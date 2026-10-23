@@ -31,6 +31,10 @@ pub struct SetupAnswer {
     pub password: Option<aterm_secrets::SecretBytes>,
     pub receipt: Option<crate::InitialSetupApplyReceipt>,
     pub cancel_receipt: Option<crate::InitialSetupCancelReceipt>,
+    /// The vault field no longer reads as System State showed it: the person typed the
+    /// vault, which moves the Mac. A field left as shown asks for the vault setup shows
+    /// when the Apply is admitted, which a vault joined since may have changed.
+    pub vault_typed: bool,
 }
 
 impl From<WorkstationSetupDecision> for SetupAnswer {
@@ -40,6 +44,7 @@ impl From<WorkstationSetupDecision> for SetupAnswer {
             password: None,
             receipt: None,
             cancel_receipt: None,
+            vault_typed: false,
         }
     }
 }

@@ -22,6 +22,9 @@
 #![cfg_attr(trust_verify, feature(register_tool))]
 #![cfg_attr(trust_verify, register_tool(trust))]
 
+#[cfg(test)]
+aterm_durable::plain_durable_flushes_in_tests!();
+
 pub mod cdn;
 pub mod codesign;
 /// The successor's signed handoff policy: the release cutter seals it into

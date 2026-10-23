@@ -1,42 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The native macOS window chrome: one compact titlebar row holding the traffic
-//! lights, a full-width view-based tab strip and a trailing "+" New Tab button. The
-//! update affordance lives in the version menu (`crate::menu::update_version_menu`).
-//!
-//! A `UnifiedCompact` `NSToolbar` merges titlebar and toolbar into one row above the
-//! content view; the title is hidden and the titlebar transparent. Its one
-//! custom-view `NSToolbarItem` hosts a container `NSView` with one [`TabView`] per
-//! tab and the right-pinned "+" [`ChromeButton`]:
-//!   * every vertical position derives from the traffic lights measured on the
-//!     live window each refresh ([`macos::strip_metrics`]), and the band starts
-//!     clear of their trailing edge;
-//!   * a tab's ✕ shows only while the pointer is inside its chip, its slot always
-//!     reserved so the reveal never reflows the centred title;
-//!   * chips split the band into equal shares with no maximum width.
-//!
-//! With a single tab the chip drops its pill and ✕ and becomes the window title:
-//! the name beside its description, centred on the window.
-//!
-//! Like `menu.rs`, the chrome adds no behavior: each affordance posts a `Wake` the
-//! main loop turns into an existing `App` command. A click on a [`TabView`] posts
-//! `Wake::SelectTab` (`App::switch_tab_in`), on its ✕ `Wake::CloseTab`
-//! (`App::close_tab_at`), a drag `Wake::TabCmd { Move }` (`App::move_tab`), and the
-//! "+" `Wake::MenuAction` with [`MenuAction::NewTab`](crate::menu::MenuAction::NewTab)
-//! (`App::open_tab`).
-//!
-//! [`set_window_tabs`] keeps the strip in sync, called from `App::sync_window`.
-//! AppKit holds a toolbar's delegate and an item's view weakly, so
-//! [`install_window_toolbar`] returns a [`ToolbarHandle`] retaining them; `App`
-//! keeps it for the window's life (like `MenuHandle`).
-//!
-//! An Objective-C exception crossing a Rust frame aborts, so this module calls only
-//! initializers documented not to raise (`+labelWithString:`,
-//! `+textFieldWithString:`, `+buttonWithTitle:target:action:`, `-initWithFrame:`),
-//! all on the main thread behind an [`aterm_objc::MainThread`].
-//!
-//! Off macOS an in-memory [`ToolbarHandle`] model stands in.
+//! Native macOS unified titlebar tab strip, NeedsPill, and inline tab rename editor.
 
 #[cfg(target_os = "macos")]
 pub(crate) use macos::native_strip_container;
@@ -57,12 +22,7 @@ pub(crate) use non_macos::{
 
 use crate::tab_bar::TabStripMetadata;
 
-/// Whether `next` differs from `current` only by the phase of a leading busy spinner
-/// (braille `dots` or the circle-fill "moon" cycle) with a byte-identical suffix.
-///
-/// Lets chrome keep one stable busy frame instead of relaying out the title, tab
-/// label, tooltip and accessibility tree several times a second. A first spinner
-/// title, a changed suffix and the final non-spinner title are never coalesced.
+/// Whether `next` differs from `current` only by the frame of a leading busy spinner.
 #[must_use]
 pub(crate) fn busy_spinner_phase_only_change(current: &str, next: &str) -> bool {
     if current == next {
@@ -83,8 +43,6 @@ pub(crate) fn busy_spinner_title_parts(title: &str) -> Option<(char, &str)> {
 
 #[must_use]
 fn is_busy_spinner_frame(ch: char) -> bool {
-    // cli-spinners' `dots` sequence (Codex's OSC title) plus the circle-fill "moon"
-    // phases ◐◑◒◓◔◕ (Claude Code). Any two in-set frames coalesce, across families.
     matches!(
         ch,
         '\u{280b}'
@@ -101,11 +59,7 @@ fn is_busy_spinner_frame(ch: char) -> bool {
     )
 }
 
-/// Format the `toolbar-tabs` introspection line from the state pixels and
-/// accessibility consume; `active` is clamped so stale input never publishes a
-/// bogus selection. Labels are the raw session titles; `icons` is `None` for a
-/// terminal and the identity of a native app. Feeds [`read_tab_chrome`] (the
-/// `chrome` verb, via `App::read_native_chrome`).
+/// Format the `toolbar-tabs` introspection line.
 #[must_use]
 pub(crate) fn format_tab_chrome(
     titles: &[String],
@@ -132,8 +86,6 @@ pub(crate) fn format_tab_chrome(
                     state.push("busy");
                 }
                 state.extend(metadata.attention.chrome_states());
-                // A both-ways connection reports both `conn-out` and `conn-in`, so
-                // the states list stays total per direction (§6: never visual-only).
                 if let Some(conn) = metadata.conn {
                     state.extend_from_slice(conn.chrome_states());
                 }
@@ -167,8 +119,6 @@ fn tab_help(
     index: usize,
 ) -> String {
     let mut parts = vec![tooltip.unwrap_or(title).to_string()];
-    // The app's name in words, unless the tab's own title already says it
-    // (a Settings tab is titled `Settings`).
     if let Some(icon) = metadata.icon {
         let name = icon.display_name();
         if !parts[0].to_lowercase().contains(&name.to_lowercase()) {
@@ -181,10 +131,6 @@ fn tab_help(
     if metadata.busy {
         parts.push("Working".to_string());
     }
-    // A tooltip carrying the reason line (`Needs attention: <reason>`, or a
-    // harness's `Needs you: <need>`) already says why, so the mark's clause
-    // would repeat it: the bare `Needs attention` always, a stall's clause when
-    // the reason is that stall's own text.
     let reason = tooltip.and_then(|tip| {
         tip.lines().find(|line| {
             line.starts_with(crate::session_chrome::NEEDS_ATTENTION_PREFIX)
@@ -206,8 +152,6 @@ fn tab_help(
     {
         parts.push(help.to_string());
     }
-    // The §4 connection mark's non-visual twin, role-level like the mark
-    // itself (per-peer detail belongs to the tooltip/menu composition).
     match metadata.conn {
         Some(crate::tab_bar::TabConnRole::Outbound) => {
             parts.push("Connects into a peer session".to_string());
@@ -229,9 +173,6 @@ fn tab_help(
 #[must_use]
 #[cfg(any(target_os = "macos", test))]
 fn tab_display_label(title: &str, index: usize, available_width: f64) -> String {
-    // The shortcut stays in hover help and accessibility at every size; render it
-    // inline only when it cannot crowd out the title. Conservative estimate for the
-    // 12 pt system font.
     let title_width = title.chars().count() as f64 * 7.0;
     let shortcut_width = 34.0;
     if index < 9 && available_width >= title_width + shortcut_width {
@@ -247,19 +188,12 @@ fn tab_close_accessibility_label(title: &str) -> String {
     format!("Close {title} Tab")
 }
 
-// Below 64 pt, equal two-tab cells cannot keep the active "Settings" label legible
-// after gutters, so the active-priority layout takes over.
 #[cfg(any(target_os = "macos", test))]
 const PREFERRED_MIN_TAB_WIDTH: f64 = 64.0;
 #[cfg(any(target_os = "macos", test))]
 const TAB_CELL_GUTTER: f64 = 1.0;
 
 /// Lay out a native tab band without ever overlapping the trailing New Tab action.
-///
-/// Every tab takes `band / count` with no maximum width, so the whole strip goes to
-/// titles. Once an equal share would drop below the legibility floor, the selected
-/// tab gets a useful share and inactive tabs compress while staying ordered and
-/// reachable.
 #[must_use]
 #[cfg(any(target_os = "macos", test))]
 fn native_tab_cells(band_width: f64, count: usize, active: usize) -> Vec<(f64, f64)> {
@@ -272,8 +206,6 @@ fn native_tab_cells(band_width: f64, count: usize, active: usize) -> Vec<(f64, f
     let widths = if ideal >= PREFERRED_MIN_TAB_WIDTH {
         vec![ideal; count]
     } else {
-        // Reserve up to 60% of the band (capped at 96 pt) for the selected tab and
-        // share the rest among inactive tabs.
         let selected = (band_width * 0.6).min(96.0).max(ideal);
         let inactive = if count > 1 {
             (band_width - selected) / (count - 1) as f64
@@ -295,28 +227,18 @@ fn native_tab_cells(band_width: f64, count: usize, active: usize) -> Vec<(f64, f
 }
 
 /// THE NEEDS PILL'S SHARE of a strip whose tab band (between the traffic
-/// lights and the trailing "+") is `band_w` points: at most 40% of it (§5), so
-/// a lit pill never takes the tabs' room past that. The pill's own layout
-/// (`aterm_messages::presence::pill_layout`) clips its words, then its label,
-/// to fit; never its glyph.
 #[cfg(any(target_os = "macos", test))]
 fn pill_share(band_w: f64) -> f64 {
     (band_w * 0.4).floor().max(0.0)
 }
 
 /// The gap (points) the macOS pill keeps between its pieces, and its inner
-/// pad from its own edge.
 #[cfg(any(target_os = "macos", test))]
 const PILL_GAP: f64 = 4.0;
 #[cfg(any(target_os = "macos", test))]
 const PILL_PAD: f64 = 8.0;
 
 /// The titlebar pill laid out in at most `share` points, its pads included
-/// (`aterm_messages::presence::pill_layout` inside them, `measure` the
-/// pieces' natural widths): its layout and whole width. The words are
-/// measured at their room (`PillWords::room`), so a pill whose age ticks
-/// keeps this width, and the tabs beside it theirs, until the age's unit
-/// moves.
 #[cfg(any(target_os = "macos", test))]
 fn titlebar_pill_layout(
     words: &crate::presence::PillWords,
@@ -334,11 +256,6 @@ mod shared_tests {
     use super::*;
 
     /// THE TITLEBAR PILL'S AGE MOVES NO TAB (§5): two pills that differ only
-    /// in their age within its unit (3s and 47s) take the same width from
-    /// the band, so the tabs get the same cells — the words are measured at
-    /// their room, by a measure that, like the label's monospaced digits,
-    /// gives every digit one width. NEGATIVE CONTROL: measured by the words
-    /// as drawn, the two widths differ.
     #[test]
     fn a_pills_age_moves_no_titlebar_tab_within_its_unit() {
         use crate::presence::{NeedSeverity, PillKind, PillWords};
@@ -418,10 +335,6 @@ mod shared_tests {
     }
 
     /// A tab that needs attention for a stated reason says it once: the
-    /// tooltip's `Needs attention: <reason>` line stands in for the bare clause,
-    /// and a tab with no reason line still gets the clause. A frozen or stopped
-    /// program's reason line names the stall, so its clause would repeat it;
-    /// another reason keeps the clause.
     #[test]
     fn the_hover_names_the_reason_once() {
         let metadata = TabStripMetadata {
@@ -441,8 +354,6 @@ mod shared_tests {
         let reason = "build\nNeeds attention: upgrade stalled";
         let frozen = "build\nNeeds attention: claude is frozen: not reading input since 14:02";
         let stopped = "build\nNeeds attention: vim is stopped with input queued since 14:02";
-        // A harness's need in its own words (`App::presence_hover`, §12.2.1)
-        // is the reason told, as `Needs attention:` is.
         let harness = "build\nNeeds you: sign 0.48.0 (+1 more)\nClaude Code carries on meanwhile";
         use aterm_messages::presence::StopCause::{Frozen, Suspended, Wall};
         for (tooltip, metadata, clauses) in [
@@ -496,7 +407,6 @@ mod shared_tests {
     }
 
     /// Each connection role is stated (never visual-only): its own chrome
-    /// token(s) and its own hover-help line, one per direction.
     #[test]
     fn connection_roles_state_their_direction_in_chrome_and_help() {
         let conn_only = |conn| TabStripMetadata {
@@ -571,8 +481,6 @@ mod shared_tests {
             assert!(busy_spinner_phase_only_change(pair[0], pair[1]));
         }
 
-        // Model a long-running title spinner: one initial chrome update, not one
-        // native relayout for every OSC title frame.
         let mut chrome = "aterm".to_string();
         let mut updates = 0;
         for index in 0..100 {
@@ -594,7 +502,6 @@ mod shared_tests {
         assert!(!busy_spinner_phase_only_change("⣿ aterm", "⠋ aterm"));
         assert!(!busy_spinner_phase_only_change("prefix ⠋", "prefix ⠙"));
 
-        // Claude Code's circle-fill "moon" spinner coalesces the same way.
         let moons = [
             "◐ Claude Code",
             "◓ Claude Code",
@@ -605,10 +512,7 @@ mod shared_tests {
             assert!(busy_spinner_phase_only_change(pair[0], pair[1]));
         }
         assert!(busy_spinner_phase_only_change("◔ task", "◕ task"));
-        // Cross-family frames coalesce too: same busy state, same suffix.
         assert!(busy_spinner_phase_only_change("⠋ aterm", "◐ aterm"));
-        // The busy→idle handoff (✳ is not a spinner frame) is always recorded,
-        // as are suffix changes and missing separators.
         assert!(!busy_spinner_phase_only_change(
             "◑ Claude Code",
             "✳ Claude Code"
@@ -676,16 +580,12 @@ mod shared_tests {
             );
         }
 
-        // The lone identity is the whole band: a one-tab window has no leftover
-        // titlebar to explain, and its title band is what fills it.
         assert_eq!(native_tab_cells(1180.0, 1, 0)[0].0, 0.0);
         assert!(native_tab_cells(1180.0, 1, 0)[0].1 >= 1180.0 - TAB_CELL_GUTTER);
     }
 }
 
 /// The non-macOS toolbar seam: an in-memory tab-chrome model serving the
-/// `chrome` verb's line. There is no native strip off macOS (a GTK4 header bar
-/// would need system libraries not present on every host).
 #[cfg(not(target_os = "macos"))]
 mod non_macos {
     use std::cell::RefCell;
@@ -697,8 +597,7 @@ mod non_macos {
     use crate::session_chrome::TabChromeExt;
     use crate::{Wake, WindowId, tab_bar::TabStripMetadata};
 
-    /// The live tab-chrome model for one window: per-tab titles in tab order and the
-    /// 0-based active index, as introspected by [`read_tab_chrome`].
+    /// Non-macOS in-memory tab-chrome model for a window.
     #[derive(Default)]
     pub(super) struct TabChrome {
         /// The raw session titles the caller syncs, in tab order.
@@ -706,41 +605,32 @@ mod non_macos {
         /// Canonical icon/status/close metadata paired with `titles`.
         metadata: Vec<TabStripMetadata>,
         /// Full route/document context paired with `titles`, shown on hover and
-        /// exposed to accessibility/introspection without bloating the paint metadata.
         tooltips: Vec<Option<String>>,
         /// Composed per-tab chrome extension (tooltip and context-menu model), paired
-        /// with `titles`; [`read_tab_menus`] serves the `chrome` mirror from it so the
-        /// lines match macOS.
         ext: Vec<TabChromeExt>,
         /// The 0-based index of the active tab (clamped into range on read/format).
         active: usize,
     }
 
-    /// The non-macOS handle: an interior-mutable [`TabChrome`] model, updated through
-    /// `&self` like the macOS handle. `App` keeps it for the window's life.
+    /// Non-macOS toolbar handle wrapping [`TabChrome`].
     pub(crate) struct ToolbarHandle {
         /// Updated by [`set_window_tabs`], read by [`read_tab_chrome`].
         chrome: RefCell<TabChrome>,
     }
 
-    /// Install the non-macOS "toolbar": an empty in-memory [`ToolbarHandle`] (the
-    /// first `App::sync_window` fills it via [`set_window_tabs`]) and the window
-    /// titled with the app name. `_proxy` and `_wid` keep the signature uniform.
+    /// Create an empty non-macOS [`ToolbarHandle`].
     pub(crate) fn install_window_toolbar(
         window: &Window,
         _proxy: &EventLoopProxy<Wake>,
         _wid: WindowId,
     ) -> Option<ToolbarHandle> {
-        // Until `App::apply_title` sets the live per-tab title.
         crate::elevated_caption::set_title(window, "aterm");
         Some(ToolbarHandle {
             chrome: RefCell::new(TabChrome::default()),
         })
     }
 
-    /// Store the synced tab set in the handle's [`TabChrome`] for
-    /// [`read_tab_chrome`]. The window title is `App::apply_title`'s; `_ids`
-    /// keeps the signature uniform (no native context menu off macOS).
+    /// Update the non-macOS [`ToolbarHandle`] with the current tab set.
     #[allow(
         clippy::too_many_arguments,
         reason = "the macOS strip's signature: every per-tab vector, the active index and the window's pill"
@@ -767,8 +657,7 @@ mod non_macos {
         chrome.active = active;
     }
 
-    /// The `toolbar-tabs` introspection line from the live model, which the
-    /// `chrome` verb reads through `AppRt::read_toolbar_chrome`.
+    /// Format the `toolbar-tabs` introspection line from `handle`.
     #[must_use]
     pub(crate) fn read_tab_chrome(handle: &ToolbarHandle) -> Option<String> {
         let chrome = handle.chrome.borrow();
@@ -780,9 +669,7 @@ mod non_macos {
         )
     }
 
-    /// Read the per-tab context-menu introspection lines (`tab-menu tab=<i>
-    /// items=[...]`), one per visible tab, serialised by
-    /// `session_chrome::tab_menu_chrome_line` like the macOS strip read.
+    /// Format per-tab context-menu introspection lines from `handle`.
     #[must_use]
     pub(crate) fn read_tab_menus(handle: &ToolbarHandle) -> Vec<String> {
         handle
@@ -801,25 +688,21 @@ mod non_macos {
             .collect()
     }
 
-    /// No-op off macOS (no native strip); keeps the `AppRt` signature uniform.
+    /// No-op off macOS.
     pub(crate) fn set_strip_dark(_handle: &ToolbarHandle, _dark: bool) {}
 
-    /// No native pill off macOS: the strip paints its own selected card
-    /// ([`crate::tab_bar::automatic_active_tab_color`]).
+    /// Always `None` off macOS.
     pub(crate) fn native_selected_pill_rgb(_handle: &ToolbarHandle) -> Option<[u8; 3]> {
         None
     }
 
-    /// Off macOS there is no native strip; the selected-tab color override is
-    /// carried by the in-grid strip instead (`tab_bar::strip_colors_with_active`).
+    /// No-op off macOS.
     pub(crate) fn set_active_tab_color(_handle: &ToolbarHandle, _color: Option<[u8; 3]>) {}
 
-    /// Off macOS there is no native strip; the in-grid strip draws the chrome
-    /// accent from the tokens instead (`tab_bar::strip_colors`).
+    /// No-op off macOS.
     pub(crate) fn set_strip_accent(_handle: &ToolbarHandle, _accent: Option<[u8; 3]>) {}
 
-    /// Off macOS the in-grid strip reads each chip's load step from its own
-    /// metadata (`App::stamp_presence_chips`) on the frame a reading asks for.
+    /// No-op off macOS.
     pub(crate) fn set_chip_loads(_handle: &ToolbarHandle, _loads: &[u8], _inks: [[u8; 3]; 2]) {}
 }
 
@@ -829,8 +712,6 @@ mod non_macos_tests {
     use crate::tab_bar::TabStripMetadata;
 
     /// `attention` is a bool because these tests only ask whether the `attention`
-    /// token prints; `ChipLevel::Wait` is the level whose chrome tokens are exactly
-    /// `["attention"]`, so it stands for "on".
     fn metadata(dirty: bool, busy: bool, attention: bool) -> TabStripMetadata {
         TabStripMetadata {
             icon: None,
@@ -867,7 +748,6 @@ mod non_macos_tests {
     }
 
     /// 2+ tabs report the line in the exact macOS shape, so the introspection
-    /// output is platform-stable.
     #[test]
     fn chrome_line_matches_macos_shape() {
         let titles = vec!["zsh".to_string(), "vim".to_string(), "htop".to_string()];
@@ -907,8 +787,6 @@ mod non_macos_tests {
 mod macos {
     use std::cell::{Cell, RefCell};
 
-    // Every AppKit send below goes through `crate::appkit`'s typed prototypes; the
-    // receiver of a declared `NSView` subclass is its own `as_id()`.
     use aterm_objc::{CGPoint, CGRect, CGSize, Id, MainThread, Obj, Retained, class, sel};
     use aterm_window::event_loop::EventLoopProxy;
 
@@ -931,70 +809,52 @@ mod macos {
     const STRIP_HEIGHT: f64 = 28.0;
 
     /// Leading gutter (points) inside the toolbar item before the first chip. The
-    /// `UnifiedCompact` toolbar already places the item past the traffic lights, so
-    /// this is only a tidy gap; [`strip_metrics`] widens it so the band never starts
-    /// before the measured lights' right edge plus [`LIGHTS_CLEARANCE`].
     const STRIP_LEADING_PAD: f64 = 4.0;
 
     /// Clear space (points) kept between the trailing edge of the window's traffic
-    /// lights and the first tab chip. Only binds when AppKit places the toolbar item
-    /// far enough left that [`STRIP_LEADING_PAD`] alone would not clear the lights.
     const LIGHTS_CLEARANCE: f64 = 10.0;
 
     /// Width (points) of the trailing "+" New Tab button at the right end of the cluster.
     const PLUS_WIDTH: f64 = 28.0;
 
     /// Trailing gutter (points) between the window's right edge and the "+", mirroring
-    /// the traffic-light inset.
     const TRAILING_PAD: f64 = 8.0;
 
     /// Gap (points) between the last tab chip and the trailing "+" button, so a chip
-    /// never butts straight against it.
     const TAB_GAP: f64 = 6.0;
 
     /// [`ChromeButton`] hover/press fill: a rounded rect inset by this margin, of fixed
-    /// height, centred on the strip's measured content line, with this corner radius.
     const BTN_INSET_X: f64 = 2.0;
     const BTN_PILL_HEIGHT: f64 = 20.0;
     const BTN_RADIUS: f64 = 6.0;
 
     /// The "+" mark: half-length of each arm and the stroke width, drawn as two
-    /// round-capped strokes crossing on the strip's measured centre line.
     const PLUS_ARM: f64 = 5.5;
     const PLUS_STROKE: f64 = 1.6;
 
     /// Min/max width (points) of the tab-strip item. A custom `NSView` has no intrinsic
-    /// size; without these `UnifiedCompact` collapses the strip into an overflow `»`.
     const STRIP_MIN_WIDTH: f64 = 120.0;
     const STRIP_MAX_WIDTH: f64 = 100_000.0;
 
     /// Tab pill geometry: a rounded rect of fixed height centred on the measured
-    /// content line, inset horizontally by this margin (which is also the gap between
-    /// adjacent pills), with this corner radius.
     const TAB_PILL_INSET_X: f64 = 2.0;
     const TAB_PILL_HEIGHT: f64 = 22.0;
     const TAB_PILL_RADIUS: f64 = 7.0;
 
     /// Height (points) of the hairline an unselected chip draws on its leading edge;
-    /// shorter than the pill so it divides titles without boxing them.
     const TAB_RULE_HEIGHT: f64 = 14.0;
 
     /// Width cap (points) of the inline rename editor in the solo band, so it reads as
-    /// in-place editing rather than a dialog.
     const SOLO_EDITOR_WIDTH: f64 = 280.0;
 
     /// Gap (points) between the solo title and its description, and the minimum clear
-    /// space kept at each end of the solo band before the title group is compressed.
     const SOLO_GAP: f64 = 10.0;
     const SOLO_EDGE_PAD: f64 = 12.0;
     /// Height (points) of the solo band's title / description labels, and of the solo
-    /// status canvas trailing them.
     const SOLO_LABEL_HEIGHT: f64 = 18.0;
     const SOLO_STATUS_SIZE: f64 = 16.0;
 
     /// A chip's placement, resolved once per refresh by [`set_window_tabs`] from the
-    /// measured [`StripMetrics`] and the tab count and handed to every [`TabView`], so
-    /// alignment, solo/tabbed mode and solo centre are applied together.
     #[derive(Clone, Copy, PartialEq, Debug)]
     struct TabGeometry {
         /// The measured content centre line, in the chip's own coordinates.
@@ -1004,13 +864,11 @@ mod macos {
         /// The window's horizontal centre, in the chip's own coordinates (solo only).
         solo_center_x: f64,
         /// Draw the leading-edge hairline. False for the first chip and for chips
-        /// touching the selected pill, which draws its own edge.
         separator: bool,
     }
 
     impl TabGeometry {
         /// Whether the chip at `index` of a strip whose `active` chip is selected
-        /// draws a leading divider.
         #[must_use]
         const fn separates(index: usize, active: usize) -> bool {
             index > 0 && index != active && index != active + 1
@@ -1021,11 +879,6 @@ mod macos {
     fn rect_of([x, y, w, h]: [f64; 4]) -> CGRect {
         rect(x, y, w.max(0.0), h.max(0.0))
     }
-
-    // ---- Drawing vocabulary ----
-    //
-    // `crate::appkit` has one function per C prototype; these are the class-specific
-    // calls this module makes, named once here instead of at each site.
 
     /// `CGRect` from four scalars — the shape `NSMakeRect` makes.
     const fn rect(x: f64, y: f64, w: f64, h: f64) -> CGRect {
@@ -1043,12 +896,7 @@ mod macos {
         CGPoint { x, y }
     }
 
-    /// One of `NSColor`'s class colour factories, by selector, +0.
-    ///
-    /// Each (`+labelColor`, `+controlAccentColor`, …) returns an autoreleased
-    /// instance, borrowed until the enclosing pool pops; callers `-set` it or hand it
-    /// to a retaining setter within the same frame.
-    ///
+    /// Call a nullary `NSColor` class factory selector.
     /// # Safety
     /// `name` must be a no-argument `+(NSColor *)` class method of `NSColor`.
     unsafe fn ns_color(name: aterm_objc::Sel) -> Id {
@@ -1056,10 +904,9 @@ mod macos {
         unsafe { appkit::send_id(class(c"NSColor").as_id(), name) }
     }
 
-    /// `+[NSColor colorWithSRGBRed:green:blue:alpha:]`, +0.
-    ///
+    /// Construct an sRGB `NSColor`.
     /// # Safety
-    /// Main thread; the four components are plain `CGFloat`s.
+    /// Must be called on the main thread.
     unsafe fn srgb(r: f64, g: f64, b: f64, a: f64) -> Id {
         // SAFETY: the documented non-raising `+(NSColor *)(CGFloat × 4)`.
         unsafe {
@@ -1074,8 +921,7 @@ mod macos {
         }
     }
 
-    /// `-[NSColor colorWithAlphaComponent:]`, +0.
-    ///
+    /// Return `color` with alpha component `alpha`.
     /// # Safety
     /// `color` must be a live `NSColor`.
     unsafe fn with_alpha(color: Id, alpha: f64) -> Id {
@@ -1083,19 +929,17 @@ mod macos {
         unsafe { appkit::send_id_f64(color, sel!(colorWithAlphaComponent:), alpha) }
     }
 
-    /// `+[NSBezierPath bezierPath]` — a fresh empty path, +0.
-    ///
+    /// Construct an empty `NSBezierPath`.
     /// # Safety
-    /// Main thread, inside a draw cycle.
+    /// Must be called on the main thread inside a draw cycle.
     unsafe fn bezier_path() -> Id {
         // SAFETY: the documented non-raising `+(NSBezierPath *)` factory.
         unsafe { appkit::send_id(class(c"NSBezierPath").as_id(), sel!(bezierPath)) }
     }
 
-    /// `+[NSBezierPath bezierPathWithRoundedRect:xRadius:yRadius:]` with equal radii, +0.
-    ///
+    /// Construct a rounded-rect `NSBezierPath`.
     /// # Safety
-    /// Main thread, inside a draw cycle.
+    /// Must be called on the main thread inside a draw cycle.
     unsafe fn rounded_rect(r: CGRect, radius: f64) -> Id {
         // SAFETY: `+(NSBezierPath *)(NSRect, CGFloat, CGFloat)`, non-raising.
         unsafe {
@@ -1109,11 +953,9 @@ mod macos {
         }
     }
 
-    /// A circle of `radius` about `(x, y)`:
-    /// `+[NSBezierPath bezierPathWithOvalInRect:]` on its bounding square, +0.
-    ///
+    /// Construct a circular `NSBezierPath` centered at `(x, y)`.
     /// # Safety
-    /// Main thread, inside a draw cycle.
+    /// Must be called on the main thread inside a draw cycle.
     unsafe fn circle(x: f64, y: f64, radius: f64) -> Id {
         // SAFETY: `+(NSBezierPath *)(NSRect)`, non-raising.
         unsafe {
@@ -1125,13 +967,11 @@ mod macos {
         }
     }
 
-    /// A closed polygon through `points`, +0, ready for `-fill` or `-stroke`.
-    ///
+    /// Construct a closed polygon `NSBezierPath` through `points`.
     /// # Safety
-    /// Main thread, inside a draw cycle.
+    /// Must be called on the main thread inside a draw cycle.
     unsafe fn polygon(points: &[CGPoint]) -> Id {
-        // SAFETY: a fresh path, then `-moveToPoint:`/`-lineToPoint:`
-        // (`-(void)(NSPoint)`) and `-closePath` (`-(void)`), none of which raise.
+        // SAFETY: a fresh path, then `-moveToPoint:`/`-lineToPoint:` (`-(void)(NSPoint)`) and `-closePath` (`-(void)`), none of which raise.
         unsafe {
             let path = bezier_path();
             for (i, &p) in points.iter().enumerate() {
@@ -1147,10 +987,9 @@ mod macos {
         }
     }
 
-    /// `+[NSFont systemFontOfSize:]` / `+boldSystemFontOfSize:`, +0.
-    ///
+    /// Return the regular or bold system `NSFont` of `size`.
     /// # Safety
-    /// Main thread.
+    /// Must be called on the main thread.
     unsafe fn system_font(size: f64, bold: bool) -> Id {
         let name = if bold {
             sel!(boldSystemFontOfSize:)
@@ -1161,18 +1000,12 @@ mod macos {
         unsafe { appkit::send_id_f64(class(c"NSFont").as_id(), name, size) }
     }
 
-    /// `+[NSFont monospacedDigitSystemFontOfSize:weight:]` at the regular
-    /// weight, +0: the system font with every digit as wide as every other,
-    /// so a figure that ticks (the pill's age) never changes its label's
-    /// width within its digit count.
-    ///
+    /// Return the regular-weight monospaced-digit system `NSFont` of `size`.
     /// # Safety
-    /// Main thread.
+    /// Must be called on the main thread.
     unsafe fn monospaced_digit_font(size: f64) -> Id {
-        // NSFontWeightRegular.
         const REGULAR: f64 = 0.0;
-        // SAFETY: `+(NSFont *)(CGFloat, NSFontWeight)`, non-raising;
-        // `NSFontWeight` is a `CGFloat`.
+        // SAFETY: `+(NSFont *)(CGFloat, NSFontWeight)`, non-raising; `NSFontWeight` is a `CGFloat`.
         unsafe {
             appkit::send_id_f64_f64(
                 class(c"NSFont").as_id(),
@@ -1183,15 +1016,11 @@ mod macos {
         }
     }
 
-    /// Set `NSLineBreakByTruncatingTail` on the field's cell, so a title too long for
-    /// its chip ends in an ellipsis instead of clipping into a plausible wrong name.
-    ///
+    /// Set tail-truncation line-break mode on `field`'s cell.
     /// # Safety
     /// `field` must be a live `NSTextField`.
     unsafe fn truncate_tail(field: Id) {
-        // SAFETY: `-cell` is a main-thread `-(id)` getter; every `NSTextField` cell is
-        // an `NSCell`, which responds to `-setLineBreakMode:` (`NSUInteger`). A nil
-        // cell is inert.
+        // SAFETY: `-cell` is a main-thread `-(id)` getter.
         unsafe {
             let cell = appkit::send_id(field, sel!(cell));
             if !cell.is_null() {
@@ -1205,28 +1034,17 @@ mod macos {
     }
 
     /// Strip geometry measured from the live window: where the traffic lights sit, in
-    /// the container view's coordinates.
-    ///
-    /// The row `UnifiedCompact` hands the custom view is not centred on the traffic
-    /// lights, so every vertical position derives from [`Self::center_y`] (the close
-    /// button's centre line) and the band's leading edge stays clear of
-    /// [`Self::lights_right`].
     #[derive(Clone, Copy, Debug)]
     struct StripMetrics {
         /// Vertical centre of the strip's content: the traffic lights' centre line in
-        /// container coordinates, or the container's midpoint when unreadable.
         center_y: f64,
         /// Trailing edge of the rightmost visible traffic light in container
-        /// coordinates (usually negative); `f64::NEG_INFINITY` when unmeasured, so the
-        /// consuming `max` falls back to the plain leading pad.
         lights_right: f64,
         /// Horizontal centre of the window in container coordinates; the solo title
-        /// centres on it rather than on the band.
         window_center_x: f64,
     }
 
     /// [`plan_strip`]'s answer: every chip's cell plus the measurements its content
-    /// is placed against.
     struct StripPlan {
         cells: Vec<(f64, f64)>,
         metrics: StripMetrics,
@@ -1235,7 +1053,6 @@ mod macos {
 
     impl StripMetrics {
         /// The content geometry of chip `index` of `n` whose cell starts at `cell_x`:
-        /// one tab is the window's title, not a switcher.
         fn geometry(&self, index: usize, n: usize, active: usize, cell_x: f64) -> TabGeometry {
             TabGeometry {
                 center_y: self.center_y,
@@ -1245,9 +1062,7 @@ mod macos {
             }
         }
 
-        /// The geometry a container with no reachable window falls back to: its own
-        /// centre, no measured lights.
-        ///
+        /// Fallback geometry when `container` has no reachable window.
         /// # Safety
         /// `container` must be a live `NSView`.
         unsafe fn unmeasured(container: Id) -> Self {
@@ -1261,21 +1076,13 @@ mod macos {
         }
     }
 
-    /// Measure the live window's traffic lights in `container`'s coordinate space.
-    ///
-    /// Returns [`StripMetrics::unmeasured`] when the window, its buttons or its content
-    /// view cannot be read. `center_y` is clamped so a full-height pill stays inside
-    /// the container.
-    ///
+    /// Measure the window's traffic lights in `container` coordinates.
     /// # Safety
     /// `container` must be a live `NSView`.
     unsafe fn strip_metrics(container: Id) -> StripMetrics {
         // SAFETY: the caller guarantees a live view.
         let mut metrics = unsafe { StripMetrics::unmeasured(container) };
-        // SAFETY: side-effect-free main-thread AppKit getters on live objects
-        // (`-window`, `-superview`, `-contentView`, `-standardWindowButton:`,
-        // `-isHidden`, `-frame`, `-bounds`, `-convertRect:fromView:`). Each nil is
-        // checked; a nil source view means window coordinates.
+        // SAFETY: side-effect-free main-thread AppKit getters on live objects (`-window`, `-superview`, `-contentView`, `-standardWindowButton:`, `-isHidden`, `-frame`, `-bounds`, `-convertRect:fromView:`). Each nil is checked; a nil source view means window coordinates.
         unsafe {
             let window = appkit::send_id(container, sel!(window));
             if window.is_null() {
@@ -1318,7 +1125,6 @@ mod macos {
                 }
             }
         }
-        // Never let a measurement push the pill outside the row AppKit gave us.
         // SAFETY: as above.
         let bounds = unsafe { appkit::send_rect(container, sel!(bounds)) };
         let lo = bounds.origin.y + TAB_PILL_HEIGHT * 0.5;
@@ -1329,44 +1135,30 @@ mod macos {
         metrics
     }
 
-    /// What [`install_window_toolbar`] returns: the backing objects, retained
-    /// because AppKit holds a toolbar's delegate and an item's view weakly.
+    /// Retained AppKit objects backing a window's native titlebar tab strip.
     pub(crate) struct ToolbarHandle {
         /// The `NSToolbarDelegate` that vends the strip's single custom-view item.
         _delegate: aterm_objc::Retained<ToolbarDelegate>,
         /// The `NSToolbar` hosting the strip item, always visible. Retain-only (the
-        /// window owns its live toolbar strongly).
         _toolbar: Obj,
         /// The container `NSView` holding the [`TabView`]s and the "+" [`ChromeButton`],
-        /// retained for [`set_window_tabs`] rebuilds and [`read_tab_chrome`].
         container: Obj,
         /// Proxy and window id for building each rebuilt [`TabView`]'s relays.
         proxy: EventLoopProxy<Wake>,
         window: WindowId,
         /// The live [`TabView`]s in tab order: the source for [`read_tab_chrome`] and
-        /// the set [`set_window_tabs`] replaces on rebuild. Retained so per-tab targets
-        /// and labels stay live.
         tabs: RefCell<Vec<aterm_objc::Retained<TabView>>>,
         /// The trailing "+" New Tab [`ChromeButton`], re-pinned to the live width and
-        /// measured centre line by every [`set_window_tabs`].
         plus: aterm_objc::Retained<ChromeButton>,
         /// winit's content `NSView`, the permanent first responder. [`end_tab_rename`]
-        /// hands focus back to it; asking the container's window later is wrong in
-        /// native fullscreen, where AppKit re-hosts the toolbar in a separate window.
         content_view: Obj,
         /// The live inline session-rename editor, or `None`. Owned by the handle rather
-        /// than a chip because a rebuild (tab count or width change) destroys every
-        /// chip; the field is repositioned across a rebuild instead.
         rename: RefCell<Option<RenameEditor>>,
         /// The NEEDS PILL ([`NeedsPill`], §5): built on the first lit pill and
-        /// kept, hidden while the window's border is unlit.
         pill: RefCell<Option<Retained<NeedsPill>>>,
         /// The pill's laid-out width (points, its pads included) at the last
-        /// [`plan_strip`]: what it takes from the tab band. 0 with no pill.
         pill_w: Cell<f64>,
         /// Where the last [`plan_strip`] laid the pill out (its share, its
-        /// right edge, the strip's height and centre line): what a pill-only
-        /// push ([`set_window_pill`]) lays it out at again.
         pill_slot: Cell<Option<PillSlot>>,
     }
 
@@ -1380,76 +1172,51 @@ mod macos {
     }
 
     /// The live inline rename editor: an `NSTextField` overlaying one tab chip,
-    /// plus the small relay object AppKit calls back on.
     struct RenameEditor {
         /// The editable field. Its `stringValue` is the only home of the in-progress
-        /// text; nothing else needs saving across a strip rebuild.
         field: Obj,
         /// The delegate/relay. Retained here because AppKit holds a delegate weakly.
         target: aterm_objc::Retained<TabRenameTarget>,
         /// Stable id of the tab the editor is painted over, for positioning only. When
-        /// it stops resolving the edit is cancelled. The commit target is the session
-        /// id the relay carries, resolved by `App` at begin.
         tab: TabId,
     }
 
-    /// The live custom-view subtree AppKit places in the unified titlebar, retained (+1).
-    ///
-    /// Full-window capture (`app_introspect.rs`) uses it to find the
-    /// titlebar-container ancestor shared with the traffic-light buttons, and
-    /// holds the retain while AppKit draws it into a bitmap.
+    /// Return the retained custom-view container placed in the unified titlebar.
     pub(crate) fn native_strip_container(handle: &ToolbarHandle) -> Obj {
         handle.container.clone_retained()
     }
 
-    // SAFETY: `ToolbarHandle` is created, read and dropped only on the main thread;
-    // it holds main-thread-only AppKit objects and is never sent across threads, so
-    // the auto-derived non-Send is kept.
-
-    /// The mutable per-button state a [`ChromeButton`] needs at click/draw time. Held in
-    /// `Cell`s/`RefCell`s because AppKit messages the view (`mouseDown:`/`drawRect:`)
-    /// through a shared `&self`.
+    /// Per-button state for [`ChromeButton`].
     pub(crate) struct ChromeIvars {
         /// The `Wake` channel a click relays through.
         proxy: EventLoopProxy<Wake>,
         /// The [`MenuAction`] this button fires (File ▸ New Tab for "+"), the same
-        /// action the menu item and keybinding use.
         action: MenuAction,
         /// Whether the pointer is inside the button (drives the hover highlight).
         hovered: Cell<bool>,
         /// Whether the mouse is held down inside the button (drives the pressed state).
         pressed: Cell<bool>,
         /// The strip's measured content centre line in this button's coordinates, so
-        /// the "+" sits on the traffic lights' optical row.
         center_y: Cell<f64>,
         /// The retained tracking area, so `updateTrackingAreas` can swap it on a frame
-        /// change without leaking the old one.
         tracking: RefCell<Option<Obj>>,
     }
 
     aterm_objc::declare_class! {
-        /// A titlebar button: a custom `NSView` drawing its own hover/press highlight
-        /// behind a drawn "+", relaying a [`Wake::MenuAction`] on a click that begins
-        /// and ends inside it. Main-thread-only via [`aterm_objc::Retained`]'s `!Send`
-        /// and the [`aterm_objc::MainThread`] the entry points take.
+        /// Custom `NSView` drawing the titlebar "+" New Tab button.
         pub(crate) struct ChromeButton: NSView {
             const NAME: &str = "ATermChromeButton";
             type Ivars = ChromeIvars;
             protocols: [NSObject];
             /// Paint the affordance, then the "+": nothing at rest, a translucent
-            /// rounded pill on hover, a stronger one while pressed.
             @sel(drawRect:)
             fn drawRect(&self, _dirty: CGRect) {
-                // SAFETY: `-bounds` is a side-effect-free `-(NSRect)` getter on
-                // this live view, inside AppKit's own draw cycle.
+                // SAFETY: `-bounds` is a side-effect-free `-(NSRect)` getter on this live view, inside AppKit's own draw cycle.
                 let bounds = unsafe { appkit::send_rect(self.as_id(), sel!(bounds)) };
                 let ivars = self.ivars();
-                // SAFETY: AppKit drawing primitives on the main thread inside a draw
-                // cycle; colors are autoreleased (+0) and used in this frame; none raise.
+                // SAFETY: AppKit drawing primitives on the main thread inside a draw cycle.
                 unsafe {
                     if ivars.pressed.get() || ivars.hovered.get() {
-                        // Translucent highlight, stronger when pressed, centred on the
-                        // strip's measured content line like the tab pills.
                         let pill = rect(
                             bounds.origin.x + BTN_INSET_X,
                             ivars.center_y.get() - BTN_PILL_HEIGHT * 0.5,
@@ -1460,9 +1227,6 @@ mod macos {
                         appkit::send_v(srgb(1.0, 1.0, 1.0, a), sel!(set));
                         appkit::send_v(rounded_rect(pill, BTN_RADIUS), sel!(fill));
                     }
-                    // The "+" is drawn as two strokes crossing on the measured centre
-                    // line: a font glyph centres on its line box, not optically.
-                    // `secondaryLabelColor` at rest, `labelColor` on hover.
                     let ink = if ivars.hovered.get() {
                         sel!(labelColor)
                     } else {
@@ -1491,7 +1255,6 @@ mod macos {
             }
 
             /// Drag while pressed: the pressed highlight holds only while the pointer
-            /// stays inside (dragging off cancels the press, as native buttons do).
             @sel(mouseDragged:)
             fn mouseDragged(&self, event: Id) {
                 let inside = self.point_inside(event);
@@ -1502,14 +1265,12 @@ mod macos {
             }
 
             /// Release: fire the action only if the press began and ended inside the
-            /// button, then clear the pressed state.
             @sel(mouseUp:)
             fn mouseUp(&self, event: Id) {
                 let was_pressed = self.ivars().pressed.get();
                 self.ivars().pressed.set(false);
                 mark_dirty(self.as_id());
                 if was_pressed && self.point_inside(event) {
-                    // A closed loop (app shutting down) drops the event.
                     let action = self.ivars().action;
                     let _ = crate::tab_spawn::post_native_menu_action(&self.ivars().proxy, action);
                 }
@@ -1530,21 +1291,18 @@ mod macos {
             }
 
             /// Rebuild the tracking area whenever geometry changes (the "+" is re-pinned on
-            /// resize), so hover detection follows.
             @sel(updateTrackingAreas)
             fn updateTrackingAreas(&self) {
                 update_tracking_areas(self.super_receiver(), &self.ivars().tracking);
             }
 
             /// Accept the first click in a non-key window, so the "+" works in one
-            /// click. Not contained: the body is send-free.
             @sel(acceptsFirstMouse:) @abort_on_exception
             fn acceptsFirstMouse(&self, _event: Id) -> aterm_objc::Bool {
                 aterm_objc::Bool::YES
             }
 
             /// VoiceOver's press action dispatches the exact same typed menu command as
-            /// a pointer click. Returning true confirms that the action was accepted.
             @sel(accessibilityPerformPress)
             fn accessibilityPerformPress(&self) -> aterm_objc::Bool {
                 let _ = crate::tab_spawn::post_native_menu_action(
@@ -1559,9 +1317,6 @@ mod macos {
 
     impl ChromeButton {
         /// Build a titlebar "+" button of `frame`, relaying `action` through `proxy`
-        /// and named `accessibility_label` for VoiceOver (the drawn glyph alone is
-        /// not a name). The mark is drawn in `drawRect:`, not set in a font, so it
-        /// lands exactly on the strip's measured centre line.
         fn build(
             mtm: MainThread,
             proxy: EventLoopProxy<Wake>,
@@ -1577,16 +1332,7 @@ mod macos {
                 center_y: Cell::new(frame.size.height * 0.5),
                 tracking: RefCell::new(None),
             };
-            // `alloc_init` would send `-init`, but an `NSView` subclass's designated
-            // initializer is `-initWithFrame:`. Ivars are stored before it runs
-            // because `-initWithFrame:` can call overridden methods
-            // (`updateTrackingAreas`) that read `ivars()`. A plain send suffices:
-            // `ChromeButton` does not implement `initWithFrame:`.
-            //
-            // SAFETY: `alloc_ivars` returns a +1 instance owing exactly one
-            // designated initializer, which is the next send. `-initWithFrame:`
-            // is `-(id)(NSRect)`, consumes that +1 and returns the initialised
-            // +1 that `Retained::from_owned` adopts.
+            // SAFETY: `alloc_ivars` returns a +1 instance owing exactly one designated initializer, which is the next send. `-initWithFrame:` is `-(id)(NSRect)`, consumes that +1 and returns the initialised +1 that `Retained::from_owned` adopts.
             let this: Retained<Self> = unsafe {
                 let raw = Self::alloc_ivars(mtm, ivars);
                 if raw.is_null() {
@@ -1595,10 +1341,7 @@ mod macos {
                 Retained::from_owned(appkit::send_id_rect(raw, sel!(initWithFrame:), frame))?
             };
 
-            // A custom NSView must opt into accessibility, or VoiceOver cannot see
-            // the drawn "+".
-            // SAFETY: `-setAccessibilityLabel:` is a plain `-(void)(NSString *)`
-            // main-thread metadata write on the fresh view.
+            // SAFETY: `-setAccessibilityLabel:` is a plain `-(void)(NSString *)` main-thread metadata write on the fresh view.
             unsafe {
                 let name = appkit::nsstring(accessibility_label)?;
                 make_accessibility_element(this.as_id(), "AXButton")?;
@@ -1609,7 +1352,6 @@ mod macos {
         }
 
         /// Move this button onto the strip's measured content line. No-op when
-        /// unchanged, so the per-refresh call costs nothing in the steady state.
         fn set_center_y(&self, center_y: f64) {
             if self.ivars().center_y.get() == center_y {
                 return;
@@ -1619,13 +1361,11 @@ mod macos {
         }
 
         /// Whether `event`'s location is within the button's bounds (a click that ends on
-        /// it).
         fn point_inside(&self, event: Id) -> bool {
             if event.is_null() {
                 return false;
             }
-            // SAFETY: `event` is the live NSEvent AppKit passed; `-bounds` is a
-            // side-effect-free `-(NSRect)` getter on this live view.
+            // SAFETY: `event` is the live NSEvent AppKit passed.
             let (p, b) = unsafe {
                 (
                     point_in_view(self.as_id(), event),
@@ -1636,18 +1376,13 @@ mod macos {
         }
     }
 
-    // ---- The needs pill (owner surfaces §5) ----
-
-    /// The pill's per-view state: what it shows (the window's pill model, as
-    /// the last strip push carried it), where its pieces sit (the engine's
-    /// layout, the one a click resolves through), and its labels.
+    /// Per-view state for [`NeedsPill`].
     pub(crate) struct PillIvars {
         /// The `Wake` channel a click relays through.
         proxy: EventLoopProxy<Wake>,
         /// The window the pill belongs to.
         window: WindowId,
         /// The session the drawn pill names: a click carries it, so a click
-        /// on a pill that has since moved acts on nothing (`App::on_pill_act`).
         session: Cell<u64>,
         /// What lit it, for its tone; `None` while hidden.
         kind: Cell<Option<crate::presence::PillKind>>,
@@ -1662,15 +1397,7 @@ mod macos {
     }
 
     aterm_objc::declare_class! {
-        /// THE NEEDS PILL: the titlebar's sentence about the window's most
-        /// pressing session, at the right end of the tab strip before "+"
-        /// (§5): a quiet rounded fill in the border's tone behind the glyph,
-        /// the tab's label, the words, the act and the count, each a label
-        /// clipped to the engine's layout (`pill_layout`: the words clip
-        /// first, then the label, never the glyph). A click resolves through
-        /// that same layout (`PillLayout::hit`) and posts
-        /// [`Wake::PillAct`]: the body goes to the tab, the act runs, the
-        /// count goes to the window's next need. Nothing reaches the PTY.
+        /// Titlebar pill view displaying the window's most pressing session need.
         pub(crate) struct NeedsPill: NSView {
             const NAME: &str = "ATermNeedsPill";
             type Ivars = PillIvars;
@@ -1682,9 +1409,7 @@ mod macos {
                 let Some(kind) = ivars.kind.get() else {
                     return;
                 };
-                // SAFETY: `-bounds` is a side-effect-free `-(NSRect)` getter on
-                // this live view, inside AppKit's own draw cycle; the colours
-                // are autoreleased (+0) and used in this frame; none raise.
+                // SAFETY: `-bounds` is a side-effect-free `-(NSRect)` getter on this live view, inside AppKit's own draw cycle; the colours are autoreleased (+0) and used in this frame; none raise.
                 unsafe {
                     let bounds = appkit::send_rect(self.as_id(), sel!(bounds));
                     let pill = rect(
@@ -1707,7 +1432,6 @@ mod macos {
             }
 
             /// Release inside the pill: resolve the region through the drawn
-            /// layout and post its act.
             @sel(mouseUp:)
             fn mouseUp(&self, event: Id) {
                 let was_pressed = self.ivars().pressed.get();
@@ -1729,7 +1453,6 @@ mod macos {
             }
 
             /// Accept the first click in a non-key window, so the pill works
-            /// in one click from a window behind. Not contained: send-free.
             @sel(acceptsFirstMouse:) @abort_on_exception
             fn acceptsFirstMouse(&self, _event: Id) -> aterm_objc::Bool {
                 aterm_objc::Bool::YES
@@ -1745,7 +1468,6 @@ mod macos {
     }
 
     /// A pill kind's tone: the stop hue for a stuck need, the wait hue for a
-    /// decide need, the dim ink for the person's own hold (the border's).
     fn tone_of(kind: crate::presence::PillKind) -> aterm_objc::Sel {
         match kind {
             crate::presence::PillKind::Need(crate::presence::NeedSeverity::Stuck) => {
@@ -1760,8 +1482,6 @@ mod macos {
 
     impl NeedsPill {
         /// A hidden pill for window `window`, its five labels built and
-        /// added. All construction is via non-raising factory initializers on
-        /// the main thread.
         fn build(
             mtm: MainThread,
             proxy: EventLoopProxy<Wake>,
@@ -1777,8 +1497,7 @@ mod macos {
                 pressed: Cell::new(false),
                 fields: RefCell::new(Vec::new()),
             };
-            // SAFETY: as `ChromeButton::build`: `alloc_ivars` returns a +1
-            // instance owing one designated initializer, the next send.
+            // SAFETY: as `ChromeButton::build`: `alloc_ivars` returns a +1 instance owing one designated initializer, the next send.
             let this: Retained<Self> = unsafe {
                 let raw = Self::alloc_ivars(mtm, ivars);
                 if raw.is_null() {
@@ -1792,9 +1511,7 @@ mod macos {
             };
             let mut fields = Vec::with_capacity(5);
             for (index, bold) in [true, false, false, true, false].into_iter().enumerate() {
-                // SAFETY: `labelWithString:` is the documented non-raising
-                // factory (+0, retained here); plain setters follow, on the
-                // main thread; the labels pass the mouse through to the pill.
+                // SAFETY: `labelWithString:` is the documented non-raising factory (+0, retained here).
                 let field = unsafe {
                     let field = Obj::retain(appkit::send_id_id(
                         class(c"NSTextField").as_id(),
@@ -1806,8 +1523,6 @@ mod macos {
                     appkit::send_v_bool(field.id(), sel!(setEditable:), false);
                     appkit::send_v_bool(field.id(), sel!(setSelectable:), false);
                     appkit::send_v_bool(field.id(), sel!(setUsesSingleLineMode:), true);
-                    // The words carry the age: monospaced digits, so the
-                    // age's figure moves no width within its room.
                     let font = if index == 2 {
                         monospaced_digit_font(12.0)
                     } else {
@@ -1843,17 +1558,13 @@ mod macos {
         }
 
         /// Show `model` (or hide on `None`): each piece's text and ink, the
-        /// session it names, the accessibility sentence, and the whole
-        /// sentence as the pill's tool tip, so words the pill clipped (the
-        /// age first, then the remedy at the words' end) are one hover away.
         fn set_model(&self, model: Option<&crate::app_presence::NeedsPillModel>) {
             let ivars = self.ivars();
             let Some(model) = model else {
                 ivars.kind.set(None);
                 *ivars.words.borrow_mut() = None;
                 ivars.layout.set(None);
-                // SAFETY: plain main-thread setters on the live view;
-                // `-setToolTip:` takes nil to clear the tip.
+                // SAFETY: plain main-thread setters on the live view.
                 unsafe {
                     appkit::send_v_id(self.as_id(), sel!(setToolTip:), Id::NIL);
                     appkit::send_v_bool(self.as_id(), sel!(setHidden:), true);
@@ -1873,8 +1584,7 @@ mod macos {
                 words.more.as_deref().unwrap_or(""),
             ];
             let fields = ivars.fields.borrow();
-            // SAFETY: main-thread setters on the live retained labels; the
-            // colours are +0 and retained by `-setTextColor:`.
+            // SAFETY: main-thread setters on the live retained labels.
             unsafe {
                 let inks = [
                     ns_color(tone_of(model.kind)),
@@ -1899,9 +1609,6 @@ mod macos {
         }
 
         /// Lay the shown pill out in at most `max_w` points (its pads
-        /// included), its right edge at `right`, on the strip's measured
-        /// centre line: each label at its span of the engine's layout, the
-        /// pill framed around them. Returns its width, 0 when hidden.
         fn lay_out(&self, max_w: f64, right: f64, strip_h: f64, center_y: f64) -> f64 {
             let ivars = self.ivars();
             let words = ivars.words.borrow();
@@ -1909,7 +1616,6 @@ mod macos {
                 return 0.0;
             };
             let fields = ivars.fields.borrow();
-            // Each piece's natural width, measured by its own label.
             // SAFETY: `-fittingSize` is a side-effect-free `-(NSSize)` getter.
             let natural: Vec<f64> = fields
                 .iter()
@@ -1923,17 +1629,11 @@ mod macos {
                 words.act.map_or("", |a| a.word()),
                 words.more.as_deref().unwrap_or(""),
             ];
-            // The words' room (`PillWords::room`, their age at its unit's
-            // widest figure), measured by the words' own label holding it for
-            // the measure: what their span is sized by, so the age ticks
-            // inside a span that holds still.
             let room_w = if words.room == words.words {
                 natural.get(2).copied().unwrap_or(0.0)
             } else {
                 fields.get(2).map_or(0.0, |field| {
-                    // SAFETY: main-thread setters and a side-effect-free
-                    // `-fittingSize` getter on the live retained label; its
-                    // text is put back before the frame is drawn.
+                    // SAFETY: main-thread setters and a side-effect-free `-fittingSize` getter on the live retained label; its text is put back before the frame is drawn.
                     unsafe {
                         let set = |text: &str| {
                             if let Some(ns) = appkit::nsstring(text) {
@@ -1968,8 +1668,7 @@ mod macos {
             ];
             let field_h = 16.0;
             let y = center_y - field_h * 0.5;
-            // SAFETY: main-thread geometry setters on the live retained view
-            // and labels.
+            // SAFETY: main-thread geometry setters on the live retained view and labels.
             unsafe {
                 appkit::send_v_rect(
                     self.as_id(),
@@ -1994,8 +1693,6 @@ mod macos {
     }
 
     /// Carry the window's pill model onto its view: built on the first lit
-    /// pill, hidden with none. Its geometry is [`place_pill`]'s, in
-    /// [`plan_strip`].
     fn sync_pill(
         handle: &ToolbarHandle,
         mtm: MainThread,
@@ -2020,21 +1717,13 @@ mod macos {
     }
 
     /// Lay the window's pill out at `slot` (its share of the band, its right
-    /// edge there): its width (0 with none shown).
     fn place_pill(handle: &ToolbarHandle, slot: PillSlot) -> f64 {
         handle.pill.borrow().as_ref().map_or(0.0, |pill| {
             pill.lay_out(slot.share, slot.right, slot.strip_h, slot.center_y)
         })
     }
 
-    /// A PILL-ONLY PUSH: carry `pill` onto the window's pill view and lay it
-    /// out again where the last strip plan put it, touching no tab chip —
-    /// what the pill's age tick asks for (`Desk::push_pill`), since an age
-    /// moves nothing else. `true` when that held: the pill keeps the width
-    /// the tabs gave it (its room did not move, `PillWords::room`). `false`
-    /// when the strip must be planned again — no plan yet, the pill lit or
-    /// unlit, or its width moved (its age's unit did) — which the caller
-    /// does with a whole strip push ([`set_window_tabs`]).
+    /// Update the window's [`NeedsPill`] and re-layout if its width changed.
     pub(crate) fn set_window_pill(
         handle: &ToolbarHandle,
         pill: Option<&crate::app_presence::NeedsPillModel>,
@@ -2053,26 +1742,18 @@ mod macos {
         place_pill(handle, slot) == was
     }
 
-    // ---- View plumbing shared by `ChromeButton` and `TabView` ----
-    //
-    // Each `view` is a declared view's own `as_id()`, messaged on the main thread.
-
     /// Request a repaint of the whole view (after a hover / press / state change).
     fn mark_dirty(view: Id) {
         // SAFETY: side-effect-free invalidation request on the live view, main thread.
         unsafe { appkit::send_v_bool(view, sel!(setNeedsDisplay:), true) };
     }
 
-    /// Opt `view` into accessibility as one enabled element of `role`. `None` only
-    /// when the role string cannot be made.
-    ///
+    /// Configure `view` as an enabled accessibility element with `role`.
     /// # Safety
-    /// `view` must be a live `NSView`, on the main thread.
+    /// `view` must be a live `NSView` on the main thread.
     unsafe fn make_accessibility_element(view: Id, role: &str) -> Option<()> {
         let role = appkit::nsstring(role)?;
-        // SAFETY: NSView implements the NSAccessibility setters on every supported
-        // macOS version; `-setAccessibilityElement:`/`-setAccessibilityEnabled:` are
-        // `-(void)(BOOL)` and `-setAccessibilityRole:` is `-(void)(NSString *)`.
+        // SAFETY: NSView implements the NSAccessibility setters on every supported macOS version.
         unsafe {
             appkit::send_v_bool(view, sel!(setAccessibilityElement:), true);
             appkit::send_v_id(view, sel!(setAccessibilityRole:), role.id());
@@ -2082,10 +1763,8 @@ mod macos {
     }
 
     /// The whole `updateTrackingAreas` override: `[super updateTrackingAreas]`, then
-    /// swap in a fresh hover area so hover detection follows a geometry change.
     fn update_tracking_areas(sup: aterm_objc::ObjcSuper, tracking: &RefCell<Option<Obj>>) {
-        // SAFETY: `[super updateTrackingAreas]` is `-(void)`; `super_receiver()` pairs
-        // the instance with the declaring class, so lookup starts at `NSView`.
+        // SAFETY: `[super updateTrackingAreas]` is `-(void)`.
         unsafe {
             let f: unsafe extern "C-unwind" fn(*const aterm_objc::ObjcSuper, aterm_objc::Sel) =
                 aterm_objc::msg_super();
@@ -2095,12 +1774,8 @@ mod macos {
     }
 
     /// (Re)install a `mouseEnteredAndExited` tracking area covering the whole view (it
-    /// follows resizes via `InVisibleRect`), removing the prior one `tracking` holds.
     fn install_tracking_area(view: Id, tracking: &RefCell<Option<Obj>>) {
-        // SAFETY: main-thread AppKit calls: `-removeTrackingArea:`/`-addTrackingArea:`
-        // are `-(void)(id)`; `-initWithRect:options:owner:userInfo:` consumes the +1
-        // from `+alloc`, which `Obj::from_owned` adopts. AppKit holds the area's
-        // owner weakly, so the ivar retains the area.
+        // SAFETY: main-thread AppKit calls: `-removeTrackingArea:`/`-addTrackingArea:` are `-(void)(id)`; `-initWithRect:options:owner:userInfo:` consumes the +1 from `+alloc`, which `Obj::from_owned` adopts. AppKit holds the area's owner weakly, so the ivar retains the area.
         unsafe {
             if let Some(old) = tracking.borrow_mut().take() {
                 appkit::send_v_id(view, sel!(removeTrackingArea:), old.id());
@@ -2120,159 +1795,98 @@ mod macos {
         }
     }
 
-    /// `event`'s cursor in `view`'s coordinates (`-locationInWindow`, then
-    /// `-convertPoint:fromView:` from window space).
-    ///
+    /// Convert `event`'s window location into `view`'s coordinate space.
     /// # Safety
-    /// `event` must be the live `NSEvent` AppKit passed to a responder method of
-    /// `view`, which is never nil.
+    /// `view` and `event` must be live AppKit objects on the main thread.
     unsafe fn point_in_view(view: Id, event: Id) -> CGPoint {
-        // SAFETY: `-locationInWindow` is a side-effect-free `-(NSPoint)`; a nil
-        // source view to `-convertPoint:fromView:` means window coordinates.
+        // SAFETY: `-locationInWindow` is a side-effect-free `-(NSPoint)`.
         unsafe {
             let win_pt = appkit::send_point(event, sel!(locationInWindow));
             appkit::send_point_point_id(view, sel!(convertPoint:fromView:), win_pt, Id::NIL)
         }
     }
 
-    /// The mutable per-tab state a [`TabView`] reads at click/draw time. Interior
-    /// mutability because AppKit messages the view through `&self`, and
-    /// `set_window_tabs` flips the active flag in place on a tab switch.
+    /// Per-tab state for [`TabView`].
     pub(crate) struct TabIvars {
         /// The `Wake` channel clicks and drags relay through.
         proxy: EventLoopProxy<Wake>,
         /// The window this tab belongs to, so a relayed `Wake` addresses the right
-        /// window (a click on a non-frontmost window's strip acts on that window).
         window: WindowId,
         /// This tab's 0-based index for the select/close/move relays, set at build.
-        /// The context-menu relay uses `tab_id` instead, since a mid-menu reorder
-        /// would misdirect a positional action.
         index: Cell<usize>,
         /// This tab's stable [`crate::tab_model::TabId`]. The diff path re-stamps it
-        /// per position after a reorder; `TabView::show_context_menu` snapshots it
-        /// into `menu_tab`. Ids are never reused, so a stale one can only miss.
         tab_id: Cell<TabId>,
         /// The identity captured when the context menu popped, which
-        /// `tabMenuAction:` posts. A strip refresh during menu tracking can re-stamp
-        /// `tab_id`, so reading it at click time could target the wrong tab. `None`
-        /// only before the first pop.
         menu_tab: Cell<Option<TabId>>,
         /// Total tab count at build time, so a drag can clamp the destination index.
         count: Cell<usize>,
         /// Whether this is the active tab: drives the accent in `drawRect:`.
         active: Cell<bool>,
         /// The canonical icon/status/close facts, pushed whole by `set_metadata`:
-        /// `icon` (`None` paints no icon); status marks `dirty` (accent dot), `busy`
-        /// (hollow ring), the `attention` level (orange diamond hollow to wait, filled
-        /// at a stop, violet dot for a story) and `conn` (design §4: ▲ outbound,
-        /// ▽ inbound, hourglass both); `closable` (a non-closable tab keeps the close
-        /// geometry but never reveals or dispatches it).
         metadata: Cell<TabStripMetadata>,
         /// Whether the pointer is inside this tab, which reveals its ×. Toggled by
-        /// the tracking-area enter/exit.
         hovered: Cell<bool>,
         /// The mouse-down location in the tab's own coordinates, kept so `mouseDragged:`
-        /// can measure horizontal travel and decide a reorder direction.
         press_x: Cell<f64>,
         /// Whether the current gesture has already fired a reorder: at most one
-        /// `Move` per press, so a long drag does not stutter through swaps.
         dragged: Cell<bool>,
         /// Solo mode: this is the window's only tab, drawn as the window title (no
-        /// pill, keyline or ✕; description beside the title). Only a rebuild flips it.
         solo: Cell<bool>,
         /// The strip's measured content centre line in this view's coordinates; every
-        /// vertical slot derives from it.
         center_y: Cell<f64>,
         /// Solo mode: the horizontal centre the title group aligns to (the window's
-        /// centre, not the band's), in view coordinates.
         solo_center_x: Cell<f64>,
         /// Draw the leading-edge divider ([`TabGeometry::separates`]), which tells
-        /// the eye that equal full-width titles are separate tabs.
         separator: Cell<bool>,
         /// Whether the geometry reserves a close slot
-        /// ([`crate::tab_bar::NativeTabContentLayout::close_available`]), cached by
-        /// `TabView::relayout` so a hover reveal is a single `setHidden:`.
         close_available: Cell<bool>,
         /// Where `TabView::paint_identity` draws the app icon and status canvas, set
-        /// by `TabView::relayout`. `None` means no room or no facts; the facts stay
-        /// in the tooltip, context menu and accessibility.
         icon_rect: Cell<Option<[f64; 4]>>,
         status_rect: Cell<Option<[f64; 4]>>,
         /// The retained close `NSButton` and title `NSTextField`, so the view can
-        /// show/hide the × on hover and so the handle keeps them alive.
         close_btn: RefCell<Option<Obj>>,
         label: RefCell<Option<Obj>>,
         /// Solo mode: the description `NSTextField` beside the title (hidden when
-        /// tabbed), showing [`crate::tab_bar::solo_subtitle`] of the session chrome.
         desc_label: RefCell<Option<Obj>>,
         /// The retained tracking area, so `updateTrackingAreas` can swap it on a frame
-        /// change without leaking the old one.
         tracking: RefCell<Option<Obj>>,
         /// Canonical undecorated tab title for accessibility and introspection.
         title: RefCell<String>,
         /// The tab's hover: the strip's own tooltip vector (`App::tab_tooltips`, the
-        /// composed session chrome plus its presence lines: the need, who drives it,
-        /// its agent's state, who last typed into it), set by [`Self::set_context`]
-        /// and at build. Also the change gate, so a steady refresh never touches
-        /// AppKit; the on-glass tooltip is composed by `sync_semantics`.
         tooltip: RefCell<Option<String>>,
         /// The composed context-menu model (`session_chrome::compose_tab_menu`),
-        /// rendered as an `NSMenu` per pop and read back by [`read_tab_menus`] for the
-        /// `chrome` mirror. Stored as the model so no stale menu outlives its facts.
         menu_entries: RefCell<Vec<TabMenuEntry>>,
         /// The connection rows of the open menu's pop-time snapshot, in order; a
-        /// `tabMenuConnection:` click decodes its `tag` as an index into this. A
-        /// refresh during tracking may rewrite `menu_entries`, so the click must decode
-        /// against the snapshot.
         menu_conn: RefCell<Vec<(aterm_session::SessionId, ConnVerb)>>,
         /// The agent-upgrade rows of the same pop-time snapshot (session, build, word);
-        /// a `tabMenuUpgrade:` click decodes its `tag` against it. The harness refuses
-        /// an upgrade that has moved on.
         menu_upgrade: RefCell<Vec<(String, String, aterm_messages::UpgradeWord)>>,
     }
 
     aterm_objc::declare_class! {
-        /// One tab's view: a custom `NSView` that draws its (in)active background and
-        /// accent, hosts the title label and close ×, reveals the × on hover, and turns
-        /// mouse-down/drag into select/reorder `Wake`s. Rebuilt per tab on each
-        /// [`set_window_tabs`].
-        ///
-        /// Declared on `NSView` with [`aterm_objc::declare_class!`], which checks every
-        /// `@sel(…)` against its Rust argument count at compile time.
+        /// Custom `NSView` rendering a single tab chip or solo window title.
         pub(crate) struct TabView: NSView {
             const NAME: &str = "ATermTabView";
             type Ivars = TabIvars;
             protocols: [NSObject];
             /// Paint the tab background: the active tab is an inset rounded pill with
-            /// a border, accent keyline and semibold label; an inactive tab is flat;
-            /// a hovered inactive tab gets a fainter pill.
             @sel(drawRect:)
             fn drawRect(&self, _dirty: CGRect) {
-                // SAFETY: `-bounds` is a side-effect-free `-(NSRect)` getter on
-                // this live view, inside AppKit's own draw cycle.
+                // SAFETY: `-bounds` is a side-effect-free `-(NSRect)` getter on this live view, inside AppKit's own draw cycle.
                 let bounds = unsafe { appkit::send_rect(self.as_id(), sel!(bounds)) };
                 let ivars = self.ivars();
                 if ivars.solo.get() {
-                    // Solo: the only tab is the window title, so no pill, keyline or
-                    // selected surface.
                     self.paint_identity();
                     return;
                 }
-                // Inset from the cell and centred on the measured content line.
                 let pill = rect(
                     bounds.origin.x + TAB_PILL_INSET_X,
                     ivars.center_y.get() - TAB_PILL_HEIGHT * 0.5,
                     (bounds.size.width - 2.0 * TAB_PILL_INSET_X).max(0.0),
                     TAB_PILL_HEIGHT,
                 );
-                // SAFETY: AppKit drawing primitives on the main thread inside a draw
-                // cycle; colors are autoreleased (+0) and used in this frame; none raise.
+                // SAFETY: AppKit drawing primitives on the main thread inside a draw cycle.
                 unsafe {
                     if ivars.active.get() {
-                        // Active tab: selected surface, border and accent keyline, in
-                        // colours resolved through the appearance `set_strip_dark` pins.
-                        // A user `active_tab_color` override replaces the surface; the
-                        // label ink follows its luminance (`active_label_color`).
                         let panel = match active_tab_color_override() {
                             Some([r, g, b]) => srgb(
                                 f64::from(r) / 255.0,
@@ -2301,14 +1915,9 @@ mod macos {
                         appkit::send_v(strip_accent_color(), sel!(set));
                         appkit::send_v(rounded_rect(keyline, 1.0), sel!(fill));
                     } else if ivars.hovered.get() {
-                        // Inactive but hovered: a fainter rounded pill so the hover target
-                        // reads (and the revealed × has a backing).
                         appkit::send_v(with_alpha(ns_color(sel!(labelColor)), 0.07), sel!(set));
                         appkit::send_v(rounded_rect(pill, TAB_PILL_RADIUS), sel!(fill));
                     } else if ivars.separator.get() {
-                        // Flat, with a short leading hairline so equal-width titles
-                        // still read as tabs. Suppressed next to the selected pill and
-                        // while hovered, which draw their own edge.
                         appkit::send_v(ns_color(sel!(separatorColor)), sel!(set));
                         let rule = rect(
                             bounds.origin.x,
@@ -2326,8 +1935,6 @@ mod macos {
                         );
                     }
                 }
-                // The tab's load meter (design §12.4): a capsule 2.5 pt above
-                // the pill's bottom, clear of the selected chip's keyline.
                 if let Some(len) = crate::tab_bar::chip_load_len_pt(
                     pill.size.width as f32,
                     ivars.metadata.get().load,
@@ -2339,8 +1946,7 @@ mod macos {
                         f64::from(len),
                         h,
                     );
-                    // SAFETY: AppKit drawing primitives on the main thread inside
-                    // this draw cycle; the colour is +0 and used in this frame.
+                    // SAFETY: AppKit drawing primitives on the main thread inside this draw cycle.
                     unsafe {
                         appkit::send_v(strip_load_color(ivars.active.get()), sel!(set));
                         appkit::send_v(rounded_rect(bar, h * 0.5), sel!(fill));
@@ -2350,15 +1956,9 @@ mod macos {
             }
 
             /// A click on the tab (outside the close button), its status marks
-            /// included, posts `Wake::SelectTab { window, index }` and seeds the
-            /// drag gesture: a press on a background tab's `◆` takes the person
-            /// there (`docs/DESIGN-owner-surfaces-2026-10-16.md` §5). A
-            /// ctrl-click is a synthesized right-click: checked first, it pops the
-            /// context menu instead.
             @sel(mouseDown:)
             fn mouseDown(&self, event: Id) {
-                // SAFETY: `-modifierFlags` is a side-effect-free `NSUInteger` getter on
-                // the live event, on the main thread.
+                // SAFETY: `-modifierFlags` is a side-effect-free `NSUInteger` getter on the live event, on the main thread.
                 let ctrl = unsafe { appkit::send_usize(event, sel!(modifierFlags)) }
                     & consts::NS_EVENT_MODIFIER_FLAG_CONTROL
                     != 0;
@@ -2366,28 +1966,18 @@ mod macos {
                     self.show_context_menu(event);
                     return;
                 }
-                // A double-click (AppKit applied the system interval and slop)
-                // renames the tab's focused session in place; the first press
-                // already selected. Latching `dragged` stops a wobble from posting
-                // a reorder under the opening editor. `== 2` because later clicks
-                // land on the field.
-                // SAFETY: `clickCount` is a side-effect-free getter on the live
-                // event, on the main thread.
+                // SAFETY: `clickCount` is a side-effect-free getter on the live event, on the main thread.
                 if unsafe { appkit::send_isize(event, sel!(clickCount)) } == 2 {
                     let ivars = self.ivars();
                     ivars.dragged.set(true);
                     let _ = ivars.proxy.send_event(Wake::BeginSessionRename {
                         window: ivars.window,
-                        // Captured now: an editor lives for seconds, and the diff
-                        // path re-stamps this chip's live id per position.
                         tab: ivars.tab_id.get(),
                     });
                     return;
                 }
-                // The press seed: where the drag gesture starts.
                 let ivars = self.ivars();
-                // SAFETY: `event` is the live event AppKit passed; a nil source view
-                // means window coordinates.
+                // SAFETY: `event` is the live event AppKit passed.
                 let p = unsafe { point_in_view(self.as_id(), event) };
                 ivars.press_x.set(p.x);
                 ivars.dragged.set(false);
@@ -2398,21 +1988,18 @@ mod macos {
             }
 
             /// Right-click pops the session context menu at the pointer (composed by
-            /// `session_chrome::compose_tab_menu`). Does not select the tab, so
-            /// inspecting a background session leaves the foreground alone.
             @sel(rightMouseDown:)
             fn rightMouseDown(&self, event: Id) {
                 self.show_context_menu(event);
             }
 
             /// A horizontal drag past one tab width posts
-            /// `Wake::TabCmd { Move { from, to } }` once per press (the `dragged`
-            /// latch), reusing `App::move_tab`. The reply channel is discarded.
             @sel(mouseDragged:)
             fn mouseDragged(&self, event: Id) {
                 let ivars = self.ivars();
                 if ivars.dragged.get() {
-                    return; // already fired this gesture
+                    // already fired this gesture
+                    return;
                 }
                 // SAFETY: side-effect-free geometry getters, main thread.
                 let (p, width) = unsafe {
@@ -2425,7 +2012,6 @@ mod macos {
                     )
                 };
                 let dx = p.x - ivars.press_x.get();
-                // Require crossing roughly half a tab to commit a single-step reorder.
                 if dx.abs() < width * 0.5 {
                     return;
                 }
@@ -2443,20 +2029,16 @@ mod macos {
                 let (tx, _rx) = std::sync::mpsc::channel();
                 let _ = ivars.proxy.send_event(Wake::TabCmd {
                     action: TabAction::Move { from, to },
-                    // A drag is the human's gesture (and a move retires nothing).
                     by: crate::session_store::ExitActor::Human,
                     reply: tx,
                 });
             }
 
             /// Every press commits on `mouseDown:` (select, rename, the marks' menu)
-            /// or in `mouseDragged:` (a reorder), so the release does nothing; it is
-            /// still this view's, never forwarded up the responder chain.
             @sel(mouseUp:)
             fn mouseUp(&self, _event: Id) {}
 
             /// Pointer entered the tab: reveal the ✕ (hover-only on every tab, the
-            /// selected one included) and repaint the faint hover highlight.
             @sel(mouseEntered:)
             fn mouseEntered(&self, _event: Id) {
                 self.ivars().hovered.set(true);
@@ -2473,14 +2055,12 @@ mod macos {
             }
 
             /// Rebuild the tracking area whenever the view's geometry changes, so hover
-            /// detection follows a resize. Removes the previous area first (no leak).
             @sel(updateTrackingAreas)
             fn updateTrackingAreas(&self) {
                 update_tracking_areas(self.super_receiver(), &self.ivars().tracking);
             }
 
             /// Accept the first click in a non-key window, so one click raises the
-            /// window and selects the tab. Not contained: the body is send-free.
             @sel(acceptsFirstMouse:) @abort_on_exception
             fn acceptsFirstMouse(&self, _event: Id) -> aterm_objc::Bool {
                 aterm_objc::Bool::YES
@@ -2498,7 +2078,6 @@ mod macos {
             }
 
             /// The close × action: posts `Wake::CloseTab { window, index }`, handled by
-            /// `App::close_tab_at`.
             @sel(closeTab:)
             fn close_tab(&self, _sender: Id) {
                 let ivars = self.ivars();
@@ -2512,24 +2091,16 @@ mod macos {
             }
 
             /// The action of every live context-menu item. The item's `tag` decodes to
-            /// a [`MenuAction`] (undecodable is inert), posted as
-            /// `Wake::TabMenuAction` with the pop-time `menu_tab` identity (not the
-            /// positional index or live `tab_id`, which a refresh can re-label). The
-            /// dispatcher no-ops if that tab is gone.
             @sel(tabMenuAction:)
             fn tab_menu_action(&self, sender: Id) {
                 if sender.is_null() {
                     return;
                 }
-                // SAFETY: `sender` is the live NSMenuItem AppKit passed as the
-                // action sender; `-tag` is `-(NSInteger)`, side-effect free.
+                // SAFETY: `sender` is the live NSMenuItem AppKit passed as the action sender.
                 let tag = unsafe { appkit::send_isize(sender, sel!(tag)) };
                 if let Some(action) = MenuAction::from_tag(tag) {
                     let ivars = self.ivars();
-                    // Unreachable from a real click (`show_context_menu` stamps the
-                    // capture first); drop rather than guess.
                     let Some(tab) = ivars.menu_tab.get() else { return };
-                    // A closed loop (app shutting down) drops the event.
                     let _ = ivars.proxy.send_event(Wake::TabMenuAction {
                         window: ivars.window,
                         tab,
@@ -2539,21 +2110,17 @@ mod macos {
             }
 
             /// The action of every per-peer connection row. The item's `tag` indexes the
-            /// pop-time `menu_conn` snapshot (the act needs a peer argument no
-            /// `MenuAction` tag can carry). An out-of-range tag is inert.
             @sel(tabMenuConnection:)
             fn tab_menu_connection(&self, sender: Id) {
                 if sender.is_null() {
                     return;
                 }
-                // SAFETY: `sender` is the live NSMenuItem AppKit passed as the
-                // action sender; `-tag` is `-(NSInteger)`, side-effect free.
+                // SAFETY: `sender` is the live NSMenuItem AppKit passed as the action sender.
                 let tag = unsafe { appkit::send_isize(sender, sel!(tag)) };
                 let ivars = self.ivars();
                 let Ok(i) = usize::try_from(tag) else { return };
                 let row = ivars.menu_conn.borrow().get(i).cloned();
                 let Some((peer_sid, verb)) = row else { return };
-                // `None` cannot happen from a real click (see `tabMenuAction:`).
                 let Some(tab) = ivars.menu_tab.get() else { return };
                 let _ = ivars.proxy.send_event(Wake::TabMenuConnection {
                     window: ivars.window,
@@ -2564,20 +2131,17 @@ mod macos {
             }
 
             /// The action of every agent-upgrade row. The item's `tag` indexes the
-            /// pop-time `menu_upgrade` snapshot. An out-of-range tag is inert.
             @sel(tabMenuUpgrade:)
             fn tab_menu_upgrade(&self, sender: Id) {
                 if sender.is_null() {
                     return;
                 }
-                // SAFETY: `sender` is the live NSMenuItem AppKit passed as the
-                // action sender; `-tag` is `-(NSInteger)`, side-effect free.
+                // SAFETY: `sender` is the live NSMenuItem AppKit passed as the action sender.
                 let tag = unsafe { appkit::send_isize(sender, sel!(tag)) };
                 let ivars = self.ivars();
                 let Ok(i) = usize::try_from(tag) else { return };
                 let row = ivars.menu_upgrade.borrow().get(i).cloned();
                 let Some((sid, to, word)) = row else { return };
-                // `None` cannot happen from a real click (see `tabMenuAction:`).
                 let Some(tab) = ivars.menu_tab.get() else { return };
                 let _ = ivars.proxy.send_event(Wake::TabMenuUpgrade {
                     window: ivars.window,
@@ -2592,17 +2156,12 @@ mod macos {
 
     impl TabView {
         /// Paint the shared icon IR and the dirty/busy/attention/connection status
-        /// shapes. The top-left 16×16 design box is flipped once for AppKit's upward y;
-        /// otherwise it matches the in-grid RawRgba8 raster.
         fn paint_identity(&self) {
             let ivars = self.ivars();
             let metadata = self.metadata();
-            // Geometry cached by `relayout`, so the ornaments agree with the laid-out
-            // text.
             let layout_icon = ivars.icon_rect.get();
             let layout_status = ivars.status_rect.get();
-            // SAFETY: all operations are standard AppKit drawing calls made from
-            // `drawRect:` on the main thread with an active graphics context.
+            // SAFETY: all operations are standard AppKit drawing calls made from `drawRect:` on the main thread with an active graphics context.
             unsafe {
                 let ink = if ivars.active.get() || ivars.solo.get() {
                     ns_color(sel!(labelColor))
@@ -2667,7 +2226,6 @@ mod macos {
                             }
                             TabIconPrimitive::Triangle { points } => {
                                 // No app icon uses a filled triangle yet; the IR walk
-                                // stays total.
                                 appkit::send_v(polygon(&points.map(at)), sel!(fill));
                             }
                         }
@@ -2676,7 +2234,6 @@ mod macos {
                 if let Some(status) = layout_status {
                     let count = metadata.status_count();
                     let mut ordinal = 0usize;
-                    // The in-grid rasterizer's four-mark shrink, folded into the scale.
                     let scale = status[2] / f64::from(TAB_ICON_DESIGN_SIZE)
                         * f64::from(tab_status_mark_scale(count));
                     for kind in TAB_STATUS_KINDS {
@@ -2702,17 +2259,11 @@ mod macos {
                             TabStatusKind::Attention => {
                                 let level = metadata.attention;
                                 if level == crate::tab_bar::ChipLevel::Done {
-                                    // A finished task not yet looked at: a quiet
-                                    // dot, no alarm hue.
                                     appkit::send_v(ns_color(sel!(secondaryLabelColor)), sel!(set));
                                     appkit::send_v(circle(x, y, 1.5 * scale), sel!(fill));
                                     continue;
                                 }
                                 if level == crate::tab_bar::ChipLevel::Note {
-                                    // The tab's own note (a failed command, a
-                                    // notice): a short dash in the label ink,
-                                    // never a need's hue, and never the done
-                                    // dot's shape (`tab_bar`'s twin).
                                     appkit::send_v(ink, sel!(set));
                                     let half = f64::from(crate::tab_bar::NOTE_DASH_HALF) * scale;
                                     let dash = bezier_path();
@@ -2736,8 +2287,6 @@ mod macos {
                                     continue;
                                 }
                                 if level == crate::tab_bar::ChipLevel::Yours {
-                                    // The person's hold: a hollow square in the
-                                    // label ink, the in-grid mark's twin.
                                     appkit::send_v(ink, sel!(set));
                                     let side = 4.4 * scale;
                                     let square = rounded_rect(
@@ -2748,8 +2297,6 @@ mod macos {
                                     appkit::send_v(square, sel!(stroke));
                                     continue;
                                 }
-                                // A stuck need in the stop hue, a decide need
-                                // in the wait hue: the border's two tones.
                                 let hue = if matches!(level, crate::tab_bar::ChipLevel::Stop(_)) {
                                     sel!(systemRedColor)
                                 } else {
@@ -2763,8 +2310,6 @@ mod macos {
                                     point(x, y - radius),
                                     point(x - radius, y),
                                 ]);
-                                // Hollow to wait, filled at a stop, as the in-grid
-                                // rasterizer draws it (`tab_bar::status_primitives`).
                                 if matches!(level, crate::tab_bar::ChipLevel::Stop(_)) {
                                     appkit::send_v(diamond, sel!(fill));
                                 } else {
@@ -2772,9 +2317,6 @@ mod macos {
                                     appkit::send_v(diamond, sel!(stroke));
                                 }
                             }
-                            // The connection mark (§4) in busy's muted ink, matching
-                            // `tab_bar::status_primitives` (y up, so the up-triangle
-                            // apex is y + height).
                             TabStatusKind::Connection => {
                                 if let Some(role) = metadata.conn {
                                     appkit::send_v(ink, sel!(set));
@@ -2790,8 +2332,6 @@ mod macos {
                                         }
                                         TabConnRole::Inbound => {
                                             let width = 1.15 * scale;
-                                            // Half-stroke inset: the outer ink
-                                            // silhouette matches outbound's fill.
                                             let (cw, ch) = (hw - width * 0.5, hh - width * 0.5);
                                             let arrow = polygon(&[
                                                 point(x - cw, y + ch),
@@ -2826,8 +2366,6 @@ mod macos {
         }
 
         /// Build a tab view for `index`/`count` showing `title`, relaying through
-        /// `proxy`/`window`. Creates the close ✕, title and solo description labels and
-        /// leaves all geometry to [`Self::relayout`].
         #[allow(
             clippy::too_many_arguments,
             reason = "tab state (id/index/count/text/active/metadata/ext) plus its render context (mtm/proxy/window/geometry); both are needed at construction and splitting them only relocates the list"
@@ -2876,11 +2414,7 @@ mod macos {
                 menu_conn: RefCell::new(Vec::new()),
                 menu_upgrade: RefCell::new(Vec::new()),
             };
-            // Two-step construction, as in `ChromeButton::build`.
-            // SAFETY: `alloc_ivars` returns a +1 instance owing exactly one
-            // designated initializer, which is the next send; `-initWithFrame:`
-            // is `-(id)(NSRect)` and consumes that +1, returning the
-            // initialised +1 `Retained::from_owned` adopts.
+            // SAFETY: `alloc_ivars` returns a +1 instance owing exactly one designated initializer, which is the next send; `-initWithFrame:` is `-(id)(NSRect)` and consumes that +1, returning the initialised +1 `Retained::from_owned` adopts.
             let this: Retained<Self> = unsafe {
                 let raw = Self::alloc_ivars(mtm, ivars);
                 if raw.is_null() {
@@ -2889,10 +2423,7 @@ mod macos {
                 Retained::from_owned(appkit::send_id_rect(raw, sel!(initWithFrame:), frame))?
             };
 
-            // The close ✕: a borderless factory-made button targeting `closeTab:`,
-            // born hidden (hover-only reveal, see `refresh_close_visibility`).
-            // SAFETY: `buttonWithTitle:target:action:` is the documented factory; plain
-            // setters follow on the fresh button; all on the main thread.
+            // SAFETY: `buttonWithTitle:target:action:` is the documented factory.
             let close = unsafe {
                 let btn = appkit::send_id_id_id_sel(
                     class(c"NSButton").as_id(),
@@ -2901,7 +2432,6 @@ mod macos {
                     this.as_id(),
                     sel!(closeTab:),
                 );
-                // The factory result is +0 (autoreleased), so retain it.
                 let btn = Obj::retain(btn)?;
                 appkit::send_v_bool(btn.id(), sel!(setBordered:), false);
                 appkit::send_v_usize(btn.id(), sel!(setImagePosition:), consts::NS_NO_IMAGE);
@@ -2916,12 +2446,8 @@ mod macos {
                 btn
             };
 
-            // The title label and the solo-only description: non-editable labels that
-            // pass the mouse through, so the chip stays one click target.
-            // SAFETY: `labelWithString:` is the documented non-raising factory; plain
-            // setters follow; on the main thread.
+            // SAFETY: `labelWithString:` is the documented non-raising factory.
             let (label, desc) = unsafe {
-                // `+labelWithString:` is a factory (+0), so both are retained.
                 let lbl = Obj::retain(appkit::send_id_id(
                     class(c"NSTextField").as_id(),
                     sel!(labelWithString:),
@@ -2937,7 +2463,6 @@ mod macos {
                     appkit::send_v_bool(field.id(), sel!(setBezeled:), false);
                     appkit::send_v_bool(field.id(), sel!(setEditable:), false);
                     appkit::send_v_bool(field.id(), sel!(setSelectable:), false);
-                    // Single line, ellipsised on overflow, so the row height is exact.
                     appkit::send_v_bool(field.id(), sel!(setUsesSingleLineMode:), true);
                     truncate_tail(field.id());
                 }
@@ -2950,10 +2475,7 @@ mod macos {
             *this.ivars().close_btn.borrow_mut() = Some(close);
             *this.ivars().label.borrow_mut() = Some(label);
             *this.ivars().desc_label.borrow_mut() = Some(desc);
-            // Invariant accessibility (a radio button identified by position), set
-            // once; `sync_semantics` keeps the rest live.
-            // SAFETY: `-setAccessibilityIdentifier:` is a plain `-(void)(NSString *)`
-            // main-thread metadata write on the fresh view.
+            // SAFETY: `-setAccessibilityIdentifier:` is a plain `-(void)(NSString *)` main-thread metadata write on the fresh view.
             unsafe {
                 let identifier = appkit::nsstring(&format!("aterm.tab.{index}"))?;
                 make_accessibility_element(this.as_id(), "AXRadioButton")?;
@@ -2963,8 +2485,6 @@ mod macos {
                     identifier.id(),
                 );
             }
-            // Session chrome (tooltip + context-menu model) — the same in-place
-            // applier the diff path uses, so build and diff share one seam.
             this.set_chrome_ext(ext);
             this.sync_close_semantics();
             this.relayout();
@@ -2974,8 +2494,6 @@ mod macos {
         }
 
         /// Place every sub-view and cache every ornament rect from the current bounds,
-        /// mode, metadata and centre line. Build and every in-place update route here,
-        /// so pixels and text agree and the solo/tabbed split lives in one place.
         fn relayout(&self) {
             let ivars = self.ivars();
             // SAFETY: `-bounds` is a side-effect-free `-(NSRect)` getter.
@@ -2998,8 +2516,7 @@ mod macos {
             ivars.icon_rect.set(content.icon);
             ivars.status_rect.set(content.status);
             let active = ivars.active.get();
-            // SAFETY: plain main-thread setters on our retained live sub-views; every
-            // rect comes from `native_tab_content_layout` (finite, non-negative).
+            // SAFETY: plain main-thread setters on our retained live sub-views.
             unsafe {
                 if let Some(btn) = ivars.close_btn.borrow().as_ref() {
                     appkit::send_v_rect(btn.id(), sel!(setFrame:), rect_of(content.close));
@@ -3008,8 +2525,6 @@ mod macos {
                     appkit::send_v_bool(desc.id(), sel!(setHidden:), true);
                 }
                 if let Some(lbl) = ivars.label.borrow().as_ref() {
-                    // Active: full label color (override-aware), semibold; inactive:
-                    // secondary and regular.
                     let color = if active {
                         active_label_color()
                     } else {
@@ -3037,8 +2552,6 @@ mod macos {
         }
 
         /// The rename editor's frame in container coordinates (the editor is a sibling
-        /// of the chips). Tabbed: the pill `drawRect:` fills. Solo: a capped box
-        /// centred on the solo title's centre.
         fn editor_frame(&self) -> CGRect {
             let ivars = self.ivars();
             // SAFETY: `-frame` is a side-effect-free `-(NSRect)` getter.
@@ -3060,10 +2573,6 @@ mod macos {
             )
         }
         /// Solo layout: `title` beside its description, centred as one group on the
-        /// window's centre, app icon leading and status canvas trailing. No pill or ✕
-        /// (the red traffic light closes the window). The group is measured
-        /// (`sizeToFit`) and compressed description-first, so a long cwd never pushes
-        /// the title off the strip.
         fn relayout_solo(&self, title: &str, bounds: CGRect, center_y: f64) {
             let ivars = self.ivars();
             let metadata = self.metadata();
@@ -3078,8 +2587,7 @@ mod macos {
                 0.0
             };
             ivars.close_available.set(false);
-            // SAFETY: plain main-thread AppKit setters/getters on our retained live
-            // sub-views; `sizeToFit` only resizes the label it is sent to.
+            // SAFETY: plain main-thread AppKit setters/getters on our retained live sub-views.
             let (title_w, desc_w) = unsafe {
                 if let Some(btn) = ivars.close_btn.borrow().as_ref() {
                     appkit::send_v_bool(btn.id(), sel!(setHidden:), true);
@@ -3127,8 +2635,6 @@ mod macos {
                 (title_w, desc_w)
             };
             let desc_gap = if desc_w > 0.0 { SOLO_GAP } else { 0.0 };
-            // Compress the description first: the title is the one string the band
-            // exists to show.
             let fixed = icon_w + status_w;
             let title_w = title_w.min((available - fixed).max(0.0));
             let desc_w = desc_w.min((available - fixed - title_w - desc_gap).max(0.0));
@@ -3164,8 +2670,6 @@ mod macos {
                 }
                 x += title_w;
                 if let Some(desc) = ivars.desc_label.borrow().as_ref() {
-                    // Hide a description that does not fit; a stale frame would paint
-                    // old text.
                     appkit::send_v_bool(desc.id(), sel!(setHidden:), desc_w <= 0.0);
                     if desc_w > 0.0 {
                         appkit::send_v_rect(
@@ -3182,8 +2686,6 @@ mod macos {
                 }
                 x += desc_gap + desc_w;
             }
-            // `status_w` included the leading gap; spend it here so the group stays
-            // centred.
             ivars.status_rect.set(metadata.has_status().then_some([
                 x + SOLO_GAP,
                 center_y - SOLO_STATUS_SIZE * 0.5,
@@ -3193,7 +2695,6 @@ mod macos {
         }
 
         /// Move this chip onto the measured content line / window centre and switch
-        /// between tabbed and solo. Relayouts only when something moved.
         fn set_geometry(&self, geometry: TabGeometry) {
             let ivars = self.ivars();
             let unchanged = ivars.solo.get() == geometry.solo
@@ -3211,9 +2712,6 @@ mod macos {
         }
 
         /// Update title and route/document context in place. The visible label keeps
-        /// the ⌘-hint only when it fits; hover, accessibility and introspection keep
-        /// the full strings. A leading busy spinner stays on its first phase until its
-        /// suffix or settled title changes.
         fn set_context(&self, title: &str, tooltip: Option<&str>) {
             let tooltip_changed = self.ivars().tooltip.borrow().as_deref() != tooltip;
             let title_changed = {
@@ -3231,8 +2729,6 @@ mod macos {
                 *self.ivars().title.borrow_mut() = title.to_string();
                 self.sync_close_semantics();
             }
-            // A solo band shows the description too, so a tooltip-only change still
-            // moves pixels there; a chip re-lays out only when its title changed.
             if title_changed || self.ivars().solo.get() {
                 self.relayout();
             }
@@ -3240,13 +2736,11 @@ mod macos {
         }
 
         /// Give the glyph-only close button an accessibility name; refreshed with the
-        /// tab context because the title follows live OSC titles.
         fn sync_close_semantics(&self) {
             let title = self.ivars().title.borrow();
             let label_text = tab_close_accessibility_label(&title);
             if let Some(btn) = self.ivars().close_btn.borrow().as_ref() {
-                // SAFETY: NSButton inherits the NSAccessibility setters; these are
-                // plain main-thread metadata updates on our retained live button.
+                // SAFETY: NSButton inherits the NSAccessibility setters.
                 unsafe {
                     if let (Some(label), Some(help)) = (
                         appkit::nsstring(&label_text),
@@ -3261,12 +2755,6 @@ mod macos {
         }
 
         /// Apply the composed per-tab chrome extension's context-menu model in place, on
-        /// both diff and build paths, for the next right-click or `read_tab_menus`.
-        /// Not its tooltip: the hover is the strip's tooltip vector, already applied
-        /// ([`Self::set_context`], or at build), which is `ext.tooltip` with the
-        /// presence lines after it. Writing `ext.tooltip` here, after it, put the bare
-        /// session chrome back, and no hover on the native strip ever showed a need,
-        /// a hold, an agent's state or who last typed into the tab.
         fn set_chrome_ext(&self, ext: &TabChromeExt) {
             let ivars = self.ivars();
             if *ivars.menu_entries.borrow() != ext.menu {
@@ -3275,34 +2763,20 @@ mod macos {
         }
 
         /// Re-stamp the stable tab id this chip displays; after a `move_tab` the id at
-        /// each position changes while views stay. Touches only `tab_id`; an open menu
-        /// keeps its pop-time `menu_tab`.
         fn set_tab_id(&self, id: TabId) {
             self.ivars().tab_id.set(id);
         }
 
         /// The stable tab id this chip displays. Read only where a gesture captures
-        /// identity at its start (menu pop, rename install), never to resolve a gesture
-        /// in flight, since the diff path re-stamps it per position.
         fn tab_id(&self) -> TabId {
             self.ivars().tab_id.get()
         }
 
         /// Build and pop this tab's context menu at the pointer from the stored model
-        /// (an empty model pops nothing). Built fresh per pop. Header and timeline rows
-        /// are disabled (tag 0, never dispatches); action rows carry the `MenuAction`
-        /// tag targeting `tabMenuAction:`. Auto-enabling is off because enabledness is
-        /// the composer's decision (e.g. `Copy CWD` greys without a cwd).
         fn show_context_menu(&self, event: Id) {
-            // The view consumes right/ctrl-click without a winit pointer event, so fence
-            // at open, before the nested menu loop; dismissal posts no wake.
             let _ = self.ivars().proxy.send_event(Wake::TabContextMenuOpening {
                 window: self.ivars().window,
             });
-            // Clone the model and drop the borrow before tracking: the nested run loop
-            // can deliver a strip refresh that `borrow_mut`s this cell. Its timeline
-            // rows are aged now, as the menu pops (`TabMenuEntry::shown_at`): the
-            // stored model carries their stamps, so no clock recomposes it.
             let entries = crate::session_chrome::menu_shown_at(
                 &self.ivars().menu_entries.borrow(),
                 crate::turn_ledger::now_ms(),
@@ -3310,11 +2784,7 @@ mod macos {
             if entries.is_empty() {
                 return;
             }
-            // Snapshot the stable identity at pop time; a refresh during tracking can
-            // re-stamp `tab_id`.
             self.ivars().menu_tab.set(Some(self.ivars().tab_id.get()));
-            // Same pop-time capture for connection rows; each item tag indexes this
-            // snapshot in the build loop's order.
             *self.ivars().menu_conn.borrow_mut() = entries
                 .iter()
                 .filter_map(|e| match e {
@@ -3325,7 +2795,6 @@ mod macos {
                 })
                 .collect();
             let mut conn_index: isize = 0;
-            // And for the agent-upgrade rows.
             *self.ivars().menu_upgrade.borrow_mut() = entries
                 .iter()
                 .filter_map(|e| match e {
@@ -3336,24 +2805,17 @@ mod macos {
                 })
                 .collect();
             let mut upgrade_index: isize = 0;
-            // SAFETY: `+[NSMenu new]` is `+(id)` and returns a +1 the `Obj`
-            // adopts; the menu is released when this frame ends, after the
-            // synchronous tracking session `popUpContextMenu:` runs.
+            // SAFETY: `+[NSMenu new]` is `+(id)` and returns a +1 the `Obj` adopts.
             let Some(menu) =
                 (unsafe { Obj::from_owned(appkit::send_id(class(c"NSMenu").as_id(), sel!(new))) })
             else {
                 return;
             };
-            // SAFETY: main-thread NSMenu/NSMenuItem construction and setters on fresh
-            // instances (the same non-raising calls `menu.rs` uses). Menu targets are
-            // weak: `handle.tabs` normally keeps this view alive through tracking, and
-            // if a rebuild drops it the zeroed target makes the click a no-op.
+            // SAFETY: main-thread NSMenu/NSMenuItem construction and setters on fresh instances (the same non-raising calls `menu.rs` uses). Menu targets are weak: `handle.tabs` normally keeps this view alive through tracking, and if a rebuild drops it the zeroed target makes the click a no-op.
             unsafe {
                 let Some(empty) = appkit::nsstring("") else {
                     return;
                 };
-                // `-initWithTitle:action:keyEquivalent:` consumes the +1 from `+alloc`;
-                // a NULL `SEL` is "no action", for informational rows.
                 let item_with = |title: &str, action: aterm_objc::Sel| -> Option<Obj> {
                     let ns = appkit::nsstring(title)?;
                     Obj::from_owned(appkit::send_id_id_sel_id(
@@ -3375,8 +2837,6 @@ mod macos {
                             appkit::send_v_id(menu.id(), sel!(addItem:), item.id());
                         }
                         TabMenuEntry::Separator => {
-                            // `+separatorItem` is a factory (+0); the menu retains
-                            // what it is handed.
                             appkit::send_v_id(
                                 menu.id(),
                                 sel!(addItem:),
@@ -3397,8 +2857,6 @@ mod macos {
                             appkit::send_v_id(menu.id(), sel!(addItem:), item.id());
                         }
                         TabMenuEntry::ConnectionAction { label, enabled, .. } => {
-                            // Tag indexes the `menu_conn` snapshot, in the same
-                            // filtered order.
                             let Some(item) = item_with(label, sel!(tabMenuConnection:)) else {
                                 continue;
                             };
@@ -3409,8 +2867,6 @@ mod macos {
                             appkit::send_v_id(menu.id(), sel!(addItem:), item.id());
                         }
                         TabMenuEntry::Upgrade { label, .. } => {
-                            // Tag indexes the `menu_upgrade` snapshot, in the same
-                            // filtered order.
                             let Some(item) = item_with(label, sel!(tabMenuUpgrade:)) else {
                                 continue;
                             };
@@ -3422,9 +2878,6 @@ mod macos {
                         }
                     }
                 }
-                // Pops synchronously and runs the nested tracking session; the popped
-                // menu keeps the snapshot it opened with even if a refresh rewrites
-                // the model.
                 appkit::send_v_id_id_id(
                     class(c"NSMenu").as_id(),
                     sel!(popUpContextMenu:withEvent:forView:),
@@ -3445,14 +2898,11 @@ mod macos {
         }
 
         /// Diff icon/status/close metadata in place. Geometry changes only when an
-        /// icon or status appears or disappears; title changes and dirty saves never
-        /// rebuild the view.
         fn set_metadata(&self, metadata: TabStripMetadata) {
             let old = self.ivars().metadata.replace(metadata);
             if old == metadata {
                 return;
             }
-            // Only the load meter moved: it takes no slot, so a repaint.
             let old_with_new_load = TabStripMetadata {
                 load: metadata.load,
                 ..old
@@ -3461,26 +2911,18 @@ mod macos {
                 mark_dirty(self.as_id());
                 return;
             }
-            // Ornament slots (and the whole solo group) move when an icon or status
-            // appears or disappears.
             self.relayout();
             self.sync_semantics();
         }
 
         /// Take a new load step (design §12.4): a repaint when it, or the
-        /// meters' inks under a lit meter, moved; never a relayout, since the
-        /// meter takes no slot.
         fn set_load(&self, load: u8, inks_moved: bool) {
             let ivars = self.ivars();
             let mut metadata = ivars.metadata.get();
             let old = metadata.load;
             metadata.load = load;
             ivars.metadata.set(metadata);
-            // The pill `drawRect:` draws the meter in, and the meter's length
-            // there in whole points: a step that moves no point repaints
-            // nothing (a busy tab's step moves on almost every reading).
-            // SAFETY: `-bounds` is a side-effect-free `-(NSRect)` getter on
-            // this live view, on the main thread.
+            // SAFETY: `-bounds` is a side-effect-free `-(NSRect)` getter on this live view, on the main thread.
             let bounds = unsafe { appkit::send_rect(self.as_id(), sel!(bounds)) };
             let pill_w = ((bounds.size.width - 2.0 * TAB_PILL_INSET_X).max(0.0)) as f32;
             let moved = crate::tab_bar::chip_load_len_pt(pill_w, old)
@@ -3492,8 +2934,6 @@ mod macos {
         }
 
         /// Re-resolve this tab's label ink against the current selected-tab color
-        /// override (the repaint half of [`set_active_tab_color`]). A solo band keeps
-        /// the primary label ink.
         fn refresh_label_ink(&self) {
             let ivars = self.ivars();
             if ivars.solo.get() {
@@ -3513,7 +2953,6 @@ mod macos {
         }
 
         /// Flip the active flag in place (the diff path): recolour and re-weight the
-        /// label and repaint the accent pill. No-op when unchanged.
         fn set_active(&self, active: bool) {
             if self.ivars().active.get() == active {
                 return;
@@ -3524,16 +2963,13 @@ mod macos {
         }
 
         /// Sync hover text and accessibility from the tab presentation. Every
-        /// context/state/selection diff path calls it so VoiceOver never lags the
-        /// pixels. The invariant parts are set once by [`Self::build`].
         fn sync_semantics(&self) {
             let ivars = self.ivars();
             let metadata = self.metadata();
             let title = ivars.title.borrow();
             let tooltip = ivars.tooltip.borrow();
             let help = tab_help(&title, tooltip.as_deref(), metadata, ivars.index.get());
-            // SAFETY: NSView implements the NSAccessibility setters on every supported
-            // macOS version. Raw messages avoid depending on the `a11y-appkit` feature.
+            // SAFETY: NSView implements the NSAccessibility setters on every supported macOS version.
             unsafe {
                 let v = self.as_id();
                 let (Some(label), Some(help)) = (appkit::nsstring(&title), appkit::nsstring(&help))
@@ -3548,11 +2984,6 @@ mod macos {
         }
 
         /// Show the close ✕ only while the pointer is inside this chip, the selected
-        /// tab included (a permanent ✕ there invites mis-clicks).
-        ///
-        /// [`native_tab_content_layout`] reserves the slot either way, so the reveal
-        /// never reflows the title. Compact chips reserve none; a solo band has no ✕.
-        /// Close Tab stays available from the context menu, File menu and ⌘W.
         fn refresh_close_visibility(&self) {
             let ivars = self.ivars();
             let show = ivars.close_available.get()
@@ -3560,8 +2991,7 @@ mod macos {
                 && ivars.metadata.get().closable
                 && ivars.hovered.get();
             if let Some(btn) = ivars.close_btn.borrow().as_ref() {
-                // SAFETY: `-setHidden:` is a `-(void)(BOOL)` setter on the live
-                // retained button, on the main thread.
+                // SAFETY: `-setHidden:` is a `-(void)(BOOL)` setter on the live retained button, on the main thread.
                 unsafe { appkit::send_v_bool(btn.id(), sel!(setHidden:), !show) };
             }
         }
@@ -3588,22 +3018,13 @@ mod macos {
     /// The toolbar item identifier for the full-width tab-strip custom view.
     const STRIP_ITEM_ID: &str = "aterm.tabstrip";
 
-    /// The delegate's ivars: the retained strip container view (the toolbar item's
-    /// custom view).
+    /// Instance variables for [`ToolbarDelegate`].
     pub(crate) struct DelegateIvars {
         container: Obj,
     }
 
     aterm_objc::declare_class! {
-        /// The `NSToolbarDelegate`: vends the single item identifier and builds the
-        /// `NSToolbarItem` whose custom view is the full-width strip container.
-        ///
-        /// Declared with [`aterm_objc::declare_class!`]; registers the three-argument
-        /// `toolbar:itemForItemIdentifier:willBeInsertedIntoToolbar:` as `"@@:@@B"`
-        /// (`"@@:@@c"` on x86_64), which a test reads back from the runtime. The
-        /// object-returning methods return +0 (explicit `autorelease` or an
-        /// autoreleased `+arrayWith…`). Main-thread-only via [`aterm_objc::Retained`]'s
-        /// `!Send` and [`aterm_objc::MainThread`].
+        /// `NSToolbarDelegate` vending the single tab-strip custom-view item.
         pub(crate) struct ToolbarDelegate: NSObject {
             const NAME: &str = "ATermToolbarDelegate";
             type Ivars = DelegateIvars;
@@ -3622,7 +3043,6 @@ mod macos {
             }
 
             /// Build the `NSToolbarItem` for the strip identifier, with the retained
-            /// container as its view. Any other identifier yields nil.
             @sel(toolbar:itemForItemIdentifier:willBeInsertedIntoToolbar:)
             fn item_for_identifier(
                 &self,
@@ -3636,19 +3056,14 @@ mod macos {
                 let Some(strip_id) = appkit::nsstring(STRIP_ITEM_ID) else {
                     return Id::NIL;
                 };
-                // SAFETY: `identifier` is the live NSString AppKit passed and
-                // `-isEqualToString:` is a side-effect-free `-(BOOL)(NSString *)`
-                // comparison.
+                // SAFETY: `identifier` is the live NSString AppKit passed and `-isEqualToString:` is a side-effect-free `-(BOOL)(NSString *)` comparison.
                 if !unsafe {
                     appkit::send_bool_id(identifier, sel!(isEqualToString:), strip_id.id())
                 } {
                     return Id::NIL;
                 }
                 let ivars = self.ivars();
-                // SAFETY: NSToolbarItem construction and plain setters on a fresh
-                // instance, on the main thread. `-initWithItemIdentifier:` consumes the
-                // +1 from `+alloc`; the container outlives the item (retained here and
-                // in the handle). The item is autoreleased on return (+0 owed).
+                // SAFETY: NSToolbarItem construction and plain setters on a fresh instance, on the main thread. `-initWithItemIdentifier:` consumes the +1 from `+alloc`; the container outlives the item (retained here and in the handle). The item is autoreleased on return (+0 owed).
                 unsafe {
                     let raw = appkit::send_id_id(
                         appkit::alloc(class(c"NSToolbarItem")),
@@ -3663,15 +3078,8 @@ mod macos {
                     };
                     appkit::send_v_id(item.id(), sel!(setLabel:), label.id());
                     appkit::send_v_id(item.id(), sel!(setPaletteLabel:), label.id());
-                    // macOS 26 wraps toolbar items in a glass capsule by default;
-                    // `setBordered:NO` keeps the full-width strip bezel-free.
                     appkit::send_v_bool(item.id(), sel!(setBordered:), false);
                     appkit::send_v_id(item.id(), sel!(setView:), ivars.container.id());
-                    // A custom NSView has no intrinsic size, so give the item a small
-                    // minimum (never collapses into `»`) and a huge maximum (fills the
-                    // toolbar); `WidthSizable` and `set_window_tabs` size the tabs.
-                    // `setMinSize:`/`setMaxSize:` are soft-deprecated but the simplest
-                    // non-raising way to do this.
                     appkit::send_v_size(
                         item.id(),
                         sel!(setMinSize:),
@@ -3704,8 +3112,7 @@ mod macos {
             let Some(strip) = appkit::nsstring(STRIP_ITEM_ID) else {
                 return Id::NIL;
             };
-            // SAFETY: `+arrayWithObject:` is `-(id)(id)` and retains its element,
-            // so the +1 `strip` may drop at the end of this frame.
+            // SAFETY: `+arrayWithObject:` is `-(id)(id)` and retains its element, so the +1 `strip` may drop at the end of this frame.
             unsafe {
                 appkit::send_id_id(
                     class(c"NSArray").as_id(),
@@ -3716,12 +3123,7 @@ mod macos {
         }
     }
 
-    /// Attach the native window chrome to `window`: one compact row with a full-width
-    /// tab strip and a trailing "+" New Tab [`ChromeButton`], hosted as one custom-view
-    /// `NSToolbarItem` in a `UnifiedCompact` `NSToolbar`. Starts with only the "+";
-    /// the first `App::sync_window` populates the tabs via [`set_window_tabs`].
-    ///
-    /// Best-effort: off the main thread or without an `NSWindow`, returns `None`.
+    /// Attach the native unified-compact toolbar and tab strip to `window`.
     pub(crate) fn install_window_toolbar(
         window: &aterm_window::window::Window,
         proxy: &EventLoopProxy<Wake>,
@@ -3729,13 +3131,11 @@ mod macos {
     ) -> Option<ToolbarHandle> {
         let mtm = MainThread::new()?;
 
-        // winit's live content NSView for this window, borrowed on the main thread.
         let view = crate::platform::ns_view_of(window);
         if view.is_null() {
             return None;
         }
-        // SAFETY: `-window` is `-(id)` and `-frame` is `-(NSRect)`, both
-        // side-effect-free main-thread getters on that live view / its window.
+        // SAFETY: `-window` is `-(id)` and `-frame` is `-(NSRect)`, both side-effect-free main-thread getters on that live view / its window.
         let (ns_window, win_w) = unsafe {
             let w = appkit::send_id(view, sel!(window));
             if w.is_null() {
@@ -3744,8 +3144,6 @@ mod macos {
             (w, appkit::send_rect(w, sel!(frame)).size.width.max(200.0))
         };
 
-        // The trailing "+" New Tab button, right-pinned: seeded here, re-pinned by
-        // `plan_strip`; `NSViewMinXMargin` keeps it anchored during live resize.
         let plus = ChromeButton::build(
             mtm,
             proxy.clone(),
@@ -3758,10 +3156,7 @@ mod macos {
                 STRIP_HEIGHT,
             ),
         )?;
-        // SAFETY: plain main-thread setters on the fresh view —
-        // `-setToolTip:` is `-(void)(NSString *)` and
-        // `-setAutoresizingMask:` is `-(void)(NSAutoresizingMaskOptions)`, an
-        // NSUInteger bitmask.
+        // SAFETY: plain main-thread setters on the fresh view — `-setToolTip:` is `-(void)(NSString *)` and `-setAutoresizingMask:` is `-(void)(NSAutoresizingMaskOptions)`, an NSUInteger bitmask.
         unsafe {
             appkit::send_v_id(
                 plus.as_id(),
@@ -3775,10 +3170,7 @@ mod macos {
             );
         }
 
-        // The strip's container view, hosting the per-tab views (built in
-        // [`set_window_tabs`]) and the trailing "+". Always visible.
-        // SAFETY: standard NSView construction + setters on a fresh instance, on the
-        // main thread; `addSubview:` takes the live retained button.
+        // SAFETY: standard NSView construction + setters on a fresh instance, on the main thread.
         let container = unsafe {
             let v = Obj::from_owned(appkit::send_id_rect(
                 appkit::alloc(class(c"NSView")),
@@ -3799,8 +3191,6 @@ mod macos {
             v
         };
 
-        // The delegate owns its own retain of the container; the handle keeps
-        // the one built above.
         let delegate = ToolbarDelegate::new(mtm, container.clone_retained())?;
 
         // SAFETY: standard NSToolbar / NSWindow setup, all on the main thread.
@@ -3811,8 +3201,6 @@ mod macos {
                 sel!(initWithIdentifier:),
                 identifier.id(),
             ))?;
-            // The declared class conforms to `NSToolbarDelegate` (asserted in a test).
-            // The toolbar holds its delegate weakly, so `ToolbarHandle` retains it.
             appkit::send_v_id(toolbar.id(), sel!(setDelegate:), delegate.as_id());
             appkit::send_v_bool(toolbar.id(), sel!(setAllowsUserCustomization:), false);
             appkit::send_v_usize(
@@ -3832,13 +3220,6 @@ mod macos {
                 consts::NS_WINDOW_TITLE_HIDDEN,
             );
             appkit::send_v_bool(ns_window, sel!(setTitlebarAppearsTransparent:), true);
-            // The window appearance is owned by config `window_theme`
-            // (`platform.rs` `window_set_appearance`), not set here. The strip's own
-            // appearance follows the terminal theme via [`set_strip_dark`], scoped to
-            // `container`, so its semantic label colours resolve against the
-            // theme-coloured titlebar.
-            // Always visible: the item always carries the "+", and `set_window_tabs`
-            // only adds and removes chips before it.
             appkit::send_v_bool(toolbar.id(), sel!(setVisible:), true);
             toolbar
         };
@@ -3851,8 +3232,7 @@ mod macos {
             window: wid,
             tabs: RefCell::new(Vec::new()),
             plus,
-            // SAFETY: `view` is winit's live content `NSView`; `Obj::retain`
-            // takes one +1 of a live object, released when the handle drops.
+            // SAFETY: `view` is winit's live content `NSView`.
             content_view: unsafe { Obj::retain(view) }?,
             rename: RefCell::new(None),
             pill: RefCell::new(None),
@@ -3862,30 +3242,18 @@ mod macos {
     }
 
     /// The user's selected-tab color override (config `active_tab_color`), packed
-    /// `0xFF_RR_GG_BB`; `0` means no override (the translucent system pill).
-    /// Process-wide: every window's strip follows one config. Read at draw time and
-    /// set before a draw cycle exists, so it is plain atomic state.
     static ACTIVE_TAB_COLOR: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
     /// The authored chrome accent (theme or config `accent_color`), floored to 3:1
-    /// on the theme's background, packed like [`ACTIVE_TAB_COLOR`]; `0` keeps the
-    /// system accent (`controlAccentColor`). The macOS native strip follows the
-    /// system accent unless an accent is authored.
     static STRIP_ACCENT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
     /// The load meters' inks (design §12.4), packed like [`STRIP_ACCENT`]: the
-    /// Tab ink the selected chip's meter takes and the aterm ink the others'
-    /// take at 70 %, solved on the band (`aterm_vitals::ink::vitals_inks`). `0`
-    /// until the first reading hands them over ([`set_chip_loads`]).
     static STRIP_LOAD_TAB: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     static STRIP_LOAD_ATERM: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
-    /// The colour a chip's load meter is drawn in: the Tab ink on the
-    /// selected chip, the aterm ink at 70 % on the others; the secondary
-    /// label ink before any are handed over.
-    ///
+    /// Return the `NSColor` for a tab chip's load meter.
     /// # Safety
-    /// Main thread, inside a draw cycle; the result is +0.
+    /// Must be called on the main thread inside a draw cycle.
     unsafe fn strip_load_color(active: bool) -> Id {
         let (slot, alpha) = if active {
             (&STRIP_LOAD_TAB, 1.0)
@@ -3907,11 +3275,7 @@ mod macos {
         }
     }
 
-    /// Hand the strip its chips' load steps (`TabStripMetadata::load`, in tab
-    /// order) and the meters' inks (`[tab, aterm]`) after a vitals reading:
-    /// each chip whose step moved repaints, and nothing is laid out again. A
-    /// count that no longer matches the strip (a rebuild is on its way, and
-    /// carries the steps itself) changes nothing.
+    /// Update per-chip load steps and meter inks and repaint the strip.
     pub(crate) fn set_chip_loads(handle: &ToolbarHandle, loads: &[u8], inks: [[u8; 3]; 2]) {
         let mut inks_moved = false;
         for (slot, ink) in [(&STRIP_LOAD_TAB, inks[0]), (&STRIP_LOAD_ATERM, inks[1])] {
@@ -3927,11 +3291,9 @@ mod macos {
         }
     }
 
-    /// The colour the strip's accent marks (the active keyline, the drop-target
-    /// ring, the dirty dot) are drawn in: the pinned accent, else the system's.
-    ///
+    /// Return the `NSColor` for strip accent marks.
     /// # Safety
-    /// Main thread, inside a draw cycle; the result is +0.
+    /// Must be called on the main thread inside a draw cycle.
     unsafe fn strip_accent_color() -> Id {
         match unpack(STRIP_ACCENT.load(std::sync::atomic::Ordering::Relaxed)) {
             // SAFETY: a plain colour constructor on the main thread.
@@ -3948,7 +3310,7 @@ mod macos {
         }
     }
 
-    /// Pin (or clear) the strip's accent and repaint the live strip. Idempotent.
+    /// Set or clear the strip accent color override and repaint.
     pub(crate) fn set_strip_accent(handle: &ToolbarHandle, accent: Option<[u8; 3]>) {
         let packed = pack(accent);
         if STRIP_ACCENT.swap(packed, std::sync::atomic::Ordering::Relaxed) == packed {
@@ -3988,13 +3350,9 @@ mod macos {
         })
     }
 
-    /// The active tab's label ink for the current override: black or white by the
-    /// override's luminance (the in-grid strip's `bg_is_light` classifier), so a
-    /// custom pill stays readable. No override gives the semantic color.
-    ///
+    /// Return the active tab's title `NSColor`.
     /// # Safety
-    /// Main thread; the result is +0 and is handed straight to
-    /// `-setTextColor:`, which retains it.
+    /// Must be called on the main thread.
     unsafe fn active_label_color() -> Id {
         match active_tab_color_override() {
             // SAFETY: plain color constructors on the main thread.
@@ -4010,8 +3368,7 @@ mod macos {
         }
     }
 
-    /// Pin (or clear) the selected-tab color override and repaint the live strip.
-    /// Idempotent; called alongside `set_strip_dark` so a config edit applies live.
+    /// Set or clear the active-tab background color override and repaint.
     pub(crate) fn set_active_tab_color(handle: &ToolbarHandle, color: Option<[u8; 3]>) {
         let packed = color.map_or(0, |c| {
             0xFF00_0000 | (u32::from(c[0]) << 16) | (u32::from(c[1]) << 8) | u32::from(c[2])
@@ -4026,20 +3383,9 @@ mod macos {
         mark_dirty(handle.container.id());
     }
 
-    /// The system's selected content colour as sRGB, resolved in the strip's
-    /// own appearance (the one [`set_strip_dark`] pins and the pill draws
-    /// under): what the selected tab's pill is painted from while no
-    /// `active_tab_color` replaces it
-    /// ([`crate::tab_bar::automatic_active_tab_color`] composites it). `None`
-    /// where the colour has no sRGB form.
+    /// Resolve the system's selected-content color in the strip's appearance as sRGB.
     pub(crate) fn native_selected_pill_rgb(handle: &ToolbarHandle) -> Option<[u8; 3]> {
-        // SAFETY: main thread (the handle is main-thread only). Every call is a
-        // documented non-raising AppKit message: `+currentAppearance` and
-        // `-effectiveAppearance` return +0 appearances, `+setCurrentAppearance:`
-        // takes one (or nil, restoring the default) for the duration of the
-        // resolution and is put back before returning, `+sRGBColorSpace` is an
-        // immortal shared space, `-colorUsingColorSpace:` returns a +0 colour or
-        // nil, and the component getters return plain `CGFloat`s.
+        // SAFETY: main thread (the handle is main-thread only).
         unsafe {
             let appearance = class(c"NSAppearance").as_id();
             let previous = appkit::send_id(appearance, sel!(currentAppearance));
@@ -4067,10 +3413,7 @@ mod macos {
     }
 
     pub(crate) fn set_strip_dark(handle: &ToolbarHandle, dark: bool) {
-        // SAFETY: `+[NSAppearance appearanceNamed:]` returns a +0 built-in appearance
-        // (or nil) for a system name read by `appkit::appearance_name`.
-        // `-setAppearance:` is a plain main-thread setter on the retained container
-        // view, and it retains.
+        // SAFETY: `+[NSAppearance appearanceNamed:]` returns a +0 built-in appearance (or nil) for a system name read by `appkit::appearance_name`. `-setAppearance:` is a plain main-thread setter on the retained container view, and it retains.
         unsafe {
             let appearance = appkit::send_id_id(
                 class(c"NSAppearance").as_id(),
@@ -4083,14 +3426,7 @@ mod macos {
         }
     }
 
-    /// Re-sync the tab strip to the app's tab state: `titles` (one per tab), `ids`
-    /// (stable [`TabId`]s paired by index, captured by the context menu at pop time)
-    /// and the 0-based `active` index. Called from `App::refresh_window_tabs`.
-    ///
-    /// The toolbar, chips and "+" are never hidden. Chips split the band between the
-    /// traffic lights and the "+" into equal shares ([`native_tab_cells`]); a lone
-    /// tab becomes the window title, centred on the window. Every vertical position
-    /// derives from the measured traffic lights ([`strip_metrics`]).
+    /// Synchronize the native tab strip with the window's current tab state.
     #[allow(
         clippy::too_many_arguments,
         reason = "the strip's one consistent snapshot: every per-tab vector, the active index and the window's pill"
@@ -4122,18 +3458,12 @@ mod macos {
                 load: 0,
             })
         };
-        // A missing id (the caller always pairs `ids` with `titles`) falls back to the
-        // never-allocated id 0, so a menu on that chip dispatches a logged no-op.
         let id_at = |i: usize| ids.get(i).copied().unwrap_or(TabId::from_stored(0));
-        // A missing extension entry degrades to the empty chrome (no tooltip, no
-        // menu), as `metadata_at` does.
         let default_ext = TabChromeExt::default();
         let ext_at = |i: usize| ext.get(i).unwrap_or(&default_ext);
         let tooltip_at = |i: usize| tooltips.get(i).and_then(Option::as_deref);
 
         if titles.is_empty() {
-            // A transient no-tab window retains only New Tab. Every real tab count,
-            // including one, gets a visible identity chip.
             // SAFETY: `removeFromSuperview` is a main-thread mutator.
             {
                 let mut tabs = handle.tabs.borrow_mut();
@@ -4141,8 +3471,6 @@ mod macos {
                     unsafe { appkit::send_v(old.as_id(), sel!(removeFromSuperview)) };
                 }
             }
-            // An editor must not be left floating over an empty strip: with no
-            // chips there is no tab to be editing, so this cancels.
             sync_rename_overlay(handle, &[]);
             return;
         }
@@ -4156,23 +3484,16 @@ mod macos {
         let active = active.min(n.saturating_sub(1));
         let geometry_at = |index: usize, cell_x: f64| metrics.geometry(index, n, active, cell_x);
 
-        // Diff path: same count and every frame matches its computed cell (width
-        // unchanged) ⇒ update views in place. Runs on every title change and tab
-        // switch. Positional indices stay valid; after a `move_tab` each position
-        // shows a different tab, so the stable id is re-stamped with the label.
         {
             let tabs = handle.tabs.borrow();
             if tabs.len() == n
                 && tabs.iter().zip(&cells).all(|(tab, &(cx, cw))| {
-                    // SAFETY: `-frame` is a side-effect-free `-(NSRect)` getter
-                    // on a live retained chip.
+                    // SAFETY: `-frame` is a side-effect-free `-(NSRect)` getter on a live retained chip.
                     let f = unsafe { appkit::send_rect(tab.as_id(), sel!(frame)) };
                     f.origin.x == cx && f.size.width == cw
                 })
             {
                 for (i, (tab, title)) in tabs.iter().zip(titles).enumerate() {
-                    // Geometry first: a display move, appearance flip or fullscreen
-                    // toggle can move the traffic lights without changing cell widths.
                     tab.set_geometry(geometry_at(i, cells[i].0));
                     tab.set_context(title, tooltip_at(i));
                     tab.set_tab_id(id_at(i));
@@ -4186,8 +3507,7 @@ mod macos {
             }
         }
 
-        // Rebuild path (count or width changed): drop the previous tab views and build
-        // fresh; the "+" stays. SAFETY: `removeFromSuperview` is a main-thread mutator.
+        // SAFETY: `removeFromSuperview` is a main-thread mutator.
         {
             let mut tabs = handle.tabs.borrow_mut();
             for old in tabs.drain(..) {
@@ -4197,8 +3517,6 @@ mod macos {
         let mut new_tabs: Vec<Retained<TabView>> = Vec::with_capacity(n);
         for (i, title) in titles.iter().enumerate() {
             let (cx, cw) = cells[i];
-            // The cell spans the full strip height so the whole chip is one target;
-            // only its content rides the measured centre line.
             let frame = rect(cx, 0.0, cw, strip_h);
             let tab = TabView::build(
                 mtm,
@@ -4215,30 +3533,19 @@ mod macos {
                 frame,
                 geometry_at(i, cx),
             );
-            // `+alloc`/`-initWithFrame:` can answer nil; skip that chip.
             let Some(tab) = tab else { continue };
             // SAFETY: `addSubview:` on the live container, main thread.
             unsafe { appkit::send_v_id(container, sel!(addSubview:), tab.as_id()) };
             new_tabs.push(tab);
         }
         *handle.tabs.borrow_mut() = new_tabs;
-        // The chips were just added on top: re-frame and re-raise a live editor over
-        // its chip, or cancel it if its tab is gone. Never removed, since the field
-        // holds the in-progress text.
         sync_rename_overlay(handle, ids);
     }
 
     /// Where a strip of `n` chips with `active` selected sits in the container now:
-    /// each chip's `(x, width)` cell, the measured traffic-light line and the strip
-    /// height. Also re-pins the "+" to the live width. Shared by [`set_window_tabs`]
-    /// and [`reflow_window_tabs`], so an in-place reflow lands on the cells a later
-    /// diff compares against.
     fn plan_strip(handle: &ToolbarHandle, n: usize, active: usize) -> StripPlan {
         let container = handle.container.id();
-        // Measure the live window once per layout (traffic-light centre and trailing
-        // edge, window centre).
-        // SAFETY: `container` is the live retained strip view; `-bounds` is a
-        // side-effect-free `-(NSRect)` getter.
+        // SAFETY: `container` is the live retained strip view.
         let (metrics, strip_h) = unsafe {
             (
                 strip_metrics(container),
@@ -4249,8 +3556,6 @@ mod macos {
             )
         };
 
-        // The tab band: from the leading pad (never under the traffic lights) to the
-        // right-pinned "+", so a chip never draws under either.
         let left = STRIP_LEADING_PAD.max(metrics.lights_right + LIGHTS_CLEARANCE);
         let cluster = TAB_GAP + PLUS_WIDTH + TRAILING_PAD;
         // SAFETY: `-frame` is a side-effect-free `-(NSRect)` getter.
@@ -4258,10 +3563,6 @@ mod macos {
             .size
             .width
             .max(left + cluster + 1.0);
-        // The needs pill, right of the tabs and before the "+": laid out in at
-        // most its share of the band, which the tabs then give up. Its width
-        // is measured at its words' room (`PillWords::room`), so it holds
-        // still while the pill's age ticks.
         let slot = PillSlot {
             share: pill_share((total_w - left - cluster).max(0.0)),
             right: total_w - cluster,
@@ -4275,7 +3576,6 @@ mod macos {
         let band_w = (total_w - left - cluster - reserved).max(1.0);
         let active = active.min(n.saturating_sub(1));
 
-        // Keep the "+" on the measured line and re-pin it to the live width.
         // SAFETY: main-thread geometry setter on the retained live button.
         unsafe {
             appkit::send_v_rect(
@@ -4302,10 +3602,7 @@ mod macos {
         }
     }
 
-    /// Re-flow the live chips to the container's current width in place, from the
-    /// state they hold. Called on every window resize (chips have no autoresizing).
-    /// Idempotent and cheap when the width is unchanged, so it can run on every step
-    /// of a live drag.
+    /// Reflow live tab chips in place to match the container's current width.
     pub fn reflow_window_tabs(handle: &ToolbarHandle) {
         if MainThread::new().is_none() {
             return;
@@ -4323,8 +3620,7 @@ mod macos {
         } = plan_strip(handle, n, active);
         let mut moved = false;
         for (i, (tab, &(cx, cw))) in tabs.iter().zip(&cells).enumerate() {
-            // SAFETY: `-frame` is a side-effect-free `-(NSRect)` getter on a live
-            // retained chip.
+            // SAFETY: `-frame` is a side-effect-free `-(NSRect)` getter on a live retained chip.
             let f = unsafe { appkit::send_rect(tab.as_id(), sel!(frame)) };
             let reframe = f.origin.x != cx || f.size.width != cw || f.size.height != strip_h;
             if reframe {
@@ -4337,7 +3633,6 @@ mod macos {
             tab.set_geometry(metrics.geometry(i, n, active, cx));
             if reframe {
                 // `set_geometry` re-lays only when the geometry itself moved; a new
-                // width with the same centre line still needs the content re-placed.
                 tab.relayout();
             }
         }
@@ -4348,9 +3643,7 @@ mod macos {
         }
     }
 
-    /// Read the title chrome's introspection line for the `chrome` verb, or `None`
-    /// when there are no tabs: undecorated titles, selection, states and tooltips from
-    /// the live [`TabView`]s. The "+" is not reported as a tab.
+    /// Format the `toolbar-tabs` introspection line from live [`TabView`]s.
     pub(crate) fn read_tab_chrome(handle: &ToolbarHandle) -> Option<String> {
         MainThread::new()?;
         let tabs = handle.tabs.borrow();
@@ -4364,9 +3657,7 @@ mod macos {
         format_tab_chrome(&labels, &metadata, &tooltips, active)
     }
 
-    /// Read the per-tab context-menu introspection lines (`tab-menu tab=<i>
-    /// items=[...]`), one per live [`TabView`], from the same models a right-click pops,
-    /// serialised by `session_chrome::tab_menu_chrome_line`. Empty only with no chips.
+    /// Format per-tab context-menu introspection lines from live [`TabView`]s.
     #[must_use]
     pub(crate) fn read_tab_menus(handle: &ToolbarHandle) -> Vec<String> {
         if MainThread::new().is_none() {
@@ -4381,50 +3672,33 @@ mod macos {
             .collect()
     }
 
-    /// The mutable state the rename relay needs at callback time.
+    /// Callback state for [`TabRenameTarget`].
     pub(crate) struct RenameIvars {
         /// The `Wake` channel every outcome relays through.
         proxy: EventLoopProxy<Wake>,
         /// The window whose strip owns the editor.
         window: WindowId,
         /// The session being renamed, captured by `App` at begin from the tab's
-        /// focused pane; the commit is validated against it.
         session: u64,
         /// Byte cap for the edited field, enforced live (`controlTextDidChange:`).
         cap: usize,
         /// Escape was pressed: the next end-of-editing is a cancel, not a commit.
         cancelled: Cell<bool>,
         /// Whether this editor has reported its outcome. AppKit can end editing more
-        /// than once around teardown, so the latch guarantees exactly one Commit or
-        /// Cancel.
         done: Cell<bool>,
     }
 
     aterm_objc::declare_class! {
-        /// The inline rename field's delegate: relays AppKit's text-field editing
-        /// callbacks into the typed `Wake` channel. `App` resolves, validates and
-        /// writes.
-        ///
-        /// Declared with [`aterm_objc::declare_class!`]. It claims
-        /// `NSTextFieldDelegate` (the parameter type of `-[NSTextField setDelegate:]`),
-        /// which formally declares all three rows as optional members, so their
-        /// registered encodings (`control:textView:doCommandBySelector:` is
-        /// `"B@:@@:"` on arm64, `"c@:@@:"` on x86_64) are checked against the
-        /// framework; see `the_rename_rows_encode_to_the_protocol_authority`.
+        /// Delegate relaying inline rename text-field callbacks into `Wake` events.
         pub(crate) struct TabRenameTarget: NSObject {
             const NAME: &str = "ATermTabRenameTarget";
             type Ivars = RenameIvars;
             protocols: [NSObject, NSTextFieldDelegate];
 
             /// `controlTextDidChange:`: canonicalize as the user types. Forbidden
-            /// formatting (control/bidi/invisible) is dropped and the value clamped to
-            /// the byte cap on a grapheme boundary, so the field simply stops taking
-            /// more and what the user sees is exactly what gets stored. (The wire
-            /// refuses such input instead, so scripts learn of the rejection.)
             @sel(controlTextDidChange:)
             fn control_text_did_change(&self, notification: Id) {
-                // SAFETY: `-object` on the live NSNotification is the edited NSControl;
-                // `-stringValue` / `-setStringValue:` are its main-thread accessors.
+                // SAFETY: `-object` on the live NSNotification is the edited NSControl.
                 unsafe {
                     let field = appkit::send_id(notification, sel!(object));
                     if field.is_null() {
@@ -4436,9 +3710,6 @@ mod macos {
                         &current,
                         self.ivars().cap,
                     );
-                    // `setStringValue:` while editing resets the insertion point, so
-                    // write only on a real change. Compare trimmed input, since the
-                    // canonical form is trimmed (edges are trimmed at commit anyway).
                     if current.trim() != canonical
                         && let Some(ns) = appkit::nsstring(&canonical)
                     {
@@ -4448,10 +3719,6 @@ mod macos {
             }
 
             /// `control:textView:doCommandBySelector:`: intercepts only Escape, which
-            /// latches a cancel and aborts the edit. Every other command is left to the
-            /// field editor, so IME, undo, selection and the emoji picker behave
-            /// natively. During IME composition the input method consumes the first
-            /// Escape.
             @sel(control:textView:doCommandBySelector:)
             fn control_text_view_do_command(
                 &self,
@@ -4464,10 +3731,6 @@ mod macos {
                 }
                 let ivars = self.ivars();
                 ivars.cancelled.set(true);
-                // Cancel from here: `abortEditing` nils the field editor's delegate
-                // before ending, so `controlTextDidEndEditing:` is not delivered.
-                // Latch `done` so a late notification is ignored, then let `App`'s
-                // cancel run the one teardown that also restores the first responder.
                 if !ivars.done.replace(true) {
                     let _ = ivars.proxy.send_event(Wake::CancelSessionRename {
                         window: ivars.window,
@@ -4479,9 +3742,6 @@ mod macos {
             }
 
             /// `controlTextDidEndEditing:`: the commit exit. Return, Tab and clicking
-            /// away all commit. Escape does not arrive here (`abortEditing` suppresses
-            /// it); the `done` latch makes a late duplicate harmless, and `App`
-            /// re-validates the session before writing.
             @sel(controlTextDidEndEditing:)
             fn control_text_did_end_editing(&self, notification: Id) {
                 if self.ivars().done.replace(true) {
@@ -4495,8 +3755,7 @@ mod macos {
                     });
                     return;
                 }
-                // SAFETY: `-object` on the live NSNotification is the edited NSControl,
-                // whose `-stringValue` is a plain getter.
+                // SAFETY: `-object` on the live NSNotification is the edited NSControl, whose `-stringValue` is a plain getter.
                 let text = unsafe {
                     let field = appkit::send_id(notification, sel!(object));
                     appkit::nsstring_to_rust(if field.is_null() {
@@ -4536,19 +3795,14 @@ mod macos {
         }
     }
 
-    /// Whether a native rename editor could be installed: the strip needs a live
-    /// window to host the field. Side-effect free, so menu validation can ask.
+    /// Whether `handle` has a live window that can host an inline rename editor.
     pub(crate) fn can_present_tab_rename(handle: &ToolbarHandle) -> bool {
-        // SAFETY: `-window` is a side-effect-free `-(id)` getter on the live
-        // retained container view.
+        // SAFETY: `-window` is a side-effect-free `-(id)` getter on the live retained container view.
         MainThread::new().is_some()
             && !unsafe { appkit::send_id(handle.container.id(), sel!(window)) }.is_null()
     }
 
-    /// Open the inline session-rename editor over the chip carrying `tab`, as a
-    /// sibling of the chips (see [`ToolbarHandle::rename`]). `seed` is the current
-    /// pin, not the chip's decorated label; `placeholder` is the fallback label an
-    /// empty field shows. Returns whether an editor is on screen.
+    /// Open the inline tab-rename text field over `tab`.
     pub(crate) fn begin_tab_rename(
         handle: &ToolbarHandle,
         tab: TabId,
@@ -4559,8 +3813,6 @@ mod macos {
         let Some(mtm) = MainThread::new() else {
             return false;
         };
-        // Replacing a live editor: end the old one first so AppKit never holds two
-        // field editors and the abandoned relay cannot post a late outcome.
         end_tab_rename(handle);
         let frame = {
             let tabs = handle.tabs.borrow();
@@ -4569,8 +3821,6 @@ mod macos {
             };
             chip.editor_frame()
         };
-        // `+alloc`/`-init` can answer nil; `begin_tab_rename` reports whether an
-        // editor is on screen, so a failure here is `false`, not a panic.
         let Some(target) = TabRenameTarget::build(
             mtm,
             handle.proxy.clone(),
@@ -4580,10 +3830,8 @@ mod macos {
         ) else {
             return false;
         };
-        // SAFETY: `textFieldWithString:` is the documented non-raising factory; the
-        // rest are plain setters on the fresh field, all on the main thread.
+        // SAFETY: `textFieldWithString:` is the documented non-raising factory.
         let Some(field) = (unsafe {
-            // `+textFieldWithString:` is a factory (+0), so this retains.
             let Some(seed_ns) = appkit::nsstring(seed) else {
                 return false;
             };
@@ -4605,8 +3853,6 @@ mod macos {
                 sel!(setAlignment:),
                 consts::NS_TEXT_ALIGNMENT_LEFT,
             );
-            // Match the chip's own label metrics so the text does not jump size
-            // between editing and committed states.
             appkit::send_v_id(field.id(), sel!(setFont:), system_font(12.0, false));
             if !placeholder.is_empty()
                 && let Some(ns) = appkit::nsstring(placeholder)
@@ -4624,11 +3870,7 @@ mod macos {
         }) else {
             return false;
         };
-        // Key focus: AppKit installs the window's field editor for this field. The
-        // field's window is resolved from the container, since in native fullscreen
-        // the toolbar lives in a separate window.
-        // SAFETY: `-window` is `-(id)`; `-makeFirstResponder:` is
-        // `-(BOOL)(NSResponder *)` and an `NSTextField` is an `NSResponder`.
+        // SAFETY: `-window` is `-(id)`.
         let focused = unsafe {
             let w = appkit::send_id(handle.container.id(), sel!(window));
             !w.is_null() && appkit::send_bool_id(w, sel!(makeFirstResponder:), field.id())
@@ -4638,40 +3880,24 @@ mod macos {
             unsafe { appkit::send_v(field.id(), sel!(removeFromSuperview)) };
             return false;
         }
-        // SAFETY: `-selectText:` is `-(void)(id)` on the main thread; selecting
-        // all makes the first keystroke replace the old pin, as a rename should.
+        // SAFETY: `-selectText:` is `-(void)(id)` on the main thread.
         unsafe { appkit::send_v_id(field.id(), sel!(selectText:), Id::NIL) };
-        // The delegate is attached last: `-selectText:` re-runs the cell's
-        // `-selectWithFrame:…`, which ends the editing session `makeFirstResponder:`
-        // began and delivers `controlTextDidEndEditing:`. A relay already attached
-        // would post a spurious commit of the seed and latch `done`, disabling both
-        // Return and Escape (the `objc_toolbar_drive` example drives this).
-        //
-        // SAFETY: `-setDelegate:` is `-(void)(id)` and holds the delegate weakly,
-        // which is why `RenameEditor` retains it below.
+        // SAFETY: `-setDelegate:` is `-(void)(id)` and holds the delegate weakly, which is why `RenameEditor` retains it below.
         unsafe { appkit::send_v_id(field.id(), sel!(setDelegate:), target.as_id()) };
         *handle.rename.borrow_mut() = Some(RenameEditor { field, target, tab });
         true
     }
 
-    /// Remove the inline rename editor and hand key focus back to the terminal.
-    /// Idempotent. Latches the relay's `done` first, so the end-of-editing AppKit
-    /// fires during teardown cannot post a second outcome.
+    /// Close the inline tab-rename editor and restore first responder to the terminal.
     pub(crate) fn end_tab_rename(handle: &ToolbarHandle) {
         let Some(editor) = handle.rename.borrow_mut().take() else {
             return;
         };
         editor.target.ivars().done.set(true);
-        // Restore first responder before removing the field, or the window is left
-        // with none and keys go nowhere.
-        // SAFETY: main-thread responder restore, then teardown;
-        // `-setDelegate: nil` drops AppKit's weak reference before the relay's
-        // last strong reference goes away here.
+        // SAFETY: main-thread responder restore, then teardown.
         unsafe {
             let window = appkit::send_id(handle.container.id(), sel!(window));
             if !window.is_null() {
-                // Best-effort: a refusal is a teardown race, and the field is removed
-                // next either way.
                 let _ = appkit::send_bool_id(
                     window,
                     sel!(makeFirstResponder:),
@@ -4683,21 +3909,17 @@ mod macos {
         }
     }
 
-    /// The live rename field's text, or `None` when no editor is open. Lets a
-    /// command that runs outside the editor (⌘W, ⌘T, a split) keep what was typed.
+    /// Current text of the active inline rename editor, if open.
     pub(crate) fn rename_editor_text(handle: &ToolbarHandle) -> Option<String> {
         let rename = handle.rename.borrow();
         let editor = rename.as_ref()?;
-        // SAFETY: `-stringValue` is a plain `-(NSString *)` main-thread value
-        // getter on the live field, and the result is +0 — copied out here.
+        // SAFETY: `-stringValue` is a plain `-(NSString *)` main-thread value getter on the live field, and the result is +0 — copied out here.
         Some(unsafe {
             appkit::nsstring_to_rust(appkit::send_id(editor.field.id(), sel!(stringValue)))
         })
     }
 
-    /// Hand one editing command to the live rename field's field editor. macOS
-    /// resolves menu key equivalents before the first responder sees the key, so
-    /// without this ⌘V would paste into the PTY behind an open editor.
+    /// Dispatch an editing action (`Cut`, `Copy`, `Paste`, `SelectAll`) to the active rename editor.
     pub(crate) fn rename_editor_edit(
         handle: &ToolbarHandle,
         action: crate::platform::RenameEditorEdit,
@@ -4707,15 +3929,12 @@ mod macos {
         let Some(editor) = rename.as_ref() else {
             return false;
         };
-        // SAFETY: `currentEditor` is a plain main-thread getter; the returned NSText
-        // implements the standard editing actions, each taking a `sender`.
+        // SAFETY: `currentEditor` is a plain main-thread getter.
         unsafe {
             let text = appkit::send_id(editor.field.id(), sel!(currentEditor));
             if text.is_null() {
                 return false;
             }
-            // Each standard editing action is `-(void)(id sender)`, and a nil
-            // sender is what a programmatic invocation passes.
             let action = match action {
                 RenameEditorEdit::Copy => sel!(copy:),
                 RenameEditorEdit::Paste => sel!(paste:),
@@ -4727,15 +3946,7 @@ mod macos {
     }
 
     /// Keep a live rename editor glued to its tab across a strip refresh. Called at
-    /// the end of every [`set_window_tabs`] path; `ids` is the refreshed tab order.
-    ///
-    /// * Tab gone: tear the editor down and post a cancel, never a commit.
-    /// * Tab present: re-frame the field over its chip and re-raise it above the
-    ///   freshly appended chips. The field is never removed, so text, selection,
-    ///   IME composition and first responder survive.
     fn sync_rename_overlay(handle: &ToolbarHandle, ids: &[TabId]) {
-        // Resolve everything under one short borrow, so the teardown branch below
-        // is free to take `handle.rename` mutably.
         let outcome = {
             let rename = handle.rename.borrow();
             let Some(editor) = rename.as_ref() else {
@@ -4763,9 +3974,7 @@ mod macos {
         let Some(editor) = rename.as_ref() else {
             return;
         };
-        // SAFETY: main-thread geometry setter and re-insert of a view already in this
-        // container; `addSubview:positioned:relativeTo:` moves it to the top without
-        // disturbing first responder.
+        // SAFETY: main-thread geometry setter and re-insert of a view already in this container.
         unsafe {
             appkit::send_v_rect(editor.field.id(), sel!(setFrame:), frame);
             appkit::send_v_id_isize_id(
@@ -4779,14 +3988,6 @@ mod macos {
     }
 
     /// Runtime tests for this module's five declared classes: each asks the
-    /// Objective-C runtime or Foundation what was registered, and behavioural tests
-    /// dispatch through machinery other than the code under test.
-    ///
-    /// `ToolbarDelegate` holds only a view, so a real instance is exercised. The
-    /// other four own an `EventLoopProxy<Wake>`, which needs a main-thread winit
-    /// `EventLoop` that libtest cannot provide; their behaviour is tested on probe
-    /// classes of the same shape, and their registration and encodings on the real
-    /// classes.
     #[cfg(test)]
     mod objc_tests {
         use aterm_objc::{
@@ -4800,21 +4001,18 @@ mod macos {
         use crate::appkit;
 
         /// `@encode(BOOL)` for this target, so expectations hold on both arches (the
-        /// arm64 literal is pinned separately).
         fn bool_enc() -> &'static str {
             Bool::ENCODING
         }
 
         /// A live, empty `NSView`, for the delegate's container ivar.
         fn a_view() -> Obj {
-            // SAFETY: `+alloc`/`-init` on `NSView` gives a +1 zero-frame view;
-            // `Obj::from_owned` adopts that one +1.
+            // SAFETY: `+alloc`/`-init` on `NSView` gives a +1 zero-frame view.
             unsafe { Obj::from_owned(appkit::send_id(appkit::alloc(class(c"NSView")), sel!(init))) }
                 .expect("NSView")
         }
 
         /// All five classes register, under the names AppKit already knows them
-        /// by, on the superclasses they had.
         #[test]
         fn all_five_declared_classes_register_as_they_did() {
             for (cls, name, superclass) in [
@@ -4834,8 +4032,7 @@ mod macos {
             ] {
                 assert!(!cls.is_null());
                 assert_eq!(class(name), cls, "objc_getClass disagrees for {name:?}");
-                // SAFETY: `cls` is a class this module registered, so it and its
-                // superclass are live, immortal class objects.
+                // SAFETY: `cls` is a class this module registered, so it and its superclass are live, immortal class objects.
                 unsafe {
                     assert_eq!(class_name(cls), name);
                     assert_eq!(class_name(aterm_objc::superclass_of(cls)), superclass);
@@ -4844,7 +4041,6 @@ mod macos {
         }
 
         /// `ToolbarDelegate` conforms to `NSToolbarDelegate`. `-setDelegate:` is sent
-        /// raw, so without conformance the toolbar would come up empty.
         #[test]
         fn the_toolbar_delegate_conforms_to_nstoolbardelegate() {
             let cls = ToolbarDelegate::class();
@@ -4854,8 +4050,7 @@ mod macos {
                     && !aterm_objc::protocols_registered_by_aterm().contains(&c"NSToolbarDelegate"),
                 "this host's AppKit registers NSToolbarDelegate — not one aterm had to supply"
             );
-            // SAFETY: `+conformsToProtocol:` and `+instancesRespondToSelector:`
-            // are side-effect-free NSObject queries on a live class object.
+            // SAFETY: `+conformsToProtocol:` and `+instancesRespondToSelector:` are side-effect-free NSObject queries on a live class object.
             unsafe {
                 assert!(
                     appkit::send_bool_id(
@@ -4880,9 +4075,6 @@ mod macos {
         }
 
         /// The three rename rows match the encodings `NSTextFieldDelegate` (inheriting
-        /// `NSControlTextEditingDelegate`) declares, read via
-        /// [`aterm_objc::protocol_method_types`], rather than a literal in this file.
-        /// Catches a wrong `BOOL` width, which is silent on arm64.
         #[test]
         fn the_rename_rows_encode_to_the_protocol_authority() {
             let cls = TabRenameTarget::class();
@@ -4893,8 +4085,7 @@ mod macos {
                         .contains(&c"NSTextFieldDelegate"),
                 "this host's AppKit registers NSTextFieldDelegate — not one aterm had to supply"
             );
-            // SAFETY: `+conformsToProtocol:` is a side-effect-free `NSObject`
-            // query on a live class object.
+            // SAFETY: `+conformsToProtocol:` is a side-effect-free `NSObject` query on a live class object.
             assert!(
                 unsafe {
                     appkit::send_bool_id(
@@ -4911,8 +4102,7 @@ mod macos {
                 sel!(controlTextDidEndEditing:),
                 sel!(control:textView:doCommandBySelector:),
             ] {
-                // SAFETY: `proto` is a live protocol object, `cls` a live class
-                // this module registered, and both queries are read-only.
+                // SAFETY: `proto` is a live protocol object, `cls` a live class this module registered, and both queries are read-only.
                 let (want, got) = unsafe {
                     (
                         aterm_objc::protocol_method_types(proto, s, true),
@@ -4930,14 +4120,11 @@ mod macos {
         }
 
         /// All thirty-eight registered encodings, read with `method_getTypeEncoding` and
-        /// checked against the table. `drawRect:` takes a 32-byte `NSRect` by value,
-        /// which needs `objc_msgSend_stret` on x86_64.
         #[test]
         fn the_runtime_reports_every_encoding_the_table_says() {
             let b = bool_enc();
             let rect = "{CGRect={CGPoint=dd}{CGSize=dd}}";
             let cases: Vec<(aterm_objc::ClassPtr, Sel, String)> = vec![
-                // --- ChromeButton, with the generated dealloc ---
                 (ChromeButton::class(), sel!(drawRect:), format!("v@:{rect}")),
                 (ChromeButton::class(), sel!(mouseDown:), "v@:@".into()),
                 (ChromeButton::class(), sel!(mouseDragged:), "v@:@".into()),
@@ -4960,7 +4147,6 @@ mod macos {
                     format!("{b}@:"),
                 ),
                 (ChromeButton::class(), sel!(dealloc), "v@:".into()),
-                // --- NeedsPill, 5 methods + the generated dealloc ---
                 (NeedsPill::class(), sel!(drawRect:), format!("v@:{rect}")),
                 (NeedsPill::class(), sel!(mouseDown:), "v@:@".into()),
                 (NeedsPill::class(), sel!(mouseUp:), "v@:@".into()),
@@ -4975,7 +4161,6 @@ mod macos {
                     format!("{b}@:"),
                 ),
                 (NeedsPill::class(), sel!(dealloc), "v@:".into()),
-                // --- TabView (without `tabMenuUpgrade:`) ---
                 (TabView::class(), sel!(drawRect:), format!("v@:{rect}")),
                 (TabView::class(), sel!(mouseDown:), "v@:@".into()),
                 (TabView::class(), sel!(rightMouseDown:), "v@:@".into()),
@@ -4998,7 +4183,6 @@ mod macos {
                 (TabView::class(), sel!(tabMenuAction:), "v@:@".into()),
                 (TabView::class(), sel!(tabMenuConnection:), "v@:@".into()),
                 (TabView::class(), sel!(dealloc), "v@:".into()),
-                // --- ToolbarDelegate; the third takes a trailing `BOOL`.
                 (
                     ToolbarDelegate::class(),
                     sel!(toolbarDefaultItemIdentifiers:),
@@ -5015,7 +4199,6 @@ mod macos {
                     format!("@@:@@{b}"),
                 ),
                 (ToolbarDelegate::class(), sel!(dealloc), "v@:".into()),
-                // --- TabRenameTarget; the middle one takes a `SEL`, encoded `":"`.
                 (
                     TabRenameTarget::class(),
                     sel!(controlTextDidChange:),
@@ -5044,8 +4227,6 @@ mod macos {
                     unsafe { class_name(cls) }
                 );
             }
-            // The arm64 literals, pinned so a `Bool::ENCODING` that went wrong
-            // could not make the `format!`s above vacuous.
             #[cfg(target_arch = "aarch64")]
             {
                 assert_eq!(b, "B");
@@ -5075,16 +4256,12 @@ mod macos {
         }
 
         /// The two `NSArray`-returning methods answer `@[STRIP_ITEM_ID]`, +0. The array
-        /// is autoreleased, so it must be read inside the pool.
         #[test]
         fn the_identifier_methods_vend_exactly_the_strip_item() {
             let delegate =
                 ToolbarDelegate::new(crate::appkit::test_witness(), a_view()).expect("delegate");
             autoreleasepool(|_| {
-                // SAFETY: `-performSelector:withObject:` is the runtime's own
-                // dispatch, `-count` is `-(NSUInteger)` and
-                // `-objectAtIndex:` is `-(id)(NSUInteger)` on the returned
-                // NSArray, which is alive for this pool.
+                // SAFETY: `-performSelector:withObject:` is the runtime's own dispatch, `-count` is `-(NSUInteger)` and `-objectAtIndex:` is `-(id)(NSUInteger)` on the returned NSArray, which is alive for this pool.
                 unsafe {
                     for s in [
                         sel!(toolbarDefaultItemIdentifiers:),

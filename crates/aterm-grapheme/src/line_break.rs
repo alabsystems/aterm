@@ -2,90 +2,35 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! WHERE A LINE OF TEXT MAY BREAK: the one answer every wrap and every
-//! word-boundary cut of aterm's chrome reads (Settings' rows and copy, the
-//! Messages band's titles and details, the Messages page, notices).
-//!
-//! The essentials of UAX #14 (Unicode line breaking) these surfaces need:
-//!
-//! - After a run of white space ([`BreakKind::Space`]). A no-break space
-//!   (U+00A0, U+2007, U+202F) is glue, not a place to break.
-//! - Between two characters of a script written without spaces between its
-//!   words, and between one of them and its neighbour
-//!   ([`BreakKind::Ideographic`]): CJK ideographs, kana, Hangul syllables,
-//!   Bopomofo, Yi, the fullwidth forms and the CJK symbols and punctuation.
-//!   A title that is all CJK has no space to break at, and broken only at
-//!   spaces it was left out at a narrow width (or broken anywhere, the
-//!   closing `。` starting a line).
-//! - Kinsoku, the start and end of line rules: closing punctuation and the
-//!   characters that may not start a line (small kana, the prolonged sound
-//!   mark, iteration marks, `、。！？`) stay with the character before them,
-//!   and opening punctuation (`「（【`) stays with the character after it.
-//! - Inside a word of prose, after a hyphen or a slash between its letters
-//!   ([`BreakKind::Joint`]): `built-` / `in`, `and/` / `or`.
-//! - Inside an identifier (a path, a URL: [`TokenKind::Identifier`]),
-//!   BEFORE each `/` between its folders, never after it, and after a URL's
-//!   `://` ([`BreakKind::Joint`]): `/private` / `/tmp` / `/aterm.toml`,
-//!   `https://` / `github.com` — the Chicago Manual's rule for a path or a
-//!   URL, which keeps each separator with the folder it leads and never
-//!   leaves one alone at a line's end (a status read "… was not saved: /"
-//!   / "private/tmp/…"). Never inside a run of them at a word's start
-//!   (UAX #14 LB20a, widened to the slash: `/private`, `-e`, `--columns`
-//!   stay whole), and never inside the rest of an identifier — its hyphens,
-//!   dots and digits are its own (`lab-42`, `75d5bccd-9c38`, UAX #14
-//!   LB25), broken only where it is wider than a whole line
-//!   ([`break_inside`]).
-//!
-//! Text with neither CJK nor a hyphen or slash breaks only at its spaces.
-//! Each surface takes the kinds it breaks at: a wrap
-//! takes them all, a cut that keeps whole words (the band's title) takes
-//! [`BreakKind::Space`] and [`BreakKind::Ideographic`], where a character
-//! is a word.
-//!
-//! A PIECE WIDER THAN A WHOLE LINE breaks inside itself where a typesetter
-//! would break it ([`break_inside`]): a word of prose at its syllables with
-//! a hyphen ([`crate::hyphen_points`]: "Bright-" / "ness"), an identifier
-//! at its own joints with no mark (`alab` / `.systems`, `0.11.0` /
-//! `+g20565c325`, `ai` / `-fleet.toml`), and only where neither fits a line at a character (a
-//! word with its hyphen, an identifier with none: a hyphen would read as
-//! one of its characters).
-//!
-//! Breaks fall only between grapheme clusters, so a mark, a variation
-//! selector or a kana's voicing mark stays with its base.
+//! UAX #14 line-breaking and word-boundary rules for chrome text wrapping.
 
 use crate::GraphemeClusters as _;
 
 /// What kind of place a line may break at ([`line_breaks`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Kind of line-break opportunity ([`line_breaks`]).
 pub enum BreakKind {
-    /// After a run of white space, which ends the line before it and is not
-    /// drawn at the start of the next.
+    /// Break after a run of whitespace.
     Space,
-    /// Between two characters of a script written without spaces between
-    /// words (CJK ideographs, kana, Hangul) or between one and its
-    /// neighbour, kinsoku kept: nothing goes between the two halves.
+    /// Break between ideographic/kana/Hangul characters.
     Ideographic,
-    /// Inside a word of prose after a hyphen or a slash, inside a path
-    /// before a slash, inside a URL after its `://`: nothing goes between
-    /// the two halves.
+    /// Break at a prose hyphen/slash, path slash, or URL delimiter.
     Joint,
 }
 
 impl BreakKind {
     /// Whether this break keeps whole words: a space, or a character of a
-    /// script whose every character is a word's worth (a cut there reads
-    /// as words, never as a word cut short).
     #[must_use]
     #[inline]
+    /// Whether this break preserves whole words (`Space` or `Ideographic`).
     pub const fn is_word_boundary(self) -> bool {
         matches!(self, Self::Space | Self::Ideographic)
     }
 }
 
 /// A place a line may break: the next line would start at byte `at` of the
-/// text (never 0 and never the text's end), after a break of `kind`. For a
-/// [`BreakKind::Space`] break, the white space before `at` ends the line.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Line-break opportunity at byte offset `at` (never `0` or `text.len()`).
 pub struct LineBreak {
     pub at: usize,
     pub kind: BreakKind,
@@ -101,13 +46,10 @@ enum Class {
     /// A character of a script written without spaces (UAX #14 `ID`).
     Ideographic,
     /// CJK closing punctuation and the characters that may not start a line
-    /// (UAX #14 `CL`, `CP`, `NS`, `EX` and their fullwidth `IS`): no break
-    /// before it.
     Closing,
     /// CJK opening punctuation (UAX #14 `OP`): no break after it.
     Opening,
     /// A hyphen or a slash: a word of prose may break after it, a path
-    /// before it.
     Joint,
     /// Anything else: a letter, a digit, Latin punctuation.
     Other,
@@ -118,31 +60,27 @@ enum Class {
 const fn is_closing(c: char) -> bool {
     matches!(
         c,
-        // CJK punctuation and closing brackets.
-        '\u{3001}' // 、
-            | '\u{3002}' // 。
-            | '\u{3009}' // 〉
-            | '\u{300B}' // 》
-            | '\u{300D}' // 」
-            | '\u{300F}' // 』
-            | '\u{3011}' // 】
-            | '\u{3015}' // 〕
-            | '\u{3017}' // 〗
-            | '\u{3019}' // 〙
-            | '\u{301B}' // 〛
-            | '\u{301C}' // 〜
-            | '\u{301E}' // 〞
-            | '\u{301F}' // 〟
-            // Iteration marks, the prolonged sound mark, the middle dot,
-            // the voicing marks.
-            | '\u{3005}' // 々
-            | '\u{303B}' // 〻
-            | '\u{309B}'..='\u{309E}' // ゛゜ゝゞ
-            | '\u{30A0}' // ゠
-            | '\u{30FB}' // ・
-            | '\u{30FC}' // ー
-            | '\u{30FD}'..='\u{30FE}' // ヽヾ
-            // Small kana.
+        '\u{3001}'
+            | '\u{3002}'
+            | '\u{3009}'
+            | '\u{300B}'
+            | '\u{300D}'
+            | '\u{300F}'
+            | '\u{3011}'
+            | '\u{3015}'
+            | '\u{3017}'
+            | '\u{3019}'
+            | '\u{301B}'
+            | '\u{301C}'
+            | '\u{301E}'
+            | '\u{301F}'
+            | '\u{3005}'
+            | '\u{303B}'
+            | '\u{309B}'..='\u{309E}'
+            | '\u{30A0}'
+            | '\u{30FB}'
+            | '\u{30FC}'
+            | '\u{30FD}'..='\u{30FE}'
             | '\u{3041}' | '\u{3043}' | '\u{3045}' | '\u{3047}' | '\u{3049}'
             | '\u{3063}' | '\u{3083}' | '\u{3085}' | '\u{3087}' | '\u{308E}'
             | '\u{3095}' | '\u{3096}'
@@ -150,39 +88,36 @@ const fn is_closing(c: char) -> bool {
             | '\u{30C3}' | '\u{30E3}' | '\u{30E5}' | '\u{30E7}' | '\u{30EE}'
             | '\u{30F5}' | '\u{30F6}'
             | '\u{31F0}'..='\u{31FF}'
-            // Vertical and small forms' closers.
             | '\u{FE10}'..='\u{FE16}'
             | '\u{FE18}'
             | '\u{FE36}' | '\u{FE38}' | '\u{FE3A}' | '\u{FE3C}' | '\u{FE3E}'
             | '\u{FE40}' | '\u{FE42}' | '\u{FE44}' | '\u{FE48}'
             | '\u{FE50}'..='\u{FE57}'
             | '\u{FE5A}' | '\u{FE5C}' | '\u{FE5E}'
-            // Fullwidth and halfwidth forms.
-            | '\u{FF01}' // ！
-            | '\u{FF09}' // ）
-            | '\u{FF0C}' // ，
-            | '\u{FF0E}' // ．
-            | '\u{FF1A}' // ：
-            | '\u{FF1B}' // ；
-            | '\u{FF1F}' // ？
-            | '\u{FF3D}' // ］
-            | '\u{FF5D}' // ｝
-            | '\u{FF60}' // ｠
-            | '\u{FF61}' // ｡
-            | '\u{FF63}' // ｣
-            | '\u{FF64}' // ､
-            | '\u{FF65}' // ･
-            | '\u{FF67}'..='\u{FF70}' // small halfwidth kana, ｰ
-            | '\u{FF9E}'..='\u{FF9F}' // ﾞﾟ
-            // Latin punctuation that closes or ends a clause, beside CJK.
+            | '\u{FF01}'
+            | '\u{FF09}'
+            | '\u{FF0C}'
+            | '\u{FF0E}'
+            | '\u{FF1A}'
+            | '\u{FF1B}'
+            | '\u{FF1F}'
+            | '\u{FF3D}'
+            | '\u{FF5D}'
+            | '\u{FF60}'
+            | '\u{FF61}'
+            | '\u{FF63}'
+            | '\u{FF64}'
+            | '\u{FF65}'
+            | '\u{FF67}'..='\u{FF70}'
+            | '\u{FF9E}'..='\u{FF9F}'
             | ')' | ']' | '}' | ',' | '.' | ':' | ';' | '!' | '?' | '%'
-            | '\u{2019}' // ’
-            | '\u{201D}' // ”
-            | '\u{00BB}' // »
-            | '\u{2025}' // ‥
-            | '\u{2026}' // …
-            | '\u{203C}' // ‼
-            | '\u{2047}'..='\u{2049}' // ⁇⁈⁉
+            | '\u{2019}'
+            | '\u{201D}'
+            | '\u{00BB}'
+            | '\u{2025}'
+            | '\u{2026}'
+            | '\u{203C}'
+            | '\u{2047}'..='\u{2049}'
     )
 }
 
@@ -191,62 +126,71 @@ const fn is_closing(c: char) -> bool {
 const fn is_opening(c: char) -> bool {
     matches!(
         c,
-        '\u{3008}' // 〈
-            | '\u{300A}' // 《
-            | '\u{300C}' // 「
-            | '\u{300E}' // 『
-            | '\u{3010}' // 【
-            | '\u{3014}' // 〔
-            | '\u{3016}' // 〖
-            | '\u{3018}' // 〘
-            | '\u{301A}' // 〚
-            | '\u{301D}' // 〝
+        '\u{3008}'
+            | '\u{300A}'
+            | '\u{300C}'
+            | '\u{300E}'
+            | '\u{3010}'
+            | '\u{3014}'
+            | '\u{3016}'
+            | '\u{3018}'
+            | '\u{301A}'
+            | '\u{301D}'
             | '\u{FE17}'
-            | '\u{FE35}' | '\u{FE37}' | '\u{FE39}' | '\u{FE3B}' | '\u{FE3D}'
-            | '\u{FE3F}' | '\u{FE41}' | '\u{FE43}' | '\u{FE47}'
-            | '\u{FE59}' | '\u{FE5B}' | '\u{FE5D}'
-            | '\u{FF08}' // （
-            | '\u{FF3B}' // ［
-            | '\u{FF5B}' // ｛
-            | '\u{FF5F}' // ｟
-            | '\u{FF62}' // ｢
-            | '(' | '[' | '{'
-            | '\u{2018}' // ‘
-            | '\u{201C}' // “
-            | '\u{00AB}' // «
+            | '\u{FE35}'
+            | '\u{FE37}'
+            | '\u{FE39}'
+            | '\u{FE3B}'
+            | '\u{FE3D}'
+            | '\u{FE3F}'
+            | '\u{FE41}'
+            | '\u{FE43}'
+            | '\u{FE47}'
+            | '\u{FE59}'
+            | '\u{FE5B}'
+            | '\u{FE5D}'
+            | '\u{FF08}'
+            | '\u{FF3B}'
+            | '\u{FF5B}'
+            | '\u{FF5F}'
+            | '\u{FF62}'
+            | '('
+            | '['
+            | '{'
+            | '\u{2018}'
+            | '\u{201C}'
+            | '\u{00AB}'
     )
 }
 
 /// A character of a script written without spaces between its words, or
-/// CJK punctuation and symbols (UAX #14 `ID`, and the fullwidth forms).
 #[inline]
 const fn is_ideographic(c: char) -> bool {
     matches!(
         c,
-        '\u{1100}'..='\u{11FF}' // Hangul Jamo
-            | '\u{2E80}'..='\u{2FFF}' // CJK radicals, Kangxi, description
-            | '\u{3001}'..='\u{303F}' // CJK symbols and punctuation
-            | '\u{3040}'..='\u{30FF}' // Hiragana, Katakana
-            | '\u{3100}'..='\u{31FF}' // Bopomofo, compatibility Jamo, Kanbun, strokes
-            | '\u{3200}'..='\u{33FF}' // enclosed CJK, compatibility
-            | '\u{3400}'..='\u{4DBF}' // CJK extension A
-            | '\u{4E00}'..='\u{9FFF}' // CJK unified ideographs
-            | '\u{A000}'..='\u{A4CF}' // Yi
-            | '\u{A960}'..='\u{A97F}' // Hangul Jamo extended A
-            | '\u{AC00}'..='\u{D7FF}' // Hangul syllables, Jamo extended B
-            | '\u{F900}'..='\u{FAFF}' // CJK compatibility ideographs
-            | '\u{FE10}'..='\u{FE1F}' // vertical forms
-            | '\u{FE30}'..='\u{FE4F}' // CJK compatibility forms
-            | '\u{FF01}'..='\u{FF60}' // fullwidth forms
-            | '\u{FF61}'..='\u{FFDC}' // halfwidth CJK forms
-            | '\u{FFE0}'..='\u{FFE6}' // fullwidth signs
-            | '\u{1B000}'..='\u{1B16F}' // kana supplement and extended
-            | '\u{20000}'..='\u{3FFFD}' // CJK extensions B on
+        '\u{1100}'..='\u{11FF}'
+            | '\u{2E80}'..='\u{2FFF}'
+            | '\u{3001}'..='\u{303F}'
+            | '\u{3040}'..='\u{30FF}'
+            | '\u{3100}'..='\u{31FF}'
+            | '\u{3200}'..='\u{33FF}'
+            | '\u{3400}'..='\u{4DBF}'
+            | '\u{4E00}'..='\u{9FFF}'
+            | '\u{A000}'..='\u{A4CF}'
+            | '\u{A960}'..='\u{A97F}'
+            | '\u{AC00}'..='\u{D7FF}'
+            | '\u{F900}'..='\u{FAFF}'
+            | '\u{FE10}'..='\u{FE1F}'
+            | '\u{FE30}'..='\u{FE4F}'
+            | '\u{FF01}'..='\u{FF60}'
+            | '\u{FF61}'..='\u{FFDC}'
+            | '\u{FFE0}'..='\u{FFE6}'
+            | '\u{1B000}'..='\u{1B16F}'
+            | '\u{20000}'..='\u{3FFFD}'
     )
 }
 
 /// White space that is glue: a no-break space keeps its neighbours on one
-/// line.
 #[inline]
 const fn is_glue(c: char) -> bool {
     matches!(c, '\u{00A0}' | '\u{2007}' | '\u{202F}')
@@ -272,13 +216,9 @@ fn class_of(c: char) -> Class {
 }
 
 /// WHETHER `token` — a run of text between spaces — NEVER STARTS A LINE,
-/// even after a space: it is nothing but closing punctuation or slashes
-/// (UAX #14 LB13: `]`, `)`, `!`, `?`, `;`, `:`, `,`, `.`, `/`), which goes
-/// with the word before it ("GPU /" / "RAM /", never "GPU" / "/ RAM /").
-/// The rule every wrap of aterm's chrome keeps ([`line_breaks`], and the
-/// copy walk that measures its own lines).
 #[must_use]
 #[inline]
+/// Whether `token` consists solely of closing/no-start characters and never starts a line.
 pub fn never_starts_a_line(token: &str) -> bool {
     !token.is_empty()
         && token
@@ -287,28 +227,18 @@ pub fn never_starts_a_line(token: &str) -> bool {
 }
 
 /// Whether `c` is CJK: an ideograph, kana, Hangul or the CJK and fullwidth
-/// punctuation that goes with them. Latin punctuation is never CJK, so it
-/// keeps its own rules beside Latin words.
 #[inline]
 const fn is_cjk(c: char) -> bool {
     is_ideographic(c)
 }
 
 /// HOW A RUN OF TEXT BETWEEN SPACES READS ([`token_kind`]): what decides
-/// where it may break inside itself, and whether a hyphen may be put in it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Classification of a whitespace-delimited token ([`token_kind`]).
 pub enum TokenKind {
-    /// A word of prose: letters, in one case, capitalized or not, perhaps
-    /// joined by a hyphen, a slash or an apostrophe (`built-in`, `and/or`,
-    /// `Couldn't`), perhaps with punctuation around it (`(default)`,
-    /// `Messages.`, `Choose…`). It breaks after its own hyphens and slashes,
-    /// and where it is wider than a line at its syllables, with a hyphen.
+    /// Prose word (single-case or capitalized letters, optionally joined by `-`, `/`, or `'`).
     Word,
-    /// Anything else: a path, a URL, a host, a version, a hash, a flag, a
-    /// file's name, a name written in mixed case (`macOS`, `GitHub`). Every
-    /// character of it is its own: a path breaks before its folders' `/`s,
-    /// and where it is wider than a line before its own joints (`.`, `-`,
-    /// `_`, `+` …), never with a hyphen put in it.
+    /// Identifier, path, URL, version, flag, or mixed-case token.
     Identifier,
 }
 
@@ -345,18 +275,16 @@ const fn closes_a_word(c: char) -> bool {
             | '}'
             | '"'
             | '\''
-            | '\u{201D}' // ”
-            | '\u{2019}' // ’
-            | '\u{BB}' // »
-            | '\u{203A}' // ›
-            | '\u{2026}' // …
-            | '\u{B7}' // ·
+            | '\u{201D}'
+            | '\u{2019}'
+            | '\u{BB}'
+            | '\u{203A}'
+            | '\u{2026}'
+            | '\u{B7}'
     )
 }
 
 /// Whether a run of letters is written as prose writes a word: all lower
-/// case, all upper case, or capitalized. Mixed case is a name (`macOS`,
-/// `GitHub`, `MacBook`), an identifier.
 fn cased_as_prose(run: &str) -> bool {
     let mut chars = run.chars();
     let Some(first) = chars.next() else {
@@ -367,18 +295,12 @@ fn cased_as_prose(run: &str) -> bool {
         upper |= c.is_uppercase();
         lower |= c.is_lowercase();
     }
-    // Lower case or capitalized (no capital after the first letter), or
-    // all capitals.
     !upper || (!first.is_lowercase() && !lower)
 }
 
 /// HOW `token` — a run of text with no breaking space in it — READS
-/// ([`TokenKind`]): a word of prose, or an identifier. Punctuation around it
-/// is taken off; what is left must be runs of letters cased as prose writes
-/// them ([`cased_as_prose`]), joined one to the next by a single hyphen,
-/// slash or apostrophe, and no more than one slash in all. A token with no
-/// letter (`·`, `—`) is a word: it has nothing inside it to break.
 #[must_use]
+/// Classify a non-whitespace `token` as [`TokenKind::Word`] or [`TokenKind::Identifier`].
 pub fn token_kind(token: &str) -> TokenKind {
     let core = token
         .trim_start_matches(opens_a_word)
@@ -386,8 +308,6 @@ pub fn token_kind(token: &str) -> TokenKind {
     if core.is_empty() {
         return TokenKind::Word;
     }
-    // Two slashes make a path, even one a space began (`Application
-    // Support/aterm/pkg`): prose joins two words with one (`and/or`).
     if core.matches('/').count() > 1 {
         return TokenKind::Identifier;
     }
@@ -403,7 +323,6 @@ pub fn token_kind(token: &str) -> TokenKind {
 }
 
 /// A grapheme as line breaking reads it: where it starts, its first
-/// character and that character's class.
 #[derive(Clone, Copy)]
 struct Cluster {
     at: usize,
@@ -412,7 +331,6 @@ struct Cluster {
 }
 
 /// A run of text between breaking white space, as [`line_breaks`] reads
-/// it: how it reads, and the clusters it spans (`start..end`).
 #[derive(Clone, Copy)]
 struct Token {
     kind: TokenKind,
@@ -421,7 +339,6 @@ struct Token {
 }
 
 /// `text`'s graphemes ([`Cluster`]) and, for each, the token it is part of
-/// (`None` for white space).
 fn clusters(text: &str) -> (Vec<Cluster>, Vec<Option<Token>>) {
     let clusters: Vec<Cluster> = text
         .grapheme_indices()
@@ -460,8 +377,6 @@ fn clusters(text: &str) -> (Vec<Cluster>, Vec<Option<Token>>) {
 }
 
 /// Whether a path may break before a `/` (or a Windows path's `\`) that
-/// follows `c`: after a folder's name, never after the `~`, `.` or `:` that
-/// leads a path, nor inside a run of slashes.
 #[inline]
 fn ends_a_folder(c: char) -> bool {
     c.is_alphanumeric() || matches!(c, '_' | ')' | ']' | '}' | '\'' | '"' | '%' | '*')
@@ -474,13 +389,11 @@ const fn is_path_separator(c: char) -> bool {
 }
 
 /// The Joint break before cluster `index` of `token`, if a line may break
-/// there ([`line_breaks`]).
 fn joint_before(clusters: &[Cluster], index: usize, token: Token) -> bool {
     let Token { kind, start, end } = token;
     let cur = clusters[index].first;
     let prev = clusters[index - 1].first;
     match kind {
-        // After a hyphen or a slash between two letters of a word.
         TokenKind::Word => {
             matches!(prev, '-' | '/')
                 && index >= start + 2
@@ -488,9 +401,6 @@ fn joint_before(clusters: &[Cluster], index: usize, token: Token) -> bool {
                 && cur.is_alphabetic()
         }
         TokenKind::Identifier => {
-            // Before a folder's separator, which leads the folder after it:
-            // never at the path's start, after another separator or the
-            // `~`, `.` or `:` that leads it, or at its end.
             let before_separator = is_path_separator(cur)
                 && index > start
                 && ends_a_folder(prev)
@@ -498,7 +408,6 @@ fn joint_before(clusters: &[Cluster], index: usize, token: Token) -> bool {
                     .get(index + 1)
                     .filter(|_| index + 1 < end)
                     .is_some_and(|next| !is_path_separator(next.first));
-            // After a URL's `://`.
             let after_scheme = prev == '/'
                 && index >= start + 3
                 && clusters[index - 2].first == '/'
@@ -510,15 +419,11 @@ fn joint_before(clusters: &[Cluster], index: usize, token: Token) -> bool {
 }
 
 /// EVERY PLACE `text` MAY BREAK, in order ([`LineBreak`]): after each run
-/// of white space, between CJK characters and beside them (kinsoku kept),
-/// inside a word of prose after a hyphen or a slash, and inside a path
-/// before a slash ([`BreakKind::Joint`]). Linear in `text`; text with no
-/// CJK, hyphen or slash in it has only its space breaks.
 #[must_use]
+/// Return all [`LineBreak`] opportunities in `text` in ascending byte order.
 pub fn line_breaks(text: &str) -> Vec<LineBreak> {
     let (clusters, tokens) = clusters(text);
     let mut breaks = Vec::new();
-    // Whether anything but white space came before: no break at the start.
     let mut seen_text = false;
     for (index, cluster) in clusters.iter().enumerate() {
         let Cluster { at, first, class } = *cluster;
@@ -530,12 +435,6 @@ pub fn line_breaks(text: &str) -> Vec<LineBreak> {
             continue;
         }
         if prev.class == Class::Space {
-            // The end of a run of white space. A CJK closer may not start
-            // the line even after a space, nor may a run of nothing but
-            // closing punctuation or slashes (UAX #14 LB13: `]`, `!`, `;`,
-            // `/` … even after spaces): a spaced slash stays with the word
-            // before it, "GPU /" / "RAM /", where a line read "/ RAM /".
-            // Other Latin punctuation keeps the break it always had.
             let closer_after_space = (class == Class::Closing && is_cjk(first))
                 || tokens[index].is_some_and(|token| {
                     let to = clusters.get(token.end).map_or(text.len(), |next| next.at);
@@ -574,29 +473,8 @@ pub fn line_breaks(text: &str) -> Vec<LineBreak> {
 }
 
 /// Where an identifier wider than a whole line may break inside itself
-/// ([`break_inside`]): BEFORE its own joints — a `.`, `_`, `+`, `@`, `#`,
-/// `~`, `?`, `&`, `=`, `,` or a separator after a letter or a digit — so
-/// the next line starts with it and no line ends in one that could read as
-/// an end of sentence (`alab` / `.systems`, the Chicago Manual's rule for a
-/// URL); at a hyphen between two letters or digits, BEFORE it in a path, a
-/// host, a file's name or an address (one with a `/`, a `\\`, an `@` or a
-/// dot a letter follows: the Chicago Manual's rule for a URL, which never
-/// ends a line in one of its own hyphens, where it reads as one a break
-/// put in — `ai` / `-fleet.toml`, `/75d5bccd` / `-9c38`, where `ai-` /
-/// `fleet.toml` read as "aifleet.toml"), and AFTER it in a name or a
-/// compound (UAX #14 LB21: `OpenAI-` / `compatible`, `MacBook-` /
-/// `Pro-M4`, which a line starting with its hyphen made read as a flag);
-/// and after a `:` that a letter or a digit follows (`host:` / `22`). Byte
-/// offsets in `token`, as two tiers: the joints, and
-/// apart from them the `.` or `,` between two digits, which split a number
-/// (`3` / `.1GHz`) and are taken only where no other joint fits (an address,
-/// `192.168.1` / `.114`). These are breaks for an identifier no line holds
-/// whole: one a line holds is never broken ([`line_breaks`] has no break
-/// inside it but a path's folders).
 fn identifier_joints(token: &str) -> (Vec<usize>, Vec<usize>) {
     let chars: Vec<(usize, char)> = token.char_indices().collect();
-    // A path, a host, a file's name, an address: a URL's rule for its
-    // hyphens.
     let url_like = chars.iter().enumerate().any(|(index, (_, c))| {
         matches!(c, '/' | '\\' | '@')
             || (*c == '.'
@@ -641,32 +519,8 @@ fn identifier_joints(token: &str) -> (Vec<usize>, Vec<usize>) {
 }
 
 /// A PIECE WIDER THAN A WHOLE LINE, BROKEN INSIDE ITSELF where a typesetter
-/// would break it: the lines `text[piece]` takes in a box `fits` measures,
-/// each `(the byte of text it starts at, what it paints)`, every line but
-/// the last as full as the box holds. The last is the piece's rest, which a
-/// wrap goes on with.
-///
-/// - A word of prose ([`TokenKind::Word`], of the run of text between
-///   spaces the piece is part of) breaks at its syllables
-///   ([`crate::hyphen_points`]), each line it breaks ending in `mark` ("-"):
-///   "Bright-" / "ness".
-/// - An identifier ([`TokenKind::Identifier`]), or any piece where `mark` is
-///   empty (code), breaks at its own joints with no mark
-///   ([`identifier_joints`]): `alab` / `.systems`, `0.11.0` / `+g20565c325`,
-///   `ai` / `-fleet.toml`; where none fits, at a syllable of a run of its
-///   letters, still with no mark (`/Applica` / `tions`).
-/// - Where none of those fits the line (a word of one syllable wider than
-///   the box, a box narrower than a word's first syllable, a hash), it
-///   breaks at a character — a word still with `mark`, which says it goes
-///   on (broken with nothing, its halves read as two words), an identifier
-///   with none (a hyphen would read as one of its characters) — and leaves
-///   three characters of the word (up to its next break) on the next line
-///   where the line can spare them, never a lone letter ("hardene-" /
-///   "d,").
-///
-/// What `piece` carries after its word (a fact separator a wrap glued on,
-/// " ·") is no letter of it: it is counted in no minimum and never broken.
 #[must_use]
+/// Break an overwide piece into lines of at most `budget` cells, hyphenating prose words when needed.
 pub fn break_inside(
     text: &str,
     piece: std::ops::Range<usize>,
@@ -692,19 +546,8 @@ pub fn break_inside(
 }
 
 /// THE FIRST PART OF A PIECE NO WHOLE LINE HOLDS THAT THE LINE IT WOULD
-/// START ON STILL HOLDS, as a typesetter fills a line before it breaks a
-/// word: `fits_here` measures the part on that line (its words, and what
-/// joins the piece to them), `fits_line` a whole line. A word fills it with
-/// the syllables that fit ("a trans-" / "lucent", where breaking the word
-/// only on a line of its own left "a" alone on the line before). An
-/// identifier fills it only at one of its own joints (never a number's
-/// dot, never a syllable) and only where its rest is then whole on the next
-/// line, so it breaks once (`Trust 0.11.0` / `+g20565c325`); where it would
-/// break again it starts a line of its own, its start being what reads it
-/// ("Trust 0.11" / ".0" / "+g20565c" lost the version). The part, its mark
-/// included, and the byte of `text` the piece's rest starts at; `None`
-/// where nothing fits there — then the piece starts the next line.
 #[must_use]
+/// Split off the longest prefix of `piece` that fits in `first_budget` when followed by a line of `next_budget`.
 pub fn break_into_line(
     text: &str,
     piece: std::ops::Range<usize>,
@@ -732,7 +575,6 @@ pub fn break_into_line(
 }
 
 /// A piece too wide for a line, as [`break_inside`] reads it: the run of
-/// text between spaces it is part of, and the places it may break.
 struct Inside<'a> {
     text: &'a str,
     mark: &'a str,
@@ -740,12 +582,8 @@ struct Inside<'a> {
     /// Where the piece's own word ends: before what a wrap glued on (" ·").
     word_end: usize,
     /// Whether the piece's word is prose ([`TokenKind::Word`]), which a
-    /// break marks.
     word: bool,
     /// The places it may break, in tiers tried in turn, each with whether
-    /// it takes the mark: a word's syllables; an identifier's joints, then
-    /// the points between a number's digits, then the syllables of its runs
-    /// of letters, with none.
     tiers: Vec<Vec<(usize, bool)>>,
     /// Every one of them, in order.
     points: Vec<usize>,
@@ -814,7 +652,6 @@ impl<'a> Inside<'a> {
     }
 
     /// The furthest place after `start` of the first tier with one where a
-    /// line from `start` fits.
     fn point(&self, start: usize, fits: &dyn Fn(&str) -> bool) -> Option<(usize, bool)> {
         self.tiers.iter().find_map(|tier| {
             tier.iter()
@@ -826,9 +663,6 @@ impl<'a> Inside<'a> {
     }
 
     /// The furthest character after `start` a line from `start` holds, its
-    /// mark included (a word's), one at least — leaving three characters of
-    /// the word, up to its next break, for the next line where this line
-    /// keeps more than three.
     fn anywhere(&self, start: usize, fits: &dyn Fn(&str) -> bool) -> (usize, bool) {
         let count = |from: usize, to: usize| {
             self.boundaries
@@ -870,9 +704,8 @@ impl<'a> Inside<'a> {
 }
 
 /// The places `text` may break that keep whole words
-/// ([`BreakKind::is_word_boundary`]): its spaces, and between CJK
-/// characters.
 #[must_use]
+/// Return word-boundary [`LineBreak`]s in `text` ([`BreakKind::is_word_boundary`]).
 pub fn word_breaks(text: &str) -> Vec<LineBreak> {
     let mut breaks = line_breaks(text);
     breaks.retain(|brk| brk.kind.is_word_boundary());
@@ -880,34 +713,20 @@ pub fn word_breaks(text: &str) -> Vec<LineBreak> {
 }
 
 /// A piece of a line of text between two places it may break
-/// ([`pieces`]): what a greedy wrap lays on a line whole, or carries to the
-/// next.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// A slice of text between two break opportunities ([`pieces`]).
 pub struct Piece<'a> {
-    /// The piece, white space trimmed from both ends: a slice of the text.
+    /// Trimmed slice of the source text.
     pub text: &'a str,
-    /// The byte of the text it starts at.
+    /// Starting byte offset in the source text.
     pub at: usize,
-    /// White space came between it and the piece before: a line that goes
-    /// on with it puts a space between them; otherwise nothing goes between
-    /// (a CJK character, the rest of a word after its hyphen). Never set on
-    /// the first piece.
+    /// Whether whitespace preceded this piece.
     pub spaced: bool,
 }
 
 /// `text` CUT AT EVERY PLACE A LINE OF IT MAY BREAK OF A KIND `keep` TAKES
-/// ([`line_breaks`]), in order, white space trimmed and empty pieces
-/// dropped: the one cut every greedy word wrap of aterm's chrome lays its
-/// lines from. A wrap that keeps hyphenated words whole takes
-/// [`BreakKind::is_word_boundary`]; one that breaks them takes every kind.
-/// Text of words and breaking spaces alone cuts exactly as
-/// `split_whitespace` does, each piece but the first spaced.
-///
-/// `keep` is a function, not a generic closure, so the cut is this crate's
-/// code wherever it is called: a debug build compiles it optimized (the root
-/// `Cargo.toml`'s `[profile.dev.package.aterm-grapheme]`), where a generic
-/// one was compiled into each caller at the caller's opt-level.
 #[must_use]
+/// Split `text` at every [`LineBreak`] accepted by `keep`.
 pub fn pieces<'a>(text: &'a str, keep: fn(BreakKind) -> bool) -> Vec<Piece<'a>> {
     let mut out: Vec<Piece<'a>> = Vec::new();
     let push = |out: &mut Vec<Piece<'a>>, from: usize, to: usize, spaced: bool| {
@@ -934,11 +753,9 @@ pub fn pieces<'a>(text: &'a str, keep: fn(BreakKind) -> bool) -> Vec<Piece<'a>> 
 }
 
 /// Whether a line may break after `c` as after white space: white space
-/// that is not a no-break space ([`line_breaks`]' glue, U+00A0, U+2007,
-/// U+202F). For a wrap that walks the text itself and keeps its white space
-/// on the line it ends.
 #[must_use]
 #[inline]
+/// Whether `c` is breaking whitespace (whitespace other than no-break spaces).
 pub fn is_break_space(c: char) -> bool {
     c.is_whitespace() && !is_glue(c)
 }
@@ -948,7 +765,6 @@ mod tests {
     use super::*;
 
     /// `text` cut at each break of the kinds `keep` takes: its pieces, white
-    /// space trimmed.
     fn pieces(text: &str, keep: fn(BreakKind) -> bool) -> Vec<&str> {
         let mut out = Vec::new();
         let mut from = 0;
@@ -965,7 +781,6 @@ mod tests {
     }
 
     /// LATIN TEXT BREAKS AT ITS SPACES, and inside a word of prose after a
-    /// hyphen or a slash between its letters; never at a no-break space.
     #[test]
     fn latin_breaks_at_spaces_and_inside_prose_words() {
         assert_eq!(
@@ -980,22 +795,12 @@ mod tests {
         assert_eq!(pieces("  lead  and trail  ", all), ["lead", "and", "trail"]);
         assert!(line_breaks("").is_empty());
         assert!(line_breaks("word").is_empty());
-        // No break before a Latin closer or after a Latin opener only where
-        // a CJK neighbour asks for one; between Latin words nothing moves.
         assert_eq!(pieces("(a) b, c!", all), ["(a)", "b,", "c!"]);
-        // A spaced slash, or closing punctuation alone, never starts a line
-        // (UAX #14 LB13). NEGATIVE CONTROL: "/ RAM /" started a line.
         assert_eq!(pieces("CPU / GPU / RAM", all), ["CPU /", "GPU /", "RAM"]);
         assert_eq!(pieces("wait ! now", all), ["wait !", "now"]);
     }
 
     /// A PATH BREAKS BEFORE ITS FOLDERS' SLASHES, never after one, so no
-    /// line ends in a separator; a URL also after its `://`; and nothing
-    /// else inside an identifier is a place to break: a run of joints at a
-    /// word's start (`/private`, `-e`, `--columns`), a hyphen before a digit
-    /// (`lab-42`) or between a host's or a triple's parts. NEGATIVE
-    /// CONTROL: broken after each `/` and `-` another character follows, a
-    /// status read "… was not saved: /" / "private/tmp/claude-" / "501/…".
     #[test]
     fn a_path_breaks_before_its_slashes_and_an_identifier_nowhere_else() {
         assert_eq!(
@@ -1051,7 +856,6 @@ mod tests {
     }
 
     /// `text` broken inside itself in a box `width` characters wide
-    /// ([`break_inside`]), every line's start checked against its text.
     fn inside(text: &str, mark: &str, width: usize) -> Vec<String> {
         let fits = |line: &str| line.chars().count() <= width;
         break_inside(text, 0..text.len(), mark, &fits)
@@ -1068,14 +872,6 @@ mod tests {
     }
 
     /// A PIECE WIDER THAN A WHOLE LINE BREAKS WHERE A TYPESETTER WOULD: a
-    /// word at its syllables with a hyphen, as full as each line holds; an
-    /// identifier before its own joints with no mark, a number kept whole;
-    /// and only where neither fits at a character (a word with its hyphen,
-    /// an identifier with none), three of the word's characters carried to
-    /// the next line, never a lone letter.
-    /// NEGATIVE CONTROL: broken where the box ended, "Brightn-" / "ess",
-    /// "AUTOMA-" / "TIC", "Messag-" / "es.", "alab.syst-" / "ems",
-    /// "0.11.0+g205-" / "65c325", "COMPUTE-" / "R ·".
     #[test]
     fn a_piece_wider_than_its_line_breaks_where_a_typesetter_would() {
         assert_eq!(inside("Brightness", "-", 8), ["Bright-", "ness"]);
@@ -1096,9 +892,6 @@ mod tests {
         assert_eq!(inside("aterm.toml", "-", 7), ["aterm", ".toml"]);
         assert_eq!(inside("/Applications", "-", 10), ["/Applica", "tions"]);
         assert_eq!(inside("ai-fleet.toml", "-", 10), ["ai-fleet", ".toml"]);
-        // A path's or a file's own hyphen starts the next line, never ends
-        // one, where it reads as a hyphen the break put in; a name's or a
-        // compound's ends it.
         assert_eq!(inside("ai-fleet.toml", "-", 7), ["ai", "-fleet", ".toml"]);
         assert_eq!(
             inside("/-Users-someone/75d5bccd-9c38-431b", "-", 10),
@@ -1109,14 +902,10 @@ mod tests {
             ["OpenAI-", "compatible"]
         );
         assert_eq!(inside("build-501x", "-", 8), ["build-", "501x"]);
-        // A number splits only where no other joint fits.
         assert_eq!(inside("Pro-3.1GHz-i7", "-", 10), ["Pro-", "3.1GHz-i7"]);
         assert_eq!(inside("192.168.1.114", "-", 10), ["192.168.1", ".114"]);
-        // No syllable fits: a character break, with the hyphen that says
-        // the word goes on, never a lone letter.
         assert_eq!(inside("Choose\u{2026}", "-", 6), ["Choo-", "se\u{2026}"]);
         assert_eq!(inside("STRENGTHS", "-", 8), ["STRENG-", "THS"]);
-        // A line that has room fills with a word's first syllables.
         let fits = |line: &str| line.chars().count() <= 10;
         let after = |lead: &'static str| move |part: &str| fits(&format!("{lead}{part}"));
         assert_eq!(
@@ -1127,8 +916,6 @@ mod tests {
             break_into_line("Choose", 0..6, "-", &after("a b c "), &fits),
             None
         );
-        // An identifier fills the line only where it then breaks once, at
-        // one of its own joints: else it starts a line of its own.
         let wide = |line: &str| line.chars().count() <= 12;
         let version = "0.11.0+g20565c325";
         assert_eq!(
@@ -1145,15 +932,10 @@ mod tests {
             break_into_line(version, 0..17, "-", &after("Trust "), &fits),
             None
         );
-        // Code takes no mark even where it reads as a word; with no joint
-        // to break at it breaks at a syllable, then anywhere.
         assert_eq!(inside("background", "", 6), ["back", "ground"]);
         assert_eq!(inside("cursor_style", "", 7), ["cursor", "_style"]);
     }
     /// CJK BREAKS BETWEEN ITS CHARACTERS, KINSOKU KEPT: closing punctuation
-    /// and the characters that may not start a line stay with the
-    /// character before them, opening punctuation with the one after it,
-    /// and a kana's voicing mark with its kana.
     #[test]
     fn cjk_breaks_between_characters_with_kinsoku() {
         assert_eq!(
@@ -1167,21 +949,13 @@ mod tests {
         assert_eq!(pieces("ちょっと", all), ["ちょっ", "と"]);
         assert_eq!(pieces("コーヒー", all), ["コー", "ヒー"]);
         assert_eq!(pieces("한국어 설정", all), ["한", "국", "어", "설", "정"]);
-        // A decomposed kana and its voicing mark are one grapheme.
         assert_eq!(pieces("か\u{3099}き", all), ["か\u{3099}", "き"]);
-        // Beside Latin: either side may break, but not before a closer.
         assert_eq!(pieces("aterm設定。", all), ["aterm", "設", "定。"]);
-        // A CJK closer after a space stays on the line before.
         assert_eq!(pieces("設定 。次", all), ["設", "定 。", "次"]);
-        // Between a closer and an opener.
         assert_eq!(pieces("終」「始", all), ["終」", "「始"]);
     }
 
     /// THE PIECES A WRAP LAYS ITS LINES FROM: Latin text of words and spaces
-    /// cuts as `split_whitespace` does, each piece after the first spaced; a
-    /// CJK run cuts between its characters, kinsoku kept, nothing between
-    /// them; a hyphenated word is whole unless the wrap takes its joints; and
-    /// each piece is the slice of the text at its own byte.
     #[test]
     fn pieces_are_what_a_wrap_lays_down() {
         fn words(text: &str, keep: fn(BreakKind) -> bool) -> Vec<(bool, &str)> {
@@ -1233,7 +1007,6 @@ mod tests {
     }
 
     /// A CUT THAT KEEPS WHOLE WORDS takes spaces and CJK characters, never a
-    /// hyphen or a slash inside a word.
     #[test]
     fn word_breaks_are_spaces_and_cjk() {
         let words = |text: &str| -> Vec<usize> {

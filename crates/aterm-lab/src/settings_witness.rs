@@ -91,7 +91,8 @@ pub fn rereads(log: &str, settings: &str) -> usize {
 /// A write Claude Code re-read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Reread {
-    /// The writes made, the last of them answered.
+    /// The writes made by the time a line answered (every one the same
+    /// write, so the line may be an earlier one's).
     pub writes: u32,
     /// From the first write to the line that answered.
     pub after: Duration,
@@ -165,7 +166,9 @@ impl<F: Fn()> Wait for SteppedWait<F> {
 /// the same write, so a line that comes after a rewrite answers too, even one
 /// that lands while the rewrite is being made. While no line comes, the write
 /// is made again every `every`. The wait gives up `hang` after the first
-/// write. `wait` is the clock and the pause between reads.
+/// write. `wait` is the clock and the pause between reads; each round reads
+/// the clock once, after the log, so no write follows a reading at or past
+/// `hang`.
 ///
 /// # Errors
 /// `write` failed, the run was interrupted, or nothing answered within `hang`.
@@ -182,20 +185,22 @@ pub(crate) fn until_reread(
     let mut writes = 1u32;
     let mut next = wait.elapsed() + every;
     loop {
-        if seen() > base {
+        let answered = seen() > base;
+        let now = wait.elapsed();
+        if answered {
             return Ok(Reread {
                 writes,
-                after: wait.elapsed().saturating_sub(start),
+                after: now.saturating_sub(start),
             });
         }
-        if wait.elapsed().saturating_sub(start) >= hang {
+        if now.saturating_sub(start) >= hang {
             return Err(Fail::die(format!(
                 "Claude Code reported no re-read of its settings in {} s ({writes} writes): its ConfigChange \
                  hook logged nothing after them",
                 hang.as_secs()
             )));
         }
-        if wait.elapsed() >= next {
+        if now >= next {
             write()?;
             writes += 1;
             next = wait.elapsed() + every;
@@ -208,26 +213,19 @@ pub(crate) fn until_reread(
 /// Set (or, with no value, remove) `key` in the scratch settings' env block
 /// of a lab whose Claude Code is running, and return once Claude Code
 /// re-read the file ([`until_reread`] on the witness's log), written again
-/// every `every` and given up `hang` after the first write (the lab's pace
-/// is [`REWRITE_EVERY`] and [`HANG`]).
+/// every [`REWRITE_EVERY`] and given up [`HANG`] after the first write.
 ///
 /// # Errors
 /// The settings could not be written, the run was interrupted, or Claude Code
-/// reported no re-read within `hang`.
-pub fn set_env_reread(
-    run: &Run,
-    key: &str,
-    value: Option<&str>,
-    (every, hang): (Duration, Duration),
-) -> Result<Reread, Fail> {
-    set_env_reread_with_wait(run, key, value, (every, hang), &WallWait::new())
+/// reported no re-read within [`HANG`].
+pub fn set_env_reread(run: &Run, key: &str, value: Option<&str>) -> Result<Reread, Fail> {
+    set_env_reread_with_wait(run, key, value, &WallWait::new())
 }
 
 pub(crate) fn set_env_reread_with_wait(
     run: &Run,
     key: &str,
     value: Option<&str>,
-    (every, hang): (Duration, Duration),
     wait: &impl Wait,
 ) -> Result<Reread, Fail> {
     let settings = run.settings().to_string_lossy().into_owned();
@@ -235,8 +233,8 @@ pub(crate) fn set_env_reread_with_wait(
     until_reread(
         || crate::verbs::set_env(run, key, value).map(drop),
         || rereads(&crate::util::scratch_text(&log), &settings),
-        every,
-        hang,
+        REWRITE_EVERY,
+        HANG,
         wait,
     )
 }
@@ -280,16 +278,26 @@ mod tests {
         }
     }
 
+    /// The wait's clock steps a third of `every` at each pause, so a rewrite
+    /// due a step or more sooner than `every` after the last write ends, or
+    /// due any time later, comes at another step than the one at `every`.
+    fn stepped() -> SteppedWait<impl Fn()> {
+        SteppedWait::new(REWRITE_EVERY / 3, || {})
+    }
+
     /// The first write is never answered (the watcher missed it), a rewrite
-    /// is: the wait writes again and returns on the line that came after it,
-    /// whether the line lands after the wait read the log again or is already
-    /// there at the first read after the rewrite (it landed while the rewrite
-    /// was being made, the moment a baseline read after each write swallowed).
-    /// The wait's clock steps `every` at each pause, so the answer always
-    /// comes at the second write, `every` or more after the first.
+    /// is: the wait writes again `every` after the first write and returns on
+    /// the line that came after it, whether the line lands after the wait read
+    /// the log again (one step later) or is already there at the first read
+    /// after the rewrite (it landed while the rewrite was being made, the
+    /// moment a baseline read after each write swallowed).
     #[test]
     fn an_unanswered_write_is_made_again_until_a_line_answers() {
-        for (what, from_read) in [("after a read", 2u32), ("during the rewrite", 1)] {
+        let after_a_read = REWRITE_EVERY + REWRITE_EVERY / 3;
+        for (what, from_read, after) in [
+            ("after a read", 2u32, after_a_read),
+            ("during the rewrite", 1, REWRITE_EVERY),
+        ] {
             let writes = Cell::new(0u32);
             let reads = Cell::new(0u32);
             let r = until_reread(
@@ -304,24 +312,26 @@ mod tests {
                 },
                 REWRITE_EVERY,
                 HANG,
-                &SteppedWait::new(REWRITE_EVERY, || {}),
+                &stepped(),
             )
             .expect(what);
-            assert_eq!(r.writes, 2, "{what}: {r:?}");
+            assert_eq!(r, Reread { writes: 2, after }, "{what}");
             assert_eq!(writes.get(), 2, "{what}: no write after the answer");
-            assert!(r.after >= REWRITE_EVERY, "{what}: {r:?}");
         }
     }
 
     /// NEGATIVE CONTROLS: a line that lands during the first write, an older
     /// change's, is no answer when no later line comes, and neither is a log
-    /// that never grows. Both end at the hang detector, after the write was
-    /// made again.
+    /// that never grows. Both end at the hang detector, at the first step at
+    /// or past `hang`, after a write at every step a multiple of `every`
+    /// before it: `hang / every` writes.
     #[test]
     fn a_line_from_before_the_write_ends_or_none_at_all_is_no_reread() {
+        let made = u32::try_from(HANG.as_millis() / REWRITE_EVERY.as_millis()).unwrap();
         for (what, bumps) in [("a line during the write", true), ("no line", false)] {
             let lines = Cell::new(0usize);
             let writes = Cell::new(0u32);
+            let wait = stepped();
             let r = until_reread(
                 || {
                     writes.set(writes.get() + 1);
@@ -333,12 +343,69 @@ mod tests {
                 || lines.get(),
                 REWRITE_EVERY,
                 HANG,
-                &SteppedWait::new(REWRITE_EVERY, || {}),
+                &wait,
             );
             let e = r.expect_err(what);
             assert!(e.msg.unwrap_or_default().contains("no re-read"), "{what}");
-            assert!(writes.get() >= 2, "{what}: {} writes", writes.get());
+            assert_eq!(wait.elapsed(), HANG, "{what}: the hang detector's moment");
+            assert_eq!(writes.get(), made, "{what}: one write every `every`");
         }
+    }
+
+    /// A clock that moves by `tick` at every reading and never at a pause,
+    /// as `WallWait`'s does when the thread is held up between two reads.
+    struct Ticking {
+        next: Cell<Duration>,
+        last: Cell<Duration>,
+        tick: Duration,
+    }
+
+    impl Wait for Ticking {
+        fn elapsed(&self) -> Duration {
+            self.last.set(self.next.get());
+            self.next.set(self.next.get() + self.tick);
+            self.last.get()
+        }
+
+        fn pause(&self) -> Result<(), Fail> {
+            Ok(())
+        }
+    }
+
+    /// No write follows a reading at or past `hang`, even on a clock that
+    /// moves between reads: a round reads the clock once, and that reading
+    /// decides both the hang detector and the rewrite. NEGATIVE CONTROL: a
+    /// round that read the clock again for the rewrite wrote after its hang
+    /// check had passed and the clock had reached `hang`.
+    #[test]
+    fn no_write_follows_a_reading_at_or_past_hang() {
+        let late: Vec<_> = [1, 1000, 7000]
+            .into_iter()
+            .filter_map(|ms| {
+                let wait = Ticking {
+                    next: Cell::new(Duration::ZERO),
+                    last: Cell::new(Duration::ZERO),
+                    tick: Duration::from_millis(ms),
+                };
+                let mut at = Vec::new();
+                let r = until_reread(
+                    || {
+                        at.push(wait.last.get());
+                        Ok(())
+                    },
+                    || 0,
+                    REWRITE_EVERY,
+                    HANG,
+                    &wait,
+                );
+                assert!(r.is_err(), "tick {ms} ms: a silent log is no re-read");
+                at.iter().any(|t| *t >= HANG).then_some((ms, at))
+            })
+            .collect();
+        assert!(
+            late.is_empty(),
+            "(tick in ms, the readings before each write): {late:?}"
+        );
     }
 
     /// The hook as the scratch settings carry it: `ConfigChange` runs the

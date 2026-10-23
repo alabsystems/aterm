@@ -1,58 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The GL arm's device: one EGL display, config and OpenGL ES 3.0 context, or
-//! on an X11 window system a GLX one (on wasm32, one WebGL2 context on a
-//! canvas), the GL function table loaded for it, and what the driver can do.
-//!
-//! # Current-ness
-//!
-//! A GL context is bound to at most one thread at a time, and every GL call
-//! acts on the calling thread's current context. The arm never assumes its
-//! context is still current: [`GlDevice::enter`] takes the device's lock, makes
-//! the context current on this thread, and the returned [`Current`] guard
-//! releases it again on drop. That is what lets two contexts share a thread
-//! (the arm and wgpu's GL backend, the differential oracle, which also releases
-//! after each operation) and lets the device move between threads (`Send`):
-//! nothing stays current behind the guard's back. A nested `enter` on the
-//! thread that already holds the device is a no-op guard, so a resource can be
-//! dropped inside an encode, and a present binds once for all its steps (on
-//! NVIDIA's GLX a bind and a release each cost milliseconds). A latched loss
-//! refuses the nested guards too.
-//!
-//! # Displays
-//!
-//! A headless device ([`GlDevice::headless`]) opens a display of its own. A
-//! device that presents to windows ([`GlDevice::on_window_system`]) opens the
-//! window system's display (an Xlib `Display*` or a `wl_display*`), because an
-//! EGL window surface can be made current only with a context of its own
-//! display. Its context is made with no config where the display allows it
-//! (`EGL_KHR_no_config_context`), so each window's surface can take the config
-//! that matches its visual. On X11 the device is GLX's instead (`super::glx`:
-//! NVIDIA's X11 EGL posts nothing on an Xorg server its own driver runs), and
-//! where GLX makes no OpenGL ES 3.0 context there is no device: the windows
-//! draw on the CPU renderer, never on an EGL whose swaps may post nothing.
-//!
-//! # Loss
-//!
-//! A lost device latches ([`GlShared::lost`]), and `GpuRenderer::device_lost`
-//! sends the frontend to the CPU renderer. It latches at `EGL_CONTEXT_LOST`
-//! from any EGL call the arm checks, at `GL_CONTEXT_LOST` from a GL error
-//! check, where a GLX context cannot be made current on its own pbuffer, at a
-//! window bind GLX keeps refusing (`super::surface`), and at a present whose
-//! reset check ([`Current::poll_reset`]) reads anything but `GL_NO_ERROR`
-//! from a context made to report resets (`super::glx::Robustness`), NVIDIA's
-//! video memory purge among them.
-//!
-//! # WebGL2 (wasm32)
-//!
-//! A browser has no displays and no headless contexts: a WebGL2 context lives
-//! on a canvas ([`GlDevice::on_canvas`]), whose drawing buffer is the
-//! context's default framebuffer, so one device is one canvas and its window
-//! surface at once. Making it current tells the glue which context the GL
-//! imports act on (`ffi::webgl`). The browser loses a context on its own
-//! (`webglcontextlost`): `isContextLost()` at every `enter`, and
-//! `CONTEXT_LOST_WEBGL` from `getError`, latch it as `EGL_CONTEXT_LOST` does.
+//! The GL arm's device: one EGL display, config and OpenGL ES 3.0 context, or on an X11 window system a GLX one (on wasm32, one WebGL2 context on a canvas), the GL function table loaded for it, and what the driver can do.
 
 use std::cell::Cell;
 #[cfg(not(target_arch = "wasm32"))]
@@ -75,22 +24,14 @@ pub(crate) struct GlCaps {
     pub(crate) version: String,
     /// `GL_MAX_TEXTURE_SIZE`.
     pub(crate) max_texture_dim: u32,
-    /// `EXT_sRGB_write_control` and `EXT_texture_sRGB_decode` together: one
-    /// `SRGB8_ALPHA8` texture can then be drawn and sampled both encoded and
-    /// raw, which is the native format plan's Unorm/sRGB view pair
-    /// (`format_plan`, `srgb_offscreen`). Without them the arm runs the
-    /// downlevel plan, the one wgpu's GL backend runs.
+    /// `EXT_sRGB_write_control` and `EXT_texture_sRGB_decode` together: one `SRGB8_ALPHA8` texture can then be drawn and sampled both encoded and raw, which is the native format plan's Unorm/sRGB view pair (`format_plan`, `srgb_offscreen`).
     pub(crate) srgb_views: bool,
-    /// The name of the context's `glGetGraphicsResetStatus` ([`reset_query`]),
-    /// which a context made to report resets is asked at every present.
+    /// The name of the context's `glGetGraphicsResetStatus` ([`reset_query`]), which a context made to report resets is asked at every present.
     #[cfg(all(not(wgpu_arm), not(target_arch = "wasm32")))]
     pub(crate) reset_query: Option<&'static CStr>,
 }
 
-/// The shared half of a device: the EGL or GLX objects (on wasm32, the WebGL2
-/// context and its canvas), the function table and the lock. Resources hold
-/// an `Arc` of it so their `Drop` can delete their GL names on the context
-/// that made them.
+/// The shared half of a device: the EGL or GLX objects (on wasm32, the WebGL2 context and its canvas), the function table and the lock.
 pub(crate) struct GlShared {
     /// The API the context lives on: EGL, or GLX on an X11 window system.
     #[cfg(not(target_arch = "wasm32"))]
@@ -102,29 +43,19 @@ pub(crate) struct GlShared {
     #[cfg(target_arch = "wasm32")]
     context: u32,
     /// The canvas the context draws into, held in the glue's object table
-    /// for the context's life.
     #[cfg(target_arch = "wasm32")]
     _canvas: aterm_wasm_abi::js::JsObject,
     /// Latched when the device is lost (the module header's "Loss"); the
-    /// device is then dead, and `GpuRenderer::device_lost` reports it to the
-    /// frontend's CPU fallback.
     lost: AtomicBool,
     /// The first latched loss's cause, for the frontend's downgrade line.
     #[cfg(not(target_arch = "wasm32"))]
     loss_reason: std::sync::OnceLock<String>,
     /// The injected-loss drill (`ATERM_GL_INJECT_LOSS`) on an EGL device: the
-    /// next [`GlShared::enter`] answers its `eglMakeCurrent` as a lost context
-    /// does, so the latch is driven through the path a real loss takes.
     inject_loss: AtomicBool,
     /// The context's `glGetGraphicsResetStatus`, where the context was made
-    /// to report resets (a robust GLX context); `None` elsewhere, where it
-    /// could only answer `GL_NO_ERROR`.
     #[cfg(all(not(wgpu_arm), not(target_arch = "wasm32")))]
     reset_status: Option<ffi::GetGraphicsResetStatusFn>,
     /// A reset status the next [`Current::poll_reset`] reads in place of the
-    /// driver's (`GL_NO_ERROR`: none): the drill on a GLX device, so its
-    /// latch comes from the check a real reset hits, after the present's GLX
-    /// calls; and the tests' statuses.
     #[cfg(all(not(wgpu_arm), not(target_arch = "wasm32")))]
     inject_reset: AtomicU32,
     pub(crate) gl: GlFns,
@@ -132,8 +63,7 @@ pub(crate) struct GlShared {
     lock: Mutex<()>,
 }
 
-/// The native display a windowed device was opened on, as raw handles carry
-/// it (addresses, so the type stays `Send`).
+/// The native display a windowed device was opened on, as raw handles carry it (addresses, so the type stays `Send`).
 #[cfg(not(target_arch = "wasm32"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg_attr(
@@ -167,13 +97,10 @@ pub(crate) struct EglBinding {
     pub(crate) display: EGLDisplay,
     context: EGLContext,
     /// The context's draw surface when the display cannot bind without one (a
-    /// 1x1 pbuffer), else `EGL_NO_SURFACE` (`EGL_KHR_surfaceless_context`).
     surface: EGLSurface,
     /// Whether the display was opened with reference tracking, so this
-    /// device's `eglTerminate` releases only its own reference.
     tracked: bool,
-    /// The config the context was made with, or `EGL_NO_CONFIG_KHR` for a
-    /// context any surface of the display can bind.
+    /// The config the context was made with, or `EGL_NO_CONFIG_KHR` for a context any surface of the display can bind.
     #[cfg_attr(
         wgpu_arm,
         expect(dead_code, reason = "read by the shipped build's window surfaces")
@@ -181,13 +108,10 @@ pub(crate) struct EglBinding {
     pub(crate) config: EGLConfig,
 }
 
-// SAFETY: every GL and EGL call on these handles happens inside a `Current`
-// guard, which holds `lock` and makes the context current on the calling
-// thread for the guard's life; no handle is used on two threads at once.
+// SAFETY: every GL and EGL call on these handles happens inside a `Current` guard, which holds `lock` and makes the context current on the calling thread for the guard's life; no handle is used on two threads at once.
 #[cfg(not(target_arch = "wasm32"))]
 unsafe impl Send for GlShared {}
-// SAFETY: as above: `&GlShared` reaches GL only through `enter`, serialized by
-// `lock`.
+// SAFETY: as above: `&GlShared` reaches GL only through `enter`, serialized by `lock`.
 #[cfg(not(target_arch = "wasm32"))]
 unsafe impl Sync for GlShared {}
 
@@ -210,8 +134,7 @@ impl std::fmt::Debug for GlDevice {
     }
 }
 
-/// The context made current on this thread; released on drop (see the module
-/// header).
+/// The context made current on this thread; released on drop (see the module header).
 pub(crate) struct Current<'a> {
     shared: &'a GlShared,
     /// `None` for a nested guard, which releases nothing.
@@ -225,11 +148,9 @@ impl Current<'_> {
         &self.shared.gl
     }
 
-    /// Drain the GL error queue; `Err` names every error raised since the last
-    /// check, with `what` for context.
+    /// Drain the GL error queue; `Err` names every error raised since the last check, with `what` for context.
     pub(crate) fn check(&self, what: &str) -> Result<(), String> {
         let mut errors = Vec::new();
-        // Bounded: a lost context can report an error on every call.
         for _ in 0..16 {
             // SAFETY: the context is current (this guard).
             let e = unsafe { (self.gl().get_error)() };
@@ -256,17 +177,13 @@ impl Current<'_> {
 
 #[cfg(all(not(wgpu_arm), not(target_arch = "wasm32")))]
 impl Current<'_> {
-    /// Make `surface`, a window surface of this device's display, the
-    /// context's draw and read surface for the rest of the guard: the default
-    /// framebuffer (name 0) is then the window's back buffer. The guard's drop
-    /// releases it with the context.
+    /// Make `surface`, a window surface of this device's display, the context's draw and read surface for the rest of the guard: the default framebuffer (name 0) is then the window's back buffer.
     pub(crate) fn bind_window(&self, surface: EGLSurface) -> Result<(), String> {
         let s = self.shared;
         let b = s
             .egl_binding()
             .ok_or("gl: an EGL window surface on a GLX device")?;
-        // SAFETY: the surface was made on this display; the guard holds the
-        // device lock, so no other thread uses the context.
+        // SAFETY: the surface was made on this display; the guard holds the device lock, so no other thread uses the context.
         let ok = unsafe { (b.egl.fns.make_current)(b.display, surface, surface, b.context) };
         if ok == ffi::EGL_TRUE {
             Ok(())
@@ -288,8 +205,7 @@ impl Current<'_> {
         }
     }
 
-    /// Set the bound window surface's swap interval (0: post at once; 1: wait
-    /// for the display's next refresh).
+    /// Set the bound window surface's swap interval (0: post at once; 1: wait for the display's next refresh).
     pub(crate) fn swap_interval(
         &self,
         fns: &ffi::EglWindowFns,
@@ -314,27 +230,20 @@ impl Current<'_> {
         self.shared
     }
 
-    /// The GLX context this guard holds current (`None` on an EGL device),
-    /// for the window-surface code's binds and posts.
+    /// The GLX context this guard holds current (`None` on an EGL device), for the window-surface code's binds and posts.
     #[inline]
     pub(crate) fn glx(&self) -> Option<&super::glx::GlxContext> {
         self.shared.glx()
     }
 
-    /// Ask the driver whether the context was reset (`glGetGraphicsResetStatus`,
-    /// on a context made to report resets; an injected status first), and
-    /// latch the device lost on any answer but `GL_NO_ERROR`: a reset context
-    /// draws nothing a post should show, and after NVIDIA purged its video
-    /// memory (`GL_PURGED_CONTEXT_RESET_NV`) every atlas and offscreen holds
-    /// garbage. One call, made once per present (`at` names the call site).
+    /// Ask the driver whether the context was reset (`glGetGraphicsResetStatus`, on a context made to report resets; an injected status first), and latch the device lost on any answer but `GL_NO_ERROR`: a reset context draws nothing a post should show, and after NVIDIA purged its video memory (`GL_PURGED_CONTEXT_RESET_NV`) every atlas and offscreen holds garbage.
     pub(crate) fn poll_reset(&self, at: &str) -> Result<(), String> {
         let s = self.shared;
         let injected = s.inject_reset.swap(ffi::GL_NO_ERROR, Ordering::AcqRel);
         let status = if injected != ffi::GL_NO_ERROR {
             injected
         } else if let Some(query) = s.reset_status {
-            // SAFETY: the context is current (this guard), and the function
-            // is its version's or extension's (`reset_query`).
+            // SAFETY: the context is current (this guard), and the function is its version's or extension's (`reset_query`).
             unsafe { query() }
         } else {
             return Ok(());
@@ -359,7 +268,6 @@ impl Drop for Current<'_> {
         let s = self.shared;
         #[cfg(not(target_arch = "wasm32"))]
         s.release();
-        // No context for the GL imports to act on until the next guard.
         #[cfg(target_arch = "wasm32")]
         {
             let _ = s;
@@ -383,9 +291,7 @@ impl GlShared {
 
 #[cfg(not(target_arch = "wasm32"))]
 impl GlShared {
-    /// The last EGL error as a message naming `call`, read once (`eglGetError`
-    /// clears it); `EGL_CONTEXT_LOST` latches the device lost ([`Self::lost`]).
-    /// Every EGL failure on a live device goes through here.
+    /// The last EGL error as a message naming `call`, read once (`eglGetError` clears it); `EGL_CONTEXT_LOST` latches the device lost ([`Self::lost`]).
     pub(crate) fn egl_failure(&self, call: &str) -> String {
         let Some(b) = self.egl_binding() else {
             return format!("gl: {call} failed");
@@ -406,7 +312,6 @@ impl GlShared {
     }
 
     /// `code`, an EGL error `call` raised, as a message; `EGL_CONTEXT_LOST`
-    /// latches the device lost.
     fn egl_error(&self, call: &str, code: EGLint) -> String {
         let e = format!("gl: {call}: {}", ffi::egl_error_name(code));
         if code == ffi::EGL_CONTEXT_LOST {
@@ -429,9 +334,7 @@ impl GlShared {
 }
 
 impl GlShared {
-    /// Whether EGL or GL has reported the context lost: at a frame's first
-    /// `eglMakeCurrent` ([`Self::enter`]), a window's bind or swap, or a GL
-    /// error check. A lost device stays lost.
+    /// Whether EGL or GL has reported the context lost: at a frame's first `eglMakeCurrent` ([`Self::enter`]), a window's bind or swap, or a GL error check.
     #[inline]
     pub(crate) fn lost(&self) -> bool {
         self.lost.load(Ordering::Acquire)
@@ -446,12 +349,7 @@ impl GlShared {
         self.lost.store(true, Ordering::Release);
     }
 
-    /// Arm the injected-loss drill, and say what it will do. On a GLX device
-    /// the next present's reset check ([`Current::poll_reset`]) reads
-    /// `GL_UNKNOWN_CONTEXT_RESET`, after the present's real GLX binds, and
-    /// latches as a real reset does; elsewhere the next [`Self::enter`] fails
-    /// as a lost context's `eglMakeCurrent` does (`EGL_CONTEXT_LOST`), and
-    /// latches.
+    /// Arm the injected-loss drill, and say what it will do.
     #[inline]
     pub(crate) fn inject_context_loss(&self) -> &'static str {
         #[cfg(all(not(wgpu_arm), not(target_arch = "wasm32")))]
@@ -468,16 +366,14 @@ impl GlShared {
         }
     }
 
-    /// Have the next [`Current::poll_reset`] read `status` in place of the
-    /// driver's answer.
+    /// Have the next [`Current::poll_reset`] read `status` in place of the driver's answer.
     #[cfg(all(not(wgpu_arm), not(target_arch = "wasm32")))]
     #[inline]
     pub(crate) fn inject_reset(&self, status: ffi::GLenum) {
         self.inject_reset.store(status, Ordering::Release);
     }
 
-    /// Whether the reset check asks the driver (the context was made to
-    /// report resets and its `glGetGraphicsResetStatus` was found).
+    /// Whether the reset check asks the driver (the context was made to report resets and its `glGetGraphicsResetStatus` was found).
     #[cfg(all(test, not(wgpu_arm), not(target_arch = "wasm32")))]
     pub(crate) const fn asks_the_driver_for_resets(&self) -> bool {
         self.reset_status.is_some()
@@ -485,8 +381,6 @@ impl GlShared {
 
     /// Make the context current on this thread (see the module header).
     pub(crate) fn enter(&self) -> Result<Current<'_>, String> {
-        // First, so a nested guard refuses too: a present holds one guard
-        // throughout, and a loss latched in it ends the present at its next
         // step's guard, as when every step bound the context itself.
         if self.lost() {
             #[cfg(not(target_arch = "wasm32"))]
@@ -523,17 +417,13 @@ impl GlShared {
 #[cfg(not(target_arch = "wasm32"))]
 impl GlShared {
     /// Bind the context on this thread (`eglMakeCurrent`, or
-    /// `glXMakeContextCurrent` on its pbuffer), or fail as a lost context's
-    /// bind does when the drill is armed.
     fn make_current(&self) -> Result<(), String> {
         if self.inject_loss.swap(false, Ordering::AcqRel) {
             return Err(self.egl_error("eglMakeCurrent", ffi::EGL_CONTEXT_LOST));
         }
         match &self.binding {
             Binding::Egl(b) => {
-                // SAFETY: the display, surface and context were created
-                // together on this display; the lock keeps every other thread
-                // off them.
+                // SAFETY: the display, surface and context were created together on this display; the lock keeps every other thread off them.
                 let ok =
                     unsafe { (b.egl.fns.make_current)(b.display, b.surface, b.surface, b.context) };
                 if ok != ffi::EGL_TRUE {
@@ -541,8 +431,6 @@ impl GlShared {
                 }
                 Ok(())
             }
-            // GLX has no lost-context answer; a context that cannot be made
-            // current on its own pbuffer is gone, and latches as one.
             #[cfg(not(wgpu_arm))]
             Binding::Glx(g) => g
                 .make_current()
@@ -553,8 +441,7 @@ impl GlShared {
     /// Unbind this thread's context (which flushes it).
     fn release(&self) {
         match &self.binding {
-            // SAFETY: the display is initialized; unbinding this thread's
-            // context is always legal.
+            // SAFETY: the display is initialized; unbinding this thread's context is always legal.
             Binding::Egl(b) => unsafe {
                 (b.egl.fns.make_current)(
                     b.display,
@@ -572,7 +459,6 @@ impl GlShared {
 #[cfg(target_arch = "wasm32")]
 impl GlShared {
     /// Point the GL imports at this context, and latch a context the browser
-    /// lost (or the drill's) as lost.
     fn make_current(&self) -> Result<(), String> {
         let lost = "gl: the WebGL2 context is lost (webglcontextlost)";
         if self.inject_loss.swap(false, Ordering::AcqRel) {
@@ -594,7 +480,6 @@ impl GlShared {
 #[cfg(target_arch = "wasm32")]
 impl Drop for GlShared {
     fn drop(&mut self) {
-        // The resources holding this `Arc` are gone; the glue forgets the
         // context, and the canvas's slot goes with `_canvas`.
         ffi::webgl::context_drop(self.context);
     }
@@ -603,11 +488,6 @@ impl Drop for GlShared {
 #[cfg(not(target_arch = "wasm32"))]
 impl Drop for GlShared {
     fn drop(&mut self) {
-        // The resources holding this `Arc` are gone; the context and its
-        // surface go with it. The display stays initialized unless it is
-        // reference-tracked (see `ffi::EGL_TRACK_REFERENCES_KHR`): an
-        // untracked `eglTerminate` would end every other user of the display.
-        // A GLX binding releases its pbuffer and context in its own drop.
         let Some(b) = self.egl_binding() else {
             return;
         };
@@ -632,20 +512,8 @@ fn has_ext(list: &str, ext: &str) -> bool {
 
 #[cfg(not(target_arch = "wasm32"))]
 impl GlDevice {
-    /// A headless device: no window system, rendering only into textures it
-    /// reads back. `Err` says why GL is unavailable: no `libEGL.so.1`, no
-    /// display, no GLES 3.0 config or context.
-    ///
-    /// The display is the arm's own: a device-platform display
-    /// (`EGL_EXT_platform_device`) on the first hardware device, else the
-    /// first device, where the driver enumerates devices; else
-    /// `EGL_MESA_platform_surfaceless`; else the default display. Not the
-    /// surfaceless display first, because that is the one wgpu's GL backend
-    /// (the test oracle) opens and `eglTerminate`s when its last instance
-    /// drops, and without `EGL_KHR_display_reference` (Mesa 25 has none) a
-    /// terminate ends every context on the display, the arm's included.
+    /// A headless device: no window system, rendering only into textures it reads back.
     pub(crate) fn headless() -> Result<Self, String> {
-        // Creation binds the new context on this thread, which would unbind a
         // device held here.
         if !HELD.with(Cell::get).is_null() {
             return Err(
@@ -653,8 +521,7 @@ impl GlDevice {
             );
         }
         let egl = Egl::get()?;
-        // SAFETY: querying client extensions on EGL_NO_DISPLAY is defined by
-        // EGL_EXT_client_extensions; a null answer means none.
+        // SAFETY: querying client extensions on EGL_NO_DISPLAY is defined by EGL_EXT_client_extensions; a null answer means none.
         let client_exts = unsafe {
             ffi::c_string((egl.fns.query_string)(
                 ffi::EGL_NO_DISPLAY,
@@ -687,8 +554,7 @@ impl GlDevice {
         }
         if display == ffi::EGL_NO_DISPLAY && has_ext(&client_exts, "EGL_MESA_platform_surfaceless")
         {
-            // SAFETY: a known platform enum, the default native display and an
-            // EGL_NONE-terminated attribute list.
+            // SAFETY: a known platform enum, the default native display and an EGL_NONE-terminated attribute list.
             display = unsafe {
                 (egl.fns.get_platform_display)(
                     ffi::EGL_PLATFORM_SURFACELESS_MESA,
@@ -709,17 +575,13 @@ impl GlDevice {
         Self::on_display(egl, display, tracked, None)
     }
 
-    /// A device on a window system's display, the one its windows' surfaces
-    /// are made on. `display` is the native display handle (an Xlib
-    /// `Display*`, a `wl_display*`), which the caller keeps open for the
-    /// device's life.
+    /// A device on a window system's display, the one its windows' surfaces are made on.
     #[cfg(not(wgpu_arm))]
     pub(crate) fn on_window_system(ws: WindowSystem) -> Result<Self, String> {
         Self::on_window_system_via(ws, Self::on_glx)
     }
 
-    /// [`Self::on_window_system`] in a build carrying wgpu, which attaches
-    /// windows on wgpu and has no GLX: the display's EGL platform.
+    /// [`Self::on_window_system`] in a build carrying wgpu, which attaches windows on wgpu and has no GLX: the display's EGL platform.
     #[cfg(wgpu_arm)]
     pub(crate) fn on_window_system(ws: WindowSystem) -> Result<Self, String> {
         if !HELD.with(Cell::get).is_null() {
@@ -730,14 +592,7 @@ impl GlDevice {
         Self::on_egl_window_system(ws)
     }
 
-    /// [`Self::on_window_system`] with `glx` as the X11 device's mint (a
-    /// test refuses it). An X11 window system's device is GLX's or none: its
-    /// windows then draw on the CPU renderer. EGL's X11 platform is no
-    /// fallback, because a working one and NVIDIA's (which posts nothing on
-    /// an Xorg server its own driver runs, every swap answering success) look
-    /// the same from here; the X servers GLX refuses while EGL would serve
-    /// (no GLX extension, a GLX with no ES profile) are rare, and the CPU
-    /// renderer draws on them.
+    /// [`Self::on_window_system`] with `glx` as the X11 device's mint (a test refuses it).
     #[cfg(not(wgpu_arm))]
     pub(super) fn on_window_system_via(
         ws: WindowSystem,
@@ -783,7 +638,6 @@ impl GlDevice {
                 None,
             ),
         };
-        // The EXT spellings of the two platforms share the KHR enums.
         let ext_alias = ext.replace("KHR", "EXT");
         if !has_ext(&client_exts, ext) && !has_ext(&client_exts, &ext_alias) {
             return Err(format!("gl: this EGL has no {ext}"));
@@ -794,8 +648,7 @@ impl GlDevice {
             attribs.push(screen as ffi::EGLAttrib);
         }
         attribs.push(ffi::EGL_NONE as ffi::EGLAttrib);
-        // SAFETY: a platform this EGL advertises, the caller's live native
-        // display, and an EGL_NONE-terminated attribute list.
+        // SAFETY: a platform this EGL advertises, the caller's live native display, and an EGL_NONE-terminated attribute list.
         let display = unsafe {
             (egl.fns.get_platform_display)(platform, native as *mut c_void, attribs.as_ptr())
         };
@@ -805,16 +658,10 @@ impl GlDevice {
                 egl.error_name()
             ));
         }
-        // Untracked: the window system's display is this process's one EGL
-        // user of it, and it stays initialized for the process.
         Self::on_display(egl, display, false, Some(ws))
     }
 
     /// A device on an X11 display's GLX (see `super::glx` for why X11 is
-    /// GLX's): a GLX OpenGL ES 3 context, current on its pbuffer between
-    /// posts, which a present asks for resets where the context reports them.
-    /// `Err` says why GLX cannot serve; the caller's windows then draw on the
-    /// CPU renderer.
     #[cfg(not(wgpu_arm))]
     fn on_glx(display: usize, screen: i32, ws: WindowSystem) -> Result<Self, String> {
         Self::on_glx_context(
@@ -823,8 +670,7 @@ impl GlDevice {
         )
     }
 
-    /// [`Self::on_glx`]'s device on the context `glx` (a test makes one
-    /// robust where GLX lists no robustness).
+    /// [`Self::on_glx`]'s device on the context `glx` (a test makes one robust where GLX lists no robustness).
     #[cfg(not(wgpu_arm))]
     pub(super) fn on_glx_context(
         glx: super::glx::GlxContext,
@@ -839,8 +685,7 @@ impl GlDevice {
             .filter(|_| glx.robustness().reports_resets())
             .map(|name| glx.proc_address(name))
             .filter(|p| !p.is_null())
-            // SAFETY: the name the context's version or extension defines
-            // (`reset_query`), whose registry signature the alias declares.
+            // SAFETY: the name the context's version or extension defines (`reset_query`), whose registry signature the alias declares.
             .map(|p| unsafe {
                 std::mem::transmute::<*const c_void, ffi::GetGraphicsResetStatusFn>(p)
             });
@@ -862,10 +707,8 @@ impl GlDevice {
     }
 
     /// The device a headless display opens on: the first with a DRM node (a
-    /// hardware GPU), else the first enumerated (Mesa's software device).
     fn pick_device(egl: &Egl, client_exts: &str) -> Option<ffi::EGLDeviceEXT> {
-        // SAFETY: eglGetProcAddress returns null or the named extension
-        // function, whose registry signature the alias types declare.
+        // SAFETY: eglGetProcAddress returns null or the named extension function, whose registry signature the alias types declare.
         let (query_devices, query_string) = unsafe {
             let q = (egl.fns.get_proc_address)(c"eglQueryDevicesEXT".as_ptr());
             let s = (egl.fns.get_proc_address)(c"eglQueryDeviceStringEXT".as_ptr());
@@ -898,9 +741,6 @@ impl GlDevice {
     }
 
     /// Initialize `display`, pick an RGBA8 GLES 3 config, create the context
-    /// and load GL through it. A headless display's config draws pbuffers; a
-    /// window system's draws windows, and its context is config-less where the
-    /// display allows it (see the module header).
     fn on_display(
         egl: &'static Egl,
         display: EGLDisplay,
@@ -918,8 +758,6 @@ impl GlDevice {
         {
             return Err(format!("gl: eglInitialize: {}", egl.error_name()));
         }
-        // From here an early return leaves the display initialized; a tracked
-        // one is released by this closure.
         let fail = |e: String| -> String {
             if tracked {
                 // SAFETY: balances the eglInitialize above (reference-tracked).
@@ -950,7 +788,6 @@ impl GlDevice {
             8,
             ffi::EGL_BLUE_SIZE,
             8,
-            // A minimum: a window system's opaque visuals have no alpha.
             ffi::EGL_ALPHA_SIZE,
             if window_system.is_some() { 0 } else { 8 },
             ffi::EGL_NONE,
@@ -974,9 +811,6 @@ impl GlDevice {
             )));
         }
         let surfaceless = has_ext(&display_exts, "EGL_KHR_surfaceless_context");
-        // A window system's context binds any of its windows' configs, when
-        // the display allows a config-less context; a context that must also
-        // bind a pbuffer keeps its config.
         let context_config = if window_system.is_some()
             && surfaceless
             && has_ext(&display_exts, "EGL_KHR_no_config_context")
@@ -992,8 +826,7 @@ impl GlDevice {
             0,
             ffi::EGL_NONE,
         ];
-        // SAFETY: a config of this display (or no config, which the display
-        // allows); no share context.
+        // SAFETY: a config of this display (or no config, which the display allows); no share context.
         let context = unsafe {
             (egl.fns.create_context)(
                 display,
@@ -1018,8 +851,7 @@ impl GlDevice {
             ));
         } else {
             let pbuffer = [ffi::EGL_WIDTH, 1, ffi::EGL_HEIGHT, 1, ffi::EGL_NONE];
-            // SAFETY: a pbuffer-capable config (surface_bit) and a terminated
-            // attribute list.
+            // SAFETY: a pbuffer-capable config (surface_bit) and a terminated attribute list.
             let s = unsafe { (egl.fns.create_pbuffer_surface)(display, config, pbuffer.as_ptr()) };
             if s == ffi::EGL_NO_SURFACE {
                 // SAFETY: the context made just above, unused.
@@ -1031,7 +863,6 @@ impl GlDevice {
             }
             s
         };
-        // Load GL with the context current, then release it.
         // SAFETY: handles created above on this display.
         if unsafe { (egl.fns.make_current)(display, surface, surface, context) } != ffi::EGL_TRUE {
             let e = egl.error_name();
@@ -1039,8 +870,7 @@ impl GlDevice {
             unsafe { (egl.fns.destroy_context)(display, context) };
             return Err(fail(format!("gl: eglMakeCurrent: {e}")));
         }
-        // SAFETY: eglGetProcAddress returns null or the named GL function,
-        // whose registry signature the table declares.
+        // SAFETY: eglGetProcAddress returns null or the named GL function, whose registry signature the table declares.
         let loaded =
             Self::load_gl(&mut |sym: &CStr| unsafe { (egl.fns.get_proc_address)(sym.as_ptr()) });
         // SAFETY: unbinding is always legal.
@@ -1073,8 +903,6 @@ impl GlDevice {
             lost: AtomicBool::new(false),
             loss_reason: std::sync::OnceLock::new(),
             inject_loss: AtomicBool::new(false),
-            // An EGL context is made without reset notification: its reset
-            // status could only answer `GL_NO_ERROR`.
             #[cfg(not(wgpu_arm))]
             reset_status: None,
             #[cfg(not(wgpu_arm))]
@@ -1089,10 +917,8 @@ impl GlDevice {
     }
 
     /// Load the GL table through `lookup` (`eglGetProcAddress`,
-    /// `glXGetProcAddressARB`) and read the caps. The context is current.
     fn load_gl(lookup: &mut dyn FnMut(&CStr) -> *const c_void) -> Result<(GlFns, GlCaps), String> {
-        // SAFETY: the lookup returns null or the named GL function, whose
-        // registry signature the table declares.
+        // SAFETY: the lookup returns null or the named GL function, whose registry signature the table declares.
         let gl = unsafe { GlFns::load(lookup) }?;
         // SAFETY: the context is current; glGetString returns a static string.
         let string = |name| unsafe { ffi::c_string((gl.get_string)(name).cast()) };
@@ -1126,10 +952,6 @@ impl GlDevice {
 }
 
 /// The name of `glGetGraphicsResetStatus` on a context whose `GL_VERSION` is
-/// `version` and whose extensions `has` names: GLES 3.2's core name, else the
-/// spelling of the robustness extension it lists (`KHR`, `EXT`, then `ARB`);
-/// `None` when it has none. Read by name, never guessed: glvnd's
-/// `glXGetProcAddressARB` hands out a stub for any name.
 #[cfg(all(not(wgpu_arm), not(target_arch = "wasm32")))]
 fn reset_query(version: &str, has: impl Fn(&str) -> bool) -> Option<&'static CStr> {
     let minor = version
@@ -1156,8 +978,7 @@ fn reset_query(version: &str, has: impl Fn(&str) -> bool) -> Option<&'static CSt
 
 #[cfg(target_arch = "wasm32")]
 impl GlDevice {
-    /// A device on `canvas`'s WebGL2 context (see the module header). `Err`
-    /// when the canvas gives no WebGL2 context, in wgpu's words for it.
+    /// A device on `canvas`'s WebGL2 context (see the module header).
     pub(crate) fn on_canvas(canvas: aterm_wasm_abi::js::JsObject) -> Result<Self, String> {
         if !HELD.with(Cell::get).is_null() {
             return Err(
@@ -1191,13 +1012,8 @@ impl GlDevice {
     }
 
     /// Read the caps of the current WebGL2 context. The GPU's name is the
-    /// unmasked renderer where the browser offers it (as wgpu's WebGL2
-    /// backend named its adapter), else the browser's `GL_RENDERER`. WebGL2
-    /// has neither `EXT_sRGB_write_control` nor `EXT_texture_sRGB_decode`, so
-    /// the arm runs the downlevel plan, as wgpu's WebGL2 backend did.
     fn load_webgl(gl: &GlFns) -> Result<GlCaps, String> {
-        // SAFETY: the context is current; glGetString returns null or a
-        // NUL-terminated string the module owns for the context's life.
+        // SAFETY: the context is current; glGetString returns null or a NUL-terminated string the module owns for the context's life.
         let string = |name| unsafe { ffi::c_string((gl.get_string)(name).cast()) };
         let version = string(ffi::GL_VERSION);
         if !version.starts_with("WebGL 2") {
@@ -1225,7 +1041,6 @@ impl GlDevice {
 
 impl GlDevice {
     /// The state every encode assumes and nothing changes: no dithering, depth,
-    /// culling or blending until a pipeline asks.
     fn init_state(&self) -> Result<(), String> {
         let cur = self.0.enter()?;
         let gl = cur.gl();
@@ -1266,16 +1081,12 @@ mod tests {
     use super::super::test_device as device;
 
     /// The device makes its context current under the guard, releases it on
-    /// drop (another thread can then take it), nests on one thread until a
-    /// loss latches, and refuses a second device while the first is held on
-    /// the thread.
     #[test]
     fn the_context_is_current_only_inside_a_guard_and_moves_between_threads() {
         let dev = device();
         let other = device();
         let egl = Egl::get().expect("the device loaded EGL");
-        // SAFETY: eglGetProcAddress returns the core entry point (EGL 1.5),
-        // whose registry signature is `EGLContext eglGetCurrentContext(void)`.
+        // SAFETY: eglGetProcAddress returns the core entry point (EGL 1.5), whose registry signature is `EGLContext eglGetCurrentContext(void)`.
         let get_current: unsafe extern "C" fn() -> ffi::EGLContext =
             unsafe {
                 std::mem::transmute::<*const c_void, unsafe extern "C" fn() -> ffi::EGLContext>(
@@ -1308,8 +1119,6 @@ mod tests {
             assert!(err.contains("held on this thread"), "{err}");
         }
         assert!(current().is_null(), "the outer guard released the context");
-        // A loss latched while a guard is held refuses the nested guards
-        // after it, as it refuses a first one.
         {
             let _held = other.enter().expect("enter the other device");
             other.0.latch_lost("gl: drilled");
@@ -1334,10 +1143,6 @@ mod tests {
     }
 
     /// A lost context latches at the first `eglMakeCurrent` that reports it,
-    /// the call every frame and resource operation starts with: the device
-    /// reads lost from then on and refuses every later guard. The drill
-    /// answers the bind the way a lost context does; an undrilled device on
-    /// the same driver (the negative control) is neither refused nor lost.
     #[test]
     fn a_lost_context_at_make_current_latches_the_device_lost() {
         let dev = device();
@@ -1370,14 +1175,6 @@ mod tests {
     }
 
     /// A present's reset check latches the device lost on any reset status
-    /// but `GL_NO_ERROR`, NVIDIA's purge among them, and names the status as
-    /// the cause the frontend's downgrade line prints. No reset can be caused
-    /// on demand, so the statuses are injected in place of the driver's
-    /// answer: each of the four, on a fresh device, fails the check naming
-    /// itself, latches the device lost, and every later guard is refused
-    /// with it. The negative control: a device whose check reads the driver
-    /// (`GL_NO_ERROR` on a context made without reset notification, as this
-    /// headless EGL one is), and then an injected `GL_NO_ERROR`, stays live.
     #[cfg(not(wgpu_arm))]
     #[test]
     fn a_reset_status_other_than_no_error_latches_the_device_lost() {
@@ -1419,11 +1216,6 @@ mod tests {
     }
 
     /// The reset check's function is read by name, never guessed (glvnd
-    /// hands out a stub for any name): GLES 3.2's core
-    /// `glGetGraphicsResetStatus` (NVIDIA's and Mesa's ES contexts on this
-    /// desk are 3.2), else the spelling of the robustness extension the
-    /// context lists, `KHR` before `EXT` before `ARB`; none on a 3.0 or 3.1
-    /// context that lists none.
     #[cfg(not(wgpu_arm))]
     #[test]
     fn the_reset_query_is_gles_3_2_s_or_the_robustness_extension_s() {

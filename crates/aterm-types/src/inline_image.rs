@@ -164,7 +164,7 @@ impl ImageData {
     /// Heap bytes this payload owns (the raster, not the struct).
     #[must_use]
     #[inline]
-    pub fn payload_bytes(&self) -> usize {
+    pub const fn payload_bytes(&self) -> usize {
         self.bytes.capacity()
     }
 

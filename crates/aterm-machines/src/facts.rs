@@ -67,6 +67,9 @@ pub fn gather_with_cache(sys: &dyn System, cache_dir: &Path) -> HostFacts {
         .filter(Ran::success)
         .and_then(|r| hardware::internal_disk(&r.out()))
         .unwrap_or_default();
+    // This process's own open of the system TCC database: over SSH, Remote Login's switch;
+    // for any process, its own Full Disk Access.
+    let tcc_open = remote_full_disk_access(sys);
     HostFacts {
         computer_name: scutil_get(sys, "ComputerName"),
         local_host_name: scutil_get(sys, "LocalHostName"),
@@ -109,7 +112,8 @@ pub fn gather_with_cache(sys: &dyn System, cache_dir: &Path) -> HostFacts {
         .filter(Ran::success)
         .and_then(|r| parse_idle_ns(&r.out()))
         .map(|ns| ns / 1_000_000_000),
-        remote_full_disk_access: remote_full_disk_access(sys),
+        remote_full_disk_access: tcc_open,
+        full_disk_access: sys.full_disk_access().or(tcc_open),
         console_user: console_user(sys, &accounts),
         users: people(sys, &accounts),
         keyboards: run(sys, &hidutil_keyboards())
@@ -1323,6 +1327,36 @@ VendorID ProductID LocationID UsagePage Usage RegistryID  Transport            C
         assert_eq!(remote_full_disk_access(&other), None);
         // A missing database is not a measurement either.
         assert_eq!(remote_full_disk_access(&Fake::root()), None);
+    }
+
+    /// The agent's job (root, from the SSH session that started it) answers its own Full
+    /// Disk Access from its own open of the system TCC database, never aterm's; a runner
+    /// that measured this process (`aterm init`, the doctor) gives its answer instead.
+    /// Negative control: filling it from the runner alone leaves the agent's grant `None`.
+    #[test]
+    fn this_process_s_full_disk_access_is_the_runners_measurement_else_its_own_open() {
+        assert_eq!(
+            gather_with_cache(&vm(), Path::new("/c")).full_disk_access,
+            Some(true)
+        );
+        let refused = TccRefuses {
+            inner: Fake::root(),
+            errno: libc::EPERM,
+        };
+        assert_eq!(
+            gather_with_cache(&refused, Path::new("/c")).full_disk_access,
+            Some(false)
+        );
+        assert_eq!(
+            gather_with_cache(&Fake::root(), Path::new("/c")).full_disk_access,
+            None
+        );
+        let mut measured = Fake::root();
+        measured.full_disk_access = Some(true);
+        assert_eq!(
+            gather_with_cache(&measured, Path::new("/c")).full_disk_access,
+            Some(true)
+        );
     }
 
     #[test]

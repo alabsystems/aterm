@@ -1,32 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The REAL Codex (the managed store binary, by path) in the lab's tab,
-//! against the stub's Responses API. `CODEX_HOME` and `HOME` are the
-//! scratch's (`codex-home/`, `home/`, whose `.codex` is a decoy: Codex must
-//! keep to `CODEX_HOME`), the launch line names every variable it needs and
-//! unsets `OPENAI_API_KEY` and `CODEX_API_KEY`. Three logins (`CODEX_MODE` in
-//! `env.sh`):
-//!
-//! * `lab`: the lab provider, `base_url` = the stub, `wire_api = "responses"`,
-//!   `env_key LAB_CODEX_KEY` = `lab-not-a-key`;
-//! * `chatgpt`: the lab provider with `requires_openai_auth = true` and a
-//!   COMPOSED fake ChatGPT `auth.json` (`codex-auth`): the path on which Codex
-//!   reads `auth.json`, reloads it on a 401 and refreshes a token
-//!   (`chatgpt_base_url` is the stub; `CODEX_REFRESH_TOKEN_URL_OVERRIDE` and the
-//!   revoke override point at it in every mode);
-//! * `signed-out`: the default OpenAI provider and no auth at all: the sign-in
-//!   screen, offline (egress black-holed).
-//!
-//! Neither a key nor a token is a credential anywhere. A login, a server
-//! outside the lab's process tree and the Desktop app are refused
-//! ([`safe_args`]); the sign-in screens offer a browser sign-in, so the harness
-//! is off for those two logins, and the jail denies the desktop's open doors
-//! (a bare-name `open` or `BROWSER` lands on the recorder). For codex-alab,
-//! `--no-daemon` keeps Codex's app server inside the process the tab (or
-//! `codex-run`) started, in the tree the witness watches and `down` ends; a
-//! vendor `codex` gets it where its bytes name it (0.163.0 does, 0.151.0 has
-//! no such flag and is launched without it) ([`takes_no_daemon`]).
+//! Real Codex lab runner against the stub Responses API ([`safe_args`], [`takes_no_daemon`]).
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -38,7 +13,7 @@ use crate::run::{Run, take_tag};
 use crate::util::shell_quote;
 use crate::{Fail, Res};
 
-/// The lab provider's `env_key` value: no credential anywhere (the stub logs it as `auth=key`).
+/// The lab provider's `env_key` value.
 pub use crate::stub::LAB_CODEX_KEY;
 
 fn lab(args: &[String]) -> Result<(Run, Vec<String>), Fail> {
@@ -66,7 +41,7 @@ fn q(s: &str) -> String {
     format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
-/// `CODEX_HOME/config.toml` for a login (`lab`, `chatgpt`, `signed-out`); its first line names the login.
+/// `CODEX_HOME/config.toml` for a login (`lab`, `chatgpt`, `signed-out`).
 #[must_use]
 pub fn config_text(mode: &str, port: &str, proj: &str, proj_spelled: &str, model: &str) -> String {
     let stub = format!("http://127.0.0.1:{port}");
@@ -75,7 +50,6 @@ pub fn config_text(mode: &str, port: &str, proj: &str, proj_spelled: &str, model
             "# aterm-lab codex (crates/aterm-lab), mode {mode}: rewritten at each launch; Codex may add to it"
         ),
         "check_for_update_on_startup = false".into(),
-        // auth.json in this CODEX_HOME, never the keychain
         "cli_auth_credentials_store = \"file\"".into(),
         "mcp_oauth_credentials_store = \"file\"".into(),
     ];
@@ -86,8 +60,6 @@ pub fn config_text(mode: &str, port: &str, proj: &str, proj_spelled: &str, model
         l.push(format!("model = {}", q(model)));
     }
     if mode == "chatgpt" {
-        // the ChatGPT backend is the stub too; its built-in apps server has no stand-in: off, or every screen
-        // carries a lab-only `⚠ 1 warning` (its failed initialize)
         l.extend([
             format!("chatgpt_base_url = {}", q(&format!("{stub}/backend-api/"))),
             String::new(),
@@ -160,10 +132,7 @@ pub fn write_config(run: &Run, mode: &str) -> Result<(), Fail> {
     .map_err(|e| Fail::die(format!("codex: cannot write config.toml: {e}")))
 }
 
-/// A composed, FAKE ChatGPT `auth.json`: unsigned JWTs whose payload names the
-/// lab's label (the stub logs `auth=jwt:<label>`, never the token), the
-/// account and the plan, an email at example.com, a refresh token that is a
-/// fixed string. No credential anywhere.
+/// A composed, fake ChatGPT `auth.json`.
 #[must_use]
 pub fn auth_json(label: &str, account: &str, plan: &str, now: i64) -> String {
     let seg = |j: &J| crate::util::b64url(j.dump(COMPACT).as_bytes());
@@ -230,8 +199,7 @@ pub fn write_auth(run: &Run, label: &str, account: &str, plan: &str) -> Result<P
     Ok(p)
 }
 
-/// Write [`auth_json`] into the live `CODEX_HOME` and a note of it into the
-/// stub's log (a scenario's marker): `codex-auth`'s work.
+/// Write [`auth_json`] into the live `CODEX_HOME` and a note of it into the stub's log.
 ///
 /// # Errors
 /// The write was refused, or the stub did not take the note.
@@ -251,13 +219,7 @@ pub fn auth_and_note(run: &Run, label: &str, account: &str, plan: &str) -> Resul
     Ok(p)
 }
 
-/// Refuse what would start a login, contact a real server, start a server
-/// outside the lab's process tree or open the Desktop app. A `login` anywhere
-/// in `args` (a subcommand, `mcp login`, an option's value) is refused unless
-/// they are exactly `login status`, `login --help` or `login -h` for
-/// `codex-run` (`tab` false; clap reads `login -c status` as a plain login);
-/// the tab takes none. Refused anywhere: `logout`, `app`, `app-server`,
-/// `remote-control`, `agents`, `exec-server`, `cloud`, `update`.
+/// Refuse arguments that would start a login, contact a real server, or open the Desktop app.
 ///
 /// # Errors
 /// What was refused.
@@ -283,37 +245,14 @@ pub fn safe_args(tab: bool, args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-/// Whether the Codex at `bin` takes `--no-daemon`: codex-alab does, and its
-/// default starts the app server as a background daemon that leaves the tree
-/// and outlives it, from a copy of the package it installs into `CODEX_HOME`;
-/// so does vendor `codex` from some release after 0.151.0 (0.163.0 lists
-/// `--no-daemon  Run without the shared background server` and by default
-/// starts the same shared daemon), while 0.151.0 refuses it (`unexpected
-/// argument '--no-daemon'`). Files only, never a run:
-///
-/// * the package whose manifest names `bin` (as the host's readers find it)
-///   carries ALab's build mark
-///   (`aterm_agent::harness::codex_alab::alab_bytes`): codex-alab, read no
-///   further;
-/// * else the binary's own bytes decide ([`names_no_daemon`]), whatever its
-///   package's version says: a release version names no flag set (0.151.0
-///   and 0.163.0 are both releases), and a daemon left out of the jail is
-///   silent where a refused flag is loud. Measured on this machine: vendor
-///   0.163.0 and the store's codex-alab hold `no-daemon`, vendor 0.151.0
-///   holds none.
+/// Whether the Codex at `bin` takes `--no-daemon`.
 #[must_use]
 pub fn takes_no_daemon(bin: &str) -> bool {
     let bin = Path::new(bin);
     aterm_agent::harness::codex_alab::alab_bytes(bin) || names_no_daemon(bin)
 }
 
-/// Whether the regular file at `bin` holds the bytes `no-daemon` (clap keeps
-/// a long flag's name as a literal, so a binary that takes `--no-daemon`
-/// holds it), read in 4 MiB blocks with the needle's length less one carried
-/// across each seam. `false` for a file that cannot be read and for anything
-/// not a regular file (a FIFO would park the launch). Read for every binary
-/// but codex-alab's marked package ([`takes_no_daemon`]): a debug lab reads a
-/// 250 MB build in a second or two.
+/// Whether the regular file at `bin` holds the bytes `no-daemon`.
 #[must_use]
 pub fn names_no_daemon(bin: &Path) -> bool {
     use std::io::Read as _;
@@ -343,12 +282,7 @@ pub fn names_no_daemon(bin: &Path) -> bool {
     }
 }
 
-/// The launcher: the line the tab types (`clear`, then `exec`), or
-/// `codex-run`'s (`exec`). Both exec, so the process the lab or the tab
-/// started IS Codex, and both put `--no-daemon` first where the binary takes
-/// it ([`takes_no_daemon`], read at each launch from the binary `up` took):
-/// codex-alab's app server then runs inside that process, in the tree the
-/// witness watches and `down` ends by pid.
+/// The launcher: the line the tab types (`clear`, then `exec`), or `codex-run`'s (`exec`).
 #[must_use]
 pub fn launcher(run: &Run, tab: bool, mode: &str, envs: &[String], args: &[String]) -> String {
     let w = run.w.to_string_lossy();
@@ -374,7 +308,6 @@ pub fn launcher(run: &Run, tab: bool, mode: &str, envs: &[String], args: &[Strin
         shell_quote(&format!("{w}/open.log")),
         shell_quote(&shim.join("open").to_string_lossy())
     ));
-    // the refresh and the revoke go to the stub in every mode: a ChatGPT auth.json can stand in any CODEX_HOME
     s.push_str(&format!(
         "  CODEX_REFRESH_TOKEN_URL_OVERRIDE=http://127.0.0.1:{0}/oauth/token CODEX_REVOKE_TOKEN_URL_OVERRIDE=http://127.0.0.1:{0}/oauth/revoke \\\n",
         run.port
@@ -460,7 +393,7 @@ pub fn parse_launch(args: &[String]) -> Result<Launch, String> {
     Ok(l)
 }
 
-/// Launch the managed Codex in the lab's first tab; the `launched: …` line.
+/// Launch the managed Codex in the lab's first tab.
 ///
 /// # Errors
 /// No Codex, no witness, a refused argument, or the launch line could not be typed.
@@ -468,8 +401,6 @@ pub fn launch(run: &Run, l: &Launch) -> Result<String, Fail> {
     need_codex(run)?;
     crate::procs::need_witness(run)?;
     safe_args(true, &l.args)?;
-    // The sign-in screens (signed out, a lost ChatGPT login) offer a browser sign-in: nothing in the lab may press
-    // one, so the harness is off for those two logins. The lab provider keeps the lab's harness.
     if l.mode != "lab" {
         crate::verbs::set_harness(run, &[("enabled".into(), "false".into())])?;
     }
@@ -521,20 +452,13 @@ pub fn cmd_codex(args: &[String]) -> Res {
     Ok(0)
 }
 
-/// `codex-run [tag] [--lab|--chatgpt|--signed-out] -- <codex args>`: a
-/// non-interactive Codex command inside the jail (scratch `HOME` and
-/// `CODEX_HOME`, `--no-daemon` where the binary takes it,
-/// [`takes_no_daemon`]), on the config of the login asked for (by
-/// default the tab's): `config.toml` is rewritten when it is another login's,
-/// which a Codex running in the tab then finds on disk too. It runs outside
-/// the instance's tree, so it is started where the witness watches it
-/// (`jailed.pids`). Its exit status.
+/// `codex-run [tag] [--lab|--chatgpt|--signed-out] -- <codex args>`.
 pub fn cmd_codex_run(args: &[String]) -> Res {
     let (run, mut a) = lab(args)?;
     codex_run(&run, &mut a, crate::procs::JailOut::Inherit).map(|(rc, _)| rc)
 }
 
-/// [`cmd_codex_run`] on a loaded lab: its exit status and, when captured, its output.
+/// [`cmd_codex_run`] on a loaded lab.
 ///
 /// # Errors
 /// No Codex, a refused argument, or the jail could not start it.
@@ -595,9 +519,7 @@ pub fn codex_run(
     .map_err(Fail::die)
 }
 
-/// `codex-auth [tag] [LABEL [ACCOUNT [PLAN]]]`: write a composed fake
-/// `auth.json` (default `B`, `acct-lab-1`, `plus`) into the LIVE `CODEX_HOME`,
-/// and a note of it into the stub's log.
+/// `codex-auth [tag] [LABEL [ACCOUNT [PLAN]]]`.
 pub fn cmd_codex_auth(args: &[String]) -> Res {
     let (run, a) = lab(args)?;
     let get = |i: usize, d: &str| a.get(i).cloned().unwrap_or_else(|| d.to_string());
@@ -619,10 +541,7 @@ pub fn cmd_codex_auth(args: &[String]) -> Res {
     Ok(0)
 }
 
-/// The `x-codex-*` headers of `ratelimits`' arguments: `off`, or `PRIMARY
-/// SECONDARY` (used percent of the 5h and the weekly window, `-` for none)
-/// and `credits=yes|no|unlimited`, `balance=N`, `reached=TYPE`,
-/// `promo=TEXT`, `active=ID`.
+/// The `x-codex-*` headers of `ratelimits`' arguments.
 ///
 /// # Errors
 /// A missing window or an unknown key.
@@ -690,10 +609,6 @@ pub fn ratelimit_headers(args: &[String]) -> Result<J, String> {
 }
 
 /// `ratelimits [tag] off | PRIMARY SECONDARY [credits=yes|no|unlimited]
-/// [balance=N] [reached=TYPE] [promo=TEXT] [active=ID]`: the `x-codex-*`
-/// headers every stub answer carries, and the account usage a `--chatgpt` Codex
-/// polls; the `on200`/`on429` blocks `headers` wrote stay
-/// ([`crate::verbs::write_headers`]).
 pub fn cmd_ratelimits(args: &[String]) -> Res {
     let (run, a) = lab(args)?;
     let h = ratelimit_headers(&a).map_err(Fail::die)?;
@@ -702,10 +617,7 @@ pub fn cmd_ratelimits(args: &[String]) -> Res {
     Ok(0)
 }
 
-/// The newest rollout of the TAB's Codex under the scratch `CODEX_HOME`, or
-/// `None`. `codex-run`'s `exec` writes its rollouts there too, and is never
-/// the tab: a rollout whose `session_meta` (its first line) names the
-/// originator `codex_exec` is skipped.
+/// The newest rollout of the tab's Codex under the scratch `CODEX_HOME`, or `None`.
 #[must_use]
 pub fn tab_rollout(run: &Run) -> Option<PathBuf> {
     let mut files = Vec::new();
@@ -866,16 +778,12 @@ mod tests {
     }
 
     /// The bytes of a stand-in codex-alab binary: clap's literal for the
-    /// flag among other text, as the store's build holds it.
     const NAMES_IT: &[u8] = b"\x00\xcf\xfa\xed\xfeno-daemon cannot be used with --remote\x00";
 
     /// The bytes of a stand-in binary that takes no `--no-daemon`: the
-    /// literal's pieces, never the literal (vendor 0.151.0's case).
     const NAMES_NONE: &[u8] = b"\x00\xcf\xfa\xed\xfeno-daemo\x00n-daemon\x00no-daemoN\x00";
 
     /// A Codex package at `root` (layout 1, `bin/codex` its entrypoint,
-    /// holding `exe`), its manifest's version `version`, ALab's when `alab`
-    /// (its `alab-build.json` beside the manifest): the binary's path.
     fn package_at(root: &Path, version: &str, alab: bool, exe: &[u8]) -> String {
         fs::create_dir_all(root.join("bin")).unwrap();
         fs::write(root.join("bin/codex"), exe).unwrap();
@@ -894,19 +802,6 @@ mod tests {
     }
 
     /// THE LAUNCHER EXECS CODEX BY PATH, `--no-daemon` ONLY WHERE IT IS
-    /// TAKEN: codex-alab's package (its ALab build mark beside the manifest)
-    /// is launched with `--no-daemon` before the caller's arguments, in the
-    /// tab and in `codex-run`, its bytes unread. Any other binary is read: a
-    /// vendor release's package whose bytes name the flag (0.163.0, which
-    /// takes it and by default runs a shared daemon) gets it; one whose bytes
-    /// do not (0.151.0, which refuses it) and a path that is no file are
-    /// launched without it, the arguments straight after the binary. So is a
-    /// binary in NO package (`LAB_CODEX` at a `target/…/codex` dev build or a
-    /// copy) and one in a package that says neither (an unmarked
-    /// pre-release): codex-alab's bytes name the flag and get it.
-    /// NEGATIVE CONTROL: the mark written into 0.151.0's package brings
-    /// `--no-daemon` in, and 0.163.0's and the dev build's bytes without the
-    /// literal take it away.
     #[test]
     fn the_launcher_execs_codex_by_path_with_no_daemon_where_it_is_taken() {
         let scratch = aterm_tempfile::tempdir().expect("exclusive package fixture");
@@ -994,8 +889,6 @@ mod tests {
             [Some(true); 2],
             "a package that says neither"
         );
-        // CONTROL: the mark brings it to 0.151.0's package, and 0.163.0's
-        // package and the dev build lose it with the literal.
         let marked = package_at(&scratch.path().join("vendor"), "0.151.0", true, NAMES_NONE);
         assert_eq!(marked, vendor);
         assert_eq!(takes(&marked), [Some(true); 2], "CONTROL: the mark");
@@ -1010,10 +903,6 @@ mod tests {
     }
 
     /// The literal is found wherever it lies, across the seam of two read
-    /// blocks too, and nowhere it is not: a file whose only `no-daemon`
-    /// straddles the first 4 MiB block's end is read as naming it, the same
-    /// file with one byte of it changed is not, and a directory is never
-    /// opened.
     #[test]
     fn a_binary_names_the_flag_across_a_block_seam() {
         let scratch = aterm_tempfile::tempdir().expect("exclusive binary fixture");

@@ -1,37 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Provisioning: everything `atpkg-keys setup` and `join` do except reading the paper phrase
-//! off `/dev/tty`.
-//!
-//! * `setup`, the first machine: generates the master, prints the phrase once, arms
-//!   `pins::PAPER_MASTER_PUBKEYS`, mints this machine's keypair, and creates the
-//!   master-signed roster.
-//! * `join`, every later machine: proves the phrase against the committed anchor and the
-//!   existing roster, then mints and extends the roster. It edits no trust anchor.
-//!
-//! The roster is the only grant: there is no compiled-in channel keyset, so every grant is
-//! one `machine-revoke` can take back.
-//!
-//! Every function here takes a [`MasterSeed`], never a phrase or bytes; it has no byte
-//! accessor, no `Clone` and a redacted `Debug`, so provisioning logic cannot write, log or
-//! return the master. The split also lets the success path run against a synthetic seed
-//! with no terminal.
-//!
-//! Three phases, and the order is the safety property:
-//!
-//! 1. [`preflight`]: every refusal possible before a secret exists. Writes no file.
-//! 2. [`plan`]: compute the whole result in memory (the new `pins.rs` text, the machine
-//!    keypair, the roster and its master signature). Bad input fails here, with the tree
-//!    untouched.
-//! 3. [`write_pins`] then [`write_rest`]: write the pre-computed bytes. The anchor goes first
-//!    and is re-read, because the key and roster depend on it. `setup` shows the phrase and
-//!    proves its transcription before either write (`main.rs`'s `provision`).
-//!
-//! The roster is a pair (`aterm-machines.toml` and its detached `.sig`), written under one
-//! crash-released lock ([`lock_roster`]) through a durable redo transaction
-//! ([`publish_roster_locked`]); the comment above that layer explains it. Nothing here
-//! commits or pushes: [`render_report`] tells the operator to review the diff.
+//! Provisioning flows for `atpkg-keys setup` and `join`.
 
 use crate::fsio::{
     concat, ensure_parent_dir, read_bytes, sync_parent, sync_parent_ordered, write_bytes_atomic,
@@ -43,32 +13,29 @@ use crate::pins_edit::{
 };
 use aterm_update_core::roster::{Roster, RosterReject};
 
-/// Where the roster and its master signature live by default — the release staging dir,
-/// so a cut picks them up as assets alongside the appcast.
+/// Default relative path for the roster and its detached master signature.
 pub const DEFAULT_ROSTER: &str = "dist/aterm-machines.toml";
 
-/// The machine's secret key, relative to `$HOME`; it never leaves the machine that minted it.
+/// Machine secret key path relative to `$HOME`.
 pub const MACHINE_KEY_REL: &str = ".aterm/machine.key";
 
-/// The machine's public record, beside its key: id, pubkey, mint time.
+/// Machine public record path relative to `$HOME`.
 pub const MACHINE_PUB_REL: &str = ".aterm/machine.toml";
 
-/// The anchor file, relative to the workspace root.
+/// Anchor file path relative to the workspace root.
 pub const PINS_REL: &str = "crates/aterm-update-core/src/pins.rs";
 
-/// Which verb is running. The two share almost all of their work; what differs is who
-/// supplies the master and what the anchor is allowed to look like beforehand.
+/// Provisioning verb being executed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Verb {
-    /// The first machine: generate the master and arm the anchor.
+    /// First machine: generate the master and arm the anchor.
     Setup,
-    /// A later machine (or a re-run on the first): prove the master, then mint.
+    /// Later machine (or re-run): verify the typed master and add or rotate this machine.
     Join,
 }
 
 impl Verb {
-    /// The verb as it is spelled on the command line, for messages and provenance
-    /// comments.
+    /// Command-line name of the verb.
     #[must_use]
     pub fn name(self) -> &'static str {
         match self {
@@ -78,25 +45,22 @@ impl Verb {
     }
 }
 
-/// Every path a provisioning run touches, explicit so a test can run the whole path in a
-/// temporary directory without `$HOME`, a repository or a terminal.
+/// File paths touched by a provisioning run.
 #[derive(Debug, Clone)]
 pub struct Paths {
-    /// `crates/aterm-update-core/src/pins.rs`.
+    /// Path to `crates/aterm-update-core/src/pins.rs`.
     pub pins: String,
-    /// The roster document; its detached master signature is `<roster>.sig`.
+    /// Path to the roster document (`<roster>.sig` holds its signature).
     pub roster: String,
-    /// This machine's secret key file, written 0600 and never copied off the machine.
+    /// Path to this machine's secret key file (`0600`).
     pub key: String,
-    /// This machine's public record.
+    /// Path to this machine's public record.
     pub machine_pub: String,
-    /// Whether `pins` came from an explicit `--pins` rather than discovery. Discovery means
-    /// the tree this binary was built from, so the compiled-in second-master refusal applies;
-    /// an explicit path names another tree, whose own file anchor governs.
+    /// Whether `pins` was passed explicitly via `--pins` rather than discovered.
     pub pins_explicit: bool,
 }
 
-/// `$HOME/<rel>`, or an error naming what was missing.
+/// Resolve `$HOME/<rel>`.
 pub fn home_path(rel: &str) -> Result<String, String> {
     let home = std::env::var("HOME").map_err(|_| "HOME is not set".to_string())?;
     let mut p = home;
@@ -106,8 +70,6 @@ pub fn home_path(rel: &str) -> Result<String, String> {
 }
 
 /// Find `crates/aterm-update-core/src/pins.rs` by walking up from the current directory.
-/// Found, not configured: a mistyped `--pins` is another transcription risk. The flag remains
-/// for tests and for an operator who means a different tree.
 pub fn discover_pins_path() -> Result<String, String> {
     let dir = std::env::current_dir()
         .map_err(|e| concat(&["cannot read the current directory: ", &e.to_string()]))?;
@@ -116,8 +78,6 @@ pub fn discover_pins_path() -> Result<String, String> {
 
 /// [`discover_pins_path`]'s walk, from `dir` rather than the current directory.
 fn discover_pins_path_from(mut dir: std::path::PathBuf) -> Result<String, String> {
-    // Bounded: a repository is not 24 levels below where anyone runs a CLI, and an
-    // unbounded walk to `/` is how a tool ends up editing something it never meant to.
     for _ in 0..24 {
         let candidate = dir.join(PINS_REL);
         if candidate.is_file() {
@@ -137,9 +97,7 @@ fn discover_pins_path_from(mut dir: std::path::PathBuf) -> Result<String, String
     ]))
 }
 
-/// Machine ids appear in signed documents and in a deny-list typed under pressure after a
-/// theft, so they are 1-32 ASCII letters, digits, `-` and `_`: nothing confusable, nothing
-/// that needs quoting, no homoglyphs.
+/// Validate a machine id.
 pub fn vet_machine_id(id: &str) -> Result<(), String> {
     if id.is_empty() || id.len() > 32 {
         return Err("a machine id must be 1-32 characters".to_string());
@@ -153,7 +111,7 @@ pub fn vet_machine_id(id: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// A stable, printable name for a roster rejection, without `format!`.
+/// Printable name for a [`RosterReject`].
 #[must_use]
 pub fn reject_name(r: &RosterReject) -> String {
     use RosterReject as R;
@@ -174,43 +132,29 @@ pub fn reject_name(r: &RosterReject) -> String {
     })
 }
 
-/// Whether an absent roster may be the first mint. A check in [`preflight`] alone holds at
-/// one moment: a roster removed before [`plan`] (`dist/` is gitignored, so a cleanup can
-/// sweep it) would reach [`load_roster`]'s fresh branch and fork the lineage at the same
-/// sequence. The mode enforces the rule at the point of use.
+/// Whether an absent roster may be treated as the first mint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RosterExpectation {
-    /// The roster must already exist: `join`'s case, since a committed master implies a
-    /// roster it signed exists somewhere, and starting another forks it.
+    /// The roster must already exist (`join`).
     MustExist,
-    /// An absent roster is the first mint: `setup`, whose preflight proved no master exists.
+    /// An absent roster starts the first mint (`setup`).
     MayCreateFresh,
 }
 
-/// The exact on-disk bytes of the roster pair a run planned against, so the write phase can
-/// prove it replaces the pair it read (as [`write_pins`] does for the anchor).
+/// On-disk bytes of the roster pair a run planned against.
 #[derive(Debug, Clone)]
 pub struct RosterSnapshot {
     pub raw: Vec<u8>,
     pub sig: Vec<u8>,
 }
 
-/// Read the roster and its signature, verify under `master_pubkey`, and parse. Returns the
-/// roster and the exact pair bytes, or `None` for a fresh roster (no pair on disk, allowed
-/// only under [`RosterExpectation::MayCreateFresh`]).
-///
-/// There is no unverified parse path, and verifying is also the transcription check: a
-/// mistyped phrase derives a master that cannot verify the real one's roster. A pair with
-/// one half missing is half-published and never starts a fresh roster.
+/// Read, verify under `master_pubkey`, and parse the roster pair.
 pub fn load_roster(
     path: &str,
     master_pubkey: &str,
     now: u64,
     expect: RosterExpectation,
 ) -> Result<(Roster, Option<RosterSnapshot>), String> {
-    // Before reading the pair: while a transaction is pending the files may be torn, and
-    // reading one fails as "signature did not verify", the mistyped-phrase diagnosis this
-    // layer exists to prevent.
     refuse_pending_roster_transaction(path)?;
     let sig_path = concat(&[path, ".sig"]);
     if std::fs::metadata(path).is_err() {
@@ -224,7 +168,6 @@ pub fn load_roster(
         }
         if expect == RosterExpectation::MustExist {
             // `join`'s refusal, enforced at the point of use as well as at preflight (see
-            // [`RosterExpectation`]).
             return Err(concat(&[
                 "no roster at ",
                 path,
@@ -272,40 +215,12 @@ pub fn load_roster(
     Ok((roster, Some(RosterSnapshot { raw, sig })))
 }
 
-// The roster pair's crash-safe transaction layer.
-//
-// The roster is two files, `aterm-machines.toml` and `aterm-machines.toml.sig`, meaningful
-// only together. Per-file atomicity (`crate::fsio::write_bytes_atomic`) makes each file whole
-// but cannot make the pair consistent: no syscall renames two names at once, and a process
-// death or power loss between the renames runs no error path. It would leave the new
-// document beside the old signature, refused by every client as "signature did not verify",
-// misread by the operator as a mistyped phrase, in a gitignored `dist/` that `git checkout`
-// cannot restore.
-//
-// So the pair is published through a redo log. The new pair and the exact predecessor it
-// replaces are written into a staging directory, fsynced, and published under one fixed name
-// by a single `rename(2)`, the commit point. Before it a crash leaves only litter; after it
-// every later run replays the pair forward on lock acquisition, before any reader looks.
-//
-// The recorded predecessor makes replay safe: recovery compares each canonical half against
-// it and the target, and a half that is neither means something authoritative landed
-// meanwhile (a copy from another machine, a newer join). Then the transaction is left in
-// place for the operator to reconcile.
-
 /// The one fixed name a committed roster transaction takes: a rendezvous recovery can find
-/// without knowing which run wrote it.
 fn roster_txn_path(path: &str) -> String {
     concat(&[path, ".atpkg-keys.txn"])
 }
 
-/// Refuse to read a roster while a committed transaction is pending. Recovery is a write
-/// that only [`lock_roster`] performs; a reader proceeding over a torn pair would report
-/// "does not verify under the master you typed" and send the operator to re-check a correct
-/// phrase.
-///
-/// Public for readers outside this crate: `targo --unverified ship provision --check` writes
-/// nothing, so it may not take the writer lock (acquiring it repairs) and applies this
-/// refusal instead.
+/// Refuse to read a roster while a committed transaction is pending.
 pub fn refuse_pending_roster_transaction(path: &str) -> Result<(), String> {
     let transaction = roster_txn_path(path);
     match std::fs::symlink_metadata(&transaction) {
@@ -329,11 +244,9 @@ pub fn refuse_pending_roster_transaction(path: &str) -> Result<(), String> {
 }
 
 /// Write one member of a staged transaction: `0600`, never over an existing name, and synced
-/// before the caller fsyncs the directory that publishes it.
 fn write_txn_file(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write as _;
     use std::os::unix::fs::OpenOptionsExt as _;
-    // `append(true)`, not `write(true)`: see `crate::fsio::stage_sibling_temp_with_mode`.
     let mut file = std::fs::OpenOptions::new()
         .append(true)
         .create_new(true)
@@ -344,11 +257,6 @@ fn write_txn_file(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
 }
 
 /// Commit a complete roster transition to one durable redo directory, returning its path.
-///
-/// The fixed name appears only after the predecessor, both target halves and the staging
-/// directory are fsynced, so the commit `rename` publishes a directory already whole on the
-/// device. The predecessor lets [`complete_roster_transaction`] tell an interrupted
-/// transition from a newer pair that landed meanwhile.
 fn begin_roster_transaction(
     path: &str,
     expected: Option<&RosterSnapshot>,
@@ -376,8 +284,6 @@ fn begin_roster_transaction(
             ]));
         }
     }
-    // The staging name is unique (pid + clock + attempt), never the fixed one: a run that
-    // dies mid-staging leaves litter, not something recovery would replay.
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -430,7 +336,6 @@ fn begin_roster_transaction(
     })
     .and_then(|()| write_txn_file(&body_path, bytes))
     .and_then(|()| write_txn_file(&sig_path, sig))
-    // Ordered: the staged entries land before the commit rename, as each member does.
     .and_then(|()| aterm_durable::ordered(&std::fs::File::open(&staged)?));
     if let Err(e) = staged_result {
         let _ = std::fs::remove_dir_all(&staged);
@@ -441,8 +346,6 @@ fn begin_roster_transaction(
             &e.to_string(),
         ]));
     }
-    // The commit point: one rename of a whole directory, then the parent fsync that makes
-    // the new name survive a power loss.
     if let Err(e) = std::fs::rename(&staged, &committed).and_then(|()| sync_parent(&committed)) {
         let _ = std::fs::remove_dir_all(&staged);
         return Err(concat(&[
@@ -456,7 +359,6 @@ fn begin_roster_transaction(
 }
 
 /// `Some(bytes)` if the file is there, `None` if it is absent, and an error otherwise: the
-/// predecessor comparison must never score "unreadable" as "absent".
 fn read_optional_bytes(path: &str) -> Result<Option<Vec<u8>>, String> {
     match read_bytes(path) {
         Ok(bytes) => Ok(Some(bytes)),
@@ -471,7 +373,6 @@ fn read_optional_bytes(path: &str) -> Result<Option<Vec<u8>>, String> {
 }
 
 /// The pair a committed transaction expected to replace: `None` when it was published
-/// over nothing (a first roster), `Some` for its exact previous bytes.
 fn transaction_predecessor(transaction: &str) -> Result<Option<RosterSnapshot>, String> {
     let state_path = std::path::Path::new(transaction).join("predecessor-state");
     let state_path = state_path
@@ -523,8 +424,6 @@ fn transaction_predecessor(transaction: &str) -> Result<Option<RosterSnapshot>, 
 }
 
 /// Whether a canonical half is one the transaction may overwrite: the predecessor it
-/// recorded, or its own target (the crash came after this half's rename). Anything else is a
-/// third state nobody in this transaction wrote.
 fn transaction_half_is_known(
     current: Option<&[u8]>,
     predecessor: Option<&[u8]>,
@@ -534,8 +433,6 @@ fn transaction_half_is_known(
 }
 
 /// Drop a completed transaction's fixed name so nothing replays it again. Rename, fsync, then
-/// delete: once the fixed name is durably gone the leftover directory is inert, so its
-/// best-effort removal cannot leave a half-deleted transaction under a trusted name.
 fn retire_roster_transaction(transaction: &str) -> Result<(), String> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -556,7 +453,6 @@ fn retire_roster_transaction(transaction: &str) -> Result<(), String> {
             &e.to_string(),
         ])
     })?;
-    // Ordered: retirement only needs to land after the pair, and replay is idempotent.
     sync_parent_ordered(transaction).map_err(|e| {
         concat(&[
             "persist retirement of completed roster transaction ",
@@ -567,15 +463,11 @@ fn retire_roster_transaction(transaction: &str) -> Result<(), String> {
         ])
     })?;
     let _ = std::fs::remove_dir_all(&retired);
-    // Ordered: garbage collection; a resurrected retired directory is removed again.
     let _ = sync_parent_ordered(&retired);
     Ok(())
 }
 
 /// Complete a committed pair forward, if one is pending. Runs on every writer-lock
-/// acquisition before the caller reads the roster, so a death after either canonical rename
-/// converges on the signed pair the redo directory holds. Idempotent: replaying an installed
-/// pair rewrites the same bytes and retires the transaction.
 fn complete_roster_transaction(path: &str) -> Result<(), String> {
     let transaction = roster_txn_path(path);
     match std::fs::symlink_metadata(&transaction) {
@@ -650,9 +542,6 @@ fn complete_roster_transaction(path: &str) -> Result<(), String> {
     })?;
     #[cfg(test)]
     crate::fsio::window::reached("roster pair replayed", path);
-    // Retirement is only legitimate once the pair is PROVED installed: retiring on the
-    // strength of two Ok returns would drop the redo log on the word of the same
-    // filesystem that just lost the pair.
     if read_bytes(path).ok().as_deref() != Some(bytes.as_slice())
         || read_bytes(&sig_path).ok().as_deref() != Some(sig.as_slice())
     {
@@ -665,39 +554,14 @@ fn complete_roster_transaction(path: &str) -> Result<(), String> {
     retire_roster_transaction(&transaction)
 }
 
-/// The advisory lock a roster writer holds across its whole read, edit, sign and publish.
-///
-/// Without it, two runs could each read sequence N, sign N+1, and pass a compare-then-publish
-/// check in the gap before the other's rename: a same-sequence fork the monotonic ratchet
-/// cannot see, in which the second publish silently de-authorizes the first one's machine. It
-/// is an [`aterm_update_core::FileLock`]: released by `LOCK_UN` when the guard drops (a copy
-/// of the descriptor in a child mid-spawn cannot keep it) and by the kernel on a crash, so
-/// there is no stale-lock recovery.
-///
-/// Every roster-pair writer in this workspace's binaries takes it (test fixtures elsewhere
-/// write pair bytes directly):
-///
-/// * `atpkg-keys setup` / `join`: [`write_rest`], from before its premise check through
-///   publication;
-/// * `atpkg-keys machine-revoke`: one lock across read, revoke and publish;
-/// * `targo --unverified ship provision`: its roster seeding (the kept-copy restore, the
-///   channel/dist install, and the kept copy written after `authorize_cut`), in
-///   `aterm-release`'s `provision::lock_roster_pair`, dropped before the in-process mint
-///   re-takes it in `write_rest`;
-/// * `targo --unverified ship recover`: `reconstruct_roster_assets`'s rewrite of `dist/`.
-///
-/// It is `flock`: it serializes across processes, per open file description, so a process
-/// that takes it twice blocks on itself. Observers take [`lock_roster_read_only`], or apply
-/// [`refuse_pending_roster_transaction`] alone when no rendezvous need exist.
+/// Advisory writer lock held across roster read, edit, sign, and publish.
 pub struct RosterLock {
     path: String,
     _guard: aterm_update_core::FileLock,
 }
 
 impl RosterLock {
-    /// Compare the guarded pair with the bytes the caller read (`None`: the caller planned a
-    /// first roster, so both halves must still be absent). A method on the live guard, so
-    /// this compare-and-swap cannot run without the serialization that gives it meaning.
+    /// Verify that the on-disk roster pair still matches `expected`.
     pub fn assert_snapshot(&self, expected: Option<&RosterSnapshot>) -> Result<(), String> {
         let sig_path = concat(&[&self.path, ".sig"]);
         match expected {
@@ -761,8 +625,7 @@ impl RosterLock {
     }
 }
 
-/// Take the roster's writer lock, replaying any committed transaction forward first, so the
-/// caller's first read sees a consistent pair.
+/// Acquire the roster writer lock, replaying any committed transaction first.
 pub fn lock_roster(path: &str) -> Result<RosterLock, String> {
     let lock_path = concat(&[path, ".lock"]);
     ensure_parent_dir(&lock_path).map_err(|e| {
@@ -782,9 +645,7 @@ pub fn lock_roster(path: &str) -> Result<RosterLock, String> {
     })
 }
 
-/// Claim an existing roster lock without creating or repairing anything, for callers that
-/// only observe: an observer reports an interrupted transaction, never completes one
-/// (recovery is a write).
+/// Acquire an existing roster lock without creating or repairing files.
 pub fn lock_roster_read_only(path: &str) -> Result<RosterLock, String> {
     use std::os::unix::fs::MetadataExt as _;
 
@@ -815,8 +676,6 @@ pub fn lock_roster_read_only(path: &str) -> Result<RosterLock, String> {
     #[cfg(test)]
     crate::fsio::window::reached("read-only claim locked", &lock_path);
 
-    // Refuse a lock file unlinked or replaced after open: a read-only claim must not lock an
-    // orphaned inode while a writer locks a new file under the same name.
     let current = std::fs::symlink_metadata(&lock_path).map_err(|e| {
         concat(&[
             "re-check existing roster lock ",
@@ -841,8 +700,6 @@ pub fn lock_roster_read_only(path: &str) -> Result<RosterLock, String> {
 }
 
 /// Lock, read the pair, and publish in one call. Test-only: a real mutation holds one lock
-/// across its own read, edit, sign and publish ([`publish_roster_locked`]); this states the
-/// transaction layer's properties without the whole provisioning pipeline.
 #[cfg(test)]
 fn publish_roster(path: &str, bytes: &[u8], sig: &[u8]) -> Result<(), String> {
     let lock = lock_roster(path)?;
@@ -866,13 +723,7 @@ fn publish_roster(path: &str, bytes: &[u8], sig: &[u8]) -> Result<(), String> {
     publish_roster_locked(&lock, path, expected.as_ref(), bytes, sig)
 }
 
-/// A roster transition durably committed but not yet installed under the two canonical
-/// names: what a process death between the commit and the renames leaves, as a value.
-///
-/// [`publish_roster_locked`] is [`commit_roster_pair`] then [`CommittedRoster::complete`].
-/// Dropping this value instead of completing it reproduces a killed process byte for byte
-/// through the real commit path, which is how `aterm-release` (whose `targo --unverified ship
-/// provision` seeds the same pair) tests its own crash recovery.
+/// A roster transaction committed to the redo directory.
 #[must_use = "a committed roster transaction that is never completed leaves the pair for \
               the next writer to recover; drop it deliberately or call complete()"]
 pub struct CommittedRoster {
@@ -881,13 +732,13 @@ pub struct CommittedRoster {
 }
 
 impl CommittedRoster {
-    /// The redo directory holding the exact signed pair — the path recovery advice names.
+    /// Redo directory path holding the signed roster pair.
     #[must_use]
     pub fn transaction_path(&self) -> &str {
         &self.transaction
     }
 
-    /// Install both canonical halves from the commit and retire it.
+    /// Install both canonical halves from the commit and remove the redo directory.
     pub fn complete(self) -> Result<(), String> {
         complete_roster_transaction(&self.path).map_err(|e| {
             concat(&[
@@ -901,9 +752,7 @@ impl CommittedRoster {
     }
 }
 
-/// Check the caller's premise and commit the new pair to the redo log, touching neither
-/// canonical name. `expected` is the pair the caller read under this lock: the CAS premise
-/// and the predecessor the transaction records.
+/// Verify `expected` and commit the new signed pair to the redo log.
 pub fn commit_roster_pair(
     lock: &RosterLock,
     path: &str,
@@ -923,8 +772,7 @@ pub fn commit_roster_pair(
     })
 }
 
-/// Publish an already-signed pair while the caller holds the roster lock across its own
-/// read → edit → CAS sequence. This is the form every roster mutation uses.
+/// Publish an already-signed roster pair while holding `lock`.
 pub fn publish_roster_locked(
     lock: &RosterLock,
     path: &str,
@@ -935,8 +783,7 @@ pub fn publish_roster_locked(
     commit_roster_pair(lock, path, expected, bytes, sig)?.complete()
 }
 
-/// The state a verb has proved before any secret exists. Produced by [`preflight`],
-/// consumed by [`plan`].
+/// State validated by [`preflight`] before any secret is read or generated.
 pub struct Preflight {
     verb: Verb,
     id: String,
@@ -949,7 +796,6 @@ pub struct Preflight {
 
 impl std::fmt::Debug for Preflight {
     /// Terse: this value travels beside a `MasterSeed`, and a derived impl would dump all of
-    /// `pins.rs` into a panic message.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("Preflight(")?;
         f.write_str(self.verb.name())?;
@@ -959,13 +805,7 @@ impl std::fmt::Debug for Preflight {
     }
 }
 
-/// Every refusal that can be made before a secret exists. Writes no file and needs no
-/// master: an operator who will be refused is refused before typing the phrase, and `setup`
-/// meeting an armed anchor stops before generating a second master, which would strand the
-/// first (its only copy is on paper).
-///
-/// It does create missing directories (`$HOME/.aterm` on a fresh machine), so that failure
-/// costs an error message instead of arriving after the anchor is armed.
+/// Validate paths and pre-existing files before reading or generating any secret.
 pub fn preflight(verb: Verb, id: &str, paths: &Paths) -> Result<Preflight, String> {
     vet_machine_id(id)?;
 
@@ -979,13 +819,11 @@ pub fn preflight(verb: Verb, id: &str, paths: &Paths) -> Result<Preflight, Strin
         ])
     })?;
 
-    // Reading the anchor is a shape check too: an unrecognised spelling stops the run now.
     let master = read_anchor(&pins_src, MASTER_ANCHOR)?;
 
     match verb {
         Verb::Setup => {
             // A second master is not an additional authority but a replacement for one
-            // that exists only on paper.
             if !master.members.is_empty() {
                 return Err(concat(&[
                     "a paper master is ALREADY committed in ",
@@ -998,10 +836,6 @@ pub fn preflight(verb: Verb, id: &str, paths: &Paths) -> Result<Preflight, Strin
                      wrote down and mints this machine under the master you already have.",
                 ]));
             }
-            // The same refusal against the compiled-in anchor: a working tree can be
-            // reverted, a shipped build cannot. Only for the discovered tree; an explicit
-            // --pins names another tree (a fixture, another checkout), whose file anchor,
-            // checked above, governs.
             if !paths.pins_explicit && !aterm_update_core::pins::PAPER_MASTER_PUBKEYS.is_empty() {
                 return Err(
                     "this build was compiled with a paper master already pinned \
@@ -1012,8 +846,6 @@ pub fn preflight(verb: Verb, id: &str, paths: &Paths) -> Result<Preflight, Strin
                         .to_string(),
                 );
             }
-            // An existing roster means an existing master signed it. `setup` has no master
-            // to verify it with, and overwriting it would discard whatever it names.
             if std::fs::metadata(&paths.roster).is_ok() {
                 return Err(concat(&[
                     "a roster already exists at ",
@@ -1035,13 +867,6 @@ pub fn preflight(verb: Verb, id: &str, paths: &Paths) -> Result<Preflight, Strin
                      there.",
                 ]));
             }
-            // The roster must already be here. A committed master means a roster it signed
-            // exists somewhere, but it lives in gitignored `dist/` and does not travel with
-            // the repository, so a fresh checkout has an armed anchor and no roster.
-            // Starting a new one at seq 1 under the real master would make two valid
-            // same-sequence rosters: whichever is published de-authorizes every machine on
-            // the other, the ratchet cannot see the fork, and a client meeting an
-            // unattributable release is wedged. There is no safe guess, so ask for the file.
             if std::fs::metadata(&paths.roster).is_err() {
                 return Err(concat(&[
                     "no roster at ",
@@ -1059,7 +884,6 @@ pub fn preflight(verb: Verb, id: &str, paths: &Paths) -> Result<Preflight, Strin
         }
     }
 
-    // The directories this run writes into, created before anything secret exists.
     for path in [&paths.key, &paths.machine_pub, &paths.roster] {
         ensure_parent_dir(path).map_err(|e| {
             concat(&[
@@ -1071,9 +895,6 @@ pub fn preflight(verb: Verb, id: &str, paths: &Paths) -> Result<Preflight, Strin
         })?;
     }
 
-    // After the verb checks: a second `setup` on the first machine trips both, and "a master
-    // is already committed, use `join`" is the message that explains it. `create_new` at
-    // write time remains the real guard against a race.
     if std::fs::metadata(&paths.key).is_ok() {
         return Err(concat(&[
             &paths.key,
@@ -1092,12 +913,7 @@ pub fn preflight(verb: Verb, id: &str, paths: &Paths) -> Result<Preflight, Strin
     })
 }
 
-/// `join`'s transcription proof, part one: the typed master must be one the committed anchor
-/// names. Part two is [`plan`]'s roster verification; both run before any write.
-///
-/// The orchestrator's call is a courtesy: [`plan`] re-runs this check for `join`, so a caller
-/// that skips it (and supplies an attacker-signed `--roster`, which the roster proof alone
-/// would accept) is still refused.
+/// Verify that `seed` derives a master key committed in `pre` (`join`).
 pub fn verify_master(pre: &Preflight, seed: &MasterSeed) -> Result<(), String> {
     let derived = seed.pubkey_b64()?;
     if pre.master_members.contains(&derived) {
@@ -1114,19 +930,16 @@ pub fn verify_master(pre: &Preflight, seed: &MasterSeed) -> Result<(), String> {
     ]))
 }
 
-/// The whole result, computed in memory; producing it writes nothing.
+/// Complete in-memory provisioning plan before writing any file.
 pub struct Planned {
     verb: Verb,
     id: String,
     paths: Paths,
     /// The complete new text of `pins.rs`. `None` when the anchor needed no change —
-    /// the idempotent re-run.
     pins_text: Option<String>,
     /// The anchor file's bytes as this run read them, so the write can prove it replaces the
-    /// file it planned against.
     pins_src: String,
     /// The roster-pair bytes this plan was computed against (`None`: planned fresh), for
-    /// [`write_rest`]'s premise check.
     roster_snapshot: Option<RosterSnapshot>,
     master_after: Vec<String>,
     master_pubkey: String,
@@ -1159,29 +972,21 @@ fn today(now: u64) -> String {
     stamp.get(..10).unwrap_or("").to_string()
 }
 
-/// Compute everything, write nothing: when this returns, the new `pins.rs`, the roster and
-/// its master signature exist in memory, checked. What remains is writing decided bytes.
+/// Compute the new `pins.rs`, machine key, and signed roster in memory.
 pub fn plan(pre: Preflight, seed: &MasterSeed, now: u64) -> Result<Planned, String> {
     let master_pubkey = seed.pubkey_b64()?;
     let master_fingerprint = seed.fingerprint()?;
 
-    // `join`'s anchor proof, re-run here so it cannot be skipped: the roster verification
-    // below proves the phrase only against the operator-supplied `--roster`, not against
-    // the committed anchor.
     if pre.verb == Verb::Join {
         verify_master(&pre, seed)?;
     }
 
-    // The machine keypair. Generated here, on this machine, and never copied off it.
     let (machine_pkcs8, machine_pubkey) = crate::generate()?;
 
-    // The hierarchy must not collapse: a master that also signs releases would live on the
-    // release machine, which the roster exists to prevent. Checked rather than assumed.
     if machine_pubkey == master_pubkey {
         return Err("the freshly minted machine key is the paper master; refusing".to_string());
     }
 
-    // The anchor edit (setup only).
     let mut text = pre.pins_src.clone();
     let mut changed = false;
     let mut master_after = pre.master_members.clone();
@@ -1215,10 +1020,6 @@ pub fn plan(pre: Preflight, seed: &MasterSeed, now: u64) -> Result<Planned, Stri
         }
     }
 
-    // The roster. Loading verifies it under the master just derived: for `join` the second
-    // half of the transcription proof; for `setup` nothing is on disk and it starts at
-    // sequence 0. `MustExist` keeps the fresh path `setup`'s alone even if the roster
-    // vanishes while the phrase is typed (see [`RosterExpectation`]).
     let expectation = match pre.verb {
         Verb::Join => RosterExpectation::MustExist,
         Verb::Setup => RosterExpectation::MayCreateFresh,
@@ -1262,15 +1063,7 @@ pub fn plan(pre: Preflight, seed: &MasterSeed, now: u64) -> Result<Planned, Stri
     })
 }
 
-/// Write the anchor file, then prove it landed by re-reading the file, not the planned text:
-/// a short write, a full filesystem or a concurrent editor can damage the file while the text
-/// is correct. Runs before [`write_rest`], whose key and roster depend on a durable anchor.
-///
-/// The file must still be the one planned against. The text is a whole-file image of what
-/// [`preflight`] read before the phrase was typed, and other agents and sessions write to
-/// this repository: writing it over a moved file would silently revert their change (at
-/// worst, a reviewed commit retiring a compromised key). A file that moved is a refusal, not
-/// a merge.
+/// Write `pins.rs` and verify the written file.
 pub fn write_pins(planned: &Planned) -> Result<(), String> {
     if let Some(text) = &planned.pins_text {
         let current = read_bytes(&planned.paths.pins)
@@ -1285,8 +1078,6 @@ pub fn write_pins(planned: &Planned) -> Result<(), String> {
                  file, then run this command again against what the file says now.",
             ]));
         }
-        // Atomic: a truncating write could leave the anchor half-written while the operator
-        // is told nothing was written.
         write_bytes_atomic(&planned.paths.pins, text.as_bytes())
             .map_err(|e| concat(&["write ", &planned.paths.pins, ": ", &e.to_string()]))?;
     }
@@ -1323,7 +1114,7 @@ pub fn write_pins(planned: &Planned) -> Result<(), String> {
     verify_members(&back, MASTER_ANCHOR, &planned.master_after).map_err(damaged)
 }
 
-/// What a completed run produced, for [`render_report`] to speak.
+/// Completed provisioning run summary for [`render_report`].
 pub struct Report {
     pub verb: Verb,
     pub id: String,
@@ -1335,16 +1126,13 @@ pub struct Report {
     pub roster_seq: u64,
     pub roster_valid_until: String,
     pub roster_machines: Vec<String>,
-    /// Whether this run created the roster rather than extending one, reported aloud: a new
-    /// roster is either the first ever (only `setup`) or a fork (fatal), and only the
-    /// operator can tell which.
+    /// Whether this run created a fresh roster rather than extending an existing one.
     pub roster_was_fresh: bool,
     pub pins_changed: bool,
 }
 
 impl std::fmt::Debug for Report {
     /// Terse, like [`Preflight`] and [`Planned`]: nothing here is secret, but a derived impl
-    /// beside a `MasterSeed` stays derived while the fields change underneath it.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("Report(")?;
         f.write_str(self.verb.name())?;
@@ -1356,21 +1144,8 @@ impl std::fmt::Debug for Report {
     }
 }
 
-/// Write the machine's own two files, then the roster and its master signature.
-///
-/// The secret key goes first: it is the step most likely to fail, and key-last could leave a
-/// published roster naming a machine whose key was lost. Key first, the worst case is a key
-/// nothing authorizes yet. `create_new` never clobbers an existing key.
-///
-/// The roster half runs under [`lock_roster`], and the recovery advice turns on the redo
-/// transaction's commit point: before it, undo the key; after it, keep the key, because the
-/// pair that authorizes it is durable and the next run installs it.
+/// Write the machine files and publish the signed roster pair.
 pub fn write_rest(planned: Planned) -> Result<Report, String> {
-    // The recovery depends on the verb. `setup` armed the anchor before this ran
-    // (`pins_text` is `Some` only then), so a failure leaving nothing authorized says to
-    // discard the anchor and the paper and start over; a join (this CLI's, or `ship
-    // provision`'s mint) only undoes its key and retries. A recoverable roster says to
-    // commit the anchor, which names the master that signed it.
     let armed = planned.pins_text.is_some();
     let pins = &planned.paths.pins;
     let start_over = concat(&[
@@ -1384,7 +1159,6 @@ pub fn write_rest(planned: Planned) -> Result<Report, String> {
         " The anchor is armed but nothing else was written: ",
         &start_over,
     ]);
-    // After `rm <key>`.
     let undo_tail = if armed {
         concat(&["`, ", &start_over])
     } else {
@@ -1392,15 +1166,8 @@ pub fn write_rest(planned: Planned) -> Result<Report, String> {
     };
     let then_commit = when_armed(&[" Then commit ", pins, "."]);
 
-    // One crash-released lock, taken before the premise check and held through both roster
-    // promotions, so two runs that read sequence N cannot both pass their check and publish
-    // two N+1 lineages. Taking it also completes any redo transaction a dead run left, so the
-    // premise is checked against a consistent pair.
     let roster_lock = lock_roster(&planned.paths.roster).map_err(|e| concat(&[&e, &armed_only]))?;
 
-    // The roster's premise check, as `write_pins` does for the anchor: the signed roster
-    // extends the pair `plan` read, so a pair that moved (or appeared, when planned fresh)
-    // refuses before either local identity file is written.
     roster_lock
         .assert_snapshot(planned.roster_snapshot.as_ref())
         .map_err(|e| {
@@ -1413,11 +1180,7 @@ pub fn write_rest(planned: Planned) -> Result<Report, String> {
                 concat(&[&e, &armed_only])
             }
         })?;
-    // Preflight already created this directory; repeated for a `Planned` built without it,
-    // as the library's tests do.
     let _ = ensure_parent_dir(&planned.paths.key);
-    // Whole, 0600, fsynced and never over an existing key: a key present under its final
-    // name but empty after a power loss is indistinguishable from one the roster authorizes.
     write_owner_file_create_new(&planned.paths.key, &planned.machine_pkcs8).map_err(|e| {
         concat(&[
             "atomically create and sync ",
@@ -1437,14 +1200,6 @@ pub fn write_rest(planned: Planned) -> Result<Report, String> {
     record.push_str("\"\nminted_at = \"");
     record.push_str(&aterm_types::rfc3339::format_rfc3339(planned.now));
     record.push_str("\"\n");
-    // The record is checked and atomic: `atpkg-publish` refuses to build an index without a
-    // parseable `machine.toml` (the id is not derivable from the key), and `join` cannot
-    // restore it, since preflight refuses once `machine.key` exists and `roster_ops::add`
-    // refuses a known id. A lost record leaves a machine that can neither publish nor
-    // re-join.
-    //
-    // It precedes the roster publish, so a failure here leaves the same state as the key
-    // write above: a key nothing authorizes.
     ensure_parent_dir(&planned.paths.machine_pub)
         .and_then(|()| write_bytes_atomic(&planned.paths.machine_pub, record.as_bytes()))
         .map_err(|e| {
@@ -1462,10 +1217,6 @@ pub fn write_rest(planned: Planned) -> Result<Report, String> {
             ])
         })?;
 
-    // The roster last, under the lock already held. The redo commit is the line the recovery
-    // advice turns on: before it, this machine holds an unauthorized key; after it, the
-    // signed pair is durable and the operator must keep the key (deleting it would remove the
-    // private half of a machine the recovered roster authorizes).
     publish_roster_locked(
         &roster_lock,
         &planned.paths.roster,
@@ -1533,15 +1284,12 @@ pub fn write_rest(planned: Planned) -> Result<Report, String> {
     })
 }
 
-/// The closing output: DONE, then NEXT, facts and next actions only; each caveat rides as a
-/// clause on the step it guards. Pure, so tests read what the operator reads.
+/// Format the human-readable provisioning report lines.
 #[must_use]
 pub fn render_report(r: &Report) -> Vec<String> {
     let mut out = Vec::new();
 
     out.push(String::new());
-    // Only `setup` edits the working tree (`pins_changed`); a join has nothing to commit, so
-    // it carries no commit caveat.
     out.push(if r.pins_changed {
         "=== DONE (working tree only — a commit makes it durable) ===".to_string()
     } else {
@@ -1577,7 +1325,6 @@ pub fn render_report(r: &Report) -> Vec<String> {
         &r.roster_machines.join(", "),
         ")",
     ]);
-    // A sentinel expiry is not news. A real one is, so it still gets its clause.
     if r.roster_valid_until != crate::roster_ops::VALID_UNTIL_FOREVER {
         roster.push_str(&concat(&["  valid until ", &r.roster_valid_until]));
     }
@@ -1595,7 +1342,6 @@ pub fn render_report(r: &Report) -> Vec<String> {
         step += 1;
         concat(&["  ", &step.to_string(), ". ", &s])
     };
-    // The diff and commit steps exist only when there is a working-tree edit.
     if r.pins_changed {
         out.push(numbered(concat(&["review: git diff -- ", &r.paths.pins])));
     }
@@ -1638,7 +1384,6 @@ mod tests {
     }
 
     /// A `pins.rs` fixture with the master anchor empty: a copy, because the tests write to
-    /// it.
     const PINS_FIXTURE: &str = "// Copyright 2026 Andrew Yates\n\
         // SPDX-License-Identifier: Apache-2.0\n\
         \n\
@@ -1689,7 +1434,6 @@ mod tests {
     }
 
     /// The first roster names this machine alone: no incumbent is seeded, since clients
-    /// verify only under the roster.
     #[test]
     fn setup_arms_the_anchor_mints_the_machine_and_signs_the_roster() {
         let dir = scratch("setup-happy");
@@ -1698,7 +1442,6 @@ mod tests {
 
         let report = run_setup(&paths, "m3").expect("setup completes");
 
-        // The anchor file, read back from disk.
         let src = std::fs::read_to_string(&paths.pins).unwrap();
         let master = read_anchor(&src, MASTER_ANCHOR).unwrap();
         assert_eq!(master.members, vec![report.master_pubkey.clone()]);
@@ -1712,7 +1455,6 @@ mod tests {
             "the minted key must appear nowhere in the anchor file"
         );
 
-        // The roster verifies under the master and names the machine.
         let bytes = std::fs::read(&paths.roster).unwrap();
         let sig = std::fs::read(concat(&[&paths.roster, ".sig"])).unwrap();
         let verified =
@@ -1728,7 +1470,6 @@ mod tests {
         assert_eq!(roster.machines[0].pubkey, report.machine_pubkey);
         assert_eq!(roster.roster_seq, 1, "one bump per machine added");
 
-        // The secret key is 0600 and holds a usable pkcs8 key.
         use std::os::unix::fs::PermissionsExt as _;
         let mode = std::fs::metadata(&paths.key).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600, "the machine key must be owner-only");
@@ -1743,7 +1484,6 @@ mod tests {
         write_fixture(&paths);
         run_setup(&paths, "m3").expect("the first setup succeeds");
 
-        // Second run: the anchor is armed now.
         let before = std::fs::read_to_string(&paths.pins).unwrap();
         let err = preflight(Verb::Setup, "m11", &paths).unwrap_err();
         assert!(err.contains("ALREADY committed"), "{err}");
@@ -1755,7 +1495,6 @@ mod tests {
             "a refused setup writes nothing"
         );
 
-        // Negative control: an unarmed tree is accepted.
         let fresh = scratch("setup-refuses-control");
         let fresh_paths = paths_in(&fresh);
         write_fixture(&fresh_paths);
@@ -1769,7 +1508,6 @@ mod tests {
         write_fixture(&paths);
         let first = run_setup(&paths, "m3").expect("setup");
 
-        // A second machine, with its own key file, in the same tree.
         let mut second = paths.clone();
         second.key = dir.join("m11.key").to_str().unwrap().to_string();
         second.machine_pub = dir.join("m11.toml").to_str().unwrap().to_string();
@@ -1798,8 +1536,6 @@ mod tests {
     }
 
     /// The default state of a second machine: the roster lives in gitignored `dist/`, so a
-    /// fresh checkout has the anchor and no roster. A new seq-1 roster there would fork the
-    /// real one.
     #[test]
     fn join_refuses_a_missing_roster_instead_of_forking_a_second_one() {
         let dir = scratch("join-no-roster");
@@ -1807,7 +1543,6 @@ mod tests {
         write_fixture(&paths);
         run_setup(&paths, "m3").expect("setup, on the first machine");
 
-        // Machine 2: the committed anchor and no roster, as `git clone` leaves it.
         let dir2 = scratch("join-no-roster-second");
         let second = paths_in(&dir2);
         std::fs::copy(&paths.pins, &second.pins).expect("the anchor travels with the repo");
@@ -1826,8 +1561,6 @@ mod tests {
         );
         assert!(!std::path::Path::new(&second.key).exists());
 
-        // Negative control: with the real roster and signature copied across, the same call
-        // is accepted.
         std::fs::copy(&paths.roster, &second.roster).unwrap();
         std::fs::copy(
             concat(&[&paths.roster, ".sig"]),
@@ -1844,8 +1577,6 @@ mod tests {
     }
 
     /// Preflight's refusal is not the enforcement: a roster that vanishes while the phrase
-    /// is typed (a cleanup of gitignored `dist/`) must be refused in `plan`, not minted
-    /// fresh. With `MayCreateFresh` for `join` in `plan`, this plan forks.
     #[test]
     fn join_refuses_a_roster_that_vanished_between_preflight_and_plan() {
         let dir = scratch("join-vanished-roster");
@@ -1857,9 +1588,7 @@ mod tests {
         second.key = dir.join("m11.key").to_str().unwrap().to_string();
         second.machine_pub = dir.join("m11.toml").to_str().unwrap().to_string();
 
-        // Preflight sees the roster and passes — the courteous check.
         let pre = preflight(Verb::Join, "m11", &second).expect("roster is present");
-        // The window: both halves vanish while the phrase is typed (saved for the control).
         let saved_body = std::fs::read(&second.roster).unwrap();
         let saved_sig = std::fs::read(concat(&[&second.roster, ".sig"])).unwrap();
         std::fs::remove_file(&second.roster).unwrap();
@@ -1876,7 +1605,6 @@ mod tests {
             "a refused plan writes nothing and forks nothing"
         );
 
-        // Negative control: with the pair restored, the same sequence completes.
         std::fs::write(&second.roster, &saved_body).unwrap();
         std::fs::write(concat(&[&second.roster, ".sig"]), &saved_sig).unwrap();
         let report = run_join(&second, "m11", PAPER).expect("join with the pair in place");
@@ -1884,8 +1612,6 @@ mod tests {
     }
 
     /// A pair that moved between `plan` and the write (a concurrent join, mint, revoke or
-    /// hand-copy) is refused before any write; publishing over it would fork the lineage.
-    /// Without `write_rest`'s `assert_snapshot` call, the publish below succeeds.
     #[test]
     fn write_rest_refuses_a_roster_that_changed_since_the_plan_read_it() {
         let dir = scratch("roster-premise");
@@ -1901,7 +1627,6 @@ mod tests {
         let seed = seed_of(PAPER);
         let planned = plan(pre, &seed, NOW).expect("plan against the current pair");
 
-        // A concurrent actor rewrites the pair while this run holds its plan.
         let mut moved = std::fs::read(&paths.roster).unwrap();
         moved.extend_from_slice(b"\n# concurrently rewritten\n");
         std::fs::write(&paths.roster, &moved).unwrap();
@@ -1919,8 +1644,6 @@ mod tests {
             "the concurrent actor's pair survives untouched"
         );
 
-        // The fresh-plan premise: `setup` planned the first roster, so a pair that appears
-        // mid-run must not be overwritten.
         let fresh_dir = scratch("roster-premise-fresh");
         let fresh_paths = paths_in(&fresh_dir);
         write_fixture(&fresh_paths);
@@ -1935,7 +1658,6 @@ mod tests {
             "nothing written on the fresh-collision refusal either"
         );
 
-        // Negative control: an untouched pair publishes.
         let control_dir = scratch("roster-premise-control");
         let control = paths_in(&control_dir);
         write_fixture(&control);
@@ -1943,9 +1665,6 @@ mod tests {
     }
 
     /// The guarded publisher reads both halves under its lock before promoting either, so a
-    /// directory squatting on the signature path is a premise failure and the document never
-    /// moves. Promoting the halves in sequence without that read would land "NEW BODY" beside
-    /// a signature no client verifies.
     #[test]
     fn a_broken_signature_target_leaves_the_roster_document_unchanged() {
         let dir = scratch("pair-rollback");
@@ -1956,7 +1675,6 @@ mod tests {
         let old_body = std::fs::read(&paths.roster).unwrap();
         let old_sig = std::fs::read(&sig_path).unwrap();
 
-        // A directory squats on the signature path, so the premise read of the pair fails.
         std::fs::remove_file(&sig_path).unwrap();
         std::fs::create_dir(&sig_path).unwrap();
         let err = publish_roster(&paths.roster, b"NEW BODY", b"NEW SIG").unwrap_err();
@@ -1969,7 +1687,6 @@ mod tests {
         std::fs::remove_dir(&sig_path).unwrap();
         std::fs::write(&sig_path, &old_sig).unwrap();
 
-        // The pair left behind still verifies, so the operator is not sent after the phrase.
         let master_pub = seed_of(PAPER).pubkey_b64().unwrap();
         assert!(
             load_roster(
@@ -1982,7 +1699,6 @@ mod tests {
             "the pair left behind by a failed publish must be the consistent old one"
         );
 
-        // A first publish with the same obstruction writes neither half.
         let fresh = scratch("pair-rollback-fresh");
         let fresh_roster = fresh
             .join("aterm-machines.toml")
@@ -1998,15 +1714,11 @@ mod tests {
             "a first publish that failed leaves nothing, not a signatureless document"
         );
 
-        // Negative control: unblocked, the same publish replaces the pair whole.
         std::fs::remove_dir(&fresh_sig).unwrap();
         publish_roster(&fresh_roster, b"BODY", b"SIG").expect("publish with nothing in the way");
         assert_eq!(std::fs::read(&fresh_roster).unwrap(), b"BODY");
         assert_eq!(std::fs::read(&fresh_sig).unwrap(), b"SIG");
 
-        // A lock makes the directory it guards (a fresh checkout has no `dist/`) and guards
-        // that roster and no other, and a commit never replaces whatever holds the
-        // transaction's fixed name, even an empty directory.
         let (guarded, other) = (fresh.join("dist/a.toml"), fresh.join("b.toml"));
         let guarded = guarded.to_str().unwrap();
         let lock = lock_roster(guarded).unwrap();
@@ -2018,9 +1730,6 @@ mod tests {
     }
 
     /// The torn pair a crash between the two renames leaves (new body, old signature) is
-    /// completed forward on the next lock acquisition, before any read. The crash is
-    /// simulated by committing and promoting only the body. Without the
-    /// `complete_roster_transaction` call in `lock_roster`, the signature stays stale.
     #[test]
     fn a_committed_roster_transaction_recovers_forward_after_a_body_only_crash() {
         let dir = scratch("pair-redo-recovery");
@@ -2037,9 +1746,6 @@ mod tests {
         let recording = aterm_durable::seam::Recording::start();
         let transaction =
             begin_roster_transaction(roster, Some(&predecessor), b"new body", b"new sig").unwrap();
-        // aterm-durable's counting seam: every redo-log member stays durable, the staged
-        // directory's entries are only ordered ahead of the commit, and the commit's own
-        // name is durable.
         let begun = recording.take();
         let (commit, rest) = begun.split_last().expect("flushes");
         let (staged, members) = rest.split_last().expect("the staged directory's flush");
@@ -2056,9 +1762,6 @@ mod tests {
             "the premise: a torn pair, which is what a verifier refuses"
         );
 
-        // A filesystem that acknowledged the replay but kept an old half, the body or the
-        // signature: the read-back catches either, and the redo log stays for the next lock
-        // to replay.
         for (half, old) in [("", &b"old body"[..]), (".sig", &b"old sig"[..])] {
             let lost = crate::fsio::window::with(
                 "roster pair replayed",
@@ -2086,7 +1789,6 @@ mod tests {
             !std::path::Path::new(&transaction).exists(),
             "a completed transaction is retired, so it cannot replay a second time"
         );
-        // ...and the retired directory is collected: nothing but the pair and its lock.
         let mut left: Vec<_> = std::fs::read_dir(&dir)
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
@@ -2103,8 +1805,6 @@ mod tests {
     }
 
     /// A canonical half that is neither the recorded predecessor nor the target (a newer
-    /// roster copied in while this machine was down) is never overwritten. With
-    /// `transaction_half_is_known` always `true`, the newer pair is lost.
     #[test]
     fn redo_recovery_never_overwrites_a_newer_or_unrelated_pair() {
         let dir = scratch("pair-redo-cas");
@@ -2126,7 +1826,6 @@ mod tests {
             b"interrupted sig",
         )
         .unwrap();
-        // While this machine was down, an authoritative pair arrived from elsewhere.
         std::fs::write(roster, b"newer body").unwrap();
         std::fs::write(&sig_path, b"newer sig").unwrap();
 
@@ -2141,8 +1840,6 @@ mod tests {
             "the evidence stays on disk for the operator to reconcile"
         );
 
-        // A predecessor marker it cannot read is a damaged log, refused rather than read
-        // as "published over nothing", even where nothing is on disk to protect.
         std::fs::write(
             std::path::Path::new(&transaction).join("predecessor-state"),
             b"torn",
@@ -2155,8 +1852,6 @@ mod tests {
     }
 
     /// Recovery is a write, so the read-only claim neither creates the rendezvous nor
-    /// replays a pending transaction. With `create(true)` or a `complete_roster_transaction`
-    /// call in `lock_roster_read_only`, one refusal below becomes a mutation of the tree.
     #[test]
     fn check_only_lock_never_creates_or_recovers_roster_state() {
         let dir = scratch("read-only-roster-lock");
@@ -2177,10 +1872,7 @@ mod tests {
         std::fs::write(roster, b"old body").unwrap();
         std::fs::write(&sig_path, b"old sig").unwrap();
         drop(lock_roster(roster).expect("establish the writer rendezvous"));
-        // Negative control: with a rendezvous and no pending transaction, it succeeds.
         drop(lock_roster_read_only(roster).expect("an existing clean rendezvous is readable"));
-        // A rendezvous replaced after the claim opened it is refused: the claim would hold
-        // a lock on an orphaned inode while a writer locks the new one.
         let swapped = crate::fsio::window::with(
             "read-only claim locked",
             |lock| {
@@ -2208,8 +1900,6 @@ mod tests {
     }
 
     /// `join` reads the roster in `plan` before taking the writer lock, so without this
-    /// refusal a crashed publish surfaces as "does not verify under the master you typed".
-    /// Without the `refuse_pending_roster_transaction` call in `load_roster`, it does.
     #[test]
     fn a_pending_roster_transaction_is_named_instead_of_a_mistyped_phrase() {
         let dir = scratch("pending-txn-read");
@@ -2219,7 +1909,6 @@ mod tests {
         let master_pub = seed_of(PAPER).pubkey_b64().unwrap();
         let sig_path = concat(&[&paths.roster, ".sig"]);
 
-        // The crash: a committed transaction, its body promoted, its signature not.
         let predecessor = RosterSnapshot {
             raw: std::fs::read(&paths.roster).unwrap(),
             sig: std::fs::read(&sig_path).unwrap(),
@@ -2242,7 +1931,6 @@ mod tests {
             "the phrase must not be blamed for a torn pair: {err}"
         );
 
-        // Negative control: once a writer completes it forward, the read gets past it.
         drop(lock_roster(&paths.roster).expect("the writer lock recovers the pair"));
         assert_eq!(std::fs::read(&paths.roster).unwrap(), b"new body");
         assert_eq!(std::fs::read(&sig_path).unwrap(), b"new sig");
@@ -2261,18 +1949,13 @@ mod tests {
     }
 
     /// The orchestrator's `verify_master` is a courtesy: skip it and hand `plan` a `--roster`
-    /// signed by the wrong master, and the roster proof alone would pass. Without the
-    /// `Verb::Join` check inside `plan`, the `unwrap_err` below fails.
     #[test]
     fn plan_reproves_the_anchor_even_when_the_orchestrator_skips_verify_master() {
-        // The victim tree: armed with PAPER's master.
         let dir = scratch("plan-anchor-reproof");
         let paths = paths_in(&dir);
         write_fixture(&paths);
         run_setup(&paths, "m3").expect("setup");
 
-        // The attacker's parallel lineage: a different tree, set up under OTHER_PAPER,
-        // yielding a roster that verifies under the wrong master.
         let attacker_dir = scratch("plan-anchor-reproof-attacker");
         let attacker_paths = paths_in(&attacker_dir);
         write_fixture(&attacker_paths);
@@ -2282,7 +1965,6 @@ mod tests {
         write_pins(&planned).unwrap();
         write_rest(planned).expect("the attacker's own lineage sets up fine");
 
-        // The join, orchestrated without `verify_master` and with the substituted roster.
         let mut second = paths.clone();
         second.roster = attacker_paths.roster.clone();
         second.key = dir.join("m11.key").to_str().unwrap().to_string();
@@ -2295,8 +1977,6 @@ mod tests {
         );
         assert!(!std::path::Path::new(&second.key).exists());
 
-        // Negative control: the committed master with its own roster plans without a prior
-        // `verify_master` call.
         let mut honest = paths.clone();
         honest.key = dir.join("m11b.key").to_str().unwrap().to_string();
         honest.machine_pub = dir.join("m11b.toml").to_str().unwrap().to_string();
@@ -2310,7 +1990,6 @@ mod tests {
         let dir = scratch("missing-dirs");
         let paths = Paths {
             pins: dir.join("pins.rs").to_str().unwrap().to_string(),
-            // Every one of these sits under a directory that does not exist yet.
             roster: dir
                 .join("dist/aterm-machines.toml")
                 .to_str()
@@ -2336,7 +2015,6 @@ mod tests {
 
         let report = run_setup(&paths, "m3").expect("setup completes on a fresh machine");
 
-        // The key really is there, 0600, and really is the key the roster names.
         use std::os::unix::fs::PermissionsExt as _;
         let mode = std::fs::metadata(&paths.key).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
@@ -2350,7 +2028,6 @@ mod tests {
     }
 
     /// Failing the roster step alone (its directory made unwritable after preflight) leaves
-    /// a key nothing authorizes, never a signed roster naming a machine with no key.
     #[test]
     fn the_key_is_written_before_the_roster_that_names_it() {
         use std::os::unix::fs::PermissionsExt as _;
@@ -2363,8 +2040,6 @@ mod tests {
         let pre = preflight(Verb::Setup, "m3", &paths).expect("preflight");
         let planned = plan(pre, &seed_of(PAPER), NOW).expect("plan");
         write_pins(&planned).expect("the anchor is written");
-        // Pre-create the lock inode (opening an existing file needs no directory write),
-        // then revoke write permission so staging the roster transaction is what fails.
         std::fs::write(concat(&[&paths.roster, ".lock"]), b"").unwrap();
         std::fs::set_permissions(&roster_dir, std::fs::Permissions::from_mode(0o500)).unwrap();
         let result = write_rest(planned);
@@ -2389,8 +2064,6 @@ mod tests {
     }
 
     /// The record is a checked write before the roster publish (see `write_rest`): revoking
-    /// its directory's write permission after preflight fails that step alone, and the run
-    /// must fail rather than publish a roster naming a machine with no record.
     #[test]
     fn a_record_that_cannot_be_written_fails_the_run_before_the_roster_is_published() {
         use std::os::unix::fs::PermissionsExt as _;
@@ -2446,8 +2119,6 @@ mod tests {
     }
 
     /// `join` never touches the anchor, so its failure says only `rm <key>`; `setup` armed
-    /// the anchor, so its failure before any key exists says so, not "NOTHING HAS BEEN
-    /// WRITTEN".
     #[test]
     fn a_failure_that_authorized_nothing_undoes_only_what_its_verb_did() {
         use std::os::unix::fs::PermissionsExt as _;
@@ -2481,7 +2152,6 @@ mod tests {
             "a join never armed the anchor: {err}"
         );
 
-        // `setup`, refused at the roster premise: the anchor is armed, no key exists.
         let dir = scratch("retry-setup-premise");
         let paths = paths_in(&dir);
         write_fixture(&paths);
@@ -2502,7 +2172,6 @@ mod tests {
     }
 
     /// The plan is built from what preflight read, before the phrase is typed; an edit
-    /// landing in that window must not be reverted by the write.
     #[test]
     fn write_pins_refuses_a_file_that_changed_under_it() {
         let dir = scratch("stale-snapshot");
@@ -2510,7 +2179,6 @@ mod tests {
         write_fixture(&paths);
         let pre = preflight(Verb::Setup, "m3", &paths).unwrap();
 
-        // A reviewed commit lands while the run is in flight.
         const REPLACEMENT: &str = "Edited by a reviewed commit that landed in flight.";
         let concurrent = PINS_FIXTURE.replace("Empty here, and therefore INERT.", REPLACEMENT);
         assert_ne!(concurrent, PINS_FIXTURE, "the fixture must actually differ");
@@ -2526,7 +2194,6 @@ mod tests {
             "the concurrent edit survives"
         );
 
-        // Negative control: planned against the current bytes, the write is accepted.
         let pre = preflight(Verb::Setup, "m3", &paths).unwrap();
         let planned = plan(pre, &seed_of(PAPER), NOW).unwrap();
         write_pins(&planned).expect("a plan built from the current bytes writes");
@@ -2558,11 +2225,9 @@ mod tests {
         assert!(err.contains("is NOT the master committed"), "{err}");
         assert!(err.contains("Nothing has been written"), "{err}");
 
-        // `plan` re-runs the anchor proof itself, so skipping `verify_master` does not help.
         let err = plan(pre, &wrong, NOW).unwrap_err();
         assert!(err.contains("is NOT the master committed"), "{err}");
 
-        // The independent roster check refuses the wrong master too.
         let err = load_roster(
             &paths.roster,
             &wrong.pubkey_b64().unwrap(),
@@ -2582,7 +2247,6 @@ mod tests {
             "no key was minted"
         );
 
-        // Negative control: the right paper is accepted on the same inputs.
         let pre = preflight(Verb::Join, "m11", &second).unwrap();
         assert!(verify_master(&pre, &seed_of(PAPER)).is_ok());
     }
@@ -2596,7 +2260,6 @@ mod tests {
         let err = preflight(Verb::Join, "m3", &paths).unwrap_err();
         assert!(err.contains("no paper master is committed"), "{err}");
         assert!(err.contains("setup"), "{err}");
-        // Negative control: setup is allowed here.
         assert!(preflight(Verb::Setup, "m3", &paths).is_ok());
     }
 
@@ -2625,12 +2288,10 @@ mod tests {
             1,
             "exactly one entry for this master"
         );
-        // The machine key appears nowhere in the anchor file.
         assert!(!src.contains(report.machine_pubkey.as_str()));
     }
 
     /// A second run on a machine whose key exists is refused at preflight, before anything
-    /// is generated.
     #[test]
     fn an_existing_machine_key_is_refused_before_anything_is_generated() {
         let dir = scratch("existing-key");
@@ -2654,8 +2315,6 @@ mod tests {
         let err = preflight(Verb::Setup, "m3", &paths).unwrap_err();
         assert!(err.contains("roster already exists"), "{err}");
 
-        // A lone SIGNATURE is a half-published pair, not an absent roster: the fresh path
-        // refuses it, so no first roster is ever planned over one.
         std::fs::remove_file(&paths.roster).unwrap();
         std::fs::write(concat(&[&paths.roster, ".sig"]), b"sig").unwrap();
         let master = seed_of(PAPER).pubkey_b64().unwrap();
@@ -2680,7 +2339,6 @@ mod tests {
     }
 
     /// The anchor file is FOUND from inside the checkout: this crate's directory is two
-    /// levels below the root.
     #[test]
     fn the_pins_file_is_discovered_from_inside_the_checkout() {
         let found = discover_pins_path_from(env!("CARGO_MANIFEST_DIR").into()).unwrap();
@@ -2712,9 +2370,6 @@ mod tests {
         let seed = seed_of(PAPER);
         let planned = plan(pre, &seed, NOW).unwrap();
 
-        // An edit that lands between the write and its read-back is reported even though
-        // the master's members are still the planned ones: the file must hold exactly the
-        // bytes written, or another change rides along unseen.
         let landed = crate::fsio::window::with(
             "anchor file written",
             |pins| {
@@ -2731,11 +2386,8 @@ mod tests {
         );
         std::fs::write(&paths.pins, PINS_FIXTURE).unwrap();
 
-        // Honest first: the ordinary path succeeds.
         write_pins(&planned).expect("the ordinary write verifies");
 
-        // Put the unarmed original back and verify again: a pass here would make the check
-        // decorative.
         std::fs::write(&paths.pins, PINS_FIXTURE).unwrap();
         let planned2 = {
             let pre = preflight(
@@ -2749,12 +2401,10 @@ mod tests {
             .unwrap();
             plan(pre, &seed, NOW).unwrap()
         };
-        // Write the planned text, then clobber it with the unarmed original and re-verify
-        // through the same function: it must refuse.
         write_pins(&planned2).expect("write");
         std::fs::write(&paths.pins, PINS_FIXTURE).unwrap();
         let mut no_write = planned2;
-        no_write.pins_text = None; // "already correct" — the idempotent path
+        no_write.pins_text = None;
         let err = write_pins(&no_write).unwrap_err();
         assert!(
             err.contains("holds 0 keys but 1 were intended")
@@ -2764,8 +2414,6 @@ mod tests {
     }
 
     /// THE SECRET IS NOT IN THE CLOSING OUTPUT. The report is built from public
-    /// identities only (the machine's public key is in it), and this asserts it
-    /// rather than trusting the type system to have.
     #[test]
     fn the_report_carries_no_secret_material() {
         let dir = scratch("report");
@@ -2794,7 +2442,6 @@ mod tests {
     }
 
     /// Every file the run wrote is scanned for the phrase, any 16-character run of it, and
-    /// its raw 32-byte seed.
     #[test]
     fn no_file_written_by_a_run_contains_the_phrase_or_its_seed() {
         let dir = scratch("no-phrase-on-disk");
@@ -2802,7 +2449,6 @@ mod tests {
         write_fixture(&paths);
         run_setup(&paths, "m3").expect("setup");
 
-        // The raw seed, by an independent base32 decode (`MasterSeed` has no accessor).
         const ALPHABET: &[u8] = b"0123456789abcdefghjkmnpqrstvwxyz";
         let mut raw = Vec::new();
         let mut acc: u32 = 0;

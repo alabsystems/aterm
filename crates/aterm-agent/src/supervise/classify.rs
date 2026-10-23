@@ -1,79 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Is this shell command line read-only? A pure function a supervisor calls hundreds of
-//! times a session. Every tie breaks toward "not read-only": an escalation only asks a
-//! person, a false approval runs the command, so some reads a person would clear at a glance
-//! (`find "$d" -name x`) ask.
-//!
-//! A pre-pass ([`prelex`]) reads the line as the shell does where the segment readers would
-//! not: a `#` comment ends at its newline, a here-document body is data up to its
-//! terminator, `$'…'` and `${…}` are followed or refused, and an unterminated quote is
-//! refused. The segment-head check is a positive filter: an unknown program, or one named by
-//! a path outside [`SYSTEM_BIN_DIRS`], is not read-only. Quoted strings are dropped before it
-//! runs (a `>` inside a `git --format` string is no redirect), but awk and sed programs are
-//! read back from the raw words (`system(…)`, `s///w file`). A program word is judged only at
-//! a segment head: `grep -rn open src` is a read, `open src` is not. Wrappers (`xargs`,
-//! `env`, `timeout`) are seen through; `&` ends a segment like `;`; the name behind a
-//! redirect (`2>/dev/null rm x`) or zsh's `-` modifier (`- rm x`) is a head. A reserved word is
-//! a keyword only where a command begins: behind an assignment, a redirect, a wrapper or `time`
-//! it is a program's name (`X=1 if true` runs a program `if`, and so does `ls | time if true`,
-//! where `time` is `/usr/bin/time`; [`skip_prefixes_at`]). Flags by which a
-//! read tool runs a program or writes a file (`git -c`, `rg --pre`, `sort
-//! --compress-program`, `printf -v`, `date -s`, …) and assignments that change a later
-//! program (`PATH=`, `GIT_*=`, `HOME=`) are refused wherever they sit.
-//!
-//! A command substitution is a word of the command around it, never a boundary, and its
-//! body is judged as a command line. A name this check cannot read cannot be cleared: a head
-//! supplied by a substitution or parameter (`$(printf 'r''m') -rf /`, `$R -rf /`), a python
-//! script path, an awk program, a sed script or an `export` operand. Nesting deeper than
-//! [`MAX_SUBSTITUTION_DEPTH`] is refused.
-//!
-//! An expansion's value is unknown. Unquoted, it word-splits into any number of words;
-//! double-quoted ([`QUOTED_SUBSTITUTION`], [`QUOTED_PARAMETER`]) it is one word, but may
-//! still be a flag (`sort "$(echo -o/f)" x` writes `/f`). So an expansion before `--` among
-//! the arguments of a tool whose write or run form a flag selects
-//! ([`SELECTED_BY_AN_ARGUMENT`]), or of any `git` subcommand, is refused. `test`/`[` go by
-//! argument count ([`test_expansions_are_operands`]): a quoted operand of a 1-, 2- or
-//! 3-argument form stays a read; an unquoted one does not (`[ $n ]` with `n='-v a[$(cmd)]'`
-//! is `test -v`, whose subscript bash evaluates). Tools with no write form (`ls`, `cat`,
-//! `grep`, `echo`) keep expansion arguments.
-//!
-//! zsh arithmetic runs a command substitution inside an array subscript taken from a quoted
-//! word, a variable's value or a globbed file name (`printf %d 'path[$(cmd)]'`). So a word
-//! zsh evaluates as arithmetic (`printf`'s arguments under a numeric format, `-t`'s operand,
-//! an `export -i`/`-E`/`-F` value, a value of one of [`ZSH_ARITHMETIC_VARS`]) must be a plain
-//! number ([`arithmetic_scan`]), and a `test`/`[` word that may brace-expand or glob into
-//! `-t` is refused. An arithmetic evaluation itself (`$((…))`, `((…))`, `$[…]`, `let`, `[[ …
-//! -eq … ]]`) is refused whole: it assigns any variable (`$((x=1,PATH=0))`) and evaluates a
-//! value's subscript in bash too ([`ARITHMETIC_RUNS`]).
-//!
-//! This judges one reading of a line. A screen-read command whose rows were joined with
-//! spaces differs from the one the shell runs, so the caller classifies both readings and
-//! approves only when both are read-only (`supervise::policy::approval`). Lines are read as
-//! zsh 5.9 and bash 3.2 read them under default options, with no alias or function. Claude
-//! Code's Bash tool replays the person's shell startup first, so the approval rule also
-//! reads that startup (`supervise::policy::shell_startup`) and, where the shell may be zsh,
-//! requires a plain line ([`plain_zsh_line`]): a positive grammar that admits no expansion but a
-//! plain parameter read (`$NAME`, `${NAME}`) and a command substitution over a plain line, the
-//! forms zsh expands no further than bash (MEASURED 2026-10-22).
+//! Pure, fail-closed shell command read-only classifier for supervisor auto-approval.
 
-/// The verdict on one command line: `read_only`, and `reason` naming the rule
-/// (token or segment head) that decided it, so a supervisor's notes say why.
+/// Read-only classification verdict and deciding rule for a shell command line.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Verdict {
-    /// `true` when every segment is a known read-only program and no danger
-    /// token appears anywhere.
+    /// `true` when every segment is a known read-only command and no danger token appears.
     pub read_only: bool,
-    /// The rule that decided it: `"every segment read-only"`, or the offending
-    /// token / segment head (`"rm"`, `"git push"`, `"redirect > b.txt"`).
+    /// Rule that decided the verdict (`"every segment read-only"` or the offending token/head).
     pub reason: String,
 }
 
 impl Verdict {
     /// Not read-only, for `reason`; a substitution token ([`SUBSTITUTION`],
-    /// [`QUOTED_SUBSTITUTION`]) is shown as `$(…)`, a quoted parameter
-    /// ([`QUOTED_PARAMETER`]) as `"$…"`.
     fn no(reason: impl Into<String>) -> Self {
         Self {
             read_only: false,
@@ -86,71 +26,36 @@ impl Verdict {
     }
 }
 
-/// An unquoted `$(…)` or backtick substitution in [`split_segments`]' segments
-/// and [`program_words`]' words: one word (or part of one) of the command
-/// around it, never a boundary; its body becomes segments of its own. It holds
-/// nothing the splitters split on, no `/` and no `=`, and no program list
-/// names it, so a program it names is unreadable. Unquoted, its output
-/// word-splits into any number of words ([`has_expansion`]).
+/// Placeholder token representing an unquoted command or backtick substitution.
 pub(crate) const SUBSTITUTION: &str = "$…";
 
-/// A double-quoted `"$(…)"` substitution: exactly one word whatever its output,
-/// though that word may still be a flag ([`runs_or_writes_by_flag`]).
-/// [`strip_quotes`] marks it ([`QUOTE_SUB_MARK`]) and [`split_segments`] reads
-/// it as this. It deliberately does not contain [`SUBSTITUTION`], so
-/// `t.contains(SUBSTITUTION)` tells unquoted from quoted. Its body is still
-/// judged, and a command it names is still unreadable. Shown as `$(…)`.
+/// Placeholder token representing a double-quoted command substitution.
 pub(crate) const QUOTED_SUBSTITUTION: &str = "$“…”";
 
-/// A parameter expansion inside double quotes (`"$X"`, `"${X}"`) as
-/// [`strip_quotes`] marks it: one word whose value is unknown. A single-quoted
-/// `'$X'` is literal and leaves no `$`. Shown as `"$…"`.
+/// Placeholder token representing a double-quoted parameter expansion.
 pub(crate) const QUOTED_PARAMETER: &str = "$“p”";
 
 /// The private marker [`strip_quotes`] writes before a substitution found inside
-/// double quotes, so [`split_segments`] reads it as [`QUOTED_SUBSTITUTION`]. A
-/// control character no shell word carries; literal ones in a line are dropped,
-/// so it cannot be spoofed.
 const QUOTE_SUB_MARK: char = '\u{1}';
 
-/// Substitutions nested deeper than this are not read: the line is refused
-/// ([`prelex`]), so no reader after it recurses further.
+/// Maximum nesting depth for command substitutions before [`prelex`] refuses the line.
 pub(crate) const MAX_SUBSTITUTION_DEPTH: usize = 16;
 
 /// Why an unquoted `(` inside a word is no read: zsh reads it as a glob group or
-/// qualifier, and the `e:…:` and `+cmd` qualifiers run a command during
-/// expansion (`ls -d /(e:'print -u2 X':)`, `echo $(print /)(e:…:)`, `ls -d
-/// /(+print)`).
 const GLOB_QUALIFIER_RUNS: &str =
     "a ( inside a word (zsh reads a glob qualifier, and `(e:…:)` or `(+cmd)` runs a command)";
 
 /// Why zsh's `~` parameter flag is no read: `$~N`, `$^~N`, `$~^N` (and `${~N}`,
-/// refused by [`braced_is_literal`]) glob the value as a pattern, whose
-/// qualifier runs a command (`N='/(e:print -u2 X:)'; echo $~N`). Refused
-/// inside double quotes too.
 const GLOB_SUBST_RUNS: &str = "zsh's $~ flag (the value is globbed as a pattern, and a qualifier `(e:…:)` in it runs a command)";
 
 /// Why an arithmetic evaluation, `$((…))` or the `((…))` command, is no read:
-/// bash and zsh assign any variable in it, the second and later of a list too,
-/// and evaluate a variable's value as arithmetic, whose subscript runs a
-/// substitution. MEASURED, bash 3.2 with a `./0/ls`: `echo $((x=1,PATH=0));
-/// ls` and `(( x=1,PATH=0 )); ls` ran it (`PATH` is `0`), and `ls='a[$(touch
-/// M)]'; echo $((ls))` made `M`; `$((ls) )` too was arithmetic. The segment
-/// readers saw a subshell running `x=1,PATH=0` (an assignment to `x`) or `ls`.
-/// Refused whole, wherever it stands, as `$[…]`, `let` and `[[ … -eq … ]]` are.
 const ARITHMETIC_RUNS: &str = "an arithmetic evaluation ($((…)) or ((…)): it may assign any variable, PATH among \
      them, and a value's subscript runs a substitution)";
 
-/// The python scripts run as reads when no `--allow-python` glob is given:
-/// none. A script's name is no evidence of what it does; a project names its
-/// generators with `--allow-python`, e.g. `scripts/*standing*.py`.
+/// Default `--allow-python` glob list (empty).
 pub const DEFAULT_PYTHON_ALLOW: &[&str] = &[];
 
 /// Programs a segment may start with and still be a read. Shell keywords are
-/// here because a `for`/`if` segment's head is the keyword; the command after
-/// `do`/`then` is checked too ([`segment_head`]). `let` and `local` are not:
-/// both evaluate arithmetic, whose array subscripts expand (`let
-/// 'x=a[$(touch M)]'` runs `touch`).
 const READ_ONLY: &[&str] = &[
     "git",
     "ls",
@@ -232,17 +137,11 @@ const READ_ONLY: &[&str] = &[
 ];
 
 /// Keyword heads that merely prefix the command a segment really runs: `do rm x`
-/// is `rm x`. Stripped before the head check so the keyword cannot launder it.
 const KEYWORD_PREFIX: &[&str] = &[
     "do", "then", "else", "if", "elif", "while", "until", "!", "{",
 ];
 
 /// Whether a word closes a `{` group in zsh: as itself or glued to a word's end, unless the
-/// word's own braces open it. `{ echo a} always { cmd }` and `{ echo ${HOME}} always { cmd }`
-/// run `cmd` (a quoted `}` reaches this as `""`); `{a,b}`, `${HOME}`, `{}` and an escaped `\}`
-/// close nothing. zsh runs a command written after a closing word (this, or `]]`) in the same
-/// list (`{ ls } always { cmd }`, `if [[ -n a ]] cmd`), so [`danger_scan`] lets one be followed
-/// only by its compound's redirects and closing words.
 fn closes_a_brace(tok: &str) -> bool {
     let mut depth = 0usize;
     let mut chars = tok.chars().peekable();
@@ -261,15 +160,9 @@ fn closes_a_brace(tok: &str) -> bool {
 }
 
 /// The directories a program may be named from by path and still be the program
-/// its basename says: `/bin/ls` is `ls`, `/tmp/evil/ls` is not.
 const SYSTEM_BIN_DIRS: &[&str] = &["/bin/", "/usr/bin/", "/sbin/", "/usr/sbin/"];
 
 /// Variables whose assignment changes what a later program runs or reads: the search path,
-/// shell startup and splitting, pagers and editors a read tool may exec, git and rg config
-/// roots. `PATH` is allowed when every entry is a [`SYSTEM_BIN_DIRS`] directory. zsh's own
-/// (`ZSH_RUNS_A_VALUE`): `NULLCMD` and `READNULLCMD` name the command a bare redirect runs,
-/// `MODULE_PATH` is where autoloaded modules load from, and `STTY` in a command prefix runs
-/// as code on a terminal. Arrays zsh ties to these count ([`ZSH_TIED`]).
 const HAZARD_VARS: &[&str] = &[
     "PATH",
     "NULLCMD",
@@ -305,8 +198,6 @@ const HAZARD_VARS: &[&str] = &[
 const HAZARD_VAR_PREFIXES: &[&str] = &["LD_", "DYLD_", "GIT_", "BASH_FUNC_"];
 
 /// zsh's tied pairs, array then scalar: assigning the array assigns the scalar
-/// (`path=/tmp/x ls` runs `/tmp/x/ls`). Every pair `zsh -f` declares. An
-/// array assignment is judged as its scalar's ([`assignment_hazard`]).
 const ZSH_TIED: &[(&str, &str)] = &[
     ("cdpath", "CDPATH"),
     ("fignore", "FIGNORE"),
@@ -320,9 +211,6 @@ const ZSH_TIED: &[(&str, &str)] = &[
 ];
 
 /// The variables whose value zsh 5.9 runs, loads or sources during an ordinary
-/// line of reads, found by assigning each declared or documented name a marker
-/// program, function, command line and directory.
-/// `STTY` runs only on a terminal and is in [`HAZARD_VARS`] separately.
 #[cfg(test)]
 const ZSH_RUNS_A_VALUE: &[&str] = &[
     "MODULE_PATH",
@@ -385,26 +273,19 @@ const FIND_EXEC_READ: &[&str] = &["du", "ls", "cat", "head", "wc", "stat", "file
 /// `tmutil` verbs that only report.
 const TMUTIL_READ: &[&str] = &["listlocalsnapshots", "latestbackup", "destinationinfo"];
 
-/// Classify with the default python allowlist ([`DEFAULT_PYTHON_ALLOW`]).
+/// Classify `cmd` using [`DEFAULT_PYTHON_ALLOW`].
 pub fn classify_command(cmd: &str) -> Verdict {
     classify_command_with(cmd, DEFAULT_PYTHON_ALLOW)
 }
 
-/// Classify `cmd`; `python_allow` are the script-path globs `python3 <path>` may
-/// run as a read (`*` matches any run of characters, `?` one).
+/// Classify `cmd`, permitting `python3 <path>` when `<path>` matches `python_allow`.
 pub fn classify_command_with<S: AsRef<str>>(cmd: &str, python_allow: &[S]) -> Verdict {
-    // Comments, here-document bodies, `$'…'` and `${…}`, read as the shell reads them, or
-    // refused.
     let cmd = match prelex(cmd) {
         Ok(cmd) => cmd,
         Err(reason) => return Verdict::no(reason),
     };
-    // The worker's timeout idiom is a wrapper, not a perl program.
     let cmd = strip_alarm_idiom(&cmd);
-    // Quoted strings are opaque to the danger scan; a substitution they held is marked
-    // ([`QUOTE_SUB_MARK`]) as a one-word [`QUOTED_SUBSTITUTION`].
     let stripped = strip_quotes(&cmd);
-    // Segments of whitespace-split tokens.
     let segments = split_segments(&stripped);
     if segments.is_empty() {
         return Verdict::no("empty command");
@@ -413,7 +294,6 @@ pub fn classify_command_with<S: AsRef<str>>(cmd: &str, python_allow: &[S]) -> Ve
     if let Some(reason) = danger_scan(&segments) {
         return Verdict::no(reason);
     }
-    // The awk and sed programs inside the quotes the scans above cannot see.
     if let Some(reason) = program_scan(&cmd) {
         return Verdict::no(reason);
     }
@@ -422,7 +302,6 @@ pub fn classify_command_with<S: AsRef<str>>(cmd: &str, python_allow: &[S]) -> Ve
             return Verdict::no(reason);
         }
     }
-    // The words zsh evaluates as arithmetic.
     if let Some(reason) = arithmetic_scan(&cmd) {
         return Verdict::no(reason);
     }
@@ -432,14 +311,7 @@ pub fn classify_command_with<S: AsRef<str>>(cmd: &str, python_allow: &[S]) -> Ve
     }
 }
 
-/// The rest of an rm line judged as a read: [`classify_command_with`] over every
-/// segment except the `rm` commands (any letter case, after assignments),
-/// assignment-only segments and the `mktemp` commands the rm resolver follows
-/// (`supervise::policy::rm_breaker`). The rm rule requires this besides the
-/// resolver's verdict. The skipped segments' assignments ([`assignment_hazard`]:
-/// `REPORTTIME=A; cat f | cat; rm …` runs `A`) and redirects
-/// ([`redirect_hazard`]: `mktemp > ~/.zshrc; rm …` truncates the file) are
-/// still judged.
+/// Classify every segment of `cmd` except `rm` segments.
 pub(crate) fn classify_except_rm<S: AsRef<str>>(cmd: &str, python_allow: &[S]) -> Verdict {
     let lexed = match prelex(cmd) {
         Ok(cmd) => cmd,
@@ -495,31 +367,7 @@ pub(crate) fn classify_except_rm<S: AsRef<str>>(cmd: &str, python_allow: &[S]) -
     }
 }
 
-/// `Ok` when `line` is plain: written only in the part of zsh's grammar whose expansions behave
-/// as text or as a plain command substitution under the modelled startup (zsh 5.9 at its
-/// default options, `NO_EXTENDED_GLOB` and `NO_BARE_GLOB_QUAL` as Claude Code's Bash tool sets
-/// them, and only the options `supervise::policy::shell_startup` reads as inert), so no zsh form
-/// this module has not measured can hide in it. `approve = "safe"`'s read-only rules require this
-/// of a line the Bash tool may run under zsh ([`classify_command_with`] judges what each command
-/// does; this admits only forms zsh expands no further than bash does).
-///
-/// A list of simple commands: no reserved word opens one ([`ZSH_RESERVED`]: `for path in …`
-/// assigns zsh's tied `path`, `repeat` evaluates arithmetic), behind a leading redirect too
-/// (`2>/dev/null for …` is the loop). Outside single quotes: no backtick, backslash, `(`, `)`,
-/// `{`, `}` or `[[`; a `$` only as [`plain_dollar`] admits it (`$NAME`, `${NAME}`, or `$(…)` over
-/// a plain line); no word opening with `=`, and no `=` in a word that is not a flag; a `~` only
-/// as `~` or `~/…`; a `<` only as a plain input redirect; a `>` only onto `/dev/null` or a
-/// descriptor; no control character. Inside double quotes: no backtick or backslash, and a `$`
-/// only as outside them. A `#` that opens a word comments to the end of its line. `Err` names the
-/// first thing that is not plain.
-///
-/// MEASURED 2026-10-22 against `/bin/zsh` 5.9 run as the Bash tool runs it
-/// (`docs/measured/breaker-transcript-and-zsh-2026-10-22.md`): an unquoted `$x` or `${x}` is
-/// neither split nor globbed (bash does both), a `$(…)` is split and not globbed (bash globs too),
-/// and quoted each is one word, so each yields no more than bash's reading of it, which the
-/// classifier judges. The forms zsh evaluates further stay refused: `${(e)x}` and every `${…}`
-/// flag or operator, `$x[…]` (its subscript is arithmetic: `$x[PATH=0]` assigned `PATH`, quoted
-/// too), `$x:h` and the other modifiers, `$=x`, `$~x`, `$^x`, `$((…))`, `=cmd`.
+/// Verify that `line` uses only plain zsh grammar whose expansions behave as text or paths.
 pub(crate) fn plain_zsh_line(line: &str) -> Result<(), String> {
     let chars: Vec<char> = line.chars().collect();
     plain_zsh(&chars, 0)
@@ -529,8 +377,6 @@ pub(crate) fn plain_zsh_line(line: &str) -> Result<(), String> {
 const PLAIN_NEST: u8 = 8;
 
 /// [`plain_zsh_line`] over `chars`, `depth` command substitutions in: inside one (`depth > 0`) a
-/// newline and a comment are refused too, so its `)` is the one zsh closes it with (a `#` opens a
-/// comment inside `$(…)` that can hide a `)` from this reader).
 fn plain_zsh(chars: &[char], depth: u8) -> Result<(), String> {
     #[derive(PartialEq)]
     enum Quote {
@@ -540,17 +386,10 @@ fn plain_zsh(chars: &[char], depth: u8) -> Result<(), String> {
     }
     let boundary = |c: Option<&char>| c.is_none_or(|c| " \t\n;|&".contains(*c));
     let mut quote = Quote::None;
-    // The current word's unquoted text (a `$` for each expansion in it), whether a quote has
-    // opened in it, whether it is a `<` redirect's target, and whether it stands where a
-    // command's first word does.
     let mut word = String::new();
     let mut quoted = false;
     let mut target = false;
     let mut command = true;
-    // A word ends: one that opens a command may not be a reserved word, a
-    // separator makes the next word a command's first, and a redirect's
-    // target (like its `2` in `2>`) leaves that slot to the word after it —
-    // zsh reads `</dev/null for …` as a loop.
     let mut end_word = |word: &mut String, quoted: &mut bool, target: &mut bool, separator| {
         let whole = !word.is_empty() || *quoted;
         if whole && command && !*quoted && ZSH_RESERVED.contains(&word.as_str()) {
@@ -621,8 +460,6 @@ fn plain_zsh(chars: &[char], depth: u8) -> Result<(), String> {
                     }
                     target = true;
                 }
-                // Whatever the word before it (a descriptor, `&>`, or an
-                // argument it ends), a `>` writes only where its target says.
                 '>' => {
                     let mut j = i + 1;
                     if chars.get(j) == Some(&'&') {
@@ -663,13 +500,6 @@ fn plain_zsh(chars: &[char], depth: u8) -> Result<(), String> {
 }
 
 /// The index past the `$` form at `chars[at]` (a `$`) where zsh expands it plainly, quoted or
-/// not: a parameter read `$NAME` or `${NAME}` (an ASCII name, a letter or `_` first), or a
-/// command substitution `$(…)` whose text is itself plain ([`plain_zsh`], one level deeper:
-/// what it runs is the classifier's to judge). After either, no `[` (a subscript, arithmetic
-/// under zsh), `:` (a modifier), `(` (a qualifier) or `{`, and no character outside ASCII (zsh
-/// may read it as more of the name). Every other form is refused: `$((…))`, a special
-/// parameter (`$1`, `$#`, `$$`, `$?`, `$@` …), a flag (`$=x`, `$~x`, `$^x`, `${(e)x}`), any other
-/// `${…}`, `$'…'` and `$"…"`.
 fn plain_dollar(chars: &[char], at: usize, depth: u8) -> Result<usize, String> {
     let name_from = |from: usize| -> Option<usize> {
         let first = chars.get(from)?;
@@ -711,8 +541,6 @@ fn plain_dollar(chars: &[char], at: usize, depth: u8) -> Result<usize, String> {
 }
 
 /// The index of the `)` that closes the `$(` whose text starts at `from`: the first `)` outside
-/// quotes and outside any `$(…)` within, `nested` deep. A backtick, a backslash or a `$((`
-/// anywhere in it, or no `)`, is refused (each also fails [`plain_zsh`] on the text).
 fn substitution_close(chars: &[char], from: usize, nested: u8) -> Result<usize, String> {
     if nested >= PLAIN_NEST {
         return Err("command substitutions nested too deep".into());
@@ -741,8 +569,6 @@ fn substitution_close(chars: &[char], from: usize, nested: u8) -> Result<usize, 
 }
 
 /// zsh 5.9's reserved words (`reswords`, `{`, `}` and `[[` aside, which a
-/// plain line never holds): where one opens a command the line is a compound
-/// or a declaration, not a simple command ([`plain_zsh_line`]).
 const ZSH_RESERVED: &[&str] = &[
     "!",
     "case",
@@ -775,11 +601,6 @@ const ZSH_RESERVED: &[&str] = &[
 ];
 
 /// A segment the rm rule's resolver (`supervise::policy::rm_breaker`) reads as a guard on a
-/// `$(mktemp -d)`: `exit` or `exit <n>` (`D=$(mktemp -d) || exit 1`), and `:` with its words
-/// (`: "${D:?}"`). Neither writes; a redirect or substitution on either is still judged
-/// ([`danger_scan`], [`program_scan`]). `exit` takes digits only: zsh evaluates its word as
-/// arithmetic, whose subscript runs a substitution from inside quotes (`exit 'a[$(cmd)]'`),
-/// and `exit 1 2` does not exit zsh.
 fn is_mktemp_guard(seg: &[String]) -> bool {
     match seg {
         [head, ..] if head == ":" => true,
@@ -789,17 +610,7 @@ fn is_mktemp_guard(seg: &[String]) -> bool {
     }
 }
 
-/// The shell's reading of the parts the segment readers get wrong, applied first: `Ok` is the
-/// line with `#` comments and here-document bodies removed (newlines kept), `$"…"` as `"…"`
-/// and a backslash-free `$'…'` as `'…'`; `Err` names a construct this reader will not follow.
-/// Substitutions nested deeper than [`MAX_SUBSTITUTION_DEPTH`] are refused here, so later
-/// readers never recurse past it.
-///
-/// A comment's apostrophe would open a quote the shell never opened, hiding later lines
-/// (`git log # what's new⏎git push --force`); so would a quote in a here-document body; and
-/// `$'a\'b'` ends where `'…'` would not. A body under an unquoted terminator still expands
-/// `$(…)` and backticks, so it is refused, as is a `${…}` holding a quote or substitution, and
-/// any quote, substitution or here-document left open.
+/// Strip `#` comments and non-expanding here-doc bodies, and refuse complex substitutions.
 pub(crate) fn prelex(src: &str) -> Result<String, String> {
     let mut lx = Prelex {
         chars: src.chars().collect(),
@@ -813,7 +624,6 @@ pub(crate) fn prelex(src: &str) -> Result<String, String> {
     lx.run(None)?;
     if !lx.heredocs.is_empty() {
         // `cat <<EOF` with no newline after it: the shell reads the body from
-        // the lines that follow, and there are none on this line.
         return Err("a here-document with no body".to_string());
     }
     Ok(lx.out)
@@ -838,7 +648,6 @@ struct Prelex {
     /// How many of those are backtick substitutions.
     backticks: usize,
     /// The position right after the last character a backslash escaped
-    /// (`0`: none yet), where no word starts ([`Self::at_word_start`]).
     escaped_to: usize,
 }
 
@@ -848,10 +657,6 @@ impl Prelex {
     }
 
     /// Whether position `i` starts a word: the shell's rule for where `#`
-    /// opens a comment. A character a backslash escapes is its word's, a
-    /// blank or a newline too (`echo a\ #; tee x` and `echo a\⏎#; tee x`
-    /// run `tee`, MEASURED 2026-10-22 under `/bin/bash` 3.2 and `/bin/zsh`
-    /// 5.9), so the position right after one starts no word.
     fn at_word_start(&self) -> bool {
         self.i == 0
             || (self.escaped_to != self.i
@@ -860,9 +665,6 @@ impl Prelex {
     }
 
     /// Whether the unquoted `(` at the cursor is part of a word (after a letter,
-    /// quote, `)`, `}`, glob, `~`, `=` or `<…>` range), which zsh reads as a glob
-    /// group or qualifier ([`GLOB_QUALIFIER_RUNS`]). Not one opening a subshell,
-    /// group or `((…))`, nor `<(…)`, `>(…)` or `=(…)`, whose bodies are commands.
     fn glued_paren(&self) -> bool {
         let boundary = |k: usize| {
             k == 0 || {
@@ -878,7 +680,6 @@ impl Prelex {
     }
 
     /// One substitution deeper: its body, read by [`Self::run`] up to and
-    /// including `stop`, or refused past [`MAX_SUBSTITUTION_DEPTH`].
     fn substitution(&mut self, stop: char) -> Result<(), String> {
         if self.depth >= MAX_SUBSTITUTION_DEPTH {
             return Err(format!(
@@ -895,7 +696,6 @@ impl Prelex {
     }
 
     /// At a backslash inside a backtick substitution: the shell rereads the
-    /// body with `\`` as a backtick, so `` `echo \`rm x\`` `` runs `rm x`.
     fn nested_backtick(&self) -> Result<(), String> {
         if self.backticks > 0 && self.peek(1) == Some('`') {
             return Err("a backtick substitution nested in another (\\`)".to_string());
@@ -904,7 +704,6 @@ impl Prelex {
     }
 
     /// One level: the top (`stop` none), a `$(…)` (`)`), or a backtick
-    /// substitution. Returns having consumed the closing character.
     fn run(&mut self, stop: Option<char>) -> Result<(), String> {
         let mut depth = 0usize;
         while let Some(c) = self.peek(0) {
@@ -922,8 +721,6 @@ impl Prelex {
                 '\'' => self.single_quoted()?,
                 '"' => self.double_quoted()?,
                 '$' if self.peek(1) == Some('\'') => {
-                    // ANSI-C quoting: a backslash escape inside it is where a
-                    // plain `'…'` reader and the shell part ways.
                     self.i += 2;
                     let start = self.i;
                     while let Some(d) = self.peek(0) {
@@ -945,7 +742,6 @@ impl Prelex {
                     self.out.push('\'');
                 }
                 '$' if self.peek(1) == Some('"') => {
-                    // `$"…"` is `"…"` translated: the same expansion rules.
                     self.i += 1;
                     self.double_quoted()?;
                 }
@@ -990,13 +786,11 @@ impl Prelex {
                     self.out.push(c);
                 }
                 '#' if self.at_word_start() => {
-                    // A comment runs to the newline, which is kept.
                     while self.peek(0).is_some_and(|d| d != '\n') {
                         self.i += 1;
                     }
                 }
                 '<' if self.peek(1) == Some('<') && self.peek(2) == Some('<') => {
-                    // A here-string: a word, not a body.
                     self.out.push_str("<<<");
                     self.i += 3;
                 }
@@ -1081,7 +875,6 @@ impl Prelex {
     }
 
     /// A `$` that opens neither `${`, `$(`, `$'` nor `$"`: copied, unless it
-    /// is a form [`Self::parameter_hazard`] refuses.
     fn bare_parameter(&mut self) -> Result<(), String> {
         if let Some(why) = self.parameter_hazard() {
             return Err(why);
@@ -1092,15 +885,8 @@ impl Prelex {
     }
 
     /// Whether the `$` at the cursor opens an arithmetic evaluation (`$[x]`, or
-    /// zsh's unbraced subscript `$name[x]` behind any flags or on a special
-    /// parameter, [`dollar_arithmetic`]), whose subscript runs a substitution
-    /// held in the value (`x='a[$(touch M)]'; echo $[x]`), or carries zsh's `~`
-    /// flag ([`GLOB_SUBST_RUNS`]). The same bare, in double quotes, or in a
-    /// `${…}` operand ([`Self::braced_parameter`]).
     fn parameter_hazard(&self) -> Option<String> {
         let after = &self.chars[self.i + 1..];
-        // zsh's flags before a bare name (`$=V`, `$^V`, `$+V`, `$#V`), in
-        // any order: `~` among them globs the value.
         if after
             .iter()
             .take_while(|c| ZSH_PARAMETER_FLAGS.contains(**c))
@@ -1112,11 +898,6 @@ impl Prelex {
     }
 
     /// `${…}`: copied when it holds no quote, substitution or nested `${` (every
-    /// form a read uses: `${VAR}`, `${VAR:-x}`, `${#VAR}`), when every
-    /// arithmetic part is a literal ([`braced_is_literal`]; subscripts and
-    /// substring offsets are evaluated, so `x='a[$(touch M)]'; echo ${a[x]}`
-    /// runs it), and when no `$` in an operand is a form refused bare
-    /// ([`Self::parameter_hazard`]; `${x:-$path[A]}` and `${x:-$~N}` run code).
     fn braced_parameter(&mut self) -> Result<(), String> {
         let start = self.i;
         self.i += 2;
@@ -1150,7 +931,6 @@ impl Prelex {
     }
 
     /// `<<[-]WORD`: the operator and its word stay in the line (the command
-    /// reads its stdin from it); the body is queued for the next newline.
     fn heredoc_operator(&mut self) -> Result<(), String> {
         self.out.push_str("<<");
         self.i += 2;
@@ -1209,8 +989,6 @@ impl Prelex {
     }
 
     /// At a newline: consume the queued bodies up to and including their
-    /// terminator lines, dropping them from the output. An unterminated body
-    /// runs to the end of the line, as the shell reads it.
     fn heredoc_bodies(&mut self) -> Result<(), String> {
         for doc in std::mem::take(&mut self.heredocs) {
             loop {
@@ -1248,13 +1026,6 @@ impl Prelex {
 }
 
 /// The arithmetic parts of a `${…}` body are literals: its subscript is an
-/// integer, `@` or `*`, and a substring offset or length is an integer. The name
-/// is a plain, positional or special parameter, optionally led by `#`; a `!` is
-/// `${!}` or an index/name listing, never an indirection; no `${NAME@OP}`; any
-/// unknown form (including zsh's `${(e)x}` flags) is refused. Default-value and
-/// pattern forms evaluate no arithmetic, but `:=` and `=` assign, and zsh
-/// evaluates some variables as arithmetic later (`${REPORTTIME:=A}` when a job
-/// ends), so such an assignment is judged as `NAME=v` is.
 fn braced_is_literal(body: &str) -> Result<(), String> {
     let refuse = |why: &str| Err(format!("a ${{{body}}} expansion with {why}"));
     let int = |t: &str| {
@@ -1270,14 +1041,9 @@ fn braced_is_literal(body: &str) -> Result<(), String> {
         }
         if body == "!#" {
             // bash's `${!#}` is the last positional parameter; its value is
-            // not read as a name in turn.
             return Ok(());
         }
         if body.starts_with('!') {
-            // bash's `${!NAME…}` expands the variable named by NAME's value,
-            // subscript and all (`A='a[$(cmd)]'; echo "${!A}"` runs `cmd`).
-            // Only the listings stay: `${!A[@]}`/`${!A[*]}` (indices) and
-            // `${!A@}`/`${!A*}` (names).
             let name = ["[@]", "[*]", "@", "*"]
                 .iter()
                 .find_map(|listing| r.strip_suffix(listing));
@@ -1313,7 +1079,6 @@ fn braced_is_literal(body: &str) -> Result<(), String> {
     }
     if rest.starts_with('@') {
         // bash 4.4's `${NAME@OP}`; `@P` expands the value as a prompt string,
-        // substitutions and all.
         return refuse("a transformation (bash's @P expands the value as a prompt)");
     }
     if let Some(r) = rest.strip_prefix(':')
@@ -1324,8 +1089,6 @@ fn braced_is_literal(body: &str) -> Result<(), String> {
             return refuse("a substring offset that is not a literal (evaluated as arithmetic)");
         }
     }
-    // `${NAME:=v}` and `${NAME=v}` assign `NAME`: judged as `NAME=v`
-    // ([`assignment_hazard`]).
     if let Some(value) = rest.strip_prefix(":=").or_else(|| rest.strip_prefix('='))
         && let Some(why) = assignment_hazard(&format!("{name}={value}"))
     {
@@ -1335,14 +1098,9 @@ fn braced_is_literal(body: &str) -> Result<(), String> {
 }
 
 /// zsh's parameter flags, any run of which may stand between a `$` and the
-/// name (`$=V`, `$^V`, `$+V`, `$#V`, `$~V`).
 const ZSH_PARAMETER_FLAGS: &str = "=^+#~";
 
 /// Whether the text after a `$` (`after`) opens an arithmetic evaluation: `$[x]`,
-/// or zsh's unbraced subscript: any run of flags ([`ZSH_PARAMETER_FLAGS`]), then
-/// a name, one special parameter (`*`, `@`, `?`, `-`, `!`, `$`, `#`) or neither,
-/// then `[`. zsh subscripts special parameters too (`A='path[$(cmd)]'; echo
-/// $*[A]` runs `cmd`), and a lone `#` flag is `$#` itself.
 fn dollar_arithmetic(after: &[char]) -> Option<&'static str> {
     if after.first() == Some(&'[') {
         return Some("a $[…] arithmetic expansion");
@@ -1365,8 +1123,6 @@ fn dollar_arithmetic(after: &[char]) -> Option<&'static str> {
 }
 
 /// The arithmetic an unquoted here-document body expands is literal: its `${…}`
-/// forms pass [`braced_is_literal`], and no `$` opens `$[…]` or a subscript
-/// ([`dollar_arithmetic`]). The body expands as a double-quoted word.
 fn body_arithmetic_is_literal(line: &str) -> Result<(), String> {
     let mut rest = line;
     while let Some(at) = rest.find('$') {
@@ -1387,8 +1143,6 @@ fn body_arithmetic_is_literal(line: &str) -> Result<(), String> {
 }
 
 /// Remove every `perl -e 'alarm N; exec @ARGV'` wrapper with exactly that body
-/// ([`is_alarm_body`]). Any other `perl -e` stays and the danger scan refuses
-/// it.
 fn strip_alarm_idiom(cmd: &str) -> String {
     let mut s = cmd.to_string();
     let mut from = 0;
@@ -1423,7 +1177,6 @@ fn strip_alarm_idiom(cmd: &str) -> String {
 }
 
 /// `alarm <digits> ; exec @ARGV [;]`, whitespace free between the parts, and
-/// nothing else: the timeout wrapper and only the timeout wrapper.
 fn is_alarm_body(body: &str) -> bool {
     let Some(rest) = body.trim().strip_prefix("alarm") else {
         return false;
@@ -1447,11 +1200,6 @@ fn is_alarm_body(body: &str) -> bool {
 }
 
 /// Replace every quoted string with `""`. A substitution inside double quotes
-/// stays glued to that `""`, preceded by [`QUOTE_SUB_MARK`] (so `x="$(…)"` is
-/// still one assignment and [`split_segments`] reads a
-/// [`QUOTED_SUBSTITUTION`]); a parameter inside double quotes becomes
-/// [`QUOTED_PARAMETER`]; find's `\(`/`\)` become bare parens; other escapes
-/// stay verbatim.
 fn strip_quotes(src: &str) -> String {
     let chars: Vec<char> = src.chars().collect();
     let mut out = String::with_capacity(src.len());
@@ -1461,8 +1209,6 @@ fn strip_quotes(src: &str) -> String {
 }
 
 /// `stop` is the character that ends this level: `)` inside a `$(…)`, a
-/// backtick inside a backtick substitution, none at the top. A literal
-/// [`QUOTE_SUB_MARK`] the line carries is dropped, so it cannot be spoofed in.
 fn strip_into(chars: &[char], i: &mut usize, out: &mut String, stop: Option<char>) {
     let mut depth = 0usize;
     while *i < chars.len() {
@@ -1523,8 +1269,6 @@ fn strip_into(chars: &[char], i: &mut usize, out: &mut String, stop: Option<char
                                 || matches!(n, '_' | '{' | '@' | '*' | '#' | '?' | '$' | '!' | '-')
                         })
                     {
-                        // A parameter inside double quotes: one word whose
-                        // value this check cannot read ([`QUOTED_PARAMETER`]).
                         out.push_str(QUOTED_PARAMETER);
                         *i += 1;
                         match chars.get(*i) {
@@ -1577,7 +1321,6 @@ fn strip_into(chars: &[char], i: &mut usize, out: &mut String, stop: Option<char
             }
             _ => {
                 // A literal QUOTE_SUB_MARK is dropped: only the marker this
-                // function writes may reach the splitter.
                 if c != QUOTE_SUB_MARK {
                     out.push(c);
                 }
@@ -1588,14 +1331,6 @@ fn strip_into(chars: &[char], i: &mut usize, out: &mut String, stop: Option<char
 }
 
 /// Split on `;`, `&`, `&&`, `||`, `|`, `(`, `)` and newline; each segment is its
-/// whitespace-split tokens. A substitution is not a separator but one word
-/// ([`SUBSTITUTION`], glued to adjacent text), so `$(printf rm) -rf /` has an
-/// unreadable head and `git tag $(date +%s)` keeps its positional; its body
-/// becomes segments of its own, first, since it runs first. An escaped
-/// character (find's `\;`) is literal; a redirect's `&` (`2>&1`, `&>f`, `<&3`)
-/// stays in its token, so only job-control `&` splits. A `>`, `<` or `&>` glued
-/// to the end of a non-descriptor word starts its own token, as the shell
-/// reads `rm>/dev/null -rf /`.
 fn split_segments(s: &str) -> Vec<Vec<String>> {
     let chars: Vec<char> = s.chars().collect();
     let mut segments = Vec::new();
@@ -1605,7 +1340,6 @@ fn split_segments(s: &str) -> Vec<Vec<String>> {
 }
 
 /// One level of [`split_segments`]: the top (`stop` none), a `$(…)` body
-/// (`)`) or a backtick body. Returns having consumed the closing character.
 fn split_level(chars: &[char], i: &mut usize, stop: Option<char>, segments: &mut Vec<Vec<String>>) {
     let mut cur = String::new();
     let flush = |cur: &mut String, segments: &mut Vec<Vec<String>>| {
@@ -1615,8 +1349,6 @@ fn split_level(chars: &[char], i: &mut usize, stop: Option<char>, segments: &mut
         }
         cur.clear();
     };
-    // Subshell parens open at this level: a `)` closes the substitution only
-    // when none is.
     let mut depth = 0usize;
     while *i < chars.len() {
         let c = chars[*i];
@@ -1628,8 +1360,6 @@ fn split_level(chars: &[char], i: &mut usize, stop: Option<char>, segments: &mut
                     *i += 1;
                 }
             }
-            // A substitution [`strip_quotes`] flagged as double-quoted: one
-            // word ([`QUOTED_SUBSTITUTION`]), never split, its body still run.
             _ if c == QUOTE_SUB_MARK
                 && chars.get(*i + 1) == Some(&'$')
                 && chars.get(*i + 2) == Some(&'(') =>
@@ -1646,8 +1376,7 @@ fn split_level(chars: &[char], i: &mut usize, stop: Option<char>, segments: &mut
                 continue;
             }
             _ if c == QUOTE_SUB_MARK => {
-                // A stray mark (no substitution follows): drop it (the outer
-                // `*i += 1` consumes it).
+                // Stray mark; consumed by the outer `*i += 1`.
             }
             '$' if chars.get(*i + 1) == Some(&'(') => {
                 *i += 2;
@@ -1708,7 +1437,6 @@ fn split_level(chars: &[char], i: &mut usize, stop: Option<char>, segments: &mut
 }
 
 /// Whether a redirect glyph arriving now would be glued to a word (`rm>x`),
-/// not to a descriptor (`2>x`), another glyph (`>>`, `<>`), or `&` (`&>x`).
 fn glued_to_a_word(cur: &str) -> bool {
     let word = cur.rsplit(char::is_whitespace).next().unwrap_or("");
     let Some(last) = word.chars().last() else {
@@ -1717,17 +1445,14 @@ fn glued_to_a_word(cur: &str) -> bool {
     !matches!(last, '>' | '<' | '&') && !word.chars().all(|c| c.is_ascii_digit())
 }
 
-/// The program name of a token: its basename, so `/bin/rm` and `rm` agree.
+/// Basename of command token `tok`.
 pub(crate) fn program(tok: &str) -> &str {
     tok.rsplit('/').next().unwrap_or(tok)
 }
 
 /// An output redirect token: `Some(target)` when `tok` redirects (`>`, `>>`,
-/// `2>`, `&>`, `>|`, `>file`); `None` when the target is the next token.
 fn redirect_target(tok: &str) -> Option<Option<&str>> {
     let pos = tok.find('>')?;
-    // `<>` and `<(` are not output redirects; `->`/`=>` inside a word are, in
-    // shell, so they are refused (a tie breaks toward not-read-only).
     if tok[..pos].ends_with('<') {
         return None;
     }
@@ -1737,7 +1462,6 @@ fn redirect_target(tok: &str) -> Option<Option<&str>> {
 }
 
 /// A redirect target that writes no file: `/dev/null`, a descriptor (`&1`) or a
-/// close (`&-`). `>&word` with another word writes both streams to `word`.
 fn redirect_is_safe(target: &str) -> bool {
     target == "/dev/null"
         || target.strip_prefix('&').is_some_and(|fd| {
@@ -1746,8 +1470,6 @@ fn redirect_is_safe(target: &str) -> bool {
 }
 
 /// `Some(reason)` when `seg[i]` is a redirect that writes a file: `<>`
-/// (read-write, creating it), or `>`, `>>`, `>|`, `&>` or `N>` to a target
-/// other than `/dev/null` or a descriptor ([`redirect_is_safe`]).
 fn redirect_hazard(seg: &[String], i: usize) -> Option<String> {
     let tok = seg[i].as_str();
     if tok.contains("<>") {
@@ -1761,7 +1483,6 @@ fn redirect_hazard(seg: &[String], i: usize) -> Option<String> {
 }
 
 /// Skip `git`'s global options to its subcommand: `-C <dir>`, `-c <k=v>`,
-/// `--git-dir=…`, `--work-tree=…`, `--no-pager`, `-P`, and any other flag.
 fn git_subcommand(seg: &[String], git_idx: usize) -> Option<(usize, &str)> {
     let mut j = git_idx + 1;
     while j < seg.len() {
@@ -1778,16 +1499,7 @@ fn git_subcommand(seg: &[String], git_idx: usize) -> Option<(usize, &str)> {
 }
 
 /// The negative filter over every token: a file redirect, `find -delete` / `-fprint` /
-/// `-exec <writer>`, `sed -i`/`-I`, `sort -o`, `tree -o`, `uniq IN OUT`, an inline-code
-/// interpreter, a python heredoc, `xargs` feeding a writer, a git write or a git flag that
-/// runs a program or writes a file, arithmetic in `[[`/`test`, a word after a closing `}`
-/// ([`closes_a_brace`]) or `]]`, and an assignment to a [`HAZARD_VARS`] variable. Program
-/// names, and the run-or-write flags of `rg`, `printf`, `less` and `date`, are the head
-/// check's job ([`runs_or_writes_by_flag`]).
 fn danger_scan(segments: &[Vec<String>]) -> Option<String> {
-    // A `}` or `]]` closes something only on a line with a `{` or `[[`
-    // word, before it or not, and a `}` glued to a word's end closes too
-    // ([`closes_a_brace`]).
     let has = |open: &str| segments.iter().flatten().any(|t| t == open);
     let (braces, brackets) = (has("{"), has("[["));
     let closing = |t: &str| (braces && closes_a_brace(t)) || (brackets && t == "]]");
@@ -1803,8 +1515,6 @@ fn danger_scan(segments: &[Vec<String>]) -> Option<String> {
                 return Some(reason);
             }
             if closing(tok) {
-                // The compound's own redirects (`{ …; } 2>&1`, `[[ … ]]
-                // 2>/dev/null`) are judged as every redirect is.
                 let mut k = i + 1;
                 while let Some(span) = seg.get(k).map(|t| redirect_span(t)).filter(|&n| n > 0) {
                     k += span;
@@ -1814,7 +1524,6 @@ fn danger_scan(segments: &[Vec<String>]) -> Option<String> {
                 }
             }
             if prog == "xargs" {
-                // `xargs [-0] [-n N] [-I {}] <cmd>`: name the fed command.
                 let mut k = i + 1;
                 while k < seg.len() && seg[k].starts_with('-') {
                     k += if seg[k] == "-n" || seg[k] == "-I" || seg[k] == "-L" || seg[k] == "-P" {
@@ -1835,9 +1544,6 @@ fn danger_scan(segments: &[Vec<String>]) -> Option<String> {
             let test_head = tok == "["
                 || (tok == "test" && (i == 0 || KEYWORD_PREFIX.contains(&seg[i - 1].as_str())));
             if tok == "[[" || test_head {
-                // `[[` arithmetic comparisons, and `-v name[sub]` in `[[`, `[`
-                // and `test`, evaluate arithmetic, running substitutions held in
-                // a value's subscript. `[`/`test` `-eq` compare without evaluating.
                 let arith: &[&str] = if tok == "[[" {
                     &["-eq", "-ne", "-lt", "-le", "-gt", "-ge", "-v"]
                 } else {
@@ -1850,11 +1556,6 @@ fn danger_scan(segments: &[Vec<String>]) -> Option<String> {
                 {
                     return Some(format!("{tok} {op} (evaluates arithmetic)"));
                 }
-                // A word the shell brace-expands or globs may become `-t` and
-                // its operand (`[ {-t,A} ]` is `[ -t A ]`; `[ * ]` beside files
-                // `-t` and `S=5` is `[ -t S=5 ]`), whose arithmetic
-                // [`arithmetic_scan`] cannot see; a word starting with `/`
-                // expands to paths only. `[[` expands neither.
                 if let Some(t) = seg[i + 1..]
                     .iter()
                     .take_while(|t| *t != "]")
@@ -1875,10 +1576,6 @@ fn danger_scan(segments: &[Vec<String>]) -> Option<String> {
                 return Some(format!("find {tok}"));
             }
             if prog == "sort" || prog == "tree" {
-                // `sort -o FILE` / `--output=FILE`, `tree -o FILE`: an output
-                // file. Neither has another short flag with an `o` in it, and
-                // sort takes any prefix of `--output` for it
-                // ([`long_option_spells`]).
                 for t in &seg[i + 1..] {
                     if long_option_spells(t, "output")
                         || (t.starts_with('-') && !t.starts_with("--") && t[1..].contains('o'))
@@ -1888,7 +1585,6 @@ fn danger_scan(segments: &[Vec<String>]) -> Option<String> {
                 }
             }
             if prog == "uniq" {
-                // `uniq IN OUT`: a second positional is the output file.
                 let mut positionals = 0;
                 let mut k = i + 1;
                 while k < seg.len() {
@@ -1919,8 +1615,6 @@ fn danger_scan(segments: &[Vec<String>]) -> Option<String> {
                 }
             }
             if prog == "sed" {
-                // macOS sed edits in place under `-I` as under `-i`, alone or
-                // in a cluster (`-nI`).
                 for t in &seg[i + 1..] {
                     if t == "--in-place"
                         || t.starts_with("--in-place=")
@@ -1946,9 +1640,6 @@ fn danger_scan(segments: &[Vec<String>]) -> Option<String> {
                 return Some(format!("{prog} -c"));
             }
             if prog == "git" {
-                // Global options that set config or the helper path run a
-                // program of the line's choosing (`-c core.pager=…`,
-                // `-c core.fsmonitor=…`) whatever the subcommand.
                 let mut j = i + 1;
                 while let Some(t) = seg.get(j).map(String::as_str) {
                     if t == "-c"
@@ -1960,9 +1651,6 @@ fn danger_scan(segments: &[Vec<String>]) -> Option<String> {
                     }
                     if t.starts_with("--git-dir") || t.starts_with("--work-tree") {
                         // A repository of the line's choosing, whose config
-                        // (`core.fsmonitor`, `diff.external`) runs a program on
-                        // a read. `-C` stays a read: `cd X && git status`
-                        // reaches the same repository.
                         return Some(format!("git {t} (a repository of the line's choosing)"));
                     }
                     if t == "--help" || t == "-h" {
@@ -1981,8 +1669,6 @@ fn danger_scan(segments: &[Vec<String>]) -> Option<String> {
                 && let Some((sub_idx, sub)) = git_subcommand(seg, i)
             {
                 let arg = seg.get(sub_idx + 1).map(String::as_str);
-                // Read subcommands' flags that write a file or run a program:
-                // `--output=<file>`, an external diff driver, `grep -O<pager>`.
                 for t in &seg[sub_idx + 1..] {
                     let t = t.as_str();
                     if t == "--output"
@@ -2017,16 +1703,9 @@ fn danger_scan(segments: &[Vec<String>]) -> Option<String> {
 }
 
 /// Why `git <sub> --help` (and `git --help <sub>`, `git -h <sub>`) is no read:
-/// it is `git help <sub>`, which runs the viewer `man.viewer`/`man.<tool>.cmd`
-/// (or with `help.format = web`, `web.browser`/`browser.<tool>.cmd`) names,
-/// keys a repository's config may set, even without a terminal.
 const GIT_HELP_RUNS: &str = "(runs git help: the man or web viewer the config names)";
 
 /// Whether a `git grep` argument turns on `-O` / `--open-files-in-pager`, which
-/// runs the pager on matching files even without a terminal: a short cluster
-/// holding `O` before any value-taking letter (`-nO`, `-iOless`, `-3O`; not
-/// `-eO`), or a long option git would take as its abbreviation (`--open`,
-/// `--op`; the ambiguous `--o` counts too).
 fn grep_opens_pager(t: &str) -> bool {
     if let Some(long) = t.strip_prefix("--") {
         let name = long.split('=').next().unwrap_or("");
@@ -2038,8 +1717,6 @@ fn grep_opens_pager(t: &str) -> bool {
     for c in cluster.chars() {
         match c {
             'O' => return true,
-            // `-A<n>` `-B<n>` `-C<n>` `-e<pattern>` `-f<file>` `-m<n>`: the
-            // rest of the cluster is the value.
             'A' | 'B' | 'C' | 'e' | 'f' | 'm' => return false,
             _ => {}
         }
@@ -2048,7 +1725,6 @@ fn grep_opens_pager(t: &str) -> bool {
 }
 
 /// Whether `tok` names a program by a path in [`SYSTEM_BIN_DIRS`] and nowhere
-/// deeper (`/bin/ls`, not `/bin/x/ls` or `/bin/../tmp/ls`).
 fn is_system_bin(tok: &str) -> bool {
     SYSTEM_BIN_DIRS.iter().any(|dir| {
         tok.strip_prefix(dir)
@@ -2057,7 +1733,6 @@ fn is_system_bin(tok: &str) -> bool {
 }
 
 /// Whether every entry of the search path `value` is a [`SYSTEM_BIN_DIRS`]
-/// directory (`/bin:/usr/bin`): a program found there is the one its name says.
 fn is_system_search_path(value: &str) -> bool {
     value.split(':').all(|entry| {
         let entry = entry.trim_end_matches('/');
@@ -2068,9 +1743,6 @@ fn is_system_search_path(value: &str) -> bool {
 }
 
 /// `Some(reason)` when `tok` assigns a [`HAZARD_VARS`] variable (or a
-/// [`HAZARD_VAR_PREFIXES`] family). `PATH` passes only when every entry is a
-/// literal system directory (`env -i PATH=/bin ls`). Arrays zsh ties to a
-/// scalar are judged as the scalar ([`ZSH_TIED`]).
 fn assignment_hazard(tok: &str) -> Option<String> {
     if !is_assignment(tok) {
         return None;
@@ -2094,11 +1766,6 @@ fn assignment_hazard(tok: &str) -> Option<String> {
 }
 
 /// A `for` loop assigns each word to its variables, and zsh evaluates each as
-/// arithmetic when the variable is one of [`ZSH_ARITHMETIC_VARS`] (`for SECONDS
-/// in 'path[$(cmd)]'` runs `cmd`). So every name the loop assigns is judged
-/// with every word it may take ([`assignment_hazard`]); a loop whose words are
-/// not in the segment (`for N; do`, zsh's `for N (…)`) is judged with an
-/// unreadable word. [`HAZARD_VARS`] are refused the same way.
 fn loop_assignment_hazard(seg: &[String]) -> Option<String> {
     let j = skip_prefixes(seg, 0);
     if seg.get(j).map(String::as_str) != Some("for") {
@@ -2124,12 +1791,6 @@ fn loop_assignment_hazard(seg: &[String]) -> Option<String> {
 }
 
 /// The variables whose assigned value zsh 5.9 evaluates as arithmetic, so an
-/// assignment (`NAME=v`, `NAME=v cmd`, `for NAME in v`) runs a command from the
-/// value's subscript (`SECONDS='path[$(cmd)]'`); only a plain number may be
-/// assigned ([`plain_number`]). Found by testing every declared or documented
-/// name: those that evaluate at assignment, `MBEGIN`/`MEND` after a matching
-/// `[[ … =~ … ]]`, and three evaluated on use (`DIRSTACKSIZE` at a `cd`,
-/// `REPORTTIME` and `REPORTMEMORY` when a forked job ends).
 const ZSH_ARITHMETIC_VARS: &[&str] = &[
     "COLUMNS",
     "DIRSTACKSIZE",
@@ -2158,29 +1819,15 @@ const ZSH_ARITHMETIC_VARS: &[&str] = &[
     "ZLE_RPROMPT_INDENT",
 ];
 
-/// The characters by which zsh expands a word into more file names than it
-/// spells: `*`, `?`, `[`, and under `EXTENDED_GLOB` (which a user's `setopt`
-/// may carry into Claude Code's shell snapshot) `^`, `#` and a `(` group (see
-/// [`GLOB_QUALIFIER_RUNS`]). `[ ^-vS ]` beside files `-t`, `-vS`, `S=5` is `[ -t
-/// S=5 ]`. Its `~` only excludes names, but changes the word's text, so
-/// [`expands_apart`] counts it.
+/// Characters that trigger zsh filename globbing (`EXTENDED_GLOB` included).
 pub(crate) const GLOB_CHARS: &[char] = &['*', '?', '[', '^', '#', '('];
 
 /// Whether the shell may make other words of the quote-stripped word `t`: an
-/// unquoted `{` it brace-expands, a [`GLOB_CHARS`] character, or an
-/// `EXTENDED_GLOB` `~` past the first character (a leading one is one path).
 fn expands_apart(t: &str) -> bool {
     t.contains('{') || t.contains(GLOB_CHARS) || t.chars().skip(1).any(|c| c == '~')
 }
 
 /// Whether `t` spells the long option `--{name}` as `getopt_long` (macOS
-/// `sort` 2.3-Apple, GNU tools) and git's option parser read one: the whole
-/// name or any prefix of it, bare or with `=value` (`--o`, `--outp=f`,
-/// `--compress`). MEASURED 2026-10-22: `sort --o=f` wrote `f`, an
-/// abbreviated `--compress-program` ran its program, `git config --unset-a
-/// k` removed `k` and `git config --rem s` removed section `s`. A prefix two
-/// options share is an error to the tool, so taking it for this one only
-/// over-refuses.
 fn long_option_spells(t: &str, name: &str) -> bool {
     t.strip_prefix("--")
         .map(|r| r.split_once('=').map_or(r, |(n, _)| n))
@@ -2188,20 +1835,12 @@ fn long_option_spells(t: &str, name: &str) -> bool {
 }
 
 /// Read tools whose write or run form an argument selects (`sort -o`, `rg
-/// --pre`, `find -delete`, `test -v`, `uniq IN OUT`, `date -s`, `less +…`, a
-/// compiling `trustc`): an expansion before `--` may be that flag, so it is
-/// refused ([`expansion_in_an_option_slot`]). `test`/`[` go by argument count
-/// ([`test_expansions_are_operands`]); `printf` is judged up to its format
-/// ([`runs_or_writes_by_flag`]); `git` has its own arm in [`head_from`].
 const SELECTED_BY_AN_ARGUMENT: &[&str] = &[
     "sort", "tree", "sed", "uniq", "less", "more", "sysctl", "file", "date", "rg", "find", "test",
     "[", "trustc", "rustc",
 ];
 
 /// Whether `tok` carries an expansion whose value is unreadable: a substitution
-/// ([`SUBSTITUTION`], [`QUOTED_SUBSTITUTION`]), a double-quoted parameter
-/// ([`QUOTED_PARAMETER`]), or an unquoted `$X`. Single-quoted and escaped `$`
-/// are literal.
 fn has_expansion(tok: &str) -> bool {
     let b = tok.as_bytes();
     b.iter()
@@ -2210,8 +1849,6 @@ fn has_expansion(tok: &str) -> bool {
 }
 
 /// The first word in `args` carrying an expansion ([`has_expansion`]) where
-/// `head` reads options: anywhere before `--`, since even a quoted expansion
-/// can start with `-`. `test`/`[` use [`test_expansions_are_operands`].
 fn expansion_in_an_option_slot<'a>(head: &str, args: &'a [String]) -> Option<&'a str> {
     if head == "test" || head == "[" {
         let ops = match args.split_last() {
@@ -2231,7 +1868,6 @@ fn expansion_in_an_option_slot<'a>(head: &str, args: &'a [String]) -> Option<&'a
 }
 
 /// Whether `tok` carries an unquoted expansion ([`SUBSTITUTION`] or bare `$X`),
-/// which word-splits and can change its command's word count.
 fn has_unquoted_expansion(tok: &str) -> bool {
     has_expansion(
         &tok.replace(QUOTED_SUBSTITUTION, "")
@@ -2240,11 +1876,6 @@ fn has_unquoted_expansion(tok: &str) -> bool {
 }
 
 /// Whether every expansion in a `test`/`[` expression is a quoted operand under
-/// POSIX's 1-, 2- and 3-argument rules (`[ X ]`, `[ ! X ]`, `[ -z X ]`, `[ X = Y
-/// ]`, `[ X -gt Y ]`, `[ ! -f X ]`). An unquoted expansion can split into
-/// another form (`[ $n ]` with `n='-v a[$(cmd)]'`), so it is never an operand.
-/// `-v` and `-R` evaluate a subscript and are excluded; numeric primaries do
-/// not evaluate arithmetic in `[`/`test`. Four or more words: no expansion.
 fn test_expansions_are_operands(ops: &[String]) -> bool {
     if ops.iter().any(|t| has_unquoted_expansion(t)) {
         return false;
@@ -2261,26 +1892,18 @@ fn test_expansions_are_operands(ops: &[String]) -> bool {
     }
 }
 
-/// Unary `test`/`[` primaries whose operand is a string or file
-/// ([`test_expansions_are_operands`]). `-t`'s operand is zsh arithmetic
-/// ([`arithmetic_scan`]); `-v` and `-R` evaluate a variable's subscript, so
-/// they are excluded.
+/// Unary `test`/`[` primaries whose operand is a string or file.
 pub(crate) const TEST_UNARY: &[&str] = &[
     "-b", "-c", "-d", "-e", "-f", "-g", "-h", "-k", "-p", "-r", "-s", "-t", "-u", "-w", "-x", "-L",
     "-O", "-G", "-N", "-S", "-z", "-n",
 ];
 
-/// Binary `test`/`[` primaries ([`TEST_UNARY`]). Numeric ones do not evaluate
-/// operands as arithmetic in `[`/`test` (only bash's `[[` does).
+/// Binary `test`/`[` primaries.
 pub(crate) const TEST_BINARY: &[&str] = &[
     "=", "==", "!=", "<", ">", "-nt", "-ot", "-ef", "-eq", "-ne", "-gt", "-ge", "-lt", "-le",
 ];
 
 /// Flags by which a read tool at a segment head runs a program or writes: `rg --pre`, `sort
-/// --compress-program=`, `printf -v NAME`, `less`/`more` with `+<command>`, a log or key
-/// file, `sysctl name=value`/`-w`, `hostname <name>`/`-F`, `file -C`, `tree -R`, `test -v`,
-/// and `date` setting the clock (`-s`, or a positional without BSD's `-j`); and for
-/// [`SELECTED_BY_AN_ARGUMENT`] tools, any expansion before `--`.
 fn runs_or_writes_by_flag(head: &str, args: &[String]) -> Option<String> {
     let flag = |t: &str| format!("{head} {t}");
     let unreadable = |t: &str| format!("{head} {t} (a word this check cannot read may be a flag)");
@@ -2301,9 +1924,6 @@ fn runs_or_writes_by_flag(head: &str, args: &[String]) -> Option<String> {
             })
             .map(|t| flag(t)),
         "printf" => {
-            // Its options, then its format: a substitution among them may be
-            // `-v NAME`, as may a brace-expanded (`{-vS,%s}`) or globbed (`-*`,
-            // [`expands_apart`]) word; after the format every word is data.
             let format = args.iter().position(|t| !t.starts_with('-'));
             let opts = &args[..format.map_or(args.len(), |k| k + 1)];
             opts.iter()
@@ -2361,7 +1981,6 @@ fn runs_or_writes_by_flag(head: &str, args: &[String]) -> Option<String> {
             let mut no_set = false;
             while let Some(t) = args.get(k).map(String::as_str) {
                 if let Some(target) = redirect_target(t) {
-                    // `2>/dev/null` is the shell's, not an operand.
                     k += if target.is_none() { 2 } else { 1 };
                     continue;
                 }
@@ -2407,7 +2026,6 @@ fn is_duration(tok: &str) -> bool {
 }
 
 /// Whether a segment is a continuation fragment, not a command: it starts with a
-/// flag (`-name` after a `\(` split) or a redirect (`2>/dev/null` after a `)`).
 fn is_fragment(head: &str) -> bool {
     head.starts_with('-') || head.starts_with('<') || redirect_target(head).is_some()
 }
@@ -2418,14 +2036,11 @@ const XARGS_VALUE_FLAGS: &[&str] = &[
 ];
 
 /// The positive filter on one segment: `None` when its head is a read-only
-/// program (with the git / tmutil / python refinements), else the reason.
 fn segment_head<S: AsRef<str>>(seg: &[String], python_allow: &[S]) -> Option<String> {
     head_from(seg, 0, true, python_allow)
 }
 
 /// How many tokens a redirect in command-name position spans: 1 with its target
-/// glued (`2>/dev/null`, `<in`, `>&2`, `<<EOF`), 2 with the target next (`>`
-/// `out`), 0 for a non-redirect.
 fn redirect_span(tok: &str) -> usize {
     let op = tok.trim_start_matches(|c: char| c.is_ascii_digit());
     if !(op.starts_with(['<', '>']) || op.starts_with("&>")) {
@@ -2439,33 +2054,11 @@ fn redirect_span(tok: &str) -> usize {
 }
 
 /// Where `seg`'s command starts from word `j`: past `VAR=value` assignments,
-/// redirects (`2>/dev/null rm x`), zsh's `-` modifier, `timeout [flags] N` or
-/// `time [-p]`, and keyword prefixes (`do`, `then`, `if`), in any order — a
-/// keyword only where the shell reads one ([`skip_prefixes_at`]).
 fn skip_prefixes(seg: &[String], j: usize) -> usize {
     skip_prefixes_at(seg, j, true).0
 }
 
 /// [`skip_prefixes`] from word `j`, where `keyword` says whether a reserved
-/// word at `j` is read as one: at a segment's start it is, as the word a
-/// wrapper runs (`env if`, `xargs for`) it is not. Returns where the command
-/// starts and whether a reserved word there is read as one. bash reads a
-/// reserved word only where a command may begin, so behind an assignment, a
-/// redirect, zsh's `-` or `timeout` it is the command's name: `X=1 if true`
-/// and `2>/dev/null if true` run a program named `if` (MEASURED, bash 3.2,
-/// with an `if` on `PATH`). A keyword prefix there is not skipped; it is the
-/// head, which [`head_from`] refuses ([`SHELL_RESERVED`]). After `time` a
-/// reserved word is never read as one: `time` is bash's keyword only where a
-/// pipeline begins, and a segment does not say whether it does. Behind a
-/// pipe it is `/usr/bin/time`, which runs a program named by the next word
-/// (MEASURED, bash 3.2, with an `if` and a `time` first on `PATH`: `echo x |
-/// time if true` ran the `time` program with `if true`), as it is behind an
-/// assignment (`X=1 time if …`). So `time if …` and `time for …` are refused
-/// even where they are the keyword's forms; `time ls` stays a read. For the
-/// same reason an option after `time [-p]` is `/usr/bin/time`'s own, not a
-/// fragment: `ls | time -o out.txt ls` and `X=1 time -o out.txt ls` write
-/// `out.txt` (MEASURED, bash 3.2), so the command there is `time` itself,
-/// which no list clears.
 fn skip_prefixes_at(seg: &[String], mut j: usize, mut keyword: bool) -> (usize, bool) {
     loop {
         let start = j;
@@ -2501,8 +2094,6 @@ fn skip_prefixes_at(seg: &[String], mut j: usize, mut keyword: bool) -> (usize, 
                 }
                 if seg.get(j).is_some_and(|t| t.starts_with('-')) {
                     // `/usr/bin/time`'s own options (`-o FILE` writes FILE,
-                    // `-a` appends): the program is `time` itself, which no
-                    // list clears, not a fragment the head check passes.
                     return (at, false);
                 }
                 keyword = false;
@@ -2517,24 +2108,12 @@ fn skip_prefixes_at(seg: &[String], mut j: usize, mut keyword: bool) -> (usize, 
 }
 
 /// bash 3.2's reserved words (`time` aside, which [`skip_prefixes_at`] reads
-/// through as a wrapper wherever it stands): where the shell reads a command's
-/// name instead of a keyword, each is the name of a program the line does not
-/// show ([`head_from`]), though [`READ_ONLY`] and [`KEYWORD_PREFIX`] list some
-/// of them as the keywords they are at a command's start.
 const SHELL_RESERVED: &[&str] = &[
     "!", "case", "coproc", "do", "done", "elif", "else", "esac", "fi", "for", "function", "if",
     "in", "select", "then", "until", "while", "{", "}", "[[", "]]",
 ];
 
 /// What the wrapper at `seg[j]` (`xargs`, `env`, by name or from a system
-/// directory) runs. `None`: no wrapper. `Some(Ok(None))`: it runs no word of the
-/// line (bare `env` prints, bare `xargs` runs `echo`).
-/// `Some(Ok(Some((k, dirs))))`: the command at `k`, in each `env -C` directory
-/// in `dirs`. `Some(Err(reason))`: it hides its command (`env -S`) or chooses
-/// its program itself (`env -P`).
-///
-/// `env`'s short options are read as `getopt` does: a cluster ends at the first
-/// value-taking option, whose value is the rest of the word or the next word.
 fn wrapper(seg: &[String], j: usize) -> Option<Wrapped<'_>> {
     let tok = seg.get(j)?.as_str();
     if tok.contains('/') && !is_system_bin(tok) {
@@ -2542,8 +2121,6 @@ fn wrapper(seg: &[String], j: usize) -> Option<Wrapped<'_>> {
     }
     match program(tok) {
         "xargs" => {
-            // `xargs [flags] [cmd [args]]`: the fed command is the head that
-            // counts.
             let mut k = j + 1;
             while k < seg.len() && seg[k].starts_with('-') && seg[k] != "-" {
                 k += if XARGS_VALUE_FLAGS.contains(&seg[k].as_str()) {
@@ -2555,7 +2132,6 @@ fn wrapper(seg: &[String], j: usize) -> Option<Wrapped<'_>> {
             Some(Ok((k < seg.len()).then(|| (k, Vec::new()))))
         }
         "env" => {
-            // `env [-i] [-u NAME] [-C DIR] [VAR=v]... [cmd]`.
             let mut k = j + 1;
             let mut dirs = Vec::new();
             while k < seg.len() {
@@ -2631,26 +2207,20 @@ fn wrapper(seg: &[String], j: usize) -> Option<Wrapped<'_>> {
 }
 
 /// What a wrapper runs ([`wrapper`]): the index of its command and the `env
-/// -C` directories on the way, no command, or why it hides one.
 type Wrapped<'s> = Result<Option<(usize, Vec<&'s str>)>, String>;
 
-/// The command a segment runs, as [`head_from`] sees it: past prefixes
-/// ([`skip_prefixes`]) and through wrappers ([`wrapper`]).
+/// Resolved command execution target of a shell segment.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Runs<'s> {
-    /// The index of the command's word in the segment.
+    /// Index of the command word within the segment.
     pub at: usize,
-    /// The `env -C`/`--chdir` directories on the way, outermost first: the
-    /// command runs in one of them, relative to the shell's own.
+    /// Outer-to-inner `env -C`/`--chdir` directory arguments preceding the command.
     pub chdir: Vec<&'s str>,
-    /// Whether an `xargs` feeds it words the line does not show.
+    /// Whether `xargs` feeds additional arguments to the command.
     pub fed: bool,
 }
 
-/// What segment `seg` runs ([`Runs`]): `Ok(None)` for no word of the line
-/// (only assignments, bare `env` or `xargs`), `Err` when a wrapper hides or
-/// picks the program ([`wrapper`]). Shared by the head check and
-/// `supervise::policy::git_config` so neither misses a wrapper.
+/// Resolve the [`Runs`] target of segment `seg` past prefixes and wrappers.
 pub(crate) fn runs(seg: &[String]) -> Result<Option<Runs<'_>>, String> {
     let mut j = 0;
     let mut keyword = true;
@@ -2675,16 +2245,12 @@ pub(crate) fn runs(seg: &[String]) -> Result<Option<Runs<'_>>, String> {
     }
 }
 
-/// The segments of `line` as shell words ([`program_words`]), read as
-/// [`classify_command_with`] reads it: through [`prelex`], with the `perl -e
-/// 'alarm N; exec @ARGV'` timeout wrapper removed.
+/// Parse `line` into per-segment shell words with quotes resolved.
 pub(crate) fn command_words(line: &str) -> Result<Vec<Vec<String>>, String> {
     Ok(program_words(&strip_alarm_idiom(&prelex(line)?)))
 }
 
 /// The head check from token `j`, re-entered for a wrapper's command (`xargs
-/// <cmd>`, `env [VAR=v] <cmd>`, `timeout N <cmd>`), so a listed wrapper cannot
-/// launder what it runs: `ls | xargs touch` is `touch`.
 fn head_from<S: AsRef<str>>(
     seg: &[String],
     j: usize,
@@ -2694,8 +2260,6 @@ fn head_from<S: AsRef<str>>(
     let (j, keyword) = skip_prefixes_at(seg, j, keyword);
     let head_tok = seg.get(j)?;
     if !keyword && SHELL_RESERVED.contains(&head_tok.as_str()) {
-        // `X=1 if true`, `2>/dev/null for …`, `env if true`, `ls | time if
-        // true`: bash runs a program by that name, which no list here names.
         return Some(format!(
             "`{head_tok}` where the shell reads a command's name (behind an assignment, a \
              redirect, a wrapper or `time` it is no keyword: a program named `{head_tok}` runs)"
@@ -2705,15 +2269,12 @@ fn head_from<S: AsRef<str>>(
         return None;
     }
     if head_tok.contains('$') {
-        // A substitution or parameter head: only the shell knows what it
-        // names, so it cannot be cleared.
         return Some(format!(
             "a command whose name this check cannot read ({head_tok})"
         ));
     }
     if head_tok.contains('/') && !is_system_bin(head_tok) {
         // `/tmp/evil/ls` and `./ls` are programs of the line's choosing
-        // whatever their basename says.
         return Some(format!("{head_tok} (a program named by path)"));
     }
     let head = program(head_tok);
@@ -2725,7 +2286,6 @@ fn head_from<S: AsRef<str>>(
     match head {
         "aterm" | "aterm-ctl" | "aterm-drive" => aterm_read(head, rest),
         "trustc" | "rustc" => {
-            // Version and configuration queries only: anything else compiles.
             let query = !rest.is_empty()
                 && rest.iter().enumerate().all(|(k, t)| {
                     matches!(t.as_str(), "-vV" | "-Vv" | "-V" | "-v" | "--version")
@@ -2736,8 +2296,6 @@ fn head_from<S: AsRef<str>>(
             (!query).then(|| format!("{head} (compiles)"))
         }
         "xargs" | "env" => match wrapper(seg, j) {
-            // The command the wrapper runs is the head that counts; a bare
-            // `xargs` runs echo, a bare `env` prints the environment.
             Some(Err(reason)) => Some(reason),
             Some(Ok(Some((k, _)))) => head_from(seg, k, false, python_allow),
             _ => None,
@@ -2758,17 +2316,12 @@ fn head_from<S: AsRef<str>>(
                 );
             }
             let args = &seg[sub_idx + 1..];
-            // An expansion in a git read's arguments before `--` is unreadable:
-            // it may be a verb (`remote "$(echo add)"`), change the arity
-            // (`config` get vs set) or be a flag (`diff "$(echo
-            // --output=f)"`). After `--` every word is a path.
             let before_dashes = args.iter().position(|a| a == "--").unwrap_or(args.len());
             if let Some(t) = args[..before_dashes].iter().find(|a| has_expansion(a)) {
                 return Some(format!(
                     "git {sub} {t} (a word this check cannot read may be a flag or a verb)"
                 ));
             }
-            // A long flag matches bare or with its `=value`.
             let has = |flags: &[&str]| {
                 args.iter().any(|a| {
                     flags
@@ -2776,9 +2329,6 @@ fn head_from<S: AsRef<str>>(
                         .any(|f| a == f || (f.starts_with("--") && a.starts_with(&format!("{f}="))))
                 })
             };
-            // A write flag also by any prefix git takes for it (`--unset-a`,
-            // `--del`: [`long_option_spells`]); the list flags that clear a
-            // positional stay exact, so a prefix of one only over-refuses.
             let has_write = |flags: &[&str]| {
                 has(flags)
                     || args.iter().any(|a| {
@@ -2790,9 +2340,6 @@ fn head_from<S: AsRef<str>>(
             };
             let writes = match sub {
                 "branch" => {
-                    // Short flags combine (`-avv`), so read by letter: d D m M
-                    // c C u f t write; a r l list. A positional with no list
-                    // flag creates a branch; `-v` is not a list flag.
                     let short = |a: &str| a.starts_with('-') && !a.starts_with("--") && a.len() > 1;
                     let write_short = args
                         .iter()
@@ -2878,9 +2425,6 @@ fn head_from<S: AsRef<str>>(
             None
         }
         "export" => {
-            // Each operand must be a literal NAME or NAME=value: `export
-            // "$(…)"`, `export $X` and `export "PATH=/x"` assign an unnamed
-            // variable, possibly `PATH`.
             let mut k = 0;
             while let Some(t) = rest.get(k).map(String::as_str) {
                 let span = redirect_span(t);
@@ -2892,8 +2436,6 @@ fn head_from<S: AsRef<str>>(
                     return Some(format!("export {t} (an assignment this check cannot read)"));
                 }
                 if t.starts_with('-') && t.contains(['i', 'E', 'F']) {
-                    // zsh's integer and float types: the value is arithmetic,
-                    // whose subscript runs a command.
                     return Some(format!(
                         "export {t} (zsh evaluates the values as arithmetic)"
                     ));
@@ -2910,14 +2452,10 @@ fn head_from<S: AsRef<str>>(
         "python" | "python2" | "python3" => match arg {
             Some(path) if !path.starts_with('-') => {
                 if path.contains('$') {
-                    // `scripts/$(…)_score.py` matches `scripts/*score*.py` as
-                    // text, but the shell may make it any path.
                     Some(format!(
                         "{head} {path}: a script path this check cannot read"
                     ))
                 } else if path.split('/').any(|c| c == "..") {
-                    // `scripts/../../tmp/x_score.py` matches `scripts/*score*.py`
-                    // as text and runs something else.
                     Some(format!(
                         "{head} {path} steps out of its directory with `..`"
                     ))
@@ -2938,12 +2476,6 @@ fn head_from<S: AsRef<str>>(
 }
 
 /// `aterm ctl` verbs that only read (screen, session state and history, the
-/// roster, a worker's result, the survey), by verb and form: `meta set
-/// attention …`, `inbox seen` and `task mark` write, so `meta`, `inbox` and
-/// `task` are judged separately. `await` covers `await task`, the wait a manager
-/// runs on its workers. `image`, `window`, `video` and `cast` write a file and
-/// are left out; so is `spawn`, which opens a session (`spawn agent=claude`
-/// starts a worker on a task).
 const ATERM_CTL_READ: &[&str] = &[
     "status",
     "text",
@@ -2986,13 +2518,10 @@ const ATERM_CTL_READ: &[&str] = &[
 ];
 
 /// `aterm pkg` and `aterm drive` verbs that only read. `drive ledger` reads
-/// too, unless `--out` names a file it writes ([`aterm_drive_read`]).
 const ATERM_PKG_READ: &[&str] = &["list", "which", "doctor"];
 const ATERM_DRIVE_READ: &[&str] = &["phase", "classify", "help", "-h", "--help"];
 
 /// `aterm …` (or `aterm-ctl` / `aterm-drive`): `None` when the form only reads:
-/// `--version`, `help`, the [`ATERM_CTL_READ`] verbs, bare `meta`, bare `inbox`
-/// and `inbox get <id>`, bare `task`, and the read verbs of `pkg` and `drive`.
 fn aterm_read(head: &str, rest: &[String]) -> Option<String> {
     let args: &[String] = match head {
         "aterm-ctl" => return aterm_ctl_read(rest),
@@ -3016,8 +2545,6 @@ fn aterm_read(head: &str, rest: &[String]) -> Option<String> {
 }
 
 /// The arguments of `aterm drive`: its one option (`--socket P`), then the
-/// command. `ledger` only reads (the turn ledger, a journal, `inbox --peek`)
-/// unless `--out` names the file it writes; `answer` types into a session.
 fn aterm_drive_read(head: &str, args: &[String]) -> Option<String> {
     let mut k = 0;
     while let Some(t) = args.get(k).map(String::as_str) {
@@ -3041,7 +2568,6 @@ fn aterm_drive_read(head: &str, args: &[String]) -> Option<String> {
 }
 
 /// The arguments of `aterm ctl`: its own flags (`--sock P`, `--pid N`,
-/// `--timeout S`), an optional `@<target>`, then the verb.
 fn aterm_ctl_read(args: &[String]) -> Option<String> {
     let mut k = 0;
     while let Some(t) = args.get(k).map(String::as_str) {
@@ -3061,7 +2587,6 @@ fn aterm_ctl_read(args: &[String]) -> Option<String> {
     let first = tail.first().map(String::as_str);
     let reads = match verb {
         Some(v) if ATERM_CTL_READ.contains(&v) => true,
-        // `<verb> --help` describes the verb and never runs it.
         Some(_) if tail.iter().all(|t| t == "--help" || t == "-h") && !tail.is_empty() => true,
         Some("meta" | "task") => tail.is_empty(),
         Some("inbox") => first.is_none() || (first == Some("get") && tail.len() == 2),
@@ -3075,10 +2600,6 @@ fn aterm_ctl_read(args: &[String]) -> Option<String> {
 }
 
 /// The programs a line hands to awk and sed, read from raw words with quotes
-/// resolved and expansions marked ([`program_words`]): `system(…)`, a redirect
-/// or pipe in awk; `w`/`W`/`e` or `s///w`/`s///e` in sed; a program file (`-f`)
-/// or a program supplied by a substitution or parameter. Every word is checked,
-/// so `xargs awk …` is covered.
 fn program_scan(cmd: &str) -> Option<String> {
     for seg in program_words(cmd) {
         for (i, w) in seg.iter().enumerate() {
@@ -3095,12 +2616,7 @@ fn program_scan(cmd: &str) -> Option<String> {
     None
 }
 
-/// Whether zsh's `printf` reads its arguments as arithmetic under `format`: a
-/// `*` width or precision, or any conversion but `%s`, `%b`, `%q`, `%c` and
-/// `%%`. A length modifier or unknown letter reads as numeric. Unicode escapes
-/// are decoded first, as zsh does ([`decode_unicode_escapes`]), so an escaped
-/// `%` counts (octal and `x` escapes do not convert). An undecodable Unicode
-/// escape reads as numeric.
+/// Whether zsh `printf` evaluates arguments as arithmetic under `format`.
 pub(crate) fn numeric_format(format: &str) -> bool {
     let Some(format) = decode_unicode_escapes(format) else {
         return true;
@@ -3122,9 +2638,6 @@ pub(crate) fn numeric_format(format: &str) -> bool {
 }
 
 /// `format` with each Unicode escape decoded in one pass, as zsh's `printf` does
-/// before reading conversions: `\u` and up to 4 hex digits, or `\U` and up to
-/// 8. Other escapes stay as written. `None` for an escape with no hex digit or
-/// no character.
 fn decode_unicode_escapes(format: &str) -> Option<String> {
     let mut out = String::with_capacity(format.len());
     let mut cs = format.chars().peekable();
@@ -3161,11 +2674,6 @@ fn decode_unicode_escapes(format: &str) -> Option<String> {
 }
 
 /// The words zsh evaluates as arithmetic, from raw words ([`program_words`]):
-/// `printf`'s arguments after a possibly numeric format ([`numeric_format`];
-/// zsh takes any first word but `--` as the format), and the operand after `-t`
-/// in `test`, `[` and `[[`. zsh arithmetic runs substitutions in array
-/// subscripts from quoted words, named variables' values, `"$A"`, or globbed
-/// names, so each such word must be a plain number ([`plain_number`]).
 fn arithmetic_scan(cmd: &str) -> Option<String> {
     for seg in program_words(cmd) {
         let Ok(Some(r)) = runs(&seg) else {
@@ -3200,10 +2708,6 @@ fn arithmetic_scan(cmd: &str) -> Option<String> {
 }
 
 /// A word zsh arithmetic reads as a number only: digits, sign, point, blanks,
-/// and letters only inside a number (`0x1f`, `1e5`, `16#ff`); no name, subscript,
-/// quote, expansion or glob. Under `EXTENDED_GLOB` `#` repeats the previous
-/// character, so `8#A` can glob to a file `A`, while `16#ff` and `2#101` match
-/// only digit-led names ([`GLOB_CHARS`]).
 fn plain_number(w: &str) -> bool {
     let digit = |r: &str| r.starts_with(|c: char| c.is_ascii_digit());
     w.chars()
@@ -3220,12 +2724,6 @@ fn plain_number(w: &str) -> bool {
 }
 
 /// `awk [-F s] [-v a=b]... 'program' files…`: the first non-flag word is the
-/// program, or every `-e`/`--source` word (gawk) when there is one. Only the
-/// options that set a separator or a variable are read past: any other option
-/// may load or write (gawk's `-f`/`-E`/`-i`/`-l` read a program or a library
-/// this check does not see, `-d`/`-o`/`-p` write a dump, a pretty-print or a
-/// profile to a file they may name, `-W` spells any of them), and gawk takes
-/// an abbreviated long option (`--exe`) for the whole one.
 fn awk_args_write(args: &[String]) -> Option<String> {
     let mut programs: Vec<&str> = Vec::new();
     let mut explicit = false;
@@ -3284,24 +2782,6 @@ fn awk_args_write(args: &[String]) -> Option<String> {
 }
 
 /// Whether an awk program does more than read: the `system` builtin in any
-/// spelling (`system(…)`, `system (…)`, and a bare `system`, which runs
-/// `$0`), anywhere in the text; any `@` (gawk's `@include`, `@load` and its
-/// indirect calls, which reach `system` by a computed name); `>>`; a
-/// coprocess; any `>` in a `print` or `printf` statement outside its
-/// parentheses, which awk reads as a redirect whatever follows (`print $1 >
-/// $2`, `print 1 > 2`); a `>` elsewhere unless a comparison against a
-/// number, field or `>=`; or a `|` to a command (not `||`). MEASURED
-/// 2026-10-22 on macOS awk 20200816: `system ("touch f")`, `{system}` over a
-/// line, `print $1 > $1`, `print 1 > 4`, `if (1) print "y" > 5` and
-/// `printf "%s", "z" > -6` each ran a command or made a file.
-///
-/// Strings, regexes and `#` comments are read as awk reads them, so none
-/// hides a redirect from the scan: a `/` divides only after an operand (a
-/// name, a number, `)`, `]`, a string or a regex) and starts a regex
-/// anywhere else (after an operator, at a statement's start, after `print`,
-/// `printf`, `return`, `else`, `do`, `case` or `in`); a `[…]` in a regex
-/// holds a `/` (as gawk reads it); and a `/` after `++` or `--`, which may
-/// be either, is refused.
 fn awk_program_writes(p: &str) -> bool {
     if p.contains(">>") || p.contains("|&") || p.contains('@') || names_awk_word(p, "system") {
         return true;
@@ -3309,15 +2789,9 @@ fn awk_program_writes(p: &str) -> bool {
     let cs: Vec<char> = p.chars().collect();
     let ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
     let mut k = 0;
-    // The last non-space character seen outside strings, regexes and
-    // comments, and where; `START` after a word that takes an operand and at
-    // a statement's start. A newline after `,`, `\`, `&&` or `||` goes on
-    // with the statement.
     const START: char = '\n';
     let mut prev: Option<char> = None;
     let mut prev_at = 0;
-    // How deep in parentheses the scan is, and the depth of the `print` or
-    // `printf` statement it is in, if any.
     let mut depth = 0usize;
     let mut print_at: Option<usize> = None;
     while k < cs.len() {
@@ -3354,7 +2828,6 @@ fn awk_program_writes(p: &str) -> bool {
                 continue;
             }
             '#' => {
-                // A comment, to the line's end (the newline is the scan's).
                 while k < cs.len() && cs[k] != '\n' {
                     k += 1;
                 }
@@ -3422,9 +2895,6 @@ fn awk_program_writes(p: &str) -> bool {
 }
 
 /// Past the regex whose text starts at `k` (after its opening `/`): to the
-/// char after its closing `/`, skipping `\` escapes and `[…]` bracket
-/// expressions (a `]` first in one, or after its `^`, is a member; `[:…:]`,
-/// `[.….]` and `[=…=]` hold a `]` of their own).
 fn past_awk_regex(cs: &[char], mut k: usize) -> usize {
     while k < cs.len() && cs[k] != '/' {
         match cs[k] {
@@ -3458,8 +2928,6 @@ fn past_awk_regex(cs: &[char], mut k: usize) -> usize {
 }
 
 /// Whether `word` stands in `text` as a whole awk identifier (no letter,
-/// digit or `_` either side), wherever it is: in a string too, which only
-/// over-refuses.
 fn names_awk_word(text: &str, word: &str) -> bool {
     let ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
     text.match_indices(word).any(|(at, _)| {
@@ -3469,7 +2937,6 @@ fn names_awk_word(text: &str, word: &str) -> bool {
 }
 
 /// `sed [-n] [-E] [-e SCRIPT]... [SCRIPT] files…`: every `-e` script, else the
-/// first non-flag word.
 fn sed_args_write(args: &[String]) -> Option<String> {
     let mut scripts: Vec<&str> = Vec::new();
     let mut explicit = false;
@@ -3523,12 +2990,10 @@ fn sed_args_write(args: &[String]) -> Option<String> {
 }
 
 /// Walk a sed script command by command: `w`/`W` write, `e` runs, as do
-/// `s///`'s `w` and `e` flags; anything unknown is refused.
 fn sed_script_writes(script: &str) -> Option<String> {
     let cs: Vec<char> = script.chars().collect();
     let n = cs.len();
     let unparsed = || Some("sed (unparsed script)".to_string());
-    // From the char after an opening delimiter, past its closing one.
     let skip_delimited = |i: &mut usize, d: char| -> bool {
         while *i < n {
             if cs[*i] == '\\' {
@@ -3560,7 +3025,6 @@ fn sed_script_writes(script: &str) -> Option<String> {
             i += 1;
             continue;
         }
-        // Addresses: N[~M], $, /re/[IM], \cREc[IM], joined by `,`, then `!`.
         loop {
             if i >= n {
                 return unparsed();
@@ -3659,12 +3123,7 @@ fn sed_script_writes(script: &str) -> Option<String> {
     None
 }
 
-/// The command as shell words with quotes resolved, segmented as
-/// [`split_segments`] does (a substitution, even in double quotes, is a
-/// [`SUBSTITUTION`] in its word, its body's words segments of their own,
-/// first). Every unquoted or double-quoted parameter expansion is also marked a
-/// [`SUBSTITUTION`], so a parameter-supplied awk program or sed script is
-/// refused by [`program_scan`] like a substitution-supplied one.
+/// Split `src` into segments of quote-resolved words with substitutions marked.
 pub(crate) fn program_words(src: &str) -> Vec<Vec<String>> {
     let chars: Vec<char> = src.chars().collect();
     let mut scan = WordScan {
@@ -3702,7 +3161,6 @@ impl WordScan<'_> {
         }
     }
     /// A nested substitution: its body's words are segments of their own,
-    /// and the substitution is a [`SUBSTITUTION`] in the word being read.
     fn nested(&mut self, stop: char) {
         let seg = std::mem::take(&mut self.seg);
         let cur = std::mem::take(&mut self.cur);
@@ -3714,9 +3172,8 @@ impl WordScan<'_> {
         self.in_word = true;
     }
     /// A parameter expansion (`$name`, `${…}`, `$1`, `$@`): consumed and marked
-    /// a [`SUBSTITUTION`].
     fn mark_parameter(&mut self) {
-        self.i += 1; // past `$`
+        self.i += 1;
         match self.chars.get(self.i) {
             Some('{') => {
                 self.i += 1;
@@ -3724,7 +3181,8 @@ impl WordScan<'_> {
                     self.i += 1;
                 }
                 if self.i < self.chars.len() {
-                    self.i += 1; // past `}`
+                    // past `}`
+                    self.i += 1;
                 }
             }
             Some(&c) if c.is_ascii_alphanumeric() || c == '_' => {
@@ -3736,8 +3194,6 @@ impl WordScan<'_> {
             }
             Some('@' | '*' | '#' | '?' | '$' | '!' | '-') => self.i += 1,
             _ => {
-                // A lone `$` (no name after it: `sed "s/ *$//"`) is literal
-                // to the shell, and so to the program it is handed to.
                 self.cur.push('$');
                 self.in_word = true;
                 return;
@@ -3846,8 +3302,6 @@ impl WordScan<'_> {
                 }
                 '>' | '<' => {
                     // Detach a redirect from the preceding word as
-                    // [`split_segments`] does: `awk>/dev/null` is `awk` and a
-                    // redirect.
                     if self.in_word
                         && self
                             .cur
@@ -3873,8 +3327,7 @@ impl WordScan<'_> {
     }
 }
 
-/// A `*`/`?` glob over the whole string (`*` spans `/` too, like fnmatch without
-/// FNM_PATHNAME).
+/// Match `pattern` (`*` and `?`, spanning `/`) against the whole `text`.
 pub fn glob_match(pattern: &str, text: &str) -> bool {
     let p: Vec<char> = pattern.chars().collect();
     let t: Vec<char> = text.chars().collect();
@@ -3902,22 +3355,17 @@ pub fn glob_match(pattern: &str, text: &str) -> bool {
     pi == p.len()
 }
 
-/// Lines whose command, or whose deciding argument, a substitution supplies, each with the
-/// rule that refuses it. Shared with `supervise::policy::approval`'s test, which draws each as
-/// a box.
+/// Corpus of substitution-bypass command lines and the rules that refuse them.
 #[cfg(test)]
 pub(crate) const MEASURED_SUBSTITUTION_BYPASSES: &[(&str, &str)] = &[
-    // The substitution names the program.
     ("$(printf 'r''m') -rf /usr", UNREADABLE_SUBSTITUTION),
     ("`printf %s r m` -rf /usr", UNREADABLE_SUBSTITUTION),
     ("$(printf 'r''m') -- /usr", UNREADABLE_SUBSTITUTION),
     ("$(printf 'r''m') 2>/dev/null /usr", UNREADABLE_SUBSTITUTION),
     ("$(printf 'r''m') ls", UNREADABLE_SUBSTITUTION),
     ("ls; $(printf 'r''m') -rf /usr", UNREADABLE_SUBSTITUTION),
-    // Program words judged only at heads must still refuse these.
     ("$(which rm) -rf /usr", UNREADABLE_SUBSTITUTION),
     ("`echo rm` -rf /usr", UNREADABLE_SUBSTITUTION),
-    // Behind an assignment, keyword, redirect or wrapper.
     ("A=1 $(printf 'r''m') -rf /usr", UNREADABLE_SUBSTITUTION),
     (
         "if $(printf 'r''m') -rf /usr; then echo; fi",
@@ -3934,8 +3382,6 @@ pub(crate) const MEASURED_SUBSTITUTION_BYPASSES: &[(&str, &str)] = &[
         UNREADABLE_SUBSTITUTION,
     ),
     ("ls | xargs $(printf 'r''m') -rf", UNREADABLE_SUBSTITUTION),
-    // The same with no quote in the substitution, which the rm breaker's lexer
-    // passes to `classify_except_rm`.
     (
         "ls | xargs $(echo qm | tr q r) -rf /usr",
         UNREADABLE_SUBSTITUTION,
@@ -3945,7 +3391,6 @@ pub(crate) const MEASURED_SUBSTITUTION_BYPASSES: &[(&str, &str)] = &[
         "timeout 5 $(echo qm | tr q r) -rf /usr",
         UNREADABLE_SUBSTITUTION,
     ),
-    // Inside another substitution, which runs too.
     (
         "echo $( $(printf 'r''m') -rf /usr )",
         UNREADABLE_SUBSTITUTION,
@@ -3954,7 +3399,6 @@ pub(crate) const MEASURED_SUBSTITUTION_BYPASSES: &[(&str, &str)] = &[
         "echo \"$( $(printf 'r''m') -rf /usr )\"",
         UNREADABLE_SUBSTITUTION,
     ),
-    // A substitution where the argument that decides the write form stands.
     (
         "git branch $(git rev-parse --short HEAD)",
         "git branch $(…) (a word this check cannot read may be a flag or a verb)",

@@ -1,201 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE EDITING WIN: what predictive editing buys someone typing real command
-//! lines over a link, and what it costs, MEASURED on the safety theorem's own
-//! world (`common/world.rs`): its aterm-core engine, its far ends in the byte
-//! forms measured from them, and its host wired the way aterm-gui wires the
-//! predictor (the key-time row, the edit keys handed to `predict_edit`, a chain
-//! painted all or none by aterm-core's span painter). The theorem says a
-//! prediction never corrupts the view; this file says how much earlier the view
-//! is right, on a typist's corpus rather than a generator's chaos, and checks
-//! the theorem's clauses over every frame of it while it counts.
-//!
-//! Everything is a pure function of its seeds: the clock is injected, nothing
-//! is timed, and every number below is a count. A rerun prints the same table.
-//!
-//! ## The corpus
-//!
-//! Three hundred command lines from a seeded generator over twenty real
-//! commands (`git`, `ls`, `cd`, `grep`, a `targo` test, `make`, `docker`,
-//! `kubectl`, `vim`, `tail`, `find | wc`, `ssh`, `cat`, `rg`, `du`, `echo`,
-//! `history`), each typed in one of ten FAMILIES of real editing, by weight:
-//! plain (35), a typo at the end fixed with Backspace (15), a typo several
-//! glyphs back reached with `←`, rubbed out, retyped, and left by End, Ctrl-E or
-//! `→` (12), Home or Ctrl-A and `sudo ` typed in front (6), Ctrl-A Ctrl-K and
-//! another command (5), `←` to the first space and ` -v` inserted (6), a junk
-//! `xx` typed first and removed by Home, Delete, Delete, End (4), a Tab
-//! completing the first word (10), Up and a small edit inside the recalled line
-//! (5), and Alt-B, a word motion, then a glyph (2). A typist's cadence: 60 to
-//! 200 ms between glyphs, 350 to 1200 ms to notice a typo, 70 to 120 ms
-//! between repeated arrows, and a pause of the link's round trip plus 300 to
-//! 1200 ms before each line (the prompt has to be there). It is the region
-//! design's probe corpus, ported generator call for generator call
-//! (`the_corpus_is_the_region_probe_s`), so its numbers and these are of the
-//! same 6999 keys.
-//!
-//! The far end is the world's line editor (`Editor::Zle`, zsh 5.9's byte forms,
-//! and `Editor::Readline`, bash 3.2.57's), with a history Up recalls and a
-//! completion table Tab completes from (`Sim::corpus_shell`), printing one line
-//! of output and a fresh prompt for each Enter on a 24 by 80 screen. From the
-//! twelfth line's Enter on, every Enter scrolls the screen, as at a real
-//! shell's bottom row. INTEGRATION is either aterm's shell integration of a local shell (a
-//! signed OSC 133 `B`, so Home, End, Ctrl-A, Ctrl-E and Delete are learned
-//! keys), or none (a shell over ssh: those keys are never modelled).
-//!
-//! ## The link
-//!
-//! Each key reaches the far end half a round trip after its press, within
-//! ±15 %, in order; its output comes back half a round trip later, within
-//! ±15 %, in order, half the time in TWO PIECES 1 to 6 ms apart, split at a
-//! byte drawn at random, so the frames a split read shows (a mid-line glyph
-//! drawn, the tail it shifts not yet) happen. A frame is drawn after every press
-//! and every piece delivered, and at every deadline of the predictor plus 1 ms
-//! (its expiry sweep), as aterm-gui draws them.
-//!
-//! ## The metrics, per run and per key class
-//!
-//! The TRUTH is the screen a key's output settles to: a pass with prediction
-//! off, every key read and its output delivered whole before the next, records
-//! the row, its text and the cursor after each key. A key COUNTS unless it is a
-//! line terminator or changed nothing (Up with no history yet, `←` at the start).
-//!
-//! * BEFORE ECHO: a counted key `k` is shown before its echo when some frame's
-//!   displayed view `D` shows the truth after some key `j ≥ k` of its line,
-//!   cells and drawn cursor, strictly earlier than the first frame whose
-//!   authoritative screen `A` does.
-//! * CORRECT AT PRESS: the frame drawn at `k`'s press already shows the truth
-//!   after `k`.
-//! * WRONG EPISODES on whole-line states: a frame that painted something (a
-//!   cell of `D` other than `A`'s, or a cursor other than the engine's) whose
-//!   row shows no state its line passes through, integrated until a frame is
-//!   right again: the episodes, their total and longest time, the most cells
-//!   wrong in one frame, and cells times time. The world's far ends here draw no
-//!   decoration (no right prompt, no suggestion), so every wrong cell is a
-//!   buffer cell.
-//! * MISPREDICTED CELLS: the same frames counted by the cell. A cell of a wrong
-//!   row that `D` shows other than both `A` and the line's newest state (the
-//!   drawn cursor's cell, where that is all that is wrong) is a mispredicted
-//!   cell from the first frame showing it wrong until the first that does not:
-//!   the times a cell went wrong, and its LIFETIME on glass in injected time at
-//!   the median, the 95th and the 99th percentile and the longest. An episode
-//!   says how long some line was wrong; a lifetime says how long the eye saw
-//!   one wrong cell, which TIMELINESS bounds by the glitch window.
-//! * PERCEIVED LATENCY: from the press to the first frame that shows the key's
-//!   effect, displayed or echoed: its median and 95th percentile.
-//! * CHURN, per thousand presses: flushes, epoch ends, expiries and bindings
-//!   unlearned (`PredictEvents`).
-//! * COST, counted: the cells each frame's reconcile asked the host for, the
-//!   ops the predictor folded each frame and each press, and the row cells each
-//!   press read (`world::Cost`).
-//!
-//! ## The variants, all the shipping crate
-//!
-//! * `Baseline`: the edit lane off (`Sim::set_editing`, as aterm-gui's config
-//!   switches it: the predictor's `set_editing`, and no row read for an edit
-//!   key) and every rule switched off (`Predictor::disable_rule_for_test`):
-//!   each rule's off branch is the code before its fix (`Rule`'s docs), so
-//!   this is the glyph lane as it shipped before predictive editing began.
-//!   On this corpus it is that predictor exactly: a cross-check drove the
-//!   crate at 3d4c211fbb, the commit before the plan's first landing, through
-//!   this world as aterm-gui drove it then, and every metric below of every
-//!   `Baseline` run came out the same (not the churn, which it did not count,
-//!   nor the cost: this press still reads the row, which that one did not).
-//! * `Phase0`: the edit lane off, every rule in force: the glyph lane as it
-//!   ships now. That is not what increment 1 bought alone: the glyph-lane
-//!   rules the later increments' reviews added are in force too (THE FLOOR,
-//!   `Rule::FloorBelow`, came with the review of increment 4, and so did the
-//!   floor row a reconcile reads), so the gap between it and `Baseline` is
-//!   every glyph-lane fix since, and the gap between it and `Full` the edit
-//!   lane's own.
-//! * `Full`: everything, as it ships.
-//! * `Sticky`: `Full` with `Rule::ProofsEndWithTheEpoch` off, the class proofs
-//!   kept across epochs for the session: the alternative the class LADDER
-//!   (a motion or a shift shown only once one of its kind echoed on this line)
-//!   was chosen over. It shows each line's first motion a round trip sooner,
-//!   and shows a motion a cooked program then echoes as `^[[D`, which the
-//!   switch corpus measures (a line at the shell, a line typed into `cat`).
-//! * `ShutAtScroll`: `Full` with `Rule::ScrollKeepsFirstKey` off, THE FIRST
-//!   KEY's gate shut at every coordinate move as it was before this file
-//!   found it should not be; run beside the signed Adaptive runs of `Full`,
-//!   for the lines each witnesses (`Stats::witnessed_lines`, printed a run).
-//! * `PaintedOverText`: `Full` with `Rule::DarkOverText` off, a guess waiting
-//!   on the screen as it was painted over the line's text, as before this file
-//!   measured what that cost `Always`; run beside the 32 `Always` runs of
-//!   `Full`, for the mispredicted cells and wrong episodes each shows.
-//!
-//! `Phase0`, `Full`, `ShutAtScroll` and `PaintedOverText` run with the
-//! theorem's checker on, so every clause holds on every frame of every run of
-//! them; `Baseline` and `Sticky` break clauses by design, and run with it off
-//! (`Sim::without_checks`), what they show measured.
-//!
-//! ## What is asserted
-//!
-//! 1. `Full`, Adaptive: no wrong episode, at every link, far end and
-//!    integration, and none on the switch corpus.
-//! 2. `Full` shows at least as many keys before their echo as `Baseline`, in
-//!    every run and every key class.
-//! 3. `Full`'s count before echo in every run is at least the one recorded at
-//!    landing (`FULL_FLOORS`, a ratchet: an improvement re-records it).
-//! 4. Under a cooked tty no motion is ever displayed, and under readline's
-//!    overwrite mode no shift (`Full`, Adaptive, on the corpus lines that
-//!    use them).
-//! 5. The cost: at most `2 * cols + 2` observe calls a reconcile, and at most
-//!    `64 * 65 / 2` ops folded a frame (`OBSERVE_BOUND`, `FOLD_BOUND`).
-//! 6. `Full` witnesses more lines than `ShutAtScroll` in every signed Adaptive
-//!    run: the gate kept across a scroll is what witnesses them.
-//! 7. No cell is shown wrong for longer than the longest glitch window the
-//!    predictor can have (`LIFETIME_BOUND_US`, 2 s), in any run of the main
-//!    matrix: every variant, mode and link.
-//! 8. `Full`, `Always`, shows no more mispredicted cells and no more wrong
-//!    episodes than `Baseline`, the predictor before the plan, in every run,
-//!    and fewer mispredicted cells than `PaintedOverText` in every run.
-//!
-//! And the metric's own negative controls: `Sticky` shows wrong lines on the
-//! switch corpus, and `Baseline` does on the main one, wrong episodes and
-//! mispredicted cells both, so a count of zero is a measurement, not a metric
-//! that cannot see.
-//!
-//! ## What it found
-//!
-//! That no line was witnessed at a shell on the bottom row: a coordinate move
-//! reset the predictor, and the reset shut THE FIRST KEY's gate, so the scroll
-//! every Enter's own output makes there left Home, End, Ctrl-A, Ctrl-E and
-//! Delete unplaced for the rest of the session (`ShutAtScroll`: 11 of the 300
-//! lines witnessed, all typed before the screen filled, at 1 to 160 ms; 10 at
-//! 250 and 320 ms, 7 at 600 ms). A scroll lets no key past the predictor, and
-//! the gate now stands across one (`observe_coordinates`,
-//! `Rule::ScrollKeepsFirstKey`,
-//! `a_scroll_after_a_line_terminator_keeps_the_first_key_s_gate`): 282 of 300
-//! are witnessed at 1 to 160 ms, 274 at 250 ms, 260 at 320 ms and 153 at
-//! 600 ms, the same for zle and readline (the report prints each run's).
-//! And that a reconcile reads two rows, not the one the plan bounded it by:
-//! THE FLOOR under the line (`Rule::FloorBelow`) came after the plan.
-//! `Baseline` reproduces the region probe's measurement of the predictor as it
-//! was (Adaptive, 68.2 / 75.2 / 68.2 % of keys before echo at 30 / 80 / 160 ms,
-//! there and here, and zsh's 9 wrong episodes at 80 ms).
-//! And, by that cross-check, that `Baseline` was not yet the predictor as it
-//! was: it showed 22 wrong episodes at 80 ms, Adaptive, and 188 where that
-//! one showed 45 at 30 ms, `Always`. A glyph typed over text (`sudo ` after
-//! Home or Ctrl-A) waited on the glyph its press read there, where the
-//! predictor before the plan flushed it at the next frame: the wait the
-//! review of phase 0 added beside a suggestion, which no rule switched off.
-//! It is `Rule::ScreenAsItWas` now, off in `Baseline` with the rest.
-//! And that the wait cost `Always` more wrong cells than the predictor before
-//! the plan showed, over ssh most (123 against 45 at 30 ms, 152 against 67 at
-//! 100 ms): `Always` painted the waiting glyph over the line's text, unshifted,
-//! until its echo. The wait itself keeps a run typed a round trip after
-//! Ctrl-K, whose glyphs land as appends once Ctrl-K's echo has erased the text
-//! their presses read (the six keys readline shows at 250 ms in Adaptive), so
-//! it stays; a guess waiting where the line's end is not known now waits off
-//! the glass, with every guess typed after it (`Rule::DarkOverText`,
-//! `PaintedOverText` beside it), and so does the run's first guess typed over
-//! the line's text behind a first glyph that hides nothing (`sudo ` typed on
-//! the `s` of `systemctl`): 2 and 35 mispredicted cells over ssh at 30 and
-//! 100 ms, and no key fewer before its echo in any run of `Full`.
-//!
-//! Run: `targo --unverified test -p aterm-predict --test predict_suite editing_win -- --nocapture`;
-//! the tables it prints are `docs/DESIGN-predictive-editing-2026-10-20.md`'s.
+//! THE EDITING WIN: what predictive editing buys someone typing real command lines over a link, and what it costs, MEASURED on the safety theorem's own world (`common/world.rs`): its aterm-core engine, its far ends in the byte forms measured from them, and its host wired the way aterm-gui wires the predictor (the key-time row, the edit keys handed to `predict_edit`, a chain painted all or none by aterm-core's span painter).
 
 use std::fmt::Write as _;
 use std::time::Duration;
@@ -210,42 +16,22 @@ use crate::world::{Config, Cost, Editor, Host, Key, Keymap, Sim, Stats, Unmodell
 const CORPUS_SEED: u64 = 0xED17_2026_0001;
 const LINES: usize = 300;
 /// The keys the region probe's corpus held, and its lines per family: the
-/// port's own check that it is the same corpus.
 const REGION_KEYS: usize = 6999;
 const REGION_FAMILIES: [usize; 10] = [101, 37, 29, 20, 18, 19, 20, 33, 17, 6];
 
 /// The screen: a standard terminal, wide enough for every line of the corpus
-/// (the longest, `sudo ` before the `targo` test, is 47 cells with the prompt).
 const ROWS: u16 = 24;
 const COLS: u16 = 80;
 
 /// THE COST BOUNDS (assertion 5). A reconcile asks the host for at most two
-/// rows and two cells: the line's row (the tail a proof stands on, a chain's
-/// cells to the margin) and the row under it, THE FLOOR (`Rule::FloorBelow`,
-/// every cell its run's press read blank), added by the review of increment 4
-/// after the plan bounded a reconcile by one row (`cols + 2`); the shipping
-/// predictor reads both on every frame a standing proof is above a floor.
 const OBSERVE_BOUND: u64 = 2 * COLS as u64 + 2;
 /// The plan's bound on the ops a frame folds: every state of a chain of
-/// `EDIT_CHAIN_MAX` (64) ops folded from scratch, `64 * 65 / 2`. The predictor
-/// folds each state from the one before, in at most seven passes a frame (the
-/// match, the part-way echoes, three in-place worlds counted twice, the
-/// retirement, the net-null tail, the transit wait, the overlay), under 800.
 const FOLD_BOUND: u64 = 64 * 65 / 2;
 /// THE LIFETIME BOUND (assertion 7): the longest glitch window the predictor
-/// can have, its own function at the slowest link and the deepest backoff (the
-/// crate's documented 2 s ceiling). TIMELINESS says every ghost on glass was
-/// typed no longer ago than the window, so a cell shown wrong is wrong at most
-/// that long, in every mode and with every rule switched off: the expiry is
-/// older than predictive editing.
 const LIFETIME_BOUND_US: u64 =
     aterm_predict::compute_glitch_window_ms(Some(u32::MAX), u8::MAX) * 1000;
 
 /// The links measured: a local shell, a LAN, a continent, an ocean, two; and
-/// 100 and 250 ms, the links the comparison of the predictor before the plan
-/// with the one shipping is quoted at (30, 100 and 250 ms), 250 ms being the
-/// glitch window's floor, where a link's echo first arrives later than the
-/// shortest window the predictor can have.
 const RTTS_MS: [u32; 8] = [1, 30, 80, 100, 160, 250, 320, 600];
 /// The links the controls and the switch corpus run on.
 const CONTROL_RTTS_MS: [u32; 3] = [80, 160, 320];
@@ -253,8 +39,6 @@ const CONTROL_RTTS_MS: [u32; 3] = [80, 160, 320];
 const LINK_SEED: u64 = 7;
 
 /// What Enter runs: a command printing one line (`Program::run_command`'s
-/// choice 8), and, on the switch corpus, `cat` (choice 11), a cooked program
-/// reading the tty until Ctrl-C.
 const RUNS_A_COMMAND: u32 = 8;
 const STARTS_CAT: u32 = 11;
 /// What every other key reads: a choice no echo draws a suggestion for.
@@ -301,7 +85,6 @@ const FAMILY_NAMES: [&str; 10] = [
     "word-motion",
 ];
 /// The families whose lines move the cursor or edit inside the text: the
-/// corpus the cooked and overwrite controls type.
 const EDITING_FAMILIES: [usize; 5] = [2, 3, 5, 6, 8];
 
 /// A key of the corpus.
@@ -353,7 +136,6 @@ impl Press {
 }
 
 /// One press of the corpus: the key, the pause before it, and whether it is
-/// its line's first (the typist waits for the prompt, a round trip more).
 #[derive(Clone, Copy, Debug)]
 struct Stroke {
     key: Press,
@@ -404,7 +186,6 @@ impl Typist<'_> {
     }
 
     /// `n` presses of `key`, the first after `gap`, the rest at the arrow's
-    /// repeat.
     fn repeated(&mut self, key: Press, n: usize, gap: u32) {
         let mut gap = gap;
         for _ in 0..n {
@@ -414,14 +195,12 @@ impl Typist<'_> {
     }
 
     /// One line of family `family` typing `cmd`, in the region probe's order
-    /// of draws (so the corpus is its corpus).
     fn line(&mut self, family: usize, cmd: &[char]) {
         let start = self.draw(300, 900);
         let len = cmd.len();
         let at = |i: usize| cmd.get(i).copied().unwrap_or(' ');
         let from = |i: usize| cmd.get(i..).unwrap_or_default();
         match family {
-            // A typo at the end, rubbed out with Backspace and the rest typed.
             1 => {
                 let p = self.rng.range(len / 2, len);
                 self.push(Press::G(at(0)), start);
@@ -439,8 +218,6 @@ impl Typist<'_> {
                 }
                 self.type_str(from(p));
             }
-            // A typo several glyphs back: `←` to it, rubbed out, retyped, and
-            // left by End, Ctrl-E or `→` back to the end.
             2 => {
                 let p = self.rng.range(1, len - 2);
                 self.push(Press::G(at(0)), start);
@@ -471,7 +248,6 @@ impl Typist<'_> {
                     }
                 }
             }
-            // A prefix: Home or Ctrl-A, and `sudo ` in front.
             3 => {
                 self.push(Press::G(at(0)), start);
                 self.type_str(from(1));
@@ -484,7 +260,6 @@ impl Typist<'_> {
                 self.push(home, gap);
                 self.type_str(&"sudo ".chars().collect::<Vec<char>>());
             }
-            // Retyped: Ctrl-A Ctrl-Press, and another command.
             4 => {
                 self.push(Press::G(at(0)), start);
                 self.type_str(from(1));
@@ -495,7 +270,6 @@ impl Typist<'_> {
                 let other: Vec<char> = self.rng.pick(&CMDS).chars().collect();
                 self.type_str(&other);
             }
-            // A flag inserted after the first word.
             5 => {
                 let word = cmd.iter().position(|&c| c == ' ').unwrap_or(len);
                 self.push(Press::G(at(0)), start);
@@ -507,7 +281,6 @@ impl Typist<'_> {
                     self.type_str(&" -v".chars().collect::<Vec<char>>());
                 }
             }
-            // A junk prefix removed: Home, Delete, Delete, End.
             6 => {
                 self.push(Press::G('x'), start);
                 let gap = self.typing();
@@ -522,7 +295,6 @@ impl Typist<'_> {
                 let gap = self.typing();
                 self.push(Press::End, gap);
             }
-            // The first word completed with Tab, where the table has it.
             7 => {
                 let word = cmd.iter().position(|&c| c == ' ').unwrap_or(len);
                 let w: String = cmd.get(..word).unwrap_or_default().iter().collect();
@@ -539,7 +311,6 @@ impl Typist<'_> {
                     self.type_str(from(1));
                 }
             }
-            // A line recalled with Up and edited inside.
             8 => {
                 self.push(Press::Up, start);
                 let notice = self.notice();
@@ -550,7 +321,6 @@ impl Typist<'_> {
                 let gap = self.typing();
                 self.push(Press::G('2'), gap);
             }
-            // A word motion (never modelled) and a glyph.
             9 => {
                 self.push(Press::G(at(0)), start);
                 self.type_str(from(1));
@@ -559,7 +329,6 @@ impl Typist<'_> {
                 let gap = self.typing();
                 self.push(Press::G('x'), gap);
             }
-            // Plain.
             _ => {
                 self.push(Press::G(at(0)), start);
                 self.type_str(from(1));
@@ -602,7 +371,6 @@ fn corpus() -> Vec<Line> {
 }
 
 /// The screen a key's output settles to: the cursor's row, its text, the
-/// cursor, and the far end's buffer (its length and the cursor's index in it).
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Truth {
     row: u16,
@@ -612,7 +380,6 @@ struct Truth {
 }
 
 /// A corpus as one far end types it: the presses, what each terminator runs,
-/// the bytes each key's output takes, and the TRUTH after each key.
 struct Script {
     strokes: Vec<Stroke>,
     /// The line each press belongs to, and each line's first press.
@@ -660,7 +427,6 @@ fn class_of(key: Press, (len, cur): (usize, usize)) -> usize {
 fn config(editor: Editor, integration: bool, mode: PredictMode) -> Config {
     Config {
         mode,
-        // A local shell under the integration; ssh without it.
         remote: !integration,
         host: Host::Faithful,
         forced_wrap: false,
@@ -684,9 +450,6 @@ fn row_text(frame: &RenderInput, row: u16, cols: usize, out: &mut Vec<char>) {
 }
 
 /// Type `lines` into `editor` with prediction off, every key read and its
-/// output delivered whole before the next: the truth after each key. On the
-/// switch corpus (`switch`) every other line's Enter starts `cat`, and the line
-/// after it, typed into `cat`, ends with Ctrl-C.
 fn script(lines: &[Line], editor: Editor, integration: bool, switch: bool) -> Script {
     let mut strokes = Vec::new();
     let mut line_of = Vec::new();
@@ -703,10 +466,6 @@ fn script(lines: &[Line], editor: Editor, integration: bool, switch: bool) -> Sc
             };
             strokes.push(Stroke { key, ..*s });
             line_of.push(l);
-            // The choice is the terminator's alone: a glyph's echo reads it too
-            // (`Program::suggest_after`, an autosuggestion now and then), and
-            // this corpus draws no decoration, which the wrong-episode metric
-            // does not excuse.
             choices.push(match key {
                 Press::Enter if switch && l % 2 == 0 => STARTS_CAT,
                 Press::Enter => RUNS_A_COMMAND,
@@ -784,7 +543,6 @@ struct Piece {
 }
 
 /// THE LINK for a round trip of `rtt_ms`: when each key is pressed, when the
-/// far end reads it, and the pieces its output comes back in, each in order.
 struct Timeline {
     press: Vec<Duration>,
     arrive: Vec<Duration>,
@@ -796,7 +554,6 @@ struct Timeline {
 fn timeline(script: &Script, rtt_ms: u32) -> Timeline {
     let mut rng = XorShift::new(LINK_SEED ^ u64::from(rtt_ms).wrapping_mul(0x9E37_79B9));
     let half_us = u64::from(rtt_ms) * 500;
-    // Half a round trip, within ±15 %.
     let jitter = |rng: &mut XorShift| half_us * (85_000 + rng.below(1000) * 30) / 100_000;
     let rtt = Duration::from_millis(u64::from(rtt_ms));
     let n = script.strokes.len();
@@ -853,13 +610,8 @@ enum Variant {
     Full,
     Sticky,
     /// `Full` with `Rule::ScrollKeepsFirstKey` off: THE FIRST KEY's gate shut
-    /// at every coordinate move, as before this file found it should not be.
-    /// Run beside `Full` at the signed runs only, for the lines witnessed.
     ShutAtScroll,
     /// `Full` with `Rule::DarkOverText` off: a guess waiting on the screen as
-    /// it was painted over the line's text, as before this file measured what
-    /// that cost `Always`. Run beside `Full` at the `Always` runs only, for the
-    /// mispredicted cells and wrong episodes each shows.
     PaintedOverText,
 }
 
@@ -884,8 +636,6 @@ impl Variant {
     }
 
     /// Configure `sim`'s predictor (and checker) before the first key. The
-    /// edit lane is switched off as aterm-gui's config switches it, through the
-    /// host (`Sim::set_editing`), which then reads no row for an edit key.
     fn prepare(self, sim: &mut Sim) {
         match self {
             Self::Baseline => {
@@ -903,11 +653,9 @@ impl Variant {
                     .disable_rule_for_test(Rule::ProofsEndWithTheEpoch);
                 sim.without_checks();
             }
-            // Less is shown with the gate shut, so every clause still holds.
             Self::ShutAtScroll => sim
                 .predictor_mut()
                 .disable_rule_for_test(Rule::ScrollKeepsFirstKey),
-            // More is painted, but only in `Always`, which claims no fidelity.
             Self::PaintedOverText => sim
                 .predictor_mut()
                 .disable_rule_for_test(Rule::DarkOverText),
@@ -931,8 +679,6 @@ struct Tally {
     max_wrong_cells: u64,
     wrong_cell_us: u64,
     /// MISPREDICTED CELLS: the times a cell went wrong on glass, and how long
-    /// each stayed wrong (`Meter::open_cells`), at the median, the 95th and 99th
-    /// percentiles and the longest.
     wrong_cells: u64,
     cell_life_p50_us: u64,
     cell_life_p95_us: u64,
@@ -949,7 +695,6 @@ struct Tally {
 }
 
 /// What a run is: the far end, its integration, the link, the mode and the
-/// variant.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Run {
     editor: Editor,
@@ -973,8 +718,6 @@ impl Run {
 }
 
 /// Whether row `text` with the cursor drawn at `cursor` shows `t`: its text,
-/// and its cursor where the cursor is on its row (a cursor on another row, just
-/// after a terminator, says nothing about this one).
 fn shows(text: &[char], cursor: (u16, u16), t: &Truth) -> bool {
     text == t.text.as_slice() && (cursor.0 != t.row || cursor == t.cursor)
 }
@@ -1020,11 +763,6 @@ struct Meter<'s> {
     wrong: Option<u64>,
     wrong_run: Duration,
     /// Each cell wrong at the last frame, and the frame it went wrong at: a
-    /// cell's LIFETIME runs from the first frame that shows it wrong to the
-    /// first that does not, whatever glyphs it shows wrong meanwhile (a cell
-    /// wrong under one guess and then under the next is one wrong cell to the
-    /// eye). A row shown wrong by its drawn cursor alone counts the cursor's
-    /// cell. Few at once: a frame shows at most a line's worth.
     open_cells: Vec<((u16, u16), Duration)>,
     /// The lifetimes of the cells that went right again, in microseconds.
     cell_lives: Vec<u64>,
@@ -1038,8 +776,6 @@ fn micros(d: Duration) -> u64 {
 }
 
 /// The `q`th percentile of `sorted` (ascending), nearest rank rounded up: the
-/// median and the 95th percentile the perceived latency always quoted, and the
-/// lifetimes' 99th.
 fn percentile(sorted: &[u64], q: usize) -> u64 {
     sorted
         .get((sorted.len().saturating_sub(1) * q).div_ceil(100))
@@ -1049,9 +785,6 @@ fn percentile(sorted: &[u64], q: usize) -> u64 {
 
 impl Meter<'_> {
     /// The states the line on row `row` passes through, as far as it has been
-    /// typed: from the screen its first key met (the terminator before it, or
-    /// the first prompt) to the newest key pressed whose truth is on that row,
-    /// searched back no further than the line before the newest key's.
     fn line_states(&self, row: u16) -> (Vec<&Truth>, &Truth) {
         let s = self.script;
         let newest = self.pressed.checked_sub(1);
@@ -1084,9 +817,7 @@ impl Meter<'_> {
     }
 
     /// Measure the frame `sim` just drew, at `now`; `press` names the key
-    /// whose press drew it, if one did.
     fn frame(&mut self, sim: &Sim, now: Duration, press: Option<usize>) {
-        // The episode in progress, integrated up to this frame.
         let dt = now.saturating_sub(self.last);
         if let Some(cells) = self.wrong {
             let us = u64::try_from(dt.as_micros()).unwrap_or(u64::MAX);
@@ -1100,7 +831,6 @@ impl Meter<'_> {
         let drawn = sim.on_glass().and_then(|g| g.cursor).unwrap_or(engine);
         let mut view = View { rows: Vec::new() };
         let s = self.script;
-        // WRONG: a painted row showing no state of its line.
         let mut rows: Vec<u16> = sim.on_glass().map(|g| g.rows.clone()).unwrap_or_default();
         rows.push(
             self.pressed
@@ -1135,15 +865,11 @@ impl Meter<'_> {
             );
             if cells_now.len() == before {
                 // Every painted cell is one of the line's own glyphs: the drawn
-                // cursor is what no state of the line shows.
                 cells_now.push((row, if drawn.0 == row { drawn.1 } else { 0 }));
             }
             let cells = (cells_now.len() - before) as u64;
             wrong_cells = Some(wrong_cells.unwrap_or(0) + cells);
         }
-        // MISPREDICTED CELLS: a cell wrong at the last frame and right at this
-        // one lived from the frame it went wrong at to this one; a cell wrong
-        // now and not at the last frame is a mispredicted cell shown.
         let lives = &mut self.cell_lives;
         self.open_cells.retain(|&(cell, since)| {
             let open = cells_now.contains(&cell);
@@ -1172,7 +898,6 @@ impl Meter<'_> {
             }
             (None, None) => {}
         }
-        // AT PRESS: the press's own frame already shows the key's truth.
         if let Some(k) = press
             && s.counted.get(k) == Some(&true)
             && let Some(t) = s.truth.get(k)
@@ -1185,8 +910,6 @@ impl Meter<'_> {
                 *hit = true;
             }
         }
-        // BEFORE ECHO: the first frame `D` shows a state at or past each key
-        // in flight, and the first `A` does.
         for i in self.lo..self.pressed {
             if s.counted.get(i) != Some(&true) {
                 continue;
@@ -1228,7 +951,6 @@ impl Meter<'_> {
         if self.wrong.is_some() {
             self.end_episode();
         }
-        // A cell still wrong at the run's last frame lived until it.
         let last = self.last;
         self.cell_lives.extend(
             self.open_cells
@@ -1287,8 +1009,6 @@ impl Meter<'_> {
 }
 
 /// Run `script` over `timeline` as `run` says: the theorem's clauses checked on
-/// every frame for a variant with every rule in force. `Err` names a clause a
-/// frame broke.
 fn measure(script: &Script, timeline: &Timeline, run: Run) -> Result<Tally, String> {
     let mut sim = Sim::sized(config(run.editor, run.integration, run.mode), ROWS, COLS);
     sim.corpus_shell(&VOCAB);
@@ -1323,8 +1043,6 @@ fn measure(script: &Script, timeline: &Timeline, run: Run) -> Result<Tally, Stri
     let start = sim.now();
     meter.frame(&sim, Duration::ZERO, None);
     let (mut pi, mut ai, mut di) = (0usize, 0usize, 0usize);
-    // The far end reads keys in order; each read is a key whose output the
-    // pieces then carry, `di` counting pieces.
     let mut guard = 0u64;
     loop {
         guard += 1;
@@ -1333,8 +1051,6 @@ fn measure(script: &Script, timeline: &Timeline, run: Run) -> Result<Tally, Stri
             "{}: the event loop never drained",
             run.label()
         );
-        // The next event, deliveries first, then reads, then presses at the same
-        // instant; a deadline of the predictor's 1 ms late, before any of them.
         let next = [
             timeline.pieces.get(di).map(|p| (p.at, 0)),
             timeline.arrive.get(ai).map(|&t| (t, 1)),
@@ -1498,7 +1214,6 @@ fn the_corpus_is_the_region_probe_s() {
 }
 
 /// Every run of the main matrix, in report order: each far end and
-/// integration, each link, each mode, each variant.
 fn main_runs() -> Vec<Run> {
     let mut runs = Vec::new();
     for editor in [Editor::Zle, Editor::Readline] {
@@ -1522,7 +1237,6 @@ fn main_runs() -> Vec<Run> {
 }
 
 /// `runs` over `lines`, every core busy, each with the script of its far end
-/// and integration (`switch`: the switch corpus). Results in `runs`' order.
 fn measure_all(lines: &[Line], runs: &[Run], switch: bool) -> Vec<Result<Tally, String>> {
     let mut worlds: Vec<(Editor, bool)> = runs.iter().map(|r| (r.editor, r.integration)).collect();
     worlds.sort_by_key(|&(e, i)| (format!("{e:?}"), i));
@@ -1560,8 +1274,6 @@ fn tallies(runs: &[Run], results: Vec<Result<Tally, String>>) -> Vec<(Run, Tally
 }
 
 /// `Full`'s count of keys shown before their echo in each run of the main
-/// matrix at landing (assertion 3, a ratchet): `(editor, integration, rtt,
-/// mode, keys)`. Deterministic, so an improvement re-records it.
 const FULL_FLOORS: [(Editor, bool, u32, PredictMode, u64); 64] = [
     (Editor::Zle, true, 1, PredictMode::Adaptive, 0),
     (Editor::Zle, true, 1, PredictMode::Always, 6538),
@@ -1630,7 +1342,6 @@ const FULL_FLOORS: [(Editor, bool, u32, PredictMode, u64); 64] = [
 ];
 
 /// THE EDITING WIN, the main matrix: the report, and assertions 1, 2, 3, 5, 6, 7
-/// and 8 (module docs).
 #[test]
 fn predictive_editing_wins_and_never_shows_a_wrong_line() {
     let lines = corpus();
@@ -1682,9 +1393,6 @@ fn predictive_editing_wins_and_never_shows_a_wrong_line() {
             s.bindings_learned,
         );
     }
-    // WHAT THIS FILE FOUND, per run: the lines witnessed at a signed prompt
-    // (the integration's authenticated `B`, the first key typed there) by
-    // `Full`, and by `Full` with the gate shut at every scroll, as it was.
     let shut_runs: Vec<Run> = all
         .iter()
         .map(|(r, _)| *r)
@@ -1715,8 +1423,6 @@ fn predictive_editing_wins_and_never_shows_a_wrong_line() {
             run.variant.name(),
             t.stats.witnessed_lines
         );
-        // The measurement's own control: the gate kept across a scroll
-        // witnesses more lines than the gate shut there.
         if full <= t.stats.witnessed_lines {
             witness_failures.push(format!(
                 "{}: full witnessed {full} lines, the gate shut at a scroll {}",
@@ -1731,10 +1437,6 @@ fn predictive_editing_wins_and_never_shows_a_wrong_line() {
             .map(|(_, t)| t)
             .expect("every run of the matrix ran")
     };
-    // WHAT THIS FILE FOUND IN `Always`, per run: the mispredicted cells and
-    // wrong episodes of the predictor before the plan (`Baseline`), of `Full`,
-    // and of `Full` painting a guess that waits over the line's text, as it did
-    // (`PaintedOverText`).
     let painted_runs: Vec<Run> = all
         .iter()
         .map(|(r, _)| *r)
@@ -1770,7 +1472,6 @@ fn predictive_editing_wins_and_never_shows_a_wrong_line() {
             t.wrong_cells,
             t.wrong_runs
         );
-        // 8. `Always` shows no more wrong than the predictor before the plan.
         if full.wrong_cells > base.wrong_cells || full.wrong_runs > base.wrong_runs {
             always_failures.push(format!(
                 "{}: {} mispredicted cells in {} wrong episodes, before the plan {} in {}",
@@ -1781,8 +1482,6 @@ fn predictive_editing_wins_and_never_shows_a_wrong_line() {
                 base.wrong_runs
             ));
         }
-        // The measurement's own control: a guess painted over the line's text
-        // shows more cells wrong.
         if full.wrong_cells >= t.wrong_cells {
             always_failures.push(format!(
                 "{}: full showed {} mispredicted cells, painted over the text {}",
@@ -1800,8 +1499,6 @@ fn predictive_editing_wins_and_never_shows_a_wrong_line() {
         always_failures.join("\n")
     );
     let mut failures = Vec::new();
-    // 7. No cell shown wrong for longer than the longest glitch window, in any
-    // run: every variant, mode and link.
     for (run, t) in &all {
         if t.cell_life_max_us > LIFETIME_BOUND_US {
             failures.push(format!(
@@ -1823,7 +1520,6 @@ fn predictive_editing_wins_and_never_shows_a_wrong_line() {
                 t.wrong_cells
             ));
         }
-        // 2. At least the baseline's keys before their echo, in every class.
         let base = find(Run {
             variant: Variant::Baseline,
             ..*run
@@ -1838,7 +1534,6 @@ fn predictive_editing_wins_and_never_shows_a_wrong_line() {
                 ));
             }
         }
-        // 3. The ratchet.
         if let Some(&(.., floor)) = FULL_FLOORS.iter().find(|&&(e, i, rtt, mode, _)| {
             (e, i, rtt, mode) == (run.editor, run.integration, run.rtt_ms, run.mode)
         }) && t.before_echo < floor
@@ -1849,7 +1544,6 @@ fn predictive_editing_wins_and_never_shows_a_wrong_line() {
                 t.before_echo
             ));
         }
-        // 5. The cost.
         if t.cost.observe_max > OBSERVE_BOUND || t.cost.frame_folds_max > FOLD_BOUND {
             failures.push(format!(
                 "{}: {}",
@@ -1875,8 +1569,6 @@ fn predictive_editing_wins_and_never_shows_a_wrong_line() {
         recorded.join("\n")
     );
     assert!(failures.is_empty(), "{}", failures.join("\n"));
-    // The checker ran, and the edit lane was exercised: a clause held on
-    // frames that showed what this increment shows.
     let full: Stats = {
         let mut s = Stats::default();
         for (_, t) in all
@@ -1897,8 +1589,6 @@ fn predictive_editing_wins_and_never_shows_a_wrong_line() {
     ] {
         assert!(n > 0, "Full, Adaptive: no {name} on the corpus: {full:?}");
     }
-    // The metric's negative control: the shipped glyph lane before predictive
-    // editing shows wrong lines on this corpus, so the zeros above are seen.
     let (baseline_wrong, baseline_cells) = all
         .iter()
         .filter(|(r, _)| r.variant == Variant::Baseline)
@@ -1913,9 +1603,6 @@ fn predictive_editing_wins_and_never_shows_a_wrong_line() {
 }
 
 /// Assertion 4: a cooked tty echoes `^[[D` for `←`, and readline's overwrite
-/// mode replaces where the others shift, so under either the class ladder never
-/// proves the class, and nothing of it is shown, on the corpus lines that use
-/// arrows and edit inside the text (`EDITING_FAMILIES`).
 #[test]
 fn a_cooked_tty_shows_no_motion_and_overwrite_mode_no_shift() {
     let lines: Vec<Line> = corpus()
@@ -1985,12 +1672,6 @@ fn a_cooked_tty_shows_no_motion_and_overwrite_mode_no_shift() {
 }
 
 /// THE LADDER'S DECISION, measured: the class proofs end with their epoch
-/// (`Full`), or stay for the session (`Sticky`). On the SWITCH corpus every
-/// other line is typed into `cat`, a cooked program the line before started,
-/// whose tty echoes `^[[D` for `←`: a motion proven at the shell and kept
-/// shows `cat`'s line wrong. `Full` shows none; `Sticky` must show some, or
-/// the ladder's cost (each line's first motion and first shift a round trip
-/// dark, the main matrix's `full` against `sticky` rows) buys nothing.
 #[test]
 fn class_proofs_end_with_their_line() {
     let lines = corpus();

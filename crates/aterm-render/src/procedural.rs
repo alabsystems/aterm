@@ -1,70 +1,22 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Procedural box-drawing, block-element and braille glyphs.
-//!
-//! Font glyphs for these ranges rarely fill the cell exactly and leave hairline seams
-//! where strokes should meet across cells (tmux pane borders, powerline). This module
-//! draws them from the cell geometry instead: every bitmap is exactly `cell_w x cell_h`
-//! and strokes reach the cell edge.
-//!
-//! * Orthogonal families (lines, junctions, dashes, doubles, blocks, shades, quadrants,
-//!   sextants, octants, braille, the legacy eighth blocks U+1FB70–1FB8B) are hard 0/255,
-//!   so the CPU coverage blend and the GPU alpha blend produce identical pixels.
-//! * Diagonal and curved families ([`antialiased`]: diagonals, rounded arcs, Powerline
-//!   separators, legacy wedges) are rasterized at 4×4 subsamples per pixel and
-//!   box-filtered, with stroke thickness measured perpendicular to the edge. Their
-//!   cell-edge texels are then forced back to 0/255 ([`Canvas::harden_edges`]) so
-//!   adjacent cells still tile bit-exactly: the seam-tiling law,
-//!   `tests/procedural_aa_edges.rs`.
-//!
-//! [`crate::Renderer::glyph_key`] routes these ranges to [`crate::FaceId::Procedural`]
-//! before any font lookup.
-//!
-//! ## The shared rounding rule
-//!
-//! Every stroke is sized and placed by one rule, so glyphs in adjacent cells meet:
-//!
-//! * `light = max(1, round(min(w, h) / 8))`, in integers `(min(w, h) + 4) / 8`.
-//! * `heavy = 3 * light`: the same parity as `light`, so the heavy span contains the
-//!   light span on both axes, widening it by `light` on each side.
-//! * a stroke of thickness `t` across extent `e` covers `[(e - t) / 2, (e - t) / 2 + t)`;
-//!   when `e - t` is odd the extra pixel goes right/bottom.
-//! * a double line is the heavy span's first and last `light` pixels; the gap between is
-//!   exactly the light span, so a single line threading a double junction passes through.
-//! * block fractions use `eighth(k, e) = (k * e + 4) / 8` (round half up), each block
-//!   anchored to its defining edge; complementary halves (▀/▄, ▌/▐, quadrants) overlap
-//!   by one pixel on odd extents rather than leaving a seam.
-//!
-//! The shades ░▒▓ are 0/255 ordered dithers (25%, 50% checkerboard, 75%), not
-//! translucent grey, to keep CPU and GPU exact. They key on the cell's absolute pixel
-//! parity ([`coverage_phased`]) so odd cell widths tile the dither uniformly
-//! (`tests/shade_phase.rs`).
+//! Procedural box-drawing, block-element, and braille glyphs routed by
+//! [`crate::Renderer::glyph_key`] to [`crate::FaceId::Procedural`], with [`antialiased`] curves
+//! ([`Canvas::harden_edges`]) and [`coverage_phased`] shade dithers.
 
 mod icons;
 mod symbols;
 
 pub use icons::{IconMetrics, band_icon_coverage, band_icon_width};
 
-/// Whether `ch` is a last-resort symbol this module can draw without a font: media
-/// controls (⏩⏪⏫⏬⏭⏮⏯ ⏴⏵⏶⏷ ⏸⏹⏺), common Geometric Shapes (■□▪▫ ▲△▶▷▼▽◀◁ ►◄ ◆◇
-/// ●○◐◑◒◓ ◢◣◤◥ …), check marks and crosses (✓✔✕✖✗✘), and ⚪⚫ ⬤ ⭘.
-///
-/// Disjoint from [`covers`] and not pre-emptive: consulted only as the last tier of the
-/// resolution chain ([`crate::font_chain::Tier::Synthetic`]) after every real face
-/// missed, so it replaces only `.notdef` tofu. (`⎿` must join a `│` above it, so it is
-/// in [`covers`] instead.)
+/// Whether `ch` is a last-resort symbol this module can draw without a font.
 #[inline]
 pub const fn covers_symbol(ch: char) -> bool {
     symbols::covers(ch)
 }
 
-/// Whether `ch` is one of Claude Code's spinner frames the symbol set draws
-/// (`✢ ✳ ✶ ✻ ✽`), which the renderer draws ahead of every face where the
-/// primary yields them to the chain and the chain's faces would draw them
-/// soft, below `bundled::SPINNER_STARS_CRISP_PX`
-/// (`Renderer::spinner_star_preempts`). From that size up the faces draw
-/// them, their weights evened across the cycle (`Renderer::even_spinner_frame`).
+/// Whether `ch` is one of Claude Code's spinner frames the symbol set draws (`✢ ✳ ✶ ✻ ✽`).
 #[inline]
 pub const fn is_spinner_star(ch: char) -> bool {
     symbols::is_spinner_star(ch)
@@ -73,26 +25,16 @@ pub const fn is_spinner_star(ch: char) -> bool {
 /// The [`is_spinner_star`] frames, `✢ ✳ ✶ ✻ ✽`.
 pub const SPINNER_STARS: [char; 5] = symbols::SPINNER_STARS;
 
-/// The spinner frame Claude Code rests on: `✻` also opens the line it leaves
-/// under every finished turn (`✻ Worked for 1m 3s`), so it is the frame a
-/// transcript shows most.
+/// The spinner frame Claude Code rests on.
 pub const SPINNER_REST: char = '\u{273B}';
 
-/// The last-resort coverage bitmap for a [`covers_symbol`] char: row-major
-/// `span * cell_w` × `cell_h` bytes (`span` is the glyph's cell count, clamped
-/// to `1..=2`; a wide emoji-presentation symbol is centred across both cells),
-/// 8-bit anti-aliased coverage. `None` outside the symbol set or for a
-/// degenerate cell.
+/// The last-resort coverage bitmap for a [`covers_symbol`] char.
 #[inline]
 pub fn symbol_coverage(ch: char, cell_w: usize, cell_h: usize, span: usize) -> Option<Vec<u8>> {
     symbols::coverage(ch, cell_w, cell_h, span)
 }
 
-/// Whether `ch` is in a range this module draws: box drawing U+2500–257F, block elements
-/// U+2580–259F, braille U+2800–28FF, legacy sextants / wedges / eighth blocks
-/// U+1FB00–1FB8B, Unicode 16 octants U+1CD00–1CDE5, Powerline separators U+E0B0–E0BF,
-/// and the `⎿` connector U+23BF, a box-drawing stroke in all but block name that must
-/// tile with `│`.
+/// Whether `ch` is in a range this module draws.
 #[inline]
 pub const fn covers(ch: char) -> bool {
     matches!(
@@ -106,10 +48,7 @@ pub const fn covers(ch: char) -> bool {
     )
 }
 
-/// Whether `ch` is in an anti-aliased (diagonal or curved) family: rounded arcs
-/// U+256D–2570, diagonals U+2571–2573, legacy wedges U+1FB3C–1FB6F, Powerline
-/// U+E0B0–E0BF. Their interior may take any coverage, their cell-edge texels are hard
-/// 0/255; everything else [`covers`] accepts is hard 0/255 throughout.
+/// Whether `ch` is in an anti-aliased (diagonal or curved) family.
 #[inline]
 pub const fn antialiased(ch: char) -> bool {
     matches!(
@@ -118,21 +57,12 @@ pub const fn antialiased(ch: char) -> bool {
     )
 }
 
-/// The procedural coverage bitmap for `ch` at a `cell_w x cell_h` cell:
-/// row-major `cell_w * cell_h` bytes — hard 0/255 for the orthogonal
-/// families, 8-bit box-filtered coverage (hard at the cell edges) for the
-/// [`antialiased`] ones. `None` when `ch` is outside the procedural ranges
-/// (or the cell is degenerate). Shades use phase `(0, 0)` here; the renderer
-/// passes the cell's absolute-parity phase via [`coverage_phased`].
+/// The procedural coverage bitmap for `ch` at a `cell_w x cell_h` cell.
 pub fn coverage(ch: char, cell_w: usize, cell_h: usize) -> Option<Vec<u8>> {
     coverage_phased(ch, cell_w, cell_h, false, false)
 }
 
-/// [`coverage`] with the shade-dither phase explicit. `phase_x`/`phase_y` are the parity
-/// of the destination cell's top-left pixel (`(pad + col * cell_w) & 1` and the row
-/// twin): the ░▒▓ dithers follow absolute framebuffer parity, so cells of odd width keep
-/// a uniform 2-pixel period across the seam. Non-shade glyphs ignore the phase. The CPU
-/// blit and GPU quads key their lookups with the same phase ([`crate::shade_phase_key`]).
+/// [`coverage`] with the shade-dither phase explicit.
 pub fn coverage_phased(
     ch: char,
     cell_w: usize,
@@ -171,10 +101,7 @@ pub fn coverage_phased(
     Some(c.buf)
 }
 
-/// The anti-aliased coverage sprite (`0..=255` per byte, row-major `cell_w * cell_h`) for
-/// a [`crate::DecoGlyph`] sparkle-word decoration. Soft-edged so it reads at small cell
-/// sizes; the GPU rasterizes this same mask and the host applies colour and alpha at
-/// composite time, so CPU and GPU match.
+/// The anti-aliased coverage sprite (`0..=255` per byte, row-major `cell_w * cell_h`).
 #[must_use]
 pub fn deco_coverage(glyph: crate::DecoGlyph, cell_w: usize, cell_h: usize) -> Vec<u8> {
     use crate::DecoGlyph;
@@ -219,9 +146,7 @@ fn plus(px: f32, py: f32, cx: f32, cy: f32, r: f32) -> f32 {
     horiz.max(vert).clamp(0.0, 1.0)
 }
 
-/// An `n`-point sparkle built from tapering needles radiating from the centre,
-/// plus a small core disc. `start` rotates the first point; `hw_frac` sets the
-/// needle half-width at the base as a fraction of `r`.
+/// An `n`-point sparkle built from tapering needles radiating from the centre.
 #[allow(
     clippy::too_many_arguments,
     reason = "8 geometric scalars (point, centre, radius, point count, start angle, width) read more clearly as positional args than wrapped in a one-off struct"
@@ -267,9 +192,7 @@ fn ellipse(px: f32, py: f32, ex: f32, ey: f32, rx: f32, ry: f32) -> f32 {
 /// A cat's paw print: a large lower pad plus four toe beans above it.
 fn paw(px: f32, py: f32, fw: f32, fh: f32) -> f32 {
     let cx = fw * 0.5;
-    // Main pad, sitting low in the cell.
     let mut cov = ellipse(px, py, cx, fh * 0.66, fw * 0.30, fh * 0.24);
-    // Four toe beans across the top, the outer pair slightly lower.
     let toe_r = fw * 0.135;
     let toes = [
         (cx - fw * 0.27, fh * 0.34),
@@ -284,25 +207,17 @@ fn paw(px: f32, py: f32, fw: f32, fh: f32) -> f32 {
 }
 
 /// The Singularity nova's per-cell Over darkening mask (Sparkle Words v2 §6.1): a soft
-/// radial shadow, coverage `1` at the cell centre falling quadratically to `0` at `r`.
-/// The host stamps one tinted decoration per cell along the contracting ring and the
-/// blobs fuse into a dark band. The `RingArc` name stays for stream stability.
 fn ring_arc(px: f32, py: f32, cx: f32, cy: f32, r: f32) -> f32 {
     let d2 = ((px - cx).powi(2) + (py - cy).powi(2)) / (r * r).max(1e-6);
     (1.0 - d2).clamp(0.0, 1.0)
 }
 
 /// The super nova's light-background eclipse veil (Sparkle Words v3 §3.3): a full-cell
-/// square whose coverage is the pixel centre's distance to the nearest cell border,
-/// clamped to `0..=1`, so it fills the cell with a ~1 px fringe like [`disc`]'s. (Not
-/// named `shade`: that is the ░▒▓ painter.)
 fn soft_square(px: f32, py: f32, fw: f32, fh: f32) -> f32 {
     px.min(fw - px).min(py.min(fh - py)).clamp(0.0, 1.0)
 }
 
 /// A coverage canvas: `w * h` bytes. The hard painters ([`Canvas::set`],
-/// [`Canvas::rect`]) write 0/255 only; [`Canvas::paint_aa`] writes box-filtered
-/// 8-bit coverage for the anti-aliased families.
 struct Canvas {
     w: usize,
     h: usize,
@@ -310,8 +225,6 @@ struct Canvas {
 }
 
 /// Subsamples per pixel axis for the AA families: 4× supersampling, box
-/// filter (a pixel's coverage is the fraction of its 4×4 subsample grid the
-/// shape contains, rounded to 8 bits).
 const SS: usize = 4;
 
 impl Canvas {
@@ -340,9 +253,6 @@ impl Canvas {
     }
 
     /// Paint an anti-aliased shape: `inside(px, py)` is evaluated at the 4×4
-    /// subsample centres of every pixel (cell coordinates, y down) and
-    /// box-filtered to 8-bit coverage. Union with whatever is already painted
-    /// (max), so hard rects and AA shapes compose within one glyph.
     fn paint_aa(&mut self, inside: impl Fn(f32, f32) -> bool) {
         for y in 0..self.h {
             for x in 0..self.w {
@@ -356,7 +266,6 @@ impl Canvas {
                         }
                     }
                 }
-                // round(hits * 255 / SS²): 16 hits -> 255, 8 -> 128, 0 -> 0.
                 let cov = ((hits * 255 + (SS * SS) as u32 / 2) / (SS * SS) as u32) as u8;
                 let i = y * self.w + x;
                 if cov > self.buf[i] {
@@ -367,8 +276,6 @@ impl Canvas {
     }
 
     /// Force the border rows and columns to hard 0/255 (majority wins): the seam-tiling
-    /// law. Only boundary texels meet a neighbouring cell's glyph, so quantizing them
-    /// leaves no half-covered seam line and keeps the CPU/GPU blends exact there.
     fn harden_edges(&mut self) {
         let (w, h) = (self.w, self.h);
         let mut harden = |i: usize| {
@@ -386,7 +293,6 @@ impl Canvas {
 }
 
 /// A centred stroke of thickness `t` across extent `e`: the half-open span
-/// `[(e - t) / 2, (e - t) / 2 + t)`, the module's placement rule.
 #[inline]
 const fn span(e: usize, t: usize) -> (usize, usize) {
     let t = if t < e { t } else { e };
@@ -401,7 +307,6 @@ const fn eighth(k: u32, e: usize) -> usize {
 }
 
 /// Per-cell stroke geometry, all derived from the module's single rounding
-/// rule so every glyph (and every neighbouring cell) agrees on positions.
 struct Metrics {
     w: usize,
     h: usize,
@@ -413,11 +318,10 @@ struct Metrics {
     /// Light horizontal stroke rows `[hl0, hl1)`.
     hl0: usize,
     hl1: usize,
-    /// Heavy vertical stroke columns `[vh0, vh1)` (also the double-line outer
-    /// envelope: rails are its first/last `light` columns).
+    /// Heavy vertical stroke columns `[vh0, vh1)` (also the double-line outer envelope).
     vh0: usize,
     vh1: usize,
-    /// Heavy horizontal stroke rows `[hh0, hh1)` (double-line envelope too).
+    /// Heavy horizontal stroke rows `[hh0, hh1)` (also the double-line outer envelope).
     hh0: usize,
     hh1: usize,
 }
@@ -476,104 +380,101 @@ const L: Arm = Arm::Light;
 const H: Arm = Arm::Heavy;
 
 /// `[up, down, left, right]` arm weights for the solid light/heavy glyphs:
-/// U+2500–254B (the dashed slots 2504–250B hold their solid equivalents;
-/// `draw_box` intercepts those before this table is consulted) and the half
-/// lines / weight transitions U+2574–257F.
 #[inline]
 const fn arms(cp: u32) -> [Arm; 4] {
     #[rustfmt::skip]
     const TABLE: [[Arm; 4]; 0x4C] = [
-        [N, N, L, L], // 2500 ─
-        [N, N, H, H], // 2501 ━
-        [L, L, N, N], // 2502 │
-        [H, H, N, N], // 2503 ┃
-        [N, N, L, L], // 2504 ┄ (dashed; intercepted)
-        [N, N, H, H], // 2505 ┅ (dashed; intercepted)
-        [L, L, N, N], // 2506 ┆ (dashed; intercepted)
-        [H, H, N, N], // 2507 ┇ (dashed; intercepted)
-        [N, N, L, L], // 2508 ┈ (dashed; intercepted)
-        [N, N, H, H], // 2509 ┉ (dashed; intercepted)
-        [L, L, N, N], // 250A ┊ (dashed; intercepted)
-        [H, H, N, N], // 250B ┋ (dashed; intercepted)
-        [N, L, N, L], // 250C ┌
-        [N, L, N, H], // 250D ┍
-        [N, H, N, L], // 250E ┎
-        [N, H, N, H], // 250F ┏
-        [N, L, L, N], // 2510 ┐
-        [N, L, H, N], // 2511 ┑
-        [N, H, L, N], // 2512 ┒
-        [N, H, H, N], // 2513 ┓
-        [L, N, N, L], // 2514 └
-        [L, N, N, H], // 2515 ┕
-        [H, N, N, L], // 2516 ┖
-        [H, N, N, H], // 2517 ┗
-        [L, N, L, N], // 2518 ┘
-        [L, N, H, N], // 2519 ┙
-        [H, N, L, N], // 251A ┚
-        [H, N, H, N], // 251B ┛
-        [L, L, N, L], // 251C ├
-        [L, L, N, H], // 251D ┝
-        [H, L, N, L], // 251E ┞
-        [L, H, N, L], // 251F ┟
-        [H, H, N, L], // 2520 ┠
-        [H, L, N, H], // 2521 ┡
-        [L, H, N, H], // 2522 ┢
-        [H, H, N, H], // 2523 ┣
-        [L, L, L, N], // 2524 ┤
-        [L, L, H, N], // 2525 ┥
-        [H, L, L, N], // 2526 ┦
-        [L, H, L, N], // 2527 ┧
-        [H, H, L, N], // 2528 ┨
-        [H, L, H, N], // 2529 ┩
-        [L, H, H, N], // 252A ┪
-        [H, H, H, N], // 252B ┫
-        [N, L, L, L], // 252C ┬
-        [N, L, H, L], // 252D ┭
-        [N, L, L, H], // 252E ┮
-        [N, L, H, H], // 252F ┯
-        [N, H, L, L], // 2530 ┰
-        [N, H, H, L], // 2531 ┱
-        [N, H, L, H], // 2532 ┲
-        [N, H, H, H], // 2533 ┳
-        [L, N, L, L], // 2534 ┴
-        [L, N, H, L], // 2535 ┵
-        [L, N, L, H], // 2536 ┶
-        [L, N, H, H], // 2537 ┷
-        [H, N, L, L], // 2538 ┸
-        [H, N, H, L], // 2539 ┹
-        [H, N, L, H], // 253A ┺
-        [H, N, H, H], // 253B ┻
-        [L, L, L, L], // 253C ┼
-        [L, L, H, L], // 253D ┽
-        [L, L, L, H], // 253E ┾
-        [L, L, H, H], // 253F ┿
-        [H, L, L, L], // 2540 ╀
-        [L, H, L, L], // 2541 ╁
-        [H, H, L, L], // 2542 ╂
-        [H, L, H, L], // 2543 ╃
-        [H, L, L, H], // 2544 ╄
-        [L, H, H, L], // 2545 ╅
-        [L, H, L, H], // 2546 ╆
-        [H, L, H, H], // 2547 ╇
-        [L, H, H, H], // 2548 ╈
-        [H, H, H, L], // 2549 ╉
-        [H, H, L, H], // 254A ╊
-        [H, H, H, H], // 254B ╋
+        [N, N, L, L],
+        [N, N, H, H],
+        [L, L, N, N],
+        [H, H, N, N],
+        [N, N, L, L],
+        [N, N, H, H],
+        [L, L, N, N],
+        [H, H, N, N],
+        [N, N, L, L],
+        [N, N, H, H],
+        [L, L, N, N],
+        [H, H, N, N],
+        [N, L, N, L],
+        [N, L, N, H],
+        [N, H, N, L],
+        [N, H, N, H],
+        [N, L, L, N],
+        [N, L, H, N],
+        [N, H, L, N],
+        [N, H, H, N],
+        [L, N, N, L],
+        [L, N, N, H],
+        [H, N, N, L],
+        [H, N, N, H],
+        [L, N, L, N],
+        [L, N, H, N],
+        [H, N, L, N],
+        [H, N, H, N],
+        [L, L, N, L],
+        [L, L, N, H],
+        [H, L, N, L],
+        [L, H, N, L],
+        [H, H, N, L],
+        [H, L, N, H],
+        [L, H, N, H],
+        [H, H, N, H],
+        [L, L, L, N],
+        [L, L, H, N],
+        [H, L, L, N],
+        [L, H, L, N],
+        [H, H, L, N],
+        [H, L, H, N],
+        [L, H, H, N],
+        [H, H, H, N],
+        [N, L, L, L],
+        [N, L, H, L],
+        [N, L, L, H],
+        [N, L, H, H],
+        [N, H, L, L],
+        [N, H, H, L],
+        [N, H, L, H],
+        [N, H, H, H],
+        [L, N, L, L],
+        [L, N, H, L],
+        [L, N, L, H],
+        [L, N, H, H],
+        [H, N, L, L],
+        [H, N, H, L],
+        [H, N, L, H],
+        [H, N, H, H],
+        [L, L, L, L],
+        [L, L, H, L],
+        [L, L, L, H],
+        [L, L, H, H],
+        [H, L, L, L],
+        [L, H, L, L],
+        [H, H, L, L],
+        [H, L, H, L],
+        [H, L, L, H],
+        [L, H, H, L],
+        [L, H, L, H],
+        [H, L, H, H],
+        [L, H, H, H],
+        [H, H, H, L],
+        [H, H, L, H],
+        [H, H, H, H],
     ];
     #[rustfmt::skip]
     const HALF: [[Arm; 4]; 12] = [
-        [N, N, L, N], // 2574 ╴
-        [L, N, N, N], // 2575 ╵
-        [N, N, N, L], // 2576 ╶
-        [N, L, N, N], // 2577 ╷
-        [N, N, H, N], // 2578 ╸
-        [H, N, N, N], // 2579 ╹
-        [N, N, N, H], // 257A ╺
-        [N, H, N, N], // 257B ╻
-        [N, N, L, H], // 257C ╼
-        [L, H, N, N], // 257D ╽
-        [N, N, H, L], // 257E ╾
-        [H, L, N, N], // 257F ╿
+        [N, N, L, N],
+        [L, N, N, N],
+        [N, N, N, L],
+        [N, L, N, N],
+        [N, N, H, N],
+        [H, N, N, N],
+        [N, N, N, H],
+        [N, H, N, N],
+        [N, N, L, H],
+        [L, H, N, N],
+        [N, N, H, L],
+        [H, L, N, N],
     ];
     match cp {
         0x2500..=0x254B => TABLE[(cp - 0x2500) as usize],
@@ -610,8 +511,6 @@ fn draw_box(c: &mut Canvas, m: &Metrics, cp: u32) {
 }
 
 /// Solid junctions: each present arm is a stroke from its cell edge through
-/// the light centre span, so any combination joins solidly (the heavy span
-/// contains the light span, and every arm reaches past the centre).
 fn draw_arms(c: &mut Canvas, m: &Metrics, up: Arm, down: Arm, left: Arm, right: Arm) {
     if let Some(t) = up.thickness(m) {
         let (x0, x1) = span(m.w, t);
@@ -632,8 +531,6 @@ fn draw_arms(c: &mut Canvas, m: &Metrics, up: Arm, down: Arm, left: Arm, right: 
 }
 
 /// Horizontal dashed line: `n` dashes, each centred in its `w/n` segment with
-/// a `max(1, seg/3)` gap split across the segment ends (so the gaps stay
-/// inside the cell — dashes are the one family that must NOT touch the seam).
 fn dash_h(c: &mut Canvas, m: &Metrics, n: usize, t: usize) {
     let (y0, y1) = span(m.h, t);
     for i in 0..n {
@@ -666,199 +563,165 @@ fn dash_v(c: &mut Canvas, m: &Metrics, n: usize, t: usize) {
 }
 
 /// Double-line glyphs U+2550–256C. Rails sit at the outer thirds of the heavy
-/// envelope (`Metrics` docs); junction shapes follow the Unicode charts: outer
-/// rails meet at the outer corner, inner rails at the inner corner, and a
-/// branch breaks only the rail it attaches to.
 fn draw_double(c: &mut Canvas, m: &Metrics, cp: u32) {
     let t = m.light;
     let (w, h) = (m.w, m.h);
-    // Horizontal rail rows: top `[tr0, tr1)`, bottom `[br0, br1)`.
     let (tr0, tr1) = (m.hh0, m.hh0 + t);
     let (br0, br1) = (m.hh1 - t, m.hh1);
-    // Vertical rail columns: left `[lr0, lr1)`, right `[rr0, rr1)`.
     let (lr0, lr1) = (m.vh0, m.vh0 + t);
     let (rr0, rr1) = (m.vh1 - t, m.vh1);
     match cp {
         0x2550 => {
-            // ═
             c.rect(0, tr0, w, tr1);
             c.rect(0, br0, w, br1);
         }
         0x2551 => {
-            // ║
             c.rect(lr0, 0, lr1, h);
             c.rect(rr0, 0, rr1, h);
         }
         0x2552 => {
-            // ╒ down single, right double
             c.rect(m.vl0, tr0, w, tr1);
             c.rect(m.vl0, br0, w, br1);
             c.rect(m.vl0, tr0, m.vl1, h);
         }
         0x2553 => {
-            // ╓ down double, right single
             c.rect(lr0, m.hl0, w, m.hl1);
             c.rect(lr0, m.hl0, lr1, h);
             c.rect(rr0, m.hl0, rr1, h);
         }
         0x2554 => {
-            // ╔
-            c.rect(lr0, tr0, w, tr1); // outer top rail
-            c.rect(lr0, tr0, lr1, h); // outer left rail
-            c.rect(rr0, br0, w, br1); // inner bottom rail
-            c.rect(rr0, br0, rr1, h); // inner right rail
+            c.rect(lr0, tr0, w, tr1);
+            c.rect(lr0, tr0, lr1, h);
+            c.rect(rr0, br0, w, br1);
+            c.rect(rr0, br0, rr1, h);
         }
         0x2555 => {
-            // ╕ down single, left double
             c.rect(0, tr0, m.vl1, tr1);
             c.rect(0, br0, m.vl1, br1);
             c.rect(m.vl0, tr0, m.vl1, h);
         }
         0x2556 => {
-            // ╖ down double, left single
             c.rect(0, m.hl0, rr1, m.hl1);
             c.rect(lr0, m.hl0, lr1, h);
             c.rect(rr0, m.hl0, rr1, h);
         }
         0x2557 => {
-            // ╗
-            c.rect(0, tr0, rr1, tr1); // outer top rail
-            c.rect(rr0, tr0, rr1, h); // outer right rail
-            c.rect(0, br0, lr1, br1); // inner bottom rail
-            c.rect(lr0, br0, lr1, h); // inner left rail
+            c.rect(0, tr0, rr1, tr1);
+            c.rect(rr0, tr0, rr1, h);
+            c.rect(0, br0, lr1, br1);
+            c.rect(lr0, br0, lr1, h);
         }
         0x2558 => {
-            // ╘ up single, right double
             c.rect(m.vl0, tr0, w, tr1);
             c.rect(m.vl0, br0, w, br1);
             c.rect(m.vl0, 0, m.vl1, br1);
         }
         0x2559 => {
-            // ╙ up double, right single
             c.rect(lr0, m.hl0, w, m.hl1);
             c.rect(lr0, 0, lr1, m.hl1);
             c.rect(rr0, 0, rr1, m.hl1);
         }
         0x255A => {
-            // ╚
-            c.rect(lr0, br0, w, br1); // outer bottom rail
-            c.rect(lr0, 0, lr1, br1); // outer left rail
-            c.rect(rr0, tr0, w, tr1); // inner top rail
-            c.rect(rr0, 0, rr1, tr1); // inner right rail
+            c.rect(lr0, br0, w, br1);
+            c.rect(lr0, 0, lr1, br1);
+            c.rect(rr0, tr0, w, tr1);
+            c.rect(rr0, 0, rr1, tr1);
         }
         0x255B => {
-            // ╛ up single, left double
             c.rect(0, tr0, m.vl1, tr1);
             c.rect(0, br0, m.vl1, br1);
             c.rect(m.vl0, 0, m.vl1, br1);
         }
         0x255C => {
-            // ╜ up double, left single
             c.rect(0, m.hl0, rr1, m.hl1);
             c.rect(lr0, 0, lr1, m.hl1);
             c.rect(rr0, 0, rr1, m.hl1);
         }
         0x255D => {
-            // ╝
-            c.rect(0, br0, rr1, br1); // outer bottom rail
-            c.rect(rr0, 0, rr1, br1); // outer right rail
-            c.rect(0, tr0, lr1, tr1); // inner top rail
-            c.rect(lr0, 0, lr1, tr1); // inner left rail
+            c.rect(0, br0, rr1, br1);
+            c.rect(rr0, 0, rr1, br1);
+            c.rect(0, tr0, lr1, tr1);
+            c.rect(lr0, 0, lr1, tr1);
         }
         0x255E => {
-            // ╞ vertical single, right double
             c.rect(m.vl0, 0, m.vl1, h);
             c.rect(m.vl0, tr0, w, tr1);
             c.rect(m.vl0, br0, w, br1);
         }
         0x255F => {
-            // ╟ vertical double, right single
             c.rect(lr0, 0, lr1, h);
             c.rect(rr0, 0, rr1, h);
             c.rect(rr0, m.hl0, w, m.hl1);
         }
         0x2560 => {
-            // ╠
-            c.rect(lr0, 0, lr1, h); // left rail, unbroken
-            c.rect(rr0, 0, rr1, tr1); // right rail above the branch
-            c.rect(rr0, br0, rr1, h); // right rail below the branch
-            c.rect(rr0, tr0, w, tr1); // top branch rail
-            c.rect(rr0, br0, w, br1); // bottom branch rail
+            c.rect(lr0, 0, lr1, h);
+            c.rect(rr0, 0, rr1, tr1);
+            c.rect(rr0, br0, rr1, h);
+            c.rect(rr0, tr0, w, tr1);
+            c.rect(rr0, br0, w, br1);
         }
         0x2561 => {
-            // ╡ vertical single, left double
             c.rect(m.vl0, 0, m.vl1, h);
             c.rect(0, tr0, m.vl1, tr1);
             c.rect(0, br0, m.vl1, br1);
         }
         0x2562 => {
-            // ╢ vertical double, left single
             c.rect(lr0, 0, lr1, h);
             c.rect(rr0, 0, rr1, h);
             c.rect(0, m.hl0, lr1, m.hl1);
         }
         0x2563 => {
-            // ╣
-            c.rect(rr0, 0, rr1, h); // right rail, unbroken
-            c.rect(lr0, 0, lr1, tr1); // left rail above the branch
-            c.rect(lr0, br0, lr1, h); // left rail below the branch
-            c.rect(0, tr0, lr1, tr1); // top branch rail
-            c.rect(0, br0, lr1, br1); // bottom branch rail
+            c.rect(rr0, 0, rr1, h);
+            c.rect(lr0, 0, lr1, tr1);
+            c.rect(lr0, br0, lr1, h);
+            c.rect(0, tr0, lr1, tr1);
+            c.rect(0, br0, lr1, br1);
         }
         0x2564 => {
-            // ╤ down single, horizontal double
             c.rect(0, tr0, w, tr1);
             c.rect(0, br0, w, br1);
             c.rect(m.vl0, br0, m.vl1, h);
         }
         0x2565 => {
-            // ╥ down double, horizontal single
             c.rect(0, m.hl0, w, m.hl1);
             c.rect(lr0, m.hl0, lr1, h);
             c.rect(rr0, m.hl0, rr1, h);
         }
         0x2566 => {
-            // ╦
-            c.rect(0, tr0, w, tr1); // top rail, unbroken
-            c.rect(0, br0, lr1, br1); // bottom rail, left piece
-            c.rect(rr0, br0, w, br1); // bottom rail, right piece
-            c.rect(lr0, br0, lr1, h); // left descender
-            c.rect(rr0, br0, rr1, h); // right descender
+            c.rect(0, tr0, w, tr1);
+            c.rect(0, br0, lr1, br1);
+            c.rect(rr0, br0, w, br1);
+            c.rect(lr0, br0, lr1, h);
+            c.rect(rr0, br0, rr1, h);
         }
         0x2567 => {
-            // ╧ up single, horizontal double
             c.rect(0, tr0, w, tr1);
             c.rect(0, br0, w, br1);
             c.rect(m.vl0, 0, m.vl1, tr1);
         }
         0x2568 => {
-            // ╨ up double, horizontal single
             c.rect(0, m.hl0, w, m.hl1);
             c.rect(lr0, 0, lr1, m.hl1);
             c.rect(rr0, 0, rr1, m.hl1);
         }
         0x2569 => {
-            // ╩
-            c.rect(0, br0, w, br1); // bottom rail, unbroken
-            c.rect(0, tr0, lr1, tr1); // top rail, left piece
-            c.rect(rr0, tr0, w, tr1); // top rail, right piece
-            c.rect(lr0, 0, lr1, tr1); // left ascender
-            c.rect(rr0, 0, rr1, tr1); // right ascender
+            c.rect(0, br0, w, br1);
+            c.rect(0, tr0, lr1, tr1);
+            c.rect(rr0, tr0, w, tr1);
+            c.rect(lr0, 0, lr1, tr1);
+            c.rect(rr0, 0, rr1, tr1);
         }
         0x256A => {
-            // ╪ vertical single threads both rails
             c.rect(m.vl0, 0, m.vl1, h);
             c.rect(0, tr0, w, tr1);
             c.rect(0, br0, w, br1);
         }
         0x256B => {
-            // ╫ horizontal single threads both rails
             c.rect(0, m.hl0, w, m.hl1);
             c.rect(lr0, 0, lr1, h);
             c.rect(rr0, 0, rr1, h);
         }
         0x256C => {
-            // ╬ four corner pieces around an open centre
             c.rect(lr0, 0, lr1, tr1);
             c.rect(0, tr0, lr1, tr1);
             c.rect(rr0, 0, rr1, tr1);
@@ -873,20 +736,11 @@ fn draw_double(c: &mut Canvas, m: &Metrics, cp: u32) {
 }
 
 /// Light arcs U+256D–2570: the two straight half-arms of the matching corner,
-/// joined by a quarter circle whose radius is the largest that fits between
-/// the centre cross and the cell edges. The arc band is at least one pixel
-/// wide at every angle so the curve stays connected at `light == 1`. The
-/// curved band is supersampled ([`Canvas::paint_aa`], radial distance — i.e.
-/// perpendicular to the curve); the straight stubs stay hard rects, so the
-/// arm meets a neighbouring `─`/`│` stroke bit-exactly at the (hardened)
-/// cell edge.
 fn draw_arc(c: &mut Canvas, m: &Metrics, cp: u32) {
     let t = m.light as f32;
     let vmid = (m.vl0 + m.vl1) as f32 / 2.0;
     let hmid = (m.hl0 + m.hl1) as f32 / 2.0;
     let (wf, hf) = (m.w as f32, m.h as f32);
-    // Arm directions: +1 = right/down. ╭ down+right, ╮ down+left,
-    // ╯ up+left, ╰ up+right.
     let (dx, dy): (f32, f32) = match cp {
         0x256D => (1.0, 1.0),
         0x256E => (-1.0, 1.0),
@@ -897,9 +751,6 @@ fn draw_arc(c: &mut Canvas, m: &Metrics, cp: u32) {
     let rx = if dx > 0.0 { wf - vmid } else { vmid };
     let ry = if dy > 0.0 { hf - hmid } else { hmid };
     let r = rx.min(ry).max(t);
-    // Centre of curvature, displaced from the stroke cross toward the corner
-    // the arms point at; the arc joins the vertical stroke at y = cy and the
-    // horizontal stroke at x = cx.
     let cx = vmid + dx * r;
     let cy = hmid + dy * r;
     let half = (t / 2.0).max(0.71);
@@ -911,8 +762,6 @@ fn draw_arc(c: &mut Canvas, m: &Metrics, cp: u32) {
         let d = ((px - cx).powi(2) + (py - cy).powi(2)).sqrt();
         (d - r).abs() <= half
     });
-    // Straight stubs from the arc joints to the cell edges (the floor/ceil
-    // overlaps the arc end by up to a pixel, never gaps).
     if dx > 0.0 {
         c.rect((cx.floor() as usize).min(m.w), m.hl0, m.w, m.hl1);
     } else {
@@ -926,18 +775,12 @@ fn draw_arc(c: &mut Canvas, m: &Metrics, cp: u32) {
 }
 
 /// Light diagonals U+2571–2573, corner to corner. A subsample is lit when it
-/// lies within half a light stroke of the ideal line, measured PERPENDICULAR
-/// to it (floored at 0.6 so the line stays visually connected — and meets the
-/// cell corners, so diagonals in adjacent cells chain without a break; the
-/// corner texels are edge-hardened back to 255).
 fn draw_diag(c: &mut Canvas, m: &Metrics, fwd: bool, back: bool) {
     let (wf, hf) = (m.w as f32, m.h as f32);
     let half = (m.light as f32 / 2.0).max(0.6);
     let norm = (wf * wf + hf * hf).sqrt();
     c.paint_aa(|px, py| {
-        // ╱ runs (0, h) -> (w, 0): h*x + w*y - w*h = 0.
         let df = (hf * px + wf * py - wf * hf).abs() / norm;
-        // ╲ runs (0, 0) -> (w, h): h*x - w*y = 0.
         let db = (hf * px - wf * py).abs() / norm;
         (fwd && df <= half) || (back && db <= half)
     });
@@ -947,31 +790,24 @@ fn draw_diag(c: &mut Canvas, m: &Metrics, fwd: bool, back: bool) {
 fn draw_block(c: &mut Canvas, cp: u32) {
     let (w, h) = (c.w, c.h);
     match cp {
-        0x2580 => c.rect(0, 0, w, eighth(4, h)), // ▀ upper half
+        0x2580 => c.rect(0, 0, w, eighth(4, h)),
         0x2581..=0x2588 => {
-            // ▁▂▃▄▅▆▇█ lower k/8, anchored to the bottom edge
             let k = cp - 0x2580;
             c.rect(0, h - eighth(k, h), w, h);
         }
         0x2589..=0x258F => {
-            // ▉▊▋▌▍▎▏ left k/8, anchored to the left edge
             let k = 8 - (cp - 0x2588);
             c.rect(0, 0, eighth(k, w), h);
         }
-        0x2590 => c.rect(w - eighth(4, w), 0, w, h), // ▐ right half
-        // ░▒▓ (0x2591..=0x2593) are intercepted by `coverage_phased` (they
-        // carry the absolute-parity dither phase) before this table.
-        0x2594 => c.rect(0, 0, w, eighth(1, h)), // ▔ upper eighth
-        0x2595 => c.rect(w - eighth(1, w), 0, w, h), // ▕ right eighth
+        0x2590 => c.rect(w - eighth(4, w), 0, w, h),
+        0x2594 => c.rect(0, 0, w, eighth(1, h)),
+        0x2595 => c.rect(w - eighth(1, w), 0, w, h),
         0x2596..=0x259F => quadrants(c, cp),
         _ => unreachable!("draw_block covers 0x2580..=0x259F"),
     }
 }
 
 /// The shade dithers: 1 = ░ 25% (even x and even y), 2 = ▒ 50% checkerboard, 3 = ▓ 75%
-/// (all but odd/odd). `phase_x`/`phase_y` are the parity of the destination cell's
-/// top-left pixel, so the pattern is one lattice in absolute framebuffer coordinates and
-/// odd cell widths do not double a dither line at the seams.
 fn shade(c: &mut Canvas, level: u8, phase_x: usize, phase_y: usize) {
     for y in 0..c.h {
         for x in 0..c.w {
@@ -989,21 +825,18 @@ fn shade(c: &mut Canvas, level: u8, phase_x: usize, phase_y: usize) {
 }
 
 /// Quadrant blocks U+2596–259F: each lit quadrant is a half-by-half rect
-/// anchored to its own corner and sized `eighth(4, ..)` (round half up), so
-/// unions never leave an interior seam.
 fn quadrants(c: &mut Canvas, cp: u32) {
-    // bit 0 = upper-left, 1 = upper-right, 2 = lower-left, 3 = lower-right.
     let bits: u8 = match cp {
-        0x2596 => 0b0100, // ▖
-        0x2597 => 0b1000, // ▗
-        0x2598 => 0b0001, // ▘
-        0x2599 => 0b1101, // ▙
-        0x259A => 0b1001, // ▚
-        0x259B => 0b0111, // ▛
-        0x259C => 0b1011, // ▜
-        0x259D => 0b0010, // ▝
-        0x259E => 0b0110, // ▞
-        0x259F => 0b1110, // ▟
+        0x2596 => 0b0100,
+        0x2597 => 0b1000,
+        0x2598 => 0b0001,
+        0x2599 => 0b1101,
+        0x259A => 0b1001,
+        0x259B => 0b0111,
+        0x259C => 0b1011,
+        0x259D => 0b0010,
+        0x259E => 0b0110,
+        0x259F => 0b1110,
         _ => unreachable!("quadrants covers 0x2596..=0x259F"),
     };
     let (w, h) = (c.w, c.h);
@@ -1023,8 +856,6 @@ fn quadrants(c: &mut Canvas, cp: u32) {
 }
 
 /// Distance from `(px, py)` to the segment `(ax, ay)..(bx, by)`. The Powerline chevron
-/// stroke: a band `dist <= t/2` is `t` thick perpendicular to the edge at every slope,
-/// where a per-row fill of width `t` thins to `t / sqrt(1 + slope²)` (beads at 45°).
 fn seg_dist(px: f32, py: f32, ax: f32, ay: f32, bx: f32, by: f32) -> f32 {
     let (dx, dy) = (bx - ax, by - ay);
     let len2 = dx * dx + dy * dy;
@@ -1038,64 +869,46 @@ fn seg_dist(px: f32, py: f32, ax: f32, ay: f32, bx: f32, by: f32) -> f32 {
 }
 
 /// Powerline separators U+E0B0–E0BF, full-bleed so they tile with the adjacent
-/// segment's background: E0B0/E0B2 solid right/left triangles, E0B1/E0B3 their chevron
-/// outlines, E0B4/E0B6 solid rounded (half-ellipse) caps, E0B5/E0B7 their outlines,
-/// E0B8–E0BF the corner triangles and their hypotenuse outlines. All are supersampled;
-/// outline thickness is perpendicular to the edge ([`seg_dist`] or radial). The caller
-/// hardens the cell-edge texels.
 fn draw_powerline(c: &mut Canvas, cp: u32) {
     let (w, h) = (c.w, c.h);
     let (wf, hf) = (w as f32, h as f32);
     let mid = hf / 2.0;
-    // Stroke thickness for the outline variants — the box "light" rule,
-    // floored like the diagonals so tiny cells keep a connected line.
     let t = (((w.min(h) + 4) / 8) as f32).max(1.0);
     let half = (t / 2.0).max(0.6);
 
-    // Corner ("angled") triangles E0B8–E0BF: the cell is split corner-to-corner
-    // by a diagonal and one side is filled (odd code points draw the hypotenuse
-    // as a centred perpendicular stroke — the same geometry as U+2571/2572).
     if (0xE0B8..=0xE0BF).contains(&cp) {
         let norm = (wf * wf + hf * hf).sqrt();
-        // Signed distances: `dmain` to the main diagonal (0,0)->(w,h), positive
-        // below it; `danti` to the anti-diagonal (0,h)->(w,0), positive below.
         c.paint_aa(|px, py| {
             let dmain = (wf * py - hf * px) / norm;
             let danti = (hf * px + wf * py - wf * hf) / norm;
             match cp {
-                0xE0B8 => dmain >= 0.0,        // lower-left solid
-                0xE0B9 => dmain.abs() <= half, // lower-left outline (╲ stroke)
-                0xE0BA => danti >= 0.0,        // lower-right solid
-                0xE0BB => danti.abs() <= half, // lower-right outline (╱ stroke)
-                0xE0BC => danti <= 0.0,        // upper-left solid
-                0xE0BD => danti.abs() <= half, // upper-left outline (╱ stroke)
-                0xE0BE => dmain <= 0.0,        // upper-right solid
-                _ => dmain.abs() <= half,      // E0BF upper-right outline (╲)
+                0xE0B8 => dmain >= 0.0,
+                0xE0B9 => dmain.abs() <= half,
+                0xE0BA => danti >= 0.0,
+                0xE0BB => danti.abs() <= half,
+                0xE0BC => danti <= 0.0,
+                0xE0BD => danti.abs() <= half,
+                0xE0BE => dmain <= 0.0,
+                _ => dmain.abs() <= half,
             }
         });
         return;
     }
-    let right = matches!(cp, 0xE0B0 | 0xE0B1 | 0xE0B4 | 0xE0B5); // apex right
+    let right = matches!(cp, 0xE0B0 | 0xE0B1 | 0xE0B4 | 0xE0B5);
     let rounded = matches!(cp, 0xE0B4..=0xE0B7);
     let outline = matches!(cp, 0xE0B1 | 0xE0B3 | 0xE0B5 | 0xE0B7);
-    // Right-pointing layout: flat side at x=0, apex at (w, mid). The
-    // left-pointing twin is the exact mirror (px -> w - px), which keeps the
-    // E0B0/E0B2 mirror-image law bit-exact under the symmetric subsample grid.
     c.paint_aa(|px, py| {
         let px = if right { px } else { wf - px };
         if rounded {
-            // Half-ellipse cap: radii (w, mid), centred at (0, mid).
             let (nx, ny) = (px / wf, (py - mid) / mid);
             let e = (nx * nx + ny * ny).sqrt();
             if outline {
-                // Radial distance scaled by the smaller radius — the
                 // perpendicular stroke width bound, as in `ellipse`.
                 ((e - 1.0) * wf.min(mid)).abs() <= half
             } else {
                 e <= 1.0
             }
         } else if outline {
-            // Chevron `>`: stroke the two hypotenuse segments
             // (0,0)->(w,mid) and (w,mid)->(0,h) at perpendicular width t.
             seg_dist(px, py, 0.0, 0.0, wf, mid).min(seg_dist(px, py, wf, mid, 0.0, hf)) <= half
         } else {
@@ -1106,18 +919,13 @@ fn draw_powerline(c: &mut Canvas, cp: u32) {
 }
 
 /// Block sextants U+1FB00–1FB3B: a 2×3 grid of filled sub-cells. The 60 code points map
-/// to the 6-bit masks 1..=62 except 21 (left column) and 42 (right column), which, like 0
-/// (space) and 63 (full block), have their own characters. Bits: 1=upper-left
-/// 2=upper-right 4=mid-left 8=mid-right 16=lower-left 32=lower-right. Hard 0/255, so
-/// adjacent sextants seam exactly.
 fn draw_sextant(c: &mut Canvas, cp: u32) {
     let k = cp - 0x1FB00;
-    // The k-th mask in 1..=62 skipping the two whole-column masks.
     let mask = k + 1 + u32::from(k >= 20) + u32::from(k >= 40);
     let (w, h) = (c.w, c.h);
-    let xm = eighth(4, w); // shared half-column boundary (matches ▌/▐)
-    let y1 = (h + 1) / 3; // upper/middle split (round)
-    let y2 = (2 * h + 1) / 3; // middle/lower split (round)
+    let xm = eighth(4, w);
+    let y1 = (h + 1) / 3;
+    let y2 = (2 * h + 1) / 3;
     if mask & 1 != 0 {
         c.rect(0, 0, xm, y1);
     }
@@ -1139,13 +947,6 @@ fn draw_sextant(c: &mut Canvas, cp: u32) {
 }
 
 /// Unicode 16 block octants U+1CD00–1CDE5, indexed by `cp - 0x1CD00`: the
-/// 2×4 fill mask of each, bit `n - 1` for octant `n` (1 upper-left, 2
-/// upper-right, 3/4 the second row, 5/6 the third, 7/8 the bottom row).
-/// Generated from the Unicode character names (`BLOCK OCTANT-<digits>`).
-/// Unicode encodes only 230 of the 256 patterns here: the other 26 already
-/// exist (space, █, the half blocks and quadrants, ▂ ▆ and the upper
-/// quarter/three-quarter blocks, the four corner single-octant blocks in
-/// U+1CEA0–1CEAF, and the middle-quarter blocks U+1FBE6–1FBE7).
 const OCTANT_MASKS: [u8; 230] = [
     0x04, 0x06, 0x07, 0x08, 0x09, 0x0B, 0x0C, 0x0D, 0x0E, 0x10, 0x11, 0x12, 0x13, 0x15, 0x16, 0x17,
     0x18, 0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E, 0x1F, 0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27,
@@ -1165,10 +966,6 @@ const OCTANT_MASKS: [u8; 230] = [
 ];
 
 /// Draw one octant mask. The column split is `eighth(4, w)`, the sextants'
-/// and ▌'s; the row splits are `eighth(2|4|6, h)`, the upper quarter /
-/// half / three-quarter blocks' (U+1FB82, ▀, U+1FB85). The eight sub-rects
-/// tile the cell with no gap and no overlap, so octants are hard 0/255 and
-/// seam with each other and with those blocks exactly.
 fn draw_octant(c: &mut Canvas, mask: u8) {
     let (w, h) = (c.w, c.h);
     let xs = [0, eighth(4, w), w];
@@ -1182,34 +979,18 @@ fn draw_octant(c: &mut Canvas, mask: u8) {
 }
 
 /// Block diagonal wedges + triangular blocks U+1FB3C–1FB6F (Symbols for
-/// Legacy Computing), supersampled.
-///
-/// U+1FB3C–1FB67 ("<CORNER> BLOCK DIAGONAL <P1> TO <P2>") fill the side of
-/// the `P1 -> P2` diagonal that contains the named corner. The endpoints lie
-/// on the cell-edge sixth lattice: x ∈ {0, w/2, w}, y ∈ {0, h/3, 2h/3, h} —
-/// stored as sixths `(x·6/w, y·6/h)`. Complementary pairs (the same diagonal
-/// with opposite corners, e.g. U+1FB3C/U+1FB52) tile the cell with no gap:
-/// both predicates are closed half-planes, so every subsample is claimed by
-/// at least one of the pair.
-///
-/// U+1FB68–1FB6F are the quarter/three-quarter triangles cut by BOTH cell
-/// diagonals: 6C/6D/6E/6F the left/upper/right/lower quarter, 68/69/6A/6B
-/// everything BUT the (strict) left/upper/right/lower quarter.
 fn draw_wedge(c: &mut Canvas, cp: u32) {
     let (wf, hf) = (c.w as f32, c.h as f32);
-    // Quarter triangles: sign vs the main diagonal (s1 > 0 below (0,0)->(w,h))
-    // and the anti-diagonal (s2 > 0 below (0,h)->(w,0)).
     if cp >= 0x1FB68 {
         let quarter = |px: f32, py: f32, strict: bool| -> [bool; 4] {
             let s1 = py * wf - px * hf;
             let s2 = py * wf + px * hf - wf * hf;
             if strict {
-                // Open quarters, for the three-quarter complements.
                 [
-                    s1 > 0.0 && s2 < 0.0, // left
-                    s1 < 0.0 && s2 < 0.0, // upper
-                    s1 < 0.0 && s2 > 0.0, // right
-                    s1 > 0.0 && s2 > 0.0, // lower
+                    s1 > 0.0 && s2 < 0.0,
+                    s1 < 0.0 && s2 < 0.0,
+                    s1 < 0.0 && s2 > 0.0,
+                    s1 > 0.0 && s2 > 0.0,
                 ]
             } else {
                 [
@@ -1221,129 +1002,117 @@ fn draw_wedge(c: &mut Canvas, cp: u32) {
             }
         };
         c.paint_aa(|px, py| match cp {
-            0x1FB68 => !quarter(px, py, true)[0], // all but left
-            0x1FB69 => !quarter(px, py, true)[1], // all but upper
-            0x1FB6A => !quarter(px, py, true)[2], // all but right
-            0x1FB6B => !quarter(px, py, true)[3], // all but lower
-            0x1FB6C => quarter(px, py, false)[0], // left quarter
-            0x1FB6D => quarter(px, py, false)[1], // upper quarter
-            0x1FB6E => quarter(px, py, false)[2], // right quarter
-            _ => quarter(px, py, false)[3],       // 1FB6F lower quarter
+            0x1FB68 => !quarter(px, py, true)[0],
+            0x1FB69 => !quarter(px, py, true)[1],
+            0x1FB6A => !quarter(px, py, true)[2],
+            0x1FB6B => !quarter(px, py, true)[3],
+            0x1FB6C => quarter(px, py, false)[0],
+            0x1FB6D => quarter(px, py, false)[1],
+            0x1FB6E => quarter(px, py, false)[2],
+            _ => quarter(px, py, false)[3],
         });
         return;
     }
-    // ((x1, y1), (x2, y2), (cx, cy)) in cell sixths: the diagonal endpoints
-    // and the corner the filled half-plane must contain. Derived one-to-one
-    // from the Unicode 13 names (UL (0,0), UC (3,0), UR (6,0), UML (0,2),
-    // UMR (6,2), LML (0,4), LMR (6,4), LL (0,6), LC (3,6), LR (6,6)).
     type WedgeSixths = ((i32, i32), (i32, i32), (i32, i32));
     #[rustfmt::skip]
     const WEDGES: [WedgeSixths; 44] = [
-        ((0, 4), (3, 6), (0, 6)), // 1FB3C lower left,  LML to LC
-        ((0, 4), (6, 6), (0, 6)), // 1FB3D lower left,  LML to LR
-        ((0, 2), (3, 6), (0, 6)), // 1FB3E lower left,  UML to LC
-        ((0, 2), (6, 6), (0, 6)), // 1FB3F lower left,  UML to LR
-        ((0, 0), (3, 6), (0, 6)), // 1FB40 lower left,  UL  to LC
-        ((0, 2), (3, 0), (6, 6)), // 1FB41 lower right, UML to UC
-        ((0, 2), (6, 0), (6, 6)), // 1FB42 lower right, UML to UR
-        ((0, 4), (3, 0), (6, 6)), // 1FB43 lower right, LML to UC
-        ((0, 4), (6, 0), (6, 6)), // 1FB44 lower right, LML to UR
-        ((0, 6), (3, 0), (6, 6)), // 1FB45 lower right, LL  to UC
-        ((0, 4), (6, 2), (6, 6)), // 1FB46 lower right, LML to UMR
-        ((3, 6), (6, 4), (6, 6)), // 1FB47 lower right, LC  to LMR
-        ((0, 6), (6, 4), (6, 6)), // 1FB48 lower right, LL  to LMR
-        ((3, 6), (6, 2), (6, 6)), // 1FB49 lower right, LC  to UMR
-        ((0, 6), (6, 2), (6, 6)), // 1FB4A lower right, LL  to UMR
-        ((3, 6), (6, 0), (6, 6)), // 1FB4B lower right, LC  to UR
-        ((3, 0), (6, 2), (0, 6)), // 1FB4C lower left,  UC  to UMR
-        ((0, 0), (6, 2), (0, 6)), // 1FB4D lower left,  UL  to UMR
-        ((3, 0), (6, 4), (0, 6)), // 1FB4E lower left,  UC  to LMR
-        ((0, 0), (6, 4), (0, 6)), // 1FB4F lower left,  UL  to LMR
-        ((3, 0), (6, 6), (0, 6)), // 1FB50 lower left,  UC  to LR
-        ((0, 2), (6, 4), (0, 6)), // 1FB51 lower left,  UML to LMR
-        ((0, 4), (3, 6), (6, 0)), // 1FB52 upper right, LML to LC
-        ((0, 4), (6, 6), (6, 0)), // 1FB53 upper right, LML to LR
-        ((0, 2), (3, 6), (6, 0)), // 1FB54 upper right, UML to LC
-        ((0, 2), (6, 6), (6, 0)), // 1FB55 upper right, UML to LR
-        ((0, 0), (3, 6), (6, 0)), // 1FB56 upper right, UL  to LC
-        ((0, 2), (3, 0), (0, 0)), // 1FB57 upper left,  UML to UC
-        ((0, 2), (6, 0), (0, 0)), // 1FB58 upper left,  UML to UR
-        ((0, 4), (3, 0), (0, 0)), // 1FB59 upper left,  LML to UC
-        ((0, 4), (6, 0), (0, 0)), // 1FB5A upper left,  LML to UR
-        ((0, 6), (3, 0), (0, 0)), // 1FB5B upper left,  LL  to UC
-        ((0, 4), (6, 2), (0, 0)), // 1FB5C upper left,  LML to UMR
-        ((3, 6), (6, 4), (0, 0)), // 1FB5D upper left,  LC  to LMR
-        ((0, 6), (6, 4), (0, 0)), // 1FB5E upper left,  LL  to LMR
-        ((3, 6), (6, 2), (0, 0)), // 1FB5F upper left,  LC  to UMR
-        ((0, 6), (6, 2), (0, 0)), // 1FB60 upper left,  LL  to UMR
-        ((3, 6), (6, 0), (0, 0)), // 1FB61 upper left,  LC  to UR
-        ((3, 0), (6, 2), (6, 0)), // 1FB62 upper right, UC  to UMR
-        ((0, 0), (6, 2), (6, 0)), // 1FB63 upper right, UL  to UMR
-        ((3, 0), (6, 4), (6, 0)), // 1FB64 upper right, UC  to LMR
-        ((0, 0), (6, 4), (6, 0)), // 1FB65 upper right, UL  to LMR
-        ((3, 0), (6, 6), (6, 0)), // 1FB66 upper right, UC  to LR
-        ((0, 2), (6, 4), (6, 0)), // 1FB67 upper right, UML to LMR
+        ((0, 4), (3, 6), (0, 6)),
+        ((0, 4), (6, 6), (0, 6)),
+        ((0, 2), (3, 6), (0, 6)),
+        ((0, 2), (6, 6), (0, 6)),
+        ((0, 0), (3, 6), (0, 6)),
+        ((0, 2), (3, 0), (6, 6)),
+        ((0, 2), (6, 0), (6, 6)),
+        ((0, 4), (3, 0), (6, 6)),
+        ((0, 4), (6, 0), (6, 6)),
+        ((0, 6), (3, 0), (6, 6)),
+        ((0, 4), (6, 2), (6, 6)),
+        ((3, 6), (6, 4), (6, 6)),
+        ((0, 6), (6, 4), (6, 6)),
+        ((3, 6), (6, 2), (6, 6)),
+        ((0, 6), (6, 2), (6, 6)),
+        ((3, 6), (6, 0), (6, 6)),
+        ((3, 0), (6, 2), (0, 6)),
+        ((0, 0), (6, 2), (0, 6)),
+        ((3, 0), (6, 4), (0, 6)),
+        ((0, 0), (6, 4), (0, 6)),
+        ((3, 0), (6, 6), (0, 6)),
+        ((0, 2), (6, 4), (0, 6)),
+        ((0, 4), (3, 6), (6, 0)),
+        ((0, 4), (6, 6), (6, 0)),
+        ((0, 2), (3, 6), (6, 0)),
+        ((0, 2), (6, 6), (6, 0)),
+        ((0, 0), (3, 6), (6, 0)),
+        ((0, 2), (3, 0), (0, 0)),
+        ((0, 2), (6, 0), (0, 0)),
+        ((0, 4), (3, 0), (0, 0)),
+        ((0, 4), (6, 0), (0, 0)),
+        ((0, 6), (3, 0), (0, 0)),
+        ((0, 4), (6, 2), (0, 0)),
+        ((3, 6), (6, 4), (0, 0)),
+        ((0, 6), (6, 4), (0, 0)),
+        ((3, 6), (6, 2), (0, 0)),
+        ((0, 6), (6, 2), (0, 0)),
+        ((3, 6), (6, 0), (0, 0)),
+        ((3, 0), (6, 2), (6, 0)),
+        ((0, 0), (6, 2), (6, 0)),
+        ((3, 0), (6, 4), (6, 0)),
+        ((0, 0), (6, 4), (6, 0)),
+        ((3, 0), (6, 6), (6, 0)),
+        ((0, 2), (6, 4), (6, 0)),
     ];
     let ((x1, y1), (x2, y2), (cx, cy)) = WEDGES[(cp - 0x1FB3C) as usize];
     let sx = |n: i32| n as f32 * wf / 6.0;
     let sy = |n: i32| n as f32 * hf / 6.0;
     let (ax, ay, bx, by) = (sx(x1), sy(y1), sx(x2), sy(y2));
-    // Cross product side test; the corner fixes the filled (closed) half-plane.
     let side = move |px: f32, py: f32| (bx - ax) * (py - ay) - (by - ay) * (px - ax);
     let corner = side(sx(cx), sy(cy));
     c.paint_aa(|px, py| side(px, py) * corner >= 0.0);
 }
 
 /// Legacy eighth blocks U+1FB70–1FB8B (Symbols for Legacy Computing): hard 0/255 fills
-/// on the same `eighth` rule as U+2580–259F, so they seam with the classic eighth
-/// blocks: one-eighth bars 2..7 (1 and 8 live at U+258F/2595 and U+2594/2581), the
-/// edge pairs, the 1-3-5-8 scanline set, and the upper/right k-eighths fills.
 fn draw_legacy_block(c: &mut Canvas, cp: u32) {
     let (w, h) = (c.w, c.h);
     match cp {
         0x1FB70..=0x1FB75 => {
-            // VERTICAL ONE EIGHTH BLOCK-k: the k-th eighth column band.
             let k = cp - 0x1FB70 + 2;
             c.rect(eighth(k - 1, w), 0, eighth(k, w), h);
         }
         0x1FB76..=0x1FB7B => {
-            // HORIZONTAL ONE EIGHTH BLOCK-k: the k-th eighth row band.
             let k = cp - 0x1FB76 + 2;
             c.rect(0, eighth(k - 1, h), w, eighth(k, h));
         }
         0x1FB7C..=0x1FB7F => {
-            // LEFT/RIGHT + LOWER/UPPER ONE EIGHTH BLOCK: an edge column plus
-            // an edge row.
             let (ew, eh) = (eighth(1, w), eighth(1, h));
             if matches!(cp, 0x1FB7C | 0x1FB7D) {
-                c.rect(0, 0, ew, h); // left eighth
+                // left eighth
+                c.rect(0, 0, ew, h);
             } else {
-                c.rect(w - ew, 0, w, h); // right eighth
+                // right eighth
+                c.rect(w - ew, 0, w, h);
             }
             if matches!(cp, 0x1FB7C | 0x1FB7F) {
-                c.rect(0, h - eh, w, h); // lower eighth
+                // lower eighth
+                c.rect(0, h - eh, w, h);
             } else {
-                c.rect(0, 0, w, eh); // upper eighth
+                // upper eighth
+                c.rect(0, 0, w, eh);
             }
         }
         0x1FB80 => {
-            // UPPER AND LOWER ONE EIGHTH BLOCK.
             c.rect(0, 0, w, eighth(1, h));
             c.rect(0, h - eighth(1, h), w, h);
         }
         0x1FB81 => {
-            // HORIZONTAL ONE EIGHTH BLOCK-1358: scanline rows 1, 3, 5 and 8.
             for k in [1u32, 3, 5, 8] {
                 c.rect(0, eighth(k - 1, h), w, eighth(k, h));
             }
         }
         0x1FB82..=0x1FB86 => {
-            // UPPER k-EIGHTHS BLOCK, k in {2,3,5,6,7} (4 is ▀, 8 is █).
             const K: [u32; 5] = [2, 3, 5, 6, 7];
             c.rect(0, 0, w, eighth(K[(cp - 0x1FB82) as usize], h));
         }
         0x1FB87..=0x1FB8B => {
-            // RIGHT k-EIGHTHS BLOCK, k in {2,3,5,6,7} (4 is ▐, 8 is █).
             const K: [u32; 5] = [2, 3, 5, 6, 7];
             c.rect(w - eighth(K[(cp - 0x1FB87) as usize], w), 0, w, h);
         }
@@ -1352,13 +1121,9 @@ fn draw_legacy_block(c: &mut Canvas, cp: u32) {
 }
 
 /// Braille U+2800–28FF: bit `n` of `cp - 0x2800` lights dot `n+1` in the
-/// standard 2x4 layout (dots 1-3 left column top-down, 4-6 right column,
-/// 7/8 the bottom pair). Each dot is a centred square-ish fill covering about
-/// half of its 2x4 grid compartment.
 fn draw_braille(c: &mut Canvas, cp: u32) {
     let bits = cp - 0x2800;
     let (w, h) = (c.w, c.h);
-    // (column, row) of each dot bit.
     const DOTS: [(usize, usize); 8] = [
         (0, 0),
         (0, 1),
@@ -1369,8 +1134,8 @@ fn draw_braille(c: &mut Canvas, cp: u32) {
         (0, 3),
         (1, 3),
     ];
-    let xb = |i: usize| (i * w).div_ceil(2); // column band boundaries (round half up == div_ceil for /2)
-    let yb = |i: usize| (i * h + 2) / 4; // row band boundaries (round half up)
+    let xb = |i: usize| (i * w).div_ceil(2);
+    let yb = |i: usize| (i * h + 2) / 4;
     for (bit, &(col, row)) in DOTS.iter().enumerate() {
         if bits & (1 << bit) == 0 {
             continue;
@@ -1379,7 +1144,8 @@ fn draw_braille(c: &mut Canvas, cp: u32) {
         let (y0, y1) = (yb(row), yb(row + 1));
         let (bw, bh) = (x1 - x0, y1 - y0);
         if bw == 0 || bh == 0 {
-            continue; // cell too small for this dot's compartment
+            // cell too small for this dot's compartment
+            continue;
         }
         let dw = bw.div_ceil(2);
         let dh = bh.div_ceil(2);
@@ -1394,8 +1160,6 @@ mod tests {
     use super::*;
 
     /// The Singularity darkening mask is a soft radial shadow: full at the centre,
-    /// monotone falloff, centre-symmetric, and empty corners so neighbouring stamps
-    /// fuse without box seams.
     #[test]
     fn ring_arc_is_a_soft_radial_shadow() {
         let (w, h) = (16usize, 18usize);
@@ -1407,9 +1171,6 @@ mod tests {
             at(cx, cy) > at(cx - 4, cy) && at(cx - 4, cy) > at(cx - 6, cy),
             "coverage falls monotonically from the centre outward"
         );
-        // Pixel CENTRES sample the field: x = cx−7 and x = cx+6 sit at the
-        // same 6.5 px distance from the centre (w even ⇒ the ±k columns are
-        // half-a-pixel asymmetric; ±(k, k−1) is the equidistant pair).
         assert_eq!(
             at(cx - 7, cy),
             at(cx + 6, cy),
@@ -1424,7 +1185,6 @@ mod tests {
     }
 
     /// The super nova veil is a full-cell soft square: interior texels saturate and
-    /// the one-texel border ring is a partial, non-zero fringe.
     #[test]
     fn shade_is_a_full_cell_soft_square() {
         let (w, h) = (16usize, 18usize);
@@ -1448,7 +1208,6 @@ mod tests {
     }
 
     /// Cell sizes exercised by the invariants below: odd/even mixes, squat,
-    /// tall, and degenerate-tiny.
     const SIZES: &[(usize, usize)] = &[
         (1, 1),
         (2, 2),
@@ -1472,8 +1231,6 @@ mod tests {
     }
 
     /// Every glyph at every size is cell-sized; orthogonal families are hard 0/255
-    /// throughout, [`antialiased`] ones on their cell-edge texels
-    /// (`tests/procedural_aa_edges.rs` covers the whole size lattice).
     #[test]
     fn every_glyph_is_cell_sized_and_hard_where_required() {
         for &(w, h) in SIZES {
@@ -1495,8 +1252,6 @@ mod tests {
                 }
             }
         }
-        // Non-vacuity: the AA regime is real — a diagonal at a chunky size has
-        // at least one INTERIOR texel that is neither 0 nor 255.
         let cov = coverage('╱', 11, 21).unwrap();
         assert!(
             (1..20).any(|y| (1..10).any(|x| !matches!(cov[y * 11 + x], 0 | 255))),
@@ -1547,7 +1302,6 @@ mod tests {
     }
 
     /// The heavy stroke span exactly contains the light span on both axes —
-    /// the parity property the module's rounding rule promises.
     #[test]
     fn heavy_span_contains_light_span_centred() {
         for &(w, h) in SIZES {
@@ -1568,7 +1322,6 @@ mod tests {
     }
 
     /// ▀/▄ and ▌/▐ cover the whole cell between them (overlap allowed on odd
-    /// extents, gaps never) — the half-block tiling rule.
     #[test]
     fn complementary_halves_leave_no_gap() {
         for &(w, h) in SIZES {
@@ -1588,13 +1341,12 @@ mod tests {
     }
 
     /// Braille dots land in their compartments: dot 1 is top-left, dot 8 is
-    /// bottom-right, and they never bleed across the column midline.
     #[test]
     fn braille_dot_positions() {
         let (w, h): (usize, usize) = (10, 20);
         let mid_x = w.div_ceil(2);
-        let d1 = coverage('\u{2801}', w, h).unwrap(); // dot 1: left column, top row
-        let d8 = coverage('\u{2880}', w, h).unwrap(); // dot 8: right column, bottom row
+        let d1 = coverage('\u{2801}', w, h).unwrap();
+        let d8 = coverage('\u{2880}', w, h).unwrap();
         let lit = |cov: &[u8]| {
             (0..h)
                 .flat_map(|y| (0..w).map(move |x| (x, y)))
@@ -1631,7 +1383,6 @@ mod tests {
     }
 
     /// Sextants are covered, hard 0/255, inked and distinct; U+1FB00 fills only the
-    /// upper-left sub-cell.
     #[test]
     fn sextants_fill_the_2x3_grid() {
         let (w, h) = (12, 24);
@@ -1649,7 +1400,7 @@ mod tests {
             );
         }
         let at = |cov: &[u8], x: usize, y: usize| cov[y * w + x] == 255;
-        let ul = coverage('\u{1FB00}', w, h).unwrap(); // upper-left only
+        let ul = coverage('\u{1FB00}', w, h).unwrap();
         assert!(at(&ul, 0, 0), "U+1FB00 fills upper-left");
         assert!(
             !at(&ul, w - 1, 0) && !at(&ul, 0, h - 1),
@@ -1658,8 +1409,6 @@ mod tests {
     }
 
     /// Octants: all 230 are covered, hard 0/255, distinct, and exactly their
-    /// mask: at every lattice size the eight sub-rects tile the cell with no
-    /// gap or overlap, and each glyph is the union of its mask's sub-rects.
     #[test]
     fn octants_fill_the_2x4_grid_exactly() {
         assert_eq!(OCTANT_MASKS.len(), 0x1CDE5 - 0x1CD00 + 1);
@@ -1670,8 +1419,6 @@ mod tests {
             if w < 2 || h < 4 {
                 continue;
             }
-            // Each single octant, drawn alone, covers a disjoint sub-rect; the
-            // eight together cover every pixel exactly once.
             let mut hits = vec![0u8; w * h];
             for bit in 0..8 {
                 let mut c = Canvas::new(w, h);
@@ -1698,25 +1445,21 @@ mod tests {
                 assert_eq!(cov, want.buf, "U+{:04X} at {w}x{h}", 0x1CD00 + i);
             }
         }
-        // Spot-check the name decoding: U+1CD00 is BLOCK OCTANT-3 (second row,
-        // left) and U+1CDE5 is BLOCK OCTANT-2345678.
         assert_eq!(OCTANT_MASKS[0], 0b0000_0100);
         assert_eq!(OCTANT_MASKS[229], 0b1111_1110);
     }
 
     /// Octants seam with the blocks that share their splits: the octant
-    /// unions Unicode encodes elsewhere draw the very pixels of ▀, ▌, ▘ and
-    /// the upper quarter / three-quarter blocks.
     #[test]
     fn octant_splits_match_the_blocks_they_extend() {
         for &(w, h) in SIZES {
             for (mask, ch) in [
-                (0b0000_1111u8, '\u{2580}'), // 1234 = ▀
-                (0b0101_0101, '\u{258C}'),   // 1357 = ▌
-                (0b0000_0101, '\u{2598}'),   // 13 = ▘
-                (0b0000_0011, '\u{1FB82}'),  // 12 = upper one quarter
-                (0b0011_1111, '\u{1FB85}'),  // 123456 = upper three quarters
-                (0xFF, '\u{2588}'),          // everything = █
+                (0b0000_1111u8, '\u{2580}'),
+                (0b0101_0101, '\u{258C}'),
+                (0b0000_0101, '\u{2598}'),
+                (0b0000_0011, '\u{1FB82}'),
+                (0b0011_1111, '\u{1FB85}'),
+                (0xFF, '\u{2588}'),
             ] {
                 let mut c = Canvas::new(w, h);
                 draw_octant(&mut c, mask);
@@ -1730,10 +1473,6 @@ mod tests {
     }
 
     /// Powerline separators are covered, anti-aliased with hard cell edges,
-    /// and shaped: a SOLID right triangle (E0B0) is widest at the vertical
-    /// middle and empty at the edges, fills the apex column at mid-height, and
-    /// is the EXACT byte mirror of the solid left triangle (E0B2). Outlines
-    /// (E0B1) carry far less ink than the solid fill.
     #[test]
     fn powerline_separators_are_shaped() {
         let (w, h) = (12, 24);
@@ -1746,25 +1485,21 @@ mod tests {
             assert!(cov.contains(&255), "U+{cp:04X} draws ink");
         }
         let at = |cov: &[u8], x: usize, y: usize| cov[y * w + x] == 255;
-        // Corner triangles fill the named corner and leave the opposite empty.
-        let ll = coverage('\u{E0B8}', w, h).unwrap(); // lower-left
+        let ll = coverage('\u{E0B8}', w, h).unwrap();
         assert!(
             at(&ll, 0, h - 1) && !at(&ll, w - 1, 0),
             "E0B8 fills lower-left"
         );
-        let ur = coverage('\u{E0BE}', w, h).unwrap(); // upper-right
+        let ur = coverage('\u{E0BE}', w, h).unwrap();
         assert!(
             at(&ur, w - 1, 0) && !at(&ur, 0, h - 1),
             "E0BE fills upper-right"
         );
         let right = coverage('\u{E0B0}', w, h).unwrap();
         let left = coverage('\u{E0B2}', w, h).unwrap();
-        // Apex column lit at mid-height, empty near the top row.
         assert!(at(&right, w - 1, h / 2), "E0B0 apex at right-middle");
         assert!(!at(&right, w - 1, 0), "E0B0 empty at top-right");
         assert!(at(&left, 0, h / 2), "E0B2 apex at left-middle");
-        // Mirror image: row by row, right(x) == left(w-1-x) — BYTE-exact (the
-        // subsample grid is symmetric, so AA coverage mirrors too).
         for y in 0..h {
             for x in 0..w {
                 assert_eq!(
@@ -1774,7 +1509,6 @@ mod tests {
                 );
             }
         }
-        // The outline carries strictly less ink than the solid fill.
         let ink = |cov: &[u8]| cov.iter().map(|&b| usize::from(b)).sum::<usize>();
         assert!(
             ink(&coverage('\u{E0B1}', w, h).unwrap()) < ink(&right),
@@ -1783,17 +1517,13 @@ mod tests {
     }
 
     /// The chevron outline's stroke width is perpendicular, not horizontal: on squat
-    /// cells every interior row carries a full stroke of ink and consecutive rows
-    /// overlap (no beading).
     #[test]
     fn chevron_outline_width_is_perpendicular_not_horizontal() {
         for (w, h) in [(20usize, 8usize), (16, 10), (12, 24), (9, 19)] {
             let t = ((w.min(h) + 4) / 8).max(1);
             for ch in ['\u{E0B1}', '\u{E0B3}'] {
                 let cov = coverage(ch, w, h).unwrap();
-                // slope of the chevron edge in x-per-y: w / (h/2).
                 let slope = w as f32 / (h as f32 / 2.0);
-                // 0.55 leaves headroom for the band clipped at the apex and edges.
                 let want = (t as f32 * (1.0 + slope * slope).sqrt() * 255.0 * 0.55) as usize;
                 let mut prev: Option<(usize, usize)> = None;
                 for y in 1..h - 1 {
@@ -1820,11 +1550,8 @@ mod tests {
     }
 
     /// Each wedge and its complement (same diagonal, opposite corner) sum to full
-    /// coverage (≥ 254: one rounding LSB); also spot-checks orientation and the quarter
-    /// triangles.
     #[test]
     fn wedge_pairs_tile_and_orient() {
-        // (glyph, complement) — same diagonal, opposite corner.
         let pairs: Vec<(u32, u32)> = (0x1FB3C..=0x1FB51).zip(0x1FB52..=0x1FB67).collect();
         for &(w, h) in SIZES {
             for &(a, b) in &pairs {
@@ -1841,22 +1568,18 @@ mod tests {
         }
         let (w, h) = (12, 24);
         let at = |cov: &[u8], x: usize, y: usize| cov[y * w + x] == 255;
-        // 1FB3C: small lower-left triangle — bottom-left lit, top row empty.
         let c3c = coverage('\u{1FB3C}', w, h).unwrap();
         assert!(at(&c3c, 0, h - 1), "1FB3C fills the lower-left corner");
         assert!(
             !at(&c3c, w - 1, 0) && !at(&c3c, w - 1, h - 1),
             "1FB3C stays lower-left"
         );
-        // 1FB6C: left quarter triangle — left-middle lit, right-middle empty.
         let c6c = coverage('\u{1FB6C}', w, h).unwrap();
         assert!(at(&c6c, 0, h / 2), "1FB6C fills the left edge middle");
         assert!(!at(&c6c, w - 1, h / 2), "1FB6C leaves the right edge");
-        // 1FB68 is its complement-ish 3/4 block: right-middle lit, left-middle empty.
         let c68 = coverage('\u{1FB68}', w, h).unwrap();
         assert!(at(&c68, w - 1, h / 2), "1FB68 fills the right edge middle");
         assert!(!at(&c68, 0, h / 2), "1FB68 leaves the left edge middle");
-        // Quarter + three-quarter tile the cell too.
         for i in 0..w * h {
             let sum = usize::from(c6c[i]) + usize::from(c68[i]);
             assert!(sum >= 254, "1FB6C+1FB68 px {i}: gap (sum {sum})");
@@ -1864,7 +1587,6 @@ mod tests {
     }
 
     /// Legacy eighth blocks (U+1FB70–1FB8B) are hard 0/255 on the same `eighth`
-    /// boundaries as U+2580–259F.
     #[test]
     fn legacy_eighth_blocks_are_hard_and_aligned() {
         let (w, h) = (16, 32);

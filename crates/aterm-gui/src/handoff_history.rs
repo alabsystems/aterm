@@ -2,39 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 //! Sidecar scrollback carry across an in-session self-update handoff.
-//!
-//! Screen checkpoints (`seamless::carry_for_wire`) are taken during the freeze and
-//! cap carried history at `seamless::MAX_HANDOFF_HISTORY_LINES` (256 lines). This
-//! module exports each session's older scrollback to a `0600` sidecar in the
-//! per-user control directory and imports it after Commit:
-//!
-//! * **Export (`HistoryExporter`)**: walks each handed session's history (or saved
-//!   primary under the alternate screen) oldest-first in [`CHUNK_LINES`] chunks
-//!   under short terminal locks, guarded by [`HistoryFence`]. On the launched lane,
-//!   the exporter starts alongside the launch, follows new history every
-//!   [`FOLLOW_EVERY`], and pauses before the park freezes anything. On the fork
-//!   lane ([`HistoryPlan::Deferred`]), the worker exports after the capture while
-//!   readers are parked. Held panes (`--hold` or kept failed starts) export after
-//!   handed sessions and yield budget to handed sessions' follow writes via
-//!   `Aggregate::evict_for`.
-//! * **Join ([`join`])**: compares the export's `[first, end)` against the park's
-//!   [`HistoryHead`] and the checkpoint's `[head.end - carried, head.end)`. When
-//!   the fence holds and the ranges meet, links the sidecar to its attempt-bound
-//!   name (`seamless-<pid>-<nonce>.s<id>.hist` or `.h<id>.hist`) and stamps
-//!   `"<len> <sha256hex> <take>"`. Any uncarried lines are counted on
-//!   `history_dropped` / `history_lost`.
-//! * **Import ([`incoming`], [`import`])**: the successor opens and unlinks each
-//!   named sidecar before publishing its adoption proof, reserves row keys via
-//!   `Terminal::reserve_older_history_keys`, and after Commit verifies the sidecar
-//!   length and SHA-256, decodes frames strictly (stripping over-cap OSC 8 links),
-//!   builds an [`OlderHistory`] off-lock, and attaches it in front of the session's
-//!   oldest line unless the scrollback was cleared since adoption.
-//! * **Policy withholding ([`HistoryPlan::Withheld`])**: when the successor's
-//!   handoff policy specifies `carry = "visible"` or `"repaint"`, nothing is
-//!   exported and all history lines are recorded as withheld (`Fallback::Withheld`).
 
-// The seamless handoff is unix-only; the successor-side types still ride the
-// cross-platform `Adopted`, so the module compiles everywhere.
 #![cfg_attr(not(unix), allow(dead_code))]
 
 use std::io::{Read as _, Write as _};
@@ -130,8 +98,7 @@ pub(crate) fn parse_stamp(stamp: &str) -> Option<(u64, [u8; 32], u64)> {
     Some((len, sha, take))
 }
 
-/// Clear hyperlinks from any line in `lines` whose serialized record exceeds the
-/// per-line record cap at `cols` ([`line_caps`]), returning the count of stripped lines.
+/// Clear hyperlinks from any line in `lines` whose serialized record exceeds the per-line record cap at `cols` ([`line_caps`]), returning the count of stripped lines.
 pub(crate) fn strip_over_cap_links(lines: &mut [Line], cols: u16) -> u64 {
     let (_, record_cap) = line_caps(cols);
     let mut stripped = 0;
@@ -152,10 +119,6 @@ struct SidecarLines {
 }
 
 /// Verify and decode `take` lines (after `skip`) from a sidecar or crash-restore
-/// frame stream of exact byte length `len` and optional SHA-256 `sha`.
-///
-/// Frames beyond `skip + take` are hashed without decoding. Lines exceeding the
-/// record cap solely due to OSC 8 hyperlinks are retained with their links cleared.
 fn read_sidecar(
     mut reader: impl std::io::Read,
     len: u64,
@@ -189,7 +152,6 @@ fn read_sidecar(
     let want = usize::try_from(take).map_err(|_| "more lines than this process can hold")?;
     out.try_reserve_exact(want)
         .map_err(|_| "more lines than this process can hold")?;
-    // Lines still to drop before the first one kept.
     let mut skipping = skip;
     let mut frame = Vec::new();
     while read < len {
@@ -228,9 +190,6 @@ fn read_sidecar(
                 .min(decoded.len());
             skipping -= drop as u64;
             let room = want - out.len();
-            // Only the lines kept count: one past `take` is the checkpoint's
-            // to carry, and the screen carry says its own; one skipped is not
-            // carried at all.
             links_dropped += stripped
                 .iter()
                 .filter(|&&at| at >= drop && at - drop < room)
@@ -238,7 +197,6 @@ fn read_sidecar(
             out.extend(decoded.into_iter().skip(drop).take(room));
         }
     }
-    // Nothing may follow the stamped length.
     let mut tail = [0u8; 1];
     if read != len || reader.read(&mut tail).map_err(|_| "unreadable")? != 0 {
         return Err("a length other than its stamp");
@@ -257,7 +215,6 @@ fn read_sidecar(
 }
 
 /// Create `path` afresh, owner-only, never through a symlink, never over
-/// anything already there.
 fn create_private_new(path: &Path) -> std::io::Result<std::fs::File> {
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
@@ -272,7 +229,6 @@ fn create_private_new(path: &Path) -> std::io::Result<std::fs::File> {
 }
 
 /// A file this module wrote and still owns: removed when dropped, unless it
-/// was handed on ([`Self::keep`]).
 struct OwnedFile(Option<PathBuf>);
 
 impl OwnedFile {
@@ -289,11 +245,7 @@ impl Drop for OwnedFile {
     }
 }
 
-// The outgoing side: export, head, join
-
-/// What one finished export fenced: the history `[first, fence.end)`, as
-/// `lines` lines. `first` is above `fence.oldest` only when the history was
-/// deeper than [`MAX_EXPORT_LINES`].
+/// What one finished export fenced: the history `first, fence.end)`, as `lines` lines.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ExportFacts {
     pub(crate) fence: HistoryFence,
@@ -301,8 +253,7 @@ pub(crate) struct ExportFacts {
     pub(crate) lines: u64,
 }
 
-/// One session's finished export: its facts and the sidecar that holds it,
-/// removed when this is dropped unless the join links it on.
+/// One session's finished export: its facts and the sidecar that holds it, removed when this is dropped unless the join links it on.
 pub(crate) struct HistoryExport {
     pub(crate) local_id: u64,
     pub(crate) facts: ExportFacts,
@@ -336,7 +287,6 @@ enum ExportEvent {
     /// Every first pass is complete, including held panes.
     Passed,
     /// The worker finished its last look for pause generation `u64` and holds no
-    /// terminal lock until resumed or stopped.
     Paused(u64),
     Done,
 }
@@ -396,9 +346,6 @@ impl std::fmt::Debug for HistoryExporter {
 }
 
 /// Handed sessions and held panes to export.
-///
-/// Handed sessions run first; held panes use remaining aggregate budget and can be
-/// evicted by handed sessions' follow writes via [`Aggregate::evict_for`].
 #[derive(Default)]
 pub(crate) struct ExportSessions {
     pub(crate) handed: Vec<ExportSession>,
@@ -509,8 +456,6 @@ impl HistoryPlan {
                 withheld: true,
                 ..ExportResults::default()
             },
-            // Paused at the park already; this stops it and collects what it
-            // finished.
             #[cfg(any(target_os = "macos", test))]
             Self::Exported(export) => export.finish(Duration::ZERO),
             Self::Deferred(sessions) => {
@@ -548,12 +493,7 @@ const IMPORTS_HISTORY_FROM_BUILD: u64 = 1_790_526_323;
 const IMPORTS_HELD_HISTORY_FROM_BUILD: u64 = 1_791_501_389;
 
 impl HistoryExporter {
-    /// Start exporting `sessions` into `dir`, on a worker of its own. With
-    /// `follow` (the launched lane, whose readers stay live until the park),
-    /// the worker keeps each session's sidecar current after its first pass,
-    /// every [`FOLLOW_EVERY`], until it is stopped; without (the fork lane,
-    /// which exports under the park), it stops after the first pass. The
-    /// sidecars together stay within [`MAX_AGGREGATE_BYTES`].
+    /// Start exporting `sessions` into `dir`, on a worker of its own.
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -571,7 +511,6 @@ impl HistoryExporter {
     }
 
     /// [`Self::start`] with the sidecars' aggregate bounded by `cap` — the
-    /// tests' way to reach the bound without writing a gigabyte.
     fn start_within(
         dir: PathBuf,
         sessions: ExportSessions,
@@ -587,11 +526,6 @@ impl HistoryExporter {
         let exited = Arc::new(AtomicBool::new(false));
         #[cfg(test)]
         let worker_exited = Arc::clone(&exited);
-        // A name nobody else's attempt can take: `seamless-<pid>-…` so the
-        // start-up sweep retires it if this process dies holding it, and a
-        // fresh token so it never meets an attempt's `<nonce>` prefix.
-        // The sequence number keeps two attempts of this process apart even if
-        // the random source failed and both drew the fallback token.
         static ATTEMPTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let tag = format!(
             "seamless-{}-hist{}x{}",
@@ -603,8 +537,6 @@ impl HistoryExporter {
             "aterm-history-export".to_string(),
             crate::qos::Role::Responsive,
             move || {
-                // It takes each session's terminal lock, which the UI thread
-                // contends: Responsive is the floor for such a holder (`qos`).
                 let stop = Stop {
                     cancel: &worker_cancel,
                     pause: &worker_pause,
@@ -655,7 +587,6 @@ impl HistoryExporter {
     }
 
     /// Take every event until `deadline`, the worker's `Done`, or `waiting`
-    /// says what it waits for has arrived.
     fn drain_while(&mut self, deadline: std::time::Instant, waiting: impl Fn(&Self) -> bool) {
         while !self.done && waiting(self) {
             let left = deadline.saturating_duration_since(std::time::Instant::now());
@@ -718,8 +649,7 @@ impl HistoryExporter {
         self.done
     }
 
-    /// Request a non-blocking pause on the launched lane before freezing sessions,
-    /// returning [`PauseAnswer`].
+    /// Request a non-blocking pause on the launched lane before freezing sessions, returning [`PauseAnswer`].
     #[cfg(any(target_os = "macos", test))]
     pub(crate) fn ask_pause(&mut self, wait: Duration) -> PauseAnswer {
         let asked_at = if let Some(asked_at) = self.pause_asked_at {
@@ -781,8 +711,6 @@ impl HistoryExporter {
         if !self.done {
             self.halt(park_halt_wait());
         }
-        // Without following, each handed session's export was handed over as
-        // its pass finished, every one of them by `CaughtUp`.
         let handed_over = self.done || (self.caught_up && !self.follow);
         let mut results = std::mem::take(&mut self.results);
         results.unfinished = !handed_over;
@@ -797,10 +725,7 @@ impl Drop for HistoryExporter {
     }
 }
 
-/// The launched lane's park gate, for the export: wait while its first pass
-/// is still running and the successor has held its claim for less than
-/// [`EXPORT_PATIENCE`]. Waiting freezes nothing (every reader is live), so it
-/// applies in every mode, an explicit apply's included.
+/// The launched lane's park gate, for the export: wait while its first pass is still running and the successor has held its claim for less than [`EXPORT_PATIENCE`].
 #[cfg(any(target_os = "macos", test))]
 #[must_use]
 pub(crate) fn park_wait(exporting: bool, held_for: Duration) -> Option<&'static str> {
@@ -808,16 +733,11 @@ pub(crate) fn park_wait(exporting: bool, held_for: Duration) -> Option<&'static 
 }
 
 /// A terminal's lock, taken on the export and import workers. A poisoned
-/// lock's data is still the data. It is a [`crate::TermGuard`] hold, so an
-/// import's attach, which moves the screen generation, rings the session's
-/// screen readers as the hold ends.
 fn locked<T>(term: &Mutex<Terminal>, read: impl FnOnce(&mut Terminal) -> T) -> T {
     read(&mut crate::term_lock(term))
 }
 
 /// What the export worker is asked to stop for: `cancel` ends it, a non-zero
-/// `pause` generation parks it after one last look until it is resumed
-/// ([`HistoryExporter::ask_pause`]).
 #[derive(Clone, Copy)]
 struct Stop<'a> {
     cancel: &'a AtomicBool,
@@ -867,7 +787,6 @@ impl Aggregate {
     }
 
     /// Evict the largest held-pane exports from `held` when doing so makes `frame` fit
-    /// for a handed session's follow write.
     fn evict_for(&mut self, frame: u64, held: &mut Vec<OpenExport>) -> bool {
         let over = self.written.saturating_add(frame).saturating_sub(self.cap);
         if over == 0 {
@@ -924,7 +843,6 @@ fn run_export(
         next: 0,
         next_held: 0,
     };
-    // `Gone`: the exporter went away, and the worker's files with its state.
     let _ = worker.run();
 }
 
@@ -968,7 +886,6 @@ impl Worker<'_> {
                 }
                 break;
             }
-            // Interleave single-chunk held-pane passes between handed-session follow ticks.
             let mut due = std::time::Instant::now() + FOLLOW_EVERY;
             while !self.stop.requested() {
                 if self.next < self.sessions.handed.len() || !caught_up {
@@ -1013,7 +930,6 @@ impl Worker<'_> {
     }
 
     /// Run first passes for all remaining handed sessions; if paused mid-pass, drop
-    /// the partial file so it restarts cleanly on resume.
     fn handed_passes(&mut self) -> Result<bool, Gone> {
         let sessions = self.sessions;
         while let Some((local_id, term)) = sessions.handed.get(self.next) {
@@ -1094,10 +1010,6 @@ impl Worker<'_> {
     }
 
     /// One look at what landed past each cursor, `chunks` at most: the handed
-    /// sessions first, each able to take room back from the held panes, then
-    /// the held panes whose first pass is done; then the evicted are told. A
-    /// tick (`interruptible`) stops at once for a stop or a pause; the last
-    /// look does not.
     fn follow_tick(&mut self, chunks: usize, interruptible: bool) -> Result<(), Gone> {
         for export in &mut self.open {
             if interruptible && self.stop.requested() {
@@ -1115,8 +1027,6 @@ impl Worker<'_> {
         if let Some(cursor) = self.open.iter().map(|export| export.facts.fence.end).min() {
             self.sessions.followed.store(cursor, Ordering::Release);
         }
-        // The held panes' exports a handed session's follow evicted: each one
-        // told as not exported, before anything the park waits on.
         for local_id in std::mem::take(&mut self.aggregate.evicted) {
             self.send(ExportEvent::NotExported {
                 local_id,
@@ -1127,7 +1037,6 @@ impl Worker<'_> {
     }
 
     /// Hand every open sidecar over, and tell each held pane whose first pass
-    /// did not finish (or never began) why it has none; then `Done`.
     fn close(mut self) -> Result<(), Gone> {
         let open = std::mem::take(&mut self.open);
         let held = std::mem::take(&mut self.open_held);
@@ -1146,7 +1055,6 @@ impl Worker<'_> {
 }
 
 /// One session's sidecar while it is being written: its fence (whose `end`
-/// is how far it has read), the open file, and the running length and hash.
 struct OpenExport {
     local_id: u64,
     term: Arc<Mutex<Terminal>>,
@@ -1157,26 +1065,17 @@ struct OpenExport {
     len: u64,
     hasher: aterm_digest::Sha256,
     /// Whether ticks still extend it: not once its fence moved, retention
-    /// passed it, or a bound was reached (its lines so far still cross, and
-    /// the join decides whether they still meet the park's).
     following: bool,
     /// A write that failed after the first pass: the file is no longer what
-    /// the hash says, so it cannot be named at all.
     broken: Option<String>,
     /// Lines written with their links dropped ([`strip_over_cap_links`]).
     links_dropped: u64,
     /// While its FIRST PASS runs: the fence the pass reads under, to its
-    /// `end`. `None` once the pass is done. A handed session's pass runs to its
-    /// end at once ([`begin_export`]); a held pane's a chunk at a time between
-    /// the follows ([`Worker::held_step`]), so until then it is no whole
-    /// history: not followed, and not handed over ([`Self::close`]).
     pass: Option<HistoryFence>,
 }
 
 impl OpenExport {
     /// Append the next `lines` of the FIRST PASS as one frame, within the
-    /// sidecar's and the handoff's byte budgets, and charge it to `aggregate`;
-    /// the pass is done once the cursor reaches its fence's end.
     fn pass_append(
         &mut self,
         mut lines: Vec<Line>,
@@ -1235,12 +1134,6 @@ impl OpenExport {
     }
 
     /// One tick of FOLLOWING: take up to `chunks` chunks of the history that
-    /// landed past the cursor, while the fence the first pass was taken on
-    /// still holds. Stops following (and keeps what it has) the moment it
-    /// does not, retention passed the cursor, or a bound was reached. A
-    /// handed session passes the held panes' exports as `held`, which it may
-    /// evict to fit the aggregate ([`Aggregate::evict_for`]); a held pane
-    /// passes `None`.
     fn follow(
         &mut self,
         aggregate: &mut Aggregate,
@@ -1257,9 +1150,6 @@ impl OpenExport {
                 if !fence.holds_at(&now) {
                     return Err(());
                 }
-                // The history past the cursor, under the fence it was
-                // exported on: same epoch, clear and reveal generations,
-                // width.
                 let ahead = HistoryFence {
                     end: now.end,
                     ..fence
@@ -1302,8 +1192,6 @@ impl OpenExport {
     }
 
     /// Write everything buffered through to the file, so a paused export's
-    /// [`Self::close`] has nothing left to do. A failed write breaks it, as
-    /// in [`Self::close`].
     fn flush(&mut self) {
         if self.broken.is_none()
             && let Err(error) = self.writer.flush()
@@ -1313,7 +1201,6 @@ impl OpenExport {
     }
 
     /// Close the sidecar: its event for the exporter. One whose first pass
-    /// had not finished holds no whole history: it is not exported.
     fn close(mut self) -> ExportEvent {
         if self.pass.is_some() {
             return ExportEvent::NotExported {
@@ -1350,8 +1237,6 @@ fn open_export(
     term: &Arc<Mutex<Terminal>>,
     aggregate: &mut Aggregate,
 ) -> Result<Option<OpenExport>, String> {
-    // Read the fence and the first chunk under a single lock so concurrent
-    // retention eviction cannot invalidate `fence.oldest` before the first read.
     let first_read = locked(term, |t| {
         let fence = t.history_fence();
         if fence.detached {
@@ -1407,8 +1292,6 @@ fn open_export(
 }
 
 /// Export one HANDED session's fenced history to `path`: its whole FIRST
-/// PASS, given up the moment the attempt asks the worker to stop (`stalls`:
-/// the tests hold it where it is, [`ExportSessions::stalled`]).
 fn begin_export(
     path: &Path,
     local_id: u64,
@@ -1460,9 +1343,7 @@ pub(crate) fn capture_head(local_id: u64, terminal: &Terminal) -> HistoryHead {
     }
 }
 
-/// Restore the pre-handoff scroll offset `lines` above `bottom_at_adopt` after import,
-/// unless the user has interacted (`gestures_at_adopt`), scrolled, or entered the
-/// alternate screen since adoption.
+/// Restore the pre-handoff scroll offset `lines` above `bottom_at_adopt` after import, unless the user has interacted (`gestures_at_adopt`), scrolled, or entered the alternate screen since adoption.
 pub(crate) fn restore_viewport(
     terminal: &mut Terminal,
     lines: u32,
@@ -1489,8 +1370,7 @@ pub(crate) fn restore_viewport(
     terminal.grid().display_offset() != 0
 }
 
-/// Tracks user/controller input sent to an adopted session via [`OutputEchoTracker::input_sent`],
-/// ignoring terminal focus/DA/DSR replies and avoiding holding the PTY master descriptor.
+/// Tracks user/controller input sent to an adopted session via [`OutputEchoTracker::input_sent`], ignoring terminal focus/DA/DSR replies and avoiding holding the PTY master descriptor.
 pub(crate) struct InputWatch {
     input: Arc<crate::app_input::OutputEchoTracker>,
     at: u64,
@@ -1498,8 +1378,6 @@ pub(crate) struct InputWatch {
 
 impl InputWatch {
     /// Whether any input was sent to the session since the watch was taken:
-    /// a keystroke, a paste, a controller's `send` — never a report or an
-    /// engine reply.
     #[must_use]
     fn moved(&self) -> bool {
         self.input.input_sent() != self.at
@@ -1515,9 +1393,7 @@ impl std::fmt::Debug for InputWatch {
     }
 }
 
-/// How many lines of the history-holding grid `checkpoint` carries: the
-/// active grid's carried history, and none while the alternate screen is up
-/// (the saved primary is carried at its visible rows).
+/// How many lines of the history-holding grid `checkpoint` carries: the active grid's carried history, and none while the alternate screen is up (the saved primary is carried at its visible rows).
 #[must_use]
 pub(crate) fn carried_history(checkpoint: &TerminalCheckpoint) -> u64 {
     if checkpoint.modes.alternate_screen {
@@ -1530,17 +1406,13 @@ pub(crate) fn carried_history(checkpoint: &TerminalCheckpoint) -> u64 {
 /// Why a session's history carry fell back to the checkpoint's bounded one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Fallback {
-    /// Nothing was exported for it (the export was not asked for, had not
-    /// reached it, or refused it — the refusal is logged by the join).
+    /// Nothing was exported for it (the export was not asked for, had not reached it, or refused it — the refusal is logged by the join).
     NotExported,
-    /// The history changed after it was exported: a rewrap, an unscroll, a
-    /// clear, a reset, or a rewrap in flight at the park.
+    /// The history changed after it was exported: a rewrap, an unscroll, a clear, a reset, or a rewrap in flight at the park.
     FenceMoved,
-    /// More output arrived between the export and the park than the
-    /// checkpoint carries, so the two do not meet.
+    /// More output arrived between the export and the park than the checkpoint carries, so the two do not meet.
     Outrun,
-    /// The successor's signed handoff policy carries no scrollback
-    /// ([`HistoryPlan::Withheld`]): nothing was exported, by request.
+    /// The successor's signed handoff policy carries no scrollback ([`HistoryPlan::Withheld`]): nothing was exported, by request.
     Withheld,
 }
 
@@ -1562,23 +1434,13 @@ impl Fallback {
 pub(crate) struct Joined {
     /// The sidecar's first `take` lines cross (0: no sidecar is named).
     pub(crate) take: u64,
-    /// History lines the park saw that the successor will not hold, even if
-    /// every carry arrives intact.
+    /// History lines the park saw that the successor will not hold, even if every carry arrives intact.
     pub(crate) dropped: u64,
     /// Why the sidecar is not used, when it is not.
     pub(crate) fallback: Option<Fallback>,
 }
 
-/// THE JOIN — see the module doc. Pure, so the Tier-1 bind drives exactly
-/// what ships: `export` is what the export fenced (if anything), `head` the
-/// history as the park saw it, `carried` how many of its newest lines the
-/// checkpoint carries.
-///
-/// Carried, the successor holds `[first, head.end)`: the sidecar's `take`
-/// lines up to where the checkpoint's begin, then the checkpoint's. Dropped
-/// are the park's lines older than `first` (a history deeper than
-/// [`MAX_EXPORT_LINES`]). Not carried, it holds the checkpoint's lines alone
-/// and every other line the park saw is dropped.
+/// THE JOIN — see the module doc.
 #[must_use]
 #[cfg_attr(
     any(test, debug_assertions),
@@ -1599,7 +1461,6 @@ pub(crate) fn join(export: Option<ExportFacts>, head: HistoryFence, carried: u64
         return if head.lines() > carried {
             fallback(Fallback::NotExported)
         } else {
-            // Everything the park saw is in the checkpoint: nothing to join.
             Joined {
                 take: 0,
                 dropped: 0,
@@ -1610,8 +1471,6 @@ pub(crate) fn join(export: Option<ExportFacts>, head: HistoryFence, carried: u64
     if !export.fence.holds_at(&head) {
         return fallback(Fallback::FenceMoved);
     }
-    // Where the checkpoint's lines begin. The export covers `[first, end)`;
-    // the two meet only when the checkpoint reaches back to the export's end.
     let carried_from = head.end - carried;
     if carried_from > export.fence.end {
         return fallback(Fallback::Outrun);
@@ -1625,10 +1484,7 @@ pub(crate) fn join(export: Option<ExportFacts>, head: HistoryFence, carried: u64
     }
 }
 
-/// Stamp every record of `manifest` with its session's history carry (and
-/// what does not cross), linking each used sidecar to its attempt-bound name
-/// `<dir>/seamless-<pid>-<nonce>.s<id>.hist`. Sidecars not used are removed
-/// when `results` drops. Returns each session's verdict, for the log.
+/// Stamp every record of `manifest` with its session's history carry (and what does not cross), linking each used sidecar to its attempt-bound name `<dir>/seamless-<pid>-<nonce>.s<id>.hist`.
 pub(crate) fn stamp_manifest(
     manifest: &mut crate::session_store::SessionHandoff,
     screens: &[(u64, TerminalCheckpoint)],
@@ -1655,8 +1511,6 @@ pub(crate) fn stamp_manifest(
             head.fence,
             carried_history(checkpoint),
         );
-        // A withheld plan exported nothing, so every session it left lines
-        // behind for is "not exported" — at the policy's request, and said so.
         if results.withheld && joined.fallback == Some(Fallback::NotExported) {
             joined.fallback = Some(Fallback::Withheld);
         }
@@ -1668,8 +1522,6 @@ pub(crate) fn stamp_manifest(
                 std::process::id(),
                 record.local_id
             ));
-            // A hard link is the O_EXCL of a rename: it never replaces what
-            // is already at the name.
             let links_dropped = export.links_dropped;
             let source = export.file.keep();
             match std::fs::hard_link(&source, &named) {
@@ -1715,8 +1567,7 @@ pub(crate) fn stamp_manifest(
 }
 
 impl ExportResults {
-    /// Partition held-pane exports out of `self` before [`stamp_manifest`] runs,
-    /// recording why any unexported held pane has no sidecar.
+    /// Partition held-pane exports out of `self` before [`stamp_manifest`] runs, recording why any unexported held pane has no sidecar.
     pub(crate) fn take_held(&mut self, held: &[u64], older_successor: bool) -> HeldExports {
         let (exports, kept) = std::mem::take(&mut self.exports)
             .into_iter()
@@ -1832,8 +1683,7 @@ pub(crate) fn name_held_sidecar(
     named
 }
 
-/// Say what the join decided: one line for the sessions whose history
-/// crosses whole, one WARN per session that falls back, with its count.
+/// Say what the join decided: one line for the sessions whose history crosses whole, one WARN per session that falls back, with its count.
 pub(crate) fn log_verdicts(verdicts: &[(u64, Joined)]) {
     let carried: Vec<String> = verdicts
         .iter()
@@ -1847,8 +1697,6 @@ pub(crate) fn log_verdicts(verdicts: &[(u64, Joined)]) {
             carried.join(" ")
         );
     }
-    // The policy's withholding is one decision, said once: which tabs, and how
-    // many lines stay behind in each.
     let withheld: Vec<String> = verdicts
         .iter()
         .filter(|(_, joined)| joined.fallback == Some(Fallback::Withheld) && joined.dropped > 0)
@@ -1882,10 +1730,7 @@ pub(crate) fn log_verdicts(verdicts: &[(u64, Joined)]) {
     }
 }
 
-// The incoming side: take before the proof, import after Commit
-
-/// One session's carried history, read only after Commit (an update) or after the
-/// recovery's restore drain (a crash restore): where its lines come from, and how many.
+/// One session's carried history, read only after Commit (an update) or after the recovery's restore drain (a crash restore): where its lines come from, and how many.
 pub(crate) struct HistoryCarry {
     source: CarrySource,
     take: u64,
@@ -1900,7 +1745,6 @@ enum CarrySource {
         sha: [u8; 32],
     },
     /// Crash-restore history ring chunks (`crash_restore`), decompressed on demand via
-    /// [`JournalFrames`] after `skip` leading lines.
     #[cfg(unix)]
     Journal {
         chunks: Vec<aterm_restore::HistoryChunk>,
@@ -1924,8 +1768,7 @@ impl std::fmt::Debug for HistoryCarry {
 }
 
 impl HistoryCarry {
-    /// A crash restore's carry: `take` lines of the history ring's `chunks` (wrapped at
-    /// `cols`) after the first `skip` ([`CarrySource::Journal`]).
+    /// A crash restore's carry: `take` lines of the history ring's `chunks` (wrapped at `cols`) after the first `skip` ([`CarrySource::Journal`]).
     #[cfg(unix)]
     pub(crate) fn journal(
         chunks: Vec<aterm_restore::HistoryChunk>,
@@ -1962,12 +1805,6 @@ impl HistoryCarry {
 }
 
 /// A crash restore's history ring chunks as one sidecar's bytes, for [`read_sidecar`]:
-/// the sidecar header at the ring's width, then each chunk's frame decompressed in turn,
-/// one at a time (only the frame being read is held decompressed). The length is known
-/// before anything is decompressed: the header's, plus what each chunk's LZ4 prefix says
-/// within the bound its line count and width allow
-/// (`aterm_restore::HistoryChunk::frame_size`). A frame that does not decompress to
-/// exactly that is a read error, which the decoder reports as a truncated frame.
 #[cfg(unix)]
 struct JournalFrames {
     chunks: std::collections::VecDeque<aterm_restore::HistoryChunk>,
@@ -2019,10 +1856,7 @@ impl std::io::Read for JournalFrames {
     }
 }
 
-/// Open the sidecar `stamp` names at its exact `path` inside `dir` — a
-/// regular file, never through a symlink, exactly the stamped length — and
-/// unlink it on every outcome. `remaining` is the handoff's sidecar budget.
-/// `Err` names why; the caller counts the stamp's lines as lost.
+/// Open the sidecar `stamp` names at its exact `path` inside `dir` — a regular file, never through a symlink, exactly the stamped length — and unlink it on every outcome.
 pub(crate) fn take_sidecar(
     path: &Path,
     dir: &Path,
@@ -2042,8 +1876,6 @@ pub(crate) fn take_sidecar(
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt as _;
-            // O_NONBLOCK for the reason `seamless::take_regular_capped` gives:
-            // a FIFO at the path must not block the proof.
             options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
         }
         let file = options
@@ -2113,9 +1945,6 @@ impl AdoptedHistory {
 }
 
 /// Open and unlink `record`'s scrollback sidecar before publishing the adoption proof.
-///
-/// If `screen_degraded` is true or the sidecar cannot be taken, removes `path` and
-/// adds the named lines to `dropped` and `lost`.
 pub(crate) fn incoming(
     record: &crate::session_store::SessionRecord,
     screen_degraded: bool,
@@ -2215,32 +2044,23 @@ pub(crate) fn incoming_held(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ImportReport {
     pub(crate) session: u64,
-    /// Lines placed in front of the session's history (after the grid's own
-    /// retention).
+    /// Lines placed in front of the session's history (after the grid's own retention).
     pub(crate) imported: u64,
-    /// This handoff's lines the outgoing side could not carry (already on
-    /// the session's running count since its registration).
+    /// This handoff's lines the outgoing side could not carry (already on the session's running count since its registration).
     pub(crate) dropped: u64,
-    /// Of `dropped`, the lines a successor's handoff policy asked the
-    /// outgoing side to leave behind ([`AdoptedHistory::withheld`]).
+    /// Of `dropped`, the lines a successor's handoff policy asked the outgoing side to leave behind ([`AdoptedHistory::withheld`]).
     pub(crate) withheld: u64,
-    /// Of `dropped`, the lines a held pane's outgoing process left behind
-    /// by design ([`AdoptedHistory::held`]).
+    /// Of `dropped`, the lines a held pane's outgoing process left behind by design ([`AdoptedHistory::held`]).
     pub(crate) held: u64,
     /// The session is a held pane ([`AdoptedHistory::held_pane`]).
     pub(crate) held_pane: bool,
     /// The named carry's lines, when it failed HERE (not yet counted).
     pub(crate) failed_lines: u64,
-    /// Of `imported`, the lines whose records were over the line-record cap
-    /// because of their OSC 8 links and crossed with those links dropped (a
-    /// producer through v0.97.0 wrote them so; [`read_sidecar`]). Their text
-    /// crossed, so they are not lost lines; the log names them.
+    /// Of `imported`, the lines whose records were over the line-record cap because of their OSC 8 links and crossed with those links dropped (a producer through v0.97.0 wrote them so; [`read_sidecar`]).
     pub(crate) links_dropped: u64,
     /// Why a named carry failed here, when one did.
     pub(crate) failed: Option<String>,
-    /// The pane's scrollback was CLEARED between the adopt and the import
-    /// (an ED3 or a reset the adopted shell sent): the carry was not put back
-    /// and nothing is counted — the user erased what it held.
+    /// The pane's scrollback was CLEARED between the adopt and the import (an ED3 or a reset the adopted shell sent): the carry was not put back and nothing is counted — the user erased what it held.
     pub(crate) cleared: bool,
 }
 
@@ -2251,30 +2071,25 @@ impl ImportReport {
         self.dropped.saturating_add(self.failed_lines)
     }
 
-    /// Of [`Self::lost`], the lines a handoff policy withheld — never more
-    /// than the outgoing side's own count, so a malformed record cannot make
-    /// a failure here read as the policy's.
+    /// Of [`Self::lost`], the lines a handoff policy withheld — never more than the outgoing side's own count, so a malformed record cannot make a failure here read as the policy's.
     #[must_use]
     pub(crate) fn withheld(&self) -> u64 {
         self.withheld.min(self.dropped)
     }
 
-    /// Of [`Self::lost`], the lines a held pane's carry left behind by
-    /// design, bounded the same way.
+    /// Of [`Self::lost`], the lines a held pane's carry left behind by design, bounded the same way.
     #[must_use]
     pub(crate) fn held(&self) -> u64 {
         self.held.min(self.dropped)
     }
 
-    /// Of [`Self::lost`], a HELD pane's lines whose carry failed — on the
-    /// outgoing side or here ([`held_failed`]).
+    /// Of [`Self::lost`], a HELD pane's lines whose carry failed — on the outgoing side or here ([`held_failed`]).
     #[must_use]
     pub(crate) fn held_failed(&self) -> u64 {
         held_failed(self.held_pane, self.lost(), self.withheld(), self.held())
     }
 
-    /// The report for a job whose import never ran (its worker could not
-    /// start): everything it named is lost.
+    /// The report for a job whose import never ran (its worker could not start): everything it named is lost.
     #[must_use]
     pub(crate) fn not_run(job: &ImportJob, why: &str) -> Self {
         Self {
@@ -2295,15 +2110,7 @@ impl ImportReport {
 /// How one import settled when it did not fail.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Imported {
-    /// Placed in front of the history: how many lines the pane's own
-    /// retention kept, and how many of the sidecar's lines crossed with
-    /// their links dropped ([`SidecarLines::links_dropped`]).
-    ///
-    /// `renumbered` is how far the attach itself raised the history grid's
-    /// absolute row counter (a rewrap that made the history longer than the
-    /// adopt reserved, or a reserve that fell short): every key moved up by
-    /// that much, the adopt's bottom ([`AdoptedHistory::bottom_at_adopt`])
-    /// with them, and none of it is output pushed into history.
+    /// Placed in front of the history: how many lines the pane's own retention kept, and how many of the sidecar's lines crossed with their links dropped ([`SidecarLines::links_dropped`]).
     Retained {
         kept: u64,
         links_dropped: u64,
@@ -2314,9 +2121,6 @@ pub(crate) enum Imported {
 }
 
 /// Import `carry` into `term` under `claim`.
-///
-/// Clears hyperlinks on held panes (whose carry is outside the adoption proof)
-/// and returns [`Imported::Cleared`] if the pane's scrollback was cleared since adoption.
 pub(crate) fn import(
     term: &Mutex<Terminal>,
     carry: HistoryCarry,
@@ -2533,9 +2337,6 @@ pub(crate) fn run_imports(jobs: Vec<ImportJob>) -> Vec<ImportReport> {
                     }
                 }
             };
-            // Clamp restored scroll offset to history that crossed (`history_at_adopt + imported`)
-            // so post-adoption output does not pull the viewport off the live bottom when
-            // no history crossed.
             let reachable = history_at_adopt.unwrap_or(0).saturating_add(imported);
             let viewport_from_bottom = viewport_from_bottom
                 .map(|lines| u32::try_from(u64::from(lines).min(reachable)).unwrap_or(lines))
@@ -2569,13 +2370,11 @@ pub(crate) fn run_imports(jobs: Vec<ImportJob>) -> Vec<ImportReport> {
 pub(crate) mod tests;
 
 /// Tier-1 bind for `NativeUpdateHistoryCarry`: every path of the machine on
-/// the real export, park, join, sidecar and import.
 #[cfg(all(test, unix))]
 #[path = "handoff_history_conformance.rs"]
 mod conformance;
 
 /// `NativeUpdateHistoryCarry` actions no shipping function performs, each waived where
-/// its Tier-1 (`conformance::the_real_history_carry_is_the_derived_machine`) binds it.
 #[cfg(all(any(test, debug_assertions), unix))]
 #[aterm_spec_anchor::spec_unmodeled(
     machine = "NativeUpdateHistoryCarry",

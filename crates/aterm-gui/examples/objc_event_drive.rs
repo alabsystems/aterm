@@ -1,67 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
-//! The event driver: every `NSEvent`-taking row of the ported `WinitView`, and the
-//! `NSApplication` `sendEvent:` override, entered with a real `NSEvent` of every
-//! type AppKit can deliver to it.
-//!
-//! It hunts a trampoline sending an accessor the event's type does not answer.
-//! AppKit raises `NSInternalInconsistencyException` ("Invalid message sent to
-//! event") for a key-only accessor such as `-keyCode` on a mouse event, and that
-//! foreign exception cannot unwind through a Rust frame.
-//!
-//! # What it drives
-//!
-//! A real `NSWindow` and `WinitView` through winit's public API. For each
-//! event-taking row, one `NSEvent` per type the row can receive, built by AppKit's
-//! factories (`+mouseEventWithType:…`, `+keyEventWithType:…`,
-//! `+enterExitEventWithType:…`, `+otherEventWithType:…`) and, where the type has
-//! one, by CoreGraphics wrapped with `+eventWithCGEvent:` (`CGEventCreateMouseEvent`,
-//! `CGEventCreateScrollWheelEvent2`, `CGEventCreateKeyboardEvent`, and a bare
-//! `CGEventCreate` retyped with `CGEventSetType`). Hardware events are CG-backed and
-//! AppKit's synthesised ones are not, so both shapes are sent, through
-//! `objc_msgSend` as AppKit enters an IMP.
-//!
-//! A last stage sends each kind of event through `-[NSApplication sendEvent:]`
-//! (`app.rs`'s override), the gesture family included: the view has no magnify,
-//! smart-magnify, rotate or pressure rows, so `Gesture` (29), `Magnify` (30) and
-//! `Rotate` (18), retyped bare `CGEvent`s (`docs/measured/nsevent-accessors/`), are
-//! sent only there, and AppKit passes them up the responder chain past the view.
-//!
-//! It asserts survival plus winit's promised relations: `mouseMoved:` inside the
-//! view yields `CursorMoved`, `mouseDown:`/`mouseUp:` `MouseInput`, `scrollWheel:`
-//! `MouseWheel`, `mouseEntered:`/`mouseExited:` `CursorEntered`/`CursorLeft`, and
-//! `keyDown:` `KeyboardInput`.
-//!
-//! # The two controls
-//!
-//! The first stage re-executes this binary as two children, one per half of the
-//! trampoline's policy:
-//!
-//! * **Exception control.** A [`aterm_objc::declare_class!`] class whose `poke:`
-//!   sends `-keyCode` to a `MouseMoved` event must be contained: exit `0`, one
-//!   stderr line naming `poke:` and `NSInternalInconsistencyException`
-//!   (`aterm_objc::exception`'s default sink), and a later send on the same object
-//!   answering.
-//! * **Panic control.** `panicInside` panics in Rust, which `@catch (id)` must not
-//!   swallow: the child must abort, as exit `3` through the signal trap (or a raw
-//!   `SIGABRT`), with `abort_on_unwind`'s message on stderr.
-//!
-//! # Exit contract (read by `aterm_verify::stages::OBJC_DRIVES`)
-//!
-//! | code | meaning |
-//! |---|---|
-//! | 0 | every row survived every event it can receive, the relations held, the exception control was contained and the panic control aborted |
-//! | 1 | a relation failed, an event could not be built, or a control answered the wrong way (the exception control aborted or was not named; the panic control survived) |
-//! | 2 | not run: no event loop, no window, no view, or a control could not be spawned. Never a pass. |
-//! | 3 | the finding: a row aborted on an event it can receive |
-//! | killed by a signal | the same finding, when the trap could not turn it into `3` |
-//!
-//! An uncaught abort makes macOS write a DiagnosticReport and show "quit
-//! unexpectedly", so before driving anything the driver traps the fatal signals: the
-//! handler writes the row being driven (a static buffer the main thread fills before
-//! each send, read with async-signal-safe calls) and `_exit`s with `3`, which the
-//! crash reporter does not see. `verify appkit` reads `3` as a failure, not
-//! could-not-run: for this driver the abort is the finding.
+
+//! Drives every `NSEvent`-taking row of `WinitView` and `NSApplication::sendEvent:` with real events.
+
 #![allow(clippy::disallowed_types, reason = "an example driver, never shipped")]
 
 #[cfg(target_os = "macos")]
@@ -108,13 +49,6 @@ mod macos {
     use super::{ABORTED, FAIL, NOT_RUN, PASS};
 
     /// The fatal-signal trap: turn the abort a row's trampoline performs into
-    /// `exit 3` with the row's name on stdout, instead of a crash dialog.
-    ///
-    /// Everything the handler touches is async-signal-safe: `write(2)`,
-    /// `_exit(2)`, and a static byte buffer the main thread filled before the
-    /// send. The signal is delivered to the faulting thread, which is the main
-    /// thread — the only thread that ever writes the buffer — so there is no
-    /// race to guard.
     mod trap {
         use std::cell::UnsafeCell;
         use std::ffi::{c_int, c_void};
@@ -135,18 +69,17 @@ mod macos {
         const CAP: usize = 192;
 
         struct RowBuf(UnsafeCell<[u8; CAP]>);
-        // SAFETY: written only by the main thread between sends, read only by
-        // a handler running on that same thread.
+        // SAFETY: written only on the main thread between sends and read on the same thread.
         unsafe impl Sync for RowBuf {}
 
         static ROW: RowBuf = RowBuf(UnsafeCell::new([0; CAP]));
         static ROW_LEN: AtomicUsize = AtomicUsize::new(0);
 
-        /// Name the row about to be driven, for the handler to report.
+        /// Records the row label about to be driven for fatal signal reporting.
         pub fn set_row(label: &str) {
             let bytes = label.as_bytes();
             let n = bytes.len().min(CAP);
-            // SAFETY: main thread only, see `RowBuf`.
+            // SAFETY: main thread only; see `RowBuf`.
             unsafe {
                 let buf = &mut *ROW.0.get();
                 buf[..n].copy_from_slice(&bytes[..n]);
@@ -171,8 +104,7 @@ mod macos {
             }
             digits[..k].reverse();
             let n = ROW_LEN.load(Ordering::SeqCst);
-            // SAFETY: the calls are async-signal-safe; the buffer is the
-            // static filled by `set_row` on this thread.
+            // SAFETY: `write` and `_exit` are async-signal-safe and read the static row buffer.
             unsafe {
                 let _ = write(1, HEAD.as_ptr().cast(), HEAD.len());
                 let _ = write(1, digits.as_ptr().cast(), k);
@@ -183,16 +115,12 @@ mod macos {
             }
         }
 
-        /// Name the row that never returned and leave with the abort code. Called
-        /// from the hang watchdog thread, not a signal handler, but with the same raw
-        /// writes, so it works whatever state the stuck main thread is in.
+        /// Reports the hung row and exits with code 134.
         pub fn report_hang_and_exit() -> ! {
             const HEAD: &[u8] =
                 b"\nobjc-event-drive: HUNG (row never returned within the budget) while driving: ";
             let n = ROW_LEN.load(Ordering::SeqCst);
-            // SAFETY: raw writes of static bytes and the row buffer, then
-            // `_exit`; the buffer is only ever written by the main thread,
-            // which is the thread that is stuck.
+            // SAFETY: raw writes of static bytes and the stuck main thread's row buffer before `_exit`.
             unsafe {
                 let _ = write(1, HEAD.as_ptr().cast(), HEAD.len());
                 let _ = write(1, (*ROW.0.get()).as_ptr().cast(), n);
@@ -201,11 +129,10 @@ mod macos {
             }
         }
 
-        /// Install `on_fatal` for every signal an abort or a fault raises.
+        /// Installs `on_fatal` for abort and fault signals.
         pub fn install() {
             for sig in [SIGABRT, SIGSEGV, SIGBUS, SIGILL, SIGTRAP] {
-                // SAFETY: `signal(2)` with a plain C handler; BSD semantics
-                // keep it installed after delivery.
+                // SAFETY: `signal(2)` installs a plain C handler for fatal signals.
                 unsafe {
                     signal(sig, on_fatal as extern "C" fn(c_int) as usize);
                 }
@@ -213,8 +140,7 @@ mod macos {
         }
     }
 
-    /// Set in the environment of the re-executed child that runs a control:
-    /// [`CONTROL_EXCEPTION`] or [`CONTROL_PANIC`].
+    /// Environment variable naming the re-executed control child ([`CONTROL_EXCEPTION`] or [`CONTROL_PANIC`]).
     pub const CONTROL_ENV: &str = "ATERM_OBJC_EVENT_DRIVE_CONTROL";
     /// The exception control: a wrong-type send, which must be contained.
     const CONTROL_EXCEPTION: &str = "exception";
@@ -222,15 +148,12 @@ mod macos {
     const CONTROL_PANIC: &str = "panic";
 
     /// Long enough for macOS to launch its `NSApplication`, hand back a window
-    /// and run every stage; past it the drive reports NOT RUN.
     const BUDGET: Duration = Duration::from_secs(60);
     /// How long the control child may take to abort before it is a hang.
     const CONTROL_WATCHDOG: Duration = Duration::from_secs(20);
     /// `SIGABRT`.
     const SIGABRT: i32 = 6;
 
-    // `NSEventType` (NSEvent.h). The CG types AppKit maps 1:1 share the
-    // numbers, which is why one table serves both factories.
     const LEFT_MOUSE_DOWN: usize = 1;
     const LEFT_MOUSE_UP: usize = 2;
     const RIGHT_MOUSE_DOWN: usize = 3;
@@ -301,21 +224,11 @@ mod macos {
         fn CFRelease(cf: *const c_void);
     }
 
-    // ------------------------------------------------------------- factories
-    //
-    // AppKit's own constructors as typed `objc_msgSend` casts; every result is
-    // autoreleased.
-
-    /// `+[NSEvent mouseEventWithType:location:modifierFlags:timestamp:
-    /// windowNumber:context:eventNumber:clickCount:pressure:]`.
-    ///
+    /// Constructs a mouse `NSEvent` via `+mouseEventWithType:...`.
     /// # Safety
-    /// `kind` must be one of the mouse types the factory accepts (the
-    /// button, moved and dragged families).
+    /// `kind` must be a valid mouse event type accepted by the factory.
     unsafe fn mouse_event(kind: usize, loc: CGPoint, win: isize, clicks: isize) -> Id {
-        // SAFETY: eleven parameters counting the class and `_cmd`, inside
-        // `MsgFn`'s sixteen; the prototype is the header's, `context:` is
-        // documented nil on modern macOS.
+        // SAFETY: eleven-argument `objc_msgSend` matches the `+mouseEventWithType:...` prototype.
         unsafe {
             let f: unsafe extern "C-unwind" fn(
                 Id,
@@ -348,14 +261,11 @@ mod macos {
         }
     }
 
-    /// `+[NSEvent enterExitEventWithType:location:modifierFlags:timestamp:
-    /// windowNumber:context:eventNumber:trackingNumber:userData:]`.
-    ///
+    /// Constructs an enter/exit `NSEvent` via `+enterExitEventWithType:...`.
     /// # Safety
-    /// `kind` must be `MouseEntered`, `MouseExited` or `CursorUpdate`.
+    /// `kind` must be `MouseEntered`, `MouseExited`, or `CursorUpdate`.
     unsafe fn enter_exit_event(kind: usize, loc: CGPoint, win: isize) -> Id {
-        // SAFETY: as `mouse_event`; `userData:` is `void *` and NULL is the
-        // documented "none".
+        // SAFETY: eleven-argument `objc_msgSend` matches the `+enterExitEventWithType:...` prototype.
         unsafe {
             let f: unsafe extern "C-unwind" fn(
                 Id,
@@ -388,16 +298,11 @@ mod macos {
         }
     }
 
-    /// `+[NSEvent keyEventWithType:location:modifierFlags:timestamp:
-    /// windowNumber:context:characters:charactersIgnoringModifiers:isARepeat:
-    /// keyCode:]`.
-    ///
+    /// Constructs a key `NSEvent` via `+keyEventWithType:...`.
     /// # Safety
-    /// `kind` must be `KeyDown`, `KeyUp` or `FlagsChanged`; `chars` a live
-    /// `NSString` (empty for `FlagsChanged`, as AppKit passes).
+    /// `kind` must be `KeyDown`, `KeyUp`, or `FlagsChanged`, and `chars` a live `NSString`.
     unsafe fn key_event(kind: usize, win: isize, chars: Id, flags: usize, code: u16) -> Id {
-        // SAFETY: twelve parameters counting the class and `_cmd`, inside
-        // `MsgFn`'s sixteen — the same cast `objc_ime_drive` makes.
+        // SAFETY: twelve-argument `objc_msgSend` matches the `+keyEventWithType:...` prototype.
         unsafe {
             let f: unsafe extern "C-unwind" fn(
                 Id,
@@ -432,15 +337,11 @@ mod macos {
         }
     }
 
-    /// `+[NSEvent otherEventWithType:location:modifierFlags:timestamp:
-    /// windowNumber:context:subtype:data1:data2:]`.
-    ///
+    /// Constructs a miscellaneous `NSEvent` via `+otherEventWithType:...`.
     /// # Safety
-    /// `kind` must be `AppKitDefined`, `SystemDefined`, `ApplicationDefined`
-    /// or `Periodic`.
+    /// `kind` must be `AppKitDefined`, `SystemDefined`, `ApplicationDefined`, or `Periodic`.
     unsafe fn other_event(kind: usize, win: isize) -> Id {
-        // SAFETY: eleven parameters counting the class and `_cmd`; `subtype:`
-        // is a `short` in the header, hence `i16`.
+        // SAFETY: eleven-argument `objc_msgSend` matches the `+otherEventWithType:...` prototype.
         unsafe {
             let f: unsafe extern "C-unwind" fn(
                 Id,
@@ -471,18 +372,14 @@ mod macos {
         }
     }
 
-    /// `+[NSEvent eventWithCGEvent:]`, then release the `CGEvent` (the
-    /// `NSEvent` holds its own reference). Nil if the factory refuses.
-    ///
+    /// Wraps `cg` with `+[NSEvent eventWithCGEvent:]` and releases `cg`.
     /// # Safety
-    /// `cg` must be a live `CGEventRef` this caller owns.
+    /// `cg` must be a live caller-owned `CGEventRef` or null.
     unsafe fn cg_wrapped(cg: *mut c_void) -> Id {
         if cg.is_null() {
             return Id::NIL;
         }
-        // SAFETY: `+eventWithCGEvent:` is `@@:^{__CGEvent=}`; the result is
-        // autoreleased and retains the CGEvent, so releasing ours is the
-        // documented balance.
+        // SAFETY: `+eventWithCGEvent:` (`@@:^{__CGEvent=}`) retains `cg`, which `CFRelease` balances.
         unsafe {
             let f: unsafe extern "C-unwind" fn(Id, Sel, *mut c_void) -> Id = checked_msg();
             let ev = f(class(c"NSEvent").as_id(), sel!(eventWithCGEvent:), cg);
@@ -491,17 +388,11 @@ mod macos {
         }
     }
 
-    /// A CG-backed mouse event of the given type at the window point `loc`.
-    ///
-    /// CoreGraphics locations are global with a top-left origin; AppKit flips them to
-    /// bottom-left screen coordinates, and for a windowless event `-locationInWindow`
-    /// answers that screen point. With the window pinned to the screen origin
-    /// (`resumed`), window point `(x, y)` is CG point `(x, height - y)`.
-    ///
+    /// Constructs a CG-backed mouse `NSEvent` at window location `loc`.
     /// # Safety
-    /// `kind` must be a CG mouse type.
+    /// `kind` must be a valid CoreGraphics mouse event type.
     unsafe fn cg_mouse(kind: usize, loc: CGPoint, button: u32) -> Id {
-        // SAFETY: the CoreGraphics prototypes above are the headers'.
+        // SAFETY: CoreGraphics extern prototypes match the framework headers.
         unsafe {
             let height = CGDisplayBounds(CGMainDisplayID()).size.height;
             let global = CGPoint {
@@ -517,9 +408,9 @@ mod macos {
         }
     }
 
-    /// A CG-backed scroll-wheel event.
+    /// Constructs a CG-backed scroll-wheel `NSEvent`.
     unsafe fn cg_scroll(units: u32, wheel1: i32, wheel2: i32) -> Id {
-        // SAFETY: as `cg_mouse`.
+        // SAFETY: CoreGraphics extern prototypes match the framework headers.
         unsafe {
             cg_wrapped(CGEventCreateScrollWheelEvent2(
                 std::ptr::null(),
@@ -532,10 +423,9 @@ mod macos {
         }
     }
 
-    /// A CG-backed key event, optionally retyped (`FlagsChanged` has no
-    /// CG constructor of its own; AppKit accepts a keyboard event retyped).
+    /// Constructs a CG-backed key `NSEvent`, optionally retyped.
     unsafe fn cg_key(code: u16, down: bool, retype: Option<usize>) -> Id {
-        // SAFETY: as `cg_mouse`.
+        // SAFETY: CoreGraphics extern prototypes match the framework headers.
         unsafe {
             let cg = CGEventCreateKeyboardEvent(std::ptr::null(), code, down);
             if let Some(kind) = retype {
@@ -545,10 +435,9 @@ mod macos {
         }
     }
 
-    /// A bare `CGEvent` retyped: the gesture family and the CG enter/exit shapes.
-    /// Nil when `+eventWithCGEvent:` refuses the type; the caller says so.
+    /// Constructs a bare `CGEvent` retyped to `kind`.
     unsafe fn cg_typed(kind: usize) -> Id {
-        // SAFETY: as `cg_mouse`.
+        // SAFETY: CoreGraphics extern prototypes match the framework headers.
         unsafe {
             let cg = CGEventCreate(std::ptr::null());
             CGEventSetType(cg, kind as u32);
@@ -556,80 +445,68 @@ mod macos {
         }
     }
 
-    // ----------------------------------------------------------------- sends
-
-    /// `-(void)row:(NSEvent *)event`, entered exactly as AppKit enters it.
-    ///
+    /// Sends `-(void)s:(NSEvent *)arg` to `target`.
     /// # Safety
-    /// `target` must be live and must implement `s` with that prototype.
+    /// `target` must be live and implement `s` with signature `v@:@`.
     unsafe fn send_v_id(target: Id, s: Sel, arg: Id) {
-        // SAFETY: the caller pins the prototype.
+        // SAFETY: caller guarantees `target` implements `s` with `v@:@`.
         unsafe {
             let f: unsafe extern "C-unwind" fn(Id, Sel, Id) = checked_msg();
             f(target, s, arg);
         }
     }
 
-    /// `-(BOOL)row:(NSEvent *)event`.
-    ///
+    /// Sends `-(BOOL)s:(NSEvent *)arg` to `target`.
     /// # Safety
-    /// As `send_v_id`.
+    /// `target` must be live and implement `s` with signature `B@:@`.
     unsafe fn send_b_id(target: Id, s: Sel, arg: Id) -> Bool {
-        // SAFETY: the caller pins the prototype.
+        // SAFETY: caller guarantees `target` implements `s` with `B@:@`.
         unsafe {
             let f: unsafe extern "C-unwind" fn(Id, Sel, Id) -> Bool = checked_msg();
             f(target, s, arg)
         }
     }
 
-    /// `-(id)sel` on a live object.
-    ///
+    /// Sends `-(id)s` to `target`.
     /// # Safety
-    /// As `send_v_id`.
+    /// `target` must be live and implement `s` with signature `@@:`.
     unsafe fn send_id(target: Id, s: Sel) -> Id {
-        // SAFETY: the caller pins the prototype.
+        // SAFETY: caller guarantees `target` implements `s` with `@@:`.
         unsafe {
             let f: unsafe extern "C-unwind" fn(Id, Sel) -> Id = checked_msg();
             f(target, s)
         }
     }
 
-    /// `-(NSInteger)sel` on a live object.
-    ///
+    /// Sends `-(NSInteger)s` to `target`.
     /// # Safety
-    /// As `send_v_id`.
+    /// `target` must be live and implement `s` with signature `q@:`.
     unsafe fn send_isize(target: Id, s: Sel) -> isize {
-        // SAFETY: the caller pins the prototype.
+        // SAFETY: caller guarantees `target` implements `s` with `q@:`.
         unsafe {
             let f: unsafe extern "C-unwind" fn(Id, Sel) -> isize = checked_msg();
             f(target, s)
         }
     }
 
-    /// `-(NSUInteger)type` of an event, for the transcript.
+    /// Reads `-(NSUInteger)type` from `ev`.
     unsafe fn event_type(ev: Id) -> usize {
-        // SAFETY: `-type` is `Q@:` and valid for every event.
+        // SAFETY: `-type` (`Q@:`) is valid on every `NSEvent`.
         unsafe {
             let f: unsafe extern "C-unwind" fn(Id, Sel) -> usize = checked_msg();
             f(ev, sel!(type))
         }
     }
 
-    // --------------------------------------------------------------- control
-
     aterm_objc::declare_class! {
         /// The controls' class: `poke:` sends a key-only accessor to whatever event
-        /// arrived, inside the same `declare_class!` trampoline the view's rows run
-        /// under; `panicInside` panics in Rust there; `alive` is the later send that
-        /// proves the object and runtime survive a containment.
         struct EventDriveControl: NSObject {
             const NAME: &str = "ATermObjcEventDriveControl";
             type Ivars = ();
 
             @sel(poke:)
             fn poke(&self, event: Id) {
-                // SAFETY: `-keyCode` is `S@:`; whether the receiver ACCEPTS it
-                // is the whole question, and AppKit answers by raising.
+                // SAFETY: `-keyCode` has signature `S@:`.
                 let code: u16 = unsafe {
                     let f: unsafe extern "C-unwind" fn(Id, Sel) -> u16 = checked_msg();
                     f(event, sel!(keyCode))
@@ -649,10 +526,7 @@ mod macos {
         }
     }
 
-    /// The child half of the controls, chosen by [`CONTROL_ENV`]'s value. The
-    /// exception control makes the wrong-type send, then a second send on the same
-    /// object, reports both on stdout and exits `0` (the containment line is on
-    /// stderr). The panic control's report is never read: the process must abort first.
+    /// Runs the negative-control child selected by [`CONTROL_ENV`].
     pub fn control_child() -> i32 {
         let mode = std::env::var(CONTROL_ENV).unwrap_or_default();
         trap::install();
@@ -670,19 +544,18 @@ mod macos {
                     trap::set_row(
                         "control: -keyCode on a MouseMoved event inside ATermObjcEventDriveControl poke:",
                     );
-                    // SAFETY: a mouse type into the mouse factory.
                     let ev =
+                        // SAFETY: `MOUSE_MOVED` is a valid mouse event type.
                         unsafe { mouse_event(MOUSE_MOVED, CGPoint { x: 10.0, y: 10.0 }, 0, 0) };
                     if ev.is_null() {
                         eprintln!("control: +[NSEvent mouseEventWithType:…] answered nil");
                         return NOT_RUN;
                     }
-                    // SAFETY: `poke:` is registered `v@:@` by the declaration
-                    // above and `obj` is the live instance.
+                    // SAFETY: `poke:` is registered `v@:@` on the live `obj` instance.
                     unsafe { send_v_id(obj.as_id(), sel!(poke:), ev) };
                     println!("control: SURVIVED the v0.72.0 send");
                     trap::set_row("control: -alive after the containment");
-                    // SAFETY: `alive` is registered `q@:`.
+                    // SAFETY: `alive` is registered `q@:` on `obj`.
                     let later = unsafe { send_isize(obj.as_id(), sel!(alive)) };
                     println!("control: a later send on the same object answered {later}");
                     println!(
@@ -695,7 +568,7 @@ mod macos {
                     trap::set_row(
                         "control: a Rust panic inside ATermObjcEventDriveControl panicInside",
                     );
-                    // SAFETY: `panicInside` is registered `v@:`.
+                    // SAFETY: `panicInside` is registered `v@:` on `obj`.
                     unsafe { aterm_objc::send::send_v(obj.as_id(), sel!(panicInside)) };
                     println!("control: SURVIVED the Rust panic");
                     PASS
@@ -709,7 +582,6 @@ mod macos {
     }
 
     /// What a control child did: its signal, or its exit code with both
-    /// output streams.
     enum ControlOutcome {
         Signalled(i32, String),
         Exited(Option<i32>, String, String),
@@ -731,8 +603,6 @@ mod macos {
             Ok(c) => c,
             Err(e) => return ControlOutcome::CouldNotSpawn(format!("spawn: {e}")),
         };
-        // Drain both pipes on threads so a chatty child (the containment line
-        // carries a call stack) can never block on a full pipe.
         let drain = |stream: Option<std::process::ChildStdout>| {
             std::thread::spawn(move || {
                 let mut text = String::new();
@@ -779,8 +649,6 @@ mod macos {
         }
     }
 
-    // ---------------------------------------------------------------- driver
-
     #[derive(Default)]
     struct Report {
         findings: Vec<String>,
@@ -807,14 +675,14 @@ mod macos {
     struct Driver {
         window: Option<Window>,
         report: Report,
-        /// Every `WindowEvent` winit delivered, by name.
+        /// `WindowEvent` names delivered by winit.
         events: Vec<String>,
         done: bool,
         stage: usize,
         pending: Option<Deferred>,
-        /// Rows actually entered with an event.
+        /// Count of rows driven with an event.
         driven: usize,
-        /// Rows this file could not drive, each with the reason.
+        /// Rows not driven, with reasons.
         not_driven: Vec<String>,
     }
 
@@ -825,11 +693,9 @@ mod macos {
         }
 
         /// The `NSWindow` holding the view, and its number — the number is
-        /// what the factories take so `-[NSEvent window]` resolves.
         fn window_number(&self) -> Option<isize> {
             let view = self.view()?;
-            // SAFETY: `-window` is `@@:` on `NSView`; `-windowNumber` is `q@:`
-            // on `NSWindow`.
+            // SAFETY: `-window` is `@@:` on `NSView` and `-windowNumber` is `q@:` on `NSWindow`.
             let win = unsafe { send_id(view, sel!(window)) };
             if win.is_null() {
                 return None;
@@ -846,7 +712,6 @@ mod macos {
         }
 
         /// Enter one row with one event and log the survival. A nil event means the
-        /// shape could not be built, which is logged as NOT DRIVEN and fails the run.
         fn drive(&mut self, view: Id, row: Sel, row_name: &str, event: Id, shape: &str) {
             if event.is_null() {
                 let why = format!("{row_name} <- {shape}: the event could not be built");
@@ -855,9 +720,7 @@ mod macos {
                 return;
             }
             trap::set_row(&format!("{row_name} <- {shape}"));
-            // SAFETY: every row driven here is registered `v@:@` (audited by
-            // `objc_live_class_audit`) and `event` is a live autoreleased
-            // NSEvent built above.
+            // SAFETY: `row` is registered `v@:@` and `event` is a live `NSEvent`.
             let kind = unsafe { event_type(event) };
             unsafe { send_v_id(view, row, event) };
             self.driven += 1;
@@ -873,7 +736,7 @@ mod macos {
                 return;
             }
             trap::set_row(&format!("{row_name} <- {shape}"));
-            // SAFETY: both rows are registered `B@:@`.
+            // SAFETY: `row` is registered `B@:@` and `event` is a live `NSEvent`.
             let kind = unsafe { event_type(event) };
             let answer = unsafe { send_b_id(view, row, event) };
             self.driven += 1;
@@ -902,13 +765,8 @@ mod macos {
                     return;
                 }
             }
-            // A CG-backed event has no window, so `-locationInWindow` answers screen
-            // coordinates, which `mouse_motion` treats as window ones. Pinning the
-            // window to the screen origin makes the two coincide over the view, so the
-            // CG shape lands in-frame like the factory shape.
             if let Some(view) = self.view() {
-                // SAFETY: `-window` is `@@:` on NSView; `-setFrameOrigin:` is
-                // `v@:{CGPoint=dd}` on NSWindow.
+                // SAFETY: `-window` (`@@:`) and `-setFrameOrigin:` (`v@:{CGPoint=dd}`) match AppKit.
                 unsafe {
                     let win = send_id(view, sel!(window));
                     if !win.is_null() {
@@ -965,8 +823,6 @@ mod macos {
                 check(self);
                 return;
             }
-            // One stage per wait, so a stage's winit events are delivered by
-            // the pump before the next stage's `pending` reads them.
             let stage = self.stage;
             self.stage += 1;
             autoreleasepool(|_| match stage {
@@ -1078,9 +934,6 @@ mod macos {
                     );
                 }
                 ControlOutcome::Exited(Some(code), out, err) if code == ABORTED => {
-                    // The trap turns any fatal signal after `set_row` into 3, a fault in
-                    // class registration or the factory included, so require the trap's
-                    // line to name signal 6 and the control row.
                     let last = out.trim().lines().last().unwrap_or("").to_owned();
                     self.report.expect(
                         "the panic control aborted (SIGABRT) inside the trampoline",
@@ -1124,7 +977,7 @@ mod macos {
             let _ = self.drain();
             let inside = CGPoint { x: 10.0, y: 10.0 };
             let outside = CGPoint { x: -50.0, y: -50.0 };
-            // SAFETY: mouse types into the mouse factories.
+            // SAFETY: mouse event types passed to the mouse event factories.
             let (a, b, c, d) = unsafe {
                 (
                     mouse_event(MOUSE_MOVED, inside, win, 0),
@@ -1164,8 +1017,6 @@ mod macos {
             self.pending = Some(Box::new(|d: &mut Driver| {
                 let got = d.drain();
                 let moved = Driver::count(&got, "CursorMoved");
-                // Two in-frame sends (factory + CG); losing either shape is a
-                // finding, so the count is exact.
                 d.report.expect(
                     "both in-frame mouseMoved: shapes yield CursorMoved",
                     moved == 2,
@@ -1239,14 +1090,13 @@ mod macos {
                 ),
             ];
             for (row, name, kind, button, clicks) in rows {
-                // SAFETY: mouse types into the mouse factories.
                 let (a, b) =
+                    // SAFETY: mouse event types passed to the mouse event factories.
                     unsafe { (mouse_event(kind, p, win, clicks), cg_mouse(kind, p, button)) };
                 self.drive(view, row, name, a, &format!("type {kind}/factory"));
                 self.drive(view, row, name, b, &format!("type {kind}/cg"));
             }
-            // The two BOOL rows that take an event and ignore it.
-            // SAFETY: as above.
+            // SAFETY: mouse and key event types match their factories.
             let (down, key) = unsafe {
                 (
                     mouse_event(LEFT_MOUSE_DOWN, p, win, 1),
@@ -1271,8 +1121,6 @@ mod macos {
                 let got = d.drain();
                 let pressed = Driver::count(&got, "MouseInput(Pressed)");
                 let released = Driver::count(&got, "MouseInput(Released)");
-                // Three down rows x two shapes, three up rows x two shapes:
-                // exact, so a shape that stops reaching its row is a finding.
                 d.report.expect(
                     "the down rows yield MouseInput(Pressed), both shapes",
                     pressed == 6,
@@ -1290,9 +1138,7 @@ mod macos {
             println!("\n=== 4. mouseEntered: / mouseExited: ===");
             let _ = self.drain();
             let p = CGPoint { x: 5.0, y: 5.0 };
-            // SAFETY: enter/exit types into the enter/exit factory; the CG
-            // shape is a retyped bare event, which is what a tracking event
-            // AppKit synthesises from hardware looks like underneath.
+            // SAFETY: enter/exit event types match their factories.
             let (a, b, c, d) = unsafe {
                 (
                     enter_exit_event(MOUSE_ENTERED, p, win),
@@ -1343,8 +1189,7 @@ mod macos {
         fn stage_scroll(&mut self, view: Id) {
             println!("\n=== 5. scrollWheel: — pixel and line units ===");
             let _ = self.drain();
-            // SAFETY: the CG scroll constructor; there is no AppKit factory
-            // for scroll events, so the CG shape is the only real one.
+            // SAFETY: CG scroll constructor arguments are valid.
             let (a, b) = unsafe {
                 (
                     cg_scroll(CG_SCROLL_UNIT_PIXEL, 3, 4),
@@ -1388,7 +1233,7 @@ mod macos {
                     .fail("could not build an empty NSString".to_owned());
                 return;
             };
-            // SAFETY: key types into the key factories.
+            // SAFETY: key event types match their factories.
             let (kd, ku, fc, cg_kd, cg_ku, cg_fc) = unsafe {
                 (
                     key_event(KEY_DOWN, win, a.id(), 0, VK_A),
@@ -1417,9 +1262,7 @@ mod macos {
                 cg_fc,
                 "FlagsChanged/cg",
             );
-            // Release the shift the factory event pressed, so the modifier
-            // state does not leak into the sendEvent: stage.
-            // SAFETY: as above.
+            // SAFETY: `FLAGS_CHANGED` and `empty` match `key_event` preconditions.
             let up = unsafe { key_event(FLAGS_CHANGED, win, empty.id(), 0, VK_SHIFT) };
             self.drive(
                 view,
@@ -1428,12 +1271,8 @@ mod macos {
                 up,
                 "FlagsChanged/factory release",
             );
-            // `cancelOperation:` reads `-[NSApplication currentEvent]`, whatever the run
-            // loop last dequeued: as from a Touch Bar or accessibility action, not a key
-            // event and possibly nil. The row must return, not send a key-only accessor.
             trap::set_row("cancelOperation: <- (currentEvent as the run loop left it)");
-            // SAFETY: `cancelOperation:` is registered `v@:@`; its argument
-            // is the sender, which the row ignores.
+            // SAFETY: `cancelOperation:` is registered `v@:@` and accepts a nil sender.
             unsafe { send_v_id(view, sel!(cancelOperation:), Id::NIL) };
             self.driven += 1;
             println!(
@@ -1442,8 +1281,6 @@ mod macos {
             self.pending = Some(Box::new(|d: &mut Driver| {
                 let got = d.drain();
                 let keys = Driver::count(&got, "KeyboardInput");
-                // keyDown:/keyUp: x factory and CG = four key events at least
-                // (flagsChanged: may add more through the modifier path).
                 d.report.expect(
                     "keyDown:/keyUp: yield KeyboardInput, both shapes",
                     keys >= 4,
@@ -1458,12 +1295,10 @@ mod macos {
         }
 
         /// Every shape through `-[NSApplication sendEvent:]` — `app.rs`'s
-        /// override, and behind it AppKit's own routing into the window and
-        /// the view. Survival is the assertion; what arrives is printed.
         fn stage_send_event(&mut self, win: isize) {
             println!("\n=== 7. -[NSApplication sendEvent:] with every shape ===");
             let _ = self.drain();
-            // SAFETY: `+sharedApplication` is `@@:`.
+            // SAFETY: `+sharedApplication` has signature `@@:`.
             let app = unsafe { send_id(class(c"NSApplication").as_id(), sel!(sharedApplication)) };
             if app.is_null() {
                 self.report.fail("no NSApplication".to_owned());
@@ -1474,8 +1309,7 @@ mod macos {
                 self.report.fail("could not build an NSString".to_owned());
                 return;
             };
-            // SAFETY: each type into the factory that accepts it; nil from a
-            // refusing factory is reported as NOT DRIVEN below.
+            // SAFETY: each event type is passed to the matching `NSEvent` factory.
             let shapes: Vec<(&str, Id)> = unsafe {
                 vec![
                     ("MouseMoved/factory", mouse_event(MOUSE_MOVED, p, win, 0)),
@@ -1544,8 +1378,7 @@ mod macos {
                     continue;
                 }
                 trap::set_row(&format!("sendEvent: <- {shape}"));
-                // SAFETY: `-sendEvent:` is `v@:@` on NSApplication; the
-                // override installed by `app.rs` has the same prototype.
+                // SAFETY: `-sendEvent:` has signature `v@:@` on `NSApplication`.
                 let kind = unsafe { event_type(ev) };
                 unsafe { send_v_id(app, sel!(sendEvent:), ev) };
                 self.driven += 1;
@@ -1559,9 +1392,6 @@ mod macos {
     }
 
     /// A row that never returns (a deadlock in a trampoline, a modal tracking loop
-    /// entered from a button row) would sit inside `about_to_wait` forever, since
-    /// `BUDGET` is consulted only between pumps; this thread names the row through the
-    /// trap's buffer and exits 3.
     fn arm_hang_watchdog() {
         std::thread::Builder::new()
             .name("objc-event-drive-hang".into())
@@ -1576,8 +1406,6 @@ mod macos {
         trap::install();
         trap::set_row("(before any row)");
         arm_hang_watchdog();
-        // The quiet builder (Accessory, no launch activation): `verify appkit` runs
-        // this drive beside a developer who is typing somewhere else.
         let mut el = match aterm_gui::quiet_driver_event_loop_builder::<()>().build() {
             Ok(el) => el,
             Err(e) => {
@@ -1624,8 +1452,6 @@ mod macos {
         for why in &driver.not_driven {
             println!("  NOT DRIVEN: {why}");
         }
-        // Every shape this file builds is expected to be constructible; one that
-        // is not means AppKit changed and this file must be re-read.
         if !driver.not_driven.is_empty() {
             driver.report.fail(format!(
                 "{} entries were not driven; every row is expected to be",

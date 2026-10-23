@@ -65,7 +65,7 @@ fn fold_owner(line: &str) -> Option<String> {
 }
 
 /// Whether `line` (and its newline) fits `room`, taking it if so.
-fn take(line: &str, room: &mut usize) -> bool {
+const fn take(line: &str, room: &mut usize) -> bool {
     let need = line.len() + 1;
     if need <= *room {
         *room -= need;

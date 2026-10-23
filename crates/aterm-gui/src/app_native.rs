@@ -1,12 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Host adapter for first-party native tab applications.
-//!
-//! Reducers emit typed effects; this module is the only layer allowed to turn
-//! them into config persistence, updater work, clipboard access, external opens,
-//! tab presentation invalidation, and redraws.
-
+//! Native Settings, update orchestration, and harness host integration on `App`.
 use crate::native_app::{
     AppEffect, AppEvent, ClipboardOutcome, ClipboardRequest, ConfigEditorOutcome,
     ConfigPatchOutcome, DamageRegion, EventResult, ExpectedConfigValue, ExternalOpenOutcome,
@@ -26,28 +21,16 @@ use crate::native_updater_service::{ReturnedApplyDisposition, ReturnedApplyFacts
 use crate::packages_screen::{PackagesBusy, PackagesCommandOutcome, PackagesWorkerCompletion};
 use crate::{App, Wake, WindowId};
 
-/// How often a lane held for its candidate's pre-park read looks again: the automatic
-/// attempt ([`App::try_pending_native_auto_apply`]) and a person's held Install
-/// ([`App::held_person_apply_deadline`]). The read raises only a flag and each look is
-/// memory-only, so either starts within this of the read's end; the looks last only as
-/// long as the read (84-546 ms arm to attempt in a guest, 2026-10-20).
+/// How often a lane held for its candidate's pre-park read looks again.
 #[cfg(unix)]
 pub(crate) const PREVERIFY_READ_POLL: std::time::Duration = std::time::Duration::from_millis(20);
 
-/// Settings ▸ Messages is republished at most this often while the center
-/// moves: a downloading update restates at 10 Hz; the page repaints at 2 Hz.
+/// Settings ▸ Messages is republished at most this often while the center moves.
 pub(crate) const MESSAGES_PUBLISH_MIN_GAP: std::time::Duration =
     std::time::Duration::from_millis(500);
-/// …and, with nothing moving, no oftener than this for the page's clock: a
-/// view on the route is republished when a time word the last publish said
-/// would read otherwise (`3 min ago` becomes `4 min ago`, `Today` becomes
-/// `Yesterday`; [`App::settings_messages_quiet_gap`]), at most once a minute,
-/// and never for a page that says no time.
+/// …and, with nothing moving, no oftener than this for the page's clock.
 pub(crate) const MESSAGES_PUBLISH_TICK: std::time::Duration = std::time::Duration::from_secs(60);
-/// …and this long after the publish that started a transient status line's
-/// clock, the one that clears it. The page times the line by the projections'
-/// wall-clock stamps, so the wait is a hair past
-/// [`crate::native_settings::MESSAGES_FEEDBACK_MS`].
+/// …and this long after the publish that started a transient status line's clock, the one that clears it.
 pub(crate) const MESSAGES_FEEDBACK_WAIT: std::time::Duration =
     std::time::Duration::from_millis(crate::native_settings::MESSAGES_FEEDBACK_MS + 50);
 
@@ -75,8 +58,7 @@ pub(crate) fn with_native_preview_instant_for_test<T>(
     run()
 }
 
-/// Real semantic compiler entries on this test thread; warm native redraws
-/// must reuse their retained tree instead of merely skipping pixel raster work.
+/// Real semantic compiler entries on this test thread.
 #[cfg(test)]
 pub(crate) fn native_ui_compile_count() -> u64 {
     NATIVE_UI_COMPILES.with(std::cell::Cell::get)
@@ -94,22 +76,11 @@ fn control_serious_mode_intent(key: &str, value: Option<&str>) -> Option<bool> {
         return None;
     }
     match value {
-        // Removing the authored field restores Config's documented default.
         None => Some(false),
         Some(value) => value.trim().parse::<bool>().ok(),
     }
 }
 
-/// The `settings` verb's answer, from what the write did: `written` is the
-/// value `key` holds once it lands (`None` where the key is absent — an
-/// `unset`, or a value equal to its default, which the service writes as a
-/// removal), and `now` what a removed key reads as, in the words its Settings
-/// row's control says and where it comes from
-/// ([`crate::native_settings::effective_value_words`]: "Auto (default)",
-/// "Off (default)", "1.5 (from theme Studio)"). An applied write says
-/// `saved: k = v` or `removed: k; now w`; a
-/// write that changed nothing says so, never "saved" with an empty value.
-/// Whether the save still needs reconciling comes last, after what it did.
 fn control_settings_completion_reply(
     key: &str,
     written: Option<&str>,
@@ -126,8 +97,6 @@ fn control_settings_completion_reply(
                 (Some(_), None, None) => format!("removed: {key}"),
             };
             if let Some(error) = synchronization_error {
-                // The worker produced a durable proof, so the save succeeded, but
-                // the service gate stays closed until a later stable observation.
                 status.push_str("; reconciliation required: ");
                 status.push_str(error);
             }
@@ -155,7 +124,6 @@ fn control_settings_completion_reply(
         }
         ConfigPatchOutcome::Rejected { message } => {
             let mut error = format!("save failed: {message}");
-            // The read after it, refused for the same reason, says nothing new.
             if let Some(reconcile) = synchronization_error.filter(|reconcile| reconcile != message)
             {
                 error.push_str("; reconciliation required: ");
@@ -166,10 +134,6 @@ fn control_settings_completion_reply(
     }
 }
 
-/// Why a write a Messages entry reports did not land, and whether it may
-/// have (`true`: unconfirmed); `None` for one that landed. A failed save's
-/// words are the cause itself ([`crate::save_words`]), never the
-/// `settings set` reply wrapped around them.
 fn write_not_saved_cause(outcome: &ConfigPatchOutcome) -> Option<(String, bool)> {
     match outcome {
         ConfigPatchOutcome::Applied { .. } => None,
@@ -197,26 +161,13 @@ thread_local! {
     };
 }
 
-/// Evidence that the main-thread native document/restore preflight was Ready.
-/// Only this module constructs it; process replacement carries the token to its
-/// final admission gate.
 #[cfg_attr(
     not(unix),
     expect(dead_code, reason = "only the unix lanes spend its counts")
 )]
 pub(crate) struct NativeUpdateSafetyToken {
-    /// Unsaved editor drafts certified as carried (journaled and verified on
-    /// disk). Only a lane whose successor restores document tabs may spend the
-    /// token: the seamless handoff does; the cold exec refuses it
-    /// (`App::start_unix_update_handoff`).
     carried_drafts: usize,
-    /// Unsaved Settings field drafts certified as carried by the handoff layout
-    /// (`App::capture_handoff_layout`). Spent only by the seamless lane, toward a
-    /// successor at least this build; an older successor ignores the field.
     carried_settings_drafts: usize,
-    /// Documents whose last checkpoint failed but ride because the successor
-    /// reopens them: unsaved text rides as a carried draft (counted in
-    /// `carried_drafts`). The cold lane refuses them with a `Retry:` reason.
     failed_checkpoints: usize,
 }
 
@@ -244,8 +195,7 @@ impl NativeUpdateSafetyToken {
         self.failed_checkpoints
     }
 
-    /// A token certifying exactly these counts, as the preflight would have
-    /// minted it — for the lane gate's own tests.
+    /// A token certifying exactly these counts, as the preflight would have minted it.
     #[cfg(all(test, unix))]
     #[must_use]
     pub(crate) fn carrying_for_test(
@@ -261,30 +211,20 @@ impl NativeUpdateSafetyToken {
     }
 }
 
-/// The most unsaved Settings text one update carries, summed over every carried
-/// field draft. Keeps the handoff layout, which the successor reads whole before
-/// adopting a shell, small; past it the update is held and says why.
+/// The most unsaved Settings text one update carries, summed over every carried field draft.
 pub(crate) const CARRIED_SETTINGS_DRAFTS_CAP_BYTES: usize = 1024 * 1024;
 
-/// The Settings half of the update preflight, over each view's
-/// [`crate::native_settings::CarriedFieldDrafts`]: views and drafts the handoff
-/// layout carries, and views holding a draft no update carries, with why. Pure,
-/// so the lane rule and the cap are testable without a window.
+/// The Settings half of the update preflight, over each view's [`crate::native_settings::CarriedFieldDrafts`].
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct SettingsDraftTally {
     pub(crate) carried_views: usize,
     pub(crate) carried_drafts: usize,
     pub(crate) carried_bytes: usize,
     pub(crate) held_views: usize,
-    /// Why the first held view is held; `None` when the successor reopens no
-    /// Settings tab at all.
     pub(crate) held_why: Option<String>,
 }
 
 impl SettingsDraftTally {
-    /// `successor_reopens`: whether this process's update successor reopens
-    /// native tabs from a handed-over layout
-    /// ([`App::successor_restores_document_tabs`]); without it nothing rides.
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -331,8 +271,6 @@ impl SettingsDraftTally {
             }
         }
         if tally.carried_bytes > cap_bytes {
-            // Over the cap nothing rides, as for editor drafts: every drafted
-            // view holds the update.
             let why = format!(
                 "{} KiB of unsaved Settings text is more than the {} KiB an update carries",
                 tally.carried_bytes.div_ceil(1024),
@@ -348,8 +286,6 @@ impl SettingsDraftTally {
         tally
     }
 
-    /// The preflight's reason for the held views, in its person-facing
-    /// [`SETTINGS_DRAFTS_BLOCK`] shape; `None` when every draft rides.
     fn blocker(&self) -> Option<String> {
         (self.held_views > 0).then(|| match &self.held_why {
             None => format!(
@@ -365,15 +301,10 @@ impl SettingsDraftTally {
     }
 }
 
-/// The most unsaved editor text one update carries, summed over every carried
-/// draft. The successor replays each draft before the outgoing process may
-/// Commit, and the Commit re-reads every one; past this the update is held.
+/// The most unsaved editor text one update carries, summed over every carried draft.
 pub(crate) const CARRIED_DRAFTS_CAP_BYTES: usize = 64 * 1024 * 1024;
 
-/// The dirty-document half of the update preflight, over each draft's
-/// [`crate::app_documents::DraftCarry`] verdict: how many are carried and their
-/// size, how many are still being journaled (the lane waits), and why each one
-/// that cannot ride cannot. Pure, so it is testable without 64 MiB of text.
+/// The dirty-document half of the update preflight, over each draft's [`crate::app_documents::DraftCarry`] verdict.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct DraftCarryTally {
     pub(crate) carried: usize,
@@ -399,8 +330,6 @@ impl DraftCarryTally {
             }
         }
         if tally.carried_bytes > cap_bytes {
-            // Over the cap nothing rides: the update is held for every draft, as
-            // for an uncarried dirty document.
             tally.refused.extend((0..tally.carried).map(|_| {
                 format!(
                     "{} MiB of unsaved drafts is more than the {} MiB an update carries",
@@ -414,8 +343,6 @@ impl DraftCarryTally {
         tally
     }
 
-    /// The preflight's reasons: a refusal opens with [`DIRTY_DOCUMENTS_BLOCK`]
-    /// (Save or close), a draft still being written with `Wait:`.
     fn blockers(&self) -> Vec<String> {
         let mut blockers = Vec::new();
         if let Some(why) = self.refused.first() {
@@ -435,8 +362,7 @@ impl DraftCarryTally {
     }
 }
 
-/// One request for the updater's disk facts (ledger and installed bundle), read off the event
-/// loop and reduced on the main thread.
+/// One request for the updater's disk facts, read off the event loop and reduced on the main thread.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct NativeUpdateReconcileTicket {
     request_sequence: u64,
@@ -449,8 +375,7 @@ impl NativeUpdateReconcileTicket {
         self.request_sequence
     }
 
-    /// Test-only ticket for hand-built worker facts, so a conformance test can
-    /// feed the real reducer the disk a failed candidate leaves behind.
+    /// Test-only ticket for hand-built worker facts, so a conformance test can feed the real reducer the disk a failed candidate leaves behind.
     #[cfg(test)]
     #[must_use]
     pub(crate) fn for_test(request_sequence: u64) -> Self {
@@ -459,17 +384,11 @@ impl NativeUpdateReconcileTicket {
 }
 
 /// What the event loop should do only after worker-collected facts have been accepted.
-/// Trigger payloads never carry update authority; the effective reducer stage does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum NativeUpdateReconcilePurpose {
     Startup,
     StageAvailable,
     ApplyControl,
-    /// Re-read the ledger with no announcement semantics: the background
-    /// check's health hook fired (a persistent failure streak), or Settings
-    /// opened on any page (Software Update, Modified and search all describe
-    /// this copy's update switches). The screen shows the current verdict, not
-    /// the last one a stage or startup imported.
     Refresh,
 }
 
@@ -490,48 +409,25 @@ fn merge_reconcile_purpose(
 #[derive(Clone, Debug)]
 pub(crate) struct NativeUpdateReconcileFacts {
     pub(crate) _ticket: NativeUpdateReconcileTicket,
-    /// Assigned by the sole facts worker immediately before the read. This, not
-    /// request dispatch order, is the freshness authority.
     pub(crate) observation_sequence: u64,
-    /// When the worker began reading the disk. The sequence orders observations
-    /// against each other; this orders them against the reducer's stage imports:
-    /// a read that began before a check staged its build must not retire what
-    /// the check imported, however late it lands.
     pub(crate) observed_at: std::time::Instant,
     pub(crate) durable: Option<DurableUpdateStatus>,
     pub(crate) installed: Option<InstalledUpdate>,
-    /// `installed` is `None` for want of proof, not because the bundle left: its
-    /// verification did not finish this pass (a passing refusal, e.g. `spctl` past
-    /// its ceiling on a captive-portal network or a `codesign` out of its budget).
-    /// Such a read is no evidence the boot trial's count is gone.
     pub(crate) installed_unproven: bool,
-    /// Whether this copy can replace itself, as this read observed it: the durable
-    /// status's own answer, or — where that read found no ledger — the bundle probe
-    /// alone (`aterm_update::running_copy_installable`). `None` observes nothing.
     pub(crate) installable: Option<bool>,
 }
 
-/// One retire of a latched installed activation for a newer verified release
-/// (`App::request_activation_supersede`): the worker's job, and the App's
-/// record that it is in flight.
+/// One retire of a latched installed activation for a newer verified release (`App::request_activation_supersede`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ActivationSupersedeJob {
     pub(crate) current_build: u64,
-    /// The latched activation's build and sealed commit — the exact bytes the
-    /// retire may take off the install path, and nothing else.
     pub(crate) activation: u64,
     pub(crate) activation_commit: String,
-    /// The verified download that takes its place.
     pub(crate) newer: u64,
-    /// The verdict's `newer_spent` before this retire spent `newer`, restored on
-    /// refusal so the release is offered again at its retry deadline.
     pub(crate) spent_before: u64,
 }
 
-/// What the retire worker posts back: the job, what
-/// `aterm_update::supersede_installed_activation` did, and the disk read after
-/// the retire (`None` when no read could be had; the completion then asks for
-/// one).
+/// What the retire worker posts back.
 #[derive(Debug)]
 pub(crate) struct ActivationSupersedeCompletion {
     pub(crate) job: ActivationSupersedeJob,
@@ -558,7 +454,6 @@ pub(crate) enum NativeUpdateWorkerRequest {
     Reconcile(NativeUpdateReconcileRequest),
     ConfirmBootHealth {
         current_build: u64,
-        /// What this process can prove about the trial.
         witness: aterm_update::TrialWitness,
     },
 }
@@ -573,17 +468,10 @@ pub(crate) enum NativeUpdateDispatch {
 pub(crate) type NativeUpdateReconcileSender =
     std::sync::mpsc::SyncSender<NativeUpdateWorkerRequest>;
 
-/// One buffered item plus the worker's active item suffice; further UI intents
-/// are held by the purpose coalescer, so stale disk work never queues ahead of
-/// user-visible updates.
+/// One buffered item plus the worker's active item suffice.
 pub(crate) const NATIVE_UPDATE_WORKER_CAPACITY: usize = 1;
 
-/// Result of reducing worker-collected disk facts on the event loop. Active
-/// updater work defers the facts without rereading disk; otherwise presentation
-/// uses only the returned effective reducer stage, never the trigger payload.
-///
-/// `Deferred` boxes its facts: it is the rare arm, and the payload is several
-/// hundred bytes the common arms would otherwise move too.
+/// Result of reducing worker-collected disk facts on the event loop.
 pub(crate) enum NativeUpdateFactsResult {
     IgnoredStale,
     Deferred(Box<NativeUpdateReconcileFacts>),
@@ -607,17 +495,10 @@ fn read_native_update_reconcile_facts(
         || {
             aterm_update::installed_update_facts_checked().map(|installed| {
                 installed
-                    // A yanked bundle newer than this process is not an activation
-                    // candidate: reporting it would retire a good download for an
-                    // activation every handoff then refuses at the floor. One at or
-                    // below the running build is the bundle we run from.
                     .filter(|installed| {
                         !(installed.yanked && installed.build_number > current_build)
                     })
                     .map(|installed| InstalledUpdate {
-                        // The boot sentinel's count, measured on this worker beside
-                        // the codesign and plist reads, so the event loop never
-                        // touches the staging root.
                         trial_launches: aterm_update::trial_launch_count(installed.build_number),
                         build: installed.build_number,
                         commit: installed.git_commit,
@@ -628,33 +509,21 @@ fn read_native_update_reconcile_facts(
             })
         },
     );
-    // A ledger that could not be read (no resolvable HOME) still has a copy to
-    // ask: the bundle probe alone answers whether it can replace itself.
     if facts.installable.is_none() {
         facts.installable = aterm_update::running_copy_installable();
     }
     facts
 }
 
-/// Read the facts: the durable status, then the installed bundle — `Ok(None)` when
-/// there is none (or it is not reported), `Err` with the refusal when one is there
-/// and could not be proven ([`aterm_update::installed_update_facts_checked`]).
 fn read_native_update_reconcile_facts_with(
     ticket: NativeUpdateReconcileTicket,
     observation_sequence: u64,
     read_durable: impl FnOnce() -> Option<DurableUpdateStatus>,
     read_installed: impl FnOnce() -> Result<Option<InstalledUpdate>, String>,
 ) -> NativeUpdateReconcileFacts {
-    // Load the ready marker before canonical bundle identity. Shipping swaps the
-    // bundle first and removes ready afterward, so this sees ready+old,
-    // ready+new or missing+new; exact installed proof dominates either
-    // surviving-marker case.
     let observed_at = std::time::Instant::now();
     let durable = read_durable();
     let installable = durable.as_ref().and_then(|durable| durable.installable);
-    // A refusal that is a verdict (an unsigned or tampered bundle) is a fact: the
-    // installed facts name no verified bundle. Only a check that did not finish is
-    // the absence of an observation.
     let (installed, installed_unproven) = match read_installed() {
         Ok(installed) => (installed, false),
         Err(refusal) => (None, aterm_update::is_passing_refusal(&refusal)),
@@ -670,8 +539,7 @@ fn read_native_update_reconcile_facts_with(
     }
 }
 
-/// Start the one process-wide, bounded FIFO facts worker. Every ledger/provenance
-/// observation is serialized here, and freshness is stamped at read time.
+/// Start the one process-wide, bounded FIFO facts worker.
 pub(crate) fn spawn_native_update_reconcile_worker(
     drain_proxy: aterm_window::event_loop::EventLoopProxy<Wake>,
 ) -> Result<NativeUpdateReconcileSender, String> {
@@ -681,8 +549,6 @@ pub(crate) fn spawn_native_update_reconcile_worker(
         "aterm-update-facts".to_string(),
         crate::qos::Role::Background,
         move || {
-            // Reconcile facts feed a settings screen, not a frame; results return
-            // through the proxy and no lock is held.
             let health_proxy = drain_proxy.clone();
             run_native_update_worker(
                 receiver,
@@ -740,14 +606,11 @@ fn run_native_update_worker(
                 let _ = reply.send(facts);
             }
         }
-        // A Reply or boot-health item need not emit any other UI event. This edge
-        // guarantees a Full-queue pending latch gets another nonblocking chance.
         drained();
     }
 }
 
-/// Queue one handoff-worker observation on the same FIFO and wait off the event
-/// loop for its ordered result.
+/// Queue one handoff-worker observation on the same FIFO and wait off the event loop for its ordered result.
 #[cfg(unix)]
 pub(crate) fn collect_native_update_reconcile_facts(
     worker: &NativeUpdateReconcileSender,
@@ -769,9 +632,7 @@ pub(crate) fn collect_native_update_reconcile_facts(
 
 const MAX_AUTOMATIC_UPDATE_CYCLES: u8 = 3;
 
-/// A refusal about the installed environment, distinct from an exhausted
-/// artifact budget. Only a later verified observation of what refused can
-/// release this latch ([`EnvironmentBlockCause`]).
+/// A refusal about the installed environment, distinct from an exhausted artifact budget.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct AutoApplyEnvironmentBlock {
     build: u64,
@@ -780,25 +641,10 @@ pub(crate) struct AutoApplyEnvironmentBlock {
     cause: EnvironmentBlockCause,
 }
 
-/// Which part of the install refused, and so which observation can say a person
-/// has changed it.
+/// Which part of the install refused, and so which observation can say a person has changed it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum EnvironmentBlockCause {
-    /// The installed bundle cannot be the swap's rollback source, or this
-    /// process does not run from one (`aterm_update::refusal_needs_person`'s
-    /// other terms): the reconcile's verified observation of that copy against
-    /// the running image is the evidence that it was put right
-    /// ([`App::release_repaired_auto_apply_environment`]).
     InstalledSource,
-    /// The install location's folder cannot be written by this user
-    /// (`aterm_update::is_install_location_refusal`): an admin-owned or MDM-managed
-    /// `/Applications`. The bundle in it verifies, so the reconcile's observation of the
-    /// installed copy never releases this; a pre-park verification of exactly the blocked
-    /// artifact that passed after the block was taken does, since the staged lane's check
-    /// asks the folder first (`install_location_check`). A person's retry is such a check
-    /// ([`App::install_location_answered_since`]), landed or not. A newer stage arms
-    /// afresh, and a changed installed copy releases it too
-    /// (`carry_manual_only_latch_across_swap`).
     InstallLocation,
 }
 
@@ -812,9 +658,7 @@ impl EnvironmentBlockCause {
         }
     }
 
-    /// What a person does about this cause: the remedy every surface names while
-    /// the block stands ([`App::apply_retry_for`]), whatever reason the ledger
-    /// booked since.
+    /// What a person does about this cause.
     pub(crate) fn remedy(self) -> crate::update_apply_trouble::PersonRemedy {
         use crate::update_apply_trouble::PersonRemedy;
         match self {
@@ -824,72 +668,28 @@ impl EnvironmentBlockCause {
     }
 }
 
-/// Distinct rungs of the activity-revoked retry ladder (2 s → 30 s,
-/// [`automatic_retry_delay`]); past the last one each revocation waits the last
-/// rung again. Activity never stops the lane: with a shell streaming output,
-/// revocation is the normal outcome of an attempt. Each attempt is a lossless
-/// launch/park/paint round trip, so the spacing bounds the cost (at most two a
-/// minute) while staying inside `LANDS_WITHIN`.
 const ACTIVITY_REVOKED_LADDER_RUNGS: u8 = 5;
 
-/// Physical handoff retries within one epoch. `TimedOut` is physical: the 15 s handoff
-/// deadline covers a cold boot, a blocking `flock`, re-verification, the swap, a second
-/// exec, the new image's boot, PTY adoption and a repaint, so it is often a transient
-/// moment, and two retries tens of minutes apart give it another chance. Structural
-/// failures use [`STRUCTURAL_FAILURE_LIFETIME_ATTEMPTS`] and never reach an epoch boundary.
 const MAX_PHYSICAL_FAILURE_CYCLES: u8 = 2;
 
-/// Physical failures counted in one epoch: the initial failure plus its
-/// [`MAX_PHYSICAL_FAILURE_CYCLES`] retries.
+/// Physical failures counted in one epoch.
 pub(crate) const PHYSICAL_FAILURES_PER_EPOCH: u8 = MAX_PHYSICAL_FAILURE_CYCLES + 1;
 
-/// Whole epochs an artifact gets before automatic apply gives up on those exact bytes,
-/// so the transient lane converges instead of replenishing forever: 9 failures over
-/// ~14 hours (three 40-min epochs, a 6 h stand-down between each), the last after a
-/// night's idle. An artifact that cannot hand off in any of them is evidence about the
-/// bytes.
 const MAX_PHYSICAL_FAILURE_EPOCHS: u8 = 3;
 
-/// Total physical failures an artifact may cost before automatic apply
-/// converges. After the ninth, [`App::spend_physical_failure_budget`] answers
-/// [`PhysicalFailureSchedule::Converged`] with a quiet re-sample one
-/// [`PHYSICAL_FAILURE_EPOCH_COOLDOWN`] out; only a structural convergence can
-/// end in a latch with no deadline.
+/// Total physical failures an artifact may cost before automatic apply converges.
 pub(crate) const PHYSICAL_FAILURE_LIFETIME_ATTEMPTS: u8 =
     PHYSICAL_FAILURES_PER_EPOCH * MAX_PHYSICAL_FAILURE_EPOCHS;
 
-/// Total physical failures a structurally shaped artifact may cost before
-/// automatic apply converges on those exact bytes.
-///
-/// An `AdoptionMismatch` is a property of the two images and a failed
-/// pre-park verification recurs, so the transient schedule's generosity does
-/// not apply. Two, not one: the class is not perfectly separable at this seam
-/// (an `AdoptionMismatch` can be a cross-version race), and one retry ten
-/// minutes out separates those for one round trip.
+/// Total physical failures a structurally shaped artifact may cost before automatic apply converges on those exact bytes.
 pub(crate) const STRUCTURAL_FAILURE_LIFETIME_ATTEMPTS: u8 = 2;
 
-/// Whole epochs an artifact gets when its handoff failure is unexplained: the candidate
-/// closed the readiness channel and the parent observed nothing about why
-/// ([`crate::ChildDeathEvidence::Unobserved`]). Common on macOS: a refusing candidate
-/// keeps running while it unwinds, so the status seen afterwards is this process's own
-/// SIGKILL. A second epoch, one [`PHYSICAL_FAILURE_EPOCH_COOLDOWN`] later, separates a
-/// bad hour from a successor that will not boot; a third would add nothing.
 const UNEXPLAINED_FAILURE_EPOCHS: u8 = 2;
 
-/// Total physical failures an artifact may cost while every one is unexplained: six,
-/// across ~7.3 hours (40 min of epoch, one 6 h stand-down, 40 min more). Strictly between
-/// the transient and structural budgets (the asserts below). Unexplained failures forgive
-/// their counted trial launch (only [`PhysicalFailureShape::Structural`] keeps it), so six
-/// attempts never reach `MAX_BOOT_ATTEMPTS` and revert the bundle.
+/// Total physical failures an artifact may cost while every one is unexplained.
 pub(crate) const UNEXPLAINED_FAILURE_LIFETIME_ATTEMPTS: u8 =
     PHYSICAL_FAILURES_PER_EPOCH * UNEXPLAINED_FAILURE_EPOCHS;
 
-/// A `ChildDied` classified structural keeps its counted boot-trial launch
-/// (`app_update_handoff`'s reject path forgives every other shape), so its budget
-/// must converge strictly before `MAX_BOOT_ATTEMPTS`, or a retry schedule would
-/// walk the build to the revert threshold. A converged verdict's one re-sample is
-/// gated on the sentinel's measured count instead (`InstalledUpdate::trial_launches`
-/// against [`BOOT_TRIAL_LAUNCH_LIMIT`]).
 #[cfg(target_os = "macos")]
 const _: () = assert!(
     (STRUCTURAL_FAILURE_LIFETIME_ATTEMPTS as u32) < aterm_update::MAX_BOOT_ATTEMPTS,
@@ -927,23 +727,9 @@ const _: () = assert!(
      failure is not about the machine"
 );
 
-/// Idle gap after which an artifact's physical-failure counter starts over.
-///
-/// Must outlast a whole epoch so epochs can be counted: one stand-down
-/// ([`PHYSICAL_FAILURE_EPOCH_COOLDOWN`], 6 h) plus the in-epoch spacing
-/// (600 s + 1800 s), with room for a late failure queued behind other updater
-/// work. A shorter window would reset the counter on the schedule's own cadence
-/// and make the lane unbounded.
 const PHYSICAL_RETRY_BUDGET_REPLENISH: std::time::Duration =
     std::time::Duration::from_secs(12 * 60 * 60);
 
-/// How long automatic apply stands down after an artifact spends one epoch's
-/// physical retry budget.
-///
-/// A spent epoch is not proof the artifact is broken (`TimedOut` is usually
-/// the machine's moment), so it is a long wait and nothing more; only
-/// [`MAX_PHYSICAL_FAILURE_EPOCHS`] ends the lane. Six hours makes the epochs
-/// independent samples while three still fit in a day.
 const PHYSICAL_FAILURE_EPOCH_COOLDOWN: std::time::Duration =
     std::time::Duration::from_secs(6 * 60 * 60);
 
@@ -955,20 +741,10 @@ const _: () = assert!(
      cap is unreachable, and a structurally broken artifact retries forever"
 );
 
-/// How long a structural convergence waits before its one re-sample. The class is not
-/// perfectly separable (an `AdoptionMismatch` can be a cross-version race), so a verdict
-/// confirmed twice is strong evidence, not proof. A day, longer than
-/// [`PHYSICAL_FAILURE_EPOCH_COOLDOWN`], because the verdict is about the bytes; a
-/// re-sample that fails again converges for good. Calendar time, the Mac's sleep counted
-/// ([`App::count_sleep_toward_update_deadlines`]).
+/// How long a structural convergence waits before its one re-sample.
 pub(crate) const STRUCTURAL_RESAMPLE_AFTER: std::time::Duration =
     std::time::Duration::from_secs(24 * 60 * 60);
 
-/// The least the wall clock must run ahead of the monotonic one between two
-/// turns of the event loop to count as a sleep
-/// ([`App::count_sleep_toward_update_deadlines`]). A Mac sleeps for seconds at
-/// the least; two clocks read one after the other drift apart by nanoseconds a
-/// turn, which must never add up to a retry.
 const SLEEP_COUNTS_FROM: std::time::Duration = std::time::Duration::from_secs(1);
 
 const _: () = assert!(
@@ -983,55 +759,25 @@ const _: () = assert!(
      why the verdict, not the budget, is what converges a re-sample that fails"
 );
 
-/// The boot sentinel's revert threshold, as the automatic lane reads it: a
-/// launch of a trialed build that brings its count to this is the one
-/// `check_boot_health` reverts on. Off macOS there is no sentinel
-/// (`aterm_update::trial_launch_count` is always 0), so nothing can reach it.
+/// The boot sentinel's revert threshold, as the automatic lane reads it.
 #[cfg(target_os = "macos")]
 pub(crate) const BOOT_TRIAL_LAUNCH_LIMIT: u32 = aterm_update::MAX_BOOT_ATTEMPTS;
 #[cfg(not(target_os = "macos"))]
 pub(crate) const BOOT_TRIAL_LAUNCH_LIMIT: u32 = u32::MAX;
 
-/// How soon a structural latch whose earned attempt found the boot trial
-/// unmeasured looks again. A latch past its deadline folds a wake the event
-/// loop takes at once, so an unanswerable look must move the deadline or it
-/// spins; this is about as often as a facts observation arrives.
 const STRUCTURAL_TRIAL_REMEASURE: std::time::Duration = std::time::Duration::from_secs(75);
 
-/// How many due looks in a row may find the structural latch's boot trial unmeasured
-/// before the lane stops waiting for the count (the model's `UnreadLooks`). The next
-/// observation re-reads a count a returned attempt forgot, so three looks in a row, each
-/// over a fresh observation that proved the installed bundle and found no count, mean
-/// the installed facts no longer name the latched activation (a channel floor raised
-/// above it drops it). The answer is the one a count with no room gets: hold, drop the
-/// deadline, say so; a newer release still supersedes.
+/// Maximum consecutive due looks where the structural latch's boot trial remains unmeasured.
 pub(crate) const STRUCTURAL_TRIAL_UNMEASURED_LOOKS: u8 = 3;
 
-/// How many due looks in a row may find the structural latch's installed bundle
-/// unproven (every facts read since the previous look failed to check it, e.g. `spctl`
-/// past its ceiling on a captive portal) before the day's re-sample moves to the next
-/// day (the model's `UnprovenLooks`). Such a read spends none of
-/// [`STRUCTURAL_TRIAL_UNMEASURED_LOOKS`]; without this bound a filter that always times
-/// `spctl` out would re-arm the latch every [`STRUCTURAL_TRIAL_REMEASURE`], silently.
+/// Maximum consecutive due looks where the structural latch's installed binary remains unproven.
 pub(crate) const STRUCTURAL_TRIAL_UNPROVEN_LOOKS: u8 = 3;
 
-/// How long a release whose retire of a latched activation was refused waits
-/// before the lane offers it again, the first time; each refusal in a row
-/// doubles it, up to [`SUPERSEDE_RETRY_CEILING`].
-///
-/// A retire often refuses on a moment (bundle verifications share an 8 s
-/// budget, Gatekeeper rides the network, the apply lock waits 120 s at most),
-/// so it is retried; not at once, because a disk-shaped refusal repeats and
-/// each try holds the apply lock across three codesign reads.
 const SUPERSEDE_RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 
-/// The longest a refused release waits between tries: a disk the retire can
-/// never undo costs one locked verification every two hours.
 const SUPERSEDE_RETRY_CEILING: std::time::Duration = std::time::Duration::from_secs(2 * 60 * 60);
 
-/// The wait before a refused release is offered again after `refusals`
-/// consecutive refusals (1 = the first): [`SUPERSEDE_RETRY_AFTER`], doubled
-/// per refusal, capped at [`SUPERSEDE_RETRY_CEILING`].
+/// The wait before a refused release is offered again after `refusals` consecutive refusals (1 = the first).
 pub(crate) fn supersede_retry_after(refusals: u32) -> std::time::Duration {
     let doublings = refusals.saturating_sub(1).min(8);
     SUPERSEDE_RETRY_AFTER
@@ -1039,34 +785,16 @@ pub(crate) fn supersede_retry_after(refusals: u32) -> std::time::Duration {
         .min(SUPERSEDE_RETRY_CEILING)
 }
 
-/// What [`App::spend_physical_failure_budget`] says about the attempt that just
-/// came back: a mid-epoch retry is invisible, a stand-down is a long quiet
-/// wait, and convergence is the only state where the Version menu beats waiting.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PhysicalFailureSchedule {
-    /// Another automatic attempt, inside the current epoch.
     Retry(std::time::Instant),
-    /// This epoch is spent; the next one begins after a long stand-down.
     StandDown(std::time::Instant),
-    /// This shape's [`PhysicalFailureShape::lifetime_attempts`] are spent; said
-    /// once ([`App::announce_automatic_apply_stranded`]). `resample_at` is what
-    /// happens next: transient and unexplained lifetimes re-sample quietly one
-    /// [`PHYSICAL_FAILURE_EPOCH_COOLDOWN`] out, every time (those shapes forgive
-    /// their trial launch, so this cannot walk the boot sentinel toward a revert).
-    /// A structural lifetime gets one re-sample, [`STRUCTURAL_RESAMPLE_AFTER`]
-    /// out, recorded on its [`crate::AutoApplyStructuralVerdict`]; a verified
-    /// download newer than the latched activation supersedes it
-    /// (`native_update_auto_intent::structural_latch`). `None` once that
-    /// re-sample is spent and no newer release has come.
     Converged {
         resample_at: Option<std::time::Instant>,
     },
 }
 
 impl PhysicalFailureSchedule {
-    /// Convergence for `shape` at `now`: a silent re-sample one epoch cooldown
-    /// out for the machine-shaped failures, and one re-sample a day out for the
-    /// structural one (the caller records it on the verdict).
     #[must_use]
     fn converged(shape: PhysicalFailureShape, now: std::time::Instant) -> Self {
         Self::Converged {
@@ -1080,9 +808,6 @@ impl PhysicalFailureSchedule {
         }
     }
 
-    /// The deadline to stamp on [`crate::AutoApplyManualOnly`]. `None` is the
-    /// latch `lapse_expired_auto_apply_manual_only` never releases, minted only
-    /// once a structural verdict's one re-sample is spent.
     #[must_use]
     fn retry_at(self) -> Option<std::time::Instant> {
         match self {
@@ -1092,56 +817,29 @@ impl PhysicalFailureSchedule {
     }
 }
 
-/// How long the automatic lane waits between attempts once an artifact's
-/// preflight-block budget is spent. Probes are screen-silent, so this is only
-/// retry spacing: saving or closing the blocking Settings edit lands the update
-/// within a minute.
 const PREFLIGHT_BLOCK_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// How the close preflight's per-person blockers open
-/// (`native_update_close_preflight`); [`App::update_blocker_for_person`]
-/// recognises these as work a person has to save.
+/// How the close preflight's per-person blockers open (`native_update_close_preflight`).
 pub(crate) const SETTINGS_DRAFTS_BLOCK: &str = "Review Settings Drafts:";
 pub(crate) const DIRTY_DOCUMENTS_BLOCK: &str = "Checkpoint Drafts:";
 pub(crate) const FAILED_CHECKPOINTS_BLOCK: &str = "Retry:";
 
 const _: () = assert!(PREFLIGHT_BLOCK_COOLDOWN.as_secs() <= 60);
 
-/// How often an intent held by a capture refusal re-reads the desk to see
-/// whether the refusing state moved. A read is a few `try_lock`s and a hash,
-/// and nothing launches unless the fingerprint changed; thirty seconds lands the
-/// update soon after the offending tab closes without relaunching on every
-/// resize drag.
+/// How often an intent held by a capture refusal re-reads the desk to see whether the refusing state moved.
 pub(crate) const CAPTURE_REFUSAL_PROBE: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// How soon the lane looks again for a busy session's baseline during a
-/// refusal's first probe. A reader can hold a session's engine when the desk is
-/// read (the refusal comes back while readers drain the freeze's backlog), and a
-/// change made to that session before its first reading becomes its baseline
-/// ([`crate::CaptureDesk::fill_from`]; which sessions are open is always read).
-/// After the first probe it is looked for at the probe, so a reader that never
-/// lets go does not wake the lane every few seconds for an hour.
+/// How soon the lane looks again for a busy session's baseline during a refusal's first probe.
 pub(crate) const CAPTURE_REFUSAL_BASELINE_PROBE: std::time::Duration =
     std::time::Duration::from_secs(2);
 
 const _: () = assert!(CAPTURE_REFUSAL_BASELINE_PROBE.as_secs() < CAPTURE_REFUSAL_PROBE.as_secs());
 
-/// Backstop for an intent held by a capture refusal: after an hour with the
-/// desk unchanged the lane tries once more, in case the refusal was about
-/// something the fingerprint does not see. Each attempt records an apply
-/// failure, so `failing_applies` keeps climbing (and the persistent-failure
-/// notice stays reachable) for a desk that never moves.
+/// Backstop for an intent held by a capture refusal.
 pub(crate) const CAPTURE_REFUSAL_BACKSTOP: std::time::Duration =
     std::time::Duration::from_secs(60 * 60);
 
-/// How long a capture refusal holds the next attempt even when the desk
-/// changed: `refusals` counts this update's refusals in a row, this one
-/// included. The first is released at the next probe, so the update lands soon
-/// after the offending tab closes; a second waits 600 s, a third and later
-/// 1800 s. The fingerprint only guesses at what a refusal was about, and a busy
-/// desk (a `cd`, an alternate-screen program, a pane opened) moves it at nearly
-/// every probe, while each attempt costs a launch, a freeze of every tab and a
-/// history export. Never past [`CAPTURE_REFUSAL_BACKSTOP`], and never a latch.
+/// How long a capture refusal holds the next attempt even when the desk changed.
 #[must_use]
 pub(crate) const fn capture_refusal_spacing(refusals: u32) -> std::time::Duration {
     std::time::Duration::from_secs(match refusals {
@@ -1151,7 +849,6 @@ pub(crate) const fn capture_refusal_spacing(refusals: u32) -> std::time::Duratio
     })
 }
 
-// The spacing only ever grows, from one probe, and stays under the backstop.
 const _: () = assert!(
     capture_refusal_spacing(1).as_secs() == CAPTURE_REFUSAL_PROBE.as_secs()
         && capture_refusal_spacing(2).as_secs() > capture_refusal_spacing(1).as_secs()
@@ -1159,9 +856,6 @@ const _: () = assert!(
         && capture_refusal_spacing(u32::MAX).as_secs() < CAPTURE_REFUSAL_BACKSTOP.as_secs()
 );
 
-/// The updater's "a newer build has waited too long" notice must fire well past
-/// the ladder's bound plus switch allowance (at least 4x) and past the
-/// physical lane's first retry (600 s), yet within the hour.
 const _: () = assert!(
     aterm_update::PENDING_UPDATE_OVERDUE_SECS
         >= 4 * (crate::native_update_auto_intent::LANDS_WITHIN.as_secs()
@@ -1176,39 +870,16 @@ const _: () = assert!(
      the hour, or a stranded machine waits in silence again"
 );
 
-/// What a returned physical failure is evidence about: the machine's moment or
-/// the two images. Carried from the worker's typed
-/// [`crate::UpdateHandoffOutcome`], never its message string. Decides how many
-/// round trips an artifact may cost; see
-/// [`STRUCTURAL_FAILURE_LIFETIME_ATTEMPTS`].
+/// What a returned physical failure is evidence about.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PhysicalFailureShape {
-    /// The attempt lost a race the next one may win. Rides the full
-    /// [`PHYSICAL_FAILURE_LIFETIME_ATTEMPTS`] schedule.
     Transient,
-    /// The candidate could not become this process's successor, for a reason that
-    /// belongs to the bytes rather than to the afternoon. Converges after
-    /// [`STRUCTURAL_FAILURE_LIFETIME_ATTEMPTS`].
     Structural,
-    /// Something ended the candidate and the parent did not see what: a failure
-    /// of unknown kind, not filed as either kind the parent can prove. Rides the
-    /// epoch machinery on the shorter
-    /// [`UNEXPLAINED_FAILURE_LIFETIME_ATTEMPTS`] budget.
     #[cfg(unix)]
     Unexplained,
 }
 
 impl PhysicalFailureShape {
-    /// Classify one worker outcome. Structural: `AdoptionMismatch` (the child
-    /// proved a PTY set the parent does not recognise, a cross-version
-    /// disagreement) and `PreparationFailed` (the staged candidate failed pre-park
-    /// verification with a verdict; a timed-out `codesign`, a full disk or `EMFILE`
-    /// is `ProducerFailed`, transient). Transient: the rest (`TimedOut`; a
-    /// non-activity `Rejected`, a commit-time re-check of state that moves on its
-    /// own), failing closed for `ProofReady` and `CaptureRefused`, which
-    /// [`HandoffFailureLane::classify`] routes to [`HandoffFailureLane::Refused`]
-    /// first. `ChildDied` decides nothing alone: a starved child also exits before
-    /// writing its readiness proof, so [`Self::of_child_death`] reads `death`.
     #[must_use]
     #[cfg(unix)]
     fn of_outcome(outcome: crate::UpdateHandoffOutcome, death: crate::ChildDeathEvidence) -> Self {
@@ -1216,8 +887,6 @@ impl PhysicalFailureShape {
             crate::UpdateHandoffOutcome::AdoptionMismatch
             | crate::UpdateHandoffOutcome::PreparationFailed => Self::Structural,
             crate::UpdateHandoffOutcome::ChildDied => Self::of_child_death(death),
-            // `StageUnconfirmed` never reaches a shape ([`HandoffFailureLane::classify`]
-            // files it first); listed here, it fails closed onto the converging one.
             crate::UpdateHandoffOutcome::TimedOut
             | crate::UpdateHandoffOutcome::ProducerFailed
             | crate::UpdateHandoffOutcome::Rejected
@@ -1228,23 +897,7 @@ impl PhysicalFailureShape {
         }
     }
 
-    /// Did the successor image run and decide, or did something end a candidate that never got
-    /// that far?
-    ///
-    /// - `Exited`: a starved process never reaches `exit`, so structural whatever the code:
-    ///   the commonest refusal is a clean `0` (`main_entry` returns without a window when the
-    ///   overlap authority is incomplete). The one exception is
-    ///   [`crate::seamless::EXIT_SUCCESSOR_PASSING`] (75, `EX_TEMPFAIL`): the candidate refused
-    ///   for a moment (its boot swap deferred, nothing it may swap now, or
-    ///   [`crate::seamless::endpoint_refusal_exit`]), so transient, and the trial launch is
-    ///   forgiven. A successor sends 75 only to a parent that declared it reads it
-    ///   (`seamless::ENV_EXIT_CAPS`), so this arm and that declaration ship together.
-    /// - `Signalled`: a fault is the image executing into a wall (the bytes); any other signal
-    ///   comes from outside (jetsam's SIGKILL under memory pressure), which is the machine.
-    /// - `Unobserved`: unexplained: retried, bounded, converging.
-    ///
-    /// No arm reads "the image started": the boot sentinel counts a launch at the first
-    /// statement of `main`, for a starved and a refusing candidate alike.
+    /// Did the successor image run and decide, or did something end a candidate that never got that far?.
     #[must_use]
     #[cfg(unix)]
     pub(crate) fn of_child_death(death: crate::ChildDeathEvidence) -> Self {
@@ -1266,15 +919,7 @@ impl PhysicalFailureShape {
         }
     }
 
-    /// The shape of a failure booked from the cached pre-park verdict
-    /// (`try_pending_native_auto_apply`): structural when the verifier reached a
-    /// verdict on the bytes, as through the worker (`PreparationFailed`); transient
-    /// when it did not ([`aterm_update::is_passing_refusal`]) or nothing is cached.
-    ///
-    /// Bound to `NativeUpdateApplyLadder`'s `PassingFailure` by
-    /// `real_passing_refusal_keeps_a_deadline_as_the_model_s_passing_failure`, with
-    /// no `#[refines]` anchor (one would oblige every other action of the machine
-    /// to carry an anchor or waiver).
+    /// The shape of a failure booked from the cached pre-park verdict (`try_pending_native_auto_apply`).
     #[must_use]
     pub(crate) fn cached_refusal_shape(reason: Option<&str>) -> Self {
         match reason {
@@ -1283,9 +928,7 @@ impl PhysicalFailureShape {
         }
     }
 
-    /// How many failures for one artifact this shape may cost before automatic
-    /// apply is done with those bytes. The counter is shared and shape-blind
-    /// (see [`App::spend_physical_failure_budget`]); only the ceiling varies.
+    /// How many failures for one artifact this shape may cost before automatic apply is done with those bytes.
     #[must_use]
     pub(crate) const fn lifetime_attempts(self) -> u8 {
         match self {
@@ -1297,14 +940,6 @@ impl PhysicalFailureShape {
     }
 }
 
-/// Whether `signal` is one an image raises on itself by executing (a fault)
-/// rather than one delivered from outside.
-///
-/// Matched by name, not number: `SIGBUS` is 10 on macOS and 7 on Linux, and 7
-/// on macOS is `SIGEMT`. The set is the synchronous exceptions both platforms
-/// name; `SIGEMT` is absent because libc defines it only for mips/sparc Linux.
-/// Everything else, `SIGKILL` above all (jetsam's signal), is someone else's
-/// decision about a process that may never have run.
 #[cfg(unix)]
 #[must_use]
 fn signal_is_the_image_faulting(signal: i32) -> bool {
@@ -1320,54 +955,23 @@ fn signal_is_the_image_faulting(signal: i32) -> bool {
     )
 }
 
-/// Which lane's budget a returned handoff failure may spend, from the
-/// [`crate::native_updater_service::ApplyMode`] the attempt was authorized under.
-/// A person's failure charges nothing: no budget, no latch, no retired intent.
+/// Which lane's budget a returned handoff failure may spend.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg(any(unix, test))]
 pub(crate) enum HandoffFailureLane {
-    /// Automatic, and the lossless rollback was caused by user/terminal activity:
-    /// spends [`AutomaticRetryKind::ActivityRevoked`] budget.
     ActivityRevoked,
-    /// Automatic, and the failure is evidence about the artifact or the
-    /// machine: spends the converging physical budget on the schedule its
-    /// [`PhysicalFailureShape`] earns.
     Physical(PhysicalFailureShape),
-    /// A person asked for this apply (the Version menu, the palette, a control
-    /// request, or an install-on-clean-quit gesture). Charges nothing.
     Manual,
-    /// Automatic, and the park's capture refused the desk
-    /// ([`crate::UpdateHandoffOutcome::CaptureRefused`]). Spends no activity
-    /// spacing and no physical budget, is never re-parked and never latches. It
-    /// is recorded as an apply failure naming the session (so `failing_applies`
-    /// moves and `update status` says `apply_failure=`) and retried once the
-    /// desk changes, or after [`CAPTURE_REFUSAL_BACKSTOP`].
     Refused,
-    /// The stage waits for an update check to confirm its signer against a current
-    /// machine roster ([`crate::UpdateHandoffOutcome::StageUnconfirmed`]), whoever
-    /// asked (`automatic` says who). No failure: nothing is charged, latched or
-    /// booked as one; the automatic lane holds for the check
-    /// ([`crate::AutoApplyRosterWait`]) and the outcome is a deferral, which the
-    /// ledger keeps as the standing refusal that names the wait.
-    /// Unix: only [`Self::classify`] (the unix handoff's) files one.
     #[cfg(unix)]
-    AwaitsRosterConfirmation { automatic: bool },
+    AwaitsRosterConfirmation {
+        automatic: bool,
+    },
 }
 
 #[cfg(any(unix, test))]
 impl HandoffFailureLane {
-    /// Classify one returned completion from the mode the apply was authorized
-    /// under and the worker's `outcome`.
-    ///
-    /// `revoked_by_activity` is the main thread's half of the activity
-    /// observation; the worker's half is the `ActivityRevoked` outcome, and
-    /// either suffices. Both matter only for a background attempt: a person's
-    /// apply does not wait for a quiet epoch (it still arms the revocation
-    /// watcher and gates Commit on `exact_activity`).
-    ///
-    /// `death` is the worker's evidence about a `ChildDied` candidate, which a
-    /// refusing, faulting or starved successor all produce identically (see
-    /// [`crate::ChildDeathEvidence`]); every other outcome ignores it.
+    /// Classify one returned completion from the mode the apply was authorized under and the worker's `outcome`.
     #[must_use]
     #[cfg(unix)]
     pub(crate) fn classify(
@@ -1376,7 +980,6 @@ impl HandoffFailureLane {
         death: crate::ChildDeathEvidence,
         revoked_by_activity: bool,
     ) -> Self {
-        // Before the mode: a stage waiting for a check to confirm its signer is no
         // failure of either lane's, a person's press included.
         if outcome == crate::UpdateHandoffOutcome::StageUnconfirmed {
             return Self::AwaitsRosterConfirmation {
@@ -1386,8 +989,6 @@ impl HandoffFailureLane {
         if !mode.is_automatic() {
             return Self::Manual;
         }
-        // First, and over the main thread's activity flag: re-filing a refusal
-        // as activity is the loop `RefusalNeverRetriesAsActivity` rules out.
         if outcome == crate::UpdateHandoffOutcome::CaptureRefused {
             return Self::Refused;
         }
@@ -1398,8 +999,6 @@ impl HandoffFailureLane {
         }
     }
 
-    /// Whether this failure is allowed to touch the automatic lane's scheduling
-    /// state at all (its budgets, its latch, its live intent).
     #[must_use]
     #[cfg(any(unix, test))]
     fn charges_the_automatic_lane(self) -> bool {
@@ -1412,12 +1011,6 @@ impl HandoffFailureLane {
     }
 }
 
-/// The fork lane's answer to a capture that refused the desk, by who asked,
-/// matching [`HandoffFailureLane::classify`] on the launched lane. Automatic:
-/// [`UpdateOutcome::CaptureRefused`], whose caller arms the desk-fingerprint
-/// retry. A person's press: [`UpdateOutcome::Failed`], as
-/// `abort_reaped_native_apply_before_reconcile` answers it; nothing arms a
-/// retry for a press, so Settings must not say "retries when it changes".
 #[cfg(unix)]
 fn fork_capture_refusal_outcome(
     mode: crate::native_updater_service::ApplyMode,
@@ -1433,24 +1026,11 @@ fn fork_capture_refusal_outcome(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AutomaticRetryKind {
     PreflightBlocked,
-    /// The overlap attempt parked, spawned, and was revoked by user or terminal
-    /// activity before Commit. The rollback is lossless (kill, reap, resume
-    /// readers; the parent consumed nothing post-park), so repeating is as safe
-    /// as the first attempt. Spaced 2 s growing to 30 s; never exhausted.
     #[cfg(any(unix, test))]
     ActivityRevoked,
     PhysicalFailure,
 }
 
-/// A bounded retry plan for cheap ordering/preflight races and, on a short
-/// budget and long leash, for physical handoff failures (see
-/// [`MAX_PHYSICAL_FAILURE_CYCLES`]); an unbounded, saturating spacing for
-/// lossless activity-revoked overlap returns.
-///
-/// For [`AutomaticRetryKind::PhysicalFailure`], `cycles` is the index within
-/// the current epoch: `None` means this epoch is spent, and
-/// [`App::spend_physical_failure_budget`] decides whether that ends the epoch
-/// or the lane. [`AutomaticRetryKind::ActivityRevoked`] never answers `None`.
 #[must_use]
 fn automatic_retry_delay(cycles: u8, kind: AutomaticRetryKind) -> Option<std::time::Duration> {
     let budget = match kind {
@@ -1465,7 +1045,6 @@ fn automatic_retry_delay(cycles: u8, kind: AutomaticRetryKind) -> Option<std::ti
     let seconds = match (kind, cycles.min(ACTIVITY_REVOKED_LADDER_RUNGS - 1)) {
         (AutomaticRetryKind::PreflightBlocked, 0 | 1) => 5,
         (AutomaticRetryKind::PreflightBlocked, _) => 15,
-        // Saturates at 30 s (`ACTIVITY_REVOKED_LADDER_RUNGS`).
         #[cfg(any(unix, test))]
         (AutomaticRetryKind::ActivityRevoked, 0) => 2,
         #[cfg(any(unix, test))]
@@ -1476,18 +1055,13 @@ fn automatic_retry_delay(cycles: u8, kind: AutomaticRetryKind) -> Option<std::ti
         (AutomaticRetryKind::ActivityRevoked, 3) => 20,
         #[cfg(any(unix, test))]
         (AutomaticRetryKind::ActivityRevoked, _) => 30,
-        // Tens of minutes, so the machine is plausibly in a different state (caches warm, load
-        // down).
         (AutomaticRetryKind::PhysicalFailure, 0) => 600,
         (AutomaticRetryKind::PhysicalFailure, _) => 1800,
     };
     Some(std::time::Duration::from_secs(seconds))
 }
 
-/// Whether a pre-park verification of `(build, commit, artifact)` must start at
-/// `now`: not when a fresh verdict for that key is cached, and not while a read
-/// of that key is still in flight within its ceiling (a second `codesign` only
-/// adds load).
+/// Whether a pre-park verification of `(build, commit, artifact)` must start at `now`.
 #[cfg(unix)]
 #[must_use]
 pub(crate) fn preverify_read_needed(
@@ -1510,21 +1084,15 @@ pub(crate) fn preverify_read_needed(
     !fresh && !running
 }
 
-/// What this process knows about a stage waiting for an update check to confirm its
-/// signer ([`App::known_roster_wait`]).
+/// What this process knows about a stage waiting for an update check to confirm its signer.
 #[cfg(unix)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct KnownRosterWait {
-    /// The wait's words ([`aterm_update::is_roster_confirmation_wait`]).
     pub(crate) reason: String,
-    /// When that answer ended.
     pub(crate) answered_at: std::time::Instant,
-    /// Known from the lane's hold rather than from a read: already held.
     pub(crate) held: bool,
 }
 
-/// Raises its flag when dropped: the pre-park verification's "I have ended",
-/// on every path out of its thread, a panic included.
 #[cfg(unix)]
 struct RaiseOnDrop(std::sync::Arc<std::sync::atomic::AtomicBool>);
 
@@ -1535,9 +1103,7 @@ impl Drop for RaiseOnDrop {
     }
 }
 
-/// Parse the durable artifact identity without allocating. Reducer-imported
-/// stages are already canonical, but automatic application fails closed on
-/// malformed identity bytes.
+/// Parse the durable artifact identity without allocating.
 #[must_use]
 pub(crate) fn decode_dmg_sha256(digest: &str) -> Option<[u8; 32]> {
     fn nibble(byte: u8) -> Option<u8> {
@@ -1560,9 +1126,7 @@ pub(crate) fn decode_dmg_sha256(digest: &str) -> Option<[u8; 32]> {
     Some(decoded)
 }
 
-/// Seed the process service from the durable status marker every update
-/// surface reads. A missing marker yields an enabled/idle (or disabled)
-/// service; no network work occurs here.
+/// Seed the process service from the durable status marker every update surface reads.
 pub(crate) fn load_native_updater_service(
     launch_installability: crate::native_updater_service::UpdateInstallability,
 ) -> NativeUpdaterService {
@@ -1570,16 +1134,11 @@ pub(crate) fn load_native_updater_service(
         .parse::<u64>()
         .unwrap_or(0);
     let version = crate::build_info::version_display();
-    // Startup ledger reconciliation is posted by an off-loop worker, so first
-    // input never queues behind TOML or PlistBuddy work on the event loop.
     NativeUpdaterService::new(build, version, aterm_update::enabled())
         .seed_installability(launch_installability)
 }
 
-/// What the launch's own path already says about whether this copy can replace
-/// itself: a disk image, a translocated download, a bare binary and a dev-marked
-/// build cannot, read before the event loop runs. An ordinary install stays
-/// unobserved until the reconcile reads its bundle.
+/// What the launch's own path already says about whether this copy can replace itself.
 #[must_use]
 pub(crate) fn launch_installability(
     posture: Option<aterm_update::which_copy::InstallPosture>,
@@ -1599,11 +1158,6 @@ pub(crate) fn launch_installability(
 }
 
 /// Bounded, owned result suitable for a typed event-loop wake.
-///
-/// Runs only on a worker thread (facts and check workers), so it can take the
-/// second ledger read: `aterm_update` keeps the apply lane's reasons out of
-/// `UpdateStatus` and exposes them through `apply_lane_report`. This joins
-/// them so every surface sees the failure count and reason together.
 pub(crate) fn durable_update_status(status: aterm_update::UpdateStatus) -> DurableUpdateStatus {
     let apply_lane = aterm_update::apply_lane_report(status.current_build).unwrap_or_default();
     DurableUpdateStatus {
@@ -1646,15 +1200,10 @@ fn failed_update_status(build: u64, message: String) -> DurableUpdateStatus {
         failing_persistent: false,
         failing_kind: String::new(),
         failing_applies: 0,
-        // A worker that could not start says nothing about the apply lane; a reason
-        // here would attach to a streak of zero.
         apply_failure: String::new(),
         apply_failure_build: 0,
         apply_failures_for_target: 0,
-        // A worker failure says nothing about the bundle; the installable claim is
-        // only ever made by a real observation.
         installable: None,
-        // Likewise: only a completed check can pronounce the channel unreadable.
         channel_unreadable: false,
         checked_at: None,
     }
@@ -1695,8 +1244,6 @@ fn union_native_damage(first: DamageRegion, second: DamageRegion) -> DamageRegio
 }
 
 /// Identity of every input that can change the active native app's compiled UI.
-/// A cached frame is observable only while this stamp still matches the live
-/// controller, service, document, and window geometry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct NativeUiCompileStamp {
     pub(crate) instance: crate::tab_model::AppInstanceId,
@@ -1707,8 +1254,6 @@ pub(crate) struct NativeUiCompileStamp {
     pub(crate) update_revision: u64,
     pub(crate) document_seq: Option<u64>,
     pub(crate) presentation_revision: u64,
-    /// Theme and chrome-font identity consumed only by raster lowering. A
-    /// paint-input change must never reuse a reducer-local rectangle.
     pub(crate) paint_revision: u64,
 }
 
@@ -1724,12 +1269,6 @@ fn native_appearance_revision(preferences: crate::native_appearance::AppearanceP
     revision.finish()
 }
 
-/// Paint identity for the host-owned motion facts supplied to every native app.
-/// These are not reducer state: focus, OS Reduce Motion, recording-watch focus,
-/// load shedding, OS appearance, the serious override and GPU capability can
-/// change while the view generation stays stable. They still invalidate
-/// retained pixels, because Settings previews resolve animation, window
-/// appearance, static effect output and their static/live badge from them.
 fn native_motion_revision(motion: crate::native_app::ViewMotionCx) -> u8 {
     (motion.system_reduced as u8)
         | ((motion.focused as u8) << 1)
@@ -1740,9 +1279,7 @@ fn native_motion_revision(motion: crate::native_app::ViewMotionCx) -> u8 {
 }
 
 impl NativeUiCompileStamp {
-    /// Regional reducer damage remains sound only when the view-local reducer
-    /// generation is the sole stamp input that changed. Geometry, services,
-    /// document content, or presentation changes conservatively widen to All.
+    /// Regional reducer damage remains sound only when the view-local reducer generation is the sole stamp input that changed.
     pub(crate) fn accepts_regional_damage_from(self, previous: Self) -> bool {
         self.instance == previous.instance
             && self.view == previous.view
@@ -1762,8 +1299,6 @@ pub(crate) enum NativeCompiledPhase {
 }
 
 /// The exact semantic/layout product lowered into the native tray for a frame.
-/// Control inspection, pixels, hit testing and the accessibility tree all observe this one
-/// artifact rather than a second compile.
 #[derive(Clone, Debug)]
 pub(crate) struct NativeCompiledFrame {
     pub(crate) stamp: NativeUiCompileStamp,
@@ -1771,34 +1306,24 @@ pub(crate) struct NativeCompiledFrame {
     pub(crate) compiled: crate::native_ui::CompiledUi,
 }
 
-/// Retained semantic scene for one native split leaf. Backend-neutral: raster
-/// consumes `compiled.tray`, and a direct `UiScene` backend could consume the
-/// same view/stamp/viewport without changing geometry, cache identity, hit
-/// testing or accessibility.
+/// Retained semantic scene for one native split leaf.
 #[derive(Clone, Debug)]
 pub(crate) struct NativeLeafScene {
     pub(crate) stamp: NativeUiCompileStamp,
     pub(crate) instance: crate::tab_model::AppInstanceId,
     pub(crate) view: crate::tab_model::ViewId,
     pub(crate) viewport: crate::native_ui::LogicalRect,
-    /// View-local logical-pixel damage declared by the reducer. The retained
-    /// tray adapter patches the outward-rounded device tile when every other
-    /// compile-stamp input is stable, without widening to the leaf or window.
     pub(crate) damage: DamageRegion,
     pub(crate) compiled: crate::native_ui::CompiledUi,
 }
 
-/// Immutable view of one compositor-retained native leaf. The full live compile
-/// stamp, lifecycle generation, semantic tree, and exact raw-window destination
-/// have already been cross-checked by the resolver that returns it.
+/// Immutable view of one compositor-retained native leaf.
 pub(crate) struct RetainedNativeLeafArtifact<'a> {
     pub(crate) instance: crate::tab_model::AppInstanceId,
     pub(crate) view: crate::tab_model::ViewId,
     pub(crate) generation: u64,
     pub(crate) compiled: &'a crate::native_ui::CompiledUi,
     pub(crate) ime_caret: Option<crate::native_ui::LogicalRect>,
-    /// Signed window-space destination. A centred transient surface crop can
-    /// place the retained leaf partly above/left of the physical client area.
     pub(crate) device_x: i64,
     pub(crate) device_y: i64,
     pub(crate) width: u32,
@@ -1853,92 +1378,47 @@ pub(crate) struct NativeConfigExternalPreparationCompletion {
 pub(crate) enum NativeConfigWork {
     Patch(crate::native_app::ConfigPatch),
     Undo(u64),
-    /// A Settings view's Undo of its own write still on its way when it was
-    /// pressed: at the lane head, right after that write, it is the Undo of
-    /// the token the write landed with ([`App::take_native_config_landings`]).
     UndoLanding(crate::native_app::OperationId),
-    /// A process command stays a semantic intent until it reaches the head of
-    /// the serialized config lane; materializing its OCC patch earlier would
-    /// give rapid toggles the same base revision and make them conflict.
     SeriousMode(bool),
-    /// Control-protocol `settings set|unset`: an absolute semantic intent,
-    /// materialized against the newest service revision at the lane head. It
-    /// never runs a standalone read/edit/write beside native Settings.
     ControlField {
         key: String,
         value: Option<String>,
     },
-    /// A theme chosen in the command palette: `theme` becomes the value
-    /// [`crate::prefs::theme_sideless_choice_value`] gives against the newest service
-    /// revision at the lane head, so a Follow-system pair keeps its other
-    /// side even when an earlier write in the lane changed it.
     ThemeChoice {
         id: String,
         side: aterm_types::Appearance,
     },
 }
 
-/// Completion authority for the one serialized config lane. Native Settings
-/// patches return to their typed reducer; process commands have no fabricated
-/// view identity and complete through their own App-owned policy transition.
+/// Completion authority for the one serialized config lane.
 #[derive(Debug)]
 pub(crate) enum NativeConfigOrigin {
     View {
         instance: crate::tab_model::AppInstanceId,
         view: crate::tab_model::ViewId,
         reply: crate::native_app::ReplyToken<ConfigPatchOutcome>,
-        /// A theme edit's request id (from the counter control and palette
-        /// theme writes share, so it orders against their previews) and value:
-        /// its completion settles the preview even after the view has closed.
         theme_request: Option<Box<(u64, String)>>,
-        /// The view's own earlier writes this one was composed over
-        /// ([`crate::native_app::AppEffect::ConfigPatch`]): at the lane head
-        /// its base revision is the newest any of them landed at
-        /// ([`App::native_config_followed_base`]).
         follows: Vec<crate::native_app::OperationId>,
     },
     SeriousMode {
         desired: bool,
     },
-    /// A `[presence]` leaf's durable write (View ▸ Show Needs in Windows writes
-    /// `presence.rim`): `key` is the leaf. The live bit flipped at the click
-    /// (`App::user_toggle_needs_in_windows`); this completion adopts the
-    /// durable truth or, on a refused write, reverts to it.
     Presence {
         key: &'static str,
     },
-    /// A theme chosen in the command palette (`App::palette_choose_theme`):
-    /// `id` is the row's theme. Its preview stands
-    /// ([`PreviewHold::Committing`](crate::control_theme::PreviewHold)) until
-    /// this completion: an applied write adopts the durable `theme` and draws
-    /// it, a refused one reverts the preview and says why.
     ThemeChoice {
         request_id: u64,
         id: String,
     },
-    /// View ▸ Stats Bars' durable write (`sys.stats_bars` set to `form`):
-    /// the runtime follows the written file through the reload every write
-    /// ends in; a refused write only says so.
     StatsBars {
         form: crate::stats_deck::StatsBars,
     },
-    /// View ▸ Deck Size's durable write (`sys.stats_deck_size` set to
-    /// `pref`): as [`Self::StatsBars`], the runtime follows the written file
-    /// through the reload every write ends in; a refused write only says so.
     DeckSize {
         pref: crate::stats_plan::DeckSizePref,
     },
-    /// The harness switch's `on` (`App::switch_harness_on`): one switch of
-    /// aterm.toml that held a session's harness off (`key`: the master
-    /// switch, the headless gate or an agent's own) written `true`. The
-    /// policy follows the written file through the watcher; a refused write
-    /// says so and lets the switch's `◐ turning on` go.
     HarnessSwitch {
         key: &'static str,
     },
-    /// Completion sink for the `settings set|unset` wire command. The control
-    /// thread blocks on this one-shot while the main loop stays free. Non-success
-    /// outcomes return as `Err`, so the wire formatter cannot prefix them with OK.
     Control {
         request_id: u64,
         key: String,
@@ -1952,10 +1432,7 @@ pub(crate) struct NativeConfigRequest {
     work: NativeConfigWork,
 }
 
-/// A Settings view's write that landed while a later request of the same
-/// view, made over it, waits in the lane ([`NativeConfigOrigin::View`]'s
-/// `follows`): the revision it landed at, and the undo token it landed
-/// with (`None` where it changed nothing).
+/// A Settings view's write that landed while a later request of the same view.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct NativeConfigLanding {
     view: crate::tab_model::ViewId,
@@ -1964,8 +1441,6 @@ pub(crate) struct NativeConfigLanding {
     undo: Option<u64>,
 }
 
-/// Whether a request still queued in `pending` follows `view`'s write
-/// `operation` ([`NativeConfigOrigin::View::follows`]).
 fn native_config_followed(
     pending: &std::collections::VecDeque<NativeConfigRequest>,
     view: crate::tab_model::ViewId,
@@ -1977,17 +1452,6 @@ fn native_config_followed(
     })
 }
 
-/// THE BASE A VIEW'S FOLLOWING WRITE IS CHECKED AT. A Settings view shows
-/// its writes still on their way at once and composes the next press over
-/// them: a second click on a switch whose first is saving expects the value
-/// the first one writes. Checked at the revision the page last read, that
-/// second write would conflict with the first, the page's own; so it is
-/// checked at the newest revision any write it follows landed at (each one
-/// ahead of it in this FIFO lane: `landings`), and at `base` when none
-/// landed. Its exact expectations still hold it to what the file has: a
-/// followed write that failed leaves the value it expected unwritten, and a
-/// change from anywhere else since that landing is newer than the base and
-/// conflicts.
 fn native_config_followed_base(landings: &[NativeConfigLanding], base: u64) -> u64 {
     landings
         .iter()
@@ -2091,9 +1555,6 @@ fn observe_and_prepare_native_config(
     crate::native_config_service::VersionedConfigService::prepare_observation(observation, themes)
 }
 
-/// Read aterm.toml at `path` for the config lane to resynchronize after a
-/// save: a refused read is said as a failed save's is ([`crate::save_words`]),
-/// the host's own account going to the log.
 fn observe_config_for_a_person(
     path: &std::path::Path,
 ) -> Result<crate::native_config_service::ConfigDiskObservation, String> {
@@ -2178,10 +1639,7 @@ impl App {
         u64::try_from(now.saturating_duration_since(self.lat_epoch).as_millis()).unwrap_or(u64::MAX)
     }
 
-    /// Main-thread projection for the control socket's front-input
-    /// authorization fence. Overlay identity wins (it consumes events first);
-    /// otherwise native Settings, and its Harness page, are distinguished from
-    /// other native apps.
+    /// Main-thread projection for the control socket's front-input authorization fence.
     pub(crate) fn front_control_surface(&self) -> crate::control::FrontControlSurface {
         if let Some(kind) = self
             .front()
@@ -2229,8 +1687,6 @@ impl App {
         }
     }
 
-    /// Hand `work` to the updater worker; a worker that has hung up is
-    /// restarted and offered it once more. A full queue answers `Saturated`.
     fn send_native_update_work(
         &mut self,
         worker: &NativeUpdateReconcileSender,
@@ -2257,8 +1713,6 @@ impl App {
     }
 
     /// Mint one monotonic identity before dispatching a durable updater read.
-    /// Exhaustion fails closed: reuse could let an old completion outrank a
-    /// newer observation.
     pub(crate) fn mint_native_update_reconcile_ticket(
         &mut self,
     ) -> Option<NativeUpdateReconcileTicket> {
@@ -2315,8 +1769,6 @@ impl App {
     }
 
     /// Queue status and installed-bundle probes on the process worker.
-    /// `try_send` never blocks input; on saturation the request stays pending
-    /// until a later event-loop turn enqueues it.
     pub(crate) fn request_native_update_reconcile(
         &mut self,
         purpose: NativeUpdateReconcilePurpose,
@@ -2341,10 +1793,6 @@ impl App {
         &mut self,
         destination: impl FnOnce(NativeUpdateReconcilePurpose) -> NativeUpdateFactDestination,
     ) -> NativeUpdateDispatch {
-        // Called at every park point. Check for real work before touching
-        // service state or building a destination: on macOS cloning the
-        // EventLoopProxy installs a CFRunLoop source, which would turn an idle
-        // park into a self-waking hot loop.
         let Some(purpose) = self.pending_native_update_reconcile_purpose.take() else {
             return NativeUpdateDispatch::Queued;
         };
@@ -2360,16 +1808,11 @@ impl App {
         outcome
     }
 
-    /// Pure guard for the event-loop retry wrapper, separate from proxy
-    /// materialization so Tier-1 can prove an idle park never clones or wakes
-    /// an `EventLoopProxy` or reaches the unavailable/log path.
     #[must_use]
     fn has_pending_native_update_reconcile(&self) -> bool {
         self.pending_native_update_reconcile_purpose.is_some()
     }
 
-    /// Injectable wrapper around proxy materialization, so Tier-1 can count the
-    /// proxy side effect itself, not just the worker dispatch below it.
     fn retry_pending_native_update_reconcile_via(
         &mut self,
         materialize_proxy: impl FnOnce(
@@ -2392,29 +1835,22 @@ impl App {
     }
 
     /// Retry one coalesced request after the worker has had an opportunity to drain.
-    /// No filesystem work and no blocking operation occurs on the event loop.
     pub(crate) fn retry_pending_native_update_reconcile(&mut self) {
         self.retry_pending_native_update_reconcile_via(|app| app.proxy.clone());
     }
 
     /// Queue boot-sentinel confirmation/GC behind already-requested fact reads.
-    /// This is nonblocking and performs no filesystem work on the event loop.
     pub(crate) fn request_native_boot_health_confirmation(&mut self) -> NativeUpdateDispatch {
         let Some(worker) = self.ensure_native_update_reconcile_worker() else {
             return NativeUpdateDispatch::Unavailable;
         };
         let work = NativeUpdateWorkerRequest::ConfirmBootHealth {
             current_build: self.native_updater_service.snapshot().current_build,
-            // A headless process's checkpoint is its control socket, and it
-            // settles only a trial no window has launched.
             witness: crate::boot_trial_witness(self.headless),
         };
         self.send_native_update_work(&worker, work)
     }
 
-    /// Refuse a control `update apply` whose updater facts could not be
-    /// collected: recorded durably (a Blocked verdict is not a ledger failure)
-    /// and surfaced like every other apply outcome.
     fn refuse_control_apply_without_facts(&mut self) {
         let reason = "Updater facts could not be collected safely";
         aterm_update::record_apply_refusal(
@@ -2445,20 +1881,13 @@ impl App {
         }
     }
 
-    /// Accept one ordered fact completion, then derive every presentation and
-    /// action from the effective reducer stage; the stage wake's build/version
-    /// are never authority.
+    /// Accept one ordered fact completion, then derive every presentation and action from the effective reducer stage.
     pub(crate) fn finish_native_update_reconcile(
         &mut self,
         purpose: NativeUpdateReconcilePurpose,
         facts: NativeUpdateReconcileFacts,
     ) {
-        // Read before reducing: `reconcile_native_update_facts` publishes the new
-        // stage into `self.relaunch`, so a later comparison would never see a
-        // newly announced stage.
         let announced_before = self.relaunch.as_ref().map(|notice| notice.build);
-        // A deferred purpose rides the newest facts, so it is never dropped as
-        // IgnoredStale behind a newer observation.
         let (purpose, facts) = match self.deferred_native_update_reconcile.take() {
             Some((deferred_purpose, deferred_facts))
                 if deferred_facts.observation_sequence <= facts.observation_sequence =>
@@ -2473,11 +1902,6 @@ impl App {
         };
         match self.reconcile_native_update_facts(facts) {
             NativeUpdateFactsResult::IgnoredStale => {
-                // The facts were stale but the purpose is not: a control apply
-                // whose read began before this process imported its stage is
-                // re-observed. Bounded, so a facts worker whose sequence restarted
-                // cannot turn one request into a hot loop; past it the request is
-                // refused, loudly.
                 const MAX_CONTROL_APPLY_STALE_RETRIES: u8 = 3;
                 if purpose == NativeUpdateReconcilePurpose::ApplyControl
                     && (self.control_apply_stale_retries >= MAX_CONTROL_APPLY_STALE_RETRIES || {
@@ -2517,8 +1941,6 @@ impl App {
                 self.say_linux_held_stage();
 
                 if let Some(stage) = effective_stage {
-                    // A launch-record renewal in flight yields: this stage's own handoff
-                    // renews the record as it lands.
                     #[cfg(target_os = "macos")]
                     self.yield_launch_record_renewal_to_update();
                     if newly_announced
@@ -2528,10 +1950,6 @@ impl App {
                                 | NativeUpdateReconcilePurpose::StageAvailable
                         )
                     {
-                        // Announced here, not by the downloader: `Progress::Staged` fires
-                        // only when this process downloaded the artifact, so a build staged
-                        // by an earlier launch or a sibling would never open the status-bar
-                        // row. `note_update_progress` is idempotent for a row already up.
                         aterm_log::info!(
                             "update staged: build {} (v{}) announced on the status bar",
                             stage.build,
@@ -2549,8 +1967,6 @@ impl App {
                         let outcome = self.apply_native_update(ApplyMode::Immediate);
                         let landed = matches!(outcome, UpdateOutcome::Accepted);
                         self.surface_update_apply_outcome("control request", outcome, false);
-                        // A control apply that did not land (preflight blocked,
-                        // deferred) leaves the stage armed like any other import.
                         if !landed {
                             self.arm_native_auto_apply(stage.build, &stage.dmg_sha256);
                         }
@@ -2572,14 +1988,6 @@ impl App {
     }
 
     /// A LINUX BUILD HELD FOR A PERSON IS ON THE BAND.
-    /// With automatic install off, a Linux check downloads a newer build and
-    /// holds it for `aterm update apply`; the macOS apply authority takes no
-    /// Linux stage (`staged_from_status`), so Settings ▸ Software Update showed
-    /// it and the band never did. Every reduced reconcile reads the copy's
-    /// facts: a held build newer than this process is said once per build
-    /// ([`crate::update_words::linux_held`]) — found at launch or after a pass —
-    /// and owed to a band that can show it; its row leaves with the stage
-    /// (installed by the command, or replaced). Reads nothing on macOS.
     pub(crate) fn say_linux_held_stage(&mut self) {
         let snapshot = self.native_updater_service.snapshot();
         let running = snapshot.current_build;
@@ -2604,10 +2012,6 @@ impl App {
         }
     }
 
-    /// Reduce the disk facts a returned apply carried through the same door as
-    /// every other reconcile, so whatever they import is also armed. A pending
-    /// deferred purpose rides these newer facts; otherwise this is a plain
-    /// refresh (arms, never announces).
     #[cfg(any(unix, test))]
     fn reduce_returned_apply_facts(&mut self, facts: NativeUpdateReconcileFacts) {
         self.finish_native_update_reconcile(NativeUpdateReconcilePurpose::Refresh, facts);
@@ -2644,9 +2048,7 @@ impl App {
         ))
     }
 
-    /// Resolve the logical viewport for one exact native presentation, even
-    /// when another leaf is focused or its tab is inactive. Never borrows the
-    /// focused leaf's rectangle.
+    /// Resolve the logical viewport for one exact native presentation, even when another leaf is focused or its tab is inactive.
     pub(crate) fn native_ui_viewport_for(
         &self,
         wid: WindowId,
@@ -2678,8 +2080,7 @@ impl App {
         self.native_ui_viewport_in_plan(wid, view, &plan)
     }
 
-    /// [`Self::native_ui_viewport_for`] from a visible `plan` of the view's
-    /// tab the caller already built (a capture lays its frame out from one).
+    /// [`Self::native_ui_viewport_for`] from a visible `plan` of the view's tab the caller already built.
     pub(crate) fn native_ui_viewport_in_plan(
         &self,
         wid: WindowId,
@@ -2692,8 +2093,6 @@ impl App {
         let leaf = plan
             .leaf(view)
             .ok_or_else(|| "native view is hidden by pane zoom".to_string())?;
-        // Zoom presents one leaf as the whole native content surface. Preserve
-        // the full viewport's padding exactly as the ordinary single-leaf path.
         if plan.leaves.len() <= 1 {
             return self.native_ui_full_viewport(wid);
         }
@@ -2718,9 +2117,7 @@ impl App {
         }
     }
 
-    /// Device-pixel Y where native content begins: top pad + OS head band +
-    /// in-frame chrome rows (tab strip + status bars). Painter and pointer
-    /// projection share this origin.
+    /// Device-pixel Y where native content begins.
     pub(crate) fn native_content_origin_y(&self, wid: WindowId) -> usize {
         let (_, ch) = self.win_cell_size(wid);
         self.win_pad_top(wid)
@@ -2782,10 +2179,6 @@ impl App {
         self.theme.bg.hash(&mut paint);
         self.theme.cursor.hash(&mut paint);
         self.theme.selection.hash(&mut paint);
-        // The page palette is a second paint input (`window_theme` can force
-        // it off the terminal theme, and color overrides do not reach it);
-        // hashing the resolved fields re-lowers retained pages exactly when
-        // their pixels move.
         self.chrome_palette(crate::app_render::ChromeSurface::NativePage)
             .hash(&mut paint);
         self.win_font_px(wid).to_bits().hash(&mut paint);
@@ -2805,8 +2198,6 @@ impl App {
             .hash(&mut paint);
         let motion = self.native_view_motion_cx(wid, view);
         native_motion_revision(motion).hash(&mut paint);
-        // The automatic selected-tab colour Settings shows follows the chrome
-        // theme, High Contrast and the system accent.
         motion.automatic_tab_color.hash(&mut paint);
         Ok(NativeUiCompileStamp {
             instance,
@@ -2821,8 +2212,7 @@ impl App {
         })
     }
 
-    /// Return the compiled artifact retained for glass only while every live
-    /// input still matches the stamp captured with it.
+    /// Return the compiled artifact retained for glass only while every live input still matches the stamp captured with it.
     pub(crate) fn cached_native_ui(&self, wid: WindowId) -> Option<&NativeCompiledFrame> {
         let stamp = self.native_ui_compile_stamp(wid).ok()?;
         self.windows
@@ -2842,9 +2232,7 @@ impl App {
         }
     }
 
-    /// Mark exactly one retained native leaf dirty. Damage is leaf-local and
-    /// never invalidates a sibling's scene; repeated regions are conservatively
-    /// unioned until the renderer consumes them.
+    /// Mark exactly one retained native leaf dirty.
     pub(crate) fn invalidate_native_view_cache(
         &mut self,
         wid: WindowId,
@@ -2877,7 +2265,6 @@ impl App {
     ) {
         self.invalidate_native_view_cache(wid, view, damage);
         if let Some(window) = self.windows.get_mut(&wid) {
-            // The full-page raster is retained independently of its leaf scene.
             window.settings_card = None;
             if let Some(window) = window.os_window.as_ref() {
                 window.request_redraw();
@@ -2890,8 +2277,6 @@ impl App {
         instance: crate::tab_model::AppInstanceId,
         damage: DamageRegion,
     ) {
-        // ViewStore owns the instance links. A shared-model publication must
-        // advance every linked frame's stamp without changing view-local state.
         let views = self
             .view_store
             .iter()
@@ -2912,8 +2297,7 @@ impl App {
         }
     }
 
-    /// Retire queued actions for every view of one shared review without
-    /// changing its fields, caret, focus, or visual frame identity.
+    /// Retire queued actions for every view of one shared review without changing its fields, caret, focus, or visual frame identity.
     pub(crate) fn retire_native_review(&mut self, instance: crate::tab_model::AppInstanceId) {
         let views = self
             .view_store
@@ -2928,8 +2312,7 @@ impl App {
         }
     }
 
-    /// Compile the active native app's one semantic tree for inspection or hit
-    /// testing. Paint uses this exact compiler in `redraw_native_window`.
+    /// Compile the active native app's one semantic tree for inspection or hit testing.
     pub(crate) fn compiled_native_ui(
         &self,
         wid: WindowId,
@@ -2976,8 +2359,7 @@ impl App {
             .map_err(|error| format!("native compile failed: {error:?}"))
     }
 
-    /// Build one independently cacheable native leaf scene. No active/focused
-    /// window assumption enters this seam.
+    /// Build one independently cacheable native leaf scene.
     pub(crate) fn build_native_leaf_scene(
         &self,
         wid: WindowId,
@@ -3016,8 +2398,6 @@ impl App {
                 .windows
                 .get(&wid)
                 .is_some_and(|window| window.screen_edr_potential),
-            // The companion verdict's three rungs, read without advancing the
-            // tenure gate (`promotable_kitty`'s read).
             companion_look: aterm_effects::companion_look::companion_precedence(
                 self.kitty_log.favourite_look_loaded(),
                 self.windows
@@ -3030,10 +2410,7 @@ impl App {
         }
     }
 
-    /// Resolve one exact retained native artifact, the tree and destination
-    /// paint, pointer routing, accessibility and inspection all consume. Any
-    /// lifecycle, geometry, service, theme or document drift changes the compile
-    /// stamp and fails closed.
+    /// Resolve one exact retained native artifact, the tree and destination paint, pointer routing, accessibility and inspection all consume.
     #[cfg(test)]
     pub(crate) fn retained_native_leaf_artifact(
         &self,
@@ -3104,8 +2481,6 @@ impl App {
         if let Some(size) = window.win_px {
             let right = device_x.checked_add(i64::from(raster.width))?;
             let bottom = device_y.checked_add(i64::from(raster.height))?;
-            // Partial intersection is the normal centred-crop case. Reject only
-            // a truly offscreen retained destination (or a torn empty extent).
             if raster.width == 0
                 || raster.height == 0
                 || right <= 0
@@ -3131,7 +2506,6 @@ impl App {
     }
 
     /// Anchor native IME candidates to the exact focused caret just presented.
-    /// The retained artifact owns the same origin/scale used for pointer input.
     pub(crate) fn report_native_ime_cursor_area(
         &mut self,
         wid: WindowId,
@@ -3147,9 +2521,6 @@ impl App {
         let Some(caret) = artifact.ime_caret else {
             return;
         };
-        // Inverse of retained_native_leaf_at_pointer: the presented leaf supplies
-        // the native scale and signed window origin, including a mixed pane's
-        // offset and transient centred crop.
         let mut left = (artifact.device_x as f64 + f64::from(caret.x) * artifact.scale).floor();
         let mut top = (artifact.device_y as f64 + f64::from(caret.y) * artifact.scale).floor();
         let mut right =
@@ -3174,8 +2545,7 @@ impl App {
         self.report_ime_cursor_rect(wid, rect);
     }
 
-    /// Resolve the retained leaf containing a raw window-space pointer and map
-    /// it into that leaf's canonical logical coordinates.
+    /// Resolve the retained leaf containing a raw window-space pointer and map it into that leaf's canonical logical coordinates.
     pub(crate) fn retained_native_leaf_at_pointer(
         &self,
         wid: WindowId,
@@ -3207,8 +2577,7 @@ impl App {
         None
     }
 
-    /// Convert a window-space pointer into the focused native app's retained
-    /// content coordinates.
+    /// Convert a window-space pointer into the focused native app's retained content coordinates.
     #[cfg(test)]
     pub(crate) fn native_content_point(&self, wid: WindowId, x: f64, y: f64) -> Option<(f32, f32)> {
         let (_, focused) = self.active_native_view(wid)?;
@@ -3216,9 +2585,6 @@ impl App {
         (artifact.view == focused).then_some((x, y))
     }
 
-    /// The aterm.toml completion panel the editor view draws (the same rule
-    /// as `EditorApp::view`), so the host sizes the text for what is really
-    /// left and the caret line stays on screen.
     fn shown_config_assist_rows(
         &self,
         instance: crate::tab_model::AppInstanceId,
@@ -3239,12 +2605,9 @@ impl App {
         }
         let listed = assist.typed || state.config_completion_interaction == Some(context);
         if listed {
-            // A list asked for with nothing to list and no help draws no
-            // panel, as the view filters it out.
             (assist.help.is_some() || !assist.completions.is_empty())
                 .then(|| crate::native_ui::EditorPalette::Rows(assist.completions.len().max(1)))
         } else {
-            // Resting on a key: the help line alone, as the view draws it.
             assist
                 .resting_help
                 .is_some()
@@ -3252,9 +2615,7 @@ impl App {
         }
     }
 
-    /// Tell the active editor how many lines its viewport shows (less the command
-    /// palette's candidates or the aterm.toml completion panel) and invalidate its
-    /// leaf; `Ok(true)` when that changed.
+    /// Tell the active editor how many lines its viewport shows and invalidate its leaf; `Ok` when that changed.
     pub(crate) fn reconcile_active_editor_viewport(
         &mut self,
         wid: WindowId,
@@ -3277,7 +2638,6 @@ impl App {
                 _ => None,
             })
             .and_then(|buffer| match &buffer.minibuffer {
-                // The view lists "No matching command" in a row of its own.
                 crate::native_editor::Minibuffer::Command { query, .. } => {
                     Some(crate::native_ui::EditorPalette::Rows(
                         crate::native_editor::command_completions(query)
@@ -3289,8 +2649,6 @@ impl App {
             })
             .or_else(|| self.shown_config_assist_rows(instance, view))
             .unwrap_or(crate::native_ui::EditorPalette::None);
-        // The toolbar the view draws, so the rows it leaves the file are the
-        // rows the caret is kept within.
         let toolbar = match (
             self.native_runtime.app(instance),
             self.native_runtime.view_state(view),
@@ -3328,16 +2686,12 @@ impl App {
         Ok(true)
     }
 
-    /// Dispatch through the active app reducer, execute every typed effect, then
-    /// refresh tab chrome. Shared by pointer/keyboard input and the control
-    /// `act` path ([`Self::dispatch_native_view_event`]).
+    /// Dispatch through the active app reducer, execute every typed effect, then refresh tab chrome.
     pub(crate) fn dispatch_native_event(
         &mut self,
         wid: WindowId,
         event: AppEvent,
     ) -> Result<EventResult, String> {
-        // A scroll the person asked for (a wheel, a page key) moves the page
-        // under a still pointer while they watch it: what the pointer rests on
         // afterwards is theirs to press (`app_mouse::NativePointerRest`).
         if matches!(
             event,
@@ -3366,9 +2720,6 @@ impl App {
         {
             self.interact_system_state(wid);
         }
-        // Only Settings scrolls a second region (its sidebar): every other
-        // view's aimed scroll is its one list's, lowered before its own
-        // mappings (Markdown's measured scroll, the editor's view scroll).
         let event = match event {
             AppEvent::ScrollAt { lines, .. } if kind != crate::native_app::AppKind::Settings => {
                 AppEvent::ScrollLines(lines)
@@ -3391,8 +2742,6 @@ impl App {
                 invocation.id.as_str()
             ));
         }
-        // Buttons, `act` and completion rows lower into the same editor
-        // reducer the Emacs keymap runs.
         let event = if kind == crate::native_app::AppKind::Markdown {
             match event {
                 AppEvent::ScrollLines(lines) => {
@@ -3441,8 +2790,6 @@ impl App {
                     "editor/revert" => {
                         AppEvent::EditorCommand(crate::native_editor::EditorCommand::RevertBuffer)
                     }
-                    // The `edit` header row's parts: done and abort, as C-c C-c
-                    // and C-c C-k run them.
                     "editor/finish" => {
                         AppEvent::EditorCommand(crate::native_editor::EditorCommand::FinishEdit)
                     }
@@ -3504,12 +2851,6 @@ impl App {
         } else {
             event
         };
-        // An editor command a button, `act` or a completion row names is
-        // checked against the authority this gesture carries before it runs
-        // (`command_registry::editor_grant`, from the command's own
-        // `EditorCommand::authority`). A refusal runs nothing, says why in the
-        // view's status line and answers the caller with it; keys and M-x
-        // meet the same check inside the reducer.
         if kind == crate::native_app::AppKind::Editor
             && let Some(refusal) = self.refuse_editor_command(view, &event)
         {
@@ -3518,9 +2859,6 @@ impl App {
             return Err(refusal);
         }
         if let Some(result) = self.dispatch_editor_event(instance, view, &event)? {
-            // The editor workspace is an independent reducer and currently has
-            // no regional-damage effect lane. Invalidate its exact leaf only,
-            // and not for an input it declined, which changed nothing, nor for
             // a view the command closed.
             if result == EventResult::Handled && self.view_store.get(view).is_some() {
                 self.invalidate_native_view_cache(wid, view, DamageRegion::All);
@@ -3533,8 +2871,6 @@ impl App {
             .native_runtime
             .dispatch(instance, view, event)
             .map_err(|error| format!("native dispatch failed: {error:?}"))?;
-        // A reducer that mutates without asking for repaint still fails safe,
-        // but only its own leaf is widened to full damage.
         if !outcome.effects.iter().any(|effect| {
             matches!(
                 effect,
@@ -3553,9 +2889,7 @@ impl App {
         Ok(outcome.result)
     }
 
-    /// Dispatch to one exact native view, refusing a stale control target or a
-    /// view no longer active in the window, so a tab switch cannot redirect a
-    /// semantic control action. Human input uses [`Self::dispatch_native_event`].
+    /// Dispatch to one exact native view.
     pub(crate) fn dispatch_native_view_event(
         &mut self,
         wid: WindowId,
@@ -3578,8 +2912,6 @@ impl App {
     }
 
     /// Time only a handled native input that changed the current view's revision.
-    /// The boundary's `true` alone also swallows unsupported keys. Keep that
-    /// routing behavior, but never turn it into a presentation sample.
     pub(crate) fn timed_native_input_event(
         &mut self,
         wid: WindowId,
@@ -3615,9 +2947,7 @@ impl App {
         taken
     }
 
-    /// Native tabs are an input boundary: keyboard/text events are reduced by
-    /// the app and never reach a hidden PTY. Geometry and focus return to the
-    /// host seam as window properties.
+    /// Native tabs are an input boundary.
     pub(crate) fn native_input_event(
         &mut self,
         wid: WindowId,
@@ -3642,9 +2972,6 @@ impl App {
         let Some((instance, active_view)) = self.active_native_view(wid) else {
             return false;
         };
-        // A keypad key acts as its main-block twin on a native page (the keypad identity
-        // is for the PTY encoder). `InputEvent::keypad_folded` is the one fold, shared
-        // with the seam's press classifier; KP_Begin has no twin and lowers to nothing.
         let folded = event.keypad_folded();
         let event = folded.as_ref().unwrap_or(event);
         let editor_active = self
@@ -3694,8 +3021,6 @@ impl App {
                     };
                     let count = assist.completions.len();
                     let present = assist.help.is_some() || count > 0;
-                    // What the view draws: the help line, and the
-                    // suggestions only while typed or asked for.
                     let listed = assist.typed || interacting;
                     let drawn = (listed && (assist.help.is_some() || count > 0))
                         || assist.resting_help.is_some();
@@ -3725,7 +3050,6 @@ impl App {
             .native_runtime
             .app(instance)
             .is_some_and(|app| app.kind() == crate::native_app::AppKind::Markdown);
-        // The one completion-page step every assist key (Ctrl-Space, Tab, Enter) sends.
         let config_completion_page =
             |context: crate::native_config_language::ConfigCompletionContext| {
                 AppEvent::EditorConfigNavigate {
@@ -3760,10 +3084,6 @@ impl App {
             return true;
         }
 
-        // Tab moves keyboard focus between a native page's controls, except
-        // in an Editor, where it is the buffer's (indent-for-tab-command, or
-        // M-x completion) unless the config editor's completion list takes it.
-        // A modified Tab the Editor declines moves focus, below.
         if !editor_chord_pending
             && let InputEvent::Key {
                 key: Key::Named(NamedKey::Tab),
@@ -3773,7 +3093,6 @@ impl App {
             } = event
         {
             if editor_config_completion_active && !mods.contains(Modifiers::SHIFT) {
-                // A held Tab pages the list once: its repeats neither page on
                 // nor indent the buffer behind the list.
                 if *event_type == KeyEventType::Repeat {
                     return true;
@@ -3787,8 +3106,6 @@ impl App {
                 {
                     return true;
                 }
-                // First Tab enters the completion list without editing the
-                // document; arrows choose, Enter or a second Tab accepts.
                 return true;
             }
             if !editor_active && *event_type == KeyEventType::Press {
@@ -3796,10 +3113,6 @@ impl App {
                 return true;
             }
         }
-        // F6 and Shift+F6 move keyboard focus between a native page's
-        // controls in every app, and in an Editor, whose Tab indents, they are
-        // how focus moves at all (design D-15). Ctrl+Tab stays the host's
-        // next tab.
         if let InputEvent::Key {
             key: Key::Named(NamedKey::F6),
             mods,
@@ -3884,10 +3197,6 @@ impl App {
             );
             return true;
         }
-        // THE KEY IS TESTED BEFORE THE PAGE IS: only a Return or Space press
-        // asks whether a text field has the keyboard (a lookup in the page's
-        // compiled tree), so an arrow, a page key or a typed letter never
-        // reaches that lookup at all.
         if !editor_active
             && let InputEvent::Key {
                 key: Key::Named(key @ (NamedKey::Enter | NamedKey::Space)),
@@ -3895,26 +3204,17 @@ impl App {
                 ..
             } = event
             && !self.native_text_field_has_focus(wid)
-            // A font list being searched takes Space as part of the name.
             && !(matches!(key, NamedKey::Space) && self.native_space_types_into_search(wid))
         {
             if self.activate_native_focus(wid).unwrap_or(false) {
                 return true;
             }
-            // Nothing holds keyboard focus: Return (and KP_Enter, folded above)
-            // activates the page's default button, the native convention. Space
-            // never does; on macOS it only activates the focused control.
             if matches!(key, NamedKey::Enter) && self.activate_native_default(wid).unwrap_or(false)
             {
                 return true;
             }
         }
 
-        // A SEGMENTED CONTROL'S ARROWS ([`crate::native_ui::UiNode::segmented`]):
-        // Left and Right move the keyboard between its segments, and stop at
-        // its ends; Return or Space (above) chooses the one it is on. Read
-        // from the page's compiled tree, so every segmented control on every
-        // native page answers the same way.
         if !editor_active
             && let InputEvent::Key {
                 key: Key::Named(arrow @ (NamedKey::ArrowLeft | NamedKey::ArrowRight)),
@@ -3939,15 +3239,9 @@ impl App {
         }
 
         let app_event = match event {
-            // Geometry and focus are window-level facts, not text input, so they
-            // fall through to the ordinary path; `ResizeWindowPx` only requests an
-            // OS window change.
             InputEvent::Resize { .. }
             | InputEvent::ResizeWindowPx { .. }
             | InputEvent::Focus(_) => return false,
-            // An Editor's keys, text and pastes go to amacs's input reducer
-            // whole (`EditorWorkspace::handle_input`), which alone decides what
-            // a key does there.
             InputEvent::Text(text) if editor_active => Some(AppEvent::EditorInput(
                 amacs::input::EditorInput::Text(text.clone()),
             )),
@@ -3968,9 +3262,6 @@ impl App {
                 event_type: KeyEventType::Press | KeyEventType::Repeat,
                 ..
             } if editor_active => {
-                // The config editor's completion list, while it holds focus,
-                // takes the vertical arrows: it is this host's panel, not the
-                // buffer's.
                 let navigation = match key {
                     Key::Named(NamedKey::ArrowUp) => {
                         Some(crate::native_app::ConfigCompletionNavigation::Previous)
@@ -3992,9 +3283,6 @@ impl App {
                         context,
                     })
                 } else {
-                    // The text a character key types is the layout's: `key`
-                    // is its UNSHIFTED key (Shift+a is `a`, German Shift+2 is
-                    // `2`).
                     let text = match key {
                         Key::Character(character) => Some(
                             crate::input::typed_glyph(*character, *mods, *layout_text).to_string(),
@@ -4041,25 +3329,14 @@ impl App {
                         value: None,
                     }))
                 } else {
-                    // Readline caret bindings for the Settings text fields:
-                    // Ctrl-A/E home/end, Ctrl-B/F left/right, Ctrl-D delete
-                    // forward, Ctrl-K/U kill to end/start, Ctrl-W word back.
-                    // Ctrl only (never ⌘/⌥), matched before the `command` arms
-                    // because `command` folds Ctrl in. Scoped to Settings so other
-                    // native apps keep their Ctrl shortcuts.
                     let readline = settings_active
                         && mods.contains(Modifiers::CTRL)
                         && !mods.intersects(
                             Modifiers::SUPER | Modifiers::ALT | Modifiers::HYPER | Modifiers::META,
                         );
-                    // The ⌥ twin of `readline`, for word motion only.
                     let alt_word = settings_active
                         && mods.intersects(Modifiers::ALT | Modifiers::META)
                         && !mods.intersects(Modifiers::CTRL | Modifiers::SUPER | Modifiers::HYPER);
-                    // Off macOS, Ctrl is the platform word modifier (Ctrl+←/→), so it
-                    // joins the ⌥ twin for the named-key arms below (the Ctrl letter arms
-                    // match first). Must match `app_input::field_edit_action`'s
-                    // `by_word`, so the find/rename fields and Settings agree.
                     #[cfg(not(target_os = "macos"))]
                     let alt_word = alt_word || readline;
                     match key {
@@ -4087,9 +3364,6 @@ impl App {
                         Key::Character('w' | 'W') if readline => {
                             Some(AppEvent::TextInput(TextInputEvent::DeleteWordBackward))
                         }
-                        // Word motion in Settings fields: ⌥←/⌥→, and ⌥B/⌥F (the
-                        // emacs spelling, like the terminal's ESC-b/ESC-f). ⌥ only,
-                        // so ⌘← and the Ctrl readline set are untouched.
                         Key::Named(NamedKey::ArrowLeft) if alt_word => {
                             Some(AppEvent::TextInput(TextInputEvent::WordLeft { extend }))
                         }
@@ -4102,9 +3376,6 @@ impl App {
                         Key::Character('f' | 'F') if alt_word => {
                             Some(AppEvent::TextInput(TextInputEvent::WordRight { extend }))
                         }
-                        // Ctrl+⌫ = backward-kill-word off macOS, ahead of the plain
-                        // ⌫ arm. Ctrl+⌦ has no `TextInputEvent` to ride, so forward
-                        // word delete is out of scope.
                         #[cfg(not(target_os = "macos"))]
                         Key::Named(NamedKey::Backspace) if readline => {
                             Some(AppEvent::TextInput(TextInputEvent::DeleteWordBackward))
@@ -4121,8 +3392,6 @@ impl App {
                         Key::Character('y' | 'Y') if command => {
                             Some(AppEvent::TextInput(TextInputEvent::Redo))
                         }
-                        // `key` is the layout's unshifted key; the press types the
-                        // character the terminal would (`crate::input::typed_glyph`).
                         Key::Character(character)
                             if !mods.intersects(
                                 Modifiers::CTRL
@@ -4196,8 +3465,6 @@ impl App {
                         }
                         Key::Named(NamedKey::PageUp) => Some(AppEvent::ScrollLines(-8)),
                         Key::Named(NamedKey::PageDown) => Some(AppEvent::ScrollLines(8)),
-                        // Settings: a text field's caret, else the list's
-                        // top or bottom (the view decides which).
                         Key::Named(NamedKey::Home) if settings_active && !command => {
                             Some(AppEvent::TextInput(TextInputEvent::Home { extend }))
                         }
@@ -4215,8 +3482,6 @@ impl App {
                 }
             }
             InputEvent::Key { .. } => None,
-            // A native view scrolls one vertical list, so a horizontal wheel
-            // maps to no event (`vertical_up()` returns `None`).
             InputEvent::Wheel { dir, lines, .. } => dir.vertical_up().map(|up| {
                 AppEvent::ScrollLines(if up {
                     -(*lines).max(1)
@@ -4259,11 +3524,6 @@ impl App {
                 self.dispatch_native_event(wid, app_event),
                 Ok(EventResult::Bubble)
             );
-            // A Tab an Editor declines (a modified Tab with no M-x query or
-            // key sequence open) is focus traversal, as on every native
-            // page: Shift+Tab back, and Ctrl+Tab no host binding took
-            // (`next_tab` is seeded off macOS) forward, Cocoa's Control-Tab
-            // out of a view whose Tab is its own.
             if declined
                 && editor_active
                 && let InputEvent::Key {
@@ -4279,11 +3539,7 @@ impl App {
         true
     }
 
-    /// The active native page's compiled tree as the window holds it now:
-    /// the compile its last redraw retained, while every input still matches
-    /// the stamp taken with it ([`Self::cached_native_ui`]), else a fresh
-    /// one. Input reads the page through this, so a key never compiles a
-    /// page the window has already compiled.
+    /// The active native page's compiled tree as the window holds it now.
     pub(crate) fn current_native_ui(
         &self,
         wid: WindowId,
@@ -4294,9 +3550,6 @@ impl App {
         }
     }
 
-    /// From the segment the keyboard is on, `step` segments on in its
-    /// segmented control ([`crate::native_ui::CompiledUi::segment_step`]):
-    /// `None` where the keyboard is on no segment.
     fn native_segment_step(
         &self,
         wid: WindowId,
@@ -4312,8 +3565,6 @@ impl App {
         self.current_native_ui(wid).ok()?.segment_step(&focus, step)
     }
 
-    /// Put the keyboard on control `key` of the active native page, ringed,
-    /// as Tab does ([`Self::move_native_focus`]).
     fn focus_native_control(
         &mut self,
         wid: WindowId,
@@ -4351,12 +3602,9 @@ impl App {
             if focus_order.is_empty() {
                 return Ok(());
             }
-            // Where a key stands in the page's reading order, focusable or not.
             let order_of = |key: &crate::native_ui::UiKey| {
                 compiled.semantics.iter().position(|node| &node.key == key)
             };
-            // Where the page's scrolling list stands in that order (not the
-            // sidebar's).
             let list_at = compiled.semantics.iter().position(|node| {
                 node.role == crate::native_ui::SemanticRole::List
                     && node.key.as_str() != "settings/navigation/list"
@@ -4366,10 +3614,6 @@ impl App {
                 .and_then(|key| focus_order.iter().position(|candidate| candidate == key))
                 .map_or_else(
                     || {
-                        // A focus that left the focus order (its control disabled
-                        // itself under the keyboard, s-25) resumes from where it
-                        // stood: the nearest focusable after it, or before it going
-                        // back — never the page's first or last control.
                         let resume = current.as_ref().and_then(order_of).and_then(|at| {
                             if backwards {
                                 focus_order
@@ -4391,9 +3635,6 @@ impl App {
                         }
                     },
                 );
-            // The Settings sidebar is one Tab stop: resolve its step before
-            // deciding whether it crosses the list, which may hold no
-            // focusable control on its current screen.
             let next = match self.native_runtime.view_state(view) {
                 Some(crate::native_app::AppViewState::Settings(state)) => state
                     .tab_past_navigation(
@@ -4406,17 +3647,10 @@ impl App {
                     .unwrap_or(next),
                 _ => next,
             };
-            // Whether the step from `current` to `next` passes over the
-            // list in reading order: forward from before it to after it (or
-            // round to the window's start), back from after it to before it
-            // (or round to the end).
             let passes_list = list_at
                 .zip(current.as_ref().and_then(order_of))
                 .is_some_and(|(list, from)| {
                     order_of(&focus_order[next]).is_none_or(|to| {
-                        // Read a backwards step as the same interval in
-                        // forward order. A wrapped interval can cross a list
-                        // before or after both of its focusable endpoints.
                         let (from, to) = if backwards { (to, from) } else { (from, to) };
                         if from < to {
                             from < list && list < to
@@ -4428,9 +3662,6 @@ impl App {
             (focus_order.clone(), next, passes_list)
         };
         let mut key = focus_order[next].clone();
-        // TAB ENTERS A LIST WHOSE SCREEN SHOWS NONE OF ITS CONTROLS: a step
-        // that would pass over it goes to its first control (Shift-Tab: its
-        // last), which the list scrolls into view.
         if passes_list
             && let Some(crate::native_app::AppViewState::Settings(state)) =
                 self.native_runtime.view_state(view)
@@ -4438,8 +3669,6 @@ impl App {
         {
             key = target;
         }
-        // A Settings list goes on past its screen: Tab from the last control
-        // it shows moves to its next one, which the list scrolls into view.
         if let Some(current) = current.as_ref()
             && let Some(crate::native_app::AppViewState::Settings(state)) =
                 self.native_runtime.view_state(view)
@@ -4447,8 +3676,6 @@ impl App {
         {
             key = beyond;
         }
-        // Settings ▸ Themes' list is one Tab stop: in at the highlighted
-        // row, out in one step.
         if let Some(crate::native_app::AppViewState::Settings(state)) =
             self.native_runtime.view_state(view)
             && let Some(target) =
@@ -4471,8 +3698,6 @@ impl App {
         Ok(())
     }
 
-    /// Whether the active Settings view's font list is being searched, so
-    /// Space types a space into the search instead of pressing a font.
     fn native_space_types_into_search(&self, wid: WindowId) -> bool {
         let Some((_, view)) = self.active_native_view(wid) else {
             return false;
@@ -4535,10 +3760,6 @@ impl App {
         Ok(true)
     }
 
-    /// Activate the page's default button (`CompiledUi::default_action`), the
-    /// bare-Return fallback when no control holds keyboard focus. `false` when
-    /// the page declares no enabled Primary button; the key then flows on to
-    /// the text-input lowering.
     fn activate_native_default(&mut self, wid: WindowId) -> Result<bool, String> {
         let Some((_, action)) = self.current_native_ui(wid)?.default_action.clone() else {
             return Ok(false);
@@ -4618,8 +3839,6 @@ impl App {
                 }
             }
             AppEffect::ConfigUndo { target, reply } => {
-                // An Undo of a write still on its way follows it: it runs
-                // right after it, with the token it lands with.
                 let (work, follows) = match target {
                     crate::native_app::UndoTarget::Token(token) => {
                         (NativeConfigWork::Undo(token), Vec::new())
@@ -4761,8 +3980,6 @@ impl App {
                     )?;
                 }
             }
-            // The page named an entry and a button; the host resolves both and
-            // performs the intent in this window (`perform_message_act`).
             AppEffect::MessageAct { id, action, reply } => {
                 let outcome = self.perform_message_act(wid, id, action);
                 if self.native_runtime.completion_is_current(&reply) {
@@ -4792,9 +4009,6 @@ impl App {
                 )?;
             }
             AppEffect::ChooseWallpaperImage => {
-                // The modal picker runs its own nested loop on the main thread.
-                // Only an affirmative selection writes config, through the same
-                // versioned lane as control `settings set`, so the image is
                 // re-decoded and every Settings view converges on one verdict.
                 if let Some(path) =
                     crate::menu::choose_local_image("Choose a wallpaper image", "Set Wallpaper")
@@ -4806,17 +4020,12 @@ impl App {
                         Some(value),
                         reply,
                     );
-                    // The lane replies asynchronously after persistence; only a
-                    // synchronously-known failure is worth surfacing here.
                     if let Ok(Err(error)) = outcome.try_recv() {
                         aterm_log::warn!("wallpaper picker: {error}");
                     }
                 }
             }
             AppEffect::OpenLogFolder { reply } => {
-                // The host's own log directory, never a path from the view, opened
-                // through NSWorkspace like Open Log: no shell, no Terminal. The page
-                // is told how it went, as `OpenExternal` tells it.
                 let outcome = match crate::logging::log_dir() {
                     Some(dir) if crate::menu::open_file_in_workspace(&dir) => {
                         ExternalOpenOutcome::Opened
@@ -4847,9 +4056,6 @@ impl App {
                 }
             }
             AppEffect::Themes { request, reply } => {
-                // The themes folder is the host's to resolve: the view named
-                // a catalog id at most (`settings_themes_host`). A headless
-                // instance's reaches stop at its own folder.
                 let outcome = crate::settings_themes_host::perform(
                     &request,
                     crate::settings_themes_host::ThemesHostArms::for_instance(self.headless),
@@ -4875,24 +4081,17 @@ impl App {
                     )?;
                 }
             }
-            AppEffect::OpenPackagesLog => {
-                // atpkg's own resolution of where it writes — never a path from the view.
-                match atpkg::packages_log::log_path() {
-                    Some(path) if crate::menu::open_file_in_workspace(&path) => {}
-                    Some(path) => {
-                        aterm_log::warn!("could not open the package log {}", path.display());
-                    }
-                    None => aterm_log::warn!("the package log has no directory to live in"),
+            AppEffect::OpenPackagesLog => match atpkg::packages_log::log_path() {
+                Some(path) if crate::menu::open_file_in_workspace(&path) => {}
+                Some(path) => {
+                    aterm_log::warn!("could not open the package log {}", path.display());
                 }
-            }
-            // Settings ▸ Harness: the host performs the page's request and the
-            // page converges on the republished projection. An AI CLI's Sign in
-            // opens its tab in the Settings view's own window.
+                None => aterm_log::warn!("the package log has no directory to live in"),
+            },
             AppEffect::Harness(crate::native_app::HarnessRequest::AiSignIn { id }) => {
                 self.ai_sign_in(wid, id);
             }
             AppEffect::Harness(request) => self.execute_native_harness(request),
-            // Its timer press, through the App's one writer.
             AppEffect::HarnessTimer(request) => self.execute_harness_timer(request),
             AppEffect::InvalidateOwnPresentation => {
                 self.refresh_native_presentation(wid, instance, view);
@@ -4908,11 +4107,7 @@ impl App {
         Ok(())
     }
 
-    /// Enqueue one `settings set|unset` command into the serialized, versioned
-    /// persistence lane native Settings uses, so validation, reconciliation, OCC,
-    /// atomic publication and follow-up observation have one owner. The main
-    /// loop never blocks on the disk worker: completion carries the socket's
-    /// one-shot reply back through [`NativeConfigOrigin::Control`].
+    /// Enqueue one `settings set|unset` command into the serialized.
     pub(crate) fn queue_control_settings_field(
         &mut self,
         key: String,
@@ -4927,9 +4122,7 @@ impl App {
         );
     }
 
-    /// [`Self::queue_control_settings_field`] under the caller's `request_id`:
-    /// `Some(request_id)` once preflight and the first pump admit it; on `None`
-    /// `reply` already carries the refusal.
+    /// [`Self::queue_control_settings_field`] under the caller's `request_id`.
     pub(crate) fn queue_control_settings_field_admitted(
         &mut self,
         key: String,
@@ -4941,19 +4134,11 @@ impl App {
             .into_iter()
             .find(|field| field.key == key)
         else {
-            // A key the file still loads but nothing reads (retired, or kept for
-            // compatibility) gets the band's and Manual's own story, never
-            // "unknown": a script that set it before its feature went is told
-            // why it no longer can, not sent to a Settings search that finds
-            // nothing. A key written by hand (`conpty`) is told where it is
-            // written.
             let message = crate::native_config_language::control_settings_refusal(&key);
             let _ = reply.send(Err(message));
             return None;
         };
         let canonical_key = field.key.to_string();
-        // A choice no option takes is refused at once, with every option and
-        // the words its row says for it.
         if let Some(Err(refusal)) = value
             .as_deref()
             .map(|value| crate::native_settings::control_input_value(&field, value))
@@ -4988,9 +4173,6 @@ impl App {
                 ..
             }) = self.native_config_pending.remove(position)
         {
-            // Reconciliation/capability failure happened before this request was
-            // reduced. Remove only this caller's tagged request so the control
-            // thread gets a bounded ERR; older UI intents stay queued for retry.
             let _ = reply.send(Err(format!("save failed: {error}")));
             self.refresh_serious_mode_queued_projection();
             return None;
@@ -5017,8 +4199,6 @@ impl App {
         reply: std::sync::mpsc::Sender<Result<String, String>>,
         request_id: u64,
     ) {
-        // A value in the words its Settings row shows ("Reduce", "Match
-        // macOS", "On") is the option it names.
         let value = value.map(|value| {
             crate::prefs::editable_fields(&self.config)
                 .iter()
@@ -5039,20 +4219,12 @@ impl App {
                 value,
             },
         });
-        // Shares the semantic queue with the native Serious Mode command.
-        // Project a valid absolute intent before pumping so a following toggle
-        // composes against it, not the durable value. Invalid bool text has no
-        // projection; reduction rejects it without changing the service.
         if let Some(desired) = serious_mode_intent {
             self.serious_mode_queued_projection = Some(desired);
         }
     }
 
-    /// Enqueue the menu/keybinding/palette Serious Mode command in the versioned
-    /// lane native Settings uses. Capability preflight happens before the
-    /// request is visible; the desired value becomes an exact OCC patch only at
-    /// the head of the lane, against the last completed/optimistic revision. The
-    /// live policy is untouched until durable completion returns.
+    /// Enqueue the menu/keybinding/palette Serious Mode command in the versioned lane native Settings uses.
     pub(crate) fn queue_serious_mode_toggle(&mut self) -> Result<(), String> {
         self.proxy
             .as_ref()
@@ -5066,9 +4238,6 @@ impl App {
         result
     }
 
-    /// Compose a new click against the newest queued intent, not the durable
-    /// policy, so rapid toggles keep their parity while completions are in
-    /// flight.
     fn enqueue_serious_mode_intent(&mut self) -> Result<(), String> {
         let desired = !self
             .serious_mode_queued_projection
@@ -5081,9 +4250,6 @@ impl App {
         Ok(())
     }
 
-    /// Recompute the semantic projection after a completion or failed queue
-    /// admission. The newest valid intent wins; malformed bool text is ignored
-    /// because its reduction always rejects without a write.
     fn refresh_serious_mode_queued_projection(&mut self) {
         self.serious_mode_queued_projection =
             self.native_config_pending
@@ -5103,11 +4269,6 @@ impl App {
                 });
     }
 
-    /// A presence toggle's durable write completed. The live bit flipped at the
-    /// click; an applied write adopts the durable `[presence]` table into
-    /// `self.config`, while a refused one (a conflict with a hand edit, an
-    /// indeterminate or rejected write) says so and reverts the live bit to the
-    /// durable truth, as Serious Mode's completion does.
     fn publish_presence_completion(
         &mut self,
         key: &'static str,
@@ -5115,8 +4276,6 @@ impl App {
         authoritative: Option<&crate::native_config_service::ConfigSnapshot>,
     ) {
         let label = crate::app_take_over::PRESENCE_RIM_LABEL;
-        // `(cause, indeterminate)`: the toggle reverted, or may not have
-        // persisted.
         let feedback = match outcome {
             ConfigPatchOutcome::Applied { .. } => {
                 if let Some(snapshot) = authoritative {
@@ -5127,8 +4286,6 @@ impl App {
             other => write_not_saved_cause(other),
         };
         if let Some((cause, indeterminate)) = feedback {
-            // The durable truth wins over the click: from the authoritative
-            // snapshot when there is one, else the config the App last adopted.
             let durable = authoritative.map_or_else(
                 || self.config.presence_rim_enabled(),
                 |snapshot| snapshot.config.presence_rim_enabled(),
@@ -5145,10 +4302,7 @@ impl App {
         }
     }
 
-    /// Queue the durable write for the needs switch (`presence.rim` set to
-    /// `desired`, View ▸ Show Needs in Windows) through the lane and OCC
-    /// materialization Serious Mode uses, so rapid clicks cannot conflict with
-    /// each other's completions.
+    /// Queue the durable settings write for the presence rim switch.
     pub(crate) fn queue_presence_write(
         &mut self,
         key: &'static str,
@@ -5168,10 +4322,7 @@ impl App {
         self.pump_native_config()
     }
 
-    /// View ▸ Stats Bars: queue the durable `sys.stats_bars` write through
-    /// the lane the presence toggles use. The bars follow the written file
-    /// (the write's reload applies it, re-gridding every window once for a
-    /// change into or out of the Deck); the radio reads the applied form.
+    /// View ▸ Stats Bars.
     pub(crate) fn user_set_stats_bars(&mut self, form: crate::stats_deck::StatsBars) {
         if form == self.stats_bars_form() {
             return;
@@ -5186,11 +4337,7 @@ impl App {
         }
     }
 
-    /// View ▸ Deck Size: queue the durable `sys.stats_deck_size` write
-    /// through the Stats Bars radio's lane. Every window follows the written
-    /// file (the write's reload re-decides each window's form, re-gridding
-    /// each one whose Deck changes height once); the radio reads the applied
-    /// choice.
+    /// View ▸ Deck Size.
     pub(crate) fn user_set_deck_size(&mut self, pref: crate::stats_plan::DeckSizePref) {
         if pref == self.deck_size_pref() {
             return;
@@ -5205,8 +4352,6 @@ impl App {
         }
     }
 
-    /// Queue one View ▸ Stats Bars radio's durable write of `key` = `word`
-    /// on the native config lane.
     fn queue_stats_write(
         &mut self,
         origin: NativeConfigOrigin,
@@ -5227,11 +4372,7 @@ impl App {
         self.pump_native_config()
     }
 
-    /// Queue the durable write of one harness switch `key` turned on
-    /// (`App::switch_harness_on`: `harness.enabled`, `harness.headless` or
-    /// `harness.<agent>.enabled`, each `true`) through the lane and OCC
-    /// materialization the presence toggles use. A lane that cannot take it
-    /// says so, as a refused write does.
+    /// Queue the durable settings write for a toggled harness switch `key`.
     pub(crate) fn queue_harness_switch_write(&mut self, key: &'static str) {
         let queued = (|| {
             self.proxy
@@ -5252,9 +4393,6 @@ impl App {
         }
     }
 
-    /// A harness switch's write completed: applied, the watcher brings the
-    /// policy in; refused or unconfirmed, say why and let the switch's
-    /// `◐ turning on` go (`claude_lights`).
     fn publish_harness_switch_completion(
         &mut self,
         key: &'static str,
@@ -5280,8 +4418,6 @@ impl App {
         }
     }
 
-    /// Say a harness switch did not reach aterm.toml, and let every switch
-    /// turning on go: nothing it waits for will come.
     fn harness_switch_not_saved(&mut self, key: &'static str, cause: &str, indeterminate: bool) {
         for ws in self.windows.values_mut() {
             if ws.claude_lights.let_switches_go() {
@@ -5295,8 +4431,6 @@ impl App {
         ));
     }
 
-    /// The Stats Bars write completed: applied, the reload already drew it;
-    /// refused or unconfirmed, say why (the bars keep the durable form).
     fn publish_stats_bars_completion(
         &mut self,
         form: crate::stats_deck::StatsBars,
@@ -5311,9 +4445,6 @@ impl App {
         }
     }
 
-    /// The Deck Size write completed: applied, the reload already re-decided
-    /// every window; refused or unconfirmed, say why (the windows keep the
-    /// durable choice).
     fn publish_deck_size_completion(
         &mut self,
         pref: crate::stats_plan::DeckSizePref,
@@ -5328,14 +4459,7 @@ impl App {
         }
     }
 
-    /// Queue the durable `theme` write for a theme chosen in the command
-    /// palette, through the lane and OCC materialization the presence toggles
-    /// use. The value is the rule for a choice that names no side
-    /// ([`crate::prefs::theme_sideless_choice_value`]): over a plain name or
-    /// an unset `theme`, the name itself (Default too); while `theme` is a
-    /// `dark:…,light:…` pair, the pair with only the side on screen replaced
-    /// for a theme made for that side, so the choice keeps following the OS,
-    /// and the name for both appearances for one made for the other.
+    /// Queue the durable `theme` write for a theme chosen in the command palette.
     pub(crate) fn queue_theme_choice(&mut self, id: &str) -> Result<(), String> {
         self.proxy
             .as_ref()
@@ -5371,14 +4495,6 @@ impl App {
         request_id
     }
 
-    /// A `theme` write completed: a palette choice, a Settings view's theme
-    /// edit, or control `settings set theme`. An applied or conflicted write
-    /// adopts the durable `theme` into `self.config` at once (the watcher's
-    /// reload of the same text then changes nothing). Applied and verified, a
-    /// preview no newer than this request ends and the configured theme, now
-    /// the chosen one, is installed, so the screen never falls back to the old
-    /// theme in between. Any other outcome ends only this request's own
-    /// preview and, with `notify`, the band says why.
     fn publish_theme_choice_completion(
         &mut self,
         request_id: u64,
@@ -5443,9 +4559,6 @@ impl App {
         }
     }
 
-    /// Build the compare-and-swap request for a Serious Mode intent at dequeue
-    /// time, when every earlier request has reduced into the service and the
-    /// base revision and expected value are current.
     fn serious_mode_patch_request(
         &self,
         desired: bool,
@@ -5479,8 +4592,6 @@ impl App {
         })
     }
 
-    /// Build the `theme` compare-and-swap for a palette choice at dequeue
-    /// time, from the raw value and catalog of the newest revision.
     fn theme_choice_patch_request(
         &self,
         id: &str,
@@ -5541,9 +4652,6 @@ impl App {
             NativeConfigWork::Undo(token) => self
                 .native_config_service
                 .undo(crate::native_config_service::UndoToken::from_stored(token)),
-            // Read at the lane head from the write it follows
-            // ([`Self::reduce_native_config_request`]); with no view to
-            // have made that write there is nothing to take back.
             NativeConfigWork::UndoLanding(_) => {
                 return Err("the change to undo is no longer known".to_string());
             }
@@ -5555,11 +4663,6 @@ impl App {
         })
     }
 
-    /// Reduce the request at the lane head. A Settings view's request made
-    /// over its own writes still on their way ([`NativeConfigOrigin::View`]'s
-    /// `follows`) is read against what they landed with: a write is checked
-    /// at the revision they landed at ([`Self::native_config_followed_base`]),
-    /// and an Undo of one of them takes back the token it landed with.
     fn reduce_native_config_request(
         &mut self,
         request: NativeConfigRequest,
@@ -5575,13 +4678,10 @@ impl App {
                     Some(NativeConfigLanding {
                         undo: Some(token), ..
                     }) => work = NativeConfigWork::Undo(*token),
-                    // It landed changing nothing: nothing to take back.
                     Some(_) => {
                         let snapshot = self.native_config_service.snapshot();
                         return (origin, Ok(ConfigPatchResult::Unchanged { snapshot }));
                     }
-                    // It did not land; what it would have written already
-                    // went back.
                     None => {
                         return (
                             origin,
@@ -5597,18 +4697,12 @@ impl App {
 
     pub(crate) fn pump_native_config(&mut self) -> Result<(), String> {
         while !self.native_config_inflight {
-            // A watcher candidate owns file authority from receipt through
-            // parse/assets/font preparation; hold semantic writes until that
-            // baseline is admitted or rejected. Once a generation is retained,
             // reconciliation orders it against a concurrent durable write.
             if self.config_watch_admission_pending()
                 && self.native_config_external_pending.is_none()
             {
                 return Ok(());
             }
-            // A conflict or post-publication proof failure invalidates the disk
-            // baseline: dispatch a bounded worker observation before popping the
-            // next request. The event loop never opens the path or its assets.
             if self.native_config_service.reconciliation_required() {
                 let proxy = self.proxy.clone().ok_or_else(|| {
                     "native config reconciliation needs an event-loop proxy".to_string()
@@ -5632,21 +4726,11 @@ impl App {
                     "native config worker stopped during reconciliation".to_string()
                 })?;
                 self.native_config_inflight = true;
-                // Park; do not fail the caller. The probe always reports back and
-                // either outcome settles this queue: success clears the fence and
-                // re-pumps (`finish_native_config_reconciliation`); failure answers
-                // every queued origin (`fail_native_config_reconciliation`). Failing
-                // fast on a remembered broken probe would answer with a stale reason
-                // while a fresh probe is in flight, and could tell a queued
-                // `SeriousMode` intent it failed while the probe went on to apply it.
                 return Ok(());
             }
             if self.native_config_pending.is_empty() {
                 return Ok(());
             }
-            // Acquire every fallible host capability before reducing, so an
-            // unavailable proxy/worker cannot advance the in-memory revision
-            // without making it durable.
             let proxy = self
                 .proxy
                 .clone()
@@ -5681,10 +4765,6 @@ impl App {
                         proxy,
                     }));
                     if let Err(error) = queue.send(job) {
-                        // The reducer advanced but no worker owns the candidate.
-                        // Restore from durable authority before completing; a
-                        // control-origin request owns a blocked socket reply and
-                        // must not be dropped.
                         let NativeConfigJob::Persist(job) = error.0 else {
                             unreachable!("persistence send returned a reconciliation job")
                         };
@@ -5751,9 +4831,7 @@ impl App {
         Ok(())
     }
 
-    /// Main-thread half of the config worker protocol. The durable transaction
-    /// completed even if its initiating view closed; revision publication fans
-    /// out to every live Settings view.
+    /// Main-thread half of the config worker protocol.
     pub(crate) fn finish_native_config_write(
         &mut self,
         origin: NativeConfigOrigin,
@@ -5807,13 +4885,8 @@ impl App {
         let reconciled_changed = authoritative
             .as_ref()
             .is_some_and(|snapshot| snapshot.revision != before_revision);
-        // Word the log line and notice from the outcome: a `Rejected` outcome can
-        // fail its preflight before any byte reaches disk, so "Config was saved"
-        // would be false there.
         let saved_wording = match &outcome {
             ConfigPatchOutcome::Applied { .. } => "Config was saved, but its exact disk generation",
-            // The worker lost the race or never produced a proof; either way the
-            // requested edit is not what is on disk now.
             ConfigPatchOutcome::Indeterminate { .. } => {
                 "Config publication could not be verified, and the current disk generation"
             }
@@ -5834,9 +4907,6 @@ impl App {
             ));
         }
         if self.config_watch_admission_pending() || self.native_config_external_pending.is_some() {
-            // A watcher candidate was observed while persistence owned the lane.
-            // Its order is ambiguous until a worker samples the path after this
-            // point, so fence queued semantic writes now.
             self.native_config_service.mark_reconciliation_required();
             runtime_observation = None;
         }
@@ -5848,15 +4918,6 @@ impl App {
         }
     }
 
-    /// Settle "a reconciliation worker reported back and the lane is still fenced":
-    /// answer everything queued behind this sample, and tell the user only when
-    /// something was lost (an `aterm.toml` that does not parse already has its row from
-    /// the watcher). The fence stays armed; only an admitted disk generation clears it.
-    ///
-    /// Does not re-pump: the fence check in `pump_native_config` precedes the emptiness
-    /// check, so pumping would re-sample the same unreadable path and loop. The next
-    /// `settings set` or Settings save dispatches a fresh sample, which is how a
-    /// transiently broken lane recovers; no failure is remembered.
     fn fail_native_config_reconciliation(&mut self, error: &str) {
         self.native_config_service.mark_reconciliation_required();
         let rejected =
@@ -5883,24 +4944,17 @@ impl App {
         let prepared = match completion.observation {
             Ok(prepared) => self.rebase_prepared_config_themes(prepared),
             Err(error) => {
-                // This sample was the one thing that could clear the fence and
-                // it came back broken; hand its reason to every request queued
-                // behind it, since nothing else drains this queue.
                 self.fail_native_config_reconciliation(&error);
                 return;
             }
         };
 
         if self.native_config_external_sequence > completion.pending_sequence {
-            // A watcher completion arrived after this worker sampled the path.
-            // Admit the sample as an intermediate generation, retain the newer
             // watcher payload, and sample once more before any write.
             if let Err(error) = self
                 .native_config_service
                 .synchronize_prepared_observation(prepared)
             {
-                // The sample read fine but the service refused it: the fence
-                // stays armed with nothing scheduled, so answer the queue.
                 self.fail_native_config_reconciliation(&error);
                 return;
             }
@@ -5942,8 +4996,6 @@ impl App {
         {
             Ok(snapshot) => snapshot,
             Err(error) => {
-                // Ditto: an unadmittable sample leaves no live retry, so answer
-                // the queue instead of holding replies nobody will settle.
                 self.fail_native_config_reconciliation(&error);
                 return;
             }
@@ -5985,10 +5037,6 @@ impl App {
         ));
     }
 
-    /// Consume the deferred generation whose baseline a reconciliation worker
-    /// just observed. Prepared runtime generations bypass the closed
-    /// reconciliation gate exactly once; their own admission clears it
-    /// atomically with the matching bytes/assets.
     fn drain_reconciled_deferred_config_generation(&mut self) {
         if let Some(generation) = self.native_config_external_pending.take() {
             match generation {
@@ -6029,9 +5077,6 @@ impl App {
                 self.finish_native_config_external_admission(&admitted_baseline);
             }
             Err(error) => {
-                // Reached from `finish_native_config_reconciliation`'s
-                // deferred-generation drain: the re-armed fence has nothing
-                // dispatched to clear it, so answer the queue here too.
                 self.native_config_service.mark_reconciliation_required();
                 self.reject_pending_native_config(&format!(
                     "config generation could not be admitted: {error}"
@@ -6047,7 +5092,6 @@ impl App {
         &mut self,
         baseline: &crate::native_document_host::AtomicFileBaseline,
     ) {
-        // Clear only the payload this admission actually proves. A slower
         // generation A must not discard a newer retained generation B.
         if self
             .native_config_external_pending
@@ -6096,8 +5140,6 @@ impl App {
                 &baseline,
                 crate::config_watcher::WatchFailureKind::ConfigPreparationFailed,
             );
-            // The worker queue itself is gone, so the fence just armed can never
-            // get a sample; queued requests are unanswerable.
             self.reject_pending_native_config(&format!("config preparation failed: {error}"));
             self.surface_native_config_lane_error(error);
         }
@@ -6110,8 +5152,6 @@ impl App {
         match completion.result {
             Ok(prepared) => self.reload_prepared_config_observation(prepared),
             Err(error) => {
-                // Invalid TOML is still valid UTF-8: Manual gets the exact watcher
-                // bytes so its diagnostics can help repair them, while live Config
                 // stays unchanged.
                 if let Err(refresh_error) =
                     self.refresh_open_config_editor_observation(&completion.observation)
@@ -6125,9 +5165,6 @@ impl App {
                     &completion.observation.baseline,
                     crate::config_watcher::WatchFailureKind::ConfigInvalidToml,
                 );
-                // The running settings stay. The watcher already posted this
-                // read's `[harness]` lines (`Wake::HarnessPolicyObserved`), kill
-                // switch included.
                 self.surface_native_config_lane_error(format!(
                     "Config observation was not valid TOML: {error}"
                 ));
@@ -6138,12 +5175,6 @@ impl App {
         }
     }
 
-    /// Run the supervisor under `harness` and keep it on the running config so
-    /// the next reload compares against what runs. Sole caller: the watcher's
-    /// `Wake::HarnessPolicyObserved`, posted for every read in disk order
-    /// (`config_watcher::observed_harness`), so the window runs the newest
-    /// read's `[harness]`. Workers restart under a changed policy, and
-    /// `enabled = false` stops them within one wait (`harness_host`).
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -6164,44 +5195,23 @@ impl App {
         if let Some(host) = self.harness.as_ref() {
             host.set_config(running.policy.clone());
         }
-        // The running config mirrors the cell, for Settings and for the next
-        // reload's comparison.
         self.config.harness = running;
-        // An agent that answers for itself re-reads `harness policy` on its
-        // `subscribe` stream's `harness-policy gen=<n>` (no clock).
         self.announce_harness_policy();
-        // Every session's effective Autopilot reads the policy in force: the
-        // roster's readers off this thread are told (`autopilot=`), and every
-        // footer's chip repaints.
         self.publish_harness_posture();
-        // Every session's A/B arm reads the posture: the stretch so far goes
-        // to the arm that was in force; Settings ▸ Harness shows the policy.
         self.note_harness_arms();
         self.harness_screen_moved();
-        // Every need verdict reads whose boxes the host answers under the
-        // policy in force (`HarnessHosting::hosts`): each is published again.
         self.publish_needs_all();
-        // Summarize in a New Tab's row reads the policy too
-        // (`App::summarize_start_block`).
         self.mark_status_dirty();
         self.request_redraw_all_windows();
     }
 
-    /// The native config lane's own error (an observation that was not TOML, a
-    /// failed pump, a dropped request): logged and posted as the single
-    /// `config.lane` row, newest cause.
+    /// The native config lane's own error (an observation that was not TOML, a failed pump, a dropped request).
     pub(crate) fn surface_native_config_lane_error(&mut self, message: String) {
         aterm_log::warn!("native config: {message}");
         self.post_message(crate::message_reporters::config_lane_error(&message));
     }
 
-    /// Answer every still-queued semantic request with one bounded rejection and empty
-    /// the lane; returns how many were rejected. Call it from every arm that re-arms the
-    /// write fence with no worker sample scheduled to clear it: the baseline each queued
-    /// request needs is gone, and a parked request would block a control caller on its
-    /// one-shot `Sender` until the wire timeout. Nothing queued has been reduced, so
-    /// nothing rolls back. Callers must not pump afterwards: the fence check runs before
-    /// the emptiness check, so pumping would spin another reconciliation.
+    /// Answer every still-queued semantic request with one bounded rejection and empty the lane.
     pub(crate) fn reject_pending_native_config(&mut self, message: &str) -> usize {
         let abandoned = std::mem::take(&mut self.native_config_pending);
         if abandoned.is_empty() {
@@ -6227,9 +5237,6 @@ impl App {
         rejected
     }
 
-    /// The landings of `view`'s writes the request at the lane head
-    /// `follows` ([`NativeConfigLanding`]); each is kept only while a request
-    /// still queued follows it.
     fn take_native_config_landings(
         &mut self,
         view: crate::tab_model::ViewId,
@@ -6245,17 +5252,12 @@ impl App {
         landings
     }
 
-    /// Drop the landings no queued request follows any more: the one at the
-    /// lane head has read its own, and a request answered without reaching
-    /// the head (a failed re-read answers every one queued) reads none.
     fn forget_unfollowed_native_config_landings(&mut self) {
         let pending = &self.native_config_pending;
         self.native_config_view_landings
             .retain(|landing| native_config_followed(pending, landing.view, landing.operation));
     }
 
-    /// Remember what a view's write landed with while a request of that
-    /// view still queued follows it ([`Self::reduce_native_config_request`]).
     fn note_native_config_view_landing(
         &mut self,
         view: crate::tab_model::ViewId,
@@ -6350,16 +5352,6 @@ impl App {
                 if serious_mode && let Some(snapshot) = authoritative.as_ref() {
                     self.apply_serious_mode_config_snapshot(snapshot);
                 }
-                // What the key holds once the write landed: a removal, or a
-                // value its default made one, is answered as removed, with
-                // what it now reads as — the words its Settings row shows.
-                // Read from the authoritative snapshot, or, where the write
-                // is durable but the disk generation after it could not be
-                // admitted, from the candidate the service wrote, which is
-                // what the worker proved on disk (it stays the service's
-                // state, and the lane runs one write at a time). Never the
-                // requested text: a value equal to its default was written
-                // as a removal, and a number as its kind spells it.
                 let landed = authoritative.clone().or_else(|| {
                     matches!(outcome, ConfigPatchOutcome::Applied { .. })
                         .then(|| self.native_config_service.snapshot())
@@ -6388,8 +5380,6 @@ impl App {
                     synchronization_error.as_deref(),
                 );
                 if key == crate::prefs::EDIT_THEME {
-                    // Adopt the saved `theme` even while a newer preview stands;
-                    // only this request's own preview may end.
                     self.publish_theme_choice_completion(
                         request_id,
                         value.as_deref().unwrap_or("Default"),
@@ -6405,9 +5395,6 @@ impl App {
                                 .to_string());
                     }
                 }
-                // A saved `theme` the admitted catalog cannot draw, or a selector
-                // with grammar issues, is said in the reply too, not only on the
-                // band the caller cannot see.
                 if key == crate::prefs::EDIT_THEME
                     && let Ok(status) = response.as_mut()
                     && let Some(snapshot) = authoritative.as_ref()
@@ -6521,15 +5508,10 @@ impl App {
             self.post_message(crate::message_reporters::serious_mode_feedback(&message));
         }
 
-        // Settings already received the exact snapshot synchronously above;
-        // the worker-prepared runtime generation is scheduled by the caller.
         self.refresh_serious_mode_queued_projection();
         self.request_redraw_all_windows();
     }
 
-    /// Install only this command's process-global projection from the
-    /// worker-validated snapshot, without reparsing TOML on the event loop, then
-    /// fan the generation out to Settings.
     fn apply_serious_mode_config_snapshot(
         &mut self,
         snapshot: &crate::native_config_service::ConfigSnapshot,
@@ -6540,9 +5522,7 @@ impl App {
         enabled
     }
 
-    /// Feed one stable file observation through the serialized config lane. If
-    /// a Settings commit is in flight, retain the bytes + disk generation;
-    /// completion rejects it if that generation is no longer current.
+    /// Feed one stable file observation through the serialized config lane.
     #[cfg(test)]
     pub(crate) fn sync_native_config_external_observation(
         &mut self,
@@ -6568,28 +5548,18 @@ impl App {
         Ok(Some(snapshot))
     }
 
-    /// Publish one admitted config generation to every live Settings view. Full
-    /// reload callers install `App.config` and assets first; a narrow process
-    /// command may install only its own live projection, then publish the full
-    /// durable snapshot while the ordinary reload applies the rest.
+    /// Publish one admitted config generation to every live Settings view.
     pub(crate) fn publish_native_config_snapshot(
         &mut self,
         snapshot: &crate::native_config_service::ConfigSnapshot,
     ) {
         self.note_config_keys(snapshot);
         self.dispatch_settings_event(&AppEvent::ConfigChanged(snapshot.clone()));
-        // Stable observations also refresh host semantics for an open Manual
-        // buffer. `analysis_generation` advances on byte-identical observations,
-        // so asset/font diagnostics refresh even when the TOML text did not.
         if let Some(document) = self.native_runtime.config_editor_document() {
             self.request_config_host_diagnostics(document);
         }
     }
 
-    /// The node log's `config key=`: the schema keys whose
-    /// authored values `snapshot` moved since the last one this App
-    /// compared, by NAME only. Every admitted snapshot is published here, so
-    /// this is the one place a config change reaches the node log.
     fn note_config_keys(&mut self, snapshot: &crate::native_config_service::ConfigSnapshot) {
         if std::sync::Arc::ptr_eq(&self.node_log_values, &snapshot.semantic_values) {
             return;
@@ -6631,9 +5601,6 @@ impl App {
                 other => self.execute_native_effect(wid, instance, view, other)?,
             }
         }
-        // Completion reducers remove pending work even when the host rejected or
-        // blocked it; refresh from the final presentation so the tab's busy/
-        // attention state never lags its Settings view.
         self.refresh_native_presentation(wid, instance, view);
         if let Some(window) = self.windows.get(&wid).and_then(|ws| ws.os_window.as_ref()) {
             window.request_redraw();
@@ -6648,30 +5615,20 @@ impl App {
         }
     }
 
-    /// Admit one Packages verb. Physical work (spawning the co-located `atpkg`,
-    /// reading its `status.toml`) happens on a worker thread; admission is
-    /// memory-only plus one `current_exe`-sibling stat.
+    /// Admit one Packages verb.
     pub(crate) fn execute_native_packages(&mut self, request: PackagesRequest) -> PackagesOutcome {
         let atpkg = crate::co_located_atpkg();
         if let Err(message) = packages_request_admissible(&request) {
             return PackagesOutcome::Failed { message };
         }
-        // Apply writes the Mac, not the instance, so it is refused by name under
-        // a private state root, before any child. The same flag leads the passes
-        // below (`crate::pass_lead`).
         let private_state_root = aterm_types::dirs::runs_under_private_state_root();
         if let Some(message) = packages_request_refusal(&request, private_state_root) {
             return PackagesOutcome::Blocked { message };
         }
         let argv = packages_argv(&request);
-        // `atpkg machine apply` is a local verb (no store, index or root key), so
-        // the manager gate below does not apply. Its stdout carries the
-        // `machine-settings:` row and the verdict sentence.
         let machine_apply = matches!(request, PackagesRequest::MachineApply);
         let check = matches!(request, PackagesRequest::CheckUpdate);
         let install = matches!(request, PackagesRequest::InstallDefaultSet);
-        // A person pressed it and waits on it, so its pass takes the band's row.
-        // The machine apply is a local, sub-second edit.
         let person = person_verb(&request);
         let Some(atpkg) = atpkg else {
             return PackagesOutcome::Failed {
@@ -6679,7 +5636,6 @@ impl App {
             };
         };
         if !machine_apply && !atpkg::manager_enabled() {
-            // atpkg would refuse too; refusing here only names why.
             return PackagesOutcome::Blocked {
                 message:
                     "the package manager is inert (no package root key is pinned in this build)"
@@ -6698,42 +5654,27 @@ impl App {
             };
         };
         let Some(sequence) = self.native_packages_service.begin(Some(busy)) else {
-            // Backstop: the page disables its buttons whenever any worker is in
-            // flight, so this is a click that raced the disable.
             return PackagesOutcome::Blocked {
                 message: "Still collecting package status — try again in a moment.".to_string(),
             };
         };
-        // The busy flip is observable: publish before the worker starts.
         self.publish_native_packages_state();
         let spawn = crate::qos::spawn_lane_thread(
             "aterm-packages-verb",
             crate::qos::Role::Background,
             move || {
-                // Background, like the six-hour pass: nobody blocks on it, and a QoS
-                // role does not pass from a thread's creator (qos.rs).
-                // atpkg records durable status in status.toml; the process result is
-                // kept separately because that status may predate a failed launch or
-                // non-zero exit. Stderr is kept: atpkg explains refusals there.
                 let mut command = PackagesCommandOutcome::Succeeded { operation: busy };
                 let mut machine_verdict: Option<String> = None;
                 let mut machine_state: Option<atpkg::machine::MachineState> = None;
                 let layout = atpkg::store::resolve_configured();
-                // The check's one fail-fast: a store held by a person's typed verb
-                // (`aterm pkg …`, `claude update`) is answered at once. Behind any
-                // lane it waits like the window's passes.
                 if check && let Some(pid) = layout.as_ref().and_then(atpkg::lock::person_holder) {
                     command = PackagesCommandOutcome::Failed {
                         operation: busy,
                         message: check_held_by_person_message(pid),
                     };
                 }
-                // The one child, unless the fail-fast above already answered (`break` and
-                // `continue` below end it early, with the outcome already set).
                 let process =
                     (!matches!(command, PackagesCommandOutcome::Failed { .. })).then_some(argv);
-                // The person's row: told before the child runs and again at its
-                // exit, whatever that exit was; every `Began` has its `Ended`.
                 let tell = |event: crate::messages_host::PersonPass| {
                     if person.is_some() {
                         let _ = proxy.send_event(Wake::PkgPersonPass(event));
@@ -6743,24 +5684,8 @@ impl App {
                     if let Some(v) = person {
                         tell(crate::messages_host::PersonPass::Began(v));
                     }
-                    // No stdin: a windowed child must never sit on a prompt nobody
-                    // sees.
-                    //
-                    // Stdout is null unless the verb may apply host settings: the
-                    // machine apply, `packages/check` and every install print the
-                    // `machine-settings:` marker (wanted by the pull-down and the
-                    // This Mac status), parsed by the launch pass's marker parser
-                    // (`spawn_machine_settings_once`). Otherwise the install passes
-                    // stream a marker contract this worker does not read.
                     let reads_stdout = machine_apply || busy.applies_machine_settings();
-                    // QoS-classed spawner: a background pass must not compete with
-                    // the window for the scheduler.
                     let mut child = crate::qos::atpkg_command(&atpkg);
-                    // The check is the window's own pass: the same argv (`--wait-lock`
-                    // with the lanes' bound, `--progress-file`), the spawner's pid and
-                    // the login shell's PATH, so a window quitting mid-check hands the
-                    // child to the orphan watch. Both passes lead with the private
-                    // window's flag: the `atpkg` beside a dev build may lack a seam.
                     if check {
                         child
                             .args(crate::pass_lead(private_state_root))
@@ -6772,8 +5697,6 @@ impl App {
                             .env(atpkg::cli::SPAWNER_PID_ENV, std::process::id().to_string())
                             .env("PATH", crate::spawn::atpkg_child_path());
                     } else if install {
-                        // The install streams too (lock wait and progress file), so
-                        // it queues like a pass and its row reads the plan.
                         child
                             .args(crate::pass_lead(private_state_root))
                             .args(verb)
@@ -6801,8 +5724,6 @@ impl App {
                             &mut child,
                             "atpkg machine apply",
                             std::time::Duration::from_secs(60),
-                            // A mutating child is never killed for a flood — see
-                            // `Overflow`. Only the deadline can stop it.
                             Overflow::Truncate,
                         );
                         let read = machine_apply_completion(result, |event| {
@@ -6816,15 +5737,9 @@ impl App {
                         }
                         continue;
                     }
-                    // The check and install stream like the lanes' passes
-                    // (`crate::run_pass_child`), so a pass queued behind another shows
-                    // its waiting row at once. Their `machine-state:` record is not
-                    // taken.
                     if check || install {
                         let post_proxy = proxy.clone();
                         let post = move |event: Wake| {
-                            // Its own queue at the store lock is the person's row's;
-                            // the lanes' `lock-waiting:` stays a log line.
                             let person = match &event {
                                 Wake::PkgMachineState(_) => return,
                                 Wake::PkgLockWaiting { .. } => {
@@ -6874,9 +5789,6 @@ impl App {
                     }
                     let result = child.output();
                     if reads_stdout && let Ok(out) = result.as_ref() {
-                        // The pass's machine lines, through the launch lanes' reader;
-                        // not its `machine-state:` record, measured at the pass's top,
-                        // possibly minutes before exit, so the completion re-reads.
                         crate::read_seed_markers(
                             std::io::BufReader::new(out.stdout.as_slice()),
                             |event| {
@@ -6918,9 +5830,6 @@ impl App {
         match spawn {
             Ok(_) => PackagesOutcome::Accepted,
             Err(error) => {
-                // Roll the reservation back so the surface does not stay busy; the
-                // synchronous failure is the feedback. `abort` (not `finish`) keeps
-                // any previously observed report, since no worker ran.
                 let _ = self.native_packages_service.abort(sequence);
                 self.publish_native_packages_state();
                 PackagesOutcome::Failed {
@@ -6930,22 +5839,15 @@ impl App {
         }
     }
 
-    /// Note what this copy's package tool IS (the co-located `atpkg` stat: cheap
-    /// `current_exe`-sibling metadata, and the compiled root key) before any
-    /// status read, so the package rows' admission is drawn from what is known
-    /// on the first frame — never "not read yet" while an unrelated read runs.
-    /// Returns the stat for the worker that follows.
+    /// Record metadata for the co-located `atpkg` binary.
     pub(crate) fn note_native_package_tool(&mut self) -> bool {
         let available = crate::co_located_atpkg().is_some();
         self.native_packages_service.note_tool(available);
         available
     }
 
-    /// Start one status-collection worker (no verb). A running worker makes
-    /// this a no-op join; headless hosts (no proxy) skip silently.
+    /// Start one status-collection worker (no verb).
     pub(crate) fn start_native_packages_refresh(&mut self) {
-        // The tool's facts first, whatever happens to the read: a host with no
-        // proxy, or a refresh joining one already running, still admits on them.
         let available = self.note_native_package_tool();
         let Some(proxy) = self.proxy.clone() else {
             self.publish_native_packages_state();
@@ -6955,13 +5857,10 @@ impl App {
             self.publish_native_packages_state();
             return;
         };
-        // The status.toml parse stays on the worker.
         let spawn = crate::qos::spawn_lane_thread(
             "aterm-packages-status",
             crate::qos::Role::Background,
             move || {
-                // A package inventory probe is cosmetic to the terminal; it lands
-                // via the proxy when done.
                 let report = crate::packages_screen::collect_packages_status(available);
                 let completion = PackagesWorkerCompletion::refresh(report);
                 let _ = proxy.send_event(Wake::NativePackagesFinished {
@@ -6971,21 +5870,13 @@ impl App {
             },
         );
         if spawn.is_err() {
-            // Release the reservation via abort, never a fabricated report: a
-            // never-observed surface stays on "Reading package status…", and an
             // observed one keeps its facts.
             let _ = self.native_packages_service.abort(sequence);
         }
         self.publish_native_packages_state();
     }
 
-    /// Start one machine read (bare `atpkg machine`, no verb, no store lock) so
-    /// Security's This Mac status confirms the `[machine]` settings from
-    /// what the co-located atpkg measured; the atpkg child is the one seam that
-    /// touches the machine. A read requested while one runs is queued behind it
-    /// (`PackagesService::request_machine_read`), never joined, since the running
-    /// read may predate an apply. Headless hosts and non-macOS builds skip
-    /// silently and draw no status (the This Mac group and its row stay).
+    /// Start an asynchronous `atpkg machine` state refresh.
     pub(crate) fn start_native_machine_refresh(&mut self) {
         if !cfg!(target_os = "macos") {
             return;
@@ -7001,9 +5892,7 @@ impl App {
         self.publish_native_packages_state();
     }
 
-    /// A queued rerun is already admitted by the completion reducer; dispatch
-    /// it directly, since requesting admission again would read the reservation
-    /// as a running worker and leave the status refreshing forever.
+    /// A queued rerun is already admitted by the completion reducer.
     pub(crate) fn finish_native_machine_refresh(
         &mut self,
         result: Result<atpkg::machine::MachineState, String>,
@@ -7021,14 +5910,7 @@ impl App {
         self.publish_native_packages_state();
     }
 
-    /// Main-thread half of the packages worker protocol (the packages analogue
-    /// of [`Self::finish_native_update_check`]); stale sequences are inert. A
-    /// finished verb that ran atpkg's machine pass
-    /// ([`PackagesBusy::applies_machine_settings`]) re-reads the machine so the
-    /// status confirms rather than assumes, except `machine apply` when its
-    /// completion carries the apply's own `machine-state:` record. The collected
-    /// lanes (`update`, every `install`) post no record, so the completion's one
-    /// read closes the expectation their change line opened.
+    /// Main-thread half of the packages worker protocol (the packages analogue of [`Self::finish_native_update_check`]).
     pub(crate) fn finish_native_packages(
         &mut self,
         sequence: u64,
@@ -7048,12 +5930,7 @@ impl App {
         }
     }
 
-    /// Publish the Settings ▸ Messages projection to the Settings controller and
-    /// fan the revision out to every Settings view. The projection is built once
-    /// from the center and the log (`App::messages_state`). Unconditional: the
-    /// caller opening Settings wants it current now; the gated twin
-    /// [`Self::publish_native_messages_state_if_due`] serves the sync and the
-    /// park. A no-op with no Settings instance.
+    /// Publish the Settings ▸ Messages projection to the Settings controller and fan the revision out to every Settings view.
     pub(crate) fn publish_native_messages_state(&mut self) {
         if self
             .native_runtime
@@ -7065,9 +5942,6 @@ impl App {
         let state = self.messages_state();
         let revision = state.revision;
         let words_offset_s = state.utc_offset_s;
-        // The zone is read at the instants themselves: a daylight-saving
-        // change before the words move owes the page its publish where it
-        // lands (`MessagesState::words_change_at`).
         let words_change_in = state
             .words_change_at(|at| crate::presence::local_offset_at(i64::try_from(at / 1000).ok()?))
             .map(|at| std::time::Duration::from_millis(at.saturating_sub(state.now_unix_ms)));
@@ -7084,13 +5958,7 @@ impl App {
         self.dispatch_to_settings_views(&AppEvent::MessagesChanged { revision });
     }
 
-    /// [`Self::publish_native_messages_state`] when it is due: the center moved
-    /// and at least [`MESSAGES_PUBLISH_MIN_GAP`] has passed, or a Settings view
-    /// on the Messages route says a time word that now reads otherwise, or its
-    /// status line is transient ([`Self::settings_messages_quiet_gap`]). Runs
-    /// after every settle and before every wait; a publish the gap holds back
-    /// is re-armed through `messages_deadline`. One enum compare per window
-    /// off the route.
+    /// [`Self::publish_native_messages_state`] when it is due.
     pub(crate) fn publish_native_messages_state_if_due(&mut self, now: std::time::Instant) {
         if self
             .native_runtime
@@ -7115,14 +5983,7 @@ impl App {
         }
     }
 
-    /// The instant the next publish falls due, for the loop's deadline fold; the
-    /// twin of [`Self::publish_native_messages_state_if_due`]'s predicate: the
-    /// 2 Hz hold-back of a publish the center's move earned, or, with the center
-    /// quiet, the page's clock or a transient status line's publishes
-    /// ([`Self::settings_messages_quiet_gap`]). The loop waits when idle, so an
-    /// unarmed tick never fires. `None` with no Settings instance, or with the
-    /// center quiet and no shown view on the route (or one whose page says no
-    /// time) and no transient line, so an idle band arms no wake.
+    /// The instant the next publish falls due, for the loop's deadline fold.
     pub(crate) fn messages_publish_due_at(&self) -> Option<std::time::Instant> {
         self.native_runtime
             .instance_by_kind(crate::native_app::AppKind::Settings)?;
@@ -7137,32 +5998,14 @@ impl App {
         )
     }
 
-    /// The publish an on-screen Settings view asks for with the center quiet
-    /// (on screen: a pane of the active tab of a window whose content is on
-    /// glass, `band_on_screen`, or a headless window's active tab): on the
-    /// Messages route, the instant a time word the last publish said first
-    /// reads otherwise (`messages_words_change_in`, the Mac's sleep counted:
-    /// [`Self::count_sleep_toward_messages_clock`]; at once when the zone reads
-    /// another offset than those words were read on), but never sooner than
-    /// [`MESSAGES_PUBLISH_TICK`] after it, and nothing for a page that says no
-    /// time; and on any page, while its status line is transient (`Copied`,
-    /// `Build information copied`), the publish that starts its clock and the
-    /// one [`MESSAGES_FEEDBACK_WAIT`] later that clears it (xa-13). The
-    /// shortest over all such views. A background tab or hidden window arms
-    /// nothing; once revealed, what it owes is overdue and publishes at once.
     fn settings_messages_quiet_gap(&self) -> Option<std::time::Duration> {
         let mut gap: Option<std::time::Duration> = None;
-        // Whether the zone reads another offset than the last publish's words
-        // were read on: asked once, and only for a shown page that says time.
         let zone_moved = std::cell::OnceCell::new();
         let zone_moved = || {
             *zone_moved.get_or_init(|| {
                 crate::presence::local_offset_s().unwrap_or(0) != self.messages_words_offset_s
             })
         };
-        // A headless instance has no glass, but what its active tab shows is
-        // what a capture of it shows — the lane UI is validated in — so its
-        // status lines run the same clock as a window's (xa-13).
         let shown = |ws: &crate::WindowState| {
             crate::messages_host::band_on_screen(ws)
                 || (self.headless
@@ -7176,8 +6019,6 @@ impl App {
             .filter(|ws| shown(ws))
             .filter_map(|ws| ws.tab_set.active())
         {
-            // Runs before parking and while selecting the next deadline, so visit
-            // the tree directly instead of allocating its leaves.
             tab.root.visit(&mut |view| {
                 if !matches!(
                     self.view_store.get(*view),
@@ -7188,11 +6029,6 @@ impl App {
                 if let Some(crate::native_app::AppViewState::Settings(state)) =
                     self.native_runtime.view_state(*view)
                 {
-                    // A transient status line's publishes, on every page
-                    // (xa-13); on Messages, the publish its time words are
-                    // owed — when one would read otherwise (at once in a zone
-                    // that moved since), at most once a minute, and none while
-                    // it says no time.
                     let clock = match state.status_clock() {
                         Some(false) => Some(MESSAGES_PUBLISH_MIN_GAP),
                         Some(true) => Some(MESSAGES_FEEDBACK_WAIT),
@@ -7218,9 +6054,7 @@ impl App {
         gap
     }
 
-    /// Publish the shared packages projection to the Settings controller and
-    /// fan the revision out to every Settings view (the packages analogue of
-    /// [`Self::publish_native_update_state`]).
+    /// Publish the shared packages projection to the Settings controller and fan the revision out to every Settings view.
     pub(crate) fn publish_native_packages_state(&mut self) {
         let revision = self.native_packages_service.revision();
         let state = self
@@ -7242,9 +6076,7 @@ impl App {
         self.dispatch_to_settings_views(&AppEvent::PackagesChanged { revision });
     }
 
-    /// Publish the Settings ▸ Harness projection (`App::harness_state`) to the
-    /// Settings controller and fan the revision out to every Settings view (the
-    /// packages twin). A no-op with no Settings instance: nothing is built.
+    /// Publish the `App::harness_state` projection to Settings ▸ Harness.
     pub(crate) fn publish_native_harness_state(&mut self) {
         if self
             .native_runtime
@@ -7253,8 +6085,6 @@ impl App {
         {
             return;
         }
-        // When the Timer's `at` offer turns its words, noted before they are
-        // read (`App::note_land_at_offer`).
         self.note_land_at_offer();
         let state = self.harness_state();
         self.harness_screen.revision = self.harness_screen.revision.saturating_add(1);
@@ -7268,9 +6098,7 @@ impl App {
         self.dispatch_to_settings_views(&AppEvent::HarnessChanged { revision });
     }
 
-    /// Deliver `event` to every Settings view and repaint every window that shows one — the
-    /// fan-out after a shared Settings projection (messages, packages, the harness, the
-    /// updater) was replaced.
+    /// Deliver `event` to every Settings view and repaint every window that shows one.
     pub(crate) fn dispatch_to_settings_views(&mut self, event: &AppEvent) {
         let setting_views = self.dispatch_settings_event(event);
         for ws in self.windows.values_mut() {
@@ -7288,9 +6116,6 @@ impl App {
         }
     }
 
-    /// Deliver `event` to every live Settings view in view-store order, run the
-    /// effects each returns, and return those views; every shared Settings
-    /// projection is published through here.
     fn dispatch_settings_event(&mut self, event: &AppEvent) -> Vec<crate::tab_model::ViewId> {
         let views =
             self.view_store
@@ -7310,10 +6135,6 @@ impl App {
             let Ok(outcome) = self.native_runtime.dispatch(instance, view, event.clone()) else {
                 continue;
             };
-            // A shared projection can complete a view's pending work (Settings ▸
-            // Themes selects a saved theme once the published catalog lists it),
-            // so its effects run as any reducer's do; dropped, that select's
-            // config patch would never run.
             if outcome.effects.is_empty() {
                 continue;
             }
@@ -7409,7 +6230,6 @@ impl App {
     }
 
     pub(crate) fn start_native_update_check(&mut self) -> UpdateOutcome {
-        // Joining does no physical work and mints no event-loop capability, which
         // keeps the no-duplicate promise testable headless.
         if self.native_updater_service.snapshot().active.is_some() {
             return match self.native_updater_service.request_check() {
@@ -7449,8 +6269,6 @@ impl App {
                     "aterm-native-update-check",
                     crate::qos::Role::Background,
                     move || {
-                        // A network update probe; nobody at the keyboard waits on
-                        // it.
                         let status = aterm_update::check_now_with_settings(build, &provider);
                         let _ = proxy.send_event(Wake::NativeUpdateFinished {
                             ticket,
@@ -7473,9 +6291,7 @@ impl App {
         }
     }
 
-    /// Main-thread half of the updater worker protocol. Completion is
-    /// service-owned, stays valid after every Settings view closes, and
-    /// publishes one revision to all subscribers.
+    /// Main-thread half of the updater worker protocol.
     pub(crate) fn finish_native_update_check(
         &mut self,
         ticket: UpdaterWorkTicket,
@@ -7483,26 +6299,19 @@ impl App {
     ) {
         let completion = self.native_updater_service.finish_check(ticket, status);
         if completion != CheckCompletion::Reduced {
-            // An old worker cannot redraw, notify, arm intent, or drain a newer
             // deferred observation. Reducer-inert means presentation-inert too.
             return;
         }
         if self.native_updater_service.snapshot().staged.is_some() {
-            // The floor for disk observations: anything read before this instant
-            // predates the stage this check imported (see
             // `reconcile_native_update_facts`).
             self.native_stage_imported_at = Some(std::time::Instant::now());
         }
         self.publish_native_update_state();
 
-        // Facts parked while this check ran were observed before it staged
-        // anything; replaying them would retire the stage it just imported. Keep
-        // the purpose (a control apply must not be lost) and re-observe the disk.
         if let Some((purpose, _stale)) = self.deferred_native_update_reconcile.take()
             && !self.request_native_update_reconcile(purpose)
         {
             if purpose == NativeUpdateReconcilePurpose::ApplyControl {
-                // A control apply never vanishes silently: the same refusal the control
                 // entry path surfaces when facts cannot be collected.
                 self.refuse_control_apply_without_facts();
             } else {
@@ -7522,8 +6331,6 @@ impl App {
             .as_ref()
             .map(|staged| (staged.build, staged.dmg_sha256.clone()))
         {
-            // This check may have confirmed the stage's signer: a lane held for
-            // that asks the stage again.
             #[cfg(unix)]
             self.roster_wait_check_reported(build);
             self.arm_native_auto_apply(build, &digest);
@@ -7531,17 +6338,7 @@ impl App {
         self.try_pending_native_auto_apply(true);
     }
 
-    /// Bring the automatic lane's deadlines forward by the time the Mac slept since the
-    /// last turn of the event loop. They are promises in calendar time, but each is an
-    /// `Instant`, which on macOS (`CLOCK_UPTIME_RAW`) stops during sleep. The sleep is how
-    /// far `wall` ran ahead of `now` since `App::update_deadline_clock` last read both: a
-    /// wall clock stepped back counts nothing, no deadline moves past `now`, read drift
-    /// never counts ([`SLEEP_COUNTS_FROM`]), and a wall clock stepped forward reads as a
-    /// sleep and can bring a retry sooner. The physical budget's replenish window stays
-    /// awake time, which only errs toward remembering the bytes longer.
-    ///
-    /// Returns the sleep it counted, for the other calendar clocks
-    /// ([`Self::count_sleep_toward_messages_clock`]); `None` when none counts.
+    /// Bring the automatic lane's deadlines forward by the time the Mac slept since the last turn of the event loop.
     pub(crate) fn count_sleep_toward_update_deadlines(
         &mut self,
         now: std::time::Instant,
@@ -7578,10 +6375,7 @@ impl App {
         Some(slept)
     }
 
-    /// The time the Mac slept since the last turn of the event loop, counted
-    /// toward every calendar clock: the automatic lane's deadlines
-    /// ([`Self::count_sleep_toward_update_deadlines`]) and the Messages page's
-    /// ([`Self::count_sleep_toward_messages_clock`]). First in each turn.
+    /// The time the Mac slept since the last turn of the event loop, counted toward every calendar clock.
     pub(crate) fn count_sleep_since_last_turn(
         &mut self,
         now: std::time::Instant,
@@ -7592,31 +6386,13 @@ impl App {
         }
     }
 
-    /// THE MESSAGES PAGE'S CLOCK IS CALENDAR TIME TOO. A page is republished
-    /// when the time words its last publish said next read otherwise
-    /// (`messages_words_change_in`, a span after that publish on the
-    /// monotonic clock, which stops while the Mac sleeps), so a page that said
-    /// `3 h ago` and slept the night would say it for most of an awake hour
-    /// more, and `Today` past the midnight it slept through. The time the Mac
-    /// slept ([`Self::count_sleep_toward_update_deadlines`]) comes off that
-    /// span: a page whose words moved during the sleep is owed its publish at
-    /// once, never sooner than [`MESSAGES_PUBLISH_TICK`] after the last.
     fn count_sleep_toward_messages_clock(&mut self, slept: std::time::Duration) {
         if let Some(until) = self.messages_words_change_in.as_mut() {
             *until = until.saturating_sub(slept);
         }
     }
 
-    /// Let a manual-only latch lapse once its deadline passes, restoring automatic apply
-    /// for that artifact. Returns true when a latch was released.
-    ///
-    /// A latch's deadline comes from the physical-failure schedule: a retry inside its
-    /// epoch, a stand-down between epochs ([`PHYSICAL_FAILURE_EPOCH_COOLDOWN`]), a
-    /// re-sample at convergence. A `retry_at: None` latch (a spent structural
-    /// re-sample, an environment block, the policy fail-safe) never lapses. A
-    /// structural verdict's re-sample deadline is instead one look at
-    /// [`Self::look_at_structural_latch`], which releases the latch only when one more
-    /// launch cannot be the one its boot trial reverts on.
+    /// Let a manual-only latch lapse once its deadline passes, restoring automatic apply for that artifact.
     pub(crate) fn lapse_expired_auto_apply_manual_only(&mut self) -> bool {
         let now = std::time::Instant::now();
         let lapsed = self
@@ -7625,8 +6401,6 @@ impl App {
         let verdict = self
             .auto_apply_manual_only
             .and_then(|manual| self.structural_verdict_of(manual));
-        // A refused release's retry coming due is a look too, whatever the
-        // latch's own deadline (folded separately, `structural_supersede_retry_at`).
         let retry_due = self.native_activation_supersede.is_none()
             && verdict
                 .is_some_and(|verdict| verdict.newer_retry.is_some_and(|retry| now >= retry.at));
@@ -7644,19 +6418,10 @@ impl App {
             );
             self.auto_apply_manual_only = None;
             self.auto_overlap_retry = None;
-            // `auto_apply_ladder` is not cleared: the landing bound is per artifact and
-            // counts from the first arming. Nor is `auto_apply_physical_retry`: it is
-            // the remaining physical budget, and clearing it on every lapse would turn
-            // a bounded retry into a permanent loop; its own replenish window forgives
-            // an artifact.
         }
         lapsed
     }
 
-    /// The structural verdict a latch rides on, when it has one. A latch without
-    /// one (a transient schedule's, the policy fail-safe's) is not the
-    /// structural latch's business, nor is the environment block even where a
-    /// verdict covers its build: it waits on the installed copy changing.
     fn structural_verdict_of(
         &self,
         latch: crate::AutoApplyManualOnly,
@@ -7670,10 +6435,7 @@ impl App {
             .filter(|verdict| verdict.covers(latch.build, latch.dmg_sha256, latch.activation))
     }
 
-    /// When a refused release behind the structural latch may be offered the
-    /// install path again, folded beside the latch's own deadline so an idle
-    /// machine still retries. `None` with no latch, verdict or refused release,
-    /// or while a retire runs (it answers through `finish_activation_supersede`).
+    /// When a refused release behind the structural latch may be offered the install path again.
     pub(crate) fn structural_supersede_retry_at(&self) -> Option<std::time::Instant> {
         if self.native_activation_supersede.is_some() {
             return None;
@@ -7684,34 +6446,8 @@ impl App {
             .map(|retry| retry.at)
     }
 
-    /// Whether one more automatic launch of the latched build keeps its boot trial under
-    /// [`BOOT_TRIAL_LAUNCH_LIMIT`], from the sentinel's count the last updater
-    /// observation measured; `None` when none has yet.
-    ///
-    /// A DOWNLOAD's latched build has no launch counted yet: it is not
-    /// installed, and the swap that installs it arms its trial from zero
-    /// (`prepare_trial`). That does NOT make its candidate safe from being a
-    /// reverting launch. The candidate's first image is the RUNNING build, whose
-    /// own trial `check_boot_health` may count before any swap. A candidate
-    /// that stays that build because its boot apply had nothing it may do now,
-    /// or deferred on a passing refusal, refuses its target as no verdict on
-    /// it — exit 75 — and gives that launch back on its way out (
-    /// #75). One whose boot apply DEFERRED ON A VERDICT (the running build's
-    /// own trial whose recovery proof fails, "trial recovery proof: …") does
-    /// neither: `seamless::passing_refusal_exit` answers no 75, and the parent
-    /// gives back only the TARGET's launch, under a build no trial is armed
-    /// for. That launch stays counted on the running build's trial, so such
-    /// attempts can spend its budget, and the launch that exhausts it is the
-    /// one `check_boot_health` reverts on (or disarms, with no verified
-    /// predecessor) — a download's candidate among them.
-    /// The installed ACTIVATION is where the count matters: a structural
-    /// `ChildDied` keeps its counted launch, so after two of them the next
-    /// launch of the bundle is the one `check_boot_health` reverts on.
     fn structural_latch_trial_room(&self, latch: crate::AutoApplyManualOnly) -> Option<bool> {
         if !latch.activation {
-            // The latched build's own trial has counted nothing (above). This is
-            // no answer for the RUNNING build's trial, which a deferred-on-a-
-            // verdict candidate can spend: that count is not this latch's, and
             // the lane does not read it here.
             return Some(true);
         }
@@ -7720,43 +6456,19 @@ impl App {
             .map(|(_, launches)| launches.saturating_add(1) < BOOT_TRIAL_LAUNCH_LIMIT)
     }
 
-    /// Whether `build` is a latched installed activation with no deadline left whose
-    /// boot trial measured no launch to spare: its next start, by anyone, is the one
-    /// `check_boot_health` reverts on (only a swap re-arms an activation's trial,
-    /// `prepare_trial`). Only a newer release moves it, so no surface offers the
-    /// press: the band row (`ApplyPosture::TrialSpent`), the Version menu, palette and
-    /// Settings read "on hold" from this fact, and a control `update apply` refuses.
-    /// An unmeasured count is not spent.
+    /// Whether `build` is a latched installed activation with no deadline left whose boot trial measured no launch to spare.
     pub(crate) fn latched_activation_trial_spent(&self, build: u64) -> bool {
         self.auto_apply_manual_only
             .filter(|latch| latch.build == build && latch.activation && latch.retry_at.is_none())
             .is_some_and(|latch| self.structural_latch_trial_room(latch) == Some(false))
     }
 
-    /// An apply attempt returned, so any count the lane held predates its
-    /// launch: the attempt's launch was counted in the candidate, and whether
-    /// it stays counted is decided on the handoff worker after this completion
-    /// (`forgives_the_counted_trial_launch`). The lane holds no count until an
-    /// observation read after now measures one; facts read mid-attempt measure
-    /// nothing. Called on every returned attempt, a person's included.
     #[cfg(any(unix, test))]
     fn forget_installed_trial_count(&mut self) {
         self.native_installed_trial = None;
         self.native_installed_trial_stale_before = Some(std::time::Instant::now());
     }
 
-    /// One look at a structural latch: ask
-    /// [`crate::native_update_auto_intent::structural_latch`] what a verified download
-    /// strictly newer than the latched build (`newest_download`), or the latch's re-sample
-    /// coming due, has earned, and act on it. Called when the re-sample deadline passes and
-    /// on every reduced updater observation; true when it released the latch.
-    ///
-    /// A newer release counts only against the installed activation (a download is
-    /// imported as the stage and arms on its own), which it supersedes
-    /// ([`Self::request_activation_supersede`]); the verdict remembers which release was
-    /// offered, so none asks twice. The bound on an unreadable count (the model's
-    /// `UnreadLooks`) is this host's, pinned by
-    /// `a_latch_whose_activation_leaves_the_installed_facts_is_decided_within_a_bound`.
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -7780,8 +6492,6 @@ impl App {
             return false;
         };
         if self.native_activation_supersede.is_some() {
-            // The retire runs off the event loop; the latch stands until it
-            // answers (`finish_activation_supersede`). A latch past its deadline
             // must move it, or the deadline fold wakes on it forever.
             if latch.retry_at.is_some_and(|at| now >= at) {
                 self.auto_apply_manual_only = Some(crate::AutoApplyManualOnly {
@@ -7791,8 +6501,6 @@ impl App {
             }
             return false;
         }
-        // A refused release's retry is about that release on disk: once the disk
-        // no longer holds it, the retry is moot and whatever is there is offered.
         if verdict
             .newer_retry
             .is_some_and(|retry| newest_download != Some(retry.newer))
@@ -7818,7 +6526,6 @@ impl App {
             verdict.unmeasured_through = 0;
             self.auto_apply_structural_verdict = Some(verdict);
         }
-        // Any proven read ends a run of unproven ones.
         if !self.native_installed_trial_unproven && verdict.unproven_looks != 0 {
             verdict.unproven_looks = 0;
             verdict.unproven_through = 0;
@@ -7826,9 +6533,6 @@ impl App {
         }
         match structural_latch(facts) {
             StructuralLatchDecision::Hold => {
-                // A look its own deadline brought (the re-sample, now outranked
-                // by a release waiting out a refusal) must move that deadline or
-                // the deadline fold wakes on it forever; the release's retry is
                 // the next thing that can change anything.
                 if facts.resample_due
                     && latch.retry_at.is_some_and(|at| now >= at)
@@ -7839,9 +6543,6 @@ impl App {
                         ..latch
                     });
                 }
-                // The unmeasured hold named the Version menu; a count since read
-                // as spent makes that start the reverting one, so say the hold
-                // again in the trial's words (same notice key, new words).
                 if verdict.held_unmeasured && facts.trial_room == Some(false) {
                     verdict.held_unmeasured = false;
                     self.auto_apply_structural_verdict = Some(verdict);
@@ -7851,14 +6552,12 @@ impl App {
                 false
             }
             StructuralLatchDecision::Supersede { newer } => {
-                // Spent only once the retire is under way; a look that cannot start
                 // it now leaves the release for the next look.
                 if self.request_activation_supersede(latch, newer, verdict.newer_spent) {
                     verdict.newer_spent = newer;
                     verdict.newer_retry = None;
                     self.auto_apply_structural_verdict = Some(verdict);
                 } else {
-                    // Not started, nothing spent; a deadline that brought this look
                     // moves, so the deadline fold does not spin on it.
                     if retry_due {
                         verdict.newer_retry =
@@ -7878,11 +6577,6 @@ impl App {
                 false
             }
             StructuralLatchDecision::Unmeasured => {
-                // Nothing is spent; the next observation re-measures
-                // (`forget_installed_trial_count`). A latch past its deadline must move it
-                // or the deadline fold spins; that move is said, a reconcile's repeat look
-                // is not. Bounded by `STRUCTURAL_TRIAL_UNMEASURED_LOOKS`; an unproven read
-                // has its own bound (`look_over_unproven_reads`).
                 let due = latch.retry_at.is_some_and(|at| now >= at);
                 if self.native_installed_trial_unproven {
                     self.look_over_unproven_reads(latch, verdict, now, due);
@@ -7959,11 +6653,6 @@ impl App {
                 true
             }
             StructuralLatchDecision::HoldForTrial => {
-                // The hold spends the re-sample, due or not: every launch left is the
-                // reverting one. Only a newer release can supersede now, so the latch
-                // loses its deadline (one with no re-sample behind it would lapse and
-                // release the build for its reverting launch); a refused release keeps
-                // its own retry (`AutoApplyStructuralVerdict::newer_retry`).
                 verdict.resample_at = None;
                 self.auto_apply_structural_verdict = Some(verdict);
                 self.auto_apply_manual_only = Some(crate::AutoApplyManualOnly {
@@ -7976,13 +6665,7 @@ impl App {
         }
     }
 
-    /// A re-sample the structural latch earned and will not take, or promised
-    /// and withdrew at the first count that rules it out, said in the log,
-    /// `update status`'s `apply_refusal=`, and the convergence notice again.
-    /// Never silent.
     fn say_structural_hold_for_trial(&mut self, build: u64) {
-        // Named as the Version menu's row names it: the stage's version, or
-        // its build number where no stage of it is in hand.
         let what = self
             .native_updater_service
             .snapshot()
@@ -7997,12 +6680,6 @@ impl App {
         self.say_structural_hold(build, &reason);
     }
 
-    /// A due look at a structural latch whose latest facts read could not prove the
-    /// installed bundle (the model's `Decide` over `unread = 2`). Each due look over a newer
-    /// read counts ([`crate::AutoApplyStructuralVerdict::unproven_looks`]), moves the
-    /// deadline [`STRUCTURAL_TRIAL_REMEASURE`] and asks for an observation. At
-    /// [`STRUCTURAL_TRIAL_UNPROVEN_LOOKS`] the re-sample moves to the next day, said in the
-    /// log and on `update status`; it asks nothing of a person, so nothing is raised.
     fn look_over_unproven_reads(
         &mut self,
         latch: crate::AutoApplyManualOnly,
@@ -8064,8 +6741,6 @@ impl App {
         );
     }
 
-    /// A structural latch's hold in `reason`'s words, said where
-    /// [`Self::say_structural_hold_for_trial`] says its own.
     fn say_structural_hold(&mut self, build: u64, reason: &str) {
         aterm_log::warn!("update auto-apply: {reason}");
         aterm_update::record_apply_refusal(
@@ -8085,23 +6760,9 @@ impl App {
             None,
             reason,
         );
-        // The staged row's posture is now "a person moves it": restated where it
-        // is up, raised as the decision where it is not.
         self.restate_staged_bar_posture(build);
     }
 
-    /// Start retiring a latched activation for a newer release: hand
-    /// [`aterm_update::supersede_installed_activation`] to a worker (it verifies three
-    /// bundles under the apply lock) and mark the retire in flight; the latch stays until
-    /// [`Self::finish_activation_supersede`].
-    ///
-    /// Not another attempt at the activation, which would cost another counted launch of
-    /// the failing build (the boot apply refuses to swap past the handoff's authorized
-    /// target, `aterm_update::apply_staged_if_ready`). The retire launches nothing: the
-    /// running build takes the install path back, the activation's trial is disarmed, and
-    /// the newer build becomes an ordinary stage. `false` when it cannot start now (an
-    /// apply in flight, or the stage is not this activation); `spent_before`, the verdict's
-    /// `newer_spent`, is given back on refusal.
     fn request_activation_supersede(
         &mut self,
         latch: crate::AutoApplyManualOnly,
@@ -8148,14 +6809,6 @@ impl App {
         true
     }
 
-    /// Run [`aterm_update::supersede_installed_activation`] on its own thread,
-    /// then read the disk through the facts worker's FIFO (ordered after the
-    /// retire) and post both to the event loop. `false` when no thread or event
-    /// loop could be had.
-    ///
-    /// QoS `Background`, never `Housekeeping`: it holds the machine's apply lock
-    /// across codesign reads, and a cold aterm launch elsewhere waits on that
-    /// lock; a lock holder must not be in the starvable class.
     #[cfg(not(test))]
     fn spawn_activation_supersede(&mut self, job: ActivationSupersedeJob) -> bool {
         let Some(proxy) = self.proxy.clone() else {
@@ -8196,26 +6849,12 @@ impl App {
         .is_ok()
     }
 
-    /// Unit tests never run the retire (it would act on this machine's install):
-    /// the job is recorded in flight and the test answers it with
-    /// [`Self::finish_activation_supersede`].
     #[cfg(test)]
     #[allow(clippy::unused_self, clippy::needless_pass_by_value)]
     fn spawn_activation_supersede(&mut self, _job: ActivationSupersedeJob) -> bool {
         true
     }
 
-    /// The retire answered. On success the observation read after the retire is
-    /// reduced as a new stage: it sees the running build installed, retires the
-    /// activation stage (and, in the reconcile's `Retired` arm, the latch keyed on it),
-    /// and imports and arms the newer download. The latch is not cleared here: an older
-    /// observation still in flight names the activation installed and would arm it
-    /// against an install path that now holds the running build.
-    ///
-    /// A refusal leaves the latch, says so ([`Self::say_activation_supersede_refused`])
-    /// and gives the release back, offered again after [`supersede_retry_after`]. A
-    /// retire whose disarm was deferred (`trial_disarm_deferred`) is still a retire (the
-    /// next boot apply finishes it) and is never said as a refusal.
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -8287,11 +6926,6 @@ impl App {
         }
     }
 
-    /// A refused retire gives its release back: the verdict's `newer_spent`
-    /// returns to its value before this retire, and the release waits out a
-    /// backoff doubling per consecutive refusal ([`supersede_retry_after`]).
-    /// Returns that wait, or `None` when the verdict no longer names this retire
-    /// (its latch is gone or another release was offered since).
     fn give_back_refused_release(
         &mut self,
         job: &ActivationSupersedeJob,
@@ -8313,13 +6947,6 @@ impl App {
         Some(wait)
     }
 
-    /// A newer release that could not yet take the latched activation's place.
-    /// Every refusal reaches the log and `update status`'s `apply_refusal=`,
-    /// with when the lane tries again. Only a refusal about the disk's shape is
-    /// a convergence notice naming the Version menu (retries meet the same disk);
-    /// a refusal about the moment (the apply lock, a verification that failed or
-    /// ran out of budget, a stage being replaced) puts nothing on glass, since
-    /// the lane retries by itself.
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -8380,13 +7007,7 @@ impl App {
         self.restate_staged_bar_posture(build);
     }
 
-    /// Authenticate the staged candidate off the GUI thread and outside the
-    /// parked window, caching the verdict for the next handoff attempt.
-    ///
-    /// Idempotent and cheap: a fresh verdict for the same `(build, commit)`
-    /// short-circuits, as does a read of that key still in flight
-    /// ([`preverify_read_needed`]). A failure is cached too, so a doomed
-    /// candidate fails preparation before parking any reader.
+    /// Authenticate the staged candidate off the GUI thread and outside the parked window, caching the verdict for the next handoff attempt.
     #[cfg(unix)]
     pub(crate) fn spawn_staged_handoff_preverification(&mut self, build: u64) {
         let snapshot = self.native_updater_service.snapshot();
@@ -8395,12 +7016,9 @@ impl App {
             .staged
             .as_ref()
             .filter(|staged| staged.build == build);
-        // An activation verifies the bundle under the executable, not a staged `.app`.
         let installed_activation = stage.is_some_and(|staged| staged.is_installed_activation());
         let commit = stage.and_then(|staged| staged.commit.clone());
         let artifact = stage.map(|staged| staged.dmg_sha256.clone());
-        // Without a pinned commit the worker's own call would be a different
-        // (weaker) query, so do not cache a verdict that would not match it.
         let (Some(commit), Some(artifact)) = (commit, artifact) else {
             return;
         };
@@ -8435,13 +7053,7 @@ impl App {
         let spawned = std::thread::Builder::new()
             .name("aterm-update-preverify".to_string())
             .spawn(move || {
-                // The read signals its end on every path (a verdict published, an
-                // unfinished check, a panic), only after its verdict is in the
-                // slot, so a waiter that sees the flag sees the verdict.
                 let _ends = RaiseOnDrop(done);
-                // No `qos::set_self`: this worker publishes into `handoff_preverified`,
-                // which the UI thread takes with a blocking `lock()`, so qos.rs forbids
-                // demoting it below `Responsive`; promoting it buys nothing.
                 let passed = if installed_activation {
                     aterm_update::preverify_installed_for_handoff(current_build, build, &commit)
                 } else {
@@ -8461,11 +7073,6 @@ impl App {
                     aterm_log::warn!(
                         "update apply: {which} build {build} failed pre-park verification: {error}"
                     );
-                    // A check that did not finish is no verdict, so the slot is left
-                    // alone (a cached refusal would short-circuit every automatic attempt)
-                    // and the next attempt verifies again on the handoff worker. The
-                    // moment is kept on this read for the cold lane, which has no handoff
-                    // worker (`PreverifyInFlight::ended_passing`).
                     if aterm_update::is_passing_refusal(error) {
                         let _ = passing.set(crate::PassingPreverification {
                             reason: format!("{which} failed pre-park verification: {error}"),
@@ -8478,8 +7085,6 @@ impl App {
                     .as_ref()
                     .err()
                     .map(|error| format!("{which} failed pre-park verification: {error}"));
-                // The successor's handoff policy, read only because the bundle
-                // passed; a refusal carries none.
                 let policy = passed.as_ref().ok().and_then(|facts| {
                     aterm_update_core::handoff_policy::adopt(
                         &facts.policy,
@@ -8504,14 +7109,11 @@ impl App {
             });
         match spawned {
             Ok(_) => self.handoff_preverify_in_flight = Some(flight),
-            // No thread: the worker verifies in-line.
             Err(_) => aterm_log::warn!("update apply: pre-park verification thread unavailable"),
         }
     }
 
-    /// Re-arm automatic apply for whatever is still staged after a latch
-    /// lapsed. Reads the service snapshot only (no disk or network); a no-op
-    /// when nothing is staged.
+    /// Re-arm automatic apply for whatever is still staged after a latch lapsed.
     pub(crate) fn rearm_native_auto_apply_after_lapse(&mut self) {
         if self.native_updater_service.snapshot().phase == UpdaterPhase::Applying {
             return;
@@ -8528,49 +7130,28 @@ impl App {
         self.arm_native_auto_apply(build, &digest);
     }
 
-    /// The close-preflight blocker for unsaved native-app (editor / Settings)
-    /// work: the one blocker a person can clear, so it is also the update row's
-    /// words ([`Self::update_blocker_for_person`]). The install is already in
-    /// place, so it never says "before relaunching".
+    /// The close-preflight blocker for unsaved native-app (editor / Settings) work.
     pub(crate) const UNSAVED_NATIVE_WORK_BLOCKS_APPLY: &'static str =
         "Save or close the open editor to finish updating";
-    /// The update row's words when only unsaved Settings text holds the
-    /// install ([`SETTINGS_DRAFTS_BLOCK`]): no editor need be open.
+    /// The update row's words when only unsaved Settings text holds the install ([`SETTINGS_DRAFTS_BLOCK`]).
     pub(crate) const UNSAVED_SETTINGS_BLOCKS_APPLY: &'static str =
         "Save or close the unsaved Settings tabs to finish updating";
     /// The update row's words when an editor and Settings text both hold it.
     pub(crate) const UNSAVED_EDITOR_AND_SETTINGS_BLOCK_APPLY: &'static str =
         "Save or close the open editor and unsaved Settings tabs to finish updating";
-    /// The close-preflight blocker while session restore / adoption is in flight
-    /// — it clears by itself.
+    /// The close-preflight blocker while session restore / adoption is in flight.
     pub(crate) const RESTORE_IN_FLIGHT_BLOCKS_APPLY: &'static str =
         "Updating after session restore finishes";
-    /// The `InstalledNeedsRelaunch` outcome's sentence: the bundle on disk is
-    /// already the newer build, and switching to it has its own admission and
-    /// policy, so the sentence promises no timing. Matches
-    /// `native_updater_service`'s `INSTALLED_SWITCHES_IN_PLACE` word for word.
+    /// The `InstalledNeedsRelaunch` outcome's sentence.
     #[cfg(any(unix, test))]
     pub(crate) const INSTALLED_ACTIVATES_IN_PLACE: &'static str =
         "The update is installed; switching to it keeps your shells running";
 
-    /// Whether a staged build is expected to land by itself, which the updater's
-    /// overdue notice ([`aterm_update::set_automatic_apply`]) claims failed when
-    /// a newer build has waited over an hour. `[update] auto_apply` on, and
-    /// neither posture where waiting is the design: an in-session handoff this
-    /// process cannot run
-    /// ([`crate::update_words::ApplyPosture::HandoffDisabled`]), or unsaved work
-    /// a person has to save ([`Self::update_blocker_for_person`]), whose own row
-    /// STANDS while it holds the lane ([`crate::update_words::waits_for_you`]; lead U38: it was a 45-s warning, and after it folded nothing
-    /// said why the update never landed),
-    /// or a process that keeps its image with
-    /// no terminal open, whose only lane waits for one
-    /// ([`Self::kept_image_waits_for_terminal`]).
+    /// Whether a staged build is expected to land by itself.
     pub(crate) fn update_lands_by_itself(&self, auto_apply_on: bool) -> bool {
         self.update_lands_by_itself_with(auto_apply_on, self.seamless_handoff_unavailable())
     }
 
-    /// [`Self::update_lands_by_itself`] with the handoff's availability
-    /// supplied, as [`Self::apply_posture_with`] takes it.
     fn update_lands_by_itself_with(
         &self,
         auto_apply_on: bool,
@@ -8582,11 +7163,7 @@ impl App {
             && !self.kept_image_waits_for_terminal()
     }
 
-    /// The update row for a close-preflight refusal the person can clear (unsaved
-    /// editor or Settings work, a failed document checkpoint), named by the work that
-    /// holds it; `None` when every reason clears by itself (a running checkpoint, a
-    /// restore landing). The reasons are this file's own
-    /// (`native_update_close_preflight`).
+    /// The update row for a close-preflight refusal the person can clear (unsaved editor or Settings work, a failed document checkpoint).
     pub(crate) fn update_blocker_for_person(reasons: &[String]) -> Option<&'static str> {
         let editor = reasons.iter().any(|reason| {
             reason == Self::UNSAVED_NATIVE_WORK_BLOCKS_APPLY
@@ -8604,10 +7181,7 @@ impl App {
         }
     }
 
-    /// `true` while the `ATERM_DEBUG_RELAUNCH_NUDGE` screenshot seam
-    /// (`aterm_types::dev_seam!`, never read by a shipped binary) suppresses the automatic
-    /// update lane, logged once per process: the seam seeds a fake `Wake::UpdateStaged`
-    /// for `ctl image`, and a fake nudge must not install anything.
+    /// Return true while `ATERM_DEBUG_RELAUNCH_NUDGE` suppresses automatic relaunch.
     pub(crate) fn relaunch_nudge_seam_suppresses_auto_apply() -> bool {
         static SEAM: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *SEAM.get_or_init(|| {
@@ -8625,9 +7199,6 @@ impl App {
         })
     }
 
-    /// Start the automatic-apply ladder for `build` at `now` unless one already
-    /// anchors that build: the ladder starts once per build, so a re-arm can only
-    /// delay the landing, never restart the clock.
     fn anchor_auto_apply_ladder(&mut self, build: u64, now: std::time::Instant) {
         if self
             .auto_apply_ladder
@@ -8643,7 +7214,6 @@ impl App {
     }
 
     /// Retain automatic apply intent for one exact (or superseding) staged build.
-    /// Returns true only when this call armed a new intent.
     pub(crate) fn arm_native_auto_apply(&mut self, build: u64, digest: &str) -> bool {
         use crate::native_update_auto_intent::{ArmDecision, ArmFacts};
 
@@ -8658,9 +7228,6 @@ impl App {
         };
         let armed = self.auto_apply_intent;
         let manual_only = self.auto_apply_manual_only;
-        // Which side of the swap the incoming artifact is on: every caller arms
-        // the reducer's own stage, which says whether these bytes are the
-        // installed bundle's activation.
         let incoming_activation = self
             .native_updater_service
             .snapshot()
@@ -8678,21 +7245,11 @@ impl App {
             armed_build: armed.map(|intent| intent.build),
             armed_exact: armed
                 .is_some_and(|intent| intent.build == build && intent.dmg_sha256 == dmg_sha256),
-            // The latch holds the update, not one side of its swap: the same build
-            // as a download or as its installed activation is one logical update,
-            // folded as the budget behind the latch folds it, so the candidate's
-            // own swap cannot re-arm the confirming retry early.
             manual_only_exact: manual_only
                 .is_some_and(|manual| manual.covers(build, dmg_sha256, incoming_activation)),
             manual_only_build: manual_only.map(|manual| manual.build),
             incoming_build: build,
         });
-        // Authenticate the staged bundle now, while every reader is live and a cancel
-        // costs nothing, not inside the parked window, and read the handoff policy it
-        // seals. Whatever the automatic lane decides: a stage a person installs
-        // (`[update] auto_apply = false`, or a build latched manual-only) parks on the
-        // fork lane before its worker verifies, so its policy is read here too, never
-        // first after the capture it forbids.
         #[cfg(unix)]
         if crate::native_update_auto_intent::arm_reads_candidate(decision, build, current_build) {
             self.spawn_staged_handoff_preverification(build);
@@ -8706,15 +7263,12 @@ impl App {
             ArmDecision::SuppressManualOnly => {
                 self.auto_apply_intent = None;
                 self.settle_update_wait_on_person();
-                // The status bar's Staged line was painted from policy alone; this
-                // build's own latch is the finer fact — say so while the bar is up.
                 self.restate_staged_bar_posture(build);
                 false
             }
             ArmDecision::Keep => false,
             ArmDecision::Set(build) => {
                 self.auto_apply_environment_block = None;
-                // A hold for other bytes waited on a stage that is gone.
                 #[cfg(unix)]
                 if self
                     .auto_apply_roster_wait
@@ -8723,18 +7277,12 @@ impl App {
                 {
                     self.auto_apply_roster_wait = None;
                 }
-                // A different artifact at the same build, or a newer build, owns a
-                // distinct budget. Older wakes were suppressed by `arm` above.
                 self.auto_apply_manual_only = None;
                 let now = std::time::Instant::now();
                 let ladder = self
                     .auto_apply_ladder
                     .filter(|ladder| ladder.build == build);
                 self.anchor_auto_apply_ladder(build, now);
-                // Logged at the default level so an operator reading aterm.log can
-                // tell an armed-and-waiting lane from a dead one. A re-arm on a
-                // retained anchor says where the ladder stands rather than
-                // promising the bound again.
                 match ladder {
                     Some(ladder) => aterm_log::info!(
                         "update auto-apply re-armed for build {build} ({}…): {} s since it \
@@ -8761,27 +7309,19 @@ impl App {
                             .as_secs()
                     ),
                 }
-                // Due at once: the quiet gate reads the last epoch, which needs no
-                // wait from here, and the attempt waits only for the pre-park read
-                // spawned above (`try_pending_native_auto_apply`). A first look one
-                // epoch out held every idle update 501-509 ms (2026-10-20, n=24).
                 self.auto_apply_intent = Some(crate::AutoApplyIntent {
                     build,
                     dmg_sha256,
                     retry_at: now,
                     attempts: 0,
                 });
-                // The status bar's "applies in place" line is now an armed fact
-                // (or, without the handoff, the line saying nothing applies while a
-                // terminal is open); restate it while the bar is up.
                 self.restate_staged_bar_posture(build);
                 true
             }
         }
     }
 
-    /// Where the automatic lane stands on its ladder at `now` for its build
-    /// (`auto_apply_ladder`). With no anchor yet, it is at the first phase.
+    /// Where the automatic lane stands on its ladder at `now` for its build (`auto_apply_ladder`).
     pub(crate) fn automatic_apply_phase(
         &self,
         now: std::time::Instant,
@@ -8796,10 +7336,7 @@ impl App {
         )
     }
 
-    /// The ladder phase an attempt under `mode` is gated by at `now`: the
-    /// anchored phase, raised to the mode's own promise. `AutomaticPastGrace`
-    /// never asks for a machine-wide idle moment, so it is at least the
-    /// output-gap phase even with no anchor; `Automatic` is the anchored phase.
+    /// The ladder phase an attempt under `mode` is gated by at `now`.
     pub(crate) fn automatic_phase_for(
         &self,
         mode: ApplyMode,
@@ -8814,10 +7351,7 @@ impl App {
         self.automatic_apply_phase(now).max(floor)
     }
 
-    /// The terminal facts the ladder reads, sampled at `now`. The keystroke
-    /// gate and the two bounded holds (warm-up, and a cold restore's agents
-    /// still relaunching) apply only to an automatic lane; an explicit apply
-    /// parks at once and the successor carries any restored agents still owed.
+    /// The terminal facts the ladder reads, sampled at `now`.
     pub(crate) fn automatic_activity_facts(
         &self,
         mode: ApplyMode,
@@ -8837,8 +7371,6 @@ impl App {
         }
     }
 
-    /// Log once, at the default level, that the lane moved to `phase` and what
-    /// it now waits for; per-poll deferrals are not logged.
     fn announce_apply_phase(&mut self, phase: crate::native_update_auto_intent::ApplyPhase) {
         let Some(ladder) = self.auto_apply_ladder.as_mut() else {
             return;
@@ -8857,10 +7389,6 @@ impl App {
         );
     }
 
-    /// Log, once each way, that the restored agents' hold began or ended while
-    /// the automatic lane waits on this ladder's build
-    /// ([`crate::native_update_auto_intent::restored_hold_line`]). It is the one
-    /// hold that also refuses the `Land` phase.
     fn announce_restored_hold(&mut self, now: std::time::Instant) {
         let holding = self
             .harness
@@ -8878,10 +7406,7 @@ impl App {
         }
     }
 
-    /// Whether a person's Install is held for the candidate's pre-park read
-    /// ([`Self::run_held_person_apply`]): work, to the automatic lane, which would
-    /// otherwise retire the held press's row and close its record with its own
-    /// deferral. Never off unix.
+    /// Whether a person's Install is held for the candidate's pre-park read ([`Self::run_held_person_apply`]).
     #[must_use]
     pub(crate) fn person_apply_is_held(&self) -> bool {
         #[cfg(unix)]
@@ -8894,18 +7419,7 @@ impl App {
         }
     }
 
-    /// Hold the automatic lane for an update check to confirm the stage's signer
-    /// ([`crate::AutoApplyRosterWait`]): `reason` is the stage's refusal
-    /// ([`aterm_update::is_roster_confirmation_wait`]), answered at `answered_at`.
-    /// Returns the hold.
-    ///
-    /// `rearm` keeps the lane's intent for these bytes, due when the hold next asks the
-    /// stage (an attempt that met the wait gave its intent up); a person's press re-arms
-    /// nothing, but an intent already armed holds all the same. Said once per hold at
-    /// the default level; `book` puts a new hold's reason in the ledger as its standing
-    /// refusal, for callers whose outcome books nothing itself. A provisional hold
-    /// ([`Self::hold_provisionally_for_a_fresh_read`]) has said nothing yet, so its
-    /// answer is said and booked as new.
+    /// Hold the automatic lane for an update check to confirm the stage's signer ([`crate::AutoApplyRosterWait`]).
     #[cfg(unix)]
     pub(crate) fn hold_for_roster_confirmation(
         &mut self,
@@ -8964,9 +7478,7 @@ impl App {
         wait
     }
 
-    /// Whether an update check reported the stage at `build` at or after `since`
-    /// ([`Self::roster_wait_check_reported`]): an answer that the stage waits for a
-    /// check, read from `since` on, may predate that check's confirmation and is stale.
+    /// Whether an update check reported the stage at `build` at or after `since` ([`Self::roster_wait_check_reported`]).
     #[cfg(unix)]
     #[must_use]
     pub(crate) fn roster_check_reported_since(
@@ -8978,14 +7490,6 @@ impl App {
             .is_some_and(|(reported, at)| reported == build && at >= since)
     }
 
-    /// A pre-park read ended waiting for a check but began before a check reported the
-    /// stage, which may have confirmed it: held on, it would make the lane wait a whole
-    /// [`crate::ROSTER_WAIT_REREAD`] after the confirmation and book again the wait the
-    /// check withdrew. So a fresh read is started and the attempt held provisionally
-    /// while it runs (`said` false: nothing is said or booked, and a person's press
-    /// does not take it for a wait): `Some(when)` to look again, every
-    /// [`crate::ROSTER_WAIT_POLL`]. `None` when no read could start (a fresh verdict
-    /// stands): the hold ends, and the attempt answers for itself.
     #[cfg(unix)]
     fn hold_provisionally_for_a_fresh_read(
         &mut self,
@@ -9025,8 +7529,6 @@ impl App {
         Some(now + crate::ROSTER_WAIT_POLL)
     }
 
-    /// End the roster-confirmation hold of these bytes, if there is one, saying so
-    /// when it had said it was holding.
     #[cfg(unix)]
     fn end_roster_wait_hold(&mut self, build: u64, dmg_sha256: [u8; 32]) {
         let Some(wait) = self
@@ -9043,20 +7545,6 @@ impl App {
         }
     }
 
-    /// The roster-confirmation hold at the automatic lane's poll, for the attempt at
-    /// `build` with `dmg_sha256` ([`crate::AutoApplyRosterWait`]): `Some(when)` to keep
-    /// the intent and look again then, `None` to attempt. Memory only; the re-read it
-    /// starts runs off this thread.
-    ///
-    /// * A pre-park read of these bytes that ended waiting for a check, after the
-    ///   answer the hold stands on, starts or renews the hold, so a launch that met a
-    ///   stale stage makes no first attempt. A read that began before a check last
-    ///   reported the stage is read again at once
-    ///   ([`Self::hold_provisionally_for_a_fresh_read`]), never held on or booked.
-    /// * Holding, it waits while a re-read runs and until the hold's re-read is due
-    ///   ([`Self::roster_wait_check_reported`] makes it due at once).
-    /// * Due, it starts a re-read and waits for its answer. Any other answer, or no
-    ///   read able to start, ends the hold, and the attempt answers for itself.
     #[cfg(unix)]
     fn roster_wait_holds(
         &mut self,
@@ -9113,11 +7601,7 @@ impl App {
         None
     }
 
-    /// Start a fresh pre-park read of the stage at `build` with `dmg_sha256`
-    /// ([`Self::spawn_staged_handoff_preverification`]), and say whether one was
-    /// started: a new read of these bytes is in the slot, running or already answered
-    /// (a stage still waiting refuses before any `codesign`). `false` when none could
-    /// start: a fresh verdict stands, or the stage is no longer this one.
+    /// Start a fresh pre-park read of the stage at `build` with `dmg_sha256` ([`Self::spawn_staged_handoff_preverification`]).
     #[cfg(unix)]
     pub(crate) fn start_fresh_preverification(&mut self, build: u64, dmg_sha256: [u8; 32]) -> bool {
         let before = self
@@ -9134,13 +7618,7 @@ impl App {
             })
     }
 
-    /// A check reported the stage at `build` (its `UpdateStaged` wake, or a person's
-    /// check): it may have confirmed the stage's signer. Recorded whether or not
-    /// anything holds now ([`Self::roster_check_reported_since`]), so an answer read
-    /// before it is read again rather than held on. A lane held for it
-    /// ([`crate::AutoApplyRosterWait`]) asks the stage again at its next poll; a check
-    /// that confirmed nothing costs one cheap re-read. The intent is due now too, so the
-    /// poll the reconcile runs looks.
+    /// A check reported the stage at `build` (its `UpdateStaged` wake, or a person's check).
     #[cfg(unix)]
     pub(crate) fn roster_wait_check_reported(&mut self, build: u64) {
         let now = std::time::Instant::now();
@@ -9166,17 +7644,7 @@ impl App {
         }
     }
 
-    /// What this process knows about the stage `attempt` targets waiting for a check to
-    /// confirm its signer, and when that was answered: the wait's words when a pre-park
-    /// read of exactly these bytes ended with it, no older than a verdict's freshness
-    /// and begun after the last check that reported the stage; else the lane's hold for
-    /// these bytes, when it stands on such an answer. Memory only: the cold lane reads
-    /// it before it relaunches for any mode ([`Self::cold_lane_verdict_gate`]), since
-    /// the successor's boot swap would wait the same way.
-    ///
-    /// Not a verdict on the bytes, so the rule that a cached verdict never answers a
-    /// person's apply does not apply: it says how long ago a check last ran, and every
-    /// check reported since retires it.
+    /// What this process knows about the stage `attempt` targets waiting for a check to confirm its signer, and when that was answered.
     #[cfg(unix)]
     #[must_use]
     pub(crate) fn known_roster_wait(
@@ -9217,8 +7685,6 @@ impl App {
     }
 
     /// Attempt a retained automatic apply from an exact event or timer wake.
-    /// Every caller honors the same retained deadline and activity gate, so a
-    /// duplicate stage wake cannot bypass backoff or spend another attempt.
     pub(crate) fn try_pending_native_auto_apply(&mut self, announce: bool) {
         use crate::native_update_auto_intent::{
             ApplyPhase, AttemptDisposition, AttemptResult, PollDecision, PollFacts, WaitReason,
@@ -9230,37 +7696,23 @@ impl App {
         let now = std::time::Instant::now();
         let deadline_ready = now >= intent.retry_at;
         if deadline_ready {
-            // A capture refusal recorded beside a busy engine reads that session
             // at the lane's next look, whatever the poll then decides.
             self.capture_refusal_take_baseline();
         }
         let phase = self.automatic_apply_phase(now);
         self.announce_apply_phase(phase);
         self.announce_restored_hold(now);
-        // A same-image handoff counts as work: a real stage arriving while the QA
-        // seam's or a launch-record renewal's handoff is in flight answers
-        // `Wait(WorkActive)` (intent kept, no budget spent) instead of failing as
-        // "already in flight". Real handoffs already set `active`/`Applying`.
         let work_active = self.native_updater_service.snapshot().active.is_some()
             || self.update_handoff_in_flight()
             || self.person_apply_is_held();
         let applying = self.native_updater_service.snapshot().phase == UpdaterPhase::Applying;
-        // Durable facts are collected by workers and reduced by their wakes. A
-        // timer callback is memory-only: it never reads ledger files or launches
-        // PlistBuddy on the UI loop.
         if deadline_ready && !work_active && !applying {
             let Some(authoritative_intent) = self.auto_apply_intent else {
-                // Asynchronous reconciliation retired or consumed the stage. Never
-                // resurrect the copied intent into another wake loop; a wait on a
-                // person ends with it.
                 self.settle_update_wait_on_person();
                 return;
             };
             intent = authoritative_intent;
         }
-        // The reconciliation above is this wake's one filesystem observation;
-        // from here on reduce the process-owned snapshot only
-        // (`staged_update_ready()` would re-read the ledger on the event loop).
         let updater = self.native_updater_service.snapshot();
         let current_build = updater.current_build;
         let staged_build = updater.staged.as_ref().map(|staged| staged.build);
@@ -9286,9 +7738,6 @@ impl App {
         });
         let (attempt_build, attempt_phase) = match decision {
             PollDecision::Clear => {
-                // The lane dropped its promise: restate the staged words to the
-                // posture that now holds. A person's wait was a wait for this lane,
-                // so it ends here too, with its standing row and the overdue notice's
                 // exemption.
                 if let Some(intent) = self.auto_apply_intent.take() {
                     self.restate_staged_bar_posture(intent.build);
@@ -9300,12 +7749,7 @@ impl App {
             PollDecision::Wait(
                 reason @ (WaitReason::WorkActive | WaitReason::Activity | WaitReason::StagePending),
             ) => {
-                // Work/publication/activity are ordering facts, not attempts:
-                // keep the intent through any number of bounded transitions and
-                // spend no retry budget.
                 intent.retry_at = match reason {
-                    // Re-poll on the quiet cadence. The ladder's phases bound
-                    // how long this can go on; nothing here needs to.
                     WaitReason::Activity => {
                         crate::automatic_update_activity_retry_at(std::time::Instant::now())
                     }
@@ -9323,10 +7767,6 @@ impl App {
                 phase,
             } => (build, phase),
         };
-        // A standing capture refusal holds the attempt until the refused
-        // desk changes (or the backstop passes), so no successor is
-        // launched into the same refusal. Intent kept, nothing spent,
-        // re-probed on the refusal lane's cadence.
         let activation = updater.staged.as_ref().is_some_and(|staged| {
             staged.build == attempt_build && staged.is_installed_activation()
         });
@@ -9335,19 +7775,12 @@ impl App {
             self.auto_apply_intent = Some(intent);
             return;
         }
-        // A stage waiting for an update check to confirm its signer holds the
-        // attempt (`crate::AutoApplyRosterWait`): intent kept, nothing spent, looked
-        // at again when the hold says.
         #[cfg(unix)]
         if let Some(retry_at) = self.roster_wait_holds(attempt_build, intent.dmg_sha256, now) {
             intent.retry_at = retry_at;
             self.auto_apply_intent = Some(intent);
             return;
         }
-        // The pre-park read of exactly these bytes, which the arm started, is still
-        // running: the attempt waits for its verdict rather than have its worker verify
-        // the same bytes again beside it, and looks every [`PREVERIFY_READ_POLL`], so
-        // it starts as the read ends. Intent kept, nothing spent.
         #[cfg(unix)]
         if self
             .handoff_preverify_in_flight
@@ -9364,22 +7797,12 @@ impl App {
         }
         intent.build = attempt_build;
         self.auto_apply_intent = None;
-        // The mode carries the phase to the handoff: `Automatic` is the first
-        // phase (a quiet moment at entry and at park); `AutomaticPastGrace` is
-        // every later phase, whose gates read the ladder. Activity revokes both
-        // mid-flight (`note_update_handoff_activity` is mode-blind, and
-        // `exact_activity` is a conjunct of Commit in every lane).
         let outcome = self.apply_native_update(if attempt_phase == ApplyPhase::PreferIdle {
             ApplyMode::Automatic
         } else {
             ApplyMode::AutomaticPastGrace
         });
         if let UpdateOutcome::Deferred { reason } = outcome {
-            // A deferral is the ladder saying "not this instant". It returned
-            // before `begin_apply_preflight` (no park, launch, ticket or budget),
-            // so it is re-polled on the quiet cadence and not logged per poll;
-            // the phase change is (`announce_apply_phase`). A path that re-armed
-            // its own intent keeps it. A fork-lane park that missed its budget
             // was already surfaced by `fork_park_miss_outcome`.
             if self.auto_apply_intent.is_none() {
                 intent.retry_at = std::time::Instant::now() + crate::AUTOMATIC_UPDATE_QUIET_EPOCH;
@@ -9392,17 +7815,12 @@ impl App {
             return;
         }
         intent.attempts = intent.attempts.saturating_add(1);
-        // Whether a person holds the lane as of this attempt: unsaved editor or
-        // Settings work is the one blocker the lane cannot outwait, and the
-        // overdue notice must not call that a failure
-        // (`App::update_lands_by_itself`). Every attempt past preflight updates it.
         self.update_waits_on_person = match &outcome {
             UpdateOutcome::Blocked { reasons } => {
                 Self::update_blocker_for_person(reasons).map(|_| intent.build)
             }
             _ => None,
         };
-        // …and its standing row leaves with it.
         if self.update_waits_on_person.is_none() {
             self.withdraw_update_waits_for_you();
         }
@@ -9411,8 +7829,6 @@ impl App {
             #[cfg(any(unix, test))]
             UpdateOutcome::InstalledNeedsRelaunch { .. } => AttemptResult::InstalledNeedsRelaunch,
             UpdateOutcome::Blocked { .. } => AttemptResult::Blocked,
-            // The intent is retained (the refusal lane re-arms it below), so to
-            // the reducer this is the not-now family, never the latching one.
             #[cfg(any(unix, test))]
             UpdateOutcome::CaptureRefused { .. } => AttemptResult::Blocked,
             UpdateOutcome::Failed { .. } => AttemptResult::Failed,
@@ -9420,10 +7836,6 @@ impl App {
         });
         match (disposition, outcome) {
             (AttemptDisposition::Complete, UpdateOutcome::Accepted) => {
-                // A successful replacement never returns; Accepted means the
-                // successor is launching (or a joined request's owner owns
-                // completion). The landing is logged at Commit
-                // (`finish_update_handoff`).
                 aterm_log::info!(
                     "update auto-apply started for build {} (new process launching; \
                      attempt {})",
@@ -9444,22 +7856,10 @@ impl App {
                 );
             }
             (AttemptDisposition::Retry, UpdateOutcome::Blocked { reasons }) => {
-                // Every blocked attempt records its reason in durable status,
-                // timer retries included, so UI silence never hides why a verified
-                // stage is not running. Polls that merely wait returned above.
                 let blocked = UpdateOutcome::Blocked {
                     reasons: reasons.clone(),
                 };
                 self.record_apply_outcome_in_ledger(&blocked);
-                // A preflight block is a fact about this moment, not evidence against
-                // the artifact: the intent is retained, not latched. Past the budget the
-                // lane re-probes quietly once per `PREFLIGHT_BLOCK_COOLDOWN`, so fixing
-                // the blocker lands the update on the next cooldown. That is safe only
-                // because every `Blocked` reaching here is transient: close-preflight
-                // blockers are live state, `NotStaged` is ordering, a native-close reducer
-                // error arrives as `Failed`, and `Disabled` or an unsealed stage never gets
-                // here (`staged_from_status` stages neither). `poll` answers
-                // `Wait(Deadline)` until `retry_at`, so it cannot spin.
                 let cooling_down = match automatic_retry_delay(
                     intent.attempts,
                     AutomaticRetryKind::PreflightBlocked,
@@ -9473,22 +7873,11 @@ impl App {
                         true
                     }
                 };
-                // Exactly the attempt that spent the last of the budget. Counting
-                // from a monotone `attempts` fires this once per artifact:
-                // only `arm` resets it, for different bytes or a newer build.
                 let first_exhaustion =
                     cooling_down && intent.attempts == MAX_AUTOMATIC_UPDATE_CYCLES;
                 self.auto_apply_intent = Some(intent);
-                // The words may not outlive the promise: admission refusals route
-                // through this lane synchronously, and the gate's posture may now
-                // say the lane is off, so recompute it (a no-op for an ordinary
-                // close-preflight block). Unsaved editor work holding it is the
-                // outcome row `note_update_blockers` raises.
                 self.restate_staged_bar_posture(intent.build);
                 if intent.attempts == 1 {
-                    // The first block of an intent is always logged (the pill stays
-                    // gated on `announce`): a preflight blocker is the one thing an
-                    // operator can act on.
                     aterm_log::info!(
                         "update auto-apply attempt 1 for build {} blocked by preflight: {}",
                         intent.build,
@@ -9496,7 +7885,6 @@ impl App {
                     );
                 }
                 if announce && intent.attempts == 1 {
-                    // Already recorded above: announcement adds UI only, not a
                     // second durable write for this same refused attempt.
                     self.react_to_update_apply_outcome("automatic", blocked, false);
                 }
@@ -9514,18 +7902,11 @@ impl App {
                         reasons.join(" · "),
                         PREFLIGHT_BLOCK_COOLDOWN.as_secs()
                     );
-                    // Logged at warn once per artifact and at debug on later
-                    // cooldowns (one probe a minute). The UI says it once, and only
-                    // when it is the person's to clear (an unsaved editor); a lane
-                    // re-probing on its own posts no row.
                     if first_exhaustion {
                         aterm_log::warn!("{message}");
                         self.note_update_blockers(&reasons, true);
                     } else {
                         aterm_log::debug!("{message}");
-                        // A wait that began past the budget says itself too: the first
-                        // exhaustion is once per artifact, and work saved and unsaved
-                        // again holds the same build anew with the overdue notice off.
                         if self.update_waits_on_person.is_some() && !self.update_wait_said {
                             self.note_update_blockers(&reasons, true);
                         }
@@ -9534,8 +7915,6 @@ impl App {
             }
             #[cfg(any(unix, test))]
             (AttemptDisposition::Retry, UpdateOutcome::CaptureRefused { message }) => {
-                // The fork lane's capture refused the desk: the launched lane's
-                // `HandoffFailureLane::Refused`.
                 self.arm_capture_refusal_retry(
                     intent.build,
                     intent.dmg_sha256,
@@ -9550,16 +7929,7 @@ impl App {
                 );
             }
             (AttemptDisposition::ManualOnly, UpdateOutcome::Failed { message }) => {
-                // A returned physical handoff can park/read/checkpoint sessions, so it
-                // is retried rarely (twice per epoch), but an epoch always ends; the
-                // physical schedule mints `retry_at: None` only at a structural
-                // convergence.
                 self.auto_apply_intent = None;
-                // Transient: submission-time failures (the admission classifier
-                // refusing, a cold-lane `exec` that returned, a stale reducer) with no
-                // candidate spawned and no typed outcome; a schedule is never derived
-                // from the message string. Which side of the swap comes from the live
-                // stage, the one `poll` admitted this intent against.
                 let activation = self
                     .native_updater_service
                     .snapshot()
@@ -9568,14 +7938,6 @@ impl App {
                     .is_some_and(|staged| {
                         staged.build == intent.build && staged.is_installed_activation()
                     });
-                // One typed fact this lane can read: the cached pre-park verdict, shaped
-                // as the worker path would book it (`PreparationFailed`, structural in
-                // `of_outcome`). A refusal only a person can clear (the installed copy or
-                // its folder, not the signed release) leaves nothing to retry: a
-                // deadline-less latch, the remedy said once, and `apply_retry_for` carries
-                // it to every surface. New evidence about what refused releases it
-                // (`release_repaired_auto_apply_environment`), and a superseding stage arms
-                // a fresh intent.
                 #[cfg(unix)]
                 let cached_refusal = self.cached_handoff_refusal_reason(intent.build);
                 #[cfg(not(unix))]
@@ -9592,11 +7954,6 @@ impl App {
                     );
                     return;
                 }
-                // …and a wait for an update check to confirm the stage's signer is no
-                // failure at all (no attempt reads the machine roster): hold for the check,
-                // intent kept, nothing charged, the wait booked as the standing refusal. A
-                // backstop: a refused cold relaunch does not seed the wait as a verdict
-                // (`App::seed_refused_cold_relaunch`).
                 #[cfg(unix)]
                 if let Some(wait) = cached_refusal
                     .as_deref()
@@ -9613,8 +7970,6 @@ impl App {
                     self.restate_staged_bar_posture(intent.build);
                     return;
                 }
-                // A passing cached refusal is not the verifier's verdict: it rides
-                // the transient schedule, and `needs_person` above is false for it.
                 let shape = PhysicalFailureShape::cached_refusal_shape(cached_refusal.as_deref());
                 let schedule = self.latch_after_physical_failure(
                     intent.build,
@@ -9623,14 +7978,8 @@ impl App {
                     shape,
                     &message,
                 );
-                // An admission refusal is synchronous, so the Staged bar may still
-                // say "applies in place" while the Version-menu row says the
-                // attempt did not start; restate the bar now.
                 self.restate_staged_bar_posture(intent.build);
                 self.surface_update_apply_outcome(
-                    // The label names which schedule answered; the glass says
-                    // nothing while a retry is scheduled and names the Version
-                    // menu once they are spent.
                     match schedule {
                         PhysicalFailureSchedule::Retry(_) => "automatic · retrying later",
                         PhysicalFailureSchedule::StandDown(_) => {
@@ -9646,13 +7995,8 @@ impl App {
                     UpdateOutcome::Failed { message },
                     false,
                 );
-                // That surfacing wrote the standing schedule note after the failure it
-                // booked (which clears any standing refusal): `App::apply_schedule_standing`.
             }
             (_, outcome) => {
-                // A policy/outcome mismatch fails safe: no panic in the input loop,
-                // no unbounded physical retry, and a latch that neither a
-                // structural re-sample nor a newer release releases.
                 self.auto_apply_intent = None;
                 if self
                     .auto_apply_structural_verdict
@@ -9675,10 +8019,7 @@ impl App {
         }
     }
 
-    /// The quiet download's words changed: only the Settings projection and the
-    /// windows showing a Settings view repaint. The Version menu, palette, tab
-    /// indicators and other windows read nothing the quiet lane changes, so with
-    /// no Settings open this costs nothing.
+    /// The quiet download's words changed.
     pub(crate) fn publish_quiet_update_words(&mut self) {
         #[cfg(test)]
         QUIET_WORD_PUBLISHES.with(|n| n.set(n.get() + 1));
@@ -9754,10 +8095,6 @@ impl App {
         {
             return NativeUpdateFactsResult::Deferred(Box::new(facts));
         }
-        // A read that began before this process's own stage import describes a
-        // disk without that stage (the read spans a codesign; the check's wake can
-        // land first). Reducing it would retire the stage just imported, so it is
-        // ignored; the next observation sees the stage.
         if let Some(imported_at) = self.native_stage_imported_at
             && facts.observed_at < imported_at
             && facts
@@ -9782,14 +8119,11 @@ impl App {
             installed_unproven,
             installable,
         } = facts;
-        // Whether this copy can replace itself, the moment any read observed it —
-        // the page says "not read yet" until then, never a guess either way.
         if let Some(installable) = installable
             && self.native_updater_service.note_installability(installable)
         {
             self.publish_native_update_state();
         }
-        // When the last check completed, whoever ran it (Settings says "Checked 12 min ago").
         if self
             .native_updater_service
             .note_checked_at(durable.as_ref().and_then(|durable| durable.checked_at))
@@ -9797,19 +8131,12 @@ impl App {
             self.publish_native_update_state();
         }
         let build = self.native_updater_service.snapshot().current_build;
-        // What a structural latch reads, taken before anything below rewrites it: the
-        // boot sentinel's count for the installed bundle, and the verified download on
-        // disk (the activation import below overwrites the durable marker). A count read
-        // before the last apply attempt returned may be one launch low, so it is dropped.
         let trial_stale_before = self.native_installed_trial_stale_before;
         let trial_readable = trial_stale_before.is_none_or(|stale| observed_at >= stale);
         self.native_installed_trial = installed
             .as_ref()
             .filter(|_| trial_readable)
             .map(|installed| (installed.build, installed.trial_launches));
-        // …and whether it could prove the installed bundle at all: a read whose
-        // verification did not finish (`spctl` on a captive portal) observed nothing
-        // about it, and a look over it counts nothing.
         if trial_readable {
             self.native_installed_trial_read = self.last_native_update_reconcile_sequence;
             self.native_installed_trial_unproven = installed_unproven;
@@ -9818,10 +8145,6 @@ impl App {
             self.native_verified_download_on_disk =
                 crate::native_updater_service::verified_download_build(build, durable).unwrap_or(0);
         }
-        // The installed bundle outranks a staged download once it is newer than
-        // this process: a downloaded stage in memory is retired first, so the
-        // activation imports through the ordinary check/stage transitions
-        // (`request_check` refuses while a stage is held).
         if let Some(installed) = installed.as_ref()
             && installed.activation_stage(build, 0).is_some()
         {
@@ -9836,10 +8159,6 @@ impl App {
                 && self.native_updater_service.retire_stage_for_activation()
             {
                 self.auto_apply_intent = None;
-                // The latch belongs to the update, not the download: one on the bundle's
-                // build is re-keyed to the activation with its deadline kept (clearing it
-                // would fire the confirming retry at once); an older one retires with the
-                // download; a strictly newer one survives.
                 self.carry_manual_only_latch_across_swap(
                     retired_build,
                     installed.build,
@@ -9881,15 +8200,7 @@ impl App {
                 self.publish_native_update_state();
                 match disposition {
                     DurableStageDisposition::InstalledNeedsRelaunch { build } => {
-                        // A retired build keeps no latch: its bytes are the installed
-                        // bundle. A latch naming a strictly newer build survives (a newer
-                        // attempt may have completed out of order); one on the installed
-                        // build is re-keyed with its deadline, since those bytes are still
-                        // the update on offer as the bundle's activation.
                         self.carry_manual_only_latch_across_swap(build, build, installed.as_ref());
-                        // The installer may be another aterm or this process (an overlap
-                        // child swaps and re-execs before writing a readiness proof), so
-                        // the line names the state and what happens next, not the installer.
                         let what = installed
                             .as_ref()
                             .and_then(|installed| installed.version.as_deref())
@@ -9900,8 +8211,6 @@ impl App {
                         );
                     }
                     DurableStageDisposition::Retired => {
-                        // The latch belongs to the exact retired artifact; kept, it could
-                        // suppress a replacement lower than the withdrawn stage but newer
                         // than this process. A latch for other bytes survives.
                         if let Some(retired) = current.as_ref()
                             && self.auto_apply_manual_only.is_some_and(|manual| {
@@ -9921,10 +8230,6 @@ impl App {
             }
         }
 
-        // The ledger's failure verdict reaches the snapshot on every reconcile
-        // that holds a stage, exact or not (an activation never matches the
-        // durable marker, and `request_check` refuses while a stage is held, so
-        // `finish_check` cannot carry it).
         if self.native_updater_service.snapshot().staged.is_some()
             && let Some(durable) = durable.as_ref()
             && self.native_updater_service.absorb_failure_state(durable)
@@ -9948,19 +8253,7 @@ impl App {
             return NativeUpdateFactsResult::Reduced { effective_stage };
         }
 
-        // Newness is the stager's test only: strictly newer than the running
-        // image. `observed_stage_floor` is in-pass hysteresis against re-importing
-        // a stage this pass just retired. The installed bundle gets no vote: its
-        // plist can be replaced under a live process, and folding it in would make
-        // a staged build the bundle already carries compare "not newer" forever.
         let stage_floor = build.max(observed_stage_floor);
-        // The installed bundle is newer than this process: activate it. The bytes are
-        // already at our path (a release cutter, a dragged-in `.app`, a sibling aterm, or
-        // our own overlap child that swapped and failed), so it is imported as an
-        // activation stage (sealed identity under `installed_activation_digest`) and rides
-        // the ordinary stage → automatic apply → seamless handoff path; the successor finds
-        // nothing to swap. Not the durable download: with the bundle replaced, a
-        // swap-apply's rollback-source proof would defer forever.
         let activation = installed
             .as_ref()
             .and_then(|installed| installed.activation_stage(build, 0));
@@ -9990,7 +8283,6 @@ impl App {
                 }
             }
             if let CheckStart::Start(ticket) = self.native_updater_service.request_check() {
-                // Logged only when the import happens: while an activation is held,
                 // `request_check` refuses and every ~75 s reconcile lands here again.
                 if activation.is_some() {
                     aterm_log::info!("update sync: {}", durable.outcome);
@@ -10005,23 +8297,12 @@ impl App {
         }
     }
 
-    /// The reconcile's one look at a structural latch, after the stage settled,
-    /// so a latch the bundle swap re-keyed to the activation in this pass is the
-    /// one a newer release may supersede. A released re-sample is armed by the
-    /// caller's `Reduced` arm; a supersede answers later through
-    /// `finish_activation_supersede`.
     fn look_at_structural_latch_after_reconcile(&mut self) {
         let on_disk = self.native_verified_download_on_disk;
         let _released = self
             .look_at_structural_latch(std::time::Instant::now(), (on_disk > 0).then_some(on_disk));
     }
 
-    /// The automatic lane's answer to a refusal only a person can clear (the
-    /// synchronous arm of [`Self::try_pending_native_auto_apply`]): `refusal`, the
-    /// cached pre-park verdict, says no lane can install `build` until a person
-    /// changes the installed copy or its folder. A deadline-less latch
-    /// ([`Self::block_native_auto_apply_environment`], keyed by what refused), the
-    /// remedy said once on the row and in the log, and the attempt's failure booked.
     fn suspend_automatic_apply_for_person(
         &mut self,
         build: u64,
@@ -10064,23 +8345,12 @@ impl App {
         self.auto_apply_manual_only = Some(crate::AutoApplyManualOnly {
             build,
             dmg_sha256,
-            // Exact bytes only, not folded with the build's activation: this latch
-            // is about the install refusing (the installed copy or its folder), and a
-            // changed installed copy releases it.
             activation: false,
             retry_at: None,
         });
     }
 
-    /// The remedy of the environment block standing for `build`, or `None` when none
-    /// stands ([`Self::auto_apply_environment_blocked`]): the one source of the
-    /// person's next step while the block holds, since the ledger's latest reason may
-    /// be an ordinary failure booked since.
-    ///
-    /// `None` for a folder that has answered ([`Self::install_location_answered_since`]):
-    /// a retry whose pre-park check passed and whose successor then died comes back
-    /// before the reconcile that releases the block, so the pass is read here as that
-    /// reconcile will read it.
+    /// The remedy of the environment block standing for `build`, or `None` when none stands ([`Self::auto_apply_environment_blocked`]).
     pub(crate) fn auto_apply_environment_remedy(
         &self,
         build: u64,
@@ -10094,15 +8364,6 @@ impl App {
             .map(|blocked| blocked.cause.remedy())
     }
 
-    /// A standing block follows the newest refusal only a person can clear. Its cause
-    /// decides the remedy every surface names and the evidence that releases it
-    /// ([`Self::release_repaired_auto_apply_environment`]); the staged check asks the
-    /// folder before the installed copy (`preverify_installed_rollback_source_with`),
-    /// so a person who fixed the folder can meet the other cause next, and a block kept
-    /// on the folder's cause could never be released. So `newest`, the verdict cache's
-    /// entry, re-keys the block when it refuses exactly the blocked artifact after the
-    /// block was taken, needs a person, and names another cause; the re-keyed block
-    /// counts from that refusal.
     #[cfg(unix)]
     fn rekey_environment_block_to(&mut self, newest: Option<&crate::HandoffPreverification>) {
         let Some(blocked) = self.auto_apply_environment_block else {
@@ -10170,10 +8431,6 @@ impl App {
         })
     }
 
-    /// Release the environment block on new evidence, memory-only: the facts
-    /// worker's complete signing-policy check or, for a folder that refused, the
-    /// pre-park verification that asked it ([`Self::install_location_answered_since`]).
-    /// Unknown or older evidence cannot rehabilitate a refused source.
     fn release_repaired_auto_apply_environment(&mut self, facts: &NativeUpdateReconcileFacts) {
         self.release_repaired_auto_apply_environment_for_commit(
             facts,
@@ -10186,10 +8443,6 @@ impl App {
         facts: &NativeUpdateReconcileFacts,
         running_commit: &str,
     ) {
-        // What refused since the block was taken names it first
-        // ([`Self::rekey_environment_block_to`]), so the evidence asked below
-        // is that cause's. Never waits: a cache another thread holds re-keys
-        // nothing this reconcile.
         #[cfg(unix)]
         {
             let cache = std::sync::Arc::clone(&self.handoff_preverified);
@@ -10209,9 +8462,6 @@ impl App {
             self.auto_apply_environment_block = None;
             return;
         }
-        // A folder is not a bundle: the facts below are about the installed copy,
-        // which verifies when only the folder refuses, so they never release the
-        // folder's block; only a pass that asked the folder does.
         if blocked.cause == EnvironmentBlockCause::InstallLocation {
             if facts
                 .durable
@@ -10242,12 +8492,8 @@ impl App {
         {
             return;
         }
-        // The pre-park verdict cache exists only where the seamless handoff reads it.
         #[cfg(unix)]
         {
-            // A cache publication newer than this read may have seen another
-            // change; never erase it with older evidence. A matching old denial is
-            // invalidated, not turned into a fabricated pass.
             let mut cached = match self.handoff_preverified.try_lock() {
                 Ok(cached) => cached,
                 Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
@@ -10277,15 +8523,6 @@ impl App {
         );
     }
 
-    /// Whether the folder took the swap's write since it refused: the verdict cache holds
-    /// a pass of exactly the `blocked` artifact, published after the block was taken (the
-    /// slot holds only the newest verdict, so a refusal since has replaced it). Only the
-    /// staged lane's pre-park verification passes that way, and it asks the folder first
-    /// (`install_location_check`, in `preverify_staged_for_handoff`); an activation's
-    /// check never asks the folder, so its pass is no evidence. Not bound by
-    /// [`crate::HANDOFF_PREVERIFY_FRESHNESS`]: the re-armed attempt verifies again when
-    /// the pass is stale, and the swap asks the folder once more under the apply lock.
-    /// Never waits: a cache another thread holds is no answer this reconcile.
     fn install_location_answered_since(&self, blocked: &AutoApplyEnvironmentBlock) -> bool {
         #[cfg(unix)]
         {
@@ -10312,9 +8549,6 @@ impl App {
                     && entry.at > blocked.blocked_at
             })
         }
-        // No verdict cache exists off unix, so nothing there says the folder
-        // took the write — nor can a refusal only a person can clear be met
-        // there.
         #[cfg(not(unix))]
         {
             let _ = blocked;
@@ -10323,17 +8557,10 @@ impl App {
     }
 
     pub(crate) fn apply_native_update(&mut self, mode: ApplyMode) -> UpdateOutcome {
-        // A person's press already held for the candidate's pre-park read: a second
-        // press joins it and runs with it once the read ends
         // (`App::run_held_person_apply`).
         if !mode.is_automatic() && self.person_apply_is_held() {
             return UpdateOutcome::Accepted;
         }
-        // A retire of this activation is running: its bundle is being taken off
-        // the install path under the apply lock, and a candidate launched now
-        // could come up as the replaced build. It takes seconds and the newer
-        // build is the stage when it answers; until then any press waits. (The
-        // latch already keeps the automatic lane off this build.)
         if let Some(job) = self.native_activation_supersede.as_ref()
             && self
                 .native_updater_service
@@ -10351,10 +8578,6 @@ impl App {
                 ),
             };
         }
-        // A build on hold (`latched_activation_trial_spent`): its next start is the
-        // one its boot trial rolls back, and no press re-arms that trial. A person's
-        // press that reaches here (a control `update apply`) is refused before
-        // anything launches, and says so.
         if !mode.is_automatic()
             && let Some(staged) = self
                 .native_updater_service
@@ -10369,12 +8592,6 @@ impl App {
                 )],
             };
         }
-        // The ladder's entry gate: an automatic apply asks whether the terminal is
-        // in a state its current phase accepts (a quiet moment, then a gap in
-        // output, then a gap in typing, then anything) before a successor is
-        // launched or a ticket minted, so a refusal costs nothing. The park re-reads
-        // the same predicate (`prelaunch_park_admitted`). A person's apply is never
-        // held.
         if mode.is_automatic() {
             let now = std::time::Instant::now();
             if let Some(reason) = crate::native_update_auto_intent::automatic_park_refusal(
@@ -10407,24 +8624,12 @@ impl App {
                 };
             }
         };
-        // `Ok(false)` means a native app declined (the user's live state,
-        // self-correcting); `Err` means the close reducer broke (an unknown
-        // window, unhandled effects), which waiting never repairs. The distinction
-        // stays typed to the outcome, since a `Blocked` latch cools down and retries.
         let mut shutdown_error = None;
-        // A background probe must not take over the screen: under `Interactive` a
-        // `Blocked` reducer switches tabs, moves focus and opens Close Recovery
-        // (`surface_native_close_recovery`), and the automatic lane re-probes on a
-        // `PREFLIGHT_BLOCK_COOLDOWN` schedule. A person's apply keeps the recovery
-        // surface.
         let visibility = if mode.is_automatic() {
             crate::app_tabs::ClosePreflightVisibility::Quiet
         } else {
             crate::app_tabs::ClosePreflightVisibility::Interactive
         };
-        // A draft journal that owes work (a failed append, a re-seat after a
-        // rolled-back update) is retried by the update itself, so an unsaved draft
-        // reads as "still being written" rather than holding the update.
         self.drive_owed_document_journals();
         let (readiness, safety_token) = match self
             .prepare_all_native_shutdown(self.update_close_scope(), visibility)
@@ -10458,11 +8663,6 @@ impl App {
                     self.apply_staged_update_now(safety_token, mode, Some(worker_attempt), None)
                 }) {
                     Ok(()) => UpdateOutcome::Accepted,
-                    // A person's press held for the candidate's read: the ticket
-                    // goes back, as for a deferral, and the press is held, its
-                    // installing row up, to run again once the read ends
-                    // (`App::run_held_person_apply`). Accepted: how it ends reaches
-                    // the row, as any accepted install's does.
                     #[cfg(unix)]
                     Err(error) if error.held_for_read_of().is_some() => {
                         let held = error.held_for_read_of();
@@ -10486,11 +8686,6 @@ impl App {
                         }
                         UpdateOutcome::Deferred { reason: message }
                     }
-                    // An admission refusal: nothing was attempted, so nothing
-                    // failed. The stage is re-armed like a deferral and the outcome
-                    // takes the Blocked lane (the ledger's non-streak Refused slot
-                    // and the disposition's cooldown), not the failure streak and
-                    // physical budget of `Failed` below.
                     Err(error) if error.is_refused() => {
                         let message = error.into_message();
                         if self
@@ -10503,10 +8698,6 @@ impl App {
                             reasons: vec![message],
                         }
                     }
-                    // The fork lane's park missed its budget: timing, like the
-                    // launched lane's stand-down after its last rung, so the same
-                    // spaced activity retry, never the physical budget. A person's
-                    // apply is told; nothing is spent either way.
                     #[cfg(unix)]
                     Err(error) if error.is_park_missed() => {
                         let message = error.into_message();
@@ -10518,8 +8709,6 @@ impl App {
                         }
                         self.fork_park_miss_outcome(&attempt, mode, message)
                     }
-                    // The fork lane's capture refused the desk
-                    // (`fork_capture_refusal_outcome`).
                     #[cfg(unix)]
                     Err(error) if error.is_capture_refused() => {
                         let message = error.into_message();
@@ -10531,18 +8720,11 @@ impl App {
                         }
                         fork_capture_refusal_outcome(mode, message)
                     }
-                    // Submission failed before the worker touched disk: re-arm the
-                    // exact authority directly. Physical failures always return
-                    // through `finish_async_native_update_handoff` with worker facts.
                     Err(error) => self.abort_unstarted_native_apply(&attempt, error.into_message()),
                 }
             }
             ApplyDecision::Blocked(reasons) => {
                 self.publish_native_update_state();
-                // The preflight ticket had to be consumed above (an abandoned
-                // `pending_preflight` makes every later `begin_apply_preflight`
-                // answer `Joined`), so the error is reported here, not by an early
-                // return.
                 if let Some(message) = shutdown_error {
                     return UpdateOutcome::Failed { message };
                 }
@@ -10554,17 +8736,7 @@ impl App {
         }
     }
 
-    /// Main-thread completion for any apply attempt that left this process
-    /// alive, including the asynchronous overlap waiter. Disk is authoritative:
-    /// the exact stage may be re-armed, a consumed/swapped stage becomes
-    /// InstalledNeedsRelaunch, and a changed stage retires the old generation
-    /// before importing the new one.
-    ///
-    /// `lane` is the typed classification from the
-    /// [`crate::native_updater_service::ApplyMode`] and the worker's activity
-    /// verdict. An activity-revoked automatic attempt spends bounded
-    /// [`AutomaticRetryKind::ActivityRevoked`] budget; a person's attempt spends
-    /// nothing (see [`HandoffFailureLane`]).
+    /// Main-thread completion for any apply attempt that left this process alive, including the asynchronous overlap waiter.
     #[cfg(any(unix, test))]
     pub(crate) fn finish_async_native_update_handoff(
         &mut self,
@@ -10576,18 +8748,6 @@ impl App {
         self.reconcile_returned_native_apply_with_facts(attempt, facts, message, lane)
     }
 
-    /// Spend one physical-failure attempt for this exact artifact and say what happens
-    /// next; every lane books through [`Self::latch_after_physical_failure`].
-    ///
-    /// The count lives on `auto_apply_physical_retry`, keyed by (build, dmg), which
-    /// outlives the latch and `AutoApplyIntent::attempts`, so the lane converges: a retry
-    /// mid-epoch, a stand-down once [`PHYSICAL_FAILURES_PER_EPOCH`] are spent, and
-    /// [`PhysicalFailureSchedule::Converged`] at the shape's
-    /// [`PhysicalFailureShape::lifetime_attempts`]. [`PHYSICAL_RETRY_BUDGET_REPLENISH`]
-    /// without a failure starts it over. The count is shape-blind: a structural failure
-    /// after a spent transient budget converges at once, and one under a standing
-    /// structural verdict re-latches onto what the verdict still owes (the model's
-    /// `AttemptFails`).
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -10623,17 +8783,11 @@ impl App {
             cycles: spent.saturating_add(1),
             last_attempt: now,
         });
-        // The verdict stands: an attempt it earned failed the same way, so
-        // re-latch at once onto what the verdict still owes (the re-sample's
-        // deadline if still to come, else nothing).
         if let Some(verdict) = verdict {
             return PhysicalFailureSchedule::Converged {
                 resample_at: verdict.resample_at,
             };
         }
-        // `spent` counts physical failures before this one, so it is this
-        // failure's 0-based lifetime index. Saturating arithmetic keeps a runaway
-        // `u8` pinned at Converged instead of wrapping into a fresh budget.
         if spent >= shape.lifetime_attempts().saturating_sub(1) {
             if shape == PhysicalFailureShape::Structural {
                 return self.mint_structural_verdict(build, dmg_sha256, activation, now);
@@ -10641,10 +8795,6 @@ impl App {
             return PhysicalFailureSchedule::converged(shape, now);
         }
         if shape == PhysicalFailureShape::Structural {
-            // One confirming retry on the transient schedule's first rung, then the lane
-            // is done with these bytes: a candidate that twice failed to become the
-            // successor leaves nothing about the machine to re-sample. A missing rung
-            // converges (fail closed).
             return match automatic_retry_delay(0, AutomaticRetryKind::PhysicalFailure) {
                 Some(delay) => PhysicalFailureSchedule::Retry(now + delay),
                 None => self.mint_structural_verdict(build, dmg_sha256, activation, now),
@@ -10653,18 +8803,11 @@ impl App {
         let within_epoch = spent % PHYSICAL_FAILURES_PER_EPOCH;
         match automatic_retry_delay(within_epoch, AutomaticRetryKind::PhysicalFailure) {
             Some(delay) => PhysicalFailureSchedule::Retry(now + delay),
-            // This epoch is spent but the lane is not: stand down long enough for
-            // the next epoch to be an independent sample, while the counter
-            // survives (asserted against [`PHYSICAL_RETRY_BUDGET_REPLENISH`]).
             None => PhysicalFailureSchedule::StandDown(now + PHYSICAL_FAILURE_EPOCH_COOLDOWN),
         }
     }
 
-    /// What this lane has booked against `attempt`'s bytes, for the cold lane to carry
-    /// across its `exec` ([`crate::app_update_handoff::ColdLaneBudget`]): the
-    /// physical-failure record and the structural verdict that cover them, raw. The
-    /// relaunched process's [`Self::spend_physical_failure_budget`] applies the
-    /// replenish window and the verdict's rule to them, with the clock carried along.
+    /// What this lane has booked against `attempt`'s bytes.
     #[cfg(unix)]
     pub(crate) fn cold_lane_budget(
         &self,
@@ -10698,15 +8841,7 @@ impl App {
         }
     }
 
-    /// A refused cold relaunch handed to this process's automatic lane: called once, by
-    /// `main_entry`, on the launch whose boot swap refused
-    /// ([`crate::app_update_handoff::ColdRelaunch`]). The refusal goes in the verdict cache
-    /// and is kept apart until an automatic read of its artifact takes it
-    /// ([`Self::answer_with_refused_cold_relaunch`]); the outgoing process's failure record
-    /// and structural verdict are put back with their clocks, so the booking that read
-    /// leads to counts this refusal after every earlier one. A roster-confirmation wait
-    /// ([`crate::app_update_handoff::ColdRelaunchSeed::roster_wait`]) is no refusal: nothing
-    /// is cached, and the lane holds for the check; the budget is put back all the same.
+    /// A refused cold relaunch handed to this process's automatic lane.
     #[cfg(unix)]
     pub(crate) fn seed_refused_cold_relaunch(
         &mut self,
@@ -10752,9 +8887,6 @@ impl App {
                 resample_at: carried
                     .resample_in_secs
                     .map(|secs| now + std::time::Duration::from_secs(secs)),
-                // A download's verdict (the only kind a cold relaunch carries)
-                // offers no newer release the install path, and its trial always
-                // has room.
                 newer_spent: 0,
                 newer_retry: None,
                 newer_refusals: 0,
@@ -10767,11 +8899,6 @@ impl App {
         }
     }
 
-    /// A structural convergence, and the verdict that remembers it: one re-sample
-    /// [`STRUCTURAL_RESAMPLE_AFTER`] out, and no newer release offered the install
-    /// path yet. A verified release already on disk while the bytes failed is not
-    /// spent: it may take the activation's place, which no failure of the older bytes
-    /// has tried, so the first look after convergence offers it.
     fn mint_structural_verdict(
         &mut self,
         build: u64,
@@ -10797,12 +8924,6 @@ impl App {
         schedule
     }
 
-    /// Spend, latch, and say so: the one sequence every physical handoff failure
-    /// takes, on every lane (the synchronous `(ManualOnly, Failed)` arm,
-    /// `abort_reaped_native_apply_before_reconcile` and
-    /// `reconcile_returned_native_apply_with_facts`). A latch is never written
-    /// without its log line, its `update status` note and, at convergence, the
-    /// health notice.
     fn latch_after_physical_failure(
         &mut self,
         build: u64,
@@ -10822,14 +8943,6 @@ impl App {
         schedule
     }
 
-    /// The schedule's log line, its standing note, and, when the lane just
-    /// converged, the loud notice. Split from
-    /// [`Self::latch_after_physical_failure`] so the words have one author.
-    ///
-    /// The note is queued on [`crate::App::apply_schedule_standing`], not written
-    /// here: booking the failure in the ledger clears any standing refusal, so
-    /// the note must land after it, which
-    /// `record_apply_outcome_for_target_in_ledger` does on every lane.
     fn say_physical_failure_schedule(
         &mut self,
         build: u64,
@@ -10839,8 +8952,6 @@ impl App {
     ) {
         let now = std::time::Instant::now();
         let wait_secs = |at: std::time::Instant| at.saturating_duration_since(now).as_secs();
-        // The lifetime index of this failure against the artifact's budget, not
-        // the per-intent counter (which restarts at 1 on every lapse and re-arm).
         let lifetime = self
             .auto_apply_physical_retry
             .filter(|retry| retry.build == build)
@@ -10873,8 +8984,6 @@ impl App {
                 wait_secs(at)
             ),
         }
-        // The schedule, durably: `status.toml` and `update status` carry the
-        // pause, not only this process's memory.
         let horizon = |at: std::time::Instant| {
             aterm_types::rfc3339::format_rfc3339(
                 aterm_time::unix_secs()
@@ -10914,14 +9023,7 @@ impl App {
         }
     }
 
-    /// The automatic lane stopped, said at once. The ledger's own health warning
-    /// (`aterm_update::health_failing_title("apply")`) fires at
-    /// [`aterm_update::PERSISTENT_AFTER`] consecutive failures, but a structural failure
-    /// converges sooner ([`STRUCTURAL_FAILURE_LIFETIME_ATTEMPTS`]), so convergence raises
-    /// the same warning through [`App::note_update_health`], plus the OS banner, once per
-    /// build and verdict. The warning names the Version menu; the `Install now` press is
-    /// the outcome row's (`react_to_update_apply_outcome`), and a lane that re-samples by
-    /// itself raises no decision row.
+    /// The automatic lane stopped, said at once.
     pub(crate) fn announce_automatic_apply_stranded(
         &mut self,
         build: u64,
@@ -10930,29 +9032,18 @@ impl App {
         resample_at: Option<std::time::Instant>,
         detail: &str,
     ) {
-        // Once per build and verdict: a re-sample that fails again is quiet, but a
-        // lane that goes from re-sampling to stopped says so again, since the old
-        // words promised a retry. On glass at most once per launch:
-        // `note_update_health` is the one latch for this title (shared with the
-        // updater's streak and overdue notices); a warning already up takes the new
-        // words (`restate_update_health`).
         let verdict = (build, resample_at.is_some());
         if self.auto_apply_stranded_announced == Some(verdict) {
             return;
         }
         self.auto_apply_stranded_announced = Some(verdict);
-        // Plain words and the one install verb: no "apply", "build N" or
-        // "handoff" on the warning; those belong in aterm.log.
         let cause = match shape {
             PhysicalFailureShape::Structural => "the new version couldn't take over",
             PhysicalFailureShape::Transient => "the moment to switch kept passing",
             #[cfg(unix)]
             PhysicalFailureShape::Unexplained => "the new version kept quitting",
         };
-        // A structural verdict re-samples once, a day out; the machine-shaped
-        // ones re-sample every cooldown.
         let next = match (shape, resample_at) {
-            // A spent boot trial: the menu's start would roll it back too.
             (_, None) if self.latched_activation_trial_spent(build) => {
                 crate::update_words::NEWER_RELEASE_REPLACES.to_string()
             }
@@ -10988,15 +9079,9 @@ impl App {
         let title = aterm_update::health_failing_title("apply");
         let said_before = self.auto_apply_stranded_said.replace(build) == Some(build);
         let announced = self.note_update_health(title, &body);
-        // The OS notification a health announcement owes, through the door
-        // `Wake::UpdateHealth` shares (it holds `desktop_alerts` and never posts
-        // from a unit test).
         if announced {
             self.post_update_health_banner(crate::update_words::HealthKind::Install, title, &body);
         } else if said_before {
-            // This lane's own words were said this launch, and promised what
-            // no longer holds (a retry withdrawn): the warning takes the new
-            // words, where it stands or as a record after it.
             self.restate_update_health(
                 crate::update_words::HealthKind::of_updater_title(title),
                 title,
@@ -11005,17 +9090,6 @@ impl App {
         }
     }
 
-    /// Carry the manual-only latch across a retirement of the stage it was
-    /// minted on, now that the bundle under our executable is `installed_build`.
-    ///
-    /// * A latch on `installed_build` itself is the same logical update (our
-    ///   candidate installed that bundle before failing), so it is re-keyed to
-    ///   the bundle's activation identity with `retry_at` unchanged. The
-    ///   environment block is the exception: it waits on the installed copy
-    ///   changing, which just happened, so it is released.
-    /// * A latch on a build no newer than the retired one retires with it.
-    /// * A latch on a strictly newer build is about another artifact and
-    ///   survives: a newer attempt may have completed out of order.
     fn carry_manual_only_latch_across_swap(
         &mut self,
         retired_build: u64,
@@ -11061,11 +9135,7 @@ impl App {
         }
     }
 
-    /// What a fork-lane park that missed its freeze budget comes back as: a spaced activity
-    /// retry on the automatic lane, a failure told to a person. Booked as a refusal (the
-    /// readers parked and the screen froze, so it is not the ladder's "not this instant"),
-    /// like the launched lane's `ActivityRevoked` stand-down, so `update status` shows
-    /// `apply_refusal=`; never a failure, so `failing_applies` does not move.
+    /// What a fork-lane park that missed its freeze budget comes back as.
     #[cfg(unix)]
     pub(crate) fn fork_park_miss_outcome(
         &mut self,
@@ -11094,12 +9164,6 @@ impl App {
         UpdateOutcome::Deferred { reason: message }
     }
 
-    /// Consume one activity-revoked overlap retry cycle for this artifact and
-    /// re-arm the automatic intent at its spaced deadline. `None` only when the
-    /// artifact identity is malformed. The counter lives on
-    /// `auto_overlap_retry`, keyed by (build, dmg), so duplicate or reordered
-    /// completions cannot restart the spacing and a different artifact starts
-    /// at the first rung. The ladder anchor is untouched.
     #[cfg(any(unix, test))]
     fn arm_activity_revoked_overlap_retry(
         &mut self,
@@ -11107,16 +9171,11 @@ impl App {
     ) -> Option<std::time::Duration> {
         let dmg_sha256 = decode_dmg_sha256(attempt.target_dmg_sha256())?;
         let build = attempt.target_build();
-        // Which side of the swap: a failed candidate leaves the bundle
-        // installed, so the retry for the same update arrives as an activation;
-        // `covers` folds both into one ladder.
         let activation = attempt.is_installed_activation();
         let now = std::time::Instant::now();
         let cycles = self
             .auto_overlap_retry
             .filter(|retry| {
-                // A busy stretch ends: once the terminal has gone long enough
-                // without a revoked attempt, the spacing starts over.
                 retry.covers(build, dmg_sha256, activation)
                     && now.duration_since(retry.last_attempt)
                         < crate::ACTIVITY_RETRY_BUDGET_REPLENISH
@@ -11132,8 +9191,6 @@ impl App {
             last_attempt: now,
         });
         self.auto_apply_manual_only = None;
-        // A revocation with no anchor for this build (the attempt was armed
-        // before this process learned the ladder): the ladder starts here.
         self.anchor_auto_apply_ladder(build, now);
         self.auto_apply_intent = Some(crate::AutoApplyIntent {
             build,
@@ -11144,13 +9201,7 @@ impl App {
         Some(delay)
     }
 
-    /// The desk as a capture refusal sees it ([`crate::CaptureDesk`]): every live
-    /// session by id (read with no engine lock, for `TooManySessions` and
-    /// `DuplicateLocalId`) and a hash of each session's rows, cols, alt screen and
-    /// cwd (for content refusals), `None` where the engine is busy this instant. Not
-    /// where a parser's last read ended: that flips whenever a read stops inside an
-    /// escape sequence, and no refusal is about it. The refusal lane retries when
-    /// this changes, spaced by [`capture_refusal_spacing`].
+    /// The desk as a capture refusal sees it ([`crate::CaptureDesk`]).
     #[must_use]
     pub(crate) fn capture_desk(&self) -> crate::CaptureDesk {
         use std::hash::{Hash as _, Hasher as _};
@@ -11177,11 +9228,7 @@ impl App {
         )
     }
 
-    /// The park's capture refused this artifact's handoff: record the refused
-    /// desk and re-arm the automatic intent on the refusal lane's probe, never
-    /// the activity spacing, the physical budget or a latch. The caller's
-    /// surfacing records the failure, which moves `failing_applies` and puts the
-    /// session in `update status`'s `apply_failure=`.
+    /// The park's capture refused this artifact's handoff.
     #[cfg(any(unix, test))]
     pub(crate) fn arm_capture_refusal_retry(
         &mut self,
@@ -11191,8 +9238,6 @@ impl App {
         detail: &str,
     ) {
         let now = std::time::Instant::now();
-        // A refusal of the attempt a release admitted counts on: the spacing
-        // grows while the same update keeps being refused.
         let refusals = self
             .auto_apply_capture_refusal
             .as_ref()
@@ -11210,8 +9255,6 @@ impl App {
             refusals,
             released: false,
         });
-        // The refusal lane owns the intent now; a lapsed physical latch for the
-        // same bytes has nothing left to say about it.
         self.auto_apply_manual_only = None;
         self.anchor_auto_apply_ladder(build, now);
         let attempts = self
@@ -11221,8 +9264,6 @@ impl App {
         self.auto_apply_intent = Some(crate::AutoApplyIntent {
             build,
             dmg_sha256,
-            // The spacing, which nothing releases sooner — or, for a session an
-            // engine kept from being read, the baseline probe, which reads it.
             retry_at: self.capture_refusal_reprobe_at(now),
             attempts,
         });
@@ -11246,12 +9287,7 @@ impl App {
         );
     }
 
-    /// When the lane next looks at a standing capture refusal: the end of its
-    /// spacing once its baseline desk is complete, since nothing releases it
-    /// sooner, and otherwise soon. A session busy when the refusal was recorded
-    /// must be read during the spacing, or it would absorb a change made to it
-    /// meanwhile: it is looked for every [`CAPTURE_REFUSAL_BASELINE_PROBE`] during
-    /// the refusal's first probe, then at the probe.
+    /// When the lane next looks at a standing capture refusal.
     #[must_use]
     pub(crate) fn capture_refusal_reprobe_at(&self, now: std::time::Instant) -> std::time::Instant {
         let probe = now + CAPTURE_REFUSAL_PROBE;
@@ -11271,11 +9307,7 @@ impl App {
         }
     }
 
-    /// Read the sessions a standing capture refusal's baseline is missing,
-    /// whatever the poll then decides: the hold reads them too, but a poll that
-    /// waits for activity to settle never reaches it, and a session first read
-    /// once the activity ends would absorb what the person did to it meanwhile.
-    /// A no-op once the baseline is complete.
+    /// Read the sessions a standing capture refusal's baseline is missing, whatever the poll then decides.
     pub(crate) fn capture_refusal_take_baseline(&mut self) {
         if !self
             .auto_apply_capture_refusal
@@ -11290,11 +9322,7 @@ impl App {
         }
     }
 
-    /// How much longer the standing capture refusal holds the next attempt at
-    /// the soonest, however the desk moves: what is left of its spacing
-    /// ([`capture_refusal_spacing`]). The words that record a refusal say it
-    /// when it is more than a probe (`update_words::capture_refused_waiting`),
-    /// so a person who closes tabs as told is not left watching nothing happen.
+    /// How much longer the standing capture refusal holds the next attempt at the soonest, however the desk moves.
     #[must_use]
     #[cfg(any(unix, test))]
     pub(crate) fn capture_refusal_spacing_left(
@@ -11310,13 +9338,7 @@ impl App {
             })
     }
 
-    /// Whether a standing capture refusal still holds the attempt the poll just
-    /// admitted: same artifact, backstop not reached, and either its spacing has
-    /// not passed ([`capture_refusal_spacing`]) or the desk has not moved
-    /// ([`crate::CaptureDesk::moved_to`]). A released record holds nothing and only
-    /// lets the next refusal of the same update count on. Every call first reads
-    /// the sessions the baseline is missing; a session busy at this read says
-    /// nothing about itself, and a session closed or opened is seen regardless.
+    /// Whether a standing capture refusal still holds the attempt the poll just admitted.
     pub(crate) fn capture_refusal_holds(
         &mut self,
         build: u64,
@@ -11340,10 +9362,6 @@ impl App {
             let Some(refusal) = self.auto_apply_capture_refusal.as_mut() else {
                 return false;
             };
-            // A session busy when the refusal was recorded takes its first
-            // readable state as its baseline, whatever the spacing, so a change
-            // made to it during the spacing is still a change when it ends. Never
-            // a release by itself: what the refusal was about may be unchanged.
             refusal.desk.fill_from(&desk);
             if held_for < capture_refusal_spacing(refusal.refusals) || !refusal.desk.moved_to(&desk)
             {
@@ -11375,10 +9393,7 @@ impl App {
         UpdateOutcome::Failed { message }
     }
 
-    /// A handoff worker has killed and reaped its child, but ordered disk
-    /// reconciliation may still be queued. Re-arm the exact in-memory authority
-    /// now so the UI never stays Applying while readers resume; the later
-    /// reconcile wake retires or imports disk authority.
+    /// A handoff worker has killed and reaped its child, but ordered disk reconciliation may still be queued.
     #[cfg(any(unix, test))]
     pub(crate) fn abort_reaped_native_apply_before_reconcile(
         &mut self,
@@ -11391,16 +9406,12 @@ impl App {
             .native_updater_service
             .abort_apply(attempt, message.clone())
         {
-            // The `Rearmed` policy of `reconcile_returned_native_apply_with_facts`
             // (the lane every completion takes), with no facts to reduce.
             return self.settle_rearmed_apply_failure(attempt, message, lane, None);
         }
         UpdateOutcome::Failed { message }
     }
 
-    /// The automatic lane's answer to a failed handoff whose stage stayed armed,
-    /// shared by the reaped abort and a `Rearmed` reconcile. Every exit publishes
-    /// the update state, then reduces the returned `facts`.
     #[cfg(any(unix, test))]
     fn settle_rearmed_apply_failure(
         &mut self,
@@ -11415,9 +9426,6 @@ impl App {
                 app.reduce_returned_apply_facts(facts);
             }
         };
-        // A refusal only a person can clear, of another cause than a standing
-        // block's, that this attempt's own pre-park check met: the block names it
-        // before any row about this attempt is built, a person's press included.
         #[cfg(unix)]
         {
             let cache = std::sync::Arc::clone(&self.handoff_preverified);
@@ -11426,10 +9434,6 @@ impl App {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             self.rekey_environment_block_to(newest.as_ref());
         }
-        // The stage waits for an update check to confirm its signer (no attempt reads
-        // the roster): a deferral, not a physical failure
-        // (`HandoffFailureLane::AwaitsRosterConfirmation`). The automatic lane holds
-        // for the check, re-armed here when it was the one that tried.
         #[cfg(unix)]
         if let HandoffFailureLane::AwaitsRosterConfirmation { automatic } = lane {
             if let Some(dmg_sha256) = decode_dmg_sha256(attempt.target_dmg_sha256()) {
@@ -11446,15 +9450,10 @@ impl App {
             publish(self);
             return UpdateOutcome::Deferred { reason: message };
         }
-        // A person's failure is not the background lane's business: the apply
-        // authority is reduced (the artifact stays staged, the UI leaves
-        // Applying) but no automatic budget is spent. See [`HandoffFailureLane`].
         if !lane.charges_the_automatic_lane() {
             publish(self);
             return UpdateOutcome::Failed { message };
         }
-        // Activity-revoked: the stage is re-armed and the rollback was lossless,
-        // so schedule one spaced re-attempt, never a latch.
         if lane == HandoffFailureLane::ActivityRevoked
             && let Some(delay) = self.arm_activity_revoked_overlap_retry(attempt)
         {
@@ -11464,8 +9463,6 @@ impl App {
             );
             return UpdateOutcome::Deferred { reason: message };
         }
-        // A capture refusal: recorded by the caller's surfacing, retried when the
-        // desk changes, never latched.
         if lane == HandoffFailureLane::Refused
             && let Some(dmg_sha256) = decode_dmg_sha256(attempt.target_dmg_sha256())
         {
@@ -11479,12 +9476,6 @@ impl App {
             publish(self);
             return UpdateOutcome::CaptureRefused { message };
         }
-        // A verdict only a person can clear (the folder this user cannot write,
-        // or the installed copy) is no failure of the build's: the worker's
-        // pre-park check reached it because the attempt outran the arm-time
-        // read. It is kept where the synchronous arm keeps it
-        // ([`Self::suspend_automatic_apply_for_person`]) instead of spending the
-        // structural budget.
         #[cfg(unix)]
         if let HandoffFailureLane::Physical(PhysicalFailureShape::Structural) = lane
             && let Some(dmg_sha256) = decode_dmg_sha256(attempt.target_dmg_sha256())
@@ -11507,8 +9498,6 @@ impl App {
             publish(self);
             return UpdateOutcome::Failed { message };
         }
-        // A physical failure spends its converging budget and takes the manual
-        // latch, logged and recorded.
         if let HandoffFailureLane::Physical(shape) = lane
             && let Some(dmg_sha256) = decode_dmg_sha256(attempt.target_dmg_sha256())
         {
@@ -11521,8 +9510,6 @@ impl App {
             );
         }
         self.auto_apply_intent = None;
-        // The Staged bar, if it is still up for this build, stands down with
-        // the lane — not after the next unrelated reconcile.
         self.restate_staged_bar_posture(attempt.target_build());
         publish(self);
         UpdateOutcome::Failed { message }
@@ -11566,18 +9553,11 @@ impl App {
         );
         match disposition {
             ReturnedApplyDisposition::Rearmed => {
-                // The stage is re-armed on disk; the facts are reduced once the
                 // lane's policy has published.
                 Some(self.settle_rearmed_apply_failure(&attempt, message, lane, Some(facts)))
             }
             ReturnedApplyDisposition::InstalledNeedsRelaunch { build } => {
                 self.auto_apply_intent = None;
-                // Our attempt swapped the bundle (this process before the launch, or
-                // a fork-lane child) and then failed. The failure
-                // is charged like every returned one (the budget folds download and
-                // activation into one count), and the latch is carried to the
-                // activation it now guards, so the imported activation does not
-                // retry immediately.
                 if let HandoffFailureLane::Physical(shape) = lane
                     && let Some(dmg_sha256) = decode_dmg_sha256(attempt.target_dmg_sha256())
                 {
@@ -11591,8 +9571,6 @@ impl App {
                 }
                 self.carry_manual_only_latch_across_swap(build, build, facts.installed.as_ref());
                 self.publish_native_update_state();
-                // A newer artifact is imported only when it exceeds the canonical
-                // installed build; the fact reducer enforces that floor.
                 self.reduce_returned_apply_facts(facts);
                 Some(UpdateOutcome::InstalledNeedsRelaunch {
                     build,
@@ -11601,8 +9579,6 @@ impl App {
             }
             ReturnedApplyDisposition::Retired => {
                 self.auto_apply_intent = None;
-                // Retiring old authority must not clear a sticky latch for a newer
-                // artifact that may already have completed out of order.
                 if self.auto_apply_manual_only.is_some_and(|manual| {
                     manual.build == attempt.target_build()
                         && decode_dmg_sha256(attempt.target_dmg_sha256()) == Some(manual.dmg_sha256)
@@ -11611,8 +9587,6 @@ impl App {
                 }
                 self.publish_native_update_state();
                 self.reduce_returned_apply_facts(facts);
-                // The reducer's own sentence for the same retirement, less its
-                // "The install stopped" (the row and the log say that already).
                 let changed = if attempt.is_installed_activation() {
                     "aterm on disk has since changed"
                 } else {
@@ -11622,9 +9596,6 @@ impl App {
                     message: format!("{message}; {changed}"),
                 })
             }
-            // A delayed callback for attempt A must not perturb attempt B's UI: the
-            // service is reducer-inert and `None` forbids logs, alerts, redraws or
-            // "remains ready" text at the caller.
             ReturnedApplyDisposition::Ignored => None,
         }
     }
@@ -11662,9 +9633,6 @@ impl App {
                 crate::tab_model::View::Terminal(_) => None,
             })
             .collect::<std::collections::BTreeSet<_>>();
-        // An unsaved draft is carried, not a blocker, once its journal holds it
-        // durably and the image on disk replays to the editor's exact text
-        // (`App::draft_carry`). Asked at the update's start and again at Commit.
         let drafts = DraftCarryTally::of(
             documents
                 .iter()
@@ -11690,11 +9658,6 @@ impl App {
                 )
             })
             .count();
-        // Whether the successor reopens what is open here from the handed-over
-        // layout (`App::capture_handoff_layout`, which carries each Settings
-        // view's unsaved field drafts). Where it does, Settings drafts and
-        // failed-checkpoint documents ride the update; where it does not (a
-        // headless successor, the Windows replace) they hold it.
         let successor_reopens = self.successor_restores_document_tabs();
         let settings = SettingsDraftTally::of(
             self.view_store.iter().filter_map(|(view, _)| {
@@ -11713,24 +9676,14 @@ impl App {
         blockers.extend(settings.blocker());
         blockers.extend(drafts.blockers());
         if self.document_journal_writes_in_flight() {
-            // A journal write on the worker now (any document's, a re-seat after
-            // a rolled-back update included) could land after the successor read
-            // its restore image or after Commit, so no update starts or commits
             // over one.
             blockers.push("Wait: a draft journal write is in flight".to_string());
         }
         if self.document_journal_landed_while_parked() {
-            // At Commit: a journal write already on the worker at the park landed
-            // afterwards, possibly after the successor read its restore image;
-            // nothing can order the two, so nothing is vouched for.
             blockers.push(
                 "Wait: a draft journal was written after the successor began restoring".to_string(),
             );
         }
-        // A failed checkpoint is not a loss the successor causes: its unsaved
-        // text is a dirty document's draft, which the tally above carries or
-        // holds the update for. A reopening successor takes it (unfrozen, unsaved,
-        // to save again); only a lane that reopens nothing waits.
         if failed_checkpoints > 0 && !successor_reopens {
             blockers.push(format!(
                 "{FAILED_CHECKPOINTS_BLOCK} {failed_checkpoints} document checkpoint(s) previously failed"
@@ -11783,8 +9736,6 @@ impl App {
     }
 
     /// Re-run native document/restore safety at asynchronous handoff completion.
-    /// The original token authorizes preparation only; edits can happen while the
-    /// child boots, so the outgoing process needs fresh evidence before exit.
     #[cfg(unix)]
     pub(crate) fn revalidate_native_update_safety(
         &self,
@@ -11798,10 +9749,7 @@ impl App {
         }
     }
 
-    /// The close scope an update asks every native app with: `CarriedRelaunch`
-    /// when the successor reopens its native tabs from the handed-over layout
-    /// (which carries their unsaved view state), else `Relaunch`, under which an
-    /// app holds what it cannot keep.
+    /// The close scope an update asks every native app with.
     pub(crate) fn update_close_scope(&self) -> crate::native_app::CloseScope {
         if self.successor_restores_document_tabs() {
             crate::native_app::CloseScope::CarriedRelaunch
@@ -11810,10 +9758,7 @@ impl App {
         }
     }
 
-    /// The automatic lane's close preflight, asked quietly (no tab switch, no focus move,
-    /// no Close Recovery), for a launch-record renewal: the same steps
-    /// [`Self::apply_native_update`] runs past its updater ticket, which a renewal has
-    /// none of.
+    /// The automatic lane's close preflight, asked quietly (no tab switch, no focus move, no Close Recovery), for a launch-record renewal.
     #[cfg(target_os = "macos")]
     pub(crate) fn quiet_native_update_safety_token(
         &mut self,
@@ -11841,12 +9786,8 @@ impl App {
         }
     }
 
-    /// QA same-binary reexec through the production native-state preflight, so
-    /// `ATERM_DEBUG_SEAMLESS_REEXEC` never bypasses dirty documents, checkpoint
-    /// work, or restore/adoption state.
+    /// QA same-binary reexec through the production native-state preflight.
     pub(crate) fn apply_debug_seamless_update(&mut self) -> UpdateOutcome {
-        // A QA seam is driven by a person at a keyboard, so a blocker is the
-        // answer to something they just did: surface the recovery commands.
         self.drive_owed_document_journals();
         match self.prepare_all_native_shutdown(
             self.update_close_scope(),
@@ -11880,8 +9821,7 @@ impl App {
         }
     }
 
-    /// Viewing the exact published update revision quiets its one announcement
-    /// without hiding the staged artifact or inventing a second notification state.
+    /// Viewing the exact published update revision quiets its one announcement without hiding the staged artifact or inventing a second notification state.
     pub(crate) fn acknowledge_native_update_attention(&mut self) {
         let Some(revision) = self.native_updater_service.snapshot().attention_revision else {
             return;
@@ -11913,15 +9853,11 @@ impl App {
         self.refresh_window_tabs(wid);
     }
 
-    /// Fold presentation across every leaf of the active split. Focus supplies
-    /// title/icon while dirty, busy and attention remain independently visible
-    /// if any sibling owns them.
+    /// Fold presentation across every leaf of the active split.
     pub(crate) fn refresh_active_split_presentation(&mut self, wid: WindowId) {
         let Some((tab_id, focused, leaves, stale_title)) =
             self.windows.get(&wid).and_then(|window| {
                 let tab = window.tab_set.active()?;
-                // The keep-stale rung below is this tab's own previous title,
-                // captured before any leaf is re-read.
                 Some((
                     tab.id,
                     tab.focus,
@@ -11939,12 +9875,6 @@ impl App {
             };
             let presentation = match linked {
                 crate::tab_model::View::Terminal(terminal) => {
-                    // Nonblocking and keep-stale: this runs on the winit thread on
-                    // every tab switch/focus change, and the reader thread holds this
-                    // mutex for a whole ingest slice. On contention only this tab's own
-                    // previous title is reused, never `tab_title_cache` (it can hold an
-                    // operator `meta set title` or the abbreviated cwd); the next output
-                    // wake republishes the true title.
                     let title = match self.pool.get(terminal.session) {
                         Some(session) => match session.term.try_lock() {
                             Ok(term) => Some(term.title().to_string()),
@@ -11959,8 +9889,6 @@ impl App {
                         .filter(|title| !title.is_empty())
                         .unwrap_or_else(|| "aterm".to_string());
                     let mut presentation = crate::tab_model::TabPresentation::terminal(title);
-                    // The shared leaf builder's mapping: a window sync must not
-                    // blank indicators a status change just published.
                     presentation.indicators = self.session_status_indicators(terminal.session);
                     presentation
                 }
@@ -11975,12 +9903,9 @@ impl App {
                         indicators: crate::tab_model::TabIndicators {
                             dirty: presentation.indicators.dirty,
                             busy: presentation.indicators.busy,
-                            // A native leaf is the out-of-band attention owner;
-                            // it has no session and no classified status.
                             attention: presentation.indicators.attention,
                             status_attention: false,
                         },
-                        // No session, no edge table, no connection role.
                         conn: None,
                         closable: presentation.closable,
                         tooltip: presentation.tooltip,
@@ -12006,7 +9931,6 @@ impl App {
     }
 }
 
-/// The Check's fail-fast answer when a person's typed verb holds the store (pid `pid`).
 fn check_held_by_person_message(pid: u32) -> String {
     format!(
         "A package command running in a terminal (pid {pid}) is using the package store; \
@@ -12014,15 +9938,6 @@ fn check_held_by_person_message(pid: u32) -> String {
     )
 }
 
-/// The failure sentence for a Settings ▸ Packages Check or Install child run the lanes'
-/// way ([`crate::run_pass_child`]), or `None` when it succeeded: [`packages_child_failure`],
-/// except for a pass on the cached index.
-///
-/// atpkg exits 1 with nothing on stderr for a pass that ran on the cached index (it did
-/// not reach the signed index and was not offline), recording the cause only in
-/// `status.toml`; this reads that record as the lanes do
-/// ([`crate::PassRun::recorded_cached_index_cause`]) and says the cause. It stays a
-/// failure: the index could not be asked.
 fn check_pass_failure(
     run: &crate::PassRun,
     result: Result<std::process::ExitStatus, &std::io::Error>,
@@ -12037,9 +9952,6 @@ fn check_pass_failure(
     packages_child_failure(result, verb, run.said.trim())
 }
 
-/// The Check's sentence for a pass that ran on the cached index
-/// ([`check_pass_failure`]): the recorded cause verbatim and what to do. It claims only
-/// that the index was not reached, nothing about what the pass installed.
 fn cached_index_check_message(cause: &str) -> String {
     format!(
         "The package index could not be reached ({cause}), so the pass ran on the last \
@@ -12047,13 +9959,6 @@ fn cached_index_check_message(cause: &str) -> String {
     )
 }
 
-/// The failure sentence for one finished `atpkg` child of the Packages worker, or
-/// `None` when it succeeded. Pure over the exit status, argv and stderr.
-///
-/// The Check and the Install wait on the store lock (`--wait-lock`), so their 75
-/// (`EX_TEMPFAIL`, atpkg's contention code) means the wait ran out; Uninstall fails fast.
-/// 69 is offline. Each is still a failure: the aterm-spec model pins
-/// `PackagesCommandOutcome` to {none, success, failure}.
 fn packages_child_failure(
     result: Result<std::process::ExitStatus, &std::io::Error>,
     verb: &[String],
@@ -12061,10 +9966,6 @@ fn packages_child_failure(
 ) -> Option<String> {
     match result {
         Ok(status) if status.success() => None,
-        // Exit 2 = ran fine, installed nothing, and never will here (atpkg
-        // `cmd_install_default_set`: the signed index pins no build for this
-        // architecture). Neither success nor a retryable failure, so it gets its
-        // own words.
         Ok(status) if status.code() == Some(2) && verb.iter().any(|v| v == "--default-set") => {
             Some(
                 "Nothing was installed: the registry served no package \
@@ -12073,7 +9974,6 @@ fn packages_child_failure(
                     .to_string(),
             )
         }
-        // The offline code: neither the index listing nor any vendor channel answered.
         Ok(status)
             if status.code()
                 == Some(i32::from(aterm_update_core::pkg_check::PASS_OFFLINE_EXIT)) =>
@@ -12084,17 +9984,11 @@ fn packages_child_failure(
                     .to_string(),
             )
         }
-        // Exit 75 = another atpkg pass holds the store lock (this window's
-        // launch/loop pass, another window's, or a terminal `aterm pkg …`).
-        // Transient; the page's status refresh shows the store it leaves behind.
-        Ok(status) if status.code() == Some(i32::from(atpkg::lock::CONTENDED_EXIT)) => {
-            // A fixed sentence: the child's own line names a peer and a lock file.
-            Some(
-                "A toolchain pass is already running on this store; it finishes by itself \
+        Ok(status) if status.code() == Some(i32::from(atpkg::lock::CONTENDED_EXIT)) => Some(
+            "A toolchain pass is already running on this store; it finishes by itself \
                  \u{2014} try again in a moment."
-                    .to_string(),
-            )
-        }
+                .to_string(),
+        ),
         Ok(status) => Some(if said.is_empty() {
             format!("atpkg {} exited with {status}", verb.join(" "))
         } else {
@@ -12108,15 +10002,11 @@ fn packages_child_failure(
     }
 }
 
-/// Arrival at the machine worker's single dispatch seam.
 enum MachineReadEvent {
     Request,
     Finished(Result<atpkg::machine::MachineState, String>),
 }
 
-/// Resolve admission once, then launch at most one worker. A completion's `true`
-/// answer already owns the coalesced rerun and must not re-enter Request. The
-/// injected operation is thread creation, not the machine read.
 fn dispatch_native_machine_read(
     service: &mut crate::packages_screen::PackagesService,
     event: MachineReadEvent,
@@ -12127,8 +10017,6 @@ fn dispatch_native_machine_read(
         MachineReadEvent::Finished(result) => service.replace_machine_state(result),
     };
     if admitted && let Err(error) = spawn() {
-        // No event can interleave on this synchronous main-thread edge, so a
-        // failed launch has no queued follower and must release its reservation.
         let rerun = service.replace_machine_state(Err(error));
         debug_assert!(!rerun);
     }
@@ -12143,9 +10031,6 @@ fn launch_native_machine_read(
         .map_err(|error| format!("could not start the machine read: {error}"))
 }
 
-/// The detached machine read thread: one `atpkg machine` child, its parsed record
-/// posted back as [`Wake::NativeMachineStateFinished`]. Serves an admitted initial
-/// request and a reserved completion rerun; `Err` is a thread-spawn failure.
 fn spawn_native_machine_read(
     proxy: aterm_window::event_loop::EventLoopProxy<Wake>,
     atpkg: std::path::PathBuf,
@@ -12154,8 +10039,6 @@ fn spawn_native_machine_read(
         "aterm-machine-status",
         crate::qos::Role::Background,
         move || {
-            // A host-settings probe is cosmetic to the terminal; it lands via
-            // the proxy when done.
             let result = read_machine_state(&atpkg);
             let _ = proxy.send_event(Wake::NativeMachineStateFinished { result });
         },
@@ -12163,10 +10046,6 @@ fn spawn_native_machine_read(
     .map(drop)
 }
 
-/// Run bare `atpkg machine` and parse its `machine-state:` line. The child gets the
-/// launch-time apply's environment (`spawn_machine_settings_once`): the spawner pid
-/// and the atpkg child PATH. Both streams are bounded; only the stdout state line is
-/// the contract.
 fn read_machine_state(atpkg: &std::path::Path) -> Result<atpkg::machine::MachineState, String> {
     let mut command = crate::qos::atpkg_command(atpkg);
     command
@@ -12180,8 +10059,6 @@ fn read_machine_state(atpkg: &std::path::Path) -> Result<atpkg::machine::Machine
     )?;
     parse_machine_state_output(&String::from_utf8_lossy(&output.stdout)).ok_or_else(|| {
         if output.status.success() {
-            // The line prints after atpkg's platform check, so its absence means
-            // no state was measured, which the status must say, never "nothing to
             // apply".
             "atpkg machine printed no state".to_string()
         } else {
@@ -12190,14 +10067,6 @@ fn read_machine_state(atpkg: &std::path::Path) -> Result<atpkg::machine::Machine
     })
 }
 
-/// A machine command has one deadline and bounded stdout/stderr. Nonblocking pipe
-/// reads avoid a reader thread or a wait on a descendant's inherited stdout. Cleanup
-/// spends only the reserved tail of the budget and reports an unconfirmed reap
-/// rather than waiting indefinitely after a failed kill.
-///
-/// One `Overflow` and one wrapper for every target; `cfg` chooses only the body of
-/// [`machine_command_output_bounded`], whose two arms share a signature, so a call
-/// site cannot compile on Unix and break the Windows build.
 fn machine_command_output(
     command: &mut aterm_uds::spawnfd::Command,
     operation: &str,
@@ -12206,26 +10075,14 @@ fn machine_command_output(
     machine_command_output_bounded(command, operation, limit, Overflow::Fail)
 }
 
-/// What a flood of output means for this child.
-///
-/// The 64 KiB cap bounds this process's memory. A read's record is one line, so a
-/// flood means a broken reader and the child is killed. `atpkg machine apply` narrates
-/// two lines per migrated directory and can legitimately exceed the cap; killing it
-/// could land between a `rename` and its symlink, so its output is truncated instead
-/// (the state is re-read afterwards).
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Overflow {
-    /// Stop with an error, and stop the child with it.
     Fail,
-    /// Keep the first 64 KiB, go on draining so the child never blocks on a full
-    /// pipe, and let it finish its work.
     Truncate,
 }
 
 #[cfg(test)]
 thread_local! {
-    /// The pid of the last child [`machine_command_output_bounded`] spawned on
-    /// this thread, so a test names its child without the child's help.
     static LAST_MACHINE_CHILD: std::cell::Cell<Option<u32>> =
         const { std::cell::Cell::new(None) };
 }
@@ -12280,8 +10137,6 @@ fn machine_command_output_bounded(
             if Instant::now() >= read_deadline {
                 return Err(format!("{operation} timed out"));
             }
-            // One bounded chunk per pipe per turn checks the deadline during a
-            // flood and drains stderr while stdout is waiting for more data.
             for (pipe, bytes, eof) in [
                 (
                     &mut stdout_pipe as &mut dyn std::io::Read,
@@ -12305,8 +10160,6 @@ fn machine_command_output_bounded(
                                         "{operation} output exceeded 64 KiB per stream"
                                     ));
                                 }
-                                // Keep the head and go on draining, so the child's
-                                // pipe never fills.
                                 let room = MAX_OUTPUT.saturating_sub(bytes.len());
                                 bytes.extend_from_slice(&chunk[..room.min(n)]);
                             } else {
@@ -12341,13 +10194,9 @@ fn machine_command_output_bounded(
         }
     })();
     result.map_err(|mut error| {
-        // On early errors, do not turn a short failure into the full command
-        // budget. No blocking wait or reader join is permitted here.
         let cleanup_deadline = deadline.min(Instant::now() + reserve);
         if !stop_machine_read_child(&mut child, cleanup_deadline) {
             error.push_str("; child exit could not be confirmed within the cleanup budget");
-            // Killed but not yet collected: dropping it hands it to the
-            // process-wide reaper, so it never stays a zombie of the window.
             drop(child);
         }
         error
@@ -12379,7 +10228,6 @@ fn stop_machine_read_child(
     }
 }
 
-/// The non-Unix arm: only macOS has machine settings, so it refuses before spawning.
 #[cfg(not(unix))]
 fn machine_command_output_bounded(
     _command: &mut aterm_uds::spawnfd::Command,
@@ -12390,8 +10238,7 @@ fn machine_command_output_bounded(
     Err("machine settings commands require macOS".into())
 }
 
-/// The `machine-state:` record in one `atpkg machine` stdout, if any line carries a
-/// parseable one (prose lines are skipped; a malformed record is no record).
+/// The `machine-state:` record in one `atpkg machine` stdout, if any line carries a parseable one.
 pub(crate) fn parse_machine_state_output(stdout: &str) -> Option<atpkg::machine::MachineState> {
     stdout.lines().find_map(|line| {
         crate::r6_marker_body(line, atpkg::cli::MACHINE_STATE_MARKER)
@@ -12399,8 +10246,6 @@ pub(crate) fn parse_machine_state_output(stdout: &str) -> Option<atpkg::machine:
     })
 }
 
-/// Deliver measured changes before settling the explicit apply. A deadline or
-/// failed write is not success even if earlier changes landed or the child exited 0.
 fn machine_apply_completion(
     output: Result<std::process::Output, String>,
     mut emit: impl FnMut(Wake),
@@ -12445,25 +10290,13 @@ fn machine_apply_completion(
 
 /// What an `atpkg machine apply` child's stdout said, sorted for the worker.
 pub(crate) struct MachineApplyStdout {
-    /// The marker rows to raise (`machine-settings:` → the pull-down row, the
-    /// appstatus ledger and the status's "Last change").
     pub(crate) events: Vec<Wake>,
-    /// The last verdict sentence after [`atpkg::cli::MACHINE_VERDICT_PREFIX`]:
-    /// `applied — …`, `nothing changed — …` or `not applied — …`.
     pub(crate) verdict: Option<String>,
-    /// [`atpkg::cli::MACHINE_NOT_APPLIED_PREFIX`]` <reason>`: the pass refused (a
-    /// home that is not the account's), or `MACHINE_APPLY_FAILED_PREFIX`: a write
-    /// failed. Either is a failure even when the command exits successfully.
     pub(crate) refusal: Option<String>,
-    /// The apply's own parsed `machine-state:` record, carried on the completion
-    /// rather than posted as an event, so only this verb confirms the status.
     pub(crate) record: Option<atpkg::machine::MachineState>,
 }
 
-/// Sort an `atpkg machine apply` stdout into marker events, the verdict sentence and
-/// any refusal or failed write. Pure, so tests pin these shapes. The prefixes are
-/// atpkg's constants, so a re-spelling on either side is a compile error, never a
-/// refusal reported as success.
+/// Sort an `atpkg machine apply` stdout into marker events, the verdict sentence and any refusal or failed write.
 pub(crate) fn machine_apply_stdout(stdout: &str) -> MachineApplyStdout {
     use atpkg::cli::{
         MACHINE_APPLY_FAILED_PREFIX, MACHINE_NOT_APPLIED_PREFIX, MACHINE_VERDICT_PREFIX,
@@ -12485,7 +10318,6 @@ pub(crate) fn machine_apply_stdout(stdout: &str) -> MachineApplyStdout {
             read.verdict = Some(sentence.trim().to_string());
         } else if let Some(event) = crate::parse_seed_line(line) {
             match event {
-                // The record rides the completion (see `record`); the last one wins.
                 Wake::PkgMachineState(body) => {
                     read.record = atpkg::machine::parse_machine_state(&body).or(read.record);
                 }
@@ -12493,28 +10325,21 @@ pub(crate) fn machine_apply_stdout(stdout: &str) -> MachineApplyStdout {
             }
         }
     }
-    // No record-missing fallback: the completion re-reads the machine whenever it
-    // carries no record (`finish_native_packages`), and that one read takes the
-    // expectation the change line opened.
     read
 }
 
-/// The exact argv of the `atpkg` process a [`PackagesRequest`] runs, the one table
-/// the Settings verbs go through; pinned by `packages_argv_is_pinned_per_request`.
+/// The exact argv of the `atpkg` process a [`PackagesRequest`] runs, the one table the Settings verbs go through.
 pub(crate) fn packages_argv(request: &PackagesRequest) -> Vec<String> {
     let parts: &[&str] = match request {
         PackagesRequest::CheckUpdate => &["update"],
         PackagesRequest::InstallDefaultSet => &["install", "--default-set"],
         PackagesRequest::UninstallAll => &["uninstall", "--all"],
-        // The [machine] host settings have their own verb (a pass carries only an edit
-        // to them). No `--wait-lock`: it takes no store lock.
         PackagesRequest::MachineApply => &["machine", "apply"],
     };
     parts.iter().map(ToString::to_string).collect()
 }
 
-/// The verb a person pressed and waits on: every Packages request but the machine
-/// apply, a local edit that finishes in well under a second.
+/// The verb a person pressed and waits on.
 pub(crate) fn person_verb(
     request: &PackagesRequest,
 ) -> Option<crate::message_reporters::PackagesVerb> {
@@ -12527,9 +10352,7 @@ pub(crate) fn person_verb(
     }
 }
 
-/// How a person's verb row ends: Fault when the verb failed (its page says why),
-/// Vanish for a child that never ran a pass (it stood aside at the lock with nothing
-/// to claim), otherwise Complete with the verb's finished words.
+/// How a person's verb row ends.
 pub(crate) fn person_echo(failed: bool, ran: bool) -> aterm_messages::EchoKind {
     if failed {
         aterm_messages::EchoKind::Fault
@@ -12549,8 +10372,7 @@ pub(crate) fn packages_busy(request: &PackagesRequest) -> PackagesBusy {
     }
 }
 
-/// The structural admission a request must pass before the busy gate: the `[machine]`
-/// host settings only where they exist.
+/// The structural admission a request must pass before the busy gate.
 pub(crate) fn packages_request_admissible(request: &PackagesRequest) -> Result<(), String> {
     match request {
         PackagesRequest::CheckUpdate
@@ -12567,13 +10389,6 @@ pub(crate) fn packages_request_admissible(request: &PackagesRequest) -> Result<(
 }
 
 /// Why this process refuses `request` for what it is, or `None`.
-///
-/// Under a private state root ([`aterm_types::dirs::runs_under_private_state_root`])
-/// Apply Now is refused: the `[machine]` settings are the Mac's, the launch's daily apply
-/// stands aside ([`atpkg::machine::LaunchApply::PrivateStateRoot`]) and a pass carries no
-/// `[machine]` edit, so `aterm pkg machine apply` in a terminal is the one way left. Check,
-/// Install and Uninstall act on the shared package prefix and pass; Check and Install lead
-/// with [`crate::pass_lead`], so their pass carries no `[machine]` edit either.
 pub(crate) fn packages_request_refusal(
     request: &PackagesRequest,
     private_state_root: bool,

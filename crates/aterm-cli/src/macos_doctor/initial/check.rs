@@ -85,10 +85,12 @@ fn selected_vault<'a>(
     home: &Path,
     status: &'a Status,
 ) -> Result<Option<&'a client::Config>, String> {
-    aterm_machines::init_secrets::selected_vault(&plan.vault_url, home, status)
+    aterm_machines::init_secrets::selected_vault(&plan.vault_url, home, status.config.as_ref())
 }
 
-fn vault_rows(
+/// The vault rows of `status` for `plan`: its membership with the files it wrote, and
+/// whether its subscriber runs.
+pub(super) fn vault_rows(
     plan: &Plan,
     home: &Path,
     status: &Status,
@@ -123,7 +125,7 @@ fn vault_rows(
     Ok(vec![
         readiness_row(Stage::Secrets.name(), ready, detail),
         readiness_row(
-            "Secrets subscriber",
+            aterm_types::macos_setup::SECRETS_SUBSCRIBER_ROW,
             subscriber,
             if subscriber {
                 String::new()

@@ -113,7 +113,8 @@ utilities do not initialize the Mac.
 Setup choices:
   Caps Lock as Control; natural scrolling off; trackpad momentum scrolling on
   Desktop icons visible; wallpaper clicks keep windows in place
-  Desktop, Stage Manager and Notification Center widgets hidden/cleared
+  Desktop and Stage Manager widgets hidden; Notification Center widgets cleared once
+    aterm has Full Disk Access
   Dock: only aterm, System Settings and Safari (Finder, Trash and running apps remain)
   Sign out of Messages and FaceTime
   Keep Rust offline documentation out of Spotlight
@@ -124,7 +125,9 @@ Setup choices:
 
 Only changed preference keys are backed up (no credentials). Restore preferences puts
 them back and stops automatic setup, leaving cloned repos, credentials and sign-outs
-in place. `doctor --apply` applies the Mac preference/account profile; System State
+in place; without Full Disk Access it leaves Notification Center's widget list as it is
+and keeps its original in the backup (run Restore again from an app with the grant).
+`doctor --apply` applies the Mac preference/account profile; System State
 also handles permissions, Spotlight, the vault and repositories.
 
 Settings modes exit 0 when verified, 1 for drift or incomplete work, and 2 for
@@ -417,8 +420,11 @@ VERBS
 FILES
   Runs from an isolated bundle copy in `~/Library/Application Support/aterm/caffeine-code.noindex/`
   with state in `caffeine.state`, lock in `caffeine.lock`, update bridge pid in
-  `caffeine.bridge`, plist in `~/Library/LaunchAgents/<label>.plist`, and logs in
-  `~/Library/Logs/aterm/caffeine.log`."#,
+  `caffeine.bridge`, and its job's plist in `caffeine/<label>.plist` beside them
+  (`~/Library/LaunchAgents/<label>.plist` while Enable at Startup is on). The job's
+  stderr goes to `~/Library/Logs/aterm/caffeine.log`; why the mug turned off or
+  stopped, a failed Enable at Startup and who sent it a SIGTERM go to `aterm.log`
+  beside it."#,
         ),
     },
     Topic {
@@ -508,7 +514,9 @@ CONFIGURATION — `[ai]` in `aterm.toml`
 Run as yourself, without sudo. Restores aterm's account links/stubs (works over SSH),
 then applies console workstation settings (Caps Lock as Control, natural scrolling off,
 widgets off, Dock pinned to aterm/System Settings/Safari, Messages & FaceTime signed out,
-rustup minimal profile without offline `rust-docs`).
+rustup minimal profile without offline `rust-docs`). Notification Center's widgets need
+Full Disk Access (aterm's in an aterm tab, else the terminal's): without it they are left
+alone and the row says so; grant it and run `aterm init` again to clear them.
 
 Optional GitHub bootstrap (`~/.config/aterm/init.toml`):
   [github]
@@ -719,7 +727,8 @@ THE [harness] TABLE (aterm.toml; every key optional, the default in brackets)
   accounts ["early"]              account rotation: `"early"`, `"on_limit"` or `"off"`
   limit_reset [false]             take an eligible limit reset on the usage-limit dialog
   limit_reset_kinds [[]]          which reset kinds `limit_reset` may spend
-  usage_tap [false]               pass aterm's status-line tap on Claude Code relaunches
+  usage_tap [false]               pass aterm's status-line tap on Claude Code relaunches;
+                                  its figures time a usage limit's continuation
   usage_notes [false]             record single-account usage when no accounts are listed
   usage_credits [false]           allow carrying a session onto paid usage credits
   logins ["renew"]                renew expired logins listed with an email (`"renew"`|`"off"`)
@@ -761,7 +770,8 @@ KEY USAGE (`aterm harness <verb> --help` has every flag)
                           login <label> | renew [--due] | use <label>|--auto |
                           sync | serve] [--json]
       Manage the Claude Code account pool (`accounts.toml`), per-account `CLAUDE_CONFIG_DIR`
-      directories, OAuth renewal and fleet account sync.
+      directories, OAuth renewal and fleet account sync from a source this machine names
+      (`sync <source>` or `[fleet] accounts_source`; there is no default source).
   aterm harness upgrade [<sid>] [--dry-run | --status | --now | --defer <dur> |
                                  --skip | models [set <id>,...]] [--json]
       Inspect or drive live agent build and model upgrades (`upgrade_ask = false`

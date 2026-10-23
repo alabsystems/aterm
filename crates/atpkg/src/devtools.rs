@@ -1,25 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The Developer Tools list (macOS): whether macOS holds each new program aterm starts for
-//! its first-run check.
-//!
-//! macOS assesses every new binary (syspolicyd, with XProtect) before its first exec, one at
-//! a time, and the program waits in `_dyld_start` meanwhile: about 45 s for a hook's
-//! `/usr/bin/env`, 1–3 min per freshly built test binary. An app switched on under System
-//! Settings ▸ Privacy & Security ▸ Developer Tools has the programs it is responsible for
-//! exempted, and every program started in an aterm tab names aterm as its responsible app.
-//! Only the owner adds an app there; aterm reads the list and never writes it. The switch
-//! applies once macOS asks about aterm again, which a running aterm makes happen at once
-//! when it sees the switch on ([`refresh_verdict`]), with nothing relaunched.
-//!
-//! One detector ([`aterm_containment::consent::devtool_grant`], over the switch's row in the
-//! system TCC.db and tccd's own answers) and one row ([`row`]), which `aterm doctor` and
-//! `aterm pkg doctor` both print.
-//!
-//! The words that bring the owner to the switch ([`HELPER_TITLE`] and the functions beside
-//! it) are spelled here once, for the window's helper panel, Settings ▸ Security, the digest
-//! line and `aterm doctor`, so no two of them can say it differently.
+//! The Developer Tools list (macOS): whether macOS holds each new program aterm starts for its first-run check.
 
 use aterm_containment::consent::{
     self, DevToolGrant, DevToolList, DevToolListLabel, DevToolListing, DevToolProbe,
@@ -31,31 +13,20 @@ use crate::doctor::{Level, Row};
 /// Where the switch is, in words: the consent module's one spelling.
 pub const PANE: &str = consent::DEVTOOLS_SETTINGS_WORDS;
 
-/// The pane's address: the legacy pane id, which System Settings maps to the Privacy &
-/// Security extension's `Privacy_DevTools` anchor (the window's opener tries the
-/// extension's own identifier first and this one second).
+/// The pane's address: the legacy pane id, which System Settings maps to the Privacy & Security extension's `Privacy_DevTools` anchor (the window's opener tries the extension's own identifier first and this one second).
 pub const PANE_URL: &str = consent::DEVTOOLS_SETTINGS_URL_LEGACY;
 
 /// The command that opens the pane and changes nothing: the owner flips the switch.
 pub const OPEN_PANE: &str =
     "open \"x-apple.systempreferences:com.apple.preference.security?Privacy_DevTools\"";
 
-/// Apple's command that adds Terminal to the list, which makes the Developer Tools pane
-/// appear on a Mac whose list is empty. It lists Terminal; it does not list aterm.
+/// Apple's command that adds Terminal to the list, which makes the Developer Tools pane appear on a Mac whose list is empty.
 pub const LIST_TERMINAL: &str = "spctl developer-mode enable-terminal";
-
-// The words the owner reads. Each says only what was measured. Whether System Settings
-// accepts aterm dropped on this list is unmeasured (spike D15), so a drag is always paired
-// with the + route. What being listed skips says "should" until spike D14 is measured: the
-// functions that claim it take `skips`, and every caller passes
-// `SpikeEvidence::devtool_skips_first_run_check`. No restart word: once the switch is on, aterm
-// has macOS check it again ([`refresh_verdict`]), and that is what reaches its next programs.
 
 /// The helper panel's heading and the first line of `aterm doctor`'s banner.
 pub const HELPER_TITLE: &str = "Add aterm to Developer Tools";
 
-/// Why the owner is asked: what macOS does to each new program aterm starts, and what the
-/// list changes ("should" until D14, see [`trade`]).
+/// Why the owner is asked: what macOS does to each new program aterm starts, and what the list changes ("should" until D14, see [`trade`]).
 #[must_use]
 pub const fn why(skips: bool) -> &'static str {
     if skips {
@@ -69,20 +40,17 @@ pub const fn why(skips: bool) -> &'static str {
     }
 }
 
-/// [`WRONG_SWITCHES`]'s words, spelled once for it and for [`HELPER_HOW`]: a macro because
-/// `concat!` takes literals, not consts.
+/// [`WRONG_SWITCHES`]'s words, spelled once for it and for [`HELPER_HOW`]: a macro because `concat!` takes literals, not consts.
 macro_rules! wrong_switches {
     () => {
         "The Processor Trace and RDMA switches on that page are different settings."
     };
 }
 
-/// The other switches on the Developer Tools page (macOS 27.0.1 holds Processor Trace and
-/// RDMA over Thunderbolt there): neither is aterm's, so no surface points at them.
+/// The other switches on the Developer Tools page (macOS 27.0.1 holds Processor Trace and RDMA over Thunderbolt there): neither is aterm's, so no surface points at them.
 pub const WRONG_SWITCHES: &str = wrong_switches!();
 
-/// [`PLUS_PRESS`]'s words, spelled once for it, [`PLUS_ROUTE`] and the consts that
-/// `concat!` them.
+/// [`PLUS_PRESS`]'s words, spelled once for it, [`PLUS_ROUTE`] and the consts that `concat!` them.
 macro_rules! plus_press {
     () => {
         "press + below it and choose aterm"
@@ -96,13 +64,10 @@ macro_rules! plus_route {
     };
 }
 
-/// The press of + itself ("it" is the Developer Tools list), for a sentence that offers
-/// it alone: once the panel's one drop is spent, there is no drag to pair it with.
+/// The press of + itself ("it" is the Developer Tools list), for a sentence that offers it alone: once the panel's one drop is spent, there is no drag to pair it with.
 pub const PLUS_PRESS: &str = plus_press!();
 
-/// The route through + that rides every drag aterm offers ("it" is the Developer Tools
-/// list): whether the list takes aterm dropped on it is unmeasured (spike D15), so no
-/// surface offers the drag without it.
+/// The route through + that rides every drag aterm offers ("it" is the Developer Tools list): whether the list takes aterm dropped on it is unmeasured (spike D15), so no surface offers the drag without it.
 pub const PLUS_ROUTE: &str = plus_route!();
 
 /// [`CHECK_SWITCH`]'s words (see [`plus_route`]).
@@ -112,8 +77,7 @@ macro_rules! check_switch {
     };
 }
 
-/// The step after the drag or +: aterm's own switch, in one spelling for the panel, the
-/// Settings card and `aterm doctor`'s did-line.
+/// The step after the drag or +: aterm's own switch, in one spelling for the panel, the Settings card and `aterm doctor`'s did-line.
 pub const CHECK_SWITCH: &str = check_switch!();
 
 /// The step for an aterm the list already holds switched off (see [`plus_route`]).
@@ -123,8 +87,7 @@ macro_rules! switch_on {
     };
 }
 
-/// How, in the order the owner meets it: the drop or + (macOS asks for the password there),
-/// then aterm's own switch, then the switches that are not it.
+/// How, in the order the owner meets it: the drop or + (macOS asks for the password there), then aterm's own switch, then the switches that are not it.
 pub const HELPER_HOW: &str = concat!(
     "Drag aterm into the Developer Tools list (",
     plus_route!(),
@@ -134,10 +97,7 @@ pub const HELPER_HOW: &str = concat!(
     wrong_switches!()
 );
 
-/// How, where aterm offers no icon to drag (a copy it will not offer — translocated, on a
-/// disk image, a dev bundle — or one it has not yet identified): + leads, since a sentence
-/// that starts with a drag sends the owner looking for something to drag. Then aterm's own
-/// switch, then the switches that are not it.
+/// How, where aterm offers no icon to drag (a copy it will not offer — translocated, on a disk image, a dev bundle — or one it has not yet identified): + leads, since a sentence that starts with a drag sends the owner looking for something to drag.
 pub const HELPER_HOW_PLUS: &str = concat!(
     "Press + below the Developer Tools list and choose aterm, enter your password, ",
     check_switch!(),
@@ -145,8 +105,7 @@ pub const HELPER_HOW_PLUS: &str = concat!(
     wrong_switches!()
 );
 
-/// How, for an aterm the list already holds, switched off: its own switch (macOS asks for
-/// the password there), then the switches that are not it. Never the drag: it is listed.
+/// How, for an aterm the list already holds, switched off: its own switch (macOS asks for the password there), then the switches that are not it.
 pub const HELPER_SWITCH_ON: &str = concat!(
     "aterm is already on the Developer Tools list, switched off: ",
     switch_on!(),
@@ -154,33 +113,25 @@ pub const HELPER_SWITCH_ON: &str = concat!(
     wrong_switches!()
 );
 
-/// What is true for an aterm the list holds switched on while tccd still checks its new
-/// programs (its answer came after the switch last changed, `consent::devtool_grant`):
-/// there is nothing to drag in and nothing to switch on, and aterm names the two causes
-/// the joined verdict allows without claiming a remedy nobody measured.
+/// What is true for an aterm the list holds switched on while tccd still checks its new programs (its answer came after the switch last changed, `consent::devtool_grant`): there is nothing to drag in and nothing to switch on, and aterm names the two causes the joined verdict allows without claiming a remedy nobody measured.
 pub const HELPER_LISTED_ON: &str = "aterm is already on the Developer Tools list and switched \
                                     on: there is nothing to add. macOS still checked a new \
                                     program aterm started after that, so the row may not match \
                                     this copy of aterm, or a policy holds it.";
 
-/// The owner's step, by what the list held of aterm when aterm read it: which how every
-/// surface says ([`Step::how`]), and what `aterm doctor`'s did-line asks after it opened
-/// the page ([`handled_words`]).
+/// The owner's step, by what the list held of aterm when aterm read it: which how every surface says ([`Step::how`]), and what `aterm doctor`'s did-line asks after it opened the page ([`handled_words`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Step {
-    /// aterm is not on the list as read, or the list was not read: add aterm (the drag,
-    /// or +), then its switch ([`HELPER_HOW`]).
+    /// aterm is not on the list as read, or the list was not read: add aterm (the drag, or +), then its switch ([`HELPER_HOW`]).
     Add,
-    /// The list, read whole, holds aterm switched off: its switch, never a drag
-    /// ([`HELPER_SWITCH_ON`]).
+    /// The list, read whole, holds aterm switched off: its switch, never a drag ([`HELPER_SWITCH_ON`]).
     SwitchOn,
-    /// The list, read whole, holds aterm switched on, while tccd still checks its new
-    /// programs: nothing to add ([`HELPER_LISTED_ON`]).
+    /// The list, read whole, holds aterm switched on, while tccd still checks its new programs: nothing to add ([`HELPER_LISTED_ON`]).
     ListedOn,
 }
 
 impl Step {
-    /// The step for the list as read. Pure.
+    /// The step for the list as read.
     #[must_use]
     pub const fn of(list: &DevToolList) -> Self {
         match (list.label, list.listing) {
@@ -200,8 +151,7 @@ impl Step {
         }
     }
 
-    /// This step as one action, for the digest line ([`HELPER_STEP`] says the rules): the drag
-    /// only for an aterm the list does not hold.
+    /// This step as one action, for the digest line ([`HELPER_STEP`] says the rules): the drag only for an aterm the list does not hold.
     #[must_use]
     pub const fn action(self) -> &'static str {
         match self {
@@ -219,30 +169,22 @@ macro_rules! status_page {
     };
 }
 
-/// Where the list's state stays readable: aterm's own Settings ▸ Security, whose DEVELOPER
-/// TOOLS card says it. One spelling for the panel's link, the Settings card and `aterm
-/// doctor`.
+/// Where the list's state stays readable: aterm's own Settings ▸ Security, whose DEVELOPER TOOLS card says it.
 pub const STATUS_PAGE: &str = status_page!();
 
 /// The helper panel's footer link, and `aterm doctor`'s banner line, to [`STATUS_PAGE`].
 pub const STATUS_LINK: &str = concat!("Status: ", status_page!());
 
-/// The how as one action, for the digest line's step: at most 90 characters, with no ` or `
-/// and no `; ` (`aterm_messages::need::Step::fault` records a line whose step is two
-/// actions instead of raising it). The + route rides the line's details.
+/// The how as one action, for the digest line's step: at most 90 characters, with no ` or ` and no `; ` (`aterm_messages::need::Step::fault` records a line whose step is two actions instead of raising it).
 pub const HELPER_STEP: &str = "Drag aterm into the Developer Tools list";
 
 /// [`Step::SwitchOn`] as one action ([`HELPER_STEP`]'s rules): its switch, never a drag.
 pub const STEP_SWITCH_ON: &str = "Switch on aterm's row in the Developer Tools list";
 
-/// [`Step::ListedOn`] as one action ([`HELPER_STEP`]'s rules): nothing to add and nothing
-/// to switch on, and no remedy nobody measured ([`HELPER_LISTED_ON`] names the causes).
+/// [`Step::ListedOn`] as one action ([`HELPER_STEP`]'s rules): nothing to add and nothing to switch on, and no remedy nobody measured ([`HELPER_LISTED_ON`] names the causes).
 pub const STEP_LISTED_ON: &str = "Look at aterm's row in the Developer Tools list";
 
-/// Which switch matters. `listed_terminal_just_now` is set when this hand-over ran
-/// [`LIST_TERMINAL`] and it answered Ok: the Terminal row the owner sees is aterm's doing,
-/// so the words say why it is there. aterm reads only its own row and a row count, so it
-/// never says anything about a Terminal row it did not add, which may already be on.
+/// Which switch matters.
 #[must_use]
 pub const fn only_aterm(listed_terminal_just_now: bool) -> &'static str {
     if listed_terminal_just_now {
@@ -253,8 +195,7 @@ pub const fn only_aterm(listed_terminal_just_now: bool) -> &'static str {
     }
 }
 
-/// What the owner trades, "should" until D14: the same words for the panel, the Settings
-/// card and `aterm doctor`.
+/// What the owner trades, "should" until D14: the same words for the panel, the Settings card and `aterm doctor`.
 #[must_use]
 pub const fn trade(skips: bool) -> &'static str {
     if skips {
@@ -289,9 +230,7 @@ pub struct Facts {
     pub list: DevToolList,
     /// tccd's answers for the subject in the last ten minutes ([`consent::probe_devtool`]).
     pub log: DevToolProbe,
-    /// The display name of the program macOS holds responsible for this process, when it is
-    /// not the subject's bundle (a doctor run in Terminal, or over ssh): aterm's switch does
-    /// not reach this shell.
+    /// The display name of the program macOS holds responsible for this process, when it is not the subject's bundle (a doctor run in Terminal, or over ssh): aterm's switch does not reach this shell.
     pub other_responsible: Option<String>,
 }
 
@@ -314,13 +253,7 @@ impl Facts {
     }
 }
 
-/// Read the list and tccd's answers for the running bundle, under the probes' own fences: a
-/// binary outside a `.app` (a test binary, `target/release/aterm`) opens and spawns nothing
-/// and is `not measured`; one started through `~/.local/bin/aterm` is judged by the bundled
-/// image ([`consent::fence_exe`]). The gate is [`ProbeGate::on`]: `[privacy] enabled` and
-/// `check` gate the window's background probes, and neither read can raise a dialog.
-/// `[privacy] observer = false` refuses both, as it refuses the window's row. `None` off
-/// macOS, where there is no such list.
+/// Read the list and tccd's answers for the running bundle, under the probes' own fences: a binary outside a `.app` (a test binary, `target/release/aterm`) opens and spawns nothing and is `not measured`; one started through `~/.local/bin/aterm` is judged by the bundled image ([`consent::fence_exe`]).
 #[must_use]
 pub fn facts() -> Option<Facts> {
     if !cfg!(target_os = "macos") {
@@ -341,7 +274,6 @@ pub fn facts() -> Option<Facts> {
     let id = subject.as_deref().unwrap_or_default();
     let list = consent::probe_devtool_list(ProbeGate::on(), id);
     if list.label.refused() {
-        // The fence spoke: the log read would refuse for the same reason.
         return Some(Facts {
             subject,
             list,
@@ -355,7 +287,6 @@ pub fn facts() -> Option<Facts> {
         });
     }
     let log = consent::probe_devtool(ProbeGate::on(), id);
-    // Past the fence: this is a bundled aterm, so naming the responsible app is in bounds.
     let other_responsible = i32::try_from(std::process::id())
         .ok()
         .and_then(consent::responsible_app)
@@ -374,9 +305,6 @@ pub fn facts() -> Option<Facts> {
 }
 
 /// `[privacy] observer = false` in the aterm.toml the window loads
-/// (`aterm_types::dirs::aterm_config_path`). A file that is missing, unreadable or not
-/// TOML leaves the window on its defaults, under which its row reads the list, so it is
-/// not "off" here either.
 fn config_observer_off() -> bool {
     aterm_types::dirs::aterm_config_path()
         .and_then(|path| std::fs::read_to_string(path).ok())
@@ -384,7 +312,6 @@ fn config_observer_off() -> bool {
 }
 
 /// The pure half of [`config_observer_off`]: whether `[privacy] observer` is the boolean
-/// `false`, parsed with `aterm_toml` as the window parses the file.
 fn observer_off_in(text: &str) -> bool {
     text.parse::<aterm_toml::Table>()
         .ok()
@@ -392,8 +319,7 @@ fn observer_off_in(text: &str) -> bool {
         == Some(false)
 }
 
-/// Why the switch's row was not read, in words: one clause, for a doctor's `not measured
-/// (…)` and the window's Settings card alike.
+/// Why the switch's row was not read, in words: one clause, for a doctor's `not measured (…)` and the window's Settings card alike.
 #[must_use]
 pub const fn list_reason(label: DevToolListLabel) -> &'static str {
     match label {
@@ -450,10 +376,6 @@ pub const fn log_reason(label: DevToolProbeLabel) -> &'static str {
 }
 
 /// The `devtools:` row, pure over the facts, or `None` where there is no such list.
-///
-/// `not_granted` is a warning (both doctors count it), never a failure: nothing in it stops a
-/// shell from starting, and only the owner can change it. `unknown` says what could not be
-/// read; it is never `ok`.
 #[must_use]
 pub fn row(facts: &Facts) -> Option<Row> {
     if facts.list.label == DevToolListLabel::UnsupportedPlatform {
@@ -469,7 +391,6 @@ pub fn row(facts: &Facts) -> Option<Row> {
         .map_or_else(String::new, |app| {
             format!("; this shell runs under {app}, not aterm, so aterm's switch does not reach it")
         });
-    // tccd's own count, when its log was read.
     let checked = match (facts.log.label, facts.log.not_allowed) {
         (DevToolProbeLabel::Observed, Some(n)) if n > 0 => format!(
             "; macOS checked {n} new program{} run in aterm in the last {} minutes",
@@ -552,11 +473,9 @@ pub fn row(facts: &Facts) -> Option<Row> {
 pub enum Handled {
     /// aterm is on the list: nothing to do.
     Granted,
-    /// Nothing was done, and why: the list could not be read (aterm does not act on a
-    /// state it did not measure), or this run does not act (read-only, no window session).
+    /// Nothing was done, and why: the list could not be read (aterm does not act on a state it did not measure), or this run does not act (read-only, no window session).
     Left(String),
-    /// The pane is open for the owner. `listed_terminal` is set when the list was empty
-    /// and [`LIST_TERMINAL`] ran first so the pane exists, with what it answered.
+    /// The pane is open for the owner.
     Opened {
         /// [`LIST_TERMINAL`]'s outcome, when it ran.
         listed_terminal: Option<Result<(), String>>,
@@ -572,8 +491,7 @@ pub enum Handled {
     },
 }
 
-/// The two things aterm may do toward the switch, injected so a test runs nothing. Neither
-/// flips it: only the owner does, in System Settings, with macOS's own authentication.
+/// The two things aterm may do toward the switch, injected so a test runs nothing.
 pub struct Reach<'a> {
     /// [`LIST_TERMINAL`] ([`list_terminal`]).
     pub list_terminal: &'a dyn Fn() -> Result<(), String>,
@@ -581,11 +499,7 @@ pub struct Reach<'a> {
     pub open_pane: &'a dyn Fn() -> Result<(), String>,
 }
 
-/// Bring the owner to the switch, only for `not_granted`: on a list read whole and empty (no
-/// Developer Tools pane yet) [`LIST_TERMINAL`] runs first, then the pane opens. aterm never
-/// adds itself, writes TCC.db, calls tccutil or presses anything in System Settings: the
-/// switch and macOS's authentication for it stay the owner's. `unknown` does nothing
-/// (fail-closed: the list may already hold aterm).
+/// Bring the owner to the switch, only for `not_granted`: on a list read whole and empty (no Developer Tools pane yet) [`LIST_TERMINAL`] runs first, then the pane opens. aterm never adds itself, writes TCC.db, calls tccutil or presses anything in System Settings: the switch and macOS's authentication for it stay the owner's.
 #[must_use]
 pub fn hand_to_owner(facts: &Facts, reach: &Reach<'_>) -> Handled {
     match facts.grant() {
@@ -653,36 +567,27 @@ pub fn handled_words(handled: &Handled) -> String {
     }
 }
 
-/// The two markers that hold back one System Settings page aterm brings up for the owner,
-/// both in `<state>`: when aterm last opened it ([`Self::last_opened`]) and the owner's Not
-/// now ([`Self::declined_until`]). Developer Tools has one pair ([`DEVELOPER_TOOLS`]), Full
-/// Disk Access the other ([`FULL_DISK_ACCESS`]), so opening or declining one page never holds
-/// back the other.
+/// The two markers that hold back one System Settings page aterm brings up for the owner, both in `<state>`: when aterm last opened it ([`Self::last_opened`]) and the owner's Not now ([`Self::declined_until`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PageMarkers {
     opened: &'static str,
     declined: &'static str,
 }
 
-/// System Settings ▸ Privacy & Security ▸ Developer Tools: `devtools-pane-opened` and
-/// `devtools-declined`, which `aterm doctor` reads and writes too.
+/// System Settings ▸ Privacy & Security ▸ Developer Tools: `devtools-pane-opened` and `devtools-declined`, which `aterm doctor` reads and writes too.
 pub const DEVELOPER_TOOLS: PageMarkers = PageMarkers {
     opened: "devtools-pane-opened",
     declined: "devtools-declined",
 };
 
-/// System Settings ▸ Privacy & Security ▸ Full Disk Access: `fda-pane-opened` and
-/// `fda-declined`, the window's own hand-over of that page.
+/// System Settings ▸ Privacy & Security ▸ Full Disk Access: `fda-pane-opened` and `fda-declined`, the window's own hand-over of that page.
 pub const FULL_DISK_ACCESS: PageMarkers = PageMarkers {
     opened: "fda-pane-opened",
     declined: "fda-declined",
 };
 
 impl PageMarkers {
-    /// Where aterm notes that it opened the page for the owner: one line,
-    /// `<aterm version> <unix seconds>`. The window's own hand-over opens a page once per
-    /// version and an unattended one at most once per [`REOPEN_AFTER_S`], so System Settings
-    /// does not come up in front of the owner again and again.
+    /// Where aterm notes that it opened the page for the owner: one line, `<aterm version> <unix seconds>`.
     #[must_use]
     pub fn opened_marker(self) -> Option<std::path::PathBuf> {
         aterm_types::dirs::state_dir().map(|dir| dir.join(self.opened))
@@ -694,8 +599,7 @@ impl PageMarkers {
         self.last_opened_in(&aterm_types::dirs::state_dir()?)
     }
 
-    /// [`Self::last_opened`] with `<state>` given: the marker as any aterm wrote it
-    /// into `state`.
+    /// [`Self::last_opened`] with `<state>` given: the marker as any aterm wrote it into `state`.
     #[must_use]
     pub fn last_opened_in(self, state: &std::path::Path) -> Option<(String, u64)> {
         let text = std::fs::read_to_string(state.join(self.opened)).ok()?;
@@ -719,14 +623,11 @@ impl PageMarkers {
         opened_ago(at, now, window_s)
     }
 
-    /// Note that aterm opened the page now, for `version`. Best effort: a marker that cannot
-    /// be written means only that the page may open once more.
+    /// Note that aterm opened the page now, for `version`.
     pub fn note_opened(self, version: &str) {
         let Some(path) = self.opened_marker() else {
             return;
         };
-        // `state_dir()`: on macOS `~/Library/Application Support/aterm`, the parent of the
-        // atpkg prefix, so never group/other-writable whatever the umask.
         if let Some(dir) = path.parent() {
             let _ = aterm_types::fs_restricted::create_dir_all_unshared(dir, 0o755);
         }
@@ -736,16 +637,13 @@ impl PageMarkers {
         let _ = std::fs::write(&path, format!("{version} {now}\n"));
     }
 
-    /// Where aterm notes that the owner said Not now to the page's helper panel, or closed
-    /// it with aterm not switched on: one `<aterm version> <unix seconds>` line per decline,
-    /// newest last. Deleting the file undoes it.
+    /// Where aterm notes that the owner said Not now to the page's helper panel, or closed it with aterm not switched on: one `<aterm version> <unix seconds>` line per decline, newest last.
     #[must_use]
     pub fn declined_marker(self) -> Option<std::path::PathBuf> {
         aterm_types::dirs::state_dir().map(|dir| dir.join(self.declined))
     }
 
-    /// The owner's latest decline of the page, while it holds; `None` when there is none, it
-    /// has run out, or the marker cannot be read.
+    /// The owner's latest decline of the page, while it holds; `None` when there is none, it has run out, or the marker cannot be read.
     #[must_use]
     pub fn declined_until(self) -> Option<Declined> {
         self.declined_until_in(&aterm_types::dirs::state_dir()?, aterm_time::unix_secs()?)
@@ -758,14 +656,11 @@ impl PageMarkers {
         decline_holding(&text, now)
     }
 
-    /// Note that the owner declined the page now, under `version`. Best effort: a marker
-    /// that cannot be written means only that aterm may offer the page once more.
+    /// Note that the owner declined the page now, under `version`.
     pub fn note_declined(self, version: &str) {
         let Some(path) = self.declined_marker() else {
             return;
         };
-        // `state_dir()`: on macOS `~/Library/Application Support/aterm`, the parent of the
-        // atpkg prefix, so never group/other-writable whatever the umask.
         if let Some(dir) = path.parent() {
             let _ = aterm_types::fs_restricted::create_dir_all_unshared(dir, 0o755);
         }
@@ -777,16 +672,13 @@ impl PageMarkers {
     }
 }
 
-/// Where aterm notes that it opened the Developer Tools pane for the owner
-/// ([`PageMarkers::opened_marker`] of [`DEVELOPER_TOOLS`]).
+/// Where aterm notes that it opened the Developer Tools pane for the owner ([`PageMarkers::opened_marker`] of [`DEVELOPER_TOOLS`]).
 #[must_use]
 pub fn opened_marker() -> Option<std::path::PathBuf> {
     DEVELOPER_TOOLS.opened_marker()
 }
 
-/// How long an unattended hand-over (the window's own, `aterm ctl devtools hand-over`, or
-/// `aterm doctor` with nobody at its terminal, which an agent may run in a loop) waits
-/// before it opens the pane again.
+/// How long an unattended hand-over (the window's own, `aterm ctl devtools hand-over`, or `aterm doctor` with nobody at its terminal, which an agent may run in a loop) waits before it opens the pane again.
 pub const REOPEN_AFTER_S: u64 = 600;
 
 /// The last time aterm opened the Developer Tools pane: `(version, unix seconds)`, or `None`.
@@ -795,23 +687,16 @@ pub fn last_opened() -> Option<(String, u64)> {
     DEVELOPER_TOOLS.last_opened()
 }
 
-/// How soon a request made with a person at the screen (`aterm ctl devtools hand-over now`,
-/// which `aterm doctor` sends from a terminal) may put the page in front of the owner again.
-/// Such a request skips the window's wait for a quiet moment, so it is held to this instead
-/// of [`REOPEN_AFTER_S`].
+/// How soon a request made with a person at the screen (`aterm ctl devtools hand-over now`, which `aterm doctor` sends from a terminal) may put the page in front of the owner again.
 pub const REOPEN_NOW_AFTER_S: u64 = 60;
 
-/// How many seconds ago aterm opened the pane, when that was under `window_s` ago
-/// ([`REOPEN_AFTER_S`], [`REOPEN_NOW_AFTER_S`]).
+/// How many seconds ago aterm opened the pane, when that was under `window_s` ago ([`REOPEN_AFTER_S`], [`REOPEN_NOW_AFTER_S`]).
 #[must_use]
 pub fn opened_within(window_s: u64) -> Option<u64> {
     DEVELOPER_TOOLS.opened_within(window_s)
 }
 
 /// The pure half of [`opened_within`]: seconds from `at` to `now`, when under `window_s`.
-/// A stamp more than [`STAMP_SKEW_S`] ahead of the clock was written under a clock since
-/// corrected: it counts as no recent open, rather than holding the page back until the
-/// clock catches up.
 fn opened_ago(at: u64, now: u64, window_s: u64) -> Option<u64> {
     if at > now.saturating_add(STAMP_SKEW_S) {
         return None;
@@ -827,40 +712,27 @@ fn parse_opened(text: &str) -> Option<(String, u64)> {
     words.next().is_none().then(|| (version.to_string(), at))
 }
 
-/// Note that aterm opened the Developer Tools pane now, for `version`. Best effort: a
-/// marker that cannot be written means only that the pane may open once more.
+/// Note that aterm opened the Developer Tools pane now, for `version`.
 pub fn note_opened(version: &str) {
     DEVELOPER_TOOLS.note_opened(version);
 }
 
-/// Where aterm notes that the owner said Not now to the helper panel, or closed it with
-/// aterm not switched on: `<state>/devtools-declined`, one `<aterm version> <unix seconds>`
-/// line per decline, newest last. The window's automatic hand-over, `aterm ctl devtools
-/// hand-over` and an unattended `aterm doctor` leave the owner alone while it holds
-/// ([`declined_until`]); the owner's own presses (the Settings card, the digest line) open
-/// the page regardless. Deleting the file undoes it.
+/// Where aterm notes that the owner said Not now to the helper panel, or closed it with aterm not switched on: `<state>/devtools-declined`, one `<aterm version> <unix seconds>` line per decline, newest last.
 #[must_use]
 pub fn declined_marker() -> Option<std::path::PathBuf> {
     DEVELOPER_TOOLS.declined_marker()
 }
 
-/// How long a first decline holds: the message center's span for the owner's own choice
-/// (`aterm_messages::need::Resurface::CHOICE`).
+/// How long a first decline holds: the message center's span for the owner's own choice (`aterm_messages::need::Resurface::CHOICE`).
 pub const DECLINE_HOLD_S: u64 = 30 * 86_400;
 
-/// How long a repeat decline holds: what `Resurface::CHOICE` backs off to on a second filing
-/// (`Resurface::MAX`). A decline never holds for good.
+/// How long a repeat decline holds: what `Resurface::CHOICE` backs off to on a second filing (`Resurface::MAX`).
 pub const DECLINE_REPEAT_HOLD_S: u64 = 90 * 86_400;
 
 /// How far back an earlier decline makes a new one a repeat: the message center's
-/// `FILED_KEEP`.
 const DECLINE_KEEP_S: u64 = 180 * 86_400;
 
-/// How far ahead of the clock a marker (a decline, the page's last opening) may be stamped
-/// and still count: the message center's `FILING_SKEW_MS`. A stamp beyond it was written
-/// under a clock since corrected, so it keeps nothing quiet: the page shown once more is
-/// cheaper than one held back for years. The window's Settings card ages the opened marker
-/// by the same rule.
+/// How far ahead of the clock a marker (a decline, the page's last opening) may be stamped and still count: the message center's `FILING_SKEW_MS`.
 pub const STAMP_SKEW_S: u64 = 3_600;
 
 /// Decline lines kept: the newest and the one before it, all a repeat needs.
@@ -873,21 +745,17 @@ pub struct Declined {
     pub version: String,
     /// When, in unix seconds.
     pub at: u64,
-    /// Until when it holds, in unix seconds: [`DECLINE_HOLD_S`] after `at`, or
-    /// [`DECLINE_REPEAT_HOLD_S`] when an earlier decline lies within 180 days before it.
+    /// Until when it holds, in unix seconds: [`DECLINE_HOLD_S`] after `at`, or [`DECLINE_REPEAT_HOLD_S`] when an earlier decline lies within 180 days before it.
     pub until: u64,
 }
 
-/// The owner's latest decline, while it holds; `None` when there is none, it has run
-/// out, or the marker cannot be read (a missing marker means only that aterm may offer
-/// the page once more).
+/// The owner's latest decline, while it holds; `None` when there is none, it has run out, or the marker cannot be read (a missing marker means only that aterm may offer the page once more).
 #[must_use]
 pub fn declined_until() -> Option<Declined> {
     DEVELOPER_TOOLS.declined_until()
 }
 
 /// The pure half of [`declined_until`]: the newest valid line of `text`, and whether it
-/// still holds at `now`. Unparsable lines are skipped.
 fn decline_holding(text: &str, now: u64) -> Option<Declined> {
     let declines: Vec<(String, u64)> = text.lines().filter_map(parse_opened).collect();
     let ((version, at), earlier) = declines.split_last()?;
@@ -911,7 +779,6 @@ fn decline_holding(text: &str, now: u64) -> Option<Declined> {
 }
 
 /// The marker's next text: `text`'s valid lines with `<version> <now>` appended, the
-/// newest [`DECLINES_KEPT`] kept. Pure.
 fn with_decline(text: &str, version: &str, now: u64) -> String {
     let mut lines: Vec<String> = text
         .lines()
@@ -927,16 +794,12 @@ fn with_decline(text: &str, version: &str, now: u64) -> String {
         .collect()
 }
 
-/// Note that the owner declined the Developer Tools page now, under `version`. Best
-/// effort: a marker that cannot be written means only that aterm may offer the page once
-/// more.
+/// Note that the owner declined the Developer Tools page now, under `version`.
 pub fn note_declined(version: &str) {
     DEVELOPER_TOOLS.note_declined(version);
 }
 
-/// Wait for the switch: read the list every two seconds until it reads `on` for `subject`
-/// or `limit` passes. `read` is [`consent::probe_devtool_list`] in production. Returns the
-/// last reading.
+/// Wait for the switch: read the list every two seconds until it reads `on` for `subject` or `limit` passes.
 pub fn await_switch(
     subject: &str,
     limit: std::time::Duration,
@@ -959,7 +822,6 @@ pub fn await_switch(
 const REACH_CEILING: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Run `program args…` to its exit within [`REACH_CEILING`]; its stderr's first line when
-/// it fails.
 fn run_quietly(program: &str, args: &[&str]) -> Result<(), String> {
     let out = aterm_uds::deadline::output_until(
         aterm_uds::spawnfd::command(program).args(args),
@@ -979,49 +841,29 @@ fn run_quietly(program: &str, args: &[&str]) -> Result<(), String> {
 }
 
 /// [`LIST_TERMINAL`], absolutely named.
-///
 /// # Errors
 /// The tool's own first line of complaint, or why it could not run.
 pub fn list_terminal() -> Result<(), String> {
     run_quietly("/usr/sbin/spctl", &["developer-mode", "enable-terminal"])
 }
 
-/// Open the pane with `/usr/bin/open` ([`PANE_URL`]). It changes nothing.
-///
+/// Open the pane with `/usr/bin/open` ([`PANE_URL`]).
 /// # Errors
 /// `open`'s own first line of complaint, or why it could not run.
 pub fn open_pane() -> Result<(), String> {
     run_quietly("/usr/bin/open", &[PANE_URL])
 }
 
-/// The hidden verb `aterm pkg __devtools-prime` ([`run_prime`]): never advertised,
-/// answered on the raw argv before the store lock, which it never takes.
+/// The hidden verb `aterm pkg __devtools-prime` ([`run_prime`]): never advertised, answered on the raw argv before the store lock, which it never takes.
 pub const PRIME_VERB: &str = "__devtools-prime";
 
 /// How long the one new program [`run_prime`] starts may take: a hang detector, never
-/// a budget (a first exec macOS still checks can wait in `_dyld_start` for a minute
-/// under load).
 #[cfg(target_os = "macos")]
 const PRIME_CEILING: std::time::Duration = std::time::Duration::from_secs(180);
 
-/// MAKE macOS ASK ABOUT ATERM AGAIN, once the owner switched it on: [`run_prime`] in
-/// aterm's own executable, started as its OWN responsible process.
-///
-/// Measured on macOS 27.0 in a VM (2026-10-16, design §7 D14): syspolicyd keeps its
-/// verdict for an aterm process it checked before the switch went on — every new
-/// program there is still checked, in its old tabs and its new ones, for as long as
-/// it was watched — until an aterm process it has not checked starts a program it has
-/// not assessed. Then tccd answers `Allowed (System Set)`, syspolicyd logs that the
-/// responsible process "is a developer tool", and from then on no aterm process's new
-/// programs are checked: the old one's, and the tabs a seamless update adopted. So the
-/// window and `aterm doctor` run this once the switch reads on, and nothing has to be
-/// relaunched. It grants and writes nothing: with aterm not on the list it is one
-/// small check, as for any new program.
-///
+/// MAKE macOS ASK ABOUT ATERM AGAIN, once the owner switched it on: [`run_prime`] in aterm's own executable, started as its OWN responsible process.
 /// # Errors
-/// Why it could not run: not a bundled aterm, the responsibility attribute macOS no
-/// longer offers (`aterm_uds::spawnfd::Command::disclaim_responsibility`), or the
-/// verb's own first line of complaint.
+/// Why it could not run: not a bundled aterm, the responsibility attribute macOS no longer offers (`aterm_uds::spawnfd::Command::disclaim_responsibility`), or the verb's own first line of complaint.
 pub fn refresh_verdict() -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
@@ -1033,9 +875,6 @@ pub fn refresh_verdict() -> Result<(), String> {
             aterm_uds::spawnfd::command(&exe)
                 .args(["pkg", PRIME_VERB])
                 .disclaim_responsibility(true),
-            // The prime's own work ends within REACH_CEILING + PRIME_CEILING of its start
-            // ([`prime`]); one more REACH_CEILING for aterm's start and its cleanup, so
-            // this deadline never kills it before it removes its directory.
             std::time::Instant::now() + PRIME_CEILING + REACH_CEILING * 2,
         )
         .map_err(|e| format!("aterm pkg {PRIME_VERB}: {e}"))?;
@@ -1056,13 +895,7 @@ pub fn refresh_verdict() -> Result<(), String> {
     }
 }
 
-/// [`PRIME_VERB`]: start one program nobody has assessed, so macOS asks about this
-/// process — aterm, started as its own responsible process by [`refresh_verdict`] —
-/// and then exit. `/usr/bin/true` copied under a fresh name into a new private
-/// directory and signed ad hoc (codesign names an ad hoc signature after its file, so
-/// a fresh name is a fresh code hash, never one macOS assessed already), run once, and
-/// removed with the directory however the run ends. Says one line on stderr when it
-/// fails; nothing else.
+/// [`PRIME_VERB`]: start one program nobody has assessed, so macOS asks about this process — aterm, started as its own responsible process by [`refresh_verdict`] — and then exit.
 pub fn run_prime() -> std::process::ExitCode {
     match prime() {
         Ok(()) => std::process::ExitCode::SUCCESS,
@@ -1077,7 +910,6 @@ pub fn run_prime() -> std::process::ExitCode {
 fn prime() -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
-        // Everything below ends by here, inside `refresh_verdict`'s deadline.
         let by = std::time::Instant::now() + REACH_CEILING + PRIME_CEILING;
         let token = aterm_uds::rand::hex_token::<8>().map_err(|e| format!("no name: {e}"))?;
         let dir = std::env::temp_dir().join(format!("aterm-devtools-prime-{token}"));
@@ -1142,15 +974,11 @@ mod tests {
     }
 
     /// The row's level for each verdict: `ok` on the list (or tccd allowing), `warn` off it,
-    /// switched off, or switched on while tccd still checks — with the count of programs
-    /// tccd checked when it answered, and no command that changes the list on the owner's
-    /// behalf — and `note`, never `ok`, when nothing could be read.
     #[test]
     fn the_row_says_the_state_the_cost_and_the_fix() {
         let quiet = DevToolProbe::refused(DevToolProbeLabel::NoRecentRequest);
         let on = row(&facts(read(DevToolListing::On, 100), quiet)).expect("a row");
         assert_eq!(on.level, Level::Ok);
-        // No row, and tccd checked 96 programs.
         let absent = row(&facts(
             read(DevToolListing::Absent, 0),
             tccd(DevToolState::Unlisted, 96, 1),
@@ -1163,8 +991,6 @@ mod tests {
         }
         let off = row(&facts(read(DevToolListing::Off, 100), quiet)).expect("a row");
         assert_eq!(off.level, Level::Warn);
-        // Listed, switched off: its row's switch, never a drag, and no Terminal listing
-        // (the pane exists: aterm is on it).
         assert!(
             off.text.contains("fix: switch on aterm's row") && off.text.contains(OPEN_PANE),
             "{}",
@@ -1179,7 +1005,6 @@ mod tests {
         ))
         .expect("a row");
         assert_eq!(shadowed.level, Level::Warn, "{}", shadowed.text);
-        // Listed and on: nothing to add, so no drag, no switch to turn on, no promise.
         assert!(
             shadowed.text.contains("nothing to add"),
             "{}",
@@ -1207,7 +1032,6 @@ mod tests {
     }
 
     /// The hand-over acts only on `not_granted`: an empty list gets Terminal listed first so
-    /// the pane exists, and the pane opens; `granted` and `unknown` do nothing at all.
     #[test]
     fn the_hand_over_opens_the_pane_only_for_not_granted() {
         let quiet = DevToolProbe::refused(DevToolProbeLabel::NoRecentRequest);
@@ -1235,15 +1059,12 @@ mod tests {
             }
         );
         assert_eq!(calls.take(), vec!["spctl", "open"]);
-        // The Terminal row aterm just added is named, so the owner leaves it off.
         let words = handled_words(&handled);
         assert!(
             words.starts_with("ran `spctl developer-mode enable-terminal` so the pane appears")
                 && words.contains("leave it off"),
             "{words}"
         );
-        // Terminal is on the list already (the pane exists): only the pane opens, and the
-        // did-line asks for the drag paired with +, then aterm's own switch.
         let handled = hand_to_owner(&facts(read(DevToolListing::Absent, 0), quiet), &reach);
         assert_eq!(
             handled,
@@ -1262,8 +1083,6 @@ mod tests {
             assert!(words.contains(said), "{said}: {words}");
         }
         assert!(!words.contains("Terminal"), "{words}");
-        // Switched off: the owner's own choice is shown to them again, never flipped, and
-        // the did-line asks for that row's switch, never a drag.
         let handled = hand_to_owner(&facts(read(DevToolListing::Off, 1), quiet), &reach);
         assert_eq!(
             handled,
@@ -1276,7 +1095,6 @@ mod tests {
         let words = handled_words(&handled);
         assert!(words.contains("switch on aterm's row"), "{words}");
         assert!(!words.contains("drag"), "{words}");
-        // Listed and on while tccd still checks: the page opens, and nothing is to add.
         let shadowed = facts(
             read(DevToolListing::On, 1),
             tccd(DevToolState::Unlisted, 1, 100_001),
@@ -1316,8 +1134,6 @@ mod tests {
         for bad in ["", "0.104.0", "0.104.0 x", "0.104.0 1 2"] {
             assert_eq!(parse_opened(bad), None, "{bad:?}");
         }
-        // How long ago, inside the window; a stamp more than an hour ahead of the clock
-        // (written under a clock since corrected) is no recent open.
         let at = 1_792_020_637;
         assert_eq!(opened_ago(at, at + 59, REOPEN_NOW_AFTER_S), Some(59));
         assert_eq!(opened_ago(at, at + 60, REOPEN_NOW_AFTER_S), None);
@@ -1330,8 +1146,6 @@ mod tests {
     }
 
     /// Each page aterm brings up keeps its own pair of markers: opening or declining Full Disk
-    /// Access never holds back Developer Tools, and `aterm doctor`'s Developer Tools files keep
-    /// their names.
     #[test]
     fn each_page_keeps_its_own_markers() {
         assert_eq!(DEVELOPER_TOOLS.opened, "devtools-pane-opened");
@@ -1350,9 +1164,6 @@ mod tests {
     }
 
     /// A decline holds 30 days, and 90 when an earlier one lies within 180 days before it
-    /// (the message center's spans for the owner's own choice); it never holds for good, a
-    /// stamp from a clock since corrected keeps nothing quiet, and a line the marker cannot
-    /// parse is skipped rather than read as a decline.
     #[test]
     fn a_decline_holds_a_month_then_three_and_never_for_good() {
         const DAY: u64 = 86_400;
@@ -1374,7 +1185,6 @@ mod tests {
             "a month, then over"
         );
 
-        // Declined again 40 days on: a repeat, so three months.
         let again = at + 40 * DAY;
         let twice = with_decline(&once, "0.105.0", again);
         assert_eq!(twice.lines().count(), 2);
@@ -1385,7 +1195,6 @@ mod tests {
         );
         assert_eq!(decline_holding(&twice, again + 90 * DAY), None);
 
-        // An earlier decline more than 180 days back does not make a repeat.
         let late = at + 200 * DAY;
         let lapsed = with_decline(&once, "0.110.0", late);
         assert_eq!(
@@ -1393,21 +1202,16 @@ mod tests {
             Some(late + 30 * DAY)
         );
 
-        // Only the newest two lines are kept; garbage is dropped on the next write.
         let kept = with_decline(&format!("junk\n{twice}"), "0.106.0", again + DAY);
         assert_eq!(kept, format!("0.105.0 {again}\n0.106.0 {}\n", again + DAY));
         assert_eq!(decline_holding("junk\n0.104.0\n", at), None);
         assert_eq!(decline_holding("", at), None);
 
-        // Stamped more than an hour ahead of the clock: holds nothing.
         assert_eq!(decline_holding(&once, at - 2 * 3_600), None);
         assert!(decline_holding(&once, at - 600).is_some());
     }
 
     /// The words every surface shares: the drag is never offered without the + route (drop
-    /// acceptance is unmeasured, D15); "should" is said exactly while D14 is unmeasured;
-    /// the digest's step is one action; the wrong switches are named in the how; and no
-    /// restart, elimination or coverage word appears.
     #[test]
     fn the_words_pair_the_drag_with_plus_and_say_should_until_d14() {
         for skips in [false, true] {
@@ -1427,7 +1231,6 @@ mod tests {
             "{HELPER_HOW}"
         );
         assert!(HELPER_HOW.ends_with(WRONG_SWITCHES), "{HELPER_HOW}");
-        // No icon to drag: + leads, and no drag is spoken of.
         assert!(
             HELPER_HOW_PLUS.starts_with("Press + below the Developer Tools list")
                 && HELPER_HOW_PLUS.contains(CHECK_SWITCH)
@@ -1435,7 +1238,6 @@ mod tests {
                 && !HELPER_HOW_PLUS.to_ascii_lowercase().contains("drag"),
             "{HELPER_HOW_PLUS}"
         );
-        // Listed and switched off: the switch, never the drag; listed and on: neither.
         assert!(
             HELPER_SWITCH_ON.ends_with(WRONG_SWITCHES) && !HELPER_SWITCH_ON.contains("Drag"),
             "{HELPER_SWITCH_ON}"
@@ -1445,7 +1247,6 @@ mod tests {
                 && !HELPER_LISTED_ON.contains("switch on"),
             "{HELPER_LISTED_ON}"
         );
-        // Each step's how, by the list as read; an unread list is asked to add aterm.
         let list = |listing, label| DevToolList {
             listing,
             label,
@@ -1471,7 +1272,6 @@ mod tests {
         assert_eq!(Step::Add.how(), HELPER_HOW);
         assert_eq!(Step::SwitchOn.how(), HELPER_SWITCH_ON);
         assert_eq!(Step::ListedOn.how(), HELPER_LISTED_ON);
-        // The digest's one action per step: the drag only to add aterm.
         assert_eq!(Step::Add.action(), HELPER_STEP);
         for step in [Step::SwitchOn, Step::ListedOn] {
             assert!(
@@ -1484,13 +1284,10 @@ mod tests {
         assert!(STATUS_LINK.ends_with(STATUS_PAGE), "{STATUS_LINK}");
         assert!(PLUS_ROUTE.ends_with(PLUS_PRESS), "{PLUS_ROUTE}");
         assert!(HELPER_TITLE.contains("Developer Tools"));
-        // The digest line's one action names the list (aterm-gui's host test runs the
-        // message center's own rules on it).
         assert!(
             HELPER_STEP.contains("Developer Tools list"),
             "names the list"
         );
-        // Terminal's switch is spoken of only when this hand-over added Terminal.
         assert!(only_aterm(true).contains("Terminal"));
         assert!(!only_aterm(false).contains("Terminal"));
         let every = [
@@ -1513,8 +1310,6 @@ mod tests {
             only_aterm(false),
             only_aterm(true),
         ];
-        // The owner's restart phrases and the design's own bans. Stems match at a
-        // word's start only, so "discover" and "recover" pass.
         let phrases = [
             "restart",
             "relaunch",
@@ -1566,7 +1361,6 @@ mod tests {
     }
 
     /// `[privacy] observer = false` stops `aterm doctor`'s reads as it stops the window's; only
-    /// that boolean in that table does, and a file the window would not load is not "off".
     #[test]
     fn only_privacy_observer_false_stops_the_devtools_read() {
         assert!(observer_off_in("[privacy]\nobserver = false\n"));

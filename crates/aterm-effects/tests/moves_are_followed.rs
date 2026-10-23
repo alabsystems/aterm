@@ -2,32 +2,6 @@
 // Copyright 2026 Andrew Yates
 
 //! A line that moved carries its band, at every width, timing and host.
-//!
-//! The follow pass (`Witness::follow_runs`) carries a band onto the row its text
-//! moved to. Every law here moves text (Claude Code's composer growing at each wrap
-//! and Shift+Enter, Codex's viewport growing, an inline box pushed by streamed rows,
-//! a line relocated twice, a torn repaint) and reads the lines or moves whose band
-//! went out under text that stayed, which must be `0`. Each family sweeps a grid at
-//! the host seam of `tests/trail_host/mod.rs`; a debug build runs its spine.
-//!
-//! A scroll's own frame feeds its rows to the follow pass and the hand's seam alone
-//! (`CursorGlow::scroll_rows`), so a box redrawn under a scroll keeps its band on
-//! the frame it is drawn, the scroll's carry below where the scroll put its light
-//! (`Witness::scroll_carry`) included.
-//!
-//! Stated limits (`trail_host::holds_but`):
-//!
-//! * a line the hand left moved two rows is followed only when that row is sampled
-//!   (`a_waiting_key_s_arming_rows_have_slots_of_their_own` in `rainbow_kitty/mod.rs`);
-//! * a line the hand left is on its retract, and a band that followed its text
-//!   still retracts on its own clock;
-//! * a line under a near copy of itself that a move carries the copy onto reads as
-//!   rewritten in place;
-//! * a torn repaint whose new row stood `TWIN_MIN` (40 ms) before the old row was
-//!   erased is a copy and melts; Claude Code and Codex bracket frames in
-//!   `CSI ?2026h … ?2026l` and never tear;
-//! * a copy that stood `TWIN_MIN` beside the line is its twin for the record's
-//!   life, so a later real move onto that row melts.
 
 use crate::trail_host::*;
 use aterm_effects::cursor_glow::InsertWidth;
@@ -35,11 +9,6 @@ use aterm_effects::kitty_pet::PetBrain;
 use aterm_effects::rainbow_kitty::TypedClass;
 use std::time::{Duration, Instant};
 
-// b2m: Claude Code's bottom-anchored composer (alt screen, 53 rows, 15×28 cells),
-// the frame hold only (every named row read), framed `fr16`, `paced` or `pet`.
-// Census: one frame after each wrap or composer newline, a completed line lit ≥90%
-// before and <90% after is dark. Host option `stale@k`: the far-row read dropped on
-// the k-th newline's echo frame.
 mod b2m {
     use super::*;
 
@@ -137,8 +106,6 @@ mod b2m {
         }
 
         /// The GUI's next frame: one frame on while output waits or the glow
-        /// keeps a cadence, else the earliest deadline the glow or pet asks for,
-        /// or `next_frame` far off when neither asks.
         fn paced_next(&self) -> Instant {
             let fd = Duration::from_micros(FRAME_US);
             let glow = if self.dirty || self.glow.needs_frame_cadence() {
@@ -174,7 +141,6 @@ mod b2m {
         }
 
         /// Output landed now: paced, the GUI presents it one frame after the
-        /// last one it drew, and no sooner than now.
         fn landed(&mut self, bytes: &[u8]) {
             self.term.process(bytes);
             self.dirty = true;
@@ -377,7 +343,6 @@ mod b2m {
     ];
 
     /// Short lines separated by composer newlines; `stale_at` (1-based) drops
-    /// the far-row read on that newline's echo frame; `take` lines typed.
     fn newline_prompt(
         cols: usize,
         key_ms: u64,
@@ -409,10 +374,6 @@ mod b2m {
             let (f1, r1) = h.counts();
             df += f1 - f0;
             dr += r1 - r0;
-            // A line dark two frames after a newline that followed every lit cell
-            // and retired nothing has reached the end of its own life, not a
-            // missed follow. Every lit line counts, the caret's included: the
-            // newline moves them all up a row.
             let lit_lines: u64 = before.iter().map(|&n| n as u64).sum();
             let all_followed = r1 == r0 && f1 - f0 >= lit_lines;
             let d: Vec<usize> = if all_followed {
@@ -434,8 +395,6 @@ mod b2m {
     }
 
     /// The pacings the census runs under: the 16.667 ms train (`fr16`), the
-    /// GUI's pacing without the pet (`paced`) and with it (`pet`, full grid
-    /// only).
     fn paces() -> Vec<Pace> {
         sweep(
             &[Pace::Flat(16), Pace::Paced, Pace::Pet],
@@ -501,8 +460,6 @@ mod b2m {
     }
 }
 
-// b2s: a band carried by one follow, then moved again with no key between. Host:
-// the scroll seam (no alt re-baseline), the frame hold with the caret row re-read.
 mod b2s {
     use super::*;
 
@@ -597,7 +554,6 @@ mod b2s {
     }
 
     /// A key (or two) typed between the moves: the second move still carries
-    /// the whole line, nothing retired.
     fn keys_between(keys: &str) -> Outcome {
         let mut h = Host::new(24, 80);
         h.term.process(b"\x1b[6;1H");
@@ -660,9 +616,6 @@ mod b2s {
     }
 }
 
-// b3: boxes, composers and tears (`h1`…`h10`, `h8b`, the paste-then-wrap `diag`).
-// Host: SYNC-1 (no frame while a `?2026` bracket is open), the scroll seam (no alt
-// re-baseline), the frame hold (caret row not re-read), on a 16 or 8 ms train.
 mod b3 {
     use super::*;
 
@@ -767,7 +720,6 @@ mod b3 {
     }
 
     /// H1 / H1b: a one-line inline box moved by `moves`, `gap_frames`
-    /// sampled frames between moves, the first `first_frames` after the key.
     fn h1_case(moves: &[i32], gap_frames: u32, first_frames: u32, frame_ms: u64) -> Outcome {
         const COLS: usize = 100;
         let text = "fix the flaky test in the witness";
@@ -985,7 +937,6 @@ mod b3 {
     }
 
     /// Claude Code's bottom-anchored composer (alt screen), `sync` wrapping
-    /// each repaint in `?2026`.
     struct Composer {
         h: Host,
         rows: usize,
@@ -1274,7 +1225,6 @@ mod b3 {
     }
 
     /// `diag`: typed first, a paste, four frames, then the wrap key 30 ms later and
-    /// one frame; judged by H8's census rule.
     fn diag_case(typed_first: usize) -> Outcome {
         let frame_ms = 16u64;
         let mut c = Composer::new(53, 91, frame_ms, true);
@@ -1702,15 +1652,10 @@ mod b3 {
     }
 }
 
-// d4: relocations, torn repaints and push-downs on `trail_host::PacedHost` (scroll
-// seam, alt re-baseline, frame hold with the caret row not re-read, SYNC-1 off),
-// framed `fr16`, `fr8`, `paced` or `pet`.
 mod d4 {
     use super::*;
 
     /// T1: `text` typed on row `from`, then relocated to row `to` by a torn repaint:
-    /// the new row drawn (caret left on the old row), the old row erased `torn` ms
-    /// later.
     fn t1(pace: Pace, text: &'static str, from: u16, to: u16, torn: u64) -> Outcome {
         let mut h = PacedHost::new(24, 80, pace, false);
         h.land(format!("\x1b[{};1H", from + 1).as_bytes());
@@ -1729,8 +1674,6 @@ mod d4 {
     }
 
     /// T1p / T1c: T1 after a 1.5 s pause plus `phase` ms (the tear's first half
-    /// anywhere in the idle frame train), and with the caret parked on the new
-    /// row at the first half (`caret_first`), making it sampled every frame.
     fn t1p(pace: Pace, from: u16, to: u16, torn: u64, phase: u64, caret_first: bool) -> Outcome {
         let text = "hello world";
         let mut h = PacedHost::new(24, 80, pace, false);
@@ -1751,9 +1694,6 @@ mod d4 {
     }
 
     /// T2: Claude Code's composer (alt screen, bottom-anchored, 53×91)
-    /// repainted without the synchronized-update bracket, each wrap's repaint
-    /// torn `torn_ms` apart (rule and moved lines first, caret row after).
-    /// Census: one wrap later, no completed line lit ≥90% before is <90%.
     struct Composer {
         h: PacedHost,
         rows: usize,
@@ -1935,8 +1875,6 @@ mod d4 {
     }
 
     /// T3: a line on the last row relocated by a scroll: a newline at the bottom,
-    /// the line redrawn on the new last row in the same write, and the scrolled
-    /// original erased `torn` ms later (same write when `0`).
     fn t3(pace: Pace, torn: u64) -> Outcome {
         let rows = 24usize;
         let text = "hello world";
@@ -1962,8 +1900,6 @@ mod d4 {
     }
 
     /// T6b / T6: a command line typed under an identical previous command (directly
-    /// above, or two rows above with output between), then pushed down `rows_down`
-    /// rows in one write by a zsh `notify` job notice `gap` ms after the last key.
     fn t6(
         pace: Pace,
         text: &'static str,
@@ -1999,7 +1935,6 @@ mod d4 {
     }
 
     /// T8, the sticky twin: `hello world` on row 10; a copy on row 11 stands `stand`
-    /// ms and is erased; 200 ms later the line is relocated onto row 11 in one write.
     fn t8(pace: Pace, stand: u64) -> Outcome {
         let text = "hello world";
         let n = text.chars().count();
@@ -2151,42 +2086,30 @@ fn all_cases() -> Vec<Case> {
 }
 
 /// A long prompt typed at 80 and 40 ms a key into Claude Code's bottom-anchored
-/// composer at 80, 91, 120 and 200 columns, on the 16.667 ms train and the GUI's
-/// pacing, with and without the pet: one frame after each wrap no lit line is dark.
-/// A letter a line shares with the line above at the same column is not a hole in
-/// the moved block.
 #[test]
 fn claude_code_s_composer_follows_every_wrap_at_every_width() {
     holds(all_cases(), "b2.census.composer_wraps/");
 }
 
 /// A pause of 0.6, 1.5 or 3 s before each new line's first key, at 91 and 120
-/// columns, so the moved band has settled before the next wrap.
 #[test]
 fn claude_code_s_composer_follows_after_a_pause_before_each_line() {
     holds(all_cases(), "b2.census.pause_before_each_line/");
 }
 
 /// A list typed a line at a time at 80, 91 and 120 columns, also with the far-row
-/// read dropped on the first or second newline's frame (`stale@1`, `stale@2`): a run
-/// beside a withheld row waits one walk (`Witness::find_deferred_runs`).
 #[test]
 fn claude_code_s_composer_follows_every_shift_enter() {
     holds(all_cases(), "b2.census.newline_list");
 }
 
 /// `hello world` cleared and redrawn a row farther twice, down and up, 150 ms apart
-/// or with one to three keys between, and a band carried back. A carried record
-/// starts over as if just armed (`Witness::translate_cells`), so what it has not yet
-/// seen is no evidence against the next move.
 #[test]
 fn a_line_relocated_again_and_again_carries_its_band() {
     holds(all_cases(), "b2.second_move.");
 }
 
 /// A box moved `±1`/`±2` two or three times, zero to three sampled frames apart, the
-/// first move zero to three frames after the last key, at 60 and 120 Hz. A glyph
-/// counts as arrived wherever the witness has not seen it stand before.
 #[test]
 fn a_box_moved_on_consecutive_frames_follows_every_move() {
     holds_where(all_cases(), |id| {
@@ -2212,9 +2135,6 @@ fn num_of(id: &str, key: &str) -> u64 {
 }
 
 /// A wrapped prompt in an inline box at 48 and 72 columns, moved `±1`/`±2` once or
-/// up to three times, 60–300 ms apart; one frame after each move no lit line is
-/// dark. Limit at 48 columns: a move up two rows lands a line the hand left on a row
-/// no band names (`a_waiting_key_s_arming_rows_have_slots_of_their_own`).
 #[test]
 fn a_multi_line_inline_box_pushed_by_streamed_rows_follows() {
     holds_but(
@@ -2225,12 +2145,6 @@ fn a_multi_line_inline_box_pushed_by_streamed_rows_follows() {
 }
 
 /// An inline box at the screen's bottom re-laid under one or two streamed rows
-/// every one to three frames, and one mid-screen pushed down one to four rows. The
-/// bottom box streamed under on every frame is followed on every frame: each
-/// scroll's frame feeds the follow pass (`CursorGlow::scroll_rows`), which finds
-/// the box the scroll's rows below where the scroll put its light. A push of three
-/// or four rows is past the follow offsets, and the caret that moved with the box
-/// says how far (`Witness::carry_caret`).
 #[test]
 fn a_box_under_streaming_output_keeps_its_band() {
     holds_where(all_cases(), |id| {
@@ -2239,17 +2153,12 @@ fn a_box_under_streaming_output_keeps_its_band() {
 }
 
 /// An unbracketed program draws a line's new row one to three sampled frames before
-/// erasing the old one, a row or two away, at 60 and 120 Hz. The new row stands
-/// under `TWIN_MIN`, so the move follows; longer tears are the limit in
-/// `the_limit_a_torn_relocation_whose_new_row_stood_twin_min_is_a_copy`.
 #[test]
 fn a_torn_repaint_across_up_to_three_frames_follows() {
     holds(all_cases(), "b3.h5.");
 }
 
 /// A composer grown to many rows at 60 and 80 columns; one repainted unbracketed
-/// with each wrap torn across zero to three frames; Codex's viewport growing under
-/// history. Tears under `TWIN_MIN` are copies, not twins, so the torn wraps follow.
 #[test]
 fn tall_and_unsynced_composers_follow_every_wrap() {
     holds_where(all_cases(), |id| {
@@ -2260,8 +2169,6 @@ fn tall_and_unsynced_composers_follow_every_wrap() {
 }
 
 /// A paste into the composer (empty or after typed keys), then a wrapping key 8–90
-/// ms later. Pasted records have not seen the row above, which is no evidence
-/// against the move.
 #[test]
 fn a_paste_then_a_wrap_on_the_next_frame_follows() {
     holds_where(all_cases(), |id| {
@@ -2272,15 +2179,6 @@ fn a_paste_then_a_wrap_on_the_next_frame_follows() {
 }
 
 /// A tall lit prompt moved: three to seven lines, each typed after a Shift+Enter,
-/// moved `±1`/`±2` once or twice, 60 or 150 ms apart. Limits:
-///
-/// * a first move up two rows: the line the hand left lands on a row no band names
-///   (`a_waiting_key_s_arming_rows_have_slots_of_their_own`);
-/// * a near copy: `tag it` under `log it` (`g it` at the same columns), and a move
-///   carrying `log it` onto its row reads as rewritten in place (the six-line
-///   prompt, and the seven-line one on a first move one row down);
-/// * a second move 60 ms after the first: the line the hand left is still on its
-///   retract and ends on its own clock.
 #[test]
 fn a_tall_lit_prompt_moved_carries_every_line_it_can() {
     holds_but(
@@ -2298,12 +2196,6 @@ fn a_tall_lit_prompt_moved_carries_every_line_it_can() {
 }
 
 /// A line under an identical command, pushed down by a notice, follows: `cd ..`,
-/// `git status`, `make test` typed under the identical previous command (directly
-/// above, or two rows above with output between), pushed down one to three rows by a
-/// job notice. With the twin directly above, the whole text stands one row up and is
-/// refused (none of it arrived): a twin testifies only about its own row. A three-row
-/// push, past the follow offsets (`±1`, `±2`), follows the caret that moved with the
-/// line (`Witness::carry_caret`).
 #[test]
 fn a_line_under_an_identical_command_pushed_down_by_a_notice_follows() {
     holds_where(all_cases(), |id| {
@@ -2317,21 +2209,11 @@ fn torn_of(id: &str) -> u64 {
 }
 
 /// The scroll's threshold: a scrolled-in row dates its copy from the last walk
-/// before the scroll (`Witness::translate`), so 32 ms on 16 ms frames and the pet's
-/// pacing, 48 ms on 8 ms frames.
 fn scroll_tear_read_as_copy(id: &str) -> u64 {
     if id.contains("/fr8/") { 48 } else { 32 }
 }
 
 /// A line relocated by a scroll follows until its new row has stood `TWIN_MIN`: a
-/// newline at the bottom, the line redrawn on the new last row in the same write,
-/// the scrolled original erased then or 8–100 ms later. Past `TWIN_MIN` it is the
-/// re-echoed command line of `tests/copies_are_not_moves.rs`'s
-/// `L3.copy.copy_on_new_last_row_by_scroll`, which must not follow. The one-write
-/// relocation follows on the scroll's own frame, whose rows feed the follow pass
-/// (`CursorGlow::scroll_rows`), so it follows under the no-pet pacing too, where no
-/// later frame comes within the 40 ms the case waits. Limits: tears from
-/// [`scroll_tear_read_as_copy`] on the flat trains and the pet's pacing.
 #[test]
 fn a_line_relocated_by_a_scroll_follows_until_its_new_row_has_stood_twin_min() {
     holds_but(
@@ -2342,28 +2224,11 @@ fn a_line_relocated_by_a_scroll_follows_until_its_new_row_has_stood_twin_min() {
 }
 
 /// The shortest tear read as a copy standing `TWIN_MIN` (40 ms): the first sampled
-/// frame at least 40 ms after the one that showed the new row, so 40 ms on 8 ms
-/// frames and 48 ms on 16 ms frames and under the GUI's pacing.
 fn tear_read_as_copy(id: &str) -> u64 {
     if id.contains("/fr8/") { 40 } else { 48 }
 }
 
 /// The limit: a torn relocation whose new row stood `TWIN_MIN` is a copy (the chosen
-/// trade). `hello world` relocated one or two rows by an unbracketed program, the old
-/// row erased 8–300 ms after the new one is drawn, after a 200 ms pause or 1.5 s at
-/// every idle-train phase, also with the caret parked on the new row. A copy that
-/// stood `TWIN_MIN` on two sampled frames is a twin, as with fzf's late list
-/// (`tests/copies_are_not_moves.rs`), and the move melts. A one-row relocation, or
-/// two rows onto the caret's row, melts from [`tear_read_as_copy`]; after a 200 ms
-/// pause under the GUI's pacing without the pet (idle frames 110–130 ms apart),
-/// from 120 ms. With the pet, from [`STICKY_PACED`]: 200 ms after `hello world`
-/// the pet has come to rest beside the line, its landing a touch-down on the
-/// writing, and its frames are the idle train. (Until 2026-10-22 it sat out a
-/// pounce's landing and was still braking then, its frames the 16 ms train,
-/// and the move melted from [`tear_read_as_copy`].) A two-row relocation onto
-/// an unnamed row is never sampled between and follows.
-/// Claude Code and Codex bracket their frames and never tear; live torn reads last
-/// 2–30 ms.
 #[test]
 fn the_limit_a_torn_relocation_whose_new_row_stood_twin_min_is_a_copy() {
     holds_but(
@@ -2389,9 +2254,6 @@ fn the_limit_a_torn_relocation_whose_new_row_stood_twin_min_is_a_copy() {
 }
 
 /// The limit: an unsynced composer's wrap torn past `TWIN_MIN` melts. Claude Code's
-/// composer (53×91, alt screen) repainted without its bracket, each wrap torn 8–200
-/// ms apart; tears from [`tear_read_as_copy`] on melt, shorter ones follow. The real
-/// composer brackets every frame (`tests/composer_multiline_wrap.rs`).
 #[test]
 fn the_limit_an_unsynced_composer_s_wrap_torn_past_twin_min_melts() {
     holds_but(
@@ -2407,14 +2269,6 @@ fn stand_of(id: &str) -> u64 {
 }
 
 /// The limit: a move onto a row a copy stood on for `TWIN_MIN` melts, because a twin
-/// is sticky (`Seen::twin`). `hello world` on row 10; a copy on row 11 erased `stand`
-/// ms later; 200 ms on, the line relocated onto row 11 in one write. Melts from
-/// [`tear_read_as_copy`] on the flat trains, and from [`STICKY_PACED`] under the
-/// GUI's pacing and with the pet: the copy lands 200 ms after the typing, the
-/// pet at rest beside the line by then (its landing a touch-down on the
-/// writing), so its frames are the idle train. (From 2026-10-20 to 2026-10-22
-/// it sat out a pounce's landing and was still braking to its stand then, its
-/// frames the 16 ms train, and the move melted from [`tear_read_as_copy`].)
 #[test]
 fn the_limit_a_move_onto_a_row_a_copy_stood_on_for_twin_min_melts() {
     holds_but(
@@ -2432,5 +2286,4 @@ fn the_limit_a_move_onto_a_row_a_copy_stood_on_for_twin_min_melts() {
 }
 
 /// The sticky-twin limit's threshold under the GUI's pacing: idle frames 110–130 ms
-/// apart, so a 100 ms stand follows and a 130 ms one melts.
 const STICKY_PACED: u64 = 130;

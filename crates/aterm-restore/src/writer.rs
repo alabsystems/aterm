@@ -2,67 +2,6 @@
 // Copyright 2026 Andrew Yates
 
 //! The journal's single-writer protocols (the crash-restore plan §2.4).
-//!
-//! Every protocol here publishes its data before the commit word that admits it: the
-//! copy is a plain write, the commit word a release store a reader loads with acquire.
-//! A process crash loses no store already made to shared memory, just as it loses no
-//! completed `write(2)`, so the only hazard is a writer stopping between two stores,
-//! and every order below is chosen so that a stop anywhere leaves a region the reader
-//! can trust up to its commit words:
-//!
-//! - **Tail append**, inside the hold that processed the slice and *after*
-//!   `Terminal::process`, so a slice that panics the parser never enters the tail and
-//!   a restore never replays the slice that killed its writer:
-//!   1. if the record would overwrite bytes at or above `tail_floor`, store the new
-//!      floor (a record boundary) first;
-//!   2. copy the record (after a PAD, or a gap under 16 bytes, when it would straddle
-//!      the ring's end);
-//!   3. store `stream_processed`, then `tail_commit`.
-//! - **Keyframe**, `seq & 1` picks the slot: store the slot's commit word 0, copy the
-//!   record, store its length, store the commit word `seq`. A death during the write
-//!   invalidates only the slot being written; the other slot still holds the previous
-//!   keyframe, whose tail the floor has not passed. [`JournalWriter::begin_keyframe`]
-//!   is the first store and [`JournalWriter::finish_keyframe`] the rest, because the
-//!   parse thread captures under the terminal lock and copies after releasing it.
-//! - **History append**: advance `hist_lo_seq` and `hist_lo` past every chunk the new
-//!   one overlaps, copy it (after zeroing the gap to the ring's end when it would
-//!   straddle), store `hist_end_row`, then `hist_hi`.
-//! - **History reset** (the fence's identity moved): publish the ring empty
-//!   (`hist_lo = hist_hi`) before anything else changes, then the new identity, and for
-//!   a clear zero every byte the ring ever held.
-//! - **Clear settle** (the parse thread, right after the keyframe a clear forced): the
-//!   other slot's commit word 0, then every byte it ever held; the newest slot's bytes
-//!   past its own record; the tail's floor up to the newest keyframe's `tail_from`, then
-//!   every ring byte outside the live window. With the history reset, no byte from
-//!   before an ED3 or a RIS stays anywhere in the region (the plan's privacy claim 4),
-//!   and a stop anywhere leaves the restore the region gave before.
-//!
-//! One order departs from the plan's text. The plan resets `tail_marks` at the
-//! keyframe's capture; here it is reset after the keyframe's commit word. A writer that
-//! died between the two would otherwise leave the PREVIOUS keyframe as the newest valid
-//! one with its tail's verified marks uncounted, and a restore would call itself exact
-//! while dropping them. Reset after the commit, the same death over-counts (the marks
-//! before the new keyframe stay counted), which costs exactness, never truth.
-//!
-//! A second follows from it. The plan counts a slice's marks only past K6's budget
-//! (`tail_marks += delta`), leaving uncounted the marks of the very slice whose K6
-//! keyframe is due: a death between that slice's append and the keyframe's commit word
-//! restored as exact with the prompt's state lost. Here every slice's marks are counted
-//! ([`JournalWriter::note_marks`]) before the slice's append, budget or not.
-//!
-//! - **Control slot** ([`ControlWriter`], the window's journal worker alone): store
-//!   `ctl_commit` 0, copy the record, store `ctl_len`, store `ctl_commit` = the record's
-//!   sequence number, then zero what a longer record left past it. A death anywhere
-//!   between the first store and the last commit word leaves the slot empty, never a
-//!   record its commit word does not name: a restore then carries no control state,
-//!   never a wrong one. One slot, so that death loses the record the slot held before
-//!   the write as well; the count beside it (`ctl_count`, [`store_ctl_count`]) is a word
-//!   no control write touches, and survives it.
-//!
-//! Words other threads own (`stream_gathered`, the resize word, `config_fp`, the cell size,
-//! `ctl_count`) have free functions over the store ([`store_gathered`],
-//! [`store_resize_word`], [`store_config_fp`], [`store_cell_px`], [`store_ctl_count`]) so
-//! their threads need no writer.
 
 use std::collections::VecDeque;
 
@@ -114,8 +53,7 @@ pub enum WriteError {
         /// The space it must fit.
         cap: usize,
     },
-    /// [`JournalWriter::finish_keyframe`] with no keyframe begun, or a begin while one
-    /// is in progress.
+    /// [`JournalWriter::finish_keyframe`] with no keyframe begun, or a begin while one is in progress.
     Sequence,
 }
 
@@ -136,13 +74,12 @@ impl std::fmt::Display for WriteError {
     }
 }
 
-/// Why a keyframe was not begun. Nothing was stored.
+/// Why a keyframe was not begun.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KeyframeError {
     /// The record did not encode.
     Encode(EncodeError),
-    /// The record is larger than a slot: the caller retries with a smaller bridge (the
-    /// plan's "giant screens" rule), and with none past that.
+    /// The record is larger than a slot.
     TooLarge {
         /// The record's length.
         len: usize,
@@ -168,9 +105,7 @@ impl std::fmt::Display for KeyframeError {
     }
 }
 
-/// What one keyframe captures, beside the writer's own positions: the engine's
-/// checkpoint (`Terminal::checkpoint_journal(bridge)`), and the engine's resize journal,
-/// history fence, config and shell-integration posture, all read in the same hold.
+/// What one keyframe captures, beside the writer's own positions.
 #[derive(Debug, Clone, Copy)]
 pub struct KeyframeInput<'a> {
     /// The projection.
@@ -181,14 +116,11 @@ pub struct KeyframeInput<'a> {
     pub resize_lifetime: u64,
     /// `Terminal::resize_ordinal()`.
     pub resize_ordinal: u64,
-    /// The bridge the projection was bounded by: the decoder's bound on the history it
-    /// may hold.
+    /// The bridge the projection was bounded by: the decoder's bound on the history it may hold.
     pub bridge_lines: u32,
     /// The engine-relevant config's fingerprint.
     pub config_fp: u64,
-    /// The engine required a shell-integration nonce and had one in use
-    /// (`Terminal::shell_integration_posture() == ShellIntegrationPosture::On`): what the
-    /// replay authorizes a nonce of its own for (`KeyframeHead::integration_on`).
+    /// The engine required a shell-integration nonce and had one in use (`Terminal::shell_integration_posture() == ShellIntegrationPosture::On`).
     pub integration_on: bool,
 }
 
@@ -201,43 +133,22 @@ struct Pending {
     tail_from: u64,
 }
 
-/// A writer with a planted defect: the negative controls of the Tier-1 sweep. Only a
-/// test build can plant one ([`JournalWriter::plant`]); the shipped writer's check is
-/// constant `false`.
+/// A writer with a planted defect: the negative controls of the Tier-1 sweep.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WriterFault {
-    /// The keyframe's commit word is stored at the begin, before the copy (the model's
-    /// `Buggy = 1`).
+    /// The keyframe's commit word is stored at the begin, before the copy (the model's `Buggy = 1`).
     PublishEarly,
     /// The tail's floor is never moved before an overwrite (the model's `Buggy = 2`).
     NoFloor,
-    /// The tail's floor is moved after the copy that overwrites what it guards, not
-    /// before. Every word is right once the append ends, so only a death between the
-    /// copy and the floor shows it.
+    /// The tail's floor is moved after the copy that overwrites what it guards, not before.
     FloorAfterCopy,
     /// The tail's stream count and commit word are stored before the copy, not after.
-    /// Every word is right once the append ends, so only a death between the commit
-    /// word and the copy shows it.
     CommitBeforeCopy,
-    /// The control slot's commit word is stored with the new record's sequence number
-    /// before its copy, never zeroed first ([`ControlWriter`]): every word is right once
-    /// the write ends, so only a death inside it shows it, as a slot whose commit word
-    /// names a record the slot does not hold.
+    /// The control slot's commit word is stored with the new record's sequence number before its copy, never zeroed first ([`ControlWriter`]).
     ControlPublishEarly,
 }
 
-/// THE HISTORY RING'S WRITER (the plan's §2.4 "History append" and "Fence reset"): the
-/// journal worker's alone (§2.2), so it is a value of its own, apart from the parse
-/// thread's [`JournalWriter`], and it is handed the region's store at every call. The
-/// worker keeps one per session beside the session's shared store and never takes the
-/// parse thread's lock to write the ring: its LZ4 encode and its copy run while the parse
-/// thread appends to the tail, each primitive store going through the store's own lock as
-/// the gather thread's count does. A [`JournalWriter`] holds one too, so a single-threaded
-/// writer (the tests, the Tier-1 sweep) drives the ring through
-/// [`JournalWriter::reset_history`] and [`JournalWriter::append_history`]; a window never
-/// calls those, so its region has exactly one ring writer.
-///
-/// It keeps a mirror of every ring word it owns, so it never reads the region back.
+/// THE HISTORY RING'S WRITER (the plan's §2.4 "History append" and "Fence reset").
 #[derive(Debug)]
 pub struct HistoryWriter {
     /// The ring's offset in the region.
@@ -253,34 +164,20 @@ pub struct HistoryWriter {
     /// `(start, seq, first_row)` of each chunk in `[lo, hi)`, oldest first.
     chunks: VecDeque<(u64, u64, u64)>,
     /// The absolute row one past the newest exported line (`hist_end_row`): the reset's
-    /// `oldest` until a chunk lands.
     end_row: u64,
-    /// One past the highest ring offset ever written, under any modulus: what a clear
-    /// zeroes. It only grows (a reset to a smaller cap leaves the larger ring's chunks
-    /// past the new modulus, pre-clear lines a clear must still reach), and only a clear
-    /// that zeroed it returns it to 0.
+    /// One past the highest ring offset ever written, under any modulus: what a clear zeroes.
     pub(crate) touched: usize,
     /// Encoded bytes of the chunks in `[lo, hi)` and the lines they hold, for the adaptive
-    /// cap's bytes-per-line ([`Self::bytes_per_line`]).
     run_bytes: u64,
     run_lines: u64,
 }
 
 /// The least logical cap the history ring is given (the plan's §2.6 floor).
 pub const MIN_HIST_CAP: usize = 256 * 1024;
-/// The least bytes per line the adaptive cap assumes (§2.6's `max(32, ewma)`): a corpus
-/// that compresses better than this is not trusted to stay that compressible.
+/// The least bytes per line the adaptive cap assumes (§2.6's `max(32, ewma)`).
 pub const MIN_BYTES_PER_LINE: u64 = 32;
 
-/// The history ring's logical cap (the plan's §2.6, judges 1 and 3: the 24 B/line cap the
-/// first design assumed rested on one corpus, and the designs measured 7.5 to 30.9 LZ4
-/// bytes a line across theirs): `clamp(line_limit × max(32, bytes_per_line) × 1.25,
-/// 256 KiB, phys)`, a multiple of 8, and the whole physical ring for an unlimited
-/// scrollback. Sized so the ring holds every line the engine retains at the corpus's own
-/// rate with a quarter to spare, and no more: a ring larger than that would wrap less
-/// often but touch, and so keep resident, pages holding lines the engine itself has
-/// already evicted. Lines the cap cannot hold are counted by the restore's join, never
-/// dropped silently.
+/// The history ring's logical cap (the plan's §2.6, judges 1 and 3: the 24 B/line cap the first design assumed rested on one corpus, and the designs measured 7.5 to 30.9 LZ4 bytes a line across theirs).
 #[must_use]
 pub fn adaptive_hist_cap(line_limit: Option<usize>, bytes_per_line: u64, phys: usize) -> usize {
     let cap = match line_limit {
@@ -299,8 +196,7 @@ pub fn adaptive_hist_cap(line_limit: Option<usize>, bytes_per_line: u64, phys: u
 /// Zeros for [`JournalWriter::zero`] to copy from, so zeroing a span allocates nothing.
 const ZEROS: [u8; 4096] = [0; 4096];
 
-/// The journal's writer for one session's region. It keeps a mirror of every word it
-/// owns, so it never reads the region back.
+/// The journal's writer for one session's region.
 #[derive(Debug)]
 pub struct JournalWriter<S: RegionStore> {
     store: S,
@@ -311,9 +207,6 @@ pub struct JournalWriter<S: RegionStore> {
     /// The record length each slot holds.
     slot_len: [usize; 2],
     /// One past the highest byte ever written in each slot: what
-    /// [`Self::settle_clear`] zeroes. A short keyframe written over a long one leaves the
-    /// long one's tail bytes past its own record, readable LZ4 literals of an older
-    /// screen, so a slot's last record length does not bound what it holds.
     slot_high: [usize; 2],
     /// The newest committed keyframe's tail position.
     keyframe_tail_from: u64,
@@ -321,38 +214,27 @@ pub struct JournalWriter<S: RegionStore> {
     tail_floor: u64,
     stream_processed: u64,
     /// Start positions of the records in `[tail_floor, tail_commit)`, oldest first: the
-    /// boundaries a floor may land on.
     tail_starts: VecDeque<u64>,
     tail_marks: u64,
-    /// The ring's writer, for a single-threaded writer of the whole region
-    /// ([`HistoryWriter`]: a window's worker keeps its own).
+    /// The ring's writer, for a single-threaded writer of the whole region ([`HistoryWriter`]: a window's worker keeps its own).
     pub(crate) history: HistoryWriter,
     /// The tail record being encoded, kept between appends so the tap allocates nothing
-    /// per slice.
     scratch: Vec<u8>,
     #[cfg(test)]
     fault: Option<WriterFault>,
 }
 
-/// Store the gather thread's count of PTY bytes read: after every `read()`, before the
-/// batch is sent to the parse thread, so a restore can count what was read and never
-/// processed.
+/// Store the gather thread's count of PTY bytes read.
 ///
 /// # Errors
-///
 /// The store's refusal.
 pub fn store_gathered<S: RegionStore + ?Sized>(store: &S, gathered: u64) -> Result<(), StoreError> {
     store.store_u64_release(OFF_STREAM_GATHERED, gathered)
 }
 
-/// Store the engine's resize lifetime and ordinal from the host's resize path, in the
-/// same terminal-lock hold as the resize: a resize followed by no output is otherwise
-/// journaled only at the reader's next hold, and a restore counts the difference
-/// (`resizes_unjournaled`). The lifetime goes first: a writer stopped between the two
-/// leaves a pair that mismatches, which a restore counts, never one that hides a resize.
+/// Store the engine's resize lifetime and ordinal from the host's resize path, in the same terminal-lock hold as the resize.
 ///
 /// # Errors
-///
 /// The store's refusal.
 pub fn store_resize_word<S: RegionStore + ?Sized>(
     store: &S,
@@ -363,11 +245,9 @@ pub fn store_resize_word<S: RegionStore + ?Sized>(
     store.store_u64_release(OFF_ENGINE_RESIZE_ORDINAL, ordinal)
 }
 
-/// Store the fingerprint of the engine-relevant config from the host's config,
-/// colour-scheme and cell-size paths, in the same hold as the engine mutation.
+/// Store the fingerprint of the engine-relevant config from the host's config, colour-scheme and cell-size paths, in the same hold as the engine mutation.
 ///
 /// # Errors
-///
 /// The store's refusal.
 pub fn store_config_fp<S: RegionStore + ?Sized>(
     store: &S,
@@ -376,14 +256,9 @@ pub fn store_config_fp<S: RegionStore + ?Sized>(
     store.store_u64_release(OFF_CONFIG_FP, config_fp)
 }
 
-/// Store the window's cell size ([`OFF_CELL_PX`]) from the host's cell-size path, in
-/// the same hold as the engine's `set_cell_pixel_size` and BEFORE the `config_fp`
-/// that folds it in. A death between the stores can leave the header's fingerprint
-/// unchanged. The window also derives its replay policy's fingerprint from this cell
-/// word, which recovery compares with the keyframe's when it replays a tail.
+/// Store the window's cell size ([`OFF_CELL_PX`]) from the host's cell-size path, in the same hold as the engine's `set_cell_pixel_size` and BEFORE the `config_fp` that folds it in.
 ///
 /// # Errors
-///
 /// The store's refusal.
 pub fn store_cell_px<S: RegionStore + ?Sized>(
     store: &S,
@@ -392,36 +267,19 @@ pub fn store_cell_px<S: RegionStore + ?Sized>(
     store.store_u64_release(OFF_CELL_PX, cell_px_word(px))
 }
 
-/// Store the window's control count ([`OFF_CTL_COUNT`]: `aterm-gui`'s turn-id count) from
-/// the thread that raised it. The caller keeps the stores rising (one lock across its read
-/// of the count and the store): a restore takes the word as a count past every one the
-/// window used.
+/// Store the window's control count ([`OFF_CTL_COUNT`]: `aterm-gui`'s turn-id count) from the thread that raised it.
 ///
 /// # Errors
-///
 /// The store's refusal.
 pub fn store_ctl_count<S: RegionStore + ?Sized>(store: &S, count: u64) -> Result<(), StoreError> {
     store.store_u64_release(OFF_CTL_COUNT, count)
 }
 
-/// ERASE a region no writer journals into any more: a counter-only marker first, so
-/// every screen/control reader takes the META rung after that atomic store, then zero
-/// every written page except that marker and the monotonic turn-id count. No keyframe,
-/// control record, tail or history byte survives a complete erase. The count remains
-/// available independently, including after a stop inside the erase. An unwritten page
-/// is not written: the erase makes nothing resident.
-///
-/// For a region that outlives its writer while the keeper holds it: the memory shed's
-/// superseded one, until the keeper link takes the custody of the region that replaced
-/// it. A clear made meanwhile has no writer left there to settle it
-/// ([`JournalWriter::settle_clear`]), so the whole region goes.
+/// ERASE a region no writer journals into any more.
 ///
 /// # Errors
-///
 /// The store's refusal.
 pub fn erase_region<S: RegionStore>(region: &Touched<S>) -> Result<(), StoreError> {
-    // The first atomic store refuses every screen/control reader without losing the
-    // process's count. A crash at any later primitive still leaves that scalar readable.
     region.store_u64_release(OFF_MAGIC, ERASED_COUNT_V1)?;
     for page in region.written_pages() {
         let mut at = page.start;
@@ -449,8 +307,6 @@ fn ring_offset(pos: u64, cap: usize) -> usize {
 }
 
 /// Zero `len` bytes of `store` at `at`, a page of zeros at a time: one primitive store
-/// (and one hold of a shared store's lock) per 4 KiB, so zeroing the whole history ring
-/// never holds the region from the parse thread for more than a page's copy.
 fn zero<S: RegionStore + ?Sized>(store: &S, at: usize, len: usize) -> Result<(), StoreError> {
     let mut done = 0;
     while done < len {
@@ -462,15 +318,10 @@ fn zero<S: RegionStore + ?Sized>(store: &S, at: usize, len: usize) -> Result<(),
 }
 
 impl<S: RegionStore> JournalWriter<S> {
-    /// Lay a fresh region out: the header's identity and geometry words, an empty tail
-    /// and history ring, and the magic last, so a region whose creator died before it
-    /// finished reads as no region at all. No keyframe yet: the caller writes the first
-    /// one before anyone is told the region exists.
+    /// Lay a fresh region out.
     ///
     /// # Errors
-    ///
-    /// [`WriteError::Layout`] for a geometry no reader accepts or one that is not the
-    /// store's length; the store's refusal.
+    /// [`WriteError::Layout`] for a geometry no reader accepts or one that is not the store's length; the store's refusal.
     pub fn create(
         store: S,
         geometry: Geometry,
@@ -572,8 +423,7 @@ impl<S: RegionStore> JournalWriter<S> {
         self.stream_processed
     }
 
-    /// Tail bytes written since the newest committed keyframe: what the policy's K3
-    /// (tail pressure) weighs against the ring.
+    /// Tail bytes written since the newest committed keyframe: what the policy's K3 (tail pressure) weighs against the ring.
     pub fn tail_since_keyframe(&self) -> u64 {
         self.tail_commit.saturating_sub(self.keyframe_tail_from)
     }
@@ -593,18 +443,13 @@ impl<S: RegionStore> JournalWriter<S> {
         zero(&self.store, at, len)
     }
 
-    // The tail
-
     /// The most payload one BYTES record carries in this ring: [`MAX_BYTES_PAYLOAD`],
-    /// or what fits beside a header in a small test ring.
     fn max_payload(&self) -> usize {
         let room = self.geometry.tail_cap.saturating_sub(TAIL_RECORD_HEADER) / 8 * 8;
         MAX_BYTES_PAYLOAD.min(room).max(1)
     }
 
     /// Append PTY bytes the engine just processed (a slice, after `Terminal::process`):
-    /// split into records of at most [`MAX_BYTES_PAYLOAD`], each advancing the stream.
-    ///
     /// # Errors
     ///
     /// The store's refusal.
@@ -641,11 +486,9 @@ impl<S: RegionStore> JournalWriter<S> {
         self.append_bytes(bytes, false)
     }
 
-    /// Append bytes the engine processed that did not come from the PTY (a foreground
-    /// handback, a manual reset): replayed, but adding nothing to the stream count.
+    /// Append bytes the engine processed that did not come from the PTY (a foreground handback, a manual reset).
     ///
     /// # Errors
-    ///
     /// The store's refusal.
     pub fn append_synthesized(&mut self, bytes: &[u8]) -> Result<(), WriteError> {
         self.append_bytes(bytes, true)
@@ -670,11 +513,9 @@ impl<S: RegionStore> JournalWriter<S> {
         Ok(())
     }
 
-    /// Append a resize the engine applied, in engine order (the reader's spine catch-up
-    /// walks `Terminal::resize_journal_since` before each slice).
+    /// Append a resize the engine applied, in engine order (the reader's spine catch-up walks `Terminal::resize_journal_since` before each slice).
     ///
     /// # Errors
-    ///
     /// The store's refusal.
     pub fn append_resize(
         &mut self,
@@ -696,49 +537,34 @@ impl<S: RegionStore> JournalWriter<S> {
         )
     }
 
-    /// Record that the engine's resize journal overran: `n` resizes are not in the tail,
-    /// so no restore that replays across this record is exact.
+    /// Record that the engine's resize journal overran.
     ///
     /// # Errors
-    ///
     /// The store's refusal.
     pub fn append_resizes_lost(&mut self, n: u32) -> Result<(), WriteError> {
         self.append_record(&TailRecord::ResizesLost { n }, self.stream_processed)
     }
 
-    /// Record that the session's engine was replaced; what follows is another
-    /// lifetime's, and the session needs a keyframe of it.
+    /// Record that the session's engine was replaced; what follows is another lifetime's, and the session needs a keyframe of it.
     ///
     /// # Errors
-    ///
     /// The store's refusal.
     pub fn append_engine_replaced(&mut self) -> Result<(), WriteError> {
         self.append_record(&TailRecord::EngineReplaced, self.stream_processed)
     }
 
-    /// Close the region: its last record says the session's journal goes on in another
-    /// region ([`crate::records::KIND_SUPERSEDED`]), so a restore from it is never exact.
-    /// Nothing may be written to it after this.
+    /// Close the region: its last record says the session's journal goes on in another region ([`crate::records::KIND_SUPERSEDED`]), so a restore from it is never exact.
     ///
     /// # Errors
-    ///
     /// The store's refusal.
     pub fn append_superseded(&mut self) -> Result<(), WriteError> {
         self.append_record(&TailRecord::Superseded, self.stream_processed)
     }
 
-    /// Continue another region's stream count in this freshly laid-out one: `processed` PTY
-    /// bytes were already processed when this region took over the session's journal (the
-    /// memory shed's replacement, `aterm-gui`'s `crash_restore`), and the gather thread's
-    /// running count, which the region inherits, counts from the session's first byte. The
-    /// first keyframe is then stamped at `processed` and every record continues from it, so
-    /// a restore counts in flight exactly what was gathered and never processed, not the
-    /// session's whole history.
+    /// Continue another region's stream count in this freshly laid-out one.
     ///
     /// # Errors
-    ///
-    /// [`WriteError::Sequence`] once anything was written past the layout (a keyframe or a
-    /// tail record: the count they were stamped with stands); the store's refusal.
+    /// [`WriteError::Sequence`] once anything was written past the layout (a keyframe or a tail record: the count they were stamped with stands).
     pub fn resume_stream(&mut self, processed: u64) -> Result<(), WriteError> {
         if self.next_seq != 1 || self.pending.is_some() || self.tail_commit != 0 {
             return Err(WriteError::Sequence);
@@ -749,17 +575,9 @@ impl<S: RegionStore> JournalWriter<S> {
             .map_err(WriteError::from)
     }
 
-    /// Mark the region's history ring SHED: its logical cap 0, which a reader refuses for
-    /// any run it finds (`recover`'s ring read: a cap of 0 under a nonempty run is a fault),
-    /// so no chunk can ever be read from a ring nothing writes. A memory-pressure shed lays
-    /// a fresh region out and calls this before anything else is told it exists, and the
-    /// ring stays untouched, its pages never resident. Exporting again starts with a ring
-    /// reset ([`HistoryWriter::reset_ring`]), which stores a cap first; an empty ring reads
-    /// as empty whatever its cap, so a reader of a region whose ring was never written sees
-    /// no history either way.
+    /// Mark the region's history ring SHED.
     ///
     /// # Errors
-    ///
     /// The store's refusal.
     pub fn shed_history(&mut self) -> Result<(), WriteError> {
         self.history.cap = 0;
@@ -779,8 +597,6 @@ impl<S: RegionStore> JournalWriter<S> {
         if len > cap {
             return Err(WriteError::TooLarge { len, cap });
         }
-        // A BYTES payload is copied straight from the slice after its header (one copy of
-        // every PTY byte, the tap's whole cost); the other kinds are a few bytes, encoded.
         let mut head = std::mem::take(&mut self.scratch);
         head.clear();
         let payload: &[u8] = match record {
@@ -800,8 +616,6 @@ impl<S: RegionStore> JournalWriter<S> {
         let start = self.tail_commit.saturating_add(word(gap));
         let end = start.saturating_add(word(len));
 
-        // 1. The floor, before any byte it guards is overwritten: the bytes written now
-        //    land on the absolute positions one ring below them.
         let need = end.saturating_sub(word(cap));
         let floor_moves = need > self.tail_floor && !self.planted(WriterFault::NoFloor);
         if floor_moves && !self.planted(WriterFault::FloorAfterCopy) {
@@ -814,8 +628,6 @@ impl<S: RegionStore> JournalWriter<S> {
             self.store.store_u64_release(OFF_TAIL_COMMIT, end)?;
         }
 
-        // 2. The copy: a PAD to the ring's end when the record would straddle it (a gap
-        //    under a header is skipped by the reader), then the record.
         if gap >= TAIL_RECORD_HEADER {
             self.store.write(
                 self.geometry.tail_off + off,
@@ -837,7 +649,6 @@ impl<S: RegionStore> JournalWriter<S> {
             self.move_floor(need, start)?;
         }
 
-        // 3. The stream count, then the commit word.
         self.stream_processed = stream_end;
         self.tail_commit = end;
         if !commit_early {
@@ -852,7 +663,6 @@ impl<S: RegionStore> JournalWriter<S> {
     }
 
     /// Move the floor onto the first record boundary at or past `need` (or onto `start`,
-    /// the record being written, when the window holds none) and store it.
     fn move_floor(&mut self, need: u64, start: u64) -> Result<(), StoreError> {
         while self.tail_starts.front().is_some_and(|&s| s < need) {
             self.tail_starts.pop_front();
@@ -862,19 +672,9 @@ impl<S: RegionStore> JournalWriter<S> {
             .store_u64_release(OFF_TAIL_FLOOR, self.tail_floor)
     }
 
-    /// Count the verified OSC 133/633 marks of the bytes about to be appended (how far
-    /// processing them moved `Terminal::shell_marks_verified`). Called for EVERY slice,
-    /// BEFORE its append (`append_slice`, `append_synthesized`): a restore replays the
-    /// tail into an engine with no nonce, which drops a verified mark, so every mark the
-    /// newest keyframe does not hold must be counted for the restore to report it lost
-    /// instead of calling itself exact. Before the append, because a death after the
-    /// append and before this store would leave a mark in the tail uncounted; a death
-    /// between the two only over-counts, which costs exactness, never truth. The next
-    /// keyframe's commit clears the count ([`Self::finish_keyframe`]), so the slice whose
-    /// mark triggers a K6 keyframe stays counted through that keyframe's encode and copy.
+    /// Count the verified OSC 133/633 marks of the bytes about to be appended (how far processing them moved `Terminal::shell_marks_verified`).
     ///
     /// # Errors
-    ///
     /// The store's refusal.
     pub fn note_marks(&mut self, delta: u64) -> Result<(), WriteError> {
         if delta == 0 {
@@ -889,7 +689,6 @@ impl<S: RegionStore> JournalWriter<S> {
     /// [`store_gathered`] through the writer.
     ///
     /// # Errors
-    ///
     /// The store's refusal.
     #[cfg_attr(
         any(test, debug_assertions),
@@ -906,7 +705,6 @@ impl<S: RegionStore> JournalWriter<S> {
     /// [`store_resize_word`] through the writer.
     ///
     /// # Errors
-    ///
     /// The store's refusal.
     pub fn set_resize_word(&self, lifetime: u64, ordinal: u64) -> Result<(), WriteError> {
         store_resize_word(&self.store, lifetime, ordinal).map_err(WriteError::from)
@@ -915,24 +713,15 @@ impl<S: RegionStore> JournalWriter<S> {
     /// [`store_config_fp`] through the writer.
     ///
     /// # Errors
-    ///
     /// The store's refusal.
     pub fn set_config_fp(&self, config_fp: u64) -> Result<(), WriteError> {
         store_config_fp(&self.store, config_fp).map_err(WriteError::from)
     }
 
-    // Keyframes
-
-    /// Capture a keyframe and begin its write: encode it (with the writer's tail
-    /// position and stream count as its `tail_from` and `stream_at`) and store its
-    /// slot's commit word 0. The caller holds the terminal lock, so the capture and the
-    /// positions agree; [`Self::finish_keyframe`] copies after the lock is released.
+    /// Capture a keyframe and begin its write.
     ///
     /// # Errors
-    ///
-    /// [`KeyframeError::TooLarge`] for a record over the slot (nothing is stored: the
-    /// caller retries with a smaller bridge), an encoding failure, a keyframe already
-    /// in progress, or the store's refusal.
+    /// [`KeyframeError::TooLarge`] for a record over the slot (nothing is stored: the caller retries with a smaller bridge), an encoding failure, a keyframe already in progress, or the store's refusal.
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -982,12 +771,9 @@ impl<S: RegionStore> JournalWriter<S> {
         Ok(seq)
     }
 
-    /// Finish the keyframe [`Self::begin_keyframe`] began: copy it into its slot, store
-    /// its length, store its commit word, then reset the tail's mark count (after the
-    /// commit: module doc). Returns its sequence number.
+    /// Finish the keyframe [`Self::begin_keyframe`] began.
     ///
     /// # Errors
-    ///
     /// [`WriteError::Sequence`] with none begun; the store's refusal.
     #[cfg_attr(
         any(test, debug_assertions),
@@ -999,7 +785,6 @@ impl<S: RegionStore> JournalWriter<S> {
     )]
     pub fn finish_keyframe(&mut self) -> Result<u64, WriteError> {
         let pending = self.pending.take().ok_or(WriteError::Sequence)?;
-        // The high-water mark before the copy, so a copy cut short still counts.
         if let Some(high) = self.slot_high.get_mut(pending.slot) {
             *high = (*high).max(pending.record.len());
         }
@@ -1024,7 +809,6 @@ impl<S: RegionStore> JournalWriter<S> {
     /// [`Self::begin_keyframe`] and [`Self::finish_keyframe`] in one call.
     ///
     /// # Errors
-    ///
     /// As theirs.
     pub fn write_keyframe(&mut self, input: &KeyframeInput<'_>) -> Result<u64, KeyframeError> {
         self.begin_keyframe(input)?;
@@ -1034,31 +818,9 @@ impl<S: RegionStore> JournalWriter<S> {
         })
     }
 
-    /// Settle a clear (ED3, RIS) in the parse thread's sections. Called right after the
-    /// keyframe the clear forced (K4) commits, it leaves no byte from before the clear in
-    /// the keyframe slots or the tail. The worker's `reset_history(.., clear = true)`
-    /// does the same for the history ring, so the region holds nothing a person cleared
-    /// (the plan's privacy claim 4):
-    ///
-    /// 1. **The other slot**, which holds a keyframe from before the clear. Its commit
-    ///    word goes first, so a stop mid-way leaves an empty slot, never a readable one.
-    ///    Then every byte the slot ever held is zeroed, up to its high-water mark rather
-    ///    than its last record's length, because an earlier, longer keyframe's tail lies
-    ///    past a short one. Then its length.
-    /// 2. **The newest slot past its own record.** An earlier, longer keyframe written
-    ///    there left its tail bytes, readable LZ4 literals of a pre-clear screen.
-    /// 3. **The tail.** The floor moves up to the newest keyframe's `tail_from`, a record
-    ///    boundary below which nothing a restore replays lies. Only then is every ring
-    ///    byte outside the live window `[floor, commit)` zeroed, the clear's own bytes
-    ///    and every pre-clear record with them. Floor first, as for an overwrite: a
-    ///    reader never walks zeroed bytes as records.
-    ///
-    /// The newest keyframe and the tail past it are untouched, so a stop anywhere leaves
-    /// a region that restores exactly as it did before the call: the settle costs no
-    /// restore anything. Nothing when a keyframe is in progress or none has committed.
+    /// Settle a clear (ED3, RIS) in the parse thread's sections.
     ///
     /// # Errors
-    ///
     /// The store's refusal.
     pub fn settle_clear(&mut self) -> Result<(), WriteError> {
         if self.pending.is_some() || self.next_seq < 2 {
@@ -1067,7 +829,6 @@ impl<S: RegionStore> JournalWriter<S> {
         let newest = slot_of(self.next_seq - 1);
         let other = 1 - newest;
 
-        // 1. The other slot.
         let high = self.slot_high[other];
         if high > 0 {
             self.store.store_u64_release(kf_commit_word(other), 0)?;
@@ -1077,17 +838,12 @@ impl<S: RegionStore> JournalWriter<S> {
             self.slot_high[other] = 0;
         }
 
-        // 2. The newest slot past its record.
         let (len, high) = (self.slot_len[newest], self.slot_high[newest]);
         if high > len {
             self.zero(self.geometry.kf_slot_off(newest) + len, high - len)?;
             self.slot_high[newest] = len;
         }
 
-        // 3. The tail: the floor, then everything outside the live window. The floor is
-        //    the keyframe's `tail_from` itself, not the next record's start: a record
-        //    that would have straddled the ring's end starts past a PAD, and a floor past
-        //    `tail_from` would read as an overflow of the keyframe's tail.
         let floor = self.tail_floor.max(self.keyframe_tail_from);
         if floor > self.tail_floor {
             self.tail_floor = floor;
@@ -1109,12 +865,9 @@ impl<S: RegionStore> JournalWriter<S> {
         Ok(())
     }
 
-    // History (through this writer's own ring writer: module doc of `HistoryWriter`)
-
     /// [`HistoryWriter::reset_ring`] over this writer's store.
     ///
     /// # Errors
-    ///
     /// The store's refusal.
     pub fn reset_history(
         &mut self,
@@ -1130,7 +883,6 @@ impl<S: RegionStore> JournalWriter<S> {
     /// [`HistoryWriter::append_chunk`] over this writer's store.
     ///
     /// # Errors
-    ///
     /// As [`HistoryWriter::append_chunk`]'s.
     pub fn append_history(&mut self, first_row: u64, lines: &[Line]) -> Result<u64, WriteError> {
         self.history.append_chunk(&self.store, first_row, lines)
@@ -1138,9 +890,7 @@ impl<S: RegionStore> JournalWriter<S> {
 }
 
 impl HistoryWriter {
-    /// The ring of a freshly laid-out region of `geometry` ([`JournalWriter::create`]
-    /// stores its words): empty, under no identity, its modulus the whole physical ring.
-    /// The first [`Self::reset_ring`] gives it the engine's identity and the adaptive cap.
+    /// The ring of a freshly laid-out region of `geometry` ([`JournalWriter::create`] stores its words).
     #[must_use]
     pub fn new(geometry: &Geometry) -> Self {
         Self {
@@ -1159,8 +909,7 @@ impl HistoryWriter {
         }
     }
 
-    /// The identity the ring's chunks are exported under (the default, whose width is 0,
-    /// before the first reset: no engine's).
+    /// The identity the ring's chunks are exported under (the default, whose width is 0, before the first reset: no engine's).
     #[must_use]
     pub fn identity(&self) -> HistoryIdentity {
         self.identity
@@ -1184,31 +933,21 @@ impl HistoryWriter {
         self.cap
     }
 
-    /// One past the highest ring offset ever written: the ring bytes this region has
-    /// touched, and so keeps resident.
+    /// One past the highest ring offset ever written: the ring bytes this region has touched, and so keeps resident.
     #[must_use]
     pub fn touched(&self) -> usize {
         self.touched
     }
 
-    /// The encoded bytes per line of the chunks the ring holds, rounded up: the corpus's
-    /// own rate, which [`adaptive_hist_cap`] sizes the ring by. `None` while it holds no
-    /// line.
+    /// The encoded bytes per line of the chunks the ring holds, rounded up.
     #[must_use]
     pub fn bytes_per_line(&self) -> Option<u64> {
         (self.run_lines > 0).then(|| self.run_bytes.div_ceil(self.run_lines))
     }
 
-    /// Start the ring over under `identity`, whose oldest line is absolute row `oldest`,
-    /// with modulus `cap` (clamped to the physical ring, a multiple of 8): the fence's
-    /// identity moved (a reflow, a reveal, a clear), the engine evicted lines the ring had
-    /// not reached (so the next chunk would leave a hole in its rows), or the adaptive cap
-    /// grew. The ring is published empty first, so a stop anywhere leaves either the old
-    /// run or none. For a `clear` (ED3, RIS) every byte the ring ever held is zeroed too,
-    /// so no pre-clear line survives in the region.
+    /// Start the ring over under `identity`, whose oldest line is absolute row `oldest`, with modulus `cap` (clamped to the physical ring, a multiple of 8).
     ///
     /// # Errors
-    ///
     /// The store's refusal.
     #[cfg_attr(
         any(test, debug_assertions),
@@ -1256,14 +995,10 @@ impl HistoryWriter {
         Ok(())
     }
 
-    /// Append one chunk: `lines` (at most 1024, wrapped at the ring identity's width), the
-    /// first at absolute row `first_row`. Returns its step sequence number.
+    /// Append one chunk: `lines` (at most 1024, wrapped at the ring identity's width), the first at absolute row `first_row`.
     ///
     /// # Errors
-    ///
-    /// [`WriteError::TooLarge`] for a chunk over the ring (nothing is stored: the caller
-    /// splits it, and past one line starts the ring over after it, counted by the join);
-    /// the store's refusal.
+    /// [`WriteError::TooLarge`] for a chunk over the ring (nothing is stored: the caller splits it, and past one line starts the ring over after it, counted by the join).
     pub fn append_chunk<S: RegionStore + ?Sized>(
         &mut self,
         store: &S,
@@ -1289,11 +1024,6 @@ impl HistoryWriter {
         let end = start.saturating_add(word(len));
         let seq = self.next_seq;
 
-        // 1. Past every chunk the new one overlaps, sequence first. A stop between the two
-        //    words leaves `hist_lo` at a chunk whose step is below `hist_lo_seq`; nothing
-        //    is copied before both words, so that chunk is whole, and the reader reads
-        //    the run from it (never a wrong chunk: the steps after it must still be dense
-        //    up to the commit word).
         let need = end.saturating_sub(word(cap));
         if self.chunks.front().is_some_and(|&(s, _, _)| s < need) {
             while self.chunks.front().is_some_and(|&(s, _, _)| s < need) {
@@ -1307,17 +1037,11 @@ impl HistoryWriter {
             store.store_u64_release(OFF_HIST_LO_SEQ, lo_seq)?;
             store.store_u64_release(OFF_HIST_LO, lo)?;
         } else if self.chunks.is_empty() {
-            // An empty ring's run starts at this chunk.
             self.lo = start;
             store.store_u64_release(OFF_HIST_LO_SEQ, seq)?;
             store.store_u64_release(OFF_HIST_LO, start)?;
         }
 
-        // 2. The copy, after zeroing the gap to the ring's end (the reader steps over a
-        //    run's zero tail to the ring's start).
-        // The high-water mark grows before each write it covers, and never shrinks here:
-        // under a cap a reset made smaller, the larger ring's chunks still lie past this
-        // modulus, and a clear must reach them.
         if gap > 0 {
             self.touched = self.touched.max(cap);
             zero(store, self.hist_off + off, gap)?;
@@ -1326,7 +1050,6 @@ impl HistoryWriter {
         self.touched = self.touched.max(at + len);
         store.write(self.hist_off + at, &record)?;
 
-        // 3. The end row, then the commit.
         let n = word(lines.len());
         self.end_row = first_row.saturating_add(n);
         store.store_u64_release(OFF_HIST_END_ROW, self.end_row)?;
@@ -1334,7 +1057,6 @@ impl HistoryWriter {
         store.store_u64_release(OFF_HIST_HI, end)?;
         self.chunks.push_back((start, seq, first_row));
         self.next_seq = seq.saturating_add(1);
-        // The run's rate, over what it holds now.
         self.run_lines = self
             .first_row()
             .map_or(0, |first| self.end_row.saturating_sub(first));
@@ -1343,24 +1065,12 @@ impl HistoryWriter {
     }
 }
 
-/// THE CONTROL SLOT'S WRITER (the crash-restore plan's increment 7): the window's journal
-/// worker alone writes the slot (`aterm-gui`'s `crash_restore`), at most once every two
-/// seconds and only when the session's turn ledger changed, so it is a value of its own,
-/// handed the region's store at every call, as [`HistoryWriter`] is. The slot holds one
-/// record ([`encode_control`]), the newest carry, which replaces the one before (module
-/// doc, "Control slot").
-///
-/// One slot, not two as for keyframes: a death inside a write leaves no carry rather than
-/// the one before, and the write is one copy of at most the slot's 64 KiB, made at human
-/// rates, so that window is microseconds a turn. Two would halve what one carry holds. The
-/// window's count (`ctl_count`, [`store_ctl_count`]) is no part of the slot: a death inside
-/// a write leaves it, so the restorer still knows how far the dead window counted.
+/// THE CONTROL SLOT'S WRITER (the crash-restore plan's increment 7).
 #[derive(Debug, Default)]
 pub struct ControlWriter {
     /// The sequence number of the record the slot holds; 0 before the first write.
     seq: u64,
     /// One past the highest slot byte written in the current region: what a shorter
-    /// record leaves behind to be zeroed.
     high: usize,
     #[cfg(test)]
     fault: Option<WriterFault>,
@@ -1398,13 +1108,10 @@ impl ControlWriter {
         self.seq
     }
 
-    /// Write `carry` as the slot's next record (module doc, "Control slot"). Returns its
-    /// sequence number.
+    /// Write `carry` as the slot's next record (module doc, "Control slot").
     ///
     /// # Errors
-    ///
-    /// [`WriteError::TooLarge`] for a record past the slot (nothing is stored: the caller
-    /// carries less); the store's refusal.
+    /// [`WriteError::TooLarge`] for a record past the slot (nothing is stored: the caller carries less); the store's refusal.
     pub fn write<S: RegionStore + ?Sized>(
         &mut self,
         store: &S,
@@ -1420,16 +1127,10 @@ impl ControlWriter {
         Ok(seq)
     }
 
-    /// Give a fresh region (`to`, laid out by [`JournalWriter::create`]) the record the slot
-    /// of `from`, the region it replaces, holds: the memory shed's replacement
-    /// (`aterm-gui`'s `crash_restore`), before anything is told the fresh region exists, so
-    /// a crash restored from either one carries the same control state. The record is
-    /// copied as it is, under its own sequence number. Nothing when `from`'s slot is empty.
+    /// Give a fresh region (`to`, laid out by [`JournalWriter::create`]) the record the slot of `from`, the region it replaces, holds.
     ///
     /// # Errors
-    ///
-    /// The store's refusal, or [`WriteError::TooLarge`] for a slot `from`'s words say is
-    /// longer than the slot.
+    /// The store's refusal, or [`WriteError::TooLarge`] for a slot `from`'s words say is longer than the slot.
     pub fn carry_into<V: RegionView + ?Sized, S: RegionStore + ?Sized>(
         &mut self,
         from: &V,
@@ -1452,7 +1153,6 @@ impl ControlWriter {
     }
 
     /// The slot's write protocol (module doc): commit word 0, copy, length, commit word,
-    /// then the stale bytes past a shorter record zeroed.
     fn write_record<S: RegionStore + ?Sized>(
         &mut self,
         store: &S,
@@ -1466,7 +1166,6 @@ impl ControlWriter {
         }
         let early = self.planted(WriterFault::ControlPublishEarly);
         store.store_u64_release(OFF_CTL_COMMIT, if early { seq } else { 0 })?;
-        // The high-water mark before the copy, so a copy cut short still counts.
         let stale = self.high;
         self.high = stale.max(len);
         store.write(geometry.ctl_off(), record)?;

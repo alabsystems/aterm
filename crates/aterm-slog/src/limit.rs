@@ -276,7 +276,7 @@ impl MarkLimiter {
 
     /// The bucket of `slot`. A named slot is filled before it is spent
     /// from ([`Self::slot`] with `take`); an empty one reads as the overflow.
-    fn bucket(&mut self, slot: Slot) -> &mut Bucket {
+    const fn bucket(&mut self, slot: Slot) -> &mut Bucket {
         match slot {
             Slot::Harness => &mut self.harness,
             Slot::Bridge => &mut self.bridge,

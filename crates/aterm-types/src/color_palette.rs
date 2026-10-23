@@ -227,7 +227,7 @@ impl ColorPalette {
     /// Returns the number of customized (non-default) colors.
     #[inline]
     #[must_use]
-    pub fn overrides_count(&self) -> usize {
+    pub const fn overrides_count(&self) -> usize {
         self.overrides.len()
     }
 

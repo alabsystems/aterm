@@ -1,45 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE STATS DECK: the three bars, Global, aterm and Tab, drawn as pixel
-//! graphics under the titlebar (`docs/DESIGN-system-awareness-2026-10-16.md`
-//! §12.2; on by default since the owner's 2026-10-19 "make sure that this
-//! feature is enabled on BY DEFAULT so that I can SEE IT").
-//!
-//! The Deck is a band of the window's chrome headroom: [`deck_px`] device
-//! pixels added to `MetricsView::head` on a window with glass, so every
-//! geometry law that reads the headroom (the grid fit, the frame size, the
-//! pointer map, the effects box) counts it with no list of its own. A headless
-//! window never has one. Under macOS's titlebar it is the head's foot; where
-//! the strip is the window's band (Linux, Windows) it is the head's top, and
-//! the band keeps its whole height under it (`App::deck_rows_px`). It is
-//! painted from [`crate::widget::DrawPrim`]s through the shared tray
-//! rasterizer (`crate::stats_paint`), identical on the CPU and GPU paths and
-//! in `image` captures, into the window's
-//! paint-only stats card, which is folded under any other card
-//! (`App::fold_stats_deck`). The compact form, the sill
-//! (`crate::stats_sill`), takes the same card in the window's bottom pad and
-//! no terminal row; the lens (`crate::stats_lens`) is the close-up over
-//! either.
-//!
-//! What it draws, one grammar for tiles and bars (§12.1):
-//! * **Cores**: one square per core, grouped by cluster as the OS names them
-//!   (each cluster labelled with its initial over its count, the GPU tank
-//!   labelled the same way beside them), fill height and the load ramp for
-//!   the level, a dotted ghost at the 20 s average, a warm sliver and a notch
-//!   when rising, a pale band when falling, a warm halo round what is rising,
-//!   a crisp or feathered edge for steady or jittery.
-//! * **Bars**: per scope, each with its key swatch (the Global bar's is the
-//!   load ramp, aterm's and the tab's their scope inks, so the label is the
-//!   legend), CPU on one capacity scale (so Tab ≤ aterm ≤ Global reads as
-//!   geometry, with a capacity bracket that fills when the machine is
-//!   pinned), a two-minute sparkline, memory on one physical scale, the
-//!   figures in tabular type and the words in clauses that fold whole from the
-//!   end, never cut mid-word.
-//!
-//! Rich does not mean animated (§12.5, O34): nothing here schedules a frame.
-//! A new snapshot re-lays the prims; positions are whole device pixels, so a
-//! frame is presented only when a drawn pixel moves (`WindowState::deck_memo`).
+//! THE STATS DECK: the three bars, Global, aterm and Tab, drawn as pixel graphics under the titlebar (`docs/DESIGN-system-awareness-2026-10-16.md` §12.2; on by default since the owner's 2026-10-19 "make sure that this feature is enabled on BY DEFAULT so that I can SEE IT").
 
 use std::sync::Arc;
 
@@ -57,13 +19,10 @@ use crate::stats_plan::{
 use crate::type_scale::TypeStep;
 use crate::widget::{DrawPrim, TextFace, TextWeight, rgba, text_prim};
 
-/// The Folded deck's height in points (124 device px at 2×, 62 at 1×):
-/// two blocks of four rows (`docs/DESIGN-stats-deck-v2-2026-10-20.md` §2.1).
+/// The Folded deck's height in points (124 device px at 2×, 62 at 1×): two blocks of four rows (`docs/DESIGN-stats-deck-v2-2026-10-20.md` §2.1).
 pub(crate) const FOLDED_PT: f64 = 62.0;
 
-/// The Full table's height in points before what it adds to the Folded
-/// height is rounded up to whole terminal cells
-/// ([`crate::stats_plan::full_delta_px`], §2.1).
+/// The Full table's height in points before what it adds to the Folded height is rounded up to whole terminal cells ([`crate::stats_plan::full_delta_px`], §2.1).
 pub(crate) const FULL_TABLE_PT: f64 = 100.0;
 
 /// Which form the stats bars take (`[sys] stats_bars`).
@@ -71,8 +30,7 @@ pub(crate) const FULL_TABLE_PT: f64 = 100.0;
 pub(crate) enum StatsBars {
     /// The three bars at full size under the titlebar (the default).
     Deck,
-    /// The three bars as light lanes in the window's bottom pad: no terminal
-    /// row, ever (`crate::stats_sill`).
+    /// The three bars as light lanes in the window's bottom pad: no terminal row, ever (`crate::stats_sill`).
     Sill,
     /// No bars.
     Off,
@@ -83,7 +41,6 @@ impl StatsBars {
     pub(crate) const ALL: [Self; 3] = [Self::Deck, Self::Sill, Self::Off];
 
     /// Parse the config value: `"deck"` (default), `"sill"`, `"off"`.
-    /// Unknown values read as the default, so the bars stay visible.
     pub(crate) fn parse(value: Option<&str>) -> Self {
         match value.map(str::trim) {
             Some(v) if v.eq_ignore_ascii_case("off") || v.eq_ignore_ascii_case("false") => {
@@ -125,19 +82,13 @@ impl StatsBars {
         !matches!(self, Self::Off)
     }
 
-    /// Whether the form takes room from the grid: the Deck's band in the
-    /// head. A change across this line re-grids every window; the sill and
-    /// off take none, so a change between them only repaints (§12.2).
+    /// Whether the form takes room from the grid: the Deck's band in the head.
     pub(crate) const fn takes_room(self) -> bool {
         matches!(self, Self::Deck)
     }
 }
 
-/// The Deck's height in device pixels at `scale` in the window's form
-/// `deck`, or 0 when the Deck is not the stats bars' form (the sill and off
-/// take no headroom). Full is the Folded height plus Δ, whole cells of
-/// `cell_px` (the window's own cell height), so a change of form moves the
-/// grid by whole rows (§2.1).
+/// The Deck's height in device pixels at `scale` in the window's form `deck`, or 0 when the Deck is not the stats bars' form (the sill and off take no headroom).
 pub(crate) fn deck_px(form: StatsBars, deck: DeckForm, scale: f64, cell_px: usize) -> usize {
     if !(form.takes_room() && scale.is_finite() && scale > 0.0) {
         return 0;
@@ -149,13 +100,7 @@ pub(crate) fn deck_px(form: StatsBars, deck: DeckForm, scale: f64, cell_px: usiz
     }
 }
 
-/// An attached window's chrome headroom in device pixels: the titlebar band
-/// (`head_pts`, measured from AppKit or the synthetic strip band) plus the
-/// Deck in the window's form `deck` at its cell height `cell_px`. Every site
-/// that derives `MetricsView::head` for a window with glass goes through
-/// here ([`crate::App::deck_head_px`]), so the Deck is counted by the grid
-/// fit, the frame size and the pointer map alike; `head_pts` keeps only the
-/// titlebar's part.
+/// An attached window's chrome headroom in device pixels: the titlebar band (`head_pts`, measured from AppKit or the synthetic strip band) plus the Deck in the window's form `deck` at its cell height `cell_px`.
 pub(crate) fn chrome_head_px(
     head_pts: f64,
     scale: f64,
@@ -171,11 +116,7 @@ fn band_px(head_pts: f64, scale: f64) -> usize {
     (head_pts * scale).round().max(0.0) as usize
 }
 
-/// Headless stats seam (development only, [`aterm_types::dev_seam!`]):
-/// `$ATERM_STATS_DECK_HEADLESS=1` draws the bars on a window with no glass
-/// (the Deck when its headroom holds it, `$ATERM_HEADROOM_PX`; the sill in
-/// the bottom pad), so a lab instance's `image` shows them. Always off in a
-/// shipped binary. Parsed once.
+/// Headless stats seam (development only, [`aterm_types::dev_seam!`]): `$ATERM_STATS_DECK_HEADLESS=1` draws the bars on a window with no glass (the Deck when its headroom holds it, `$ATERM_HEADROOM_PX`; the sill in the bottom pad), so a lab instance's `image` shows them.
 pub(crate) fn deck_on_headless() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
@@ -184,9 +125,7 @@ pub(crate) fn deck_on_headless() -> bool {
     })
 }
 
-/// Whether `ws` draws the stats bars: a window with glass, or any window
-/// under the headless seam ([`deck_on_headless`]) or in a unit test that
-/// asks for it ([`tests::attach_stats`]).
+/// Whether `ws` draws the stats bars: a window with glass, or any window under the headless seam ([`deck_on_headless`]) or in a unit test that asks for it ([`tests::attach_stats`]).
 pub(crate) fn stats_drawn_on(ws: &crate::WindowState) -> bool {
     ws.os_window.is_some() || deck_on_headless() || tests_attached()
 }
@@ -207,11 +146,7 @@ const fn tests_attached() -> bool {
     false
 }
 
-/// The inks solved on a ground, its words and its accent
-/// ([`ink::vitals_inks`], a few microseconds to tens of them on a light
-/// ground), remembered for the last few grounds: every frame's fingerprint
-/// and every pointer event over the bars asks, and the grounds change only
-/// with the theme.
+/// The inks solved on a ground, its words and its accent ([`ink::vitals_inks`], a few microseconds to tens of them on a light ground), remembered for the last few grounds: every frame's fingerprint and every pointer event over the bars asks, and the grounds change only with the theme.
 pub(crate) fn cached_inks(ground: Rgb, value: Rgb, accent: Rgb) -> VitalsInks {
     type Key = (Rgb, Rgb, Rgb);
     thread_local! {
@@ -244,22 +179,7 @@ impl crate::App {
         self.config.stats_deck_size_or_default()
     }
 
-    /// Window `wid`'s chrome head in device pixels for a `head_pts` titlebar
-    /// band at `scale`: the band plus the Deck in the window's form, at the
-    /// window's own cell height ([`chrome_head_px`]).
-    ///
-    /// The form is re-decided here and nowhere else, from `frame_h_px`, the
-    /// window's frame height in device pixels: [`crate::stats_plan::deck_form_for`]
-    /// on the avail under the Folded deck, from the form the window had
-    /// (`docs/DESIGN-stats-deck-v2-2026-10-20.md` §2.2). The callers are the
-    /// window events that re-derive the head: the macOS resize, the synthetic
-    /// strip, the metrics refresh (a font change, a zoom, a reload) and the
-    /// attach, which passes the window's carried frame or, for a new window,
-    /// the frame it would have under the Folded deck. No reading reaches it,
-    /// so the deck's height never moves with data, and a change of form is a
-    /// change of head that the grid fit those events run next books as their
-    /// one re-grid. A frame of 0 keeps the form: a window not sized yet, and
-    /// the scale change, whose frame is still the old scale's.
+    /// Window `wid`'s chrome head in device pixels for a `head_pts` titlebar band at `scale`: the band plus the Deck in the window's form, at the window's own cell height ([`chrome_head_px`]).
     pub(crate) fn deck_head_px(
         &mut self,
         wid: crate::WindowId,
@@ -284,11 +204,7 @@ impl crate::App {
         chrome_head_px(head_pts, scale, form, deck, cell_px)
     }
 
-    /// The Deck's height in window `wid`'s head when it draws there
-    /// ([`Self::deck_frame`]'s Deck), in the window's own form and at its own
-    /// cell height, as the head sites count it ([`Self::deck_head_px`]): 0
-    /// under the sill or off, on a window that draws no bars, or one whose
-    /// head cannot hold it.
+    /// The Deck's height in window `wid`'s head when it draws there ([`Self::deck_frame`]'s Deck), in the window's own form and at its own cell height, as the head sites count it ([`Self::deck_head_px`]): 0 under the sill or off, on a window that draws no bars, or one whose head cannot hold it.
     pub(crate) fn deck_drawn_px(&self, wid: crate::WindowId) -> usize {
         let form = self.stats_bars_form();
         let Some(ws) = self.windows.get(&wid) else {
@@ -304,16 +220,7 @@ impl crate::App {
         }
     }
 
-    /// The Deck's rows in window `wid`'s frame, `[top, bottom)` device px,
-    /// while it draws in the head ([`Self::deck_drawn_px`]). Under macOS's
-    /// titlebar it ends where the grid's top pad starts. Where the strip is
-    /// the window's band (Linux, Windows), the band is the head's synthetic
-    /// part, the top pad and the strip's own rows, which the grid's first row
-    /// closes: the Deck takes the head's top, and the band keeps its whole
-    /// height under it ([`Self::strip_band_top_px`]), its cards, its `+` and
-    /// the window's buttons with it. Ending at the head there put the Deck
-    /// over the band's middle, where the band centres its cards (the lane's
-    /// `proof-20261019-174123`).
+    /// The Deck's rows in window `wid`'s frame, `top, bottom)` device px, while it draws in the head (`Self::deck_drawn_px`).
     pub(crate) fn deck_rows_px(&self, wid: crate::WindowId) -> Option<std::ops::Range<usize>> {
         let deck = self.deck_drawn_px(wid);
         if deck == 0 {
@@ -328,12 +235,7 @@ impl crate::App {
         Some(top..top + deck)
     }
 
-    /// Where window `wid`'s strip band starts above its first row, in device
-    /// px: the top pad and the head, less the Deck where the Deck takes the
-    /// head's top (the strip is the window's band: Linux, Windows; see
-    /// [`Self::deck_frame`]). The band's raster lifts its canvas by this and
-    /// centres its cards in what it spans, so the band keeps its height and
-    /// the Deck never covers it.
+    /// Where window `wid`'s strip band starts above its first row, in device px: the top pad and the head, less the Deck where the Deck takes the head's top (the strip is the window's band: Linux, Windows; see [`Self::deck_frame`]).
     pub(crate) fn strip_band_top_px(&self, wid: crate::WindowId) -> usize {
         let top = self.win_pad_top(wid) + self.win_head(wid);
         if crate::tab_bar::STRIP_IS_CHROME_BAND {
@@ -344,9 +246,7 @@ impl crate::App {
     }
 }
 
-/// Where a stats surface is drawn: its card's size in device pixels, the
-/// window's side pad (so the bars align with the grid), the scale and the
-/// chrome text size.
+/// Where a stats surface is drawn: its card's size in device pixels, the window's side pad (so the bars align with the grid), the scale and the chrome text size.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct DeckGeom {
     /// Card width (the frame's width).
@@ -361,8 +261,7 @@ pub(crate) struct DeckGeom {
     pub(crate) font_px: f32,
 }
 
-/// What a stats surface shows: the snapshot, which tab is this window's, and
-/// the inks solved for its ground.
+/// What a stats surface shows: the snapshot, which tab is this window's, and the inks solved for its ground.
 pub(crate) struct DeckInput<'a> {
     /// The latest snapshot, `None` before the first.
     pub(crate) snap: Option<&'a Snapshot>,
@@ -370,8 +269,7 @@ pub(crate) struct DeckInput<'a> {
     pub(crate) tab_key: Option<u64>,
     /// Its label, `Tab 2`.
     pub(crate) tab_label: String,
-    /// How many tabs this window holds (the sill draws the Tab lane at 2+;
-    /// the Deck says "the only tab" at 1).
+    /// How many tabs this window holds (the sill draws the Tab lane at 2+; the Deck says "the only tab" at 1).
     pub(crate) tab_count: usize,
     /// Inks for the ground.
     pub(crate) inks: VitalsInks,
@@ -379,10 +277,7 @@ pub(crate) struct DeckInput<'a> {
     pub(crate) dwc: bool,
     /// The instance's deviations, worst first (⊘ > ☠ > ◔ > ◇ > stopped).
     pub(crate) marks: Vec<StatsMark>,
-    /// The sill's plate behind each instrument, as an alpha, while the floor
-    /// is translucent (`background_opacity` under 1, or a wallpaper): 0.92,
-    /// or opaque under Reduce Transparency (§12.2 "Plate"). `None` on an
-    /// opaque floor and for the Deck, whose band is opaque.
+    /// The sill's plate behind each instrument, as an alpha, while the floor is translucent (`background_opacity` under 1, or a wallpaper): 0.92, or opaque under Reduce Transparency (§12.2 "Plate").
     pub(crate) plate: Option<u8>,
     /// The Deck's form for the window (Stats Deck v2 §2).
     pub(crate) form: DeckForm,
@@ -392,21 +287,14 @@ pub(crate) struct DeckInput<'a> {
     pub(crate) locale: Locale,
 }
 
-// THE HEAT TABLE (`docs/DESIGN-stats-deck-v2-2026-10-20.md` §3, §4, §6, §9,
-// §10, §11.1–§11.2): the rows' words are read once from the snapshot
-// ([`DeckWords`]), then laid on the planner's columns for the deck's width
-// and drawn in the deck's form.
-
 /// A glyph's ink above the baseline, per em: the box T-G4 checks.
 pub(crate) const ASCENT_EM: f64 = 0.76;
-/// A descender's depth below the baseline, per em (§3.1: "descent ≈ 2 pt"
-/// at 9.5 pt).
+/// A descender's depth below the baseline, per em (§3.1: "descent ≈ 2 pt" at 9.5 pt).
 pub(crate) const DESCENT_EM: f64 = 0.22;
 /// The header line's baseline, Full (§3.5) and Folded (§4.2).
 const HEADER_BASE_FULL: f64 = 11.5;
 const HEADER_BASE_FOLDED: f64 = 9.5;
 /// Where the header's hit region ends: Full's row 0 starts its hit at
-/// 16 − 1.5 (§11.1), Folded's at 12.5 (§11.2).
 const HEADER_HIT_FULL: f64 = 14.5;
 const HEADER_HIT_FOLDED: f64 = 12.5;
 /// Where the per-minute gridlines start (§3.1, §4.1).
@@ -419,13 +307,9 @@ const MARK_EM: f64 = 1.1;
 /// The gap between an amount and its state words (rule S).
 const STATE_GAP: f64 = 6.0;
 /// The strips' cell periods, seconds (§5.5): 60 × 10 s, 30 × 20 s and
-/// 20 × 30 s.
 const STRIP_PERIODS: [u32; 3] = [10, 20, 30];
 
-/// The chrome face's advances the deck measures with: the UI faces the
-/// rasterizer draws `TextFace::Ui` and `UiBold` in, or the pen's 0.6 em
-/// placeholder while none is installed (as in headless tests). Kept while
-/// the installed faces are the same ones.
+/// The chrome face's advances the deck measures with: the UI faces the rasterizer draws `TextFace::Ui` and `UiBold` in, or the pen's 0.6 em placeholder while none is installed (as in headless tests).
 pub(crate) fn deck_metrics() -> Arc<FaceMetrics> {
     type Held = (Option<Arc<Font>>, Option<Arc<Font>>, Arc<FaceMetrics>);
     thread_local! {
@@ -456,7 +340,6 @@ pub(crate) fn deck_metrics() -> Arc<FaceMetrics> {
 }
 
 /// A text and its advance at 1 pt in the deck's face, regular and bold:
-/// measured once, so fitting it at any size is arithmetic.
 #[derive(Clone, Debug, PartialEq)]
 struct Txt {
     s: String,
@@ -480,7 +363,6 @@ fn txts(forms: impl IntoIterator<Item = String>, m: &FaceMetrics) -> Vec<Txt> {
 }
 
 /// Rule F (§6.0): the first form whose advance fits `room`, else the last
-/// form cut with "…".
 fn fit(forms: &[Txt], room: f64, pt: f64, bold: bool, m: &FaceMetrics) -> String {
     if let Some(t) = forms.iter().find(|t| t.w(pt, bold) <= room + 0.01) {
         return t.s.clone();
@@ -491,7 +373,6 @@ fn fit(forms: &[Txt], room: f64, pt: f64, bold: bool, m: &FaceMetrics) -> String
 }
 
 /// The scope bar's segments as shares of the row's capacity (§6), each
-/// `0..=1`.
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct BarFill {
     /// The machine's; none on Tokens, which has no Global figure (§6.6).
@@ -505,7 +386,6 @@ struct BarFill {
 }
 
 /// A row's state for where Details is absent (rule S) and for the fslim
-/// header (§4.4).
 #[derive(Clone, Debug, PartialEq)]
 struct StateTxt {
     state: State,
@@ -550,13 +430,11 @@ struct RowWords {
     heat_now: Option<f32>,
     pct: Txt,
     /// The sentence in the strip's place (§6.2, §6.6), or "reading…": its
-    /// forms, longest first (rule F).
     strip_text: Option<Vec<Txt>>,
     /// The strip's columns at each of [`STRIP_PERIODS`].
     cols: [Vec<HeatCell>; 3],
     bar: Option<BarFill>,
     /// The amount's forms on each ladder: Det (with the compact forms that
-    /// repeat no Details figure after them), Cols, NoCols.
     amount: [Vec<Txt>; 3],
     state: Option<StateTxt>,
     scope: ScopeTxt,
@@ -572,8 +450,7 @@ struct CoreCluster {
     heat: Vec<Option<f32>>,
 }
 
-/// The deck's words for one snapshot: what every row says, measured in the
-/// deck's face. The layout reads them at any width.
+/// The deck's words for one snapshot: what every row says, measured in the deck's face.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct DeckWords {
     rows: Vec<RowWords>,
@@ -622,7 +499,6 @@ impl DeckWords {
     }
 
     /// Before the first snapshot: each row's name and "reading…" where its
-    /// strip goes.
     fn reading(m: &FaceMetrics) -> Self {
         let rows = Resource::ALL
             .iter()
@@ -673,8 +549,6 @@ impl RowWords {
         let forms = |ladder| words::amount_forms(res, &view, facts, ladder, loc);
         let mut det = forms(Ladder::Det);
         let cols = forms(Ladder::Cols);
-        // With Details showing the amount never repeats its freed figure,
-        // but keeps every shorter form to fall back on (§6.0).
         for f in &cols {
             if !f.contains("freed") && !det.contains(f) {
                 det.push(f.clone());
@@ -731,8 +605,6 @@ impl RowWords {
 }
 
 /// The scope bar's segments for `res` (§6): Global, aterm and Tab where
-/// the scopes count in the row's unit (CPU, Memory, Processes; Tokens
-/// without Global), the machine's alone where they do not.
 fn bar_fill(res: Resource, view: &ResourceView, snap: &Snapshot) -> Option<BarFill> {
     let cap = view.binding().capacity;
     let share = |fig: &ScopeFig| -> Option<f32> {
@@ -881,7 +753,6 @@ impl Table {
     }
 
     /// Row `r`'s hit band: its cell, and half the gap to each neighbour
-    /// (§11.1, §11.2).
     fn band(&self, r: u32) -> (f64, f64) {
         let gap = self.rows.pitch - self.rows.cell;
         let top = self.rows.top(r);
@@ -902,8 +773,7 @@ struct HeadState<'w> {
     full: String,
 }
 
-/// A state's ink: the mark's ink its words take in the deck's rows and the
-/// lens's answer line (§9.3).
+/// A state's ink: the mark's ink its words take in the deck's rows and the lens's answer line (§9.3).
 pub(crate) fn kind_ink(i: &VitalsInks, k: InkKind) -> Rgb {
     match k {
         InkKind::Words => i.words,
@@ -916,7 +786,6 @@ pub(crate) fn kind_ink(i: &VitalsInks, k: InkKind) -> Rgb {
 }
 
 /// A grid of core squares on whole device px: its origin, its pitch and a
-/// square's side.
 struct Lattice {
     x: f32,
     y: f32,
@@ -1055,7 +924,6 @@ impl<'a> Deck<'a> {
     }
 
     /// `s` at `(x, base)` in pt; answers its advance. `room` is the column
-    /// it belongs to.
     #[expect(
         clippy::too_many_arguments,
         reason = "a text run's place, size, weight, ink and column"
@@ -1118,7 +986,6 @@ impl<'a> Deck<'a> {
     }
 
     /// `[mark] text`: the mark at `x + 0.42 em`, the words after 1.1 em;
-    /// answers the advance.
     #[expect(
         clippy::too_many_arguments,
         reason = "a marked run's place, mark, size, weight, ink and column"
@@ -1149,8 +1016,6 @@ impl<'a> Deck<'a> {
         let seam = self.px(self.h_pt - 1.0);
         self.rect((0.0, seam, w, h - seam), 0.0, self.inks.seam);
     }
-
-    // -- strips -----------------------------------------------------------
 
     /// The over cap at 2× (§3.1): its height and its gap above the cell, px.
     fn cap_px(&self) -> Option<(f32, f32)> {
@@ -1188,8 +1053,6 @@ impl<'a> Deck<'a> {
         let radius = if self.s < 2.0 { 0.0 } else { 1.0 };
         let small = self.small_cells(strip, cell_h);
         let cap = self.cap_px();
-        // The columns end at now: a ring shorter than the strip leaves its
-        // oldest columns unread.
         let unread = n.saturating_sub(cols.len());
         for i in 0..n {
             let x = x0 + i as f32 * pitch;
@@ -1220,7 +1083,6 @@ impl<'a> Deck<'a> {
     }
 
     /// A column with no reading: a 1 px outline, or a 1 px tick along the
-    /// bottom of a cell under 4 × 4 px (§9.2).
     fn hollow_cell(&mut self, (x, y, w, h): Rect, radius: f32, small: bool) {
         let ink = self.inks.hollow;
         if small {
@@ -1239,7 +1101,6 @@ impl<'a> Deck<'a> {
     }
 
     /// The per-minute gridlines in the strip's inter-cell gaps from `y0` to
-    /// `y1`, broken over the rows in `holes` (§3.1).
     fn gridlines(&mut self, strip: &Strip, y0: f64, y1: f64, holes: &[(f64, f64)]) {
         if !self.draw {
             return;
@@ -1268,8 +1129,6 @@ impl<'a> Deck<'a> {
             }
         }
     }
-
-    // -- the scope bar ------------------------------------------------------
 
     /// The nested scope bar, Tab | aterm | Global from its left (§3.1, §9.4).
     fn bar(&mut self, col: Col, top: f64, h_pt: f64, fill: &BarFill) {
@@ -1348,10 +1207,7 @@ impl<'a> Deck<'a> {
         }
     }
 
-    // -- text cells -------------------------------------------------------
-
     /// The amount slot, saying the row's state where Details is absent
-    /// (rule S, §6.0).
     fn amount(&mut self, col: Col, base: f64, pt: f64, row: &RowWords, t: &Table) {
         let room = Some((col.x, col.end()));
         let words_ink = self.inks.words;
@@ -1365,7 +1221,6 @@ impl<'a> Deck<'a> {
         let mark = Some((st.mark, self.mark_ink(st.mark, st.ink)));
         let ink = self.ink(st.ink);
         let says: Vec<&Txt> = st.clauses.iter().chain(std::iter::once(&st.word)).collect();
-        // Tiers 1 and 2: the amount, then the clause or the word.
         for said in &says {
             for am in &st.amounts {
                 if am.w(pt, false) + STATE_GAP + madv + said.w(pt, true) <= col.w + 0.01 {
@@ -1376,8 +1231,6 @@ impl<'a> Deck<'a> {
                 }
             }
         }
-        // Tiers 3 and 4: the state alone, the word cut last. A mark never
-        // stands alone.
         let text = says
             .iter()
             .find(|said| madv + said.w(pt, true) <= col.w + 0.01)
@@ -1422,9 +1275,6 @@ impl<'a> Deck<'a> {
     }
 
     /// Details (rule D, §6.0): for each kept set, from every clause down to
-    /// the keep-only set, every clause long, then shortened one at a time
-    /// from the lowest priority up; the first arrangement that fits wins.
-    /// Else the keep clauses short, the last cut with "…".
     fn details(&mut self, col: Col, base: f64, clauses: &[ClauseTxt]) {
         let pt = SMALL_PT;
         let sep = Txt::new(" \u{b7} ", self.m);
@@ -1508,8 +1358,6 @@ impl<'a> Deck<'a> {
         }
     }
 
-    // -- rows ---------------------------------------------------------------
-
     /// One resource row of `t` at row `r` (§6, §11).
     fn row(&mut self, t: &Table, r: u32, row: &RowWords, reading: bool) {
         let rows = t.rows;
@@ -1535,8 +1383,6 @@ impl<'a> Deck<'a> {
                 let room = t.strip.end() - t.strip.x;
                 let text = fit(forms, room, SMALL_PT, false, self.m);
                 let ink = self.inks.words2;
-                // The sentence stands where the strip would, over the next
-                // row's strip: its descenders clear that row's caps.
                 let cap_room = self
                     .cap_px()
                     .map_or(0.0, |(h, gap)| f64::from(h + gap) / self.s);
@@ -1602,14 +1448,7 @@ impl<'a> Deck<'a> {
         self.hits_rows.push(Hit::row(rect, inst, Bar::Global));
     }
 
-    // -- cores --------------------------------------------------------------
-
     /// The lattice a grid of core squares `side` pt at `pitch` pt sits on
-    /// from `(x, y)` pt: a pitch of whole device px (rounded down, so the
-    /// grid never outgrows its plan) and a square at least 1 px under it.
-    /// Rounding each square's edges on its own would let a square at a
-    /// fractional pitch (2 pt at 2.5 pt, at 1×) touch the next, and the
-    /// squares would read as a bar.
     fn lattice(&self, x: f64, y: f64, pitch: f64, side: f64) -> Lattice {
         let step = (pitch * self.s).floor().max(2.0) as f32;
         Lattice {
@@ -1621,7 +1460,6 @@ impl<'a> Deck<'a> {
     }
 
     /// The core at column `col` and row `row` of `grid`; hollow when
-    /// unreadable. A square under 4 px has square corners.
     fn core(&mut self, grid: &Lattice, (col, row): (usize, usize), heat: Option<f32>, radius: f32) {
         if !self.draw {
             return;
@@ -1641,7 +1479,6 @@ impl<'a> Deck<'a> {
     }
 
     /// The cores block (wide, mid; §3.4): the title on the header line, then
-    /// each cluster's caption and squares.
     fn cores_block(&mut self, at: Col, top0: f64, words: &DeckWords) {
         let clusters = words.clusters();
         let room = Some((at.x, at.end()));
@@ -1684,7 +1521,6 @@ impl<'a> Deck<'a> {
     }
 
     /// A Cores row in `room` (§3.4, §4.5): per cluster its count and name,
-    /// then its squares in `mode`, or the count in words.
     fn cores_row(
         &mut self,
         room: Col,
@@ -1740,8 +1576,6 @@ impl<'a> Deck<'a> {
             x += w + 8.0;
         }
     }
-
-    // -- the header line ----------------------------------------------------
 
     /// A scope's swatch, a Panel on the baseline (§3.5).
     fn swatch(&mut self, x: f64, base: f64, bar: Bar) {
@@ -1845,7 +1679,6 @@ impl<'a> Deck<'a> {
     }
 
     /// One key item at `x` on the header line (rule K, §3.6): drawn the way
-    /// the strip beside it draws.
     fn key(&mut self, item: KeyItem, x: f64, base: f64, small: bool) {
         let words2 = self.inks.words2;
         let top = base - 7.0;
@@ -1921,8 +1754,6 @@ impl<'a> Deck<'a> {
             }
         }
     }
-
-    // -- the forms ----------------------------------------------------------
 
     /// The Full form (§3).
     fn full(&mut self, words: &DeckWords) {
@@ -2093,8 +1924,6 @@ impl<'a> Deck<'a> {
 }
 
 /// A Folded block's worst state for an fslim header (§4.4): the worst of
-/// its rows' states, a ◢ before a ● at one level (the well's order, §6),
-/// else the first among equals; "+N" for the other rows that have one.
 fn block_state<'w>(rows: &[&'w RowWords], x: f64) -> Option<HeadState<'w>> {
     let with: Vec<(&RowWords, &StateTxt)> = rows
         .iter()
@@ -2121,9 +1950,7 @@ fn block_state<'w>(rows: &[&'w RowWords], x: f64) -> Option<HeadState<'w>> {
     })
 }
 
-/// Lay the Deck out and paint it: Full or Folded, as the window's form
-/// says, on the planner's columns for its width. Pure: the same input gives
-/// the same prims, at whole device pixels.
+/// Lay the Deck out and paint it: Full or Folded, as the window's form says, on the planner's columns for its width.
 pub(crate) fn deck_paint(g: &DeckGeom, input: &DeckInput<'_>) -> (Vec<DrawPrim>, Vec<Hit>) {
     let m = deck_metrics();
     let words = DeckWords::new(input, &m);
@@ -2145,8 +1972,7 @@ pub(crate) struct Laid {
     pub(crate) head: Option<HeaderPlan>,
 }
 
-/// [`deck_paint`] on words already read and a face's metrics, recording
-/// every box; with `draw` false nothing is drawn (T-G4's sweep).
+/// [`deck_paint`] on words already read and a face's metrics, recording every box; with `draw` false nothing is drawn (T-G4's sweep).
 #[cfg(test)]
 pub(crate) fn lay(
     g: &DeckGeom,
@@ -2175,15 +2001,12 @@ pub(crate) fn deck_prims(g: &DeckGeom, input: &DeckInput<'_>) -> Vec<DrawPrim> {
 }
 
 /// A fingerprint of the prims, so an identical layout presents nothing.
-/// Every position is a whole device pixel, so the Debug text is stable.
 pub(crate) fn prims_fp(prims: &[DrawPrim]) -> u64 {
     let text = format!("{prims:?}");
     aterm_hash::fnv1a_64(text.as_bytes()) | 1
 }
 
-/// The stats card's inputs for a window, read off the App: which form, the
-/// card geometry and placement, the tab, the inks. `None` when the window
-/// shows no bars.
+/// The stats card's inputs for a window, read off the App: which form, the card geometry and placement, the tab, the inks.
 pub(crate) struct DeckFrame {
     pub(crate) form: StatsBars,
     /// The sill's plate alpha ([`DeckInput::plate`]).
@@ -2194,8 +2017,7 @@ pub(crate) struct DeckFrame {
     pub(crate) tab_label: String,
     pub(crate) tab_count: usize,
     pub(crate) inks: VitalsInks,
-    /// The lens's inks: always solved on the band ground (the lens sits in
-    /// band-ground wells over either form).
+    /// The lens's inks: always solved on the band ground (the lens sits in band-ground wells over either form).
     pub(crate) lens_inks: VitalsInks,
     pub(crate) dwc: bool,
     /// The window's Deck form (§2).
@@ -2205,8 +2027,7 @@ pub(crate) struct DeckFrame {
 }
 
 impl crate::App {
-    /// The window's frame height as the presenters compose it (the head, the
-    /// top pad, the rows and the strip, the bottom pad), in device px.
+    /// The window's frame height as the presenters compose it (the head, the top pad, the rows and the strip, the bottom pad), in device px.
     pub(crate) fn stats_frame_h(&self, wid: crate::WindowId) -> usize {
         let Some(ws) = self.windows.get(&wid) else {
             return 0;
@@ -2222,8 +2043,6 @@ impl crate::App {
 
     pub(crate) fn deck_frame(&self, wid: crate::WindowId) -> Option<DeckFrame> {
         let form = self.stats_bars_form();
-        // Off pays nothing: this runs on every frame's fingerprint and every
-        // pointer event.
         if form == StatsBars::Off {
             return None;
         }
@@ -2247,10 +2066,6 @@ impl crate::App {
         match form {
             StatsBars::Off => None,
             StatsBars::Deck => {
-                // The window's own form and cell height, as its head sites
-                // count them (`App::deck_head_px`), at the rows the head
-                // gives it (`App::deck_rows_px`), so the card, the lens and
-                // the hit map sit where the head put the Deck.
                 let rows = self.deck_rows_px(wid)?;
                 let (dy, deck) = (rows.start, rows.len());
                 Some(DeckFrame {
@@ -2280,9 +2095,6 @@ impl crate::App {
                     return None;
                 }
                 let frame_h = self.stats_frame_h(wid);
-                // The sill's plate is the terminal's own floor: its inks are
-                // solved on the background the pad is painted in (§12.2
-                // "Plate"), the front tab's own theme when it draws one.
                 let (floor, value, accent) = self.sill_floor(tab_key);
                 let translucent = self.config.background_opacity_or_default() < 1.0
                     || self.config.wallpaper.is_some();
@@ -2316,8 +2128,6 @@ impl crate::App {
     }
 
     /// The sill's floor, words and accent: the front tab's session's own
-    /// theme when it draws one (Choose Tab Theme, `theme session set`), else
-    /// the instance's.
     fn sill_floor(&self, tab_key: Option<u64>) -> (Rgb, Rgb, Rgb) {
         let rgb = |c: u32| [(c >> 16) as u8, (c >> 8) as u8, c as u8];
         let theme = self.theme;
@@ -2334,10 +2144,7 @@ impl crate::App {
         }
     }
 
-    /// The instance's attention marks for the bars, worst first, from the
-    /// stuck engine's view on the snapshot (design §11): empty while nothing
-    /// is stuck, quiet, waiting, parked or unreaped, and before the first
-    /// jobs pass.
+    /// The instance's attention marks for the bars, worst first, from the stuck engine's view on the snapshot (design §11): empty while nothing is stuck, quiet, waiting, parked or unreaped, and before the first jobs pass.
     pub(crate) fn stats_marks(&self) -> Vec<StatsMark> {
         self.vitals
             .snapshot
@@ -2358,8 +2165,7 @@ impl crate::App {
             .then_some((fx, fy - top))
     }
 
-    /// The instrument under the pointer on the stats card, from the hit
-    /// regions its last layout recorded.
+    /// The instrument under the pointer on the stats card, from the hit regions its last layout recorded.
     pub(crate) fn stats_hit_under_pointer(&self, wid: crate::WindowId) -> Option<Hit> {
         let (x, y) = self.stats_card_point(wid)?;
         let _ = self.stats_deck_fp(wid);
@@ -2371,7 +2177,6 @@ impl crate::App {
     }
 
     /// A cheap hash of everything the card's prims read: the snapshot's
-    /// sequence, the form, the geometry and placement, the tab and the inks.
     fn deck_input_key(&self, f: &DeckFrame) -> u64 {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -2389,15 +2194,11 @@ impl crate::App {
         f.deck.hash(&mut h);
         f.contrast.hash(&mut h);
         format!("{:?}", f.inks).hash(&mut h);
-        // The face the words are measured in: a new UI font re-lays them.
         Arc::as_ptr(&deck_metrics()).hash(&mut h);
-        // The marks come from the snapshot, whose sequence is hashed above.
         h.finish() | 1
     }
 
     /// The card's prims, laid out only when their inputs moved
-    /// (`WindowState::deck_memo` keeps the last input key and prims' print;
-    /// `WindowState::stats_hits` the hit regions).
     fn deck_layout(&self, wid: crate::WindowId, f: &DeckFrame, key: u64) -> Vec<DrawPrim> {
         let input = DeckInput {
             snap: self.vitals.snapshot.as_deref(),
@@ -2410,8 +2211,6 @@ impl crate::App {
             plate: f.plate,
             form: f.deck,
             contrast: f.contrast,
-            // A new snapshot re-lays the card each second, so the clock's
-            // zone is read again with it.
             locale: Locale {
                 platform: Platform::host(),
                 utc_offset_s: crate::presence::local_offset_s().unwrap_or(0),
@@ -2429,9 +2228,7 @@ impl crate::App {
         prims
     }
 
-    /// The stats card's fingerprint for `wid` (`0` when it shows none), the
-    /// `RepaintKey` term: whole-pixel prims, so a new snapshot that moves no
-    /// drawn pixel presents nothing. The open lens folds in.
+    /// The stats card's fingerprint for `wid` (`0` when it shows none), the `RepaintKey` term: whole-pixel prims, so a new snapshot that moves no drawn pixel presents nothing.
     pub(crate) fn stats_deck_fp(&self, wid: crate::WindowId) -> u64 {
         let lens = self.stats_lens_fp(wid);
         let Some(f) = self.deck_frame(wid) else {
@@ -2447,9 +2244,7 @@ impl crate::App {
         self.windows.get(&wid).map_or(0, |ws| ws.deck_memo.get().1) ^ lens
     }
 
-    /// Rasterize the stats card into `wid`'s paint-only `deck_card`,
-    /// re-rasterizing only when its prims or placement moved, and the lens
-    /// into its own card. `None` when it shows none.
+    /// Rasterize the stats card into `wid`'s paint-only `deck_card`, re-rasterizing only when its prims or placement moved, and the lens into its own card.
     pub(crate) fn splice_stats_deck(&mut self, wid: crate::WindowId) {
         self.splice_stats_lens(wid);
         let Some(f) = self.deck_frame(wid) else {
@@ -2477,7 +2272,6 @@ impl crate::App {
         if let Some(card) = ws.deck_card.as_mut()
             && card.fp == fp
         {
-            // New inputs, the same pixels: keep the raster.
             card.geom = key;
             return;
         }
@@ -2501,10 +2295,7 @@ impl crate::App {
         });
     }
 
-    /// Fold the stats card and the open lens under the card the window would
-    /// otherwise present (the backends take one tray surface), cached by the
-    /// cards' identities. Runs after every other card's splice in each paint
-    /// path.
+    /// Fold the stats card and the open lens under the card the window would otherwise present (the backends take one tray surface), cached by the cards' identities.
     pub(crate) fn fold_stats_deck(&mut self, wid: crate::WindowId) {
         use std::hash::{Hash, Hasher};
         let Some(ws) = self.windows.get_mut(&wid) else {
@@ -2516,7 +2307,6 @@ impl crate::App {
             .or(ws.settings_card.as_ref())
             .or(ws.badge_card.as_ref());
         if top.is_some_and(|t| t.scrim.is_some()) {
-            // A modal with a scrim covers the window, the bars with it.
             ws.deck_fold = None;
             return;
         }
@@ -2524,9 +2314,6 @@ impl crate::App {
             .into_iter()
             .flatten()
             .collect();
-        // The stats card alone, or another card alone, needs no fold: the
-        // presenters take it as it is (`WindowState::present_card`). An open
-        // lens always folds, since no presenter takes the lens card itself.
         if ws.lens_card.is_none() && (cards.len() < 2 || ws.deck_card.is_none()) {
             ws.deck_fold = None;
             return;
@@ -2583,10 +2370,6 @@ impl crate::App {
 const A11Y_TITLE: &str = "Stats deck, last 10 minutes";
 
 /// A share (1 is 100 %) as a meter's value: a whole percent, as the % column
-/// prints it, never past 100 (the over mark and the words carry the
-/// excess); `None` when unknown. A share above 0 that the column prints as
-/// "<1%" keeps a tenth of a percent, at least 0.1, so the value is not 0
-/// beside words that say "less than 1 percent".
 #[cfg(a11y_tree)]
 fn meter_pct(share: Option<f32>) -> Option<f32> {
     share.filter(|v| v.is_finite()).map(|v| {
@@ -2599,14 +2382,7 @@ fn meter_pct(share: Option<f32>) -> Option<f32> {
     })
 }
 
-/// The deck as a reader meets it (Stats Deck v2 §12, whose
-/// `stats_a11y_groups` this is, one group now): a group named
-/// [`A11Y_TITLE`] holding one meter a resource in row order, each valued at
-/// its % of max (none when unknown) and described by its row's sentence
-/// (`words::row_sentence`, what ⌘C in the lens copies), and a group of one
-/// meter a core named by its cluster ("Super core 1"). Before the first
-/// snapshot every row says it is reading. Pure, so a test reads it without
-/// an App.
+/// The deck as a reader meets it (Stats Deck v2 §12, whose `stats_a11y_groups` this is, one group now): a group named [`A11Y_TITLE`] holding one meter a resource in row order, each valued at its % of max (none when unknown) and described by its row's sentence (`words::row_sentence`, what ⌘C in the lens copies), and a group of one meter a core named by its cluster ("Super core 1").
 #[cfg(a11y_tree)]
 pub(crate) fn stats_a11y_group(
     snap: Option<&Snapshot>,
@@ -2682,8 +2458,6 @@ impl crate::App {
             .map(|(lg, lens, laid)| crate::a11y_tree::StatsLens {
                 keys: lens.how != crate::stats_lens::Opened::Hover,
                 name: laid.title,
-                // How to read is read whole: the grammar its sections draw
-                // in pieces (§12).
                 explainer: if lens.focus == Instrument::HowToRead {
                     crate::stats_lens::how_to_read_words(loc.platform)
                 } else {
@@ -2714,7 +2488,6 @@ pub(crate) mod tests {
     };
 
     /// Gives this test thread's windows the stats bars, as glass gives a
-    /// real window ([`stats_drawn_on`]), until the guard drops.
     #[must_use]
     pub(crate) fn attach_stats() -> Attached {
         TESTS_ATTACHED.with(|c| c.set(true));
@@ -2731,10 +2504,6 @@ pub(crate) mod tests {
     }
 
     /// Only the Deck takes room: the head the grid fit reads is the same for
-    /// the sill and off, so the config apply's re-grid predicate agrees with
-    /// the head for every pair of forms, and a sill ↔ off change re-grids
-    /// nothing. The Deck's own form moves the head only while the Deck takes
-    /// room, and then by whole cells (T-G5, T-G6).
     #[test]
     fn only_a_change_into_or_out_of_the_deck_moves_the_head() {
         const CELL: usize = 28;
@@ -2763,18 +2532,6 @@ pub(crate) mod tests {
     }
 
     /// T-G6: the head sites and `deck_frame` agree. Every site that derives
-    /// an attached window's head (the macOS resize, the synthetic strip, the
-    /// scale change, the metrics refresh and the attach) takes it from
-    /// `App::deck_head_px`; the card, the lens and the hit map take the Deck
-    /// from `deck_frame`. For one window in either form, at 1× and 2× and
-    /// cells of 10 to 40 px, both give the same Deck beside the same band:
-    /// under it on macOS, where the grid starts where the card ends; at the
-    /// head's top where the strip is the window's band (Linux, Windows),
-    /// where the band follows the card and the grid follows the band
-    /// (`App::deck_rows_px`). A change of form moves the head
-    /// by whole cells, so every frame on the whole-cell resize lattice fits
-    /// the grid with the same remainder in either form: the lattice has no
-    /// slack.
     #[test]
     fn head_sites_agree() {
         use aterm_window::dpi::PhysicalSize;
@@ -2795,7 +2552,6 @@ pub(crate) mod tests {
                 let (_, ch) = app.win_cell_size(wid);
                 cells.insert(ch);
                 let at = format!("{ch} px cells at {scale}×");
-                // One frame under the auto band's floor, one over its ceiling.
                 let mut heads = Vec::new();
                 for (avail, want) in [(700.0, DeckForm::Folded), (900.0, DeckForm::Full)] {
                     let frame = band + (FOLDED_PT * scale) as usize + (avail * scale) as usize;
@@ -2805,8 +2561,6 @@ pub(crate) mod tests {
                     ws.metrics.head = head;
                     app.backend.set_head(head);
                     let f = app.deck_frame(wid).expect("the Deck shows");
-                    // Where the band sits above the card (macOS) and below
-                    // it (the band platforms).
                     let (above, below) = if crate::tab_bar::STRIP_IS_CHROME_BAND {
                         (0, band)
                     } else {
@@ -2825,8 +2579,6 @@ pub(crate) mod tests {
                         "the grid starts under the card and the band, {at}"
                     );
                     if crate::tab_bar::STRIP_IS_CHROME_BAND {
-                        // The band lifts its canvas over the top pad and its
-                        // own height only: it spans what the card leaves.
                         assert_eq!(
                             app.strip_band_top_px(wid),
                             app.win_pad_top(wid) + band,
@@ -2859,14 +2611,12 @@ pub(crate) mod tests {
             }
         }
         assert!(
-            // DejaVu Sans Mono's 8 px line (the Linux lane's) is 11 px.
             cells.first().is_some_and(|c| *c <= 12) && cells.last().is_some_and(|c| *c >= 40),
             "the cells span 12 to 40 px: {cells:?}"
         );
     }
 
     /// The setting forces the form on every window event and never moves it
-    /// otherwise; a frame not sized yet keeps it.
     #[test]
     fn the_deck_size_setting_forces_the_form() {
         let mut app = crate::App::headless_for_test();
@@ -2897,11 +2647,6 @@ pub(crate) mod tests {
     }
 
     /// §2.3: a restored window decides its form from the frame it carries.
-    /// A Full window whose avail sits in the hysteresis band (850 to 870 pt
-    /// under the Folded deck, Full only because it was) comes back Full at
-    /// its own size; a Folded one in the same band stays Folded at its size;
-    /// a new window of the Full one's grid decides Folded, from the frame
-    /// that grid has under the Folded deck.
     #[test]
     fn a_restored_window_keeps_its_form_and_size() {
         use aterm_window::dpi::PhysicalSize;
@@ -2917,7 +2662,6 @@ pub(crate) mod tests {
         let (_, cell) = app.win_cell_size(wid);
         let cols = 80;
         let form = |app: &crate::App| app.windows[&wid].deck_form;
-        // The frame of `rows` under `deck`, and that frame's avail.
         let frame_in = |app: &mut crate::App, deck: DeckForm, rows: u16| {
             app.windows.get_mut(&wid).expect("the window").deck_form = deck;
             let head = app.deck_head_px(wid, band_pts, scale, 0);
@@ -2930,8 +2674,6 @@ pub(crate) mod tests {
             );
             (frame, avail)
         };
-        // Attach `rows` at `carried` as the attach does, and the size it
-        // takes.
         let attach = |app: &mut crate::App, rows: u16, carried: Option<PhysicalSize<u32>>| {
             app.windows.get_mut(&wid).expect("the window").deck_form = DeckForm::Folded;
             let head = app.attach_deck_head(wid, band_pts, scale, (rows, cols), carried);
@@ -2969,8 +2711,6 @@ pub(crate) mod tests {
     }
 
     /// A snapshot after three readings: ten cores in two clusters, memory, a
-    /// GPU, a volume, aterm with one tab running claude. Shared with the
-    /// sill's and the lens's tests.
     pub(crate) fn snapshot() -> Snapshot {
         let mut v = aterm_vitals::Vitals::new();
         let tabs = vec![TabRoot {
@@ -3076,19 +2816,8 @@ pub(crate) mod tests {
     }
 
     /// T-V9 on every built-in theme's band (Stats Deck v2 §9.4): the inks
-    /// solved on the band ground, with the band's words and accent as
-    /// [`DeckFrame`] solves them, hold every Deck floor the ground leaves in
-    /// reach. The floors a band's ground puts out of reach are pinned with
-    /// the least its inks (the best the range allows) may measure against
-    /// them, so a theme that newly misses a floor, or misses one by more,
-    /// fails by name, and so does a pin whose floor now holds.
     #[test]
     fn deck_inks_hold_on_every_built_in_band() {
-        // The Increase Contrast ramp's step spacing, under HEAT_DL's 0.05 on
-        // bands lighter than the default: (theme, floor, the least measured).
-        // Those grounds are the theme blends macOS and Windows lay; Linux lays
-        // every dark band on the CSD headerbar's #303030
-        // (`chrome_band::PLATFORM_BAR_BASE`), where each floor holds.
         let blends = matches!(
             crate::chrome_band::PLATFORM_BAR_BASE,
             aterm_messages::ink::BarBase::Blend
@@ -3168,11 +2897,6 @@ pub(crate) mod tests {
     };
 
     /// Where the Deck sits in the head: under macOS's titlebar at the head's
-    /// foot, as it always has; where the strip is the window's band (Linux,
-    /// Windows) at the head's top, with the band's lift less the Deck so the
-    /// band keeps its whole height under it (the Linux lane's
-    /// `proof-20261019-174123` found it over the band's middle). The Linux
-    /// arm is held live by the lane's Deck rows (`lab linux deck`).
     #[cfg(unix)]
     #[test]
     fn the_deck_takes_the_heads_foot_under_a_titlebar_and_its_top_over_a_band() {
@@ -3207,8 +2931,6 @@ pub(crate) mod tests {
             f.dy as usize, rows.start,
             "the card is drawn where its rows are"
         );
-        // A head that cannot hold it, and the Deck off: no rows, and the band
-        // lifted by the whole head.
         app.windows.get_mut(&wid).expect("window").metrics.head = deck - 1;
         app.backend.set_head(deck - 1);
         assert_eq!(app.deck_rows_px(wid), None);
@@ -3224,10 +2946,6 @@ pub(crate) mod tests {
     }
 
     /// A point over the Deck is not a strip column, though a point above the
-    /// grid clamps onto the strip's row: a press there is the Deck's
-    /// (`App::stats_press`), and a pointer resting on it lights no tab and
-    /// steps no strip drag. The same point with the Deck off is the strip's,
-    /// so the exclusion is what answers `None`.
     #[cfg(unix)]
     #[test]
     fn a_point_over_the_deck_is_no_strip_column() {
@@ -3296,7 +3014,6 @@ pub(crate) mod tests {
     }
 
     /// Before the first snapshot each row names itself and says "reading…"
-    /// where its strip goes, and nothing is a hit yet.
     #[test]
     fn before_the_first_snapshot_the_deck_says_it_is_reading() {
         let empty = Snapshot::default();
@@ -3322,8 +3039,6 @@ pub(crate) mod tests {
     }
 
     /// The header's scope labels carry their inks as swatches (§3.5): the
-    /// machine's, aterm's and the tab's, so a newcomer reads which ink is
-    /// whose without a legend.
     #[test]
     fn every_bar_label_carries_its_ink_as_a_key() {
         let snap = snapshot();
@@ -3346,8 +3061,6 @@ pub(crate) mod tests {
     }
 
     /// A meter's value is the share as a whole percent up to 100, but a
-    /// share above 0 that the % column prints as "<1%" keeps a tenth, so it
-    /// is not 0 beside words that say "less than 1 percent".
     #[cfg(a11y_tree)]
     #[test]
     fn a_meter_under_half_a_percent_is_not_zero() {
@@ -3363,12 +3076,6 @@ pub(crate) mod tests {
     }
 
     /// T-G12 (Stats Deck v2 §12): the deck reads as one group of seven
-    /// meters in row order, each valued at its % of max (no value when
-    /// unknown) and described by its row's sentence, then a group of one
-    /// meter a core named by its cluster. Before the first snapshot every
-    /// row says it is reading, and a row with no reading says so. The
-    /// lens's wells and How to read are read through the App
-    /// (`stats_lens::behaviour_tests::the_tree_reads_the_deck_and_its_lens`).
     #[cfg(a11y_tree)]
     #[test]
     fn a11y_meters() {
@@ -3397,12 +3104,9 @@ pub(crate) mod tests {
                 "Processes"
             ]
         );
-        // Each meter says its row's sentence: what ⌘C copies.
         for (m, &res) in g.meters.iter().zip(&Resource::ALL) {
             assert_eq!(m.words, words::row_sentence(res, &calm, Some(FRONT), &MAC));
         }
-        // CPU: the %, the amount, the scopes, the trend, then every Details
-        // clause.
         assert_eq!(g.meters[0].value, Some(98.0));
         assert_eq!(
             g.meters[0].words,
@@ -3410,8 +3114,6 @@ pub(crate) mod tests {
              Rose from about 49 percent. Over capacity 6 of the last 10 minutes. 8 waiting for \
              a core, load 25.7 on 18 cores. Busiest rustc, 9 processes in Tab 3, 5.9 cores."
         );
-        // The cores: one meter a core, named by its cluster, apart and
-        // stably (only the values move).
         assert_eq!(g.cores_name, "18 CPU cores");
         assert_eq!(g.cores.len(), 18);
         assert_eq!(g.cores[0].name, "Super core 1");
@@ -3428,7 +3130,6 @@ pub(crate) mod tests {
             format!("{:.0} percent busy", g.cores[7].value.unwrap())
         );
 
-        // Disk in trouble.
         let disk = meter(&scene(Scene::Trouble), Resource::Disk);
         assert_eq!(disk.value, Some(98.0));
         assert_eq!(
@@ -3440,7 +3141,6 @@ pub(crate) mod tests {
              last 10 minutes. Most in ~/aterm/target, 212 gigabytes."
         );
 
-        // Network learning its peak on the link's rate, an hour read.
         let mut first = scene(Scene::FirstRun);
         first.facts.net_read_s = 3_600;
         let net = meter(&first, Resource::Network);
@@ -3453,8 +3153,6 @@ pub(crate) mod tests {
              megabytes per second."
         );
 
-        // Tokens learning aterm's peak, no plan read, no agent in the tab:
-        // no value, since there is no maximum yet.
         let no_agent = ScopeFig {
             now: None,
             missing: Some(NoFigure::NoAgent),
@@ -3469,14 +3167,11 @@ pub(crate) mod tests {
              per minute, cache re-reads included. Plan limit not read."
         );
 
-        // A row with no reading has no value and says so.
         let mut unread = scene(Scene::Calm);
         unread.resources[Resource::Gpu.index()] = ResourceView::default();
         let gpu = meter(&unread, Resource::Gpu);
         assert_eq!((gpu.value, gpu.words.as_str()), (None, "GPU: not read."));
 
-        // Before the first snapshot every row is reading and no core is
-        // named.
         let reading = stats_a11y_group(None, Some(FRONT), &MAC);
         for (m, &res) in reading.meters.iter().zip(&Resource::ALL) {
             assert_eq!(m.value, None, "{m:?}");

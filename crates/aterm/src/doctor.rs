@@ -378,18 +378,136 @@ fn unmeasured(id: &str, family: &str, layer: Option<Layer>, why: String) -> Item
 
 /// The base items `aterm init` runs before its workstation items (design §4.2, S5): the
 /// same repair items, the doctor's pass (an opted-out rc stays as the person left it),
-/// and `base.clt` over atpkg's C toolchain probe (S6).
+/// `base.ai.accounts`, and `base.clt` over atpkg's C toolchain probe (S6).
 #[cfg(target_os = "macos")]
 pub(crate) fn init_base(applies: bool) -> aterm_machines::init::Base {
-    let base = match atpkg::store::resolve_configured() {
+    let mut base = match atpkg::store::resolve_configured() {
         Some(layout) => {
             init_base_over(&Arc::new(Ground::of_process(layout, Pass::Doctor)), applies)
         }
         None => aterm_machines::init::Base::none(),
     };
+    base.items.push(Box::new(AiAccountsItem));
     aterm_machines::init::Base {
         clt: command_line_tools(),
         ..base
+    }
+}
+
+/// `base.ai.accounts`: converges `accounts.toml` and `fleet-accounts.toml`
+/// during `aterm init` when a fleet accounts source is configured or discoverable.
+#[cfg(target_os = "macos")]
+struct AiAccountsItem;
+
+#[cfg(target_os = "macos")]
+impl Item for AiAccountsItem {
+    fn id(&self) -> String {
+        "base.ai.accounts".to_owned()
+    }
+
+    fn family(&self) -> &'static str {
+        "accounts"
+    }
+
+    fn layer(&self) -> Layer {
+        Layer::Base
+    }
+
+    fn class(&self) -> aterm_converge::Class {
+        aterm_converge::Class::Preference
+    }
+
+    fn title(&self) -> String {
+        "AI CLI account rotation".to_owned()
+    }
+
+    fn probe(&self) -> aterm_converge::Probe {
+        use aterm_agent::harness::{
+            accounts,
+            accounts_sync::{FLEET_ROSTER_FILE, has_init_accounts_source},
+            cli::Env,
+        };
+        use aterm_converge::Probe;
+        let Ok(env) = Env::from_process() else {
+            return Probe::NotApplicable {
+                why: "no user home directory is configured".to_owned(),
+            };
+        };
+        let Some(home) = env.home.as_deref() else {
+            return Probe::NotApplicable {
+                why: "no user home directory is configured".to_owned(),
+            };
+        };
+        let Some(roster_path) = env.accounts_roster() else {
+            return Probe::NotApplicable {
+                why: "no config directory is configured".to_owned(),
+            };
+        };
+        let store = env.accounts_store();
+        let fleet_path = roster_path
+            .parent()
+            .map(|p| p.join(FLEET_ROSTER_FILE))
+            .unwrap_or_default();
+        if let Ok(raw) = accounts::Roster::load(&roster_path)
+            && !raw.rows.is_empty()
+            && fleet_path.is_file()
+        {
+            let bound = store.bound(&raw, env.now).unwrap_or(raw);
+            let enrolled = accounts::enrolled(&bound);
+            let ready = bound
+                .rows
+                .iter()
+                .filter(|r| r.dir.is_none() || enrolled.contains(&r.label))
+                .count();
+            let state = store.load(env.now).map(|(s, _)| s).unwrap_or_default();
+            let own_label = bound.row_for_login(None).map(|r| r.label.as_str());
+            let next_hint = accounts::sign_in_next(&bound, &state, &enrolled, own_label, env.now)
+                .filter(|(_, has_email)| *has_email && ready < bound.rows.len())
+                .map(|(label, _)| format!("; next: `aterm harness accounts renew {label}`"))
+                .unwrap_or_default();
+            return Probe::Ok {
+                now: format!(
+                    "{} accounts synced ({ready} enrolled{next_hint})",
+                    bound.rows.len()
+                ),
+            };
+        }
+        if !has_init_accounts_source(home, &env.state, &roster_path, env.now) {
+            return Probe::NotApplicable {
+                why: "no fleet accounts source is configured".to_owned(),
+            };
+        }
+        Probe::Change {
+            from: "absent".to_owned(),
+            to: "accounts.toml + fleet-accounts.toml synced".to_owned(),
+        }
+    }
+
+    fn apply(&self) -> Result<(), String> {
+        use aterm_agent::harness::{accounts_sync::sync_accounts_for_init, cli::Env};
+        let env = Env::from_process()?;
+        let home = env
+            .home
+            .as_deref()
+            .ok_or_else(|| "no user home directory".to_owned())?;
+        let roster_path = env
+            .accounts_roster()
+            .ok_or_else(|| "no config directory".to_owned())?;
+        sync_accounts_for_init(home, &env.state, &roster_path, env.now).map(|_| ())
+    }
+
+    fn explain(&self, probe: &aterm_converge::Probe) -> aterm_converge::Explain {
+        use aterm_converge::{Explain, Probe, Remedy};
+        let why = match probe {
+            Probe::Ok { now } => now.clone(),
+            _ => "AI CLI account rotation roster (`accounts.toml`) is not synced yet".to_owned(),
+        };
+        Explain {
+            why,
+            remedy: Remedy::Init {
+                only: "base.ai.accounts".to_owned(),
+            },
+        }
     }
 }
 

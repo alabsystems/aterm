@@ -1,29 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The production GitHub-Releases [`Fetcher`](crate::flow::Fetcher) (§5/§9): the network impl
-//! the install flow ([`crate::flow`]) runs against a real repo.
-//!
-//! One transport: every byte (the index and its roster, each `pkg-*.toml`, every artifact)
-//! comes from the release download host,
-//! `https://github.com/<owner>/<repo>/releases/download/<tag>/<name>`, anonymously; no
-//! `api.github.com` request is made. The download host is unmetered, while the API's anonymous
-//! budget (sixty requests an hour per IP) is shared by every machine behind one address.
-//! Authenticity comes from signatures, never the transport (§8), and the bytes reach the
-//! verifier raw, before any parse.
-//!
-//! Every URL is derived, not discovered:
-//!
-//! * the newest index is found by HEADs of its tags ([`newest_index`]), relying on the
-//!   publisher's guarantee that index builds are contiguous (`atpkg-publish index` refuses an
-//!   `index_build` that is not its baseline's plus one);
-//! * a program's build is named by the signed index's pin, and the tag convention
-//!   (`atpkg-<program>-<build>`) names its manifest and artifact.
-//!
-//! The index lives on `<owner>/aterm` ([`crate::discovery::index_repo`]); each program's
-//! `pkg-*.toml` and artifacts on its own repo (`repo`, §4.2). Every fetch is anonymous, so a
-//! repointed account (`[packages].account`) or a `[packages.links]` fetch override must be
-//! publicly readable.
+//! The production GitHub-Releases [`Fetcher`](crate::flow::Fetcher) (§5/§9).
 
 use std::path::{Path, PathBuf};
 
@@ -31,19 +9,12 @@ use crate::flow::VendorFetchError;
 use crate::select::Candidate;
 
 /// The download URL for asset `name` of release `tag` in `slug` (`owner/repo`), or `None` if
-/// the slug is not exactly one `owner/repo` pair or any segment is not path-safe.
-///
-/// Delegates to [`aterm_update_core::cdn::release_download_url`], the builder the app updater
-/// uses too, so the convention has one spelling. Strict because these URLs are synthesized: a
-/// slash, `..`, empty half or scheme in a slug or tag would otherwise splice into a URL
-/// pointing elsewhere.
 fn web_asset_url(slug: &str, tag: &str, name: &str) -> Option<String> {
     let (owner, repo) = slug.split_once('/')?;
     aterm_update_core::cdn::release_download_url(owner, repo, tag, name)
 }
 
 /// The one way this fetcher reads bytes from the release download host. Neither it nor the
-/// transport takes a credential, so no token can reach `github.com`; an API URL is refused.
 fn web_fetch_bytes(url: &str, cap: u64) -> Result<Vec<u8>, String> {
     refuse_api_host(url)?;
     aterm_update_core::download_bytes(url, cap)
@@ -66,7 +37,6 @@ fn refuse_api_host(url: &str) -> Result<(), String> {
 }
 
 /// Why no download URL follows for `what` from `slug`: the slug, a program or asset name,
-/// or a tag is not path-safe, or an asset name carries no build number. Nothing is fetched.
 fn underivable(slug: &str, what: &str) -> String {
     let mut msg = String::from("no release download URL derives for ");
     msg.push_str(what);
@@ -76,8 +46,6 @@ fn underivable(slug: &str, what: &str) -> String {
 }
 
 /// The `(pkg-<program>-<build>.toml, .sig)` download URLs for a build the signed index pins,
-/// on the `atpkg-<program>-<build>` release. `None` when the slug or program name is not
-/// URL-safe.
 fn direct_manifest_urls(slug: &str, program: &str, build: u64) -> Option<(String, String)> {
     if program.is_empty()
         || !program
@@ -103,15 +71,7 @@ fn direct_manifest_urls(slug: &str, program: &str, build: u64) -> Option<(String
 }
 
 /// The download URL for a release asset whose name carries its build (`ty-2973.tar.zst` and
-/// `ty-2973-x86_64-unknown-linux-gnu.tar.zst` both live under tag `atpkg-ty-2973`). `None` when
-/// the name has no extension, no build number, or is not URL-safe.
-///
-/// The tag is the name's build-qualified prefix, not its whole stem: only the
-/// `aarch64-apple-darwin` asset is `<prog>-<build>.tar.zst`, every other triple
-/// `<prog>-<build>-<triple>.tar.zst` on the same release. The build number is the anchor: the
-/// first all-digit `-` segment, which no program name or target triple has.
 fn direct_asset_url(slug: &str, asset: &str) -> Option<String> {
-    // Strip the full extension: `Path::file_stem` would leave `ty-2973.tar`.
     let stem = asset.split_once('.')?.0;
     if stem.is_empty()
         || !stem
@@ -120,9 +80,6 @@ fn direct_asset_url(slug: &str, asset: &str) -> Option<String> {
     {
         return None;
     }
-    // `<prog>-<build>`: the stem truncated after its first all-digit segment, dropping any
-    // `-<triple>` suffix. The stem is ASCII by the check above, so the index is a char
-    // boundary. A name with no build number derives nothing.
     let mut end = None;
     let mut pos = 0usize;
     for seg in stem.split('-') {
@@ -138,23 +95,12 @@ fn direct_asset_url(slug: &str, asset: &str) -> Option<String> {
     web_asset_url(slug, &tag, asset)
 }
 
-/// Byte caps bounding what an attacker-controlled asset can write: a manifest is a few KB, an
-/// artifact up to a multi-GB toolchain bundle. Public: the producer reads index and manifest
-/// files under the same cap, so it never accepts one a client would refuse.
-pub const MANIFEST_CAP: u64 = 5_000_000; // 5 MB
-pub const SIG_CAP: u64 = 4_096; // an Ed25519 detached sig is 64 bytes; cap generously
-const ARTIFACT_CAP: u64 = 8u64 << 30; // 8 GiB ceiling for a toolchain bundle
+/// Byte caps bounding what an attacker-controlled asset can write.
+pub const MANIFEST_CAP: u64 = 5_000_000;
+pub const SIG_CAP: u64 = 4_096;
+const ARTIFACT_CAP: u64 = 8u64 << 30;
 
 /// The byte cap for one artifact transfer: the row's signed `size`, clamped by
-/// [`ARTIFACT_CAP`].
-///
-/// The disk preflight (`flow`'s `disk_gate(size + disk_installed)`) runs once, before the
-/// transfer, from that same signed number, and the sha256 gate sees the file only when it is
-/// whole, so the cap is all that bounds the bytes while they land; the ceiling alone would let
-/// a substituted asset write through the free-space floor (§9: caps from the signed manifest).
-///
-/// `0` keeps the ceiling: [`crate::vendor::check_row`] requires `size > 0` only for `https`
-/// rows, so an older `github-release` row may state none.
 fn artifact_cap(size: u64) -> u64 {
     if size == 0 || size > ARTIFACT_CAP {
         ARTIFACT_CAP
@@ -163,55 +109,28 @@ fn artifact_cap(size: u64) -> u64 {
     }
 }
 
-/// A roster is a few hundred bytes per machine and at most 16 machines; `aterm-update` uses the
-/// same ceiling for the same asset.
-/// Public, like [`MANIFEST_CAP`]: the producer's anonymous head read takes the same bound.
+/// A roster is a few hundred bytes per machine and at most 16 machines; `aterm-update` uses the same ceiling for the same asset.
 pub const ROSTER_CAP: u64 = 65_536;
 
 /// How many index releases one resolve fetches the signed quad for, newest first, never below
-/// the lowest build the walk knows is published (the store's verified floor).
-///
-/// Selection takes the highest signed `index_build` in the newest admitted roster generation,
-/// so the others are fallbacks for a newest index that fails verification or is still
-/// uploading; in the steady state the newest is the floor and one quad is fetched. Stays below
-/// the §14 cache's candidate cap (`cache::MAX_CACHE_CANDIDATES`, 24) with room for the cached
-/// index that serves beside a full set.
 const INDEX_CANDIDATE_CAP: u64 = 4;
 
 /// The most HEADs one index discovery's walk asks ([`WALK_AHEAD_BUDGET`] bounds the ones asked
-/// ahead of it). The walk needs two in the steady state, three when an index was published,
-/// about twice log₂ of the distance when a store is far behind, a few more per missing number
-/// it steps over, and at most twenty-one more when the store has verified nothing — so this
-/// bounds only a host whose every answer says "published".
 const WALK_HEAD_BUDGET: u32 = 48;
 
 /// The highest power of two a store that has verified no index HEADs while it looks for the
-/// channel's first build ([`newest_index`]).
 const FIRST_INDEX_SEARCH_LIMIT: u64 = 1 << 20;
 
 /// How many requests one discovery round or candidate fetch keeps in flight. Each is still
-/// its own `curl` process over the unchanged single-URL calls (`-q` first, `--` before the
-/// one URL, https only, capped, retried per URL); twenty of them at once measured the same
-/// wall time as one batched `curl -Z` (0.25–0.48 s), where twenty in turn took four seconds
-/// — a fresh process and two TLS handshakes each.
 const FETCH_CONCURRENCY: usize = 20;
 
 /// How many requests the manifest prefetch keeps in flight: both halves of every pair of a
-/// set of up to 32 programs in ONE wave. It was [`FETCH_CONCURRENCY`], ten programs' pairs,
-/// and the prescan grew to eleven: the last program's pair (`ty`, last in plan order) waited
-/// for the first of twenty to land and was a second round of GitHub's redirect and the
-/// asset host before the install announcement, on every first launch (PKG-9's trace: twenty
-/// manifest fetches at once, then two).
 const MANIFEST_WAVE: usize = 64;
 
 /// The most HEADs one discovery asks ahead of its walk ([`ahead_of_walk`]), beyond the walk's
-/// own ([`WALK_HEAD_BUDGET`]): a host whose answers keep defeating the guess costs at most this
-/// many more, and is then walked a HEAD at a time.
 const WALK_AHEAD_BUDGET: usize = 2 * WALK_HEAD_BUDGET as usize;
 
 /// `job` over every item, up to [`FETCH_CONCURRENCY`] at once, the answers in item order.
-/// The calling thread works the queue too, so a thread the system refuses only narrows the
-/// fan-out; a job that panics panics here, as it would if called in turn.
 pub(crate) fn fan_out<T: Sync, R: Send>(items: &[T], job: &(dyn Fn(&T) -> R + Sync)) -> Vec<R> {
     fan_out_upto(items, FETCH_CONCURRENCY, job)
 }
@@ -227,7 +146,6 @@ fn fan_out_upto<T: Sync, R: Send>(
     }
     let next = std::sync::atomic::AtomicUsize::new(0);
     let mut answered: Vec<(usize, R)> = std::thread::scope(|scope| {
-        // Copy: it holds only references, so every helper takes its own.
         let numbered = || {
             let mut mine = Vec::new();
             loop {
@@ -267,33 +185,7 @@ fn index_tag(build: u64) -> String {
     tag
 }
 
-/// The newest published index, by HEADs of its tags alone: `probe(n)` answers whether
-/// `atpkg-index-<n>` is published (`Err` when the answer says neither). Returns the newest
-/// build and the lowest build known published (the candidates' lower bound).
-///
-/// It relies on index builds being contiguous (`atpkg-publish index` refuses a gap, and an
-/// index release is deleted only to be re-cut under the same number), so a miss above a
-/// published build bounds the run:
-///
-/// * the run's lower end is the store's verified `floor` — published when this store
-///   verified it, unless a machine signed it above the run, which
-///   [`GithubFetcher::walk_candidates`] then walks again from none — or, on a store that
-///   has verified nothing, the first power of two that answers (the public channel's first
-///   index is atpkg-index-6, so 8 does);
-/// * from there the walk GALLOPS — HEAD `low+1`, `low+2`, `low+4`, … — to the first miss,
-///   then bisects between it and the last hit, landing a published `hit` whose `hit+1` is
-///   not;
-/// * and it HEADs `hit+2` before it believes that: published, the walk gallops on from
-///   there. So ONE missing number anywhere — a first publish numbered by hand, a release
-///   deleted and never re-cut — is stepped over (the probe HEADs only `floor+1`, so a gap
-///   there would otherwise hold the store at its floor for good). Two consecutive missing
-///   numbers can still end the run — always when they sit directly above the floor — and the
-///   builds above them are then reached only once the missing ones are published.
-///
-/// Two HEADs in the steady state (`floor+1` and `floor+2` absent), three when one index was
-/// published. The contiguity guarantee is what lets the walk prove it found the newest
-/// without listing releases on the metered API. Public: a keyless producer finds the
-/// channel head the same way (`atpkg-publish`'s `quad::head_build`).
+/// The newest published index, by HEADs of its tags alone.
 ///
 /// # Errors
 /// The first probe that said neither, or `no atpkg-index release is published`.
@@ -316,10 +208,8 @@ pub fn newest_index(
                 .ok_or_else(|| String::from("no atpkg-index release is published"))?;
         }
     };
-    // `hit` is always published.
     let mut hit = low;
     loop {
-        // Gallop from `base` to a miss, then bisect to a published `hit` with `hit+1` absent.
         let base = hit;
         let mut step = 1u64;
         let mut miss = loop {
@@ -338,7 +228,6 @@ pub fn newest_index(
                 miss = mid;
             }
         }
-        // One missing number is a gap, not the end: the run goes on past it.
         let past = hit.checked_add(2).ok_or_else(overflow)?;
         if !probe(past)? {
             return Ok((hit, low));
@@ -347,29 +236,20 @@ pub fn newest_index(
     }
 }
 
-/// The environment variable a release build compiles [`compiled_index_hint`] from: the
-/// shipped channel's published run as the release cut found it ([`published_index_run`]),
-/// spelled as [`IndexHint`] displays it. `ship release` sets it (aterm-release's build
-/// plan); a development build has none.
+/// The environment variable a release build compiles [`compiled_index_hint`] from.
 pub const INDEX_HINT_ENV: &str = "ATPKG_INDEX_HINT";
 
-/// What the discovery rounds may GUESS the channel publishes ([`ahead_of_walk`]): the newest
-/// build something saw published, and where the run the walk from no floor finds starts, when
-/// that is known. Never an answer: the walk asks every build it reads, and a hint the channel
-/// has moved past, or one that names no build it publishes, costs HEADs and a round, never a
-/// different index.
+/// What the discovery rounds may GUESS the channel publishes ([`ahead_of_walk`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IndexHint {
-    /// The first build [`newest_index`] from no floor found published — the run's first
-    /// power of two (8 on the public channel, whose first index is 6), when known.
+    /// The first build [`newest_index`] from no floor found published.
     pub low: Option<u64>,
     /// The newest build seen published.
     pub newest: u64,
 }
 
 impl IndexHint {
-    /// `<low>..<newest>`, or a bare `<newest>` ([`std::fmt::Display`]'s spellings). `None`
-    /// for anything else, a zero, or a `low` above `newest`.
+    /// `<low>..<newest>`, or a bare `<newest>` ([`std::fmt::Display`]'s spellings).
     #[must_use]
     pub fn parse(text: &str) -> Option<Self> {
         let number = |digits: &str| digits.parse::<u64>().ok().filter(|&n| n > 0);
@@ -391,17 +271,13 @@ impl std::fmt::Display for IndexHint {
     }
 }
 
-/// The published run this binary's release cut compiled in ([`INDEX_HINT_ENV`]); `None` in
-/// a development build, or for a value [`IndexHint::parse`] refuses.
+/// The published run this binary's release cut compiled in ([`INDEX_HINT_ENV`]).
 #[must_use]
 pub fn compiled_index_hint() -> Option<IndexHint> {
     option_env!("ATPKG_INDEX_HINT").and_then(IndexHint::parse)
 }
 
-/// The shipped channel's published run, found as a store that has verified nothing finds it:
-/// [`newest_index`] from no floor over HEADs of the download host, each read as discovery
-/// reads it — what a release cut compiles in ([`INDEX_HINT_ENV`]). A HEAD at a time: a cut
-/// asks once.
+/// The shipped channel's published run, found as a store that has verified nothing finds it.
 ///
 /// # Errors
 /// The first HEAD that said neither, or `no atpkg-index release is published`.
@@ -419,7 +295,6 @@ pub fn published_index_run() -> Result<IndexHint, String> {
 }
 
 /// The four derived download URLs of one index release: the index, its machine signature,
-/// and the master-signed roster and its signature.
 #[derive(Debug)]
 struct IndexQuad {
     label: String,
@@ -444,13 +319,6 @@ fn index_quad(slug: &str, tag: &str) -> Option<IndexQuad> {
 }
 
 /// The quads of `newest` and the builds below it, down to [`INDEX_CANDIDATE_CAP`] and never
-/// below `low`, newest first. A release whose four assets do not all arrive is left out,
-/// the first such failure (newest first, each quad's assets in order) kept in `first_error`.
-///
-/// Every asset of every quad is asked at once ([`fan_out`]), each under its own cap: the older
-/// quads are selection's input, not a fallback to fetch later. The newest admitted roster
-/// generation across all of them decides, which is how a fresh store sees the owner's revoking
-/// generation in an older release beside a newer tag a revoked machine signed.
 fn fetch_run(
     slug: &str,
     (newest, low): (u64, u64),
@@ -495,7 +363,6 @@ fn fetch_run(
 }
 
 /// One quad's candidate from its four answers in quad order (index, its signature, roster,
-/// its signature), or the first that did not arrive.
 fn whole_quad(
     label: &str,
     [index, index_sig, roster, roster_sig]: [Result<Vec<u8>, String>; 4],
@@ -510,11 +377,6 @@ fn whole_quad(
 }
 
 /// How discovery asks a redirect-refusing HEAD of one derived URL: whole, every attempt
-/// (`aterm_update_core::head_no_redirect`), or — in a walk's first round, its link probe —
-/// its first attempt apart from the rest, so the round reads the link from every first
-/// attempt before any of them backs off ([`GithubFetcher::walk_candidates`]). [`Wire`] in
-/// production; a test's closure is a HEAD that answers whole. `Sync`: a round asks several
-/// at once.
 trait Heads: Sync {
     /// Every attempt of the HEAD.
     fn whole(
@@ -536,7 +398,6 @@ trait Heads: Sync {
     }
 
     /// Every first attempt of a round reached no host: the link is down for this process
-    /// ([`aterm_update_core::note_link_down`]).
     fn link_down(&self) {}
 }
 
@@ -583,16 +444,12 @@ impl Heads for Wire {
 type HeadFn<'a> = dyn Heads + 'a;
 
 /// A capped byte GET of one derived URL — [`web_fetch_bytes`] in production, injected by the
-/// tests. `Sync`: [`fan_out`] asks several at once.
 type WebFetch<'a> = dyn Fn(&str, u64) -> Result<Vec<u8>, String> + Sync + 'a;
 
 /// One HEAD of an index tag as discovery reads it: whether the release is published, or, when
-/// the answer says neither, the message the discovery fails with and whether no host answered
-/// (the link down).
 type HeadVerdict = Result<bool, (String, bool)>;
 
 /// One HEAD of `atpkg-index-<build>`'s index asset in `slug`, read as the next-index probe
-/// reads it ([`read_head_answer`]).
 fn head_verdict(slug: &str, build: u64, head: &HeadFn<'_>) -> HeadVerdict {
     let url = index_head_url(slug, build)?;
     read_head_answer(&url, build, head.whole(&url))
@@ -605,9 +462,6 @@ fn index_head_url(slug: &str, build: u64) -> Result<String, (String, bool)> {
 }
 
 /// What the HEAD of `url`, `atpkg-index-<build>`'s index asset, answered, read as the
-/// next-index probe reads it ([`crate::index_probe::classify`]): only GitHub's own 302/307 to
-/// its release-asset storage is a publication, a 404 its absence, and anything else — a 200
-/// from a captive portal, a 429, a 5xx — says nothing.
 fn read_head_answer(
     url: &str,
     build: u64,
@@ -638,13 +492,6 @@ fn read_head_answer(
 }
 
 /// A walk's FIRST round, its link probe: every HEAD's first attempt at once, and only then
-/// the rest of each that may still change ([`Heads::again`], each after its own backoff).
-/// When EVERY first attempt reached no host, there is no link to retry: the process holds it
-/// down ([`Heads::link_down`]) and the round's verdicts are those attempts' failures — the
-/// offline first launch's answer in one attempt's time, where three attempts and their
-/// backoff took three seconds. A round any host answered, or that failed any other way (a
-/// timeout after the handshake, a TLS refusal, a 5xx), keeps every HEAD's honest retries,
-/// the first attempt counted among them.
 fn probe_round(slug: &str, round: &[u64], head: &HeadFn<'_>) -> Vec<HeadVerdict> {
     use aterm_update_core::FirstHead;
     let firsts = fan_out(round, &|&build| {
@@ -668,8 +515,6 @@ fn probe_round(slug: &str, round: &[u64], head: &HeadFn<'_>) -> Vec<HeadVerdict>
     if unreached {
         head.link_down();
     }
-    // The rest of every HEAD that may still change, at once; the ones that settled are read
-    // where they stand.
     let rest: Vec<(usize, String)> = firsts
         .iter()
         .enumerate()
@@ -699,35 +544,6 @@ fn probe_round(slug: &str, round: &[u64], head: &HeadFn<'_>) -> Vec<HeadVerdict>
 }
 
 /// The builds worth a HEAD in the next discovery round, `need` first: what the walk from
-/// `floor` ([`newest_index`], replayed over the answers already `known`) asks after it under
-/// every answer it may get, up to `room` builds, none already known.
-///
-/// Correctness never rests on this: the walk runs unchanged over the answers in its own order,
-/// and a build named here that it never asks is only a wasted HEAD. What it saves is rounds.
-/// Each replay follows a guess where the answers so far support one (nothing published seen
-/// yet: "absent", which puts the steady state's two HEADs and a fresh store's power-of-two
-/// search each in one round; at or below the highest published build seen: "published"; at or
-/// past the first miss above it: "absent") and forks where they do not, exploring both answers
-/// breadth first.
-///
-/// `hint` ([`GithubFetcher::with_index_hint`]) names a build something saw published — the
-/// highest this store's §14 cache holds, the one the release cut compiled in, the one the
-/// window's probe woke this pass for — so once a published build at or below it is seen,
-/// every build between the two is guessed published (the run is contiguous), and past it,
-/// with no answer there yet, "absent" — the steady state's guess, where the walk otherwise
-/// forks. And with nothing seen yet it guesses the whole first round where it knows where
-/// the run starts: the store's floor, or the run's first power of two the cut compiled in
-/// ([`IndexHint::low`]). From there to the hint is published, past it absent, so a fresh
-/// store meets a channel that has not moved since its release cut, and a floor one index
-/// behind, in one round.
-///
-/// A hint is usually some builds behind the channel by the time it is asked — a release
-/// cut's, days later at a first install — so the room such a guessed round leaves goes to
-/// the HEADs the walk would ask next were the channel 1, 2, 4, … builds past the hint, its
-/// own gallop, while room lasts. Their answers bracket where the channel went, and the round
-/// after them finishes the walk: a fresh store whose cut saw atpkg-index-71 meets any channel
-/// from 72 to 103 in two rounds, where the guess alone took three. A hint the channel has
-/// since moved past costs HEADs, never a different answer.
 fn ahead_of_walk(
     floor: u64,
     need: u64,
@@ -735,17 +551,12 @@ fn ahead_of_walk(
     room: usize,
     hint: Option<IndexHint>,
 ) -> Vec<u64> {
-    // A hint at or below the floor names nothing the floor does not — the window's probe
-    // build a pass verified since it woke this one — and guessing from it would fill the
-    // steady state's round of two HEADs to `room`.
     let hint = hint.filter(|h| floor == 0 || h.newest > floor);
     let top = known
         .iter()
         .filter(|(_, v)| matches!(v, Ok(true)))
         .map(|(b, _)| *b)
         .max();
-    // Where the published run starts, when known: the walk asks only above a floor, and from
-    // none it searches the powers of two for the first published one.
     let run = hint.and_then(|h| {
         let low = if floor > 0 { Some(floor) } else { h.low };
         low.map(|low| low..=h.newest)
@@ -765,8 +576,6 @@ fn ahead_of_walk(
     };
     let mut want = vec![need];
     let mut forks = std::collections::VecDeque::from([std::collections::BTreeMap::new()]);
-    // Each replay ends at its first unguessable build, so the tree is walked a node per
-    // replay; the cap only bounds a host whose every answer forks.
     let mut replays = 0usize;
     while want.len() < room && replays < 4 * room {
         let Some(assumed) = forks.pop_front() else {
@@ -803,9 +612,6 @@ fn ahead_of_walk(
             }
         }
     }
-    // The guesses above followed the hint: the room they left goes to the channel having
-    // moved 1, 2, 4, … builds past it, from where the run starts (`low`, or wherever the
-    // answers already say once something published is seen).
     let moved_from = match (hint, top) {
         (Some(h), None) => run.as_ref().map(|run| (*run.start(), h.newest)),
         (Some(h), Some(top)) if h.newest >= top => Some((0, h.newest)),
@@ -840,50 +646,30 @@ fn ahead_of_walk(
 }
 
 /// `(slug, program, build)`: what fully determines which asset pair a memoized manifest came
-/// from.
 type ManifestKey = (String, String, u64);
 
 /// The raw, unverified `(manifest, signature)` bytes of one asset pair, shared by `Arc` so a
-/// memo hit costs no copy.
 type ManifestBytes = std::sync::Arc<(Vec<u8>, Vec<u8>)>;
 
 /// The locked map behind the fetcher's `manifests` memo.
 type ManifestMemo = std::sync::Mutex<std::collections::BTreeMap<ManifestKey, ManifestBytes>>;
 
-/// The production fetcher: an `owner` account and the optional per-program `[packages.links]`
-/// `owner/repo` fetch overrides. Construct with [`GithubFetcher::new`] (then
-/// [`GithubFetcher::with_overrides`], [`GithubFetcher::with_index_floor`]).
+/// The production fetcher: an `owner` account and the optional per-program `[packages.links]` `owner/repo` fetch overrides.
 pub struct GithubFetcher {
     owner: String,
     /// program → slug-validated `"owner/repo"`: where that program's `pkg-*.toml` and
-    /// artifacts are fetched from instead of `<owner>/<repo>` (a development setting). Never an
-    /// authenticity input: the index fetch is untouched, reachability (§5) still requires the
-    /// index to name the program, and every byte passes the same signature, sha256 and
-    /// `tree_root` gates.
     overrides: std::collections::BTreeMap<String, String>,
     /// Per-invocation memo of the index candidate set: the flow re-resolves it per dependency
-    /// and per default-set member, and a miss is a discovery walk plus four downloads per
-    /// candidate.
     index: std::sync::Mutex<Option<std::sync::Arc<Vec<Candidate>>>>,
     /// The highest index build this store has verified (its durable floor,
-    /// [`crate::index_probe::verified_floor`]), where the discovery walk counts from. `0` is
-    /// none: the walk then looks for the channel's first build.
     index_floor: u64,
     /// A build something saw published, and where the run starts when that is known
-    /// ([`Self::with_index_hint`]): a guess the discovery rounds follow, never an answer.
     index_hint: Option<IndexHint>,
     /// Whether the last discovery's HEAD failed on the link (curl reached no host), which
-    /// [`crate::flow::Fetcher::index_link_down`] reads.
     link_down: std::sync::atomic::AtomicBool,
     /// What the last discovery asked (its HEADs, the rounds they went out in, its asset GETs),
-    /// for the package log's `index-resolved` line.
     walk_cost: [std::sync::atomic::AtomicU32; 3],
     /// Per-invocation memo of the raw `(pkg-<program>-<build>.toml, .sig)` bytes, keyed by
-    /// `(slug, program, build)`. The same member's manifest is fetched two or three times per
-    /// apply (preflight, prescan, stage), each miss two downloads.
-    ///
-    /// Bytes, not trust (like the on-disk [`crate::IndexCache`]): every consumer still runs
-    /// `verify_pkg` → `parse_pkg` and re-binds `program`/`build_number` itself.
     manifests: ManifestMemo,
 }
 
@@ -903,8 +689,7 @@ impl GithubFetcher {
         }
     }
 
-    /// Attach the per-program `owner/repo` fetch overrides (from `[packages.links]`, already
-    /// slug-validated by [`crate::config::repo_overrides`]).
+    /// Attach the per-program `owner/repo` fetch overrides (from `[packages.links]`, already slug-validated by [`crate::config::repo_overrides`]).
     #[must_use]
     pub fn with_overrides(mut self, overrides: std::collections::BTreeMap<String, String>) -> Self {
         self.overrides = overrides;
@@ -918,8 +703,7 @@ impl GithubFetcher {
         self
     }
 
-    /// Attach what this store may guess the channel publishes ([`IndexHint`]): the discovery
-    /// rounds guess from it ([`ahead_of_walk`]); the walk's answer never rests on it.
+    /// Attach what this store may guess the channel publishes ([`IndexHint`]): the discovery rounds guess from it ([`ahead_of_walk`]).
     #[must_use]
     pub fn with_index_hint(mut self, hint: Option<IndexHint>) -> Self {
         self.index_hint = hint;
@@ -932,7 +716,6 @@ impl GithubFetcher {
     }
 
     /// The `<owner>/<repo>` slug `program`'s release fetches go to: its fetch override when one
-    /// is declared, else the index-declared `repo` under this fetcher's account.
     fn slug_for(&self, program: &str, repo: &str) -> String {
         match self.overrides.get(program) {
             Some(slug) => slug.clone(),
@@ -953,7 +736,6 @@ impl GithubFetcher {
         build: u64,
         fetch: &WebFetch<'_>,
     ) -> Result<(Vec<u8>, Vec<u8>), String> {
-        // The slug (override-aware) is resolved once: it keys the memo and derives the URLs.
         let slug = self.slug_for(program, repo);
         let key = (slug.clone(), program.to_string(), build);
         if let Ok(memo) = self.manifests.lock()
@@ -961,13 +743,10 @@ impl GithubFetcher {
         {
             return Ok((**hit).clone());
         }
-        // `build` comes from the signed index's pin, so the exact URL is already determined;
-        // the bytes are still verified by the caller, so the host stays a transport (§8).
         let (toml_url, sig_url) = direct_manifest_urls(&slug, program, build)
             .ok_or_else(|| underivable(&slug, program))?;
         let pair =
             std::sync::Arc::new((fetch(&toml_url, MANIFEST_CAP)?, fetch(&sig_url, SIG_CAP)?));
-        // Successes only — a failed download stays retryable.
         if let Ok(mut memo) = self.manifests.lock() {
             memo.insert(key, std::sync::Arc::clone(&pair));
         }
@@ -975,10 +754,6 @@ impl GithubFetcher {
     }
 
     /// [`crate::flow::Fetcher::prefetch_manifests`] over an injected byte fetch: every pair
-    /// of `pins` the memo does not hold yet, both halves of all of them asked at once
-    /// ([`MANIFEST_WAVE`]), each under its own cap. A pair that arrives WHOLE is memoized,
-    /// exactly as [`Self::manifest_pair`] memoizes it; one that does not is left out, so the
-    /// read that wants it fetches it again and meets the failure itself.
     fn prefetch_with(&self, pins: &[(String, String, u64)], fetch: &WebFetch<'_>) {
         let mut wanted: Vec<(ManifestKey, String, String)> = Vec::new();
         for (repo, program, build) in pins {
@@ -991,7 +766,6 @@ impl GithubFetcher {
             if held || wanted.iter().any(|(k, ..)| *k == key) {
                 continue;
             }
-            // An underivable name is left to the read, which names it.
             if let Some((toml, sig)) = direct_manifest_urls(&key.0, program, *build) {
                 wanted.push((key, toml, sig));
             }
@@ -1012,21 +786,12 @@ impl GithubFetcher {
     }
 
     /// The index candidates, from the download host alone, over an injected HEAD and byte
-    /// fetch: the seam [`crate::flow::Fetcher::index_candidates`] runs.
-    ///
-    /// [`newest_index`] runs unchanged from this store's verified floor, its HEADs sent in
-    /// rounds of the build it needs and the ones it is likely to need next ([`ahead_of_walk`]),
-    /// each read by [`head_verdict`]. An answer that says nothing fails the discovery only if
-    /// the walk asks for that build, and a HEAD that reached no host marks the link down. The
-    /// quads are fetched at once, and the resolve fails only when none arrives whole
-    /// ([`fetch_run`]).
     fn walk_candidates(
         &self,
         slug: &str,
         head: &HeadFn<'_>,
         fetch: &WebFetch<'_>,
     ) -> Result<Vec<Candidate>, String> {
-        // The link verdict and the cost are this walk's own, not an earlier walk's.
         self.link_down
             .store(false, std::sync::atomic::Ordering::Relaxed);
         let [heads_asked, rounds, gets] = &self.walk_cost;
@@ -1038,9 +803,6 @@ impl GithubFetcher {
             fetch(url, cap)
         };
         let fetch: &WebFetch<'_> = &counted;
-        // Every HEAD answered so far, read by the walk in its own order; a build not here yet
-        // goes out in a round with the ones the walk is likely to ask next ([`ahead_of_walk`]).
-        // A verdict that says nothing is kept too, and fails the walk only if it asks that build.
         let mut known = std::collections::BTreeMap::<u64, HeadVerdict>::new();
         let mut heads = 0u32;
         let mut asked_ahead = 0usize;
@@ -1063,7 +825,6 @@ impl GithubFetcher {
                     u32::try_from(round.len()).unwrap_or(u32::MAX),
                     std::sync::atomic::Ordering::Relaxed,
                 );
-                // The walk's first round is its link probe ([`probe_round`]).
                 let verdicts = if first {
                     probe_round(slug, &round, head)
                 } else {
@@ -1080,7 +841,6 @@ impl GithubFetcher {
                     }
                     Err(msg.clone())
                 }
-                // Unreachable: a round always asks the build it was started for.
                 None => Err(underivable(slug, &index_tag(build))),
             }
         };
@@ -1088,13 +848,6 @@ impl GithubFetcher {
         let run = newest_index(floor, &mut |build| probe_from(floor, build))?;
         let mut first_error: Option<String> = None;
         let mut out = fetch_run(slug, run, fetch, &mut first_error)?;
-        // The floor is a signed number, not a tag: a rostered machine can sign one far above
-        // the run, and a store that took it would otherwise never ask for an owner's tag
-        // again, not even the revoking republish (`sig::BuildFloor`). With nothing above the
-        // floor and its own tag absent, walk again from none; selection still holds every
-        // candidate to the floor, and a run it refuses whole leaves the resolve on its cache
-        // (`flow::resolve_verified_index`). A run ending directly below the floor is its tag
-        // deleted to be re-cut: no second walk, and the failure stands.
         if out.is_empty()
             && floor > 0
             && run.0 == floor
@@ -1114,7 +867,6 @@ impl GithubFetcher {
 impl crate::flow::Fetcher for GithubFetcher {
     fn index_candidates(&self) -> Result<Vec<Candidate>, String> {
         // Memoized per invocation (the `index` field); the same raw bytes still flow through
-        // every gate.
         if let Ok(memo) = self.index.lock()
             && let Some(hit) = memo.as_ref()
         {
@@ -1135,7 +887,6 @@ impl crate::flow::Fetcher for GithubFetcher {
             },
         });
         let out = walked?;
-        // Successes only — a failed discovery or fetch stays retryable.
         let out = std::sync::Arc::new(out);
         if let Ok(mut memo) = self.index.lock() {
             *memo = Some(std::sync::Arc::clone(&out));
@@ -1165,8 +916,6 @@ impl crate::flow::Fetcher for GithubFetcher {
     }
 
     fn download(&self, repo: &str, asset: &str, dest: &Path) -> Result<(), String> {
-        // The unsized lane: the only bound is the ceiling. The flow's artifact path calls
-        // `download_for` with the row's signed `size` instead.
         let slug = self.slug_of(repo);
         let url = direct_asset_url(&slug, asset).ok_or_else(|| underivable(&slug, asset))?;
         web_fetch_to(&url, dest, ARTIFACT_CAP)
@@ -1180,9 +929,6 @@ impl crate::flow::Fetcher for GithubFetcher {
         dest: &Path,
         cap: u64,
     ) -> Result<(), String> {
-        // Same release repo (and override) as the manifest; the tag follows from the asset
-        // name ([`direct_asset_url`]). The cap is the row's signed `size` ([`artifact_cap`]);
-        // resumable, with the sha256 gate over the complete file still deciding acceptance.
         let slug = self.slug_for(program, repo);
         let url = direct_asset_url(&slug, asset).ok_or_else(|| underivable(&slug, asset))?;
         web_fetch_to(&url, dest, artifact_cap(cap))
@@ -1190,8 +936,6 @@ impl crate::flow::Fetcher for GithubFetcher {
 
     fn download_url(&self, url: &str, dest: &Path, cap: u64) -> Result<(), String> {
         // The vendor lane: the URL is the signed row's own, already admitted by
-        // `vendor::check_row` (https, allow-listed host), so no slug, override or credential is
-        // consulted. `cap` is the signed `size`; the https pin covers every redirect.
         aterm_update_core::download_to_resumable_https_only(url, dest, cap)
     }
 
@@ -1202,8 +946,6 @@ impl crate::flow::Fetcher for GithubFetcher {
         cap: u64,
         if_none_match: Option<&str>,
     ) -> Result<crate::flow::VendorGet, VendorFetchError> {
-        // Only the program's own compiled prefixes, and never a credential (the transport
-        // takes none).
         refuse_unpinned_vendor_url(program, url)?;
         aterm_update_core::vendor_get(url, cap, if_none_match)
             .map(vendor_get_from)
@@ -1241,15 +983,12 @@ impl crate::flow::Fetcher for GithubFetcher {
     }
 }
 
-/// The §14 cache key of the GitHub source under `owner`: [`GithubFetcher`]'s `source_id`, and
-/// the key `doctor` reads the cache back under ([`crate::index_probe::held_index_builds`]).
+/// The §14 cache key of the GitHub source under `owner`.
 pub(crate) fn github_source_id(owner: &str) -> String {
     format!("github:{owner}/{}", crate::discovery::index_repo())
 }
 
-/// A vendor head read as a hint (the window's head watch, and every pass's and door's head
-/// read, [`crate::flow::Fetcher::vendor_head`]): `vendor_get`'s pins, cap and anonymity in one
-/// short attempt ([`aterm_update_core::vendor_get_hint`]).
+/// A vendor head read as a hint (the window's head watch, and every pass's and door's head read, [`crate::flow::Fetcher::vendor_head`]).
 pub(crate) fn vendor_hint_get(
     program: &str,
     url: &str,
@@ -1274,8 +1013,6 @@ fn refuse_unpinned_vendor_url(program: &str, url: &str) -> Result<(), VendorFetc
 }
 
 /// The transport's error, split the way the vendor-direct lane treats it: only a network
-/// failure, or a status that says the host is busy (408, 429, 5xx), is unreachable; every
-/// other answer is a verdict.
 fn vendor_error(e: aterm_update_core::HttpError) -> VendorFetchError {
     use aterm_update_core::HttpError;
     match e {
@@ -1306,17 +1043,13 @@ fn vendor_get_from(response: aterm_update_core::VendorResponse) -> crate::flow::
     }
 }
 
-/// The offline / publisher-test fetcher (§14): a flat directory of release assets
-/// (`index.toml`(`.sig`), the roster and its signature, `pkg-<program>-<build>.toml`(`.sig`),
-/// the artifact tarballs). No network. The bytes reach the flow raw, so a `dir:` registry gets
-/// the same verify-before-parse, floor and freshness gates as `github:`.
+/// The offline / publisher-test fetcher (§14).
 pub struct DirFetcher {
     dir: PathBuf,
 }
 
 impl DirFetcher {
-    /// A fetcher reading assets from `dir` (canonicalized when possible for a stable
-    /// `source_id`).
+    /// A fetcher reading assets from `dir` (canonicalized when possible for a stable `source_id`).
     #[must_use]
     pub fn new(dir: PathBuf) -> Self {
         let dir = std::fs::canonicalize(&dir).unwrap_or(dir);
@@ -1325,7 +1058,6 @@ impl DirFetcher {
 }
 
 /// Reject a file-name component that could escape `dir` (defense in depth: the manifest is
-/// signed).
 fn safe_name(n: &str) -> bool {
     !(n.is_empty()
         || n == "."
@@ -1341,8 +1073,6 @@ impl crate::flow::Fetcher for DirFetcher {
         let read = |name: &str, bound: u64| {
             crate::metadata_io::read_bounded_regular(&self.dir.join(name), cap(bound))
         };
-        // A `dir:` registry supplies bytes, never trust, so it must carry the same complete
-        // authorization unit a release does: a missing roster is as fatal here as there.
         match (
             read("index.toml", MANIFEST_CAP),
             read("index.toml.sig", SIG_CAP),
@@ -1356,7 +1086,6 @@ impl crate::flow::Fetcher for DirFetcher {
                 roster_bytes,
                 roster_sig,
             }]),
-            // Missing any of the four: no candidate, so `NoIndex`.
             _ => Ok(vec![]),
         }
     }
@@ -1391,12 +1120,7 @@ impl crate::flow::Fetcher for DirFetcher {
             return Err(format!("unsafe asset name {asset:?}"));
         }
         let src = self.dir.join(asset);
-        // Unlink first, or a retry destroys the registry file: a stale staging hardlink makes
-        // `hard_link` fail EEXIST, and the `fs::copy` fallback then copies the shared inode
-        // onto itself, which on macOS opens it `O_TRUNC` and reports `Ok(0)`, zeroing the asset.
         let _ = std::fs::remove_file(dest);
-        // Hardlink to avoid duplicating a multi-GB toolchain (removing the staged link later
-        // never touches the registry file); across filesystems, copy.
         if std::fs::hard_link(&src, dest).is_ok() {
             return Ok(());
         }
@@ -1415,7 +1139,6 @@ impl crate::flow::Fetcher for DirFetcher {
 }
 
 /// Conformance of the real tag walk to the derived `AtpkgIndexPublishWalk` model (the reader
-/// half; the producer's suite binds the writer half).
 #[cfg(test)]
 mod index_publish_conformance;
 
@@ -1424,7 +1147,6 @@ mod tests {
     use super::*;
 
     /// The synthesized URLs are the contract with the publisher's tag convention
-    /// (`atpkg-<program>-<build>`): a drift sends every fetch to a 404.
     #[test]
     fn direct_urls_match_the_publishing_tag_convention() {
         let (toml, sig) = super::direct_manifest_urls("alabsystems/ty", "ty", 2973).unwrap();
@@ -1440,14 +1162,10 @@ mod tests {
             super::direct_asset_url("alabsystems/ty", "ty-2973.tar.zst").unwrap(),
             "https://github.com/alabsystems/ty/releases/download/atpkg-ty-2973/ty-2973.tar.zst"
         );
-        // A hyphenated program name does not confuse the tag: the build is the first all-digit
-        // segment.
         assert_eq!(
             super::direct_asset_url("alabsystems/trust-mc", "trust-mc-20011.tar.zst").unwrap(),
             "https://github.com/alabsystems/trust-mc/releases/download/atpkg-trust-mc-20011/trust-mc-20011.tar.zst"
         );
-        // `.tar.zst` is a double extension: stripping only the last would name the tag
-        // `atpkg-ty-2973.tar`.
         assert!(
             !super::direct_asset_url("alabsystems/ty", "ty-2973.tar.zst")
                 .unwrap()
@@ -1456,8 +1174,6 @@ mod tests {
     }
 
     /// Every triple but `aarch64-apple-darwin` is published as `<prog>-<build>-<triple>.tar.zst`
-    /// on the shared `atpkg-<prog>-<build>` release, so the tag comes from the build number,
-    /// not the whole stem.
     #[test]
     fn a_triple_suffixed_asset_derives_the_shared_build_tag() {
         for (slug, asset, tag) in [
@@ -1471,7 +1187,6 @@ mod tests {
                 "trust-4821-aarch64-apple-darwin.tar.zst",
                 "atpkg-trust-4821",
             ),
-            // The darwin spelling with no triple.
             (
                 "alabsystems/trust",
                 "trust-4821.tar.zst",
@@ -1494,7 +1209,6 @@ mod tests {
                 "{asset}"
             );
         }
-        // No build number in the name: no tag follows, so derive nothing.
         assert!(super::direct_asset_url("alabsystems/ty", "ty-latest.tar.zst").is_none());
     }
 
@@ -1502,13 +1216,13 @@ mod tests {
     #[test]
     fn direct_urls_refuse_unsafe_slugs_and_names() {
         for bad in [
-            "alabsystems",                     // no repo half
-            "alabsystems/ty/extra",            // an extra path segment
-            "alabsystems/",                    // empty repo
-            "/ty",                             // empty owner
-            "alabsystems/..",                  // parent traversal
-            "evil.com/x/../../alabsystems/ty", // traversal via a long slug
-            "https://evil.com/a",              // a scheme smuggled in as a slug
+            "alabsystems",
+            "alabsystems/ty/extra",
+            "alabsystems/",
+            "/ty",
+            "alabsystems/..",
+            "evil.com/x/../../alabsystems/ty",
+            "https://evil.com/a",
         ] {
             assert!(
                 super::direct_manifest_urls(bad, "ty", 1).is_none(),
@@ -1523,8 +1237,6 @@ mod tests {
         assert!(super::direct_manifest_urls("a/b", "", 1).is_none());
         assert!(super::direct_asset_url("a/b", "../x.tar.zst").is_none());
         assert!(super::direct_asset_url("a/b", "noextension").is_none());
-        // The shared builder's own refusals reach here too: a server-supplied tag with
-        // a query, a fragment, an escape or whitespace derives nothing.
         for tag in ["v1?x", "v1#x", "v1%2f", "v 1", "", ".."] {
             assert!(
                 super::web_asset_url("a/b", tag, "index.toml").is_none(),
@@ -1544,10 +1256,7 @@ mod tests {
     #[test]
     fn artifact_cap_is_the_signed_size_clamped_by_the_ceiling() {
         assert_eq!(super::artifact_cap(30_000_000), 30_000_000);
-        // A row that states no size keeps the ceiling, never a zero-byte cap.
         assert_eq!(super::artifact_cap(0), super::ARTIFACT_CAP);
-        // A size above the ceiling is clamped down to it: a signed row can lower the bound,
-        // never raise it.
         assert_eq!(
             super::artifact_cap(super::ARTIFACT_CAP + 1),
             super::ARTIFACT_CAP
@@ -1560,7 +1269,6 @@ mod tests {
     }
 
     /// No credential on the web host, structurally: `web_fetch_bytes` and `web_fetch_to` take
-    /// no token (nor does the transport) and refuse an API URL before any request.
     #[test]
     fn direct_fetches_present_no_credential_to_the_web_host() {
         let api = "https://api.github.com/repos/alabsystems/ty/releases/assets/1";
@@ -1585,20 +1293,14 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
-    // The `[packages.links]` fetch override redirects only the named program's release slug;
-    // the index repo and every other program are untouched.
     #[test]
     fn override_redirects_only_the_named_programs_slug() {
         let mut overrides = std::collections::BTreeMap::new();
         overrides.insert("orc".to_string(), "alabsystems/orc-private".to_string());
         let f = GithubFetcher::new("alabsystems".into()).with_overrides(overrides);
-        // The overridden program fetches from the declared owner/repo…
         assert_eq!(f.slug_for("orc", "orc"), "alabsystems/orc-private");
-        // …even if the index declares a differently-named repo for it…
         assert_eq!(f.slug_for("orc", "some-repo"), "alabsystems/orc-private");
-        // …while every other program stays under the fetcher's account + index repo.
         assert_eq!(f.slug_for("ay", "ay"), "alabsystems/ay");
-        // No overrides at all: the plain account/repo slug.
         let plain = GithubFetcher::new("alabsystems".into());
         assert_eq!(plain.slug_for("orc", "orc"), "alabsystems/orc");
     }
@@ -1615,7 +1317,6 @@ mod tests {
         // SAFETY: `index_c` is a live NUL-terminated path in our private fixture.
         assert_eq!(unsafe { libc::mkfifo(index_c.as_ptr(), 0o600) }, 0);
         std::fs::write(d.join("index.toml.sig"), b"sig").unwrap();
-        // The roster is present, so an empty candidate set is the refused index.
         std::fs::write(d.join("aterm-machines.toml"), b"roster").unwrap();
         std::fs::write(d.join("aterm-machines.toml.sig"), b"sig").unwrap();
         let fetcher = DirFetcher::new(d.clone());
@@ -1635,7 +1336,6 @@ mod tests {
     }
 
     /// A stale staging hardlink left by a killed run never truncates the registry file on the
-    /// retry (see `DirFetcher::download`).
     #[test]
     fn a_stale_staging_hardlink_never_truncates_the_registry_file() {
         use crate::flow::Fetcher as _;
@@ -1650,7 +1350,6 @@ mod tests {
         let f = DirFetcher::new(dir.join("reg"));
         f.download("r", "ay-18.tar.zst", &dest).unwrap();
         assert_eq!(std::fs::read(&dest).unwrap(), payload);
-        // A kill here leaves the link behind; the retry must not destroy the source.
         f.download("r", "ay-18.tar.zst", &dest).unwrap();
         assert_eq!(
             std::fs::read(&src).unwrap(),
@@ -1666,8 +1365,6 @@ mod tests {
     }
 
     /// A vendor-direct fetch outside the program's own compiled prefixes is refused before any
-    /// spawn, as a verdict (an allow-listed host or another vendor's prefix is not enough), and
-    /// the transport's answer carries over field for field.
     #[test]
     fn the_github_fetcher_fetches_vendor_documents_only_under_the_pins() {
         use crate::flow::Fetcher as _;
@@ -1688,7 +1385,6 @@ mod tests {
                 "claude",
                 "https://downloads.claude.ai/claude-code-releases/latest?x=1",
             ),
-            // the other vendor's pinned URLs, and an unpinned program
             (
                 "claude",
                 "https://releases.openai.com/codex/channels/latest",
@@ -1738,8 +1434,6 @@ mod tests {
     }
 
     /// Only the network and a busy host are unreachable; a size, scheme, certificate or
-    /// status verdict, and an unreadable answer, are refusals — so the vendor lane never
-    /// files a bad document as a network blip. The message survives either way.
     #[test]
     fn a_vendor_transport_error_is_unreachable_only_for_the_network() {
         use aterm_update_core::HttpError;
@@ -1771,8 +1465,6 @@ mod tests {
     }
 
     /// A name no download URL derives from is refused before any request on the manifest, the
-    /// unsized and the sized lanes alike, and nothing is written. The control: a published name
-    /// derives its URL.
     #[test]
     fn an_underivable_name_is_refused_with_no_fallback() {
         use crate::flow::Fetcher as _;
@@ -1798,7 +1490,6 @@ mod tests {
     }
 
     /// The build number of an `atpkg-index-<n>/index.toml` download URL, for the recording
-    /// HEADs below.
     fn walked_build(url: &str) -> u64 {
         url.strip_prefix("https://github.com/alabsystems/aterm/releases/download/atpkg-index-")
             .and_then(|rest| rest.strip_suffix("/index.toml"))
@@ -1862,8 +1553,6 @@ mod tests {
     type SequentialFetch<'a> = dyn FnMut(&str, u64) -> Result<Vec<u8>, String> + 'a;
 
     /// The sequential reference: discovery with every HEAD asked when the walk asks it and
-    /// every asset in turn, a quad given up at its first missing asset. [`walk`] runs it beside
-    /// the fetcher.
     fn sequential_walk(
         slug: &str,
         floor: u64,
@@ -1935,10 +1624,6 @@ mod tests {
     }
 
     /// One discovery on the shipped index repository from `floor`, every HEAD answered by
-    /// `answer` and every asset download succeeding unless its URL ends with one of `missing`,
-    /// run by the fetcher and by the [`sequential_walk`] reference: the two must land the same
-    /// candidates (or failure) and link verdict, and the fetcher must HEAD every build the walk
-    /// asked, none twice, within the walk's and the ahead budgets together.
     fn walk(
         floor: u64,
         answer: &(
@@ -2047,7 +1732,6 @@ mod tests {
     }
 
     /// Every asset URL of the quads of `builds`, sorted: what [`Walked::fetched`] holds when
-    /// each of those quads was asked whole.
     fn quad_assets(builds: &[u64]) -> Vec<String> {
         let mut urls: Vec<String> = builds
             .iter()
@@ -2061,8 +1745,6 @@ mod tests {
     }
 
     /// From a verified floor of 44, with 45 published and 46 onward absent, the walk resolves
-    /// 45 (and 44) in three HEADs and eight downloads, all on the release download host. The
-    /// negative control: the predicate recognises an API Releases listing.
     #[test]
     fn the_walk_resolves_the_next_index_with_no_api_request() {
         assert!(aterm_update_core::cdn::is_api_host(
@@ -2093,8 +1775,6 @@ mod tests {
     }
 
     /// The walk from every kind of floor: two HEADs and one quad in the steady state; a gallop
-    /// and bisection for a store five builds behind; and for a store that has verified nothing,
-    /// a search from the first power of two that answers.
     #[test]
     fn the_walk_finds_the_newest_from_any_floor_and_from_none() {
         let steady = walk(45, &channel(6, 45), &[]);
@@ -2112,7 +1792,6 @@ mod tests {
         let fresh = walk(0, &channel(6, 45), &[]);
         assert_eq!(fresh.labels, labels(&[45, 44, 43, 42]));
 
-        // Nothing published at all: a failure, after the bounded search.
         let empty = walk(0, &|_| absent(), &[]);
         assert!(empty.labels.is_err());
         assert_eq!(
@@ -2128,7 +1807,6 @@ mod tests {
     }
 
     /// Exhaustively over small contiguous channels: for every floor the walk lands the newest
-    /// within its HEAD bound, and the lower bound it reports is published.
     #[test]
     fn the_search_lands_the_newest_of_every_contiguous_channel() {
         for first in 1..=9u64 {
@@ -2161,9 +1839,6 @@ mod tests {
     }
 
     /// A single missing number is stepped over: exhaustively over small channels with every
-    /// pattern of non-adjacent gaps, from every floor, the walk lands the newest. The control is
-    /// the documented limit: two consecutive missing numbers directly above the floor end the
-    /// run at the floor.
     #[test]
     fn the_search_steps_over_a_missing_number_and_stops_at_two() {
         for first in 1..=3u64 {
@@ -2171,7 +1846,8 @@ mod tests {
                 let interior = (newest - first).saturating_sub(1);
                 for gaps in 0..(1u64 << interior) {
                     if gaps & (gaps >> 1) != 0 {
-                        continue; // two adjacent missing numbers: the control below
+                        // two adjacent missing numbers: the control below
+                        continue;
                     }
                     let published = |build: u64| {
                         (first..=newest).contains(&build)
@@ -2208,8 +1884,6 @@ mod tests {
                 }
             }
         }
-        // Through the fetcher: 45 absent above a floor of 44. The walk HEADs 45, steps to 46,
-        // gallops to 50, and 45 is simply not a candidate.
         let gap = |build: u64| {
             if build == 45 {
                 absent()
@@ -2230,7 +1904,6 @@ mod tests {
             labels(&[50, 49, 47]),
             "a missing number inside the window"
         );
-        // The control: 45 and 46 absent above 44 lands 44, after exactly those two HEADs.
         let double = |build: u64| {
             if build == 45 || build == 46 {
                 absent()
@@ -2256,9 +1929,6 @@ mod tests {
     }
 
     /// An answer that says nothing fails the discovery, never reads as "not published" (which
-    /// would land an older index) nor leads to another host. A portal's 200, a renamed repo's
-    /// 301, a login redirect, a rate limit and a 5xx are a host that answered (link up); curl
-    /// reaching no host is the link down. No asset is fetched either way.
     #[test]
     fn an_answer_that_says_nothing_fails_the_discovery() {
         let answer = |code: u16, location: Option<&str>| {
@@ -2309,7 +1979,6 @@ mod tests {
         assert_eq!(offline.heads, vec![45]);
         assert_eq!(offline.asked.len(), offline.headed.len(), "nothing fetched");
         assert!(offline.link_down, "no host answered");
-        // The verdict is the last walk's.
         use crate::flow::Fetcher as _;
         let f = GithubFetcher::new("alabsystems".into()).with_index_floor(44);
         let slug = f.index_slug();
@@ -2332,7 +2001,6 @@ mod tests {
     }
 
     /// A release whose four assets do not all arrive is left out, not the resolve's failure;
-    /// only when no candidate arrives does the resolve fail, naming the first missing asset.
     #[test]
     fn a_release_that_does_not_arrive_whole_is_left_out() {
         let w = walk(44, &channel(6, 46), &["atpkg-index-46/index.toml.sig"]);
@@ -2352,10 +2020,6 @@ mod tests {
     }
 
     /// A floor above the published run (a rostered machine signed an `index_build` above every
-    /// tag): with nothing above it and its own tag absent, the walk finds the run again from
-    /// none. The control is the re-cut window: a floor whose tag was deleted to be re-cut sits
-    /// directly above the run, and its walk still fails, so the resolve keeps the cached floor
-    /// index.
     #[test]
     fn a_floor_above_the_published_run_is_found_again_from_first_contact() {
         let poisoned = i64::MAX.unsigned_abs();
@@ -2381,7 +2045,6 @@ mod tests {
     }
 
     /// The channel as discovery meets it: the real walk from a floor of 47 over HEADs and
-    /// downloads of genuinely signed quads (the test roster's machine and paper master).
     struct SignedChannel {
         fetcher: GithubFetcher,
         publication: std::cell::RefCell<Publication>,
@@ -2466,12 +2129,6 @@ mod tests {
     }
 
     /// A run found below the floor never displaces the cached floor index: with 47 and then 46
-    /// deleted for a re-cut, every candidate of the run found at 45 is refused (same
-    /// generation, below the floor), and the resolve serves the cached 47, caches it beside
-    /// what was served, and serves it offline after; a refused run above the floor is cached
-    /// beside it for `doctor` to name. The controls are the generations: a release beside the
-    /// next roster drops the cached 47 (the refusal stands and its set replaces the cache), and
-    /// the owner's republish of 45 at that generation is selected live.
     #[test]
     fn a_run_found_below_the_floor_keeps_serving_the_cached_floor_index() {
         use crate::sig::testkit;
@@ -2518,8 +2175,6 @@ mod tests {
         };
         let cached = |builds: &[u64]| labels(builds).unwrap();
         let never = u64::MAX;
-        // 1. First contact, on a prefix nothing has created yet: 47 live, cached, and the
-        //    generation that admitted it recorded in the prefix.
         assert_eq!(
             pass(Some(6..=47), never, never, never),
             (Ok(47), true, cached(&[47]))
@@ -2528,28 +2183,19 @@ mod tests {
             crate::sig::Floor::new(store.roster_floor()).current(),
             testkit::SEQ
         );
-        // 2. 47 deleted to be re-cut, 3. then offline: the cache serves.
         let from_cache = (Ok(47), false, cached(&[47]));
         assert_eq!(pass(Some(6..=46), never, never, never), from_cache);
         assert_eq!(pass(None, never, never, never), from_cache);
-        // 4. 46 deleted as well, 5. then offline: the run found again at 45 is refused
-        //    whole, and the cached floor index still serves, cached beside that run.
         let beside_run = (Ok(47), false, cached(&[45, 44, 43, 42, 47]));
         assert_eq!(pass(Some(6..=45), never, never, never), beside_run);
         assert_eq!(pass(None, never, never, never), beside_run);
-        // 6. Restored.
         assert_eq!(
             pass(Some(6..=47), never, never, never),
             (Ok(47), true, cached(&[47]))
         );
-        // 6b. Four releases above the floor signed by a key on no roster: the cached 47 serves
-        //     and the refused run is cached beside it (for `doctor`); offline after, 47 still
-        //     serves.
         let beside_refused = (Ok(47), false, cached(&[51, 50, 49, 48, 47]));
         assert_eq!(pass(Some(6..=51), never, never, 48), beside_refused);
         assert_eq!(pass(None, never, never, 48), beside_refused);
-        // 6c. With the floor index's window lapsed it is refused `Stale` live, and beside the
-        //     refused run too; the run is still cached beside it.
         f.lapsed_through.set(47);
         let stale = |builds: &[u64], reached| {
             (
@@ -2568,8 +2214,6 @@ mod tests {
             pass(Some(6..=47), never, never, never),
             (Ok(47), true, cached(&[47]))
         );
-        // 7. 48 published beside the next generation, signed by a key on no roster: nothing
-        //    selects, so the source's verdict stands and what it served is cached.
         let refused = |builds: &[u64]| {
             (
                 Err(crate::flow::FlowError::NoIndex.to_string()),
@@ -2578,13 +2222,10 @@ mod tests {
             )
         };
         assert_eq!(pass(Some(6..=48), 48, never, 48), refused(&[48, 47]));
-        // 8. The run found below the floor beside that generation, its indexes declaring the
-        //    old one: refused the same way.
         assert_eq!(
             pass(Some(6..=45), 0, never, never),
             refused(&[45, 44, 43, 42])
         );
-        // 9. The owner republishes 45 at the next generation: selected live.
         assert_eq!(
             pass(Some(6..=45), 45, 45, never),
             (Ok(45), true, cached(&[45, 44, 43, 42]))
@@ -2592,10 +2233,6 @@ mod tests {
     }
 
     /// The rounds against the reference over a fixed pseudo-random stream of channels the cases
-    /// above do not reach: starting from 1 to 40, up to 80 builds long, with up to three missing
-    /// numbers (sometimes adjacent, where the walk's answer depends on where it looks), each
-    /// walked from no floor, a floor in the run, its top or above it, with one roster missing.
-    /// [`walk`] holds every one to [`sequential_walk`].
     #[test]
     fn the_rounds_land_what_the_sequential_walk_lands() {
         let mut state = 0x9e37_79b9_7f4a_7c15_u64;
@@ -2622,9 +2259,6 @@ mod tests {
                 first + next(last - first + 1)
             );
             let up = move |b: u64| (first..=last).contains(&b) && !holes.contains(&b);
-            // A build seen published, when there is one: in the run, at its top, behind it,
-            // or above it — and where the run starts, right, wrong, or unknown. A guess the
-            // rounds follow, never the answer.
             let newest = match next(5) {
                 0 => None,
                 1 => Some(first + next(last - first + 1)),
@@ -2648,7 +2282,6 @@ mod tests {
     }
 
     /// The run a release cut compiles in (`ATPKG_INDEX_HINT`) reads back as that run; a value
-    /// that names no run reads as no hint, and the binary walks as a development build does.
     #[test]
     fn a_compiled_index_hint_reads_back_or_is_no_hint() {
         let run = IndexHint {
@@ -2679,14 +2312,9 @@ mod tests {
     }
 
     /// How many rounds discovery takes, which is its wall time: a round costs one HEAD's latency
-    /// however many it asks. The steady state is one round of two HEADs; a store one index
-    /// behind, two; a store that has verified nothing, against a channel of builds 6 to 71,
-    /// three; and every channel from 6 to any build below a thousand, from no floor or from a
-    /// floor at or near either end, at most five.
     #[test]
     fn discovery_takes_a_few_rounds_where_the_walk_takes_many_heads() {
         /// Rounds and HEADs from `floor` to a channel publishing 6 to `newest`, guessing from
-        /// `hint`.
         fn hinted_rounds(floor: u64, newest: u64, hint: Option<IndexHint>) -> (usize, usize) {
             let mut known = std::collections::BTreeMap::<u64, HeadVerdict>::new();
             let mut rounds = 0;
@@ -2724,7 +2352,6 @@ mod tests {
             }
         }
         assert!(worst <= 5, "{worst} rounds");
-        // The fetcher's own walk goes out in those rounds.
         assert_eq!(
             walk(71, &channel(6, 71), &[]).rounds,
             1,
@@ -2735,10 +2362,6 @@ mod tests {
             3,
             "the fetcher, first contact"
         );
-        // A store that verified nothing but holds the §14 cache (a pass that resolved and
-        // landed nothing) guesses from the cache's highest build: one round fewer when the
-        // channel has not moved since, the same answer and no more than the walk's bound of
-        // rounds when it has, or when the hint is no build the channel publishes.
         let seen = |newest| Some(IndexHint { low: None, newest });
         assert_eq!(
             hinted_rounds(0, 71, seen(71)).0,
@@ -2752,10 +2375,6 @@ mod tests {
                 "{newest} hinted {hint}"
             );
         }
-        // A fresh install whose release cut compiled in the run it saw (atpkg-index-8 to 71,
-        // `ship release`'s ATPKG_INDEX_HINT) guesses its whole first round: one round while the
-        // channel has not moved since, two while it moved up to 32 builds on; and a floor one
-        // index behind that the window's probe woke for the next one walks in one round, not two.
         let run = |newest| {
             Some(IndexHint {
                 low: Some(8),
@@ -2771,8 +2390,6 @@ mod tests {
         for newest in 72..=103 {
             assert_eq!(hinted_rounds(0, newest, run(71)).0, 2, "moved to {newest}");
         }
-        // The cache's hint buys the same once the channel moved past it: two rounds to 76,
-        // three past it, where its guess alone took four from 73 on.
         for newest in 71..=103 {
             let want = if newest <= 76 { 2 } else { 3 };
             assert_eq!(
@@ -2783,8 +2400,6 @@ mod tests {
         }
         assert_eq!(hinted_rounds(70, 71, seen(71)).0, 1, "one behind, woken");
         assert_eq!(walk_with(70, seen(71), &channel(6, 71), &[]).rounds, 1);
-        // A probe build at or below the floor (a pass verified it since the probe woke this
-        // one) is no hint: the steady state's one round of two HEADs.
         for hint in [71, 70, 3] {
             assert_eq!(
                 hinted_rounds(71, 71, seen(hint)),
@@ -2799,7 +2414,6 @@ mod tests {
     }
 
     /// HEADs whose first attempts are scripted apart from the rest ([`Heads`]), each call
-    /// recorded: what a walk's first round asks of the transport.
     struct ScriptedHeads<'a> {
         first: &'a (dyn Fn(u64) -> aterm_update_core::FirstHead + Sync),
         rest: &'a (
@@ -2869,11 +2483,6 @@ mod tests {
     }
 
     /// A WALK'S FIRST ROUND IS ITS LINK PROBE. When every first attempt in it reached no host,
-    /// the walk fails then and there: the link is held down once for the process, and no HEAD
-    /// backs off to try again — the offline first launch's whole wait. One HEAD a host
-    /// answered, or failures of any other kind (a timeout after the handshake), and every HEAD
-    /// whose first attempt may still change gets the rest of its attempts, and nothing is held
-    /// down. Later rounds ask whole.
     #[test]
     fn a_walk_whose_first_round_reaches_no_host_is_offline_at_once() {
         use crate::flow::Fetcher as _;
@@ -2900,9 +2509,6 @@ mod tests {
                 heads.agains.lock().unwrap().is_empty() && heads.wholes.lock().unwrap().is_empty(),
                 "from {floor}: no HEAD retried a link that is not there"
             );
-            // One HEAD of the round reached no host on its first attempt and every other
-            // answered: it alone gets the rest of its attempts, and the walk lands what the
-            // channel publishes.
             let lone = if floor == 0 { 8 } else { 72 };
             let one_unreached = |b: u64| {
                 if b == lone {
@@ -2922,8 +2528,6 @@ mod tests {
             assert_eq!(ScriptedHeads::sorted(&heads.agains), vec![lone]);
             assert_eq!(heads.downs.load(std::sync::atomic::Ordering::Relaxed), 0);
             assert!(!f.index_link_down());
-            // Every first attempt failed, none for want of a host (a transfer that timed
-            // out): each gets its honest retries.
             let timed_out = |_| FirstHead::Again {
                 answer: Err(HttpError::Transport(
                     "curl: (28) Operation timed out".into(),
@@ -2942,7 +2546,6 @@ mod tests {
     }
 
     /// The scratch directory [`probe_a_first_round_over_counted_curl`] runs in, set only for
-    /// the child [`a_first_rounds_curls_are_one_per_head_offline_and_whole_online`] starts.
     #[cfg(unix)]
     const LINK_PROBE_ENV: &str = "ATPKG_TEST_LINK_PROBE_DIR";
     /// That probe's name, as `--exact` wants it.
@@ -2950,10 +2553,6 @@ mod tests {
     const LINK_PROBE: &str = "net::tests::probe_a_first_round_over_counted_curl";
 
     /// The child's half: a first round of three HEADs over the PRODUCTION transport ([`Wire`],
-    /// [`aterm_update_core::head_no_redirect_first`]), its curl the counting wrapper the
-    /// parent laid ([`aterm_update_core::CURL_SEAM`]), then one whole HEAD of a fourth build —
-    /// what the round's link verdict leaves a request after it. Nothing without the parent's
-    /// directory.
     #[cfg(unix)]
     #[test]
     fn probe_a_first_round_over_counted_curl() {
@@ -2970,7 +2569,6 @@ mod tests {
         let mut out: Vec<String> = round.iter().map(said).collect();
         out.push(match after {
             Ok(answer) => format!("after {}", answer.code),
-            // The class, not curl's words: a link held down fails as a transport error.
             Err(aterm_update_core::HttpError::Transport(_)) => "after err transport".into(),
             Err(e) => format!("after err {e:?}"),
         });
@@ -2978,12 +2576,6 @@ mod tests {
     }
 
     /// PKG-4'S LINK PROBE, COUNTED IN PROCESSES. The first round runs in a child of this test
-    /// binary ([`probe_a_first_round_over_counted_curl`]) whose every curl is a wrapper that
-    /// logs its URL and answers as the scenario says. On a dead link (every attempt exits 7,
-    /// no host) the round spends exactly ONE curl per HEAD, and the link it then holds down
-    /// answers the next request in one more. On a live one (two HEADs answer 404, the third
-    /// reaches no host) that third HEAD still gets attempts two and three — the round's
-    /// answers say the link is up — and the others one each.
     #[cfg(unix)]
     #[test]
     fn a_first_rounds_curls_are_one_per_head_offline_and_whole_online() {
@@ -3007,8 +2599,6 @@ mod tests {
                 .args(["--exact", "--nocapture", LINK_PROBE])
                 .env(LINK_PROBE_ENV, dir.path())
                 .env(aterm_update_core::CURL_SEAM, &wrapper)
-                // The online HEAD's attempts two and three come after curl's backoff, at
-                // a thousandth under the fast-timers seam: the count is what is pinned.
                 .env(aterm_types::domain::ENV_DEV_FAST_TIMERS, "1")
                 .stdin(aterm_uds::spawnfd::Stdio::null())
                 .output()
@@ -3058,10 +2648,6 @@ mod tests {
     }
 
     /// The manifest prefetch asks both halves of every pinned pair, each under its own cap, and
-    /// memoizes only whole pairs: the reads after it fetch nothing, a pair whose signature did
-    /// not arrive is fetched again by the read that wants it, and a prefetched pair still has to
-    /// verify (the memo holds bytes, not trust, so a tampered signature is refused as one fresh
-    /// off the wire).
     #[test]
     fn the_manifest_prefetch_fills_the_memo_with_bytes_not_trust() {
         use crate::sig::testkit;
@@ -3112,7 +2698,6 @@ mod tests {
             )
             .into_bytes(),
         );
-        // Whole pairs serve the reads with nothing fetched — and still have to verify.
         let (raw, sig) = f.manifest_pair("ay", "ay", 8256, &wire).unwrap();
         assert!(
             index.verify_pkg(raw, &sig).is_ok(),
@@ -3124,20 +2709,15 @@ mod tests {
             "a tampered signature the prefetch carried is refused"
         );
         assert!(asked.lock().unwrap().is_empty(), "both read from the memo");
-        // The pair that did not arrive whole is the read's to fetch, and its failure too.
         let err = f.manifest_pair("nn", "nn", 108, &wire).unwrap_err();
         assert!(err.contains("HTTP 503"), "{err}");
         assert_eq!(asked.lock().unwrap().len(), 2, "fetched again on the read");
-        // What the memo holds is not asked again.
         asked.lock().unwrap().clear();
         f.prefetch_with(&pins[..2], &wire);
         assert!(asked.lock().unwrap().is_empty());
     }
 
     /// THE PREFETCH IS ONE WAVE: a set with more pairs than the shared fan-out keeps in
-    /// flight has every request out at once, so no program's manifest waits for another's to
-    /// land — the eleventh program's pair was a second round before the announcement. Each
-    /// request is answered only once all of them have arrived; a minute is the hang detector.
     #[test]
     fn the_manifest_prefetch_asks_every_pair_in_one_wave() {
         let f = GithubFetcher::new("alabsystems".into());
@@ -3173,7 +2753,6 @@ mod tests {
     }
 
     /// A host whose every answer is "published" cannot hold the walk: it stops at its HEAD
-    /// budget with a named failure, and fetches nothing.
     #[test]
     fn the_walk_stops_at_its_head_budget() {
         let w = walk(44, &|_| published(), &[]);
@@ -3194,8 +2773,6 @@ mod tests {
         assert_eq!(q.roster_sig, format!("{base}aterm-machines.toml.sig"));
         assert!(index_quad("a/b/c", "atpkg-index-41").is_none());
         assert!(index_quad("alabsystems/aterm", "atpkg-index-4/1").is_none());
-        // Below the §14 cache's candidate ceiling, with room for the cached index beside a
-        // refused set.
         const { assert!(INDEX_CANDIDATE_CAP < 24) };
     }
 }

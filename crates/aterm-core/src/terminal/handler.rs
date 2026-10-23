@@ -216,7 +216,7 @@ impl TerminalHandler<'_> {
     /// once per completed parser action (a bulk text run is one action), never
     /// per DCS/APC payload byte.
     #[inline]
-    pub(super) fn note_sync_open_action(&mut self) {
+    pub(super) const fn note_sync_open_action(&mut self) {
         if self.modes.synchronized_output {
             self.transient.sync_open_dirty = true;
         }
@@ -242,7 +242,7 @@ impl TerminalHandler<'_> {
     }
 
     #[inline]
-    pub(super) fn sgr_style(&mut self) -> SgrStyleHandler<'_> {
+    pub(super) const fn sgr_style(&mut self) -> SgrStyleHandler<'_> {
         SgrStyleHandler {
             grid: &mut *self.grid,
             style: &mut *self.style,
@@ -251,7 +251,7 @@ impl TerminalHandler<'_> {
     }
 
     #[inline]
-    pub(super) fn cursor_state(&mut self) -> CursorStateHandler<'_> {
+    pub(super) const fn cursor_state(&mut self) -> CursorStateHandler<'_> {
         CursorStateHandler {
             grid: &mut *self.grid,
             style: &mut *self.style,
@@ -353,7 +353,7 @@ impl TerminalHandler<'_> {
     /// Returns whether appending `additional_len` would stay within the cap,
     /// which the replies share with the unsolicited reports.
     #[inline]
-    pub(super) fn can_append_response_bytes(&self, additional_len: usize) -> bool {
+    pub(super) const fn can_append_response_bytes(&self, additional_len: usize) -> bool {
         self.transient.owed_len().saturating_add(additional_len) <= MAX_RESPONSE_BUFFER_SIZE
     }
 
@@ -660,7 +660,7 @@ pub(super) fn note_full_clear(top: u64, from_home: bool, shell: &mut super::Shel
 /// between the shell's A and its prompt), that row is too far down, and the
 /// shell's C brings it back (`TerminalHandler::shell_execution_start`).
 #[inline]
-fn restart_prompt(prompt: &mut u64, command: &mut Option<u64>, top: u64) {
+const fn restart_prompt(prompt: &mut u64, command: &mut Option<u64>, top: u64) {
     if let Some(row) = command {
         *row = top.saturating_add(row.saturating_sub(*prompt));
     }

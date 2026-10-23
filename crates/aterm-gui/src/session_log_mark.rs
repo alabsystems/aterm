@@ -1,39 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE SESSION LOG'S CONSUMER HALF, host side (design §7.2-§7.4, phase 3A):
-//! what a reader of the log is told beside the log itself, a child module of
-//! `session_log` so it reaches [`SessionLog`]'s fields as the carry module
-//! does.
-//!
-//! - [`SessionLog::status_fields`]: the `status` record's `log_seq= log_ep=
-//!   run= turn= step= need= need_since_ms=`, from the reader's view (a fenced
-//!   log shows its fence).
-//! - [`SessionLog::take_log_wake`]: THE WAKE. A producer appends under the
-//!   timeline's lock and takes the owed wake, which rings the session's
-//!   watchers (`await log`, `subscribe … log`) when this says the reader's
-//!   head moved: `SessionTimeline::slog_take_wake` rings them in that same
-//!   hold, and a `mark` ([`SessionLog::mark_claim`]) once its hold ends.
-//!   Every producer site does so (the status sweep, the settle tick, a
-//!   person's burst, the restore lineage, a failure seen, a fence lifted,
-//!   control input, a `ctl turn`, a `mark`); the session's close wakes
-//!   through `Wake::Exit`.
-//! - [`SessionLog::ctl_input`]: control input, by its author, its burst's
-//!   `mark - input`; [`validate_cause`] what a `cause=` may name.
+//! Host-side consumer marks and rate limiting for the session log.
 
 use super::SessionLog;
 
 impl SessionLog {
     /// THE `status` FIELDS (phase 3A), printed before the `gen=`/`seq=`/
-    /// `hash=` stamp: `log_seq=<n> log_ep=<e> run=<r|-> turn=<t|-> step=<p|->
-    /// need=<w|-> need_since_ms=<ms|->`. The head and the epoch are the
-    /// reader's ([`aterm_slog::Log::reader_last_seq`]: the fence while an
-    /// update's carry stands), so a `since=` taken from them is one every
-    /// read accepts; the open path and the need are the fold's as a reader is
-    /// shown it. `need=` is the most urgent OBSERVED need: `status` is the
-    /// classifier's record and names no author, so a need a claim raised
-    /// (`mark … need`) appears only in `brief` (`claim need …`). `need_since_ms=`
-    /// is its age at `now_wall`.
     pub(crate) fn status_fields(&self, now_wall: u64) -> String {
         let log = &self.log;
         let st = log.reader_state();
@@ -61,13 +34,9 @@ impl SessionLog {
     }
 }
 
-// Control input and `cause=` (phase 3A, design §2.5-§2.6).
-
 use aterm_slog::{Actor, Conf, Fields, Key, Kind, Mark, Node, ShortId, Src, Stamp};
 
 /// What an acted control input's mark says: its `act=`, and
-/// `re=` the step it was admitted under when that step closed before its
-/// bytes were written.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct InputAct {
     pub(crate) act: Option<aterm_slog::ActWord>,
@@ -89,8 +58,6 @@ impl InputAct {
 }
 
 /// The input verbs the log names (`mark - input verb=`): `send`, `key` (and
-/// `ctrl`), `paste` (and `paste-bin`), `feed` (and `feed-bin`), `turn`.
-/// `mouse` and `focus` are not recorded.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum InputVerb {
     /// `send`.
@@ -131,17 +98,9 @@ impl InputVerb {
 }
 
 /// The authors whose control-input bursts are told apart: the
-/// trusted actors (the harness, the bridge, `ctl`, the person) each have a
-/// burst clock of their own outside every table, so no flood of other
-/// authors suppresses their `mark - input`; sessions (edge sources) and the
-/// unattributed share a table of eight, each slot reused once its burst
-/// ended, and one slot every author past them shares, so they open a burst
-/// at most once a window together.
 const INPUT_BURST_ACTORS: usize = 8;
 
 /// Which reserved burst clock a trusted actor's input keeps
-/// ([`Consumers::reserved`]), or `None`: a session or nobody, which share
-/// the table.
 const fn reserved_burst(by: &Actor) -> Option<usize> {
     match by {
         Actor::Harness => Some(0),
@@ -153,29 +112,19 @@ const fn reserved_burst(by: &Actor) -> Option<usize> {
 }
 
 /// THE CONSUMER HALF's state in a session's log (one `SessionLog` field):
-/// the mark limiter, the watchers' wake and the control-input bursts. Under
-/// 2 KiB a session, and under 4 KiB while the limiter's owed-only table is
-/// full (32 entries of 56 bytes on the heap); not counted by
-/// `Log::footprint`.
 #[derive(Debug)]
 pub(crate) struct Consumers {
     /// `mark`'s per-author limiter ([`aterm_slog::MarkLimiter`]): one claim a
-    /// second, bursts of twenty, the trusted authors' buckets their own.
     limiter: aterm_slog::MarkLimiter,
     /// The reader's head (epoch, seq) the watchers were last woken for
-    /// ([`SessionLog::take_log_wake`]).
     notified: (u32, u64),
     /// When each trusted actor last sent control input (monotonic ms), by
-    /// [`reserved_burst`]: never shared, never taken by another author.
     reserved: [Option<u64>; 4],
     /// Which session (or nobody) last sent control input, and when.
     bursts: [Option<(Actor, u64)>; INPUT_BURST_ACTORS],
     /// When an author past the table last sent input.
     other: Option<u64>,
     /// The exit path is running and the retire that writes the session's
-    /// close may follow it: a parked `await log` waits for that close
-    /// ([`SessionLog::note_close_due`]). Cleared by the close itself and by
-    /// the end of the exit handling ([`SessionLog::take_close_due`]).
     close_due: bool,
 }
 
@@ -194,10 +143,6 @@ impl Default for Consumers {
 
 impl Consumers {
     /// Whether input from `by` at `now_mono` opens a burst: its first after
-    /// [`crate::session_timeline::HUMAN_BURST_GAP_MS`] without one. A
-    /// trusted actor keeps its own clock ([`reserved_burst`]); any other
-    /// author keeps its slot while it types, and a new one takes a free slot
-    /// or one whose burst ended, else the shared one.
     fn burst_starts(&mut self, by: Actor, now_mono: u64) -> bool {
         let gap = crate::session_timeline::HUMAN_BURST_GAP_MS;
         let ended = |t: u64| now_mono.saturating_sub(t) >= gap;
@@ -230,16 +175,6 @@ impl Consumers {
 
 impl SessionLog {
     /// THE OWED WAKE (phase 3A, design §2.2): whether what a reader is shown
-    /// moved since the watchers were last woken — the reader's head
-    /// ([`aterm_slog::Log::reader_last_seq`]) or its epoch — and so whether
-    /// this session's watchers are owed a wake. `SessionTimeline::slog_take_wake`
-    /// takes it and rings them in the same timeline hold, as
-    /// `SessionTimeline::record` does: the watchers' `slots` lock is the leaf
-    /// under the timeline's lock. [`Self::mark_claim`] hands it to the `mark`
-    /// arm, which rings them once that hold ends. One comparison of two
-    /// numbers, so no append path (this phase's, an earlier one's, or a later
-    /// one's) can be forgotten: every append moves the head, a fence lifting
-    /// moves it past the overlap, an adoption moves the epoch.
     pub(crate) fn take_log_wake(&mut self) -> bool {
         let head = (self.log.ep(), self.log.reader_last_seq());
         let owed = head != self.consumers.notified;
@@ -248,46 +183,22 @@ impl SessionLog {
     }
 
     /// THE CLOSE IS DUE (`App::exit_session_logical`, told BEFORE the session
-    /// reads `Exited`): its program ended and the exit path is running, so
-    /// the retire that writes the session's close (`close - spawn
-    /// out=shell-exit code=`) may follow. Only while this holds does an
-    /// `await log` parked on an ended session wait for that close
-    /// (`control_session::await_log`); every other ended session answers
-    /// `ERR exited` at once — a pane kept after its program ended (`--hold`,
-    /// a shell that failed at start, a held pane restored across an update),
-    /// or one any later path marks `Exited`, writes no close until someone
-    /// closes it. The close clears it ([`Self::close_session`]), and so does
-    /// the end of the exit handling when no retire came
-    /// ([`Self::take_close_due`]).
     pub(crate) fn note_close_due(&mut self) {
         self.consumers.close_due = true;
     }
 
     /// Whether the session's close is due ([`Self::note_close_due`]). Only for
-    /// tests: production reads the flag only inside `await_look`, together
-    /// with the log, so no waiter can read the two in separate lock holds.
     #[cfg(test)]
     pub(crate) fn close_due(&self) -> bool {
         self.consumers.close_due
     }
 
     /// THE EXIT HANDLING IS OVER (`App::settle_log_close`): clear
-    /// [`Self::note_close_due`] and say whether it still held, i.e. whether
-    /// the waiters parked on it must be woken to read that no close is coming.
     pub(crate) fn take_close_due(&mut self) -> bool {
         std::mem::take(&mut self.consumers.close_due)
     }
 
     /// CONTROL INPUT reached the session (`send`, `key`, `paste`, `feed`, and
-    /// their binary twins, once it moved bytes): the tracker attributes a turn
-    /// that opens within 5 s to `by` (the connection's actor, never a
-    /// parameter) with its `cause=`, a run a waiting name opens later is told
-    /// it too (`Typed`), and the first input of a burst from `by` writes
-    /// `mark - input verb=<v> [cause= cause_k=] by=<a> src=ctl conf=strong` on
-    /// the session. The bytes are never recorded.
-    /// An input that carries `act=` (`acted`) is marked at
-    /// every input, with its act and a late one's step, within its author's
-    /// mark tokens ([`Self::ctl_input_mark`]).
     pub(crate) fn ctl_input(
         &mut self,
         by: Actor,
@@ -306,10 +217,6 @@ impl SessionLog {
     }
 
     /// THE ACCEPTANCE of a control input admitted as `adm` (its bytes fully
-    /// written): a person's key the timeline's hold kept from the
-    /// log first (T2), then the tracker binds the input from `by` with its
-    /// `act=` to the approval or question step it was admitted under, or
-    /// led to. What it came to (a late input's step, for its mark's `re=`).
     pub(crate) fn ctl_accepted(
         &mut self,
         by: Actor,
@@ -327,30 +234,11 @@ impl SessionLog {
     }
 
     /// THE ADMISSION of a control input about to be written:
-    /// what the agent's tracker holds now, read under the timeline lock the
-    /// writer takes before a byte. `None` with no agent run.
     pub(crate) fn admit_input(&self, at: Stamp) -> Option<aterm_slog::Admission> {
         self.agent.as_ref().map(|a| a.tracker.admit(at))
     }
 
     /// The input mark alone, for an input the tracker was already told of (a
-    /// `ctl turn`'s first byte, [`SessionLog::ctl_turn`]): written at the first
-    /// input of a burst from `by`.
-    /// An acted input is marked whatever the burst, `mark -
-    /// input verb=<v> act=<w> [re=<step>] [dropped=<n> [pool=shared]]
-    /// by=<it>`, `re=` the
-    /// step a late one was admitted under (it closed before the bytes were
-    /// written), within its author's mark tokens: one past its burst's first
-    /// spends one ([`aterm_slog::MarkLimiter`], as a claim does: twenty, then
-    /// one a second), and one its bucket is short of is counted, not marked,
-    /// the author's next acted mark saying how many (`dropped=`): its own
-    /// count, a trusted actor's, a named slot's holder's, or an overflowed
-    /// author's owed-only entry's; past
-    /// that table, the shared pool's, said as the pool's (`dropped=<n>
-    /// pool=shared`) by an overflowed author with none of its own
-    /// ([`aterm_slog::MarkLimiter::owed`]). So no author's acted keys push
-    /// the session's other records out of its ring, and no author's count
-    /// rides another author's mark as that author's.
     pub(crate) fn ctl_input_mark(
         &mut self,
         by: Actor,
@@ -392,7 +280,6 @@ impl SessionLog {
         let mut f = f;
         if dropped > 0 {
             let _ = f.set(Key::Dropped, aterm_slog::Val::U(dropped));
-            // The shared pool's count is said as the pool's.
             if owed.is_shared() {
                 f = f.clone().word(Key::Pool, "shared").unwrap_or(f);
             }
@@ -416,7 +303,6 @@ impl SessionLog {
     }
 
     /// Whether this log's mail records name broker offset `off` (a `mail`
-    /// mark's `off=`).
     fn names_mail(&self, off: u64) -> bool {
         self.log
             .window()
@@ -424,8 +310,6 @@ impl SessionLog {
     }
 
     /// Whether seq `n` lies in this log's current seq space: from its first
-    /// accounted seq to the head a reader is shown, outside every seq range it
-    /// never held.
     fn in_seq_space(&self, n: u64) -> bool {
         let log = &self.log;
         n >= log.first_seq().max(1)
@@ -461,12 +345,6 @@ impl CauseRef {
 pub(crate) const CAUSE_USAGE: &str = "ERR usage: cause=@<off>|<seq> names the mail (@broker offset) or record (seq) acted on, once\n";
 
 /// THE CAUSE CHECK: `cause=` names only what THIS
-/// session holds — mail it was delivered or a post of its own landed at
-/// ([`crate::fabric::SessionFabric::holds_offset`]) or a `mail` record of its
-/// log names, or a record seq inside its log's current seq space outside
-/// every hole. The inbox lock and then the timeline's leaf lock, each alone
-/// (no new lock order). `Ok` is the id the turn will name; `Err` the reply,
-/// answered before any byte is written.
 pub(crate) fn validate_cause(ctx: &crate::SessionCtx, cause: CauseRef) -> Result<ShortId, String> {
     match cause {
         CauseRef::Mail(off) => {
@@ -490,9 +368,6 @@ pub(crate) fn validate_cause(ctx: &crate::SessionCtx, cause: CauseRef) -> Result
         }
     }
 }
-
-// `mark` (phase 3A, design §7.4): attributed, rate-limited claims that never
-// act.
 
 /// The `mark` verb's usage line.
 pub(crate) const MARK_USAGE: &str = "ERR usage: mark <node|-> note|verdict|label|need|clear|act \
@@ -527,7 +402,6 @@ const LABEL_MAX_BYTES: usize = 40;
 const LABEL_TTL_MAX_S: u64 = 3600;
 
 /// A parsed `mark` request: what it asks to write, checked for shape (the
-/// session's own facts — the node, `re=` — are checked under its locks).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct MarkReq {
     /// The node named (`None`: `-`, the deepest open node).
@@ -549,9 +423,6 @@ fn is_as_name(s: &str) -> bool {
 }
 
 /// A `text=` value through the `meta set` ladder (design §7.4): percent-
-/// decoded, trimmed, never empty, never with control, bidi or invisible
-/// formatting (refused, not stripped), within the field's 160 encoded bytes
-/// (refused, not clamped).
 fn mark_text(raw: &str) -> Result<String, String> {
     let decoded = aterm_codec::pct::decode(raw);
     let text = decoded.trim();
@@ -564,8 +435,6 @@ fn mark_text(raw: &str) -> Result<String, String> {
     if aterm_slog::field::encoded_len(text) > 160 {
         return Err("ERR mark: text over 160 bytes encoded\n".to_string());
     }
-    // What the field keeps is what was asked: a character its own filter
-    // drops (a hidden one) is refused, never stripped.
     if aterm_slog::BoundedText::new(Key::Text, text).is_none_or(|t| t.as_str() != text) {
         return Err("ERR mark: text has forbidden formatting\n".to_string());
     }
@@ -574,8 +443,6 @@ fn mark_text(raw: &str) -> Result<String, String> {
 
 impl MarkReq {
     /// Parse `mark`'s arguments (pure): every refusal of shape, before any
-    /// lock. A kind's words and options are §7.4's table; an option the kind
-    /// does not take, an option given twice or an unknown one is the usage.
     pub(crate) fn parse(rest: &str) -> Result<MarkReq, String> {
         use aterm_grapheme::GraphemeClusters as _;
         let usage = || MARK_USAGE.to_string();
@@ -613,7 +480,6 @@ impl MarkReq {
             ttl: None,
             rule: None,
         };
-        // What each kind takes: (word list, text, ttl, rule).
         let (words, takes_text, takes_ttl, takes_rule): (
             Option<&[&'static str]>,
             bool,
@@ -658,9 +524,6 @@ impl MarkReq {
                     );
                 }
                 "re" => req.re = Some(CauseRef::parse(v).ok_or_else(usage)?),
-                // A chosen name is never an actor word a connection's class
-                // names (class): `by=- as=harness` would read as
-                // the harness to whoever reads the log.
                 "as" if is_as_name(v) && aterm_slog::field::is_reserved_name(v) => {
                     return Err(format!("ERR mark: as={v} is a session log actor\n"));
                 }
@@ -669,7 +532,6 @@ impl MarkReq {
                 _ => return Err(usage()),
             }
         }
-        // What each kind requires.
         let missing = match kind {
             Kind::Note | Kind::Label => req.text.is_none(),
             Kind::Verdict | Kind::Need | Kind::Act => req.word.is_none(),
@@ -688,7 +550,6 @@ impl MarkReq {
     }
 
     /// The record's fields: `word= text= ttl= rule= re= as=`, existing keys
-    /// only (at most six, inside a record's bound).
     fn fields(&self, re: Option<ShortId>) -> Fields {
         let mut f = Fields::new();
         if let Some(w) = self.word {
@@ -723,11 +584,6 @@ impl MarkReq {
 
 impl SessionLog {
     /// WRITE A CLAIM (design §7.4): `req` by `by` (the connection's actor),
-    /// `re` already checked. Refused when the named node is not open (a mark
-    /// never moves to another node in silence) or was never issued, or when
-    /// `by`'s bucket is short (`Err` carries `retry_ms`). Appended as `src=mark
-    /// conf=claim`, the token spent only then. Returns the seq, the node it
-    /// landed on and whether the readers are owed a wake.
     pub(crate) fn mark_claim(
         &mut self,
         req: &MarkReq,
@@ -768,22 +624,6 @@ impl SessionLog {
     }
 
     /// A SELF-SUPERVISED AGENT'S ACT: what a
-    /// proven self-claim's holder told with `meta set harness_act <act>`, as
-    /// the log's `mark <node> act word=<w> rule=<act> holder=<h>
-    /// harness_act=<act> by=<a> src=mark conf=claim` — the word
-    /// [`aterm_agent::harness::acts::self_claim_act`] gives, on the deepest
-    /// open node (the approval's step while one is open; `-` only when
-    /// nothing is), as the loop's own act marks land. `by` is the
-    /// connection's actor (`log_actor`), never a parameter of the request;
-    /// `holder` the proven claim's holder the server read from the session's
-    /// meta (host tier: an id the server sets, never caller text; phase 6,
-    /// 6F-7), left out when it is no id; and the act as the holder told it
-    /// (`harness_act=`, host tier, the `harness-act` row's whole, which a
-    /// wire `rule=` cannot hold). A claim like any mark: the act is the
-    /// holder's word, spent from `by`'s mark bucket and held to the log's
-    /// mark quota. EVERY ACT IS A RECORD (the review of 6F-7): an act with no
-    /// word is `word=unknown`, with no `rule=`, so no `harness-act` row stands
-    /// alone. Returns the seq, if one was written.
     pub(crate) fn self_claim_act(
         &mut self,
         act: &str,
@@ -816,19 +656,6 @@ impl SessionLog {
 }
 
 /// THE `mark` VERB (design §7.4): parse, check `re=` against what this session
-/// holds (the inbox lock alone, then the timeline's), then write the claim
-/// under the timeline's leaf lock alone ([`SessionLog::mark_claim`]). `by` is
-/// the connection's actor ([`crate::control`]'s `log_actor`); `reads` whether
-/// the connection may read the session. Returns the reply and whether the
-/// session's watchers are owed a wake. A mark is a record and nothing else:
-/// this path names no input, signal or session write (the census's
-/// `slog-inert`).
-///
-/// WHAT A WRITER WHO MAY NOT READ LEARNS: nothing of the session. Naming a
-/// node or a `re=` is reading it — the answer says whether that node is open
-/// or that record or mail exists — so both need read, as `cause=` does
-/// (`ERR denied`); and its `OK` names neither the seq its claim took (the
-/// log's head) nor the node the claim landed on: `OK by=<actor>`.
 pub(crate) fn cmd_mark(
     ctx: &crate::SessionCtx,
     by: Actor,
@@ -866,9 +693,6 @@ pub(crate) fn cmd_mark(
     }
 }
 
-// `await log` (design §7.2): park on the session log
-// until a need, an open, a close or a kind, never polling and never spinning.
-
 /// The `await log` usage line.
 pub(crate) const AWAIT_LOG_USAGE: &str = "ERR usage: await log <wait>[,<wait>...] \
      [since=<seq> ep=<e>] [timeout=<ms>]; <wait> is need|open=<lvl>|close=<lvl>|kind=<k>, at \
@@ -881,8 +705,6 @@ pub(crate) const LOG_WAITS_MAX: usize = 4;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum LogWait {
     /// A record that raises a need ([`aterm_slog::need_raised`]): a step's open
-    /// (`approval`, `question`, `wall`, `stall`), a run's close `out=fail`,
-    /// the session's close, a `need` mark (a claim's shows `conf=claim`).
     Need,
     /// A node of the level opens.
     Open(aterm_slog::Lvl),
@@ -920,9 +742,6 @@ impl LogWait {
 }
 
 /// What one `await log` waits for: one to
-/// [`LOG_WAITS_MAX`] distinct predicates, written `need,close=turn`; a record
-/// that satisfies ANY of them answers the wait, and the wait is one waiter
-/// however many it lists.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct LogWaits {
     list: [LogWait; LOG_WAITS_MAX],
@@ -939,7 +758,6 @@ impl LogWaits {
     }
 
     /// The comma-separated list `token` names: each member a predicate, none
-    /// twice, at most [`LOG_WAITS_MAX`]; `None` otherwise.
     fn parse(token: &str) -> Option<LogWaits> {
         let mut waits: Option<LogWaits> = None;
         for member in token.split(',') {
@@ -962,7 +780,6 @@ impl LogWaits {
     }
 
     /// Whether `need` is among them: a since-less wait then latches as `need`
-    /// alone does ([`SessionLog::await_start`]).
     pub(crate) fn has_need(&self) -> bool {
         self.members().contains(&LogWait::Need)
     }
@@ -979,7 +796,6 @@ pub(crate) struct LogAwait {
     /// The predicates, any of which answers.
     pub(crate) what: LogWaits,
     /// Where to read from (`since=` and the `ep=` it came with), or `None`:
-    /// from what the log holds now.
     pub(crate) since: Option<aterm_slog::Cursor>,
 }
 
@@ -996,12 +812,6 @@ fn await_lvl(w: &str) -> Option<aterm_slog::Lvl> {
 
 impl LogAwait {
     /// Parse `await log`'s arguments (the `timeout` already taken off):
-    /// exactly one predicate list (`need,close=turn`: up to
-    /// [`LOG_WAITS_MAX`] distinct members); `since=` with the `ep=` it came with, always
-    /// (as `log` and `subscribe … since-log= log-ep=` take them: a cursor
-    /// with no epoch is one no read can place, which would answer a reset gap
-    /// that never happened). Anything else is the usage, answered at once and
-    /// parking nothing.
     pub(crate) fn parse(args: &[&str]) -> Result<LogAwait, &'static str> {
         let mut what: Option<LogWaits> = None;
         let (mut since, mut ep) = (None, None);
@@ -1038,14 +848,6 @@ pub(crate) enum LogAwaitStep {
 
 impl SessionLog {
     /// Where an `await log` with no `since=` starts, and a latched answer:
-    /// `need` LATCHES from the fold's open OBSERVED needs as a reader is shown
-    /// them (never by replaying the ring, which a gap or a carried
-    /// update's hole would answer again and again; a claim's need is left out,
-    /// as `status need=` leaves it, or a need nobody can lift would answer
-    /// every wait), `OK seq=<raised> ep=<e> as_of=<head> latched=1 <record>`
-    /// (the raising record when the ring still holds it, else `need=<w>
-    /// node=<n>`); every other wait starts at the reader's head. A list
-    /// holding `need` latches as `need` alone does (5F-1).
     pub(crate) fn await_start(&self, what: LogWaits) -> LogAwaitStep {
         let log = &self.log;
         let head = aterm_slog::Cursor::new(log.ep(), log.reader_last_seq());
@@ -1072,13 +874,6 @@ impl SessionLog {
     }
 
     /// ONE CHECK of an `await log` from `cursor` (the timeline's leaf lock is
-    /// the caller's): nothing new (an O(1) compare of the head), the first
-    /// record past it that satisfies `what` (`OK seq=<n> ep=<e>[ gap=<why>:<lost>]
-    /// <record>`, the gap the records before it crossed, counted exactly up to
-    /// it), a gap with no match among what the read returned (`OK gap why=
-    /// lost= resync_to=<next> ep=` — `resync_to` the read's own `next`, so a
-    /// wait re-armed there reads past the hole and never meets the same gap),
-    /// or the cursor to read on from.
     pub(crate) fn await_check(&self, what: LogWaits, cursor: aterm_slog::Cursor) -> LogAwaitStep {
         let log = &self.log;
         if log.reader_last_seq() == cursor.seq && log.ep() == cursor.ep {
@@ -1086,9 +881,6 @@ impl SessionLog {
         }
         let read = log.read(cursor, aterm_slog::MAX_RECORDS);
         if let Some(at) = read.recs.iter().position(|r| what.matches(r)) {
-            // The read up to the match alone: its gap is exactly the loss the
-            // records before the match crossed (a loss after it is the next
-            // wait's to say).
             let upto = log.read(cursor, at + 1);
             let r = upto.recs[at];
             let gap = upto
@@ -1114,16 +906,6 @@ impl SessionLog {
     }
 
     /// ONE LOOK of an `await log` at an ended session (phase 3A review): the
-    /// check from `cursor` ([`Self::await_check`]) and whether the close is
-    /// still due ([`Self::note_close_due`]), read under one `&self` borrow
-    /// and so within one hold of the timeline's lock. The close and the
-    /// clearing of the flag happen in one hold ([`Self::close_session`]). So
-    /// if a look finds the close not due, the close is in what it read
-    /// whenever one was written: it never gets `(Wait, false)` over a close
-    /// the log holds. It is one method so that a waiter cannot split the look
-    /// across two holds, which would let a retire land between them and the
-    /// waiter answer `ERR exited` over its close. Outside tests nothing else
-    /// reads the flag.
     pub(crate) fn await_look(
         &self,
         what: LogWaits,

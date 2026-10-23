@@ -82,6 +82,9 @@ aterm-digest = { workspace = true }
 workspace = true
 
 [dev-dependencies]
+# `plain_durable_flushes_in_tests!`: the doctor's journal tests make thousands of
+# durable flushes, which this test binary takes as plain `fsync(2)`s.
+aterm-durable = { workspace = true }
 aterm-tempfile = { workspace = true }
 # The tests' scratch-directory stamp (the workspace's one epoch-clock read).
 aterm-time = { workspace = true }

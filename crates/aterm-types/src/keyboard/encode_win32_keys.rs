@@ -102,7 +102,7 @@ pub(super) fn win32_named_record(
 /// the legacy `ESC ESC [ E` typed `[E`). No `NUMLOCK_ON`: the key is only KP_Begin with the
 /// lock off.
 #[cfg_attr(trust_verify, trust::skip)]
-fn win32_keypad_begin(modifiers: Modifiers) -> Win32KeyRecord {
+const fn win32_keypad_begin(modifiers: Modifiers) -> Win32KeyRecord {
     Win32KeyRecord {
         vk: WIN32_VK_CLEAR,
         sc: WIN32_SC_KEYPAD_5,
@@ -164,7 +164,7 @@ fn win32_f13_f20(
 
 /// The chord bits of `dwControlKeyState`, LEFT standing for either side as elsewhere.
 #[cfg_attr(trust_verify, trust::skip)]
-fn chord_state(modifiers: Modifiers) -> u32 {
+const fn chord_state(modifiers: Modifiers) -> u32 {
     let mut cs = 0;
     if modifiers.contains(Modifiers::SHIFT) {
         cs |= WIN32_SHIFT_PRESSED;
@@ -204,7 +204,7 @@ fn win32_ctrl_break(modifiers: Modifiers) -> Option<Win32KeyRecord> {
 /// Ctrl+Shift+Space, so its record completed nothing where the NUL, read as Ctrl+@, runs
 /// MenuComplete (and Git Bash gets nothing either way).
 #[cfg_attr(trust_verify, trust::skip)]
-fn win32_space_chord(modifiers: Modifiers) -> Option<Win32KeyRecord> {
+const fn win32_space_chord(modifiers: Modifiers) -> Option<Win32KeyRecord> {
     let shift = modifiers.contains(Modifiers::SHIFT);
     let ctrl = modifiers.contains(Modifiers::CTRL);
     let alt = modifiers.contains(Modifiers::ALT);

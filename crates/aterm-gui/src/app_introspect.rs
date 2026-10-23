@@ -1,19 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The application-render client-frame introspection path.
-//! `snapshot` (SIGUSR1 PNG+txt) and `render_image` (the control `image` verb)
-//! capture the CURRENT app-owned route (terminal, native, or heterogeneous,
-//! including host chrome/effects). A windowed SIGUSR1 snapshot copies the exact
-//! successful application-present client destination, including swapchain-only
-//! transforms and remainder bands, and a windowed `image` copies the same
-//! destination cut back to its frame (`capture_source_kind` says when it
-//! rerenders instead). Headless capture has no presentation target and is
-//! explicitly a semantic-renderer artifact. `read_native_chrome` and
-//! `capture_window` form the distinct OS-chrome boundary; full-window capture
-//! binds that chrome to a successful application-present client destination.
-//! None of these client-frame paths claims compositor visibility or scanout.
-
+//! Window introspection, screenshot capture, and diagnostic state serialization.
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -30,17 +18,13 @@ use crate::platform::AppRt;
 use crate::snapshot_path;
 use crate::{App, accessibility, control_auth};
 
-/// How long a test waits for a reply the capture path owes it. The encoders run at
-/// `Background` QoS, the class macOS starves first under load, so this is a hang
-/// detector, not a latency budget: a wait ends the moment the reply comes.
 #[cfg(test)]
 const WORKER_PATIENCE: Duration = Duration::from_secs(60);
 
 const DEFERRED_GPU_CAPTURE_LIMIT: usize = 8;
 const GPU_CAPTURE_PENDING: &str = "capture pending: waiting for the requested GPU drawable";
 
-/// The original request owns its deadline cancellation and artifact permit for
-/// the entire wait. No caller reply is sent until this same request completes.
+/// The original request owns its deadline cancellation and artifact permit for the entire wait.
 pub(crate) struct DeferredGpuCapture {
     window: WindowId,
     surface: u64,
@@ -70,10 +54,7 @@ impl CapturePresentBudget {
     }
 }
 
-/// One pixel capture: the `image` verb, a SIGUSR1 snapshot, or the `window`
-/// verb. Every capture enters [`App::run_capture`] as one of these; one deferred
-/// for its GPU drawable waits as the same value and re-enters there when the
-/// drawable is ready.
+/// One pixel capture.
 pub(crate) enum CaptureRequest {
     Image(ImageReq),
     Snapshot {
@@ -83,16 +64,10 @@ pub(crate) enum CaptureRequest {
     Window(WindowReq),
 }
 
-/// A `window` photograph: platform chrome stitched around the exact presented
-/// client frame.
+/// A `window` photograph.
 #[cfg(any(target_os = "macos", windows))]
 pub(crate) struct WindowReq {
-    /// The logical window to photograph; `None` is the front window. A deferred
-    /// macOS photograph names the window it waited on (`CaptureRequest::bound_to`).
     target: Option<WindowId>,
-    /// The surface the caller named (`window <target>`): refused unless the front
-    /// window shows it ([`App::window_target_refusal`]), asked again when a
-    /// deferred photograph resumes.
     aux: AuxTarget,
     handoff: crate::control::ReplyRetentionPermit,
     path: control_auth::ConfinedImage,
@@ -101,8 +76,6 @@ pub(crate) struct WindowReq {
 }
 
 impl CaptureRequest {
-    /// The window this capture photographs: for `@<sid> image` the window whose
-    /// active tab displays that session, otherwise the front window.
     fn target_window(&self, app: &App) -> Option<WindowId> {
         match self {
             Self::Image(request) => match request.session {
@@ -115,8 +88,6 @@ impl CaptureRequest {
         }
     }
 
-    /// What the capture may be made from, which sizes its admission
-    /// ([`App::capture_bytes_estimate`]).
     fn charge(&self) -> CaptureCharge {
         match self {
             Self::Image(request) => {
@@ -128,8 +99,6 @@ impl CaptureRequest {
         }
     }
 
-    /// The verb's answer once its caller has cancelled (its deadline passed);
-    /// `None` while the caller still waits. A snapshot has no caller to cancel.
     fn cancellation(&self) -> Option<&'static str> {
         match self {
             Self::Image(request) => request
@@ -145,9 +114,6 @@ impl CaptureRequest {
         }
     }
 
-    /// Whether this capture copies its window's presented destination when it
-    /// can: a snapshot and `window` always, an `image` unless plain. A deferred
-    /// one that armed the tap owns it while it waits for its drawable.
     fn takes_client_tap(&self) -> bool {
         match self {
             Self::Image(request) => !request.clean,
@@ -157,9 +123,6 @@ impl CaptureRequest {
         }
     }
 
-    /// A deferred macOS photograph stays bound to the window it waited on, even
-    /// if another came to the front meanwhile. A named overlay is a surface of
-    /// the FRONT window, so that photograph stays bound to the front window.
     #[cfg(target_os = "macos")]
     fn bound_to(self, window: WindowId) -> Self {
         match self {
@@ -186,10 +149,6 @@ impl CaptureRequest {
         }
     }
 
-    /// Answer busy: the encoder already holds its byte budget
-    /// ([`App::admit_capture`]), so nothing is captured. A refused snapshot's
-    /// generation is begun and left unpublished: a stale `.done` from an earlier
-    /// snapshot must not answer a requester's stat for this one.
     fn reject_busy(self) {
         match self {
             Self::Image(request) => {
@@ -222,7 +181,6 @@ impl CaptureRequest {
         }
     }
 
-    /// Answer that the window this capture waited on is no longer its target.
     fn reject_retargeted(self) {
         let error = match &self {
             Self::Image(_) => "image target changed while waiting for GPU acquisition",
@@ -242,8 +200,6 @@ fn deferred_capture_owns_current_tap(exact_tap: bool, expected: u64, current: Op
     exact_tap && current == Some(expected)
 }
 
-/// A ready drawable still needs its ordinary repaint if capture rejected
-/// before submitting, starting another acquire, or scheduling a real failure.
 fn capture_resume_owns_next_frame(
     before: u64,
     after: u64,
@@ -253,8 +209,6 @@ fn capture_resume_owns_next_frame(
     after != before || pending || !retry_open
 }
 
-/// The bounded ownership transfer used by every deferred request. Rejection
-/// returns the same owned request so its reply and artifact permit cannot vanish.
 fn enqueue_deferred_gpu_capture(
     queue: &mut std::collections::VecDeque<DeferredGpuCapture>,
     capture: DeferredGpuCapture,
@@ -352,17 +306,7 @@ impl App {
         }
     }
 
-    /// THE door every pixel capture enters: the `image` verb, a SIGUSR1
-    /// snapshot, the `window` verb, and a deferred capture once its GPU drawable
-    /// is ready ([`Self::resume_deferred_gpu_captures`]). It asks, in order:
-    /// whether a `window <target>` names a surface the front window shows
-    /// (`window_target_refusal`); whether the encoder has room for its bytes
-    /// ([`Self::admit_capture`]);
-    /// whether its caller still waits; and whether an earlier capture of the
-    /// same window already waits for a drawable, in which case this one queues
-    /// behind it to keep control order. Only then does the verb's body run, with
-    /// a fresh present budget, except a deferred capture's replay, which keeps
-    /// the budget it waited with.
+    /// THE door every pixel capture enters.
     pub(crate) fn run_capture(&mut self, request: CaptureRequest) {
         #[cfg(any(target_os = "macos", windows))]
         if let CaptureRequest::Window(window) = &request
@@ -395,14 +339,10 @@ impl App {
                 CaptureRequest::Window(request) => self.window_body(wid, request),
             }
         }
-        // A body that deferred, refused or replied without an encode job
-        // leaves its permit here: release it.
         self.capture_permit = None;
     }
 
-    /// Consume waiting control demand before an ordinary ready redraw can take
-    /// its drawable. At most the entry queue length is serviced in one turn;
-    /// another Pending yields immediately to the worker's next completion.
+    /// Consume waiting control demand before an ordinary ready redraw can take its drawable.
     pub(crate) fn resume_deferred_gpu_captures(&mut self, window: WindowId, surface: u64) -> bool {
         let budget = self.deferred_gpu_captures.len();
         let mut serviced = false;
@@ -450,9 +390,6 @@ impl App {
                 request.reject_retargeted();
             }
             self.replaying_gpu_capture = None;
-            // The replay either consumed its tap or requeued that same owner.
-            // Cancellation/target rejection can happen between dequeue and the
-            // capture entry; followers never inherit an abandoned exact tap.
             if capture.exact_tap
                 && !self.deferred_gpu_captures.iter().any(|queued| {
                     queued.window == window && queued.surface == surface && queued.exact_tap
@@ -483,198 +420,93 @@ impl App {
     }
 }
 
-/// Headless capture may arrive long after the output wake that created a word.
-/// Ten seconds is the effects engine's episode-retention horizon: older stamps
-/// are equivalent for every bounded one-shot, and clamping avoids carrying an
-/// arbitrary process-lifetime duration into the reconstruction tick.
 const CAPTURE_BIRTH_MAX_AGE: Duration = Duration::from_secs(10);
 
-/// When capture is the first presentation, sample a feline episode at the end
-/// of its 450 ms rise: the authored cat is fully visible, the sighting is real
-/// (pixels landed), and no timer or synthetic frame loop is introduced between
-/// capture requests. A still-pending output stamp proves the application
-/// presentation accounting has not consumed it yet, even for a windowed
-/// surface whose redraw was occluded.
 const CAPTURE_PREVIEW_AGE: Duration = Duration::from_millis(450);
 
-/// What a capture takes from the present its barrier forces
-/// ([`App::present_before_capture`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PresentTake {
-    /// The serial and the host visuals: the capture reads the window's model
-    /// (text, hashes) or rerenders it.
     Model,
-    /// Also the exact client destination that present submitted, copied by
-    /// the one-shot tap armed for it. A tap that cannot be armed or taken
-    /// fails the attempt.
     ClientTap,
-    /// The client destination when the tap copies it, else the model: a tap
-    /// that cannot be armed lets the present run without it, and one that
-    /// cannot be taken binds the present without its destination, so the
-    /// capture rerenders the presented model instead of failing.
     ClientTapOrModel,
 }
 
-/// Whether a capture of a window can force a present of it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CaptureTarget {
-    /// It presents to a surface: a capture is bound to a present it forces.
     Windowed,
-    /// No surface: a capture stages its own frame.
     Headless,
 }
 
-/// One successful application present a capture is bound to: its serial and
-/// the host visuals committed beside it, plus the exact destination when the
-/// barrier tapped it. It owns no model. A barrier's present and the capture
-/// that reads it run in one synchronous main-thread turn, so the window's
-/// `input_scratch` is the presented model until that turn yields: text and
-/// hashes borrow it, and only a rerender takes an owned copy
-/// ([`App::take_rerender_input`]). A recording's still carries the recorded
-/// present's serial and visuals here and its resident model beside it
-/// ([`RecordingPresentedFrame`]).
 #[derive(Debug)]
 struct PresentedCapture {
     serial: u64,
     visuals: crate::app_render::HostVisualState,
-    /// `Some` for [`PresentTake::ClientTap`], and for
-    /// [`PresentTake::ClientTapOrModel`] when its tap copied the destination:
-    /// the whole client destination, as the present's surface holds it.
     client: Option<CapturePixels>,
 }
 
-/// One recording-owned successful-present tuple resolved against the GPU's
-/// still-resident input epoch. Every validation happens before the input clone;
-/// callers then own an immutable model while this main-thread request renders.
 struct RecordingPresentedFrame {
     presented: PresentedCapture,
-    /// The model the recorded present rendered, cloned from the GPU's resident
-    /// copy: the window's scratch may already hold a newer one.
     input: aterm_render::RenderInput,
     terminal_grid: Option<crate::app_render::TerminalCaptureGrid>,
     facts: RecordedFacts,
 }
 
-/// What a headless recording froze at its present, which a still of it reads
-/// in place of the live values: the window's renderer state may have moved on
-/// since, and the still describes the recorded frame.
 struct RecordedFacts {
     cell_size: (usize, usize),
     theme_fingerprint: u64,
     overlay_fingerprint: u64,
-    /// The native or mixed frame's metadata, built when the still asked for it;
-    /// the encoded frame's size and pixel fingerprint are filled in later.
     native_metadata: Option<crate::control::ImageFrameMetadata>,
 }
 
-/// Exact pixels of the current persistent headless destination, bound to the
-/// recording's last successful application-present tuple. This is deliberately
-/// independent of the semantic resident model: later renderer/card state may
-/// change while these already-presented bytes remain authoritative.
 struct RecordingPresentedDestination {
     pixels: CapturePixels,
     route: crate::VisibleContentRoute,
     serial: u64,
 }
 
-/// What a capture asks of its source ([`App::resolve_capture_source`]).
 #[derive(Clone, Copy, Debug)]
 struct SourcePolicy {
-    /// Whether the frame is the destination a present submitted
-    /// ([`capture_source_kind`]).
     destination: DestinationDemand,
-    /// The sink encodes the frame, not the surface around it: a window's
-    /// tapped destination is cut back to the frame its present placed
-    /// (`image`). A snapshot writes the whole client destination, bands
-    /// included.
     frame_only: bool,
-    /// The sink reads the frame's model beside its pixels (snapshot text,
-    /// image metadata), so a headless recording's destination also brings the
-    /// resident model the recording validated.
     model: bool,
-    /// The sink builds `image --meta`: a recorded frame's metadata is frozen
-    /// with it, and a presented terminal frame brings its inventory.
     metadata: bool,
 }
 
-/// Whether a capture's frame is the destination a present submitted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DestinationDemand {
-    /// Never: the frame is a rerender with the host bling layers emptied
-    /// (`image plain`).
     Never,
-    /// Whenever the destination shows what the window shows and can be
-    /// copied as it is; otherwise, or when the tap fails, a rerender
-    /// (`image`).
     Preferred,
-    /// Always: a window the platform guards refuse is refused (the SIGUSR1
-    /// snapshot).
     Required,
 }
 
 impl DestinationDemand {
-    /// An `image`'s: `image plain` (`clean`) never takes the destination, any
-    /// other `image` prefers it.
     fn of_image(clean: bool) -> Self {
         if clean { Self::Never } else { Self::Preferred }
     }
 }
 
-/// What a capture may be made from, which sizes the bytes it is admitted with
-/// ([`App::capture_bytes_estimate`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CaptureCharge {
-    /// A frame of the window (`image`, a SIGUSR1 snapshot): a rerender, or,
-    /// unless the demand is [`DestinationDemand::Never`], the destination a
-    /// present submitted.
     Frame(DestinationDemand),
-    /// `window`: the platform photograph with the presented client stitched
-    /// in ([`WindowStitch`]).
     #[cfg(any(target_os = "macos", windows))]
     Window,
 }
 
-/// What a capture's frame is made from ([`capture_source_kind`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SourceKind {
-    /// The destination a present submitted: the barrier's tap of a window's
-    /// own present, or a headless recording's virtual target.
     Destination,
-    /// A rerender of the model.
     Rerender,
 }
 
-/// The facts of a capture's window that choose its source
-/// ([`capture_source_kind`]).
 #[derive(Clone, Copy, Debug)]
 struct SourceFacts {
-    /// The window presents to a surface ([`CaptureTarget::Windowed`]).
     windowed: bool,
-    /// The window presents a translucent client layer
-    /// ([`App::client_is_translucent`]): on every platform its destination is
-    /// the layer before anything is put behind its alpha, not what the window
-    /// shows.
     translucent: bool,
-    /// The platform guards on a copy of the window's client layer
-    /// ([`App::client_capture_guards`]): `Err` when the compositor blends it
-    /// with what is behind the window, or with a backdrop material.
     guards: Result<(), &'static str>,
-    /// The window's present can be tapped: its surface offers a copy of its
-    /// destination ([`App::client_tap_is_copyable`]).
     copyable: bool,
-    /// A recording of this window is running.
     recording: bool,
 }
 
-/// THE source decision for every capture that does not photograph the
-/// platform window (`image`, the SIGUSR1 snapshot). A window's own present is
-/// tapped when the capture wants its destination, the copy shows what the
-/// window shows (an opaque client the platform guards admit) and the surface
-/// offers one; a capture that requires the destination is
-/// refused by the guards instead, and leaves a failed copy to the barrier. A
-/// headless window's glass is its recording's virtual target, when one runs.
-/// Anything else is a rerender. `Err` is a required destination the guards
-/// refuse.
 fn capture_source_kind(
     demand: DestinationDemand,
     facts: SourceFacts,
@@ -697,17 +529,11 @@ fn capture_source_kind(
     })
 }
 
-/// Where a capture's pixels come from, chosen once per capture
-/// ([`App::resolve_capture_source`]).
 enum CaptureSource {
-    /// Pixels a present already produced, encoded as they are: the client
-    /// destination the barrier tapped, or a headless recording's virtual
-    /// target. They already hold the tray, the host visuals and the GPU-only
-    /// passes, so nothing is layered on them again.
-    Destination { pixels: CapturePixels, serial: u64 },
-    /// The model, rasterized by [`App::rerender_capture`] under `visuals`:
-    /// those retained beside the present `serial` names, or, for a frame
-    /// staged in this turn (`serial: None`), the host policy sampled then.
+    Destination {
+        pixels: CapturePixels,
+        serial: u64,
+    },
     Rerender {
         serial: Option<u64>,
         visuals: crate::app_render::HostVisualState,
@@ -715,8 +541,6 @@ enum CaptureSource {
 }
 
 impl CaptureSource {
-    /// The present this frame is bound to; `None` for a frame staged in this
-    /// turn.
     fn serial(&self) -> Option<u64> {
         match *self {
             Self::Destination { serial, .. } => Some(serial),
@@ -724,9 +548,6 @@ impl CaptureSource {
         }
     }
 
-    /// `frame-phase`: `destination` for the pixels a present submitted,
-    /// `presented` for a rerender of the model a present rendered, `staged`
-    /// for a rerender of a frame staged in this turn.
     fn phase(&self) -> &'static str {
         match self {
             Self::Destination { .. } => "destination",
@@ -738,59 +559,32 @@ impl CaptureSource {
     }
 }
 
-/// The layout and facts a capture's sink reads beside its pixels.
 struct CaptureContext {
-    /// The plan and route the frame was laid out from: the request layout, or
-    /// the plan a headless staging returned. A recording's destination taken
-    /// without its model (an `image` without metadata) is encoded as it is,
-    /// and its sink reads neither.
     plan: crate::tab_model::VisibleLeafPlan,
     route: crate::VisibleContentRoute,
-    /// A terminal frame's inventory: the staging's, the recording's, or, for
-    /// a sink that builds metadata, the one the barrier's present filled.
     terminal_grid: Option<crate::app_render::TerminalCaptureGrid>,
-    /// Facts frozen at a headless recording's present; `None` reads them live.
     recorded: Option<RecordedFacts>,
 }
 
-/// One capture resolved to its source ([`App::resolve_capture_source`]).
 struct ResolvedCapture {
     source: CaptureSource,
-    /// The model the frame shows. `None`: the window's `input_scratch`, which
-    /// the barrier's present or this turn's staging filled, and which a
-    /// rerender copies ([`App::take_rerender_input`]). `Some`: the model a
-    /// headless recording presented, owned.
     model: Option<aterm_render::RenderInput>,
     context: CaptureContext,
 }
 
-/// Why a capture has no source this turn. Each verb answers in its own words.
 #[derive(Debug)]
 enum CaptureDeferral {
-    /// Nothing to capture this frame: no visible layout, or a staging that
-    /// found nothing to draw (`image` answers `0 0`).
     Nothing,
-    /// A synchronized terminal update holds the staging until `retry_at`.
     Held { retry_at: Instant },
-    /// The barrier waits for its GPU drawable: the caller queues its request
-    /// ([`App::queue_gpu_capture`]).
     PendingGpu,
-    /// The capture cannot be taken.
     Refused(String),
 }
 
-/// Borrowed visible-layout authority valid only for one synchronous main-loop
-/// control turn. It may be reused across bounded present retries, which cannot
-/// mutate tabs, pane topology, zoom, or window cell bounds, but must never be
-/// retained across an event-loop yield.
 type VisibleFrameLayoutRef<'a> = (
     &'a crate::tab_model::VisibleLeafPlan,
     crate::VisibleContentRoute,
 );
 
-/// What an `image --meta` reads of the frame it describes, beside the model
-/// and layout: its pixels' fingerprint is the encode worker's to fill in
-/// ([`PendingMetadata`]).
 #[derive(Clone, Copy)]
 struct ImageFrameFacts {
     phase: &'static str,
@@ -799,24 +593,14 @@ struct ImageFrameFacts {
     height: u32,
 }
 
-/// An `image --meta` built on the main thread from the model, layout and
-/// rasters its frame was made from, which the encode worker completes with
-/// the `pixel-fingerprint` of the pixels it encodes and publishes before it
-/// answers ([`run_encode_job`]): the control thread reads it once the reply
-/// arrives.
+/// An `image --meta` built on the main thread from the model.
 pub(crate) struct PendingMetadata {
     metadata: crate::control::ImageFrameMetadata,
-    /// The frame's raster is its encoded pixels (a terminal frame): its
-    /// `raster-fingerprint`, and its singular leaf's, are the
-    /// `pixel-fingerprint`. A native frame's raster is the retained card,
-    /// hashed apart.
     raster_is_pixels: bool,
     cell: std::sync::Arc<std::sync::OnceLock<crate::control::ImageFrameMetadata>>,
 }
 
 impl PendingMetadata {
-    /// Fill in the encoded pixels' fingerprint and publish the metadata.
-    /// `Err` when the request's metadata was already published.
     fn publish(self, pixel_fingerprint: u64) -> Result<(), String> {
         let Self {
             mut metadata,
@@ -837,15 +621,9 @@ impl PendingMetadata {
     }
 }
 
-/// A capture's pixels as their producer made them, moved to the encode worker
-/// as they are ([`EncodeJob`]): no producer converts one form into another, and
-/// the worker reads any form a row at a time ([`Self::rgba_row`]). A tapped
-/// destination is cut back to its frame by narrowing the part that is read
-/// ([`Self::cut_to`]), so the thread that took it moves no pixel.
+/// A capture's pixels as their producer made them, moved to the encode worker as they are ([`EncodeJob`]).
 pub(crate) struct CapturePixels {
     store: PixelStore,
-    /// The part of `store` that is the capture, in its pixels: all of it, or
-    /// the frame a present placed in its destination.
     view: aterm_render::PixelRect,
 }
 
@@ -864,28 +642,20 @@ impl std::fmt::Debug for CapturePixels {
     }
 }
 
-/// The buffer a capture's pixels live in, in the form their producer made.
 enum PixelStore {
-    /// Straight-alpha RGBA8, tightly packed: a `window` photograph stitched on
-    /// the encode worker. Only [`CapturePixels::rgba8`] makes one; stock
-    /// rustc counts that expected-dead constructor as live, so the variant is
-    /// live there and an `expect` here goes unfulfilled, hence `allow`.
     #[cfg_attr(not(any(target_os = "macos", windows, test)), allow(dead_code))]
-    Rgba8 { width: usize, bytes: Vec<u8> },
-    /// The renderer's packed `0xTTRRGGBB` frame: a rerender (the CPU raster or
-    /// the GPU readback).
+    Rgba8 {
+        width: usize,
+        bytes: Vec<u8>,
+    },
     Packed(Frame),
-    /// A GPU present's destination as its staging buffer mapped it, in the
-    /// swapchain's format and colour space: a windowed tap, or a headless
-    /// recording's virtual target.
     Raw(aterm_gpu::video_tap::RawCapture),
-    /// A CPU present's softbuffer, packed `0x__RRGGBB`. The surface is opaque,
-    /// so the high byte never reached it: every pixel's alpha is 255.
-    Softbuffer { width: usize, pixels: Vec<u32> },
+    Softbuffer {
+        width: usize,
+        pixels: Vec<u32>,
+    },
 }
 
-/// `Err` unless a buffer of `len` units is exactly `width · height` pixels of
-/// `per_pixel` units each.
 fn exact_pixels(
     what: &str,
     len: usize,
@@ -918,8 +688,6 @@ impl CapturePixels {
         }
     }
 
-    /// Tightly packed straight RGBA8. `Err` unless `bytes` is
-    /// `4 · width · height` long.
     #[cfg_attr(
         not(any(target_os = "macos", windows, test)),
         expect(dead_code, reason = "a window photograph is macOS's and Windows'")
@@ -947,8 +715,7 @@ impl CapturePixels {
         Self::whole(PixelStore::Raw(raw), width, height)
     }
 
-    /// A CPU present's `width`×`height` softbuffer. `Err` unless it holds
-    /// `width · height` pixels.
+    /// A CPU present's `width`×`height` softbuffer.
     pub(crate) fn softbuffer(
         pixels: Vec<u32>,
         width: usize,
@@ -962,8 +729,6 @@ impl CapturePixels {
         ))
     }
 
-    /// Narrow the capture to `rect` of its pixels. `Err` when `rect` is not
-    /// inside them.
     fn cut_to(mut self, rect: aterm_render::PixelRect) -> Result<Self, String> {
         let inside = |start: usize, len: usize, bound: usize| {
             start.checked_add(len).is_some_and(|end| end <= bound)
@@ -984,24 +749,16 @@ impl CapturePixels {
         Ok(self)
     }
 
-    /// Width and height in pixels.
     fn dims(&self) -> (usize, usize) {
         (self.view.width, self.view.height)
     }
 
-    /// What encoding this capture holds at most on the encode worker, for
-    /// [`CapturePermit::recharge`]: the pixels' allocation as they travel (a
-    /// destination cut to its frame keeps its surface's), the PNG they grow
-    /// into and the encoder's scratch ([`capture_encode_overhead`]). The
-    /// fingerprint's one row is read before the encode, inside that scratch.
     fn peak_bytes(&self) -> usize {
         let (width, height) = self.dims();
         self.allocation()
             .saturating_add(capture_encode_overhead(width, height))
     }
 
-    /// The bytes the pixels' buffer holds: its allocation, whatever part of
-    /// it the capture is.
     fn allocation(&self) -> usize {
         match &self.store {
             PixelStore::Rgba8 { bytes, .. } => bytes.capacity(),
@@ -1016,10 +773,6 @@ impl CapturePixels {
         }
     }
 
-    /// Append row `y` as straight RGBA8: a packed pixel's alpha is
-    /// `255 - transmittance`, a softbuffer pixel's 255, a raw destination's
-    /// its conversion to sRGB. A row outside the capture appends nothing,
-    /// which the encoder refuses as a short row.
     fn rgba_row(&self, y: usize, row: &mut Vec<u8>) {
         let aterm_render::PixelRect {
             x: x0,
@@ -1047,7 +800,6 @@ impl CapturePixels {
                     return;
                 };
                 for &pixel in scanline {
-                    // `as u8` keeps each channel's byte.
                     row.extend_from_slice(&[
                         (pixel >> 16) as u8,
                         (pixel >> 8) as u8,
@@ -1077,11 +829,6 @@ impl CapturePixels {
         }
     }
 
-    /// `pixel-fingerprint`: SipHash of the width, the height and the packed
-    /// `0xTTRRGGBB` pixels as one `[u32]`, whichever form the pixels travel
-    /// in. A packed frame's rows are hashed in place; any other form is
-    /// converted a row at a time and packed a block at a time into the same
-    /// hasher input, never as a copy of the frame. Runs on the encode worker.
     fn pixel_fingerprint(&self) -> u64 {
         use std::hash::{Hash, Hasher};
 
@@ -1090,8 +837,6 @@ impl CapturePixels {
         let mut hash = std::collections::hash_map::DefaultHasher::new();
         width.hash(&mut hash);
         height.hash(&mut hash);
-        // `<[u32]>::hash`: the length, then every pixel's bytes in one stream,
-        // which the hasher folds the same however it is split.
         width.saturating_mul(height).hash(&mut hash);
         if let PixelStore::Packed(frame) = &self.store {
             for y in self.view.y..self.view.y + height {
@@ -1119,11 +864,6 @@ impl CapturePixels {
     }
 }
 
-/// What a `width` x `height` capture's encode holds beside its pixels: the
-/// PNG, which the encoder writes into a buffer reserved to its bound
-/// ([`aterm_png::max_encoded_len`]), and the encoder's scratch
-/// ([`aterm_png::encoder_scratch_len`]). Geometry no PNG can hold charges
-/// everything: its encode is refused, but nothing is admitted beside it.
 fn capture_encode_overhead(width: usize, height: usize) -> usize {
     let (Ok(width), Ok(height)) = (u32::try_from(width), u32::try_from(height)) else {
         return usize::MAX;
@@ -1135,12 +875,6 @@ fn capture_encode_overhead(width: usize, height: usize) -> usize {
         .unwrap_or(usize::MAX)
 }
 
-/// What a capture of a `width`×`height` frame holds until its encode is done,
-/// as [`CapturePixels::peak_bytes`] counts it: the larger of its rerender's
-/// packed frame (four bytes a pixel) and `destination`, the allocation of a
-/// destination a present submitted, which travels whole however it is cut to
-/// the frame (an f16 swapchain's eight bytes a pixel, padded rows); plus the
-/// frame's encode ([`capture_encode_overhead`]).
 fn frame_capture_peak(width: usize, height: usize, destination: Option<usize>) -> usize {
     width
         .saturating_mul(height)
@@ -1149,10 +883,7 @@ fn frame_capture_peak(width: usize, height: usize, destination: Option<usize>) -
         .saturating_add(capture_encode_overhead(width, height))
 }
 
-/// One encoded capture: the PNG and the size it shows, which the reply and a
-/// snapshot's `.done` marker name once the pixels, and the capture bytes they
-/// held, are gone (the encode worker drops both before it answers:
-/// [`run_encode_job`]).
+/// One encoded capture.
 pub(crate) struct CapturePng {
     width: u32,
     height: u32,
@@ -1160,11 +891,7 @@ pub(crate) struct CapturePng {
 }
 
 impl CapturePng {
-    /// THE capture encoder: 8-bit RGBA with an `sRGB` chunk (intent
-    /// Perceptual; a frame's RGB is non-linear sRGB, so wide-gamut viewers need
-    /// not guess), converted, filtered and compressed a row at a time from the
-    /// pixels as they travel. Runs on the encode worker. An error is an answer,
-    /// never a worker panic.
+    /// THE capture encoder.
     pub(crate) fn encode(pixels: &CapturePixels) -> Result<Self, String> {
         note_pixel_work();
         let (width, height) = pixels.dims();
@@ -1186,9 +913,6 @@ pub(crate) fn encode_frame_png(frame: &Frame) -> CapturePng {
         .expect("a fixture frame encodes")
 }
 
-/// Run `write` on an 8-bit RGBA sRGB (Perceptual) PNG writer whose sink is
-/// reserved to the file's bound, so the encode never reallocates it and holds
-/// at most [`capture_encode_overhead`] beside its pixels.
 fn encode_srgb_rgba8(
     width: u32,
     height: u32,
@@ -1210,7 +934,6 @@ fn encode_srgb_rgba8(
     Ok(out)
 }
 
-/// `raster-fingerprint` of a retained RGBA raster: its size and its bytes.
 fn hash_raster(width: u32, height: u32, rgba: &[u8]) -> u64 {
     use std::hash::{Hash, Hasher};
 
@@ -1222,8 +945,7 @@ fn hash_raster(width: u32, height: u32, rgba: &[u8]) -> u64 {
 }
 
 impl crate::SettingsCard {
-    /// This card's `raster-fingerprint`, hashed once per card: every capture
-    /// of an unchanged card reads the first hash.
+    /// This card's `raster-fingerprint`, hashed once per card.
     pub(crate) fn raster_fingerprint(&self) -> u64 {
         *self
             .raster_fingerprint_once
@@ -1232,8 +954,6 @@ impl crate::SettingsCard {
 }
 
 impl crate::NativeLeafRaster {
-    /// This raster's `raster-fingerprint`, hashed once per raster pass: every
-    /// capture until the next pass reads the first hash.
     fn raster_fingerprint(&self) -> u64 {
         *self
             .raster_fingerprint_once
@@ -1259,9 +979,6 @@ fn capture_rescan_birth(now: Instant, pending: Option<Instant>, windowless: bool
     }
 }
 
-/// Serialize the terminal band of an already-composed capture. Top tab-strip
-/// rows are chrome, but split dividers and every pane's visible cells are part
-/// of the terminal viewport and remain in the text.
 fn terminal_capture_text(
     input: &aterm_render::RenderInput,
     strip_rows: usize,
@@ -1275,8 +992,6 @@ fn terminal_capture_text(
     text
 }
 
-/// Assemble the non-macOS `chrome` response after the platform adapter has read
-/// its live tab model.
 #[cfg(not(target_os = "macos"))]
 fn non_macos_chrome_output(
     mut platform_lines: Vec<String>,
@@ -1291,9 +1006,6 @@ fn non_macos_chrome_output(
     if let Some(toolbar_tabs) = toolbar_tabs {
         platform_lines.push(toolbar_tabs);
     }
-    // The tab strip's version label (Windows) follows the tab model it sits in,
-    // and the strip's window buttons (Linux, where the band is the header) the
-    // label.
     if let Some(strip_version) = strip_version {
         platform_lines.push(strip_version);
     }
@@ -1303,21 +1015,11 @@ fn non_macos_chrome_output(
     if let Some(ime) = ime {
         platform_lines.push(ime);
     }
-    // Per-tab context-menu mirror lines (`tab-menu tab=<i> items=[...]`) ride
-    // between the toolbar-tabs line and the app menu, matching the macOS order.
     platform_lines.extend(tab_menu_lines);
     platform_lines.extend(menu_lines);
     platform_lines
 }
 
-/// The `chrome` verb's `ime` line: the front window's input-method composition
-/// as the platform reported it (`Ime::Preedit`: its text, quoted as Rust quotes a
-/// string, and its caret, a byte offset into it, `-` for none) and the caret box
-/// aterm last reported back for it (`set_ime_cursor_area`, window pixels
-/// `x,y,wxh`, `-` before the first), the spot an input method draws its
-/// preedit or candidates at:
-/// `ime preedit="<text>" caret=<n|-> spot=<x>,<y>,<w>x<h>|-`. The composition is
-/// painted, never typed, so `text` never shows it; this line does.
 #[cfg(any(test, not(target_os = "macos")))]
 fn ime_chrome_line(
     preedit: &str,
@@ -1332,14 +1034,6 @@ fn ime_chrome_line(
     format!("ime preedit={preedit:?} caret={caret} spot={spot}")
 }
 
-/// The `chrome` verb's `strip-caption` line (Linux): the window's own frame
-/// (`crate::client_frame`, LW.5) and the buttons the front window's strip LAID
-/// OUT for it, so the columns it prints are the ones `pointer move -1 <col>` and
-/// a click resolve. Where the window draws its own frame:
-/// `strip-caption frame=client buttons=<button>:<s>..<e>,… hovered=<button|none>
-/// maximized=<bool> edges=<bool> menu=<bool>` (`buttons=none` when the strip laid
-/// none out: no strip, or none laid out yet); where the window system decorates
-/// it: `strip-caption frame=system`.
 #[cfg(any(test, not(target_os = "macos")))]
 fn strip_caption_chrome_line(
     segments: &[crate::tab_bar::TabSegment],
@@ -1381,20 +1075,12 @@ fn strip_caption_chrome_line(
     )
 }
 
-/// Why the strip shows no version label, for the `strip-version shown=no` line.
 #[cfg(any(test, not(target_os = "macos")))]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum StripVersionAbsence {
-    /// The window has no in-grid strip (`tab_strip_rows == 0`).
     NoStrip,
-    /// The strip has no layout to report: no frame has laid it out since the
-    /// window opened or since a chrome regrid cleared it (a headless instance
-    /// lays its strip out when it composes a frame — an `image`).
     NotLaidOut,
-    /// The strip was laid out before its UI face landed, so no slot was
-    /// measured — the label is laid out in that face or not at all.
     NoUiFace,
-    /// The tabs need every column: no rung fits without costing a tab its seat.
     StripFull,
 }
 
@@ -1410,16 +1096,6 @@ impl StripVersionAbsence {
     }
 }
 
-/// The `chrome` verb's `strip-version` line: the version label as it was laid
-/// out in the front window's strip (`segments` — `ws.tab_segments`), so the
-/// columns it prints are the ones `pointer move -1 <col>` and a click resolve,
-/// and `action=` is what that click fires ([`crate::menu::version_slot_click`],
-/// printed as its `invoke` token). Shown:
-/// `strip-version shown=yes rung=<full|short> cols=<s>..<e> text="…" attention=<bool>
-/// hovered=<bool> action=<token>`; not shown: `strip-version shown=no
-/// reason=<no-strip|not-laid-out|no-ui-face|strip-full> text="<the full label>" attention=<bool>
-/// action=<token>` — `absent` is the caller's reading of why, consulted only when
-/// no label was laid out. A label that is laid out reports its own update mark.
 #[cfg(any(test, not(target_os = "macos")))]
 fn strip_version_chrome_line(
     segments: &[crate::tab_bar::TabSegment],
@@ -1458,14 +1134,6 @@ fn strip_version_chrome_line(
     }
 }
 
-/// A captured frame handed OFF the winit event-loop thread, which only took its
-/// pixels, for every pixel pass after that: the conversion of a mapped
-/// destination, the cut, the fingerprint, the PNG encode, and the confined
-/// write. A Retina-sized deflate alone is a 50–150 ms stall, so the encode
-/// worker owns it. Only after the write completes does the worker transfer a
-/// guarded result to the control thread. File guards are revalidated and
-/// retained through the complete response and explicit client ACK; inline PNG
-/// memory is retained through the bounded write and flush.
 #[cfg_attr(
     not(any(target_os = "macos", windows)),
     expect(
@@ -1475,39 +1143,20 @@ fn strip_version_chrome_line(
     )
 )]
 pub(crate) enum EncodeJob {
-    /// The `image` verb's fully-composited application frame (every app-owned
-    /// splice/overlay is baked in before the pixels are moved here). A failed
-    /// encode/write replies `Err` so the client is never told `OK` for a file
-    /// that does not exist ("OK means the file is on disk" is the protocol
-    /// contract). `Ok((0, 0))` stays the render's no-window sentinel.
     Image {
         pixels: CapturePixels,
-        /// `image --meta`: published with the pixels' fingerprint before the
-        /// reply is sent.
         metadata: Option<PendingMetadata>,
         target: control_auth::ConfinedImage,
-        /// `image --bytes`: return the PNG in the reply instead of writing `target`.
         want_bytes: bool,
         cancel: crate::control::CaptureCancellation,
         reply: std::sync::mpsc::Sender<crate::control::ImageReply>,
-        /// Declared last so whole-job teardown closes every accounted resource
-        /// before returning its global admission charge.
         handoff: crate::control::ReplyRetentionPermit,
     },
-    /// SIGUSR1 `snapshot` output (PNG + parallel .txt + .done marker). The frame
-    /// is fully composited before it is moved here; its conversion, deflate and
-    /// writes run here — the same 50–150 ms Retina stall the `image` verb
-    /// already routes around. No reply channel: the `.done` marker file IS the completion
-    /// signal (requesters stat() for it; stderr is unreliable for GUIs).
     Snapshot {
         pixels: CapturePixels,
         text: String,
         transaction: SnapshotTransaction,
     },
-    /// A `window`/`window <aux>` capture: the platform photograph taken on the
-    /// main thread (macOS: CGWindowList; Windows: `PrintWindow` — both need
-    /// main-thread window state) with the presented client it frames; the
-    /// stitch ([`WindowStitch::finish`]), the encode and the write run here.
     #[cfg(any(target_os = "macos", windows))]
     Window {
         stitch: WindowStitch,
@@ -1516,90 +1165,35 @@ pub(crate) enum EncodeJob {
         reply: std::sync::mpsc::Sender<crate::control::WindowReply>,
         handoff: crate::control::ReplyRetentionPermit,
     },
-    /// Video introspection dump: one finalized recording, byte-budget bounded at
-    /// capture and moved, not copied. Encodes every frame to PNG, writes
-    /// `index.json` last (the completion marker), then replies with its path. The
-    /// input-attempt log (`inputs`) drops with the job: recording-lifetime only.
     VideoDump {
         take: aterm_gpu::video_tap::VideoTake,
-        /// The recording's honesty label ([`crate::VideoMode`]): whether the
-        /// tap copied the swapchain bytes submitted through the WSI present path
-        /// (`swapchain-tap`; compositor visibility/scanout remain unobserved) or
-        /// the headless virtual target's bytes (`offscreen-present-real`; no
-        /// OS presentation target existed). Disclosed verbatim in index.json's
-        /// `meta.mode` with mode-matched `stamp_semantics`.
         mode: crate::VideoMode,
-        /// Whether the request carried the `keys` flag. Drives the honesty
-        /// tokens on the reply line: a recording that opted into the ledger
-        /// always states `inputs=` and `unlogged_inputs=`, so a driver reading
-        /// only the reply can tell "measured zero" from "could not measure".
         keys_enabled: bool,
         inputs: Vec<(u64, crate::VideoInputSample)>,
-        /// The recording loop's proved-unchanged ticks (`VideoRec::pace_ticks`),
-        /// published as index.json `ticks[]`: when the recorder sampled a screen
-        /// that had not changed, so a static window's honest frame gaps are not
-        /// read as a starved recorder, while a stalled render still is.
         pace_ticks: Vec<u64>,
-        /// TOTAL input attempts during this take that are not in `inputs`: the
-        /// control-thread egresses (see [`crate::unseamed_control_inputs`]),
-        /// plus `unlogged_other_window`, plus `unlogged_over_cap`.
         unlogged_inputs: u64,
-        /// The subset of `unlogged_inputs` that reached the App input seam but
-        /// belonged to a window this recording was not capturing. Kept apart so
-        /// `analysis.note` can name the right cause: "drive the front tab" and
-        /// "drive the window being recorded" are different corrections.
         unlogged_other_window: u64,
-        /// The subset of `unlogged_inputs` the recorded window's seam saw after
-        /// the ledger was full (`VIDEO_KEY_LOG_CAP` rows): stamped by nothing,
-        /// counted so a full `inputs[]` is not read as every key of the take.
         unlogged_over_cap: u64,
         started_us: u64,
-        // Boxed: this capability owns a retained directory chain, and keeping it
-        // indirect keeps every queued job compact.
         dir: Box<crate::control_auth::ConfinedVideoDir>,
         reply: std::sync::mpsc::Sender<crate::control::Retained<String>>,
         cancel: crate::VideoCancellation,
-        /// Busy/idle acknowledgement for serialization and graceful shutdown.
         permit: crate::VideoExportPermit,
         handoff: crate::control::ReplyRetentionPermit,
     },
 }
 
-/// Bound full-frame captures waiting behind the one shared PNG worker. The
-/// worker may own one additional active job; keeping the waiting set small
-/// prevents snapshots (which do not consume artifact-handoff permits) from
-/// accumulating unbounded framebuffer copies on the event-loop thread.
 const ENCODE_QUEUE_CAPACITY: usize = 4;
 
-/// THE CAPTURE BYTE BUDGET (docs/AUDIT-performance-quality-2026-08-29.md P2):
-/// the most capture bytes that may be held between the event loop's decision
-/// to photograph and the encode worker finishing with the pixels, each capture
-/// charged its pixels plus its encode's working set
-/// ([`CapturePixels::peak_bytes`]: the PNG at its worst-case size and the
-/// encoder's scratch). The count bound above admits five framebuffers whatever
-/// their size — five 5K Retina frames are ~280 MiB — and was checked only AFTER
-/// the event loop had already captured and read back the frame it then threw
-/// away. This budget is checked BEFORE the capture: a saturated encoder answers
-/// busy without taking the photograph at all. A full-screen Retina capture
-/// (2880x1800) charges about 45 MB, so one fills most of it while several
-/// window-sized ones fit; one capture larger than the whole budget is still
-/// admitted when nothing else is in flight, so no window is ever too big to
-/// photograph.
 const CAPTURE_BYTE_BUDGET: usize = 64 * 1024 * 1024;
 
-/// One capture's bytes ([`CapturePixels::peak_bytes`]), reserved from the
-/// App's in-flight counter BEFORE the photograph ([`App::admit_capture`]) and
-/// released when the permit drops — after the encode worker finishes the job
-/// it rides with, or on any path that rejects, cancels or abandons it, so none
-/// can leak.
+/// One capture's bytes ([`CapturePixels::peak_bytes`]).
 pub(crate) struct CapturePermit {
     held: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     bytes: usize,
 }
 
 impl CapturePermit {
-    /// Reserve `bytes` against the budget, or `None` when the encoder already
-    /// holds too much (the lone-frame rule admits anything into an empty one).
     fn try_reserve(
         held: &std::sync::Arc<std::sync::atomic::AtomicUsize>,
         bytes: usize,
@@ -1616,9 +1210,6 @@ impl CapturePermit {
         })
     }
 
-    /// The photograph exists: hold its true size from here on (the reservation
-    /// was an estimate from the window's geometry). Never refuses — refusal
-    /// happens before a capture, never after it.
     fn recharge(&mut self, actual: usize) {
         use std::sync::atomic::Ordering;
         if actual >= self.bytes {
@@ -1637,18 +1228,13 @@ impl Drop for CapturePermit {
     }
 }
 
-/// What travels to the encode worker: the job and the capture bytes it holds.
-/// The worker drops the permit only after the job's encode and write are done;
-/// a rejected job drops it with the job.
+/// What travels to the encode worker.
 pub(crate) struct EncodeWork {
     job: EncodeJob,
     permit: Option<CapturePermit>,
 }
 
 impl EncodeJob {
-    /// What this job holds at most until its encode is done, for
-    /// [`CapturePermit::recharge`] ([`CapturePixels::peak_bytes`]). A video
-    /// dump is budgeted at its recording.
     fn peak_bytes(&self) -> usize {
         match self {
             Self::Image { pixels, .. } | Self::Snapshot { pixels, .. } => pixels.peak_bytes(),
@@ -1661,8 +1247,6 @@ impl EncodeJob {
 
 #[cfg(test)]
 thread_local! {
-    /// Capture bodies entered on this thread after admission — the test seam
-    /// that proves a refused capture never took its photograph.
     static CAPTURE_BODIES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
@@ -1670,15 +1254,10 @@ thread_local! {
 static ENCODE_THREADS: std::sync::Mutex<Vec<std::thread::ThreadId>> =
     std::sync::Mutex::new(Vec::new());
 
-/// The threads that ran a whole-frame pixel pass of a capture (a conversion,
-/// fingerprint, stitch or encode) — the test seam that proves the thread
-/// that took the capture ran none.
 #[cfg(test)]
 static PIXEL_WORK_THREADS: std::sync::Mutex<Vec<std::thread::ThreadId>> =
     std::sync::Mutex::new(Vec::new());
 
-/// Record that this thread runs a capture's whole-frame pixel pass (tests
-/// only; a no-op in shipping builds).
 fn note_pixel_work() {
     #[cfg(test)]
     {
@@ -1701,7 +1280,6 @@ pub(crate) fn ran_pixel_work(thread: std::thread::ThreadId) -> bool {
         .contains(&thread)
 }
 
-/// Count an admitted capture body (tests only; a no-op in shipping builds).
 fn note_capture_body() {
     #[cfg(test)]
     CAPTURE_BODIES.with(|bodies| bodies.set(bodies.get() + 1));
@@ -1723,8 +1301,6 @@ fn reject_encode_job(mut job: EncodeJob, reason: &str) {
             let _ = reply.send(Err(format!("image {reason}")));
         }
         EncodeJob::Snapshot { transaction, .. } => {
-            // `begin_snapshot_generation` already removed `.done`; dropping the
-            // untouched transaction therefore leaves this attempt unpublished.
             crate::logging::stderr_line!(
                 "aterm-gui: snapshot rejected for {}: {reason}",
                 transaction.target.path.display()
@@ -1739,10 +1315,6 @@ fn reject_encode_job(mut job: EncodeJob, reason: &str) {
     }
 }
 
-/// A snapshot sidecar as a whole pathname, for tests that stat what a snapshot
-/// published. Production reaches every payload through the pinned directory and
-/// one component (`sidecar_name` + [`crate::pinned_dir::PinnedDir`]), which keeps
-/// the TOCTOU confinement.
 #[cfg(test)]
 fn snapshot_sidecar_path(path: &std::path::Path, suffix: &str) -> std::path::PathBuf {
     let mut sidecar = path.as_os_str().to_os_string();
@@ -1750,8 +1322,6 @@ fn snapshot_sidecar_path(path: &std::path::Path, suffix: &str) -> std::path::Pat
     sidecar.into()
 }
 
-/// A snapshot's canonical path, its pinned directory, and the one-component names
-/// of its PNG, text and `.done` payloads inside that directory.
 #[derive(Clone, Debug)]
 struct SnapshotTarget {
     path: std::path::PathBuf,
@@ -1767,9 +1337,6 @@ pub(crate) struct SnapshotTransaction {
     target: SnapshotTarget,
 }
 
-/// The generation is private so nothing outside this module can invent or hold
-/// one the fence did not mint; [`crate::artifact_transaction_conformance`] only
-/// reads it.
 #[cfg(test)]
 impl SnapshotTransaction {
     #[must_use]
@@ -1788,8 +1355,6 @@ fn sha256_hex(bytes: &[u8]) -> String {
     aterm_codec::hex::encode_lower(&aterm_digest::Sha256::digest(bytes))
 }
 
-/// A snapshot's canonical path, its pinned directory, and the one-component names
-/// of its PNG, text and `.done` payloads inside that directory.
 fn clear_snapshot_completion(target: &SnapshotTarget) -> std::io::Result<()> {
     clear_snapshot_completion_with_sync(target, |dir| dir.sync())
 }
@@ -1808,8 +1373,6 @@ enum SnapshotCommitPlan {
     DiscardStale,
 }
 
-/// Pure shipping decision at the fixed-marker commit point. Only the newest
-/// request generation may publish `.done`.
 #[must_use]
 fn snapshot_commit_plan(job_generation: u64, latest_generation: u64) -> SnapshotCommitPlan {
     if job_generation == latest_generation {
@@ -1827,9 +1390,6 @@ fn snapshot_generation_fence() -> &'static std::sync::Mutex<SnapshotGenerations>
     FENCE.get_or_init(|| std::sync::Mutex::new(std::collections::BTreeMap::new()))
 }
 
-/// Begin a new fixed-path snapshot generation. Incrementing the generation and
-/// clearing `.done` share the same mutex held by worker commit, so once this
-/// returns no older worker can publish a marker afterward.
 #[cfg_attr(
     any(test, debug_assertions),
     aterm_spec_anchor::refines(
@@ -1883,9 +1443,6 @@ pub(crate) fn begin_snapshot_generation(
     })
 }
 
-/// Publish one SIGUSR1 snapshot transaction. `.done` is the sole commit marker
-/// and lands only after both payloads completed. Any failed attempt removes its
-/// payloads best-effort, leaving no completed artifact for requesters to trust.
 #[cfg_attr(
     any(test, debug_assertions),
     aterm_spec_anchor::refines(
@@ -1910,10 +1467,6 @@ pub(crate) fn write_snapshot_artifacts(
     write_snapshot_artifacts_with_hook(encoded, text, transaction, || {})
 }
 
-/// Transactional implementation with a seam used by the deterministic
-/// stale-worker regression. The caller encodes the PNG outside the generation
-/// lock; every shared-path write happens after the generation check and while
-/// the lock remains held through `.done`.
 fn write_snapshot_artifacts_with_hook(
     encoded: &CapturePng,
     text: &str,
@@ -1936,8 +1489,6 @@ fn write_snapshot_artifacts_with_hook(
         .map_err(|_| "snapshot generation fence is poisoned".to_string())?;
     let latest = generations.get(&target.path).copied().unwrap_or(0);
     if snapshot_commit_plan(generation, latest) == SnapshotCommitPlan::DiscardStale {
-        // This job has not touched the shared payload paths. In particular, do
-        // not clean them: they may already belong to the current generation
         // whose transaction completed while this worker waited for the lock.
         return Err(format!(
             "snapshot generation {generation} was superseded by {latest}"
@@ -1971,9 +1522,6 @@ fn write_snapshot_artifacts_with_hook(
         let _ = target.dir.sync();
         return Err(format!("payload identity changed before commit: {error}"));
     }
-    // The first line is the fixed-path compatibility contract. The rest lets a
-    // poller that needs same-uid integrity bind the marker to this generation and
-    // these payload bytes; the marker's existence only signals writer completion.
     let done = format!(
         "{}x{}\ngeneration={generation}\npng_sha256={}\ntext_sha256={}\n",
         encoded.width,
@@ -1991,22 +1539,11 @@ fn write_snapshot_artifacts_with_hook(
             return Err(format!("completion marker write failed: {error}"));
         }
     };
-    // `write_new_private` has already fsync'd the marker and containing
-    // directory and validated both exact identities. Do not add a fallible
-    // post-marker phase: once `.done` becomes externally observable this
-    // transaction is committed. The guards live through this return.
     let _commit_guards = (png_file, text_file, done_file);
     Ok(())
 }
 
 /// The honesty tokens a `video ... keys` recording adds to its OK reply line.
-///
-/// When the take opted into the ledger the reply always states both `inputs=`
-/// (attempts this recording timestamped) and `unlogged_inputs=` (attempts on the
-/// control-thread path the ledger cannot see), so a driver can tell "nothing
-/// happened" from "it happened where the ledger cannot watch". A take without `keys`
-/// recorded no ledger and says nothing. The leading space keeps the recording path
-/// the last whitespace token of the reply.
 pub(crate) fn video_keys_reply_tokens(keys_enabled: bool, logged: usize, unlogged: u64) -> String {
     if keys_enabled {
         format!(" inputs={logged} unlogged_inputs={unlogged}")
@@ -2015,21 +1552,7 @@ pub(crate) fn video_keys_reply_tokens(keys_enabled: bool, logged: usize, unlogge
     }
 }
 
-/// The same disclosure for the mid-flight `video status` line, so a driver polling
-/// during a take sees that the ledger is empty because its verbs take the
-/// unobservable path while the take can still be saved. A take without `keys`
-/// says `keys=false` rather than print counts that read as a measured zero.
-///
-/// The finalized reply arrives only when the take is over, which is too late to
-/// change how the take is driven. A driver that polls `video status` after its
-/// first few keys must be able to see, right then, that the ledger is empty
-/// BECAUSE its verbs are taking the unobservable path — so `keys=true inputs=0
-/// unlogged=3` is the whole warning, delivered while the recording can still be
-/// saved. A take without `keys` says `keys=false` rather than printing counts
-/// that would read as a measured zero.
-///
-/// `unlogged` deliberately lacks the finalized reply's `_inputs` suffix: it is a
-/// running subtotal of a live take, not the take's published figure.
+/// The same disclosure for the mid-flight `video status` line.
 pub(crate) fn video_keys_status_tokens(keys_enabled: bool, logged: usize, unlogged: u64) -> String {
     if keys_enabled {
         format!(" keys=true inputs={logged} unlogged={unlogged}")
@@ -2038,9 +1561,7 @@ pub(crate) fn video_keys_status_tokens(keys_enabled: bool, logged: usize, unlogg
     }
 }
 
-/// The `analysis.note` for a recording whose `inputs[]` came out empty. No ledger
-/// requested, a measurement gap and a measured zero each get their own note, so a
-/// driver can tell an idle screen from a misrouted one.
+/// The `analysis.note` for a recording whose `inputs[]` came out empty.
 pub(crate) fn video_empty_ledger_note(
     keys_enabled: bool,
     unlogged: u64,
@@ -2052,9 +1573,6 @@ pub(crate) fn video_empty_ledger_note(
             .to_string();
     }
     if unlogged > 0 {
-        // The two causes need different corrections, so the note names whichever
-        // actually happened (and both when both did) rather than blaming the
-        // control-thread path for a key that simply went to another window.
         let control_thread = unlogged.saturating_sub(unlogged_other_window);
         let mut causes = String::new();
         if control_thread > 0 {
@@ -2087,10 +1605,6 @@ pub(crate) fn video_empty_ledger_note(
 mod video_keys_honesty_tests {
     use super::{video_empty_ledger_note, video_keys_reply_tokens, video_keys_status_tokens};
 
-    /// A `keys` take states both counts on the mid-flight `video status` line
-    /// (a driver polling two seconds into a thirty-second take learns, while
-    /// the take is salvageable, that its verbs bypass the ledger) and on the
-    /// reply; a take without `keys` adds nothing that reads as a measured zero.
     #[test]
     fn status_and_reply_tokens_state_both_counts_only_for_a_keys_take() {
         assert_eq!(
@@ -2105,11 +1619,6 @@ mod video_keys_honesty_tests {
         assert_eq!(video_keys_reply_tokens(false, 0, 0), "");
     }
 
-    /// A measuring instrument that reports zero must never be indistinguishable
-    /// from one that could not measure: the unrequested ledger, a bypassed
-    /// drive, a foreign-window drive, both, and a genuine zero each read
-    /// differently. Every note is interpolated RAW into index.json's
-    /// `"note": "…"`, so none may carry a quote or a backslash.
     #[test]
     fn empty_ledger_note_separates_measured_zero_from_unmeasurable() {
         let notes = [
@@ -2131,9 +1640,6 @@ mod video_keys_honesty_tests {
     }
 }
 
-/// Abort a video export without leaving an `index.json` completion artifact.
-/// The recording directory is server-created and unique to this job, so removing
-/// it also prevents failed, never-prunable partial PNG sequences from accumulating.
 fn fail_video_dump(
     mut dir: Box<crate::control_auth::ConfinedVideoDir>,
     reply: &std::sync::mpsc::Sender<crate::control::Retained<String>>,
@@ -2156,12 +1662,6 @@ fn fail_video_dump_in_place(
     )));
 }
 
-/// Own the complete video publication transaction in an unwind-safe drop
-/// order. Rust drops fields in declaration order: the exact index/marker guards
-/// release before an unpublished directory capability recursively cleans the
-/// tree (required by Windows deny-delete handles). Frame seals hold no file
-/// descriptors. A marker-visible directory is irrevocable and survives later
-/// response/ACK failure.
 struct VideoPublication {
     frame_seals: Vec<crate::control_auth::VideoFrameSeal>,
     index_file: crate::pinned_dir::PinnedFile,
@@ -2267,11 +1767,6 @@ fn send_video_reply_with_retention(
     reply: &std::sync::mpsc::Sender<crate::control::Retained<String>>,
     value: String,
 ) {
-    // Move every frame-identity checkpoint and exact index/directory guard with the
-    // reply. Wire preparation revalidates the bundle and publishes its marker before
-    // any OK byte; retention lasts through the client's ACK. A channel drop before
-    // preparation still aborts the invisible tree; once the marker could have been
-    // visible, a later write/ACK failure preserves the recording.
     let guard = VideoReplyRetention { publication };
     let retention = permit.retain(guard);
     let _ = reply.send(crate::control::Retained::guarded(value, retention));
@@ -2336,12 +1831,6 @@ fn send_capture_reply_after_validation<T: Send>(
         file,
         target,
     } = pending;
-    // Move the file and every directory handle with the reply. The control server
-    // retains this bundle through the client's explicit ACK: the file pins the
-    // inode and the lease pins its advertised name, so another capture cannot
-    // replace or prune the path after OK but before the client opens it. The
-    // shared namespace advisory lock also excludes same-uid explicit-name
-    // replacement across processes.
     let guard = CaptureReplyRetention {
         target,
         file: Some(file),
@@ -2367,11 +1856,7 @@ fn reject_pending_capture_reply<T>(
     false
 }
 
-/// Queue one authorized capture exactly as the encode worker does:
-/// `send_capture_reply_after_validation` revalidates the written file and
-/// either hands its guarded reply over or aborts it. The
-/// `ArtifactReplyPublication` Tier-1 bind drives the rest through the control
-/// writer and ACK wait.
+/// Queue one authorized capture exactly as the encode worker does.
 #[cfg(test)]
 pub(crate) fn queue_capture_reply_for_test(
     target: crate::control_auth::ConfinedImage,
@@ -2408,15 +1893,6 @@ fn send_capture_reply_after_validation_with_hook<T: Send>(
     send_capture_reply_after_validation(pending, reply, value, context)
 }
 
-/// Encode + confined-write one job, then transfer its guarded result. Runs on
-/// the encode worker; unavailable or saturated workers reject at submission.
-/// The write keeps the TOCTOU confinement contract: each target owns the directory
-/// handles retained when the control thread confined it; the worker never re-opens
-/// a multi-segment pathname.
-///
-/// `permit` is the capture's reserved framebuffer bytes ([`CapturePermit`]),
-/// released with the raw framebuffer before any reply is sent, so a client that
-/// sends its next `image` the moment it reads this answer finds the budget free.
 fn run_encode_job(job: EncodeJob, permit: Option<CapturePermit>) {
     #[cfg(test)]
     ENCODE_THREADS
@@ -2442,8 +1918,6 @@ fn run_encode_job(job: EncodeJob, permit: Option<CapturePermit>) {
                 }));
                 return;
             }
-            // The metadata is published before any reply: the control thread
-            // reads it once the reply arrives.
             if let Some(metadata) = metadata
                 && let Err(error) = metadata.publish(pixels.pixel_fingerprint())
             {
@@ -2452,10 +1926,6 @@ fn run_encode_job(job: EncodeJob, permit: Option<CapturePermit>) {
                 return;
             }
             let encoded = CapturePng::encode(&pixels);
-            // A receiver may release admission as soon as `send` exposes the
-            // retained PNG. Destroy the raw pixels first so the old and newly
-            // admitted jobs cannot overlap unaccounted RAM, and their capture
-            // bytes with them.
             drop((pixels, permit));
             let CapturePng {
                 width: w,
@@ -2469,10 +1939,6 @@ fn run_encode_job(job: EncodeJob, permit: Option<CapturePermit>) {
                 }
             };
             if want_bytes {
-                // `--bytes`: hand the PNG back over the wire; write no file (a remote
-                // driver cannot read the server's filesystem). Retain admission
-                // through base64 construction and the bounded socket flush. The
-                // payload has no path identity or post-flush lifetime to guard.
                 let retention = handoff.release_path_and_retain_in_memory(target);
                 let _ = reply.send(Ok(crate::control::Retained::write_retained(
                     (w, h, Some(png)),
@@ -2498,8 +1964,6 @@ fn run_encode_job(job: EncodeJob, permit: Option<CapturePermit>) {
                 }
             };
             let write = target.write_private_authorized(&png, || cancel.authorize_commit());
-            // The file owns its encoded bytes now. Free the encode buffer before
-            // validation can transfer (or reject and release) the handoff permit.
             drop(png);
             match write {
                 Ok(file) => {
@@ -2536,8 +2000,6 @@ fn run_encode_job(job: EncodeJob, permit: Option<CapturePermit>) {
             let path = transaction.target.path.display();
             let encoded = CapturePng::encode(&pixels);
             drop((pixels, permit));
-            // A failed encode leaves the attempt unpublished, as a failed write
-            // does: `begin_snapshot_generation` already removed `.done`.
             match encoded
                 .and_then(|encoded| write_snapshot_artifacts(&encoded, &text, &transaction))
             {
@@ -2656,9 +2118,6 @@ fn run_encode_job(job: EncodeJob, permit: Option<CapturePermit>) {
             }
             let inputs_logged = inputs.len();
             let inputs_cap = crate::VIDEO_KEY_LOG_CAP;
-            // A server-named directory should be fresh, but fail closed if a
-            // collision/retry left a completion marker: this job may publish only
-            // the index it builds after every requested frame is durable.
             for completion in ["index.json", "index.json.tmp"] {
                 if let Err(error) = dir.remove_file_if_exists(std::ffi::OsStr::new(completion)) {
                     fail_video_dump(
@@ -2669,33 +2128,14 @@ fn run_encode_job(job: EncodeJob, permit: Option<CapturePermit>) {
                     return;
                 }
             }
-            // Correlate each pre-routing input attempt with the first later
-            // whole-frame change. That is response evidence, not proof the event
-            // reached a PTY or caused the change, and a sampling instrument floored
-            // by the recorder's capture cadence: `crate::video_key_analysis` owns
-            // the correlation and publishes that floor beside every number.
-            // The whole frame, not a fixed band: the typed line lives wherever the
-            // screen has scrolled to.
             let mut fps = if inputs.is_empty() {
                 Vec::new()
             } else {
                 Vec::with_capacity(take.frames.len())
             };
-            // Frames first, index.json last inside the still-private recording.
-            // Guarded wire preparation later publishes `.published`, the sole
-            // visibility marker readers accept, after revalidating these files.
             let mut frame_lines = String::with_capacity(take.frames.len().saturating_mul(112));
             let mut written = 0usize;
             let mut frame_seals = Vec::with_capacity(take.frames.len());
-            // `fp` = the frame's content hash; `delta` = the 8×8 tiles that differ
-            // from the previous captured frame (`crate::video_key_analysis`). A
-            // multimodal AI reads index.json and pulls only the high-`delta`
-            // frames (the visually eventful moments) instead of downloading every
-            // PNG. Both are computed beside PNG encoding so the large frame store
-            // is streamed once; the fingerprint is retained for key analysis only
-            // when that ledger is non-empty. `prev` tracks capture order. Any
-            // encode/write error aborts the whole export, so every adjacent
-            // `delta` also has an adjacent PNG.
             let mut prev: Option<&aterm_gpu::video_tap::CapturedFrame> = None;
             for (i, f) in take.frames.iter().enumerate() {
                 if cancel.is_cancelled() {
@@ -2766,9 +2206,6 @@ fn run_encode_job(job: EncodeJob, permit: Option<CapturePermit>) {
                 if !input_lines.is_empty() {
                     input_lines.push_str(",\n");
                 }
-                // `"ch"` for a character-shaped attempt, `"key"` for a named key
-                // that has none (esc / arrows / F-keys). Both are JSON-escaped by
-                // `json_field`.
                 write!(
                     &mut input_lines,
                     "    {{\"t_us\":{t},{}}}",
@@ -2782,12 +2219,6 @@ fn run_encode_job(job: EncodeJob, permit: Option<CapturePermit>) {
                 .collect::<Vec<_>>()
                 .join(", ");
             let stop_us = crate::metrics::now_us();
-            // Coverage: `dropped` on the wire is the total loss (ring skips + head
-            // evictions — every presented frame not in the artifact); the meta
-            // splits it into `ring_skipped` (GPU behind) and `evicted_frames` (the
-            // head is gone — `head_truncated`). `decimated_frames` (the fps= gate)
-            // is deliberate, so it is reported but never folded into `dropped`.
-            // `covered_us` is the captured window on the frame-stamp clock.
             let dropped_total = take.dropped + take.evicted;
             let head_truncated = take.evicted > 0;
             let requested_ms = take.requested_ms;
@@ -2799,10 +2230,6 @@ fn run_encode_job(job: EncodeJob, permit: Option<CapturePermit>) {
                 .fps_cap
                 .map_or_else(|| "null".to_string(), |n| n.to_string());
             let budget_mib = take.budget_bytes >> 20;
-            // The honesty disclosure: which texture the tap copied (`mode`) and
-            // what the frame stamps therefore mean (`stamp_semantics`). Swapchain
-            // bytes were submitted to present; compositor visibility/scanout is
-            // not observable here. Offscreen-present-real never had an OS target.
             let mode_str = mode.as_str();
             let stamp_semantics = mode.stamp_semantics();
             let index = format!(
@@ -2836,9 +2263,6 @@ fn run_encode_job(job: EncodeJob, permit: Option<CapturePermit>) {
                 frame_lines,
                 input_lines,
             );
-            // `take` can be hundreds of MiB. The index now owns every scalar and
-            // text fact derived from it, so tear down the frame store and all
-            // encode scratch before any reply path can release admission.
             drop((
                 take,
                 inputs,
@@ -2851,10 +2275,6 @@ fn run_encode_job(job: EncodeJob, permit: Option<CapturePermit>) {
                 covered_us,
                 fps_cap,
             ));
-            // Build and fsync `index.json` under a private create-new temporary
-            // name, then atomically publish it with no-replace rename. A planted
-            // final component fails the commit, and readers observe either no
-            // index or the complete bounded JSON document—never partial bytes.
             let index_file = match dir.write_batch_member_authorized(
                 std::ffi::OsStr::new("index.json"),
                 index.as_bytes(),
@@ -2891,11 +2311,6 @@ fn run_encode_job(job: EncodeJob, permit: Option<CapturePermit>) {
                     return;
                 }
             };
-            // Publication ownership crosses before the observable reply: a
-            // disconnected client or a panic during send leaves the durable
-            // recording retained, never an OK for a tree Drop then removes.
-            // New reply tokens go before the path, which is always the last
-            // whitespace token (the one client invariant).
             let value = format!(
                 "OK frames={written} dropped={dropped_total} head_truncated={head_truncated}{} {}\n",
                 video_keys_reply_tokens(keys_enabled, inputs_logged, unlogged_inputs),
@@ -2907,28 +2322,12 @@ fn run_encode_job(job: EncodeJob, permit: Option<CapturePermit>) {
     }
 }
 
-// Which window an introspection verb targets. The existing `image`/`window`/`chrome`
-// verbs only ever see the FRONTMOST terminal window (`App::front()`); the auxiliary
-// targets are the other GUI surfaces and Settings routes a bare `window`/`chrome`
-// doesn't name. Carried by `Wake::CaptureAuxWindow` / `Wake::ReadAuxControls` so the
-// generalized `window <name>` / `controls <name>` verbs can reach any GUI screen. The
-// targets, their keywords and aliases, and which verbs take each are one table in
-// `aterm_types::control_verbs` (`aux_targets!`), which the verbs' help entries and
-// refusals quote.
 pub(crate) use aterm_types::control_verbs::AuxTarget;
 
-/// May an explicit capture advance the live cursor-effect engines? With no OS
-/// presentation target, capture is the window's only application-render tick, so
-/// it ticks. A windowed target reuses its last successful application-present
-/// quads, so capture never advances effect state past the app-present artifact.
-/// While a `video` recording targets this window its offscreen present loop owns
-/// the engine clock, and a concurrent `image` reuses that loop's last-present quads.
 fn capture_ticks_cursor_fx(has_os_window: bool, recording_this_window: bool) -> bool {
     !has_os_window && !recording_this_window
 }
 
-/// A test `image` request on the front window: unmetered and uncancelled,
-/// asking for metadata exactly when `frame_metadata` is given.
 #[cfg(test)]
 fn image_req_for_test(
     target: crate::control_auth::ConfinedImage,
@@ -2952,9 +2351,6 @@ fn image_req_for_test(
     }
 }
 
-/// Match publication to a genuinely emitted full-body sprite. Drawing under
-/// terminal ink changes z-order, not the resident's identity. A claimed box
-/// without matching atlas-backed pixels must fail these capture regressions.
 #[cfg(test)]
 fn captured_resident_body_for_test(app: &App, wid: WindowId) -> &aterm_core::render::FreeSprite {
     let ws = &app.windows[&wid];
@@ -2987,20 +2383,6 @@ fn captured_resident_body_for_test(app: &App, wid: WindowId) -> &aterm_core::ren
     body
 }
 
-/// The capture observes the console: bind the resident to the cell plane and
-/// bounded facts from the authorized extraction, so `image`, `window` and `trail
-/// status` see the pet's placement, attention and visibility. Runs only when
-/// capture owns the effect tick (on a headless instance it is the only tick,
-/// [`capture_ticks_cursor_fx`]); it never re-locks the terminal or refreshes
-/// metadata from a newer DEC-2026 episode.
-///
-/// `composed` selects the buffer the matching present arm observes: the focused
-/// pane's own grid on a split, the window grid on a single pane — never the
-/// composite, because the pet's world is that pane's grid.
-///
-/// The ownership latch is not set here: the owner's tick sets
-/// `set_console_presentable` unconditionally on both arms, so a stale `true`
-/// cannot let a retired pet keep a resident.
 fn observe_capture_pet_world(
     ws: &mut crate::WindowState,
     exact_focus: &crate::app_render::TerminalCaptureFocus,
@@ -3029,11 +2411,6 @@ fn observe_capture_pet_world(
     crate::metrics::note_pet_world_observation(observed);
 }
 
-/// Advance the visual half of the sing-along only when the explicit capture
-/// owns this window's cursor-effect clock. Application-present performs this
-/// same detector → cat sync on both live render paths; a glass-less still has
-/// to do it itself, while a windowed or recording-owned capture must retain
-/// the already-presented state. Deliberately no audio handle enters this seam.
 struct CaptureCompanionSongSync<'a> {
     style: crate::cursor_glow::GlowStyle,
     cursor_trail_enabled: bool,
@@ -3059,10 +2436,6 @@ fn sync_capture_companion_song(sync: CaptureCompanionSongSync<'_>) -> f32 {
         riff_bar,
     } = sync;
     if !cursor_companions_allowed {
-        // Input bookkeeping is intentionally source-agnostic and may have
-        // re-armed the detector after Serious Mode's transition drain. A
-        // capture can run before the event loop's next scheduler drain, so it
-        // must hard-retire that state here instead of sampling a graceful tail.
         *detector = aterm_effects::kitty_sing::KittySing::default();
         *riff_bar = None;
     }
@@ -3075,9 +2448,6 @@ fn sync_capture_companion_song(sync: CaptureCompanionSongSync<'_>) -> f32 {
     };
     if drive > 0.0 {
         glow.celebrate(now, drive);
-        // Keep the visual bar latch current without emitting a sound event. If
-        // this logical window later acquires glass, application-present resumes
-        // on the current bar instead of replaying one the still already showed.
         if let Some(bar) = detector.bar(now) {
             *riff_bar = Some(bar);
         }
@@ -3102,10 +2472,6 @@ fn sync_capture_companion_song(sync: CaptureCompanionSongSync<'_>) -> f32 {
     drive
 }
 
-/// The flying companion's exact capture-side presentation predicate. This is
-/// the application-present law from both live paths: surface presentability,
-/// the sparkle sprite owner, and either ordinary/hello admission or the
-/// reduced-motion static singing frame.
 fn capture_flying_companion_enabled(
     cursor_companion_presentable: bool,
     animate_cat: bool,
@@ -3123,10 +2489,6 @@ fn capture_flying_companion_enabled(
         ) || sing > 0.0)
 }
 
-/// The flying head's alpha for an introspection frame, through the same
-/// custody law as application-present: in pet mode the full resident keeps
-/// every frame, through a song and its wind-down, and no replacement head is
-/// admitted. The resident's own half of the custody is its owner's.
 fn capture_flying_alpha(pet_mode: bool, kitty_enabled: bool, cat_alpha: u8) -> u8 {
     if kitty_enabled && !pet_mode {
         cat_alpha
@@ -3135,14 +2497,6 @@ fn capture_flying_alpha(pet_mode: bool, kitty_enabled: bool, cat_alpha: u8) -> u
     }
 }
 
-/// The facts a capture hands the pet's owner, read under the same lock as
-/// the captured cells. A capture is one isolated frame and reads none of the
-/// stream facts (the content clock, the wrap serial, the Execute level, the
-/// completion), so those rest. The caret is a present's: hidden or not, with
-/// the program's account of an unfinished frame beside it, so the caret the
-/// companions escort ([`aterm_effects::companion::PetTick::escort_caret`]) is
-/// the one the glass shows. A capture that read only a painted caret drew no
-/// flying head, and a pet that faded, under a program that hides its cursor.
 fn capture_pet_facts(
     focus: &crate::app_render::TerminalCaptureFocus,
 ) -> aterm_effects::host::TerminalFacts {
@@ -3164,9 +2518,6 @@ fn capture_pet_facts(
     }
 }
 
-/// A capture on a window that also presents ticks the live brain, so the
-/// still shows the pet where the glass has it; a windowless still
-/// materialises the resident instead of walking it.
 fn capture_mode(windowless: bool) -> aterm_effects::host::CaptureMode {
     if windowless {
         aterm_effects::host::CaptureMode::StaticCapture
@@ -3175,10 +2526,6 @@ fn capture_mode(windowless: bool) -> aterm_effects::host::CaptureMode {
     }
 }
 
-/// One axis of `dims`: `(offset, band_before, band_after, crop_before,
-/// crop_after)` of the frame's present-time placement
-/// ([`aterm_render::frame_placement`], the law both presenters use), so `dims`
-/// reports the placement the glass has.
 fn dims_axis(axis: aterm_render::AxisPlacement) -> (i64, u32, u32, u32, u32) {
     let px = |value: usize| u32::try_from(value).unwrap_or(u32::MAX);
     (
@@ -3196,8 +2543,6 @@ fn dims_px(cells: u32, cell_px: u32, extra_px: u32) -> u32 {
 
 fn native_settings_closed_controls_lines() -> Vec<String> {
     vec![
-        // The first line stays byte-for-byte for callers that only test
-        // open/closed; a closed tab has no visible route or controls.
         "state open=false".to_string(),
         "prefs fields=0".to_string(),
         "native surface=native-tab route=- controls=0 semantics=0".to_string(),
@@ -3237,10 +2582,6 @@ fn native_settings_field_kind(
         crate::prefs::EditKind::Enum { options } => {
             format!("enum options=[{}]", options.join(","))
         }
-        // Theme names contain spaces ("Solarized Dark") and a theme file's name
-        // is user text, so each option is a quoted string: a reader that splits
-        // on whitespace outside quotes (as label=/value= need) gets one token
-        // per option, and no name can forge a `key=value` of the record.
         crate::prefs::EditKind::Theme => format!(
             "theme options=[{}]",
             crate::native_settings::settings_theme_options(themes)
@@ -3266,15 +2607,6 @@ pub(crate) fn native_settings_controls_lines(
     state: &crate::native_settings::SettingsViewState,
     compiled: &crate::native_ui::CompiledUi,
 ) -> Vec<String> {
-    // A compatibility `field` record exists only when the exact compiled native tree
-    // contains a control that edits that setting: one record per config key,
-    // bound by the Settings builder ([`crate::native_settings::edited_setting_key`]:
-    // a row's `settings/control/<key>`, the theme card's slots and Follow
-    // system switch for `theme`), in the order the page shows them. The
-    // setting's own row is its control where the page draws one, else the
-    // first control that holds its value (a slot), else the first that edits
-    // it (the switch). Navigation, actions, status cards, and previews remain
-    // available in the additive canonical `ui` records below.
     let rank = |node: &crate::native_ui::SemanticNode| {
         if node.key.as_str().starts_with("settings/control/") {
             0
@@ -3303,13 +2635,7 @@ pub(crate) fn native_settings_controls_lines(
     out.push(native_settings_state_line(state, fields.len(), status));
     out.push(format!("prefs fields={}", fields.len()));
     for (node, field) in fields {
-        // Compatibility meanings: `value` is the registry seed (configured text,
-        // and resolved state for Bool rows); `effective` is what the native
-        // control presents after defaults and live policy projection.
         let value = field.seed.as_deref().unwrap_or("");
-        // A control that is the setting's own row presents its value; one of
-        // several that edit it together (the theme card) gives the setting's
-        // words.
         let effective = if node.key.as_str().starts_with("settings/control/") {
             native_settings_effective_value(&node.value)
         } else {
@@ -3392,20 +2718,11 @@ fn native_settings_route_not_open_controls_lines(
 
 #[cfg(all(test, target_os = "macos"))]
 thread_local! {
-    /// How many window photographs this thread has asked the OS for
-    /// ([`App::window_rgba_of`]): a test's evidence that a verb took none.
     static OS_WINDOW_PHOTOGRAPHS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 impl App {
-    /// The `trail` control-socket verb ([`crate::Wake::TrailAdmissions`]): the
-    /// focused window's cursor-trail admission ring — the last spawn-seam verdicts
-    /// (`licensed` / `declined`, with the declining reason token and the move's
-    /// endpoints), newest last (`aterm_effects::cursor_glow::AdmissionRecord::line`
-    /// rows). Records carry positions and reason tokens only, never typed text.
-    ///
-    /// `Err` when there is no focused window, never a fabricated empty ring. An
-    /// idle ring answers `OK 0`: the engine has judged no cursor move at all.
+    /// The `trail` control-socket verb ([`crate::Wake::TrailAdmissions`]).
     pub(crate) fn trail_admissions(&self, count: Option<usize>) -> Result<Vec<String>, String> {
         let Some(ws) = self.frontmost_window.and_then(|wid| self.windows.get(&wid)) else {
             return Err("no focused window".to_string());
@@ -3422,9 +2739,7 @@ impl App {
         Ok(all[all.len() - keep..].to_vec())
     }
 
-    /// Sample the selected terminal grid and all main-thread-owned presentation
-    /// geometry as one event-turn record. A busy terminal returns immediately;
-    /// callers can retry without ever parking the renderer behind this lock.
+    /// Sample the selected terminal grid and all main-thread-owned presentation geometry as one event-turn record.
     pub(crate) fn try_dims_snapshot(
         &self,
         session: u64,
@@ -3440,33 +2755,13 @@ impl App {
                 return Err("terminal busy; retry dims");
             }
         };
-        // The guard is dropped at the end of the match before viewer sorting or
-        // backend geometry lookup. Resize/zoom ownership is main-thread-only, so
-        // same-turn coherence remains while the PTY reader is never held behind
-        // unrelated introspection work.
         Ok(self.dims_snapshot(session, rows, cols))
     }
 
-    /// The DPI scale a detached session's `dims` record is derived from. No window
-    /// holds the session, so [`Self::dims_snapshot`] reports the live shared backend,
-    /// which `apply_window_scale` tunes to one window's [`crate::MetricsView`] at a
-    /// time; the scale is that window's. In order:
-    ///
-    /// 1. A force pin (`--scale`), which overrides every window's real factor and is
-    ///    the only scale a headless boot has.
-    /// 2. The window whose metric record the backend currently carries (the equality
-    ///    `apply_window_scale` guards its re-tune with), so scale, pad and font
-    ///    describe one window.
-    /// 3. Failing an exact match (a live zoom moves `font_px` without a per-window
-    ///    re-record), the window `dims_snapshot` prefers: front, else lowest id.
-    /// 4. `1.0` only when there is no window at all — the seed the pre-attach
-    ///    cell/pad values in that branch are built from.
     fn detached_scale(&self) -> f64 {
         if let Some(pinned) = crate::app_config::resolve_force_scale() {
             return pinned;
         }
-        // `windows` is a BTreeMap, so both scans below are id-ordered: a detached
-        // `dims` is as repeatable as an attached one.
         let tuned = if self.backend.is_pending() {
             None
         } else {
@@ -3486,12 +2781,7 @@ impl App {
             .map_or(1.0, |ws| ws.scale)
     }
 
-    /// Project one selected session through the live geometry of the front window
-    /// when it contains the session, else the lowest-id window that does, so
-    /// `@session dims` is repeatable even with several viewers. `rows`/`cols` come
-    /// from the `Wake::ReadDims` handler's `try_lock` of the target terminal in the
-    /// same main-loop turn, so a busy grid is a retryable error rather than a
-    /// split-generation record or an event-loop stall.
+    /// Project one selected session through the live geometry of the front window when it contains the session.
     pub(crate) fn dims_snapshot(&self, session: u64, rows: u32, cols: u32) -> DimsSnapshot {
         let mut windows: Vec<crate::WindowId> = self
             .windows
@@ -3505,12 +2795,6 @@ impl App {
             .frontmost_window
             .filter(|wid| windows.contains(wid))
             .or_else(|| windows.first().copied());
-        // The DPI scale the rest of this snapshot is derived from, read from the
-        // per-window record (`attach_os_window` seeds it, `on_scale_factor_changed`
-        // keeps it current), not the shared backend, which is re-tuned to whichever
-        // window last drew and so reports the wrong DPI on a mixed-DPI desktop. With
-        // no window holding the session the detached branch below reports that
-        // shared backend, so its scale is read the same way.
         let scale = selected.map_or_else(|| self.detached_scale(), |wid| self.windows[&wid].scale);
 
         let (
@@ -3532,10 +2816,6 @@ impl App {
             geometry,
         ) = if let Some(wid) = selected {
             let ws = &self.windows[&wid];
-            // The listener is published just before the first window attaches,
-            // while the async backend may still be `Pending`. Use the same
-            // bounded seed only for that short pre-attach interval; every ready
-            // window resolves the exact live face metrics at its own font px.
             let (cell_w, cell_h) = if self.backend.is_pending() {
                 crate::seed_cell_px(ws.metrics.font_px)
             } else {
@@ -3581,9 +2861,6 @@ impl App {
                 geometry,
             )
         } else {
-            // A session can be briefly detached while a tab/window transition is
-            // being installed. Report the live shared renderer truth and make the
-            // absence explicit instead of falling back to a startup estimate.
             let (cell_w, cell_h) = if self.backend.is_pending() {
                 crate::seed_cell_px(self.font_px)
             } else {
@@ -3725,11 +3002,6 @@ impl App {
         }
     }
 
-    /// The composed (split) twin of [`Self::capture_words`]: run the glass's own
-    /// per-pane sparkle pass and install its window-coordinate output over the
-    /// composite this capture just built. Reusing `compose_words` makes the capture
-    /// WYSIWYG by construction: same engine, per-pane binding, damage gate and
-    /// translation into window coordinates.
     fn capture_composed_words(
         &mut self,
         wid: WindowId,
@@ -3776,16 +3048,9 @@ impl App {
             return;
         }
         let raw_focused = self.windows.get(&wid).is_some_and(|ws| ws.focused);
-        // `cursor_fx_focus`, not bare `motion_focus`: the present seams fold
-        // the typed wake into the focus input, and a capture resolves the same
-        // policy the glass painted.
         let capture_focused = self.cursor_fx_focus(wid, raw_focused, now);
-        // Sparkle Words take the un-woken focus on every path
-        // (`app_render::sparkle_words_presentable`).
         let word_focus = self.motion_focus(wid, raw_focused);
         let motion = self.motion_policy(capture_focused);
-        // The resident's posture never takes the load-shed latch, on glass
-        // or in a capture (`App::accessibility_motion_policy`).
         let pet_motion = self.accessibility_motion_policy(capture_focused);
         let shed_envelope = self.effective_shed_envelope(self.config.motion_mode(), now);
         let animate_sparkles = motion.animate(crate::motion::MotionEffect::WordSparkles);
@@ -3800,15 +3065,11 @@ impl App {
         let pet_species = trail_presentation
             .pet_species
             .unwrap_or(aterm_effects::kitty_pet::PetSpecies::Cat);
-        // The one companion verdict (favourite > program with tenure > launch
-        // kitty), through the seam the composed present uses, so a capture shows
-        // the breed the glass wears: same window, focused pane and frame instant.
         let companion_look = self.companion_verdict(wid, focus, now);
         let windowless = self
             .windows
             .get(&wid)
             .is_none_or(|window| window.os_window.is_none());
-        // The focused pane's caret, in pane-local cells: the companion's anchor.
         if exact_focus.session != focus || !exact_focus.damage_consumed {
             return;
         }
@@ -3828,11 +3089,6 @@ impl App {
         if let Some((terminal_id, alternate_screen)) = focus_coordinate_space {
             sync_cursor_effect_coordinate_space(ws, terminal_id, alternate_screen);
         }
-        // The resident's owner gate, read fresh on this clock (as the owner's
-        // switch in `companion.prepare` is), never from a copy a mid-pass config
-        // reload could make stale. `pet_mode` alone is not the gate: it is
-        // resolved from the style string and misses the trail master switch and
-        // Serious Mode (`enabled && serious_allows(CursorCat)`).
         if aterm_effects::companion::resident_pet_owner_present(
             pet_mode,
             glow_cfg.enabled && cursor_companions_allowed,
@@ -3844,7 +3100,6 @@ impl App {
         ws.fx.companions_mut().cursor_cat.set_look(companion_look);
         let cursor_companion_presentable =
             cursor_companions_allowed && capture_focused && !load_shed && focus_live_viewport;
-        // A capture is itself a presentation boundary (the single-pane arm's rule).
         ws.fx
             .companions_mut()
             .cursor_cat
@@ -3872,10 +3127,6 @@ impl App {
                 riff_bar,
             })
         };
-        // A capture is a renderer, not a reduced-motion verdict. Sample one
-        // live pose whenever the same policy as glass permits animation;
-        // headless captures must not erase an already-earned companion merely
-        // because they have no OS window.
         let animate_cat = motion.animate(crate::motion::MotionEffect::CursorGlow);
         let cat_frame = if animate_cat {
             ws.fx.companions_mut().cursor_cat.frame(now)
@@ -3902,15 +3153,7 @@ impl App {
                     ),
                 )
             });
-        // The pet, through its one driver, resolved as the composed present does
-        // so `image` on a split window shows the selected companion. It is one
-        // isolated frame: it spends none of the present-owned diffs (burst, wrap,
-        // completion, Execute), has no pointer, and a windowless still
-        // materialises rather than walks.
         ws.fx.companion_mut().set_species(pet_species);
-        // The glass beside the focused pane, the composed present's twin
-        // (`CompanionOwner::offer_glass`): a capture mid-way through a split-pane
-        // focus switch draws the old body fading in its own pane.
         ws.fx
             .companion_mut()
             .offer_glass(
@@ -3960,10 +3203,6 @@ impl App {
             pane: Some((focus, pane_origin)),
             room: None,
         });
-        // This capture owns the tick, so it publishes the same full-body
-        // rectangle as application-present. The existing non-owning still
-        // path never reaches here and cannot replace the live window's hit
-        // target.
         let escort_caret = pet_tick.escort_caret();
         let pet = ws.fx.companion_mut().tick(pet_tick);
         let ctx = crate::app_render::ComposeDecoCtx {
@@ -3983,33 +3222,19 @@ impl App {
             kitty_alpha,
             cat_frame,
             pet,
-            // A capture, not a drawn present: the pet sync site must not spend
-            // a hello for a frame no window presented (see `emit_resident_pet`).
             present: false,
             accent: glow_cfg.accent,
             cursor_color: ws.input_scratch.cursor_color,
             now,
         };
         self.compose_words(wid, &ctx);
-        // Prism wake rides the same composed pass the present uses, or a capture
-        // would show a frame the window does not (and the paint-conformance
-        // matrix's pixel gates read captures).
         self.compose_output_streak(wid, &ctx);
-        // The advancing capture already consumed every pane's represented
-        // damage under its exact extraction lock. Nothing below may relock a
-        // terminal and swallow a newer synchronized-output episode.
         if let Some(ws) = self.windows.get_mut(&wid) {
             ws.fx.publish_words(&mut ws.input_scratch);
         }
     }
 
-    /// Build this window's sparkle-word decorations into `input_scratch`, mirroring
-    /// the application-present redraw (`redraw_window`), so `image`/`snapshot` use
-    /// the same app-owned transient-effect state. Must run after `cell_frame_into`
-    /// and before the tab-strip splice (which shifts decorations with the grid).
-    /// Word-owned channels are omitted when the feature is off, or on the
-    /// alt-screen with `suppress_in_alt_screen` set. Cursor companions remain
-    /// independent and still follow their own presentation policy.
+    /// Build this window's sparkle-word decorations into `input_scratch`.
     #[cfg(any(test, feature = "bench-support"))]
     pub(crate) fn capture_words(&mut self, wid: crate::WindowId, now: Instant) {
         let Some(focus) = self
@@ -4030,12 +3255,6 @@ impl App {
         now: Instant,
         exact_focus: crate::app_render::TerminalCaptureFocus,
     ) {
-        // One clock owner, including the companion engines: a windowed capture
-        // reuses the application-present artifact, and a still during a headless
-        // recording reuses the recording loop's. Rebuilding either would advance
-        // KittySing, CursorCat and PetBrain past the pixels that owner presented.
-        // The retained accumulators are reinstalled because a composed grid refill
-        // clears host overlays.
         let recording_this_window = self.video_rec.as_ref().is_some_and(|r| r.window == wid);
         let has_os_window = self
             .windows
@@ -4044,7 +3263,6 @@ impl App {
         let capture_owns_cursor_fx = capture_ticks_cursor_fx(has_os_window, recording_this_window);
         if !capture_owns_cursor_fx {
             if let Some(ws) = self.windows.get_mut(&wid) {
-                // Rain remains intentionally excluded from introspection.
                 ws.input_scratch.rain_quads.clear();
                 ws.input_scratch.rain_atlas = None;
                 ws.input_scratch.rain_add.clear();
@@ -4052,31 +3270,16 @@ impl App {
             }
             return;
         }
-        // Resolve the sparkle config if it hasn't been (headless never runs
-        // `redraw_window`, which is the only other site that recomputes it), so the
-        // capture reflects the configured decorations.
         if self.sparkle_dirty {
             self.recompute_sparkle();
         }
-        // Phosphor rain: keep the cached resolve fresh on the headless path
-        // too (a reload/toggle before any windowed present must still land),
-        // mirroring the sparkle gate above.
         if self.rain_dirty {
             self.recompute_matrix_rain();
         }
-        // Rain is excluded from captures: it would pollute VLM/OCR reads and make
-        // byte-identical grids diff. The capture reuses the window's live
-        // `input_scratch` and `cell_frame_into` leaves overlay channels alone, so
-        // clear the three rain channels here, before the sparkle early-returns.
         if let Some(ws) = self.windows.get_mut(&wid) {
             ws.input_scratch.rain_quads.clear();
             ws.input_scratch.rain_atlas = None;
             ws.input_scratch.rain_add.clear();
-            // `cell_frame_into` intentionally preserves every host-owned
-            // overlay. Clear the complete word-decoration family before the
-            // feature-off early return below, or an enabled capture followed by
-            // a config disable reuses the prior frame's cat/ink/nova forever.
-            // A live feature repopulates these channels at the commit tail.
             ws.input_scratch.word_decorations.clear();
             ws.input_scratch.ink.clear();
             ws.input_scratch.cat_quads.clear();
@@ -4085,16 +3288,7 @@ impl App {
             ws.input_scratch.free_atlas = None;
             ws.input_scratch.nova_add.clear();
         }
-        // Capture and application-present install the same admitted outer catalog Arc.
-        // Keep this before all feature early-outs so a capture can never retain
-        // an earlier rainbow kitty generation merely because word sparkles are disabled.
         self.install_window_config_assets(wid);
-        // Composed (split) capture: the glass decorates every visible pane, so run
-        // the same per-pane pass the composed present runs over the composite
-        // `prepare_terminal_capture_grid` built. The coherence refill further down
-        // must not run here: it re-extracts the front terminal at window dims and
-        // would overwrite the composite. The capture verbs gate on
-        // `TerminalCaptureGrid::composed` first; this is the direct-caller backstop.
         if self
             .active_tree(wid)
             .is_some_and(|t| t.len() > 1 && !t.is_zoomed())
@@ -4106,18 +3300,12 @@ impl App {
             .sparkle
             .as_ref()
             .map(|r| (r.cfg.clone(), r.lexicon.clone()));
-        // The same motion policy as application-present, including its
-        // `motion_focus` recording pin and typed-wake fold (`cursor_fx_focus`), so
-        // a reduced or unfocused window captures the decorations the glass painted.
-        // Folded into the effects engine's own `reduced_motion` seam below.
         let capture_focused = self.cursor_fx_focus(
             wid,
             self.windows.get(&wid).is_some_and(|ws| ws.focused),
             now,
         );
         let motion = self.motion_policy(capture_focused);
-        // The resident's posture never takes the load-shed latch, on glass
-        // or in a capture (`App::accessibility_motion_policy`).
         let pet_motion = self.accessibility_motion_policy(capture_focused);
         let shed_envelope = self.effective_shed_envelope(self.config.motion_mode(), now);
         let sparkle = sparkle.map(|(mut cfg, lexicon)| {
@@ -4126,12 +3314,8 @@ impl App {
             }
             (cfg, lexicon)
         });
-        // Cell metrics for the cat emitter, read before the `ws` borrow.
         let (cell_w, cell_h) = self.backend.cell_size();
         let kitty_log_on = self.kitty_log_enabled();
-        // The one companion verdict ([`crate::App::companion_verdict`]: favourite >
-        // program with tenure > launch kitty), resolved through the single-pane
-        // present's rule so a capture never shows a different cat than the glass.
         let capture_front_session = self.focused_session_id(wid).unwrap_or(0);
         let companion_look = self.companion_verdict(wid, capture_front_session, now);
         let trail_presentation = self.trail_presentation();
@@ -4143,14 +3327,8 @@ impl App {
         let pet_species = trail_presentation
             .pet_species
             .unwrap_or(aterm_effects::kitty_pet::PetSpecies::Cat);
-        // The same alt-screen policy the live application-present resolves: only a
-        // configured `suppress_in_alt_screen` blanks the capture's decorations.
         let suppress_alt = sparkle.is_some() && self.config.sparkle_suppress_alt_screen();
-        // The same effective load-shed gate the live present folds into
-        // `deco_suspend` (app_render). The raw diagnostic latch does not
-        // suppress a user-forced Full policy or an explicit adaptive opt-out.
         let load_shed = self.load_shed_active();
-        // Prism wake knobs, resolved before the `self.windows` borrow below.
         let streak_enabled = self.output_streak_shows();
         let streak_intensity = self.config.output_streak_intensity_or_default();
         let streak_tail = self.config.output_streak_tail_or_default();
@@ -4162,9 +3340,6 @@ impl App {
             .get(&wid)
             .is_none_or(|window| window.os_window.is_none());
         if exact_focus.session != capture_front_session || !exact_focus.damage_consumed {
-            // A one-pane headless decoration pass is admitted only by the
-            // exact extraction that consumed its own damage session. Missing
-            // or mismatched custody fails closed instead of re-locking a
             // possibly newer synchronized-output episode.
             return;
         }
@@ -4195,7 +3370,6 @@ impl App {
             exact_focus.terminal_id,
             exact_focus.alternate_screen,
         );
-        // The resident's owner gate, read fresh: see `capture_composed_words`.
         if aterm_effects::companion::resident_pet_owner_present(
             pet_mode,
             glow_cfg.enabled && cursor_companions_allowed,
@@ -4203,15 +3377,9 @@ impl App {
         ) {
             observe_capture_pet_world(ws, &exact_focus, false);
         }
-        // Capture consumes the same admitted catalog Arc as application-present. Asset
-        // installation above is Arc/scalar-only and cannot perform filesystem
-        // or decode work.
         ws.fx.companions_mut().cursor_cat.set_look(companion_look);
         let cursor_companion_presentable =
             cursor_companions_allowed && capture_focused && !load_shed && live_viewport;
-        // The capture itself is a presentation boundary. This resumes a hello
-        // that was discovered after the preceding capture had already resolved
-        // its frame and was therefore paused unseen below.
         ws.fx
             .companions_mut()
             .cursor_cat
@@ -4219,11 +3387,6 @@ impl App {
         if !cursor_companions_allowed {
             ws.fx.companions_mut().music_notes.clear();
         }
-        // A capture is a renderer, so it declares its session as the unsplit glass
-        // path does (`app_render::redraw_window`). This arm binds no pane —
-        // `input_scratch` holds the front terminal's whole grid — and an unbound
-        // engine would treat every session as matching. Declared before the
-        // suspension fork below: identity does not depend on whether this frame draws.
         ws.fx
             .decos_mut()
             .set_scan_session(Some(exact_focus.session));
@@ -4247,10 +3410,6 @@ impl App {
                 riff_bar,
             })
         };
-        // Explicit captures have no animation timer, but they are renderers:
-        // sample the live lifecycle once under the same motion policy as glass.
-        // Reduced motion still uses the static collection frame and never
-        // synthesizes an unearned ordinary flight.
         let animate_cat = motion.animate(crate::motion::MotionEffect::CursorGlow);
         let cat_frame = if animate_cat {
             ws.fx.companions_mut().cursor_cat.frame(now)
@@ -4272,12 +3431,6 @@ impl App {
             rows: rows as u16,
             cols: cols as u16,
         };
-        // The pet brain ticks on the capture too, through its one driver: the
-        // suppression below needs the animal's live body. It resolves as the
-        // composed capture arm does — a presentation boundary, the shared custody
-        // law keeping the full resident and its caret through singing and load,
-        // and the ownership switch ahead of every presentation fork. One isolated
-        // frame: no present-owned diff is read or spent.
         ws.fx.companion_mut().set_species(pet_species);
         let pet_tick = ws.fx.pet_prepare(aterm_effects::companion::PetFacts {
             facts: &capture_pet_facts(&exact_focus),
@@ -4310,15 +3463,10 @@ impl App {
             pane: None,
             room: None,
         });
-        // The caret the companions escort, by the present's rule.
         let cur = pet_tick.escort_caret();
         let pet = ws.fx.companion_mut().tick(pet_tick);
         let words_suspended = exact_focus.alternate_screen && suppress_alt;
         if load_shed || words_suspended || sparkle.is_none() {
-            // The word field freezes under load or alternate-screen suppression;
-            // an explicit feature disable resets it. The full resident retains
-            // its independent surface and its motion (the shed takes only its
-            // frame train). The flying head's existing load gate already denies
             // its pixels and pauses its hello.
             if load_shed || words_suspended {
                 ws.fx.decos_mut().freeze(now);
@@ -4328,8 +3476,6 @@ impl App {
             }
             ws.fx.open_words();
 
-            // The authorized extraction already consumed this capture's exact
-            // damage session, even when no word scanner is enabled.
             let default_bg = ws.input_scratch.default_bg;
             let cursor_color = ws.input_scratch.cursor_color;
             let _ = crate::app_render::emit_single_cursor_companion(
@@ -4337,7 +3483,6 @@ impl App {
                 effect_geom,
                 cur,
                 &pet,
-                // A capture: never a spent hello (`emit_resident_pet`).
                 false,
                 cat_frame,
                 animate_cat,
@@ -4355,14 +3500,6 @@ impl App {
             .as_ref()
             .expect("enabled, unsuspended Sparkle Words was checked above");
         let epoch = ws.input_scratch.snapshot_seq;
-        // A normal application-present consumes `pending_deco_birth`. If the
-        // stamp is still here, capture is this episode's first observable
-        // presentation (headless or an occluded window), so an old stamp primes
-        // one fully-risen preview instead of aging an unseen peek through Done
-        // — bounded work only on a damaged capture, never a synthetic animation
-        // loop. A capture is a renderer, so it declares its snapshot's row
-        // origin for the kitty-command flash exactly as the glass paths do: a
-        // headless instance driven over the control socket rescans only here.
         let rescan =
             ws.fx
                 .decos()
@@ -4371,11 +3508,6 @@ impl App {
                     birth: capture_rescan_birth(now, ws.pending_deco_birth.take(), windowless),
                     cursor: live_viewport.then_some(grid_cursor),
                 });
-        // One cat per caret: the companion routed before the word pass
-        // ([`crate::app_render::route_single_cursor_companion`]) and emitted
-        // after it, so a capture shows the same single cat the glass does —
-        // the flying head by its rect at its seat, the pet by its live drawn
-        // body.
         let routed = crate::app_render::route_single_cursor_companion(
             ws,
             effect_geom,
@@ -4387,12 +3519,6 @@ impl App {
             now,
         );
         let companion_at = routed.on_glass(cur, pet.body_px);
-        // The capture tick shares the window's live effect state, so it keeps
-        // app-present phase parity: the same cursor cell, selection view and
-        // real focus (a capture never clobbers a focused window's armed blink
-        // one-shot, and a headless/unfocused capture arms nothing). The capture
-        // preparation consumed this exact damage session while it still held
-        // the sync-authorized extraction lock, so nothing here relocks.
         let words = ws.fx.word_grid(&aterm_effects::pipeline::WordGrid {
             now,
             lexicon,
@@ -4411,12 +3537,6 @@ impl App {
             },
             focused: ws.focused,
         });
-        // Prism wake on the single-pane capture: the site the paint-conformance
-        // matrix reads, since its headless rows assert pixels over the control
-        // socket and headless never runs the windowed present. Appended to the
-        // nova light after the decoration tick filled it, as the present does.
-        // Silent on the alt screen and in scrollback (neither is arrival) and
-        // under load shed, like every other decoration.
         let suppressed = ws.input_scratch.engine_alt || ws.input_scratch.display_offset != 0;
         let streak_inert = crate::app_render::output_streak_inert(
             streak_enabled,
@@ -4438,8 +3558,6 @@ impl App {
                         theme_bg: ws.input_scratch.default_bg,
                         theme_fg: ws.input_scratch.default_fg,
                         theme_cursor: ws.input_scratch.cursor_color,
-                        // A capture never speaks: a still taken by a script must
-                        // not make the machine chime.
                         sound: false,
                     },
                     seed: aterm_effects::genome::mix(wid.0 ^ 0x5052_4953_4D5F_574B),
@@ -4462,11 +3580,6 @@ impl App {
                 })
                 .as_ref(),
         );
-        // Kitty Log drain: the capture tick is a real tick and the sightings vec
-        // clears at the next tick's start, so a headless-only session must drain
-        // here or lose them. The (session, ident) dedupe matches the windowed
-        // drain, so a capture racing a present never double-counts. Ambient
-        // provenance: count and collect only, never the companion.
         self.kitty_log.observe_ambient(
             exact_focus.session,
             ws.fx.decos_mut().drain_kitty_sightings(),
@@ -4474,10 +3587,6 @@ impl App {
             now,
             kitty_log_on,
         );
-        // Curse cues share the application-present drain's exact site dedupe. A
-        // capture never makes the Mac speak (gain `None`); the visual reaction
-        // still belongs to the cursor companion, with the primed birth frame's
-        // sites counted too.
         let curse_drain = crate::app_render::drain_curse_bonk_cues(
             ws.fx.decos_mut(),
             glow_cfg.style,
@@ -4493,16 +3602,12 @@ impl App {
                 .primed_wince_hits
                 .saturating_add(curse_drain.wince_hits),
         );
-        // The shared config-free emitter owns both animals. Sparkle Words may
-        // contribute ambient sprites to the frame, but it neither chooses the
-        // companion nor supplies its palette/lifecycle.
         let default_bg = ws.input_scratch.default_bg;
         let cursor_color = ws.input_scratch.cursor_color;
         let _ = crate::app_render::emit_routed_cursor_companion(
             ws,
             effect_geom,
             &pet,
-            // A capture: never a spent hello (`emit_resident_pet`).
             false,
             routed,
             kitty_alpha,
@@ -4512,13 +3617,9 @@ impl App {
             cursor_color,
             glow_cfg.accent,
         );
-        // Every word channel is part of the styled capture (`plain` strips them via
-        // `clear_overlays`); without the sprites a headless styled capture loses
-        // the cat.
         ws.fx.publish_words(&mut ws.input_scratch);
     }
 
-    /// Select the sole legal animation-clock owner for a composed capture.
     fn composed_capture_cursor_fx_clock(
         &self,
         wid: crate::WindowId,
@@ -4536,13 +3637,7 @@ impl App {
         }
     }
 
-    /// Reconstruct the leaf inventory of a just-presented pure-terminal frame
-    /// without touching a terminal lock. `capture_leaf_snapshot_seqs` and its
-    /// content-clock twin were filled in the exact pane extraction loop that
-    /// built `input_scratch`; the synchronous present barrier guarantees no
-    /// later staged frame can replace either half before this function runs.
-    /// A capture reads it from its request layout
-    /// ([`Self::presented_terminal_capture_grid_from_layout`]).
+    /// Reconstruct the leaf inventory of a just-presented pure-terminal frame without touching a terminal lock.
     #[cfg(test)]
     pub(crate) fn presented_terminal_capture_grid(
         &self,
@@ -4552,9 +3647,6 @@ impl App {
         self.presented_terminal_capture_grid_from_layout(wid, &plan, route)
     }
 
-    /// Reconstruct the presented terminal inventory from the exact layout that
-    /// authorized the synchronous redraw, without resolving the visible tree a
-    /// second time.
     fn presented_terminal_capture_grid_from_layout(
         &self,
         wid: crate::WindowId,
@@ -4573,7 +3665,6 @@ impl App {
             .then_some(grid)
     }
 
-    /// Allocation-reusing twin used by the 60fps recording success hook.
     fn refill_presented_terminal_capture_grid(
         &self,
         wid: crate::WindowId,
@@ -4631,10 +3722,6 @@ impl App {
         })
     }
 
-    /// Compact identity of every leaf in a native/mixed frame. Later stills
-    /// compare this exact list before consulting retained native caches; a
-    /// staged tab/layout/document change therefore defers instead of pairing
-    /// the recording's resident input with newer semantic metadata.
     fn refill_recording_native_leaf_identities(
         &self,
         wid: crate::WindowId,
@@ -4683,9 +3770,7 @@ impl App {
         Some(changed)
     }
 
-    /// Commit the lightweight semantic half of the just-successful video
-    /// present. The GPU's resident input is identified, not copied: explicit
-    /// still/snapshot consumers pay the one owned clone later.
+    /// Commit the lightweight semantic half of the just-successful video present.
     pub(crate) fn commit_recording_presented_meta(
         &mut self,
         wid: crate::WindowId,
@@ -4802,14 +3887,6 @@ impl App {
         }
     }
 
-    /// Resolve the recording loop's latest successful application present.
-    ///
-    /// The lightweight metadata is committed only after video submission
-    /// succeeds; the large input stays resident in `WindowGpu`. Every encode
-    /// attempt advances that resident epoch, so a later failed or in-flight
-    /// attempt makes the old metadata non-consumable instead of letting a still
-    /// pair old semantics with newer pixels. Explicit captures alone pay the
-    /// owned `RenderInput` clone.
     fn recording_presented_frame_capture(
         &self,
         wid: crate::WindowId,
@@ -4964,12 +4041,6 @@ impl App {
         })
     }
 
-    /// Read the current persistent VirtualTarget without forcing another
-    /// present. The application serial binds the frontend success seam and the
-    /// GPU's submitted-input epoch binds the target generation. Live knob,
-    /// chrome and layout state are intentionally irrelevant to these extant
-    /// pixels; semantic callers validate those separately when they need
-    /// metadata, text, or a clean reraster.
     fn recording_presented_destination_capture(
         &mut self,
         wid: crate::WindowId,
@@ -5027,13 +4098,7 @@ impl App {
         })
     }
 
-    /// Present one capture frame from caller-supplied synchronous layout
-    /// authority when available, otherwise resolve the ordinary redraw layout.
-    ///
-    /// The redraw's present is marked as a capture's, so a minimized Windows
-    /// window, whose ordinary presents park, still presents it
-    /// ([`aterm_gpu::WindowGpu::parks_while_minimized`]): a capture, and a
-    /// `pointer` reply (`App::pointer_cmd`), wait on it.
+    /// Present one capture frame from caller-supplied synchronous layout authority when available, otherwise resolve the ordinary redraw layout.
     pub(crate) fn redraw_capture_frame(
         &mut self,
         wid: crate::WindowId,
@@ -5048,8 +4113,6 @@ impl App {
         self.mark_capture_present(wid, false);
     }
 
-    /// Mark window `wid`'s GPU presents as a capture's, or no longer
-    /// ([`aterm_gpu::WindowGpu::set_capture_present`]). A CPU target has no park.
     fn mark_capture_present(&mut self, wid: crate::WindowId, on: bool) {
         if let Some(crate::PresentTarget::Gpu { window_gpu, .. }) = self
             .windows
@@ -5060,10 +4123,6 @@ impl App {
         }
     }
 
-    /// Whether a capture of `wid` can force a present of it: it has an OS
-    /// window to present to. A test's scripted CPU surface counts too, as it
-    /// does for the present itself (`redraw_window_with_layout`), so a headless
-    /// test drives the windowed capture path end to end.
     fn capture_target(&self, wid: WindowId) -> CaptureTarget {
         let Some(window) = self.windows.get(&wid) else {
             return CaptureTarget::Headless;
@@ -5084,31 +4143,6 @@ impl App {
         }
     }
 
-    /// Make screenshot ordering match control ordering: force one successful
-    /// application present of `wid` and bind the capture to it.
-    ///
-    /// GUI mutations (`open`, `act`, tab selection, Settings edits) run on this
-    /// same main loop and reply after changing the model, while their
-    /// `request_redraw` is asynchronous. Without this barrier, an immediately
-    /// following `image`/`window` can photograph the prior composited frame even
-    /// though `inspect` already reports the new semantic tree. A present can also
-    /// be dropped while acquiring the GPU surface, so one blind redraw is not a
-    /// sufficient barrier: authorize capture only when the window's real-present
-    /// serial advances after redrawing the CURRENT composite. The serial belongs to
-    /// the whole window rather than one focused native leaf, so this remains correct
-    /// for every route, heterogeneous terminal/native splits and native leaves with
-    /// sub-viewports included. Each attempt is an explicit external presentation
-    /// stimulus: it reopens a parked/backoff retry episode and clears the
-    /// optimistic repaint stamp so the redraw cannot early-out. Actual drops retry
-    /// at most three times, then fail closed. Async acquisition answers
-    /// [`GPU_CAPTURE_PENDING`] at once, so the caller yields its original owned
-    /// request to the bounded completion queue, preserving its tap and
-    /// cancellation deadline across the wait.
-    ///
-    /// `frame_layout` is the caller's synchronous layout authority, used for
-    /// every attempt; `None` resolves the ordinary redraw layout. `Ok(None)`:
-    /// the window has no surface ([`CaptureTarget::Headless`]), so the caller
-    /// stages its own frame. The result owns no model ([`PresentedCapture`]).
     fn present_before_capture(
         &mut self,
         wid: WindowId,
@@ -5123,15 +4157,12 @@ impl App {
         let mut captured = None;
         let mut acquire_pending = false;
         let mut last_capture_error = None;
-        // The presents forced here run on the caller's schedule, not the
-        // terminal's: they book their latency as tainted.
         self.capture_barrier = Some(wid);
         let presented =
             crate::run_capture_present_barrier(self.capture_present_budget.remaining, || {
                 if acquire_pending {
                     return false;
                 }
-                // A replay resumes the tap its wait kept armed.
                 let resumed_tap = tap
                     && self
                         .windows
@@ -5144,9 +4175,6 @@ impl App {
                     .windows
                     .get(&wid)
                     .map_or(0, |window| window.capture_present_serial);
-                // Whether this attempt's present carries the tap: a resumed
-                // one, or one armed now. An optional tap that cannot be armed
-                // lets the present run without it.
                 let armed = resumed_tap
                     || (tap
                         && match self.arm_presented_client_capture(wid) {
@@ -5196,8 +4224,6 @@ impl App {
                             last_capture_error = Some(error);
                             return false;
                         }
-                        // The present succeeded without its destination: bind
-                        // it, and leave no tap armed for a later present.
                         Err(_) => {
                             self.discard_presented_client_capture(wid);
                             None
@@ -5232,10 +4258,6 @@ impl App {
         ))
     }
 
-    /// An owned copy of `wid`'s staged model for a capture that rasterizes it
-    /// itself (`image`, and a headless snapshot). It is the only copy a capture
-    /// takes: the rasterization and `image plain`'s overlay stripping then run
-    /// on the copy, never on the scratch a later present or capture reuses.
     fn take_rerender_input(&self, wid: WindowId) -> aterm_render::RenderInput {
         #[cfg(test)]
         crate::work_counts::capture_input_cloned();
@@ -5245,30 +4267,11 @@ impl App {
             .unwrap_or_default()
     }
 
-    /// Choose where a capture of `front` takes its pixels and its model from,
-    /// once, for every capture that does not photograph the platform window
-    /// (`image`, the SIGUSR1 snapshot).
-    ///
-    /// The kind of frame is decided once ([`capture_source_kind`]). A window
-    /// with a surface is bound to the present its barrier forces
-    /// ([`Self::present_before_capture`]), with the request layout as that
-    /// present's authority: the destination the barrier tapped, or a rerender
-    /// of the presented model under the visuals committed beside it. A headless
-    /// window has no glass. Under a recording of it the recording's virtual
-    /// target is its glass, so the still is bound to the recording's last
-    /// present: that destination, or a rerender of the recording's resident
-    /// model (`image plain`). Otherwise the frame is staged in this turn
-    /// ([`Self::stage_headless_capture`]) and rerendered under the host visuals
-    /// sampled after the staging.
     fn resolve_capture_source(
         &mut self,
         front: WindowId,
         policy: SourcePolicy,
     ) -> Result<ResolvedCapture, CaptureDeferral> {
-        // A capture is a PIXEL demand: redeem a headless launch's deferred GPU
-        // intent before any capture geometry or renderer state is read, so the
-        // capture is served by the backend a boot-built one would have been.
-        // No-op windowed, and once redeemed or declined.
         self.ensure_pixel_backend();
         let (plan, route) = self
             .active_visible_frame_layout(front)
@@ -5318,9 +4321,6 @@ impl App {
         })
     }
 
-    /// The windowed arm of [`Self::resolve_capture_source`]: the present the
-    /// barrier forces, laid out from the request layout, and what the capture
-    /// takes from it.
     fn presented_capture_source(
         &mut self,
         front: WindowId,
@@ -5338,11 +4338,8 @@ impl App {
                     CaptureDeferral::Refused(error)
                 }
             })?;
-        // The barrier binds nothing only for a window without a surface, which
-        // `capture_target` excluded.
         let presented = presented.ok_or(CaptureDeferral::Nothing)?;
         let terminal_grid = match route {
-            // The present filled the leaf inventory in this same turn.
             crate::VisibleContentRoute::Terminal { .. } if policy.metadata => Some(
                 self.presented_terminal_capture_grid_from_layout(front, &plan, route)
                     .ok_or_else(|| {
@@ -5368,8 +4365,6 @@ impl App {
             Some(Err(error)) if take == PresentTake::ClientTap => {
                 return Err(CaptureDeferral::Refused(error));
             }
-            // A destination that cannot be cut back to its frame falls back
-            // to the rerender of the same present, as a failed tap does.
             Some(Err(_)) | None => CaptureSource::Rerender {
                 serial: Some(presented.serial),
                 visuals: presented.visuals,
@@ -5387,9 +4382,6 @@ impl App {
         })
     }
 
-    /// The headless-recording arm of [`Self::resolve_capture_source`]: the
-    /// recording's last successful present, its destination or a rerender of
-    /// its resident model as `kind` says.
     fn recorded_capture_source(
         &mut self,
         front: WindowId,
@@ -5408,8 +4400,6 @@ impl App {
         if !policy.model
             && let Some(destination) = destination
         {
-            // The common live-repro path: the destination as it is, with no
-            // semantic clone, hash or reraster.
             return Ok(ResolvedCapture {
                 source: CaptureSource::Destination {
                     pixels: destination.pixels,
@@ -5424,8 +4414,6 @@ impl App {
                 },
             });
         }
-        // The validation holds the current layout, geometry and chrome to the
-        // recorded present's, so the request layout is the recorded frame's.
         let recorded = self
             .recording_presented_frame_capture(front, policy.metadata, policy.metadata)
             .map_err(CaptureDeferral::Refused)?;
@@ -5454,18 +4442,6 @@ impl App {
         })
     }
 
-    /// A HEADLESS CAPTURE IS ITS WINDOW'S ONE WATCHER. A window with no glass
-    /// never has its Settings preview ticked by the park
-    /// ([`crate::native_preview_may_tick`]: nothing would see those frames),
-    /// so the retained raster holds whatever frame the page's last change
-    /// compiled. The capture samples the active preview at its own instant,
-    /// exactly as a focused window's tick would have left it (the same
-    /// predicate, with the capture standing in for the glass, and the same
-    /// invalidation): a looping preview is recompiled at the capture's phase,
-    /// a still one is left as it is, and a modal over the page keeps the
-    /// preview parked under it as glass does. The preview's viewport comes
-    /// from the capture's own `plan`, so the capture still lays its frame out
-    /// from one visible plan.
     fn sample_native_preview_for_capture(
         &mut self,
         wid: WindowId,
@@ -5487,16 +4463,6 @@ impl App {
         self.invalidate_active_native_settings_preview_in(wid, phase_ms, viewport);
     }
 
-    /// Stage a headless capture's frame in this turn from the request layout:
-    /// the route's preparation into the window's scratch, then its chrome in
-    /// the order the glass layers it ([`crate::route_chrome`]). A staging is a
-    /// read: it consumes no damage and stamps no present. Returns the plan the frame was
-    /// laid out from and, for a terminal route, its inventory.
-    ///
-    /// A terminal-only split stages the divider grid and the per-pane
-    /// composite, each pane keeping its own live default background, never the
-    /// front pane stretched over the window; a single pane keeps the front
-    /// terminal refill.
     fn stage_headless_capture(
         &mut self,
         wid: WindowId,
@@ -5514,8 +4480,6 @@ impl App {
         let (plan, terminal_grid) = match route {
             crate::VisibleContentRoute::Terminal { .. } => {
                 let capture_now = Instant::now();
-                // The band's motion at the capture instant (design §10.8): a
-                // capture is a pure function of the center and `capture_now`.
                 self.prepare_band_motion(wid, capture_now);
                 let clock = self.composed_capture_cursor_fx_clock(wid, capture_now);
                 let (grid, plan) = match self
@@ -5528,15 +4492,10 @@ impl App {
                     CapturePreparation::Unavailable => return Err(CaptureDeferral::Nothing),
                 };
                 let focus = grid.focus.ok_or(CaptureDeferral::Nothing)?;
-                // The decoration splice dispatches on one-pane versus composed
-                // geometry itself, and owns the capture/recording clock
-                // boundary: it retains rather than advances under a recording.
                 self.capture_words_sampled(wid, capture_now, focus);
                 self.refresh_pane_headers(wid, &plan);
                 self.paint_pane_headers(wid);
                 self.splice_tab_strip(wid);
-                // The overlay scrollbar's and hollow cursors' facts at the
-                // capture instant, which the chrome's pane overlay paints.
                 self.refresh_pane_overlay_for_capture(wid, &plan, capture_now);
                 (plan, Some(grid))
             }
@@ -5562,24 +4521,12 @@ impl App {
                 (plan, None)
             }
         };
-        // The window's chrome in the order the glass layers it: a capture that
-        // omitted a layer would tell a driving AI it is absent while a human
-        // looks at it.
-        // The link caption it composes is the present's to publish, never a
-        // capture's.
         if self.compose_route_chrome(wid, route, &plan).is_none() {
             return Err(CaptureDeferral::Nothing);
         }
         Ok((plan, terminal_grid))
     }
 
-    /// Rasterize a capture's model into the frame it encodes, composed as the
-    /// glass composes it: the window's renderer context bound, the backend
-    /// tray card ([`crate::WindowState::present_card`]) cropped below the
-    /// paste banner, and `visuals`, the bell invert and the host overlay, over
-    /// it ([`apply_host_chrome_at`]). The one rerender every capture that
-    /// rasterizes its own frame ends in: `image`, and the headless snapshot.
-    /// `input` is the capture's own copy, never the window's scratch.
     fn rerender_capture(
         &mut self,
         wid: WindowId,
@@ -5588,11 +4535,7 @@ impl App {
     ) -> Result<Frame, String> {
         let tray_floor_y = self.paste_banner_tray_floor_y(wid);
         self.bind_window_renderer_state(wid);
-        // Timed so `metrics` observes offscreen rasters, headless included, on
-        // their own counters (`metrics::record_offscreen_raster`).
         let render_t0 = Instant::now();
-        // Disjoint borrows: the renderer, the introspection GPU scratch and the
-        // window's tray cards are separate fields.
         let App {
             backend,
             introspect_gpu,
@@ -5602,8 +4545,6 @@ impl App {
         let window = windows
             .get(&wid)
             .ok_or_else(|| "capture lost its window".to_string())?;
-        // The GPU arm bakes the card into its offscreen, as the present does;
-        // the CPU arm composites it below.
         let tray = window
             .present_card()
             .and_then(|card| tray_quad_below_y(card, tray_floor_y));
@@ -5624,7 +4565,6 @@ impl App {
             0,
             width,
             height,
-            // The frame is the surface here: no remainder band to continue.
             0..0,
             cpu_tray,
             visuals.invert,
@@ -5634,9 +4574,6 @@ impl App {
         Ok(frame)
     }
 
-    /// A snapshot's `.txt` for `route`: the terminal band, each visible native
-    /// leaf's semantic lines, or both on a heterogeneous route, then an open
-    /// palette's control lines.
     fn snapshot_visible_text(
         &self,
         wid: WindowId,
@@ -5703,32 +4640,20 @@ impl App {
     }
 
     /// Introspect the current visible route and write PNG + semantic text.
-    ///
-    /// With a window, the PNG is the exact client destination copied beside one
-    /// successful present submission: raw destination bands and present-only GPU
-    /// colour/glow passes, but not OS compositor visibility or platform
-    /// titlebar/backdrop pixels, and the `.txt` is projected from that same
-    /// present. Headless has no surface transaction, so its PNG is the semantic
-    /// renderer output and may omit present-only passes. Triggered by SIGUSR1; the
-    /// files are written 0600 into the per-user 0700 control dir (see
-    /// `snapshot_path`).
     #[cfg(unix)]
     pub(crate) fn snapshot(&mut self) {
         let Some(path) = snapshot_path::resolve() else {
+            // Distinct branch.
             return; // refusal already logged by resolve()
         };
         self.snapshot_at_path(path);
     }
 
-    // Only the SIGUSR1 snapshot (`snapshot`, unix) and tests call it; Windows
-    // captures through the `image` verb.
     #[cfg_attr(not(unix), allow(dead_code))]
     pub(crate) fn snapshot_at_path(&mut self, path: String) {
         self.run_capture(CaptureRequest::Snapshot { path });
     }
 
-    /// The snapshot's body, once [`Self::run_capture`] has admitted it:
-    /// `front` is the front window it photographs.
     fn snapshot_body(&mut self, front: Option<WindowId>, path: String) {
         let transaction = match begin_snapshot_generation(std::path::Path::new(&path)) {
             Ok(transaction) => transaction,
@@ -5762,10 +4687,6 @@ impl App {
         self.snapshot_tail(front, capture, strip_rows, transaction);
     }
 
-    /// Finish a snapshot from its resolved source: the text of the model the
-    /// frame shows, and the frame, a destination as it is or the one rerender.
-    /// Deflate and writes run on the encode worker, which writes the `.done`
-    /// marker last, so the requester's stat() contract holds.
     fn snapshot_tail(
         &mut self,
         front: WindowId,
@@ -5785,8 +4706,6 @@ impl App {
         else {
             return;
         };
-        // Terminal rows share the accessibility serializer; native rows come
-        // from the exact retained `CompiledUi` that supplied the route's raster.
         let text = self.snapshot_visible_text(
             front,
             context.route,
@@ -5818,19 +4737,8 @@ impl App {
         });
     }
 
-    /// Hand a capture to the single PNG encode/write worker, spawning it lazily
-    /// on first use (a run that never screenshots pays nothing). EXACTLY ONE
-    /// worker by design: `image` requests, one per [`crate::Wake::Image`] in the
-    /// order winit delivers them, must reply in that order, and a single mpsc
-    /// consumer preserves submission order. Admission is bounded and
-    /// non-blocking: a saturated or unavailable worker rejects and cleans the
-    /// job instead of stalling the event-loop thread or accumulating full-frame
-    /// buffers without limit.
+    /// Hand a capture to the single PNG encode/write worker, spawning it lazily on first use (a run that never screenshots pays nothing).
     pub(crate) fn submit_encode_job(&mut self, mut job: EncodeJob) {
-        // A video dump can hold a worker for seconds to minutes (hundreds of
-        // full-frame PNG encodes), so it runs on its own one-shot lane and no
-        // `image`/`window`/`snapshot` reply queues behind it. At most one recording
-        // exists at a time. A failed spawn falls through to the shared worker. A
         // dump is byte-budgeted at capture, so it takes no capture permit.
         if matches!(&job, EncodeJob::VideoDump { .. }) {
             let (vtx, vrx) = std::sync::mpsc::channel::<EncodeJob>();
@@ -5838,8 +4746,6 @@ impl App {
                 "aterm-video-encode".to_string(),
                 crate::qos::Role::Background,
                 move || {
-                    // Background QoS: a recording encode is cosmetic work no
-                    // keystroke waits on, so it never takes P-core time from the
                     // UI thread on a saturated machine.
                     if let Ok(j) = vrx.recv() {
                         run_encode_job(j, None);
@@ -5848,17 +4754,12 @@ impl App {
             )
             .is_ok();
             if spawned {
-                // The receiver is owned by the just-spawned thread and exits
-                // after this job. Preserve ownership even if it dies before
-                // receiving, then use the bounded shared fallback below.
                 match vtx.send(job) {
                     Ok(()) => return,
                     Err(std::sync::mpsc::SendError(returned)) => job = returned,
                 }
             }
         }
-        // The capture's reserved bytes ride with its job, recharged to the
-        // frame it actually produced; dropped with the job wherever it ends.
         let permit = if matches!(&job, EncodeJob::VideoDump { .. }) {
             None
         } else {
@@ -5875,8 +4776,6 @@ impl App {
                     reject_encode_job(work.job, ENCODE_QUEUE_FULL);
                     return;
                 }
-                // Worker gone (its loop only ends when every sender drops, so
-                // this is defensive); respawn below with the returned job.
                 Err(std::sync::mpsc::TrySendError::Disconnected(returned)) => {
                     self.encode_tx = None;
                     work = returned;
@@ -5888,12 +4787,6 @@ impl App {
             "aterm-png-encode".to_string(),
             crate::qos::Role::Background,
             move || {
-                // Background QoS: screenshot encoding is off the keystroke path;
-                // the client waits on its reply, not the human.
-                // Drain until every sender is gone (process teardown); a dead
-                // client's dropped reply receiver only makes send() fail, which
-                // `run_encode_job` ignores — never a worker panic. The capture
-                // bytes go with the raw framebuffer, before the reply.
                 while let Ok(EncodeWork { job, permit }) = rx.recv() {
                     run_encode_job(job, permit);
                 }
@@ -5904,8 +4797,6 @@ impl App {
             match tx.try_send(work) {
                 Ok(()) => self.encode_tx = Some(tx),
                 Err(std::sync::mpsc::TrySendError::Full(work)) => {
-                    // The fresh queue is empty and has positive capacity, but
-                    // keep ownership total if that invariant ever changes.
                     self.encode_tx = Some(tx);
                     reject_encode_job(work.job, ENCODE_QUEUE_FULL);
                 }
@@ -5918,15 +4809,6 @@ impl App {
         }
     }
 
-    /// The bytes a capture of `wid` will hold until its encode is done,
-    /// estimated BEFORE it is taken, as its job's `peak_bytes` will count
-    /// them, from what the capture may be made of (`charge`) and the window's
-    /// geometry: its frame's size (the window's device-pixel size, or headless
-    /// the grid plus its chrome at this window's cell size) and the destination
-    /// its present can be tapped for ([`Self::destination_capture_bytes`]).
-    /// A frame charges [`frame_capture_peak`]; a `window`, its photograph and
-    /// stitch ([`Self::window_capture_estimate`]). [`CapturePermit::recharge`]
-    /// corrects it to the capture actually produced.
     fn capture_bytes_estimate(&self, wid: WindowId, charge: CaptureCharge) -> usize {
         let Some(ws) = self.windows.get(&wid) else {
             return 0;
@@ -5955,15 +4837,6 @@ impl App {
         }
     }
 
-    /// The allocation of a destination tapped from `wid`'s present, as it
-    /// travels to the encode worker ([`CapturePixels::peak_bytes`] counts the
-    /// whole of it however it is cut): a GPU swapchain's mapped copy, its
-    /// format's texels in rows padded to the copy alignment
-    /// ([`aterm_gpu::GpuSurface::snapshot_bytes`]); a CPU present's softbuffer
-    /// of the `width`×`height` window, four bytes a pixel; a headless
-    /// recording's virtual target as mapped
-    /// ([`aterm_gpu::WindowGpu::virtual_snapshot_bytes`]). `None` when nothing
-    /// can be tapped.
     fn destination_capture_bytes(
         &self,
         wid: WindowId,
@@ -5979,12 +4852,6 @@ impl App {
         }
     }
 
-    /// A `window` capture's estimate ([`StitchCharge`]): the photograph at
-    /// the platform window's outer size (the frame's size when there is no
-    /// platform window), the presented client (`destination`, or the frame's
-    /// packed size), and on macOS the titlebar chrome as wide as the
-    /// photograph and as tall as the window's chrome headroom, handed over as
-    /// an 8-bit bitmap.
     #[cfg(any(target_os = "macos", windows))]
     fn window_capture_estimate(
         &self,
@@ -6019,19 +4886,11 @@ impl App {
         .peak_bytes()
     }
 
-    /// ADMIT a capture of `wid` BEFORE taking it: reserve its estimated bytes
-    /// ([`Self::capture_bytes_estimate`]) from the encoder's in-flight budget
-    /// ([`CAPTURE_BYTE_BUDGET`]) and park
-    /// the permit where the capture's [`Self::submit_encode_job`] picks it up.
-    /// `false` means the encoder already holds too much: the caller answers
-    /// busy (`encode queue full; retry`) WITHOUT capturing — no photograph, no
-    /// readback, nothing thrown away on the event loop.
     fn admit_capture(&mut self, wid: Option<WindowId>, charge: CaptureCharge) -> bool {
         let bytes = wid.map_or(0, |wid| self.capture_bytes_estimate(wid, charge));
         self.admit_capture_bytes(bytes)
     }
 
-    /// [`Self::admit_capture`] for a capture estimated at `bytes`.
     fn admit_capture_bytes(&mut self, bytes: usize) -> bool {
         match CapturePermit::try_reserve(&self.capture_bytes, bytes) {
             Some(permit) => {
@@ -6043,12 +4902,6 @@ impl App {
         }
     }
 
-    /// The `--meta` identity of one encoded `image` frame, for every route: a
-    /// terminal frame's from its inventory and the model it shows
-    /// ([`Self::terminal_image_metadata`]), a native or mixed frame's from the
-    /// retained rasters of its plan ([`Self::native_image_metadata_from_plan`]),
-    /// or the facts a headless recording froze at its present. The encode
-    /// worker fills in the pixels' fingerprint and publishes it into `cell`.
     fn image_metadata(
         &self,
         front: WindowId,
@@ -6094,11 +4947,6 @@ impl App {
         })
     }
 
-    /// The metadata of a terminal frame: the fingerprints of its engine
-    /// snapshot and geometry, and one leaf per visible pane. A single pane is
-    /// the frame's one view, and its leaf carries the frame's size; a split
-    /// names no singular view. The frame's raster is its encoded pixels, whose
-    /// fingerprint the encode worker fills in ([`PendingMetadata::publish`]).
     fn terminal_image_metadata(
         &self,
         front: WindowId,
@@ -6314,10 +5162,7 @@ impl App {
         })
     }
 
-    /// `theme-fingerprint`: every colour the installed theme draws (renderer
-    /// chrome, the 16 ANSI slots, extended `palette[]` entries, selection
-    /// foreground, `bold_is_bright`), so themes that differ only in one of them
-    /// tell apart. FNV-1a keeps the value stable across builds and toolchains.
+    /// `theme-fingerprint`.
     pub(crate) fn image_theme_fingerprint(&self) -> u64 {
         let mut hash = aterm_hash::Fnv1a64::new();
         hash.write(b"theme-fingerprint-v2");
@@ -6345,14 +5190,6 @@ impl App {
         hash.finish() | 1
     }
 
-    /// Hash the exact terminal-owned model fields a renderer consumes.
-    ///
-    /// `damage_epoch`/`snapshot_seq` is deliberately not sufficient: damage is
-    /// latched until a real present consumes it, while explicit captures are
-    /// observational and may extract several different grids inside one
-    /// outstanding damage session. Hashing cells and every sparse companion
-    /// keeps idle captures stable and still distinguishes output that lands
-    /// between two capture requests.
     fn hash_terminal_render_model<H: std::hash::Hasher>(
         input: &aterm_render::RenderInput,
         hash: &mut H,
@@ -6377,21 +5214,11 @@ impl App {
                 cell.strikethrough.hash(hash);
                 cell.overline.hash(hash);
                 cell.underline_color.hash(hash);
-                // Every field the renderer reads off a cell, including one no
-                // escape sequence sets: a field left out of this hash is a
-                // difference a capture cannot report. The terminal band leaves the
-                // overline colour `None`, so this changes no identity today.
                 cell.overline_color.hash(hash);
             }
         }
         input.clusters.hash(hash);
         input.combining.hash(hash);
-        // v8: each row's BiDi visual→logical map. The selection is painted
-        // through it, so a frame whose only change is a row's order (BiDi
-        // switched on over a row of one repeated Hebrew letter) highlights
-        // other cells under otherwise equal fields. Read by meaning, as
-        // `RenderInput`'s equality reads it: a missing row and an
-        // empty one are both the identity, so only permuted rows are hashed.
         for (row, map) in input.visual_to_logical.iter().enumerate() {
             if !map.is_empty() {
                 row.hash(hash);
@@ -6400,9 +5227,6 @@ impl App {
         }
         usize::MAX.hash(hash);
 
-        // Image payloads can be large and one Arc appears in every covered
-        // cell. Hash each unique payload once, while every placement/tile still
-        // contributes its row/column coordinates.
         let mut seen_images = std::collections::HashSet::new();
         for row in &input.images {
             row.len().hash(hash);
@@ -6425,11 +5249,6 @@ impl App {
                     image.cols.hash(hash);
                     image.rows.hash(hash);
                     image.z_index.hash(hash);
-                    // Placement policy, not just payload: the same raster in the
-                    // same footprint draws differently pixel-exact (sixel,
-                    // un-sized Kitty) than fitted (OSC 1337, Kitty `c=`/`r=`)
-                    // or stretched (`preserveAspectRatio=0`), and a Kitty crop
-                    // shows a different part of it.
                     image.scaling.hash(hash);
                     image.source_rect.hash(hash);
                     image.bytes.hash(hash);
@@ -6459,13 +5278,7 @@ impl App {
         input.display_offset.hash(hash);
         input.base_y.hash(hash);
         input.absolute_row_revision.hash(hash);
-        // v7: the renumber epoch travels with the revision everywhere else
-        // (`splice_find_bar`, `search_stamp_mismatch`, the parked find anchor).
-        // Every path that raises it also moves something hashed above; it is
-        // hashed anyway, by the rule at `overline_color`.
         input.history_renumber_epoch.hash(hash);
-        // The holder fence decides where a card is decorated, so two frames
-        // that differ only in it can draw differently.
         input.holder.hash(hash);
         input.cursor_row.hash(hash);
         input.cursor_col.hash(hash);
@@ -6490,10 +5303,6 @@ impl App {
         } else {
             false.hash(hash);
         }
-        // v5: the per-pane selection list. On a composed split frame it is the
-        // renderer's selection authority (the scalar fields above are only the
-        // focused pane's), so the scalars alone would miss an unfocused pane's
-        // highlight moving. Empty on every single-terminal frame.
         input.selections.len().hash(hash);
         for pane in &input.selections {
             pane.clip.hash(hash);
@@ -6516,11 +5325,6 @@ impl App {
         }
     }
 
-    /// Identity of the engine-owned terminal snapshot that fed one capture.
-    /// `snapshot_seq` is the terminal's monotone damage epoch, captured under
-    /// the same lock that extracted every cell; session + view make that epoch
-    /// unambiguous across panes, while viewport coordinates bind the retained
-    /// model to the exact visible slice that was rasterized.
     fn terminal_snapshot_fingerprint(
         view: u64,
         session: u64,
@@ -6535,9 +5339,6 @@ impl App {
         snapshot.finish() | 1
     }
 
-    /// Identity of the one-terminal snapshot, or of every exact leaf extraction
-    /// that fed a pure-terminal composite. The one-leaf arm is
-    /// [`Self::terminal_snapshot_fingerprint`] unchanged, so its identities stay stable.
     fn terminal_capture_fingerprint(
         capture: &crate::app_render::TerminalCaptureGrid,
         input: &aterm_render::RenderInput,
@@ -6581,9 +5382,6 @@ impl App {
         geometry.finish() | 1
     }
 
-    /// `pixel-fingerprint` of packed pixels hashed in one piece: the reference
-    /// [`CapturePixels::pixel_fingerprint`] streams to, which the tests hold it
-    /// to.
     #[cfg(test)]
     fn image_pixel_fingerprint<T: std::hash::Hash>(
         width: usize,
@@ -6599,14 +5397,7 @@ impl App {
         hash.finish() | 1
     }
 
-    /// The `panes` control verb's payload: a window's active-tab pane layout as
-    /// parse-stable `k=v` rows, so a headless driver can assert split state, read
-    /// zoom, and aim per-pane mouse/focus actions. One `layout …` header, then one
-    /// `pane …` row per visible pane (a zoomed tab reports the single zoomed rect).
-    /// Content cell coords; split dividers and per-pane subtab headers lie outside
-    /// these rects. `session` targets the window whose active tab displays it (the
-    /// `image` routing rule, so `@<sid> panes` and `@<sid> image` agree). Empty when
-    /// no window resolves (`OK 0`), never a silent fallback to the front window.
+    /// The `panes` control verb's payload.
     pub(crate) fn read_pane_layout(&self, session: Option<u64>) -> Vec<String> {
         let win = match session {
             Some(id) => self.windows_displaying(id).next(),
@@ -6620,8 +5411,6 @@ impl App {
         };
         let active = ws.tab_set.active_index().unwrap_or(0);
         let Some(tree) = self.active_tree(wid) else {
-            // Native / mixed tree: no terminal pane geometry to report — an
-            // honest empty layout, never a guess.
             return vec![format!(
                 "layout tab={active} panes=0 zoomed=false terminal=false"
             )];
@@ -6632,12 +5421,6 @@ impl App {
         let Some(focus_index) = plan.leaves.iter().position(|leaf| leaf.focused) else {
             return Vec::new();
         };
-        // The plan's rects, not the tree's: `resize_panes` sizes every pane's
-        // engine + PTY from the visible plan's leaf rects (through
-        // [`Self::pane_target_grid`]) and `dims` reads the engine back, so the plan
-        // is the one geometry `panes` can report and agree with `dims` for every
-        // pane. The pane tree's own layout places panes by a different rule once
-        // a layout is squeezed (`pane.rs`'s module docs).
         let mut panes = Vec::with_capacity(plan.leaves.len());
         for (index, leaf) in plan.leaves.iter().enumerate() {
             let Some(sid) = self
@@ -6646,7 +5429,6 @@ impl App {
                 .copied()
                 .and_then(crate::tab_model::View::terminal_session)
             else {
-                // The tree said all-terminal; a leaf that resolves to no session
                 // is a stale plan. Fail closed, never a guess.
                 return Vec::new();
             };
@@ -6675,11 +5457,7 @@ impl App {
         lines
     }
 
-    /// One planned leaf's grid in cells — `(rows, cols)`, rounded and floored at
-    /// one cell. The one rounding rule: `resize_panes` sizes every pane's engine +
-    /// PTY with it (through [`Self::pane_target_grid`]) and
-    /// [`Self::read_pane_layout`] reports it, so the grid `panes` prints is the grid
-    /// `dims` reads back by construction.
+    /// One planned leaf's grid in cells.
     pub(crate) fn leaf_grid_cells(rect: &crate::tab_model::LogicalRect) -> (u16, u16) {
         (
             (rect.size.height.round() as u16).max(1),
@@ -6687,12 +5465,7 @@ impl App {
         )
     }
 
-    /// The grid `resize_panes` gives `session`'s engine for a leaf planned at
-    /// `planned` cells: that leaf's own grid, except for a shared session
-    /// (co-viewed in several windows, `views > 1`), whose one grid is the
-    /// minimum across the windows showing it ([`Self::shared_target_geometry`]).
-    /// In the larger viewer such a session's engine is smaller than its leaf
-    /// (the surplus letterboxes), so `panes` must report this, not the leaf.
+    /// The grid `resize_panes` gives `session`'s engine for a leaf planned at `planned` cells.
     pub(crate) fn pane_target_grid(&self, session: u64, planned: (u16, u16)) -> (u16, u16) {
         if self.pool.views(session).is_some_and(|views| views > 1) {
             self.shared_target_geometry(session)
@@ -6701,34 +5474,11 @@ impl App {
         }
     }
 
-    /// Render the CURRENT terminal for the control socket's `image` verb (the
-    /// same renderer the window uses, GPU path if active). Runs on the main
-    /// thread per [`crate::Wake::Image`] — but ONLY the render + app-composition
-    /// composites: the PNG encode + confined write are handed to the encode
-    /// worker, which transfers guarded `(width, height)` after the write. The
-    /// control writer revalidates file replies and retains them through response
-    /// ACK/quarantine; inline PNG memory is retained through write and flush.
+    /// Render the CURRENT terminal for the control socket's `image` verb (the same renderer the window uses, GPU path if active).
     pub(crate) fn render_image(&mut self, req: ImageReq) {
         self.run_capture(CaptureRequest::Image(req));
     }
 
-    /// The `image` body, once [`Self::run_capture`] has admitted it. Cross-session
-    /// (`@<sid> image`), `win` is the window whose ACTIVE tab displays the target
-    /// session — the frame that session's viewer actually sees (splits,
-    /// decorations, tab strip included); self keeps the frontmost window
-    /// byte-for-byte ([`CaptureRequest::target_window`]). No displaying window
-    /// (background tab / no windows) is its own `Err`; every later (0,0) reply is
-    /// a window with nothing to capture this frame.
-    ///
-    /// `image` is deliberately the application's own frame, never a
-    /// platform-window photograph: only the distinct `window` verb includes
-    /// title bars, traffic lights and OS chrome. A WINDOWED capture is bound to
-    /// the real present it forces, without acquiring Screen Recording
-    /// permission or changing image dimensions when focus crosses a
-    /// terminal/native split: an opaque window's `image` is the destination
-    /// that present submitted, cut to the frame, so the picture cannot diverge
-    /// from the glass; `image plain`, a translucent window and a headless one
-    /// are renderer artifacts ([`capture_source_kind`]).
     fn image_body(&mut self, win: Option<WindowId>, req: ImageReq) {
         let Some(front) = win else {
             let _ = req.reply.send(Err(if req.session.is_some() {
@@ -6775,9 +5525,6 @@ impl App {
         self.image_tail(front, capture, req);
     }
 
-    /// Finish an `image` from its resolved source: the frame (a destination as
-    /// it is, or the one rerender of an owned copy of the model, which `image
-    /// plain` strips of its bling layers), its metadata, and the encode.
     fn image_tail(&mut self, front: WindowId, capture: ResolvedCapture, req: ImageReq) {
         let ImageReq {
             handoff,
@@ -6800,12 +5547,6 @@ impl App {
         let (pixels, model) = match source {
             CaptureSource::Destination { pixels, .. } => (pixels, model),
             CaptureSource::Rerender { visuals, .. } => {
-                // CLEAN capture (`image plain`): drop every host-owned bling
-                // LAYER so the AI reads the bare terminal (cursor trail, LUMEN
-                // glow, sparkle-word decorations, the animated Scene). They
-                // live in separate `RenderInput` fields of this copy, so the
-                // cell grid is untouched, and so is the scratch a later present
-                // or capture reuses.
                 let mut input = model.unwrap_or_else(|| self.take_rerender_input(front));
                 if clean {
                     input.clear_overlays();
@@ -6820,8 +5561,6 @@ impl App {
                 }
             }
         };
-        // The metadata is built here, from the model and layout of this turn;
-        // the encode worker hashes the pixels it encodes into it.
         let metadata = if want_metadata {
             let (width, height) = pixels.dims();
             let (Ok(width), Ok(height)) = (u32::try_from(width), u32::try_from(height)) else {
@@ -6849,20 +5588,6 @@ impl App {
         } else {
             None
         };
-        // `confine_image_path` (control thread) produced `target` as a canonical
-        // `images/` dir + a SINGLE filename, forbidding nested target dirs. The
-        // worker writes by opening THAT directory `O_DIRECTORY|O_NOFOLLOW` and
-        // `openat`-ing the final component `O_NOFOLLOW|O_CREAT|O_TRUNC` — so the
-        // only guarantee we rely on is: the write lands in the canonical images
-        // dir and never follows a symlink at the directory OR the final name.
-        // (We do NOT claim atomicity vs. a same-uid client deleting+recreating
-        // the directory between threads; we DO close the intermediate-dir
-        // symlink-swap window by never re-resolving a multi-segment path string.)
-        //
-        // The PNG deflate (50–150 ms on a Retina-sized frame) + write run on the
-        // encode worker, NOT this event-loop thread. Every app-owned splice/overlay
-        // above is already baked into the moved `pixels`, and the worker replies
-        // only after the write — the client reads the file the moment it sees OK.
         self.submit_encode_job(EncodeJob::Image {
             pixels,
             metadata,
@@ -6874,15 +5599,7 @@ impl App {
         });
     }
 
-    /// THE FRONT WINDOW'S TAB LINE WHERE NO NATIVE STRIP DRAWS IT (a macOS
-    /// `--headless` instance builds no toolbar): `toolbar-tabs …` as
-    /// [`crate::toolbar::format_tab_chrome`] formats the native strip's, from
-    /// the App's own model — the labels `inspect app/v1 tabs` reads (the
-    /// refresh's cached chrome titles), the marks
-    /// [`Self::tab_strip_metadata`] stamps (a background tab's `done` among
-    /// them, `docs/DESIGN-harness-autopilot-2026-10-15.md` §11.2.1) and the
-    /// tooltips. A pure read, made only when `chrome` is asked. `None` with no
-    /// window or no tab.
+    /// THE FRONT WINDOW'S TAB LINE WHERE NO NATIVE STRIP DRAWS IT (a macOS `--headless` instance builds no toolbar).
     #[cfg(any(target_os = "macos", test))]
     pub(crate) fn stripless_tab_chrome(&self) -> Option<String> {
         let wid = self
@@ -6912,9 +5629,6 @@ impl App {
             &self.tab_tooltips(wid),
             ws.tab_set.active_index().unwrap_or(0),
         )?;
-        // A dev build adds the hovers as the strip was last stamped with
-        // them: composed above at the read, a hover whose push was never
-        // made again would read fresh, where a person sees it stale.
         #[cfg(any(test, debug_assertions))]
         let line = {
             let pushed: Vec<Option<&str>> =
@@ -6924,26 +5638,7 @@ impl App {
         Some(line)
     }
 
-    /// Read the frontmost window's native macOS chrome — its `NSToolbar` items and
-    /// the application menu bar — as text lines for the `chrome` verb. Runs on the
-    /// main thread (the only place AppKit objects may be touched), driven by
-    /// [`crate::Wake::ReadChrome`]; the control thread blocks on the reply.
-    ///
-    /// The only introspection path that sees OS chrome (`image`/`text` render the
-    /// content view only). A pure read: it only calls getters, never mutating
-    /// AppKit state.
-    ///
-    /// The menu bar is read through the injected [`App::app_menu_bar`] field, never
-    /// here: its AppKit read begins with `+[NSApplication sharedApplication]`, which
-    /// CREATES the application object — and with it the process's WindowServer
-    /// connection — in a headless process, whose display-free loop never built one
-    /// ([`crate::app_menu_bar`] says what happened when it did).
-    ///
-    /// Off macOS, the other `read_native_chrome` reports the platform-neutral menu.
-    ///
-    /// A front window with no native strip (a `--headless` instance's) prints
-    /// the `toolbar-tabs` line its strip would show
-    /// ([`Self::stripless_tab_chrome`]).
+    /// Read the frontmost window's native macOS chrome.
     #[cfg(target_os = "macos")]
     pub(crate) fn read_native_chrome(&self) -> Vec<String> {
         use aterm_objc::{autoreleasepool, sel};
@@ -6959,41 +5654,24 @@ impl App {
 
         let mut out: Vec<String> = Vec::new();
 
-        // We are on the winit main-loop thread (this runs via `user_event`), so the
-        // witness is always present; bail gracefully if somehow not.
         let Some(mtm) = MainThread::new() else {
             out.push("ERR not on main thread".to_string());
             return out;
         };
 
-        // Every object this function touches is borrowed (+0), so the whole read
-        // runs inside one pool that keeps them alive by scope; only `String`s escape.
         autoreleasepool(|_| {
-            // --- The frontmost window's NSToolbar ------------------------------
-            // Reach the NSWindow as `toolbar::install_window_toolbar` does: winit
-            // Window -> content NSView -> NSWindow.
             let ns_window = self
                 .front()
                 .and_then(|ws| ws.os_window.as_ref())
                 .map(|w| crate::platform::ns_view_of(w))
                 .filter(|view| !view.is_null())
                 .and_then(|view| {
-                    // SAFETY: `view` is the front window's live NSView (owned by
-                    // winit for the window's lifetime); we only borrow it on the
-                    // main thread, as AppKit requires, to read its `window`.
-                    // `-[NSView window]` is `-(NSWindow *)` and +0.
+                    // SAFETY: `view` is the front window's live `NSView` borrowed on the main thread.
                     let window = unsafe { appkit::send_id(view, sel!(window)) };
                     (!window.is_null()).then_some(window)
                 });
 
-            // SAFETY: the AppKit getters below (`toolbar`/`toolbarStyle`/
-            // `displayMode`/`items`/`count`/`objectAtIndex:`/`itemIdentifier`/
-            // `label`) are side-effect-free accessors needing only a live receiver,
-            // called on the main thread (`mtm` proves it). Each returns +0,
-            // borrowed for the pool above. The two enumerated properties are read
-            // at the widths the runtime states: `-toolbarStyle` is an NSInteger and
-            // `-displayMode` an NSUInteger — a pair that would silently agree on
-            // every value either happens to hold.
+            // SAFETY: side-effect-free AppKit toolbar accessors on live main-thread receivers.
             unsafe {
                 let toolbar = ns_window
                     .map(|w| appkit::send_id(w, sel!(toolbar)))
@@ -7009,9 +5687,6 @@ impl App {
                                 Some(NS_WINDOW_TOOLBAR_STYLE_UNIFIED_COMPACT) => "unified-compact",
                                 _ => "?",
                             };
-                        // All four `NSToolbarDisplayMode` enumerators are named, so
-                        // each stays in the constant table the SDK check covers;
-                        // `_` reads an enumerator Apple adds later as "default".
                         let display_mode = match appkit::send_usize(toolbar, sel!(displayMode)) {
                             NS_TOOLBAR_DISPLAY_MODE_ICON_ONLY => "icon-only",
                             NS_TOOLBAR_DISPLAY_MODE_LABEL_ONLY => "label-only",
@@ -7046,44 +5721,25 @@ impl App {
                 }
             }
 
-            // Native title chrome, including a one-tab window: canonical titles,
-            // selection, independent states and tooltips (app/session identity, not
-            // only a tab switcher), read off the retained handle `toolbar.rs` built
-            // and owns rather than a toolbar-item view downcast.
             if let Some(handle) = self.frontmost_window.and_then(|w| self._toolbars.get(&w)) {
                 if let Some(line) = self.apprt.read_toolbar_chrome(handle) {
                     out.push(line);
                 }
-                // The per-tab context menus: one `tab-menu tab=<i> items=[...]` line
-                // per tab chip, read off the stored models a right-click pops, so a
-                // driver sees exactly the items (and greyed states) a human would.
-                // Empty at ≤1 tab, like the switcher line above.
                 out.extend(self.apprt.read_toolbar_tab_menus(handle));
             } else if let Some(line) = self.stripless_tab_chrome() {
-                // No native strip (a headless instance): the line its strip
                 // would show, so a tab's marks stay readable there too.
                 out.push(line);
             }
 
-            // --- The application menu bar (NSApplication.mainMenu) ------------
-            // Through the injected reader: AppKit's for a windowed instance, the
-            // inert `menu (none)` for a headless one and for every unit test.
             out.extend((self.app_menu_bar)(mtm));
         });
 
         out
     }
 
-    /// Off macOS there is no native window toolbar, but the application menu is
-    /// still serialised from the platform-neutral [`crate::menu::MENU_MODEL`], so
-    /// `chrome` reports the same logical menu (`menu "File": …` lines) on every
-    /// platform. A method on every target so the [`crate::Wake::ReadChrome`]
-    /// handler is platform-independent.
+    /// Off macOS there is no native window toolbar.
     #[cfg(not(target_os = "macos"))]
     pub(crate) fn read_native_chrome(&self) -> Vec<String> {
-        // Windows: report the native chrome the `AppRtWindows` backend applied,
-        // read back from the live HWND via DwmGetWindowAttribute (dark mode, corner
-        // preference, system backdrop). Off Windows there is no native chrome to read.
         #[cfg(windows)]
         let out: Vec<String> = crate::platform_win::read_chrome_lines(
             self.front().and_then(|ws| ws.os_window.as_deref()),
@@ -7092,45 +5748,23 @@ impl App {
         );
         #[cfg(not(windows))]
         let out: Vec<String> = Vec::new();
-        // Off macOS the host keeps the title/tab model in memory even where no native
-        // header-bar widget exists yet. Read it through the same AppRt seam as macOS so
-        // Settings identity, route tooltip, selection, state, and the terminal-no-icon
-        // policy remain visible to introspection on every host.
         let toolbar_tabs = self
             .frontmost_window
             .and_then(|wid| self._toolbars.get(&wid))
             .and_then(|handle| self.apprt.read_toolbar_chrome(handle));
-        // No native window toolbar off macOS (the tab strip is in-grid); say so,
-        // then serialise the platform-neutral menu model. The per-tab context-menu
-        // mirror is surfaced too: the in-memory toolbar model records the same
-        // composed per-tab menus the macOS strip pops (empty at ≤1 tab).
         let tab_menus = self
             .frontmost_window
             .and_then(|w| self._toolbars.get(&w))
             .map_or_else(Vec::new, |handle| self.apprt.read_toolbar_tab_menus(handle));
-        // The Version menu's install row and ⌘W's title are live state, read
-        // as the palette reads them: the install row's label or no row, and
-        // Close Pane on a split tab.
         let live = self.palette_live();
         let apply_row = crate::palette::apply_row_label(&live);
-        // The strip's version label (Windows): what the front window's strip
-        // laid out, read off its segments, or why it laid none out.
         let strip_version = crate::tab_bar::STRIP_VERSION_SLOT.then(|| {
-            // No strip, no label — whatever a strip drawn before it was turned
-            // off left in the segment cache.
             let (segments, hovered) = self
                 .front()
                 .filter(|_| self.tab_strip_rows > 0)
                 .map_or((&[][..], false), |ws| {
                     (ws.tab_segments.as_slice(), ws.strip_hover_version)
                 });
-            // The reason is read off the slot the strip was laid out with: the
-            // window's version-slot memo, which every strip splice measures into
-            // before its cache decision — not `last_strip_fp`, which chrome, font
-            // and theme invalidations empty while the segments stay laid out. A
-            // strip laid out before the UI face landed measured no slot; a headless
-            // instance lays its strip out only when it composes a frame (`image`);
-            // a chrome regrid clears the segments until the next frame.
             #[cfg(any(windows, target_os = "linux"))]
             let laid_slot = self
                 .front()
@@ -7149,8 +5783,6 @@ impl App {
             };
             strip_version_chrome_line(segments, hovered, absent, self.strip_version_attention())
         });
-        // The window's own frame and its header buttons (Linux, LW.5), as the
-        // front window's strip laid them out.
         let strip_caption = cfg!(target_os = "linux").then(|| {
             let (segments, frame, hovered) = self.front().map_or((&[][..], None, None), |ws| {
                 let segments = if self.tab_strip_rows > 0 {
@@ -7176,8 +5808,7 @@ impl App {
         )
     }
 
-    /// The `window` verb: the front window's platform chrome stitched around
-    /// its exact presented client frame.
+    /// The `window` verb.
     #[cfg(any(target_os = "macos", windows))]
     pub(crate) fn capture_window(
         &mut self,
@@ -7189,23 +5820,6 @@ impl App {
         self.capture_aux_window(AuxTarget::Front, handoff, path, cancel, reply);
     }
 
-    /// The `window` body, once [`Self::run_capture`] has admitted it: `wid` is
-    /// the logical window to photograph. The platforms differ only in their
-    /// photograph ([`Self::photograph`]). A capture failure replies `Err`
-    /// immediately; captured pixels are handed to the encode worker.
-    ///
-    /// The platform photograph supplies the window frame; its client rows are
-    /// replaced with the exact successful-present destination. A successful
-    /// Metal `present()` means the drawable was accepted, not that the
-    /// out-of-process WindowServer has already promoted it, so CoreGraphics can
-    /// photograph the previous client frame for one compositor interval right
-    /// after an `open`/`act`, even though the titlebar and semantic inspection
-    /// are current. The one-shot surface capture is already the final raw
-    /// client layer (letterbox bands/crops, tray, bell/overlay, SDR crown and
-    /// HDR conversion included), so it is authoritative below the overlapping
-    /// titlebar; the photograph stays authoritative only for platform-owned
-    /// title/toolbar chrome. No timing guess or offscreen lookalike enters
-    /// full-window introspection.
     #[cfg(any(target_os = "macos", windows))]
     fn window_body(&mut self, wid: Option<WindowId>, request: WindowReq) {
         let Some(wid) = wid else {
@@ -7264,10 +5878,6 @@ impl App {
         }
     }
 
-    /// The `window` body's same-turn half: the window still shows the present
-    /// its barrier bound and has the client geometry it presented at. The
-    /// stitch itself, a pixel pass, is the encode worker's
-    /// ([`WindowStitch::finish`]).
     #[cfg(any(target_os = "macos", windows))]
     fn window_stitch(
         &self,
@@ -7287,10 +5897,6 @@ impl App {
         Ok(WindowStitch { shot, client, rect })
     }
 
-    /// The platform guards for a capture that copies `wid`'s presented client
-    /// layer (`window`, a windowed snapshot): one the compositor blends with
-    /// what is behind the window, or with a backdrop material the photograph
-    /// omits, is not what the window shows ([`crate::platform_capture_guards`]).
     fn client_capture_guards(&self, wid: WindowId) -> Result<(), &'static str> {
         crate::platform_capture_guards(
             crate::HOST_CAPTURE,
@@ -7300,8 +5906,6 @@ impl App {
         )
     }
 
-    /// Whether `wid` presents a translucent client layer, on any platform
-    /// ([`crate::translucent_gpu_client`]).
     fn client_is_translucent(&self, wid: WindowId) -> bool {
         crate::translucent_gpu_client(
             &self.render_knobs,
@@ -7310,18 +5914,12 @@ impl App {
         )
     }
 
-    /// Whether `wid` presents through a GPU swapchain.
     fn presents_to_gpu_surface(&self, wid: WindowId) -> bool {
         self.windows
             .get(&wid)
             .is_some_and(|window| matches!(window.present, Some(crate::PresentTarget::Gpu { .. })))
     }
 
-    /// Whether `wid`'s present can be tapped: a CPU surface always (its opaque
-    /// softbuffer), a GPU swapchain when it offers `COPY_SRC`
-    /// ([`aterm_gpu::GpuSurface::snapshot_is_copyable`]). A Display-P3 or f16
-    /// swapchain's tap is converted to sRGB on the encode worker, like any
-    /// other.
     fn client_tap_is_copyable(&self, wid: WindowId) -> bool {
         match self
             .windows
@@ -7336,11 +5934,6 @@ impl App {
         }
     }
 
-    /// Cut a destination tapped from `wid`'s present back to the frame that
-    /// present placed in it, by the placement law the present used
-    /// ([`aterm_render::frame_placement`]): the whole frame when it fits the
-    /// surface, its visible intersection while it overflows (a transient
-    /// resize). Only the part read narrows; the encode worker reads it.
     fn presented_frame_of(
         &self,
         wid: WindowId,
@@ -7361,10 +5954,6 @@ impl App {
         client.cut_to(visible)
     }
 
-    /// Arm one exact destination copy for the next successful surface
-    /// transaction. CPU retains its final softbuffer only for this requested
-    /// frame; GPU attaches an independent one-shot tap beside any active video
-    /// recorder and copies the post-crown swapchain texture in the same encoder.
     fn arm_presented_client_capture(&mut self, wid: WindowId) -> Result<(), String> {
         let App {
             backend, windows, ..
@@ -7391,11 +5980,6 @@ impl App {
         }
     }
 
-    /// Drain the exact destination armed above, as the surface holds it: a CPU
-    /// softbuffer's copy, or a GPU staging buffer's mapped bytes, which the
-    /// encode worker converts. This runs only after the successful-present
-    /// serial advances, so blocking for the explicit GPU readback is off the
-    /// ordinary present hot path.
     fn take_presented_client_capture(&mut self, wid: WindowId) -> Result<CapturePixels, String> {
         let App {
             backend, windows, ..
@@ -7426,9 +6010,6 @@ impl App {
         }
     }
 
-    /// Clear any failed/stale one-shot before a bounded retry. Taking an armed
-    /// GPU tap consumes it even though it returns "not captured"; CPU simply
-    /// drops the requested/staged clone.
     fn discard_presented_client_capture(&mut self, wid: WindowId) {
         let App {
             backend, windows, ..
@@ -7446,11 +6027,6 @@ impl App {
         }
     }
 
-    /// The main-thread half of a window capture: resolve the logical window's
-    /// `NSWindow` → `windowNumber()` (AppKit objects are main-thread-only) and
-    /// photograph its composited on-screen pixels, returning tightly-packed
-    /// premultiplied RGBA8 + dims. The stitch, encode and write half lives on
-    /// the encode worker.
     #[cfg(target_os = "macos")]
     fn window_rgba_of(&self, wid: WindowId) -> Result<(Vec<u8>, u32, u32), String> {
         use aterm_objc::sel;
@@ -7460,8 +6036,6 @@ impl App {
 
         use crate::appkit;
 
-        // Reach the NSView as `read_native_chrome` does. `None` means no attached
-        // OS surface (headless): nothing to photograph.
         let Some(os_window) = self.windows.get(&wid).and_then(|ws| ws.os_window.as_ref()) else {
             return Err("no window to capture (headless)".to_string());
         };
@@ -7469,19 +6043,12 @@ impl App {
         if view.is_null() {
             return Err("no window to capture (headless)".to_string());
         }
-        // SAFETY: `view` points at that window's live NSView (owned by winit
-        // for the window's lifetime); we only borrow it on the main thread, as AppKit
-        // requires, to read its `window` and the window's `windowNumber`.
-        // `-[NSView window]` is `-(NSWindow *)` and +0 — borrowed, and nothing here
-        // outlives the two accessor calls below, so no retain is owed.
+        // SAFETY: `view` is this window's live `NSView` borrowed on the main thread.
         let ns_window = unsafe { appkit::send_id(view, sel!(window)) };
         if ns_window.is_null() {
             return Err("no window to capture (headless)".to_string());
         }
-        // `-windowNumber` is the CGWindowID the window server knows this NSWindow
-        // by. Zero or negative means off-screen / not yet committed: uncapturable.
-        // SAFETY: a side-effect-free `-(NSInteger)` accessor on the live
-        // `NSWindow`, called on the main thread.
+        // SAFETY: side-effect-free `windowNumber` accessor on the live `NSWindow` on the main thread.
         let window_number = unsafe { appkit::send_isize(ns_window, sel!(windowNumber)) };
         if window_number <= 0 {
             return Err(
@@ -7489,18 +6056,9 @@ impl App {
             );
         }
 
-        // Off to CoreGraphics: photograph our own window's composited on-screen
-        // pixels — no Screen Recording grant is involved (see `capture_window_pixels`).
-        // A window not on screen returns a clear `Err`; the PNG encode + confined
-        // write happen on the encode worker.
         capture_window_pixels(window_number as u32)
     }
 
-    /// Resolve the renderer client layer's true origin inside the OS window
-    /// photograph from winit's physical inner/outer geometry. Dimensions alone
-    /// cannot identify this rectangle: Windows has asymmetric non-client resize
-    /// borders, while macOS full-size content starts beneath overlapping toolbar
-    /// chrome. Fail closed if geometry moved between present and capture.
     #[cfg(any(target_os = "macos", windows))]
     fn window_client_rect_of(
         &self,
@@ -7547,20 +6105,6 @@ impl App {
         })
     }
 
-    /// Snapshot the actual AppKit titlebar subtree into a transparent RGBA layer.
-    ///
-    /// `FullSizeContentView` puts the renderer beneath the titlebar, so the exact
-    /// presented client owns every row, while the traffic lights, unified toolbar,
-    /// tab chips and titlebar decoration remain a distinct AppKit view subtree.
-    /// `cacheDisplayInRect:toBitmapImageRep:` produces alpha zero wherever that
-    /// subtree draws nothing: the per-pixel chrome mask a rectangular crop cannot
-    /// give.
-    ///
-    /// The root is found without private class names: start at the standard close
-    /// button and walk upward only while the ancestor does not contain Winit's
-    /// content view. That reaches the titlebar container (and its decoration
-    /// sibling) but never the CAMetalLayer/softbuffer subtree. A hierarchy that
-    /// cannot satisfy that separation fails closed rather than approximating rows.
     #[cfg(target_os = "macos")]
     fn native_chrome_overlay_of(
         &self,
@@ -7570,19 +6114,9 @@ impl App {
     ) -> Result<Option<ChromeLayer>, String> {
         use aterm_objc::autoreleasepool;
 
-        // ONE POOL AROUND THE WHOLE SNAPSHOT. Every AppKit object this function
-        // touches after the first two is +0 — `-bitmapImageRepForCachingDisplayInRect:`,
-        // `+sRGBColorSpace`, the converted rep, its `CGImage` and a fallback PNG
-        // `NSData` are all autoreleased or rep-owned — and the ones it OWNS
-        // (`chrome_root`, a fallback's empty properties dictionary) release inside
-        // it, which is where a `dealloc`'s own autoreleases land. `objc2` retained each of these into a `Retained` and
-        // relied on the caller's pool for the same drops; the scope is stated here
-        // instead of assumed.
         autoreleasepool(|_| self.native_chrome_overlay_pooled(wid, window_width, window_height))
     }
 
-    /// The pooled body of [`Self::native_chrome_overlay_of`], split out so `?` has a
-    /// `Result`-returning function to return from.
     #[cfg(target_os = "macos")]
     fn native_chrome_overlay_pooled(
         &self,
@@ -7599,9 +6133,6 @@ impl App {
             .windows
             .get(&wid)
             .ok_or_else(|| "window capture lost its logical window".to_string())?;
-        // No overlapping titlebar exists in fullscreen or when the
-        // ATERM_NO_FULLSIZE_CONTENT escape hatch is active. The platform capture
-        // already owns the ordinary non-client rows outside the inset client rect.
         if state.metrics.head == 0 {
             return Ok(None);
         }
@@ -7613,11 +6144,7 @@ impl App {
         if content.is_null() {
             return Err("window capture could not read the AppKit content view".to_string());
         }
-        // SAFETY: Winit owns this live NSView for the OS window's lifetime. This
-        // method runs only on the application's main event-loop thread.
-        // `-[NSView window]` is `-(NSWindow *)` and `-[NSWindow
-        // standardWindowButton:]` is `-(NSButton *)(NSWindowButtonType)`, an
-        // NSUInteger — both +0, borrowed for the pool this runs inside.
+        // SAFETY: live main-thread `NSView` and `NSWindow` button accessors returning borrowed `+0` references.
         let ns_window = unsafe { appkit::send_id(content, sel!(window)) };
         if ns_window.is_null() {
             return Err("window capture lost its AppKit window".to_string());
@@ -7633,14 +6160,9 @@ impl App {
         if close.is_null() {
             return Err("window capture could not locate AppKit titlebar controls".to_string());
         }
-        // No cast: an `Id` is the instance address, so the NSButton -> NSControl ->
-        // NSView upcast is not an operation here. That the object is an NSView (so
-        // `-superview` and `-bounds` apply) is carried by the SAFETY comments on
-        // the sends.
         let mut chrome_root = close;
         for _ in 0..32 {
-            // SAFETY: side-effect-free `-(NSView *)superview` read on a live
-            // main-thread NSView, +0.
+            // SAFETY: side-effect-free `superview` read on a live main-thread `NSView`.
             let parent = unsafe { appkit::send_id(chrome_root, sel!(superview)) };
             if parent.is_null() {
                 break;
@@ -7656,14 +6178,7 @@ impl App {
             );
         }
 
-        // The retained custom strip must be inside the selected titlebar root.
-        // Otherwise the snapshot would silently omit native tabs or the '+' button.
         if let Some(toolbar) = self._toolbars.get(&wid) {
-            // `native_strip_container` returns a +1 `Obj`; `strip_owner` holds it
-            // and `strip` is the raw pointer inside it. A raw `Id` carries no
-            // lifetime, so dropping the owner while `strip` is in use would
-            // compile: the owner is bound to a name that lives to the end of this
-            // block and is never rebound.
             let strip_owner = crate::toolbar::native_strip_container(toolbar);
             let strip = strip_owner.id();
             if !macos_view_is_ancestor_of(chrome_root, strip)? {
@@ -7674,19 +6189,12 @@ impl App {
             }
         }
 
-        // SAFETY: `-[NSView bounds]` is `-(NSRect)` — a 32-byte struct return, which
-        // is why `send_rect` exists and picks the indirect entry point on the arch
-        // that needs one — on a live main-thread NSView.
+        // SAFETY: `-[NSView bounds]` on a live main-thread `NSView` via `send_rect`.
         let bounds = unsafe { appkit::send_rect(chrome_root, sel!(bounds)) };
         if !macos_rect_is_finite(bounds) || bounds.size.width <= 0.0 || bounds.size.height <= 0.0 {
             return Err("window capture found invalid AppKit chrome bounds".to_string());
         }
-        // nil means window-base coordinates. Convert those exact points through
-        // NSWindow's backing transform rather than multiplying by a guessed scale.
-        // SAFETY: `-convertRect:toView:` is `-(NSRect)(NSRect, NSView *)` and
-        // `-convertRectToBacking:` is `-(NSRect)(NSRect)`; both are side-effect-free
-        // geometry conversions on live main-thread receivers, and `Id::NIL` is the
-        // documented "window base coordinates" argument.
+        // SAFETY: side-effect-free geometry conversions on live main-thread receivers.
         let window_rect = unsafe {
             appkit::send_rect_rect_id(chrome_root, sel!(convertRect:toView:), bounds, Id::NIL)
         };
@@ -7697,11 +6205,7 @@ impl App {
             return Err("window capture found invalid AppKit backing geometry".to_string());
         }
 
-        // SAFETY: both calls are the documented view-caching pair, on the main
-        // thread. The first allocates a compatible bitmap
-        // (`-(NSBitmapImageRep *)(NSRect)`, +0); the second draws only this chrome
-        // subtree into it (`-(void)(NSRect, NSBitmapImageRep *)`) and leaves every
-        // undrawn pixel transparent.
+        // SAFETY: documented AppKit view-caching pair on a live main-thread subtree.
         let bitmap = unsafe {
             appkit::send_id_rect(
                 chrome_root,
@@ -7721,15 +6225,7 @@ impl App {
                 bitmap,
             );
         }
-        // The caching rep inherits the live window/display backing profile.
-        // Convert its pixels (do not merely retag them) before mixing them with
-        // the renderer's canonical sRGB client and declaring sRGB in the PNG.
-        //
-        // SAFETY: `+[NSColorSpace sRGBColorSpace]` is `+(NSColorSpace *)`, +0 and
-        // process-lifetime; `-bitmapImageRepByConvertingToColorSpace:renderingIntent:`
-        // is `-(NSBitmapImageRep *)(NSColorSpace *, NSColorRenderingIntent)` — the
-        // intent is an NSInteger, which is why the helper is `send_id_id_isize` and
-        // not its unsigned twin.
+        // SAFETY: process-lifetime `sRGBColorSpace` and color-space conversion on a live bitmap rep.
         let srgb = unsafe { appkit::send_id(class(c"NSColorSpace").as_id(), sel!(sRGBColorSpace)) };
         if srgb.is_null() {
             return Err("window capture could not reach the sRGB color space".to_string());
@@ -7746,8 +6242,6 @@ impl App {
         if bitmap.is_null() {
             return Err("window capture could not convert AppKit chrome to sRGB".to_string());
         }
-        // The converted rep's own bytes, copied once; the encode worker turns
-        // them into straight RGBA ([`ChromeLayer::overlay`]).
         let (pixels, width, height) = chrome_pixels_of(bitmap)?;
 
         let expected_width = backing_rect.size.width.round();
@@ -7790,9 +6284,6 @@ impl App {
         }))
     }
 
-    /// The macOS photograph of `wid`: CoreGraphics' composited window,
-    /// premultiplied as its bitmap context drew it (its alpha is the outer
-    /// shape mask), and the AppKit titlebar subtree as a transparent overlay.
     #[cfg(target_os = "macos")]
     fn photograph(&self, wid: WindowId) -> Result<PlatformShot, String> {
         let (pixels, width, height) = self.window_rgba_of(wid)?;
@@ -7806,10 +6297,6 @@ impl App {
         })
     }
 
-    /// The Windows photograph of `wid`: `PrintWindow`'s window, non-client
-    /// frame included, as GDI wrote it. Windows draws that frame outside the
-    /// client rect, in place in the photograph, so no chrome overlay is taken;
-    /// nor is a shape mask.
     #[cfg(windows)]
     fn photograph(&self, wid: WindowId) -> Result<PlatformShot, String> {
         let window = self
@@ -7827,9 +6314,7 @@ impl App {
         })
     }
 
-    /// Off macOS/Windows there is no window server / `PrintWindow` to photograph, so
-    /// the `window` verb says so. Kept on every target so the
-    /// [`crate::Wake::CaptureWindow`] handler is platform-independent.
+    /// Off macOS/Windows there is no window server / `PrintWindow` to photograph, so the `window` verb says so.
     #[cfg(all(not(target_os = "macos"), not(windows)))]
     pub(crate) fn capture_window(
         &mut self,
@@ -7845,23 +6330,7 @@ impl App {
 }
 
 impl App {
-    /// Capture an auxiliary own-rendered GUI surface to the confined PNG, replying its
-    /// `(width, height)`. Serves Settings-route aliases such as `window prefs` (main
-    /// thread, per [`crate::Wake::CaptureAuxWindow`]).
-    ///
-    /// Every supported target lives in the front aterm frame, so this is the
-    /// ordinary `window` photograph with its confinement and encoding behavior —
-    /// once the front window is SHOWING the target; one it is not showing is refused
-    /// ([`App::window_target_refusal`]) instead of photographed as a plain front frame.
-    /// [`Self::run_capture`] asks before admission, and asks again when a capture
-    /// deferred for its GPU drawable resumes, so an overlay dismissed while it
-    /// waited is refused too.
-    ///
-    /// Windows takes the same arm: Settings renders INSIDE the frame there too,
-    /// and `capture_window` is fully implemented (`PrintWindow` + the presented
-    /// client stitch). It used to answer "only available on macOS" — refusing a
-    /// photograph it was already able to take, which left `window prefs` (the
-    /// route an AI uses to SEE the Settings surface) unreachable on Windows.
+    /// Capture an auxiliary own-rendered GUI surface to the confined PNG, replying its `(width, height)`.
     #[cfg(any(target_os = "macos", windows))]
     pub(crate) fn capture_aux_window(
         &mut self,
@@ -7881,10 +6350,7 @@ impl App {
         }));
     }
 
-    /// Off macOS/Windows there is no window server / `PrintWindow` to photograph, so
-    /// the aux-window capture says so, with `capture_window`'s platform split and
-    /// wording. Kept on every target so the [`crate::Wake::CaptureAuxWindow`] handler
-    /// is platform-independent.
+    /// Off macOS/Windows there is no window server / `PrintWindow` to photograph.
     #[cfg(not(any(target_os = "macos", windows)))]
     pub(crate) fn capture_aux_window(
         &mut self,
@@ -7919,11 +6385,6 @@ impl App {
             };
         };
 
-        // Prefer the retained frame lowered into the Settings card whenever it is
-        // current, binding compatibility inspection to the artifact behind pixels,
-        // hit testing and accessibility. An inactive native view has no retained
-        // application-present cache: compile that exact view/viewport instead of
-        // borrowing the focused one.
         if let Some(frame) = self
             .cached_native_ui(wid)
             .filter(|frame| frame.stamp.instance == instance && frame.stamp.view == view)
@@ -7940,12 +6401,6 @@ impl App {
     }
 
     /// Read an auxiliary own-rendered surface's controls as human-readable text lines.
-    /// Serves [`crate::Wake::ReadAuxControls`] on the main thread.
-    ///
-    /// Built from the pure models the windows render from, not OS subviews, so it is
-    /// deterministic, AppKit-free and works headless. For Settings, the compatibility
-    /// `state` / `prefs fields` / `field` records come from the exact compiled native
-    /// tree and are followed by its canonical `ui` records.
     pub(crate) fn read_aux_controls(&self, target: AuxTarget) -> Vec<String> {
         match target {
             AuxTarget::Prefs => self.read_native_settings_controls(None),
@@ -7953,38 +6408,25 @@ impl App {
                 "about",
                 crate::native_settings::SettingsRoute::About,
             ))),
-            AuxTarget::Menu => {
-                // Prefer the live open palette (query, cursor, resolved
-                // enabled/checked) so the text matches the painted card; else a
-                // fresh live-resolved snapshot, so `controls menu` works headless or
-                // closed and the Version section's update row reads truthfully.
-                match self.front().and_then(|ws| ws.palette()) {
-                    Some(p) => p.controls_lines(),
-                    None => self
-                        .frontmost_window
-                        .map_or_else(crate::palette::PaletteState::new, |wid| {
-                            self.palette_snapshot(wid)
-                        })
-                        .controls_lines(),
-                }
-            }
+            AuxTarget::Menu => match self.front().and_then(|ws| ws.palette()) {
+                Some(p) => p.controls_lines(),
+                None => self
+                    .frontmost_window
+                    .map_or_else(crate::palette::PaletteState::new, |wid| {
+                        self.palette_snapshot(wid)
+                    })
+                    .controls_lines(),
+            },
             AuxTarget::Update => self.read_native_settings_controls(Some((
                 "update",
                 crate::native_settings::SettingsRoute::SoftwareUpdate,
             ))),
-            // The open in-grid tab menu's live rows (cursor included). No closed
-            // fallback: the `chrome` verb's `tab-menu` lines already serve the
-            // composed per-tab model; this target reads the interactive surface.
             AuxTarget::TabMenu => match self.front().and_then(|ws| ws.tab_menu.as_ref()) {
                 Some(menu) => menu.controls_lines(),
                 None => vec!["tab-menu open=false".to_string()],
             },
-            // The Autopilot menu's live rows, by the tab menu's rule.
             AuxTarget::AutopilotMenu => self.autopilot_menu_controls(),
-            // A fact's menu, the same card hung from a fact (`crate::fact_menu`).
             AuxTarget::FactMenu => self.fact_menu_controls(),
-            // Every session of the instance (Owner-gated at the dispatch): the
-            // OPEN card's rows only.
             AuxTarget::Overview => match self.front().and_then(|ws| ws.overview()) {
                 Some(card) => card.controls_lines(),
                 None => vec!["overview open=false".to_string()],
@@ -7994,8 +6436,6 @@ impl App {
                     Some(o) => vec![o.status_line()],
                     None => vec!["overlay open=false".to_string()],
                 };
-                // The pending close/quit confirm (Windows, `close_confirm`), with
-                // the wire way to answer it, so an agent that raised it can settle it.
                 lines.extend(self.close_confirm_controls_line());
                 lines
             }
@@ -8077,8 +6517,6 @@ mod native_settings_compatibility_controls_tests {
         }
     }
 
-    /// Split a `controls` record the way its quoted fields require: on
-    /// whitespace outside `"…"` strings (with `\"` and `\\` escapes).
     fn split_record(line: &str) -> Vec<String> {
         let mut out = Vec::new();
         let mut token = String::new();
@@ -8104,12 +6542,6 @@ mod native_settings_compatibility_controls_tests {
         out
     }
 
-    /// `controls settings` lists Settings ▸ Themes like every other page: a
-    /// `ui` record per drawn row (role ListBoxOption, named by the theme,
-    /// its appearance and contrast as the value), the list, the filter and
-    /// the strip; Keep and Revert only while a theme is tried (the negative
-    /// control: idle, neither is listed); and in Customize the registry rows
-    /// as `field` records, beside the palette's slots.
     #[test]
     fn controls_settings_lists_showcase_rows() {
         let mut app = App::headless_for_test();
@@ -8195,13 +6627,9 @@ mod native_settings_compatibility_controls_tests {
         );
     }
 
-    /// The theme field's options are quoted strings: a quote-aware split
-    /// keeps "Solarized Dark" in one token and yields no stray `key=value`.
     #[test]
     fn controls_theme_options_are_quoted_and_split_whole() {
         let mut app = App::headless_for_test();
-        // A single theme, so Top Settings draws one Color theme control (a
-        // theme that follows the system draws Dark and Light slots instead).
         app.native_config_service = crate::native_config_service::VersionedConfigService::new(
             "theme = \"Nord\"\n".to_string(),
         )
@@ -8231,12 +6659,10 @@ mod native_settings_compatibility_controls_tests {
             tokens.iter().all(|token| !token.starts_with("Dark")),
             "no option leaks a stray token: {tokens:?}"
         );
-        // Every token after the kind is a key=value of the record itself.
         assert!(
             tokens.iter().skip(1).all(|token| token.contains('=')),
             "{tokens:?}"
         );
-        // Negative control: a plain whitespace split breaks the spaced name.
         assert!(
             theme
                 .split_whitespace()
@@ -8291,10 +6717,6 @@ mod native_settings_compatibility_controls_tests {
     }
 }
 
-/// Whether `ancestor` contains `descendant` in the live AppKit view hierarchy.
-///
-/// Bounded traversal makes a corrupt/cyclic foreign hierarchy a capture error
-/// instead of an event-loop hang.
 #[cfg(target_os = "macos")]
 fn macos_view_is_ancestor_of(
     ancestor: aterm_objc::Id,
@@ -8308,8 +6730,7 @@ fn macos_view_is_ancestor_of(
     if ancestor == descendant {
         return Ok(true);
     }
-    // SAFETY: side-effect-free `-(NSView *)superview` reads on live NSViews, main
-    // thread only. Each answer is +0 and is only compared, never kept.
+    // SAFETY: side-effect-free `superview` reads on live main-thread `NSView`s.
     let mut current = unsafe { crate::appkit::send_id(descendant, sel!(superview)) };
     for _ in 0..64 {
         if current.is_null() {
@@ -8324,9 +6745,6 @@ fn macos_view_is_ancestor_of(
     Err("window capture found an invalid cyclic AppKit view hierarchy".to_string())
 }
 
-/// `NSRect` is `CGRect` on 64-bit macOS: the runtime encodes both as
-/// `{CGRect={CGPoint=dd}{CGSize=dd}}`, the type every rect-returning helper in
-/// [`aterm_objc::send`] returns.
 #[cfg(target_os = "macos")]
 fn macos_rect_is_finite(rect: aterm_objc::CGRect) -> bool {
     rect.origin.x.is_finite()
@@ -8335,10 +6753,6 @@ fn macos_rect_is_finite(rect: aterm_objc::CGRect) -> bool {
         && rect.size.height.is_finite()
 }
 
-/// The pixels of AppKit's sRGB chrome bitmap `rep`, and its size, taken on the
-/// main thread with one copy: its `CGImage`'s own bytes when their layout is
-/// one [`normalize_bitmap`] reads, else AppKit's PNG of the rep. The encode
-/// worker turns either into straight RGBA8 ([`ChromeLayer::overlay`]).
 #[cfg(target_os = "macos")]
 fn chrome_pixels_of(rep: aterm_objc::Id) -> Result<(ChromePixels, u32, u32), String> {
     use aterm_cg::*;
@@ -8347,17 +6761,14 @@ fn chrome_pixels_of(rep: aterm_objc::Id) -> Result<(ChromePixels, u32, u32), Str
 
     use crate::appkit;
 
-    // SAFETY: `-[NSBitmapImageRep CGImage]` is `-(CGImageRef)` on the live
-    // converted rep; the image is +0 and the rep owns it, and the caller's
-    // autorelease pool keeps the rep alive through every read below.
+    // SAFETY: `-[NSBitmapImageRep CGImage]` on the live converted rep kept alive by the autorelease pool.
     let image: CGImageRef = unsafe { appkit::send_id(rep, sel!(CGImage)) }
         .as_ptr()
         .cast();
     if image.is_null() {
         return Err("window capture could not read the AppKit chrome bitmap".to_string());
     }
-    // SAFETY: side-effect-free accessors on the live CGImage. Its colour
-    // space is +0, owned by the image.
+    // SAFETY: side-effect-free accessors on the live `CGImage`.
     let desc = unsafe {
         let space = CGImageGetColorSpace(image);
         BitmapDesc {
@@ -8379,8 +6790,7 @@ fn chrome_pixels_of(rep: aterm_objc::Id) -> Result<(ChromePixels, u32, u32), Str
         if provider.is_null() {
             return Err("window capture could not reach the AppKit chrome bytes".to_string());
         }
-        // SAFETY: `CGDataProviderCopyData` returns a new CFData (+1) holding
-        // the provider's bytes, or NULL; the guard releases it exactly once.
+        // SAFETY: `CGDataProviderCopyData` returns a `+1` `CFData` (or NULL) released once by the guard.
         let data = unsafe { CGDataProviderCopyData(provider) };
         if data.is_null() {
             return Err("window capture could not copy the AppKit chrome bytes".to_string());
@@ -8393,8 +6803,7 @@ fn chrome_pixels_of(rep: aterm_objc::Id) -> Result<(ChromePixels, u32, u32), Str
             }
         }
         let _data_guard = DataGuard(data);
-        // SAFETY: length and byte pointer of the live CFData, which owns
-        // `len` bytes at `ptr` until the guard releases it after this copy.
+        // SAFETY: length and byte pointer of the live `CFData` held until the guard drops.
         let bytes = unsafe {
             let len = usize::try_from(CFDataGetLength(data)).unwrap_or(0);
             let ptr = CFDataGetBytePtr(data);
@@ -8406,13 +6815,9 @@ fn chrome_pixels_of(rep: aterm_objc::Id) -> Result<(ChromePixels, u32, u32), Str
         };
         return Ok((ChromePixels::Bitmap { bytes, desc }, width, height));
     }
-    // PNG standardizes a layout `normalize_bitmap` does not read into
-    // straight RGBA, which the encode worker decodes.
     Ok((ChromePixels::Png(chrome_png_of(rep)?), width, height))
 }
 
-/// AppKit's PNG of the chrome bitmap `rep`: straight RGBA whatever the rep's
-/// layout, 8 or 16 bits a sample ([`decode_native_chrome_png`] reads either).
 #[cfg(target_os = "macos")]
 fn chrome_png_of(rep: aterm_objc::Id) -> Result<Vec<u8>, String> {
     use aterm_objc::{Obj, class, sel};
@@ -8420,18 +6825,13 @@ fn chrome_png_of(rep: aterm_objc::Id) -> Result<Vec<u8>, String> {
     use crate::appkit;
     use crate::appkit::consts::NS_BITMAP_IMAGE_FILE_TYPE_PNG;
 
-    // An EMPTY properties dictionary, exactly as the `objc2` form built. `+new`
-    // rather than `+dictionary` so the +1 is owned by this frame outright and its
-    // lifetime does not depend on which pool is innermost.
     // SAFETY: `+[NSDictionary new]` is `+(instancetype)` and +1.
     let Some(properties) =
         (unsafe { Obj::from_owned(appkit::send_id(class(c"NSDictionary").as_id(), sel!(new))) })
     else {
         return Err("window capture could not allocate AppKit chrome properties".to_string());
     };
-    // SAFETY: `-representationUsingType:properties:` is
-    // `-(NSData *)(NSBitmapImageFileType, NSDictionary *)` — the file type is an
-    // NSUInteger — on the live converted rep, with a live dictionary. +0.
+    // SAFETY: `-representationUsingType:properties:` on the live converted rep and dictionary.
     let png = unsafe {
         appkit::send_id_usize_id(
             rep,
@@ -8447,12 +6847,7 @@ fn chrome_png_of(rep: aterm_objc::Id) -> Result<Vec<u8>, String> {
     let png_len = unsafe { appkit::send_usize(png, sel!(length)) };
     let mut png_bytes = vec![0_u8; png_len];
     if png_len != 0 {
-        // SAFETY: `-getBytes:length:` is `-(void)(void *, NSUInteger)` and WRITES
-        // through the pointer, which is why the helper's argument is `*mut` and
-        // its encoding `^v` rather than the const `r^v`. The Vec owns exactly
-        // `png_len` initialized bytes, so the destination is valid and correctly
-        // sized for NSData's bounded copy — and `png_len` came from the receiver
-        // itself, so it cannot exceed the receiver's own length.
+        // SAFETY: `-getBytes:length:` writes at most `png_len` bytes into the pre-sized `Vec`.
         unsafe {
             appkit::send_v_ptr_usize(
                 png,
@@ -8465,8 +6860,6 @@ fn chrome_png_of(rep: aterm_objc::Id) -> Result<Vec<u8>, String> {
     Ok(png_bytes)
 }
 
-/// Decode AppKit's in-memory PNG of a chrome bitmap into tightly packed
-/// straight RGBA8.
 #[cfg(target_os = "macos")]
 fn decode_native_chrome_png(bytes: &[u8]) -> Result<(Vec<u8>, u32, u32), String> {
     const MAX_CHROME_BYTES: usize = 256 * 1024 * 1024;
@@ -8513,32 +6906,12 @@ fn decode_native_chrome_png(bytes: &[u8]) -> Result<(Vec<u8>, u32, u32), String>
     Ok((decoded, width, height))
 }
 
-/// Photograph the on-screen window with CoreGraphics window id `window_id` and
-/// return its `(tightly-packed premultiplied RGBA8 bytes, width, height)`.
-/// Runs on the MAIN thread (called from the `capture_window`/`capture_aux_window`
-/// verbs' AppKit half); unassociating the alpha, the stitch, the PNG encode and
-/// the write run on the encode worker ([`WindowStitch::finish`]).
-///
-/// Robust-format strategy (per the implementation note): rather than read the
-/// source `CGImage`'s native, possibly-padded pixel layout, we draw it into a
-/// freshly-created RGBA8 `CGBitmapContext` we own, then read THAT context's
-/// tightly-packed buffer (`width * 4` stride, premultiplied-alpha-last). So the
-/// bytes are always premultiplied RGBA8 no matter what the window server hands
-/// us.
-///
-/// `Err` (never a panic or leak) when CoreGraphics cannot capture. That is not a
-/// permission failure: CoreGraphics photographs aterm's own window without a
-/// Screen Recording grant, so a NULL image means the window is not on screen and
-/// the error says so (a grant aterm never uses re-prompts on a cooldown since
-/// macOS 15).
+/// Capture the on-screen window `window_id` via CoreGraphics into an sRGB RGBA8 buffer.
 #[cfg(target_os = "macos")]
 pub(crate) fn capture_window_pixels(window_id: u32) -> Result<(Vec<u8>, u32, u32), String> {
     use crate::cg_capture::*;
 
-    // SAFETY: `CGWindowListCreateImage` is the documented capture entry point; we
-    // pass `CGRectNull` (use the window's own bounds), the single-window option keyed
-    // by `window_id`, and the ignore-framing | best-resolution image options. It
-    // returns either a new CGImage we own (and release below) or NULL on failure.
+    // SAFETY: `CGWindowListCreateImage` returns an owned `CGImage` (released below) or NULL.
     let image: CGImageRef = unsafe {
         CGWindowListCreateImage(
             CG_RECT_NULL,
@@ -8548,7 +6921,6 @@ pub(crate) fn capture_window_pixels(window_id: u32) -> Result<(Vec<u8>, u32, u32
         )
     };
     if image.is_null() {
-        // Not a permission failure (see the doc comment), and the message must not
         // say it is: NULL means the window is not on screen.
         return Err(
             "window capture failed (the window is not on screen: minimized, on another \
@@ -8558,9 +6930,7 @@ pub(crate) fn capture_window_pixels(window_id: u32) -> Result<(Vec<u8>, u32, u32
         );
     }
 
-    // From here on, `image` must be released on every path — use a tiny guard so an
-    // early `?`/return cannot leak it. SAFETY: `image` is the live CGImage we just
-    // created; `CGImageGetWidth/Height` are side-effect-free accessors on it.
+    // SAFETY: `image` is the live `CGImage` created above; width/height accessors are side-effect-free.
     struct ImageGuard(CGImageRef);
     impl Drop for ImageGuard {
         fn drop(&mut self) {
@@ -8580,17 +6950,10 @@ pub(crate) fn capture_window_pixels(window_id: u32) -> Result<(Vec<u8>, u32, u32
         .checked_mul(BYTES_PER_PIXEL)
         .ok_or_else(|| "window capture failed (image too large)".to_string())?;
 
-    // Normalize the platform image into the same explicit sRGB space as the
-    // renderer-owned client and AppKit chrome overlay. DeviceRGB is
-    // display-dependent and cannot truthfully be tagged sRGB in the output PNG.
     let Some(srgb_name) = crate::appkit::nsstring("kCGColorSpaceSRGB") else {
         return Err("window capture failed (could not name the sRGB color space)".to_string());
     };
-    // SAFETY: NSString is toll-free bridged to CFStringRef, so the +1 `Obj` above is
-    // a valid `CFStringRef` for this call and stays alive across it (it is dropped at
-    // the end of this function, long after `CreateWithName` has copied what it needs).
-    // `CreateWithName` returns a new colour-space object that the guard below releases
-    // exactly once.
+    // SAFETY: `NSString` is toll-free bridged to `CFStringRef` and outlives `CGColorSpaceCreateWithName`.
     let color_space: CGColorSpaceRef =
         unsafe { CGColorSpaceCreateWithName(srgb_name.id().as_ptr().cast_const()) };
     if color_space.is_null() {
@@ -8622,16 +6985,13 @@ pub(crate) fn capture_window_pixels(window_id: u32) -> Result<(Vec<u8>, u32, u32
     struct CtxGuard(CGContextRef);
     impl Drop for CtxGuard {
         fn drop(&mut self) {
-            // SAFETY: the context created above, released exactly once. Its backing
-            // buffer is freed here — after we have already copied the bytes out.
+            // SAFETY: `self.0` is the `CGContext` created above, released once after copying its bytes.
             unsafe { CGContextRelease(self.0) };
         }
     }
     let _ctx_guard = CtxGuard(context);
 
-    // Draw the captured image to fill the whole context, normalizing it to our
-    // known RGBA8 layout. SAFETY: `context` and `image` are both live objects we
-    // created; the rect spans the full context.
+    // SAFETY: `context` and `image` are live objects and `full` spans the context bounds.
     let full = CGRect {
         origin: CGPoint { x: 0.0, y: 0.0 },
         size: CGSize {
@@ -8641,10 +7001,7 @@ pub(crate) fn capture_window_pixels(window_id: u32) -> Result<(Vec<u8>, u32, u32
     };
     unsafe { CGContextDrawImage(context, full, image) };
 
-    // Read the tightly-packed RGBA8 bytes back out. SAFETY: `CGBitmapContextGetData`
-    // returns a pointer to the context's backing buffer (valid until the context is
-    // released, which the guard does only after this copy). We copy exactly
-    // `bytes_per_row * height` bytes — the buffer's full size for our chosen stride.
+    // SAFETY: `CGBitmapContextGetData` returns a pointer valid until `_ctx_guard` drops.
     let data_ptr = unsafe { CGBitmapContextGetData(context) } as *const u8;
     if data_ptr.is_null() {
         return Err("window capture failed (bitmap context has no data)".to_string());
@@ -8652,23 +7009,13 @@ pub(crate) fn capture_window_pixels(window_id: u32) -> Result<(Vec<u8>, u32, u32
     let total = bytes_per_row
         .checked_mul(height)
         .ok_or_else(|| "window capture failed (image too large)".to_string())?;
-    // SAFETY: `data_ptr` is the context's backing buffer of exactly `total` bytes
-    // (width*4 stride, no extra padding — CG honours the stride we requested).
+    // SAFETY: `data_ptr` points to `total` initialized RGBA8 bytes in the bitmap context.
     let rgba = unsafe { std::slice::from_raw_parts(data_ptr, total) }.to_vec();
     Ok((rgba, width as u32, height as u32))
 }
 
-/// Convert tightly-packed premultiplied RGBA8 to straight RGBA8 in place.
-///
-/// Endpoint behavior is deliberate: fully transparent pixels carry no
-/// meaningful colour and are normalized to black; opaque pixels are already
-/// straight and remain byte-identical. Intermediate channels use round-half and
-/// clamp after division, matching the integer definition of unassociation.
 #[cfg(any(target_os = "macos", test))]
 fn unpremultiply_rgba8(rgba: &mut [u8]) {
-    // Tightly-packed RGBA8: callers pass a whole number of pixels, so the chunk
-    // remainder is empty. A trailing partial pixel would carry no alpha byte to
-    // unassociate by, so leaving it byte-identical is the only defined answer.
     for pixel in rgba.as_chunks_mut::<4>().0 {
         let alpha = u32::from(pixel[3]);
         match alpha {
@@ -8683,12 +7030,6 @@ fn unpremultiply_rgba8(rgba: &mut [u8]) {
     }
 }
 
-/// Exact placement of the platform client layer inside a full-window capture.
-///
-/// On macOS a `FullSizeContentView` consumes the whole window, including the
-/// transparent titlebar band. There is therefore deliberately no "protected"
-/// row range here: every client pixel comes from the exact successful present.
-/// Native chrome is a separate transparent [`RgbaOverlay`] composited afterward.
 #[cfg(any(target_os = "macos", windows, test))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct WindowClientRect {
@@ -8698,7 +7039,6 @@ struct WindowClientRect {
     height: u32,
 }
 
-/// One straight-alpha native view snapshot placed in full-window pixel space.
 #[cfg(any(target_os = "macos", test))]
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct RgbaOverlay {
@@ -8709,45 +7049,32 @@ struct RgbaOverlay {
     rgba: Vec<u8>,
 }
 
-/// One platform photograph of a window ([`App::photograph`]) as the platform
-/// made it, before the encode worker stitches the presented client into it
-/// ([`WindowStitch::finish`]).
 #[cfg(any(target_os = "macos", windows))]
 struct PlatformShot {
-    /// Four bytes a pixel, tightly packed, in `encoding`.
     pixels: Vec<u8>,
     width: u32,
     height: u32,
     encoding: ShotEncoding,
-    /// Platform chrome drawn over the client rect, composited back over the
-    /// stitched client: the macOS titlebar subtree.
     #[cfg(target_os = "macos")]
     chrome: Option<ChromeLayer>,
 }
 
-/// How a platform photograph's four bytes a pixel hold it.
 #[cfg(any(target_os = "macos", windows))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ShotEncoding {
-    /// Premultiplied RGBA, as a CoreGraphics bitmap context draws it.
     #[cfg(target_os = "macos")]
     PremultipliedRgba,
-    /// BGR and a fourth byte GDI leaves undefined (`GetDIBits`): opaque.
     #[cfg(windows)]
     Bgrx,
 }
 
 #[cfg(any(target_os = "macos", windows))]
 impl ShotEncoding {
-    /// The encoding this platform's photograph comes in ([`App::photograph`]).
     #[cfg(target_os = "macos")]
     const NATIVE: Self = Self::PremultipliedRgba;
     #[cfg(windows)]
     const NATIVE: Self = Self::Bgrx;
 
-    /// Turn a photograph in this encoding into straight RGBA8, in place: a
-    /// stitch never mixes two alpha encodings (which darkens translucent
-    /// titlebar and rounded-edge pixels).
     fn to_straight_rgba8(self, pixels: &mut [u8]) {
         match self {
             #[cfg(target_os = "macos")]
@@ -8757,8 +7084,6 @@ impl ShotEncoding {
         }
     }
 
-    /// Whether the photograph's alpha draws the compositor's outer shape
-    /// (macOS rounded corners: [`multiply_platform_outer_shape_alpha`]).
     fn carries_outer_shape(self) -> bool {
         match self {
             #[cfg(target_os = "macos")]
@@ -8769,10 +7094,7 @@ impl ShotEncoding {
     }
 }
 
-/// A `window` capture as its main-thread turn left it: the platform
-/// photograph, the presented client destination, and where that client sits
-/// in the photograph, checked in that turn ([`App::window_stitch`]). The
-/// encode worker composes them ([`Self::finish`]).
+/// A `window` capture as its main-thread turn left it.
 #[cfg(any(target_os = "macos", windows))]
 pub(crate) struct WindowStitch {
     shot: PlatformShot,
@@ -8782,16 +7104,11 @@ pub(crate) struct WindowStitch {
 
 #[cfg(any(target_os = "macos", windows))]
 impl WindowStitch {
-    /// The full-window capture, on the encode worker: the photograph in
-    /// straight RGBA, the presented client replacing its client rows, the
-    /// platform chrome back over them, and the photograph's outer shape alpha
-    /// multiplied back last ([`multiply_platform_outer_shape_alpha`]).
     fn finish(self) -> Result<CapturePixels, String> {
         note_pixel_work();
         let Self { shot, client, rect } = self;
         let (width, height, encoding) = (shot.width, shot.height, shot.encoding);
         let mut pixels = shot.pixels;
-        // Unassociating leaves alpha as it was, so the mask is the photograph's.
         let outer_alpha: Option<Vec<u8>> = encoding.carries_outer_shape().then(|| {
             pixels
                 .as_chunks::<4>()
@@ -8813,8 +7130,6 @@ impl WindowStitch {
         CapturePixels::rgba8(width, height, pixels)
     }
 
-    /// What this capture holds at most on the encode worker, for
-    /// [`CapturePermit::recharge`] ([`StitchCharge::peak_bytes`]).
     fn peak_bytes(&self) -> usize {
         #[cfg(target_os = "macos")]
         let chrome = self.shot.chrome.as_ref().map_or(0, ChromeLayer::peak_bytes);
@@ -8833,34 +7148,19 @@ impl WindowStitch {
     }
 }
 
-/// The sizes a `window` capture's charge is made of: those of a
-/// [`WindowStitch`], or the estimate of one before the photograph is taken
-/// ([`App::window_capture_estimate`]).
 #[cfg(any(target_os = "macos", windows))]
 struct StitchCharge {
-    /// The photograph's size in pixels.
     width: usize,
     height: usize,
-    /// The photograph's bytes, which become the encoded pixels.
     photograph: usize,
-    /// The presented client's allocation ([`CapturePixels::allocation`]).
     client: usize,
-    /// The client's width in pixels: one stitched row.
     client_width: usize,
-    /// The chrome as handed over and as straight RGBA ([`chrome_peak_bytes`]).
     chrome: usize,
-    /// The photograph carries an outer shape mask
-    /// ([`ShotEncoding::carries_outer_shape`]).
     outer_shape: bool,
 }
 
 #[cfg(any(target_os = "macos", windows))]
 impl StitchCharge {
-    /// The photograph, and the larger of what the stitch holds beside it (the
-    /// client, the chrome, one stitched row, and for an outer shape its mask,
-    /// its mirrored copy and the flood's visited flags, a byte a pixel each;
-    /// the flood's queue is not counted) and what the encode does
-    /// ([`capture_encode_overhead`]).
     fn peak_bytes(&self) -> usize {
         let shape = if self.outer_shape {
             self.width.saturating_mul(self.height).saturating_mul(3)
@@ -8877,8 +7177,6 @@ impl StitchCharge {
     }
 }
 
-/// The macOS titlebar subtree's snapshot, placed in full-window pixels, in the
-/// form AppKit handed it over ([`ChromePixels`]).
 #[cfg(target_os = "macos")]
 struct ChromeLayer {
     x: u32,
@@ -8888,8 +7186,6 @@ struct ChromeLayer {
     pixels: ChromePixels,
 }
 
-/// The chrome snapshot's pixels: its sRGB bitmap's own bytes when their
-/// layout is one [`normalize_bitmap`] reads, else AppKit's PNG of it.
 #[cfg(target_os = "macos")]
 enum ChromePixels {
     Bitmap { bytes: Vec<u8>, desc: BitmapDesc },
@@ -8898,7 +7194,6 @@ enum ChromePixels {
 
 #[cfg(target_os = "macos")]
 impl ChromeLayer {
-    /// The snapshot as a straight RGBA8 overlay, on the encode worker.
     fn overlay(self) -> Result<RgbaOverlay, String> {
         note_pixel_work();
         let rgba = match self.pixels {
@@ -8925,7 +7220,6 @@ impl ChromeLayer {
         })
     }
 
-    /// The bytes it holds ([`chrome_peak_bytes`]).
     fn peak_bytes(&self) -> usize {
         let handed = match &self.pixels {
             ChromePixels::Bitmap { bytes, .. } | ChromePixels::Png(bytes) => bytes.capacity(),
@@ -8934,14 +7228,11 @@ impl ChromeLayer {
     }
 }
 
-/// What a `width`×`height` chrome snapshot holds: the `handed` bytes AppKit
-/// gave over, and the straight RGBA8 overlay made from them.
 #[cfg(target_os = "macos")]
 fn chrome_peak_bytes(width: usize, height: usize, handed: usize) -> usize {
     handed.saturating_add(width.saturating_mul(height).saturating_mul(4))
 }
 
-/// A CoreGraphics bitmap's layout, as the `CGImageGet*` accessors report it.
 #[cfg(any(target_os = "macos", test))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct BitmapDesc {
@@ -8950,28 +7241,19 @@ struct BitmapDesc {
     bytes_per_row: usize,
     bits_per_component: usize,
     bits_per_pixel: usize,
-    /// `CGBitmapInfo`: the alpha info, float and byte-order bits.
     bitmap_info: u32,
-    /// The colour space's model is RGB.
     rgb: bool,
 }
 
-/// Where an 8-bit pixel's channels sit in its four bytes, and whether its
-/// colour is premultiplied by its alpha.
 #[cfg(any(target_os = "macos", test))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct DirectLayout {
-    /// The byte offsets of R, G, B and A within a pixel.
     offsets: [usize; 4],
     premultiplied: bool,
 }
 
 #[cfg(any(target_os = "macos", test))]
 impl BitmapDesc {
-    /// The layout its bytes are read in directly: 8-bit RGB components with
-    /// alpha, first or last, premultiplied or straight, in 32-bit pixels of
-    /// either byte order, packed, rows at least `4 · width` bytes. `Err` for any
-    /// other bitmap, which is not guessed at (`CGImage.h` defines the bits).
     fn direct_layout(&self) -> Result<DirectLayout, String> {
         const ALPHA_INFO: u32 = 0x1F;
         const PREMULTIPLIED_LAST: u32 = 1;
@@ -9003,8 +7285,6 @@ impl BitmapDesc {
             FIRST => (true, false),
             _ => return Err(refuse()),
         };
-        // Memory order is the component order for big-endian (and default)
-        // 32-bit pixels, and its reverse for little-endian ones.
         let big_endian = match self.bitmap_info & BYTE_ORDER {
             ORDER_DEFAULT | ORDER_32_BIG => true,
             ORDER_32_LITTLE => false,
@@ -9023,10 +7303,6 @@ impl BitmapDesc {
     }
 }
 
-/// A bitmap in a direct layout ([`BitmapDesc::direct_layout`]) as tightly
-/// packed straight RGBA8, premultiplied colour unassociated as
-/// [`unpremultiply_rgba8`] does. `Err` for any other layout, or bytes short of
-/// the last row.
 #[cfg(any(target_os = "macos", test))]
 fn normalize_bitmap(bytes: &[u8], desc: BitmapDesc) -> Result<Vec<u8>, String> {
     let layout = desc.direct_layout()?;
@@ -9056,8 +7332,6 @@ fn normalize_bitmap(bytes: &[u8], desc: BitmapDesc) -> Result<Vec<u8>, String> {
     Ok(rgba)
 }
 
-/// A GDI photograph's BGR, and the fourth byte `GetDIBits` leaves undefined,
-/// as opaque RGBA8, in place.
 #[cfg(any(windows, test))]
 fn bgrx_to_opaque_rgba8(pixels: &mut [u8]) {
     for pixel in pixels.as_chunks_mut::<4>().0 {
@@ -9066,15 +7340,6 @@ fn bgrx_to_opaque_rgba8(pixels: &mut [u8]) {
     }
 }
 
-/// Splice the exact successful-present destination into the platform frame.
-///
-/// No centering, background reconstruction or alpha borrowing: the client already
-/// has raw destination dimensions and includes live remainder bands, crops, host
-/// effects and GPU present-only passes. Copying all four straight-RGBA channels
-/// keeps a current generation from inheriting stale platform alpha. A full-size
-/// macOS client replaces the titlebar-underlay rows too; titlebar controls come
-/// back later from a transparent AppKit view snapshot, and the platform's outer
-/// shape alpha is multiplied back last ([`multiply_platform_outer_shape_alpha`]).
 #[cfg(any(target_os = "macos", windows, test))]
 fn stitch_presented_client_into_window_rgba(
     window_rgba: &mut [u8],
@@ -9132,17 +7397,6 @@ fn stitch_presented_client_into_window_rgba(
     Ok(())
 }
 
-/// Multiply the current full-window result by the platform photograph's outer
-/// shape mask without borrowing stale platform colour or ordinary client alpha.
-///
-/// WindowServer clips the rectangular full-size content view to an antialiased
-/// rounded outline, so replacing every client pixel naively turns the four
-/// transparent corners opaque. Boundary-connected non-opaque platform alpha is the
-/// compositor shape mask: flood it inward through non-opaque neighbours and
-/// multiply only those alpha values, leaving RGB untouched; an isolated non-opaque
-/// pixel in an ordinary row is stale content and is ignored. Columns and rows the
-/// platform did not photograph (past the display's edge) are not shape
-/// ([`photographed_shape_alpha`]).
 #[cfg(any(target_os = "macos", windows, test))]
 fn multiply_platform_outer_shape_alpha(
     current_rgba: &mut [u8],
@@ -9227,11 +7481,6 @@ fn multiply_platform_outer_shape_alpha(
     Ok(())
 }
 
-/// The platform shape mask with every column and row the platform did not
-/// photograph (no ink at all: past the display's edge) replaced by its mirror
-/// across the window's centre, or opaque where that is unphotographed too
-/// ([`multiply_platform_outer_shape_alpha`]). Borrowed as-is when every column and
-/// row has ink, so the common case costs one scan.
 #[cfg(any(target_os = "macos", windows, test))]
 fn photographed_shape_alpha(
     alpha: &[u8],
@@ -9273,12 +7522,6 @@ fn photographed_shape_alpha(
     std::borrow::Cow::Owned(shape)
 }
 
-/// Composite a straight-RGBA overlay over `destination`, clipped to `clip`.
-///
-/// Both RGB triplets are unassociated (straight) alpha. The integer source-over
-/// calculation therefore weights destination RGB by its own alpha before
-/// unassociating the result; treating destination RGB as opaque would produce
-/// dark fringes around antialiased traffic lights and toolbar glyphs.
 #[cfg(any(target_os = "macos", test))]
 fn composite_straight_rgba_overlay(
     destination: &mut [u8],
@@ -9401,42 +7644,23 @@ fn composite_straight_rgba_overlay(
     Ok(())
 }
 
-/// Encode a tightly-packed straight RGBA8 buffer (`width * height * 4` bytes,
-/// no row padding) as the capture encoder does ([`CapturePng::encode`]): a
-/// borrowed buffer, for the video export's frames and the tests' fixtures.
+/// Encode a tightly packed RGBA8 buffer (`width * height * 4` bytes) as a PNG byte vector.
 pub(crate) fn encode_rgba8_png(rgba: &[u8], width: u32, height: u32) -> Result<Vec<u8>, String> {
     encode_srgb_rgba8(width, height, |writer| writer.write_image_data(rgba))
 }
 
-/// One session's window membership as the main thread sees it: the row the
-/// `sessions` roster stitches onto its store projection (`window=` / `active=` /
-/// `wfocus=`). Read for the whole roster in one [`crate::Wake::ReadSessionWindows`]
-/// hop, so a fleet listing costs one event-loop turn, not one per session.
+/// One session's window membership as the main thread sees it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct SessionWindowRow {
-    /// The process-local session id (`sessions`' first column).
     pub(crate) local: u64,
-    /// The hosting window's stable logical id.
     pub(crate) window: u64,
-    /// Whether the session is on that window's active tab (the tab a `send`
-    /// would be seen in; a zoomed split counts only its focused pane, the same
-    /// rule the repaint gate uses).
     pub(crate) active_tab: bool,
-    /// Whether that window is the front window.
     pub(crate) window_focused: bool,
 }
 
 impl App {
     /// Every session some window hosts, with the window it is reported under.
-    /// A session no window shows (detached, or a view the strip no longer
-    /// holds) has no row — the roster prints it `window=none`. A session
-    /// hosted by several windows (co-viewing) is reported under the same window
-    /// [`Self::dims_snapshot`] projects it through — the front window when it
-    /// contains the session, else the lowest stable id — so `sessions` and
-    /// `dims` can never name two different windows for one session. Pure read.
     pub(crate) fn session_window_rows(&self) -> Vec<SessionWindowRow> {
-        // `windows` is a BTreeMap: the first window seen for a session is the
-        // lowest id, so the front-window preference is the only override.
         let mut rows: Vec<SessionWindowRow> = Vec::new();
         for (wid, ws) in &self.windows {
             let focused = self.frontmost_window == Some(*wid);
@@ -9466,8 +7690,6 @@ impl App {
                         window_focused: focused,
                     };
                     match rows.iter_mut().find(|r| r.local == session) {
-                        // Already reported under a lower id: only the front
-                        // window may take the row over.
                         Some(existing) => {
                             if focused {
                                 *existing = row;
@@ -9488,10 +7710,6 @@ mod session_window_rows_tests {
     use super::SessionWindowRow;
     use crate::{App, WindowId};
 
-    /// The rows follow the tab tree: the lone session of a fresh headless app is
-    /// on window 0's active tab and that window is front; a pushed tab takes the
-    /// active slot from it; a second window becomes front and demotes the first;
-    /// a session no window hosts has no row at all.
     #[test]
     fn rows_follow_the_tab_tree_and_the_front_window() {
         let mut app = App::headless_for_test();
@@ -9505,7 +7723,6 @@ mod session_window_rows_tests {
             }]
         );
 
-        // A second tab in window 0: it is now the active tab; session 0 is not.
         let sid1 = app.next_session_id;
         app.push_stub_tab(WindowId(0), crate::stub_session(sid1));
         let rows = app.session_window_rows();
@@ -9520,7 +7737,6 @@ mod session_window_rows_tests {
         );
         assert!(rows.iter().all(|r| r.window_focused));
 
-        // A second window: it is front, so window 0's rows lose `wfocus`.
         let sid2 = app.next_session_id;
         let wid2 = app.insert_logical_window(crate::stub_session(sid2), 24, 80);
         let rows = app.session_window_rows();
@@ -9539,7 +7755,6 @@ mod session_window_rows_tests {
                 window_focused: true,
             }
         );
-        // Sorted by local id, and every row names a real window.
         assert!(rows.windows(2).all(|w| w[0].local < w[1].local));
         assert!(
             rows.iter()
@@ -9570,8 +7785,6 @@ mod dims_snapshot_tests {
         );
     }
 
-    /// A detached session (no window holds it) reports the scale of the window the
-    /// shared backend is tuned to, the one its cells/pad/font came from.
     #[test]
     fn detached_dims_reports_the_scale_its_own_geometry_came_from() {
         let mut app = App::headless_for_test();
@@ -9582,8 +7795,6 @@ mod dims_snapshot_tests {
             ws.scale = 2.0;
             ws.metrics = metrics;
         }
-        // Tune the shared backend to that window, exactly as `apply_window_scale`
-        // does before the window composes.
         app.font_px = metrics.font_px;
         app.backend.activate_px(metrics.font_px);
         app.backend.set_pad(metrics.pad);
@@ -9611,9 +7822,6 @@ mod dims_snapshot_tests {
         );
     }
 
-    /// Every `pane` row of `panes` against the grid its session's engine holds
-    /// (what `dims` reads): asserts they agree, that exactly one pane is
-    /// focused, and returns `(session, rows, cols)` per row.
     fn panes_rows_matching_the_engines(app: &App, panes: usize) -> Vec<(u64, u16, u16)> {
         let lines = app.read_pane_layout(None);
         assert_eq!(lines.len(), panes + 1, "a header and the panes: {lines:?}");
@@ -9652,14 +7860,6 @@ mod dims_snapshot_tests {
         rows_out
     }
 
-    /// Where the two layouts part: `resize_panes` sizes every engine from the tab's
-    /// visible plan, while the pane tree's `compute_layout` places panes by a
-    /// different rule once a layout is squeezed (the plan honours a nested split's
-    /// minimum, the tree clamps each leaf to one cell: `pane.rs`'s module docs).
-    /// Two stacked splits in a six-row window: after the title rows the plan gives
-    /// the top pane one content row so the nested pair keeps a row each, while the
-    /// tree gives it two. The negative control pins that the tree really disagrees
-    /// here, so the agreement is not vacuous.
     #[test]
     fn panes_agrees_with_the_engines_where_the_tree_layout_does_not() {
         let mut app = App::headless_for_test();
@@ -9688,12 +7888,6 @@ mod dims_snapshot_tests {
         );
     }
 
-    /// A co-viewed session (Cmd-Shift-O, `views > 1`) has one grid sized to the
-    /// minimum across the windows showing it, so in the larger viewer its engine
-    /// is smaller than the leaf it sits in — and `panes` there must report the
-    /// engine's grid, as `dims` does, not the leaf's. The negative control pins
-    /// that the larger viewer's own leaf really is bigger, so reporting the
-    /// leaf would fail here.
     #[test]
     fn panes_reports_a_co_viewed_sessions_shared_grid_in_every_viewer() {
         let mut app = App::headless_for_test(); // window 0: 24x80, session 0
@@ -9770,9 +7964,6 @@ mod dims_snapshot_tests {
             .present_retry
             .on_external_stimulus();
 
-        // The same live window snapshot exposes CURRENT recovery state rather
-        // than forcing an operator to infer it from a stale process-global last
-        // drop.
         app.windows.get_mut(&wid).unwrap().present_retry.on_drop(
             crate::metrics::PresentDropReason::GpuTimeout,
             Instant::now(),
@@ -9788,8 +7979,6 @@ mod dims_snapshot_tests {
             .present_retry
             .on_external_stimulus();
 
-        // Model the exact class seen during an interactive resize: the raw
-        // surface has a non-cell remainder around the centered renderer frame.
         let surface = PhysicalSize::new(initial.frame_w + 11, initial.frame_h + 28);
         app.windows.get_mut(&wid).unwrap().win_px = Some(surface);
         let banded = app.dims_snapshot(0, 24, 80);
@@ -9803,9 +7992,6 @@ mod dims_snapshot_tests {
             banded.surface_h - banded.frame_h,
         );
 
-        // Live font zoom rebuilds the backend and refreshes every window's
-        // MetricsView. `dims` must immediately reflect the new cells/frame while
-        // retaining the independently observed raw surface size.
         let old_font_size = app.font_size;
         app.windows.get_mut(&wid).unwrap().present_retry.on_drop(
             crate::metrics::PresentDropReason::GpuOccluded,
@@ -9840,17 +8026,10 @@ mod dims_snapshot_tests {
 
 #[cfg(test)]
 mod split_capture_tests {
-    //! A split capture shows what the glass shows: the glass decorates every
-    //! visible pane, so the capture does.
 
     use crate::{App, WindowId, term_lock};
     use std::time::{Duration, Instant};
 
-    /// The clear-space precondition, as the composed present's pet fixtures state it
-    /// (`app_render::split_sparkle_tests::configure_pane_backgrounds`): `PetWorld`
-    /// reads a cell as clear only when its background is the renderer's, so a pane
-    /// left on the terminal's default background has no clear space and no resident
-    /// can be drawn on it.
     fn configure_pane_backgrounds(app: &App, sid: u64) {
         let bg = aterm_render::Theme::default().bg;
         for session in [0, sid] {
@@ -9863,8 +8042,6 @@ mod split_capture_tests {
         }
     }
 
-    /// The first capture applies the configured pet species, in one pane and in a
-    /// split: the dog skin reaches the atlas, and the cat is the negative control.
     #[test]
     fn first_headless_capture_applies_the_configured_pet_species() {
         use aterm_effects::kitty_pet::PetSpecies;
@@ -9917,12 +8094,6 @@ mod split_capture_tests {
         }
     }
 
-    /// Prism wake paints in a split, anchored inside the pane that produced the
-    /// output: pane-local emission plus `translate_nova_into_pane` must put a comet
-    /// where the text that earned it is, not at the window origin. It does not
-    /// assert the unfocused pane paints too: no capture stages
-    /// `unfocused_pane_scratch` (only a real composed present does), so that would
-    /// measure the harness, not the product.
     #[test]
     fn a_split_paints_a_streak_anchored_in_the_pane_that_produced_it() {
         let run = |enabled: bool| {
@@ -9939,8 +8110,6 @@ mod split_capture_tests {
                 let ws = app.windows.get_mut(&wid).expect("window");
                 ws.focused = true;
             }
-            // Establish both panes first: the first composed pass baselines
-            // every engine's arrival counter, so nothing answers history.
             app.capture_words(wid, t0);
             let term = app.pool.get(sid).expect("pane session").term.clone();
             term_lock(&term).process(b"\r\noutput in the focused pane\r\n");
@@ -9955,9 +8124,6 @@ mod split_capture_tests {
             !xs.is_empty(),
             "a split must not go dark: the composed pass owes streak light"
         );
-        // The focused pane is the right half the vertical split just created, so
-        // every quad must sit past the divider; a comet in window coordinates
-        // instead of pane-local ones would land left of it.
         let min_x = xs.iter().copied().min().expect("min");
         assert!(
             u32::from(min_x) >= half,
@@ -9971,9 +8137,6 @@ mod split_capture_tests {
         );
     }
 
-    /// Prism wake reaches the single-pane capture, the path every pixel gate reads
-    /// (headless never runs the windowed present). The disabled twin is the
-    /// non-vacuity control: "quads appear" alone would pass for another engine's.
     #[test]
     fn a_capture_carries_the_output_streak_and_an_off_config_carries_none() {
         let streak_quads = |enabled: bool| {
@@ -9993,9 +8156,6 @@ mod split_capture_tests {
                 .expect("front terminal")
                 .term
                 .clone();
-            // The first capture baselines the arrival counter (a fresh engine
-            // must never answer history with a burst), so the licensed
-            // observation is the second one.
             app.capture_words(wid, t0);
             let before = app.windows[&wid].fx.nova().len();
             term_lock(&term).process(b"\r\nprogram output arrives here\r\n");
@@ -10014,7 +8174,6 @@ mod split_capture_tests {
         );
     }
 
-    /// A composed (split) capture splices the sparkle channels.
     #[test]
     fn split_capture_splices_decorations() {
         let t0 = Instant::now();
@@ -10026,8 +8185,6 @@ mod split_capture_tests {
             let ws = app.windows.get_mut(&wid).expect("window");
             ws.focused = true;
         }
-        // Establish both panes first (a never-scanned pane spends whatever was
-        // already on it), then type the words that must summon cats.
         app.capture_words(wid, t0);
         for s in [0u64, sid] {
             let term = app.pool.get(s).expect("pane session").term.clone();
@@ -10064,9 +8221,6 @@ mod chrome_output_tests {
     };
     use aterm_render::Frame;
 
-    /// The `strip-caption` line names the window's own frame (LW.5) and the
-    /// buttons the strip laid out for it, at the columns `pointer move -1 <col>`
-    /// and a click resolve; a window the system decorates says so.
     #[test]
     fn strip_caption_line_reports_the_frame_and_its_buttons() {
         use super::strip_caption_chrome_line;
@@ -10128,8 +8282,6 @@ mod chrome_output_tests {
         );
     }
 
-    /// The `ime` line reports the composition and the spot aterm gave the
-    /// input method, quoted so a CJK preedit and an empty one read back.
     #[test]
     fn ime_line_reports_the_composition_and_its_spot() {
         use super::ime_chrome_line;
@@ -10147,10 +8299,6 @@ mod chrome_output_tests {
         );
     }
 
-    /// The `strip-version` line reports the label the strip laid out — its
-    /// rung, its columns, its text, whether the pointer is on it and what a
-    /// click fires — or, when there is none, why, with the full label it would
-    /// have shown.
     #[test]
     fn strip_version_line_reports_what_was_laid_out() {
         use super::{StripVersionAbsence, strip_version_chrome_line};
@@ -10186,7 +8334,6 @@ mod chrome_output_tests {
                  attention=false hovered=false action=Version"
             )
         );
-        // The test binary is a dev build, which always has a short rung.
         let short = strip_version_label(VersionRung::Short, false).expect("a dev short rung");
         assert_eq!(
             strip_version_chrome_line(
@@ -10214,8 +8361,6 @@ mod chrome_output_tests {
                 )
             );
         }
-        // Under attention the absent line names the marked label and the click
-        // this platform would fire.
         let marked = strip_version_label(VersionRung::Full, true).expect("a full rung");
         let action = crate::menu::version_slot_click(true);
         assert_eq!(
@@ -10227,11 +8372,6 @@ mod chrome_output_tests {
         );
     }
 
-    /// The reason is the layout's, not the cache's (Windows): the live `chrome`
-    /// line reads why no label is shown off the slot the reported segments were
-    /// laid out with — not the strip cache key, which every font, theme and
-    /// geometry invalidation empties while those segments stay laid out, and not
-    /// the UI face's state now, which can be ahead of the last layout.
     #[cfg(windows)]
     #[test]
     fn the_strip_version_reason_reads_the_layout_it_reports() {
@@ -10241,7 +8381,6 @@ mod chrome_output_tests {
                 .find(|line| line.starts_with("strip-version "))
                 .expect("Windows reports the strip's version label")
         };
-        // This thread may hold faces an earlier test installed: start without.
         crate::tray_raster::clear_ui_fonts_for_test();
         let mut app = crate::App::headless_for_test();
         let wid = crate::WindowId(0);
@@ -10276,12 +8415,8 @@ mod chrome_output_tests {
             "the next frame lays the label out in the face: {}",
             line(&app)
         );
-        // A cache invalidation that leaves the segments laid out does not unsay
-        // them.
         app.windows.get_mut(&wid).expect("window").last_strip_fp = None;
         assert!(line(&app).contains("shown=yes rung=full"), "{}", line(&app));
-        // Too narrow for either rung beside a lone 27-column tab
-        // (`tab_bar::LONE_CHIP_COLS`): measured, and left out.
         app.windows.get_mut(&wid).expect("window").cols = 32;
         app.splice_tab_strip_with(wid, 1);
         assert!(
@@ -10289,7 +8424,6 @@ mod chrome_output_tests {
             "{}",
             line(&app)
         );
-        // A chrome regrid clears the segments until the next frame.
         app.windows
             .get_mut(&wid)
             .expect("window")
@@ -10322,8 +8456,6 @@ mod chrome_output_tests {
         ] {
             platform_alpha[(y * width + x) as usize] = 128;
         }
-        // An isolated stale alpha sample in an ordinary client row is not an
-        // outer shape pixel and must not survive.
         platform_alpha[(2 * width + 2) as usize] = 31;
 
         let mut window = vec![0_u8; (width * height * 4) as usize];
@@ -10347,8 +8479,6 @@ mod chrome_output_tests {
         .unwrap();
         multiply_platform_outer_shape_alpha(&mut window, width, height, &platform_alpha).unwrap();
 
-        // Byte offset of the (x, y) pixel's first channel in the RGBA window,
-        // so every assertion below keeps its row/column shape on the page.
         let at = |x: u32, y: u32| ((y * width + x) * 4) as usize;
         for (x, y) in [(0, 0), (4, 0), (0, 4), (4, 4)] {
             let index = at(x, y);
@@ -10359,8 +8489,6 @@ mod chrome_output_tests {
             );
             assert_eq!(window[index + 3], 0);
         }
-        // The half-shape pixel at (1, 0): 200 fresh alpha scaled by the 128
-        // platform sample.
         assert_eq!(window[at(1, 0) + 3], 100);
         let center = at(2, 2);
         assert_eq!(&window[center..center + 3], &fresh[center..center + 3]);
@@ -10371,21 +8499,15 @@ mod chrome_output_tests {
         );
     }
 
-    /// The part of a window past the display's right edge comes back from the
-    /// platform with no ink at all; it is not outer shape, so the renderer's pixels
-    /// there keep their alpha and the off-screen corners take the on-screen
-    /// corners' mirrored shape.
     #[test]
     fn mac_window_stitch_keeps_what_the_platform_did_not_photograph() {
         let (width, height) = (8_u32, 4_u32);
         let mut platform_alpha = vec![255_u8; (width * height) as usize];
-        // Columns 5..8 are past the screen's edge: never photographed.
         for y in 0..height {
             for x in 5..width {
                 platform_alpha[(y * width + x) as usize] = 0;
             }
         }
-        // The on-screen left corners: transparent tip, half-covered neighbour.
         for y in [0, height - 1] {
             platform_alpha[(y * width) as usize] = 0;
             platform_alpha[(y * width + 1) as usize] = 128;
@@ -10396,27 +8518,14 @@ mod chrome_output_tests {
         }
         multiply_platform_outer_shape_alpha(&mut window, width, height, &platform_alpha).unwrap();
         let alpha = |x: u32, y: u32| window[((y * width + x) * 4 + 3) as usize];
-        // The off-screen middle keeps the renderer's alpha.
         assert_eq!((alpha(6, 1), alpha(7, 2), alpha(5, 1)), (200, 200, 200));
-        // The off-screen corners are the on-screen ones, mirrored.
         assert_eq!((alpha(7, 0), alpha(7, 3)), (0, 0));
         assert_eq!((alpha(6, 0), alpha(6, 3)), (100, 100));
-        // The on-screen corners are unchanged.
         assert_eq!((alpha(0, 0), alpha(1, 0), alpha(2, 1)), (0, 100, 200));
     }
 
-    /// THE WINDOWED SNAPSHOT ENCODES THE EXACT DESTINATION AS MAPPED. A GPU
-    /// tap's padded `Bgra8Unorm` rows travel as they were mapped and the
-    /// snapshot PNG decodes to their straight RGBA byte for byte, the
-    /// remainder band and the alpha-192 present pass included. NEGATIVE
-    /// CONTROL: a mapped buffer one byte short of its last row is refused when
-    /// the tap builds it, so a destination that is not what it claims never
-    /// reaches the encoder.
     #[test]
     fn sigusr_windowed_snapshot_roundtrips_exact_non_cell_destination_and_present_passes() {
-        // 3×2 deliberately cannot be expressed as this fixture's hypothetical
-        // 2×2 cell grid. The last column is a destination remainder band; the
-        // other sentinels stand for already-applied SDR crown / HDR glow output.
         let expected = vec![
             11, 12, 13, 255, // semantic base
             90, 80, 70, 255, // present-only crown transformed pixel
@@ -10425,7 +8534,6 @@ mod chrome_output_tests {
             210, 160, 120, 192, // present-only glow + alpha
             6, 7, 8, 255, // right remainder band
         ];
-        // As a swapchain tap maps it: BGRA, rows padded to 256 bytes.
         let stride = 256;
         let mut mapped = vec![0xA5_u8; stride * 2];
         for (index, &[r, g, b, a]) in expected.as_chunks::<4>().0.iter().enumerate() {
@@ -10453,10 +8561,6 @@ mod chrome_output_tests {
         );
     }
 
-    /// A CPU present's capture is its softbuffer, opaque: each pixel's RGB as
-    /// the surface holds it, alpha 255 whatever the renderer's transmittance
-    /// byte says. NEGATIVE CONTROL: a softbuffer that is not its size is
-    /// refused.
     #[test]
     fn cpu_softbuffer_capture_is_its_rgb_and_opaque() {
         let pixels = CapturePixels::softbuffer(vec![0x7f11_2233, 0xff44_5566], 2, 1)
@@ -10472,9 +8576,6 @@ mod chrome_output_tests {
         assert!(CapturePixels::softbuffer(vec![0; 3], 2, 1).is_err());
     }
 
-    /// Pixels a frame rendered with transmittance, alpha and every channel
-    /// distinct, at a width that is not a multiple of anything the encoder or
-    /// the fingerprint's blocks use.
     fn packed_fixture(width: usize, height: usize) -> Frame {
         Frame {
             width,
@@ -10491,9 +8592,6 @@ mod chrome_output_tests {
         }
     }
 
-    /// The same pixels in every form a capture travels in: straight RGBA, the
-    /// packed frame, a padded `Bgra8Unorm` mapping, and (for an opaque frame)
-    /// a softbuffer.
     fn every_form(frame: &Frame) -> Vec<(&'static str, CapturePixels)> {
         let (width, height) = (frame.width, frame.height);
         let rgba = frame.rgba_bytes();
@@ -10530,12 +8628,6 @@ mod chrome_output_tests {
         forms
     }
 
-    /// ONE ENCODER FOR EVERY FORM. A rerender's packed frame, its straight
-    /// RGBA bytes and its mapped destination encode to the same PNG, byte for
-    /// byte, and the PNG decodes to those bytes (alpha `255 - transmittance`).
-    /// Straight RGBA and a packed frame one pixel longer or shorter than their
-    /// size are refused when built. NEGATIVE CONTROL: a frame one channel
-    /// different encodes differently, so the comparison sees the pixels.
     #[test]
     fn packed_frame_encodes_like_its_rgba_bytes() {
         for (width, height) in [(1usize, 1usize), (3, 2), (37, 29)] {
@@ -10573,11 +8665,6 @@ mod chrome_output_tests {
         }
     }
 
-    /// ONE `pixel-fingerprint` FOR EVERY FORM. Straight RGBA, a mapped
-    /// destination and a softbuffer fold into the same hash as the packed frame
-    /// they show, at sizes below, at and past the fingerprint's 1024-pixel
-    /// blocks, and that hash is [`App::image_pixel_fingerprint`] of the frame.
-    /// NEGATIVE CONTROL: one alpha step (one transmittance step) changes it.
     #[test]
     fn rgba8_and_packed_pixels_share_one_fingerprint() {
         for (width, height) in [(1usize, 1usize), (32, 32), (37, 29), (1031, 3)] {
@@ -10607,11 +8694,6 @@ mod chrome_output_tests {
         }
     }
 
-    /// A CAPTURE CUT TO A RECT IS THAT RECT. In every form, the encode and the
-    /// fingerprint of pixels cut to a sub-rect are those of the sub-rect's
-    /// pixels on their own, and a second cut is relative to the first.
-    /// NEGATIVE CONTROLS: a rect reaching past the pixels is refused, and the
-    /// rect one pixel further right is different pixels.
     #[test]
     fn a_cut_capture_is_its_rect() {
         let frame = packed_fixture(9, 7);
@@ -10679,9 +8761,6 @@ mod chrome_output_tests {
 
     #[test]
     fn window_stitch_uses_explicit_asymmetric_client_origin() {
-        // A 2×2 client at (2,1) inside asymmetric chrome/borders. The pixels
-        // already contain arbitrary live remainder/crop output; the stitch
-        // neither recenters nor synthesizes any band.
         let mut window = vec![9_u8; 5 * 4 * 4];
         let rgba: Vec<u8> = (0_u8..16).collect();
         let client = CapturePixels::rgba8(2, 2, rgba.clone()).expect("a 2x2 client");
@@ -10698,8 +8777,6 @@ mod chrome_output_tests {
             &client,
         )
         .unwrap();
-        // Byte offset of the (row, col) pixel in the 5-wide RGBA window, so the
-        // client's two rows stay legible as rows rather than as byte counts.
         let at = |row: usize, col: usize| (row * 5 + col) * 4;
         assert_eq!(&window[at(1, 2)..at(1, 4)], &rgba[..8]);
         assert_eq!(&window[at(2, 2)..at(2, 4)], &rgba[8..]);
@@ -10772,8 +8849,6 @@ mod chrome_output_tests {
             "straight-alpha source-over must weight both source and destination alpha"
         );
         assert_eq!(&destination[8..12], &[4, 5, 6, 255]);
-        // Bytes 12.. are the whole second row (three pixels), so the `as_chunks`
-        // remainder is empty.
         let (second_row, _) = destination[12..].as_chunks::<4>();
         assert!(second_row.iter().all(|px| *px == [1, 2, 3, 255]));
     }
@@ -10830,8 +8905,6 @@ mod chrome_output_tests {
         );
     }
 
-    /// The bitmap a [`BitmapDesc`] names in each of its direct layouts: two
-    /// rows of three pixels, padded, `pixels` placed by `offsets` (R, G, B, A).
     fn bitmap_of(pixels: &[[u8; 4]; 6], offsets: [usize; 4], bytes_per_row: usize) -> Vec<u8> {
         let mut bytes = vec![0xC3_u8; bytes_per_row * 2];
         for (index, pixel) in pixels.iter().enumerate() {
@@ -10843,16 +8916,8 @@ mod chrome_output_tests {
         bytes
     }
 
-    /// EVERY CHROME BITMAP LAYOUT READ DIRECTLY IS NORMALIZED TO STRAIGHT
-    /// RGBA8. Alpha first or last, premultiplied or straight, in 32-bit pixels
-    /// of default, big- or little-endian byte order, with padded rows: each
-    /// gives the hand-computed straight pixels (premultiplied colour
-    /// unassociated with round-half, transparent colour zeroed). NEGATIVE
-    /// CONTROLS: a 16-bit, float, alpha-less or non-RGB bitmap, or one short
-    /// of its last row, is refused, which sends the capture to AppKit's PNG.
     #[test]
     fn normalize_bitmap_covers_every_supported_layout() {
-        // Premultiplied R, G, B, A.
         let premultiplied = [
             [0x40, 0x20, 0x10, 0x80],
             [1, 2, 3, 255],
@@ -10866,7 +8931,6 @@ mod chrome_output_tests {
             32, 32,
         ];
         let straight: Vec<u8> = premultiplied.iter().flatten().copied().collect();
-        // (alpha info, byte order, R/G/B/A offsets)
         let layouts = [
             (1, 0, [0, 1, 2, 3]),       // premultiplied last: R G B A
             (1, 4 << 12, [0, 1, 2, 3]), // the same, 32-bit big-endian
@@ -10937,14 +9001,6 @@ mod chrome_output_tests {
         );
     }
 
-    /// A real `width`×`height` `NSBitmapImageRep` of `bits`-bit RGBA samples
-    /// (`straight` alpha or premultiplied), built off WindowServer as the
-    /// wallpaper decoder's tests build theirs, its one plane written by
-    /// `fill(bytes, bytes_per_row)`, then converted to sRGB as the titlebar
-    /// snapshot is (`native_chrome_overlay_pooled`). A device RGB rep is
-    /// really converted; `tagged_srgb` tags it sRGB first, so the conversion
-    /// keeps its samples. Returns the rep (+1) and the converted one (+0, in
-    /// the caller's autorelease pool).
     #[cfg(target_os = "macos")]
     fn srgb_chrome_rep(
         (width, height): (isize, isize),
@@ -10958,7 +9014,6 @@ mod chrome_output_tests {
         use crate::appkit;
         use crate::appkit::consts::NS_COLOR_RENDERING_INTENT_PERCEPTUAL;
 
-        /// `NSBitmapFormatAlphaNonpremultiplied` (`NSBitmapImageRep.h`).
         const ALPHA_NONPREMULTIPLIED: usize = 1 << 1;
         type Init = unsafe extern "C-unwind" fn(
             Id,
@@ -10976,11 +9031,7 @@ mod chrome_output_tests {
             isize,
         ) -> Id;
         let space = appkit::nsstring("NSDeviceRGBColorSpace").expect("a colour space name");
-        // SAFETY: `+alloc`, then the designated initializer with its own
-        // prototype (`NSInteger` sizes and sample counts, `BOOL` flags, the
-        // `NSString *` colour space name, an `NSBitmapFormat` (`NSUInteger`),
-        // `NSInteger` row and pixel sizes, 0 for "computed"); NULL planes make
-        // the rep allocate its own meshed buffer. +1.
+        // SAFETY: `+alloc` and designated `NSBitmapImageRep` initializer with NULL planes allocate an owned buffer.
         let rep = unsafe {
             let init: Init = aterm_objc::checked_msg();
             let alloc = appkit::send_id(class(c"NSBitmapImageRep").as_id(), sel!(alloc));
@@ -11001,9 +9052,7 @@ mod chrome_output_tests {
             ))
         }
         .expect("an NSBitmapImageRep");
-        // SAFETY: `-bytesPerRow` (`NSInteger`) and `-bitmapData`
-        // (`unsigned char *`) of the live meshed rep, whose one plane is
-        // `bytesPerRow · height` bytes it owns while `rep` lives.
+        // SAFETY: `-bytesPerRow` and `-bitmapData` on the live `rep` owning `bytesPerRow * height` bytes.
         let (plane, row) = unsafe {
             let data: unsafe extern "C-unwind" fn(Id, Sel) -> *mut u8 = aterm_objc::checked_msg();
             let row = usize::try_from(appkit::send_isize(rep.id(), sel!(bytesPerRow)))
@@ -11015,8 +9064,7 @@ mod chrome_output_tests {
             )
         };
         fill(plane, row);
-        // SAFETY: `+sRGBColorSpace` (+0, immortal); the retag and the
-        // conversion are `-(NSBitmapImageRep *)` sends on the live rep, +0.
+        // SAFETY: `+sRGBColorSpace` and color-space conversion sends on the live `NSBitmapImageRep`.
         let converted = unsafe {
             let srgb = appkit::send_id(class(c"NSColorSpace").as_id(), sel!(sRGBColorSpace));
             let source = if tagged_srgb {
@@ -11039,14 +9087,6 @@ mod chrome_output_tests {
         (rep, converted)
     }
 
-    /// AN 8-BIT APPKIT CHROME BITMAP IS COPIED AS IT IS, AND READS AS THE PNG
-    /// IT REPLACED. A real premultiplied 8-bit rep holding every colour value
-    /// under every alpha, converted from device RGB to sRGB as the titlebar
-    /// snapshot is, takes `chrome_pixels_of`'s direct copy, and its straight
-    /// overlay is byte for byte the decode of AppKit's own PNG of the same rep
-    /// (the main-thread round trip the copy replaced): translucent edges
-    /// included, AppKit unassociates as `unpremultiply_rgba8` does. NEGATIVE
-    /// CONTROL: the same bytes read as straight alpha are not that PNG.
     #[cfg(target_os = "macos")]
     #[test]
     fn an_appkit_chrome_bitmap_is_copied_as_its_png_would_read() {
@@ -11058,7 +9098,6 @@ mod chrome_output_tests {
                     for x in 0..256 {
                         let colour = x * alpha / 255;
                         let pixel = &mut plane[alpha * row + x * 4..][..4];
-                        // `as u8`: every value is at most `alpha`, below 256.
                         pixel.copy_from_slice(&[
                             colour as u8,
                             (colour * 3 % (alpha + 1)) as u8,
@@ -11086,7 +9125,6 @@ mod chrome_output_tests {
                 "the rep has translucent pixels"
             );
             let as_straight = BitmapDesc {
-                // Alpha info 3: straight, last.
                 bitmap_info: (desc.bitmap_info & !0x1F) | 3,
                 ..desc
             };
@@ -11117,12 +9155,6 @@ mod chrome_output_tests {
         });
     }
 
-    /// A 16-BIT APPKIT CHROME BITMAP KEEPS APPKIT'S PNG. The sRGB conversion
-    /// keeps a device RGB 16-bit rep at 16 bits a sample, and
-    /// `chrome_pixels_of` does not read it directly; a straight 16-bit sRGB
-    /// rep (whose conversion keeps its samples) is handed over as AppKit's
-    /// PNG, whose overlay is each sample's high byte. NEGATIVE CONTROL: bytes
-    /// that are not a PNG are refused.
     #[cfg(target_os = "macos")]
     #[test]
     fn a_sixteen_bit_appkit_chrome_bitmap_goes_through_its_png() {
@@ -11168,8 +9200,6 @@ mod chrome_output_tests {
         assert!(decode_native_chrome_png(&[0; 16]).is_err());
     }
 
-    /// A GDI photograph's BGR becomes opaque RGB, whatever GDI left in its
-    /// fourth byte.
     #[test]
     fn bgrx_photograph_becomes_opaque_rgba() {
         let mut pixels = vec![1, 2, 3, 99, 4, 5, 6, 0];
@@ -11177,15 +9207,6 @@ mod chrome_output_tests {
         assert_eq!(pixels, [3, 2, 1, 255, 6, 5, 4, 255]);
     }
 
-    /// `window` IS STITCHED ON THE ENCODE WORKER. The photograph as
-    /// CoreGraphics drew it (premultiplied, transparent corners), the
-    /// presented client and the AppKit chrome in its own bitmap layout
-    /// (premultiplied BGRA) travel to the encode worker, which writes the
-    /// composition: the client over every client row, the opaque chrome pixel
-    /// as it is and the translucent one blended over the client, and the
-    /// photograph's corners transparent again. The submitting thread ran none
-    /// of it. Negative control: the same stitch finished on this thread is
-    /// recorded here, and it is the PNG the worker wrote.
     #[cfg(target_os = "macos")]
     #[test]
     fn a_window_is_stitched_on_the_encode_worker() {
@@ -11201,8 +9222,6 @@ mod chrome_output_tests {
                 photograph.extend(if corner { [0; 4] } else { [9, 9, 9, 255] });
             }
             let client: Vec<u32> = (0..width * height).map(|i| 0x0010_2030 + i).collect();
-            // Premultiplied BGRA, rows padded to 12 bytes: half-alpha magenta, then
-            // opaque (1, 2, 3).
             let mut chrome = vec![0x80, 0, 0x80, 0x80, 3, 2, 1, 255];
             chrome.extend([0xEE; 4]);
             WindowStitch {
@@ -11281,7 +9300,6 @@ mod chrome_output_tests {
         );
         assert_ne!(at(1, 0), [0x10, 0x20, 0x31, 255], "and blended into it");
 
-        // Negative control: on this thread, the same composition.
         let here_pixels = stitch().finish().expect("finishes");
         assert!(super::ran_pixel_work(here));
         let here_png = CapturePng::encode(&here_pixels).expect("encodes");
@@ -11385,8 +9403,6 @@ mod terminal_split_capture_tests {
         let (video_reply, _video_rx) = std::sync::mpsc::channel();
         app.video_rec = Some(crate::VideoRec {
             window: wid,
-            // A wall-clock budget nothing here tests (recording expiry has its
-            // own tests), set out of reach of machine load.
             deadline: Instant::now() + Duration::from_secs(3_600),
             started_us: 0,
             keys: false,
@@ -11434,7 +9450,6 @@ mod terminal_split_capture_tests {
                 w: 1,
                 h: 1,
                 color: 0x0001_0101,
-                // Additive light (see `GlowQuad::alpha`).
                 alpha: 0,
                 color2: 0x0001_0101,
                 alpha2: 0,
@@ -11471,13 +9486,8 @@ mod terminal_split_capture_tests {
             crate::app_render::HostVisualState::default(),
         );
         let successful_serial = app.windows[&wid].capture_present_serial;
-        // Font fallback convergence may clear this immediately after a
-        // successful submit. It is deliberately not capture authority.
         app.windows.get_mut(&wid).unwrap().last_present = None;
 
-        // Interleave a fresh snapshot/layout extraction that rewrites the shared
-        // scratch and its leaf sequence vector after the video frame succeeds:
-        // the recording artifact must stay immutable.
         app.prepare_terminal_capture_grid(wid)
             .expect("interleaved terminal snapshot");
         {
@@ -11555,10 +9565,6 @@ mod terminal_split_capture_tests {
         assert!(staged.cursor_trail.is_empty());
         assert!(staged.cursor_glow_add.is_empty());
 
-        // `image plain` of the recording rerenders the resident model under
-        // the visuals retained beside the recorded present (none here), from
-        // an owned copy stripped of its bling layers. A newer scratch and a
-        // live glow were never presented, so neither reaches the still.
         let scratch_bg = 0x0013_57A9;
         app.windows.get_mut(&wid).unwrap().input_scratch.default_bg = scratch_bg;
         let plain_still = |app: &mut App, name: &str| {
@@ -11626,15 +9632,12 @@ mod terminal_split_capture_tests {
             .expect("a live glow");
         let (_, _, glowing, serial) = plain_still(&mut app, "plain-glow.png");
         assert_eq!(serial, successful_serial);
-        // The outer corner lies outside glyphs and cards; the rim covers it.
         assert_eq!(
             glowing[0], absent[0],
             "a retained None overlay is authoritative: the live glow is not resampled"
         );
         app.level_up = None;
 
-        // Negative controls: the live glow, resampled, would show at the
-        // corner, and a rerender of the scratch shows its background.
         let mut resampled = absent.clone();
         crate::app_render::apply_overlay_at(
             &mut resampled,
@@ -11723,11 +9726,6 @@ mod terminal_split_capture_tests {
         );
     }
 
-    /// The capture-only compositor must include both pane snapshots, each with
-    /// its own OSC-11 blank and default-background provenance and the cursor
-    /// offset into the focused pane, without borrowing any present semantics:
-    /// no damage consume, no repaint stamp, no predictor advance. (Composed
-    /// cursor-effect projection is pinned by the mixed-composite tests.)
     #[test]
     fn split_capture_grid_composes_sparse_panes_without_present_side_effects() {
         let (mut app, wid, right) = split_fixture();
@@ -11841,8 +9839,6 @@ mod terminal_split_capture_tests {
         );
         assert!(!ws.predictor.idle());
 
-        // A still-outstanding damage session remains latched: another write does
-        // not advance the epoch unless capture incorrectly called take_damage().
         term_lock(&left_term).process(b"!");
         assert_eq!(
             term_lock(&left_term).damage_epoch(),
@@ -11875,9 +9871,6 @@ mod terminal_split_capture_tests {
             selection.complete_selection();
         }
 
-        // The clip and box arithmetic is `push_pane_selection`'s own
-        // (`app_render::selection_projection_tests`); this pins that both
-        // routes hand it the focused pane's offsets and live OSC 17/19 colours.
         let assert_projection = |input: &aterm_render::RenderInput, lane: &str| {
             let row0 = usize::from(right_rect.row_off);
             let col0 = usize::from(right_rect.col_off);
@@ -11923,11 +9916,6 @@ mod terminal_split_capture_tests {
         assert_projection(&app.windows[&wid].input_scratch, "capture");
     }
 
-    /// The capture model's per-pane selection loop (`terminal-render-model-v8`): on
-    /// a composed split the `selections` list is the renderer's selection
-    /// authority, so two frames that differ only in an unfocused pane's highlight
-    /// hash apart. The empty list stays distinct from a bare entry, and an
-    /// identical frame hashes identically.
     #[test]
     fn the_capture_model_hash_sees_every_panes_selection() {
         use aterm_core::selection::{SelectionSide, SelectionType, TextSelection};
@@ -11977,11 +9965,6 @@ mod terminal_split_capture_tests {
         assert_ne!(hash(&bare), hash(&one), "a selection is not a bare entry");
     }
 
-    /// The capture model hashes each row's BiDi map (`terminal-render-model-
-    /// v8`): a row of one repeated Hebrew letter paints the same cells in
-    /// either order, but its selection lights a different cell, so the two
-    /// frames are two models. A missing map row and an empty one are the same
-    /// identity, as `RenderInput`'s equality reads them.
     #[test]
     fn the_capture_model_hash_sees_a_rows_bidi_map() {
         use aterm_core::selection::{SelectionSide, SelectionType};
@@ -12010,11 +9993,6 @@ mod terminal_split_capture_tests {
         assert_eq!(hash(&unmapped), hash(&empty_rows), "both the identity");
     }
 
-    /// Selection custody: an unfocused split pane's selection (1) paints in the
-    /// composed frame and (2) is what ⌘-C resolves to when the focused pane holds
-    /// none. Paint without the copy leaves a highlight ⌘-C ignores; the copy
-    /// without the paint copies text the user cannot see highlighted. Focus keeps
-    /// absolute priority.
     #[test]
     fn an_unfocused_pane_selection_paints_and_is_what_a_copy_resolves() {
         use aterm_core::selection::{SelectionSide, SelectionType};
@@ -12035,7 +10013,6 @@ mod terminal_split_capture_tests {
             "the split fixture focuses the NEW pane, so session 0 is unfocused"
         );
 
-        // Select "LEFT" in the unfocused pane.
         let left_term = app.pool.get(0).expect("left pane").term.clone();
         {
             let mut terminal = term_lock(&left_term);
@@ -12070,16 +10047,12 @@ mod terminal_split_capture_tests {
             "the unfocused pane's selection PAINTS (this is the whole item)"
         );
 
-        // The copy half. Asserted through the resolver rather than
-        // `copy_selection_in`: the resolver is the decision this pins (see
-        // `a_copy_resolves_the_routed_window_not_the_frontmost_one`).
         assert_eq!(
             app.window_selection_text(wid).as_deref(),
             Some("LEFT"),
             "⌘-C resolves the pane whose highlight is on screen"
         );
 
-        // Focus keeps absolute priority once the focused pane has its own.
         let right_term = app.pool.get(right).expect("right pane").term.clone();
         {
             let mut terminal = term_lock(&right_term);
@@ -12094,15 +10067,9 @@ mod terminal_split_capture_tests {
             "the focused pane wins whenever it has a selection at all"
         );
 
-        // …including when its selection resolves to nothing: ownership is
-        // `has_selection()`, never non-empty text. `selection_to_string_capped`
-        // returns `None` for an all-whitespace span, so gating on text would fall
-        // through and copy a sibling pane the user never touched — with
-        // `copy_on_select` on, on every drag across a blank region.
         {
             let mut terminal = term_lock(&right_term);
             let selection = terminal.text_selection_mut();
-            // A row the seed never wrote: resolves to "" and therefore to `None`.
             selection.start_selection(3, 0, SelectionSide::Left, SelectionType::Simple);
             selection.update_selection(3, 6, SelectionSide::Right);
             selection.complete_selection();
@@ -12123,10 +10090,6 @@ mod terminal_split_capture_tests {
         );
     }
 
-    /// Observing an unchanged composite is idempotent at the audit-model layer,
-    /// while changed cells inside the same latched damage epoch still produce a
-    /// new identity. The same idle-stability law applies to zoom, whose one
-    /// visible leaf is still a composed split view.
     #[test]
     fn unchanged_split_and_zoom_captures_keep_stable_model_identity() {
         let (mut app, wid, _) = split_fixture();
@@ -12137,9 +10100,6 @@ mod terminal_split_capture_tests {
             App::terminal_capture_fingerprint(&second, &app.windows[&wid].input_scratch),
             first_fp
         );
-        // Capture intentionally did not consume damage. A later write can
-        // therefore retain the same engine epoch; exact model hashing must
-        // still see the newly extracted cell.
         let left = app.pool.get(0).unwrap().term.clone();
         crate::term_lock(&left).process(b"!");
         let changed = app.prepare_terminal_capture_grid(wid).unwrap();
@@ -12169,20 +10129,11 @@ mod terminal_split_capture_tests {
         );
     }
 
-    /// Drive the real control `image` path with chrome enabled. The encoded frame
-    /// is a composite, metadata enumerates both leaves, and the retained scratch
-    /// has exactly one strip splice (never cumulative/doubled).
     #[test]
     fn image_capture_reports_split_composite_and_splices_chrome_once() {
         let (mut app, wid, right) = split_fixture();
-        // The single-splice and one-companion laws below are about what the
-        // composed route draws, so the trail master is asked for, not inherited
-        // (its absent-key default is platform-split).
         app.config.cursor_trail = Some(true);
         app.recompute_sparkle();
-        // Cursor companions share the sprite atlas with Sparkle Words, but do
-        // not belong to that feature. Exercise the actual composed-image route
-        // with the word scanner structurally absent.
         app.sparkle = None;
         app.windows.get_mut(&wid).expect("window").focused = true;
         app.tab_strip_rows = 1;
@@ -12279,15 +10230,10 @@ mod capture_overlay_reset_tests {
     use std::sync::Arc;
     use std::time::Instant;
 
-    /// `cell_frame_into` preserves host overlays. Disabling sparkle words between
-    /// captures must therefore clear the prior capture before the feature-off
-    /// early return, including every Arc-backed sprite channel.
     #[test]
     fn disabled_word_decorations_cannot_leak_prior_capture_layers() {
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
-        // Isolate word-owned residue from the independent cursor companion: the
-        // cursor-trail owner is off, so any surviving free sprite is a leak.
         app.config.cursor_trail = Some(false);
         app.prepare_terminal_capture_grid(wid).unwrap();
         app.sparkle_dirty = false;
@@ -12334,10 +10280,6 @@ mod capture_overlay_reset_tests {
         assert!(input.nova_add.is_empty());
     }
 
-    /// The decoration helper deliberately takes a second coherent terminal
-    /// snapshot to close the initial-capture/PTY race. Live OSC 11/12 state must
-    /// come from that same lock too; otherwise cells and sequence describe
-    /// snapshot B while padding and cursor colour remain torn from snapshot A.
     #[test]
     fn decoration_refill_restamps_live_default_and_cursor_colors() {
         let mut app = App::headless_for_test();
@@ -12374,11 +10316,6 @@ mod encode_worker_tests {
     use crate::control_auth::ensure_private_dir;
     use std::time::Duration;
 
-    /// `image` IS NEVER AN OS SCREEN CAPTURE: it renders the frame the window
-    /// draws (the backend's own render), so it needs no window on screen and
-    /// asks CoreGraphics for no photograph. A headless App's `image` answers a
-    /// PNG, and this thread asked the OS for no window photograph. CONTROL: a
-    /// window photograph asked for is counted.
     #[cfg(target_os = "macos")]
     #[test]
     fn image_renders_the_frame_and_never_photographs_the_window() {
@@ -12436,11 +10373,6 @@ mod encode_worker_tests {
         control_auth::ConfinedImage::for_test(dir, name)
     }
 
-    /// A capture of the front window bound to a retained present of `input`
-    /// under `visuals`, in the shape the resolver binds a headless recording's
-    /// still (`recorded_capture_source`), without the GPU recording. The
-    /// resolver arm itself is exercised through `render_image` by
-    /// `recording_image_keeps_the_exact_successful_present_cursor_layers`.
     fn retained_capture(
         app: &App,
         input: aterm_render::RenderInput,
@@ -12464,8 +10396,6 @@ mod encode_worker_tests {
         }
     }
 
-    /// The pixels of an `image plain` of the front window: a fresh capture, or
-    /// one bound to a retained present of `input` under its visuals.
     fn visual_capture_pixels(
         app: &mut App,
         presented: Option<(
@@ -12495,7 +10425,6 @@ mod encode_worker_tests {
         rgb_frame_of_png(&png.expect("capture PNG bytes"))
     }
 
-    /// The pixels of a SIGUSR1 snapshot of the front window, once published.
     fn snapshot_capture_pixels(app: &mut App, dir: &std::path::Path, name: &str) -> Frame {
         let path = dir.join(name);
         let done = snapshot_sidecar_path(&path, ".done");
@@ -12525,8 +10454,6 @@ mod encode_worker_tests {
         }
     }
 
-    /// Both captures that rasterize their own frame, `image` and the SIGUSR1
-    /// snapshot, paint the host visual policy and no policy of their own.
     #[test]
     fn capture_visual_policy_terminal_fallback_keeps_charging_over_a_palette() {
         type Capture = fn(&mut App, &std::path::Path, &str) -> Frame;
@@ -12576,16 +10503,12 @@ mod encode_worker_tests {
             expected.height,
             overlay,
         );
-        // The outer corner is outside terminal glyphs and cards, so cursor timing
-        // cannot satisfy this comparison; blanket suppression would return the
-        // baseline pixel here.
         assert_ne!(expected.pixels[0], baseline.pixels[0], "{verb}");
         assert_eq!(
             charged.pixels[0], expected.pixels[0],
             "{verb}: the charging rim, over the palette, with no bell"
         );
 
-        // The rim ended (Commit): the drag still yields to the modal.
         app.level_up = None;
         assert_eq!(app.host_visual_state(wid, Instant::now()).overlay, None);
         let committed = capture(&mut app, &dir, "committed.png");
@@ -12636,10 +10559,6 @@ mod encode_worker_tests {
         );
     }
 
-    /// The encode worker's contract: a guarded result is transferred only after the
-    /// confined write, in FIFO submission order, through exactly one worker. The
-    /// control writer later revalidates it at the socket edge, so `OK <w> <h>`
-    /// means the PNG is complete and bursts keep queue order.
     #[test]
     fn encode_worker_replies_fifo_and_only_after_write() {
         let root = unique_dir("encode-worker");
@@ -12647,10 +10566,6 @@ mod encode_worker_tests {
         let mut app = App::headless_for_test();
         let (tx, rx) = std::sync::mpsc::channel();
         let mut paths = Vec::new();
-        // Server-automatic targets have independent per-path leases, so this
-        // isolates the encode worker's FIFO contract from the intentionally
-        // one-at-a-time caller-explicit namespace contract tested separately.
-        // One shared reply channel makes recv order exactly worker reply order.
         for (i, side) in [1usize, 2, 3].into_iter().enumerate() {
             let target = control_auth::confine_automatic_image_path(&root, &format!("shot{i}"))
                 .expect("confine automatic image target");
@@ -12686,25 +10601,16 @@ mod encode_worker_tests {
                 .expect("file reply carries exact handles")
                 .prepare_write()
                 .expect("wire-edge identity remains exact");
-            // Reply-after-write: at recv time this job's PNG must already be a
-            // complete file (the client reads it the moment it sees OK).
             let bytes = std::fs::read(&paths[i]).expect("file written before reply");
             assert!(
                 bytes.starts_with(&[0x89, b'P', b'N', b'G']),
                 "PNG signature missing"
             );
         }
-        // The lazily-spawned worker is retained for reuse across captures.
         assert!(app.encode_tx.is_some());
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// The capture byte permit answers busy before capturing: with the encoder
-    /// holding its whole budget, an `image` request is refused with the
-    /// encode-queue-full answer without its body running and reserves nothing; a
-    /// SIGUSR1 snapshot is refused the same way and leaves no `.done` (a stale one
-    /// is cleared). Once the budget frees the request is admitted, and its bytes
-    /// come back after the worker's encode.
     #[test]
     fn a_saturated_encoder_answers_busy_before_capturing() {
         let dir = unique_dir("capture-permit-busy");
@@ -12756,7 +10662,6 @@ mod encode_worker_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The capture kinds, each entered through its public entry.
     #[derive(Clone, Copy, Debug)]
     enum CaptureKind {
         Image,
@@ -12773,9 +10678,6 @@ mod encode_worker_tests {
             CaptureKind::Window,
         ];
 
-        /// Enter the capture and return its reply. A snapshot has no caller to
-        /// reply to, so its answer is read off the disk instead: published once
-        /// its worker finishes when `admitted`, untouched otherwise.
         fn enter(
             self,
             app: &mut App,
@@ -12840,11 +10742,6 @@ mod encode_worker_tests {
         }
     }
 
-    /// ONE DOOR ADMITS EVERY CAPTURE KIND, ONCE. `image`, the SIGUSR1 snapshot
-    /// and `window` all enter through `App::run_capture`: while the encoder
-    /// holds its whole byte budget each is answered busy and no body runs; with
-    /// room each runs exactly one body. The second half is the negative
-    /// control: a door that refused every kind, or admitted one twice, fails it.
     #[test]
     fn run_capture_admits_every_kind_once() {
         let dir = unique_dir("capture-door");
@@ -12873,10 +10770,6 @@ mod encode_worker_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Twenty captures asked of an encoder that drains nothing (a queue deep
-    /// enough that its record count never binds): each admitted by `admit`
-    /// is then taken, `job(i)`, and submitted. Returns the captures admitted,
-    /// the bytes in flight after each, and the queued work.
     fn feed_a_blocked_encoder(
         app: &mut App,
         mut admit: impl FnMut(&mut App) -> bool,
@@ -12890,7 +10783,6 @@ mod encode_worker_tests {
             if !admit(app) {
                 continue;
             }
-            // The capture: its pixels exist only for an admitted request.
             app.submit_encode_job(job(i));
             app.capture_permit = None;
             admitted.push(i);
@@ -12899,7 +10791,6 @@ mod encode_worker_tests {
         (admitted, in_flight, blocked)
     }
 
-    /// An `image` job of `pixels`, whose reply nobody reads.
     fn image_job(
         pixels: CapturePixels,
         reply: &std::sync::mpsc::Sender<crate::control::ImageReply>,
@@ -12915,10 +10806,6 @@ mod encode_worker_tests {
         }
     }
 
-    /// The captures `feed_a_blocked_encoder` admitted, each charged `peak`:
-    /// every admitted job holds exactly that, the bytes in flight never pass
-    /// the budget (a lone capture may), and as many are admitted as the
-    /// budget holds.
     fn assert_each_holds_its_peak(label: &str, in_flight: &[usize], peak: usize) {
         for (n, &bytes) in in_flight.iter().enumerate() {
             assert_eq!(bytes, (n + 1) * peak, "{label}: capture {n} holds its peak");
@@ -12934,14 +10821,6 @@ mod encode_worker_tests {
         );
     }
 
-    /// A BLOCKED ENCODER HOLDS AT MOST ITS BYTE BUDGET. Twenty maximum-size
-    /// (5K Retina) captures are asked of an encoder that drains nothing: each
-    /// is admitted only while the bytes in flight fit the budget, a refused
-    /// one allocates no framebuffer at all, and the in-flight bytes plateau
-    /// instead of growing with every request. Each holds its pixels and its
-    /// encode's working set ([`CapturePixels::peak_bytes`]), as estimated at
-    /// admission. The admitted jobs reach the encoder in FIFO order, and
-    /// draining it returns every byte.
     #[test]
     fn a_blocked_encoder_holds_at_most_its_byte_budget() {
         let mut app = App::headless_for_test();
@@ -12990,24 +10869,11 @@ mod encode_worker_tests {
         );
     }
 
-    /// AN ADMITTED CAPTURE IS CHARGED WHAT ITS ADMISSION RESERVED, WHATEVER IT
-    /// CARRIES. A tapped f16 destination (eight bytes a pixel), a padded 8-bit
-    /// destination cut to its frame (it travels whole) and a `window` stitch
-    /// (photograph, client, chrome and shape mask) are each recharged, when
-    /// submitted, exactly the bytes admission estimated for them
-    /// ([`frame_capture_peak`] over the destination's mapped size, which
-    /// `GpuSurface::snapshot_bytes` reports; [`App::capture_bytes_estimate`]
-    /// for the window), so a blocked encoder fed any of them holds a whole
-    /// number of them and never more than its budget. NEGATIVE CONTROL:
-    /// admitted at the frame-only estimate (four bytes a pixel, what admission
-    /// reserved before it knew the payload), 1440x900 f16 destinations push
-    /// the bytes in flight past the budget.
     #[test]
     fn an_admitted_capture_is_charged_what_admission_reserved() {
         use aterm_gpu::video_tap::RawCapture;
 
         let (reply, _replies) = std::sync::mpsc::channel();
-        // A destination as mapped: `bpp`-byte texels, rows padded to 256 bytes.
         let mapped = |width: usize, height: usize, bpp: usize| {
             let row = (width * bpp).div_ceil(256) * 256;
             (vec![0_u8; row * height], row)
@@ -13045,7 +10911,6 @@ mod encode_worker_tests {
             "negative control: the frame-only estimate overruns the budget"
         );
 
-        // A surface one pixel wider and taller than the frame cut from it.
         let cut = || {
             let (bytes, row) = mapped(width + 1, height + 1, 4);
             let raw =
@@ -13148,7 +11013,6 @@ mod encode_worker_tests {
         }
     }
 
-    /// Metadata of no frame: every identity zero, no leaf.
     fn blank_metadata() -> crate::control::ImageFrameMetadata {
         crate::control::ImageFrameMetadata {
             frame_kind: "terminal",
@@ -13175,18 +11039,6 @@ mod encode_worker_tests {
         }
     }
 
-    /// A CAPTURE'S BYTES ARE FREE BEFORE ITS ANSWER (2026-09-26 review). The
-    /// worker releases the capture permit with the raw pixels, before the
-    /// reply, so a client that sends its next `image` the moment it reads the
-    /// answer finds the budget free — on a 5K window one capture's peak
-    /// ([`CapturePixels::peak_bytes`]) is past the whole budget, and nothing
-    /// retries `encode queue full`. Every reply path of a byte capture: the
-    /// PNG, a cancelled request's error, an encoder's error (pixels wider than
-    /// a PNG can describe), which is an answer, never a worker panic, and a
-    /// request whose metadata was already published.
-    /// RED before: the worker dropped the permit after `run_encode_job`
-    /// returned, after the reply, so the reader could still see the frame's
-    /// bytes held (reproduced by delaying that drop).
     #[test]
     fn a_captures_bytes_are_free_before_its_answer() {
         let held = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -13260,8 +11112,6 @@ mod encode_worker_tests {
         }
     }
 
-    /// NO PNG DEFLATE ON THE EVENT LOOP: a submitted capture is encoded on the
-    /// worker, never on the thread that submitted it.
     #[test]
     fn no_png_deflate_runs_on_the_submitting_thread() {
         let mut app = App::headless_for_test();
@@ -13291,9 +11141,6 @@ mod encode_worker_tests {
         );
     }
 
-    /// A job rejected at a full encode queue answers its caller with the
-    /// precise error and publishes nothing: no image at its target, no snapshot
-    /// pixels and no `.done` (begin already removed the stale marker).
     #[test]
     fn rejected_encode_jobs_publish_nothing() {
         let root = unique_dir("encode-queue-reject");
@@ -13362,8 +11209,6 @@ mod encode_worker_tests {
             pixels: vec![0x0011_2233],
         };
 
-        // Negative control: a stale marker exists and the text destination is a
-        // directory, forcing the second payload write to fail after PNG creation.
         std::fs::write(&done_path, b"stale\n").unwrap();
         std::fs::create_dir(&text_path).unwrap();
         let transaction = begin_snapshot_generation(&path).unwrap();
@@ -13566,7 +11411,6 @@ mod encode_worker_tests {
         let second_target = crate::control_auth::ConfinedImage::for_test(&root, "other.png");
         let second_path = second_target.display_path();
         let second_cancel = crate::control::CaptureCancellation::new();
-        // No wait: contention is the subject, not how long a capture queues.
         let busy = crate::control_auth::acquire_capture_name_lease_with_wait(
             &second_target,
             || second_cancel.is_cancelled(),
@@ -13903,9 +11747,6 @@ mod encode_worker_tests {
         assert!(model.fire("CommitOld", &mut state));
         assert!(model.check_invariant("CommittedPayloadIsCurrent", &state));
 
-        // Deterministic real interleaving: A owns generation 1, B begins and
-        // clears the fixed marker, then A reaches commit. A may have encoded its
-        // payload outside the fence, but it can never republish `.done`.
         let dir = unique_dir("snapshot-generation");
         ensure_private_dir(&dir).unwrap();
         let path = dir.join("snapshot.png");
@@ -13964,10 +11805,6 @@ mod encode_worker_tests {
         let transaction_a = begin_snapshot_generation(&path).unwrap();
         let transaction_b = begin_snapshot_generation(&path).unwrap();
 
-        // B owns the fence and has written both B payloads. At the hook, start
-        // stale A: it can encode, but must block before touching a shared path.
-        // B then publishes `.done` and releases; only afterward can A observe
-        // that it is stale and return without deleting/overwriting B.
         let (attempted_tx, attempted_rx) = std::sync::mpsc::channel();
         let (result_tx, result_rx) = std::sync::mpsc::channel();
         write_snapshot_artifacts_with_hook(
@@ -14021,7 +11858,6 @@ mod encode_worker_tests {
         assert_eq!(&rgba[..info.buffer_size()], &[0x11, 0x22, 0x33, 0x80]);
     }
 
-    /// A loss-free take of `frames` 1x1 frames.
     fn pixel_take(frames: u64) -> aterm_gpu::video_tap::VideoTake {
         aterm_gpu::video_tap::VideoTake {
             frames: (1..=frames)
@@ -14053,8 +11889,6 @@ mod encode_worker_tests {
         }
     }
 
-    /// Export `take` into `dir` as a swapchain-tap recording on this thread,
-    /// cancelled first when asked; returns the reply and the export's state.
     fn run_video_dump(
         dir: control_auth::ConfinedVideoDir,
         take: aterm_gpu::video_tap::VideoTake,
@@ -14101,8 +11935,6 @@ mod encode_worker_tests {
         ensure_private_dir(&root).unwrap();
         let dir = crate::control_auth::confine_video_dir(&root).expect("server-minted video dir");
         let dir_path = dir.path().to_path_buf();
-        // A directory at the first frame's filename makes the confined file open
-        // fail on every platform without relying on permissions or symlink support.
         std::fs::create_dir(dir_path.join("frame_0001.png")).unwrap();
         let (rx, _export) = run_video_dump(dir, pixel_take(1), false, 0);
         let error = rx.recv().expect("failure reply");
@@ -14118,10 +11950,6 @@ mod encode_worker_tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
-    /// A frame seal is metadata, not a retained file descriptor. Exercise the
-    /// complete worker/publication/reply path below a limit that cannot hold one
-    /// descriptor per frame. The limit changes only in an exact-test child so
-    /// parallel libtest workers never inherit the process-wide mutation.
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn video_export_frame_seals_keep_file_descriptors_bounded() {
@@ -14129,7 +11957,6 @@ mod encode_worker_tests {
             return;
         }
 
-        // Shallow: confinement walks the root a component at a time under 16 descriptors.
         let root = crate::test_scratch::short_dir("the video root");
         ensure_private_dir(root.path()).unwrap();
         let dir =
@@ -14264,7 +12091,6 @@ mod encode_worker_tests {
         assert!(wire.contains(&format!("seq{}", retained.snapshot_seq)));
     }
 
-    /// The `--meta` of one `image --bytes` of the front window.
     fn image_metadata_now(
         app: &mut App,
         dir: &std::path::Path,
@@ -14288,14 +12114,6 @@ mod encode_worker_tests {
         metadata.get().cloned().expect("frame metadata is bound")
     }
 
-    /// A NATIVE FRAME'S RASTERS ARE HASHED ONCE PER RASTER PASS. Two `image
-    /// --meta` captures of an unchanged Settings tab publish the same leaf and
-    /// card `raster-fingerprint`s, and both are the hashes the first capture
-    /// stored on the leaf raster and the card. A regional raster pass patches
-    /// the leaf's pixels in place and takes its stored hash, so the next
-    /// capture hashes the patched pixels. NEGATIVE CONTROL: the stored hash is
-    /// gone after the pass; one left in place would answer for pixels that are
-    /// no longer the raster's.
     #[test]
     fn native_raster_fingerprints_are_hashed_once_per_raster_pass() {
         let dir = unique_dir("native-raster-fingerprint-once");
@@ -14500,9 +12318,6 @@ mod encode_worker_tests {
         };
 
         let before = capture(&mut app);
-        // Colours alone move, on the terminal theme and on the installed
-        // resolution the page palette is read from
-        // (`App::native_page_palette_theme`).
         app.theme.bg ^= 0x0008_1018;
         app.theme.fg ^= 0x0010_0804;
         app.installed_colors
@@ -14652,10 +12467,6 @@ mod encode_worker_tests {
         );
     }
 
-    /// Selection custody: a mixed composite paints every terminal leaf's
-    /// selection, and the focused terminal leaf also stamps the scalar anchor.
-    /// Focusing the native pane leaves the terminal's highlight on screen with the
-    /// scalar fields neutral, because no terminal leaf is focused.
     #[test]
     fn mixed_composite_paints_every_terminal_selection_and_anchors_the_focused_one() {
         use aterm_core::selection::{SelectionSide, SelectionType};
@@ -14711,7 +12522,6 @@ mod encode_worker_tests {
                 w: u16::MAX,
                 h: u16::MAX,
                 color: 0x0042_84C6,
-                // Additive light (see `GlowQuad::alpha`).
                 alpha: 0,
                 color2: 0x0042_84C6,
                 alpha2: 0,
@@ -14789,9 +12599,6 @@ mod encode_worker_tests {
         let input = &app.windows[&wid].input_scratch;
         assert!(!input.selection.has_selection());
         assert_eq!(input.selection_clip, None);
-        // …but the terminal leaf's highlight is still painted. The scalar fields
-        // are the focused leaf's authority and the focused leaf is native, so
-        // they stay neutral; the per-pane list carries the live selection.
         assert_eq!(input.selections[0].bg, 0x0021_4365);
         assert!(
             input.selection_contains_cell(row + 1, col + pane_cols - 1, false, false),
@@ -14993,12 +12800,6 @@ mod encode_worker_tests {
         );
     }
 
-    /// Reply shape: the `video` OK line may grow tokens, but only before the path,
-    /// which is always the last whitespace token (the invariant clients rely on).
-    /// `dropped=` is the total loss (ring skips + evictions), `head_truncated=` iff
-    /// any frame was evicted, and index.json carries the split + the
-    /// requested/covered window.
-    /// Each frames[] row carries its frame's content hash and changed tiles.
     #[test]
     fn video_dump_reply_keeps_path_last_and_reports_honest_coverage() {
         let root = unique_dir("video-dump");
@@ -15012,8 +12813,6 @@ mod encode_worker_tests {
             h: 2,
             rgba,
         };
-        // The second frame differs in one green byte, which the strided byte
-        // sum `fp` used to be never sampled.
         let mut lit = vec![0u8; 16];
         lit[5] = 1;
         let frames = [frame(4, 1_000, vec![0u8; 16]), frame(5, 2_000, lit)];
@@ -15089,20 +12888,10 @@ mod encode_worker_tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// A real headless `image` capture advances the same feline overlay path as
-    /// application-present: terminal row scan, focused phase start, bounded cat
-    /// bake, free-atlas publication and collection observation — under the ambient
-    /// provenance law: the scanned word still peeks and collects, but never
-    /// activates or re-dresses the cursor companion, and no discovery hello starts
-    /// from a capture.
     #[test]
     fn headless_capture_emits_and_collects_an_eligible_cat() {
         let mut app = App::headless_for_test();
         let wid = crate::WindowId(0);
-        // This test isolates ambient word-cat provenance. The resident cursor
-        // companion is independently covered above and legitimately uses the
-        // over-text free-sprite tier, so disable its owner here rather than
-        // confusing it with a forbidden discovery hello.
         app.config.cursor_trail = Some(false);
         let t0 = Instant::now();
         {
@@ -15112,20 +12901,12 @@ mod encode_worker_tests {
                 .term
                 .clone();
             let ws = app.windows.get_mut(&wid).expect("window 0");
-            // The live `Wake::Output` arm records this before a headless image
-            // can run; direct Terminal injection in this test models that edge.
             ws.pending_deco_birth = Some(t0);
             let mut term = crate::term_lock(&terminal);
             term.process(b"\r\n\r\n\r\nhello kitty friend");
-            // `render_image` performs this extraction immediately before the
-            // splice; keep the regression's framebuffer path equally literal.
             term.cell_frame_into(&mut ws.input_scratch, ws.rows as usize, ws.cols as usize);
         }
 
-        // A control client is allowed to inspect long after the output wake.
-        // No output-driven frame existed in between, so the first requested
-        // image must still present a fully-risen cat instead of aging the
-        // never-seen one-shot straight through Done.
         let first_capture = t0 + Duration::from_secs(15);
         app.capture_words(wid, first_capture);
 
@@ -15149,8 +12930,6 @@ mod encode_worker_tests {
                 .any(|item| item.count > 0),
             "the same visible sprite must be observed as a collectible"
         );
-        // The ambient half of the law: the collection grew, the companion did
-        // not — a scanned word is output text, not a keystroke.
         assert_eq!(
             app.kitty_log.favourite_look(),
             None,
@@ -15161,8 +12940,6 @@ mod encode_worker_tests {
             "and no discovery hello starts from a capture"
         );
 
-        // A second requested windowless capture, long after any hold: still no
-        // cursor companion over the text — the hello is the typed path's alone.
         app.capture_words(wid, first_capture + Duration::from_secs(30));
         assert!(
             app.windows[&wid]
@@ -15178,8 +12955,6 @@ mod encode_worker_tests {
             "a no-damage capture continues the episode without recollecting it"
         );
 
-        // A later no-damage capture advances the original one-shot; it does
-        // not synthesize another preview, replay the word cat, or recollect it.
         app.capture_words(wid, first_capture + Duration::from_secs(40));
         assert!(
             app.windows[&wid]
@@ -15192,14 +12967,6 @@ mod encode_worker_tests {
         assert_eq!(app.kitty_log.log().sightings, 1);
     }
 
-    /// A capture is a renderer and honours the same tab scope. `WordDecorations` is
-    /// per window and a tab switch retires nothing, so a capture that does not
-    /// declare the session it draws inherits the previous tab's scan; two tabs'
-    /// independent damage epochs can read equal, and then a skipped rescan
-    /// re-emits the previous tab's words over the new tab's text. Hence the witness
-    /// is a cat at a named column, not "some cat is present". Each tab carries a
-    /// feline word of its own at a different column, so both directions of the
-    /// check have something to find.
     #[test]
     fn a_capture_of_another_tab_carries_only_that_tabs_words() {
         let mut app = App::headless_for_test();
@@ -15225,8 +12992,6 @@ mod encode_worker_tests {
             cell_h > 0 && cell_w > 0,
             "PRECONDITION: the fixture has real cell metrics"
         );
-        // A peeking cat's dest rect starts near its word's first cell, so one
-        // cell of tolerance is generous.
         let cat_at_col = |app: &App, col: u16| {
             app.windows[&wid]
                 .input_scratch
@@ -15234,19 +12999,12 @@ mod encode_worker_tests {
                 .iter()
                 .any(|s| (s.x - i32::from(col) * cell_w).abs() <= cell_w)
         };
-        // Where tab A's ambient cat stands: `kitty` begins at column 6 of
-        // "hello kitty friend". Pinned as a precondition so the negative it
-        // anchors further down (tab A's cat is not in tab B's image) cannot
-        // pass merely because the column test never matches anything.
         let first_word_col: u16 = 6;
         assert!(
             cat_at_col(&app, first_word_col),
             "PRECONDITION: tab A's own cat really stands at its own word"
         );
 
-        // A second tab, made front as ⌘T does, with a feline word of its own (so
-        // its capture cannot be silent for an unrelated reason) at a column tab
-        // A's word does not occupy.
         let session_b = app.next_session_id;
         app.push_stub_tab(wid, crate::stub_session(session_b));
         assert_eq!(
@@ -15276,7 +13034,6 @@ mod encode_worker_tests {
              capture is of tab B's grid, where that column is blank"
         );
 
-        // Back to tab A: a scope, not a deletion.
         app.switch_tab_in(wid, 0);
         {
             let ws = app.windows.get_mut(&wid).expect("window 0");
@@ -15294,8 +13051,6 @@ mod encode_worker_tests {
         );
     }
 
-    /// Capture is silent, but it must not discard the cursor companion's
-    /// visual curse reaction while draining the shared cue queue.
     #[test]
     fn headless_capture_preserves_complete_curse_wince_for_next_frame() {
         let mut app = App::headless_for_test();
@@ -15317,10 +13072,6 @@ mod encode_worker_tests {
                 .cursor_cat
                 .set_collection_presentable(t0, false);
             ws.pending_deco_birth = Some(t0);
-            // The curse is typed: the engine's typed witness is the caret's
-            // completion position and a committed key (a passive output line
-            // parks the caret one past a curse just as readily). Without this
-            // the fixture stages output, which correctly never winces.
             ws.fx.decos_mut().note_typed_edit(t0, None);
             let mut term = crate::term_lock(&terminal);
             term.process(b"fuck");
@@ -15349,11 +13100,6 @@ mod encode_worker_tests {
         );
     }
 
-    /// A capture snapshots the terminal before it enters the decoration
-    /// splice. PTY output can arrive between those lock scopes while the
-    /// existing damage epoch is already latched, so an epoch comparison alone
-    /// cannot reveal the stale cells. The splice must re-extract and rescan one
-    /// coherent snapshot or the new word and its collectible are lost.
     #[test]
     fn capture_rescan_refreshes_cells_after_snapshot_race() {
         let mut app = App::headless_for_test();
@@ -15370,9 +13116,6 @@ mod encode_worker_tests {
             term.process(b"ordinary text");
             term.cell_frame_into(&mut ws.input_scratch, ws.rows as usize, ws.cols as usize);
 
-            // Model output arriving after `render_image` dropped this lock.
-            // Keep the prior damage session outstanding deliberately: the
-            // damage epoch may remain equal even though the content changed.
             ws.pending_deco_birth = Some(now);
             term.process(b"\r\n\r\n\r\nhello kitty friend");
         }
@@ -15437,9 +13180,6 @@ mod encode_worker_tests {
         );
     }
 
-    /// A capture during a `perf_reduced` freeze freezes the engine (never
-    /// `reset()`s it) and skips the rescan/tick, so recovery resumes every episode
-    /// where it paused instead of grace-expiring them.
     #[test]
     fn capture_during_freeze_preserves_and_resumes_episodes() {
         let mut app = App::headless_for_test();
@@ -15475,8 +13215,6 @@ mod encode_worker_tests {
                 .cursor_cat
                 .set_collection_presentable(t0, false);
         }
-        // Load-shed latch: freeze the ambient engine and clear its channels,
-        // while retaining the full resident — off the frame train.
         app.perf_reduced = true;
         app.capture_words(wid, t0 + Duration::from_millis(100));
         {
@@ -15493,9 +13231,6 @@ mod encode_worker_tests {
                 "a suppressed capture keeps the collection hello paused"
             );
         }
-        // 20 s of suspension (> the 10 s grace TTL) with new output landing
-        // mid-freeze: the frozen capture must neither rescan nor tick, so no
-        // episode grace-expires against the suspended clock.
         {
             let terminal = app
                 .front_terminal(wid)
@@ -15521,9 +13256,6 @@ mod encode_worker_tests {
             None,
             "twenty seconds of suppressed captures consume no hello time"
         );
-        // Recovery: the capture thaws (shifting every stored clock by the freeze
-        // duration), so the episode resumes ~100 ms into its window rather than
-        // having completed during the 20 s freeze.
         app.perf_reduced = false;
         let t1 = t0 + Duration::from_secs(20) + Duration::from_millis(50);
         app.capture_words(wid, t1);
@@ -15567,8 +13299,6 @@ mod encode_worker_tests {
             app.windows[&wid].fx.companion().brain().is_active(),
             "load shedding keeps the resident without revoking ownership"
         );
-        // The shed takes the resident's frame train, never its motion: the
-        // capture ticked it at full motion, so it still names its next step.
         assert!(
             app.windows[&wid]
                 .fx
@@ -15601,9 +13331,6 @@ mod encode_worker_tests {
         );
     }
 
-    /// A dead client (dropped reply receiver) must not panic the worker or wedge
-    /// later jobs: the write still lands, the failed send is ignored, and a
-    /// subsequent job on the same worker still replies.
     #[test]
     fn encode_worker_survives_dropped_reply_receiver() {
         let dir = std::env::temp_dir().join(format!("aterm-encode-dead-{}", std::process::id()));
@@ -15651,8 +13378,6 @@ mod encode_worker_tests {
             .expect("file reply carries exact handles")
             .prepare_write()
             .expect("live reply validates at the wire edge");
-        // A dropped receiver never observes OK, so its unpublished exact file is
-        // removed when the guard cannot cross into the control writer.
         assert!(!dir.join("dead.png").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -15697,17 +13422,6 @@ mod encode_worker_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// THE NEEDS BORDER'S IMAGES (owner surfaces §5), through the SACRED
-    /// `image` path: for each border — stuck, decide, and the person's yours
-    /// outline — the captured PNG is the quiet baseline with exactly the
-    /// border's [`OverlayGlow`] applied by `apply_overlay_at` (the one CPU
-    /// compositor the present, the capture and the GPU blit's `DropOverlay`
-    /// twin all resolve to; the blit maps the same four fields verbatim).
-    /// Steady: no border washes the body, the stuck and decide borders share
-    /// the plain inset and differ in hue, and the yours outline is thinner
-    /// than both. A border gone out leaves the quiet baseline byte for byte.
-    /// Nothing moves with the clock, so the frame is the same image under
-    /// reduced motion.
     #[test]
     fn needs_borders_reach_the_sacred_image_path_steady() {
         use crate::presence::Rim;
@@ -15767,8 +13481,6 @@ mod encode_worker_tests {
         assert_ne!(glow("stuck").2.accent, glow("decide").2.accent);
         assert_ne!(glow("decide").2.accent, glow("yours").2.accent);
 
-        // Quiet again: the border went out, and presence draws nothing, so
-        // the capture is the quiet baseline byte for byte.
         set_rim(&mut app, Rim::None);
         assert_eq!(app.host_visual_state(wid, Instant::now()).overlay, None);
         assert_eq!(
@@ -15777,8 +13489,6 @@ mod encode_worker_tests {
             "quiet again: the baseline"
         );
 
-        // Reduced motion (`motion = "reduced"`): nothing on the border moves
-        // with the clock, so the frame is the same image.
         set_rim(&mut app, Rim::Decide);
         app.config.motion = Some("reduced".to_string());
         let again = visual_capture_pixels(&mut app, None);
@@ -15843,8 +13553,6 @@ mod window_render_context_capture_tests {
             None,
             tx,
         ));
-        // This test checks render-context rebinding, not capture latency: a
-        // hang detector, not a latency budget (`WORKER_PATIENCE`).
         let mut retained = rx
             .recv_timeout(crate::app_introspect::WORKER_PATIENCE)
             .expect("image worker reply")
@@ -15895,7 +13603,6 @@ mod window_render_context_capture_tests {
             window.focused = true;
         }
 
-        // Poison all shared channels with B before capturing A.
         app.font_px = second_metrics.font_px;
         app.backend.activate_px(second_metrics.font_px);
         app.backend.set_pad(second_metrics.pad);
@@ -15956,8 +13663,6 @@ mod headless_cursor_fx_tests {
     use crate::{App, WindowId, control_auth, term_lock};
     use std::time::{Duration, Instant};
 
-    /// A focused pet-mode window (`rainbow kitty pet`, word sparkles off) at
-    /// `motion`, split into two panes when asked.
     fn pet_app(motion: &str, split: bool) -> (App, WindowId) {
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
@@ -15973,7 +13678,6 @@ mod headless_cursor_fx_tests {
         (app, wid)
     }
 
-    /// Drive the production `image` path for the front window, bytes only.
     fn render_front_image(app: &mut App) {
         let (tx, rx) = std::sync::mpsc::channel();
         let target = control_auth::ConfinedImage::in_memory();
@@ -16048,10 +13752,6 @@ mod headless_cursor_fx_tests {
         assert_eq!(riff_bar, None);
     }
 
-    /// A held selection is the oracle that the capture OBSERVES the console it
-    /// ticks the pet against (it once never called `observe_console`, so every
-    /// console verdict read "nothing here"): reading interest follows the
-    /// selection in one pane and in a split, even scrolled into history.
     #[test]
     fn single_and_split_capture_retain_the_pet_watching_selected_history() {
         use aterm_core::selection::{SelectionSide, SelectionType};
@@ -16070,8 +13770,6 @@ mod headless_cursor_fx_tests {
                     terminal.process(b"line\r\n");
                 }
             }
-            // Establish the resident from a genuine live caret before the
-            // viewport moves into history. No input or caret is fabricated.
             app.capture_words(wid, start);
             assert!(app.windows[&wid].fx.companion().brain().is_active());
             term_lock(&term).scroll_display(10);
@@ -16128,9 +13826,6 @@ mod headless_cursor_fx_tests {
         }
     }
 
-    /// Only shipping extraction and capture ticks establish ownership: the
-    /// resident keeps its console home while DECTCEM hides the caret, and a real
-    /// reset clears it.
     #[test]
     fn headless_capture_retains_hidden_caret_home_and_clears_real_reset() {
         use aterm_core::terminal::{ContentScrollDelta, ContentScrollState};
@@ -16146,9 +13841,6 @@ mod headless_cursor_fx_tests {
                 terminal.process(b"\x1b[6;12H");
                 terminal.grid().rows()
             };
-            // The resident arrives with its own fade-in (paid at most 0.1 s
-            // a tick); let it land before its home is measured — a load
-            // shed no longer snaps it opaque.
             for ago in (1..=6).rev() {
                 app.capture_words(wid, start - Duration::from_millis(ago * 100));
             }
@@ -16156,8 +13848,6 @@ mod headless_cursor_fx_tests {
             let (cw, ch) = app.win_cell_size(wid);
             let full_body = |app: &App| {
                 let ws = &app.windows[&wid];
-                // The resident's BODY: a load shed no longer stills the
-                // cat, so its mote lane (a z, a note) may ride beside it.
                 let bodies: Vec<_> = ws
                     .input_scratch
                     .free_sprites
@@ -16169,9 +13859,6 @@ mod headless_cursor_fx_tests {
                 assert_eq!(body.alpha, 255, "split={split}");
                 let (ox, oy, _, _, _) =
                     app.effects_origin_win(wid, usize::from(ws.rows), usize::from(ws.cols), ch);
-                // The emitted split sprite already includes its pane
-                // offset. The published hit rectangle adds the same grid
-                // origin as the rasterizer's padding/chrome placement.
                 let x = body.x + i32::from(ox);
                 let y = body.y + i32::from(oy);
                 assert_eq!(
@@ -16182,11 +13869,6 @@ mod headless_cursor_fx_tests {
                 (body.x, body.y, body.w, body.h)
             };
             let home = full_body(&app);
-            // Where the body STANDS — its centre column and its baseline.
-            // A settled resident breathes (the swell squashes the sprite
-            // about its feet), and neither a load shed nor the hidden
-            // caret's repaint hold freezes that, so the scaled rect can
-            // differ by a pixel while the cat has not moved.
             let feet =
                 |(x, y, w, h): (i32, i32, u16, u16)| (x + i32::from(w) / 2, y + i32::from(h));
             let input_seq = app.windows[&wid].fx.companion().brain().console_input_seq();
@@ -16219,9 +13901,6 @@ mod headless_cursor_fx_tests {
                     input_seq
                 );
             }
-            // Reset AFTER the authorized extraction, in the former lock
-            // gap. This capture still owns its old cells and scroll facts;
-            // re-locking for PetWorld would mix two terminal episodes.
             let captured_at = start + Duration::from_millis(2016);
             let capture = app
                 .prepare_terminal_capture_grid_with_cursor_fx_interleaved(
@@ -16243,12 +13922,6 @@ mod headless_cursor_fx_tests {
                 "capture must consume only its owned snapshot"
             );
 
-            // The NEXT extraction sees the real unknown/reset motion: a
-            // hidden caret cannot retain ownership across that boundary. The
-            // capture reads the caret as the glass does (hidden, it is still
-            // the caret: the reset's, at the home cell), so the resident
-            // stands at that caret's home, as presented glass puts it, and
-            // never at the former one.
             for step in 0..20 {
                 app.capture_words(wid, start + Duration::from_millis(2100 + step * 100));
             }
@@ -16262,15 +13935,11 @@ mod headless_cursor_fx_tests {
                 input_seq
             );
 
-            // Fresh visible bodies make both denial controls non-vacuous.
-            // Hiding the surface or removing its owner must immediately
-            // clear publication even if the old brain still has alpha.
             term_lock(&term).process(b"\x1b[?25h\x1b[6;12H");
             for (control, owner_removed) in [false, true].into_iter().enumerate() {
                 app.windows.get_mut(&wid).unwrap().focused = true;
                 app.config.cursor_trail = Some(true);
                 let now = start + Duration::from_millis(5000 + control as u64 * 1000);
-                // The fresh body fades in (0.1 s of it a tick): let it land.
                 for ago in (0..=6).rev() {
                     app.capture_words(wid, now - Duration::from_millis(ago * 100));
                 }
@@ -16308,13 +13977,9 @@ mod headless_cursor_fx_tests {
                 app.effective_shed_envelope(app.config.motion_mode(), now),
                 0.0
             );
-            // The real native composed path runs without a platform window.
-            // Its zero-envelope result must agree with the capture route.
             if split {
                 let ws = &app.windows[&wid];
                 let (rows, cols) = (usize::from(ws.rows), usize::from(ws.cols));
-                // Under load the resident arrives at its ordinary motion (the
-                // shed never snaps it), presented at its coarse offers.
                 let mut at = now;
                 for _ in 0..60 {
                     assert!(
@@ -16365,9 +14030,6 @@ mod headless_cursor_fx_tests {
                 1,
                 "no head or animated attachment under load"
             );
-            // The split's chrome (an unfocused pane's hollow cursor, the
-            // scrollbar: `crate::pane_chrome`) rides the nova stream too, and is
-            // not a decoration.
             assert!(
                 ws.input_scratch.word_decorations.is_empty()
                     && ws.input_scratch.ink.is_empty()
@@ -16394,17 +14056,10 @@ mod headless_cursor_fx_tests {
 
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
-        // The companion this measures is the trail's; ask for its master explicitly so
-        // the reduced-motion singing law is proved on Windows too, where the absent-key
-        // default is off.
         app.config.cursor_trail = Some(true);
         app.config.motion = Some("reduced".into());
         app.recompute_sparkle();
         app.sparkle = None;
-        // Future-anchored: `render_image` samples its own `Instant::now()`, and
-        // a stall past the singer's 250 ms finger-lift would release the key
-        // before the capture looked. Every reader measures with
-        // `saturating_duration_since`, so stamps 60 s ahead read as mid-hold.
         let now = Instant::now() + Duration::from_secs(60);
         {
             let ws = app.windows.get_mut(&wid).expect("headless window 0");
@@ -16473,9 +14128,6 @@ mod headless_cursor_fx_tests {
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
         app.config.cursor_trail = Some(true);
-        // The flying head's own spelling: `rainbow kitty` names the walking pet,
-        // and this fixture is about the earned classic flypast (it asserts the
-        // resident is inactive below).
         app.config.cursor_trail_style = Some("rainbow kitty flying".into());
         app.config.motion = Some("full".into());
         app.recompute_sparkle();
@@ -16528,10 +14180,6 @@ mod headless_cursor_fx_tests {
         app.sparkle = None;
         assert!(app.set_serious_mode(true));
 
-        // Model the adversarial event ordering: cosmetic input bookkeeping is
-        // source-agnostic and can run after the transition drain but before an
-        // explicit capture, which must not consume this live drive and resurrect
-        // the singing face.
         let now = Instant::now();
         let start = now - Duration::from_millis(u64::from(SING_ARM_REPEATS - 1) * 10);
         {
@@ -16566,8 +14214,6 @@ mod headless_cursor_fx_tests {
     fn alt_screen_word_suppression_keeps_the_independent_capture_pet() {
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
-        // The pet must be on for "the word switch cannot blank it" to mean anything, so
-        // the fixture asks for it instead of leaning on a platform-split default.
         app.config.cursor_trail = Some(true);
         app.config.sparkle_words = Some(crate::app_config::SparkleWordsConfig {
             enabled: Some(true),
@@ -16645,10 +14291,6 @@ mod headless_cursor_fx_tests {
         );
     }
 
-    /// A headless `image` capture ticks the fire live — a cursor move puts hot
-    /// quads into the capture's `cursor_glow_add` — and a much later capture with
-    /// no further motion composes them back to exactly empty (the engines'
-    /// idle-zero decay law, through the capture seam `render_image` drives).
     #[test]
     fn headless_capture_ticks_fire_live_then_decays_to_zero() {
         let mut app = App::headless_for_test();
@@ -16656,27 +14298,19 @@ mod headless_cursor_fx_tests {
         app.config.cursor_trail_style = Some("fire".into());
         let wid = WindowId(0);
         let t0 = Instant::now();
-        // Capture 1: primes the engine's last-seen cursor cell (no motion yet).
         let _ = app.prepare_terminal_capture_grid_with_cursor_fx(
             wid,
             crate::app_render::ComposedCursorFxClock::Advance(t0),
         );
-        // This headless fixture deliberately scripts the next cursor move. A
-        // timestamp alone is not authored-movement evidence; use the engines'
-        // explicit preview/test licence before changing the terminal cursor.
         {
             let ws = app.windows.get_mut(&wid).expect("headless window 0");
             ws.fx.cursor_mut().glow.note_synthetic_move(t0);
             ws.fx.cursor_mut().trail.note_synthetic_move(t0);
         }
-        // Advance the scripted cursor without minting a parser generation: a
-        // synthetic licence is for preview/test geometry, while parser output
-        // is admitted only through the separate exact-content proof path.
         {
             let terminal = app.front_terminal(wid).expect("front terminal");
             term_lock(&terminal.term).grid_mut().cursor_forward(1);
         }
-        // Capture 2, one frame later: the observed move must spawn live fire.
         let _ = app.prepare_terminal_capture_grid_with_cursor_fx(
             wid,
             crate::app_render::ComposedCursorFxClock::Advance(t0 + Duration::from_millis(16)),
@@ -16688,9 +14322,6 @@ mod headless_cursor_fx_tests {
                 "a headless capture right after a cursor move carries live fire quads"
             );
         }
-        // Capture 3, >30 s later with no further motion: every thermal
-        // integrator (heat/flare/coal/quench + spark TTLs + the crown window)
-        // has decayed and the capture composes zero quads again.
         let _ = app.prepare_terminal_capture_grid_with_cursor_fx(
             wid,
             crate::app_render::ComposedCursorFxClock::Advance(t0 + Duration::from_secs(31)),
@@ -16700,14 +14331,6 @@ mod headless_cursor_fx_tests {
             ws.input_scratch.cursor_glow_add.is_empty(),
             "31 s idle: the fire must decay to exactly zero quads in the capture"
         );
-        // v0.31 ("the cursor color starts green" → warm it): the fire block
-        // cursor rests as a WARM EMBER on the black-body ramp (solved to read
-        // on its page), never the theme's accent, so the forge fill settles to
-        // a constant ember (Some) — NOT None — at idle. The
-        // idle-zero law it must still honour is the ANIMATED fire (the quads
-        // above) decaying to nothing; the rest ember is a static, u8-quantized
-        // override that rides `cursor_fill_override` WITHOUT churning the fp
-        // (the fold is temp-gated), so the present still dedups at rest.
         let ember = ws
             .input_scratch
             .cursor_fill_override
@@ -16719,13 +14342,6 @@ mod headless_cursor_fx_tests {
         );
     }
 
-    /// A row the capture skipped is no row, not a blank one. The capture reads the
-    /// rows flanking the caret only while Rainbow Kitty's v2 owns the frame
-    /// (`capture_cursor_neighbor_rows`); on the tick that engages it, v2 does not
-    /// own it yet at the capture, so the buffers are cleared. The engine copies
-    /// what it is handed for the seam's content witnesses, so the capture hands its
-    /// own `false` rather than two blank rows a lifted-word witness would read as
-    /// fact. The windowed single-pane present is the same code (`redraw_window`).
     #[test]
     fn headless_capture_hands_no_neighbor_rows_before_rainbow_kitty_owns_the_frame() {
         let mut app = App::headless_for_test();
@@ -16874,7 +14490,6 @@ mod deferred_gpu_capture_tests {
                 ));
             }
         }
-        // Actual ownership order, including a head request that yields again.
         let head = queue.pop_front().unwrap();
         assert_eq!(head.surface, 1);
         assert!(enqueue_deferred_gpu_capture(&mut queue, head, true).is_ok());
@@ -17007,8 +14622,6 @@ mod deferred_gpu_capture_tests {
         queue.push_back(follower);
         for completed in 1..=crate::NATIVE_CAPTURE_PRESENT_ATTEMPT_LIMIT {
             assert!(model.fire("Demand", &mut state));
-            // Pending may carry a stale failure flag from earlier retry state;
-            // it still is not a completed attempt and must cost zero.
             let budget_before = original.budget;
             original.budget.record_attempt(true, false, true);
             assert_eq!(original.budget, budget_before);
@@ -17124,8 +14737,6 @@ mod deferred_gpu_capture_tests {
         assert!(receiver.recv().unwrap().is_err());
         assert!(app.windows[&WindowId(0)].capture_acquire_armed);
         assert!(app.windows[&WindowId(0)].capture_client_requested);
-        // A stale owning continuation also cannot release a replacement's
-        // tap. This fixture has no GPU target, so the queued identity is stale.
         let (mut owner, receiver, cancellation) = capture(17);
         owner.exact_tap = true;
         assert!(cancellation.cancel());
@@ -17134,8 +14745,6 @@ mod deferred_gpu_capture_tests {
         assert!(receiver.recv().unwrap().is_err());
         assert!(app.windows[&WindowId(0)].capture_acquire_armed);
         assert!(app.windows[&WindowId(0)].capture_client_requested);
-        // Positive control binds the real owner/identity guard to the real tap
-        // teardown without constructing an OS surface in a unit test.
         assert!(!super::deferred_capture_owns_current_tap(
             false,
             17,
@@ -17166,8 +14775,6 @@ mod headless_settings_preview_capture_tests {
 
     const WID: WindowId = WindowId(0);
 
-    /// The front window's `image`, its PNG bytes, with the instance's clock
-    /// `elapsed_ms` past its epoch at the capture.
     fn image_at(app: &mut App, elapsed_ms: u64) -> Vec<u8> {
         let now = app.lat_epoch + Duration::from_millis(elapsed_ms);
         crate::app_native::with_native_preview_instant_for_test(now, || {
@@ -17183,7 +14790,6 @@ mod headless_settings_preview_capture_tests {
         })
     }
 
-    /// The Settings preview the last staged frame painted.
     fn drawn_preview(app: &App) -> SettingsPreviewSpec {
         let (_, view) = app.active_native_view(WID).expect("the Settings view");
         app.windows[&WID].leaf_render_cache[&view]
@@ -17200,21 +14806,8 @@ mod headless_settings_preview_capture_tests {
             .expect("the page paints its cursor preview")
     }
 
-    /// A HEADLESS CAPTURE SAMPLES A LIVE SETTINGS PREVIEW AT ITS OWN INSTANT.
-    /// A headless window has no glass, so its park never ticks a Settings
-    /// preview (`native_preview_may_tick`: nothing would see the frames), and
-    /// an `image` staged the page from the retained raster: every capture of
-    /// a cursor page showed the frame the page's last change compiled, still
-    /// for seconds while its header read "Live trail" and motion was full
-    /// (the lab probe of 2026-10-22). A capture is that window's one watcher,
-    /// so the looping preview it encodes is the one a focused window's tick
-    /// leaves at the capture instant. NEGATIVE CONTROLS: the park still never
-    /// ticks the unwatched headless preview, and a preview with nothing to
-    /// play (the window unfocused, so motion is reduced) is not recompiled by
-    /// a capture: two captures of it are the same frame.
     #[test]
     fn a_headless_capture_samples_a_live_settings_preview_at_its_instant() {
-        // The specimen's terminal draws in the settled chrome face.
         let mut renderer = aterm_render::Renderer::from_bytes(
             aterm_render::embedded_font(),
             14.0,
@@ -17226,7 +14819,6 @@ mod headless_settings_preview_capture_tests {
         let mut app = App::headless_for_test();
         app.lat_epoch = Instant::now();
         {
-            // A window tall enough that the card shows its specimen's rows.
             let window = app.windows.get_mut(&WID).unwrap();
             window.focused = true;
             window.rows = 50;
@@ -17253,8 +14845,6 @@ mod headless_settings_preview_capture_tests {
         assert_eq!((early.phase_ms, late.phase_ms), (420, 980));
         assert_ne!(early_png, late_png, "the preview moved between captures");
 
-        // NEGATIVE CONTROL: an unfocused window's preview is still (motion
-        // reduced), so a capture finds nothing to sample.
         app.windows.get_mut(&WID).unwrap().focused = false;
         let still_png = image_at(&mut app, 1_400);
         let still = drawn_preview(&app);

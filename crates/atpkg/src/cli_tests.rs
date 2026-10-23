@@ -1,6 +1,5 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
-
 #[path = "vendor_plan_effects_tests.rs"]
 mod vendor_plan_effects;
 
@@ -56,13 +55,6 @@ fn conditional_link_options_are_parsed_without_becoming_bin_paths() {
     assert_eq!(plain.wait_lock, Some(std::time::Duration::from_secs(60)));
 }
 
-/// Every fixture pass runs against an empty `PATH`: a pass consults `PATH` for a foreign
-/// copy ahead of ours (`reconcile_shadowed`) and for a system install that satisfies a
-/// program (`reconcile_system_satisfied_with`), so a fixture reading the developer's
-/// `PATH` would judge a temp prefix against the real machine. Empty, not the real one
-/// filtered: only that can never acquire a foreign binary later. A pass that exercises
-/// shadowing calls [`super::install_default_set_with_path`] with its own `PATH`. The
-/// consent shapes only the wire lane's announcement, which `net_announcement`'s tests pin.
 fn install_default_set(
     layout: &crate::store::Layout,
     fetcher: &dyn crate::flow::Fetcher,
@@ -85,11 +77,6 @@ fn install_default_set(
     )
 }
 
-/// The `--wait-lock <secs>` edge grammar: stripped for the three provisioning verbs
-/// wherever it sits, the last parsable value wins, and an unparsable value or a bare flag
-/// at the end of argv is consumed and means "no wait", never a program name. (A valueless
-/// flag mid-argv eats the next token; no spawner produces that shape, see
-/// `take_wait_lock_flag`.)
 #[test]
 fn wait_lock_flag_is_stripped_at_the_edge_and_degrades_to_no_wait() {
     let argv = |parts: &[&str]| parts.iter().map(ToString::to_string).collect::<Vec<_>>();
@@ -137,10 +124,6 @@ fn published_index_hint_is_a_stripped_scheduling_witness_only() {
     }
 }
 
-/// What a discovery may guess the channel publishes: a store that verified nothing takes
-/// the highest build its cache holds, its release cut compiled in, or the window's probe
-/// saw, and where the run starts from the cut; a store with a floor takes only the probe's
-/// build, and never reads its cache for this.
 #[test]
 fn a_discovery_guesses_from_every_build_seen_published() {
     use crate::net::IndexHint;
@@ -161,10 +144,6 @@ fn a_discovery_guesses_from_every_build_seen_published() {
     assert_eq!(discovery_hint(72, unread, cut, Some(73)), hint(None, 73));
 }
 
-/// The package log's lanes, read off how the pass was spawned: the head watch's flag, the
-/// session's detached spawner, the window's queue-and-report flags, the intercept's queue
-/// without a progress file, else typed. And the exit code an `ExitCode` carries comes back
-/// out of it.
 #[test]
 fn a_pass_names_its_lane_from_how_it_was_spawned() {
     let lane = |hw, wait, progress, detached, verb, operand| {
@@ -206,10 +185,6 @@ fn a_pass_names_its_lane_from_how_it_was_spawned() {
     );
 }
 
-/// A pass-end quotes only the outcome this pass wrote: a row written keeping the outcome
-/// (the head-watch door's `update codex` whose vendor was not reached) moves `updated_at`
-/// but carries an earlier pass's sentence, which is not this pass's. The same sentence
-/// written again is quoted; a pass that wrote none says none.
 #[cfg(unix)]
 #[test]
 fn a_pass_end_quotes_the_outcome_this_pass_wrote_and_no_other() {
@@ -256,8 +231,6 @@ fn a_pass_end_quotes_the_outcome_this_pass_wrote_and_no_other() {
     );
     assert_eq!(pass.outcome(), "codex 0.157.0 refused: digest mismatch");
 
-    // The same sentence written again is this pass's too (the record stamped earlier,
-    // so the write is seen to land).
     let mut earlier = crate::status::read(&layout).unwrap();
     earlier.updated_at = "2026-09-21T00:00:00Z".into();
     crate::status::write(&layout, &earlier).unwrap();
@@ -267,9 +240,6 @@ fn a_pass_end_quotes_the_outcome_this_pass_wrote_and_no_other() {
     let _ = std::fs::remove_dir_all(&layout.prefix);
 }
 
-/// `--defer-busy-flip` is the unattended lanes' opt-in to hold the toolchain's flip for
-/// quiet: stripped at the edge wherever it sits, never an operand, and without it (a
-/// person's `aterm pkg update`) the policy is to flip at once.
 #[test]
 fn the_defer_busy_flip_flag_is_stripped_and_picks_the_policy() {
     let argv = |parts: &[&str]| parts.iter().map(ToString::to_string).collect::<Vec<_>>();
@@ -279,14 +249,9 @@ fn the_defer_busy_flip_flag_is_stripped_and_picks_the_policy() {
     let mut args = argv(&["update"]);
     assert!(!super::take_flag(&mut args, super::DEFER_BUSY_FLIP_FLAG));
     assert_eq!(args, argv(&["update"]), "absent: untouched");
-    // This test process never saw the flag: a person's pass.
     assert_eq!(super::flip_policy(), crate::quiet::FlipPolicy::Now);
 }
 
-/// A toolchain flip held for quiet is a state, never a failure: each member it would move
-/// gets a `deferred:` row naming the staged build, the live one and the latest it waits
-/// until, doctor counts none of it a problem, and the UpToDate arm lifts the row once the
-/// wait is over.
 #[test]
 fn a_held_toolchain_flip_writes_deferred_rows_and_counts_no_failure() {
     let layout = temp_layout("flip-deferred-rows");
@@ -350,10 +315,6 @@ fn a_held_toolchain_flip_writes_deferred_rows_and_counts_no_failure() {
     let _ = std::fs::remove_dir_all(&layout.prefix);
 }
 
-/// A group pinned mid-wait ends every member's `deferred:` row: the pin ends the held flip,
-/// and a sibling the flip would have moved, not pinned itself, stops saying its staged
-/// build installs when the toolchain is quiet and says whose pin holds it. A sibling whose
-/// row said something else keeps it.
 #[test]
 fn a_group_pinned_mid_wait_rewrites_its_siblings_deferred_rows() {
     let layout = temp_layout("flip-deferred-pinned");
@@ -375,7 +336,6 @@ fn a_group_pinned_mid_wait_rewrites_its_siblings_deferred_rows() {
         skipped_linked: Vec::new(),
         resolved_assets: std::collections::BTreeMap::new(),
     };
-    // The wait: trust and trust-ir move; trust-vc is already at its pin.
     assert!(crate::quiet::note_deferred(
         &layout,
         "rustc",
@@ -418,8 +378,6 @@ fn a_group_pinned_mid_wait_rewrites_its_siblings_deferred_rows() {
     assert!(rows("trust").starts_with(crate::state::FLIP_DEFERRED_PREFIX));
     assert!(rows("trust-ir").starts_with(crate::state::FLIP_DEFERRED_PREFIX));
     let vc_before = rows("trust-vc");
-    // The owner pins trust-ir mid-wait: the next pass holds the tuple by the pin — a
-    // hold, never a failure.
     assert_eq!(
         report_channel_apply(
             &layout,
@@ -448,9 +406,6 @@ fn a_group_pinned_mid_wait_rewrites_its_siblings_deferred_rows() {
     let _ = std::fs::remove_dir_all(&layout.prefix);
 }
 
-/// THE HOLDER VERB'S GRAMMAR: one directory and at most one `--who` before the first
-/// `--`, the command whole after it — its own `--` and flags included — and every
-/// other shape a usage refusal.
 #[test]
 fn the_lease_verb_parses_a_directory_a_name_and_a_whole_command() {
     let argv = |parts: &[&str]| parts.iter().map(ToString::to_string).collect::<Vec<_>>();
@@ -485,7 +440,6 @@ fn the_lease_verb_parses_a_directory_a_name_and_a_whole_command() {
     ] {
         assert!(parse_lease_args(&argv(bad)).is_err(), "{bad:?} is refused");
     }
-    // A blank name is no name: the command's own words name the run.
     let blank = parse_lease_args(&argv(&["d", "--who", " ", "--", "/bin/sh", "-c", "x"])).unwrap();
     assert_eq!(
         lease_who(&blank, 7, std::path::Path::new("/w")),
@@ -493,10 +447,6 @@ fn the_lease_verb_parses_a_directory_a_name_and_a_whole_command() {
     );
 }
 
-/// The holder holds for exactly the command's life: while the command runs the build it
-/// names is leased, by the run's own words, and once it has ended the lease is gone, with
-/// the command's status handed back whole. Each step waits on the command's own file,
-/// never on a clock.
 #[test]
 fn the_lease_verb_holds_the_build_while_its_command_runs() {
     let layout = temp_layout("lease-verb-held");
@@ -529,8 +479,6 @@ fn the_lease_verb_holds_the_build_while_its_command_runs() {
         );
         (run, said)
     });
-    // The command's own file: it is running (a backstop bound only — the file is the
-    // event).
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     while !started.exists() {
         assert!(
@@ -563,9 +511,6 @@ fn the_lease_verb_holds_the_build_while_its_command_runs() {
     let _ = std::fs::remove_dir_all(&layout.prefix);
 }
 
-/// A directory that is not there once the lease is laid runs nothing (a toolchain
-/// reclaimed after its caller resolved it), while one atpkg does not manage runs its
-/// command with nothing held, and says so.
 #[test]
 fn the_lease_verb_runs_nothing_on_a_missing_build_and_holds_nothing_outside_the_store() {
     let layout = temp_layout("lease-verb-missing");
@@ -592,8 +537,6 @@ fn the_lease_verb_runs_nothing_on_a_missing_build_and_holds_nothing_outside_the_
     assert!(said.is_empty(), "{said:?}");
     let outside = layout.prefix.join("elsewhere/bin");
     std::fs::create_dir_all(&outside).unwrap();
-    // Outside the prefix's `store/`, `compat/` and `rustup/`: a directory of the
-    // prefix's own that no subject names is not atpkg's to hold either.
     let run = lease_and_run(
         Some(&layout.prefix),
         &touch(outside),
@@ -603,7 +546,6 @@ fn the_lease_verb_runs_nothing_on_a_missing_build_and_holds_nothing_outside_the_
     );
     assert!(matches!(run, LeaseRun::Ran(s) if s.success()), "{run:?}");
     assert!(ran.exists(), "an unmanaged toolchain's command runs");
-    // Unmanaged and absent: a typo, not a reclaim — nothing runs, and it is told apart.
     std::fs::remove_file(&ran).unwrap();
     let nowhere = layout.prefix.join("elsewhere/nope");
     let run = lease_and_run(
@@ -621,18 +563,12 @@ fn the_lease_verb_runs_nothing_on_a_missing_build_and_holds_nothing_outside_the_
     let _ = std::fs::remove_dir_all(&layout.prefix);
 }
 
-/// The holder is transparent: the command it runs holds every descriptor its caller
-/// handed the holder (here an unflagged one above 99; in life a make jobserver's pipe or a
-/// `3>` redirect) on any std. A `std` child holds only its stdio under Trust's std, so the
-/// holder spawns through `aterm_uds::spawnfd::transparent`; its exit status still comes
-/// back whole.
 #[cfg(unix)]
 #[test]
 fn the_lease_verb_hands_its_command_every_descriptor_its_caller_gave_it() {
     use std::os::fd::{AsRawFd as _, FromRawFd as _};
     let null = std::fs::File::open("/dev/null").unwrap();
-    // SAFETY: F_DUPFD duplicates a descriptor this test owns onto the lowest free
-    // number from 100, close-on-exec clear; the new one is owned below.
+    // SAFETY: `F_DUPFD` duplicates a test-owned descriptor onto an unused fd >= 100.
     let fd = unsafe { libc::fcntl(null.as_raw_fd(), libc::F_DUPFD, 100) };
     assert!(fd >= 100, "F_DUPFD: {}", std::io::Error::last_os_error());
     // SAFETY: `fd` was just opened here and nothing else owns it.
@@ -643,12 +579,9 @@ fn the_lease_verb_hands_its_command_every_descriptor_its_caller_gave_it() {
         command: vec![
             "/bin/sh".into(),
             "-c".into(),
-            // Read from the shell's own table: a `[ -e /dev/fd/N ]` read the held number as
-            // absent on Darwin while anything else looked it up.
             aterm_spec::host::held_probe(fd),
         ],
     };
-    // No prefix: nothing is leased, and the command runs all the same.
     let run = lease_and_run(None, &args, "w", crate::lease::DEFAULT_WAIT, &mut |_| {});
     let LeaseRun::Ran(status) = run else {
         panic!("the command ran: {run:?}");
@@ -658,11 +591,6 @@ fn the_lease_verb_hands_its_command_every_descriptor_its_caller_gave_it() {
     drop(held);
 }
 
-/// "My window is gone" is a change of parent from the spawner the edge recorded, never
-/// "pid 1" on its own: the macOS orphan (launchd) and the Linux subreaper orphan (any
-/// other pid) both count; the spawner itself never does, even when it is init (a
-/// scheduler's job); a parent nobody can read (Windows) and a spawner nobody named never
-/// count, and wait out the bound instead.
 #[test]
 fn an_orphaned_waiter_is_one_whose_parent_changed_from_its_spawner() {
     assert!(
@@ -696,9 +624,6 @@ fn an_orphaned_waiter_is_one_whose_parent_changed_from_its_spawner() {
     assert_eq!(super::SPAWNER_PID_ENV, "ATPKG_SPAWNER_PID");
 }
 
-/// The spawner the edge records: the pid a window names, the parent otherwise, and nobody
-/// for a pass detached on purpose (the session's one-shot pass), whose waiter then never
-/// reads as orphaned when its detaching `sh` exits.
 #[test]
 fn a_detached_pass_names_no_spawner_and_waits_out_its_bound() {
     let parent = || Some(4242);
@@ -733,20 +658,14 @@ fn a_detached_pass_names_no_spawner_and_waits_out_its_bound() {
     );
 }
 
-/// A person's terminal gets no line for the window's records or for a fact a sentence
-/// beside it already says, a non-marker line passes through, and no marker leaks its
-/// raw prefix.
 #[test]
 fn a_marker_reads_as_a_sentence_on_a_terminal() {
     let said = |line: &str| human_marker(line);
-    // Universal Control's change has its own line beside the marker, with the revert.
     let alone = format!(
         "atpkg: {}",
         machine_settings_line(&[crate::machine::UNIVERSAL_CONTROL_ENTRY.to_string()])
     );
     assert_eq!(said(&alone), None);
-    // `seed-busy:` is silent: the sentence beside it (the intercept's epilogue, or the
-    // typed lane's timed-out sentence) already says it.
     for silent in [
         LOCK_ACQUIRED_MARKER,
         GROUP_ABORTED_MARKER,
@@ -763,8 +682,6 @@ fn a_marker_reads_as_a_sentence_on_a_terminal() {
         said("atpkg: not a marker").as_deref(),
         Some("atpkg: not a marker")
     );
-    // Every marker the ledger lists is a sentence — but `seed-busy:`, silent above — and
-    // none leaks its raw prefix.
     for (marker, _) in announcement::MARKERS {
         if *marker == SEED_BUSY_MARKER {
             continue;
@@ -782,20 +699,12 @@ fn a_marker_reads_as_a_sentence_on_a_terminal() {
 use super::*;
 use std::os::unix::fs::PermissionsExt;
 
-/// The `install` argv takes one operand: a second is a usage error before any store is
-/// touched (`install` parses its own argv, outside the one-operand gate).
 #[test]
 fn install_takes_one_operand() {
     let two = std::process::ExitCode::from(2);
     assert_eq!(cmd_install_argv(&["ay".to_string(), "ny".to_string()]), two);
 }
 
-/// `doctor --json` swallowed the flag and exited 0 with the human report (audit D-12),
-/// and `repair --dry-run` rewrote the shell wiring at exit 0 (2026-09-16). A verb whose
-/// row says [`Arity::None`] refuses ANY argument at the dispatch edge, before the store
-/// lock, naming the verb, the argument and the arity; the doctor takes `--verbose` and
-/// `--json` (its rows in the one schema, design §3.3), each once, and nothing else.
-/// `--help` still answers through the edge, and the bare forms run.
 #[test]
 fn zero_arity_verbs_refuse_arguments_instead_of_swallowing_them() {
     let none: Vec<&str> = TABLE
@@ -813,7 +722,6 @@ fn zero_arity_verbs_refuse_arguments_instead_of_swallowing_them() {
         );
         assert!(arity_refusal(&[], verb).is_none(), "bare `{verb}` proceeds");
     }
-    // `repair` takes `--json` (its rows in the one schema) once, and nothing else.
     let arg = |a: &[&str]| a.iter().map(ToString::to_string).collect::<Vec<_>>();
     for refused in [&["--dry-run"][..], &["--json", "--json"], &["--json", "x"]] {
         assert_eq!(
@@ -853,14 +761,8 @@ fn zero_arity_verbs_refuse_arguments_instead_of_swallowing_them() {
             Some((Everything, true))
         );
     }
-    // The process edge (a refused argument exits 2 before the store or the lock) is
-    // `tests/one_operand_verbs.rs`'s, over a scratch HOME.
 }
 
-/// The one-name gate leaves the multi-name grammars ([`Arity::Own`]) alone (`link
-/// <program> <checkout>`, `refresh a b`, `run <tool> <args…>`); its refusals are
-/// `tests/one_operand_verbs.rs`'s, through the real binary, and `update`'s `--retry` is
-/// counted out in `cli_held_row_tests`.
 #[test]
 fn the_one_operand_gate_never_refuses_a_multi_name_grammar() {
     let two = vec!["ta".to_string(), "tb".to_string()];
@@ -869,8 +771,6 @@ fn the_one_operand_gate_never_refuses_a_multi_name_grammar() {
     }
 }
 
-/// `help <x>` for an `x` that is not a verb fails (exit 2) rather than printing the
-/// roster at exit 0, which would read as the help for x.
 #[test]
 fn help_for_an_unknown_topic_is_a_usage_error_not_a_roster() {
     assert_eq!(
@@ -878,17 +778,13 @@ fn help_for_an_unknown_topic_is_a_usage_error_not_a_roster() {
         ExitCode::from(2),
         "an unknown topic must exit 2"
     );
-    // A real verb still answers, at 0.
     assert_eq!(
         cmd_verb_help("install"),
         ExitCode::SUCCESS,
         "`install` is a verb; its help is a success"
     );
-    // Every verb has a usage line by construction: it is a field of its table row.
 }
 
-/// The suggestion engine: a one-slip typo gets the fix, gibberish gets silence —
-/// a far-fetched guess erodes trust in the near ones.
 #[test]
 fn did_you_mean_suggests_and_gives_up() {
     assert_eq!(did_you_mean("instal"), Some("install"));
@@ -952,7 +848,6 @@ fn list_includes_programs_provisioned_only_through_development_links() {
     );
 }
 
-/// `list` with no resolvable prefix exits 1, like every sibling read verb.
 #[test]
 fn list_exit_codes() {
     assert_eq!(
@@ -962,8 +857,6 @@ fn list_exit_codes() {
     );
 }
 
-/// Uninstalling what is not there is a refusal: exit 1, and no removed-marker is minted.
-/// Partial-install debris (a store tree with no shims) still cleans.
 #[test]
 fn uninstall_not_installed_refuses() {
     let layout = temp_layout("uninstall-absent");
@@ -976,7 +869,6 @@ fn uninstall_not_installed_refuses() {
         !removed_programs(&layout).contains("ty"),
         "no removed-marker is minted for a program that was never here"
     );
-    // Partial debris: a store tree with no shims is still this verb's to clean.
     std::fs::create_dir_all(layout.build_dir("ty", 7)).unwrap();
     assert_eq!(
         format!("{:?}", uninstall_one(&layout, "ty")),
@@ -994,12 +886,6 @@ fn uninstall_not_installed_refuses() {
     let _ = std::fs::remove_dir_all(&layout.prefix);
 }
 
-/// `uninstall --all` reports only what it removed. The sweep walks the union of the live
-/// builds and every status row, and `ops::uninstall` returns Ok for a name with no store
-/// tree under the prefix, so a system copy, a row an older client wrote for an OS-level
-/// install, and a queued agent program must not count as removals
-/// (`docs/DESIGN-which-copy-runs-2026-08-27.md` §S11): "system copies are never
-/// touched and the output says so".
 #[test]
 fn uninstall_all_removes_only_what_aterm_installed() {
     let layout = temp_layout("uninstall-all-foreign");
@@ -1008,7 +894,6 @@ fn uninstall_all_removes_only_what_aterm_installed() {
     for (program, build, state) in [
         ("ay", Some(18), crate::state::managed(18, 41)),
         ("gh", None, gh.clone()),
-        // Retired spellings an older client wrote (design §5.3(b)/(c)).
         (
             "clt",
             None,
@@ -1075,7 +960,6 @@ fn uninstall_all_removes_only_what_aterm_installed() {
     let _ = std::fs::remove_dir_all(&layout.prefix);
 }
 
-/// A cause is one sentence: the first line, bounded, an ellipsis when cut.
 #[test]
 fn clip_cause_keeps_the_first_line_bounded() {
     assert_eq!(
@@ -1089,15 +973,11 @@ fn clip_cause_keeps_the_first_line_bounded() {
     assert!(clipped.ends_with('…'));
 }
 
-/// Only an agent program's stub passes through, and only to a foreign copy on PATH outside
-/// the managed prefix: `trust` never does, and `claude` with no other copy prints its
-/// state and stops.
 #[cfg(unix)]
 #[test]
 fn only_an_agent_program_with_a_foreign_copy_passes_through() {
     use std::os::unix::fs::PermissionsExt as _;
     let l = temp_layout("passthrough");
-    // Named for this process: the temp dir is shared with other runs of this suite.
     let foreign = l
         .prefix
         .parent()
@@ -1130,10 +1010,6 @@ fn only_an_agent_program_with_a_foreign_copy_passes_through() {
     let _ = std::fs::remove_dir_all(&l.prefix);
 }
 
-/// What `repair`'s rc pass will not touch: an rc linked into a read-only directory (a
-/// home-manager store's shape) is refused with its target untouched, and a `~/.aterm`
-/// that is a symlink touches no rc at all. (The opt-out, and `repair` laying the block
-/// back over it, are `hooks.rs`'s `a_deleted_rc_block_stays_deleted_and_repair_is_the_way_back`.)
 #[test]
 fn repair_refuses_a_read_only_rc_and_a_linked_aterm_dir() {
     use crate::hooks::{HookPass, RcOutcome, RcWiring};
@@ -1142,7 +1018,6 @@ fn repair_refuses_a_read_only_rc_and_a_linked_aterm_dir() {
     let zshrc = home.join(".zshrc");
     let mine = "export FOO=1\n";
 
-    // Non-root only: root can write a 0555 directory, so the refusal never happens.
     if crate::platform::our_uid() != 0 {
         let store = home.join("ro-store");
         std::fs::create_dir_all(&store).unwrap();
@@ -1155,7 +1030,6 @@ fn repair_refuses_a_read_only_rc_and_a_linked_aterm_dir() {
         assert_eq!(std::fs::read_to_string(store.join("zshrc")).unwrap(), mine);
     }
 
-    // ~/.aterm refused (a symlink): nothing touched.
     let refused = home.join("refused-home");
     std::fs::create_dir_all(refused.join("elsewhere")).unwrap();
     std::os::unix::fs::symlink(refused.join("elsewhere"), refused.join(".aterm")).unwrap();
@@ -1171,12 +1045,6 @@ fn repair_refuses_a_read_only_rc_and_a_linked_aterm_dir() {
     let _ = std::fs::remove_dir_all(&layout.prefix);
 }
 
-/// THE FIRST LAUNCH'S TWO `[machine]` APPLIES MEET ON ONE QUEUE. Before any pass has made
-/// the store's prefix, the window's (or a session's) launch apply and the launch seed's edge
-/// both start: the apply's queue makes the prefix ([`super::machine_apply_queue`]), and the
-/// edge, asking while it is held, finds it taken and leaves the table to that apply
-/// ([`super::MachineTurn::Busy`]); once it is let go the edge takes it. Negative control: a
-/// queue that answers "no prefix, no queue" leaves both to apply unqueued, side by side.
 #[test]
 fn the_first_launchs_machine_applies_meet_on_one_queue_before_any_prefix_exists() {
     let home = crate::testdir::dir("atpkg-machine-queue-");
@@ -1210,10 +1078,6 @@ fn temp_layout(label: &str) -> crate::testdir::ScratchLayout {
     crate::testdir::layout(&format!("atpkg-main-{label}-"))
 }
 
-/// A command nothing here runs is answered by the program that ships it: its recorded
-/// reason when no install changes it (no build for this target, a hold), else that
-/// program's install — never `aterm pkg install targo`, which install refuses, nor an
-/// install that answers "unavailable". A program asks of its own row.
 #[test]
 fn a_command_nothing_runs_is_answered_by_the_program_that_ships_it() {
     let unavailable = crate::state::unavailable("aarch64-unknown-linux-gnu", "");
@@ -1234,7 +1098,6 @@ fn a_command_nothing_runs_is_answered_by_the_program_that_ships_it() {
         not_installed_fix("ty")
     );
 
-    // Through the record: the program's row decides, the command's name has none.
     let layout = temp_layout("not-runnable");
     std::fs::create_dir_all(&layout.prefix).unwrap();
     assert_eq!(
@@ -1270,8 +1133,6 @@ fn a_command_nothing_runs_is_answered_by_the_program_that_ships_it() {
     let _ = std::fs::remove_dir_all(&layout.prefix);
 }
 
-/// A parsed index shaped by hand: `(name, system)` per program. No channels: the
-/// set-planning helpers under test read `[programs]` only.
 fn index_of(programs: &[(&str, Option<&str>)]) -> crate::manifest::Index {
     crate::manifest::Index {
         schema: 2,
@@ -1304,10 +1165,6 @@ fn names(v: &[&str]) -> std::collections::BTreeSet<String> {
     v.iter().map(|s| (*s).to_string()).collect()
 }
 
-// `which <program>` for a bundle whose build exposes no command of its own name (`trust`
-// → trustc/targo, `trust-mc` → trust-mc-driver) answers with the managed store dir and
-// the names it does put on PATH; a same-named unrelated binary on PATH (Homebrew's
-// p11-kit `trust`) is named as exactly that, after the truth, never as "the system copy".
 #[cfg(unix)]
 #[test]
 fn which_for_a_bundle_program_names_the_store_and_its_exposed_tools() {
@@ -1322,7 +1179,6 @@ fn which_for_a_bundle_program_names_the_store_and_its_exposed_tools() {
         )
         .unwrap();
     }
-    // Only the driver is exposed — the compiler is an internal, like the real pack.
     crate::activate::install_shims(
         &layout,
         &build,
@@ -1342,7 +1198,6 @@ fn which_for_a_bundle_program_names_the_store_and_its_exposed_tools() {
         },
         "up to date".into(),
     );
-    // A same-named unrelated binary on PATH (p11-kit's `trust`).
     let brew = layout.prefix.parent().unwrap().join(format!(
         "atpkg-main-which-bundle-brew-{}",
         std::process::id()
@@ -1367,10 +1222,8 @@ fn which_for_a_bundle_program_names_the_store_and_its_exposed_tools() {
         "the same-named binary on PATH is named after the truth: {line}"
     );
     assert!(lines.next().is_none());
-    // Without the impostor: one line.
     let line = which_line(&layout, "tm", Some(std::ffi::OsStr::new(""))).unwrap();
     assert_eq!(line.lines().count(), 1);
-    // The exposed tool itself still answers by the ordinary shim arm.
     let line = which_line(&layout, "tm-driver", Some(std::ffi::OsStr::new(""))).unwrap();
     assert!(line.starts_with("tm-driver → "), "{line}");
     assert!(line.contains("managed 20065"), "{line}");
@@ -1378,10 +1231,6 @@ fn which_for_a_bundle_program_names_the_store_and_its_exposed_tools() {
     let _ = std::fs::remove_dir_all(&brew);
 }
 
-/// `atpkg which` for an AGENT PROGRAM (owner decision 2026-09-10): with `agents/`
-/// first on `PATH` the managed copy is what runs — the canonical managed line — and a
-/// SECOND line names every foreign copy it out-ranked, home-abbreviated, with the
-/// version its real location spells; nothing is executed to learn it.
 #[cfg(unix)]
 #[test]
 fn which_for_an_agent_program_names_the_managed_copy_and_the_out_ranked_foreign_copies() {
@@ -1414,9 +1263,6 @@ fn which_for_an_agent_program_names_the_managed_copy_and_the_out_ranked_foreign_
         },
         "up to date".into(),
     );
-    // Two foreign copies shaped like the real machine: Anthropic's native install
-    // (`~/.local/bin/claude → …/versions/2.1.267`) and a Homebrew cask
-    // (`…/Caskroom/claude-code/2.1.204/claude`), reached through a symlink each.
     let root = crate::testdir::dir("atpkg-main-which-agent-foreign-");
     let native_real = root.join("share/claude/versions/2.1.267");
     let cask_real = root.join("Caskroom/claude-code/2.1.204/claude");
@@ -1440,12 +1286,8 @@ fn which_for_an_agent_program_names_the_managed_copy_and_the_out_ranked_foreign_
     .unwrap();
     let line = which_line(&layout, "claude", Some(&agents_first)).unwrap();
     let mut lines = line.lines();
-    // The self-update sentence (`crate::selfupdate`) closes the managed line, ahead of
-    // the foreign-copies line.
     assert_eq!(
         lines.next().unwrap(),
-        // agents/ first: the twin is the copy that runs, and what the closing sentence
-        // is about.
         format!(
             "claude → {} → {} — managed 2.1.281 — Anthropic latest — `claude update` here \
              runs `aterm pkg update claude`",
@@ -1457,13 +1299,11 @@ fn which_for_an_agent_program_names_the_managed_copy_and_the_out_ranked_foreign_
         lines.next().unwrap(),
         format!(
             "foreign copies out-ranked: {} (2.1.267), {} (2.1.204)",
-            // Home-abbreviated: a TMPDIR under $HOME puts this scratch root there.
             super::home_abbreviated(&local.join("claude")),
             super::home_abbreviated(&brew.join("claude"))
         )
     );
     assert_eq!(lines.next(), None);
-    // No foreign copy at all: the managed line alone.
     let managed_only = std::env::join_paths([layout.agents_dir(), layout.bin_dir()]).unwrap();
     assert_eq!(
         which_line(&layout, "claude", Some(&managed_only))
@@ -1476,12 +1316,6 @@ fn which_for_an_agent_program_names_the_managed_copy_and_the_out_ranked_foreign_
     let _ = std::fs::remove_dir_all(&layout.prefix);
 }
 
-/// `which claude` in a shell whose reroute stub decides at exec time: inside aterm the
-/// stub takes the twin, so the line names that route (stub, twin, store) with the
-/// self-update sentence the twin makes true, whatever this shell's PATH puts ahead;
-/// outside aterm the stub passes through to this shell's own copy, said as the design
-/// (never SHADOWED, no remedy), and where the pass-through reaches `bin/` the managed line
-/// carries no self-update sentence.
 #[cfg(unix)]
 #[test]
 fn which_for_an_agent_program_names_the_reroute_stubs_route_at_exec_time() {
@@ -1547,8 +1381,6 @@ fn which_for_an_agent_program_names_the_reroute_stubs_route_at_exec_time() {
         )
     );
     assert!(!line.contains("SHADOWED"), "{line}");
-    // Outside aterm: the stub passes through to this shell's own copy — the design,
-    // said as such, with no SHADOWED and no remedy.
     let outside = which_line_in(
         &layout,
         "claude",
@@ -1564,8 +1396,6 @@ fn which_for_an_agent_program_names_the_reroute_stubs_route_at_exec_time() {
             crate::state::agent_passed_through(v281, &stub, &local.join("claude"))
         )
     );
-    // …and so is an iTerm shell's, whose PATH has no reroute dir at all: the stub is
-    // laid, this shell's own copy runs by design, no SHADOWED, no remedy.
     let iterm = std::env::join_paths([local.clone(), layout.bin_dir()]).unwrap();
     let line = which_line_in(
         &layout,
@@ -1582,10 +1412,6 @@ fn which_for_an_agent_program_names_the_reroute_stubs_route_at_exec_time() {
             crate::state::agent_own_copy_outside_aterm(v281, &local.join("claude"))
         )
     );
-    // …and where the pass-through reaches `bin/` (nothing of the user's on PATH, with
-    // `agents/` on it but skipped by the stub), the managed line stands without the
-    // self-update sentence: `bin/claude` carries no hand-over, and the twin that does is
-    // not what runs there.
     let bin_only = std::env::join_paths([
         crate::reroute::dir(&layout),
         layout.agents_dir(),
@@ -1608,8 +1434,6 @@ fn which_for_an_agent_program_names_the_reroute_stubs_route_at_exec_time() {
     let _ = std::fs::remove_dir_all(&layout.prefix);
 }
 
-/// The version a foreign copy's path spells: the last dotted-digits component, or nothing,
-/// never a guess.
 #[test]
 fn version_from_components_reads_the_last_dotted_digits_component() {
     let v = |p: &str| version_from_components(std::path::Path::new(p));
@@ -1635,9 +1459,6 @@ fn version_from_components_reads_the_last_dotted_digits_component() {
     assert_eq!(v("/x/.hidden/claude"), None, "a dot alone is not a version");
 }
 
-// A failed Universal Control write is reported under `MACHINE_APPLY_FAILED_PREFIX` and
-// mints no `machine-settings:` entry; only the success arm adds
-// `universal-control disabled`, with its revert.
 #[test]
 fn machine_write_failure_is_explicit() {
     use crate::machine::UniversalControlOutcome;
@@ -1660,7 +1481,6 @@ fn machine_write_failure_is_explicit() {
         assert!(record_universal_control_outcome(outcome, &mut entries).is_none());
         assert!(entries.is_empty());
     }
-    // The genuine success arm remains distinct and carries its revert.
     let success =
         record_universal_control_outcome(UniversalControlOutcome::Disabled, &mut entries).unwrap();
     assert!(!success.starts_with(MACHINE_APPLY_FAILED_PREFIX));
@@ -1671,8 +1491,6 @@ fn machine_write_failure_is_explicit() {
     );
 }
 
-/// A Rosetta 2 install is a `machine-settings:` entry only when it landed; a failure is
-/// the failed line with atpkg's why, and an installed or inapplicable Mac says nothing.
 #[test]
 fn a_rosetta_install_is_an_entry_only_when_it_landed() {
     use crate::machine::RosettaOutcome;
@@ -1708,9 +1526,6 @@ fn a_rosetta_install_is_an_entry_only_when_it_landed() {
     );
 }
 
-/// Bare `machine`'s verdict names each half an apply would do, and says nothing is left
-/// in the words of what applies here; `nothing changed` blames the switches only when
-/// every setting that applies is switched off.
 #[test]
 fn the_machine_verdicts_name_what_is_left_and_why_nothing_changed() {
     use crate::config::UniversalControlPolicy::Off;
@@ -1785,10 +1600,6 @@ fn the_machine_verdicts_name_what_is_left_and_why_nothing_changed() {
     );
 }
 
-/// The marker LINES are a cross-crate contract (`crates/aterm-gui` splits them; the
-/// marker constants themselves are shared, so only the composed payloads are pinned
-/// here): `machine-settings:`'s entry, `foreign:`'s items with a `; ` inside a field
-/// written `, `, and `managed-current:`'s entries the GUI splits on `; `.
 #[test]
 fn the_marker_payloads_are_byte_stable() {
     assert_eq!(
@@ -1840,13 +1651,6 @@ fn the_marker_payloads_are_byte_stable() {
     );
 }
 
-/// THE MANAGED-CURRENT LINE NAMES VENDOR PROGRAMS (design §1.7): an agent program whose
-/// active vendor build's row says it is the vendor's latest, and whose twin is that
-/// build, is listed by version and source — never a store id, never an index pin. One
-/// whose vendor this run could not reach, or no check has reached for a day, is listed
-/// `not checked`, and a kept row by its own word (audit 2026-10-09: an unreached
-/// Anthropic left the line naming Codex alone, read as every program current); a row
-/// for another build and a missing twin each leave it out.
 #[cfg(unix)]
 #[test]
 fn the_managed_current_line_lists_vendor_programs_at_their_vendors_latest() {
@@ -1894,14 +1698,11 @@ fn the_managed_current_line_lists_vendor_programs_at_their_vendors_latest() {
         managed_current_line(&managed_current_entries(&layout, &none, now)).as_deref(),
         Some("managed-current: claude 2.1.281 (Anthropic latest)")
     );
-    // Unreachable this run: the row is an older check's, so the line says `not checked`
-    // rather than leaving the program out.
     let unreached = std::collections::BTreeSet::from([String::from("claude")]);
     assert_eq!(
         managed_current_line(&managed_current_entries(&layout, &unreached, now)).as_deref(),
         Some("managed-current: claude 2.1.281 (not checked)")
     );
-    // Nor current when the last check that reached the vendor is more than a day old.
     assert_eq!(
         managed_current_line(&managed_current_entries(
             &layout,
@@ -1912,7 +1713,6 @@ fn the_managed_current_line_lists_vendor_programs_at_their_vendors_latest() {
         Some("managed-current: claude 2.1.281 (not checked)"),
         "a stale check"
     );
-    // A kept row says its own word, reached or not.
     record_status(
         &layout,
         "claude",
@@ -1928,7 +1728,6 @@ fn the_managed_current_line_lists_vendor_programs_at_their_vendors_latest() {
             Some("managed-current: claude 2.1.281 (held)")
         );
     }
-    // A row for another build is not what runs: nothing.
     let other = row(
         crate::state::vendor_managed("2.1.280", "Anthropic"),
         claude - 1,
@@ -1950,12 +1749,6 @@ fn the_managed_current_line_lists_vendor_programs_at_their_vendors_latest() {
     );
 }
 
-/// The one remedy: where the hook file for the invoking shell exists (the parent
-/// process's, `caller_shell`; `$SHELL` only when that is no shell) it is sourced in place
-/// (`. ~/.aterm/shell.d/00-atpkg.zsh`, `source …fish`, the dot-source for pwsh), wired rc
-/// or not, and never `exec $SHELL`, which inside an aterm tab drops the tab's shell
-/// integration (the zsh wrapper consumes `ATERM_ORIGINAL_ZDOTDIR`, so a re-exec'd zsh
-/// loads none). Only a shell without the hook file gets a PATH line, in its own dialect.
 #[test]
 fn the_remedy_sources_the_hook_in_place_and_never_execs_the_shell() {
     let layout = temp_layout("remedy");
@@ -1963,7 +1756,6 @@ fn the_remedy_sources_the_hook_in_place_and_never_execs_the_shell() {
     let shell_d = home.join(".aterm").join("shell.d");
     std::fs::create_dir_all(&shell_d).unwrap();
     let agents = layout.agents_dir().display().to_string();
-    // No hook written yet (nor an rc that could be wired): the PATH line, per dialect.
     assert_eq!(
         shell_remedy_for(Some("zsh"), Some(&home), &layout),
         format!("export PATH=\"{agents}:$PATH\"")
@@ -1983,9 +1775,6 @@ fn the_remedy_sources_the_hook_in_place_and_never_execs_the_shell() {
         shell_remedy_for(Some("zsh"), None, &layout),
         format!("export PATH=\"{agents}:$PATH\"")
     );
-    // The hooks written (what every pass does): the source line, and the rc's wiring
-    // makes no difference — an rc block is never written here, and the remedy is the
-    // same one the block itself runs.
     crate::hooks::write_hooks(
         &shell_d,
         &layout.bin_dir(),
@@ -2001,7 +1790,6 @@ fn the_remedy_sources_the_hook_in_place_and_never_execs_the_shell() {
         shell_remedy_for(Some("bash"), Some(&home), &layout),
         ". ~/.aterm/shell.d/00-atpkg.bash"
     );
-    // `sh` has no hook it can source (the bash hook is not POSIX sh): the PATH line.
     assert_eq!(
         shell_remedy_for(Some("sh"), Some(&home), &layout),
         format!("export PATH=\"{agents}:$PATH\"")
@@ -2018,7 +1806,6 @@ fn the_remedy_sources_the_hook_in_place_and_never_execs_the_shell() {
         shell_remedy_for(Some("powershell"), Some(&home), &layout),
         ". ~/.aterm/shell.d/00-atpkg.ps1"
     );
-    // A wired rc changes nothing: still the source, never `exec $SHELL`.
     std::fs::write(
         home.join(".zshrc"),
         "# >>> atpkg shell integration >>>\n. ~/.aterm/shell.d/00-atpkg.zsh\n# <<< atpkg shell integration <<<\n",
@@ -2035,9 +1822,6 @@ fn the_remedy_sources_the_hook_in_place_and_never_execs_the_shell() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
-/// Every rustup seam re-assertion ends with its [`FOREIGN_MARKER`] line, naming a foreign
-/// `trust` entry with [`crate::seam::DETACH_FIX`] and leaving the entry alone. Negative
-/// control: once the entry is gone, and with no rustup home at all, the line says `none`.
 #[cfg(unix)]
 #[test]
 fn the_seam_reassertion_names_a_foreign_entry_on_the_foreign_line() {
@@ -2078,12 +1862,6 @@ fn the_seam_reassertion_names_a_foreign_entry_on_the_foreign_line() {
     );
 }
 
-/// `atpkg which` (design S6) and the shadow reconcile (design S5), over a real store: a
-/// managed shim answers `managed <build> — pinned by index <N>` with the shim → store
-/// resolution; a foreign copy ahead of the managed bin/ turns that into `SHADOWED by
-/// <path>` (said by the pass, never fixed); a foreign copy with no managed shim is the
-/// `system:` state; a pending stub says the next pass installs it; nothing is the fix
-/// line.
 #[cfg(unix)]
 #[test]
 fn which_names_the_copy_that_runs_and_shadowing_is_read_per_path() {
@@ -2124,7 +1902,6 @@ fn which_names_the_copy_that_runs_and_shadowing_is_read_per_path() {
             crate::which(&layout, "trust").unwrap().display()
         )
     );
-    // A foreign copy ahead of the managed bin/.
     let local = layout
         .prefix
         .parent()
@@ -2139,8 +1916,6 @@ fn which_names_the_copy_that_runs_and_shadowing_is_read_per_path() {
     }
     let ahead = std::env::join_paths([local.clone(), layout.bin_dir()]).unwrap();
     let shadowed = crate::state::shadowed(6808, &local.join("trust"));
-    // trust is ALab's own, so its alias is laid: the answer carries the one trailing
-    // fix-line after the canonical state (§17.11).
     assert_eq!(
         which_line(&layout, "trust", Some(&ahead)).unwrap(),
         format!(
@@ -2159,9 +1934,6 @@ fn which_names_the_copy_that_runs_and_shadowing_is_read_per_path() {
         Some("type alab-trust for the managed one"),
         "the pass log composes the same sentence after the same state"
     );
-    // A foreign `alab-trust` ahead of the managed bin/ too: the alias would not run the
-    // managed copy either, so the fix-line is withheld and `which alab-trust` reports the
-    // alias as SHADOWED itself.
     {
         let foreign_alias = local.join("alab-trust");
         std::fs::write(&foreign_alias, b"#!/bin/sh\nexit 0\n").unwrap();
@@ -2188,9 +1960,6 @@ fn which_names_the_copy_that_runs_and_shadowing_is_read_per_path() {
                 crate::state::shadowed(6808, &foreign_alias)
             )
         );
-        // The pass still says the shadow, but a shadow with no fix is no exception: the
-        // window's foreign line names nothing. Negative control: the fixed shadow below,
-        // which the line names.
         let _ = take_markers_said();
         assert_eq!(
             reconcile_shadowed(&layout, 41, Some(&ahead)),
@@ -2202,8 +1971,6 @@ fn which_names_the_copy_that_runs_and_shadowing_is_read_per_path() {
         );
         std::fs::remove_file(&foreign_alias).unwrap();
     }
-    // The containment is anchored: an `alab-<x>` that resolves into a `store/<x>/…` tail
-    // outside this prefix (a hand-made link into a checkout) earns no fix-line.
     {
         let checkout = local.join("store").join("trust").join("1").join("bin");
         std::fs::create_dir_all(&checkout).unwrap();
@@ -2225,8 +1992,6 @@ fn which_names_the_copy_that_runs_and_shadowing_is_read_per_path() {
         std::fs::remove_file(&alias_shim).unwrap();
         std::os::unix::fs::symlink(&managed_target, &alias_shim).unwrap();
     }
-    // The alias itself resolves the managed copy, in the same canonical words as the
-    // plain name — whatever PATH holds ahead of the managed bin/.
     let alias_shim = layout
         .shim(&crate::store::ToolName::new("alab-trust").unwrap())
         .display()
@@ -2238,8 +2003,6 @@ fn which_names_the_copy_that_runs_and_shadowing_is_read_per_path() {
             crate::which(&layout, "trust").unwrap().display()
         )
     );
-    // The pass says it and records nothing (SHADOWED is one shell's truth); a reader with
-    // that PATH computes it: the canonical row, never the fix-line.
     let before = crate::status::read(&layout).unwrap().programs["trust"]
         .state
         .clone();
@@ -2248,7 +2011,6 @@ fn which_names_the_copy_that_runs_and_shadowing_is_read_per_path() {
         reconcile_shadowed(&layout, 41, Some(&ahead)),
         vec!["trust".to_string()]
     );
-    // …and names it for the window, with the fix the line beside it says.
     assert!(
         take_markers_said().contains(&format!(
             "atpkg: foreign: path trust {} — type alab-trust for the managed one",
@@ -2273,7 +2035,6 @@ fn which_names_the_copy_that_runs_and_shadowing_is_read_per_path() {
         crate::which(&layout, "trust").is_some() && local.join("trust").exists(),
         "SHADOWED is said, never fixed: both copies are untouched"
     );
-    // A row an older client recorded as SHADOWED is put back to the managed row.
     record_status(
         &layout,
         "trust",
@@ -2294,13 +2055,8 @@ fn which_names_the_copy_that_runs_and_shadowing_is_read_per_path() {
         crate::status::read(&layout).unwrap().programs["trust"].state,
         crate::state::managed(6808, 41)
     );
-    // Behind the managed bin/ the foreign copy does not run: no shadow.
     let behind = std::env::join_paths([layout.bin_dir(), local.clone()]).unwrap();
     assert!(reconcile_shadowed(&layout, 41, Some(&behind)).is_empty());
-    // AN AGENT PROGRAM (2026-09-16). Its `agents/` twin is laid and current, so a
-    // foreign copy ahead on THIS PATH is one shell's state: `which` names it as
-    // such with the in-place remedy, the pass records the managed row (never
-    // SHADOWED), and names it on no `shadowed:` marker.
     let v281 = vendor_version("2.1.281").build_id();
     let cbuild = layout.build_dir("claude", v281);
     std::fs::create_dir_all(cbuild.join("bin")).unwrap();
@@ -2334,8 +2090,6 @@ fn which_names_the_copy_that_runs_and_shadowing_is_read_per_path() {
     let remedy = shell_remedy_command(&layout);
     let expect_absent =
         crate::state::agent_shadowed_in_shell(v281, &exe, &layout.agents_dir(), false, &remedy);
-    // (An aterm shell's answer, where the remedy works; outside aterm the same PATH is
-    // this shell's own copy, a note.)
     let inside = crate::reroute::StubEnv { in_aterm: true };
     let line = which_line_in(&layout, "claude", Some(&no_agents), inside).unwrap();
     assert_eq!(
@@ -2346,7 +2100,6 @@ fn which_names_the_copy_that_runs_and_shadowing_is_read_per_path() {
             foreign_copies_line_with(FOREIGN_ON_THIS_SHELL, std::slice::from_ref(&exe))
         )
     );
-    // The pass: nothing shadowed, the managed row recorded, the tail printed.
     let _ = take_markers_said();
     assert!(
         !reconcile_shadowed(&layout, 41, Some(&no_agents)).contains(&"claude".to_string()),
@@ -2364,8 +2117,6 @@ fn which_names_the_copy_that_runs_and_shadowing_is_read_per_path() {
             .is_some_and(|r| crate::state::shadowed_by(&r.state).is_some()),
         "never recorded as SHADOWED"
     );
-    // …and a row an older client recorded as SHADOWED is put back to managed: for a
-    // vendor program, its version and source, never an index pin.
     record_status(
         &layout,
         "claude",
@@ -2381,9 +2132,6 @@ fn which_names_the_copy_that_runs_and_shadowing_is_read_per_path() {
         crate::status::read(&layout).unwrap().programs["claude"].state,
         crate::state::vendor_source("2.1.281", "Anthropic")
     );
-    // With the twin gone (a lane that could not lay it), the plain SHADOWED row is the
-    // truth again for that PATH: nothing in front of it vouches for the managed copy.
-    // Said by the pass, and read, never recorded.
     std::fs::remove_file(layout.agent_shim(&crate::store::ToolName::new("claude").unwrap()))
         .unwrap();
     assert!(!agent_twin_current(&layout, "claude", v281));
@@ -2401,15 +2149,11 @@ fn which_names_the_copy_that_runs_and_shadowing_is_read_per_path() {
         crate::state::shadowed(v281, &exe)
     );
     crate::activate::reconcile_agents(&layout);
-    // A pending stub: the next pass installs it.
     crate::stub::write_pending_stub(&layout, &crate::store::ToolName::new("emacs").unwrap())
         .unwrap();
     let line = which_line(&layout, "emacs", Some(&managed_only)).unwrap();
     assert!(line.starts_with("emacs → "), "{line}");
     assert!(line.contains("(pending stub)"), "{line}");
-    // A program that is both a pending stub and shadowed by a foreign copy: PATH order
-    // decides what runs. Foreign copy ahead of the managed bin/ ⇒ it runs and atpkg does
-    // not manage it; behind it ⇒ the stub runs and waits.
     let exe = local.join("emacs");
     std::fs::write(&exe, b"#!/bin/sh\nexit 0\n").unwrap();
     std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -2424,14 +2168,12 @@ fn which_names_the_copy_that_runs_and_shadowing_is_read_per_path() {
     let stub_first = std::env::join_paths([layout.bin_dir(), local.clone()]).unwrap();
     let line = which_line(&layout, "emacs", Some(&stub_first)).unwrap();
     assert!(line.contains("(pending stub)"), "{line}");
-    // A command's stub names the program whose install lays it.
     crate::stub::write_pending_stub(&layout, &crate::store::ToolName::new("targo").unwrap())
         .unwrap();
     let line = which_line(&layout, "targo", Some(&managed_only)).unwrap();
     assert!(line.starts_with("targo → "), "{line}");
     assert!(line.ends_with("(now: aterm pkg install trust)"), "{line}");
     let _ = std::fs::remove_file(layout.shim(&crate::store::ToolName::new("targo").unwrap()));
-    // A recorded non-shim state reads back verbatim.
     let unserved = crate::state::unavailable("x86_64-unknown-linux-gnu", "macOS only");
     record_status(
         &layout,
@@ -2447,21 +2189,12 @@ fn which_names_the_copy_that_runs_and_shadowing_is_read_per_path() {
         which_line(&layout, "homebrew", Some(&managed_only)).unwrap(),
         format!("homebrew → (nothing runs) — {unserved}")
     );
-    // Nothing: the fix line, as an error.
     assert_eq!(
         which_line(&layout, "nothing", Some(&managed_only)).unwrap_err(),
         not_installed_fix("nothing")
     );
-    // The REVERSE case, honestly: an `alab-<x>` nothing answers to says why there is
-    // no alias instead of promising `aterm pkg install alab-x`. claude is installed
-    // above with the policy Off; with no cached index the line can
-    // only say the tool is installed and not aliased. An unknown base gets the plain
-    // name's fix line.
     assert!(which_line(&layout, "alab-claude", Some(&managed_only)).is_err());
     assert!(which_line(&layout, "alab-nothing", Some(&managed_only)).is_err());
-    // A name the cached index does not serve: install's own refusal, never a promise
-    // of an install that refuses. A served name, a vendor program, and no cached
-    // index at all keep the fix line.
     let index = index_of(&[("ay", None), ("gh", Some("gh")), ("codex", None)]);
     assert!(unserved_which_line("nosuch", Some(&index)).is_some());
     assert_eq!(unserved_which_line("ay", Some(&index)), None);
@@ -2473,17 +2206,11 @@ fn which_names_the_copy_that_runs_and_shadowing_is_read_per_path() {
     let _ = std::fs::remove_dir_all(&layout.prefix);
 }
 
-/// `which trust` with p11-kit's `trust` on PATH, through the store, in the two states the
-/// fix for the cached-index case missed: a fresh machine with NO index cached, and a
-/// seeded one whose pending stub sits behind the unrelated binary (the hook APPENDS bin/
-/// to PATH) — each names the binary as unrelated, never "system: … not managed by
-/// aterm". A pending stub AHEAD of it is what runs, and says so.
 #[cfg(unix)]
 #[test]
 fn which_names_a_same_named_binary_unrelated_with_no_index_or_behind_a_stub() {
     let layout = temp_layout("p11-kit");
     std::fs::create_dir_all(layout.bin_dir()).unwrap();
-    // Outside the prefix: every directory under it is the store's, never foreign.
     let foreign_dir = std::path::PathBuf::from(format!("{}-usr-bin", layout.prefix.display()));
     std::fs::create_dir_all(&foreign_dir).unwrap();
     std::fs::write(foreign_dir.join("trust"), "#!/bin/sh\nexit 0\n").unwrap();
@@ -2494,7 +2221,6 @@ fn which_names_a_same_named_binary_unrelated_with_no_index_or_behind_a_stub() {
     .unwrap();
     let path = |dirs: &[&std::path::Path]| std::env::join_paths(dirs).unwrap();
 
-    // No index, no stub: the compiled roster says `trust` is ALab's own.
     let line = which_line(&layout, "trust", Some(&path(&[&foreign_dir]))).unwrap();
     assert!(
         line.starts_with("trust → (nothing runs) — not installed"),
@@ -2503,7 +2229,6 @@ fn which_names_a_same_named_binary_unrelated_with_no_index_or_behind_a_stub() {
     assert!(line.contains("on PATH is an unrelated binary"), "{line}");
     assert!(!line.contains("system:"), "{line}");
 
-    // A pending stub BEHIND the foreign binary: still unrelated, with the stub's words.
     crate::stub::write_pending_stub(&layout, &crate::store::ToolName::new("trust").unwrap())
         .unwrap();
     let behind = path(&[&foreign_dir, &layout.bin_dir()]);
@@ -2515,7 +2240,6 @@ fn which_names_a_same_named_binary_unrelated_with_no_index_or_behind_a_stub() {
     assert!(line.contains("on PATH is an unrelated binary"), "{line}");
     assert!(!line.contains("system:"), "{line}");
 
-    // AHEAD of it, the stub is what runs (arm 3), as before.
     let ahead = path(&[&layout.bin_dir(), &foreign_dir]);
     let line = which_line(&layout, "trust", Some(&ahead)).unwrap();
     assert!(line.contains("(pending stub)"), "{line}");
@@ -2523,9 +2247,6 @@ fn which_names_a_same_named_binary_unrelated_with_no_index_or_behind_a_stub() {
     let _ = std::fs::remove_dir_all(&foreign_dir);
 }
 
-/// The rolled-back row claims no pin: an index-program rollback records
-/// `managed <to> — rolled back from <from>`, never a `pinned by index N` for a build index
-/// N does not pin, and `which`'s state reader prints those words for that build.
 #[test]
 fn a_rolled_back_row_records_what_happened_and_which_prints_it() {
     let words = crate::state::rolled_back(7345, 8606);
@@ -2538,9 +2259,7 @@ fn a_rolled_back_row_records_what_happened_and_which_prints_it() {
         state: words.clone(),
         tree_root: String::new(),
     };
-    // No cached index in this fresh layout: the row's own words, verbatim.
     assert_eq!(managed_state_of(&layout, "clean", 7345, Some(&row)), words);
-    // Another build's row is not this build's words.
     assert!(
         managed_state_of(&layout, "clean", 8606, Some(&row)).starts_with("managed 8606"),
         "{}",
@@ -2552,7 +2271,6 @@ fn a_rolled_back_row_records_what_happened_and_which_prints_it() {
 const MIB: u64 = 1 << 20;
 const GIB: u64 = 1 << 30;
 
-/// An install unit for the set-refusal tests: `(member, tree, asset)` per member.
 fn unit(group: Option<&str>, members: &[(&str, u64, u64)]) -> SetUnit {
     SetUnit {
         group: group.map(str::to_string),
@@ -2564,8 +2282,6 @@ fn unit(group: Option<&str>, members: &[(&str, u64, u64)]) -> SetUnit {
     }
 }
 
-/// The `not enough disk space` sentence a unit's own gate writes for `need` (reserve
-/// excluded) on `have` free.
 fn gate_sentence(need: u64, have: u64) -> String {
     crate::FlowError::InsufficientDisk {
         required: need + crate::cost::FREE_FLOOR,
@@ -2574,10 +2290,6 @@ fn gate_sentence(need: u64, have: u64) -> String {
     .to_string()
 }
 
-/// The set's need is the peak the per-unit gates enforce, archives included, so freeing
-/// exactly the shortfall the line names lets the tuple's own gate pass. The rustc tuple
-/// alone (trust 3 GiB + a 1 GiB archive, three 100 MiB siblings with 50 MiB archives) on
-/// 4 GiB free needs 5.4 GiB, where installed sizes alone sum to 4.3 GiB.
 #[test]
 fn default_set_disk_refusal_names_the_peak_its_gates_enforce() {
     let prefix = std::path::Path::new("/Users//x/.aterm");
@@ -2592,13 +2304,10 @@ fn default_set_disk_refusal_names_the_peak_its_gates_enforce() {
     );
     let units = [rustc.clone()];
     let r = set_disk_refusal(&units, 0, 4 * GIB, prefix).expect("refuses");
-    // The figures are the contract: the peak need, what is free, the
-    // shortfall, the volume — and no `install` offered for a tuple member.
     for figure in ["5.4 GiB", "4.0 GiB", "1.4 GiB", "/Users//x/.aterm"] {
         assert!(r.line.contains(figure), "{figure}: {}", r.line);
     }
     assert!(!r.line.contains("aterm pkg install"), "{}", r.line);
-    // The tuple cannot fit by itself: every member carries the tuple's own figure.
     let tuple = gate_sentence(rustc.bytes.need(), 4 * GIB);
     assert_eq!(
         r.rows,
@@ -2606,7 +2315,6 @@ fn default_set_disk_refusal_names_the_peak_its_gates_enforce() {
             .map(|m| (m.to_string(), tuple.clone()))
             .to_vec()
     );
-    // Freed to exactly the need: the set passes, and so does the gate it stands for.
     let need = crate::flow::peak_need([rustc.bytes]) + crate::cost::FREE_FLOOR;
     assert!(set_disk_refusal(&units, 0, need, prefix).is_none());
     assert!(crate::cost::disk_ok(
@@ -2617,10 +2325,6 @@ fn default_set_disk_refusal_names_the_peak_its_gates_enforce() {
     assert!(set_disk_refusal(&units, 0, need - 1, prefix).is_some());
 }
 
-/// Agents landing beside the set are in its figure: a set that fits by itself, beside
-/// agents that need 2 GiB at once and fit by themselves, is refused when the volume cannot
-/// hold both at once (the line names the joint need and why) and passes at exactly that
-/// need.
 #[test]
 fn default_set_disk_refusal_counts_the_agents_landing_beside_it() {
     let prefix = std::path::Path::new("/Users//x/.aterm");
@@ -2649,10 +2353,6 @@ fn default_set_disk_refusal_counts_the_agents_landing_beside_it() {
     assert!(set_disk_refusal(&units, 2 * GIB, joint - 1, prefix).is_some());
 }
 
-/// The offer is a unit whose own gate passes: an ungrouped program whose archive and
-/// tree fit beside the reserve — never one whose tree alone fits (ay: 2.5 GiB + a 1 GiB
-/// archive on 4 GiB free fails its gate), and never a tuple member, which `aterm pkg
-/// install` lands outside its tuple, however small.
 #[test]
 fn default_set_disk_refusal_offers_only_an_ungrouped_program_its_gate_admits() {
     let prefix = std::path::Path::new("/Users//x/.aterm");
@@ -2690,7 +2390,6 @@ fn default_set_disk_refusal_offers_only_an_ungrouped_program_its_gate_admits() {
         "the tuple's members carry its figure, the program that fits the set's"
     );
 
-    // A tuple that fits by itself is still no offer: its members install together.
     let small = unit(
         Some("rustc"),
         &[
@@ -2710,9 +2409,6 @@ fn default_set_disk_refusal_offers_only_an_ungrouped_program_its_gate_admits() {
     );
 }
 
-/// Every member the refused set would add gets a current row, so a stale figure from an
-/// earlier pass cannot outlive it: three programs that each fit alone, refused on their
-/// sum, all record the set's sentence, and a member held by its memo keeps its held row.
 #[test]
 fn a_refused_set_rewrites_every_member_row_and_spares_a_held_one() {
     use crate::flow::{LandingBytes, PlannedLanding};
@@ -2759,11 +2455,6 @@ fn a_refused_set_rewrites_every_member_row_and_spares_a_held_one() {
     let _ = std::fs::remove_dir_all(&layout.prefix);
 }
 
-/// The units the set check judges: a unit its lane lands nothing of is left out (on
-/// 4.5 GiB free, a 4 GiB tuple a sibling's local pin holds does not refuse a 300 MiB
-/// program, nor does a held one), while any other unknown leaves the check unanswered. A
-/// tuple's unit carries the members the pass adds and the bytes its own gate sums, which
-/// can count more than those members.
 #[test]
 fn set_units_leave_out_the_units_the_pass_lands_nothing_of() {
     use crate::flow::{LandingBytes, PlannedLanding};
@@ -2804,7 +2495,6 @@ fn set_units_leave_out_the_units_the_pass_lands_nothing_of() {
         }]
     );
     assert!(set_disk_refusal(&units, 0, have, prefix).is_none());
-    // The same tuple counted: the set refuses — what leaving it out spares.
     let units = set_units(&planned, lands(bytes(4 * GIB))).expect("all known");
     assert!(set_disk_refusal(&units, 0, have, prefix).is_some());
     assert_eq!(
@@ -2821,14 +2511,8 @@ fn set_units_leave_out_the_units_the_pass_lands_nothing_of() {
     assert!(set_units(&planned, lands(PlannedLanding::Unknown)).is_none());
 }
 
-/// A coherence-group member is held by any member's pin: the update pass's group gate
-/// freezes the whole tuple ([`crate::flow::pin_gate_members`]). So the line names every
-/// unpin the hold takes (the program's own when it is pinned, and each pinned sibling's)
-/// and claims nothing about updates moving it while a sibling's pin holds the tuple; with
-/// no cached index to read the group from, an unchanged pin predicts nothing.
 #[test]
 fn a_group_member_s_pin_line_names_every_unpin_the_hold_takes() {
-    // The programs a line's `aterm pkg unpin <p>` commands name, sorted.
     fn unpins(line: &str) -> Vec<&str> {
         let mut named: Vec<&str> = line
             .split("aterm pkg unpin ")
@@ -2862,7 +2546,6 @@ fn a_group_member_s_pin_line_names_every_unpin_the_hold_takes() {
             "a sibling's pin still holds the tuple: {line}"
         );
     }
-    // Alone, the same verbs do say updates move it: the claim the group arm withholds.
     for changed in [false, true] {
         let line = pin_line("trust-cg", 9178, false, changed, PinPeers::Alone);
         assert!(claims_updates_move(&line), "{line}");
@@ -2875,17 +2558,6 @@ fn a_group_member_s_pin_line_names_every_unpin_the_hold_takes() {
     }
 }
 
-/// THE SELF-UPDATE VERB (2026-09-19, `crate::selfupdate`), in-process, the endings the
-/// binary-level `tests/selfupdate_intercept.rs` does not reach: usage exit 2 (a `--help`
-/// operand too — non-mutating); not a tool name exit 2; the prefix cross-check proceeds
-/// when the store atpkg resolves here agrees with the operand or cannot be resolved at
-/// all; `install stable` and `install 2.1.200` are declined whether the manager is
-/// enabled or not — there is no escape hatch, the plan has no input that could turn a
-/// decline into a forward — and `update --foo` is declined; the disabled manager refuses
-/// with its line for every check shape; the hidden verb takes no lock. Then THE 75
-/// ENDING's relay (§8): `selfupdate_check` with a ONE-SECOND bound runs a stub `atpkg`
-/// that records its argv (`update claude --wait-lock 1`) and exits 75, and the verb
-/// relays `CONTENDED_EXIT`.
 #[cfg(unix)]
 #[test]
 fn cmd_selfupdate_refuses_forwards_and_never_takes_the_lock() {
@@ -2894,7 +2566,6 @@ fn cmd_selfupdate_refuses_forwards_and_never_takes_the_lock() {
     let claude = crate::store::ToolName::new("claude").unwrap();
     let row = selfupdate::row_for("claude").unwrap();
     let args = |v: &[&str]| v.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
-    // 1. Usage and the tool-name gate, through the verb itself (nothing runs).
     assert_eq!(cmd_selfupdate(&[]), ExitCode::from(2));
     assert_eq!(cmd_selfupdate(&args(&["--help"])), ExitCode::from(2));
     assert_eq!(
@@ -2911,7 +2582,6 @@ fn cmd_selfupdate_refuses_forwards_and_never_takes_the_lock() {
         cmd_selfupdate(&args(&["", "--", "update"])),
         ExitCode::from(2)
     );
-    // 3. The prefix cross-check proceeds when it agrees or cannot resolve.
     for resolved in [Some(&*layout), None] {
         match selfupdate_plan(&layout, &claude, &args(&["update"]), resolved, true) {
             SelfUpdatePlan::Check { row: r } => {
@@ -2920,7 +2590,6 @@ fn cmd_selfupdate_refuses_forwards_and_never_takes_the_lock() {
             other => panic!("{resolved:?}: {other:?}"),
         }
     }
-    // 4. Declined shapes. No input of the plan can turn a decline into a forward.
     for (typed, decline) in [
         (
             &["install", "stable"][..],
@@ -2963,7 +2632,6 @@ fn cmd_selfupdate_refuses_forwards_and_never_takes_the_lock() {
         ),
         "an unknown shape is declined"
     );
-    // 6. The manager disabled: its line for every check shape.
     for typed in [
         &["update"][..],
         &["upgrade"],
@@ -2977,17 +2645,12 @@ fn cmd_selfupdate_refuses_forwards_and_never_takes_the_lock() {
             other => panic!("{typed:?}: {other:?}"),
         }
     }
-    // 7. The verb takes no lock of its own.
     assert!(!verb_mutates_store(selfupdate::HIDDEN_VERB));
     assert!(
         !layout.store_lock().exists(),
         "no ending above touches the store lock — only the child does"
     );
     let _ = std::fs::remove_dir_all(&layout.prefix);
-    // 8. THE 75 ENDING's relay. The child is a stub named `atpkg` (so `child_argv`
-    // hands it the argv verbatim) that records that argv and exits 75; the real
-    // binary's wait, its lock sentence and its `seed-busy:` marker are
-    // `tests/store_lock_wait.rs`'s (`a_waiting_seed_times_out_with_exit_75`).
     let home = crate::testdir::dir("atpkg-main-selfupdate-75-");
     let held = crate::store::Layout {
         prefix: crate::store::default_prefix(&home),
@@ -3020,13 +2683,6 @@ fn cmd_selfupdate_refuses_forwards_and_never_takes_the_lock() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
-/// The predicate behind the `which` sentence, over the bytes every twin renderer lays and
-/// the twins older clients laid (pure and cfg-free, so the Windows shape is pinned from
-/// here): the `sh` twin with the block carries the hand-over, as does the older
-/// block-then-landing twin; the landing-only `sh` twin, the `bin/` shim and the `.cmd`
-/// twin (whose self-update prelude renders empty, so on Windows `claude update` is the
-/// vendor's) do not. That keeps `aterm pkg which claude` from claiming `here runs …` on
-/// Windows.
 #[test]
 fn the_hand_over_predicate_reads_the_sh_block_and_never_the_cmd_twin_or_bin() {
     use std::path::Path;
@@ -3060,8 +2716,6 @@ fn the_hand_over_predicate_reads_the_sh_block_and_never_the_cmd_twin_or_bin() {
     let cmd_target = Path::new(
         "C:\\Program Files (x86)\\aterm\\pkg\\store\\claude\\2026091601\\bin\\claude.exe",
     );
-    // The `.cmd` twin renders no block (`twin_prelude`'s Windows arm is empty), so the
-    // sentence is never claimed on Windows — nor over an older twin's landing block.
     assert!(!twin_carries_hand_over(
         crate::platform::cmd_shim_content_twin(cmd_target, &env, "").as_bytes()
     ));
@@ -3073,10 +2727,6 @@ fn the_hand_over_predicate_reads_the_sh_block_and_never_the_cmd_twin_or_bin() {
     assert!(!twin_carries_hand_over(b""));
 }
 
-/// System satisfaction: a `system = "gh"` member with `gh` on PATH outside the prefix is
-/// satisfied (recorded, announced, not planned); a managed copy it had is retired so the
-/// system binary wins; the managed `bin/` on PATH never counts; a member without the key
-/// is never satisfied, whatever PATH holds.
 #[cfg(unix)]
 #[test]
 fn a_system_install_satisfies_a_default_set_member_and_retires_the_managed_copy() {
@@ -3096,7 +2746,6 @@ fn a_system_install_satisfies_a_default_set_member_and_retires_the_managed_copy(
     }
     let path = std::env::join_paths([layout.bin_dir(), sys.clone()]).unwrap();
     let wanted = names(&["ay", "gh"]);
-    // 1. Nothing managed yet: gh is satisfied, ay (no `system` key) is not.
     let mut installed = std::collections::BTreeMap::new();
     assert_eq!(
         reconcile_system_satisfied_with(&layout, &index, &wanted, &mut installed, Some(&path)),
@@ -3110,7 +2759,6 @@ fn a_system_install_satisfies_a_default_set_member_and_retires_the_managed_copy(
         "the row is the canonical system state, naming the path, with no retirement yet"
     );
     assert_eq!(layout.retired_date("gh"), None);
-    // 2. A managed copy exists: it is retired and the plan no longer counts it installed.
     let build = layout.build_dir("gh", 7);
     std::fs::create_dir_all(build.join("bin")).unwrap();
     std::fs::write(build.join("bin/gh"), b"#!/bin/sh\nexit 0\n").unwrap();
@@ -3138,7 +2786,6 @@ fn a_system_install_satisfies_a_default_set_member_and_retires_the_managed_copy(
         "the managed shim is gone"
     );
     assert!(!build.exists(), "the managed store tree is gone");
-    // The retirement is dated: the marker holds today, and the row says so.
     let date = layout
         .retired_date("gh")
         .expect("a retired managed copy leaves a dated marker");
@@ -3152,7 +2799,6 @@ fn a_system_install_satisfies_a_default_set_member_and_retires_the_managed_copy(
         crate::state::system_retired(&row.state),
         Some(date.as_str())
     );
-    // `which` reads the same facts back, in the same words.
     assert_eq!(
         which_line(&layout, "gh", Some(&path)).unwrap(),
         format!(
@@ -3166,7 +2812,6 @@ fn a_system_install_satisfies_a_default_set_member_and_retires_the_managed_copy(
         "NOT a removal on purpose: no `removed` marker, so the member returns if the \
          system binary goes away"
     );
-    // 3. Only the managed bin/ on PATH: not satisfied — the member stays wanted.
     let managed_only = std::env::join_paths([layout.bin_dir()]).unwrap();
     let mut none = std::collections::BTreeMap::new();
     assert!(
@@ -3178,9 +2823,6 @@ fn a_system_install_satisfies_a_default_set_member_and_retires_the_managed_copy(
     let _ = std::fs::remove_dir_all(&layout.prefix);
 }
 
-/// A verdict the authority never gave never becomes a row: `NotReachable` means the signed
-/// index verified and does not name the token, a fact about the request; recording it
-/// would invent a program that `atpkg doctor` reads back as a missing member.
 #[test]
 fn a_name_the_index_does_not_name_is_never_recorded() {
     assert_eq!(
@@ -3193,8 +2835,6 @@ fn a_name_the_index_does_not_name_is_never_recorded() {
         Some(String::from("dev-linked (skipped)")),
         "a dev-linked program is a benign hard-skip (§13), and still says so"
     );
-    // The offline family, all raised before the program lookup: recorded against a
-    // program they would call it broken, when the machine could not reach the channel.
     for env in [
         crate::FlowError::NoIndex,
         crate::FlowError::Unreachable("dns".into()),
@@ -3207,8 +2847,6 @@ fn a_name_the_index_does_not_name_is_never_recorded() {
             "{env} is a fact about the network, not about any program"
         );
     }
-    // …while a genuine per-program fact about this machine still lands on the record:
-    // no row for this target is the canonical `unavailable on` state, never an error.
     assert_eq!(
         failed_install_state(&crate::FlowError::NoArtifact("aarch64".into())),
         Some(crate::state::unavailable("aarch64", "")),
@@ -3219,16 +2857,12 @@ fn a_name_the_index_does_not_name_is_never_recorded() {
         Some(format!("error: {}", crate::FlowError::PkgVerify)),
         "a manifest that failed its signature check is a fault worth remembering"
     );
-    // A refused vendor row is a fact about THIS machine's install attempt (the row was
-    // signed and reached the client): it lands like any other stage fault.
     assert!(
         failed_install_state(&crate::FlowError::VendorRefused("url host is evil".into()))
             .is_some_and(|s| s.starts_with("error: ") && s.contains("url host is evil"))
     );
 }
 
-/// Put `program` genuinely live in `layout` at `build` (real build tree, real shims, real
-/// channel pointer), so `active_builds` reports it the way it does on a machine.
 fn make_live(layout: &crate::store::Layout, program: &str, build: u64) {
     let dir = layout.build_dir(program, build);
     std::fs::create_dir_all(dir.join("bin")).unwrap();
@@ -3245,12 +2879,6 @@ fn make_live(layout: &crate::store::Layout, program: &str, build: u64) {
     crate::store::mark_build_ready(&dir).unwrap();
 }
 
-/// Roll forward: a pass killed between a `current` flip and its shims leaves a complete
-/// build no shim runs; the next pass's edge lays its shims from the build and its
-/// sidecars, with no fetcher, so nothing is staged or downloaded. A program the machine
-/// removed, and an index program whose group membership no cached index can vouch for (a
-/// lone member of a tuple must not be split off), are left to the pass; a consistent store
-/// rolls nothing.
 #[test]
 fn an_interrupted_activation_is_rolled_forward_without_a_fetch() {
     let layout = temp_layout("roll-forward");
@@ -3262,7 +2890,6 @@ fn an_interrupted_activation_is_rolled_forward_without_a_fetch() {
         roll_forward_interrupted_activations(&layout, || None).is_empty(),
         "consistent: nothing to finish"
     );
-    // The kill: 2.1.282 staged complete and `current` flipped, its shims never laid.
     flip_only(&layout, "claude", v282);
     flip_only(&layout, "ay", 19);
     assert_eq!(crate::active_builds(&layout).get("claude"), Some(&v281));
@@ -3286,7 +2913,6 @@ fn an_interrupted_activation_is_rolled_forward_without_a_fetch() {
         roll_forward_interrupted_activations(&layout, || None).is_empty(),
         "converged"
     );
-    // A removed program is never revived by it.
     flip_only(&layout, "claude", vendor_version("2.1.283").build_id());
     std::fs::write(layout.removed(), "claude\n").unwrap();
     assert!(roll_forward_interrupted_activations(&layout, || None).is_empty());
@@ -3294,8 +2920,6 @@ fn an_interrupted_activation_is_rolled_forward_without_a_fetch() {
     let _ = std::fs::remove_dir_all(&layout.prefix);
 }
 
-/// `program`'s build `build` staged complete and its `current` flipped, its shims never
-/// laid — the state a pass killed between the two leaves.
 fn flip_only(layout: &crate::store::Layout, program: &str, build: u64) {
     let dir = layout.build_dir(program, build);
     std::fs::create_dir_all(dir.join("bin")).unwrap();
@@ -3313,11 +2937,6 @@ fn flip_only(layout: &crate::store::Layout, program: &str, build: u64) {
     crate::activate::activate_build(layout, &dir).unwrap();
 }
 
-/// The row follows the roll-forward, and an old root never attests a new build: ay 17 live
-/// with its signed root, a pass flipped `current` to 18 and was killed before the shims.
-/// The next pass's edge rolls ay forward and records 18 with no root, its apply finds ay up
-/// to date, and its root recovery re-derives 18's signed root, so `verify` matches. The
-/// same holds when the row was lost: a row still naming 17 never carries 17's root onto 18.
 #[cfg(unix)]
 #[test]
 fn a_rolled_forward_build_is_attested_by_its_own_root_never_the_old_one() {
@@ -3325,7 +2944,6 @@ fn a_rolled_forward_build_is_attested_by_its_own_root_never_the_old_one() {
     for (label, lose_the_row) in [("roll-root", false), ("roll-root-lost", true)] {
         let layout = world::layout(label);
         let f = Fake::default();
-        // The world's index pins ay at 18 (ungrouped): here the live build is 17.
         *f.index.borrow_mut() = Some(world::signed_index(44, "2099-01-01T00:00:00Z", &[]));
         make_live(&layout, "ay", 17);
         let root17 = crate::tree::tree_root(&layout.build_dir("ay", 17)).unwrap();
@@ -3395,10 +3013,6 @@ fn a_rolled_forward_build_is_attested_by_its_own_root_never_the_old_one() {
     }
 }
 
-/// Roll-forward activates nothing the normal path would refuse: a pinned program, a build
-/// the latest verified index yanked, and, after an `atpkg rollback`, the build rolled off
-/// (the undo flips `current` before it re-lays the shims, so the one divergence it can
-/// leave points at the prior build).
 #[cfg(unix)]
 #[test]
 fn roll_forward_never_activates_a_pinned_yanked_or_rolled_off_build() {
@@ -3433,7 +3047,6 @@ fn roll_forward_never_activates_a_pinned_yanked_or_rolled_off_build() {
         roll_forward_interrupted_activations(&layout, || index(&[])),
         vec!["ay".to_string()]
     );
-    // `atpkg rollback ay` off 18 back to 17 (its undo's order is pinned in flow.rs).
     crate::flow::rollback(
         &f,
         &layout,
@@ -3453,9 +3066,6 @@ fn roll_forward_never_activates_a_pinned_yanked_or_rolled_off_build() {
     let _ = std::fs::remove_dir_all(&layout.prefix);
 }
 
-/// The build a pass keeps below the live one is the build `aterm pkg rollback` lands on:
-/// with ay 16, 17 and 18 retained, 18 live and 17 yanked, the pass's closing gc keeps 16
-/// and reclaims 17.
 #[test]
 fn the_pass_keeps_the_build_a_rollback_lands_on() {
     use crate::vendor_direct::lane::world::{self, Fake};
@@ -3492,10 +3102,6 @@ fn the_pass_keeps_the_build_a_rollback_lands_on() {
     let _ = std::fs::remove_dir_all(&layout.prefix);
 }
 
-/// A failed install uninstalls nothing, so it does not report that it did: an upgrade that
-/// dies at download/stage/activate leaves the previous build live, and its row keeps
-/// `installed_build` and `tree_root`. `crate::verify` fails closed on an empty root, so
-/// dropping it would turn one failed upgrade into a permanent "cannot verify".
 #[test]
 fn a_failed_install_keeps_the_live_build_and_its_attestation() {
     let layout = temp_layout("failure-row");
@@ -3511,7 +3117,6 @@ fn a_failed_install_keeps_the_live_build_and_its_attestation() {
         "up to date".into(),
     );
 
-    // An upgrade to 20 dies mid-flight.
     let row = failure_row(&layout, "ay", String::from("error: download failed"));
     assert_eq!(
         row.installed_build,
@@ -3527,15 +3132,10 @@ fn a_failed_install_keeps_the_live_build_and_its_attestation() {
         "the failure is still reported"
     );
 
-    // …while a program that was never installed still records nothing to preserve.
     let fresh = failure_row(&layout, "clean", String::from("error: download failed"));
     assert_eq!(fresh.installed_build, None);
     assert!(fresh.tree_root.is_empty());
 
-    // The record disagrees with the store: live at 20 while the record says 18/root18.
-    // Build from the store and root from the record would claim "build 20, attested by
-    // build 18's signature", which disarms verify's `BuildMismatch` guard and yields a
-    // false `Drift` or, worse, a false `Match`.
     make_live(&layout, "ay", 20);
     assert_eq!(
         crate::active_builds(&layout).get("ay").copied(),
@@ -3558,9 +3158,6 @@ fn a_failed_install_keeps_the_live_build_and_its_attestation() {
     let _ = std::fs::remove_dir_all(&layout.prefix);
 }
 
-/// A tombstoned program keeps its attestation: its shims are failing stubs, so
-/// `active_builds` goes silent, but its bytes and signed root sit untouched in the store,
-/// and the build-agreement rule above must not read that silence as disagreement.
 #[test]
 fn a_tombstoned_program_does_not_lose_its_signed_root() {
     let layout = temp_layout("tombstone-root");
@@ -3574,7 +3171,6 @@ fn a_tombstoned_program_does_not_lose_its_signed_root() {
         },
         "up to date".into(),
     );
-    // No shims at all: exactly what `active_builds` sees for a tombstoned program.
     assert_eq!(crate::active_builds(&layout).get("trust").copied(), None);
 
     let row = failure_row(&layout, "trust", String::from("tombstoned: pin yanked"));
@@ -3585,8 +3181,6 @@ fn a_tombstoned_program_does_not_lose_its_signed_root() {
     let _ = std::fs::remove_dir_all(&layout.prefix);
 }
 
-/// A complete build dir with an executable `bin/<program>` and its ready marker (the shape
-/// `list_installed` reports), for the repair tests below.
 fn seed_ready_build(layout: &crate::store::Layout, program: &str, build: u64) -> PathBuf {
     let dir = layout.build_dir(program, build);
     std::fs::create_dir_all(dir.join("bin")).unwrap();
@@ -3597,7 +3191,6 @@ fn seed_ready_build(layout: &crate::store::Layout, program: &str, build: u64) ->
     dir
 }
 
-/// Lay `program`'s shims at `dir` and point both `current` links at it.
 fn activate_seeded(layout: &crate::store::Layout, program: &str, dir: &Path) {
     crate::activate::install_shims(
         layout,
@@ -3609,9 +3202,6 @@ fn activate_seeded(layout: &crate::store::Layout, program: &str, dir: &Path) {
     crate::activate::activate_build(layout, dir).unwrap();
 }
 
-/// Unlink's restore tells "no installed build" (off PATH) apart from an installed
-/// build whose commands the link never took over (they still run): only the first
-/// sends the reader to `aterm pkg install`.
 #[test]
 fn unlink_restore_tells_no_build_from_nothing_taken_over() {
     let l = temp_layout("restore-kinds");
@@ -3634,10 +3224,6 @@ fn unlink_restore_tells_no_build_from_nothing_taken_over() {
     let _ = std::fs::remove_dir_all(&l.prefix);
 }
 
-/// Repair never revives a revoked build. A tombstone keeps the revoked build's tree,
-/// marker and `current` links; only its shim becomes a failing notice that resolves to
-/// nothing, and repair must not read that as "no exposes recorded" and lay a live shim
-/// over it. Refused both on the recorded `tombstoned:` row and on the tombstone shim alone.
 #[test]
 fn repair_does_not_revive_a_tombstoned_build() {
     for with_status_row in [true, false] {
@@ -3686,9 +3272,6 @@ fn repair_does_not_revive_a_tombstoned_build() {
     }
 }
 
-/// A lay that fails reaches the exit code: every program whose shims could not be re-laid
-/// comes back in the fourth slot and `run_repair` exits 1 on it, so a scripted
-/// `repair && …` can tell fixed from refused.
 #[cfg(unix)]
 #[test]
 fn a_shim_that_cannot_be_relaid_is_named_and_not_swallowed() {
@@ -3696,10 +3279,6 @@ fn a_shim_that_cannot_be_relaid_is_named_and_not_swallowed() {
     let d17 = seed_ready_build(&l, "ay", 17);
     activate_seeded(&l, "ay", &d17);
     let ay = crate::store::ToolName::new("ay").unwrap();
-    // The seeded activation already laid `ay`, and a lay that finds its shim in place
-    // writes nothing, so take it away; a read-only `bin/` is no obstacle (the lay
-    // re-asserts the directory's mode), but a directory where the shim goes is: no rename
-    // lands a file over it.
     std::fs::remove_file(l.shim(&ay)).unwrap();
     std::fs::create_dir(l.shim(&ay)).unwrap();
 
@@ -3715,9 +3294,6 @@ fn a_shim_that_cannot_be_relaid_is_named_and_not_swallowed() {
     let _ = std::fs::remove_dir_all(&l.prefix);
 }
 
-/// The command step's two arms both reach the verdict: a copy the move could not
-/// make, and — from an atpkg that is not the installed app's — every copy still in
-/// `~/.local/bin`, each a leftover; a clean move leaves none.
 #[cfg(unix)]
 #[test]
 fn every_copy_the_command_step_leaves_is_a_leftover() {
@@ -3750,9 +3326,6 @@ fn every_copy_the_command_step_leaves_is_a_leftover() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
-/// A copied command the first step could not move keeps repair from "done": with
-/// nothing installed and with a healthy store alike, the verdict is exit 1, and
-/// the same store with nothing left over is done.
 #[cfg(unix)]
 #[test]
 fn a_copied_command_left_in_place_keeps_repair_from_saying_done() {
@@ -3778,10 +3351,6 @@ fn a_copied_command_left_in_place_keeps_repair_from_saying_done() {
     let _ = std::fs::remove_dir_all(&l.prefix);
 }
 
-/// Repair puts back a program's own-name shim when only it is gone: with ty 3007 shipping
-/// `bin/ty` and `bin/tla` and only `tla` (+`alab-tla`) left, repair must not derive ty's
-/// exposes from the survivors alone. Control: an own-name shim present as a dev link into
-/// a checkout keeps that link.
 #[cfg(unix)]
 #[test]
 fn repair_lays_a_lost_own_name_shim_beside_the_survivors() {
@@ -3814,7 +3383,6 @@ fn repair_lays_a_lost_own_name_shim_beside_the_survivors() {
         assert!(target.starts_with(&d), "{name}: {}", target.display());
     }
 
-    // Control: the own-name shim is a dev link into a checkout — present, so untouched.
     let checkout = l.prefix.join("checkout-bin");
     std::fs::create_dir_all(&checkout).unwrap();
     std::fs::write(checkout.join("ty"), b"#!/bin/sh\nexit 0\n").unwrap();
@@ -3834,9 +3402,6 @@ fn repair_lays_a_lost_own_name_shim_beside_the_survivors() {
     let _ = std::fs::remove_dir_all(&l.prefix);
 }
 
-/// The lost-shim fixture: ty 3007, shipping `bin/ty` and `bin/tla`, laid with its `alab-`
-/// aliases and activated, then `bin/ty` and `alab-ty` lost (with `all`, every shim of it).
-/// Returns the layout and the build dir.
 #[cfg(unix)]
 fn seed_ty_with_lost_shim(label: &str, all: bool) -> (crate::testdir::ScratchLayout, PathBuf) {
     let l = temp_layout(label);
@@ -3865,7 +3430,6 @@ fn seed_ty_with_lost_shim(label: &str, all: bool) -> (crate::testdir::ScratchLay
     (l, d)
 }
 
-/// A `PATH` that holds nothing: one empty directory under the layout.
 #[cfg(unix)]
 fn empty_path(l: &crate::store::Layout) -> std::ffi::OsString {
     let dir = l.prefix.join("empty-path");
@@ -3873,10 +3437,6 @@ fn empty_path(l: &crate::store::Layout) -> std::ffi::OsString {
     dir.into_os_string()
 }
 
-/// A prefix from before the per-program `current` link still answers a lost shim —
-/// from the build the program's surviving shims point into — and a name with no
-/// store directory at all is refused before that walk of every shim in `bin/`, which
-/// the `aterm <word>` front door would otherwise pay for every unknown word.
 #[cfg(unix)]
 #[test]
 fn a_lost_shim_without_a_current_link_answers_from_the_surviving_shims() {
@@ -3887,21 +3447,14 @@ fn a_lost_shim_without_a_current_link_answers_from_the_surviving_shims() {
         (found.build, found.binary),
         (3007, d.join("bin").join("ty"))
     );
-    // With every shim lost too, nothing local names the build: no answer, rather
-    // than a guess.
     let tla = crate::store::ToolName::new("tla").unwrap();
     std::fs::remove_file(l.shim(&tla)).unwrap();
     std::fs::remove_file(l.shim(&tla.alias().unwrap())).unwrap();
     assert_eq!(live_without_shim(&l, "ty"), None);
-    // A name the store has never held stops at the store-directory check.
     assert!(!l.prefix.join("store").join("no-such-tool").exists());
     assert_eq!(live_without_shim(&l, "no-such-tool"), None);
 }
 
-/// A tool a program ships under another name (`tla`, shipped by `ty`) answers for its lost
-/// shim when the caller names the program (the reroute's question for `trustfmt`), and
-/// only then: a standing shim, a build that does not ship it, or the wrong program answers
-/// nothing.
 #[cfg(unix)]
 #[test]
 fn a_lost_shim_of_a_shipped_tool_answers_for_the_program_that_ships_it() {
@@ -3924,10 +3477,6 @@ fn a_lost_shim_of_a_shipped_tool_answers_for_the_program_that_ships_it() {
     let _ = std::fs::remove_dir_all(&l.prefix);
 }
 
-/// An agent program's lost `bin/` shim is not "nothing runs" where its twin leads: the
-/// `agents/` twin execs the store build, so with `agents/` ahead on PATH the managed copy
-/// still runs and `which` names the twin; with no `agents/` on PATH nothing managed runs;
-/// and a foreign copy ahead of `agents/` runs instead.
 #[cfg(unix)]
 #[test]
 fn which_names_the_agents_twin_that_still_runs_over_a_lost_bin_shim() {
@@ -3996,10 +3545,6 @@ fn which_names_the_agents_twin_that_still_runs_over_a_lost_bin_shim() {
     let _ = std::fs::remove_dir_all(&foreign_dir);
 }
 
-/// A lost shim is not an uninstalled program: with ty 3007 live and `bin/ty` gone, `run`
-/// execs the store copy with a notice naming `aterm pkg repair`, `which` says the shim is
-/// missing, and the named repair puts the shim back, after which the ordinary path answers
-/// with no notice.
 #[cfg(unix)]
 #[test]
 fn run_and_which_answer_a_live_build_whose_own_shim_is_lost() {
@@ -4052,8 +3597,6 @@ fn run_and_which_answer_a_live_build_whose_own_shim_is_lost() {
             assert!(!line.contains(never), "{label}: {never:?} in {line}");
         }
 
-        // The remedy named is the one that works: repair re-lays the shim, and then
-        // run takes the ordinary path, with no notice.
         let (relaid, _, _, failed) = relay_shims(&l);
         assert_eq!((relaid, failed.len()), (1, 0), "{label}");
         assert_eq!(live_without_shim(&l, "ty"), None, "{label}: repaired");
@@ -4070,9 +3613,6 @@ fn run_and_which_answer_a_live_build_whose_own_shim_is_lost() {
     }
 }
 
-/// A lost shim never revives what this machine turned off, and never answers for a name
-/// the program does not own. Each control keeps the lost-shim shape and changes one thing;
-/// every one answers None and never execs.
 #[cfg(unix)]
 #[test]
 fn a_lost_shim_answer_never_revives_or_borrows() {
@@ -4086,18 +3626,15 @@ fn a_lost_shim_answer_never_revives_or_borrows() {
         let _ = std::fs::remove_dir_all(&l.prefix);
     };
 
-    // A tombstone at bin/ty: the build was revoked, not lost.
     let (l, _) = seed_ty_with_lost_shim("lost-ctl-tomb-shim", false);
     crate::activate::install_tombstone_shim(&l, &ty).unwrap();
     not_run(&l, "tombstone shim");
 
-    // A tombstone among its other shims (the tla one), bin/ty absent.
     let (l, _) = seed_ty_with_lost_shim("lost-ctl-tomb-sibling", false);
     crate::activate::install_tombstone_shim(&l, &crate::store::ToolName::new("tla").unwrap())
         .unwrap();
     not_run(&l, "tombstone sibling");
 
-    // A recorded `tombstoned:` row, and an `aborted:` one.
     for (label, state) in [
         ("lost-ctl-row-tomb", "tombstoned: pin yanked/below floor"),
         ("lost-ctl-row-abort", "aborted: group rolled back"),
@@ -4116,12 +3653,10 @@ fn a_lost_shim_answer_never_revives_or_borrows() {
         not_run(&l, label);
     }
 
-    // Removed on purpose.
     let (l, _) = seed_ty_with_lost_shim("lost-ctl-removed", true);
     std::fs::write(l.removed(), "ty\n").unwrap();
     not_run(&l, "removed");
 
-    // Dev-linked from a checkout, whose shim was then lost.
     let (l, _) = seed_ty_with_lost_shim("lost-ctl-linked", false);
     let checkout = l.prefix.join("checkout");
     std::fs::create_dir_all(checkout.join("bin")).unwrap();
@@ -4132,25 +3667,21 @@ fn a_lost_shim_answer_never_revives_or_borrows() {
     std::fs::remove_file(l.shim(&ty)).unwrap();
     not_run(&l, "dev-linked");
 
-    // A build that is not complete (its ready marker gone).
     let (l, d) = seed_ty_with_lost_shim("lost-ctl-incomplete", true);
     std::fs::remove_file(d.with_file_name("3007.ready")).unwrap();
     not_run(&l, "incomplete build");
 
-    // A build that does not ship bin/ty.
     let (l, d) = seed_ty_with_lost_shim("lost-ctl-no-binary", false);
     std::fs::remove_file(d.join("bin").join("ty")).unwrap();
     crate::store::mark_build_ready(&d).unwrap();
     not_run(&l, "no bin/ty in the build");
 
-    // A `current` link that names another program's build.
     let (l, _) = seed_ty_with_lost_shim("lost-ctl-foreign-current", true);
     let other = seed_ready_build(&l, "ay", 17);
     std::fs::remove_file(l.program_current("ty")).unwrap();
     std::os::unix::fs::symlink(&other, l.program_current("ty")).unwrap();
     not_run(&l, "current names another program");
 
-    // Ownership: a trust bundle whose bin/ carries ty, while program ty is not here.
     let l = temp_layout("lost-ctl-bundle");
     let trust = seed_ready_build(&l, "trust", 1);
     let bundled = trust.join("bin").join("ty");
@@ -4171,12 +3702,10 @@ fn a_lost_shim_answer_never_revives_or_borrows() {
     );
     not_run(&l, "bundled same-named binary");
 
-    // An alias name is never a program.
     let (l, _) = seed_ty_with_lost_shim("lost-ctl-alias", false);
     assert_eq!(live_without_shim(&l, "alab-ty"), None);
     let _ = std::fs::remove_dir_all(&l.prefix);
 
-    // The unchanged path: the shim stands, so nothing is "lost".
     let (l, d) = seed_ty_with_lost_shim("lost-ctl-present", false);
     let (relaid, _, _, _) = relay_shims(&l);
     assert_eq!(relaid, 1);
@@ -4192,10 +3721,6 @@ fn a_lost_shim_answer_never_revives_or_borrows() {
     let _ = std::fs::remove_dir_all(&l.prefix);
 }
 
-/// An agent program with a lost shim is named, not run: its run hands `claude update` to
-/// the package manager only through a shim that resolves, so exec'ing the store copy would
-/// let the vendor's updater run. `run` says it is installed and names the repair; `which`
-/// offers no `now: aterm pkg run`.
 #[cfg(unix)]
 #[test]
 fn a_lost_agent_shim_is_named_and_not_run() {
@@ -4233,9 +3758,6 @@ fn a_lost_agent_shim_is_named_and_not_run() {
     let _ = std::fs::remove_dir_all(&l.prefix);
 }
 
-/// Repair keeps what the build exports: `relay_shims` re-lays each shim with its build's
-/// sidecar environment, so `bin/claude` keeps `export DISABLE_AUTOUPDATER=1` and the
-/// vendor's own updater stays off.
 #[cfg(unix)]
 #[test]
 fn repair_relays_a_shim_with_the_environment_its_build_declared() {
@@ -4259,12 +3781,6 @@ fn repair_relays_a_shim_with_the_environment_its_build_declared() {
     let _ = std::fs::remove_dir_all(&l.prefix);
 }
 
-/// The pass heals a primary shim laid without its build's environment. An up-to-date
-/// program is never laid again, so the alias reconcile re-lays such a primary first and
-/// the `agents/` twin (and an ALab program's `alab-` alias) carry the healed environment in
-/// the same pass; a shim exporting something else is put to exactly the declaration; a
-/// second pass writes nothing; and a build with no sidecar keeps whatever its shim exports
-/// (add-only).
 #[cfg(unix)]
 #[test]
 fn the_pass_re_lays_a_primary_that_lost_its_builds_environment() {
@@ -4276,7 +3792,6 @@ fn the_pass_re_lays_a_primary_that_lost_its_builds_environment() {
     crate::shim_env::write_sidecar(&dir, &env).expect("sidecar");
     let claude = crate::store::ToolName::new("claude").unwrap();
     let (shim, twin) = (l.shim(&claude), l.agent_shim(&claude));
-    // An ALab program whose shim exports other than its build declares, with its alias.
     let ay_dir = seed_ready_build(&l, "ay", 17);
     crate::activate::install_tools_env(
         &l,
@@ -4348,7 +3863,6 @@ fn the_pass_re_lays_a_primary_that_lost_its_builds_environment() {
         );
     }
 
-    // Add-only: no sidecar ⇒ the shim's own exports stand.
     crate::shim_env::write_sidecar(&dir, &crate::shim_env::ShimEnv::NONE).unwrap();
     reconcile_aliases(&l, &index);
     assert_eq!(crate::platform::shim_env_of(&shim), env, "never stripped");
@@ -4431,8 +3945,6 @@ fn repair_refuses_malformed_development_link_intent_without_replacing_its_shim()
     }
 }
 
-/// `repair`'s verdict counts an item it could not read (`Unknown`) as left undone, as it
-/// counts a failed or blocked one: exit 1 and "not done", never "done".
 #[test]
 fn repair_counts_an_unread_item_undone() {
     let row = |outcome| aterm_converge::ItemReport {
@@ -4477,8 +3989,6 @@ fn repair_counts_an_unread_item_undone() {
     }
 }
 
-/// An rc `repair` leaves alone is said, with why: here a `~/.zshrc` that is a dangling
-/// link, which no pass edits.
 #[test]
 fn repair_says_an_rc_it_left_alone() {
     let layout = temp_layout("repair-rc-alone");
@@ -4509,16 +4019,12 @@ fn repair_says_an_rc_it_left_alone() {
     );
 }
 
-/// Repair respects a rollback: `rollback` keeps the build it rolled off until gc, so repair
-/// re-lays the build `current` selects, not the highest on disk, or it would undo the
-/// rollback and mint the `LinkShimMismatch` doctor reports.
 #[test]
 fn repair_respects_rollback() {
     let l = temp_layout("repair-rollback");
     let d18 = seed_ready_build(&l, "ay", 18);
     let d19 = seed_ready_build(&l, "ay", 19);
     activate_seeded(&l, "ay", &d19);
-    // The rollback: shims and both links back on 18, 19 retained on disk.
     activate_seeded(&l, "ay", &d18);
     let ay = crate::store::ToolName::new("ay").unwrap();
 
@@ -4538,12 +4044,6 @@ fn repair_respects_rollback() {
     let _ = std::fs::remove_dir_all(&l.prefix);
 }
 
-/// A complete trust build in the shape bundles 8571/8589/8590/8595 ship: `bin/rustc` a
-/// separate file beside `bin/trustc` whose bytes differ (the ad-hoc signature bakes each
-/// file's name in), a tippy that refuses that pair, and a `lib/` with a driver dylib, with
-/// its ready marker, `store/trust/current` pointing at it, and plain shims for `trustc`,
-/// `targo`, `tippy` and `alab-tippy` as a client before exec roots laid them. Returns the
-/// build dir.
 fn seed_affected_trust(layout: &crate::store::Layout, build: u64) -> PathBuf {
     let dir = layout.build_dir("trust", build);
     let bin = dir.join("bin");
@@ -4580,7 +4080,6 @@ fn seed_affected_trust(layout: &crate::store::Layout, build: u64) -> PathBuf {
     dir
 }
 
-/// Whether the shim `bin/<name>` carries an exec-root guard line.
 fn routes(layout: &crate::store::Layout, name: &str) -> bool {
     std::fs::read_to_string(layout.bin_dir().join(name))
         .unwrap()
@@ -4588,11 +4087,6 @@ fn routes(layout: &crate::store::Layout, name: &str) -> bool {
         .any(|l| l.starts_with("[ ! -h "))
 }
 
-/// THE PASS HEALS AN UP-TO-DATE AFFECTED MACHINE WITHOUT AN INSTALL. A machine already
-/// on trust 8595 with the plain shims an older client laid is short-circuited by the
-/// apply before any shim is written; [`reconcile_exec_roots`] alone — no
-/// `install_tools` — lays `compat/trust/8595` and routes every trust shim, the `alab-`
-/// alias included, and answers `true`.
 #[test]
 fn the_pass_reconcile_routes_an_up_to_date_affected_install() {
     let l = temp_layout("exec-root-pass");
@@ -4608,14 +4102,6 @@ fn the_pass_reconcile_routes_an_up_to_date_affected_install() {
     }
 }
 
-/// REPAIR ROUTES, AND SAYS SO IN ITS EXIT CODE WHEN IT CANNOT. An empty store still
-/// reconciles roots left by a partial removal, and a failure there also exits 1.
-/// Over an affected build
-/// with plain shims, [`repair_store`] re-lays them through the root it lays and exits
-/// 0; with the root unlayable (an unreadable directory in the build's `lib/`, standing
-/// in for the EXDEV of a store on another volume) every shim is still re-laid — plain,
-/// running the store path as before — and repair exits 1, because doctor's fix for a
-/// PATH tippy that cannot run is exactly this verb.
 #[test]
 fn repair_routes_the_trust_shims_and_exits_1_when_the_root_cannot_be_laid() {
     let empty = temp_layout("exec-root-repair-empty");
@@ -4659,9 +4145,6 @@ fn repair_routes_the_trust_shims_and_exits_1_when_the_root_cannot_be_laid() {
     let _ = std::fs::remove_dir_all(&l.prefix);
 }
 
-/// A row does not outlive its program: `active_builds` reads shims, but Settings ▸
-/// Packages reads the record. The stale-row reconciler rightly declines (the signed index
-/// still names the program), so the uninstall retires the row.
 #[test]
 fn uninstalling_retires_the_program_row() {
     let layout = temp_layout("retire-row");
@@ -4692,7 +4175,6 @@ fn uninstalling_retires_the_program_row() {
         "precondition: ay is genuinely live"
     );
 
-    // The real path the CLI arm runs, not the primitive it calls.
     uninstall_and_retire(&layout, "ay").expect("uninstall succeeds");
 
     assert!(
@@ -4715,10 +4197,6 @@ fn uninstalling_retires_the_program_row() {
     let _ = std::fs::remove_dir_all(&layout.prefix);
 }
 
-/// A held-update record ends with the last build it moves off: doctor reports an outlived
-/// record and changes nothing, so the doors that write end it (the uninstall that took its
-/// builds, and `repair`, which doctor names for a store emptied by hand). Negative
-/// control: a record one of whose builds still stands is kept by both.
 #[test]
 fn uninstall_and_repair_end_a_held_update_record_that_outlived_its_builds() {
     let layout = temp_layout("held-outlived-doors");
@@ -4745,21 +4223,18 @@ fn uninstall_and_repair_end_a_held_update_record_that_outlived_its_builds() {
     };
     let held = || crate::quiet::read(&layout).is_some();
 
-    // One build it moves off still stands: kept by the uninstall and by repair.
     note(&[("ay", 18), ("clean", 7)]);
     uninstall_and_retire(&layout, "ay").expect("uninstall succeeds");
     assert!(held(), "clean 7 still stands: the record is a wait");
     let _ = repair_store(&layout, &[]);
     assert!(held(), "and repair keeps it");
 
-    // The uninstall that takes its last build ends it.
     uninstall_and_retire(&layout, "clean").expect("uninstall succeeds");
     assert!(
         !held(),
         "nothing it moves off is left: the record ended with them"
     );
 
-    // A record a store emptied by hand left: repair, the door doctor names, ends it.
     note(&[("clean", 7)]);
     assert!(matches!(
         crate::quiet::held(&layout),
@@ -4770,10 +4245,6 @@ fn uninstall_and_repair_end_a_held_update_record_that_outlived_its_builds() {
     let _ = std::fs::remove_dir_all(&layout.prefix);
 }
 
-/// Row retirement accepts only program names: `ops::uninstall`'s shape rule rejects only
-/// empty/`.`/`..`/separators/NUL, so without the gate `atpkg uninstall '*toolset*'` would
-/// delete a bookkeeping row with its own owner, and `atpkg uninstall --help` would mint a
-/// removed-marker for a flag.
 #[test]
 fn retirement_refuses_names_that_are_not_programs() {
     let layout = temp_layout("retire-gate");
@@ -4807,8 +4278,6 @@ fn retirement_refuses_names_that_are_not_programs() {
         !removed_programs(&layout).contains("--help"),
         "no removed-marker is minted for a flag"
     );
-    // The removal intent is recorded before the delete, so the shape rule `ops::uninstall`
-    // enforces must refuse first too: a path-shaped name is not a program to remember.
     assert!(uninstall_and_retire(&layout, "a/b").is_err());
     assert!(
         removed_programs(&layout).is_empty(),
@@ -4817,10 +4286,6 @@ fn retirement_refuses_names_that_are_not_programs() {
     let _ = std::fs::remove_dir_all(&layout.prefix);
 }
 
-/// The removal intent lands before the delete. `ops::uninstall` takes the shims off and
-/// then spends seconds in `remove_dir_all` (3.4 GB for trust); a kill inside the delete
-/// must not leave the program absent and recorded nowhere, for the next pass to reinstall.
-/// A subtree the delete cannot empty stops `remove_dir_all` where a kill would.
 #[cfg(unix)]
 #[test]
 fn a_delete_cut_short_still_leaves_the_removal_recorded() {
@@ -4832,7 +4297,6 @@ fn a_delete_cut_short_still_leaves_the_removal_recorded() {
     std::fs::write(locked.join("payload"), b"x").unwrap();
     std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o500)).unwrap();
     if std::fs::write(locked.join("probe"), b"x").is_ok() {
-        // Privileged (root in a container): permissions cannot stop the delete here.
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
         let _ = std::fs::remove_dir_all(&layout.prefix);
         aterm_uds::host::could_not_run(
@@ -4870,9 +4334,6 @@ fn a_delete_cut_short_still_leaves_the_removal_recorded() {
     let _ = std::fs::remove_dir_all(&layout.prefix);
 }
 
-/// An offline first run still leaves a witness: the environmental failures' reason goes
-/// only to the outcome sentence, so `record_outcome` creates the record on a virgin store.
-/// That failed-seed machine is the case doctor's fallback to this sentence exists for.
 #[test]
 fn the_outcome_sentence_creates_the_record_it_needs() {
     let layout = temp_layout("virgin-outcome");
@@ -4893,10 +4354,6 @@ fn the_outcome_sentence_creates_the_record_it_needs() {
     assert_eq!(s.schema, 1, "a created record is a well-formed one");
 }
 
-/// The record is a derived memo; the signed index is the authority on what exists. The
-/// conditions are pinned together because each alone is a different bug: prune a sentinel
-/// and the bookkeeping rows lose their reapers; prune a live-but-dropped program and
-/// `atpkg verify` fails closed forever on an erased attestation.
 #[test]
 fn the_record_reconciles_against_the_signed_index() {
     let row = |state: &str| crate::ProgramStatus {
@@ -4942,10 +4399,6 @@ fn the_record_reconciles_against_the_signed_index() {
     );
 }
 
-/// Fail-closed: an account that cannot be resolved is not proof that HOME is it.
-/// (Some, Some) same → account; different → mismatch naming both; (Some, None) →
-/// unresolved, naming the reason; (None, _) → the account (an unset HOME falls back
-/// to the passwd entry in `home_dir()`).
 #[test]
 fn an_unresolvable_account_is_a_synthetic_machine() {
     use crate::machine::HomePosture;
@@ -4981,13 +4434,9 @@ fn an_unresolvable_account_is_a_synthetic_machine() {
     );
 }
 
-/// The same directory under another spelling is the real home; a different one, or a
-/// missing one, is not.
 #[cfg(unix)]
 #[test]
 fn the_same_directory_under_another_spelling_is_the_real_home() {
-    // Unique per run (`crate::testdir`), so two runs of this suite never race on one
-    // directory and symlink name.
     let t = crate::testdir::dir("atpkg-same-directory-test-");
     let links = crate::testdir::dir("atpkg-same-directory-link-");
     let link = links.join("link");
@@ -5006,10 +4455,6 @@ fn the_same_directory_under_another_spelling_is_the_real_home() {
     let _ = std::fs::remove_dir_all(&t);
 }
 
-/// A config that does not parse changes nothing: the `[machine]` default acts, so
-/// "malformed ⇒ defaults" would let a typo three tables away re-enable what the owner
-/// switched off. The refusal comes before the home question: it is cheaper, and the one
-/// the owner can fix.
 #[test]
 fn an_unreadable_config_refuses_before_anything_is_measured() {
     let unreadable = crate::config::MachineConfig {
@@ -5020,21 +4465,14 @@ fn an_unreadable_config_refuses_before_anything_is_measured() {
         machine_refusal(&unreadable).is_some(),
         "an unreadable config refuses"
     );
-    // And it refuses even though the resolved value looks like the default.
     assert_eq!(
         unreadable.universal_control(),
         crate::config::UniversalControlPolicy::Off
     );
 }
 
-/// `machine`'s grammar is three spellings and nothing else: bare (read), `apply` and
-/// `cache` (the build cache housekeeping's dry run). Anything more is a usage error, so a
-/// typo never silently reads when someone meant to apply.
 #[test]
 fn machine_grammar_is_exact() {
-    // Both accepted spellings are answered by `--help` without acting, like every
-    // verb; and a third word is refused. The read/apply bodies touch the real
-    // machine, so they are exercised by hand, not here.
     let argv = |s: &str| -> Vec<String> { s.split_whitespace().map(String::from).collect() };
     assert_eq!(
         cmd_machine(&argv("check")),
@@ -5045,14 +4483,11 @@ fn machine_grammar_is_exact() {
     assert_eq!(cmd_machine(&argv("apply extra")), ExitCode::from(2));
 }
 
-/// `--help` answers, never acts, for every verb.
 #[test]
 fn help_flag_is_answered_for_every_verb_and_never_dispatches() {
     for verb in VERBS {
         for spelling in ["--help", "-h"] {
             let argv: Vec<std::ffi::OsString> = vec![(*verb).into(), spelling.into()];
-            // Reaching a verb body would need the store lock or the network;
-            // returning SUCCESS here is the observable proof it short-circuited.
             let code = main_entry(argv);
             assert_eq!(
                 format!("{code:?}"),
@@ -5063,8 +4498,6 @@ fn help_flag_is_answered_for_every_verb_and_never_dispatches() {
     }
 }
 
-/// A `--help` that belongs to the tool is forwarded, not answered: `run` looks only at
-/// its first operand, and a literal `--` ends the scan for every verb.
 #[test]
 fn a_tools_own_help_flag_is_forwarded_by_run_and_stopped_by_a_separator() {
     let s = |xs: &[&str]| xs.iter().map(|x| (*x).to_string()).collect::<Vec<_>>();
@@ -5081,9 +4514,6 @@ fn a_tools_own_help_flag_is_forwarded_by_run_and_stopped_by_a_separator() {
     assert!(!help_flag_addresses_atpkg("install", &s(&[])));
 }
 
-/// `lane` at the dispatch edge: a stock command line is refused (exit 2), a Trust one is
-/// not (0), and a `--help` after `--` belongs to the command, so `lane -- cargo --help` is
-/// read, not answered with lane's own usage.
 #[test]
 fn lane_refuses_stock_rust_and_reads_the_command_after_the_separator() {
     let run = |argv: &[&str]| main_entry(argv.iter().map(std::ffi::OsString::from).collect());
@@ -5112,13 +4542,6 @@ fn lane_refuses_stock_rust_and_reads_the_command_after_the_separator() {
     assert_eq!(run(&["lane", "--verbose", "-"]), ExitCode::from(1));
 }
 
-/// A provisioned Mac's launch never touches the network for its seedless sentence:
-/// `report_seedless_posture` resolves the signed index (a metered listing, verification,
-/// a floor record, under the store lock) only for an empty store a typed `aterm pkg seed`
-/// asks about, where its verdict is the point; a store that holds builds prints the same
-/// line either way. The window's own seed (`--wait-lock`) never resolves, since the update
-/// right behind it says the same verdict (`a_window_seed_asks_no_index_and_a_typed_one_does`
-/// in `tests/seed_disabled.rs` drives both at the process edge).
 #[test]
 fn the_seedless_lane_resolves_the_index_only_for_an_empty_store() {
     use std::cell::Cell;
@@ -5141,8 +4564,6 @@ fn the_seedless_lane_resolves_the_index_only_for_an_empty_store() {
             None,
         ]
     };
-    // A store that holds builds is served, whatever the index would have said — and
-    // the index is never asked.
     for answer in answers() {
         assert_eq!(
             seedless_serves_us(true, resolve(answer)),
@@ -5154,17 +4575,12 @@ fn the_seedless_lane_resolves_the_index_only_for_an_empty_store() {
         0,
         "a provisioned store must not resolve the index for the seedless sentence"
     );
-    // An empty store asks exactly once and reports what the index said.
     for answer in answers() {
         assert_eq!(seedless_serves_us(false, resolve(answer.clone())), answer);
     }
     assert_eq!(calls.get(), 4, "an empty store resolves once per verdict");
 }
 
-/// The seed never calls a machine empty-handed while a vendor-direct program is still to
-/// land: agy and muse are in no index, so an `exclude` naming every index program and
-/// claude and codex leaves `seed_serviceable` empty while the pass right behind the seed
-/// installs both.
 #[test]
 fn a_wanted_vendor_program_serves_the_seed_without_the_index() {
     let darwin = "aarch64-apple-darwin";
@@ -5183,13 +4599,11 @@ fn a_wanted_vendor_program_serves_the_seed_without_the_index() {
         &crate::config::PackagesConfig::default(),
         &none
     ));
-    // Every vendor program excluded: the index alone answers.
     assert!(!vendor_set_wanted_on(
         darwin,
         &excluding(programs().collect()),
         &none
     ));
-    // One left still serves; an uninstall takes it out as an exclude does.
     let all_but_muse = excluding(programs().filter(|p| p != "muse").collect());
     assert!(vendor_set_wanted_on(darwin, &all_but_muse, &none));
     assert!(!vendor_set_wanted_on(
@@ -5197,7 +4611,6 @@ fn a_wanted_vendor_program_serves_the_seed_without_the_index() {
         &all_but_muse,
         &std::collections::BTreeSet::from(["muse".to_string()])
     ));
-    // Off darwin, Meta's binary is unserved: wanted there, it promises nothing.
     assert!(!vendor_set_wanted_on(
         "x86_64-unknown-linux-gnu",
         &all_but_muse,
@@ -5205,10 +4618,6 @@ fn a_wanted_vendor_program_serves_the_seed_without_the_index() {
     ));
 }
 
-/// Adoption keeps a user's toolchain whole as the suite grows (§11): under the one install
-/// consent (`auto_install`, default on) a machine that runs the set gets newly published
-/// members without being asked again. A lifecycle error is silent both ways: a missing
-/// marker decays the toolset, a sticky one reinstalls what the user removed.
 #[test]
 fn adoption_is_recorded_by_the_whole_set_and_forgotten_by_uninstall() {
     let dir = crate::testdir::dir("atpkg-adopt-");
@@ -5216,10 +4625,8 @@ fn adoption_is_recorded_by_the_whole_set_and_forgotten_by_uninstall() {
         prefix: dir.clone(),
     };
 
-    // A fresh store has not adopted.
     assert!(!adopted(&layout), "a fresh store has adopted nothing");
 
-    // A whole-set install records it, and is idempotent.
     record_adoption(&layout);
     assert!(adopted(&layout), "the whole-set install adopts");
     let first = std::fs::read(layout.adopted()).unwrap();
@@ -5230,7 +4637,6 @@ fn adoption_is_recorded_by_the_whole_set_and_forgotten_by_uninstall() {
         "re-adopting rewrites nothing"
     );
 
-    // The marker is 0600 like every other durable store file.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
@@ -5241,20 +4647,13 @@ fn adoption_is_recorded_by_the_whole_set_and_forgotten_by_uninstall() {
         assert_eq!(mode & 0o777, 0o600, "adoption marker must be 0600");
     }
 
-    // Adoption is the file's existence, never a parsed value, so a garbled or truncated
-    // write cannot read as another answer.
     std::fs::write(layout.adopted(), b"\0\0garbage").unwrap();
     assert!(adopted(&layout), "existence is the whole predicate");
 
-    // Uninstall forgets it: set-completion must never undo an explicit removal.
     clear_adoption(&layout);
     assert!(!adopted(&layout), "uninstall opts out of set completion");
-    // Clearing what is already clear is not an error.
     clear_adoption(&layout);
 
-    // The whole-set verb's decision table: an install adopts, and so does a set found
-    // already complete; a machine with no builds before or after, a failed member, a
-    // skipped member or an owed member does not.
     let none: Vec<String> = Vec::new();
     let some = vec![String::from("trust")];
     assert!(
@@ -5290,9 +4689,6 @@ fn adoption_is_recorded_by_the_whole_set_and_forgotten_by_uninstall() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A targeted removal sticks too: without a per-program record the resumable seed lane
-/// would bring `atpkg uninstall ny` back on the next launch. Asking for it back lifts the
-/// record.
 #[test]
 fn a_single_program_removal_is_not_undone_by_the_seed_lane() {
     let dir = crate::testdir::dir("atpkg-rm-");
@@ -5307,7 +4703,6 @@ fn a_single_program_removal_is_not_undone_by_the_seed_lane() {
     let rm = removed_programs(&layout);
     assert!(rm.contains("ny") && rm.contains("clean"), "{rm:?}");
     assert_eq!(rm.len(), 2, "no duplicate from the repeat: {rm:?}");
-    // The comment header must never read as a program name.
     assert!(!rm.iter().any(|p| p.starts_with('#')), "{rm:?}");
 
     clear_removed(&layout, &["ny".to_string()]);
@@ -5328,12 +4723,6 @@ fn a_single_program_removal_is_not_undone_by_the_seed_lane() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A removal that could not be recorded is said. An unwritable prefix (a read-only store,
-/// a full disk, a `removed` path something else owns) must not leave `uninstall` printing
-/// success with nothing recorded: this file alone keeps the program out of the unattended
-/// lanes (`seed_serviceable` and `install_default_set_inner` filter on
-/// `removed_programs`). `write_removed` returns the failure, the recorder prints it, and
-/// the entries already recorded survive the temp+rename.
 #[cfg(unix)]
 #[test]
 fn a_removal_record_that_cannot_be_written_is_reported_not_swallowed() {
@@ -5346,9 +4735,6 @@ fn a_removal_record_that_cannot_be_written_is_reported_not_swallowed() {
     record_removed(&layout, "ny");
     assert!(removed_programs(&layout).contains("ny"));
 
-    // The prefix goes read-only: the temp file cannot be created, and the rename
-    // that would publish it could not land either. Permissions are restored before
-    // anything is asserted, so a failure here still leaves a removable directory.
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
     let mut all = removed_programs(&layout);
     all.insert("clean".to_string());
@@ -5359,8 +4745,6 @@ fn a_removal_record_that_cannot_be_written_is_reported_not_swallowed() {
         "an unwritable prefix must come back as an error, never a silent success"
     );
 
-    // The removal already recorded is intact — never truncated in place — and no
-    // half-written temp file is left for the next reader to find.
     assert_eq!(
         removed_programs(&layout),
         std::collections::BTreeSet::from(["ny".to_string()]),
@@ -5379,9 +4763,6 @@ fn a_removal_record_that_cannot_be_written_is_reported_not_swallowed() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Removal must stick: the resumable seed lane installs whatever the store lacks, so it
-/// would reinstall everything `uninstall --all` removed on the next launch. The decline
-/// marker stops that and an explicit install lifts it; both directions are pinned.
 #[test]
 fn declining_the_toolset_survives_until_an_explicit_install() {
     let dir = crate::testdir::dir("atpkg-decline-");
@@ -5392,7 +4773,6 @@ fn declining_the_toolset_survives_until_an_explicit_install() {
     assert!(!declined(&layout), "a fresh store has declined nothing");
     record_decline(&layout);
     assert!(declined(&layout), "uninstall --all declines the toolset");
-    // Idempotent, and 0600 like every other durable marker.
     record_decline(&layout);
     assert!(declined(&layout));
     #[cfg(unix)]
@@ -5404,7 +4784,6 @@ fn declining_the_toolset_survives_until_an_explicit_install() {
             .mode();
         assert_eq!(mode & 0o777, 0o600, "decline marker must be 0600");
     }
-    // Existence is the predicate — never a parsed value.
     std::fs::write(layout.declined(), b"\0garbage").unwrap();
     assert!(declined(&layout));
 
@@ -5412,18 +4791,12 @@ fn declining_the_toolset_survives_until_an_explicit_install() {
     assert!(!declined(&layout), "an explicit install lifts the decline");
     clear_decline(&layout); // clearing what is clear is not an error
 
-    // Decline and adoption are independent facts: declining must not read as adoption,
-    // or a removed toolset would still get set completion.
     record_decline(&layout);
     assert!(!adopted(&layout), "declining is not adopting");
 
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// The marker contract has a positive terminal (`seed-done:`), and the ledger knows which
-/// half of the contract each marker keeps. Without it a pass that announced itself, ended
-/// well and had no roster to name printed nothing, and the GUI read that silence as a
-/// failure.
 #[test]
 fn the_marker_table_covers_every_marker_and_names_the_one_that_opens() {
     use super::announcement::MARKERS;
@@ -5437,17 +4810,10 @@ fn the_marker_table_covers_every_marker_and_names_the_one_that_opens() {
         vec![NET_STARTING_MARKER],
         "exactly one marker OPENS an announcement; every other one answers"
     );
-    // `lock-waiting:`, which is NEITHER half, stays out of the table: a
-    // `lock-waiting:` line answers nothing and opens nothing, so the ledger
-    // must read straight past it (a child that waited and then announced is
-    // an OPEN announcement, not an answered one).
     assert!(
         !MARKERS.iter().any(|(m, _)| *m == LOCK_WAITING_MARKER),
         "`lock-waiting:` is neither an announcement nor an answer"
     );
-    // …and so does `lock-acquired:`, which answers the wait, not an announcement: were it
-    // an answer, a child that waited, acquired and then announced would look answered
-    // before it began.
     assert!(
         !MARKERS.iter().any(|(m, _)| *m == LOCK_ACQUIRED_MARKER),
         "`lock-acquired:` is neither an announcement nor an answer"
@@ -5471,10 +4837,6 @@ fn the_marker_table_covers_every_marker_and_names_the_one_that_opens() {
     );
 }
 
-/// The ledger reads the same bytes the GUI parses, and an informational row is not an
-/// answer: `managed-current:` / `machine-settings:` print at the end of every pass,
-/// announced or not, and counting one as a terminal would let a pass retire a card it had
-/// not finished with.
 #[test]
 fn only_a_terminal_marker_closes_an_announcement() {
     use super::announcement;
@@ -5498,24 +4860,14 @@ fn only_a_terminal_marker_closes_an_announcement() {
 
     announcement::note(&format!("atpkg: {SEED_DONE_MARKER}the pass finished"));
     assert!(!announcement::is_open(), "the positive terminal answers");
-    // THE PROPERTY (2026-08-20 audit): a pass that announced nothing answers
-    // nothing — `answer_announcement` runs at every announcing verb's tail, and with no
-    // announcement open it is a no-op for BOTH verdicts, or the warning card is back on
-    // screen at every launch of a healthy machine.
     for ok in [true, false] {
         answer_announcement(ok);
         assert!(!announcement::is_open(), "nothing to answer (ok={ok})");
     }
 }
 
-/// The wire lane's announcement, as the window reads it: the `net-starting:` prefix and
-/// the set, then the signed sizes as the line's one trailing parenthetical (the toolchain
-/// bar's input), within the bar's and the log's bounds — and no line at all for a pass
-/// with nothing to install.
 #[test]
 fn the_network_lane_names_the_size_and_the_off_switches() {
-    // The set a first launch names, from the compiled lists the client installs from,
-    // sorted as `install_default_set_inner` sorts `will_install`.
     let mut set: Vec<String> = crate::stub::DEFAULT_SET_STUB_NAMES
         .iter()
         .map(|(n, _)| (*n).to_string())
@@ -5523,15 +4875,12 @@ fn the_network_lane_names_the_size_and_the_off_switches() {
         .collect();
     set.sort();
     set.dedup();
-    // 3_650_000_000 B = 3.399… GiB and 1_100_000_000 B = 1.024… GiB, so the one
-    // renderer's rounding is exercised on both figures of the same `[cost]` row.
     let both = SignedSizes {
         download: Some(1_100_000_000),
         disk: Some(3_650_000_000),
     };
     let line = net_announcement(Consent::InstallingAterm, &set, both)
         .expect("a non-empty network pass announces before acting");
-    // The GUI strips exactly this prefix…
     assert!(
         line.starts_with(&format!(
             "atpkg: {NET_STARTING_MARKER}installing {} program(s) over the network: {} — ",
@@ -5540,7 +4889,6 @@ fn the_network_lane_names_the_size_and_the_off_switches() {
         )),
         "{line}"
     );
-    // …each size is cost::human_bytes of its signed sum, stated once…
     assert_eq!(
         line.matches("3.4 GiB").count(),
         1,
@@ -5551,11 +4899,7 @@ fn the_network_lane_names_the_size_and_the_off_switches() {
         1,
         "one download figure, once: {line}"
     );
-    // …the whole line owns exactly two '(' — "program(s)" and the size — so a
-    // parenthesis can arrive from neither the switch phrase nor the format…
     assert_eq!(line.matches('(').count(), 2, "{line}");
-    // …and the sizes are the line's trailing parenthetical, which is where the toolchain
-    // bar reads them, so the off-switch phrase must bring no parenthesis of its own…
     let (_, tail) = line.rsplit_once('(').expect("a parenthetical");
     assert_eq!(tail, "~1.0 GiB download, ~3.4 GiB on disk)", "{line}");
     let (consent_clause, seed_clause) = Consent::InstallingAterm.announced();
@@ -5565,18 +4909,12 @@ fn the_network_lane_names_the_size_and_the_off_switches() {
             "the bar would read the wrong parenthetical: {phrase}"
         );
     }
-    // …shown whole: the bar clips the text inside the parentheses at 40 characters, and
-    // the figures this line exists to disclose may not be what gets clipped…
     let inside = tail.strip_suffix(')').expect("closed");
     assert!(
         inside.chars().count() <= 40,
         "{inside:?} would be clipped on the toolchain bar"
     );
     assert_eq!(crate::progress::sanitize_for_tty(inside, 40), inside);
-    // …and the whole line fits the log, whose sink elides a record body past
-    // aterm_log::MAX_RECORD_BYTES = 512. The sizes are last on the line, so they are the
-    // first casualty of any growth. atpkg does not depend on aterm-log, so the cap is
-    // pinned here by hand: change both or neither.
     const MAX_RECORD_BYTES: usize = 512; // = aterm_log::MAX_RECORD_BYTES
     let detail = line
         .strip_prefix(&format!("atpkg: {NET_STARTING_MARKER}"))
@@ -5587,34 +4925,24 @@ fn the_network_lane_names_the_size_and_the_off_switches() {
         "the log sink would elide the sizes: {logged} bytes as logged, cap \
          {MAX_RECORD_BYTES}: {line}"
     );
-    // No signed sum ⇒ no size at all (no number beats a wrong one), the
-    // switches still named, and the last '(' is then "program(s)", whose
-    // tail does not close — the bar shows "starting…" rather than a guess.
     let bare = net_announcement(Consent::InstallingAterm, &set, SignedSizes::UNKNOWN)
         .expect("a non-empty network pass announces before acting");
     assert!(!bare.contains("GiB") && !bare.contains("GB"), "{bare}");
     assert!(bare.contains(NET_OFF_SWITCH), "{bare}");
     let (_, tail) = bare.rsplit_once('(').expect("program(s)");
     assert!(!tail.ends_with(')'), "{bare}");
-    // …and the ordinary no-op tick stays silent, whoever consented.
     for consent in [Consent::InstallingAterm, Consent::Explicit] {
         assert!(net_announcement(consent, &[], both).is_none());
     }
 }
 
-/// Who adopted, across the verbs that change it: the record behind
-/// `set_completion_consent`'s second input. The seed pass writes it only when it creates
-/// adoption, since stamping a marker it found would hand a machine the explicit verb
-/// adopted back to the first launch's consent. Neither file alone vouches for anything.
 #[test]
 fn who_adopted_is_recorded_only_when_the_seed_pass_creates_adoption() {
     let layout = temp_layout("who-adopted");
-    // What `cmd_update_all` asks.
     let consent = |layout: &crate::store::Layout| {
         set_completion_consent(adopted(layout), adopted_by_seed(layout))
     };
 
-    // The first launch adopts, and says so.
     record_seed_adoption(&layout);
     assert!(adopted(&layout) && adopted_by_seed(&layout));
     assert_eq!(consent(&layout), Consent::InstallingAterm);
@@ -5627,14 +4955,10 @@ fn who_adopted_is_recorded_only_when_the_seed_pass_creates_adoption() {
             .mode();
         assert_eq!(mode & 0o777, 0o600, "the record is 0600 like the marker");
     }
-    // Every later launch re-runs the seed pass: a no-op.
     let first = std::fs::read(layout.adopted_by_seed()).unwrap();
     record_seed_adoption(&layout);
     assert_eq!(std::fs::read(layout.adopted_by_seed()).unwrap(), first);
 
-    // Default keys, `uninstall --all`, then Settings "Install ALab toolset":
-    // uninstall forgets both files, the explicit verb clears the record and
-    // adopts, and the next launch's seed pass finds a marker and records nothing.
     clear_adoption(&layout);
     assert!(!adopted(&layout) && !layout.adopted_by_seed().exists());
     clear_seed_adoption(&layout);
@@ -5647,21 +4971,17 @@ fn who_adopted_is_recorded_only_when_the_seed_pass_creates_adoption() {
         "the explicit verb adopted this machine; its passes must not claim the first launch"
     );
 
-    // The explicit verb on a machine the seed pass adopted takes the claim over.
     clear_adoption(&layout);
     record_seed_adoption(&layout);
     assert_eq!(consent(&layout), Consent::InstallingAterm);
     clear_seed_adoption(&layout);
     assert!(adopted(&layout), "clearing the record is not un-adopting");
     assert_eq!(consent(&layout), Consent::Explicit);
-    // Clearing what is already clear is not an error.
     clear_seed_adoption(&layout);
 
-    // A record without the marker vouches for nothing…
     clear_adoption(&layout);
     std::fs::write(layout.adopted_by_seed(), b"stray").unwrap();
     assert!(!adopted_by_seed(&layout));
-    // …and a marker that predates the record reads as the explicit verb's.
     clear_seed_adoption(&layout);
     record_adoption(&layout);
     assert_eq!(consent(&layout), Consent::Explicit);
@@ -5669,9 +4989,6 @@ fn who_adopted_is_recorded_only_when_the_seed_pass_creates_adoption() {
     let _ = std::fs::remove_dir_all(&layout.prefix);
 }
 
-/// The None-on-zero sum behind both figures: one undeclared (zero) entry
-/// poisons its total, the other figure is unaffected, and an already-poisoned
-/// total stays `None` whatever follows.
 #[test]
 fn a_signed_sum_is_poisoned_by_one_undeclared_entry() {
     assert_eq!(sum_nonzero(Some(0), 5), Some(5));
@@ -5681,37 +4998,23 @@ fn a_signed_sum_is_poisoned_by_one_undeclared_entry() {
     assert_eq!(sum_nonzero(Some(u64::MAX), 1), Some(u64::MAX));
 }
 
-/// The consent policy as a table ([`should_complete_set`] states each input's reason).
 #[test]
 fn set_completion_honours_every_opt_out_over_the_one_consent() {
-    // (consent, adopted, asked, enabled, declined, unreadable)
-    // The batteries-included default on an adopted machine: keep the set complete.
     assert!(should_complete_set(true, true, false, true, false, false));
-    // Not adopted — a fresh store before its seed pass, or a seed refusal that took
-    // its adoption back for want of disk — installs nothing new.
     assert!(!should_complete_set(true, false, false, true, false, false));
-    // …unless `auto_install = true` is written: the one way a machine no window runs on
-    // gets the set (and gets it back after `uninstall <program>` cleared adoption).
     assert!(
         should_complete_set(true, false, true, true, false, false),
         "a written `auto_install = true` stands in for adoption"
     );
-    // `auto_install = false` (or the retired `seed_install = false`) stops it, even
-    // on a machine adopted long ago — and so does a `[packages] prefix` this build
-    // ignores (`installs_unattended` is the consent input).
     assert!(!should_complete_set(false, true, false, true, false, false));
-    // Automatic updates off: no pass installs anything new, typed or not.
     assert!(
         !should_complete_set(true, true, true, false, false, false),
         "enabled = false always wins over the install consent"
     );
-    // Declined outranks the consent, a written one too.
     assert!(
         !should_complete_set(true, true, true, true, true, false),
         "declining outranks the install consent — it is the later, more specific act"
     );
-    // An unreadable [packages] table outranks it too: it has no `exclude` to narrow the
-    // lane with.
     assert!(
         !should_complete_set(true, true, true, true, false, true),
         "the set waits for the config to be readable before it is completed from an \
@@ -5719,10 +5022,6 @@ fn set_completion_honours_every_opt_out_over_the_one_consent() {
     );
 }
 
-/// The work rule the next-index probe asks before it spends a HEAD: an empty store that is
-/// not completing the set has nothing an index could move, so its `update` answers
-/// `EMPTY_UPDATE` and no published index wakes one. Controls: an installed program, set
-/// completion, or a development link is work.
 #[test]
 fn an_empty_store_not_completing_the_set_has_no_update_work() {
     let dir = scratch("has-work");
@@ -5753,9 +5052,6 @@ fn an_empty_store_not_completing_the_set_has_no_update_work() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// The probe worker outlives a CLI invocation: an adopted but empty store starts looking
-/// for newly published members once the user enables Automatic updates in the same running
-/// window or session, without a restart.
 #[test]
 fn near_index_work_check_reads_live_install_consent() {
     let dir = scratch("has-work-live-config");
@@ -5781,17 +5077,11 @@ fn near_index_work_check_reads_live_install_consent() {
     std::fs::write(&config_path, "[packages]\nenabled = false\n").unwrap();
     assert!(!update_pass_has_work_with(&layout, live.poll()));
 
-    // A malformed table must revoke unattended install eligibility even
-    // though the previous readable table allowed it; a repaired table
-    // restores the next probe without restarting the worker.
     std::fs::write(&config_path, "[packages]\nenabled = [\n").unwrap();
     assert!(!update_pass_has_work_with(&layout, live.poll()));
     std::fs::write(&config_path, "[packages]\nenabled = true\n").unwrap();
     assert!(update_pass_has_work_with(&layout, live.poll()));
 
-    // A path that exists but cannot be read as a config behaves the same
-    // way. The read failure is retried rather than cached as a permanent
-    // answer when the path becomes readable again.
     std::fs::remove_file(&config_path).unwrap();
     std::fs::create_dir(&config_path).unwrap();
     assert!(!update_pass_has_work_with(&layout, live.poll()));
@@ -5801,9 +5091,6 @@ fn near_index_work_check_reads_live_install_consent() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// The two durable ratchets advance together and independently: an index build and a
-/// roster generation are different counters over different documents, and one shared
-/// high-water would let either one's advance refuse the other's current document.
 #[test]
 fn advance_floors_ratchets_both_counters_separately() {
     let layout = temp_layout("floors");
@@ -5812,41 +5099,26 @@ fn advance_floors_ratchets_both_counters_separately() {
     advance_floors(&layout, 41, 3);
     assert_eq!(crate::sig::Floor::new(layout.floor()).current(), 41);
     assert_eq!(crate::sig::Floor::new(layout.roster_floor()).current(), 3);
-    // An index republish that does not bump the roster leaves the roster floor put, so
-    // the generation still in use is not ratcheted out from under the client.
     advance_floors(&layout, 42, 3);
     assert_eq!(crate::sig::Floor::new(layout.floor()).current(), 42);
     assert_eq!(crate::sig::Floor::new(layout.roster_floor()).current(), 3);
-    // A revocation bumps the roster without re-cutting the index — symmetrically.
     advance_floors(&layout, 42, 4);
     assert_eq!(crate::sig::Floor::new(layout.floor()).current(), 42);
     assert_eq!(crate::sig::Floor::new(layout.roster_floor()).current(), 4);
-    // And the anchor the CLI builds carries the roster floor it just recorded.
     assert_eq!(effective_anchor(&layout).roster_floor, 4);
-    // Non-vacuity: they are separate files.
     assert_ne!(layout.floor(), layout.roster_floor());
     let _ = std::fs::remove_dir_all(&layout.prefix);
 }
 
-/// A build floor one machine drove out of reach is re-based by the next generation:
-/// `index_build` sits inside machine-signed bytes, so a rostered machine could set it to
-/// the u64 ceiling and lock the store above every index the owner publishes, including
-/// the one revoking it. A strictly newer master-signed generation re-bases the floor;
-/// only the paper master mints a generation, so the lever is the master's alone.
-/// Mutation: replacing the `roster_seq > generation.current()` arm in `advance_floors` with
-/// the plain `check_and_record` fails the rescue assertion.
 #[test]
 fn a_newer_generation_rebases_a_floor_a_machine_drove_out_of_reach() {
     let layout = temp_layout("floor-poison");
     std::fs::create_dir_all(&layout.prefix).unwrap();
     std::fs::set_permissions(&layout.prefix, std::fs::Permissions::from_mode(0o700)).unwrap();
 
-    // A machine on generation 3 publishes the TOML integer ceiling.
     advance_floors(&layout, u64::MAX, 3);
     assert_eq!(build_floor(&layout).index_build, u64::MAX);
     assert_eq!(build_floor(&layout).roster_seq, 3);
-    // Precondition: within that same generation the floor is immovable, so this really
-    // is the trap.
     advance_floors(&layout, 101, 3);
     assert_eq!(
         build_floor(&layout).index_build,
@@ -5854,7 +5126,6 @@ fn a_newer_generation_rebases_a_floor_a_machine_drove_out_of_reach() {
         "same generation ⇒ monotonic, exactly as before"
     );
 
-    // The owner revokes that machine and republishes at a sane build under generation 4.
     advance_floors(&layout, 101, 4);
     assert_eq!(
         build_floor(&layout),
@@ -5864,36 +5135,23 @@ fn a_newer_generation_rebases_a_floor_a_machine_drove_out_of_reach() {
         },
         "a newer master-signed generation re-bases the floor it inherited"
     );
-    // ...and from there it ratchets again, so the rescue is one step, not a hole.
     advance_floors(&layout, 100, 4);
     assert_eq!(build_floor(&layout).index_build, 101);
     let _ = std::fs::remove_dir_all(&layout.prefix);
 }
-
-// ---- [packages.links] reconciliation + the auto-install bootstrap ----
-// Signed-fixture helpers mirroring flow.rs's (a real USTAR+zstd archive, a machine-signed
-// index beside the master-signed roster, signed pkg manifests) laid out as a dir registry
-// so the production `DirFetcher` serves them (§14).
 
 use ring::signature::{Ed25519KeyPair, KeyPair};
 use std::path::{Path, PathBuf};
 
 use crate::sig::testkit;
 
-/// The synthetic paper master and the one machine it rosters: the fixture the whole crate
-/// signs with, so a CLI test proves nothing under a trust shape no other layer uses.
 const ROOT_SEED: [u8; 32] = testkit::MASTER_SEED;
 const RELEASE_SEED: [u8; 32] = testkit::MACHINE_SEED;
 
-/// The anchor the dir-registry tests resolve under: armed with the synthetic master,
-/// roster floor 0.
 fn test_anchor() -> crate::Anchor {
     crate::Anchor::of(vec![pk(&ROOT_SEED)], 0)
 }
 
-/// Publish the master-signed roster beside a `dir:` registry's index. Without it the
-/// DirFetcher yields no candidate: a registry is the index plus the generation that
-/// authorized its signer.
 fn write_roster(dir: &Path) {
     let (bytes, sig) = testkit::published_roster();
     std::fs::write(
@@ -5922,7 +5180,6 @@ fn scratch(label: &str) -> crate::testdir::Dir {
     crate::testdir::dir(&format!("atpkg-cli-{label}-"))
 }
 
-/// A raw USTAR + zstd archive shipping `bin/<prog>`.
 fn make_archive(dir: &Path, prog: &str, build: u64) -> PathBuf {
     fn entry(name: &str, content: &[u8]) -> Vec<u8> {
         let mut h = [0u8; 512];
@@ -5952,26 +5209,18 @@ fn make_archive(dir: &Path, prog: &str, build: u64) -> PathBuf {
     path
 }
 
-/// Write one program's release-signed `pkg-<prog>-<build>.toml` (+ `.sig`) beside its
-/// real archive, with the archive's genuine sha256 + tree_root baked in.
 fn write_pkg(dir: &Path, prog: &str, build: u64) {
     write_pkg_for_triple(dir, prog, build, current_triple());
 }
 
-/// [`write_pkg`] with an explicit artifact `target`: a manifest whose one artifact serves
-/// a foreign triple is how the registry looks from every machine the publisher does not
-/// build for.
 fn write_pkg_for_triple(dir: &Path, prog: &str, build: u64, triple: &str) {
     write_pkg_exposing(dir, prog, build, triple, &[prog]);
 }
 
-/// [`write_pkg_for_triple`] whose manifest exposes `exposes` (its archive holds `bin/<prog>`).
 fn write_pkg_exposing(dir: &Path, prog: &str, build: u64, triple: &str, exposes: &[&str]) {
     let archive = make_archive(dir, prog, build);
     let sha = crate::tree::file_sha256(&archive).unwrap();
     let probe = dir.join(format!("probe-{prog}"));
-    // The extractor's own fold — what a producer signs; on Windows it folds the
-    // declared modes the plain walk cannot read (`crate::tree`'s module docs).
     let root = crate::extract::extract_tar_zst_tree(
         &archive,
         &probe,
@@ -6004,16 +5253,10 @@ fn write_pkg_exposing(dir: &Path, prog: &str, build: u64, triple: &str, exposes:
     .unwrap();
 }
 
-/// Write the machine-signed index for a 4-program default set on `channel`: `ay`
-/// (installable), `ny` (a second installable, for exclude), `zz` (pin yanked: never
-/// installs), `lk` (installable, dev-linked in the tests), plus signed pkgs and archives
-/// for the non-yanked members.
 fn write_registry(dir: &Path, channel: &str) {
     write_registry_at(dir, channel, 41);
 }
 
-/// As [`write_registry`], with an explicit `index_build` (the floor-admission tests
-/// need an index strictly above / equal to the durable floor).
 fn write_registry_at(dir: &Path, channel: &str, index_build: u64) {
     let index_body = format!(
         "schema = 2\nindex_build = {index_build}\nvalid_until = \"2026-07-05T12:00:00Z\"\n\
@@ -6026,7 +5269,6 @@ fn write_registry_at(dir: &Path, channel: &str, index_build: u64) {
         seq = testkit::SEQ
     );
     std::fs::write(dir.join("index.toml"), index_body.as_bytes()).unwrap();
-    // The index is machine-signed; only the roster is signed by the master.
     std::fs::write(
         dir.join("index.toml.sig"),
         sign(&RELEASE_SEED, index_body.as_bytes()),
@@ -6038,7 +5280,6 @@ fn write_registry_at(dir: &Path, channel: &str, index_build: u64) {
     write_pkg(dir, "lk", 3);
 }
 
-/// A fake checkout with a built `target/release/<prog>` bin.
 fn checkout(label: &str, prog: &str) -> crate::testdir::Dir {
     let d = scratch(&format!("co-{label}"));
     std::fs::create_dir_all(d.join("target/release")).unwrap();
@@ -6046,8 +5287,6 @@ fn checkout(label: &str, prog: &str) -> crate::testdir::Dir {
     d
 }
 
-/// A counting [`crate::DirFetcher`]: every index resolve reaches the fetcher through
-/// `index_candidates`, so the counter is the instrument for "the pass verify-selects once".
 struct CountingFetcher {
     inner: crate::DirFetcher,
     resolves: std::cell::Cell<u32>,
@@ -6101,9 +5340,6 @@ impl crate::flow::Fetcher for CountingFetcher {
     }
 }
 
-/// An empty-store update can retry a transiently failed initial resolve in
-/// set completion. The pass-end witness must name that retry's signed build,
-/// even when the requested hint named an older build and nothing installed.
 #[test]
 fn empty_store_retry_records_the_signed_index_it_resolved() {
     let dir = scratch("retry-witness-registry");
@@ -6178,8 +5414,6 @@ fn assert_empty_store_retry_success(first_index_link_down: bool) {
     let mut fetcher = CountingFetcher::new(dir.clone());
     fetcher.fail_first_index.set(true);
     fetcher.first_index_link_down = first_index_link_down;
-    // Leave one signed member installable so this is a completed pass, not
-    // the intentional exit-2 verdict for an empty, wholly excluded toolset.
     let cfg = crate::config::PackagesConfig {
         exclude: Some(
             ["ny", "zz", "lk", "claude", "codex"]
@@ -6192,7 +5426,6 @@ fn assert_empty_store_retry_success(first_index_link_down: bool) {
     let trust = crate::vendor_direct::lane::world::trust();
     let seams = PassSeams {
         anchor: |_| test_anchor(),
-        // Not 0, the "clock unusable" sentinel that stamps nothing (`rfc3339_at`).
         now: || 1,
         trust: &trust,
         shell_hooks: no_shell_hooks,
@@ -6232,8 +5465,6 @@ fn assert_empty_store_retry_success(first_index_link_down: bool) {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// An empty store whose first index resolve was refused, or met a link that was down,
-/// installs on the set lane's retry and records the pass as the success it was.
 #[test]
 fn empty_store_retry_after_refusal_reports_success() {
     for first_index_link_down in [false, true] {
@@ -6241,9 +5472,6 @@ fn empty_store_retry_after_refusal_reports_success() {
     }
 }
 
-/// A Rosetta pass writes its own row: the translated refusal (exit 2) writes its verdict
-/// over an earlier pass's "index unreachable" `*toolset*` row, which the window would
-/// otherwise read as this pass's.
 #[test]
 fn a_translated_pass_replaces_an_earlier_passs_unreachable_row() {
     let dir = scratch("translated-registry");
@@ -6271,7 +5499,6 @@ fn a_translated_pass_replaces_an_earlier_passs_unreachable_row() {
     let trust = crate::vendor_direct::lane::world::trust();
     let seams = PassSeams {
         anchor: |_| test_anchor(),
-        // Not 0, the "clock unusable" sentinel that stamps nothing (`rfc3339_at`).
         now: || 1,
         trust: &trust,
         shell_hooks: no_shell_hooks,
@@ -6295,9 +5522,6 @@ fn a_translated_pass_replaces_an_earlier_passs_unreachable_row() {
     );
     assert_eq!(code, 2, "the translated refusal");
     let status = crate::status::read(&layout).expect("pass-end record");
-    // The pass reached the signed index (the registry is the channel here), so exit 2
-    // is a verdict no retry changes and the record says a check ran
-    // (`finish_update_pass`, the derived model `AtpkgPassStamps`).
     assert_eq!(status.last_pass, "ok");
     assert!(!status.last_success_at.is_empty());
     assert_eq!(
@@ -6314,13 +5538,6 @@ fn a_translated_pass_replaces_an_earlier_passs_unreachable_row() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// The update says the seed's verdict, line for line. The window's own seed asks no index
-/// (`report_seedless_posture`, a `--wait-lock` caller), so the update right behind it,
-/// which resolves the index anyway, is where an unserved architecture or a toolset
-/// narrowed to nothing reaches the window's card: its empty-store arm prints the line the
-/// seed prints for that verdict, beside its stderr sentence and its exit 2. A pass that
-/// never resolved an index has no verdict about the machine and prints none (the negative
-/// control: offline is not "unserved").
 #[test]
 fn the_updates_empty_store_verdict_prints_the_seeds_unusable_line() {
     let names = |n: &[&str]| n.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
@@ -6397,32 +5614,21 @@ fn the_updates_empty_store_verdict_prints_the_seeds_unusable_line() {
     }
 }
 
-/// One pass, one verify-select: `apply_channel` resolves and verifies the signed index,
-/// and every other lane of the same pass (set completion, the attestation repair, the
-/// alias reconcile, the empty-store diagnosis) takes that index rather than re-reading the
-/// cache, re-checking every signature and re-admitting the roster for an answer that
-/// cannot differ inside one pass. The attestation repair reads the real clock, so a
-/// fixture index whose signed window is long past cannot exercise it here.
 #[test]
 fn a_pass_verify_selects_the_index_once_and_hands_it_to_every_lane() {
     let dir = scratch("one-resolve");
     write_registry(&dir, "stable");
     let layout = temp_layout("one-resolve");
     let fetcher = CountingFetcher::new(dir.clone());
-    // `ny` and `zz` are narrowed out so both measured passes run over a complete set: a
-    // lane with members to install also runs the per-program `flow::install` path, which
-    // resolves for itself and would drown the count.
     let cfg = crate::config::PackagesConfig {
         exclude: Some(vec!["ny".into(), "zz".into()]),
         ..Default::default()
     };
-    // The pass's one verify-select, as the apply lane runs it.
     let index =
         crate::resolve_verified_index(&fetcher, &layout, &test_anchor(), build_floor(&layout), 0)
             .expect("the signed fixture index verifies");
     assert_eq!(fetcher.resolves(), 1, "the pass resolved its index");
 
-    // Lay the set down first (this pass installs, so it resolves per program too).
     let out = install_default_set(&layout, &fetcher, &test_anchor(), &cfg, 0);
     assert_eq!(out.index_error, None);
     assert_eq!(
@@ -6432,8 +5638,6 @@ fn a_pass_verify_selects_the_index_once_and_hands_it_to_every_lane() {
     );
     let settled = fetcher.resolves();
 
-    // On the shape the six-hourly tick meets (a complete set, nothing to install), the
-    // set-completion lane handed the pass's index verify-selects nothing.
     let out = super::install_default_set_with_path(
         &layout,
         &fetcher,
@@ -6457,7 +5661,6 @@ fn a_pass_verify_selects_the_index_once_and_hands_it_to_every_lane() {
         "the set-completion lane re-used the pass's index"
     );
 
-    // …while the same pass with no index in hand resolves one for itself.
     let out = install_default_set(&layout, &fetcher, &test_anchor(), &cfg, 0);
     assert_eq!(out.index_error, None);
     assert_eq!(
@@ -6467,8 +5670,6 @@ fn a_pass_verify_selects_the_index_once_and_hands_it_to_every_lane() {
     );
     let settled = fetcher.resolves();
 
-    // No gate is skipped: past the signed `valid_until` the held index is refused re-use,
-    // and the lane's own resolve meets the same freshness refusal.
     let lapsed = 4_000_000_000;
     assert!(
         reusable_index(Some(&index), lapsed).is_none(),
@@ -6513,8 +5714,6 @@ fn update_counts_live_development_toolsets_and_records_broken_links() {
         &update_link_inventory(&layout).unwrap()
     ));
     crate::link(&layout, "ay", &co, &[PathBuf::from("target/release/ay")]).unwrap();
-    // A real marker and regular file without execute permission are not a
-    // provisioned toolset. The failure is durable and cannot mint a success.
     assert!(update_link_inventory(&layout).is_err());
     let failed = crate::status::read(&layout).unwrap();
     assert!(failed.programs["*links*"].state.contains("non-executable"));
@@ -6544,9 +5743,6 @@ fn update_counts_live_development_toolsets_and_records_broken_links() {
     let _ = std::fs::remove_dir_all(&co);
 }
 
-/// An update pass separates a present local toolset from a network check: a dev-link-only
-/// pass succeeds without inventing a registry build or check, and a checkout gone before
-/// the final inventory still fails.
 #[test]
 #[cfg(unix)]
 fn a_dev_link_only_update_pass_preserves_tools_without_fabricating_an_index_check() {
@@ -6595,16 +5791,11 @@ fn a_dev_link_only_update_pass_preserves_tools_without_fabricating_an_index_chec
     let _ = std::fs::remove_dir_all(&co);
 }
 
-// The auto-install decision matrix (§11), against the production DirFetcher over a real
-// signed dir registry: a missing default-set member installs, an `exclude`d member is
-// narrowed out, a dev-linked member hard-skips, a yanked pin never installs, and an
-// already-installed member is left to the update pass. No skip counts as a failure.
 #[test]
 fn default_set_bootstrap_installs_missing_and_skips_excluded_linked_yanked() {
     let dir = scratch("bootstrap");
     write_registry(&dir, "stable");
     let layout = temp_layout("bootstrap");
-    // Dev-link `lk` (the hard-skip member).
     let co = checkout("bootstrap", "lk");
     crate::link(&layout, "lk", &co, &[PathBuf::from("target/release/lk")]).unwrap();
     let cfg = crate::config::PackagesConfig {
@@ -6627,31 +5818,21 @@ fn default_set_bootstrap_installs_missing_and_skips_excluded_linked_yanked() {
         crate::is_linked(&layout, "lk"),
         "the dev link survives untouched"
     );
-    // Idempotence: a second pass finds ay installed and re-installs nothing.
     let failures = install_default_set(&layout, &fetcher, &test_anchor(), &cfg, 0).failures;
     assert_eq!(failures, 0);
     assert_eq!(crate::active_builds(&layout).get("ay").copied(), Some(18));
-    // The durable floor advanced to the trusted index (§8 gate 3).
     assert_eq!(crate::sig::Floor::new(layout.floor()).current(), 41);
     let _ = std::fs::remove_dir_all(&layout.prefix);
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::remove_dir_all(&co);
 }
 
-// THE YANK LIST IS HONOURED BY EVERY LANE, WITH ONE STATE STRING. `zz` is pinned at
-// 5 and `yanked = ["zz@5"]`: the default-set pass skips
-// it (no failure, no store dir, no shim) and records `tombstoned: pin yanked/below
-// floor`; the update lane tombstones a LIVE zz@5 with the same row and takes its
-// shims off PATH. Supply side will yank trust-mc 20065 — this is what a client does
-// with that.
 #[test]
 fn a_yanked_pinned_build_is_skipped_with_a_recorded_tombstone_row() {
     let dir = scratch("yank-row");
     write_registry(&dir, "stable");
     let layout = temp_layout("yank-row");
     let fetcher = crate::DirFetcher::new(dir.clone());
-    // The default-set lane: skipped, said, recorded. (The pure gate's verdict is
-    // `gate.rs`'s `pin_below_floor_or_yanked_tombstones`.)
     let cfg = crate::config::PackagesConfig {
         exclude: Some(vec!["ny".into()]),
         ..Default::default()
@@ -6668,8 +5849,6 @@ fn a_yanked_pinned_build_is_skipped_with_a_recorded_tombstone_row() {
     let status = crate::status::read(&layout).expect("a status record");
     assert_eq!(status.programs["zz"].state, crate::state::TOMBSTONED_PIN);
     assert_eq!(status.programs["zz"].installed_build, None);
-    // The update lane over a live copy of the yanked build: tombstoned with the same
-    // words, shims off PATH.
     make_live(&layout, "zz", 5);
     assert_eq!(crate::active_builds(&layout).get("zz").copied(), Some(5));
     let (report, failures) = update_pass(&layout, &fetcher);
@@ -6689,17 +5868,10 @@ fn a_yanked_pinned_build_is_skipped_with_a_recorded_tombstone_row() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// An empty store's verdict names its real cause: `seed_serviceable` is empty both when
-/// the index publishes nothing for this triple and when the user's `[packages].exclude` or
-/// uninstalls took everything it does publish. `index_serves` asks again without the
-/// narrowing, and only an empty unnarrowed set blames the CPU.
 #[test]
 fn an_empty_store_blames_the_architecture_only_when_nothing_is_published_for_it() {
     let dir = scratch("index-serves");
     write_registry(&dir, "stable");
-    // Every member publishes for this triple — `zz` too: its pin is yanked, but the
-    // prescan asks about artifacts, and a member with no manifest at all would be
-    // counted as served (an unverifiable manifest is skipped, not missing).
     write_pkg(&dir, "zz", 5);
     let layout = temp_layout("index-serves");
     let fetcher = crate::DirFetcher::new(dir.clone());
@@ -6713,13 +5885,11 @@ fn an_empty_store_blames_the_architecture_only_when_nothing_is_published_for_it(
         ..Default::default()
     };
     let names = |n: &[&str]| n.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
-    // Served.
     let plain = crate::config::PackagesConfig::default();
     assert_eq!(
         index_serves(&layout, &fetcher, &index, &plain),
         IndexServes::Yes
     );
-    // `[packages].exclude` names every served member: the exclusion, not the CPU.
     let all_out = exclude(&["ay", "ny", "lk", "zz"]);
     assert_eq!(
         index_serves(&layout, &fetcher, &index, &all_out),
@@ -6728,7 +5898,6 @@ fn an_empty_store_blames_the_architecture_only_when_nothing_is_published_for_it(
             removed: Vec::new(),
         })
     );
-    // Uninstalled one by one: the removals, and read as a decision.
     std::fs::write(layout.removed(), "ay\nny\nlk\nzz\n").unwrap();
     let removed = index_serves(&layout, &fetcher, &index, &plain);
     assert_eq!(
@@ -6744,8 +5913,6 @@ fn an_empty_store_blames_the_architecture_only_when_nothing_is_published_for_it(
     let (_, state) = narrowing.verdict(current_triple());
     assert_eq!(state, crate::state::TOOLSET_REMOVED);
     assert!(!crate::doctor::is_recorded_problem("*toolset*", state));
-    // Both at once: each member named under its own cause, and the exclusion's
-    // state — a failure a person can act on — is the one recorded.
     std::fs::write(layout.removed(), "ny\nlk\nzz\n").unwrap();
     let mixed = index_serves(&layout, &fetcher, &index, &exclude(&["ay"]));
     let IndexServes::Narrowed(narrowing) = mixed else {
@@ -6756,8 +5923,6 @@ fn an_empty_store_blames_the_architecture_only_when_nothing_is_published_for_it(
     let (_, state) = narrowing.verdict(current_triple());
     assert_eq!(state, crate::state::TOOLSET_EXCLUDED);
     assert!(crate::doctor::is_recorded_problem("*toolset*", state));
-    // Negative control: when nothing is published for this triple the architecture is
-    // the answer, exclusions and removals notwithstanding.
     for (prog, build) in [("ay", 18), ("ny", 7), ("lk", 3), ("zz", 5)] {
         write_pkg_for_triple(&dir, prog, build, "riscv64gc-unknown-linux-gnu");
     }
@@ -6773,16 +5938,10 @@ fn an_empty_store_blames_the_architecture_only_when_nothing_is_published_for_it(
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A program the registry publishes no artifact for on this triple neither announces, nor
-/// counts as a failure, nor leaves a pending stub, and its own row records `unavailable on
-/// <target>: <hint>`, so a pre-existing stub's `__pending` tells the truth (design §2).
-/// Served members still install, and because one does, the toolset-wide `blocked` verdict
-/// (for a machine the index serves nothing on) is not raised.
 #[test]
 fn unserved_triple_members_skip_quietly_with_a_recorded_reason() {
     let dir = scratch("unserved");
     write_registry(&dir, "stable");
-    // ay's one artifact serves a machine this test is not running on.
     write_pkg_for_triple(&dir, "ay", 18, "riscv64gc-unknown-linux-gnu");
     let layout = temp_layout("unserved");
     let cfg = crate::config::PackagesConfig::default();
@@ -6811,8 +5970,6 @@ fn unserved_triple_members_skip_quietly_with_a_recorded_reason() {
         "ny was served, so the machine is not blocked as a whole: {:?}",
         status.programs.keys().collect::<Vec<_>>()
     );
-    // (`zz`'s yanked pin is a fault: its `tombstoned:` row is the point of
-    // `a_yanked_pinned_build_is_skipped_with_a_recorded_tombstone_row`.)
     assert!(
         crate::doctor::recorded_problems(Some(&status))
             .iter()
@@ -6830,9 +5987,6 @@ fn unserved_triple_members_skip_quietly_with_a_recorded_reason() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A three-program registry for the retired-`requires` tests: `ay` (`requires =
-/// ["xc"]`), `ny` (no requires), `xc` (`extra = true`, a key an older index carries and
-/// this client ignores) — every pkg served for this triple.
 fn write_registry_with_requires(dir: &Path) {
     let index_body = format!(
         "schema = 2\nindex_build = 41\nvalid_until = \"2026-07-05T12:00:00Z\"\n\
@@ -6857,10 +6011,6 @@ fn write_registry_with_requires(dir: &Path) {
     write_pkg(dir, "xc", 9);
 }
 
-/// The retired `requires` through the set-completion pass (§5.3(b)/(c)): `ay`'s signed row
-/// names it, so the pass refuses ay (an `error:` row naming the refusal, nothing
-/// downloaded, no artifact resolved) while `ny` and the former extra `xc` install beside it
-/// as default-set members.
 #[cfg(unix)]
 #[test]
 fn the_pass_refuses_a_program_naming_the_retired_requires_and_installs_the_rest() {
@@ -6897,9 +6047,6 @@ fn the_pass_refuses_a_program_naming_the_retired_requires_and_installs_the_rest(
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// One update pass over `layout`, exactly as `cmd_update_all` runs it — the channel
-/// apply over the live builds, then the per-group report that writes the rows —
-/// returning the report and its failure count.
 fn update_pass(
     layout: &crate::store::Layout,
     fetcher: &crate::DirFetcher,
@@ -6921,7 +6068,6 @@ fn update_pass(
     (report, failures)
 }
 
-/// The outcome the report carries for `program`'s group.
 fn outcome_of<'a>(report: &'a crate::ChannelApplyReport, program: &str) -> &'a crate::TxnOutcome {
     &report
         .groups
@@ -6931,10 +6077,6 @@ fn outcome_of<'a>(report: &'a crate::ChannelApplyReport, program: &str) -> &'a c
         .1
 }
 
-// An UpToDate pass rewrites every live member's row to name this pass's index (migrating
-// the legacy `active` spelling and re-stamping `pinned by index 15`) while keeping the
-// pass's own outcome sentence, and leaves every other spelling (a SHADOWED row, a fault)
-// to the arm that owns it.
 #[test]
 fn an_up_to_date_pass_migrates_legacy_rows_and_restamps_the_index() {
     assert!(up_to_date_row_needs_rewrite(None, 18, 41));
@@ -6959,13 +6101,10 @@ fn an_up_to_date_pass_migrates_legacy_rows_and_restamps_the_index() {
             "{other} belongs to another arm"
         );
     }
-    // A fault row a failed pass wrote is lifted: a member this pass finds live at its pin
-    // has, by that fact, no such fault.
     for fault in [
         "aborted: stage",
         "aborted: flip (rolled back)",
         "error: coherence group 'trust' bootstrap aborted",
-        // An older client's requirement-gate row (§5.3(b)).
         "blocked by xc: not installed",
     ] {
         assert!(
@@ -7005,7 +6144,6 @@ fn an_up_to_date_pass_migrates_legacy_rows_and_restamps_the_index() {
         status.outcome, "up to date (index build 41)",
         "a row migration never speaks for the pass"
     );
-    // A stale index stamp is refreshed the same way.
     record_status(
         &layout,
         "ay",
@@ -7019,8 +6157,6 @@ fn an_up_to_date_pass_migrates_legacy_rows_and_restamps_the_index() {
     let _ = update_pass(&layout, &fetcher);
     let status = crate::status::read(&layout).unwrap();
     assert_eq!(status.programs["ay"].state, crate::state::managed(18, 41));
-    // A live build cannot inherit the recorded attestation of an older build,
-    // even while this same reporting pass migrates the row's state spelling.
     record_status(
         &layout,
         "ay",
@@ -7043,17 +6179,12 @@ fn an_up_to_date_pass_migrates_legacy_rows_and_restamps_the_index() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// An installed `rustc`-locked tuple's registry: the channel moves `ta`@3 + `tb`@5 to
-/// `ta`@4 + `tb`@6, with tb's new build published only for `tb_triple` (how it looks from a
-/// host the publisher does not build that pin for), and `yanked` as the deny-list.
 fn write_installed_group_registry(dir: &Path, tb_triple: &str, yanked: &[&str]) {
     write_group_index(dir, "ta = 4, tb = 6", yanked);
     write_pkg(dir, "ta", 4);
     write_pkg_for_triple(dir, "tb", 6, tb_triple);
 }
 
-/// The signed index (build 51) of a `rustc`-locked tuple `ta` + `tb` pinned at `pins`,
-/// with `yanked` as the channel's deny-list, published beside its roster.
 fn write_group_index(dir: &Path, pins: &str, yanked: &[&str]) {
     let yanked: Vec<String> = yanked.iter().map(|y| format!("\"{y}\"")).collect();
     let index_body = format!(
@@ -7076,7 +6207,6 @@ fn write_group_index(dir: &Path, pins: &str, yanked: &[&str]) {
     write_roster(dir);
 }
 
-/// `ta`@3 + `tb`@5 genuinely live, each with a managed row and a recorded root.
 fn make_installed_group_live(layout: &crate::store::Layout) {
     for (p, b) in [("ta", 3u64), ("tb", 5u64)] {
         make_live(layout, p, b);
@@ -7093,12 +6223,6 @@ fn make_installed_group_live(layout: &crate::store::Layout) {
     }
 }
 
-/// A tuple that cannot fully exist on this host is a correct state, not a failure
-/// ([`crate::flow::group_missing_triple`]): the group is held, no failure is counted, each
-/// installed member's row says which build is unpublished and which one stays, and a
-/// channel stepping back lifts the held rows. (That nothing moves or stages is
-/// `flow_tests`' `an_installed_group_whose_new_pin_lacks_this_triple_is_held_whole`; a
-/// pin published here upgrades: the control below.)
 #[test]
 fn an_installed_group_whose_new_pin_is_unpublished_here_is_held_not_failed() {
     let dir = scratch("update-held-triple");
@@ -7150,12 +6274,9 @@ fn an_installed_group_whose_new_pin_is_unpublished_here_is_held_not_failed() {
         crate::doctor::recorded_problems(Some(&status))
     );
 
-    // The next tick says the same thing and still counts nothing.
     let (_, failures) = update_pass(&layout, &fetcher);
     assert_eq!(failures, 0, "the hold is steady across passes");
 
-    // The channel steps back to the builds this host runs: the UpToDate pass lifts the
-    // held rows to the ordinary managed state, build and attestation kept.
     write_group_index(&dir, "ta = 3, tb = 5", &[]);
     let (report, failures) = update_pass(&layout, &fetcher);
     assert_eq!(failures, 0);
@@ -7168,10 +6289,6 @@ fn an_installed_group_whose_new_pin_is_unpublished_here_is_held_not_failed() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// …but a hold never keeps a revoked build running: quietly holding the tuple would leave
-/// a yanked build live on exactly the host that has no replacement. The pass disables that
-/// build's commands and aborts loudly instead, and stays loud — later passes hold the tuple
-/// quietly for the member still installed, while the disabled row is still a doctor fault.
 #[test]
 fn an_unpublished_pin_never_quietly_holds_a_revoked_current_build() {
     let dir = scratch("update-held-revoked");
@@ -7197,9 +6314,6 @@ fn an_unpublished_pin_never_quietly_holds_a_revoked_current_build() {
         outcome_of(&report, "ta")
     );
     let triple = current_triple();
-    // A live shim is an `exec` stub too (a regular file), so what marks the tombstone is
-    // that it forwards nowhere and says why, and that the store stops counting the revoked
-    // build as live.
     let shim = layout.shim(&crate::store::ToolName::new("ta").unwrap());
     assert_eq!(
         crate::platform::resolve_shim(&shim),
@@ -7243,9 +6357,6 @@ fn an_unpublished_pin_never_quietly_holds_a_revoked_current_build() {
         "…and doctor counts it against the disabled program: {problems:?}"
     );
 
-    // The next pass: the tombstone took ta out of `active_builds`, so only tb is seen
-    // installed and tb's unpublished pin holds the tuple quietly. ta must not go quiet
-    // with it — still disabled, and still a doctor fault on its own row.
     let (report, failures) = update_pass(&layout, &fetcher);
     assert_eq!(failures, 0, "{:?}", report.groups);
     assert_eq!(
@@ -7276,11 +6387,6 @@ fn an_unpublished_pin_never_quietly_holds_a_revoked_current_build() {
         problems.len() == 1 && problems[0].starts_with("ta: aborted: stage"),
         "doctor still counts the disabled program: {problems:?}"
     );
-    // …and so does the set-completion prescan that runs next in the same pass on an
-    // adopted machine: ta is neither installed nor published here, so the prescan counts
-    // it unserved, but must not repaint its fault row as the benign `unavailable on
-    // <triple>: …`. Its measurement is `program_disabled_here`: the recorded row, or a
-    // tombstone shim.
     assert!(
         program_disabled_here(&layout, Some(&status), "ta"),
         "ta reads as disabled: its row says so and its shim is a tombstone"
@@ -7289,8 +6395,6 @@ fn an_unpublished_pin_never_quietly_holds_a_revoked_current_build() {
         !program_disabled_here(&layout, Some(&status), "tb"),
         "tb is held, not disabled"
     );
-    // Either measurement alone is enough: a row that says it with no shim on disk,
-    // and a tombstone shim under a row that says nothing.
     let mut rows = status.clone();
     rows.programs.remove("ta");
     assert!(
@@ -7308,9 +6412,6 @@ fn an_unpublished_pin_never_quietly_holds_a_revoked_current_build() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// The hold is only for a pin this host cannot run: the same installed tuple whose new pin
-/// is published for this triple upgrades as it always did — staged whole, flipped whole,
-/// managed rows naming the new index, the new signed roots recorded.
 #[test]
 fn an_installed_group_whose_new_pin_is_published_here_upgrades_as_before() {
     let dir = scratch("update-group-served");
@@ -7348,10 +6449,6 @@ fn an_installed_group_whose_new_pin_is_published_here_upgrades_as_before() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// The hold needs proof bound to the pin. A genuinely signed manifest served where tb@6's
-/// belongs, but naming another build or another program, says nothing about tb@6: the pass
-/// takes the loud path — the stage refuses the mismatch, one failure, the ordinary
-/// `aborted: stage` row — never the quiet hold.
 #[test]
 fn a_manifest_that_does_not_bind_to_the_pin_never_proves_it_unpublished() {
     for (label, prog, build) in [("build", "tb", 7u64), ("program", "ta", 6u64)] {
@@ -7401,10 +6498,6 @@ fn a_manifest_that_does_not_bind_to_the_pin_never_proves_it_unpublished() {
     }
 }
 
-// THE ONE CHANNEL: the bootstrap resolves `stable` ([`crate::config::CHANNEL`]) —
-// a registry publishing only `nightly` installs nothing, loudly, and a retired
-// `[packages].channel = "nightly"` in the file changes nothing (2026-09-23). The
-// `stable` control is `default_set_bootstrap_installs_missing_and_skips_excluded_linked_yanked`.
 #[test]
 fn default_set_bootstrap_uses_the_one_channel() {
     let dir = scratch("channel");
@@ -7429,14 +6522,9 @@ fn default_set_bootstrap_uses_the_one_channel() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-// An unresolved index is not a check: an adopted machine with an empty store runs `update`
-// through the set-completion lane alone, and offline (or on a channel the index does not
-// publish) that lane fails before it checks anything. It stamps no `last_success_at`,
-// records the apply lane's `*index*` row, and a resolved pass retires the row.
 #[test]
 fn an_empty_store_pass_that_never_resolved_the_index_is_not_stamped() {
     let cfg = crate::config::PackagesConfig::default();
-    // Offline: nothing at the index URL.
     let empty = scratch("unresolved-offline");
     let layout = temp_layout("unresolved-offline");
     let out = install_default_set(
@@ -7466,13 +6554,10 @@ fn an_empty_store_pass_that_never_resolved_the_index_is_not_stamped() {
         crate::status::never_checked(&layout),
         "an unresolved pass is not a completed check"
     );
-    // …but a miss after the apply lane resolved this pass changes nothing.
     let quiet = temp_layout("unresolved-after-apply");
     assert!(settle_net_lane_index(&quiet, true, Some("offline")));
     assert!(crate::status::read(&quiet).is_none(), "no row re-opened");
     let _ = std::fs::remove_dir_all(&quiet.prefix);
-    // A channel the index does not publish: resolved, but nothing to act on — the
-    // apply lane's `Err(NoChannel)`, so the same verdict.
     let dir = scratch("unresolved-channel");
     write_registry(&dir, "nightly");
     let fetcher = crate::DirFetcher::new(dir.clone());
@@ -7481,8 +6566,6 @@ fn an_empty_store_pass_that_never_resolved_the_index_is_not_stamped() {
         nightly_only.index_error.is_some(),
         "a missing channel is no check"
     );
-    // The index resolves on the one channel: the pass checked, and the failure row it
-    // disproved is retired.
     let stable = scratch("unresolved-channel-stable");
     write_registry(&stable, "stable");
     let ok = install_default_set(
@@ -7511,10 +6594,6 @@ fn an_empty_store_pass_that_never_resolved_the_index_is_not_stamped() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Write a machine-signed index whose default set is the `rustc`-locked coherence tuple
-/// `ta`+`tb` plus the ungrouped singleton `ay` (the §7 bootstrap fixture).
-/// `write_tb_pkg = false` leaves tb's pkg manifest unpublished, so its stage fails and the
-/// group transaction must abort whole.
 fn write_group_registry(dir: &Path, channel: &str, write_tb_pkg: bool) {
     let index_body = format!(
         "schema = 2\nindex_build = 51\nvalid_until = \"2026-07-05T12:00:00Z\"\n\
@@ -7528,7 +6607,6 @@ fn write_group_registry(dir: &Path, channel: &str, write_tb_pkg: bool) {
         seq = testkit::SEQ
     );
     std::fs::write(dir.join("index.toml"), index_body.as_bytes()).unwrap();
-    // The index is machine-signed; only the roster is signed by the master.
     std::fs::write(
         dir.join("index.toml.sig"),
         sign(&RELEASE_SEED, index_body.as_bytes()),
@@ -7542,10 +6620,6 @@ fn write_group_registry(dir: &Path, channel: &str, write_tb_pkg: bool) {
     }
 }
 
-// §7 all-or-nothing: a tuple member whose pkg manifest is unpublished aborts the whole
-// group. The sibling that staged fine is neither activated nor left on disk (a
-// complete-but-inactive build would read as active next run), the ungrouped singleton
-// still installs, and the group counts one failure.
 #[test]
 fn default_set_bootstrap_never_splits_a_coherence_group() {
     let dir = scratch("group-abort");
@@ -7577,9 +6651,6 @@ fn default_set_bootstrap_never_splits_a_coherence_group() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A [`crate::DirFetcher`] whose first request for `program`'s manifest fails, as a dropped
-/// connection does; every later request is served. Nothing remembers a failed fetch, so a
-/// prescan that met the failure proved nothing and a later walk, asking again, succeeds.
 struct FirstManifestFetchFails {
     inner: crate::DirFetcher,
     program: &'static str,
@@ -7608,11 +6679,6 @@ impl crate::flow::Fetcher for FirstManifestFetchFails {
     }
 }
 
-// The bootstrap arm of the missing-triple hold. A partly installed tuple: ta@3 is live,
-// tb is missing, the channel pins ta = 4 (published only for a foreign triple) and tb = 6.
-// The prescan's request for ta@4's manifest fails and proves nothing, so the walk fetches
-// it and finds no artifact for this triple. A tuple that cannot fully exist here is a clean
-// skip, never a failure: nothing staged, nothing resolved.
 #[test]
 fn default_set_bootstrap_skips_a_partial_tuple_whose_installed_pin_is_unpublished() {
     let dir = scratch("group-partial-unpublished");
@@ -7657,8 +6723,6 @@ fn default_set_bootstrap_skips_a_partial_tuple_whose_installed_pin_is_unpublishe
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A [`crate::DirFetcher`] that records, in order, every manifest pair it was asked to
-/// prefetch (`true`) and every one it was then asked to read (`false`).
 struct PrefetchRecorder {
     inner: crate::DirFetcher,
     asked: std::cell::RefCell<Vec<(bool, String, u64)>>,
@@ -7692,10 +6756,6 @@ impl crate::flow::Fetcher for PrefetchRecorder {
     }
 }
 
-// The set's manifests at once: before the set completion reads its first manifest, one
-// prefetch has asked for every pinned manifest its missing-triple prescan reads (one at a
-// time, they are a GET apiece ahead of the announcement), and every read the pass then
-// makes is of a pair it asked for.
 #[test]
 fn the_set_completion_asks_its_manifests_at_once_before_reading_one() {
     let dir = scratch("prefetch-prescan");
@@ -7743,8 +6803,6 @@ fn the_set_completion_asks_its_manifests_at_once_before_reading_one() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A [`crate::DirFetcher`] a pass may share, recording which thread asked for each archive;
-/// with `refuse`, every download fails as a dropped link does.
 struct SharedDownloads {
     inner: crate::DirFetcher,
     asked: std::sync::Mutex<Vec<(String, String)>>,
@@ -7778,11 +6836,6 @@ impl crate::flow::Fetcher for SharedDownloads {
     }
 }
 
-/// EVERY COMMAND A PROGRAM'S SIGNED MANIFEST EXPOSES ANSWERS BEFORE IT LANDS, not only the
-/// branded names the compiled table knows: the set completion's reconcile lays a pending stub
-/// for each, read from the manifest its probe verified, and the stub names its program
-/// (`ay-maxsat` comes with `ay`), which is what `__pending` waits on. Here every download
-/// fails, so ay stays absent and its stubs stand once the pass is over.
 #[test]
 fn a_command_only_the_manifest_exposes_gets_a_pending_stub_naming_its_program() {
     let dir = scratch("exposed-stub");
@@ -7813,11 +6866,6 @@ fn a_command_only_the_manifest_exposes_gets_a_pending_stub_naming_its_program() 
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A NAME ANOTHER PROGRAM OWNS, OR THE REROUTE TABLE ANSWERS, IS NO COMMAND STUB. `lk`'s
-/// manifest also exposes `ay` — a program of the index's own, removed on this machine — and
-/// `z3`, an upstream name the reroute table routes: no stub naming `lk` stands for `ay` (so
-/// `aterm pkg install ay` asks for `ay` back rather than pointing at `lk`), none stands for
-/// `z3`, and `lk`'s own command still gets its stub naming `lk`.
 #[test]
 fn a_manifest_exposing_another_programs_name_lays_no_stub_over_it() {
     let dir = scratch("exposed-owned");
@@ -7854,9 +6902,6 @@ fn a_manifest_exposing_another_programs_name_lays_no_stub_over_it() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-// The set completion fetches ahead: with a fetcher it may share, every archive of the set
-// (the tuple's members and the singleton after them) comes off the download-ahead lane's
-// thread, once each, while the pass's own thread stages and flips.
 #[test]
 fn the_set_completion_takes_its_archives_from_the_download_ahead_lane() {
     let dir = scratch("set-ahead");
@@ -7896,10 +6941,6 @@ fn the_set_completion_takes_its_archives_from_the_download_ahead_lane() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-// A set the disk check could not size starts no lane: tb's signed manifest does not
-// arrive, so the set's bytes are unknown, and planning a lane would ask for that manifest
-// once more (a connect timeout apiece on a dead link) before the first unit starts. The
-// set lands one download at a time on the pass's own thread: the tuple refused, ay in.
 #[test]
 fn a_set_whose_size_is_unknown_lands_without_the_download_ahead_lane() {
     let dir = scratch("set-ahead-unsized");
@@ -7934,9 +6975,6 @@ fn a_set_whose_size_is_unknown_lands_without_the_download_ahead_lane() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-// Every archive lost is the pass's own fetch fault: offline, the lane's first download
-// fails and the pass fetches the rest itself, so each failure the set completion counts is
-// a fault on the pass's thread, the equation its offline verdict reads.
 #[test]
 fn a_set_whose_every_download_fails_counts_each_failure_as_a_fetch_fault() {
     let dir = scratch("set-ahead-offline");
@@ -7967,11 +7005,6 @@ fn a_set_whose_every_download_fails_counts_each_failure_as_a_fetch_fault() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-// §7 narrowing: an `exclude` that leaves part of a coherence tuple out refuses the whole
-// group (a loud diagnostic, not a failure) while the ungrouped singleton still installs.
-// The refusal is decided at planning: the refused members ride out on the outcome
-// (`skipped_narrowed`), are not counted in `remaining_missing`, and keep no pending stub,
-// which would promise the install the pass refused.
 #[test]
 fn a_narrowed_tuple_is_refused_at_planning_and_reported_on_the_outcome() {
     let dir = scratch("group-narrowed-plan");
@@ -7999,8 +7032,6 @@ fn a_narrowed_tuple_is_refused_at_planning_and_reported_on_the_outcome() {
         vec!["ta".to_string()],
         "the refused member is reported, not silently dropped"
     );
-    // The vendor programs are wanted from the compiled table and still coming through
-    // their own lane (design §1.5); no index member is.
     assert!(
         out.remaining_missing
             .iter()
@@ -8016,12 +7047,9 @@ fn a_narrowed_tuple_is_refused_at_planning_and_reported_on_the_outcome() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-// A legacy `*seed*` offer row is swept row-only (the pass's own outcome sentence
-// survives), by a clean set-completing pass and by the seed verb.
 #[test]
 fn a_legacy_seed_offer_row_is_retired_row_only() {
     let layout = temp_layout("seed-row-retire");
-    // No row: retiring writes nothing.
     retire_seed_row(&layout);
     assert!(
         crate::status::read(&layout).is_none(),
@@ -8051,9 +7079,6 @@ fn a_legacy_seed_offer_row_is_retired_row_only() {
     let _ = std::fs::remove_dir_all(&layout.prefix);
 }
 
-// A `[packages.links]` owner/repo override for a program the signed index does not name
-// can never install anything; the bootstrap only says so loudly. Fail-closed: no unsigned
-// installs from slugs.
 #[test]
 fn unindexed_repo_override_never_installs() {
     let dir = scratch("unindexed");
@@ -8074,9 +7099,6 @@ fn unindexed_repo_override_never_installs() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-// [packages.links] reconciliation: a config checkout path becomes a managed
-// dev-link (idempotent across passes); a missing checkout links nothing; an
-// invalid value acts on nothing.
 #[test]
 fn reconcile_links_creates_and_reasserts_config_links() {
     let layout = temp_layout("reconcile");
@@ -8102,8 +7124,6 @@ fn reconcile_links_creates_and_reasserts_config_links() {
         !crate::is_linked(&layout, "bad"),
         "invalid value acts on nothing"
     );
-    // Idempotent second pass: still linked, same checkout, and a newly-built bin
-    // is picked up by the quiet refresh.
     std::fs::write(co.join("target/release").join("ay2"), b"#!/bin/true\n").unwrap();
     let cfg2 = crate::config::parse_packages(&format!(
         "[packages.links]\nay = {:?}\n",
@@ -8119,8 +7139,6 @@ fn reconcile_links_creates_and_reasserts_config_links() {
     let _ = std::fs::remove_dir_all(&co);
 }
 
-// A hand-made dev-link pointing at a different checkout is never re-pointed by config:
-// the link and its shim target survive untouched.
 #[test]
 fn reconcile_links_refuses_to_touch_a_foreign_link() {
     let layout = temp_layout("foreign");
@@ -8150,13 +7168,10 @@ fn reconcile_links_refuses_to_touch_a_foreign_link() {
     let _ = std::fs::remove_dir_all(&config_wants);
 }
 
-// `__pending`: the five states, the honesty edge, escape stripping (design §5).
-
 fn now_secs() -> u64 {
     aterm_time::unix_secs().unwrap()
 }
 
-/// A live-looking progress snapshot: this test process's pid, a fresh heartbeat.
 fn live_snapshot(programs: &str, queue: &str) -> String {
     format!(
         "{{\"v\":1,\"pid\":{},\"pass\":\"net\",\"heartbeat_unix\":{},\
@@ -8171,7 +7186,6 @@ fn bump_contents(l: &crate::store::Layout) -> String {
     std::fs::read_to_string(l.bump_file()).unwrap_or_default()
 }
 
-/// [`pending_state`] collected non-interactively (no TTY, no aterm): the lines only.
 fn pending_state_lines(layout: &crate::store::Layout, tool: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let mut say = |line: String| out.push(line);
@@ -8184,8 +7198,6 @@ fn pending_state_lines(layout: &crate::store::Layout, tool: &str) -> Vec<String>
     out
 }
 
-/// [`pending_state`] for a person at a terminal who can wait: the lines and what the stub
-/// does next.
 fn pending_state_waiting(layout: &crate::store::Layout, tool: &str) -> (Vec<String>, PendingNext) {
     let mut out: Vec<String> = Vec::new();
     let mut say = |line: String| out.push(line);
@@ -8198,8 +7210,6 @@ fn pending_state_waiting(layout: &crate::store::Layout, tool: &str) -> (Vec<Stri
     (out, next)
 }
 
-/// State: NOT STARTED — no progress file, no status row. The bump is still written
-/// so the next pass front-loads the program the user actually wanted.
 #[test]
 fn pending_not_started_records_the_wish() {
     let l = temp_layout("pend-notstarted");
@@ -8212,9 +7222,6 @@ fn pending_not_started_records_the_wish() {
     let _ = std::fs::remove_dir_all(&l.prefix);
 }
 
-/// A person at a terminal waits: the same live download is a wait that ends in the program
-/// running ([`PendingNext::WaitThenRun`]), and a queued program is bumped first so the wait
-/// is short. A failed row is said, never waited on.
 #[test]
 fn pending_on_a_terminal_waits_for_a_program_on_its_way() {
     let l = temp_layout("pend-wait");
@@ -8242,9 +7249,6 @@ fn pending_on_a_terminal_waits_for_a_program_on_its_way() {
     let _ = std::fs::remove_dir_all(&l.prefix);
 }
 
-/// An archive the set completion fetched ahead waits, whole, for the pass to reach its
-/// program: a person waiting for it bumps it as they would a queued one (its stage has not
-/// started), while one whose bytes are still moving is left where it is.
 #[test]
 fn pending_on_a_terminal_bumps_a_download_that_waits_for_the_pass() {
     let l = temp_layout("pend-wait-ahead");
@@ -8267,9 +7271,6 @@ fn pending_on_a_terminal_bumps_a_download_that_waits_for_the_pass() {
     let _ = std::fs::remove_dir_all(&l.prefix);
 }
 
-/// A command answers with its program's state: `targo` is `trust`'s, so the progress row
-/// read, the bump written and the install named are `trust`'s, and an unattended caller (no
-/// terminal) waits for it too, told the bound, not Ctrl-C.
 #[test]
 fn a_command_stub_reports_and_waits_for_its_program() {
     let l = temp_layout("pend-command");
@@ -8309,13 +7310,11 @@ fn a_command_stub_reports_and_waits_for_its_program() {
                 && x.contains("waiting at most 15 minutes")),
         "{out:?}"
     );
-    // What the wait says every few seconds: the program's share.
     let file = crate::progress::read_progress(&l).unwrap();
     assert_eq!(
         unattended_wait_line("targo", "trust", file.programs.get("trust")),
         "atpkg: targo is being installed (trust 41%)"
     );
-    // Nothing installing: the bump names the program the installer can act on.
     let _ = std::fs::remove_file(l.progress_file());
     let lines = pending_state_lines(&l, "trustc");
     assert!(
@@ -8328,17 +7327,10 @@ fn a_command_stub_reports_and_waits_for_its_program() {
     let _ = std::fs::remove_dir_all(&l.prefix);
 }
 
-/// A WAIT ON A PROMISE ITS CALLER SAW ends at once on a plan that left the program out,
-/// even when the update retired the promise before the wait's first read: the stub said
-/// "on its way" and then found no promise, so a live default-set pass with no row for
-/// `trust` is the honesty edge (127). The pass keeps its heartbeat until the wait has
-/// answered, as a real one runs on: a wait that missed the promise waits it out, and the
-/// hang detector says so.
 #[test]
 fn a_wait_on_a_promise_its_caller_saw_answers_a_plan_that_left_it_out_at_once() {
     use std::sync::atomic::{AtomicBool, Ordering};
     let l = temp_layout("pend-seen-promise");
-    // Written whole and renamed in, as a pass writes it: a reader never sees half a plan.
     let plan = |l: &crate::store::Layout| {
         let tmp = l.progress_file().with_extension("tmp");
         std::fs::write(
@@ -8394,12 +7386,6 @@ fn a_wait_on_a_promise_its_caller_saw_answers_a_plan_that_left_it_out_at_once() 
     let _ = std::fs::remove_dir_all(&l.prefix);
 }
 
-/// A promised pass is waited for before it begins (`pass-owed.json`, the window's first-run
-/// seed or an update about to plan): an unattended `targo` waits for `trust`, bumped first,
-/// and keeps waiting through the begun pass's first seconds before its plan lands, where a
-/// planned pass that leaves `trust` out is the honesty edge. A promise whose owner is gone,
-/// or whose deadline passed, keeps nobody waiting: the not-running answer, as with no
-/// promise at all.
 #[test]
 fn a_promised_pass_is_waited_for_until_it_plans() {
     fn lines_waiting_unattended(l: &crate::store::Layout) -> (Vec<String>, PendingNext) {
@@ -8434,14 +7420,12 @@ fn a_promised_pass_is_waited_for_until_it_plans() {
         "trust unattended\n",
         "bumped before the wait, for a script"
     );
-    // A caller that cannot wait is told the program is requested first.
     let lines = pending_state_lines(&l, "targo");
     assert!(
         lines.iter().any(|x| x.contains("requested first")),
         "{lines:?}"
     );
 
-    // The pass begun, its plan not in yet: still the promise's wait, never the edge…
     std::fs::write(l.progress_file(), live_snapshot("{}", "[]")).unwrap();
     let (lines, next) = lines_waiting_unattended(&l);
     assert_eq!(next, PendingNext::WaitForPromise, "{lines:?}");
@@ -8451,7 +7435,6 @@ fn a_promised_pass_is_waited_for_until_it_plans() {
             .any(|x| x.contains("no longer part of the default set")),
         "{lines:?}"
     );
-    // …which the same planned pass, the promise retired, is (the negative control).
     crate::progress::retire_promise(&l);
     let (lines, next) = lines_waiting_unattended(&l);
     assert_eq!(next, PendingNext::Done, "{lines:?}");
@@ -8463,7 +7446,6 @@ fn a_promised_pass_is_waited_for_until_it_plans() {
     );
     let _ = std::fs::remove_file(l.progress_file());
 
-    // A broken promise: its owner gone, or past its deadline.
     let gone = std::process::Command::new("/usr/bin/true")
         .spawn()
         .map(|mut c| {
@@ -8495,8 +7477,6 @@ fn a_promised_pass_is_waited_for_until_it_plans() {
     let _ = std::fs::remove_dir_all(&l.prefix);
 }
 
-/// A failed pass left before the command began is not the promised successor,
-/// including when both clocks round to the same Unix second.
 #[test]
 fn a_promised_wait_does_not_adopt_an_unchanged_same_second_failure() {
     let l = temp_layout("pending-same-second-old-failure");
@@ -8510,7 +7490,6 @@ fn a_promised_wait_does_not_adopt_an_unchanged_same_second_failure() {
     );
     sink.finish();
     let mut initial = crate::progress::read_progress(&l).unwrap();
-    // An exact controlled second, without waiting for a wall-clock boundary.
     initial.started_unix = began;
     initial.heartbeat_unix = began;
     initial.ended_unix = Some(began);
@@ -8526,8 +7505,6 @@ fn a_promised_wait_does_not_adopt_an_unchanged_same_second_failure() {
     assert_eq!(pending_wait_step(owed, false, failed), WaitStep::Wait);
 }
 
-/// A real successor that begins and ends between looks still owns its failure,
-/// even if every coarse timestamp and program row equals the preceding pass.
 #[test]
 fn a_pending_wait_reports_a_same_second_successor_failure() {
     let l = temp_layout("pending-same-second-new-failure");
@@ -8593,11 +7570,6 @@ fn a_legacy_terminal_snapshot_requires_an_observed_live_pass() {
     assert!(pending_wait_file(Some(&ended), None, false, false).is_none());
 }
 
-/// A whole update promises its plan on a first install, or over a promise it finds. A
-/// routine pass (an ALab program already active) makes none, so a stub for a program it
-/// will not plan (held, unserved here) answers with its recorded reason at once instead of
-/// waiting for that plan; it takes over the window seed's live promise; and a pass that
-/// does not plan the set promises nothing.
 #[test]
 fn a_whole_update_promises_its_plan_only_on_a_first_install_or_over_a_promise() {
     let l = temp_layout("update-promise-gate");
@@ -8615,16 +7587,11 @@ fn a_whole_update_promises_its_plan_only_on_a_first_install_or_over_a_promise() 
     let _ = std::fs::remove_dir_all(&l.prefix);
 }
 
-/// The promise ends where the plan begins: a pass promised before it began retires the
-/// promise once its plan is in `progress.json`, the pass still live, so a stub reads the
-/// pass's own rows from then on. A pass that stops before it plans (its index
-/// unresolvable) leaves the promise to the update's return ([`PromiseEnds`]).
 #[test]
 fn a_promised_pass_retires_its_promise_once_its_plan_lands() {
     let _slot = crate::progress::own_pass_slot();
     let now = || aterm_time::unix_secs().unwrap();
     let cfg = crate::config::PackagesConfig::default();
-    // Negative control: nothing to resolve, so no plan, and the promise stands.
     let empty = scratch("promise-plan-empty");
     let layout = temp_layout("promise-plan-unresolved");
     crate::progress::promise_pass(&layout, std::process::id(), 60);
@@ -8678,12 +7645,6 @@ fn a_promised_pass_retires_its_promise_once_its_plan_lands() {
     let _ = std::fs::remove_dir_all(&empty);
 }
 
-/// THE WINDOW'S SEED SAYS THE RECORDED VERDICT ON A LAUNCH NO UPDATE FOLLOWS. A toolset
-/// excluded to nothing gets its `seed-unusable:` card from the update's empty-store arm, and
-/// the window's seed asks no index; on a launch whose update is not due, that seed says the
-/// verdict again from the record, so the card is there at every launch. Not when the update
-/// is due (it says it), not once a later pass's outcome replaced the verdict, and not on a
-/// store something is wanted in.
 #[test]
 fn the_window_seed_says_the_recorded_verdict_when_no_update_is_due() {
     let layout = temp_layout("seed-recorded-verdict");
@@ -8797,12 +7758,6 @@ fn the_window_seed_says_the_recorded_verdict_when_no_update_is_due() {
     let _ = std::fs::remove_dir_all(&layout.prefix);
 }
 
-/// TIER-1: the stub's REAL decision ([`pending_wait_step`]) against the derived model
-/// `AtpkgPendingWait`, at every reachable deciding state — the model's reads mapped
-/// onto the function's inputs in the order `wait_then_run` makes them (the promise, then
-/// the pass, then the shim). Negative control: the decision the stub could have made
-/// instead — "the pass ended, so it failed", asked before the shim — disagrees with the
-/// model at a reachable state, so agreement is never vacuous.
 #[test]
 fn the_pending_wait_decision_refines_the_derived_model() {
     use aterm_models_atpkg::atpkg_pending_wait_model;
@@ -8839,9 +7794,6 @@ fn the_pending_wait_decision_refines_the_derived_model() {
         ["DecideWait"] => WaitStep::Wait,
         ref other => panic!("exactly one decision is enabled at {s:?}: {other:?}"),
     };
-    // `running` is what the promise and the pass read together say (a pass is coming), and
-    // `failed` is the pass saying it will not bring the program: a failed row, a plan that
-    // left it out (`left_out`), or a done row with no shim of the name (`landed_without`).
     let inputs = |s: &std::collections::BTreeMap<&'static str, i64>| {
         (
             s["coming"] == 1,
@@ -8857,7 +7809,6 @@ fn the_pending_wait_decision_refines_the_derived_model() {
             "the real decision at {s:?}"
         );
     }
-    // Negative control: ended-means-failed, asked before the shim.
     let mutant = |running: bool, installed: bool, failed: bool| {
         if failed || !running {
             WaitStep::Fail
@@ -8876,9 +7827,6 @@ fn the_pending_wait_decision_refines_the_derived_model() {
     );
 }
 
-/// A pass that installs something else (a person's `update`, another program's `install`)
-/// is no delisting: its snapshot never planned the default set, so the stub answers as if
-/// nothing were installing this program, and still records the wish.
 #[test]
 fn pending_is_not_delisted_by_a_pass_that_plans_other_work() {
     let l = temp_layout("pend-other-pass");
@@ -8899,10 +7847,6 @@ fn pending_is_not_delisted_by_a_pass_that_plans_other_work() {
     let _ = std::fs::remove_dir_all(&l.prefix);
 }
 
-/// State: skipped, a terminal phase, never a wait. `Sink::finished` has retired the program
-/// from the queue and counted it done, so nothing later in this pass installs it and the
-/// reorder-only bump file cannot put it back. The stub says the recorded reason
-/// (control-stripped) and claims no bump.
 #[test]
 fn pending_skipped_says_the_recorded_reason_and_claims_no_bump() {
     let l = temp_layout("pend-skipped");
@@ -8934,8 +7878,6 @@ fn pending_skipped_says_the_recorded_reason_and_claims_no_bump() {
     let _ = std::fs::remove_dir_all(&l.prefix);
 }
 
-/// State: failed. The recorded error surfaces with its next act, control characters
-/// stripped before the TTY.
 #[test]
 fn pending_failed_names_the_error_and_strips_escapes() {
     let l = temp_layout("pend-failed");
@@ -8966,8 +7908,6 @@ fn pending_failed_names_the_error_and_strips_escapes() {
     let _ = std::fs::remove_dir_all(&l.prefix);
 }
 
-/// A stale snapshot renders only not-running states: yesterday's "downloading" is never
-/// today's claim.
 #[test]
 fn pending_stale_heartbeat_renders_not_running() {
     let l = temp_layout("pend-stale");
@@ -8992,9 +7932,6 @@ fn pending_stale_heartbeat_renders_not_running() {
     let _ = std::fs::remove_dir_all(&l.prefix);
 }
 
-/// The honesty edge: a live resolved-pass snapshot that does not plan the program says "no
-/// longer part of the default set" and claims no bump, which the reorder-only intersection
-/// would drop.
 #[test]
 fn pending_delisted_name_is_told_the_truth_and_not_bumped() {
     let l = temp_layout("pend-delisted");
@@ -9018,8 +7955,6 @@ fn pending_delisted_name_is_told_the_truth_and_not_bumped() {
     let _ = std::fs::remove_dir_all(&l.prefix);
 }
 
-/// A name the shim gate refuses is never echoed back — the one universally safe
-/// answer for it.
 #[test]
 fn pending_refuses_inadmissible_names() {
     let l = temp_layout("pend-refuse");
@@ -9032,10 +7967,6 @@ fn pending_refuses_inadmissible_names() {
     let _ = std::fs::remove_dir_all(&l.prefix);
 }
 
-/// A pending stub an older client laid for an extra (with the retired marker line) reads
-/// as the default-set state: every program the index names is a default-set member now, so
-/// `__pending` says it is not installed yet and bumps it, with no question or marker. An
-/// agent program with no stub gets its vendor line the same way.
 #[test]
 fn pending_over_an_older_extra_stub_is_the_default_set_state() {
     let l = temp_layout("pend-extra-retired");
@@ -9063,8 +7994,6 @@ fn pending_over_an_older_extra_stub_is_the_default_set_state() {
     let _ = std::fs::remove_dir_all(&l.prefix);
 }
 
-// The priority queue — reorder-only by construction (design §4).
-
 fn plan_of(groups: &[&[&str]]) -> Vec<(usize, Vec<String>)> {
     groups
         .iter()
@@ -9073,24 +8002,18 @@ fn plan_of(groups: &[&[&str]]) -> Vec<(usize, Vec<String>)> {
         .collect()
 }
 
-/// Bumped-first in bump order, plan order as the stable tiebreak; names outside
-/// the plan have no effect at all.
 #[test]
 fn resort_bumped_orders_bumped_first_then_plan_order() {
     let mut plan = plan_of(&[&["ay"], &["clean"], &["ny"], &["ty"]]);
     resort_bumped(&mut plan, &["ty".to_string(), "clean".to_string()]);
     let order: Vec<usize> = plan.iter().map(|(i, _)| *i).collect();
     assert_eq!(order, vec![3, 1, 0, 2], "bump order first, then plan order");
-    // Unknown names are inert — the reorder-only intersection already dropped
-    // anything unplanned, and even raw they cannot move a thing.
     let mut plan = plan_of(&[&["ay"], &["clean"]]);
     resort_bumped(&mut plan, &["sudo".to_string(), "zzz".to_string()]);
     let order: Vec<usize> = plan.iter().map(|(i, _)| *i).collect();
     assert_eq!(order, vec![0, 1]);
 }
 
-/// Bumping any member bumps its whole group: the tuple stays transactional, the queue
-/// jump is group-granular.
 #[test]
 fn bumping_a_member_bumps_the_whole_group() {
     let mut plan = plan_of(&[&["ay"], &["trust", "trust-cg", "trust-ir"], &["ty"]]);
@@ -9112,11 +8035,6 @@ fn bumping_a_member_bumps_the_whole_group() {
     );
 }
 
-/// `verify-pkg` runs the client's whole chain, not only the signature: a publisher that
-/// takes it as the client's own rule refuses to ship what it refuses, so a manifest that
-/// verifies but no client can parse must fail it. Every body is signed by the roster's own
-/// machine, so only the post-verify behaviour is under test; the refusal names the fix, as
-/// `Reject::ShimEnv`/`RetiredKind` promise.
 #[test]
 fn verify_pkg_refuses_a_signed_manifest_no_client_can_parse() {
     const HEAD: &str = "schema = 2\nprogram = \"claude\"\nversion = \"2.1.231\"\n\
@@ -9134,7 +8052,6 @@ fn verify_pkg_refuses_a_signed_manifest_no_client_can_parse() {
     std::fs::write(&roster_sig_path, roster_sig.as_slice()).unwrap();
     let master = pk(&ROOT_SEED);
 
-    // The verb, over a manifest machine-signed through the real chain every time.
     let run = |label: &str, body: &str| -> String {
         let pkg = dir.join(format!("pkg-claude-{label}.toml"));
         let sig = dir.join(format!("pkg-claude-{label}.toml.sig"));
@@ -9154,14 +8071,12 @@ fn verify_pkg_refuses_a_signed_manifest_no_client_can_parse() {
     let verified_ok = format!("{:?}", ExitCode::SUCCESS);
     let refused = format!("{:?}", ExitCode::from(1));
 
-    // A manifest a client can read passes.
     assert_eq!(
         run("good", &format!("{HEAD}{ROW}")),
         verified_ok,
         "a signed, parsable manifest must still verify"
     );
 
-    // Every post-verify gate a client applies fails the verb too.
     for (label, body, names) in [
         (
             "shim-env",
@@ -9201,8 +8116,6 @@ fn verify_pkg_refuses_a_signed_manifest_no_client_can_parse() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
-/// A file `verify-index` / `verify-pkg` cannot read stops it at exit 1 (the path and
-/// the error are said), never the usage error's 2.
 #[test]
 fn verify_stops_at_the_first_unreadable_file() {
     let dir = scratch("verify-unreadable");
@@ -9217,13 +8130,6 @@ fn verify_stops_at_the_first_unreadable_file() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// `verify-index` names a post-verify mistake instead of blaming the signature.
-/// `TrustedRoster::authorize_index` verifies Ed25519 first, then parses, then binds the
-/// attribution, so `Malformed`, `Schema`, `Unattributed` and `SeqMismatch` are reachable
-/// only once a roster machine signed these bytes; reported as "no machine on that roster
-/// signed this index" they would send the publisher to re-key when the fix is one line of
-/// the index. Every body is signed by the roster's own machine; the last case guards the
-/// other direction: a crypto verdict stays opaque (§8).
 #[test]
 fn verify_index_names_the_post_verify_mistake_instead_of_blaming_the_signature() {
     let dir = scratch("verify-index-post-verify");
@@ -9234,7 +8140,6 @@ fn verify_index_names_the_post_verify_mistake_instead_of_blaming_the_signature()
     std::fs::write(&roster_sig_path, roster_sig.as_slice()).unwrap();
     let master = pk(&ROOT_SEED);
 
-    // An index this chain accepts: attributed to the roster's machine, at its seq.
     let good = format!(
         "schema = 2\nindex_build = 41\nvalid_until = \"2099-01-01T00:00:00Z\"\n\
          machine_id = \"{id}\"\nroster_seq = {seq}\n[programs.ay]\nrepo = \"ay\"\n",
@@ -9242,7 +8147,6 @@ fn verify_index_names_the_post_verify_mistake_instead_of_blaming_the_signature()
         seq = testkit::SEQ
     );
 
-    // The verb itself, over an index signed by `seed`.
     let run = |label: &str, body: &str, seed: &[u8; 32]| -> String {
         let index = dir.join(format!("index-{label}.toml"));
         let sig = dir.join(format!("index-{label}.toml.sig"));
@@ -9259,7 +8163,6 @@ fn verify_index_names_the_post_verify_mistake_instead_of_blaming_the_signature()
             ])
         )
     };
-    // What the verb prints for those bytes: the refusal the same call hands it.
     let refusal = |body: &str, seed: &[u8; 32]| -> Option<String> {
         let sig = sign(seed, body.as_bytes());
         let Err(why) = testkit::trusted_roster().authorize_index(body.as_bytes().to_vec(), &sig)
@@ -9271,7 +8174,6 @@ fn verify_index_names_the_post_verify_mistake_instead_of_blaming_the_signature()
     let verified_ok = format!("{:?}", ExitCode::SUCCESS);
     let refused = format!("{:?}", ExitCode::from(1));
 
-    // A correctly authored index verifies.
     assert_eq!(
         run("good", &good, &RELEASE_SEED),
         verified_ok,
@@ -9279,7 +8181,6 @@ fn verify_index_names_the_post_verify_mistake_instead_of_blaming_the_signature()
     );
 
     for (label, body, names) in [
-        // The two an edit to the index authoring script produces.
         (
             "duplicate-key",
             good.replace("schema = 2\n", "schema = 2\nindex_build = 41\n"),
@@ -9300,7 +8201,6 @@ fn verify_index_names_the_post_verify_mistake_instead_of_blaming_the_signature()
             good.replace(&format!("machine_id = \"{}\"\n", testkit::MACHINE_ID), ""),
             "machine_id",
         ),
-        // A misread `roster_seq` lands here, and the refusal must name it.
         (
             "seq-mismatch",
             good.replace(
@@ -9329,8 +8229,6 @@ fn verify_index_names_the_post_verify_mistake_instead_of_blaming_the_signature()
         );
     }
 
-    // The other direction: a signature that does not verify says nothing beyond that,
-    // so the operator gets the one opaque line (§8).
     assert_eq!(
         run("outsider", &good, &testkit::OUTSIDER_SEED),
         refused,
@@ -9343,8 +8241,6 @@ fn verify_index_names_the_post_verify_mistake_instead_of_blaming_the_signature()
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
-
-// ---- the vendor-direct lane in the pass (design §1.5, §1.8) ----
 
 fn vendor_floor() -> crate::sig::BuildFloor {
     crate::sig::BuildFloor {
@@ -9363,20 +8259,16 @@ fn world_now() -> i64 {
 
 fn no_shell_hooks(_: &crate::store::Layout) {}
 
-/// No rustup seam: the real one writes the real `~/.rustup`.
 fn no_rustup_seam(_: &crate::store::Layout) {}
 
 thread_local! {
-    /// Every program a pass on this thread asked to warm, in order ([`record_warm`]).
     static WARMED: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
-/// The world's warm: recorded on this thread (tests run one per thread), never run.
 fn record_warm(_: &crate::store::Layout, programs: &std::collections::BTreeSet<String>) {
     WARMED.with(|w| w.borrow_mut().extend(programs.iter().cloned()));
 }
 
-/// What this thread's passes asked to warm since the last call.
 fn take_warmed() -> Vec<String> {
     WARMED.with(|w| std::mem::take(&mut *w.borrow_mut()))
 }
@@ -9385,14 +8277,10 @@ fn world_anchor(_: &crate::store::Layout) -> crate::Anchor {
     crate::sig::testkit::anchor()
 }
 
-/// A process table with nothing in it: the pass tests' flip gate is `Now`, which never
-/// reads one, and a test that asks for quiet says so with its own.
 fn no_processes() -> Option<Vec<std::path::PathBuf>> {
     Some(Vec::new())
 }
 
-/// What a pass runs under here: the test anchor and key, the world's clock, no shell
-/// hooks (they write the real home), no progress file, and a warm that only records.
 fn world_seams(trust: &crate::vendor_direct::lane::Trust) -> PassSeams<'_> {
     PassSeams {
         anchor: world_anchor,
@@ -9411,14 +8299,10 @@ fn world_seams(trust: &crate::vendor_direct::lane::Trust) -> PassSeams<'_> {
     }
 }
 
-/// A `dir:` registry whose `rustc` tuple is `trust` + `tb`, pinned at trust 4821 and
-/// tb 6 by an index still valid at the world's clock, beside both signed pkgs.
 fn write_toolchain_registry(dir: &Path) {
     write_toolchain_registry_and(dir, &[]);
 }
 
-/// [`write_toolchain_registry`] with the ungrouped `singletons` `(program, build)` beside
-/// the tuple.
 fn write_toolchain_registry_and(dir: &Path, singletons: &[(&str, u64)]) {
     let programs: String = singletons
         .iter()
@@ -9453,10 +8337,6 @@ fn write_toolchain_registry_and(dir: &Path, singletons: &[(&str, u64)]) {
     }
 }
 
-/// One flip gate for the whole unattended pass: with a build running from trust 4800, the
-/// apply lane stages the `rustc` tuple and waits, and the same pass's set-completion lane,
-/// finding `tb` absent, must not complete it by flipping trust under that build. `tb`
-/// arrives with the flip once the toolchain is quiet.
 #[test]
 fn a_busy_toolchain_is_not_flipped_by_set_completion_and_lands_whole_when_quiet() {
     let dir = scratch("busy-set-completion");
@@ -9507,15 +8387,12 @@ fn a_busy_toolchain_is_not_flipped_by_set_completion_and_lands_whole_when_quiet(
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A pass that only applies (no set completion: `auto_install = false`, a machine nothing
-/// adopted) and flips trust 4800 to 4821 leaves the rustup view presenting 4821.
 #[test]
 fn an_apply_only_pass_that_flips_trust_re_lays_the_rustup_view() {
     let dir = scratch("apply-only-seam");
     write_toolchain_registry(&dir);
     let layout = temp_layout("apply-only-seam");
     make_live(&layout, "trust", 4800);
-    // Bytes of its own, so a view of 4800 cannot pass for one of 4821.
     std::fs::write(
         layout.build_dir("trust", 4800).join("bin/trust"),
         b"#!/bin/true\n# build 4800\n",
@@ -9557,55 +8434,27 @@ fn an_apply_only_pass_that_flips_trust_re_lays_the_rustup_view() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// The ALab set and the agents in one fetcher, worked from several threads at once as the
-/// production fetcher is ([`crate::flow::Fetcher::shared`]): a `dir:` registry for the set
-/// and a vendor world for the agents. With `checkpoints`, three requests wait, each on the
-/// one-minute hang detector, for what only a pass running its lanes side by side asks
-/// first: claude's head for codex's (the vendor plans go out together), the first agent's
-/// payload for the other lane's landing to wait on the link (the lanes land side by side),
-/// and the pass's read of a `rustc` member's manifest once the tuple's archives are moving,
-/// for claude's payload (the agents land while the set installs, not once its toolchain has
-/// flipped).
 struct SetBesideVendors {
     registry: crate::DirFetcher,
     vendors: crate::vendor_direct::lane::world::Fake,
     layout: crate::store::Layout,
     checkpoints: bool,
-    /// Every `head:<program>`, `download:<program>` and `payload:<program>` asked so far.
     asked: (std::sync::Mutex<Vec<String>>, std::sync::Condvar),
-    /// As each agent's payload was asked for: whether every archive of `set` was in, and
-    /// whether trust was live.
     at_payload: std::sync::Mutex<Vec<(String, bool, bool)>>,
-    /// The set's programs, whose archives the agents' bytes wait for.
     set: &'static [&'static str],
-    /// The live pass's queue as the set's first archive was asked for.
     queue_at_first_download: std::sync::Mutex<Option<Vec<String>>>,
-    /// trust's archive waits, on the one-minute hang detector, for claude's payload: what
-    /// only a pass that lands a bumped agent beside the tuple asks first.
     tuple_waits_for_claude: bool,
-    /// Agent payloads downloading now, and the most there ever were at once.
     payloads_in_flight: (
         std::sync::atomic::AtomicUsize,
         std::sync::atomic::AtomicUsize,
     ),
-    /// As each agent's payload was asked for: whether a pass was still promised, and the
-    /// live plan's rows.
     owed_at_payload: std::sync::Mutex<Vec<(String, bool, Vec<String>)>>,
-    /// The set's programs whose first archive download fails, as a dropped transfer does.
     flaky: std::sync::Mutex<Vec<&'static str>>,
-    /// Every set archive download, with the thread that asked.
     downloads: std::sync::Mutex<Vec<(String, String)>>,
-    /// The index resolve waits — on the one-minute hang detector — for this to be asked.
     resolve_waits_for: Option<&'static str>,
-    /// `(program, what)`: that program's head read waits, on the hang detector, for `what`.
     head_waits_for: Option<(&'static str, &'static str)>,
-    /// `(program, agent)`: that program's payload waits, on the hang detector, until `agent`'s
-    /// shim is live and its status row reads `managed` — the row its lane's landing writes.
     payload_waits_for_row: Option<(&'static str, &'static str)>,
-    /// The set's manifest prefetch waits, on the hang detector, until the store's index floor
-    /// is recorded.
     prefetch_waits_for_floor: bool,
-    /// The set's manifest prefetch waits, on the hang detector, for this to be asked.
     prefetch_waits_for: Option<&'static str>,
 }
 
@@ -9633,8 +8482,6 @@ impl SetBesideVendors {
         }
     }
 
-    /// Wait — on the one-minute hang detector — until `agent`'s shim is live (no pending stub
-    /// stands there) and its status row reads `managed`.
     fn wait_until_row_reads_managed(&self, agent: &str) {
         let deadline = std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN;
         let tool = crate::store::ToolName::new(agent).unwrap();
@@ -9658,8 +8505,6 @@ impl SetBesideVendors {
         }
     }
 
-    /// Wait, on the one-minute hang detector, until the live pass's row for `program` says
-    /// its landing has begun (its build is noted) and it still waits, queued, for its bytes.
     fn wait_until_waiting_for_the_link(&self, program: &str) {
         let deadline = std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN;
         while !crate::progress::live_snapshot()
@@ -9858,8 +8703,6 @@ impl crate::flow::Fetcher for SetBesideVendors {
             "claude"
         };
         if self.checkpoints && !self.was_asked(&format!("payload:{other}")) {
-            // The other lane's landing begins while the first agent's bytes are in flight,
-            // and waits for the link, its row still queued: the lanes land side by side, and
             // only their bytes take turns.
             self.wait_until_waiting_for_the_link(other);
         }
@@ -9877,8 +8720,6 @@ impl crate::flow::Fetcher for SetBesideVendors {
     }
 }
 
-/// The agents a first run lands beside its set: claude and codex (agy and muse, which the
-/// vendor world does not publish, left out).
 fn claude_and_codex_wanted() -> crate::config::PackagesConfig {
     crate::config::PackagesConfig {
         exclude: Some(agents_except(&["claude", "codex"])),
@@ -9886,8 +8727,6 @@ fn claude_and_codex_wanted() -> crate::config::PackagesConfig {
     }
 }
 
-/// Every agent program of the table but `keep`: what a test wanting only those excludes, so
-/// a row the table gains (`codex-old`) never joins a test that did not ask for it.
 fn agents_except(keep: &[&str]) -> Vec<String> {
     crate::vendor_direct::VENDORS
         .iter()
@@ -9897,18 +8736,6 @@ fn agents_except(keep: &[&str]) -> Vec<String> {
         .collect()
 }
 
-/// A first run lands its agents beside its set under one announcement. On an empty store
-/// whose index resolves, the vendor plans go out together; no agent's payload is asked for
-/// until every archive of the set is in (a pass landing the agents first, or beside the
-/// set's own downloads, fails here), and the agents then land while the set installs (the
-/// pass's read of a `rustc` manifest at its stage waits for claude's payload, so a pass
-/// holding the agents until the toolchain has flipped never finishes), two at a time,
-/// taking turns at the download alone: codex's lane reaches its download while claude's is
-/// in flight, and its bytes move only once claude's are in (two payloads at once fail here,
-/// and a lane that held its turn past the download never lets codex's row move). One
-/// `net-starting:` names both lanes before any byte, one terminal answers it with both,
-/// every row is its own lane's, no stub stands over an agent's shim, and the rustup view
-/// follows trust at its flip and again at the pass end.
 #[test]
 fn an_empty_store_lands_its_agents_beside_its_set_under_one_announcement() {
     use crate::vendor_direct::lane::world::{self, native_exe};
@@ -10021,11 +8848,6 @@ fn an_empty_store_lands_its_agents_beside_its_set_under_one_announcement() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A first run's queue reads in the order its bytes move, and the agents' lane meters on
-/// the pass it rides: while the `rustc` tuple downloads, the queue a pending stub reads its
-/// place in names the tuple first and the agents after it (never claude "next in line"
-/// ahead of a toolchain it waits for), and each agent's row, landed on a thread of its own,
-/// ends `done` on the one live pass.
 #[test]
 fn a_first_runs_queue_names_the_toolchain_before_the_agents_that_wait_for_it() {
     use crate::vendor_direct::lane::world::{self, native_exe};
@@ -10076,11 +8898,6 @@ fn a_first_runs_queue_names_the_toolchain_before_the_agents_that_wait_for_it() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A person who typed an agent's name does not wait for the toolchain. Its pending stub
-/// bumps it ("bumped first when still queued, so the wait is short"); the agents ride
-/// behind the `rustc` tuple, so the bumped one lands at once beside it (trust's archive
-/// waits for claude's payload, and a lane that ignored the bump never asks for it), while
-/// an agent nobody asked for still waits for the set's archives.
 #[test]
 fn a_bumped_agent_lands_beside_the_toolchain_not_after_it() {
     use crate::vendor_direct::lane::world::{self, native_exe};
@@ -10134,12 +8951,6 @@ fn a_bumped_agent_lands_beside_the_toolchain_not_after_it() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A RIDING AGENT'S ROW IS WRITTEN AS IT LANDS, not once the pass is over. The agents land
-/// on lane threads beside the set, and the pass's thread — the one that writes every row —
-/// reports each landing as it comes: codex's payload, the other lane's, waits on the
-/// one-minute hang detector until claude's shim is live and claude's status row reads
-/// `managed`. A pass that writes the riders' rows only after its lanes join never lets
-/// codex's bytes move.
 #[test]
 fn a_riding_agents_row_is_written_as_it_lands_while_the_other_lane_still_runs() {
     use crate::vendor_direct::lane::world::{self, native_exe};
@@ -10170,13 +8981,6 @@ fn a_riding_agents_row_is_written_as_it_lands_while_the_other_lane_still_runs() 
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// THE EXPLICIT VERB LANDS ITS AGENTS BESIDE ITS SET, as a first run's update pass does.
-/// `install --default-set` on an empty store asks for no agent's payload until every
-/// archive of the set is in — the vendor-first verb landed claude and codex before the
-/// set's first byte — under ONE announcement that keeps the verb's own consent (it names
-/// neither the first launch nor `auto_install`), answered once; each agent's row is written
-/// as it lands (codex's payload waits for claude's, as above), and the rustup view follows
-/// trust at its flip as well as at the verb's end.
 #[test]
 fn the_toolset_verb_lands_its_agents_beside_its_set_under_one_announcement() {
     use crate::vendor_direct::lane::world::{self, native_exe};
@@ -10245,10 +9049,6 @@ fn the_toolset_verb_lands_its_agents_beside_its_set_under_one_announcement() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// An agent a script asked for waits for the toolchain's bytes, then goes first. A script's
-/// `codex --version` (no terminal) bumps codex as a person's stub does, but nobody is waiting
-/// at a terminal: codex's bytes wait for every archive of the set like any agent's, and once
-/// the gate opens codex is the request taken first, ahead of claude's place in the table.
 #[test]
 fn a_script_bumped_agent_waits_for_the_toolchain_then_goes_first() {
     use crate::vendor_direct::lane::world::{self, native_exe};
@@ -10302,8 +9102,6 @@ fn a_script_bumped_agent_waits_for_the_toolchain_then_goes_first() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// [`write_toolchain_registry`] whose index publishes no channel this client follows, as a
-/// machine with no channel for its triple reads it.
 fn write_channelless_registry(dir: &Path) {
     write_toolchain_registry(dir);
     let body = std::fs::read_to_string(dir.join("index.toml"))
@@ -10317,12 +9115,6 @@ fn write_channelless_registry(dir: &Path) {
     .unwrap();
 }
 
-/// No channel here, and the promise goes with the plan that says so. A first run's set
-/// completion finds no channel for this machine and plans nothing: the promise a stub waits
-/// on goes then, so `targo` hears the truth at once rather than when the update exits. When
-/// the agents the set was to carry land alone after it, their plan takes the promise over
-/// (a stub waiting for claude never reads it gone before claude's row is up) and goes with
-/// it.
 #[test]
 fn a_set_with_no_channel_hands_its_promise_to_the_plan_that_comes_next() {
     use crate::vendor_direct::lane::world::{self, native_exe};
@@ -10357,7 +9149,6 @@ fn a_set_with_no_channel_hands_its_promise_to_the_plan_that_comes_next() {
         code
     };
 
-    // The agents land alone: at each one's payload its plan is up and the promise gone.
     let layout = temp_layout("no-channel-agents");
     let f = SetBesideVendors::new(&dir, &layout, false);
     f.vendors
@@ -10381,10 +9172,6 @@ fn a_set_with_no_channel_hands_its_promise_to_the_plan_that_comes_next() {
     );
     let _ = std::fs::remove_dir_all(&layout.prefix);
 
-    // codex's read is still out when the set stops (its head answers only once claude's
-    // payload is asked for): claude lands alone first, its plan keeping the promise for
-    // codex, and codex's own plan, after it, takes the promise with it. claude's read is in
-    // before the index is, so the plan tells the two apart with no grace to wait out.
     let layout = temp_layout("no-channel-late");
     let mut f = SetBesideVendors::new(&dir, &layout, false);
     f.head_waits_for = Some(("codex", "payload:claude"));
@@ -10417,7 +9204,6 @@ fn a_set_with_no_channel_hands_its_promise_to_the_plan_that_comes_next() {
     );
     let _ = std::fs::remove_dir_all(&layout.prefix);
 
-    // Nothing to land after it: the set completion's empty plan retires the promise.
     let layout = temp_layout("no-channel-alone");
     let f = SetBesideVendors::new(&dir, &layout, false);
     let none = crate::config::PackagesConfig {
@@ -10438,11 +9224,6 @@ fn a_set_with_no_channel_hands_its_promise_to_the_plan_that_comes_next() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A FIRST RUN'S VENDOR READS GO OUT WITH ITS INDEX RESOLVE. The resolve here answers only
-/// once claude's documents have been asked for — what only a pass that reads the vendor
-/// lane's heads and the documents they name beside its index resolve asks first (a pass
-/// that reads them after the index never gets past the resolve). The plan then takes what
-/// was read: each head asked once, and the agents land beside the set as ever.
 #[test]
 fn a_first_runs_vendor_reads_go_out_with_its_index_resolve() {
     use crate::vendor_direct::lane::world::{self, native_exe};
@@ -10487,14 +9268,6 @@ fn a_first_runs_vendor_reads_go_out_with_its_index_resolve() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A VENDOR THAT DOES NOT ANSWER IS NOT THE SET'S ANNOUNCEMENT'S TO WAIT FOR. codex's head
-/// read hangs until the set's first archive is asked for — a host that never answers, as a
-/// name that does not resolve or a connect that never finishes, until long after: a pass
-/// whose announcement waits for every vendor's plan never gets there. The set announces with
-/// claude beside it and lands; codex, planned once its read is in, lands after the set,
-/// announced and answered on its own; and the set's plan kept the promise for it. claude's
-/// read is in before the index is, and codex's cannot be before the plan, so the plan tells
-/// them apart with no grace to wait out.
 #[test]
 fn a_vendor_that_does_not_answer_lands_after_the_set_it_did_not_hold() {
     use crate::vendor_direct::lane::world::{self, native_exe};
@@ -10572,12 +9345,6 @@ fn a_vendor_that_does_not_answer_lands_after_the_set_it_did_not_hold() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// THE SET'S MANIFESTS DO NOT WAIT FOR THE VENDOR PLAN. A first run's plan waits for a
-/// vendor's read still out past the index, and codex's head here answers only once the set's
-/// manifests have been asked for: a pass that asks for them only after its vendor plan is in
-/// never gets there (the plan waits out a grace as long as the hang detector, and the head
-/// read its hang detector). Asked beside the plan, they let codex's read in, and the set
-/// announces once, with both agents beside it.
 #[test]
 fn a_first_run_asks_for_its_set_manifests_while_the_vendor_plan_waits() {
     use crate::vendor_direct::lane::world::{self, native_exe};
@@ -10626,10 +9393,6 @@ fn a_first_run_asks_for_its_set_manifests_while_the_vendor_plan_waits() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A FIRST RUN RECORDS ITS FLOOR WHILE ITS SET'S MANIFESTS ARE OUT: the floor's durable writes
-/// stood between the last manifest and the announcement. Here the manifests arrive only once
-/// the floor is recorded, so a pass that records it only when its set completion starts, after
-/// them, never gets there (the prefetch's hang detector).
 #[test]
 fn a_first_run_records_its_floor_while_its_set_manifests_are_out() {
     use crate::vendor_direct::lane::world::{self, native_exe};
@@ -10666,12 +9429,6 @@ fn a_first_run_records_its_floor_while_its_set_manifests_are_out() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// AN UPDATE'S FLIP IS NOT HELD BEHIND THE SET'S MANIFESTS. Only a first run asks for its
-/// set's manifests beside its vendor plan, joined with it: on any other pass the apply lane
-/// comes between the plan and the set completion. Here trust is live at an older build and
-/// its tuple's tb absent, and the set's manifests are answered only once the apply lane has
-/// asked for trust's new archive: a pass that waits for them before its apply lane never
-/// gets there (the prefetch's hang detector).
 #[test]
 fn an_update_pass_does_not_hold_its_apply_lane_behind_the_sets_manifests() {
     let _slot = crate::progress::own_pass_slot();
@@ -10707,11 +9464,6 @@ fn an_update_pass_does_not_hold_its_apply_lane_behind_the_sets_manifests() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// ONE DROPPED TRANSFER DOES NOT COST A FIRST RUN ITS TOOLCHAIN. The download-ahead lane's
-/// download of trust's archive is cut short: the lane goes on to the set's other archives,
-/// the pass fetches trust's itself when it reaches the tuple, and the whole set and both
-/// agents land in this pass — where a lane whose first failure halted it, and stood in for
-/// the pass's own download, aborted the toolchain's tuple.
 #[test]
 fn a_first_run_lands_its_set_whole_when_the_lane_loses_one_archive() {
     use crate::vendor_direct::lane::world::{self, native_exe};
@@ -10768,11 +9520,6 @@ fn a_first_run_lands_its_set_whole_when_the_lane_loses_one_archive() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A set unit the download-ahead lane does not fetch keeps the gate shut on the lane's
-/// word: `ay`'s row carries no compressed size, so the lane leaves it to the pass, which
-/// fetches it inline; the lane's last archive in is then not the set's, and the agents'
-/// gate waits for the pass's own rule (no tuple left to land): every agent's bytes move
-/// after trust flips.
 #[test]
 fn a_unit_the_lane_does_not_fetch_keeps_the_agents_behind_the_toolchain() {
     use crate::vendor_direct::lane::world::{self, native_exe};
@@ -10823,18 +9570,12 @@ fn a_unit_the_lane_does_not_fetch_keeps_the_agents_behind_the_toolchain() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A refused set leaves its agents to land alone, and the promise with them. A volume that
-/// cannot hold the set refuses it up front, so the agents it was to carry land after it on
-/// their own; the set completion's empty plan keeps the promise for theirs (a stub waiting
-/// for claude never reads it gone before claude's row is up), and the agents' plan retires
-/// it.
 #[test]
 fn a_refused_set_keeps_the_promise_for_the_agents_it_leaves_behind() {
     use crate::vendor_direct::lane::world::{self, native_exe};
     let _slot = crate::progress::own_pass_slot();
     let dir = scratch("refused-set-registry");
     write_toolchain_registry(&dir);
-    // trust's tree is larger than any volume: the set is refused before it moves a byte.
     let manifest = dir.join("pkg-trust-4821.toml");
     let body = std::fs::read_to_string(&manifest).unwrap().replace(
         "disk_installed = 1048576",
@@ -10948,10 +9689,6 @@ fn a_refused_set_keeps_the_promise_for_the_agents_it_leaves_behind() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// An agent that fails beside the set cancels nothing: the set lands whole, the terminal
-/// names what arrived, the pass exits 1 for the agents, and each agent's row is its own
-/// lane's failure, never the set's "installing" row it was painted with before its bytes
-/// moved.
 #[test]
 fn an_agent_failing_beside_the_set_leaves_the_set_and_its_own_row() {
     use crate::vendor_direct::lane::world::{self, native_exe};
@@ -11090,8 +9827,6 @@ fn a_requested_agent_waiting_for_its_signature_keeps_its_priority() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// With no index, the agents still land (design §1.5): alone and first, under their own
-/// announcement and terminal, while the set completion that follows can do nothing.
 #[test]
 fn a_failed_index_resolve_lands_the_agents_alone() {
     use crate::vendor_direct::lane::world::{self, native_exe};
@@ -11134,8 +9869,6 @@ fn a_failed_index_resolve_lands_the_agents_alone() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Pause exactly at the vendor release-head GET. The test thread can inspect the
-/// real active shim while the pass is unable to finish that unrelated request.
 struct BlockVendorHead {
     inner: crate::DirFetcher,
     entered: std::sync::mpsc::Sender<()>,
@@ -11182,10 +9915,6 @@ impl crate::flow::Fetcher for BlockVendorHead {
     }
 }
 
-/// A window hint advances the signed, installed ay build before an unrelated vendor GET
-/// can answer. Negative controls: without the hint, or with the signed build below the
-/// hint, the vendor runs first (§1.5); with the hinted index refused, vendor work still
-/// runs before the pass reports the index failure.
 #[test]
 fn a_signed_published_hint_activates_before_a_blocked_vendor_get() {
     for (label, hint, broken_index, ay_at_vendor, pass_code) in [
@@ -11196,8 +9925,6 @@ fn a_signed_published_hint_activates_before_a_blocked_vendor_get() {
     ] {
         let dir = scratch(&format!("priority-registry-{label}"));
         write_registry_at(&dir, "stable", 46);
-        // The shared registry fixture is intentionally expired for other tests.
-        // Re-sign a future-dated index so this test exercises a live selection.
         let body = std::fs::read_to_string(dir.join("index.toml"))
             .unwrap()
             .replace("2026-07-05T12:00:00Z", "2099-01-01T00:00:00Z");
@@ -11253,9 +9980,6 @@ fn a_signed_published_hint_activates_before_a_blocked_vendor_get() {
     }
 }
 
-/// The stall this lane exists for: the vendors' heads move while the ALab index is stale,
-/// or none verifies at all, and the pass's vendor lane installs and then upgrades both,
-/// apart from the index lane, which still refuses every ALab program on the same fetcher.
 #[test]
 fn a_moved_head_installs_while_the_index_is_stale_or_absent_and_alab_stays_refused() {
     use crate::vendor_direct::lane::world::{self, Fake, native_exe};
@@ -11309,7 +10033,6 @@ fn a_moved_head_installs_while_the_index_is_stale_or_absent_and_alab_stays_refus
         assert_eq!(rows["claude"].state, "managed 2.1.282 — Anthropic latest");
         assert_eq!(rows["codex"].state, "managed 0.157.0 — OpenAI latest");
         assert!(!rows["claude"].tree_root.is_empty());
-        // The index lane, on the same fetcher, refuses every ALab program.
         let err = crate::flow::install(
             &f,
             &layout,
@@ -11335,9 +10058,6 @@ fn a_moved_head_installs_while_the_index_is_stale_or_absent_and_alab_stays_refus
     }
 }
 
-/// The window's head-watch pass is the update pass's unattended lane for one installed
-/// program; a person's `update <program>` is the explicit door. Only the person's installs
-/// what is missing, fails on an unreached vendor, and forgets a refusal.
 #[test]
 fn the_windows_vendor_update_is_the_unattended_lane_and_a_persons_the_explicit_door() {
     use crate::vendor_direct::lane::{
@@ -11366,7 +10086,6 @@ fn the_windows_vendor_update_is_the_unattended_lane_and_a_persons_the_explicit_d
     assert!(run(VendorDoor::Window, &trust), "unreached: quiet");
     assert!(!run(VendorDoor::Person, &trust), "unreached: not checked");
     f.offline.set(false);
-    // The Apple anchor exists on macOS only.
     if cfg!(target_os = "macos") {
         f.publish_claude("2.1.283", &native_exe("claude 2.1.283"));
         let refusing = world::trust_refusing_signers();
@@ -11388,9 +10107,6 @@ fn the_windows_vendor_update_is_the_unattended_lane_and_a_persons_the_explicit_d
             "a person's door forgets it"
         );
         assert_eq!(active(), build("2.1.282"));
-        // A signature check that did not finish: quiet for the window (no failure, no
-        // "Package update failed") and nothing moved; a person's door says it did not
-        // happen; the next window pass whose check finishes lands it.
         f.publish_claude("2.1.284", &native_exe("claude 2.1.284"));
         let slow = world::trust_timing_out();
         assert!(run(VendorDoor::Window, &slow), "a deferral is quiet");
@@ -11409,12 +10125,6 @@ fn the_windows_vendor_update_is_the_unattended_lane_and_a_persons_the_explicit_d
     let _ = std::fs::remove_dir_all(&layout.prefix);
 }
 
-/// THE WARM OF A LANDED BUILD ([`crate::warm`], 2026-09-23): every lane that LANDS a
-/// new claude asks for it to be warmed exactly once — a pass's vendor lane at either of
-/// its exits (a fresh install, then an upgrade), the head watch's and a person's
-/// `update claude`, and `install claude` — and a lane that lands nothing (current,
-/// unreached) asks for nothing. (Every other verdict, a refusal included, is
-/// `only_an_installed_verdict_is_a_landing`'s.)
 #[test]
 fn a_landed_agent_build_is_warmed_once_by_every_lane_that_lands_it() {
     use crate::vendor_direct::lane::world::{self, Fake, native_exe};
@@ -11431,7 +10141,6 @@ fn a_landed_agent_build_is_warmed_once_by_every_lane_that_lands_it() {
     let active = || crate::active_builds(&layout).get("claude").copied();
     let build = |v: &str| Some(vendor_version(v).build_id());
     let _ = take_warmed();
-    // The pass's vendor lane, completing the set: the fresh-landing exit.
     f.publish_claude("2.1.281", &native_exe("claude 2.1.281"));
     let pass = vendor_pass(
         &layout,
@@ -11447,12 +10156,8 @@ fn a_landed_agent_build_is_warmed_once_by_every_lane_that_lands_it() {
         &seams,
     );
     assert_eq!(active(), build("2.1.281"));
-    // A fresh install asks too: whether the account ever ran claude — a default-set
-    // install nobody launched has nothing to refresh — is the warm's own question
-    // (`warm::declined`), answered where the user's config home is known.
     assert_eq!(take_warmed(), ["claude"], "a fresh install");
     assert!(pass.landed.is_empty(), "warmed, then forgotten");
-    // The full update pass: an upgrade, at the vendor lane's early exit.
     f.publish_claude("2.1.282", &native_exe("claude 2.1.282"));
     let installed = crate::active_builds(&layout);
     run_update_pass(&layout, &cfg, &f, &installed, false, &seams);
@@ -11465,7 +10170,6 @@ fn a_landed_agent_build_is_warmed_once_by_every_lane_that_lands_it() {
     run_update_pass(&layout, &cfg, &f, &installed, false, &seams);
     assert!(take_warmed().is_empty(), "unreached: nothing landed");
     f.offline.set(false);
-    // The head watch's door, then a person's.
     f.publish_claude("2.1.283", &native_exe("claude 2.1.283"));
     assert!(update_vendor(
         &layout,
@@ -11501,7 +10205,6 @@ fn a_landed_agent_build_is_warmed_once_by_every_lane_that_lands_it() {
     ));
     assert_eq!(take_warmed(), ["claude"], "a person's landing");
     let _ = std::fs::remove_dir_all(&layout.prefix);
-    // `install claude`.
     let layout = world::layout("warm-install-door");
     install_vendor_door(&layout, &f, "stable", claude, &seams).expect("installs");
     assert!(crate::active_builds(&layout).contains_key("claude"));
@@ -11511,8 +10214,6 @@ fn a_landed_agent_build_is_warmed_once_by_every_lane_that_lands_it() {
     let _ = std::fs::remove_dir_all(&layout.prefix);
 }
 
-/// Only an install is a landing: a rollback re-activates a build that already ran here, a
-/// tombstone runs nothing, and every other verdict moved nothing, so none is warmed.
 #[test]
 fn only_an_installed_verdict_is_a_landing() {
     use crate::vendor_direct::decide::{InstallReason, Installed, KeepReason};
@@ -11607,11 +10308,6 @@ fn only_an_installed_verdict_is_a_landing() {
     let _ = std::fs::remove_dir_all(&layout.prefix);
 }
 
-/// An index re-pin of a vendor program never downgrades or fights: an index pin whose
-/// version is behind the vendor's head fetches nothing and never flips the store back;
-/// an installed pin build is a floor, kept until a head passes it. The fake's release lane
-/// panics on the pin's artifact, so a pass that planned the pin would fail here (without
-/// `apply::plan_groups`' vendor skip it does).
 #[test]
 fn an_index_re_pin_of_a_vendor_program_never_downgrades_or_fights() {
     use crate::vendor_direct::lane::world::{self, Fake, native_exe};
@@ -11619,7 +10315,6 @@ fn an_index_re_pin_of_a_vendor_program_never_downgrades_or_fights() {
     let cfg = crate::config::PackagesConfig::default();
     let trust = world::trust();
     let seams = world_seams(&trust);
-    // A lagging re-pin under a vendor build.
     let layout = world::layout("repin-lagging");
     let f = Fake::default();
     *f.index.borrow_mut() = Some(world::signed_index(44, "2099-01-01T00:00:00Z", &[]));
@@ -11660,8 +10355,6 @@ fn an_index_re_pin_of_a_vendor_program_never_downgrades_or_fights() {
         "nothing is fetched for the pin: {:?}",
         f.downloads.borrow()
     );
-    // A pin build an older client laid, newer than the vendor's head: kept (a floor),
-    // until a head passes it.
     let layout = world::layout("repin-floor");
     let f = Fake::default();
     *f.index.borrow_mut() = Some(world::signed_index(44, "2099-01-01T00:00:00Z", &[]));
@@ -11687,10 +10380,6 @@ fn an_index_re_pin_of_a_vendor_program_never_downgrades_or_fights() {
     let _ = std::fs::remove_dir_all(&layout.prefix);
 }
 
-/// No index rule decides a vendor program: a fresh index pinning a yanked legacy claude
-/// leaves the vendor build and its shims untouched through the channel apply, the
-/// single-program planners refuse it by name, an install of it forks to the vendor lane
-/// before the index resolve, and the index's yank is latched for the vendor lane.
 #[test]
 fn a_yanked_legacy_pin_never_reaches_a_vendor_build() {
     use crate::vendor_direct::lane::world::{self, Fake, native_exe};
@@ -11786,8 +10475,6 @@ fn a_yanked_legacy_pin_never_reaches_a_vendor_build() {
             other => panic!("{other:?}"),
         }
     }
-    // An install forks before the index resolve: under the compiled Anthropic key the
-    // test-signed 2.1.282 is the vendor lane's refusal, never an index decision.
     f.publish_claude("2.1.282", &native_exe("next"));
     let err = crate::flow::install(
         &f,
@@ -11810,27 +10497,20 @@ fn a_yanked_legacy_pin_never_reaches_a_vendor_build() {
         }
         other => panic!("{other:?}"),
     }
-    // The fresh index's yanks were latched for the vendor lane.
     let latch = crate::vendor_direct::policy::YankLatch::read(&layout).unwrap();
     assert_eq!(latch.index_build, 44);
     assert!(latch.policy.is_legacy_yanked("claude", 2_026_091_901));
     let _ = std::fs::remove_dir_all(&layout.prefix);
 }
 
-/// Two hours after the world's clock: a latch verified at [`world_now`] is past its hour.
 fn two_hours_on() -> i64 {
     world_now() + 2 * 60 * 60
 }
 
-/// Half an hour after [`two_hours_on`]: a latch verified then is still current.
 fn two_and_a_half_hours_on() -> i64 {
     two_hours_on() + 30 * 60
 }
 
-/// A yank published since the last pass binds the head watch's door: the latch the last
-/// verification left is over an hour old, so the `--head-watch` door verifies the index
-/// first and skips the head the newer index yanks. Within the hour after that verification
-/// a door decides on the latch without asking the index.
 #[test]
 fn a_yank_published_after_the_last_pass_binds_the_head_watch_door() {
     use crate::vendor_direct::lane::world::{self, Fake, native_exe};
@@ -11840,7 +10520,6 @@ fn a_yank_published_after_the_last_pass_binds_the_head_watch_door() {
     let claude = crate::vendor_direct::spec("claude").unwrap();
     let trust = world::trust();
     let active = || crate::active_builds(&layout).get("claude").copied();
-    // The last pass: index 44, no yanks, verified now; a person installs 2.1.281.
     *f.index.borrow_mut() = Some(world::signed_index(44, "2099-01-01T00:00:00Z", &[]));
     f.publish_claude("2.1.281", &native_exe("claude 2.1.281"));
     assert!(update_vendor(
@@ -11856,7 +10535,6 @@ fn a_yank_published_after_the_last_pass_binds_the_head_watch_door() {
         Some((44, world_now())),
         "the door's own verification wrote the latch"
     );
-    // Two hours on, index 45 yanks the head the vendor has just published.
     *f.index.borrow_mut() = Some(world::signed_index(
         45,
         "2099-01-01T00:00:00Z",
@@ -11887,7 +10565,6 @@ fn a_yank_published_after_the_last_pass_binds_the_head_watch_door() {
         row.state,
         "managed 2.1.281 — Anthropic's latest (2.1.282) is yanked"
     );
-    // Within the hour: no index read, and the refreshed latch still binds.
     let reads = f.index_reads.get();
     let soon = PassSeams {
         now: two_and_a_half_hours_on,
@@ -11909,10 +10586,6 @@ fn a_yank_published_after_the_last_pass_binds_the_head_watch_door() {
     let _ = std::fs::remove_dir_all(&layout.prefix);
 }
 
-/// A yank published since the last pass binds a first launch's install: the consented
-/// `install claude` a pending stub re-enters ([`install_vendor_door`]) and the flow's own
-/// install fork find no latch, verify the index first, and never install the yanked
-/// version.
 #[test]
 fn a_yank_published_after_the_last_pass_binds_a_first_launch_install() {
     use crate::vendor_direct::lane::world::{self, Fake, native_exe};
@@ -11957,10 +10630,6 @@ fn a_yank_published_after_the_last_pass_binds_a_first_launch_install() {
     let _ = std::fs::remove_dir_all(&layout.prefix);
 }
 
-/// The door's resolve never blocks it: with the latch a day old and no index that
-/// verifies (none published, or only a stale one), `install claude`, the head watch's door
-/// and a person's `update claude` each try the index, then decide on the latch (whose yank
-/// still binds) and land every admissible head.
 #[test]
 fn a_failing_resolve_never_blocks_a_vendor_door() {
     use crate::vendor_direct::lane::world::{self, Fake, native_exe};
@@ -12026,9 +10695,6 @@ fn a_failing_resolve_never_blocks_a_vendor_door() {
     }
 }
 
-/// A pass whose index lane cannot run still settles what its vendor lane moved: with the
-/// index stale across two vendor upgrades, each pass exits 1 and the store keeps the live
-/// build and one rollback.
 #[test]
 fn a_stale_index_pass_reclaims_what_the_vendor_lane_superseded() {
     use crate::vendor_direct::lane::world::{self, Fake, native_exe};
@@ -12083,10 +10749,6 @@ fn a_stale_index_pass_reclaims_what_the_vendor_lane_superseded() {
     let _ = std::fs::remove_dir_all(&layout.prefix);
 }
 
-/// A VENDOR REFUSAL FAILS THE PASS even when the index resolves and applies clean —
-/// the index lane's count is added to the vendor lane's, never written over it — and
-/// the program's row says so where doctor looks, the pass's outcome where Settings does. A head kept at for a reason that is
-/// no fault is named, never called the vendor's latest.
 #[test]
 fn a_vendor_refusal_fails_a_pass_whose_index_is_fresh() {
     use crate::vendor_direct::lane::world::{self, CLAUDE, Fake, native_exe};
@@ -12111,7 +10773,6 @@ fn a_vendor_refusal_fails_a_pass_whose_index_is_fresh() {
         &seams,
     );
     let build = vendor_version("2.1.281").build_id();
-    // 2.1.282 arrives with a signature that does not verify.
     f.publish_claude("2.1.282", &native_exe("b"));
     let forged = crate::openpgp::testkit::sign_detached(b"another document", 1_790_000_000);
     f.doc(&format!("{CLAUDE}2.1.282/manifest.json.sig"), &forged);
@@ -12138,8 +10799,6 @@ fn a_vendor_refusal_fails_a_pass_whose_index_is_fresh() {
         !status.last_success_at.is_empty(),
         "the index lane resolved: a check that ran"
     );
-    // The index then yanks 2.1.282; the very next pass — which verifies the index
-    // before its vendor lane runs — keeps 2.1.281 and says why.
     *f.index.borrow_mut() = Some(world::signed_index(
         45,
         "2099-01-01T00:00:00Z",
@@ -12159,25 +10818,13 @@ fn a_vendor_refusal_fails_a_pass_whose_index_is_fresh() {
 }
 
 thread_local! {
-    /// The conformance's pass clock, in ten-second ticks past the world's `NOW`.
     static TICK: std::cell::Cell<i64> = const { std::cell::Cell::new(0) };
 }
 
-/// The world's clock plus [`TICK`] ten-second steps: every pass of the conformance
-/// stamps a strictly later second, as the model's `t` does.
 fn ticking_now() -> i64 {
     world_now() + 10 * TICK.with(std::cell::Cell::get)
 }
 
-/// Tier-1 conformance of `AtpkgPassStamps` (aterm-spec): the real writer (a whole recorded
-/// `update` pass over the world's fake channel) and the real readers (`Stamps::read`,
-/// `pkg_check::healed`, `pass_ended_since_queued`) step for step against the model, each
-/// record projected onto `succ`/`fail` in ten-second ticks past the world's `NOW`. The
-/// stand-down reader is checked as an implication (an `ok` stand-down only behind a reached
-/// pass) and shown to stand down `ok` at least once. Negative controls: PK-3, the `Buggy`
-/// model's cache-served pass stamps a success the real record does not; PK-4, the
-/// historical reader (`updated_at` after the last success ⇒ failed) calls the door's write
-/// a failed pass where the real reader does not.
 #[test]
 fn the_pass_record_refines_the_derived_model() {
     use crate::vendor_direct::lane::world::{self, Fake, native_exe};
@@ -12216,10 +10863,7 @@ fn the_pass_record_refines_the_derived_model() {
     };
     let at = |t: i64| world_now() + 10 * t;
     let slot = |unix: Option<i64>| unix.map_or(0, |u| (u - world_now()) / 10);
-    // The record and every reader against the model's state, after each step.
     let stood_down_ok = std::cell::Cell::new(false);
-    // The store's full-pass count when the waiter queued (the model's `Wait`), which the
-    // stand-down reader compares with the count it finds under the lock.
     let queued_at: std::cell::Cell<Option<u64>> = std::cell::Cell::new(None);
     let agree = |state: &std::collections::BTreeMap<&'static str, i64>, step: &str| {
         let stamps = Stamps::read(&layout.status());
@@ -12288,7 +10932,6 @@ fn the_pass_record_refines_the_derived_model() {
         assert!(m.fire(action, state), "{action}");
     };
 
-    // 1. A pass that reaches the index: a success, and the cache holds the index now.
     tick(&state);
     assert_eq!(
         run_recorded_update_pass(&layout, &cfg, &f, &installed, false, &seams),
@@ -12298,8 +10941,6 @@ fn the_pass_record_refines_the_derived_model() {
     fire(&buggy, &mut historical, "PassReached");
     agree(&state, "reached");
 
-    // 2. This lane's pass is refused (a rate limit): it runs on the §14 cache, exits 1
-    //    and stamps a failure, never a success.
     *f.index.borrow_mut() = None;
     f.index_refused.set(true);
     tick(&state);
@@ -12312,16 +10953,12 @@ fn the_pass_record_refines_the_derived_model() {
     fire(&buggy, &mut historical, "OwnPassUnreached");
     agree(&state, "own pass refused");
 
-    // 3. A pass queues behind the store lock, reading the store's pass count first.
     tick(&state);
     queued_at.set(Some(crate::status::pass_seq(&layout)));
     fire(&model, &mut state, "Wait");
     fire(&buggy, &mut historical, "Wait");
     agree(&state, "waiting");
 
-    // 4. A sibling's pass, refused the same way, served from the cache. PK-3's replay:
-    //    the historical writer stamps a success here, healing this lane's ladder and
-    //    standing the waiter down with nothing reached; the real record does not.
     tick(&state);
     assert_eq!(
         run_recorded_update_pass(&layout, &cfg, &f, &installed, false, &seams),
@@ -12338,8 +10975,6 @@ fn the_pass_record_refines_the_derived_model() {
     assert!(!buggy.check_invariant("HealedOnlyByAReachedPass", &historical));
     assert!(!buggy.check_invariant("StandDownOnlyBehindAReachedPass", &historical));
 
-    // 5. The index is served again, then a vendor door writes a row. PK-4's replay:
-    //    the historical reader took the door's `updated_at` for a failed pass.
     *f.index.borrow_mut() = Some(world::signed_index(44, "2099-01-01T00:00:00Z", &[]));
     f.index_refused.set(false);
     tick(&state);
@@ -12373,7 +11008,6 @@ fn the_pass_record_refines_the_derived_model() {
         "the negative control: the historical reader calls that a failed pass"
     );
 
-    // 6. Nothing answers — offline: exit 69, a failure stamped.
     *f.index.borrow_mut() = None;
     f.offline.set(true);
     tick(&state);
@@ -12390,10 +11024,6 @@ fn the_pass_record_refines_the_derived_model() {
     let _ = std::fs::remove_dir_all(&layout.prefix);
 }
 
-/// Offline is not success: a pass whose index came only from the §14 cache and whose
-/// vendor channels did not answer exits `PASS_OFFLINE_EXIT` (not 0, 1 or 75) and leaves
-/// `last_success_at` where it was. One that reached either is an ordinary pass; one with
-/// no index at all and no vendor reached is offline too.
 #[test]
 fn a_pass_that_reached_nothing_is_offline_not_a_success() {
     use crate::vendor_direct::lane::world::{self, Fake, native_exe};
@@ -12427,7 +11057,6 @@ fn a_pass_that_reached_nothing_is_offline_not_a_success() {
     );
     let checked = crate::status::read(&layout).unwrap().last_success_at;
     assert!(!checked.is_empty());
-    // Nothing answers: the index (the cache serves it) and the vendor.
     *f.index.borrow_mut() = None;
     f.offline.set(true);
     std::fs::write(
@@ -12457,14 +11086,11 @@ fn a_pass_that_reached_nothing_is_offline_not_a_success() {
         Some(world_now()),
         "…at the pass's own clock"
     );
-    // The vendor answers while the index does not: not offline — and still not a check
-    // that ran, since the index came from the cache.
     f.offline.set(false);
     assert_eq!(
         run_update_pass(&layout, &cfg, &f, &installed, false, &seams),
         1
     );
-    // No index anywhere (a first launch before the network came up) and no vendor.
     let bare = world::layout("pass-offline-bare");
     make_live(&bare, "claude", vendor_version("2.1.281").build_id());
     f.offline.set(true);
@@ -12478,10 +11104,6 @@ fn a_pass_that_reached_nothing_is_offline_not_a_success() {
     let _ = std::fs::remove_dir_all(&layout.prefix);
 }
 
-/// A host that answered is not an offline machine: with the index source refusing (a rate
-/// limit, a renamed repo) and every vendor channel down, the pass runs on the cached index
-/// and exits 1, its outcome naming the refusal, never the offline code the window retries
-/// quietly. A vendor channel that answered with a status is a host that answered too.
 #[test]
 fn an_index_host_that_answered_with_a_refusal_is_a_failure_not_offline() {
     use crate::vendor_direct::lane::world::{self, CLAUDE, Fake, native_exe};
@@ -12522,7 +11144,6 @@ fn an_index_host_that_answered_with_a_refusal_is_a_failure_not_offline() {
     let outcome = crate::status::read(&layout).unwrap().outcome;
     assert!(outcome.contains("index from cache"), "{outcome}");
     assert!(outcome.contains("HTTP 403"), "{outcome}");
-    // The listing's link down, and the vendor's head answering 404: not offline either.
     f.index_refused.set(false);
     f.offline.set(false);
     f.forget(&format!("{CLAUDE}latest"));
@@ -12531,13 +11152,6 @@ fn an_index_host_that_answered_with_a_refusal_is_a_failure_not_offline() {
     let _ = std::fs::remove_dir_all(&layout.prefix);
 }
 
-/// A pass that failed only for its cached index is recorded as that, and a child standing
-/// down behind it exits as it did: the listing refused while no member failed, so exit 1,
-/// nothing on stderr, and [`crate::status::stale_index_only_end`] holds for that pass end;
-/// a `--wait-lock` child that stands down behind it says its line on stdout and exits 1
-/// ([`stand_down_exit`]), which the window reads as a stale index, not "Package update
-/// failed". Controls: a clean pass, an offline one, and a cached-index pass that also
-/// failed a member are not that.
 #[test]
 fn a_pass_that_failed_only_for_its_cached_index_is_recorded_and_stood_down_as_that() {
     use crate::vendor_direct::lane::world::{self, Fake, native_exe};
@@ -12580,7 +11194,6 @@ fn a_pass_that_failed_only_for_its_cached_index_is_recorded_and_stood_down_as_th
         !crate::status::stale_index_only_end(&record()),
         "a clean pass"
     );
-    // The listing refuses (HTTP 403): the pass runs on the cache, no member fails.
     *f.index.borrow_mut() = None;
     f.index_refused.set(true);
     assert_eq!(
@@ -12606,7 +11219,6 @@ fn a_pass_that_failed_only_for_its_cached_index_is_recorded_and_stood_down_as_th
         "the stand-down exits as that pass did: nothing on stderr ({})",
         said.line
     );
-    // Offline: not that.
     f.index_refused.set(false);
     f.offline.set(true);
     assert_eq!(
@@ -12615,8 +11227,6 @@ fn a_pass_that_failed_only_for_its_cached_index_is_recorded_and_stood_down_as_th
     );
     assert!(!crate::status::stale_index_only_end(&record()), "offline");
     f.offline.set(false);
-    // Control (the Apple anchor exists on macOS only): the cached index and a member
-    // refused, a failure the stand-down still says on stderr.
     if cfg!(target_os = "macos") {
         f.index_refused.set(true);
         f.publish_claude("2.1.282", &native_exe("b"));
@@ -12642,10 +11252,6 @@ fn a_pass_that_failed_only_for_its_cached_index_is_recorded_and_stood_down_as_th
     let _ = std::fs::remove_dir_all(&layout.prefix);
 }
 
-/// The stand-down's exit per holder ending ([`stand_down_exit`]): `ok` 0 and `offline`
-/// the offline code on stdout; `failed` 1 on stderr — on stdout only for a holder that
-/// failed for its cached index alone. The flag never quiets an ok or offline ending's
-/// code, nor moves them to stderr.
 #[test]
 fn a_stand_down_exits_as_the_pass_it_stood_behind() {
     use aterm_update_core::pkg_check::{PASS_OFFLINE_EXIT, PassOutcome};
@@ -12668,11 +11274,6 @@ fn a_stand_down_exits_as_the_pass_it_stood_behind() {
     assert!(stale.line.contains("index from cache"), "{}", stale.line);
 }
 
-/// Tier 1 of the derived model `AtpkgFullPassRule`, the queue: over every state either arm
-/// reaches with a child waiting behind a pass that has since ended (`TakeLockBehind`
-/// enabled), [`pass_ended_since_queued`] stands down exactly when the fixed model's child
-/// does (always), and the replaced success-only rule, the negative control, exactly when
-/// `Buggy=1`'s does.
 #[test]
 fn a_queued_pass_stands_down_as_its_derived_model_does() {
     use crate::status::full_pass_rule_tier1::{AGE_SECS, reachable, realize, walk};
@@ -12680,7 +11281,6 @@ fn a_queued_pass_stands_down_as_its_derived_model_does() {
     use aterm_spec::derive::Model;
     let fixed = atpkg_full_pass_rule_model();
     let buggy = aterm_spec::interp::with_buggy(&fixed, 1);
-    // The replaced rule: stand down behind a success stamped since the wait began.
     let legacy = |layout: &crate::store::Layout, first: i64| {
         crate::status::read(layout)
             .and_then(|s| aterm_update_core::pkg_check::rfc3339_to_unix(&s.last_success_at))
@@ -12704,7 +11304,6 @@ fn a_queued_pass_stands_down_as_its_derived_model_does() {
             );
             let now = crate::flow::now_unix();
             let (layout, _) = realize(&format!("queue-{arm}-{i}"), state, arm == 0, now);
-            // First contended while the pass that just ended still held the lock.
             let first = now - AGE_SECS[0] - 30;
             let stands_down = if arm == 0 {
                 let stamps = crate::status::pass_stamps(&layout, now);
@@ -12723,8 +11322,6 @@ fn a_queued_pass_stands_down_as_its_derived_model_does() {
         }
     }
     assert!(seen[0] > 0 && seen[1] > 0, "{seen:?}");
-    // The replayed queue: two lanes decide in the gap, the first child's pass fails,
-    // the second takes the lock behind it.
     let queue = ["SessionLook", "WindowWalk", "TakeLockFresh", "PassFails"];
     let now = crate::flow::now_unix();
     let first = now - AGE_SECS[0] - 30;
@@ -12745,9 +11342,6 @@ fn a_queued_pass_stands_down_as_its_derived_model_does() {
     let _ = std::fs::remove_dir_all(&layout.prefix);
 }
 
-/// A stale cache is offline only when nothing answered: the §14 cache aged past its window
-/// off the network is offline (retried soon, no failure shown); the same stale index served
-/// by a host that answered, or with the host refusing, is a failure.
 #[test]
 fn a_stale_cache_is_offline_only_when_nothing_answered() {
     use crate::vendor_direct::lane::world::{self, Fake};
@@ -12781,10 +11375,6 @@ fn a_stale_cache_is_offline_only_when_nothing_answered() {
     let _ = std::fs::remove_dir_all(&layout.prefix);
 }
 
-/// An unreached pass is offline only when every failure was the network's: a member lost
-/// at its manifest fetch while nothing answers is offline; one that failed at a step that
-/// needs no network (a row this client cannot stage) is a failure, whatever the network
-/// did.
 #[test]
 fn an_unreached_pass_is_offline_only_when_every_failure_was_a_fetch() {
     use crate::vendor_direct::lane::world::{self, Fake};
@@ -12797,8 +11387,6 @@ fn an_unreached_pass_is_offline_only_when_every_failure_was_a_fetch() {
     let trust = world::trust();
     let seams = world_seams(&trust);
     let installed = crate::active_builds(&layout);
-    // Online, the index pins ay 18, whose manifest is not served: a failure (and the
-    // index is cached now).
     assert_eq!(
         run_update_pass(&layout, &cfg, &f, &installed, false, &seams),
         1
@@ -12819,8 +11407,6 @@ fn an_unreached_pass_is_offline_only_when_every_failure_was_a_fetch() {
     let _ = std::fs::remove_dir_all(&layout.prefix);
 }
 
-/// Held, as the CLI edge holds every verb that takes the store lock, an idle pass writes
-/// `status.toml` once and the record is whole; unheld, every writer rewrites it.
 #[test]
 fn an_idle_pass_writes_status_once_when_held() {
     use crate::vendor_direct::lane::world::{self, Fake, native_exe};
@@ -12846,7 +11432,6 @@ fn an_idle_pass_writes_status_once_when_held() {
             &seams,
         );
         let installed = crate::active_builds(&layout);
-        // The first pass settles the rows; the second is the idle one measured.
         assert_eq!(
             run_update_pass(&layout, &cfg, &f, &installed, false, &seams),
             0
@@ -12872,7 +11457,6 @@ fn an_idle_pass_writes_status_once_when_held() {
     assert!(record.outcome.starts_with("up to date (index build 44)"));
 }
 
-/// The world's clock an hour on, and a day and an hour on.
 fn world_now_plus_an_hour() -> i64 {
     crate::vendor_direct::lane::world::NOW + 60 * 60
 }
@@ -12881,10 +11465,6 @@ fn world_now_plus_a_day() -> i64 {
     crate::vendor_direct::lane::world::NOW + 25 * 60 * 60
 }
 
-/// "LATEST" NEEDS A CHECK BEHIND IT: a vendor that cannot be reached leaves the row
-/// alone for a day after the last check that reached it; past that the row says since
-/// when it was not reached. (The managed-current marker's `not checked` is
-/// `the_managed_current_line_lists_vendor_programs_at_their_vendors_latest`'s.)
 #[test]
 fn a_vendor_not_reached_for_a_day_is_no_longer_called_latest() {
     use crate::vendor_direct::lane::world::{self, Fake, native_exe};
@@ -12925,17 +11505,12 @@ fn a_vendor_not_reached_for_a_day_is_no_longer_called_latest() {
         row(),
         "managed 2.1.281 — Anthropic's release channel not reached since 2026-09-22"
     );
-    // Reached again: latest again.
     f.offline.set(false);
     assert!(run(world_now_plus_a_day));
     assert_eq!(row(), "managed 2.1.281 — Anthropic latest");
     let _ = std::fs::remove_dir_all(&layout.prefix);
 }
 
-/// The vendor doors sweep only their own programs: the window's head-watch door, a pass
-/// whose index lane cannot run, and `install <vendor>` each land a new claude, and none
-/// sweeps trust's `.part` resume state or carried archive, or reclaims another program's
-/// superseded build.
 #[test]
 fn a_vendor_door_sweeps_only_the_programs_its_lane_ran() {
     use crate::vendor_direct::lane::world::{self, Fake, native_exe};
@@ -13011,8 +11586,6 @@ fn a_vendor_door_sweeps_only_the_programs_its_lane_ran() {
     let _ = std::fs::remove_dir_all(&layout.prefix);
 }
 
-/// `install <vendor>` records its row through the lane's own writer: an install over a
-/// yanked build that rolls back to the retained one says so, never "latest".
 #[test]
 fn an_install_that_rolls_back_off_a_yank_never_says_latest() {
     use crate::vendor_direct::lane::world::{self, Fake, native_exe};
@@ -13055,10 +11628,6 @@ fn an_install_that_rolls_back_off_a_yank_never_says_latest() {
     let _ = std::fs::remove_dir_all(&layout.prefix);
 }
 
-/// SEVERAL ROWS, ONE WRITE: the rows a call changes reach the record together — each printed,
-/// every other row kept — where a write apiece cost a first run's four agent rows four fsyncs,
-/// renames and directory syncs before its announcement; and a call that changes nothing writes
-/// nothing.
 #[test]
 fn rows_recorded_together_are_one_write_of_the_record() {
     let layout = temp_layout("rows-one-write");
@@ -13092,8 +11661,6 @@ fn rows_recorded_together_are_one_write_of_the_record() {
     let _ = std::fs::remove_dir_all(&layout.prefix);
 }
 
-/// A vendor fresh-install refusal stays on its row through the same pass's set
-/// completion: the agent-rows loop never paints it `agent program — installing`.
 #[test]
 fn a_vendor_fresh_install_refusal_survives_set_completion() {
     use crate::vendor_direct::lane::world::{self, CLAUDE, Fake, native_exe};
@@ -13128,10 +11695,6 @@ fn a_vendor_fresh_install_refusal_survives_set_completion() {
     let _ = std::fs::remove_dir_all(&layout.prefix);
 }
 
-/// A yank binds the pass that first sees it: the update pass and the toolset verb verify
-/// the index before their vendor lane runs, so a yank published since the last pass keeps
-/// the yanked head out now; when no index verifies, the vendor lane still runs, on the
-/// latch.
 #[test]
 fn a_yank_published_since_the_last_pass_binds_this_pass() {
     use crate::vendor_direct::lane::world::{self, Fake, native_exe};
@@ -13162,8 +11725,6 @@ fn a_yank_published_since_the_last_pass_binds_this_pass() {
         Some(vendor_version("2.1.281").build_id()),
         "the yanked head is kept out by the pass that first verified the yank"
     );
-    // No index verifies (a stale one, which lifts no yank): the vendor lane still runs,
-    // and the latch still binds.
     *f.index.borrow_mut() = Some(world::signed_index(46, "2026-01-01T00:00:00Z", &[]));
     f.publish_claude("2.1.282", &native_exe("b"));
     assert_eq!(
@@ -13186,7 +11747,6 @@ fn a_yank_published_since_the_last_pass_binds_this_pass() {
         "never blocked by the index"
     );
     let _ = std::fs::remove_dir_all(&layout.prefix);
-    // The toolset verb, on a machine with nothing installed and no latch yet.
     let layout = world::layout("yank-now-toolset");
     let f = Fake::default();
     *f.index.borrow_mut() = Some(world::signed_index(
@@ -13207,10 +11767,6 @@ fn a_yank_published_since_the_last_pass_binds_this_pass() {
     let _ = std::fs::remove_dir_all(&layout.prefix);
 }
 
-/// A tombstoned vendor program is revisited by an update pass on a machine that never
-/// adopted the set, as the index lane revisits one: the shim view is silent for it, and
-/// once the vendor ships an admissible build the pass installs it, even with nothing else
-/// installed.
 #[test]
 fn a_tombstoned_vendor_program_comes_back_with_an_admissible_head() {
     use crate::vendor_direct::lane::world::{self, Fake, native_exe};
@@ -13237,8 +11793,6 @@ fn a_tombstoned_vendor_program_comes_back_with_an_admissible_head() {
         None,
         &seams,
     );
-    // A fresh index yanks 2.1.281 while the head still names it and nothing is
-    // retained: the lane tombstones it.
     *f.index.borrow_mut() = Some(world::signed_index(
         44,
         "2099-01-01T00:00:00Z",
@@ -13288,8 +11842,6 @@ fn a_tombstoned_vendor_program_comes_back_with_an_admissible_head() {
     let _ = std::fs::remove_dir_all(&layout.prefix);
 }
 
-/// The vendor lane's fresh installs are a progress pass of their own: their bytes
-/// meter on the window's progress file before the index lane's pass begins.
 #[test]
 fn a_vendor_fresh_install_streams_on_the_progress_file() {
     use crate::vendor_direct::lane::world::{self, Fake, native_exe};
@@ -13327,16 +11879,9 @@ fn a_vendor_fresh_install_streams_on_the_progress_file() {
     let _ = std::fs::remove_dir_all(&layout.prefix);
 }
 
-/// A first landing whose signature check did not finish is no failure: on the
-/// set-completion lane's fresh path (`update` with `complete_the_set`, `install
-/// --default-set`) a codesign timeout is a Skipped row with no error, no failure counted
-/// and no `net-failed:`; the `seed-done:` terminal names what waits, and the next pass
-/// lands the kept archive without a download. Control: a real signer refusal on the same
-/// path still fails its row and says `net-failed:`.
 #[test]
 fn a_fresh_landing_whose_signature_check_did_not_finish_is_no_failure() {
     use crate::vendor_direct::lane::world::{self, Fake, native_exe};
-    // The Apple anchor exists on macOS only: off it no codesign check runs at all.
     if !cfg!(target_os = "macos") {
         return;
     }
@@ -13389,7 +11934,6 @@ fn a_fresh_landing_whose_signature_check_did_not_finish_is_no_failure() {
     assert_eq!(row.phase, crate::progress::Phase::Skipped, "{row:?}");
     assert_eq!(row.error, None);
     assert!(!crate::active_builds(&layout).contains_key("claude"));
-    // The next pass, whose check finishes, lands the kept archive: no download.
     let downloads = f.downloads.borrow().len();
     let (pass, said, file) = pass_over(&layout, &f, &world::trust());
     assert_eq!(pass.failures, 0);
@@ -13405,7 +11949,6 @@ fn a_fresh_landing_whose_signature_check_did_not_finish_is_no_failure() {
         "the verified archive was kept for the retry"
     );
     let _ = std::fs::remove_dir_all(&layout.prefix);
-    // Control: a real refusal on the same fresh path is still a failure, said.
     let layout = world::layout("fresh-refused");
     let f = Fake::default();
     f.publish_claude("2.1.281", &native_exe("claude 2.1.281"));
@@ -13420,10 +11963,6 @@ fn a_fresh_landing_whose_signature_check_did_not_finish_is_no_failure() {
     let _ = std::fs::remove_dir_all(&layout.prefix);
 }
 
-/// The fresh-landing terminal, case by case: something arrived → `net-installed:`
-/// (a deferral beside it said on its own line); nothing arrived and one landing
-/// failed → `net-failed:`, even beside a deferral; every landing deferred →
-/// `seed-done:`; nothing planned → nothing.
 #[test]
 fn the_fresh_landing_terminal_fails_only_on_a_failure() {
     assert_eq!(fresh_landing_terminal(&[], &[], 0), None);
@@ -13443,12 +11982,6 @@ fn the_fresh_landing_terminal_fails_only_on_a_failure() {
     );
 }
 
-/// THE TOOLSET VERB CHANGES ITS MIND BEFORE ITS PASS. The pass narrows what it wants by
-/// the removal markers, so clearing them AFTER it honoured the old mind for exactly the pass
-/// asked to change it: a legacy `trust` removal kept its group out of the explicit toolset
-/// install, which then called the set complete (2026-08-27, live). A member removed by
-/// `uninstall` and a recorded decline: the verb installs the member, and neither marker
-/// survives it.
 #[test]
 fn the_toolset_verb_changes_its_mind_before_its_pass() {
     use crate::vendor_direct::lane::world::{self, Fake};
@@ -13481,8 +12014,6 @@ fn the_toolset_verb_changes_its_mind_before_its_pass() {
     let _ = std::fs::remove_dir_all(&layout.prefix);
 }
 
-/// The explicit toolset verb over a vendor that did not serve its head exits 1 naming it,
-/// never "already complete", and still adopts the set its index lane completed.
 #[test]
 fn the_toolset_verb_is_incomplete_while_a_vendor_program_is_missing() {
     use crate::vendor_direct::lane::world::{self, CLAUDE, Fake};
@@ -13510,7 +12041,6 @@ fn the_toolset_verb_is_incomplete_while_a_vendor_program_is_missing() {
         &seams,
     );
     assert!(crate::active_builds(&layout).contains_key("codex"));
-    // Anthropic's host does not serve the head.
     f.forget(&format!("{CLAUDE}latest"));
     assert_eq!(install_toolset(&layout, &cfg, &f, &seams), 1);
     assert!(
@@ -13521,9 +12051,6 @@ fn the_toolset_verb_is_incomplete_while_a_vendor_program_is_missing() {
     let _ = std::fs::remove_dir_all(&layout.prefix);
 }
 
-/// No index rule decides a vendor program through the set lane or the explicit door: an
-/// index `system = "claude"` with a claude on PATH retires nothing, and `install claude`
-/// asks the index nothing before its own lane.
 #[cfg(unix)]
 #[test]
 fn an_index_system_key_never_retires_a_vendor_program() {
@@ -13567,8 +12094,6 @@ fn an_index_system_key_never_retires_a_vendor_program() {
     let _ = std::fs::remove_dir_all(&layout.prefix);
 }
 
-/// `list` names a vendor build by its version, never its 19-digit store id; an index
-/// build keeps its number, byte for byte.
 #[test]
 fn list_names_a_vendor_build_by_version() {
     let claude = vendor_version("2.1.280").build_id();
@@ -13596,11 +12121,6 @@ fn list_names_a_vendor_build_by_version() {
     );
 }
 
-/// THE VENDOR LANE NEVER WRITES THE RECORD for refused names (design S13): its landings run
-/// on rider threads beside the pass thread, which writes the program rows, and an unlocked
-/// rewrite there could lose one. Its `exposes` is the compiled table, which a shim may carry
-/// whole (`vendor_direct::table`'s test), so it has nothing to record. Measured with a
-/// record that a refused-names write would rewrite: an entry whose build left the store.
 #[cfg(unix)]
 #[test]
 fn a_vendor_landing_writes_no_refused_names_record() {
@@ -13642,10 +12162,6 @@ fn a_vendor_landing_writes_no_refused_names_record() {
     let _ = std::fs::remove_dir_all(&layout.prefix);
 }
 
-/// `atpkg rollback <vendor program>` builds no index fetcher: it moves to the newest
-/// retained vendor build no signed yank names, shims the table's exposes and records a row
-/// with the build's own root (so `atpkg verify` passes); with nothing retained, or only a
-/// yanked build, it refuses and nothing moves.
 #[test]
 fn a_vendor_rollback_moves_to_the_retained_build_without_the_index() {
     use crate::vendor_direct::lane::world::{self, Fake, native_exe};
@@ -13702,8 +12218,6 @@ fn a_vendor_rollback_moves_to_the_retained_build_without_the_index() {
     f.publish_claude("2.1.282", &native_exe("claude 2.1.282"));
     assert!(matches!(install().verdict, Verdict::Installed { .. }));
     let (v281, v282) = (vendor_version("2.1.281"), vendor_version("2.1.282"));
-    // The retained build is yanked by the latch the verb reads: refused by version,
-    // and nothing moves.
     let yanked = Policy::from_entries(["claude@2.1.281"]);
     let err = lane::roll_back_by_hand(&layout, &yanked, spec).unwrap_err();
     assert_eq!(
@@ -13719,7 +12233,6 @@ fn a_vendor_rollback_moves_to_the_retained_build_without_the_index() {
     assert_eq!(rollback(), ExitCode::from(1));
     assert_eq!(active(), Some(v282.build_id()));
     std::fs::remove_file(&latch).unwrap();
-    // Admissible: it moves, through the verb's body, with no index read.
     let reads = f.index_reads.get();
     assert_eq!(rollback(), ExitCode::SUCCESS);
     assert_eq!(active(), Some(v281.build_id()));
@@ -13745,10 +12258,6 @@ fn a_vendor_rollback_moves_to_the_retained_build_without_the_index() {
         ),
         "atpkg verify passes on the rolled-back build"
     );
-    // gc keeps below the live build the one this verb lands on: .283 live, .282 and .281
-    // retained (a session still running .281 kept it through a pass), and the latch
-    // yanking .282. `atpkg gc`'s own call reclaims the yanked .282 and keeps .281, so
-    // the verb still has a build to land on.
     f.publish_claude("2.1.283", &native_exe("claude 2.1.283"));
     assert!(matches!(install().verdict, Verdict::Installed { .. }));
     std::fs::write(
@@ -13766,11 +12275,6 @@ fn a_vendor_rollback_moves_to_the_retained_build_without_the_index() {
     let _ = std::fs::remove_dir_all(&layout.prefix);
 }
 
-/// A legacy build's row carries a root only when the recorded row was captured for that
-/// same build: the shims run legacy build B while the record names legacy build A (an
-/// older client's pass on a shared store), and the vendor lane keeps B (a local hold) —
-/// the row names B with no root, never B attested by A's, which would disarm verify's
-/// BuildMismatch guard.
 #[cfg(unix)]
 #[test]
 fn a_kept_legacy_row_never_carries_another_builds_root() {
@@ -13827,7 +12331,6 @@ fn a_kept_legacy_row_never_carries_another_builds_root() {
     let row = keep();
     assert_eq!(row.installed_build, Some(b));
     assert_eq!(row.tree_root, "", "A's root never attests B");
-    // The record for B itself keeps its root.
     record_status(&layout, "claude", recorded(b), "x".into());
     let row = keep();
     assert_eq!(row.installed_build, Some(b));
@@ -13835,9 +12338,6 @@ fn a_kept_legacy_row_never_carries_another_builds_root() {
     let _ = std::fs::remove_dir_all(&layout.prefix);
 }
 
-/// A vendor program its vendor serves this machine nothing for carries the canonical
-/// `unavailable on <target>: <hint>` row — the state `doctor` reads as no fault — recorded
-/// once, with no build, and never a failure of the pass.
 #[test]
 fn an_unserved_vendor_program_records_the_unavailable_row() {
     use crate::vendor_direct::lane::world::{self, Fake};
@@ -13880,10 +12380,6 @@ fn an_unserved_vendor_program_records_the_unavailable_row() {
     let _ = std::fs::remove_dir_all(&layout.prefix);
 }
 
-/// `install muse` — and `update muse` while it is not installed — where Meta serves
-/// nothing: the door asks no index and no host, and answers the lane's state whole, the
-/// canonical non-error state the verb prints on stdout with a clean exit (as the index
-/// lane's `NoArtifact`) and records as the row.
 #[test]
 fn an_unserved_vendor_install_answers_the_unavailable_state() {
     use crate::vendor_direct::lane::{Verdict, world};
@@ -13916,10 +12412,6 @@ fn an_unserved_vendor_install_answers_the_unavailable_state() {
     let _ = std::fs::remove_dir_all(&layout.prefix);
 }
 
-/// Right after the cutover the only retained build below the first vendor build is the
-/// legacy index build it replaced — the one `list` shows as kept for rollback — and
-/// `rollback` moves to it: shimmed with the table's env (not the index's), its row
-/// naming it by number with no index pin, and a signed yank on its number refusing it.
 #[cfg(unix)]
 #[test]
 fn a_vendor_rollback_returns_to_the_legacy_build_the_first_vendor_install_replaced() {
@@ -13930,7 +12422,6 @@ fn a_vendor_rollback_returns_to_the_legacy_build_the_first_vendor_install_replac
     let legacy = layout.build_dir("claude", 2_026_091_901);
     std::fs::create_dir_all(legacy.join("bin")).unwrap();
     std::fs::write(legacy.join("bin/claude"), native_exe("legacy")).unwrap();
-    // The index manifest's env, which the table overrides.
     crate::shim_env::write_sidecar(
         &legacy,
         &crate::shim_env::ShimEnv::admit(&["FROM_INDEX=1".to_string()]).unwrap(),
@@ -13966,7 +12457,6 @@ fn a_vendor_rollback_returns_to_the_legacy_build_the_first_vendor_install_replac
     ));
     let no_index =
         || -> Box<dyn crate::flow::Fetcher> { panic!("a vendor rollback reached the index lane") };
-    // A signed yank on the legacy number refuses it, and nothing moves.
     let yanked = Policy::from_entries(["claude@2026091901"]);
     let err = lane::roll_back_by_hand(&layout, &yanked, spec).unwrap_err();
     assert_eq!(
@@ -13997,15 +12487,6 @@ fn a_vendor_rollback_returns_to_the_legacy_build_the_first_vendor_install_replac
     let _ = std::fs::remove_dir_all(&layout.prefix);
 }
 
-/// A ROLLBACK TO THE LEGACY BUILD IS ATTESTED, with no index asked: the first vendor
-/// install overwrites the row that carried the legacy build's signed root, so the root is
-/// kept in the program's stamp — from that row as it is replaced, or from the signed
-/// manifest the lane read the build's version from — and the rollback's row carries it,
-/// so `atpkg verify` matches instead of saying "no signed tree_root". A rollback row an
-/// earlier client recorded without it is attested all the same, and the next pass that
-/// keeps the build writes the root into it. (A root nothing holds, read again from the
-/// build's signed manifest, is `vendor_direct::lane`'s
-/// `a_legacy_root_nothing_holds_is_read_from_its_signed_manifest_once`.)
 #[cfg(unix)]
 #[test]
 fn a_rollback_to_the_legacy_build_is_attested_by_its_kept_root() {
@@ -14055,7 +12536,6 @@ fn a_rollback_to_the_legacy_build_is_attested_by_its_kept_root() {
         crate::status::read(layout).unwrap().programs["claude"].clone()
     };
 
-    // The recorded one: the legacy build's row carried its signed root.
     let layout = world::layout("rollback-legacy-row");
     let root = legacy_install(&layout);
     record_status(
@@ -14091,8 +12571,6 @@ fn a_rollback_to_the_legacy_build_is_attested_by_its_kept_root() {
             build: legacy_build
         }
     );
-    // A rollback row recorded without the root (an earlier client's): verify still
-    // attests the build, and the next pass that keeps it heals the row.
     let mut bare = row(&layout);
     bare.tree_root = String::new();
     record_status(&layout, "claude", bare, "x".into());
@@ -14114,8 +12592,6 @@ fn a_rollback_to_the_legacy_build_is_attested_by_its_kept_root() {
     );
     let _ = std::fs::remove_dir_all(&layout.prefix);
 
-    // Its pkg manifest: no row ever carried the root, and the lane read the build's
-    // version — and root — from its signed manifest before replacing it.
     let layout = world::layout("rollback-legacy-pkg");
     let root = legacy_install(&layout);
     let f = Fake::default();
@@ -14153,10 +12629,6 @@ fn a_rollback_to_the_legacy_build_is_attested_by_its_kept_root() {
     let _ = std::fs::remove_dir_all(&layout.prefix);
 }
 
-/// A PROGRAM BUILT INTO aterm IS ANSWERED AS SUCH (amacs design §8.5). An `amacs` on
-/// PATH outside the prefix is what the store's arms would call `system: … — not managed by
-/// aterm`; `which` answers in the built-in state instead, naming the alias beside the
-/// running aterm, or the other copy that runs ahead of it.
 #[test]
 fn which_amacs_is_built_in() {
     let l = temp_layout("which-built-in");
@@ -14173,8 +12645,6 @@ fn which_amacs_is_built_in() {
             version
         ))
     );
-    // Another aterm's alias first on PATH, outside the prefix: built in, shadowed by it,
-    // and never `system:`.
     let bundle = crate::testdir::dir("atpkg-built-in-bundle-");
     std::fs::write(bundle.join("aterm"), b"#!/bin/true\n").unwrap();
     std::fs::set_permissions(bundle.join("aterm"), std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -14202,9 +12672,6 @@ fn which_amacs_is_built_in() {
     assert!(!line.contains("system:"), "{line}");
 }
 
-/// `list`'s human form ends with the programs built into aterm (ahead of a closing
-/// `next` line, which stays last); its piped form is the store's alone, byte for byte as
-/// before, on an empty store and on a live one.
 #[test]
 fn list_human_shows_built_in_row_and_porcelain_is_unchanged() {
     let section = crate::builtin::list_human_lines(aterm_types::version::app_version());
@@ -14242,8 +12709,6 @@ fn list_human_shows_built_in_row_and_porcelain_is_unchanged() {
     assert_eq!(closing, expected, "the one next act stays the last line");
 }
 
-/// `install amacs` has nothing to fetch: it exits 0 at the dispatch edge, before the store
-/// lock (`update amacs` likewise).
 #[test]
 fn install_amacs_is_a_noop_exit_0() {
     let run = |argv: &[&str]| main_entry(argv.iter().map(std::ffi::OsString::from).collect());
@@ -14251,10 +12716,6 @@ fn install_amacs_is_a_noop_exit_0() {
     assert_eq!(run(&["update", "amacs"]), ExitCode::SUCCESS);
 }
 
-/// Each store verb's answer for a built-in name reads that verb's own flags off the table,
-/// as the arity gate does: `update amacs --retry` is `update amacs`, never a pass that asks
-/// the index for amacs; `--vendor`/`--alab`, `pin`, `unpin` and `rollback` refuse; and any
-/// other argv is left to the verb's own grammar.
 #[test]
 fn built_in_answers_read_the_verbs_own_flags() {
     let argv = |xs: &[&str]| xs.iter().map(ToString::to_string).collect::<Vec<_>>();
@@ -14286,9 +12747,6 @@ fn built_in_answers_read_the_verbs_own_flags() {
     }
 }
 
-/// `uninstall amacs` refuses with exit 1: a built-in program cannot leave the binary, so
-/// the refusal names the setting that ends its role instead. atpkg has no `remove`; the
-/// word other package managers use is answered with `uninstall`.
 #[test]
 fn remove_amacs_refuses_naming_the_setting() {
     let run = |argv: &[&str]| main_entry(argv.iter().map(std::ffi::OsString::from).collect());
@@ -14310,10 +12768,6 @@ fn remove_amacs_refuses_naming_the_setting() {
     assert_eq!(did_you_mean("rm"), Some("uninstall"));
 }
 
-/// The `c-toolchain:` marker names what the window files (design init-system §4.2,
-/// `base.clt`): `missing` where no toolchain is installed, `broken` where one cannot build
-/// and an install fixes it (off macOS), `ready` wherever an install would fix nothing, no
-/// line where nothing was probed; and a terminal shows none of it.
 #[test]
 fn the_c_toolchain_marker_files_what_an_install_fixes_and_is_ready_elsewhere() {
     use crate::prereq::CcVerdict;
@@ -14357,12 +12811,6 @@ fn the_c_toolchain_marker_files_what_an_install_fixes_and_is_ready_elsewhere() {
     assert_eq!(super::human_marker(missing.as_deref().unwrap()), None);
 }
 
-/// The seed's `c-toolchain:` line (design init-system §4.2), read without spawning
-/// anything: on macOS the install shim with no developer directory behind it is `missing`
-/// once the toolset is here to need the tools (a toolset that arrived over SSH is filed at
-/// the next launch; a first launch leaves the filing to the pass that lays the set down),
-/// and a developer directory holding a clang is `ready`, which ends the entry. Off macOS a
-/// found `cc` may still lack headers, so the seed says nothing at all.
 #[cfg(unix)]
 #[test]
 fn the_seed_reads_the_command_line_tools_without_running_anything() {
@@ -14412,8 +12860,6 @@ fn the_seed_reads_the_command_line_tools_without_running_anything() {
     assert!(!ran.exists(), "nothing was spawned");
 }
 
-/// Only root holds a relay pass back (`sudo` keeps `$HOME`, and a root-owned rc would lock
-/// its owner out of it); any other uid lays its own tree.
 #[cfg(unix)]
 #[test]
 fn only_root_holds_a_relay_pass_back() {

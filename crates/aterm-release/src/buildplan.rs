@@ -1,29 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The release's one build (`artifact.rs` keeps what it makes): both architecture slices
-//! of `aterm` at once, each with its own target directory and log, `SOURCE_DATE_EPOCH=n`
-//! as the sole build-number conduit, `lipo` to universal, the dSYM (judged by DWARF file
-//! existence plus UUID match, see [`extract_dsym`]), `strip -x` on the shipped copy, the
-//! dSYM zip, the x86_64 slice driven under Rosetta, and the unsigned bundle laid out from
-//! the same snapshot (`bundle::assemble_at`).
-//!
-//! Two compiler lanes: the native aarch64 slice on Trust (targo's `--unverified` lane) and
-//! the x86_64-apple-darwin compat slice on upstream stable. Both build from one source take
-//! made from git objects and one lock-checksummed, offline dependency bundle
-//! ([`crate::snapshot`]); only the compiler differs. The environment is cleared, so
-//! inherited RUSTC, RUSTC_BOOTSTRAP, RUSTFLAGS and RUSTUP_TOOLCHAIN steer neither lane, and
-//! the native binary must self-report a Trust compiler (see [`run`]).
-//!
-//! STOCK EXCEPTION: the compat slice builds with `RUSTUP_TOOLCHAIN=stable`, because Trust
-//! has no x86_64-apple-darwin std in the aarch64 sysroot (`targo --unverified check
-//! --target x86_64-apple-darwin -p aterm` fails with E0463). That pin lives here and
-//! nowhere else.
-//!
-//! `SOURCE_DATE_EPOCH` reaches every cargo child, so the binary's ATERM_BUILD_NUMBER, the
-//! plist CFBundleVersion and the manifest build_number come from one u64. A failed cargo
-//! build is a hard error: no artifact ships with a missing slice.
+//! The release's one build (`artifact.rs` keeps what it makes).
 
+//! STOCK EXCEPTION: the compat slice builds with `RUSTUP_TOOLCHAIN=stable`, because Trust
 use aterm_uds::spawnfd::{Command, command};
 use std::ffi::OsString;
 use std::fs::File;
@@ -35,8 +15,6 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use crate::snapshot;
 
-// Native workers share the snapshot of git objects and the scrubbed Trust
-// invocation of the canonical cutter. They never sign or upload anything.
 #[path = "linux_release.rs"]
 pub mod linux;
 
@@ -47,72 +25,46 @@ const NATIVE_SLICE: &str = "native";
 const LIPO_ARM64: &str = "arm64";
 const LIPO_X86_64: &str = "x86_64";
 
-/// The compile-time marker every release build carries. The binary's
-/// `BuildStamp.release_build` (`crates/aterm/src/main.rs`) is its presence (the
-/// menu bar's release/dev signature); it carries no version.
+/// The compile-time marker every release build carries.
 pub const RELEASE_BUILD_MARKER: &str = "ATERM_RELEASE_BUILD";
 
-/// Everything [`run`] needs, resolved by the caller (`artifact::build` owns the
-/// identity and the store; this module only builds).
+/// Everything [`run`] needs, resolved by the caller (`artifact::build` owns the identity and the store; this module only builds).
 pub struct BuildPlan {
-    /// The checkout whose repository holds [`BuildPlan::commit`] — release
-    /// orchestration runs here. The build reads none of its files: the bytes come
-    /// from git objects ([`crate::snapshot`]), and Cargo receives the snapshot's
-    /// manifest explicitly from an inert root cwd.
+    /// The checkout whose repository holds [`BuildPlan::commit`] — release orchestration runs here.
     pub repo_root: PathBuf,
-    /// The full commit the release builds — the reserved release commit for a
-    /// release, HEAD for a dry run.
+    /// The full commit the release builds — the reserved release commit for a release, HEAD for a dry run.
     pub commit: String,
-    /// Receives what the build made, once the snapshot verified: the unsigned
-    /// `aterm.app`, the dSYM and its zip, and the x86_64 record.
+    /// Receives what the build made, once the snapshot verified: the unsigned `aterm.app`, the dSYM and its zip, and the x86_64 record.
     pub out_dir: PathBuf,
-    /// The reserved ledger number `n`: every cargo child's `SOURCE_DATE_EPOCH` and the
-    /// bundle's CFBundleVersion.
+    /// The reserved ledger number `n`: every cargo child's `SOURCE_DATE_EPOCH` and the bundle's CFBundleVersion.
     pub build_number: u64,
     /// Release version ("0.2.0") — names the dSYM zip `aterm-0.2.0-dSYM.zip`.
     pub short_version: String,
-    /// Exact lowercase SHA-256 fingerprint that every independently-built and
-    /// final shipped architecture slice must embed for its compiled updater
-    /// key. `None` exists only for unsigned development fixtures.
+    /// Exact lowercase SHA-256 fingerprint that every independently-built and final shipped architecture slice must embed for its compiled updater key.
     pub expected_update_pin_sha256: Option<String>,
-    /// Build the slices one after the other, not at once: the memory the last
-    /// build's slices peaked at would not fit beside each other
-    /// (`artifact::slices_fit`).
+    /// Build the slices one after the other, not at once.
     pub one_slice_at_a_time: bool,
-    /// The shipped channel's published index run the build compiles in as
-    /// [`atpkg::net::INDEX_HINT_ENV`] ([`index_hint_now`]): what a fresh install's first
-    /// discovery round guesses from. `None` builds without one, as a development build is.
+    /// The shipped channel's published index run the build compiles in as [`atpkg::net::INDEX_HINT_ENV`] ([`index_hint_now`]).
     pub index_hint: Option<String>,
 }
 
-/// What [`run`] produced: the unsigned universal bundle around the stripped,
-/// ship-ready binary, plus the dSYM artifacts (symbols live in the dSYM, matched by
-/// the Mach-O UUID, which strip preserves).
+/// What [`run`] produced.
 pub struct BuildOutput {
-    /// The unsigned bundle (`<out_dir>/aterm.app`): `Contents/MacOS/aterm` is the
-    /// stripped universal binary, its Info.plist stamped with `n` and the commit.
+    /// The unsigned bundle (`<out_dir>/aterm.app`).
     pub app: PathBuf,
     /// The snapshot digest the bytes were built from ([`snapshot::Snapshot::digest`]).
     pub snapshot_digest: String,
-    /// Each slice's build: its triple, its wall seconds, and the peak resident
-    /// memory its build child reported (`wait4`), when it did.
+    /// Each slice's build: its triple, its wall seconds, and the peak resident memory its build child reported (`wait4`), when it did.
     pub slices: Vec<SliceBuild>,
     /// `lipo -archs` of the shipped `aterm` (e.g. "x86_64 arm64"), for the cut transcript.
     pub archs: String,
-    /// The built binary's `--diagnose` `compiler:` line (`Trust <own version> · trustc
-    /// <slug> · …`), for the cut transcript. Always Trust-flavor: [`run`] refuses otherwise.
+    /// The built binary's `--diagnose` `compiler:` line (`Trust <own version> · trustc <slug> · …`), for the cut transcript.
     pub compiler_line: String,
-    /// `<out_dir>/aterm.dSYM`, present iff dsymutil produced a non-empty DWARF whose UUIDs
-    /// match the binary (see [`extract_dsym`]).
+    /// `<out_dir>/aterm.dSYM`, present iff dsymutil produced a non-empty DWARF whose UUIDs match the binary (see [`extract_dsym`]).
     pub dsym: Option<PathBuf>,
-    /// `<out_dir>/aterm-<ver>-dSYM.zip`: the owner's symbolication archive, never
-    /// published (its DWARF names this machine's paths).
+    /// `<out_dir>/aterm-<ver>-dSYM.zip`: the owner's symbolication archive, never published (its DWARF names this machine's paths).
     pub dsym_zip: Option<PathBuf>,
-    /// `aterm-<ver>-x86_64-probe.txt` — the x86_64 slice's `--diagnose` report under
-    /// Rosetta ([`x86_64_probe_transcript`]), the record that the universal build RAN
-    /// its Intel slice (docs/DESIGN-intel-just-works-2026-09-14.md §3.1). The site's
-    /// `data-intel-proof` (`ship site`, crates/aterm-release/src/site) links it once the
-    /// public release carries it.
+    /// `aterm-<ver>-x86_64-probe.txt`.
     pub x86_64_probe: PathBuf,
 }
 
@@ -121,8 +73,7 @@ pub struct BuildOutput {
 pub struct SliceBuild {
     pub triple: &'static str,
     pub secs: u64,
-    /// Peak resident bytes of the build child and the children it waited for
-    /// (`wait4`'s `ru_maxrss`), `None` where the host does not report it.
+    /// Peak resident bytes of the build child and the children it waited for (`wait4`'s `ru_maxrss`), `None` where the host does not report it.
     pub peak_bytes: Option<u64>,
 }
 
@@ -132,16 +83,7 @@ pub fn x86_64_probe_asset_name(version: &str) -> String {
     format!("aterm-{version}-x86_64-probe.txt")
 }
 
-/// The x86_64 execution record's text: what ran, what was checked, the session turn's
-/// outcome, and the slice's own `--diagnose` report verbatim.
-///
-/// PII-free by construction: the report is produced under a cleared environment whose
-/// `HOME` is a private scratch directory named by the cut's pid and a timestamp
-/// ([`x86_64_slice_runs`]), so its `config:` and `environment:` lines name nothing of the
-/// builder, and the session turn is recorded as a fixed sentence — never the screen,
-/// whose prompt carries the host and user. That `HOME` is writable and `SHELL` is
-/// [`X86_64_PROBE_SHELL`], as on a real Mac, so the report's `shell-int:` line reads the
-/// x86_64 slice preparing its own shell loader, not the probe's environment.
+/// The x86_64 execution record's text.
 #[must_use]
 pub fn x86_64_probe_transcript(version: &str, report: &str) -> String {
     let mut text = format!(
@@ -188,13 +130,6 @@ pub(crate) fn current_release_uid() -> Result<u32, String> {
 }
 
 /// Open one release-owned directory without accepting a symlink substitution.
-///
-/// The first metadata read rejects a static symlink. Comparing the opened descriptor's
-/// device/inode with it before any chmod closes the check/use gap: a path swapped while
-/// opening modifies no referent. Later permission changes go through the descriptor, and
-/// the final path check proves the same directory is still at `path`. Every directory of
-/// the release cache and the build's stage is made through [`snapshot::private_dir`],
-/// which holds it to this.
 #[cfg(unix)]
 pub(crate) fn open_release_directory(
     path: &Path,
@@ -425,11 +360,6 @@ fn validate_release_rustup_shim_dir(
 }
 
 /// Rustup's home for the compat lane: a non-empty `$RUSTUP_HOME`, else
-/// `<home>/.rustup` — atpkg's one rule ([`atpkg::seam::rustup_home_with`], which
-/// calls `atpkg::toolchain::rustup_home`, the file aterm-verify compiles by
-/// `#[path]` for its toolchain), which [`crate::gates`] resolves the rustup `trust`
-/// entry through as well. A set-but-empty variable is the default, not a
-/// relative path to refuse.
 fn release_rustup_home(home: &std::ffi::OsStr) -> Result<OsString, String> {
     let value = atpkg::seam::rustup_home_with(
         std::env::var_os("RUSTUP_HOME").as_deref(),
@@ -455,21 +385,15 @@ fn checked_output(command: &mut Command, what: &str) -> Result<Output, String> {
     Ok(output)
 }
 
-/// What a release build reads and writes: the [`snapshot::Snapshot`] of the commit
-/// it builds, and the warm per-clone directories of its [`snapshot::CacheRoot`], held
-/// for the take's whole life ([`snapshot::CacheHold`]): snapshot, both slices, lipo and
-/// strip, [`Take::verify`], and the move of what it built out of the cache.
+/// What a release build reads and writes.
 pub(crate) struct Take {
     /// Commit C's tree and its vendored dependencies, sealed and digested.
     pub(crate) snapshot: snapshot::Snapshot,
     /// The workspace's own Cargo config, as C has it (`<src>/.cargo/config.toml`).
     workspace_config: PathBuf,
     /// The warm target root: one `CARGO_TARGET_DIR` per slice under it
-    /// ([`Take::slice_target`]), so the slices build at once without queueing on
-    /// one directory's cargo lock.
     target_root: PathBuf,
     /// The builds' `CARGO_HOME` root, emptied for each build: one per slice under
-    /// it ([`Take::slice_cargo_home`]).
     cargo_home: PathBuf,
     /// `TMPDIR` for every build child.
     temporary_dir: PathBuf,
@@ -477,17 +401,13 @@ pub(crate) struct Take {
     stage: PathBuf,
     release_uid: u32,
     /// `git rev-parse --short=12 C` — pinned as the binary's `ATERM_GIT_COMMIT` and
-    /// stamped as the bundle's `ATermGitCommit`, so binary and plist name C alike.
     short_commit: String,
     /// The cache, this take's alone until the take drops (declared last, so it is let
-    /// go of last).
     _hold: snapshot::CacheHold,
 }
 
 impl Take {
-    /// Hold the clone's cache, materialize `commit` of `repo_root` into it and lay the
-    /// build's directories beside it. Another take of the clone holding the cache is
-    /// waited for ([`snapshot::CacheRoot::hold`]).
+    /// Hold the clone's cache, materialize `commit` of `repo_root` into it and lay the build's directories beside it.
     pub(crate) fn prepare(repo_root: &Path, commit: &str) -> Result<Self, String> {
         let hold = snapshot::CacheRoot::for_repo(repo_root)?.hold()?;
         let cache = hold.cache();
@@ -546,25 +466,17 @@ impl Take {
 }
 
 impl Take {
-    /// The slice's own `CARGO_TARGET_DIR`: `<target>/native` for the build with no
-    /// `--target` (the host's Trust lane), `<target>/<triple>` for a `--target`
-    /// one. Warm across builds, and each slice's alone.
+    /// The slice's own `CARGO_TARGET_DIR`.
     pub(crate) fn slice_target(&self, target: Option<&str>) -> PathBuf {
         self.target_root.join(target.unwrap_or(NATIVE_SLICE))
     }
 
     /// The slice's own `CARGO_HOME`, empty: an offline build over the vendored tree
-    /// needs nothing in it, and two builds at once never share its locks.
     fn slice_cargo_home(&self, target: Option<&str>) -> PathBuf {
         self.cargo_home.join(target.unwrap_or(NATIVE_SLICE))
     }
 
-    /// Whatever the build did, the bytes it read must still be the bytes digested
-    /// before it: a source changed under cargo is a refusal, never a release.
-    ///
-    /// What cargo compiled from changed bytes is in the warm target, and cargo
-    /// fingerprints a vendored package by its version, not its bytes — the next sync
-    /// would restore the source and keep the artifact. So a refusal removes the target.
+    /// Whatever the build did, the bytes it read must still be the bytes digested before it.
     pub(crate) fn verify(&self) -> Result<(), String> {
         self.snapshot
             .verify()
@@ -578,11 +490,7 @@ impl Take {
     }
 }
 
-/// Run the whole build: snapshot → both slices' cargo builds, at once → lipo →
-/// dsymutil → strip → dSYM zip → the x86_64 slice driven under Rosetta → the unsigned
-/// bundle laid out from the snapshot, then the snapshot verified again and the
-/// products moved out of the cache into `out_dir`, all under the take's hold on the
-/// cache. Returns what it made, which no later take of the clone can touch.
+/// Run the full release build (snapshot, dual-slice build, lipo, dsymutil, strip, Rosetta check, bundle layout) into `out_dir`.
 pub fn run(plan: &BuildPlan) -> Result<BuildOutput, String> {
     let take = Take::prepare(&plan.repo_root, &plan.commit)?;
     let staged_out = take.stage.join("dist");
@@ -595,9 +503,6 @@ pub fn run(plan: &BuildPlan) -> Result<BuildOutput, String> {
 }
 
 /// Move what a verified take built out of its stage into `out_dir`: the unsigned
-/// bundle, the dSYM (beside which its zip and the x86_64 record go). The stage is
-/// the clone's, recreated by the next take, so nothing the release goes on to
-/// measure or sign may stay in it.
 fn publish_verified_output(
     mut output: BuildOutput,
     out_dir: &Path,
@@ -613,9 +518,6 @@ fn publish_verified_output(
             ));
         }
     }
-    // Validate and tighten the output directory before any replacement below can be
-    // redirected outside it. (No `.metadata_never_index`: `bundle::prepare_staging` says
-    // why.)
     drop(open_release_directory(
         out_dir,
         expected_uid,
@@ -635,7 +537,6 @@ fn publish_verified_output(
 }
 
 /// Move one staged release directory into `out_dir` under its own name, replacing
-/// a stale copy.
 fn publish_staged_dir(staged: &Path, out_dir: &Path, what: &str) -> Result<PathBuf, String> {
     let name = staged
         .file_name()
@@ -657,7 +558,6 @@ fn publish_staged_dir(staged: &Path, out_dir: &Path, what: &str) -> Result<PathB
 }
 
 /// Move one staged release file into `out_dir` under its own name, replacing a stale
-/// copy from an earlier cut.
 fn publish_staged_file(staged: &Path, out_dir: &Path, what: &str) -> Result<PathBuf, String> {
     let name = staged
         .file_name()
@@ -679,18 +579,12 @@ fn publish_staged_file(staged: &Path, out_dir: &Path, what: &str) -> Result<Path
 }
 
 /// The slices' builds, at once: the native slice on the Trust lane and the x86_64 compat
-/// slice on upstream stable, each with its own target directory ([`Take::slice_target`]),
-/// `CARGO_HOME` and log (`<stage>/<triple>.log`, whose tail a failure prints).
-/// `plan.one_slice_at_a_time` builds them one after the other, and says so.
-///
-/// Returns each slice's binary (native first) and what its build measured.
 fn build_slices(
     plan: &BuildPlan,
     take: &Take,
     logs: &Path,
 ) -> Result<(Vec<PathBuf>, Vec<SliceBuild>), String> {
-    // The x86_64 compat slice is the STOCK EXCEPTION (see the module doc). Its target std
-    // is checked before either build starts.
+    // The x86_64 compat slice is the STOCK EXCEPTION (see the module doc).
     require_rustup_target(X86_64)?;
     let slices: [(&'static str, Option<&'static str>, &str); 2] = [
         (ARM64, None, "Trust toolchain (+t): native build"),
@@ -790,13 +684,8 @@ fn log_tail(log: &Path, n: usize) -> String {
 }
 
 fn run_with_take(plan: &BuildPlan, take: &Take, symbol_out: &Path) -> Result<BuildOutput, String> {
-    // Everything stays in the private stage until the snapshot passes its post-build
-    // verification.
     snapshot::private_dir(symbol_out, "release symbol stage")?;
 
-    // --- both slices, at once ------------------------------------------------
-    // The native slice has no --target, so host proc-macros and build scripts ride the
-    // same config rustflags.
     let (slices, slice_builds) = build_slices(plan, take, &take.stage)?;
 
     if let Some(expected) = &plan.expected_update_pin_sha256 {
@@ -807,7 +696,6 @@ fn run_with_take(plan: &BuildPlan, take: &Take, symbol_out: &Path) -> Result<Bui
         );
     }
 
-    // --- lipo to universal ---------------------------------------------------
     let universal = take.stage.join("universal");
     snapshot::private_dir(&universal, "release universal stage")?;
     let fat = universal.join("aterm");
@@ -815,38 +703,24 @@ fn run_with_take(plan: &BuildPlan, take: &Take, symbol_out: &Path) -> Result<Bui
     let archs = lipo_archs(&fat)?;
     println!("    universal binary: {archs}");
 
-    // --- dSYM from the unstripped binary -------------------------------------
     let (dsym, dsym_zip) = extract_dsym(&fat, symbol_out, &plan.short_version, &plan.repo_root)?;
 
-    // --- strip the shipped copy ----------------------------------------------
-    // Symbols live in the dSYM (matched by the Mach-O UUID, which strip preserves).
     let ship_dir = universal.join("ship");
     snapshot::private_dir(&ship_dir, "release ship stage")?;
     let shipped = ship_dir.join("aterm");
     std::fs::copy(&fat, &shipped).map_err(|e| format!("copy {}: {e}", fat.display()))?;
     make_executable(&shipped)?;
-    // `strip -x`: local symbols only. A failure is tolerated: unstripped is bigger, never
-    // wrong.
     let _ = command("strip")
         .arg("-x")
         .arg(&shipped)
         .current_dir(&plan.repo_root)
         .output();
 
-    // Bind the post-strip bytes: a tolerated strip failure still reaches this proof, and
-    // a strip or lipo that drops or changes either slice's pin section fails closed. Fat
-    // slices are extracted as data, never executed.
     if let Some(expected) = &plan.expected_update_pin_sha256 {
         verify_shipped_update_pin_slices(&shipped, &archs, expected)?;
         println!("    updater pin: every final shipped architecture structurally verified");
     }
 
-    // --- compiler provenance gate --------------------------------------------------
-    // Ask the built binary: `--diagnose` prints build.rs's `$RUSTC -vV` probe as the
-    // `compiler:` line, which leads with the toolchain's name (`Trust <own version> ·
-    // trustc <slug> · …`, or `Rust <release> · rustc <slug> · …` upstream). The native
-    // slice must be Trust; anything else is a bypassed toolchain file (broken rustup
-    // link, stale env), and the build refuses.
     let diagnose = match command(&shipped)
         .arg("--diagnose")
         .current_dir(&plan.repo_root)
@@ -900,9 +774,6 @@ fn run_with_take(plan: &BuildPlan, take: &Take, symbol_out: &Path) -> Result<Bui
         ));
     }
     println!("    compiler: {compiler_line}  (Trust provenance gate passed)");
-    // The host-registration line, echoed so the transcript records which host the proof
-    // ran on. A note, not a gate: a builder whose macOS registers everything says nothing
-    // about an older host (the objc layer supplies a missing protocol itself).
     let objc_line = diagnose
         .lines()
         .find_map(|l| l.strip_prefix("objc:"))
@@ -910,11 +781,6 @@ fn run_with_take(plan: &BuildPlan, take: &Take, symbol_out: &Path) -> Result<Bui
         .unwrap_or("(no objc: line in --diagnose — binary predates the probe)");
     println!("    objc: {objc_line}");
 
-    // --- the x86_64 slice runs before a universal build ships -----------------------
-    // (docs/DESIGN-intel-just-works-2026-09-14.md §3.1.) Intel-only faults sit where
-    // x86_64 execution differs from arm64 (ObjC encodings, stret sends, `BOOL` width),
-    // which no build or structural proof sees; Rosetta reproduces that ABI. No Rosetta is
-    // a refusal naming the remedy, never an unexecuted slice.
     let scratch = private_slice_scratch()?;
     let probed = (|| {
         let report = x86_64_slice_runs(&shipped, &scratch.join("home"), &mut |command| {
@@ -925,8 +791,6 @@ fn run_with_take(plan: &BuildPlan, take: &Take, symbol_out: &Path) -> Result<Bui
             validate_slice_update_pin_reports(expected, &[(label, &report)])?;
         }
         validate_app_version_reports(&plan.short_version, &[(label, &report)])?;
-        // `--diagnose` never reaches the session, PTY and CoreText paths, where x86_64
-        // stret/`BOOL` faults live: the slice must also drive a session.
         slice_drives_a_session(
             &shipped,
             SliceArch::X86_64,
@@ -940,7 +804,6 @@ fn run_with_take(plan: &BuildPlan, take: &Take, symbol_out: &Path) -> Result<Bui
     })();
     let _ = std::fs::remove_dir_all(&scratch);
     let report = probed?;
-    // The record of the run, staged beside the dSYM and published with it.
     let record = symbol_out.join(x86_64_probe_asset_name(&plan.short_version));
     std::fs::write(
         &record,
@@ -953,9 +816,6 @@ fn run_with_take(plan: &BuildPlan, take: &Take, symbol_out: &Path) -> Result<Bui
         x86_64_probe_asset_name(&plan.short_version)
     );
 
-    // --- the unsigned bundle, from the same snapshot --------------------------------
-    // Its resources are the release commit's bytes, from the snapshot this take verifies
-    // after. Signing is the cut's, over a byte copy of exactly this.
     let app = symbol_out.join("aterm.app");
     crate::bundle::assemble_at(
         &crate::bundle::BundleSpec {
@@ -1031,33 +891,6 @@ struct ReleaseEnv<'a> {
 }
 
 /// THE RELEASE BUILD'S WHOLE ENVIRONMENT: the command starts empty and gets exactly
-/// these. Nothing here steers what compiles (no `RUSTFLAGS` family, no `RUSTC`, no
-/// wrapper): the lane's flags are the config's.
-///
-/// * the toolchain `PATH`, `HOME`, a C locale, the take's `TMPDIR` and `CARGO_HOME`;
-/// * THE build-number conduit (spec §2 propagation): `SOURCE_DATE_EPOCH` = the one
-///   reserved u64, which build.rs reads for `ATERM_BUILD_NUMBER` and
-///   `ATERM_BUILD_TIME` and which wins over its live-git fallback, so the binary, the
-///   plist stamp and the manifest carry the same number;
-/// * the commit stamp, PINNED (the snapshot has no `.git`, so crates/aterm/build.rs
-///   takes these instead of asking git): the release commit, 0 commits past it;
-/// * the slice's own `CARGO_TARGET_DIR`;
-/// * a real .dSYM: line-table debug info AND no stripping, set unconditionally (an
-///   ambient `CARGO_PROFILE_RELEASE_STRIP=true` would kill the dSYM) — on a Linux
-///   worker instead no debug info and only debuginfo stripped
-///   ([`release_profile_debug`]);
-/// * the release marker ([`RELEASE_BUILD_MARKER`]), and no version: the binary
-///   reports `[workspace.package] version` as written;
-/// * the shipped channel's published index run, when the plan carries one
-///   ([`atpkg::net::INDEX_HINT_ENV`], [`index_hint_now`]): a guess a fresh install's first
-///   discovery round follows, never an input to what verifies;
-/// * on the compat slice only, `RUSTUP_HOME` and `RUSTUP_TOOLCHAIN=stable` (a
-///   deliberate stock lane; the native slice adds nothing beyond its driver);
-/// * on Linux, `CARGO_BUILD_JOBS=4`: native Linux workers run beside the developer's
-///   app build, and an inherited value would not survive the clear.
-///
-/// No trust anchor is injected: they are committed constants (`aterm_update_core::
-/// pins`), never a property of the shell that compiled the binary.
 fn release_env(e: &ReleaseEnv<'_>) -> Vec<(&'static str, OsString)> {
     let mut env: Vec<(&'static str, OsString)> = vec![
         ("PATH", e.path.clone()),
@@ -1095,11 +928,6 @@ fn release_env(e: &ReleaseEnv<'_>) -> Vec<(&'static str, OsString)> {
 }
 
 /// The release profile's `(debug, strip)` pair for this worker's build, set as
-/// unconditionally as the rest of [`release_env`]. macOS: line-table debug info and no
-/// stripping, for the dSYM. A Linux worker has no dSYM step: the executable it builds IS
-/// the published asset, so it carries no debug info (373 MB with it, 64 MB without,
-/// measured on aarch64 at 0.105.0) and keeps its symbol table, so a backtrace still names
-/// functions.
 const fn release_profile_debug() -> (&'static str, &'static str) {
     if cfg!(target_os = "linux") {
         ("0", "debuginfo")
@@ -1108,10 +936,7 @@ const fn release_profile_debug() -> (&'static str, &'static str) {
     }
 }
 
-/// The shipped channel's published index run now, as a store that has verified nothing
-/// finds it ([`atpkg::net::published_index_run`]), for a release build to compile in
-/// ([`BuildPlan::index_hint`]) — said either way. `None` when the walk fails: the build goes
-/// on without one, since a guess gates nothing, and its fresh installs walk from none.
+/// The shipped channel's published index run now, as a store that has verified nothing finds it ([`atpkg::net::published_index_run`]), for a release build to compile in ([`BuildPlan::index_hint`]).
 pub(crate) fn index_hint_now() -> Option<String> {
     match atpkg::net::published_index_run() {
         Ok(run) => {
@@ -1129,9 +954,6 @@ pub(crate) fn index_hint_now() -> Option<String> {
 }
 
 /// THE RELEASE BUILD'S COMMAND, as [`build_one`] spawns it but for where its output
-/// goes: `driver` run in `/` with `args`, its environment cleared and then exactly
-/// [`release_env`]'s — nothing a shell exported (`RUSTFLAGS`, a wrapper, a profile)
-/// reaches the build — and no stdin.
 fn release_build_command(driver: &Path, args: Vec<OsString>, env: &ReleaseEnv<'_>) -> Command {
     let mut cmd = command(driver);
     cmd.current_dir("/")
@@ -1143,10 +965,6 @@ fn release_build_command(driver: &Path, args: Vec<OsString>, env: &ReleaseEnv<'_
 }
 
 /// One `cargo build --release -p <pkg>`: `target` is `None` for the native Trust slice,
-/// `Some(triple)` for the upstream-stable compat slice. Each slice has its own target
-/// directory and `CARGO_HOME`, so two can run at once. Output goes to `log` when given
-/// (its tail printed on failure), else streams to the operator. Returns the build
-/// child's peak resident memory, where the host reports it.
 fn build_one(
     plan: &BuildPlan,
     take: &Take,
@@ -1155,9 +973,8 @@ fn build_one(
     log: Option<&Path>,
 ) -> Result<Option<u64>, String> {
     snapshot::refuse_root_cargo_config()?;
-    // The build driver, per lane. Native: `targo` from the Trust stage2 tool dir, never a
+    // PATH `cargo`.
     // PATH `cargo`. Compat: stable's `cargo` via the rustup shim (STOCK EXCEPTION, see the
-    // module doc).
     let home = std::env::var_os("HOME").ok_or("release build requires HOME")?;
     let compat_shim = if target.is_some() {
         Some(release_rustup_shim_dir(&home)?)
@@ -1171,9 +988,6 @@ fn build_one(
         (stage2.join("targo"), "targo")
     };
     let (driver_path, driver_name) = driver;
-    // Toolchain PATH, per lane. Native: the physical Trust stage2 bin dir first, so targo
-    // resolves its co-located trustc/trustdoc (protected Trust drivers refuse symlinked
-    // toolchain paths). Compat: the validated rustup shim directory first.
     let tool_dir = if let Some(shim) = &compat_shim {
         shim
     } else {
@@ -1186,12 +1000,6 @@ fn build_one(
         Some(_) => Some(release_rustup_home(&home)?),
         None => None,
     };
-    // AT THE RELEASE'S OWN TIER — no `taskpolicy`. This is the one compile of the
-    // bytes `verify release` judges and the cut signs, on the release's critical path:
-    // at UTILITY any peer's default-QoS build starves it. Targo's explicit unverified
-    // lane, the exact sealed dependency source, and offline resolution are one tested
-    // argument vector for both arches; the environment is the whole of
-    // [`release_env`]'s.
     let mut cmd = release_build_command(
         &driver_path,
         cargo_build_args(
@@ -1248,8 +1056,6 @@ fn build_one(
 }
 
 /// Wait for `child` and read the peak resident memory of it and the children it waited
-/// for (`wait4`'s `ru_maxrss`), which decides whether the next build's slices may run at
-/// once.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn wait_with_peak(
     mut child: aterm_uds::spawnfd::Child,
@@ -1266,8 +1072,6 @@ fn wait_with_peak(
 }
 
 /// Refuse, with the remediation, when stable's target std (or rustup) is absent. Probes
-/// stable explicitly: a bare `rustup target list` would resolve the repo's `trust`
-/// toolchain, which never carries rustup-managed targets.
 fn require_rustup_target(triple: &str) -> Result<(), String> {
     let home = std::env::var_os("HOME").ok_or("compat target probe requires HOME")?;
     let rustup_home = release_rustup_home(&home)?;
@@ -1301,8 +1105,7 @@ fn require_rustup_target(triple: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// The `commit-hash` stable's `rustc -vV` answers — the compiler of the x86_64 slice,
-/// part of what a build is keyed by (`artifact::key`).
+/// The `commit-hash` stable's `rustc -vV` answers.
 ///
 /// # Errors
 /// No rustup shim, or a stable `rustc` that does not answer `-vV` with a commit.
@@ -1375,10 +1178,6 @@ fn read_exact_macho<R: Read>(
 }
 
 /// Parse one THIN 64-bit Mach-O executable and return the sole dedicated
-/// updater-authority record.  This intentionally understands the small Mach-O
-/// surface we emit instead of searching arbitrary executable bytes: a matching
-/// fingerprint elsewhere (a diagnostic literal, debug data, or an attacker-added
-/// decoy) is never authority.
 fn parse_thin_macho_update_pin<R: Read + Seek>(
     reader: &mut R,
     file_len: u64,
@@ -1568,11 +1367,9 @@ fn validate_embedded_update_pin(expected: &str, observed: &str, label: &str) -> 
 }
 
 /// The architectures a release ships: both, always (the universal app is the
-/// product; there is no single-architecture release).
 const SHIPPED_ARCHITECTURES: [&str; 2] = [LIPO_ARM64, LIPO_X86_64];
 
-/// `lipo -archs`' answer for the shipped binary, held to [`SHIPPED_ARCHITECTURES`]
-/// exactly — each once, nothing else.
+/// `lipo -archs`' answer for the shipped binary, held to [`SHIPPED_ARCHITECTURES`] exactly — each once, nothing else.
 pub(crate) fn validate_lipo_architectures(archs: &str) -> Result<Vec<&str>, String> {
     let observed: Vec<&str> = archs.split_whitespace().collect();
     let expected = &SHIPPED_ARCHITECTURES;
@@ -1677,8 +1474,6 @@ fn verify_shipped_update_pin_slices(
     } else {
         let temp = PrivateSliceDir::create()?;
         for architecture in &architectures {
-            // `architecture` came through the exact allowlist above, so it is
-            // both a safe filename component and a valid lipo selector.
             let thin = temp.0.join(architecture);
             let mut command = command("lipo");
             command
@@ -1703,8 +1498,7 @@ fn verify_shipped_update_pin_slices(
     validate_final_slice_records(expected_pin, &SHIPPED_ARCHITECTURES, &records)
 }
 
-/// Require every diagnostics report to carry exactly one app-version field
-/// equal to the ledger-derived release identity.
+/// Require every diagnostics report to carry exactly one app-version field equal to the ledger-derived release identity.
 pub fn validate_app_version_reports(
     expected: &str,
     reports: &[(&str, &str)],
@@ -1737,13 +1531,6 @@ pub fn validate_cli_app_version(expected: &str, stdout: &[u8]) -> Result<(), Str
 }
 
 /// Require an argv0 alias identity to be exactly `<name> <claimed>` on LINE ONE.
-///
-/// `aterm --version` says which copy runs after its identity line (S12 of
-/// `docs/DESIGN-which-copy-runs-2026-08-27.md`): `running: <path>` and, per other
-/// `aterm.app` in the usual places, `another copy: …`. Those lines are path-dependent
-/// by design — a staged universal binary names its own path — so the gate pins the
-/// identity line byte for byte and admits ONLY the S12 lines after it: anything else
-/// (a stale cached library slice's chatter, alias-routing drift) still fails.
 pub fn validate_named_cli_app_version(
     name: &str,
     expected: &str,
@@ -1757,8 +1544,6 @@ pub fn validate_named_cli_app_version(
             "{name} --version output {observed:?} does not open with {wanted:?}"
         ));
     };
-    // The origin line (`by Andrew Yates · ALab · alab.systems`) may sit right
-    // under the identity line — exactly the shared constant, nothing else.
     let rest = rest
         .strip_prefix(aterm_types::identity::ORIGIN_LINE)
         .and_then(|r| r.strip_prefix('\n'))
@@ -1784,23 +1569,9 @@ pub fn validate_named_cli_app_version(
 }
 
 /// The only lines `aterm --version` may print after its identity line (and the
-/// optional origin line right under it, admitted verbatim above): the S12
-/// "which copy runs" report (`aterm_update::which_copy::WhichCopy::lines`), the
-/// build number, and the trust roots this binary was built against.
-///
-/// `build:` and `trusts:` were added to `--version` after this gate was written,
-/// so the v0.86.0 cut failed here on its own correct output — the gate was
-/// refusing a line it had never been told about, which is the shape it exists to
-/// catch and also the shape that makes it wrong when the report grows honestly.
-/// Each is path- and machine-independent and carries no secret: `build:` is the
-/// build number the identity already implies, and `trusts:` is the paper master's
-/// fingerprint (`master=`), the same value the updater pin gate checks separately.
-/// Anything ELSE after the identity line still fails.
 const WHICH_COPY_LINE_PREFIXES: &[&str] = &["running: ", "another copy: ", "build: ", "trusts: "];
 
-/// Pure report validator used by the native-slice and final-universal runtime
-/// cross-checks. Each report must contain exactly one stable diagnostics field
-/// and independently equal the authority.
+/// Pure report validator used by the native-slice and final-universal runtime cross-checks.
 pub fn validate_slice_update_pin_reports(
     expected: &str,
     reports: &[(&str, &str)],
@@ -1840,16 +1611,11 @@ fn verify_built_slice_update_pins(
         return Err("no architecture slices were supplied for updater-pin proof".into());
     }
 
-    // Structural proof for EVERY thin slice.  In particular, the x86_64 path
-    // is read as data and is never executed, so this gate works without Rosetta.
     for slice in slices {
         let observed = read_thin_macho_update_pin(slice)?;
         validate_embedded_update_pin(expected, &observed, &slice.display().to_string())?;
     }
 
-    // Independent executable conformance for the native slice.  The final
-    // stripped universal is checked again by `run`; neither probe executes the
-    // x86_64 compatibility slice.
     let native = &slices[0];
     let output = command(native)
         .arg("--diagnose")
@@ -1878,21 +1644,15 @@ fn verify_built_slice_update_pins(
 }
 
 /// The `SHELL` the x86_64 `--diagnose` probe runs with: the macOS default login shell,
-/// so the report's `shell-int:` line exercises the slice's zsh loader-prepare path.
 const X86_64_PROBE_SHELL: &str = "/bin/zsh";
 
 /// What the session turn types into a slice's shell. A shell spawned by a process
-/// runs that process's slice — a Rosetta-translated one its x86_64 slice — so the
-/// screen answers the slice's own architecture ([`SliceArch::uname`]).
 const SLICE_TURN_TEXT: &str = "uname -m";
 
 /// How long a slice's headless instance may take to open its control socket: a hang
-/// detector, never a budget. Rosetta translates the whole binary on the x86_64
-/// slice's first run, which is most of this.
 const SLICE_SOCKET_WAIT: std::time::Duration = std::time::Duration::from_secs(180);
 
-/// One architecture slice of the universal binary, as `arch(1)` selects it and
-/// `uname -m` names it.
+/// One architecture slice of the universal binary, as `arch(1)` selects it and `uname -m` names it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SliceArch {
     Arm64,
@@ -1928,19 +1688,13 @@ impl SliceArch {
 /// The renderer a slice's session drive starts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Renderer {
-    /// `--cpu`: the x86_64 slice's drive under Rosetta at the build, which judges the
-    /// translated session, PTY and CoreText paths and keeps off the GPU.
+    /// `--cpu`: the x86_64 slice's drive under Rosetta at the build, which judges the translated session, PTY and CoreText paths and keeps off the GPU.
     Cpu,
-    /// The launch default (GPU wanted), REQUIRED live: the signed bundle's arm64 slice
-    /// at the cut, where the hardened runtime, library validation and the entitlements
-    /// signing added are what a GPU start meets. One clock-free pixel command (`ctl image
-    /// --bytes`) starts the renderer — it starts lazily, on the first pixel — and `ctl
-    /// metrics` must then report `backend=gpu`, never the CPU fallback.
+    /// The launch default (GPU wanted), REQUIRED live.
     Gpu,
 }
 
 /// Scope `command` to a cleared environment: the system `PATH`, `HOME` = `home`, and
-/// nothing else from the builder (its `ATERM_*`, its `HOME`, its user name).
 fn hermetic_env(command: &mut Command, home: &Path) {
     command
         .env_clear()
@@ -1949,14 +1703,6 @@ fn hermetic_env(command: &mut Command, home: &Path) {
 }
 
 /// Run the x86_64 slice of `universal` under Rosetta (`/usr/bin/arch -x86_64 … --diagnose`)
-/// and return its report. `run` spawns, injected so the refusal paths are testable without
-/// Rosetta. `Err` when Rosetta cannot run a trivial x86_64 program
-/// ([`crate::gates::ROSETTA_REFUSAL`] — the pre-claim [`crate::gates::universal_gate`] asks
-/// the same probe first, so on a real cut this arm is Rosetta vanishing mid-build), or the
-/// slice does not answer. The report is the record's body, so the slice runs in a cleared
-/// environment, from `/`, with `home` (created here, inside the cut's private scratch) as
-/// `HOME` and [`X86_64_PROBE_SHELL`] as `SHELL`: nothing of the builder can reach it, and
-/// the slice prepares its shell loader in `home` as it would on a real Mac.
 fn x86_64_slice_runs(
     universal: &Path,
     home: &Path,
@@ -1985,9 +1731,7 @@ fn x86_64_slice_runs(
         .map_err(|_| "the x86_64 slice's diagnostics are not UTF-8".to_string())
 }
 
-/// A fresh, private (0700) scratch directory for a slice's probes (`--diagnose`, then
-/// the session turn), under `/tmp` so the control socket's path stays inside `sun_path`.
-/// Its name carries the builder's pid and a timestamp — nothing of the builder.
+/// A fresh, private (0700) scratch directory for a slice's probes (`--diagnose`, then the session turn), under `/tmp` so the control socket's path stays inside `sun_path`.
 pub(crate) fn private_slice_scratch() -> Result<PathBuf, String> {
     use std::os::unix::fs::DirBuilderExt as _;
     let nanos = SystemTime::now()
@@ -2004,21 +1748,7 @@ pub(crate) fn private_slice_scratch() -> Result<PathBuf, String> {
     Ok(dir)
 }
 
-/// A slice of `universal` DRIVES A SESSION — §3.1's second half for the x86_64 slice
-/// under Rosetta at the build ([`Renderer::Cpu`]), and the signed bundle's arm64 slice
-/// at the cut's self-check ([`Renderer::Gpu`]: the hardened runtime and entitlements
-/// are what signing adds, and a launch and a GPU start are what reach them). A
-/// headless, hermetic instance (`--headless --no-reroute`, `--cpu` for
-/// [`Renderer::Cpu`], `HOME`/XDG dirs under `scratch`, updates and packages off) is
-/// spawned under `arch <slice>`; once its control socket appears, one `aterm ctl turn`
-/// — the slice's own client — types [`SLICE_TURN_TEXT`] and settles on a row reading
-/// the slice's architecture, and for [`Renderer::Gpu`] one pixel command starts the
-/// renderer and `ctl metrics` must name it the GPU ([`gpu_verdict`]). CLOCK-FREE: the
-/// waits are hang detectors, never a latency budget. `spawn` and `run` are injected so every refusal is testable without
-/// Rosetta. The instance is killed and reaped on every path, and it holds the
-/// caller's LIFELINE (`aterm_uds::lifeline`, its FIFO in `scratch`): a release killed
-/// before its `Drop` runs — a SIGKILL, a second Ctrl-C — takes the instance and its
-/// shell with it (gap #36).
+/// A slice of `universal` DRIVES A SESSION.
 pub(crate) fn slice_drives_a_session(
     universal: &Path,
     slice: SliceArch,
@@ -2075,8 +1805,6 @@ pub(crate) fn slice_drives_a_session(
         .stdout(aterm_uds::spawnfd::Stdio::null())
         .stderr(aterm_uds::spawnfd::Stdio::null());
     hermetic(&mut instance);
-    // Held until this function returns, and bound BEFORE the `Reap` so it drops
-    // after it: the instance is killed and reaped first, then the lifeline is cut.
     let _lifeline =
         aterm_uds::lifeline::Lifeline::arm(&mut instance, scratch).map_err(|error| {
             format!(
@@ -2106,7 +1834,6 @@ pub(crate) fn slice_drives_a_session(
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
 
-    // The slice's own client, under `arch <slice>`, hermetic.
     let ctl = |args: &[&str]| {
         let mut command = command("/usr/bin/arch");
         command
@@ -2132,9 +1859,6 @@ pub(crate) fn slice_drives_a_session(
     if renderer == Renderer::Cpu {
         return Ok(());
     }
-    // The renderer starts lazily, on the first pixel command: one capture starts it (no
-    // clock — the capture answers once a frame is drawn), and the live backend is read
-    // after it, so it is the renderer that drew.
     let image = run(&mut ctl(&["image", "--bytes"]))
         .map_err(|error| format!("capture the {name} slice's first frame: {error}"))?;
     if !image.status.success() {
@@ -2151,10 +1875,6 @@ pub(crate) fn slice_drives_a_session(
 }
 
 /// Judge the renderer that drew the slice's first frame from `ctl metrics`' first line
-/// — `metrics::backend_gpu()`, the LIVE backend, stored on both arms of the GPU start
-/// (`--diagnose` prints only the intent). `backend=gpu` passes; the CPU fallback (the
-/// GPU did not start, and aterm-gui fell back silently) and a line with no backend are
-/// refused, in the paint probe's own words.
 fn gpu_verdict(out: &std::process::Output, slice: SliceArch) -> Result<(), String> {
     let name = slice.uname();
     let text = String::from_utf8_lossy(&out.stdout);
@@ -2179,11 +1899,7 @@ fn gpu_verdict(out: &std::process::Output, slice: SliceArch) -> Result<(), Strin
     }
 }
 
-/// THE SIGNED BUNDLE DRIVES A SESSION ON THE GPU: the cut's self-check runs
-/// [`slice_drives_a_session`] on the native (arm64) slice of the bundle at `app` after
-/// it is signed — the drive the build gives the x86_64 slice, over the bytes signing
-/// changed — and requires the GPU renderer live ([`Renderer::Gpu`]). Its scratch is
-/// private and removed on every path.
+/// THE SIGNED BUNDLE DRIVES A SESSION ON THE GPU.
 ///
 /// # Errors
 /// The drive's refusal, naming what the turn saw.
@@ -2203,8 +1919,6 @@ pub(crate) fn signed_slice_drives_a_session(app: &Path) -> Result<(), String> {
 }
 
 /// Judge the session turn: the client succeeded, its verdict (stderr) says the screen
-/// SETTLED on the awaited row, and a row (stdout) reads exactly the slice's
-/// architecture. Anything else is a refusal naming what the turn saw, never a pass.
 fn turn_verdict(out: &std::process::Output, slice: SliceArch) -> Result<(), String> {
     let verdict = String::from_utf8_lossy(&out.stderr);
     let rows = String::from_utf8_lossy(&out.stdout);
@@ -2226,10 +1940,9 @@ fn turn_verdict(out: &std::process::Output, slice: SliceArch) -> Result<(), Stri
 }
 
 /// Combine slices into one fat binary, or pass a single slice through
-/// (build-app.sh's lipo step, incl. the single-arch copy branch).
 fn lipo_or_copy(slices: &[PathBuf], out: &Path) -> Result<(), String> {
     match slices {
-        [] => Err("no architecture built".into()), // unreachable: builds hard-fail
+        [] => Err("no architecture built".into()),
         [one] => {
             std::fs::copy(one, out).map_err(|e| format!("copy {}: {e}", one.display()))?;
             make_executable(out)
@@ -2260,14 +1973,6 @@ fn lipo_archs(bin: &Path) -> Result<String, String> {
 }
 
 /// Extract `dist/aterm.dSYM` from the UN-stripped universal binary, then zip
-/// it as `dist/aterm-<ver>-dSYM.zip` for the release assets.
-///
-/// EXIT-CODE CAVEAT (inherited from build-app.sh, preserved on purpose):
-/// dsymutil exits non-zero on harmless "unable to open object file" warnings
-/// (cargo's deleted intermediate .o's), so success is judged by the DWARF
-/// file's existence and non-emptiness, NOT by the exit code. A missing/empty
-/// dSYM is a WARNING, not an abort — the release still ships, crash reports
-/// just won't symbolicate (same tolerance as the script).
 fn extract_dsym(
     bin: &Path,
     out_dir: &Path,
@@ -2276,7 +1981,6 @@ fn extract_dsym(
 ) -> Result<(Option<PathBuf>, Option<PathBuf>), String> {
     let dsym = out_dir.join("aterm.dSYM");
     let _ = std::fs::remove_dir_all(&dsym);
-    // Exit code + output deliberately ignored (see caveat above).
     let _ = command("dsymutil")
         .arg(bin)
         .arg("-o")
@@ -2293,10 +1997,6 @@ fn extract_dsym(
         return Ok((None, None));
     }
 
-    // UUID match (spec §6): the dSYM only symbolicates if its per-arch UUIDs
-    // cover the binary's (strip preserves the UUID, so checking the unstripped
-    // original vouches for the shipped copy too). Best-effort: a missing
-    // dwarfdump skips the check rather than failing the cut.
     match (dwarf_uuids(bin), dwarf_uuids(&dwarf)) {
         (Some(bin_uuids), Some(dsym_uuids)) => {
             if !bin_uuids.iter().all(|u| dsym_uuids.contains(u)) {
@@ -2313,8 +2013,6 @@ fn extract_dsym(
         ),
     }
 
-    // ditto -c -k --keepParent: the standard .dSYM archive form (preserves the
-    // bundle structure so Xcode/symbolicators accept it after unzip).
     let zip = out_dir.join(format!("aterm-{short_version}-dSYM.zip"));
     let _ = std::fs::remove_file(&zip);
     let mut cmd = command("/usr/bin/ditto");
@@ -2329,7 +2027,6 @@ fn extract_dsym(
 }
 
 /// `dwarfdump --uuid <path>` → the UUID token of every "UUID: <hex> (<arch>)"
-/// line, or None when dwarfdump is unavailable / produced nothing.
 fn dwarf_uuids(path: &Path) -> Option<Vec<String>> {
     let out = command("dwarfdump").arg("--uuid").arg(path).output().ok()?;
     if !out.status.success() {
@@ -2366,7 +2063,6 @@ fn make_executable(_path: &Path) -> Result<(), String> {
 }
 
 /// Run a short command with captured output; on failure surface its stderr in
-/// the error (the "typed Command shell-outs with captured stderr" rule, §6).
 fn run_quiet(mut cmd: Command, what: &str) -> Result<(), String> {
     let out = cmd.output().map_err(|e| format!("spawn {what}: {e}"))?;
     if !out.status.success() {
@@ -2379,7 +2075,6 @@ fn run_quiet(mut cmd: Command, what: &str) -> Result<(), String> {
 }
 
 /// Where a `--target` build put a cargo binary (by its bin name, `aterm`: the one
-/// binary is the whole surface, and the bundle adds its argv0 aliases as symlinks).
 fn target_bin(target_dir: &Path, triple: &str, bin: &str) -> PathBuf {
     target_dir.join(triple).join("release").join(bin)
 }
@@ -2426,9 +2121,6 @@ mod tests {
     };
 
     /// §3.1 of DESIGN-intel-just-works: a universal cut RUNS its x86_64 slice. A builder
-    /// without Rosetta is refused with the remedy (and the escape) named, before the slice
-    /// is ever tried; a slice that does not answer is refused; one that answers returns
-    /// its report — and every spawn goes through `arch -x86_64`.
     #[test]
     fn the_universal_cut_runs_its_x86_64_slice_under_rosetta() {
         use std::os::unix::process::ExitStatusExt as _;
@@ -2472,11 +2164,6 @@ mod tests {
             Ok(output(0, "app-version: 0.93.0\n"))
         })
         .unwrap();
-        // PII-free by construction: the report that becomes the record runs in a
-        // cleared environment under a HOME that names nobody, from `/`. That HOME is
-        // writable and SHELL is zsh, as on a real Mac, so the report's `shell-int:`
-        // line describes the slice, not a read-only probe HOME with no shell (the
-        // `/var/empty` probe read `NOT ACTIVE — loader cache unwritable`).
         let home_env = format!("HOME={:?}", home.display().to_string());
         assert!(
             rendered[1].starts_with("cd \"/\" && env -i ")
@@ -2501,16 +2188,10 @@ mod tests {
     }
 
     /// §3.1's session turn: the x86_64 slice runs headless under Rosetta in a hermetic
-    /// scratch tree, and one translated `aterm ctl turn` must SETTLE on a row reading
-    /// `x86_64`. An instance that dies or never opens its socket is refused, and so is a
-    /// turn that timed out or saw another architecture (the negative controls). The
-    /// instance is reaped on every path.
     #[test]
     fn the_universal_cut_drives_a_session_on_its_x86_64_slice() {
         use std::os::unix::process::ExitStatusExt as _;
         let bin = std::path::Path::new("/stage/ship/aterm");
-        // A hang detector for `sh` + `touch` (a loaded box can take seconds to
-        // start a shell); it returns as soon as the socket file appears.
         let wait = std::time::Duration::from_secs(60);
         let turn_out = |code: i32, verdict: &str, rows: &str| std::process::Output {
             status: std::process::ExitStatus::from_raw(code << 8),
@@ -2525,9 +2206,6 @@ mod tests {
             std::fs::create_dir_all(&dir).unwrap();
             dir
         };
-        // The fake instance: the real command's --control-sock operand becomes a file,
-        // then it sleeps until reaped — standing in for the translated headless aterm.
-        // Its sleep outlives `wait`, so it can only end by the reap.
         let fake_instance = |command: &mut aterm_uds::spawnfd::Command| {
             let args: Vec<String> = command
                 .get_args()
@@ -2550,7 +2228,6 @@ mod tests {
                 .spawn()
         };
 
-        // A turn that settles on `x86_64` passes, and the instance is gone afterwards.
         let dir = scratch_for("pass");
         let mut turn_argv = Vec::new();
         slice_drives_a_session(
@@ -2586,8 +2263,6 @@ mod tests {
         let toml = std::fs::read_to_string(dir.join("cfg/aterm/aterm.toml")).unwrap();
         assert!(toml.contains("[update]\nenabled = false") && toml.contains("[packages]"));
 
-        // Negative controls: the screen answered another architecture; the turn timed
-        // out; the client failed.
         for (verdict, rows, code) in [
             (settled, "sh$ uname -m\narm64\n", 0),
             (
@@ -2611,14 +2286,9 @@ mod tests {
             assert!(!err.is_empty());
         }
         assert!(turn_verdict(&turn_out(0, settled, "x86_64\n"), SliceArch::X86_64).is_ok());
-        // The signed bundle's arm64 slice (the cut's self-check) is the same drive
-        // under `arch -arm64`, judged by its own answer: `arm64` passes it, and the
-        // x86_64 answer that passes the Rosetta drive refuses it.
         assert!(turn_verdict(&turn_out(0, settled, "arm64\n"), SliceArch::Arm64).is_ok());
         turn_verdict(&turn_out(0, settled, "x86_64\n"), SliceArch::Arm64)
             .expect_err("another slice's answer");
-        // The signed arm64 drive wants the GPU: no `--cpu`, and after the turn one
-        // pixel command starts the renderer and `metrics` must name it the GPU.
         let arm64_instance = |command: &mut aterm_uds::spawnfd::Command| {
             let args: Vec<String> = command
                 .get_args()
@@ -2668,8 +2338,6 @@ mod tests {
                 "metrics"
             ]
         );
-        // Negative controls: the CPU fallback drew the frame; metrics named no backend;
-        // the capture failed (no frame, no renderer to judge).
         let (driven, _) = gpu_drive("arm64-cpu", 0, "backend=cpu frames=3\n");
         driven.unwrap_err();
         let (driven, _) = gpu_drive("arm64-none", 0, "frames=3\n");
@@ -2678,7 +2346,6 @@ mod tests {
         driven.unwrap_err();
         assert_eq!(verbs.len(), 2, "no metrics read without a frame: {verbs:?}");
 
-        // An instance that exits before its socket appears is refused, naming that.
         let dir = scratch_for("exit");
         slice_drives_a_session(
             bin,
@@ -2691,7 +2358,6 @@ mod tests {
         )
         .unwrap_err();
 
-        // One that stays up but never opens it is refused at the bound.
         let dir = scratch_for("silent");
         slice_drives_a_session(
             bin,
@@ -2860,15 +2526,6 @@ mod tests {
     }
 
     /// THE CUTTER NEVER COMPILES A DEVELOPMENT SEAM. Every
-    /// `aterm_types::dev_seam!` read — `ATPKG_REGISTRY`, `ATERM_UPDATE_ROOT`, the
-    /// handoff deadlines, the `ATERM_DEBUG_*` seams — and every development setting
-    /// (`[update]` owner/repo/require_team_id, `[packages]` prefix/account/repo links)
-    /// compiles only under `cfg(any(debug_assertions, feature = "dev-seams"))`. A
-    /// release build has no `debug_assertions`, so the one way a shipped binary could
-    /// carry a seam is the feature — and this pins two ways it could arrive: the argv
-    /// (no `--features`/`-F`/`--all-features`, nothing naming the feature) and the
-    /// manifests (no crate enables it by default or through a dependency — only the
-    /// `dev-seams` feature lists forward it).
     #[test]
     fn the_release_build_enables_no_development_seam() {
         let config = std::path::Path::new("/private/take/.cargo/config.toml");
@@ -2897,9 +2554,6 @@ mod tests {
                 "{target:?}: the cutter builds the `release` profile the pins below read: {args:?}"
             );
         }
-        // The build's whole environment is its command's, and that is release_env's
-        // (the command starts empty): nothing in it steers what compiles, on either
-        // slice. The plan's index hint reaches both slices' compiles, and nothing else does.
         for (rustup_home, index_hint) in [
             (None, None),
             (None, Some("8..72")),
@@ -3013,8 +2667,6 @@ mod tests {
                     }
                 }
             }
-            // Every dependency table, however it is spelled: a `features = [..]`
-            // that names the seam compiles it into whatever depends on it.
             let mut tables: Vec<&aterm_toml::Table> = Vec::new();
             for key in ["dependencies", "build-dependencies", "workspace"] {
                 if let Some(t) = doc.get(key).and_then(|t| t.as_table()) {
@@ -3046,13 +2698,6 @@ mod tests {
         }
         assert!(forwarders > 0, "no crate declares the seam feature");
 
-        // DEBUG ASSERTIONS TURN THE SEAMS ON TOO: `dev_seam!` compiles
-        // under `cfg(any(debug_assertions, feature = "dev-seams"))`, so a
-        // `debug-assertions = true` in the release profile — added for overflow checks,
-        // say — or a `-C debug-assertions` / `--cfg feature="dev-seams"` in the config the
-        // cutter passes (`--config <take>/.cargo/config.toml`) would make every shipped
-        // binary honour ATPKG_REGISTRY, ATERM_UPDATE_ROOT and the `[packages]`/`[update]`
-        // development settings, with every pin above still green.
         let workspace: aterm_toml::Table =
             aterm_toml::from_str(&std::fs::read_to_string(root.join("Cargo.toml")).unwrap())
                 .unwrap();
@@ -3070,9 +2715,6 @@ mod tests {
     }
 
     /// No table under `table` turns debug assertions (and so the development seams) on:
-    /// no `debug-assertions = true` at any depth (a profile, a `package.*` override, a
-    /// `build-override`), and no string (a rustflags entry) naming `debug-assertions`,
-    /// `debug_assertions` or `dev-seams`.
     fn assert_no_debug_assertions(shown: &str, table: &aterm_toml::Table) {
         fn walk(shown: &str, path: &str, value: &aterm_toml::Value) {
             match value {
@@ -3107,8 +2749,6 @@ mod tests {
     }
 
     /// Everything a verified take built leaves the clone's shared stage for `dist/`:
-    /// the stripped binary the bundle copies, too, so a later take of the clone (which
-    /// recreates the stage) cannot pull it out from under the cut.
     #[test]
     fn a_verified_take_publishes_its_binary_and_symbols_out_of_the_stage() {
         let scratch = PrivateSliceDir::create().unwrap();
@@ -3234,8 +2874,6 @@ mod tests {
     }
 
     /// Minimal structurally valid arm64 thin Mach-O.  `declared_size` is kept
-    /// separate from the data length so negative tests can exercise exact-size
-    /// and bounds checks independently.
     fn thin_macho(sections: &[(&[u8], u64, &[u8])]) -> Vec<u8> {
         let section_count = u32::try_from(sections.len()).unwrap();
         let command_size = SEGMENT_COMMAND_64_LEN + SECTION_64_LEN * u64::from(section_count);
@@ -3316,8 +2954,6 @@ mod tests {
         let report = "aterm diagnostics\nversion:   0.2.0 (abc123, built now)\nrenderer: gpu\n";
         assert!(validate_app_version_reports("0.2.0", &[("universal", report)]).is_ok());
         assert!(validate_app_version_reports("0.3.0", &[("universal", report)]).is_err());
-        // The dev-build spelling of the same workspace version is NOT the
-        // release version: only DEV == 0 ships.
         assert!(validate_app_version_reports("0.2.1", &[("universal", report)]).is_err());
         assert!(validate_app_version_reports("0.2.0", &[("universal", "")]).is_err());
         let duplicate = format!("{report}version:   0.2.0 (abc123, built now)\n");
@@ -3330,7 +2966,6 @@ mod tests {
         assert!(
             validate_named_cli_app_version("aterm-ctl", "0.2.0", b"aterm-gui 0.2.0\n").is_err()
         );
-        // The S12 which-copy lines may follow the identity line — and only those.
         assert!(
             validate_cli_app_version(
                 "0.2.0",
@@ -3341,8 +2976,6 @@ mod tests {
             .is_ok()
         );
         assert!(validate_cli_app_version("0.2.0", b"aterm 0.2.0\nrunning: /x/aterm\n").is_ok());
-        // The origin line may follow the identity line, exactly as shared, then
-        // the which-copy lines; a paraphrase of it is still "anything else".
         let origin = aterm_types::identity::ORIGIN_LINE;
         assert!(
             validate_cli_app_version(

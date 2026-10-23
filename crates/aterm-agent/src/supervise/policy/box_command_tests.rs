@@ -1,12 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! [`barred_rows`], [`header_rows`], [`drawn_as`] and [`pending_bash`] over
-//! what Claude Code 2.1.307 and 2.1.308 really drew and wrote (MEASURED
-//! 2026-10-22 in the real-Claude lab,
-//! `docs/measured/breaker-transcript-and-zsh-2026-10-22.md`): each box
-//! capture `claude-2.1.30[78]-box-bash-*` beside the call row the lab's stub
-//! made it for, and the transcript as it stood while a box was up.
+//! [`barred_rows`], [`header_rows`], [`drawn_as`] and [`pending_bash`] over what Claude Code 2.1.307 and 2.1.308 really drew and wrote (MEASURED 2026-10-22 in the real-Claude lab, `docs/measured/breaker-transcript-and-zsh-2026-10-22.md`): each box capture `claude-2.1.30[78]-box-bash-*` beside the call row the lab's stub made it for, and the transcript as it stood while a box was up.
 
 use aterm_json::Value;
 use aterm_phase::prompt::fixtures as phase_fixtures;
@@ -14,10 +9,8 @@ use aterm_phase::prompt::fixtures as phase_fixtures;
 use super::*;
 
 /// The call row of every box capture below (`Probe <name>`), and the first
-/// `Echo 65 empty substitutions` call: `echo` and 65 `$(true)` as one line.
 const CALLS: &str = include_str!("fixtures/claude-2.1.307-transcript-box-probe-calls.jsonl");
 /// The transcript from the prompt to the moment the newline twin's box stood:
-/// its call is the last row, with no result.
 const TWIN_PENDING: &str =
     include_str!("fixtures/claude-2.1.307-transcript-too-many-twin-pending.jsonl");
 /// The rows written after that box was refused (Esc): its result first.
@@ -26,8 +19,7 @@ const TWIN_REJECTED: &str =
 /// The twin's call id in [`TWIN_PENDING`].
 const TWIN_ID: &str = "toolu_lab16914d0fee39f3eb";
 
-/// The newline twin's own box: the measured too-many box's rows, under the
-/// twin's call's row.
+/// The newline twin's own box: the measured too-many box's rows, under the twin's call's row.
 pub(crate) const TWIN_SCREEN: &str =
     include_str!("fixtures/claude-2.1.307-box-bash-too-many-newline-twin.txt");
 
@@ -103,24 +95,6 @@ fn boxed(text: &str) -> (PromptV2, Vec<String>) {
 }
 
 /// EVERY MEASURED CAPTURE DRAWS AS ITS OWN CALL'S COMMAND: nine boxes at 144
-/// and 100 columns (a word broken across rows, spaces at a wrap, newlines with
-/// leading and trailing blanks and an empty line, a word exactly as wide as
-/// the row and one wider, a row ending one short of the edge, a line opening
-/// with a blank, a tab), each matched by the command the stub made it for,
-/// in its box and in its call's row above it. The measured too-many box
-/// (`echo` and 65 `$(true)` as one line, captured 2026-10-21) and its
-/// newline twin (the same text with a newline at each wrap, captured
-/// 2026-10-22) draw the SAME box rows, which is why the box alone proves
-/// neither; their calls' rows differ (the twin's breaks at its newline, the
-/// one-line call's two cells sooner), so each now draws as its own capture
-/// alone.
-///
-/// NEGATIVE CONTROLS: every command against every other capture fails (the
-/// 100-column capture's command is the one-line call's, so that pair is the
-/// same text); the measured box against its command drawn a cell wider or
-/// narrower; a command with an ideographic space, an ambiguous-width
-/// letter, an emoji, a zero-width space, a `\r` or an escape is refused by
-/// name.
 #[test]
 fn every_measured_capture_draws_as_its_own_calls_command() {
     let space = command_of("Echo 65 empty substitutions");
@@ -166,7 +140,6 @@ fn every_measured_capture_draws_as_its_own_calls_command() {
             drawn_as(p, rows, command)
         );
     }
-    // NEGATIVE CONTROLS
     let row_139 = command_of("Probe wrap-row-139");
     for (command, text, width) in [
         (&space, phase_fixtures::BOX_RM_TOO_MANY_NO_RM_2_1_307, 139),
@@ -209,12 +182,6 @@ fn every_measured_capture_draws_as_its_own_calls_command() {
 }
 
 /// THE MODEL'S OWN STEPS, each from a capture above: a row a wrap starts
-/// loses one leading space and keeps the rest (`   $(true)` after a full row
-/// draws two blanks); a word exactly as wide as the row after a full row
-/// leaves an empty row; a word one wider is broken one short of the edge on
-/// the row after the full one; a line's own leading blank is kept.
-///
-/// NEGATIVE CONTROLS: each step undone draws the capture otherwise.
 #[test]
 fn the_wrap_drops_one_blank_at_a_wrap_and_breaks_a_wide_word() {
     let s = " $(true)";
@@ -233,24 +200,12 @@ fn the_wrap_drops_one_blank_at_a_wrap_and_breaks_a_wide_word() {
     assert_eq!(edge, vec![" echo a".to_string()]);
     let lines = barred_rows("echo a\n\n   echo b  ", 140).expect("drawn");
     assert_eq!(lines, vec!["echo a", "", "   echo b  "]);
-    // NEGATIVE CONTROLS
     assert_ne!(spaces[1], "   $(true)");
     assert_ne!(word.len(), 2);
     assert_ne!(wider[1].len(), 140);
 }
 
 /// THE CALL WAITING ON THE BOX IS THE TRANSCRIPT'S ONE PENDING BASH CALL: the
-/// transcript as it stood while the twin's box was up names the twin's call
-/// and its exact command (passing over the `api-request-blob` row, which
-/// echoes the previous call's result, and the `api-request` row).
-///
-/// NEGATIVE CONTROLS: the same transcript with the rows written after the box
-/// was refused (its result) names none; a call already spent names none; a
-/// second call waiting beside it names none (`2 calls`); a subagent's call
-/// beside it is passed over; a call of another tool, alone, is no Bash call;
-/// a result in an `api-request-blob` row answers nothing; a person's prompt
-/// after it (a row whose parent is the call's) ends it; a file with nothing
-/// waiting names none.
 #[test]
 fn the_call_waiting_is_the_transcripts_one_pending_bash_call() {
     let twin = command_of("Probe too-many-newline-twin");
@@ -261,7 +216,6 @@ fn the_call_waiting_is_the_transcripts_one_pending_bash_call() {
             command: twin.clone()
         })
     );
-    // NEGATIVE CONTROLS
     let answered = format!("{TWIN_PENDING}{TWIN_REJECTED}");
     assert!(pending_bash(&answered, &[]).is_err_and(|e| e.contains("no call waiting")));
     assert!(
@@ -299,9 +253,6 @@ fn the_call_waiting_is_the_transcripts_one_pending_bash_call() {
         pending_bash(&format!("{TWIN_PENDING}{echoed}\n"), &[]).map(|c| c.id),
         Ok(TWIN_ID.to_string())
     );
-    // The measured prompt row asked again after the call: its `uuid` fresh,
-    // its parent the call's row (a row that is the call's own ancestor is
-    // its own turn's prompt, never a later one).
     let prompt = TWIN_PENDING
         .lines()
         .find(|l| l.contains("\"type\":\"user\""))
@@ -328,7 +279,6 @@ fn the_call_waiting_is_the_transcripts_one_pending_bash_call() {
 }
 
 /// The measured too-many box (manual mode) with the row reading `from` (its
-/// trailing blanks aside) replaced by `to`, and its rows.
 fn measured_with(from: &str, to: &str) -> (PromptV2, Vec<String>) {
     let mut rows = phase_fixtures::screen(phase_fixtures::BOX_RM_TOO_MANY_NO_RM_2_1_307);
     let row = rows
@@ -341,13 +291,6 @@ fn measured_with(from: &str, to: &str) -> (PromptV2, Vec<String>) {
 }
 
 /// THE ROW COUNT IS PART OF THE JOIN: a command that draws only the box's
-/// first rows, or the box's rows and one more, is not what the box draws,
-/// though every row it draws matches one of the box's. The newline twin
-/// draws its own capture's four rows (control); the twin less its last line
-/// draws the first three exactly, and the twin with one more line draws the
-/// four and a fifth.
-///
-/// NEGATIVE CONTROLS: both are refused, naming the counts.
 #[test]
 fn a_command_drawing_fewer_or_more_rows_than_the_box_is_not_the_box() {
     let (p, rows) = boxed(SCREENS[0].1);
@@ -368,7 +311,6 @@ fn a_command_drawing_fewer_or_more_rows_than_the_box_is_not_the_box() {
         .map(|r| format!(" \u{2502} {r}").trim_end().to_string())
         .collect();
     assert_eq!(drawn, shown, "a strict prefix of the box's rows");
-    // NEGATIVE CONTROLS
     assert_eq!(
         drawn_as(&p, &rows, first_three),
         Err("the command draws 3 rows 140 cells wide, and the box shows 4".to_string())
@@ -381,15 +323,6 @@ fn a_command_drawing_fewer_or_more_rows_than_the_box_is_not_the_box() {
 }
 
 /// A CALL ANSWERED BY ITS RESULT WAITS NO MORE, with no prompt row after it:
-/// Claude Code 2.1.300's transcript while its Edit box stood (the real-Claude
-/// lab, 2026-10-15) holds a Read call, the Read's result in a user row of
-/// results alone, then the Edit call, so the one call waiting is the Edit
-/// (no Bash call). And 2.1.307's newline twin answered by its result row
-/// alone (the measured rejection's first row), then a second Bash call: the
-/// second is the one waiting.
-///
-/// NEGATIVE CONTROLS: the same files with the result rows taken out hold two
-/// calls waiting.
 #[test]
 fn a_result_row_takes_its_call_away_and_leaves_the_next() {
     const EDIT_PENDING: &str =
@@ -410,7 +343,6 @@ fn a_result_row_takes_its_call_away_and_leaves_the_next() {
         pending_bash(&answered, &[]).map(|c| c.id),
         Ok("toolu_labsecondcall00000".to_string())
     );
-    // NEGATIVE CONTROLS
     let unanswered: String = EDIT_PENDING
         .lines()
         .filter(|l| !l.contains("\"tool_result\"") || l.contains("api-request"))
@@ -428,20 +360,12 @@ fn a_result_row_takes_its_call_away_and_leaves_the_next() {
 }
 
 /// THE BOX A TRANSCRIPT'S COMMAND IS MATCHED TO ([`may_prove`]): the measured
-/// too-many box, read whole, from the main agent, its footer its own keys.
-///
-/// NEGATIVE CONTROLS, each refused by [`may_prove`] and so by [`drawn_as`]
-/// though its rows still draw as the command: the footer ending in the
-/// background agents' note (a subagent's box), the footer cut short, the
-/// breaker's note another kind's (`some nested commands …`), the box's head
-/// off the screen (its title row and the rows above it gone).
 #[test]
 fn only_the_main_agents_whole_too_many_box_is_matched_to_a_command() {
     let space = command_of("Echo 65 empty substitutions");
     let (p, rows) = boxed(phase_fixtures::BOX_RM_TOO_MANY_NO_RM_2_1_307);
     assert!(may_prove(&p));
     assert_eq!(drawn_as(&p, &rows, &space), Ok(()));
-    // NEGATIVE CONTROLS
     let footer = " Esc to cancel · Tab to amend";
     let note = " \u{2502} Dangerous rm operation not ruled out — too many command substitutions to \
                 analyze (65)";
@@ -483,18 +407,10 @@ fn only_the_main_agents_whole_too_many_box_is_matched_to_a_command() {
 }
 
 /// THE TRANSCRIPT IS READ ONLY FOR CLAUDE CODE'S TOO-MANY BOX THAT THE SCREEN
-/// LEAVES TO A PERSON ([`wanted`]): the measured box, drawn by Claude Code,
-/// escalated on its screen readings.
-///
-/// NEGATIVE CONTROLS: the same box read for any other program; the box the
-/// screen's readings decide (the escalation asked, and not); a box
-/// [`may_prove`] refuses (another breaker's note), with the escalation never
-/// asked.
 #[test]
 fn the_transcript_is_read_only_for_claudes_too_many_box_the_screen_escalates() {
     let (p, _) = boxed(phase_fixtures::BOX_RM_TOO_MANY_NO_RM_2_1_307);
     assert!(wanted(Program::Claude, &p, || true));
-    // NEGATIVE CONTROLS
     for program in [
         Program::Codex,
         Program::Agy,
@@ -520,25 +436,12 @@ fn the_transcript_is_read_only_for_claudes_too_many_box_the_screen_escalates() {
 }
 
 /// A conversation's first turn as 2.1.307 wrote it in a bypass session (the
-/// real-Claude lab `b2l1`, 2026-10-22): the assistant row of the too-many
-/// box's call (`echo` and 65 `$(true)`) BEFORE the prompt row `toolstart`
-/// and the attachment rows its `parentUuid` chain runs up through.
 const FIRST_TURN: &str =
     include_str!("fixtures/claude-2.1.307-transcript-too-many-first-turn-pending.jsonl");
 /// The call's id in [`FIRST_TURN`].
 const FIRST_TURN_ID: &str = "toolu_labca5ab29a1491b609";
 
 /// THE CONVERSATION'S ORDER, NOT THE FILE'S (MEASURED 2026-10-22): in
-/// [`FIRST_TURN`] the prompt row follows the call's row in the file, but it
-/// is the call's own ancestor, so the call is still the one waiting, with
-/// the measured box's command. And a result answers its call wherever it is
-/// written: a result row (constructed) for the call written BEFORE the call's
-/// row leaves nothing waiting.
-///
-/// NEGATIVE CONTROLS: a later prompt (a constructed row whose parent is the
-/// call's row) ends the call; the same file with the call row's chain cut
-/// (its `parentUuid` a uuid the tail does not hold) cannot show the prompt
-/// is its own, and the prompt written after it ends it.
 #[test]
 fn a_call_written_before_its_own_prompt_row_is_still_waiting() {
     let space = command_of("Echo 65 empty substitutions");
@@ -576,7 +479,6 @@ fn a_call_written_before_its_own_prompt_row_is_still_waiting() {
         "{:?}",
         pending_bash(&result_first, &[])
     );
-    // NEGATIVE CONTROLS
     let later = format!(
         r#"{{"parentUuid":"{call_uuid}","isSidechain":false,"type":"user","message":{{"role":"user","content":"and then"}},"uuid":"00000000-0000-4000-8000-00000000p001"}}"#
     );
@@ -605,12 +507,7 @@ fn a_call_written_before_its_own_prompt_row_is_still_waiting() {
 pub(crate) const CALLS_308: &str =
     include_str!("fixtures/claude-2.1.308-transcript-box-probe-calls.jsonl");
 
-/// Each 2.1.308 capture's name and screen: `Probe <name>`'s box, under its
-/// call's row (MEASURED 2026-10-22, the measured note's §H and §W): the
-/// call's row's width, cut and trim (`h-…`), tabs, CJK, kana, Hangul and
-/// fullwidth forms, and both ends of every block [`WIDE`] holds, in the box
-/// (`w-ranges`) and in the call's row (`w-ranges` for the two CJK blocks,
-/// `hr-…` for the other five).
+/// Each 2.1.308 capture's name and screen: `Probe <name>`'s box, under its call's row (MEASURED 2026-10-22, the measured note's §H and §W): the call's row's width, cut and trim (`h-…`), tabs, CJK, kana, Hangul and fullwidth forms, and both ends of every block [`WIDE`] holds, in the box (`w-ranges`) and in the call's row (`w-ranges` for the two CJK blocks, `hr-…` for the other five).
 pub(crate) const SCREENS_308: &[(&str, &str)] = &[
     (
         "h-one-line",
@@ -735,9 +632,6 @@ pub(crate) const SCREENS_308: &[(&str, &str)] = &[
 ];
 
 /// The pairs of 2.1.308 captures whose commands draw both rows alike (the
-/// residual the measured note keeps): a newline where the other has a space
-/// at a break both rows share (`h-wrap-same`), and a word one splits with a
-/// blank where it fills a row and the other does not (`h-full-split`).
 const ALIKE_308: &[(&str, &str)] = &[
     ("h-wrap-same", "h-wrap-same-twin"),
     ("h-full-split", "h-full-join"),
@@ -752,10 +646,7 @@ fn capture_308(name: &str) -> &'static str {
         .unwrap_or_else(|| panic!("the capture {name}"))
 }
 
-/// A SCREEN FOR A PAIR NO CAPTURE HOLDS: the `h-one-line` capture (144
-/// columns) with its call's row and its box's rows redrawn for `command` by
-/// this model ([`header_rows`] at 138 cells, led by `⏺ Bash` and six blanks;
-/// [`barred_rows`] at 140, led by ` │ `), and its box.
+/// A SCREEN FOR A PAIR NO CAPTURE HOLDS: the `h-one-line` capture (144 columns) with its call's row and its box's rows redrawn for `command` by this model ([`header_rows`] at 138 cells, led by `⏺ Bash` and six blanks; [`barred_rows`] at 140, led by ` │ `), and its box.
 pub(crate) fn drawn_screen(command: &str) -> (PromptV2, Vec<String>) {
     let rows = phase_fixtures::screen(capture_308("h-one-line"));
     let lead = rows
@@ -794,10 +685,7 @@ pub(crate) fn drawn_screen(command: &str) -> (PromptV2, Vec<String>) {
     (p, out)
 }
 
-/// The 2.1.308 captures whose commands hold a character this model refuses:
-/// an ideographic space inside (`ＡＢＣ　ｘｙｚ`) and at both ends, and a
-/// zero-width space and a soft hyphen (the box draws each as `U+FFFD`, the
-/// call's row draws neither).
+/// The 2.1.308 captures whose commands hold a character this model refuses: an ideographic space inside (`ＡＢＣ　ｘｙｚ`) and at both ends, and a zero-width space and a soft hyphen (the box draws each as `U+FFFD`, the call's row draws neither).
 pub(crate) const REFUSED_308: &[(&str, &str, &str)] = &[
     (
         "w-fullwidth",
@@ -817,8 +705,6 @@ pub(crate) const REFUSED_308: &[(&str, &str, &str)] = &[
 ];
 
 /// The Bash row of a command of two lines and under 160 units (`  ` and 65
-/// empty backtick pairs, then `echo x`), shown as it is: its blanks kept,
-/// no `…`. Its box is the parser's (`Parse error`), not the too-many box.
 const SHORT_BACKTICKS: &str =
     include_str!("fixtures/claude-2.1.308-box-bash-w-short-backticks.txt");
 
@@ -833,20 +719,6 @@ fn box_rows(rows: &[String]) -> Vec<String> {
 }
 
 /// EVERY 2.1.308 CAPTURE DRAWS AS ITS OWN CALL'S COMMAND, IN THE BOX AND IN
-/// THE CALL'S ROW (MEASURED 2026-10-22, 144 columns): twelve probes of the
-/// call's row (its cut to two lines and 160 units, its trim, its two cells
-/// less than the box, a newline twin, a word split or not where it fills a
-/// row), eight of tabs (after a word, at a wrap, late in a long line,
-/// leading, in runs, on a second line, on the call's row's second line,
-/// after a wide character) and eleven of East Asian wide characters (a run
-/// broken one cell short of a row's end, at an odd column, among words, at
-/// a row's edge, cut on the call's row, kana and Hangul, every block's both
-/// ends in the box and in the call's row).
-///
-/// NEGATIVE CONTROLS: every command against every other capture fails but
-/// for the two measured pairs whose rows draw alike ([`ALIKE_308`], the
-/// residual); each refused capture is refused naming its character, and its
-/// box draws the zero-width space and soft hyphen as `U+FFFD`.
 #[test]
 fn every_2_1_308_capture_draws_as_its_own_calls_command_in_the_box_and_the_calls_row() {
     for (name, text) in SCREENS_308 {
@@ -865,7 +737,6 @@ fn every_2_1_308_capture_draws_as_its_own_calls_command_in_the_box_and_the_calls
             );
         }
     }
-    // NEGATIVE CONTROLS
     for (name, text, named) in REFUSED_308 {
         let (p, rows) = boxed(text);
         let command = command_in(CALLS_308, &format!("Probe {name}"));
@@ -883,19 +754,6 @@ fn every_2_1_308_capture_draws_as_its_own_calls_command_in_the_box_and_the_calls
 }
 
 /// THE CALL'S ROW TELLS A NEWLINE FROM A WRAP THE BOX DRAWS ALIKE, where
-/// its own wrap falls elsewhere (MEASURED 2026-10-22, 2.1.308): `echo` and
-/// 65 `$(true)` as one line, and the same text with a newline at the box's
-/// first wrap, draw the same box rows; the call's row, two cells narrower,
-/// breaks the one-line text before its 17th `$(true)` and the twin at its
-/// newline, so each command draws as its own capture alone. A row whose dot
-/// is blinked off (`  Bash(`) is the same row.
-///
-/// NEGATIVE CONTROLS: where the newline falls on the call's row's own break
-/// (`h-wrap-same` and its twin) both rows draw alike and both commands draw
-/// as both captures (the residual the measured note keeps); with the
-/// `Waiting…` row gone, the blank row under it gone, the call's row drawn
-/// under another tool's name, or its first row cut off the screen, no
-/// command draws as the box.
 #[test]
 fn the_calls_row_tells_a_newline_from_a_wrap_the_box_draws_alike() {
     let screen = |name: &str| {
@@ -930,7 +788,6 @@ fn the_calls_row_tells_a_newline_from_a_wrap_the_box_draws_alike() {
     blinked[lead] = blinked[lead].replacen("\u{23fa} Bash(", "  Bash(", 1);
     let p = aterm_phase::prompt::parse_prompt_v2(&blinked).expect("the box");
     assert_eq!(drawn_as(&p, &blinked, &one), Ok(()));
-    // NEGATIVE CONTROLS
     let (same_p, same_rows) = screen("h-wrap-same");
     let (same_twin_p, same_twin_rows) = screen("h-wrap-same-twin");
     let (same, same_twin) = (probe("h-wrap-same"), probe("h-wrap-same-twin"));
@@ -970,16 +827,6 @@ fn the_calls_row_tells_a_newline_from_a_wrap_the_box_draws_alike() {
 }
 
 /// THE CALL'S ROW'S TEXT (MEASURED 2026-10-22, 2.1.308, and Claude Code's
-/// own `Jhi`): a command of more than two lines shows its first two and `…`
-/// (`h-newlines`, and three short lines); one over 160 units its first 160, trimmed, and `…`
-/// (`h-long-word`, `h-edge-spaces`); a command of two lines and under 160
-/// units shows as it is, its leading blanks kept and no `…` (the
-/// short-backticks capture). A command whose lines are all comments may
-/// show its comment in its place: refused.
-///
-/// NEGATIVE CONTROLS: the short command drawn as if cut (trimmed, with `…`)
-/// is not the captured row; a comment line followed by a command is drawn
-/// (the comment branch needs every other line a comment or blank).
 #[test]
 fn the_calls_row_shows_two_lines_and_160_units_trimmed() {
     let probe = |name: &str| command_in(CALLS_308, &format!("Probe {name}"));
@@ -987,8 +834,6 @@ fn the_calls_row_shows_two_lines_and_160_units_trimmed() {
         header_rows(&probe("h-newlines"), 138).expect("drawn"),
         ["(echo a", "echo b\u{2026})"]
     );
-    // Three short lines, under 160 units (`Jhi`'s `c.length > E`, read in
-    // the bytes; no too-many box is that short): two shown.
     assert_eq!(
         header_rows("echo a\necho b\necho c", 138).expect("drawn"),
         ["(echo a", "echo b\u{2026})"]
@@ -1012,7 +857,6 @@ fn the_calls_row_shows_two_lines_and_160_units_trimmed() {
         [format!("(  {}", "``".repeat(65)), "echo x)".to_string()]
     );
     assert!(header_rows("# just a note\n\n# and more", 138).is_err_and(|e| e.contains("comment")));
-    // NEGATIVE CONTROLS
     let cut = format!("({}\u{2026})", short.trim_start());
     let cut_rows = [cut.split('\n').next().unwrap_or_default().to_string()];
     assert_ne!(header_rows(&short, 138).expect("drawn")[..1], cut_rows[..]);
@@ -1023,15 +867,6 @@ fn the_calls_row_shows_two_lines_and_160_units_trimmed() {
 }
 
 /// TABS GO TO STOPS OF EIGHT CELLS AND THE BLOCKS [`WIDE`] HOLDS TAKE TWO
-/// (MEASURED 2026-10-22, 2.1.308, the captures above): a tab after `echo`
-/// draws four blanks, after `echo 日` one (日 is two cells), after `日日`
-/// four, two tabs from a stop eight and eight; a tab on a later line counts
-/// from that line; a wide character with one cell left goes to the next
-/// row, so `echo ` and 100 `日` fill 139 cells of 140.
-///
-/// NEGATIVE CONTROLS: counted in characters, `echo 日` would put the tab's
-/// stop two cells on (two blanks); the 68th `日` does not fit on the first
-/// row.
 #[test]
 fn tabs_go_to_stops_of_eight_cells_and_wide_characters_take_two() {
     assert_eq!(expand_tabs("echo\tx"), "echo    x");
@@ -1046,22 +881,11 @@ fn tabs_go_to_stops_of_eight_cells_and_wide_characters_take_two() {
     assert_eq!(rows[0], format!("echo {}", "\u{65e5}".repeat(67)));
     assert_eq!(width(&rows[0]), 139);
     assert_eq!(rows[1], "\u{65e5}".repeat(33));
-    // NEGATIVE CONTROLS
     assert_ne!(expand_tabs("echo \u{65e5}\tx"), "echo \u{65e5}  x");
     assert_eq!(width(&format!("echo {}", "\u{65e5}".repeat(68))), 141);
 }
 
 /// THE CALL'S ROW IS COMPARED ROW FOR ROW, EACH WITH ITS LEAD, UNDER ITS
-/// `Waiting…` AND A BLANK ROW ([`called_as`]): `echo a` over `echo` and 65
-/// `$(true)`, and the same with a newline after the second line's 17th
-/// `$(true)` (the box's own wrap there), draw the same box rows and a call's
-/// row of three rows each whose first two are alike; only the third tells
-/// them apart. On the first's screen (redrawn by this model from
-/// `h-one-line`) the first is taken and the second refused at row 3.
-///
-/// NEGATIVE CONTROLS, on the measured `h-one-line` screen: the blank row
-/// under `Waiting…` drawn on (`Waiting…` kept in its place), and the call's
-/// second row led by eight blanks, not six, are each refused.
 #[test]
 fn the_calls_row_is_compared_row_for_row_and_lead_for_lead() {
     let second = format!("echo{}", " $(true)".repeat(65));
@@ -1086,7 +910,6 @@ fn the_calls_row_is_compared_row_for_row_and_lead_for_lead() {
         drawn_as(&p, &rows, &b),
         Err("the call's row 3 above the box draws otherwise than the command's".to_string())
     );
-    // NEGATIVE CONTROLS
     let one = command_in(CALLS_308, "Probe h-one-line");
     let measured = phase_fixtures::screen(capture_308("h-one-line"));
     let waiting = measured
@@ -1122,15 +945,6 @@ fn the_calls_row_is_compared_row_for_row_and_lead_for_lead() {
 }
 
 /// THE BLOCKS [`WIDE`] HOLDS END WHERE THEY WERE MEASURED: each block's first
-/// and last character take two cells, and the code points just before its
-/// first and just after its last are refused (none is printable ASCII or in
-/// another block); so are the characters [`WIDE`]'s docs leave out by name:
-/// the combining sound marks U+3099 and U+309A, the CJK compatibility
-/// ideographs U+F900 and U+FAFF (which `normalize()` rewrites), U+D7B0 of
-/// Hangul Jamo Extended-B (narrow) and the ideographic space U+3000.
-///
-/// NEGATIVE CONTROLS: the blocks' own ends are drawn, in the box and in the
-/// call's row.
 #[test]
 fn the_wide_blocks_end_where_they_were_measured() {
     let refused = |c: char| {
@@ -1150,7 +964,6 @@ fn the_wide_blocks_end_where_they_were_measured() {
             assert!(!c.is_ascii(), "{c:?}");
             refused(c);
         }
-        // NEGATIVE CONTROLS
         for end in [*first, *last] {
             let command = format!("echo {end}x");
             assert!(barred_rows(&command, 140).is_ok(), "{end:?}");
@@ -1165,27 +978,6 @@ fn the_wide_blocks_end_where_they_were_measured() {
 }
 
 /// A READING OF THE ROWS PROVES NOTHING WHERE ITS WORDS TURN ON A BLANK THE
-/// SCREEN CANNOT SHOW ([`blanks_read_as_drawn`]; MEASURED 2026-10-22 under
-/// `/bin/bash` 3.2, the measured note's §B). Each command below draws as its
-/// box ([`drawn_as`], redrawn from `h-one-line`), and so does its twin, the
-/// text the screen shows typed as a command (the two differ past the call's
-/// row's two lines); the classifier reads the twin a read and the command
-/// not, since bash runs the command's `tee x` where the twin holds it as
-/// here-document text or as a word: `<<-` over a tab-led `EOF`, and over
-/// the blanks the tab draws as; a backslash before a blank that ends a line,
-/// and one ending it; a backslash before a tab and `#`, and one before the
-/// blanks the tab draws as. The screen's newline reading of each box is
-/// refused, the form named. Where the screen's reading is the twin (both
-/// backslashes) it would otherwise be proven a read; the rows of the
-/// here-document lose their leading blanks, so there the screen's own
-/// reading ends the body and runs `tee x`.
-///
-/// NEGATIVE CONTROLS: blanks and a tab that only separate words, a backslash
-/// before one blank and a word (`My\ File`, read alike whether the blank is
-/// a tab drawn as one), a here-string and the measured lines of `echo` are
-/// read as drawn; a backslash at the text's end, one before a tab, one
-/// before a blank that ends a line, and an arithmetic `<<` are refused by
-/// name (stricter than the shell there).
 #[test]
 fn a_reading_whose_words_turn_on_a_blank_the_screen_cannot_show_proves_nothing() {
     use crate::supervise::classify::classify_command;
@@ -1233,7 +1025,6 @@ fn a_reading_whose_words_turn_on_a_blank_the_screen_cannot_show_proves_nothing()
             "{what}: {got:?}"
         );
     }
-    // NEGATIVE CONTROLS
     for plain in [
         format!("{pre}\necho ab        x"),
         format!("{pre}\necho\tab x"),
@@ -1261,16 +1052,10 @@ fn a_reading_whose_words_turn_on_a_blank_the_screen_cannot_show_proves_nothing()
     }
 }
 
-/// THE STALE CALL (MEASURED 2026-10-22, 2.1.308, the measured note's
-/// breaker-4 section): the transcript as it stood while the box of
-/// [`STALE_SCREEN`] (call N, `Probe stale`, h-wrap-same's newline twin) was
-/// up. The file refused writes while S's box stood (S: `Probe stale` too,
-/// h-wrap-same's one-line command), S was answered Yes and ran, and the
-/// writes of S's result and N's call were lost: S is the last row, waiting.
+/// THE STALE CALL (MEASURED 2026-10-22, 2.1.308, the measured note's breaker-4 section): the transcript as it stood while the box of [`STALE_SCREEN`] (call N, `Probe stale`, h-wrap-same's newline twin) was up.
 pub(crate) const STALE_PENDING: &str =
     include_str!("fixtures/claude-2.1.308-transcript-stale-pending.jsonl");
 /// The rows written after N's box was refused (Esc): N's result (for a call
-/// the file never held), the interruption, the turn's end.
 const STALE_REJECTED: &str =
     include_str!("fixtures/claude-2.1.308-transcript-stale-rejected.jsonl");
 /// N's box, under S's answered row and N's own `Waiting…` row.
@@ -1281,20 +1066,6 @@ pub(crate) const STALE_S_ID: &str = "toolu_labe02bf4f6eb4c1b97";
 const STALE_N_ID: &str = "toolu_lab1f7a88c34ad9d8bf";
 
 /// AN OLDER CALL LEFT WAITING DRAWS AS A NEWER BOX WHOSE OWN CALL THE FILE
-/// NEVER GOT (MEASURED 2026-10-22, 2.1.308, the real-Claude lab `b4o1`):
-/// the reader names S, the one call waiting, for N's box; S's command and
-/// N's both draw as N's box and as the call's row above it (`⏺ Bash(…)`
-/// over `Waiting…`: S's answered row and N's draw alike); S is a read and N
-/// is not (its second line runs `cccccccccc`), and the screen's newline
-/// reading is not a read either. No text on the screen ties the box to one
-/// call: the description is the model's (both say `Probe stale`), the row
-/// above the box is the newest call's, no call id is drawn. So the
-/// transcript's command is one more reading, never the box's alone
-/// (`breaker-read-only@v4`).
-///
-/// NEGATIVE CONTROLS: after Esc the file holds N's result and the
-/// interruption, a user row with no result, which ends S: nothing waits;
-/// S spent on its own box leaves nothing waiting.
 #[test]
 fn an_older_call_left_waiting_draws_as_a_newer_box_whose_call_the_file_never_got() {
     use crate::supervise::classify::classify_command;
@@ -1322,7 +1093,6 @@ fn an_older_call_left_waiting_draws_as_a_newer_box_whose_call_the_file_never_got
         .find(|r| r.contains('\n'))
         .expect("the newline reading");
     assert!(!classify_command(newline).read_only, "{newline:?}");
-    // NEGATIVE CONTROLS
     let after = format!("{STALE_PENDING}{STALE_REJECTED}");
     assert!(after.contains(STALE_N_ID));
     assert!(
@@ -1337,37 +1107,21 @@ fn an_older_call_left_waiting_draws_as_a_newer_box_whose_call_the_file_never_got
 }
 
 /// The transcript at the first sighting of the next box after a kill
-/// (MEASURED 2026-10-22, 2.1.308, lab `b4o1`): the box over `Probe orph213`
-/// stood when its Claude Code was killed, the harness resumed the session,
-/// and the box over `Probe after286` was up; the killed call is the last
-/// call, and nothing the resumed session wrote had reached the file.
 const ORPHAN_AT_NEXT_BOX: &str =
     include_str!("fixtures/claude-2.1.308-transcript-orphan-at-next-box.jsonl");
 /// The resumed session's first row: the killed call's synthetic result,
-/// written 38 ms after [`ORPHAN_AT_NEXT_BOX`] was read.
 const ORPHAN_INTERRUPTED: &str =
     include_str!("fixtures/claude-2.1.308-transcript-orphan-interrupted.jsonl");
 /// The killed call's id.
 const ORPHAN_ID: &str = "toolu_lab4132fb62a965895a";
 
 /// A KILLED SESSION'S CALL IS THE ONE WAITING AT THE RESUMED SESSION'S NEXT
-/// BOX (MEASURED 2026-10-22, 2.1.308): the resumed Claude Code holds the
-/// killed call's synthetic result, the new prompt's rows and the new call in
-/// memory and writes them in one batch after the new box is drawn, so at
-/// that box's first sighting the reader names the killed call, alone. The
-/// stale call needs no fault: a kill and a resume make one. (Its command
-/// differs from the new call's, so it would not draw as the new box; and a
-/// settle's re-read, after the batch lands, finds another call.)
-///
-/// NEGATIVE CONTROL: the synthetic result answers the killed call wherever
-/// it lands: with it, nothing in these rows waits.
 #[test]
 fn a_killed_sessions_call_is_the_one_waiting_at_the_resumed_sessions_next_box() {
     let call = pending_bash(ORPHAN_AT_NEXT_BOX, &[]).expect("the killed call");
     assert_eq!(call.id, ORPHAN_ID);
     assert!(call.command.starts_with("echo $(true) "), "{call:?}");
     assert!(!ORPHAN_AT_NEXT_BOX.contains("toolu_lab754e5f6714a7e7fc"));
-    // NEGATIVE CONTROL
     assert!(ORPHAN_INTERRUPTED.contains(ORPHAN_ID));
     let answered = format!("{ORPHAN_AT_NEXT_BOX}{ORPHAN_INTERRUPTED}");
     assert!(

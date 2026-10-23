@@ -17,6 +17,9 @@
 
 #![forbid(unsafe_code)]
 
+#[cfg(test)]
+aterm_durable::plain_durable_flushes_in_tests!();
+
 pub mod age;
 pub mod b64;
 pub mod bech32;

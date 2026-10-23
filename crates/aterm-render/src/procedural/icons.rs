@@ -7,9 +7,11 @@
 //!
 //! The row's cell keeps its character (the text grid, a screen reader, copy and the
 //! `messages` verb read it); only its glyph's pixels are drawn here, and only on a band
-//! row that asks ([`aterm_core::render::ChromeRaster::icons`]). The harness switch's three
-//! marks (`● ○ ◐`, `BandIcon::switch_mark`) are drawn here too, on the composer's top line,
-//! so its states read as one set whatever face holds which of them.
+//! row that asks ([`aterm_core::render::ChromeRaster::icons`]). The marks the harness glass
+//! prints where a font's would stand out (`● ○ ◐ ◌ ⊘ ◉ ◈ ⌂ ⤓`, `BandIcon::glass_mark`) are
+//! drawn here too, so they read as one set whatever face holds which of them: the ring
+//! family from one outline the size of the primary face's own `●` ([`IconMetrics::disc`]),
+//! and the fact menus' `◈` and `⌂` in that outline's box.
 //!
 //! # Geometry
 //!
@@ -47,6 +49,11 @@ pub struct IconMetrics {
     /// reaches above it, so a row lifted clear of its rail (ruling 248),
     /// which clips its glyphs at the row's top, never clips an icon.
     pub head: f32,
+    /// The glass's ring family's diameter, in pixels (`● ○ ◐ ◌ ⊘`): the ink
+    /// height of the primary face's own `●` where the face has one, so a
+    /// drawn `◐` beside the face's `○` is its size; the capital height where
+    /// it has none.
+    pub disc: f32,
 }
 
 /// The width of an icon's raster: its own cell, or with `spill` the blank
@@ -98,6 +105,14 @@ struct Shape {
     room: f32,
     bot: f32,
     top: f32,
+    /// The ring family's half diameter ([`IconMetrics::disc`], never under
+    /// three fifths of the capitals), which [`Self::mark_frame`] holds to
+    /// `half`.
+    ring: f32,
+    /// The half height an icon narrower than it is tall may keep in a cell
+    /// of its own (`⤓`): the capitals' where the row allows, whatever the
+    /// cell's width.
+    tall: f32,
 }
 
 impl Shape {
@@ -149,6 +164,14 @@ impl Shape {
         // triangle, tick, cross and tray) narrow themselves to the room.
         let room = (cx.min(wide - cx) - 1.0).max(1.0);
         let half = half0.min(room - 0.5).max(1.0);
+        // Never under three fifths of the capitals: a `●` that small is a
+        // bullet, beside which the ring's stroke would close `○`'s hollow and
+        // `⊘`'s openings, and `○ off` would read as `● on`.
+        let disc = if m.disc.is_finite() && m.disc > 1.0 {
+            m.disc.max(cap * 0.6)
+        } else {
+            cap
+        };
         Shape {
             cx,
             cy,
@@ -157,6 +180,8 @@ impl Shape {
             room,
             bot: cy + half,
             top,
+            ring: (disc * 0.5).max(1.0),
+            tall: (cap * 0.5).min(cy - top - 1.5).max(half),
         }
     }
 
@@ -419,10 +444,91 @@ impl Shape {
             BandIcon::HalfDisc => {
                 // `◐`: the ring, its left half filled to a pixel boundary at the
                 // centre (the centre's own column filled where the centre is a
-                // pixel's middle), so the three marks share one outline.
+                // pixel's middle), so the family shares one outline.
                 let split = (self.cx + 0.5).floor();
                 self.mark_ring(px, py)
                     .min(self.mark_disc(px, py).max(px - split))
+            }
+            BandIcon::DottedRing => {
+                // `◌`: eight dots a stroke across on the ring's centre line, one
+                // at each quarter, so its ink box is the ring's.
+                let (r, cyr) = self.mark_frame();
+                let on = r - t * 0.5;
+                let step = std::f32::consts::FRAC_PI_4;
+                let k = ((py - cyr).atan2(px - self.cx) / step).round() * step;
+                (px - (self.cx + on * k.cos())).hypot(py - (cyr + on * k.sin())) - t * 0.5
+            }
+            BandIcon::SlashedRing => {
+                // `⊘`: the ring and a stroke from its lower left to its upper
+                // right, its round caps on the ring's centre line.
+                let (r, cyr) = self.mark_frame();
+                let k = (r - t * 0.5) * std::f32::consts::FRAC_1_SQRT_2;
+                let slash =
+                    super::seg_dist(px, py, self.cx - k, cyr + k, self.cx + k, cyr - k) - t * 0.5;
+                self.mark_ring(px, py).min(slash)
+            }
+            BandIcon::ToBar => {
+                // `⤓`: a stem from the capital line down onto a bar on the
+                // baseline, its head's tip on the bar. As tall as the capitals
+                // in a cell of its own too ([`Self::tall`]): narrower than it is
+                // tall, it only narrows to the room.
+                let h = self.tall;
+                let bottom = (self.cy + h).round();
+                let bar = bottom - t * 0.5;
+                let tip = bar - t;
+                let a = (0.5 * h).min(self.room - t * 0.5);
+                let bw = (0.74 * h).min(self.room - t * 0.5);
+                let seg = |x0: f32, y0: f32, x1: f32, y1: f32| {
+                    super::seg_dist(px, py, x0, y0, x1, y1) - t * 0.5
+                };
+                let stem = seg(self.cx, self.cy - h + t * 0.5, self.cx, tip);
+                let head = seg(self.cx - a, tip - a, self.cx, tip).min(seg(
+                    self.cx,
+                    tip,
+                    self.cx + a,
+                    tip - a,
+                ));
+                stem.min(head)
+                    .min(seg(self.cx - bw, bar, self.cx + bw, bar))
+            }
+            BandIcon::Fisheye => {
+                // `◉`: the ring and, a clear gap inside it, a disc at its centre.
+                // The gap is a share of the ring, not of the stroke, so a bold
+                // mark is heavier.
+                let (r, cyr) = self.mark_frame();
+                let gap = (r * 0.3).round().max(1.0);
+                let dot = (r - t - gap).max(t * 0.5);
+                self.mark_ring(px, py)
+                    .min((px - self.cx).hypot(py - cyr) - dot)
+            }
+            BandIcon::InsetDiamond => {
+                // `◈`: a diamond in the ring's box, one stroke wide on its
+                // inside, and a small one filled inside that, a clear pixel
+                // between them along a row: each slanted edge's antialiasing
+                // reaches half a pixel's diagonal into the gap, so the gap is
+                // `1 + √2` along the row. A share of the box, not of the stroke,
+                // so a bold mark is heavier.
+                use std::f32::consts::{FRAC_1_SQRT_2, SQRT_2};
+                let (r, cyr) = self.mark_frame();
+                let diamond =
+                    |a: f32| ((px - self.cx).abs() + (py - cyr).abs() - a) * FRAC_1_SQRT_2;
+                let inner = (r - SQRT_2 * t - (1.0 + SQRT_2)).max(0.5);
+                self.mark_outline(diamond(r))
+                    .min(diamond(inner))
+                    .max(self.mark_box(px, py))
+            }
+            BandIcon::House => {
+                // `⌂`: a house in the ring's box, one stroke wide on its inside:
+                // the roof from the box's top middle down to its sides at the
+                // centre row, the walls, and the floor.
+                let (r, cyr) = self.mark_frame();
+                let (l, rt, top, floor) = (self.cx - r, self.cx + r, cyr - r, cyr + r);
+                let house = polygon_sd(
+                    px,
+                    py,
+                    &[(self.cx, top), (rt, cyr), (rt, floor), (l, floor), (l, cyr)],
+                );
+                self.mark_outline(house).max(self.mark_box(px, py))
             }
             BandIcon::More => {
                 let r = (t * 0.6).max(0.8);
@@ -440,27 +546,48 @@ impl Shape {
         }
     }
 
-    /// The harness switch's marks' radius and centre row: a disc as tall as
-    /// the capitals on their centre line, as a face's `●` sits among words
-    /// (no badge's overshoot), its sides and its top on pixel boundaries.
+    /// The glass's ring family's radius and centre row: a disc the face's own
+    /// `●`'s height ([`Self::ring`]) on the capitals' centre line, as a face's
+    /// `●` sits among words (no badge's overshoot), its sides and its top on
+    /// pixel boundaries. The face's `●` rounds a half pixel down (a centre on
+    /// a pixel edge, an even stroke, takes an even diameter, and one over the
+    /// face's `●` would stand out where one under it does not), never past
+    /// what the room leaves the icon.
     fn mark_frame(&self) -> (f32, f32) {
         let frac = self.cx.fract();
-        let r = ((self.half - frac).round() + frac).min(self.room).max(1.0);
+        let face = (self.ring - frac - 0.5).ceil();
+        let r = (face.min((self.half - frac).round()) + frac)
+            .min(self.room)
+            .max(1.0);
         let top = (self.cy - r).round();
         (r, top + r)
     }
 
-    /// `●`: the switch's disc ([`Self::mark_frame`]).
+    /// `●`: the family's disc ([`Self::mark_frame`]).
     fn mark_disc(&self, px: f32, py: f32) -> f32 {
         let (r, cyr) = self.mark_frame();
         (px - self.cx).hypot(py - cyr) - r
     }
 
-    /// `○`: the switch's disc as a ring one stroke wide, its outer edge the
+    /// `○`: the family's disc as a ring one stroke wide, its outer edge the
     /// disc's.
     fn mark_ring(&self, px: f32, py: f32) -> f32 {
         let (r, cyr) = self.mark_frame();
         ((px - self.cx).hypot(py - cyr) - (r - self.t * 0.5)).abs() - self.t * 0.5
+    }
+
+    /// The band one stroke wide just inside a shape whose signed distance at
+    /// the pixel is `d`: its outline, drawn as `○` is from `●`.
+    fn mark_outline(&self, d: f32) -> f32 {
+        (d + self.t * 0.5).abs() - self.t * 0.5
+    }
+
+    /// The family's box ([`Self::mark_frame`]): the disc's ink box, which the
+    /// marks drawn in it (`◈ ⌂`) are cut to, so a corner's tip never inks a
+    /// pixel the disc does not.
+    fn mark_box(&self, px: f32, py: f32) -> f32 {
+        let (r, cyr) = self.mark_frame();
+        rect(px, py, self.cx - r, cyr - r, self.cx + r, cyr + r)
     }
 
     /// A disc of radius `r` pixels on the centre line, `v` half heights
@@ -530,6 +657,7 @@ mod tests {
         cap: 13.0,
         stem: 1.6,
         head: 3.0,
+        disc: 13.0,
     };
 
     /// The faces the band draws at, measured (`Renderer::icon_metrics`): the
@@ -544,6 +672,7 @@ mod tests {
                 cap: 15.0,
                 stem: 1.65,
                 head: 3.0,
+                disc: 15.0,
             },
         ),
         (
@@ -554,6 +683,7 @@ mod tests {
                 cap: 15.0,
                 stem: 2.74,
                 head: 3.0,
+                disc: 15.0,
             },
         ),
         (
@@ -564,6 +694,7 @@ mod tests {
                 cap: 20.0,
                 stem: 2.24,
                 head: 3.0,
+                disc: 20.0,
             },
         ),
         (
@@ -574,6 +705,7 @@ mod tests {
                 cap: 20.0,
                 stem: 3.69,
                 head: 3.0,
+                disc: 20.0,
             },
         ),
         (
@@ -584,6 +716,7 @@ mod tests {
                 cap: 19.0,
                 stem: 3.0,
                 head: 3.0,
+                disc: 19.0,
             },
         ),
         (
@@ -594,6 +727,7 @@ mod tests {
                 cap: 19.0,
                 stem: 2.0,
                 head: 3.0,
+                disc: 19.0,
             },
         ),
     ];
@@ -624,6 +758,7 @@ mod tests {
                     cap: 9.0,
                     stem: 1.0,
                     head: 2.0,
+                    disc: 9.0,
                 },
             ),
             (
@@ -634,6 +769,7 @@ mod tests {
                     cap: 22.0,
                     stem: 2.8,
                     head: 3.0,
+                    disc: 22.0,
                 },
             ),
             // The two parity mismatches: an odd stroke in an even cell, an
@@ -646,6 +782,7 @@ mod tests {
                     cap: 13.0,
                     stem: 1.0,
                     head: 3.0,
+                    disc: 13.0,
                 },
             ),
             (
@@ -656,6 +793,7 @@ mod tests {
                     cap: 12.0,
                     stem: 2.0,
                     head: 3.0,
+                    disc: 12.0,
                 },
             ),
         ]
@@ -767,6 +905,7 @@ mod tests {
             cap: 18.0,
             stem: 1.0,
             head: 3.0,
+            disc: 18.0,
         };
         let bold = IconMetrics {
             stem: 2.6,
@@ -850,28 +989,114 @@ mod tests {
         }
     }
 
-    /// THE HARNESS SWITCH'S MARKS ARE ONE SET: `●`, `○` and `◐` share one ink box on every
-    /// face, spilled or in a cell of their own; `○` is hollow at its centre and `●` is not;
-    /// `◐` is `●` left of its centre and `○` right of it.
+    /// THE GLASS'S RING FAMILY IS ONE SET: `●`, `○`, `◐`, `◌`, `⊘` and `◉`, and the `◈` and
+    /// `⌂` drawn in their box, share one ink box on every face, spilled or in a cell of their
+    /// own, the face's own `●`'s height ([`IconMetrics::disc`]) where it is under the
+    /// capitals; `○`, `◌` and `⌂` are hollow at their centre and `●`, `⊘`, `◉` and `◈` are
+    /// not; `◌` is drawn on `○`'s line with gaps; `◐` is `●` left of its centre and `○` right
+    /// of it; `◉` is `○` with a dot a clear gap inside it, and `◈` (where its box has the
+    /// room) a diamond with one; `⌂`'s roof leaves the box's top corners clear and its walls
+    /// stand on the box's floor. NEGATIVE CONTROL: the outline follows `disc`, so a face
+    /// whose `●` is shorter draws a smaller family.
     #[test]
-    fn the_switch_marks_share_one_outline() {
-        for (cw, ch, m) in FACES.into_iter().chain([(12, 24, M)]) {
+    fn the_ring_family_shares_one_outline() {
+        let shorter = FACES.map(|(cw, ch, m)| {
+            (
+                cw,
+                ch,
+                IconMetrics {
+                    disc: m.cap - 4.0,
+                    ..m
+                },
+            )
+        });
+        for (cw, ch, m) in FACES.into_iter().chain([(12, 24, M)]).chain(shorter) {
             for spill in [false, true] {
                 let w = band_icon_width(cw, spill);
                 let draw = |icon| band_icon_coverage(icon, cw, ch, m, spill);
-                let (disc, ring, half) = (
+                let (disc, ring, half, dots, slashed) = (
                     draw(BandIcon::Disc),
                     draw(BandIcon::Ring),
                     draw(BandIcon::HalfDisc),
+                    draw(BandIcon::DottedRing),
+                    draw(BandIcon::SlashedRing),
                 );
-                let at = format!("{cw}x{ch} stem {} spill {spill}", m.stem);
+                let (eye, diamond, house) = (
+                    draw(BandIcon::Fisheye),
+                    draw(BandIcon::InsetDiamond),
+                    draw(BandIcon::House),
+                );
+                let at = format!("{cw}x{ch} stem {} disc {} spill {spill}", m.stem, m.disc);
                 let outline = ink_box(&disc, w);
                 assert_eq!(ink_box(&ring, w), outline, "{at}: ○ is ●'s size");
                 assert_eq!(ink_box(&half, w), outline, "{at}: ◐ is ●'s size");
+                assert_eq!(ink_box(&dots, w), outline, "{at}: ◌ is ●'s size");
+                assert_eq!(ink_box(&slashed, w), outline, "{at}: ⊘ is ●'s size");
+                assert_eq!(ink_box(&eye, w), outline, "{at}: ◉ is ●'s size");
+                assert_eq!(ink_box(&diamond, w), outline, "{at}: ◈ is ●'s size");
+                assert_eq!(ink_box(&house, w), outline, "{at}: ⌂ is ●'s size");
                 let (x0, x1, y0, y1) = outline;
+                if spill && m.disc < m.cap {
+                    assert!(
+                        (y1 - y0) as f32 <= m.disc + 1.0,
+                        "{at}: the family is the face's `●`'s height ({outline:?})"
+                    );
+                    let full = IconMetrics { disc: m.cap, ..m };
+                    let (_, _, f0, f1) =
+                        ink_box(&band_icon_coverage(BandIcon::Disc, cw, ch, full, spill), w);
+                    assert!(
+                        f1 - f0 > y1 - y0,
+                        "{at}: control, the capitals' disc is taller"
+                    );
+                }
                 let (cx, cy) = ((x0 + x1) / 2, (y0 + y1) / 2);
                 assert_eq!(disc[cy * w + cx], 255, "{at}: ● is filled");
                 assert_eq!(ring[cy * w + cx], 0, "{at}: ○ is hollow");
+                assert_eq!(dots[cy * w + cx], 0, "{at}: ◌ is hollow");
+                assert!(slashed[cy * w + cx] > 0, "{at}: ⊘ is struck through");
+                assert!(eye[cy * w + cx] > 0, "{at}: ◉ has its dot");
+                assert!(diamond[cy * w + cx] > 0, "{at}: ◈ has its dot");
+                assert_eq!(house[cy * w + cx], 0, "{at}: ⌂ is hollow");
+                // Out from the centre along its row, `◉` clears between its dot and
+                // its outline, and so does `◈` wherever its box leaves room for the
+                // gap (`1 + √2` along the row) and a dot; a box too small for both
+                // (a cell of its own, a shorter face's) keeps the dot and blurs the
+                // gap.
+                let r = (x1 - x0) as f32 * 0.5;
+                let room =
+                    r - std::f32::consts::SQRT_2 * m.stem.round() >= 1.5 + std::f32::consts::SQRT_2;
+                let gapped: &[(&str, &Vec<u8>)] = if room {
+                    &[("◉", &eye), ("◈", &diamond)]
+                } else {
+                    &[("◉", &eye)]
+                };
+                for &(name, buf) in gapped {
+                    let row = &buf[cy * w + cx..cy * w + x1];
+                    let clear = row.iter().position(|&c| c == 0);
+                    assert!(
+                        clear.is_some_and(|k| row[k..].iter().any(|&c| c > 0)),
+                        "{at}: {name}'s dot stands clear of its outline {row:?}"
+                    );
+                }
+                assert!(
+                    eye.iter().zip(&ring).all(|(&e, &o)| e >= o),
+                    "{at}: ◉ is ○ and a dot"
+                );
+                // `⌂`: the box's top corners clear (a roof, not a square) and its
+                // floor inked across the box.
+                let corner = |x: usize, y: usize| house[y * w + x];
+                assert_eq!(corner(x0, y0), 0, "{at}: ⌂'s top left corner is clear");
+                assert_eq!(corner(x1 - 1, y0), 0, "{at}: ⌂'s top right corner is clear");
+                assert!(
+                    (x0..x1).all(|x| house[(y1 - 1) * w + x] > 0),
+                    "{at}: ⌂ stands on its floor"
+                );
+                let ink = |b: &[u8]| b.iter().map(|&c| u32::from(c)).sum::<u32>();
+                assert!(ink(&dots) < ink(&ring), "{at}: ◌ has gaps");
+                assert!(
+                    dots.iter().zip(&ring).all(|(&d, &r)| d == 0 || r > 0),
+                    "{at}: ◌'s dots lie on ○'s line"
+                );
                 for y in y0..y1 {
                     for x in x0..x1 {
                         // Two columns either side of the centre are the split's.
@@ -885,6 +1110,36 @@ mod tests {
                         };
                         assert_eq!(half[y * w + x], want, "{at}: ◐ at ({x}, {y})");
                     }
+                }
+            }
+        }
+    }
+
+    /// `⤓` (Land) is as tall as the capitals in a cell of its own as well as between blanks,
+    /// standing on the baseline's row, and narrows to its cell: an arrow is narrower than it
+    /// is tall, so it keeps the height the font's glyph has beside a clock's digits
+    /// (`⤓18:00`). NEGATIVE CONTROL: the band's `⇣`, held to a square in its own cell, is
+    /// shorter there.
+    #[test]
+    fn the_land_arrow_keeps_the_capitals_height_in_its_own_cell() {
+        for (cw, ch, m) in FACES.into_iter().chain([(12, 24, M)]) {
+            let cap = m.cap.round() as usize;
+            let baseline = m.baseline as usize;
+            for spill in [false, true] {
+                let w = band_icon_width(cw, spill);
+                let buf = band_icon_coverage(BandIcon::ToBar, cw, ch, m, spill);
+                let (_, _, y0, y1) = ink_box(&buf, w);
+                let at = format!("{cw}x{ch} stem {} spill {spill}", m.stem);
+                assert!(
+                    (cap - 1..=cap + 1).contains(&(y1 - y0)),
+                    "{at}: ⤓ is {} rows tall, the capitals {cap}",
+                    y1 - y0
+                );
+                assert_eq!(y1, baseline, "{at}: ⤓ stands on the baseline");
+                if !spill {
+                    let band = band_icon_coverage(BandIcon::Download, cw, ch, m, spill);
+                    let (_, _, b0, b1) = ink_box(&band, w);
+                    assert!(b1 - b0 < y1 - y0, "{at}: control, the band's ⇣ is shorter");
                 }
             }
         }
@@ -912,5 +1167,98 @@ mod tests {
                 assert!(buf[..w].iter().all(|&c| c == 0), "{cw}x{ch}: top row clear");
             }
         }
+    }
+
+    /// A SMALL `●` NEVER CLOSES THE RINGS: on a face whose own `●` is half its capitals or
+    /// less (a bullet's size), between blanks as the glass lays them, `○` is still hollow
+    /// and `⊘` still open on each side of its slash, so `○ off` and `⊘ off` never read as
+    /// `● on`: the family is never under three fifths of the capitals. Off the face's `●`
+    /// alone, on a 14 × 30 cell (capitals 18, stem 2) a `●` of 9 left `⊘` no clear pixel
+    /// and `○` four, one of 7 left `○` none, and on a 7 × 15 cell (capitals 9) one of 4 left
+    /// `○` one. NEGATIVE CONTROL: over the floor the face's `●` still sizes the family, so no
+    /// installed face's moves (the smallest measured, Andale Mono's and PT Mono's at 24 px,
+    /// is 11 of 17 capitals).
+    #[test]
+    fn a_small_disc_never_closes_the_rings() {
+        let cells = [
+            (
+                14,
+                30,
+                IconMetrics {
+                    baseline: 24.0,
+                    cap: 18.0,
+                    stem: 2.0,
+                    head: 3.0,
+                    disc: 18.0,
+                },
+            ),
+            (
+                7,
+                15,
+                IconMetrics {
+                    baseline: 12.0,
+                    cap: 9.0,
+                    stem: 1.0,
+                    head: 2.0,
+                    disc: 9.0,
+                },
+            ),
+        ];
+        for (cw, ch, face) in cells {
+            let w = band_icon_width(cw, true);
+            for share in [0.5f32, 0.39, 0.25] {
+                let m = IconMetrics {
+                    disc: (face.cap * share).round(),
+                    ..face
+                };
+                let at = format!("{cw}x{ch} cap {} disc {}", m.cap, m.disc);
+                let draw = |icon| band_icon_coverage(icon, cw, ch, m, true);
+                let (disc, ring, slashed) = (
+                    draw(BandIcon::Disc),
+                    draw(BandIcon::Ring),
+                    draw(BandIcon::SlashedRing),
+                );
+                let (x0, x1, y0, y1) = ink_box(&disc, w);
+                let (cx, cy) = ((x0 + x1) / 2, (y0 + y1) / 2);
+                let clear = |b: &[u8], side: fn(isize) -> bool| {
+                    (y0..y1)
+                        .flat_map(|y| (x0..x1).map(move |x| (x, y)))
+                        .filter(|&(x, y)| {
+                            let diag = (x as isize - cx as isize) + (y as isize - cy as isize);
+                            disc[y * w + x] == 255 && b[y * w + x] == 0 && side(diag)
+                        })
+                        .count()
+                };
+                let hollow = clear(&ring, |_| true);
+                assert!(hollow >= 5, "{at}: ○'s hollow is {hollow} pixels");
+                if m.cap >= 18.0 {
+                    let (above, below) = (clear(&slashed, |d| d < 0), clear(&slashed, |d| d > 0));
+                    assert!(
+                        above > 0 && below > 0,
+                        "{at}: ⊘ clears {above} pixels above its slash, {below} below"
+                    );
+                }
+                assert!(
+                    (y1 - y0) as f32 >= (m.cap * 0.6).floor(),
+                    "{at}: the family is {} rows, under three fifths of the capitals",
+                    y1 - y0
+                );
+            }
+        }
+        // NEGATIVE CONTROL: over the floor the face's `●` still sizes the family: at the
+        // capitals of 18, a `●` of 11 draws another family from one of 12 (0.65 of them).
+        let (cw, ch, face) = cells[0];
+        let rows = |disc: f32| {
+            let m = IconMetrics { disc, ..face };
+            let (_, _, y0, y1) =
+                ink_box(&band_icon_coverage(BandIcon::Disc, cw, ch, m, true), cw * 3);
+            y1 - y0
+        };
+        assert!(
+            rows(11.0) < rows(12.0),
+            "control: {} and {} rows",
+            rows(11.0),
+            rows(12.0)
+        );
     }
 }

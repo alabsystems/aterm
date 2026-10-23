@@ -1,63 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE FACTS' ONE TYPING PATH (owner, 2026-10-19: "clicking [the top-effort
-//! key] toggles it on and off … and likewise for model, effort"): the only
-//! place the footer's facts (`crate::claude_facts`, `crate::fact_menu`) put
-//! keys into Claude Code. What it types is Claude's own: its session-only
-//! `/effort <key> on|off` ([`Slash::TopEffort`]), and `/model` or `/effort`
-//! bare, which open Claude's ModelPicker and EffortSlider — where aterm
-//! presses nothing: the person picks. No level and no model is ever typed
-//! (`/effort <level>` saves the level as the default for new sessions).
-//!
-//! A PRESS ([`SlashPress`]) is one person's gesture, at most one per session
-//! across every window and never beside a mode return of the lights
-//! (`crate::claude_lights`), in three writes, each fenced under the terminal
-//! lock it is made under ([`crate::control::input_if_fenced_observed`]: the
-//! screen generation the decision read, the person's input count, and the
-//! caret row as it was, at the cursor). Each write also holds the published
-//! foreground identity captured at the click: an observed group, reader,
-//! program or image change ends its custody, even if it changes back:
-//!
-//! 1. THE PROBE (`App::press_slash`, on the gesture): `/` alone, stamped as
-//!    the person's input (`App::note_person_input`). Only into Claude's own
-//!    idle, empty composer, read off the ENGINE: the composer frame is drawn
-//!    and no box or picker covers it, its pill names a mode and stands
-//!    after no vim INSERT indicator (`-- INSERT --`, refused explicitly), no
-//!    turn is live (a background agent's or workflow's wait alone does not
-//!    count: the turn ended, MEASURED on 2.1.304), no draft (a dim
-//!    suggestion is none), no survey, and the caret row strictly between the
-//!    composer's rules holding the cursor (the `!` box, a stale transcript
-//!    `❯` and the slash menu's `❯` over the top rule are none). A screen that
-//!    moved between the read and the write is read once more and written
-//!    once more; a second move is [`SlashRefusal::Moved`].
-//! 2. THE TEXT (`App::advance_slash_presses`, on the footer wake): the rest
-//!    of the command, once the composer reads back exactly `/` at the caret
-//!    and no turn has gone live (one a background agent's end starts) and
-//!    no survey drawn since the click — those hold it, and stop it past the
-//!    probe's deadline with the `/` left as it is.
-//!    vim NORMAL mode draws nothing of its own and passes every check above
-//!    (MEASURED on 2.1.304), and there the whole command typed at once ran as
-//!    motions and left `rt <key> on` on a new composer line; `/` alone is no
-//!    motion there and draws nothing, so the probe that never reads back
-//!    stops the press with the composer as it was ([`SlashRefusal::Vim`]):
-//!    READ in the 2.1.304 bundle, NORMAL's idle state maps `/` to no motion,
-//!    no operator and no pending state.
-//! 3. THE ENTER, aterm's own (`Source::Controller`), once the composer has
-//!    held exactly the command — with no slash menu for an argument
-//!    command, or with the command itself pointed in it for a bare one
-//!    (MEASURED: Enter runs the pointed entry), the menu read on either side
-//!    of the composer, over its top rule (the fullscreen renderer) or under
-//!    its bottom rule (the inline one, MEASURED 2026-10-20) — and nothing in
-//!    it moved for [`QUIET`].
-//!
-//! Then Claude's answer ends it: the key's tag on the top rule as asked, or
-//! its `⎿` answer (`footer::top_effort_reply`, wrapped rows joined); a
-//! refusal (`needs dynamic workflows`, `isn't available on <model>`) latches
-//! the key off for the process and the model; a picker drawn over the
-//! composer is a picker opened. A person's key, a box, a deadline or any
-//! other text ends it too, named ([`SlashRefusal`]) — and NO STOP EVER
-//! ERASES THE COMPOSER: what aterm typed is left for the person to see.
+//! THE FACTS' ONE TYPING PATH (owner, 2026-10-19: "clicking [the top-effort key] toggles it on and off … and likewise for model, effort"): the only place the footer's facts (`crate::claude_facts`, `crate::fact_menu`) put keys into Claude Code.
 
 use std::time::{Duration, Instant};
 
@@ -72,9 +16,7 @@ use crate::{App, WindowId};
 
 /// How often a press in flight reads the engine (the lights' mode poll).
 pub(crate) const SLASH_POLL: Duration = Duration::from_millis(80);
-/// How long the composer must hold the whole command, nothing in it moving,
-/// before the Enter: MEASURED on 2.1.304, 0.6 s of quiet after the text ran
-/// the command with its arguments.
+/// How long the composer must hold the whole command, nothing in it moving, before the Enter: MEASURED on 2.1.304, 0.6 s of quiet after the text ran the command with its arguments.
 pub(crate) const QUIET: Duration = Duration::from_millis(600);
 /// How long a write may take to read back.
 pub(crate) const ECHO: Duration = Duration::from_secs(3);
@@ -90,8 +32,7 @@ const MENU_ROWS: usize = 8;
 /// What aterm types into Claude Code for a fact.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum Slash {
-    /// `/effort <key> on` (true) or `/effort <key> off`: the session-only
-    /// toggle of the top-effort key (Claude Code 2.1.304's `A()` parser).
+    /// `/effort <key> on` (true) or `/effort <key> off`: the session-only toggle of the top-effort key (Claude Code 2.1.304's `A()` parser).
     TopEffort(bool),
     /// `/model`: Claude's ModelPicker.
     ModelPicker,
@@ -114,7 +55,6 @@ impl Slash {
     }
 
     /// Whether it is a bare command, whose own entry Claude points in the
-    /// slash menu it draws over the top rule as it is typed.
     const fn bare(self) -> bool {
         !matches!(self, Slash::TopEffort(_))
     }
@@ -143,8 +83,7 @@ impl Slash {
         }
     }
 
-    /// What the title slot says once it is done (none for a picker, which
-    /// covers the composer itself).
+    /// What the title slot says once it is done (none for a picker, which covers the composer itself).
     #[must_use]
     pub(crate) fn done(self) -> Option<String> {
         match self {
@@ -157,16 +96,13 @@ impl Slash {
     }
 }
 
-/// Whether Claude Code `version` takes the top-effort key's session toggle
-/// (`/effort <key> on|off`, READ in the 2.1.304 bundle's `A()` parser; no
-/// build through 2.1.303 has it): the one place the cut is named.
+/// Whether Claude Code `version` takes the top-effort key's session toggle (`/effort <key> on|off`, READ in the 2.1.304 bundle's `A()` parser; no build through 2.1.303 has it): the one place the cut is named.
 #[must_use]
 pub(crate) fn takes_key_toggle(version: &str) -> bool {
     aterm_phase::anchors::newer_than(version, "2.1.303")
 }
 
-/// The key as Claude writes it at a sentence's start (`<Key> needs …`),
-/// built from the one const.
+/// The key as Claude writes it at a sentence's start (`<Key> needs …`), built from the one const.
 #[must_use]
 pub(crate) fn key_capitalised() -> String {
     let mut chars = CLAUDE_TOP_EFFORT_KEY.chars();
@@ -175,8 +111,7 @@ pub(crate) fn key_capitalised() -> String {
     })
 }
 
-/// Why a press did not begin, or stopped short — each said in words
-/// ([`Self::says`]).
+/// Why a press did not begin, or stopped short — each said in words ([`Self::says`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum SlashRefusal {
     /// A press, or a mode return of the lights, is in flight for the session.
@@ -187,8 +122,7 @@ pub(crate) enum SlashRefusal {
     Parked,
     /// Another driver's lease stands on the session.
     Driver,
-    /// No composer to type into: a box, a picker, a scrolled view, the `!`
-    /// shell box.
+    /// No composer to type into: a box, a picker, a scrolled view, the `!` shell box.
     Covered,
     /// A turn is live.
     Busy,
@@ -196,9 +130,7 @@ pub(crate) enum SlashRefusal {
     Draft,
     /// A survey is open.
     Survey,
-    /// The composer is drawn but not taking text as Claude's own: no pill
-    /// this build names under it, vim INSERT's indicator before the pill,
-    /// or the caret row not where the cursor is.
+    /// The composer is drawn but not taking text as Claude's own: no pill this build names under it, vim INSERT's indicator before the pill, or the caret row not where the cursor is.
     NotReady,
     /// The probe `/` never read back: vim NORMAL mode takes keys as motions.
     Vim,
@@ -221,12 +153,7 @@ pub(crate) enum SlashRefusal {
 }
 
 impl SlashRefusal {
-    /// Its words (design §10.6.14): `text` is what the composer holds for
-    /// [`Self::LeftTyped`], the command for [`Self::NoAnswer`], and, for a
-    /// hold or a box that stops a press AFTER its probe, what aterm typed
-    /// that stands there (`/`, or the command) — said as left in the
-    /// composer, never as "nothing typed"; `model` the model Claude named
-    /// for [`Self::Unavailable`].
+    /// Its words (design §10.6.14): `text` is what the composer holds for [`Self::LeftTyped`], the command for [`Self::NoAnswer`], and, for a hold or a box that stops a press AFTER its probe, what aterm typed that stands there (`/`, or the command) — said as left in the composer, never as "nothing typed"; `model` the model Claude named for [`Self::Unavailable`].
     #[must_use]
     pub(crate) fn says(self, text: &str, model: Option<&str>) -> String {
         let key = key_capitalised();
@@ -250,8 +177,6 @@ impl SlashRefusal {
             Self::Draft => left("the composer holds a draft"),
             Self::Survey => left("a survey is open"),
             Self::NotReady => left("the composer is not ready"),
-            // Only ever after the probe: the `/` went, and an echo later
-            // than the deadline may still draw it.
             Self::Vim => {
                 "the composer took no text (vim normal mode); nothing more sent".to_owned()
             }
@@ -274,8 +199,7 @@ impl SlashRefusal {
 pub(crate) enum Stage {
     /// The probe `/` is written; its echo is awaited.
     Probed,
-    /// The whole command is written. `quiet` is when the composer's view
-    /// last moved and what it was then: the Enter waits [`QUIET`] past it.
+    /// The whole command is written.
     Typed { quiet: Option<(Instant, u64)> },
     /// The Enter went; Claude's answer, or its picker, is awaited.
     Entered,
@@ -288,16 +212,9 @@ pub(crate) struct SlashPress {
     pub(crate) slash: Slash,
     text: Box<str>,
     pub(crate) stage: Stage,
-    /// The person's input count right after the press's own first write,
-    /// moved on past the person's gestures that reached no program since
-    /// (a selection's click, a viewport's scroll): the count every later
-    /// write is fenced on.
+    /// The person's input count right after the press's own first write, moved on past the person's gestures that reached no program since (a selection's click, a viewport's scroll): the count every later write is fenced on.
     pub(crate) human_after: u64,
-    /// The person's last gesture that REACHED the program as of the probe
-    /// (`HumanInputStamp::counts`): one since — a key, a paste, a click or
-    /// a wheel the program is sent — is the person's hand on the session
-    /// ([`SlashRefusal::Person`]); one that reached nothing leaves Claude's
-    /// composer as it was, and the press goes on.
+    /// The person's last gesture that REACHED the program as of the probe (`HumanInputStamp::counts`): one since — a key, a paste, a click or a wheel the program is sent — is the person's hand on the session ([`SlashRefusal::Person`]); one that reached nothing leaves Claude's composer as it was, and the press goes on.
     pub(crate) reached_after: u64,
     /// Past this, the stage is given up.
     pub(crate) deadline: Instant,
@@ -319,8 +236,7 @@ pub(crate) enum SlashEnd {
     Stopped(SlashRefusal),
 }
 
-/// THE KEY LATCHED OFF: Claude refused it for this process and model, so
-/// nothing offers to turn it on until the model moves (or the process).
+/// THE KEY LATCHED OFF: Claude refused it for this process and model, so nothing offers to turn it on until the model moves (or the process).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct KeyLatch {
     pub(crate) pgid: i32,
@@ -339,9 +255,7 @@ impl KeyLatch {
     }
 }
 
-/// One read of a session's engine, under one hold of its lock: the rows as
-/// text, the cursor, each row's column-2 DIM flag (a suggestion's), the
-/// screen generation and the person's input count.
+/// One read of a session's engine, under one hold of its lock: the rows as text, the cursor, each row's column-2 DIM flag (a suggestion's), the screen generation and the person's input count.
 #[derive(Clone, Debug)]
 pub(crate) struct EngineRead {
     pub(crate) rows: Vec<String>,
@@ -374,8 +288,7 @@ pub(crate) struct Composer {
 
 #[cfg(test)]
 impl Composer {
-    /// Its text and whether the cursor proves it typed (the conformance
-    /// projection's read, a unix test's).
+    /// Its text and whether the cursor proves it typed (the conformance projection's read, a unix test's).
     #[cfg(unix)]
     pub(crate) fn text_and_typed(&self) -> (&str, bool) {
         (&self.text, self.typed)
@@ -387,8 +300,7 @@ fn squashed(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// The composer on `read`, where its frame is drawn and its caret row lies
-/// strictly between its rules. Pure.
+/// The composer on `read`, where its frame is drawn and its caret row lies strictly between its rules.
 #[must_use]
 pub(crate) fn composer_of(read: &EngineRead) -> Option<Composer> {
     let rows = &read.rows;
@@ -414,16 +326,7 @@ pub(crate) fn composer_of(read: &EngineRead) -> Option<Composer> {
     })
 }
 
-/// The slash menu Claude Code 2.1.304 draws as a command is typed, on the
-/// side of the composer its renderer puts it: OVER the top rule (row `top`)
-/// in the fullscreen renderer (`  ❯ /model  Set the AI model …` at column
-/// 2, then `    /code-review …`, MEASURED 2026-10-19), UNDER the bottom
-/// rule (row `bottom`), in the mode row's place, in the inline one
-/// (`CLAUDE_CODE_NO_FLICKER=0` or `tui = "default"`; MEASURED 2026-10-20,
-/// fixture `claude-2.1.304-slash-menu-inline-model-120col`). `None` with no
-/// entry on either side, else the pointed entry's command (`Some(None)`:
-/// entries, none pointed, or two pointers). Its `❯` is no caret (it lies
-/// outside the frame). Pure.
+/// The slash menu Claude Code 2.1.304 draws as a command is typed, on the side of the composer its renderer puts it: OVER the top rule (row `top`) in the fullscreen renderer (`  ❯ /model  Set the AI model …` at column 2, then `    /code-review …`, MEASURED 2026-10-19), UNDER the bottom rule (row `bottom`), in the mode row's place, in the inline one (`CLAUDE_CODE_NO_FLICKER=0` or `tui = "default"`; MEASURED 2026-10-20, fixture `claude-2.1.304-slash-menu-inline-model-120col`).
 #[must_use]
 pub(crate) fn slash_menu(rows: &[String], top: usize, bottom: usize) -> Option<Option<String>> {
     let over = rows[top.saturating_sub(MENU_ROWS)..top].iter().rev();
@@ -432,8 +335,6 @@ pub(crate) fn slash_menu(rows: &[String], top: usize, bottom: usize) -> Option<O
 }
 
 /// A slash menu's entries in `rows`, read away from the composer (up from
-/// its top rule, or down from its bottom rule) to the first blank row or
-/// row at column zero: `None` with none ([`slash_menu`]).
 fn menu_block<'a>(rows: impl Iterator<Item = &'a String>) -> Option<Option<String>> {
     let mut entries = false;
     let mut pointers = 0;
@@ -459,8 +360,6 @@ fn menu_block<'a>(rows: impl Iterator<Item = &'a String>) -> Option<Option<Strin
 }
 
 /// The composer's view a quiet window watches: its rows, the rows a slash
-/// menu takes over it, the menu's reading on either side, and the cursor.
-/// Pure.
 fn view_of(read: &EngineRead, c: &Composer) -> u64 {
     use std::hash::{Hash as _, Hasher as _};
     let mut h = std::hash::DefaultHasher::new();
@@ -471,26 +370,17 @@ fn view_of(read: &EngineRead, c: &Composer) -> u64 {
 }
 
 /// Whether `rows` show a LIVE turn (`screen` their reading): busy, and not
-/// the wait on a background agent's or a workflow's work alone, which
-/// reads busy for the work's whole life after the turn ended (MEASURED on
-/// 2.1.304). Pure.
 fn live_turn(screen: Option<&lights::Screen>, rows: &[String]) -> bool {
     screen.is_some_and(|s| s.busy && !aterm_phase::phase::background_only(rows))
 }
 
-/// THE CLICK'S CHECKS ON THE ENGINE (module header, step 1): the caret row
-/// to type at, or why not. Pure.
+/// THE CLICK'S CHECKS ON THE ENGINE (module header, step 1): the caret row to type at, or why not.
 pub(crate) fn ready(read: &EngineRead) -> Result<usize, SlashRefusal> {
     let rows = &read.rows;
     let screen = lights::read_screen(rows).ok_or(SlashRefusal::Covered)?;
-    // A pill this build names, nothing typed on a guess; and none after vim
-    // INSERT's indicator (`  -- INSERT -- ⏵⏵ auto mode on`, MEASURED on
-    // 2.1.304), whose pill the lights read as any other, but whose composer
-    // takes keys through vim.
     if screen.mode.is_none() || screen.vim_insert {
         return Err(SlashRefusal::NotReady);
     }
-    // A live turn ([`live_turn`]: a background agent's wait alone is none).
     if live_turn(Some(&screen), rows) {
         return Err(SlashRefusal::Busy);
     }
@@ -507,8 +397,7 @@ pub(crate) fn ready(read: &EngineRead) -> Result<usize, SlashRefusal> {
     Ok(c.caret)
 }
 
-/// What a press in flight does next, decided from one engine read
-/// ([`decide`]).
+/// What a press in flight does next, decided from one engine read ([`decide`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Step {
     /// Nothing yet.
@@ -517,9 +406,7 @@ pub(crate) enum Step {
     Quiet(u64),
     /// The probe read back: write the rest, fenced at the cursor's row.
     Rest { row: usize },
-    /// Quiet with the whole command: Enter, fenced at the cursor's row —
-    /// the caret row, or the row a narrow composer wrapped the command
-    /// onto, where the cursor stands after it.
+    /// Quiet with the whole command: Enter, fenced at the cursor's row — the caret row, or the row a narrow composer wrapped the command onto, where the cursor stands after it.
     Enter { row: usize },
     /// Claude answered as asked, or its picker is up.
     Done,
@@ -531,9 +418,7 @@ pub(crate) enum Step {
     },
 }
 
-/// THE WAKE'S DECISION for `press` from the engine as `read` shows it at
-/// `now` (module header, steps 2 and 3, and the answer). `None` for a read
-/// that found no live screen (a scrolled view). Pure.
+/// THE WAKE'S DECISION for `press` from the engine as `read` shows it at `now` (module header, steps 2 and 3, and the answer).
 #[must_use]
 pub(crate) fn decide(press: &SlashPress, read: Option<&EngineRead>, now: Instant) -> Step {
     let late = now >= press.deadline;
@@ -545,8 +430,6 @@ pub(crate) fn decide(press: &SlashPress, read: Option<&EngineRead>, now: Instant
     let Some(read) = read else {
         return match press.stage {
             _ if !late => Step::Wait,
-            // No live screen since the probe (a view scrolled into history):
-            // its `/` is what aterm typed.
             Stage::Probed => stop(SlashRefusal::Covered, "/"),
             _ => stop(SlashRefusal::NoAnswer, &press.text),
         };
@@ -556,10 +439,6 @@ pub(crate) fn decide(press: &SlashPress, read: Option<&EngineRead>, now: Instant
     let busy = live_turn(screen.as_ref(), &read.rows);
     let survey = aterm_phase::survey_block(&read.rows).is_some();
     match press.stage {
-        // The probe read back, and no turn went live and no survey drew
-        // since the click: the rest. A turn a background agent's end
-        // started, or a survey, holds it (the model's `Type`), and one that
-        // outlasts the probe's deadline stops it, the `/` left as it is.
         Stage::Probed => match composer {
             Some(c) if c.typed && c.text == "/" && (busy || survey) => {
                 if late {
@@ -574,7 +453,6 @@ pub(crate) fn decide(press: &SlashPress, read: Option<&EngineRead>, now: Instant
                 }
             }
             Some(c) if c.typed && c.text == "/" => Step::Rest { row: read.cursor.0 },
-            // vim NORMAL draws nothing for `/`: the composer as it was.
             Some(c) if c.empty => {
                 if late {
                     stop(SlashRefusal::Vim, "")
@@ -598,17 +476,12 @@ pub(crate) fn decide(press: &SlashPress, read: Option<&EngineRead>, now: Instant
                 };
             }
             if !(c.typed && c.text == *press.text) {
-                // The rest's echo still on its way: the text so far is the
                 // command's own head.
                 if c.typed && press.text.starts_with(c.text.as_str()) && !late {
                     return Step::Wait;
                 }
                 return stop(SlashRefusal::LeftTyped, &c.text);
             }
-            // Claude's slash menu, over the composer or under it as the
-            // renderer draws it: none for a command with arguments, the
-            // command itself pointed for a bare one (Enter runs the pointed
-            // entry, MEASURED).
             let menu = slash_menu(&read.rows, c.top, c.bottom);
             let menu_ok = match menu {
                 None => true,
@@ -656,13 +529,11 @@ pub(crate) fn decide(press: &SlashPress, read: Option<&EngineRead>, now: Instant
                         _ => None,
                     }
                 }),
-                // The picker replaced the composer and both its rules.
                 Slash::ModelPicker | Slash::EffortPicker if screen.is_none() => Some(Step::Done),
                 _ => None,
             };
             match answered {
                 Some(step) => step,
-                // The Enter not taken: the command stands in the composer.
                 None if late && held => stop(SlashRefusal::LeftTyped, &press.text),
                 None if late => stop(SlashRefusal::NoAnswer, &press.text),
                 None => Step::Wait,
@@ -672,8 +543,6 @@ pub(crate) fn decide(press: &SlashPress, read: Option<&EngineRead>, now: Instant
 }
 
 /// THE SESSION'S OWN HOLDS (G3), asked at the click and again before each
-/// later write of a press: halted (`fabric`), parked for an update, or
-/// another driver's lease on it. `None`: none stands.
 fn slash_holds(ctx: &crate::SessionCtx) -> Option<SlashRefusal> {
     if crate::fabric::halt_refusal(ctx, "send").is_some() {
         return Some(SlashRefusal::Halted);
@@ -693,9 +562,7 @@ fn slash_holds(ctx: &crate::SessionCtx) -> Option<SlashRefusal> {
 }
 
 impl App {
-    /// `session`'s engine read once ([`EngineRead`]): `None` for a gone
-    /// session or a view scrolled into history. The lock is held only to
-    /// copy.
+    /// `session`'s engine read once ([`EngineRead`]): `None` for a gone session or a view scrolled into history.
     pub(crate) fn slash_engine_read(&self, session: u64) -> Option<EngineRead> {
         let entry = self.pool.get(session)?;
         let human = entry.ctx.human_input.seq();
@@ -724,8 +591,7 @@ impl App {
         })
     }
 
-    /// Whether `session`'s engine shows the top-effort key's tag on its
-    /// composer's top rule now; `None` without a composer to read.
+    /// Whether `session`'s engine shows the top-effort key's tag on its composer's top rule now; `None` without a composer to read.
     #[must_use]
     pub(crate) fn engine_top_tag(&self, session: u64) -> Option<bool> {
         let read = self.slash_engine_read(session)?;
@@ -745,9 +611,6 @@ impl App {
     }
 
     /// Write `bytes` into `session` fenced against `read` at row `row`, the
-    /// one its cursor stands on: the screen generation it read, the
-    /// person's count `human`, and that row as it read, at the cursor
-    /// (`InputFence::guard_at_cursor` matches the cursor's row alone).
     fn slash_write(
         &self,
         session: u64,
@@ -786,11 +649,7 @@ impl App {
         )
     }
 
-    /// THE CLICK'S HALF (module header, step 1): begin typing `slash` into
-    /// `session` for a gesture in window `wid` — the probe `/` written as
-    /// the person's — or say why not, having typed nothing. Run on the
-    /// person's gesture only (a click, Return or Space on a selected target,
-    /// a menu row chosen, a reader's press): never on a wake or a frame.
+    /// THE CLICK'S HALF (module header, step 1): begin typing `slash` into `session` for a gesture in window `wid` — the probe `/` written as the person's — or say why not, having typed nothing.
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -807,7 +666,6 @@ impl App {
     ) -> Result<(), SlashRefusal> {
         let result = self.begin_slash(wid, session, slash);
         if let Err(why) = result {
-            // Said where the person looks; a press already in flight keeps
             // its own words.
             if why != SlashRefusal::InFlight {
                 self.note_fact_said(wid, session, why.says("", None), REFUSAL_SHOWN);
@@ -827,7 +685,6 @@ impl App {
             return Err(SlashRefusal::NotReady);
         };
         let ctx = entry.ctx.clone();
-        // G1: Claude Code's own composer alone.
         let (claude, pgid, model, foreground) = {
             let tl = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
             (
@@ -843,17 +700,13 @@ impl App {
         let Some(foreground) = foreground else {
             return Err(SlashRefusal::NotReady);
         };
-        // G2: one aterm input per session, a mode return's included.
         if self.slash_in_flight(session) || self.mode_return_in_flight(session) {
             return Err(SlashRefusal::InFlight);
         }
-        // G3: the session's own holds.
         if let Some(why) = slash_holds(&ctx) {
             return Err(why);
         }
         let probe = InputEvent::KeySequence(b"/".to_vec());
-        // G4-G9, then the write; a screen that moved between them is read
-        // and written once more.
         for attempt in 0..2 {
             let read = self
                 .slash_engine_read(session)
@@ -889,8 +742,6 @@ impl App {
                     return Err(SlashRefusal::InputRejected);
                 }
             }
-            // The person's own input: it holds the supervisor off as a
-            // keystroke does.
             self.note_person_input(session, &probe, Source::Human);
             let counts = ctx.human_input.counts();
             self.claude_facts.entry(session).or_default().press = Some(SlashPress {
@@ -908,8 +759,6 @@ impl App {
                 writes: 1,
             });
             self.claude_facts.entry(session).or_default().ended = None;
-            // Said while it runs: its own poll wakes it, and its end says
-            // what came of it — no wake of the pending words' own.
             self.set_fact_said(wid, session, slash.pending(), ECHO + QUIET + ECHO + ANSWER);
             crate::claude_lights::wake_after(session, SLASH_POLL);
             return Ok(());
@@ -917,12 +766,7 @@ impl App {
         Err(SlashRefusal::Moved)
     }
 
-    /// THE WAKE'S HALF (module header, steps 2 and 3, and the answer):
-    /// every press in flight one step from its engine as it is now — never a
-    /// painted frame — its writes aterm's own (`Source::Controller`). A
-    /// person's input since the press began stops it first. Each press in
-    /// flight keeps ONE poll armed. A stop's words past their showing are let
-    /// go.
+    /// THE WAKE'S HALF (module header, steps 2 and 3, and the answer): every press in flight one step from its engine as it is now — never a painted frame — its writes aterm's own (`Source::Controller`).
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -1009,13 +853,7 @@ impl App {
             self.end_slash(session, SlashEnd::Stopped(SlashRefusal::Changed), "", None);
             return;
         }
-        // The person first: a gesture of theirs that reached the program
-        // since the probe, and nothing more is sent. One that reached none
-        // (a selection's click, a viewport's scroll) touched no composer:
-        // the fence moves on to the count it made.
         let counts = entry.ctx.human_input.counts();
-        // The session's own holds, taken since the click: nothing more is
-        // written under a halt, a park or another driver's lease.
         let holds = (press.stage != Stage::Entered)
             .then(|| slash_holds(&entry.ctx))
             .flatten();
@@ -1037,9 +875,6 @@ impl App {
             press.human_after = counts.seq;
             self.with_press(session, |p| p.human_after = counts.seq);
         }
-        // A read that found no live screen, or a reader that panicked on it,
-        // decides as no screen does: wait, and stop past the deadline — a
-        // press never polls on with nothing to read.
         let read = self.slash_engine_read(session);
         let step = read
             .as_ref()
@@ -1077,8 +912,6 @@ impl App {
                         p.deadline = now + ECHO;
                         p.writes += 1;
                     }),
-                    // A person's gesture between the read and the write is
-                    // judged by the next poll (reached the program, or not).
                     GuardedInput::Changed | GuardedInput::Skipped | GuardedInput::Person => {}
                     GuardedInput::Pressed(_) => {
                         self.end_slash(
@@ -1135,7 +968,6 @@ impl App {
                 return;
             }
         }
-        // Still in flight: keep one poll armed.
         let due = self
             .claude_facts
             .get_mut(&session)
@@ -1164,10 +996,6 @@ impl App {
     }
 
     /// END `session`'s press: done or stopped, `left` what the composer
-    /// holds of it, `latch` a refusal Claude answered. Its words go in the
-    /// title slot of the window it began in for their showing; the facts'
-    /// titles and an open fact menu follow. Nothing is sent, and the
-    /// composer is left as it is.
     fn end_slash(
         &mut self,
         session: u64,
@@ -1201,7 +1029,6 @@ impl App {
             SlashEnd::Done => press.slash.done(),
             SlashEnd::Stopped(why) => Some(why.says(left, named.as_deref())),
         };
-        // One wake at the words' end, which is the end's too (`ended`).
         let woken = match words {
             Some(words) => self.note_fact_said(press.wid, session, words, shown),
             None => {
@@ -1210,7 +1037,6 @@ impl App {
             }
         };
         if end == SlashEnd::Done {
-            // The key turned on here exists for this process: its ghost may
             // stand in for Claude's tag once it is off again.
             if press.slash == Slash::TopEffort(true) {
                 self.claude_facts.entry(session).or_default().top_seen = Some(press.pgid);
@@ -1226,7 +1052,6 @@ impl App {
     }
 
     /// Ask the footer's resolver to read `session`'s facts now (an Enter
-    /// went, a press is done): Claude's answer lands in its transcript.
     fn request_footer_now(&self, session: u64, pgid: i32) {
         #[cfg(test)]
         {
@@ -1246,9 +1071,6 @@ impl App {
 }
 
 /// `claude_slash_press` environment actions, each waived where the Tier-1
-/// test (`claude_lights::slash_tests`) drives it on the real engine.
-// The slash press's actions that are not aterm's: Claude's own echoes,
-// boxes and turns, and the person's keys and settings.
 #[cfg(all(any(test, debug_assertions), unix))]
 #[aterm_spec_anchor::spec_unmodeled(
     machine = "claude_slash_press",
@@ -1316,11 +1138,9 @@ fn slash_press_environment_waivers() {}
 
 #[cfg(test)]
 thread_local! {
-    /// What a test does between the click's read of the engine and its
-    /// write: Claude drawing meanwhile.
+    /// What a test does between the click's read of the engine and its write: Claude drawing meanwhile.
     pub(crate) static BETWEEN_READ_AND_WRITE: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
         const { std::cell::RefCell::new(None) };
-    /// The footer reads a press asked for, in a test build: the resolver's
-    /// thread would read a process the test has none of.
+    /// The footer reads a press asked for, in a test build: the resolver's thread would read a process the test has none of.
     pub(crate) static FOOTER_ASKED: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }

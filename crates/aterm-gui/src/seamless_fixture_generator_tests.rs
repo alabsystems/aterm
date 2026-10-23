@@ -1,58 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The handoff fixture generator: what this release's producer writes, for every desk in
-//! `REQUIRED_DESKS` and for the rendezvous transport, recorded so every later release's guard
-//! (`seamless_fixture_tests.rs`) can run it through its consumer
-//! (`tests/fixtures/handoff/README.md`).
-//!
-//! It is compiled into every `aterm-gui` library test build, beside the carry
-//! tests whose helpers it reuses (`FakeApp`, `old_session`, `ENV_LOCK`,
-//! `pipe_pair`, `restore_env`, `this_build`, `child_proof_from`), and calls the
-//! release's own policy reader, capture ladder, history carry, writer and
-//! consumer, and the guard's own rendezvous capture. An API change that breaks
-//! it fails to compile, and each release's tree carries the generator that
-//! matches its producer. Both tests run in isolated children: ordinary test
-//! runs generate and validate private scratch fixtures; the release cutter
-//! supplies an explicit destination and release stamp for publication.
-//!
-//! THE FIELDS ITS DESKS WRITE are recorded beside them (`fields.toml`,
-//! [`fx_record_fields`]) and held to the newest release that recorded its own:
-//! a carried field added since, or a field or variant an earlier release's
-//! desks wrote, that no desk here gives a value stops every ordinary test run
-//! and the cut, until a desk writes it as a real session would.
-//!
-//! WHAT MAIN WILL ASK OF THEM is asked here too: every desk written goes through the desk
-//! guard's own per-desk check (`fixture_tests::assert_written_desks_adopt`), and the serde
-//! corpus's sweep of every shipped producer's bytes reads them as it will once they are checked
-//! in ([`fx_record_shipped_state`]), so a desk main's tests would refuse fails this run, not
-//! main after the release lands it.
-//!
-//! `targo --unverified ship release` runs them in the cut tree once the release's identity is
-//! reserved, and lands what they wrote on main after the cut (`aterm-release`'s `fixtures.rs`),
-//! with the sweep's answers for them.
-//! By hand (the README's fallback):
-//!
-//! ```text
-//! ATERM_BUILD_GIT_COMMIT=<the tag's 12-digit commit> \
-//! ATERM_BUILD_GIT_COMMIT_FULL=<the tag's 40-digit commit> \
-//! SOURCE_DATE_EPOCH=<the release's build number in RELEASES.ledger> \
-//! ATERM_HANDOFF_FIXTURE_OUT=<dir>/vX.Y.0 ATERM_RENDEZVOUS_FIXTURE_OUT=<dir>/vX.Y.0 \
-//!   targo --unverified test -p aterm-gui --lib -- generate_ --test-threads 1
-//! ```
-//!
-//! Every release input is derived, never spelled: [`fx_install_release_stamp`] installs the stamp
-//! the shipped binary carries from the three pins above, so `producer_version`, `producer_commit`
-//! and each manifest's `outgoing_build` are the release's; the successor is a build a day newer at
-//! the next minor, and the policy desks' rescue range names the release's own build. A release
-//! that changes its producer's shape changes this code with it, adds a desk for the shape to
-//! `REQUIRED_DESKS` with itself as the floor, and says what changed in the README's section for it.
+//! Handoff fixture generator for seamless upgrade compatibility tests.
 
 use super::*;
 
 /// Keep the installed build stamp and generator environment out of sibling
-/// tests. An explicit destination retains the release caller's required pins;
-/// ordinary tests use the deterministic library stamp and a private directory.
 fn fx_generator_in_child(output: &str) -> bool {
     if crate::test_alone::in_child() {
         return true;
@@ -93,9 +46,6 @@ fn fx_generator_in_child(output: &str) -> bool {
 
 const FIXTURE_DIR_PLACEHOLDER: &str = "@HANDOFF_DIR@";
 /// The successor these desks hand to: a build a day newer than this release's own, the hop every
-/// install of this release makes. It decides the wire caps (`WireCaps::for_target`), that the
-/// history is exported at all, the held panes' too (`handoff_history::exports_for_target`), and
-/// the words the control carry spells its records in (`StatusWords::for_target`).
 fn fx_target_build() -> u64 {
     crate::running_build_number() + FX_SUCCESSOR_AFTER_SECS
 }
@@ -103,7 +53,6 @@ fn fx_target_build() -> u64 {
 const FX_SUCCESSOR_AFTER_SECS: u64 = 86_400;
 const FIXTURE_TARGET_COMMIT: &str = "fedcba987654";
 /// The successor's version, as the update row names it
-/// (`update_words::installing`): the next MINOR after this release's.
 fn fx_successor_version() -> String {
     let version = crate::build_info::version();
     let mut parts = version.split('.').map(|part| part.parse::<u64>().ok());
@@ -115,7 +64,6 @@ fn fx_successor_version() -> String {
     }
 }
 /// The exit ledger's last row id each desk's store carries (`SessionHandoff::roster_seq`): seven
-/// shells exited before the park.
 const FX_ROSTER_SEQ: u64 = 7;
 
 fn fx_hex(bytes: &[u8]) -> String {
@@ -123,7 +71,6 @@ fn fx_hex(bytes: &[u8]) -> String {
 }
 
 /// `epoch` as the RFC3339 UTC timestamp `date -u +%Y-%m-%dT%H:%M:%SZ` prints
-/// (days to the civil date by Howard Hinnant's `civil_from_days`).
 fn fx_rfc3339(epoch: u64) -> String {
     let (days, secs) = (epoch / 86_400, epoch % 86_400);
     let z = days + 719_468;
@@ -144,14 +91,6 @@ fn fx_rfc3339(epoch: u64) -> String {
 }
 
 /// The release's own build stamp, installed before anything reads provenance. The shipped binary's
-/// stamp comes from `crates/aterm/build.rs` (installed by `main`) and this test binary reads a
-/// fixed one, so the generator reads the three pins the release build hands that script
-/// (`ATERM_BUILD_GIT_COMMIT`, `ATERM_BUILD_GIT_COMMIT_FULL`, `SOURCE_DATE_EPOCH`) and installs what
-/// it stamps from them: a clean tree at that commit. The first install wins, so this runs first;
-/// the closing assertion proves this process reads it. The rest of the `BuildStamp` is the shipped
-/// binary's too (this tree's version, the release's prover, the release lane's profile,
-/// verification state and marker); none of the compiler, profile or verification fields reaches a
-/// fixture byte.
 fn fx_install_release_stamp() {
     let var = |name: &str| {
         std::env::var(name)
@@ -209,8 +148,6 @@ struct FxCompiler {
 }
 
 /// The release's compiler: `trustc -vV` of the release's prover (`$TRUST_STAGE2_BIN`, which the
-/// cutter builds the release with and hands every child), else the `trustc` on PATH. Read as
-/// `crates/aterm/build.rs` reads it, and refused unless it is Trust.
 fn fx_release_compiler() -> FxCompiler {
     let trustc = std::env::var_os("TRUST_STAGE2_BIN")
         .filter(|bin| !bin.is_empty())
@@ -220,8 +157,6 @@ fn fx_release_compiler() -> FxCompiler {
         );
     let out = match aterm_uds::spawnfd::command(&trustc).arg("-vV").output() {
         Ok(out) => out,
-        // No trustc on PATH is the host's, not the tree's: `verify` and the
-        // release cutter name one. A `$TRUST_STAGE2_BIN` without one is not.
         Err(e) if e.kind() == std::io::ErrorKind::NotFound && trustc.is_relative() => {
             aterm_uds::host::could_not_run(format_args!(
                 "no {} here: set $TRUST_STAGE2_BIN or put trustc on PATH",
@@ -263,14 +198,10 @@ struct FxSession {
     term: Arc<Mutex<Terminal>>,
     turns: Arc<Mutex<TurnLedger>>,
     /// Its timeline ([`fx_timeline`]): its session log rides the control
-    /// carry and the record, and its epoch the layout leaf.
     timeline: Arc<Mutex<crate::session_timeline::SessionTimeline>>,
     /// The rung this release's ladder carries this session at: `Full` for every honest desk,
-    /// `StrippedLinks` for a screen holding a line record over the wire's per-record cap. The
-    /// capture asserts it, and that the self-check (`settle_wire_carries`) lowers nothing.
     rung: CarryRung,
     /// How many of the lines the `.hist` sidecar carries for import (its first `take`) lose their
-    /// links to the export: `0` on every desk but the one for that shape. The writer asserts it.
     taken_links_stripped: usize,
 }
 
@@ -278,8 +209,6 @@ struct FxDesk {
     name: &'static str,
     nonce_seed: u128,
     /// The carry ceiling of the successor's handoff policy this desk is parked under: `Full` for
-    /// the release's own checked-in (empty) policy, `Visible` or `Repaint` for a successor whose
-    /// signed policy asks for that (`fx_park_policy` lays the file out and reads it either way).
     ceiling: aterm_update_core::handoff_policy::CarryCeiling,
     window: WindowCarry,
     sessions: Vec<FxSession>,
@@ -287,25 +216,14 @@ struct FxDesk {
     connections: Vec<ConnectionCarry>,
     next_turn_id: Option<u64>,
     /// The bridge `fabric attach` armed beyond the configured one, as the
-    /// park draws it (`fabric_launch::handoff_attached`): empty on every desk
-    /// but `carried-state`.
     fabric_attached: Vec<String>,
     /// The panes kept open after their command exited (`--hold`): in the
-    /// layout, never handed, their final screens carried beside the
-    /// manifest since v0.100.0. Empty on every desk
-    /// but `held-pane` and the held-history desks.
     held: Vec<FxHeld>,
     /// What the park draws from its store beside the records
-    /// (`SessionHandoff::from_store`): nothing on every desk but
-    /// `carried-state`.
     drawn: FxDrawn,
 }
 
 /// The rows a park draws from the store and the status item rather than
-/// from a session (`SessionHandoff::from_store`, `App::fleet_told_rows`):
-/// the fleet needs whose notice the owner was told, the bus mirror's closed
-/// sessions, and whether a bridge served the mirror. The machine's names are
-/// drawn for every desk ([`fx_machine_names`]).
 #[derive(Default)]
 struct FxDrawn {
     fleet_told: Vec<String>,
@@ -314,16 +232,11 @@ struct FxDrawn {
 }
 
 /// The names the kernel gave every desk's machine as the park reads them
-/// (`tab_label::machine_names_for_handoff`), which every park writes: the
-/// name each desk's shells report in their OSC 7 (`file://devhost/…`), and
-/// the name the network gave the machine since they started.
 fn fx_machine_names() -> Vec<String> {
     ["devhost", "devhost-2.local"].map(String::from).to_vec()
 }
 
 /// One held pane: the pool id its layout leaf names, its engine and turn ledger, how its command
-/// ended as the outgoing process collected it (`App::exit_status`), and whether the person had
-/// looked at the failure its exit marks the tab for (`StatusObserver::failure_seen`).
 struct FxHeld {
     local_id: u64,
     term: Arc<Mutex<Terminal>>,
@@ -333,10 +246,6 @@ struct FxHeld {
     exit: Option<aterm_pty::ChildExit>,
     failure_seen: bool,
     /// A resize that reached the pane after its held capture and before the
-    /// history export did (`App::history_sessions` exports after the park):
-    /// the fence the capture took no longer names its lines, so its scrollback
-    /// is left behind as a failure (`HeldLoss::Failed`). `None` on every held
-    /// pane but `held-failed`'s.
     resized: Option<(u16, u16)>,
 }
 
@@ -359,22 +268,13 @@ fn fx_record(local_id: u64, title: &str) -> SessionRecord {
         control: None,
         frozen_path: false,
         topics: Vec::new(),
-        // Stamped by the park capture (`fx_write`, as `stamp_fg_holders`).
         fg_holder: None,
         rekey: false,
         loader: false,
-        // Stamped by the history carry's join (`stamp_manifest`), which also says whether a
-        // successor's policy withheld the carry (`history_withheld`; never under the shipped empty
-        // policy).
         history: None,
         history_dropped: 0,
         history_withheld: false,
         history_lost: 0,
-        // As `SessionHandoff::from_store` fills them for a session nobody halted, supervised
-        // from outside or escalated: no halt, no other supervisor's lease (so a claim the producer
-        // vouches for), no keyed escalation, an empty outbox, and the timeline's next id plus the
-        // overlap's reserve (`SessionTimeline::handoff_id`). `viewport_from_bottom` is stamped
-        // with the history carry, from the park's head.
         hold: None,
         more_holds: Vec::new(),
         supervisor: None,
@@ -383,16 +283,8 @@ fn fx_record(local_id: u64, title: &str) -> SessionRecord {
         viewport_from_bottom: None,
         fabric: crate::fabric::FabricCarry::default(),
         timeline_id: 24 + local_id * 3 + crate::session_timeline::HANDOFF_ID_RESERVE,
-        // Drawn from the session's log with the manifest (`fx_write`, as
-        // `SessionHandoff::from_store`).
         log_ids: None,
         log_seq: 0,
-        // Since v0.101.0, stamped by the park (`fx_write`, as
-        // `stamp_render_debts` and `stamp_journal_keys`): the rows the engine
-        // owed a carried alternate screen, and the crash journal key of a
-        // shell whose journal image was not this process's own: none here,
-        // and a desk sets one where another window wrote the image
-        // (`carried-state`'s session 1).
         render_debt: None,
         render_debt_cut: 0,
         journal_key: None,
@@ -403,11 +295,6 @@ fn fx_record(local_id: u64, title: &str) -> SessionRecord {
 }
 
 /// A pooled session's timeline as its registration leaves it
-/// (`SessionStore::register`): `spawned` recorded and its session log's
-/// session node opened, the log at this process's next epoch
-/// (`SessionTimeline::default`). Since the session log's phase 2A the park
-/// carries that log (`handoff_carry::capture_head`, `SessionRecord::log_ids`
-/// and `log_seq`), and since phase 6A-2 every layout leaf names its epoch.
 fn fx_timeline() -> Arc<Mutex<crate::session_timeline::SessionTimeline>> {
     let mut timeline = crate::session_timeline::SessionTimeline::default();
     timeline.record("spawned", "state=alive".to_string());
@@ -447,26 +334,15 @@ fn fx_leaf(local_id: u64, title: &str, cwd: Option<&str>) -> crate::restore::Res
         autopilot: None,
         land_at: None,
         autopilot_by: None,
-        // Since v0.95.0 the crash journal's and a system quit's layout fill
-        // it; the handoff's only for a cold restore's agent whose relaunch is
-        // still owed (`pending_restored_agent`: `carried-state`'s session 1).
         agent: None,
         supervised: None,
         lost: None,
-        // A pane kept open after its command exited.
         held: false,
         holds: Vec::new(),
     }))
 }
 
 /// EVERY TERMINAL LEAF AS THE HANDOFF'S CAPTURE WRITES IT
-/// (`App::view_restore_descriptor_carrying`), off the pooled session it
-/// names: its sid, the first session of the restores it continues (its
-/// lineage) and the epoch its log is at (written by every capture since the
-/// session log's phase 2A and 6A-2), and the operator's
-/// metadata in lockstep with the session's record (drawn from `SessionMeta`).
-/// A leaf that names no session of
-/// the desk keeps what its builder gave it.
 fn fx_capture_leaves(desk: &mut FxDesk) {
     use crate::restore::{RestoredSplitTree, RestoredView};
     fn walk(node: &mut RestoredSplitTree, fill: &dyn Fn(&mut crate::restore::TerminalLeafRestore)) {
@@ -495,8 +371,6 @@ fn fx_capture_leaves(desk: &mut FxDesk) {
         } else {
             return;
         };
-        // The first session of the restores it continues, where that is not
-        // the session itself (`App::view_restore_descriptor_carrying`).
         let (lineage, log_ep) = {
             let timeline = timeline.lock().unwrap();
             (timeline.slog().lineage(), timeline.slog().log().ep())
@@ -551,8 +425,6 @@ fn fx_tab(root: crate::restore::RestoredSplitTree) -> crate::restore::RestoredTa
 }
 
 /// A restored tree's legacy mirror (`PaneLayout`), as `PaneTree::to_layout` writes it: the
-/// divider's orientation where the restored tree names the children's (children side by side are
-/// the restored `Horizontal` and the legacy `Vertical`), and the tab's focused leaf marked.
 fn fx_pane_mirror(
     node: &crate::restore::RestoredSplitTree,
     focused: Option<u64>,
@@ -585,13 +457,6 @@ fn fx_pane_mirror(
     })
 }
 
-// Every desk's layout window, built by hand as `App::capture_manifest` writes one for a handoff:
-// the canonical `restored_tabs` and the legacy mirrors capture fills from the same tabs (`tabs`,
-// one `PaneLayout` per all-terminal tab; `native_tabs`, one descriptor per single-view native tab;
-// `tab_order` interleaving the two), and on macOS the window's `show` state
-// (`window_show::captured_show`: on screen, neither full screen nor minimized, frontmost and key)
-// and its raw inner size (`fx_inner_px`). A desk with a second window lowers that one's place in
-// the stack.
 fn fx_window(
     rows: u16,
     cols: u16,
@@ -601,9 +466,6 @@ fn fx_window(
 }
 
 /// A window's raw inner size as this release's capture reads it (`WindowState::win_px`, written as
-/// `WindowLayout::inner_px` and, for window 0, `WindowCarry::inner_px`): an unzoomed window is
-/// exactly the frame of its grid and the `band_rows` message-band rows above it
-/// (`App::window_frame_px_for`), at this build's default metrics.
 fn fx_inner_px(rows: u16, cols: u16, band_rows: u16) -> Option<[u32; 2]> {
     let app = crate::App::headless_for_test();
     let size = app.frame_px(rows.saturating_add(band_rows), cols);
@@ -624,7 +486,6 @@ fn fx_window_in(
     let mut native_tabs = Vec::new();
     let mut tab_order = Vec::new();
     for tab in &tabs {
-        // The focused leaf, down the tab's focus path.
         let mut node = &tab.root;
         for branch in &tab.focused_path {
             let RestoredSplitTree::Split { first, second, .. } = node else {
@@ -659,7 +520,6 @@ fn fx_window_in(
                 ("system-state", None, None) => NativeTabRestore::SystemState,
                 other => panic!("a native tab this generator does not spell: {other:?}"),
             };
-            // The mirror's one rule: no second Settings and no second copy.
             if descriptor.joins_mirror(&native_tabs) {
                 tab_order.push(TabOrderEntry::Native {
                     index: native_tabs.len(),
@@ -685,8 +545,6 @@ fn fx_window_in(
         outer_x: Some(96),
         outer_y: Some(48),
         maximized: None,
-        // Since v0.101.0: the size the successor recreates the window at, and whether a
-        // presence row stood under its chrome (none here, so not written).
         inner_px: fx_inner_px(rows, cols, band_rows),
         presence_row: false,
         show,
@@ -699,8 +557,6 @@ fn fx_window_in(
 }
 
 fn fx_window_carry(rows: u16, cols: u16, installing: bool) -> WindowCarry {
-    // The update's flow row as the real App posts it and hands it over, and (since v0.101.0)
-    // when the messages were captured (`App::carried_messages`, which every park calls).
     let mut app = crate::App::headless_for_test();
     if installing {
         app.post_message(crate::update_words::installing(&fx_successor_version()));
@@ -712,16 +568,12 @@ fn fx_window_carry(rows: u16, cols: u16, installing: bool) -> WindowCarry {
         cols,
         outer_x: Some(96),
         outer_y: Some(48),
-        // Since v0.101.0: window 0's raw inner size, and no presence row.
         inner_px: fx_inner_px(rows, cols, band_rows),
         presence_row: false,
         status_bar_rows: band_rows,
-        // Verified an hour after the successor was built.
         update_verified_unix_ms: installing.then_some((fx_target_build() + 3_600) * 1_000),
         messages: carried.messages,
         next_message_id: carried.next_message_id,
-        // Since v0.100.0 (`App::handoff_window_carry`): the font zoom, only when the person
-        // zoomed (`App::handoff_font_zoom`), and what the parent's health warnings said.
         font_px_milli: None,
         font_reset_px_milli: None,
         font_size_milli: None,
@@ -820,17 +672,6 @@ fn fx_claude(local_id: u64, rows: u16, cols: u16, before: usize) -> FxSession {
 }
 
 /// The park's policy, as an install of this release reads it. The cut copies the successor's
-/// `publish/handoff-policy.toml` into its bundle at `BUNDLE_PATH`; the producer's pre-verification
-/// reads it there (`handoff_policy::read_from_bundle`, after the codesign check) and keeps what it
-/// must follow (`handoff_policy::adopt`), which every park reads by the attempt's key
-/// (`App::park_policy`). Releases ship the file empty (`schema = 1`), so the park captures at the
-/// `Full` ceiling. This lays the checked-in file out as the cut does and runs that reader.
-///
-/// The policy desks (`want` below `Full`) stand for a successor whose cut sealed a rescue asking
-/// this producer for that ceiling: a `[[ranges]]` entry naming the producers it is for and its
-/// reason, with the top-level keys as the hull older builds follow (`PolicyFile::parse_for_cut`
-/// checks it). The same reader and `adopt` run over it, so the park's ceiling is the producer's
-/// own reading.
 fn fx_park_policy(
     scratch: &std::path::Path,
     want: aterm_update_core::handoff_policy::CarryCeiling,
@@ -856,7 +697,6 @@ fn fx_park_policy(
         )
         .into_bytes()
     };
-    // What the cutter seals: a file it would refuse is no release's policy.
     if let Err(why) = PolicyFile::parse_for_cut(std::str::from_utf8(&file).unwrap()) {
         panic!("a cut seals this successor's policy: {why}");
     }
@@ -891,9 +731,6 @@ fn fx_park_policy(
     let park = crate::app_update_handoff::ParkPolicy {
         policy: adopted,
         known: true,
-        // The pre-verification that read the policy also read the
-        // candidate's `Info.plist`; a successor newer than v0.100.0 declares
-        // the chunked rendezvous grant. Only the launched lane reads it.
         grant_chunks: true,
     };
     assert_eq!(
@@ -913,28 +750,16 @@ struct FxCapture {
     heads: Vec<crate::handoff_history::HistoryHead>,
     screen_digest: [u8; 32],
     /// The sessions whose parser the capture found mid-sequence, the state it was in, and whether
-    /// the carry holds that partial state (false for a hooked DCS, which no desk stands for).
     abandoned: Vec<(u64, &'static str, bool)>,
     /// The rung each session was carried at, and how many of its lines lost
-    /// their links (`StrippedLinks`).
     rungs: Vec<(u64, CarryRung, usize)>,
     /// The rows the engine owed each carried alternate screen (v0.101.0's
-    /// `ParkedScreens::render_debts`), only where not zero.
     render_debts: Vec<(u64, aterm_core::terminal::RenderDebt)>,
     /// The held panes' screens (`App::capture_held_screens`), captured last,
-    /// priced from what the handed screens left of the aggregate cells; their
-    /// control carries are in `sources`.
     held: Vec<HeldScreen>,
 }
 
 /// This release's capture (`App::capture_parked_screens`) over a desk whose time is ample, on the
-/// fork lane, under the park's policy `ceiling`: the pool walked in session-id order, its
-/// mandatory visible grids reserved first, then each session carried by `carry_for_wire_within`
-/// with 256 lines of history (none under a ceiling that carries no scrollback) when the cell and
-/// byte budgets admit it after that reserve, its history head and (at a rung that keeps it) its
-/// control carry's head taken under the same lock; then the pool committed by
-/// `settle_wire_carries`, and last the held panes (`fx_capture_held`). The repaint set is the
-/// sessions whose rung `needs_repaint`.
 fn fx_capture(
     sessions: &[FxSession],
     held: &[FxHeld],
@@ -965,14 +790,6 @@ fn fx_capture(
     for s in &order {
         let id = s.record.local_id;
         let guard = s.term.lock().unwrap();
-        // The parser and the output state ride the checkpoint: a partial sequence (since
-        // v0.100.0) and the engine's in-flight output state (since v0.101.0: the REP character,
-        // an open OSC 8 link, a VT52 address, the XTPUSHSGR stack...) cross for the successor to
-        // continue. A miss over queued output is left for a sequence no carry holds (a hooked DCS)
-        // and for one the carry would only swallow (an over-cap OSC) that is not a picture (a
-        // kitty-graphics APC, an OSC 1337 image or a sixel string, whose next frame replaces the
-        // one dropped). The fork lane has no mid-sequence re-park (`soft_miss_may_repark` is
-        // false), so the park carries those only over a quiet PTY.
         assert!(
             caps.carries_parser() && caps.carries_output_state(),
             "the hop these desks stand for carries the parser and the output state"
@@ -1045,8 +862,6 @@ fn fx_capture(
         );
         let mut stripped = 0;
         if rung == CarryRung::StrippedLinks {
-            // Only the over-cap records' links are gone, at the whole depth the budget asked
-            // for; everything else is the engine's own exact carry at that depth.
             let exact = guard
                 .checkpoint_carry(history as usize)
                 .expect("a link-dense desk is at Ground");
@@ -1065,8 +880,6 @@ fn fx_capture(
         if history != 0 && rung == CarryRung::VisibleOnly {
             history_latched_off = true;
         }
-        // The render debt (since v0.101.0), under the checkpoint's lock: what the engine owes the
-        // alternate screen of a session whose screen is carried (not blank on purpose).
         if rung != CarryRung::Repaint && guard.modes().alternate_screen {
             let debt = guard.render_debt();
             if debt.owed() {
@@ -1080,10 +893,6 @@ fn fx_capture(
         )
         .map_or(u64::MAX, |bytes| capture_budget.saturating_add(bytes));
         heads.push(crate::handoff_history::capture_head(id, &guard));
-        // Since v0.100.0 every session's control carry travels; a rung that does not keep the
-        // screen it describes goes without the differ's state only.
-        // It holds the session's log too (`capture_parked_screens` hands the
-        // session's timeline), as since the session log's phase 2A.
         let mut source = handoff_carry::capture_head(
             id,
             &guard,
@@ -1140,8 +949,6 @@ fn fx_capture(
         repaint.is_empty() || ceiling == aterm_update_core::handoff_policy::CarryCeiling::Repaint,
         "only a successor's `carry = \"repaint\"` policy repaints a session here"
     );
-    // The held panes, last: they get what the handed screens left of the aggregate cells, and
-    // their control carries join the handed sessions'.
     let held = fx_capture_held(held, &mut capture_cells, caps, ceiling, &mut sources);
     FxCapture {
         screens,
@@ -1157,14 +964,6 @@ fn fx_capture(
 }
 
 /// This release's held capture (`App::capture_held_screens`): every pooled pane not handed, in id
-/// order, its visible screen at the most faithful rung the successor's caps and the policy's
-/// ceiling admit, without scrollback, priced from what the handed screens left of the aggregate
-/// cells. Since v0.101.0 each also carries its session id, its scrollback's line count and fence
-/// (its export is joined against them when the manifest is written), whether the person had seen
-/// its failure, and, pushed onto `carries` under the same lock, its control carry's head without
-/// the differ's state. A pane that would go blank for a repaint, whose meta `held_screen_meta`
-/// refuses, or past the held caps is left out; no desk stands for those, so every held pane must
-/// be kept.
 fn fx_capture_held(
     held: &[FxHeld],
     capture_cells: &mut u64,
@@ -1226,7 +1025,6 @@ fn fx_capture_held(
 }
 
 /// Every line of `t`'s history-holding grid (the saved primary under an
-/// alternate screen), as text.
 fn fx_history_text(t: &Terminal) -> Vec<String> {
     let grid = t.main_grid();
     (0..grid.scrollback_lines())
@@ -1239,7 +1037,6 @@ fn fx_history_text(t: &Terminal) -> Vec<String> {
 }
 
 /// Every line of `t`'s history-holding grid (the saved primary under an
-/// alternate screen), oldest first.
 fn fx_history_lines(t: &Terminal) -> Vec<aterm_core::scrollback::Line> {
     let grid = t.main_grid();
     (0..grid.scrollback_lines())
@@ -1252,10 +1049,6 @@ fn fx_history_lines(t: &Terminal) -> Vec<aterm_core::scrollback::Line> {
 }
 
 /// `lines` as v0.98.0 carries them at `cols`: a line whose record is over the
-/// wire's per-record cap (`line_record_cap`, the arithmetic of both the screen
-/// carry's link-stripping rung and the history export's `line_caps`) loses its
-/// OSC 8 links, and every other line is exact. Returns the lines and how many
-/// lost their links.
 fn fx_carried_lines(
     lines: &[aterm_core::scrollback::Line],
     cols: u16,
@@ -1277,8 +1070,6 @@ fn fx_carried_lines(
 }
 
 /// `got` is `want` line for line: as text first (so a failure names the lines
-/// that differ), then as each line's own record, every cell's style, link and
-/// width.
 fn fx_assert_same_lines(
     got: &[aterm_core::scrollback::Line],
     want: &[aterm_core::scrollback::Line],
@@ -1300,10 +1091,6 @@ fn fx_assert_same_lines(
 }
 
 /// Every line of a v0.98.0 `.hist` sidecar, read off its bytes by the line codec alone:
-/// `ATHIST1\n`, the width (`u16` LE), two zero bytes, then frames of a `u32` LE length and a
-/// line-codec block. Each frame must decode under the strict per-line bounds the import reads it
-/// under (`cols * 256` content bytes, `line_record_cap(cols)` a record): v0.98.0's export drops an
-/// over-cap line's links before it writes, so no record in it is over the cap.
 fn fx_sidecar_lines(label: &str, bytes: &[u8]) -> (u16, Vec<aterm_core::scrollback::Line>) {
     let (head, mut frames) = bytes.split_at_checked(12).expect("a sidecar header");
     assert_eq!(&head[..8], b"ATHIST1\n", "{label}: a history sidecar");
@@ -1330,8 +1117,6 @@ fn fx_sidecar_lines(label: &str, bytes: &[u8]) -> (u16, Vec<aterm_core::scrollba
 }
 
 /// The text of absolute row `abs` of `t`'s history-holding grid (the saved
-/// primary under an alternate screen), history or visible; `None` once the
-/// row is evicted or past the screen.
 fn fx_text_at(t: &Terminal, abs: u64) -> Option<String> {
     let grid = t.main_grid();
     let oldest = grid.oldest_absolute_row();
@@ -1358,12 +1143,8 @@ fn fx_write(desk: &FxDesk, scratch_root: &std::path::Path) {
     let dir = crate::control_auth::socket_dir().expect("control dir");
     std::fs::create_dir_all(&dir).unwrap();
 
-    // The successor's handoff policy, read as every park of this release reads it: the ceiling
-    // this park captures under.
     let (park, adopted) = fx_park_policy(&scratch, desk.ceiling);
     let ceiling = park.carry_ceiling();
-    // Real PTYs, before the capture: the capture polls a mid-sequence session's master, and the
-    // self-check below adopts them with this release's own consumer, which refuses a non-tty.
     let mut masters = Vec::new();
     let mut slaves = Vec::new();
     for _ in &desk.sessions {
@@ -1396,9 +1177,6 @@ fn fx_write(desk: &FxDesk, scratch_root: &std::path::Path) {
             })
             .collect(),
     };
-    // THE MANIFEST'S DRAW (`SessionHandoff::from_store`, before the capture):
-    // each session log's epoch and node-id counters and its seq count, with
-    // their overlap reserves, under the timeline's lock.
     let log_draws: Vec<(u64, String, u64)> = desk
         .sessions
         .iter()
@@ -1414,8 +1192,6 @@ fn fx_write(desk: &FxDesk, scratch_root: &std::path::Path) {
     let caps = WireCaps::for_target(fx_target_build());
     let capture = fx_capture(&desk.sessions, &desk.held, &fds.entries, caps, ceiling);
     let screens = &capture.screens;
-    // The foreground holder the park stamps on every record (`stamp_fg_holders`): the shell
-    // itself at a prompt, else the job it runs.
     let mut records: Vec<SessionRecord> = desk.sessions.iter().map(|s| s.record.clone()).collect();
     for (i, record) in records.iter_mut().enumerate() {
         let index = i32::try_from(i).unwrap();
@@ -1425,12 +1201,6 @@ fn fx_write(desk: &FxDesk, scratch_root: &std::path::Path) {
             41_000 + index
         };
         record.fg_holder = Some(holder).filter(|holder| *holder > 0);
-        // THE RENDER DEBT (v0.101.0, `stamp_render_debts`): `"<shift>,<pushed>"`,
-        // and the columns in their own key, for a session whose carried
-        // alternate screen the engine owed something, and nothing for any
-        // other. The journal key (`stamp_journal_keys`) is the desk's: none
-        // where this process's journal holds its own image, which is every
-        // session's but `carried-state`'s restored shell (session 1).
         record.carry_render_debt(
             capture
                 .render_debts
@@ -1445,8 +1215,6 @@ fn fx_write(desk: &FxDesk, scratch_root: &std::path::Path) {
         record.log_ids = Some(ids.clone());
         record.log_seq = *seq;
     }
-    // Each `(src, dst, op)` once, sorted, as `SessionHandoff::from_store` draws them (since
-    // v0.101.0).
     let mut connections = desk.connections.clone();
     connections.sort_by(|a, b| (&a.src, &a.dst, &a.op).cmp(&(&b.src, &b.dst, &b.op)));
     connections.dedup();
@@ -1464,16 +1232,8 @@ fn fx_write(desk: &FxDesk, scratch_root: &std::path::Path) {
         sessions: records,
         window: None,
         connections,
-        // The worker writes the turn-id count below (`manifest_turn_id`).
         next_turn_id: None,
         outgoing_build: Some(crate::running_build_number()),
-        // Since v0.100.0 (`SessionHandoff::from_store`): the held panes are
-        // named by the writer (`write_outgoing_with_held`); the exit
-        // ledger's last row id, so the successor counts on above it; and the
-        // bridge `fabric attach` armed beyond the configured one, if any.
-        // Since v0.108.0 ('s U10) the rows drawn beside the
-        // records: the fleet needs already told, the bus mirror's closed
-        // sessions and whether a bridge served it, and the machine's names.
         held: Vec::new(),
         roster_seq: Some(FX_ROSTER_SEQ),
         fabric_attached: desk.fabric_attached.clone(),
@@ -1482,12 +1242,6 @@ fn fx_write(desk: &FxDesk, scratch_root: &std::path::Path) {
         mirror_served: desk.drawn.mirror_served,
         machine_names: fx_machine_names(),
     };
-    // THE LAYOUT, captured after the screens and committed at the park
-    // (`App::capture_handoff_layout`, then `commit_handoff_layout`). Since
-    // v0.101.0 the capture folds a desk past the layout's caps into what one
-    // layout holds (`RestoreManifest::fold_into_caps`): a
-    // desk within them is left exactly as it was, and one past them
-    // (`folded`) is folded.
     let mut layout = desk.layout.clone();
     layout.fold_into_caps();
     let past_caps = desk.layout.windows.len() > crate::restore::MAX_WINDOWS
@@ -1514,12 +1268,6 @@ fn fx_write(desk: &FxDesk, scratch_root: &std::path::Path) {
         .unwrap_or_else(|refusal| {
             panic!("{}: the park commits its layout: {refusal:?}", desk.name)
         });
-    // The fork lane's history plan, under the ceiling the park was taken
-    // under (`HistoryPlan::deferred_under`): every pooled session, exported
-    // by the worker once the capture is done (`App::history_sessions`, which
-    // exports only to a successor that imports the sidecars). Since
-    // v0.101.0 the held panes' scrollback is exported too, after the handed
-    // sessions'.
     assert!(
         crate::handoff_history::exports_for_target(
             crate::running_build_number(),
@@ -1556,19 +1304,12 @@ fn fx_write(desk: &FxDesk, scratch_root: &std::path::Path) {
             desk.name
         );
     }
-    // The worker's first step on the fork lane refuses a capture taken above the policy it reads
-    // (`capture_exceeds_policy`); the park read the same policy.
     assert!(
         crate::app_update_handoff::capture_exceeds_policy(Some(ceiling), adopted).is_none(),
         "{}: the capture was taken under the policy the worker reads",
         desk.name
     );
     let nonce = format!("{:032x}", desk.nonce_seed);
-    // The worker, as `prepare_outgoing_artifacts` runs it on the fork lane: the layout's round
-    // trip (refused if empty, if it does not parse back to itself, or if its wire is not the
-    // committed digest), the control carry's export, the history carry's (exported now with every
-    // reader parked) with the held panes' exports taken out and the handed sessions' joined, the
-    // writer, then the layout sidecar.
     let layout_wire = layout
         .to_toml()
         .ok()
@@ -1583,21 +1324,13 @@ fn fx_write(desk: &FxDesk, scratch_root: &std::path::Path) {
         "{}: the layout's wire is the committed one",
         desk.name
     );
-    // The turn-id count: the ids this process minted (the desk's ledger) plus the reserve for the
-    // turns it still serves until its `_exit` (`turn_ids_for_handoff`, spelled out so the count is
-    // the desk's and not the test process's); the export spells its records in the successor's
-    // words.
     let minted = desk.next_turn_id.unwrap_or(0);
     let turn_id_ceiling = minted
         .saturating_add(crate::control::TURN_ID_RESERVE)
         .min(crate::handoff_carry::MAX_TURN_ID);
-    // The producer's own call (`app_update_handoff`'s park): the successor's
-    // words and, since it reads one, each session's log beside its ledger.
     let controls =
         handoff_carry::export_for_target(&capture.sources, turn_id_ceiling, fx_target_build());
     manifest.next_turn_id = handoff_carry::manifest_turn_id(turn_id_ceiling);
-    // A resize that reached a held pane after the capture moved the fence the
-    // capture took before the export read its scrollback.
     for pane in &desk.held {
         if let Some((rows, cols)) = pane.resized {
             pane.term.lock().unwrap().resize(rows, cols);
@@ -1634,8 +1367,6 @@ fn fx_write(desk: &FxDesk, scratch_root: &std::path::Path) {
             );
             continue;
         }
-        // The policy withheld the history: no sidecar, and every line the park saw beyond the
-        // checkpoint's is counted as the policy's.
         let parent_lines = fx_history_text(
             &desk
                 .sessions
@@ -1674,9 +1405,6 @@ fn fx_write(desk: &FxDesk, scratch_root: &std::path::Path) {
         );
     }
     for record in &manifest.sessions {
-        // Since v0.98.0 the record says a withheld carry as the successor's request
-        // (`history_withheld`): never under the empty policy, always for a session that leaves
-        // lines behind under one that withholds.
         assert_eq!(
             record.history_withheld,
             !ceiling.carries_scrollback() && record.history_dropped > 0,
@@ -1685,8 +1413,6 @@ fn fx_write(desk: &FxDesk, scratch_root: &std::path::Path) {
             record.local_id
         );
     }
-    // The held panes' screens go beside the manifest through the same writer, with their
-    // scrollback's exports (v0.101.0) and their control carries.
     let held = &capture.held;
     let outgoing = write_outgoing_with_held(
         &manifest,
@@ -1712,7 +1438,6 @@ fn fx_write(desk: &FxDesk, scratch_root: &std::path::Path) {
     );
     let manifest_path = std::path::PathBuf::from(&outgoing.manifest_path);
     let layout_path = manifest_path.with_extension("layout.toml");
-    // The layout sidecar, sealed at the park (the fork lane writes no speculative one).
     crate::handoff_diet::seal_layout(&layout_path, &layout_wire, None).expect("layout sidecar");
     let layout_wire = std::fs::read_to_string(&layout_path).unwrap();
     let layout = layout_wire_digest(&layout_wire).unwrap();
@@ -1791,8 +1516,6 @@ fn fx_write(desk: &FxDesk, scratch_root: &std::path::Path) {
         copied.push(name);
     }
     copied.sort();
-    // Each session's meta JSON, extracted for review (the manifest holds the
-    // hashed copy).
     let body = std::fs::read_to_string(&manifest_path).unwrap();
     let (_, toml) = body.split_once('\n').unwrap();
     let published = SessionHandoff::from_toml(toml).unwrap();
@@ -1837,9 +1560,6 @@ fn fx_write(desk: &FxDesk, scratch_root: &std::path::Path) {
             desk.name,
             rec.local_id
         );
-        // v0.98.0: the history export drops the links of every over-cap line before it writes the
-        // frame, so the sidecar is the parent's whole history with only those links gone. The row
-        // records how many lines crossed without their links.
         let history_links_stripped = if take > 0 {
             let hist = format!("{stem}.s{}.hist", rec.local_id);
             let (cols, lines) = fx_sidecar_lines(
@@ -1900,8 +1620,6 @@ fn fx_write(desk: &FxDesk, scratch_root: &std::path::Path) {
             rec.history_lost,
             rec.fg_holder.unwrap_or(0),
         ));
-        // v0.95.0's meta additions: the numbering the successor continues,
-        // and the colour and shell-integration state it carries.
         session_rows.push_str(&format!(
             "absolute_row_counter = {}\nalt_absolute_row_counter = {}\ncolor = {}\nshell_phase = {}\nshell_marks = {}\nshell_completed_seq = {}\n",
             cp.absolute_row_counter,
@@ -1911,15 +1629,10 @@ fn fx_write(desk: &FxDesk, scratch_root: &std::path::Path) {
             cp.shell.command_marks.len(),
             cp.shell.completed_seq,
         ));
-        // v0.97.0: the rung the session was carried at, and how many of its lines lost their links.
         session_rows.push_str(&format!("rung = \"{rung}\"\nlinks_stripped = {stripped}\n"));
-        // v0.98.0: how many lines of the session's `.hist` sidecar the export
-        // wrote with their OSC 8 links dropped (`0` without a sidecar).
         session_rows.push_str(&format!(
             "history_links_stripped = {history_links_stripped}\n"
         ));
-        // v0.101.0: whether the meta carries the engine's in-flight output
-        // state (`output_state`), and the render debt the record carries.
         session_rows.push_str(&format!(
             "output_state = {}\n",
             !cp.output_state.is_default()
@@ -1930,9 +1643,6 @@ fn fx_write(desk: &FxDesk, scratch_root: &std::path::Path) {
         if rec.render_debt_cut != 0 {
             session_rows.push_str(&format!("render_debt_cut = {}\n", rec.render_debt_cut));
         }
-        // The policy desks: whether the successor must make the program redraw, and the history
-        // lines this hop leaves behind. A row without them repaints and drops nothing, which is
-        // what every `Full` desk's rows say by leaving them out.
         if ceiling != aterm_update_core::handoff_policy::CarryCeiling::Full {
             session_rows.push_str(&format!(
                 "repaint = {}\nhistory_dropped = {}\n",
@@ -1941,9 +1651,6 @@ fn fx_write(desk: &FxDesk, scratch_root: &std::path::Path) {
         }
         session_rows.push('\n');
     }
-    // v0.100.0: each held pane the writer named, its geometry and how its command ended; since
-    // v0.101.0 its sid, its scrollback's carry (the `.h<id>.hist` take and the lines left behind),
-    // whether its control carry crossed and whether the person had seen its failure.
     assert_eq!(
         published
             .held
@@ -2049,10 +1756,6 @@ fn fx_write(desk: &FxDesk, scratch_root: &std::path::Path) {
     );
     std::fs::write(out.join("parent.toml"), parent).unwrap();
 
-    // Self-check: this release's own consumer adopts its own desk exactly (every session, nothing
-    // repainted but what the rung asks, the layout placed, the same digests, the proof the parent
-    // expects), and the history import after Commit gives each session its parent's whole
-    // history, so the fixture is a desk the release itself admits.
     let (ready_read, ready_write) = pipe_pair("ready");
     let (commit_read, commit_write) = pipe_pair("commit");
     // SAFETY: `getppid` is a side-effect-free libc getter.
@@ -2082,7 +1785,6 @@ fn fx_write(desk: &FxDesk, scratch_root: &std::path::Path) {
         "{}: the layout places every session",
         desk.name
     );
-    // Since v0.98.0 a Settings leaf's unsaved drafts ride the layout and are placed with its tab.
     assert_eq!(
         incoming.layout.as_ref().unwrap().carried_settings_drafts(),
         folded.carried_settings_drafts(),
@@ -2095,9 +1797,6 @@ fn fx_write(desk: &FxDesk, scratch_root: &std::path::Path) {
         "{}",
         desk.name
     );
-    // Every held pane is shown: its final screen at its geometry, without scrollback or a link,
-    // how its command ended, and since v0.101.0 its sid, its seen failure, its control carry and
-    // its scrollback's sidecar, taken before the proof.
     assert_eq!(
         incoming
             .held
@@ -2191,7 +1890,6 @@ fn fx_write(desk: &FxDesk, scratch_root: &std::path::Path) {
             .1;
         let restored = adopted.checkpoint.as_ref().unwrap();
         assert_eq!(restored.grid, carried.grid, "{}", desk.name);
-        // Both grids: a link-dense line on the saved primary is stripped in the inactive grid.
         assert_eq!(restored.alt_grid, carried.alt_grid, "{}", desk.name);
         assert_eq!(
             restored.shell_integration_nonce, carried.shell_integration_nonce,
@@ -2204,7 +1902,6 @@ fn fx_write(desk: &FxDesk, scratch_root: &std::path::Path) {
             "{}",
             desk.name
         );
-        // v0.95.0: the numbering, the application's colours and the shell-integration state.
         assert_eq!(
             (
                 restored.absolute_row_counter,
@@ -2234,8 +1931,6 @@ fn fx_write(desk: &FxDesk, scratch_root: &std::path::Path) {
             "{}",
             desk.name
         );
-        // v0.101.0: the in-flight output state crosses the meta intact, and the record's render
-        // debt is the one the successor seeds.
         assert_eq!(
             restored.output_state, carried.output_state,
             "{}: session {}'s output state crosses",
@@ -2255,8 +1950,6 @@ fn fx_write(desk: &FxDesk, scratch_root: &std::path::Path) {
             desk.name,
             adopted.local_id
         );
-        // The repaint set, the withheld history's count and (since v0.98.0) whether the policy
-        // withheld it cross.
         assert_eq!(
             adopted.repaint,
             capture.repaint.contains(&adopted.local_id),
@@ -2283,10 +1976,6 @@ fn fx_write(desk: &FxDesk, scratch_root: &std::path::Path) {
             adopted.local_id
         );
     }
-    // A stalled sequence rides the copy: the carried checkpoint holds the partial state for the
-    // successor to continue, or, for one no carry can hold, says Ground as if CAN had ended it.
-    // Either way the live parser keeps the partial sequence, so a rolled-back handoff resumes
-    // byte-exactly.
     for (id, state, held) in &capture.abandoned {
         let carried = &screens
             .iter()
@@ -2322,7 +2011,6 @@ fn fx_write(desk: &FxDesk, scratch_root: &std::path::Path) {
             desk.name
         );
     }
-    // The held panes, kept for their import after Commit.
     let held_shown = std::mem::take(&mut incoming.held);
     let ((child, ready, _), adopted) =
         child_proof_from(incoming).unwrap_or_else(|| panic!("{}: the child proves", desk.name));
@@ -2338,7 +2026,6 @@ fn fx_write(desk: &FxDesk, scratch_root: &std::path::Path) {
     )
     .unwrap();
     assert_eq!(child, expected, "{}: the proof is the parent's", desk.name);
-    // The ready signal owns its write end now, and closes it.
     drop(ready);
     for mut item in adopted {
         let parent = fx_history_text(
@@ -2394,8 +2081,6 @@ fn fx_write(desk: &FxDesk, scratch_root: &std::path::Path) {
             desk.name,
             item.local_id
         );
-        // Every line the policy let cross, and no other: the parent's whole history under `full`,
-        // only the checkpoint's lines (none) under a ceiling that withholds the scrollback.
         let crossed =
             usize::try_from(report.imported + u64::from(checkpoint.history_lines)).unwrap();
         assert_eq!(
@@ -2405,8 +2090,6 @@ fn fx_write(desk: &FxDesk, scratch_root: &std::path::Path) {
             desk.name,
             item.local_id
         );
-        // v0.98.0's export wrote every record within the cap, so the import's leniency for older
-        // producers' over-cap links repairs nothing here.
         assert_eq!(
             report.links_dropped, 0,
             "{}: session {}: the import finds no over-cap record to repair",
@@ -2419,8 +2102,6 @@ fn fx_write(desk: &FxDesk, scratch_root: &std::path::Path) {
             desk.name,
             item.local_id
         );
-        // …cell for cell: only the over-cap lines' links dropped (by the screen carry's rung for
-        // the checkpoint's lines, by the export for the sidecar's), every other line exact.
         {
             let source = desk
                 .sessions
@@ -2441,9 +2122,6 @@ fn fx_write(desk: &FxDesk, scratch_root: &std::path::Path) {
                 ),
             );
         }
-        // Since v0.95.0, after the import: every installed shell mark still names its line (the
-        // successor continues the parent's numbering), the shell state and colours are the
-        // parent's, and a command running across the handoff completes on the successor.
         let source = desk
             .sessions
             .iter()
@@ -2453,7 +2131,6 @@ fn fx_write(desk: &FxDesk, scratch_root: &std::path::Path) {
             .lock()
             .unwrap();
         let mut successor = successor.lock().unwrap();
-        // The restored parser continues the partial sequence the carry held, else is at Ground.
         let continues = if checkpoint.parser.is_some() {
             source.partial_sequence_state()
         } else {
@@ -2473,11 +2150,6 @@ fn fx_write(desk: &FxDesk, scratch_root: &std::path::Path) {
             desk.name,
             item.local_id
         );
-        // A repainted screen is blank until its program redraws, so its
-        // marks name rows the successor has not drawn yet. A carry keeps a
-        // mark while any row it names is carried (804646426f), so a row older
-        // than the successor's oldest one (a prompt above a visible-only
-        // carry's screen) reads Evicted there, as in the live terminal.
         let redraws = capture.repaint.contains(&item.local_id);
         let oldest = successor.main_grid().oldest_absolute_row();
         for mark in successor.command_marks().iter().filter(|_| !redraws) {
@@ -2555,12 +2227,6 @@ fn fx_write(desk: &FxDesk, scratch_root: &std::path::Path) {
             );
         }
     }
-    // A held pane's scrollback crosses as an adopted session's does (since v0.101.0): restored as
-    // `App::restore_held_leaf` restores it (`held_pane_session`, then `held_pane_history`, which
-    // reserves the import's keys under the engine's first lock) and imported by the same worker
-    // after Commit, every parent line in front of the held screen, cell for cell. Since v0.102.0
-    // the import drops every link of a held pane's lines, as its screen's are: nothing runs behind
-    // the pane, so a link there could only open a URL.
     for shown in held_shown {
         let sent = desk
             .held
@@ -2575,11 +2241,6 @@ fn fx_write(desk: &FxDesk, scratch_root: &std::path::Path) {
             &shown.checkpoint,
             None,
         );
-        // A HELD PANE WHOSE SCROLLBACK DID NOT CROSS (v0.108.0's held-history
-        // desks): every line its capture counted is said left behind, and why
-        // — the successor's policy's choice under a ceiling that carries no
-        // scrollback, a failure under one that does (its fence moved before
-        // the export read it) — and there is nothing to import.
         let carry = published
             .held
             .iter()
@@ -2675,10 +2336,6 @@ fn fx_write(desk: &FxDesk, scratch_root: &std::path::Path) {
 
 fn fx_incident_desk() -> FxDesk {
     use crate::restore::RestoreManifest;
-    // Session 0: Claude Code entered 1049 from a prompt on the last row of a 56-row grid, then
-    // the message band took one row away. The shrink demotes the saved primary's top row into
-    // history and the DECSC slot rides up with its text (`Grid::lend_saved_cursor`, xterm's
-    // `AdjustSavedCursor`): row 54, after `$ claude` (row 55 in fixtures through v0.101.0).
     let mut claude = fx_claude(0, 56, 149, 60);
     {
         let mut t = claude.term.lock().unwrap();
@@ -2805,8 +2462,6 @@ fn fx_history_desk() -> FxDesk {
 
 fn fx_twelve_pane_desk() -> FxDesk {
     use crate::restore::{RestoreManifest, SplitKind};
-    // Window A (46x168): a 2x2 tab, a three-column tab, one full tab.
-    // Window B (40x140): a three-pane tab, one full tab.
     let geometry: [(u16, u16); 12] = [
         (22, 83),
         (23, 83),
@@ -2871,7 +2526,6 @@ fn fx_twelve_pane_desk() -> FxDesk {
             fx_tab(leaf(11, "zsh")),
         ],
     );
-    // The second window is behind the first, and not key.
     if window_b.show.z_order.is_some() {
         window_b.show.z_order = Some(1);
         window_b.show.key = Some(false);
@@ -2900,7 +2554,6 @@ fn fx_twelve_pane_desk() -> FxDesk {
 }
 
 /// A shell signing its OSC 133/633 marks with its tab's nonce: what `spawn`
-/// installs for a shell with integration, and what the carry sends.
 fn fx_signed_shell(rows: u16, cols: u16, nonce: [u8; 32], cwd: &str, flavour: u8) -> Terminal {
     let mut t = Terminal::new(rows, cols);
     t.authorize_shell_integration(nonce);
@@ -2925,10 +2578,6 @@ fn fx_signed_shell(rows: u16, cols: u16, nonce: [u8; 32], cwd: &str, flavour: u8
 }
 
 /// The shape v0.92.0 changed: each shell's authorized shell-integration nonce rides the carry
-/// (meta key `shell_integration_nonce`), so the successor authorizes the same value and the
-/// shells' marks keep counting. Two shells with different nonces (the nonce is per tab), one in
-/// 1049 with an editor, side by side. Shells spawned with integration since v0.94.0 also read
-/// their re-key file and body pointer (`rekey`, `loader`).
 fn fx_shell_integration_desk() -> FxDesk {
     use crate::restore::{RestoreManifest, SplitKind};
     let a = fx_signed_shell(30, 100, [0x94; 32], "/home/dev/src/aterm", 1);
@@ -2963,11 +2612,6 @@ fn fx_shell_integration_desk() -> FxDesk {
 }
 
 /// The shapes v0.93.0 and v0.94.0 changed. The history carry: a shell whose history is deeper
-/// than the checkpoint's 256 lines, and one running `less` in 1049, whose checkpoint carries none
-/// of its shell's history (the saved primary rides at its visible rows), so the `.hist` sidecar
-/// carries all of it. The records carry what those releases added beside it: a running
-/// `history_lost` from an earlier handoff, the foreground holder, the integration's `rekey` and
-/// `loader`, and the `questions` word (on the record and, in lockstep, on its layout leaf).
 fn fx_history_carry_desk() -> FxDesk {
     use crate::restore::{RestoreManifest, RestoredSplitTree, RestoredView, SplitKind};
     let deep = fx_shell(40, 120, 1500, "/home/dev/src/aterm", 6);
@@ -3017,11 +2661,6 @@ fn fx_history_carry_desk() -> FxDesk {
 }
 
 /// A shell under OSC 133/633 integration with `commands` finished commands
-/// (prompt, command line, a few lines of output, an exit status), its marks
-/// signed with `nonce` when it has one (aterm's own integration) and unsigned
-/// otherwise (a shell that sources its own script, with aterm's injection
-/// off), ending at a fresh prompt. `theme` is what its rc file writes at
-/// start, and `palette_opt_in` the host's `allow_palette_reconfigure`.
 #[allow(clippy::too_many_arguments, reason = "a throwaway fixture builder")]
 fn fx_marked_shell(
     rows: u16,
@@ -3079,19 +2718,8 @@ fn fx_marked_shell(
 }
 
 /// The shape v0.95.0 changed: the meta carries the absolute row counters, the colours an
-/// application set (a diff from the configured theme, and the whole XTPUSHCOLORS stack) and the
-/// OSC 133/633 state, running command included. Session 0 is a shell with aterm's signed
-/// integration, a base16 theme (OSC 4, opted into with `allow_palette_reconfigure`, and OSC
-/// 10/11/12), 150 finished commands (deeper than the checkpoint, so it names a `.hist` sidecar)
-/// and a `cargo build` still running. Session 1 is a shell whose own script sends unsigned marks,
-/// running vim in 1049, which pushed the colours (OSC 30001) and set its background, cursor and
-/// selection colours: its checkpoint carries none of the shell's history, and its marks sit on the
-/// saved primary.
 fn fx_colour_and_shell_desk() -> FxDesk {
     use crate::restore::{RestoreManifest, SplitKind};
-    // base16-shell's theme, as its rc hook writes it at shell start
-    // (ST-terminated): sixteen palette entries, then foreground, background
-    // and cursor.
     let base16 = [
         "28/2c/34", "e0/6c/75", "98/c3/79", "e5/c0/7b", "61/af/ef", "c6/78/dd", "56/b6/c2",
         "ab/b2/bf", "54/58/62", "e0/6c/75", "98/c3/79", "e5/c0/7b", "61/af/ef", "c6/78/dd",
@@ -3169,12 +2797,6 @@ fn fx_colour_and_shell_desk() -> FxDesk {
 }
 
 /// A parser left mid-sequence over a quiet PTY, the shape v0.93.0 changed (v0.94.0 and v0.95.0
-/// wrote no such desk). Since v0.100.0 the carry holds each partial sequence for the successor to
-/// continue or swallow (`TerminalCheckpoint::parser`); v0.97.0 and v0.98.0 left it out as CAN
-/// would. Three stalls a real desk holds: a shell that printed an unterminated OSC title
-/// (`printf '\e]0;building'`), an ssh session stalled halfway through an SGR, and an editor in
-/// 1049 whose kitty-graphics upload stopped inside its APC payload. The title shell's 300 lines
-/// and the editor's saved primary each name a `.hist` sidecar.
 fn fx_stalled_sequence_desk() -> FxDesk {
     use crate::restore::{RestoreManifest, SplitKind};
     let mut title = fx_shell(30, 100, 300, "/home/dev/src/aterm", 8);
@@ -3218,11 +2840,6 @@ fn fx_stalled_sequence_desk() -> FxDesk {
 }
 
 /// One row of `n` OSC 8 links labelled `<label><k>`, each to a signed URL of
-/// exactly `url_len` bytes: a CI tool's row of log links. The engine keeps a
-/// URL of up to 8 KiB, and a line record carries each URL once per span, so a
-/// dozen 8 KiB links make a record of about 96 KiB, past the wire's
-/// per-record cap (`16 KiB + cols * 512`) at any width under 160 columns; two
-/// stay under it.
 fn fx_link_row(n: usize, url_len: usize, host: &str, label: &str) -> String {
     const SIGNATURE: &[u8; 64] =
         b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
@@ -3243,16 +2860,6 @@ fn fx_link_row(n: usize, url_len: usize, host: &str, label: &str) -> String {
 }
 
 /// The shape v0.97.0 changed: a line record over the wire's per-record cap costs that line its
-/// OSC 8 links, never the screen. v0.97.0 carries such a screen at `CarryRung::StrippedLinks`:
-/// every character, attribute, wrap flag and scalar exact, only the over-cap lines' link
-/// destinations dropped, the scrollback and the control carry kept, no repaint.
-///
-/// Session 0 listed two CI runs' signed log links: one row of a dozen 8 KiB links scrolled into
-/// its history, another on screen, and a row of two links under the cap, which keeps them. Its
-/// history is inside the checkpoint's 256 lines, so it names no sidecar. Session 1 has 600 lines of
-/// history, printed a row of links, then opened vim in 1049: the dense row is on the saved primary
-/// (the inactive grid), which the carry strips, and the `.hist` sidecar carries the saved
-/// primary's whole history.
 fn fx_link_dense_desk() -> FxDesk {
     use crate::restore::{RestoreManifest, SplitKind};
     let prompt = |cwd: &str| format!("\x1b[1;38;5;202mdev@devhost\x1b[0m {cwd} % ");
@@ -3327,23 +2934,6 @@ fn fx_link_dense_desk() -> FxDesk {
 }
 
 /// The shape v0.98.0 changed: a link-dense line in the history a `.hist` sidecar carries. Exports
-/// from v0.94.0 through v0.97.0 wrote such a line as the engine serialized it, and v0.97.0's import
-/// refuses the whole sidecar for it (a frame is 1,024 lines, decoded whether or not the line is
-/// inside the checkpoint's 256). v0.98.0's export drops the links of every over-cap line before it
-/// writes the frame, so its sidecars decode strictly; the line keeps its text, attributes and wrap
-/// flag, and every other line its links.
-///
-/// Session 0 listed two CI runs' signed log links 400 lines apart: the first row of a dozen 8 KiB
-/// links is older than the checkpoint's 256 lines, in the part of the sidecar the successor takes;
-/// the second is inside them, so the screen carry strips it (`CarryRung::StrippedLinks`, one line)
-/// and the sidecar holds it stripped past its take. A row of two links stays under the cap and
-/// keeps them. Session 1 has 500 lines of history, printed a dense row and 80 more lines, then
-/// opened vim in 1049: its checkpoint carries none of the saved primary's history and its screen
-/// holds no dense row, so it is carried at `Full`, its sidecar holding the dense row stripped.
-/// Sessions 0 and 1 cross with 2 and 1 sidecar lines stripped.
-///
-/// The window's second tab is Settings with an unsaved font-family draft: since v0.98.0 the
-/// handoff layout carries Settings drafts on the leaf.
 fn fx_link_dense_history_desk() -> FxDesk {
     use crate::restore::{
         NativeLeafRestore, RestoreManifest, RestoredSplitTree, RestoredView, SettingsDraftRestore,
@@ -3421,9 +3011,6 @@ fn fx_link_dense_history_desk() -> FxDesk {
         session.taken_links_stripped = 1;
     }
 
-    // A Settings leaf spelled as `App::capture_handoff_layout` spells one
-    // (`NativeLeafRestore::settings` with its route, then the view's one unsaved text draft);
-    // `fx_window` files it as `native_tabs`' one descriptor, second in `tab_order`.
     let draft = SettingsDraftRestore {
         key: "font_family".to_string(),
         text: "Iosevka Term".to_string(),
@@ -3461,8 +3048,6 @@ fn fx_link_dense_history_desk() -> FxDesk {
 }
 
 /// A shell under aterm's signed integration with `commands` finished commands
-/// and a `cargo build` still running (OSC 133 phase 3), so the successor must
-/// complete a command the parent started.
 fn fx_building_shell(
     rows: u16,
     cols: u16,
@@ -3500,13 +3085,6 @@ fn fx_building_shell(
 }
 
 /// The shape v0.97.0 added, at `carry = "visible"`: the successor's signed handoff policy asks
-/// for the visible screen and its scalars, never the scrollback. Every session is carried at
-/// `VisibleOnly`, no `.hist` sidecar is named, and the join counts every line the park saw as left
-/// behind, as the policy's (`history_dropped`, `history_lost` on top of an earlier handoff's
-/// running loss, and since v0.98.0 `history_withheld`). The control carry still crosses: the screen
-/// it describes is exact. Session 0 is a shell with 1,500 lines of history, session 1 a signed
-/// shell with a command still running (its marks on the visible rows), session 2 Claude Code in
-/// 1049 with a turn in its ledger.
 fn fx_policy_visible_desk() -> FxDesk {
     use crate::restore::{RestoreManifest, SplitKind};
     let deep = fx_shell(42, 120, 1500, "/home/dev/src/aterm", 6);
@@ -3550,13 +3128,6 @@ fn fx_policy_visible_desk() -> FxDesk {
 }
 
 /// The shape v0.97.0 added, at `carry = "repaint"`: every session is carried as a blank canonical
-/// screen its program redraws, its scalars from `Terminal::carry_meta_abandoning_partial` with no
-/// grid projected (the path such a policy is sealed to route around). Every session is in the
-/// repaint set, its control carry crosses without the differ's state, and no history does: every
-/// line is counted, as the policy's. Session 0 is a shell with 1,500 lines of history, session 1
-/// vim in 1049 (so its blank carry has an inactive grid), session 2 a shell stalled inside an
-/// unterminated OSC title (its meta carries the partial sequence), session 3 Claude Code in 1049
-/// with a turn in its ledger.
 fn fx_policy_repaint_desk() -> FxDesk {
     use crate::restore::{RestoreManifest, SplitKind};
     let deep = fx_shell(40, 120, 1500, "/home/dev/src/aterm", 6);
@@ -3605,12 +3176,6 @@ fn fx_policy_repaint_desk() -> FxDesk {
 }
 
 /// The shape v0.100.0 added: panes kept open by `--hold` after their command exited. They are in
-/// the layout but never handed (no process, no PTY), so they have no session record; their final
-/// screens ride the manifest's `held` list, each with how its command ended, in `.h<id>.heldgrid`
-/// (and, for a screen left in 1049, `.heldalt`) sidecars outside every digest. The first tab is a
-/// live shell beside `make`, which failed with status 2 after printing a link to its log; the
-/// second a live shell above vim, killed by SIGKILL in 1049. The successor shows each held screen
-/// read-only, with no link to click; one that skips the list keeps its placeholder.
 fn fx_held_pane_desk() -> FxDesk {
     use crate::restore::{RestoreManifest, SplitKind};
     let mut make = fx_shell(ROWS, COLS, 30, "/home/dev/src/aterm", 4);
@@ -3660,9 +3225,6 @@ fn fx_held_pane_desk() -> FxDesk {
         next_turn_id: None,
         fabric_attached: Vec::new(),
         drawn: FxDrawn::default(),
-        // Since v0.101.0 each held pane's scrollback and control carry cross too, and whether
-        // the person had seen its failure: `make` sits beside the focused shell in the front tab,
-        // so its failure was seen; vim was killed in the tab behind.
         held: vec![
             FxHeld {
                 local_id: 2,
@@ -3687,8 +3249,6 @@ fn fx_held_pane_desk() -> FxDesk {
 }
 
 /// The bridge `aterm ctl fabric attach` armed on `carried-state`'s instance,
-/// which has no `[fabric] command` configured: what the park draws
-/// (`fabric_launch::handoff_attached`) and the successor arms again.
 fn fx_attached_bridge() -> Vec<String> {
     ["/home/dev/.local/bin/fabric-bridge", "serve", "--fleet"]
         .map(String::from)
@@ -3696,7 +3256,6 @@ fn fx_attached_bridge() -> Vec<String> {
 }
 
 /// What [`fx_mailbox`] drew: the first session's mailbox and topics, and the
-/// store's bus mirror rows.
 struct FxMailbox {
     fabric: crate::fabric::FabricCarry,
     topics: Vec<String>,
@@ -3705,26 +3264,6 @@ struct FxMailbox {
 }
 
 /// WHAT `carried-state`'S FIRST SESSION'S MAILBOX AND ITS STORE'S BUS MIRROR
-/// HOLD AT THE PARK, driven through the bridge plane's handlers as
-/// `control::dispatch_bridge_verb` calls them and the session's own verbs, on
-/// a store of this build's, and drawn as `SessionHandoff::from_store` draws
-/// them (`SessionFabric::handoff_carry` under the one mail budget, the topic
-/// set, `StoreMirror::draw_tombstones` and `StoreMirror::served`).
-///
-/// While no bridge was attached the agent posted a note whose deadline is
-/// `u64::MAX`, past what the manifest's TOML can write, so the park leaves it
-/// behind by id. Then a bridge attached that mirrors the session logs and
-/// refills broadcasts. On its log A an ask came and was handled, so its owed
-/// receipt names an earlier log once the bridge moved to log B, where another
-/// ask came and was handled — and answered (`re=` its offset, with a
-/// deadline, on the person's behalf, under an idempotency key), the answer
-/// still queued — and one more arrived at the far end of the offset space
-/// (its receipt, past what TOML can write, is counted rather than carried). The session took the `builds` topic, and a
-/// run of broadcasts on it, one from each CI runner (each sender's quota is
-/// its own), overflowed the ring: the oldest went unseen, and
-/// the rest wait unhandled for the bridge to offer again. Another session of
-/// the store, whose log the bridge had taken and not landed, closed, and the
-/// mirror keeps its tail, drawn as a tombstone.
 fn fx_mailbox() -> FxMailbox {
     use crate::fabric::{
         CARRY_MAIL_BYTES, RING_CAP, bridge_attached, cmd_deliver, cmd_hello, cmd_inbox_seen,
@@ -3799,8 +3338,6 @@ fn fx_mailbox() -> FxMailbox {
             );
             assert!(reply.starts_with("OK "), "{reply}");
         }
-        // The closed session: registered, its log opened and three commands
-        // run, a take that engaged its mirror, then its shell's exit.
         let closed = crate::session_store::test_handle(9);
         let closed_ctx = closed.ctx.clone();
         store.write().unwrap().register(closed);
@@ -3866,12 +3403,6 @@ fn fx_mailbox() -> FxMailbox {
 }
 
 /// A WORKER CLAUDE CODE ADOPTED ACROSS AN EARLIER UPDATE ('s
-/// U10), at `rows`x`cols`: its ledger came carried with the floor its
-/// sender's ring had shed harness records below (`ControlCarry::ledger`),
-/// holding the manager's turn 41; since then the window harness pressed
-/// `keep going` (turn 42, `STATUS_PRESSED`), and the person scrolled the app
-/// back eight rows, which left the bottom of its scrolling region for the
-/// differ's `below`. Returns the session and the ids this process minted.
 fn fx_worker(local_id: u64, rows: u16, cols: u16) -> (FxSession, u64) {
     use crate::turn_ledger::{STATUS_PRESSED, TurnBy};
     let mut app = FakeApp::new();
@@ -3933,8 +3464,6 @@ fn fx_worker(local_id: u64, rows: u16, cols: u16) -> (FxSession, u64) {
 }
 
 /// A hosted agent's leaf restore (`AgentRestore`), as a cold restore's queue
-/// owes it or the host supervises it: Claude Code's (no run, no word) or the
-/// lane's under its word.
 fn fx_agent(
     pid: u32,
     program: &str,
@@ -3960,44 +3489,6 @@ fn fx_agent(
 }
 
 /// THE STATE A SESSION, ITS WINDOW AND ITS DESK CARRY BESIDE THE SCREENS
-/// (v0.108.0 on's U10): every field the producer writes
-/// only for a session someone supervises, escalates, halts, subscribes or
-/// tasks, a window someone zoomed, warned or posted to, and a desk with a
-/// bridge `fabric attach` armed — the shapes no other desk carries, each
-/// spelled by the code that writes it or held to the parser that reads it.
-///
-/// The last run's window crashed, and this process restored its desk cold:
-/// the restored tabs whose agents' relaunches its queue still owed at the
-/// park carry them.
-///
-/// Session 0 is a shell the person scrolled back 12 lines, whose meta a
-/// driver set (title, icon, the bare attention, a keyed `wait` escalation,
-/// Autopilot `cruise` until a time, set over `aterm ctl`), under a fleet
-/// and a local halt (the status item saw the local one), an external
-/// supervisor's lease, a task the harness marks working and the agent's work
-/// on it so far, its own theme, the first session of the
-/// restores it continues, and its mailbox and topic ([`fx_mailbox`]); the
-/// bridge's mirror took its log.
-/// Session 1 is the shell session 0 spawned, a cold restore's tab whose
-/// Codex relaunch is still owed (its leaf's `agent`, the run under `codex`,
-/// with the `CODEX_HOME` its exec environment set), whose journal image was
-/// the crashed window's.
-/// Session 2 is a worker Claude Code the host supervises ([`fx_worker`]),
-/// under the Claude home and login its exec environment named, in a shell an
-/// earlier build spawned without the PATH self-heal.
-/// Sessions 3 to 5 are restored tabs whose Muse Code, agy and Gemini CLI
-/// relaunches are owed, and session 6 one whose Claude Code relaunch is owed
-/// for the explicit restart that ended it, in the tab it ran in before.
-/// Session 7 is a tab whose agent the host says cannot be brought back, the
-/// mark it set standing.
-/// A second window co-views session 0 (`Open Session in New Window`) beside
-/// the worker's and session 7's tabs. The first window is zoomed two steps,
-/// and its band holds a keyless wire notice posted twice, a row restated a
-/// mark worse than it was posted, an update-health warning nobody answered,
-/// a build the wire meters, the crash's record, the worker's tab that lost
-/// its shell integration, and the worker's lost login waiting on the owner's
-/// sign-in (a standing ask with a short title). The status item told the
-/// owner of a fleet need.
 fn fx_carried_state_desk() -> FxDesk {
     use crate::restore::{
         AgentRestore, AgyRestore, AlabRestore, CodexRestore, GeminiRestore, LostRestore,
@@ -4029,9 +3520,6 @@ fn fx_carried_state_desk() -> FxDesk {
             fx_shell(ROWS, COLS, 6, cwd, flavour),
         ));
     }
-    // THE OPERATOR'S META, as `meta set` writes it and `Drawn::of` reads it:
-    // the record's fields are its `sanitized` projection, the escalations
-    // its `handoff_attention_owners`.
     let mut meta = SessionMeta::default();
     meta.set("title", Some("release".to_string()));
     meta.set("icon", Some("rocket".to_string()));
@@ -4056,10 +3544,8 @@ fn fx_carried_state_desk() -> FxDesk {
     record.autopilot = drawn.autopilot.clone();
     record.land_at = drawn.land_at;
     record.attention_owners = meta.handoff_attention_owners();
-    // An external supervisor's lease, 30 s left, the whole claim state.
     record.supervisor = Some("harness 30000".to_string());
     record.claim_known = true;
-    // The standing halts (`render_holds`): the fleet's first, then the owner's.
     let mut holds = crate::fabric::render_holds(&crate::fabric::parse_holds([
         "fleet maintenance",
         "local manual",
@@ -4067,14 +3553,9 @@ fn fx_carried_state_desk() -> FxDesk {
     .into_iter();
     record.hold = holds.next();
     record.more_holds = holds.collect();
-    // Its mailbox and topic, and the store's mirror rows, as the manifest
-    // draws them.
     let mailbox = fx_mailbox();
     record.topics = mailbox.topics;
     record.fabric = mailbox.fabric;
-    // What the status item saw of it (`App::status_seen_rows`,
-    // `stamp_status_seen`): the owner's local hold, since an hour into the
-    // release's day.
     record.status_seen = crate::status_item::StatusCarry {
         need: None,
         told: false,
@@ -4089,17 +3570,11 @@ fn fx_carried_state_desk() -> FxDesk {
         "rev=2 state=working from=ctl since={} result_bytes=0 attention=0",
         release_ms + 3_000_000
     ));
-    // The task's work so far, as the park stamps it (`App::end_carry_rows`,
-    // `EndCarry::row`): 25 s of the agent's busy time since the task opened,
-    // and no end standing yet, the task still working.
     record.autopilot_end = crate::harness_end_carry::EndCarry {
         end: None,
         worked_ms: 25_000,
     }
     .row();
-    // The first session of the restores it continues (`seed_lineage`, as a
-    // restore's shell takes it), and the bridge's mirror took its log
-    // (`cmd_log_take`'s copy, under the timeline's lock).
     {
         let mut timeline = sessions[0].timeline.lock().unwrap();
         timeline
@@ -4108,20 +3583,14 @@ fn fx_carried_state_desk() -> FxDesk {
         let now = timeline.slog().now();
         let _ = timeline.slog_mut().mirror_log().bus_copy(1, now);
     }
-    // Session 1's journal image was the crashed window's
-    // (`App::journal_keys`, `stamp_journal_keys`): its pid and pool id.
     sessions[1].record.journal_key = Some(crate::session_store::journal_key_row((48_100, 1)));
-    // The worker's shell an earlier build spawned without the PATH self-heal,
-    // adopted as such (`SessionStore::has_frozen_path`).
     sessions[2].record.frozen_path = true;
-    // The host's mark on session 7, which its lost word keeps.
     let lost_conversation = "1057c0de-6e66-4f1e-9c0d-8e4f5a6b7c8d";
     let lost_command = format!("claude --resume {lost_conversation}");
     sessions[7].record.attention = Some(format!(
         "Cannot bring the agent back (its conversation could not be resumed); run \
          {lost_command} in this tab"
     ));
-    // Every row reads back as the successor reads it.
     let record = &sessions[0].record;
     assert!(
         crate::status_item::StatusCarry::parse(record.status_seen.as_deref().unwrap())
@@ -4168,8 +3637,6 @@ fn fx_carried_state_desk() -> FxDesk {
     );
     sessions[1].record.parent = Some(sessions[0].record.sid.clone());
 
-    // THE WINDOW, as `App::handoff_window_carry` reads it off an App the
-    // person zoomed and the wire and the update checker posted to.
     let mut app = crate::App::headless_for_test();
     let reset = app.default_font_size;
     assert!(app.set_font_size_with(reset + 2.0 * crate::FONT_ZOOM_STEP, |_| true));
@@ -4181,8 +3648,6 @@ fn fx_carried_state_desk() -> FxDesk {
         ));
         assert!(reply.starts_with("OK"), "{reply}");
     }
-    // A reporter that speaks through one row restates it a mark worse
-    // (`restatement_of`, as the tailed meters and the standing warnings do).
     let row = |severity, title: &str| {
         aterm_messages::Message::new(aterm_messages::tags::SYSTEM, severity, title)
     };
@@ -4208,13 +3673,10 @@ fn fx_carried_state_desk() -> FxDesk {
             )
         ),
     ));
-    // A build the wire meters, 42% through with its count beside the bar.
     let reply = app.take_notice(notice(
         "progress cargo pct=42 Building aterm -- 412/980 crates",
     ));
     assert!(reply.starts_with("OK"), "{reply}");
-    // The crash's record, posted at launch (`crash_message`): the last run's
-    // window crashed, which is why this desk was restored cold.
     app.post_message(crate::message_reporters::crash_message(
         &crate::logging::CrashEvidence {
             path: std::path::PathBuf::from(
@@ -4223,9 +3685,6 @@ fn fx_carried_state_desk() -> FxDesk {
             head: vec!["thread 'main' panicked at crates/aterm-gui/src/app.rs:4100:9".to_string()],
         },
     ));
-    // The worker's shell, adopted across the earlier update, came without its
-    // integration key (`integration_notice`): the row names its tab and the
-    // words it ends with once a new tab gives the integration back.
     app.post_message(
         crate::message_reporters::integration_lost(&[crate::message_reporters::LostTab {
             place: "in window 2, tab 2".to_string(),
@@ -4234,10 +3693,6 @@ fn fx_carried_state_desk() -> FxDesk {
         }])
         .expect("one tab"),
     );
-    // The worker's Claude Code lost its login, carried as far as aterm
-    // carries it (`/login` typed, the method picked): the one step left is
-    // the owner's sign-in in the browser, a standing ask whose band title
-    // gives way to its short form (`resume_ask`).
     app.post_message(crate::message_reporters::resume_ask(
         &sessions[2].record.sid,
         &crate::message_reporters::UpgradeSpot {
@@ -4251,8 +3706,6 @@ fn fx_carried_state_desk() -> FxDesk {
             "the agent working",
         ),
     ));
-    // The park comes after the meter's grace, which reveals it
-    // (`App::settle_messages`).
     let parked = std::time::Instant::now()
         + aterm_messages::PROGRESS_GRACE
         + std::time::Duration::from_millis(10);
@@ -4316,13 +3769,6 @@ fn fx_carried_state_desk() -> FxDesk {
         messages_captured_unix_ms: carried.captured_unix_ms,
     };
 
-    // THE LAYOUT: session 0 beside the shell it spawned, whose leaf owes its
-    // Codex (`App::pending_restored_agent`, the handoff layout's alone), the
-    // owed Muse Code beside the owed agy, and the owed Gemini CLI beside the
-    // Claude Code the explicit restart owes; and a second window behind the
-    // first co-viewing session 0, beside the worker the host supervises
-    // (`App::hosted_agent`, where nothing is owed) and the tab whose agent
-    // cannot be brought back (`App::hosted_lost_word`).
     let thread = "019a4c2e-7d10-7c3a-9e51-3f2b6d8a0c41";
     let leaf_of =
         |local_id: u64, title: &str, fill: &dyn Fn(&mut crate::restore::TerminalLeafRestore)| {
@@ -4469,8 +3915,6 @@ fn fx_carried_state_desk() -> FxDesk {
         behind.show.z_order = Some(1);
         behind.show.key = Some(false);
     }
-    // What the park drew beside the records: the fleet need the status item
-    // told the owner of (`App::fleet_told_rows`), and the store's mirror rows.
     let drawn_rows = FxDrawn {
         fleet_told: vec![crate::fleet_glance::told_row(
             crate::fleet_glance::herald_key("mac-2", &format!("s-{:020x}", 0x00ee_0000_0001_u64)),
@@ -4497,8 +3941,6 @@ fn fx_carried_state_desk() -> FxDesk {
         drawn: drawn_rows,
         held: Vec::new(),
     };
-    // The leaves' Autopilot setter rides the layout alone (§11.7.3, item 5);
-    // the rest of each leaf's meta is the capture's (`fx_capture_leaves`).
     for window in &mut desk.layout.windows {
         for tab in &mut window.restored_tabs {
             if let crate::restore::RestoredSplitTree::Split { first, .. } = &mut tab.root
@@ -4515,14 +3957,6 @@ fn fx_carried_state_desk() -> FxDesk {
 }
 
 /// A HELD PANE'S SCROLLBACK LEFT BEHIND, AND WHY (v0.108.0 on's
-/// U10): a shell beside a `make` that failed and was kept open, with its build
-/// log in its scrollback. Under `held-withheld`'s successor policy, which
-/// carries no scrollback, the pane's lines are left behind as the policy's
-/// choice (`HeldPaneCarry::history_withheld`); under `held-failed`'s, which
-/// does, the person dragged the divider after the park captured the pane and
-/// before the export read its scrollback, so the fence the capture took no
-/// longer names its lines and they are left behind as a failure
-/// (`history_failed`). Either way every line is counted.
 fn fx_held_history_desk(failed: bool) -> FxDesk {
     use crate::restore::{RestoreManifest, SplitKind};
     let cwd = "/home/dev/src/aterm";
@@ -4585,16 +4019,12 @@ fn fx_held_history_desk(failed: bool) -> FxDesk {
 }
 
 /// One drawer's card on the main screen (an inline agent's answer), three
-/// rows on its own background.
 fn fx_card(n: u8) -> Vec<u8> {
     let row = format!("⏺ answer {n} — {}", "the drawer's own rows ".repeat(2));
     format!("\x1b[48;5;{}m{row}\r\n{row}\r\n{row}\x1b[0m\r\n", 236 + n).into_bytes()
 }
 
 /// A shell running an inline agent (Claude Code drawing on the main screen)
-/// that the person stopped with Ctrl-Z and resumed in a second one: the
-/// stopped drawer's mark sealed and kept, the running one's open
-/// (`Terminal::note_holder_cut`, as the host reports each foreground change).
 fn fx_two_drawers(flavour: u8) -> Terminal {
     use aterm_core::terminal::{CutKind, HolderCut};
     let mut t = fx_shell(ROWS, COLS, 30, "/home/dev/src/aterm", flavour);
@@ -4623,32 +4053,6 @@ fn fx_two_drawers(flavour: u8) -> Terminal {
 }
 
 /// THE ENGINE STATE A CARRIED SCREEN HOLDS BEYOND ITS CELLS (v0.108.0 on;
-/// 's U10), one session for each shape no other desk carries,
-/// each its own tab:
-///
-/// * the parser stopped inside every kind of sequence its carry holds: an ssh
-///   session halfway through a colon-separated truecolour SGR, vim inside a
-///   DECSCUSR's intermediate, `imgcat` past the OSC carry's cap, `cat` inside
-///   a split UTF-8 character, GNU screen's hardstatus APC ending in one, a
-///   kitty image wrapped for tmux, and a sixel's DCS header (which an older
-///   build would refuse, so it rides as `DcsIgnore` with the exact state);
-/// * Midnight Commander's state: its palette and dynamic colours pushed onto
-///   the colour stack (OSC 30001), 96-character sets in G1 to G3, its title
-///   pushed after it cleared the icon name, its taskbar progress, an XTSAVE'd mouse mode, a DECSC on the
-///   alternate screen (under kitty flags it pushed there) with an underline
-///   colour, its pen pushed with XTPUSHSGR, an open OSC 8 link and a ZWJ
-///   waiting for the emoji it joins;
-/// * htop in 1049 narrowed under its last frame (the render debt's columns);
-///   a shell whose screen was made shorter than its blank rows (the grid's
-///   handback); a VT52 program waiting for an `ESC Y` column;
-/// * the shell integration's state: a shell that signs its own cwd report and
-///   ran its integration body's revision; one holding a background job's
-///   report at its prompt beside the cwd a key binding's program replaced; one
-///   whose re-key's first mark was a `D`; one whose `clear` blanked finished
-///   and running blocks before it ran a command it did not mark;
-/// * the holder fence: an inline agent stopped with Ctrl-Z and a second one
-///   drawing, and the same desk restored from its keyframe that took output
-///   before its host adopted it.
 fn fx_engine_state_desk() -> FxDesk {
     use crate::restore::RestoreManifest;
     let cwd = "/home/dev/src/aterm";
@@ -4710,9 +4114,6 @@ fn fx_engine_state_desk() -> FxDesk {
 
     let mut htop = fx_shell(ROWS, COLS, 40, cwd, 3);
     htop.process(b"htop\r\n\x1b[?1049h\x1b[H\x1b[2J");
-    // Every row drawn across 99 of the 100 columns, its command line's tail last: the
-    // narrowing to 80 below cuts 19 drawn columns off the right edge
-    // (`ResizeReport::cut`), the debt's `render_debt_cut = 19`.
     for r in 1..=ROWS {
         let row = format!(
             "  {:>5} dev   20   0  412M  38M S  0.{r}  0.4  0:0{}.12 /home/dev/.local/bin/aterm --sock /tmp/s{r}",
@@ -4798,13 +4199,6 @@ fn fx_engine_state_desk() -> FxDesk {
 }
 
 /// A DESK PAST THE LAYOUT'S WINDOW CAP (v0.108.0 on's U10): a
-/// shell in front, and behind it a document in each of [`MAX_WINDOWS`] windows
-/// — the config open in the Editor with two selections, notes read in Markdown,
-/// one with a passage selected — so the capture folds the last window's tab
-/// into the one before it (`RestoreManifest::fold_into_caps`),
-/// and the layout says what it folded and which pane was in front.
-///
-/// [`MAX_WINDOWS`]: crate::restore::MAX_WINDOWS
 fn fx_fold_desk() -> FxDesk {
     use crate::restore::{
         NativeLeafRestore, RestoreManifest, RestoreSelection, RestoredSplitTree, RestoredView,
@@ -4817,7 +4211,6 @@ fn fx_fold_desk() -> FxDesk {
         vec![fx_tab(fx_leaf(0, "zsh", Some(cwd)))],
     )];
     for n in 1..=crate::restore::MAX_WINDOWS {
-        // As `App::view_restore_descriptor_carrying` reads each view.
         let view = if n == 1 {
             let mut editor = NativeLeafRestore::document(
                 "editor",
@@ -4880,25 +4273,6 @@ fn fx_fold_desk() -> FxDesk {
 }
 
 /// EVERY VARIANT A CARRIED ENUM TAKES THAT NO OTHER DESK DOES (v0.108.0 on;
-/// 's U10), each as a program or the host sets it:
-///
-/// * a demo of DEC's national sets, whose screen, main-screen DECSC slot and
-///   alternate-screen DECSC slot each hold four of them in G0-G3, with GL
-///   and GR shifted (SO, LS2, LS3, LS1R, LS3R) and an SS2 still waiting for
-///   its character, on a VT100 (DECSCL) in a light-mode window, with a
-///   steady block, X10 mouse reports in UTF-8, the taskbar progress hidden,
-///   LTR paragraphs (SCP) and explicit BiDi (BDSM reset);
-/// * a Latin-2 and Latin-5 viewer (DEC Supplemental in G0, the two 96-sets in
-///   G1 and G2, an SS3 waiting) on a VT220, with BiDi off in the config, a
-///   blinking underline, button-event mouse in SGR, a failed progress and
-///   RTL paragraphs;
-/// * a VT320 with a steady underline, any-event mouse in urxvt's encoding
-///   and an indeterminate progress, and a VT520 with a steady bar, normal
-///   mouse in SGR pixels and a paused progress;
-/// * beside the VT520, focused in a split's second pane, the placeholder a
-///   pane no session was carried for became on the update before
-///   (`retire_unhanded_terminals`), which this capture writes back as the
-///   Recovery view it shows (`App::view_restore_descriptor_carrying`).
 fn fx_variants_desk() -> FxDesk {
     use crate::restore::{
         PlaceholderLeafRestore, RestoreBranch, RestoreManifest, RestoredSplitTree, RestoredTab,
@@ -4909,12 +4283,8 @@ fn fx_variants_desk() -> FxDesk {
     let mut nrcs = fx_shell(ROWS, COLS, 6, cwd, 1);
     nrcs.set_color_scheme(aterm_types::Appearance::Light);
     nrcs.process(b"./nrcs-demo\r\n");
-    // French, French Canadian, German and Italian; LS2 and LS1R. Saved in
-    // the main screen's DECSC slot as the alternate screen is entered.
     nrcs.process(b"\x1b(R\x1b)Q\x1b*K\x1b+Y\x1bn\x1b~\x1b[?1049h");
-    // Norwegian/Danish, Spanish, Swedish and Swiss; LS3 and LS3R; DECSC.
     nrcs.process(b"\x1b(E\x1b)Z\x1b*H\x1b+=\x1bo\x1b|\x1b7\x1b[?1049l");
-    // DEC line drawing, UK, Dutch and Finnish; SO.
     nrcs.process(b"\x1b(0\x1b)A\x1b*4\x1b+C\x0e");
     nrcs.process(b"\x1b[2 q\x1b[?9h\x1b[?1005h\x1b]9;4;0\x07\x1b[1 k\x1b[8l\x1b[61\"p\x1bN");
     assert_eq!(nrcs.mouse_mode(), aterm_core::terminal::MouseMode::X10);
@@ -4975,8 +4345,6 @@ fn fx_variants_desk() -> FxDesk {
         });
         sessions.push(fx_session(id, title, term));
     }
-    // Open and capture the real controller without a startup offer: its
-    // handoff descriptor carries the tab, never credentials or OS work.
     let mut app = crate::App::headless_for_test();
     assert!(app.open_system_state_tab_in_window(crate::WindowId(0)));
     let mut captured = app.capture_handoff_layout();
@@ -5047,21 +4415,14 @@ fn generate_handoff_fixtures() {
         std::env::var_os("ATERM_HANDOFF_FIXTURE_OUT")
             .expect("set ATERM_HANDOFF_FIXTURE_OUT to tests/fixtures/handoff/v<release>"),
     );
-    // What the guard asks of these desks once they are checked in.
     crate::seamless::fixture_tests::assert_written_desks_adopt(&out);
     fx_record_shipped_state(&out);
 }
 
 /// Where the release cut keeps [`fx_record_shipped_state`]'s answers file (`aterm-release`'s
-/// `fixtures.rs`). Unset, as in an ordinary run, the answers are checked and kept nowhere.
 const SHIPPED_STATE_OUT: &str = "ATERM_SHIPPED_STATE_OUT";
 
 /// THE SHIPPED-STATE ANSWERS THESE DESKS ADD: the serde corpus's sweep of every shipped
-/// producer's bytes (`serde_corpus_tests::state_written_by_shipped_producers_answers_as_recorded`)
-/// as it reads once the desks in `out` are checked in as this release's, which refuses unless
-/// this release's models read back every manifest, layout and meta they hold. The release cut
-/// keeps the answers file at `$ATERM_SHIPPED_STATE_OUT`, and its landing records this release's
-/// cases on main in the commit that adds the desks, so that commit leaves the sweep green.
 fn fx_record_shipped_state(out: &std::path::Path) {
     let tag = format!("v{}", crate::build_info::version());
     let answers = crate::serde_corpus_tests::shipped_state_with(&tag, out);
@@ -5072,10 +4433,6 @@ fn fx_record_shipped_state(out: &std::path::Path) {
 }
 
 /// THE CARRIED FIELDS NO HANDOFF OFF MACOS WRITES: a window's show is
-/// captured on macOS alone (`window_show::captured_show`), so a session
-/// elsewhere carries `WindowShow::UNKNOWN`, and so does its desk
-/// (`fx_window_in`). Held beside [`NO_HANDOFF_WRITES`] off macOS only: a macOS
-/// desk writes them.
 const NO_HANDOFF_WRITES_OFF_MACOS: &[(&str, &str)] = &[
     ("layout", "WindowLayout.show"),
     ("layout", "WindowShow.fullscreen"),
@@ -5085,53 +4442,21 @@ const NO_HANDOFF_WRITES_OFF_MACOS: &[(&str, &str)] = &[
 ];
 
 /// THE CARRIED FIELDS AND VARIANTS NO HANDOFF WRITES, so no desk can: each one
-/// the update's producer never sets (written by another writer of its struct,
-/// retired, or set by nothing in this build), beside why. The hold refuses a
-/// row a desk writes, and one absent from both the current walk and the newest
-/// release's written fields. Named session identities need no rows now:
-/// v0.110.0's record already omits both deleted fields; older fixtures remain.
 const NO_HANDOFF_WRITES: &[(&str, &str)] = &[
-    // A crash carry's turn-id count (`handoff_carry::CrashLedger`); an
-    // update's sidecar leaves it out (`encode_wire`).
     ("control", "Wire.turn_ids"),
-    // Retired with the presence row (owner surfaces, 2026-10-16): this build
-    // never sets either, and keeps them on the wire for an older successor
-    // (`App::handoff_window_carry`, `App::capture_manifest`).
     ("manifest", "WindowCarry.presence_row"),
     ("layout", "WindowLayout.presence_row"),
-    // The maximized bit of a capture that tracks a window's normal frame
-    // (`TRACKS_NORMAL_FRAME`: Windows and X11); a macOS window carries its
-    // show state instead, and these desks are a macOS producer's.
     ("layout", "WindowLayout.maximized"),
-    // The durable captures' alone (a quit, the crash journal, a closed tab):
-    // the handoff's Commit compares layouts, and its session records carry
-    // the holds (`App::view_restore_descriptor_carrying`).
     ("layout", "TerminalLeafRestore.held"),
     ("layout", "TerminalLeafRestore.holds"),
-    // Set by no capture in this build (the same).
     ("layout", "TerminalLeafRestore.profile"),
-    // An older build's resume words for the retired Codex screen lane: read
-    // by nothing since, and never written by this build.
     ("layout", "CodexRestore.carried"),
-    // A description an unknown app version kept; no capture of this build
-    // writes one (`NativeLeafRestore::settings`, `NativeLeafRestore::document`).
     ("layout", "NativeLeafRestore.metadata"),
-    // The XTPUSHCOLORS stack as whole entries, read from a parent that
-    // predates `stack_overrides`; this build never writes it.
     ("meta", "ColorRepr.stack"),
-    // The frontend's cursor shapes: DECTCEM hides the cursor without changing
-    // its style, and the unfocused outline and the laser glow's bolt are
-    // render overrides. DECSCUSR and the config set only the six DEC shapes
-    // (`CursorStyle::from_param`, `Terminal::apply_config`).
     ("meta", "CursorStyle::Hidden"),
     ("meta", "CursorStyle::HollowBlock"),
     ("meta", "CursorStyle::Bolt"),
-    // Set by nothing in this build: SCP names automatic, LTR and RTL
-    // (`handle_scp`), and the config's paragraph direction is never read
-    // from aterm.toml.
     ("meta", "ParagraphDirection::AutoRtl"),
-    // Set by nothing in this build: DECSCL names only levels 61-65
-    // (`VtLevel::from_decscl_param`), and no config sets a level.
     ("meta", "VtLevel::VT240"),
     ("meta", "VtLevel::VT330"),
     ("meta", "VtLevel::VT340"),
@@ -5140,21 +4465,12 @@ const NO_HANDOFF_WRITES: &[(&str, &str)] = &[
 ];
 
 /// THE FIELDS AND VARIANTS THESE DESKS WRITE (`fixture_cover`): recorded
-/// beside them as `fields.toml`, and held strictly. Every field of every
-/// struct a desk reaches, and every variant of every enum a desk reaches, is
-/// written by a desk, the way a real session would carry it, or is one no
-/// handoff writes ([`NO_HANDOFF_WRITES`]); and every field and variant the
-/// newest release that recorded its own wrote, reached here or not, is still
-/// written here. Anything else stops the generator — and with it the cut —
-/// until a desk writes it.
 fn fx_record_fields() {
     use crate::seamless::fixture_cover::{DeskFields, FIELDS_FILE, newest_recorded};
     let out = std::path::PathBuf::from(
         std::env::var_os("ATERM_HANDOFF_FIXTURE_OUT")
             .expect("set ATERM_HANDOFF_FIXTURE_OUT to tests/fixtures/handoff/v<release>"),
     );
-    // The baseline first, and never this run's own record: the hand-run
-    // fallback writes `v<release>/` under the fixtures' root.
     let root = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/handoff");
     let baseline = newest_recorded(std::path::Path::new(root), &out);
     let fields = DeskFields::of_release(&out);
@@ -5180,18 +4496,6 @@ fn fx_record_fields() {
     );
 }
 
-// ------------------------------------------------------ the rendezvous transport capture
-//
-// Writes `$ATERM_RENDEZVOUS_FIXTURE_OUT/rendezvous.toml`: the claim frame this release's dialer
-// writes for a fixed secret; the grant header and body its parent sends for a fixed nonce and
-// sessions, and the order its descriptors arrive in, observed by a real receiver over a real
-// bound `Rendezvous` with openpty masters and two pipes; the launch environment's names and value
-// shapes; its own `ATERM_SEAMLESS_TARGET` and `ATERM_HANDOFF_PARENT_BIRTH` values; and the
-// adoption proof over the recorded `st_rdev` terms. The capture is the guard's own
-// (`fixture_tests::capture_transport`, over its fixed inputs), so the record and the guard's
-// reading of this build cannot drift apart. The guard is
-// `fixture_tests::every_shipped_producers_rendezvous_grants_this_successor`.
-
 #[cfg(target_os = "macos")]
 mod rendezvous_generator {
     use crate::seamless::fixture_tests::{
@@ -5215,9 +4519,6 @@ mod rendezvous_generator {
     }
 
     /// The literal a match arm of this release's own `app_update_handoff.rs`
-    /// gives the proof term for `lane` (`HandoffLane::OutOfBand => "device"`):
-    /// the parent writes that literal into the successor's environment, and no
-    /// function returns it.
     fn proof_term_of(lane: &str) -> String {
         let source = include_str!("app_update_handoff.rs");
         let arm = format!("HandoffLane::{lane} => \"");
@@ -5230,7 +4531,6 @@ mod rendezvous_generator {
     }
 
     /// Write `$ATERM_RENDEZVOUS_FIXTURE_OUT/rendezvous.toml` with this release's claim, grant,
-    /// descriptor order, launch environment and device-term proof over the fixed inputs.
     #[test]
     fn generate_rendezvous_fixture() {
         if !super::fx_generator_in_child("ATERM_RENDEZVOUS_FIXTURE_OUT") {

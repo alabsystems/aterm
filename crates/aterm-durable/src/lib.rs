@@ -1,101 +1,24 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `aterm-durable` — the two ways aterm finishes a write, in one place.
+//! File and directory flush primitives: [`durable`] ([`File::sync_all`], [`durable_data`],
+//! [`durable_dir`], [`Flush::Durable`]) and [`ordered`] ([`ordered_dir`],
+//! [`Flush::ordered_if_same_device`]), with [`seam::Recording`] for test/debug inspection.
 //!
-//! A write that must outlive more than a process death ends with a flush, and there
-//! are two. They are named by what a power loss leaves; a kernel panic, a forced
-//! power-off and a watchdog reset count as one here, since no Apple document says the
-//! drive's volatile cache survives them.
-//!
-//! * [`durable`]: the data is on stable media when the call returns. Apple:
-//!   `fcntl(F_FULLFSYNC)` (std's [`File::sync_all`]), which drains the device's whole
-//!   queue. Measured on one Mac (Apple SSD, APFS, under other agents' builds): p50
-//!   4.3 ms in steps of about 4.2 ms, and while it runs a neighbour's 64-byte write
-//!   with no flush went to p95 4-5 ms. A later probe there
-//!   (`docs/measured/flush-wait-2026-10-21.md`) saw every barrier it caught, and
-//!   most `fsync(2)`s, growing appends, creates and renames, wait out a full flush
-//!   in flight from another thread; a read and an in-place page-cache write did not.
-//!   Elsewhere the platform full flush. Stable-on-return is the supported
-//!   filesystem/device contract, not an independent check of the hardware. A site
-//!   needs it when something outside this device's write order depends on the data
-//!   having reached the media: a reply or ack that promises it is saved, a network
-//!   send or other irreversible effect that assumes it, a promise made to the person,
-//!   or a write whose loss the next boot's recovery would neither notice nor repair.
-//! * [`ordered`]: flush the named descriptor, then order that I/O and any other I/O
-//!   already flushed with `fsync` on the same device before later I/O. Nothing is
-//!   promised durable on return, and unflushed other descriptors are not covered.
-//!   Apple: `fcntl(F_BARRIERFSYNC)` (astream-sys's `barrier_sync`), measured p50
-//!   0.13-0.6 ms beside the same load, with a neighbour tax an order of magnitude
-//!   smaller. A site may use this for "A persists before B" on one device only
-//!   after flushing every descriptor that phase A depends on, including directory
-//!   publications. The barrier does not order writes within a phase, make a batch
-//!   atomic, or prove that a reader accepts only a valid prefix. Each caller must
-//!   establish those invariants and tolerate older state; its comment names that
-//!   recovery. A returned flush error or an intentionally ignored directory error
-//!   supplies no such ordering guarantee.
-//!
-//! A directory flush after a create, rename or unlink is the same choice, because
-//! the entry is metadata on the same device ([`durable_dir`], [`ordered_dir`]).
-//!
-//! THE BARRIER IS DEVICE-WIDE AND ONLY DEVICE-WIDE. fcntl(2): "The barrier applies to
-//! I/O that have been flushed with fsync(2) on the same device before. These
-//! operations are guaranteed to be persisted before any other I/O that would follow
-//! the barrier." It can therefore cover other descriptors on the volume only when
-//! their I/O was flushed before the barrier. It promises nothing about another
-//! volume: where the writes that must come
-//! after live on a different device, [`Flush::ordered_if_same_device`] answers
-//! [`Flush::Durable`]. Under that same storage contract, a successful full flush
-//! also persists the earlier, already-flushed I/O on its device.
-//!
-//! Off Apple targets there is no ordering-only flush (Linux's `fdatasync` flushes the
-//! drive cache too), so [`ordered`] is the same `fsync(2)` as [`durable`]: never
-//! weaker than asked, and byte-for-byte the flush those platforms took before.
-//!
-//! ## Test and debug builds
-//!
-//! (And any build with the `test-support` feature, which a `--release` test run of a
-//! dependent names on its command line, `--features aterm-durable/test-support`.)
-//! [`seam::Recording`] records which of the two each operation on this thread asked
-//! for, so a test asserts the tier a site chose with no timing. It records and changes
-//! nothing else: [`ordered`] issues the real `F_BARRIERFSYNC` in every build, test,
-//! debug, `opt-test` and release alike, so a debug instance (`lab instance`) or the
-//! `opt-test` perf lane measures the flush that ships. That costs a test run little:
-//! measured on the crash journal's conformance test, the heaviest user, 3.8-7.5 s
-//! against 2.2-4.2 s with a plain `fsync(2)` in its place (load 27-47).
-//!
-//! THE DURABLE FLUSH IS A PLAIN `fsync(2)` IN A TEST OR DEBUG BUILD ON APPLE TARGETS
-//! ([`durable`] and [`durable_data`], still recorded as [`Flush::Durable`]). It is a real
-//! flush, made at the same point and in the same order, so a test sees the same files,
-//! renames and errors; what it drops is the drive-cache barrier, which no test can
-//! observe (it orders the disk only against a power loss) and whose `F_FULLFSYNC` costs
-//! a step of about 4.2 ms and, while it runs, holds up most flushes, growing writes,
-//! creates and renames made beside it: a probe saw every barrier it caught and 72-99% of
-//! the rest wait, from threads of one process on files in one directory tree
-//! (`docs/measured/flush-wait-2026-10-21.md`). Every test binary of the workspace, the
-//! instances and children it starts, and every crate it reaches take this arm, so no
-//! crate keeps one of its own. Before it was here, six crates' own unit tests did:
-//! `aterm-gui --lib` made 4,763 full flushes (its crash journal's conformance test
-//! 13.6-17.0 s, 3.7 s with `fsync(2)`, and a no-op flush gained nothing more),
-//! `atpkg --lib` 7,381 (28.5-29.8 s instead of 44.5-63.6 s alone), `aterm-update --lib`
-//! 4,492 (7.0-7.3 s instead of 18.0-20.0 s), `aterm-agent --lib` 2,561. What those arms
-//! did not reach, measured on 2026-10-22 alternating two pairs each with this arm in
-//! the primitives: `fabric_world` 18.4-18.8 -> 14.8-15.5 s, `atpkg --lib` 8.1-8.3 ->
-//! 6.2-6.3 s, `aterm-agent --lib` 21.1-21.3 -> 19.2-19.8 s. Every release build (every
-//! shipped one) and every other target issues the full flush.
+//! Every application flushes in full, debug builds included (astream 46e7c1b's ruling):
+//! only a test binary that asks ([`plain_durable_flushes_in_tests!`]) takes a plain
+//! `fsync(2)` for its durable flushes on Apple targets.
 
 use std::fs::File;
 use std::io;
 use std::path::Path;
 
-/// Which flush finished a write. See the [crate docs](crate) for what each leaves
-/// after a power loss.
+/// Which flush finished a write.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Flush {
     /// On stable media when the flush returns ([`durable`]).
     Durable,
-    /// Flush this descriptor and order the flushed I/O ahead of later writes on
-    /// its device, with no general stable-on-return promise ([`ordered`]).
+    /// Flush this descriptor and order the flushed I/O ahead of later writes on its device.
     Ordered,
 }
 
@@ -146,8 +69,7 @@ impl Flush {
         }
     }
 
-    /// Encode a 17-byte device-pair decision record `(flush_tag: u8, written_dev: u64, later_dev: u64)`
-    /// in little-endian byte order using bitwise shifts.
+    /// Encode a 17-byte device-pair decision record.
     #[inline]
     #[must_use]
     pub const fn encode_device_pair(written_dev: u64, later_dev: u64) -> [u8; 17] {
@@ -173,8 +95,7 @@ impl Flush {
         ]
     }
 
-    /// Decode a 17-byte device-pair decision record `(Flush, written_dev, later_dev)`,
-    /// returning `None` if the tag is invalid or inconsistent with `for_devices(written_dev, later_dev)`.
+    /// Decode a 17-byte device-pair decision record `(Flush, written_dev, later_dev)`.
     #[inline]
     #[must_use]
     pub const fn decode_device_pair(bytes: &[u8; 17]) -> Option<(Self, u64, u64)> {
@@ -228,11 +149,7 @@ impl Flush {
         }
     }
 
-    /// [`Flush::Ordered`] when `written` and `later` are on one device, else
-    /// [`Flush::Durable`]. `written` is what this flush finishes; `later` is where the
-    /// writes that must not persist before it land. A barrier orders only its own
-    /// device's I/O, so a later write on another volume could reach its media first;
-    /// a path that cannot be read answers [`Flush::Durable`], the safe direction.
+    /// [`Flush::Ordered`] when `written` and `later` are on one device, else [`Flush::Durable`].
     #[must_use]
     pub fn ordered_if_same_device(written: &Path, later: &Path) -> Self {
         if same_device(written, later) {
@@ -243,8 +160,7 @@ impl Flush {
     }
 }
 
-/// Make everything written to `file` DURABLE: on stable media when this returns. Apple:
-/// `fcntl(F_FULLFSYNC)`; elsewhere `fsync(2)`.
+/// Make everything written to `file` durable.
 ///
 /// # Errors
 /// The flush's own error.
@@ -254,10 +170,7 @@ pub fn durable(file: &File) -> io::Result<()> {
     full_or_fsync(file, primitive::full)
 }
 
-/// [`durable`] for `file`'s data and the metadata a read of it needs (its size), not
-/// its timestamps: std's [`File::sync_data`]. Apple: the same `fcntl(F_FULLFSYNC)`;
-/// Linux: `fdatasync(2)`, which a log append that changes no other metadata pays less
-/// for.
+/// [`durable`] for `file`'s data and size metadata, without its timestamps.
 ///
 /// # Errors
 /// The flush's own error.
@@ -267,31 +180,36 @@ pub fn durable_data(file: &File) -> io::Result<()> {
     full_or_fsync(file, primitive::full_data)
 }
 
-/// The durable flush `full` ([`primitive::full`] or [`primitive::full_data`]): in every
-/// release build, and off Apple targets in every build.
-#[cfg(not(all(any(test, debug_assertions), target_vendor = "apple")))]
+/// The durable flush `full` ([`primitive::full`] or [`primitive::full_data`]), or a plain
+/// `fsync(2)` in a test binary on Apple targets that asked ([`plain_durable_flushes_in_tests!`]).
 #[inline]
 fn full_or_fsync(file: &File, full: fn(&File) -> io::Result<()>) -> io::Result<()> {
+    #[cfg(all(any(test, debug_assertions), target_vendor = "apple"))]
+    if seam::PLAIN.load(std::sync::atomic::Ordering::Relaxed) {
+        return primitive::fsync(file);
+    }
     full(file)
 }
 
-/// [`full_or_fsync`] in a test or debug build on Apple targets: a plain `fsync(2)`
-/// ([`primitive::fsync`]) in place of `F_FULLFSYNC` (the [crate docs](crate) say why).
-#[cfg(all(any(test, debug_assertions), target_vendor = "apple"))]
-#[inline]
-fn full_or_fsync(file: &File, _full: fn(&File) -> io::Result<()>) -> io::Result<()> {
-    primitive::fsync(file)
+/// Make this test binary's durable flushes plain `fsync(2)`s on Apple targets: a crate's
+/// root says `#[cfg(test)] aterm_durable::plain_durable_flushes_in_tests!();`, which
+/// expands to a load-time hook only under `cfg(test)`. Applications keep the full flush.
+#[macro_export]
+macro_rules! plain_durable_flushes_in_tests {
+    () => {
+        #[cfg(all(test, target_vendor = "apple"))]
+        const _: () = {
+            extern "C" fn plain_durable_flushes() {
+                $crate::seam::plain_durable_flushes();
+            }
+            #[used]
+            #[unsafe(link_section = "__DATA,__mod_init_func,mod_init_funcs")]
+            static PLAIN_DURABLE_FLUSHES: extern "C" fn() = plain_durable_flushes;
+        };
+    };
 }
 
-/// ORDER everything written to `file`, and everything else this process or another
-/// flushed on its device, ahead of every write issued after this call. Nothing is
-/// promised durable on return. Apple: `fcntl(F_BARRIERFSYNC)`; a filesystem or device
-/// that refuses the barrier gets [`durable`]'s full flush instead, which orders by
-/// persisting. Measured on macOS 27.0.1: devfs and autofs refuse it, while APFS, HFS+,
-/// and FAT and exFAT (both through FSKit) take it, so an ordered write to a FAT or
-/// exFAT stick is ordered on return, not persisted. Any other barrier error is
-/// returned, never covered by a full flush that happens to succeed after it
-/// ([`primitive::barrier`]). Elsewhere `fsync(2)`, as [`durable`].
+/// Order everything written to `file`.
 ///
 /// # Errors
 /// The flush's own error (the full flush's, when the barrier was refused).
@@ -301,8 +219,7 @@ pub fn ordered(file: &File) -> io::Result<()> {
     primitive::barrier(file)
 }
 
-/// [`durable`] for the directory `dir`: what makes a create, rename or unlink in it
-/// durable.
+/// [`durable`] for the directory `dir`.
 ///
 /// # Errors
 /// The directory could not be opened, or the flush's own error.
@@ -313,8 +230,7 @@ pub fn durable_dir(dir: &Path) -> io::Result<()> {
     }
 }
 
-/// [`ordered`] for the directory `dir`: a create, rename or unlink in it reaches the
-/// media before any write issued after this call.
+/// [`ordered`] for the directory `dir`.
 ///
 /// # Errors
 /// The directory could not be opened, or the flush's own error.
@@ -340,15 +256,12 @@ fn same_device(_a: &Path, _b: &Path) -> bool {
     false
 }
 
-/// The flushes themselves, unrecorded. Public so this crate's tests, and a reviewer,
-/// can reach each one by name; product code finishes a write with [`durable`] or
-/// [`ordered`].
+/// The flushes themselves, unrecorded.
 pub mod primitive {
     use std::fs::File;
     use std::io;
 
-    /// The full flush: [`File::sync_all`], which is `fcntl(F_FULLFSYNC)` on Apple
-    /// targets and `fsync(2)` elsewhere.
+    /// The full flush: [`File::sync_all`].
     ///
     /// # Errors
     /// The flush's own error.
@@ -360,8 +273,7 @@ pub mod primitive {
         file.sync_all()
     }
 
-    /// The full flush of the data and the size: [`File::sync_data`], the same
-    /// `fcntl(F_FULLFSYNC)` on Apple targets and `fdatasync(2)` on Linux.
+    /// The full flush of the data and the size.
     ///
     /// # Errors
     /// The flush's own error.
@@ -373,14 +285,10 @@ pub mod primitive {
         file.sync_data()
     }
 
-    /// The ordering flush: `fcntl(F_BARRIERFSYNC)` on Apple targets, the full flush
-    /// where the volume refuses the barrier or the platform has none.
+    /// The ordering flush: `fcntl(F_BARRIERFSYNC)` on Apple targets.
     ///
     /// # Errors
-    /// The barrier's own error when it failed, and the full flush's when the volume
-    /// refused the barrier (astream-sys's `barrier_refused`, an Apple-only dependency,
-    /// so a plain name here: this doc is built on every target). Off Apple targets,
-    /// the full flush's.
+    /// The barrier's own error when it failed.
     pub fn barrier(file: &File) -> io::Result<()> {
         #[cfg(target_vendor = "apple")]
         {
@@ -392,41 +300,7 @@ pub mod primitive {
         }
     }
 
-    /// `barrier`, answered by the full flush only when the volume REFUSED it. This is
-    /// the one body [`barrier`] runs on Apple targets. Tests hand it a barrier and a
-    /// full flush of their own to see which errors reach which; another runs
-    /// [`barrier`] itself on `/dev/null`, whose barrier and full flush devfs both
-    /// refuse, to pin the pair production passes in (a full flush that skipped the
-    /// flush would answer `Ok` there).
-    ///
-    /// WHY ONLY A REFUSAL. astream-sys's contract ([`astream_sys::barrier_refused`]):
-    /// `F_BARRIERFSYNC` answers `ENOTSUP`, `ENODEV`, `EINVAL` or `ENOTTY` when the
-    /// filesystem or device cannot take a barrier at all. Nothing was ordered, and
-    /// the full flush orders by persisting. Every other error (`EIO`, `ENOSPC`, ...) is
-    /// a FAILED flush, and is returned as a failed `fsync` is. A full flush that then
-    /// succeeds says nothing about what the failed one was to cover: the device has
-    /// nothing dirty left to rewrite for those bytes, so it returns 0 whether or not
-    /// they are on media. astream's own log refuses that mask for the same reason:
-    /// its `issue_flush` (`astream-broker` `store.rs`) sends only a refused barrier
-    /// to the full flush and returns every other barrier error, and claim
-    /// `broker.ordered-tier` says why ("a later flush that succeeds says nothing about
-    /// what the failed one was to cover"). What the log does next is its own: a failed
-    /// flush inside a commit rolls the batch back, and poisons the open too only when
-    /// earlier acks rode barriers that no full flush has covered. The rule this
-    /// replaced, "any error gets the full flush, which reports a real I/O error just
-    /// as well", was written against astream c6ee512, before astream 87140e5 added
-    /// `barrier_refused`.
-    ///
-    /// WHY NO LATCH. astream's log serves Strict, full flushes only, for the rest of
-    /// an open after one refusal (`BrokerLog::settle_issued` latches it through
-    /// `latch_strict`; `issue_flush` itself only falls back for the one call), because
-    /// a log is one file on one device and reports the tier it serves. This crate
-    /// keeps no state: [`barrier`] takes whatever descriptor a site holds, on whatever
-    /// volume. A process-wide latch would turn every later barrier on the APFS home
-    /// into a full flush after one refusal on another volume (devfs, autofs). A latch
-    /// per device would add an `fstat` and a
-    /// lock to every barrier on the common path, to skip one `fcntl` on the volumes
-    /// that refuse. So every call asks the barrier first.
+    /// `barrier`, answered by the full flush only when the volume refused it.
     #[cfg(target_vendor = "apple")]
     pub(crate) fn barrier_or_full(
         file: &File,
@@ -440,19 +314,14 @@ pub mod primitive {
         }
     }
 
-    /// A plain `fsync(2)`, retried on `EINTR` as std retries its `F_FULLFSYNC`: the
-    /// data handed to the drive, which by its own man page promises neither
-    /// durability nor order against a power loss. A test or debug build on Apple targets
-    /// takes it in place of the full flush ([`durable`](crate::durable)); nothing takes it
-    /// in place of the barrier (see the [crate docs](crate)).
+    /// A plain `fsync(2)`, retried on `EINTR` as std retries its `F_FULLFSYNC`.
     ///
     /// # Errors
     /// The flush's own error.
     #[cfg(unix)]
     pub fn fsync(file: &File) -> io::Result<()> {
         use std::os::fd::AsRawFd as _;
-        // SAFETY: `fsync(2)` takes a descriptor by value and dereferences no pointer;
-        // for a descriptor that is not open it fails with `EBADF`.
+        // SAFETY: `fsync(2)` takes a descriptor by value and dereferences no pointer.
         unsafe extern "C" {
             safe fn fsync(fd: std::ffi::c_int) -> std::ffi::c_int;
         }
@@ -468,11 +337,7 @@ pub mod primitive {
     }
 }
 
-/// THE COUNTING SEAM (test and debug builds, and the `test-support` feature): which
-/// flush each operation asked for, recorded per thread while a
-/// [`Recording`](crate::seam::Recording) lives, so a test asserts the tier a site
-/// chose without timing anything. A thread with no recording pays one thread-local
-/// read per flush; a release build without `test-support` compiles none of this.
+/// The counting seam (test and debug builds, and the `test-support` feature).
 #[cfg(any(test, debug_assertions, feature = "test-support"))]
 pub mod seam {
     use super::Flush;
@@ -482,15 +347,10 @@ pub mod seam {
         static LOG: RefCell<Option<Vec<Flush>>> = const { RefCell::new(None) };
     }
 
-    /// A recording of every flush this thread asks for through this crate, from
-    /// [`Recording::start`] until it drops. A recording started inside another hides
-    /// the outer one until it drops, and the outer one then resumes without the
-    /// inner's flushes. The guard must stay on its creating thread, so it is neither
-    /// `Send` nor `Sync`.
+    /// A recording of every flush this thread asks for through this crate.
     #[must_use = "the recording stops when it drops"]
     pub struct Recording {
         outer: Option<Vec<Flush>>,
-        // The LOG slot belongs to the creating thread. The marker allocates nothing.
         _thread: std::marker::PhantomData<std::rc::Rc<()>>,
     }
 
@@ -504,8 +364,7 @@ pub mod seam {
             }
         }
 
-        /// The flushes recorded since the start or the last take, oldest first, and
-        /// an empty log behind them.
+        /// The flushes recorded since the start or the last take, oldest first.
         #[must_use]
         pub fn take(&self) -> Vec<Flush> {
             LOG.with(|log| match log.borrow_mut().as_mut() {
@@ -528,6 +387,22 @@ pub mod seam {
                 flushes.push(flush);
             }
         });
+    }
+
+    /// Whether this process's durable flushes are plain `fsync(2)`s (Apple targets):
+    /// from the start in this crate's own tests, and once a test binary's load-time hook
+    /// says so ([`plain_durable_flushes_in_tests!`](crate::plain_durable_flushes_in_tests)).
+    #[cfg(all(any(test, debug_assertions), target_vendor = "apple"))]
+    pub(crate) static PLAIN: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(cfg!(test));
+
+    /// Make this process's durable flushes plain `fsync(2)`s from now on (Apple
+    /// targets, in a test or debug build; elsewhere nothing). Only a test binary's
+    /// load-time hook calls it
+    /// ([`plain_durable_flushes_in_tests!`](crate::plain_durable_flushes_in_tests)).
+    pub fn plain_durable_flushes() {
+        #[cfg(all(any(test, debug_assertions), target_vendor = "apple"))]
+        PLAIN.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -632,8 +507,6 @@ mod tests {
         std::fs::write(&path, b"x").unwrap();
         let recording = seam::Recording::start();
         std::thread::spawn(move || {
-            // Open for writing, as a writer flushes: Windows's `FlushFileBuffers`
-            // refuses a read-only handle (access denied), where `fsync(2)` takes one.
             let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
             durable(&file).unwrap();
         })
@@ -643,7 +516,6 @@ mod tests {
     }
 
     /// The real primitives on a regular file, and on Unix also on a directory of
-    /// the test volume: the barrier and the full flush.
     #[test]
     fn the_real_barrier_and_full_flush_take_a_file_and_a_directory() {
         let dir = scratch();
@@ -660,9 +532,6 @@ mod tests {
     }
 
     /// The barrier itself, with no fallback behind it, on a regular file and on a directory
-    /// of the test volume (Apple). [`primitive::barrier`] answers a refused barrier with the
-    /// full flush, so its own test passes either way; this one says whether the volume
-    /// takes `F_BARRIERFSYNC` at all, for the directory entries most ordered sites flush.
     #[cfg(target_vendor = "apple")]
     #[test]
     fn this_volume_takes_the_barrier_on_a_file_and_a_directory() {
@@ -682,9 +551,6 @@ mod tests {
     }
 
     /// What [`primitive::barrier_or_full`] did with one injected barrier answer: its
-    /// result, and how many times it asked the barrier and the full flush. The full
-    /// flush it is handed is the real one ([`primitive::full`]) unless `full_fails`,
-    /// which stands in a full flush that answers `EIO`.
     #[cfg(target_vendor = "apple")]
     fn barrier_answering(
         answer: std::io::Error,
@@ -713,8 +579,6 @@ mod tests {
     }
 
     /// The four errnos astream-sys reads as a REFUSED barrier (`ENODEV`, `EINVAL`,
-    /// `ENOTTY`, `ENOTSUP`) promise no ordering, so each gets the full flush, whose
-    /// own answer is the result. A barrier that succeeds gets no full flush.
     #[cfg(target_vendor = "apple")]
     #[test]
     fn a_refused_barrier_is_answered_by_the_full_flush() {
@@ -748,15 +612,10 @@ mod tests {
     }
 
     /// THE NEGATIVE CONTROL of the test above: the same harness, with a barrier that
-    /// FAILED rather than was refused. Its error is returned, and the full flush is
-    /// never called, since one that succeeds afterwards would answer `Ok` for bytes
-    /// the failed flush may have lost. An error that carries no errno is no refusal
-    /// either: astream-sys reads a refusal only from the OS's own number.
     #[cfg(target_vendor = "apple")]
     #[test]
     fn a_failed_barrier_is_returned_and_never_covered_by_a_full_flush() {
         for errno in [5, 28, 9, 1] {
-            // EIO, ENOSPC, EBADF, EPERM.
             let (result, barriers, fulls) =
                 barrier_answering(std::io::Error::from_raw_os_error(errno), false);
             assert_eq!(
@@ -774,15 +633,6 @@ mod tests {
     }
 
     /// The pair [`primitive::barrier`] itself hands [`primitive::barrier_or_full`] on
-    /// Apple: astream-sys's barrier and this crate's real full flush. The two tests
-    /// above inject both, so they pin the rule but not what production passes it: a
-    /// full-flush argument that answered `Ok` without flushing would pass them, and the
-    /// shipped barrier would then answer `Ok` for a refused barrier with nothing on
-    /// media. `/dev/null` is a descriptor whose answers the OS fixes: devfs refuses
-    /// `F_BARRIERFSYNC` on it and fails `F_FULLFSYNC` too, both with `ENODEV` (measured
-    /// on macOS 27.0.1), so the shipped barrier must answer with the full flush's own
-    /// error. Both answers are asserted first, so a macOS that changed either fails
-    /// this test by name instead of letting it pass with nothing checked.
     #[cfg(target_vendor = "apple")]
     #[test]
     fn the_shipped_barrier_answers_a_refusal_with_the_real_full_flush() {
@@ -831,7 +681,6 @@ mod tests {
     }
 
     /// Two volumes, where this host has them: `/dev` is its own filesystem on Apple
-    /// and Linux, so a write there is never ordered by a barrier on the temp volume.
     #[cfg(any(target_vendor = "apple", target_os = "linux"))]
     #[test]
     fn a_later_write_on_another_device_is_durable() {

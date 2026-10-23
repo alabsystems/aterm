@@ -11,7 +11,9 @@ use std::path::PathBuf;
 use aterm_agent::harness::footer::{FactKind, FactMask};
 use aterm_agent::harness::session_usage::TrafficView;
 
-use super::{FactMenuFacts, band_glyphs, band_level, rows, traffic_rows};
+use super::{
+    AccountMenuRow, FactMenuFacts, band_glyphs, band_level, rows, traffic_rows, weekly_meter_bar,
+};
 use crate::autopilot_menu::{MenuRow, PlotInk};
 use crate::claude_lights::Fact;
 
@@ -32,6 +34,10 @@ fn menu_facts(off: FactMask, side: bool) -> FactMenuFacts {
         path: Some("~/aterm".into()),
         branch: Some("main".into()),
         context: Some("ctx 84% left".into()),
+        subscription: None,
+        weekly_meter: None,
+        accounts: Vec::new(),
+        auto_rotate: true,
         off,
         cwd: side.then(|| PathBuf::from("/Users//someone/aterm")),
         repo_root: side.then(|| PathBuf::from("/Users//someone")),
@@ -350,4 +356,59 @@ fn busy_columns_take_the_shaded_ground() {
     assert_eq!(busy.fg, c.band.accent);
     // CONTROL: the first minute's column was idle.
     assert_eq!(row[lead].bg, c.card_bg);
+}
+
+#[test]
+fn account_menu_shows_weekly_meter_and_rotation_accounts() {
+    assert_eq!(
+        weekly_meter_bar("weekly 0% left"),
+        "\u{25b1}\u{25b1}\u{25b1}\u{25b1}\u{25b1}  weekly 0% left"
+    );
+    assert_eq!(
+        weekly_meter_bar("weekly 73% left"),
+        "\u{25b0}\u{25b0}\u{25b0}\u{25b0}\u{25b1}  weekly 73% left"
+    );
+    assert_eq!(
+        weekly_meter_bar("weekly 100% left"),
+        "\u{25b0}\u{25b0}\u{25b0}\u{25b0}\u{25b0}  weekly 100% left"
+    );
+    let facts = FactMenuFacts {
+        title: "Accounts \u{b7} tab 1".into(),
+        spoken: "Accounts, tab 1".into(),
+        subscription: Some("sol-m27@example.test \u{b7} max 20x".into()),
+        weekly_meter: Some(weekly_meter_bar("weekly 0% left")),
+        accounts: vec![
+            AccountMenuRow {
+                label: "m27 \u{b7} dedicated \u{b7} 0% left (limited)".into(),
+                active: true,
+                enabled: true,
+            },
+            AccountMenuRow {
+                label: "m27-2 \u{b7} dedicated \u{b7} 100% left (auto-login)".into(),
+                active: false,
+                enabled: true,
+            },
+            AccountMenuRow {
+                label: "m27-3 \u{b7} pool \u{b7} 100% left (auto-login)".into(),
+                active: false,
+                enabled: true,
+            },
+        ],
+        auto_rotate: true,
+        ..menu_facts(FactMask::default(), true)
+    };
+    assert_eq!(
+        shown(&rows(Fact::Account, &facts)),
+        [
+            "header Accounts \u{b7} tab 1",
+            "note \u{2386}  sol-m27@example.test \u{b7} max 20x",
+            "note \u{25f7}  \u{25b1}\u{25b1}\u{25b1}\u{25b1}\u{25b1}  weekly 0% left",
+            "rule",
+            "\u{2386} m27 \u{b7} dedicated \u{b7} 0% left (limited) [fact-menu/account/use/0] true",
+            "\u{2386} m27-2 \u{b7} dedicated \u{b7} 100% left (auto-login) [fact-menu/account/use/1] true",
+            "\u{2386} m27-3 \u{b7} pool \u{b7} 100% left (auto-login) [fact-menu/account/use/2] true",
+            "rule",
+            "\u{21bb} Auto-rotate (dedicated \u{2192} pool) [fact-menu/account/auto-rotate] true",
+        ]
+    );
 }

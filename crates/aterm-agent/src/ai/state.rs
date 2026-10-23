@@ -344,9 +344,19 @@ pub fn assess(f: &Facts, wanted: bool, now: i64) -> Row {
         row.mark = Mark::Warn;
         row.fix = Some(format!("aterm ai login {}", c.id));
     } else if let Some(until) = limited {
-        words.push(format!("usage limit until {}", when(until)));
-        row.state = State::Limited(until);
-        row.mark = Mark::Note;
+        if let Some(next) = f.accounts.as_ref().and_then(|a| a.next_sign_in.as_deref()) {
+            words.push(format!(
+                "usage limit until {} (next account `{next}` needs sign-in)",
+                when(until)
+            ));
+            row.state = State::Due(until);
+            row.mark = Mark::Warn;
+            row.fix = Some(format!("aterm ai login {}", c.id));
+        } else {
+            words.push(format!("usage limit until {}", when(until)));
+            row.state = State::Limited(until);
+            row.mark = Mark::Note;
+        }
     } else if f.accounts.as_ref().and_then(|a| a.state) == Some("ok")
         || newest_use.is_some_and(|t| now.saturating_sub(t) <= OK_FRESH_S)
     {

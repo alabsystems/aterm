@@ -4,18 +4,9 @@
 // Derived from winit 0.30.13 src/platform/windows.rs,
 // modified by the aterm project in 2026 (see the repository NOTICE).
 
-// Modified by Andrew Yates for the aterm project in 2026; see the repository NOTICE.
-// Preserve the public integer-handle API with windows-sys 0.61 pointer handles; re-export the
-// `recorded` key-message replay for downstream tests (tests and debug builds).
-
 //! # Windows
-//!
-//! The supported OS version is Windows 7 or higher, though Windows 10 is
-//! tested regularly.
 
-/// aterm: recorded Windows key messages, replayed through this backend's real key path, for the
-/// tests of the crates above it (`aterm-gui`'s byte-level layout tests). Tests and debug builds
-/// only.
+/// aterm: recorded Windows key messages, replayed through this backend's real key path, for the tests of the crates above it (`aterm-gui`'s byte-level layout tests).
 #[cfg(any(test, debug_assertions))]
 #[doc(hidden)]
 pub use crate::platform_impl::recorded;
@@ -38,15 +29,9 @@ pub type HMENU = isize;
 pub type HMONITOR = isize;
 
 /// Describes a system-drawn backdrop material of a window.
-///
-/// For a detailed explanation, see [`DWM_SYSTEMBACKDROP_TYPE docs`].
-///
-/// [`DWM_SYSTEMBACKDROP_TYPE docs`]: https://learn.microsoft.com/en-us/windows/win32/api/dwmapi/ne-dwmapi-dwm_systembackdrop_type
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BackdropType {
     /// Corresponds to `DWMSBT_AUTO`.
-    ///
-    /// Usually draws a default backdrop effect on the title bar.
     #[default]
     Auto = 0,
 
@@ -54,18 +39,12 @@ pub enum BackdropType {
     None = 1,
 
     /// Corresponds to `DWMSBT_MAINWINDOW`.
-    ///
-    /// Draws the Mica backdrop material.
     MainWindow = 2,
 
     /// Corresponds to `DWMSBT_TRANSIENTWINDOW`.
-    ///
-    /// Draws the Background Acrylic backdrop material.
     TransientWindow = 3,
 
     /// Corresponds to `DWMSBT_TABBEDWINDOW`.
-    ///
-    /// Draws the Alt Mica backdrop material.
     TabbedWindow = 4,
 }
 
@@ -75,8 +54,6 @@ pub enum BackdropType {
 pub struct Color(u32);
 
 impl Color {
-    // Special constant only valid for the window border and therefore modeled using Option<Color>
-    // for user facing code
     const NONE: Color = Color(0xfffffffe);
     /// Use the system's default color
     pub const SYSTEM_DEFAULT: Color = Color(0xffffffff);
@@ -94,38 +71,24 @@ impl Default for Color {
 }
 
 /// Describes how the corners of a window should look like.
-///
-/// For a detailed explanation, see [`DWM_WINDOW_CORNER_PREFERENCE docs`].
-///
-/// [`DWM_WINDOW_CORNER_PREFERENCE docs`]: https://learn.microsoft.com/en-us/windows/win32/api/dwmapi/ne-dwmapi-dwm_window_corner_preference
 #[repr(i32)]
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CornerPreference {
     /// Corresponds to `DWMWCP_DEFAULT`.
-    ///
-    /// Let the system decide when to round window corners.
     #[default]
     Default = 0,
 
     /// Corresponds to `DWMWCP_DONOTROUND`.
-    ///
-    /// Never round window corners.
     DoNotRound = 1,
 
     /// Corresponds to `DWMWCP_ROUND`.
-    ///
-    /// Round the corners, if appropriate.
     Round = 2,
 
     /// Corresponds to `DWMWCP_ROUNDSMALL`.
-    ///
-    /// Round the corners if appropriate, with a small radius.
     RoundSmall = 3,
 }
 
 /// A wrapper around a [`Window`] that ignores thread-specific window handle limitations.
-///
-/// See [`WindowBorrowExtWindows::any_thread`] for more information.
 #[derive(Debug)]
 pub struct AnyThread<W>(W);
 
@@ -180,66 +143,12 @@ impl<W: Borrow<Window>> rwh_06::HasWindowHandle for AnyThread<W> {
 /// Additional methods on `EventLoop` that are specific to Windows.
 pub trait EventLoopBuilderExtWindows {
     /// Whether to allow the event loop to be created off of the main thread.
-    ///
-    /// By default, the window is only allowed to be created on the main
-    /// thread, to make platform compatibility easier.
-    ///
-    /// # `Window` caveats
-    ///
-    /// Note that any `Window` created on the new thread will be destroyed when the thread
-    /// terminates. Attempting to use a `Window` after its parent thread terminates has
-    /// unspecified, although explicitly not undefined, behavior.
     fn with_any_thread(&mut self, any_thread: bool) -> &mut Self;
 
     /// Whether to enable process-wide DPI awareness.
-    ///
-    /// By default, `winit` will attempt to enable process-wide DPI awareness. If
-    /// that's undesirable, you can disable it with this function.
-    ///
-    /// # Example
-    ///
-    /// Disable process-wide DPI awareness.
-    ///
-    /// ```
-    /// use aterm_window::event_loop::EventLoop;
-    /// #[cfg(target_os = "windows")]
-    /// use aterm_window::platform::windows::EventLoopBuilderExtWindows;
-    ///
-    /// let mut builder = EventLoop::builder();
-    /// #[cfg(target_os = "windows")]
-    /// builder.with_dpi_aware(false);
-    /// # if false { // We can't test this part
-    /// let event_loop = builder.build();
-    /// # }
-    /// ```
     fn with_dpi_aware(&mut self, dpi_aware: bool) -> &mut Self;
 
     /// A callback to be executed before dispatching a win32 message to the window procedure.
-    /// Return true to disable winit's internal message dispatching.
-    ///
-    /// # Example
-    ///
-    /// ```
-    /// # use windows_sys::Win32::UI::WindowsAndMessaging::{ACCEL, CreateAcceleratorTableW, TranslateAcceleratorW, DispatchMessageW, TranslateMessage, MSG};
-    /// use aterm_window::event_loop::EventLoop;
-    /// #[cfg(target_os = "windows")]
-    /// use aterm_window::platform::windows::EventLoopBuilderExtWindows;
-    ///
-    /// let mut builder = EventLoop::builder();
-    /// #[cfg(target_os = "windows")]
-    /// builder.with_msg_hook(|msg|{
-    ///     let msg = msg as *const MSG;
-    /// #   let accels: Vec<ACCEL> = Vec::new();
-    ///     let translated = unsafe {
-    ///         TranslateAcceleratorW(
-    ///             (*msg).hwnd,
-    ///             CreateAcceleratorTableW(accels.as_ptr() as _, 1),
-    ///             msg,
-    ///         ) == 1
-    ///     };
-    ///     translated
-    /// });
-    /// ```
     fn with_msg_hook<F>(&mut self, callback: F) -> &mut Self
     where
         F: FnMut(*const c_void) -> bool + 'static;
@@ -271,18 +180,6 @@ impl<T> EventLoopBuilderExtWindows for EventLoopBuilder<T> {
 /// Additional methods on `Window` that are specific to Windows.
 pub trait WindowExtWindows {
     /// Enables or disables mouse and keyboard input to the specified window.
-    ///
-    /// A window must be enabled before it can be activated.
-    /// If an application has create a modal dialog box by disabling its owner window
-    /// (as described in [`WindowAttributesExtWindows::with_owner_window`]), the application must
-    /// enable the owner window before destroying the dialog box.
-    /// Otherwise, another window will receive the keyboard focus and be activated.
-    ///
-    /// If a child window is disabled, it is ignored when the system tries to determine which
-    /// window should receive mouse messages.
-    ///
-    /// For more information, see <https://docs.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-enablewindow#remarks>
-    /// and <https://docs.microsoft.com/en-us/windows/win32/winmsg/window-features#disabled-windows>
     fn set_enable(&self, enabled: bool);
 
     /// This sets `ICON_BIG`. A good ceiling here is 256x256.
@@ -292,52 +189,24 @@ pub trait WindowExtWindows {
     fn set_skip_taskbar(&self, skip: bool);
 
     /// Shows or hides the background drop shadow for undecorated windows.
-    ///
-    /// Enabling the shadow causes a thin 1px line to appear on the top of the window.
     fn set_undecorated_shadow(&self, shadow: bool);
 
     /// Sets system-drawn backdrop type.
-    ///
-    /// Requires Windows 11 build 22523+.
     fn set_system_backdrop(&self, backdrop_type: BackdropType);
 
     /// Sets the color of the window border.
-    ///
-    /// Supported starting with Windows 11 Build 22000.
     fn set_border_color(&self, color: Option<Color>);
 
     /// Sets the background color of the title bar.
-    ///
-    /// Supported starting with Windows 11 Build 22000.
     fn set_title_background_color(&self, color: Option<Color>);
 
     /// Sets the color of the window title.
-    ///
-    /// Supported starting with Windows 11 Build 22000.
     fn set_title_text_color(&self, color: Color);
 
     /// Sets the preferred style of the window corners.
-    ///
-    /// Supported starting with Windows 11 Build 22000.
     fn set_corner_preference(&self, preference: CornerPreference);
 
     /// Get the raw window handle for this [`Window`] without checking for thread affinity.
-    ///
-    /// Window handles in Win32 have a property called "thread affinity" that ties them to their
-    /// origin thread. Some operations can only happen on the window's origin thread, while others
-    /// can be called from any thread. For example, [`SetWindowSubclass`] is not thread safe while
-    /// [`GetDC`] is thread safe.
-    ///
-    /// In Rust terms, the window handle is `Send` sometimes but `!Send` other times.
-    ///
-    /// Therefore, in order to avoid confusing threading errors, [`Window`] only returns the
-    /// window handle when the [`window_handle`] function is called from the thread that created
-    /// the window. In other cases, it returns an [`Unavailable`] error.
-    ///
-    /// However in some cases you may already know that you are using the window handle for
-    /// operations that are guaranteed to be thread-safe. In which case this function aims
-    /// to provide an escape hatch so these functions are still accessible from other threads.
-    ///
     /// # Safety
     ///
     /// It is the responsibility of the user to only pass the window handle into thread-safe
@@ -352,24 +221,6 @@ pub trait WindowExtWindows {
     /// ## Example
     ///
     /// ```no_run
-    /// # use aterm_window::window::Window;
-    /// # fn scope(window: Window) {
-    /// use std::thread;
-    /// use aterm_window::platform::windows::WindowExtWindows;
-    /// use aterm_window::raw_window_handle::HasWindowHandle;
-    ///
-    /// // We can get the window handle on the current thread.
-    /// let handle = window.window_handle().unwrap();
-    ///
-    /// // However, on another thread, we can't!
-    /// thread::spawn(move || {
-    ///     assert!(window.window_handle().is_err());
-    ///
-    ///     // We can use this function as an escape hatch.
-    ///     let handle = unsafe { window.window_handle_any_thread().unwrap() };
-    /// });
-    /// # }
-    /// ```
     #[cfg(feature = "rwh_06")]
     unsafe fn window_handle_any_thread(
         &self,
@@ -410,8 +261,6 @@ impl WindowExtWindows for Window {
     #[inline]
     fn set_title_background_color(&self, color: Option<Color>) {
         // The windows docs don't mention NONE as a valid options but it works in practice and is
-        // useful to circumvent the Windows option "Show accent color on title bars and
-        // window borders"
         self.window.set_title_background_color(color.unwrap_or(Color::NONE))
     }
 
@@ -439,19 +288,8 @@ impl WindowExtWindows for Window {
 }
 
 /// Additional methods for anything that dereference to [`Window`].
-///
-/// [`Window`]: crate::window::Window
 pub trait WindowBorrowExtWindows: Borrow<Window> + Sized {
     /// Create an object that allows accessing the inner window handle in a thread-unsafe way.
-    ///
-    /// It is possible to call [`window_handle_any_thread`] to get around Windows's thread
-    /// affinity limitations. However, it may be desired to pass the [`Window`] into something
-    /// that requires the [`HasWindowHandle`] trait, while ignoring thread affinity limitations.
-    ///
-    /// This function wraps anything that implements `Borrow<Window>` into a structure that
-    /// uses the inner window handle as a mean of implementing [`HasWindowHandle`]. It wraps
-    /// `Window`, `&Window`, `Arc<Window>`, and other reference types.
-    ///
     /// # Safety
     ///
     /// It is the responsibility of the user to only pass the window handle into thread-safe
@@ -471,29 +309,9 @@ impl<W: Borrow<Window> + Sized> WindowBorrowExtWindows for W {}
 #[allow(rustdoc::broken_intra_doc_links)]
 pub trait WindowAttributesExtWindows {
     /// Set an owner to the window to be created. Can be used to create a dialog box, for example.
-    /// This only works on a window with no parent, which is every window here: `WindowAttributes`
-    /// takes no parent window.
-    /// Can be used in combination with
-    /// [`WindowExtWindows::set_enable(false)`][WindowExtWindows::set_enable] on the owner
-    /// window to create a modal dialog box.
-    ///
-    /// From MSDN:
-    /// - An owned window is always above its owner in the z-order.
-    /// - The system automatically destroys an owned window when its owner is destroyed.
-    /// - An owned window is hidden when its owner is minimized.
-    ///
-    /// For more information, see <https://docs.microsoft.com/en-us/windows/win32/winmsg/window-features#owned-windows>
     fn with_owner_window(self, parent: HWND) -> Self;
 
     /// Sets a menu on the window to be created.
-    ///
-    /// Parent and menu are mutually exclusive; a child window cannot have a menu!
-    ///
-    /// The menu must have been manually created beforehand with [`CreateMenu`] or similar.
-    ///
-    /// Note: Dark mode cannot be supported for win32 menus, it's simply not possible to change how
-    /// the menus look. If you use this, it is recommended that you combine it with
-    /// `with_theme(Some(Theme::Light))` to avoid a jarring effect.
     #[cfg_attr(
         windows_platform,
         doc = "[`CreateMenu`]: windows_sys::Win32::UI::WindowsAndMessaging::CreateMenu"
@@ -508,11 +326,6 @@ pub trait WindowAttributesExtWindows {
     fn with_no_redirection_bitmap(self, flag: bool) -> Self;
 
     /// Enables or disables drag and drop support (enabled by default). Will interfere with other
-    /// crates that use multi-threaded COM API (`CoInitializeEx` with `COINIT_MULTITHREADED`
-    /// instead of `COINIT_APARTMENTTHREADED`) on the same thread. Note that winit may still
-    /// attempt to initialize COM API regardless of this option. Currently only fullscreen mode
-    /// does that, but there may be more in the future. If you need COM API with
-    /// `COINIT_MULTITHREADED` you must initialize it before calling any winit functions. See <https://docs.microsoft.com/en-us/windows/win32/api/objbase/nf-objbase-coinitialize#remarks> for more information.
     fn with_drag_and_drop(self, flag: bool) -> Self;
 
     /// Whether show or hide the window icon in the taskbar.
@@ -522,37 +335,24 @@ pub trait WindowAttributesExtWindows {
     fn with_class_name<S: Into<String>>(self, class_name: S) -> Self;
 
     /// Shows or hides the background drop shadow for undecorated windows.
-    ///
-    /// The shadow is hidden by default.
-    /// Enabling the shadow causes a thin 1px line to appear on the top of the window.
     fn with_undecorated_shadow(self, shadow: bool) -> Self;
 
     /// Sets system-drawn backdrop type.
-    ///
-    /// Requires Windows 11 build 22523+.
     fn with_system_backdrop(self, backdrop_type: BackdropType) -> Self;
 
     /// This sets or removes `WS_CLIPCHILDREN` style.
     fn with_clip_children(self, flag: bool) -> Self;
 
     /// Sets the color of the window border.
-    ///
-    /// Supported starting with Windows 11 Build 22000.
     fn with_border_color(self, color: Option<Color>) -> Self;
 
     /// Sets the background color of the title bar.
-    ///
-    /// Supported starting with Windows 11 Build 22000.
     fn with_title_background_color(self, color: Option<Color>) -> Self;
 
     /// Sets the color of the window title.
-    ///
-    /// Supported starting with Windows 11 Build 22000.
     fn with_title_text_color(self, color: Color) -> Self;
 
     /// Sets the preferred style of the window corners.
-    ///
-    /// Supported starting with Windows 11 Build 22000.
     fn with_corner_preference(self, corners: CornerPreference) -> Self;
 }
 
@@ -666,8 +466,6 @@ impl MonitorHandleExtWindows for MonitorHandle {
 /// Additional methods on `DeviceId` that are specific to Windows.
 pub trait DeviceIdExtWindows {
     /// Returns an identifier that persistently refers to this specific device.
-    ///
-    /// Will return `None` if the device is no longer available.
     fn persistent_identifier(&self) -> Option<String>;
 }
 
@@ -679,89 +477,15 @@ impl DeviceIdExtWindows for DeviceId {
 }
 
 /// Additional methods on `Icon` that are specific to Windows.
-///
-/// Windows icons can be created from files, or from the [`embedded resources`](https://learn.microsoft.com/en-us/windows/win32/menurc/about-resource-files).
-///
-/// The `ICON` resource definition statement use the following syntax:
-/// ```rc
-/// nameID ICON filename
-/// ```
-/// `nameID` is a unique name or a 16-bit unsigned integer value identifying the resource,
-/// `filename` is the name of the file that contains the resource.
-///
-/// More information about the `ICON` resource can be found at [`Microsoft Learn`](https://learn.microsoft.com/en-us/windows/win32/menurc/icon-resource) portal.
 pub trait IconExtWindows: Sized {
     /// Create an icon from a file path.
-    ///
-    /// Specify `size` to load a specific icon size from the file, or `None` to load the default
-    /// icon size from the file.
-    ///
-    /// In cases where the specified size does not exist in the file, Windows may perform scaling
-    /// to get an icon of the desired size.
     fn from_path<P: AsRef<Path>>(path: P, size: Option<PhysicalSize<u32>>)
         -> Result<Self, BadIcon>;
 
     /// Create an icon from a resource embedded in this executable or library by its ordinal id.
-    ///
-    /// The valid `ordinal` values range from 1 to [`u16::MAX`] (inclusive). The value `0` is an
-    /// invalid ordinal id, but it can be used with [`from_resource_name`] as `"0"`.
-    ///
-    /// [`from_resource_name`]: IconExtWindows::from_resource_name
-    ///
-    /// Specify `size` to load a specific icon size from the file, or `None` to load the default
-    /// icon size from the file.
-    ///
-    /// In cases where the specified size does not exist in the file, Windows may perform scaling
-    /// to get an icon of the desired size.
     fn from_resource(ordinal: u16, size: Option<PhysicalSize<u32>>) -> Result<Self, BadIcon>;
 
     /// Create an icon from a resource embedded in this executable or library by its name.
-    ///
-    /// Specify `size` to load a specific icon size from the file, or `None` to load the default
-    /// icon size from the file.
-    ///
-    /// In cases where the specified size does not exist in the file, Windows may perform scaling
-    /// to get an icon of the desired size.
-    ///
-    /// # Notes
-    ///
-    /// Consider the following resource definition statements:
-    /// ```rc
-    /// app     ICON "app.ico"
-    /// 1       ICON "a.ico"
-    /// 0027    ICON "custom.ico"
-    /// 0       ICON "alt.ico"
-    /// ```
-    ///
-    /// Due to some internal implementation details of the resource embedding/loading process on
-    /// Windows platform, strings that can be interpreted as 16-bit unsigned integers (`"1"`,
-    /// `"002"`, etc.) cannot be used as valid resource names, and instead should be passed into
-    /// [`from_resource`]:
-    ///
-    /// [`from_resource`]: IconExtWindows::from_resource
-    ///
-    /// ```rust,no_run
-    /// use aterm_window::platform::windows::IconExtWindows;
-    /// use aterm_window::window::Icon;
-    ///
-    /// assert!(Icon::from_resource_name("app", None).is_ok());
-    /// assert!(Icon::from_resource(1, None).is_ok());
-    /// assert!(Icon::from_resource(27, None).is_ok());
-    /// assert!(Icon::from_resource_name("27", None).is_err());
-    /// assert!(Icon::from_resource_name("0027", None).is_err());
-    /// ```
-    ///
-    /// While `0` cannot be used as an ordinal id (see [`from_resource`]), it can be used as a
-    /// name:
-    ///
-    /// [`from_resource`]: IconExtWindows::from_resource
-    ///
-    /// ```rust,no_run
-    /// # use aterm_window::platform::windows::IconExtWindows;
-    /// # use aterm_window::window::Icon;
-    /// assert!(Icon::from_resource_name("0", None).is_ok());
-    /// assert!(Icon::from_resource(0, None).is_err());
-    /// ```
     fn from_resource_name(name: &str, size: Option<PhysicalSize<u32>>) -> Result<Self, BadIcon>;
 }
 

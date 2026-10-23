@@ -8,8 +8,7 @@ use super::message_reporters::KEY_FILE_ACCESS;
 use aterm_containment::consent::{FdaProbe, FdaState, ProbeLabel};
 use std::time::{Duration, Instant};
 
-/// Real App/card glue over synthetic published observations; never a live OS probe. The
-/// cache's own publication and invalidation are tested in `consent_state`.
+/// Real App/card glue over synthetic published observations; never a live OS probe.
 pub(super) fn windowed(probe: FdaProbe) -> App {
     let mut app = App::headless_for_test();
     app.headless = false;
@@ -39,8 +38,7 @@ pub(super) fn grant_recorded(app: &App) -> bool {
         .any(|rec| rec.title == GRANTED_CAPTION)
 }
 
-/// Whether the question stands: an entry of the digest, or a `privacy.fda`
-/// row an older parent carried across an update.
+/// Whether the question stands: an entry of the digest, or a `privacy.fda` row an older parent carried across an update.
 pub(super) fn access_row(app: &App) -> bool {
     app.messages.live_by_key(KEY_FILE_ACCESS).is_some()
         || app
@@ -90,7 +88,6 @@ fn pending_launch_retains_the_opened_marker_until_access_is_observed() {
 }
 
 /// A watch whose evidence goes pending, then denied, records no grant: a grant is recorded only
-/// from a completed `granted` read, so no older observation replays as a confirmation.
 #[test]
 fn pending_and_withdrawn_access_never_publish_an_old_confirmation() {
     let now = Instant::now();
@@ -147,9 +144,6 @@ fn disabling_checks_clears_a_pending_answer_and_its_route_row() {
     app.decide_macos_access_card(crate::consent_card::PendingDecision::launch(Some(
         Marker::Opened,
     )));
-    // The question as an older parent left it (a row, restated to the
-    // route words of an earlier Open Settings, still on the band), and the
-    // entry this build raised beside it.
     app.raise_fda_need(&super::consent_card::NeedWords::sample(), now);
     assert!(access_row(&app));
     let id = app.post_message(super::message_reporters::file_access_question(
@@ -239,7 +233,6 @@ fn settings_gesture_restarts_a_settled_watch_with_fresh_evidence() {
     assert!(grant_recorded(&app));
     assert_eq!(app.next_macos_access_card_deadline(now), None);
 
-    // The same explicit door still respects the current notice switch.
     app.config.privacy = Some(super::app_config::PrivacyConfig {
         notice: Some(false),
         ..Default::default()
@@ -249,12 +242,7 @@ fn settings_gesture_restarts_a_settled_watch_with_fresh_evidence() {
     assert_eq!(app.next_macos_access_card_deadline(now), None);
 }
 
-// FILE ACCESS ON A NEW MAC (owner ask 2026-10-16; `consent_launch`)
-
 /// A window standing in for a new Mac: the probe reads `denied`, the hand-over lane
-/// opens pages and shows panels through counted stand-ins, and the launch state knows a
-/// bundle id. Nothing reaches the OS. A planted verdict is served for an hour, so no stall
-/// of the test's own expires it.
 fn new_mac() -> App {
     use crate::consent_launch::{LaunchConsent, LaunchReach};
     use crate::devtools_helper::{Lane, test_arms};
@@ -321,7 +309,6 @@ fn setup_permission_hold_defers_queued_launch_decisions_and_automatic_page_effec
 }
 
 /// A new Mac's launch check: the card settles and the window's own Full Disk Access
-/// hand-over waits for its quiet moment.
 fn launched(now: Instant) -> App {
     let mut app = new_mac();
     assert!(app.consent_card.begin_deciding(now));
@@ -330,10 +317,6 @@ fn launched(now: Instant) -> App {
 }
 
 /// THE FIRST LAUNCH ON A NEW MAC: the launch check reads Full Disk Access off and never
-/// verified, so the window's own hand-over waits for its quiet moment (and the folder
-/// warm-up waits behind it, with no timer); at the moment, System Settings opens at Full
-/// Disk Access — not Developer Tools — with aterm's panel; the owner's Not now notes that
-/// page's decline, and the folder warm-up then walks at its own quiet moment.
 #[test]
 fn a_new_mac_brings_the_owner_to_full_disk_access_then_to_the_folders() {
     use crate::consent_launch::FdaLaunch;
@@ -378,13 +361,9 @@ fn a_new_mac_brings_the_owner_to_full_disk_access_then_to_the_folders() {
         FdaLaunch::Ended { owner_acted: false }
     );
 
-    // The page's opening retired the cached probe; until a fresh one lands the warm-up
-    // waits with no timer.
     app.launch_warmup_look(now, quiet);
     assert_eq!(app.consent_launch.next_deadline(), None);
     assert!(!app.consent_launch.walking());
-    // The fresh probe still reads off: not quiet, it looks again in a few seconds;
-    // quiet, it walks.
     app.consent = ConsentState::with_cached_probe_for_test(denied());
     app.launch_warmup_look(now, |_, _| false);
     assert!(app.consent_launch.next_deadline().is_some());
@@ -393,7 +372,6 @@ fn a_new_mac_brings_the_owner_to_full_disk_access_then_to_the_folders() {
 }
 
 /// A cache that expired between the launch check and the quiet moment reads pending:
-/// the look waits for the fresh reading instead of refusing the hand-over as unknown.
 #[test]
 fn a_pending_read_at_the_quiet_moment_waits_rather_than_refuses() {
     use crate::consent_launch::FdaLaunch;
@@ -418,7 +396,6 @@ fn a_pending_read_at_the_quiet_moment_waits_rather_than_refuses() {
 }
 
 /// Switching the Full Disk Access question off after the launch check answers the
-/// waiting hand-over for this process: nothing opens, and the warm-up stops waiting.
 #[test]
 fn a_question_switched_off_drops_the_waiting_hand_over() {
     use crate::consent_launch::FdaLaunch;
@@ -435,7 +412,6 @@ fn a_question_switched_off_drops_the_waiting_hand_over() {
 }
 
 /// The owner's "I've switched it on" ends the panel as the owner's act: the access
-/// card's `opened` marker and watch, and no folder dialogs on top of the grant.
 #[test]
 fn switched_on_is_the_owners_act_and_no_folders_follow() {
     use crate::consent_launch::FdaLaunch;
@@ -455,7 +431,6 @@ fn switched_on_is_the_owners_act_and_no_folders_follow() {
 }
 
 /// A probe that reads the grant while the panel is up turns it to its done words and
-/// records the grant once, however many turns see it.
 #[test]
 fn a_grant_read_while_the_panel_is_up_is_recorded_once() {
     use crate::devtools_helper::Phase;
@@ -479,8 +454,6 @@ fn a_grant_read_while_the_panel_is_up_is_recorded_once() {
 }
 
 /// Where Full Disk Access reads held, or the owner said Not now to the question for
-/// good, nothing is brought up; with the question declined the folders are still asked
-/// for.
 #[test]
 fn a_held_grant_or_a_standing_not_now_brings_up_nothing() {
     use crate::consent_launch::FdaLaunch;
@@ -509,7 +482,6 @@ fn a_held_grant_or_a_standing_not_now_brings_up_nothing() {
 }
 
 /// The folder warm-up waits while a Developer Tools hand-over is queued: one System
-/// Settings page or folder dialog at a time.
 #[test]
 fn the_folders_wait_behind_a_queued_developer_tools_hand_over() {
     use crate::devtools_helper::Origin;
@@ -525,7 +497,6 @@ fn the_folders_wait_behind_a_queued_developer_tools_hand_over() {
 }
 
 /// The owner's own Open Settings for Full Disk Access brings aterm's panel beside the
-/// page, and ends a waiting automatic hand-over.
 #[test]
 fn the_owners_open_settings_brings_the_panel() {
     use crate::devtools_helper::Origin;
@@ -546,7 +517,6 @@ fn the_owners_open_settings_brings_the_panel() {
 }
 
 /// A session's `aterm ctl devtools hand-over now` never takes the owner's Full Disk
-/// Access panel away (nor, with it, the folder warm-up that follows a Not now).
 #[test]
 fn a_control_verbs_now_panel_waits_behind_full_disk_access() {
     use crate::devtools_helper::{HandOver, Origin, Page, Refusal, test_arms};
@@ -593,8 +563,6 @@ fn warmup_wake(app: &mut App) {
 }
 
 /// A Don't Allow in the launch pass is the owner's answer to aterm's own question: no
-/// Full Disk Access need, however many wakes report the pass after it ended. The
-/// owner's own pass, refused the same way, still is one.
 #[test]
 fn the_launch_pass_refusals_raise_no_need_but_the_owners_pass_does() {
     let now = Instant::now();
@@ -623,9 +591,6 @@ fn the_launch_pass_refusals_raise_no_need_but_the_owners_pass_does() {
 }
 
 /// A launch that finds a grant verified before, reading off now: on the Mac it was
-/// verified on, nothing comes up (it was switched off there); on another Mac — a config
-/// directory synced or migrated — it is a new Mac, and the page comes up; a record from
-/// an older build, with no Mac on it, keeps its word.
 #[test]
 fn a_grant_verified_on_another_mac_does_not_stop_the_new_macs_page() {
     use crate::consent_card::{AccessRecord, DecideWhy, PendingDecision};
@@ -652,8 +617,6 @@ fn a_grant_verified_on_another_mac_does_not_stop_the_new_macs_page() {
 }
 
 /// An update's successor that starts while its predecessor's Full Disk Access page may
-/// still be in front of the owner (opened within ten minutes) brings up no page and
-/// walks no folders over it.
 #[test]
 fn a_successor_leaves_its_predecessors_page_alone() {
     use crate::consent_launch::FdaLaunch;
@@ -677,8 +640,6 @@ fn a_successor_leaves_its_predecessors_page_alone() {
 }
 
 /// The page aterm brings up itself is the card's Open Settings: the `opened` marker and
-/// `opened_at` are on record the moment it opens, so a grant made there and followed by
-/// System Settings' own Quit & Reopen is confirmed by the next process.
 #[test]
 fn the_automatic_page_is_on_record_for_the_next_process_to_confirm() {
     let now = Instant::now();
@@ -689,7 +650,6 @@ fn the_automatic_page_is_on_record_for_the_next_process_to_confirm() {
     assert_eq!(app.consent_card_host.marker, Some(Marker::Opened));
     assert!(app.consent_card_host.record.opened_at.is_some());
 
-    // The next process, the grant on.
     let mut next = new_mac();
     next.consent = ConsentState::with_cached_probe_for_test(granted());
     assert!(next.consent_card.begin_deciding(now));
@@ -709,7 +669,6 @@ fn own(probe: FdaProbe) -> ConsentState {
 }
 
 /// `probe`, read by a window another app started in-process: macOS names that app
-/// (here launchd's pid) responsible, and the probe reads ITS grant.
 fn foreign(probe: FdaProbe) -> ConsentState {
     let mut consent = ConsentState::with_cached_probe_for_test(probe);
     consent.set_responsible_for_test(|pids| pids.iter().map(|_| Ok(1)).collect());
@@ -717,8 +676,6 @@ fn foreign(probe: FdaProbe) -> ConsentState {
 }
 
 /// A grant aterm reads held — at launch, never asked for, or at a waiting hand-over's
-/// quiet moment — is recorded as seen on this Mac, so a later switch-off here is not
-/// taken for a new Mac and brings nothing up.
 #[test]
 fn a_grant_aterm_reads_held_is_recorded_so_a_switch_off_brings_nothing_up() {
     use crate::consent_card::{DecideWhy, PendingDecision};
@@ -733,7 +690,6 @@ fn a_grant_aterm_reads_held_is_recorded_so_a_switch_off_brings_nothing_up() {
     assert!(record.verified_at.is_some(), "the held grant is on record");
     assert!(!grant_recorded(&app), "silently: the owner was never asked");
 
-    // A later launch on this Mac, the owner having switched it off.
     let mut later = new_mac();
     assert!(later.consent_card.begin_deciding(now));
     later.decide_macos_access_card(PendingDecision {
@@ -744,7 +700,6 @@ fn a_grant_aterm_reads_held_is_recorded_so_a_switch_off_brings_nothing_up() {
     });
     assert_eq!(later.devtools_helper.fda_queued(), None);
 
-    // A grant made while the hand-over waits is recorded at its quiet moment.
     let mut waiting = launched(now);
     waiting.consent = own(granted());
     let (opens, _, _) = test_arms::fda_counts();
@@ -756,8 +711,6 @@ fn a_grant_aterm_reads_held_is_recorded_so_a_switch_off_brings_nothing_up() {
 }
 
 /// A window started in-process by another terminal reads THAT terminal's grant (macOS
-/// holds the terminal responsible): it is never recorded as aterm's, at launch or at a
-/// waiting hand-over's quiet moment, so a later aterm of its own still gets the page.
 #[test]
 fn another_terminals_grant_is_never_recorded_as_aterms() {
     use crate::devtools_helper::test_arms;
@@ -769,8 +722,6 @@ fn another_terminals_grant_is_never_recorded_as_aterms() {
     app.decide_macos_access_card(crate::consent_card::PendingDecision::launch(None));
     assert_eq!(app.consent_card_host.record.verified_at, None);
 
-    // A page aterm opened earlier is on record (`opened`): a foreign reading does not
-    // confirm it, and the marker stays for aterm's own next launch.
     let mut confirm = new_mac();
     confirm.consent = foreign(granted());
     assert!(confirm.consent_card.begin_deciding(now));
@@ -785,8 +736,6 @@ fn another_terminals_grant_is_never_recorded_as_aterms() {
     assert_eq!(confirm.consent_card_host.marker, Some(Marker::Opened));
     assert!(!grant_recorded(&confirm));
 
-    // Nor does it bring aterm's page up on that terminal's reading: whose reading it is
-    // is judged at the quiet moment, and there nothing comes up.
     let mut denied_there = new_mac();
     denied_there.consent = foreign(denied());
     assert!(denied_there.consent_card.begin_deciding(now));
@@ -800,7 +749,6 @@ fn another_terminals_grant_is_never_recorded_as_aterms() {
         crate::consent_launch::FdaLaunch::NotAsked
     );
 
-    // Nor does it walk the folders: macOS would ask for the other app.
     let mut walker = new_mac();
     walker.consent = foreign(denied());
     walker
@@ -820,7 +768,6 @@ fn another_terminals_grant_is_never_recorded_as_aterms() {
 }
 
 /// 0.104's only answer to the Full Disk Access question was its Dismiss in "To look at":
-/// inside that span the window's own page stays down, as after the panel's Not now.
 #[test]
 fn a_dismissed_full_disk_access_question_holds_the_launch_page_back() {
     use crate::consent_card::{NeedCause, NeedWords};
@@ -850,11 +797,7 @@ fn a_dismissed_full_disk_access_question_holds_the_launch_page_back() {
     assert_eq!(app.consent_launch.fda(), FdaLaunch::NotAsked);
 }
 
-// AN UPDATE FROM 0.105.0 ON THE OWNER'S MAC (2026-10-17)
-
 /// The owner's config directory (`~/.config/aterm`) on the Mac where 0.105.0 drew "aterm
-/// would like to access files in your Downloads folder" for an agent in a tab at 08:33
-/// (macOS 27.0.1; listed that evening, 2026-10-17, names only). There is no `aterm.toml`.
 const OWNER_CONFIG_0_105: &[&str] = &[
     "connections-first-use",
     "kitty-collectibles.toml",
@@ -865,7 +808,6 @@ const OWNER_CONFIG_0_105: &[&str] = &[
 ];
 
 /// Its state directory (`~/Library/Application Support/aterm`) then, sockets, the control
-/// token and the journal left out; a trailing `/` is a directory.
 const OWNER_STATE_0_105: &[&str] = &[
     ".cell-metrics.toml.aterm-restore.lock",
     ".session.toml.aterm-restore.lock",
@@ -892,15 +834,6 @@ const DEVELOPER_ID_DR: &str = "identifier \"com.aterm.aterm\" and anchor apple g
      A66A9P66Z7";
 
 /// MAIN AS THE UPDATE SUCCESSOR OF 0.105.0, ON THE OWNER'S MAC. 0.105.0 never asked for
-/// Full Disk Access there (`access_card state=quiet asked_at=-`): it had no launch
-/// hand-over, and its probe read only the per-user `TCC.db`, which macOS 27 does not keep.
-/// Composed from the deciders alone, over that Mac's files as 0.105.0 left them, read
-/// through this build's own readers: the probe reads `denied` (the user store `ENOENT`,
-/// the system one `EPERM`); the launch check hands over; the hand-over waits for the first
-/// quiet moment after `LAUNCH_SETTLE`, ahead of a waiting Developer Tools page and of any
-/// folder dialog; and no 0.105.0 marker holds it back for good — the Developer Tools page
-/// 0.105.0 opened two minutes before the update delays it to that page's ten minutes,
-/// and that page's once-per-version word is not this page's.
 #[test]
 fn main_as_the_successor_of_0_105_0_on_the_owners_mac_hands_full_disk_access_over_first() {
     use crate::consent_card::{
@@ -922,8 +855,6 @@ fn main_as_the_successor_of_0_105_0_on_the_owners_mac_hands_full_disk_access_ove
     use std::path::Path;
     const BUNDLE: &str = "com.aterm.aterm";
     const HERE: &str = "5B1E0C2A-7F3D-4E8B-9A61-0D2C4F6E8A10";
-    // 0.105.0 opened the Developer Tools page at `opened`; the update's successor
-    // started two minutes later.
     let opened: u64 = 1_792_226_100;
     let started = opened + 120;
 
@@ -945,7 +876,6 @@ fn main_as_the_successor_of_0_105_0_on_the_owners_mac_hands_full_disk_access_ove
         if let Some(dir) = name.strip_suffix('/') {
             std::fs::create_dir_all(state.join(dir)).expect("a state directory");
         } else {
-            // 0.105.0's `atpkg::devtools::note_opened`: `<version> <unix seconds>`.
             let text = if *name == "devtools-pane-opened" {
                 format!("0.105.0 {opened}\n")
             } else {
@@ -956,7 +886,6 @@ fn main_as_the_successor_of_0_105_0_on_the_owners_mac_hands_full_disk_access_ove
     }
     let toml = config.join("aterm.toml");
 
-    // What this build reads there: no answer, no record, no Mac a grant was seen on.
     let marker = read_marker(Some(&toml));
     let record = read_record(Some(&toml));
     let here = verified_here(Some(&toml), Some(HERE), Some(BUNDLE));
@@ -979,15 +908,12 @@ fn main_as_the_successor_of_0_105_0_on_the_owners_mac_hands_full_disk_access_ove
     assert_eq!(probe.state, FdaState::Denied);
     let dr = classify_dr(DEVELOPER_ID_DR);
     assert!(dr.grant_stable());
-    // The page's once-per-version word, as this build writes it, and 0.105.0's word,
-    // which is the Developer Tools page's.
     let fda_word = format!("{}@{BUNDLE}@{HERE}", aterm_types::version::app_version());
     assert_eq!(
         DEVELOPER_TOOLS.last_opened_in(&state),
         Some(("0.105.0".to_owned(), opened))
     );
     assert_eq!(FULL_DISK_ACCESS.last_opened_in(&state), None);
-    // `App::fda_admit_facts` at `now` (unix seconds), in a window whose reading is `own`.
     let facts_at = |now: u64, own: bool| FdaFacts {
         fda: probe.state,
         declined: FULL_DISK_ACCESS.declined_until_in(&state, now).is_some()
@@ -1005,8 +931,6 @@ fn main_as_the_successor_of_0_105_0_on_the_owners_mac_hands_full_disk_access_ove
         own,
     };
 
-    // THE LAUNCH CHECK hands over, and the hand-over is held for its quiet moment —
-    // also while the outgoing 0.105.0 is still named responsible (the fork lane).
     let verdict = decide_launch(
         &CardFacts {
             offered: true,
@@ -1026,7 +950,6 @@ fn main_as_the_successor_of_0_105_0_on_the_owners_mac_hands_full_disk_access_ove
             "own {own}"
         );
     }
-    // No folder dialog comes first: the warm-up waits on the page.
     let answered = answered_at(&state.join("privacy-warmup-answered"), BUNDLE);
     assert_eq!(answered, Some(false));
     let warmup = WarmupFacts {
@@ -1040,8 +963,6 @@ fn main_as_the_successor_of_0_105_0_on_the_owners_mac_hands_full_disk_access_ove
     };
     assert_eq!(decide_warmup(&warmup), WarmupStep::Wait);
 
-    // THE LANE of an update's successor: settled at LAUNCH_SETTLE, and a Developer Tools
-    // hand-over waiting beside this one waits behind it.
     let mut lane = Lane::windowed_with_fda_for_test(
         test_arms::opening(),
         test_arms::fda_opening(),
@@ -1069,9 +990,6 @@ fn main_as_the_successor_of_0_105_0_on_the_owners_mac_hands_full_disk_access_ove
     );
     assert!(quiet_after(settle));
 
-    // AT THE FIRST QUIET MOMENT AFTER LAUNCH_SETTLE the outgoing process is gone and
-    // the window reads its own grant. Inside the ten minutes of 0.105.0's Developer
-    // Tools page the hand-over is held again, never refused; past them it hands over.
     let hand = Admit::Hand {
         list_terminal: false,
     };
@@ -1093,8 +1011,6 @@ fn main_as_the_successor_of_0_105_0_on_the_owners_mac_hands_full_disk_access_ove
         ),
         hand
     );
-    // An update an hour after that page hands over at the first quiet moment after
-    // LAUNCH_SETTLE itself.
     assert_eq!(
         admit_fda(
             Origin::Automatic,
@@ -1107,6 +1023,7 @@ fn main_as_the_successor_of_0_105_0_on_the_owners_mac_hands_full_disk_access_ove
 
 std::thread_local! {
     /// How long ago the Developer Tools page came up, for [`devtools_opened_within`].
+    /// How long ago the Developer Tools page came up, for [`devtools_opened_within`].
     static DEVTOOLS_AGO: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
 }
 
@@ -1118,8 +1035,6 @@ fn devtools_opened_within(window_s: u64) -> Option<u64> {
 }
 
 /// THE 0.105.0 UPDATE IN THE WINDOW: the Developer Tools page the outgoing process opened
-/// two minutes before holds the launch's Full Disk Access page back until that page's ten
-/// minutes are up, walks no folder meanwhile, and then brings it up; it never drops it.
 #[test]
 fn a_developer_tools_page_up_minutes_ago_holds_the_launch_page_back_and_never_drops_it() {
     use crate::consent_launch::FdaLaunch;
@@ -1154,9 +1069,6 @@ fn a_developer_tools_page_up_minutes_ago_holds_the_launch_page_back_and_never_dr
 }
 
 /// AN UPDATE'S SUCCESSOR ON THE FORK LANE names its outgoing process responsible for the
-/// seconds its launch check runs in (TCC design §2.2): the hand-over is held all the same,
-/// and at its quiet moment, the outgoing process gone and the reading the window's own,
-/// the page comes up.
 #[test]
 fn a_fork_lane_successor_gets_the_page_once_its_reading_is_its_own() {
     use crate::devtools_helper::{Origin, test_arms};
@@ -1172,8 +1084,6 @@ fn a_fork_lane_successor_gets_the_page_once_its_reading_is_its_own() {
     assert_eq!(test_arms::fda_counts().0, opens + 1);
     assert!(app.fda_panel_up());
 }
-
-// DEBUGGER ACCESS ON A NEW MAC (`debugger_access`)
 
 /// One alert as the stand-in was asked it: title, body and proceed button.
 type Alert = (String, String, String);
@@ -1197,8 +1107,6 @@ fn debugger_alert(title: &str, body: &str, proceed: &str) {
 }
 
 /// The alert the launch ask raises on `app`'s stand-in Mac: the Security page's
-/// debugger-access alert in its launch words, over the facts that Mac publishes,
-/// and not the press's.
 fn launch_alert(app: &mut App) -> Alert {
     use crate::native_settings::{DebuggerAlertFrom, debugger_access_alert};
     use aterm_containment::consent::DebuggerChange;
@@ -1234,7 +1142,6 @@ fn owner_says_yes(title: &str, body: &str, proceed: &str) -> Option<bool> {
 }
 
 /// The stand-in worker start: no thread and no process; the change stays under way
-/// until the test ends it.
 fn worker_started(
     _job: crate::debugger_access::DevtoolsJob,
 ) -> crate::debugger_access::DevtoolsSpawn {
@@ -1242,7 +1149,6 @@ fn worker_started(
 }
 
 /// The debugger probe's answer on this stand-in Mac: debugger access off, the
-/// account an admin, this aterm hardened — the facts under which aterm asks.
 fn debugger_reads_off(app: &mut App) {
     use aterm_containment::consent::{
         DebuggerMember, DebuggerMode, DebuggerProbe, DebuggerProbeLabel, SelfHardening,
@@ -1258,9 +1164,6 @@ fn debugger_reads_off(app: &mut App) {
 }
 
 /// Queue the launch ask on a test App as a windowed macOS instance does: a scratch
-/// config folder (`dir`) for its record, the shared debugger records read, this Mac
-/// named `host`, and the stand-in alert `confirm` and worker start. The probe is NOT
-/// published: a test that wants the ask to get that far calls [`debugger_reads_off`].
 fn queue_debugger_ask(
     app: &mut App,
     dir: &std::path::Path,
@@ -1278,7 +1181,6 @@ fn queue_debugger_ask(
 }
 
 /// A new Mac where both launch pages are over (Full Disk Access not offered, the
-/// Developer Tools list read) and the ask is queued and may ask.
 fn ready_to_ask(dir: &std::path::Path, confirm: fn(&str, &str, &str) -> Option<bool>) -> App {
     use crate::devtools_helper::test_arms;
     let mut app = new_mac();
@@ -1306,10 +1208,6 @@ fn later(at: &mut Instant) -> Instant {
 }
 
 /// THE FIRST LAUNCH ON A NEW MAC, WHOLE: the Full Disk Access page, then the Developer
-/// Tools page, then aterm's debugger-access alert (once, in its launch words, with this
-/// Mac recorded before it), then the folder warm-up. Neither page's wait, neither panel
-/// and no unread Developer Tools list lets the alert come early, and the folders wait
-/// for the alert.
 #[test]
 fn a_new_mac_asks_for_debugger_access_after_both_pages_and_before_the_folders() {
     use crate::consent_launch::FdaLaunch;
@@ -1322,12 +1220,10 @@ fn a_new_mac_asks_for_debugger_access_after_both_pages_and_before_the_folders() 
     debugger_reads_off(&mut app);
     let config = root.path().join("aterm.toml");
 
-    // Full Disk Access waits for its moment: the alert waits behind it.
     assert_eq!(app.consent_launch.fda(), FdaLaunch::Waiting);
     app.look_for_debugger_moment(later(&mut t), quiet);
     assert!(debugger_alerts().is_empty() && app.debugger_launch.queued());
     assert!(app.debugger_launch.next_deadline().is_some_and(|at| at > t));
-    // The page and its panel: still behind it.
     app.look_for_fda_moment(Instant::now(), quiet);
     assert!(app.fda_panel_up());
     app.look_for_debugger_moment(later(&mut t), quiet);
@@ -1338,10 +1234,8 @@ fn a_new_mac_asks_for_debugger_access_after_both_pages_and_before_the_folders() 
         app.consent_launch.fda(),
         FdaLaunch::Ended { owner_acted: false }
     );
-    // The Developer Tools list not read yet: the alert waits for it.
     app.look_for_debugger_moment(later(&mut t), quiet);
     assert!(debugger_alerts().is_empty() && app.debugger_launch.queued());
-    // Read, aterm off it: the window's own hand-over waits, and the alert behind it.
     app.devtools_helper.note_reading(
         test_arms::reading(
             aterm_containment::DevToolGrant::NotGranted,
@@ -1366,7 +1260,6 @@ fn a_new_mac_asks_for_debugger_access_after_both_pages_and_before_the_folders() 
     app.tick_devtools_hand_over(now);
     assert!(app.devtools_helper.panel().is_none());
 
-    // The folders wait for the alert still to come.
     app.consent = ConsentState::with_cached_probe_for_test(denied());
     debugger_reads_off(&mut app);
     app.launch_warmup_look(later(&mut t), quiet);
@@ -1376,7 +1269,6 @@ fn a_new_mac_asks_for_debugger_access_after_both_pages_and_before_the_folders() 
     );
     assert!(app.consent_launch.next_deadline().is_some());
 
-    // Both pages over, a quiet moment: the alert, once, with this Mac recorded first.
     app.look_for_debugger_moment(later(&mut t), quiet);
     assert_eq!(debugger_alerts(), [launch_alert(&mut app)]);
     assert!(crate::debugger_access::read_asked(&config, "NEW-MAC"));
@@ -1396,7 +1288,6 @@ fn a_new_mac_asks_for_debugger_access_after_both_pages_and_before_the_folders() 
         app.consent_launch.walking(),
         "then the folders are asked for"
     );
-    // The record is written off the UI thread: it lands before the folder goes.
     let cached = app.consent_card_host.record;
     aterm_spec::wait::until_within(
         aterm_spec::wait::MUST_HAPPEN,
@@ -1406,9 +1297,6 @@ fn a_new_mac_asks_for_debugger_access_after_both_pages_and_before_the_folders() 
 }
 
 /// The owner's yes starts the change a press starts — the same lane, the App's one
-/// start through its injected worker arm — and a press queued behind the alert does
-/// not ask again. While that change is under way (macOS's administrator dialog may be
-/// up) the folders wait; once it is over they walk.
 #[test]
 fn a_yes_at_launch_starts_the_change_and_the_folders_wait_for_it() {
     let root = crate::test_scratch::outlived_dir("aterm-access-");
@@ -1440,9 +1328,6 @@ fn a_yes_at_launch_starts_the_change_and_the_folders_wait_for_it() {
 }
 
 /// The alert never comes while anything goes before it: the Full Disk Access decision
-/// not made or its page waiting, the Developer Tools list unread, a hand-over waiting,
-/// a panel up, a moment that is not quiet, or the owner's recent decline. Each waits —
-/// queued, with a later look — and the same Mac with the blocker gone is asked.
 #[test]
 fn the_debugger_alert_waits_behind_every_page_panel_and_moment() {
     use crate::consent_launch::FdaLaunch;
@@ -1512,11 +1397,6 @@ fn the_debugger_alert_waits_behind_every_page_panel_and_moment() {
 }
 
 /// The owner's own Open Settings for Full Disk Access, over a grant that reads held,
-/// takes the window's waiting hand-over with it and shows no panel: nothing is left to
-/// say how that visit ends, so the launch counts the owner at the page. The debugger
-/// alert waits while the Full Disk Access decision is unmade, a hand-over is queued or
-/// a panel is up, never behind a hand-over that is gone: a `Waiting` with nothing
-/// queued and no panel holds nothing.
 #[test]
 fn a_full_disk_access_hand_over_gone_with_no_panel_holds_nothing() {
     use crate::consent_launch::FdaLaunch;
@@ -1562,11 +1442,6 @@ fn a_full_disk_access_hand_over_gone_with_no_panel_holds_nothing() {
 }
 
 /// THE ALERT IS RAISED ONLY ON A FRESH READING OF THE RULE. While the ask waits for its
-/// moment it judges the answer already cached, however old, and starts no probe and
-/// retires nothing; at the moment, an answer older than
-/// [`crate::debugger_access::ASK_PROBE_FRESH`] is retired and the rule read again before
-/// any alert, so a rule switched on meanwhile (by the owner's own `sudo`, which retires
-/// no cached answer) is never asked about.
 #[test]
 fn the_debugger_alert_waits_for_a_fresh_reading_of_the_rule() {
     use crate::debugger_access::ASK_PROBE_FRESH;
@@ -1576,7 +1451,6 @@ fn the_debugger_alert_waits_for_a_fresh_reading_of_the_rule() {
     let root = crate::test_scratch::outlived_dir("aterm-access-");
     let mut t = Instant::now();
     let mut app = ready_to_ask(root.path(), owner_says_yes);
-    // Older than the slot's own refresh age too: a read through it would dispatch.
     let old = Duration::from_secs(120);
     app.consent.publish_debugger_aged_for_test(
         DebuggerProbe {
@@ -1619,9 +1493,6 @@ fn the_debugger_alert_waits_for_a_fresh_reading_of_the_rule() {
 }
 
 /// A change on disk this lane never settles — here a peer's change lock held for good
-/// — refuses each offer before anything is written, and the ask looks again; but only
-/// for [`crate::debugger_access::REFUSED_FOR`] from the first refusal. Then it is over
-/// for this process, with nothing recorded and no alert, and the folders it held walk.
 #[cfg(unix)]
 #[test]
 fn a_change_on_disk_holds_the_ask_and_the_folders_for_a_bounded_span() {
@@ -1664,7 +1535,6 @@ thread_local! {
 }
 
 /// The host key reads cold, and the read ends right after: the worker finishing
-/// between the look's two loads.
 fn cold_then_ended() -> Option<&'static str> {
     HOST_READ.with(|done| {
         if let Some(done) = done.borrow().as_ref() {
@@ -1675,8 +1545,6 @@ fn cold_then_ended() -> Option<&'static str> {
 }
 
 /// A host-key read that ends while a look reads the key cold is not a Mac the kernel
-/// never names: that look waits, and only a later look that finds the read ended
-/// with the key still cold drops the ask.
 #[test]
 fn a_host_read_ending_mid_look_is_not_a_mac_without_a_name() {
     let root = crate::test_scratch::outlived_dir("aterm-access-");
@@ -1697,12 +1565,6 @@ fn a_host_read_ending_mid_look_is_not_a_mac_without_a_name() {
 }
 
 /// THE RECORD IS READ OFF THE EVENT LOOP: on a launch, a look that finds this Mac's
-/// line in the record unread starts its read on a thread of its own and waits, the
-/// ask still queued, instead of reading the home folder in the window's turn (a home
-/// on a network volume that stopped answering held the window there until the
-/// server came back); once that read has ended, the next look acts on it — here a
-/// record that names this Mac already, so the ask drops with no alert. NEGATIVE
-/// CONTROL: read in the look, the first look drops the ask.
 #[test]
 fn the_launch_asks_record_is_read_off_the_event_loop() {
     let root = crate::test_scratch::outlived_dir("aterm-access-");
@@ -1732,14 +1594,6 @@ fn the_launch_asks_record_is_read_off_the_event_loop() {
 }
 
 /// THE OFFER WRITES THIS MAC OFF THE EVENT LOOP, AND ITS ALERT FOLLOWS AT THE NEXT LOOK.
-/// On a launch, the look that would ask starts the offer's disk half (the change lock,
-/// the record's read and this Mac's durable line) on a thread of its own and waits,
-/// queued and with no alert, however fast that ends, and the window's thread syncs
-/// nothing. The disk half's end makes the ask due, and the next look raises the alert
-/// before it judges anything again, so a moment that is no longer quiet does not hold
-/// back the alert for a Mac already recorded. A settle writes its record on a thread
-/// too. NEGATIVE CONTROL: with the disk work run in the look (the other tests' queue),
-/// that look raises the alert, and the window's thread made the durable flushes.
 #[test]
 fn the_launch_asks_record_is_written_off_the_event_loop() {
     use aterm_durable::{Flush, seam::Recording};
@@ -1758,7 +1612,6 @@ fn the_launch_asks_record_is_written_off_the_event_loop() {
         "the record's read ends",
         || app.debugger_launch.asked("READY-MAC").map(|_| ()),
     );
-    // A fresh reading at the moment, however long that read took.
     debugger_reads_off(&mut app);
     let asking = later(&mut t);
     app.look_for_debugger_moment(asking, quiet);
@@ -1841,10 +1694,6 @@ fn the_launch_asks_record_is_written_off_the_event_loop() {
 }
 
 /// WHILE THE OFFER'S DISK HALF IS OUT, THE ASK ONLY WAITS: a look then ends nothing,
-/// even one that would drop the ask (here, no config folder), so no write lands after
-/// the ask is over; and once the answer is in, it is spent before anything is judged
-/// again, so the Mac it recorded is asked. NEGATIVE CONTROL: with no disk half out, the
-/// same look drops the ask.
 #[test]
 fn the_launch_ask_waits_out_its_disk_half_and_spends_it_first() {
     use crate::debugger_access::OfferPrep;
@@ -1886,9 +1735,6 @@ fn the_launch_ask_waits_out_its_disk_half_and_spends_it_first() {
 }
 
 /// FIRST-LAUNCH SETUP COMES FIRST: while it holds the macOS permissions back (its offer
-/// not yet answered, cancelled, or applied with its permissions choice unchecked) the
-/// ask does not look: no record, no alert, still queued. An Apply that keeps the choice
-/// releases it, and the Mac is asked.
 #[test]
 fn a_held_first_launch_setup_holds_the_debugger_ask() {
     use crate::InitialSetupPermissionPolicy as Policy;
@@ -1928,7 +1774,6 @@ fn a_held_first_launch_setup_holds_the_debugger_ask() {
 }
 
 /// An app whose offer's disk half has just recorded this Mac: the look that
-/// started it waited, and its answer is in. `at` is that look's time.
 fn recorded_mid_offer(app: &mut App, t: &mut Instant) -> Instant {
     let read = app.debugger_access_facts();
     let slot = app.debugger_launch.start_prepare(read).expect("none out");
@@ -1943,10 +1788,6 @@ fn recorded_mid_offer(app: &mut App, t: &mut Instant) -> Instant {
 }
 
 /// AN ANSWER GIVEN WHILE THE OFFER RECORDS SETTLES THE ASK: the owner answered a
-/// debugger-access alert after the offer was admitted (a Settings press, its change not
-/// started yet), so the Mac just recorded gets no second alert and the ask is over, as
-/// admission's settle for an answer says. NEGATIVE CONTROL: unanswered, the same answer
-/// raises the alert.
 #[test]
 fn an_answer_given_while_the_offer_records_settles_the_ask() {
     let mut t = Instant::now();
@@ -1967,9 +1808,6 @@ fn an_answer_given_while_the_offer_records_settles_the_ask() {
 }
 
 /// A DECLINE QUIET THAT BEGAN WHILE THE OFFER RECORDS DEFERS THE ALERT, NEVER DROPS IT:
-/// a recent decline of any Security alert quiets this one too, so the recorded answer is
-/// kept and the ask waits, still queued, for its time (not at the next wake); a look
-/// once the quiet has passed raises the alert, whatever the moment.
 #[test]
 fn a_decline_quiet_while_the_offer_records_defers_its_alert() {
     use crate::debugger_access::AskWait;
@@ -2066,10 +1904,6 @@ fn rule_reads_unrecognized(
 }
 
 /// An app whose recorded answer waited out a decline's quiet, its reading now
-/// older than [`crate::debugger_access::ASK_PROBE_FRESH`] — as a kept answer's
-/// is, past `OWNER_QUIET_FIRST` — but younger than the slot's own refresh age,
-/// so only the spend's retirement reads the rule again; the rule is read again
-/// by `read_again`. Returns the next look's time.
 fn kept_on_an_aging_reading(
     app: &mut App,
     t: &mut Instant,
@@ -2094,9 +1928,6 @@ fn kept_on_an_aging_reading(
 }
 
 /// Look as the park does until a reading of the rule has landed, then give the
-/// next look's time. A look dispatches the read, or, inside the slot's retry floor,
-/// leaves it to a later look; no look is made while a read is out, so none races
-/// the reading it waits for.
 fn read_again_lands(app: &mut App) -> Instant {
     use crate::debugger_access::ASK_PROBE_FRESH;
     let gate = app.config.privacy_probe_gate();
@@ -2118,11 +1949,6 @@ fn read_again_lands(app: &mut App) -> Instant {
 }
 
 /// A KEPT ANSWER'S ALERT STATES A FRESH READING OF THE RULE: once the decline quiet has
-/// passed, a reading older than [`crate::debugger_access::ASK_PROBE_FRESH`] is retired
-/// and the rule read again before any alert, as admission does, so a rule switched on
-/// meanwhile (by the owner's own `sudo`, which retires no cached answer) is a press the
-/// lane refuses: the ask ends with no alert, the record standing. NEGATIVE CONTROL: a
-/// rule read again as off is asked about.
 #[test]
 fn a_kept_answer_is_spent_on_a_fresh_reading_of_the_rule() {
     use crate::debugger_access::ASK_PROBE_FRESH;
@@ -2163,16 +1989,6 @@ fn a_kept_answer_is_spent_on_a_fresh_reading_of_the_rule() {
 }
 
 /// A FAILED READ OF THE RULE AT THE SPEND IS NO ANSWER: a `-status` that timed out, did
-/// not start or answered what the classifier does not claim reads nothing, and admission
-/// drops such a reading with nothing written; this Mac is recorded already, so the failed
-/// read is retired and the rule read again `RECHECK_EVERY` later, and a read that comes
-/// back off raises the alert. Failed reads held for
-/// [`crate::debugger_access::REFUSED_FOR`] from the first end the ask with no alert once
-/// they number [`crate::debugger_access::UNREAD_READS`], not before: one met after an
-/// absence keeps it. A rule `-status` calls unknown is a reading the lane refuses, and a
-/// `[privacy]` gate closed meanwhile is no read at all (the owner has said not to read
-/// the rule): each ends the ask at once.
-/// NEGATIVE CONTROL: the alert is raised only once the rule reads off.
 #[test]
 fn a_failed_read_of_the_rule_at_the_spend_is_read_again() {
     use crate::debugger_access::{REFUSED_FOR, UNREAD_READS};
@@ -2227,8 +2043,6 @@ fn a_failed_read_of_the_rule_at_the_spend_is_read_again() {
         );
     }
 
-    // The bound: a failure met after an absence is read again; the span and
-    // UNREAD_READS failures end it.
     assert_eq!(UNREAD_READS, 3, "the case below fails three reads");
     let root = crate::test_scratch::outlived_dir("aterm-access-");
     let mut app = ready_to_ask(root.path(), owner_says_no);
@@ -2282,11 +2096,6 @@ fn a_failed_read_of_the_rule_at_the_spend_is_read_again() {
 }
 
 /// FIRST-LAUNCH SETUP'S HOLD DOES NOT STRAND AN OFFER ADMITTED BEFORE IT ARMED: the
-/// hold holds back asks not yet admitted, but this Mac is recorded already, and an alert
-/// held behind a setup the owner cancels would never come. Under the hold the ask's
-/// looks keep waking while its answer is out or kept, and that answer is spent.
-/// NEGATIVE CONTROL: with nothing offered, a held look asks nothing and the hold folds
-/// no look for the ask.
 #[test]
 fn a_setup_hold_armed_while_the_offer_records_does_not_strand_it() {
     use crate::metrics::DeadlineOwner;
@@ -2345,7 +2154,6 @@ fn a_setup_hold_armed_while_the_offer_records_does_not_strand_it() {
         "asked: over for this process"
     );
 
-    // An answer kept for a decline's quiet, not out, still wakes its look under the hold.
     let root = crate::test_scratch::outlived_dir("aterm-access-");
     let mut kept = ready_to_ask(root.path(), owner_says_no);
     focus(&mut kept);
@@ -2361,7 +2169,6 @@ fn a_setup_hold_armed_while_the_offer_records_does_not_strand_it() {
         kept.debugger_launch.next_deadline().is_some(),
         "a later look"
     );
-    // Before every other lane's turn, so the fold can only be the ask's.
     let next = at + Duration::from_secs(1);
     kept.debugger_launch.look_later(next);
     assert_eq!(
@@ -2379,7 +2186,6 @@ fn a_setup_hold_armed_while_the_offer_records_does_not_strand_it() {
 }
 
 /// A headless instance never queues the ask, and one queued on it by hand drops at its
-/// first look, before any read: no probe dispatched, no record, no alert.
 #[test]
 fn a_headless_app_never_asks_or_probes() {
     let root = crate::test_scratch::outlived_dir("aterm-access-");
@@ -2388,8 +2194,6 @@ fn a_headless_app_never_asks_or_probes() {
     app.tick_consent_lanes(Instant::now());
     assert!(debugger_alerts().is_empty());
     assert!(!crate::debugger_access::LaunchAskQueue::new(false).queued());
-    // Queued by hand on a headless instance whose consent reads are live-flagged:
-    // a probe read would dispatch its worker.
     app.consent = ConsentState::with_cached_probe_for_test(denied());
     app.consent_card_config = Some(root.path().join("aterm.toml"));
     app.debugger_launch =
@@ -2410,7 +2214,6 @@ fn a_headless_app_never_asks_or_probes() {
 }
 
 /// ONCE PER MAC: a second launch on the same config folder asks nothing and reads no
-/// probe for it; another Mac sharing that folder (a synced config) is asked once.
 #[test]
 fn a_second_launch_on_the_same_mac_asks_nothing() {
     let root = crate::test_scratch::outlived_dir("aterm-access-");
@@ -2445,8 +2248,6 @@ fn a_second_launch_on_the_same_mac_asks_nothing() {
 }
 
 /// Already on, seen go off (the shared record says it was on, and it reads off
-/// now), or answered on the Settings page in this process: the question is answered
-/// on this Mac. The record says so, and no alert comes.
 #[test]
 fn an_answered_question_settles_without_an_alert() {
     use aterm_containment::consent::{

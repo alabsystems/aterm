@@ -45,6 +45,7 @@ fn accounts(state: Option<&'static str>) -> ClaudeAccounts {
         limited_until: None,
         served_at: None,
         renewed_at: None,
+        next_sign_in: None,
     }
 }
 
@@ -354,4 +355,36 @@ fn a_persisted_extreme_use_without_how_does_not_become_fresh() {
     );
     assert_eq!(row.state, State::Idle, "an ancient use cannot become fresh");
     assert_eq!(assess(&future, true, i64::MIN).state, State::Ok);
+}
+
+#[test]
+fn claude_limited_with_unenrolled_successor_is_due_and_actionable() {
+    let mut f = facts(&CLAUDE);
+    f.profile_signed_in = true;
+    f.limited_until = Some(NOW + 86_400);
+    let mut a = accounts(Some("ok"));
+    a.label = "m27-3".into();
+    a.limited_until = Some(NOW + 86_400);
+    f.accounts = Some(a.clone());
+    let row = assess(&f, true, NOW);
+    assert_eq!(
+        (row.state, row.mark),
+        (State::Limited(NOW + 86_400), Mark::Note)
+    );
+    assert_eq!(row.fix, None);
+
+    a.next_sign_in = Some("m27".into());
+    f.accounts = Some(a);
+    let row = assess(&f, true, NOW);
+    assert_eq!(
+        (row.state, row.mark),
+        (State::Due(NOW + 86_400), Mark::Warn)
+    );
+    assert!(row.state.needs_person(row.wanted));
+    assert_eq!(row.fix.as_deref(), Some("aterm ai login claude"));
+    assert!(
+        row.fact.contains("next account `m27` needs sign-in"),
+        "{}",
+        row.fact
+    );
 }

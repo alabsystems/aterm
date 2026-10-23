@@ -17,7 +17,7 @@ impl SgrStyleHandler<'_> {
     /// background, so line feeds, autowrap and scrolls before the next explicit
     /// erase use it.
     #[inline]
-    pub(super) fn apply_style_change(&mut self) {
+    pub(super) const fn apply_style_change(&mut self) {
         // Refresh unconditionally: individual codes (`\x1b[39;49m`) can return
         // fg/bg/flags to default without `reset_sgr`, and the next cell write
         // reads `cached_colors`.
@@ -35,7 +35,7 @@ impl SgrStyleHandler<'_> {
     /// (`\x1b[31m`, `\x1b[38;5;Nm`, `\x1b[1;38;5;Nm`). The BCE cursor template
     /// depends only on bg, so it is left alone.
     #[inline]
-    pub(super) fn apply_style_change_keep_bce(&mut self) {
+    pub(super) const fn apply_style_change_keep_bce(&mut self) {
         self.style.update_cached_colors();
     }
 
@@ -60,7 +60,7 @@ impl SgrStyleHandler<'_> {
     /// skips `convert_colors` and refreshes only the two flag-dependent booleans.
     /// It cannot alter the background either, so the BCE template stands.
     #[inline]
-    pub(super) fn apply_flags_change(&mut self) {
+    pub(super) const fn apply_flags_change(&mut self) {
         self.style.update_flags_cache();
     }
 

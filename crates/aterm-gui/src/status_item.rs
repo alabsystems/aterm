@@ -1,60 +1,11 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-// The menu-bar status item is an AppKit surface; off macOS only the glance,
-// the herald and the handle type compile (the host's `install_status_item`
-// answers `None` there itself), and the menu vocabulary is gated to macOS and
-// the tests.
-
-//! The `❯` status item (macOS `NSStatusItem`): from any app or Space, one
-//! glance answers "what needs me?", "what is everyone doing?" and "take me
-//! there".
-//!
-//! * The bar title is `❯` (nothing needs you, nothing for later), `❯•`
-//!   (nothing needs you, but the digest holds entries or a worker's result
-//!   waits under Done for you) or `❯N` (N needs: this aterm's, its same-Mac
-//!   siblings', and the fleet's from a read no older than
-//!   `fleet_glance::COUNT_FRESH`), red while any of them is stuck.
-//! * The menu lists, each section only with data: Needs you (each row naming
-//!   its tab, a click going there; a fleet need's row a submenu of reads and
-//!   Screen Sharing — and Take Over / Hand Back on a Mac that lets this one
-//!   drive it, the step-in; any other is read-only from here), This Mac
-//!   (counts), the managers and their workers, Done for you, Waiting (one row
-//!   per cause, never one per tab), the holds, the Fleet row (its submenu
-//!   composed at its own `menuNeedsUpdate:` from the fleet glance's slot,
-//!   [`compose_fleet_menu`]), To look at (the digest) and the acts
-//!   (Overview…, Read the Fleet or Read This Mac, Notify Me When I'm Needed).
-//!
-//! The item classifies nothing. Every row reads the session's published verdict
-//! (`crate::needs`, `App::publish_need`), so the badge, `status needs=`, the
-//! survey and the window can never disagree, and the herald's notices are
-//! fed by the same need ([`Herald`], [`escalation`]).
-//!
-//! The glance is pure ([`Glance::build`], [`compose_status_menu`]): rows in,
-//! rows out, no locks, no AppKit, so it is unit-tested off macOS. The App
-//! rebuilds it once per event-loop turn when a change marked it
-//! (`App::mark_status_dirty`), on the loop's way to its wait, and hands it
-//! over only when its [`Glance::fingerprint`] (ages left out) moved. Every
-//! click's payload is an index into the glance its menu was painted from
-//! ([`Pick`]); the menu's open hands that glance back and the App keeps it
-//! until the next open, so glances handed over while the menu is open (a
-//! fleet read's start and end) never strand its clicks, and an index that
-//! does not resolve does nothing — a stale click fails closed.
-//!
-//! Structure mirrors `menu.rs`: a portable action enum with stable integer
-//! tags and a pure model at the top; the `objc2` AppKit half in a
-//! `#[cfg(target_os = "macos")]` module below; a `()` handle and a no-op
-//! `update` off macOS so `App`'s field shape is platform-independent.
-
 use aterm_types::needs::{HoldWord, NeedWord, Severity, WaitWord};
 
 use crate::task_record::TaskState;
 
-/// A click's place in the glance it was drawn from: the glance's generation
-/// ([`Glance::generation`]) and an index into one of its target tables. The App
-/// resolves it against the glance it drew with that generation; anything
-/// else — a generation it no longer keeps, an index past the table — does
-/// nothing (`App::status_pick`).
+/// A click's place in the glance it was drawn from: the glance's generation ([`Glance::generation`]) and an index into one of its target tables.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Pick {
     /// The drawn glance's generation.
@@ -64,13 +15,11 @@ pub(crate) struct Pick {
 }
 
 impl Pick {
-    /// The packed payload: generation in the high half, index in the low.
     #[cfg(any(target_os = "macos", test))]
     fn packed(self) -> u64 {
         (u64::from(self.generation) << 16) | u64::from(self.index)
     }
 
-    /// [`Self::packed`]'s inverse; `None` past 32 bits.
     #[cfg(any(target_os = "macos", test))]
     fn unpacked(payload: u64) -> Option<Self> {
         let payload = u32::try_from(payload).ok()?;
@@ -81,24 +30,13 @@ impl Pick {
     }
 }
 
-/// One user action from the status-item menu. Carried by `Wake::StatusAction`
-/// from the AppKit callback to the event loop, which dispatches on `App`
-/// (`App::dispatch_status_action`).
-///
-/// Tags are this menu's own namespace (the items are wired to
-/// `ATermStatusTarget`, never to the main-menu `ATermMenuTarget`, so they can
-/// never collide with `MenuAction` tags). Stable once assigned; a retired tag
-/// is never reused: 1-4 were Start / Show / Stop Operator and Show Connection
-/// Map, packed kinds 1-3 a window row, a session id and a sibling's pid.
+/// One user action from the status-item menu.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg(any(target_os = "macos", test))]
 pub(crate) enum StatusAction {
-    /// File the exceptions digest: every fact it stands on goes to the log as
-    /// one dismissal — what `Dismiss all` does on Settings ▸ Messages, the
-    /// same press.
+    /// File the exceptions digest: every fact it stands on goes to the log as one dismissal — what `Dismiss all` does on Settings ▸ Messages, the same press.
     DismissExceptions,
-    /// Overview… (and "and k more — Overview…"): the card of every session
-    /// (`App::open_overview`).
+    /// Overview… (and "and k more — Overview…"): the card of every session (`App::open_overview`).
     Overview,
     /// Read This Mac: `aterm ctl survey` into a document tab.
     ReadThisMac,
@@ -106,14 +44,11 @@ pub(crate) enum StatusAction {
     ToggleNotify,
     /// Hand Back All: lift every person hold.
     HandBackAll,
-    /// Open Settings ▸ Messages at one digest entry (payload: its log id) —
-    /// what a click on a "To look at" line does.
+    /// Open Settings ▸ Messages at one digest entry (payload: its log id) — what a click on a "To look at" line does.
     ShowException(u64),
-    /// Go to a tab ([`Glance::go`]): a need row, a worker, a manager, a
-    /// waiting tab, a held tab, a finished worker with no result.
+    /// Go to a tab ([`Glance::go`]): a need row, a worker, a manager, a waiting tab, a held tab, a finished worker with no result.
     Go(Pick),
-    /// Read a finished worker's result in a document tab ([`Glance::reads`]),
-    /// which marks it seen.
+    /// Read a finished worker's result in a document tab ([`Glance::reads`]), which marks it seen.
     ReadResult(Pick),
     /// A sibling aterm's need row ([`Glance::raises`]): raise its tab there.
     RaiseSibling(Pick),
@@ -129,16 +64,11 @@ pub(crate) enum StatusAction {
     PeerScreen(Pick),
     /// A fleet need's Copy "ssh <its Mac>" ([`Glance::peers`]).
     PeerSsh(Pick),
-    /// A fleet need's Take Over on its Mac — `aterm ctl --host <it> hold
-    /// <sid> on`, the step-in — where that Mac lets this one drive it
-    /// ([`PeerRef::drive`]).
+    /// A fleet need's Take Over on its Mac — `aterm ctl --host <it> hold <sid> on`, the step-in — where that Mac lets this one drive it ([`PeerRef::drive`]).
     PeerTakeOver(Pick),
-    /// A fleet need's Hand Back on its Mac: `aterm ctl --host <it> hold <sid>
-    /// off`.
+    /// A fleet need's Hand Back on its Mac: `aterm ctl --host <it> hold <sid> off`.
     PeerHandBack(Pick),
-    /// A Fleet submenu Mac's Read in Full: the pick's generation is the
-    /// fleet snapshot's ([`crate::fleet_glance::FleetSlot::generation`]),
-    /// its index the Mac's.
+    /// A Fleet submenu Mac's Read in Full: the pick's generation is the fleet snapshot's ([`crate::fleet_glance::FleetSlot::generation`]), its index the Mac's.
     MacRead(Pick),
     /// A Fleet submenu Mac's Screen Sharing.
     MacScreen(Pick),
@@ -146,18 +76,12 @@ pub(crate) enum StatusAction {
     MacSsh(Pick),
 }
 
-/// The packed-tag band width for payload-carrying actions: `tag = kind × BAND +
-/// payload`. Payloads are a log id or a packed [`Pick`], so `payload < BAND`
-/// always holds in practice; an out-of-range payload encodes to `0` (the inert
-/// tag) rather than aliasing another row — fail closed.
 #[cfg(any(target_os = "macos", test))]
 const TAG_BAND: isize = 1_000_000_000_000;
 
 #[cfg(any(target_os = "macos", test))]
 impl StatusAction {
-    /// The `NSMenuItem.tag` this action rides in. `0` is never used (an untagged
-    /// item decodes to `None` and stays inert). Fixed actions take small tags
-    /// from 5; payload actions ride the [`TAG_BAND`] codec from kind 4.
+    /// The `NSMenuItem.tag` this action rides in.
     pub(crate) fn tag(self) -> isize {
         let packed = |kind: isize, payload: u64| -> isize {
             isize::try_from(payload)
@@ -189,8 +113,7 @@ impl StatusAction {
         }
     }
 
-    /// Inverse of [`tag`](Self::tag); unknown and retired tags are `None`
-    /// (an inert item).
+    /// Inverse of [`tag`](Self::tag); unknown and retired tags are `None` (an inert item).
     pub(crate) fn from_tag(tag: isize) -> Option<Self> {
         match tag {
             5 => Some(Self::DismissExceptions),
@@ -225,33 +148,24 @@ impl StatusAction {
     }
 }
 
-/// One session as the glance reads it, copied under the leaf locks by
-/// `App::status_session_row`: its tab label, its published verdict
-/// ([`crate::needs::Verdict`]), its agent word and its task record. The item
-/// never classifies a session itself.
+/// One session as the glance reads it, copied under the leaf locks by `App::status_session_row`: its tab label, its published verdict ([`crate::needs::Verdict`]), its agent word and its task record.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct SessionRow {
     /// Process-local session id.
     pub id: u64,
     /// The session's global sid (a task's `from=` names it).
     pub sid: String,
-    /// The tab's label as every Agents surface names it
-    /// (`App::tab_label_of_session`): its role, else its title pin, else the
-    /// strip's own rungs (the live OSC title without the status glyph an
-    /// agent leads it with, then the cwd), else the tab's position, else the
-    /// short sid.
+    /// The tab's label as every Agents surface names it (`App::tab_label_of_session`): its role, else its title pin, else the strip's own rungs (the live OSC title without the status glyph an agent leads it with, then the cwd), else the tab's position, else the short sid.
     pub title: String,
     /// What the session needs of its owner now, as published.
     pub need: Option<crate::needs::Need>,
     /// What aterm is waiting out for it, as published.
     pub waiting: Option<crate::needs::Waiting>,
-    /// The wait is an unsupervised limit before its reset (the verdict's
-    /// recheck): nobody continues it but the person, at the reset.
+    /// The wait is an unsupervised limit before its reset (the verdict's recheck): nobody continues it but the person, at the reset.
     pub unsupervised: bool,
     /// Whose hold stands, as published.
     pub held: Option<HoldWord>,
-    /// The published agent word (`busy`, `idle`, `prompt`, …); empty or `-`
-    /// for no identified agent.
+    /// The published agent word (`busy`, `idle`, `prompt`, …); empty or `-` for no identified agent.
     pub agent: &'static str,
     /// The task record, for a worker.
     pub task: Option<TaskRow>,
@@ -259,44 +173,24 @@ pub(crate) struct SessionRow {
     pub need_since: Option<i64>,
     /// When the hold was first seen standing (unix seconds).
     pub held_since: Option<i64>,
-    /// How many writes aimed at the tab the person's hold refused since it
-    /// was set (`SessionFabric::person_refusals`); `0` with no person hold.
+    /// How many writes aimed at the tab the person's hold refused since it was set (`SessionFabric::person_refusals`); `0` with no person hold.
     pub person_refusals: u64,
-    /// The Mac that holds the tab over the fleet (the step-in's remote
-    /// slot), by the name this Mac's book gives it.
+    /// The Mac that holds the tab over the fleet (the step-in's remote slot), by the name this Mac's book gives it.
     pub held_by_host: Option<String>,
-    /// Its supervised agent's task end, while one stands on the harness's
-    /// glass (`harness_glass::EndGlass`).
+    /// Its supervised agent's task end, while one stands on the harness's glass (`harness_glass::EndGlass`).
     pub end: Option<EndRow>,
-    /// Its Autopilot chip's face is LANDED (`ChipFace::Landed`: under Land,
-    /// all of the work on the remote main branch), seen or not, whether or not
-    /// an end was told: This Mac counts it `landed`, a worker or a plain Land
-    /// tab.
+    /// Its Autopilot chip's face is LANDED (`ChipFace::Landed`: under Land, all of the work on the remote main branch), seen or not, whether or not an end was told: This Mac counts it `landed`, a worker or a plain Land tab.
     pub landed: bool,
-    /// It is LANDING (`docs/DESIGN-harness-autopilot-2026-10-15.md` §12.4.3
-    /// item 1): its Autopilot is Land, its chip wears `⤓ land`
-    /// (the task open or unknown), and a hold stands — Land's instruction
-    /// has been typed to it (`App::shown_hold`). A worker's row then says
-    /// `landing`, not `working`; before the instruction (a worker on its
-    /// first task) it says `working`, as under Cruise.
+    /// It is LANDING (`docs/DESIGN-harness-autopilot-2026-10-15.md` §12.4.3 item 1): its Autopilot is Land, its chip wears `⤓ land` (the task open or unknown), and a hold stands — Land's instruction has been typed to it (`App::shown_hold`).
     pub landing: bool,
-    /// What holds the landing, where a land act's yield did not land or
-    /// nudges were typed: its worker row's tip, in the hold's words with no
-    /// clock (`not landed yet: 2 unpushed commits · 3 nudges`,
-    /// `harness_glass::hold_words`' tip form) — the menu keeps ages,
-    /// composed at paint, and never a clock that would go stale.
+    /// What holds the landing, where a land act's yield did not land or nudges were typed: its worker row's tip, in the hold's words with no clock (`not landed yet: 2 unpushed commits · 3 nudges`, `harness_glass::hold_words`' tip form) — the menu keeps ages, composed at paint, and never a clock that would go stale.
     pub landing_tip: Option<String>,
-    /// Where its tab is (`in tab 3`, `in tab 3, left pane`;
-    /// `App::session_place`), filled by the glance's first pass only where
-    /// another row shares its label: every row that names the
-    /// session says it after the label ([`Self::named`]). `None` for a
-    /// unique label, which names no place.
+    /// Where its tab is (`in tab 3`, `in tab 3, left pane`; `App::session_place`), filled by the glance's first pass only where another row shares its label: every row that names the session says it after the label ([`Self::named`]).
     pub place: Option<String>,
 }
 
 impl SessionRow {
-    /// The session as a row names it: its label, and where it is when
-    /// another row shares the label (`Claude Code in tab 2`).
+    /// The session as a row names it: its label, and where it is when another row shares the label (`Claude Code in tab 2`).
     #[must_use]
     pub(crate) fn named(&self) -> String {
         match &self.place {
@@ -306,17 +200,12 @@ impl SessionRow {
     }
 }
 
-/// A supervised agent's task end as the glance reads it: under Cruise / Land
-/// the one end is Land's landing (Cruise never ends), so an instant and
-/// whether it was seen, nothing that moves while it stands — no trail words,
-/// no live state words, no clock words — so the Done for you row it makes
-/// cannot go stale; its age is composed when the menu is painted ([`done_line`]).
+/// A supervised agent's task end as the glance reads it: under Cruise / Land the one end is Land's landing (Cruise never ends), so an instant and whether it was seen, nothing that moves while it stands — no trail words, no live state words, no clock words — so the Done for you row it makes cannot go stale; its age is composed when the menu is painted ([`done_line`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct EndRow {
     /// The end's session-local serial: a captured result acknowledges this end.
     pub serial: u32,
-    /// When the task's face moved there (unix milliseconds); `0` where no
-    /// time is known, and the row then says no age.
+    /// When the task's face moved there (unix milliseconds); `0` where no time is known, and the row then says no age.
     pub since_unix_ms: u64,
     /// Someone looked at it (the one looking rule, or the menu bar's Go).
     pub seen: bool,
@@ -343,8 +232,7 @@ pub(crate) struct TaskRow {
     pub seen: bool,
 }
 
-/// One same-Mac sibling aterm, from the last sibling scan
-/// (`sibling_scan`, its `survey facts`).
+/// One same-Mac sibling aterm, from the last sibling scan (`sibling_scan`, its `survey facts`).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct SiblingInstance {
     /// Its pid.
@@ -355,16 +243,11 @@ pub(crate) struct SiblingInstance {
     pub sessions: usize,
     /// Its sessions that need the owner, by their published `needs=`.
     pub needs: Vec<SiblingNeed>,
-    /// When the scan read it (unix ms): its needs count only while this is
-    /// younger than [`SIBLING_FRESH`], and their ages are measured from it.
+    /// When the scan read it (unix ms): its needs count only while this is younger than [`SIBLING_FRESH`], and their ages are measured from it.
     pub scanned_ms: u64,
 }
 
-/// A sibling's needs count on the badge only from a scan this young. The
-/// scan runs every `sibling_scan::RESCAN_KNOWN` (15 s) while a sibling is
-/// known, each sibling bounded at 2 s: this leaves room for a slow scan of
-/// several, and drops a need whose sibling stopped answering, or quit, in
-/// well under a minute.
+/// A sibling's needs count on the badge only from a scan this young.
 pub(crate) const SIBLING_FRESH: std::time::Duration = std::time::Duration::from_secs(45);
 
 /// One sibling session's need, from its `survey facts` row.
@@ -383,23 +266,18 @@ pub(crate) struct SiblingNeed {
 /// The stall half of a session's need facts — `input_stall::menu_row`'s words.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct InputStallRow {
-    /// The server's own attention words for the stall (`<prog> is frozen: not reading input
-    /// since <HH:MM> (…) — restart it: …`), as its `meta attention=` entry carries them.
+    /// The server's own attention words for the stall (`<prog> is frozen: not reading input since <HH:MM> (…) — restart it: …`), as its `meta attention=` entry carries them.
     pub text: String,
-    /// The episode's identity (a hash of when its oldest unread byte was
-    /// accepted): one notification per stall, however its text moves.
+    /// The episode's identity (a hash of when its oldest unread byte was accepted): one notification per stall, however its text moves.
     pub key: u64,
-    /// The job is stopped with input queued (`signal cont` resumes it), not
-    /// frozen: the notification's title says which.
+    /// The job is stopped with input queued (`signal cont` resumes it), not frozen: the notification's title says which.
     pub stopped: bool,
 }
 
-/// What an escalation row is about: the need's word in the herald's coarser
-/// vocabulary (its log word and key spelling), most severe first.
+/// What an escalation row is about: the need's word in the herald's coarser vocabulary (its log word and key spelling), most severe first.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum EscalationKind {
-    /// The program has left its input unread, or its job is stopped with
-    /// input queued ([`NeedWord::Frozen`], [`NeedWord::Stopped`]).
+    /// The program has left its input unread, or its job is stopped with input queued ([`NeedWord::Frozen`], [`NeedWord::Stopped`]).
     Unresponsive,
     /// The worker's task is stalled ([`NeedWord::Stalled`]).
     Stalled,
@@ -409,9 +287,7 @@ pub(crate) enum EscalationKind {
     Prompt,
     /// A question nobody answers ([`NeedWord::Question`]).
     Question,
-    /// A wall nobody answers: a lost login, the memory banner nobody
-    /// restarts, any other wall ([`NeedWord::Login`], [`NeedWord::Memory`],
-    /// [`NeedWord::Wall`]).
+    /// A wall nobody answers: a lost login, the memory banner nobody restarts, any other wall ([`NeedWord::Login`], [`NeedWord::Memory`], [`NeedWord::Wall`]).
     Wall,
 }
 
@@ -428,7 +304,6 @@ impl EscalationKind {
         }
     }
 
-    /// The kind's one word in `aterm.log` ([`herald_log_line`]).
     fn log_word(self) -> &'static str {
         match self {
             Self::Unresponsive => "unresponsive",
@@ -441,9 +316,7 @@ impl EscalationKind {
     }
 }
 
-/// The notification's title for a need — aterm's own words, the word's: a
-/// stopped job is not frozen, and an agent under the memory banner has not
-/// stopped (Claude Code draws it while the agent still runs).
+/// The notification's title for a need — aterm's own words, the word's: a stopped job is not frozen, and an agent under the memory banner has not stopped (Claude Code draws it while the agent still runs).
 pub(crate) fn headline(word: NeedWord) -> &'static str {
     match word {
         NeedWord::Frozen => "aterm \u{00b7} program frozen",
@@ -457,26 +330,18 @@ pub(crate) fn headline(word: NeedWord) -> &'static str {
     }
 }
 
-/// One session's escalation: its published need, as the menu row and the
-/// herald read it.
+/// One session's escalation: its published need, as the menu row and the herald read it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Escalation {
-    /// Process-local session id, or a fleet need's key
-    /// (`fleet_glance::herald_key`, which no local id reaches).
+    /// Process-local session id, or a fleet need's key (`fleet_glance::herald_key`, which no local id reaches).
     pub session: u64,
     /// What it is about.
     pub kind: EscalationKind,
-    /// The need it is: what a seamless update's carry is matched by
-    /// ([`Herald::note`]) — a kind holds several words (a login, a memory
-    /// wall and any other wall are all [`EscalationKind::Wall`]), and each
-    /// is its own need.
+    /// The need it is: what a seamless update's carry is matched by ([`Herald::note`]) — a kind holds several words (a login, a memory wall and any other wall are all [`EscalationKind::Wall`]), and each is its own need.
     pub word: NeedWord,
-    /// The transition's identity within `(session, kind)`
-    /// ([`crate::needs::Need::key`]): the same need re-read is the same key;
-    /// a new one is a new key.
+    /// The transition's identity within `(session, kind)` ([`crate::needs::Need::key`]): the same need re-read is the same key; a new one is a new key.
     pub key: u64,
-    /// The need row's words without its age: `<tab label> — <what>`. A
-    /// change of it re-renders the menu ([`HeraldOutcome::row_moved`]).
+    /// The need row's words without its age: `<tab label> — <what>`.
     pub label: String,
     /// The notification body: `<tab title>: <what>`.
     pub body: String,
@@ -484,14 +349,11 @@ pub(crate) struct Escalation {
     pub headline: &'static str,
 }
 
-/// Byte budget for the tab title inside a row or a notification.
 const ROW_TITLE_MAX: usize = 32;
 
 pub(crate) use crate::needs::{fold_clip, wall_words};
 
-/// A banner body about one tab: `<tab title>: <what>`, the title stripped of
-/// status glyphs and clipped like a menu row; `what` alone when the title is
-/// empty. Every banner aterm posts for a tab leads with it.
+/// A banner body about one tab: `<tab title>: <what>`, the title stripped of status glyphs and clipped like a menu row; `what` alone when the title is empty.
 pub(crate) fn tab_body(title: &str, what: &str) -> String {
     let title = fold_clip(stripped_title(title), ROW_TITLE_MAX);
     if title.is_empty() {
@@ -501,9 +363,6 @@ pub(crate) fn tab_body(title: &str, what: &str) -> String {
     }
 }
 
-/// A need's words in a banner's body: a harness's need in its own words,
-/// whole up to [`crate::needs::NEED_WHAT_MAX`] with ` (+N more)` after it
-/// (§12.2.1), else the row's words.
 fn body_words(need: &crate::needs::Need) -> String {
     need.harness.as_ref().map_or_else(
         || need.what.clone(),
@@ -511,10 +370,7 @@ fn body_words(need: &crate::needs::Need) -> String {
     )
 }
 
-/// Adapter from a row's published need to the herald's escalation: every
-/// notice names its tab, attention included. `None` while the session needs
-/// nothing — a box a harness presses, a wall it waits out, an unreachable API
-/// (one digest entry instead) and a hold raise no notice.
+/// Adapter from a row's published need to the herald's escalation: every notice names its tab, attention included.
 pub(crate) fn escalation(row: &SessionRow) -> Option<Escalation> {
     let need = row.need.as_ref()?;
     let body = tab_body(&row.title, &body_words(need));
@@ -530,19 +386,13 @@ pub(crate) fn escalation(row: &SessionRow) -> Option<Escalation> {
     })
 }
 
-/// The shortest spacing between two notifications for one session: a flapping verdict costs
-/// one notification per floor, never one per flap. The menu row stays current.
+/// The shortest spacing between two notifications for one session: a flapping verdict costs one notification per floor, never one per flap.
 pub(crate) const NOTIFY_SESSION_FLOOR: std::time::Duration = std::time::Duration::from_secs(20);
-/// At most [`NOTIFY_BURST`] notifications per [`NOTIFY_BURST_WINDOW`] across the instance: ten
-/// agents hitting one usage limit page a few times, not ten. The menu lists every one.
+/// At most [`NOTIFY_BURST`] notifications per [`NOTIFY_BURST_WINDOW`] across the instance: ten agents hitting one usage limit page a few times, not ten.
 pub(crate) const NOTIFY_BURST: usize = 3;
 /// The window [`NOTIFY_BURST`] is counted over.
 pub(crate) const NOTIFY_BURST_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
-/// How long a session whose notice `notify.rs`'s queue refused ([`Herald::refused`]) waits
-/// before that notice is tried again; no other session waits on it. The queue is shared with
-/// program notifications and drains one notifier subprocess (~100 ms) at a time, so a full one
-/// has room within about two seconds unless a program floods it; a persistent refusal costs one
-/// `warn` per interval per owing session, never one per loop wake.
+/// How long a session whose notice `notify.rs`'s queue refused ([`Herald::refused`]) waits before that notice is tried again; no other session waits on it.
 pub(crate) const NOTIFY_RETRY: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// One native notification the herald decided to post.
@@ -554,8 +404,6 @@ pub(crate) struct HeraldNotice {
     pub title: &'static str,
     /// `<tab title>: <what>`.
     pub body: String,
-    /// Private: only the herald builds a notice, so
-    /// [`crate::notify::NotifyMsg::herald`] posts nothing it did not decide.
     decided: (),
 }
 
@@ -566,25 +414,11 @@ pub(crate) struct HeraldOutcome {
     pub row_moved: bool,
     /// Post exactly this notification.
     pub notice: Option<HeraldNotice>,
-    /// This note met a new `(kind, key)`: not a re-read of the one shown, and not the timer
-    /// re-heralding an owed notice ([`Herald::due`]).
+    /// This note met a new `(kind, key)`: not a re-read of the one shown, and not the timer re-heralding an owed notice ([`Herald::due`]).
     pub transition: bool,
-    /// The transitions awaiting a notice when this note decided, its own
-    /// included: what a post pays (`aterm.log`'s `(+n-1 more)`), what
-    /// [`HeraldQuiet::Limited`] still owes (`1` on the FIRST hold), what
-    /// [`HeraldQuiet::Looking`] or [`HeraldQuiet::Disabled`] spent. `0` when
-    /// there was nothing to decide
-    /// ([`HeraldQuiet::Same`], or nothing escalates), so those outcomes stay
-    /// equal to `HeraldOutcome::default()` while the row does not move.
+    /// The transitions awaiting a notice when this note decided, its own included: what a post pays (`aterm.log`'s `(+n-1 more)`), what [`HeraldQuiet::Limited`] still owes (`1` on the FIRST hold), what [`HeraldQuiet::Looking`] or [`HeraldQuiet::Disabled`] spent.
     pub owed: u32,
-    /// This quiet decision — [`HeraldQuiet::Looking`], [`HeraldQuiet::Disabled`], or
-    /// [`HeraldQuiet::Limited`]'s FIRST hold (a transition leaving one notice
-    /// owed) — is its session's first since the later of its last post and
-    /// a [`NOTIFY_SESSION_FLOOR`] ago: the one `aterm.log` records at `info`
-    /// ([`herald_log_line`]). A clear does not reopen that window, so a
-    /// verdict that flaps inside the floor (box, answered, box, answered…)
-    /// earns one such line, never one per flap — as it earns one
-    /// notification. `false` for every other outcome.
+    /// This quiet decision — [`HeraldQuiet::Looking`], [`HeraldQuiet::Disabled`], or [`HeraldQuiet::Limited`]'s FIRST hold (a transition leaving one notice owed) — is its session's first since the later of its last post and a [`NOTIFY_SESSION_FLOOR`] ago: the one `aterm.log` records at `info` ([`herald_log_line`]).
     pub first_quiet: bool,
 }
 
@@ -595,58 +429,29 @@ pub(crate) enum HeraldQuiet {
     Same,
     /// The human is looking at the tab in the active app.
     Looking,
-    /// Desktop alerts are off. The row still moves; the notice is spent before rate limiting
-    /// and arms no retry.
+    /// Desktop alerts are off.
     Disabled,
-    /// [`NOTIFY_SESSION_FLOOR`] or [`NOTIFY_BURST`] held it back, or the
-    /// notifier's queue refused this session's notice less than
-    /// [`NOTIFY_RETRY`] ago (another session's refusal holds nothing here):
-    /// it is owed, and posted (coalesced) when the limit allows
-    /// ([`Herald::due`]).
+    /// [`NOTIFY_SESSION_FLOOR`] or [`NOTIFY_BURST`] held it back, or the notifier's queue refused this session's notice less than [`NOTIFY_RETRY`] ago (another session's refusal holds nothing here): it is owed, and posted (coalesced) when the limit allows ([`Herald::due`]).
     Limited,
 }
 
 #[derive(Clone, Debug, Default)]
 struct HeraldSlot {
-    /// The `(kind, key)` last noted, `None` while nothing escalates.
     shown: Option<(EscalationKind, u64)>,
-    /// The row label last noted (a subject arriving late changes it).
     label: Option<String>,
-    /// When this session last posted.
     notified_at: Option<std::time::Instant>,
-    /// When it posted before that: what [`Herald::refused`] puts back in
-    /// `notified_at` when the notifier's queue refused the last post, which
-    /// then told nobody and was no post at all.
     notified_before: Option<std::time::Instant>,
-    /// When the notice the notifier's queue last refused for this session
-    /// ([`Herald::refused`]) may be tried again: [`NOTIFY_RETRY`] after the
-    /// refusal. `None` from the session's next post. Per session, never
-    /// herald-wide: a wait for the whole instance would hold an unrelated
-    /// session's first notice as [`HeraldQuiet::Limited`].
     retry_at: Option<std::time::Instant>,
-    /// Transitions the rate limit held back since the last post. Nonzero
-    /// means a notice is owed for the escalation shown now; it is paid by one
-    /// coalesced notice once the limit allows, and dropped when the
-    /// escalation clears or the human looks.
     owed: u32,
-    /// When this session's last quiet decision reached `aterm.log` at `info`
-    /// ([`HeraldOutcome::first_quiet`]); `None` until one does, and again
-    /// from the session's next post. Not cleared with what is shown: a box
-    /// answered and redrawn inside the floor is a new transition each time
-    /// (`owed` back to 1), and zeroing this with `owed` would make every such
-    /// flap a fresh `info` line.
     quiet_logged_at: Option<std::time::Instant>,
 }
 
 impl HeraldSlot {
-    /// Spend desktop-only work without forgetting the current in-app row.
     fn suppress_desktop_notice(&mut self) {
         self.owed = 0;
         self.retry_at = None;
     }
 
-    /// Whether a quiet decision at `now` is this session's first `info` log line since the
-    /// later of its last post and a [`NOTIFY_SESSION_FLOOR`] ago; spends the window when it is.
     fn first_quiet(&mut self, now: std::time::Instant) -> bool {
         let open = self
             .quiet_logged_at
@@ -658,56 +463,20 @@ impl HeraldSlot {
     }
 }
 
-/// The escalation herald: per session, folds the current [`escalation`] into
-/// "did the menu row move" and "post one notification". Pure — the caller
-/// reads the facts under leaf locks, acts on the outcome, and never holds a
-/// lock across it — so the whole policy is a table test.
-///
-/// One notification per transition into an escalation, keyed by `(session,
-/// kind, key)` (for an agent verdict the key is `agent_rev`): re-reading the
-/// same box is not a transition. A transition while the human is looking at
-/// that tab in the active app is spent silently — they already see it — and
-/// is not re-announced when they look away. Rate-limited per session by
-/// [`NOTIFY_SESSION_FLOOR`] and per instance by [`NOTIFY_BURST`]; a held-back
-/// transition is owed, not spent: when the limit allows ([`Self::due`], the
-/// App's timer), and only while that session still escalates, one notice
-/// pays every transition it held back, naming the box shown now (the count
-/// is `aterm.log`'s: the boxes it replaced are gone). Several boxes in a
-/// few seconds therefore page twice, not once and then never — and never
-/// for a box already gone. A post the notifier's queue refuses told nobody:
-/// it is taken back ([`Self::refused`]) and owed again, and that session —
-/// no other — is not tried again until [`NOTIFY_RETRY`] has passed.
+/// The escalation herald: per session, folds the current [`escalation`] into "did the menu row move" and "post one notification".
 #[derive(Debug, Default)]
 pub(crate) struct Herald {
     slots: std::collections::HashMap<u64, HeraldSlot>,
-    /// Post times inside the last [`NOTIFY_BURST_WINDOW`], oldest first.
     recent: std::collections::VecDeque<std::time::Instant>,
-    /// Why the last note posted nothing (test-visible).
     last_quiet: Option<HeraldQuiet>,
-    /// Since when each session's published need and hold have stood, for the
-    /// glance's ages ([`Self::observe`]): a need is new when its word or key
-    /// moves, a hold when its word does.
     since: std::collections::HashMap<u64, Since>,
-    /// What a seamless update's outgoing process had told the owner and
-    /// since when, per adopted session, until each part's first sighting
-    /// here or [`ADOPT_SETTLE`] ([`Self::adopt`]).
     adopted: std::collections::HashMap<u64, Adopted>,
 }
 
-/// How long a seamless successor takes what its outgoing process had told
-/// the owner as already told ([`Herald::adopt`], and `App::herald_fleet`'s
-/// first fresh read): room for every standing need to be published again —
-/// the stall watch's re-detection (`input_backlog::STALL_AFTER`, stretched
-/// under load, then `input_stall::RECHECK`) and an issuer's first fleet read
-/// (`fleet_glance::POLL_EVERY` and its timeout). A carried need not seen
-/// again by then ended during the update, so a later one is a new need.
+/// How long a seamless successor takes what its outgoing process had told the owner as already told ([`Herald::adopt`], and `App::herald_fleet`'s first fresh read): room for every standing need to be published again — the stall watch's re-detection (`input_backlog::STALL_AFTER`, stretched under load, then `input_stall::RECHECK`) and an issuer's first fleet read (`fleet_glance::POLL_EVERY` and its timeout).
 pub(crate) const ADOPT_SETTLE: std::time::Duration = std::time::Duration::from_secs(120);
 
-/// What the status item knew of one session, carried across a seamless
-/// update as one row (`SessionRecord::status_seen`): the published need and
-/// since when it stood, whether the herald had told it (posted, or spent it
-/// on a looking owner or alerts off: nothing owed), the hold and since when,
-/// and the done the owner looked at, by when its task entered it.
+/// What the status item knew of one session, carried across a seamless update as one row (`SessionRecord::status_seen`): the published need and since when it stood, whether the herald had told it (posted, or spent it on a looking owner or alerts off: nothing owed), the hold and since when, and the done the owner looked at, by when its task entered it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct StatusCarry {
     /// The need's word and since when it stood (unix seconds).
@@ -716,15 +485,12 @@ pub(crate) struct StatusCarry {
     pub told: bool,
     /// The hold's word and since when it stood (unix seconds).
     pub held: Option<(HoldWord, i64)>,
-    /// The done the owner looked at: its task's `since_unix_ms`, the
-    /// wall-clock instant the record entered it (carried exactly, unlike its
-    /// entry rev).
+    /// The done the owner looked at: its task's `since_unix_ms`, the wall-clock instant the record entered it (carried exactly, unlike its entry rev).
     pub done: Option<u64>,
 }
 
 impl StatusCarry {
-    /// The row: `need=<word>@<unix s>`, `told=1`, `hold=<word>@<unix s>` and
-    /// `done=<unix ms>`, each only when it holds; `None` for nothing known.
+    /// The row: `need=<word>@<unix s>`, `told=1`, `hold=<word>@<unix s>` and `done=<unix ms>`, each only when it holds; `None` for nothing known.
     #[cfg(any(unix, test))]
     pub(crate) fn row(&self) -> Option<String> {
         let mut parts = Vec::new();
@@ -743,10 +509,7 @@ impl StatusCarry {
         (!parts.is_empty()).then(|| parts.join(" "))
     }
 
-    /// Read a carried row back. A part that does not read carries nothing
-    /// (a word this build does not know, a stamp that is no number), and a
-    /// key this build does not know is skipped: at worst a need is told
-    /// again, never hidden. `told` stands only beside a need it names.
+    /// Read a carried row back.
     pub(crate) fn parse(row: &str) -> Self {
         let stamped = |value: &str| {
             let (word, at) = value.split_once('@')?;
@@ -773,37 +536,22 @@ impl StatusCarry {
     }
 }
 
-/// One adopted session's carry while it waits for its first sighting
-/// ([`Herald::adopt`]): each part is spent by the first sighting of its
-/// kind, or at the deadline.
 #[derive(Clone, Copy, Debug)]
 struct Adopted {
-    /// The carried need's word and age, for [`Herald::observe`].
     need: Option<(NeedWord, i64)>,
-    /// The carried need the herald had told, for [`Herald::note`].
     told: Option<NeedWord>,
-    /// The carried hold's word and age, for [`Herald::observe`].
     held: Option<(HoldWord, i64)>,
-    /// [`ADOPT_SETTLE`] after adoption, on each clock its reader runs on.
     until_unix: i64,
     until: std::time::Instant,
 }
 
-/// When one session's need and hold were first seen (unix seconds), and what
-/// the glance last showed of it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct Since {
-    /// The need's word and key, and when they were first published.
     need: Option<(NeedWord, u64, i64)>,
-    /// The hold's word, and when it was first seen.
     held: Option<(HoldWord, i64)>,
-    /// [`shown_key`] of the session's last row.
     shown: u64,
 }
 
-/// What the glance shows of `row`, hashed — every fact a section reads, no
-/// age: an agent word only by its class (working, resting, shell), so a
-/// busy agent's box and its answer are one class.
 fn shown_key(row: &SessionRow) -> u64 {
     let class = match row.agent {
         "" | "-" => 0_u8,
@@ -829,14 +577,7 @@ fn shown_key(row: &SessionRow) -> u64 {
 }
 
 impl Herald {
-    /// Fold session `session`'s row at `now_unix` (`None`: it is gone): the
-    /// first sight of a need (a new word or key) or of a hold (a new word)
-    /// starts its age; the same one re-read keeps it. Called on every
-    /// publication (`App::herald_session`), headless too, so the glance's
-    /// ages and its "oldest first" order never wait for a menu. Returns
-    /// whether what the glance shows of the session moved — its need, wait,
-    /// hold, agent class, task or label, never an age — so the App dirties
-    /// the menu-bar item only then.
+    /// Fold session `session`'s row at `now_unix` (`None`: it is gone): the first sight of a need (a new word or key) or of a hold (a new word) starts its age; the same one re-read keeps it.
     pub(crate) fn observe(
         &mut self,
         session: u64,
@@ -850,9 +591,6 @@ impl Herald {
         let since = self.since.entry(session).or_default();
         let moved = since.shown != shown;
         since.shown = shown;
-        // A seamless update's carry: the first sighting of a need or a hold
-        // here takes the outgoing process's age when it is the word carried
-        // (the same need, published again), and spends that part either way.
         let mut adopted = self
             .adopted
             .get_mut(&session)
@@ -881,14 +619,7 @@ impl Herald {
         moved
     }
 
-    /// A seamless update adopted `session` with what its outgoing process
-    /// knew of it (`carry`, `SessionRecord::status_seen`), at `now_unix` /
-    /// `now`: for [`ADOPT_SETTLE`], its first need published here takes the
-    /// carried age when it is the carried word ([`Self::observe`]), and is no
-    /// transition when it is the need the herald had told ([`Self::note`]) —
-    /// an update is no new need, and the owner was told once. A different
-    /// need, or any need past the first or past the deadline, is a
-    /// transition as ever.
+    /// A seamless update adopted `session` with what its outgoing process knew of it (`carry`, `SessionRecord::status_seen`), at `now_unix` / `now`: for [`ADOPT_SETTLE`], its first need published here takes the carried age when it is the carried word ([`Self::observe`]), and is no transition when it is the need the herald had told ([`Self::note`]) — an update is no new need, and the owner was told once.
     pub(crate) fn adopt(
         &mut self,
         session: u64,
@@ -912,10 +643,7 @@ impl Herald {
         );
     }
 
-    /// What this herald knows of `session` for the next process
-    /// ([`StatusCarry`]; the done is the App's): the need and hold it last
-    /// observed and since when, and whether the need it shows is told —
-    /// noted and nothing owed for it.
+    /// What this herald knows of `session` for the next process ([`StatusCarry`]; the done is the App's): the need and hold it last observed and since when, and whether the need it shows is told — noted and nothing owed for it.
     #[cfg(any(unix, test))]
     pub(crate) fn carry_of(&self, session: u64) -> StatusCarry {
         let since = self.since.get(&session).copied().unwrap_or_default();
@@ -930,9 +658,7 @@ impl Herald {
         }
     }
 
-    /// Whether `session`'s notice for the need `(kind, key)` is shown and
-    /// owed nothing: told (or looked at, or held back by the setting, which
-    /// owe nothing either) — what a seamless update's carry calls told.
+    /// Whether `session`'s notice for the need `(kind, key)` is shown and owed nothing: told (or looked at, or held back by the setting, which owe nothing either) — what a seamless update's carry calls told.
     #[cfg(any(unix, test))]
     pub(crate) fn told(&self, session: u64, kind: EscalationKind, key: u64) -> bool {
         self.slots
@@ -950,8 +676,7 @@ impl Herald {
         self.since.get(&session)?.held.map(|(_, at)| at)
     }
 
-    /// Fold `session`'s current escalation. `looking`: the session is the focused pane of a
-    /// focused window.
+    /// Fold `session`'s current escalation.
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -994,7 +719,6 @@ impl Herald {
     ) -> HeraldOutcome {
         self.last_quiet = None;
         if current.is_none() && !self.slots.contains_key(&session) {
-            // Nothing escalates and nothing did: keep no slot, so a retired session's late
             // refresh cannot re-grow the map.
             return HeraldOutcome::default();
         }
@@ -1011,10 +735,6 @@ impl Herald {
                 ..HeraldOutcome::default()
             };
         };
-        // A seamless update's carry ([`Self::adopt`]): the first need here,
-        // when it is the WORD the outgoing process had told — not merely its
-        // kind: a told login says nothing of a memory wall — is shown already
-        // — no transition, nothing owed. Spent by that first need either way.
         if let Some(told) = self
             .adopted
             .get_mut(&session)
@@ -1029,8 +749,6 @@ impl Herald {
             slot.shown = ident;
             slot.owed += 1;
         }
-        // Read before a branch below spends it, so the outcome (and `herald_log_line`) says how
-        // many transitions it posted, held or dropped.
         let owed = slot.owed;
         let quiet = |herald: &mut Self, why, first_quiet| {
             herald.last_quiet = Some(why);
@@ -1047,13 +765,10 @@ impl Herald {
             return quiet(self, HeraldQuiet::Same, false);
         }
         if looking {
-            // The human sees it on this tab.
             slot.owed = 0;
             let first_quiet = slot.first_quiet(now);
             return quiet(self, HeraldQuiet::Looking, first_quiet);
         }
-        // Suppress before the rate limit, so a disabled notice never becomes debt. Keep the row
-        // and its key, so enabling alerts later does not replay this escalation.
         if !desktop_alerts {
             slot.suppress_desktop_notice();
             let first_quiet = slot.first_quiet(now);
@@ -1068,8 +783,6 @@ impl Herald {
             self.recent.pop_front();
         }
         if Self::free_at(&self.recent, notified_at, retry_at, now) > now {
-            // Only the first hold earns the line: a re-read while owed recurs at change rate,
-            // and a further box behind it is counted by the post that pays it.
             let first_quiet = transition && owed == 1 && slot.first_quiet(now);
             return quiet(self, HeraldQuiet::Limited, first_quiet);
         }
@@ -1079,13 +792,9 @@ impl Herald {
         slot.owed = 0;
         slot.notified_before = slot.notified_at;
         slot.notified_at = Some(now);
-        // The refused notice's wait is over; a refusal of this post starts a new one.
         slot.retry_at = None;
-        // A post reopens the log's window: the first hold behind this notice is news.
         slot.quiet_logged_at = None;
         self.recent.push_back(now);
-        // The box on screen now, alone: a held-back transition was replaced by it, so a count
-        // here would read as a second box waiting. `aterm.log` keeps the count.
         HeraldOutcome {
             row_moved,
             notice: Some(HeraldNotice {
@@ -1100,19 +809,7 @@ impl Herald {
         }
     }
 
-    /// `notify.rs`'s queue refused the notice [`Self::note`] just posted for
-    /// `session`, which paid `owed` transitions ([`HeraldOutcome::owed`]): it
-    /// was full — it is shared with program notifications — or its thread was
-    /// gone (`App::post_herald_notice`). Nobody was told, so the post is taken
-    /// back and its transitions are owed again. The session's floor and the instance's burst place the post took are given
-    /// back — `notified_at` is the post before it again, and its entry leaves
-    /// `recent`. [`Self::due`] re-heralds it once [`NOTIFY_RETRY`] has passed
-    /// (the slot's `retry_at`), never at once: the queue that refused it has
-    /// not drained, and an owed notice due NOW wakes the App's timer at once
-    /// (`App::presence_deadline`), so it would be retried, refused and logged
-    /// on every turn of the event loop. The wait is `session`'s alone: another
-    /// session's notice is tried when its own limit allows, and a refusal of
-    /// it starts that session's own wait.
+    /// `notify.rs`'s queue refused the notice [`Self::note`] just posted for `session`, which paid `owed` transitions ([`HeraldOutcome::owed`]): it was full — it is shared with program notifications — or its thread was gone (`App::post_herald_notice`).
     pub(crate) fn refused(&mut self, session: u64, owed: u32, now: std::time::Instant) {
         let Some(slot) = self.slots.get_mut(&session) else {
             return;
@@ -1128,8 +825,7 @@ impl Herald {
         slot.owed += owed;
     }
 
-    /// Turning desktop alerts off cancels pending rate-limit and refusal retries, keeping the
-    /// labels and transition keys the menu uses.
+    /// Turning desktop alerts off cancels pending rate-limit and refusal retries, keeping the labels and transition keys the menu uses.
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -1144,9 +840,6 @@ impl Herald {
         }
     }
 
-    /// When a session last notified at `notified_at` may notify again: the latest of its
-    /// [`NOTIFY_SESSION_FLOOR`], a [`NOTIFY_BURST`] place freeing in the window, and its own
-    /// `retry_at` ([`Self::refused`]). `now` means now.
     fn free_at(
         recent: &std::collections::VecDeque<std::time::Instant>,
         notified_at: Option<std::time::Instant>,
@@ -1168,9 +861,7 @@ impl Herald {
         floor.max(burst).max(retry).max(now)
     }
 
-    /// The sessions whose owed notice the limit now allows — the App's timer
-    /// re-heralds each ([`Self::note`] with its current escalation), and the
-    /// earliest instant any other owed notice becomes allowed (its next wake).
+    /// The sessions whose owed notice the limit now allows — the App's timer re-heralds each ([`Self::note`] with its current escalation), and the earliest instant any other owed notice becomes allowed (its next wake).
     pub fn due(&self, now: std::time::Instant) -> (Vec<u64>, Option<std::time::Instant>) {
         let mut ready = Vec::new();
         let mut next: Option<std::time::Instant> = None;
@@ -1187,17 +878,12 @@ impl Herald {
         (ready, next)
     }
 
-    /// Why the last [`Self::note`] posted nothing, when it had a transition
-    /// or a re-read to judge; `None` after a post or a cleared escalation.
+    /// Why the last [`Self::note`] posted nothing, when it had a transition or a re-read to judge; `None` after a post or a cleared escalation.
     pub(crate) fn last_quiet(&self) -> Option<HeraldQuiet> {
         self.last_quiet
     }
 
-    /// `session` cannot be told of now — a fleet need whose Mac did not
-    /// answer, or whose last read stopped counting (`App::herald_fleet`): a
-    /// notice it owes is dropped, since no read can pay it and the App's
-    /// timer ([`Self::due`]) would ask again at once, and what it shows is
-    /// kept, so the same need read again is no new transition.
+    /// `session` cannot be told of now — a fleet need whose Mac did not answer, or whose last read stopped counting (`App::herald_fleet`): a notice it owes is dropped, since no read can pay it and the App's timer ([`Self::due`]) would ask again at once, and what it shows is kept, so the same need read again is no new transition.
     pub(crate) fn forgo(&mut self, session: u64) {
         if let Some(slot) = self.slots.get_mut(&session) {
             slot.suppress_desktop_notice();
@@ -1212,65 +898,18 @@ impl Herald {
     }
 }
 
-/// What became of a [`Herald::note`]'s notice ([`herald_log_line`]'s
-/// `post`), decided before its line is written.
+/// What became of a [`Herald::note`]'s notice ([`herald_log_line`]'s `post`), decided before its line is written.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum HeraldPost {
     /// `notify.rs`'s queue took it — or the note owed no notice at all.
     Queued,
     /// The queue refused it, and why (`App::post_herald_notice`'s `Err`).
     Refused(&'static str),
-    /// `desktop_alerts` is off: nothing was offered to the queue. The menu
-    /// bar, the band and the tab marks still carry the escalation; the
-    /// notice is not owed again.
+    /// `desktop_alerts` is off: nothing was offered to the queue.
     Suppressed,
 }
 
-/// The one `aterm.log` line a [`Herald::note`] earns, as `(level, text)`, or
-/// `None` when it decided nothing (nothing escalates, or the escalation
-/// cleared). `quiet` is [`Herald::last_quiet`], read right after the note;
-/// `post` says what became of the note's notice ([`HeraldPost`]: queued,
-/// refused by `notify.rs`'s queue in `App::post_herald_notice`, or held back
-/// by `desktop_alerts = false`) — so the line is written after the post, and
-/// says what happened to it.
-///
-/// Each decision on a transition is one line, and at `info` it never repeats
-/// at change rate:
-///
-/// * a post the queue took says `queued`, never "posted": the delivery
-///   thread may still drop it on its own focus check. A notice the limit held
-///   back and the App's timer paid ([`Herald::due`]) says `queued after the
-///   rate limit`; a coalesced one adds `(+N more)`, the transitions it paid
-///   (the notice itself names only the box shown now). Posts
-///   are rate-limited, so these lines are too.
-/// * a post the queue refused (full — it is shared with program
-///   notifications and drained one notifier subprocess at a time — or its
-///   thread gone) is instead one `warn`, `not queued…: <why>`: `queued` is
-///   only true once `try_send` returned `Ok`, and counting `queued` lines is
-///   how the log answers "which banners went out". The refused notice stays
-///   owed ([`Herald::refused`]), and its retry, [`NOTIFY_RETRY`] later, is a
-///   decision with a line of its own (`queued after the rate limit`, or
-///   refused again).
-/// * a notice `desktop_alerts = false` held back is one `info`, `not
-///   queued…: suppressed by desktop_alerts = false` — the person's own
-///   choice, so neither a `warn` nor owed again.
-/// * `not queued: looking` — the human is looking at that tab — and `not
-///   queued: limited` — the rate limit's first hold (a transition leaving
-///   one notice owed) — are `info` only when
-///   [`HeraldOutcome::first_quiet`]: the session's first since the later of
-///   its last post and a [`NOTIFY_SESSION_FLOOR`] ago. A flap inside the floor
-///   (box, answered, box…), a re-read while a notice is owed, a further box
-///   held behind the first (counted by the eventual `queued … (+N more)`) —
-///   each recurs at change rate, and stays `debug`.
-///
-/// `debug`, never `info`: [`HeraldQuiet::Same`] (no transition).
-///
-/// No text: the line names the session, the kind and the key
-/// ([`herald_key_words`]) — never the body, label, command, subject or
-/// attention text. A box's command can hold a secret, and `aterm.log` is
-/// what a bug report attaches. Pure, so the table is tested without
-/// installing a logger (a test binary's process-global logger is
-/// first-installer-wins).
+/// The one `aterm.log` line a [`Herald::note`] earns, as `(level, text)`, or `None` when it decided nothing (nothing escalates, or the escalation cleared).
 pub(crate) fn herald_log_line(
     session: u64,
     current: Option<&Escalation>,
@@ -1330,16 +969,6 @@ pub(crate) fn herald_log_line(
     ))
 }
 
-/// An escalation's key as `aterm.log` names it ([`herald_log_line`]). An
-/// agent kind's key IS the session's `agent_rev`, printed in DECIMAL as
-/// `status agent_rev=` prints it (`session_timeline.rs`), so a log line reads
-/// against `aterm ctl status`. Typed attention's key is the FNV-1a hash of
-/// its text and a stall's the hash of its EPISODE
-/// ([`crate::input_stall::episode_key`]): opaque, so hex. A published
-/// [`EscalationKind::Unresponsive`] need almost always carries the stall's
-/// key: the server publishes `agent=wall:unresponsive` only while it
-/// publishes that stall, which the classifier reads first
-/// ([`crate::needs::of`]).
 fn herald_key_words(kind: EscalationKind, key: u64) -> String {
     match kind {
         EscalationKind::Prompt | EscalationKind::Question | EscalationKind::Wall => {
@@ -1347,29 +976,23 @@ fn herald_key_words(kind: EscalationKind, key: u64) -> String {
         }
         EscalationKind::Attention => format!("text_key={key:#018x}"),
         EscalationKind::Unresponsive => format!("episode_key={key:#018x}"),
-        // The rev the task entered its stall at (`TaskRecord::entered`), in
-        // decimal as `task_rev=` prints revs.
         EscalationKind::Stalled => format!("task_rev={key}"),
     }
 }
 
-/// The most need rows the menu spells out; the rest are counted on one
-/// "and k more — Overview…" row.
+/// The most need rows the menu spells out; the rest are counted on one "and k more — Overview…" row.
 #[cfg_attr(
     all(not(target_os = "macos"), not(test)),
     expect(dead_code, reason = "the menu-bar status item is macOS's")
 )]
 pub(crate) const NEEDS_SHOWN: usize = 10;
-/// The most rows one level in a session's further needs get under its own
-/// row (§12.2.1); the needs past them are counted on that row as
-/// ` (+N more)`.
+/// The most rows one level in a session's further needs get under its own row (§12.2.1); the needs past them are counted on that row as ` (+N more)`.
 #[cfg_attr(
     all(not(target_os = "macos"), not(test)),
     expect(dead_code, reason = "the menu-bar status item is macOS's")
 )]
 pub(crate) const NEED_MORE_ROWS: usize = 2;
-/// The most rows one level in the whole Needs you section draws, the
-/// sessions in the menu's order taking them first.
+/// The most rows one level in the whole Needs you section draws, the sessions in the menu's order taking them first.
 #[cfg_attr(
     all(not(target_os = "macos"), not(test)),
     expect(dead_code, reason = "the menu-bar status item is macOS's")
@@ -1387,14 +1010,11 @@ pub(crate) const MANAGERS_SHOWN: usize = 8;
     expect(dead_code, reason = "the menu-bar status item is macOS's")
 )]
 pub(crate) const DONE_SHOWN: usize = 5;
-/// The most digest lines the menu spells out; the rest are counted.
 #[cfg(any(target_os = "macos", test))]
 const EXCEPTION_LINES_SHOWN: usize = 4;
-/// Byte budget for one row's whole line.
 const LINE_MAX: usize = 120;
 
-/// Where a need stands, in the order the menu lists them: this aterm's,
-/// then a same-Mac sibling's.
+/// Where a need stands, in the order the menu lists them: this aterm's, then a same-Mac sibling's.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum Origin {
     /// This aterm.
@@ -1425,47 +1045,36 @@ pub(crate) struct NeedRow {
     pub origin: Origin,
     /// The tab's label.
     pub label: String,
-    /// "(worker of lab-sweep)": the manager's label where the task's
-    /// `from=` resolves here.
+    /// "(worker of lab-sweep)": the manager's label where the task's `from=` resolves here.
     pub worker_of: Option<String>,
     /// The need's words.
     pub what: String,
-    /// A harness's need in its own words ([`crate::needs::Need::harness`]):
-    /// the row says it clipped to the room its label and age leave
-    /// ([`need_line`]). This aterm's rows alone.
+    /// A harness's need in its own words ([`crate::needs::Need::harness`]): the row says it clipped to the room its label and age leave ([`need_line`]).
     pub harness: Option<crate::needs::HarnessAsk>,
     /// Since when it has stood (unix seconds), for its age.
     pub since_unix: Option<i64>,
     /// What a click does.
     pub at: NeedAt,
-    /// It counts on the badge: always for this Mac's; for a fleet need, only
-    /// from a read younger than `fleet_glance::COUNT_FRESH`.
+    /// It counts on the badge: always for this Mac's; for a fleet need, only from a read younger than `fleet_glance::COUNT_FRESH`.
     pub counted: bool,
     /// The fleet read it comes from (unix ms): "(read 20 s ago)".
     pub read_at_ms: Option<u64>,
 }
 
-/// "This Mac": every live session of this aterm by what it is doing, and
-/// how many more a sibling aterm holds.
+/// "This Mac": every live session of this aterm by what it is doing, and how many more a sibling aterm holds.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Here {
     /// Agents at work (a box a harness presses is work too).
     pub working: usize,
-    /// Sessions whose published verdict needs the owner (stuck or a
-    /// decision): never counted as working.
+    /// Sessions whose published verdict needs the owner (stuck or a decision): never counted as working.
     pub need_you: usize,
-    /// Sessions aterm is waiting something out for (a limit, the API, a
-    /// writer's `kind=wait`): never counted as working.
+    /// Sessions aterm is waiting something out for (a limit, the API, a writer's `kind=wait`): never counted as working.
     pub waiting: usize,
     /// Agents at rest.
     pub resting: usize,
-    /// Sessions that LANDED: every session whose chip's face is
-    /// landed (a plain Land tab included), and every worker whose record
-    /// reads `done why=landed`.
+    /// Sessions that LANDED: every session whose chip's face is landed (a plain Land tab included), and every worker whose record reads `done why=landed`.
     pub landed: usize,
-    /// Workers whose task is done by an older build's rule
-    /// (`why=marker|done-check`), which no harness writes any more, or by a
-    /// hand's `aterm ctl task mark done` with no `why=landed`.
+    /// Workers whose task is done by an older build's rule (`why=marker|done-check`), which no harness writes any more, or by a hand's `aterm ctl task mark done` with no `why=landed`.
     pub done: usize,
     /// Workers whose agent exited.
     pub exited: usize,
@@ -1492,26 +1101,16 @@ pub(crate) struct WorkerRow {
     pub go: u16,
     /// Read its result ([`Glance::reads`]), for a done worker with one.
     pub read: Option<u16>,
-    /// Its session is landing ([`SessionRow::landing`]): Land's instruction
-    /// was typed to it and a hold stands.
+    /// Its session is landing ([`SessionRow::landing`]): Land's instruction was typed to it and a hold stands.
     pub landing: bool,
     /// Its row's tip while it is landing ([`SessionRow::landing_tip`]).
     pub tip: Option<String>,
 }
 
-/// The words a manager's line counts its workers by, in its order
-/// ([`WorkerRow::word`]): a landing ahead of the work, a landed one first
-/// among the ends, an older build's `done` after it.
 const WORKER_WORDS: [&str; 6] = ["landing", "working", "landed", "done", "exited", "stalled"];
 
 impl WorkerRow {
-    /// What its row and its manager's count say of it: `landing` for a
-    /// working task whose session is landing (Land's instruction typed, a
-    /// hold standing: [`SessionRow::landing`]), `landed` for a record that
-    /// reads `done why=landed` (Land landed its work), else its state's own
-    /// word — a worker on its first task, before Land's instruction, says
-    /// `working`, and an older build's `done why=marker|done-check` keeps
-    /// `done`.
+    /// What its row and its manager's count say of it: `landing` for a working task whose session is landing (Land's instruction typed, a hold standing: [`SessionRow::landing`]), `landed` for a record that reads `done why=landed` (Land landed its work), else its state's own word — a worker on its first task, before Land's instruction, says `working`, and an older build's `done why=marker|done-check` keeps `done`.
     #[must_use]
     pub(crate) fn word(&self) -> &'static str {
         if self.landing && self.state == TaskState::Working {
@@ -1525,8 +1124,7 @@ impl WorkerRow {
     }
 }
 
-/// A manager: a session a live task's `from=` names, or the workers of a sid
-/// not on this instance.
+/// A manager: a session a live task's `from=` names, or the workers of a sid not on this instance.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ManagerRow {
     /// The manager's label; for a sid not here, its short sid.
@@ -1546,9 +1144,7 @@ pub(crate) enum DoneAt {
     Go(u16),
 }
 
-/// What came down that nobody here waits on and nobody has looked at: a
-/// finished worker started from `ctl` or whose manager is gone, or a
-/// supervised agent's task end.
+/// What came down that nobody here waits on and nobody has looked at: a finished worker started from `ctl` or whose manager is gone, or a supervised agent's task end.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct DoneRow {
     /// Its tab's label.
@@ -1559,9 +1155,7 @@ pub(crate) struct DoneRow {
     pub result_bytes: u64,
     /// What a click does.
     pub at: DoneAt,
-    /// A landing (`landed`), seen or not: a supervised agent's end, or a
-    /// worker whose record reads `done why=landed` or whose end or face is
-    /// a landing; else an older build's `done`.
+    /// A landing (`landed`), seen or not: a supervised agent's end, or a worker whose record reads `done why=landed` or whose end or face is a landing; else an older build's `done`.
     pub landed: bool,
 }
 
@@ -1572,15 +1166,13 @@ pub(crate) struct WaitRow {
     pub word: WaitWord,
     /// The wall's kind, where a wall is the cause.
     pub wall: Option<&'static str>,
-    /// An unsupervised limit, waited out until the person continues it at
-    /// its reset.
+    /// An unsupervised limit, waited out until the person continues it at its reset.
     pub unsupervised: bool,
     /// The reset the first of them names.
     pub reset: Option<String>,
     /// Since when the API has been out of reach (unix seconds).
     pub since_unix: Option<i64>,
-    /// The `kind=wait` entry they wait on ([`WaitWord::Entry`]): its writer
-    /// and words, which the row prints.
+    /// The `kind=wait` entry they wait on ([`WaitWord::Entry`]): its writer and words, which the row prints.
     pub entry: Option<crate::needs::WaitEntry>,
     /// Its tabs: label and where a click goes ([`Glance::go`]).
     pub tabs: Vec<(String, u16)>,
@@ -1591,15 +1183,13 @@ pub(crate) struct WaitRow {
 pub(crate) struct HeldRow {
     /// Its tab's label.
     pub label: String,
-    /// "(worker of lab-sweep)": the manager's label where the task's
-    /// `from=` resolves here — who waits while the tab is held.
+    /// "(worker of lab-sweep)": the manager's label where the task's `from=` resolves here — who waits while the tab is held.
     pub worker_of: Option<String>,
     /// Whose hold.
     pub hold: HoldWord,
     /// The Mac whose node holds it over the fleet ([`HoldWord::Remote`]).
     pub by_host: Option<String>,
-    /// How many writes aimed at the tab the person's hold refused
-    /// ([`SessionRow::person_refusals`]); `0` for a client's or the bus's.
+    /// How many writes aimed at the tab the person's hold refused ([`SessionRow::person_refusals`]); `0` for a client's or the bus's.
     pub refused: u64,
     /// Since when (unix seconds).
     pub since_unix: Option<i64>,
@@ -1607,10 +1197,7 @@ pub(crate) struct HeldRow {
     pub go: u16,
 }
 
-/// A session on another Mac that this Mac holds over the fleet (the
-/// step-in's remote hold, its row's `held_from=` this Mac's node): listed
-/// whatever its need, since a hold is never one, so its Hand Back stays in
-/// reach for as long as the hold stands.
+/// A session on another Mac that this Mac holds over the fleet (the step-in's remote hold, its row's `held_from=` this Mac's node): listed whatever its need, since a hold is never one, so its Hand Back stays in reach for as long as the hold stands.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct HeldThereRow {
     /// "mac-17 · lab-sweep".
@@ -1637,8 +1224,7 @@ pub(crate) struct ResultRef {
 /// A fleet need's session, for its submenu's acts.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PeerRef {
-    /// The name the book knows the Mac by: what `survey --host` takes
-    /// (`fleet_glance::dial_of`).
+    /// The name the book knows the Mac by: what `survey --host` takes (`fleet_glance::dial_of`).
     pub dial: String,
     /// How rows name the Mac (`fleet_glance::short_name`).
     pub name: String,
@@ -1646,9 +1232,7 @@ pub(crate) struct PeerRef {
     pub host: Option<String>,
     /// The session there.
     pub sid: String,
-    /// That Mac lets this one drive it (its survey said `drive=1`: its
-    /// person ran `aterm fleet allow drive --from <this Mac>` there): Take
-    /// Over and Hand Back on it, over the fleet.
+    /// That Mac lets this one drive it (its survey said `drive=1`: its person ran `aterm fleet allow drive --from <this Mac>` there): Take Over and Hand Back on it, over the fleet.
     pub drive: bool,
 }
 
@@ -1662,8 +1246,7 @@ pub(crate) enum FleetLine {
     NotInFleet,
     /// In a fleet.
     InFleet {
-        /// The last good read: how many Macs answered of how many asked,
-        /// how many agents they run, and when it was read (unix ms).
+        /// The last good read: how many Macs answered of how many asked, how many agents they run, and when it was read (unix ms).
         read: Option<(usize, usize, usize, u64)>,
         /// A read is in flight.
         reading: bool,
@@ -1673,9 +1256,7 @@ pub(crate) enum FleetLine {
         no_route: bool,
         /// The issuer a member's book names: what it alone reaches.
         member_of: Option<String>,
-        /// The issuer a member's book binds no key to: no Mac's key is
-        /// proven here until this Mac joins again
-        /// (`fleet_glance::BookFacts::unbound_issuer`).
+        /// The issuer a member's book binds no key to: no Mac's key is proven here until this Mac joins again (`fleet_glance::BookFacts::unbound_issuer`).
         unbound_issuer: Option<String>,
     },
 }
@@ -1691,20 +1272,16 @@ pub(crate) struct SiblingRef {
     pub sid: String,
 }
 
-/// The glance: everything the status item shows, as pure data
-/// ([`Glance::build`]), painted by [`compose_status_menu`].
+/// The glance: everything the status item shows, as pure data ([`Glance::build`]), painted by [`compose_status_menu`].
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Glance {
-    /// The generation the App drew it as ([`Pick::generation`]); `0` until handed
-    /// over.
+    /// The generation the App drew it as ([`Pick::generation`]); `0` until handed over.
     pub generation: u16,
-    /// Needs you: stuck before decide, this aterm's before a sibling's,
-    /// oldest first.
+    /// Needs you: stuck before decide, this aterm's before a sibling's, oldest first.
     pub needs: Vec<NeedRow>,
     /// This Mac.
     pub here: Here,
-    /// The managers, this aterm's in id order, then the workers of sids not
-    /// here.
+    /// The managers, this aterm's in id order, then the workers of sids not here.
     pub managers: Vec<ManagerRow>,
     /// Done for you, newest first.
     pub done: Vec<DoneRow>,
@@ -1714,14 +1291,11 @@ pub(crate) struct Glance {
     pub held: Vec<HeldRow>,
     /// The sessions on other Macs this Mac holds over the fleet.
     pub held_there: Vec<HeldThereRow>,
-    /// The digest's entries — what needs a look, not now — `(log id, subject)`
-    /// per entry, worst first.
+    /// The digest's entries — what needs a look, not now — `(log id, subject)` per entry, worst first.
     pub exceptions: Vec<(u64, String)>,
     /// `desktop_alerts`: the Notify Me checkmark.
     pub alerts: bool,
-    /// Whose banner those notices arrive as here (`notify::own_voice`): the
-    /// Notify Me row's hover. `None` until it has been read off the event
-    /// loop, and off macOS.
+    /// Whose banner those notices arrive as here (`notify::own_voice`): the Notify Me row's hover.
     pub voice: Option<NoticeVoice>,
     /// The sessions a [`StatusAction::Go`] goes to.
     pub go: Vec<u64>,
@@ -1735,31 +1309,19 @@ pub(crate) struct Glance {
     pub fleet: FleetLine,
 }
 
-/// Whose banner aterm's own notices arrive as on this Mac
-/// (`notify::own_voice`, macOS): what the Notify Me row's hover says.
+/// Whose banner aterm's own notices arrive as on this Mac (`notify::own_voice`, macOS): what the Notify Me row's hover says.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct NoticeVoice {
-    /// What macOS has said about aterm posting as itself
-    /// (`notice_center`): granted, a notice is aterm's own and a click goes to
-    /// the tab it is about; otherwise a bundle posts none.
+    /// What macOS has said about aterm posting as itself (`notice_center`): granted, a notice is aterm's own and a click goes to the tab it is about; otherwise a bundle posts none.
     pub center: crate::notice_center::Center,
-    /// What a notice is where there is no center to post through (`center`
-    /// is `Absent`): none from a bundle, a subprocess's banner from a bare
-    /// binary.
+    /// What a notice is where there is no center to post through (`center` is `Absent`): none from a bundle, a subprocess's banner from a bare binary.
     pub fallback: NoticeFallback,
 }
 
-/// What a notice is where there is no center to post through
-/// (`notify::route`).
+/// What a notice is where there is no center to post through (`notify::route`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum NoticeFallback {
-    /// None: aterm runs from an app bundle, which posts only as itself, and
-    /// it has no center. `named`: the bundle's id was read, so the center
-    /// itself did not open (UserNotifications did not load, or macOS gave
-    /// none: `aterm.log` says which); otherwise aterm does not read the
-    /// bundle's identity (it sits under a protected root, or was started
-    /// through a link from outside it), and from /Applications or
-    /// ~/Applications it would.
+    /// None: aterm runs from an app bundle, which posts only as itself, and it has no center.
     #[cfg_attr(
         all(not(target_os = "macos"), not(test)),
         expect(dead_code, reason = "UNUserNotificationCenter is macOS's")
@@ -1768,20 +1330,16 @@ pub(crate) enum NoticeFallback {
         /// Whether the running bundle's id was read.
         named: bool,
     },
-    /// terminal-notifier, speaking as itself: a bare binary has no bundle id
-    /// to speak for.
+    /// terminal-notifier, speaking as itself: a bare binary has no bundle id to speak for.
     #[cfg_attr(
         all(not(target_os = "macos"), not(test)),
         expect(dead_code, reason = "terminal-notifier is macOS's")
     )]
     Notifier,
-    /// `osascript`: Script Editor's banner, and a click opens Script Editor —
-    /// a bare binary's, without terminal-notifier.
+    /// `osascript`: Script Editor's banner, and a click opens Script Editor — a bare binary's, without terminal-notifier.
     ScriptEditor,
 }
 
-/// A table index as a payload; a table past `u16` drops what it cannot
-/// address (never aliases).
 fn slot<T>(table: &mut Vec<T>, item: T) -> Option<u16> {
     let at = u16::try_from(table.len()).ok()?;
     table.push(item);
@@ -1789,12 +1347,7 @@ fn slot<T>(table: &mut Vec<T>, item: T) -> Option<u16> {
 }
 
 impl Glance {
-    /// The glance of `rows` (this aterm's live sessions, in id order),
-    /// `siblings` (the last sibling scan) and `fleet` (the fleet glance's
-    /// slot, `None` where none runs), at `now_ms` (unix milliseconds: a
-    /// read's freshness is judged to the millisecond its reader wakes at);
-    /// `api_since` is when the first tab lost the API (`App::api_outage`).
-    /// The digest and the alerts switch are the caller's to fill.
+    /// The glance of `rows` (this aterm's live sessions, in id order), `siblings` (the last sibling scan) and `fleet` (the fleet glance's slot, `None` where none runs), at `now_ms` (unix milliseconds: a read's freshness is judged to the millisecond its reader wakes at); `api_since` is when the first tab lost the API (`App::api_outage`).
     pub(crate) fn build(
         rows: &[SessionRow],
         siblings: &[SiblingInstance],
@@ -1813,7 +1366,6 @@ impl Glance {
             go_of.insert(session, at);
             Some(at)
         };
-        // Needs, this aterm's.
         for row in rows {
             let Some(need) = &row.need else { continue };
             let Some(at) = go(&mut g, row.id) else {
@@ -1837,8 +1389,6 @@ impl Glance {
                 read_at_ms: None,
             });
         }
-        // Needs, a sibling's: counted only from a young scan, and aged from
-        // the scan that read them, not from this rebuild.
         let sibling_fresh = u64::try_from(SIBLING_FRESH.as_millis()).unwrap_or(u64::MAX);
         for sibling in siblings {
             let fresh = now_ms.saturating_sub(sibling.scanned_ms) <= sibling_fresh;
@@ -1866,21 +1416,11 @@ impl Glance {
                     }),
                     at: NeedAt::Raise(at),
                     counted: fresh,
-                    // An old scan's row says how old: "(read 2m ago)".
                     read_at_ms: (!fresh).then_some(sibling.scanned_ms),
                 });
             }
         }
-        // Needs, the fleet's: from the last good read, listed whatever its
-        // age and counted only while it is fresh; an older or unproven peer's
-        // never (`FleetMac::counts`).
         g.fleet = fleet.map_or(FleetLine::Off, |slot| g.fleet_needs(slot, now_ms));
-        // What the badge counts before what it does not (a need from an old
-        // fleet read or sibling scan: its age is that read's, so it would
-        // sort ahead of fresh rows and push a counted need behind "and k
-        // more"), then stuck before decide, this aterm's before a sibling's,
-        // oldest first (a need of unknown age last), then by label: a stable
-        // order.
         g.needs.sort_by(|a, b| {
             (
                 !a.counted,
@@ -1897,11 +1437,6 @@ impl Glance {
                     &b.label,
                 ))
         });
-        // This Mac: what everyone is doing — a landing first, read from the
-        // chip's face before any task record, so a landed tab that is no
-        // worker counts too; then a worker's end by its record; then the
-        // published verdict — a frozen, logged-out, walled or unanswered
-        // agent is no worker.
         for row in rows {
             let landed = |t: &TaskRow| {
                 t.state == TaskState::Done && t.why == Some(crate::task_record::WHY_LANDED)
@@ -1919,7 +1454,6 @@ impl Glance {
             }
         }
         g.here.elsewhere = siblings.iter().map(|s| s.sessions).sum();
-        // The managers and their workers: grouped by the task's `from=`.
         let mut managers: Vec<(String, ManagerRow)> = Vec::new();
         for row in rows {
             let Some(task) = row
@@ -1979,7 +1513,6 @@ impl Glance {
                 }
             }
         }
-        // This aterm's managers in their id order, then the sids not here.
         managers.sort_by_key(|(sid, m)| {
             (
                 m.go.is_none(),
@@ -1990,9 +1523,7 @@ impl Glance {
             )
         });
         g.managers = managers.into_iter().map(|(_, m)| m).collect();
-        // Done for you: a done task nobody here waits on, not yet looked at.
         let mut done: Vec<DoneRow> = Vec::new();
-        // The sessions whose own task row stands there.
         let mut listed: Vec<u64> = Vec::new();
         for row in rows {
             let Some(task) = row.task.as_ref().filter(|t| {
@@ -2030,23 +1561,12 @@ impl Glance {
                 since_unix_ms: task.since_unix_ms,
                 result_bytes: task.result_bytes,
                 at,
-                // A worker whose record says Land landed it, or whose end (a
-                // landing) stands on the glass or its chip's face: this one
-                // row is that landing's, worded as it, seen or not. An older
-                // build's `done` keeps `done`.
                 landed: task.why == Some(crate::task_record::WHY_LANDED)
                     || row.end.is_some()
                     || row.landed,
             });
             listed.push(row.id);
         }
-        // …and a supervised agent's task end nobody has looked at: its tab's
-        // label, `landed`, the instant its face moved there, and a click that
-        // goes to the session — no result. One row per session: where its own
-        // task row stands above (a worker under Autopilot), that row is it. A
-        // worker its manager here waits on gets none, as its task's done gets
-        // none: its row is under its manager, and Done for you is what nobody
-        // here waits on.
         for row in rows {
             let Some(end) = row.end.filter(|end| !end.seen) else {
                 continue;
@@ -2073,7 +1593,6 @@ impl Glance {
         }
         done.sort_by_key(|d| std::cmp::Reverse(d.since_unix_ms));
         g.done = done;
-        // Waiting: one row per cause.
         for row in rows {
             let Some(wait) = &row.waiting else { continue };
             let Some(at) = go(&mut g, row.id) else {
@@ -2102,8 +1621,6 @@ impl Glance {
                 }),
             }
         }
-        // The holds: whose, who waits on the tab (its manager, as a need row
-        // names it), and what the person's hold kept out.
         for row in rows {
             let Some(hold) = row.held else { continue };
             let Some(at) = go(&mut g, row.id) else {
@@ -2131,14 +1648,6 @@ impl Glance {
         g
     }
 
-    /// The fleet's need rows from `fleet`'s last good read, each counted
-    /// while its Mac's rows are no older than `fleet_glance::COUNT_FRESH` at
-    /// `now_ms` (a Mac that missed this read is carried with its own), the
-    /// sessions this Mac holds there, and the Fleet row's state. A Mac whose
-    /// needs this Mac does not count (`FleetMac::counts`: an older aterm, one
-    /// whose key is not proven) adds no row here, so nothing of it is
-    /// counted, taken over or handed back: an unproven one is listed under
-    /// its own mark in the Fleet submenu ([`compose_fleet_menu`]).
     fn fleet_needs(&mut self, fleet: &crate::fleet_glance::FleetSlot, now_ms: u64) -> FleetLine {
         if !fleet.book.in_fleet {
             return FleetLine::NotInFleet;
@@ -2218,8 +1727,7 @@ impl Glance {
         }
     }
 
-    /// How many needs the badge counts: this Mac's, and the fleet's from a
-    /// fresh read.
+    /// How many needs the badge counts: this Mac's, and the fleet's from a fresh read.
     pub(crate) fn need_count(&self) -> usize {
         self.needs.iter().filter(|n| n.counted).count()
     }
@@ -2250,10 +1758,7 @@ impl Glance {
         matches!(self.fleet, FleetLine::InFleet { .. })
     }
 
-    /// The menu-bar button title: `❯N` while N needs stand, else `❯•` while
-    /// the digest holds entries or a row stands under Done for you (a
-    /// worker's done, a supervised agent's end nobody has looked at), else
-    /// `❯`.
+    /// The menu-bar button title: `❯N` while N needs stand, else `❯•` while the digest holds entries or a row stands under Done for you (a worker's done, a supervised agent's end nobody has looked at), else `❯`.
     pub(crate) fn button_title(&self) -> String {
         match self.need_count() {
             0 if !self.exceptions.is_empty() || !self.done.is_empty() => "\u{276f}\u{2022}".into(),
@@ -2262,9 +1767,7 @@ impl Glance {
         }
     }
 
-    /// The button's hover: how many need you and where, or that nothing
-    /// does, and how much of the fleet the last read reached. No age: it is
-    /// set when a glance is handed over, not when hovered.
+    /// The button's hover: how many need you and where, or that nothing does, and how much of the fleet the last read reached.
     #[cfg_attr(
         not(target_os = "macos"),
         expect(dead_code, reason = "the menu-bar status item is macOS's")
@@ -2279,7 +1782,6 @@ impl Glance {
         let here = count(|o| *o == Origin::Local);
         let sibling = count(|o| matches!(o, Origin::Sibling(_)));
         let fleet = count(|o| *o == Origin::Fleet);
-        // "on mac-17" where every counted fleet need is that one Mac's.
         let mut fleet_macs: Vec<&str> = self
             .needs
             .iter()
@@ -2319,8 +1821,7 @@ impl Glance {
         tip
     }
 
-    /// The local sessions needing the owner, in the order the menu lists
-    /// them: what a test reads off a real App.
+    /// The local sessions needing the owner, in the order the menu lists them: what a test reads off a real App.
     #[cfg(test)]
     pub(crate) fn local_need_sessions(&self) -> Vec<u64> {
         self.needs
@@ -2332,11 +1833,7 @@ impl Glance {
             .collect()
     }
 
-    /// A cheap change fingerprint: the App hands the status item a new glance
-    /// only when this differs from the last one handed over. Every rendered
-    /// fact moves it, and nothing else: the generation and every age are left
-    /// out, so a glance that differs only in how long ago things happened
-    /// (the menu prints ages when it opens) hands nothing over.
+    /// A cheap change fingerprint: the App hands the status item a new glance only when this differs from the last one handed over.
     pub(crate) fn fingerprint(&self) -> u64 {
         let mut plain = self.clone();
         plain.generation = 0;
@@ -2361,29 +1858,17 @@ impl Glance {
     }
 }
 
-/// A noun's plural ending for `n` of it: `s`, none for one.
 fn plural(n: usize) -> &'static str {
     if n == 1 { "" } else { "s" }
 }
 
-/// A title after stripping leading non-alphanumeric status glyphs (tab
-/// spinners/state marks like `✳`/`◐`) and whitespace — `⚠` survives the strip,
-/// so a title that carries one still says so in a banner ([`tab_body`]).
 fn stripped_title(title: &str) -> &str {
     title
         .trim_start_matches(|c: char| !c.is_alphanumeric() && c != '⚠')
         .trim_start()
 }
 
-/// A sibling's or a fleet peer's row names its session by what that row
-/// carries: its typed role, else the title its person gave it, else its OSC
-/// title without the status glyph an agent leads it with
-/// ([`crate::app_take_over::title_without_agent_glyph`], the one strip of a
-/// spinner frame or Claude Code's idle `✳`, so the animation moves neither
-/// a row nor [`Glance::fingerprint`]); `None` when all three are empty, and
-/// the row falls back to the peer's program (`fleet_glance::mac_of`). This
-/// aterm's own rows are named as every Agents surface names a tab
-/// (`App::tab_label_of_session`).
+/// A sibling's or a fleet peer's row names its session by what that row carries: its typed role, else the title its person gave it, else its OSC title without the status glyph an agent leads it with ([`crate::app_take_over::title_without_agent_glyph`], the one strip of a spinner frame or Claude Code's idle `✳`, so the animation moves neither a row nor [`Glance::fingerprint`]); `None` when all three are empty, and the row falls back to the peer's program (`fleet_glance::mac_of`).
 pub(crate) fn tab_name(
     role: Option<&str>,
     user_title: Option<&str>,
@@ -2398,8 +1883,7 @@ pub(crate) fn tab_name(
         .map(|s| fold_clip(s, 40))
 }
 
-/// A need word in a few words, where a row has no words of its own (a
-/// sibling's or a fleet peer's facts row carries the word, never its text).
+/// A need word in a few words, where a row has no words of its own (a sibling's or a fleet peer's facts row carries the word, never its text).
 pub(crate) fn need_words(word: NeedWord) -> &'static str {
     match word {
         NeedWord::Frozen => "frozen: not reading input",
@@ -2457,7 +1941,6 @@ pub(crate) fn clock_words(unix: i64) -> Option<String> {
     Some(format!("{:02}:{:02}", local / 3600, (local % 3600) / 60))
 }
 
-/// A stalled worker's why in words (the classifier's own, `needs::of`).
 fn stall_words(why: Option<&str>) -> String {
     match why {
         Some("held") => "held at a screen aterm does not know".to_string(),
@@ -2467,23 +1950,16 @@ fn stall_words(why: Option<&str>) -> String {
     }
 }
 
-/// The age suffix, ` · 3m`, of something that has stood since `since`.
 fn age_suffix(since: Option<i64>, now_unix: i64) -> String {
     since.map_or_else(String::new, |at| {
         format!(" \u{b7} {}", age_words(now_unix - at))
     })
 }
 
-/// The age of a unix-milliseconds instant, in seconds.
 fn ms_age(since_unix_ms: u64, now_unix: i64) -> i64 {
     now_unix.saturating_sub(i64::try_from(since_unix_ms / 1000).unwrap_or(i64::MAX))
 }
 
-/// One need row's line: `◆ review — frozen: … · 3m`, a sibling's ending
-/// ` · other aterm (pid 900)`. `shown`: the rows one level in that say the
-/// session's further needs under it ([`further_need_rows`]), the last of
-/// which counts the needs past them, so a harness's row counts its further
-/// needs (` (+N more)`) only where none is drawn.
 #[cfg_attr(
     all(not(target_os = "macos"), not(test)),
     expect(dead_code, reason = "the menu-bar status item is macOS's")
@@ -2510,21 +1986,6 @@ fn need_line(row: &NeedRow, now_unix: i64, shown: usize) -> String {
     fold_clip(&line, LINE_MAX)
 }
 
-/// A SESSION'S FURTHER NEEDS, ONE ROW EACH (Autopilot v5 §12.2.1):
-/// under the session's own row, one level in and with no mark, each
-/// need the worker named after its first, whole up to [`LINE_MAX`] bytes;
-/// a click on any of them is the session's `go`, as on its own row. At
-/// most [`NEED_MORE_ROWS`] a session and, across the section, the `left`
-/// of [`NEED_MORE_ALL`] (taken down by the rows drawn here). The needs past
-/// them are counted on the LAST of these rows (` (+N more)`, kept whole as
-/// a row's age is), so the count reads as what follows the rows above it,
-/// never as them; with none drawn, on the session's own row
-/// ([`need_line`]). Each says whose need it is on its hover
-/// (`Claude Code in proj-api refactor needs this too`; `Claude Code needs
-/// this too` where the tab is named for its program), which VoiceOver
-/// speaks where the eye reads the indent. None for a need the window holds
-/// no words of (the entry's parse alone, another owner's ask, a sibling's
-/// or a fleet Mac's row).
 #[cfg(any(target_os = "macos", test))]
 fn further_need_rows(need: &NeedRow, left: &mut usize, go: StatusAction) -> Vec<StatusRow> {
     let Some(ask) = need.harness.as_ref() else {
@@ -2561,19 +2022,8 @@ fn further_need_rows(need: &NeedRow, left: &mut usize, go: StatusAction) -> Vec<
         .collect()
 }
 
-/// The fewest bytes of a harness's need its row keeps, however long the
-/// tab's label: the label is clipped first below it.
 const NEED_ROOM_MIN: usize = 24;
 
-/// A HARNESS'S NEED ROW (§12.2.1): `◇ proj-api refactor — grant Screen
-/// Recording to com.aterm.aterm in System Settings ▸ Privacy & Secu… (+1
-/// more) · 3m`, the need in the worker's words clipped to the room the
-/// mark, the label, ` (+N more)` and `end` (the age) leave in [`LINE_MAX`],
-/// so the age is always kept and the line is never cut after it. A label so
-/// long it would leave the need less than [`NEED_ROOM_MIN`] is clipped
-/// first. ` (+N more)` counts the further needs only where no row one level
-/// in is drawn under it (`shown` is 0); else the last of those rows counts
-/// them ([`further_need_rows`]).
 fn harness_need_line(
     row: &NeedRow,
     ask: &crate::needs::HarnessAsk,
@@ -2599,9 +2049,6 @@ fn harness_need_line(
     format!("{lead}{SEP}{}{end}", fold_clip(&ask.first, room))
 }
 
-/// "This Mac — 4 working · 2 need you · 1 waiting · 3 resting · 2 landed ·
-/// 1 exited · 4 shells (+2 in another aterm)", every count that is not zero;
-/// an older build's done worker `1 done`.
 #[cfg_attr(
     all(not(target_os = "macos"), not(test)),
     expect(dead_code, reason = "the menu-bar status item is macOS's")
@@ -2632,8 +2079,6 @@ fn here_line(here: &Here) -> String {
     line
 }
 
-/// A manager's line: "lab-sweep — 3 workers: 1 working, 2 landed", each
-/// worker counted by its row's word ([`WorkerRow::word`]).
 #[cfg_attr(
     all(not(target_os = "macos"), not(test)),
     expect(dead_code, reason = "the menu-bar status item is macOS's")
@@ -2658,11 +2103,6 @@ fn manager_line(m: &ManagerRow) -> String {
     )
 }
 
-/// A worker's line: "● bench — working 12m", "● bench — landing 12m"
-/// (Land's instruction typed to it, a hold standing: [`WorkerRow::word`];
-/// the age is the task's, as `working`'s), "◆ fmt — stalled: never started
-/// · 2m", "✓ lint — landed 4m · 2.1 KB" (Land landed it; an older build's
-/// record keeps "done").
 #[cfg_attr(
     all(not(target_os = "macos"), not(test)),
     expect(dead_code, reason = "the menu-bar status item is macOS's")
@@ -2688,10 +2128,6 @@ fn worker_line(w: &WorkerRow, now_unix: i64) -> String {
     fold_clip(&line, LINE_MAX)
 }
 
-/// A Done for you line: "✓ fleet summary — done 3m · 1.4 KB", and a
-/// landing's "✓ proj-api refactor — landed 3m". The age is composed here,
-/// when the menu is painted, never kept on the row; a row with no known time
-/// says none.
 #[cfg_attr(
     all(not(target_os = "macos"), not(test)),
     expect(dead_code, reason = "the menu-bar status item is macOS's")
@@ -2714,11 +2150,6 @@ fn done_line(d: &DoneRow, now_unix: i64) -> String {
     )
 }
 
-/// A Waiting line: "⧗ 3 waiting out the session usage limit — resets 19:30",
-/// "⧗ 4 can't reach the API since 14:02", "⧗ 1 memory restart queued for its
-/// next idle point", "⧗ tab 4 — waiting for CI on PR 412 (ci)" (a writer's
-/// `kind=wait` entry, in its words: one tab named, more counted). The words
-/// after the count are the Overview's for one tab ([`crate::needs::wait_words`]).
 #[cfg_attr(
     all(not(target_os = "macos"), not(test)),
     expect(dead_code, reason = "the menu-bar status item is macOS's")
@@ -2760,12 +2191,6 @@ fn wait_line(w: &WaitRow) -> String {
     fold_clip(&format!("\u{29d7} {body}"), LINE_MAX)
 }
 
-/// A held tab's line: "✋ bench (worker of lab-sweep) — yours 12m · refused
-/// 3 writes", "✋ deploy — held by a client 3m", "✋ api — held over the
-/// message bus 1h", "✋ build — held by mac-03 over the fleet 2m". The count is every write aimed at the tab that the
-/// person's hold refused, whoever sent it (aterm does not attribute a write
-/// to its sender), so it names no sender; the manager named is the one its
-/// task says waits on it.
 #[cfg_attr(
     all(not(target_os = "macos"), not(test)),
     expect(dead_code, reason = "the menu-bar status item is macOS's")
@@ -2802,16 +2227,9 @@ fn held_line(h: &HeldRow, now_unix: i64) -> String {
     fold_clip(&format!("\u{270b} {label}"), LINE_MAX)
 }
 
-/// How wide a line of the You hold section's cost paragraph runs, in
-/// characters: the sentence is a paragraph of disabled lines, not one row
-/// the menu would widen to fit.
 #[cfg(any(target_os = "macos", test))]
 const COST_LINE: usize = 72;
 
-/// `text` as lines no wider than `width` columns (a wide char two), broken
-/// where the shared rule lets a line break ([`aterm_grapheme::pieces`]):
-/// between words, and between CJK characters with nothing put between them
-/// (a piece wider than `width` is a line of its own).
 #[cfg(any(target_os = "macos", test))]
 fn wrap_words(text: &str, width: usize) -> Vec<String> {
     let mut lines: Vec<String> = Vec::new();
@@ -2835,8 +2253,7 @@ fn wrap_words(text: &str, width: usize) -> Vec<String> {
     lines
 }
 
-/// One row of the rendered status menu — the pure model the AppKit half only
-/// paints (the tab context menu's "the description IS the menu" discipline).
+/// One row of the rendered status menu — the pure model the AppKit half only paints (the tab context menu's "the description IS the menu" discipline).
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg(any(target_os = "macos", test))]
 pub(crate) enum StatusRow {
@@ -2856,11 +2273,7 @@ pub(crate) enum StatusRow {
         checked: bool,
         /// Its hover, when it has one.
         tip: Option<String>,
-        /// How many levels in it is drawn (`NSMenuItem`'s
-        /// `indentationLevel`): 1 for a harness's further need under its
-        /// session's row (§12.2.1), with no mark; 0 for every other row.
-        /// `chrome` prints it as ` indent=<n>`, never as the two-space lead
-        /// a submenu's row gets ([`menu_lines`]).
+        /// How many levels in it is drawn (`NSMenuItem`'s `indentationLevel`): 1 for a harness's further need under its session's row (§12.2.1), with no mark; 0 for every other row.
         indent: u8,
     },
     /// A row that opens a submenu of `rows`, painted with its parent.
@@ -2870,17 +2283,13 @@ pub(crate) enum StatusRow {
         /// The submenu's rows.
         rows: Vec<StatusRow>,
     },
-    /// The Fleet row: a submenu composed at its OWN `menuNeedsUpdate:` from
-    /// the fleet glance's slot ([`compose_fleet_menu`]), which the reader
-    /// writes directly, so a read that lands while the menu is open shows the
-    /// next time the submenu opens.
+    /// The Fleet row: a submenu composed at its OWN `menuNeedsUpdate:` from the fleet glance's slot ([`compose_fleet_menu`]), which the reader writes directly, so a read that lands while the menu is open shows the next time the submenu opens.
     FleetSubmenu {
         /// The visible label.
         label: String,
     },
 }
 
-/// A live, unchecked action row.
 #[cfg(any(target_os = "macos", test))]
 fn act(label: impl Into<String>, action: StatusAction) -> StatusRow {
     StatusRow::Action {
@@ -2893,14 +2302,6 @@ fn act(label: impl Into<String>, action: StatusAction) -> StatusRow {
     }
 }
 
-/// Notify Me When I'm Needed's hover: what a notice is, and whose banner it
-/// arrives as here — a person who sees Script Editor's banner, or none, knows
-/// why, and what changes it. `on` is the row's checkmark: where macOS has not
-/// been asked yet, turning the row on asks, and a row already on asks with
-/// the first notice (or is turned off and on again). A bundle posts only as
-/// aterm (`notify::route`), so a subprocess's banner is named only for a bare
-/// binary, and a bundle with no center says what gives it one. Before the
-/// voice is read, what a notice is alone.
 #[cfg(any(target_os = "macos", test))]
 fn notify_tip(voice: Option<NoticeVoice>, on: bool) -> String {
     use crate::notice_center::Center;
@@ -2957,10 +2358,7 @@ fn notify_tip(voice: Option<NoticeVoice>, on: bool) -> String {
     }
 }
 
-/// Compose the whole status menu from a glance, its ages as of `now_unix` —
-/// pure, deterministic, and unit-testable off macOS. Each section appears only
-/// with data: Needs you, This Mac (always), the managers, Done for you,
-/// Waiting, the holds, To look at, then the acts (always).
+/// Compose the whole status menu from a glance, its ages as of `now_unix` — pure, deterministic, and unit-testable off macOS.
 #[cfg(any(target_os = "macos", test))]
 pub(crate) fn compose_status_menu(g: &Glance, now_unix: i64) -> Vec<StatusRow> {
     let pick = |index: u16| Pick {
@@ -2969,9 +2367,6 @@ pub(crate) fn compose_status_menu(g: &Glance, now_unix: i64) -> Vec<StatusRow> {
     };
     let mut rows = Vec::new();
     if !g.needs.is_empty() {
-        // A fleet need from a read past `COUNT_FRESH`, or a sibling's from a
-        // scan past `SIBLING_FRESH`, is listed, with its read's age, and not
-        // counted: the header says how many are so.
         let counted = g.need_count();
         let stale = g.needs.len() - counted;
         rows.push(StatusRow::Info(if stale == 0 {
@@ -2979,7 +2374,6 @@ pub(crate) fn compose_status_menu(g: &Glance, now_unix: i64) -> Vec<StatusRow> {
         } else {
             format!("Needs you ({counted}, and {stale} from an old read)")
         }));
-        // The rows one level in the section may still draw (§12.2.1).
         let mut further_left = NEED_MORE_ALL;
         for need in g.needs.iter().take(NEEDS_SHOWN) {
             match need.at {
@@ -3030,7 +2424,6 @@ pub(crate) fn compose_status_menu(g: &Glance, now_unix: i64) -> Vec<StatusRow> {
                 worker_line(worker, now_unix),
                 StatusAction::Go(pick(worker.go)),
             );
-            // A landing worker's tip says what holds it (§12.3.1), no clock.
             if let StatusRow::Action { tip, .. } = &mut row {
                 tip.clone_from(&worker.tip);
             }
@@ -3103,11 +2496,6 @@ pub(crate) fn compose_status_menu(g: &Glance, now_unix: i64) -> Vec<StatusRow> {
                 StatusAction::Go(pick(held.go)),
             ));
         }
-        // The hold's cost, stated where it is seen, in the sentence Take Over's
-        // tool tip and `aterm ctl help hold` use: while any tab is held,
-        // `fabric::app_halt_refusal` refuses the app verbs and sudo's password
-        // relay instance-wide, and the cards do not open — what keeps an agent
-        // from clicking Hand Back.
         rows.extend(
             wrap_words(aterm_types::control_verbs::HOLD_COST, COST_LINE)
                 .into_iter()
@@ -3117,9 +2505,6 @@ pub(crate) fn compose_status_menu(g: &Glance, now_unix: i64) -> Vec<StatusRow> {
             rows.push(act("Hand Back All", StatusAction::HandBackAll));
         }
     }
-    // A hold this Mac placed on another Mac's session stands until this Mac
-    // hands it back, whatever that session's need — and a hold is never a
-    // need — so it is listed here for as long as that Mac's read shows it.
     if !g.held_there.is_empty() {
         rows.push(StatusRow::Separator);
         rows.push(StatusRow::Info("Held from here".to_string()));
@@ -3160,10 +2545,6 @@ pub(crate) fn compose_status_menu(g: &Glance, now_unix: i64) -> Vec<StatusRow> {
             ));
         }
     }
-    // What needs a look, not now: the digest's entries as clickable lines (each
-    // opens Settings ▸ Messages at that entry, where the whole sentence and its
-    // button are) and one way to file them all. A menu is a pull surface, so
-    // this costs the terminal nothing and interrupts nobody.
     if !g.exceptions.is_empty() {
         rows.push(StatusRow::Separator);
         rows.push(StatusRow::Info(format!(
@@ -3179,9 +2560,6 @@ pub(crate) fn compose_status_menu(g: &Glance, now_unix: i64) -> Vec<StatusRow> {
                 g.exceptions.len() - EXCEPTION_LINES_SHOWN
             )));
         }
-        // The count is on the item: the menu spells out four lines, the
-        // dismissal files them ALL (the page's own `Dismiss` / `Dismiss all`
-        // words), and a dismissed entry stays readable in Messages.
         rows.push(act(
             match g.exceptions.len() {
                 1 => "Dismiss \u{2014} kept in Messages".to_string(),
@@ -3208,8 +2586,6 @@ pub(crate) fn compose_status_menu(g: &Glance, now_unix: i64) -> Vec<StatusRow> {
     rows
 }
 
-/// The Fleet row's line: "Fleet — 29 of 31 Macs answered · 41 agents · read
-/// 20 s ago", "Fleet — reading…", "Fleet — last read failed".
 #[cfg_attr(
     all(not(target_os = "macos"), not(test)),
     expect(dead_code, reason = "the menu-bar status item is macOS's")
@@ -3237,9 +2613,6 @@ fn fleet_line(
     line
 }
 
-/// The Fleet's degrade lines: no route to any Mac (a click opens the Local
-/// Network pane), a member that reaches only its issuer (`member_of`), one
-/// whose book binds no key to its issuer (`unbound`), a failed last read.
 #[cfg(any(target_os = "macos", test))]
 fn degrade_rows(
     no_route: bool,
@@ -3272,12 +2645,6 @@ fn degrade_rows(
     rows
 }
 
-/// What proves a fleet Mac here where this Mac's book binds no key to its
-/// issuer `issuer` (`fleet_glance::BookFacts::unbound_issuer`): this Mac
-/// joining again, once the issuer holds a node key to bind (an issuer from
-/// before node keys mints one at `aterm fleet init`). Until then no answer
-/// is proven here, the issuer's and every member's alike, whatever each of
-/// them does.
 #[cfg(any(target_os = "macos", test))]
 fn unbound_issuer_row(issuer: &str) -> StatusRow {
     StatusRow::Info(fold_clip(
@@ -3289,10 +2656,6 @@ fn unbound_issuer_row(issuer: &str) -> StatusRow {
     ))
 }
 
-/// A fleet need's submenu: Read This Session; Take Over and Hand Back on its
-/// Mac where that Mac lets this one drive it (the step-in); Screen Sharing
-/// and Copy "ssh" where it named a host; and the grey line — why the rest is
-/// that Mac's own, or that its person wins.
 #[cfg(any(target_os = "macos", test))]
 fn peer_rows(peer: &PeerRef, pick: Pick) -> Vec<StatusRow> {
     let mut rows = vec![act("Read This Session", StatusAction::PeerRead(pick))];
@@ -3332,9 +2695,6 @@ fn peer_rows(peer: &PeerRef, pick: Pick) -> Vec<StatusRow> {
     rows
 }
 
-/// A session this Mac holds on another Mac's submenu: Hand Back on that Mac
-/// while it still lets this one drive it, Read This Session, and the grey
-/// line — what the hold costs there, or who hands it back now.
 #[cfg(any(target_os = "macos", test))]
 fn held_there_rows(peer: &PeerRef, pick: Pick) -> Vec<StatusRow> {
     let mut rows = Vec::new();
@@ -3360,15 +2720,6 @@ fn held_there_rows(peer: &PeerRef, pick: Pick) -> Vec<StatusRow> {
     rows
 }
 
-/// One Mac's row in the Fleet submenu: its needs, managers and counts, then
-/// Read in Full, Screen Sharing and Copy "ssh" (the last two where it named
-/// a host). A Mac whose key is not proven (`FleetMac::unproven`) says so on
-/// its row ("studio — key not proven · 1 need · 2 working": no need of it is
-/// counted, so none "needs you"), lists the sessions it says this Mac holds
-/// there — a hold no Hand Back from here can lift — and ends with what its
-/// mark means and what proves it: that Mac joining again, or, where this
-/// Mac's book binds no key to its issuer (`unbound`), this Mac joining
-/// again ([`unbound_issuer_row`]). `pick` names the snapshot and the Mac.
 #[cfg(any(target_os = "macos", test))]
 fn mac_row(
     mac: &crate::fleet_glance::FleetMac,
@@ -3405,8 +2756,6 @@ fn mac_row(
             LINE_MAX,
         )));
     }
-    // The holds an unproven Mac says this Mac placed: here, not under Held
-    // from here beside a Hand Back the dialler would refuse.
     if mac.unproven {
         for held in &mac.held_here {
             rows.push(StatusRow::Info(fold_clip(
@@ -3473,7 +2822,6 @@ fn mac_row(
     let what = match (mac.needs.len(), mac.working) {
         (0, 0) => "quiet".to_string(),
         (0, w) => format!("{w} working"),
-        // Counted nowhere: none of them "needs you".
         (n, w) if mac.unproven => format!("{n} need{} \u{b7} {w} working", plural(n)),
         (n, w) => format!(
             "{n} need{} you \u{b7} {w} working",
@@ -3485,7 +2833,6 @@ fn mac_row(
     } else {
         ""
     };
-    // A Mac that missed this read shows its last answer, and how old it is.
     let carried = if mac.carried {
         format!(
             " (read {} ago)",
@@ -3503,13 +2850,7 @@ fn mac_row(
     }
 }
 
-/// Compose the Fleet submenu from the fleet glance's slot, ages as of
-/// `now_unix` — pure, at the submenu's own `menuNeedsUpdate:`: the degrade
-/// lines; the Macs that need you or work, needs first; the quiet ones, the
-/// ones that did not answer, the ones whose key is not proven (an older one
-/// among them stands with the older) and the older ones each folded into one
-/// row; and Read the Fleet Now. Every Mac's pick carries the snapshot's
-/// generation.
+/// Compose the Fleet submenu from the fleet glance's slot, ages as of `now_unix` — pure, at the submenu's own `menuNeedsUpdate:`: the degrade lines; the Macs that need you or work, needs first; the quiet ones, the ones that did not answer, the ones whose key is not proven (an older one among them stands with the older) and the older ones each folded into one row; and Read the Fleet Now.
 #[cfg(any(target_os = "macos", test))]
 pub(crate) fn compose_fleet_menu(
     slot: &crate::fleet_glance::FleetSlot,
@@ -3574,9 +2915,6 @@ pub(crate) fn compose_fleet_menu(
                         .collect(),
                 });
             }
-            // Listed, never counted: its fold, and each row's last lines, say
-            // what proves it — that Mac joining again, or this one where it
-            // binds no key to its issuer.
             let unproven: Vec<StatusRow> = snap
                 .macs
                 .iter()
@@ -3624,25 +2962,14 @@ pub(crate) fn compose_fleet_menu(
     rows
 }
 
-/// A ROW'S PATH IN THE COMPOSED MENU (`docs/DESIGN-harness-autopilot-2026-10-15.md`
-/// §12.5.2): its index among its menu's rows, separators and information
-/// lines counted, then its index in each submenu down to it — the Fleet
-/// row's rows being the ones its own open composes ([`compose_fleet_menu`]).
-/// `chrome` prints it on each `statusmenu` line of a debug build
-/// (`at=<i>[.<j>…]`, [`menu_lines`]), and a development build's stand-in for
-/// the person presses the row it names (`aterm ctl person menubar press
-/// <at>`, [`row_at`]). A path, not a label: two rows can share a label, and
-/// a label's words change.
+/// A ROW'S PATH IN THE COMPOSED MENU (`docs/DESIGN-harness-autopilot-2026-10-15.md` §12.5.2): its index among its menu's rows, separators and information lines counted, then its index in each submenu down to it — the Fleet row's rows being the ones its own open composes ([`compose_fleet_menu`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct MenuAt(Vec<usize>);
 
 impl MenuAt {
-    /// The most levels a path names: the menu, a submenu, the Fleet row's
-    /// submenu and one of its own (an older-aterm fold).
     const MAX_DEPTH: usize = 4;
 
-    /// `at` read: one to [`Self::MAX_DEPTH`] indices joined by `.`, each
-    /// plain decimal digits; `None` for anything else.
+    /// `at` read: one to [`Self::MAX_DEPTH`] indices joined by `.`, each plain decimal digits; `None` for anything else.
     pub(crate) fn parse(at: &str) -> Option<Self> {
         let path: Vec<usize> = at
             .split('.')
@@ -3668,16 +2995,10 @@ impl std::fmt::Display for MenuAt {
     }
 }
 
-/// Whether `chrome`'s `statusmenu` lines end with the row's path (` at=…`,
-/// [`MenuAt`]): in a debug or test build, whose stand-in for the person
-/// presses a row by it. A release build carries no stand-in, and prints the
-/// lines as before.
 #[cfg(any(target_os = "macos", test))]
 const ROW_PATHS: bool = cfg!(any(test, debug_assertions));
 
-/// The row `at` names in the menu `rows` composes (the Fleet row's own rows
-/// `fleet`), as [`menu_lines`] numbers them; `None` where no row stands
-/// there, or the path goes on below a row that opens no submenu.
+/// The row `at` names in the menu `rows` composes (the Fleet row's own rows `fleet`), as [`menu_lines`] numbers them; `None` where no row stands there, or the path goes on below a row that opens no submenu.
 #[cfg(any(test, all(target_os = "macos", debug_assertions)))]
 pub(crate) fn row_at<'a>(
     rows: &'a [StatusRow],
@@ -3696,26 +3017,7 @@ pub(crate) fn row_at<'a>(
     level.get(*last)
 }
 
-/// The menu as text (`aterm ctl chrome`'s `statusmenu` lines): `rows`, as
-/// [`compose_status_menu`] composed them for the menu itself, one line per
-/// row in the order the menu shows them — each submenu's rows after it,
-/// indented two spaces a level, the Fleet row's being `fleet` (what its own
-/// open composes, [`compose_fleet_menu`]). A line names the row's label,
-/// quoted as the `menu` lines quote a title, and whether it is enabled; a
-/// row that acts adds its checkmark, its hover where it has one, and
-/// ` indent=<n>` where it is drawn levels in within its own menu (a
-/// harness's further need, §12.2.1: never the two-space lead, which says a
-/// submenu's row); in a debug build every line ends with the row's path
-/// ([`MenuAt`], ` at=…`, always last, after a hover's quoted words):
-///
-/// ```text
-/// statusmenu "This Mac — 1 working · 2 shells" enabled=no at=0
-/// statusmenu --- at=1
-/// statusmenu "Notify Me When I’m Needed" enabled=yes checked=no tip="One notice …" at=2
-/// statusmenu "Fleet — 2 of 2 Macs answered · …" enabled=yes submenu at=3
-/// statusmenu   "Read the Fleet Now" enabled=yes checked=no at=3.0
-/// statusmenu "the release credential to sign 0.48.0" enabled=yes checked=no indent=1 at=5
-/// ```
+/// The menu as text (`aterm ctl chrome`'s `statusmenu` lines): `rows`, as [`compose_status_menu`] composed them for the menu itself, one line per row in the order the menu shows them — each submenu's rows after it, indented two spaces a level, the Fleet row's being `fleet` (what its own open composes, [`compose_fleet_menu`]).
 #[cfg(any(target_os = "macos", test))]
 pub(crate) fn menu_lines(rows: &[StatusRow], fleet: &[StatusRow]) -> Vec<String> {
     fn push(lines: &mut Vec<String>, rows: &[StatusRow], fleet: &[StatusRow], at: &mut MenuAt) {
@@ -3773,12 +3075,7 @@ pub(crate) fn menu_lines(rows: &[StatusRow], fleet: &[StatusRow]) -> Vec<String>
     lines
 }
 
-/// The bar button's face — its title, and whether it is drawn red — to set
-/// for `glance`, or `None` when the button already shows it. `shown` is what
-/// the AppKit half last set (`None` before the first set, or after a set that
-/// did not take). Pure, so "only a real change retitles the button" is
-/// testable off macOS: the fingerprint moves with every menu fact, the face
-/// only with the count and its colour.
+/// The bar button's face — its title, and whether it is drawn red — to set for `glance`, or `None` when the button already shows it.
 #[cfg(any(target_os = "macos", test))]
 pub(crate) fn button_face_change(
     shown: Option<&(String, bool)>,
@@ -3791,9 +3088,7 @@ pub(crate) fn button_face_change(
 #[cfg(target_os = "macos")]
 pub(crate) use macos::{StatusItemHandle, attach_fleet, install, update};
 
-/// Non-macOS no-op handle: there is no menu-bar status item off macOS. Held by
-/// `App` in the same field on every target so the struct shape is
-/// platform-independent (the `MenuHandle` pattern).
+/// Non-macOS no-op handle: there is no menu-bar status item off macOS.
 #[cfg(not(target_os = "macos"))]
 pub(crate) type StatusItemHandle = ();
 
@@ -3814,146 +3109,62 @@ mod macos {
     use crate::appkit::consts::NS_VARIABLE_STATUS_ITEM_LENGTH;
     use crate::appkit::{self, MainThread};
 
-    /// `NSControlStateValueOn` (`NSCell.h`): a menu item's checkmark.
     const NS_CONTROL_STATE_VALUE_ON: isize = 1;
 
-    /// What [`install`] returns. `target` and `item` are load-bearing
-    /// retentions: releasing an `NSStatusItem` REMOVES it from the menu bar, and
-    /// AppKit holds a menu item's target and a menu's delegate only weakly — so
-    /// `App` keeps this handle in a field for the process lifetime (the
-    /// `MenuHandle` rule). The item holds its one menu itself
-    /// (`NSStatusItem`'s `menu` is a strong property).
     pub(crate) struct StatusItemHandle {
-        /// The single `statusAction:` relay target every item is wired to, and
-        /// the menu's delegate, which holds the glance the menu is painted from.
         target: Retained<StatusTarget>,
-        /// The bar item itself; dropping it would vanish the icon.
         item: Obj,
-        /// The bar button's face last set — its title, and whether it is red —
-        /// so [`update`] sends `-setTitle:` only when it really changes. `None`
-        /// until a set has taken.
         shown_face: RefCell<Option<(String, bool)>>,
-        /// The hover last set.
         shown_tip: RefCell<Option<String>>,
     }
 
-    /// The Rust state a [`StatusTarget`] carries. A `RefCell` because AppKit
-    /// messages the target through a shared `&self` (the `toolbar.rs` ivar
-    /// rule).
     pub(crate) struct StatusIvars {
-        /// The `Wake` channel a click or a menu open relays through.
         proxy: EventLoopProxy<Wake>,
-        /// The latest glance [`update`] handed over; `menuNeedsUpdate:` paints
-        /// the menu from it just before the menu opens.
         glance: RefCell<Glance>,
-        /// The glance the root menu was last painted from, until the open
-        /// that shows it relays it (`menuWillOpen:`): every tag in the open
-        /// menu is an index into it, so the App keeps it until the next open
-        /// (`App::note_status_painted`), however many glances it hands over
-        /// meanwhile.
         painted: RefCell<Option<Glance>>,
-        /// The fleet glance's slot ([`attach_fleet`]), which the Fleet
-        /// submenu is painted from at its own `menuNeedsUpdate:`.
         fleet: RefCell<Option<Arc<Mutex<crate::fleet_glance::FleetSlot>>>>,
-        /// The Fleet submenu painted last (its address), `0` for none: how
-        /// the delegate tells it from the root menu.
         fleet_menu: Cell<usize>,
     }
 
     aterm_objc::declare_class! {
-        /// The target object for every status-menu item, and the menu's
-        /// delegate. Owns the `EventLoopProxy<Wake>` and the latest glance, and
-        /// exposes three selectors: `statusAction:` decodes the sender's tag to
-        /// a [`StatusAction`] and posts [`Wake::StatusAction`] — a pure relay
-        /// from AppKit into the `Wake` channel, exactly like `menu.rs`'s
-        /// `MenuTarget`; `menuNeedsUpdate:` paints the menu from the stored
-        /// glance; `menuWillOpen:` relays the open.
-        ///
-        /// Declared with [`aterm_objc::declare_class!`]. The tests pin the
-        /// registered class, its protocol conformance and its method
-        /// encodings; the macro's dispatch is `aterm-objc`'s own tests'. No
-        /// test runs AppKit's menu tracking (libtest cannot start a modal
-        /// menu-tracking run loop) or the real `menuNeedsUpdate:` body (it
-        /// paints through `+[NSMenuItem separatorItem]`, which opens a
-        /// WindowServer connection from a test binary: the aterm-census guard
-        /// `test-appkit-door`).
-        ///
-        /// What objc2 spelled `type Mutability = MainThreadOnly` is carried by
-        /// [`MainThread`] at the entry points plus
-        /// [`aterm_objc::Retained`]'s unconditional `!Send` — see the note on
-        /// [`MainThread`].
         pub(crate) struct StatusTarget: NSObject {
             const NAME: &str = "ATermStatusTarget";
             type Ivars = StatusIvars;
             protocols: [NSObject, NSMenuDelegate];
 
-            /// `statusAction:` — the one selector wired to every actionable item.
-            /// A tag that doesn't decode is inert (never fires a wrong command).
             @sel(statusAction:)
             fn status_action(&self, sender: Id) {
                 if sender.is_null() {
                     return;
                 }
-                // SAFETY: `sender` is the live NSMenuItem AppKit passed as the
-                // action sender; `-tag` is `-(NSInteger)` with no side effects.
+                // SAFETY: `sender` is the live NSMenuItem AppKit passed as the action sender; `-tag` is `-(NSInteger)` with no side effects.
                 let tag = unsafe { appkit::send_isize(sender, sel!(tag)) };
                 if let Some(action) = StatusAction::from_tag(tag) {
-                    // Fire-and-forget: a closed loop (app shutting down) just
                     // drops the event — mirrors menu.rs.
                     let _ = self.ivars().proxy.send_event(Wake::StatusAction { action });
                 }
             }
 
-            /// The menu is about to be displayed: PAINT it from the stored
-            /// glance — `-removeAllItems`, then exactly the rows
-            /// [`super::compose_status_menu`] composes, ages as of now,
-            /// painted as [`install`] paints them. AppKit sends this on the
-            /// main thread at the start of a tracking session, before the menu
-            /// shows, so the menu opens as current as the last glance
-            /// [`update`] stored. It touches only this target's own glance and
-            /// the menu AppKit passed — never `App` (the `menuWillOpen:`
-            /// discipline below). It is sent for two menus only: the root,
-            /// whose submenus are painted with it and carry no delegate, and
-            /// the Fleet submenu, which has this target as its own delegate
-            /// and is composed from the slot the fleet reader writes.
             @sel(menuNeedsUpdate:)
             fn menu_needs_update(&self, menu: Id) {
                 if menu.is_null() || MainThread::new().is_none() {
                     return;
                 }
-                // The Fleet submenu: composed from the slot the reader
-                // writes, as it stands now.
                 if menu.addr() == self.ivars().fleet_menu.get() {
                     paint_fleet(menu, self);
                     return;
                 }
-                // Compose under the borrow and paint after it ends, so no
-                // AppKit send runs while the cell is borrowed. `update` borrows
-                // it on this same thread and never across a call out, so it is
-                // free here; were it somehow held, the menu keeps what it last
-                // showed rather than panicking inside AppKit's tracking loop.
                 let now = aterm_time::unix_secs().map_or(0, |s| i64::try_from(s).unwrap_or(0));
                 let (rows, painted) = match self.ivars().glance.try_borrow() {
                     Ok(glance) => (super::compose_status_menu(&glance, now), glance.clone()),
                     Err(_) => return,
                 };
                 autoreleasepool(|_| paint_menu(menu, self, rows));
-                // What the menu's tags now index, for the open to relay.
                 if let Ok(mut slot) = self.ivars().painted.try_borrow_mut() {
                     *slot = Some(painted);
                 }
             }
 
-            /// The menu is about to track: RELAY ONLY. This runs inside
-            /// AppKit's nested menu-tracking run loop, so it must never touch
-            /// `App` — it posts a wake carrying the glance the menu was just
-            /// painted from, which the App keeps until the next open so every
-            /// click in this one resolves, and the event loop kicks the
-            /// background sibling scan, whose result freshens the NEXT open
-            /// (the `toolbar.rs` mid-track discipline). The App's observers
-            /// run during menu tracking (`kCFRunLoopCommonModes`), so glances
-            /// ARE handed over while it is open; the painted one is what its
-            /// tags index.
             @sel(menuWillOpen:)
             fn menu_will_open(&self, menu: Id) {
                 // The root's open only: the Fleet submenu's is the same visit.
@@ -3975,15 +3186,6 @@ mod macos {
         }
     }
 
-    /// Create the menu-bar status item and its ONE menu, painted from `glance`.
-    /// Called once when the first OS window attaches (never headless). Returns
-    /// the retained handle for `App` to keep alive; best-effort `None` off the
-    /// main thread, or when AppKit gives no item or no menu — never a panic
-    /// (the `menu::install` contract).
-    ///
-    /// The menu is built, painted, given its delegate and set on the item here
-    /// and nowhere else: after this, `-setMenu:` is never sent again (see
-    /// [`update`]).
     pub(crate) fn install(
         proxy: &EventLoopProxy<Wake>,
         glance: &Glance,
@@ -3994,20 +3196,13 @@ mod macos {
             StatusIvars {
                 proxy: proxy.clone(),
                 glance: RefCell::new(glance.clone()),
-                // The install paints the menu from `glance`: until an open
-                // repaints it, that is what its tags index.
                 painted: RefCell::new(Some(glance.clone())),
                 fleet: RefCell::new(None),
                 fleet_menu: Cell::new(0),
             },
         )?;
         let handle = autoreleasepool(|_| -> Option<StatusItemHandle> {
-            // SAFETY: `+systemStatusBar` is a `-(id)` singleton accessor and
-            // `-statusItemWithLength:` is `-(id)(CGFloat)`; both are main-thread
-            // AppKit calls (proved by `main`). The item comes back AUTORELEASED
-            // (+0), so it is retained into the handle here — releasing an
-            // `NSStatusItem` removes it from the menu bar, which is why the
-            // handle owns one.
+            // SAFETY: `+systemStatusBar` is a `-(id)` singleton accessor and `-statusItemWithLength:` is `-(id)(CGFloat)`; both are main-thread AppKit calls (proved by `main`).
             let item = unsafe {
                 let bar = appkit::send_id(class(c"NSStatusBar").as_id(), sel!(systemStatusBar));
                 if bar.is_null() {
@@ -4023,11 +3218,7 @@ mod macos {
             let menu = new_menu()?;
             let now = aterm_time::unix_secs().map_or(0, |s| i64::try_from(s).unwrap_or(0));
             paint_menu(menu.id(), &target, super::compose_status_menu(glance, now));
-            // SAFETY: `-setDelegate:` and `-setMenu:` are `-(void)(id)` on live
-            // receivers, on the main thread. The delegate is the retained
-            // target, which outlives the menu because the handle owns it; the
-            // item retains the menu, so `menu` may drop at the end of this
-            // scope, inside the pool.
+            // SAFETY: `-setDelegate:` and `-setMenu:` are `-(void)(id)` on live receivers, on the main thread.
             unsafe {
                 appkit::send_v_id(menu.id(), sel!(setDelegate:), target.as_id());
                 appkit::send_v_id(item.id(), sel!(setMenu:), menu.id());
@@ -4044,14 +3235,6 @@ mod macos {
         Some(handle)
     }
 
-    /// Hand the status item a new glance. After [`install`], only a real
-    /// change touches the `NSStatusItem`: `-button`/`-setTitle:` run only when
-    /// the button's face changes (the need count or its colour), and the menu
-    /// is never replaced — the glance is stored in the menu's delegate, which
-    /// repaints the one menu from it in `menuNeedsUpdate:`, just before the
-    /// menu opens. Skipping `-setMenu:` and redundant `-setTitle:` calls avoids
-    /// synchronous `-[NSSceneStatusItem _setupScene:]` work on the main thread.
-    /// Main-thread guarded: a call off the main thread is a silent no-op.
     pub(crate) fn update(handle: &StatusItemHandle, glance: Glance) {
         let Some(_main) = MainThread::new() else {
             return;
@@ -4064,17 +3247,11 @@ mod macos {
         if handle.shown_tip.borrow().as_deref() != Some(tip.as_str()) {
             show_tip(handle, tip);
         }
-        // `try_borrow_mut`: `menuNeedsUpdate:` borrows the cell only while it
-        // composes rows, on this same thread, so it is free here; were it
-        // somehow held, the menu keeps the previous glance for one open rather
-        // than the event loop panicking.
         if let Ok(mut stored) = handle.target.ivars().glance.try_borrow_mut() {
             *stored = glance;
         }
     }
 
-    /// Give the status item the fleet glance's slot, which its Fleet submenu
-    /// is painted from.
     pub(crate) fn attach_fleet(
         handle: &StatusItemHandle,
         slot: Arc<Mutex<crate::fleet_glance::FleetSlot>>,
@@ -4082,9 +3259,6 @@ mod macos {
         *handle.target.ivars().fleet.borrow_mut() = Some(slot);
     }
 
-    /// Paint the Fleet submenu `menu` from the slot as it stands now
-    /// ([`super::compose_fleet_menu`]); the slot's lock is held only to copy
-    /// it out.
     fn paint_fleet(menu: Id, target: &StatusTarget) {
         let slot = target
             .ivars()
@@ -4101,18 +3275,13 @@ mod macos {
         autoreleasepool(|_| paint_menu(menu, target, rows));
     }
 
-    /// `NSForegroundColorAttributeName` and `NSFontAttributeName`, the
-    /// attributed-string keys a title's colour and font ride. Linked rather
-    /// than transcribed: AppKit exports them as `APPKIT_EXTERN
-    /// NSAttributedStringKey const`.
     fn attribute_keys() -> (Id, Id) {
         #[link(name = "AppKit", kind = "framework")]
         unsafe extern "C" {
             static NSForegroundColorAttributeName: *mut std::ffi::c_void;
             static NSFontAttributeName: *mut std::ffi::c_void;
         }
-        // SAFETY: immortal `NSString *` constants AppKit exports; reading a
-        // symbol is a load.
+        // SAFETY: immortal `NSString *` constants AppKit exports; reading a symbol is a load.
         unsafe {
             (
                 Id::from_ptr(NSForegroundColorAttributeName),
@@ -4121,21 +3290,9 @@ mod macos {
         }
     }
 
-    /// The title in `systemRedColor` and in `font` — the bar button's own, so
-    /// a red `❯2` keeps the menu bar's face and baseline (an attributed
-    /// string with no font attribute draws in Helvetica 12), else the menu
-    /// bar's font: an `NSAttributedString` (+1), or `None` when Foundation
-    /// refused it.
     fn red_title(title: &str, font: Id) -> Option<Obj> {
         let text = appkit::nsstring(title)?;
-        // SAFETY: `+systemRedColor` is `-(NSColor *)`, an autoreleased shared
-        // colour; `+menuBarFontOfSize:` is `-(NSFont *)(CGFloat)`, 0 meaning
-        // the menu bar's own size; `+dictionaryWithObjects:forKeys:count:` is
-        // `-(id)(const id *, const id *, NSUInteger)`, which copies the two
-        // arrays (live on this frame) and retains their elements;
-        // `-initWithString:attributes:` is NSAttributedString's `-(id)(NSString
-        // *, NSDictionary *)` initializer, consuming the +1 `+alloc`. Every
-        // argument is live for the call, inside the caller's pool.
+        // SAFETY: `+systemRedColor` is `-(NSColor *)`, an autoreleased shared colour; `+menuBarFontOfSize:` is `-(NSFont *)(CGFloat)`, 0 meaning the menu bar's own size; `+dictionaryWithObjects:forKeys:count:` is `-(id)(const id *, const id *, NSUInteger)`, which copies the two arrays (live on this frame) and retains their elements; `-initWithString:attributes:` is NSAttributedString's `-(id)(NSString *, NSDictionary *)` initializer, consuming the +1 `+alloc`.
         unsafe {
             let red = appkit::send_id(class(c"NSColor").as_id(), sel!(systemRedColor));
             let font = if font.is_null() {
@@ -4172,24 +3329,15 @@ mod macos {
         }
     }
 
-    /// Set the bar button's face — `title`, red when `stuck` — and remember
-    /// it for [`super::button_face_change`]. A face that did not take (no
-    /// button, or Foundation refused the string) is not remembered, so the
-    /// next [`update`] tries again.
     fn show_face(handle: &StatusItemHandle, face: (String, bool)) {
         let set = autoreleasepool(|_| {
-            // SAFETY: plain AppKit sends on live receivers, on the main thread
-            // (both callers checked `MainThread::new()`). `-button` is `-(id)`
-            // and returns the bar button for an item created with a variable
-            // length; `-setTitle:` and `-setAttributedTitle:` are
-            // `-(void)(id)`, the plain title replacing any attributed one.
+            // SAFETY: plain AppKit sends on live receivers, on the main thread (both callers checked `MainThread::new()`).
             unsafe {
                 let button = appkit::send_id(handle.item.id(), sel!(button));
                 if button.is_null() {
                     return false;
                 }
                 if face.1 {
-                    // `-font` is `-(NSFont *)` on the button (an NSControl).
                     let font = appkit::send_id(button, sel!(font));
                     let Some(text) = red_title(&face.0, font) else {
                         return false;
@@ -4209,7 +3357,6 @@ mod macos {
         }
     }
 
-    /// Set the bar button's hover text.
     fn show_tip(handle: &StatusItemHandle, tip: String) {
         let set = autoreleasepool(|_| {
             // SAFETY: as `show_face`; `-setToolTip:` is `-(void)(NSString *)`.
@@ -4230,13 +3377,8 @@ mod macos {
         }
     }
 
-    /// A fresh `NSMenu` with auto-enable off, so the model's `enabled` flags
-    /// are authoritative: the root, built once by [`install`], and every
-    /// submenu, built as its row is painted.
     fn new_menu() -> Option<Obj> {
-        // SAFETY: `+alloc` on `NSMenu` gives a +1 uninitialised instance and
-        // `-init` consumes it, so `Obj::from_owned` adopts exactly one +1;
-        // `-setAutoenablesItems:` is `-(void)(BOOL)` on the fresh menu.
+        // SAFETY: `+alloc` on `NSMenu` gives a +1 uninitialised instance and `-init` consumes it, so `Obj::from_owned` adopts exactly one +1; `-setAutoenablesItems:` is `-(void)(BOOL)` on the fresh menu.
         unsafe {
             let raw = appkit::send_id(appkit::alloc(class(c"NSMenu")), sel!(init));
             let menu = Obj::from_owned(raw)?;
@@ -4245,13 +3387,8 @@ mod macos {
         }
     }
 
-    /// Paint `rows` — the pure model from [`super::compose_status_menu`] —
-    /// into `menu`, replacing every item it held: native code renders rows,
-    /// never decides them. Runs on the main thread inside a pool, from
-    /// [`install`] and from `menuNeedsUpdate:`.
     fn paint_menu(menu: Id, target: &StatusTarget, rows: Vec<super::StatusRow>) {
-        // SAFETY: `-removeAllItems` is `-(void)` on the live menu, on the main
-        // thread.
+        // SAFETY: `-removeAllItems` is `-(void)` on the live menu, on the main thread.
         unsafe { appkit::send_v(menu, sel!(removeAllItems)) };
         for row in rows {
             match row {
@@ -4280,17 +3417,10 @@ mod macos {
         }
     }
 
-    /// `[[NSMenuItem alloc] initWithTitle:action:keyEquivalent:]`, +1, or `None`
-    /// if Foundation refused either string. `action` is [`Sel::NULL`] for a row
-    /// that is a label rather than a command.
     fn new_item(title: &str, action: Sel) -> Option<Obj> {
         let title = appkit::nsstring(title)?;
         let empty = appkit::nsstring("")?;
-        // SAFETY: `initWithTitle:action:keyEquivalent:` is NSMenuItem's
-        // designated initializer, `-(id)(NSString *, SEL, NSString *)`, and a
-        // nil SEL is its documented "no action" value. `+alloc` is +1 and the
-        // initializer consumes it, so `Obj::from_owned` adopts one +1. Both
-        // strings are live +1 NSStrings the initializer copies.
+        // SAFETY: `initWithTitle:action:keyEquivalent:` is NSMenuItem's designated initializer, `-(id)(NSString *, SEL, NSString *)`, and a nil SEL is its documented "no action" value.
         unsafe {
             let raw = appkit::send_id_id_sel_id(
                 appkit::alloc(class(c"NSMenuItem")),
@@ -4303,7 +3433,6 @@ mod macos {
         }
     }
 
-    /// Append an actionable item wired to `target` ([`action_item`]).
     fn add_action(
         menu: Id,
         target: &StatusTarget,
@@ -4316,20 +3445,13 @@ mod macos {
             return;
         };
         if let Some(tip) = tip.and_then(appkit::nsstring) {
-            // SAFETY: `-setToolTip:` is `-(void)(NSString *)` on the fresh
-            // item, handed a live string it copies.
+            // SAFETY: `-setToolTip:` is `-(void)(NSString *)` on the fresh item, handed a live string it copies.
             unsafe { appkit::send_v_id(item.id(), sel!(setToolTip:), tip.id()) };
         }
-        // SAFETY: `-addItem:` is `-(void)(NSMenuItem *)` on the live menu,
-        // handed the fresh item, which it retains.
+        // SAFETY: `-addItem:` is `-(void)(NSMenuItem *)` on the live menu, handed the fresh item, which it retains.
         unsafe { appkit::send_v_id(menu, sel!(addItem:), item.id()) };
     }
 
-    /// An actionable item wired to `target` carrying `action`'s tag and
-    /// `(enabled, checked, indent)` (`indent` its `indentationLevel`: a
-    /// harness's further need, one level in, §12.2.1): +1, or `None` where
-    /// Foundation refused its title. Its hover is [`add_action`]'s to set
-    /// (`-setToolTip:` opens WindowServer, so no test reaches it from here).
     pub(super) fn action_item(
         target: Id,
         title: &str,
@@ -4337,11 +3459,7 @@ mod macos {
         (enabled, checked, indent): (bool, bool, u8),
     ) -> Option<Obj> {
         let item = new_item(title, sel!(statusAction:))?;
-        // SAFETY: plain setters on a fresh NSMenuItem — `-setTarget:` is
-        // `-(void)(id)` (AppKit holds the target WEAKLY, which is why the
-        // handle retains it; nil is "no target"), `-setTag:`, `-setState:`
-        // and `-setIndentationLevel:` are `-(void)(NSInteger)` (the level
-        // within AppKit's 0-15) and `-setEnabled:` is `-(void)(BOOL)`.
+        // SAFETY: plain setters on a fresh NSMenuItem — `-setTarget:` is `-(void)(id)` (AppKit holds the target WEAKLY, which is why the handle retains it; nil is "no target"), `-setTag:`, `-setState:` and `-setIndentationLevel:` are `-(void)(NSInteger)` (the level within AppKit's 0-15) and `-setEnabled:` is `-(void)(BOOL)`.
         unsafe {
             appkit::send_v_id(item.id(), sel!(setTarget:), target);
             appkit::send_v_isize(item.id(), sel!(setTag:), action.tag());
@@ -4356,7 +3474,6 @@ mod macos {
         Some(item)
     }
 
-    /// Append an item that opens a submenu of `rows`, painted now.
     fn add_submenu(menu: Id, target: &StatusTarget, title: &str, rows: Vec<super::StatusRow>) {
         let Some(item) = new_item(title, Sel::NULL) else {
             return;
@@ -4365,9 +3482,7 @@ mod macos {
             return;
         };
         paint_menu(submenu.id(), target, rows);
-        // SAFETY: `-setSubmenu:` is `-(void)(NSMenu *)` and `-setEnabled:`
-        // `-(void)(BOOL)` on the fresh item; the item retains the submenu, and
-        // `-addItem:` retains the item into the live menu.
+        // SAFETY: `-setSubmenu:` is `-(void)(NSMenu *)` and `-setEnabled:` `-(void)(BOOL)` on the fresh item; the item retains the submenu, and `-addItem:` retains the item into the live menu.
         unsafe {
             appkit::send_v_id(item.id(), sel!(setSubmenu:), submenu.id());
             appkit::send_v_bool(item.id(), sel!(setEnabled:), true);
@@ -4375,9 +3490,6 @@ mod macos {
         }
     }
 
-    /// Append the Fleet row: an item whose submenu has this target as its
-    /// delegate, so it is composed at its own `menuNeedsUpdate:` from the
-    /// fleet glance's slot — and painted once now, so it never opens empty.
     fn add_fleet_submenu(menu: Id, target: &StatusTarget, title: &str) {
         let Some(item) = new_item(title, Sel::NULL) else {
             return;
@@ -4387,8 +3499,7 @@ mod macos {
         };
         target.ivars().fleet_menu.set(submenu.id().addr());
         paint_fleet(submenu.id(), target);
-        // SAFETY: as `add_submenu`; `-setDelegate:` is `-(void)(id)` on the
-        // fresh submenu, its delegate the retained target that outlives it.
+        // SAFETY: as `add_submenu`; `-setDelegate:` is `-(void)(id)` on the fresh submenu, its delegate the retained target that outlives it.
         unsafe {
             appkit::send_v_id(submenu.id(), sel!(setDelegate:), target.as_id());
             appkit::send_v_id(item.id(), sel!(setSubmenu:), submenu.id());
@@ -4397,7 +3508,6 @@ mod macos {
         }
     }
 
-    /// Append a disabled information row (explicit — auto-enable is off).
     fn add_info(menu: Id, title: &str) {
         let Some(item) = new_item(title, Sel::NULL) else {
             return;
@@ -4409,11 +3519,8 @@ mod macos {
         }
     }
 
-    /// Append a separator line.
     fn add_separator(menu: Id) {
-        // SAFETY: `+separatorItem` is `-(id)` and returns a shared,
-        // AUTORELEASED item — borrowed here for the length of `-addItem:`,
-        // which retains it into the menu, inside the caller's pool.
+        // SAFETY: `+separatorItem` is `-(id)` and returns a shared, AUTORELEASED item — borrowed here for the length of `-addItem:`, which retains it into the menu, inside the caller's pool.
         unsafe {
             let sep = appkit::send_id(class(c"NSMenuItem").as_id(), sel!(separatorItem));
             if !sep.is_null() {
@@ -4429,17 +3536,12 @@ mod macos {
         use super::{StatusTarget, new_item};
         use crate::appkit;
 
-        /// The registered class is what the runtime says it is: right name,
-        /// right superclass, all three selectors present on instances, and it
-        /// conforms to `NSMenuDelegate` — the property `-[NSMenu setDelegate:]`
-        /// reads before it will ever call back.
         #[test]
         fn the_registered_class_is_what_the_runtime_reports() {
             let cls = StatusTarget::class();
             assert!(!cls.is_null());
             assert_eq!(class(c"ATermStatusTarget"), cls);
-            // SAFETY: `cls` is the class this module registered, so it and its
-            // superclass are live, immortal class objects.
+            // SAFETY: `cls` is the class this module registered, so it and its superclass are live, immortal class objects.
             unsafe {
                 assert_eq!(class_name(cls), c"ATermStatusTarget");
                 assert_eq!(class_name(aterm_objc::superclass_of(cls)), c"NSObject");
@@ -4450,8 +3552,7 @@ mod macos {
                     && !aterm_objc::protocols_registered_by_aterm().contains(&c"NSMenuDelegate"),
                 "this host's AppKit registers NSMenuDelegate — not one aterm had to supply"
             );
-            // SAFETY: `+conformsToProtocol:` and `+instancesRespondToSelector:`
-            // are side-effect-free NSObject queries on a live class object.
+            // SAFETY: `+conformsToProtocol:` and `+instancesRespondToSelector:` are side-effect-free NSObject queries on a live class object.
             unsafe {
                 assert!(
                     appkit::send_bool_id(
@@ -4479,11 +3580,6 @@ mod macos {
             }
         }
 
-        /// Proof for the encodings: what `class_addMethod` actually
-        /// registered, read back out of the runtime with
-        /// `method_getTypeEncoding`, against the verified table. All three
-        /// selectors are `- (void)x:(id)y`, so all three are `"v@:@"`; the
-        /// generated `-dealloc` is `"v@:"`.
         #[test]
         fn the_runtime_reports_the_encodings_the_table_says() {
             let cls = StatusTarget::class();
@@ -4505,15 +3601,12 @@ mod macos {
             }
         }
 
-        /// An item built with [`Sel::NULL`] really has no action — the shape
-        /// `add_info` needs.
         #[test]
         fn an_information_row_has_a_nil_action() {
             autoreleasepool(|_| {
                 let item = new_item("info", Sel::NULL).expect("item");
                 let wired = new_item("cmd", sel!(statusAction:)).expect("item");
-                // SAFETY: `-action` is `-(SEL)` on a live NSMenuItem, and
-                // `-title` is `-(NSString *)`.
+                // SAFETY: `-action` is `-(SEL)` on a live NSMenuItem, and `-title` is `-(NSString *)`.
                 unsafe {
                     let action: unsafe extern "C-unwind" fn(aterm_objc::Id, Sel) -> Sel =
                         aterm_objc::checked_msg();
@@ -4540,8 +3633,6 @@ mod tests {
 
     use crate::needs::{AgentFact, NeedFacts};
 
-    /// [`Glance::build`] with no fleet glance (a headless instance's), at
-    /// `now_unix` seconds.
     fn local_glance(
         rows: &[SessionRow],
         siblings: &[SiblingInstance],
@@ -4551,12 +3642,10 @@ mod tests {
         Glance::build(rows, siblings, None, unix_ms(now_unix), api_since)
     }
 
-    /// `secs` (unix seconds) in unix milliseconds.
     fn unix_ms(secs: i64) -> u64 {
         u64::try_from(secs).unwrap_or(0) * 1000
     }
 
-    /// A row whose published need is what the classifier makes of `facts`.
     fn row_of(id: u64, title: &str, facts: &NeedFacts) -> SessionRow {
         SessionRow {
             id,
@@ -4566,8 +3655,6 @@ mod tests {
         }
     }
 
-    /// An unsupervised agent's facts at verdict `word`: a `prompt` is the rm
-    /// box.
     fn agent_facts(word: &'static str, rev: u64) -> NeedFacts {
         NeedFacts {
             agent: Some(AgentFact {
@@ -4584,12 +3671,8 @@ mod tests {
         row_of(id, title, &agent_facts(word, rev))
     }
 
-    /// The session's own resume command (`FooterFacts::resume`).
     const OWN: &str = "claude --model opus --resume 5f1c2d3e-4b5a-4c6d-8e7f-0a1b2c3d4e5f";
 
-    /// A stall's words as `App::need_facts` reads them (`input_stall::menu_row`):
-    /// the server's attention words for `fact`, with the clock fixed so the
-    /// text is exact.
     fn stall_row(
         fact: &crate::input_stall::InputStallFact,
         program: Option<&str>,
@@ -4624,9 +3707,6 @@ mod tests {
         }
     }
 
-    /// An identified agent's facts at the published stall `row` of `fact`:
-    /// the stall half, and the verdict the server derives from it
-    /// (`wall:unresponsive`, detail `stopped` for a stopped job) at `rev`.
     fn stalled_agent(
         fact: &crate::input_stall::InputStallFact,
         row: InputStallRow,
@@ -4637,7 +3717,6 @@ mod tests {
                 text: row.text,
                 key: row.key,
                 stopped: row.stopped,
-                // The pill carries the restart where the publication named it.
                 act: fact.act.is_some(),
                 hand_back_frees: false,
             }),
@@ -4651,13 +3730,6 @@ mod tests {
         }
     }
 
-    /// One notification per episode: the herald keys a stall row by its
-    /// episode, so a row whose text moves — the `for <dur>` clause of a zone
-    /// with no clock, the byte count of a later reading — re-renders the menu
-    /// and posts nothing new; a stalled job that turns stopped is the same
-    /// episode, though the agent's verdict moves with it (a new rev). A new
-    /// episode after a thaw notifies again. Negative control: keyed by its
-    /// text, as typed attention is, the same row would have posted twice.
     #[test]
     fn a_stall_notifies_once_per_episode_while_its_text_moves() {
         let fact = incident_stall();
@@ -4698,7 +3770,6 @@ mod tests {
         let moved = h.note(5, Some(&later), false, true, now + NOTIFY_SESSION_FLOOR * 2);
         assert!(moved.row_moved && moved.notice.is_none());
         assert_eq!(h.last_quiet(), Some(HeraldQuiet::Same));
-        // Frozen turning stopped re-renders the row and posts nothing new.
         let turned_note = h.note(
             5,
             Some(&stopped),
@@ -4707,7 +3778,6 @@ mod tests {
             now + NOTIFY_SESSION_FLOOR * 5 / 2,
         );
         assert!(turned_note.row_moved && turned_note.notice.is_none());
-        // The stall clears, and a NEW episode begins: a new notification.
         let _ = h.note(5, None, false, true, now + NOTIFY_SESSION_FLOOR * 3);
         let next = crate::input_stall::InputStallFact {
             since: fact.since + std::time::Duration::from_secs(600),
@@ -4720,23 +3790,12 @@ mod tests {
                 .notice
                 .is_some()
         );
-        // Negative control: keyed by text, the moved row is a second notice.
         assert_ne!(
             aterm_hash::fnv1a_64(first.label.as_bytes()),
             aterm_hash::fnv1a_64(later.label.as_bytes())
         );
     }
 
-    /// A stall row on an agent: a supervised Claude Code whose box the
-    /// supervisor's badge escalated, and a published stall, which makes the
-    /// agent's verdict `wall:unresponsive`. The row is the stall's, ahead of
-    /// the badge, supervised or not, in the person's words and with its
-    /// episode's key: frozen, and stopped (detail `stopped`) with the stopped
-    /// word and title. The remedy the stall's attention text ends with (the
-    /// hosted restart, `signal cont`) is an agent's command line: the attention
-    /// entry keeps it, and the row and the notice, whose act the pill's
-    /// Restart or Resume is, do not. Negative control: with no stall the
-    /// badge is the row again.
     #[test]
     fn a_stall_on_an_agent_is_its_row_frozen_or_stopped() {
         use crate::input_stall::{InputStallFact, StallAct};
@@ -4759,8 +3818,6 @@ mod tests {
                 ..stalled_agent(fact, row, rev)
             }
         };
-        // The window's host carries the explicit restart (the publication's
-        // `act`), and says it relaunches the agent.
         let hosted = InputStallFact {
             act: Some(StallAct {
                 cmd: aterm_agent::harness::resume::restart_command(
@@ -4800,7 +3857,6 @@ mod tests {
             "the entry keeps it: {entry}"
         );
         assert!(!frozen.body.contains("aterm ctl"), "{}", frozen.body);
-        // Most severe of all: ahead of typed attention and a box.
         let g = local_glance(
             &[
                 row(1, "zsh", Some("deploy needs a human")),
@@ -4812,8 +3868,6 @@ mod tests {
             None,
         );
         assert_eq!(g.local_need_sessions()[0], 3, "{:?}", g.needs);
-        // Stopped: its own word and title, its words without the `signal
-        // cont` remedy, and the same episode, supervised or not.
         let stopped_fact = InputStallFact {
             word: aterm_session::input_backlog::InputWord::Stopped,
             stopped: true,
@@ -4843,7 +3897,6 @@ mod tests {
             );
             assert!(!stopped.label.contains("signal cont"), "{}", stopped.label);
         }
-        // Negative control: no stall — the supervisor's badge is the row.
         let mut facts = worker(&fact, &AfterRestart::Relaunch, 11);
         facts.stall = None;
         facts.agent.as_mut().unwrap().word = "prompt";
@@ -4853,22 +3906,12 @@ mod tests {
         );
     }
 
-    /// A refused post spends nothing: not its session's floor — `notified_at`
-    /// is its last post before the refused one again, neither the refused one's
-    /// nor cleared — and not the instance's burst place, which another session
-    /// posts in. The refused notice is paid when the limit next allows, still
-    /// coalesced (one notice pays both boxes, naming the one shown). Negative
-    /// control: the same notice queued spends both.
     #[test]
     fn a_refused_notice_spends_no_floor_and_no_burst_place() {
         let t0 = std::time::Instant::now();
         let t1 = t0 + NOTIFY_SESSION_FLOOR;
         let retry = t1 + NOTIFY_RETRY;
-        // The box shown now, alone: rev 3 was replaced by rev 5.
         let coalesced = Some("a: bash rm -rf build".to_string());
-        // Sessions 1 and 2 post at t0 (one burst place left); session 1's two
-        // next boxes are held by its floor, and paid at t1 by one notice —
-        // which the queue refuses, or (the control) takes.
         let run = |refuse: bool| {
             let mut h = Herald::default();
             for id in [1, 2] {
@@ -4890,15 +3933,11 @@ mod tests {
         };
 
         let mut h = run(true);
-        // Not the floor: its last post that told someone is back…
         assert_eq!(h.slots[&1].notified_at, Some(t0));
         assert_eq!(h.due(t1), (vec![], Some(retry)));
         assert_eq!(h.due(retry).0, vec![1]);
-        // …not the burst place: a third session posts in it…
         let three = agent_row(3, "c", "prompt", 1);
         assert!(herald_note(&mut h, &three, false, retry).notice.is_some());
-        // …and the refused notice is paid, coalesced as it was, once the
-        // burst window slides past t0.
         let freed = t0 + NOTIFY_BURST_WINDOW;
         assert_eq!(h.due(retry), (vec![], Some(freed)));
         let paid = herald_note(&mut h, &agent_row(1, "a", "prompt", 5), false, freed);
@@ -4906,7 +3945,6 @@ mod tests {
         assert_eq!(paid.notice.map(|n| n.body), coalesced);
         assert_eq!(h.due(freed), (vec![], None));
 
-        // The control: queued, the notice spent the floor and the burst place.
         let mut h = run(false);
         assert_eq!(h.slots[&1].notified_at, Some(t1));
         assert_eq!(h.due(retry), (vec![], None));
@@ -4914,13 +3952,6 @@ mod tests {
         assert_eq!(h.last_quiet(), Some(HeraldQuiet::Limited));
     }
 
-    /// The wait after a refusal is the refused session's alone: a herald-wide
-    /// wait would hold session 2's brand-new box, a second after session 1's
-    /// refusal, as [`HeraldQuiet::Limited`]. The spin stays impossible:
-    /// session 1 is not due before its own [`NOTIFY_RETRY`], a further box of
-    /// its own is held behind that, and its retry pays both, coalesced.
-    /// Negative control: session 2's post, refused in turn, waits out its own
-    /// retry, not session 1's.
     #[test]
     fn a_refusal_holds_only_the_refused_session() {
         let t = std::time::Instant::now();
@@ -4931,7 +3962,6 @@ mod tests {
         assert!(out.notice.is_some());
         h.refused(1, out.owed, t);
 
-        // Session 2's first box, a second later: posted, and logged `queued`.
         let two = agent_row(2, "b", "prompt", 1);
         let posted = herald_note(&mut h, &two, false, t1);
         assert_eq!(h.last_quiet(), None, "held by another session's refusal");
@@ -4945,14 +3975,11 @@ mod tests {
         );
         assert_eq!(line.map(|(_, text)| text.ends_with(": queued")), Some(true));
 
-        // Session 1 is not due before its own retry, and a further box of its
-        // own is held behind it.
         assert_eq!(h.due(t1), (vec![], Some(retry)));
         let held = herald_note(&mut h, &agent_row(1, "a", "prompt", 3), false, t1);
         assert!(held.notice.is_none());
         assert_eq!(h.last_quiet(), Some(HeraldQuiet::Limited));
 
-        // The control: session 2's post refused too — its wait is its own.
         h.refused(2, posted.owed, t1);
         assert_eq!(h.due(t1), (vec![], Some(retry)));
         assert_eq!(h.due(retry), (vec![1], Some(retry_two)));
@@ -4977,11 +4004,8 @@ mod tests {
             clipped.len() <= 20 && clipped.ends_with('\u{2026}'),
             "{clipped}"
         );
-        // Never splits a char.
         let wide = "\u{00e9}".repeat(30);
         assert!(fold_clip(&wide, 11).ends_with('\u{2026}'));
-        // Bidi overrides/isolates and invisible format characters never reach
-        // native chrome: the command reads in its real order.
         assert_eq!(
             fold_clip("rm -rf /tmp/\u{202e}gol.txt\u{2066}x\u{2069}\u{200b}y", 64),
             "rm -rf /tmp/gol.txtxy"
@@ -4990,12 +4014,10 @@ mod tests {
         spoof.agent.as_mut().unwrap().subject = Some("ls \u{202e}fr- mr".to_string());
         let esc = escalation(&row_of(1, "t", &spoof)).unwrap();
         assert!(!esc.label.contains('\u{202e}') && !esc.body.contains('\u{202e}'));
-        // Negative control: ordinary non-ASCII text and emoji joiners survive.
         assert_eq!(
             fold_clip("caf\u{00e9} \u{1f469}\u{200d}\u{1f4bb}", 64),
             "caf\u{00e9} \u{1f469}\u{200d}\u{1f4bb}"
         );
-        // A prompt with no subject still names its kind.
         let mut bare = agent_facts("prompt", 1);
         bare.agent.as_mut().unwrap().subject = None;
         assert_eq!(
@@ -5004,9 +4026,6 @@ mod tests {
         );
     }
 
-    /// The menu bar and the presence band say a box and a wall in one set of
-    /// words: the question tool's box is a question (it approves nothing), a
-    /// box of no named kind is an approval, and an overload is the service's.
     #[test]
     fn presence_band_and_menu_bar_say_a_box_and_a_wall_alike() {
         let mut bare = agent_facts("prompt", 1);
@@ -5048,9 +4067,6 @@ mod tests {
         h.note(row.id, escalation(row).as_ref(), looking, true, now)
     }
 
-    /// One notification per transition: the first box posts, the same box
-    /// re-read does not, a cleared-then-new box does; a box first seen while
-    /// the human looks is spent and never announced when they look away.
     #[test]
     fn the_herald_posts_once_per_transition() {
         let t0 = std::time::Instant::now();
@@ -5063,21 +4079,18 @@ mod tests {
         let again = herald_note(&mut h, &boxed, false, t0);
         assert_eq!(again, HeraldOutcome::default(), "same box, nothing");
         assert_eq!(h.last_quiet(), Some(HeraldQuiet::Same));
-        // Answered (busy, rev 6), then a new box (rev 7) past the floor.
         let busy = agent_row(4, "builder", "busy", 6);
         assert!(herald_note(&mut h, &busy, false, t0).row_moved);
         let later = t0 + NOTIFY_SESSION_FLOOR;
         let next = herald_note(&mut h, &agent_row(4, "builder", "prompt", 7), false, later);
         assert!(next.notice.is_some(), "a new box is a new transition");
 
-        // Looking: spent, and not re-announced once the human looks away.
         let mut h = Herald::default();
         let seen = herald_note(&mut h, &boxed, true, t0);
         assert!(seen.row_moved && seen.notice.is_none());
         assert_eq!(h.last_quiet(), Some(HeraldQuiet::Looking));
         assert!(herald_note(&mut h, &boxed, false, t0).notice.is_none());
 
-        // A late subject changes the row without a second post.
         let mut h = Herald::default();
         let mut early = agent_facts("prompt", 5);
         early.agent.as_mut().unwrap().subject = None;
@@ -5090,9 +4103,6 @@ mod tests {
         assert!(late.row_moved && late.notice.is_none());
     }
 
-    /// The limiter: a session posts at most once per floor, the instance at
-    /// most [`NOTIFY_BURST`] per window; a held transition is spent, not
-    /// deferred; retiring a session forgets it.
     #[test]
     fn the_herald_is_rate_limited_per_session_and_per_instance() {
         let t0 = std::time::Instant::now();
@@ -5106,12 +4116,9 @@ mod tests {
         let flap = herald_note(&mut h, &agent_row(1, "a", "prompt", 3), false, t0);
         assert!(flap.notice.is_none(), "inside the session floor");
         assert_eq!(h.last_quiet(), Some(HeraldQuiet::Limited));
-        // A second box inside the floor is owed too.
         let second = herald_note(&mut h, &agent_row(1, "a", "prompt", 4), false, t0);
         assert!(second.notice.is_none());
-        // Owed, not spent: the timer is armed at the floor…
         assert_eq!(h.due(t0), (vec![], Some(t0 + NOTIFY_SESSION_FLOOR)));
-        // …and past it the same, still-shown box posts one coalesced notice.
         let after = t0 + NOTIFY_SESSION_FLOOR;
         assert_eq!(h.due(after), (vec![1], None));
         let paid = herald_note(&mut h, &agent_row(1, "a", "prompt", 4), false, after);
@@ -5121,21 +4128,17 @@ mod tests {
             Some("a: bash rm -rf build".to_string()),
             "it names the box shown now, never a count of boxes it replaced"
         );
-        // Paid once: nothing more is owed, and a re-read stays quiet.
         assert_eq!(h.due(after), (vec![], None));
         assert!(
             herald_note(&mut h, &agent_row(1, "a", "prompt", 4), false, after)
                 .notice
                 .is_none()
         );
-        // Negative control: an owed notice whose escalation cleared is dropped
-        // — a box already answered is never announced late.
         let _ = herald_note(&mut h, &agent_row(1, "a", "prompt", 5), false, after);
         assert_eq!(h.last_quiet(), Some(HeraldQuiet::Limited));
         let _ = herald_note(&mut h, &agent_row(1, "a", "busy", 6), false, after);
         assert_eq!(h.due(after + NOTIFY_SESSION_FLOOR), (vec![], None));
 
-        // Ten sessions hit a limit together: NOTIFY_BURST post now, not ten…
         let mut h = Herald::default();
         let posted = (10..20)
             .filter(|id| {
@@ -5150,32 +4153,20 @@ mod tests {
             })
             .count();
         assert_eq!(posted, NOTIFY_BURST);
-        // Every one of them still has its row (the menu is not rate-limited).
         let rows: Vec<SessionRow> = (10..20)
             .map(|id| agent_row(id, "w", "wall:usage-session", 1))
             .collect();
         assert_eq!(local_glance(&rows, &[], 0, None).needs.len(), 10);
-        // …and the rest are owed until the window slides.
         let later = t0 + NOTIFY_BURST_WINDOW;
         assert_eq!(h.due(t0).1, Some(later));
         let (ready, _) = h.due(later);
         assert_eq!(ready.len(), 10 - NOTIFY_BURST);
 
-        // Retire forgets; a cleared session that never escalated keeps no slot.
         h.retire(30);
         assert_eq!(h.note(99, None, false, true, t0), HeraldOutcome::default());
         assert!(!h.slots.contains_key(&99));
     }
 
-    /// Every decision on a transition is one log line, no `info` line recurs
-    /// at change rate, and no line carries text. Driven through the real
-    /// [`Herald::note`]: a post is `info`, or one `warn` when the notifier's
-    /// queue refused it; the same box re-read is `debug`; the rate limit's
-    /// first hold is `info`, while its re-read, a box answered and redrawn
-    /// inside the floor (the flap) and a second box held behind it stay
-    /// `debug`; a post reopens the window, so the next box the human sees is
-    /// `info`, its flap `debug`, and a floor later `info` again; a legacy
-    /// title and a machine's fact another tab told are `debug`.
     #[test]
     fn each_herald_decision_is_one_log_line_without_its_text() {
         use aterm_log::Level::{Debug, Info, Warn};
@@ -5194,8 +4185,6 @@ mod tests {
             );
             (esc, out, line)
         };
-        // Every word a line must not carry: the tab title, the box's command,
-        // the escalation's row and notification text.
         let leaks = |line: &str, esc: &Escalation, secrets: &[&str]| {
             [esc.body.as_str(), esc.label.as_str()]
                 .into_iter()
@@ -5213,13 +4202,9 @@ mod tests {
             (out, line)
         };
 
-        // A transition that posts — or, had the queue refused it, one `warn`;
-        // with `desktop_alerts = false`, `info` (the person's choice).
         let (out, line) = step(&mut h, "prompt", 7, false, 0);
         assert!(out.transition && out.owed == 1);
         assert_eq!(level(&line), Some(Info));
-        // The line says which banner: the session and the key
-        // `aterm ctl status agent_rev=` prints, in decimal.
         let said = line.as_ref().map(|(_, l)| l.as_str()).unwrap_or_default();
         assert!(
             said.contains("session 4 ") && said.contains("agent_rev=7)"),
@@ -5240,16 +4225,12 @@ mod tests {
             )),
             Some(Info)
         );
-        // Non-vacuous: the text the lines leave out is really in the notice.
         assert!(out.notice.unwrap().body.contains("rm -rf build"));
 
-        // The same box re-read: no transition, `debug`.
         let (out, line) = step(&mut h, "prompt", 7, false, 0);
         assert_eq!(out, HeraldOutcome::default());
         assert_eq!(level(&line), Some(Debug));
 
-        // Answered, then a new box inside the floor: the FIRST hold is
-        // `info`, its re-read `debug`, and so is every flap.
         assert_eq!(step(&mut h, "busy", 8, false, 15).1, None);
         let (out, line) = step(&mut h, "prompt", 9, false, 15);
         assert_eq!((out.transition, out.owed, out.first_quiet), (true, 1, true));
@@ -5268,14 +4249,11 @@ mod tests {
         let (out, line) = step(&mut h, "prompt", 16, false, 19);
         assert_eq!((out.transition, out.owed), (true, 2));
         assert_eq!(level(&line), Some(Debug));
-        // The App's timer pays it past the floor: `info`.
         assert_eq!(h.due(s(20)).0, vec![4]);
         let (out, line) = step(&mut h, "prompt", 16, false, 20);
         assert!(!out.transition && out.notice.is_some());
         assert_eq!(level(&line), Some(Info));
 
-        // The post reopened the window: a box the human sees is `info`, its
-        // flap `debug`, and a floor after the last `info` it is news again.
         assert_eq!(step(&mut h, "busy", 17, false, 21).1, None);
         let (out, line) = step(&mut h, "prompt", 18, true, 21);
         assert_eq!(h.last_quiet(), Some(HeraldQuiet::Looking));
@@ -5288,16 +4266,12 @@ mod tests {
         assert!(out.first_quiet);
         assert_eq!(level(&line), Some(Info));
 
-        // Session 4's `info` lines: one post, one hold for the whole flap, the
-        // paid notice, two looks — and not one line carries text.
         assert_eq!(log.iter().filter(|(l, _)| *l == Info).count(), 5);
         let boxed = escalation(&agent_row(4, "builder", "prompt", 7)).expect("a row");
         for (_, line) in &log {
             assert_eq!(leaks(line, &boxed, &secrets), None, "{line}");
         }
 
-        // Typed attention posts under its text's hex key, and says none of it;
-        // a stall posts under its episode's.
         let mut h = Herald::default();
         let asked = row(5, "zsh", Some("deploy token hunter2 needs a human"));
         let (esc, _, line) = note(&mut h, &asked, false, t0);
@@ -5336,8 +4310,6 @@ mod tests {
         assert!(line.contains("0x000000000000beef"), "its episode: {line}");
         assert_eq!(leaks(&line, &esc.unwrap(), &["frozen"]), None, "{line}");
 
-        // Negative control: the text check is not vacuous — it catches the
-        // body in a line that includes `<body>`.
         let old = format!("escalation notification not delivered: {}", boxed.body);
         assert_eq!(
             leaks(&old, &boxed, &secrets).as_deref(),
@@ -5345,8 +4317,6 @@ mod tests {
         );
     }
 
-    /// A row whose published need is a person's bare attention entry (an
-    /// ask), where `attention` is set.
     fn row(id: u64, title: &str, attention: Option<&str>) -> SessionRow {
         let facts = NeedFacts {
             attention: attention
@@ -5362,7 +4332,6 @@ mod tests {
         row_of(id, title, &facts)
     }
 
-    /// A worker of `from` in task state `state`.
     fn worker(id: u64, title: &str, from: &str, state: TaskState, result: u64) -> SessionRow {
         SessionRow {
             id,
@@ -5383,8 +4352,6 @@ mod tests {
         }
     }
 
-    /// The structure of a composed menu: each row's kind and action, a
-    /// submenu's as its own list — what the tests compare, never the words.
     #[derive(Debug, PartialEq, Eq)]
     enum Shape {
         Info,
@@ -5406,10 +4373,6 @@ mod tests {
             .collect()
     }
 
-    /// The step-in's rows: a fleet need on a Mac that lets this one
-    /// drive it offers Take Over and Hand Back on it, and its grey line says
-    /// its person wins; on any other Mac the line says why it is read-only,
-    /// naming the grant that would change it.
     #[test]
     fn a_fleet_need_on_a_mac_that_lets_this_one_drive_it_offers_take_over() {
         let driven = PeerRef {
@@ -5470,12 +4433,6 @@ mod tests {
         );
     }
 
-    /// A HOLD THIS MAC PLACED STAYS IN REACH: a session on another Mac that
-    /// this one holds over the fleet is listed under Held from here though it
-    /// needs nothing, with Hand Back on that Mac — no badge count, no need
-    /// row. Where that Mac no longer lets this one drive it, the row reads it
-    /// and offers no Hand Back that would be refused. NEGATIVE CONTROL: a Mac
-    /// whose read shows no hold of this Mac's lists none.
     #[test]
     fn a_hold_this_mac_placed_elsewhere_keeps_its_hand_back() {
         let now = 10_000_i64;
@@ -5551,9 +4508,6 @@ mod tests {
         );
     }
 
-    /// Each row of `rows` in the menu's order, a submenu's after it a level
-    /// deeper and the Fleet row's being `fleet`: its depth, and its label
-    /// (`None` for a separator).
     fn flat(rows: &[StatusRow], fleet: &[StatusRow], depth: usize) -> Vec<(usize, Option<String>)> {
         let mut out = Vec::new();
         for row in rows {
@@ -5575,9 +4529,6 @@ mod tests {
         out
     }
 
-    /// `lines` without each one's path (` at=…`, always last): the rows'
-    /// words, which the path's own test reads apart
-    /// (`every_row_path_chrome_prints_names_its_row`).
     fn worded(lines: Vec<String>) -> Vec<String> {
         lines
             .into_iter()
@@ -5588,14 +4539,6 @@ mod tests {
             .collect()
     }
 
-    /// EVERY ROW'S PATH NAMES ITS ROW (`docs/DESIGN-harness-autopilot-2026-10-15.md`
-    /// §12.5.2): each `statusmenu` line a debug build prints ends with
-    /// `at=<i>[.<j>…]`, and that path, read back, is the row the line
-    /// prints ([`row_at`]) — a top-level row, a separator, a submenu's child
-    /// and a Fleet row's own child (from its own composition) alike; the
-    /// path is the line's last word, after a hover's quoted words. NEGATIVE
-    /// CONTROLS: a path one past a menu's last row, one below a row that
-    /// opens no submenu, and words that are no path name nothing.
     #[test]
     fn every_row_path_chrome_prints_names_its_row() {
         let now = 10_000_i64;
@@ -5645,7 +4588,6 @@ mod tests {
             fleet_child.starts_with("statusmenu   "),
             "PRECONDITION: one level in: {fleet_child}"
         );
-        // NEGATIVE CONTROLS.
         assert_eq!(row_at(&rows, &fleet, &MenuAt(vec![rows.len()])), None);
         let leaf = rows
             .iter()
@@ -5658,14 +4600,6 @@ mod tests {
         assert_eq!(MenuAt::parse("3.0"), Some(MenuAt(vec![3, 0])));
     }
 
-    /// THE MENU READS AS TEXT WITHOUT A CLICK (`aterm ctl chrome`'s
-    /// `statusmenu` lines, [`menu_lines`]): one line per row the builder
-    /// composed, in its order, each submenu's rows indented under it and the
-    /// Fleet row's from the fleet slot's own composition — so Notify Me reads
-    /// off, a fleet need on a Mac that lets this one drive it carries Take
-    /// Over on that Mac, and a hold this Mac placed there stands under Held
-    /// from here. NEGATIVE CONTROL: on a Mac that does not let this one drive
-    /// it the dump has no Take Over, and says read-only from here.
     #[test]
     fn the_menu_dump_is_the_builders_rows_in_order() {
         let now = 10_000_i64;
@@ -5718,7 +4652,6 @@ mod tests {
             ),
             "the Fleet row's own rows: {lines:#?}"
         );
-        // NEGATIVE CONTROL.
         let (lines, _) = dump(crate::fleet_glance::FleetMac {
             drive: false,
             ..driven
@@ -5735,15 +4668,6 @@ mod tests {
         );
     }
 
-    /// A MAC WHOSE KEY IS NOT PROVEN IS LISTED, NEVER COUNTED OR DRIVEN: its
-    /// need is no row under Needs you and moves no badge, and nothing offers
-    /// Take Over or Hand Back on it, though it says `drive=1` and that this
-    /// Mac holds one of its sessions; the Fleet submenu folds it under "1
-    /// Mac's key not proven", its own row marked, listing that hold with no
-    /// Hand Back and ending with what proves it — and `aterm ctl chrome`'s
-    /// dump reads the same. NEGATIVE CONTROL: the same answer proven is a
-    /// counted need with Take Over on it, its hold under Held from here, and
-    /// its row "needs you".
     #[test]
     fn a_mac_whose_key_is_not_proven_is_listed_and_never_counted_or_driven() {
         let now = 10_000_i64;
@@ -5825,7 +4749,6 @@ mod tests {
                 .any(|line| line.contains("studio's key is not proven")),
             "{lines:#?}"
         );
-        // NEGATIVE CONTROL: proven.
         let (g, fleet, lines) = read(crate::fleet_glance::FleetMac {
             unproven: false,
             ..studio
@@ -5851,15 +4774,6 @@ mod tests {
         );
     }
 
-    /// WHERE THIS MAC BINDS NO KEY TO ITS ISSUER, WHAT PROVES ANY MAC IS ITS
-    /// OWN JOIN: every answer reads unproven here then, the issuer's too
-    /// (its book's keys are copied only from an issuer it binds), so the
-    /// fold says "join again here", one degrade line under the Fleet row and
-    /// at the head of its submenu names the issuer and that act, and each
-    /// Mac's row ends with it — none says to rejoin that Mac, which proves
-    /// nothing here, or the issuer, which joins nothing. NEGATIVE CONTROL:
-    /// its issuer bound, the same Macs' rows each name their own rejoin and
-    /// no line names the issuer.
     #[test]
     fn where_this_mac_binds_no_key_to_its_issuer_its_own_join_proves_them() {
         let now = 10_000_i64;
@@ -5897,7 +4811,6 @@ mod tests {
             "{lines:#?}"
         );
         assert_eq!(says(&lines, "Update aterm on"), 0, "{lines:#?}");
-        // NEGATIVE CONTROL: its issuer bound.
         let lines = read(None);
         assert_eq!(says(&lines, "binds no key to its issuer"), 0, "{lines:#?}");
         assert_eq!(
@@ -5923,7 +4836,6 @@ mod tests {
         }
     }
 
-    /// The acts every menu ends with.
     fn acts() -> [Shape; 4] {
         [
             Shape::Sep,
@@ -5940,10 +4852,6 @@ mod tests {
         }
     }
 
-    /// The glance reads the published need: one row per session that
-    /// needs its owner — stuck before decide, then oldest first — each going
-    /// to its tab, and nothing for a busy or idle agent. Negative control: a
-    /// busy agent alone raises no row and no count.
     #[test]
     fn needs_are_listed_stuck_first_then_oldest_and_each_goes_to_its_tab() {
         let mut limits = agent_row(1, "limits", "wall:usage-session", 3);
@@ -5983,15 +4891,11 @@ mod tests {
             shape(&menu[..6]),
             vec![Shape::Info, go(1), go(4), go(3), go(5), Shape::Sep]
         );
-        // NEGATIVE CONTROL.
         let calm = local_glance(&[agent_row(2, "tests", "busy", 1)], &[], 1000, None);
         assert!(calm.needs.is_empty());
         assert_eq!(calm.button_title(), "\u{276f}");
     }
 
-    /// The badge: this aterm's needs plus a sibling's, red iff one is stuck;
-    /// decide alone is the default ink. A sibling's need raises its tab there
-    /// (never a local focus) and lists after this aterm's.
     #[test]
     fn the_badge_counts_local_and_sibling_needs_and_is_red_only_when_stuck() {
         let sibling = SiblingInstance {
@@ -6017,12 +4921,10 @@ mod tests {
         assert_eq!(both.button_title(), "\u{276f}2");
         assert!(both.stuck(), "the sibling's frozen agent is stuck");
         assert_eq!(both.stuck_count(), 1);
-        // Stuck first, wherever it stands.
         assert_eq!(both.needs[0].origin, Origin::Sibling(900));
         assert_eq!(both.needs[0].at, NeedAt::Raise(0));
         assert_eq!(both.raises[0].sid, "s-sib");
         assert_eq!(both.here.elsewhere, 2);
-        // A sibling whose rows carry no need counts its sessions, nothing else.
         let quiet = SiblingInstance {
             needs: Vec::new(),
             ..sibling
@@ -6031,11 +4933,6 @@ mod tests {
         assert_eq!((g.need_count(), g.here.elsewhere), (0, 2));
     }
 
-    /// A SIBLING'S NEED COUNTS ONLY FROM A YOUNG SCAN, aged from the scan
-    /// that read it: an old scan's row is listed with how old it is and not
-    /// counted (its sibling may have quit), and the header says so. The age
-    /// grows with the clock, not with the rebuild. NEGATIVE CONTROL: the same
-    /// scan inside `SIBLING_FRESH` counts.
     #[test]
     fn a_sibling_need_counts_only_from_a_young_scan() {
         let scanned_ms = 1_000_000_000_500;
@@ -6072,8 +4969,6 @@ mod tests {
         assert_ne!(young.fingerprint(), old.fingerprint(), "uncounted moves it");
     }
 
-    /// THE DOT: nothing needs you, but the digest holds entries or a
-    /// worker's result waits under Done for you. A need outranks it.
     #[test]
     fn the_dot_means_something_for_later_and_never_hides_a_need() {
         let mut g = local_glance(&[], &[], 0, None);
@@ -6098,8 +4993,6 @@ mod tests {
         assert_eq!(asked.button_title(), "\u{276f}1", "a need wins the title");
     }
 
-    /// Sections appear only with data: an empty glance is This Mac and the
-    /// acts; each section's data adds exactly its rows, in order.
     #[test]
     fn sections_appear_only_with_data_in_order() {
         let empty = compose_status_menu(&local_glance(&[], &[], 0, None), 0);
@@ -6171,7 +5064,6 @@ mod tests {
             Shape::Info,
             go(6),
         ];
-        // What a hold costs the instance: one sentence, set as a paragraph.
         want.extend(
             wrap_words(aterm_types::control_verbs::HOLD_COST, COST_LINE)
                 .iter()
@@ -6192,8 +5084,6 @@ mod tests {
             (2, 2, 1),
             "the manager and bench work; lint and the summary are done"
         );
-        // A session that needs the owner, or waits something out, is never
-        // counted as working (or as a shell): it is said by its own word.
         assert_eq!(
             (g.here.need_you, g.here.waiting),
             (1, 1),
@@ -6205,12 +5095,6 @@ mod tests {
         );
     }
 
-    /// The You hold row says what the person's hold kept out: the refusal count
-    /// beside the age, and the manager its task says waits on the tab, as a
-    /// need row names it; the section ends with the cost sentence Take Over's
-    /// tool tip and `help hold` use, as lines the menu does not widen for.
-    /// Negative controls: no refusal leaves the row and the fingerprint as they
-    /// were, and a client's hold carries no count of the person's.
     #[test]
     fn the_you_hold_row_counts_the_refused_writes_and_names_who_waits() {
         let manager = SessionRow {
@@ -6237,7 +5121,6 @@ mod tests {
             line(&quiet),
             "\u{270b} bench (worker of lab-sweep) \u{2014} yours 4m"
         );
-        // A refusal moves the row and the fingerprint the App hands over by.
         let refused = glance(held(1, HoldWord::Person));
         assert_eq!(refused.held[0].refused, 1);
         assert_eq!(
@@ -6246,17 +5129,14 @@ mod tests {
         );
         assert_ne!(refused.fingerprint(), quiet.fingerprint());
         assert!(line(&glance(held(3, HoldWord::Person))).ends_with("refused 3 writes"));
-        // NEGATIVE CONTROL: the same glance again moves nothing.
         assert_eq!(
             glance(held(0, HoldWord::Person)).fingerprint(),
             quiet.fingerprint()
         );
-        // A client's hold is not the person's: it carries no count of theirs.
         let client = glance(held(5, HoldWord::Local));
         assert_eq!(client.held[0].refused, 0);
         assert!(!line(&client).contains("refused"), "{}", line(&client));
 
-        // The cost: every line of the sentence, none wider than the paragraph.
         let menu = compose_status_menu(&refused, 2000);
         let infos: Vec<&str> = menu
             .iter()
@@ -6275,8 +5155,6 @@ mod tests {
         );
     }
 
-    /// The ten-row cap and the manager cap: the rest are counted on one
-    /// Overview row each.
     #[test]
     fn more_needs_and_managers_than_fit_are_one_overview_row() {
         let mut rows: Vec<SessionRow> = (0..13).map(|id| row(id, "zsh", Some("look"))).collect();
@@ -6325,10 +5203,6 @@ mod tests {
         assert_eq!(managers, MANAGERS_SHOWN);
     }
 
-    /// DONE FOR YOU: a done task started from `ctl`, or whose manager is not
-    /// here, not yet looked at; a worker its manager here waits on is the
-    /// manager's, and a seen one is gone. Read Result where it has one, else
-    /// its tab.
     #[test]
     fn done_for_you_lists_what_nobody_here_waits_on() {
         let manager = SessionRow {
@@ -6362,13 +5236,9 @@ mod tests {
         assert_eq!(labels, vec!["orphan", "bare"]);
         assert!(matches!(g.done[0].at, DoneAt::Read(_)));
         assert!(matches!(g.done[1].at, DoneAt::Go(_)));
-        // The orphan's manager is not here: its workers are grouped so.
         assert!(g.managers.iter().any(|m| m.go.is_none()));
     }
 
-    /// A supervised agent's session whose task end (Land's landing, the one
-    /// end under Cruise / Land) stands since `at_unix`, looked at (`seen`) or
-    /// not.
     fn ended(id: u64, title: &str, at_unix: i64, seen: bool) -> SessionRow {
         SessionRow {
             id,
@@ -6384,7 +5254,6 @@ mod tests {
         }
     }
 
-    /// The composed menu's Done for you rows as `chrome` prints them.
     fn done_lines(g: &Glance, now_unix: i64) -> Vec<String> {
         worded(menu_lines(&compose_status_menu(g, now_unix), &[]))
             .into_iter()
@@ -6392,10 +5261,6 @@ mod tests {
             .collect()
     }
 
-    /// An end nobody has looked at is one Done for you row: a landing worded
-    /// `landed` (Cruise never ends, so it has no row of its own), the tab's
-    /// label and its age as the menu is painted, no size, a click that goes to
-    /// the session — newest first — and a seen end none; the title is `❯•`.
     #[test]
     fn an_unseen_end_is_one_go_row_worded_landed() {
         let now = 1_000_000;
@@ -6430,17 +5295,11 @@ mod tests {
             ]
         );
         assert_eq!(g.button_title(), "\u{276f}\u{2022}");
-        // CONTROL: the seen end, unseen, is a row.
         let mut unseen = rows.clone();
         unseen[2].end.as_mut().expect("an end").seen = false;
         assert_eq!(local_glance(&unseen, &[], now, None).done.len(), 3);
     }
 
-    /// One row per session: a worker under Autopilot whose own task row stands
-    /// under Done for you is that row alone — its Read Result where it has
-    /// one, else Go — and a worker its manager here waits on gets none, as its
-    /// task's done gets none (Done for you is what nobody here waits on; its
-    /// row is under its manager).
     #[test]
     fn a_worker_whose_task_row_stands_gets_one_row() {
         let end = Some(EndRow {
@@ -6484,18 +5343,11 @@ mod tests {
                 .any(|m| m.workers.iter().any(|w| w.label == "managed")),
             "the managed worker's row is under its manager"
         );
-        // CONTROL: its manager gone, the managed worker's end is listed.
         let g = local_glance(&[managed], &[], 2_000, None);
         assert_eq!(g.done.len(), 1);
         assert!(matches!(g.done[0].at, DoneAt::Go(_)));
     }
 
-    /// A landed worker's one row says `landed`: a `ctl` worker under Land whose
-    /// task row stands and whose end is a landing is the task's row — its Read
-    /// Result and its size — worded as its end, seen or not, though its record
-    /// carries no `why=landed` (§12.4.1). The same worker with no end and no
-    /// `why=landed` (Cruise never ends) says `done`. NEGATIVE CONTROL (as
-    /// run): main's `landed = end unseen` says `done` for the seen end.
     #[test]
     fn a_landed_workers_one_row_says_landed() {
         let with_end = |end: Option<bool>| {
@@ -6528,9 +5380,6 @@ mod tests {
         assert!(!g.done[0].landed, "no end: done");
     }
 
-    /// Every end is counted, the newest shown: seven unseen ends are `Done for
-    /// you (7)` and the five newest rows, newest first; a sixth is shown once a
-    /// newer row goes.
     #[test]
     fn the_heading_counts_every_end_and_the_newest_are_shown() {
         let now = 1_000_000;
@@ -6568,8 +5417,6 @@ mod tests {
         );
     }
 
-    /// The title is `❯•` while an end's row stands and nothing needs you: no
-    /// new title class, and a need still wins it (`❯1`).
     #[test]
     fn the_title_lights_for_an_end_row_while_nothing_needs_you() {
         let now = 1_000_000;
@@ -6595,10 +5442,6 @@ mod tests {
         assert_eq!(g.button_title(), "\u{276f}", "CONTROL: seen");
     }
 
-    /// Nothing on an end's row goes stale: its age is composed at paint, so the
-    /// same glance painted later says an older age, and a glance built later
-    /// from the same facts hands nothing over (its fingerprint leaves the age
-    /// out, as it does a worker's).
     #[test]
     fn an_end_rows_age_is_composed_at_paint() {
         let now = 1_000_000;
@@ -6610,7 +5453,6 @@ mod tests {
             local_glance(&rows, &[], now + 600, None).fingerprint(),
             g.fingerprint()
         );
-        // No time known: no age, never `20000d`.
         let mut untimed = rows.clone();
         untimed[0].end.as_mut().expect("an end").since_unix_ms = 0;
         let g = local_glance(&untimed, &[], now, None);
@@ -6620,8 +5462,6 @@ mod tests {
         );
     }
 
-    /// WAITING IS ONE ROW PER CAUSE, NEVER ONE PER TAB: eight tabs at one
-    /// limit are one row with eight tabs; another cause is another row.
     #[test]
     fn waiting_is_one_row_per_cause() {
         let wait = |id: u64, word: WaitWord, wall: Option<&'static str>| SessionRow {
@@ -6649,11 +5489,6 @@ mod tests {
         assert_eq!(g.button_title(), "\u{276f}");
     }
 
-    /// A WRITER'S `kind=wait` IS SHOWN IN ITS OWN WORDS, never as a usage
-    /// limit (`aterm help needs` tells scripts to write one): one tab names
-    /// the tab, its words and whose they are; another entry is another row,
-    /// and two tabs waiting on the same entry share one. NEGATIVE CONTROL: a
-    /// limit's row still says the limit.
     #[test]
     fn a_writers_wait_is_shown_in_its_words() {
         let wait = |id: u64, owner: &str, text: &str| SessionRow {
@@ -6699,10 +5534,6 @@ mod tests {
         assert_eq!(g.here.waiting, 5, "a wait is never work");
     }
 
-    /// A STALE CLICK IS INERT: every action's tag round-trips — the fleet's
-    /// too — and no two share one, a retired tag (Start, Show, Stop, the map,
-    /// a window row, a raw session id, a sibling pid) decodes to nothing, an
-    /// unknown one too, and a payload past the band is the inert `0`.
     #[test]
     fn tags_round_trip_and_retired_tags_are_inert() {
         let p = Pick {
@@ -6752,12 +5583,9 @@ mod tests {
         assert_eq!(StatusAction::from_tag(99), None);
         assert_eq!(StatusAction::from_tag(99 * TAG_BAND + 5), None);
         assert_eq!(StatusAction::ShowException(u64::MAX).tag(), 0);
-        // A packed payload past 32 bits names no pick.
         assert_eq!(StatusAction::from_tag(5 * TAG_BAND + (1 << 33)), None);
     }
 
-    /// The fingerprint is unmoved by ages alone: the same needs, workers,
-    /// waits and holds, minutes older, hand nothing over; a new need moves it.
     #[test]
     fn the_fingerprint_is_unmoved_by_ages_alone() {
         let rows = |since: i64, ms: u64| {
@@ -6780,15 +5608,11 @@ mod tests {
             a.fingerprint(),
             local_glance(&more, &[], 200, None).fingerprint()
         );
-        // The generation is no rendered fact either.
         let mut regen = a.clone();
         regen.generation = 9;
         assert_eq!(a.fingerprint(), regen.fingerprint());
     }
 
-    /// Only a real change re-faces the bar button: the first update always
-    /// sets; a glance whose menu moved but whose count and colour did not
-    /// sends nothing; a count or a colour change sends one.
     #[test]
     fn the_bar_button_is_refaced_only_when_its_face_changes() {
         let calm = local_glance(&[row(1, "zsh", None)], &[], 0, None);
@@ -6812,11 +5636,6 @@ mod tests {
         );
     }
 
-    /// A PEER ROW'S NAME: the role, else the user's title, else the OSC
-    /// title without the spinner frame or idle mark an agent leads it with —
-    /// so an animating agent's name never moves — else none. A title alone
-    /// raises no need (NEGATIVE CONTROL: the same tab with typed attention
-    /// does).
     #[test]
     fn the_tab_name_drops_status_glyphs_and_a_title_raises_nothing() {
         for frame in [
@@ -6863,11 +5682,6 @@ mod tests {
         assert_eq!(g.local_need_sessions(), vec![9]);
     }
 
-    /// THE AGE A NEED STANDS AT: its first publication, kept while the same
-    /// need is re-read and restarted by a new one; a hold's the same; a gone
-    /// session keeps no memory. What the glance shows moving is reported, an
-    /// agent's box and its answer (one class) are not. NEGATIVE CONTROL: a
-    /// re-read of the same row moves nothing.
     #[test]
     fn the_herald_remembers_since_when_a_need_and_a_hold_stand() {
         let asked = |key: u64, hold: Option<HoldWord>| SessionRow {
@@ -6900,11 +5714,6 @@ mod tests {
         assert!(h.since.is_empty());
     }
 
-    /// THE STATUS CARRY'S ROW reads back as written, a part at a time: a
-    /// need with its age and whether it was told, a hold with its age, the
-    /// done looked at. Nothing known is no row. A part that does not read
-    /// carries nothing, an unknown key is skipped, and `told` stands only
-    /// beside a need it names.
     #[test]
     fn the_status_carry_row_reads_back_a_part_at_a_time() {
         let full = StatusCarry {
@@ -6934,13 +5743,6 @@ mod tests {
         );
     }
 
-    /// A seamless update tells no standing need again: the outgoing herald's
-    /// told need, carried ([`Herald::carry_of`], its row, [`Herald::adopt`]),
-    /// is shown already at its first note in the successor — under a key the
-    /// successor minted anew (an agent's rev) — and keeps its age; a new need
-    /// after it posts. Negative controls: the same need carried untold (the
-    /// limit had held it back) posts; a different need posts; the first need
-    /// past [`ADOPT_SETTLE`] posts.
     #[test]
     fn an_adopted_standing_need_posts_nothing_and_a_new_one_posts() {
         let t0 = std::time::Instant::now();
@@ -6989,11 +5791,6 @@ mod tests {
         );
     }
 
-    /// A CARRIED NEED IS MATCHED BY ITS WORD, not its kind: a told login,
-    /// carried, keeps the successor's first login quiet, but a memory wall
-    /// there (the same `EscalationKind::Wall`) is another need and posts —
-    /// as a stopped job after a told frozen one does (both `Unresponsive`).
-    /// The first case is the control: the carry does hold the same word.
     #[test]
     fn a_carried_need_is_matched_by_its_word_not_its_kind() {
         let t0 = std::time::Instant::now();
@@ -7039,8 +5836,6 @@ mod tests {
         );
     }
 
-    /// The digest's entries as clickable lines, more than fit counted, and
-    /// one dismissal that files them all.
     #[test]
     fn the_menu_lists_the_digest_and_offers_to_file_it() {
         let mut g = local_glance(&[], &[], 0, None);
@@ -7077,18 +5872,6 @@ mod tests {
         );
     }
 
-    /// The Notify Me row's hover says whose banner a notice arrives as here,
-    /// and differs where that differs: aterm's own once macOS lets it (a click
-    /// on one about a tab here goes to that tab, any other only brings aterm
-    /// forward), the ask that turning it on makes, the ask the first notice
-    /// makes for a row already on, a refusal, a bundle with no center (none,
-    /// and what gives it one: for a bundle whose identity aterm does not read
-    /// where it sits, moving aterm.app to /Applications), and a bare binary's
-    /// banners (Script Editor's, without terminal-notifier, and then what
-    /// installing it makes them); no other row has one. Wherever there is a
-    /// center — granted, refused, or not answered with the row on or off — and
-    /// wherever a bundle has none, a bundle posts only as aterm, so no such
-    /// hover names a subprocess's banner.
     #[test]
     fn notify_me_says_whose_banner_a_notice_is() {
         use crate::notice_center::Center;
@@ -7125,9 +5908,6 @@ mod tests {
         for fallback in fallbacks {
             cases.push((voice(Center::Absent, fallback), false));
         }
-        // A bare binary: Script Editor's without terminal-notifier, and what
-        // installing it makes them, which is what the hover says once it is
-        // found: terminal-notifier's own, never aterm's.
         let without = tip(voice(Center::Absent, NoticeFallback::ScriptEditor), false);
         let found = tip(voice(Center::Absent, NoticeFallback::Notifier), false);
         assert!(without.contains("Script Editor's banners"), "{without}");
@@ -7138,7 +5918,6 @@ mod tests {
             );
             assert!(bare.contains("not running from aterm.app"), "{bare}");
         }
-        // A bundle with no center: none reach the desktop, and the remedy.
         let unread = tip(
             voice(Center::Absent, NoticeFallback::Withheld { named: false }),
             false,
@@ -7183,8 +5962,6 @@ mod tests {
         assert!(asking.contains("none reach the desktop"), "{asking}");
         let refused = tip(voice(Center::Refused, bundled), false);
         assert!(refused.contains("none reach the desktop"), "{refused}");
-        // With a center, the fallback is not the owner's business: no
-        // subprocess posts for a bundle.
         for fallback in fallbacks {
             for on in [true, false] {
                 assert_eq!(granted, tip(voice(Center::Granted, fallback), on));
@@ -7200,7 +5977,6 @@ mod tests {
         }
     }
 
-    /// The Notify Me row is checked exactly when `desktop_alerts` is on.
     #[test]
     fn notify_me_is_checked_with_desktop_alerts() {
         for alerts in [true, false] {
@@ -7220,8 +5996,6 @@ mod tests {
         }
     }
 
-    /// A slot in a fleet whose last good read, at `read_at_ms`, holds `macs`
-    /// (each one's rows from that read).
     fn fleet_slot(
         macs: Vec<crate::fleet_glance::FleetMac>,
         read_at_ms: u64,
@@ -7252,7 +6026,6 @@ mod tests {
         }
     }
 
-    /// A fleet Mac with `needs` (a stalled worker each) and `working` agents.
     fn mac(
         label: &str,
         needs: usize,
@@ -7281,12 +6054,6 @@ mod tests {
         }
     }
 
-    /// EVERY NEED THE BADGE COUNTS IS SHOWN BEFORE ONE IT DOES NOT: with
-    /// more needs than fit, the ten counted ones — a fresh fleet read's
-    /// stuck need and nine asks of this aterm — fill the rows, and "and k
-    /// more" holds only an old fleet read's three stuck needs (listed, not
-    /// counted), whose ages (their read's) are older. NEGATIVE CONTROL:
-    /// among the counted, stuck still comes before decide.
     #[test]
     fn counted_needs_are_shown_before_an_old_reads() {
         let now = 10_000_i64;
@@ -7324,12 +6091,6 @@ mod tests {
         assert_eq!(kinds, expected);
     }
 
-    /// The fleet's needs on the badge: a fresh read's needs count and are red
-    /// when stuck; a read older than five minutes is listed and not counted; an
-    /// older peer's rows are never needs; a failed read after a good one never
-    /// moves the title. Each fleet row's submenu holds Read This Session,
-    /// Screen Sharing and Copy "ssh" (a Mac with a host) and the read-only
-    /// line.
     #[test]
     fn fleet_needs_count_only_from_a_fresh_read() {
         let now = 10_000_i64;
@@ -7355,7 +6116,6 @@ mod tests {
             g.button_title(),
             "a failed read never moves it"
         );
-        // The fleet row's submenu, and its place after the needs header.
         let menu = compose_status_menu(&g, now);
         let sub = menu
             .iter()
@@ -7373,7 +6133,6 @@ mod tests {
                 Shape::Info,
             ]
         );
-        // In a fleet the Fleet row is lazy, and Read the Fleet replaces Read This Mac.
         assert!(
             menu.iter()
                 .any(|r| matches!(r, StatusRow::FleetSubmenu { .. }))
@@ -7392,7 +6151,6 @@ mod tests {
                 ..
             }
         )));
-        // NEGATIVE CONTROL: not in a fleet, one grey line and Read This Mac.
         let mut alone = slot.clone();
         alone.book.in_fleet = false;
         let menu = compose_status_menu(
@@ -7413,11 +6171,6 @@ mod tests {
         )));
     }
 
-    /// A FLEET NEED STOPS COUNTING TO THE MILLISECOND ITS ROWS PASS
-    /// `COUNT_FRESH` — the instant the reader wakes the App at — whatever the
-    /// read's millisecond part; a Mac carried from an earlier read counts by
-    /// its own read's age, not the snapshot's, and its answer is not counted
-    /// as one. NEGATIVE CONTROL: one millisecond earlier it still counts.
     #[test]
     fn a_fleet_need_counts_by_its_own_read_to_the_millisecond() {
         let fresh = u64::try_from(crate::fleet_glance::COUNT_FRESH.as_millis()).unwrap();
@@ -7428,7 +6181,6 @@ mod tests {
         };
         assert_eq!(count(&slot, read_at + fresh), 1, "the control");
         assert_eq!(count(&slot, read_at + fresh + 1), 0);
-        // mac-22 missed a read 60 s later and is carried with its own.
         let mut carried = fleet_slot(vec![mac("mac-busy", 0, 2, false)], read_at + 60_000);
         if let Some(snap) = carried.snapshot.as_mut() {
             std::sync::Arc::make_mut(snap)
@@ -7459,13 +6211,6 @@ mod tests {
         );
     }
 
-    /// THE FLEET SUBMENU: the Macs that need you or work, needs first, each
-    /// with Read in Full, Screen Sharing and Copy "ssh" (a hostless Mac gets
-    /// only Read); the quiet ones, the ones not answering, the ones whose key
-    /// is not proven (whatever they need) and the older ones (an unproven one
-    /// among them) folded into one row each; Read the Fleet Now last. With
-    /// every peer refusing with no route, the first row opens the Local
-    /// Network pane.
     #[test]
     fn the_fleet_submenu_lists_macs_needs_first_and_folds_the_rest() {
         let mut hostless = mac("x y", 0, 2, false);
@@ -7504,7 +6249,6 @@ mod tests {
             _ => None,
         };
         let shapes = shape(&menu);
-        // mac-17 (needs), mac-busy (3 working), the hostless one (2 working).
         let firsts: Vec<Vec<Shape>> = shapes
             .iter()
             .take(3)
@@ -7544,7 +6288,6 @@ mod tests {
             "1 older"
         );
         assert_eq!(tail(&menu), Some(StatusAction::ReadFleetNow));
-        // No route: the degrade line leads, and opens the pane.
         let mut dark = slot.clone();
         if let Some(snap) = dark.snapshot.as_mut() {
             std::sync::Arc::make_mut(snap).no_route = true;
@@ -7556,7 +6299,6 @@ mod tests {
                 ..
             })
         ));
-        // Not read yet: one line and Read the Fleet Now.
         let mut unread = slot.clone();
         unread.snapshot = None;
         assert_eq!(
@@ -7569,12 +6311,9 @@ mod tests {
         );
     }
 
-    /// Need (a) of design §12.2.1 as the entry's writer cut it (64 cells).
     const NEED_A_CUT: &str = "grant Screen Recording to com.aterm.aterm in System Settings \u{25b8} \
                               Priv\u{2026}";
 
-    /// A row whose published need is a harness's own entry naming `first`
-    /// and one more need, standing since `since`.
     fn harness_row(id: u64, title: &str, first: &str, since: i64) -> SessionRow {
         let facts = NeedFacts {
             attention: vec![crate::needs::AttentionFact {
@@ -7590,13 +6329,6 @@ mod tests {
         }
     }
 
-    /// A NEED ROW KEEPS ITS AGE AND CLIPS THE NEED (Autopilot v5 §12.2.1,
-    /// §12.2.6): under a 60-character tab label, a harness's need reads in
-    /// the worker's words, without `claude needs you:`, clipped to the room
-    /// the label, ` (+1 more)` and the age leave, so ` · 3m` ends the line
-    /// and the line is within [`LINE_MAX`]. NEGATIVE CONTROL (run for the
-    /// landing): main's `fold_clip(line, LINE_MAX)` over the whole line
-    /// (`need_line` reading no `harness`) drops ` · 3m`.
     #[test]
     fn a_need_row_keeps_its_age_and_clips_the_need() {
         let now = 10_000_i64;
@@ -7617,8 +6349,6 @@ mod tests {
             "{line:?}"
         );
         assert!(!line.contains("needs you"), "{line:?}");
-        // A label too long to leave the need room is clipped first: the age
-        // still ends the line.
         let long = "x".repeat(150);
         let g = local_glance(
             &[harness_row(1, &long, NEED_A_CUT, now - 180)],
@@ -7634,10 +6364,6 @@ mod tests {
         assert!(line.contains("\u{2014} grant Screen"), "{line:?}");
     }
 
-    /// A HARNESS'S NEED READS WHOLE ON THE BANNER (§12.2.1): the body is
-    /// `<tab>: <the need as the entry carries it> (+1 more)`, never `claude
-    /// needs you:`, and never clipped to the row's 72 bytes. NEGATIVE CONTROL
-    /// (run for the landing): the body built from `what` cuts the need.
     #[test]
     fn a_harness_need_reads_whole_on_the_banner() {
         let row = harness_row(1, "proj-api refactor", NEED_A_CUT, 0);
@@ -7645,10 +6371,6 @@ mod tests {
         assert_eq!(body, format!("proj-api refactor: {NEED_A_CUT} (+1 more)"));
     }
 
-    /// THE GLANCE'S SHOWN KEY FOLDS THE HARNESS'S WORDS (§12.2.3): two rows
-    /// whose needs share a word, a key and `what` but not the worker's words
-    /// are two shows. NEGATIVE CONTROL (run for the landing): `shown_key`
-    /// without `harness` calls them one.
     #[test]
     fn the_shown_key_folds_the_harness_words() {
         let a = harness_row(1, "t", NEED_A_CUT, 0);
@@ -7661,10 +6383,6 @@ mod tests {
         assert_ne!(shown_key(&a), shown_key(&b));
     }
 
-    /// The facts of a session whose loop told the window `needs` whole,
-    /// beside the needs owner's entry it put up for them
-    /// in its writer's form: the first need (short enough here to stand
-    /// whole), then ` (+N more)`.
     fn told_facts(needs: &[&str]) -> NeedFacts {
         let more = needs.len() - 1;
         let tail = if more == 0 {
@@ -7690,7 +6408,6 @@ mod tests {
         }
     }
 
-    /// A row whose loop told the window `needs`, standing since `since`.
     fn told_row(id: u64, title: &str, needs: &[&str], since: i64) -> SessionRow {
         SessionRow {
             need_since: Some(since),
@@ -7698,13 +6415,10 @@ mod tests {
         }
     }
 
-    /// `<title> 1` to `<title> n`: a session's `n` needs, by name.
     fn named_needs(title: &str, n: usize) -> Vec<String> {
         (1..=n).map(|i| format!("{title} {i}")).collect()
     }
 
-    /// The Needs you section of `menu`: every row after its header, up to
-    /// the separator that ends it.
     fn needs_section(menu: &[StatusRow]) -> &[StatusRow] {
         let end = menu
             .iter()
@@ -7713,7 +6427,6 @@ mod tests {
         &menu[1..end]
     }
 
-    /// The labels of the rows one level in among `rows`.
     fn further_labels(rows: &[StatusRow]) -> Vec<&str> {
         rows.iter()
             .filter_map(|r| match r {
@@ -7725,8 +6438,6 @@ mod tests {
             .collect()
     }
 
-    /// The label of `session`'s own row (its mark, then its title) among
-    /// `rows`.
     fn own_row<'a>(rows: &'a [StatusRow], title: &str) -> &'a str {
         rows.iter()
             .find_map(|r| match r {
@@ -7740,19 +6451,6 @@ mod tests {
             .unwrap_or_else(|| panic!("no row of {title}: {rows:?}"))
     }
 
-    /// EVERY FURTHER NEED READS ON A ROW OF ITS OWN, CAPPED (Autopilot v5
-    /// §12.2.1, §12.2.6): under each session's row, one row one
-    /// level in per need after its first. Sessions of 1, 3 and 5 needs get
-    /// 0, 2 and 2 such rows, the third's last such row counting the 2 past
-    /// them (` (+2 more)`) and no session's own row counting any, and no
-    /// overflow row. Five sessions of 5 needs get 8 in all, in the menu's
-    /// order (the first four two each, the last of them counting 2, the
-    /// fifth none, so its own row counts all 4); twelve sessions
-    /// of 2 needs list main's 10 (`and 2 more — Overview…`), 8 of them with
-    /// their row one level in and the ninth and tenth counting theirs. A
-    /// row one level in carries its need whole. NEGATIVE CONTROL (run as a
-    /// mutant for the landing): `NEED_MORE_ROWS = 0` draws no such row, and
-    /// need (b) (`three 2`) is nowhere.
     #[test]
     fn every_further_need_reads_on_a_row_of_its_own_capped() {
         let now = 10_000_i64;
@@ -7778,7 +6476,6 @@ mod tests {
             vec!["three 2", "three 3", "five 2", "five 3 (+2 more)"],
             "{section:#?}"
         );
-        // Each under its own session's row, in the menu's order.
         let order: Vec<&str> = section
             .iter()
             .filter_map(|r| match r {
@@ -7822,7 +6519,6 @@ mod tests {
             "no overflow row"
         );
 
-        // Five sessions of five: eight rows one level in, in the menu's order.
         let fives: Vec<Vec<String>> = (1..=5).map(|i| named_needs(&format!("s{i}"), 5)).collect();
         let rows: Vec<SessionRow> = fives
             .iter()
@@ -7854,7 +6550,6 @@ mod tests {
             own_row(section, "s5")
         );
 
-        // Twelve sessions: main's ten and its overflow row, which counts sessions.
         let rows: Vec<SessionRow> = (1..=12_u64)
             .map(|id| {
                 let first = format!("t{id} 1");
@@ -7896,13 +6591,6 @@ mod tests {
         assert!(own_row(section, "t10").contains(" (+1 more) "));
     }
 
-    /// A FURTHER NEED'S ROW GOES WHERE ITS SESSION GOES (§12.2.1, §12.2.6):
-    /// every row one level in acts, and acts as its session's own row does
-    /// (its `Go`, the same glance slot), so a click on any of a session's
-    /// rows brings that tab in front; the path `chrome` prints for it
-    /// (`row_at`, what `person menubar press` presses) names that row.
-    /// NEGATIVE CONTROL (run as a mutant for the landing): rows built as
-    /// [`StatusRow::Info`] are inert: no row one level in acts.
     #[test]
     fn a_further_needs_row_goes_where_its_session_goes() {
         let now = 10_000_i64;
@@ -7939,7 +6627,6 @@ mod tests {
             }
         }
         assert_eq!(further, 3, "{menu:#?}");
-        // Each session's rows go to that session.
         let go_of = |label: &str| {
             menu.iter().find_map(|r| match r {
                 StatusRow::Action {
@@ -7956,14 +6643,6 @@ mod tests {
         );
     }
 
-    /// `chrome` MARKS A ROW ONE LEVEL IN (§12.2.1, §12.2.6): a further need's
-    /// `statusmenu` line keeps the section's depth (no two-space lead, which
-    /// says a submenu's row to every reader of the lines) and says
-    /// ` indent=1` before its path, which stays last; its session's own row
-    /// says no indent. NEGATIVE CONTROL (run as a mutant for the landing):
-    /// printing the row one level in with a submenu row's two-space lead
-    /// gives `statusmenu   "b 2"`, which this reads as no row of the
-    /// section.
     #[test]
     fn menu_lines_marks_a_row_one_level_in() {
         let now = 10_000_i64;
@@ -7996,13 +6675,6 @@ mod tests {
         );
     }
 
-    /// THE NATIVE ITEM IS DRAWN ONE LEVEL IN (§12.2.1; the review of 2d):
-    /// every acting row of a composed menu built as `add_action` builds its
-    /// item (`action_item`, its hover aside: `-setToolTip:` opens
-    /// WindowServer), read back from AppKit — a further need's
-    /// `NSMenuItem` says `indentationLevel` 1, every other row 0. NEGATIVE
-    /// CONTROL (run as a mutant for the landing): `action_item` without its
-    /// `-setIndentationLevel:` reads 0 for `a 2` and `a 3`.
     #[cfg(target_os = "macos")]
     #[test]
     fn a_further_needs_item_is_drawn_one_level_in() {
@@ -8038,8 +6710,7 @@ mod tests {
                     (*enabled, *checked, *indent),
                 )
                 .expect("an item");
-                // SAFETY: `-indentationLevel` is `-(NSInteger)` with no side
-                // effects, on a live NSMenuItem.
+                // SAFETY: `-indentationLevel` is `-(NSInteger)` with no side effects, on a live NSMenuItem.
                 let level = unsafe {
                     crate::appkit::send_isize(item.id(), aterm_objc::sel!(indentationLevel))
                 };
@@ -8070,19 +6741,6 @@ mod tests {
         );
     }
 
-    /// A FURTHER NEED'S ROW SAYS WHOSE IT IS, AND THE COUNT FOLLOWS THE ROWS
-    /// (§12.2.1; the review of 2d): each row one level in carries a hover
-    /// naming its program and its session (`Claude Code in alpha needs this
-    /// too`; a tab named for its program, `Claude Code needs this too`),
-    /// which VoiceOver speaks where the eye reads the indent, and `chrome`
-    /// prints it (`tip="…"` before ` indent=1`); the session's own row has
-    /// none. A session's needs past its rows are counted on the LAST of them
-    /// (`a 3 (+2 more)`), never on its own row above them, where ` (+2
-    /// more)` would read as the rows under it. NEGATIVE CONTROLS (run as
-    /// mutants for the landing): further rows built with no tip; the count
-    /// on the session's own row (`more_past(shown)` there, as first built);
-    /// the tip naming the program and the tab alike (`Claude Code in Claude
-    /// Code`).
     #[test]
     fn a_further_needs_row_says_whose_it_is_and_the_count_follows_the_rows() {
         let now = 10_000_i64;
@@ -8112,8 +6770,6 @@ mod tests {
             ),
             "{lines:#?}"
         );
-        // A tab named for its program (an untitled Claude Code's) is not
-        // named twice.
         let g = local_glance(
             &[told_row(1, "Claude Code", &["c 1", "c 2"], now - 60)],
             &[],
@@ -8135,14 +6791,6 @@ mod tests {
         assert_eq!(tips, ["Claude Code needs this too"]);
     }
 
-    /// A TOLD NEED READS WHOLE WHERE THERE IS ROOM (§12.2.1): need
-    /// (a), longer than the 64 cells its entry carries, and need (b) told
-    /// with that entry: the banner's body says (a) whole and ` (+1 more)`;
-    /// the session's row clips (a) to the room its label and age leave,
-    /// keeps the age and counts nothing, since (b) has a row of its own one
-    /// level in, whole. NEGATIVE CONTROL (run as a mutant for the landing):
-    /// the verdict reading the entry's parse alone (`harness_ask` ignoring
-    /// the told set) gives the body (a) cut at 64 cells and no row for (b).
     #[test]
     fn a_told_need_reads_whole_on_the_banner_and_the_menu() {
         const NEED_A: &str = "grant Screen Recording to com.aterm.aterm in System Settings \
@@ -8151,7 +6799,6 @@ mod tests {
         const NEED_B: &str = "the release credential (~/.aterm/release-credentials.toml) to \
                               sign 0.48.0";
         let now = 10_000_i64;
-        // The entry carries (a) as its writer cuts it: 64 cells.
         let mut facts = told_facts(&[NEED_A, NEED_B]);
         let cut: String = NEED_A.chars().take(63).chain(['\u{2026}']).collect();
         let entry = format!("claude needs you: {cut} (+1 more) \u{2014} carrying on");

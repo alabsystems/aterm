@@ -1,10 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The Windows volume table: its pure assembly and placement, held on every
-//! platform over recorded mount-manager answers, then the live reads on
-//! Windows (the mount and object managers, `GetDiskFreeSpaceExW`, file
-//! identity) and the layout of the one hand-declared struct.
+//! The Windows volume table.
 
 use super::*;
 
@@ -26,8 +23,6 @@ fn letters(l: &[(char, Option<&str>)]) -> Vec<(char, Option<String>)> {
 }
 
 /// The volumes of the owner's box (`C:` and two volumes mounted nowhere),
-/// plus a data volume at a folder and a letter, an optical drive, a `subst`
-/// letter and a mapped share.
 fn box_inputs() -> (Vec<VolumeSeen>, Vec<(char, Option<String>)>) {
     (
         vec![
@@ -77,9 +72,6 @@ fn a_multi_sz_lists_its_strings() {
 }
 
 /// Only a numbered `\Device\HarddiskVolume` is local; optical and floppy
-/// media are removable; `\??\X:\…` is a `subst`; everything else — a
-/// redirector, a user-mode file system, a `subst` onto a share, a device
-/// nobody measured — is remote.
 #[test]
 fn a_dos_target_is_classed_by_an_allowlist() {
     for (target, want) in [
@@ -113,9 +105,6 @@ fn a_dos_target_is_classed_by_an_allowlist() {
 }
 
 /// Every mount point of every volume and every other letter is listed, each
-/// classed by its device; a volume mounted nowhere adds nothing; a `subst`
-/// letter is local and keyed as the volume it points into; the network's
-/// synthetic mount is remote. Read whole: complete.
 #[test]
 fn the_windows_table_lists_every_mount_point_and_letter() {
     let t = box_table();
@@ -153,8 +142,6 @@ fn the_windows_table_lists_every_mount_point_and_letter() {
 }
 
 /// A letter this session sees pointing elsewhere than its volume (a
-/// per-session `subst` or `net use` over it) is read as this session sees
-/// it; the volume keeps its other mount points.
 #[test]
 fn a_letter_this_session_points_elsewhere_is_read_as_it_points() {
     let (v, _) = box_inputs();
@@ -176,9 +163,6 @@ fn a_letter_this_session_points_elsewhere_is_read_as_it_points() {
 }
 
 /// Whatever was not read leaves the table incomplete: the enumeration cut,
-/// a volume's mount points or device unread, a letter's target unread, more
-/// than [`MAX_MOUNTS`] mounts. NEGATIVE CONTROL: the same inputs read whole
-/// are complete.
 #[test]
 fn an_unread_volume_or_letter_makes_the_table_incomplete() {
     let (v, l) = box_inputs();
@@ -238,11 +222,6 @@ fn an_unread_volume_or_letter_makes_the_table_incomplete() {
 }
 
 /// The Windows rule places every spelling of a path: verbatim or plain, any
-/// case, a trailing separator; the longest mount point wins, component by
-/// component; a volume GUID path is placed through that volume's mount; a
-/// `subst` letter is followed to where it points; a UNC path is the
-/// network's, remote; what cannot be placed is `None`. NEGATIVE CONTROL: the
-/// unix rule places the verbatim spelling nowhere.
 #[test]
 fn a_windows_path_finds_its_mount_in_any_spelling() {
     let t = box_table();
@@ -278,11 +257,6 @@ fn a_windows_path_finds_its_mount_in_any_spelling() {
 }
 
 /// `mounts_under` by the Windows rule sees a folder mount point inside a
-/// directory in any spelling of it (through a `subst` letter too), and
-/// nothing beside it; a directory that cannot be placed answers every mount;
-/// a `subst` letter is never listed. NEGATIVE CONTROL: the unix rule misses
-/// the verbatim spelling's mount on Windows (a missed folder mount is the
-/// whole-removal fence passing over another volume).
 #[test]
 fn mounts_under_sees_a_folder_mount_inside_in_any_spelling() {
     let (mut v, mut l) = box_inputs();
@@ -324,15 +298,6 @@ fn mounts_under_sees_a_folder_mount_inside_in_any_spelling() {
 }
 
 /// The table's rule relates what the table-less one cannot: a path on a
-/// `subst` letter lies under the directory the letter names, and a path
-/// spelled through one mount point of a volume lies under a directory
-/// spelled through another (the box's data volume is at `D:\`, at
-/// `C:\mnt\data` and here at `C:\alias` too). A share or a network letter
-/// may be the local disk again, so beside a local path it is not placed; so
-/// is a letter the table does not list, and anything but "under" in a table
-/// that is not complete. NEGATIVE CONTROLS: the unix rule and the table-less
-/// key answer a false "not under" (or nothing) for the same pairs, and two
-/// unrelated directories still answer `Some(false)`.
 #[test]
 fn the_tables_rule_relates_every_spelling_of_a_directory() {
     let (mut v, l) = box_inputs();
@@ -420,11 +385,6 @@ fn the_tables_rule_relates_every_spelling_of_a_directory() {
 }
 
 /// A mount point is found in any spelling: verbatim or plain, any case,
-/// through a `subst` letter, through another mount point of the volume it
-/// is a folder of; a `subst` letter itself is none; what cannot be placed,
-/// or is not found in a table that is not complete, is `None`. NEGATIVE
-/// CONTROL: `Path` equality against [`Table::points`] misses every other
-/// spelling.
 #[test]
 fn a_mount_point_is_found_in_any_spelling() {
     let (mut v, mut l) = box_inputs();
@@ -468,10 +428,6 @@ fn a_mount_point_is_found_in_any_spelling() {
 }
 
 /// A mount point the key cannot place leaves every path unplaced (it may
-/// lie on that point's volume, never on the one above it), and is listed
-/// by every `mounts_under`. A mount point is keyed verbatim, as the mount
-/// manager names it: a folder named `data.` is a mount point. NEGATIVE
-/// CONTROL: without the unkeyable point the same path places on `C:\`.
 #[test]
 fn an_unkeyable_mount_point_places_nothing_under_the_drive() {
     let mut v = vec![
@@ -501,11 +457,6 @@ fn an_unkeyable_mount_point_places_nothing_under_the_drive() {
 }
 
 /// A folder mount point spelled through a letter this session sees pointing
-/// elsewhere (a per-session `net use` over `D:`) is read as this session
-/// reads the letter: a path through it lies on the share. A folder spelled
-/// through a letter no volume read here owns is kept, and the table proves
-/// nothing. NEGATIVE CONTROL: with the session's `D:` the volume's own, the
-/// folder mount holds the path.
 #[test]
 fn a_folder_mount_on_a_letter_this_session_overrides_is_read_as_it_points() {
     let x = "Volume{12345678-9abc-4def-8123-456789abcdef}";
@@ -549,7 +500,6 @@ fn a_folder_mount_on_a_letter_this_session_overrides_is_read_as_it_points() {
 }
 
 /// `GetLogicalDrives`' mask names the letters, bit 0 `A:`; a mask naming
-/// none is the call failing, never a machine without drives.
 #[test]
 fn a_drive_mask_with_no_letter_is_a_failed_read() {
     assert_eq!(drive_letters(0), None);
@@ -562,8 +512,6 @@ fn a_drive_mask_with_no_letter_is_a_failed_read() {
 }
 
 /// A mount's key: a Windows volume GUID name keys as [`VolumeKey::Volume`],
-/// lowercase, spelled `volume:{…}`; an APFS container as before; no
-/// container, no key.
 #[test]
 fn a_mount_keys_its_volume_by_guid() {
     let mut m = box_table().mounts[1].clone();
@@ -589,8 +537,6 @@ fn a_mount_keys_its_volume_by_guid() {
 }
 
 /// [`long_spelling_in`] of `p` against `t` by the Windows rule, the file
-/// system's long spelling injected (`answer`): what it gave back, and what
-/// the file system was asked to spell long (`None`: it was not asked).
 fn long_of(p: &str, t: &Table, answer: Option<&str>) -> (String, Option<String>) {
     let mut asked = None;
     let got = long_spelling_in(Path::new(p), t, true, |through| {
@@ -601,18 +547,6 @@ fn long_of(p: &str, t: &Table, answer: Option<&str>) -> (String, Option<String>)
 }
 
 /// THE ONE 8.3 RULE ([`Table::long_spelling`]), held on every platform: a
-/// path the key refuses only for its short names is spelled long when the
-/// table places the part before them on a local, non-automounted mount —
-/// `C:\`, and a `subst` letter onto it — the file system asked for the
-/// part through the LAST short name alone, verbatim, and the names after it
-/// appended as they are, so a path whose tail does not exist yet (a tab's
-/// directory before it is made) or no longer does places as its long
-/// spelling would. NEGATIVE CONTROLS: the file system is never asked for a
-/// path that keys already, one on a share (a mapped letter, a UNC path) or
-/// on an automounted optical drive (a stalled one answers by blocking), one
-/// refused for another reason too, or by the rule of unix; and a failed
-/// expansion, or one that names a path the key still refuses, leaves the
-/// path as it was — unplaceable, so held.
 #[test]
 fn a_short_spelled_path_is_expanded_only_on_a_local_volume() {
     let t = box_table();
@@ -670,10 +604,6 @@ fn a_short_spelled_path_is_expanded_only_on_a_local_volume() {
     assert_eq!((unix.as_ref(), asked), (Path::new(short), false));
 }
 
-// Live, on Windows: the mount and object managers, one volume's figures, and
-// file identity. Each reads only this test's own scratch files and the
-// volumes' roots.
-
 #[cfg(windows)]
 fn system_root() -> PathBuf {
     let drive = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".to_owned());
@@ -686,7 +616,6 @@ fn scratch() -> aterm_tempfile::TempDir {
 }
 
 /// The live table is read whole and lists the system drive's root, local,
-/// on its volume GUID, and the network's synthetic mount.
 #[cfg(windows)]
 #[test]
 fn the_live_table_lists_the_system_drive_local_and_whole() {
@@ -710,8 +639,6 @@ fn the_live_table_lists_the_system_drive_local_and_whole() {
 }
 
 /// The system drive is a fixed disk, through its own mount and through the
-/// mount `mount_of` places a path on it on in any spelling; the network's
-/// synthetic mount is not.
 #[cfg(windows)]
 #[test]
 fn the_system_drive_is_fixed_and_the_network_is_not() {
@@ -736,9 +663,6 @@ fn the_system_drive_is_fixed_and_the_network_is_not() {
 }
 
 /// The home directory, read through the verbatim spelling `canonicalize`
-/// answers, is on a local volume with free space below its size; its plain
-/// and lowercased spellings read the same volume; the reading's device is
-/// the home's own [`file_id`] device.
 #[cfg(windows)]
 #[test]
 fn the_home_volume_reads_through_any_spelling() {
@@ -768,9 +692,6 @@ fn the_home_volume_reads_through_any_spelling() {
 }
 
 /// A file's identity is the same through every open and every spelling (a
-/// handle already open, too), on the device its volume's reading names; a
-/// second file differs in number only, and following makes no difference
-/// for a plain file.
 #[cfg(windows)]
 #[test]
 fn a_file_id_is_stable_and_on_its_volumes_device() {
@@ -803,8 +724,6 @@ fn a_file_id_is_stable_and_on_its_volumes_device() {
 }
 
 /// A path past `MAX_PATH` (`LongPathsEnabled` is 0 on most machines; a cargo
-/// profile's paths run past it) has an identity in its plain spelling and
-/// its verbatim one alike, and places on its volume.
 #[cfg(windows)]
 #[test]
 fn a_path_past_max_path_has_an_identity_and_a_volume() {
@@ -827,11 +746,6 @@ fn a_path_past_max_path_has_an_identity_and_a_volume() {
 }
 
 /// A missing path has no identity, and neither has any file on a volume
-/// that keeps no file ids (FAT, exFAT): `None`, never a narrower serial.
-/// Every FAT or exFAT volume whose file system this reader can name is
-/// checked, and how many were is printed: a machine with none readable (the
-/// owner's EFI FAT32 volume is readable, and refuses `FileIdInfo` with
-/// `ERROR_INVALID_PARAMETER`) checks only the missing paths.
 #[cfg(windows)]
 #[test]
 fn a_missing_path_or_a_volume_without_file_ids_has_none() {
@@ -857,17 +771,10 @@ fn a_missing_path_or_a_volume_without_file_ids_has_none() {
 }
 
 /// A directory junction answers as itself unless followed: `follow` gives
-/// its target's identity, and not following gives the link's own, on the
-/// same device. The table's rule is lexical, so a path recorded through the
-/// link is canonicalized first (which spells the target): then it lies
-/// under the target by [`Table::is_under`]. NEGATIVE CONTROL: the two
-/// answers differ, so a fence that asked for one cannot be handed the
-/// other.
 #[cfg(windows)]
 #[test]
 fn a_junction_answers_as_itself_unless_followed() {
     let dir = scratch();
-    // Long names, verbatim: a temp directory may be spelled by a short name.
     let root = std::fs::canonicalize(dir.path()).expect("canonical scratch");
     let target = root.join("target-dir");
     std::fs::create_dir(&target).expect("target");
@@ -889,21 +796,6 @@ fn a_junction_answers_as_itself_unless_followed() {
 }
 
 /// A real folder with a long name, read through the 8.3 short spelling the
-/// file system generated for it (`GetShortPathNameW`), is spelled long by
-/// [`Table::long_spelling`] — the same file (its [`file_id`]), placed under
-/// the folder by [`Table::is_under`] and on its volume by [`mount_of`] — as
-/// are a file inside it and a path inside it that does not exist yet (a
-/// tab's directory before it is made: the names after the last short one
-/// are never asked about). A JUNCTION among the short names keeps its own
-/// long name, as in the long spelling (the branch's review, rev4-1): a
-/// directory reached through `folder\a junction with a long name` is under
-/// the folder, as its long spelling is, and not under the junction's target,
-/// as its long spelling is not. NEGATIVE CONTROL: the short spelling itself
-/// places nowhere ([`Table::is_under`] answers `None`), so each hit is the
-/// expansion's. PREMISE, stated where it fails: the volume holding the
-/// scratch folder generates short names (`fsutil 8dot3name query`); one
-/// that does not cannot hand a process this spelling, and the test says so
-/// rather than passing on nothing.
 #[cfg(windows)]
 #[test]
 fn a_short_spelling_of_a_real_folder_is_spelled_long() {
@@ -974,12 +866,6 @@ fn a_short_spelling_of_a_real_folder_is_spelled_long() {
 }
 
 /// A quiet guard ([`crate::quiet_errors`]) holds this thread's
-/// critical-error and open-file boxes off for its life and restores the mode
-/// it found: guards nest, the inner one handing the outer's mode back.
-/// NEGATIVE CONTROL: a fresh thread, holding none, reads them on — the
-/// thread's own mode (`GetThreadErrorMode`), which a process-wide mode does
-/// not set — so a seam that reads [`crate::errors_quiet`] inside a thread
-/// tells a guarded thread from one that is not.
 #[cfg(windows)]
 #[test]
 fn a_quiet_guard_holds_the_boxes_off_for_its_life_alone() {
@@ -1007,7 +893,6 @@ fn a_quiet_guard_holds_the_boxes_off_for_its_life_alone() {
 }
 
 /// The hand-declared `FILE_ID_INFO` has the SDK's layout: a `ULONGLONG`
-/// serial, then the 16-byte `FILE_ID_128`, 24 bytes, 8-aligned.
 #[cfg(windows)]
 #[test]
 fn file_id_info_has_the_sdk_layout() {
@@ -1019,11 +904,6 @@ fn file_id_info_has_the_sdk_layout() {
 }
 
 /// AN OPEN SOMEONE ELSE NAMED RAISES NO BOX ([`crate::quiet_errors`]):
-/// while the guard lives this thread's critical-error and open-file boxes
-/// are off, every other bit of its mode kept, and after it — an unwind too
-/// — the mode is the one it had. On a fresh thread whose mode is set
-/// without those bits first (NEGATIVE CONTROL: they are off before and
-/// after).
 #[cfg(windows)]
 #[test]
 fn quiet_errors_keeps_the_threads_other_bits_and_restores_them() {

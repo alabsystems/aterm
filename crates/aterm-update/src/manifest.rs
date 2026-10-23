@@ -1,29 +1,15 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The two TOML records the updater reads/writes: the release-side **manifest**
-//! (`aterm-appcast.toml`, an attached release asset, emitted by the ship tool —
-//! `targo --unverified ship cut`, crate aterm-release) and the local **ready marker**
-//! (`ready.toml`, written last when staging completes — its presence is the sole
-//! "ready" signal).
+//! Release-side appcast manifest (`aterm-appcast.toml`) and local stage-ready marker
+//! (`ready.toml`) codecs.
 
 use std::path::Path;
 
 use aterm_durable::Flush;
 use serde::{Deserialize, Serialize};
 
-/// Write `text` to `path` atomically: temp file, a flush, rename, best-effort directory
-/// flush (as `aterm_update_core::sentinel` writes the boot sentinel), each flush `flush`:
-/// [`Flush::Durable`] where something beyond this device's write order depends on the
-/// record, [`Flush::Ordered`] where the writes that depend on it land on its device
-/// ([`Flush::ordered_if_same_device`] when they are in the install root). Either way the
-/// temp's bytes land before the rename that publishes them.
-/// `trial.toml` and `installed-receipt.toml` take the tier of the sentinel that points at
-/// them, and never a rename ahead of their bytes: APFS can commit a rename while the data
-/// pages stay dirty for ~30 s, and a zero-length trial marker beside an armed sentinel
-/// makes the updater disarm instead of revert, keeping a crash-looping build. An
-/// unsupported sync (network home, some FUSE volumes) degrades to an unflushed write; a
-/// real I/O error fails it.
+/// Write `text` to `path` atomically.
 pub(crate) fn write_durable(
     path: &Path,
     text: &str,
@@ -61,75 +47,40 @@ pub(crate) fn write_durable(
     Ok(())
 }
 
-/// The client's view of the release manifest (`aterm-appcast.toml`): the fields the updater
-/// consumes, filled by [`Manifest::parse`] from the shared
-/// `aterm_update_core::manifest::Manifest` wire type the ship tool serializes, so the
-/// schema and its validation live in one place.
+/// The client's view of the release manifest (`aterm-appcast.toml`).
 #[derive(Debug, Clone)]
 pub struct Manifest {
-    /// Manifest format version (the ship tool emits `schema = 1`). Absent ⇒ 0. Tests
-    /// only: the "newer than supported" rejection lives in
-    /// `aterm_update_core::manifest::Manifest`, which [`Manifest::parse`] runs first.
+    /// Manifest format version (the ship tool emits `schema = 1`).
     #[cfg(test)]
     pub schema: u32,
-    /// Human semver, e.g. `"0.2.0"`.
+    /// Human semver, e.g.
     pub version: String,
-    /// Monotonic build number, unique per published build: claimed from the
-    /// append-only `RELEASES.ledger` as `max(last+1, unix-epoch-now)` at cut time
-    /// (== the bundle's sealed `CFBundleVersion`). The downgrade gate.
+    /// Monotonic build number, unique per published build.
     pub build_number: u64,
-    /// Full git commit hash of the source the release was built from, binding the build
-    /// number to an exact commit. Every ship-tool manifest carries it; absent ⇒ None (a
-    /// hand-written or older manifest).
+    /// Full git commit hash of the source the release was built.
     pub commit: Option<String>,
     /// SHA-256 (lowercase hex) of the DMG asset.
     pub sha256: String,
-    /// The DMG asset's file name within the release, e.g. `"aterm-0.2.0.dmg"`.
+    /// The DMG asset's file name within the release, e.g.
     pub dmg: String,
-    /// The container's browser download URL as the publisher wrote it:
-    /// `https://github.com/{owner}/{repo}/releases/download/v{version}/{dmg}`. Never
-    /// followed: the client downloads from the URL it derives for the tag the channel head
-    /// names. It binds that pointer to the signed bytes (`github::web_container_url_agrees`):
-    /// the tag must be `v` + [`Self::version`] and the tag inside this URL, so a signed
-    /// appcast copied onto another tag cannot be elected under it. Absent ⇒ None (a
-    /// hand-written manifest), which the check refuses.
+    /// The container's browser download URL as the publisher wrote it.
     pub url: Option<String>,
-    /// The updater container's file name, e.g. `"aterm-0.2.0-mac.zip"`: the same signed
-    /// bundle as the DMG, packed with `ditto`. Preferred for staging when present
-    /// ([`crate::install::stage_from_zip`]): after a seamless overlap update the surviving
-    /// process is an orphan whose launchd job exited, and `hdiutil attach` fails ENXIO
-    /// there (DiskImages needs a live bootstrap context). Absent ⇒ None, and the client
-    /// falls back to the DMG.
+    /// The updater container's file name, e.g.
     pub zip: Option<String>,
-    /// SHA-256 (lowercase hex) of the zip asset. Absent ⇒ None. A zip without a
-    /// digest is never staged from — there would be nothing to check the bytes
-    /// against — so the client falls back to the DMG.
+    /// SHA-256 (lowercase hex) of the zip asset.
     pub zip_sha256: Option<String>,
-    /// Optional operator **apply floor**: clients refuse to stage/apply any build whose
-    /// `build_number` is below this, even a genuine signed one, so the owner can retire a
-    /// bad-but-genuine release (a "yank"). Ratcheted monotonically client-side
-    /// ([`Floor`]); the release cutter carries a raised channel floor into every successor
-    /// manifest. Absent ⇒ 0 (no floor).
+    /// Optional operator **apply floor**.
     pub min_build: Option<u64>,
-    /// Optional "what changed" notes (this release's CHANGELOG.md section, verbatim, as in
-    /// the GitHub release notes), shown by the updater's status query and the "Check for
-    /// Updates" menu. Absent ⇒ None.
+    /// Optional "what changed" notes.
     pub changelog: Option<String>,
-    /// Attribution: which machine signed this release (`"m3"`). The id sits inside the
-    /// signed appcast bytes, so a genuine signature by one machine cannot be relabelled as
-    /// another, and the roster maps id to public key, so a stolen key cannot claim
-    /// another id. Absent ⇒ None (a release cut before the roster).
+    /// Attribution: which machine signed this release (`"m3"`).
     pub machine_id: Option<String>,
-    /// The `roster_seq` that authorized [`Self::machine_id`] — the cross-check that stops
-    /// an old roster being paired with a new release after a machine is revoked.
-    /// Absent ⇒ None.
+    /// The `roster_seq` that authorized [`Self::machine_id`].
     pub roster_seq: Option<u64>,
 }
 
 impl Manifest {
-    /// Parse a manifest from TOML text via the shared `aterm-update-core`
-    /// validator (schema ceiling, `min_build <= build_number` floor sanity),
-    /// so publisher and client can never drift.
+    /// Parse a manifest from TOML text via the shared `aterm-update-core` validator.
     pub fn parse(text: &str) -> Result<Self, String> {
         let m = aterm_update_core::manifest::Manifest::parse(text)?;
         Ok(Self {
@@ -151,17 +102,14 @@ impl Manifest {
     }
 }
 
-/// The local staging marker. Written atomically (temp + rename) AFTER the staged
-/// bundle is fully materialized and verified, so a reader never sees a
-/// half-staged update.
+/// The local staging marker.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Ready {
     /// Build number of the staged bundle (must exceed the running build to apply).
     pub build_number: u64,
     /// Human semver of the staged bundle (for log lines).
     pub version: String,
-    /// Git commit of the staged bundle's source, copied from the manifest at stage time
-    /// (queryable via status without re-fetching). Absent ⇒ None.
+    /// Git commit of the staged bundle's source, copied from the manifest at stage time.
     #[serde(default)]
     pub commit: Option<String>,
     /// SHA-256 of the DMG the staged bundle came from (stage-time integrity record).
@@ -170,52 +118,30 @@ pub struct Ready {
     pub team_id: String,
     /// RFC3339 UTC time the bundle was staged.
     pub staged_at: String,
-    /// "What changed" notes copied from the manifest at stage time, so the version +
-    /// changelog is queryable (status / menu) without re-fetching. Absent ⇒ None.
+    /// "What changed" notes copied from the manifest at stage time.
     #[serde(default)]
     pub changelog: Option<String>,
-    /// Attribution recorded at stage time: which machine's key authorized this bundle, and
-    /// under which roster generation. Every later reader matches it against the floor's
-    /// durable revocation set ([`Floor::withdraws`]); a revocation no check has observed
-    /// yet is what [`Self::roster_confirmed_at`] bounds. Absent ⇒ None (an older marker or
-    /// an unattributed release): `None` means unknown, never "exempt".
+    /// Attribution recorded at stage time.
     #[serde(default)]
     pub machine_id: Option<String>,
     /// See [`Self::machine_id`].
     #[serde(default)]
     pub roster_seq: Option<u64>,
-    /// RFC3339 UTC of when the last check that confirmed this stage's authorization read
-    /// its machine roster ([`crate::install::confirm_roster_authorization`]): the read, not
-    /// the write, so a slow download before the publish adds nothing to the window. A
-    /// revocation reaches this Mac only through a check, and the boot swap runs before any
-    /// check can, so no lane swaps a stage confirmed [`ROSTER_FRESHNESS_SECS`] or more ago
-    /// ([`Self::roster_authorization_stale`]); it waits for the check after launch
-    /// ([`Self::needs_roster_reconfirmation`]). Skipped while empty: an older build ignores
-    /// it, and this build waits for a check on a marker without it.
+    /// RFC3339 UTC of when the last check that confirmed this stage's authorization read.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub roster_confirmed_at: Option<String>,
 }
 
-/// How long a stage's roster confirmation ([`Ready::roster_confirmed_at`]) stays good
-/// for a swap: a day. Inside it, a revocation published after the last confirming
-/// check is the residual (docs/RELEASE-KEYS.md); past it, the swap waits for a check.
+/// How long a stage's roster confirmation ([`Ready::roster_confirmed_at`]) stays good for a swap.
 pub(crate) const ROSTER_FRESHNESS_SECS: u64 = 24 * 60 * 60;
 
-/// How old a confirmation may grow before the check re-reads the channel head's roster
-/// even though the head has not moved: an hour. A client confirms only while it runs, so
-/// re-read hourly the stamp a quit leaves is at most this plus one check interval old, and
-/// only a gap of nearly a day makes a launch wait. The cost is a few small GETs an hour,
-/// only while a newer stage is waiting.
+/// How old a confirmation may grow before the check re-reads the channel head's roster.
 pub(crate) const ROSTER_RECONFIRM_AFTER_SECS: u64 = 60 * 60;
 
 /// How far ahead of this Mac's clock a confirmation may sit and still count: a clock
-/// stepped back by more (an NTP correction, a hand-set date) leaves the age
-/// unknowable, which reads as stale — the next check stamps it again.
 const ROSTER_CONFIRMATION_SKEW_SECS: u64 = 60;
 
-/// The words every stale-confirmation refusal carries, so the check that confirms
-/// the stage can withdraw the refusal it answers from the ledger, and the window's
-/// apply lane can tell the wait from a failure (`crate::is_roster_confirmation_wait`).
+/// The words every stale-confirmation refusal carries.
 pub(crate) use crate::ROSTER_UNCONFIRMED_KEY;
 
 impl Ready {
@@ -230,9 +156,7 @@ impl Ready {
         aterm_toml::to_string(self).map_err(|e| format!("serialize ready marker: {e}"))
     }
 
-    /// Cheap structural identity gate shared by apply and status surfaces. A
-    /// merely parseable marker is not enough to advertise an update: shipping
-    /// markers carry a full 40-hex source commit and 64-hex artifact digest.
+    /// Cheap structural identity gate shared by apply and status surfaces.
     pub(crate) fn has_canonical_identity(&self) -> bool {
         self.build_number != 0
             && self
@@ -242,15 +166,7 @@ impl Ready {
             && aterm_codec::hex::is_hex(self.dmg_sha256.trim(), 64)
     }
 
-    /// Whether this marker names a genuinely published local stage: the bundle directory
-    /// (never a symlink) is the capability the checker, status UI and apply path must agree
-    /// exists. Binds the marker cheaply to the bundle's XML Info.plist build and source
-    /// stamp, spawning no helper; full signature/policy verification stays at apply time.
-    /// The floor must still admit it: a build since yanked, or signed by a machine since
-    /// revoked ([`Floor::withdraws`]), is no update even before anything retires the stage.
-    /// A floor or quarantine record this read could not get through admits nothing this
-    /// pass ([`Floor::read_for_gate`], [`artifact_quarantined_for_gate`]), and nothing
-    /// retires a stage on this answer.
+    /// Whether this marker names a genuinely published local stage.
     pub(crate) fn is_publishable(&self, staging: &crate::paths::Staging) -> bool {
         self.is_published_bundle(staging)
             && Floor::read_for_gate(&staging.floor()).is_ok_and(|floor| {
@@ -260,26 +176,14 @@ impl Ready {
             })
     }
 
-    /// [`Self::is_publishable`] without the floor: the marker names a real published,
-    /// non-quarantined bundle that rebinds to it. What a lane that retires a withdrawn
-    /// stage looks for.
-    ///
-    /// A quarantined artifact is never an update: a stager that decided before a
-    /// crash-loop revert (or an older build's, which never asks) can publish it after the
-    /// revert, and every reader must see nothing staged. A quarantine record this read
-    /// could not get through is no word that it is not quarantined: `false` this pass
-    /// ([`artifact_quarantined_for_gate`]), so a lane that RETIRES on `false` judges the
-    /// records itself and asks [`Self::names_published_bundle`].
+    /// [`Self::is_publishable`] without the floor.
     pub(crate) fn is_published_bundle(&self, staging: &crate::paths::Staging) -> bool {
         self.names_published_bundle(staging)
             && artifact_quarantined_for_gate(staging, self.build_number, &self.dmg_sha256)
                 == Ok(false)
     }
 
-    /// [`Self::is_published_bundle`] without the records: the marker carries a canonical
-    /// identity, and the stage is a real directory (never a symlink) whose `Info.plist`
-    /// rebinds to it. No ledger is read, so the answer is the same however a read of
-    /// the floor or the quarantine would have gone.
+    /// [`Self::is_published_bundle`] without the records.
     pub(crate) fn names_published_bundle(&self, staging: &crate::paths::Staging) -> bool {
         self.has_canonical_identity()
             && std::fs::symlink_metadata(&staging.staged_app)
@@ -287,22 +191,17 @@ impl Ready {
             && cheap_staged_identity_matches(self, &staging.staged_app) == Some(true)
     }
 
-    /// Read only a marker that passes [`Self::is_publishable`]. This is the one
-    /// shared staged-ready read used by background checks and status surfaces.
+    /// Read only a marker that passes [`Self::is_publishable`].
     pub(crate) fn read_publishable(staging: &crate::paths::Staging) -> Option<Self> {
         Self::read(&staging.ready).filter(|ready| ready.is_publishable(staging))
     }
 
-    /// Read a marker that passes [`Self::is_published_bundle`] — published, whether or
-    /// not the floor still admits it.
+    /// Read a marker that passes [`Self::is_published_bundle`].
     pub(crate) fn read_published_bundle(staging: &crate::paths::Staging) -> Option<Self> {
         Self::read(&staging.ready).filter(|ready| ready.is_published_bundle(staging))
     }
 
-    /// Seconds since [`Self::roster_confirmed_at`] at `now`, or `None` when there is
-    /// no confirmation this clock can date: none recorded (an older build's marker),
-    /// a stamp that is not this module's RFC3339 shape, or one more than
-    /// [`ROSTER_CONFIRMATION_SKEW_SECS`] ahead of `now`.
+    /// Seconds since [`Self::roster_confirmed_at`] at `now`.
     pub(crate) fn roster_confirmation_age(&self, now: u64) -> Option<u64> {
         let stamp = self.roster_confirmed_at.as_deref()?;
         let confirmed = u64::try_from(aterm_types::rfc3339::parse_utc(stamp)?).ok()?;
@@ -312,15 +211,7 @@ impl Ready {
         Some(now.saturating_sub(confirmed))
     }
 
-    /// Why no lane may swap this stage in at `now` (its roster authorization was last
-    /// confirmed [`ROSTER_FRESHNESS_SECS`] or more ago, or never on this Mac), or `None`
-    /// when it may. A passing refusal: a fact about how long ago a check ran, never a
-    /// verdict on the build, so nothing is retired, memoized or backed off, and the check
-    /// that confirms the stage ends it.
-    ///
-    /// `armed` is whether this build holds a roster tier at all
-    /// (`aterm_update_core::pins::roster_tier_armed`): with no paper master pinned
-    /// there is no roster to confirm against, and the gate is not asked.
+    /// Why no lane may swap this stage in at `now`.
     pub(crate) fn roster_authorization_stale(&self, now: u64, armed: bool) -> Option<String> {
         if !armed {
             return None;
@@ -347,10 +238,7 @@ impl Ready {
         )))
     }
 
-    /// Whether a check should re-read the channel head's machine roster for this
-    /// stage even though the head has not moved: its confirmation is
-    /// [`ROSTER_RECONFIRM_AFTER_SECS`] old or more, or missing, on a build with a
-    /// roster tier. The steady state otherwise reads nothing but the pointer.
+    /// Whether a check should re-read the channel head's machine roster for this stage.
     pub(crate) fn needs_roster_reconfirmation(&self, now: u64, armed: bool) -> bool {
         armed
             && self
@@ -360,8 +248,6 @@ impl Ready {
 }
 
 /// Bind the required XML Info.plist. `None` means the cheap binding is
-/// unavailable; it therefore grants no authority. `Some(false)` means a
-/// present plist is malformed, unsafe, or disagrees with the marker.
 fn cheap_staged_identity_matches(ready: &Ready, app: &Path) -> Option<bool> {
     let plist = app.join("Contents/Info.plist");
     let metadata = match std::fs::symlink_metadata(&plist) {
@@ -392,14 +278,9 @@ fn cheap_staged_identity_matches(ready: &Ready, app: &Path) -> Option<bool> {
     )
 }
 
-/// Extract the string immediately following one exact XML plist key. Release
-/// bundles are emitted as XML; missing/binary/malformed plists fail closed and
-/// force a fresh verified stage.
+/// Extract the string immediately following one exact XML plist key.
 pub(crate) fn xml_plist_string<'a>(text: &'a str, key: &str) -> Option<&'a str> {
     let after_key = text.find(key)? + key.len();
-    // The value element must immediately follow the key (modulo whitespace).
-    // Searching arbitrarily far forward would let a malformed/intervening key's
-    // string be mis-bound to the release identity we are authenticating.
     let value_tail = text[after_key..].trim_start().strip_prefix("<string>")?;
     let string_end = value_tail.find("</string>")?;
     let value = value_tail[..string_end].trim();
@@ -427,15 +308,13 @@ impl InstalledReceipt {
         })
     }
 
-    /// Read a well-formed receipt. Missing, oversized, malformed, or non-canonical
-    /// data fails closed as no proof.
+    /// Read a well-formed receipt.
     pub(crate) fn read(path: &Path) -> Option<Self> {
         let parsed: Self = aterm_toml::from_str(&crate::read_ledger_text(path)?).ok()?;
         Self::canonical(parsed.build_number, &parsed.git_commit, &parsed.dmg_sha256)
     }
 
     /// Atomically replace the prior installed receipt after a successful swap.
-    /// Failure is returned so the caller can keep the install transaction honest.
     pub(crate) fn record(
         path: &Path,
         build_number: u64,
@@ -460,8 +339,7 @@ impl InstalledReceipt {
         write_durable(path, &text, "installed receipt", flush)
     }
 
-    /// Re-record a previously parsed receipt verbatim. Used when an exec-failure
-    /// inverse swap restores the old bundle and its receipt must come back unchanged.
+    /// Re-record a previously parsed receipt verbatim.
     pub(crate) fn record_preserving_kind(&self, path: &Path, flush: Flush) -> Result<(), String> {
         Self::write_atomic(
             path,
@@ -472,8 +350,7 @@ impl InstalledReceipt {
         )
     }
 
-    /// Bind this unsigned local receipt to the codesign-sealed identity of the
-    /// bundle currently at the canonical install path.
+    /// Check whether this receipt matches the staged bundle's sealed build number and commit.
     pub(crate) fn matches_sealed(&self, build_number: u64, git_commit: &str) -> bool {
         self.build_number == build_number && crate::commit_matches(&self.git_commit, git_commit)
     }
@@ -483,57 +360,25 @@ impl InstalledReceipt {
     }
 }
 
-/// A persisted recency floor kept under `Updates/floor.toml`. Every field ratchets up on
-/// observation, so the file can never force a downgrade; it blocks replay/rollback and
-/// honors an operator yank:
-///
-/// * `min_build`: the highest `min_build` any observed manifest declared; the client
-///   refuses to stage/apply below it.
-/// * `high_water`: the highest build the client ever successfully staged; it refuses to
-///   stage a "latest available" below it.
-///
-/// Only a revocation lowers them: each floor records who raised it ([`FloorSources`]), and
-/// a machine the roster revokes takes its contributions with it, so a stolen key's
-/// `min_build = 9_999_999_999` cannot strand every client for good. `revoked_machines`
-/// keeps a withdrawn machine's word from counting again. `roster_seq` covers what the two
-/// numbers cannot (a client that has never seen a higher build), with its own residual.
-///
-/// Every added field is `serde(default)` and skipped while empty; an older build that
-/// rewrites the file drops them, and the next reader treats the numbers as unattributed
-/// ([`FloorSources::step`]), never a lower floor.
+/// A persisted recency floor kept under `Updates/floor.toml`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Floor {
     /// Operator apply floor (max `min_build` ever seen from a machine still trusted).
-    /// Absent ⇒ 0.
     #[serde(default)]
     pub min_build: u64,
-    /// Highest build ever successfully staged by this client (from a machine still
-    /// trusted). Absent ⇒ 0.
+    /// Highest build ever successfully staged by this client (from a machine still trusted).
     #[serde(default)]
     pub high_water: u64,
-    /// Highest `roster_seq` from any machine roster this client has ever accepted: the
-    /// replay defence for the master-signed roster tier. A thief holding a revoked
-    /// machine's key may also hold the roster generation that listed it, whose master
-    /// signature never expires; a client that has durably seen sequence `n` refuses `n-1`.
-    ///
-    /// A fresh install accepts whatever roster it is first shown: rosters stamp
-    /// `valid_until` 9999-12-31 (`atpkg_keys::roster_ops::VALID_UNTIL_FOREVER`), so first
-    /// contact has no replay defence. That is deliberate: a freshness window would need a
-    /// twice-yearly re-sign and risk a fleet-wide fail-closed outage, and revocation
-    /// answers a stolen key either way.
-    ///
-    /// Absent ⇒ 0, the permissive first-contact value. Never lowered.
+    /// Highest `roster_seq` from any machine roster this client has ever accepted.
     #[serde(default)]
     pub roster_seq: u64,
-    /// Who raised [`Self::min_build`]. Empty ⇒ all of it is unattributed.
+    /// Who raised [`Self::min_build`].
     #[serde(default, skip_serializing_if = "FloorSources::is_empty")]
     pub min_build_sources: FloorSources,
-    /// Who raised [`Self::high_water`]. Empty ⇒ all of it is unattributed.
+    /// Who raised [`Self::high_water`].
     #[serde(default, skip_serializing_if = "FloorSources::is_empty")]
     pub high_water_sources: FloorSources,
-    /// Every machine id an admitted, master-verified roster has revoked (as the Linux
-    /// lane's `revoked_machines`). Never shrinks: a machine withdrawn once is not trusted
-    /// again on this client under any later roster.
+    /// Every machine id an admitted, master-verified roster has revoked.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub revoked_machines: Vec<String>,
 }
@@ -549,19 +394,13 @@ pub struct FloorObservation<'a> {
     pub high_water: u64,
     /// An admitted roster's generation (0: none).
     pub roster_seq: u64,
-    /// The machine whose signed manifest carried `min_build` / `high_water`; `None`
-    /// records them unattributed (no revocation can lower them).
+    /// The machine whose signed manifest carried `min_build` / `high_water`.
     pub machine: Option<&'a str>,
     /// The machine ids an admitted roster revokes.
     pub revoked: &'a [String],
 }
 
 /// The refusal of a gate that could not get through one of the update records it
-/// judges by (`error`: the floor, the quarantine ledger or `failed.toml` this read could
-/// not open or read just then): passing ([`crate::PASSING_REFUSAL_KEY`]), never the
-/// permissive default the record's display read falls back to. The words carry the
-/// remedy, since a record that stays unreadable (root-owned after `sudo`, a broken ACL,
-/// a failing disk) refuses every gate and check until someone fixes it.
 fn records_unreadable(error: String) -> String {
     crate::verify::mark_passing(format!(
         "aterm can't read its update records ({error}), so no update installs until it \
@@ -571,13 +410,7 @@ fn records_unreadable(error: String) -> String {
 }
 
 impl Floor {
-    /// Read the floor FOR DISPLAY, defaulting to all-zero (no floor) when absent,
-    /// unparseable or unreadable just then: a corrupt floor must not permanently wedge
-    /// updates, and zero is the permissive value of a lower bound. So it is never evidence
-    /// a build is admitted; anything that admits, announces or publishes one reads with
-    /// [`Self::read_for_gate`]. The callers left only describe or tighten: why a refused
-    /// publish was held, a roster re-read that takes a max, a pending build's clock, a
-    /// revert's floor-breach note.
+    /// Read the floor FOR display, defaulting to all-zero (no floor) when absent.
     pub fn read(path: &Path) -> Self {
         crate::read_ledger_text(path)
             .and_then(|t| aterm_toml::from_str(&t).ok())
@@ -585,11 +418,6 @@ impl Floor {
     }
 
     /// [`Self::read`] for the writer, which replaces what it reads: a present floor this
-    /// read could not get through (`EMFILE`, `EIO`, a mode this uid cannot open) is an
-    /// error, never the all-zero default, which would write `roster_seq`, `min_build` and
-    /// the revocation set away on a moment's failure. Only an absent file, or one that is
-    /// not a floor at all (refusing would freeze the ratchet for good), starts from the
-    /// default.
     fn read_for_replace(path: &Path) -> Result<Self, String> {
         let text = crate::read_ledger_text_checked(path)
             .map_err(|error| format!("read {}: {error}", path.display()))?;
@@ -598,29 +426,18 @@ impl Floor {
             .unwrap_or_default())
     }
 
-    /// [`Self::read`] for a gate that admits a build (the publish, the swap's 4b/4c, the
-    /// pre-park refusals, the check's judging floor). A present floor this read could not
-    /// get through is a passing refusal ([`crate::PASSING_REFUSAL_KEY`]), never the
-    /// all-zero default, which would let a yanked or revoked build through on that read;
-    /// an absent or non-floor file reads as the default. The words carry the remedy: a
-    /// floor that stays unreadable (root-owned after `sudo`, a broken ACL, a failing disk)
-    /// refuses every gate and check, and `commit_observation` can never rewrite it.
+    /// [`Self::read`] for a gate that admits a build.
     pub(crate) fn read_for_gate(path: &Path) -> Result<Self, String> {
         Self::read_for_replace(path).map_err(records_unreadable)
     }
 
-    /// Whether `machine` has been revoked by a roster this client admitted. An unnamed
-    /// machine is never matched: "I cannot tell who signed this" is not evidence of
-    /// withdrawal.
+    /// Whether `machine` has been revoked by a roster this client admitted.
     #[must_use]
     pub fn revokes(&self, machine: Option<&str>) -> bool {
         machine.is_some_and(|id| self.revoked_machines.iter().any(|r| r == id))
     }
 
-    /// Why this floor withdraws a build (`build` signed by `machine`), or `None` when it
-    /// still admits it: the operator yank (`min_build`) and the durable revocation set.
-    /// The one predicate the stage's publisher, its readers and the apply lane share, so a
-    /// withdrawn build is never published, announced or applied.
+    /// Why this floor withdraws a build (`build` signed by `machine`).
     #[must_use]
     pub fn withdraws(&self, build: u64, machine: Option<&str>) -> Option<String> {
         if self.revokes(machine) {
@@ -638,7 +455,6 @@ impl Floor {
     }
 
     /// This floor with its sources made to explain its numbers, in the one form it is
-    /// written in ([`FloorSources::step`] with nothing observed).
     fn canonical(mut self) -> Self {
         (self.min_build, self.min_build_sources) =
             self.min_build_sources.step(self.min_build, &[], 0, None);
@@ -647,8 +463,7 @@ impl Floor {
         self
     }
 
-    /// [`Self::observe_and_write`] with no machine and no revocations: nothing recorded
-    /// here is lowered by a revocation.
+    /// [`Self::observe_and_write`] with no machine and no revocations.
     #[cfg(test)]
     pub fn bump_and_write(
         path: &Path,
@@ -667,15 +482,7 @@ impl Floor {
         );
     }
 
-    /// Persist atomically, raising each field monotonically to at least `observation`'s
-    /// values; the per-floor lock covers the whole read/max/write transaction, and a no-op
-    /// write is skipped. The revocations are recorded first and take back every floor their
-    /// machines raised; then the observation is raised, unless its own machine is revoked.
-    ///
-    /// Best-effort but never silent: a full disk, a read-only remount, or a floor file this
-    /// uid cannot replace freezes the floor, so the failure is warned and the updater
-    /// carries on under the old value (refusing outright would let anyone who can wedge the
-    /// file wedge the updater).
+    /// Persist atomically, raising each field monotonically to at least `observation`'s values.
     pub fn observe_and_write(path: &Path, observation: &FloorObservation<'_>) {
         if let Err(error) = Self::observe_reporting(path, observation) {
             crate::warn(&format!(
@@ -686,7 +493,6 @@ impl Floor {
     }
 
     /// [`Self::bump_and_write`] that returns the failure instead of warning, so a test can
-    /// pin both halves of a failed commit: the error is reported and the temp file is gone.
     #[cfg(test)]
     fn bump_and_write_reporting(
         path: &Path,
@@ -707,9 +513,6 @@ impl Floor {
 
     fn observe_reporting(path: &Path, observation: &FloorObservation<'_>) -> Result<(), String> {
         Self::commit_observation(path, observation).map_err(|error| {
-            // Name the advance that was lost, not just the step that failed: the raw step
-            // error ("commit /…/floor.toml: Is a directory") does not say that replay and
-            // rollback protection stopped moving.
             format!(
                 "could not raise the update floor at {} to (min_build {}, high_water {}, \
                  roster_seq {}): {error}",
@@ -722,8 +525,6 @@ impl Floor {
     }
 
     /// The floor `cur` becomes after `observation` — pure, so the rule is testable
-    /// without a file: record the revocations, retract what their machines raised,
-    /// then raise by the observation unless its machine is revoked.
     fn after(cur: Self, observation: &FloorObservation<'_>) -> Self {
         let mut next = cur;
         for id in observation.revoked {
@@ -750,9 +551,6 @@ impl Floor {
     /// The locked read/observe/write transaction itself, reporting the step that failed.
     fn commit_observation(path: &Path, observation: &FloorObservation<'_>) -> Result<(), String> {
         let lock_path = path.with_extension("toml.lock");
-        // `_lock`, never `_`: the guard covers the whole read/max/write transaction.
-        // Bounded: the checker thread ratchets here after a stage, and a holder stopped
-        // mid-write would park it for good; a timeout is an ordinary, reported failure.
         let _lock = aterm_update_core::FileLock::acquire_within(
             &lock_path,
             crate::install::BACKGROUND_LOCK_WAIT,
@@ -765,96 +563,47 @@ impl Floor {
         }
         let text =
             aterm_toml::to_string(&next).map_err(|error| format!("encode floor: {error}"))?;
-        // Durable, like every other trust record here: a zero-length floor.toml after a
-        // panic or power cut would deserialize (`serde(default)`) into the permissive
-        // all-zero floor, discarding the replay/rollback ratchet. Only a moved coordinate
-        // writes (the `next == cur` return above), so it costs one fsync per real change.
         write_durable(path, &text, "update floor", Flush::Durable)
     }
 }
 
-/// A memo of the last candidate build that was downloaded but failed to stage
-/// (verification / mount / extract), under `Updates/failed.toml`, so the periodic loop
-/// doesn't re-download a DMG every interval when the newest release is a build already
-/// proved unstageable. Keyed by `(build_number, sha256)`, so a re-published fix under the
-/// same build is retried.
-///
-/// It suppresses rather than forbids: staging also fails for reasons that say nothing
-/// about the bytes (a full disk, a `codesign`/`spctl` race with Gatekeeper's cache, a
-/// mount refused under memory pressure, sleep mid-extract), so the same candidate is
-/// retried on a widening schedule ([`RETRY_BACKOFF_SECS`]). A corrupt artifact costs one
-/// download per backoff period, and a transient failure heals on its own.
-///
-/// The crash-loop trial marker (`Updates/trial.toml`) is another use of this type, with
-/// permanent semantics: its paths call [`FailedMark::record_required`] /
-/// [`FailedMark::matches`] and never consult the deadline.
+/// A memo of the last candidate build that was downloaded but failed to stage.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct FailedMark {
     #[serde(default)]
     pub build_number: u64,
     #[serde(default)]
     pub sha256: String,
-    /// How many times this exact `(build_number, sha256)` has failed. Absent ⇒ 0, which
-    /// [`FailedMark::next_attempt`] treats as one failure, so an old file gets no longer a
-    /// backoff than a fresh one.
+    /// How many times this exact `(build_number, sha256)` has failed.
     #[serde(default)]
     pub attempts: u32,
-    /// Unix seconds before which this candidate is skipped. Absent ⇒ 0, i.e. an
-    /// old permanent-style marker becomes immediately retryable, which is the
-    /// safe direction: the worst case is one extra download.
+    /// Unix seconds before which this candidate is skipped.
     #[serde(default)]
     pub retry_after: u64,
-    /// Quarantine: this artifact was swapped in, failed to confirm boot health
-    /// `MAX_BOOT_ATTEMPTS` times, and was reverted. Unlike `retry_after` this never
-    /// lapses; only a newer build or a re-publish under a different digest (a different
-    /// key) escapes it. A field rather than a `retry_after` sentinel because
-    /// [`Self::suppresses`] reads `retry_after = 0` as "retry now". Absent ⇒ `false`.
+    /// Quarantine: this artifact was swapped.
     #[serde(default)]
     pub quarantined: bool,
-    /// Trial markers only: the install root (`…/aterm.app`) the armed trial belongs to.
-    /// The sentinel and this marker are per user, while a build can sit at several paths
-    /// (`~/Applications/aterm.app` beside `/Applications/aterm.app`): a same-build process
-    /// launched from a different bundle must not count launches against, or disarm, a
-    /// trial it does not own. Absent ⇒ unbound.
+    /// Trial markers only: the install root (`…/aterm.app`) the armed trial belongs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub install_root: Option<String>,
-    /// The latest failure booked here was a moment (staging could not finish: a helper
-    /// past its deadline, a lock a sibling held, a full disk), not a verdict on the bytes.
-    /// It picks the schedule the deadline was set from ([`MOMENT_BACKOFF_SECS`]) and the
-    /// words a backed-off check says. Absent ⇒ `false`: an older build's memo is a
-    /// verdict, and an older reader reads the deadline alone.
+    /// The latest failure booked here was a moment.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub moment: bool,
 }
 
-/// The widening retry schedule for a candidate that failed to stage, in seconds: 15 min,
-/// 1 h, 4 h, then 24 h forever. Even a check asked for by hand (`aterm update check`,
-/// Check for Updates) cannot download a failed build more than once per 15 minutes, and
-/// the 24 h ceiling bounds a permanently corrupt artifact at one download a day.
+/// The widening retry schedule for a candidate that failed to stage, in seconds.
 pub const RETRY_BACKOFF_SECS: [u64; 4] = [15 * 60, 60 * 60, 4 * 60 * 60, 24 * 60 * 60];
 
-/// The retry schedule for a candidate whose staging could not finish (a moment), by the
-/// `n`-th consecutive failure: nothing for the first, then 15 min, 1 h, and 4 h while the
-/// moment keeps coming back. Unthrottled, a step that times out every time (a network that
-/// black-holes Gatekeeper, an `hdiutil attach` that always runs long) would re-download the
-/// container at every check of every aterm; the memo is shared by every aterm on the Mac,
-/// so this bounds the machine. The cap is short because a moment is expected to pass, and a
-/// check a person asks for passes a moment's memo, never a verdict's or a quarantine
-/// (`github::stage_backoff`).
+/// The retry schedule for a candidate whose staging could not finish (a moment).
 pub const MOMENT_BACKOFF_SECS: [u64; 4] = [0, 15 * 60, 60 * 60, 4 * 60 * 60];
 
 impl FailedMark {
-    /// Read the memo, or `None` if absent/unparseable. A marker that parses to all
-    /// defaults (every field is `serde(default)`, so a zero-length file left by a kernel
-    /// panic does) is treated as absent, not as a memo.
+    /// Read the memo, or `None` if absent/unparseable.
     pub fn read(path: &Path) -> Option<Self> {
         Self::parse(&crate::read_ledger_text(path)?)
     }
 
     /// [`Self::read`] for a writer that replaces or removes what it reads: a present memo
-    /// this read could not get through (`EMFILE`, `EIO`, a mode this uid cannot open) is
-    /// an error, never "no memo", since this file may hold the only record of a
-    /// quarantine.
     fn read_for_replace(path: &Path) -> Result<Option<Self>, String> {
         let text = crate::read_ledger_text_checked(path)
             .map_err(|error| format!("read {}: {error}", path.display()))?;
@@ -866,22 +615,12 @@ impl FailedMark {
         (parsed.build_number != 0 || !parsed.sha256.is_empty()).then_some(parsed)
     }
 
-    /// Whether this memo matches the given candidate (same build and same DMG hash). Pure
-    /// identity, no notion of time: what the crash-loop trial marker wants. The
-    /// download/stage memo uses [`FailedMark::suppresses`], or a transient failure would
-    /// become permanent.
+    /// Whether this memo matches the given candidate (same build and same DMG hash).
     pub fn matches(&self, build_number: u64, sha256: &str) -> bool {
         self.build_number == build_number && self.sha256.eq_ignore_ascii_case(sha256)
     }
 
-    /// Whether this memo should skip the given candidate right now: it names the same
-    /// artifact and either it is quarantined (crash-looped, never retried) or its backoff
-    /// deadline has not passed at `now` (unix seconds). A marker with no `retry_after` and
-    /// no quarantine flag never suppresses.
-    ///
-    /// Reader half of the `NativeUpdateFailedMarkSuppression` contract pair
-    /// ([`Self::quarantine_mark`], [`Self::stage_failure_mark`]): a quarantine suppresses
-    /// at every `now`, a backoff memo iff `now < retry_after`.
+    /// Whether this memo should skip the given candidate right now.
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -903,24 +642,19 @@ impl FailedMark {
         self.matches(build_number, sha256) && (self.quarantined || now < self.retry_after)
     }
 
-    /// Whether this memo is the never-lapsing crash-loop quarantine rather than a
-    /// timed backoff. Callers report the two differently: one ends by itself, the
-    /// other ends only when the channel offers a different artifact.
+    /// Whether this memo is the never-lapsing crash-loop quarantine rather than a timed backoff.
     #[must_use]
     pub fn is_quarantine(&self) -> bool {
         self.quarantined
     }
 
-    /// Seconds until this memo stops suppressing, or 0 if it already has. Meaningless
-    /// for a quarantine — check [`Self::is_quarantine`] first.
+    /// Seconds until this memo stops suppressing, or 0 if it already.
     #[must_use]
     pub fn retry_in_secs(&self, now: u64) -> u64 {
         self.retry_after.saturating_sub(now)
     }
 
-    /// The attempt count a fresh failure of `(build_number, sha256)` should be recorded
-    /// with, given this memo as the prior state. A failure of a different artifact resets
-    /// the budget.
+    /// The attempt count a fresh failure of `(build_number, sha256)` should be recorded.
     #[must_use]
     pub fn next_attempt(&self, build_number: u64, sha256: &str) -> u32 {
         if self.matches(build_number, sha256) {
@@ -930,39 +664,27 @@ impl FailedMark {
         }
     }
 
-    /// The backoff for the `n`-th consecutive failure (1-based), saturating at the
-    /// last entry of [`RETRY_BACKOFF_SECS`].
+    /// The backoff for the `n`-th consecutive failure (1-based).
     #[must_use]
     pub fn backoff_secs(attempts: u32) -> u64 {
         let idx = (attempts.max(1) as usize - 1).min(RETRY_BACKOFF_SECS.len() - 1);
         RETRY_BACKOFF_SECS[idx]
     }
 
-    /// The backoff for the `n`-th consecutive failure (1-based) when it is a moment,
-    /// saturating at the last entry of [`MOMENT_BACKOFF_SECS`].
+    /// The backoff for the `n`-th consecutive failure (1-based) when it is a moment.
     #[must_use]
     pub fn moment_backoff_secs(attempts: u32) -> u64 {
         let idx = (attempts.max(1) as usize - 1).min(MOMENT_BACKOFF_SECS.len() - 1);
         MOMENT_BACKOFF_SECS[idx]
     }
 
-    /// Record `(build_number, sha256)` as the in-flight trial artifact, discarding the
-    /// persistence error. Test-only: production arms the trial through
-    /// [`Self::record_required`], because a trial marker that failed to persist must fail
-    /// the apply rather than swap in a build whose crash-loop recovery cannot name it.
-    /// Identity only: readers use [`Self::matches`], never the deadline.
+    /// Record `(build_number, sha256)` as the in-flight trial artifact.
     #[cfg(test)]
     pub fn record(path: &Path, build_number: u64, sha256: &str) {
         let _ = Self::record_required(path, build_number, sha256, None);
     }
 
-    /// Quarantine `(build_number, sha256)`: it was swapped in, failed to confirm boot
-    /// health `MAX_BOOT_ATTEMPTS` times, and was reverted. [`Self::suppresses`] then skips
-    /// it until the channel offers a different build or digest, which changes the key.
-    ///
-    /// Durable: this memo is the only thing standing between a build that just
-    /// crash-looped and the next check re-applying it, and every other record that could
-    /// re-derive the verdict (trial, rollback, stage) is deleted moments later.
+    /// Quarantine `(build_number, sha256)`.
     pub fn record_quarantine(path: &Path, build_number: u64, sha256: &str, flush: Flush) {
         let m = Self::quarantine_mark(build_number, sha256);
         let Ok(text) = aterm_toml::to_string(&m) else {
@@ -971,13 +693,7 @@ impl FailedMark {
         let _ = write_durable(path, &text, "artifact quarantine", flush);
     }
 
-    /// The in-memory quarantine verdict [`Self::record_quarantine`] persists: the writer
-    /// half of the suppression contract (machine `NativeUpdateFailedMarkSuppression`).
-    /// For the value `V` returned, `V.suppresses(build_number, sha256, now)` holds for
-    /// every `now`: the verdict lands in the `quarantined` field [`Self::suppresses`]
-    /// consults, never in a `retry_after` sentinel it reads as "already elapsed". The
-    /// persisted half is covered by `a_vacuous_marker_reads_as_absent_not_as_an_empty_memo`
-    /// and `a_quarantine_suppresses_forever_while_the_shape_it_used_to_take_does_not`.
+    /// The in-memory quarantine verdict [`Self::record_quarantine`] persists.
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -999,17 +715,12 @@ impl FailedMark {
         }
     }
 
-    /// Record a download/stage failure of `(build_number, sha256)` at `now` (unix
-    /// seconds), widening the backoff for a repeat of the same artifact and resetting it
-    /// when the candidate changed. Best-effort: a lost memo costs one redundant download.
+    /// Record a download/stage failure of `(build_number, sha256)` at `now` (unix seconds).
     pub fn record_stage_failure(path: &Path, build_number: u64, sha256: &str, now: u64) {
         Self::record_timed(path, build_number, sha256, now, false);
     }
 
-    /// Record a staging moment of `(build_number, sha256)` (a step that could not finish,
-    /// no verdict on the bytes) on the gentler schedule ([`MOMENT_BACKOFF_SECS`]: the
-    /// first one costs nothing), and answer the memo written. Same persistence as
-    /// [`Self::record_stage_failure`].
+    /// Record a staging moment of `(build_number, sha256)`.
     pub fn record_stage_moment(path: &Path, build_number: u64, sha256: &str, now: u64) -> Self {
         Self::record_timed(path, build_number, sha256, now, true)
     }
@@ -1019,7 +730,6 @@ impl FailedMark {
         let prior = match Self::read_for_replace(path) {
             Ok(prior) => prior.unwrap_or_default(),
             Err(error) => {
-                // What this read could not see may be a quarantine: keep the file.
                 crate::warn(&format!(
                     "did not write the backoff memo of build {build_number} over a memo this \
                      could not read: {error}"
@@ -1028,14 +738,8 @@ impl FailedMark {
             }
         };
         let m = prior.stage_failure_mark(build_number, sha256, now, moment);
-        // A timed memo never erases a quarantine: this file may hold the only record of
-        // one (an older build's revert wrote it alone, [`artifact_quarantined`]), so it
-        // moves to the quarantine ledger first (which no stage event touches); if that
-        // cannot be written, this memo is not.
         if prior.is_quarantine() {
             let ledger = path.with_file_name("quarantine.toml");
-            // Ordered: the ledger lands before this memo replaces the file it moves out
-            // of, and both live in the one directory.
             if let Err(error) =
                 Quarantine::record(&ledger, prior.build_number, &prior.sha256, Flush::Ordered)
             {
@@ -1049,7 +753,6 @@ impl FailedMark {
         let Ok(text) = aterm_toml::to_string(&m) else {
             return m;
         };
-        // Not durable, deliberately: losing a backoff memo costs one redundant download.
         let tmp = path.with_extension(format!("toml.{}.tmp", std::process::id()));
         if std::fs::write(&tmp, text).is_ok() {
             let _ = std::fs::rename(&tmp, path);
@@ -1059,13 +762,7 @@ impl FailedMark {
         m
     }
 
-    /// The in-memory backoff memo [`Self::record_stage_failure`] persists, given this memo
-    /// as the prior state: the writer half of the timed suppression contract (machine
-    /// `NativeUpdateFailedMarkSuppression`). For the value `V` returned, with
-    /// `D = V.retry_after`, `V.suppresses(build_number, sha256, now)` holds iff `now < D`,
-    /// which binds [`Self::suppresses`]' comparison direction. `moment` picks only the
-    /// schedule ([`RETRY_BACKOFF_SECS`] or [`MOMENT_BACKOFF_SECS`]); a first moment's
-    /// deadline is `now` itself, so it suppresses at no later probe.
+    /// The in-memory backoff memo [`Self::record_stage_failure`] persists.
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -1093,8 +790,6 @@ impl FailedMark {
             sha256: sha256.to_ascii_lowercase(),
             attempts,
             retry_after: now.saturating_add(backoff),
-            // A timed backoff, never a quarantine: this failure is about fetching or
-            // staging the artifact, not about the artifact having proved itself bad.
             quarantined: false,
             install_root: None,
             moment,
@@ -1102,8 +797,6 @@ impl FailedMark {
     }
 
     /// Atomically record `(build_number, sha256)`, reporting persistence failure.
-    /// Apply uses this stricter form before swap because crash-loop recovery must be
-    /// able to poison the exact trial artifact deterministically.
     pub(crate) fn record_required(
         path: &Path,
         build_number: u64,
@@ -1113,7 +806,6 @@ impl FailedMark {
         let m = FailedMark {
             build_number,
             sha256: sha256.to_ascii_lowercase(),
-            // Identity only: no deadline and no verdict.
             attempts: 0,
             retry_after: 0,
             quarantined: false,
@@ -1122,9 +814,6 @@ impl FailedMark {
         };
         let text = aterm_toml::to_string(&m)
             .map_err(|error| format!("serialize artifact marker: {error}"))?;
-        // Ordered when the install root shares this marker's device: the order is the
-        // trial identity, then the arm, then the swap, and a crash after the identity
-        // alone leaves no active authority. Across devices, or with no root, durable.
         let flush = match (install_root, path.parent()) {
             (Some(root), Some(dir)) => Flush::ordered_if_same_device(dir, root),
             _ => Flush::Durable,
@@ -1137,30 +826,17 @@ impl FailedMark {
         let _ = std::fs::remove_file(path);
     }
 
-    /// Clear the download/stage backoff memo once a stage succeeds, and only that: a
-    /// quarantine verdict in the same file (another artifact's, or one an older build
-    /// wrote there alone) stays, because one build's success says nothing about a build
-    /// that crash-looped.
+    /// Clear the download/stage backoff memo once a stage succeeds.
     pub fn clear_backoff(path: &Path) {
         match Self::read_for_replace(path) {
             Ok(Some(mark)) if mark.is_quarantine() => {}
             Ok(_) => Self::clear(path),
-            // A memo this read could not get through may be a quarantine: it stays too.
             Err(_) => {}
         }
     }
 }
 
-/// The crash-loop quarantine ledger (`quarantine.toml`): every artifact that was swapped
-/// in, failed boot health `MAX_BOOT_ATTEMPTS` times and was reverted on this machine, as
-/// `build:sha256`. It is separate from [`FailedMark`], which holds one artifact and is
-/// replaced by another build's stage failure and cleared by a success; here nothing but
-/// another quarantine writes, and nothing removes an entry (the list is bounded by
-/// [`Self::KEEP`], oldest dropped first).
-///
-/// Older builds read only `failed.toml`, so the revert still writes the verdict there
-/// too ([`quarantine_artifact`]), and every reader of this build consults both
-/// ([`artifact_quarantined`]).
+/// The crash-loop quarantine ledger (`quarantine.toml`).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Quarantine {
     /// `"<build_number>:<sha256>"`, lowercase digest, oldest first.
@@ -1169,8 +845,7 @@ pub struct Quarantine {
 }
 
 impl Quarantine {
-    /// How many verdicts the ledger keeps. A machine that reverted more builds
-    /// than this has older verdicts the channel has long since moved past.
+    /// How many verdicts the ledger keeps.
     pub const KEEP: usize = 64;
 
     fn entry(build_number: u64, sha256: &str) -> String {
@@ -1186,8 +861,6 @@ impl Quarantine {
     }
 
     /// [`Self::read`] for [`Self::record`], which replaces what it reads: a present
-    /// ledger this read could not get through is an error, never the empty ledger
-    /// that would write every verdict it holds away (as [`Floor::read_for_replace`]).
     fn read_for_replace(path: &Path) -> Result<Self, String> {
         let text = crate::read_ledger_text_checked(path)
             .map_err(|error| format!("read {}: {error}", path.display()))?;
@@ -1210,9 +883,7 @@ impl Quarantine {
         self.artifacts.iter().any(|held| held.starts_with(&prefix))
     }
 
-    /// Add `(build_number, sha256)`, durably: like the verdict it supersedes, this
-    /// is the only thing standing between a build that just crash-looped and the
-    /// next check re-applying it.
+    /// Add `(build_number, sha256)`, durably.
     pub fn record(
         path: &Path,
         build_number: u64,
@@ -1232,10 +903,7 @@ impl Quarantine {
     }
 }
 
-/// Quarantine `(build_number, sha256)` on this machine (the crash-loop revert's
-/// verdict): into the quarantine ledger ([`Quarantine`]), which no later stage event
-/// touches, and into `failed.toml` ([`FailedMark::record_quarantine`]) for a reader
-/// of an older build, which knows only that one.
+/// Quarantine `(build_number, sha256)` on this machine (the crash-loop revert's verdict).
 pub fn quarantine_artifact(
     staging: &crate::paths::Staging,
     build_number: u64,
@@ -1250,14 +918,7 @@ pub fn quarantine_artifact(
     FailedMark::record_quarantine(&staging.failed(), build_number, sha256, flush);
 }
 
-/// Whether `(build_number, sha256)` is quarantined on this machine: in the
-/// quarantine ledger, or in a `failed.toml` verdict (written by this build's revert
-/// beside the ledger, or by an older build's alone).
-///
-/// FOR DISPLAY AND THROTTLES: a record this read could not get through reads as "not
-/// quarantined". A gate that admits, publishes or swaps a stage reads
-/// [`artifact_quarantined_for_gate`]; the callers left say why a stage was held, or
-/// skip a download the publish would refuse anyway.
+/// Whether `(build_number, sha256)` is quarantined on this machine.
 #[must_use]
 pub fn artifact_quarantined(
     staging: &crate::paths::Staging,
@@ -1269,14 +930,7 @@ pub fn artifact_quarantined(
             .is_some_and(|mark| mark.is_quarantine() && mark.matches(build_number, sha256))
 }
 
-/// [`artifact_quarantined`] for a gate that admits a build (the publish, the swap, both
-/// pre-park checks, every reader of a published stage): a present ledger this read
-/// could not get through (`EMFILE`, `EIO`, a mode this uid cannot open) is a passing
-/// refusal ([`records_unreadable`]), never "not quarantined", which would let a
-/// crash-looped build back in on that read. An absent or unparseable file reads as
-/// holding nothing, as the writers read it ([`Quarantine::record`],
-/// [`FailedMark::clear_backoff`]). A ledger that holds the artifact answers without
-/// `failed.toml` being read.
+/// [`artifact_quarantined`] for a gate that admits a build.
 pub(crate) fn artifact_quarantined_for_gate(
     staging: &crate::paths::Staging,
     build_number: u64,
@@ -1294,17 +948,10 @@ pub(crate) fn artifact_quarantined_for_gate(
 }
 
 /// One bounded machine state as both spec tiers exchange it — variable name to
-/// bounded value.
 #[cfg(any(test, debug_assertions))]
 type SpecState = std::collections::BTreeMap<&'static str, i64>;
 
-/// Project one observed writer→reader round trip of [`FailedMark`] onto the bounded
-/// `NativeUpdateFailedMarkSuppression` machine: the picked-inputs state (phase 1), the
-/// state after the observed writer ran (phase 2), and after the observed
-/// [`FailedMark::suppresses`] probe (phase 3). Its inputs are observations of the real
-/// writer's value and probe verdict, not a second implementation of either rule.
-/// `probe_now_class`/`recorded_deadline_class` are bounded timeline positions (0 smallest,
-/// 2 the interior deadline, 3 strictly past it; 0 doubles as the no-deadline sentinel).
+/// Project one observed writer→reader round trip of [`FailedMark`] onto the bounded.
 #[cfg(any(test, debug_assertions))]
 #[doc(hidden)]
 #[must_use]
@@ -1340,9 +987,6 @@ mod tests {
     use super::*;
 
     /// Which flush each record write takes (aterm-durable's counting seam): the floor stays
-    /// durable; a receipt, a quarantine and its ledger take the tier their caller found;
-    /// a trial identity is ordered beside an install root on its device and durable with
-    /// none; the timed memo's move of a quarantine into the ledger is ordered.
     #[test]
     fn each_record_write_names_its_flush() {
         use aterm_durable::seam::Recording;
@@ -1386,8 +1030,6 @@ mod tests {
     }
 
     /// A quarantine `failed.toml` alone held (an older build's revert) survives any number
-    /// of moments and stage failures of another artifact, carried into the quarantine
-    /// ledger. Negative control: over a plain backoff memo, nothing is carried.
     #[test]
     fn a_timed_memo_never_erases_a_quarantine() {
         let staging = crate::paths::Staging::scratch("timed-keeps-quarantine");
@@ -1415,8 +1057,6 @@ mod tests {
     }
 
     /// A read that fails is not an absent record: with `failed.toml` holding build 7's
-    /// quarantine and the ledger build 9's, a mode this uid cannot open on either file (a
-    /// stand-in for `EMFILE`/`EIO`) makes every writer keep it.
     #[test]
     fn a_record_the_writer_could_not_read_survives() {
         use std::os::unix::fs::PermissionsExt;
@@ -1461,7 +1101,6 @@ mod tests {
         let read = FailedMark::read(&path).expect("a real memo reads back");
         assert_eq!(read.build_number, 42);
         assert!(read.quarantined, "and keeps its verdict");
-        // It went through the durable writer, which leaves no temp behind.
         let strays: Vec<_> = std::fs::read_dir(&dir)
             .unwrap()
             .filter_map(Result::ok)
@@ -1491,13 +1130,10 @@ mod tests {
         assert_eq!(m.attempts, 1);
         assert_eq!(m.retry_after, 1_000 + RETRY_BACKOFF_SECS[0]);
 
-        // Inside the window: skipped.
         assert!(m.suppresses(BUILD, SHA, 1_000));
         assert!(m.suppresses(BUILD, SHA, 1_000 + RETRY_BACKOFF_SECS[0] - 1));
-        // Past the window: retried.
         assert!(!m.suppresses(BUILD, SHA, 1_000 + RETRY_BACKOFF_SECS[0]));
 
-        // A different artifact is never suppressed by this memo.
         assert!(!m.suppresses(BUILD + 1, SHA, 1_000));
         assert!(!m.suppresses(BUILD, &"a".repeat(64), 1_000));
 
@@ -1505,7 +1141,6 @@ mod tests {
     }
 
     /// Repeats of the same artifact widen the backoff and saturate; a different
-    /// artifact resets it.
     #[test]
     fn the_retry_budget_widens_saturates_and_resets_on_a_new_artifact() {
         let root =
@@ -1521,12 +1156,10 @@ mod tests {
             assert_eq!(m.attempts as usize, n + 1, "attempt {n} count");
             assert_eq!(m.retry_after, *expected, "attempt {n} backoff");
         }
-        // Saturated: one more failure keeps the ceiling, does not grow past it.
         FailedMark::record_stage_failure(&path, 7, SHA, 0);
         let m = FailedMark::read(&path).unwrap();
         assert_eq!(m.retry_after, *RETRY_BACKOFF_SECS.last().unwrap());
 
-        // A different build resets to the first rung.
         FailedMark::record_stage_failure(&path, 8, SHA, 0);
         let m = FailedMark::read(&path).unwrap();
         assert_eq!(m.attempts, 1);
@@ -1546,16 +1179,12 @@ mod tests {
             !m.suppresses(9, "ff", 0),
             "old markers must not strand a machine"
         );
-        // Its next failure is a repeat: rung 2, not 1.
         assert_eq!(m.next_attempt(9, "ff"), 2);
         assert_eq!(m.next_attempt(10, "ff"), 1);
-        // An absent quarantine flag means none.
         assert!(!m.is_quarantine());
     }
 
     /// A quarantine lives in its own field (a zero `retry_after` reads as "already
-    /// elapsed", like a pre-budget marker) and outlives every later stage event: neither
-    /// another build's failure nor a success (which clears the backoff memo) erases it.
     #[test]
     fn a_quarantine_survives_a_later_stage_failure_of_another_build() {
         const NOW: u64 = 1_000_000;
@@ -1575,11 +1204,9 @@ mod tests {
             artifact_quarantined(&staging, x, &sx),
             "nor may a later successful stage"
         );
-        // A second quarantine keeps the first.
         quarantine_artifact(&staging, y, &sy, aterm_durable::Flush::Durable);
         assert!(artifact_quarantined(&staging, x, &sx));
         assert!(artifact_quarantined(&staging, y, &sy));
-        // The key is the artifact: a re-publish under another digest is not it.
         assert!(!artifact_quarantined(&staging, x, &"ef".repeat(32)));
         assert!(!artifact_quarantined(&staging, x + 2, &sx));
         let _ = std::fs::remove_dir_all(&staging.root);
@@ -1593,14 +1220,12 @@ mod tests {
         let path = root.join("failed.toml");
         let sha = "ab".repeat(32);
 
-        // The identity-only shape is inert at any time.
         FailedMark::record(&path, 42, &sha);
         let old = FailedMark::read(&path).expect("parses");
         assert!(old.matches(42, &sha), "it names the right artifact…");
         assert!(!old.is_quarantine());
         assert!(!old.suppresses(42, &sha, 0), "…and suppresses nothing");
 
-        // The quarantine: same key, but it holds.
         FailedMark::record_quarantine(&path, 42, &sha, aterm_durable::Flush::Durable);
         let q = FailedMark::read(&path).expect("parses");
         assert!(q.is_quarantine());
@@ -1609,15 +1234,11 @@ mod tests {
             q.suppresses(42, &sha, u64::MAX),
             "no clock lapses a quarantine"
         );
-        // Case-insensitive on the digest, like every other comparison here.
         assert!(q.suppresses(42, &sha.to_ascii_uppercase(), 0));
 
-        // The escapes: a newer build, or a re-publish under a different digest.
         assert!(!q.suppresses(43, &sha, 0));
         assert!(!q.suppresses(42, &"cd".repeat(32), 0));
 
-        // A timed stage failure recorded afterwards replaces the quarantine with a
-        // lapsing window: the artifact identity is the key, and the last write wins.
         FailedMark::record_stage_failure(&path, 42, &sha, 100);
         let timed = FailedMark::read(&path).expect("parses");
         assert!(!timed.is_quarantine());
@@ -1628,9 +1249,6 @@ mod tests {
     }
 
     /// The bounded timeline class of a real unix-seconds value relative to the recorded
-    /// deadline, as the `NativeUpdateFailedMarkSuppression` machine's `probe_now`/`deadline`
-    /// classes. With `deadline == 0` (the quarantine's no-deadline sentinel) nothing is
-    /// before the deadline, so absolute smallness keeps the four classes distinct.
     fn timeline_class(now: u64, deadline: u64) -> i64 {
         if deadline == 0 {
             i64::try_from(now.min(3)).expect("bounded class fits i64")
@@ -1646,9 +1264,6 @@ mod tests {
     }
 
     /// The writer/reader suppression contract pair, exhaustively: each real writer's value,
-    /// probed by the real [`FailedMark::suppresses`] through every bounded input class of
-    /// `NativeUpdateFailedMarkSuppression`, both transitions validated against the machine.
-    /// A quarantine suppresses at every `now`; a timed memo with deadline `D` iff `now < D`.
     #[test]
     fn failed_mark_suppression_exhaustively_refines_the_model() {
         use std::collections::BTreeSet;
@@ -1667,15 +1282,12 @@ mod tests {
         const BUILD: u64 = 42;
         let sha = "ab".repeat(32);
         let wrong_sha = "cd".repeat(32);
-        // The matching candidate plus both escape shapes (newer build, re-published
-        // digest): the non-matching lanes must agree that a changed key ends suppression.
         let candidates = [
             (BUILD, sha.clone(), true),
             (BUILD + 1, sha.clone(), false),
             (BUILD, wrong_sha, false),
         ];
 
-        // Writer 1: the quarantine verdict. In-memory, no filesystem.
         let quarantine = FailedMark::quarantine_mark(BUILD, &sha);
         assert!(quarantine.quarantined);
         assert_eq!(
@@ -1683,14 +1295,11 @@ mod tests {
             "the verdict must NOT ride the deadline field — that was the bug"
         );
 
-        // Writer 2: a first stage failure at NOW0 — deadline NOW0 + rung 1.
         const NOW0: u64 = 1_000;
         let backoff = FailedMark::default().stage_failure_mark(BUILD, &sha, NOW0, false);
         assert_eq!(backoff.retry_after, NOW0 + RETRY_BACKOFF_SECS[0]);
         assert_eq!(backoff.attempts, 1);
         assert!(!backoff.quarantined && !backoff.moment);
-        // The same writer on the moment schedule: a first moment is due at once
-        // (deadline = its own now), the second waits rung 2.
         let first_moment = FailedMark::default().stage_failure_mark(BUILD, &sha, NOW0, true);
         assert_eq!(first_moment.retry_after, NOW0 + MOMENT_BACKOFF_SECS[0]);
         assert_eq!(first_moment.retry_after, NOW0, "one moment costs nothing");
@@ -1708,8 +1317,6 @@ mod tests {
             (&second_moment, false),
         ] {
             let deadline = mark.retry_after;
-            // One probe per timeline class; `timeline_class` is asserted below
-            // to hit all four so the sweep cannot silently narrow.
             let probes = if quarantine_writer {
                 [0, 1, 2, u64::MAX]
             } else {
@@ -1718,7 +1325,6 @@ mod tests {
             for now in probes {
                 for (cand_build, cand_sha, matches) in &candidates {
                     let suppressed = mark.suppresses(*cand_build, cand_sha, now);
-                    // The two contracts, asserted directly on the real verdict.
                     if quarantine_writer {
                         assert_eq!(
                             suppressed, *matches,
@@ -1800,15 +1406,11 @@ mod tests {
     }
 
     /// The healthy machine rejects both halves of the writer/reader divergence, and
-    /// `Buggy=1` reproduces them, so the contract is not vacuous.
     #[test]
     fn failed_mark_suppression_model_negative_controls_are_non_vacuous() {
         let model = aterm_models_update::native_update_failed_mark_suppression_model();
         let buggy = aterm_spec::interp::with_buggy(&model, 1);
 
-        // Writer half: the crash-loop verdict recorded as a plain timed memo
-        // (`retry_after = 0`, no quarantine field), which the real reader reads as
-        // already elapsed: written, then ignored.
         let legacy_poison = FailedMark {
             build_number: 42,
             sha256: "ab".repeat(32),
@@ -1858,9 +1460,6 @@ mod tests {
         );
         assert!(!buggy.check_invariant("QuarantineSuppressesAtEveryProbe", &retried));
 
-        // Reader half: a memo that suppresses from its deadline instead of until it. The
-        // healthy machine rejects the flipped verdict on a healthy recorded prefix;
-        // Buggy=1 admits it.
         let (picked, recorded, flipped) =
             failed_mark_suppression_projection(false, 3, true, false, 2, true);
         let (admitted, why) = aterm_spec::verify::validate_transition_tiered(
@@ -1958,9 +1557,6 @@ mod tests {
                 Floor::bump_and_write(&path, seen_min_build, staged_build, seen_roster_seq);
             })
         };
-        // Each writer carries the maximum of exactly one coordinate; without the locked
-        // transaction the loser's write would clobber the winner's, the roster sequence
-        // included (a replayed pre-revocation roster would be acceptable again).
         let min_writer = writer(1_000, 1, 1);
         let high_writer = writer(1, 2_000, 9);
         start.wait();
@@ -2010,7 +1606,6 @@ mod tests {
     }
 
     /// Lock the published wire shape: the full field set the ship tool emits, including
-    /// the `'''` multiline `changelog` and extra keys, parses and reads back.
     #[test]
     fn parses_full_gen_appcast_shape() {
         let m = Manifest::parse(
@@ -2139,9 +1734,6 @@ changelog = '''
     }
 
     /// A floor this read could not get through publishes nothing: a stage signed by a
-    /// machine the floor revokes is not "verified and ready" while that floor cannot be
-    /// read (mode 000 stands in for `EMFILE`/`EIO`). NEGATIVE CONTROL: the same stage
-    /// under a readable floor that revokes nothing is publishable.
     #[test]
     fn an_unreadable_floor_publishes_nothing() {
         use std::os::unix::fs::PermissionsExt;
@@ -2193,7 +1785,6 @@ changelog = '''
     }
 
     /// The live parser (delegating to the shared aterm-update-core validator) refuses a
-    /// `min_build` above its own build.
     #[test]
     fn manifest_rejects_min_build_above_its_own_build() {
         Manifest::parse(
@@ -2205,7 +1796,6 @@ changelog = '''
         )
         .unwrap_err();
 
-        // Negative control for the strict boundary: equality remains valid.
         let m = Manifest::parse(
             r#"version = "1.0.0"
                build_number = 10
@@ -2219,26 +1809,20 @@ changelog = '''
 
     #[test]
     fn floor_ratchets_monotonically_and_reads_default() {
-        // A dir of its own: the write leaves a `.lock` beside the file.
         let dir = aterm_tempfile::Builder::new()
             .prefix("aterm-floor-")
             .tempdir()
             .unwrap();
         let p = dir.path().join("floor.toml");
-        // Absent ⇒ all-zero default (permissive).
         assert_eq!(Floor::read(&p).min_build, 0);
         assert_eq!(Floor::read(&p).high_water, 0);
         assert_eq!(Floor::read(&p).roster_seq, 0);
-        // Bump up.
         Floor::bump_and_write(&p, 5, 12, 3);
         let f = Floor::read(&p);
         assert_eq!((f.min_build, f.high_water, f.roster_seq), (5, 12, 3));
-        // Lower observations never lower the floor, the roster sequence included, so a
-        // replayed pre-revocation roster stays unusable once a newer one was seen.
         Floor::bump_and_write(&p, 3, 8, 2);
         let f = Floor::read(&p);
         assert_eq!((f.min_build, f.high_water, f.roster_seq), (5, 12, 3));
-        // Higher observations raise each independently.
         Floor::bump_and_write(&p, 9, 12, 3);
         let f = Floor::read(&p);
         assert_eq!((f.min_build, f.high_water), (9, 12));
@@ -2247,8 +1831,6 @@ changelog = '''
     }
 
     /// Every mixed-version pairing reads the floor as before: an older build reads this
-    /// build's file as its own, and a number found with no provenance (an older build
-    /// rewrote the file) is unattributed, so no revocation lowers it.
     #[test]
     fn a_floor_without_provenance_is_never_lowered_and_an_old_reader_sees_the_numbers() {
         #[derive(Deserialize)]
@@ -2282,7 +1864,6 @@ changelog = '''
             (9_000, 9_500, 9)
         );
 
-        // An older build rewrote it: the numbers stand, the provenance is gone.
         std::fs::write(
             &path,
             "min_build = 9000\nhigh_water = 9500\nroster_seq = 9\n",
@@ -2304,7 +1885,6 @@ changelog = '''
         );
         assert!(floor.revokes(Some("m11")) && !floor.revokes(None));
 
-        // Negative control: the same history with provenance is withdrawn.
         let _ = std::fs::remove_file(&path);
         Floor::observe_and_write(
             &path,
@@ -2333,7 +1913,6 @@ changelog = '''
             Some(true)
         );
         assert_eq!(floor.withdraws(5, Some("m3")), None);
-        // The yank is strict: a floor at a build admits it, one above withdraws it.
         let yank = Floor {
             min_build: 5,
             ..Floor::default()
@@ -2344,14 +1923,11 @@ changelog = '''
     }
 
     /// A floor that cannot be committed (the rename fails) is reported, naming the lost
-    /// advance, and leaves no temp file behind.
     #[test]
     fn a_floor_that_cannot_be_committed_is_reported_and_leaves_no_temp_file() {
         let root = std::env::temp_dir().join(format!("aterm-floor-commit-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
-        // A directory where the floor file belongs: the temp write succeeds and the
-        // rename over it cannot.
         let path = root.join("floor.toml");
         std::fs::create_dir(&path).unwrap();
         let tmp = path.with_extension(format!("toml.{}.tmp", std::process::id()));
@@ -2362,7 +1938,6 @@ changelog = '''
             !tmp.exists(),
             "the temp file must never outlive a failed commit"
         );
-        // Nor may any temp spelling: nothing collects strays in the 0700 Updates root.
         let leaked: Vec<String> = std::fs::read_dir(&root)
             .unwrap()
             .filter_map(Result::ok)
@@ -2370,12 +1945,8 @@ changelog = '''
             .filter(|name| name.ends_with(".tmp"))
             .collect();
         assert!(leaked.is_empty(), "a failed commit left temps: {leaked:?}");
-        // The consequence the report exists to explain: the floor is still all-zero, so
-        // the same roster generation is accepted again on the next check.
         assert_eq!(Floor::read(&path), Floor::default());
 
-        // Negative control: on an ordinary path the same advance commits, reports
-        // nothing, and also leaves no temp file behind.
         let ok_path = root.join("ok.toml");
         assert_eq!(Floor::bump_and_write_reporting(&ok_path, 5, 12, 3), Ok(()));
         assert_eq!(Floor::read(&ok_path).roster_seq, 3);
@@ -2385,8 +1956,6 @@ changelog = '''
     }
 
     /// A floor the write could not read (mode 000 standing in for `EMFILE`/`EIO`) is never
-    /// replaced with defaults: the advance is refused and reported. Negative control: a
-    /// readable copy raises high-water and keeps the rest.
     #[test]
     fn a_floor_the_write_could_not_read_is_never_replaced_with_defaults() {
         use std::os::unix::fs::PermissionsExt;
@@ -2463,9 +2032,6 @@ changelog = '''
     }
 
     /// A stage confirmed less than a day ago may be swapped in; one confirmed a day or more
-    /// ago, never, in a shape this module does not write, or ahead of the clock waits, as a
-    /// passing refusal naming when the roster was last read. A build with no roster tier is
-    /// never held, and the hourly re-read keeps an overnight quit from making a launch wait.
     #[test]
     fn a_stage_is_swapped_only_inside_a_day_of_its_roster_confirmation() {
         let now = 1_790_000_000;
@@ -2497,28 +2063,21 @@ changelog = '''
                     assert!(refusal.contains(stamp), "names when: {refusal}");
                 }
             }
-            // No roster tier, no roster to confirm against: never held.
             assert_eq!(ready.roster_authorization_stale(now, false), None);
         }
         let mut malformed = confirmed_ready(Some(now));
         malformed.roster_confirmed_at = Some("2026-10-02 09:00:00".into());
         assert!(malformed.roster_authorization_stale(now, true).is_some());
-        // Controls: another passing moment is not the wait, and nor are the wait's
-        // words without the passing mark.
         assert!(!crate::is_roster_confirmation_wait(
             &crate::verify::mark_passing("could not take the apply lock within 10s".to_string())
         ));
         assert!(!crate::is_roster_confirmation_wait(ROSTER_UNCONFIRMED_KEY));
 
-        // The check's re-read: due from an hour on, or with no stamp.
         let reread = ROSTER_RECONFIRM_AFTER_SECS;
         assert!(!confirmed_ready(Some(now - reread + 1)).needs_roster_reconfirmation(now, true));
         assert!(confirmed_ready(Some(now - reread)).needs_roster_reconfirmation(now, true));
         assert!(confirmed_ready(None).needs_roster_reconfirmation(now, true));
         assert!(!confirmed_ready(None).needs_roster_reconfirmation(now, false));
-        // The oldest stamp a running client leaves at a quit: one re-read's age plus the
-        // check due to read it (jittered). An evening quit and the next morning's launch,
-        // 13.5 h apart, are inside the day, so the launch swaps.
         let oldest_at_quit =
             reread + crate::cadence::INTERVAL_SECS * (100 + crate::cadence::JITTER_PCT) / 100;
         assert!(
@@ -2540,7 +2099,6 @@ changelog = '''
     }
 
     /// The confirmation is one additive key: v0.98.0's marker shape reads a marker that
-    /// carries it, and this build reads v0.98.0's marker as unconfirmed.
     #[test]
     fn the_roster_confirmation_is_one_additive_key_both_ways() {
         #[derive(serde::Deserialize)]

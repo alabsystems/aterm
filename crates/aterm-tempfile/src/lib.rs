@@ -2,15 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Zero-dependency temporary directories with RAII cleanup.
-//!
-//! A drop-in for the parts of the `tempfile` crate aterm uses: `TempDir`,
-//! `Builder`, and the free function `tempdir()`. Tests that run a stand-in
-//! script also get `stand_in`: in test and debug builds, and in any build with
-//! the `test-support` feature, which a `--release` test run of a dependent names
-//! on its command line (`--features aterm-tempfile/test-support`).
 
-// Register the `trust` tool namespace so the FFI/CSPRNG wrappers below can
-// carry `#[cfg_attr(trust_verify, trust::skip)]`; inert off-Trust.
 #![cfg_attr(trust_verify, feature(register_tool))]
 #![cfg_attr(trust_verify, register_tool(trust))]
 
@@ -22,20 +14,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Generate a temporary name component from the pid, a process-wide counter
-/// and OS randomness. The counter separates names in this process; callers
-/// retry `AlreadyExists` to handle a collision with another process's name.
-// Skipped under Trust: the body is `String` assembly, whose panic-freedom
-// obligations are the allocator's; the verifier exhausts its budget on them.
 #[cfg_attr(trust_verify, trust::skip)]
 fn unique_name(prefix: &str) -> String {
     let pid = std::process::id();
     let count = COUNTER.fetch_add(1, Ordering::Relaxed);
     let rand = os_random_u64();
-    // Assembled without `format!`, whose expansion puts an unsafe
-    // `Arguments::new` call in this crate's MIR that the verifier cannot
-    // model. Output equals `format!("{prefix}{pid}_{rand:016x}_{count}")`.
-    // The capacity is a constant because a `prefix.len()`-derived one is
-    // unbounded under the verifier's model; longer names just reallocate.
     let mut name = String::with_capacity(64);
     name.push_str(prefix);
     name.push_str(&pid.to_string());
@@ -44,8 +27,6 @@ fn unique_name(prefix: &str) -> String {
     let mut hex = ['0'; 16];
     for slot in hex.iter_mut().rev() {
         *slot = hex_digit(v & 0xf);
-        // `v / 16` == `v >> 4` for unsigned; the verifier models unsigned
-        // division by a constant but not shifts.
         v /= 16;
     }
     for c in hex {
@@ -57,9 +38,6 @@ fn unique_name(prefix: &str) -> String {
 }
 
 /// Map a value in `0..=15` to its lowercase hex digit.
-///
-/// The `_` arm is unreachable for masked inputs; it exists so the function
-/// is total (no panic path) under verification.
 #[inline]
 #[must_use]
 pub const fn hex_digit(nibble: u64) -> char {
@@ -131,8 +109,6 @@ pub const fn decode_temp_seed_le(bytes: [u8; 16]) -> (u64, u32, u32) {
 }
 
 /// Read 8 bytes of randomness from the OS.
-///
-/// Falls back to [`no_csprng_fallback`] if the OS source is unavailable.
 fn os_random_u64() -> u64 {
     let mut buf = [0u8; 8];
     if read_os_random(&mut buf) {
@@ -150,14 +126,9 @@ fn os_random_u64() -> u64 {
 }
 
 /// The name seed to use when the OS CSPRNG is unavailable: a nanosecond wall
-/// clock. Not a CSPRNG; `unique_name` also mixes in the pid and a counter, so
-/// this only breaks ties between processes started in the same nanosecond.
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 fn no_csprng_fallback() -> u64 {
     match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
-        // Equals `d.as_nanos() as u64` (the truncating cast is mod 2^64, as is
-        // the wrapping arithmetic); the verifier does not support 128-bit
-        // truncating casts.
         Ok(d) => d
             .as_secs()
             .wrapping_mul(1_000_000_000)
@@ -167,70 +138,33 @@ fn no_csprng_fallback() -> u64 {
 }
 
 /// `wasm32-unknown-unknown` arm of [`no_csprng_fallback`], the one target
-/// where the clock arm above cannot be used.
-///
-/// This target has no OS CSPRNG, so this is the only seed, and
-/// `std::time::SystemTime::now()` panics there ("time not implemented on this
-/// platform"). aterm-tempfile reaches `aterm-wasm` through `aterm-grid`, and
-/// the browser cells' lint (`crates/aterm-time/wasm32/clippy.toml`) refuses
-/// std's clock there.
-///
-/// The seed is a process-wide counter mixed by a splitmix-style finalizer.
-/// With one wasm instance per module and no fork, the counter alone keeps
-/// every name distinct, which is all `unique_name` needs. It is not
-/// randomness: a browser caller needing unpredictable bytes must use
-/// `crypto.getRandomValues`.
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 fn no_csprng_fallback() -> u64 {
     static SEED: AtomicU64 = AtomicU64::new(0x9E37_79B9_7F4A_7C15);
     let mut z = SEED.fetch_add(0x9E37_79B9_7F4A_7C15, Ordering::Relaxed);
-    // splitmix64's finalizer: avalanches the counter so consecutive names do
-    // not share a hex prefix. All wrapping, so total on every input. `/ 2^n`
-    // is `>> n` for unsigned, spelled as division because the verifier does
-    // not model shifts.
-    z = (z ^ (z / 0x4000_0000)).wrapping_mul(0xBF58_476D_1CE4_E5B9); // >> 30
-    z = (z ^ (z / 0x0800_0000)).wrapping_mul(0x94D0_49BB_1331_11EB); // >> 27
-    z ^ (z / 0x8000_0000) // >> 31
+    z = (z ^ (z / 0x4000_0000)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z / 0x0800_0000)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z / 0x8000_0000)
 }
 
-// getentropy(2) first, a bounded device read last: the workspace's one
-// entropy pattern (see `aterm_uds::rand`). This crate is zero-dependency, so
-// it carries its own twin with one inline libc extern.
 #[cfg(unix)]
-// Skipped under Trust: an inline `getentropy(2)` FFI call plus a raw device
-// read, a syscall boundary with nothing verifiable in it.
 #[cfg_attr(trust_verify, trust::skip)]
 fn read_os_random(buf: &mut [u8]) -> bool {
-    // getentropy(2) fills up to 256 bytes per call from the system CSPRNG
-    // with no fd (macOS and modern Linux).
     unsafe extern "C" {
         fn getentropy(buf: *mut core::ffi::c_void, len: usize) -> i32;
     }
-    // The only caller passes 8 bytes, under the 256-byte per-call cap, so one
-    // call suffices; an oversized buffer would fail (EIO) and fall through to
-    // the device read, which handles any length.
-    // SAFETY: `buf` is a live &mut [u8] for the duration of the call and
-    // `len` is its exact length; getentropy writes at most `len` bytes.
+    // SAFETY: `buf` is a live &mut [u8] for the duration of the call and `len` is its exact length; getentropy writes at most `len` bytes.
     if unsafe { getentropy(buf.as_mut_ptr().cast(), buf.len()) } == 0 {
         return true;
     }
-    // Last resort: a bounded `read_exact` from the kernel CSPRNG device into
-    // the caller's fixed buffer, never a read-to-EOF of a device that never
-    // reaches EOF.
     use std::io::Read;
     match fs::File::open("/dev/urandom") {
-        // `read_exact` via `call2` (see `call0`), and an explicit `match`
-        // rather than a closure, so the verifier scopes out the absent std
-        // callee as it does for this crate's other file ops.
         Ok(mut f) => call2(<fs::File as Read>::read_exact, &mut f, buf).is_ok(),
         Err(_) => false,
     }
 }
 
-// One inline Win32 extern (bcrypt.dll), mirroring the unix getentropy(2)
-// extern, so the crate stays zero-dependency.
 #[cfg(windows)]
-// Skipped under Trust, as the unix twin: an FFI call, nothing verifiable.
 #[cfg_attr(trust_verify, trust::skip)]
 fn read_os_random(buf: &mut [u8]) -> bool {
     #[link(name = "bcrypt")]
@@ -238,9 +172,7 @@ fn read_os_random(buf: &mut [u8]) -> bool {
         fn BCryptGenRandom(h: *mut core::ffi::c_void, p: *mut u8, n: u32, f: u32) -> i32;
     }
     const BCRYPT_USE_SYSTEM_PREFERRED_RNG: u32 = 0x0000_0002;
-    // SAFETY: buf is a live &mut [u8] for the duration of the call; NULL
-    // algorithm handle + the flag is the documented system-RNG form;
-    // 0 == STATUS_SUCCESS.
+    // SAFETY: buf is a live &mut [u8] for the duration of the call; NULL algorithm handle + the flag is the documented system-RNG form; 0 == STATUS_SUCCESS.
     unsafe {
         BCryptGenRandom(
             core::ptr::null_mut(),
@@ -257,16 +189,6 @@ fn read_os_random(_buf: &mut [u8]) -> bool {
 }
 
 /// Call `f()` through a generic callable parameter.
-///
-/// Trust's hardened-boundary pass attaches contracts to direct call sites by
-/// callee identity: `std::fs::remove_file`/`rename`/`OpenOptions::open` get
-/// raw-path contracts no wrapper can discharge, and any callee named
-/// `read`/`write` picks up libc file-descriptor contracts. Through this helper
-/// the callee is the generic `FnOnce::call_once`, which the verifier scopes
-/// out like other polymorphic callees. Behavior is identical.
-///
-/// Used to reach `std::env::temp_dir`, whose direct call raises an unproven
-/// panic-freedom obligation.
 fn call0<F, T>(f: F) -> T
 where
     F: FnOnce() -> T,
@@ -275,7 +197,6 @@ where
 }
 
 /// Two-argument sibling of [`call0`]; see there for why this exists. The Unix
-/// entropy read reaches `read_exact` through it.
 #[cfg(unix)]
 fn call2<F, A, B, T>(f: F, a: A, b: B) -> T
 where
@@ -292,18 +213,14 @@ pub struct TempDir {
 
 impl TempDir {
     /// Create a new temporary directory in the system temp directory.
-    ///
     /// # Errors
-    ///
     /// Returns an error if the directory cannot be created.
     pub fn new() -> io::Result<Self> {
         Self::new_in(call0(std::env::temp_dir))
     }
 
     /// Create a new temporary directory inside `dir`.
-    ///
     /// # Errors
-    ///
     /// Returns an error if the directory cannot be created.
     pub fn new_in(dir: impl AsRef<Path>) -> io::Result<Self> {
         Self::with_prefix_in(".tmp", dir)
@@ -314,9 +231,6 @@ impl TempDir {
         let dir = dir.as_ref();
         for _ in 0..5 {
             let name = unique_name(prefix);
-            // A prefix contributes to one complete file name, never to its
-            // parent path. Compare the raw name too, since components alone
-            // would normalize separators or a leading "./" away.
             let mut components = Path::new(&name).components();
             if !matches!(components.next(), Some(std::path::Component::Normal(part)) if part == name.as_str())
                 || components.next().is_some()
@@ -327,9 +241,6 @@ impl TempDir {
                 ));
             }
             let path = dir.join(name);
-            // Mode 0o700, as upstream `tempfile`, so the contents are not
-            // world-traversable; O_EXCL/AlreadyExists still guards the
-            // final-component symlink race.
             #[cfg(unix)]
             let attempt = {
                 use std::os::unix::fs::DirBuilderExt;
@@ -356,8 +267,7 @@ impl TempDir {
         &self.path
     }
 
-    /// Keep the directory and its contents after this guard is consumed. The caller
-    /// takes responsibility for removing the returned path.
+    /// Keep the directory and its contents after this guard is consumed.
     #[inline]
     #[must_use]
     pub fn keep(mut self) -> PathBuf {
@@ -366,9 +276,6 @@ impl TempDir {
 }
 
 impl Drop for TempDir {
-    // Skipped under Trust: a `fs::remove_dir_all` syscall wrapper; marking the
-    // destructor total also discharges the drop-glue obligation of every
-    // dropped `TempDir`.
     #[cfg_attr(trust_verify, trust::skip)]
     fn drop(&mut self) {
         if !self.path.as_os_str().is_empty() {
@@ -398,10 +305,7 @@ impl Builder {
         Self { prefix: None }
     }
 
-    /// Set the prefix for the temporary name. Path separators and Windows
-    /// drive prefixes are refused when the directory is created.
-    // Skipped under Trust: `str::to_owned` allocates and the reassignment
-    // drops the prior `Option<String>`; nothing verifiable.
+    /// Set the prefix for the temporary name.
     #[cfg_attr(trust_verify, trust::skip)]
     #[must_use]
     pub fn prefix(mut self, prefix: &str) -> Self {
@@ -410,9 +314,6 @@ impl Builder {
     }
 
     /// The configured prefix, or the crate default `.tmp`.
-    ///
-    /// A native `match` rather than `as_deref().unwrap_or(".tmp")`, whose std
-    /// bodies the verifier's lowered bundle lacks.
     #[inline]
     const fn prefix_str(&self) -> &str {
         match &self.prefix {
@@ -422,20 +323,15 @@ impl Builder {
     }
 
     /// Create a temporary directory using the configured options.
-    ///
     /// # Errors
-    ///
     /// Returns an error if the directory cannot be created.
     pub fn tempdir(&self) -> io::Result<TempDir> {
         let prefix = self.prefix_str();
         TempDir::with_prefix_in(prefix, call0(std::env::temp_dir))
     }
 
-    /// Create a temporary directory inside `dir` using the configured options
-    /// (e.g. a short `/tmp` for a socket path, or a target-local scratch root).
-    ///
+    /// Create a temporary directory inside `dir` using the configured options (e.g. a short `/tmp` for a socket path, or a target-local scratch root).
     /// # Errors
-    ///
     /// Returns an error if the directory cannot be created.
     pub fn tempdir_in(&self, dir: impl AsRef<Path>) -> io::Result<TempDir> {
         TempDir::with_prefix_in(self.prefix_str(), dir)
@@ -443,35 +339,15 @@ impl Builder {
 }
 
 /// Create a temporary directory in the system temp directory.
-///
 /// # Errors
-///
 /// Returns an error if the directory cannot be created.
 pub fn tempdir() -> io::Result<TempDir> {
     TempDir::new()
 }
 
-/// Lay an executable stand-in at `path` holding `body`, mode 0555, replacing
-/// whatever is there by rename.
-///
-/// macOS assesses every new executable at its first exec and caches the verdict
-/// per inode. On macOS the body is cached once per user under the temp
-/// directory (keyed by content hash) and hard-linked into place so only the
-/// first run on a machine pays the `syspolicyd` check (278 ms for a new
-/// script's first exec vs. 3 ms for a hard link to an already-assessed inode
-/// and 121 ms for a fresh copy).
-///
-/// Every caller with the same body shares one read-only inode, so writes
-/// through `path` fail instead of mutating other tests' stand-ins. Do not use
-/// for stand-ins that a test chmods or rewrites in place, inspects by inode or
-/// link count, or parameterizes with per-test paths. Falls back to a fresh
-/// write when hard-linking is unavailable (cross-volume or mismatched directory
-/// owner).
-///
+/// Lay an executable stand-in at `path` holding `body`, mode 0555, replacing whatever is there by rename.
 /// # Errors
-///
-/// Returns an error if `path` has no file name or the stand-in cannot be written
-/// or moved into place.
+/// Returns an error if `path` has no file name or the stand-in cannot be written or moved into place.
 #[cfg(all(unix, any(test, debug_assertions, feature = "test-support")))]
 pub fn stand_in(path: &Path, body: &str) -> io::Result<()> {
     if path.file_name().is_none() {
@@ -492,17 +368,12 @@ pub fn stand_in(path: &Path, body: &str) -> io::Result<()> {
     if !shared && let Err(e) = write_read_only(&tmp, body.as_bytes()) {
         return Err(e);
     }
-    // Renaming one link of an inode over another link of it does nothing and
-    // succeeds, so laying a body again where it already lies leaves `tmp`.
     let renamed = fs::rename(&tmp, path);
     let _ = fs::remove_file(&tmp);
     renamed
 }
 
 /// Hard-link the shared copy of `body` at `tmp`, laying it first when it is
-/// absent or not `body`. A link is kept only when [`is_stand_in`] holds for it.
-/// A link that fails, or a copy not owned by `dir`'s owner, is an error that
-/// leaves the shared copy (already assessed) as it was.
 #[cfg(all(
     target_os = "macos",
     any(test, debug_assertions, feature = "test-support")
@@ -543,8 +414,6 @@ fn link_shared(tmp: &Path, dir: &Path, body: &[u8]) -> io::Result<()> {
 }
 
 /// Whether `file` is a regular file holding exactly `body`, mode 0555, owned by
-/// whoever owns `dir`: what was checked is the inode itself, which only its
-/// owner can change.
 #[cfg(all(
     target_os = "macos",
     any(test, debug_assertions, feature = "test-support")
@@ -590,7 +459,6 @@ fn write_read_only(path: &Path, body: &[u8]) -> io::Result<()> {
 }
 
 /// 64-bit FNV-1a: names the shared copy. A collision costs a rewrite, never a
-/// wrong stand-in: [`is_stand_in`] compares the bytes.
 #[cfg(all(
     target_os = "macos",
     any(test, debug_assertions, feature = "test-support")
@@ -682,8 +550,6 @@ mod tests {
     }
 
     /// One body, one read-only inode (on macOS); another body, its own; a shared
-    /// copy whose mode or bytes changed is replaced, not linked; a body laid
-    /// again where it lies leaves nothing beside it.
     #[cfg(unix)]
     #[test]
     fn stand_ins_share_one_read_only_inode_per_body() {
@@ -697,8 +563,6 @@ mod tests {
             }
         }
         let dir = tempdir().expect("tempdir");
-        // This run's own body, so no concurrent run tampers with its shared
-        // copy; the copy goes with the test, pass or fail.
         let body = format!("#!/bin/sh\necho {}\n", unique_name("t"));
         #[cfg(target_os = "macos")]
         let _evict = Evict(
@@ -757,7 +621,6 @@ mod tests {
     }
 
     /// On Windows the OS RNG (BCryptGenRandom) must actually work: two
-    /// consecutive 8-byte reads succeed and produce different values.
     #[cfg(windows)]
     #[test]
     fn windows_os_random_succeeds_and_differs() {

@@ -1,55 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The over-ink ledger: one budget per text cell, spent once by every
-//! additive light that reaches it.
-//!
-//! Each of fire's lights over the typed line (the streak, the crown's two
-//! halos, the forge core and its crawling embers, the ember shower, the
-//! steam) was capped on its own, but the renderer adds them all with
-//! `add_sat` onto the same letters, so individually legal layers summed past
-//! the point where the newest glyph washed to white. The ledger holds the
-//! light already laid on each text cell and admits a new light only at the
-//! strength that still leaves the reference stroke (the shipped dark theme's
-//! foreground on its background, as the streak budgets use) its contrast
-//! there.
-//!
-//! The account is kept per horizontal band of a cell ([`InkLedger::BANDS`]
-//! of them), conservatively: every light is charged its strength at the
-//! band's nearest point, as though all of them peaked on one pixel of it. So
-//! an ember hanging over the tops of the letters spends the top band, which
-//! the streak along the middle of the row barely touches. The caret's own
-//! cell is free (the block caret covers it), and so is every cell off the
-//! text lines ([`CursorGlow::begin_ink_ledger`]).
-//!
-//! The beam family, water and the classic wake's mono face
-//! keep the same account on a dark ground. Their streak lies UNDER the
-//! letters there (the bed, [`CursorGlow::emit_dark_bed`]; water's wake), so a
-//! cell's ground is what lies under it rather than the page
-//! ([`InkLedger::lay_under`]), and every additive light
-//! that still lands on a letter spends from what the bed left: the crown and
-//! the laser's aura ([`InkLedger::HEAD_FLOOR`]), the flying grains and the
-//! landing ring ([`InkLedger::FLYING_FLOOR`]), the caret's body
-//! ([`InkLedger::BODY_FLOOR`]) and, last, the momentum glow
-//! ([`InkLedger::MOMENTUM_FLOOR`]), each down to its own floor, so the later
-//! lights keep a share and their sum cannot pass the last one. A light made of
-//! quads (the bodies, the glow, the grains) is charged by its own summed
-//! pixels ([`InkLedger::admit_quads`]). A head light (the crown, the ring,
-//! the bodies, the glow) is admitted cell by cell ([`InkLedger::admit_masked`],
-//! [`InkLedger::admit_halos_masked`]): each letter it reaches keeps the share
-//! that letter can take and the light is cut to it there, recovering over a
-//! smooth shoulder, while over the blank cells around the caret it lands
-//! whole. The tier floors are the caret's line's: a letter on any other
-//! line the account holds keeps the text bar ([`InkLedger::NEIGHBOUR_FLOOR`]).
+//! Over-ink contrast ledger for additive cursor glow emitters.
 
 use super::*;
 
-/// A streak sample's lift per unit coverage on each band of its cell, top
-/// first ([`InkLedger::admit_axis`]).
+/// Per-band RGB lift per unit coverage for a streak sample ([`InkLedger::admit_axis`]).
 pub(super) type BandLifts = [[f32; 3]; InkLedger::BANDS];
 
-/// One frame's over-ink account (see the module docs), reset by
-/// [`CursorGlow::begin_ink_ledger`] before the frame's first emitter.
+/// Per-frame over-ink contrast account reset by [`CursorGlow::begin_ink_ledger`].
 #[derive(Default)]
 pub(crate) struct InkLedger {
     /// Whether this frame keeps the account; an idle ledger admits everything.
@@ -61,29 +20,20 @@ pub(crate) struct InkLedger {
     /// The caret cell, whose light the block caret covers.
     caret: Option<(i32, i32)>,
     /// The light laid on each band of each text cell so far, per channel in
-    /// `add_sat` levels: `lines` slot-major, `stride` cells a slot,
-    /// [`Self::BANDS`] bands a cell, top first.
     laid: Vec<[f32; 3]>,
     stride: usize,
     /// The pair the account keeps legible: the stroke's ink and the page.
     pair: (u32, u32),
     /// What lies under each text cell's letters before any light (the page,
-    /// or the bed's composite over it), `lines` slot-major as `laid` is, one
-    /// entry a cell.
     under: Vec<u32>,
     /// Each text cell's letter ink, as `under` (the pair's ink, or the
-    /// frame's own cell's).
     ink: Vec<u32>,
     /// [`Self::admit_quads`]'s scratch: the text cells one light reaches
-    /// (indices into `under`), and the summed light on each of their pixels,
-    /// cell-major.
     reached: Vec<usize>,
     px: Vec<[f32; 3]>,
     /// Each reached cell's brightest pixel per band and channel, cell-major
-    /// ([`Self::quad_peaks`]).
     peaks: Vec<[f32; 3]>,
     /// The text cells the light being masked keeps less than its whole
-    /// strength over ([`Self::admit_masked`]).
     dims: Vec<Dim>,
     /// The masked light's pieces, spliced back over the light they cut.
     pieces: Vec<GlowQuad>,
@@ -95,15 +45,10 @@ pub(crate) struct InkLedger {
     #[cfg(test)]
     uniform: bool,
     /// A print of every cut this frame's masked lights took (each dimmed
-    /// cell and the share it kept), so a frame whose cuts differ prints
-    /// differently ([`CursorGlow::over_ink_print`]).
     print: u64,
 }
 
 /// One text cell a light was admitted over at less than its whole strength:
-/// the cell's pixel box and the share of the light it keeps. The light
-/// recovers its whole strength around it over [`InkLedger::FEATHER_X`] and
-/// [`InkLedger::FEATHER_Y`] ([`InkLedger::mask_at`]).
 #[derive(Clone, Copy, Debug)]
 struct Dim {
     x0: f32,
@@ -114,57 +59,34 @@ struct Dim {
 }
 
 impl InkLedger {
-    /// The least contrast the reference stroke keeps under the account's sum:
-    /// the beam family's streak floor ([`CursorGlow::STREAK_INK_FLOOR`]).
+    /// Minimum contrast floor for the reference stroke ([`CursorGlow::STREAK_INK_FLOOR`]).
     pub(super) const FLOOR: f32 = CursorGlow::STREAK_INK_FLOOR;
-    /// The contrast the steady lights (the streak, the crown and the forge,
-    /// which burn in place frame after frame) may spend a cell down to, so
-    /// the flying ones (embers and steam) keep the rest of the budget, down
-    /// to [`Self::FLOOR`], around the head.
+    /// Contrast floor for steady lights (streak, crown, forge).
     pub(super) const STEADY_FLOOR: f32 = 6.0;
-    /// The horizontal bands a cell's account is kept in.
+    /// Number of horizontal bands tracked per text cell.
     pub(super) const BANDS: usize = 4;
     /// The text cells [`Self::admit_quads`]' scratch is sized for up front.
     const QUAD_CELLS: usize = 32;
     /// The pieces [`Self::admit_masked`]'s scratch is sized for up front.
     const MASK_PIECES: usize = 4096;
-    /// The floors of a dark streak's lights over the bed, one tier each, in
-    /// the order the frame lays them: the style's own head light (the crown,
-    /// the laser's aura over the caret's neighbour) first, then the flying
-    /// grains and the landing ring, then the caret's body, and the momentum
-    /// glow last. Each spends only down to its own floor, so every later
-    /// tier keeps a share, and the last is the least any letter keeps with
-    /// every light on: [`Self::MOMENTUM_FLOOR`], over the 3:1 the captures
-    /// are judged at by the measure's own margin (a glyph's antialiased core
-    /// reads darker than its ink, and the ledger charges every light at one
-    /// pixel).
+    /// Contrast floor for the cursor head light over a dark streak bed.
     pub(crate) const HEAD_FLOOR: f32 = 3.6;
-    /// See [`Self::HEAD_FLOOR`].
+    /// Contrast floor for flying lights (embers, sparks) over a dark streak bed.
     pub(crate) const FLYING_FLOOR: f32 = 3.4;
-    /// See [`Self::HEAD_FLOOR`].
+    /// Contrast floor for the caret body ([`OverInkTier::Body`]).
     pub(super) const BODY_FLOOR: f32 = 3.25;
-    /// See [`Self::HEAD_FLOOR`].
+    /// Contrast floor for the typing-momentum glow ([`OverInkTier::Momentum`]).
     pub(super) const MOMENTUM_FLOOR: f32 = 3.1;
-    /// The least contrast every light together leaves a letter on a line
-    /// other than the caret's (the output above, a selection below): WCAG's
-    /// 4.5:1 text bar plus the account's own rounding (a share is bisected
-    /// to 1/256 and each cut piece rounds its colour), since the caret's
-    /// light there is decoration over letters nobody is typing. The tier
-    /// floors above are the caret's line's.
+    /// Minimum contrast floor on neighbouring text lines above and below the caret row.
     pub(super) const NEIGHBOUR_FLOOR: f32 = 4.6;
-    /// How far a masked light ([`Self::admit_masked`]) takes to recover its
-    /// whole strength off a dimmed text cell, as a share of the cell's width
-    /// and height: a smooth shoulder, so the light never shows a cell's
-    /// hard edge, laid in [`Self::FEATHER_STEP`]-px slices.
+    /// Horizontal feather width for masked lights as a fraction of cell width.
     pub(super) const FEATHER_X: f32 = 0.45;
-    /// See [`Self::FEATHER_X`].
+    /// Vertical feather height for masked lights as a fraction of cell height.
     pub(super) const FEATHER_Y: f32 = 0.35;
     /// See [`Self::FEATHER_X`].
     const FEATHER_STEP: i32 = 2;
 
     /// The account index of band 0 of text cell `(row, col)`, or `None` for a
-    /// cell the account does not hold (off every line, past the grid, or the
-    /// caret's own).
     #[inline]
     const fn slot(&self, row: i32, col: i32) -> Option<usize> {
         if matches!(self.caret, Some((cr, cc)) if cr == row && cc == col)
@@ -188,7 +110,6 @@ impl InkLedger {
     }
 
     /// The text cell at `(row, col)`'s index into `under`, as
-    /// [`Self::slot`] finds it.
     #[inline]
     const fn cell(&self, row: i32, col: i32) -> Option<usize> {
         match self.slot(row, col) {
@@ -197,9 +118,7 @@ impl InkLedger {
         }
     }
 
-    /// Close the account: an idle ledger admits everything. Every tick does
-    /// this first, so a frame that never opens one (a light ground, a dark
-    /// tick) leaves no stale account for the caret's bodies to spend.
+    /// Close the ledger for the frame so an inactive ledger admits all lights.
     #[inline]
     pub(super) const fn close(&mut self) {
         self.on = false;
@@ -215,10 +134,7 @@ impl InkLedger {
         );
     }
 
-    /// Lay `rgb` under the letters of text cell `(row, col)`: the streak's
-    /// bed composited over the page there. The brighter of two beds on one
-    /// cell stands (by luminance), so a cell two samples share is charged
-    /// the worse of them.
+    /// Record composite bed colour `rgb` under text cell `(row, col)`.
     pub(super) fn lay_under(&mut self, (row, col): (i32, i32), rgb: u32) {
         if !self.on {
             return;
@@ -233,8 +149,7 @@ impl InkLedger {
         }
     }
 
-    /// How far band `band` of a cell `ch` px tall lies from the cell's middle
-    /// row of pixels (a streak sample's axis), at its nearest point.
+    /// Distance in pixels from a cell's vertical centre to the nearest edge of `band`.
     #[inline]
     pub(super) const fn band_reach(ch: f32, band: usize) -> f32 {
         let h = ch / Self::BANDS as f32;
@@ -244,8 +159,6 @@ impl InkLedger {
     }
 
     /// Whether the account's ink keeps `floor` over `ground` under `lift`,
-    /// with ink and ground lifted together and clipped at 255 as `add_sat`
-    /// does.
     #[inline]
     fn reads_with(
         table: &crate::color_math::RelativeLuminanceTable,
@@ -263,7 +176,6 @@ impl InkLedger {
     }
 
     /// The largest share `0..=1` of `add` account `at` can still take while
-    /// the account's ink keeps `floor` over what lies under that cell.
     fn room(&self, at: usize, add: [f32; 3], floor: f32) -> f32 {
         if add == [0.0; 3] {
             return 1.0;
@@ -273,9 +185,6 @@ impl InkLedger {
         let unpack = |rgb: u32| [16u32, 8, 0].map(|sh| ((rgb >> sh) & 0xff) as f32);
         let cell = at / Self::BANDS;
         let (ink, ground) = (unpack(self.ink[cell]), unpack(self.under[cell]));
-        // A line other than the caret's (earlier output, a selection, the
-        // prompt above) holds the text bar: the lights only wash the letters
-        // being typed down to their tier's floor.
         let slot = cell / self.stride.max(1);
         let off_caret = self.lines[slot]
             .zip(self.caret)
@@ -292,7 +201,6 @@ impl InkLedger {
         if !Self::reads_with(table, ink, ground, with(0.0), floor) {
             return 0.0;
         }
-        // Eight halvings resolve the share well inside one coverage level.
         let (mut lo, mut hi) = (0.0f32, 1.0f32);
         for _ in 0..8 {
             let mid = 0.5 * (lo + hi);
@@ -305,11 +213,7 @@ impl InkLedger {
         lo
     }
 
-    /// Admit a streak sample of coverage `cov` on cell `(row, col)`, its axis
-    /// on the cell's middle row, lifting band `b` by `lifts[b]` per unit
-    /// coverage (the layers of its stack that reach that band): the coverage
-    /// the cell can take, charged. The streak claims first, and only down to
-    /// [`Self::STEADY_FLOOR`].
+    /// Admit a streak sample of coverage `cov` on `(row, col)` with per-band `lifts` down to `floor`.
     pub(super) fn admit_axis(
         &mut self,
         (row, col): (u16, u16),
@@ -336,11 +240,7 @@ impl InkLedger {
         cov * share
     }
 
-    /// Admit a radial halo at `(cx, cy)` with radii `(rx, ry)` and
-    /// premultiplied colour `premul` (its centre's light): the share `0..=1`
-    /// of its peak every text band it reaches can take down to `floor`
-    /// ([`Self::STEADY_FLOOR`] or [`Self::FLOOR`]), charged to each of them
-    /// at that share.
+    /// Admit an additive radial halo at `(cx, cy)` with radii `(rx, ry)` down to `floor`.
     pub(super) fn admit_halo(
         &mut self,
         (cx, cy): (f32, f32),
@@ -354,9 +254,6 @@ impl InkLedger {
         let peak = [16u32, 8, 0].map(|sh| ((premul >> sh) & 0xff) as f32);
         let (ox, oy, cw, ch) = self.grid;
         let bh = ch / Self::BANDS as f32;
-        // The halo's falloff at the nearest point of band `band` of a cell,
-        // as the renderer's `halo_weight` (`(1 − d²)²`), or `None` where it
-        // does not reach.
         let row_dy2 = |row: i32| -> [f32; Self::BANDS] {
             let ry0 = oy + row as f32 * ch;
             std::array::from_fn(|band| {
@@ -374,7 +271,6 @@ impl InkLedger {
                 (d2 < 1.0).then_some((1.0 - d2) * (1.0 - d2))
             })
         };
-        // The cells of one line the halo's box reaches.
         let reached = |(row, first, end): (i32, i32, i32)| {
             let (y0, y1) = (oy + row as f32 * ch, oy + (row + 1) as f32 * ch);
             let lo = (((cx - rx - ox) / cw).floor() as i32).max(first);
@@ -430,11 +326,6 @@ impl InkLedger {
     }
 
     /// The light `quads` (its additive quads; source-over ones pass
-    /// uncharged) lays on each band of each text cell it reaches, summed as
-    /// the renderer adds it (a gradient quad at each column's own value):
-    /// fills `reached` (indices into `under`) and `peaks` (each band's
-    /// brightest pixel per channel, [`Self::BANDS`] a cell), and says whether
-    /// it reaches any.
     fn quad_peaks(&mut self, quads: &[GlowQuad]) -> bool {
         let (ox, oy, cw, ch) = self.grid;
         let (cwi, chi) = (cw as i32, ch as i32);
@@ -444,7 +335,6 @@ impl InkLedger {
             return false;
         }
         let lit = |q: &&GlowQuad| q.alpha == 0 && (q.color | q.color2) & 0x00FF_FFFF != 0;
-        // The text cells the light reaches, and each one's pixel box.
         let mut reached = std::mem::take(&mut self.reached);
         let span = |lo: f32, len: u16, o: f32, size: i32| {
             let first = ((lo - o) / size as f32).floor() as i32;
@@ -491,7 +381,6 @@ impl InkLedger {
                 let k_base = k * area + ((y0 - cy0) * cwi) as usize;
                 let y_span = (y1 - y0) as usize;
                 for x in x0..x1 {
-                    // The renderer's column law for a gradient quad.
                     let m = (2 * (x - qx0) + 1) as f32;
                     let t = m / denom;
                     let c = ends.map(|(a, da)| a + da * t);
@@ -505,7 +394,6 @@ impl InkLedger {
                 }
             }
         }
-        // Each band's brightest pixel, per channel.
         let cwi_u = cwi as usize;
         for k in 0..reached.len() {
             let cell_base = k * area;
@@ -532,7 +420,6 @@ impl InkLedger {
     }
 
     /// Window px of the top-left corner of text cell `cell` (an index into
-    /// `under`).
     #[inline]
     const fn cell_origin(&self, cell: usize) -> (i32, i32) {
         let (ox, oy, cw, ch) = self.grid;
@@ -545,12 +432,7 @@ impl InkLedger {
         (ox as i32 + col * cw as i32, oy as i32 + row * ch as i32)
     }
 
-    /// Admit one light made of additive quads (`alpha == 0`; source-over
-    /// quads pass uncharged) down to `floor`, as one: the share `0..=1` of
-    /// it every text band it reaches can take, charged at that share. A band
-    /// is charged the light's own brightest pixel in it, per channel
-    /// ([`Self::quad_peaks`]), so a body whose quads tile its halo side by
-    /// side is charged its halo, not the sum of its tiles.
+    /// Admit a group of additive quads uniformly down to `floor`.
     pub(super) fn admit_quads(&mut self, quads: &[GlowQuad], floor: f32) -> f32 {
         if !self.on || !self.quad_peaks(quads) {
             return 1.0;
@@ -577,16 +459,7 @@ impl InkLedger {
         share
     }
 
-    /// Admit one light made of the additive quads `quads[range]` down to
-    /// `floor`, each text cell it reaches on its own: a cell keeps the share
-    /// of the light its own bands can take ([`Self::room`]) and is charged
-    /// that, and the light is cut to it there and kept whole everywhere
-    /// else, recovering off each dimmed cell over a smooth shoulder
-    /// ([`Self::mask_at`]). So a caret's bloom stays at full strength over
-    /// the blank cells around it and over the caret's own cell, and only the
-    /// letters it reaches hold it back. The pieces are spliced over
-    /// `quads[range]` in order (source-over quads pass through whole).
-    /// Returns the least share any cell kept (`1.0` for the whole light).
+    /// Admit additive quads in `quads[range]` cell by cell down to `floor`, slicing around dimmed cells.
     pub(crate) fn admit_masked(
         &mut self,
         quads: &mut Vec<GlowQuad>,
@@ -653,9 +526,6 @@ impl InkLedger {
     }
 
     /// The share of a masked light kept at window px `(x, y)`: each dimmed
-    /// cell's share inside it, rising to the whole light over the feather's
-    /// reach off its box (a smoothstep of the normalised distance), the
-    /// least of every dimmed cell's.
     #[inline]
     fn mask_at(&self, x: f32, y: f32) -> f32 {
         let (_, _, cw, ch) = self.grid;
@@ -679,9 +549,6 @@ impl InkLedger {
     }
 
     /// Fill `knots_x`/`knots_y` with the slice edges of the box
-    /// `[x0, x1) × [y0, y1)` against the dimmed cells: its own edges, each
-    /// dimmed cell's edges, and the feather's slices off them, inside the
-    /// box. Returns whether any dimmed cell's feathered box meets it.
     fn knots(&mut self, (x0, y0, x1, y1): (i32, i32, i32, i32)) -> bool {
         let (_, _, cw, ch) = self.grid;
         let (fx, fy) = (
@@ -728,10 +595,6 @@ impl InkLedger {
     }
 
     /// One quad of a masked light, cut into the pieces [`Self::mask_at`]
-    /// asks for, into `out`: a source-over quad, or one no dimmed cell's
-    /// feather reaches, whole; otherwise each slice a gradient piece whose
-    /// ends carry the quad's own colour there times the mask there (the
-    /// column law makes a piece's ends meet its neighbours').
     fn mask_quad(&mut self, q: GlowQuad, out: &mut Vec<GlowQuad>) {
         let (x0, y0) = (i32::from(q.x), i32::from(q.y));
         let (x1, y1) = (x0 + i32::from(q.w), y0 + i32::from(q.h));
@@ -776,13 +639,7 @@ impl InkLedger {
         }
     }
 
-    /// Admit the radial halos `halos[from..]` (additive ones; a veil passes
-    /// through) down to `floor`, each halo once (the per-row pieces one
-    /// [`push_halo`] call splits a halo into share its centre, radii and
-    /// colour) and each text cell it reaches on its own, as
-    /// [`Self::admit_masked`] admits quads: a cell keeps the share its bands
-    /// can take at the halo's falloff there, and the halo is cut to it there
-    /// and kept whole elsewhere, each slice at the mask at its middle.
+    /// Admit additive radial halos in `halos[from..]` down to `floor`, slicing around dimmed cells.
     pub(crate) fn admit_halos_masked(
         &mut self,
         halos: &mut Vec<RainHalo>,
@@ -849,9 +706,6 @@ impl InkLedger {
     }
 
     /// One radial halo's account, cell by cell ([`Self::admit_halos_masked`]):
-    /// each text cell it reaches is charged the share of the halo its bands
-    /// can take down to `floor` at the halo's falloff there, and a cell that
-    /// keeps less than the whole halo joins `dims`.
     fn halo_dims(&mut self, (cx, cy): (f32, f32), (rx, ry): (f32, f32), premul: u32, floor: f32) {
         if rx <= 0.0 || ry <= 0.0 {
             return;
@@ -910,8 +764,7 @@ impl InkLedger {
 }
 
 impl InkLedger {
-    /// Admit quads already laid one by one down to `floor` (each a grain of
-    /// its own), scaling each to its share.
+    /// Admit each additive quad in `quads` independently down to `floor`.
     pub(super) fn admit_each_quad(&mut self, quads: &mut [GlowQuad], floor: f32) {
         if !self.on {
             return;
@@ -941,8 +794,7 @@ const fn scale_rgb(c: u32, share: f32) -> u32 {
     (c & 0xFF00_0000) | (r << 16) | (g << 8) | b
 }
 
-/// Scale every additive quad of `quads` (`alpha == 0`) by `share`, colour
-/// and gradient end alike: the light [`InkLedger::admit_quads`] admitted.
+/// Scale every additive quad (`alpha == 0`) in `quads` by `share`.
 #[inline]
 pub(super) fn scale_additive(quads: &mut [GlowQuad], share: f32) {
     if share >= 1.0 {
@@ -955,21 +807,7 @@ pub(super) fn scale_additive(quads: &mut [GlowQuad], share: f32) {
 }
 
 impl CursorGlow {
-    /// Open this frame's [`InkLedger`]: on a dark ground under Fire, a style
-    /// whose streak lies under the letters there ([`Self::streak_lies_under`])
-    /// or the classic wake's mono face; idle otherwise. The caret's cell is
-    /// free. Fire keeps
-    /// its account on the reference pair, as its caps were solved; the others
-    /// on the live theme's, the pair their bed is solved for
-    /// ([`Self::bed_pair`]). Allocates only when the grid widens.
-    ///
-    /// The account holds every line of text the row probe shows. Where the
-    /// probe is silent it assumes text rather than air, since fire's light
-    /// rises off the typed run onto whatever line sits above it: a caret row
-    /// with no probe holds the typed sparks' span (the letters just typed),
-    /// and a neighbouring grid row the host did not capture (the GUI captures
-    /// them only for the rainbow kitty) holds the typed span widened by
-    /// [`Self::INK_LEDGER_REACH`] cells, where the shower and the steam rise.
+    /// Initialize this frame's [`InkLedger`] from the active style, theme, and text lines.
     pub(super) fn begin_ink_ledger(
         &mut self,
         cfg: &GlowConfig,
@@ -1010,8 +848,6 @@ impl CursorGlow {
             if let Some((first, last)) = typed {
                 add((row, first, last + 1));
             }
-            // The neighbours the probe did not capture, over the typed run
-            // (or around the caret before one is laid).
             let (first, last) = typed.unwrap_or((col, col));
             let reach = Self::INK_LEDGER_REACH;
             let (lo, hi) = (
@@ -1024,8 +860,6 @@ impl CursorGlow {
                 .filter(|m| i32::from(m.row) == row);
             let captured =
                 |nbr: fn(&RowProbe) -> NbrProbe| meta.is_some_and(|m| nbr(m) == NbrProbe::Probed);
-            // A neighbour the frame's own cells read holds what they show
-            // (nothing, if blank); one nobody read holds the typed span.
             let text = self.text_view();
             let mut neighbour = |nbr: i32| match text.frame_line(nbr) {
                 Some(Some((first, end))) => add((nbr, first, end)),
@@ -1066,10 +900,6 @@ impl CursorGlow {
         ledger.under.resize(3 * geom.cols, ledger.pair.1);
         ledger.ink.clear();
         ledger.ink.resize(3 * geom.cols, ledger.pair.0);
-        // A letter the frame's own cells show is held against the colours
-        // it is drawn in (a selection's ground, a coloured prompt's ink),
-        // not the page's pair. Fire keeps the reference pair its caps were
-        // solved on.
         if !fire {
             let frame = &self.frame_text;
             for (slot, line) in ledger.lines.iter().enumerate() {
@@ -1078,8 +908,6 @@ impl CursorGlow {
                 };
                 for col in first.max(0)..end.min(geom.cols as i32) {
                     if let Some((fg, bg)) = frame.pair(row, col) {
-                        // A blank cell inside the line keeps the pair's ink
-                        // as its stand-in letter, on its own ground.
                         let i = slot * geom.cols + col as usize;
                         ledger.ink[i] = fg.unwrap_or(ledger.pair.0);
                         ledger.under[i] = bg;
@@ -1087,10 +915,6 @@ impl CursorGlow {
                 }
             }
         }
-        // `admit_quads`' scratch, sized once for the widest light it meets
-        // (a landing ring at its largest reaches about this many text cells),
-        // so a frame whose grain straddles one more cell than the last does
-        // not allocate.
         let want = InkLedger::QUAD_CELLS * geom.cw * geom.ch;
         if ledger.px.capacity() < want {
             ledger.px.reserve(want - ledger.px.len());
@@ -1100,9 +924,6 @@ impl CursorGlow {
                 .reached
                 .reserve(InkLedger::QUAD_CELLS - ledger.reached.len());
         }
-        // The masked lights' scratch ([`InkLedger::admit_masked`]), sized
-        // once for the most a frame's head lights cut into, so a frame that
-        // cuts one more piece than the last does not allocate.
         reserve_to(&mut ledger.peaks, InkLedger::QUAD_CELLS * InkLedger::BANDS);
         reserve_to(&mut ledger.dims, InkLedger::QUAD_CELLS);
         reserve_to(&mut ledger.knots_x, InkLedger::QUAD_CELLS * 8);
@@ -1111,9 +932,7 @@ impl CursorGlow {
         reserve_to(&mut ledger.halo_pieces, InkLedger::MASK_PIECES);
     }
 
-    /// The pair a dark bed is solved for and its account kept on: the live
-    /// theme's ink and page, or the reference pair when the host handed no
-    /// coherent one (`fg == bg` reads as unknown).
+    /// Return the `(ink, page)` RGB pair used to solve dark-bed contrast.
     #[inline]
     pub(crate) const fn bed_pair(cfg: &GlowConfig) -> (u32, u32) {
         let (fg, bg) = (cfg.theme_fg & 0x00FF_FFFF, cfg.theme_bg & 0x00FF_FFFF);
@@ -1124,9 +943,7 @@ impl CursorGlow {
         }
     }
 
-    /// Whether `style`'s streak lies under the letters on a dark ground: the
-    /// beam family's bed ([`Self::emit_comet`]) and water's wake. Their
-    /// over-text lights spend the over-ink account ([`InkLedger`]).
+    /// Whether `style` draws its streak underneath letters on a dark ground.
     #[inline]
     pub(super) const fn streak_lies_under(style: GlowStyle) -> bool {
         matches!(
@@ -1141,26 +958,14 @@ impl CursorGlow {
         )
     }
 
-    /// A print of every cut this frame's over-ink account made to a masked
-    /// light ([`InkLedger::admit_masked`]): which letters held a light back
-    /// and by how much, so a host folding it into its frame fingerprint
-    /// repaints when only the cuts change. `0` with no cut.
+    /// Fingerprint of all masked-light cuts performed during this frame.
     #[inline]
     #[must_use]
     pub const fn over_ink_print(&self) -> u64 {
         self.ink_ledger.print
     }
 
-    /// Admit one of the caret's bodies, or the momentum glow, into this
-    /// frame's over-ink account cell by cell ([`InkLedger::admit_masked`]):
-    /// `quads[range]` is the light it just laid, cut where it reaches a
-    /// letter to the share that letter's cell can take and kept whole over
-    /// the blank cells and the caret's own, the pieces spliced in its place.
-    /// The host calls this after [`Self::tick`], in the order the lights are
-    /// laid; without an open account (a light ground, a style whose light
-    /// does not reach the letters) it changes nothing. Returns the least
-    /// share any letter kept (`1.0` for the whole light), which the host
-    /// folds into its frame fingerprint when it bound.
+    /// Admit `quads[range]` at `tier` into this frame's over-ink ledger and return whether the cut fingerprint changed.
     #[inline]
     pub fn admit_over_ink(
         &mut self,
@@ -1179,14 +984,11 @@ impl CursorGlow {
     }
 }
 
-/// Which of the lights laid after the aurora a host admits
-/// ([`CursorGlow::admit_over_ink`]): each spends the over-ink account only
-/// down to its own floor, so the later one keeps a share.
+/// Over-ink contrast tier for lights emitted after the aurora ([`CursorGlow::admit_over_ink`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OverInkTier {
-    /// The caret's own body (the comet nucleus, the phaser emitter, the
-    /// light rod, the droplet).
+    /// Caret body light.
     Body,
-    /// The typing-momentum glow, laid last.
+    /// Typing-momentum glow.
     Momentum,
 }

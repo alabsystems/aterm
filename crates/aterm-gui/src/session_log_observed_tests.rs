@@ -1,11 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The remaining marks (plan §3.5): each site's record
-//! and its fields through the site's own entry point where a test can reach
-//! it (the status sweep on a headless App), dedup (a value written twice
-//! writes one mark), the wake, the carry, and the leak rule (a
-//! notification's body in no record).
+//! The remaining marks (plan §3.5).
 
 use std::time::{Duration, Instant};
 
@@ -14,7 +10,6 @@ use super::*;
 use crate::{App, WindowId};
 
 /// A registration on `session`'s watcher list, any ring already pending
-/// drained.
 fn watching(app: &App, session: u64) -> crate::session_watch::Subscription {
     let sub = crate::session_watch::Subscription::single(
         &app.pool.get(session).expect("a live session").ctx.watchers,
@@ -28,20 +23,12 @@ fn having<'a>(got: &'a [String], needle: &str) -> Vec<&'a String> {
 }
 
 /// THE ENGINE'S MARKS through the status sweep (plan §3.2): an
-/// OSC 9 sent with notifications off is counted (`mark - notify n=1`) and
-/// its body is in no record; bells are counted; an OSC 9;4 is progress
-/// (`state=normal pct=42`), never a notification; the integration's posture
-/// is said once. A second sweep over the same engine writes none of them
-/// again (dedup), and the sweep woke the session's watchers (a one-minute
-/// hang detector). NEGATIVE CONTROL: the first sweep is a baseline — what
-/// the engine counted before the log first read it is not said.
 #[test]
 fn the_sweep_marks_what_the_engine_says_once() {
     let mut app = App::headless_for_test();
     let front = app.front_terminal(WindowId(0)).expect("a front terminal");
     let (session, term) = (front.session, std::sync::Arc::clone(&front.term));
     let timeline = std::sync::Arc::clone(&app.pool.get(session).expect("pooled").ctx.timeline);
-    // Counted before the first read: the baseline.
     crate::term_lock(&term).process(b"\x1b]9;SENTINEL-EARLY\x07");
     let t0 = Instant::now();
     app.observe_session_statuses(t0);
@@ -71,7 +58,6 @@ fn the_sweep_marks_what_the_engine_says_once() {
             && progress[0].contains(" src=engine conf=exact "),
         "{progress:?}"
     );
-    // Dedup: the same engine again writes none of them.
     app.observe_session_statuses(t0 + Duration::from_secs(2));
     let again = lines_of(&timeline);
     for kind in [" notify ", " bell ", " progress ", " integration "] {
@@ -81,7 +67,6 @@ fn the_sweep_marks_what_the_engine_says_once() {
             "{kind}: {again:?}"
         );
     }
-    // The leak rule: the notifications' text is in no record at any tier.
     let g = timeline.lock().unwrap();
     for rec in g.slog().log().window() {
         let line = aterm_slog::encode(rec, aterm_slog::Tier::Content).expect("fits");
@@ -90,9 +75,6 @@ fn the_sweep_marks_what_the_engine_says_once() {
 }
 
 /// `mark <run> status …` (plan §3.2): one typed mark per published status
-/// transition, beside the timeline's `status-change` row and with the same
-/// facts — a failing command's `out=fail code=1`. NEGATIVE CONTROL: a sweep
-/// that publishes no transition writes no status mark.
 #[test]
 fn a_status_transition_is_one_typed_mark() {
     let mut app = App::headless_for_test();
@@ -132,7 +114,6 @@ fn a_status_transition_is_one_typed_mark() {
             .any(|r| r.contains("outcome=failure exit_code=1")),
         "{rows:?}"
     );
-    // NEGATIVE CONTROL: nothing moved, nothing written.
     app.observe_session_statuses(t0 + Duration::from_secs(9));
     assert_eq!(
         having(&lines_of(&timeline), " status phase=").len(),
@@ -141,7 +122,6 @@ fn a_status_transition_is_one_typed_mark() {
 }
 
 /// A busy Claude Code screen (the shape the reader reads), its context
-/// indicator and its goal against the right edge above the composer.
 fn claude_screen(ctx: Option<u8>, goal: bool) -> Vec<String> {
     let rule = "\u{2500}".repeat(120);
     let right = |t: &str| format!("{}{t}", " ".repeat(120 - t.chars().count()));
@@ -175,10 +155,6 @@ fn paint(app: &App, sid: u64, rows: &[String]) {
 }
 
 /// CLAUDE CODE'S CONTEXT AND GOAL through the sweep's publish hold (plan
-/// §3.2; addendum A22): `mark <run> ctx pct=` when the context left moves a
-/// tenth, `mark <run> goal state=on` when the goal is armed, on the agent
-/// run. NEGATIVE CONTROLS: a move within the tenth (12% → 15%) writes no ctx
-/// mark; an unchanged goal writes none.
 #[test]
 fn claude_codes_context_and_goal_are_marked_when_they_move() {
     let mut app = App::headless_for_test();
@@ -210,10 +186,6 @@ fn claude_codes_context_and_goal_are_marked_when_they_move() {
 }
 
 /// THE SCREEN'S INTERRUPT (plan §3.2, `out=interrupted`): a turn the screen
-/// saw a person stop closes `out=interrupted` at its settle. NEGATIVE
-/// CONTROL: the same turn unstopped closes `out=done`; and only Claude
-/// Code's reading says a turn was stopped (agent-gate: Codex's says
-/// nothing).
 #[test]
 fn a_stopped_turn_closes_interrupted() {
     for stopped in [true, false] {
@@ -260,9 +232,6 @@ fn a_stopped_turn_closes_interrupted() {
 }
 
 /// THE LAUNCH CARD's amend (plan §3.2; addendum A28): the names it reads
-/// amend the agent run `src=screen conf=strong`, only what the run does not
-/// already hold; the same card again writes nothing. NEGATIVE CONTROL: no
-/// Claude Code run, no amend.
 #[test]
 fn the_launch_card_amends_the_agent_run_once() {
     let card = aterm_phase::LaunchCard {
@@ -273,7 +242,6 @@ fn the_launch_card_amends_the_agent_run_once() {
     let (tl, _hand) = opened();
     {
         let mut g = tl.lock().unwrap();
-        // NEGATIVE CONTROL: no run.
         let now = g.slog().now();
         g.slog_mut().observe_card(&card, now);
     }
@@ -297,10 +265,6 @@ fn the_launch_card_amends_the_agent_run_once() {
 }
 
 /// `mark - render state=… run=…` (plan §3.2; phase 6, 6F-7): every
-/// transition the ledger records is one mark with its row's fields, the
-/// same state twice too, as the ring keeps a row for each; the ledger's
-/// transitions name their state. NEGATIVE CONTROL (by scratch revert): the
-/// state dedupe this replaced writes two marks for three transitions.
 #[test]
 fn every_render_transition_is_one_mark_with_its_row() {
     use crate::resize_ledger::Transition;
@@ -359,9 +323,6 @@ fn every_render_transition_is_one_mark_with_its_row() {
 }
 
 /// THE CARRY: what the marks last wrote crosses an update as
-/// words and tenths on the `state` line, so a successor does not restate
-/// them. NEGATIVE CONTROL: a line without the tokens (an older build's)
-/// reads as nothing known, and an unknown word is none.
 #[test]
 fn the_observed_values_cross_an_update_as_words() {
     let (tl, _hand) = opened();
@@ -392,7 +353,6 @@ fn the_observed_values_cross_an_update_as_words() {
     let mut odd = Observed::default();
     odd.read_carry(|k| (k == "obs_int").then(|| "sideways".to_string()));
     assert_eq!(odd, Observed::default());
-    // The successor's engine says the same: nothing is restated.
     drop(g);
     let (next, _hand) = opened();
     let mut n = next.lock().unwrap();
@@ -404,7 +364,6 @@ fn the_observed_values_cross_an_update_as_words() {
         having(&got, " integration ").is_empty() && having(&got, " progress ").is_empty(),
         "{got:?}"
     );
-    // NEGATIVE CONTROL: a successor with nothing carried says them.
     let (fresh, _hand) = opened();
     let mut f = fresh.lock().unwrap();
     let now = f.slog().now();
@@ -413,8 +372,6 @@ fn the_observed_values_cross_an_update_as_words() {
     assert_eq!(having(&said, " integration ").len(), 1, "{said:?}");
     assert_eq!(having(&said, " progress ").len(), 1, "{said:?}");
 }
-
-// ---- C9: cwd, title, modes, in-doubt ----------------------------------------
 
 /// Every record of `timeline`'s log at the content tier (the title's).
 pub(super) fn content_lines(
@@ -429,11 +386,6 @@ pub(super) fn content_lines(
 }
 
 /// THE DRIFT FLUSH (plan §3.2): `mark - cwd cwd=<path>` when the OSC 7
-/// directory moved and `mark - title` when the informative title did, in
-/// the flush's own hold, which wakes the session's watchers (a one-minute
-/// hang detector). The title is content tier: the host tier `log` prints
-/// by default holds no `title=`. NEGATIVE CONTROLS: a spinner frame's move
-/// alone writes no title mark; a title-only move writes no second cwd mark.
 #[test]
 fn the_drift_flush_marks_the_cwd_and_the_title_when_they_move() {
     let mut app = App::headless_for_test();
@@ -470,7 +422,6 @@ fn the_drift_flush_marks_the_cwd_and_the_title_when_they_move() {
         "content tier: {:?}",
         content_lines(&timeline)
     );
-    // A spinner title, then its next frame: one mark, not two.
     for (i, t) in ["\u{280b} Build", "\u{2819} Build"].iter().enumerate() {
         crate::term_lock(&term).process(format!("\x1b]2;{t}\x07").as_bytes());
         let at = t0 + Duration::from_secs(1 + i as u64);
@@ -479,7 +430,6 @@ fn the_drift_flush_marks_the_cwd_and_the_title_when_they_move() {
     let got = lines_of(&timeline);
     assert_eq!(having(&got, " mark - title ").len(), 2, "{got:?}");
     assert_eq!(having(&got, " mark - cwd ").len(), 1, "{got:?}");
-    // A cleared directory is the mark with no `cwd=`.
     {
         let mut g = timeline.lock().unwrap();
         let at = g.slog().now();
@@ -493,8 +443,6 @@ fn the_drift_flush_marks_the_cwd_and_the_title_when_they_move() {
 }
 
 /// The cwd and the title cross an update as fingerprints, never as text:
-/// a successor that reads the same directory and title says
-/// neither again. NEGATIVE CONTROL: one that reads a new title says it.
 #[test]
 fn the_cwd_and_the_title_cross_an_update_as_fingerprints() {
     let (tl, _hand) = opened();
@@ -533,7 +481,6 @@ fn the_cwd_and_the_title_cross_an_update_as_fingerprints() {
     );
     n.slog_mut().observe_title("\u{280b} SENTINEL-TITLE", at);
     assert_eq!(having(&lines(n.slog().log()), " mark - title ").len(), 1);
-    // A title with no text to say is no news at first read.
     let (fresh, _hand) = opened();
     let mut f = fresh.lock().unwrap();
     let at = f.slog().now();
@@ -542,9 +489,6 @@ fn the_cwd_and_the_title_cross_an_update_as_fingerprints() {
 }
 
 /// `mark - modes n=<reverted>` (plan §3.2): a manual reset writes it in the
-/// `modes-restored` hold, `by=human` from the menu; the verb's direct run
-/// (no reader takes the lane) leaves the wake owed that the verb's arm
-/// takes. NEGATIVE CONTROL: the verb's mark names no author.
 #[test]
 fn a_manual_reset_is_a_modes_mark_by_whoever_asked() {
     let (tl, _hand) = opened();
@@ -559,7 +503,6 @@ fn a_manual_reset_is_a_modes_mark_by_whoever_asked() {
     assert_eq!(modes.len(), 2, "{got:?}");
     assert!(modes[0].contains(" by=human "), "{modes:?}");
     assert!(!modes[1].contains(" by="), "{modes:?}");
-    // The verb on a session whose lane no reader takes runs it directly.
     let h = crate::session_store::test_handle(11);
     let _ = h.ctx.timeline.lock().unwrap().slog_take_wake();
     let reply = crate::manual_reset::cmd_reset(h.local_id, &h.term, &h.ctx, "");
@@ -575,12 +518,6 @@ fn a_manual_reset_is_a_modes_mark_by_whoever_asked() {
 }
 
 /// `mark - in-doubt verb=<w>` (plan §3.2; addendum A15): a keyed write
-/// whose outcome nobody knows is marked by its verb in the `in-doubt` row's
-/// hold, and the guard calls the control worker's wake once it is released:
-/// a parked `await log kind=in-doubt` returns (a one-minute hang detector).
-/// The reply's words and the bytes are in no record. NEGATIVE CONTROLS: an
-/// `OK` write and a replay write no mark and call no wake; a verb the
-/// vocabulary does not hold reads `unknown`.
 #[test]
 fn a_write_in_doubt_is_marked_by_its_verb_and_wakes_its_watchers() {
     let h = crate::session_store::test_handle(12);
@@ -642,10 +579,7 @@ fn a_write_in_doubt_is_marked_by_its_verb_and_wakes_its_watchers() {
     assert!(got.iter().all(|l| !l.contains("SENTINEL")), "{got:?}");
 }
 
-// ---- C10: the fabric's one typed hook ----------------------------------------
-
-/// A registered session and its store: what a control worker's fabric verb
-/// runs against.
+/// A registered session and its store: what a control worker's fabric verb runs against.
 pub(super) fn fabric_rig(
     local: u64,
 ) -> (
@@ -658,9 +592,7 @@ pub(super) fn fabric_rig(
     (h, store)
 }
 
-/// An in-process `await log kind=<kind>` parked past `h`'s log as it stands:
-/// its reply arrives once a `<kind>` record is written and its watchers are
-/// woken.
+/// An in-process `await log kind=<kind>` parked past `h`'s log as it stands.
 pub(super) fn parked_log_await(
     h: &crate::session_store::SessionHandle,
     store: &crate::session_store::Store,
@@ -686,15 +618,6 @@ pub(super) fn returned(rx: &std::sync::mpsc::Receiver<String>, site: &str) -> St
 }
 
 /// A WORKER'S TASK MOVES ARE TASK MARKS, each through
-/// its production entry point — `task mark` (the verb a worker's harness and
-/// a manager use) and the supervisor's attention (`meta set attention
-/// owner=supervisor`, whose caller wakes on `changed` as `serve_meta`'s
-/// change wake does) — each site's parked `await log kind=task` its
-/// one-minute hang detector: `mark - task rev= state= attention= [why=]
-/// [code=] src=aterm conf=exact`, the `task-change` row's fact, with no path,
-/// size or origin. NEGATIVE CONTROLS: a mark that changes nothing writes no
-/// second mark, and a record seeded across an update (no row: nothing moved)
-/// writes none.
 #[test]
 fn a_workers_task_moves_are_task_marks_and_wake_the_log() {
     use crate::control::Scope;
@@ -729,7 +652,6 @@ fn a_workers_task_moves_are_task_marks_and_wake_the_log() {
         ),
         "{got}"
     );
-    // The supervisor's attention: one more rev of the same state.
     let rx = parked_log_await(&h, &store, "task");
     let changed = crate::session_timeline::write_attention_owned(
         &h.ctx,
@@ -744,7 +666,6 @@ fn a_workers_task_moves_are_task_marks_and_wake_the_log() {
         got.contains(" mark - task rev=3 state=exited attention=1 why=exit code=3 "),
         "{got}"
     );
-    // NEGATIVE CONTROL: the same state and facts again move nothing.
     let reply = cmd_task(
         &h.ctx,
         h.local_id,
@@ -757,7 +678,6 @@ fn a_workers_task_moves_are_task_marks_and_wake_the_log() {
     for leak in ["SENTINEL", "result", "from=", "tasks/"] {
         assert!(marks.iter().all(|l| !l.contains(leak)), "{leak}: {marks:?}");
     }
-    // NEGATIVE CONTROL: a seeded record writes no mark.
     let seeded = crate::session_store::test_handle(24);
     let record = h
         .ctx
@@ -773,20 +693,11 @@ fn a_workers_task_moves_are_task_marks_and_wake_the_log() {
 }
 
 /// THE FABRIC'S MARKS (plan §3.2; addendum A14), each through its verb's
-/// production entry point and the control worker's wake
-/// ([`crate::control::wake_sid_watchers`]), each site's parked `await log`
-/// its one-minute hang detector: a delivered row is `mail dir=in by=bridge`,
-/// a post is `mail dir=out`, its landing `mail-landed`, an `inbox seen`
-/// `mail-seen moved=1 word=`, and the hold `hold state=on|off`. The fold
-/// counts the mail. No body is in any record. NEGATIVE CONTROLS: a
-/// redelivered offset writes no second mark, and a repeated `inbox seen`
-/// one that says it moved nothing (`moved=0`, 6F-6).
 #[test]
 fn the_fabric_verbs_mark_the_log_and_wake_its_watchers() {
     let (h, store) = fabric_rig(21);
     let sid = h.ctx.self_id.as_str().to_string();
     let wake = |s: &aterm_session::SessionId| crate::control::wake_sid_watchers(&store, s);
-    // Mail in.
     let rx = parked_log_await(&h, &store, "mail");
     let line = format!("{sid} off=7 from=h-a kind=task trust=human text=SENTINEL%20BODY");
     assert_eq!(
@@ -801,12 +712,9 @@ fn the_fabric_verbs_mark_the_log_and_wake_its_watchers() {
             && reply.contains(" by=bridge src=fabric conf=exact "),
         "{reply}"
     );
-    // NEGATIVE CONTROL: the same offset again is the same row.
     let _ = crate::fabric::cmd_deliver_waking(&store, &line, &wake);
-    // A post, then its landing.
     let rx = parked_log_await(&h, &store, "mail");
     let post = crate::fabric::cmd_post(&h.ctx, "to=@s-peer kind=ask --wait=0 SENTINEL-POST", None);
-    // Queued whether or not a bridge is up (`ERR fabric absent id=1` here).
     assert!(super::overlap_tests::queued(&post, 1), "{post}");
     let reply = returned(&rx, "post");
     assert!(reply.contains(" mark - mail dir=out kind=ask "), "{reply}");
@@ -821,7 +729,6 @@ fn the_fabric_verbs_mark_the_log_and_wake_its_watchers() {
         reply.contains(" mark - mail-landed inbox=1 off=9 by=bridge "),
         "{reply}"
     );
-    // Inbox seen.
     let rx = parked_log_await(&h, &store, "mail-seen");
     let seen = crate::fabric::cmd_inbox_seen(&h.ctx, "1 handled");
     assert!(seen.starts_with("OK seen=1"), "{seen}");
@@ -834,7 +741,6 @@ fn the_fabric_verbs_mark_the_log_and_wake_its_watchers() {
     let _ = crate::fabric::cmd_inbox_seen(&h.ctx, "1 handled");
     let reply = returned(&rx, "inbox seen again");
     assert!(reply.contains(" seen=1 moved=0 src=fabric "), "{reply}");
-    // The hold, on and off.
     for (state, word) in [("on reason=demo", "on"), ("off", "off")] {
         let rx = parked_log_await(&h, &store, "hold");
         let reply = crate::fabric::cmd_hold_waking(
@@ -869,12 +775,6 @@ fn the_fabric_verbs_mark_the_log_and_wake_its_watchers() {
 }
 
 /// T13'S IN-PROCESS NEGATIVE CONTROL for 5B-7's world test, which asserts
-/// presence only (the delivery path's fault gives no final positive
-/// signal): its check — a delivered inbox row has its `mail dir=in` mark at
-/// the row's offset — holds over the real fabric hook
-/// ([`crate::fabric::FabricSession::record_fact`] on a `SessionCtx`) and
-/// fails over a hook that drops the `MailIn` fact, which writes the inbox
-/// row and no mark.
 #[test]
 fn a_delivery_whose_hook_drops_the_fact_writes_the_row_and_no_mail_mark() {
     use std::sync::{Arc, RwLock};
@@ -921,7 +821,6 @@ fn a_delivery_whose_hook_drops_the_fact_writes_the_row_and_no_mail_mark() {
         fn torn_state_set_aside(&self, _: u64, _: bool) {}
         fn torn_state_held(&self, _: u64) {}
     }
-    // 5B-7's presence check: the inbox row at `off` has its mark.
     let check = |ctx: &crate::SessionCtx, off: u64| -> Result<(), String> {
         let g = ctx.timeline.lock().unwrap();
         let at = format!(" off={off}");
@@ -947,14 +846,12 @@ fn a_delivery_whose_hook_drops_the_fact_writes_the_row_and_no_mail_mark() {
         let line = format!("{sid} off=7 from=h-a kind=task trust=human text=SENTINEL");
         assert_eq!(store(&line), "OK 1\n", "the delivery");
     };
-    // The real hook: the row and its mark.
     let (h, store) = fabric_rig(24);
     deliver(
         &|l| crate::fabric::cmd_deliver_waking(&store, l, &|_| {}),
         h.ctx.self_id.as_str(),
     );
     check(&h.ctx, 7).expect("the real hook marks the delivery");
-    // NEGATIVE CONTROL: the hook that drops the fact.
     let dropped = crate::session_store::test_handle(25);
     let reg = Arc::new(RwLock::new(One(Arc::new(DropsMailIn(Arc::clone(
         &dropped.ctx,
@@ -966,8 +863,6 @@ fn a_delivery_whose_hook_drops_the_fact_writes_the_row_and_no_mail_mark() {
     let e = check(&dropped.ctx, 7).expect_err("a dropped fact is caught");
     assert!(e.contains("has no mail dir=in mark"), "{e}");
 }
-
-// ---- C11: meta and story ------------------------------------------------------
 
 /// The `escalated` needs `ctx`'s log's fold holds, each as `by= src= conf=`.
 fn escalated_needs(ctx: &crate::SessionCtx) -> Vec<String> {
@@ -999,13 +894,6 @@ fn meta_marks(ctx: &crate::SessionCtx) -> Vec<String> {
 }
 
 /// THE META WRITERS' MARK (plan §3.2): a wire `meta set` is
-/// `mark - meta field=<f> value=<v>` by the connection's `log_actor`
-/// (`ctl` for an Owner instance client), through the dispatch's own
-/// `serve_meta`; an unset has no `value=`; the window's editor writes
-/// `by=human` and aterm's own stall line `by=aterm` (an attention text by
-/// its fingerprint, `fp=`). The arm's notify wakes a
-/// parked `await log kind=meta` (the one-minute hang detector). NEGATIVE
-/// CONTROL: the same value again moves nothing and writes no mark.
 #[test]
 fn the_meta_writers_mark_the_log_by_their_writer() {
     let (h, store) = fabric_rig(31);
@@ -1013,7 +901,6 @@ fn the_meta_writers_mark_the_log_by_their_writer() {
     let reply =
         crate::control::meta_line_for_test(&store, &h.term, h.local_id, &h.ctx, "set role builder");
     assert_eq!(reply, "OK\n");
-    // The arm's own wake (`handle`'s `meta` closure notifies the session).
     crate::control::wake_sid_watchers(&store, &h.ctx.self_id);
     let got = returned(&rx, "meta set");
     assert!(
@@ -1030,7 +917,6 @@ fn the_meta_writers_mark_the_log_by_their_writer() {
         last.contains(" mark - meta field=role by=ctl ") && !last.contains("value="),
         "{last}"
     );
-    // aterm's own line (`input_stall`'s owner) is aterm's.
     assert!(crate::session_timeline::write_server_attention(
         &h.ctx,
         crate::input_stall::SERVER_ATTENTION_OWNER,
@@ -1051,7 +937,6 @@ fn the_meta_writers_mark_the_log_by_their_writer() {
         )) && !last.contains("value="),
         "an attention text is said by its fingerprint: {last}"
     );
-    // The window's editor is the person's.
     let mut app = App::headless_for_test();
     let session = app
         .front_terminal(WindowId(0))
@@ -1067,12 +952,6 @@ fn the_meta_writers_mark_the_log_by_their_writer() {
 }
 
 /// THE ESCALATED NEED, DERIVED BY ATERM (addendum A16): the supervisor's
-/// attention raises `need word=escalated src=meta conf=strong` `by=aterm`
-/// whoever wrote it — the harness here — and a second writer of it raises no
-/// second need; aterm's own stall line, written over it, makes it no longer
-/// the effective owner's and its `clear` (by aterm) lifts the need though a
-/// harness's write raised it. NEGATIVE CONTROL: `meta set attention
-/// owner=upgrade` raises nothing.
 #[test]
 fn the_supervisors_attention_is_one_escalated_need_by_aterm() {
     use crate::session_timeline::{MetaEdit, write_attention_owned};
@@ -1129,7 +1008,6 @@ fn the_supervisors_attention_is_one_escalated_need_by_aterm() {
         1,
         "{raised:?}"
     );
-    // A second writer of the supervisor's line: one need still.
     let reply = crate::control::meta_line_for_test(
         &store,
         &h.term,
@@ -1144,7 +1022,6 @@ fn the_supervisors_attention_is_one_escalated_need_by_aterm() {
         1,
         "no second need mark"
     );
-    // aterm's stall line, newer, is the effective one now: aterm clears.
     assert!(crate::session_timeline::write_server_attention(
         &h.ctx,
         crate::input_stall::SERVER_ATTENTION_OWNER,
@@ -1164,19 +1041,6 @@ fn the_supervisors_attention_is_one_escalated_need_by_aterm() {
 }
 
 /// THE SUPERVISOR'S ATTENTION TEXT NEVER LEAVES RAM (which turned "never stored" into the ring's own exposure; the
-/// design's tier table: box commands, question text and the screen's last
-/// line are never journaled, carried or published):
-/// an escalation over a
-/// Bash box whose command holds a sentinel, the shape `supervise::escalate`
-/// writes, is `mark - meta field=attention fp=<16 hex>`, the text's
-/// fingerprint, with the text beside it at `Tier::Content` (`attn_text=`),
-/// so the log's view prints the `meta-change` row as the ring does. The
-/// sentinel is in that record at the content tier and in no line at the
-/// host tier (what `log` prints by default), in no journal line, on no
-/// carry line, in no brief and in no bus mirror body. NEGATIVE CONTROLS:
-/// the sentinel is in the session's meta store, where the attention
-/// belongs; another field's value is kept as it was written; and (by
-/// scratch revert) `attn_text` marked HOST puts it in the journal.
 #[test]
 fn the_supervisors_attention_text_never_leaves_ram() {
     use crate::session_timeline::{MetaEdit, write_attention_owned};
@@ -1282,12 +1146,6 @@ fn the_supervisors_attention_text_never_leaves_ram() {
 }
 
 /// THE META A SUCCESSOR RESTORES IS NO NEWS (`meta_fp`): the
-/// carry's `state` line holds each meta field's value as the log last said
-/// it, a fingerprint, never its text, and a successor that reads it back
-/// and restores the same value (`restore_carried_meta`, by aterm) writes
-/// its row's mark (one a row since phase 6) saying
-/// `carried=1`: no news. NEGATIVE CONTROL: a restore of another value, or
-/// of a field the predecessor never said, is a mark with no `carried=`.
 #[test]
 fn a_successor_restoring_the_same_meta_marks_it_carried() {
     use crate::session_timeline::MetaChange;
@@ -1346,13 +1204,6 @@ fn a_successor_restoring_the_same_meta_marks_it_carried() {
 }
 
 /// THE AUTOPILOT TIMER IS A MOVE OF THE PAIR (6F-8; the review of 6F-8):
-/// its fingerprint holds the word and the timer (`land_at=`, whole
-/// seconds), so the word with a timer a minute later is a move (no
-/// `carried=`) and the same pair again is no news (`carried=1`); across a
-/// carry, a successor restoring the word with the timer the log last said
-/// is no news, and with another timer is a move. NEGATIVE CONTROL (by
-/// scratch revert): a fingerprint of the word alone reads the timer-only
-/// move, here and on the successor, as no news.
 #[test]
 fn the_autopilot_timer_is_in_the_meta_fingerprint() {
     use crate::session_timeline::MetaChange;
@@ -1407,10 +1258,6 @@ fn the_autopilot_timer_is_in_the_meta_fingerprint() {
 }
 
 /// A PROVEN CLAIM THE SWEEP CLEARS (`release_proven_if_gone`, the status
-/// sweep's call) is a `meta field=supervisor` mark `by=aterm` with no
-/// `value=`, and leaves the escalated need as the attention says: still
-/// one, never a second, never cleared by the claim's going. A carried
-/// session (`obs_esc=1`) does not restate it.
 #[test]
 fn a_proven_claim_the_sweep_clears_leaves_the_need_consistent() {
     use crate::session_timeline::{MetaEdit, claim_supervisor_as, release_proven_if_gone};
@@ -1422,8 +1269,6 @@ fn a_proven_claim_the_sweep_clears_leaves_the_need_consistent() {
         MetaEdit::Set("stuck"),
         aterm_slog::Actor::Harness,
     );
-    // A stand-in's proof, not this process's: the claim reads its process's
-    // codex-alab record, and this process's environment names the person's.
     let proven = crate::self_claim::stand_in::running();
     let pid = proven.pid;
     let now = crate::metrics::now_us();
@@ -1452,7 +1297,6 @@ fn a_proven_claim_the_sweep_clears_leaves_the_need_consistent() {
     assert_eq!(escalated_needs(&h.ctx), ["by=aterm src=meta conf=strong"]);
     let got = lines_of(&h.ctx.timeline);
     assert_eq!(having(&got, " word=escalated ").len(), 1, "{got:?}");
-    // The carry: a successor reads the standing back and does not restate it.
     let tokens = h
         .ctx
         .timeline
@@ -1482,9 +1326,6 @@ fn a_proven_claim_the_sweep_clears_leaves_the_need_consistent() {
 }
 
 /// `mark - story word=<verb>` (addendum A15): what `aterm ctl story` told,
-/// by its teller (carried in `Wake::Story`), written on the main thread
-/// after the point is noted, which wakes the session's watchers. Its text
-/// is in no record at any tier.
 #[test]
 fn a_told_story_is_one_mark_by_its_teller_and_no_text() {
     let mut app = App::headless_for_test();
@@ -1519,9 +1360,6 @@ fn a_told_story_is_one_mark_by_its_teller_and_no_text() {
 }
 
 /// ONE `meta-change` WRITER BY CONSTRUCTION: the general
-/// recorder refuses the kind (a debug build panics, a release build appends
-/// nothing), so no writer can skip the helper's mark and its derived
-/// `escalated`.
 #[test]
 #[should_panic(expected = "record_meta_change's")]
 fn a_meta_change_has_one_writer() {
@@ -1531,8 +1369,6 @@ fn a_meta_change_has_one_writer() {
         "field=role value=x".to_string(),
     );
 }
-
-// ---- 6C-1: a harness relaunch lifts the failure it caused ----------------
 
 /// The session's failure needs, and its `mark - seen by=harness` lines.
 fn failures_and_harness_seen(
@@ -1556,8 +1392,6 @@ fn failures_and_harness_seen(
 }
 
 /// The relaunch's act at `ms` into the test, as the hosted lanes' row
-/// writer writes it (`harness_host::log_act`) for a step that brought a new
-/// agent process up (`upgrade_drive::started`).
 fn relaunch_at(
     tl: &std::sync::Mutex<crate::session_timeline::SessionTimeline>,
     hand: &super::super::tests::Hand,
@@ -1570,8 +1404,6 @@ fn relaunch_at(
 }
 
 /// `claude` in front (group `pgid`) of the running block `blk` begun at
-/// `start`, at `ms`: the sweep its name wakes opens its `agent` run under
-/// that block's `cmd` run, as the resolver and the status sweep do.
 fn claude_in_front(
     tl: &std::sync::Mutex<crate::session_timeline::SessionTimeline>,
     hand: &super::super::tests::Hand,
@@ -1593,10 +1425,6 @@ fn claude_in_front(
 }
 
 /// (a) A HARNESS RELAUNCH LIFTS THE FAILURE IT CAUSED:
-/// the old `claude` command, an agent in front of it, ends 143
-/// (`need=failure` on its run), the relaunched `claude` opens a new `cmd`
-/// run, and the relaunch's act writes `mark - seen by=harness src=aterm
-/// conf=strong` after it, so no failure need is left and `brief` names none.
 #[test]
 fn a_relaunch_lifts_the_failure_it_caused() {
     let (tl, hand) = opened();
@@ -1647,10 +1475,6 @@ fn a_relaunch_lifts_the_failure_it_caused() {
 }
 
 /// (b) NEGATIVE CONTROLS: a relaunch's act written while no newer run of
-/// the failed kind is open writes no `seen`. Before the old run's end is
-/// read there is no failure to lift, and the 143 close that follows raises
-/// the need; with the need standing and still no newer run open, a second
-/// act lifts nothing either.
 #[test]
 fn a_relaunch_with_no_newer_run_open_lifts_nothing() {
     let (tl, hand) = opened();
@@ -1674,12 +1498,6 @@ fn a_relaunch_with_no_newer_run_open_lifts_nothing() {
 }
 
 /// (d) TWO FAILURES: a `seen` lifts every failure need, so a relaunch beside
-/// a second failure writes none and both stand (the session did fail).
-/// Two `cmd` failures never stand together (the second's close lifts the
-/// first, `lifts_failure`), so the second is a program run's, written into
-/// the log as a producer of `prog` runs would. NEGATIVE CONTROL (the plan's,
-/// run by scratch revert): a guard that checks only N writes the `seen` and
-/// erases the program run's failure.
 #[test]
 fn a_relaunch_beside_a_second_failure_lifts_neither() {
     use aterm_slog::{Close, Open, Out, RunOut};
@@ -1715,14 +1533,6 @@ fn a_relaunch_beside_a_second_failure_lifts_neither() {
 }
 
 /// (f) A RESTART LIFTS NO FAILURE OF A COMMAND THAT RAN NO AGENT (the
-/// relaunch did not cause it): `make` ends 2 before the person starts
-/// `claude`, which is in front of its own command when the harness's
-/// restart step comes. The failure is the session's only one, its run is
-/// closed and a newer `cmd` run is open, but no agent ran under `make`, so
-/// the act is written and no `seen`: the need stands until a later command
-/// ends, as 3B's rule says. NEGATIVE CONTROL (by scratch revert): a guard
-/// that does not ask whether an agent ran under the failed run writes the
-/// `seen` and erases `make`'s failure.
 #[test]
 fn a_restart_lifts_no_failure_of_a_command_that_ran_no_agent() {
     let (tl, hand) = opened();

@@ -1,70 +1,12 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Window show state across an update: full screen, minimized, the window
-//! stack, and the key window.
-//!
-//! * Capture (outgoing, macOS only) — `App::capture_restore_manifest` records a
-//!   [`WindowShow`] per window through [`captured_show`]. Full screen and
-//!   minimized are read off the live window (winit's full-screen state and
-//!   `isMiniaturized`); the stack and the key window are read off
-//!   `App::focus_order` and `frontmost_window` through [`stacking_ranks`], so
-//!   no new AppKit query is needed. On macOS a window that gains focus is
-//!   raised, so focus MRU order matches stacking order for every window the
-//!   user brought forward.
-//! * Commit comparison — the show state is live, like the position, and
-//!   `commit_layout_topology` normalizes it out, so zooming, minimizing, or
-//!   clicking another window while the successor boots cannot revoke a healthy
-//!   Commit.
-//! * Restore (successor, and a cold launch that restores a quit's manifest) —
-//!   `apply_restore_manifest` records which live window each manifest window
-//!   became, [`plan`] turns the carried states into a [`ShowPlan`], and
-//!   `App::settle_carried_window_show` applies it in two stages:
-//!   1. Stack, once every carried window is on glass: minimize what was
-//!      minimized, then raise the rest back to front with the key window last
-//!      ([`ShowPlan::stacking_ops`]). Windows are created in manifest order
-//!      (window 0 is the bootstrap window whose session was spawned before the
-//!      restore runs, and manifest order is what the layout digest and Commit
-//!      comparison cover), so the stack is re-established after creation. On
-//!      the update lane this runs from the proof path in the same call that
-//!      writes the adoption proof, so it is in place before the outgoing
-//!      process activates the successor at Commit, and a window it minimizes
-//!      cannot be one the proof still waits to see paint (a minimized window
-//!      presents nothing; see `App::settle_carried_window_show`). Raising is
-//!      winit's `set_visible(true)` (`makeKeyAndOrderFront:`), which orders the
-//!      window front within the app without activating the app.
-//!   2. Full screen, only after Commit and only while aterm is the active app
-//!      ([`ShowPlan::fullscreen_ops`], key window last so the user ends in its
-//!      Space). Entering full screen resizes the window, and before Commit the
-//!      successor shares every PTY with the parked outgoing process — a resize
-//!      would SIGWINCH programs of a process that may yet resume. While the
-//!      user is in another app, a full-screen transition would pull them into
-//!      aterm's new Space, so it waits for aterm to be in front again (a later
-//!      update carries a pending re-entry as full screen so the state is not
-//!      lost). "In front" is read only off focus records a `Focused` event has
-//!      confirmed (`CarriedShow::heard`), since newly created windows start out
-//!      recorded as focused. At Commit the key window is made key once more,
-//!      unless the user already typed into another carried window.
-//!
-//! A manifest whose windows carry no show state (non-macOS or headless
-//! captures, or older manifests) plans nothing; a window that is gone or has no
-//! OS window is skipped; a cold launch never restores every window minimized.
-//! `window_show_conformance` replays the plan, stage ordering, and bookkeeping
-//! against `NativeUpdateWindowShow`.
+//! Window show state across an update: full screen, minimized, the window stack, and the key window.
 
 use crate::WindowId;
 use crate::restore::WindowShow;
 
-/// Front-to-back stacking ranks for `live` windows (aligned index for index; 0
-/// is the frontmost), from the focus MRU `focus_order` (most recent last).
-///
-/// Windows that gained focus rank by how recently they did. A window that
-/// never gained focus ranks in front of every one that did, newest first: its
-/// reveal ordered it front within the app, and it can only still be unfocused
-/// if the app has not been active since — so no focus gain has reordered the
-/// others above it. (A restore seeds the MRU from the stack it applied, so the
-/// windows an update restores while the user is in another app are not in this
-/// class; see `App::settle_carried_window_show`.)
+/// Front-to-back stacking ranks for `live` windows (aligned index for index; 0 is the frontmost), from the focus MRU `focus_order` (most recent last).
 #[cfg(any(target_os = "macos", test))]
 pub(crate) fn stacking_ranks<W: Copy + Ord>(live: &[W], focus_order: &[W]) -> Vec<u32> {
     let mut front_to_back: Vec<W> = live
@@ -72,7 +14,6 @@ pub(crate) fn stacking_ranks<W: Copy + Ord>(live: &[W], focus_order: &[W]) -> Ve
         .copied()
         .filter(|window| !focus_order.contains(window))
         .collect();
-    // Newest first: window ids are allocated in increasing order.
     front_to_back.sort_unstable_by(|a, b| b.cmp(a));
     for window in focus_order.iter().rev() {
         if live.contains(window) && !front_to_back.contains(window) {
@@ -100,12 +41,7 @@ pub(crate) struct ShowProbe {
     pub minimized: Option<bool>,
 }
 
-/// One window's captured [`WindowShow`]. `probe` is `None` for a window with
-/// no OS window (a headless instance, a window not attached yet) — nothing is
-/// known about how it is shown, so nothing is recorded. `fullscreen_pending`
-/// is a carried full-screen re-entry this process has not performed yet
-/// (aterm has not been in front since the update): the window is recorded as
-/// full screen, so a second update before the user returns does not forget it.
+/// One window's captured [`WindowShow`].
 #[cfg(any(target_os = "macos", test))]
 pub(crate) fn captured_show(
     probe: Option<ShowProbe>,
@@ -118,8 +54,6 @@ pub(crate) fn captured_show(
     };
     let minimized = probe.minimized;
     WindowShow {
-        // A window cannot be both: AppKit refuses to miniaturize a full-screen
-        // window, and a pending re-entry is never planned for a minimized one.
         fullscreen: Some((probe.fullscreen || fullscreen_pending) && minimized != Some(true)),
         minimized,
         z_order: Some(rank),
@@ -132,35 +66,27 @@ pub(crate) fn captured_show(
 pub(crate) enum ShowLane {
     /// A seamless update's successor: reproduce the outgoing process exactly.
     Handoff,
-    /// A cold launch restoring a quit's manifest: the same, except that it
-    /// never leaves every window minimized.
+    /// A cold launch restoring a quit's manifest: the same, except that it never leaves every window minimized.
     Cold,
 }
 
-/// What a restore does with the carried show states. Built by [`plan`].
+/// What a restore does with the carried show states.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ShowPlan<W> {
     /// Windows to miniaturize, back to front.
     pub minimize: Vec<W>,
-    /// Windows to raise, back to front, the key window last. Empty when the
-    /// plan names a single window: its reveal already made it key and front.
+    /// Windows to raise, back to front, the key window last.
     pub raise: Vec<W>,
-    /// The window typing should go to: the carried key window when it is not
-    /// minimized, else the frontmost window that is not.
+    /// The window typing should go to: the carried key window when it is not minimized, else the frontmost window that is not.
     pub key: Option<W>,
     /// Windows to re-enter full screen, back to front, the key window last.
     pub fullscreen: Vec<W>,
-    /// The focus MRU this stack implies, most recent last — what the restore
-    /// seeds `App::focus_order` with, so the next capture reads the stack it
-    /// applied even if the app never gains focus in between.
+    /// The focus MRU this stack implies, most recent last.
     pub focus_seed: Vec<W>,
 }
 
 impl<W> ShowPlan<W> {
-    /// Whether the plan has nothing to do. A key window alone is not work: with
-    /// one window on screen the reveal already made it key, so a single-window
-    /// update that was neither minimized nor in full screen — the common case —
-    /// records no carry and makes no extra AppKit call.
+    /// Whether the plan has nothing to do.
     pub(crate) fn is_empty(&self) -> bool {
         self.minimize.is_empty() && self.raise.is_empty() && self.fullscreen.is_empty()
     }
@@ -171,26 +97,14 @@ impl<W> ShowPlan<W> {
 pub(crate) enum ShowOp<W> {
     /// Miniaturize into the Dock (winit `set_minimized(true)`).
     Minimize(W),
-    /// Order front within the app and make it the app's key window, without
-    /// activating the app (winit `set_visible(true)`, `makeKeyAndOrderFront:`).
+    /// Order front within the app and make it the app's key window, without activating the app (winit `set_visible(true)`, `makeKeyAndOrderFront:`).
     Raise(W),
-    /// Enter native full screen on its current display (winit
-    /// `set_fullscreen(Borderless(None))`).
+    /// Enter native full screen on its current display (winit `set_fullscreen(Borderless(None))`).
     EnterFullScreen(W),
 }
 
 impl<W: Copy + Eq> ShowPlan<W> {
-    /// Key the most recent window in `typed` that this plan raises or
-    /// minimizes instead of the carried key window: it becomes the plan's key,
-    /// raised last, entered into full screen last, and last in the focus seed.
-    /// Returns it when the key moved.
-    ///
-    /// A revealed window takes keys from the moment it is on glass while the
-    /// adoption proof (which the stack waits for) is still pending. Raising the
-    /// carried key window over a window being typed into would move keyboard
-    /// focus mid-command. A window carried minimized is also on glass from its
-    /// reveal until the stack; typing into it un-minimizes it, moving it from
-    /// `minimize` to the end of `raise`.
+    /// Key the most recent window in `typed` that this plan raises or minimizes instead of the carried key window.
     pub(crate) fn key_typed_window(&mut self, typed: &[W]) -> Option<W> {
         let window = *typed
             .iter()
@@ -219,8 +133,7 @@ impl<W: Copy + Eq> ShowPlan<W> {
 }
 
 impl<W: Copy> ShowPlan<W> {
-    /// Stage 1, the stack: minimize first, so the key window the raises settle
-    /// on is the last window AppKit was told to key, then raise back to front.
+    /// Stage 1, the stack: minimize first, so the key window the raises settle on is the last window AppKit was told to key, then raise back to front.
     pub(crate) fn stacking_ops(&self) -> Vec<ShowOp<W>> {
         self.minimize
             .iter()
@@ -238,12 +151,7 @@ impl<W: Copy> ShowPlan<W> {
     }
 }
 
-/// Plan a restore of `windows` — `(live window, carried show state)` in
-/// manifest order.
-///
-/// Returns an empty plan when no window carries any show state. The stack is
-/// the carried `z_order` (front to back; a window without one goes behind
-/// every window with one; ties keep manifest order).
+/// Plan a restore of `windows` — `(live window, carried show state)` in manifest order.
 pub(crate) fn plan<W: Copy + Eq>(windows: &[(W, WindowShow)], lane: ShowLane) -> ShowPlan<W> {
     let empty = ShowPlan {
         minimize: Vec::new(),
@@ -255,7 +163,6 @@ pub(crate) fn plan<W: Copy + Eq>(windows: &[(W, WindowShow)], lane: ShowLane) ->
     if windows.iter().all(|(_, show)| show.is_unknown()) {
         return empty;
     }
-    // Front to back: stable, so ties keep manifest order.
     let mut front_to_back: Vec<(W, WindowShow)> = windows.to_vec();
     front_to_back.sort_by_key(|(_, show)| show.z_order.unwrap_or(u32::MAX));
     let mut minimized: Vec<W> = front_to_back
@@ -263,7 +170,6 @@ pub(crate) fn plan<W: Copy + Eq>(windows: &[(W, WindowShow)], lane: ShowLane) ->
         .filter(|(_, show)| show.minimized == Some(true))
         .map(|(window, _)| *window)
         .collect();
-    // A cold launch the user started must show them a window.
     if lane == ShowLane::Cold && minimized.len() == front_to_back.len() {
         minimized.retain(|window| *window != front_to_back[0].0);
     }
@@ -277,7 +183,6 @@ pub(crate) fn plan<W: Copy + Eq>(windows: &[(W, WindowShow)], lane: ShowLane) ->
         .find(|(window, show)| show.key == Some(true) && visible.contains(window))
         .map(|(window, _)| *window)
         .or_else(|| visible.first().copied());
-    // Back to front, the key window moved to the end.
     let back_to_front = |candidates: Vec<W>| -> Vec<W> {
         let mut ordered: Vec<W> = candidates.into_iter().rev().collect();
         if let Some(key) = key
@@ -312,30 +217,21 @@ pub(crate) fn plan<W: Copy + Eq>(windows: &[(W, WindowShow)], lane: ShowLane) ->
     }
 }
 
-/// The show state a restore carried, from the moment its windows exist until
-/// the last of it is applied (`App::carried_window_show`).
+/// The show state a restore carried, from the moment its windows exist until the last of it is applied (`App::carried_window_show`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CarriedShow {
     pub lane: ShowLane,
     pub plan: ShowPlan<WindowId>,
     /// Stage 1 is done: the stack is on glass.
     pub stacked: bool,
-    /// This process owns every window: always on a cold launch, from Commit on
-    /// the update lane. Full screen waits for it.
+    /// This process owns every window: always on a cold launch, from Commit on the update lane.
     pub committed: bool,
-    /// The carried windows whose focus the App's record reports truthfully —
-    /// what "is aterm in front" is read from. A window the restore just created
-    /// starts out recorded as focused (`WindowState` is built focused) until
-    /// winit delivers the `Focused(false)` it queued at creation, so its record
-    /// counts only once a `Focused` event has reached it. The bootstrap window
-    /// counts from the start: it was created, and its focus reported, before
-    /// the restore ran.
+    /// The carried windows whose focus the App's record reports truthfully — what "is aterm in front" is read from.
     pub heard: Vec<WindowId>,
 }
 
 impl CarriedShow {
-    /// A fresh carry for `plan`, nothing applied yet; `bootstrap` is the window
-    /// that existed before the restore (manifest window 0's live window).
+    /// A fresh carry for `plan`, nothing applied yet.
     pub(crate) fn new(
         lane: ShowLane,
         plan: ShowPlan<WindowId>,
@@ -358,10 +254,7 @@ impl CarriedShow {
 }
 
 impl crate::App {
-    /// Record, at the end of the restore rebuild, the live window each manifest
-    /// window became and the show state it carried; `bootstrap` is the window
-    /// that existed before the rebuild. Inert headless (no OS window to show)
-    /// and for a manifest that carries no show state at all.
+    /// Record, at the end of the restore rebuild, the live window each manifest window became and the show state it carried.
     pub(crate) fn record_carried_window_show(
         &mut self,
         windows: &[(WindowId, WindowShow)],
@@ -382,9 +275,7 @@ impl crate::App {
         self.carried_window_show = Some(CarriedShow::new(lane, plan, bootstrap));
     }
 
-    /// A `Focused` event reached `window` (the `WindowEvent::Focused` arm, after
-    /// `on_focus` recorded it): its focus record is truthful from now on, and a
-    /// gain may be exactly what a waiting full screen needs.
+    /// A `Focused` event reached `window` (the `WindowEvent::Focused` arm, after `on_focus` recorded it).
     pub(crate) fn carried_window_show_focus_event(
         &mut self,
         window: WindowId,
@@ -398,46 +289,26 @@ impl crate::App {
         self.settle_carried_window_show()
     }
 
-    /// Advance the carried show state as far as it can go now, and return the
-    /// operations performed (the seam the tests read). Cheap when nothing is
-    /// carried; called from `about_to_wait`, at Commit and on every focus event.
-    ///
-    /// While this process still owes the adoption proof (`handoff_ready`), the
-    /// stack is applied only from the proof path
-    /// ([`Self::settle_carried_window_show_at_proof`]). The proof waits for
-    /// every OS window to have a frame on record (`last_present`), which the
-    /// boot clears and re-earns more than once (the fallback-face convergence
-    /// clears it after every present while the async parse is in flight), and
-    /// a minimized window presents nothing: its acquire parks. A stack applied
-    /// in that gap — every window revealed, one not painted — could minimize a
-    /// window that then never painted again, leaving the proof unwritten until
-    /// the parent's timeout rolled the update back.
+    /// Advance the carried show state as far as it can go now, and return the operations performed (the seam the tests read).
     pub(crate) fn settle_carried_window_show(&mut self) -> Vec<ShowOp<WindowId>> {
         let may_stack = self.handoff_ready.is_none();
         self.settle_carried_window_show_as(may_stack)
     }
 
-    /// The proof path's settle (`maybe_signal_handoff_ready`, past its last
-    /// gate: every OS window painted and revealed, the restore drained, the
-    /// control service ready). The stack goes on here and the proof is written
-    /// in the same call, so nothing it does can hold the proof back.
+    /// The proof path's settle (`maybe_signal_handoff_ready`, past its last gate: every OS window painted and revealed, the restore drained, the control service ready).
     pub(crate) fn settle_carried_window_show_at_proof(&mut self) -> Vec<ShowOp<WindowId>> {
         self.settle_carried_window_show_as(true)
     }
 
     /// [`Self::settle_carried_window_show`]'s body; `may_stack` is whether this
-    /// caller may apply the stack.
     fn settle_carried_window_show_as(&mut self, may_stack: bool) -> Vec<ShowOp<WindowId>> {
         if self.carried_window_show.is_none() {
             return Vec::new();
         }
-        // Where the person typed while the update finished: the stack keys
-        // that window, not the carried one.
         let typed = self.pre_commit_typed_windows();
         let Some(carried) = self.carried_window_show.as_mut() else {
             return Vec::new();
         };
-        // A carried window closed in the meantime is simply not shown.
         let windows = &self.windows;
         let live = |window: &WindowId| windows.contains_key(window);
         carried.plan.minimize.retain(live);
@@ -449,13 +320,10 @@ impl crate::App {
         }
         let mut performed = Vec::new();
         if !carried.stacked {
-            // The proof is owed and this is not its path: nothing else can be
             // due either (full screen waits for the stack and for Commit).
             if !may_stack {
                 return performed;
             }
-            // Raising a window still waiting for its first present would put a
-            // frame on glass before the carried pixels (`pending_reveal`).
             let revealed = carried.plan.focus_seed.iter().all(|window| {
                 windows
                     .get(window)
@@ -484,10 +352,6 @@ impl crate::App {
                 self.perform_show_op(*op);
             }
             performed.extend(ops);
-            // The stack just applied IS the OS stack: seed the MRU with it (and
-            // the front with the key window), so a capture before the app next
-            // gains focus reads it, and a close re-points to the window AppKit
-            // raises. A live focus gain re-pushes in the same order.
             for window in &seed {
                 self.focus_order.retain(|candidate| candidate != window);
                 self.focus_order.push(*window);
@@ -518,10 +382,7 @@ impl crate::App {
         performed
     }
 
-    /// The carried windows keys or text were typed into while the update
-    /// finished — the pre-Commit queue (`handoff_deferred_input`), in the
-    /// order they were typed. What the stack and Commit read to leave the
-    /// keyboard where the person is working.
+    /// The carried windows keys or text were typed into while the update finished.
     pub(crate) fn pre_commit_typed_windows(&self) -> Vec<WindowId> {
         self.handoff_deferred_input
             .iter()
@@ -536,12 +397,7 @@ impl crate::App {
             .collect()
     }
 
-    /// The update has committed: this process owns every window now. Make the
-    /// carried key window key again — unless the user typed into a different
-    /// carried window while the update was finishing (`typed_into`), in which
-    /// case that is where they are working and the key stays theirs — and let
-    /// full screen proceed. Returns the operations performed. (Commit is the
-    /// unix overlap handoff's; nothing else reaches it.)
+    /// The update has committed: this process owns every window now.
     #[cfg(any(unix, test))]
     pub(crate) fn commit_carried_window_show(
         &mut self,
@@ -552,10 +408,6 @@ impl crate::App {
         };
         let first_commit = !carried.committed;
         carried.committed = true;
-        // A stack that is not on glass yet raises the key window last when it
-        // goes on, so only a stack already applied needs the key re-asserted —
-        // and only a stack of more than one window (`raise` is empty for one:
-        // there is no other window the keyboard could be on).
         let rekey = (first_commit && carried.stacked && !carried.plan.raise.is_empty())
             .then_some(carried.plan.key)
             .flatten();
@@ -578,8 +430,6 @@ impl crate::App {
     }
 
     /// Stage 2: re-enter the carried full screens once it is safe — the stack
-    /// is on glass, the process owns every window, and aterm is the active app.
-    /// Clears the carry once nothing is left to do.
     fn enter_carried_fullscreen_if_due(&mut self) -> Vec<ShowOp<WindowId>> {
         let Some(carried) = self.carried_window_show.as_ref() else {
             return Vec::new();
@@ -591,10 +441,6 @@ impl crate::App {
             self.carried_window_show = None;
             return Vec::new();
         }
-        // "aterm is the active app": one of the restored windows holds the
-        // keyboard, by a focus record that is truthful (`CarriedShow::heard`).
-        // Every window of a windowed restore has an OS window (one whose attach
-        // failed was closed), so that record is what AppKit reported.
         let in_front = carried.plan.focus_seed.iter().any(|window| {
             carried.heard.contains(window) && self.windows.get(window).is_some_and(|ws| ws.focused)
         });
@@ -622,9 +468,6 @@ impl crate::App {
     }
 
     /// Perform one operation on the window's OS window. A window with none — a
-    /// headless instance, or one whose attach failed — is skipped: this is the
-    /// only place the show state reaches AppKit, and it goes through the
-    /// window's own winit handle, never a process-global query.
     fn perform_show_op(&self, op: ShowOp<WindowId>) {
         let (ShowOp::Minimize(window) | ShowOp::Raise(window) | ShowOp::EnterFullScreen(window)) =
             op;
@@ -637,10 +480,6 @@ impl crate::App {
         };
         match op {
             ShowOp::Minimize(_) => os_window.set_minimized(true),
-            // The plan never raises or full-screens a window it minimized, but
-            // the user can minimize one between the stack and Commit, and
-            // `makeKeyAndOrderFront:` would pull it back out of the Dock: what
-            // they did last wins.
             ShowOp::Raise(_) | ShowOp::EnterFullScreen(_)
                 if os_window.is_minimized() == Some(true) => {}
             ShowOp::Raise(_) => os_window.set_visible(true),
@@ -664,27 +503,18 @@ mod tests {
         }
     }
 
-    // ---- capture ----------------------------------------------------------
-
     /// The MRU is the stack: the most recently focused window is rank 0, and
-    /// a window closed since it was focused is not ranked at all.
     #[test]
     fn stacking_ranks_follow_the_focus_mru() {
-        // Focused 1, then 3, then 2: front to back is 2, 3, 1. Window 9 is
-        // gone and must not take a rank.
         let ranks = stacking_ranks(&[1_u64, 2, 3], &[9, 1, 3, 2]);
         assert_eq!(ranks, vec![2, 0, 1]);
     }
 
     /// A window that never gained focus sits in front of every window that did
-    /// (its reveal ordered it front and nothing has reordered since), newest
-    /// first — the successor that restored while the user was elsewhere.
     #[test]
     fn never_focused_windows_rank_in_front_newest_first() {
         let ranks = stacking_ranks(&[1_u64, 2, 3, 4], &[2, 1]);
-        // Never focused: 4 (newest), 3. Then the MRU: 1, 2.
         assert_eq!(ranks, vec![2, 3, 1, 0]);
-        // No focus history at all (a headless-shaped App): newest in front.
         assert_eq!(stacking_ranks(&[5_u64, 7], &[]), vec![1, 0]);
     }
 
@@ -719,8 +549,6 @@ mod tests {
     }
 
     /// A carried full screen this process has not re-entered yet (aterm has
-    /// not been in front since the update) is still captured AS full screen,
-    /// so a second update does not forget it.
     #[test]
     fn a_pending_full_screen_is_captured_as_full_screen() {
         let probe = ShowProbe {
@@ -731,7 +559,6 @@ mod tests {
             captured_show(Some(probe), 0, true, true).fullscreen,
             Some(true)
         );
-        // …but never over a window the user has since minimized.
         let minimized = ShowProbe {
             fullscreen: false,
             minimized: Some(true),
@@ -741,8 +568,6 @@ mod tests {
             Some(false)
         );
     }
-
-    // ---- plan -------------------------------------------------------------
 
     /// A manifest that carries no show state plans nothing, on either lane.
     #[test]
@@ -757,8 +582,6 @@ mod tests {
     }
 
     /// Three windows created in manifest order 1, 2, 3 (so the reveals left 3
-    /// key and in front), while the carried stack was 2 in front and key, then
-    /// 1, then 3: the plan raises back to front with the key window last.
     #[test]
     fn the_stack_is_raised_back_to_front_with_the_key_window_last() {
         let windows = [
@@ -778,7 +601,6 @@ mod tests {
     }
 
     /// The key flag outranks the stack when the two disagree (a window the app
-    /// keyed without a focus event): the key window is raised last either way.
     #[test]
     fn the_key_flag_outranks_the_stack() {
         let windows = [(1_u64, show(0, false)), (2, show(1, true))];
@@ -788,8 +610,6 @@ mod tests {
     }
 
     /// One window: its reveal already made it key and front, so there is
-    /// nothing to raise — a single-window update performs no extra AppKit call
-    /// unless it has to minimize or re-enter full screen, and records no carry.
     #[test]
     fn a_single_window_raises_nothing() {
         let plan = plan(&[(1_u64, show(0, true))], ShowLane::Handoff);
@@ -805,7 +625,6 @@ mod tests {
     }
 
     /// Minimized windows are minimized FIRST, never raised, never keyed; the
-    /// key moves to the frontmost window still on screen.
     #[test]
     fn minimized_windows_are_minimized_first_and_never_keyed() {
         let mut minimized_key = show(0, true);
@@ -821,13 +640,10 @@ mod tests {
             plan.stacking_ops(),
             vec![ShowOp::Minimize(1), ShowOp::Raise(3), ShowOp::Raise(2)]
         );
-        // The MRU seed keeps the minimized window behind the ones on screen.
         assert_eq!(plan.focus_seed, vec![1, 3, 2]);
     }
 
     /// The update lane reproduces the outgoing process exactly, even with
-    /// every window minimized; a cold launch the user started shows the
-    /// frontmost one instead.
     #[test]
     fn a_cold_launch_never_restores_every_window_minimized() {
         let mut back = show(1, false);
@@ -850,8 +666,6 @@ mod tests {
     }
 
     /// Full screen is re-entered back to front with the key window LAST, so
-    /// the user ends in the Space they were in; a minimized window is never
-    /// full-screened (AppKit cannot hold both).
     #[test]
     fn full_screen_is_re_entered_with_the_key_window_last() {
         let mut key = show(0, true);
@@ -871,8 +685,6 @@ mod tests {
     }
 
     /// A hand-edited or partial manifest is data: windows without a rank go
-    /// behind the ranked ones, ties keep manifest order, and a second `key`
-    /// loses to the first.
     #[test]
     fn gaps_ties_and_duplicate_keys_are_tolerated() {
         let unranked = WindowShow {
@@ -886,24 +698,11 @@ mod tests {
             (4, show(3, false)),
         ];
         let plan = plan(&windows, ShowLane::Handoff);
-        // Front to back: 4, 2, 3, 1. The first `key = true` in manifest order
-        // is window 1.
         assert_eq!(plan.key, Some(1));
         assert_eq!(plan.raise, vec![3, 2, 4, 1]);
     }
 
-    // ---- the App carry ----------------------------------------------------
-    //
-    // A headless App has no OS windows, so `perform_show_op` reaches nothing
-    // here: what these pin is WHEN each stage runs and what the App's own
-    // bookkeeping (the MRU, the front, the carry) becomes — the half a unit
-    // test can see. The operations returned are the ones performed on a
-    // windowed App. `crate::window_show_conformance` replays the same seams
-    // against the `NativeUpdateWindowShow` model.
-
-    /// Three logical windows: 0 is the bootstrap, 1 and 2 are the ones the
-    /// rebuild created (2 last, so it is the front the rebuild left). Like a
-    /// real rebuild's, the two new windows start out recorded as focused.
+    /// Three logical windows: 0 is the bootstrap, 1 and 2 are the ones the rebuild created (2 last, so it is the front the rebuild left).
     pub(crate) fn three_windows() -> (crate::App, [WindowId; 3]) {
         let mut app = crate::App::headless_for_test();
         let first = WindowId(0);
@@ -918,9 +717,6 @@ mod tests {
     }
 
     /// Stage 1 on the update lane: nothing moves while a carried window is
-    /// still waiting for its first present, then the stack goes on back to
-    /// front with the key window last, and the MRU and the front become that
-    /// stack — the rebuild had left window 2 in front, the carried key was 1.
     #[test]
     fn the_stack_waits_for_the_reveal_then_seeds_the_mru_and_the_front() {
         let (mut app, [w0, w1, w2]) = three_windows();
@@ -967,10 +763,6 @@ mod tests {
     }
 
     /// Window 2 was carried minimized, but every carried window is on glass
-    /// from its reveal until the stack, and the reveal left window 2 key.
-    /// Typing into window 2 un-minimizes it: the stack leaves it on glass,
-    /// raises it last, and keys it, and Commit keys it again. With nothing
-    /// typed, window 2 goes to the Dock and window 1 is keyed, as carried.
     #[test]
     fn keys_typed_into_a_window_carried_minimized_keep_it_out_of_the_dock() {
         let windows = |[w0, w1, w2]: [WindowId; 3]| {
@@ -1034,7 +826,6 @@ mod tests {
     }
 
     /// A carried window the user closed before its stage runs is dropped from
-    /// the plan — never raised, never keyed — and the rest still goes on.
     #[test]
     fn a_closed_window_is_dropped_from_the_carry() {
         let (mut app, [w0, w1, w2]) = three_windows();
@@ -1056,7 +847,6 @@ mod tests {
     }
 
     /// A headless instance records no carry, and a headless capture records no
-    /// show state, so its layout wire omits `[windows.show]`.
     #[test]
     fn a_headless_app_carries_and_captures_nothing() {
         let (mut app, [w0, w1, _]) = three_windows();

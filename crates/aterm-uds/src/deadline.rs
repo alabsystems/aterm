@@ -1,69 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A deadline on a call that can block forever: in this process ([`Gate`]) or in a child
-//! ([`output_until`], [`output_while_progressing`], [`outputs_until`]).
-//!
-//! The case is macOS's `trustd`. Security.framework's certificate and code-signing checks
-//! (`SecTrustEvaluateWithError`, `SecCodeCheckValidity`, `SecStaticCodeCheckValidity` on
-//! certificate-chained code) and `/usr/bin/codesign` are synchronous Mach round-trips to it;
-//! with `trustd` silent they wait forever (no socket timeout reaches a thread parked in a Mach
-//! receive, and there is no cancellation API). `SecCodeCopySelf`, designated-requirement reads,
-//! `SecStaticCodeCreateWithPath`, a validity check of ad-hoc code, `spctl` and `security` still
-//! answer.
-//!
-//! # In this process: [`Gate::run`]
-//!
-//! The call runs on a helper thread and the caller stops waiting at `deadline`:
-//!
-//! * `work` is `'static + Send`, so a helper that outlives its caller cannot reach the
-//!   caller's state. They share one reference-counted slot; a caller that gives up marks it
-//!   abandoned, and the helper drops its result when it returns.
-//! * Every running helper carries its own suspect age: how long that kind of call may honestly
-//!   take (a TLS evaluation a few seconds, hashing a large bundle a minute). While any helper is
-//!   past its suspect age, a new call is refused at once without starting a helper, so the
-//!   stuck helpers never grow past those that started before the first went overdue. When they
-//!   return the next call tries the service again: recovery needs no restart. The check and
-//!   the start are one step under the list's lock.
-//! * Per-call suspect ages keep one site's honest slowness from refusing another; an overdue
-//!   call refuses every site sharing the gate, which is why every in-process wait on `trustd`
-//!   goes through the one [`TRUST`] gate.
-//! * A panic settles as [`Refused::Failed`], never as a service that did not answer.
-//!
-//! [`Gate::start`] is the same call with the wait left to the caller: a [`Pending`] it waits
-//! for in slices, watching other things between them, for as long as it chooses. Its suspect
-//! age still says when it starts refusing the other calls; dropped unanswered, it is abandoned
-//! as [`Gate::run`] abandons a call at its deadline.
-//!
-//! # In a child: [`output_until`]
-//!
-//! `codesign`, `spctl`, `security`: run to completion by a deadline, with the child's process
-//! group killed and reaped at the deadline. Children need no gate. The exit is waited for as
-//! the kernel reports it ([`ExitWait`]: a kqueue on Darwin, a pidfd on Linux), not on a sleep
-//! tick, so a 40 ms tool returns at 40 ms.
-//!
-//! A child that does a long run of small steps is held to its progress instead
-//! ([`output_while_progressing`]): killed once a caller's probe of it has not moved for one
-//! window, however long the whole run takes.
-//!
-//! # Several children at once: [`outputs_until`]
-//!
-//! On Unix every child starts before any is waited for, so a check that needs five tools waits
-//! for the slowest, not the sum. One `poll(2)` on the calling thread drains their streams and
-//! watches their exits, so it starts no thread (the boot apply runs it before the window
-//! exists).
-//!
-//! # A child started now, run later: [`Held`]
-//!
-//! On Darwin a child can be started stopped at its exec and run to its output once the caller
-//! decides it may: the exec, and the work the system does at one, overlap the caller's own
-//! work, and nothing of the program runs before the decision.
-//!
-//! # Tests
-//!
-//! Test and debug builds (never a release one) add [`require_trust_service`] and
-//! [`require_disk_image_service`]: a test that needs the service ends COULD NOT RUN when it
-//! does not answer ([`crate::host::could_not_run`]).
+//! Deadlines for potentially blocking in-process calls ([`Gate`]) and child processes ([`output_until`], [`output_while_progressing`], [`outputs_until`]).
 
 use std::io::{self, Read};
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -81,31 +19,16 @@ pub use complete::{
     CompleteOutputError, output_until_complete_stdout, output_until_complete_stdout_from,
 };
 
-/// How long macOS may hold the first exec of a new file (a copy, a fresh build) at
-/// `_dyld_start` while `syspolicyd` assesses it: a hang detector, never a budget. A fresh 167 MB
-/// debug binary took 64 s to its first exec, and a backed-up `syspolicyd` held a fresh two-line
-/// script up to 600 s (`aterm_spec::wait::FIRST_EXEC` measured both). Killing the process does
-/// not end the assessment, and on macOS 27.0.1 `syspolicyd` crashes when the file is unlinked or
-/// renamed before it finishes, stranding every exec on the host: so a copy started and never
-/// shown to have run stays where it is until this has passed since its exec (or its kill).
-/// Shipped code reads it too (the updater, the keeper, the mug), not only tests.
+/// Maximum duration macOS may hold the first exec of a new binary in `syspolicyd`.
 pub const FIRST_EXEC_HANG: Duration = Duration::from_secs(10 * 60);
 
-/// The file a program started from a fresh copy writes into the copy's directory first thing
-/// (the keeper's and the mug's copies): the copy's first exec is over, so it may go
-/// ([`copy_may_go`]).
+/// Marker filename written by a fresh copy immediately after exec.
 pub const RAN: &str = "ran";
 
-/// The file [`stamp_exec`] writes into a copy's directory just before its exec: the awake
-/// clock's reading then, in milliseconds.
+/// Marker filename written by [`stamp_exec`] before exec with the awake-clock reading.
 pub const EXEC_STAMP: &str = "exec";
 
-/// Say in `home`, the directory of a copy about to be exec'd, when that is on the awake clock
-/// ([`EXEC_STAMP`], [`crate::process::awake_ms`]): `syspolicyd` assesses only while the machine
-/// is awake, so a sleep or a step of the wall clock inside [`FIRST_EXEC_HANG`] must not age the
-/// copy ([`copy_may_go`]). Writing it also sets the directory's modification time, so the
-/// wall-clock reading a copy without a stamp falls back to counts from the exec too, not from
-/// the copy. Best effort.
+/// Writes the current awake-clock reading to [`EXEC_STAMP`] inside `home` before exec.
 pub fn stamp_exec(home: &std::path::Path) {
     let stamp = crate::process::awake_ms()
         .map(|ms| ms.to_string())
@@ -115,21 +38,13 @@ pub fn stamp_exec(home: &std::path::Path) {
     }
 }
 
-/// Whether the directory `home`, holding a copy a program may have been started from, may be
-/// removed at `now` ([`copy_wait_left`] is `None`).
+/// Whether the binary copy directory `home` is safe to remove at `now`.
 #[must_use]
 pub fn copy_may_go(home: &std::path::Path, now: std::time::SystemTime) -> bool {
     copy_wait_left(home, now).is_none()
 }
 
-/// How long the copy in `home` must still stay at `now`, `None` once it may go: a program
-/// running from it said so ([`RAN`] in it), or [`FIRST_EXEC_HANG`] has passed since its exec.
-/// That is time awake since its [`EXEC_STAMP`] (one clock read, which never goes backwards in a
-/// boot, so a clock behind the stamp is a later boot's, and no assessment outlives a boot), or
-/// for a copy with no stamp the wall-clock time since the directory last changed (a copy is
-/// made whole before its exec). A directory whose time cannot be read, or that changed after
-/// `now`, stays the whole hang. Waiting what this says with the machine awake is enough under
-/// either clock.
+/// Remaining duration before the binary copy in `home` may be removed at `now`.
 #[must_use]
 pub fn copy_wait_left(home: &std::path::Path, now: std::time::SystemTime) -> Option<Duration> {
     copy_wait_left_at(home, now, crate::process::awake_ms())
@@ -168,19 +83,15 @@ pub use silent::{
 #[cfg(all(unix, any(test, debug_assertions)))]
 pub use silent::{cat_echoes, prints};
 
-/// The gate for every in-process call that can wait on macOS's `trustd` (TLS certificate
-/// evaluation, the PTY keeper's peer and on-disk code checks): one process-wide gate, so a
-/// wedge any of them finds refuses all of them and the stuck threads stay at about one.
+/// Shared gate for in-process calls that can block on macOS `trustd`.
 pub static TRUST: Gate = Gate::new("aterm-trust-check");
 
-/// Why [`Gate::run`] produced no result.
+/// Reason [`Gate::run`] or [`Gate::start`] produced no result.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Refused {
-    /// The work did not finish within the deadline, or an earlier call's work
-    /// has been running past its suspect age and still has not.
+    /// Work timed out, or an earlier call on the gate has exceeded its suspect age.
     Unanswered,
-    /// The work could not be run at all (no thread could be started) or it
-    /// panicked. Carries what went wrong, for the error text.
+    /// Helper thread could not be spawned or panicked.
     Failed(String),
 }
 
@@ -209,7 +120,7 @@ struct Helpers {
     running: Vec<Running>,
 }
 
-/// Runs work on a helper thread under a deadline; see the module docs.
+/// Runs closures on a named helper thread under a deadline.
 #[derive(Debug)]
 pub struct Gate {
     /// The helper threads' name.
@@ -218,7 +129,7 @@ pub struct Gate {
 }
 
 impl Gate {
-    /// A gate whose helper threads are called `name`.
+    /// Creates a gate whose helper threads use `name`.
     #[must_use]
     pub const fn new(name: &'static str) -> Self {
         Self {
@@ -230,7 +141,7 @@ impl Gate {
         }
     }
 
-    /// Helpers that have not yet returned.
+    /// Number of helper threads currently running on this gate.
     pub fn running(&self) -> usize {
         self.helpers
             .lock()
@@ -239,17 +150,10 @@ impl Gate {
             .len()
     }
 
-    /// `work()`, on a helper thread, if it finishes within `deadline`.
-    ///
-    /// Refused at once, without starting a helper, while an earlier call's work has run longer
-    /// than its suspect age. This call's suspect age is `suspect` (capped at `deadline`).
+    /// Runs `work` on a helper thread if it completes within `deadline`.
     ///
     /// # Errors
-    /// [`Refused::Unanswered`] past the deadline or while another call is
-    /// overdue; [`Refused::Failed`] when no thread could start or `work`
-    /// panicked.
-    // Redundant to the compiler (the module is native-only); read by the wasm census's OB-12
-    // spawn sweep, which does not evaluate `lib.rs`'s gate.
+    /// Returns [`Refused::Unanswered`] on timeout or overdue gate, or [`Refused::Failed`] on spawn failure or panic.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn run<T, F>(
         &'static self,
@@ -261,22 +165,15 @@ impl Gate {
         T: Send + 'static,
         F: FnOnce() -> T + Send + 'static,
     {
-        // Still pending at the deadline: dropping it marks the slot abandoned.
         self.start(suspect.min(deadline), work)?
             .wait(deadline)
             .unwrap_or(Err(Refused::Unanswered))
     }
 
-    /// `work()`, started on a helper thread, its answer left to the caller to wait for
-    /// ([`Pending::wait`]) for as long as it chooses.
-    ///
-    /// Refused at once, without starting a helper, while an earlier call's work has run longer
-    /// than its suspect age. This call's suspect age is `suspect`: past it, while the caller
-    /// still waits, every other call through the gate is refused at once.
+    /// Starts `work` on a helper thread and returns a [`Pending`] handle to wait on.
     ///
     /// # Errors
-    /// [`Refused::Unanswered`] while another call is overdue; [`Refused::Failed`] when no
-    /// thread could start.
+    /// Returns [`Refused::Unanswered`] if an earlier call is overdue, or [`Refused::Failed`] if no thread could start.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn start<T, F>(&'static self, suspect: Duration, work: F) -> Result<Pending<T>, Refused>
     where
@@ -307,12 +204,9 @@ impl Gate {
             });
             id
         };
-        // The record is in before the helper exists, and the guard is gone before
-        // it starts: the helper's own `forget` never runs under `helpers`.
         let spawned = std::thread::Builder::new()
             .name(self.name.to_owned())
             .spawn(move || {
-                // Caught so the slot always settles: an unsettled one reads as no answer.
                 let value = catch_unwind(AssertUnwindSafe(work));
                 self.forget(id);
                 let (lock, answered) = &*theirs;
@@ -338,18 +232,16 @@ impl Gate {
     }
 }
 
-/// A call [`Gate::start`] began whose answer nobody has taken yet. Dropped before then, it is
-/// abandoned: the helper drops its result when it returns.
+/// In-flight call started by [`Gate::start`]; abandoned if dropped before completion.
 pub struct Pending<T> {
     slot: Arc<(Mutex<Slot<std::thread::Result<T>>>, Condvar)>,
 }
 
 impl<T> Pending<T> {
-    /// The call's answer, if it comes within `within`; the call back, still pending, if not.
+    /// Waits up to `within` for the call's answer, returning `Err(self)` if still pending.
     ///
     /// # Errors
-    /// The pending call itself while its work has not returned. Its answer is
-    /// [`Refused::Failed`] when the work panicked.
+    /// Returns `Err(self)` if the work has not yet finished within `within`.
     pub fn wait(self, within: Duration) -> Result<Result<T, Refused>, Self> {
         let answer = {
             let (lock, answered) = &*self.slot;
@@ -366,7 +258,6 @@ impl<T> Pending<T> {
                     *slot = Slot::Pending;
                     None
                 }
-                // Only this call's own drop abandons it, and that has not run.
                 Slot::Abandoned => Some(Err(Refused::Unanswered)),
             }
         };
@@ -387,14 +278,14 @@ impl<T> std::fmt::Debug for Pending<T> {
     }
 }
 
-/// Why [`output_until`] produced no output.
+/// Reason [`output_until`] failed to produce output.
 #[derive(Debug)]
 pub enum RunError {
-    /// The child could not be started (or a reader thread for it could not).
+    /// Child process or stream reader thread could not be spawned.
     Spawn(io::Error),
-    /// Waiting for the child failed; it was killed and reaped.
+    /// Waiting for the child failed; the child was killed and reaped.
     Wait(io::Error),
-    /// The child did not finish by the deadline; it was killed and reaped.
+    /// Child did not finish before the deadline and was killed and reaped.
     TimedOut,
 }
 
@@ -411,50 +302,35 @@ impl std::fmt::Display for RunError {
 impl std::error::Error for RunError {}
 
 /// The first sleep tick of an [`ExitWait`] with no exit descriptor, doubled up to
-/// [`POLL_MAX`] so a tool that takes tens of milliseconds is not rounded up to a fixed tick.
 const POLL_MIN: Duration = Duration::from_millis(1);
 const POLL_MAX: Duration = Duration::from_millis(25);
 
 /// How long [`output_until`] reads the streams after the child exits: a pipe still open past
-/// that is held by a descendant, not part of the child's report.
 const DRAIN_GRACE: Duration = Duration::from_millis(250);
 
-/// How much of each stream [`output_until`] keeps: the tail, so a tool's last diagnostic is
-/// never the part cut; far more than any tool it runs prints.
+/// Maximum tail bytes retained per output stream by [`output_until`].
 pub const OUTPUT_KEEP: usize = 1024 * 1024;
 
-/// `Command::output` with a deadline. Stdin is closed; stdout and stderr are drained on their
-/// own threads, so a chatty child cannot wedge on a full pipe (the last [`OUTPUT_KEEP`] bytes
-/// of each kept). On Unix the child leads a new process group, and at the deadline the group
-/// is killed (`SIGKILL`) and the child reaped, so nothing it started outlives the call. After
-/// the child exits its streams are read for at most [`DRAIN_GRACE`] more, in case a descendant
-/// still holds a pipe.
-///
-/// Build `cmd` with [`crate::spawnfd::command`]: the child holds its stdio and nothing else
-/// and, on Darwin, starts without a fork.
+/// Runs `cmd` with closed stdin, draining stdout/stderr and killing its process group at `deadline`.
 ///
 /// # Errors
-/// [`RunError::Spawn`], [`RunError::Wait`] or [`RunError::TimedOut`]; never a
-/// partial output.
+/// Returns [`RunError::Spawn`], [`RunError::Wait`], or [`RunError::TimedOut`].
 pub fn output_until(cmd: &mut Command, deadline: Instant) -> Result<Output, RunError> {
     output_until_from(cmd, Stdio::null(), deadline)
 }
 
-/// [`output_until`] with its deadline `within` from the call: for a caller that reads no
-/// clock of its own (the supervisor's probe bodies read time only through its `Fx`, and a
-/// hang bound on a child is no value the loop observes).
+/// [`output_until`] with a relative timeout `within` from now.
 ///
 /// # Errors
-/// As [`output_until`].
+/// Returns the same errors as [`output_until`].
 pub fn output_within(cmd: &mut Command, within: Duration) -> Result<Output, RunError> {
     output_until(cmd, Instant::now() + within)
 }
 
-/// [`output_until`] with `stdin` as the child's standard input (a file the caller opened),
-/// for a tool that reads its request there.
+/// [`output_until`] with `stdin` attached as the child's standard input.
 ///
 /// # Errors
-/// As [`output_until`].
+/// Returns the same errors as [`output_until`].
 pub fn output_until_from(
     cmd: &mut Command,
     stdin: Stdio,
@@ -466,37 +342,20 @@ pub fn output_until_from(
 }
 
 /// The most time [`output_while_progressing`] lets pass between two reads of its progress
-/// probe (a quarter of its window, when that is shorter): a stall is named within one tick of
-/// its window, and a probe that reads a file's length costs nothing at this rate.
 const PROGRESS_TICK: Duration = Duration::from_millis(100);
 
-/// [`output_until`] held to the child's PROGRESS, not to one deadline: for a child that does a
-/// long run of small steps (one shell running a batch of calls), where a deadline on the whole
-/// run times the batch rather than a hang, and a loaded machine fails an honest run.
-///
-/// `progress` is the caller's measure of how far the child has got (the length of a file it
-/// appends to is the usual one), read when the child is first found running and then at least
-/// every [`PROGRESS_TICK`] (a quarter of `window` when that is shorter); any change in what it
-/// returns is progress. The child runs as long as it keeps making some, and once `progress`
-/// has answered the same for `window` the child's process group is killed (`SIGKILL`) and the
-/// child reaped, as [`output_until`] does at its deadline. A reading taken late (a descheduled
-/// caller) still counts what the child did meanwhile. Stdin, the kept tails, the process group
-/// and [`DRAIN_GRACE`] are as in [`output_until`].
+/// Runs `cmd` while `progress()` keeps advancing at least once every `window`.
 ///
 /// # Errors
-/// As [`output_until`]. [`RunError::TimedOut`] here means no progress for `window`: the
-/// probe's last reading is where the child stopped, which the caller can name.
+/// Returns [`RunError::TimedOut`] if `progress()` stays unchanged for `window`, or spawn/wait errors.
 pub fn output_while_progressing(
     cmd: &mut Command,
     window: Duration,
     progress: &mut dyn FnMut() -> u64,
 ) -> Result<Output, RunError> {
     let tick = PROGRESS_TICK.min(window / 4).max(Duration::from_millis(1));
-    // The reading, and when it last changed: taken at the first look, after the spawn.
     let mut last: Option<(u64, Instant)> = None;
     output_by(cmd, Stdio::null(), &mut || {
-        // The reading first, then the clock: a quiet stretch is never counted from before
-        // the reading that ended the last one.
         let reading = progress();
         let now = Instant::now();
         let since = match last {
@@ -512,9 +371,6 @@ pub fn output_while_progressing(
 }
 
 /// The one child run behind [`output_until_from`] and [`output_while_progressing`]: each time
-/// the child is found still running, `left` says how long to wait for its exit before looking
-/// again, and zero ends the run (the group is killed and the child reaped,
-/// [`RunError::TimedOut`]).
 fn output_by(
     cmd: &mut Command,
     stdin: Stdio,
@@ -555,8 +411,6 @@ fn output_by(
             }
         }
     };
-    // The drains finish promptly unless a descendant still holds a pipe; then what was read by
-    // the grace is the child's report.
     let by = Instant::now() + DRAIN_GRACE;
     let collect = |drain: Option<Drain>| drain.map(|d| d.collect(by)).unwrap_or_default();
     Ok(Output {
@@ -566,44 +420,10 @@ fn output_by(
     })
 }
 
-/// Waits for one child's exit as the kernel reports it.
-///
-/// It blocks on a descriptor the kernel makes readable at the exit (Darwin: a kqueue
-/// `EVFILT_PROC`/`NOTE_EXIT`; Linux: a pidfd; see [`crate::exitwatch::exit_fd`]), so the wait
-/// ends at the exit, or at the caller's timeout. A sleep tick from 1 ms doubling to 25 ms
-/// would add about half again to a 30-70 ms `codesign`. Without such a descriptor (Windows, a
-/// kernel without `pidfd_open`) it sleeps that backoff tick.
-///
-/// Make it while the child is unreaped (right after the spawn), then alternate `try_wait`
-/// with [`ExitWait::wait`]:
-///
-/// ```no_run
-/// use std::{io, process::ExitStatus, time::Instant};
-/// use aterm_uds::{deadline::ExitWait, spawnfd::Child};
-///
-/// // On timeout the caller still owns the live child and decides how to end it.
-/// fn wait_until(child: &mut Child, deadline: Instant) -> io::Result<Option<ExitStatus>> {
-///     let mut exit = ExitWait::new(child);
-///     loop {
-///         if let Some(status) = child.try_wait()? {
-///             return Ok(Some(status));
-///         }
-///         let remaining = deadline.saturating_duration_since(Instant::now());
-///         if remaining.is_zero() {
-///             return Ok(None);
-///         }
-///         exit.wait(remaining);
-///     }
-/// }
-/// ```
-///
-/// A process that is not this one's child is waited on by pid
-/// ([`ExitWait::on_pid`]), with the caller's own witness of that process in
-/// `try_wait`'s place.
+/// Kernel-backed wait handle for a single child process's exit.
 #[derive(Debug)]
 pub struct ExitWait {
     /// Readable once the child has exited; `None` without such a descriptor, or once it has
-    /// reported (it stays readable, and a child not yet reapable must not spin on it).
     #[cfg(unix)]
     fd: Option<std::os::fd::OwnedFd>,
     /// The fallback sleep, doubled up to [`POLL_MAX`].
@@ -611,16 +431,13 @@ pub struct ExitWait {
 }
 
 impl ExitWait {
-    /// A wait on `child`'s exit. Its pid cannot be reissued while it is
-    /// unreaped, so the watch names it.
+    /// Creates an exit wait handle for `child`.
     #[must_use]
     pub fn new(child: &Child) -> Self {
         Self::on_pid(child.id())
     }
 
-    /// A wait on the exit of whatever holds `pid` at the call. A caller whose
-    /// pid may have been reissued proves after this returns that it still
-    /// names its process ([`crate::exitwatch::exit_fd`]).
+    /// Creates an exit wait handle for whatever process currently holds `pid`.
     #[must_use]
     pub fn on_pid(pid: u32) -> Self {
         #[cfg(not(unix))]
@@ -632,20 +449,16 @@ impl ExitWait {
         }
     }
 
-    /// Block until the kernel reports the process's exit or `timeout` passes
-    /// (without a descriptor, for one backoff tick at most), whichever is
-    /// first; the caller's `try_wait` (or its own witness) says which.
+    /// Blocks until the kernel reports the process's exit or `timeout` elapses.
     pub fn wait(&mut self, timeout: Duration) {
         #[cfg(unix)]
         if let Some(fd) = &self.fd {
             match children::exit_reported(fd, timeout) {
                 Ok(false) => return,
-                // Reported: the next `try_wait` reaps it. Ticks from here on.
                 Ok(true) => {
                     self.reported();
                     return;
                 }
-                // A `poll` that cannot run (no memory): fall back to ticks.
                 Err(_) => self.reported(),
             }
         }
@@ -667,7 +480,6 @@ impl ExitWait {
 }
 
 /// Kill (`SIGKILL`; on Unix the child's whole process group, which
-/// [`output_until`] made it lead) and reap.
 fn end(child: &mut Child) {
     #[cfg(unix)]
     children::kill_group(child);
@@ -677,9 +489,6 @@ fn end(child: &mut Child) {
 }
 
 /// Reap a killed `child` by `by`, waiting on its exit as the kernel reports
-/// it. On Unix, one the kernel has not let go by then is left for the
-/// dropped spawnfd handle to hand to [`crate::reaper`]. This function does
-/// not certify that the child has exited when its reserve runs out.
 fn reap_within(child: &mut Child, exit: Option<&mut ExitWait>, by: Instant) {
     let mut fallback;
     let exit = match exit {
@@ -703,17 +512,7 @@ fn reap_within(child: &mut Child, exit: Option<&mut ExitWait>, by: Instant) {
     }
 }
 
-/// [`output_until`] for each of `cmds`, all started before any is waited for and held to the
-/// one `deadline`; the results come back in `cmds`' order. Stdin, the kept tails, the process
-/// group and [`DRAIN_GRACE`] are as in [`output_until`].
-///
-/// Unlike [`output_until`], the cleanup at the deadline is bounded: every child still running
-/// has its group killed (`SIGKILL`) and all are reaped within `reap`. One the kernel has not
-/// let go by then is left to [`crate::reaper`] and answers [`RunError::TimedOut`] either way,
-/// so a caller on a deadline of its own cannot park on a process wedged past its `SIGKILL`.
-///
-/// On Unix no thread is started: one `poll(2)` drains every stream and watches every exit.
-/// Elsewhere the children run one after another through [`output_until`].
+/// Spawns all `cmds` in parallel and collects their outputs under a shared `deadline`.
 #[must_use]
 pub fn outputs_until(
     cmds: &mut [&mut Command],
@@ -737,16 +536,7 @@ pub fn outputs_until(
 #[cfg(unix)]
 const HELD_REAP: Duration = Duration::from_millis(250);
 
-/// A child STARTED STOPPED AT ITS EXEC ([`crate::spawnfd::Command::start_suspended`]), for
-/// [`Self::output_until`] to run later. Its exec — and whatever the system does at one, a
-/// first-exec assessment included — proceeds while the caller does other work, and not one
-/// instruction of the program runs before the caller resumes it.
-///
-/// Dropped unrun, it is killed (`SIGKILL`, its process group) without ever running and reaped
-/// within [`HELD_REAP`]; one the kernel has not let go by then is left to [`crate::reaper`].
-/// If this process dies holding it, it dies unrun too: it leads its own process group, which
-/// the kernel hangs up when orphaned, with `SIGHUP` at its default
-/// ([`crate::spawnfd::Command::start_suspended`]).
+/// Child process started suspended at exec ([`crate::spawnfd::Command::start_suspended`]).
 #[cfg(unix)]
 #[derive(Debug)]
 pub struct Held {
@@ -756,28 +546,25 @@ pub struct Held {
 
 #[cfg(unix)]
 impl Held {
-    /// Start `cmd` stopped at its exec, set up as [`outputs_until`] runs a child: leading a new
-    /// process group, stdin `/dev/null`, stdout and stderr piped.
+    /// Spawns `cmd` suspended at exec in a new process group with piped output.
     ///
     /// # Errors
-    /// The spawn's, the exec's own included: `Unsupported` off Darwin, with nothing started.
+    /// Returns an error if spawning fails or suspended start is unsupported on this platform.
     pub fn start(cmd: &mut Command) -> io::Result<Self> {
         let child = children::prepare(cmd).start_suspended(true).spawn()?;
         Ok(Self { child: Some(child) })
     }
 
-    /// The held child's pid.
+    /// Process ID of the held child.
     #[must_use]
     pub fn id(&self) -> u32 {
         self.child.as_ref().map_or(0, Child::id)
     }
 
-    /// Resume the child and run it to its output by `deadline`, exactly as [`outputs_until`]
-    /// runs one child from its spawn (the reaping reserve `reap` included).
+    /// Resumes the held child and collects its output until `deadline`.
     ///
     /// # Errors
-    /// As [`outputs_until`]'s, and [`RunError::Spawn`] for a child that could not be resumed
-    /// (killed and reaped within `reap`; it never ran).
+    /// Returns [`RunError`] on resume failure, wait failure, or timeout.
     pub fn output_until(mut self, deadline: Instant, reap: Duration) -> Result<Output, RunError> {
         let Some(mut child) = self.child.take() else {
             return Err(RunError::TimedOut);
@@ -802,7 +589,6 @@ impl Drop for Held {
 }
 
 /// One stream being read on a thread of its own: the tail so far, and a
-/// signal when the stream has ended.
 struct Drain {
     tail: Arc<Mutex<Vec<u8>>>,
     ended: mpsc::Receiver<()>,
@@ -858,9 +644,6 @@ mod tests {
     use super::{Gate, Refused};
 
     /// A copy's age is awake time since its exec when it is stamped, wall-clock time since its
-    /// directory changed when not, and a copy a program ran from goes at once. NEGATIVE CONTROL:
-    /// a stamped copy whose directory reads hours old (a sleep, a clock step) is kept while the
-    /// awake clock says the hang has not passed; a reading of the age off the wall clock fails it.
     #[test]
     fn a_copy_ages_on_the_awake_clock_from_its_exec() {
         use super::{EXEC_STAMP, FIRST_EXEC_HANG, RAN, copy_wait_left_at, stamp_exec};
@@ -871,12 +654,9 @@ mod tests {
         let home = dir.path().join("1-2");
         std::fs::create_dir(&home).expect("mkdir");
         let now = std::time::SystemTime::now();
-        // Past the hang since every change below, which all come after `now`.
         let later = now + FIRST_EXEC_HANG + Duration::from_secs(60);
-        // Unstamped: the wall clock since the directory changed.
         assert!(!copy_may_go_at(&home, now, Some(5)));
         assert!(copy_may_go_at(&home, later, Some(5)));
-        // Stamped at 1000 ms awake: the wall clock no longer counts.
         std::fs::write(home.join(EXEC_STAMP), "1000\n").expect("stamp");
         assert!(
             !copy_may_go_at(&home, later, Some(1000 + hang - 1)),
@@ -889,22 +669,18 @@ mod tests {
             Some(FIRST_EXEC_HANG - Duration::from_secs(60)),
             "what is left is awake time too"
         );
-        // No awake clock to read, or a stamp that is not one: the wall clock again.
         assert!(!copy_may_go_at(&home, now, None));
         assert!(copy_may_go_at(&home, later, None));
         std::fs::write(home.join(EXEC_STAMP), "").expect("blank stamp");
         assert!(!copy_may_go_at(&home, now, Some(1000 + hang)));
         assert!(copy_may_go_at(&home, later, Some(1000 + hang)));
-        // A program ran from it.
         std::fs::write(home.join(RAN), "").expect("ran");
         assert!(copy_may_go_at(&home, now, Some(0)));
-        // The real stamp reads as a number where the clock is wired, and moves the directory.
         let fresh = dir.path().join("3-4");
         std::fs::create_dir(&fresh).expect("mkdir");
         stamp_exec(&fresh);
         let text = std::fs::read_to_string(fresh.join(EXEC_STAMP)).expect("stamped");
         assert!(text.is_empty() || text.parse::<u64>().is_ok(), "{text:?}");
-        // One clock read: a later reading is never behind an earlier one in a boot.
         let first = crate::process::awake_ms();
         let second = crate::process::awake_ms();
         assert!(first <= second, "{first:?} then {second:?}");
@@ -953,7 +729,6 @@ mod tests {
     fn work_that_never_answers_is_refused_at_the_deadline_and_piles_up_no_threads() {
         static GATE: Gate = Gate::new("test-gate");
 
-        // A `trustd` that never replies: the work blocks until the test releases it.
         let (release, held) = mpsc::channel::<()>();
         let begun = Instant::now();
         let first = GATE.run(HANG, DEADLINE, move || {
@@ -969,7 +744,6 @@ mod tests {
         assert!(waited < HANG, "the call did not come back: {waited:?}");
         assert_eq!(GATE.running(), 1, "the stuck helper is still running");
 
-        // While it is stuck, a second call is refused without starting a helper.
         let (work, seen) = witness();
         assert_eq!(GATE.run(HANG, DEADLINE, work), Err(Refused::Unanswered));
         assert!(
@@ -978,7 +752,6 @@ mod tests {
         );
         assert_eq!(GATE.running(), 1);
 
-        // Released, the helper leaves the list and the next call runs.
         release.send(()).expect("the stuck helper is still waiting");
         drained(&GATE);
         assert_eq!(GATE.run(HANG, HANG, || 7), Ok(7));
@@ -986,8 +759,6 @@ mod tests {
 
     #[test]
     fn calls_that_arrive_after_the_suspect_age_start_no_helper_while_the_first_still_waits() {
-        // The first caller's deadline is long; later calls past its suspect age must refuse
-        // at once, not each start a helper and wait out a deadline of their own.
         const SUSPECT: Duration = Duration::from_millis(100);
         static GATE: Gate = Gate::new("test-gate");
 
@@ -1011,8 +782,6 @@ mod tests {
             assert_eq!(GATE.running(), 1, "only the first call has a helper");
         }
 
-        // The first caller still holds its own deadline; release the service
-        // and it gets its answer.
         release.send(()).expect("the stuck helper is still waiting");
         assert_eq!(first.join().expect("the first caller"), Ok(()));
         drained(&GATE);
@@ -1032,7 +801,6 @@ mod tests {
             })
         });
         started(&GATE, 1);
-        // Older than the short call's suspect age, but within its own.
         std::thread::sleep(SHORT * 3);
         assert_eq!(GATE.run(SHORT, HANG, || "quick"), Ok("quick"));
 
@@ -1054,14 +822,12 @@ mod tests {
             })
             .expect("the gate is idle");
         std::thread::sleep(SUSPECT * 2);
-        // Waited for in slices, it stays pending, and its caller keeps it.
         for _ in 0..3 {
             pending = match pending.wait(Duration::from_millis(5)) {
                 Err(still) => still,
                 Ok(answer) => panic!("answered before its work returned: {answer:?}"),
             };
         }
-        // Past its suspect age it refuses every other call at once.
         let (work, seen) = witness();
         assert_eq!(GATE.run(HANG, HANG, work), Err(Refused::Unanswered));
         assert!(never_ran(&seen), "a call started behind an overdue one");
@@ -1158,8 +924,6 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("dir");
         let pid_file = dir.join("pid");
         let mut cmd = crate::spawnfd::command("/bin/sh");
-        // `exec`, so the pid the shell writes is sleep's own; the background
-        // sleep is a descendant that must die with it.
         let grandchild_file = dir.join("grandchild");
         cmd.arg("-c")
             .arg("sleep 600 & echo $! > \"$1\"; echo $$ > \"$0\"; exec sleep 600")
@@ -1170,8 +934,6 @@ mod tests {
         let waited = begun.elapsed();
         assert!(matches!(result, Err(RunError::TimedOut)), "{result:?}");
         assert!(waited < HANG, "the call did not come back: {waited:?}");
-        // A zombie still answers `kill(pid, 0)`, so gone means killed and reaped. A machine
-        // too loaded to start the shell in two seconds leaves no pid to check.
         if let Some(pid) = std::fs::read_to_string(&pid_file)
             .ok()
             .and_then(|text| text.trim().parse::<u32>().ok())
@@ -1234,15 +996,10 @@ mod tests {
     }
 
     /// The window the two progress tests hold a child to: short, so a stall is named in well
-    /// under a second. Each test's progress is the probe's own (a reading the test moves), so
-    /// neither verdict rests on how fast a loaded machine runs the child.
     #[cfg(unix)]
     const WINDOW: Duration = Duration::from_millis(300);
 
     /// A child that keeps making progress outlives its window and answers: the probe's
-    /// reading moves every quarter window, and after three windows the probe drops the flag
-    /// the child waits for. A deadline of one window would have killed it. The reading stops
-    /// moving at the hang detector, so a child that never sees the flag still fails.
     #[cfg(unix)]
     #[test]
     fn a_child_that_keeps_making_progress_outlives_its_window() {
@@ -1275,9 +1032,6 @@ mod tests {
     }
 
     /// A child that stops making progress is killed, with its group, one whole window after
-    /// its LAST step, not one window after it started, and the probe's last reading names the
-    /// step it stopped after: the reading moves on each of the probe's first five looks and
-    /// never again, while the child sleeps for ten minutes.
     #[cfg(unix)]
     #[test]
     fn a_child_that_stops_making_progress_is_killed_one_window_after_its_last_step() {
@@ -1310,8 +1064,6 @@ mod tests {
             killed.duration_since(begun) < HANG,
             "the call did not come back"
         );
-        // A zombie still answers `kill(pid, 0)`, so gone means killed and reaped. A machine
-        // too loaded to start the shell in time leaves no pid to check.
         if let Some(pid) = child {
             assert!(
                 !crate::process::pid_alive(pid),
@@ -1321,9 +1073,6 @@ mod tests {
     }
 
     /// The first child cannot finish until the third has run, which a one-after-another run
-    /// would reach only at the deadline. Each answers with its own status and streams, in
-    /// order; a tool that cannot start stops nothing else; one that leaves a descendant on its
-    /// pipe answers after the grace.
     #[cfg(unix)]
     #[test]
     fn several_children_run_at_once_and_each_answers_for_itself() {
@@ -1363,7 +1112,6 @@ mod tests {
     }
 
     /// A child writing more than a pipe holds, on both streams, is drained while it runs and
-    /// keeps the tail past [`OUTPUT_KEEP`].
     #[cfg(unix)]
     #[test]
     fn a_child_writing_more_than_a_pipe_holds_is_drained_while_it_runs() {
@@ -1388,8 +1136,6 @@ mod tests {
     }
 
     /// At the deadline a running child is killed with its group and reaped within `reap`; the
-    /// others keep their own answers (a tool that could not start is a spawn error, not a
-    /// timeout).
     #[cfg(unix)]
     #[test]
     fn at_the_deadline_the_running_child_is_killed_and_reaped_and_the_rest_keep_their_answers() {
@@ -1411,8 +1157,6 @@ mod tests {
         let mut results = results.into_iter();
         assert!(matches!(results.next(), Some(Err(RunError::TimedOut))));
         assert!(matches!(results.next(), Some(Err(RunError::Spawn(_)))));
-        // A zombie still answers `kill(pid, 0)`, so gone means killed and reaped. A machine
-        // too loaded to start the shell in two seconds leaves no pid to check.
         if let Some(pid) = pid_in(&pid_file) {
             assert!(
                 !crate::process::pid_alive(pid),
@@ -1428,10 +1172,6 @@ mod tests {
     }
 
     /// **A HELD CHILD RUNS ONLY ONCE RESUMED, TO ITS OUTPUT.** Held, the shell is exec'd and
-    /// stopped before its first instruction (`ps`: `T`) and has left no marker;
-    /// [`Held::output_until`] runs it to its status and both streams, as
-    /// [`output_until`] does from a spawn. Dropped unresumed, a held child is killed and
-    /// gone without having run.
     #[cfg(target_vendor = "apple")]
     #[test]
     fn a_held_child_runs_only_once_resumed_and_one_dropped_never_runs() {

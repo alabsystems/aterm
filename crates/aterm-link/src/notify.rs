@@ -2,36 +2,6 @@
 // Copyright 2026 Andrew Yates
 
 //! `aterm-link notify`: run a command when the fabric needs a human ([`USAGE`] lists the flags).
-//!
-//! * **Untrusted record bodies**: `--exec <cmd>` runs as `/bin/sh -c <cmd>`. Nothing from a
-//!   record is interpolated into `<cmd>`; every fact arrives in `$ATERM_NOTIFY_*` with free text
-//!   flattened to printable ASCII and capped at [`TEXT_MAX`] bytes.
-//! * **Rate budget & suppression**: `--rate <n>/<window>` bounds fires, not matches. A
-//!   rate-limited record gets a durable `dropped` journal line, a stderr line, and increments
-//!   the persisted `suppressed` counter (`ATERM_NOTIFY_SUPPRESSED=<n>`), which is cleared only
-//!   when a command exits `rc=0`. Dropped records are terminal and stay on the bus for `ls` and
-//!   `inbox`.
-//! * **Durable state (`<state>/notify/`, written temp + `fsync` + `rename`)**:
-//!
-//!   | file | contents |
-//!   |---|---|
-//!   | `cur/<key>` | monotone next offset to scan for selector `<key>` |
-//!   | `journal` | newest [`JOURNAL_KEEP`] verdicts (`<off> firing\|fired\|dropped …`) |
-//!   | `log` | identity of the root bus log (`cur/` and `journal` belong to this log) |
-//!   | `logs/<identity>/` | `cur/`, `journal` and `standing` for up to [`LOGS_KEEP`] other logs ([`Store::for_log`]), carried over across generation moves at the lineage fork |
-//!   | `logs/used` | LRU order of `logs/<identity>/` ([`Store::prune_logs`]) |
-//!   | `standing` | per presence subject, the `attention=` token last paged with `rc=0` ([`STANDING_KEEP`]) |
-//!   | `rate` | fire timestamps within the rate window |
-//!   | `suppressed` | rate-dropped notifications not yet reported to a command |
-//!
-//! * **Deduplication**: By record offset (`journal`), and for `attention` also by value per
-//!   presence subject (`standing`): republishing the same `attention=` on a session row does not
-//!   re-page (`standing=` in the summary line), while clearing (`attention=-` or absent) re-arms
-//!   the subject. Only a fire with `rc=0` records a standing token.
-//! * **Ordered-broker durability hold**: On a broker serving `ordered`, records not yet covered
-//!   by a full flush wait in read order (up to [`HOLD_MAX`] bytes) until a `Mark` reports the
-//!   broker's durable head past them, keeping the selector cursor at the first held record.
-//!   `--once` leaves records not yet durable for the next run.
 
 use aterm_uds::spawnfd::Stdio;
 use std::io::{self, Write};
@@ -46,7 +16,6 @@ use crate::subject::{is_fleet, is_principal};
 use crate::transport::{self, Backoff, Closer, Conn};
 
 /// Records per `Fetch` page while catching up (`POST_PAGE` so `JOURNAL_KEEP` outlives any single
-/// page re-scan after a crash).
 const PAGE: u32 = crate::transport::POST_PAGE;
 
 /// Verdicts kept in `journal` (must exceed [`PAGE`]).
@@ -67,7 +36,6 @@ const DEFAULT_LIMIT: u32 = 10;
 const DEFAULT_WINDOW_MS: u64 = 60_000;
 
 /// Maximum bytes of records held while waiting for an ordered broker's durable mark; past this
-/// bound, held records are paged immediately with a warning.
 const HOLD_MAX: usize = 4 << 20;
 
 #[derive(Debug)]
@@ -98,22 +66,16 @@ struct Held {
 }
 
 /// A zero-capacity handoff from the broker readers to the serial executor: a body can be
-/// 16 MiB, and a buffered channel would let a slow command grow memory without limit.
 fn notice_handoff() -> (mpsc::SyncSender<Notice>, mpsc::Receiver<Notice>) {
     mpsc::sync_channel(0)
 }
-
-// the selectors
 
 /// One `--on` selector: which records are worth waking a human for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Sel {
     /// A presence row carrying a non-empty `attention=` (§4.1).
     Attention,
-    /// An `ask` ADDRESSED TO this principal — a session's `post to=<p>
-    /// kind=ask`, which its node publishes on `/f/<F>/in/p/<p>/<node>/ask`: how
-    /// a person is reached (§9.3). The person's own cap
-    /// ([`crate::enable::person_grants`]'s `ro:/f/<F>/in/p/<p>/>`) reads it.
+    /// An `ask` ADDRESSED TO this principal — a session's `post to=<p> kind=ask`, which its node publishes on `/f/<F>/in/p/<p>/<node>/ask`: how a person is reached (§9.3).
     Ask(String),
     /// A fleet halt coming on (§9.3).
     Halt,
@@ -121,9 +83,7 @@ pub enum Sel {
 
 impl Sel {
     /// Parse one selector word.
-    ///
     /// # Errors
-    ///
     /// A word that is not `attention`, `halt` or `ask:<principal>`.
     pub fn parse(word: &str) -> Result<Self, String> {
         match word {
@@ -149,22 +109,17 @@ impl Sel {
         }
     }
 
-    /// The cursor file name. A principal is `[a-z0-9-]{1,32}` (§3.2), so no selector can spell a
-    /// path separator.
+    /// The cursor file name.
     #[must_use]
     pub fn key(&self) -> String {
         match self {
             Sel::Attention => "attention".to_string(),
-            // `ask-to.`, not the `ask.` an older build kept for its asks FROM
-            // `<p>`: that cursor scanned another filter, and resuming this one
-            // from it would skip every ask TO `<p>` below it, unseen.
             Sel::Ask(p) => format!("ask-to.{p}"),
             Sel::Halt => "halt".to_string(),
         }
     }
 
-    /// The grant that reads [`Sel::filter`], and which cap carries it — what a
-    /// refused first read names ([`Notifier::preflight`]).
+    /// The grant that reads [`Sel::filter`], and which cap carries it — what a refused first read names ([`Notifier::preflight`]).
     #[must_use]
     pub fn grant(&self, fleet: &str) -> String {
         match self {
@@ -190,15 +145,6 @@ impl Sel {
     }
 
     /// The reader's own check, behind the grant's filter. It parses by position from the left,
-    /// as `subject::parse_in` does: `>` is one or more segments, and a right-anchored reading of
-    /// an over-long subject is the forgery a peer would reach for.
-    ///
-    /// Every segment it keeps must be a principal: each becomes an environment value of
-    /// `/bin/sh -c`, most are the sender's choice rather than cap-forced, and astream's grammar
-    /// checks structure, not character set (a bidi override or shell metacharacter arrives
-    /// intact; an oversized segment would fail `spawn` with `E2BIG` after the budget was
-    /// charged). A refused subject is not a hit: no journal line, no budget charged, nothing
-    /// spawned.
     fn hit(&self, fleet: &str, offset: u64, subject: &str, body: &[u8]) -> Option<Hit> {
         let segs: Vec<&str> = subject.split('/').collect();
         if segs.first() != Some(&"") || segs.get(1) != Some(&"f") || segs.get(2) != Some(&fleet) {
@@ -206,7 +152,6 @@ impl Sel {
         }
         match self {
             Sel::Attention => {
-                // The one presence-row reader `ls` and `aterm fabric` use too.
                 let row = crate::glance::Row::parse(fleet, offset, subject, body)?;
                 let attention = crate::pct::decode(row.field("attention"));
                 if attention.is_empty() || attention == crate::glance::ABSENT {
@@ -224,7 +169,6 @@ impl Sel {
             }
             Sel::Ask(p) => {
                 // `/f/<F>/in/p/<p>/<src>/ask`, by position from the left: the
-                // literal owner `p`, the watched principal, and the sender.
                 if segs.len() != 8
                     || segs[3] != "in"
                     || segs[4] != "p"
@@ -233,14 +177,10 @@ impl Sel {
                 {
                     return None;
                 }
-                // The sender is cap-forced (a node, or a person under a ring of
-                // its own) but still checked: it becomes `$ATERM_NOTIFY_NODE`.
                 if !crate::subject::is_principal(segs[6]) {
                     return None;
                 }
                 let (parsed, _) = Body::decode(body);
-                // The asking session, as its node attests it in the body; any
-                // other shape is the empty string, never the raw token.
                 let sid = parsed
                     .from
                     .as_deref()
@@ -257,17 +197,10 @@ impl Sel {
                 })
             }
             Sel::Halt => {
-                // A halt the bridges apply, by their own rule
-                // ([`crate::subject::parse_halt`]): a human's row. An `a-`
-                // service's or a node's `state=on` holds no session anywhere,
-                // and waking someone for it reports a stop that never happened.
                 let row = crate::subject::parse_halt(fleet, subject, body)?;
-                // A fleet cap ending in `>` does not force `<who>`, and it becomes
-                // `$ATERM_NOTIFY_WHO`.
                 if !crate::subject::is_principal(row.human) {
                     return None;
                 }
-                // A halt coming off wakes nobody.
                 if !row.on {
                     return None;
                 }
@@ -288,11 +221,6 @@ impl Sel {
 }
 
 /// What a presence row says of its subject's escalation, for `attention`'s
-/// standing set: `None` for a row this reader does not accept (the wall
-/// [`Sel::hit`] stands behind), `Some(None)` for a row that raises none — a
-/// clear — and `Some(Some(token))` for the raw `attention=` token it raises.
-/// Raw, not decoded: [`crate::glance::Row::parse`] splits a body on
-/// whitespace, so a token is one word, and `standing` keeps it on a line.
 fn escalation(fleet: &str, offset: u64, subject: &str, body: &[u8]) -> Option<Option<String>> {
     let row = crate::glance::Row::parse(fleet, offset, subject, body)?;
     let raw = row.field("attention");
@@ -309,27 +237,22 @@ pub struct Hit {
     pub offset: u64,
     /// The full subject, verbatim.
     pub subject: String,
-    /// The node the record is about, when the subject names one (for an `ask`,
-    /// the asking node).
+    /// The node the record is about, when the subject names one (for an `ask`, the asking node).
     pub node: String,
-    /// The principal it is about (a presence row's owner, the person an ask is
-    /// addressed to, the human who halted).
+    /// The principal it is about (a presence row's owner, the person an ask is addressed to, the human who halted).
     pub who: String,
-    /// The asking session, for an `ask`: with [`Hit::node`], the
-    /// `to=@<sid>@<node>` an answer goes to.
+    /// The asking session, for an `ask`: with [`Hit::node`], the `to=@<sid>@<node>` an answer goes to.
     pub sid: String,
-    /// The free text, flattened and capped. Untrusted, and never a shell word.
+    /// The free text, flattened and capped.
     pub text: String,
 }
 
 /// The subject as an environment value, flattened and capped like the text so [`TEXT_MAX`]
-/// bounds it whatever the parse admitted.
 fn subject_env(subject: &str) -> String {
     one_line(subject)
 }
 
 /// Flatten untrusted text to one line of printable ASCII, capped at [`TEXT_MAX`]: the command
-/// may echo it at a terminal.
 fn one_line(s: &str) -> String {
     let mut out = String::with_capacity(s.len().min(TEXT_MAX));
     for ch in s.chars() {
@@ -345,12 +268,10 @@ fn one_line(s: &str) -> String {
     out
 }
 
-// the durable side
-
 /// Where a scan starts when a selector has no cursor yet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Since {
-    /// The log head, so a new notifier does not page through the fleet's history. The default.
+    /// The log head, so a new notifier does not page through the fleet's history.
     Head,
     /// Offset zero — the whole retained log.
     Start,
@@ -359,14 +280,6 @@ pub enum Since {
 }
 
 /// `<state>/notify/`: durable cursors, journal, standing tokens, and rate-limit state.
-///
-/// Cursors (`cur/<key>`), `journal` and `standing` are scoped per bus log identity
-/// ([`Store::for_log`]): the root store holds the first log named in `notify/log` (or a
-/// pre-identity broker), and additional logs live under `notify/logs/<identity>/`. When a log's
-/// generation moves with lineage (`LogIdentity::continues`), [`Store::carry`] carries over its
-/// predecessor's cursors and journal clamped at the fork so nothing below the fork re-pages and
-/// nothing after it is skipped. `rate` and `suppressed` are global to the human and stay at the
-/// root.
 #[derive(Clone)]
 struct Store {
     root: PathBuf,
@@ -409,8 +322,6 @@ impl Store {
     }
 
     /// Return the [`Store`] for `log` (`self` for the root log or a pre-identity broker;
-    /// `logs/<identity>/` for any other, carrying over from a predecessor generation when
-    /// `lineage` links them).
     fn for_log(
         &self,
         log: Option<astream_broker::LogIdentity>,
@@ -421,10 +332,6 @@ impl Store {
         };
         let name = log.to_string();
         let path = self.root.join("log");
-        // Only an absent identity file permits the first claim. An unreadable
-        // or damaged witness cannot turn the existing cursors and journal into
-        // another log's state. A dangling symlink is an existing, unreadable
-        // witness too, not an absent file to replace.
         let owner = match std::fs::read_to_string(&path) {
             Ok(saved) => Some(
                 astream_broker::LogIdentity::parse(saved.trim_end_matches('\n')).ok_or_else(
@@ -471,7 +378,6 @@ impl Store {
     }
 
     /// Find the newest stored generation of the same log that `log` continues under `lineage`,
-    /// together with the fork offset where they agree.
     fn predecessor(
         &self,
         owner: astream_broker::LogIdentity,
@@ -507,7 +413,6 @@ impl Store {
     }
 
     /// Carry admits absence only when the name is absent. A read failure or
-    /// damaged cursor must not publish a successor with missing state.
     fn carry_text(&self, name: &str) -> io::Result<Option<String>> {
         let path = self.root.join(name);
         match std::fs::read_to_string(&path) {
@@ -524,8 +429,6 @@ impl Store {
     }
 
     /// Carry `from`'s store into `to` for a generation that agrees below `fork`: clamp each
-    /// `cur/<key>` to `min(cur, fork)`, keep only `journal` verdicts below `fork`, and copy
-    /// `standing` intact. Built in a sibling temp dir and atomically renamed into place.
     fn carry(&self, from: &Store, to: &Path, fork: u64) -> io::Result<()> {
         let logs = to.parent().unwrap_or(&self.root).to_path_buf();
         std::fs::create_dir_all(&logs)?;
@@ -634,7 +537,6 @@ impl Store {
     }
 
     /// Monotone: a cursor that walked backwards would re-offer offsets the journal has
-    /// already forgotten.
     fn set_cursor(&self, key: &str, off: u64) -> io::Result<()> {
         if self.cursor(key).is_some_and(|have| have >= off) {
             return Ok(());
@@ -664,8 +566,6 @@ impl Store {
     }
 
     /// `<subject> <attention token>` per line, the oldest first. Both are one
-    /// word by construction ([`escalation`]); a line that is not two words is
-    /// skipped, which can only cost a re-page.
     fn standing(&self) -> Vec<(String, String)> {
         self.read("standing")
             .map(|s| {
@@ -697,11 +597,6 @@ impl Store {
 }
 
 /// Test-only fault injection, armed by `$ATERM_LINK_NOTIFY_FAULT` through
-/// `aterm_types::dev_seam!`, so a release build compiles it to `None`; the gate matters because
-/// aterm's `fabric_launch::filter_child_env` passes the variable on. [`Fault::fire`] kills the
-/// notifier inside the in-doubt window (command exit to `fired` line), too narrow to race from
-/// outside. One shot: the marker is in the state dir, since the process that would remember it
-/// is the one that dies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Fault {
     None,
@@ -731,8 +626,6 @@ impl Fault {
     }
 }
 
-// the notifier
-
 /// Everything the verb was told.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -756,8 +649,7 @@ pub struct Counts {
     pub dup: u64,
     pub skipped: u64,
     pub dropped: u64,
-    /// `attention` rows that republished the escalation a human was already
-    /// told of on that subject: no command, no journal line, no budget.
+    /// `attention` rows that republished the escalation a human was already told of on that subject: no command, no journal line, no budget.
     pub standing: u64,
 }
 
@@ -765,37 +657,27 @@ struct Notifier {
     cfg: Config,
     store: Store,
     /// The store of the log this notifier is reading NOW ([`Store::for_log`]):
-    /// where its cursors and `journal` are read and written.
     log_store: Store,
     /// That log's identity, `None` for a broker that predates one.
     log_now: Option<astream_broker::LogIdentity>,
     /// The log each follow-mode reader's connection last reached
-    /// ([`Notice::Log`]), by selector index.
     reader_log: Vec<ReadLog>,
     journal: Vec<String>,
     /// The log in hand's `standing` ([`Store::standing`]): per presence
-    /// subject, the `attention=` token a human was last told of.
     standing: Vec<(String, String)>,
     stamps: Vec<u64>,
     suppressed: u64,
     fault: Fault,
     counts: Counts,
     /// Whether a page waits for its record to be durable on a broker that
-    /// serves ordered (the module doc). `false` only under the negative
-    /// control's dev seam, `ATERM_LINK_NOTIFY_PAGE_EARLY` — the notifier
-    /// before the wait.
     wait_durable: bool,
     /// By selector index, the records held for durability, in read order
-    /// ([`Notifier::take`]).
     held: Vec<std::collections::VecDeque<Held>>,
     /// The bytes [`Self::held`] holds, against [`HOLD_MAX`].
     held_bytes: usize,
     /// By selector index, the highest page checkpoint not yet written because
-    /// a held record lies below it: the cursor it moves to once the last held
-    /// record is paged.
     scanned: Vec<Option<u64>>,
     /// By selector index, the durable head the reader's current connection
-    /// last told ([`Notice::Durable`]).
     durable: Vec<u64>,
 }
 
@@ -825,7 +707,6 @@ impl Notifier {
     }
 
     /// One broker connection with every capability attached, every exchange bounded by
-    /// [`ACK_DEADLINE`] so a wedged broker ends `--once` with an error.
     fn connect(&self) -> io::Result<Conn> {
         let (mut conn, _closer) = transport::connect(&self.cfg.broker, ACK_DEADLINE)?;
         transport::attach_cap_files(&mut conn, &self.cfg.cap_files)?;
@@ -833,9 +714,6 @@ impl Notifier {
     }
 
     /// Read and write cursors and verdicts as the log `log`'s from here on
-    /// ([`Store::for_log`]), loading its journal when that is another log
-    /// than the one in hand. Said once on stderr: the human reading it learns
-    /// why escalations already journalled are not skipped on this log.
     fn scope_to(&mut self, read: &ReadLog) -> io::Result<()> {
         let log = read.id;
         if log == self.log_now {
@@ -860,8 +738,6 @@ impl Notifier {
     }
 
     /// Check once before starting that `--cap-file` paths read cleanly and no permanent broker
-    /// refusal rejects the attached capabilities or selector filters. Transient connection or
-    /// broker errors return `Ok(())` so readers can retry under backoff.
     fn preflight(&self) -> Result<(), String> {
         for path in &self.cfg.cap_files {
             crate::bridge::read_cap_file(path).map_err(|e| format!("--cap-file {path}: {e}"))?;
@@ -902,7 +778,6 @@ impl Notifier {
     }
 
     /// The verdict the journal holds for an offset. Keyed by offset alone: a record wakes a human
-    /// once however many selectors name it.
     fn verdict(&self, off: u64) -> Option<&str> {
         self.journal.iter().find_map(|line| {
             let mut it = line.split_whitespace();
@@ -912,7 +787,6 @@ impl Notifier {
     }
 
     /// Whether the journal's verdict for `off` says a human was TOLD: a
-    /// `fired` line whose command answered `rc=0`, the module doc's rule.
     fn told(&self, off: u64) -> bool {
         self.journal.iter().any(|line| {
             let mut it = line.split_whitespace();
@@ -931,8 +805,6 @@ impl Notifier {
     }
 
     /// Make `token` the escalation standing on `subject` (`None`: nothing
-    /// stands there), durably, keeping the newest [`STANDING_KEEP`] subjects.
-    /// Written only when it changes, so a republished row writes nothing.
     fn set_standing(&mut self, subject: &str, token: Option<&str>) -> io::Result<()> {
         if self.standing_of(subject) == token {
             return Ok(());
@@ -963,7 +835,6 @@ impl Notifier {
     }
 
     /// Whether the budget has room at `now`, forgetting stamps outside the window. Stamps a
-    /// backwards clock left in the future count as inside, erring towards suppressing.
     fn has_room(&mut self, now: u64) -> bool {
         let window = self.cfg.window_ms;
         self.stamps.retain(|t| now.saturating_sub(*t) < window);
@@ -971,7 +842,6 @@ impl Notifier {
     }
 
     /// Charge one fire against the budget, durably, before the command runs, so a restart cannot
-    /// burst.
     fn charge(&mut self, now: u64) -> io::Result<()> {
         self.stamps.push(now);
         let limit = self.cfg.limit as usize;
@@ -983,10 +853,6 @@ impl Notifier {
 
     /// One record off the bus, already matched against `sel`.
     fn on_record(&mut self, sel: &Sel, off: u64, subject: &str, body: &[u8]) -> io::Result<()> {
-        // `attention` IS A LAST-VALUE FACE (the module doc): what the row says
-        // of its subject's escalation decides before anything else whether it
-        // is news. A clear re-arms the subject; a raise of ANOTHER value means
-        // the one standing there is not standing any more, told or not.
         let raised = match sel {
             Sel::Attention => match escalation(&self.cfg.fleet, off, subject, body) {
                 None => return Ok(()),
@@ -1004,10 +870,6 @@ impl Notifier {
             return Ok(());
         };
         let dup = match self.verdict(off) {
-            // Terminal: this offset has had its answer. Never fired twice, and
-            // never re-offered after the window rolls. A replay of a TOLD
-            // escalation puts it back as standing — the re-scan of a page a
-            // crash interrupted can deliver its subject's earlier clear first.
             Some("fired" | "dropped") => {
                 if let Some(token) = raised.as_deref().filter(|_| self.told(off)) {
                     self.set_standing(subject, Some(token))?;
@@ -1015,11 +877,7 @@ impl Notifier {
                 self.counts.skipped += 1;
                 return Ok(());
             }
-            // In doubt: a crash between spawn and completion. Fire again, labelled (module doc).
             Some(_) => true,
-            // THE ESCALATION THE HUMAN WAS ALREADY TOLD OF, republished — an
-            // attach, a reconnect, an update's successor, a phase change, the
-            // `exited` row. Not news: no command, no journal line, no budget.
             None if raised.is_some() && self.standing_of(subject) == raised.as_deref() => {
                 self.counts.standing += 1;
                 return Ok(());
@@ -1058,13 +916,10 @@ impl Notifier {
             off,
             format!("{off} fired on={} {verdict} dup={}", hit.on, u8::from(dup)),
         )?;
-        // Cleared only by `rc=0` (module doc).
         if carried > 0 && verdict == "rc=0" {
             self.suppressed -= carried;
             self.store.set_suppressed(self.suppressed)?;
         }
-        // AND ONLY A TOLD ESCALATION STANDS, after its `fired` line: a crash
-        // between the two is the replay above, which reads the line back.
         if let Some(token) = raised.as_deref().filter(|_| verdict == "rc=0") {
             self.set_standing(subject, Some(token))?;
         }
@@ -1076,7 +931,6 @@ impl Notifier {
     }
 
     /// Run the operator's command and return its verdict. Never fails the run: a missing `curl`
-    /// must not stop the notifier.
     fn exec(&self, hit: &Hit, dup: bool, suppressed: u64) -> String {
         let mut cmd = aterm_uds::spawnfd::command("/bin/sh");
         cmd.arg("-c")
@@ -1148,16 +1002,11 @@ impl Notifier {
         Ok(match self.cfg.since {
             Since::Start => 0,
             Since::At(n) => n,
-            // `max = 0` is the broker's head query (R2).
             Since::Head => conn.fetch(0, &sel.filter(&self.cfg.fleet), 0)?.1 .1,
         })
     }
 
     /// Catch up to the head once and stop: the whole of `--once`.
-    ///
-    /// On a broker that serves ordered, a selector's scan STOPS at its first
-    /// record the page's closing `Mark` does not say is durable, its cursor
-    /// left at that record for the next run (the module doc).
     fn catch_up(&mut self) -> io::Result<()> {
         let mut conn = self.connect()?;
         let log = log_of(&mut conn, &self.cfg)?;
@@ -1167,8 +1016,6 @@ impl Notifier {
             let key = sel.key();
             let mut from = self.start_offset(&mut conn, &sel)?;
             loop {
-                // A retaining broker refuses a cursor below what the selector
-                // still keeps: the scan reads on from there and says so.
                 let ((rows, (next, head)), floor) =
                     transport::fetch_kept(&mut conn, from, &filter, PAGE)?;
                 if let Some(floor) = floor {
@@ -1178,9 +1025,6 @@ impl Notifier {
                         sel.label()
                     );
                 }
-                // The page's own mark: how far the broker was durable when it
-                // read it. A broker new enough to serve ordered always says;
-                // one that did not would be paged, never withheld.
                 let durable = conn.seen_durable();
                 for (off, subject, body) in rows {
                     if self.wait_durable && log.ordered && durable.is_some_and(|d| off >= d) {
@@ -1207,7 +1051,6 @@ impl Notifier {
     }
 
     /// Follow the bus. One subscription per selector, each on its own connection and thread, all
-    /// feeding one executor: the command runs one at a time and the journal has one writer.
     fn follow(&mut self) -> io::Result<()> {
         let (tx, rx) = notice_handoff();
         for (idx, sel) in self.cfg.on.iter().enumerate() {
@@ -1223,7 +1066,6 @@ impl Notifier {
         while let Ok(notice) = rx.recv() {
             self.take(notice)?;
         }
-        // Every reader gave up for good: not an exit 0.
         Err(io::Error::new(
             io::ErrorKind::ConnectionAborted,
             "every subscription ended",
@@ -1231,7 +1073,6 @@ impl Notifier {
     }
 
     /// Process one [`Notice`] from a follow-mode reader in read order, holding records from an
-    /// `ordered` broker until a [`Notice::Durable`] mark covers them.
     fn take(&mut self, notice: Notice) -> io::Result<()> {
         match notice {
             Notice::Log(idx, log) => {
@@ -1239,8 +1080,6 @@ impl Notifier {
                     return Ok(());
                 };
                 if slot.id != log.id {
-                    // Drop records held from another log; the reader re-reads this log from its
-                    // own cursor.
                     let dropped: usize = self.held[idx]
                         .drain(..)
                         .map(|h| h.subject.len() + h.body.len())
@@ -1251,8 +1090,6 @@ impl Notifier {
                 self.durable[idx] = 0;
                 let ordered = log.ordered;
                 self.reader_log[idx] = log;
-                // If the same log is now served non-ordered, release any held records in read
-                // order before processing the new connection's deliveries.
                 if !ordered && !self.held[idx].is_empty() {
                     self.release(idx, u64::MAX)?;
                 }
@@ -1281,7 +1118,6 @@ impl Notifier {
                         self.held[idx].push_back(Held { off, subject, body });
                         return Ok(());
                     }
-                    // THE BOUND: page what is held, as it was read, then this.
                     eprintln!(
                         "aterm-link notify: {} holds {} bytes the broker has not said are \
                          durable — past {HOLD_MAX}, so they are paged now, before it does",
@@ -1318,8 +1154,6 @@ impl Notifier {
     }
 
     /// Page selector `idx`'s held records below `durable`, oldest first, each
-    /// cursor moved past it as it goes; once none is held, write the page
-    /// checkpoint they held back.
     fn release(&mut self, idx: usize, durable: u64) -> io::Result<()> {
         let Some(sel) = self.cfg.on.get(idx).cloned() else {
             return Ok(());
@@ -1344,36 +1178,22 @@ impl Notifier {
 }
 
 /// One selector's reader thread: bounded catch-up, then subscribe from the page's resume
-/// cursor, and on any failure back off and do it again. One per selector, so one deep backlog
-/// does not delay the others.
-///
-/// It never resumes below what it has forwarded, so a reconnect replays at most what the
-/// executor had not finished, which the journal dedups. The paged scan moves the durable cursor
-/// across records the selector does not match (the per-page `Checkpoint`): a subscription
-/// reports only matches, so a sparse selector subscribed straight from a stale cursor would
-/// restart from its last match every time.
 fn reader(idx: usize, sel: &Sel, cfg: &Config, root: &Path, tx: &mpsc::SyncSender<Notice>) {
     let filter = sel.filter(&cfg.fleet);
     let key = sel.key();
     let mut seen: Option<u64> = None;
-    // The log the offsets in `seen` were read on: a reconnect to ANOTHER log
-    // never resumes from them ([`Store::for_log`]).
     let mut seen_on: Option<PathBuf> = None;
-    // Reset only by a connection that stayed up, so a broker that accepts and then drops is
-    // redialled under the back-off.
     let mut backoff = Backoff::default();
     loop {
         let wait = match connect_for_reader(cfg, root, &key, &filter, &mut seen, &mut seen_on) {
             Ok((mut conn, closer, mut from, log)) => {
                 if tx.send(Notice::Log(idx, log)).is_err() {
-                    return; // the executor is gone
+                    // the executor is gone
+                    return;
                 }
                 backoff.attached(Instant::now());
                 let mut closed = false;
                 loop {
-                    // A cursor below what the broker's retention keeps reads on
-                    // from its floor, said: refused, it would be refused again
-                    // at every redial.
                     let (rows, (next, head)) =
                         match transport::fetch_kept(&mut conn, from, &filter, PAGE) {
                             Ok((page, floor)) => {
@@ -1395,18 +1215,15 @@ fn reader(idx: usize, sel: &Sel, cfg: &Config, root: &Path, tx: &mpsc::SyncSende
                         };
                     for (off, subject, body) in rows {
                         if tx.send(Notice::Record(idx, off, subject, body)).is_err() {
-                            return; // the executor is gone
+                            // the executor is gone
+                            return;
                         }
                         seen = Some(seen.map_or(off + 1, |s| s.max(off + 1)));
                     }
                     if tx.send(Notice::Checkpoint(idx, next)).is_err() {
                         return;
                     }
-                    // The zero-buffer handoff accepted the checkpoint after every record of
-                    // this page, so those rows were all processed.
                     seen = Some(seen.map_or(next, |s| s.max(next)));
-                    // And the page's mark: how far the broker was durable when
-                    // it read the page (what releases a record held for it).
                     if let Some(durable) = conn.seen_durable() {
                         if tx.send(Notice::Durable(idx, durable)).is_err() {
                             return;
@@ -1421,8 +1238,6 @@ fn reader(idx: usize, sel: &Sel, cfg: &Config, root: &Path, tx: &mpsc::SyncSende
                 if !closed {
                     match conn.subscribe(from, &filter) {
                         Ok(mut sub) => {
-                            // Clear the catch-up read timeout and bound liveness via idle marks
-                            // (`recv_live_event`), which also carry the broker's durable head.
                             let _ = closer.set_read_timeout(None);
                             loop {
                                 match sub
@@ -1435,7 +1250,8 @@ fn reader(idx: usize, sel: &Sel, cfg: &Config, root: &Path, tx: &mpsc::SyncSende
                                     })) => {
                                         if tx.send(Notice::Record(idx, off, subject, body)).is_err()
                                         {
-                                            return; // the executor is gone
+                                            // the executor is gone
+                                            return;
                                         }
                                         seen = Some(seen.map_or(off + 1, |s| s.max(off + 1)));
                                     }
@@ -1480,8 +1296,6 @@ fn reader(idx: usize, sel: &Sel, cfg: &Config, root: &Path, tx: &mpsc::SyncSende
 }
 
 /// Open one reader's connection from the higher of the durable cursor and what this thread
-/// has forwarded, else `--since`. A first `--since=head` is persisted before subscribing, so a
-/// restart while idle still replays records published after this first start.
 fn connect_for_reader(
     cfg: &Config,
     root: &Path,
@@ -1492,8 +1306,6 @@ fn connect_for_reader(
 ) -> io::Result<(Conn, Closer, u64, ReadLog)> {
     let (mut conn, closer) = transport::connect(&cfg.broker, ACK_DEADLINE)?;
     transport::attach_cap_files(&mut conn, &cfg.cap_files)?;
-    // THE CURSOR IS THIS LOG'S ([`Store::for_log`]), and so is what this
-    // thread forwarded: offsets read on another log name nothing here.
     let log = log_of(&mut conn, cfg)?;
     let store = Store {
         root: root.to_path_buf(),
@@ -1522,10 +1334,6 @@ fn connect_for_reader(
 }
 
 /// The log `conn` reaches: the identity its attach's `Hello` answered, or —
-/// with no cap file, so no `Hello` went — one asked for now (`None`: a broker
-/// that predates identity), and the lineage that SAME answer told beside it
-/// ([`astream_broker::Client::log_lineage`]), so the two always describe one
-/// log.
 fn log_of(conn: &mut Conn, cfg: &Config) -> io::Result<ReadLog> {
     let id = match conn.seen_log_identity() {
         Some(log) => Some(log),
@@ -1535,9 +1343,6 @@ fn log_of(conn: &mut Conn, cfg: &Config) -> io::Result<ReadLog> {
     let lineage = conn.log_lineage().cloned();
     #[cfg(test)]
     let lineage = lineage.filter(|_| !FORGET_LINEAGE.with(std::cell::Cell::get));
-    // The tier IN FORCE, as the same answer told it: only a broker that
-    // serves ordered makes a page wait (one asked for ordered and serving
-    // strict has durable records the moment they are visible).
     let ordered = conn
         .served_durability()
         .is_some_and(|s| s.served == astream_broker::Tier::Ordered);
@@ -1551,12 +1356,8 @@ fn log_of(conn: &mut Conn, cfg: &Config) -> io::Result<ReadLog> {
 #[cfg(test)]
 thread_local! {
     /// THE NEGATIVE CONTROL of the carry-over tests: a notifier on this thread
-    /// reads no lineage, and so meets a moved generation as another log, from
-    /// `--since` — the notifier before lineage. Tests only.
     static FORGET_LINEAGE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
-
-// the command line
 
 /// Usage, printed to stderr on a usage error (exit 2).
 const USAGE: &str = "\
@@ -1583,7 +1384,7 @@ subject (clearing and re-raising pages again; crashes during `--exec` re-fire wi
 leaves non-durable records for the next run).
 ";
 
-/// `aterm-link notify`. Every failure is an exit code and a line on stderr.
+/// `aterm-link notify`.
 #[must_use]
 pub fn main(args: &[String]) -> ExitCode {
     let cfg = match parse(args) {
@@ -1626,7 +1427,6 @@ pub fn main(args: &[String]) -> ExitCode {
 }
 
 /// Parse argv. Every flag takes a value except `--once`; a flag
-/// without one is a usage error rather than a silently defaulted setting.
 fn parse(args: &[String]) -> Result<Config, String> {
     let mut cfg = Config {
         fleet: String::new(),
@@ -1738,8 +1538,6 @@ mod tests {
     use super::*;
 
     /// A slow `--exec` leaves the consumer unavailable, and a reader must stop
-    /// at its current row rather than queue broker bodies while it runs: an
-    /// unbounded channel let a slow command grow without limit.
     #[test]
     fn follow_handoff_buffers_no_row_for_a_stalled_executor() {
         let (tx, _rx) = notice_handoff();
@@ -1751,7 +1549,6 @@ mod tests {
     }
 
     /// Every subject segment that becomes an environment value is a principal: no bidi override,
-    /// no oversized segment.
     #[test]
     fn a_subject_segment_that_is_not_a_principal_never_becomes_an_environment_value() {
         let huge = "x".repeat(200_000);
@@ -1767,14 +1564,12 @@ mod tests {
             )
             .is_some());
         for bad in [
-            format!("/f/f1/in/p/h-andrew/{huge}/ask"), // the SENDER's node
-            format!("/f/f1/in/p/h-andrew/{bidi}/ask"), // a bidi override
-            "/f/f1/in/p/h-andrew/NODE/ask".to_string(), // not lowercase
+            format!("/f/f1/in/p/h-andrew/{huge}/ask"),
+            format!("/f/f1/in/p/h-andrew/{bidi}/ask"),
+            "/f/f1/in/p/h-andrew/NODE/ask".to_string(),
         ] {
             assert_eq!(ask.hit("f1", 7, &bad, b"v=1 t=1"), None, "{}", &bad[..40]);
         }
-        // The asking SESSION rides in the body, the node's word: a `from=` that
-        // is not an `s-` principal is no sid at all, never the raw token.
         for from in [huge.as_str(), bidi, "h-b"] {
             let body = format!("v=1 t=1 from={from} text=hi");
             let hit = ask
@@ -1789,7 +1584,7 @@ mod tests {
             .hit("f1", 3, "/f/f1/pub/n-a/s-b/presence", body)
             .is_some());
         for bad in [
-            format!("/f/f1/pub/n-a/{huge}/presence"), // the publisher's own face
+            format!("/f/f1/pub/n-a/{huge}/presence"),
             format!("/f/f1/pub/{huge}/s-b/presence"),
             format!("/f/f1/pub/n-a/{bidi}/presence"),
         ] {
@@ -1804,7 +1599,6 @@ mod tests {
             None
         );
 
-        // What passes is bounded by `TEXT_MAX`.
         let hit = ask
             .hit(
                 "f1",
@@ -1845,9 +1639,6 @@ mod tests {
     }
 
     /// THE SELECTORS MATCH BY POSITION, and an over-long subject is not a hit
-    /// however its tail reads. `ask:<p>` is an ask ADDRESSED TO `<p>` — the
-    /// `/f/<F>/in/p/<p>/<node>/ask` a session's `post to=<p> kind=ask` lands on
-    /// — and never one `<p>` sent, which reads `…/in/<node>/<sid>/<p>/ask`.
     #[test]
     fn a_selector_matches_by_position_and_an_overlong_subject_never_matches() {
         let ask = Sel::Ask("h-andrew".into());
@@ -1861,13 +1652,13 @@ mod tests {
         );
         assert_eq!(hit.text, "is this ok?");
         for bad in [
-            "/f/f1/in/n-a/s-b/h-andrew/ask",   // an ask FROM h-andrew
-            "/f/f1/in/p/h-andrew/n-a/s-1/ask", // nine segments, forged tail
-            "/f/f1/in/p/h-other/n-a/ask",      // to someone else
-            "/f/f1/in/p/h-andrew/n-a/note",    // a different kind
-            "/f/f2/in/p/h-andrew/n-a/ask",     // another fleet
-            "/f/f1/pub/p/h-andrew/n-a/ask",    // another face
-            "/f/f1/in/n-a/h-andrew/n-b/ask",   // no literal `p` owner
+            "/f/f1/in/n-a/s-b/h-andrew/ask",
+            "/f/f1/in/p/h-andrew/n-a/s-1/ask",
+            "/f/f1/in/p/h-other/n-a/ask",
+            "/f/f1/in/p/h-andrew/n-a/note",
+            "/f/f2/in/p/h-andrew/n-a/ask",
+            "/f/f1/pub/p/h-andrew/n-a/ask",
+            "/f/f1/in/n-a/h-andrew/n-b/ask",
         ] {
             assert_eq!(ask.hit("f1", 7, bad, b"v=1 t=1"), None, "{bad}");
         }
@@ -1895,16 +1686,12 @@ mod tests {
         ] {
             assert_eq!(sel.hit("f1", 3, subject, body), None);
         }
-        // A halt coming off wakes nobody.
         let halt = Sel::Halt;
         let lane = "/f/f1/fleet/h-andrew/halt";
         assert!(halt
             .hit("f1", 4, lane, b"v=1 t=1 state=on reason=main%20broken")
             .is_some());
         assert_eq!(halt.hit("f1", 4, lane, b"v=1 t=1 state=off"), None);
-        // And a halt no bridge applies wakes nobody either: a bridge holds a
-        // session for a HUMAN's row alone, so an `a-` service's or a node's
-        // `state=on` is a stop that never happened.
         for lane in ["/f/f1/fleet/a-svc/halt", "/f/f1/fleet/n-node/halt"] {
             assert_eq!(
                 halt.hit("f1", 4, lane, b"v=1 t=1 state=on reason=stop"),
@@ -1932,9 +1719,7 @@ mod tests {
         assert!(n.has_room(1_100));
         n.charge(1_100).expect("charge");
         assert!(!n.has_room(1_200), "two in the window is the limit of 2");
-        // The window rolls: the first stamp is 60s old at 61_000.
         assert!(n.has_room(61_050), "the 1_000 stamp has left the window");
-        // The stamps are durable: a restart inside the window still counts.
         let mut back = Notifier::new(cfg(&dir)).expect("reopen");
         assert!(
             !back.has_room(1_200),
@@ -1944,7 +1729,6 @@ mod tests {
     }
 
     /// A notifier over `dir` whose command appends each offset it is run for to
-    /// `<dir>/fired`, under a budget of `limit` (and `exec` in front of it).
     fn appending(dir: &str, limit: u32, exec: &str) -> (Notifier, PathBuf) {
         std::fs::create_dir_all(dir).expect("scratch");
         let fired = Path::new(dir).join("fired");
@@ -1972,17 +1756,6 @@ mod tests {
     }
 
     /// **A STANDING ATTENTION PAGES ONCE PER TRANSITION, NOT ONCE PER OFFSET**
-    /// (r3-22). Presence is a last-value face the bridge rewrites on every
-    /// attach, reconnect, successor after an update, meta change and exit,
-    /// standing `attention=` and all. s-one raises "needs a key": it pages.
-    /// Its row republished by an attach (`inc=2`), a phase change and its
-    /// `exited` row pages nobody and charges nothing — the negative control:
-    /// offset dedup alone ran the command for all four. s-two's identical text
-    /// is s-two's own escalation and pages. A clear and the same text again
-    /// pages; so does another value, and the first value after it. A restart
-    /// remembers what stands. And the re-scan of a page a crash interrupted —
-    /// the clear below an escalation already told, then that escalation —
-    /// leaves it standing, so its next republish pages nobody.
     #[test]
     fn a_standing_attention_pages_once_per_transition_not_once_per_offset() {
         let dir = scratch("standing");
@@ -2055,7 +1828,6 @@ mod tests {
             "a value that moved is a new escalation, and so is moving back"
         );
 
-        // THE RE-SCAN of offsets 6 and 7, after a crash before their cursor.
         feed(&mut back, 11, "s-two", "v=1 t=11 attention=-");
         feed(&mut back, 12, "s-two", &format!("v=1 t=12 {key}"));
         feed(&mut back, 11, "s-two", "v=1 t=11 attention=-");
@@ -2066,11 +1838,6 @@ mod tests {
     }
 
     /// **AN ESCALATION NOBODY WAS TOLD OF DOES NOT STAND** (r3-22). Value
-    /// dedup must not become the silent drop the module refuses. With a budget
-    /// of one, s-one's raise pages and s-two's is rate-dropped: s-two's
-    /// republish is offered again, and with room it pages. A command that
-    /// answered `rc=3` told nobody, so its escalation's republish runs the
-    /// command again; once it answers `rc=0`, the next republish pages nobody.
     #[test]
     fn an_escalation_nobody_was_told_of_is_offered_again_on_its_republish() {
         let dir = scratch("untold");
@@ -2180,8 +1947,6 @@ mod tests {
                 ),
                 _ => unreachable!(),
             }
-            // Repair the same state in place, then prove A resumes and B starts
-            // with its own empty namespace, rather than A's cursor/journal.
             std::fs::remove_file(&path).unwrap();
             store.write("log", &a.to_string()).unwrap();
             let resumed = store.for_log(Some(a), None).unwrap();
@@ -2194,13 +1959,6 @@ mod tests {
     }
 
     /// **A LOG CHANGE DOES NOT LEAVE A STORE BEHIND FOR EVER.** The root
-    /// claims log 0; six log changes follow (each a relaxed broker's unclean
-    /// reboot, say), each filing a cursor under its own `logs/<identity>/`.
-    /// Only the newest [`LOGS_KEEP`] stay — a store from before `logs/used`
-    /// went with the old ones — and a kept log read again is the newest, its
-    /// cursor standing; a pruned one read again starts as a first run. The
-    /// root's store, and a name under `logs/` that is not an identity, are
-    /// never touched.
     #[test]
     fn only_the_newest_other_logs_stores_are_kept() {
         let id = |n: u8| astream_broker::LogIdentity {
@@ -2268,14 +2026,6 @@ mod tests {
     }
 
     /// The cursor never moves backwards.
-    /// **ANOTHER LOG IS READ AS A FIRST RUN, AND THE OLD ONE RESUMES** (r2-01).
-    /// Each log carries an escalation at offset 0. Run against log A, it fires
-    /// and A's cursor and journal say so. Pointed at log B — a recreated
-    /// bus.log, or another host's broker — that cursor and that journal name
-    /// A's records: B's escalation at the same offset fires all the same,
-    /// filed under B. Back on A, A's cursor and journal stand and nothing
-    /// fires twice. Negative control: one cursor and one journal for every
-    /// log, as before, and B's escalation is skipped as already fired.
     #[cfg(unix)]
     #[test]
     fn a_notifier_files_its_cursor_and_journal_under_the_log_it_read() {
@@ -2339,19 +2089,12 @@ mod tests {
             .join(broker_b.log_identity().to_string())
             .join("cur/attention")
             .exists());
-        // Before the dir goes, while their names still reach the acceptors.
         server_a.shutdown();
         server_b.shutdown();
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// **A CURSOR BELOW A RETAINING BROKER'S FLOOR READS ON FROM IT**.
-    /// Three escalations at offsets 0, 1 and 2, the log
-    /// then cut below 1; a first run from the start reads from 0, below what the
-    /// broker keeps. The two it kept fire and the catch-up ends well, never a
-    /// refusal each run repeats for ever. NEGATIVE CONTROL, run: the plain
-    /// `fetch` the scan made before is refused `retained-from=1`, and the
-    /// catch-up with it.
     #[cfg(unix)]
     #[test]
     fn a_catch_up_below_the_retained_floor_reads_on_from_it() {
@@ -2398,24 +2141,14 @@ mod tests {
     #[derive(Clone, Copy)]
     enum Ended {
         /// Its clean stop: the listener dropped, and astream flushed the log
-        /// in full and recorded it `Closed`.
         Clean,
         /// Killed, nothing lost: the page cache kept every record, and the
-        /// run stays `Open` in the log's sidecar.
         Killed,
         /// A power loss: every ack after the first was page cache, so the log
-        /// comes back cut to one record, the run still `Open`.
         PowerLoss,
     }
 
     /// A relaxed broker in boot 1 carries four escalations (`help-0`..`3`,
-    /// offsets 0..3), each fired by a notifier on `since` that read the empty
-    /// log once before them — its cursor and journal filed under that log's
-    /// identity. The broker ends as `ended` and is reopened relaxed in `boot`,
-    /// and a NEW escalation, `help-9`, lands. `forget` runs the notifier with
-    /// no lineage ([`FORGET_LINEAGE`]: the notifier before lineage). Answers the
-    /// offset `help-9` took, the `<offset> <text>` lines the notifier fired
-    /// after the reopen, and the identities before and after.
     #[cfg(unix)]
     fn after_a_relaxed_stop(
         tag: &str,
@@ -2441,7 +2174,6 @@ mod tests {
         );
         let escalate = |text: &str| {
             let (mut conn, _) = transport::connect(&sock.to_string_lossy(), ACK_DEADLINE).unwrap();
-            // `help-<d>` publishes as sequence d + 1: one key per text.
             let seq = u64::from(text.as_bytes()[text.len() - 1] - b'0') + 1;
             let body = format!("v=1 t=1 attention={text}");
             conn.publish(7, seq, "/f/f1/pub/n-a/s-x/presence", body.as_bytes())
@@ -2465,7 +2197,6 @@ mod tests {
             .unwrap();
             if !matches!(ended, Ended::Clean) {
                 // What a stop that never reached the clean close leaves
-                // (astream's seam): the log as a killed run left it.
                 opened.broker.arm_unclean_stop();
             }
             let mut server = opened.broker.serve(&sock).unwrap();
@@ -2476,8 +2207,6 @@ mod tests {
                 escalate(text);
             }
             assert_eq!(run().lines().count(), 4, "all four fire in boot 1");
-            // The last listener's shutdown is astream's clean close, unless
-            // the seam was armed above.
             server.shutdown();
             (opened.broker.log_identity(), cut)
         };
@@ -2507,9 +2236,6 @@ mod tests {
         FORGET_LINEAGE.with(|f| f.set(forget));
         let after = run().lines().skip(4).map(str::to_string).collect();
         FORGET_LINEAGE.with(|f| f.set(false));
-        // Shut down while the socket's names still reach its acceptor: with the
-        // dir removed first, shutdown dials nobody and abandons the acceptor after
-        // astream's ten unanswered 100 ms rounds, a second per stop.
         server.shutdown();
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(
@@ -2521,25 +2247,6 @@ mod tests {
     }
 
     /// **A RELAXED BROKER'S POWER LOSS COSTS THE NOTIFIER NOTHING BUT WHAT IT
-    /// TOOK** ([`crate::durability`]). The power loss keeps only `help-0`, the
-    /// next boot's open moves the log's generation with lineage `(g + 1, 1)`,
-    /// and the new escalation lands at offset 1 — an offset the notifier's
-    /// cursor (4) and journal (`1 fired`) account for under the old generation.
-    ///
-    /// * The store is CARRIED OVER: the cursor resumes at the fork (1), the
-    ///   journal keeps `0 fired` and loses `1..3 fired` (they name records the
-    ///   loss took). The new escalation fires, on the DEFAULT `--since head` as
-    ///   on `--since start` (a carried cursor is no first run), and the
-    ///   surviving one is not paged again.
-    /// * NEGATIVE CONTROL, the notifier before lineage (it reads none): the new
-    ///   generation is another log, a first run. On `--since head` that starts
-    ///   past the new escalation, which never fires — the residual cost the
-    ///   relaxed tier used to carry; on `--since start` it re-reads from 0 and
-    ///   pages the survivor twice.
-    /// * NEGATIVE CONTROL, opened in boot 1 (a same-boot reopen is a process
-    ///   crash to astream, which moves nothing): the cursor past the head and
-    ///   the journal's `1 fired` swallow it even from `--since start` — the
-    ///   hazard the generation move closes.
     #[cfg(unix)]
     #[test]
     fn a_power_loss_under_a_relaxed_broker_resumes_the_notifier_where_the_log_continues() {
@@ -2578,14 +2285,6 @@ mod tests {
     }
 
     /// **NEITHER A CLEAN STOP NOR A KILL COSTS A DEFAULT NOTIFIER ANYTHING
-    /// ACROSS A REBOOT.** Stopped cleanly (astream's close: a full flush, then
-    /// `Closed`), the log keeps its identity in boot 2, and the new escalation
-    /// at offset 4 fires on the default `--since head`, as under a strict
-    /// broker. Killed instead — nothing lost, but the run stays `Open`, so the
-    /// next boot moves the generation with lineage `(g + 1, 4)` — the carried
-    /// cursor (4) still pages it. NEGATIVE CONTROL: the same kill read with no
-    /// lineage is a first run from the head, past it — what a kill used to
-    /// cost.
     #[cfg(unix)]
     #[test]
     fn a_clean_stop_or_a_kill_keeps_a_default_notifiers_place_across_a_reboot() {
@@ -2603,13 +2302,6 @@ mod tests {
     }
 
     /// THE CARRY-OVER IS THE STORE OF THE NEWEST GENERATION IT CONTINUES,
-    /// whole or not at all. A notifier read `(id, 0)` (the root's store) and
-    /// `(id, 1)` (under `logs/`); `(id, 2)`, whose lineage forks at 5 from 1
-    /// and at 3 from 0, is carried over from `(id, 1)`'s store — cursor 9 → 5,
-    /// journal kept below 5, `standing` as it was — and a second read of
-    /// `(id, 2)` finds that store and carries nothing again. A lineage missing
-    /// the step to the generation held (a move astream recorded none for), or
-    /// another `id`, carries nothing: a first run.
     #[test]
     fn a_moved_generation_carries_the_newest_store_it_continues() {
         let dir = scratch("carry");
@@ -2661,7 +2353,6 @@ mod tests {
             .collect();
         assert!(leftovers.is_empty(), "no scratch left behind");
 
-        // A chain with a step missing, or another log: nothing carried.
         let gap = lineage_of(&[(3, 4)]);
         let three = store.for_log(Some(g(4)), Some(&gap)).unwrap();
         assert_eq!(
@@ -2681,20 +2372,6 @@ mod tests {
     }
 
     /// THE EXECUTOR HOLDS A RECORD UNTIL A DURABLE MARK COVERS IT, on a
-    /// broker that serves ordered — the follow-mode notices, fed in the
-    /// order a reader sends them. An attention row at offset 5 is held (no
-    /// page, no cursor), and so is the one at 7 behind it; the page
-    /// checkpoint past both (9) waits too. A durable head of 5 releases
-    /// nothing (5 is not below it); 6 pages 5 and moves the cursor to 6; 8
-    /// pages 7 and writes the held-back checkpoint, 9. A reconnect to ANOTHER
-    /// log drops what is held there, unpaged; a reconnect to the same log
-    /// whose broker no longer serves ordered pages what is held at once, ahead
-    /// of its own first record; a record past [`HOLD_MAX`] is paged with
-    /// everything held before it, in order.
-    ///
-    /// NEGATIVE CONTROLS: the same notices from a broker that serves strict,
-    /// and from an ordered one with the wait turned off (the dev seam the
-    /// end-to-end control uses), page every record the moment it is read.
     #[test]
     fn the_executor_holds_a_record_until_a_durable_mark_covers_it() {
         let presence = |sid: &str| format!("/f/f1/pub/n-a/{sid}/presence");
@@ -2740,7 +2417,6 @@ mod tests {
         assert_eq!(cursor(&n), Some(9), "the held-back checkpoint");
         assert_eq!(n.held_bytes, 0);
 
-        // A reconnect to another log drops what it held there.
         feed(
             &mut n,
             vec![
@@ -2756,8 +2432,6 @@ mod tests {
         );
         assert_eq!(n.held_bytes, 0);
 
-        // The same log, its broker restarted without ordered: what is held pages
-        // at once, in order, ahead of the new connection's first record.
         feed(
             &mut n,
             vec![
@@ -2771,7 +2445,6 @@ mod tests {
         assert_eq!(n.held_bytes, 0);
         n.take(Notice::Log(0, log(true, 1))).unwrap();
 
-        // THE BOUND: past it, every held record pages, in order, then the new one.
         feed(
             &mut n,
             vec![
@@ -2806,11 +2479,6 @@ mod tests {
     }
 
     /// A broker opened as aterm opens an ordered one, but with NO HORIZON, so
-    /// its durable head moves only for an escalated record or a
-    /// `flush_durable` — what the `--once` test below depends on, and nothing
-    /// else (the follow-mode one keeps aterm's horizon, which is what it
-    /// proves). `None` where astream serves ordered strict (off macOS):
-    /// there every record is durable when visible, and the tests say so.
     fn ordered_broker(log: &Path) -> Option<astream_broker::Broker> {
         let mut opts = crate::durability::Durability::Ordered.options();
         opts.durability = astream_broker::Durability::Ordered { horizon: None };
@@ -2821,16 +2489,6 @@ mod tests {
     }
 
     /// **ON A BROKER THAT SERVES ORDERED, `--once` PAGES A RECORD ONLY ONCE IT
-    /// IS DURABLE** (the module doc). An attention row (a presence record:
-    /// not escalated) is not durable when the first run reads it, so the run
-    /// pages nothing and leaves the selector's cursor AT it; once the broker
-    /// has flushed in full (`flush_durable`), the next run pages it, once. A
-    /// halt row IS escalated (aterm's table, `Subject("/f/*/fleet/>")`): it
-    /// is durable before it is visible, and pages on the first run.
-    ///
-    /// NEGATIVE CONTROL: the notifier before the wait (its dev seam's field
-    /// off) pages the attention row on the first run, before any full flush
-    /// — the page a power loss could leave pointing at nothing.
     #[cfg(unix)]
     #[test]
     fn an_ordered_broker_pages_a_record_only_once_it_is_durable() {
@@ -2885,8 +2543,6 @@ mod tests {
                 .unwrap()
                 .0;
             assert!(broker.durable_head() > halt, "the halt is escalated");
-            // The escalated halt's full flush covered the row before it: a
-            // later row is what waits.
             let waits = conn
                 .publish(
                     7,
@@ -2928,9 +2584,6 @@ mod tests {
     }
 
     /// Take a follow-mode reader's notices into `n` until `done` holds, under
-    /// a one-minute hang detector (`what` names what never happened). Returns
-    /// the kind of the last notice taken: the one that made `done` hold, when
-    /// only taking a notice can.
     fn pump(
         n: &mut Notifier,
         rx: &mpsc::Receiver<Notice>,
@@ -2959,23 +2612,6 @@ mod tests {
     }
 
     /// **IN FOLLOW MODE, ON A BROKER OPENED AS ATERM OPENS AN ORDERED ONE, THE
-    /// HORIZON ALONE PAGES AN ATTENTION ROW.** The broker takes
-    /// `Durability::Ordered.options()` unchanged — aterm's 100 ms horizon and
-    /// escalation table, not [`ordered_broker`]'s no horizon — and a
-    /// follow-mode reader subscribes. One attention row is raised (a presence
-    /// record: not escalated), and then nothing: nobody calls `flush_durable`
-    /// and nothing else is published. The broker's writer flushes in full on
-    /// its own timer (astream's `the_horizon_flushes_an_idle_broker_on_its_timer`,
-    /// `broker.ordered-tier`), the subscription is sent a durable mark past the
-    /// row, and that mark is what pages it: once, for one full flush. The writer
-    /// may notice the due horizon after the batch or on its timed wake; both
-    /// paths are valid regardless of when the OS schedules it. Every wait is a
-    /// one-minute hang detector, never a latency budget.
-    ///
-    /// NEGATIVE CONTROLS: the notifier before the wait (its dev seam's field
-    /// off) pages the row as it reads it, not on a durable mark. A premature
-    /// full flush after every batch is rejected separately by astream's
-    /// `a_long_horizon_flushes_nothing_early`.
     #[cfg(unix)]
     #[test]
     fn in_follow_mode_the_horizon_alone_pages_an_attention_row() {
@@ -3016,7 +2652,6 @@ mod tests {
                 let root = n.store.root.clone();
                 std::thread::spawn(move || reader(0, &Sel::Attention, &c, &root, &tx))
             };
-            // Caught up and subscribed: the reader's tail parks on the broker.
             pump(&mut n, &rx, "the reader's subscription", |_| {
                 broker.stats().parked_tails == 1
             });
@@ -3048,7 +2683,6 @@ mod tests {
             } else {
                 assert_eq!(by, "record", "NEGATIVE CONTROL: paged as it was read");
             }
-            // The executor gone, the reader ends at its next notice: another row.
             drop(rx);
             conn.publish(
                 7,
@@ -3064,7 +2698,6 @@ mod tests {
             }
             follower.join().expect("the reader");
             drop(conn);
-            // Stopped cleanly before its directory goes.
             server.shutdown();
             drop(broker);
             let _ = std::fs::remove_dir_all(&dir);
@@ -3190,7 +2823,6 @@ mod tests {
         assert_eq!(carried.cursor("attention"), Some(2));
         assert_eq!(carried.journal(), ["1 fired rc=0"]);
         assert_eq!(carried.standing(), from.standing());
-        // Truly absent optional files are empty, rather than an I/O refusal.
         let empty = Store {
             root: dir.path().join("empty"),
         };
@@ -3229,7 +2861,6 @@ mod tests {
     }
 
     /// Publication and returned-error cleanup may retire only the stage this
-    /// invocation acquired; pre-existing sibling and target bytes stay whole.
     #[test]
     fn a_carry_retires_only_its_exclusively_owned_stage() {
         let dir = aterm_tempfile::TempDir::new().expect("owned carry parent");

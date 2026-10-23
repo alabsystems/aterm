@@ -1,63 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The accessibility runtime of the Linux lane (L-A11Y-RUNTIME,
-//! `docs/AUDIT-third-party-2026-10-15.md`, unit a11y): rows of `linux proof`
-//! on each arch, and `linux a11y`, which runs them alone.
-//!
-//! Before aterm-gui is built, the tests ([`test_rows`]):
-//!
-//! * aterm-dbus, aterm-update-core and aterm-a11y ([`TESTED`]), every test
-//!   included: aterm-dbus's live bus through a private `dbus-daemon`, and
-//!   aterm-update-core's Linux SHA-256 arm;
-//! * aterm-a11y's acceptance bench `live_atspi` ([`LIVE_ATSPI`]) against
-//!   at-spi2-core's own bus: an AT reads a window; the bus killed and
-//!   rejoined; the bus frozen with SIGSTOP, left on the publisher's write
-//!   deadline and rejoined thawed, and its control without a deadline, held.
-//!   It is a `harness = false` bench, which `cargo test --tests` does not
-//!   run, judged on its summary line ([`measured`]);
-//! * aterm-gui's accessibility suites (its unit tests named `a11y`), and the
-//!   Settings portal's motion read (`portal_settings`, every test included):
-//!   GNOME's `enable-animations` set with `gsettings` and read back through
-//!   the guest's xdg-desktop-portal and its GTK backend.
-//!
-//! Then, with aterm-gui built, its rows ([`gui_rows`]), two under Xvfb:
-//!
-//! * **The bus killed** ([`Ordeal::Killed`]): aterm-gui publishing, its tree
-//!   walked (`lane-bus atspi-walk`), the accessibility bus's `dbus-daemon`
-//!   SIGKILLed. at-spi-bus-launcher exits with it and D-Bus starts another;
-//!   the publisher must say the bus failed, join the new one, and publish
-//!   the window again: a line typed after the rejoin is read on the new bus,
-//!   aterm-gui alive and no panic on its stderr ([`judge`]).
-//! * **The bus frozen** ([`Ordeal::Frozen`]): the same daemon stopped
-//!   (SIGSTOP) while the screen keeps changing, so the publisher's writes
-//!   fill the socket the daemon no longer reads. Nothing on the session bus
-//!   says the bus is gone: the publisher must give up a write after its
-//!   deadline (aterm-a11y's `WRITE`), say the bus stopped reading, and leave
-//!   it, while aterm-gui keeps drawing (the flood's last line appears with the
-//!   daemon still frozen); thawed (SIGCONT), the publisher rejoins on its own
-//!   schedule and a line typed then is read on the bus.
-//! * **Orca** ([`orca`]), three rows, one per [`OrcaScreen`]: Xvfb;
-//!   headless Mutter with aterm-gui and Orca on its Xwayland; and headless
-//!   Mutter with aterm-gui a Wayland client typed into from a RemoteDesktop
-//!   seat. Orca speaks through speech-dispatcher's dummy output module,
-//!   which answers every `SPEAK` with no audio device (the guest has none;
-//!   with a real synthesizer speech-dispatcher never answered and Orca's
-//!   event loop blocked, `docs/measured/a11y-atspi-publisher-2026-10-17.md`),
-//!   both lane units of the row's own, and the messages speech-dispatcher
-//!   queued (its log) the sink. Orca must have the frame named, the
-//!   terminal's text read, and the output of a line typed after it came up
-//!   spoken ([`heard`]). The line is typed as keys (`xdotool type` on the X
-//!   rows, the seat's keys on Wayland), because Orca speaks a terminal's new
-//!   output only when a key it heard caused it; a line sent through aterm's
-//!   control socket reached the screen and the bus, and Orca logged "Not
-//!   speaking inserted string due to lack of cause" (measured 2026-10-19).
-//!   Under Wayland, Orca 46 hears no key in the lane at all, so the
-//!   Wayland row also passes on an output left unspoken for that reason
-//!   alone ([`heard_keyless`]).
-//!
-//! The rows turn at-spi2-core's `IsEnabled` (and, for Orca,
-//! `ScreenReaderEnabled`) on and off again, and stop every unit they started.
+//! The accessibility runtime of the Linux lane (L-A11Y-RUNTIME, `docs/AUDIT-third-party-2026-10-15.md`, unit a11y): rows of `linux proof` on each arch, and `linux a11y`, which runs them alone.
 
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -71,23 +15,19 @@ use crate::stop::Stopped;
 /// The packages whose tests the first row runs, every test included.
 pub const TESTED: [&str; 3] = ["aterm-dbus", "aterm-update-core", "aterm-a11y"];
 
-/// The acceptance bench the second row runs: its package, its name, and the
-/// target its `measure row:` and `measure result:` lines name.
+/// The acceptance bench the second row runs: its package, its name, and the target its `measure row:` and `measure result:` lines name.
 pub const LIVE_ATSPI: [&str; 3] = ["aterm-a11y", "live_atspi", "a11y-atspi"];
 
-/// What an acceptance bench prints for each row and once at its end
-/// (aterm-conformance's bench support).
+/// What an acceptance bench prints for each row and once at its end (aterm-conformance's bench support).
 pub const MEASURE_ROW: &str = "measure row: ";
 pub const MEASURE_RESULT: &str = "measure result: ";
 
-/// The publisher's lines in aterm.log (aterm-a11y's `atspi::publisher`):
-/// joined, the bus failed, and a write that waited out the deadline.
+/// The publisher's lines in aterm.log (aterm-a11y's `atspi::publisher`): joined, the bus failed, and a write that waited out the deadline.
 pub const JOINED: &str = "accessibility: publishing on the AT-SPI bus as";
 pub const FAILED: &str = "accessibility: the AT-SPI bus failed";
 pub const STOPPED: &str = "accessibility: the AT-SPI bus stopped reading";
 
-/// What is typed before the bus is ended, and its output, which the typed
-/// text never contains.
+/// What is typed before the bus is ended, and its output, which the typed text never contains.
 pub const BEFORE: &str = "echo A11Y-$((6*7))";
 pub const BEFORE_ECHO: &str = "A11Y-42";
 
@@ -98,37 +38,28 @@ pub const AFTER_ECHO: &str = "REJOINED-42";
 /// The file under the scratch HOME whose appearance ends the flood.
 pub const FLOOD_STOP: &str = "flood-stop";
 
-/// The flood typed while the bus is frozen: a line every 10 ms until
-/// [`FLOOD_STOP`] exists, then [`FLOOD_ECHO`].
+/// The flood typed while the bus is frozen: a line every 10 ms until [`FLOOD_STOP`] exists, then [`FLOOD_ECHO`].
 pub const FLOOD: &str = "i=0; while [ ! -e ~/flood-stop ]; do i=$((i+1)); echo flood-$i; sleep 0.01; \
                          done; echo FLOOD-$((6*7))";
 pub const FLOOD_ECHO: &str = "FLOOD-42";
 
-/// What is typed with Orca listening, as X key events a person's keyboard
-/// makes, and its output.
+/// What is typed with Orca listening, as X key events a person's keyboard makes, and its output.
 pub const ORCA_TYPED: &str = "echo ORCA-$((6*7))";
 pub const ORCA_ECHO: &str = "ORCA-42";
 
-/// The speech-dispatcher configuration the Orca row runs with: the dummy
-/// output module alone, which answers every message without audio, and the
-/// log level at which speech-dispatcher logs each message it queues
-/// ([`QUEUED`]).
+/// The speech-dispatcher configuration the Orca row runs with: the dummy output module alone, which answers every message without audio, and the log level at which speech-dispatcher logs each message it queues ([`QUEUED`]).
 pub const SPEECHD_CONF: &str = "\
 AddModule \"dummy\" \"sd_dummy\" \"\"\n\
 DefaultModule dummy\n\
 LogLevel 5\n";
 
-/// What speech-dispatcher's log writes before each message a client asked
-/// it to speak (`Queueing message |<speak>…</speak>| with priority 2`).
+/// What speech-dispatcher's log writes before each message a client asked it to speak (`Queueing message |<speak>…</speak>| with priority 2`).
 pub const QUEUED: &str = "Queueing message |";
 
-/// The `portals.conf` the lane's xdg-desktop-portal reads: no desktop names
-/// its backends here (a GNOME session's `gnome-portals.conf` does), so it
-/// names GTK's, whose Settings answers from GSettings (dconf).
+/// The `portals.conf` the lane's xdg-desktop-portal reads: no desktop names its backends here (a GNOME session's `gnome-portals.conf` does), so it names GTK's, whose Settings answers from GSettings (dconf).
 pub const PORTALS_CONF: &str = "[preferred]\ndefault=gtk\n";
 
-/// The scratch `XDG_CONFIG_HOME` the lane's portal reads [`PORTALS_CONF`]
-/// from.
+/// The scratch `XDG_CONFIG_HOME` the lane's portal reads [`PORTALS_CONF`] from.
 pub(crate) const PORTAL_CONFIG: &str = "/tmp/aterm-lane-portal-config";
 
 /// One wait for something that must happen: a hang detector, never a budget.
@@ -139,8 +70,7 @@ const HANG_SECS: u32 = 60;
 pub enum Ordeal {
     /// Its `dbus-daemon` SIGKILLed, as a crash ends it.
     Killed,
-    /// Its `dbus-daemon` stopped (SIGSTOP) while the screen changes, then
-    /// thawed.
+    /// Its `dbus-daemon` stopped (SIGSTOP) while the screen changes, then thawed.
     Frozen,
 }
 
@@ -187,9 +117,7 @@ pub struct Evidence {
     pub alive: bool,
 }
 
-/// The frame's name, when `walk` reads aterm-gui's application, its frame,
-/// and a terminal whose text holds `echo`.
-///
+/// The frame's name, when `walk` reads aterm-gui's application, its frame, and a terminal whose text holds `echo`.
 /// # Errors
 /// Which of the three the walk did not read.
 pub fn read_back(walk: &str, echo: &str) -> Result<String, String> {
@@ -220,9 +148,7 @@ pub fn read_back(walk: &str, echo: &str) -> Result<String, String> {
     }
 }
 
-/// The publisher's join, its loss as `said` names it, and its rejoin, in
-/// that order in `log`: the three lines.
-///
+/// The publisher's join, its loss as `said` names it, and its rejoin, in that order in `log`: the three lines.
 /// # Errors
 /// The first of the three missing.
 pub fn rejoined<'a>(log: &'a str, said: &str) -> Result<[&'a str; 3], String> {
@@ -243,13 +169,9 @@ pub fn rejoined<'a>(log: &'a str, said: &str) -> Result<[&'a str; 3], String> {
     Ok([joined, lost, again])
 }
 
-/// The row's verdict on `e`: `Ok` with the detail, or `Err` naming the first
-/// thing that was not a rejoin.
-///
+/// The row's verdict on `e`: `Ok` with the detail, or `Err` naming the first thing that was not a rejoin.
 /// # Errors
-/// The walk before or after did not read the window and its text, aterm.log
-/// does not show the loss and the rejoin in order, aterm-gui panicked or was
-/// gone.
+/// The walk before or after did not read the window and its text, aterm.log does not show the loss and the rejoin in order, aterm-gui panicked or was gone.
 pub fn judge(e: &Evidence, ordeal: Ordeal) -> Result<String, String> {
     let frame = read_back(&e.before, BEFORE_ECHO).map_err(|why| format!("before: {why}"))?;
     if let Some(line) = e.stderr.lines().find(|l| l.contains("panicked")) {
@@ -271,10 +193,7 @@ pub fn judge(e: &Evidence, ordeal: Ordeal) -> Result<String, String> {
     ))
 }
 
-/// The messages speech-dispatcher queued, as its log (`log`) names them:
-/// Orca's SSML with its marks and tags taken out and its five entities read,
-/// in order. A message runs to `| with priority`, over several lines when
-/// the text holds line breaks.
+/// The messages speech-dispatcher queued, as its log (`log`) names them: Orca's SSML with its marks and tags taken out and its five entities read, in order.
 #[must_use]
 pub fn spoken(log: &str) -> Vec<String> {
     let mut out = Vec::new();
@@ -307,7 +226,6 @@ pub fn spoken(log: &str) -> Vec<String> {
 }
 
 /// What Orca spoke of the three a row wants: the frame's name and the
-/// terminal's text, which it must have spoken, and the typed line's output.
 struct Spoke<'a> {
     named: &'a str,
     text: &'a str,
@@ -324,18 +242,6 @@ fn never(speech: &[String], what: &str) -> String {
 }
 
 /// The frame's name, the terminal's text (the prompt) before anything of the
-/// typed line, and the typed line's output if Orca spoke it. The text must be
-/// a string of its own, spoken before the first string that holds a word of
-/// the typed line or its output ([`TYPED_WORDS`]): the output comes with the
-/// next prompt (`ORCA-42` then `lane$`), so a prompt inside it says nothing
-/// of whether the terminal was read when its window came up.
-///
-/// The output is any string that holds [`ORCA_ECHO`], which the typed line
-/// never does (the shell computes it). Orca's terminal script speaks an
-/// insertion from the start of the first line it touches, so when the line's
-/// last key and its output reach the terminal in one insertion, Orca speaks
-/// the output in one string with the whole line
-/// (`lane$ echo ORCA-$((6*7)) ORCA-42 lane$`).
 fn spoke<'a>(speech: &'a [String], frame: &str) -> Result<Spoke<'a>, String> {
     let named = speech
         .iter()
@@ -365,9 +271,7 @@ fn spoke<'a>(speech: &'a [String], frame: &str) -> Result<Spoke<'a>, String> {
     })
 }
 
-/// Orca's row verdict: it spoke the frame's name, the terminal's text before
-/// the typed line ([`spoke`]), and the typed line's output.
-///
+/// Orca's row verdict: it spoke the frame's name, the terminal's text before the typed line ([`spoke`]), and the typed line's output.
 /// # Errors
 /// The first of the three Orca never spoke.
 pub fn heard(speech: &[String], frame: &str) -> Result<String, String> {
@@ -384,15 +288,9 @@ pub fn heard(speech: &[String], frame: &str) -> Result<String, String> {
     ))
 }
 
-/// The verdict where Orca can hear no key ([`OrcaScreen::MutterWayland`]):
-/// the frame's name and the terminal's text as [`heard`] wants them, and the
-/// typed line's output either spoken, or left unspoken by an Orca whose
-/// debug log (`debug`) presents none of the line's keys ([`KEY_HEARD`]) and
-/// says it left new text unspoken for want of a cause ([`NO_CAUSE`]).
-///
+/// The verdict where Orca can hear no key ([`OrcaScreen::MutterWayland`]): the frame's name and the terminal's text as [`heard`] wants them, and the typed line's output either spoken, or left unspoken by an Orca whose debug log (`debug`) presents none of the line's keys ([`KEY_HEARD`]) and says it left new text unspoken for want of a cause ([`NO_CAUSE`]).
 /// # Errors
-/// The frame or the text never spoken, or the output unspoken by an Orca
-/// that heard keys or never said why.
+/// The frame or the text never spoken, or the output unspoken by an Orca that heard keys or never said why.
 pub fn heard_keyless(speech: &[String], frame: &str, debug: &str) -> Result<String, String> {
     let s = spoke(speech, frame)?;
     if s.output.is_some() {
@@ -420,9 +318,7 @@ pub fn heard_keyless(speech: &[String], frame: &str, debug: &str) -> Result<Stri
     ))
 }
 
-/// The words of [`ORCA_TYPED`] and [`ORCA_ECHO`] that the terminal's text
-/// before the line was typed never holds: a string with one of them is the
-/// typed line, its echo or its output.
+/// The words of [`ORCA_TYPED`] and [`ORCA_ECHO`] that the terminal's text before the line was typed never holds: a string with one of them is the typed line, its echo or its output.
 pub const TYPED_WORDS: [&str; 2] = ["echo", "ORCA-"];
 
 /// What one arch's rows run with.
@@ -469,7 +365,6 @@ impl Cell<'_> {
     }
 
     /// A test run as a row: judged on its tally, a skip and what Rosetta
-    /// could not run read from its uncaptured output.
     fn test_row(&self, title: &str, name: &str, args: &[&str]) -> Row {
         println!("\n=== {}: {title} ===", self.tag);
         let mut env = self.env.clone();
@@ -488,7 +383,6 @@ impl Cell<'_> {
     }
 
     /// An acceptance bench run as a row (`cargo bench --profile test`, so it
-    /// builds as the tests do), judged by [`measured`].
     fn bench_row(&self, title: &str, name: &str, [package, bench, target]: [&str; 3]) -> Row {
         println!("\n=== {}: {title} ===", self.tag);
         let mut env = self.env.clone();
@@ -514,13 +408,7 @@ impl Cell<'_> {
     }
 }
 
-/// The verdict of an acceptance bench whose rows name `target`, from its
-/// output and whether it exited 0. It passes only on exactly one summary
-/// that accounts for every row it planned (more than none), every one
-/// passed, and exit 0. A row that could not run (no session bus, no
-/// at-spi2-core) makes it not run; a failed row, a missing, repeated,
-/// malformed or partial summary, or a nonzero exit beside passes, fails it.
-/// The detail is each row's line and the line after it, its own words.
+/// The verdict of an acceptance bench whose rows name `target`, from its output and whether it exited 0.
 #[must_use]
 pub fn measured(target: &str, text: &str, exited_ok: bool) -> (Verdict, String) {
     let lines: Vec<&str> = text.lines().map(str::trim).collect();
@@ -589,7 +477,6 @@ pub fn measured(target: &str, text: &str, exited_ok: bool) -> (Verdict, String) 
 }
 
 /// The tests' rows of one arch, pushed to `rows` as each ends.
-///
 /// # Errors
 /// The person stopped the run.
 pub(crate) fn test_rows(cell: &Cell<'_>, rows: &mut Vec<Row>) -> Result<(), Stopped> {
@@ -598,7 +485,6 @@ pub(crate) fn test_rows(cell: &Cell<'_>, rows: &mut Vec<Row>) -> Result<(), Stop
     for p in TESTED {
         args.extend(["-p", p]);
     }
-    // Uncaptured, so a skip and what Rosetta could not run are read.
     args.extend(["--", "--include-ignored", "--nocapture"]);
     args.extend(rosetta);
     rows.push(cell.test_row(
@@ -662,13 +548,7 @@ pub(crate) fn test_rows(cell: &Cell<'_>, rows: &mut Vec<Row>) -> Result<(), Stop
     crate::stop::check()
 }
 
-/// The desktop's Settings portal, up for the portal row: Xvfb (the GTK
-/// backend is a GTK program and opens a display), the backend, then
-/// xdg-desktop-portal reading [`PORTALS_CONF`], each a lane unit. The
-/// services D-Bus activated before are stopped first: activated, the
-/// backend has no display and the portal no configuration, and the portal
-/// then serves no Settings at all (measured 2026-10-19). Returns once the
-/// portal owns its name.
+/// The desktop's Settings portal, up for the portal row: Xvfb (the GTK backend is a GTK program and opens a display), the backend, then xdg-desktop-portal reading [`PORTALS_CONF`], each a lane unit.
 pub(crate) fn portal_up(up: &Up) -> Result<(), String> {
     linux::start_display(up, Display::Xvfb)?;
     let dir = format!("{PORTAL_CONFIG}/xdg-desktop-portal");
@@ -728,17 +608,13 @@ pub(crate) fn portal_up(up: &Up) -> Result<(), String> {
 }
 
 /// One of aterm-gui's rows: an ordeal of the bus under Xvfb, or Orca on one
-/// of its screens.
 #[derive(Clone, Copy)]
 enum GuiRow {
     Ordeal(Ordeal),
     Orca(OrcaScreen),
 }
 
-/// aterm-gui's rows of one arch, pushed to `rows` as each ends: the bus's
-/// ordeals under Xvfb, then Orca on each [`OrcaScreen`]; `built` false:
-/// aterm-gui's build failed, and each is NOT RUN.
-///
+/// aterm-gui's rows of one arch, pushed to `rows` as each ends: the bus's ordeals under Xvfb, then Orca on each [`OrcaScreen`]; `built` false: aterm-gui's build failed, and each is NOT RUN.
 /// # Errors
 /// The person stopped the run.
 pub(crate) fn gui_rows(cell: &Cell<'_>, built: bool, rows: &mut Vec<Row>) -> Result<(), Stopped> {
@@ -809,7 +685,6 @@ pub(crate) fn gui_rows(cell: &Cell<'_>, built: bool, rows: &mut Vec<Row>) -> Res
 }
 
 /// Set at-spi2-core's `org.a11y.Status.ScreenReaderEnabled`, which Orca's
-/// presence says to applications.
 fn screen_reader(up: &Up, on: bool) -> linux::Out {
     up.sh(&[
         "busctl".into(),
@@ -825,7 +700,6 @@ fn screen_reader(up: &Up, on: bool) -> linux::Out {
 }
 
 /// aterm-gui's aterm.log in `gui`'s scratch world (the XDG state dir's
-/// `aterm/logs`, under its HOME).
 fn log_path(gui: &Gui<'_>) -> String {
     format!("{}/home/.local/state/aterm/logs/aterm.log", gui.dir)
 }
@@ -841,7 +715,6 @@ fn run_line(gui: &Gui<'_>, line: &str, echo: &str) -> Result<(), String> {
 }
 
 /// Wait in the guest for `n` lines holding `text` in `path`: `Err` naming
-/// `what` after a minute.
 fn wait_lines(gui: &Gui<'_>, path: &str, text: &str, n: usize, what: &str) -> Result<(), String> {
     if gui.up.sh(&guest::wait_lines(path, text, n, HANG_SECS)).ok() {
         Ok(())
@@ -851,7 +724,6 @@ fn wait_lines(gui: &Gui<'_>, path: &str, text: &str, n: usize, what: &str) -> Re
 }
 
 /// `lane-bus atspi-walk` of aterm-gui (process `pid`), again until it reads
-/// the window and `echo` ([`read_back`]) or a minute passed: the last walk.
 fn walk_until(gui: &Gui<'_>, pid: &str, echo: &str) -> String {
     let argv = vec![
         "env".to_string(),
@@ -877,7 +749,6 @@ fn walk_until(gui: &Gui<'_>, pid: &str, echo: &str) -> String {
 }
 
 /// The accessibility bus's `dbus-daemon` (at-spi2-core's `accessibility.conf`)
-/// of the guest user (whose uid names its runtime dir): its pid.
 fn bus_daemon(up: &Up) -> Result<String, String> {
     let uid = up.runtime.rsplit('/').next().unwrap_or_default();
     let out = up.sh(&[
@@ -913,7 +784,6 @@ fn signal(up: &Up, signal: &str, pid: &str) -> Result<(), String> {
 }
 
 /// Start aterm-gui under Xvfb in `gui`'s world, end its accessibility bus as
-/// `ordeal` says, and judge the rejoin: the row's verdict and detail.
 fn drive(gui: &Gui<'_>, arch: Arch, ordeal: Ordeal, results: &Path) -> (Verdict, String) {
     if let Err(e) = gui.prepare() {
         return (Verdict::NotRun, format!("scratch world: {e}"));
@@ -952,8 +822,6 @@ fn drive(gui: &Gui<'_>, arch: Arch, ordeal: Ordeal, results: &Path) -> (Verdict,
 }
 
 /// How systemd says aterm-gui's unit ended (or that it runs still), read
-/// before the row stops it: its state, its `Result` (`success`,
-/// `core-dump`, `signal`, …) and its main process's exit code and status.
 fn unit_end(gui: &Gui<'_>) -> String {
     let out = gui.up.sh(&[
         "systemctl".into(),
@@ -970,16 +838,7 @@ fn unit_end(gui: &Gui<'_>) -> String {
         .join(" ")
 }
 
-/// Rosetta's own abort, when it is what ended aterm-gui: on x86_64 the unit
-/// ended in a core dump (`Result=core-dump` in [`unit_end`]'s answer) and
-/// aterm-gui's stderr holds the translator's assertion, `assertion failed
-/// [<condition>]: <why>` and on the next line its site, `(<File>.cpp:<line>
-/// <function>)`. Measured 2026-10-19: rosettad crashed ("translation had no
-/// instructions"), and 11 s later the frozen row's aterm-gui dumped core on
-/// SIGTRAP with `Could not readlinkat /proc/<pid>/exe`
-/// (`ThreadContextFcntl.cpp:142`) on its stderr, 7 s into the row and before
-/// the write deadline could pass. Rust's own `assert!` says `assertion
-/// failed:` with no bracket, so aterm's failures never read as one.
+/// Rosetta's own abort, when it is what ended aterm-gui: on x86_64 the unit ended in a core dump (`Result=core-dump` in [`unit_end`]'s answer) and aterm-gui's stderr holds the translator's assertion, `assertion failed [<condition>]: <why>` and on the next line its site, `(<File>.cpp:<line> <function>)`.
 #[must_use]
 pub fn translator_abort(arch: Arch, ended: &str, stderr: &str) -> Option<String> {
     let dumped = ended.split_whitespace().any(|f| f == "Result=core-dump");
@@ -994,8 +853,6 @@ pub fn translator_abort(arch: Arch, ended: &str, stderr: &str) -> Option<String>
 }
 
 /// A failed row's verdict: NOT RUN when the translator ended aterm-gui
-/// ([`translator_abort`]), since the row then decided nothing about aterm,
-/// as a test the translator cannot run is not run; else FAIL.
 fn translated_away(arch: Arch, ended: &str, stderr: &str, detail: String) -> (Verdict, String) {
     match translator_abort(arch, ended, stderr) {
         Some(abort) => (
@@ -1033,8 +890,6 @@ fn ordeal_run(gui: &Gui<'_>, ordeal: Ordeal, stderr: &str) -> Result<Evidence, S
         Ordeal::Frozen => {
             signal(gui.up, "STOP", &daemon)?;
             let frozen = frozen(gui, &log);
-            // Thawed however the freeze went: a daemon left stopped holds
-            // every later client of the session's accessibility bus.
             let thawed = signal(gui.up, "CONT", &daemon);
             frozen?;
             thawed?;
@@ -1070,8 +925,6 @@ fn ordeal_run(gui: &Gui<'_>, ordeal: Ordeal, stderr: &str) -> Result<Evidence, S
 }
 
 /// With the bus's daemon frozen: flood the screen until the publisher says
-/// the bus stopped reading, then end the flood and see its last line drawn
-/// while the daemon is still frozen.
 fn frozen(gui: &Gui<'_>, log: &str) -> Result<(), String> {
     gui.expect(&["send", FLOOD], &|r| r.starts_with("OK"))?;
     gui.expect(&["key", "enter"], &|r| r.starts_with("OK"))?;
@@ -1096,27 +949,11 @@ fn frozen(gui: &Gui<'_>, log: &str) -> Result<(), String> {
 /// Where an Orca row runs aterm-gui and Orca.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OrcaScreen {
-    /// Xvfb, which runs no window manager: the row gives aterm-gui's window
-    /// the X keyboard focus itself (`xdotool windowfocus`), as a person's
-    /// click would, and types on the X keyboard.
+    /// Xvfb, which runs no window manager: the row gives aterm-gui's window the X keyboard focus itself (`xdotool windowfocus`), as a person's click would, and types on the X keyboard.
     Xvfb,
-    /// Headless Mutter, GNOME's compositor, with its own Xwayland
-    /// ([`mutter_up`]): aterm-gui and Orca are X11 clients of it and Mutter
-    /// is their window manager, which gives the window the focus when asked
-    /// (`_NET_ACTIVE_WINDOW`, `xdotool windowactivate`). The line is typed
-    /// on Xwayland's X keyboard, where Orca listens as it does on any X
-    /// display.
+    /// Headless Mutter, GNOME's compositor, with its own Xwayland ([`mutter_up`]): aterm-gui and Orca are X11 clients of it and Mutter is their window manager, which gives the window the focus when asked (`_NET_ACTIVE_WINDOW`, `xdotool windowactivate`).
     MutterX11,
-    /// Headless Mutter with aterm-gui as a Wayland client, typed into from a
-    /// RemoteDesktop seat (`lane-bus seat`), whose first key gives the window
-    /// the keyboard's focus. Orca 46 cannot start without an X display (it
-    /// runs `xkbcomp $DISPLAY`), so it gets Mutter's Xwayland as in a GNOME
-    /// session, and the Wayland socket. Under Wayland, Orca 46 listens for
-    /// keys on AT-SPI's device event controller (at-spi2-core 2.52's legacy
-    /// device), and nothing in the lane's plain Mutter forwards a key there:
-    /// Orca hears none of the line's keys, so it leaves the line's output
-    /// unspoken ("lack of cause"), and the row judges it with
-    /// [`heard_keyless`] (measured 2026-10-19).
+    /// Headless Mutter with aterm-gui as a Wayland client, typed into from a RemoteDesktop seat (`lane-bus seat`), whose first key gives the window the keyboard's focus.
     MutterWayland,
 }
 
@@ -1151,39 +988,31 @@ impl OrcaScreen {
 /// A variable a client is started with: its name and value.
 pub type Var = (String, String);
 
-/// The Orca rows' Mutter ([`mutter_up`]): its pid, and what it told the
-/// command it ran once up.
+/// The Orca rows' Mutter ([`mutter_up`]): its pid, and what it told the command it ran once up.
 pub(crate) struct Mutter {
     pid: String,
     /// `DISPLAY` and `XAUTHORITY`: its Xwayland, and the authority file
-    /// Mutter wrote for it.
     x: Vec<Var>,
     /// `WAYLAND_DISPLAY`, as its socket's absolute path.
     wayland: Var,
 }
 
 /// The Orca rows' Mutter's unit, and its Wayland socket's name. The lane's
-/// other Mutter ([`Display::Mutter`]) runs `--no-x11`.
 const MUTTER_ORCA: &str = "aterm-lane-mutter-orca";
 
 /// Where the command Mutter runs once up writes what Mutter gave it.
 const MUTTER_ENV: &str = "/tmp/aterm-lane-mutter-orca.env";
 
 /// That command: the display variables Mutter set for it, written whole to
-/// `$0`, then held, since Mutter ends when its command does.
 const MUTTER_COMMAND: &str = "env | grep -E '^(DISPLAY|XAUTHORITY|WAYLAND_DISPLAY)=' \
                               >\"$0.part\" && mv \"$0.part\" \"$0\"; exec sleep infinity";
 
 /// Headless Mutter with its Xwayland, as a lane unit, once it ran its
-/// command: Mutter picks the X display's number and writes an authority file
-/// for it, and says both only to the command it runs (`mutter … --
-/// COMMAND`).
 fn mutter_up(up: &Up) -> Result<Mutter, String> {
     let _ = up.sh(&["rm".into(), "-f".into(), MUTTER_ENV.into()]);
     let unit = guest::Unit {
         name: MUTTER_ORCA.into(),
         env: vec![("XDG_SESSION_TYPE".into(), "wayland".into())],
-        // The size of every lane screen.
         argv: [
             "mutter",
             "--headless",
@@ -1229,10 +1058,7 @@ fn mutter_up(up: &Up) -> Result<Mutter, String> {
     Ok(Mutter { pid, x, wayland })
 }
 
-/// What Mutter gave its command ([`MUTTER_COMMAND`]'s file): `DISPLAY` and
-/// `XAUTHORITY`, and `WAYLAND_DISPLAY` made absolute under `runtime`, Mutter's
-/// `XDG_RUNTIME_DIR`, since a client's own differs.
-///
+/// What Mutter gave its command ([`MUTTER_COMMAND`]'s file): `DISPLAY` and `XAUTHORITY`, and `WAYLAND_DISPLAY` made absolute under `runtime`, Mutter's `XDG_RUNTIME_DIR`, since a client's own differs.
 /// # Errors
 /// One of the three missing.
 pub fn mutter_env(given: &str, runtime: &str) -> Result<(Vec<Var>, Var), String> {
@@ -1264,12 +1090,10 @@ pub fn mutter_env(given: &str, runtime: &str) -> Result<(Vec<Var>, Var), String>
 /// What Orca's debug log says for each key it heard and presents.
 pub const KEY_HEARD: &str = "Presenting keyboard event";
 
-/// What Orca's debug log says when it leaves new text unspoken because no
-/// key it heard caused it.
+/// What Orca's debug log says when it leaves new text unspoken because no key it heard caused it.
 pub const NO_CAUSE: &str = "Not speaking inserted string due to lack of cause";
 
-/// The seat's steps that type `line`, one key at a time: a space by its
-/// name, every other character as its own keysym (`lane-bus seat`'s `tap`).
+/// The seat's steps that type `line`, one key at a time: a space by its name, every other character as its own keysym (`lane-bus seat`'s `tap`).
 #[must_use]
 pub fn seat_keys(line: &str) -> Vec<String> {
     line.chars()
@@ -1281,9 +1105,6 @@ pub fn seat_keys(line: &str) -> Vec<String> {
 }
 
 /// An Orca row: speech-dispatcher on its dummy module and Orca as lane
-/// units, then aterm-gui on `screen` focused and typed into; what
-/// speech-dispatcher queued judged by [`heard`] ([`heard_keyless`] where
-/// Orca hears no key). Its log and Orca's debug log are kept in `results`.
 fn orca(
     gui: &Gui<'_>,
     arch: Arch,
@@ -1310,8 +1131,6 @@ fn orca(
         String::new()
     };
     let log = gui.up.sh(&["cat".into(), speechd_log.clone()]);
-    // Orca answers SIGTERM only after its own long shutdown: the unit's stop
-    // would wait out systemd's 90 s.
     let _ = gui.up.sh(&guest::signal_unit(
         &format!("{}orca", guest::UNIT_PREFIX),
         "SIGKILL",
@@ -1366,7 +1185,6 @@ enum On<'a> {
 
 impl On<'_> {
     /// What an X client of the screen is told: Xvfb's display, or Mutter's
-    /// Xwayland and its authority file.
     fn x(self, up: &Up) -> Vec<(String, String)> {
         match self {
             On::Xvfb => vec![Display::Xvfb.client_env(&up.runtime)],
@@ -1384,9 +1202,6 @@ fn x_client(x: &[(String, String)], argv: &[&str]) -> Vec<String> {
 }
 
 /// Start the speech sink, Orca and aterm-gui on `on`, give aterm-gui's
-/// window the keyboard focus, type a line, and wait until Orca had its
-/// output spoken, or (Wayland) left it unspoken: the frame's name the walk
-/// read.
 fn orca_run(gui: &Gui<'_>, on: On<'_>, speechd_log: &str, debug: &str) -> Result<String, String> {
     let up = gui.up;
     let d = &gui.dir;
@@ -1466,7 +1281,6 @@ fn orca_run(gui: &Gui<'_>, on: On<'_>, speechd_log: &str, debug: &str) -> Result
     if !up.sh(&guest::run_unit(&orca, None)).ok() {
         return Err("Orca's unit did not start".into());
     }
-    // Orca says "Screen reader on." once it is listening.
     wait_lines(
         gui,
         speechd_log,
@@ -1515,10 +1329,6 @@ fn orca_run(gui: &Gui<'_>, on: On<'_>, speechd_log: &str, debug: &str) -> Result
                 .find(|w| !w.is_empty() && w.chars().all(|c| c.is_ascii_digit()))
                 .ok_or_else(|| format!("aterm-gui's X window was never mapped: {}", found.tail(2)))?
                 .to_string();
-            // Xvfb runs no window manager, so nothing gives the window the
-            // focus a person's click would; Mutter, the window manager of
-            // its Xwayland, gives it when asked. Orca reads only the focused
-            // window.
             let how = if matches!(on, On::Xvfb) {
                 "windowfocus"
             } else {
@@ -1530,9 +1340,6 @@ fn orca_run(gui: &Gui<'_>, on: On<'_>, speechd_log: &str, debug: &str) -> Result
             }
         }
         On::MutterWayland(m) => {
-            // The seat's first key gives the window the keyboard's focus,
-            // and the seat waits for the frame to say it is active; the
-            // line is typed when the row says go.
             let mut argv = vec![
                 format!("{}/lane-bus", gui.bin),
                 "seat".into(),
@@ -1579,9 +1386,6 @@ fn orca_run(gui: &Gui<'_>, on: On<'_>, speechd_log: &str, debug: &str) -> Result
         1,
         "Orca never had the terminal's text spoken",
     )?;
-    // Orca speaks a terminal's new output when a key it heard caused it
-    // (Return, here); text typed through aterm's control socket is no key
-    // Orca hears, and its output is not spoken ("lack of cause").
     let unspoken_before = up
         .sh(&["grep".into(), "-cF".into(), NO_CAUSE.into(), debug.into()])
         .text
@@ -1614,7 +1418,6 @@ fn orca_run(gui: &Gui<'_>, on: On<'_>, speechd_log: &str, debug: &str) -> Result
         r.starts_with("OK match")
     })?;
     if matches!(on, On::MutterWayland(_)) {
-        // Orca hears no key here: it speaks the output, or says it will not.
         let decided = up.sh(&[
             "timeout".into(),
             HANG_SECS.to_string(),
@@ -1654,7 +1457,6 @@ mod tests {
     use super::*;
 
     /// A walk of aterm-gui as lane-bus prints it (the baseline's xvfb walk,
-    /// 2026-10-17), with `text` the terminal's.
     fn walk(text: &str) -> String {
         format!(
             "apps 1\n\
@@ -1701,16 +1503,13 @@ mod tests {
         let [joined, lost, again] = rejoined(&stopped, STOPPED).unwrap();
         assert!(joined.ends_with(":1.7") && again.ends_with(":1.9"));
         assert!(lost.contains(STOPPED));
-        // Lost the other way: not this row's loss.
         assert!(rejoined(&log(FAILED), STOPPED).is_err());
-        // Never rejoined.
         let cut: String = log(STOPPED).lines().take(3).collect::<Vec<_>>().join("\n");
         assert!(
             rejoined(&cut, STOPPED)
                 .unwrap_err()
                 .contains("never that the publisher rejoined")
         );
-        // A join only after the loss line is not a loss of a joined bus.
         let late = format!("{STOPPED}\n{JOINED} :1.2\n");
         assert!(rejoined(&late, STOPPED).is_err());
     }
@@ -1745,12 +1544,10 @@ mod tests {
                     .starts_with("after the rejoin")
             );
         }
-        // The other ordeal's loss line does not stand for this one's.
         assert!(judge(&evidence(Ordeal::Killed), Ordeal::Frozen).is_err());
     }
 
     /// A bench's output as aterm-conformance's bench support prints it, the
-    /// publisher's log interleaved, with `rows` (name, status, detail).
     fn bench(rows: &[(&str, &str, &str)], summary: &str) -> String {
         let mut text =
             String::from("[DEBUG] accessibility: publishing on the AT-SPI bus as :1.4\n");
@@ -1773,7 +1570,6 @@ mod tests {
         let (verdict, detail) = measured("a11y-atspi", &bench(&passed, all), true);
         assert_eq!(verdict, Verdict::Pass, "{detail}");
         assert!(detail.contains("frozen PASS: left the frozen bus after 4389 changes"));
-        // The same passes with a nonzero exit, or another target's summary.
         assert_eq!(
             measured("a11y-atspi", &bench(&passed, all), false).0,
             Verdict::Fail
@@ -1782,7 +1578,6 @@ mod tests {
             measured("a11y-other", &bench(&passed, all), true).0,
             Verdict::Fail
         );
-        // A failed row outweighs a refusal, and a refusal alone is not run.
         let failed = "measure result: a11y-atspi planned=3 passed=1 failed=1 refused=1\n";
         assert_eq!(
             measured("a11y-atspi", &bench(&passed, failed), false).0,
@@ -1793,8 +1588,6 @@ mod tests {
             measured("a11y-atspi", &bench(&passed, refused), false).0,
             Verdict::NotRun
         );
-        // No summary (a build that failed, a bench killed), two, a partial
-        // one, an empty matrix, or one missing a count.
         for summary in [
             "error: could not compile `aterm-a11y`\n",
             &format!("{all}{all}"),
@@ -1809,8 +1602,6 @@ mod tests {
 
     #[test]
     fn only_rosettas_own_abort_of_a_dumped_aterm_gui_is_not_run() {
-        // aterm-gui's stderr and unit as the frozen row's x86_64 run left
-        // them (a11y-20261019-212418).
         let stderr = "\
             aterm-gui: GPU rendering on llvmpipe (LLVM 20.1.2, 256 bits) (Gl)\n\
             libEGL warning: DRI3 error: Could not get DRI3 device\n\
@@ -1822,8 +1613,6 @@ mod tests {
         let (verdict, detail) = translated_away(Arch::X86_64, dumped, stderr, "why".into());
         assert_eq!(verdict, Verdict::NotRun);
         assert!(detail.contains("Rosetta aborted aterm-gui") && detail.ends_with("why"));
-        // Natively there is no translator; a gui that runs still, or exited,
-        // was not aborted by it; and aterm's own assertion is a failure.
         assert_eq!(translator_abort(Arch::Aarch64, dumped, stderr), None);
         for alive in [
             "ActiveState=active Result=success ExecMainCode=0 ExecMainStatus=0",
@@ -1867,10 +1656,6 @@ mod tests {
 
     #[test]
     fn orca_must_speak_the_frame_the_text_and_the_typed_output() {
-        // What speech-dispatcher queued for Orca in the lane's aarch64 Orca
-        // row (a11y-20261019-215428), in order, the key echoes and the
-        // repeated shifts trimmed; the terminal's text and the output each
-        // over two lines, the output with the next prompt.
         let log = [
             queued("21:59:06", "<speak><mark name=\"0:6\"/>Screen <mark name=\"7:13\"/>reader <mark name=\"14:17\"/>on.</speak>"),
             queued("21:59:07", "<speak><mark name=\"0:1\"/>~ <mark name=\"2:8\"/>frame.</speak>"),
@@ -1907,20 +1692,16 @@ mod tests {
         let without = |gone: &dyn Fn(&str) -> bool| -> Vec<String> {
             speech.iter().filter(|s| !gone(s)).cloned().collect()
         };
-        // The typed line without its output.
         assert!(
             heard(&without(&|s| s.starts_with("ORCA-42")), "~")
                 .unwrap_err()
                 .contains("typed line's output")
         );
-        // A frame never named.
         assert!(
             heard(&speech, "lane-frame")
                 .unwrap_err()
                 .contains("frame's name")
         );
-        // The terminal never read before the line was typed: the prompt the
-        // output came with is not its text.
         assert!(
             heard(&without(&|s| s == "lane$\n"), "~")
                 .unwrap_err()
@@ -1932,7 +1713,6 @@ mod tests {
                 .unwrap_err()
                 .contains("terminal's text")
         );
-        // Nor is a prompt spoken with the typed line's echo.
         let echoed = [
             "~ frame.".to_string(),
             "lane$ echo O".into(),
@@ -1943,9 +1723,6 @@ mod tests {
 
     #[test]
     fn where_orca_hears_no_key_an_unspoken_output_must_be_for_want_of_one() {
-        // What speech-dispatcher queued with aterm-gui a Wayland client of
-        // the lane's Mutter and the line typed from its seat (2026-10-19):
-        // the line's echo, but not its output.
         let speech: Vec<String> = [
             "Screen reader on.",
             "~ frame.",
@@ -1964,26 +1741,22 @@ mod tests {
             passed.contains("left the output ORCA-42 unspoken"),
             "{passed}"
         );
-        // heard alone fails it: the output is what it wants.
         assert!(
             heard(&speech, "~")
                 .unwrap_err()
                 .contains("typed line's output")
         );
-        // An Orca that heard the keys and still said nothing fails.
         let heard_keys = format!("{deaf}22:57:36.1 - TERMINAL: Presenting keyboard event e\n");
         assert!(
             heard_keyless(&speech, "~", &heard_keys)
                 .unwrap_err()
                 .contains("though it heard 1 keys")
         );
-        // So does one that never said why.
         assert!(
             heard_keyless(&speech, "~", "22:57:33.18 - EVENT MANAGER: Processing\n")
                 .unwrap_err()
                 .contains("never says")
         );
-        // The frame and the text are still wanted.
         assert!(
             heard_keyless(&speech, "lane-frame", deaf)
                 .unwrap_err()
@@ -1995,7 +1768,6 @@ mod tests {
                 .unwrap_err()
                 .contains("terminal's text")
         );
-        // An output spoken after all is heard's pass.
         let mut spoken_out = speech.clone();
         spoken_out.push("ORCA-42".into());
         assert_eq!(
@@ -2007,11 +1779,6 @@ mod tests {
 
     #[test]
     fn an_output_spoken_with_its_whole_line_is_spoken() {
-        // What speech-dispatcher queued in the lane's aarch64 Mutter
-        // (Wayland) row (proof-20261019-232729): the line's last `)` and its
-        // output reached the terminal in one insertion, which ended at the
-        // caret, so Orca took it for a command's output with no key heard
-        // and spoke it from the start of the line it began on.
         let log = [
             queued("23:31:12", "<speak><mark name=\"0:6\"/>Screen <mark name=\"7:13\"/>reader <mark name=\"14:17\"/>on.</speak>"),
             queued("23:31:13", "<speak><mark name=\"0:1\"/>~ <mark name=\"2:8\"/>frame.</speak>"),
@@ -2037,8 +1804,6 @@ mod tests {
             "{passed}"
         );
         assert_eq!(heard_keyless(&speech, "~", ""), heard(&speech, "~"));
-        // The whole line without the output is not it, nor is the typed
-        // line spoken whole.
         let unanswered = [
             "~ frame.".to_string(),
             "lane$\n".into(),
@@ -2072,7 +1837,6 @@ mod tests {
                 ),
             )
         );
-        // Mutter with no Xwayland (`--no-x11`) gives no DISPLAY.
         assert!(
             mutter_env("WAYLAND_DISPLAY=aterm-lane-mutter-orca\n", "/run/user/501")
                 .unwrap_err()

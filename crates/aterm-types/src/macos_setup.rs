@@ -7,6 +7,14 @@
 /// The default ALab vault on the local network, advertised through mDNS.
 pub const DEFAULT_VAULT_URL: &str = "http://alab-secrets.local:7484/v1/alab";
 
+/// The name of setup's Secrets stage rows in its report, which System State reads to know
+/// that setup synced the vault.
+pub const SECRETS_VAULT_ROW: &str = "Secrets vault";
+
+/// The name of the row that says whether the vault's subscriber runs, beside
+/// [`SECRETS_VAULT_ROW`] in a read of the vault.
+pub const SECRETS_SUBSCRIBER_ROW: &str = "Secrets subscriber";
+
 /// One independently selectable part of the workstation profile.
 /// Discriminants are persisted bit positions, independent of presentation order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -20,7 +28,8 @@ pub enum Setting {
     TrackpadScrolling = 2,
     /// Desktop icons and wallpaper clicks.
     Desktop = 3,
-    /// Desktop, Stage Manager and Notification Center widgets.
+    /// Desktop and Stage Manager widgets; Notification Center's widgets once the app that
+    /// runs the pass (aterm, for System State) holds Full Disk Access.
     Widgets = 4,
     /// Dock pins, extras, recent applications and minimization.
     Dock = 5,
@@ -72,7 +81,7 @@ impl Setting {
             }
             Self::Desktop => "Show desktop icons; keep windows in place when clicking wallpaper",
             Self::Widgets => {
-                "Hide desktop and Stage Manager widgets; clear Notification Center widgets"
+                "Hide desktop and Stage Manager widgets; clear Notification Center widgets once aterm has Full Disk Access"
             }
             Self::Dock => {
                 "Dock: only aterm, System Settings and Safari; no stacks or recents; minimize into app icons"
@@ -128,7 +137,7 @@ impl Selection {
     }
 
     /// Change one checkbox without changing any other setting.
-    pub fn set(&mut self, setting: Setting, selected: bool) {
+    pub const fn set(&mut self, setting: Setting, selected: bool) {
         let bit = 1 << setting as u8;
         if selected {
             self.0 |= bit;

@@ -1,57 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! THE AGY LIVE UPGRADE, ITS I/O HALF: the quiet flow's one step
-//! ([`upgrade_visit`]) at the idle point the window's host parked its loop at
-//! ([`super::super::super::upgrade_agy_live`] is the pure half, and says what
-//! was measured). For the tab's foreground agy TUI:
-//!
-//! 1. **Behind** ([`behind`]): the build it runs (its mapped executable, a
-//!    store build) against the build the managed twin execs, each by its store
-//!    record's version, in atpkg's order; never `--version`.
-//! 2. **The look** ([`look_at`]), read in this order so that work ending
-//!    while it is read shows in a later read — the screen first, the files
-//!    last: no hold, no hand, no unread input and no person within the grace;
-//!    no background work on the screen (G-A2(a)) and its reader's idle reading
-//!    (Idle, authoritative, no wall) over an empty composer (G-A1); no
-//!    descendant process at all (G-A2(d)); no other live agy with the
-//!    conversation open ([`sharers`], G-A4: the relaunch could never type
-//!    while one has); the conversation's summary rows read only, live
-//!    ([`read_summaries`]: G-A1, G-A2(c)); its transcript's
-//!    rows of this process with no task or subagent open ([`transcript_look`]:
-//!    G-A2(b)); no wake pending in its messages ([`messages_look`]: G-A2(e)).
-//!    One wait word each ([`upgrade_agy_live::gate`]); every unreadable
-//!    witness fails closed.
-//! 3. **The build proved to start** (`build_start::proved_named`: `<twin>
-//!    --help` with null stdio in its own process group, measured in that very
-//!    form by the lab's `agy-upgrade`: exit 0, nothing written, no request).
-//! 4. **The line planned** before anything ends it: a launch the relaunch
-//!    cannot carry is never restarted (`skip:<why>`) — its flags, or an
-//!    environment it set on its own typed line (`skip:env-not-carried`: the
-//!    shell's record of the command the tab runs, [`live::inline_env`]; the
-//!    relaunch line carries only `HOME`).
-//! 5. **The claim** ([`claim_record`], G-A3): the tab's record names the
-//!    process, its conversation, its config and the `HOME` its line carries,
-//!    the twin and the upgrade's cause, in flight, ON DISK BEFORE THE SIGNAL —
-//!    so its exit `0` is the upgrade's own restart
-//!    (`relaunch::ended_by_restart`), carried by the host's exit watch, never
-//!    read as someone's graceful end. A write that does not complete waits
-//!    (`wait:claim-unwritten`) and sends no signal. Then the last look again
-//!    (the same process, still holding its conversation's presence lock, its
-//!    shell's foreground job in this tab, the whole gate still open), else the
-//!    record put back as it was (`wait:changed-before-signal`).
-//! 6. **SIGTERM** (`terminate`: one server-side decision that refuses under a
-//!    hold or a person's input within the grace), then **the relaunch**: the
-//!    lane's own (`relaunch_held`: the exit, the shell's prompt, the
-//!    conversation free, `<twin> … --conversation=<uuid>` typed), adopted by
-//!    the new process that leads the tab, and carried on QUIETLY: nothing is
-//!    typed after, the record done once the new process holds
-//!    `presence/<uuid>.lock` (`done:resumed`).
-//!
-//! The ask flow never runs here: `[harness] upgrade_ask` is read by Claude
-//! Code's lane alone, and at a background break (`opts.background`) nothing
-//! of this step acts (`wait:break`). A hand-run sweep (no roster of its own)
-//! moves no agy.
+//! I/O half of the live `agy` upgrade step ([`upgrade_visit`]), paired with [`super::super::super::upgrade_agy_live`].
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -65,18 +15,13 @@ use super::super::{
 };
 use super::{AgyKernel, ag, carry_in_flight_with, key, ledger, plan, relaunch_held};
 
-/// The install word an agy build's start note is filed under
-/// (`build_start::proved_named`): its own, so a Claude Code build of the same
-/// spelling is never another's.
+/// Install source label recorded by `build_start::proved_named` for managed `agy` builds.
 pub(super) const SOURCE: &str = "agy-managed";
 
 /// The wait word of a step at the agent's background break: nothing ends an
-/// agy there (the restart is the next idle point's).
 const AT_BREAK: &str = "wait:break";
 
-/// The foreground leader of tab `tab` by the host's roster (`tabs`), where it
-/// is an agy: its pid. A leader whose program cannot be read, or that is no
-/// `agy`, is not this lane's (`None`).
+/// Returns the foreground `agy` leader PID for `tab` from `tabs`.
 pub(super) fn leader(tabs: &[LiveTab], tab: &str, k: &dyn AgyKernel) -> Option<u32> {
     let pid = u32::try_from(tabs.iter().find(|t| t.sid == tab)?.fgpgid?).ok()?;
     let named = |p: &Path| p.file_name().and_then(|n| n.to_str()) == Some(ag::PROGRAM);
@@ -87,33 +32,25 @@ pub(super) fn leader(tabs: &[LiveTab], tab: &str, k: &dyn AgyKernel) -> Option<u
     agy.then_some(pid)
 }
 
-/// A move owed: the version the running build's record names, the twin's
-/// build's, and the twin a relaunch types.
+/// Pending version move from the running `agy` build to the managed twin.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct Move {
-    /// The running build's version (its store record).
+    /// Running build version from its store record.
     pub(super) running: String,
-    /// The twin's build's version (its store record): newer by
-    /// [`live::moves_onto`].
+    /// Target twin build version from its store record ([`live::moves_onto`]).
     pub(super) target: String,
-    /// The managed twin (`<prefix>/agents/agy`) the relaunch types.
+    /// Managed twin executable path (`<prefix>/agents/agy`).
     pub(super) twin: PathBuf,
 }
 
 /// A store build's version as its record names it, only where the record
-/// and the build's directory agree ([`live::build_version`]).
 fn build_record(exe: &Path) -> Option<String> {
     let version = store_version(exe)?;
     let dir = exe.parent()?.parent()?.file_name()?.to_str()?;
     live::build_version(&version, Some(dir)).map(|_| version)
 }
 
-/// THE MOVE `exe` (the running agy's mapped executable) IS OWED onto the
-/// build the managed twin `twin` execs: `Ok(Some)` where the twin's build is
-/// strictly newer by atpkg's order of their store records; `Ok(None)` for a
-/// process run from no store build (another install: nothing managed moves
-/// it), no twin, or a build not newer; `Err(word)` where a record cannot be
-/// read (`no-version`).
+/// Returns the [`Move`] owed by `exe` onto `twin`, or `Err` when unprovable ([`Open::Unproved`]).
 pub(super) fn behind(exe: &Path, twin: Option<PathBuf>) -> Result<Option<Move>, &'static str> {
     if !ag::store_build(exe) {
         return Ok(None);
@@ -136,11 +73,7 @@ pub(super) fn behind(exe: &Path, twin: Option<PathBuf>) -> Result<Option<Move>, 
     }))
 }
 
-/// [`super::super::due`]'s answer for a tab an agy leads (`None`: not this
-/// lane's tab): `Yes` while its build is behind the twin's, `No` when current
-/// (or no TUI, or no managed build), `Unread` where its process or a build
-/// record cannot be read. A relaunch of this tab in flight is
-/// [`super::super::in_flight`]'s, asked before.
+/// Answers [`super::super::due`] for a tab led by `agy`.
 pub(in super::super) fn upgrade_due(opts: &Opts, tabs: &[LiveTab]) -> Option<Due> {
     upgrade_due_with(
         opts,
@@ -150,7 +83,7 @@ pub(in super::super) fn upgrade_due(opts: &Opts, tabs: &[LiveTab]) -> Option<Due
     )
 }
 
-/// [`upgrade_due`] over the twin `twin` and the kernel `k`.
+/// Evaluates [`upgrade_due`] against `twin` and kernel `k`.
 pub(super) fn upgrade_due_with(
     opts: &Opts,
     tabs: &[LiveTab],
@@ -175,19 +108,14 @@ pub(super) fn upgrade_due_with(
     })
 }
 
-/// Whether an agy leads tab `opts.only_sid` ([`super::super::note_behind`]'s
-/// lane answer): its lane mints no ladder state (the quiet flow has none), so
-/// nothing is noted for it.
+/// Returns `true` when `agy` leads `opts.only_sid` ([`super::super::note_behind`]).
 pub(in super::super) fn leads(opts: &Opts, tabs: &[LiveTab]) -> bool {
     opts.only_sid
         .as_deref()
         .is_some_and(|tab| leader(tabs, tab, &super::super::Live).is_some())
 }
 
-/// The agy lane's share of one sweep ([`super::super::lanes`]): the quiet
-/// flow's step for tab `opts.only_sid`, where an agy leads it by the host's
-/// own roster. A pass with no roster of its own (the CLI's sweep) moves no
-/// agy.
+/// Runs the `agy` upgrade sweep step ([`super::super::lanes`]) for `opts.only_sid`.
 pub(in super::super) fn upgrade_pass(opts: &Opts, live_tabs: Option<&[LiveTab]>) -> Vec<Report> {
     let Some(tabs) = live_tabs else {
         return Vec::new();
@@ -202,10 +130,7 @@ pub(in super::super) fn upgrade_pass(opts: &Opts, live_tabs: Option<&[LiveTab]>)
     .collect()
 }
 
-// ---------------------------------------------------------------- the files
-
 /// The directory agy keeps a conversation's own files under
-/// (`<config>/brain/<uuid>/.system_generated`).
 fn generated(config: &Path, conversation: &str) -> PathBuf {
     config
         .join("brain")
@@ -214,12 +139,9 @@ fn generated(config: &Path, conversation: &str) -> PathBuf {
 }
 
 /// How much of a transcript the look reads from its end: this process's
-/// start must be in the window (else [`Open::Unproved`]).
 const TRANSCRIPT_BYTES: u64 = 32 << 20;
 
 /// The transcript's text as read — whole, or its last [`TRANSCRIPT_BYTES`]
-/// with the partial first line dropped (`true`) — or `None` where it cannot
-/// be read.
 fn transcript_tail(path: &Path) -> Option<(String, bool)> {
     use std::io::{Read, Seek, SeekFrom};
     let mut f = std::fs::File::open(path).ok()?;
@@ -239,10 +161,7 @@ fn transcript_tail(path: &Path) -> Option<(String, bool)> {
     })
 }
 
-/// G-A2(b) OVER THE CONVERSATION'S TRANSCRIPT (`<config>/brain/<uuid>/
-/// .system_generated/logs/transcript.jsonl`) for the process started at
-/// `started_ms` ([`live::quiet_transcript`]): one that cannot be read FAILS
-/// CLOSED ([`Open::Unreadable`]).
+/// Reads the conversation transcript tail for process `started_ms` (`G-A2(b)`).
 pub(super) fn transcript_look(
     config: &Path,
     conversation: &str,
@@ -259,11 +178,7 @@ fn modified_ms(meta: &std::fs::Metadata) -> Option<u64> {
     u64::try_from(at.duration_since(std::time::UNIX_EPOCH).ok()?.as_millis()).ok()
 }
 
-/// G-A2(e) OVER THE CONVERSATION'S MESSAGES (`<config>/brain/<uuid>/
-/// .system_generated/messages/`: one `<id>.json` each, `read.json` marking
-/// the read ones) at `now_ms` ([`live::wakes`]): the wakes pending, `None`
-/// where the directory, a message or `read.json` cannot be read (fail closed).
-/// No directory yet is no message.
+/// Inspects `.system_generated/messages/` for unread or recent messages (`G-A2(e)`).
 pub(super) fn messages_look(config: &Path, conversation: &str, now_ms: u64) -> Option<usize> {
     let dir = generated(config, conversation).join("messages");
     let entries = match std::fs::read_dir(&dir) {
@@ -301,18 +216,15 @@ pub(super) fn messages_look(config: &Path, conversation: &str, now_ms: u64) -> O
 }
 
 /// Apple's `sqlite3`, named absolutely (a platform binary): the one reader of
-/// agy's summary database, READ ONLY.
 const SQLITE3: &str = "/usr/bin/sqlite3";
 
-/// agy's summary database under its config.
+/// File name of `agy`'s conversation summary database.
 pub(super) const SUMMARIES: &str = "conversation_summaries.db";
 
 /// How long one read may take: it takes milliseconds (4 ms typical, 61 ms the
-/// most over 2 179 live reads); the bound is for a wedged process.
 const SUMMARY_WAIT: Duration = Duration::from_secs(5);
 
 /// The query: the conversation's own row and its subagents' (`conversation`
-/// a UUIDv4, checked by the caller, so no quote can be in it).
 fn summary_query(conversation: &str) -> String {
     format!(
         "SELECT conversation_id, status, not_fully_idle, parent_conversation_id FROM \
@@ -322,10 +234,6 @@ fn summary_query(conversation: &str) -> String {
 }
 
 /// One run of the reader over `target` (a private copy's path, or an
-/// immutable URI: [`aterm_uds::foreign_db::read`]):
-/// `-readonly`, no `~/.sqliterc` (`-init /dev/null`), `-safe` (no command that
-/// touches another file), `-nofollow`, one `|`-separated line per row, no
-/// header.
 fn run_reader(target: &str, sql: &str) -> Option<String> {
     let words = [
         "-init",
@@ -346,19 +254,7 @@ fn run_reader(target: &str, sql: &str) -> Option<String> {
     bounded_output(Path::new(SQLITE3), &args, SUMMARY_WAIT, 1 << 16)
 }
 
-/// THE CONVERSATION'S SUMMARY ROWS, READ FROM THE LIVE DATABASE WITH NO LOCK
-/// ON IT (`<config>/conversation_summaries.db`, [`aterm_uds::foreign_db::read`]):
-/// while agy holds it open (its `-wal` beside it), from a private copy of the
-/// file and its `-wal`; while agy has it closed — some 30 s after its last
-/// write it closes it, deleting both — as an immutable file. Never through
-/// SQLite's own open of the live file, which joins agy's locking: a reader
-/// that finds the WAL index unbuilt (its `-shm` just made by agy's open) takes
-/// the index's write lock to build it, and agy, whose busy timeout is 5 s,
-/// logs `summary store: sync upsert failed: ... database is locked` past it
-/// and drops that write for good (measured, 2026-10-20). An answer is kept
-/// only where the files are the same after the read as before; twice at most
-/// (a write, a close or an open between the look at the files and the read);
-/// `Err` where neither read holds — fail closed.
+/// Reads summary rows for `conversation` and its subagents from [`SUMMARIES`] via [`aterm_uds::foreign_db::read`].
 pub(super) fn read_summaries(config: &Path, conversation: &str) -> Result<String, ()> {
     if !ag::is_conversation_uuid(conversation) {
         return Err(());
@@ -376,14 +272,7 @@ pub(super) fn read_summaries(config: &Path, conversation: &str) -> Result<String
     Err(())
 }
 
-// ---------------------------------------------------------------- the look
-
-/// G-A1'S SCREEN HALF: whether agy's own reader reads `rows` as the quiet
-/// restart's idle point — Idle AUTHORITATIVELY and no wall. A turn's spinner,
-/// its own background work over an ended turn, an exit pending, a box, a
-/// question the turn ended on and a screen agy left all read otherwise; a
-/// sign-in or an API error stands as a wall, which a restart would bury
-/// under the resumed screen.
+/// Returns `true` when `rows` show `agy` authoritatively idle with no active surface.
 #[must_use]
 pub(super) fn screen_idle(rows: &[String]) -> bool {
     aterm_phase::agy::phase(rows) == (aterm_phase::Phase::Idle, true)
@@ -391,19 +280,12 @@ pub(super) fn screen_idle(rows: &[String]) -> bool {
 }
 
 /// Whether agy's composer on `rows` is empty: its caret row holds nothing (a
-/// permission mode's hint is nothing) and no row under it a word.
 fn composer_empty(rows: &[String]) -> bool {
     aterm_phase::agy::composer_draft(rows)
         .is_some_and(|(_, lines)| lines.iter().all(|l| l.trim().is_empty()))
 }
 
-/// THE LOOK FROM WHAT WAS READ: the person's hold, the screen's rows
-/// (`None`: unread, which reads neither idle nor empty, and shows no work
-/// though the screen witness holds by the idle half), the summary database's
-/// answer ([`live::summary_rows`] of `conversation`), the transcript, the
-/// process's descendants, the wakes pending and the other agys on the
-/// conversation ([`sharers`]). The one composition [`look_at`] makes and the
-/// Tier-1 bind replays.
+/// Assembles a [`Look`] from the held state, screen rows, summaries, transcript, and messages.
 #[must_use]
 #[allow(clippy::too_many_arguments)]
 pub(super) fn look_of(
@@ -431,14 +313,7 @@ pub(super) fn look_of(
     }
 }
 
-/// THE OTHER LIVE AGYS WITH `conversation` OPEN (G-A4): those whose argv
-/// names it ([`AgyKernel::agy_resuming`]) and those holding its database under
-/// `config` with no presence lock ([`AgyKernel::lockless_openers`]: opened on
-/// it while `pid` held it, by `--conversation`, `-c` or an in-TUI `/resume`,
-/// and holding it still once `pid` is gone: measured) — never `pid` itself.
-/// The relaunch types nothing while one has it open (`wait:conversation-held`),
-/// so a restart begun then would end an idle agy that nothing brings back.
-/// `None` where either cannot be read: held, never free.
+/// Finds other live `agy` processes sharing `conversation` (`G-A4`) via [`AgyKernel::agy_resuming`].
 pub(super) fn sharers(
     k: &dyn AgyKernel,
     config: &Path,
@@ -452,10 +327,7 @@ pub(super) fn sharers(
     Some(others.len())
 }
 
-/// THE LOOK AT AGY `pid` IN `tab` the quiet flow's gate takes
-/// ([`live::gate`]), its conversation `conversation` under `config`, the
-/// process started at `started_ms`: read screen first and files last (the
-/// module header), each by its own rule.
+/// Gathers the [`Look`] at `agy` process `pid` in `tab` for [`live::gate`].
 #[allow(clippy::too_many_arguments)]
 pub(super) fn look_at(
     opts: &Opts,
@@ -487,14 +359,7 @@ pub(super) fn look_at(
     )
 }
 
-/// THE CLAIM (G-A3): the record the quiet restart writes BEFORE its SIGTERM,
-/// from the snapshot `snap` of the agy it ends and the move `mv` — the
-/// process, its shell and tab, its conversation, its config and the `HOME`
-/// its line carries, its launch's argv and directory, the twin, the versions,
-/// and the UPGRADE'S cause (empty: [`super::super::super::relaunch::ends_its_agent`]),
-/// in flight ([`Phase::Exiting`]) and quiet: what makes its exit the
-/// upgrade's own (`relaunch::ended_by_restart`) and what the relaunch plans
-/// its line from. `None` for a snapshot of no agy or with no conversation.
+/// Builds the restart claim record (`G-A3`) written before `SIGTERM` (`--resume <uuid>`).
 pub(super) fn claim_record(
     snap: &super::super::super::relaunch::Snapshot,
     mv: &Move,
@@ -511,7 +376,6 @@ pub(super) fn claim_record(
         agy_config: run.config.to_string_lossy().into_owned(),
         agy_env: ag::env_words(&run.env),
         argv: snap.argv.clone(),
-        // The workspace: agy's is the directory it was launched in.
         cwd: snap.cwd.clone(),
         twin: mv.twin.to_string_lossy().into_owned(),
         pid: snap.pid,
@@ -520,7 +384,6 @@ pub(super) fn claim_record(
         from: mv.running.clone(),
         to: mv.target.clone(),
         source: "managed".to_string(),
-        // The upgrade's own: ends its agent ([`relaunch::ends_its_agent`]).
         cause: String::new(),
         quiet: true,
         salt: now,
@@ -529,17 +392,7 @@ pub(super) fn claim_record(
     })
 }
 
-/// THE QUIET FLOW'S STEP for tab `opts.only_sid` over the host's roster
-/// `tabs` (the module's steps 1–6), the twin `twin` and the kernel `k`.
-/// `None`: no agy leads the tab and none of its relaunches is in flight there
-/// (not this lane's). The words: `current` (nothing newer, or nothing
-/// managed); `wait:<why>` (the gate's, the build's proof, the socket, a claim
-/// not written, the claim's last look, the signal's refusal, `break` at a
-/// background break); `skip:<why>` (a launch no relaunch carries — its flags,
-/// or an environment set on its own line — a tab's own program);
-/// `terminated` once signalled and the relaunch's own words after it
-/// (`adopted`, `done:resumed`, a wait the host's exit watch carries on); a
-/// relaunch of this tab in flight is carried by the lane's own rules.
+/// Executes one quiet-upgrade step for `opts.only_sid` across `tabs`, `twin`, and kernel `k`.
 #[allow(clippy::too_many_lines)]
 pub(super) fn upgrade_visit(
     opts: &Opts,
@@ -557,9 +410,6 @@ pub(super) fn upgrade_visit(
         to: "-".to_string(),
         step: String::new(),
     };
-    // A relaunch of this tab in flight — the upgrade's own, or a crash's —
-    // is carried by its lane's rules, never begun again, WHOEVER LEADS THE
-    // TAB NOW: between the SIGTERM and the typed line its shell does.
     if let Some(st) = load(opts, &session_key).filter(|st| st.agent == Agent::Agy && st.in_flight())
     {
         let r = report(leader(tabs, &tab, k).unwrap_or(st.pid));
@@ -592,7 +442,6 @@ pub(super) fn upgrade_visit(
     if opts.background {
         return Some(said(r, AT_BREAK));
     }
-    // Its shell's foreground job, else nothing would take the terminal back.
     let shell = match super::super::foreground_shell(k.job(pid)) {
         Ok(shell) => shell,
         Err("not-a-shell-job") => return Some(said(r, "skip:not-a-shell-job")),
@@ -608,7 +457,6 @@ pub(super) fn upgrade_visit(
     let Some(run) = snap.agy() else {
         return Some(said(r, "wait:not-agy"));
     };
-    // A fresh agy that took no turn holds no conversation: nothing to resume.
     let (Some(lock), Some(conversation)) = (run.lock.clone(), snap.session.clone()) else {
         return Some(said(r, "wait:no-session"));
     };
@@ -624,15 +472,11 @@ pub(super) fn upgrade_visit(
     let Some(mut st) = claim_record(&snap, &mv, now) else {
         return Some(said(r, "wait:no-session"));
     };
-    // The line the relaunch types, planned before anything ends the agent: a
-    // launch it cannot carry is never restarted.
     match plan(opts, &st, k) {
         Ok(_) => {}
         Err(super::NoPlan::Wait(why)) => return Some(said(r, format!("wait:{why}"))),
         Err(super::NoPlan::Refused { why, .. }) => return Some(said(r, format!("skip:{why}"))),
     }
-    // An environment the launch set on its own typed line, which the line
-    // the relaunch types in the shell's environment would not carry.
     if super::super::super::relaunch::running_cmdline(&mut c, &tab)
         .as_deref()
         .and_then(live::inline_env)
@@ -646,9 +490,6 @@ pub(super) fn upgrade_visit(
     if opts.dry_run {
         return Some(said(r, "would-restart"));
     }
-    // The harness's hand on the tab from the last look to the relaunched
-    // agy's first idle point: no other writer lands in the dying agent or the
-    // bare shell.
     let Some(mut hand) = Hand::take(&mut c, &tab) else {
         return Some(said(r, "wait:held"));
     };
@@ -657,9 +498,6 @@ pub(super) fn upgrade_visit(
         hand.give_back(&mut c);
         return Some(said(r, "wait:claim-unwritten"));
     }
-    // THE LAST LOOK, the claim on disk: the same process, still holding its
-    // conversation's presence lock, still its shell's foreground job in this
-    // tab, and the gate still open.
     let still = k.alive(pid)
         && k.process_start(pid)
             .map(|s| super::super::squash(&s))

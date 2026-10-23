@@ -165,6 +165,14 @@ pub trait Item: Send + Sync {
         None
     }
 
+    /// Why this item leaves some of its keys alone in this pass: they are in another app's
+    /// sandbox container and the pass holds no known Full Disk Access
+    /// ([`defaults::withheld`]). Such an item is not done, whatever its row reads, until a
+    /// pass with the grant reaches those keys. `None`, the default: it reaches all of them.
+    fn withheld(&self) -> Option<String> {
+        None
+    }
+
     /// Why this item stands aside before it acts ([`aterm_converge::Item::stands_aside`]):
     /// the run lacks what its change needs (the vault a join reads does not answer). The
     /// engine then neither journals nor applies it, and reports it `Blocked` with this

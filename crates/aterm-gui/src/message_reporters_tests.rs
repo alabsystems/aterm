@@ -2,9 +2,6 @@
 // Copyright 2026 Andrew Yates
 
 /// A VOLUME SHORT WHILE CLEANUP IS OFF IS NOT THE PASSES' LINE (review
-/// 30): no pass ran, so its line has its own key — dismissing one never
-/// hides the other — and carries the settings' action, where the passes'
-/// line has none.
 #[test]
 fn a_volume_short_while_cleanup_is_off_is_not_the_passes_line() {
     let passes = super::disk_low_entry(3, 17, &["~/a 9 GiB (a)".to_string()]);
@@ -57,9 +54,6 @@ fn incomplete_workstation_setup_is_a_separate_manual_digest_step() {
 }
 
 /// THE SETUP LINE NAMES WHERE EVERY STAGE IS READ: System State, by its menu row,
-/// never `aterm doctor --check`, which reads no Secrets vault, Mac approval or
-/// disk-image copy, the steps that most often hold setup up. Its reason claims no
-/// more than setup knows: a step not finished, not a "workstation setting".
 #[test]
 fn incomplete_workstation_setup_points_at_system_state() {
     let (title, why, then, more) = entry_words(&super::workstation_setup_failure_entry());
@@ -76,7 +70,6 @@ fn incomplete_workstation_setup_points_at_system_state() {
 }
 
 /// [`super::SYSTEM_STATE_MENU`] is the path of the real row: the app menu's title
-/// and the label of its `MenuAction::SystemState` item.
 #[test]
 fn the_system_state_words_name_the_real_menu_row() {
     let named = crate::menu::MENU_MODEL.iter().find_map(|section| {
@@ -91,7 +84,6 @@ fn the_system_state_words_name_the_real_menu_row() {
 }
 
 /// What the digest reads of `entry`: its title, its reason, its action and
-/// the detail lines behind them.
 fn entry_words(entry: &Entry) -> (String, String, String, Vec<String>) {
     let msg = entry
         .message()
@@ -110,8 +102,6 @@ fn signed_out(labels: &[&str]) -> Entry {
 }
 
 /// A label cannot fault the signed-out entry, whatever lint words it holds: the title, reason and
-/// action read as for any label. Negative control: each such label, written where its lint
-/// reads, faults the entry.
 #[test]
 fn a_label_cannot_fault_the_signed_out_entry() {
     use aterm_messages::exceptions::EntryFault;
@@ -144,7 +134,6 @@ fn a_label_cannot_fault_the_signed_out_entry() {
             "{label}: the action ends in it: {then}"
         );
         assert!(more.iter().any(|l| l.contains(label)), "{label}: {more:?}");
-        // Negative control: the word is one the lints know.
         let (reason, step) = match where_it_faults {
             Written::Reason => (
                 format!("{label} is signed out, and only a browser sign-in restores it"),
@@ -171,15 +160,10 @@ fn a_label_cannot_fault_the_signed_out_entry() {
 }
 
 /// AN AUTOPILOT SET FROM THE WINDOW IS A RECORD (the Autopilot design, §2):
-/// titled with the mode the session now runs under, its first line led by
-/// the tab and saying what the mode does, its second whose word it is, and
-/// keyed per session so the next replaces it. NEGATIVE CONTROL: a session no
-/// tab shows leads with nothing.
 #[test]
 fn an_autopilot_set_from_the_window_is_a_keyed_record() {
     use crate::autopilot::{AutopilotView, mode_words};
     use aterm_agent::supervise::Autopilot;
-    // Each mode's line is its sentence from the one table (§12.4.1).
     let (land, cruise) = (mode_words(Autopilot::Land), mode_words(Autopilot::Cruise));
     let msg = super::autopilot_set("s-a1", "in tab 2", AutopilotView::Land, true, None, None);
     assert_eq!(msg.title, "Autopilot set to land");
@@ -209,16 +193,6 @@ fn an_autopilot_set_from_the_window_is_a_keyed_record() {
 }
 
 /// THE AUTOPILOT RECORDS (§10.2.1, §10.2.5; the lifecycle hunt's fire that
-/// said "wraps the work up" over every session): every title
-/// `autopilot_set`, `autopilot_timer_set` and `autopilot_timer_ended` mint —
-/// for every view, a timer today and on another day, each closed-over case
-/// and each thing the fire can find — passes the glass title rule; a hand
-/// change over an armed timer says it is cancelled, and one over none does
-/// not; the fire says the harness lands the work only over work the harness
-/// carries (Cruise never ends, so every hosted agent's work is that), and
-/// over an off harness, an agent's own switch off, no host or a tab with no
-/// agent, that nothing is landed.
-/// NEGATIVE CONTROL: main's two titles break the rule.
 #[test]
 fn the_autopilot_records_keep_the_title_rule_and_say_what_the_fire_found() {
     use super::FireOver;
@@ -275,7 +249,6 @@ fn the_autopilot_records_keep_the_title_rule_and_say_what_the_fire_found() {
         super::autopilot_timer_ended("s-1", "in tab 3", clock, passed, over, None)
     };
     let turned = "Tab 3: at 18:00 Autopilot switched to land; ";
-    // Land's own sentence, from the one table (`autopilot::MODE_WORDS`).
     let land_record = crate::autopilot::mode_words(aterm_agent::supervise::Autopilot::Land).record;
     for (over, then) in [
         (FireOver::Work, land_record.to_string()),
@@ -301,9 +274,6 @@ fn the_autopilot_records_keep_the_title_rule_and_say_what_the_fire_found() {
         ),
     ] {
         let msg = ended(Some("18:00"), None, over);
-        // One title true over every fire, in the chip's and the menu's
-        // words (owner-eye-8): never `began landing` over nothing landed,
-        // never the setting's own name for its value (`the word`).
         assert_eq!(msg.title, "Autopilot switched to land", "{over:?}");
         assert_eq!(msg.detail, [format!("{turned}{then}")], "{over:?}");
         assert!(
@@ -346,18 +316,11 @@ fn the_autopilot_records_keep_the_title_rule_and_say_what_the_fire_found() {
     for title in &titles {
         assert_eq!(glass_title_fault(title), None, "{title}");
     }
-    // NEGATIVE CONTROL: main's titles of the timer's two records.
     assert!(glass_title_fault("Autopilot set to cruise until 18:00, then land").is_some());
     assert!(glass_title_fault("autopilot: cruise until 18:00 ended; land").is_some());
 }
 
 /// WHO SET IT IS A LINE, NEVER THE TITLE (design §11.7.1, §11.7.5, "The
-/// titles"): with every setter's words — each window surface, the wire's
-/// writers, an edge writer's tab, a session gone, a word from before a
-/// restart, the timer's own clock — each Autopilot builder keeps the title it
-/// mints without one, still under the glass title rule, and ends its lines
-/// with the setter's, as given. NEGATIVE CONTROL: a builder that puts the
-/// setter in its title breaks the rule for every setter (checked below).
 #[test]
 fn who_set_it_is_the_records_last_line_never_its_title() {
     use super::FireOver;
@@ -427,7 +390,6 @@ fn who_set_it_is_the_records_last_line_never_its_title() {
             );
             assert_eq!(with.detail.last(), Some(set_by), "{set_by}: the last line");
             assert_eq!(with.key, bare.key);
-            // NEGATIVE CONTROL: the setter in the title breaks the rule.
             assert!(
                 glass_title_fault(&format!("{} {set_by}", bare.title)).is_some(),
                 "{set_by}"
@@ -437,17 +399,6 @@ fn who_set_it_is_the_records_last_line_never_its_title() {
 }
 
 /// ONLY AN INTERRUPT STANDS ON THE BAND (the owner, 2026-09-28: "there needs
-/// to be some clear reason why the user must be engaged and what the user
-/// should do... don't continue to persist alerts to the user that are not
-/// actionable"; the second reviews of 2026-09-29: this claim was type-checked
-/// and never observed). For a roster of rows that covers every class the
-/// classifier has, the reporter's entry is a standing warn row exactly where
-/// [`Row::interrupt`] names a need and says that need's words; every other
-/// row — a wait before or after its notice, a usage limit, a rest, a
-/// refusal, a give-up after the owner's own press three days behind (F7: it stood as a warn row for days)
-/// — is a record (`LogOnly`).
-/// The pure half of the pre-landing drive (`plan-upgrade` 12.0): the host's
-/// half is driven against a private instance.
 #[test]
 fn only_an_interrupt_stands_on_the_band() {
     use aterm_agent::harness::upgrade::{Agent, GAVE_UP, Phase};
@@ -560,7 +511,6 @@ fn only_an_interrupt_stands_on_the_band() {
                 ..b.clone()
             },
         ));
-        // The interrupts.
         roster.push((
             "the agent is gone",
             Row {
@@ -624,12 +574,6 @@ fn only_an_interrupt_stands_on_the_band() {
 }
 
 /// RULING 283, THE AUDIT'S REAL CASE: a round that gave up, is resting,
-/// and is more than six hours behind asks again on its own, so it is a
-/// RECORD with no tab mark — and it offers `Upgrade now`, which re-arms it
-/// at once. Ruling 314: the why AND the next step are the sentence
-/// Settings ▸ Messages sets for a person; a refused press restated above
-/// them joins the sentence; a record with no move line, or no tab's key,
-/// keeps one line.
 #[test]
 fn a_resting_round_that_gave_up_is_a_record_that_offers_upgrade_now() {
     use aterm_agent::harness::upgrade::Phase;
@@ -684,16 +628,6 @@ fn a_resting_round_that_gave_up_is_a_record_that_offers_upgrade_now() {
 }
 
 /// A TAB NO WORKER OF ATERM'S RUNS IN, BY SOMEONE ELSE'S HAND, IS NEVER
-/// SAID AS ATERM'S OWN FAULT (the review of 2026-09-30, of C10): its agent
-/// suspended with `^Z` (not in front), its tab under another supervisor's
-/// claim, or its Autopilot turned off by the owner
-/// (`Row::aside`, which the owner's view sets). The record nothing has
-/// stamped for three hours is told by what holds it — "it is not in front in
-/// its tab", "another supervisor holds its tab", "its autopilot is off" —
-/// and by what moves it: `fg` in the tab, that supervisor letting go, the
-/// Autopilot on again. NEGATIVE CONTROL: the same record with no aside reads
-/// as aterm's own fault ("not checked for 3 h — aterm's own fault"), as it
-/// must where aterm's watch is at fault.
 #[test]
 fn a_tab_held_aside_is_said_by_whose_hand_holds_it() {
     use aterm_agent::harness::upgrade::Phase;
@@ -756,9 +690,6 @@ fn a_tab_held_aside_is_said_by_whose_hand_holds_it() {
 }
 
 /// The owner's `Upgrade now` is answered on the glass: once `--now` stops quieting the stall, a
-/// move waiting on the agent's own work is a calm notice that says what it waits on and folds
-/// after [`ANSWER_MAX`], not a record. Negative control: with no word from the owner it stays a
-/// record.
 #[test]
 fn the_owners_upgrade_now_is_answered_on_the_glass() {
     use aterm_agent::harness::upgrade::{Phase, Request};
@@ -773,12 +704,8 @@ fn the_owners_upgrade_now_is_answered_on_the_glass() {
             asks: 3,
         },
         wait: "background".into(),
-        // Inside the move clock (`MOVE_BUDGET_S`): past it the round no longer asks on its own,
-        // and the answer to the owner's press is the same.
         behind_since: NOW - 8 * 3_600,
         request,
-        // Pressed longer ago than `--now` quiets a stall (`NOW_QUIETS_S`, which is `REASK_S`):
-        // the stall, and the host's row, are back.
         request_at: NOW - aterm_agent::harness::upgrade::REASK_S - 60,
         ..Row::default()
     };
@@ -790,7 +717,6 @@ fn the_owners_upgrade_now_is_answered_on_the_glass() {
         (Severity::Info, Hold::For(super::ANSWER_MAX))
     );
     assert!(msg.actions.is_empty(), "the answer is no new decision");
-    // Negative control: no word from the owner, the same wait: a record.
     let msg = super::agent_upgrade_stalled(&row(Request::None), NOW, "in tab 1");
     assert_eq!((msg.severity, msg.hold), (Severity::Info, Hold::LogOnly));
 }
@@ -817,8 +743,6 @@ fn every_debugger_access_record() -> Vec<Message> {
 }
 
 /// DEBUGGER ACCESS RECORDS (design §3.8): records, never rows, with the
-/// undo — the command that turns access back off — on every "on" record
-/// and only those.
 #[test]
 fn the_debugger_access_records_are_records_with_the_undo_only_when_on() {
     use crate::debugger_access::DebuggerRecord;
@@ -841,7 +765,6 @@ fn the_debugger_access_records_are_records_with_the_undo_only_when_on() {
 }
 
 /// Every message a launch or reload can post, from fixtures that stand
-/// in for the real producers' words.
 fn every_reporter_message() -> Vec<Message> {
     let mut warns = ConfigWarnings::default();
     warns.push(
@@ -874,7 +797,6 @@ fn every_reporter_message() -> Vec<Message> {
          auto_update = false\nseed_install = true\n",
     );
     let mut all = warns.into_messages();
-    // Every family's title, singular and plural, so a re-word of any meets the attention gate.
     for family in [
         ConfigFamily::Keybindings,
         ConfigFamily::IgnoredKeys,
@@ -954,8 +876,6 @@ fn every_reporter_message() -> Vec<Message> {
             }
         }
     }
-    // A pane whose folder no shell could start in: the reopened line that counts it, and each
-    // fault's row; and a pane a program held whose folder is not here.
     for (gone, unasked) in [(1, 0), (2, 0), (0, 1)] {
         all.push(journal_reopened_message(
             &reopened_fixture(crate::crash_journal::DeathClass::Killed),
@@ -1060,7 +980,6 @@ fn every_reporter_message() -> Vec<Message> {
                 notice: None,
             },
         ));
-        // Every notice the loop raises, at the longest label and clause.
         for text in aterm_agent::supervise::policy::notice::ALL {
             all.push(resume_ask(
                 "s-0123456789abcdef",
@@ -1163,7 +1082,6 @@ fn every_reporter_message() -> Vec<Message> {
     ] {
         all.push(config_lane_error(head));
     }
-    // The live agent upgrade's three: waiting, stalled and done.
     all.extend(agent_upgrade_waiting(
         "Claude Code",
         &["2.1.282", "2.1.282"],
@@ -1174,8 +1092,6 @@ fn every_reporter_message() -> Vec<Message> {
         &["2.1.282", "2.1.283"],
     ));
     all.extend(agent_upgrade_waiting("Codex", &["0.157.1"]));
-    // One session's record, by its tab and in a second window, Claude Code's longer product name
-    // included.
     for (agent, from, to) in [
         (
             aterm_agent::harness::upgrade::Agent::Codex,
@@ -1222,8 +1138,6 @@ fn every_reporter_message() -> Vec<Message> {
         1_790_311_076,
         "in tab 2",
     ));
-    // A Claude Code behind its own running work, after a notice and before one: the sentence
-    // guards read both remedy lines.
     for (phase, wait) in [
         (
             aterm_agent::harness::upgrade::Phase::Announced {
@@ -1248,8 +1162,6 @@ fn every_reporter_message() -> Vec<Message> {
             "in tab 2",
         ));
     }
-    // A record nothing has checked: aterm's own fault, said as such; the sentence guards read its
-    // remedy too.
     all.push(agent_upgrade_stalled(
         &aterm_agent::harness::upgrade_drive::Row {
             phase: aterm_agent::harness::upgrade::Phase::Pending,
@@ -1264,9 +1176,6 @@ fn every_reporter_message() -> Vec<Message> {
         "in tab 2",
     ));
     all.push(agent_upgrade_done(&upgrade, "in tab 2"));
-    // The rows that stand (the agent the upgrade ended, a shutdown that hung, a relaunch that
-    // reached no prompt), the answer to the owner's own `Upgrade now`, and aterm's own fault:
-    // every sentence is read by the title, restart and glass-row guards.
     {
         use aterm_agent::harness::upgrade::{Phase, Request};
         const NOW: u64 = 1_790_311_076;
@@ -1311,8 +1220,6 @@ fn every_reporter_message() -> Vec<Message> {
             all.push(agent_upgrade_fault(&unclassified, &need, "in tab 2"));
         }
     }
-    // Where the owner has more than one window the place names it (`in window 2, tab 1`): every
-    // title that names the tab still keeps the glass title rule, at two-digit windows and tabs.
     for place in [tab_place(Some(2), 1), tab_place(Some(12), 10)] {
         for (phase, wait) in [
             (
@@ -1357,7 +1264,6 @@ fn every_reporter_message() -> Vec<Message> {
         }
         all.push(agent_upgrade_done(&upgrade, &place));
     }
-    // A stall's end, recorded under its row's key once the row was down.
     let stalled = agent_upgrade_stalled(&upgrade, 1_790_311_076, "in tab 2");
     for end in [StallEnd::AsksAgain, StallEnd::MovesAgain, StallEnd::Left] {
         all.push(agent_upgrade_stall_over(
@@ -1368,7 +1274,6 @@ fn every_reporter_message() -> Vec<Message> {
             end,
         ));
     }
-    // The owner's word from the band: what each word did, and each kind of refusal.
     all.push(agent_upgrade_worded(
         &upgrade,
         aterm_messages::UpgradeWord::Now,
@@ -1382,8 +1287,6 @@ fn every_reporter_message() -> Vec<Message> {
             "stale:2.1.283",
             "the upgrade in tab s-b5cf2faabac5ce5127bd stopped for good (no-resume): `--now` \
              re-arms only one that gave up",
-            // A round that stopped between the offer and the press, as the writer refuses it
-            // (typed).
             "stopped:1790318276:the upgrade in tab s-b5cf2faabac5ce5127bd stopped \
              (no-resume): `--now` re-arms only one that gave up",
             "stopped:0:the upgrade in tab s-b5cf2faabac5ce5127bd stopped (signal-refused): \
@@ -1398,8 +1301,6 @@ fn every_reporter_message() -> Vec<Message> {
             ));
         }
     }
-    // The Codex lane's (a daemon-mode client moved, one that named no
-    // thread as it exited): its words pass every reporter guard too.
     let codex = aterm_agent::harness::upgrade_drive::Row {
         agent: aterm_agent::harness::upgrade::Agent::Codex,
         session: "codex-s-b5cf2faabac5ce5127bd".into(),
@@ -1420,9 +1321,6 @@ fn every_reporter_message() -> Vec<Message> {
         1_790_311_076,
         "in tab 2",
     ));
-    // The same, failed after its `/exit` ended the TUI (its record now
-    // stands with no holder, and names `codex resume`), and a Codex
-    // client whose daemon waits on a detached thread.
     all.push(agent_upgrade_stalled(
         &aterm_agent::harness::upgrade_drive::Row {
             phase: aterm_agent::harness::upgrade::Phase::Failed("no-resume-hint".into()),
@@ -1442,9 +1340,6 @@ fn every_reporter_message() -> Vec<Message> {
         1_790_311_076,
         "in tab 2",
     ));
-    // A Claude Code move that stopped after its SIGTERM ended the agent (it names
-    // `claude --resume`), and moves under way that do not move (stuck exiting, exited,
-    // relaunched), for both agents.
     all.push(agent_upgrade_stalled(
         &aterm_agent::harness::upgrade_drive::Row {
             session: "0badf00d-1111-2222-3333-444455556666".into(),
@@ -1521,7 +1416,6 @@ fn every_reporter_message() -> Vec<Message> {
     all.push(font_family_rejected(
         "font_family: \"Nope\" is not an admissible font",
     ));
-    // The gesture, consent, install and connection reporters.
     all.extend(gesture_failures());
     all.push(file_access_question(
         &crate::consent_card::NeedWords::sample(),
@@ -1552,10 +1446,6 @@ fn named(dirs: &[&str]) -> crate::spawn_folder::Named {
 }
 
 /// THE MEMORY CEILING'S WARNING IS A ROW (owner direction 2026-09-29:
-/// warn, do not restart): a failure on the glass, keyed per session so the
-/// next episode's replaces it, naming the tab by its place and never the
-/// raw session id, its resume line kept whole. NEGATIVE CONTROL: the
-/// supervisor's information is a record, never a row.
 #[test]
 fn a_supervisors_memory_warning_is_a_row_and_its_information_a_record() {
     let text = "Claude Code uses 215.1 GB, past aterm's memory ceiling of 46.0 GB; a \
@@ -1576,10 +1466,6 @@ fn a_supervisors_memory_warning_is_a_row_and_its_information_a_record() {
 }
 
 /// THE MEMORY ROW NEVER CUTS A RESUME LINE
-/// ([`aterm_agent::supervise::memory::never_cut`]): a Claude Code launched
-/// with many flags, led by its tab, passes the row's 400 characters, so the
-/// row names its line with its permission mode alone, whole on one detail
-/// line. NEGATIVE CONTROL: the cap alone cuts the conversation.
 #[test]
 fn the_memory_row_steps_a_long_resume_line_down_whole() {
     use aterm_agent::harness::resume;
@@ -1624,12 +1510,9 @@ fn the_memory_row_steps_a_long_resume_line_down_whole() {
         "{mode}"
     );
     assert_eq!(row.detail.last(), Some(&mode), "{:?}", row.detail);
-    // NEGATIVE CONTROL.
     let cut = atpkg::progress::sanitize_for_tty(&format!("Tab 2: {text}"), 400);
     assert!(!cut.contains(session), "{cut}");
 
-    // Inside the 400 characters, but its clause longer than a detail line:
-    // laid out whole, the line would be split across two; it steps down.
     const CLAUSE: &str = "to restart it yourself: ";
     let spare = MemoryOver {
         available_mib: None,
@@ -1658,14 +1541,11 @@ fn the_memory_row_steps_a_long_resume_line_down_whole() {
         "{:?}",
         row.detail
     );
-    // NEGATIVE CONTROL.
     let laid = aterm_messages::text::split_sentence(&led, aterm_messages::DETAIL_LINE_CAP);
     assert!(laid.iter().all(|l| !l.contains(&line)), "{laid:?}");
 }
 
 /// A folder row reads back as the folders it names, as a carried row must when the next folder
-/// joins it: one, several, past the cap, with a space, longer than a line. Negative control: a
-/// row of another shape.
 #[test]
 fn a_folder_row_reads_back_as_the_folders_it_names() {
     use crate::spawn_folder::{Fault, Named};
@@ -1696,11 +1576,6 @@ fn a_folder_row_reads_back_as_the_folders_it_names() {
 }
 
 /// the reopened layout's restored line claimed every
-/// tab came back in its folder; it COUNTS the panes that could not open
-/// theirs instead, and claims folders only when none failed. A pane a
-/// program held whose folder is not here (audit #8) is not counted, and
-/// the line then claims no folders: its shell started in the default one.
-/// The rest of the row is unchanged.
 #[test]
 fn the_reopened_row_counts_the_panes_that_could_not_open_their_folder() {
     use crate::crash_journal::DeathClass;
@@ -1763,11 +1638,6 @@ fn gesture_failures() -> Vec<Message> {
 }
 
 /// THE FULL DISK ACCESS ENTRY ASKS AND GRANTS NOTHING (design-exceptions
-/// §8.2, §9.2): one button, which opens the Settings pane, and no `Not
-/// now` (the dismissal is the decline). A regression (a verified grant
-/// later reads off) is a different key, so a different fact; the keys a
-/// grant clears are exactly the two the builder can raise, and none is the
-/// retired row's.
 #[test]
 fn the_file_access_entry_is_honest_and_fence_clean() {
     use crate::consent_card::{NeedCause, NeedWords};
@@ -1800,10 +1670,6 @@ fn the_file_access_entry_is_honest_and_fence_clean() {
 }
 
 /// R14 UNDER THE OWNER'S ATTENTION RULE (2026-09-23): a failure of the
-/// person's own gesture is an Error row on a short `HOLD_GESTURE`, keyed to
-/// nothing (each is an event of its own), with the WHOLE error behind
-/// Details — never cut at 160. A split refusal's excerpt is its sizes,
-/// with the sentence whole behind them.
 #[test]
 fn a_failed_gesture_is_a_short_row_with_the_whole_error_behind_details() {
     let long = "x".repeat(200);
@@ -1836,9 +1702,6 @@ fn a_failed_gesture_is_a_short_row_with_the_whole_error_behind_details() {
 }
 
 /// THE REST OF THE RETIRED TOAST UNDER THE ATTENTION RULE: a crippled
-/// install is a row only when there is something to fix (no page of
-/// aterm's performs the fix, so it carries no action); the grant and the
-/// connection disclosure are records that never touch the glass.
 #[test]
 fn the_rest_of_the_retired_toast_is_rows_only_where_there_is_something_to_fix() {
     use aterm_update::which_copy::InstallPosture;
@@ -1850,11 +1713,8 @@ fn the_rest_of_the_retired_toast_is_rows_only_where_there_is_something_to_fix() 
         assert!(row.actions.is_empty(), "{posture:?}");
         assert_eq!(row.key.as_deref(), Some(KEY_INSTALL_POSTURE));
     }
-    // R17 is a record (R20 went with the sealed seed, Phase 5; R22 with the
-    // connection card).
     assert_eq!(file_access_granted().hold, Hold::LogOnly);
     assert_eq!(file_access_granted().key.as_deref(), Some(KEY_FILE_ACCESS));
-    // A dialog the card is not about: a record per service, naming the tab.
     let dialog = consent_dialog_record("MediaLibrary", "the music and media library", Some(3));
     assert_eq!(dialog.hold, Hold::LogOnly, "{dialog:?}");
     assert_eq!(dialog.tag, tags::PRIVACY);
@@ -1870,8 +1730,6 @@ fn the_rest_of_the_retired_toast_is_rows_only_where_there_is_something_to_fix() 
 }
 
 /// The killed row's `Open log` goes to the log, never to the empty crash
-/// marker (how aterm knew, not something the reader acts on), and the row
-/// takes the crash row's slot.
 #[test]
 fn the_killed_row_opens_the_log_and_shares_the_crash_slot() {
     let log = "/Users/_an/Library/Logs/aterm/aterm.log";
@@ -1909,9 +1767,6 @@ fn keeper_evidence_fixtures() -> (crate::logging::CrashEvidence, crate::logging:
 }
 
 /// The keeper's recovery row takes the crash row's slot, so it says
-/// where that row's evidence is — the crash log, else the killed run's
-/// log — while `End sessions` stays its one action; and it never claims
-/// a screen was redrawn, only that its program was asked to.
 #[test]
 fn the_keeper_row_keeps_the_evidence_of_the_row_it_replaces() {
     let (crash, killed) = keeper_evidence_fixtures();
@@ -1944,12 +1799,6 @@ fn the_keeper_row_keeps_the_evidence_of_the_row_it_replaces() {
 }
 
 /// THE ROW SAYS HOW THE SCREENS CAME BACK (crash restore, increment 4) AND THEIR
-/// SCROLLBACK (increment 5), held to what the counts select rather than to its wording:
-/// every screen exact with every line back reads as the one sentence for it, and no
-/// screen from a region keeps the blank-screen words; otherwise the row names the
-/// repainted screens, the blank ones and the lines that did not come back, each by its
-/// count; no two cases read alike; a recovery with a blank screen never says "each
-/// screen"; none claims a screen was redrawn.
 #[test]
 fn the_keeper_row_says_how_the_screens_came_back() {
     use crate::crash_restore::RungCounts;
@@ -2020,7 +1869,6 @@ fn reopened_fixture(class: crate::crash_journal::DeathClass) -> crate::crash_jou
 }
 
 /// The fixture with the journal saying which leaves ran a program (D16):
-/// `(tab, program)` in its one window.
 fn reopened_with_programs(
     class: crate::crash_journal::DeathClass,
     programs: &[(u32, &str)],
@@ -2043,8 +1891,6 @@ fn reopened_with_programs(
 }
 
 /// [`reopened_with_programs`] with Claude hosted in tab 2 (ruling 293):
-/// its leaf carries a relaunch record naming a conversation, and the
-/// journal says the agent ran there.
 fn reopened_with_agent(
     class: crate::crash_journal::DeathClass,
     programs: &[(u32, &str)],
@@ -2081,14 +1927,6 @@ fn reopened_with_agent(
 }
 
 /// A RESTORED CODEX THAT DID NOT COME BACK IS SAID AS CODEX (F1-R8-G4): the
-/// restored agents' row hard-coded Claude, so a Codex the queue did not
-/// relaunch was told to the owner as a Claude, its remedy `claude --resume`
-/// — a command that never brings a Codex thread back. Each tab is worded by
-/// the agent that ran there, as the held record is (`restored_agent_held`):
-/// Codex's `codex resume` and its thread; a row of both kinds names each
-/// tab's command on its own line — and a Codex whose typed relaunch did not
-/// come up is said as that, not as one that started (F1-R9-G5). CONTROL: a
-/// Claude row reads as before.
 #[test]
 fn a_restored_codex_that_did_not_come_back_is_said_as_codex() {
     use aterm_agent::harness::relaunch::Outcome;
@@ -2107,9 +1945,6 @@ fn a_restored_codex_that_did_not_come_back_is_said_as_codex() {
         "it could not be started there, so its thread did not come back after aterm stopped: \
          type codex resume there to pick it up again"
     );
-    // F1-R9-G5: the Codex lane's `no-resume`, and its `wait:resume` while
-    // no relaunched TUI is found, mean the relaunched Codex never came up in
-    // the tab — never "Codex started in the tab".
     let mut started = Vec::new();
     for step in ["failed:no-resume", "wait:resume"] {
         let row = restored_agents_not_resumed(
@@ -2200,8 +2035,6 @@ fn a_restored_codex_that_did_not_come_back_is_said_as_codex() {
             row.detail
         );
     }
-    // F1-R8-G4: the reopened row's resumed line says a Codex as Codex, on its
-    // thread; both kinds together as the agents.
     assert_eq!(
         journal_resumed_line(&[((0, 1), Agent::Codex)], 1),
         "aterm starts Codex again on its thread in tab 2"
@@ -2213,11 +2046,6 @@ fn a_restored_codex_that_did_not_come_back_is_said_as_codex() {
 }
 
 /// A RESTORED AGY THAT DID NOT COME BACK IS TOLD A COMMAND THAT RUNS: agy
-/// and its own picker (`/resume`), in its own name. The row carries no
-/// conversation id, and a bare `agy --conversation` — what it said before —
-/// is refused by agy (`flag needs an argument: -conversation`, exit 2,
-/// checked live on 1.4.2). NEGATIVE CONTROL: no line, step or mixed row
-/// names `--conversation` without its id.
 #[test]
 fn a_restored_agy_that_did_not_come_back_is_told_a_command_that_runs() {
     use aterm_agent::harness::relaunch::Outcome;
@@ -2317,11 +2145,6 @@ fn journal_note_fixtures() -> Vec<crate::crash_journal::Note> {
 }
 
 /// D16 (ruling 282) — A QUIET RELAUNCH: a killed run whose tabs all sat at
-/// their prompts lost nothing a person ran, so the reopened layout is a
-/// RECORD, never a held warning. The negative controls: a program that ran
-/// keeps the warning and names itself, a crash keeps its row whatever ran,
-/// a leaf the layout does not hold counts for nothing, and a journal that
-/// did not say (an older writer's) keeps the warning.
 #[test]
 fn a_relaunch_that_lost_nothing_is_a_record_and_a_lost_program_is_named() {
     use crate::crash_journal::DeathClass;
@@ -2382,12 +2205,6 @@ fn a_relaunch_that_lost_nothing_is_a_record_and_a_lost_program_is_named() {
 }
 
 /// A RETIRED SPELLING IS NOT AN UNKNOWN KEY (design ruling 42). atpkg
-/// still reads `[packages] auto_update = false` as `enabled = false`, so
-/// it is its own family: a record that never reaches the glass. Beside a
-/// typo, the typo is the one row (the setting the person silently misses),
-/// and the retired spellings — `auto_update`, which still applies, and
-/// `channel`, a removed feature's — are the record (ruling 213). The
-/// sentences are the validator's own (`app_config::collect_key_notices`).
 #[test]
 fn a_retired_spelling_is_a_record_and_never_counted_as_an_unknown_key() {
     let mut warns = ConfigWarnings::default();
@@ -2430,7 +2247,6 @@ fn a_retired_spelling_is_a_record_and_never_counted_as_an_unknown_key() {
         Some(ConfigFamily::RetiredKeys.key())
     );
     assert_eq!(retired.hold, Hold::LogOnly);
-    // `--validate-config` still lists every key that needs an edit.
     assert_eq!(
         crate::native_config_language::ignored_key_warnings(src).len(),
         3
@@ -2438,10 +2254,6 @@ fn a_retired_spelling_is_a_record_and_never_counted_as_an_unknown_key() {
 }
 
 /// AN AFRESH MOVE'S BAND ROW NAMES ITS MARK'S COMMAND: the upgrade's restart
-/// that started its agent afresh (`Row::fresh`), ended and not brought back, stands as the
-/// need its mark carries — a plain `claude`, under the home its line carried — never
-/// `claude --resume <id>`, which Claude refuses for a conversation with no message. NEGATIVE
-/// CONTROL: the same row of a move that resumed names its conversation.
 #[test]
 fn an_afresh_moves_band_row_names_its_marks_command() {
     use aterm_agent::harness::upgrade::Phase;
@@ -2477,10 +2289,6 @@ fn an_afresh_moves_band_row_names_its_marks_command() {
 }
 
 /// The person's own presses on a worker: a Take Over or Hand Back that moved
-/// nothing, and a Stop Worker the signal refused, are the gesture failing (a
-/// row for the gesture's hold, one per hold or tab, the later superseding);
-/// a stop that found nothing to stop asked for what already is, and a command
-/// read into a tab ends as a record whatever its exit, unless it left no tab.
 #[test]
 fn a_failed_worker_gesture_is_a_row_and_one_that_found_nothing_a_record() {
     for on in [true, false] {
@@ -2510,11 +2318,6 @@ fn a_failed_worker_gesture_is_a_row_and_one_that_found_nothing_a_record() {
 }
 
 /// A DIAGNOSTIC IS ONE PROBLEM, NOT ONE LINE (upstream e7dc1feee, ported
-/// onto R13). A rejected `aterm.toml` reaches the config lane as the REAL
-/// parser's error with its caret diagram: one message whose detail is the
-/// diagnostic's rows, the caret row whole on a line of its own, no blank
-/// row, and no control character in a cell — a control byte that survives
-/// the split is spelled, not dropped.
 #[test]
 fn a_multi_line_diagnostic_is_one_message_with_the_rows_it_actually_has() {
     let error = "x = [bad\n"
@@ -2548,11 +2351,6 @@ fn a_multi_line_diagnostic_is_one_message_with_the_rows_it_actually_has() {
 }
 
 /// A PERSON'S SETTINGS ▸ PACKAGES VERB (design ruling 224): every row it
-/// can show — the verb's own, and queued at the store lock — is PROGRESS
-/// (a busy meter), keyed to the lane's pass so the plan's reads restate it,
-/// revealed only after the progress grace (a 1–4 s no-op never flashes a
-/// row), with no capsule; the queued row outlives a wait that may last the
-/// lock's whole bound. The machine apply, a sub-second edit, has no row.
 #[test]
 fn a_persons_packages_rows_are_progress_after_the_grace() {
     for verb in [
@@ -2588,11 +2386,6 @@ fn a_persons_packages_rows_are_progress_after_the_grace() {
 }
 
 /// THE OWNER'S RULE OVER EVERY BUILDER (design §10.1, ruling 76; owner rule
-/// 2026-09-28): every message a reporter here or in a lane can post is
-/// progress with an indicator, a decision, a failure or a record — never a
-/// confirmation, an FYI or a long or clause-split glass title — and goes
-/// through a fresh center's door without being RECORDED in its place
-/// (`demotions() == 0`: a class that could not stand is a defect).
 #[test]
 fn every_reporter_message_survives_the_door() {
     let now = std::time::Instant::now();
@@ -2616,9 +2409,6 @@ fn every_reporter_message_survives_the_door() {
 }
 
 /// Every lane's rows beside this module's: the update flow, its records
-/// and outcomes, the toolchain lane's rows and records, a person's
-/// Settings ▸ Packages verbs and the session waits — the census the
-/// marks are held over (ruling 302).
 fn every_lane_message() -> Vec<Message> {
     use crate::toolchain_words as tw;
     use crate::update_words as uw;
@@ -2704,8 +2494,6 @@ fn every_lane_message() -> Vec<Message> {
 }
 
 /// The lost-integration rows the corpus holds: one tab under each
-/// remedy, two tabs in two windows under both, and more tabs than the row
-/// names a line each.
 fn integration_lost_fixtures() -> Vec<Message> {
     use crate::integration_notice::Heal;
     let tab = |place: &str, sid: &str, heal| LostTab {
@@ -2739,13 +2527,6 @@ fn integration_lost_fixtures() -> Vec<Message> {
 }
 
 /// DESIGN (a) OF THE 2026-09-29 REVIEW (rulings 270, 300): the row names
-/// each tab by its PLACE, never by the raw `s-<hex>` a person never sees;
-/// the session ids ride the technical lines alone, where the successor
-/// reads them back whole, however many lines they take — and a one-tab row
-/// an older parent carried (it said `sessions`) still reads. An agent tab
-/// past the first line's naming cap is still listed. No line carries a
-/// space run (the `AgentMoved` remedy once held 18 spaces where its line
-/// continuation lost the `\`), the rekey record's included.
 #[test]
 fn the_lost_integration_row_names_tabs_by_place_never_by_session_id() {
     use crate::integration_notice::Heal;
@@ -2816,14 +2597,6 @@ fn the_lost_integration_row_names_tabs_by_place_never_by_session_id() {
 }
 
 /// UNDER ONE TAB'S KEY, THE SAME STALL IS THE SAME BY ITS WORDS (the
-/// owner's report of 2026-09-27: a restart posted two tabs' stalls the
-/// owner had already read): wherever that tab now stands (the place on
-/// the move line is not compared), wherever a refused press put its lines
-/// (ruling 307: the restated row shifted every index, and a stall the
-/// owner saw through came back), and an overdue one whatever its age.
-/// NEGATIVE CONTROLS: another stall and another target are other stalls;
-/// so is a row before ruling 270 (the move alone on its line) whose words
-/// differ, while one whose words are the same is the same stall.
 #[test]
 fn a_stall_is_the_same_by_its_words_wherever_its_tab_now_stands() {
     use aterm_agent::harness::upgrade::Phase;
@@ -2847,7 +2620,6 @@ fn a_stall_is_the_same_by_its_words_wherever_its_tab_now_stands() {
         "never the sid there: {:?}",
         row_a.detail
     );
-    // THE SAME STALL, wherever its tab now stands.
     let moved = agent_upgrade_stalled(&refused(a), NOW, "in its tab");
     assert!(same_stall(&row_a.detail, &moved.detail));
     let windowed = |tab: &str, window: usize| {
@@ -2855,7 +2627,6 @@ fn a_stall_is_the_same_by_its_words_wherever_its_tab_now_stands() {
     };
     assert!(same_stall(&row_a.detail, &windowed(a, 2).detail));
     assert!(same_stall(&windowed(a, 1).detail, &windowed(a, 12).detail));
-    // AND WHEREVER A REFUSED PRESS PUT ITS LINES: the refusal above them.
     let mut restated = vec!["press it again: another step held the upgrade's lock".to_string()];
     restated.extend(row_a.detail.iter().cloned());
     assert!(same_stall(&restated, &row_a.detail), "{restated:?}");
@@ -2876,7 +2647,6 @@ fn a_stall_is_the_same_by_its_words_wherever_its_tab_now_stands() {
         &overdue(7 * 3_600).detail,
         &overdue(9 * 3_600).detail
     ));
-    // NEGATIVE CONTROLS.
     assert!(
         !same_stall(&row_a.detail, &overdue(7 * 3_600).detail),
         "another stall"
@@ -2891,7 +2661,6 @@ fn a_stall_is_the_same_by_its_words_wherever_its_tab_now_stands() {
     );
     assert!(!same_stall(&row_a.detail, &newer.detail), "another target");
 
-    // A ROW BEFORE RULING 270: the move alone on its line.
     let unplaced = |detail: &[String]| -> Vec<String> {
         let mut d = detail.to_vec();
         d[STALL_MOVE_LINE] = d[STALL_MOVE_LINE]
@@ -2907,7 +2676,6 @@ fn a_stall_is_the_same_by_its_words_wherever_its_tab_now_stands() {
         &unplaced(&overdue(7 * 3_600).detail),
         &overdue(9 * 3_600).detail
     ));
-    // NEGATIVE CONTROLS in that layout too, and words that differ.
     assert!(!same_stall(
         &unplaced(&overdue(7 * 3_600).detail),
         &row_a.detail
@@ -2916,7 +2684,6 @@ fn a_stall_is_the_same_by_its_words_wherever_its_tab_now_stands() {
     let mut reworded = old.clone();
     reworded[0] = "the move stopped (not-a-shell-job)".to_string();
     assert!(!same_stall(&reworded, &row_a.detail), "{reworded:?}");
-    // A move line whose head is no place is compared whole.
     for head in [
         "tab two",
         "in window two, tab 1",
@@ -2930,13 +2697,6 @@ fn a_stall_is_the_same_by_its_words_wherever_its_tab_now_stands() {
 }
 
 /// ONE TAB'S UPGRADE KEY, AND NOTHING ELSE (review of 2026-09-27): the
-/// carried-row sweep (`upgrade_host::post_upgrade_stalls`) withdraws
-/// every live row this filter matches that its view does not own, so a
-/// match too wide would take other families' rows down. A tab's key —
-/// this build's, cleaned as it prints, or an earlier build's — names its
-/// tab; the waiting record's bare key, an empty tab, the finished moves'
-/// `done`, a key that only begins with the family's word, and every
-/// other family's key name none.
 #[test]
 fn a_tabs_upgrade_key_names_its_tab_and_no_other_key_does() {
     assert_eq!(agent_upgrade_key_tab("harness.upgrade.s-x"), Some("s-x"));
@@ -2957,10 +2717,7 @@ fn a_tabs_upgrade_key_names_its_tab_and_no_other_key_does() {
     }
 }
 
-// ---- the second adversarial hunt's host repros -------------
-
 /// Overdue rows of `n` Claude tabs, each with a real-length tab id
-/// (`s-` and 20 hex digits).
 fn r44_overdue_tabs(
     n: u64,
     now: u64,
@@ -2983,15 +2740,6 @@ fn r44_overdue_tabs(
 }
 
 /// `UPGRADE NOW` ONLY WHERE IT MOVES (#4's review and its
-/// review). A quiet round its agent's own work gave up on — the work seen
-/// since its notice, or running under the agent at the last look — is a
-/// wait on that work: `Upgrade now` re-arms a round the quiet restart's
-/// gate holds on the same work, so the row offered a button that moved
-/// nothing. Its words name what holds it. NEGATIVE CONTROLS keep the
-/// button: a quiet give-up no work held (a status that only lagged), the
-/// ask flow's give-up, a CODEX round (its lane re-arms a resting round only
-/// when the rest is over), and a Claude Code round whose status still says
-/// `shell` over ended shells — the owner's `--now` moves all of these.
 #[test]
 fn a_quiet_round_its_own_work_gave_up_on_offers_no_upgrade_now() {
     use aterm_agent::harness::upgrade::{Agent, GAVE_UP, Phase};
@@ -3085,8 +2833,6 @@ fn a_quiet_round_its_own_work_gave_up_on_offers_no_upgrade_now() {
 }
 
 /// THE LOGIN LIFECYCLE'S WORDS ARE SHOWABLE (accounts v2 S7): the due line,
-/// the day's warning, the wrong account, each a valid entry whose title
-/// counts and whose detail names the labels, never an address.
 #[test]
 fn the_login_lifecycle_entries_are_showable() {
     let labels = |names: &[&str]| -> Vec<String> { names.iter().map(|n| n.to_string()).collect() };
@@ -3122,10 +2868,6 @@ fn the_login_lifecycle_entries_are_showable() {
     for text in due.detail.iter().chain(&none.detail).chain(&wrong.detail) {
         assert!(!text.contains('@'), "{text}");
     }
-    // The two accounts notices read whole: at any count of labels, what
-    // aterm did and what follows close the detail, and every line is the
-    // expanded row's sentence. NEGATIVE CONTROL: the due line's labels are
-    // its technical detail.
     let crowd: Vec<String> = (0..40).map(|i| format!("account-number-{i:02}")).collect();
     for (text, entry) in [
         (
@@ -3156,17 +2898,6 @@ fn the_login_lifecycle_entries_are_showable() {
 }
 
 /// EVERY NOTICE'S ASK IS ITS OWN ROW, KEYED WHOLE: at a tab id of the shape
-/// sessions have (`s-` and twenty hex digits, as the real-Claude lab's tab
-/// read on 2026-10-19), the engine keeps each notice's key as written (its
-/// cap cut `harness.resume-ask.<tab>.login-…` once, and every notice's
-/// key was one), the keys differ, and each row is the owner's four parts,
-/// THE STEP LEADING — the band's excerpt, under a title that already says
-/// what happened (the review of the login carry, 2026-10-20: led by the
-/// happening, the band said it twice and never the step) — all four the
-/// expanded row's sentence, with how the step's pin ends after them where it
-/// sets one (r3h-3), and the row offers its tab where it was found.
-/// NEGATIVE CONTROLS: an exception with no notice keeps the tab's own key; a
-/// tab not found offers nothing.
 #[test]
 fn every_notices_ask_is_its_own_row_keyed_whole() {
     let sid = "s-5f7f1e417ee76c7b52ae";
@@ -3187,8 +2918,6 @@ fn every_notices_ask_is_its_own_row_keyed_whole() {
         let key = notice_ask_key(sid, Some(text.code));
         assert_eq!(msg.key.as_deref(), Some(key.as_str()), "{}", text.id);
         assert!(keys.insert(key), "{}: a key twice", text.id);
-        // …and after them, where the step outlasts the notice, how it ends
-        // (r3h-3): the pin `accounts use` sets, and nothing else.
         let undo = n.undo.clone();
         assert_eq!(undo.is_some(), text.undo.is_some(), "{}", text.id);
         let mut said = vec![e.action.clone(), e.why.clone(), n.did, n.expect];
@@ -3232,10 +2961,6 @@ fn every_notices_ask_is_its_own_row_keyed_whole() {
 }
 
 /// What a reader faults in the disk-full alert `msg` built for `cause`, whose
-/// bytes left read `left`: an ask that cannot stand, a band that does not
-/// open on the step, Details that do not show the cause next, the bytes left
-/// said on more lines than one, the claim that aterm took all it may said
-/// twice or where aterm was kept from trying, a settings key, a clipped line.
 fn disk_full_faults(msg: &Message, cause: DiskFullCause, left: &str) -> Vec<String> {
     let aterm_messages::need::Need::Now(ask) = msg.need() else {
         return vec!["not a standing ask".to_owned()];
@@ -3284,18 +3009,11 @@ fn disk_full_faults(msg: &Message, cause: DiskFullCause, left: &str) -> Vec<Stri
 }
 
 /// The disk watch's lines on a volume it has not measured: the emergency's
-/// own floor, 4 GiB and 50,000 files.
 fn disk_lines() -> aterm_agent::harness::disk::Thresholds {
     aterm_agent::harness::disk::Config::default().thresholds(None)
 }
 
 /// THE DISK-FULL ALERT SAYS WHAT ENDS IT AND WHAT FOLLOWS (the review of the
-/// band, 2026-10-20: an owner who freed 2 GiB still saw `Disk full`, with no
-/// target and no word that the stopped tabs go on): under its step and its
-/// cause, one line names the free space the watch ends the alert at — in
-/// bytes, or for a volume out of inodes in files — and it is part of the
-/// owner's sentence in Details, the largest folders technical lines under
-/// it. NEGATIVE CONTROL: other lines name other figures.
 #[test]
 fn the_disk_full_alert_says_what_ends_it() {
     use super::DiskFullCause as C;
@@ -3336,7 +3054,6 @@ fn the_disk_full_alert_says_what_ends_it() {
             "{cause:?}: the step, the cause and what to expect"
         );
         assert!(msg.detail[3].starts_with("Largest: "), "{cause:?}");
-        // NEGATIVE CONTROL: the line follows the watch's own figure.
         let moved = said(&other);
         assert!(
             moved.detail[2].contains(&theirs),
@@ -3348,12 +3065,6 @@ fn the_disk_full_alert_says_what_ends_it() {
 }
 
 /// THE PROGRAM-CHECK ALERT STANDS, LEADS WITH THE RESTART AND READS AS THE
-/// DISK-FULL ALERT DOES (2026-10-20: a stuck `syspolicyd` closed every window
-/// 4.5 days after it stuck): an interrupt the owner alone can answer, keyed
-/// so the watch's end resolves it, never under `privacy.` (the [privacy]
-/// switch retracts those); the step first, its cut the restart alone, then
-/// the cause and what it does as the owner's sentence, the pool's figures
-/// after. NEGATIVE CONTROL: the figures follow the reading.
 #[test]
 fn the_program_check_alert_leads_with_the_restart() {
     let msg = super::program_check_stuck(95, Some(90));
@@ -3395,17 +3106,6 @@ fn the_program_check_alert_leads_with_the_restart() {
 }
 
 /// THE DISK-FULL ALERT SHOWS ITS STEP AND STATES ITS CAUSE ONCE (review
-/// ox-17; the review of the owner's notices, 2026-10-20: the band showed the
-/// cause and never the step): the band's excerpt is the step, and Details
-/// open on it and then the cause; the bytes left lead the cause and are on
-/// no other line; only a pass that took every build cache aterm may remove
-/// says so, and once; no line names a settings key; every cause reads apart
-/// from the others; and the largest folders follow the cause, the step
-/// pointing at them. Every figure is tried at its widest, so no line is
-/// clipped. NEGATIVE CONTROLS: the alert's old shape (its own lines, then
-/// the ask) is faulted for leading with no step, for saying aterm took all
-/// it may twice and, with cleanup off, for claiming it at all and for naming
-/// the key.
 #[test]
 fn the_disk_full_alert_states_its_cause_once_and_shows_its_step() {
     use super::DiskFullCause as C;
@@ -3422,8 +3122,6 @@ fn the_disk_full_alert_states_its_cause_once_and_shows_its_step() {
         C::Private(crate::harness_host::DiskPrivate::DeviceUnnamed),
         C::Private(crate::harness_host::DiskPrivate::NoAccountHome),
     ];
-    // 1023.9 MiB and 1023.9 GiB: the widest figures `human_bytes` writes
-    // below a TiB.
     let widest_free = (1u64 << 30) - (1u64 << 20) / 10;
     let widest_freed = (1u64 << 40) - (1u64 << 30) / 10;
     assert_eq!(human(widest_free), "1023.9 MiB");
@@ -3475,9 +3173,6 @@ fn the_disk_full_alert_states_its_cause_once_and_shows_its_step() {
         causes.len(),
         "one reason per cause: {reasons:?}"
     );
-    // A PASS KEPT FROM REMOVING (its write-ahead record refused on the full
-    // volume) never says it found nothing to remove, nor that it took all it
-    // may; NEGATIVE CONTROL: a clean pass keeps the Spent words.
     let kept = |freed| {
         super::disk_full(Some(1 << 20), freed, &[], C::Unrecorded, &disk_lines()).detail[1].clone()
     };
@@ -3499,7 +3194,6 @@ fn the_disk_full_alert_states_its_cause_once_and_shows_its_step() {
         );
     }
 
-    // NEGATIVE CONTROLS: the old shape, its lines written before its ask.
     let old = |why: &str| {
         Message::new(tags::SYSTEM, Severity::Error, "Disk full")
             .line("1.0 MiB left on /Users//x; aterm freed 0 B and can free nothing more safely")
@@ -3539,7 +3233,6 @@ fn the_disk_full_alert_states_its_cause_once_and_shows_its_step() {
 }
 
 /// `msg` alone on the band of a window `cols` cells wide, once its reveal's
-/// grace is over, measured as the window measures it.
 fn band_row(msg: Message, cols: usize) -> aterm_messages::RowLayout {
     let now = aterm_messages::Instant::now();
     let mut c = aterm_messages::MessageCenter::new(aterm_messages::MessageLog::empty(), now);
@@ -3558,27 +3251,20 @@ fn band_row(msg: Message, cols: usize) -> aterm_messages::RowLayout {
 }
 
 /// The columns of the windows the review imaged the band at: 864 px and
-/// 514 px of the default font (`targo --unverified lab instance --columns`).
 const BAND_WIDE: usize = 120;
 const BAND_NARROW: usize = 70;
 
 /// The window's own width when nothing sizes it (`app_config`'s
-/// `resolve_initial_columns`): the band most owners read.
 const BAND_DEFAULT: usize = 80;
 
 /// The cells the band keeps clear before a row's first capsule
-/// (`aterm_messages`' `BEFORE_CAPSULES`).
 const BAND_CLEARANCE: usize = 2;
 
 /// The band's implicit link to Details, and the cells it takes beside the
-/// capsule before it (its words, its two pads, the gap).
 const DETAILS_LINK: &str = "Details \u{203a}";
 const DETAILS_CELLS: usize = 12;
 
 /// Whether a band row's `shown` title reads as its whole `title`, its
-/// `short` form whole, or its short form cut with an ellipsis: never as a
-/// cut of the whole title (the review of the band, 2026-10-20: `Claude's
-/// lo…` at the default window).
 fn title_reads(shown: &str, title: &str, short: &str) -> bool {
     let said = shown.trim_end_matches('\u{2026}');
     shown == title
@@ -3587,33 +3273,6 @@ fn title_reads(shown: &str, title: &str, short: &str) -> bool {
 }
 
 /// EVERY NOTICE'S STEP STANDS ON THE BAND, AND SAYS WHICH ACCOUNT THERE (the
-/// review of the owner's notices, 2026-10-20: at 864 px the step was cut
-/// mid-sentence, at 514 px it was gone, and the disk-full band showed no
-/// step at all; the review of the band, 2026-10-20: at 514 px, and at the
-/// default 80 columns, the cut took the account each step names, and a
-/// renewal's command lost its label). At the wide window the title and the
-/// step stand whole, for the roster's first label (`main`, which the first
-/// `accounts add` lists) and each clause a notice is raised with. At the
-/// narrow and the default ones, for that label and for one as long as the
-/// sentences name whole ([`notice::LABEL_ROOM`]): the step stands from its
-/// first word, the title giving way first; a step that names the account
-/// names it whole, and its lead clause (`Sign in to …:`) stands whole; and a
-/// step that runs a command is the whole command or its short form
-/// ([`notice::COMMAND_UNDER_DETAILS`]), never a cut of it — at every width.
-/// A sentence step not shown whole ends in `…`, its lead clause alone too
-/// (the review of the band, ox4-8: `Sign in to client-acme-research-024`
-/// read as the whole step); and where the short form stands in a command's
-/// place, a title cut beside it leaves no blank cells (ox4-3: 25 blank cells
-/// beside `Claude usag…`), and the short title whole leaves none `Details ›`
-/// would fit in. The title reads whole, as its short form whole or as its
-/// short form cut — never a stub of the whole title (`Claude's lo…` at the
-/// default window). The disk-full alert alike, at each step it says.
-/// NEGATIVE CONTROLS: a notice with no short title is a stub at the
-/// default band; a step
-/// longer than the wide band's room is cut there; a step that names its
-/// label last (the wording the review imaged) loses it at the narrow band; a
-/// lead clause too long for the narrow band is cut there; and a command with
-/// no short form is cut — so each check can fail.
 #[test]
 fn every_tab_notices_step_stands_on_the_band() {
     use aterm_agent::supervise::policy::notice;
@@ -3640,7 +3299,6 @@ fn every_tab_notices_step_stands_on_the_band() {
         assert_eq!(wide.title.1, title, "{at}: {wide:?}");
     };
     const COMMAND: &str = "aterm harness";
-    // The width law of one notice's step at `cols`.
     let holds = |e: &Exception, label: Option<&str>, cols: usize, at: &str| {
         let msg = resume_ask("s-1", &spot, e);
         let title = msg.title.clone();
@@ -3664,11 +3322,6 @@ fn every_tab_notices_step_stands_on_the_band() {
                 shown == step || shown == notice::COMMAND_UNDER_DETAILS,
                 "{at} at {cols}: a command cut: {shown:?}"
             );
-            // The short form gives back what the whole command would have
-            // taken (ox4-3): a title cut beside it leaves no blank cells
-            // before the capsules' clearance, and the short title whole
-            // leaves fewer than `Details ›` takes where that link is gone
-            // (the short form sends the reader to it).
             if shown == notice::COMMAND_UNDER_DETAILS && row.title.1 != title {
                 let (col, words) = row.detail.as_ref().expect("the short form");
                 let end = col + crate::message_band::cell_width(words);
@@ -3691,7 +3344,6 @@ fn every_tab_notices_step_stands_on_the_band() {
             return;
         }
         assert!(step.starts_with(&shown), "{at} at {cols}: {shown:?}");
-        // A step cut short says so (ox4-8): never its lead clause bare.
         assert!(
             raw == step || raw.ends_with('\u{2026}'),
             "{at} at {cols}: a cut step with no mark: {raw:?}"
@@ -3719,7 +3371,6 @@ fn every_tab_notices_step_stands_on_the_band() {
                 for cols in [BAND_NARROW, BAND_DEFAULT, BAND_WIDE] {
                     holds(&e, name, cols, text.id);
                 }
-                // A command is never cut, at any width.
                 for cols in 30..=160 {
                     let shown = excerpt(resume_ask("s-1", &spot, &e), cols);
                     assert!(
@@ -3746,8 +3397,6 @@ fn every_tab_notices_step_stands_on_the_band() {
             "disk {cause:?}: {shown:?}"
         );
     }
-    // NEGATIVE CONTROL: a notice with no short title reads as a stub of its
-    // whole title at the default band.
     let e = Exception::of_notice(&notice::LIMIT_RENEW, Some(&room), None, "x");
     let unshort = Exception {
         notice: e.notice.clone().map(|n| notice::Notice {
@@ -3763,7 +3412,6 @@ fn every_tab_notices_step_stands_on_the_band() {
         !title_reads(&row.title.1, &title, notice::LIMIT_RENEW.short_title),
         "the control: {row:?}"
     );
-    // NEGATIVE CONTROL: a step past the wide band's room.
     let long = Exception {
         action: format!(
             "{} {}",
@@ -3778,7 +3426,6 @@ fn every_tab_notices_step_stands_on_the_band() {
             || row.title.1 != row.full_title,
         "the control: {row:?}"
     );
-    // NEGATIVE CONTROL: the step the review imaged, its label last.
     let last = Exception {
         action: "Type /login and sign in to the account labelled main.".to_string(),
         ..Exception::of_notice(&notice::LOGIN_CANCELLED, Some("main"), None, "x")
@@ -3788,7 +3435,6 @@ fn every_tab_notices_step_stands_on_the_band() {
         "the control: {:?}",
         narrow(resume_ask("s-1", &spot, &last))
     );
-    // NEGATIVE CONTROL: a lead clause past the narrow band's room is cut.
     let lead = Exception {
         action: format!("Sign in to {}: type /login in the tab.", "q".repeat(48)),
         ..Exception::of_notice(&notice::LOGIN_CANCELLED, Some("main"), None, "x")
@@ -3798,8 +3444,6 @@ fn every_tab_notices_step_stands_on_the_band() {
         !shown.starts_with(lead.action.split_once(": ").expect("a lead").0),
         "the control: {shown:?}"
     );
-    // NEGATIVE CONTROL: a command with no short form is cut on the narrow
-    // band (an exception built by hand carries none).
     let bare_command = Exception {
         notice: Exception::of_notice(&notice::LIMIT_RENEW, Some(&room), None, "x")
             .notice

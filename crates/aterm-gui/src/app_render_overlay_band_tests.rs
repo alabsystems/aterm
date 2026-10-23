@@ -519,6 +519,105 @@ fn a_menu_card_untints_a_selection_and_retires_a_meter_and_a_sparkle_under_it() 
     );
 }
 
+/// A MENU CARD CUTS A CHROME ROW'S ICONS AT ITS EDGE: a raster on the card's
+/// rows loses what spans the row (ground, rail, rings, split, lift) and the
+/// icons the card covers or one would spill into, and keeps the drawn icons
+/// beside the card (on main the whole raster went, and a switch's `●` beside
+/// the menu fell back to the font's glyph). NEGATIVE CONTROLS: an icon on a
+/// card cell goes; one whose blank neighbour is a blank card cell goes (it
+/// would spill into the card); a row-wide raster with no icon goes whole; a
+/// raster off the card's rows is untouched.
+#[test]
+fn a_menu_card_cuts_a_chrome_rows_icons_at_its_edge() {
+    use aterm_core::render::{BandIcon, ChromeIcon, ChromeRaster, ChromeRing, InkSplit};
+    // Cells 10x20 px; the card covers frame rows 2..5, cols 4..10.
+    let card = crate::tab_menu::MenuRect {
+        row: 2,
+        col: 4,
+        w: 6,
+        h: 3,
+    };
+    let icon = |col| ChromeIcon {
+        col,
+        icon: BandIcon::Disc,
+    };
+    let raster = |row, icons: Vec<ChromeIcon>| ChromeRaster {
+        row,
+        ground: std::sync::Arc::from(vec![0x0011_2233; 160]),
+        rail: std::sync::Arc::from(vec![0x0044_5566; 160]),
+        rail_h: 2,
+        clear_rail: true,
+        own: vec![(0, 2)],
+        split: Some(InkSplit {
+            col: 1,
+            x: 3,
+            ink: 0x00ff_ffff,
+            bg: 0,
+        }),
+        rings: vec![ChromeRing {
+            start: 12,
+            end: 15,
+            ring: 0x00ff_ffff,
+            inner: 0,
+            seam: None,
+        }],
+        icons,
+    };
+    let mut input = aterm_render::RenderInput::empty();
+    input.rows = 8;
+    input.cols = 16;
+    // Every row blank (the card's middle cells blank too), the card's
+    // border cells drawn.
+    let blank = aterm_core::terminal::RenderCell::default();
+    input.cells = vec![vec![blank; 16]; 8];
+    for row in &mut input.cells[2..5] {
+        row[4].ch = '\u{2502}';
+    }
+    // Row 3: on the card (5); right of it with the card's blank last cell
+    // beside it (10, spills into the card); left of it with the card's
+    // border beside it (3, keeps to its cell); clear of it (14).
+    input.chrome_rasters = vec![
+        raster(3, vec![icon(3), icon(5), icon(10), icon(14)]),
+        raster(4, Vec::new()),
+        raster(6, vec![icon(5)]),
+    ];
+    let off_rows = input.chrome_rasters[2].clone();
+    super::scrub_overlay_card(&mut input, card, (10, 20), (5, 0));
+    let kept = input
+        .chrome_rasters
+        .iter()
+        .find(|m| m.row == 3)
+        .expect("the row keeps its icons beside the card");
+    assert_eq!(
+        kept.icons,
+        [icon(3), icon(14)],
+        "the icons beside the card stay; the one on it and the one that would spill into it go"
+    );
+    assert!(
+        kept.ground.is_empty()
+            && kept.rail.is_empty()
+            && kept.rail_h == 0
+            && !kept.clear_rail
+            && kept.own.is_empty()
+            && kept.split.is_none()
+            && kept.rings.is_empty(),
+        "what spans the row goes: {kept:?}"
+    );
+    assert_eq!(
+        input
+            .chrome_rasters
+            .iter()
+            .map(|m| m.row)
+            .collect::<Vec<_>>(),
+        [3, 6],
+        "CONTROL: a raster on the card's rows with nothing per cell goes"
+    );
+    assert_eq!(
+        input.chrome_rasters[1], off_rows,
+        "CONTROL: a raster off the card's rows is untouched"
+    );
+}
+
 /// Whether a card raster holds the terminal's orange ink: a pixel whose red
 /// leads its blue by more than 60 at more than a quarter coverage.
 fn has_orange_ink(rgba: &[u8]) -> bool {

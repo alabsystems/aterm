@@ -1,122 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Input admission for hosted momentum glow, and the scratch budget each tick
-//! may push into.
+//! Input admission and [`ScratchBudget`] bounds for hosted momentum glow ([`MOMENTUM_PROFILE`],
+//! [`MOMENTUM_ENVELOPE`], [`GlowQuad`](aterm_render::GlowQuad)).
 //!
-//! When the glow runs as an Aos task, every input passes these checks before
-//! it reaches the engine. Inside the admitted profile every engine call is
-//! total and bounded: no integer overflow, no runaway loop, no
-//! `Instant + Duration` that panics, and no push beyond a budget that is
-//! reserved before the tick. Outside it, the input is refused before the call,
-//! so the engine's state and the scratch vectors are untouched. The
-//! functions are pure: they read their arguments and nothing else.
-//!
-//! # The profile
-//!
-//! [`MOMENTUM_PROFILE`] is the profile the host runs under:
-//!
-//! | limit | value | what it bounds |
-//! |---|---|---|
-//! | `max_extent_px` | 65 535 | `origin + cells · cell` on each axis: [`GlowQuad`](aterm_render::GlowQuad)'s `u16` pixels, and every `i32` the halo computes |
-//! | `max_radius_cells` | 4.0 | the halo's reach, so both halo loops scale with the cell size (production: 1.6) |
-//! | `max_tau_s` | 60 s | the settle schedule's addend `τ · ln 50 ≤ 235 s` (production: 1.2 s) |
-//! | `max_frame_interval` | 1 s | `now + frame_interval` in `next_change_deadline` |
-//! | `horizon` | 30 days | logical time, as a signed offset from the epoch the host took at attach |
-//!
-//! The derivations below hold only inside [`MOMENTUM_ENVELOPE`], the widest
-//! profile the engine's arithmetic was checked for. A check passes only when
-//! the value is inside both the caller's profile and the envelope. So a
-//! hand-built profile that is wider than the envelope, or that has NaN
-//! limits, cannot widen what is admitted.
-//!
-//! # What is refused
-//!
-//! * [`admit_tick`] runs these checks in this order:
-//!   * geometry ([`AdmitRefusal::Geometry`]): `1 ≤ cw`, `1 ≤ ch`,
-//!     `origin_x + max(cols, 1) · cw ≤ extent`,
-//!     `origin_y + max(rows, 1) · ch ≤ extent` (an empty grid still names a
-//!     cell that must fit), and `head ≤ origin_y`. All of it uses checked
-//!     arithmetic;
-//!   * `cfg.tau_s` ([`admit_tau`]);
-//!   * `cfg.radius_cells`, which must be finite and in `[0, max]`
-//!     ([`AdmitRefusal::Radius`]);
-//!   * `cfg.intensity`, which must be finite ([`AdmitRefusal::Intensity`]);
-//!     the engine clamps it to `[0, 1]`;
-//!   * a glyph span, which must satisfy `0 ≤ first ≤ end ≤ cols`
-//!     ([`AdmitRefusal::GlyphSpan`]).
-//!
-//!   The window extent (`win_w`, `win_h`) and the colours are never read by
-//!   the engine, and any value is total, so they are admitted as they are. A
-//!   cursor outside the grid is not refused either: the engine treats it as
-//!   off.
-//! * [`admit_tau`]: τ must be finite and in `(0, max_tau_s]`. This covers both
-//!   `on_key`'s τ and the τ a tick latches.
-//! * [`admit_frame_interval`]: the interval must be `≤ max_frame_interval`.
-//! * [`admit_time`]: an input's time, as a signed nanosecond offset from the
-//!   epoch, must be in `[0, horizon]` and no earlier than the previous input's.
-//!
-//! Every instant the engine forms is then at most
-//! `epoch + horizon + max(frame_interval, τ · ln 50 + 1 ms)`. That is far
-//! inside `Instant`'s range on every std target when the epoch is a real
-//! `Instant::now()`, so the engine's unchecked additions
-//! (`next_change_deadline`, `decays_to`) cannot overflow.
-//!
-//! # The scratch budget
-//!
-//! A hot tick pushes into exactly one stream: the dark page's halo goes to
-//! `out` (`emit_halo`) and the light page's ink to `under` (`emit_light_halo`).
-//! An inert tick pushes nothing. [`admit_tick`] returns a [`ScratchBudget`]
-//! that bounds the pushes of every tick these inputs can make, whatever the
-//! engine's state and the time. The host reserves it before the tick, so a
-//! push never reallocates.
-//!
-//! *Every amplitude at once.* The halo's size depends on the amplitude only
-//! through `s = smoothstep(q / 255) ≤ 1`, and `rx`, `ry` and `rx_full` grow with
-//! `s`. IEEE rounding is monotone in each operation, so the computed floats
-//! grow with `s` too. The row grid and the slab tiling are anchored where `s`
-//! does not reach: the caret row's top edge, and `ceil` of the vertex `x`. So
-//! the rows and slabs at any amplitude are a subset of those at `s = 1`, and
-//! the budget is computed once, at `s = 1`, with the engine's own float
-//! expressions.
-//!
-//! *Dark* (`emit_halo`): the rows lie on a grid `row_h = max(⌊ch / 12⌋, 2)`
-//! apart, anchored at the caret row's top edge. A row works when
-//! `1 − v² > 0`, and that set shrinks as `ry` shrinks. A working row makes 4
-//! knot pairs × 2 sides = 8 `push_fx_ramp` calls. Each call clips to the
-//! effects box `[fx_top, fx_bot)` and pushes one quad per `ch`-band, anchored
-//! at `origin_y`, that the clipped row meets. The budget is
-//! `Σ 8 · bands(row)` over the working rows at `s = 1`, counted by walking the
-//! engine's row grid. It is never above the closed form
-//! `16 · min(⌈2·ry/row_h⌉, ⌈(fx_bot − fx_top)/row_h⌉ + 1)`, because a row meets
-//! at most two bands (`row_h ≤ ch`, or `row_h = 2` at `ch = 1`).
-//!
-//! *Light* (`emit_light_halo` → `soft_ellipse` → `ribbon_beam`): 25 vertices
-//! span `[cx − rx_full, cx + rx_full]`. The 24 segments tile
-//! `[⌈x₀⌉, ⌈x₂₄⌉)` (`W` px), and inside each segment the slabs are
-//! `stride = max(⌊cw/8⌋, 1)` px wide. Only a slab that meets
-//! `[fx_left, fx_right)` (`ℓ` px of the tiling) can push.
-//! * Slabs: `min(⌊(W + 24·(stride − 1)) / stride⌋, ⌊(ℓ + 24·(2·stride − 2)) / stride⌋)`.
-//!   The first term counts every slab. The second counts, per segment, the
-//!   slabs that meet the clip, `⌈(ℓᵢ − 1)/stride⌉ + 1`.
-//! * Rows per slab: one quad per pixel row, at most one. A vertex's reach is
-//!   at most `ch / 2` (`push_ink_ellipse_shaped` holds the mark inside the
-//!   caret row), and a lerp of two reaches overshoots by a few ulps at most,
-//!   far under a pixel. So the rows lie in `[cell_top − 1, cell_top + ch + 1)`,
-//!   clipped to `[fx_top, fx_bot)`.
-//! * Total: `min(4095, slabs · rows)`. 4095 is the cap `ribbon_beam` enforces
-//!   itself, a relative budget of `LIGHT_MARK_QUADS = 4096` checked as
-//!   `len + 2 > max` before each row.
-//!
-//! The budget bounds pushes, not work. A light slab outside the clip still
-//! walks its rows without pushing, so a light tick's row steps are bounded by
-//! the whole tiling: about `(2·rx_full / stride + 24) · (ch + 2)`. That is
-//! finite inside the profile, and it scales with the cell, not with the
-//! window.
-//!
-//! The property sweep (`every_admitted_tick_pushes_within_its_budget_and_never_reallocates`)
-//! checks both bounds against the real engine across geometries, radii,
-//! amplitudes, themes and cursor positions.
+//! Validates tick inputs ([`admit_tick`], [`admit_tau`], [`admit_frame_interval`], [`admit_time`])
+//! and reports refusals via [`AdmitRefusal::Geometry`], [`AdmitRefusal::Radius`],
+//! [`AdmitRefusal::Intensity`], and [`AdmitRefusal::GlyphSpan`].
 
 use std::fmt;
 use std::time::Duration;
@@ -124,8 +14,7 @@ use std::time::Duration;
 use super::{HALO_ROW_DIV, HALO_SEGMENTS, MomentumGlowConfig};
 use crate::cursor_glow::{Geom, LIGHT_MARK_QUADS};
 
-/// The limits hosted momentum inputs are admitted under (the module docs'
-/// table).
+/// The limits hosted momentum inputs are admitted under (the module docs' table).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct MomentumProfile {
     /// The largest window-pixel coordinate the grid may reach, on each axis.
@@ -149,13 +38,7 @@ pub const MOMENTUM_PROFILE: MomentumProfile = MomentumProfile {
     horizon: Duration::from_secs(30 * 24 * 60 * 60),
 };
 
-/// The widest profile the engine's arithmetic was checked for. Admission
-/// holds every profile to it.
-/// * Extent `u16::MAX`: `GlowQuad` pixels are `u16`.
-/// * Radius 64 cells: `ry ≤ 38.9 · ch` and `rx ≤ 64.6 · cw` stay below 2²² px,
-///   so every `f32 → i32` in the halo is exact and unsaturated.
-/// * τ one hour, frame interval one minute, horizon ten years: every instant
-///   the engine forms stays within about ten years of the epoch.
+/// The widest profile the engine's arithmetic was checked for.
 pub const MOMENTUM_ENVELOPE: MomentumProfile = MomentumProfile {
     max_extent_px: u16::MAX as u32,
     max_radius_cells: 64.0,
@@ -175,8 +58,7 @@ const _: () = {
     assert!(MOMENTUM_PROFILE.horizon.as_nanos() <= MOMENTUM_ENVELOPE.horizon.as_nanos());
 };
 
-/// The most quads one tick may append to each scratch stream. The host
-/// reserves this capacity before the tick.
+/// The most quads one tick may append to each scratch stream.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ScratchBudget {
     /// The additive `cursor_glow_add` stream (the dark page's halo).
@@ -208,13 +90,11 @@ pub enum GeometryFault {
     },
     /// `head > origin_y`: the effects box would start above the window.
     HeadAboveOrigin { head: u16, origin_y: u16 },
-    /// The scratch budget's checked arithmetic overflowed. Inside the envelope
-    /// this cannot happen. It is refused rather than guessed.
+    /// The scratch budget's checked arithmetic overflowed.
     Unbounded,
 }
 
-/// Why an input was refused before it reached the engine. A refusal leaves
-/// the engine's state and the scratch streams untouched.
+/// Why an input was refused before it reached the engine.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AdmitRefusal {
     /// A τ (`f32` bits) that is not finite or not in `(0, max_tau_s]`.
@@ -231,7 +111,7 @@ pub enum AdmitRefusal {
     FrameInterval(Duration),
     /// A time (signed ns from the epoch) before the epoch or past the horizon.
     Horizon(i128),
-    /// A time earlier than the previous input's.
+    /// A time earlier than the previous one.
     TimeWentBack { last: i128, at: i128 },
 }
 
@@ -308,11 +188,9 @@ impl fmt::Display for AdmitRefusal {
 
 impl std::error::Error for AdmitRefusal {}
 
-/// Admits a τ, either `on_key`'s or a tick's `cfg.tau_s`: finite and in
-/// `(0, max_tau_s]`.
+/// Admits a τ, either `on_key`'s or a tick's `cfg.tau_s`.
 ///
 /// # Errors
-///
 /// [`AdmitRefusal::Tau`].
 #[inline]
 pub const fn admit_tau(p: &MomentumProfile, tau_s: f32) -> Result<(), AdmitRefusal> {
@@ -327,10 +205,9 @@ pub const fn admit_tau(p: &MomentumProfile, tau_s: f32) -> Result<(), AdmitRefus
     }
 }
 
-/// Admits a schedule query's frame interval: at most `max_frame_interval`.
+/// Admits a schedule query's frame interval.
 ///
 /// # Errors
-///
 /// [`AdmitRefusal::FrameInterval`].
 #[inline]
 pub const fn admit_frame_interval(p: &MomentumProfile, d: Duration) -> Result<(), AdmitRefusal> {
@@ -344,12 +221,9 @@ pub const fn admit_frame_interval(p: &MomentumProfile, d: Duration) -> Result<()
     }
 }
 
-/// Admits an input's logical time `at` (signed nanoseconds from the epoch)
-/// after an input at `last`. The time must be inside `[0, horizon]` and
-/// nondecreasing. The range is checked first.
+/// Admits an input's logical time `at` (signed nanoseconds from the epoch) after an input.
 ///
 /// # Errors
-///
 /// [`AdmitRefusal::Horizon`] or [`AdmitRefusal::TimeWentBack`].
 #[inline]
 pub const fn admit_time(
@@ -360,7 +234,6 @@ pub const fn admit_time(
     let p_ns = p.horizon.as_nanos();
     let env_ns = MOMENTUM_ENVELOPE.horizon.as_nanos();
     let horizon_ns = if p_ns < env_ns { p_ns } else { env_ns };
-    // Every `Duration` is below 2^94 ns, so its nanoseconds fit in `i128`.
     let within = horizon_ns <= i128::MAX as u128 && at >= 0 && at <= horizon_ns as i128;
     if !within {
         return Err(AdmitRefusal::Horizon(at));
@@ -371,15 +244,10 @@ pub const fn admit_time(
     }
 }
 
-/// Admits one tick's inputs and returns the scratch it may push (the module
-/// docs list the checks and derive the budget). A tick that cannot be hot gets
-/// a zero budget: no cursor, a cursor outside the grid, disabled, or
-/// intensity ≤ 0.
+/// Admits one tick's inputs and returns the scratch it may push.
 ///
 /// # Errors
-///
-/// [`AdmitRefusal::Geometry`], [`AdmitRefusal::Tau`], [`AdmitRefusal::Radius`],
-/// [`AdmitRefusal::Intensity`] or [`AdmitRefusal::GlyphSpan`], in that order.
+/// [`AdmitRefusal::Geometry`], [`AdmitRefusal::Tau`], [`AdmitRefusal::Radius`].
 #[inline]
 pub fn admit_tick(
     p: &MomentumProfile,
@@ -405,7 +273,6 @@ pub fn admit_tick(
     {
         return Err(AdmitRefusal::GlyphSpan(first, end));
     }
-    // The engine's static inert arm: nothing can be pushed.
     let Some((cr, cc)) = cur else {
         return Ok(ScratchBudget::default());
     };
@@ -423,7 +290,6 @@ pub fn admit_tick(
 }
 
 /// The admitted geometry, narrowed: every extent fits `u16`, so the budget's
-/// arithmetic starts from small integers.
 #[derive(Clone, Copy, Debug)]
 struct Grid {
     cw: u16,
@@ -447,8 +313,6 @@ const fn admit_geometry(p: &MomentumProfile, geom: &Geom) -> Result<Grid, AdmitR
     } else {
         MOMENTUM_ENVELOPE.max_extent_px
     };
-    // `origin + max(cells, 1) · cell ≤ limit`, checked; a pass bounds every
-    // factor by `limit ≤ u16::MAX`.
     const fn fits(origin: u16, cells: usize, cell: usize, limit: u32) -> Option<(u16, u16)> {
         let cells_floor = if cells > 1 { cells } else { 1 };
         let Some(prod) = cells_floor.checked_mul(cell) else {
@@ -502,13 +366,9 @@ const WIDEST: f32 = 1.0;
 const LIGHT_ELLIPSE_SEGMENTS: i64 = 24;
 
 /// Each `push_fx_ramp` call per working dark-halo row: both sides of every
-/// knot pair.
 const DARK_CALLS_PER_ROW: usize = 2 * HALO_SEGMENTS;
 
 /// `emit_halo`'s worst case over every amplitude (the module docs): the
-/// engine's row grid at `s = 1`, eight calls per working row, one quad per
-/// `ch`-band each call's clipped row meets. Mirrors `emit_halo`'s float
-/// expressions exactly; `None` only if checked arithmetic overflows.
 fn dark_halo_budget((cr, cc): (u16, u16), geom: &Geom, g: &Grid, radius: f32) -> Option<usize> {
     let (cw, ch) = (geom.cw as f32, geom.ch as f32);
     let (_, cy) = geom.cell_center(cr, cc);
@@ -554,15 +414,10 @@ fn dark_halo_budget((cr, cc): (u16, u16), geom: &Geom, g: &Grid, radius: f32) ->
 }
 
 /// `emit_light_halo`'s worst case over every amplitude (the module docs): the
-/// slabs that can meet the clip at `s = 1` times the rows a slab can cover,
-/// capped by `ribbon_beam`'s own budget. `None` only if checked arithmetic
-/// overflows.
 fn light_halo_budget((cr, cc): (u16, u16), geom: &Geom, g: &Grid, radius: f32) -> Option<usize> {
     let cw = geom.cw as f32;
     let (cx, _) = geom.cell_center(cr, cc);
     let rx_full = cw * (0.55 + radius * WIDEST);
-    // `soft_ellipse`'s first and last vertices, `cx + u · rx_full` at `u = -1`
-    // and `u = 1` exactly; `±1 · rx_full` is exact, so these are the same floats.
     let x_first = cx - rx_full;
     let x_last = cx + rx_full;
     let (start, end) = (

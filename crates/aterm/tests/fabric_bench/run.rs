@@ -1,68 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The measured phases, each selected scenario over its own world, booted as
-//! the fabric suite boots it (`harness::World`: a guarded broker in this process, opened with
-//! aterm's own options for the arm's tier — ordered at aterm's horizon by
-//! default — and retained by aterm's default rules as `aterm link broker`
-//! retains it, a headless `aterm`, and the real `aterm link serve` child it
-//! launched, its bus mirror at `--log auto`; [`boot_world`] takes an arm's
-//! `retention=off`, `log=off` and tick interval):
-//!
-//! 1. MESSAGING, on one node. [`latency`]: session A posts a `note` to session
-//!    B, one at a time on an idle bridge, and the clock runs from the `post`
-//!    reply to B's `await inbox` answering. [`burst`]: N posts back to back
-//!    from sender sessions to B (within B's allowance, [`BURST_WINDOW`]), with
-//!    B consuming as a real reader does. Then the census of the records each
-//!    message cost.
-//! 2. PING-PONG, on a node of its own ([`pingpong`]): A posts, B replies the
-//!    moment it sees the message, back to back, with the bridge's wait tally
-//!    on — the reply's wait on the delivery's inbox commit and the bridge's one
-//!    loop, which the latency phase waits out on purpose.
-//! 3. ATTACH, on a third node: a bridge that starts with N sessions, until
-//!    its node row and every session's presence row are on the broker again,
-//!    for each population in the spec; the census of what it wrote, the
-//!    killed bridge's fired will counted apart. And a second stop each
-//!    restart: a note the boot session posts to itself the moment the bridge
-//!    is killed, until it is visible — after the presence rows, the bus
-//!    mirror's start (over a retaining broker at `--log auto`), the refill
-//!    the rows owe and the live drain.
-//! 4. HANDOFF, on a fourth node ([`handoff`]): a successor instance's bridge
-//!    standing by on the held state dir while the holder quits saying `bye
-//!    handoff`; the outage until the successor's rows are acked, and a post
-//!    queued in the gap.
-//!
-//! Each world also runs the [`calibrate`] yardstick — bare strict, ordered and
-//! escalated publishes, no aterm — before and after its phases, and every
-//! headline is reported in strict yardstick units beside its milliseconds: a
-//! correction for the disk, not for a busy CPU.
-//!
-//! Separate worlds, not one, so the attach populations are exactly what the
-//! spec names (sessions are never closed here), the messaging numbers are not
-//! taken beside thirty sessions' roster traffic, and only the ping-pong
-//! world's bridge runs with a development seam set.
-//!
-//! THE POST IS THE DEFAULT ONE: `kind=note` without `--wait`, which answers
-//! `OK <id>` once aterm has queued it in the session's outbox. So "post ->
-//! visible" spans everything the fabric does for a message: the bridge's
-//! outbox drain, the publish and its fsync, the bridge reading its own inbox
-//! subscription, the `deliver` into B's ring, and B's parked `await` waking.
-//! The broker-side landing time ([`crate::clock`]) splits it in two.
-//!
-//! THE RECIPIENT READS LIKE A READER. aterm's ring holds at most 64 UNLISTED
-//! rows from one peer node (`aterm-gui` `SENDER_QUOTA`), and every sender here
-//! is the same node, so a recipient that never listed would refuse the 65th
-//! message and the bench would measure refusals. After every wake B lists what
-//! arrived (`inbox since=<id>`, not `--peek`), which is what releases the
-//! quota — and a listing records nothing the bridge acts on, so it wakes no
-//! bridge work into the next measured message. The burst's sender keeps inside
-//! that allowance too ([`BURST_WINDOW`]): a reader can always be descheduled
-//! for longer than a fast bridge takes to deliver 64 rows.
-//!
-//! EVERY ROW IS ACCOUNTED FOR. A phase hands the next the newest row id it
-//! listed, and every listing must hold only the rows that phase sent, each
-//! once: a message delivered twice, or a late repeat of an earlier phase's,
-//! fails the run by name instead of being timed as a message.
+//! The measured phases, each selected scenario over its own world, booted as the fabric suite boots it (`harness::World`: a guarded broker in this process, opened with aterm's own options for the arm's tier — ordered at aterm's horizon by default — and retained by aterm's default rules as `aterm link broker` retains it, a headless `aterm`, and the real `aterm link serve` child it launched, its bus mirror at `--log auto`; [`boot_world`] takes an arm's `retention=off`, `log=off` and tick interval):
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
@@ -94,31 +33,16 @@ pub struct Report {
 }
 
 /// How long the bench lets a bridge run before it kills it again.
-///
-/// aterm's bridge supervisor (`aterm-gui` `fabric_launch.rs`) doubles its
-/// relaunch back-off after a child that ran less than `RELAUNCH_HEALTHY` (5 s)
-/// and resets it to its 200 ms floor after one that ran longer. The attach
-/// rounds kill the bridge on purpose, so each waits out the healthy mark first
-/// (with a margin for the bench's own view of the start lagging the bridge's)
-/// — otherwise round nine would wait 25 s for its relaunch. NOT a
-/// synchronisation sleep: nothing it precedes depends on the time passing,
-/// only the run's length does, and the measured attach starts at the new
-/// bridge's own pid file, after the back-off.
 const SUPERVISOR_HEALTHY: Duration = Duration::from_millis(5_500);
 
 /// How often the pid file is read while a killed bridge comes back: it marks
-/// the start of an attach, so it is read finely. A file read, so it puts no
-/// load on the broker being measured.
 const PID_POLL: Duration = Duration::from_millis(1);
-
-// the control-socket verbs the phases speak
 
 fn request(ctl: &mut Ctl, line: &str) -> Reply {
     ctl.request(line).unwrap_or_else(|e| panic!("{line}: {e}"))
 }
 
 /// `from` posts a note to `to`: `(stamp before the request, stamp after the
-/// reply)`.
 fn post(ctl: &mut Ctl, clock: Clock, from: &str, to: &str, text: &str) -> (u64, u64) {
     let line = format!("@{from} post to=@{to} kind=note -- {text}");
     let t_call = clock.us();
@@ -129,14 +53,11 @@ fn post(ctl: &mut Ctl, clock: Clock, from: &str, to: &str, text: &str) -> (u64, 
 }
 
 /// Park on `sid`'s inbox until a note row newer than `since` is there: `(the
-/// newest such row's id, the stamp when the answer arrived)`.
-///
 /// # Errors
 ///
 /// Any answer but a row — `OK timeout` after the hang detector — as the
 /// request and its reply.
 fn await_note(ctl: &mut Ctl, clock: Clock, sid: &str, since: u64) -> Result<(u64, u64), String> {
-    // A minute: the hang detector (`harness::DEADLINE`), never a budget.
     let line = format!(
         "@{sid} await inbox since={since} kinds=note timeout={}",
         DEADLINE.as_millis()
@@ -177,7 +98,6 @@ fn rows_of(reply: &Reply) -> Vec<Row> {
 }
 
 /// LIST `sid`'s rows newer than `since` — not `--peek`: listing is what
-/// releases the sender's quota (see the module note).
 fn list_since(ctl: &mut Ctl, sid: &str, since: u64) -> Vec<Row> {
     let line = format!("@{sid} inbox since={since}");
     let reply = request(ctl, &line);
@@ -204,7 +124,6 @@ fn spawn(w: &World) -> String {
 }
 
 /// SPAWN `n` IDLE BYSTANDER SESSIONS ([`Spec::bystanders`]): sessions that never
-/// post or read, beside the two that talk. Their sids, for the presence wait.
 fn bystanders(w: &World, n: usize) -> Vec<String> {
     if n > 0 {
         eprintln!("fabric bench: spawning {n} idle bystander session(s)");
@@ -231,7 +150,6 @@ fn presence_subject(w: &World, owner: &str) -> String {
 }
 
 /// Wait until the node row and every one of `sids`' presence rows say
-/// `state=live` at an offset at or past `from`.
 fn wait_live(w: &World, sids: &[String], from: u64, what: &str) {
     let mut owners: Vec<&str> = sids.iter().map(String::as_str).collect();
     owners.push("node");
@@ -248,7 +166,6 @@ fn wait_live(w: &World, sids: &[String], from: u64, what: &str) {
 }
 
 /// One row a consumer saw: which message (its index), at which broker offset,
-/// stamped when.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Seen {
     j: usize,
@@ -259,18 +176,12 @@ struct Seen {
 /// What a reader saw.
 struct Consumed {
     /// Every row it listed, in arrival order, A REPEAT INCLUDED: a message
-    /// delivered twice is two entries here, and [`tally`] refuses it.
     seen: Vec<Seen>,
     /// The newest row id it listed: where the next phase's reading starts.
     since: u64,
 }
 
 /// Read `sid`'s inbox like a reader until `want` DISTINCT messages whose text
-/// is `<prefix><j>` have arrived: each wake is followed by a listing, and a
-/// row is stamped VISIBLE at the wake that covered it (or at the listing, for
-/// one that arrived between the two). After each listing it tells `credit`
-/// how many it has listed.
-///
 /// # Errors
 ///
 /// A wait that timed out, or a row whose text is not `<prefix><j>` — a stray,
@@ -318,7 +229,6 @@ fn consume(
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Miscount {
     /// Message `j` arrived as two rows: at one offset (the endpoint's `off=`
-    /// dedup failed) or at two (the bus holds the record twice).
     Twice { j: usize, first: u64, again: u64 },
     /// Message `j` never arrived.
     Never(usize),
@@ -340,7 +250,6 @@ impl std::fmt::Display for Miscount {
 }
 
 /// Each of `n` messages' row, by index. Pure (unit-tested).
-///
 /// # Errors
 ///
 /// The first [`Miscount`]: a message seen twice, one never seen, or an index
@@ -365,36 +274,18 @@ fn tally(seen: &[Seen], n: usize) -> Result<Vec<Seen>, Miscount> {
 }
 
 /// How many burst posts may be in flight — posted, not yet LISTED by the
-/// reader — at once.
-///
-/// aterm refuses a delivery while 64 rows from the sending peer sit unlisted in
-/// the recipient's ring (`aterm-gui` `SENDER_QUOTA`; every sender here is one
-/// node, so one allowance), and the bridge books that refusal as final: an
-/// `undeliverable` on the sender's lane, the record committed past, never
-/// retried. A burst sent with no bound therefore holds only while the reader
-/// keeps within 64 rows of the bridge — true while one fsync'd commit per
-/// delivery paces the bridge at ~100 messages/s, and false the moment a faster
-/// bridge (the commit batching this bench exists to measure) can deliver 64
-/// rows during one scheduling stall of the reader. So the sender keeps the
-/// allowance itself: unlisted rows from this node never exceed the posts in
-/// flight, and this keeps those under 64 with a margin. The burst is still
-/// back to back wherever the endpoint permits it — exactly what any sender
-/// that must not be refused can do.
 const BURST_WINDOW: usize = 56;
 
 /// aterm's per-peer allowance of unlisted rows (`aterm-gui` `SENDER_QUOTA`,
-/// crate-private there), which [`BURST_WINDOW`] stays under.
 const RECIPIENT_ALLOWANCE: usize = 64;
 const _: () = assert!(BURST_WINDOW < RECIPIENT_ALLOWANCE);
 
 /// Whether post `posted` (0-based) may go out with `listed` messages listed.
-/// Pure (unit-tested).
 fn may_post(posted: usize, listed: usize, window: usize) -> bool {
     posted < listed + window
 }
 
 /// The burst's flow control: the reader says how many messages it has listed,
-/// and the sender waits for room in [`BURST_WINDOW`] before each post.
 struct Credit {
     window: usize,
     /// `(listed, the reader has stopped)`.
@@ -425,8 +316,6 @@ impl Credit {
     }
 
     /// Wait until post `posted` may go out. `false` when the reader stopped
-    /// first: its own answer says why.
-    ///
     /// # Panics
     ///
     /// After [`DEADLINE`] with the reader still running and no room — the hang
@@ -452,7 +341,6 @@ impl Credit {
 }
 
 /// Closes its [`Credit`] when dropped — on the reader's unwind too, so a
-/// failed reader never leaves the sender waiting out the hang detector.
 struct CloseOnDrop<'a>(&'a Credit);
 
 impl Drop for CloseOnDrop<'_> {
@@ -462,8 +350,6 @@ impl Drop for CloseOnDrop<'_> {
 }
 
 /// Every `undeliverable` verdict in `sids`' inboxes, read with `--peek` (so
-/// nothing is released): what a refused delivery leaves on its sender's lane,
-/// for a failure message.
 fn refusals(w: &World, sids: &[String]) -> String {
     let mut ctl = w.ctl();
     let found: Vec<String> = sids
@@ -505,7 +391,6 @@ fn stop_and_read(w: &mut World) -> Vec<Rec> {
 }
 
 /// Run `phases` beside a head sampler on `w`'s broker: what they answered, and
-/// both heads over the run ([`Heads`]).
 fn sampled<T: Send>(w: &World, clock: Clock, phases: impl FnOnce() -> T + Send) -> (T, Heads) {
     let broker = w.broker.as_ref().expect("the world serves its own broker");
     let stop = AtomicBool::new(false);
@@ -531,14 +416,6 @@ fn ms_opt(a: Option<u64>, b: Option<u64>) -> Option<f64> {
 }
 
 /// THE LAST RECORDS, SEEN DURABLE. On a broker that serves ordered, wait until
-/// its durable head has caught up with its acked head as it stands now — the
-/// horizon's full flush, at most the horizon plus a batch and a flush away —
-/// so the phases' last records are seen durable before the sampler stops
-/// (without it, the burst's whole "every record durable" milestone falls
-/// after the run). Called after a world's timed phases, never inside one.
-/// Strict needs no wait (its two heads are one), and relaxed never flushes
-/// (its durable head does not move until a clean close), so neither waits.
-/// The wait is a hang detector, never a budget.
 fn await_durable(broker: &Broker) {
     if broker.served_durability().served != astream_broker::Tier::Ordered {
         return;
@@ -555,11 +432,7 @@ fn await_durable(broker: &Broker) {
     });
 }
 
-// the broker's flushes, counted
-
 /// The flushes a window cost: `after - before`, field by field, of
-/// [`Broker::flush_counts`] read at its two ends (under the log lock, so each
-/// count is between two whole batches; never inside a timed round trip).
 fn flushes_between(before: FlushCounts, after: FlushCounts) -> FlushCounts {
     FlushCounts {
         barrier: after.barrier - before.barrier,
@@ -570,7 +443,6 @@ fn flushes_between(before: FlushCounts, after: FlushCounts) -> FlushCounts {
 }
 
 /// A window's flushes for the report's JSON: the counts and each per delivered
-/// message.
 fn flushes_json(f: FlushCounts, n: usize) -> Value {
     let per = |v: u64| (n > 0).then(|| stats::round3(v as f64 / n as f64));
     json!({
@@ -585,8 +457,6 @@ fn flushes_json(f: FlushCounts, n: usize) -> Value {
 }
 
 /// A window's flushes for the report's tables: what a strict broker spends one
-/// full flush on per batch, an ordered one spends a barrier on, plus a full
-/// flush per escalated batch and per horizon; a relaxed one spends nothing.
 fn flushes_line(f: FlushCounts, n: usize) -> String {
     let per = |v: u64| {
         if n == 0 {
@@ -608,12 +478,6 @@ fn flushes_line(f: FlushCounts, n: usize) -> String {
 }
 
 /// The broker's RETENTION TICKS so far: how many it ran and how many it
-/// skipped because a compaction was under way (`BrokerStats::retention_ticks`
-/// and `retention_skips`). `0` and `0` on a broker nothing retains, which
-/// never ticks. A tick runs when a batch's bytes pass a rule's bound or the
-/// interval passes (`Broker::set_retention_interval`, a minute unless the arm
-/// names `retention_interval_ms=`); the bench's bytes are far below every
-/// rule's, so at the shipped interval a window holds none.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct Ticks {
     run: u64,
@@ -621,7 +485,6 @@ struct Ticks {
 }
 
 /// The broker's ticks now: read through `Broker::stats`, under the log lock,
-/// so never inside a timed round trip.
 fn ticks(broker: &Broker) -> Ticks {
     let stats = broker.stats();
     Ticks {
@@ -652,44 +515,13 @@ fn ticks_line(t: Ticks) -> String {
     )
 }
 
-// the yardstick: the disk, measured beside the stack
-
 /// Publishes in one yardstick block.
 const CALIBRATION_PUBLISHES: usize = 50;
 
 /// The producer id the yardstick publishes under. No bridge's (a bridge's is
-/// its own, bound to its node's cap), so its records never meet a bridge's
-/// dedup; its subject (`/f/<F>/bench/…`) is under no filter a bridge holds.
 const CALIBRATION_PRODUCER: u64 = 0x0fab_0be7_0000_0001;
 
 /// THE YARDSTICK: blocks of `CALIBRATION_PUBLISHES` bare publishes, one at a
-/// time, from a client in this process — one round trip each, no aterm, no
-/// bridge — of three kinds ([`Yardstick`]): to a STRICT broker (one full
-/// flush each: the unit), to an ORDERED one on an ordinary subject (one
-/// barrier each), and to the same ordered broker on a PERSON-LANE subject,
-/// which aterm's table escalates (one full flush each, before the ack). Every
-/// number above it is "some flushes plus aterm's work", and the flush is the
-/// machine's: on a shared host another job's writes stretch every
-/// `F_FULLFSYNC` (each one flushes the drive's whole cache). So each world
-/// runs a block of each before its phases and after, and the report divides
-/// by the strict yardstick's p50 as well as quoting milliseconds — a ratio
-/// taken in one run on one disk. The ordered and escalated blocks say what a
-/// barrier and an escalation cost on this disk at this moment, beside it.
-///
-/// WHAT IT DOES NOT CORRECT FOR: CPU contention. It times one thread's round
-/// trip and one flush; the phases above it hop through three processes and
-/// several threads, and on a loaded host each hop waits for a core the
-/// yardstick never asked for. The baseline's own runs show it (2026-10-16:
-/// 2.40 / 1.65 / 1.55 yardstick units for one build at load 15-28 and 12-13),
-/// so the ratio narrows the spread between runs and does not remove it; the
-/// ledger entry's load average is the only CPU measure. Reported, never
-/// judged.
-///
-/// THE UNIT IS ALWAYS STRICT. Under the ordered and relaxed arms the world's
-/// broker does not flush every ack in full, so its publishes would not time
-/// the disk; the strict block then publishes to a Strict broker of its own
-/// ([`Ruler`]), so every run's unit is the same full flush and the arms
-/// compare in it.
 fn calibrate(ruler: &Ruler, w: &World, clock: Clock, seq: &mut u64) -> Yardstick {
     let block = |c: &mut astream_broker::Client, subject: &str, seq: &mut u64| -> Vec<f64> {
         (0..CALIBRATION_PUBLISHES)
@@ -704,8 +536,6 @@ fn calibrate(ruler: &Ruler, w: &World, clock: Clock, seq: &mut u64) -> Yardstick
     };
     let mut strict = ruler.strict_client(w);
     let mut ordered = ruler.ordered_client();
-    // The person lane a bridge's `post to=h-bench` would land on: escalated by
-    // aterm's `Subject("/f/*/in/p/>")` rule, whoever writes it.
     let escalated = format!(
         "{}/note",
         aterm_link::subject::person_lane(FLEET, "h-bench", &w.node)
@@ -730,20 +560,12 @@ struct Yardstick {
     /// Bare publishes to a strict broker: the unit.
     strict: Vec<f64>,
     /// Bare publishes to an ordered broker (aterm's options, the default
-    /// horizon), on a subject its table does not escalate.
     ordered: Vec<f64>,
     /// The same, on a person-lane subject its table escalates.
     escalated: Vec<f64>,
 }
 
 /// The brokers the yardstick publishes to: for the strict block, the world's
-/// own when the world is Strict (what every run before the tier knob
-/// measured), else a Strict broker opened for it in the world's scratch
-/// directory; for the ordered and escalated blocks, always an ordered broker
-/// of its own, opened with aterm's ordered options (the default horizon and
-/// aterm's table), so the world's log holds none of their records. Each is
-/// served on its own socket and dropped with this. One flush per publish, on
-/// the same disk.
 struct Ruler {
     own: Option<(Broker, BrokerHandle)>,
     sock: String,
@@ -811,7 +633,6 @@ impl Ruler {
     }
 
     /// What the ordered blocks' broker serves (astream serves ordered strict
-    /// off Apple and off the boot volume): the report says, beside them.
     fn ordered_served(&self) -> astream_broker::ServedInfo {
         self.ordered.0.served_durability()
     }
@@ -827,12 +648,6 @@ impl Drop for Ruler {
 }
 
 /// BOOT ONE OF THE RUN'S WORLDS as the arm names it: its broker opened with
-/// [`opts_for`], retained by aterm's default rules unless the arm says
-/// `retention=off` (what `aterm link broker` opens: the rules at every open),
-/// its tick at the arm's interval when it names one, and the bridge's
-/// `--log off` when the arm says `log=off` (else the bridge's own default,
-/// `auto`, what ships). `env` is the `aterm` instance's extra environment,
-/// which its bridge child inherits ([`World::boot_arm`]).
 fn boot_world(tag: &str, spec: &Spec, env: &[(&str, &str)]) -> World {
     let flags: &[&str] = match spec.log {
         Log::Auto => &[],
@@ -849,9 +664,6 @@ fn boot_world(tag: &str, spec: &Spec, env: &[(&str, &str)]) -> World {
 }
 
 /// The options a run's world opens its broker with: aterm's own for the arm's
-/// tier ([`harness::broker_opts`]: the tier and, on a weak one, aterm's
-/// escalation table) — so the ordered arm measures aterm's real table — with
-/// the arm's horizon when it names one.
 fn opts_for(spec: &Spec) -> OpenOptions {
     use aterm_link::durability::Durability as Aterm;
     let mut opts = harness::broker_opts(match spec.durability {
@@ -932,8 +744,6 @@ fn fmt_x(v: Option<f64>) -> String {
     v.map_or("–".to_string(), |v| format!("{v:.2}"))
 }
 
-// 1. messaging
-
 /// One measured round trip.
 struct LatSample {
     text: String,
@@ -943,8 +753,6 @@ struct LatSample {
 }
 
 /// How finely [`latency`] watches for the previous message's commit to land:
-/// an atomic load of the in-process broker's head, so it costs the stack
-/// nothing.
 const IDLE_POLL: Duration = Duration::from_micros(100);
 
 /// What the latency phase measured.
@@ -952,41 +760,16 @@ struct LatRaw {
     /// The measured round trips.
     samples: Vec<LatSample>,
     /// Every round trip's text, warm-up included: each one's idle wait is
-    /// checked against the log after the run.
     texts: Vec<String>,
     /// The newest row id it listed.
     since: u64,
     /// The broker's flushes over the measured round trips: from just before
-    /// the first measured post to the end of the last one's idle wait (its
-    /// commit acked).
     flushes: FlushCounts,
     /// The broker's retention ticks over the same window ([`Ticks`]).
     ticks: Ticks,
 }
 
 /// The latency phase: `warmup + samples` round trips, one at a time.
-///
-/// ONE MESSAGE AT A TIME MEANS ON AN IDLE BRIDGE. The bridge delivers a record
-/// and commits its inbox cursor past it at the top of its next round, once no
-/// inbox record is queued behind it (`Bridge::round`; on an idle bridge, right
-/// after the delivery) — one more Strict append, after the row is already
-/// visible. A next post issued
-/// the moment the row shows up queues behind that commit, and its sample would
-/// carry the tail of the message before it (measured: about one fsync). So
-/// each round trip waits for the head to pass the record after the message's
-/// own before the next post. That record being the commit is an ASSUMPTION
-/// about today's bridge (the census shows the pair), and one no in-run read can
-/// check without asking the broker for it — so [`messaging`] checks it for
-/// every round against the log after the run ([`census::next_is_its_commit`]),
-/// and a bridge that writes anything between a delivery and its commit fails
-/// the run by name rather than leaving a fsync of tail in every sample.
-/// Back-to-back traffic is what [`burst`] measures.
-///
-/// ON AN ORDERED BROKER the wait is for the commit to be ACKED (the visible
-/// head), not durable: the next message is posted while the horizon's full
-/// flush may still be owed, as it would be in use, and when that flush lands
-/// inside a later round trip that round trip pays for it — which the full
-/// flush count and the p95 say.
 fn latency(w: &World, broker: &Broker, spec: &Spec, clock: Clock, a: &str, b: &str) -> LatRaw {
     let mut ctl = w.ctl();
     let mut since = newest_id(&mut ctl, b);
@@ -996,7 +779,6 @@ fn latency(w: &World, broker: &Broker, spec: &Spec, clock: Clock, a: &str, b: &s
     let mut ticks_before = ticks(broker);
     for i in 0..spec.warmup + spec.samples {
         if i == spec.warmup {
-            // Between two round trips: the last warm-up's commit is acked.
             flushes_before = broker.flush_counts();
             ticks_before = ticks(broker);
         }
@@ -1004,8 +786,6 @@ fn latency(w: &World, broker: &Broker, spec: &Spec, clock: Clock, a: &str, b: &s
         let (t_call, t_ret) = post(&mut ctl, clock, a, b, &text);
         let (woke_at, t_seen) =
             await_note(&mut ctl, clock, b, since).unwrap_or_else(|e| panic!("round trip {i}: {e}"));
-        // WHAT WOKE IT IS THIS POST, and nothing else arrived: checked, not
-        // assumed, so a stray row can never be timed as the message.
         let rows = list_since(&mut ctl, b, since);
         assert!(
             rows.len() == 1 && rows[0].text == text && rows[0].id == woke_at,
@@ -1047,21 +827,14 @@ struct BurstRaw {
     /// Each message's row, by index ([`tally`]: each seen exactly once).
     seen: Vec<Seen>,
     /// The broker's BATCHES over the burst: writer batches that appended a
-    /// record, from just before the first post to the record past the last
-    /// message (the burst's commit) — on the Strict log one full flush each,
-    /// on the Ordered one one barrier each: the cost pipelining folds
-    /// ([`burst`]). (Entries before the ordered arm called these
-    /// `broker_flushes`: on their strict broker the two were one.)
     batches: u64,
     /// The flushes those batches cost, by kind, over the same window
-    /// ([`Broker::flush_counts`]).
     flushes: FlushCounts,
     /// The broker's retention ticks over the same window ([`Ticks`]).
     ticks: Ticks,
 }
 
 /// The burst phase, reading `b`'s inbox on from row `since` (the latency
-/// phase's last).
 fn burst(
     w: &World,
     broker: &Broker,
@@ -1080,8 +853,6 @@ fn burst(
         "every burst sender's presence row to say live",
     );
     let mut ctl = w.ctl();
-    // ONE WARM-UP POST PER SENDER, consumed before the clock starts: a
-    // session's first post creates its per-session state on the bridge.
     for (i, s) in senders.iter().enumerate() {
         post(&mut ctl, clock, s, b, &format!("warm-{i}"));
     }
@@ -1091,8 +862,6 @@ fn burst(
 
     let n = spec.burst;
     let credit = Credit::new(BURST_WINDOW);
-    // Read under the log lock (`Broker::stats`), so each count is between two
-    // whole batches; outside the timed window at both ends.
     let flushed = || {
         let stats = broker.stats();
         stats.writer_batches - stats.empty_batches
@@ -1124,20 +893,6 @@ fn burst(
     let seen = tally(&consumed.seen, n)
         .unwrap_or_else(|e| panic!("burst: every message is seen exactly once, but {e}"));
 
-    // THE FENCE bounds the burst's window by the commit covering its last
-    // message. The bridge commits its inbox cursor at the top of a round once
-    // no inbox record is queued (`Bridge::round`; within a burst, also every
-    // `INBOX_COMMIT_EVERY` records), so that commit is the bridge's next write
-    // after the last delivery, and the fence is posted only once the log holds
-    // a record past the burst's last one (the latency phase's idle wait). That
-    // is not proof: a round that drains aterm's outbox ahead of its flush (a
-    // roster round, `Bridge::roster_backstop`) could still publish the fence
-    // first and fold it into the burst's commit, which would put the fence's
-    // round trip in the burst's numbers. So [`messaging`] checks against the
-    // log after the run that the commit landed before the fence's record
-    // ([`census::lands_before`]), and fails the run by name if not. Read on
-    // from the burst reader's last row, so a late repeat of a burst message is
-    // a stray here.
     let b_last = consumed.seen.iter().map(|s| s.off).max().unwrap_or(0);
     aterm_spec::wait::within(DEADLINE, IDLE_POLL, || {
         (broker.visible_head() > b_last + 1).then_some(())
@@ -1163,11 +918,6 @@ fn burst(
 }
 
 /// What a world's broker serves, in one line for its section: the tier in
-/// force, the one asked, why they differ, the horizon and the rule count —
-/// read from the broker itself (astream serves ordered strict off Apple and
-/// off the boot volume), never from the arm's word — and what it retains,
-/// read from it too (its retention rules and its tick's interval), beside the
-/// bridge's `--log` the arm set.
 fn served_line(w: &World, spec: &Spec) -> String {
     let broker = w.broker.as_ref().expect("the world serves its own broker");
     let s = broker.served_durability();
@@ -1240,9 +990,6 @@ fn messaging(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
     let recs = stop_and_read(&mut w);
     let lane = format!("/f/{FLEET}/in/{}/{b}/{}/note", w.node, w.node);
     let group = aterm_link::subject::inbox_group(FLEET, &w.node);
-    // Every text this run sent is unique, so ONE record per text: a second is
-    // a message the bus holds twice, named here rather than letting one record
-    // shadow the other in the lookup.
     let mut on_lane: HashMap<&str, &Rec> = HashMap::new();
     for r in recs.iter().filter(|r| r.subject == lane) {
         if let Some(first) = on_lane.insert(r.text.as_str(), r) {
@@ -1259,7 +1006,6 @@ fn messaging(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
             .unwrap_or_else(|| panic!("no record of `{text}` on {lane}"))
             .seq
     };
-    // THE IDLE-BRIDGE WAIT HELD: every round trip's next record was its commit.
     for text in &lat_raw.texts {
         census::next_is_its_commit(&recs, &group, seq_of(text)).unwrap_or_else(|e| {
             panic!(
@@ -1271,7 +1017,6 @@ fn messaging(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
     }
     let lat = &lat_raw.samples;
 
-    // --- latency
     let mut post_call = Vec::new();
     let mut deliver = Vec::new();
     let mut end_to_end = Vec::new();
@@ -1298,7 +1043,6 @@ fn messaging(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
         census::covering_commit(&recs, &group, lat_last, lat_last).map_or(lat_last, |r| r.seq);
     let lat_census = census::census(census::window(&recs, lat_lo, lat_hi));
 
-    // --- burst
     let n = bur.rets.len();
     let mut b_deliver = Vec::new();
     let mut b_to_acked = Vec::new();
@@ -1336,8 +1080,6 @@ fn messaging(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
     let t_all_durable = latest(&durable_all);
     let b_lo = seqs.iter().copied().min().unwrap_or(0);
     let b_last = seqs.iter().copied().max().unwrap_or(0);
-    // THE FENCE HELD: the burst's commit landed before the fence's record, so
-    // the window it bounds holds no part of the fence's round trip.
     census::lands_before(&recs, &group, b_last, seq_of("fence-0")).unwrap_or_else(|e| {
         panic!(
             "the burst's window ends at the commit covering its last message, and {e} — so the \
@@ -1520,13 +1262,10 @@ fn messaging(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
     (json, md)
 }
 
-// 2. attach
-
 /// One bridge restart.
 struct Round {
     sessions: usize,
     /// The visible head just before the kill: every record the new bridge
-    /// writes is at or past it.
     mark: u64,
     /// The restarted bridge's pid: its node row names it.
     pid: i32,
@@ -1534,7 +1273,6 @@ struct Round {
     t_pid: u64,
     sids: Vec<String>,
     /// THE LIVE MAIL ([`attach`]): its text, and the moment it was visible
-    /// in its recipient's inbox.
     mail: String,
     t_mail_seen: u64,
 }
@@ -1549,7 +1287,6 @@ fn read_pid(w: &World) -> Option<i32> {
 }
 
 /// Where one bridge's attach landed: its node row, and each session's row in
-/// the order the sessions were named.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AttachRows {
     node: u64,
@@ -1558,8 +1295,6 @@ struct AttachRows {
 
 impl AttachRows {
     /// The last of them, the node row included: when the attach is done. (A
-    /// bridge that wrote its node row after a session's would otherwise be
-    /// "done" before its node said live.)
     fn last(&self) -> u64 {
         self.sessions
             .iter()
@@ -1576,18 +1311,6 @@ impl AttachRows {
 }
 
 /// Where the bridge `pid` published its attach among `rows` — `(offset,
-/// subject, body head line)`, all at or past the round's mark: its node row
-/// (`state=live … pid=<pid>`) and, under that row's `inc=`, each of
-/// `session_subjects`' first live row. `None` until every one is there. Pure
-/// (unit-tested).
-///
-/// KEYED ON THE NEW BRIDGE'S OWN MARKS, not on "the first live row past the
-/// mark": a row the killed bridge wrote just before it died (a roster round's
-/// republish) lands past the mark too, and it is not this attach. The node row
-/// names the bridge's pid, and every session row the same bridge writes carries
-/// the node row's incarnation (`bring_presence_up`, `publish_session_presence`).
-/// No order is assumed between the rows: a bridge that publishes a session's
-/// row before its node's is read the same way.
 fn attach_rows(
     rows: &[(u64, &str, &str)],
     node_subject: &str,
@@ -1614,18 +1337,6 @@ fn attach_rows(
 }
 
 /// THE ATTACH'S STOP SIGNAL, with nothing asked of the broker inside the timed
-/// window: read `watch` — a subscription to the node's presence rows from the
-/// round's mark, opened BEFORE the kill — until the bridge `pid` has published
-/// its whole attach ([`attach_rows`]).
-///
-/// WHY A SUBSCRIPTION AND NOT A POLL. The stop TIME is read off the log after
-/// the run; this only has to know the attach is over before the next round. A
-/// `last_all` poll would answer that by scanning the subject index under the
-/// broker's log lock every 10 ms — the lock the writer takes for the very
-/// Strict appends being timed. A subscription costs the broker what each of the
-/// bridge's own subscribers costs it: a short lock per commit to copy the new
-/// records out. Its setup (the `Subscribe` request and its catch-up) happens
-/// before the clock starts.
 fn await_attach(
     watch: &mut Subscription,
     node_subject: &str,
@@ -1642,8 +1353,6 @@ fn await_attach(
         if attach_rows(&rows, node_subject, session_subjects, pid).is_some() {
             return;
         }
-        // Marks keep arriving on an idle subscription, so the read timeout
-        // alone would never fire: the hang detector is this deadline.
         assert!(
             Instant::now() < deadline,
             "the restarted bridge (pid {pid}) did not publish its attach within {DEADLINE:?}; \
@@ -1663,10 +1372,8 @@ fn await_attach(
 #[derive(Default)]
 struct AttachRecords {
     /// Each round's census of the attach, the killed bridge's fired will left
-    /// out.
     censuses: Vec<census::Census>,
     /// Each round's fired wills: records the KILL caused (the broker publishing
-    /// the dead bridge's `state=gone` node row), landing inside the window.
     fired: Vec<usize>,
 }
 
@@ -1691,7 +1398,6 @@ impl AttachRecords {
 }
 
 /// The attach world: grow the population, restart the bridge `rounds` times
-/// at each size, census.
 fn attach(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
     eprintln!("fabric bench: booting the attach world");
     let mut w = boot_world("fbench-att", spec, &[]);
@@ -1707,9 +1413,6 @@ fn attach(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
     let cal_before = calibrate(&ruler, &w, clock, &mut cal_seq);
     let (rounds, heads) = sampled(&w, clock, || {
         let broker = w.broker.as_ref().expect("the world serves its own broker");
-        // THE LIVE MAIL's sender and recipient: the boot session, writing to
-        // itself, so every population has it (sessions are never added for
-        // it). Its control connection is opened here, outside every window.
         let mut mail_ctl = w.ctl();
         let mut mail_since = newest_id(&mut mail_ctl, &first);
         let mailer = first.clone();
@@ -1742,11 +1445,6 @@ fn attach(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
                     .expect("bound the presence subscription");
                 let t_kill = clock.us();
                 harness::kill(pid, 9);
-                // THE LIVE MAIL, queued the moment the bridge is gone: aterm
-                // holds it in the session's outbox, and only the new bridge
-                // can publish it, after its presence rows, the bus mirror's
-                // start (`--log auto` over a retaining broker) and the refill the
-                // rows owe (`Bridge::attach`), when its live drain starts.
                 let mail = format!("live-{}", rounds.len());
                 post(&mut mail_ctl, clock, &mailer, &mailer, &mail);
                 let new_pid = aterm_spec::wait::within(DEADLINE, PID_POLL, || {
@@ -1756,8 +1454,6 @@ fn attach(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
                 let t_pid = clock.us();
                 pid = new_pid;
                 up_since = Instant::now();
-                // Parked before the mail can land: the new bridge has only
-                // just written its pid, and its attach's rows come first.
                 let (woke_at, t_mail_seen) = await_note(&mut mail_ctl, clock, &mailer, mail_since)
                     .unwrap_or_else(|e| panic!("the live mail `{mail}`: {e}"));
                 let listed = list_since(&mut mail_ctl, &mailer, mail_since);
@@ -1788,7 +1484,6 @@ fn attach(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
     let recs = stop_and_read(&mut w);
     let fired = census::will_firings(&recs);
 
-    // Each round, read off the log: where the new bridge's rows landed.
     let mut by_size: BTreeMap<usize, Vec<Value>> = BTreeMap::new();
     let mut series: BTreeMap<usize, [Vec<f64>; 8]> = BTreeMap::new();
     let mut records: BTreeMap<usize, AttachRecords> = BTreeMap::new();
@@ -1812,10 +1507,6 @@ fn attach(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
         let t_all = heads.acked.landed(last);
         let t_last_session = found.last_session().and_then(|s| heads.acked.landed(s));
         let t_all_durable = heads.durable.landed(last);
-        // THE LIVE MAIL IS THE NEW BRIDGE'S: one record on the mailer's own
-        // lane, landing after the new bridge's node row (the killed bridge
-        // was gone before it was posted), and never part of the attach's
-        // census.
         let mail_lane = format!("/f/{FLEET}/in/{}/{}/{}/note", w.node, r.sids[0], w.node);
         let mut mails = recs
             .iter()
@@ -1999,11 +1690,7 @@ fn attach(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
     (json, md)
 }
 
-// the run
-
 /// What the run's broker promised, for the report's head and its JSON. Each
-/// world's section also says what its broker SERVES, read from the broker
-/// (astream serves ordered strict off Apple and off the boot volume).
 fn broker_note(spec: &Spec) -> String {
     match spec.durability {
         Tier::Strict => "astream Broker::open_opts with aterm's strict options (Durability::Strict: \
@@ -2030,10 +1717,6 @@ fn broker_note(spec: &Spec) -> String {
 }
 
 /// What the run's broker RETAINS and what the bridge mirrors, for the
-/// report's head beside [`broker_note`]: what ships (aterm's default rules at
-/// every open, the bridge's `--log auto`, astream's minute between ticks)
-/// unless the arm names otherwise. Each world's section says what its broker
-/// was read to hold.
 fn retention_note(spec: &Spec) -> String {
     let rules = if spec.retention {
         "retained by aterm's default rules, set at every open \
@@ -2075,12 +1758,9 @@ fn measure_scenario(
     }
 }
 
-/// Measure everything `spec` names. Unselected JSON sections are null.
+/// Measure everything `spec` names.
 #[must_use]
 pub fn measure(spec: &Spec) -> Report {
-    // ONE BINARY THROUGHOUT. Read before the first launch and after the last
-    // (the supervisor re-launches the bridge by path on every attach round);
-    // the lane holds both to what its own build wrote.
     let binary_at_start = binary_identity();
     let clock = Clock::start();
     let started = Instant::now();
@@ -2113,9 +1793,6 @@ pub fn measure(spec: &Spec) -> Report {
     md.extend(attach_md);
     md.extend(handoff_md);
     let binary_at_end = binary_identity();
-    // THE ARM IS THE BINARY'S. `harness::aterm()` is the window and, through the
-    // seam, the bridge; cargo built it, and this test (which holds the broker),
-    // under one profile, whose directory it sits in.
     let arm = Profile::of_binary(Path::new(harness::aterm()));
     let json = json!({
         "schema": "aterm-fabric-bench-v1",
@@ -2141,7 +1818,6 @@ pub fn measure(spec: &Spec) -> Report {
 }
 
 /// [`profile::identity`] of the harness's `aterm`, or why it could not be read,
-/// which the lane takes as no identity.
 fn binary_identity() -> String {
     profile::identity(Path::new(harness::aterm()))
         .unwrap_or_else(|why| format!("unreadable: {why}"))
@@ -2173,7 +1849,6 @@ mod tests {
         assert_eq!(json["measured"].as_str(), Some("pingpong"));
         assert_eq!(markdown, ["pingpong"]);
 
-        // The omitted/default selection still starts every phase exactly once.
         calls.set(0);
         for phase in [
             Scenario::Messaging,
@@ -2195,14 +1870,6 @@ mod tests {
     }
 
     /// EACH ARM OPENS ITS BROKER AS ATERM OPENS IT: aterm's options for the
-    /// tier — the escalation table on the weak tiers, none on strict — and
-    /// the arm's horizon on ordered, aterm's own unless named. The std-only
-    /// spec's spelling of that horizon is aterm's.
-    ///
-    /// THE DEFAULT ARM IS WHAT ATERM SHIPS: a bare spec opens the broker as
-    /// aterm opens its guarded one by default
-    /// (`aterm_link::durability::default_for`), so a bare `verify perf
-    /// fabric` measures that configuration and moves with it.
     #[test]
     fn each_arm_opens_its_broker_with_aterms_options() {
         use super::*;
@@ -2281,8 +1948,6 @@ mod tests {
             tally(&[seen(1, 11), seen(0, 10)], 2),
             Ok(vec![seen(0, 10), seen(1, 11)])
         );
-        // THE REPEAT THAT ARRIVES WITH THE LAST MESSAGE: n + 1 rows holding n
-        // distinct messages, which a count of distinct indices calls complete.
         assert_eq!(
             tally(&[seen(0, 10), seen(1, 11), seen(1, 11)], 2),
             Err(Miscount::Twice {
@@ -2291,7 +1956,6 @@ mod tests {
                 again: 11
             })
         );
-        // The bus holding one message twice: two offsets.
         assert_eq!(
             tally(&[seen(0, 10), seen(0, 12), seen(1, 11)], 2),
             Err(Miscount::Twice {
@@ -2311,20 +1975,15 @@ mod tests {
     fn the_burst_never_has_more_in_flight_than_its_window() {
         use super::*;
 
-        // A window of 3: posts 0, 1 and 2 go with nothing listed; post 3 waits
-        // for the reader to list one.
         assert!(may_post(2, 0, 3));
         assert!(!may_post(3, 0, 3));
         assert!(may_post(3, 1, 3));
         let credit = Credit::new(2);
         assert!(credit.acquire(0) && credit.acquire(1));
         std::thread::scope(|s| {
-            // The reader lists one, which is what lets post 2 out; the wait is
-            // the hang detector's, never a budget.
             s.spawn(|| credit.listed(1));
             assert!(credit.acquire(2));
         });
-        // A reader that stopped lets nothing more out, and says so at once.
         let closed = Credit::new(2);
         drop(CloseOnDrop(&closed));
         assert!(!closed.acquire(2));
@@ -2340,8 +1999,6 @@ mod tests {
         let sb = "/f/f1/pub/n-1/s-b/presence".to_string();
         let both = [sa.clone(), sb.clone()];
         let rows = vec![
-            // The killed bridge's will, fired; then a republish it wrote just
-            // before it died — past the mark, and not this attach.
             (10, node, "v=1 state=gone inc=4 fabric=disconnected"),
             (11, sa.as_str(), "v=1 inc=4 state=live"),
             (12, node, "v=1 state=live inc=5 pid=77"),
@@ -2359,8 +2016,6 @@ mod tests {
         assert_eq!(found.last(), 14);
         assert_eq!(attach_rows(&rows[..4], node, &both, 77), None, "s-a owed");
         assert_eq!(attach_rows(&rows, node, &both, 78), None, "another pid's");
-        // A bridge that writes its node row LAST: the attach ends there, and
-        // the per-session part is negative.
         let node_last = vec![
             (20, sa.as_str(), "v=1 inc=6 state=live"),
             (21, node, "v=1 state=live inc=6 pid=80"),

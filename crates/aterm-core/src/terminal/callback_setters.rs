@@ -261,7 +261,7 @@ impl Terminal {
     /// LZ4 promotion off the PTY-drain path. See
     /// [`Grid::set_compress_offload_active`](aterm_grid::Grid::set_compress_offload_active).
     #[inline]
-    pub fn set_compress_offload_active(&mut self, active: bool) {
+    pub const fn set_compress_offload_active(&mut self, active: bool) {
         let target = if self.modes.alternate_screen {
             self.alt_grid.as_mut()
         } else {

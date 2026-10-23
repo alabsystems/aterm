@@ -1,44 +1,14 @@
 // SPDX-License-Identifier: MIT
 // Copyright 2026 Andrew Yates
-//
-// `aterm-gpu-web`: the GPU sibling of `aterm-wasm`. The same engine front-end
-// (`aterm-core`), drawn by `aterm-gpu` on WebGL2 straight into a `<canvas>` (or
-// `OffscreenCanvas`) surface, with no CPU readback on the present path. WebGPU is
-// refused. The JS surface is aterm-wasm's, with the same contracts and
-// boundary-type shapes, less the CPU framebuffer pointer `rgba_ptr` and plus the
-// GPU-only exports; aterm-effects' `web_binding_parity` enforces it.
-//
-// Init is synchronous: nothing in WebGL2 bring-up waits. The canvas crosses
-// as a JS object (`aterm_gpu::web::HtmlCanvasElement`) and aterm-gpu's GL arm
-// makes its WebGL2 context on it through the module's `aterm_gl` imports.
-// `render` draws the grid via `present_input`; `render_offscreen` plus `rgba`/
-// `width`/`height` read the framebuffer back so an e2e harness can pixel-compare
-// GPU against CPU.
-//
-// Construction, resize, zoom, chrome and render admission use the CPU twin's
-// shared 256 MiB per-frame bound, including committed message rows. The browser
-// ABI throws Result errors as strings; successful void operations still return
-// undefined. Rejected resize/zoom/chrome leave state intact. Font/line-height
-// setters can change geometry independently; a later render then refuses an
-// oversized frame until the host corrects it.
 
-// What JS sees is marked `#[export]` (aterm-wasm-abi), and `verify glue` writes
-// the module's JS glue from it.
 #[cfg(target_arch = "wasm32")]
 use aterm_wasm_abi::export;
 
-// The allocator and return slot the glue calls.
 #[cfg(target_arch = "wasm32")]
 aterm_wasm_abi::export_runtime!();
 
-// The terminal type the binding modules shared by aterm-wasm and
-// aterm-gpu-web extend (aterm-gpu-web mounts them by `#[path]`).
 use crate::AtermGpuTerminal as WebTerminal;
 
-// Expands a shared module's `bind!` — its exported impl — onto this crate's
-// terminal under this crate's export attribute, as aterm-wasm does. The
-// attribute names the JS class after the impl's type, a bare identifier, so
-// the name is brought into the shared module here.
 macro_rules! web_terminal_impl {
     ($bind:ident) => {
         use crate::AtermGpuTerminal;
@@ -75,31 +45,18 @@ use aterm_core::terminal::{BlockText, ClipboardAccess, CursorStyle, MouseMode, R
 use aterm_effects::pipeline::EffectsPipeline;
 use aterm_render::{RenderInput, Renderer, SpillBand, Theme};
 
-// Cooperative (thread-free) width-reflow offload: `resize` detaches the tiered
-// history in O(1) and each `pump_reflow` (host-called, or a render-grace /
-// output-backlog safety net) advances one budget-bounded `reflow_step` slice,
-// so no event-loop task grows with session history.
-
 /// Histories at or below this many lines are rewrapped inline by `resize`, as in
-/// aterm-gui and aterm-wasm.
 const INLINE_REFLOW_MAX_LINES: usize = 20_000;
 
 /// Safety net for a host that never pumps: after this many `render` /
-/// `render_offscreen` calls with a stashed rewrap (~2 s at 60 fps), each frame
-/// runs one budgeted step.
 const REFLOW_PUMP_GRACE_RENDERS: u32 = 120;
 
 /// Safety net for a host that never renders or pumps: past this lazy-buffer
-/// backlog, every `process` call pumps one budgeted step, so the rewrap
-/// converges in short tasks.
 const REFLOW_BACKLOG_MAX_LINES: usize = 20_000;
 
 /// Default per-pump rewrap budget in input history lines (tunable via
-/// [`AtermGpuTerminal::pump_reflow_budget`]); a few milliseconds of work.
 const REFLOW_STEP_BUDGET_LINES: usize = 2_000;
 
-// GpuContext is used only by the wasm init path (`init`); on the native
-// target (a compile-verification surface only) it would be unused.
 #[cfg(target_arch = "wasm32")]
 use aterm_gpu::GpuContext;
 #[cfg(any(target_arch = "wasm32", test))]
@@ -108,14 +65,11 @@ use aterm_gpu::{GpuRenderer, GpuSurface, WindowGpu};
 
 std::thread_local! {
     /// Host-registered font blobs, copied across the JS/wasm boundary once per
-    /// module. Engines reference them by `u32` handle, so large face blobs are
-    /// never re-copied (or left fragmenting linear memory) per pane.
     static REGISTERED_FONTS: std::cell::RefCell<Vec<std::sync::Arc<Vec<u8>>>> =
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// Register a font blob for handle-based reuse by every engine in this module.
-/// Content-interned: identical bytes return a handle to one shared copy.
 #[cfg_attr(target_arch = "wasm32", export)]
 pub fn register_font(bytes: &[u8]) -> u32 {
     let arc = aterm_render::intern_font_bytes_slice(bytes);
@@ -139,122 +93,57 @@ fn registered_font(handle: u32) -> Result<std::sync::Arc<Vec<u8>>, String> {
     })
 }
 
-/// Construction is split to match the browser lifecycle:
-///   1. [`AtermGpuTerminal::new`] — synchronous: engine grid plus a CPU face
-///      from injected font bytes (cell metrics, glyph atlas). No GPU yet.
-///   2. [`AtermGpuTerminal::init`] — synchronous too: acquire the GPU and
-///      configure the canvas surface. If WebGL is unavailable the host can
-///      fall back to the CPU path (`aterm-wasm`) without having built
-///      anything GPU-side.
+/// Construction is split to match the browser lifecycle: 1.
 #[cfg_attr(target_arch = "wasm32", export)]
 pub struct AtermGpuTerminal {
     term: Terminal,
-    // CPU face: glyph rasterizer and cell metrics, used for cols/rows sizing.
     cpu: Renderer,
     rows: usize,
     cols: usize,
     theme: Theme,
-    // Read by `gpu_face`, which rebuilds the face from these.
     font_bytes: Vec<u8>,
-    // GPU side: `None` until `init` succeeds.
     gpu: Option<GpuState>,
-    // The last `render_offscreen` frame as RGBA8 (width*height*4 bytes).
     #[cfg(target_arch = "wasm32")]
     rgba: Vec<u8>,
     #[cfg(target_arch = "wasm32")]
     fb_width: usize,
     #[cfg(target_arch = "wasm32")]
     fb_height: usize,
-    // Smart-selection rules for link detection (`link_at`).
     smart: SmartSelection,
-    // Host-injected faces, kept so `gpu_face` can re-apply them to the fresh face
-    // `init` builds from `font_bytes`. Interned Arcs shared across panes.
     fallback_font: Option<std::sync::Arc<Vec<u8>>>,
-    // Further fallback faces from `add_fallback_font`, most-preferred first.
     fallback_chain_extra: Vec<std::sync::Arc<Vec<u8>>>,
     emoji_font: Option<std::sync::Arc<Vec<u8>>>,
-    // Host-injected bold face (`set_bold_font`).
     bold_font: Option<std::sync::Arc<Vec<u8>>>,
-    // Host-injected symbol fallback face (`set_symbol_font`).
     symbol_font: Option<std::sync::Arc<Vec<u8>>>,
-    // Host-selected text shaping (ligatures, OpenType `font_features`).
     text_shaping: aterm_render::TextShapingConfig,
-    // Per-frame engine snapshot, refilled in place (damaged rows only when the
-    // continuity proof holds).
     frame_scratch: RenderInput,
-    // Which arm the last `refill_frame_scratch` took (`None` before the first).
     #[cfg(test)]
     last_refill: Option<aterm_core::render::FrameRefill>,
-    // The shared visual-effects pipeline, host-clocked via `advance_effects`.
     pub(crate) effects: EffectsPipeline,
-    // Theme cursor colour (0x00RRGGBB): the default glow/trail colour.
     pub(crate) theme_cursor: u32,
-    // Theme colours the PHOSPHOR resolver needs.
     pub(crate) theme_fg: u32,
     pub(crate) theme_bg: u32,
-    // Bounded OSC 9/99/777 notification queue (`take_notifications`).
     pub(crate) notifications: notifications_api::NotificationQueue,
-    // The message band, composed above the grid. With no committed row a frame
-    // is byte-identical to a band-less one.
     pub(crate) band: messages_api::WebBand,
-    // Sub-row scroll accumulator for fractional/pixel wheel deltas.
     pub(crate) scroll_input: scroll_input_api::ScrollInputState,
-    // Predictive local echo; inert until `set_predictive_echo`.
     pub(crate) predict: aterm_predict::Predictor,
-    // Row buffers for the predictor: `Predictor::reconcile_seen` observes the
-    // same row once per retired guess and once per tail scan, and
-    // `Terminal::logical_row_into` refills these instead of allocating and
-    // re-resolving each time; the cursor row a run's first keypress hands the
-    // predictor lives here too.
     pub(crate) pred_row_scratch: predict_api::PredRows,
-    // Chrome-band spill rasterizer (cross-pane window-space effects export),
-    // refreshed per render from the CPU face's geometry.
     pub(crate) spill: SpillBand,
-    // A deferred width-change scrollback rewrap: `Some` while the tiered history
-    // is detached awaiting pumps.
     pending_reflow: Option<PendingScrollbackReflow>,
-    // Render-call countdown for safety net #1 (`REFLOW_PUMP_GRACE_RENDERS`).
     reflow_grace: u32,
-    // Per-pump `reflow_step` budget in input lines (`pump_reflow_budget`).
     reflow_budget: usize,
-    // Single-slot cache of the last display row read cell by cell (`cell_text` /
-    // `cell_is_wide`): a scrolled-back row is materialized from scrollback, so a
-    // per-cell walk would cost O(cols²) per row.
     display_row_cache: std::cell::RefCell<GpuDisplayRowCache>,
-    // This pane's membership in the module-global scrollback byte budget;
-    // the share is applied at frame/drain boundaries.
     pub(crate) budget_share: aterm_core::terminal::scrollback_shared_budget::ScrollbackBudgetShare,
-    // Host half of the frame-gate key: bumped by every wasm-layer mutator of
-    // renderer-held or presentation state that the engine's damage epoch cannot
-    // see. `open_frame` reads it, so a mutator that forgets to bump serves a
-    // stale frame. Over-bumping costs one frame. Pinned by
-    // `every_visual_mutator_bumps_the_host_visual_generation`.
     host_visual_gen: u64,
-    // Gate key of the last frame built and presented. `None` means the canvas
-    // cannot be assumed to hold any frame of ours: after construction, `init`,
-    // a failed present, or an offscreen readback.
     last_frame_key: Option<FrameGateKey>,
-    // `scroll_frac_px` of the last presented frame. Releasing a sub-row
-    // residual moves every pixel without grid damage, so the gate renders one
-    // more frame after a nonzero residual.
     last_present_frac: i32,
-    // Whether the last `render` was gated (`last_render_skipped`).
     last_render_gated: bool,
-    // Last blink phase handed to the renderer, so re-asserting it does not force
-    // a render.
     blink_phase_shadow: Option<bool>,
-    // The same for the hollow-cursor override.
     hollow_shadow: Option<bool>,
-    // Named themes, splits and registered themes (the shared theme_api): the
-    // selector on screen and the host's last appearance.
     pub(crate) web_theme: theme_api::WebThemeState,
 }
 
 /// Frame-gate key: every input of a rendered frame that can change between two
-/// `render()` calls at stable dims/config. Grid content folds into
-/// `damage_epoch`, host visual state into `host_visual_gen`; the effects
-/// active->idle edge changes the key so the cleared overlays paint once.
-/// Identical to `aterm-wasm`'s key.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct FrameGateKey {
     damage_epoch: u64,
@@ -266,20 +155,12 @@ struct FrameGateKey {
 #[derive(Default)]
 struct GpuDisplayRowCache {
     /// `(alt_screen, content_gen, display_offset, row)` the cached cells were
-    /// resolved at. Main and alt grids keep independent `content_gen` counters,
-    /// so the alt-screen bit is needed to invalidate on a screen swap.
     key: Option<(bool, u64, usize, u16)>,
     /// `(grapheme, is_wide)` per display column of `key.row`.
     cells: Vec<(String, bool)>,
 }
 
 /// Keep the engine's implicit cells and OSC 110/111/112/117 reset baselines
-/// aligned with the renderer theme: frame refills take sparse row tails and
-/// selection colours from `Terminal`, so a renderer-only theme change is lost.
-///
-/// The baseline moves through [`Terminal::rebase_colors`], so a program's OSC
-/// 10/11/12/17 colours survive a host theme change, as they survive a native
-/// reload; the palette and the selection foreground keep their current baseline.
 #[inline]
 fn apply_terminal_theme_colors(term: &mut Terminal, fg: u32, bg: u32, cursor: u32, selection: u32) {
     let mut base = term.color_baseline();
@@ -294,13 +175,10 @@ fn apply_terminal_theme_colors(term: &mut Terminal, fg: u32, bg: u32, cursor: u3
 struct GpuState {
     renderer: GpuRenderer,
     surface: GpuSurface,
-    // Per-window present state (the prior frame, for the scissored present).
     win: WindowGpu,
 }
 
 /// Convert the GPU crate's typed swapchain failure into the string error
-/// exposed across the module boundary; target-neutral so native tests can prove a
-/// dropped present never becomes `Ok(())`.
 #[cfg(any(target_arch = "wasm32", test))]
 fn webgl_present_result(result: Result<(), SurfacePresentFailure>) -> Result<(), String> {
     result.map_err(|failure| format!("WebGL canvas present failed: {failure:?}"))
@@ -309,25 +187,17 @@ fn webgl_present_result(result: Result<(), SurfacePresentFailure>) -> Result<(),
 #[cfg(any(target_arch = "wasm32", test))]
 impl AtermGpuTerminal {
     /// The CPU face `init` builds the GPU renderer on: from the injected font
-    /// bytes at the live face's px, without system font discovery, carrying every
-    /// face and setting the host applied before init. The band's parity test
-    /// draws on this same face.
     fn gpu_face(&self) -> Result<Renderer, String> {
         let mut cpu = Renderer::from_bytes(&self.font_bytes, self.cpu.px(), self.theme)?;
         cpu.set_runtime_font_discovery(false);
-        // Re-apply everything the host set before init: the fresh face is built
-        // from `font_bytes` alone with default settings.
         if let Some(bytes) = self.fallback_font.as_deref() {
             cpu.set_fallback_bytes(bytes)?;
         }
-        // The rest of the chain, in order, after the reset base above.
         for bytes in &self.fallback_chain_extra {
             cpu.add_fallback_bytes(bytes)?;
         }
         if let Some(arc) = self.emoji_font.as_ref() {
             // Already an interned Arc: install the shared blob rather than
-            // deep-copying the ~180 MB colour face per pane (wasm memory never
-            // shrinks).
             cpu.set_color_font_arc(std::sync::Arc::clone(arc))?;
         }
         if let Some(bytes) = self.bold_font.as_deref() {
@@ -336,12 +206,7 @@ impl AtermGpuTerminal {
         if let Some(bytes) = self.symbol_font.as_deref() {
             cpu.set_symbol_fallback_bytes(bytes)?;
         }
-        // Read normalized settings from the live CPU face, including rejected
-        // requests that left the last valid setting in place.
         cpu.set_line_height(self.cpu.line_height());
-        // Re-apply the host's text shaping (ligatures + font_features): the fresh face
-        // above starts at TextShapingConfig::default(), so a setting chosen before init
-        // would otherwise be lost — same retention contract as the fallback/emoji faces.
         cpu.set_text_shaping(self.text_shaping.clone());
         cpu.set_minimum_contrast(self.cpu.minimum_contrast());
         cpu.set_background_opacity(self.cpu.background_opacity());
@@ -351,9 +216,6 @@ impl AtermGpuTerminal {
         cpu.set_selection_fg(self.cpu.selection_fg());
         cpu.set_selection_inactive(self.cpu.selection_inactive());
         cpu.set_selection_inactive_bg(self.cpu.selection_inactive_bg());
-        // Re-apply window-chrome set before init (set_chrome; the fresh face
-        // defaults to the exact-fit frame) — init's frame_size then sizes the
-        // swapchain to the padded frame. Same retention contract as above.
         cpu.set_pad(self.cpu.pad());
         cpu.set_head(self.cpu.head());
         Ok(cpu)
@@ -362,28 +224,8 @@ impl AtermGpuTerminal {
 
 impl AtermGpuTerminal {
     /// Frame gate: run the two frame-boundary pumps, then decide whether this
-    /// tick draws. `Some(key)` = build and present, then record `key`; `None` =
-    /// identical to the last presented frame, so skip build and present.
-    ///
-    /// The pumps run first so a reflow re-attach's full damage shows in the
-    /// epoch. Gate terms:
-    /// - `damage_epoch`: advances iff the grid changed since the last build.
-    /// - `host_visual_gen`: bumped by every renderer/presentation mutator.
-    /// - `effects_active`: an active pipeline never skips; the active->idle
-    ///   edge buys one settle frame.
-    /// - frac terms: a pending or just-released sub-row translate re-presents.
-    /// - `pending_reflow`: always draws.
-    ///
-    /// Skipping is safe on WebGL because an untouched canvas keeps its last image
-    /// (the key is dropped whenever it might not), and a gated tick returns before
-    /// `present_input`, so aterm-gpu's prior-frame bookkeeping still describes the
-    /// frame on glass for the next scissored present.
     fn open_frame(&mut self) -> Option<FrameGateKey> {
-        // Deferred-reflow safety net #1: a host that never calls `pump_reflow`
-        // still re-attaches its rewrapped history within the grace window.
         self.pump_reflow_on_render_tick();
-        // Frame-boundary scrollback maintenance: apply a pending global-budget
-        // share, then promote one bounded staged batch (LZ4 stays off ingest).
         self.drain_compress_backlog_on_render();
         let key = FrameGateKey {
             damage_epoch: self.term.damage_epoch(),
@@ -405,8 +247,6 @@ impl AtermGpuTerminal {
     }
 
     /// Record the frame `build_frame` just produced as the one on glass. The
-    /// epoch in `key` was latched before `take_damage`, which re-arms but never
-    /// changes the epoch value, so an idle successor matches.
     #[inline]
     fn record_presented_frame(&mut self, key: FrameGateKey) {
         self.last_frame_key = Some(key);
@@ -414,36 +254,20 @@ impl AtermGpuTerminal {
     }
 
     /// Build one frame into the kept scratch; shared by `render`,
-    /// `render_offscreen` and the native `render_headless` seam. Order, as in
-    /// `aterm-wasm`: engine refill (consuming damage) -> effects overlays ->
-    /// sub-row scroll stamp -> band compose -> chrome spill export. Spill runs
-    /// before any GPU access so exports stay coherent when a present fails.
     fn build_frame(&mut self) {
-        // Take last frame's band rows off the scratch so a scoped refill is
-        // possible. The refill consumes the damage session so the next change
-        // advances the epoch `open_frame` compares; the epoch value stays, so the
-        // effects pipeline's `damage_epoch() == snapshot_seq` check still holds.
         let _ = self.band.undo(&mut self.frame_scratch, self.rows);
         self.refill_frame_scratch();
         let rows = self.rows;
-        // With every effect off `apply` only clears channels the scratch carries.
         let (cw, ch) = self.cpu.cell_size();
-        // The pipeline reads the pointer against where this frame draws the grid.
         self.hand_band_to_effects();
         self.effects
             .apply(&mut self.term, &mut self.frame_scratch, cw, ch);
-        // Stamped every frame so the kept scratch never carries a stale shift.
         self.scroll_input.stamp(&mut self.frame_scratch, rows, ch);
         self.compose_band_into_frame();
-        // Spill before any GPU access; a second same-frame pass is free.
         self.spill.update(&self.cpu, &self.frame_scratch);
     }
 
     /// Refill every engine-owned frame channel and consume the frame's damage
-    /// session through the engine's one damage consumer,
-    /// [`Terminal::cell_frame_damage_scoped_into`]: only damaged rows re-resolve
-    /// under its continuity proof, else it refills fully. The effects pipeline
-    /// closes only a session still open, so it does not re-take this one.
     #[inline]
     fn refill_frame_scratch(&mut self) {
         let refill =
@@ -457,15 +281,13 @@ impl AtermGpuTerminal {
         let _ = refill;
     }
 
-    /// Record a visual change the engine's damage epoch cannot see (renderer-held
-    /// or presentation state), reopening the frame gate for one frame.
+    /// Record a visual change the engine's damage epoch cannot see (renderer-held or presentation state), reopening the frame gate for one frame.
     #[inline]
     pub(crate) fn note_host_visual_change(&mut self) {
         self.host_visual_gen = self.host_visual_gen.wrapping_add(1);
     }
 
-    /// Band host hook: the CPU face's cell, pad and grid-top metrics (the face
-    /// the GPU renderer is built from, so both agree).
+    /// Band host hook: the CPU face's cell, pad and grid-top metrics (the face the GPU renderer is built from, so both agree).
     #[inline]
     pub(crate) fn band_metrics(&self) -> messages_api::BandMetrics {
         let (cell_w, cell_h) = self.cpu.cell_size();
@@ -477,8 +299,7 @@ impl AtermGpuTerminal {
         }
     }
 
-    /// Set the band's gutters on the CPU face (read by spill and the offscreen
-    /// path) and on the live GPU renderer's inner face.
+    /// Set the band's gutters on the CPU face (read by spill and the offscreen path) and on the live GPU renderer's inner face.
     #[inline]
     pub(crate) fn set_band_bleed(&mut self, bleed: Option<aterm_render::ChromeBleed>) {
         self.cpu.set_chrome_bleed(bleed);
@@ -487,8 +308,7 @@ impl AtermGpuTerminal {
         }
     }
 
-    /// The band changed: reopen the frame gate for one frame and, when its row
-    /// count moved, resize the swapchain to the new frame height.
+    /// The band changed: reopen the frame gate for one frame and, when its row count moved, resize the swapchain to the new frame height.
     #[inline]
     pub(crate) fn note_band_change(&mut self, rows_moved: bool) {
         self.note_host_visual_change();
@@ -498,10 +318,6 @@ impl AtermGpuTerminal {
     }
 
     /// Size the live swapchain to the frame [`Self::build_frame`] composes:
-    /// the grid plus committed band rows at the renderer's pad and
-    /// head. The one sizing site after init (`resize`, `set_chrome`, band row
-    /// moves). A band change can make the frame inadmissible; leave the old
-    /// surface intact then, and the next render returns the geometry error.
     fn size_swapchain(&mut self) {
         let Ok((w, h)) = self.checked_surface_size() else {
             return;
@@ -513,8 +329,6 @@ impl AtermGpuTerminal {
     }
 
     /// Read one `(grapheme, is_wide)` display cell through the single-slot row
-    /// cache, refreshed from [`Terminal::display_row_grapheme_cells`] only when the
-    /// key changes. `None` for an out-of-range row/col.
     fn with_display_row_cell<T>(
         &self,
         row: u16,
@@ -546,48 +360,35 @@ impl AtermGpuTerminal {
 }
 
 /// The renderer half of a theme install, which `theme_api` (shared with
-/// aterm-wasm) calls on whichever crate compiles it.
 impl AtermGpuTerminal {
-    /// The CPU face: the GPU face wraps a copy of it and reads its floors,
-    /// theme and opacity off it.
+    /// The CPU face: the GPU face wraps a copy of it and reads its floors, theme and opacity off it.
     #[inline]
     pub(crate) const fn render_face(&self) -> &Renderer {
         &self.cpu
     }
 
-    /// Everything a theme change does outside the engine's colours: the
-    /// repaint, the effects' and band's theme-derived inks, and both faces.
+    /// Everything a theme change does outside the engine's colours.
     pub(crate) fn install_renderer_theme(&mut self, parts: aterm_types::scheme::ThemeParts) {
         let aterm_types::scheme::ThemeParts { fg, bg, cursor, .. } = parts;
-        // WF-1 gate
         self.note_host_visual_change();
-        // Keep the effects' derive-from-theme default in sync (glow/trail colours
-        // passed as `None` follow the cursor colour, like the native app).
         self.theme_cursor = cursor & 0x00FF_FFFF;
         self.theme_fg = fg & 0x00FF_FFFF;
         self.theme_bg = bg & 0x00FF_FFFF;
         self.effects
             .set_matrix_rain_theme(self.theme_bg, self.theme_fg, self.theme_cursor);
-        // The pet's contrast sample belongs to the old theme; drop it while the
-        // pet's behaviour, position and breed carry on.
         self.effects.invalidate_companion_colors();
         let theme = Theme::from(parts);
         self.theme = theme;
         self.cpu.set_theme(theme);
-        // The band's inks derive from the theme (the next frame repaints it).
         self.band.set_theme(fg, bg, cursor);
         if let Some(gpu) = self.gpu.as_mut() {
             gpu.renderer.set_theme(theme);
-            // Force a full repaint: selection band, idle cursor and padding
-            // border are theme-derived, so the dirty-row diff would miss them.
             gpu.win.invalidate_present();
         }
     }
 
-    /// The renderer half of `set_selection_fg` (the engine half is the
-    /// caller's), on both faces.
+    /// The renderer half of `set_selection_fg` (the engine half is the caller's), on both faces.
     pub(crate) fn install_renderer_selection_fg(&mut self, fg: Option<u32>) {
-        // WF-1 gate
         self.note_host_visual_change();
         self.cpu.set_selection_fg(fg);
         if let Some(gpu) = self.gpu.as_mut() {
@@ -605,9 +406,7 @@ impl AtermGpuTerminal {
 
 #[cfg_attr(target_arch = "wasm32", export)]
 impl AtermGpuTerminal {
-    /// Build a `rows`x`cols` terminal. `font_bytes` (TTF/OTF) is supplied by
-    /// the host; there is no font discovery on wasm. `px` is the cell font size;
-    /// `fg`/`bg`/`cursor`/`selection` (0x00RRGGBB) seed the default theme.
+    /// Build a `rows`x`cols` terminal.
     #[allow(clippy::too_many_arguments)]
     #[cfg_attr(target_arch = "wasm32", export(constructor))]
     pub fn new(
@@ -622,9 +421,6 @@ impl AtermGpuTerminal {
     ) -> Result<AtermGpuTerminal, String> {
         #[cfg(target_arch = "wasm32")]
         aterm_wasm_abi::panic_hook::set_once(host::CONSOLE);
-        // The wasm artifact is its own root, the binary of the web terminal: it
-        // stamps its version here (XTVERSION reads it), and only on wasm32, so
-        // the native compile of this library carries no build fact.
         #[cfg(target_arch = "wasm32")]
         aterm_types::version::install(aterm_types::version::BuildStamp {
             app_version: env!("CARGO_PKG_VERSION"),
@@ -636,18 +432,12 @@ impl AtermGpuTerminal {
             cursor,
             selection,
         };
-        // Build the CPU face now (cheap, GPU-independent) so cell metrics are
-        // available before WebGL init and the host can size the canvas.
         let mut cpu = Renderer::from_bytes(font_bytes, px, theme)?;
-        // No filesystem on the web: a miss surfaces via `take_missing_font_classes`.
         cpu.set_runtime_font_discovery(false);
-        // Check the clamped dimensions before the engine allocates its grids.
         let (rows, cols) = frame_geometry_api::checked_grid_size(&cpu, rows, cols, 0)?;
-        // The tiered store is attached here; compression drains at the render boundary.
         let mut term = scrollback_tiers_api::tiered_terminal(rows, cols);
         let budget_share = scrollback_tiers_api::register_budget_share(&term);
         apply_terminal_theme_colors(&mut term, fg, bg, cursor, selection);
-        // A web host has no callback thread: notifications queue for a poll.
         let notifications = notifications_api::wire_notification_queue(&mut term);
         let web_theme = theme_api::WebThemeState::new(term.color_scheme());
         let rows = term.grid().rows() as usize;
@@ -701,33 +491,21 @@ impl AtermGpuTerminal {
         })
     }
 
-    /// Inject a broad-coverage (CJK + symbols) fallback face from font bytes, so
-    /// glyphs the primary face lacks render real shapes instead of `.notdef` tofu.
-    /// Applies to the CPU face (metrics) and the live GPU face if `init` already
-    /// ran; the bytes are also remembered so `init` re-applies them to the fresh
-    /// GPU face it builds. Throws on a bad blob; the existing faces stay.
+    /// Inject a broad-coverage (CJK + symbols) fallback face from font bytes, so glyphs the primary face lacks render real shapes instead of `.notdef` tofu.
     pub fn set_fallback_font(&mut self, bytes: &[u8]) -> Result<(), String> {
-        // WF-1 gate
         self.note_host_visual_change();
         self.cpu.set_fallback_bytes(bytes)?;
         if let Some(gpu) = self.gpu.as_mut() {
             gpu.renderer.set_fallback_font_bytes(bytes)?;
             gpu.win.invalidate_present();
         }
-        // Interning allocates only for a new blob, so panes injecting the same OS
-        // face copy nothing.
         self.fallback_font = Some(aterm_render::intern_font_bytes_slice(bytes));
-        // Setting the base resets the chain.
         self.fallback_chain_extra.clear();
         Ok(())
     }
 
-    /// Append another fallback face to the chain (unlike [`Self::set_fallback_font`],
-    /// which resets it), e.g. CJK then Arabic/Devanagari/Thai/Hebrew. Applies
-    /// to the CPU face and the live GPU face; remembered so `init` re-applies
-    /// the chain. Throws on a bad blob; the chain stays.
+    /// Append another fallback face to the chain (unlike [`Self::set_fallback_font`], which resets it), e.g. CJK then Arabic/Devanagari/Thai/Hebrew.
     pub fn add_fallback_font(&mut self, bytes: &[u8]) -> Result<(), String> {
-        // WF-1 gate
         self.note_host_visual_change();
         self.cpu.add_fallback_bytes(bytes)?;
         if let Some(gpu) = self.gpu.as_mut() {
@@ -739,19 +517,12 @@ impl AtermGpuTerminal {
         Ok(())
     }
 
-    /// Inject a colour-emoji (sbix) face from font bytes, driving the existing
-    /// ColorEmoji colour path. Same wiring as [`Self::set_fallback_font`]. Throws on
-    /// a bad blob; the existing face stays.
+    /// Inject a colour-emoji (sbix) face from font bytes, driving the existing ColorEmoji colour path.
     pub fn set_emoji_font(&mut self, bytes: &[u8]) -> Result<(), String> {
-        // WF-1 gate
         self.note_host_visual_change();
-        // Intern once and install/retain the shared Arc. `set_color_font_arc`
-        // runs the same validation as the byte setter, so a bad blob still
-        // throws (after landing in the intern store, as with `register_font`).
         let arc = aterm_render::intern_font_bytes_slice(bytes);
         self.cpu.set_color_font_arc(arc.clone())?;
         if let Some(gpu) = self.gpu.as_mut() {
-            // GpuRenderer has no Arc setter, so a live GPU face takes a copy.
             gpu.renderer.set_emoji_font_bytes(bytes.to_vec())?;
             gpu.win.invalidate_present();
         }
@@ -759,11 +530,8 @@ impl AtermGpuTerminal {
         Ok(())
     }
 
-    /// Inject a real bold weight of the primary family so SGR-bold cells use it
-    /// instead of synthetic embolden. Applies to the CPU and live GPU faces;
-    /// remembered for `init`. Throws on a bad blob; the existing weight stays.
+    /// Inject a real bold weight of the primary family so SGR-bold cells use it instead of synthetic embolden.
     pub fn set_bold_font(&mut self, bytes: &[u8]) -> Result<(), String> {
-        // WF-1 gate
         self.note_host_visual_change();
         self.cpu.set_bold_font(bytes)?;
         if let Some(gpu) = self.gpu.as_mut() {
@@ -774,11 +542,8 @@ impl AtermGpuTerminal {
         Ok(())
     }
 
-    /// Inject a symbol fallback face from font bytes (the byte-injection
-    /// counterpart of the config `symbol_font`). Applies to the CPU and live
-    /// GPU faces; remembered for `init`. Throws on a bad blob.
+    /// Inject a symbol fallback face from font bytes (the byte-injection counterpart of the config `symbol_font`).
     pub fn set_symbol_font(&mut self, bytes: &[u8]) -> Result<(), String> {
-        // WF-1 gate
         self.note_host_visual_change();
         self.cpu.set_symbol_fallback_bytes(bytes)?;
         if let Some(gpu) = self.gpu.as_mut() {
@@ -789,12 +554,8 @@ impl AtermGpuTerminal {
         Ok(())
     }
 
-    // Registered-font (handle) variants: they store the `register_font` Arc
-    // directly, so panes injecting the same OS faces copy nothing.
-
     /// [`AtermGpuTerminal::set_fallback_font`] from a registered handle.
     pub fn set_fallback_font_registered(&mut self, handle: u32) -> Result<(), String> {
-        // WF-1 gate
         self.note_host_visual_change();
         let bytes = registered_font(handle)?;
         self.cpu.set_fallback_bytes(&bytes)?;
@@ -803,14 +564,12 @@ impl AtermGpuTerminal {
             gpu.win.invalidate_present();
         }
         self.fallback_font = Some(bytes);
-        // Setting the base resets the chain.
         self.fallback_chain_extra.clear();
         Ok(())
     }
 
     /// [`AtermGpuTerminal::add_fallback_font`] from a registered handle.
     pub fn add_fallback_font_registered(&mut self, handle: u32) -> Result<(), String> {
-        // WF-1 gate
         self.note_host_visual_change();
         let bytes = registered_font(handle)?;
         self.cpu.add_fallback_bytes(&bytes)?;
@@ -822,11 +581,8 @@ impl AtermGpuTerminal {
         Ok(())
     }
 
-    /// [`AtermGpuTerminal::set_emoji_font`] from a registered handle. The CPU
-    /// face gets the shared interned copy; a live GPU face still receives its
-    /// own copy (rare: fonts are usually seeded before `init`).
+    /// [`AtermGpuTerminal::set_emoji_font`] from a registered handle.
     pub fn set_emoji_font_registered(&mut self, handle: u32) -> Result<(), String> {
-        // WF-1 gate
         self.note_host_visual_change();
         let bytes = registered_font(handle)?;
         self.cpu.set_color_font_arc(bytes.clone())?;
@@ -840,7 +596,6 @@ impl AtermGpuTerminal {
 
     /// [`AtermGpuTerminal::set_bold_font`] from a registered handle.
     pub fn set_bold_font_registered(&mut self, handle: u32) -> Result<(), String> {
-        // WF-1 gate
         self.note_host_visual_change();
         let bytes = registered_font(handle)?;
         self.cpu.set_bold_font(&bytes)?;
@@ -854,7 +609,6 @@ impl AtermGpuTerminal {
 
     /// [`AtermGpuTerminal::set_symbol_font`] from a registered handle.
     pub fn set_symbol_font_registered(&mut self, handle: u32) -> Result<(), String> {
-        // WF-1 gate
         self.note_host_visual_change();
         let bytes = registered_font(handle)?;
         self.cpu.set_symbol_fallback_bytes(&bytes)?;
@@ -866,28 +620,20 @@ impl AtermGpuTerminal {
         Ok(())
     }
 
-    /// Swap the primary face (the host's `terminalFontFamily`) and
-    /// re-rasterize on the CPU and live GPU faces. The bytes replace
-    /// `font_bytes` so a later `init` uses them. The host re-reads cell metrics
-    /// and resizes after. Throws on a bad blob; the existing face stays.
+    /// Swap the primary face (the host's `terminalFontFamily`) and re-rasterize on the CPU and live GPU faces.
     pub fn set_primary_font(&mut self, bytes: &[u8]) -> Result<(), String> {
-        // WF-1 gate
         self.note_host_visual_change();
         self.cpu.set_primary_font(bytes)?;
         if let Some(gpu) = self.gpu.as_mut() {
             gpu.renderer.set_primary_font_bytes(bytes)?;
             gpu.win.invalidate_present();
         }
-        // A later `init` builds its face from the new family.
         self.font_bytes = bytes.to_vec();
         Ok(())
     }
 
-    /// Scale the cell box height (`terminalLineHeight`) without changing glyph
-    /// px, on the CPU and live GPU faces; remembered for `init`. The host
-    /// re-reads `cell_height` and resizes after.
+    /// Scale the cell box height (`terminalLineHeight`) without changing glyph px, on the CPU and live GPU faces; remembered for `init`.
     pub fn set_line_height(&mut self, scale: f32) {
-        // WF-1 gate
         self.note_host_visual_change();
         self.cpu.set_line_height(scale);
         if let Some(gpu) = self.gpu.as_mut() {
@@ -896,11 +642,8 @@ impl AtermGpuTerminal {
         }
     }
 
-    /// Programming ligatures on/off (`=>`, `!=`, `===` …), like the native
-    /// `ligatures` knob. Applies to the CPU and live GPU faces; remembered for
-    /// `init`. Preserves any configured `font_features`.
+    /// Programming ligatures on/off (`=>`, `!=`, `===` …), like the native `ligatures` knob.
     pub fn set_ligatures(&mut self, on: bool) {
-        // WF-1 gate
         self.note_host_visual_change();
         self.text_shaping.ligature_mode = if on {
             aterm_render::LigatureMode::Enabled
@@ -914,12 +657,8 @@ impl AtermGpuTerminal {
         }
     }
 
-    /// OpenType font features for the primary face as a space-separated spec
-    /// (`"+ss01 zero -calt"`), like the native `font_features` knob; blank
-    /// clears. Applies to both faces; remembered for `init`. Preserves the
-    /// ligature mode.
+    /// OpenType font features for the primary face as a space-separated spec (`"+ss01 zero -calt"`), like the native `font_features` knob.
     pub fn set_font_features(&mut self, spec: &str) {
-        // WF-1 gate
         self.note_host_visual_change();
         let features = aterm_render::parse_font_features(spec);
         self.text_shaping.font_features = if features.is_empty() {
@@ -937,20 +676,14 @@ impl AtermGpuTerminal {
         }
     }
 
-    /// Set palette colour `index` (0–255; 0–15 are the ANSI colours) so
-    /// SGR-indexed cells resolve through the host's theme. The palette lives on
-    /// the shared grid, so both GPU and CPU paths see it.
+    /// Set palette colour `index` (0–255; 0–15 are the ANSI colours) so SGR-indexed cells resolve through the host's theme.
     pub fn set_palette_color(&mut self, index: u8, r: u8, g: u8, b: u8) {
-        // WF-1 gate
         self.note_host_visual_change();
         self.term.set_palette_color_components(index, r, g, b);
-        // The band borrows slots 1, 3, 4 and 6 (its error, warn and meter hues).
         self.band.set_palette_color(index, [r, g, b]);
     }
 
     /// Set the cursor blink phase on the live GPU renderer and the CPU face.
-    /// Value-shadowed, so a host timer re-asserting the same phase does not
-    /// defeat the frame gate.
     pub fn set_cursor_blink_phase(&mut self, on: bool) {
         if self.blink_phase_shadow != Some(on) {
             self.blink_phase_shadow = Some(on);
@@ -962,9 +695,7 @@ impl AtermGpuTerminal {
         }
     }
 
-    /// Force a hollow (unfocused) cursor when `true`, or restore the terminal's
-    /// DECSCUSR style when `false`, on both faces. Value-shadowed like the
-    /// blink phase.
+    /// Force a hollow (unfocused) cursor when `true`, or restore the terminal's DECSCUSR style when `false`, on both faces.
     pub fn set_cursor_hollow(&mut self, hollow: bool) {
         if self.hollow_shadow != Some(hollow) {
             self.hollow_shadow = Some(hollow);
@@ -981,10 +712,7 @@ impl AtermGpuTerminal {
         }
     }
 
-    /// Drain the missing-font class bits (1 = text/mono fallback, 2 = colour
-    /// emoji) accumulated since the last call. Misses land on the pre-init
-    /// metrics face and on the GPU renderer's inner CPU face, so both are
-    /// drained and OR-ed.
+    /// Drain the missing-font class bits (1 = text/mono fallback, 2 = colour emoji) accumulated since the last call.
     pub fn take_missing_font_classes(&mut self) -> u8 {
         let mut classes = self.cpu.take_missing_font_classes();
         if let Some(gpu) = self.gpu.as_mut() {
@@ -993,27 +721,18 @@ impl AtermGpuTerminal {
         classes
     }
 
-    /// Seed the engine's default foreground/background so OSC 10/11 colour-query
-    /// replies report the host theme. RGB components, 0–255.
+    /// Seed the engine's default foreground/background so OSC 10/11 colour-query replies report the host theme.
     pub fn set_default_foreground(&mut self, r: u8, g: u8, b: u8) {
-        // WF-1 gate
         self.note_host_visual_change();
         self.term.set_default_foreground(Rgb { r, g, b });
     }
 
     pub fn set_default_background(&mut self, r: u8, g: u8, b: u8) {
-        // WF-1 gate
         self.note_host_visual_change();
         self.term.set_default_background(Rgb { r, g, b });
     }
 
-    /// Replace the default fg/bg/cursor/selection theme (0x00RRGGBB) on the GPU
-    /// renderer and the CPU face without a device or face rebuild.
-    ///
-    /// A program's OSC 10/11/12/17 colours survive it (the engine baseline is
-    /// rebased, as on native). It takes the colours back from a named theme
-    /// (`set_theme_by_name`), so a later `set_color_scheme` leaves them alone,
-    /// and the reported scheme returns to the host's last `set_color_scheme`.
+    /// Replace the default fg/bg/cursor/selection theme (0x00RRGGBB) on the GPU renderer and the CPU face without a device or face rebuild.
     pub fn set_theme(&mut self, fg: u32, bg: u32, cursor: u32, selection: u32) {
         self.install_host_colors(aterm_types::scheme::ThemeParts {
             fg,
@@ -1023,22 +742,15 @@ impl AtermGpuTerminal {
         });
     }
 
-    /// Explicit selected-text foreground (0x00RRGGBB), or `undefined` for the
-    /// WCAG contrast-floor default. Set on both faces; forces a full present.
+    /// Explicit selected-text foreground (0x00RRGGBB), or `undefined` for the WCAG contrast-floor default.
     pub fn set_selection_fg(&mut self, fg: Option<u32>) {
         self.term
             .set_default_selection_foreground(fg.map(theme_api::unpack));
         self.install_renderer_selection_fg(fg);
     }
 
-    /// Per-cell minimum contrast ratio (xterm's `minimumContrastRatio`,
-    /// 1..=21; `<= 1.0` is off, the default): each glyph fg is floored against
-    /// its own cell bg. Cells with fg == bg (SGR 8 conceal) are never adjusted.
-    /// While `set_background_opacity` is below 1 both faces floor at no less
-    /// than 4.5:1 (`effective_minimum_contrast`), as native does.
-    /// Set on both faces; forces a full present.
+    /// Per-cell minimum contrast ratio (xterm's `minimumContrastRatio`, 1..=21; `<= 1.0` is off, the default).
     pub fn set_minimum_contrast(&mut self, ratio: f32) {
-        // WF-1 gate
         self.note_host_visual_change();
         self.cpu.set_minimum_contrast(ratio);
         if let Some(gpu) = self.gpu.as_mut() {
@@ -1047,14 +759,8 @@ impl AtermGpuTerminal {
         }
     }
 
-    /// Default-background opacity (0..=1, like Ghostty's `background-opacity`;
-    /// `1.0` is opaque and the default). Only pixels whose bg is the frame's
-    /// default background go translucent, and below 1 glyphs are floored to at
-    /// least 4.5:1 against their cell (`effective_minimum_contrast`), as on
-    /// native. Set on both faces; forces a full present. On glass this needs an
-    /// alpha-compositing canvas; the offscreen readback carries alpha either way.
+    /// Default-background opacity (0..=1, like Ghostty's `background-opacity`; `1.0` is opaque and the default).
     pub fn set_background_opacity(&mut self, opacity: f32) {
-        // WF-1 gate
         self.note_host_visual_change();
         self.cpu.set_background_opacity(opacity);
         if let Some(gpu) = self.gpu.as_mut() {
@@ -1063,16 +769,10 @@ impl AtermGpuTerminal {
         }
     }
 
-    /// Window chrome for window-space effects: interior padding (`pad`, px per
-    /// edge) plus a top rise band (`head`, px), laid out `[head][pad][grid][pad]`.
-    /// The swapchain resizes to the padded frame (the host offsets the canvas by
-    /// `-pad,-(pad+head)`) and effect emissions become window-absolute. Set on
-    /// both faces; `0/0` (default) is byte-identical to the exact-fit frame.
-    /// Throws before changing anything if the proposed physical frame is too large.
+    /// Window chrome for window-space effects.
     pub fn set_chrome(&mut self, pad: u16, head: u16) -> Result<(), String> {
         let (cw, ch) = self.cpu.cell_size();
         self.checked_surface_geometry(cw, ch, usize::from(pad), usize::from(head))?;
-        // WF-1 gate
         self.note_host_visual_change();
         self.cpu.set_pad(pad as usize);
         self.cpu.set_head(head as usize);
@@ -1081,7 +781,6 @@ impl AtermGpuTerminal {
             gpu.renderer.set_pad(pad as usize);
             gpu.renderer.set_head(head as usize);
         }
-        // The padded frame holds the band's rows too.
         self.size_swapchain();
         if let Some(gpu) = self.gpu.as_mut() {
             gpu.win.invalidate_present();
@@ -1089,8 +788,7 @@ impl AtermGpuTerminal {
         Ok(())
     }
 
-    /// The chrome interior padding from [`Self::set_chrome`] (px; 0 = exact
-    /// fit), read from the CPU face.
+    /// The chrome interior padding from [`Self::set_chrome`] (px; 0 = exact fit), read from the CPU face.
     #[cfg_attr(target_arch = "wasm32", export(getter))]
     pub fn chrome_pad(&self) -> u16 {
         self.cpu.pad() as u16
@@ -1102,11 +800,8 @@ impl AtermGpuTerminal {
         self.cpu.head() as u16
     }
 
-    /// Cursor-fill opacity (0..=1, like Ghostty's `cursor-opacity`; `1.0` is
-    /// the default opaque fill with block cut-out). Below 1.0 the glyph shows
-    /// through. Set on both faces; forces a full present.
+    /// Cursor-fill opacity (0..=1, like Ghostty's `cursor-opacity`; `1.0` is the default opaque fill with block cut-out).
     pub fn set_cursor_opacity(&mut self, opacity: f32) {
-        // WF-1 gate
         self.note_host_visual_change();
         self.cpu.set_cursor_opacity(opacity);
         if let Some(gpu) = self.gpu.as_mut() {
@@ -1115,11 +810,8 @@ impl AtermGpuTerminal {
         }
     }
 
-    /// Mark the pane unfocused (`true`) or focused (`false`); unfocused paints
-    /// the selection with the inactive bg (xterm
-    /// `selectionInactiveBackground`). Set on both faces; forces a full present.
+    /// Mark the pane unfocused (`true`) or focused (`false`).
     pub fn set_selection_inactive(&mut self, inactive: bool) {
-        // WF-1 gate
         self.note_host_visual_change();
         self.cpu.set_selection_inactive(inactive);
         if let Some(gpu) = self.gpu.as_mut() {
@@ -1128,11 +820,8 @@ impl AtermGpuTerminal {
         }
     }
 
-    /// Set the inactive (unfocused) selection bg (0x00RRGGBB), or `undefined` to
-    /// derive it from the active selection bg blended toward the theme bg. Set on
-    /// both the CPU fallback face and the live GPU renderer; forces a full present.
+    /// Set the inactive (unfocused) selection bg (0x00RRGGBB), or `undefined` to derive it from the active selection bg blended toward the theme bg.
     pub fn set_selection_inactive_bg(&mut self, bg: Option<u32>) {
-        // WF-1 gate
         self.note_host_visual_change();
         self.cpu.set_selection_inactive_bg(bg);
         if let Some(gpu) = self.gpu.as_mut() {
@@ -1141,14 +830,10 @@ impl AtermGpuTerminal {
         }
     }
 
-    /// Re-rasterize at a new cell font px (DPI change) on both faces; the GPU
-    /// renderer also drops its atlas. The host re-reads cell metrics and
-    /// resizes after.
-    /// Throws before changing anything if the proposed physical frame is too large.
+    /// Re-rasterize at a new cell font px (DPI change) on both faces; the GPU renderer also drops its atlas.
     pub fn set_px(&mut self, px: f32) -> Result<(), String> {
         let (cw, ch, _) = self.cpu.cell_geometry(px);
         self.checked_surface_geometry(cw, ch, self.cpu.pad(), self.cpu.head())?;
-        // WF-1 gate
         self.note_host_visual_change();
         self.cpu.set_px(px);
         if let Some(gpu) = self.gpu.as_mut() {
@@ -1159,60 +844,30 @@ impl AtermGpuTerminal {
     }
 
     /// Resize the grid and, if the GPU is live, the swapchain.
-    ///
-    /// The visible grid, bounded ring and swapchain resize synchronously. A
-    /// width change with a deep tiered history detaches it in O(1)
-    /// (`resize_offloading_scrollback`) and rewraps it in later budgeted tasks
-    /// (see [`Self::pump_reflow`]); histories up to `INLINE_REFLOW_MAX_LINES`
-    /// rewrap inline.
-    /// Dimensions clamp to the engine's bounds; an oversized physical frame is
-    /// refused before grid, reflow, prediction, frame-gate or swapchain changes.
     pub fn resize(&mut self, rows: u16, cols: u16) -> Result<(), String> {
         let (rows, cols) =
             frame_geometry_api::checked_grid_size(&self.cpu, rows, cols, self.band.committed())?;
-        // A reconfigured swapchain's contents are undefined, so the canvas no
-        // longer holds the frame `last_frame_key` describes; bump always, even
-        // for a same-dims call.
         self.note_host_visual_change();
         if let Some(pending) = self.term.resize_offloading_scrollback(rows, cols) {
             if pending.line_count() <= INLINE_REFLOW_MAX_LINES {
                 // Small history: rewrap now. A follow-up job would wedge the
-                // detach window if dropped, so route any to the pump.
                 if let Some(follow) = self.term.finish_resize_offload(pending.reflow()) {
                     self.pending_reflow = Some(follow);
                     self.reflow_grace = REFLOW_PUMP_GRACE_RENDERS;
                 }
             } else {
-                // Stash for a later host turn. A stashed job is overwritten only
-                // after a reset/erase re-created the store, whose clear_gen guard
-                // would discard the old job anyway.
                 self.pending_reflow = Some(pending);
                 self.reflow_grace = REFLOW_PUMP_GRACE_RENDERS;
             }
         }
-        // Re-sync to the clamped grid dims (1..=4096), not the raw args: the GPU
-        // surface is sized from these fields.
         self.rows = self.term.grid().rows() as usize;
         self.cols = self.term.grid().cols() as usize;
-        // The prediction coordinate space just changed: drop in-flight guesses
-        // rather than ghost-paint them at stale coords (the native resize rule).
         self.predict.reset();
-        // The swapchain holds the band's rows too (the frame grows by them).
         self.size_swapchain();
         Ok(())
     }
 
-    /// Whether the next `render` would draw: the exported frame gate, so a JS
-    /// host can skip the wasm call and its own rAF work on a settled pane.
-    ///
-    /// `&mut self` because reading `Terminal::damage_epoch` latches the current
-    /// damage session (idempotent). `true` may be spurious; `false` is
-    /// authoritative: the following `render()` will skip.
-    ///
-    /// Host hazard: a host that stops calling `render` on settled panes also
-    /// stops any liveness check inside its draw function. Chromium can evict
-    /// the oldest WebGL context without firing `webglcontextlost`, so poll
-    /// `isContextLost()` outside the draw path (docs/matrix-rain-design.md).
+    /// Whether the next `render` would draw.
     pub fn needs_frame(&mut self) -> bool {
         let cell_h = self.cpu.cell_size().1;
         let key = FrameGateKey {
@@ -1228,14 +883,11 @@ impl AtermGpuTerminal {
     }
 
     /// Render-tick safety net (see `REFLOW_PUMP_GRACE_RENDERS`): after the grace
-    /// window, one budgeted step per frame.
     #[inline]
     fn pump_reflow_on_render_tick(&mut self) {
         if self.pending_reflow.is_none() {
             return;
         }
-        // Decremented through a local: Trust does not lower a checked `-=` on
-        // this field place (`MalformedTrustIr`), which left it unproved.
         let grace = self.reflow_grace;
         if grace > 0 {
             self.reflow_grace = grace - 1;
@@ -1245,7 +897,6 @@ impl AtermGpuTerminal {
     }
 
     /// Output safety net (see `REFLOW_BACKLOG_MAX_LINES`), called by `process`:
-    /// one budgeted step per call while staged output is past the cap.
     #[inline]
     fn pump_reflow_on_output(&mut self) {
         if self.pending_reflow.is_some() && self.term.lazy_backlog_len() > REFLOW_BACKLOG_MAX_LINES
@@ -1286,8 +937,6 @@ impl AtermGpuTerminal {
 }
 
 /// Metadata for a legacy-contract search ([`AtermGpuTerminal::search_meta`]).
-/// Same shape as the aterm-wasm module's `SearchMeta` (each wasm module
-/// exports its own copy of the boundary type).
 #[cfg_attr(target_arch = "wasm32", export)]
 pub struct SearchMeta {
     incomplete: bool,
@@ -1296,15 +945,13 @@ pub struct SearchMeta {
 
 #[cfg_attr(target_arch = "wasm32", export)]
 impl SearchMeta {
-    /// True when the results may be truncated: index eviction dropped old rows
-    /// before they could be searched, or the engine's match cap was reached.
+    /// True when the results may be truncated.
     #[cfg_attr(target_arch = "wasm32", export(getter))]
     pub fn incomplete(&self) -> bool {
         self.incomplete
     }
 
-    /// Number of matches the paired [`AtermGpuTerminal::search`] call returns
-    /// (its flat triplet array length / 3), after any cap.
+    /// Number of matches the paired [`AtermGpuTerminal::search`] call returns (its flat triplet array length / 3), after any cap.
     #[cfg_attr(target_arch = "wasm32", export(getter))]
     pub fn match_count(&self) -> u32 {
         self.match_count
@@ -1312,8 +959,6 @@ impl SearchMeta {
 }
 
 /// One slice of a budgeted search ([`AtermGpuTerminal::search_budgeted`]).
-/// Same shape as the aterm-wasm module's `BudgetedSearchResult` (each wasm
-/// module exports its own copy of the boundary type).
 #[cfg_attr(target_arch = "wasm32", export)]
 pub struct BudgetedSearchResult {
     matches: Vec<u32>,
@@ -1329,15 +974,13 @@ pub struct BudgetedSearchResult {
 
 #[cfg_attr(target_arch = "wasm32", export)]
 impl BudgetedSearchResult {
-    /// Stable match delta as flat `[abs_line, start_col, len]` triplets (same
-    /// coordinate contract as [`AtermGpuTerminal::search`]); append across calls.
+    /// Stable match delta as flat `[abs_line, start_col, len]` triplets (same coordinate contract as [`AtermGpuTerminal::search`]).
     #[cfg_attr(target_arch = "wasm32", export(getter))]
     pub fn matches(&self) -> Vec<u32> {
         self.matches.clone()
     }
 
-    /// Whether every retained row has been scanned and every match delta has
-    /// been delivered. Dense searches may finish scanning before this flips.
+    /// Whether every retained row has been scanned and every match delta has been delivered.
     #[cfg_attr(target_arch = "wasm32", export(getter))]
     pub fn complete(&self) -> bool {
         self.complete
@@ -1349,15 +992,13 @@ impl BudgetedSearchResult {
         self.cursor
     }
 
-    /// Stable identity for the logical search, including its completing step;
-    /// `undefined` only for an empty/invalid query result.
+    /// Stable identity for the logical search, including its completing step; `undefined` only for an empty/invalid query result.
     #[cfg_attr(target_arch = "wasm32", export(getter))]
     pub fn search_id(&self) -> Option<u64> {
         self.search_id
     }
 
-    /// Whether this step starts a new logical result stream. Clear previously
-    /// accumulated match deltas before appending this step when true.
+    /// Whether this step starts a new logical result stream.
     #[cfg_attr(target_arch = "wasm32", export(getter))]
     pub fn reset(&self) -> bool {
         self.reset
@@ -1369,9 +1010,7 @@ impl BudgetedSearchResult {
         self.incomplete_index
     }
 
-    /// Final oldest absolute line retained by the completed search index,
-    /// stable from the first turn. A nonzero watermark distinguishes history
-    /// eviction from match-cap-only truncation.
+    /// Final oldest absolute line retained by the completed search index, stable from the first turn.
     #[cfg_attr(target_arch = "wasm32", export(getter))]
     pub fn lowest_retained_line(&self) -> u32 {
         self.lowest_retained_line
@@ -1392,8 +1031,6 @@ impl BudgetedSearchResult {
 
 impl AtermGpuTerminal {
     /// Expand an OSC-8 hyperlink to the span of contiguous cells sharing its
-    /// link. Cells group by `id=` when present, else by URL. Returns
-    /// `[start_col, end_col_exclusive)`. Only valid at display_offset 0.
     fn osc8_span(&self, row: u16, col: u16) -> (u16, u16) {
         let same = |c: u16| -> bool {
             let id_here = self.term.hyperlink_id_at(row, col);
@@ -1420,14 +1057,7 @@ impl AtermGpuTerminal {
     }
 }
 
-/// Stateless key encoder for worker-hosted engines: encode a DOM keyboard
-/// event against a mode-bits snapshot instead of a live terminal.
-///
-/// The host mirrors [`AtermGpuTerminal::keyboard_mode_bits`] to the main
-/// thread and encodes keydowns synchronously here, accepting one-frame
-/// staleness (as it does for DECCKM via `is_app_cursor_mode`). Parameters
-/// match [`AtermGpuTerminal::encode_key`], plus `mode_bits` (undefined bits
-/// are truncated). With fresh bits the output equals the instance method's.
+/// Stateless key encoder for worker-hosted engines.
 #[cfg_attr(target_arch = "wasm32", export)]
 #[must_use]
 pub fn encode_key_with_mode(
@@ -1442,9 +1072,7 @@ pub fn encode_key_with_mode(
     encode_dom_key(key, mods, event_type, base_layout_key, mode)
 }
 
-/// A detected link under a cell: its text/URL, the half-open grid-column span
-/// it covers, and a `kind` discriminant (0=osc8, 1=url, 2=file_path, 3=other).
-/// Same shape as aterm-wasm's `LinkHit`.
+/// A detected link under a cell.
 #[cfg_attr(target_arch = "wasm32", export)]
 pub struct LinkHit {
     url: String,
@@ -1461,10 +1089,7 @@ impl LinkHit {
         self.url.clone()
     }
 
-    /// Inclusive start column of the link span: a grid column in logical order,
-    /// the painted cell on a single-width left-to-right row (a DEC double-width
-    /// line paints grid column `c` at cells `2c` and `2c + 1`; a BiDi row is
-    /// painted in visual order).
+    /// Inclusive start column of the link span.
     #[cfg_attr(target_arch = "wasm32", export(getter))]
     pub fn start_col(&self) -> u16 {
         self.start_col
@@ -1483,9 +1108,7 @@ impl LinkHit {
     }
 }
 
-/// Selection bounds in display viewport cell coords (0 = top visible row),
-/// inclusive of `start`, with `end` side-adjusted to match `selection_text`
-/// and the painted highlight.
+/// Selection bounds in display viewport cell coords (0 = top visible row), inclusive of `start`, with `end` side-adjusted to match `selection_text` and the painted highlight.
 #[cfg_attr(target_arch = "wasm32", export)]
 pub struct SelectionRange {
     start_x: u16,
@@ -1521,8 +1144,7 @@ impl SelectionRange {
     }
 }
 
-/// JSON-escape `s` and wrap it in double quotes for `take_osc_events` /
-/// `take_notifications`.
+/// JSON-escape `s` and wrap it in double quotes for `take_osc_events` / `take_notifications`.
 pub(crate) fn json_string(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
@@ -1563,31 +1185,15 @@ fn classify(s: &str) -> u8 {
     3
 }
 
-// WebGL init + present, wasm32 only. Native callers drive aterm-gpu directly
-// via `GpuRenderer::new` and a window surface.
 #[cfg(target_arch = "wasm32")]
 #[export]
 impl AtermGpuTerminal {
     /// Acquire the GPU and create + configure a WebGL2 surface on `canvas`.
-    ///
-    /// The browser counterpart of aterm-gpu's `GpuRenderer::new` +
-    /// `create_window_surface`, with the context made on the canvas first
-    /// (a WebGL2 context lives on its canvas): `GpuContext::for_canvas`,
-    /// `GpuRenderer::from_parts`, then `configure_canvas_surface`.
-    ///
-    /// Synchronous: the GPU is ready when this returns. A host written for
-    /// the Promise this once returned can still `await` it, and a throw
-    /// inside its async function still rejects that function.
-    ///
-    /// Returns `Err` (a JS string) if WebGL is unavailable or any step fails, so
-    /// the host can fall back to the CPU `aterm-wasm` path.
     pub fn init(&mut self, canvas: aterm_gpu::web::HtmlCanvasElement) -> Result<(), String> {
         self.init_with_target(aterm_gpu::web::CanvasTarget::Canvas(canvas))
     }
 
-    /// Worker variant: create the WebGL2 surface on a transferred
-    /// `OffscreenCanvas`, so rendering and present run off the main thread.
-    /// Otherwise identical to `init`.
+    /// Worker variant: create the WebGL2 surface on a transferred `OffscreenCanvas`, so rendering and present run off the main thread.
     pub fn init_offscreen(
         &mut self,
         canvas: aterm_gpu::web::OffscreenCanvas,
@@ -1596,20 +1202,12 @@ impl AtermGpuTerminal {
     }
 
     /// Shared GPU bring-up for `init` and `init_offscreen`: context and
-    /// pending canvas surface from `target`, then the renderer and swapchain
-    /// config. Not `pub` because `CanvasTarget` is not a JS type.
     fn init_with_target(&mut self, target: aterm_gpu::web::CanvasTarget) -> Result<(), String> {
         let (w, h) = self.checked_surface_size()?;
-        // The WebGL2 context lives on the canvas, so aterm-gpu makes it there
-        // and hands the canvas back unconfigured. Its errors name the failed
-        // step.
         let (ctx, canvas_surface) = GpuContext::for_canvas(target)?;
 
-        // Assemble the portable GPU renderer on the acquired context, on the
-        // face the host configured — this builds every pipeline.
         let renderer = GpuRenderer::from_parts(ctx, self.gpu_face()?, None, self.theme)?;
 
-        // Configure the canvas swapchain (non-sRGB, sized to the grid).
         let surface = renderer
             .configure_canvas_surface(canvas_surface, w as u32, h as u32)
             .map_err(|e| format!("configure canvas surface failed: {e}"))?;
@@ -1619,28 +1217,15 @@ impl AtermGpuTerminal {
             surface,
             win: WindowGpu::new(),
         });
-        // A fresh swapchain holds no frame of ours; the gate must not skip the
-        // first present onto it.
         self.last_frame_key = None;
         self.last_render_gated = false;
         Ok(())
     }
 
-    /// Present one frame on the GPU canvas. Errors (as JS strings) when WebGL
-    /// is uninitialized or the surface reports a typed transient failure
-    /// (`Reconfigured`, `Timeout`, `Occluded`, `Validation`). After
-    /// `Reconfigured` the resize repair already ran; the host should keep its
-    /// rAF loop alive and retry.
-    ///
-    /// aterm-gpu's `present_input` renders the built frame offscreen and blits it
-    /// into the canvas swapchain.
+    /// Present one frame on the GPU canvas.
     pub fn render(&mut self) -> Result<(), String> {
         self.checked_surface_size()?;
-        // Frame gate: `None` means the canvas already holds an identical frame,
-        // so neither the build nor the present runs.
         let Some(key) = self.open_frame() else {
-            // A gated tick reports what an ungated one would: a missing `init`
-            // is never `Ok(())`.
             return if self.gpu.is_some() {
                 Ok(())
             } else {
@@ -1650,8 +1235,6 @@ impl AtermGpuTerminal {
         self.build_frame();
         self.record_presented_frame(key);
         let gpu = self.gpu.as_mut().ok_or("render() before init()")?;
-        // `invert == false`: the visual-bell flash is host-driven. No overlay
-        // or tray on the canvas path.
         let presented = webgl_present_result(gpu.renderer.present_input(
             &mut gpu.win,
             &mut gpu.surface,
@@ -1662,46 +1245,32 @@ impl AtermGpuTerminal {
         ));
         if presented.is_err() {
             // The canvas did not receive this frame; drop the key so the
-            // host's retry draws.
             self.last_frame_key = None;
         }
         presented
     }
 
-    /// Render the current grid offscreen and read the pixels back into the
-    /// internal RGBA8 buffer, for GPU-vs-CPU pixel comparison (a WebGL
-    /// swapchain is not CPU-readable). Same contract as aterm-wasm's
-    /// `render()`+`rgba()`: `Frame` pixels (0xTTRRGGBB, TT = transmittance, 0 =
-    /// opaque) expanded to RGBA8. Errors if WebGL was not initialized, geometry
-    /// exceeds the frame limit, or framebuffer reservation/readback fails.
+    /// Render the current grid offscreen and read the pixels back into the internal RGBA8 buffer, for GPU-vs-CPU pixel comparison (a WebGL swapchain is not CPU-readable).
     pub fn render_offscreen(&mut self) -> Result<(), String> {
         let (width, height) = self.checked_surface_size()?;
         let bytes = width * height * 4;
         self.rgba
             .try_reserve_exact(bytes.saturating_sub(self.rgba.len()))
             .map_err(|e| format!("cannot reserve RGBA framebuffer: {e}"))?;
-        // Ungated: a harness asking for a readback gets one. The frame-boundary
-        // pumps still run.
         self.pump_reflow_on_render_tick();
         self.drain_compress_backlog_on_render();
-        // The same frame build as `render`, so the readback matches the canvas.
         self.build_frame();
-        // The canvas did not receive this frame, so it must not stand in for a
-        // present: leave the gate open.
         self.last_frame_key = None;
         self.last_render_gated = false;
         let gpu = self
             .gpu
             .as_mut()
             .ok_or("render_offscreen() before init()")?;
-        // `None`: the canvas path has no settings-card tray.
         let frame = gpu
             .renderer
             .try_render_input(&mut gpu.win, &self.frame_scratch, None)?;
         self.fb_width = frame.width;
         self.fb_height = frame.height;
-        // Expand 0xTTRRGGBB (TT = 255 - alpha) to RGBA8 for ImageData. Alpha is
-        // 0xff at default opacity, lower on default-bg pixels below it.
         self.rgba.clear();
         for &p in &frame.pixels {
             self.rgba.push((p >> 16) as u8);
@@ -1712,57 +1281,33 @@ impl AtermGpuTerminal {
         Ok(())
     }
 
-    /// Width in pixels of the last [`render_offscreen`](Self::render_offscreen)
-    /// framebuffer.
+    /// Width in pixels of the last [`render_offscreen`](Self::render_offscreen) framebuffer.
     #[export(getter)]
     pub fn width(&self) -> usize {
         self.fb_width
     }
 
-    /// Height in pixels of the last [`render_offscreen`](Self::render_offscreen)
-    /// framebuffer.
+    /// Height in pixels of the last [`render_offscreen`](Self::render_offscreen) framebuffer.
     #[export(getter)]
     pub fn height(&self) -> usize {
         self.fb_height
     }
 
-    /// Copy of the last [`render_offscreen`](Self::render_offscreen) RGBA8
-    /// framebuffer (`width*height*4` bytes), ready for
-    /// `ctx.putImageData(new ImageData(rgba, width, height), 0, 0)` or a pixel diff.
+    /// Copy of the last [`render_offscreen`](Self::render_offscreen) RGBA8 framebuffer (`width*height*4` bytes), ready for `ctx.putImageData(new ImageData(rgba, width, height), 0, 0)` or a pixel diff.
     pub fn rgba(&self) -> Vec<u8> {
         self.rgba.clone()
     }
 }
 
-// Native-only test seams, absent from the wasm build. `new_from_system` builds
-// the CPU face from the first system monospace font, with `new`'s dims clamp.
 #[cfg(not(target_arch = "wasm32"))]
 impl AtermGpuTerminal {
-    /// The native half of `render`: the same frame gate and frame build, minus
-    /// the WebGL present. Returns `true` when the frame was gated.
-    ///
-    /// Returns `Ok(true)` when the settled-frame gate elided the frame, or an
-    /// error before frame work when its physical geometry is too large.
-    ///
-    /// This exists so the gate and the per-tick frame build are measurable and
-    /// testable OFF the browser: the crate's own native tests use it as the
-    /// gate's reach witness. It is deliberately NOT a second implementation — it calls the
-    /// same two helpers `render` calls, in the same order, so a divergence is
-    /// impossible by construction. What it does NOT cover is the GL half
-    /// (swapchain acquire + letterbox blit + submit + present), which the gate
-    /// also skips; any number measured here is therefore a LOWER bound on what
-    /// a settled browser tick saves.
-    ///
-    /// `cfg(not(wasm32))`, like `new_from_system` directly below and for the
-    /// same reason: it adds ZERO surface to the module that actually ships —
-    /// the wasm build does not contain it.
+    /// The native half of `render`: the same frame gate and frame build, minus the WebGL present.
     pub fn render_headless(&mut self) -> Result<bool, String> {
         self.checked_surface_size()?;
         let Some(key) = self.open_frame() else {
             return Ok(true);
         };
         self.build_frame();
-        // No canvas here: "presented" means "built", so the gate settles as in a browser.
         self.record_presented_frame(key);
         Ok(false)
     }
@@ -1771,11 +1316,9 @@ impl AtermGpuTerminal {
         let theme = Theme::default();
         let cpu = Renderer::from_system(px, theme)?;
         let (rows, cols) = frame_geometry_api::checked_grid_size(&cpu, rows, cols, 0).ok()?;
-        // Same tiered-store attachment as `new`.
         let mut term = scrollback_tiers_api::tiered_terminal(rows, cols);
         let budget_share = scrollback_tiers_api::register_budget_share(&term);
         apply_terminal_theme_colors(&mut term, theme.fg, theme.bg, theme.cursor, theme.selection);
-        // Same notification wiring as `new` (fail-closed until authorized).
         let notifications = notifications_api::wire_notification_queue(&mut term);
         let web_theme = theme_api::WebThemeState::new(term.color_scheme());
         let rows = term.grid().rows() as usize;
@@ -1835,9 +1378,7 @@ impl AtermGpuTerminal {
     }
 }
 
-/// A test terminal on the host's system font: `new_from_system`, or COULD NOT
-/// RUN where this host has no system monospace font. Never a silent pass: a
-/// missing font decides nothing about the code.
+/// A test terminal on the host's system font: `new_from_system`, or COULD NOT RUN where this host has no system monospace font.
 #[cfg(all(test, not(target_arch = "wasm32")))]
 pub(crate) fn system_font_terminal(rows: u16, cols: u16, px: f32) -> AtermGpuTerminal {
     AtermGpuTerminal::new_from_system(rows, cols, px)
@@ -1851,11 +1392,9 @@ mod tests {
     use super::*;
 
     /// The bundled face, injected as a JS host would. Paste tests use it so a
-    /// security property is never skipped on a box with no system font.
     const BUNDLED_FACE: &[u8] = include_bytes!("../../aterm-render/assets/DejaVuSansMono.ttf");
 
     /// A link's columns and text come from the cells it is drawn in, whatever
-    /// precedes it on the row: two ideographs, or two flag halves written out of order.
     #[test]
     fn a_link_after_wide_characters_is_read_from_its_cells() {
         let mut t = AtermGpuTerminal::new(4, 60, BUNDLED_FACE, 16.0, 0, 0, 0, 0)
@@ -1881,8 +1420,6 @@ mod tests {
     }
 
     /// `init` builds its GPU face from the host's current settings
-    /// (`gpu_face`), not the constructor's px: a `set_px` before `init`, or a
-    /// re-`init` after one, must draw at the size the cells were measured at.
     #[test]
     fn the_gpu_face_is_the_face_the_host_set() {
         let mut t = AtermGpuTerminal::new(8, 48, BUNDLED_FACE, 14.0, 0, 0, 0, 0)
@@ -1890,8 +1427,6 @@ mod tests {
         t.set_px(21.0).expect("admitted geometry");
         t.set_line_height(1.25);
         t.set_chrome(4, 2).expect("admitted geometry");
-        // An unusable request keeps the last valid CPU geometry. Rebuilding
-        // must retain that geometry too, rather than replay the rejected input.
         t.set_line_height(f32::INFINITY);
         let face = t.gpu_face().expect("the bundled face");
         assert_eq!(face.px(), 21.0);
@@ -1941,20 +1476,16 @@ mod tests {
         assert_eq!(t.effects.cursor_pet_console_input_seq(), 0);
         assert!(t.note_typed_char('x'));
         assert_eq!(t.effects.cursor_pet_console_input_seq(), 1);
-        // Same-cell overwrite and subsequent unrelated output do not note input.
         t.process(b"x\r");
         t.process(b"program repaint\r");
         assert_eq!(t.effects.cursor_pet_console_input_seq(), 1);
 
-        // The handler reports an entire composition commit, never preedit or
-        // one note per scalar. A zero-advance combining commit counts as well.
         assert!(t.note_console_input("text"));
         t.process("中文🙂".as_bytes());
         assert_eq!(t.effects.cursor_pet_console_input_seq(), 2);
         assert!(!t.note_typed_char('\u{0301}'));
         assert_eq!(t.effects.cursor_pet_console_input_seq(), 3);
 
-        // Formatting is pure; admission owns the single paste event.
         let paste = t.format_paste("one pasted sentence");
         assert_eq!(t.effects.cursor_pet_console_input_seq(), 3);
         let generation = t.host_visual_gen;
@@ -1982,15 +1513,11 @@ mod tests {
     }
 
     /// The web export is the engine's paste formatter: sanitize-then-wrap makes
-    /// a planted `ESC[201~` (or 8-bit `0x9B 2 0 1 ~`) inert before the closing
-    /// guard, so it cannot end its own bracket.
     #[test]
     fn paste_export_wraps_only_sanitized_text_so_a_planted_terminator_stays_inert() {
         let mut t = AtermGpuTerminal::new(24, 80, BUNDLED_FACE, 14.0, 0, 0, 0, 0)
             .expect("the bundled face parses");
 
-        // Mode off: no guards to escape, yet ESC/C1 are still stripped and a bare
-        // LF is still folded to CR for the PTY.
         assert!(!t.bracketed_paste_mode());
         assert_eq!(
             t.format_paste("a\x1b[31mb\u{009d}c\nd"),
@@ -2016,8 +1543,6 @@ mod tests {
             "the 8-bit CSI spelling of the terminator is stripped as well"
         );
 
-        // The seam that keeps the two web facades and native from drifting: the
-        // export delegates, it does not reimplement.
         let mut engine = Terminal::new(24, 80);
         engine.process(b"\x1b[?2004h");
         for probe in [
@@ -2038,9 +1563,6 @@ mod tests {
     }
 
     /// The `effects_api` mutators' `note_host_visual_change` bumps must be live:
-    /// an effects config change that fails to reopen the gate would serve a
-    /// stale frame. Also pins that `advance_effects` does not bump, since hosts
-    /// call it every rAF tick.
     #[test]
     fn effects_config_mutators_bump_the_host_visual_generation() {
         let mut t = crate::system_font_terminal(6, 40, 14.0);
@@ -2051,8 +1573,6 @@ mod tests {
             "advance_effects must not bump — it runs every rAF tick"
         );
 
-        // One representative per mutator family: focus/visibility gates,
-        // keystroke ignition, cursor wake, phosphor rain and sparkle words.
         let mut last = start;
         for (label, mutate) in [
             (
@@ -2106,13 +1626,11 @@ mod tests {
     }
 
     /// The frame gate, both sides: a settled tick skips the whole frame, and
-    /// every class of change the damage epoch cannot see reopens it.
     #[test]
     fn frame_gate_skips_settled_ticks_and_reopens_on_every_change_class() {
         let mut t = settled(8, 40);
         assert!(!t.needs_frame(), "needs_frame must agree with the gate");
 
-        // Grid damage (echo).
         t.process(b"!");
         assert!(t.needs_frame(), "damage must reopen the gate");
         assert!(
@@ -2124,7 +1642,6 @@ mod tests {
             "and then re-settle"
         );
 
-        // Renderer-held blink phase (no grid damage); an identical re-assert gates.
         t.set_cursor_blink_phase(false);
         assert!(
             !t.render_headless().expect("renderable frame"),
@@ -2136,7 +1653,6 @@ mod tests {
             "an idempotent blink re-assert must gate"
         );
 
-        // Selection (Terminal-held, no grid damage) and its pointer-cadence de-dup.
         t.selection_start(2, 1);
         t.selection_extend(2, 8);
         assert!(
@@ -2160,7 +1676,6 @@ mod tests {
         );
         t.render_headless().expect("renderable frame");
 
-        // Viewport scroll (display-offset damage -> epoch).
         t.scroll_lines(3);
         assert!(
             !t.render_headless().expect("renderable frame"),
@@ -2174,7 +1689,6 @@ mod tests {
         );
         t.render_headless().expect("renderable frame");
 
-        // An appearance-only change, which the damage epoch cannot see.
         t.set_theme(0x00FF_0000, 0x0000_2200, 0x00FF_FFFF, 0x0033_3366);
         assert!(
             !t.render_headless().expect("renderable frame"),
@@ -2188,9 +1702,6 @@ mod tests {
         );
         t.render_headless().expect("renderable frame");
 
-        // An active effects pipeline animates, so it never gates, and the
-        // active->idle edge buys one settle frame. Matrix rain is the ambient
-        // effect a web host can ignite without typed-move witnesses.
         t.set_matrix_rain_enabled(true);
         assert!(
             !t.render_headless().expect("renderable frame"),
@@ -2199,7 +1710,6 @@ mod tests {
         let mut saw_active = false;
         for i in 0u32..60 {
             // Real output now and then: rain holds still on a pane that is only
-            // being read, where closing the gate is correct.
             if i.is_multiple_of(10) {
                 t.process(b"x");
             }
@@ -2216,8 +1726,6 @@ mod tests {
             saw_active,
             "the rain session never went active — this case proved nothing"
         );
-        // Off again: the pipeline must be able to settle back into the gate
-        // rather than holding it open forever.
         t.set_matrix_rain_enabled(false);
         let mut settled = false;
         for _ in 0..10 {
@@ -2233,9 +1741,6 @@ mod tests {
     }
 
     /// Mutator audit: every `pub fn` that changes what a frame looks like must
-    /// bump `host_visual_gen`, or the gate serves a stale frame. Each entry is
-    /// called on a settled terminal and must reopen the gate. Fallible entries
-    /// get invalid arguments: the bump precedes validation.
     #[test]
     fn every_visual_mutator_bumps_the_host_visual_generation() {
         let mut t = settled(8, 40);
@@ -2326,8 +1831,6 @@ mod tests {
                 let _ = t.selection_line(4, 0);
             }),
             ("selection_clear", |t| t.selection_clear()),
-            // Last, since it changes the grid: a resize reconfigures the
-            // swapchain, so it reopens the gate even at unchanged dims.
             ("resize", |t| t.resize(8, 40).expect("admitted geometry")),
         ] {
             mutate(&mut t);
@@ -2465,7 +1968,6 @@ mod tests {
     }
 
     /// `search_meta` agrees with `search` and carries the `incomplete` signal
-    /// `search` drops.
     #[test]
     fn search_meta_agrees_with_search_and_is_silent_on_empty_or_bad_input() {
         let mut t = crate::system_font_terminal(24, 80, 16.0);
@@ -2482,7 +1984,6 @@ mod tests {
     }
 
     /// Reject an oversized frame before constructing or changing a grid. Existing
-    /// text, presentation state and pixels survive refused resize, chrome and zoom.
     #[test]
     fn oversized_frames_are_refused_before_state_changes() {
         let new = |rows, cols| {
@@ -2569,8 +2070,6 @@ mod tests {
         t.resize(0, 0).expect("zero resize clamps up");
         assert_eq!((t.rows, t.cols), (1, 1));
 
-        // The message band belongs to the same physical framebuffer budget.
-        // This builds only a tiny grid; no large glyph or pixel raster is made.
         let mut banded =
             AtermGpuTerminal::new(2, 1, BUNDLED_FACE, 6_000.0, 0xffffff, 0, 0xffffff, 0x444444)
                 .expect("the grid alone fits the frame budget");
@@ -2590,7 +2089,6 @@ mod tests {
     }
 
     /// Shrinking retention invalidates the search index like any content
-    /// change, so a search never returns just-evicted absolute rows.
     #[test]
     fn retention_shrink_search_returns_no_evicted_rows() {
         let mut t = crate::system_font_terminal(5, 40, 16.0);
@@ -2599,19 +2097,13 @@ mod tests {
         }
         assert_eq!(t.search("needle-", true, false).len() / 3, 300);
 
-        // Shrink retention to 50 (evicting the oldest history immediately)
-        // with no intervening write: the very next search must reflect it.
         t.set_scrollback_limit(50);
         let hits = t.search("needle-", true, false);
-        // 50 retained history lines + the 4 needle rows still on screen.
         assert_eq!(hits.len() / 3, 54, "evicted rows no longer match");
-        // Absolute-row identity: needle-i sits at absolute row i; the oldest
-        // survivor is needle-246 (300 written − 50 history − 4 on screen).
         assert_eq!(hits[0], 246, "the first match is the oldest RETAINED row");
     }
 
     /// `set_scrollback_limit` is one total bound across ring + staged + store:
-    /// shrink evicts oldest immediately; grow widens the store share.
     #[test]
     fn set_scrollback_limit_governs_ring_retention() {
         let mut t = crate::system_font_terminal(5, 40, 16.0);
@@ -2639,9 +2131,6 @@ mod tests {
     }
 
     /// win32-input-mode is the host's to grant: conhost's `?9001h` changes
-    /// nothing until the embedder says a ConPTY is behind the terminal
-    /// (`set_win32_input_enabled`). Then Shift+Enter is the key-record pair
-    /// conhost reads (down, up) instead of the legacy LF.
     #[test]
     fn a_conpty_host_opts_in_to_win32_input_records() {
         let mut t = crate::system_font_terminal(24, 80, 16.0);
@@ -2663,14 +2152,12 @@ mod tests {
     /// The stateless encoder over mirrored `keyboard_mode_bits` (the worker path).
     #[test]
     fn encode_key_with_mode_matches_the_instance_encoder() {
-        // Stateless with mode_bits = 0: plain legacy CSI A, no instance needed.
         assert_eq!(
             encode_key_with_mode("ArrowUp", 0, 0, None, 0).as_deref(),
             Some(&b"\x1b[A"[..])
         );
         let mut t = crate::system_font_terminal(24, 80, 16.0);
         assert_eq!(t.keyboard_mode_bits(), 0, "fresh terminal: no mode bits");
-        // Bits mirrored from a terminal with DECCKM set encode SS3 arrows.
         t.process(b"\x1b[?1h");
         assert_eq!(
             encode_key_with_mode("ArrowUp", 0, 0, None, t.keyboard_mode_bits()).as_deref(),
@@ -2678,14 +2165,12 @@ mod tests {
             "snapshot bits under DECCKM must be SS3"
         );
         t.process(b"\x1b[?1l");
-        // Bits captured after a real kitty disambiguate push speak CSI-u.
         t.process(b"\x1b[>1u");
         assert_eq!(
             encode_key_with_mode("Enter", 1, 0, None, t.keyboard_mode_bits()).as_deref(),
             Some(&b"\x1b[13;2u"[..]),
             "snapshot bits under pushed kitty must be CSI-u Shift+Enter"
         );
-        // With fresh bits the stateless encoder equals the instance method.
         for (key, mods, event_type) in [
             ("ArrowUp", 0u8, 0u8),
             ("ArrowUp", 1, 0),
@@ -2704,8 +2189,6 @@ mod tests {
     }
 
     /// `build_frame` re-resolves one row per echo with the damage-reading
-    /// effects on: the refill consumes the damage session and the effects
-    /// pipeline does not re-take it.
     #[test]
     fn build_frame_echo_refills_one_row_with_sparkle_and_rain_on() {
         let mut t = crate::system_font_terminal(8, 40, 16.0);
@@ -2730,8 +2213,6 @@ mod tests {
     }
 
     /// Every built frame's engine channels equal a full extraction across a
-    /// mutation stream with the damage-reading effects on, and both refill
-    /// arms are reached.
     #[test]
     fn build_frame_scoped_refill_matches_a_full_extraction_over_a_mutation_stream() {
         let mut t = crate::system_font_terminal(8, 40, 16.0);
@@ -2790,7 +2271,6 @@ mod tests {
     }
 
     /// Native stand-in for the effects render path (GPU init is wasm-only):
-    /// refill the snapshot, apply the effects pipeline, refresh the spill band.
     fn fill_frame(t: &mut AtermGpuTerminal) {
         t.refill_frame_scratch();
         let (cw, ch) = t.cpu.cell_size();
@@ -2799,11 +2279,6 @@ mod tests {
     }
 
     /// Snapshot equality across two engine instances.
-    ///
-    /// `RenderInput`'s `PartialEq` compares sprite atlases by `Arc` identity,
-    /// which differs between instances even for identical content. Compare
-    /// atlas values here, neutralize the identity difference, and let the real
-    /// `PartialEq` judge every other field.
     fn same_snapshot_across_instances(a: &RenderInput, b: &RenderInput) -> bool {
         fn atlas_value_eq(
             x: &Option<std::sync::Arc<aterm_render::SceneAtlas>>,
@@ -2834,9 +2309,6 @@ mod tests {
     }
 
     /// Spill band on the GPU engine's CPU face: the water jump splash on the
-    /// top row surfaces band bytes whose source-over composite onto the theme
-    /// bg equals the CPU face's composed band exactly. Also pins strip sizing,
-    /// pointer stability, idle rev/rect stillness and the 0/0-chrome identity.
     #[test]
     fn spill_exports_surface_band_content_on_the_cpu_face() {
         let mut t = crate::system_font_terminal(12, 40, 16.0);
@@ -2848,13 +2320,7 @@ mod tests {
         t.set_chrome(pad as u16, head as u16)
             .expect("admitted geometry");
         t.set_cursor_glow(true, "water", None, None, 400, 64, 1.0, 2.0, true);
-        // Seed the just-enabled engines' cursor anchor so the first witness
-        // below has an owner to check against (apply is the anchor authority).
         fill_frame(&mut t);
-        // The glow observes cursor motion frame to frame: keystrokes interleave
-        // with frames, each witnessed through the committed-char seam as a JS
-        // keydown handler would (unwitnessed motion stays dark). The row-0
-        // splashes arc droplets into the head band.
         for (ch, bytes) in [('a', b"a"), ('b', b"b"), ('c', b"c")] {
             assert!(
                 t.note_typed_char(ch),
@@ -2864,9 +2330,6 @@ mod tests {
             t.advance_effects(30.0);
             fill_frame(&mut t);
         }
-        // Find a frame with live band coverage (nonzero alpha), not merely a
-        // rev tick (the erase after a droplet exits also ticks it), so parity
-        // below is non-vacuous.
         let mut lit_frame = false;
         for _ in 0..40 {
             if t.spill_rev() > 0
@@ -2898,7 +2361,6 @@ mod tests {
         assert!(t.spill_rev() > 0, "splash droplets must reach the band");
         assert!(t.spill_rect_count() > 0, "band content must report rects");
 
-        // Byte parity against the CPU face's composed frame.
         let input = t.frame_scratch.clone();
         let mut win = aterm_render::WindowCpu::new();
         let view = t.cpu.render_input_cached(&mut win, &input);
@@ -2940,13 +2402,9 @@ mod tests {
         }
         assert!(lit > 0, "the splash must light band pixels (non-vacuous)");
 
-        // An unwitnessed program leap-write retires the live wake: the band goes
-        // dark at once and stays dark, and the in-grid aurora drains on its own
-        // envelope (~740 ms here; the wait is 2 s). Serious mode holds the `water`
-        // caret body (which reaches the head band on the top row) out of the claim.
         t.effects.set_serious(true);
         t.process(b"\x1b[1;30Hz");
-        const DRAIN_FRAMES: usize = 125; // 2 s at the 16 ms step above
+        const DRAIN_FRAMES: usize = 125;
         let mut drained_at = None;
         let mut last_quads = usize::MAX;
         for i in 0..DRAIN_FRAMES {
@@ -2979,19 +2437,16 @@ mod tests {
             DRAIN_FRAMES * 16
         );
 
-        // Pointer stability across an animating content frame.
         let ptr = t.spill_ptr();
         t.advance_effects(16.0);
         fill_frame(&mut t);
         assert_eq!(t.spill_ptr(), ptr, "same geometry ⇒ the export never moves");
 
-        // Idle re-frame (no clock advance): rev and rects hold still.
         let rev = t.spill_rev();
         fill_frame(&mut t);
         assert_eq!(t.spill_rev(), rev, "idle re-frame must not tick the rev");
         assert_eq!(t.spill_rect_count(), 0);
 
-        // 0/0 restore: the identity law again — bytes drop with the band.
         t.set_chrome(0, 0).expect("admitted geometry");
         fill_frame(&mut t);
         assert_eq!(t.spill_len(), 0);
@@ -3001,7 +2456,6 @@ mod tests {
     }
 
     /// `set_chrome` before GPU init sticks on the CPU face (init re-applies it
-    /// and sizes the swapchain to the padded frame); 0/0 restores exact-fit.
     #[test]
     fn set_chrome_sticks_pre_init_and_zero_restores() {
         let mut t = crate::system_font_terminal(24, 80, 16.0);
@@ -3017,8 +2471,6 @@ mod tests {
     }
 
     /// Two instances fed the same bytes and dt stream produce identical
-    /// `RenderInput`s (cells and every overlay channel), and turning everything
-    /// off restores the untouched-instance snapshot exactly.
     #[test]
     fn effects_snapshots_are_deterministic_and_restore_on_off() {
         let mut a = crate::system_font_terminal(24, 80, 16.0);
@@ -3055,7 +2507,6 @@ mod tests {
                 || !a.frame_scratch.ink.is_empty(),
             "effects actually emitted something while on"
         );
-        // Toggle everything off: the snapshot must equal the never-touched one.
         for t in [&mut a, &mut b] {
             t.set_sparkle_words_enabled(false);
             t.set_cursor_glow(false, "lumen", None, None, 260, 24, 0.7, 0.6, true);
@@ -3071,7 +2522,6 @@ mod tests {
     }
 
     /// The word-separator setting reshapes double-click words, and clearing it
-    /// restores the default class-based word logic exactly.
     #[test]
     fn set_word_separators_reshapes_double_click_words() {
         let mut t = crate::system_font_terminal(24, 80, 16.0);
@@ -3083,12 +2533,7 @@ mod tests {
         assert_eq!(t.selection_word(0, 1).as_deref(), Some("foo"));
     }
 
-    // Cooperative width-reflow offload. The render-grace net is driven through
-    // `pump_reflow_on_render_tick` (what the wasm-only render paths call).
-
     /// Swap the engine for one whose bulk history lives in the tiered store
-    /// (tiny ring → nearly all scroll-off spills to tiered) and feed `lines`
-    /// numbered lines short enough not to wrap at the test widths.
     fn install_tiered_history(t: &mut AtermGpuTerminal, rows: u16, cols: u16, lines: usize) {
         let sb = aterm_core::scrollback::Scrollback::new(64, 512, 64_000_000);
         t.term = Terminal::with_scrollback(rows, cols, 8, sb);
@@ -3103,8 +2548,6 @@ mod tests {
 
     #[test]
     fn resize_without_tiered_store_never_defers() {
-        // A ring-only engine (no tiered store, e.g. restored from an old
-        // checkpoint): every resize is the plain bounded path, nothing stashes.
         let mut t = crate::system_font_terminal(24, 80, 16.0);
         t.term = Terminal::new(24, 80);
         for i in 0..50 {
@@ -3118,9 +2561,6 @@ mod tests {
 
     #[test]
     fn scrolled_wrapped_row_len_and_wrap_flag_are_tier_aware() {
-        // After a width-shrink reflow overflows wrapped rows into scrollback,
-        // a scrolled-back history row reports correct row_len / row_is_wrapped
-        // (not just text).
         let mut t = crate::system_font_terminal(3, 40, 16.0);
         let a = "A".repeat(30);
         let b = "B".repeat(30);
@@ -3154,9 +2594,6 @@ mod tests {
 
     #[test]
     fn display_row_cache_distinguishes_main_and_alt_screen() {
-        // The display_row_cache key includes the alt-screen bit, so a main<->alt
-        // swap at a coinciding content_gen + offset + row does not serve the
-        // other buffer's cell.
         let mut t = crate::system_font_terminal(5, 20, 16.0);
         for _ in 0..30 {
             t.process(b"\r\n");
@@ -3196,8 +2633,6 @@ mod tests {
 
     #[test]
     fn large_tiered_history_defers_rewrap_and_stepped_pumps_reattach_it() {
-        // Pumping in random small budgets re-attaches the same history a
-        // one-shot rewrap yields.
         let mut t = crate::system_font_terminal(24, 80, 16.0);
         install_tiered_history(&mut t, 24, 80, INLINE_REFLOW_MAX_LINES + 5_000);
         let before = t.term.grid().scrollback_lines();
@@ -3213,7 +2648,6 @@ mod tests {
              (got {during} of {before})"
         );
 
-        // Pump in random small budgets (deterministic LCG) until done.
         let mut lcg = 0x0600_60DD_u64;
         let mut pumps = 0usize;
         loop {
@@ -3245,9 +2679,6 @@ mod tests {
 
     #[test]
     fn resize_mid_stepping_supersedes_without_losing_history() {
-        // A width change while a job is half-stepped: nothing re-detaches; the
-        // job keeps its progress and still re-attaches (content valid, wrapping
-        // stale until the next width change).
         let mut t = crate::system_font_terminal(24, 80, 16.0);
         install_tiered_history(&mut t, 24, 80, INLINE_REFLOW_MAX_LINES + 5_000);
         let before = t.term.grid().scrollback_lines();
@@ -3260,7 +2691,7 @@ mod tests {
         }
         assert!(t.reflow_pending(), "job is half-stepped");
 
-        t.resize(24, 60).expect("admitted geometry"); // supersede mid-stepping
+        t.resize(24, 60).expect("admitted geometry");
         assert!(
             t.reflow_pending(),
             "the half-stepped job survives a re-resize"
@@ -3299,8 +2730,6 @@ mod tests {
 
     #[test]
     fn never_pumped_host_completes_via_the_render_grace_net() {
-        // A host that never calls `pump_reflow`: the render-tick net closes the
-        // window alone, one bounded step per frame after grace.
         let mut t = crate::system_font_terminal(24, 80, 16.0);
         install_tiered_history(&mut t, 24, 80, INLINE_REFLOW_MAX_LINES + 5_000);
         let before = t.term.grid().scrollback_lines();
@@ -3333,9 +2762,6 @@ mod tests {
 
     #[test]
     fn never_pumped_host_streaming_output_converges_via_the_backlog_net() {
-        // A host that neither pumps nor renders but keeps feeding output: past
-        // the cap every `process` call advances one bounded step, so the window
-        // closes after finitely many calls.
         let mut t = crate::system_font_terminal(24, 80, 16.0);
         install_tiered_history(&mut t, 24, 80, INLINE_REFLOW_MAX_LINES + 5_000);
         t.resize(24, 40).expect("admitted geometry");
@@ -3344,7 +2770,7 @@ mod tests {
         for i in 0..(REFLOW_BACKLOG_MAX_LINES + 2_000) {
             buf.extend_from_slice(format!("W{i}-window\r\n").as_bytes());
         }
-        t.process(&buf); // blows past the cap; each further call steps once
+        t.process(&buf);
         let mut calls = 0usize;
         while t.reflow_pending() {
             t.process(format!("T{calls}-tail\r\n").as_bytes());
@@ -3362,8 +2788,6 @@ mod tests {
     }
 
     /// Budgeted search: resumed slices complete to the one-shot triplets, a
-    /// superseded cursor restarts, and empty-query / invalid-regex edges give
-    /// an empty complete result.
     #[test]
     fn search_budgeted_matches_one_shot_and_restarts_when_superseded() {
         let mut t = crate::system_font_terminal(6, 40, 16.0);
@@ -3394,7 +2818,6 @@ mod tests {
         assert_eq!(all_matches, one_shot, "budgeted equals one-shot");
         assert_eq!(step.lowest_retained_line(), 0);
 
-        // Supersession: a new pattern with the old cursor restarts progress.
         let first = t.search_budgeted("NEEDLE", true, false, None, 5);
         assert!(!first.complete());
         assert!(first.reset());
@@ -3404,7 +2827,6 @@ mod tests {
         assert!(switched.reset());
         assert_ne!(switched.search_id(), first_id);
         t.search_budgeted_cancel();
-        // Edges: empty query and invalid regex answer empty complete results.
         let empty = t.search_budgeted("", true, false, switched.cursor(), 5);
         assert!(empty.complete() && empty.matches().is_empty());
         assert!(empty.reset() && empty.search_id().is_none());

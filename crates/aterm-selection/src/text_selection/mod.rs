@@ -1,40 +1,13 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
-// Author: Andrew Yates
 
 //! Mouse-based text selection state machine.
-//!
-//! Specified in `docs/DESIGN-selection-custody-2026-08-21.md` §5.2; the
-//! lifecycle below is the `TextSelectionLifecycle` model
-//! (`aterm_models_core::text_selection_lifecycle_model`), bound to these calls
-//! by `tests/conformance_text_selection.rs`.
-//!
-//! Selection lifecycle:
-//! - None -> InProgress (start selection on mouse down)
-//! - InProgress -> Complete (finish selection on mouse up)
-//! - Complete -> InProgress (extend selection with shift-click)
-//! - InProgress/Complete -> None (clear selection)
-//!
-//! Selection types:
-//! - Simple: Character-by-character selection
-//! - Block: Rectangular selection (column mode)
-//! - Semantic: Word/URL selection (double-click)
-//! - Lines: Full line selection (triple-click)
 
 use std::cmp::Ordering;
 
 pub use aterm_types::selection::{SelectionSide, SelectionType};
 
 /// Side-aware projection of a selection into concrete grid coordinates.
-///
-/// This is the output of [`TextSelection::project_range`] and provides exactly
-/// the information a consumer needs to render or hit-test a selection without
-/// access to the private `SelectionAnchor::side` field.
-///
-/// Column values are already adjusted for side: a `Right`-sided start anchor
-/// shifts `start_col` forward by one, and a `Left`-sided end anchor shifts
-/// `end_col` backward by one. For `Lines` selections, columns span the full
-/// line width (0 to `last_col`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SelectionProjection {
     /// Start row (can be negative for scrollback).
@@ -65,11 +38,6 @@ pub enum SelectionState {
 }
 
 /// A selection anchor point.
-///
-/// An anchor marks one end of a selection. It includes:
-/// - Row: Can be negative for scrollback
-/// - Column: 0-indexed
-/// - Side: Which side of the cell
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct SelectionAnchor {
     /// Row (can be negative for scrollback).
@@ -103,10 +71,6 @@ impl Ord for SelectionAnchor {
 }
 
 /// Text selection state machine (`docs/DESIGN-selection-custody-2026-08-21.md` §5.2).
-///
-/// `PartialEq`/`Eq` let the renderer detect a selection change between frames.
-/// Equality covers all five fields, `truncated` included: a `truncated`-only
-/// difference costs one per-row span loop that marks nothing dirty.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TextSelection {
     /// Current selection state.
@@ -118,8 +82,6 @@ pub struct TextSelection {
     /// End anchor (updated on mouse move).
     end: SelectionAnchor,
     /// Whether an endpoint was CLAMPED to the history floor because its content
-    /// was evicted from scrollback — the selection still names real text, but
-    /// less of it than the user picked. Reported, never rendered from.
     truncated: bool,
 }
 
@@ -175,27 +137,18 @@ impl TextSelection {
     }
 
     /// Get the raw (un-normalized) start anchor.
-    ///
-    /// Returns the anchor set by `start_selection`. The `side` field is
-    /// `pub(crate)`, so external callers can read `row` and `col` only.
     #[inline]
     pub const fn start(&self) -> SelectionAnchor {
         self.start
     }
 
     /// Get the raw (un-normalized) end anchor.
-    ///
-    /// Returns the anchor last updated by `update_selection`. The `side`
-    /// field is `pub(crate)`, so external callers can read `row` and `col` only.
     #[inline]
     pub const fn end(&self) -> SelectionAnchor {
         self.end
     }
 
-    /// Whether an endpoint was clamped to the history floor after scrollback
-    /// eviction. Surfaced as ` incomplete` by control-socket `selection`/`copy`
-    /// replies; `SelectionFingerprint::of` ignores it because truncation always
-    /// moves an anchor row.
+    /// Whether an endpoint was clamped to the history floor after scrollback eviction.
     #[must_use]
     #[inline]
     pub const fn truncated(&self) -> bool {
@@ -203,10 +156,6 @@ impl TextSelection {
     }
 
     /// Whether this selection overlaps the absolute row band `lo_abs..=hi_abs`.
-    ///
-    /// Converts live-screen-relative anchor rows (`0` = top visible row at live
-    /// bottom, negative = scrollback) into absolute rows via `live_top_abs + row`
-    /// (`live_top_abs = absolute_row_counter - visible_rows`).
     #[must_use]
     #[inline]
     pub fn intersects_absolute_band(&self, live_top_abs: u64, lo_abs: u64, hi_abs: u64) -> bool {
@@ -222,23 +171,11 @@ impl TextSelection {
         sel_lo <= hi && lo <= sel_hi
     }
 
-    /// Re-floor the selection after scrollback eviction without a scroll delta
-    /// (e.g. a retention-limit shrink or memory-budget trim).
-    ///
-    /// `oldest_abs - live_top_abs` gives the deepest addressable relative row.
-    /// Clamps a single evicted endpoint and returns `false` (clearing the
-    /// selection) only when both endpoints were evicted.
+    /// Re-floor the selection after scrollback eviction without a scroll delta (e.g. a retention-limit shrink or memory-budget trim).
     pub fn truncate_to_floor(&mut self, oldest_abs: u64, live_top_abs: u64) -> bool {
-        // Saturate rather than `as`-wrap a huge absolute row into a negative one.
         let oldest = i64::try_from(oldest_abs).unwrap_or(i64::MAX);
         let live_top = i64::try_from(live_top_abs).unwrap_or(i64::MAX);
-        // A floor too deep for the anchor space is a floor no anchor can be below,
-        // so `i32::MIN` is the safe saturation: nothing is treated as evicted.
         let min_row = i32::try_from(oldest.saturating_sub(live_top)).unwrap_or(i32::MIN);
-        // `min_row == -scrollback_lines` is not an invariant: `oldest_absolute_row()`
-        // saturates, and a rows-grow moves `visible_rows` without the counter. Assert
-        // only that the floor sits at or above the live top, and clamp, so a saturated
-        // counter degrades to "no history" rather than "every live row is evicted".
         debug_assert!(
             min_row <= 0,
             "history floor cannot sit below the live top: min_row={min_row}"
@@ -247,21 +184,15 @@ impl TextSelection {
     }
 
     /// Clamp an endpoint evicted below `min_row` (the deepest retained row,
-    /// including tiered history) onto `min_row`, or clear and return `false`
-    /// when both endpoints are below `min_row`.
     fn clamp_head_to_min_row(&mut self, min_row: i32) -> bool {
         if self.state == SelectionState::None {
             return true;
         }
-        // Only the LOWER-row anchor can be evicted first, and it is not necessarily
-        // `start`: an upward drag leaves the older row in `end`.
         let lo = self.start.row.min(self.end.row);
         let hi = self.start.row.max(self.end.row);
         if lo >= min_row {
             return true;
         }
-        // `min_row >= 0` means no retained history (alt screen or zero
-        // scrollback): clear rather than clamping onto row 0.
         if min_row >= 0 || hi < min_row {
             self.clear();
             return false;
@@ -272,18 +203,11 @@ impl TextSelection {
             &mut self.end
         };
         anchor.row = min_row;
-        // Block selections clamp only the row; resetting `col = 0` would
-        // widen the rectangle across every retained row.
         if self.selection_type != SelectionType::Block {
             anchor.col = 0;
-            // `Right` on the head anchor means "start AFTER this cell", which would
-            // eat the first cell of the oldest row we just clamped onto.
             anchor.side = SelectionSide::Left;
         }
         self.truncated = true;
-        // A clamp that leaves nothing selectable (the surviving anchor also on the
-        // floor row at col 0 side Left) is a total loss: clear rather than keep a
-        // selection nothing paints or copies.
         if self.side_adjusted_bounds().is_none() {
             self.clear();
             return false;
@@ -292,8 +216,6 @@ impl TextSelection {
     }
 
     /// Get the normalized start (the anchor that comes first).
-    ///
-    /// For block selection, returns the top-left corner.
     #[inline]
     pub fn normalized_start(&self) -> SelectionAnchor {
         if self.selection_type == SelectionType::Block {
@@ -310,8 +232,6 @@ impl TextSelection {
     }
 
     /// Get the normalized end (the anchor that comes last).
-    ///
-    /// For block selection, returns the bottom-right corner.
     #[inline]
     pub fn normalized_end(&self) -> SelectionAnchor {
         if self.selection_type == SelectionType::Block {
@@ -328,10 +248,6 @@ impl TextSelection {
     }
 
     /// Get normalized selection bounds as primitive coordinates.
-    ///
-    /// Returns `(start_row, start_col, end_row, end_col)` where start is the
-    /// top-left endpoint for block selection and the earliest endpoint for
-    /// linear selections.
     #[inline]
     pub fn normalized_bounds(&self) -> (i32, u16, i32, u16) {
         let start = self.normalized_start();
@@ -340,13 +256,6 @@ impl TextSelection {
     }
 
     /// Apply sub-cell side adjustment to a normalized anchor pair.
-    ///
-    /// Returns `(start_row, start_col, end_row, end_col)`. A `Right`-sided start
-    /// shifts `start_col` forward by 1; a `Left`-sided end shifts `end_col`
-    /// backward by 1. A `Left`-sided end at col 0 means "stop before column 0",
-    /// which excludes the whole end row — retreat to the previous row with
-    /// `end_col = u16::MAX`. Shared by `side_adjusted_bounds`, `contains`, and
-    /// `project_range` so all sites agree on the selected region.
     #[inline]
     fn apply_side_adjustment(
         ns: SelectionAnchor,
@@ -361,7 +270,6 @@ impl TextSelection {
             if ne.col > 0 {
                 (ne.row, ne.col - 1)
             } else {
-                // An end before the first representable row contains no cells.
                 // Saturating here would instead select that entire row.
                 (ne.row.checked_sub(1)?, u16::MAX)
             }
@@ -372,16 +280,6 @@ impl TextSelection {
     }
 
     /// Get side-adjusted selection bounds matching the visual highlight.
-    ///
-    /// Returns `Some((start_row, start_col, end_row, end_col))` where columns
-    /// have been adjusted for sub-cell side positioning. A `Right`-sided start
-    /// shifts `start_col` forward by 1; a `Left`-sided end shifts `end_col`
-    /// backward by 1. This matches the column range used by [`Self::contains`]
-    /// and [`Self::project_range`]. `Lines` selections cover whole rows and
-    /// return columns `0..=u16::MAX`, independent of anchor sides.
-    ///
-    /// Returns `None` if no selection is active or if the selection is empty
-    /// after side adjustment.
     #[inline]
     pub fn side_adjusted_bounds(&self) -> Option<(i32, u16, i32, u16)> {
         if self.state == SelectionState::None {
@@ -391,9 +289,6 @@ impl TextSelection {
         let ns = self.normalized_start();
         let ne = self.normalized_end();
 
-        // Full-line selections ignore sub-cell sides and columns everywhere:
-        // copy, hit-testing and rendering must resolve the same row span even
-        // while a drag or shift-click has not called `expand_lines`.
         if self.selection_type == SelectionType::Lines {
             return Some((ns.row, 0, ne.row, u16::MAX));
         }
@@ -406,8 +301,6 @@ impl TextSelection {
     }
 
     /// Start a new selection.
-    ///
-    /// This clears any existing selection and begins a new one at the given position.
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -427,13 +320,10 @@ impl TextSelection {
         self.selection_type = selection_type;
         self.start = SelectionAnchor::new(row, col, side);
         self.end = SelectionAnchor::new(row, col, side);
-        // Reset truncation state for the new selection.
         self.truncated = false;
     }
 
     /// Update the selection endpoint (during mouse drag).
-    ///
-    /// Only works when selection is in progress.
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -474,16 +364,10 @@ impl TextSelection {
     )]
     pub fn clear(&mut self) {
         self.state = SelectionState::None;
-        // Anchors are left stale; the truncation report goes with the span.
         self.truncated = false;
     }
 
     /// Extend an existing complete selection.
-    ///
-    /// This is used for shift-click to extend selection.
-    /// Moves the end anchor to the new position and re-enters `InProgress`
-    /// state so that `update_selection` / `complete_selection` can refine
-    /// the endpoint further.
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -510,10 +394,6 @@ impl TextSelection {
     }
 
     /// Shift selection anchors by `-delta` rows on a terminal scroll.
-    ///
-    /// Valid rows span `-floor..max_rows` (`0` = top visible row, negative =
-    /// scrollback). Clears and returns `false` if any endpoint lands `>= max_rows`
-    /// or both land `< -floor`; clamps a single endpoint below `-floor`.
     pub fn adjust_for_scroll(&mut self, delta: i32, max_rows: i32, floor: i32) -> bool {
         if self.state == SelectionState::None {
             return true;
@@ -524,15 +404,11 @@ impl TextSelection {
             return false;
         }
 
-        // Saturate: `delta = i32::MAX` is the region-scroll sentinel, and lands
-        // below any realistic floor.
         let new_start_row = self.start.row.saturating_sub(delta);
         let new_end_row = self.end.row.saturating_sub(delta);
 
         let min_row = floor.saturating_neg();
 
-        // Above the live bottom there is no content to clamp onto: clear. The
-        // control socket's `select` verb relies on this for out-of-range rows.
         if new_start_row >= max_rows || new_end_row >= max_rows {
             self.clear();
             return false;
@@ -540,16 +416,10 @@ impl TextSelection {
 
         self.start.row = new_start_row;
         self.end.row = new_end_row;
-        // Below the floor is eviction; one evicted endpoint is a partial loss.
         self.clamp_head_to_min_row(min_row)
     }
 
     /// Re-anchor endpoints across a cursor-anchored rows-only shrink.
-    ///
-    /// Rows given up by the viewport become the newest scrollback, shifting
-    /// every live and archived relative row by `-removed_rows` via
-    /// [`Self::adjust_for_scroll`]. Clears and returns `false` if an endpoint
-    /// was above the pre-resize live bottom, or clamps at `-floor`.
     pub fn adjust_for_rows_shrink(
         &mut self,
         kept_rows: i32,
@@ -562,32 +432,17 @@ impl TextSelection {
         if kept_rows <= 0 || removed_rows <= 0 {
             return self.adjust_for_scroll(0, kept_rows, floor);
         }
-        // `kept_rows` is the post-shift live bottom: a pre-resize row in
-        // `0..kept_rows + removed_rows` lands in `-removed_rows..kept_rows`.
         self.adjust_for_scroll(removed_rows, kept_rows, floor)
     }
 
     /// Translate both anchor rows into a presentation coordinate space.
-    ///
-    /// This is for composition-only offsets such as prepending window chrome or
-    /// placing a pane inside a larger frame. Unlike [`Self::adjust_for_scroll`],
-    /// it does not apply terminal-history bounds or clear the selection: state,
-    /// selection type, columns, and anchor sides are preserved. Each row uses
-    /// saturating addition so even an untrusted or degenerate offset cannot
-    /// overflow.
     #[inline]
     pub const fn translate_rows_for_presentation(&mut self, delta: i32) {
         self.start.row = self.start.row.saturating_add(delta);
         self.end.row = self.end.row.saturating_add(delta);
     }
 
-    /// Re-anchor selection endpoints across a row insertion of `inserted` rows
-    /// before a fixed footer at `boundary_row`.
-    ///
-    /// Rows before `boundary_row` shift toward scrollback by `-inserted`; rows
-    /// at or after `boundary_row` keep their relative row. Clears if a remapped
-    /// endpoint lands `>= max_rows` or both land `< -floor`, clamping a single
-    /// endpoint below `-floor`.
+    /// Re-anchor selection endpoints across a row insertion of `inserted` rows before a fixed footer at `boundary_row`.
     pub fn adjust_for_row_splice(
         &mut self,
         boundary_row: i32,
@@ -623,10 +478,7 @@ impl TextSelection {
         self.clamp_head_to_min_row(min_row)
     }
 
-    /// Whether the cell at `(row, col)` is selected, treating a wide glyph
-    /// (`is_wide` lead or `is_wide_continuation` right half) as selected when
-    /// either of its columns via [`glyph_cell_span`](aterm_types::selection::glyph_cell_span)
-    /// is selected so highlight and copy boundaries agree.
+    /// Whether `(row, col)` is selected, expanding wide glyphs via [`glyph_cell_span`](aterm_types::selection::glyph_cell_span).
     #[inline]
     pub fn contains_cell(
         &self,
@@ -637,21 +489,10 @@ impl TextSelection {
     ) -> bool {
         let (lead, continuation) =
             aterm_types::selection::glyph_cell_span(col, is_wide, is_wide_continuation);
-        // `lead == continuation` is the single-width case — the overwhelming
-        // majority of cells on a frame with a selection, each of which pays this
-        // predicate. Short-circuit rather than testing the same column twice.
         self.contains(row, lead) || (continuation != lead && self.contains(row, continuation))
     }
 
     /// Check if a cell is within the selection.
-    ///
-    /// Returns true if the cell at (row, col) is selected.
-    /// Applies the same side adjustment as [`project_range`] so that both
-    /// methods agree on the selected region.
-    ///
-    /// Note: this method knows nothing about wide (CJK/emoji) glyphs, so on its
-    /// own it will divide one. Anything painting cells wants
-    /// [`Self::contains_cell`], which counts a glyph whole.
     #[inline]
     pub fn contains(&self, row: i32, col: u16) -> bool {
         let Some((start_row, start_col, end_row, end_col)) = self.side_adjusted_bounds() else {
@@ -667,7 +508,6 @@ impl TextSelection {
                 end_row,
                 usize::from(end_col),
             ),
-            // Simple, Semantic, and future variants are linear.
             _ => aterm_types::selection::selection_contains_linear(
                 row,
                 usize::from(col),
@@ -680,14 +520,9 @@ impl TextSelection {
     }
 
     /// Project the selection into side-adjusted grid coordinates.
-    ///
-    /// Returns `None` if no selection is active or if the selection is empty
-    /// after side adjustment. `last_col` is the rightmost column index for
-    /// `Lines` selection expansion.
     #[inline]
     pub fn project_range(&self, last_col: u16) -> Option<SelectionProjection> {
         let (start_row, start_col, end_row, end_col) = self.side_adjusted_bounds()?;
-        // `Lines` spans whole rows whatever the sub-cell sides say.
         if self.selection_type == SelectionType::Lines {
             return Some(SelectionProjection {
                 start_row,
@@ -707,9 +542,6 @@ impl TextSelection {
     }
 
     /// Expand the selection to include the entire cell on both ends.
-    ///
-    /// Sets the earlier anchor's side to `Left` and the later anchor's side
-    /// to `Right`, ensuring that `project_range` will not clip either endpoint.
     #[inline]
     pub fn include_all(&mut self) {
         if self.state != SelectionState::None {
@@ -724,9 +556,6 @@ impl TextSelection {
     }
 
     /// Adjust raw anchor positions without changing sides or state.
-    ///
-    /// Used by scroll-rotation adapters that need to shift both anchors
-    /// by a delta while preserving the selection type and side metadata.
     #[inline]
     pub const fn relocate(&mut self, start_row: i32, start_col: u16, end_row: i32, end_col: u16) {
         self.start.row = start_row;
@@ -736,8 +565,6 @@ impl TextSelection {
     }
 
     /// Expand selection to semantic boundaries (for word selection).
-    ///
-    /// This is called after starting a Semantic selection to expand to word boundaries.
     #[inline]
     pub fn expand_semantic(&mut self, start_col: u16, end_col: u16) {
         if self.state == SelectionState::InProgress
@@ -751,8 +578,6 @@ impl TextSelection {
     }
 
     /// Expand selection to full lines.
-    ///
-    /// This is called for Lines selection type to select entire lines.
     #[inline]
     pub fn expand_lines(&mut self, max_col: u16) {
         if self.state == SelectionState::InProgress && self.selection_type == SelectionType::Lines {

@@ -225,7 +225,8 @@ fn a_binary_asked_what_it_is_cannot_swallow_the_installers_stdin() {
     let placed = scratch.mkdir("rd/store");
     scratch.stand_in("rd/store/aterm", READER);
     let none = scratch.mkdir("rd/none");
-    let cases: [(&str, &[&Path], String); 5] = [
+    let candidate = scratch.stand_in("rd/candidate/aterm-linux", READER);
+    let cases: [(&str, &[&Path], String); 6] = [
         (
             "bin_aterm_verdict \"$2\" \"$3\"",
             &[&reader, &store],
@@ -254,6 +255,11 @@ fn a_binary_asked_what_it_is_cannot_swallow_the_installers_stdin() {
             "setup_aterm self-uninstall \"$2\" \"$3\"",
             &[&none, &placed],
             String::new(),
+        ),
+        (
+            "linux_candidate_answers_tag \"$2\" v0.99.0; echo \"$?:$LINUX_CANDIDATE_SAID\"",
+            &[&candidate],
+            "1:not-aterm 1.0".into(),
         ),
     ];
     for (call, args, said) in cases {
@@ -285,6 +291,38 @@ fn a_binary_asked_what_it_is_cannot_swallow_the_installers_stdin() {
     }
 }
 
+/// A whole run on the bundle lane hands its stdin to no binary it runs: the
+/// installed bundle's aterm, found, linked, asked what it is and set up, reads
+/// /dev/null each time.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_whole_run_hands_its_stdin_to_no_binary() {
+    let scratch = Scratch::new();
+    let home = scratch.home("whole");
+    let read_log = scratch.join("whole/read.log");
+    scratch.stand_in(
+        "whole/home/Applications/aterm.app/Contents/MacOS/aterm",
+        "#!/bin/sh\ncat >>\"${STUB_READ:?}\"\necho \"aterm 0.99.0\"\n",
+    );
+    let env = crate::support::hermetic(&home, &[("STUB_READ", s(&read_log))]);
+    let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let run = sh(
+        &format!(
+            "printf 'THE-INSTALLERS-STDIN\\n' | {} {} --no-app --no-toolchain --no-path",
+            q(s(&bash())),
+            q(s(&install_sh()))
+        ),
+        &env,
+    );
+    assert_eq!(run.code(), 0, "{}", run.all());
+    assert!(
+        run.stdout.contains("install.sh: linked aterm 0.99.0 -> "),
+        "the bundle lane ran: {}",
+        run.all()
+    );
+    assert_eq!(read(&read_log), "", "a run read the installer's stdin");
+}
+
 /// Every place the installer asks a binary what it is cuts off a run that
 /// never finishes once the hang detector has passed on the clock, process
 /// group and all, and takes what it printed before as no answer; setup_aterm
@@ -306,6 +344,7 @@ fn a_binary_that_never_finishes_is_cut_off_and_answers_nothing() {
     let placed = scratch.mkdir("stall/store");
     scratch.stand_in("stall/store/aterm", &stall);
     let none = scratch.mkdir("stall/none");
+    let candidate = scratch.stand_in("stall/candidate/aterm-linux", &stall);
     // (the case, what the staller says first, the argument it finishes on, the call, what
     // the call says)
     let cases = [
@@ -359,6 +398,16 @@ fn a_binary_that_never_finishes_is_cut_off_and_answers_nothing() {
                 q(s(&placed))
             ),
             String::new(),
+        ),
+        (
+            "linux",
+            "aterm 0.99.0",
+            "",
+            format!(
+                "linux_candidate_answers_tag {} v0.99.0; echo \"$?:$LINUX_CANDIDATE_SAID\"",
+                q(s(&candidate))
+            ),
+            "2:".to_string(),
         ),
     ];
     let parked = |name: &str| scratch.join(&format!("stall/{name}.parked"));

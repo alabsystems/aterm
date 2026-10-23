@@ -1,25 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Recursive terminal and native workspace restore across quit and relaunch.
-//!
-//! Separate from `session_store::SessionHandoff`, which hands live fds to a re-exec'd process
-//! and models no window, tab or pane tree. This manifest is the durable, human-inspectable
-//! layout written on graceful quit and applied on the next cold launch: the window grid, each
-//! terminal tab's pane tree, and the descriptors that reopen first-party native tabs. Durable
-//! descriptors never hold process-local ids, document bytes, config values or secrets; bounded
-//! source-addressed selections and viewport anchors are kept so a document reopens at the same
-//! position. The one exception is the seamless update's attempt-bound handoff layout, whose
-//! Settings leaves carry unsaved field drafts ([`NativeLeafRestore::settings_drafts`]).
-//!
-//! A leaf stores the shell's cwd and title, not its process-local id, so a fresh session
-//! respawns in the same place and the tree is rebuilt with new ids in tree order
-//! (`pane::PaneTree::rebuild`).
-//!
-//! Parsing is fail-safe: any I/O error, malformed TOML or schema mismatch yields `None` (a
-//! fresh window), and the manifest is single-use (claimed on read), so a crash mid-restore
-//! cannot loop.
-
+//! Session layout persistence, crash recovery, and restore manifest serialization.
 use crate::crash_journal::{Evidence, JournalId};
 use crate::durable::Flush;
 use aterm_agent::harness::relaunch::AgentRun;
@@ -30,8 +12,7 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// The current on-disk schema. Bumped on any incompatible layout change; a manifest with
-/// a different schema is ignored (fresh start), never mis-parsed.
+/// The current on-disk schema.
 pub(crate) const SCHEMA: u32 = 2;
 const LEGACY_SCHEMA: u32 = 1;
 
@@ -42,30 +23,17 @@ const MAX_SETTINGS_ROUTE_BYTES: usize = 128;
 const MAX_RESTORE_TAG_BYTES: usize = 128;
 const MAX_LEAVES_PER_TAB: usize = 256;
 const MAX_SPLIT_DEPTH: usize = 32;
-/// The words every cap refusal of [`RestoreManifest::why_not_whole`] ends its cap with; the
-/// update's record keys on them (`update_words::capture_refused_waiting`).
+/// The words every cap refusal of [`RestoreManifest::why_not_whole`] ends its cap with.
 pub(crate) const UPDATE_CAP_KEY: &str = "an update can carry";
 const MAX_VIEW_METADATA_BYTES: usize = 16 * 1024;
 const MAX_EDITOR_SELECTIONS: usize = 256;
-/// The longest Settings field key a carried draft may name. Keys are `aterm.toml` paths
-/// (`sparkle_words.lexicon`); the bound keeps a malformed layout from making the successor
-/// hash or compare an unbounded key.
 const MAX_SETTINGS_DRAFT_KEY_BYTES: usize = 128;
-/// The longest unsaved Settings field text an update carries; a longer field is not carried,
-/// and the update waits for it ([`settings_draft_is_carriable`]).
+/// The longest unsaved Settings field text an update carries.
 pub(crate) const MAX_SETTINGS_DRAFT_TEXT_BYTES: usize = 16 * 1024;
-/// The most drafts one Settings view carries: above the rows the Settings pages edit
-/// (`prefs::editable_fields`, held below it by a test), so only a malformed layout meets it.
+/// The most drafts one Settings view carries.
 pub(crate) const MAX_SETTINGS_DRAFTS_PER_VIEW: usize = 256;
 
-/// Whether one unsaved Settings field draft can ride a seamless update: the one rule the
-/// outgoing preflight counts a draft as carried by, the handoff capture writes by, and the
-/// layout's sanitize keeps by. A refused draft is not carried, and the preflight holds the
-/// update for it.
-///
-/// A NUL is refused because no carried string may hold one (the capture must be a fixed point
-/// of the parse); the bounds keep the sidecar far below the successor's
-/// `MAX_HANDOFF_LAYOUT_BYTES`.
+/// Whether one unsaved Settings field draft can ride a seamless update.
 #[must_use]
 pub(crate) fn settings_draft_is_carriable(key: &str, text: &str) -> bool {
     !key.is_empty()
@@ -75,17 +43,10 @@ pub(crate) fn settings_draft_is_carriable(key: &str, text: &str) -> bool {
         && !text.contains('\0')
 }
 
-/// A pane's working directory as a layout may carry it (at most `MAX_DOCUMENT_URI_BYTES`, no
-/// NUL), else `None`. Both leaf shapes (`TerminalLeafRestore`, the legacy `PaneLayout::Leaf`)
-/// sanitize with it, so the capture and the parse agree about a directory.
 fn storable_leaf_cwd(cwd: Option<String>) -> Option<String> {
     cwd.filter(|cwd| cwd.len() <= MAX_DOCUMENT_URI_BYTES && !cwd.contains('\0'))
 }
 
-/// Strip NULs from a pane title and cut it to `MAX_DOCUMENT_URI_BYTES` at a
-/// character boundary — the title a layout may carry. Idempotent, so a sanitized
-/// capture is a fixed point of `from_toml`, which is what the update worker's
-/// layout round trip checks.
 fn sanitize_leaf_title(title: &mut String) {
     if title.contains('\0') {
         title.retain(|character| character != '\0');
@@ -99,8 +60,7 @@ fn sanitize_leaf_title(title: &mut String) {
     }
 }
 
-/// serde-stable mirror of [`crate::pane::SplitDir`] — kept separate so the on-disk format
-/// never couples to the internal enum's representation.
+/// serde-stable mirror of [`crate::pane::SplitDir`].
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum SplitKind {
@@ -108,8 +68,7 @@ pub(crate) enum SplitKind {
     Horizontal,
 }
 
-/// Stable path component used to identify focus and closed-view insertion points without
-/// persisting a process-local [`crate::tab_model::ViewId`].
+/// Stable path component used to identify focus and closed-view insertion points without persisting a process-local [`crate::tab_model::ViewId`].
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum RestoreBranch {
@@ -117,16 +76,14 @@ pub(crate) enum RestoreBranch {
     Second,
 }
 
-/// One source-addressed selection. Byte offsets are clamped to the reopened document at
-/// apply time; the persisted value can never become an unchecked slice index.
+/// One source-addressed selection.
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) struct RestoreSelection {
     pub anchor: usize,
     pub head: usize,
 }
 
-/// Stable metadata for a terminal split leaf. `local_id` is adoption-only and is ignored
-/// on a cold launch; it is never treated as a durable session identity.
+/// Stable metadata for a terminal split leaf.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
 pub(crate) struct TerminalLeafRestore {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -137,11 +94,6 @@ pub(crate) struct TerminalLeafRestore {
     pub profile: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub local_id: Option<u64>,
-    /// User session metadata (the `meta set` title, description, icon, role and attention),
-    /// captured at quit and at a seamless update's park and re-seeded onto the shell this leaf
-    /// stands for (`App::carry_restored_identity`): after a quit or a reopened tab, the session
-    /// filling the leaf; after a seamless update, the handed-off shell `local_id` names, never a
-    /// stand-in. `title` above is the engine's OSC title, a different datum.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_title: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -152,168 +104,35 @@ pub(crate) struct TerminalLeafRestore {
     pub role: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attention: Option<String>,
-    /// The `meta set questions` policy word, carried like the five fields above. Re-validated
-    /// on the way in (`sanitize_user_metadata`): a value outside the four words is dropped.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub questions: Option<String>,
-    /// The session's `meta set autopilot` word (2026-10-15; additive, absent
-    /// tolerated, not written when unset): carried like `questions`, so a
-    /// restored or updated session keeps the Autopilot its owner chose — an
-    /// Off session stays Off, its agent left alone. Re-validated on the way in
-    /// (`sanitize_user_metadata`): a value that names no mode is dropped, and
-    /// the table's default decides.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub autopilot: Option<String>,
-    /// The instant a timed Cruise lands, unix ms (2026-10-16; additive, absent
-    /// tolerated, not written when unset;
-    /// `docs/DESIGN-harness-autopilot-2026-10-15.md` §9.3.6, item 2): carried
-    /// beside `autopilot`, which it goes with — so a restored or updated
-    /// session keeps "cruise until 18:00, then land", and one whose time
-    /// passed while aterm was closed lands at once. Dropped on the way in
-    /// under any word but `cruise` (`sanitize_user_metadata`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub land_at: Option<i64>,
-    /// WHO SET THE AUTOPILOT WORD, AND WHEN (2026-10-19; additive, absent
-    /// tolerated, not written when unset;
-    /// `docs/DESIGN-harness-autopilot-2026-10-15.md` §11.7.3, item 5): `<setter>
-    /// <unix ms>`, the setter as `meta`'s `autopilot_by=` words it
-    /// (`human:chip`, `ctl`, …; [`crate::session_timeline::AutopilotSetBy`]),
-    /// carried beside `autopilot` on the cold, reopen and graft paths, so a
-    /// restored row still says `set 14:05 over aterm ctl`. Sanitized with the
-    /// word and dropped where it is (`sanitize_user_metadata`); a value this
-    /// build cannot read is dropped too, and a word with no setter reads
-    /// `restored`. An older build skips the field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub autopilot_by: Option<String>,
-    /// THE SESSION'S OWN THEME (additive, absent tolerated, not written when
-    /// unset): the selector `theme session set`, `spawn theme=` or a split
-    /// gave this session ([`crate::session_theme::SessionTheme`]), so a
-    /// restore and a seamless update keep the tab's colours. It comes back as
-    /// origin `restored`; one that no longer draws keeps its selector and
-    /// draws the instance theme.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub theme: Option<String>,
-    /// THE AGENT THIS LEAF HOSTED (2026-09-27; additive, absent tolerated):
-    /// what a relaunch needs, read while it ran by the window's supervisor
-    /// host — or, none published yet, the one a relaunch still owes the tab
-    /// or an update's parent handed it running (`App::fill_desk_agents`) —
-    /// carried by the crash journal ([`crate::crash_journal`]) and by the
-    /// quit layout of a restart, a logout or a shutdown
-    /// ([`crate::system_quit`]), never by the one a person's own quit
-    /// writes, so an end they did not choose (a crash, a kill, a power loss,
-    /// the system's quit) relaunches it on its conversation in its restored
-    /// tab, and one they chose does not.
-    ///
-    /// On a seamless update's handoff layout it names only an agent a cold restore's relaunch
-    /// queue still owed this tab at the park (`HostHandle::pending_restored_for`); the
-    /// successor relaunches it in the adopted shell at its Commit
-    /// (`App::hand_carried_restored_agents`). Boxed: the other leaf kinds are a fraction of
-    /// its size.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent: Option<Box<AgentRestore>>,
-    /// THE AGENT THE OUTGOING INSTANCE'S HOST SUPERVISED HERE (round
-    /// eighteen; additive, absent tolerated): ON A SEAMLESS UPDATE'S HANDOFF
-    /// LAYOUT ONLY, and only where no relaunch is owed (`agent`), the agent
-    /// the host last published for the tab, followed through its own record
-    /// (`harness_host::followed_snapshot`), for the successor to watch from
-    /// its Commit (`HostHandle::watch_handed`): an exit the outgoing
-    /// instance will not act on — a crash during its Commit's hold, read
-    /// there by a process about to exit, or one that comes before the
-    /// successor's first pass names the agent — is the successor's to read
-    /// and relaunch, once. The Commit compares the process it names
-    /// (`app_update_handoff::commit_agent_carry`): one that changed between
-    /// the two captures was decided by the outgoing instance, and the Commit
-    /// is refused as activity. An older successor ignores it; an older
-    /// producer never writes it. Never on a durable layout, whose `agent`
-    /// names what runs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supervised: Option<Box<AgentRestore>>,
-    /// THE WORD THAT THE TAB'S AGENT CANNOT BE BROUGHT BACK, STANDING (LC-4
-    /// of ; additive, absent tolerated): ON A SEAMLESS
-    /// UPDATE'S HANDOFF LAYOUT ONLY, the outgoing host's word for the tab
-    /// (`harness_host::HostHandle::lost_word`), for the successor's host to
-    /// stand again at its Commit, before its first pass
-    /// (`HostHandle::adopt_lost_words`). The tab's mark rides the session
-    /// record with its other escalations; the word is what keeps it — no
-    /// program that merely starts in the tab lowers it — and what ends it
-    /// once its conversation is held again in any tab. Before, the successor
-    /// rebuilt no word: the first program that started in the tab, a Claude
-    /// Code at its first-run screen included, lowered the mark as an earlier
-    /// aterm's, and a conversation resumed elsewhere left it standing until
-    /// then. The Commit compares it with the agents
-    /// (`app_update_handoff::commit_agent_carry`). An older successor ignores
-    /// it; an older producer never writes it. Never on a durable layout: a
-    /// cold restore's reopened tab is another session. Boxed, as `agent` is.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lost: Option<Box<LostRestore>>,
-    /// At capture a program other than the shell held the PTY (ssh, a container shell, vim:
-    /// the quit confirm's `tcgetpgrp` test) and it was not the agent aterm hosts there, so
-    /// `cwd` may name a folder on another machine ([`Self::folder_may_be_remote`]); the
-    /// restore takes it only when a shell can start in it here ([`Self::start_cwd`]). Written
-    /// only by durable captures (quit, crash journal, a closed tab): the seamless update's
-    /// Commit compares layouts, and a program may start or end in between.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub held: bool,
-    /// THE TAB'S STANDING HOLDS (round twenty, LC-8 of ;
-    /// additive, absent tolerated, written only when one stood; not
-    /// [`Self::held`], a program's hold on the PTY): the session's holds, one
-    /// per origin (`fabric::Holds`), as [`crate::fabric::render_holds`] writes
-    /// them, `<origin> <reason>`, the fleet's first. Put on by the layouts an
-    /// end nobody chose leaves the next launch — the crash journal's image and
-    /// the quit layout of a restart, a logout or a shutdown
-    /// (`App::fill_desk_agents`) — never by a person's own quit, which keeps
-    /// no agent either, nor by a seamless update's layout, whose session
-    /// record carries every hold itself. Its cold restore (ruling 23 of
-    /// `docs/HANDOFF-robustness-rounds-2026-10-08.md`,
-    /// `App::carry_restored_identity`): the leaf's [`Self::agent`] is the
-    /// holder's and is not relaunched — nothing is typed into a held tab, and
-    /// an exit read under a hold is the holder's
-    /// (`aterm_agent::harness::relaunch::OnExit::Held`) — and the OWNER's
-    /// hold (`local`) is put back on the reopened tab, `carried=1`; the
-    /// fleet's is not: a fleet hold is the process's, and quitting is the one
-    /// recovery from a stuck one (`fabric.rs`'s header). A shell the PTY
-    /// keeper gave back carries its own holds from its keeper META, and the
-    /// owner's from here is added where that carry has none (fail-closed: the
-    /// two samples cannot be ordered). An older successor ignores it (and
-    /// relaunches the agent, as before); an older producer never writes it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub holds: Vec<String>,
-    /// THE SESSION THIS LEAF'S SHELL WAS (additive,
-    /// absent tolerated, written by every capture): its sid, so the shell a
-    /// restore starts for the leaf opens `open - restore prev=<sid>`, and a
-    /// reader can go from the new session to the one it stands in for (whose
-    /// log `log @<sid>` still answers while the closed index holds it). Kept
-    /// only in the shape this build mints (`s-<hex>`, within a log id's 40
-    /// bytes): a hand-edited value is dropped, never stored.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sid: Option<String>,
-    /// THE FIRST SESSION OF ITS CHAIN OF RESTORES (the same; written only
-    /// when it is not `sid` itself): what `lineage=` names, so a session
-    /// restored twice still names the session it began as. Checked as `sid`
-    /// is. On a seamless update's layout it goes to the shell the leaf names.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lineage: Option<String>,
-    /// THE EPOCH ITS SHELL'S LOG WAS AT (additive, absent tolerated, written by every capture):
-    /// a later
-    /// process notes it before any session starts
-    /// (`session_log::Epochs::note_leaves`), so the epoch it gives a log of
-    /// the same sid (an adoption told nothing of its predecessor's, a crash
-    /// recovery, a relaunch) is above it, even for a chain whose handoffs ran
-    /// ahead of the wall clock. Constant for a session in one process (an
-    /// epoch moves only at its adoption, before it registers), so the
-    /// Commit's layout comparison is unmoved by it. An older build skips it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub log_ep: Option<u32>,
 }
 
-/// The word that a tab's agent cannot be brought back, as a seamless update's
-/// handoff leaf carries it ([`TerminalLeafRestore::lost`]): the conversation
-/// it is about, the agent that ended (whose publication is never that
-/// conversation held again), whether the word holds the tab's mark, and what
-/// it said — the reason, whether aterm's own restart ended the agent, and
-/// the command that starts it by hand. What the outgoing host read of
-/// another conversation in the tab is not carried: the successor reads it
-/// again.
+/// The word that a tab's agent cannot be brought back, as a seamless update's handoff leaf carries it ([`TerminalLeafRestore::lost`]).
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
 pub(crate) struct LostRestore {
     pub session: String,
@@ -328,115 +147,38 @@ pub(crate) struct LostRestore {
     pub command: Option<String>,
 }
 
-/// Whether `sid` is one a restore leaf may carry (`TerminalLeafRestore::sid`):
-/// the shape this build mints, within a session log id's bytes.
+/// Whether `sid` is one a restore leaf may carry (`TerminalLeafRestore::sid`).
 pub(crate) fn carried_sid(sid: &str) -> bool {
     crate::keeper_link::valid_sid(sid) && aterm_slog::ShortId::new(sid).is_some()
 }
 
-/// A hosted agent as its leaf's restore carries it (see
-/// [`TerminalLeafRestore::agent`]): the relaunch snapshot's durable half
-/// (`aterm_agent::harness::relaunch::Snapshot`), without the tab and the
-/// shell, which the restored leaf provides.
-///
-/// A WIRE FORMAT OTHER BUILDS READ: an older window's successor in a live
-/// update's handoff, a newer build's cold restore, and back. On disk it is
-/// [`leaf::AgentRestore`], field for field and in its order; in memory the
-/// lane's run is one exhaustive shape ([`RunRestore`]), keyed on disk by the
-/// lane's word beside the others (`codex`), which an older reader ignores
-/// (no `deny_unknown_fields` there, nor on any build's since 0.101.0).
+/// A hosted agent as its leaf's restore carries it (see [`TerminalLeafRestore::agent`]).
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub(crate) struct AgentRestore {
-    /// The agent's pid when it ran, and its kernel start: the pid-reuse guard
-    /// that tells a process still running from the one that ended.
     pub pid: u32,
     pub start: String,
-    /// What it ran (an absolute path) and its argv, program first.
     pub program: String,
     pub argv: Vec<String>,
-    /// Its conversation, when it had registered one.
     pub session: Option<String>,
-    /// The directory it was started in.
     pub cwd: String,
-    /// Its version, when it had registered one.
     pub version: Option<String>,
-    /// The raw `CLAUDE_CONFIG_DIR` of its exec environment, as the host read it while it ran
-    /// (`aterm_agent::harness::relaunch::Snapshot::home`). The relaunch puts it back on its
-    /// line as a live relaunch does (`relaunch::required_env`); without it, an agent started
-    /// under another home comes back on `~/.claude.json`, in the first-run theme picker, never
-    /// resuming.
     pub home: Option<String>,
-    /// The raw `CLAUDE_SECURESTORAGE_CONFIG_DIR` (`Snapshot::login`), the same way. Set and
-    /// empty (the default login named) is written `""`, which differs from none. A leaf naming
-    /// a home or a login is relaunched under them, never under the roster's proven active
-    /// account, which is for an agent nothing names the login of
-    /// (`harness_host::RestoredAgent::unread`).
     pub login: Option<String>,
-    /// THE RUN OF A LANE PAST CLAUDE CODE'S (a Codex's: its home, and
-    /// codex-alab's validated line): what its relaunch reads beside the
-    /// conversation `session` names, on disk under the lane's word
-    /// ([`RunRestore`]). `None` for Claude Code, whose run is this leaf's own
-    /// fields — and a Codex whose run is lost, or that carries no validated
-    /// line ([`CodexRestore::alab`]: a vendor `codex`, or a leaf an older
-    /// build wrote), is relaunched by nobody ([`Self::relaunched`]).
     pub run: Option<RunRestore>,
-    /// THE AGENT IT WAS, by its record word (`upgrade::Agent::word`; additive,
-    /// absent tolerated, written only when set): `codex`, and none for Claude
-    /// Code, whose leaf is as it always was. So a leaf a newer build wrote for
-    /// an agent this one has no lane for is relaunched as no other agent's
-    /// ([`Self::agent`], [`Self::snapshot`]); with no word the agent is read
-    /// off its run, as every older producer's leaf is.
     pub word: String,
-    /// The explicit restart's cause (`asked` or `stall`, `restart_stamp::Cause::word`) on a
-    /// relaunch owed for it (`harness_host::OwedRelaunch::asked`), so the relaunch is the act's:
-    /// carried through a hand it waits on rather than counted, and made on its cause
-    /// (`harness_host::RestoredAgent::asked`). On a seamless update's handoff layout only,
-    /// whose successor adopts the very tab (`App::pending_restored_agent`); a durable layout's
-    /// agent is relaunched in a reopened tab as aterm's own end.
     pub cause: Option<String>,
-    /// THE TAB IT RAN IN (2026-10-15; additive, absent tolerated, written
-    /// only when set): that tab's sid at capture
-    /// (`aterm_agent::harness::relaunch::Snapshot::tab`). A cold restore
-    /// reopens the tab under a NEW sid, and what the old tab's loop typed
-    /// into the conversation is in the old sid's ledger: the relaunch keeps
-    /// it among the conversation's earlier tabs
-    /// (`relaunch::after_host_ended_from`), so a `keep going` that loop
-    /// typed after the worker's token is no one's prompt that reopens the
-    /// finished task (XREV-LC-1). An older producer writes none: its
-    /// conversation's earlier tab is unknown, read as before.
     pub tab: Option<String>,
 }
 
-/// THE RUN A LEAF CARRIES FOR A LANE PAST CLAUDE CODE'S
-/// ([`AgentRestore::run`]), one variant per such lane, the run of
-/// `aterm_agent::harness::relaunch::AgentRun` it was read from. ON DISK each
-/// is a table under its lane's record word ([`leaf::AgentRestore`]: `codex`), a
-/// key an older reader ignores, so a lane adds its variant here and its key
-/// there and no leaf of another agent changes.
+/// THE RUN A LEAF CARRIES FOR A LANE PAST CLAUDE CODE'S ([`AgentRestore::run`]).
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub(crate) enum RunRestore {
-    /// A Codex TUI's ([`CodexRestore`]), under `codex`.
     Codex(CodexRestore),
-    /// A Muse Code TUI's ([`MuseRestore`]), under `muse`: its session goes
-    /// in that table, NEVER in the leaf's `session` (see [`MuseRestore`]).
     Muse(MuseRestore),
-    /// An agy TUI's ([`AgyRestore`]), under `agy`: its conversation goes in
-    /// that table, NEVER in the leaf's `session` (see [`AgyRestore`]).
     Agy(AgyRestore),
-    /// A Gemini CLI TUI's ([`GeminiRestore`]), under `gemini`: its session
-    /// goes in that table, NEVER in the leaf's `session` (see
-    /// [`GeminiRestore`]).
     Gemini(GeminiRestore),
 }
 
-/// [`AgentRestore`] AS IT IS WRITTEN AND READ: the leaf's table, every field
-/// under the name and in the order the builds that know it write it (each
-/// later key additive and optional: `home`, `login`, `word`, `cause`, `tab`;
-/// the serde corpus's `restore` cases, and the frozen older shapes in this
-/// module's tests, pin both ways). Its own type is named `AgentRestore` too,
-/// so a refusal names the leaf as it always did. A lane past Claude Code's
-/// adds its run here as one more optional table under its record word,
-/// beside `codex`.
 mod leaf {
     use serde::{Deserialize, Serialize};
 
@@ -455,7 +197,6 @@ mod leaf {
         pub(super) home: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub(super) login: Option<String>,
-        /// [`super::RunRestore::Codex`]'s table.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub(super) codex: Option<super::CodexRestore>,
         #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -464,19 +205,10 @@ mod leaf {
         pub(super) cause: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub(super) tab: Option<String>,
-        /// [`super::RunRestore::Muse`]'s table (2026-10-17; additive, absent
-        /// tolerated, written only when set), after every key an older build
-        /// writes.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub(super) muse: Option<super::MuseRestore>,
-        /// [`super::RunRestore::Agy`]'s table (2026-10-17; additive, absent
-        /// tolerated, written only when set), after every key an older build
-        /// writes.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub(super) agy: Option<super::AgyRestore>,
-        /// [`super::RunRestore::Gemini`]'s table (2026-10-18; additive,
-        /// absent tolerated, written only when set), after every key an older
-        /// build writes.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub(super) gemini: Option<super::GeminiRestore>,
     }
@@ -494,8 +226,6 @@ impl From<leaf::AgentRestore> for AgentRestore {
             version: leaf.version,
             home: leaf.home,
             login: leaf.login,
-            // One run per leaf: deserialization rejects two lanes' tables
-            // before conversion. `AgentRestore::agent` holds its word to the run.
             run: match (leaf.codex, leaf.muse, leaf.agy, leaf.gemini) {
                 (Some(codex), None, None, None) => Some(RunRestore::Codex(codex)),
                 (None, Some(muse), None, None) => Some(RunRestore::Muse(muse)),
@@ -512,7 +242,6 @@ impl From<leaf::AgentRestore> for AgentRestore {
 
 impl From<AgentRestore> for leaf::AgentRestore {
     fn from(agent: AgentRestore) -> Self {
-        // Each lane's run under its own word.
         let (codex, muse, agy, gemini) = match agent.run {
             Some(RunRestore::Codex(run)) => (Some(run), None, None, None),
             Some(RunRestore::Muse(run)) => (None, Some(run), None, None),
@@ -577,165 +306,66 @@ impl RunRestore {
     }
 }
 
-/// A Muse Code TUI's run as its leaf's restore carries it
-/// (`aterm_agent::harness::relaunch::MuseRun`), on disk the leaf's `muse`
-/// table.
-///
-/// ITS SESSION IS HERE, NEVER IN THE LEAF'S `session`: v0.104.0's leaf has
-/// no word and reads a leaf with no Codex run as Claude Code's, which it
-/// would relaunch as `claude --resume <session>`; with no `session` it
-/// relaunches it as nobody's (`ended:no-conversation`) and tells no line.
-/// v0.105.0 reads the word `muse` as an agent with no lane, relaunched and
-/// told by nothing (pinned both ways by
-/// `the_agent_leaf_reads_both_ways_across_0_104_and_0_105`).
+/// A Muse Code TUI's run as its leaf's restore carries it, on disk the leaf's `muse` table.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
 pub(crate) struct MuseRestore {
-    /// The session it held, as its witness proved it (a UUID); `None`: none
-    /// proven, and nothing resumes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session: Option<String>,
-    /// The session's workspace, as its own log last named it: where the
-    /// relaunch `cd`s first.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace: Option<String>,
-    /// The data home its sessions are under (absent tolerated: read as
-    /// none, and the relaunch then finds no session's lock).
     #[serde(default)]
     pub data: String,
-    /// THE HOMES ITS RELAUNCH LINE CARRIES (`XDG_DATA_HOME=…`,
-    /// `XDG_CONFIG_HOME=…`, as its own exec environment set them; written
-    /// only when set).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub env: Vec<String>,
 }
 
-/// An agy TUI's run as its leaf's restore carries it
-/// (`aterm_agent::harness::relaunch::AgyRun`), on disk the leaf's `agy`
-/// table. Its workspace is the leaf's own `cwd` (agy's is the directory it
-/// was launched in).
-///
-/// ITS CONVERSATION IS HERE, NEVER IN THE LEAF'S `session`, as Muse Code's
-/// is ([`MuseRestore`]): v0.104.0 reads a leaf with no Codex run as Claude
-/// Code's, and with no `session` relaunches it as nobody's
-/// (`ended:no-conversation`) and tells no line; v0.105.0 reads the word `agy`
-/// as an agent with no lane, relaunched and told by nothing (pinned both ways
-/// by `the_agent_leaf_reads_both_ways_across_0_104_and_0_105`).
+/// An agy TUI's run as its leaf's restore carries it (`aterm_agent::harness::relaunch::AgyRun`), on disk the leaf's `agy` table.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
 pub(crate) struct AgyRestore {
-    /// The conversation it held, as its witness proved it (a UUIDv4);
-    /// `None`: none proven, and nothing resumes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conversation: Option<String>,
-    /// The config directory its conversations are under (absent tolerated:
-    /// read as none, and the relaunch then finds no presence lock).
     #[serde(default)]
     pub config: String,
-    /// THE HOME ITS RELAUNCH LINE CARRIES (`HOME=…`, where its own exec
-    /// environment set another than the user's; written only when set).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub env: Vec<String>,
 }
 
-/// A Gemini CLI TUI's run as its leaf's restore carries it
-/// (`aterm_agent::harness::relaunch::GeminiRun`), on disk the leaf's `gemini`
-/// table. Its project is the leaf's own `cwd` (its sessions are kept under
-/// its working directory).
-///
-/// ITS SESSION IS HERE, NEVER IN THE LEAF'S `session`, as Muse Code's and
-/// agy's are ([`MuseRestore`], [`AgyRestore`]): v0.104.0 reads a leaf with no
-/// Codex run as Claude Code's, and with no `session` relaunches it as
-/// nobody's (`ended:no-conversation`) and tells no line; v0.105.0 reads the
-/// word `gemini` as no agent's, relaunched and told by nothing
-/// (pinned both ways by
-/// `the_agent_leaf_reads_both_ways_across_0_104_and_0_105`). Its parent's
-/// start rides along, so the relaunch after aterm ended reads the start-time
-/// rule again over the session files as they are then.
+/// A Gemini CLI TUI's run as its leaf's restore carries it (`aterm_agent::harness::relaunch::GeminiRun`), on disk the leaf's `gemini` table.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
 pub(crate) struct GeminiRestore {
-    /// The session the start-time rule named for it (a full UUID); `None`:
-    /// none named, and nothing resumes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session: Option<String>,
-    /// The Gemini directory its sessions are under
-    /// (`<GEMINI_CLI_HOME or HOME>/.gemini`; absent tolerated).
     #[serde(default)]
     pub home: String,
-    /// Its project's chats directory (absent tolerated: read as none, and
-    /// then no session is named).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chats: Option<String>,
-    /// THE HOMES ITS RELAUNCH LINE CARRIES (`GEMINI_CLI_HOME=…`, `HOME=…`;
-    /// written only when set).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub env: Vec<String>,
-    /// When its parent started, unix milliseconds (`0`: unread): the
-    /// start-time rule's one input from the process, read again at the
-    /// relaunch.
     #[serde(default)]
     pub started_ms: u64,
 }
 
-/// A Codex TUI's run as its leaf's restore carries it
-/// (`aterm_agent::harness::relaunch::CodexRun`).
+/// A Codex TUI's run as its leaf's restore carries it.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
 pub(crate) struct CodexRestore {
-    /// The `$CODEX_HOME` it ran with.
     pub home: String,
-    /// THE `CODEX_HOME` ITS OWN EXEC ENVIRONMENT SET (additive, absent
-    /// tolerated, written only when set): the value verbatim, as the host
-    /// read it while it ran (`aterm_agent::harness::relaunch::CodexRun::home_env`).
-    /// The relaunch after aterm ended puts it back on its line as every live
-    /// relaunch does (`codex_alab::line_env`): without it, a Codex a
-    /// wrapper or its own command line started under another home came back
-    /// under `~/.codex`, where its thread is not. `home` cannot tell a
-    /// variable set to `~/.codex` from the default. An older producer never
-    /// writes it, and that leaf restores as it always did; an older
-    /// successor ignores it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub home_env: Option<String>,
-    /// It held its thread's writer lock itself; `false`: its daemon did.
-    /// Read by nothing since the Codex screen lane's retirement
-    /// (2026-10-16), and written `true` so an older successor, which requires
-    /// it, still reads the leaf.
     pub embedded: bool,
-    /// When it started, unix milliseconds. Read by nothing, and written `0`,
-    /// for the same reason as [`Self::embedded`].
     pub started_ms: u64,
-    /// A PROVEN SELF-CLAIMED CODEX-ALAB's LINE (the codex-alab self-claim
-    /// contract, §4; additive, absent tolerated, written only when set): the
-    /// resume line aterm's own copy of its session record validated against
-    /// the live process ([`AlabRestore`];
-    /// `aterm_agent::harness::relaunch::CodexRun::self_claimed`). The
-    /// relaunch after aterm's own end — a crash's journal, a restart's quit
-    /// layout — and a seamless update's successor, for a relaunch owed at
-    /// its Commit, bring it back on its thread on this line, exactly as the
-    /// crash rule would. The copy itself is kept in memory only; this is the
-    /// line it validated. A leaf without it (an older producer's, or a
-    /// vendor `codex`'s) is relaunched by nobody (the Codex screen lane's
-    /// retirement, 2026-10-16); an older successor ignores it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub alab: Option<AlabRestore>,
-    /// THE WORDS AN OLDER BUILD'S RELAUNCH WOULD TYPE AFTER THE PROGRAM
-    /// (additive, absent tolerated, written only when set): `resume <flags>
-    /// <thread>`, as the retired Codex screen lane read them. Kept in the
-    /// leaf's frozen form (`leaf::AgentRestore`) and read by nothing since
-    /// that lane's retirement (2026-10-16); this build never writes it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub carried: Option<Vec<String>>,
 }
 
-/// The crash rule's validated resume line as a leaf carries it
-/// (`aterm_agent::harness::self_claimed::Resume`).
+/// The crash rule's validated resume line as a leaf carries it.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
 pub(crate) struct AlabRestore {
-    /// The line, `argv[0]` the launch path.
     pub argv: Vec<String>,
-    /// The conversation (the primary thread) it resumes.
     pub session: String,
-    /// The `CODEX_HOME` it is relaunched under, when its launch had one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub codex_home: Option<String>,
-    /// The directory it ran in, when its record named one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
 }
@@ -761,15 +391,12 @@ impl AlabRestore {
 }
 
 impl AgentRestore {
-    /// The process it was: its pid and kernel start. One agent is named on
-    /// every leaf that showed its session (`Open Session in New Window`), so
-    /// whatever relaunches it, or says it comes back, goes by this, once.
+    /// The process it was.
     pub(crate) fn ran_as(&self) -> (u32, &str) {
         (self.pid, &self.start)
     }
 
-    /// A relaunch owed on `snap`, its act's `asked` cause with it
-    /// ([`Self::cause`]).
+    /// A relaunch owed on `snap`, its act's `asked` cause with it.
     pub(crate) fn owed(
         snap: aterm_agent::harness::relaunch::Snapshot,
         asked: Option<aterm_agent::harness::restart_stamp::Cause>,
@@ -780,25 +407,19 @@ impl AgentRestore {
         }
     }
 
-    /// The tab it ran in ([`Self::tab`]) where that is not `now`, the sid
-    /// of the tab it is reopened in: `None` for a tab whose sid was kept (a
-    /// seamless update's handoff) or a leaf naming none.
+    /// The tab it ran in ([`Self::tab`]) where that is not `now`, the sid of the tab it is reopened in.
     pub(crate) fn ran_in_another(&self, now: &str) -> Option<String> {
         self.tab.clone().filter(|t| t != now)
     }
 
-    /// The explicit restart's cause it carries ([`Self::cause`]); a word
-    /// this build does not know is none.
+    /// The explicit restart's cause it carries ([`Self::cause`]).
     pub(crate) fn asked(&self) -> Option<aterm_agent::harness::restart_stamp::Cause> {
         self.cause
             .as_deref()
             .and_then(aterm_agent::harness::restart_stamp::Cause::parse)
     }
 
-    /// The durable half of the relaunch snapshot `snap`. A Muse Code's
-    /// session, an agy's conversation and a Gemini CLI's session go in their
-    /// own tables, never in `session` ([`MuseRestore`], [`AgyRestore`],
-    /// [`GeminiRestore`]).
+    /// The durable half of the relaunch snapshot `snap`.
     pub(crate) fn of(snap: aterm_agent::harness::relaunch::Snapshot) -> Self {
         let word = snap.agent().word().to_string();
         let (session, lane_session) = match &snap.run {
@@ -806,7 +427,6 @@ impl AgentRestore {
             AgentRun::Claude | AgentRun::Codex(_) => (snap.session, None),
         };
         Self {
-            // Read before the tab moves out of `snap`.
             word,
             tab: Some(snap.tab).filter(|t| !t.is_empty()),
             pid: snap.pid,
@@ -851,20 +471,13 @@ impl AgentRestore {
         }
     }
 
-    /// The relaunch snapshot of this agent in the reopened tab `tab`, whose
-    /// shell is `shell`; `None` for an agent this build has no lane for
-    /// ([`Self::agent`]) and for a Codex with no validated line
-    /// ([`Self::relaunched`]), which nothing relaunches.
+    /// The relaunch snapshot of this agent in the reopened tab `tab`, whose shell is `shell`.
     pub(crate) fn snapshot(
         self,
         tab: String,
         shell: u32,
     ) -> Option<aterm_agent::harness::relaunch::Snapshot> {
         use aterm_agent::harness::upgrade::Agent;
-        // The run of the agent its word names, each agent by name: one this
-        // build has no lane for, or whose run the leaf lost, is none. A Muse
-        // Code's session, an agy's conversation and a Gemini CLI's session are
-        // their tables' ([`MuseRestore`], [`AgyRestore`], [`GeminiRestore`]).
         if !self.relaunched() {
             return None;
         }
@@ -886,7 +499,6 @@ impl AgentRestore {
                     data: std::path::PathBuf::from(run.data),
                     env: aterm_agent::harness::upgrade_muse::env_of_words(&run.env),
                     workspace: run.workspace,
-                    // Found again by its session; not carried.
                     lock: None,
                     started_ms: 0,
                     block: None,
@@ -898,10 +510,7 @@ impl AgentRestore {
                 AgentRun::Agy(aterm_agent::harness::relaunch::AgyRun {
                     config: std::path::PathBuf::from(run.config),
                     env: aterm_agent::harness::upgrade_agy::env_of_words(&run.env),
-                    // Named again by its conversation; not carried.
                     lock: None,
-                    // No exit of this process is read after a restore: aterm's
-                    // own end is the relaunch's cause.
                     crash: None,
                     started_ms: 0,
                     block: None,
@@ -914,17 +523,13 @@ impl AgentRestore {
                     home: std::path::PathBuf::from(run.home),
                     chats: run.chats.map(std::path::PathBuf::from),
                     env: aterm_agent::harness::upgrade_gemini::env_of_words(&run.env),
-                    // Carried: the relaunch reads the start-time rule again.
                     started_ms: run.started_ms,
-                    // No exit of this process is read after a restore:
-                    // aterm's own end is the relaunch's cause.
                     child: 0,
                     unwitnessed: None,
                     block: None,
                 })
             }
             (Agent::Gemini, _) => return None,
-            // Its run is another lane's: never read as it.
             (
                 Agent::Codex,
                 Some(RunRestore::Muse(_) | RunRestore::Agy(_) | RunRestore::Gemini(_)),
@@ -941,22 +546,10 @@ impl AgentRestore {
             cwd: self.cwd,
             version: self.version,
             run,
-            // Read only by the frozen remedy's wording (`relaunch::resumes_on_exit`); the
-            // relaunch's plan reads the shell's dialect itself, and nothing is read here on the
-            // event loop.
             dialect: None,
-            // Not carried: read from its home and its `cwd`
-            // (`upgrade_drive::Records::of_snapshot`).
             claude_dir: None,
-            // As the layout carried them off the host's snapshot; nothing is read here. A leaf
-            // naming neither adds nothing: the host knows the snapshot is the layout's
-            // (`harness_host::RestoredAgent::unread`) and, where two or more Claude Code
-            // accounts are listed, carries the machine's proven active one.
             login: self.login,
             home: self.home,
-            // Not carried: a cold restore's relaunch carries no usage tap
-            // (`relaunch::Snapshot::stored_login`); its first relaunch after
-            // that, from a live read, may.
             stored_login: false,
             profile: None,
         })
@@ -964,17 +557,7 @@ impl AgentRestore {
 }
 
 impl AgentRestore {
-    /// The relaunch snapshot of this agent, SUPERVISED by the outgoing
-    /// instance and handed across a seamless update
-    /// ([`TerminalLeafRestore::supervised`]), in the tab `tab` whose adopted
-    /// process is `adopted`: the shell, unless the agent IS that process — a
-    /// tab's own program (`aterm -e claude`, `exec claude`), which no shell
-    /// holds — whose snapshot names no shell
-    /// (`aterm_agent::harness::relaunch::NO_SHELL`), as the outgoing host's
-    /// own read did. Only for a live handed agent: a cold restore's leaf has
-    /// a fresh shell, and an owed relaunch's agent is gone, its pid free for
-    /// another process. `None` for an agent this build has no lane for, as
-    /// [`Self::snapshot`]'s.
+    /// The relaunch snapshot of this agent.
     #[cfg(any(unix, test))]
     pub(crate) fn handed_snapshot(
         self,
@@ -989,31 +572,22 @@ impl AgentRestore {
         self.snapshot(tab, shell)
     }
 
-    /// Whether the relaunch after aterm ended brings this agent back on its
-    /// conversation ([`agent_resumes`]), by a relaunch that is anyone's
-    /// ([`Self::relaunched`]). Not where its leaf carries the owner's hold
-    /// ([`TerminalLeafRestore::resumes_agent`]).
+    /// Whether the relaunch after aterm ended brings this agent back on its conversation ([`agent_resumes`]).
     pub(crate) fn resumes(&self) -> bool {
         self.relaunched()
             && match &self.run {
-                // A Muse Code's session is its table's, and its one-shot
-                // launches are its own table's ([`MuseRestore`]).
                 Some(RunRestore::Muse(run)) => {
                     run.session
                         .as_deref()
                         .is_some_and(aterm_agent::harness::upgrade_muse::is_session_uuid)
                         && aterm_agent::harness::upgrade_muse::is_tui_argv(&self.argv)
                 }
-                // An agy's conversation is its table's, and its one-shot
-                // launches its own table's ([`AgyRestore`]).
                 Some(RunRestore::Agy(run)) => {
                     run.conversation
                         .as_deref()
                         .is_some_and(aterm_agent::harness::upgrade_agy::is_conversation_uuid)
                         && aterm_agent::harness::upgrade_agy::is_tui_argv(&self.argv)
                 }
-                // A Gemini CLI's session is its table's, and its one-shot
-                // launches its own table's ([`GeminiRestore`]).
                 Some(RunRestore::Gemini(run)) => {
                     run.session
                         .as_deref()
@@ -1026,13 +600,7 @@ impl AgentRestore {
             }
     }
 
-    /// Whether any relaunch brings this agent back: never a Codex that
-    /// carries no line aterm's copy of codex-alab's own record validated
-    /// ([`CodexRestore::alab`]) — a vendor `codex`, or an older build's
-    /// leaf (the Codex screen lane's retirement, 2026-10-16): its tab comes
-    /// back at its shell. Claude Code's, Muse Code's, agy's and Gemini CLI's
-    /// always (the last three's resume is read off its own table,
-    /// [`Self::resumes`]).
+    /// Whether any relaunch brings this agent back.
     pub(crate) fn relaunched(&self) -> bool {
         match &self.run {
             None | Some(RunRestore::Muse(_) | RunRestore::Agy(_) | RunRestore::Gemini(_)) => true,
@@ -1040,43 +608,22 @@ impl AgentRestore {
         }
     }
 
-    /// The agent as a person names it, the one its relaunch would read
-    /// ([`Self::agent`]): `Claude`, `Codex`, `Muse Code`, `agy` or `Gemini
-    /// CLI`; `None` for a word this build does not know, which nothing
-    /// relaunches.
+    /// The agent as a person names it, the one its relaunch would read ([`Self::agent`]).
     pub(crate) fn name(&self) -> Option<&'static str> {
         use aterm_agent::harness::upgrade::Agent;
         self.agent().map(|agent| match agent {
             Agent::Claude => "Claude",
             Agent::Codex => "Codex",
             Agent::Muse => agent.product(),
-            // By the name a person types it by, as `Claude` and `Codex` are.
             Agent::Agy => aterm_agent::harness::upgrade_agy::PROGRAM,
-            // By its product's name: `gemini` alone reads as a word.
             Agent::Gemini => agent.product(),
         })
     }
 
-    /// THE LINE A PERSON TYPES IN THE REOPENED TAB TO RESUME THIS AGENT ON
-    /// ITS CONVERSATION, where aterm does not (a held tab: ruling 23 of the
-    /// robustness handoff, `App::say_restored_held`): its program's own
-    /// resume — a Claude Code's as every told line is
-    /// (`upgrade_drive::resume_command_kept`, the launch's flags carried; its
-    /// model record is not read here, on the event loop, so a `--model` that
-    /// record marks failed stays on), a codex-alab's validated line — behind
-    /// the environment its relaunch would carry: the Claude home and the login it ran under
-    /// ([`Self::home`], [`Self::login`]; `relaunch::required_env`'s pairs,
-    /// in that order), a Codex's `CODEX_HOME` ([`CodexRestore::home`]).
-    /// Without them the line resumes nothing: a bare `claude --resume <id>`
-    /// in a shell with another home does not find the conversation. `None`
-    /// with no conversation, an agent this build has no lane for
-    /// ([`Self::agent`]), a Codex with no validated line ([`Self::relaunched`]:
-    /// nothing aterm knows resumes it), a launch no resume can carry, or a
-    /// word no line can hold (a control character).
+    /// THE LINE A PERSON TYPES IN THE REOPENED TAB TO RESUME THIS AGENT ON ITS CONVERSATION.
     pub(crate) fn resume_line(&self) -> Option<String> {
         use aterm_agent::harness::accounts::{HOME_ENV, LOGIN_ENV};
         use aterm_agent::harness::upgrade::{Agent, Dialect, is_session_id, quote};
-        // A word as the shell reads it: bare where it is plain, else quoted.
         let word = |w: &str| -> Option<String> {
             if w.chars().any(char::is_control) {
                 return None;
@@ -1090,14 +637,6 @@ impl AgentRestore {
                 quote(Dialect::Zsh, w)
             })
         };
-        // Each agent's line by name. Muse Code's is its own resume line (`muse
-        // resume <uuid>`), on the session its table carries, behind the homes
-        // its relaunch carries; agy's its own resume hint (`agy
-        // --conversation=<uuid>`), on the conversation its table carries,
-        // after the flags that moved its config and behind its `HOME`; Gemini
-        // CLI's its own `gemini --resume <uuid>` in its project, behind its
-        // homes, only where its resume would load every turn (the pre-check,
-        // read now: a few small files of one session, once per held tab).
         let run = match self.agent()? {
             Agent::Claude | Agent::Codex => &self.run,
             Agent::Muse => {
@@ -1147,8 +686,6 @@ impl AgentRestore {
                     conversation,
                 )?,
             ),
-            // A codex-alab's own line, as the crash rule would type it: the
-            // one its record named and aterm's copy validated.
             Some(RunRestore::Codex(CodexRestore {
                 alab: Some(alab), ..
             })) => (
@@ -1163,7 +700,6 @@ impl AgentRestore {
                     .collect::<Option<Vec<_>>>()?
                     .join(" "),
             ),
-            // Told above, on its own table's session.
             Some(RunRestore::Muse(_) | RunRestore::Agy(_) | RunRestore::Gemini(_)) => return None,
             Some(RunRestore::Codex(CodexRestore { alab: None, .. })) => return None,
         };
@@ -1178,15 +714,7 @@ impl AgentRestore {
         Some(said)
     }
 
-    /// The agent it was: the one its word names ([`Self::word`]), `None`
-    /// for a word this build does not know; with no word, the agent whose run
-    /// it carries ([`Self::run`]: a Codex's), else Claude Code — the rule its
-    /// relaunch snapshot answers by
-    /// (`aterm_agent::harness::relaunch::Snapshot::agent`). A word its run
-    /// contradicts (`codex` with no run, or another agent's word beside a
-    /// Codex's run) is `None` too: the relaunch reads the run, the reopened
-    /// row and the journal the word, and no leaf is told as one agent while
-    /// it relaunches as another.
+    /// The agent it was.
     pub(crate) fn agent(&self) -> Option<aterm_agent::harness::upgrade::Agent> {
         use aterm_agent::harness::upgrade::Agent;
         let ran = self.run.as_ref().map(RunRestore::agent);
@@ -1195,8 +723,6 @@ impl AgentRestore {
         } else {
             Agent::parse(&self.word)?
         };
-        // The run each agent's leaf carries: Claude Code's none, Codex's,
-        // Muse Code's, agy's and Gemini CLI's their own.
         let agrees = match agent {
             Agent::Claude => ran.is_none(),
             Agent::Codex | Agent::Muse | Agent::Agy | Agent::Gemini => ran == Some(agent),
@@ -1205,56 +731,36 @@ impl AgentRestore {
     }
 }
 
-/// Whether an agent aterm hosted when it ended (its conversation `session` and argv, as the
-/// layout carried them) comes back on the relaunch in its reopened tab: it names a
-/// conversation and is no one-shot run (`-p`, `--version`). These are the two refusals
-/// `aterm_agent::harness::relaunch::after_host_ended` makes before it looks at the tab
-/// (`ended:no-conversation`, `ended:one-shot`); what it finds there is reported when it
-/// happens ([`crate::message_reporters::restored_agents_not_resumed`]).
+/// Return whether an agent session hosted before shutdown should be resumed on restore.
 pub(crate) fn agent_resumes(session: Option<&str>, argv: &[String]) -> bool {
     use aterm_agent::harness::upgrade::{is_session_id, one_shot};
     session.is_some_and(is_session_id) && !one_shot(argv)
 }
 
 impl TerminalLeafRestore {
-    /// The standing holds this leaf's tab carried ([`Self::holds`]), read
-    /// fail-closed ([`crate::fabric::parse_holds`]: a row that does not read
-    /// is a hold still).
+    /// The standing holds this leaf's tab carried, read fail-closed.
     pub(crate) fn carried_holds(&self) -> crate::fabric::Holds {
         crate::fabric::parse_holds(self.holds.iter().map(String::as_str))
     }
 
-    /// The agent this leaf names that the relaunch after aterm ended brings
-    /// back on its conversation ([`AgentRestore::resumes`]) — never one on a
-    /// tab that was held ([`Self::holds`], any origin, a row that does not
-    /// read among them), which is left the holder's and not relaunched, so
-    /// the reopened row does not promise it.
+    /// The agent this leaf names that the relaunch after aterm ended brings back on its conversation ([`AgentRestore::resumes`]).
     pub(crate) fn resumes_agent(&self) -> Option<&AgentRestore> {
         self.agent
             .as_deref()
             .filter(|agent| agent.resumes() && self.holds.is_empty())
     }
 
-    /// Whether this leaf's folder may be another machine's: a program held
-    /// the pane ([`Self::held`]), and the leaf carries no agent aterm hosted
-    /// there ([`Self::agent`]), which ran on this machine in that folder.
+    /// Whether this leaf's folder may be another machine's.
     pub(crate) fn folder_may_be_remote(&self) -> bool {
         self.held && self.agent.is_none()
     }
 
-    /// The folder this leaf's fresh shell is asked to start in: its `cwd`,
-    /// unless that folder may be another machine's
-    /// ([`Self::folder_may_be_remote`]) and no shell can start in it here.
-    /// Then it is not asked for and not reported: the shell starts where one
-    /// with no folder would ([`crate::spawn_folder::inherited`]).
+    /// The folder this leaf's fresh shell is asked to start in.
     pub(crate) fn start_cwd(&self) -> Option<String> {
         crate::spawn_folder::inherited(self.cwd.clone()?, || self.folder_may_be_remote())
     }
 
-    /// The seven USER fields this leaf carries, and the timer beside the
-    /// Autopilot word, as the values of the
-    /// [`SessionMeta`](crate::session_timeline::SessionMeta) they were captured
-    /// from.
+    /// The seven USER fields this leaf carries.
     pub(crate) fn carried_user_meta(&self) -> crate::session_timeline::SessionMeta {
         crate::session_timeline::SessionMeta {
             user_title: self.user_title.clone(),
@@ -1270,9 +776,7 @@ impl TerminalLeafRestore {
         }
     }
 
-    /// The setter this leaf carries ([`Self::autopilot_by`]), kept only
-    /// beside a word (§11.7.3, item 5: sanitized with the word) and only
-    /// where it parses.
+    /// The setter this leaf carries, kept only beside a word and only where it parses.
     pub(crate) fn carried_set_by(&self) -> Option<crate::session_timeline::AutopilotSetBy> {
         self.autopilot.as_ref()?;
         self.autopilot_by
@@ -1280,8 +784,7 @@ impl TerminalLeafRestore {
             .and_then(crate::session_timeline::AutopilotSetBy::parse_carried)
     }
 
-    /// The timer this leaf carries: its `land_at`, kept only beside the word
-    /// `cruise` (§9.3.6, item 2: sanitized with the word).
+    /// The timer this leaf carries.
     pub(crate) fn carried_land_at(&self) -> Option<i64> {
         self.land_at.filter(|_| {
             self.autopilot
@@ -1291,12 +794,6 @@ impl TerminalLeafRestore {
         })
     }
 
-    /// Make this leaf one `RestoredView::bounded` admits, whatever wrote it.
-    ///
-    /// The session half (cwd, title, profile) is program output: the capture copies the
-    /// engine's OSC 7 directory and OSC 0/2 title straight in. An unstorable directory or
-    /// profile is dropped and the title loses its NULs and is cut to the bound, so program
-    /// output never costs the whole manifest. A lost directory costs a cold respawn a `cd`.
     fn sanitize(&mut self) {
         self.cwd = storable_leaf_cwd(self.cwd.take());
         sanitize_leaf_title(&mut self.title);
@@ -1306,18 +803,11 @@ impl TerminalLeafRestore {
             .filter(|profile| profile.len() <= MAX_SETTINGS_ROUTE_BYTES && !profile.contains('\0'));
         self.sid = self.sid.take().filter(|sid| carried_sid(sid));
         self.lineage = self.lineage.take().filter(|sid| carried_sid(sid));
-        // An epoch no producer writes (0, or above the ceiling a corrupt or
-        // foreign value would saturate the allocator at) is dropped.
         self.log_ep = self.log_ep.and_then(crate::session_log::told_epoch);
-        // A hold row is never dropped — dropping it lifts a halt — but read
-        // fail-closed and written back in its bounded wire form.
         self.holds = crate::fabric::render_holds(&self.carried_holds());
         self.sanitize_user_metadata();
     }
 
-    /// Restore files survive across versions and are operator-writable. Normalize the user
-    /// chrome fields before they can be re-seeded onto a live session; the control path's
-    /// visible rejection cannot protect this persistence path.
     fn sanitize_user_metadata(&mut self) {
         self.user_title = self
             .user_title
@@ -1347,11 +837,7 @@ impl TerminalLeafRestore {
             .autopilot
             .as_deref()
             .and_then(|value| carried_user_value("autopilot", value));
-        // The timer goes with the word: under any word but `cruise` it is
-        // dropped, never stored.
         self.land_at = self.carried_land_at();
-        // So does its setter, under any word, and written back in its one
-        // form (§11.7.3, item 5).
         self.autopilot_by = self.carried_set_by().map(|set_by| set_by.carried());
     }
 
@@ -1373,21 +859,13 @@ impl TerminalLeafRestore {
     }
 }
 
-/// One Settings text field's unsaved draft: the `aterm.toml` key its row edits and
-/// the text the person typed but did not save. Carried by a seamless update's
-/// handoff layout only ([`NativeLeafRestore::settings_drafts`]).
+/// One Settings text field's unsaved draft.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
 pub(crate) struct SettingsDraftRestore {
     pub key: String,
     pub text: String,
 }
 
-/// Read a layout's `settings_drafts` leniently: a carry this build cannot read costs the
-/// drafts, never the layout. Every entry that is not a `{ key, text }` table, and the whole
-/// field when it is not a list, becomes an empty-key entry, which the sanitize every parse
-/// runs ([`NativeLeafRestore::sanitize_settings_drafts`]) drops and counts, so the successor
-/// says how many it could not reopen. A strict field would fail the whole parse and lose every
-/// native tab and the pane arrangement to `seamless::take_incoming`'s orphan net.
 fn lenient_settings_drafts<'de, D>(deserializer: D) -> Result<Vec<SettingsDraftRestore>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -1420,11 +898,6 @@ where
     })
 }
 
-/// One user field as a restore carries it: the presentation sanitizer, plus the carry's own
-/// rule for `attention` ([`crate::session_timeline::carried_attention`]). Both
-/// `sanitize_user_metadata` and `user_metadata_is_canonical` ask this one rule, so a sanitized
-/// leaf is canonical by construction; a disagreement would make `from_toml` refuse the whole
-/// manifest.
 fn carried_user_value(field: &str, value: &str) -> Option<String> {
     if field == "attention" {
         return crate::session_timeline::carried_attention(value);
@@ -1432,11 +905,7 @@ fn carried_user_value(field: &str, value: &str) -> Option<String> {
     crate::session_timeline::sanitize_metadata_value(field, value)
 }
 
-/// Per-view native state. Canonical document bytes and draft contents deliberately do not
-/// appear here: Editor durability is addressed by the document journal and `durable_seq`.
-/// The one exception is [`Self::settings_drafts`], carried by a seamless update's handoff
-/// layout and by nothing else. Unknown app versions may put a bounded, copyable
-/// description in `metadata`; it is data, never executable input.
+/// Per-view native state.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
 pub(crate) struct NativeLeafRestore {
     pub restore_tag: String,
@@ -1444,8 +913,6 @@ pub(crate) struct NativeLeafRestore {
     pub route: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub uri: Option<String>,
-    /// This Editor is the canonical aterm.toml Manual surface. Additive for
-    /// backward compatibility; ordinary Editor restores remain `false`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub config_editor: bool,
     #[serde(default)]
@@ -1462,24 +929,12 @@ pub(crate) struct NativeLeafRestore {
     pub durable_seq: u64,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub metadata: String,
-    /// A Settings view's unsaved field drafts, in key order, carried only by a seamless
-    /// update's handoff layout (`App::capture_handoff_layout`), so the successor reopens the
-    /// view with the typed text still unsaved. A durable manifest (quit, crash journal,
-    /// closed-tab recovery) never holds one: only the handoff continues the same session.
-    ///
-    /// Absent when no draft is carried, so older consumers' bytes are unchanged. An older
-    /// consumer ignores the field (this struct denies no unknown field), which is why the
-    /// seamless lane refuses to carry drafts to an older build. A value this build cannot read
-    /// is dropped and counted ([`lenient_settings_drafts`]).
     #[serde(
         default,
         skip_serializing_if = "Vec::is_empty",
         deserialize_with = "lenient_settings_drafts"
     )]
     pub settings_drafts: Vec<SettingsDraftRestore>,
-    /// How many carried drafts the parse dropped (unreadable, not carriable, repeated, past
-    /// [`MAX_SETTINGS_DRAFTS_PER_VIEW`], or not on a Settings leaf), so the successor says a
-    /// draft was lost. Never written; always zero in a capture.
     #[serde(skip)]
     pub settings_drafts_unreadable: usize,
 }
@@ -1528,10 +983,6 @@ impl NativeLeafRestore {
         }
     }
 
-    /// Whether [`Self::settings_drafts`] is what
-    /// [`Self::sanitize_settings_drafts`] leaves: carriable, one per key, within
-    /// the cap, and only on a Settings leaf. Part of the layout's shape check,
-    /// so a manifest built around the sanitize is refused rather than carried.
     fn settings_drafts_are_canonical(&self) -> bool {
         let mut keys = std::collections::BTreeSet::new();
         self.settings_drafts.is_empty()
@@ -1543,10 +994,6 @@ impl NativeLeafRestore {
                 }))
     }
 
-    /// Keep exactly the carried drafts this build can reopen (carriable, the first for its
-    /// key, at most [`MAX_SETTINGS_DRAFTS_PER_VIEW`], only on a Settings leaf) and count the
-    /// rest into [`Self::settings_drafts_unreadable`]. Idempotent and a no-op over a capture,
-    /// so the capture stays a fixed point of the parse.
     fn sanitize_settings_drafts(&mut self) {
         if self.settings_drafts.is_empty() {
             return;
@@ -1636,27 +1083,19 @@ impl NativeLeafRestore {
     }
 }
 
-/// A recoverable leaf occupying the exact split position of an unavailable or malformed
-/// app. It retains bounded metadata for diagnostics/copying and never falls back to a
-/// shell command or silently deletes a healthy sibling.
+/// A recoverable leaf occupying the exact split position of an unavailable or malformed app.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
 pub(crate) struct PlaceholderLeafRestore {
     pub restore_tag: String,
     pub reason: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub metadata: String,
-    /// The terminal leaf this placeholder stands in for, when a seamless successor retired it
-    /// because no session was handed for it ([`RestoreManifest::placed_for_handed`]). Its
-    /// outgoing pool id matches a held pane's carried screen (`App::restore_held_leaf`), and
-    /// its user identity (`meta set` title, icon, role, description) is what
-    /// that pane is shown with. Never on the wire: set only by the successor's own placement.
     #[serde(skip)]
     pub unhanded: Option<Box<TerminalLeafRestore>>,
 }
 
 impl PlaceholderLeafRestore {
-    /// The outgoing pool id of the retired terminal leaf this placeholder
-    /// stands in for ([`Self::unhanded`]).
+    /// The outgoing pool id of the retired terminal leaf this placeholder stands in for.
     #[cfg(test)]
     #[must_use]
     pub(crate) fn unhanded_local_id(&self) -> Option<u64> {
@@ -1664,7 +1103,6 @@ impl PlaceholderLeafRestore {
     }
 }
 
-/// Content descriptor at one recursive restore leaf.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 #[allow(
@@ -1686,8 +1124,6 @@ impl RestoredView {
         match self {
             Self::Terminal(terminal) => terminal.sanitize(),
             Self::Native(native) => {
-                // Before the validation: a draft this build cannot reopen costs
-                // that draft (counted), never the leaf.
                 native.sanitize_settings_drafts();
                 let Some(reason) = native.validation_error() else {
                     return;
@@ -1736,7 +1172,6 @@ impl RestoredView {
     }
 }
 
-/// Recursive, content-agnostic persisted split tree.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 #[serde(tag = "node", rename_all = "snake_case")]
 #[allow(
@@ -1815,10 +1250,6 @@ impl RestoredSplitTree {
             }
     }
 
-    /// Every terminal leaf of this tree whose `local_id` is in `unhanded`
-    /// becomes a [`RestoredView::Placeholder`] saying no session was carried
-    /// for it — the pane, its place in the split and the tab's focus path all
-    /// kept. See [`RestoreManifest::placed_for_handed`].
     fn retire_unhanded_terminals(&mut self, unhanded: &[u64]) {
         match self {
             Self::Leaf { view } => {
@@ -1828,8 +1259,6 @@ impl RestoredSplitTree {
                 if !terminal.local_id.is_some_and(|id| unhanded.contains(&id)) {
                     return;
                 }
-                // The pane's directory and title as the Recovery view's copyable metadata,
-                // bounded in chars so the bytes stay under the leaf's cap whatever the script.
                 let metadata = format!(
                     "folder: {}\ntitle: {}",
                     terminal.cwd.as_deref().unwrap_or("none"),
@@ -1853,8 +1282,7 @@ impl RestoredSplitTree {
         }
     }
 
-    /// Every terminal leaf of this tree names no pool id
-    /// ([`TerminalLeafRestore::local_id`]): see [`WindowLayout::forget_pool_ids`].
+    /// Every terminal leaf of this tree names no pool id ([`TerminalLeafRestore::local_id`]).
     pub(crate) fn forget_pool_ids(&mut self) {
         match self {
             Self::Leaf {
@@ -1868,8 +1296,6 @@ impl RestoredSplitTree {
         }
     }
 
-    /// Every Settings leaf's carried drafts in this tree, and how many the
-    /// parse had to drop — see [`RestoreManifest::carried_settings_drafts`].
     fn collect_settings_drafts(
         &self,
         drafts: &mut Vec<SettingsDraftRestore>,
@@ -1890,8 +1316,7 @@ impl RestoredSplitTree {
         }
     }
 
-    /// The first terminal leaf in rebuild order (first branch before second); see
-    /// [`WindowLayout::bootstrap_local_id`].
+    /// The first terminal leaf in rebuild order (first branch before second).
     pub(crate) fn first_terminal_leaf(&self) -> Option<&TerminalLeafRestore> {
         match self {
             Self::Leaf {
@@ -1904,8 +1329,6 @@ impl RestoredSplitTree {
         }
     }
 
-    /// The first terminal leaf that recorded a directory, in the walk of
-    /// [`Self::first_terminal_leaf`] (see [`WindowLayout::bootstrap_cwd`]).
     fn first_terminal_with_cwd(&self) -> Option<&TerminalLeafRestore> {
         match self {
             Self::Leaf {
@@ -1919,8 +1342,7 @@ impl RestoredSplitTree {
     }
 }
 
-/// One complete tab recovery record. Focus and zoom are properties of the container,
-/// never duplicated into each leaf.
+/// One complete tab recovery record.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 pub(crate) struct RestoredTab {
     pub root: RestoredSplitTree,
@@ -1945,8 +1367,6 @@ impl RestoredTab {
         self.focused_leaf().is_some()
     }
 
-    /// The leaf [`Self::focused_path`] names, or `None` when the path runs off
-    /// the tree (a shape [`Self::shape_is_valid`] refuses).
     fn focused_leaf(&self) -> Option<&RestoredView> {
         let mut node = &self.root;
         for branch in &self.focused_path {
@@ -1965,9 +1385,7 @@ impl RestoredTab {
     }
 }
 
-/// One node of a persisted tab pane tree. A `Leaf` drops the process-local session id and
-/// keeps the shell's `cwd` + `title` (so the session can be respawned there); a `Split`
-/// preserves the divider direction + ratio.
+/// One node of a persisted tab pane tree.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub(crate) enum PaneLayout {
@@ -1976,12 +1394,8 @@ pub(crate) enum PaneLayout {
         cwd: Option<String>,
         #[serde(default)]
         title: String,
-        /// The one leaf that held keyboard focus in its tab.
         #[serde(default)]
         focused: bool,
-        /// The outgoing session's pool id, captured only so a seamless-update boot can
-        /// re-adopt the live shell for this pane (matched to its handed-off fd). A cold
-        /// restore ignores it and forks fresh.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         local_id: Option<u64>,
     },
@@ -1994,8 +1408,7 @@ pub(crate) enum PaneLayout {
 }
 
 impl PaneLayout {
-    /// A plain single-pane leaf — a test-fixture convenience (production capture goes
-    /// through [`crate::pane::PaneTree::to_layout`], which builds variants directly).
+    /// A plain single-pane leaf.
     #[cfg(test)]
     pub(crate) fn leaf(cwd: Option<String>, title: String, focused: bool) -> Self {
         PaneLayout::Leaf {
@@ -2006,9 +1419,6 @@ impl PaneLayout {
         }
     }
 
-    /// The legacy mirror's leaves under the same rule as `TerminalLeafRestore::sanitize`, so an
-    /// older consumer reading this projection is not handed a directory the canonical tree
-    /// dropped.
     fn sanitize_leaf_metadata(&mut self) {
         match self {
             PaneLayout::Leaf { cwd, title, .. } => {
@@ -2022,11 +1432,6 @@ impl PaneLayout {
         }
     }
 
-    /// Every leaf's id that `forget` names is forgotten: the legacy mirror's
-    /// half of [`RestoreManifest::placed_for_handed`] — a leaf naming a session
-    /// that was not handed names none, so no reader of this projection
-    /// (`WindowLayout::bootstrap_local_id`'s fallback) can pick it as a shell
-    /// to adopt — and of [`WindowLayout::forget_pool_ids`], every id.
     fn forget_local_ids(&mut self, forget: &dyn Fn(u64) -> bool) {
         match self {
             PaneLayout::Leaf { local_id, .. } => {
@@ -2049,9 +1454,7 @@ impl PaneLayout {
         }
     }
 
-    /// Every `Leaf` in this subtree in tree order (left-to-right / top-to-bottom), the order
-    /// [`crate::pane::PaneTree::rebuild`] assigns fresh session ids, so `leaves()[i]`'s cwd is
-    /// the spawn cwd for `fresh[i]`.
+    /// Every `Leaf` in this subtree in tree order (left-to-right / top-to-bottom).
     pub(crate) fn leaves(&self) -> Vec<&PaneLayout> {
         let mut out = Vec::with_capacity(self.leaf_count());
         self.collect_leaves(&mut out);
@@ -2076,9 +1479,7 @@ impl PaneLayout {
         }
     }
 
-    /// This leaf's outgoing session pool id, when captured for a seamless-update handoff
-    /// (`None` for a `Split`, and for any cold-quit leaf). The boot adoption matches this
-    /// to a handed-off live fd to re-adopt the running shell into this exact pane.
+    /// This leaf's outgoing session pool id, when captured for a seamless-update handoff (`None` for a `Split`, and for any cold-quit leaf).
     pub(crate) fn local_id(&self) -> Option<u64> {
         match self {
             PaneLayout::Leaf { local_id, .. } => *local_id,
@@ -2087,11 +1488,7 @@ impl PaneLayout {
     }
 }
 
-/// Durable identity of one native tab. Titles and indicators are deliberately absent:
-/// the live app derives them again from the Settings route or canonical document grant.
-/// This legacy mirror omits view state; [`NativeLeafRestore`] carries bounded selections
-/// and viewport anchors in the canonical layout. Process-local async target identities
-/// are never persisted.
+/// Durable identity of one native tab.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum NativeTabRestore {
@@ -2117,16 +1514,7 @@ impl NativeTabRestore {
         }
     }
 
-    /// Whether this descriptor may join a window's legacy mirror that already holds `mirror`:
-    /// no second Settings descriptor and no second copy of an equal one. The one rule for the
-    /// mirror, read and written: every build's parse refuses a window whose `native_tabs`
-    /// breaks it ([`WindowLayout::shape_is_valid`]), so the capture leaves the offending
-    /// descriptor out of the mirror, as it leaves out a heterogeneous split tab; the canonical
-    /// `restored_tabs` keep that tab whole.
-    ///
-    /// A live window can hold such a pair: an update's fold
-    /// ([`RestoreManifest::fold_into_caps`]) moves tabs whole, so a spilled window's Settings
-    /// or document can land beside an equal one.
+    /// Whether this descriptor may join a window's legacy mirror that already holds `mirror`.
     pub(crate) fn joins_mirror(&self, mirror: &[Self]) -> bool {
         let is_settings = |descriptor: &Self| matches!(descriptor, Self::Settings { .. });
         !mirror.contains(self) && !(is_settings(self) && mirror.iter().any(is_settings))
@@ -2151,8 +1539,7 @@ impl NativeTabRestore {
     }
 }
 
-/// Canonical chrome order without persisting any live [`crate::tab_model::TabId`]. Each
-/// entry is an index into the matching compatibility list in [`WindowLayout`].
+/// Canonical chrome order without persisting any live [`crate::tab_model::TabId`].
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum TabOrderEntry {
@@ -2160,29 +1547,21 @@ pub(crate) enum TabOrderEntry {
     Native { index: usize },
 }
 
-/// One window's macOS show state at capture time. Every field is `Option`: `None` is "not
-/// captured", and restore treats it as the window's ordinary state, never a forced change.
-/// See `crate::window_show` for what the capture reads and what a restore does with it.
+/// One window's macOS show state at capture time.
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub(crate) struct WindowShow {
-    /// The window was in native full screen (its own Space).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fullscreen: Option<bool>,
-    /// The window was miniaturized into the Dock.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub minimized: Option<bool>,
-    /// Its place in the window stack, front to back: 0 is the frontmost. A rank: only the order
-    /// means anything, and restore tolerates gaps and ties.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub z_order: Option<u32>,
-    /// It was the key window — the one typing went to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key: Option<bool>,
 }
 
 impl WindowShow {
-    /// Nothing captured: the value every non-macOS capture, headless capture and
-    /// older manifest carries.
+    /// Nothing captured.
     pub(crate) const UNKNOWN: Self = Self {
         fullscreen: None,
         minimized: None,
@@ -2190,95 +1569,45 @@ impl WindowShow {
         key: None,
     };
 
-    /// Whether nothing was captured — the `skip_serializing_if` that keeps such
-    /// a window's wire byte-identical to an older build's.
+    /// Whether nothing was captured.
     pub(crate) fn is_unknown(&self) -> bool {
         *self == Self::UNKNOWN
     }
 }
 
-/// One window's persisted state: its size, position, the active tab index, and one pane
-/// tree per tab.
+/// One window's persisted state.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 pub(crate) struct WindowLayout {
     pub rows: u16,
     pub cols: u16,
     #[serde(default)]
     pub active_tab: usize,
-    /// Outer window position (physical px), when known, so a reopened window (cold restore or
-    /// seamless update) comes back where it was instead of at the OS cascade default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outer_x: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outer_y: Option<i32>,
-    /// Whether the window was maximized at capture time, so it reopens maximized. With
-    /// `Some(true)` the Windows capture stores `rcNormalPosition`, the OS's restore-down rect,
-    /// in `outer_x`/`outer_y` (`App::capture_restore_manifest`), so un-maximizing after a
-    /// restore lands where it would have before the quit. `None` (an older manifest) is
-    /// treated as `Some(false)`. Written on Windows only; `commit_layout_topology` normalizes
-    /// it out with the position.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub maximized: Option<bool>,
-    /// The window's raw inner size, `[width, height]` in physical px (`WindowState::win_px`):
-    /// never a maximized window's (its row holds the normal grid), and in a durable capture
-    /// never a full-screen one's. Rows without it (older writers) restore inheriting the front
-    /// window's grid.
-    ///
-    /// A row that carries it is recreated at its own grid (`rows`×`cols`), and at this size
-    /// when the size holds exactly that grid at the launch's metrics (`App::attach_frame_px`),
-    /// else at the grid's exact frame. An update needs it because a font zoom re-grids inside
-    /// the window it has: a zoomed window is its grid's frame plus under a cell per axis, and
-    /// recreating it at the exact frame would make the zoom back out fit a row and a column
-    /// fewer. Window 0's size rides `WindowCarry::inner_px`, which outranks this row.
-    ///
-    /// On the wire, so the layout digest covers it (the child hashes the bytes it read,
-    /// `seamless::layout_wire_digest`); live like the position, so `commit_layout_topology`
-    /// normalizes it out.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inner_px: Option<[u32; 2]>,
-    /// Whether the window had its PRESENCE ROW committed under its chrome, in
-    /// an older build's seamless update layout. RETIRED with the row (owner
-    /// surfaces, 2026-10-16): this build never sets it and reads it nowhere;
-    /// it stays on the wire so an older successor's reader is whole. A sizing
-    /// fact like `inner_px`, so `commit_layout_topology` normalizes it out.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub presence_row: bool,
-    /// The window's macOS show state (full screen, minimized, stack place, key window), so a
-    /// seamless update keeps a full-screen window in its Space and keys the window typing went
-    /// to. Captured on macOS only (`App::capture_restore_manifest`); elsewhere, headless and in
-    /// older manifests it is [`WindowShow::UNKNOWN`], which restore treats as "change nothing"
-    /// and the wire omits. An older reader ignores the table, and the child's digest hashes
-    /// the wire it read (`seamless::layout_wire_digest`). Live, so `commit_layout_topology`
-    /// normalizes it out.
     #[serde(default, skip_serializing_if = "WindowShow::is_unknown")]
     pub show: WindowShow,
-    /// Terminal-only compatibility projection, byte-compatible with the v1 layout.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tabs: Vec<PaneLayout>,
-    /// Stable native app descriptors. No title or process-local identity is persisted.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub native_tabs: Vec<NativeTabRestore>,
-    /// Canonical interleaving of `tabs` and `native_tabs`. An absent list is the legacy
-    /// terminal-only order, allowing pre-native manifests to decode unchanged.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tab_order: Vec<TabOrderEntry>,
-    /// Canonical active chrome index. `active_tab` remains the legacy terminal-projection
-    /// active index; this additive field disambiguates mixed windows.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_item: Option<usize>,
-    /// Canonical tabs. The v1 projections above stay so a rolling seamless update can decode
-    /// the layout; new code prefers this recursive form when present.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub restored_tabs: Vec<RestoredTab>,
 }
 
 impl WindowLayout {
-    /// The handed-off shell id of the pane this window's bootstrap session fills. The deferred
-    /// restore grafts the window's running session onto the canonical tree's first terminal
-    /// leaf in rebuild order (tabs in order, first branch before second), so the shell adopted
-    /// as that session must be the one that leaf names (`main_entry` picks window 0's by this,
-    /// `apply_restore_manifest` every further window's). The legacy `tabs` mirror lists
-    /// all-terminal tabs only, so it speaks only for a layout with no canonical terminal leaf.
+    /// The handed-off shell id of the pane this window's bootstrap session fills.
     pub(crate) fn bootstrap_local_id(&self) -> Option<u64> {
         match self.bootstrap_terminal_leaf() {
             Some(leaf) => leaf.local_id,
@@ -2286,14 +1615,7 @@ impl WindowLayout {
         }
     }
 
-    /// The working directory of the pane this window's bootstrap session fills (the leaf
-    /// [`Self::bootstrap_local_id`] names), so its session starts where that pane's shell was.
-    ///
-    /// When that leaf recorded none (no OSC 7, or the quit's capture found its terminal
-    /// locked: `App::restore_session_meta`), the first directory another terminal pane of the
-    /// same tab recorded, in rebuild order; never another tab's.
-    /// [`TerminalLeafRestore::start_cwd`] decides it, so a program's remote folder (ssh) is not
-    /// asked for; the legacy mirror records no program and passes its folder as it is.
+    /// The working directory of the pane this window's bootstrap session fills, so its session starts where that pane's shell was.
     pub(crate) fn bootstrap_cwd(&self) -> Option<String> {
         match self.bootstrap_tab() {
             Some(tab) => tab.root.first_terminal_with_cwd()?.start_cwd(),
@@ -2307,22 +1629,17 @@ impl WindowLayout {
         }
     }
 
-    /// The canonical tree's first terminal leaf, in rebuild order: the leaf
-    /// the deferred restore grafts this window's bootstrap session onto.
     fn bootstrap_terminal_leaf(&self) -> Option<&TerminalLeafRestore> {
         self.bootstrap_tab()?.root.first_terminal_leaf()
     }
 
-    /// The first canonical tab with a terminal leaf: the tab holding
-    /// [`Self::bootstrap_terminal_leaf`].
     fn bootstrap_tab(&self) -> Option<&RestoredTab> {
         self.restored_tabs
             .iter()
             .find(|tab| tab.root.first_terminal_leaf().is_some())
     }
 
-    /// Validated canonical order. Legacy terminal-only manifests synthesize the identity
-    /// order. Duplicate/out-of-range indices fail closed rather than aliasing descriptors.
+    /// Validated canonical order.
     pub(crate) fn canonical_order(&self) -> Option<Vec<TabOrderEntry>> {
         if self.tab_order.is_empty() {
             return self.native_tabs.is_empty().then(|| {
@@ -2377,9 +1694,6 @@ impl WindowLayout {
     }
 
     fn shape_is_valid(&self) -> bool {
-        // Unique descriptors, at most one of them Settings: each joins the
-        // mirror ahead of it (`NativeTabRestore::joins_mirror`, the rule the
-        // capture writes by).
         let native_mirror_is_valid = self
             .native_tabs
             .iter()
@@ -2401,10 +1715,6 @@ impl WindowLayout {
             && self.restored_tabs.iter().all(RestoredTab::shape_is_valid)
     }
 
-    /// Every tab of this window, both projections, made one `from_toml` admits: the one
-    /// manifest-wide sanitize, run by `RestoreManifest::new` (so every capture is already a
-    /// fixed point before an update's `layout_digest`) and by `from_toml` (so an older writer's
-    /// layout is recovered rather than refused).
     fn sanitize(&mut self) {
         for tab in &mut self.tabs {
             tab.sanitize_leaf_metadata();
@@ -2414,11 +1724,6 @@ impl WindowLayout {
         }
     }
 
-    /// A window [`RestoreManifest::fold_into_caps`] made for a spill from
-    /// `donor`: the donor's grid and the size that holds it, so the shells
-    /// moved into it keep their grid; no position, show state or maximize,
-    /// so the window system places it; and its first tab in front. No tabs
-    /// yet: the fold moves them in.
     fn spill_of(donor: &Self) -> Self {
         Self {
             rows: donor.rows,
@@ -2438,11 +1743,7 @@ impl WindowLayout {
         }
     }
 
-    /// Drop the legacy mirror (`tabs`, `native_tabs`, `tab_order` and the
-    /// mirror's `active_tab`) of a window [`RestoreManifest::fold_into_caps`]
-    /// moved tabs out of. The canonical `restored_tabs` stay, and the empty
-    /// mirror is one every reader admits (`canonical_order` of an empty
-    /// mirror is the empty order); see the fold for why the mirror goes.
+    /// Clear the legacy flat tab mirror fields from the manifest.
     pub(crate) fn forget_legacy_mirror(&mut self) {
         self.tabs.clear();
         self.native_tabs.clear();
@@ -2450,17 +1751,7 @@ impl WindowLayout {
         self.active_tab = 0;
     }
 
-    /// NO POOL ID OF THE LAUNCH THAT WROTE IT on any leaf of this window —
-    /// its tabs' ([`RestoredSplitTree::forget_pool_ids`]) or its legacy
-    /// mirror's: a window, or a tab, a cold drain still owes a quit's layout
-    /// (`app_restore::RestoreDrain::carry_owed`; RV-SURV-1). Those ids name
-    /// the earlier launch's shells, and this one mints its own again from 0
-    /// (`app_restore::LeafIds::Retired`: only a collision), so the fills that
-    /// read a leaf's session by its id ([`RestoreManifest::fill_agents`],
-    /// [`RestoreManifest::fill_holds`]) took the agent and the owner's hold
-    /// such a leaf carries off it, or put a live tab's on it. A cold layout
-    /// adopts nothing by them (`local_id` is adoption-only), and the next
-    /// launch reopens the leaf as it did.
+    /// NO POOL ID OF THE LAUNCH THAT WROTE IT on any leaf of this window.
     pub(crate) fn forget_pool_ids(&mut self) {
         for tab in &mut self.restored_tabs {
             tab.root.forget_pool_ids();
@@ -2545,8 +1836,6 @@ impl RestoredTab {
                     let second = convert(second, path, focused);
                     path.pop();
                     RestoredSplitTree::Split {
-                        // Legacy PaneLayout names the divider orientation, while the
-                        // recursive model names the child-placement axis.
                         axis: match dir {
                             SplitKind::Vertical => SplitKind::Horizontal,
                             SplitKind::Horizontal => SplitKind::Vertical,
@@ -2585,48 +1874,26 @@ impl RestoredTab {
     }
 }
 
-/// What a seamless update's producer folded to bring its desk within the layout's caps
-/// ([`RestoreManifest::fold_into_caps`]): windows past [`MAX_WINDOWS`] that became tabs, tabs
-/// past [`MAX_TABS_PER_WINDOW`] that moved to another window, and which panes were in front
-/// before anything moved. The successor says it once (`update_words::layout_folded`). Omitted
-/// from the wire when nothing was folded; an older reader ignores the table and places the
-/// folded layout as it is.
+/// What a seamless update's producer folded to bring its desk within the layout's caps ([`RestoreManifest::fold_into_caps`]).
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug, Default)]
 pub(crate) struct LayoutFold {
-    /// Windows past [`MAX_WINDOWS`] whose tabs went into the windows that fit.
     #[serde(default)]
     pub windows: u32,
-    /// Tabs past a window's [`MAX_TABS_PER_WINDOW`] moved into another window.
     #[serde(default)]
     pub tabs: u32,
-    /// The panes in front before the fold: each captured window's active tab's focused
-    /// terminal ([`RestoreManifest::front_terminal_ids`]). Those are the panes whose titles the
-    /// outgoing build kept current in their session records (`publish_active_terminal_title`),
-    /// which the seamless adoption checks (`seamless::take_incoming`). The fold changes which
-    /// tab each window shows, so a folded layout answers by this list rather than the windows'
-    /// `active_item`. Written only by a fold that moved something; at most one entry per
-    /// distinct tab, so at most [`MAX_FOLD_FRONT`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub front: Vec<u64>,
 }
 
-/// The most [`LayoutFold::front`] entries a parse keeps: one per tab of a
-/// layout at both caps, since each entry is the focus of a distinct tab and
-/// tabs move whole. Every fold the park admits is within it, so the parse is a
-/// fixed point of the producer's layout.
 const MAX_FOLD_FRONT: usize = MAX_WINDOWS * MAX_TABS_PER_WINDOW;
 
 impl LayoutFold {
-    /// The default value: what every layout within the caps carries, and the
-    /// one the wire leaves out.
+    /// The default value.
     pub(crate) fn is_none(&self) -> bool {
         *self == Self::default()
     }
 
-    /// Whether the fold moved anything: a window merged into tabs, or a tab
-    /// moved to another window. What the successor says, and when
-    /// [`Self::front`] (not the windows' `active_item`) names the panes in
-    /// front.
+    /// Whether the fold moved anything.
     pub(crate) fn folded(&self) -> bool {
         self.windows > 0 || self.tabs > 0
     }
@@ -2636,8 +1903,6 @@ impl LayoutFold {
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 pub(crate) struct RestoreManifest {
     pub schema: u32,
-    /// What the producer folded to fit the caps; only a seamless update's
-    /// layout ever carries one ([`Self::fold_into_caps`]).
     #[serde(default, skip_serializing_if = "LayoutFold::is_none")]
     pub fold: LayoutFold,
     pub windows: Vec<WindowLayout>,
@@ -2656,37 +1921,12 @@ impl RestoreManifest {
         }
     }
 
-    /// Apply the layout caps in the writer. Nothing at runtime limits windows or tabs, but a
-    /// layout holds at most [`MAX_WINDOWS`] windows of [`MAX_TABS_PER_WINDOW`] tabs and every
-    /// build's parse leaves out what is past them ([`Self::from_toml`]). A seamless update's
-    /// layout must name every shell it hands ([`Self::placed_for_handed`]), so the handoff
-    /// capture folds what is past the caps into what fits:
-    ///
-    /// * windows past the [`MAX_WINDOWS`]th become tabs of the last window that fits, in
-    ///   order, after its own;
-    /// * a window's tabs past [`MAX_TABS_PER_WINDOW`] move, in order, to the next window with
-    ///   room (after it, then from the first), or to a window made for them (at the donor's
-    ///   grid and size, placed by the window system) while the desk is under the window cap.
-    ///   When every window is full the rest stays put, and the park refuses the desk typed
-    ///   ([`Self::why_not_whole`]);
-    /// * a window that lost tabs keeps its canonical tabs only: its legacy mirror (`tabs`,
-    ///   `native_tabs`, `tab_order`) would name a moved tab's shell in two windows, and no
-    ///   build since v0.21.0 reads the mirror beside `restored_tabs` but to pick a bootstrap
-    ///   shell for a tree with no terminal pane. A window that only received tabs keeps its
-    ///   mirror;
-    /// * a donor whose front tab moved shows its last remaining tab, and a window made for a
-    ///   spill shows the moved front tab when it holds it.
-    ///
-    /// Tabs move whole, so every handed shell is named as often as before. A layout within the
-    /// caps is left byte-identical, and [`Self::fold`] records what was folded for the
-    /// successor to say once.
+    /// Apply the layout caps in the writer.
     pub(crate) fn fold_into_caps(&mut self) {
         let over_tab_cap = |window: &WindowLayout| window.restored_tabs.len() > MAX_TABS_PER_WINDOW;
         if self.windows.len() <= MAX_WINDOWS && !self.windows.iter().any(over_tab_cap) {
             return;
         }
-        // The panes in front as the outgoing build shows them, before a tab
-        // moves: `LayoutFold::front`.
         let front = self.windows_front_terminal_ids();
         let mut fold = LayoutFold::default();
         if self.windows.len() > MAX_WINDOWS {
@@ -2754,10 +1994,6 @@ impl RestoreManifest {
         self.fold = fold;
     }
 
-    /// Where [`Self::fold_into_caps`] spills `donor`'s tabs past the cap: the
-    /// next window with room after it, then from the first; else a window
-    /// made for them (`Some(self.windows.len())`) while the desk is under
-    /// the window cap; else nowhere.
     fn spill_host_for(&self, donor: usize) -> Option<usize> {
         let count = self.windows.len();
         (donor + 1..count)
@@ -2766,27 +2002,13 @@ impl RestoreManifest {
             .or_else(|| (count < MAX_WINDOWS).then_some(count))
     }
 
-    /// Whether [`Self::from_toml`] reads every window of this layout back as
-    /// it is ([`Self::why_not_whole`] says nothing): the tests' shorthand.
+    /// Whether [`Self::from_toml`] reads every window of this layout back as it is ([`Self::why_not_whole`] says nothing).
     #[cfg(test)]
     pub(crate) fn admits_whole(&self) -> bool {
         self.why_not_whole().is_none()
     }
 
-    /// Why [`Self::from_toml`] would not read every window of this layout back as it is (past
-    /// the window cap, or a window in a shape this build does not rebuild), or `None`. A
-    /// seamless update's park asks this before committing to its layout
-    /// (`app_update_handoff::commit_handoff_layout`): a layout that fails it fails the worker's
-    /// round trip on every attempt, so the park refuses it as a fact about the desk, retried
-    /// when the desk changes. After the fold only a desk past what any layout holds fails: more
-    /// than 64 windows of 256 tabs, or a tab past 256 panes or 31 nested splits.
-    ///
-    /// In the words the park's refusal carries, which the update's record
-    /// shows as they are ([`UPDATE_CAP_KEY`] in each): what is past a cap, by
-    /// how much, and where — or, for a window in another shape this build does
-    /// not read back, that window, never a cap it is within (the D5 review: a
-    /// window holding two Settings descriptors in its legacy mirror was refused
-    /// as "past what one handoff layout holds").
+    /// Return why [`Self::from_toml`] would reject any window in this layout.
     #[cfg(any(unix, test))]
     pub(crate) fn why_not_whole(&self) -> Option<String> {
         if self.windows.len() > MAX_WINDOWS {
@@ -2805,9 +2027,6 @@ impl RestoreManifest {
             tab.root.leaf_count() > MAX_LEAVES_PER_TAB || tab.root.depth() > MAX_SPLIT_DEPTH
         };
         Some(if window.restored_tabs.len() > MAX_TABS_PER_WINDOW {
-            // The park sees the layout after the fold, which moves whole tabs
-            // and drops none: a window still past the tab cap means the total
-            // is past every window's, and the total is what the person has.
             let total: usize = self.windows.iter().map(|w| w.restored_tabs.len()).sum();
             format!(
                 "{total} tabs are open, more than the {} ({MAX_WINDOWS} windows of \
@@ -2824,7 +2043,6 @@ impl RestoreManifest {
                     root.leaf_count()
                 )
             } else {
-                // `depth` counts the panes' own level: the splits are one fewer.
                 format!(
                     "tab {tab} of window {number} is split {} levels deep, more than the {} \
                      {UPDATE_CAP_KEY}",
@@ -2846,14 +2064,7 @@ impl RestoreManifest {
             .all(|w| w.tabs.is_empty() && w.native_tabs.is_empty() && w.restored_tabs.is_empty())
     }
 
-    /// The exact set of live terminal ids a seamless-update layout carries, sorted and
-    /// distinct. Durable manifests omit these ids, so they are no handoff authority. A terminal
-    /// leaf with no id is rejected: it would be backed by a shell spawned during the overlap.
-    ///
-    /// An id named twice is one session shown twice (`Open Session in New Window`,
-    /// Cmd-Shift-O) and is accepted: the successor adopts the shell at the first leaf it
-    /// rebuilds that names it and shows it again at every later one
-    /// (`App::restore_terminal_leaf`).
+    /// The exact set of live terminal ids a seamless-update layout carries, sorted and distinct.
     pub(crate) fn seamless_terminal_ids(&self) -> Option<Vec<u64>> {
         fn collect(node: &RestoredSplitTree, ids: &mut Vec<u64>) -> Option<()> {
             match node {
@@ -2880,10 +2091,7 @@ impl RestoreManifest {
         Some(ids)
     }
 
-    /// Every canonical terminal leaf that names a handed-off shell (`local_id`), cloned, in
-    /// rebuild order. The orphan net (`App::adopt_orphan_shells_as_tabs`) runs after the
-    /// rebuild has consumed the manifest, and puts on each shell the rebuild left over the user
-    /// identity of the leaf that names it.
+    /// Every canonical terminal leaf that names a handed-off shell (`local_id`), cloned, in rebuild order.
     pub(crate) fn handed_off_leaves(&self) -> Vec<TerminalLeafRestore> {
         fn collect(node: &RestoredSplitTree, leaves: &mut Vec<TerminalLeafRestore>) {
             match node {
@@ -2907,17 +2115,7 @@ impl RestoreManifest {
         leaves
     }
 
-    /// The handed-off shells (`local_id`) of the panes in front: in each window, the terminal
-    /// leaf focused in its active tab, as the capture recorded them (`active_item` into
-    /// `restored_tabs`, then that tab's `focused_path`). Exactly the panes whose titles an
-    /// outgoing build kept current in their session records (`publish_active_terminal_title`
-    /// publishes the active tab's focused terminal only), which the seamless adoption needs
-    /// (`seamless::take_incoming`).
-    ///
-    /// A window with no active item (its active tab had no descriptor, or a migrated legacy
-    /// layout) names no pane, nor does one whose focused leaf is native or names no handed-off
-    /// shell. A folded layout ([`Self::fold_into_caps`]) answers by [`LayoutFold::front`], since
-    /// its windows no longer show the tabs the outgoing build showed.
+    /// The handed-off shells (`local_id`) of the panes in front.
     pub(crate) fn front_terminal_ids(&self) -> Vec<u64> {
         if self.fold.folded() {
             return self.fold.front.clone();
@@ -2925,7 +2123,6 @@ impl RestoreManifest {
         self.windows_front_terminal_ids()
     }
 
-    /// [`Self::front_terminal_ids`] read off the windows as they are.
     fn windows_front_terminal_ids(&self) -> Vec<u64> {
         self.windows
             .iter()
@@ -2942,11 +2139,7 @@ impl RestoreManifest {
             .collect()
     }
 
-    /// Put on every terminal leaf the agent `hosted` says its session
-    /// (`local_id`) runs — the crash journal's capture ([`crate::crash_journal`]);
-    /// a leaf whose session hosts none carries none. A leaf that names no
-    /// session of this launch — a tab a cold drain still owed
-    /// ([`WindowLayout::forget_pool_ids`]) — keeps the agent it carries.
+    /// Put on every terminal leaf the agent `hosted` says its session (`local_id`) runs.
     pub(crate) fn fill_agents(&mut self, hosted: &dyn Fn(u64) -> Option<AgentRestore>) {
         self.fill_terminals(&mut |terminal| {
             if let Some(id) = terminal.local_id {
@@ -2955,11 +2148,7 @@ impl RestoreManifest {
         });
     }
 
-    /// Put on every terminal leaf the holds `holds` says its session
-    /// (`local_id`) stands under ([`TerminalLeafRestore::holds`];
-    /// `App::fill_desk_agents`); a leaf whose session stands under none
-    /// carries none. A leaf that names no session of this launch keeps the
-    /// holds it carries, as [`Self::fill_agents`] keeps its agent (RV-SURV-1).
+    /// Populate each terminal leaf with the holds reported by `holds`.
     pub(crate) fn fill_holds(&mut self, holds: &dyn Fn(u64) -> Vec<String>) {
         self.fill_terminals(&mut |terminal| {
             if let Some(id) = terminal.local_id {
@@ -2968,7 +2157,6 @@ impl RestoreManifest {
         });
     }
 
-    /// `fill` on every terminal leaf of the canonical tabs.
     fn fill_terminals(&mut self, fill: &mut dyn FnMut(&mut TerminalLeafRestore)) {
         fn walk(node: &mut RestoredSplitTree, fill: &mut dyn FnMut(&mut TerminalLeafRestore)) {
             match node {
@@ -2989,12 +2177,7 @@ impl RestoreManifest {
         }
     }
 
-    /// No terminal leaf carries an agent ([`TerminalLeafRestore::agent`]) or
-    /// the tab's holds ([`TerminalLeafRestore::holds`]): the layout of a
-    /// person's own quit, which writes neither (`App::quit_agents`). A live
-    /// leaf's capture carries none of its own; a tab a cold drain still owed
-    /// carries what its earlier layout — a crash's, a restart's — named
-    /// (RV-SURV-1).
+    /// No terminal leaf carries an agent ([`TerminalLeafRestore::agent`]) or the tab's holds ([`TerminalLeafRestore::holds`]).
     pub(crate) fn forget_agents_and_holds(&mut self) {
         fn forget(node: &mut RestoredSplitTree) {
             match node {
@@ -3018,20 +2201,7 @@ impl RestoreManifest {
         }
     }
 
-    /// The layout a seamless successor places, given the sessions the outgoing process handed
-    /// (`expected`), or the layout back, unplaced, when it cannot be made to name exactly them.
-    ///
-    /// A layout may name more than was handed: the outgoing process hands only live sessions
-    /// (`App::handoff_live_sessions`), but its capture stamps a `local_id` on every terminal
-    /// view, including a pane kept open by `--hold` after its process exited. A leaf naming a
-    /// session that was not handed becomes a placeholder saying no session was carried for it;
-    /// its split, its tab and every other leaf are placed as they were. Each handed PTY is
-    /// still named exactly once, and no terminal leaf is left to be backed by a shell spawned
-    /// during the overlap.
-    ///
-    /// A layout that misses a handed session or has a terminal leaf with no id stays unplaced
-    /// (the orphan net answers it). A session named twice is a co-view and is placed
-    /// ([`Self::seamless_terminal_ids`]); one handed twice is not.
+    /// The layout a seamless successor places.
     pub(crate) fn placed_for_handed(mut self, expected: &[u64]) -> Result<Self, Self> {
         let Some(named) = self.seamless_terminal_ids() else {
             return Err(self);
@@ -3064,9 +2234,7 @@ impl RestoreManifest {
         }
     }
 
-    /// Every unsaved Settings draft this layout carries, in window, tab and tree order, with
-    /// how many the parse dropped: what a successor that cannot place the layout reports
-    /// losing, with the text.
+    /// Every unsaved Settings draft this layout carries, in window, tab and tree order, with how many the parse dropped.
     pub(crate) fn carried_settings_drafts(&self) -> (Vec<SettingsDraftRestore>, usize) {
         let mut drafts = Vec::new();
         let mut unreadable = 0usize;
@@ -3079,9 +2247,7 @@ impl RestoreManifest {
         (drafts, unreadable)
     }
 
-    /// True only when this layout names every authenticated inherited terminal
-    /// exactly once and names no additional terminal. Native leaves are allowed:
-    /// they have no PTY and are independently restored from bounded descriptors.
+    /// True only when this layout names every authenticated inherited terminal exactly once and names no additional terminal.
     pub(crate) fn covers_exact_seamless_ids(&self, expected: &[u64]) -> bool {
         let mut expected = expected.to_vec();
         expected.sort_unstable();
@@ -3089,15 +2255,12 @@ impl RestoreManifest {
             && self.seamless_terminal_ids().as_deref() == Some(expected.as_slice())
     }
 
-    /// The cwd of the pane the bootstrap session 0 becomes (the first window's
-    /// [`WindowLayout::bootstrap_cwd`]), so its spawn starts there; every other leaf is
-    /// spawned later by `apply_pending_restore` with its own cwd.
+    /// The cwd of the pane the bootstrap session 0 becomes (the first window's [`WindowLayout::bootstrap_cwd`]), so its spawn starts there.
     pub(crate) fn first_leaf_cwd(&self) -> Option<String> {
         self.windows.first()?.bootstrap_cwd()
     }
 
-    /// A layout of one window whose one terminal leaf records `log_ep`
-    /// ([`TerminalLeafRestore::log_ep`]), as a capture writes it.
+    /// A layout of one window whose one terminal leaf records `log_ep`, as a capture writes it.
     #[cfg(test)]
     pub(crate) fn one_terminal_for_test(log_ep: Option<u32>) -> RestoreManifest {
         RestoreManifest::new(vec![WindowLayout {
@@ -3150,8 +2313,7 @@ impl RestoreManifest {
         }])
     }
 
-    /// The largest epoch a terminal leaf of the canonical tabs recorded for
-    /// its shell's log ([`TerminalLeafRestore::log_ep`]), or `None`.
+    /// The largest epoch a terminal leaf of the canonical tabs recorded for its shell's log, or `None`.
     pub(crate) fn max_log_ep(&self) -> Option<u32> {
         fn walk(node: &RestoredSplitTree, max: &mut Option<u32>) {
             match node {
@@ -3178,15 +2340,7 @@ impl RestoreManifest {
         aterm_toml::to_string(self).map_err(|e| format!("serialize restore manifest: {e}"))
     }
 
-    /// Fail-safe parse: any TOML error or schema mismatch yields `None`, so a corrupt or
-    /// old-version manifest never blocks launch.
-    ///
-    /// The caps degrade per window: a window this build cannot rebuild (a legacy projection
-    /// that does not migrate, a shape past a cap) is left out on its own, windows after the
-    /// [`MAX_WINDOWS`]th are not read, and a log line says how many did not come back. Only a
-    /// layout none of whose windows reads is refused. Only the handoff capture folds to the caps
-    /// ([`Self::fold_into_caps`]); a larger desk's quit layout and crash-journal images rely on
-    /// this.
+    /// Fail-safe parse.
     pub(crate) fn from_toml(s: &str) -> Option<Self> {
         let mut manifest: Self = aterm_toml::from_str(s).ok()?;
         if manifest.schema != LEGACY_SCHEMA && manifest.schema != SCHEMA {
@@ -3207,15 +2361,9 @@ impl RestoreManifest {
     }
 }
 
-/// The saved windows [`RestoreManifest::from_toml`] reopens, and how many it leaves out by
-/// cause, counted apart so the log names each.
 struct AdmittedWindows {
     kept: Vec<WindowLayout>,
-    /// Left out after the [`MAX_WINDOWS`]th kept window.
     past_cap: usize,
-    /// Left out in a shape this build cannot rebuild: more than
-    /// [`MAX_TABS_PER_WINDOW`] tabs, a legacy layout that does not migrate, a
-    /// split past its bounds.
     unbuildable: usize,
 }
 
@@ -3245,8 +2393,6 @@ impl AdmittedWindows {
         admitted
     }
 
-    /// The log's words for the windows left out of `offered`, or `None` when
-    /// every one came back.
     fn left_out_line(&self, offered: usize) -> Option<String> {
         let left_out = self.past_cap + self.unbuildable;
         if left_out == 0 {
@@ -3272,30 +2418,17 @@ impl AdmittedWindows {
     }
 }
 
-/// The manifest path: `<aterm data dir>/session.toml` ([`aterm_types::dirs::aterm_data_dir`]:
-/// `<data_dir>/aterm`, unless a development build's `ATERM_STATE_HOME` gives the instance its
-/// own root, which the crash journals beside it follow too). `None` when nothing resolves.
+/// The manifest path.
 pub(crate) fn manifest_path() -> Option<PathBuf> {
     aterm_types::dirs::aterm_data_dir().map(|dir| dir.join("session.toml"))
 }
 
-/// Durably write `manifest` under the process-shared restore lock: a unique create-new
-/// sibling, file sync, atomic replacement and directory sync, so no write collides with or
-/// truncates another's temporary. The shipped writers stamp a run ([`write_quit_to`]) or
-/// publish a serialized wire ([`write_wire_once_to`]); this spelling is the tests'.
+/// Durably write `manifest` under the process-shared restore lock.
 #[cfg(test)]
 pub(crate) fn write_to(path: &Path, manifest: &RestoreManifest) -> Result<(), String> {
     write_quit_to(path, manifest, None)
 }
 
-/// The `[quit]` table a quit appends to its `session.toml`, naming the run that wrote it by
-/// its crash journal's stem (`<pid>-<nanos>`, `crash_journal::JournalId::stem`). A quit writes
-/// this file first and retires its journal after; a quit cut short between the two (a Force
-/// Quit, a logout's kill, a power loss) leaves both, and the next claim must not reopen that
-/// desk a second time. `also` names the other instances' desks a stamped quit kept behind its
-/// own ([`write_quit_to`]), each by its run. Additive: a build that does not know the table
-/// ignores it, one that does not know `also` reopens every window and sets aside only `run`'s
-/// journal, and a file without the table names no run.
 #[derive(Serialize, Deserialize, Default)]
 struct QuitDoc {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3306,13 +2439,10 @@ struct QuitDoc {
 struct QuitTable {
     #[serde(default)]
     run: String,
-    /// The other desks behind the quit's own, in file order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     also: Vec<KeptDesk>,
 }
 
-/// Another instance's desk a `session.toml` holds ([`QuitTable::also`]): the
-/// run whose quit wrote it, and how many of the file's windows are its.
 #[derive(Serialize, Deserialize)]
 struct KeptDesk {
     #[serde(default)]
@@ -3321,8 +2451,7 @@ struct KeptDesk {
     windows: usize,
 }
 
-/// The run a `session.toml`'s text names ([`QuitDoc`]); `None` when it names
-/// none (an older quit's, or a layout no quit wrote).
+/// The run a `session.toml`'s text names ([`QuitDoc`]).
 pub(crate) fn quit_run_of(text: &str) -> Option<String> {
     aterm_toml::from_str::<QuitDoc>(text)
         .ok()?
@@ -3331,8 +2460,7 @@ pub(crate) fn quit_run_of(text: &str) -> Option<String> {
         .filter(|run| !run.is_empty())
 }
 
-/// The runs whose desks a `session.toml`'s text holds behind its own quit's
-/// ([`QuitTable::also`]): a journal of one of them is that quit's own too.
+/// The runs whose desks a `session.toml`'s text holds behind its own quit's ([`QuitTable::also`]).
 pub(crate) fn quit_also_of(text: &str) -> Vec<String> {
     aterm_toml::from_str::<QuitDoc>(text)
         .ok()
@@ -3346,17 +2474,11 @@ pub(crate) fn quit_also_of(text: &str) -> Vec<String> {
         })
 }
 
-/// One quit's desk in a `session.toml`: its run, and its windows.
 struct Desk {
     run: String,
     windows: Vec<WindowLayout>,
 }
 
-/// The desks a stamped `session.toml`'s `text` holds, its own quit's first;
-/// `None` for one no stamping quit wrote (an older build's, an unstamped
-/// write) or this build cannot read whole. Every window is read as written —
-/// a desk is counted by position, and the parse's caps leave windows out
-/// ([`RestoreManifest::from_toml`]; they apply when the file is taken).
 fn desks_of(text: &str) -> Option<Vec<Desk>> {
     let quit = aterm_toml::from_str::<QuitDoc>(text).ok()?.quit?;
     let manifest = aterm_toml::from_str::<RestoreManifest>(text).ok()?;
@@ -3379,11 +2501,6 @@ fn desks_of(text: &str) -> Option<Vec<Desk>> {
     Some(desks)
 }
 
-/// The text of a quit layout: `manifest` as `run`'s desk, then as much of
-/// each of `kept` as fits within [`MAX_WINDOWS`] (a desk left no room is left
-/// out whole, its run with it, so a journal of its quit cut short still
-/// reopens it), and the `[quit]` table naming them. With nothing kept it is
-/// exactly `manifest`'s text and the table naming `run`.
 fn quit_wire(
     manifest: &RestoreManifest,
     run: &str,
@@ -3429,9 +2546,6 @@ fn quit_wire(
     Ok(toml)
 }
 
-/// The desks of the `session.toml` at `path` that are not `run`'s — read
-/// under the restore lock its caller holds; none when there is no file, or
-/// one no stamping quit wrote ([`desks_of`]).
 fn other_desks(path: &Path, run: &str) -> Vec<Desk> {
     fs::read_to_string(path)
         .ok()
@@ -3443,16 +2557,6 @@ fn other_desks(path: &Path, run: &str) -> Vec<Desk> {
         .collect()
 }
 
-/// [`write_to`], the text followed by the `[quit]` table naming `run`, the quit's own run
-/// ([`QuitDoc`]); `None` writes exactly what [`write_to`] does.
-///
-/// Two windowed instances are supported and every windowed launch takes `session.toml` at
-/// boot, so a stamped quit reads the file under the lock it replaces it under and keeps every
-/// other run's desk behind its own ([`quit_wire`]), replacing only its own run's: each desk
-/// opens once, and a journal of either quit cut short is set aside by its run
-/// (`crash_journal::QuitLayout::names`). An unstamped write (the tests' [`write_to`], Windows'
-/// end-session flush) replaces the file, and so does a stamped one over a file no stamping
-/// quit wrote (an older build's quit, or that flush).
 #[cfg_attr(
     any(test, debug_assertions),
     aterm_spec_anchor::refines(
@@ -3470,11 +2574,7 @@ pub(crate) fn write_quit_to(
         .map_err(String::from)
 }
 
-/// [`write_quit_to`] for the cold update lane, which runs on the GUI main
-/// thread: the restore lock is waited for at most `budget`, and a holder past
-/// it (another aterm reading or writing its windows, or stopped while it does)
-/// is a PASSING refusal, never a wait with no end.
-/// Every refusal says whether it passes ([`RestoreFault`]).
+/// [`write_quit_to`] for the cold update lane, which runs on the GUI main thread.
 #[cfg(unix)]
 pub(crate) fn write_quit_to_within(
     path: &Path,
@@ -3482,9 +2582,6 @@ pub(crate) fn write_quit_to_within(
     run: Option<&str>,
     budget: std::time::Duration,
 ) -> Result<(), RestoreFault> {
-    // Ordered: the successor is a local exec that reads the page cache; after a power
-    // loss neither runs, and the crash journal plus the same-run stamp bring the desk
-    // back as they do for any quit.
     write_quit_to_waiting(
         path,
         manifest,
@@ -3511,21 +2608,13 @@ fn write_quit_to_waiting(
     })
 }
 
-/// TAKE BACK A QUIT LAYOUT NO EXEC USED: the cold update lane's, written for
-/// a successor that did not start ([`write_quit_to`]), so that no later
-/// launch reopens a desk that stayed up. Only `run`'s desk goes: every other
-/// instance's desk the write kept stays, the file's lead passing to the
-/// first of them. Taking the whole file lost them all. A file that holds no
-/// desk of `run`'s is left as it is; with `run` `None` (an unstamped write,
-/// which replaced the file) the file is taken.
+/// TAKE BACK A QUIT LAYOUT NO EXEC USED.
 #[cfg(all(test, unix))]
 pub(crate) fn unwrite_quit_to(path: &Path, run: Option<&str>) -> Result<(), String> {
     unwrite_quit_to_waiting(path, run, LockWait::Unbounded).map_err(String::from)
 }
 
-/// [`unwrite_quit_to`] for the cold update lane on the GUI main thread: the
-/// restore lock is waited for at most `budget`, as its write waits
-/// ([`write_quit_to_within`]).
+/// [`unwrite_quit_to`] for the cold update lane on the GUI main thread.
 #[cfg(unix)]
 pub(crate) fn unwrite_quit_to_within(
     path: &Path,
@@ -3572,12 +2661,8 @@ fn unwrite_quit_to_waiting(
                     windows: lead.windows,
                 };
                 let wire = quit_wire(&lead_desk, &lead.run, others)?;
-                // Ordered: the take-back of a cold-lane layout no exec used, recovered
-                // after a power loss as the cold write is (crash journal, run stamp).
                 write_restore_locked(path, wire.as_bytes(), Flush::Ordered)
             }
-            // Ordered: a lost removal leaves a layout stamped with this run, whose
-            // journal `claim_at_boot` then skips, so the desk reopens once.
             None => fs::remove_file(path)
                 .and_then(|()| sync_restore_directory(parent, Flush::Ordered))
                 .map_err(|error| {
@@ -3587,12 +2672,6 @@ fn unwrite_quit_to_waiting(
     })
 }
 
-/// `path`'s directory, made when it is not there: it and its missing ancestors `0755`
-/// whatever the umask ([`create_dir_all_unshared`]). On Linux it is `~/.local/share/aterm`,
-/// the atpkg prefix's parent, and `targo trust` refuses every toolchain installed below a
-/// group-writable directory, which `create_dir_all` made it under umask `002`.
-///
-/// [`create_dir_all_unshared`]: aterm_types::fs_restricted::create_dir_all_unshared
 fn made_parent(path: &Path) -> Result<&Path, RestoreFault> {
     let parent = path.parent().ok_or_else(|| {
         RestoreFault::settled(format!("restore manifest {} has no parent", path.display()))
@@ -3602,35 +2681,22 @@ fn made_parent(path: &Path) -> Result<&Path, RestoreFault> {
     Ok(parent)
 }
 
-/// [`write_to`] of an already serialized manifest: `wire` is published byte for
-/// byte, under the same lock, sync, atomic replacement and directory sync.
 #[cfg(any(unix, test))]
 fn write_wire_to(path: &Path, wire: &str) -> Result<(), String> {
     made_parent(path)?;
-    // Ordered: only the live successor reads the handoff's sidecar, from the page
-    // cache; after a power loss neither process exists, the next start deletes it
-    // (`sweep_dead_handoff_leftovers`) and the crash journal brings the desk back.
     with_restore_lock(path, || {
         write_restore_locked(path, wire.as_bytes(), Flush::Ordered)
     })
     .map_err(String::from)
 }
 
-/// [`write_to`] for a one-shot name no other process locks (an update handoff's attempt-bound
-/// layout, `seamless-<pid>-<nonce>.layout.toml`, which its successor reads without the lock),
-/// then remove the lock file the write took, so locks do not pile up one per update. Only such
-/// a name may drop its lock: a shared one's (`session.toml`) unlinked while another process
-/// waits on it lets a third lock a new file beside it. The handoff writes through
-/// [`write_wire_once_to`]; this spelling is the tests'.
+/// Write `manifest` atomically to a one-shot path not shared with concurrent writers.
 #[cfg(test)]
 pub(crate) fn write_once_to(path: &Path, manifest: &RestoreManifest) -> Result<(), String> {
     write_wire_once_to(path, &manifest.to_toml()?)
 }
 
-/// [`write_once_to`] of an already serialized layout, published byte for byte:
-/// the handoff's layout sidecar is written from the exact wire its digest and
-/// its byte-equality check were taken over (`handoff_diet`), never from a
-/// second serialization.
+/// [`write_once_to`] of an already serialized layout, published byte for byte.
 #[cfg(any(unix, test))]
 pub(crate) fn write_wire_once_to(path: &Path, wire: &str) -> Result<(), String> {
     let written = write_wire_to(path, wire);
@@ -3644,22 +2710,12 @@ pub(crate) fn write_wire_once_to(path: &Path, wire: &str) -> Result<(), String> 
 #[derive(Debug)]
 pub(crate) struct TakenQuit {
     pub(crate) manifest: RestoreManifest,
-    /// The run its quit names ([`quit_run_of`]); `None` for an older build's
-    /// quit, which names none.
     pub(crate) run: Option<String>,
-    /// The runs of the other instances' desks it holds behind its quit's own
-    /// ([`quit_also_of`]).
     pub(crate) also: Vec<String>,
-    /// When the quit wrote it: the file's modification time, in Unix
-    /// milliseconds ([`modified_unix_ms`]; `None` when the file system did
-    /// not say). A quit writes its layout after its crash journal's last
-    /// image, so a journal image written later is another run's
-    /// (`crash_journal::QuitLayout::written_unix_ms`).
     pub(crate) written_unix_ms: Option<u64>,
 }
 
-/// When the file `meta` describes was last written, in Unix milliseconds;
-/// `None` when the file system does not say.
+/// When the file `meta` describes was last written, in Unix milliseconds.
 pub(crate) fn modified_unix_ms(meta: &fs::Metadata) -> Option<u64> {
     let since = meta
         .modified()
@@ -3669,15 +2725,7 @@ pub(crate) fn modified_unix_ms(meta: &fs::Metadata) -> Option<u64> {
     u64::try_from(since.as_millis()).ok()
 }
 
-/// Claim the manifest atomically, durably remove its public name, then parse the
-/// claimed bytes. The rename is the single-use commit point: a crash during
-/// parsing/apply cannot expose the same manifest to the next launch.
-///
-/// `None` means absent, consumed-but-invalid, or an I/O failure. Failures are
-/// logged because this compatibility API intentionally falls back to a fresh
-/// window rather than blocking launch. With the manifest come the run its
-/// quit names ([`quit_run_of`]) and when it was written ([`TakenQuit`]). A
-/// unix launch takes in two phases instead ([`take_for_launch`]).
+/// Claim the manifest atomically, durably remove its public name, then parse the claimed bytes.
 #[cfg(any(test, not(unix)))]
 pub(crate) fn take_quit_from(path: &Path) -> Option<TakenQuit> {
     match take_from_result(path, LockWait::Unbounded) {
@@ -3749,11 +2797,6 @@ fn take_from_result(path: &Path, wait: LockWait) -> Result<Option<TakenQuit>, St
         let claim = unique_restore_sibling_path(parent, name, "claimed")?;
         claim_restore_file(path, &claim)
             .map_err(|error| format!("claim {}: {error}", path.display()))?;
-        // DURABLE, not ordered: the claim is what stops a restore that brings the
-        // machine down (a kernel panic, a watchdog reset) from running again at the
-        // next launch. An ordered claim reaches media only at the device's next full
-        // flush, which such a crash can beat, and the next launch would take the same
-        // layout and loop. Once per launch.
         sync_restore_directory(parent, Flush::Durable).map_err(|error| {
             format!(
                 "{} was claimed but single-use durability is indeterminate: {error}",
@@ -3761,7 +2804,6 @@ fn take_from_result(path: &Path, wait: LockWait) -> Result<Option<TakenQuit>, St
             )
         })?;
 
-        // The claim is a rename: the file keeps the time the quit wrote it.
         let read = File::open(&claim).and_then(|mut file| {
             let written_unix_ms = file.metadata().ok().as_ref().and_then(modified_unix_ms);
             let mut text = String::new();
@@ -3785,8 +2827,6 @@ fn take_from_result(path: &Path, wait: LockWait) -> Result<Option<TakenQuit>, St
                 None
             }
         };
-        // The cleanup's directory flush is ordered: a leftover `.claimed` sibling is
-        // never read, and `sweep_dead_restore_siblings` removes it.
         if let Err(error) = fs::remove_file(&claim) {
             crate::logging::stderr_line!(
                 "aterm-gui: claimed restore cleanup {} failed: {error}",
@@ -3802,18 +2842,11 @@ fn take_from_result(path: &Path, wait: LockWait) -> Result<Option<TakenQuit>, St
     })
 }
 
-/// A restore-file operation that did not land: what failed, and whether its cause passes
-/// (another aterm holding the restore lock past a bounded wait, a full disk or quota, an I/O
-/// error, no descriptor or memory just then) or answers the same on every try (no data dir, a
-/// folder or lock this user cannot write, a read-only volume, a volume without the locks or
-/// syncs the write needs). Typed for the cold update lane, which retries a passing one and
-/// goes on without its layout past a settled one.
+/// A restore-file operation that did not land.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct RestoreFault {
     message: String,
     passing: bool,
-    /// The file was published before the failure: only its directory's
-    /// durability is unknown ([`Self::published_but`]).
     published: bool,
 }
 
@@ -3836,9 +2869,7 @@ impl RestoreFault {
         }
     }
 
-    /// [`Self::io`] for a failure after the file was published (its directory's sync): a
-    /// reader already sees it, so a caller that does not go on takes it back
-    /// ([`Self::published`]).
+    /// [`Self::io`] for a failure after the file was published (its directory's sync).
     pub(crate) fn published_but(context: impl std::fmt::Display, error: &std::io::Error) -> Self {
         Self {
             published: true,
@@ -3846,8 +2877,6 @@ impl RestoreFault {
         }
     }
 
-    /// The restore lock at `lock_path`, held by another description past
-    /// `budget`: passing — its holder lets go, or is resumed.
     #[cfg(unix)]
     fn busy(lock_path: &Path, budget: std::time::Duration) -> Self {
         Self {
@@ -3862,7 +2891,6 @@ impl RestoreFault {
         }
     }
 
-    /// Whether the cause passes (see the type).
     #[cfg_attr(
         not(unix),
         allow(
@@ -3874,8 +2902,6 @@ impl RestoreFault {
         self.passing
     }
 
-    /// Whether the file was published before the failure
-    /// ([`Self::published_but`]).
     #[cfg_attr(
         not(unix),
         allow(
@@ -3900,19 +2926,12 @@ impl From<RestoreFault> for String {
     }
 }
 
-/// A failure spelled as words alone (a layout that does not serialize): it
-/// answers the same on every try.
 impl From<String> for RestoreFault {
     fn from(message: String) -> Self {
         Self::settled(message)
     }
 }
 
-/// Whether `error` passes: interrupted, timed out or would block; out of memory or
-/// descriptors; a full disk or quota; an I/O error; a busy resource. Everything else
-/// (`EACCES`, `EPERM`, `EROFS`, `ENOTSUP`, `ENOLCK`, a missing folder) comes back the same
-/// every time. The install-location probe's split
-/// (`aterm_update::bundle::classify_probe_error`), for this module's writes.
 fn io_error_passes(error: &std::io::Error) -> bool {
     use std::io::ErrorKind;
     if matches!(
@@ -3950,8 +2969,6 @@ fn io_error_passes(error: &std::io::Error) -> bool {
     }
 }
 
-/// The lock file that serializes every write and claim of `path`: the hidden
-/// `.<name>.aterm-restore.lock` beside it. `None` for a path with no parent.
 fn restore_lock_path(path: &Path) -> Option<PathBuf> {
     let parent = path.parent()?;
     let name = path
@@ -3967,18 +2984,13 @@ fn with_restore_lock<T, E: From<RestoreFault>>(
     with_restore_lock_waiting(path, LockWait::Unbounded, operation)
 }
 
-/// How long a restore-lock take may wait for another holder.
 #[derive(Clone, Copy, Debug)]
 enum LockWait {
-    /// Until the holder lets go: a launch's take, a person's quit, a worker.
     Unbounded,
-    /// At most this long, then a passing refusal ([`RestoreFault::busy`]): the
-    /// GUI main thread's, which may not wait with no end.
     #[cfg(unix)]
     Within(std::time::Duration),
 }
 
-/// [`with_restore_lock`], waiting for the lock as `wait` says.
 fn with_restore_lock_waiting<T, E: From<RestoreFault>>(
     path: &Path,
     wait: LockWait,
@@ -3987,9 +2999,6 @@ fn with_restore_lock_waiting<T, E: From<RestoreFault>>(
     with_restore_lock_seeing(path, wait, |_| operation())
 }
 
-/// [`with_restore_lock_waiting`], handing `operation` the launch takes other runs
-/// left beside `path` (`take_name`), which the sweep of dead siblings reads on
-/// its way ([`sweep_dead_restore_siblings`]).
 fn with_restore_lock_seeing<T, E: From<RestoreFault>>(
     path: &Path,
     wait: LockWait,
@@ -4021,10 +3030,6 @@ fn with_restore_lock_seeing<T, E: From<RestoreFault>>(
                 )
             })?;
     }
-    // Released by `LOCK_UN` when the guard drops, on every return, not by the close alone:
-    // the take waits, and a child any thread forks while the lock is held (a tab's shell)
-    // keeps a copy of the description until it execs, so a close-only release would leave
-    // the next manifest write waiting on a shell's exec.
     let locking = |error: &std::io::Error| {
         RestoreFault::io(
             format_args!("lock restore manifest {}", path.display()),
@@ -4054,13 +3059,6 @@ fn with_restore_lock_seeing<T, E: From<RestoreFault>>(
     operation(takes)
 }
 
-/// Remove the write temporaries and claims ([`restore_sibling_path`]) that a
-/// writer or claimer of `path` left when it was killed mid-operation (or, a
-/// claim, when its directory sync failed): each a whole layout that nothing
-/// reads again. Run under `path`'s restore lock, which every write and claim of
-/// it holds; a live pid's is left all the same, this process's included. Only
-/// regular files go, so a link is never followed. Answers the launch takes it
-/// passed (`take_name`), which only a launch's take judges.
 fn sweep_dead_restore_siblings(path: &Path) -> Vec<PathBuf> {
     let mut takes = Vec::new();
     let Some(parent) = path.parent() else {
@@ -4125,7 +3123,6 @@ fn create_unique_restore_sibling(
             }
         }
     }
-    // Every name of one seed taken: the next try draws another.
     Err(RestoreFault {
         message: "could not allocate a unique restore temporary".to_string(),
         passing: true,
@@ -4238,23 +3235,18 @@ fn sync_restore_directory(_path: &Path, _flush: Flush) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Write the manifest to the standard [`manifest_path`] (graceful-quit hook). With no path,
-/// the refusal names its cause: a development build's relative (or empty) `ATERM_STATE_HOME`
-/// resolves none on purpose, else no data dir resolves. The quit's own write is
-/// [`write_quit`], which names its run.
+/// Write the manifest to the standard [`manifest_path`] (graceful-quit hook).
 #[cfg(any(windows, test))]
 pub(crate) fn write(manifest: &RestoreManifest) -> Result<(), String> {
     write_quit(manifest, None)
 }
 
-/// [`write`] for the quit: the layout stamped with the quit's own run
-/// ([`write_quit_to`]).
+/// [`write`] for the quit.
 pub(crate) fn write_quit(manifest: &RestoreManifest, run: Option<&str>) -> Result<(), String> {
     let path = manifest_path().ok_or_else(no_manifest_path)?;
     write_quit_to(&path, manifest, run)
 }
 
-/// Why no [`manifest_path`] resolves.
 fn no_manifest_path() -> String {
     if aterm_types::dev_seam!("ATERM_STATE_HOME")
         .is_some_and(|root| !Path::new(&root).is_absolute())
@@ -4265,8 +3257,7 @@ fn no_manifest_path() -> String {
     }
 }
 
-/// [`write_quit_to_within`] at the standard [`manifest_path`]: the cold update
-/// lane's layout. No path is a settled refusal.
+/// [`write_quit_to_within`] at the standard [`manifest_path`].
 #[cfg(unix)]
 pub(crate) fn write_quit_within(
     manifest: &RestoreManifest,
@@ -4277,8 +3268,7 @@ pub(crate) fn write_quit_within(
     write_quit_to_within(&path, manifest, run, budget)
 }
 
-/// [`unwrite_quit_to_within`] at the standard [`manifest_path`] (the cold
-/// update lane's take-back).
+/// [`unwrite_quit_to_within`] at the standard [`manifest_path`].
 #[cfg(unix)]
 pub(crate) fn unwrite_quit_within(
     run: Option<&str>,
@@ -4294,47 +3284,13 @@ pub(crate) fn take_from(path: &Path) -> Option<RestoreManifest> {
     take_quit_from(path).map(|taken| taken.manifest)
 }
 
-// THE LAUNCH'S TAKE, IN TWO PHASES (r6 sweep #7, START-1).
-//
-// A macOS window takes `session.toml` before its `NSApplication` build (LAG-11:
-// session 0's shell starts first, ahead of 28.6-60.2 ms of build in the owner's
-// two logged launches), and a single-use take there lost the last quit's windows
-// to a crash or a hang inside that build — and to any end after it until this
-// run kept a record of its own desk. So the launch's take holds what it took.
-// Phase one renames `session.toml` to a name tagged with this run,
-// `.session.toml.aterm-taken-<run>` (`<run>` is the run's crash-journal stem,
-// `<pid>-<nanos>`, the start its crash marker is named for), and holds that
-// file's `flock` for the run's life. Phase two ([`settle_take`]) removes it once
-// the run keeps the desk itself: its crash journal's first image (written once
-// the deferred restore has rebuilt the layout), its quit's own layout, or
-// `restore_session` going off.
-//
-// Every launch's take judges the takes other runs left, under the restore lock:
-// one whose `flock` is held is a live run's and is left alone; a dead run's is
-// taken again — renamed `.session.toml.aterm-retaken-<run>-<n>` and held by this
-// run — only when that run left crash evidence (`crash_journal::classify_death`)
-// and nothing else holds its desk. Otherwise it goes: the run ended cleanly; its
-// own quit's layout or its crash journal holds the desk; or it was this process's
-// previous image, which an `exec` replaced (the cold update lane, whose layout
-// names it). THE BRAKE: a re-taken file is never taken a third time. A run that
-// re-took one and died again before it settled leaves it set aside, so a layout
-// that stops aterm comes back at most once more, as a reopened crash journal does.
-
-/// Which of a launch's takes a file is ([`take_name`]).
 #[cfg(unix)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TakeKind {
-    /// Taken from `session.toml`.
     Taken,
-    /// Taken again from a run that died before it settled: never taken a third
-    /// time (the brake).
     Retaken,
 }
 
-/// Run `run`'s take of the layout `name`: `.<name>.aterm-taken-<run>`, or its
-/// `n`th re-take, `.<name>.aterm-retaken-<run>-<n>`. No `.tmp` suffix, so no
-/// sweep of dead siblings ([`sweep_dead_restore_siblings`]), this build's or an
-/// older one's, ever removes it.
 #[cfg(unix)]
 fn take_name(name: &OsStr, kind: TakeKind, run: JournalId, n: usize) -> String {
     let name = name.to_string_lossy();
@@ -4344,7 +3300,6 @@ fn take_name(name: &OsStr, kind: TakeKind, run: JournalId, n: usize) -> String {
     }
 }
 
-/// Parse a [`take_name`] of `name`: the take's kind and the run that took it.
 #[cfg(unix)]
 fn parse_take_name(name: &OsStr, file: &str) -> Option<(TakeKind, JournalId)> {
     let rest = file.strip_prefix(&format!(".{}.aterm-", name.to_string_lossy()))?;
@@ -4356,10 +3311,7 @@ fn parse_take_name(name: &OsStr, file: &str) -> Option<(TakeKind, JournalId)> {
     Some((TakeKind::Retaken, JournalId::parse_stem(stem)?))
 }
 
-/// What a launch's take holds until its run keeps the desk itself
-/// ([`settle_take`]): each file it took, under that file's `flock`. Dropped
-/// unsettled — the run's death, or a test playing one — the files stay with
-/// their locks free, for a later launch to judge.
+/// What a launch's take holds until its run keeps the desk itself ([`settle_take`]).
 #[cfg(unix)]
 #[derive(Default)]
 pub(crate) struct HeldTake {
@@ -4368,11 +3320,7 @@ pub(crate) struct HeldTake {
 
 #[cfg(unix)]
 impl HeldTake {
-    /// Phase two: remove each file, THEN let its lock go, so a later launch
-    /// never wins the lock of a take whose name still stands ([`hold_take`]).
-    /// No directory sync: a removal a power loss undoes leaves a dead run's
-    /// take, which the next launch judges as any other (its crash journal, if
-    /// that reached the disk, holds the desk).
+    /// Phase two.
     pub(crate) fn settle(self) {
         for (path, lock) in self.files {
             if let Err(error) = fs::remove_file(&path)
@@ -4388,14 +3336,10 @@ impl HeldTake {
     }
 }
 
-/// This run's [`HeldTake`], from [`take_for_launch`] until [`settle_take`].
 #[cfg(unix)]
 static HELD_TAKE: std::sync::Mutex<Option<HeldTake>> = std::sync::Mutex::new(None);
 
-/// PHASE TWO of this run's take (`HeldTake::settle`): the run keeps its desk
-/// itself now — its crash journal's first image is on disk, its quit wrote its
-/// own layout, or `restore_session` went off. Every later call, and every call
-/// in a run that took nothing, is one uncontended lock.
+/// PHASE TWO of this run's take (`HeldTake::settle`).
 pub(crate) fn settle_take() {
     #[cfg(unix)]
     if let Some(held) = HELD_TAKE
@@ -4407,12 +3351,7 @@ pub(crate) fn settle_take() {
     }
 }
 
-/// THE LAUNCH'S TAKE of the standard [`manifest_path`] (launch hook): the last
-/// quit's layout and every dead run's take that comes back
-/// (`take_holding_from`), held for this run, `run` (its crash-journal id),
-/// until [`settle_take`]. `evidence` is where a dead run's end is read. Off unix
-/// the take is single-use (`take_quit_from`): no lock and no crash marker
-/// there say whether a run lives or how it ended.
+/// THE LAUNCH'S TAKE of the standard [`manifest_path`] (launch hook).
 pub(crate) fn take_for_launch(run: JournalId, evidence: &Evidence<'_>) -> Option<TakenQuit> {
     let path = manifest_path()?;
     #[cfg(unix)]
@@ -4430,15 +3369,7 @@ pub(crate) fn take_for_launch(run: JournalId, evidence: &Evidence<'_>) -> Option
     }
 }
 
-/// `take_quit_from` in two phases, for a launch (the note above): `path` is
-/// claimed onto run `run`'s take and held there, and each take another run left
-/// beside it is judged — a dead run's comes back when it left crash `evidence`
-/// and nothing else holds its desk, and goes otherwise; a live run's is left
-/// alone. The layout is the quit's windows, then each re-taken one's, within
-/// [`MAX_WINDOWS`]. It returns a layout only once every claim is durable, as
-/// `take_quit_from` does, so a restore that brings the machine down comes
-/// back no further than the brake lets it; when that sync fails it returns
-/// none and still holds what it took.
+/// `take_quit_from` in two phases, for a launch (the note above).
 #[cfg(unix)]
 pub(crate) fn take_holding_from(
     path: &Path,
@@ -4471,12 +3402,8 @@ fn take_holding_result(
             .file_name()
             .unwrap_or_else(|| OsStr::new("session.toml"));
         let mut held = HeldTake::default();
-        // Every layout taken, the quit's first: its text and when its quit wrote it.
         let mut texts: Vec<(String, Option<u64>)> = Vec::new();
-        // The runs whose desks the quit's layout holds, and below every other layout
-        // that comes back: a take of theirs is that layout's.
         let mut kept_by_quit: Vec<String> = Vec::new();
-        // A claim this run could not hold goes once read, as the single-use one does.
         let mut unheld = None;
         let mut claimed = false;
         if path.exists() {
@@ -4513,10 +3440,6 @@ fn take_holding_result(
                 texts.push((text, written));
             }
         }
-        // Every take another run left whose lock this run wins — a dead run's — with
-        // its first verdict and its text: the last verdict waits for them all, since
-        // a layout one of them brings back can hold the desk of the run another was
-        // taken by.
         let mut dead = Vec::new();
         for from in left {
             let Some((kind, left_by)) = from
@@ -4526,7 +3449,6 @@ fn take_holding_result(
             else {
                 continue;
             };
-            // A live run's take, or one no lock can be tried on: left alone.
             let Some(lock) = hold_take(&from) else {
                 continue;
             };
@@ -4534,9 +3456,6 @@ fn take_holding_result(
             let read = read_take(lock.file(), &from);
             dead.push((from, left_by, lock, why, read));
         }
-        // A run's quit layout holds what that run had taken (it restored it first),
-        // so a take of a run a layout coming back names — its quit's, or a desk it
-        // kept — is that layout's already: it goes, never the desk twice.
         for (_, _, _, why, read) in &dead {
             if why.is_none()
                 && let Some((text, _)) = read
@@ -4573,20 +3492,9 @@ fn take_holding_result(
             texts.extend(read);
             held.files.push((to, lock));
         }
-        // DURABLE, as the single-use claim is: the names are what stop a restore
-        // that brings the machine down (a kernel panic, a watchdog reset) from
-        // running again past the brake at the next launch. Once per launch, and
-        // nearly all of the take's cost (START-1, take8 n=12: the journal phase
-        // 5.4-7.2 ms median with a layout to take, 0.2 ms without). It stays on
-        // the critical path: session 0's shell starts in the layout's first folder
-        // right after, and a folder whose file system takes the machine down is
-        // the very restore this guards.
         if (claimed || retaken > 0)
             && let Err(error) = sync_restore_directory(parent, Flush::Durable)
         {
-            // Nothing comes back, as from the single-use claim: a claim that may not
-            // outlive a crash must not bring back a layout that brings the machine
-            // down. What this run took stays HELD — never a live run's take with its
             // lock let go for another launch to take — and goes when it settles.
             if let Some(unheld) = unheld {
                 let _ = fs::remove_file(&unheld);
@@ -4608,12 +3516,6 @@ fn take_holding_result(
     })
 }
 
-/// Open the take at `path` — no link followed, no FIFO waited on — and take its
-/// `flock` without waiting: the held lock, or `None` when another description
-/// holds it (a live run's), when it is no regular file or cannot be opened or
-/// locked, or when `path` no longer names it: a run settles by removing the
-/// name BEFORE its lock goes ([`HeldTake::settle`]), so a lock won on a file
-/// whose name is gone was a settled take's.
 #[cfg(unix)]
 fn hold_take(path: &Path) -> Option<crate::native_document_host::HeldAdvisoryLock> {
     use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
@@ -4628,8 +3530,6 @@ fn hold_take(path: &Path) -> Option<crate::native_document_host::HeldAdvisoryLoc
     (locked.is_file() && locked.dev() == named.dev() && locked.ino() == named.ino()).then_some(lock)
 }
 
-/// The text of the take `file` (at `path`) and when its quit wrote it — a
-/// rename keeps the file's time; `None`, said, when it cannot be read.
 #[cfg(unix)]
 fn read_take(file: &File, path: &Path) -> Option<(String, Option<u64>)> {
     let written_unix_ms = file.metadata().ok().as_ref().and_then(modified_unix_ms);
@@ -4647,10 +3547,6 @@ fn read_take(file: &File, path: &Path) -> Option<(String, Option<u64>)> {
     }
 }
 
-/// Why the take `kind` that the dead run `left_by` left does not come back to
-/// run `run`, or `None` when it does: that run left crash `evidence` and nothing
-/// else holds its desk (the note above). `kept_by_quit`: the runs whose desks
-/// the quit's layout this run took holds; `dir`: where their crash journals are.
 #[cfg(unix)]
 fn take_set_aside(
     kind: TakeKind,
@@ -4678,11 +3574,6 @@ fn take_set_aside(
     }
 }
 
-/// One launch's [`TakenQuit`] of the layouts it took (`texts`, the quit's
-/// first): the first readable one, with each later one's windows behind it
-/// within [`MAX_WINDOWS`] and each later one's runs among `also`, so a crash
-/// journal of theirs is set aside as that quit's own
-/// (`crash_journal::QuitLayout::names`).
 #[cfg(unix)]
 fn taken_together(texts: Vec<(String, Option<u64>)>) -> Option<TakenQuit> {
     let mut parsed = texts.into_iter().filter_map(|(text, written_unix_ms)| {
@@ -4705,47 +3596,16 @@ fn taken_together(texts: Vec<(String, Option<u64>)>) -> Option<TakenQuit> {
     Some(taken)
 }
 
-// The per-scale cell-metrics cache.
-//
-// A windowed cold launch sizes its first, hidden OS window from `seed_cell_px` (a 0.6×/1.2×
-// em heuristic) and keeps it hidden until the backend joins: revealing the heuristic size
-// would make the window jump. `attach_os_window` persists the real cell metrics the backend
-// derived, keyed by display scale, so the next launch sizes the pre-backend window exactly
-// and reveals it before the join (Windows only; see `attach_os_window`'s early-reveal note).
-//
-// Not part of [`RestoreManifest`]: the manifest is single-use and written only on graceful
-// quit, so the metrics would be lost to every crash and restore-less boot. This durable
-// sibling shares the manifest's lock and unique-temp publication.
-//
-// Staleness is safe, not prevented: a font-file update that changes advance widths without a
-// config change yields a wrong entry. `attach_os_window` treats the cache as a prediction,
-// re-derives the truth after the join, logs a disagreement and re-persists (one launch with a
-// post-reveal resize, then converged).
-
-/// On-disk schema for [`CellMetricsCache`]. Bumped on incompatible layout
-/// change; a mismatched file is ignored wholesale (cold-launch behaviour),
-/// never mis-parsed.
 const CELL_METRICS_SCHEMA: u32 = 1;
 
-/// Scales worth remembering: a desktop has a handful of distinct DPI factors, and dropping
-/// the oldest entry past this bounds the file against a `--scale` sweep.
 const MAX_CELL_METRICS_ENTRIES: usize = 16;
 
-/// Sanity bound for one persisted cell edge in device px. A corrupted or
-/// hand-edited file must never size a window to absurdity; out-of-band entries
-/// read as absent (cold launch), and degenerate measurements are never written.
 const MAX_CELL_EDGE_PX: usize = 4096;
 
 /// One scale factor's measured cell geometry.
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Debug)]
 pub(crate) struct CellMetricsEntry {
-    /// The display scale factor × 1000, rounded — an integer key so lookup is
-    /// exact equality, immune to f64 formatting drift through TOML.
     pub scale_milli: u32,
-    /// The font size (physical px) the cells were measured at — the launch
-    /// default for this scale at write time. A reader predicts its own target
-    /// px and rejects the entry on mismatch, so an explicit `font_px` config
-    /// change invalidates without a schema bump.
     pub font_px: f32,
     pub cell_w: u32,
     pub cell_h: u32,
@@ -4755,38 +3615,26 @@ pub(crate) struct CellMetricsEntry {
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Default)]
 pub(crate) struct CellMetricsCache {
     pub schema: u32,
-    /// The cell-geometry fingerprint (font selection + line height) every entry was measured
-    /// under. One key for the whole file: a font change invalidates every scale at once.
     pub font_key: String,
     #[serde(default)]
     pub entries: Vec<CellMetricsEntry>,
 }
 
-/// The cache path: `<aterm data dir>/cell-metrics.toml`, beside `session.toml` under the
-/// same rule ([`aterm_types::dirs::aterm_data_dir`]).
 fn cell_metrics_path() -> Option<PathBuf> {
     aterm_types::dirs::aterm_data_dir().map(|dir| dir.join("cell-metrics.toml"))
 }
 
-/// `scale` → the integer entry key. Clamped positive so a hostile/broken scale
-/// can neither alias 0 nor overflow.
 fn cell_metrics_scale_milli(scale: f64) -> u32 {
     (scale * 1000.0).round().clamp(1.0, 1_000_000.0) as u32
 }
 
-/// Fail-safe read: any I/O error, malformed TOML, or schema mismatch is `None`
-/// (the caller cold-launches), mirroring the manifest's parse contract.
 fn read_cell_metrics(path: &Path) -> Option<CellMetricsCache> {
     let text = fs::read_to_string(path).ok()?;
     let cache: CellMetricsCache = aterm_toml::from_str(&text).ok()?;
     (cache.schema == CELL_METRICS_SCHEMA).then_some(cache)
 }
 
-/// The persisted cell size for `scale`, iff it was measured under the same
-/// font fingerprint at (within rounding) the same font px the caller predicts
-/// for this launch. `None` = cold launch (keep the hidden-until-ready path).
-/// Unlocked read on the launch critical path: publication is whole-file
-/// atomic (unique temp + rename), so a torn read cannot be observed.
+/// The persisted cell size for `scale`.
 #[cfg(windows)]
 pub(crate) fn load_cell_metrics(
     font_key: &str,
@@ -4809,9 +3657,6 @@ fn load_cell_metrics_from(
     }
     let key = cell_metrics_scale_milli(scale);
     let entry = cache.entries.iter().find(|e| e.scale_milli == key)?;
-    // Same tolerance class as the attach path's own "backend already at the
-    // target size" comparison (0.5 px): a real font-px change always exceeds
-    // it, while a bit-identical re-derivation always passes.
     if (entry.font_px - expected_font_px).abs() >= 0.5 {
         return None;
     }
@@ -4820,10 +3665,7 @@ fn load_cell_metrics_from(
         .then_some((cell_w, cell_h))
 }
 
-/// The one display scale this machine has measured cells at (the cache's sole entry), for
-/// `predicted_first_window_scale` on a host with no pre-window display query. Two or more
-/// entries (a laptop driving an external display) are `None`: the caller's 1× fallback is the
-/// honest unknown. A missing or malformed cache is `None`.
+/// The one display scale this machine has measured cells at (the cache's sole entry).
 pub(crate) fn recorded_cell_metrics_scale() -> Option<f64> {
     recorded_cell_metrics_scale_from(&cell_metrics_path()?)
 }
@@ -4836,9 +3678,7 @@ fn recorded_cell_metrics_scale_from(path: &Path) -> Option<f64> {
     }
 }
 
-/// Persist one scale's measured cell metrics, fire-and-forget on a spawned thread: the caller
-/// is inside the window-attach bracket between launch and first paint, and a lost write costs
-/// one future cold launch.
+/// Persist one scale's measured cell metrics, fire-and-forget on a spawned thread.
 pub(crate) fn store_cell_metrics(
     font_key: String,
     scale: f64,
@@ -4865,7 +3705,6 @@ fn store_cell_metrics_to(
     cell_w: usize,
     cell_h: usize,
 ) -> Result<(), String> {
-    // Never persist a degenerate measurement: a 0-px or absurd cell would make the next
     // launch reveal a broken frame. The cache stays cold for this scale.
     if !(1..=MAX_CELL_EDGE_PX).contains(&cell_w) || !(1..=MAX_CELL_EDGE_PX).contains(&cell_h) {
         return Ok(());
@@ -4876,13 +3715,8 @@ fn store_cell_metrics_to(
     let parent = path
         .parent()
         .ok_or_else(|| format!("cell-metrics cache {} has no parent", path.display()))?;
-    // `session.toml`'s directory, made as [`made_parent`] makes it.
     aterm_types::fs_restricted::create_dir_all_unshared(parent, 0o755)
         .map_err(|error| format!("mkdir {}: {error}", parent.display()))?;
-    // Read-modify-write UNDER the shared restore lock (keyed per file name, so
-    // this never contends with `session.toml` traffic): two live aterm
-    // instances finishing backends concurrently must not lose each other's
-    // scale entries by racing the whole-file rewrite.
     with_restore_lock(path, || {
         let mut cache = read_cell_metrics(path)
             .filter(|c| c.font_key == font_key)
@@ -4902,7 +3736,6 @@ fn store_cell_metrics_to(
             .iter_mut()
             .find(|e| e.scale_milli == entry.scale_milli)
         {
-            // Steady state (an attach on an already-cached scale): no disk write.
             Some(existing) if *existing == entry => return Ok(()),
             Some(existing) => *existing = entry,
             None => {
@@ -4914,8 +3747,6 @@ fn store_cell_metrics_to(
         }
         let toml =
             aterm_toml::to_string(&cache).map_err(|e| format!("serialize cell metrics: {e}"))?;
-        // Ordered: a cache; a lost write costs one cold launch and heals itself, and a
-        // malformed file reads as none.
         write_restore_locked(path, toml.as_bytes(), Flush::Ordered)
     })
     .map_err(String::from)
@@ -4925,8 +3756,6 @@ fn store_cell_metrics_to(
 mod tests {
     use super::*;
 
-    /// The restore lock is free once its operation returns, even while a child forked under
-    /// it has yet to exec (a real fork inside the hold, [`crate::parked_fork`]).
     #[cfg(unix)]
     #[test]
     fn the_restore_lock_is_free_while_a_child_forked_under_it_has_yet_to_exec() {
@@ -4953,17 +3782,12 @@ mod tests {
         child.release();
     }
 
-    /// The cold update lane's layout write and its take-back wait a bounded time for the
-    /// restore lock (another instance stopped while holding it: Ctrl-Z, a debugger), then
-    /// refuse as passing with nothing written. Control: once the holder lets go, the write
-    /// lands.
     #[cfg(unix)]
     #[test]
     fn the_cold_lanes_layout_write_waits_a_bounded_time_for_the_restore_lock() {
         let dir = aterm_tempfile::tempdir().expect("scratch dir");
         let path = dir.path().join("session.toml");
         let budget = std::time::Duration::from_millis(100);
-        // Another aterm's boot or quit: the lock held on its own description.
         let holder = crate::native_document_host::HeldAdvisoryLock::lock(
             OpenOptions::new()
                 .read(true)
@@ -4992,7 +3816,6 @@ mod tests {
         let fault = took.expect_err("the take-back is bounded too");
         assert!(fault.passing(), "{fault}");
         assert!(!path.exists(), "nothing was written");
-        // Control: free, it lands, and its take-back takes it.
         write_quit_to_within(&path, &sample(), Some("1-2"), budget).expect("written");
         assert_eq!(
             take_from(&path).map(|manifest| manifest.windows.len()),
@@ -5003,11 +3826,6 @@ mod tests {
         assert!(!path.exists(), "its own desk, taken back");
     }
 
-    /// Which flush each restore write takes (aterm-durable's counting seam): the
-    /// quit's own layout and the launch's single-use claim stay durable; the cold
-    /// lane's layout and both arms of its take-back (the rewrite that keeps another
-    /// instance's desk, and the removal), the warm handoff's sidecar, the claim's
-    /// cleanup and the cell-metrics cache are only ordered.
     #[cfg(unix)]
     #[test]
     fn the_restore_writes_name_their_flush() {
@@ -5028,8 +3846,6 @@ mod tests {
         );
         unwrite_quit_to_within(&path, Some("1-2"), budget).expect("taken back");
         assert_eq!(recording.take(), [O], "the take-back's removal");
-        // Another instance's desk in the file: the take-back rewrites it, keeping
-        // that desk, instead of removing it.
         write_quit_to(&path, &sample(), Some("1-1")).expect("the other quit");
         write_quit_to_within(&path, &sample(), Some("1-2"), budget).expect("cold lane");
         let _ = recording.take();
@@ -5072,7 +3888,6 @@ mod tests {
         assert_eq!(recording.take(), [O, O], "the cell-metrics cache");
     }
 
-    /// No crash evidence anywhere: every dead run's end reads clean.
     #[cfg(unix)]
     fn no_evidence() -> Evidence<'static> {
         Evidence {
@@ -5081,7 +3896,6 @@ mod tests {
         }
     }
 
-    /// The crash evidence in the log dir `logs`.
     #[cfg(unix)]
     fn evidence_in(logs: &Path) -> Evidence<'_> {
         Evidence {
@@ -5090,7 +3904,6 @@ mod tests {
         }
     }
 
-    /// The launch takes of `session.toml` in `dir`, sorted.
     #[cfg(unix)]
     fn takes_in(dir: &Path) -> Vec<String> {
         let mut names: Vec<String> = fs::read_dir(dir)
@@ -5103,23 +3916,16 @@ mod tests {
         names
     }
 
-    /// Run `run`'s `kind` take of `session.toml` (its `n`th).
     #[cfg(unix)]
     fn take_of(kind: TakeKind, run: JournalId, n: usize) -> String {
         take_name(OsStr::new("session.toml"), kind, run, n)
     }
 
-    /// A run of a pid that is no process any more, started now.
     #[cfg(unix)]
     fn dead_run() -> JournalId {
         JournalId::now(crate::crash_journal::tests::reaped_pid())
     }
 
-    /// THE LAUNCH'S TAKE HOLDS WHAT IT TOOK (r6 sweep #7, START-1). The layout
-    /// leaves `session.toml` for a name tagged with the run, which stays, under
-    /// the run's lock, until the run keeps its desk itself; a launch beside it
-    /// never takes a live run's take, crash marker or not, and the settle leaves
-    /// nothing behind.
     #[cfg(unix)]
     #[test]
     fn a_launch_take_is_held_until_its_run_settles_and_never_taken_while_it_lives() {
@@ -5134,7 +3940,6 @@ mod tests {
         assert_eq!(taken.run.as_deref(), Some("1-2"));
         assert!(!path.exists(), "no longer under its public name");
         assert_eq!(takes_in(dir.path()), [take_of(TakeKind::Taken, a, 0)]);
-        // A's marker would read as a kill, but A's lock is held: A lives.
         marker(logs.path(), a);
         let (beside, beside_held) = take_holding_from(&path, dead_run(), &evidence_in(logs.path()));
         assert!(beside.is_none(), "a live run's take is never taken");
@@ -5146,15 +3951,6 @@ mod tests {
         assert!(after.is_none());
     }
 
-    /// A DEAD RUN'S TAKE COMES BACK, ONCE (r6 sweep #7, START-1). A run that died
-    /// before it settled and left crash evidence (here its empty marker: a kill, a
-    /// hang's force quit) leaves its take to the next launch, behind that launch's
-    /// own quit layout, whose `also` names the run the take's quit was. When that
-    /// launch dies too before it settles, the layout it took AGAIN is set aside —
-    /// the brake — while the quit layout it took first comes back once in turn.
-    ///
-    /// NEGATIVE CONTROL: the single-use take (the launch's before this change)
-    /// leaves nothing for the launch after a run that dies before it restores.
     #[cfg(unix)]
     #[test]
     fn a_dead_runs_take_comes_back_once_when_its_run_ended_uncleanly() {
@@ -5212,14 +4008,6 @@ mod tests {
         assert!(takes_in(dir.path()).is_empty());
     }
 
-    /// A DEAD RUN'S TAKE GOES WHEN NOTHING SAYS IT WAS LOST (r6 sweep #7,
-    /// START-1): its run ended cleanly (no crash evidence); its run's own quit
-    /// wrote the desk before it was cut short (that layout comes back alone,
-    /// never the desk twice); its run's crash journal holds the desk (the claim
-    /// reopens that); this process's previous image left it, which an exec
-    /// replaced; or another dead run's take that comes back holds its run's desk.
-    /// NEGATIVE CONTROL: the same take with a crash marker and none of those comes
-    /// back (the last case).
     #[cfg(unix)]
     #[test]
     fn a_dead_runs_take_goes_when_its_end_was_clean_or_its_desk_is_held_elsewhere() {
@@ -5227,7 +4015,6 @@ mod tests {
         let (dir, logs) = (scratch("rt-dir"), scratch("rt-logs"));
         let path = dir.path().join("session.toml");
         let lost = layout(&[("/work/lost", "zsh")]);
-        // Run `a` takes `lost` and dies before it settles, `marked` or not.
         let died_holding = |a: JournalId, marked: bool| {
             write_quit_to(&path, &lost, Some("1-2")).expect("the quit's layout");
             drop(take_holding_from(&path, a, &no_evidence()).1);
@@ -5268,10 +4055,6 @@ mod tests {
         assert!(taken.is_none(), "this process's previous image's take goes");
         assert!(takes_in(dir.path()).is_empty());
 
-        // Y took `lost` and its quit wrote `own`, which names Y, before Y settled; A took
-        // that quit meanwhile (Y's take, still held, was left alone); then both were
-        // killed. A's take comes back, and Y's goes: Y's desk, which A's take holds,
-        // holds what Y had taken.
         write_quit_to(&path, &lost, Some("1-2")).expect("the quit's layout");
         let y = dead_run();
         let (_, y_held) = take_holding_from(&path, y, &no_evidence());
@@ -5298,14 +4081,6 @@ mod tests {
         held.settle();
     }
 
-    /// A TAKE WHOSE CLAIM MAY NOT OUTLIVE A CRASH BRINGS NOTHING BACK AND STILL
-    /// HOLDS WHAT IT TOOK (r6 sweep #7, START-1): the data dir's durable sync
-    /// fails (here the directory cannot be opened for it, while its names can
-    /// still be renamed), so the launch restores nothing, as the single-use
-    /// claim did; and its take stays under its lock, so a launch beside this
-    /// live run never takes it, crash marker or not, until the run settles.
-    /// NEGATIVE CONTROL: a take that let its lock go on that failure is taken
-    /// by the launch beside it (the `beside` check).
     #[cfg(unix)]
     #[test]
     fn a_take_whose_sync_fails_restores_nothing_and_holds_what_it_took() {
@@ -5315,7 +4090,6 @@ mod tests {
         let path = dir.path().join("session.toml");
         write_quit_to(&path, &sample(), Some("1-2")).expect("the quit's layout");
         let a = dead_run();
-        // Search and write but no read: the renames land, the open for the sync fails.
         fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o300)).expect("chmod");
         let (taken, held) = take_holding_from(&path, a, &evidence_in(logs.path()));
         fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).expect("chmod");
@@ -5324,7 +4098,6 @@ mod tests {
             "nothing comes back past an indeterminate claim"
         );
         assert_eq!(takes_in(dir.path()), [take_of(TakeKind::Taken, a, 0)]);
-        // A's marker would read as a kill, but A's lock is held: A lives.
         marker(logs.path(), a);
         let (beside, _) = take_holding_from(&path, dead_run(), &evidence_in(logs.path()));
         assert!(beside.is_none(), "a live run's take is never taken");
@@ -5333,12 +4106,6 @@ mod tests {
         assert!(takes_in(dir.path()).is_empty());
     }
 
-    /// A LAYOUT WRITE SAYS WHETHER ITS CAUSE PASSES. A full
-    /// disk, a quota, an I/O error or a busy lock is a moment the cold lane
-    /// retries; a data folder this user cannot write, a read-only volume or a
-    /// volume without the locks or syncs the write needs answers the same on
-    /// every try, and the lane goes on without its layout rather than refuse
-    /// the update every minute with no end.
     #[cfg(unix)]
     #[test]
     fn a_restore_write_fault_says_whether_its_cause_passes() {
@@ -5367,7 +4134,6 @@ mod tests {
             assert!(!RestoreFault::io("write", &error).passing(), "{error}");
         }
         assert!(!RestoreFault::from("serialize".to_string()).passing());
-        // A real one: a data folder this user cannot write.
         // SAFETY: `geteuid` has no preconditions.
         if unsafe { libc::geteuid() } != 0 {
             use std::os::unix::fs::PermissionsExt as _;
@@ -5387,7 +4153,6 @@ mod tests {
         }
     }
 
-    /// A terminal leaf naming session `id`.
     fn terminal(id: Option<u64>, title: &str) -> RestoredSplitTree {
         RestoredSplitTree::leaf(RestoredView::Terminal(TerminalLeafRestore {
             sid: None,
@@ -5415,9 +4180,6 @@ mod tests {
         }))
     }
 
-    /// A `--hold` desk as the outgoing capture writes it, in both projections: a live shell
-    /// (0) split with an exited pane (`exited`) the handoff does not hand, beside a Settings
-    /// tab carrying an unsaved draft.
     fn held_desk(exited: Option<u64>) -> RestoreManifest {
         let mut settings = NativeLeafRestore::settings("/text-fonts".to_string());
         settings.settings_drafts = vec![SettingsDraftRestore {
@@ -5473,26 +4235,19 @@ mod tests {
         }])
     }
 
-    /// The pane in front is each window's active tab's focused terminal, by `active_item` and
-    /// `focused_path`: the one pane whose title the outgoing build kept current.
     #[test]
     fn the_pane_in_front_is_each_windows_active_tabs_focused_terminal() {
         let mut desk = held_desk(Some(7));
-        // The Settings tab in front: no terminal is.
         assert_eq!(desk.windows[0].active_item, Some(1));
         assert!(desk.front_terminal_ids().is_empty());
-        // The split in front: its focused second pane, never the first.
         desk.windows[0].active_item = Some(0);
         assert_eq!(desk.front_terminal_ids(), vec![7]);
         desk.windows[0].restored_tabs[0].focused_path = vec![RestoreBranch::First];
         assert_eq!(desk.front_terminal_ids(), vec![0]);
-        // A second window answers for its own front pane.
         let mut other = held_desk(Some(9)).windows.remove(0);
         other.active_item = Some(0);
         desk.windows.push(other);
         assert_eq!(desk.front_terminal_ids(), vec![0, 9]);
-        // A focused pane that names no handed shell, and a window that
-        // recorded no active item, name none.
         desk.windows[1].restored_tabs[0].root = RestoredSplitTree::Split {
             axis: SplitKind::Vertical,
             ratio: 0.5,
@@ -5503,9 +4258,6 @@ mod tests {
         assert!(desk.front_terminal_ids().is_empty());
     }
 
-    /// A layout naming a pane the handoff did not hand (an exited `--hold` pane) is placed
-    /// with that pane retired to a placeholder and everything else as it was. Control: the
-    /// exact check, `covers_exact_seamless_ids`, refuses this layout.
     #[test]
     fn a_layout_naming_an_unhanded_pane_is_placed_with_that_pane_retired() {
         let wire = held_desk(Some(7))
@@ -5586,13 +4338,10 @@ mod tests {
             "the bootstrap pick is the handed shell"
         );
 
-        // An exact layout is placed unchanged.
         let exact = RestoreManifest::from_toml(&held_desk(Some(7)).to_toml().unwrap()).unwrap();
         assert_eq!(exact.clone().placed_for_handed(&[0, 7]), Ok(exact));
     }
 
-    /// A layout that misses a handed session, a handed id listed twice, or a terminal leaf
-    /// with no id stays unplaced, for the orphan net.
     #[test]
     fn a_layout_missing_a_handed_session_stays_unplaced() {
         let parsed = RestoreManifest::from_toml(&held_desk(Some(7)).to_toml().unwrap()).unwrap();
@@ -5611,8 +4360,6 @@ mod tests {
         );
     }
 
-    /// A layout naming one session in two leaves (`Open Session in New Window`) is placed
-    /// whole: the repeat is one session shown twice, not an ambiguous PTY.
     #[test]
     fn a_layout_naming_a_session_in_two_windows_is_placed_whole() {
         let mut desk = held_desk(Some(7));
@@ -5627,8 +4374,6 @@ mod tests {
     }
 
     fn sample() -> RestoreManifest {
-        // A two-window manifest: window 0 has one plain tab + one split tab; window 1 a
-        // single tab. Exercises every variant + per-leaf cwd/title/focus + active_tab.
         RestoreManifest::new(vec![
             WindowLayout {
                 rows: 24,
@@ -5710,9 +4455,6 @@ mod tests {
         }
     }
 
-    /// A handoff layout whose Settings leaf carries `drafts`, as
-    /// `App::capture_handoff_layout` builds it (through `RestoreManifest::new`,
-    /// the capture's sanitize).
     fn settings_handoff_layout(drafts: Vec<SettingsDraftRestore>) -> RestoreManifest {
         let mut leaf = NativeLeafRestore::settings("/text-fonts".to_string());
         leaf.settings_drafts = drafts;
@@ -5725,9 +4467,6 @@ mod tests {
         RestoreManifest::new(vec![window])
     }
 
-    /// A Settings leaf's carried drafts ride the handoff layout's wire and the capture stays a
-    /// fixed point of the parse (`from_toml(to_toml(layout)) == layout`, which the update
-    /// worker checks). Quotes, newlines and non-ASCII survive.
     #[test]
     fn settings_drafts_ride_the_handoff_layout_as_a_fixed_point() {
         let layout = settings_handoff_layout(vec![
@@ -5755,14 +4494,13 @@ mod tests {
         );
     }
 
-    /// A carried draft this build cannot read or reopen costs that draft (counted), never the
-    /// leaf, the layout or the handoff.
     #[test]
     fn an_unreadable_settings_draft_costs_the_draft_not_the_layout() {
         let parse = |tag: &str, extra: &str| -> NativeLeafRestore {
             let route = if tag == "settings" {
                 "route = \"/home\"\n"
             } else {
+                // Distinct branch.
                 "uri = \"file:///tmp/notes.md\"\n"
             };
             let wire = format!("kind = \"native\"\nrestore_tag = \"{tag}\"\n{route}{extra}");
@@ -5823,13 +4561,6 @@ mod tests {
         RestoredView::Native(native.clone()).bounded()
     }
 
-    /// Gap #29, the wire half. A window's show state round-trips exactly — the
-    /// parent's own pre-flight (`from_toml(to_toml(layout)) == layout`) and the
-    /// byte fixed point a same-build child re-proves — and an UNKNOWN one emits
-    /// nothing at all, so every capture that records none (every platform but
-    /// macOS, every headless capture) writes the wire an older build writes. So
-    /// does an unknown `maximized` (W3): a pre-`maximized` manifest reads it
-    /// unknown.
     #[test]
     fn window_show_state_round_trips_and_unknown_emits_nothing() {
         let mut shown = sample();
@@ -5857,8 +4588,6 @@ mod tests {
             "a manifest carrying show state is a byte fixed point of the codec"
         );
 
-        // An unknown show state, and an unknown `maximized`, write the wire an
-        // older build writes, and read back unknown, never a forced state.
         let mut unknown = sample();
         for window in &mut unknown.windows {
             window.maximized = None;
@@ -5873,11 +4602,6 @@ mod tests {
         assert!(back.windows.iter().all(|w| w.maximized.is_none()));
     }
 
-    /// Show state is compatible with older and newer peers: a layout written before it parses
-    /// with it unknown, one carrying `[windows.show]` parses with exactly those windows known,
-    /// an older reader (no `show`, no `deny_unknown_fields`) skips the table, and a key a later
-    /// build adds inside `show` is skipped by this one. The child's digest hashes the wire it
-    /// read (`seamless::layout_wire_digest`), so a skipped key cannot move the proof.
     #[test]
     fn window_show_state_is_compatible_with_older_and_newer_peers() {
         let mut shown = sample();
@@ -5917,8 +4641,6 @@ mod tests {
         let back = RestoreManifest::from_toml(&later).expect("a later show key is skipped");
         assert_eq!(back.windows[0].show, shown.windows[0].show);
 
-        // Every layout an older release's parent really wrote (the checked-in
-        // handoff fixtures, one directory per release and desk).
         let fixtures = Path::new(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/tests/fixtures/handoff"
@@ -5932,8 +4654,6 @@ mod tests {
             }
             for desk in fs::read_dir(&release).expect("a release's desks") {
                 let desk = desk.expect("a desk").path();
-                // A release directory also holds files of its own (its
-                // `rendezvous.toml`); only its directories are desks.
                 if !desk.is_dir() {
                     continue;
                 }
@@ -5945,9 +4665,6 @@ mod tests {
                     let wire = fs::read_to_string(&path).expect("a fixture layout");
                     let parsed = RestoreManifest::from_toml(&wire)
                         .unwrap_or_else(|| panic!("{} parses", path.display()));
-                    // A window's `[windows.show]` table is written only
-                    // when something was captured (`WindowShow::is_unknown`),
-                    // so the tables a parent wrote are the windows it carried.
                     let carried = wire.matches("[windows.show]\n").count();
                     let known = parsed
                         .windows
@@ -5991,8 +4708,6 @@ mod tests {
         terminal.description = Some(format!("purpose\u{2029}{}", "x".repeat(1100)));
         terminal.icon = Some("\u{2066}👨‍👩‍👧‍👦\u{2069}".to_string());
 
-        // Serialize the deliberately noncanonical structure directly: the
-        // ordinary constructor already sanitizes and would not exercise parse.
         let wire = aterm_toml::to_string(&manifest).expect("serialize hostile fixture");
         let decoded = RestoreManifest::from_toml(&wire).expect("bounded restore parses");
         let RestoredSplitTree::Leaf {
@@ -6015,9 +4730,6 @@ mod tests {
         assert!(terminal.user_metadata_is_canonical());
     }
 
-    /// The parse drops the retired Claude Code hooks' bare badge, keeping the rest of the leaf
-    /// and the round trip's fixed point. Negative control: an attention without the prefix
-    /// arrives intact.
     #[test]
     fn restore_parse_drops_the_retired_hook_badge_and_keeps_the_rest() {
         let parse = |attention: &str| {
@@ -6030,8 +4742,6 @@ mod tests {
             };
             terminal.user_title = Some("worker".to_string());
             terminal.attention = Some(attention.to_string());
-            // Serialized directly, as an unfixed parent writes it: the
-            // ordinary constructor would drop the badge before the parse.
             let wire = aterm_toml::to_string(&manifest).expect("serialize legacy fixture");
             assert!(wire.contains(attention), "the wire carries it: {wire}");
             let decoded = RestoreManifest::from_toml(&wire).expect("the manifest still parses");
@@ -6100,8 +4810,6 @@ focused = true
                 .canonical_active(&decoded.windows[0].canonical_order().expect("legacy order")),
             0
         );
-        // A legacy split side by side (`Vertical` divider) is the canonical
-        // tree's `Horizontal` axis.
         assert!(matches!(
             sample().windows[0].restored_tabs[1].root,
             RestoredSplitTree::Split {
@@ -6111,9 +4819,6 @@ focused = true
         ));
     }
 
-    /// The caps degrade per window: a window past a cap is left out alone, windows after the
-    /// 64th are not read, and the rest come back in order. Negative control: a layout none of
-    /// whose windows reads is refused.
     #[test]
     fn a_layout_past_the_caps_keeps_every_window_it_can() {
         use crate::crash_journal::fixtures::layout;
@@ -6131,8 +4836,6 @@ focused = true
         windows.insert(1, layout(&crowded).windows.remove(0));
         let manifest = RestoreManifest::new(windows);
         assert_eq!(manifest.windows.len(), MAX_WINDOWS + 2, "PRECONDITION");
-        // Each cause is counted apart: the crowded window, and the one after
-        // the 64th.
         let admitted = AdmittedWindows::of(manifest.windows.clone());
         assert_eq!((admitted.past_cap, admitted.unbuildable), (1, 1));
         let read = RestoreManifest::from_toml(&manifest.to_toml().unwrap())
@@ -6150,9 +4853,6 @@ focused = true
         );
     }
 
-    /// A window of one terminal tab per shell in `shells`, in both projections
-    /// (the canonical tree and the legacy terminal mirror), as the handoff
-    /// capture writes it.
     fn shells_window(shells: std::ops::Range<u64>) -> WindowLayout {
         WindowLayout {
             rows: 30,
@@ -6186,7 +4886,6 @@ focused = true
         }
     }
 
-    /// The shells each window's tabs name, in order.
     fn shells_of(manifest: &RestoreManifest) -> Vec<Vec<u64>> {
         manifest
             .windows
@@ -6201,9 +4900,6 @@ focused = true
             .collect()
     }
 
-    /// What every fold must keep: the layout is a fixed point of the parse
-    /// (the update worker's round trip), within the caps, and names every
-    /// handed shell — nothing is left to the orphan net.
     fn assert_folded_whole(folded: &RestoreManifest, shells: u64) {
         assert!(folded.admits_whole(), "within the caps");
         assert_eq!(
@@ -6218,8 +4914,6 @@ focused = true
         );
     }
 
-    /// A desk exactly at the caps (64 windows, one of 256 tabs) is not folded: layout and wire
-    /// unchanged, no `fold` table.
     #[test]
     fn a_desk_within_the_caps_is_left_byte_identical() {
         let mut windows = vec![shells_window(0..256)];
@@ -6245,9 +4939,6 @@ focused = true
         assert!(folded.admits_whole());
     }
 
-    /// Windows past the cap become tabs of the last window that fits, after its own; tabs
-    /// past that window's cap go to the next window with room (here, the first). Every window
-    /// that lost tabs drops its legacy mirror; every other window is as captured.
     #[test]
     fn the_windows_past_the_cap_fold_into_the_last_window_that_fits() {
         let mut windows = (0..MAX_WINDOWS as u64 - 1)
@@ -6304,11 +4995,6 @@ focused = true
         }
         assert_folded_whole(&folded, 323);
 
-        // THE PANES IN FRONT ARE THE OUTGOING BUILD'S (the D5 review, P3):
-        // the seamless adoption trusts a record's title copy only for a pane
-        // that was in front. Read off the folded windows, the merged windows'
-        // front panes (313, 318) are missing; the folded layout answers by the
-        // fold's record, which a parse bounds by the tabs a layout holds.
         assert!(!folded.windows_front_terminal_ids().contains(&313));
         assert_eq!(folded.front_terminal_ids(), folded.fold.front);
         let mut hostile = folded;
@@ -6317,8 +5003,6 @@ focused = true
         assert_eq!(read.fold.front.len(), MAX_FOLD_FRONT);
     }
 
-    /// A window past the tab cap spills into the next window with room, skipping a full one;
-    /// when its front tab moves to a window with its own, the donor shows its last tab.
     #[test]
     fn a_window_past_the_tab_cap_spills_into_the_next_window_with_room() {
         let mut crowded = shells_window(0..300);
@@ -6359,15 +5043,10 @@ focused = true
         );
         assert_eq!(folded.windows[1], before.windows[1]);
         assert_folded_whole(&folded, 566);
-        // The donor's new front pane (255) was behind before the fold; the
-        // moved front pane (280) is the one that was in front.
         assert!(folded.windows_front_terminal_ids().contains(&255));
         assert_eq!(folded.front_terminal_ids(), vec![280, 300, 556]);
     }
 
-    /// D5: A LONE WINDOW PAST THE TAB CAP SPILLS INTO WINDOWS MADE FOR IT —
-    /// at its grid and size, placed by the window
-    /// system — the first of which shows its front tab, which moved there.
     #[test]
     fn a_lone_window_past_the_tab_cap_spills_into_windows_made_for_it() {
         let mut crowded = shells_window(0..600);
@@ -6409,9 +5088,6 @@ focused = true
         assert_folded_whole(&folded, 600);
     }
 
-    /// A desk past what any layout holds (64 full windows and a tab to spare, or a tab past
-    /// its split depth) is left as it is by the fold and not admitted whole; the park refuses
-    /// it typed (`app_update_handoff::commit_handoff_layout`).
     #[test]
     fn a_desk_past_what_any_layout_holds_is_not_admitted_whole() {
         let mut windows = (0..MAX_WINDOWS as u64)
@@ -6444,7 +5120,6 @@ focused = true
         }
         let mut deep = shells_window(0..1);
         deep.restored_tabs[0].root = root;
-        // Focused on a leaf at the top: the depth alone is past the cap.
         deep.restored_tabs[0].focused_path = vec![RestoreBranch::Second];
         let mut deep = RestoreManifest::new(vec![deep]);
         let before = deep.clone();
@@ -6457,16 +5132,6 @@ focused = true
         assert!(deep.why_not_whole().is_some(), "the refusal says why");
     }
 
-    /// THE MIRROR RULE, ONE FOR THE READ AND THE WRITE (the D5 review). The
-    /// fold moves tabs whole, so a window past the cap with Settings open, or
-    /// the same document, puts a second one into the last window; its
-    /// successor reopens both, and its next capture wrote both into the
-    /// window's legacy mirror — which every build's parse refuses, so the next
-    /// update refused its own layout ("past what one handoff layout holds",
-    /// which it was not) and the quit layout and crash journals left the window
-    /// out. The capture now leaves out of the mirror what
-    /// `NativeTabRestore::joins_mirror` refuses, the very rule the parse reads
-    /// the mirror by.
     #[test]
     fn system_state_restore_descriptors_round_trip_without_document_authority() {
         let native = NativeLeafRestore::system_state();
@@ -6528,8 +5193,6 @@ focused = true
              same file does not"
         );
 
-        // The parse admits the mirror the rule wrote, and refuses the one it
-        // would not have: a window whose canonical tabs are whole either way.
         let window_with = |native_tabs: Vec<NativeTabRestore>| {
             let mut window = shells_window(0..1);
             window.tab_order = std::iter::once(TabOrderEntry::Terminal { index: 0 })
@@ -6578,6 +5241,7 @@ focused = true
         assert!(RestoreManifest::from_toml(&toml).is_none());
 
         malformed_uri.windows[0].native_tabs[1] = NativeTabRestore::Editor {
+            // Distinct branch.
             uri: "file:///tmp/readme.md".to_string(),
         };
         malformed_uri.windows[0].tab_order = vec![
@@ -6706,6 +5370,7 @@ metadata = "opaque=copy-me"
     fn v2_sanitizes_geometry_but_rejects_resource_exhaustion_shapes() {
         let mut manifest = mixed_sample("file:///tmp/readme.md");
         let mut tab = RestoredTab::from_legacy_native(&NativeTabRestore::Editor {
+            // Distinct branch.
             uri: "file:///tmp/readme.md".to_string(),
         })
         .unwrap();
@@ -6745,9 +5410,6 @@ metadata = "opaque=copy-me"
         );
     }
 
-    /// A NUL in a pane's directory (OSC 7 `file:///tmp/a%00b`) costs the directory, never the
-    /// layout: the leaf's sanitize drops it, and strips NULs from the title, at both the
-    /// capture (`RestoreManifest::new`) and the parse, so an older writer's layout is adopted.
     #[test]
     fn a_nul_cwd_leaf_round_trips_sanitized() {
         let hostile = || {
@@ -6791,8 +5453,6 @@ metadata = "opaque=copy-me"
             assert_eq!(title, "zsh ~", "{what}: and strips the title the same way");
         };
 
-        // The parse: an older writer's raw layout, serialized without the sanitizing
-        // constructor.
         let raw = RestoreManifest {
             schema: SCHEMA,
             fold: LayoutFold::default(),
@@ -6802,8 +5462,6 @@ metadata = "opaque=copy-me"
         let parsed = RestoreManifest::from_toml(&wire).expect("a NUL directory is recoverable");
         assert_clean(&parsed, "parse");
 
-        // The capture: what `capture_restore_manifest` builds, and the update worker's exact
-        // check, `from_toml(to_toml(layout)) == layout`.
         let captured = RestoreManifest::new(vec![hostile()]);
         assert_clean(&captured, "capture");
         let round_trip = captured
@@ -6817,14 +5475,6 @@ metadata = "opaque=copy-me"
         );
     }
 
-    /// A LEAF NAMES THE EPOCH ITS SHELL'S LOG WAS AT,
-    /// AND THE LAYOUT SAYS THE LARGEST: `log_ep` round
-    /// trips through the capture's wire and the parse; a leaf without it is
-    /// written as an older writer wrote it (no key) and an older writer's
-    /// layout reads as none; `max_log_ep` is the largest over every
-    /// window's leaves, which a launch notes before any session starts
-    /// (`session_log::Epochs::note_leaves`). NEGATIVE CONTROL: a layout with
-    /// no epoch says none.
     #[test]
     fn a_leaf_names_its_logs_epoch_and_the_layout_says_the_largest() {
         let named = RestoreManifest::one_terminal_for_test(Some(1_792_000_123));
@@ -6857,13 +5507,6 @@ metadata = "opaque=copy-me"
         );
     }
 
-    /// A LEAF NAMES ITS SESSION AND ITS LINEAGE, AND A PEER WITHOUT THEM READS
-    /// PAST THEM: both round-trip through the capture and the parse; a leaf
-    /// without them is written as an older writer wrote it (no key), and this
-    /// build reads past a field it does not know, as an older one reads past
-    /// these. A HOSTILE LEAF costs only the values: a 1 MiB lineage, a sid
-    /// with a NUL, one past a log id's 40 bytes and one not of the minted shape
-    /// are each dropped, and the layout still parses (never refused whole).
     #[test]
     fn a_leaf_names_its_session_and_lineage_and_older_peers_read_past_them() {
         let window = |sid: Option<String>, lineage: Option<String>| WindowLayout {
@@ -6973,14 +5616,6 @@ metadata = "opaque=copy-me"
         }
     }
 
-    /// AUDIT #8 — A LEAF A PROGRAM HELD (ssh) is written `held = true`, a
-    /// leaf that was not is written as it always was (so an older writer's
-    /// layout and today's unheld one are the same bytes), and the bootstrap
-    /// session does not ask for a folder a held pane reported that is not
-    /// here. NEGATIVE CONTROLS: the same folder from an unheld pane is asked
-    /// for (its spawn falls back and says so), a held pane's folder that is
-    /// here is kept, and a pane the agent aterm hosted held ran on this
-    /// machine, so its folder is asked for.
     #[test]
     fn a_held_leaf_round_trips_and_its_folder_that_is_not_here_is_not_asked_for() {
         let scratch = aterm_tempfile::Builder::new()
@@ -7015,8 +5650,6 @@ metadata = "opaque=copy-me"
         let back = RestoreManifest::from_toml(&wire(&held)).expect("parses");
         assert_eq!(back, held, "held survives the wire");
 
-        // Off unix no folder is judged before a spawn (`spawn_folder::inherited`):
-        // a Windows spawn whose folder is not there inherits instead.
         assert_eq!(
             back.first_leaf_cwd().as_deref(),
             (!cfg!(unix)).then_some(remote.as_str()),
@@ -7061,13 +5694,10 @@ metadata = "opaque=copy-me"
         );
     }
 
-    /// Corrupt TOML, a wrong schema and empty input all yield `None` (start fresh), never a
-    /// partial layout.
     #[test]
     fn parse_is_fail_safe() {
         assert!(RestoreManifest::from_toml("this is not toml {{{").is_none());
         assert!(RestoreManifest::from_toml("").is_none());
-        // Valid TOML, wrong schema → ignored.
         let mut m = sample();
         m.schema = 999;
         let toml = aterm_toml::to_string(&m).unwrap();
@@ -7077,11 +5707,6 @@ metadata = "opaque=copy-me"
         );
     }
 
-    /// A one-shot name — the handoff's attempt-bound layout — keeps nothing but the
-    /// manifest: its lock goes with the write (they used to pile up in the control
-    /// directory, one per update), while a shared name keeps the lock every writer
-    /// and claimer of it serializes on. The bytes are exactly `to_toml()`, which is
-    /// what the handoff's layout digest commits to.
     #[test]
     fn a_one_shot_write_leaves_only_its_manifest() {
         let dir =
@@ -7118,10 +5743,6 @@ metadata = "opaque=copy-me"
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A write temporary or a claim that a killed writer or claimer left beside
-    /// a name, each a whole layout, is swept under that name's lock once its pid
-    /// is gone. A live pid's is left, as is another name's, and a link is never
-    /// followed.
     #[cfg(unix)]
     #[test]
     fn a_dead_pids_restore_temporaries_go_under_the_lock() {
@@ -7222,9 +5843,6 @@ metadata = "opaque=copy-me"
         assert!(!path.exists());
         assert!(take_from(&path).is_none());
 
-        // The launch's two-phase take keeps the law (r6 sweep #7): of two launches
-        // racing for the layout one takes and holds it, and the other finds that
-        // live run's take and leaves it.
         #[cfg(unix)]
         {
             write_to(&path, &manifest).unwrap();
@@ -7262,8 +5880,6 @@ metadata = "opaque=copy-me"
             assert!(takes_in(&dir).is_empty());
         }
 
-        // Tier-1 projection of the one real winner and absent loser. Returning
-        // before SyncClaim is the explicit negative control.
         let model = aterm_models_native::restore_manifest_single_use_model();
         let locked = model.successors("LockTakeA", &model.init_state())[0].clone();
         let claimed = model.successors("ClaimA", &locked)[0].clone();
@@ -7276,9 +5892,6 @@ metadata = "opaque=copy-me"
         assert!(model.check_invariant("AtMostOneConsumer", &absent));
         assert!(model.check_invariant("ReturnOnlyAfterDurableClaim", &absent));
 
-        // Negative control: the unlocked read-then-remove take, replayed on real files in its
-        // losing interleaving: A reads, B reads while the name survives, A removes, B's remove
-        // fails (ignored), and both return the manifest. Each step is the mutant's.
         write_to(&path, &manifest).unwrap();
         let buggy = aterm_spec::interp::with_buggy(&model, 1);
         let initial = buggy.init_state();
@@ -7304,17 +5917,6 @@ metadata = "opaque=copy-me"
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A PRIVATE INSTANCE'S LAYOUT STAYS ITS OWN (ruling 406; day ten's D1): under a
-    /// development build's `ATERM_STATE_HOME` the manifest, the crash journals beside
-    /// it and the cell-metrics cache live in that root, beside the logs folder whose
-    /// crash markers the journal claim reads — before, an instance on the owner's
-    /// `$HOME` with its own state root took the owner's `session.toml` and claimed,
-    /// then deleted, the owner's dead journals. A relative seam resolves nothing
-    /// (never the owner's folder), and unset they are `aterm_data_dir()`: in a shipped
-    /// process `<data_dir>/aterm` exactly as before (`aterm_types::dirs`' own tests), in
-    /// this test binary its own root's (`aterm_types::dirs::test_root`). NEGATIVE
-    /// CONTROL: the unset arm names that folder, not the scratch root, so the scoped
-    /// arm's pass is the seam's doing.
     #[test]
     fn the_manifest_journals_and_cell_metrics_follow_the_state_home_seam() {
         let scratch = aterm_tempfile::Builder::new()
@@ -7336,7 +5938,6 @@ metadata = "opaque=copy-me"
             assert_eq!(manifest_path(), None, "a relative seam is refused");
             assert_eq!(crate::crash_journal::journal_dir(), None);
             assert_eq!(cell_metrics_path(), None);
-            // Nothing is written: no path resolves.
             assert!(write(&RestoreManifest::new(Vec::new())).is_err());
         });
         crate::test_env::scoped_unset("ATERM_STATE_HOME", || {
@@ -7359,8 +5960,6 @@ metadata = "opaque=copy-me"
         });
     }
 
-    /// The recorded scale is the cache's sole entry: none with no file, the one scale after
-    /// one store, none again once a second scale is recorded.
     #[test]
     fn the_recorded_scale_is_the_sole_cached_scale_or_nothing() {
         let dir = std::env::temp_dir().join(format!(
@@ -7382,8 +5981,6 @@ metadata = "opaque=copy-me"
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Cell-metrics store→load round-trips per scale, a second scale coexists with the first,
-    /// and re-storing the identical entry writes nothing.
     #[test]
     fn cell_metrics_round_trip_per_scale() {
         let dir = std::env::temp_dir().join(format!(
@@ -7404,19 +6001,15 @@ metadata = "opaque=copy-me"
             load_cell_metrics_from(&path, "JetBrains Mono|lh=1", 1.5, 18.0),
             Some((11, 22))
         );
-        // An uncached scale misses without disturbing the cached ones.
         assert_eq!(
             load_cell_metrics_from(&path, "JetBrains Mono|lh=1", 2.0, 24.0),
             None
         );
 
-        // Steady state: the identical re-store leaves the file's bytes untouched (compared by
-        // content: mtimes are too coarse on some filesystems).
         let before = std::fs::read_to_string(&path).unwrap();
         store_cell_metrics_to(&path, "JetBrains Mono|lh=1", 1.0, 12.0, 7, 15).unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
 
-        // A real change on one scale updates that entry and keeps the other.
         store_cell_metrics_to(&path, "JetBrains Mono|lh=1", 1.0, 12.0, 8, 16).unwrap();
         assert_eq!(
             load_cell_metrics_from(&path, "JetBrains Mono|lh=1", 1.0, 12.0),
@@ -7429,8 +6022,6 @@ metadata = "opaque=copy-me"
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Every cell-metrics staleness gate fails closed (a miss, never a wrong hit): font-key
-    /// change, font-px change, degenerate cells, schema mismatch, absent or corrupt files.
     #[test]
     fn cell_metrics_staleness_gates_fail_closed() {
         let dir = std::env::temp_dir().join(format!(
@@ -7441,17 +6032,13 @@ metadata = "opaque=copy-me"
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("cell-metrics.toml");
 
-        // Absent + corrupt files read as cold launches.
         assert_eq!(load_cell_metrics_from(&path, "k", 1.0, 12.0), None);
         std::fs::write(&path, "not toml [").unwrap();
         assert_eq!(load_cell_metrics_from(&path, "k", 1.0, 12.0), None);
         let _ = std::fs::remove_file(&path);
 
         store_cell_metrics_to(&path, "Cascadia|lh=1", 1.0, 12.0, 7, 15).unwrap();
-        // A font change (new fingerprint) misses...
         assert_eq!(load_cell_metrics_from(&path, "Fira|lh=1", 1.0, 12.0), None);
-        // ...and the next store under the new key drops the stale entries wholesale rather
-        // than mixing fingerprints.
         store_cell_metrics_to(&path, "Fira|lh=1", 2.0, 24.0, 13, 29).unwrap();
         assert_eq!(
             load_cell_metrics_from(&path, "Cascadia|lh=1", 1.0, 12.0),
@@ -7461,25 +6048,20 @@ metadata = "opaque=copy-me"
             load_cell_metrics_from(&path, "Fira|lh=1", 2.0, 24.0),
             Some((13, 29))
         );
-        // A predicted-font-px drift ≥ the tolerance misses (an explicit
-        // `font_px` config change), a sub-tolerance one hits (f32 noise).
         assert_eq!(load_cell_metrics_from(&path, "Fira|lh=1", 2.0, 25.0), None);
         assert_eq!(
             load_cell_metrics_from(&path, "Fira|lh=1", 2.0, 24.2),
             Some((13, 29))
         );
 
-        // Degenerate measurements are never persisted...
         store_cell_metrics_to(&path, "Fira|lh=1", 3.0, 36.0, 0, 15).unwrap();
         assert_eq!(load_cell_metrics_from(&path, "Fira|lh=1", 3.0, 36.0), None);
-        // ...and a hand-corrupted absurd entry is rejected at load.
         let text = std::fs::read_to_string(&path)
             .unwrap()
             .replace("cell_w = 13", "cell_w = 99999");
         std::fs::write(&path, text).unwrap();
         assert_eq!(load_cell_metrics_from(&path, "Fira|lh=1", 2.0, 24.0), None);
 
-        // A future schema is ignored wholesale, never mis-parsed.
         let _ = std::fs::remove_file(&path);
         store_cell_metrics_to(&path, "Fira|lh=1", 1.0, 12.0, 7, 15).unwrap();
         let text = std::fs::read_to_string(&path)
@@ -7490,8 +6072,6 @@ metadata = "opaque=copy-me"
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// [`sample`] with its terminal leaves numbered `0..` in layout order, as
-    /// the capture stamps each leaf's session id.
     fn numbered_sample() -> RestoreManifest {
         fn number(node: &mut RestoredSplitTree, next: &mut u64) {
             match node {
@@ -7518,13 +6098,6 @@ metadata = "opaque=copy-me"
         m
     }
 
-    /// THE AGENT RIDES ITS LEAF (2026-09-27): the crash journal's capture puts on
-    /// each terminal leaf the agent its session hosts, and the manifest
-    /// carries it through its own codec unchanged — the tab it ran in too
-    /// ([`AgentRestore::tab`], XREV-LC-1). NEGATIVE CONTROL: a leaf whose
-    /// session hosts none carries none, a manifest never filled (a person's
-    /// own quit) carries none at all, and a leaf as an older build wrote it
-    /// (no `tab`) names no tab.
     #[test]
     fn a_hosted_agent_rides_its_leaf_through_the_codec() {
         fn agents(m: &RestoreManifest) -> Vec<Option<AgentRestore>> {
@@ -7583,11 +6156,6 @@ metadata = "opaque=copy-me"
         assert_eq!(older[1].as_ref().map(|a| a.tab.as_deref()), Some(None));
     }
 
-    /// A cold restore's reopened tab, a new sid, is told the tab its agent ran
-    /// in ([`AgentRestore::ran_in_another`]): the snapshot's sid, kept by
-    /// [`AgentRestore::of`]. NEGATIVE CONTROLS: the very sid (a seamless
-    /// update's handoff keeps it) names none, nor does a snapshot naming no
-    /// tab.
     #[test]
     fn a_restored_agent_names_the_tab_it_ran_in_only_for_another() {
         let snap = |tab: &str| aterm_agent::harness::relaunch::Snapshot {
@@ -7618,21 +6186,8 @@ metadata = "opaque=copy-me"
         assert_eq!(AgentRestore::of(snap("")).tab, None, "none to write");
     }
 
-    /// The sid of a tab a crashed run held.
     const OLD_TAB: &str = "s-00000000000000000001";
 
-    /// THE TAB'S HOLDS RIDE ITS LEAF (2026-10-15 and
-    /// its review; ruling 23): [`RestoreManifest::fill_holds`] puts the hold
-    /// rows of the session a leaf names (`fabric::render_holds`'
-    /// `"<origin> <reason>"`) on that leaf alone, an agent on it or none, and
-    /// they go through the layout's codec unchanged. They read back as the
-    /// tab's holds — FAIL-CLOSED, as the seamless update reads its carry: a
-    /// row it cannot read is the owner's hold, `carried-unreadable` — and the
-    /// agent on a held leaf, the owner's hold or the fleet's, is one the
-    /// reopened row does not promise to resume
-    /// ([`TerminalLeafRestore::resumes_agent`]). NEGATIVE CONTROL: a leaf as
-    /// an older build writes it (no field) reads as no hold, and its agent
-    /// resumes.
     #[test]
     fn a_tabs_holds_ride_its_leaf_and_its_agent_is_not_promised() {
         use crate::fabric::{CARRIED_UNREADABLE, Hold};
@@ -7672,8 +6227,6 @@ metadata = "opaque=copy-me"
             }
             out
         }
-        // The first tab's leaf names session 7 and its agent; every other
-        // leaf names another session.
         let layout = |hold: Option<&str>| {
             let mut m = sample();
             if let RestoredSplitTree::Leaf {
@@ -7708,7 +6261,6 @@ metadata = "opaque=copy-me"
             None,
             "the reopened row does not promise it"
         );
-        // FAIL-CLOSED: a row no build wrote is a local hold all the same.
         let garbled = TerminalLeafRestore {
             holds: vec!["garbled row here".to_string()],
             ..back[0].clone()
@@ -7721,14 +6273,12 @@ metadata = "opaque=copy-me"
             })
         );
         assert_eq!(garbled.resumes_agent(), None, "a garbled row holds");
-        // A fleet row rides the leaf too, and its agent is the holder's.
         let (_, back) = layout(Some("fleet fabric-lost"));
         assert!(
             back[0].carried_holds().has("fleet") && !back[0].carried_holds().has("local"),
             "{back:?}"
         );
         assert_eq!(back[0].resumes_agent(), None, "fleet");
-        // NEGATIVE CONTROL: an older build's leaf.
         let (text, back) = layout(None);
         assert!(!text.contains("holds ="), "no field written: {text}");
         assert_eq!(
@@ -7738,15 +6288,6 @@ metadata = "opaque=copy-me"
         );
     }
 
-    /// THE LEAF NAMES ITS AGENT BY ITS RECORD WORD (`upgrade::Agent::word`):
-    /// a Codex's leaf carries `word = "codex"`, a Claude Code's carries none
-    /// and is as every older build wrote it, and a leaf an older producer
-    /// wrote with no word is read off its Codex run as before. A word this
-    /// build has no lane for — a leaf a newer build wrote for another agent —
-    /// is no agent: no snapshot, so no relaunch types another agent's line
-    /// into its tab. FAILS WITHOUT THE WORD: that leaf, carrying no Codex
-    /// run, came back as a Claude Code and was relaunched with `claude
-    /// --resume`.
     #[test]
     fn a_leaf_names_its_agent_and_an_unknown_one_is_relaunched_by_nothing() {
         use aterm_agent::harness::relaunch::{CodexRun, Snapshot};
@@ -7789,11 +6330,9 @@ metadata = "opaque=copy-me"
         );
         assert_eq!(read(&wire(&claude)).agent(), Some(Agent::Claude));
         assert_eq!(read(&wire(&codex)).agent(), Some(Agent::Codex));
-        // An older producer's Codex leaf: no word, its run says Codex.
         let older = wire(&codex).replace("word = \"codex\"\n", "");
         assert!(!older.contains("word"), "{older}");
         assert_eq!(read(&older).agent(), Some(Agent::Codex));
-        // A word its run contradicts is no agent either way round.
         let no_run = read(wire(&codex).split("[codex]").next().unwrap());
         assert!(
             no_run.run.is_none() && no_run.word == "codex",
@@ -7804,24 +6343,16 @@ metadata = "opaque=copy-me"
         let mut claude_with_run = read(&wire(&codex));
         claude_with_run.word = "claude".to_string();
         assert_eq!(claude_with_run.agent(), None, "claude beside a Codex run");
-        // A newer build's leaf for an agent this one does not know.
         let newer = read(&format!("word = \"opencode\"\n{}", wire(&claude)));
         assert_eq!(newer.agent(), None);
         assert!(
             newer.snapshot("s-new".into(), 6161).is_none(),
             "relaunched by nothing"
         );
-        // Muse Code's word needs its own run (`[muse]`, where its session
-        // is): with none, the word its run contradicts, it is no agent and
-        // relaunched by nothing — never as Claude Code. Its leaf with its run
-        // is `the_agent_leaf_reads_both_ways_across_0_104_and_0_105`'s.
         let muse_no_run = read(&format!("word = \"muse\"\n{}", wire(&claude)));
         assert_eq!(muse_no_run.agent(), None, "muse without its run");
         assert!(muse_no_run.resume_line().is_none());
         assert!(muse_no_run.snapshot("s-new".into(), 6161).is_none());
-        // agy's the same way (`[agy]`, where its conversation is), and
-        // Gemini CLI's (`[gemini]`, where its session is); beside a Codex
-        // run, neither is an agent.
         for word in ["agy", "gemini"] {
             let no_run = read(&format!("word = \"{word}\"\n{}", wire(&claude)));
             assert_eq!(no_run.agent(), None, "{word} without its run");
@@ -7840,7 +6371,6 @@ metadata = "opaque=copy-me"
         );
     }
 
-    /// The first agent a manifest's terminal leaves carry, in layout order.
     fn first_agent_of(m: &RestoreManifest) -> Option<AgentRestore> {
         fn walk(node: &RestoredSplitTree) -> Option<AgentRestore> {
             match node {
@@ -7859,34 +6389,11 @@ metadata = "opaque=copy-me"
             .find_map(|t| walk(&t.root))
     }
 
-    /// THE CLAUDE HOME AND THE LOGIN AN AGENT RAN UNDER RIDE ITS LEAF INTO
-    /// THE RELAUNCH AFTER ATERM ENDED (2026-10-09): what the host read off
-    /// its process (`Snapshot::home`, `::login`) goes onto the leaf
-    /// ([`AgentRestore::of`]), through every on-disk format a cold restore
-    /// reads — the layout's own codec (the quit's `session.toml`, the
-    /// seamless update's handoff layout) and the crash journal's image —
-    /// back into the reopened tab's snapshot ([`AgentRestore::snapshot`]),
-    /// and onto the line its relaunch plans
-    /// (`aterm_agent::harness::relaunch::exit_line`: `required_env`, as every
-    /// live relaunch's). The default login NAMED (set and empty) stays named.
-    /// NEGATIVE CONTROL: a leaf naming neither plans today's line, byte for
-    /// byte. A Codex run (2026-09-27, the harness's Codex parity) rides the
-    /// same formats whole.
-    ///
-    /// AND BOTH WAYS ACROSS AN UPDATE: a leaf as 0.101.0 writes it (its
-    /// `AgentRestore`, frozen below) is what this build writes for an agent
-    /// with neither, and reads back as today — no home, no login, today's
-    /// line; and 0.101.0's reader takes a leaf naming both, ignoring them.
-    ///
-    /// RED with the fields left off the leaf (`of` and `snapshot` as before):
-    /// every format gives back neither, and the line is the plain one.
     #[test]
     fn a_restored_agents_home_and_login_ride_its_leaf_into_its_relaunch_line() {
         use aterm_agent::harness::relaunch::{CodexRun, Snapshot, exit_line};
         use aterm_agent::harness::upgrade::Dialect;
         const SESSION: &str = "0b6f3c1e-8a4d-4b61-9d52-7f1e2c3a4b5c";
-        // An absolute home (a relative one is refused, `home_carried`): on
-        // Windows an absolute path names its drive.
         const HOME: &str = if cfg!(windows) {
             "C:/Users//me/lab home/.claude"
         } else {
@@ -7894,7 +6401,6 @@ metadata = "opaque=copy-me"
         };
         const LOGIN: &str = "/Users//me/logins/work-2";
 
-        /// `AgentRestore` as 0.101.0 declares it: no home, no login, no `deny_unknown_fields`.
         #[derive(Serialize, Deserialize, PartialEq, Debug)]
         struct AgentRestore0101 {
             pid: u32,
@@ -7928,8 +6434,6 @@ metadata = "opaque=copy-me"
             home: home.map(str::to_string),
             claude_dir: None,
         };
-        // The reopened tab's snapshot, read back from each on-disk format,
-        // in a zsh as the relaunch's plan reads the reopened shell's dialect.
         let through = |snap: Snapshot| -> Vec<(&str, Snapshot)> {
             let mut m = numbered_sample();
             let carried = AgentRestore::of(snap);
@@ -7972,7 +6476,6 @@ metadata = "opaque=copy-me"
                 "{format}: the home, then the login, on the line"
             );
         }
-        // The default login named is carried named: a different line from none.
         for (format, back) in through(ran(None, Some(""))) {
             assert_eq!(
                 (back.home.as_deref(), back.login.as_deref()),
@@ -7988,7 +6491,6 @@ metadata = "opaque=copy-me"
                 "{format}"
             );
         }
-        // Negative control: neither gives the plain line, byte for byte.
         for (format, back) in through(ran(None, None)) {
             assert_eq!((&back.home, &back.login), (&None, &None), "{format}");
             assert_eq!(
@@ -7997,12 +6499,6 @@ metadata = "opaque=copy-me"
                 "{format}"
             );
         }
-        // A CODEX run rides the same leaf, whole: the home its relaunch reads,
-        // AND THE `CODEX_HOME` IT WAS STARTED WITH (`CodexRun::home_env`),
-        // verbatim beside the canonical home. A VENDOR `codex` — no line aterm's
-        // copy of codex-alab's own record validated — is named by its leaf and
-        // comes back at its shell: nothing relaunches it or tells a line for it
-        // (the Codex screen lane's retirement, 2026-10-16).
         let codex = Snapshot {
             run: AgentRun::Codex(CodexRun {
                 home: "/Users//me/lab codex".into(),
@@ -8035,7 +6531,6 @@ metadata = "opaque=copy-me"
             wire
         };
         assert!(vendor(&codex).contains("home_env"));
-        // A run that had no `CODEX_HOME`: no key on the leaf.
         let unset = Snapshot {
             run: AgentRun::Codex(CodexRun {
                 home_env: None,
@@ -8045,12 +6540,6 @@ metadata = "opaque=copy-me"
         };
         let wire = vendor(&unset);
         assert!(!wire.contains("home_env"), "{wire}");
-        // A PROVEN SELF-CLAIMED CODEX-ALAB (the self-claim contract, §4): the
-        // line aterm's copy of its record validated rides the leaf back into the
-        // reopened tab's snapshot, where `relaunch::after_host_ended` relaunches
-        // it on that line, as the crash rule would. The person's own line for a
-        // held tab is that line too. NEGATIVE CONTROL: an older leaf with no
-        // `alab` table reads back with no line, as before.
         let line = aterm_agent::harness::self_claimed::Resume {
             argv: vec![
                 "/Users//me/.aterm/agents/codex".into(),
@@ -8102,8 +6591,6 @@ metadata = "opaque=copy-me"
             "an older leaf with no line is relaunched by nobody"
         );
 
-        // As 0.101.0 writes it: this build's record for an agent with neither variable, byte
-        // for byte, read back with the plain line.
         let old = AgentRestore0101 {
             pid: 4242,
             start: "Fri Oct  9 01:02:03 2026".into(),
@@ -8115,8 +6602,6 @@ metadata = "opaque=copy-me"
             codex: None,
         };
         let written = aterm_toml::to_string(&old).expect("0.101.0's record");
-        // (The tab it ran in is the one field 0.101.0 never wrote: additive,
-        // [`AgentRestore::tab`].)
         let neither = AgentRestore {
             tab: None,
             ..AgentRestore::of(ran(None, None))
@@ -8138,7 +6623,6 @@ metadata = "opaque=copy-me"
             exit_line(std::path::Path::new("/Users//me"), &back).as_deref(),
             Some(plain.as_str())
         );
-        // …and 0.101.0 reads this build's leaf naming both, ignoring them.
         let both = aterm_toml::to_string(&AgentRestore::of(ran(Some(HOME), Some(LOGIN))))
             .expect("this build's record");
         assert!(
@@ -8151,13 +6635,6 @@ metadata = "opaque=copy-me"
         );
     }
 
-    /// A TAB'S OWN PROGRAM HANDED ACROSS A SEAMLESS UPDATE STILL NAMES NO
-    /// SHELL ([`AgentRestore::handed_snapshot`]): the outgoing host read it
-    /// with `NO_SHELL`, which the leaf does not carry, and the successor's
-    /// adopted process IS the agent (`aterm -e claude`, `exec claude`), so
-    /// its snapshot names no shell again — and an exit during the Commit is
-    /// refused as no shell's job, never "its shell is gone". NEGATIVE
-    /// CONTROL: an agent its adopted shell runs is handed that shell.
     #[test]
     fn a_handed_tab_program_names_no_shell_and_a_shells_job_its_shell() {
         use aterm_agent::harness::relaunch::NO_SHELL;
@@ -8190,28 +6667,6 @@ metadata = "opaque=copy-me"
         assert_eq!((under.pid, under.shell), (4242, 4241), "CONTROL: its shell");
     }
 
-    /// THE AGENT LEAF IS A WIRE FORMAT 0.104.0 AND 0.105.0 READ, AND ITS RUN
-    /// A SHAPE IN MEMORY ONLY ([`AgentRestore::run`], [`leaf::AgentRestore`]).
-    /// Their `AgentRestore` and `CodexRestore` are frozen below
-    /// (`git show v0.104.0:crates/aterm-gui/src/restore.rs`, and v0.105.0's),
-    /// with the rule each reads the agent by (0.104.0: by its Codex run
-    /// alone, no word; 0.105.0: by its word, an unknown one no agent's).
-    ///
-    /// BOTH WAYS: this build's Claude Code and Codex leaves are 0.105.0's byte
-    /// for byte but for the additive keys since (`tab`), and read in both as
-    /// the same agent; their leaves read here as they wrote them.
-    ///
-    /// AND MUSE CODE'S, AGY'S AND GEMINI CLI'S LEAVES, THE FORM A LANE PAST
-    /// CODEX'S ADDS ITS RUN IN: a table under its record word (`[muse]`,
-    /// `[agy]`, `[gemini]`), its conversation in that table and never in
-    /// `session`. Both older readers take the leaf (the layout
-    /// around it still restores) and ignore the table; 0.105.0 reads it as no
-    /// agent's, and 0.104.0, which has no word and reads it as Claude Code's,
-    /// finds no conversation to relaunch it on (`agent_resumes`,
-    /// `ended:no-conversation`) and no line to tell. This build reads each as
-    /// its agent's, relaunches it on its table's conversation and tells that
-    /// agent's own line. NEGATIVE CONTROL: the same leaf with its conversation
-    /// in `session` would be one 0.104.0 relaunches as Claude Code.
     #[test]
     fn the_agent_leaf_reads_both_ways_across_0_104_and_0_105() {
         use aterm_agent::harness::relaunch::{CodexRun, Snapshot};
@@ -8278,9 +6733,6 @@ metadata = "opaque=copy-me"
             #[serde(default, skip_serializing_if = "Option::is_none")]
             cause: Option<String>,
         }
-        // 0.104.0's agent: its snapshot's (`relaunch::Snapshot::agent`, by
-        // the Codex run alone), and whether its relaunch after aterm ended
-        // finds a conversation (`agent_resumes`, then `ended:no-conversation`).
         fn agent_0104(leaf: &AgentRestore0104) -> &'static str {
             if leaf.codex.is_some() {
                 "codex"
@@ -8292,8 +6744,6 @@ metadata = "opaque=copy-me"
             leaf.session.as_deref().is_some_and(is_session_id)
                 && !aterm_agent::harness::upgrade::one_shot(&leaf.argv)
         }
-        // 0.105.0's `AgentRestore::agent`: its word, else its run; an unknown
-        // word, or one its run contradicts, no agent's.
         fn agent_0105(leaf: &AgentRestore0105) -> Option<&'static str> {
             let agent = match leaf.word.as_str() {
                 "" if leaf.codex.is_some() => "codex",
@@ -8340,7 +6790,6 @@ metadata = "opaque=copy-me"
             aterm_toml::to_string(&AgentRestore::of(snap.clone())).expect("this build's leaf")
         };
 
-        // THIS BUILD'S LEAVES, READ BY 0.104.0 AND 0.105.0.
         for (snap, agent) in [(&claude, "claude"), (&codex, "codex")] {
             let text = wire(snap);
             let old = aterm_toml::from_str::<AgentRestore0104>(&text).expect("0.104.0 reads it");
@@ -8348,8 +6797,6 @@ metadata = "opaque=copy-me"
             assert!(resumes_0104(&old), "{text}");
             let older = aterm_toml::from_str::<AgentRestore0105>(&text).expect("0.105.0 reads it");
             assert_eq!(agent_0105(&older), Some(agent), "{text}");
-            // Byte for byte, but for the keys added since, which 0.105.0
-            // ignores (`tab`, the tab it ran in).
             assert!(text.contains("tab = \"s-old\"\n"), "{text}");
             assert_eq!(
                 aterm_toml::to_string(&older).expect("0.105.0 writes it"),
@@ -8358,7 +6805,6 @@ metadata = "opaque=copy-me"
             );
         }
 
-        // THEIR LEAVES, READ HERE.
         let codex_0104 = AgentRestore0104 {
             pid: 4343,
             start: "Fri Oct 16 01:02:03 2026".into(),
@@ -8392,9 +6838,6 @@ metadata = "opaque=copy-me"
         assert_eq!(back.session, claude_0104.session);
         assert_eq!(back.home, claude_0104.home);
         assert!(back.codex().is_none(), "{text}");
-        // An older build's Codex leaf carries no line aterm's copy of
-        // codex-alab's own record validated: read as a Codex, relaunched by
-        // nobody (the Codex screen lane's retirement, 2026-10-16).
         let text = aterm_toml::to_string(&codex_0104).expect("0.104.0's leaf");
         let read: AgentRestore = aterm_toml::from_str(&text).expect("this build reads it");
         assert_eq!(read.agent(), Some(Agent::Codex), "{text}");
@@ -8435,9 +6878,6 @@ metadata = "opaque=copy-me"
             "a vendor `codex`'s leaf is relaunched by nobody"
         );
 
-        // MUSE CODE'S LEAF, THE FORM A LANE PAST CODEX'S ADDS ITS RUN IN: its
-        // table under its word (`[muse]`), its conversation there and never
-        // in `session`.
         let muse = Snapshot {
             program: "/opt/pkg/store/muse/2001004010006427002/bin/muse".into(),
             argv: vec![
@@ -8521,9 +6961,6 @@ metadata = "opaque=copy-me"
             lane,
             "read and written back as written"
         );
-        // A `[muse]` table naming no session (none was proven) resumes
-        // nothing and tells no line; one beside a `codex` table (no build
-        // writes both) is refused.
         let unproven = wire(&Snapshot {
             session: None,
             ..muse.clone()
@@ -8531,8 +6968,6 @@ metadata = "opaque=copy-me"
         let unproven: AgentRestore = aterm_toml::from_str(&unproven).expect("read");
         assert_eq!(unproven.agent(), Some(Agent::Muse));
         assert!(!unproven.resumes() && unproven.resume_line().is_none());
-        // Two lane tables must not erase the contradictory run into `None`,
-        // which a missing/default or Claude word reads as Claude Code's.
         for word in [None, Some(""), Some("claude"), Some("muse"), Some("codex")] {
             let word = word.map_or_else(String::new, |w| format!("word = {w:?}\n"));
             let both = format!(
@@ -8549,15 +6984,10 @@ metadata = "opaque=copy-me"
                 "AMBIGUOUS_AGENT_RUN_TABLES_MUST_NOT_RESUME_AS_CLAUDE: {both}"
             );
         }
-        // NEGATIVE CONTROL: its conversation in `session` is a leaf 0.104.0
-        // relaunches, as Claude Code.
         let in_session = format!("{}word = \"muse\"\n", wire(&claude));
         let old = aterm_toml::from_str::<AgentRestore0104>(&in_session).expect("0.104.0");
         assert_eq!((agent_0104(&old), resumes_0104(&old)), ("claude", true));
 
-        // AGY'S LEAF, THE SAME FORM: its table under its word (`[agy]`), its
-        // conversation there and never in `session`; its workspace the leaf's
-        // own `cwd`.
         let agy = Snapshot {
             program: "/opt/pkg/store/agy/1000001000004000000/bin/agy".into(),
             argv: vec![
@@ -8648,8 +7078,6 @@ metadata = "opaque=copy-me"
         let unproven: AgentRestore = aterm_toml::from_str(&unproven).expect("read");
         assert_eq!(unproven.agent(), Some(Agent::Agy));
         assert!(!unproven.resumes() && unproven.resume_line().is_none());
-        // Beside a `[muse]` or a `[codex]` table (no build writes two), as
-        // Muse Code's: refused, never erased into `None` (Claude Code's).
         for word in [None, Some(""), Some("claude"), Some("agy"), Some("muse")] {
             let word = word.map_or_else(String::new, |w| format!("word = {w:?}\n"));
             let top = lane.replacen("word = \"agy\"\n", &word, 1);
@@ -8664,16 +7092,10 @@ metadata = "opaque=copy-me"
                 );
             }
         }
-        // NEGATIVE CONTROL: its conversation in `session` is a leaf 0.104.0
-        // relaunches, as Claude Code.
         let in_session = format!("{}word = \"agy\"\n", wire(&claude));
         let old = aterm_toml::from_str::<AgentRestore0104>(&in_session).expect("0.104.0");
         assert_eq!((agent_0104(&old), resumes_0104(&old)), ("claude", true));
 
-        // GEMINI CLI'S LEAF, THE SAME FORM: its table under its word
-        // (`[gemini]`), its session there and never in `session`; its project
-        // the leaf's own `cwd`, its parent's start carried (the relaunch reads
-        // the start-time rule again).
         let chats = aterm_tempfile::tempdir().expect("scratch dir");
         let chats_dir = chats.path().to_string_lossy().into_owned();
         let gemini = Snapshot {
@@ -8724,8 +7146,6 @@ metadata = "opaque=copy-me"
         assert_eq!(here.agent(), Some(Agent::Gemini), "read as Gemini CLI's");
         assert_eq!(here.name(), Some("Gemini CLI"));
         assert!(here.resumes(), "its own table's session resumes");
-        // Its told line only where its resume loads every turn: no file of
-        // the session yet, none told; one holding its turn, its own line.
         assert_eq!(here.resume_line(), None, "no file: nothing vouched for");
         std::fs::write(
             chats.path().join(format!("session-2026-10-18T06-40-{}.jsonl", &GEMINI[..8])),
@@ -8797,24 +7217,11 @@ metadata = "opaque=copy-me"
                 "AMBIGUOUS_AGENT_RUN_TABLES_MUST_NOT_RESUME_AS_CLAUDE: {both}"
             );
         }
-        // NEGATIVE CONTROL: its session in `session` is a leaf 0.104.0
-        // relaunches, as Claude Code.
         let in_session = format!("{}word = \"gemini\"\n", wire(&claude));
         let old = aterm_toml::from_str::<AgentRestore0104>(&in_session).expect("0.104.0");
         assert_eq!((agent_0104(&old), resumes_0104(&old)), ("claude", true));
     }
 
-    /// THE DIRECTORIES A WINDOW MAKES ON THE WAY TO ITS DATA AND STATE ROOTS ARE
-    /// NEVER GROUP- OR OTHER-WRITABLE, WHATEVER THE UMASK. `session.toml`'s and
-    /// the cell-metrics cache's directory is `~/.local/share/aterm` on Linux, the
-    /// atpkg prefix's parent; the draft journal's and the control directories'
-    /// state root can be the first to make `~/.local` (Linux) or is the prefix's
-    /// parent (macOS). `create_dir_all` made each missing one `0777 & ~umask`, so
-    /// under umask `002` (a user-private-group login's default) a first launch
-    /// left a group-writable directory above the atpkg store, and `targo trust`
-    /// refuses every toolchain installed below one. Missing ancestors are `0755`,
-    /// each leaf its own mode. The umask is process-wide: the body runs alone in a
-    /// child ([`crate::test_alone::alone`]).
     #[cfg(unix)]
     #[test]
     fn directories_made_under_an_open_umask_are_never_group_writable() {
@@ -8822,12 +7229,10 @@ metadata = "opaque=copy-me"
         if !crate::test_alone::alone() {
             return;
         }
-        // SAFETY: `umask(2)` swaps this process's file-creation mask and cannot
-        // fail; this child runs this one test, so no other create sees the mask.
+        // SAFETY: `umask(2)` sets this isolated test child's file-creation mask and cannot fail.
         unsafe { libc::umask(0o002) };
         let scratch = aterm_tempfile::tempdir().expect("scratch dir");
         let root = scratch.path();
-        // Octal text, so a failure reads `775`, not `509`.
         let mode = |rel: &str| {
             let meta = fs::symlink_metadata(root.join(rel)).expect("made");
             format!("{:o}", meta.permissions().mode() & 0o7777)

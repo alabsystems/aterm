@@ -1,130 +1,27 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A LOOP THAT FOLLOWS ANOTHER BEHAVES AS THE FIRST LOOP, AT EVERY HANDOFF
-//! (the owner's rule for the successor's seed: a seamless update, a new
-//! window, a policy reload or a fault restart starts a loop on the
-//! session's ledger). For each scenario — a usage window, the weekly
-//! window, a spend limit, a model bucket with and without the fallback's
-//! relaunch, the done check, the take window — the FIRST loop runs a
-//! scripted timeline on the fixed clock. At every instant a handoff could
-//! fall (just after each event and act, just before each act, inside long
-//! gaps) a SUCCESSOR is started on the first loop's ledger as it stood then
-//! (its rows restamped on the test's clock, so every `ts` the seed reads is
-//! the instant it was written), seeded as `drive_loop` seeds
-//! ([`Session::seed_from_ledger`], [`Session::seed_wall_memory`]), and fed
-//! the rest of the timeline — and at every handoff a CHAIN too: that
-//! successor run to the next handoff, where a third loop attaches on its
-//! books ([`run_chain`]). The successor's acts are matched to the first
-//! loop's (the same text within 40 s); the first that differs is the
-//! cell's, and it must be no sooner than the first loop's act — not by a
-//! second — the same text, never one where the first loop types nothing, and
-//! never a wait with nothing due where the first loop acts; later is
-//! fail-closed only while bounded by a fresh appearance's first rung (30
-//! minutes from attaching, a person's standing draft's grace on top:
-//! [`LATER_BOUND_S`]). The world answers an act once it is typed: an answer
-//! to an act a successor typed later (inside the 40 s) comes as much later.
-//! A successor the host started as Off lifted finds no park on its books:
-//! the host stopped the loop before it under Off, and the row is its own to
-//! write. And at every point, a loop STOPPED IN THE POINT'S WINDOW — its line
-//! and the task's end its fold took journaled, as `look` journals them
-//! ([`Session::say_point`]), its act still to come, where the host's step
-//! takes the point and the host stops the loop — is followed a second on,
-//! as Off lifts where Off stood and lifted next, and in a chain from it and
-//! into it ([`window_cells`]): before 2026-10-20 the end's note was owed to
-//! the act, and the matrix, deciding and acting on a point in one step with
-//! no point line journaled, had no handoff between them.
-//! Where the take window is modelled, a successor attached between an act
-//! and the first loop's first read after it first looks there (the read
-//! latency is the world's). Time on the fixed clock moves the policy's
-//! instants as a real clock would ([`TurnEndState::slept`] at every step,
-//! the watch's marks moved with it so no sleep is read), and the monotonic
-//! clock stands between steps ([`Session::set_mono_standing`]): no real time
-//! is read, so a step a loaded machine is slow over moves no instant. The
-//! take window, where a scenario models it, is production's 30 s
-//! ([`TAKE_S`]) on the worker's clock, which the test's does not move: a
-//! read the model places past it is decided with no window
-//! ([`Loop::take_clock`]), so the matrix sleeps for none and decides the
-//! same every run (the scenarios run on the machine's threads, each cell's
-//! loops its own). NEGATIVE CONTROL:
-//! successors that take nothing up from the ledger type sooner, and the
-//! matrix says so. An API error's retry ladder (a 529) is held to the rule
-//! too ([`api_retry_scenarios`]): its rung and appearance are every row's
-//! mark while it stands ([`crate::supervise::approvals::RetryMark`],
-//! [`TurnEndState::seed_retry`]).
-//!
-//! What the seed takes up, by the ledger's rows (the verifier of 341e1fa81,
-//! RS7-1..7): an awaited act's take window from the first loop's first read
-//! after it (its wall's row) or, nothing read yet, this loop's
-//! ([`TurnEndState::seed_awaited`]); a try met again from where it was judged
-//! met (that window's end), however old, its rung due in the gap owed
-//! ([`TurnEndState::seed_met_attempt`]); a try nobody read met at once where
-//! this loop's first read dates its answer — the done row, the transcript's
-//! notice ([`TurnEndState::date_unread_try`]; its record for a loop after it,
-//! [`crate::supervise::approvals::RULE_TRY_ANSWERED`]) — and, nothing dating
-//! it, aged out over before this loop's first wall, the wall standing ([`TurnEndState::take_try_over`],
-//! [`crate::supervise::approvals::RULE_TRY_OVER`]); Off standing
-//! ([`crate::supervise::approvals::RULE_OFF_STOOD`]), parked as the loop that
-//! parked holds its books — a record, no read of a try; a task's end
-//! ([`crate::supervise::approvals::RULE_TASK_DONE`]), the act before it
-//! answered; the Land episode ([`crate::supervise::approvals::land_episode`]);
-//! and the short streak ([`crate::supervise::approvals::short_streak`]): an
-//! act's mark, its yield still to come, or the record of the last point a
-//! loop judged ([`crate::supervise::approvals::RULE_POINT`]: every
-//! act's answer and every move of the streak; every move of the
-//! point's time), that point's streak and time, and the answer of the check
-//! or a land act judged there — unless a turn was read running after it
-//! ([`crate::supervise::approvals::RULE_TURN_RAN`]): the next idle
-//! point is that turn's end, a later turn's. A person's exchange left to them
-//! is in the ledger whenever it is left, the task's end said before it or not
-//! . The gap cells ([`gap_cells`]: [`run_follower`] on books cut at
-//! a point the loop before never read, whose end it reads as a turn that ran:
-//! [`TurnEndState::take_gap`]) are their own tests, every scenario's among
-//! them, and so is the cut a loop's start makes of a ledger past its bound
-//! ([`crate::supervise::approvals::bound`]).
-
+//! Successor-loop seed matrix tests across handoff scenarios.
 use super::*;
 use crate::supervise::approvals::Ledger;
 use std::fmt::Write as _;
 
 const SID: &str = "@s-1";
 
-/// The tab a cold restore reopened the follower's from ([`Books::restored`]).
 const WAS: &str = "s-a0";
 
 #[derive(Clone, Debug)]
 enum Ev {
-    /// The screen shows a point: a turn's end, a wall.
     Point(Vec<String>),
-    /// The Mac SLEPT the given seconds up to this beat, and the screen shows
-    /// a point, read first after the wake: the wall clock moves the length
-    /// of the sleep with nothing run and the watch's marks left where they
-    /// stood ([`Loop::advance_to`]), and the machine counts the sleep and
-    /// records it as its last, so the loop's first read measures it
-    /// ([`Session::watch_sleep`]) — no other step of the matrix's clock is
-    /// a sleep the loop reads, and a loop that attaches after it finds the
-    /// count and the record as they stand ([`First::asleep_at`]).
     Woke(i64, Vec<String>),
-    /// A live turn read busy.
     Busy(Vec<String>),
-    /// The host's transcript of the agent changes (nothing drawn).
     Tail(Option<String>),
-    /// Nothing happens: a handoff instant (one second after it) where the
-    /// rest of the timeline has none.
     Mark,
-    /// A person's keystroke in the window (`status human_ms=` from it on);
-    /// nothing drawn.
     Key,
-    /// The session's Autopilot stood at Off and lifted
-    /// ([`TurnEndState::park_off`]); nothing drawn. A loop attached one
-    /// second after it is the one the host started as Off lifted
-    /// ([`Session::seed_from_ledger`]'s `lifted_off`).
     OffLifted,
 }
 
 impl Ev {
-    /// The seconds the Mac slept up to the event ([`Ev::Woke`]): none for
-    /// any other.
     fn slept(&self) -> i64 {
         match self {
             Ev::Woke(secs, _) => *secs,
@@ -135,9 +32,7 @@ impl Ev {
 
 #[derive(Clone, Copy, Debug)]
 enum At {
-    /// Seconds from the scenario's start.
     Start(i64),
-    /// Seconds after the first loop's `k`-th act (0-based).
     Act(usize, i64),
 }
 
@@ -159,19 +54,10 @@ struct Scenario {
     name: String,
     t0: i64,
     policy: SupervisorConfig,
-    /// The host's restart answers, and its transcript at the start; `None`:
-    /// no host.
     host: Option<(Vec<&'static str>, Option<String>)>,
     beats: Vec<Beat>,
-    /// Seconds past the last beat simulated.
     tail_s: i64,
-    /// The take window is modelled ([`TAKE_S`]); else every point is
-    /// judged at once.
     take: bool,
-    /// Every screen read carries the person's last keystroke ([`Ev::Key`]),
-    /// as production's reads carry `human_ms`: a point is judged by the stamp
-    /// its own read carries, before any `status` is read. Else only the
-    /// window's `status` says it.
     person_on_screen: bool,
 }
 
@@ -182,57 +68,31 @@ struct Act {
     text: String,
 }
 
-/// One loop over the scripted timeline.
 struct Loop<'m> {
     s: Session<'m, Mock>,
     opts: SuperviseOpts,
     host: Option<Arc<AccountHost>>,
     ledger: PathBuf,
     read: usize,
-    /// The ledger mirrored: its rows, read again only as it grows ([`RowCount`]).
     count: RowCount,
-    /// Every ledger row, stamped with the test's clock when it was written.
     stamped: Vec<(i64, String)>,
-    /// The lines said and noted since the last look ([`Journaled`]), each
-    /// with the count of ledger rows written before it.
     lines: Vec<Said>,
-    /// Every line the loop said or noted, journaled as production journals
-    /// it beside the ledger ([`crate::supervise::approvals::journal_beside`]),
-    /// stamped where it fell among the rows.
     journal: Vec<(i64, String)>,
     acts: Vec<Act>,
     seq: u64,
-    /// The wait standing (unix seconds).
     due: Option<i64>,
     busy_since: Option<i64>,
-    /// The last point decided (what a wait's end decides again).
     seen: Option<Turn>,
-    /// The screen standing.
     rows: Vec<String>,
     log: Vec<String>,
-    /// The take window is modelled ([`Scenario::take`]).
     take: bool,
-    /// The first point after the last act no busy read followed: when, on
-    /// the test's clock.
     unseen: Option<i64>,
-    /// An act awaited, no busy read since.
     awaiting: bool,
-    /// A person's last keystroke ([`Ev::Key`]), on the test's clock.
     key_at: Option<i64>,
-    /// Every screen read carries it ([`Scenario::person_on_screen`]).
     person_on_screen: bool,
-    /// Every point's window ([`Window`]), in order.
     windows: Vec<Window>,
 }
 
-/// THE WINDOW OF A POINT ([`Loop::point`]): its own line journaled, and the
-/// task's end its fold took right after it, its act still to come — where
-/// production's host may take the point with a step of its own and the
-/// loop be stopped before the act (`look`: the live upgrade's restart, a
-/// relaunch's carry-on, then Off, a SUPERVISION setting saved, aterm's own
-/// update). Its instant, and how many of the loop's rows ([`Loop::stamped`])
-/// and lines ([`Loop::journal`]) stand in it: the books a loop stopped there
-/// leaves ([`window_cells`]).
 #[derive(Clone, Copy, Debug)]
 struct Window {
     at: i64,
@@ -240,12 +100,6 @@ struct Window {
     lines: usize,
 }
 
-/// A line said or noted ([`Journaled`]): the count of ledger rows written
-/// before it, and what its journal record carries beside the line — the
-/// mark of the worker's last words at a point
-/// ([`crate::supervise::journal::JournalRecord::mark`]), and the time an
-/// end it restates was first noted
-/// ([`crate::supervise::journal::JournalRecord::ended`]).
 struct Said {
     rows: usize,
     line: String,
@@ -253,13 +107,8 @@ struct Said {
     ended: Option<i64>,
 }
 
-/// The production take window ([`TurnEndTiming::take_within`]), on the
-/// test's clock.
 const TAKE_S: i64 = 30;
 
-/// The take window a scenario's loops run with: production's where it is
-/// modelled (the worker's clock, which the test's does not move, never runs
-/// it out: [`Loop::take_clock`] ends it), else none.
 fn take_within(take: bool) -> Duration {
     if take {
         Duration::from_secs(TAKE_S.unsigned_abs())
@@ -268,43 +117,21 @@ fn take_within(take: bool) -> Duration {
     }
 }
 
-/// THE LOOP'S REVIEW, AS PRODUCTION'S JOURNALS: every line said or noted
-/// goes to the session's journal (`Lines`, `StopAtReview`: `Sink::record`),
-/// which the window's host keeps beside the ledger and a loop that follows
-/// reads the landing from (`landed_before`). With no journal, the matrix
-/// never met that seed (the merge review's MG9-S2). Each line is kept with
-/// the count of ledger rows written before it, so [`Loop::collect`] stamps it
-/// where it fell among them, as production's one clock orders them.
 struct Journaled<'j> {
     ledger: &'j Path,
-    /// The rows [`Loop::collect`] has stamped: the count a line takes where
-    /// the file cannot be read.
     read: usize,
-    /// The ledger mirrored: its rows, read again only as it grows ([`RowCount`]).
     count: &'j mut RowCount,
     lines: &'j mut Vec<Said>,
 }
 
-/// THE LEDGER A LOOP APPENDS TO, mirrored: its bytes as the file holds them
-/// now, and the rows (`\n`) in them. A look costs one `stat` where the file
-/// stands (its length and modification time unmoved), and a read of the rows
-/// appended since where it grew — through the descriptor the last read held,
-/// where the platform names the file's identity and the path still names that
-/// file (a loop writes its books in place only by appending; its cut writes a
-/// new file and renames it in, read whole). Anything else is read whole, as a
-/// look at every line the loop says once read it.
 #[derive(Default)]
 struct RowCount {
-    /// The file read, held open, and its identity.
     held: Option<(std::fs::File, u64)>,
-    /// The length and modification time the mirror stands at.
     at: Option<(u64, Option<std::time::SystemTime>)>,
-    /// The file's bytes, and the rows in them.
     body: Vec<u8>,
     rows: usize,
 }
 
-/// The file's identity where the platform names one (its inode).
 fn file_identity(meta: &std::fs::Metadata) -> Option<u64> {
     #[cfg(unix)]
     {
@@ -319,18 +146,14 @@ fn file_identity(meta: &std::fs::Metadata) -> Option<u64> {
 }
 
 impl RowCount {
-    /// The rows at `path` now; `unread` where it cannot be read.
     fn rows(&mut self, path: &Path, unread: usize) -> usize {
         self.counted(path).unwrap_or(unread)
     }
 
-    /// The rows at `path` now, `None` where it cannot be read.
     fn counted(&mut self, path: &Path) -> Option<usize> {
         self.sync(path).then_some(self.rows)
     }
 
-    /// The text at `path` now (`str::lines` of it as `std::fs::read_to_string`
-    /// reads it: empty where it cannot be read or is no UTF-8).
     fn text(&mut self, path: &Path) -> &str {
         if self.sync(path) {
             std::str::from_utf8(&self.body).unwrap_or_default()
@@ -339,8 +162,6 @@ impl RowCount {
         }
     }
 
-    /// The mirror brought to the file at `path`: `false` where it cannot be
-    /// read (the mirror then holds nothing).
     fn sync(&mut self, path: &Path) -> bool {
         use std::io::Read as _;
         let Ok(meta) = std::fs::metadata(path) else {
@@ -400,8 +221,6 @@ impl Review for Journaled<'_> {
     fn review(&mut self, turn: &Turn) -> Result<bool, String> {
         self.review_marked(turn, None)
     }
-    /// The point's own line, with its mark, as `Lines` journals it: what a
-    /// loop that follows reads an end's point by ([`ended_before`]).
     fn review_marked(&mut self, turn: &Turn, mark: Option<u64>) -> Result<bool, String> {
         self.record(&event_line(turn, &[]), mark, None);
         Ok(true)
@@ -421,7 +240,6 @@ impl Review for Journaled<'_> {
     }
 }
 
-/// The rows of `stamped` (ledger rows or journal lines) written before `ms`.
 fn before_ms(stamped: &[(i64, String)], ms: i64) -> Vec<(i64, String)> {
     stamped.iter().filter(|(t, _)| *t < ms).cloned().collect()
 }
@@ -447,8 +265,6 @@ impl Loop<'_> {
         self.s.set_clock(to, PDT);
         let by = u64::try_from(to * 1000 - from_ms).unwrap_or(0);
         self.s.turn_end.slept(Duration::from_millis(by));
-        // The person's last keystroke the last `status` read, and the
-        // draft's last change, are as far back.
         let back = |p: &mut Instant| {
             if let Some(earlier) = p.checked_sub(Duration::from_millis(by)) {
                 *p = earlier;
@@ -463,35 +279,22 @@ impl Loop<'_> {
         self.s.clock_marks = Some((self.s.fx.mono(), self.s.now_unix_ms()));
     }
 
-    /// The clock to `to` for an event that comes then ([`Self::advance`]),
-    /// the last `asleep` seconds of it a sleep of the Mac ([`Ev::Woke`]):
-    /// the wall clock alone moves over those, no instant of the policy's
-    /// and no mark of the watch's with it. A busy turn's own measure is the
-    /// loop's monotonic clock, which a sleep stops: its start moves with it,
-    /// and so does a person's keystroke, whose age the host reads on its
-    /// awake clock.
     fn advance_to(&mut self, to: i64, asleep: i64) {
         self.advance(to - asleep);
         if asleep > 0 && to > self.now() {
             let asleep = to - self.now();
             self.s.set_clock(to, PDT);
-            // The machine counts it, and records it as its last sleep.
             self.s.count_slept(asleep);
             if let Some(b) = &mut self.busy_since {
                 *b += asleep;
             }
-            // A person's keystroke's age is the host's awake clock's
-            // (`status human_ms=`), which the sleep stopped too.
             if let Some(k) = &mut self.key_at {
                 *k += asleep;
             }
         }
     }
 
-    /// The rows written since the last look, stamped now; typed rows are
-    /// acts.
     fn collect(&mut self) -> Vec<Act> {
-        // No row since the last look: nothing to read ([`RowCount`]).
         let unmoved = self.count.counted(&self.ledger) == Some(self.read);
         let (total, fresh): (usize, Vec<String>) = if unmoved {
             (self.read, Vec::new())
@@ -533,8 +336,6 @@ impl Loop<'_> {
                 });
             }
         }
-        // The lines said meanwhile, stamped as the next row after the ones
-        // before them would be.
         for said in std::mem::take(&mut self.lines) {
             let ms = now * 1000 + i64::try_from(said.rows.saturating_sub(self.read)).unwrap_or(0);
             let mut rec =
@@ -548,9 +349,6 @@ impl Loop<'_> {
         new
     }
 
-    /// The take window, as the worker's clock would run it: a point decided
-    /// [`TAKE_S`] (the test's clock) after the first unjudged one is past it
-    /// — the window is zero for that read — and one inside is not.
     fn take_clock(&mut self) {
         let mut window = take_within(self.take);
         if self.take && self.awaiting {
@@ -563,7 +361,6 @@ impl Loop<'_> {
         self.s.turn_end.timing.take_within = window;
     }
 
-    /// The person as the window's status says it now ([`Ev::Key`]).
     fn status_person(&mut self) {
         let now = self.now();
         self.s.ctl.human_ms = self
@@ -571,7 +368,6 @@ impl Loop<'_> {
             .map(|k| u64::try_from((now - k) * 1000).unwrap_or(0));
     }
 
-    /// A point drawn now.
     fn point(&mut self, rows: Vec<String>) -> Vec<Act> {
         self.take_clock();
         self.status_person();
@@ -579,9 +375,6 @@ impl Loop<'_> {
         self.rows.clone_from(&rows);
         self.s.ctl.screens = vec![rows.clone()];
         self.s.ctl.served = 0;
-        // The point's read, as production's loop reads every point it
-        // decides: it clocks a draft from its first sight (`Session::screen`),
-        // whose grace a person's draft is held for.
         let _ = self.s.screen();
         self.s.ctl.served = 0;
         let worked = self
@@ -589,7 +382,6 @@ impl Loop<'_> {
             .take()
             .map(|b| Duration::from_secs(u64::try_from(self.now() - b).unwrap_or(0)));
         let mut p = point_at(&self.s, rows, self.seq);
-        // The read's own stamp ([`Scenario::person_on_screen`]).
         if self.person_on_screen
             && let Some(k) = self.key_at
         {
@@ -608,9 +400,6 @@ impl Loop<'_> {
             worked.map(|d| d.as_secs()),
             brief(&self.s, &a)
         ));
-        // `look`'s order: the task's end the fold took is recorded and
-        // published, then the point's own line and the end's note
-        // ([`Session::say_point`])…
         let mut review = Journaled {
             ledger: &self.ledger,
             read: self.read,
@@ -619,15 +408,12 @@ impl Loop<'_> {
         };
         let _ = self.s.task_edge_at_fold(&p.screen, &self.opts, &mut review);
         let _ = self.s.say_point(&p, &mut review);
-        // …THE WINDOW, where the host's step may take the point and the loop
-        // be stopped ([`Window`])…
         let written = self.count.rows(&self.ledger, self.read);
         self.windows.push(Window {
             at: self.now(),
             rows: self.stamped.len() + written.saturating_sub(self.read),
             lines: self.journal.len() + self.lines.len(),
         });
-        // …then the point's act.
         let mut review = Journaled {
             ledger: &self.ledger,
             read: self.read,
@@ -639,7 +425,6 @@ impl Loop<'_> {
         self.after_act()
     }
 
-    /// The standing wait ran out: the point is decided again.
     fn wake(&mut self) -> Vec<Act> {
         let Some(seen) = self.seen.clone() else {
             self.due = None;
@@ -672,8 +457,6 @@ impl Loop<'_> {
             self.awaiting = true;
             self.unseen = None;
         }
-        // The wait the decision (or a restart's tries) left standing; the
-        // take window's on the production clock.
         let unseen = self.unseen;
         self.due = self.s.turn_end_due.as_ref().map(|d| {
             if self.take
@@ -688,7 +471,6 @@ impl Loop<'_> {
         new
     }
 
-    /// A live turn read busy now.
     fn busy(&mut self, rows: Vec<String>) {
         self.seq += 1;
         self.rows.clone_from(&rows);
@@ -711,8 +493,6 @@ impl Loop<'_> {
         }
     }
 
-    /// Run the standing waits that fall before `t`; the first act, if
-    /// `stop`, ends the run.
     fn waits_before(&mut self, t: i64, stop: bool) -> Option<Act> {
         let mut n = 0;
         while let Some(u) = self.due {
@@ -746,10 +526,6 @@ impl Loop<'_> {
                 Vec::new()
             }
             Ev::OffLifted => {
-                // `park_while_off`'s fold: nothing read under Off is folded
-                // in, and the park ends what it ends, its ledger row with it
-                // — its note journaled first, in that build's words, as
-                // every build since Autopilot notes it.
                 let note = crate::supervise::run::lifecycle::parked_off_note(self.seq);
                 Journaled {
                     ledger: &self.ledger,
@@ -800,35 +576,20 @@ fn host_for(
     })
 }
 
-/// The first loop's run: its concrete timeline (absolute times), its acts,
-/// and its ledger rows stamped.
 struct First {
-    /// (time, label, event, the act it answers: `None` for the world's).
     events: Vec<(i64, String, Ev, Option<usize>)>,
     acts: Vec<Act>,
     stamped: Vec<(i64, String)>,
-    /// Its journal's lines, stamped ([`Loop::journal`]).
     journal: Vec<(i64, String)>,
-    /// Every point's window ([`Window`]), on its books.
     windows: Vec<Window>,
     log: Vec<String>,
-    /// When the run ends (unix seconds): its last event, and the
-    /// scenario's tail past it.
     end: i64,
-    /// The machine a loop that follows it runs on ([`Machine`]).
     machine: Machine,
 }
 
-/// THE MACHINE A LOOP THAT FOLLOWS RUNS ON ([`run_follower`]): the first
-/// loop's, its count of its sleep on the same boot ([`First::asleep_at`])
-/// and its record of its last sleep ([`First::last_sleep_at`]) — unless a
-/// test says it keeps no record, or booted again since.
 #[derive(Clone, Copy, Default)]
 struct Machine {
-    /// It keeps no record of its last sleep (Linux keeps none).
     no_last: bool,
-    /// It booted again since the first loop's acts: its count of its sleep
-    /// is another boot's.
     rebooted: bool,
 }
 
@@ -883,7 +644,6 @@ fn run_first(sc: &Scenario, dir: &Path) -> First {
         .unwrap_or(sc.t0);
     l.s.set_clock(first_at.min(sc.t0), PDT);
     l.s.set_mono_standing();
-    // The machine counts its sleep ([`Ev::Woke`]), from none.
     l.s.count_sleeps(Duration::ZERO);
     l.s.turn_end_seeded = true;
     let mut events = Vec::new();
@@ -892,8 +652,6 @@ fn run_first(sc: &Scenario, dir: &Path) -> First {
         let t = match b.at {
             At::Start(dt) => sc.t0 + dt,
             At::Act(k, dt) => {
-                // The act this beat answers: the loop's waits run until it
-                // is typed.
                 let mut guard = 0;
                 while l.acts.len() <= k && guard < 400 {
                     guard += 1;
@@ -909,7 +667,6 @@ fn run_first(sc: &Scenario, dir: &Path) -> First {
                 a.at + dt
             }
         };
-        // Nothing runs while the Mac sleeps.
         let asleep = b.ev.slept();
         l.waits_before(t - asleep, false);
         if t - asleep < l.now() {
@@ -927,7 +684,6 @@ fn run_first(sc: &Scenario, dir: &Path) -> First {
             Ev::Point(rows) => Ev::Point(resolve(rows, t, &mut stamps)),
             Ev::Woke(secs, rows) => Ev::Woke(*secs, resolve(rows, t, &mut stamps)),
             Ev::Busy(rows) => Ev::Busy(resolve(rows, t, &mut stamps)),
-            // A transcript row written when its beat comes ([`TAIL_AT`]).
             Ev::Tail(Some(tail)) => Ev::Tail(Some(
                 tail.replace(TAIL_AT, &crate::harness::usage::rfc3339_utc(t)),
             )),
@@ -957,66 +713,38 @@ fn run_first(sc: &Scenario, dir: &Path) -> First {
     out
 }
 
-/// A cell's follower: its first act that is not the first loop's next, the
-/// first loop's act it was due to match, the wait it left standing (unix
-/// seconds), and its log.
 type Cell = (Option<Act>, usize, Option<i64>, Vec<String>);
 
-/// What a loop that follows did ([`run_follower`]).
 struct Followed {
-    /// Its first act that is not the first loop's next.
     diverged: Option<Act>,
-    /// The first loop's act it was due to match next.
     at_k: usize,
-    /// The last act it (or a loop before it) typed.
     last: Option<i64>,
-    /// The wait it left standing (unix seconds).
     due: Option<i64>,
     log: Vec<String>,
-    /// The books it attached on and every row it wrote, stamped: the ledger
-    /// a loop that follows IT attaches on ([`run_chain`]).
     stamped: Vec<(i64, String)>,
-    /// The journal it attached beside and every line it said, stamped: the
-    /// journal beside that ledger.
     journal: Vec<(i64, String)>,
-    /// Every point's window it met ([`Window`]), on those books.
     windows: Vec<Window>,
 }
 
-/// The books a loop that follows attaches on: the ledger's rows and the
-/// journal's lines beside it, stamped — the ones before its attach standing.
 #[derive(Clone, Copy)]
 struct Books<'b> {
     rows: &'b [(i64, String)],
     journal: &'b [(i64, String)],
-    /// A COLD RESTORE reopened the follower's tab from tab [`WAS`]
-    /// ([`Restore`]).
     restored: Option<Restore>,
 }
 
-/// A COLD RESTORE that reopened the follower's tab from tab [`WAS`] at
-/// `at_ms`: the books' rows and lines before it are that tab's, signed with
-/// its session, and the rest the follower's tab's own, beside them.
 #[derive(Clone, Copy)]
 struct Restore {
-    /// When the restore reopened the tab.
     at_ms: i64,
-    /// Whether the restore noted `WAS` beside the tab's ledger
-    /// (`upgrade_drive::note_earlier_tab`); not: the control.
     noted: bool,
 }
 
 impl First {
-    /// THE MACHINE'S COUNT OF ITS SLEEP AT `h` (unix seconds): every sleep
-    /// of the timeline before it ([`Ev::Woke`]), and as much of one that has
-    /// begun and not ended (a loop attached at `h` counts the rest itself).
     fn asleep_at(&self, h: i64) -> Duration {
         let secs = self.slept_between(i64::MIN, h);
         Duration::from_secs(u64::try_from(secs).unwrap_or(0))
     }
 
-    /// How many seconds of the timeline's sleeps ([`Ev::Woke`]) fall between
-    /// `a` and `b` (unix seconds).
     fn slept_between(&self, a: i64, b: i64) -> i64 {
         self.events
             .iter()
@@ -1027,8 +755,6 @@ impl First {
             .sum()
     }
 
-    /// THE MACHINE'S RECORD OF ITS LAST SLEEP AT `h` (unix ms, asleep and
-    /// woke): the last sleep of the timeline that ended by then.
     fn last_sleep_at(&self, h: i64) -> Option<(i64, i64)> {
         self.events
             .iter()
@@ -1037,7 +763,6 @@ impl First {
             .map(|(t, _, ev, _)| ((t - ev.slept()) * 1000, t * 1000))
     }
 
-    /// The first loop's books ([`Books`]).
     fn books(&self) -> Books<'_> {
         Books {
             rows: &self.stamped,
@@ -1046,10 +771,6 @@ impl First {
         }
     }
 
-    /// The instants a loop stopped in the window at `at` ([`Window`]) is
-    /// followed at: a second on, and — Off standing and lifting next — a
-    /// second after it lifts (the host stops a worker its session reads Off
-    /// for, and starts one as Off lifts).
     fn window_attach(&self, at: i64) -> Vec<i64> {
         let mut hs = vec![at + 1];
         if let Some((t_off, ..)) = self
@@ -1065,7 +786,6 @@ impl First {
 }
 
 impl Followed {
-    /// The books a loop that follows this one attaches on ([`Books`]).
     fn books(&self) -> Books<'_> {
         Books {
             rows: &self.stamped,
@@ -1075,8 +795,6 @@ impl Followed {
     }
 }
 
-/// A successor attached at `h` on the first loop's books as they stood
-/// then, fed the rest of the timeline: its first act, and its last wait.
 fn run_successor(sc: &Scenario, first: &First, h: i64, dir: &Path, seed: bool) -> Cell {
     let before: Vec<&Act> = first.acts.iter().filter(|a| a.at < h).collect();
     let last = before.last().map(|a| a.at);
@@ -1092,11 +810,6 @@ fn run_successor(sc: &Scenario, first: &First, h: i64, dir: &Path, seed: bool) -
     (f.diverged, f.at_k, f.due, f.log)
 }
 
-/// A loop attached at `h` on `on` (rows and journal lines stamped, the ones
-/// before `h` standing), the first loop's acts before `k0` typed by the loops before
-/// it (the last of them at `last`), fed the rest of the timeline — up to
-/// `until` (exclusive), where a loop that follows it takes over, or to the
-/// run's end.
 fn run_follower(
     sc: &Scenario,
     first: &First,
@@ -1106,15 +819,7 @@ fn run_follower(
     dir: &Path,
     seed: bool,
 ) -> Followed {
-    // ONE SET OF FILES PER `dir`, its loops run one after another: each
-    // file a loop reads is written whole before it attaches (the books, the
-    // journal beside them, a restore's note, which names the same tab every
-    // time), and the loop writes nothing here but its ledger's rows. Made and
-    // removed per cell, the files were most of a restored cell's time.
     let books = dir.join("books.jsonl");
-    // Whether the host started this loop as the session's Off lifted: the
-    // loop before it was stopped under Off, so the park's row is this
-    // loop's to write ([`Session::seed_from_ledger`]), not on its books.
     let lifted_at = first
         .events
         .iter()
@@ -1134,9 +839,6 @@ fn run_follower(
         })
         .cloned()
         .collect();
-    // A COLD RESTORE ([`Books::restored`]): the books standing before it are
-    // those of the tab it was reopened from, signed with that tab's session,
-    // under a state root's `drive` beside this tab's own ledger.
     let state = dir.join("state");
     let (written, books) = match on.restored {
         None => (books.clone(), books),
@@ -1180,19 +882,15 @@ fn run_follower(
             .collect()
     };
     std::fs::write(&written, body(&standing_rows, false)).expect("the books");
-    // The journal beside them, as the window's host keeps it.
     let journal = crate::supervise::approvals::journal_beside(&written);
     let standing_lines = before_ms(on.journal, h * 1000);
     std::fs::write(&journal, body(&standing_lines, false)).expect("the journal");
-    // The restored tab's own, beside them.
     let own = on.restored.is_some().then(|| {
         let journal = crate::supervise::approvals::journal_beside(&books);
         std::fs::write(&books, body(&standing_rows, true)).expect("the tab's books");
         std::fs::write(&journal, body(&standing_lines, true)).expect("the tab's journal");
         standing_rows.iter().filter(|(ms, _)| !theirs(*ms)).count()
     });
-    // The transcript as it stands at `h` (the world's answer to an act its
-    // books do not hold is not written yet).
     let mut tail = sc.host.as_ref().and_then(|(_, t)| t.clone());
     for (t, _, ev, answers) in &first.events {
         if *t < h
@@ -1202,8 +900,6 @@ fn run_follower(
             tail.clone_from(x);
         }
     }
-    // The window's person as its status says it at `h`: the keystroke's age
-    // on the host's awake clock, which a sleep since it does not move.
     let key_at = first
         .events
         .iter()
@@ -1245,21 +941,12 @@ fn run_follower(
     });
     l.s.set_clock(h, PDT);
     l.s.set_mono_standing();
-    // The machine's count of its sleep and its record of its last sleep, as
-    // they stand at `h` ([`First::asleep_at`]), on the machine the test says
-    // ([`Machine`]).
     l.s.count_sleeps(first.asleep_at(h));
     if first.machine.rebooted {
         l.s.set_boot(crate::supervise::fx::OTHER_TEST_BOOT);
     }
     l.s.set_last_sleep(first.last_sleep_at(h).filter(|_| !first.machine.no_last));
-    // `drive_loop`'s seed. Its take window on the test's clock: an act
-    // younger than [`TAKE_S`] is awaited (production's 30 s), whose window
-    // then runs on the worker's clock as the first loop's does.
-    // (Not seeded: the negative control, a loop with no books.)
     l.s.turn_end.timing.take_within = Duration::from_secs(TAKE_S.unsigned_abs());
-    // The ledger is open as the seed is read, as `drive_loop` opens it: the
-    // rows so far are the predecessor's, and any the seed writes this loop's.
     l.s.ledger = Ledger::open(Some(&books), Some(SID), &mut Vec::new());
     l.read = own.unwrap_or(standing_rows.len());
     let open = seed
@@ -1269,8 +956,6 @@ fn run_follower(
     l.s.turn_end.timing.take_within = take_within(sc.take);
     l.s.seed_wall_memory(open);
     l.awaiting = sc.take && l.s.turn_end.untaken_act().is_some();
-    // The window the seed counts from the first loop's read, on the test's
-    // clock ([`TurnEndState::seed_awaited`]).
     if l.awaiting {
         l.unseen = l.s.turn_end.untaken_act_seen().map(|t| {
             let ago = l.s.fx.mono().saturating_duration_since(t).as_millis();
@@ -1281,31 +966,11 @@ fn run_follower(
         l.log
             .push(format!("  {} == attached as Off lifted", h - sc.t0));
     }
-    // Its first look: the screen standing at `h` — never the world's answer
-    // to an act its books do not hold (books cut short of the first loop's:
-    // [`a_tries_answer_no_loop_read_is_dated_by_the_screen_or_the_transcript`]).
     let standing = first.events.iter().rev().find(|(t, _, ev, answers)| {
         *t < h
             && answers.is_none_or(|k| k < k0)
             && matches!(ev, Ev::Point(_) | Ev::Woke(..) | Ev::Busy(_))
     });
-    // On the fixed clock (no take window modelled) a point is judged at once:
-    // a first look, inside an act's own window, at the screen the act was
-    // typed at would judge what no loop judges there (production's window is
-    // 30 s, and the act is awaited: [`TurnEndState::seed_awaited`]). Those
-    // scenarios' successors first look at the next event. (The act the
-    // loops before this one typed: a chain's successor may have typed none
-    // where the first loop did.)
-    //
-    // Where the take window is modelled, a successor attached after an act
-    // and before the first loop's first read after it (a point or a busy
-    // read, however late it comes) first looks there too: a loop reads at
-    // its poll, and a handoff takes longer, so the read latency is the
-    // world's (a read 70 s on is the Mac asleep, a refusal's pause, an
-    // outage ridden out: no loop reads sooner). One that read sooner would
-    // open the act's window sooner, as the first loop itself would reading
-    // then, and judge a turn whose busy read comes in the gap as no taking of
-    // the act.
     let first_read = |a: i64| {
         first
             .events
@@ -1321,11 +986,6 @@ fn run_follower(
         Some(a) if *t <= a => h - a >= TAKE_S,
         _ => true,
     });
-    // The successor's acts that match the first loop's from `k0` on (the
-    // same text, no sooner and within 40 s later; any relaunch for a
-    // relaunch) carry it on: the
-    // world's answers to them are its events too. The first that does not
-    // match is the cell's.
     let same = |want: Option<&Act>, got: &Act| {
         want.is_some_and(|w| {
             (w.rule == "model-fallback@v1" && got.rule == w.rule)
@@ -1361,20 +1021,12 @@ fn run_follower(
         going = take(acts, &mut matched, &mut chain);
     }
     let end = until.unwrap_or(first.end);
-    // The rest of the timeline: what comes after `h`, and the world's answer
-    // to every act its books do not hold yet, however early the first loop
-    // met it (placed after this loop's own act, below).
     let mut evs: Vec<&(i64, String, Ev, Option<usize>)> = first
         .events
         .iter()
         .filter(|(t, _, _, answers)| (*t >= h || answers.is_some_and(|k| k >= k0)) && *t < end)
         .collect();
     evs.sort_by_key(|e| e.0);
-    // The world answers an act once it is typed: an answer to one this loop
-    // typed later than the first loop (inside the 40 s it matches by) comes
-    // as much later, one to an act it typed sooner on the first loop's
-    // timeline (the screen an act was typed at stands until the first loop's
-    // own answer comes), and one to an act it has not typed, not yet.
     let at_of = |e: &(i64, String, Ev, Option<usize>), chain: &[Act]| match e.3 {
         Some(k) if k >= k0 => chain
             .get(k - k0)
@@ -1389,12 +1041,10 @@ fn run_follower(
             .min_by_key(|&(i, t)| (t, i))
             .filter(|&(_, t)| t < end);
         let typed = matched;
-        // Nothing runs while the Mac sleeps ([`Ev::Woke`]).
         let awake = next.map_or(end, |(i, t)| t - evs[i].2.slept());
         while going && let Some(a) = l.waits_before(awake, true) {
             going = take(vec![a], &mut matched, &mut chain);
         }
-        // An act typed meanwhile: its answers may come first.
         if !going || matched != typed {
             continue;
         }
@@ -1438,9 +1088,6 @@ fn run_follower(
     Followed {
         diverged,
         at_k: k0 + matched,
-        // The world answers the first loop's acts on its timeline: the
-        // screen an act was typed at stands until the first loop's own
-        // answer comes (a relaunch matched however much sooner).
         last: chain.last().map(|a| a.at).or(last).max(
             (k0 + matched)
                 .checked_sub(1)
@@ -1455,11 +1102,6 @@ fn run_follower(
     }
 }
 
-/// A CHAIN OF THREE LOOPS: a successor attached at `h1` on the first loop's
-/// books, run up to `h2`, where a third loop attaches on ITS books (the
-/// first loop's rows and the successor's own) and runs to the end. `None`
-/// where the successor itself parted from the first loop before `h2` (that
-/// cell is the pair's).
 fn run_chain(sc: &Scenario, first: &First, h1: i64, h2: i64, dir: &Path) -> Option<Cell> {
     let before: Vec<&Act> = first.acts.iter().filter(|a| a.at < h1).collect();
     let last = before.last().map(|a| a.at);
@@ -1491,9 +1133,6 @@ fn run_chain(sc: &Scenario, first: &First, h1: i64, h2: i64, dir: &Path) -> Opti
     Some((third.diverged, third.at_k, third.due, log))
 }
 
-/// The handoff instants of a run: just after each event and act, just
-/// before each act, and the middle of every long gap — but none while the
-/// Mac sleeps ([`Ev::Woke`]): no loop stops or starts then.
 fn handoffs(first: &First) -> Vec<i64> {
     let mut moments: Vec<i64> = first.events.iter().map(|e| e.0).collect();
     moments.sort_unstable();
@@ -1530,25 +1169,14 @@ fn handoffs(first: &First) -> Vec<i64> {
     hs
 }
 
-/// The cells of a scenario's matrix that break the rule, and how many it ran.
 #[derive(Default)]
 struct Tally {
     cells: usize,
     broken: Vec<String>,
 }
 
-/// How long past the first loop's act a successor's may come: a fresh
-/// appearance's first rung from attaching (30 min), a person's draft standing
-/// in the composer, whose grace each loop counts from its own first sight
-/// of it (`human_grace_s`, 2 min: a loop held by it past the try's next
-/// rung leaves the rung owed to the loop after it, which types it once its
-/// own grace is over: [`TurnEndState::seed_met_attempt`]), and the take
-/// window's slack.
 const LATER_BOUND_S: i64 = 30 * MIN + 2 * MIN + 40;
 
-/// The rule a follower's first differing act breaks, if any (module docs):
-/// `mine` the first loop's act it was due to match, `theirs` its own, `due`
-/// the wait it left standing.
 fn verdict(mine: Option<&Act>, theirs: Option<&Act>, due: Option<i64>) -> Option<&'static str> {
     match (mine, theirs) {
         (Some(a), Some(b)) if b.at < a.at => Some("SOONER"),
@@ -1561,23 +1189,13 @@ fn verdict(mine: Option<&Act>, theirs: Option<&Act>, due: Option<i64>) -> Option
     }
 }
 
-/// One scenario's matrix: the first loop's run, and a successor at every
-/// handoff (`seed`: taken up from the ledger, else started blank, the
-/// negative control) — and, seeded, a CHAIN at every handoff: the
-/// successor followed in its turn by a third loop at the next handoff
-/// ([`run_chain`]) — and the cells of every point's window
-/// ([`window_cells`]). The log of every cell, and the cells that break the
-/// rule (module docs) with their successor's log.
 fn run_matrix(sc: &Scenario, seed: bool) -> (String, Tally) {
     run_matrix_owed(sc, seed, false)
 }
 
-/// [`run_matrix`]; `owed`: the window's books without the task's end said
-/// in it ([`window_cells`], the negative control).
 fn run_matrix_owed(sc: &Scenario, seed: bool, owed: bool) -> (String, Tally) {
     let mut out = String::new();
     let mut tally = Tally::default();
-    // The scenario's name as a file name every platform takes (Windows refuses `:`, `?`, …).
     let tag: String = sc
         .name
         .chars()
@@ -1655,9 +1273,6 @@ fn run_matrix_owed(sc: &Scenario, seed: bool, owed: bool) -> (String, Tally) {
     (out, tally)
 }
 
-/// The acts typed on `rows` (ledger rows, stamped): how many, and when the
-/// last was (unix seconds) — what a loop attached on them takes the first
-/// loop's acts to be up to ([`run_follower`]'s `k0` and `last`).
 fn typed_on(rows: &[(i64, String)]) -> (usize, Option<i64>) {
     let typed: Vec<i64> = rows
         .iter()
@@ -1671,15 +1286,8 @@ fn typed_on(rows: &[(i64, String)]) -> (usize, Option<i64>) {
     (typed.len(), typed.last().copied())
 }
 
-/// Books a loop left, owned ([`Books`]): its ledger's rows and its
-/// journal's lines, stamped.
 type Stood = (Vec<(i64, String)>, Vec<(i64, String)>);
 
-/// THE BOOKS A LOOP STOPPED IN A POINT'S WINDOW LEAVES ([`Window`]): the
-/// rows and lines of `on` that stood there. `owed`: without the task's end
-/// said in it (`DONE …`, `LEFT …` in the window's instant) — the books
-/// before the end's note went right after its point's line, when it was
-/// owed to the point's act, the negative control.
 fn in_window(on: Books<'_>, w: Window, owed: bool) -> Stood {
     let rows = on.rows[..w.rows].to_vec();
     let lines = on.journal[..w.lines]
@@ -1694,23 +1302,6 @@ fn in_window(on: Books<'_>, w: Window, owed: bool) -> Stood {
     (rows, lines)
 }
 
-/// THE WINDOW CELLS OF A SCENARIO (the claim of 2026-10-20 against
-/// `look()`: a point's line journaled, the task's end its fold took said
-/// at the point's act, which the host's step took): at every point of the
-/// first loop's timeline, the loop STOPPED IN THE POINT'S WINDOW
-/// ([`Window`]: its line and the task's end said, its act not yet typed —
-/// the host's step took the point, and the host stopped the loop) and a
-/// successor attached a second on, on the books as it left them; where Off
-/// stood and lifted next, one attached as it lifts (the host stops a worker
-/// its session reads Off for, and starts one as Off lifts:
-/// [`Session::seed_from_ledger`]'s `lifted_off`); a CHAIN FROM IT, that
-/// successor run to the next handoff (`hs`) and a third loop attached
-/// there on its books; and a CHAIN INTO IT, a successor attached at the
-/// handoff before the point, stopped in its own window there, and a third
-/// loop attached a second on (and as Off lifts) on the books it left.
-/// Each a cell of the rule (module docs), named with its log. `owed`: the
-/// books without the task's end said in the window ([`in_window`]), the
-/// negative control.
 fn window_cells(
     sc: &Scenario,
     first: &First,
@@ -1755,8 +1346,6 @@ fn window_cells(
         if !seed {
             continue;
         }
-        // A CHAIN FROM IT: the successor a second on, run to the next
-        // handoff, where a third loop attaches on its books.
         let books = in_window(first.books(), *w, owed);
         let on = Books {
             rows: &books.0,
@@ -1791,8 +1380,6 @@ fn window_cells(
                 ));
             }
         }
-        // A CHAIN INTO IT: a successor attached at the handoff before the
-        // point, stopped in its own window there.
         if let Some(&h1) = hs.iter().rev().find(|&&h| h <= w.at) {
             let before: Vec<&Act> = first.acts.iter().filter(|a| a.at < h1).collect();
             let second = run_follower(
@@ -1822,9 +1409,6 @@ fn window_cells(
     cells
 }
 
-// ---------------------------------------------------------------- screens
-
-/// `unix` on the test's clock as Claude Code's done row says it (`3:11 PM`).
 fn done_clock(unix: i64) -> String {
     let local = unix + PDT;
     let h = (local / 3600).rem_euclid(24);
@@ -1838,7 +1422,6 @@ fn done_clock(unix: i64) -> String {
     format!("{h12}:{m:02} {ap}")
 }
 
-/// A reset's clock as a notice names it (`5:15pm`, `5pm`).
 fn reset_clock(unix: i64) -> String {
     let local = unix + PDT;
     let h = (local / 3600).rem_euclid(24);
@@ -1856,8 +1439,6 @@ fn reset_clock(unix: i64) -> String {
     }
 }
 
-/// Claude Code's screen: its launch card, the conversation `history`, the
-/// composer, `footer` rows and the mode line.
 fn cc(history: &[String], footer: &[String], mode_extra: &str) -> Vec<String> {
     let mut r = vec![
         " ▐▛███▛█   Claude Code v2.1.300".to_string(),
@@ -1882,8 +1463,6 @@ fn s(v: &[&str]) -> Vec<String> {
     v.iter().map(|x| (*x).to_string()).collect()
 }
 
-/// A turn: `prompt` (none: the worker's own continuation), its reply rows,
-/// its done row (`worked` minutes, done at `at`).
 fn turn(prompt: Option<&str>, reply: &[&str], worked_s: i64, at: i64) -> Vec<String> {
     let mut r = Vec::new();
     if let Some(p) = prompt {
@@ -1900,8 +1479,6 @@ fn turn(prompt: Option<&str>, reply: &[&str], worked_s: i64, at: i64) -> Vec<Str
     } else {
         format!("{sec}s")
     };
-    // A turn whose end is not known yet (`at` 0) is stamped when its screen
-    // is first drawn ([`resolve`]).
     let done = if at == 0 {
         format!(
             "@T{}@",
@@ -1917,8 +1494,6 @@ fn turn(prompt: Option<&str>, reply: &[&str], worked_s: i64, at: i64) -> Vec<Str
 
 static TURN_IDS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
 
-/// The screen's turns ended at `t` where first drawn: each `@T<n>@` stamp is
-/// the done clock of the first screen that drew it.
 fn resolve(
     rows: &[String],
     t: i64,
@@ -1957,17 +1532,10 @@ fn live(history: &[String], prompt: &str) -> Vec<String> {
     r
 }
 
-// ---------------------------------------------------------------- scenarios
-
 const MIN: i64 = 60;
 const HOUR: i64 = 3600;
-/// 2026-09-17 15:00 PDT.
 const T0: i64 = TEST_NOW + 6 * HOUR + 5 * MIN;
 
-/// The matrix's policy. Under `[harness] usage_credits = true`: the spend
-/// limit's entitlement ladder, whose tries the scenarios hand off, is a
-/// ladder under the key on alone (under the key off its owner is told,
-/// `turn_end`'s `a_wall_only_usage_credits_lift_is_not_continued_under_the_key_off`).
 fn default_policy() -> SupervisorConfig {
     SupervisorConfig {
         model_fallback: None,
@@ -1976,8 +1544,6 @@ fn default_policy() -> SupervisorConfig {
     }
 }
 
-/// The five-hour window's wall as a turn's end draws it, the vendor's
-/// countdown armed (`armed`) or not.
 fn session_wall(
     history: &[String],
     reset: i64,
@@ -2010,7 +1576,6 @@ fn session_wall(
     (h, footer)
 }
 
-/// The session's work turns as the screen keeps them.
 fn work0() -> Vec<String> {
     turn(
         Some("carry on with the task"),
@@ -2026,7 +1591,6 @@ fn with(history: &[String], more: &[String]) -> Vec<String> {
     h
 }
 
-/// The five-hour wall's history after Esc on its countdown.
 fn cancelled(h: &[String]) -> Vec<String> {
     with(
         h,
@@ -2040,7 +1604,6 @@ fn cancelled(h: &[String]) -> Vec<String> {
 const CANCELLED_NOTE: &str =
     "                             Automatic continue cancelled · /rate-limit-options to re-arm";
 
-/// The spend limit, as a turn's end draws it.
 fn spend_turn(prompt: Option<&str>, worked_s: i64, at: i64) -> Vec<String> {
     turn(
         prompt,
@@ -2053,7 +1616,6 @@ fn spend_turn(prompt: Option<&str>, worked_s: i64, at: i64) -> Vec<String> {
     )
 }
 
-/// After the try: a busy read of its turn two seconds on.
 fn taken(k: usize, h: &[String], prompt: &str) -> Beat {
     beat(
         At::Act(k, 2),
@@ -2062,7 +1624,6 @@ fn taken(k: usize, h: &[String], prompt: &str) -> Beat {
     )
 }
 
-// The lab's Sonnet bucket (2.1.300): its reset, Oct 17 4:20pm PDT.
 const BUCKET_RESET: i64 = 1_792_279_200;
 
 fn bucket_armed() -> Vec<String> {
@@ -2071,8 +1632,6 @@ fn bucket_armed() -> Vec<String> {
     )
 }
 
-/// The bucket's screen with its countdown rows gone and `add` above the
-/// composer.
 fn bucket_with(add: &[&str], model: &str) -> Vec<String> {
     let mut rows: Vec<String> = bucket_armed()
         .into_iter()
@@ -2096,7 +1655,6 @@ fn bucket_with(add: &[&str], model: &str) -> Vec<String> {
     rows
 }
 
-/// The relaunched process's redraw (as the existing tests construct it).
 fn bucket_redrawn() -> Vec<String> {
     bucket_armed()
         .iter()
@@ -2128,8 +1686,6 @@ fn above_composer(base: &[String], add: &[&str]) -> Vec<String> {
 const BUCKET_NOTICE: &str =
     "You've hit your Sonnet limit · resets Oct 17 at 4:20pm (America/Los_Angeles)";
 
-/// The transcript ending on `prompt` answered by the bucket's notice,
-/// written at `at` (the A2 test's).
 fn bucket_tail(prompt: &str, at: i64) -> String {
     let stamp = crate::harness::usage::rfc3339_utc(at);
     include_str!("fixtures/claude-2.1.294-transcript-session-limit.jsonl")
@@ -2159,7 +1715,7 @@ fn bucket_tail(prompt: &str, at: i64) -> String {
 
 fn scenarios() -> Vec<Scenario> {
     let mut out = Vec::new();
-    let reset = T0 + 12 * MIN + 2 * HOUR + 15 * MIN; // 17:27
+    let reset = T0 + 12 * MIN + 2 * HOUR + 15 * MIN;
     let w0 = work0();
     let wall_at = T0 + 12 * MIN;
     let (h_wall, f_armed) = session_wall(&w0, reset, wall_at, 12 * MIN, true);
@@ -2171,7 +1727,6 @@ fn scenarios() -> Vec<Scenario> {
             Ev::Busy(live(&w0, "carry on with the task")),
         )
     };
-    // ---- A: five-hour, armed; the vendor goes on by itself.
     for (tag, reply, busy_s) in [
         ("progress", "⏺ Stage 3 of 5 is in; stage 4 is next.", 0),
         (
@@ -2220,7 +1775,6 @@ fn scenarios() -> Vec<Scenario> {
             person_on_screen: false,
         });
     }
-    // ---- B: five-hour, Esc on the countdown; the loop's try at the reset.
     let h_c = cancelled(&h_wall);
     let esc = cc(&h_c, &[], CANCELLED_NOTE);
     let notice_again = format!(
@@ -2280,7 +1834,6 @@ fn scenarios() -> Vec<Scenario> {
             _ => {}
         }
         if tag == "a /clear" {
-            // The new task's work meets the window again; its countdown armed.
             let fresh = turn(
                 Some("start on the parser"),
                 &["⏺ Reading the parser."],
@@ -2330,7 +1883,6 @@ fn scenarios() -> Vec<Scenario> {
                 }
                 "met again" => {
                     let h3 = with(&h_after, &turn(Some("keep going"), &[&notice_again], 0, 0));
-                    // (no busy read: replace the take's busy)
                     beats.pop();
                     beats.push(beat(
                         At::Act(0, 3),
@@ -2396,7 +1948,6 @@ fn scenarios() -> Vec<Scenario> {
             person_on_screen: false,
         });
     }
-    // ---- C: the weekly window, no countdown.
     let weekly_notice =
         "  ⎿  You've hit your weekly limit · resets Sep 19 at 11am (America/Los_Angeles)";
     for tag in ["served", "met again"] {
@@ -2449,7 +2000,6 @@ fn scenarios() -> Vec<Scenario> {
             person_on_screen: false,
         });
     }
-    // ---- D-H: the spend limit (the entitlement ladder).
     let sp0 = with(&w0, &spend_turn(None, 3 * MIN, T0 + 3 * MIN));
     let spend_wall = cc(&sp0, &[], "");
     let met = |h: &[String]| with(h, &spend_turn(Some("keep going"), 0, 0));
@@ -2497,9 +2047,6 @@ fn scenarios() -> Vec<Scenario> {
                 beats.push(taken(1, &h2, "keep going"));
             }
             "the try's own short turn meets it" => {
-                // Under `progress` (no new episode: the rung counts from its
-                // end), and long enough for a handoff inside it past the try's
-                // take window.
                 beats.push(taken(0, &sp0, "keep going"));
                 let h2 = with(&sp0, &spend_turn(Some("keep going"), 4 * MIN + 30, 0));
                 beats.push(beat(
@@ -2610,7 +2157,6 @@ fn scenarios() -> Vec<Scenario> {
             person_on_screen: false,
         });
     }
-    // ---- I: the Sonnet bucket, no fallback.
     let bt0 = BUCKET_RESET - 2 * 86_400;
     let busy0 = live(&s(&["❯ start the task", ""]), "carry on with the task");
     for tag in [
@@ -2692,7 +2238,6 @@ fn scenarios() -> Vec<Scenario> {
             person_on_screen: false,
         });
     }
-    // ---- J/K: the bucket with the fallback's relaunch.
     let redrawn = bucket_redrawn();
     let before = bucket_tail("carry on with the task", bt0 - 600);
     for tag in [
@@ -2707,7 +2252,6 @@ fn scenarios() -> Vec<Scenario> {
         } else {
             vec!["relaunched"]
         };
-        // The bucket met at once (no work read): the redraw is a short turn.
         let mut beats = vec![beat(
             At::Start(0),
             "the bucket, armed",
@@ -2846,8 +2390,6 @@ fn scenarios() -> Vec<Scenario> {
     out
 }
 
-/// The take window on the worker's clock, the done check a wall cut, and
-/// limits of mixed kinds.
 fn more_scenarios() -> Vec<Scenario> {
     let mut out = Vec::new();
     let w0 = work0();
@@ -2861,7 +2403,6 @@ fn more_scenarios() -> Vec<Scenario> {
     let sp0 = with(&w0, &spend_turn(None, 3 * MIN, T0 + 3 * MIN));
     let spend_wall = cc(&sp0, &[], "");
     let window = true;
-    // ---- TW: the spend try, its take window thirty seconds.
     for tag in [
         "the notice read inside the window, the try taken, its turn ends on it",
         "the notice read inside the window, a local command, a person's 3h turn ends on it",
@@ -2967,7 +2508,6 @@ fn more_scenarios() -> Vec<Scenario> {
             person_on_screen: false,
         });
     }
-    // ---- TW-long: the try taken, its own turn longer than the try's rung.
     for work in [3 * HOUR, 90 * MIN] {
         let mut beats = vec![
             start(),
@@ -3008,7 +2548,6 @@ fn more_scenarios() -> Vec<Scenario> {
             person_on_screen: false,
         });
     }
-    // ---- TW-draft: the try's Enter did not take (its line left in the composer).
     {
         let mut drafted = spend_wall.clone();
         let caret = drafted
@@ -3041,7 +2580,6 @@ fn more_scenarios() -> Vec<Scenario> {
             person_on_screen: false,
         });
     }
-    // ---- O: a model bucket no reset ends (the entitlement ladder).
     let ob0 = with(
         &w0,
         &turn(
@@ -3172,7 +2710,6 @@ fn more_scenarios() -> Vec<Scenario> {
             person_on_screen: false,
         });
     }
-    // ---- K: the done check a wall cut, waited out, its retry.
     let reset = T0 + 12 * MIN + 2 * HOUR + 15 * MIN;
     let wall_at = T0 + 12 * MIN;
     let (h_wall, f_armed) = session_wall(&w0, reset, wall_at, 12 * MIN, true);
@@ -3241,7 +2778,6 @@ fn more_scenarios() -> Vec<Scenario> {
             person_on_screen: false,
         });
     }
-    // ---- M: limits of mixed kinds.
     for tag in [
         "the spend try met by the five-hour window",
         "the five-hour try met by the weekly window",
@@ -3326,8 +2862,6 @@ fn more_scenarios() -> Vec<Scenario> {
     out
 }
 
-/// The five-hour window's notice again (the try met it: its reset placed
-/// early).
 fn five_again(reset: i64) -> String {
     format!(
         "  ⎿  You've hit your session limit · resets {} (America/Los_Angeles)",
@@ -3335,7 +2869,6 @@ fn five_again(reset: i64) -> String {
     )
 }
 
-/// A person's `/compact` running (its spinner, `esc to interrupt`).
 fn compacting(history: &[String]) -> Vec<String> {
     let mut h = history.to_vec();
     h.extend(s(&[
@@ -3350,8 +2883,6 @@ fn compacting(history: &[String]) -> Vec<String> {
     r
 }
 
-/// The conversation after a person's `/compact`: redrawn from the
-/// compaction's banner, the kept turn, and the command's answer.
 fn compacted(kept: &str) -> Vec<String> {
     cc(
         &s(&[
@@ -3371,8 +2902,6 @@ fn compacted(kept: &str) -> Vec<String> {
     )
 }
 
-/// The weekly window's wall at `at`, its reset at `reset` named with its
-/// date (`resets Sep 17 at 5:27pm`), the vendor's countdown armed or not.
 fn weekly_wall(history: &[String], reset: i64, at: i64, armed: bool) -> (Vec<String>, Vec<String>) {
     let clock = format!("Sep 17 at {}", reset_clock(reset));
     let mut h = history.to_vec();
@@ -3406,14 +2935,6 @@ fn land_policy() -> SupervisorConfig {
     }
 }
 
-/// THE SHAPES GROWN IN (the seed's real inputs the matrix lacked):
-/// a handoff in the read latency past a try's take window; acts in a
-/// limit's place other than the done check; a cancelled notice under the
-/// screen a try was typed at; a loop started as Off lifts; a done check
-/// already answered, then a person's turn; the weekly window reached; a
-/// usage window's try met by a model bucket; tries in a row; a person's
-/// typing grace; a `/compact` between; the vendor's `continuing
-/// automatically` words standing with no countdown.
 #[allow(clippy::too_many_lines)]
 fn grown_scenarios() -> Vec<Scenario> {
     let mut out = Vec::new();
@@ -3465,7 +2986,6 @@ fn grown_scenarios() -> Vec<Scenario> {
             person_on_screen: false,
         }
     };
-    // ---- R1: a handoff in the read latency past the try's take window.
     for (tag, first_read, busy_at) in [
         ("the first read after the try 35 s on", 35, 40),
         ("the first read 2 s on, the busy read 32 s on", 2, 32),
@@ -3490,9 +3010,6 @@ fn grown_scenarios() -> Vec<Scenario> {
         } else if first_read < 2 * TAKE_S {
             beats.extend([mark, read]);
         } else {
-            // A handoff past twice the window, the try unread still: the
-            // seed once read such a try as met at the screen it was typed at
-            // (follow-2).
             let late = beat(At::Act(0, first_read - 5), "(a handoff instant)", Ev::Mark);
             beats.extend([mark, late, read]);
         }
@@ -3516,9 +3033,6 @@ fn grown_scenarios() -> Vec<Scenario> {
             true,
         ));
     }
-    // ---- R2: acts in a limit's place other than the done check. The
-    // vendor's continuation at the reset, the worker's reply under it, the
-    // limit's rows scrolled off.
     for (tag, reply, policy) in [
         ("the reversible answer", force, default_policy()),
         ("the done check (control)", done, default_policy()),
@@ -3603,9 +3117,6 @@ fn grown_scenarios() -> Vec<Scenario> {
             ));
         }
     }
-    // ---- R2b: a land nudge in the limit's place: the instruction typed at
-    // an ordinary point, its turn meets the five-hour wall, the vendor goes
-    // on and the reply is a done report.
     {
         let p0 = cc(
             &with(&w0, &turn(None, &[progress], 0, T0 + 2 * MIN)),
@@ -3651,8 +3162,6 @@ fn grown_scenarios() -> Vec<Scenario> {
             false,
         ));
     }
-    // ---- R2c: Land, its landing spent (the instruction, then its nudges,
-    // each answered with progress): nothing more is typed for it.
     {
         let p0 = cc(
             &with(&w0, &turn(None, &[progress], 0, T0 + 2 * MIN)),
@@ -3684,8 +3193,6 @@ fn grown_scenarios() -> Vec<Scenario> {
             false,
         ));
     }
-    // ---- R3: the cancelled notice under the screen the try was typed at
-    // (the take window modelled).
     for tag in [
         "read again inside the window",
         "no read before the busy one",
@@ -3719,9 +3226,7 @@ fn grown_scenarios() -> Vec<Scenario> {
             true,
         ));
     }
-    // ---- R4: Off stood and lifted (a loop the host starts as it lifts).
     {
-        // (a) Inside the try's take window.
         let mut beats = b_head();
         beats.push(beat(
             At::Act(0, 3),
@@ -3750,7 +3255,6 @@ fn grown_scenarios() -> Vec<Scenario> {
         ));
     }
     {
-        // (b) A done check the weekly limit cut, Off lifting before its retry.
         let weekly_notice =
             "  ⎿  You've hit your weekly limit · resets Sep 19 at 11am (America/Los_Angeles)";
         let mut beats = b_head();
@@ -3797,7 +3301,6 @@ fn grown_scenarios() -> Vec<Scenario> {
         ));
     }
     {
-        // (c) The spend limit's ladder, Off lifting between its tries.
         let h1 = with(&sp0, &spend_turn(Some("keep going"), 0, 0));
         let beats = vec![
             start(),
@@ -3823,7 +3326,6 @@ fn grown_scenarios() -> Vec<Scenario> {
         ));
     }
     {
-        // (d) Land: the instruction typed, Off lifting before its answer.
         let p0 = cc(
             &with(&w0, &turn(None, &[progress], 0, T0 + 2 * MIN)),
             &[],
@@ -3853,12 +3355,6 @@ fn grown_scenarios() -> Vec<Scenario> {
             false,
         ));
     }
-    // (e) A task's end, then Off stood and lifted: the landing — the clean
-    // defense in words that answers Land's instruction (Autopilot Land; the
-    // retired token lands nothing, and Cruise never ends, so main's token
-    // and done-check cells have no end to hand over). A loop stopped in the
-    // end's window ([`window_cells`]) leaves books a loop started as Off
-    // lifts reads the end from.
     {
         let defense = [
             "⏺ Merged the parser into main and pushed it; every suite passes.",
@@ -3870,11 +3366,6 @@ fn grown_scenarios() -> Vec<Scenario> {
             &[],
             "",
         );
-        // The land act's own `❯` row over its answer, as Claude Code draws
-        // the words typed: a successor lands a reply no read of its own saw
-        // run only where its act's taking is that plain (the land act's
-        // seed, `TurnEndState::seed_land_act`); under a `❯ (land)` stand-in
-        // the books' landing was owed Land's act again.
         let land = crate::supervise::policy::turn_end::LAND;
         let landed = with(&w0, &turn(Some(land), &defense, 10 * MIN, 0));
         let beats = vec![
@@ -3901,7 +3392,6 @@ fn grown_scenarios() -> Vec<Scenario> {
             false,
         ));
     }
-    // ---- R6: the weekly window reached within the run.
     let (hw, fw) = weekly_wall(&w0, reset, wall_at, true);
     let wk_walled = cc(&hw, &fw, "");
     let hw_c = cancelled(&hw);
@@ -3972,7 +3462,6 @@ fn grown_scenarios() -> Vec<Scenario> {
             false,
         ));
     }
-    // ---- R7: the five-hour window's try met by a model bucket.
     for (tag, notice, take) in [
         (
             "the Opus bucket, no reset",
@@ -4013,10 +3502,6 @@ fn grown_scenarios() -> Vec<Scenario> {
             take,
         ));
     }
-    // ---- R7b: the five-hour window's try TAKEN, its own 20-minute turn
-    // ending on a bucket that names no reset: the bucket's appearance is that
-    // turn's end, judged at once (work read), take window or not — not the
-    // window's end after it ("a loop that follows another").
     for take in [false, true] {
         let mut beats = b_head();
         beats.push(taken(0, &h_c, "keep going"));
@@ -4053,7 +3538,6 @@ fn grown_scenarios() -> Vec<Scenario> {
             take,
         ));
     }
-    // ---- R8: tries in a row before the handoff (the five-hour window).
     for take in [false, true] {
         let mut beats = b_head();
         let mut h_at = h_c.clone();
@@ -4084,9 +3568,7 @@ fn grown_scenarios() -> Vec<Scenario> {
             take,
         ));
     }
-    // ---- R9: a person's typing grace.
     {
-        // (a) The Esc and a keystroke a minute before the try.
         let mut beats = b_head();
         beats.insert(3, beat(At::Start(22 * MIN), "the Esc's keystroke", Ev::Key));
         beats.push(beat(
@@ -4111,8 +3593,6 @@ fn grown_scenarios() -> Vec<Scenario> {
         ));
     }
     for take in [false, true] {
-        // (b) The spend limit: a keystroke 20 s before the first rung, and
-        // one inside the try's take window.
         let mut beats = vec![
             start(),
             beat(
@@ -4148,7 +3628,6 @@ fn grown_scenarios() -> Vec<Scenario> {
             take,
         ));
     }
-    // ---- R11: a person's `/compact` between.
     for (tag, busy) in [("read busy", true), ("not read busy", false)] {
         let mut beats = b_head();
         if busy {
@@ -4184,7 +3663,6 @@ fn grown_scenarios() -> Vec<Scenario> {
         ));
     }
     {
-        // The spend limit met again, a /compact, the ladder.
         let h1 = with(&sp0, &spend_turn(Some("keep going"), 0, 0));
         let after = compacted("⏺ Running the suite.");
         let kept = &after[5..after.len() - 4];
@@ -4226,10 +3704,7 @@ fn grown_scenarios() -> Vec<Scenario> {
             false,
         ));
     }
-    // ---- R12: the vendor's `continuing automatically` words.
     {
-        // (a) The dialog's answer `Claude Code will continue automatically
-        // at …`, the countdown armed; the vendor goes on.
         let clock = reset_clock(reset);
         let dialog = with(
             &h_wall,
@@ -4274,9 +3749,6 @@ fn grown_scenarios() -> Vec<Scenario> {
         ));
     }
     for (tag, seen_armed) in [("after the armed wall", true), ("first seen so", false)] {
-        // (b) The countdown's record `⏺ Usage limit reached · continuing
-        // automatically at …` standing with no countdown (a `/resume` back
-        // into the conversation dropped it): nobody goes on.
         let mut beats = vec![start()];
         if seen_armed {
             beats.push(beat(
@@ -4306,10 +3778,6 @@ fn grown_scenarios() -> Vec<Scenario> {
             false,
         ));
     }
-    // ---- R13: short turns in a row (the streak's back-off is read from
-    // the screen again, not seeded), and Off lifting in its back-off before
-    // a person's own short exchange (the carry the park drops, which the
-    // acts a successor seeds give back).
     for tag in [
         "short turns in a row",
         "Off lifts in the back-off, a person's exchange",
@@ -4374,14 +3842,6 @@ fn grown_scenarios() -> Vec<Scenario> {
     out
 }
 
-/// THE SHAPES GROWN IN (the verifier of 97daeeace, RS8): Off
-/// standing between a try and its late first read (a record of the loop's
-/// is no read); the short streak moved at points no act follows — a
-/// person's short turn, a wake's, a done check's answer judged not done —
-/// and held past the window, to the ladder's top; the task ended, then a
-/// later turn's done report; and an act's yield seen run by a successor
-/// attached in its turn (a land act's done reply, a spend limit's try's
-/// real work).
 #[allow(clippy::too_many_lines)]
 fn round8_scenarios() -> Vec<Scenario> {
     let mut out = Vec::new();
@@ -4409,7 +3869,6 @@ fn round8_scenarios() -> Vec<Scenario> {
             person_on_screen: false,
         }
     };
-    // The worker's short turn, then `n` short yields to `keep going`.
     let short_yields = |n: usize, beats: &mut Vec<Beat>| {
         let p0 = cc(&with(&w0, &turn(None, &[progress], 0, T0)), &[], "");
         beats.push(beat(At::Start(0), "the worker's short turn", Ev::Point(p0)));
@@ -4424,8 +3883,6 @@ fn round8_scenarios() -> Vec<Scenario> {
         }
         h
     };
-    // ---- RS8-R1: Off stood between the spend limit's try and its first
-    // read 20 s on (the record of it no read of the try's).
     let sp0 = with(&w0, &spend_turn(None, 3 * MIN, T0 + 3 * MIN));
     let spend_wall = cc(&sp0, &[], "");
     for off_at in [2, 10] {
@@ -4464,8 +3921,6 @@ fn round8_scenarios() -> Vec<Scenario> {
             true,
         ));
     }
-    // ---- RS8-R3: short turns in a row, then a person's short turn after
-    // the last yield was judged (no act between).
     for acts in [2, 3] {
         let mut beats = Vec::new();
         let h = short_yields(acts, &mut beats);
@@ -4499,8 +3954,6 @@ fn round8_scenarios() -> Vec<Scenario> {
             false,
         ));
     }
-    // ---- RS8-R4: the done check answered NOT done (a short reply), then a
-    // person's turn ending in a done report.
     {
         let p0 = with(&w0, &turn(None, &[done], 10 * MIN, T0 + 10 * MIN));
         let mut beats = vec![
@@ -4555,8 +4008,6 @@ fn round8_scenarios() -> Vec<Scenario> {
             false,
         ));
     }
-    // ---- RS8-F2: Land, landed by the land act's 10 min done reply, then a
-    // new task's short turn (the land act's yield seen run).
     for (tag, reply) in [("a done report", done), ("progress", progress)] {
         let p0 = cc(
             &with(&w0, &turn(None, &[progress], 0, T0 + 2 * MIN)),
@@ -4600,7 +4051,6 @@ fn round8_scenarios() -> Vec<Scenario> {
             false,
         ));
     }
-    // ---- RS8-F2: a wake's short turn between two acts.
     {
         let mut beats = Vec::new();
         let mut h = short_yields(1, &mut beats);
@@ -4640,7 +4090,6 @@ fn round8_scenarios() -> Vec<Scenario> {
             false,
         ));
     }
-    // ---- RS8-F2/F3: short turns in a row to the ladder's top (60 min).
     {
         let mut beats = Vec::new();
         let h = short_yields(7, &mut beats);
@@ -4653,8 +4102,6 @@ fn round8_scenarios() -> Vec<Scenario> {
             false,
         ));
     }
-    // ---- RS8-F2: short turns, the spend limit at a short yield, the try's
-    // real work (no continuation: its yield keeps the streak).
     {
         let mut beats = Vec::new();
         let mut h = short_yields(1, &mut beats);
@@ -4689,9 +4136,6 @@ fn round8_scenarios() -> Vec<Scenario> {
     out
 }
 
-/// the prior shapes (the verifier of 75b03ac6d): the land act answered not
-/// done (RS9-F4). (Its RS9-F2 and RS9-F3 began at a task the worker's own
-/// token ended, which Autopilot Cruise retired.)
 fn round9_scenarios() -> Vec<Scenario> {
     let mut out = Vec::new();
     let w0 = work0();
@@ -4714,9 +4158,6 @@ fn round9_scenarios() -> Vec<Scenario> {
             take: false,
             person_on_screen,
         };
-    // ---- RS9-F4: RS8-R4 under Land: the land instruction answered NOT
-    // done (a short reply), then a turn ending in a done report — a
-    // person's, and nobody's: no landing in hand, so Land nudges.
     for (tag, with_key) in [("a person's hand", true), ("nobody's hand", false)] {
         let p0 = cc(
             &with(&w0, &turn(None, &[progress], 0, T0 + 2 * MIN)),
@@ -4781,23 +4222,12 @@ fn round9_scenarios() -> Vec<Scenario> {
     out
 }
 
-/// AN API ERROR'S RETRY LADDER (a 529, overloaded: [`TurnEndTiming::retry_backoff`],
-/// 1, 5, 15, 30, then 60 minutes from each appearance's "a
-/// loop that follows another"). Taken up from nothing, a loop that follows
-/// retried on the ladder's first rung from its own read, whatever rung the
-/// loop before was on: up to an hour sooner. The ladder met again at every
-/// rung; a retry's own long work meeting it again (a new episode, the
-/// ladder from the start); a retry's short turn meeting it again (the same
-/// episode); and the ladder in a take window.
 fn api_retry_scenarios() -> Vec<Scenario> {
     let mut out = Vec::new();
     let w0 = work0();
     let overloaded = "  ⎿  API Error: 529 Overloaded. This is a server-side issue, usually \
                       temporary — try again in a moment. If it persists, check \
                       https://status.claude.com.";
-    // A 500's ladder is the 529's; an older build's journal names both
-    // `api-error`'s and the network's alike, and only the act's words tell
-    // them apart (`retry_held`).
     let server = "  ⎿  API Error: 500 Internal server error. This is a server-side issue, \
                   usually temporary — try again in a moment.";
     let api_turn_of = |error: &'static str| {
@@ -4817,7 +4247,6 @@ fn api_retry_scenarios() -> Vec<Scenario> {
     let h0 = with(&w0, &api_turn(None, 3 * MIN, T0 + 3 * MIN));
     for take in [false, true] {
         let window = if take { ", take window" } else { "" };
-        // The ladder met again at every rung, then a retry taken.
         for (code, error) in [("529", overloaded), ("500", server)] {
             let api_turn = api_turn_of(error);
             let h0 = with(&w0, &api_turn(None, 3 * MIN, T0 + 3 * MIN));
@@ -4857,8 +4286,6 @@ fn api_retry_scenarios() -> Vec<Scenario> {
                 person_on_screen: false,
             });
         }
-        // Met again twice, then a retry's own work meets it: 20 minutes (a
-        // new episode, its ladder from the start) or 3 (the same episode).
         for (work, tag) in [(20 * MIN, "long"), (3 * MIN, "short")] {
             let mut beats = vec![
                 start(),
@@ -4899,8 +4326,6 @@ fn api_retry_scenarios() -> Vec<Scenario> {
                 person_on_screen: false,
             });
         }
-        // A 529 cuts Land's act and the wall's retry is answered with a clean defense: the
-        // retry delivers the act again and lands the task, unless a person's turn came between.
         let land = crate::supervise::policy::turn_end::LAND;
         let retry = crate::supervise::policy::turn_end::wall_retry_text(
             crate::supervise::policy::turn_end::RULE_API_RETRY,
@@ -4956,7 +4381,6 @@ fn api_retry_scenarios() -> Vec<Scenario> {
                     Ev::Point(cc(&answered, &[], "")),
                 ),
             ]);
-            // The first loop lands the task, or, a person's turn between, nudges the landing.
             beats.push(if person {
                 taken(2, &answered, crate::supervise::policy::turn_end::LAND_NUDGE)
             } else {
@@ -4978,13 +4402,6 @@ fn api_retry_scenarios() -> Vec<Scenario> {
                 person_on_screen: false,
             });
         }
-        // Cruise's done check meets a full context in its own turn, or a 529 cuts it and the
-        // wall's retry meets one: the `/compact`'s continuation types the check again. No row
-        // names that wall, so a successor reads it off the check's point and the `/compact`
-        // after it. A person's turn between (met by a 529 too) leaves the plain continuation.
-        // The report names an irreversible act, so the check carries the reversible clause,
-        // as a successor's continuation types it for a check it did not type
-        // (`compact_owed_text`).
         let check = crate::supervise::policy::turn_end::DONE_CHECK;
         let claim = "⏺ All done: committed and pushed. Should I delete the old release branch?";
         let h1 = with(&w0, &turn(None, &[claim], 0, T0 + 2 * MIN));
@@ -5004,7 +4421,6 @@ fn api_retry_scenarios() -> Vec<Scenario> {
                 ),
                 taken(0, &h1, check),
             ];
-            // The act whose turn meets the full context: the check, or the wall's retry.
             let (k, act, mut h) = if api {
                 (
                     1,
@@ -5096,11 +4512,6 @@ fn api_retry_scenarios() -> Vec<Scenario> {
                 person_on_screen: false,
             });
         }
-        // Land's instruction meets a full context in its own turn, or a 529 cuts it and the
-        // wall's retry meets one, or the continuation's own turn meets one again: the
-        // `/compact`'s continuation types the instruction again, and its clean defense lands
-        // the task. No row names that wall: a successor reads it off the act's point and the
-        // `/compact` after it, and the act by its row's rule (`compact_owed_text`).
         let answer = crate::supervise::policy::turn_end::LAND_ANSWER;
         for (api, twice, asked) in [
             (false, false, false),
@@ -5224,14 +4635,6 @@ fn api_retry_scenarios() -> Vec<Scenario> {
     out
 }
 
-/// The scenarios of 's person lane, after its review
-/// (KR-P6-ESC): the first loop's `keep going`, its answer stopped by an Esc
-/// that is no act of the harness's — a person's key, and the Esc with no
-/// keystroke the window stamps — then, inside the Esc's hold, a person's own
-/// short message, answered in a minute. The first loop's act answered under
-/// that Esc ends its carry (`TurnEndState::observe`'s act arm), so the
-/// person's turn after it is their own exchange, left to them. Every read
-/// carries the person's stamp.
 fn person_scenarios() -> Vec<Scenario> {
     let mut out = Vec::new();
     let w0 = work0();
@@ -5303,14 +4706,8 @@ fn person_scenarios() -> Vec<Scenario> {
     out
 }
 
-/// How many scenarios of a matrix run side by side. The test binary already runs a test per
-/// core, so a matrix spread over every core only contends with them: the matrix's 23 tests
-/// alone took 7.3 s and 68 CPU-s on 18 workers (35 of them the kernel's), 4.2 s and 38 CPU-s
-/// on 4, 6.2 s on 2.
 const MATRIX_WORKERS: usize = 4;
 
-/// Each scenario's matrix, in order: run on [`MATRIX_WORKERS`] threads (each
-/// cell's loops are its own, on the fixed clock).
 fn run_all(scenarios: &[Scenario], seed: bool) -> Vec<(String, Tally)> {
     use std::sync::atomic::{AtomicUsize, Ordering};
     let next = AtomicUsize::new(0);
@@ -5355,9 +4752,6 @@ fn a_loop_that_follows_types_as_the_first_loop_at_every_handoff() {
             .collect::<Vec<_>>()
             .join("\n")
     );
-    // NEGATIVE CONTROL: successors that take nothing up from the ledger, at
-    // a spend limit met again and at a five-hour window's try met again,
-    // type sooner than the first loop, and the matrix says so.
     let controls: Vec<Scenario> = scenarios
         .into_iter()
         .filter(|sc| {
@@ -5372,11 +4766,6 @@ fn a_loop_that_follows_types_as_the_first_loop_at_every_handoff() {
             "CONTROL: a successor with no seed broke nothing:\n{out}"
         );
     }
-    // NEGATIVE CONTROL: the books a loop stopped in a point's window leaves
-    // without the task's end said there — its note owed to the point's act,
-    // as `look` owed it until 2026-10-20 ([`window_cells`]' `owed`): the
-    // landing said in words, read by a loop started as Off lifts, gets the
-    // land instruction again.
     let landed = self::scenarios()
         .into_iter()
         .find(|sc| sc.name == "R4 Off lifts after the landing (Land, in words)")
@@ -5390,17 +4779,6 @@ fn a_loop_that_follows_types_as_the_first_loop_at_every_handoff() {
     );
 }
 
-/// A LAND EPISODE A READING IN ANOTHER MODE ENDED IS OVER FOR A LOOP THAT
-/// FOLLOWS (the record of it, [`crate::supervise::approvals::RULE_LAND_OVER`];
-/// the episode's seed, RS7-2). The land instruction is typed under Land; the
-/// next point, its short yield, is read under Cruise and types nothing (the
-/// short streak's back-off): the episode is over, a Land after it is a new
-/// one, and the ledger holds no episode for a loop that follows
-/// ([`crate::supervise::approvals::land_episode`]). With no row, a loop that
-/// follows under Land again would nudge, or type nothing for a landing
-/// spent, where the loop that read Cruise types the instruction anew — the
-/// matrix's scenarios hold one mode each. NEGATIVE CONTROL: the same point
-/// read under Land keeps the episode.
 #[test]
 fn a_land_episode_a_reading_in_another_mode_ended_is_over_for_a_loop_that_follows() {
     use crate::supervise::config::Autopilot;
@@ -5482,17 +4860,6 @@ fn a_land_episode_a_reading_in_another_mode_ended_is_over_for_a_loop_that_follow
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// THE HOLD'S `since` IS THE INSTRUCTION'S ROW, FOR THIS LOOP AND THE NEXT
-/// (the Autopilot design's §12.3.3): the loop that types Land's
-/// instruction holds it from the stamp its ledger row carries
-/// (`ledger_row` → `TurnEndState::ledgered`), and a loop that follows on
-/// the same books (a restart, a seamless update) seeds that very stamp
-/// (`approvals::LandSeed::hold` → `TurnEndState::seed_land_hold`), its
-/// episode's legs unread until its first yield. The nudge its yield is owed,
-/// typed and ledgered later, counts one and leaves `since` at the
-/// instruction's row, in this loop and the next. NEGATIVE CONTROLS: the
-/// hold before the instruction is none, a loop over books with no episode
-/// holds none, and the nudge's own row is later than the instruction's.
 #[test]
 fn a_land_holds_since_its_instruction_row_for_this_loop_and_the_next() {
     use crate::supervise::config::Autopilot;
@@ -5527,7 +4894,6 @@ fn a_land_holds_since_its_instruction_row_for_this_loop_and_the_next() {
         ..TurnEndTiming::default()
     });
     s.set_clock(T0 + 2 * MIN, PDT);
-    // Virtual clocks, moved by sleeps alone: each row's stamp is its own.
     {
         use crate::supervise::fx::{ClockSource, Fx, VirtualClock};
         s.set_fx(Fx::over(ClockSource::Virtual(std::sync::Arc::new(
@@ -5554,13 +4920,11 @@ fn a_land_holds_since_its_instruction_row_for_this_loop_and_the_next() {
             .next_back()
     };
     let row_ts = row_of(RULE_LAND).expect("the instruction's row");
-    // This loop: the row's own stamp, its yield not read yet.
     let live = s.turn_end.land_held().expect("the episode");
     assert_eq!(live.since_ms, Some(row_ts), "{live:?}");
     assert!(!live.read && live.legs == 0 && live.nudges == 0, "{live:?}");
     let instructed = dir.join("instructed.jsonl");
     std::fs::copy(&ledger, &instructed).expect("the books so far");
-    // Its yield, real work that is no landing, and the nudge it is owed.
     let yielded = cc(
         &with(
             &w0,
@@ -5597,14 +4961,12 @@ fn a_land_holds_since_its_instruction_row_for_this_loop_and_the_next() {
         "{nudged:?}"
     );
     drop(s);
-    // The loop that follows, seeded from those books: before the nudge…
     let mut m = Mock::new(vec![Vec::new()]);
     let mut next = session(&mut m, Some(SID.to_string()));
     next.seed_from_ledger(&instructed, row_ts + 60_000, false);
     let seeded = next.turn_end.land_held().expect("the seeded episode");
     assert_eq!(seeded, live, "the same hold, from the same row");
     drop(next);
-    // …and after it.
     let mut m = Mock::new(vec![Vec::new()]);
     let mut next = session(&mut m, Some(SID.to_string()));
     next.seed_from_ledger(&ledger, nudge_ts + 60_000, false);
@@ -5615,7 +4977,6 @@ fn a_land_holds_since_its_instruction_row_for_this_loop_and_the_next() {
         "{seeded:?}"
     );
     drop(next);
-    // NEGATIVE CONTROL: books with no episode seed none.
     let mut m = Mock::new(vec![Vec::new()]);
     let mut bare = session(&mut m, Some(SID.to_string()));
     bare.seed_from_ledger(&dir.join("none.jsonl"), row_ts + 60_000, false);
@@ -5624,14 +4985,6 @@ fn a_land_holds_since_its_instruction_row_for_this_loop_and_the_next() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// OFF STANDS AT EVERY PARK THE JOURNAL SAYS, IN THE BOOKS A LOOP THAT
-/// FOLLOWS READS (done-6): a build through 0.105.0 notes
-/// `PARKED seq=<n> autopilot=off` as it parks and records no
-/// `autopilot-off@v1`; read where that note stands, the Land episode the
-/// park ended is over (`approvals::land_episode_in`), and a newer build's
-/// own record beside its note reads the same. NEGATIVE CONTROLS, the
-/// episode still in hand: another session's park, a park before the
-/// episode's instruction, an `UNPARKED` note, no journal.
 #[test]
 fn off_stands_at_every_park_the_journal_says() {
     use crate::supervise::approvals::{self, Outcome, Row};
@@ -5672,7 +5025,6 @@ fn off_stands_at_every_park_the_journal_says() {
         !in_hand(&newer, Some(&park(2_000, SID))),
         "a newer build's record too"
     );
-    // The park among later rows: placed before the first row at or after it.
     let later = format!(
         "{land}\n{}\n",
         row(RULE_LAND, Outcome::Typed, "the turn-end policy", 3_000)
@@ -5681,7 +5033,6 @@ fn off_stands_at_every_park_the_journal_says() {
         in_hand(&later, Some(&park(2_000, SID))),
         "a Land typed after the park"
     );
-    // NEGATIVE CONTROLS.
     assert!(
         in_hand(&books, Some(&park(2_000, "s-2"))),
         "another session's park"
@@ -5695,18 +5046,6 @@ fn off_stands_at_every_park_the_journal_says() {
     assert!(in_hand(&books, None), "no journal");
 }
 
-/// A LOOP WHOSE SEED FOUND THE LEDGER'S TRY AGED OUT WRITES THE TRY OVER,
-/// NOT THE WALL'S END, before its first wall row (RS8-R2,
-/// [`crate::supervise::approvals::RULE_TRY_OVER`]). The ledger: a done check
-/// typed in a spend limit's place three hours ago, past its two-hour rung.
-/// This loop's first point is the spend limit: the try is over for a loop
-/// that follows it ([`crate::supervise::approvals::usage_attempt`]), and no
-/// row ends a wall — what a wall stands for (a check it cut, a move refused
-/// at it) stands, as for this loop. NEGATIVE CONTROL: the try an hour old is
-/// inside its rung, and the wall row alone is written. Written as the wall's
-/// end ([`crate::supervise::approvals::LIMIT_ENDED`]), a third loop read a
-/// check the wall cut as answered by nothing and asked it again after the
-/// retry's done reply, and asked a move again at the wall it was refused at.
 #[test]
 fn a_try_a_seed_found_aged_out_is_over_and_ends_no_wall() {
     use crate::supervise::approvals::{self, Outcome, Row};
@@ -5816,23 +5155,6 @@ fn a_try_a_seed_found_aged_out_is_over_and_ends_no_wall() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// THE TRY'S FIRST READ CAME LATE, AND A SUCCESSOR ATTACHED INSIDE THE
-/// WINDOW IT OPENED AWAITS THE TRY (RS8-F4): the spend limit's try, its
-/// first read 70 s on (the Mac asleep, an outage ridden out), its turn's
-/// busy read 90 s on, its three-hour turn ending on the limit again. The
-/// first loop's window counts from its late read, so the busy read takes
-/// the try, and it types 30 minutes from the wall that turn ends on; so does
-/// a successor attached after that read, the window the ledger shows (the
-/// wall's row) counted from there however late it came. Capped at twice the
-/// window, the successor judged the try met at the screen it was typed at,
-/// kept its two-hour rung through the try's own turn, and typed into the
-/// standing limit 30 minutes sooner. So does a successor attached before
-/// that read, 66 s after the try, which no read has seen yet: its own first
-/// read is the try's first, however late after the try it comes, as the
-/// first loop's was (follow-2: capped at twice the window,
-/// it judged the try met at the screen it was typed at and typed 30 minutes
-/// sooner). NEGATIVE CONTROL: a successor that takes nothing up types
-/// sooner.
 #[test]
 fn a_try_s_late_first_read_opens_the_window_a_successor_awaits() {
     let w0 = work0();
@@ -5898,19 +5220,6 @@ fn a_try_s_late_first_read_opens_the_window_a_successor_awaits() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A TRY'S TURN NO LOOP WATCHED IS READ AS THE LOOP THAT WATCHED IT READS IT
-/// ("a long unwatched gap"): the loop that typed a spend
-/// limit's try stopped before any read after it, the try's own turn worked
-/// 40 minutes and ended on the limit again, and a loop attached a second
-/// after that end — its books holding the try and nothing since — reads the
-/// done row Claude Code drew there as the try's turn ([`act_turn_work`]):
-/// the ladder starts over at that turn's end, the next try 30 minutes on,
-/// when the first loop's. Read as a point no read saw run, the try's rung
-/// stood from the follower's first look: two hours on. So too a try's turn
-/// that worked three hours (its done row's span past the first rung's
-/// two). NEGATIVE CONTROL (in the test): the same follower on a screen
-/// whose done row is the turn the try was typed after (Claude Code held the
-/// line, no turn ran) keeps the try's rung.
 #[test]
 fn a_tries_turn_no_loop_watched_starts_the_ladder_over_as_the_first_loop_does() {
     let w0 = work0();
@@ -5960,8 +5269,6 @@ fn a_tries_turn_no_loop_watched_starts_the_ladder_over_as_the_first_loop_does() 
         let first = run_first(&sc, &dir);
         let tried = first.acts.first().expect("the try").at;
         assert_eq!(first.acts.len(), 2, "the try and the next: {:?}", first.log);
-        // The books as the loop that typed the try left them: the try, and
-        // nothing read after it.
         let rows = before_ms(&first.stamped, (tried + 1) * 1000);
         let journal = before_ms(&first.journal, (tried + 1) * 1000);
         let books = Books {
@@ -5980,8 +5287,6 @@ fn a_tries_turn_no_loop_watched_starts_the_ladder_over_as_the_first_loop_does() 
             f.log.join("\n")
         );
         if held {
-            // The try's rung stands: the next try comes two hours after the
-            // follower's first look, never the first loop's 30 minutes.
             assert_eq!(
                 verdict(first.acts.get(f.at_k), f.diverged.as_ref(), f.due),
                 Some("LATER-UNBOUNDED"),
@@ -5999,18 +5304,6 @@ fn a_tries_turn_no_loop_watched_starts_the_ladder_over_as_the_first_loop_does() 
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// AN ACT'S TIME IS THE WALL CLOCK'S ACROSS A SLEEP (limits-5's review): the
-/// act a spend limit's try is, typed and then no read for 40 minutes that
-/// the monotonic clock did not count (the matrix's stands between steps,
-/// while each step moves the policy's instants with the wall clock:
-/// [`Loop::advance`]), read at last at the end of the try's turn, its
-/// done row `Worked for 40m 0s` reaching back to the try: the try's own
-/// turn, which starts the ladder over at its end — the next try 30 minutes
-/// on. Set against the act's time on the take window's clock, which the
-/// sleep does not move, the try read as typed when the loop woke, the turn
-/// as one that ran before it, and the try's two-hour rung stood. NEGATIVE
-/// CONTROL: the line held (no turn ran: the done row is the turn the try was
-/// typed after) keeps the rung.
 #[test]
 fn a_turn_an_act_began_is_dated_from_the_act_across_a_sleep() {
     let w0 = work0();
@@ -6055,7 +5348,6 @@ fn a_turn_an_act_began_is_dated_from_the_act_across_a_sleep() {
         let [tried, next, ..] = first.acts.iter().map(|a| a.at).collect::<Vec<_>>()[..] else {
             panic!("the try and the next: {why}");
         };
-        // The loop's first read after the try: the turn's end.
         let read = tried + 2 + 40 * MIN;
         if held {
             assert!(next >= read + 2 * HOUR, "CONTROL {why}");
@@ -6069,22 +5361,6 @@ fn a_turn_an_act_began_is_dated_from_the_act_across_a_sleep() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A SLEEP OF THE MAC INSIDE A TRY'S TURN IS NO WORK OF THE TURN'S (limits-5
-/// live, `docs/measured/real-claude-lab-2026-10-15.md`): Claude Code times a
-/// turn on the wall clock, which runs on through a sleep, so the spend
-/// limit's try it answered at once, the Mac asleep 30 minutes from the
-/// Enter, draws `✻ Worked for 30m 0s` at the wake. The loop measured the
-/// sleep ([`Ev::Woke`], [`Session::watch_sleep`]), so the turn's work is
-/// its span less the sleep ([`act_turn_work`]'s `asleep`,
-/// [`TurnEndReading::of_slept`]): under the five minutes that end a limit's
-/// episode ([`TurnEndTiming::progress`]), the try was met again and keeps
-/// its two-hour rung; ten minutes of work around the same sleep start the
-/// ladder over at the turn's end — a long turn of work is not counted short.
-/// So too where a read saw the try's turn run before the sleep (the loop's
-/// own measure, which a sleep stops, three seconds). Read whole, `30m 0s`
-/// and `32m 30s` started the ladder over, the next try due 90 minutes
-/// sooner. CONTROLS, the Mac awake: 30 minutes of work start the ladder
-/// over, two and a half keep the rung.
 #[test]
 fn a_sleep_inside_a_tries_turn_is_no_work_of_the_turns() {
     let dir = crate::supervise::test_scratch_path("seed-matrix", "sleep-in-try");
@@ -6097,7 +5373,6 @@ fn a_sleep_inside_a_tries_turn_is_no_work_of_the_turns() {
         let [tried, next, ..] = first.acts.iter().map(|a| a.at).collect::<Vec<_>>()[..] else {
             panic!("the try and the next: {why}");
         };
-        // The loop's first read after the try's turn: its end.
         let read = tried + 2 + span;
         if over {
             assert!(
@@ -6111,17 +5386,6 @@ fn a_sleep_inside_a_tries_turn_is_no_work_of_the_turns() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A SLEEP INSIDE A PERSON'S TURN IS NO WORK OF IT EITHER (the measured
-/// doc's "a person's turn across one", where no act is awaited): the act's
-/// answer stopped with an Esc, a person's message read running, the Mac
-/// asleep 30 minutes, its turn ends at the wake, its done row counting the
-/// night. The turn's span is read less the sleep the loop measured inside
-/// it ([`Session::turn_asleep`]): answered in three seconds, their own
-/// exchange, left to them — nothing typed; fifteen minutes of work before
-/// the same sleep, a job, continued at the turn's end. Read whole, the three
-/// seconds were half an hour of work, a job, and the loop typed `keep going`
-/// into the person's exchange. CONTROLS, the Mac awake: three seconds are
-/// left to the person, fifteen minutes continued.
 #[test]
 fn a_sleep_inside_a_persons_turn_is_no_work_of_it() {
     let dir = crate::supervise::test_scratch_path("seed-matrix", "sleep-in-person");
@@ -6135,7 +5399,6 @@ fn a_sleep_inside_a_persons_turn_is_no_work_of_it() {
         else {
             panic!("the act: {why}");
         };
-        // The person's turn's end, read first at the wake.
         let end = carried + 90 + worked + asleep;
         if left {
             assert!(after.is_empty(), "left to the person: {why}");
@@ -6151,8 +5414,6 @@ fn a_sleep_inside_a_persons_turn_is_no_work_of_it() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// [`a_sleep_inside_a_persons_turn_is_no_work_of_it`]'s cases: what, the
-/// person's turn's work, the Mac asleep at its end, left to the person.
 const SLEEP_IN_PERSON: [(&str, i64, i64, bool); 4] = [
     ("a person's 3 s exchange, the Mac asleep", 3, 30 * MIN, true),
     (
@@ -6175,11 +5436,6 @@ const SLEEP_IN_PERSON: [(&str, i64, i64, bool); 4] = [
     ),
 ];
 
-/// The act's answer stopped with a person's Esc, then their message, read
-/// running, whose turn works `worked` seconds and ends at the wake from a
-/// sleep of `asleep` ([`SLEEP_IN_PERSON`]; the shape of
-/// [`person_scenarios`]' KI1016-P6) — and, not `left` to the person, the
-/// act that continues it taken.
 fn sleep_in_person(what: &str, worked: i64, asleep: i64, left: bool) -> Scenario {
     let w0 = work0();
     let progress = "⏺ Stage 3 of 5 is in; stage 4 is next.";
@@ -6250,25 +5506,6 @@ fn sleep_in_person(what: &str, worked: i64, asleep: i64, left: bool) -> Scenario
     }
 }
 
-/// A SLEEP THAT ENDED BEFORE A PERSON'S PROMPT IS NO PART OF THEIR TURN:
-/// the act's answer stopped with a person's Esc, their question answered at
-/// once (their own exchange, left to them), the Mac then asleep two hours,
-/// idle; the person wakes it and presses Enter five seconds after the wake,
-/// and the done row of their message names the minute it ended in. That
-/// minute reaches back up to 59 s before the Enter, so the span a loop reads
-/// the turn in holds the end of the sleep — but a turn begins and ends
-/// awake, so a sleep the system's record places exactly lies wholly inside
-/// a turn or wholly outside it
-/// ([`crate::supervise::policy::sleeps::Sleep::most_inside`]), and this one
-/// is outside. So a loop that follows types as the first loop at every
-/// handoff: the person's own 5-minute exchange, ending 50 s into its
-/// minute, is left to them, and a 620 s job, ending 30 s into its minute,
-/// is continued at its end. Read with the sleep's last 45 s inside the
-/// exchange, its keystroke fell outside its 255 s turn (no person's hand),
-/// and a loop that followed typed `keep going` into it; with 25 s inside
-/// the job, it read as a 595 s exchange, under [`EXCHANGE_WORK`], and a
-/// loop that followed left it to the person. CONTROLS, the Mac awake: the
-/// same.
 #[test]
 fn a_sleep_before_a_persons_prompt_is_no_part_of_their_turn() {
     let dir = crate::supervise::test_scratch_path("seed-matrix", "sleep-before-person");
@@ -6277,8 +5514,6 @@ fn a_sleep_before_a_persons_prompt_is_no_part_of_their_turn() {
         for asleep in [2 * HOUR, 0] {
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(&dir).expect("dir");
-            // The act's own time is the first loop's: the turn's end is
-            // moved into its minute once that is known.
             let probe = run_first(&sleep_before_person(work, asleep, 0, left), &dir);
             let a0 = probe.acts.first().expect("the act").at;
             let adj = (second - (a0 + SLEPT_BEFORE_ENTER + work)).rem_euclid(60);
@@ -6325,16 +5560,8 @@ fn a_sleep_before_a_persons_prompt_is_no_part_of_their_turn() {
     );
 }
 
-/// [`sleep_before_person`]'s Enter, after the act: the act's answer, a
-/// person's exchange, two hours and five minutes on.
 const SLEPT_BEFORE_ENTER: i64 = 2 * HOUR + 5 * MIN + 5;
 
-/// The act's answer stopped with a person's Esc and their question
-/// answered in three seconds; `asleep` seconds of sleep (none: the Mac
-/// awake) ending five seconds before their next message's Enter
-/// ([`SLEPT_BEFORE_ENTER`] after the act, `adj` seconds later), which works
-/// `work` seconds — and, not `left` to the person, the act that continues
-/// it taken.
 fn sleep_before_person(work: i64, asleep: i64, adj: i64, left: bool) -> Scenario {
     let w0 = work0();
     let progress = "⏺ Stage 3 of 5 is in; stage 4 is next.";
@@ -6430,23 +5657,6 @@ fn sleep_before_person(work: i64, asleep: i64, adj: i64, left: bool) -> Scenario
     }
 }
 
-/// SLEEPS AFTER A PERSON'S EXCHANGE LEAVE IT THEIRS, FOR A LOOP THAT
-/// FOLLOWS: the act's answer stopped with a person's Esc; their message,
-/// read running, is answered in 5m 28s (their own exchange, left to them),
-/// two seconds before its minute's end; five seconds later the Mac sleeps
-/// an hour, wakes five seconds with no loop reading, and sleeps eight hours
-/// (the system's record of its last sleep). The loop that read the
-/// person's turn running stopped a second after that read, and a loop
-/// attaches a second after the last wake. The ledger counts the hour, but
-/// cannot place it: it lies somewhere between the act and the eight hours,
-/// so as much of it as the turn's span holds may lie inside it — and none
-/// must. A person's keystroke is read against the turn's work at its most
-/// (the least sleep inside: `TurnEndReading::worked_most`), so the exchange
-/// is still theirs, and the loop that follows types nothing, as the first
-/// loop. Read against its work at its least, the 328 s turn was none, the
-/// keystroke outside it, and the loop that follows typed `keep going` into
-/// it after the short streak's back-off. CONTROL: the eight hours alone,
-/// placed exactly after the exchange.
 #[test]
 fn sleeps_after_a_persons_exchange_leave_it_theirs_for_a_loop_that_follows() {
     let dir = crate::supervise::test_scratch_path("seed-matrix", "exchange-then-sleeps");
@@ -6464,8 +5674,6 @@ fn sleeps_after_a_persons_exchange_leave_it_theirs_for_a_loop_that_follows() {
             58,
             "the end's second: {why}"
         );
-        // The books of the loop that read the person's turn running, cut a
-        // second after that read.
         let rows = before_ms(&first.stamped, (a0 + 91) * 1000);
         let journal = before_ms(&first.journal, (a0 + 91) * 1000);
         let last_wake = first.events.iter().map(|e| e.0).max().expect("events");
@@ -6493,12 +5701,8 @@ fn sleeps_after_a_persons_exchange_leave_it_theirs_for_a_loop_that_follows() {
     }
 }
 
-/// [`exchange_then_sleeps`]' person's turn: 5m 28s.
 const EXCHANGE_THEN_SLEEPS: i64 = 5 * MIN + 28;
 
-/// [`sleeps_after_a_persons_exchange_leave_it_theirs_for_a_loop_that_follows`]'s
-/// shape: a first sleep of `s1` seconds (none: one sleep only), five seconds
-/// awake, and the last of `s2`, after the person's exchange.
 fn exchange_then_sleeps(s1: i64, s2: i64) -> Scenario {
     let w0 = work0();
     let progress = "⏺ Stage 3 of 5 is in; stage 4 is next.";
@@ -6582,26 +5786,6 @@ fn exchange_then_sleeps(s1: i64, s2: i64) -> Scenario {
     }
 }
 
-/// A LOOP ATTACHED AFTER A SLEEP IT NEVER MEASURED reads the try's turn
-/// less it as the loop that measured it does (the measured doc's "a
-/// follower attached after a sleep it never measured"): the loop that typed
-/// a spend limit's try stopped before any read after it, the Mac slept 30
-/// minutes inside the try's turn, and a loop attached a second after the
-/// wake reads the done row Claude Code drew there. The try's row on the
-/// books records the machine's count of its sleep and the boot it counts in
-/// (`approvals::SLEPT_MS`), and the loop's own count, read at its first look,
-/// says how long the machine slept since the try
-/// ([`crate::supervise::policy::sleeps::SleepBook::take_up`]); the system's
-/// record of its last sleep places it exactly, with no count on the books.
-/// So the try answered at once, or after two and a half minutes of work,
-/// keeps its two-hour rung, as the first loop's does, and ten minutes of
-/// work still start the ladder over at the turn's end. WHERE NOTHING SAYS —
-/// an older build's books (no count) or another boot's count, on a machine
-/// that keeps no record of its last sleep — the done row reads whole, as
-/// before the count, the ladder over 90 minutes sooner than the first
-/// loop's rung (data that does not exist), and the journal says so once
-/// (`SLEEP …`); so too where only the system's record counts it. NEGATIVE
-/// CONTROL: the same books on the same boot, no record, keep the rung.
 #[test]
 fn a_loop_attached_after_a_sleep_it_never_measured_reads_the_tries_turn_less_it() {
     let dir = crate::supervise::test_scratch_path("seed-matrix", "unmeasured-sleep");
@@ -6613,8 +5797,6 @@ fn a_loop_attached_after_a_sleep_it_never_measured_reads_the_tries_turn_less_it(
         let mut first = run_first(&sc, &dir);
         let tried = first.acts.first().expect("the try").at;
         assert_eq!(first.acts.len(), 2, "the try and the next: {:?}", first.log);
-        // The books as the loop that typed the try left them: the try, and
-        // nothing read after it.
         let rows = before_ms(&first.stamped, (tried + 1) * 1000);
         let older: Vec<(i64, String)> = rows.iter().map(|(t, r)| (*t, uncounted(r))).collect();
         let journal = before_ms(&first.journal, (tried + 1) * 1000);
@@ -6629,7 +5811,6 @@ fn a_loop_attached_after_a_sleep_it_never_measured_reads_the_tries_turn_less_it(
             no_last: true,
             rebooted: true,
         };
-        // (what says it, the books, the machine, read whole, `SLEEP` said)
         for (says, books, machine, whole, said) in [
             ("CONTROL: the books' count", &rows, no_last, false, false),
             (
@@ -6669,9 +5850,6 @@ fn a_loop_attached_after_a_sleep_it_never_measured_reads_the_tries_turn_less_it(
                 f.log.join("\n")
             );
             let v = verdict(first.acts.get(f.at_k), f.diverged.as_ref(), f.due);
-            // Read whole, a turn of under five minutes' work starts the
-            // ladder over where the first loop's rung stood; one that worked
-            // ten minutes started it over for both.
             if whole && !over {
                 assert_eq!(v, Some("SOONER"), "{why}");
             } else {
@@ -6689,21 +5867,6 @@ fn a_loop_attached_after_a_sleep_it_never_measured_reads_the_tries_turn_less_it(
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// THE SEED MATRIX ACROSS A SLEEP: at every handoff of the scenarios a
-/// sleep of the Mac falls in — inside a spend limit's try's turn
-/// ([`SLEEP_IN_TRY`]), inside a person's turn ([`SLEEP_IN_PERSON`]), and
-/// their controls awake — a loop that follows types as the first loop: one
-/// attached before the sleep measures it as the first loop does, one
-/// attached after it takes it up from the books' count and the system's
-/// record ([`a_loop_attached_after_a_sleep_it_never_measured_reads_the_tries_turn_less_it`]),
-/// and a chain of three so; so too one attached a second after the wake
-/// where the loop before stopped before it, a turn read running across the
-/// sleep on its books ([`gap_cells`]). So too on an older build's books,
-/// whose acts count no sleep, by the system's record of its last sleep. NEGATIVE
-/// CONTROL: those books on a machine that keeps no such record — nothing
-/// says how long it slept before the follower's first look, and the try's
-/// turn of seconds read whole starts the ladder over sooner than the first
-/// loop.
 #[test]
 fn a_loop_that_follows_across_a_sleep_types_as_the_first_loop_at_every_handoff() {
     let slept: Vec<Scenario> = SLEEP_IN_TRY
@@ -6729,10 +5892,6 @@ fn a_loop_that_follows_across_a_sleep_types_as_the_first_loop_at_every_handoff()
             .collect::<Vec<_>>()
             .join("\n")
     );
-    // THE GAP CELLS ([`gap_cells`]): a loop that stopped before a point —
-    // the wake's first read among them, a turn it read running before the
-    // sleep on its books — and one attached a second after it, which never
-    // measured the sleep.
     let (cells, broken) = gap_matrix(&slept, false);
     assert!(
         broken.is_empty(),
@@ -6775,9 +5934,6 @@ fn a_loop_that_follows_across_a_sleep_types_as_the_first_loop_at_every_handoff()
     );
 }
 
-/// [`a_sleep_inside_a_tries_turn_is_no_work_of_the_turns`]'s cases: what,
-/// the try's turn read running from (seconds after it), the done row's span,
-/// the Mac asleep at its end, the ladder over.
 const SLEEP_IN_TRY: [(&str, Option<i64>, i64, i64, bool); 6] = [
     (
         "answered at once, the Mac asleep",
@@ -6823,9 +5979,6 @@ const SLEEP_IN_TRY: [(&str, Option<i64>, i64, i64, bool); 6] = [
     ),
 ];
 
-/// A spend limit's try whose turn's done row spans `span` seconds, the last
-/// `asleep` of them a sleep of the Mac read first at the wake, and read
-/// running `ran` seconds after the try ([`SLEEP_IN_TRY`]).
 fn sleep_in_try(what: &str, ran: Option<i64>, span: i64, asleep: i64) -> Scenario {
     let w0 = work0();
     let sp0 = with(&w0, &spend_turn(None, 3 * MIN, T0 + 3 * MIN));
@@ -6872,14 +6025,8 @@ fn sleep_in_try(what: &str, ran: Option<i64>, span: i64, asleep: i64) -> Scenari
     }
 }
 
-/// The stamp of a transcript row written when its beat comes: the beat's
-/// time on the test's clock ([`run_first`]).
 const TAIL_AT: &str = "@AT@";
 
-/// A try a spend limit answers AT ONCE, as Claude Code draws it (the shape
-/// measured on 2.1.302's Sonnet bucket): the prompt, the notice under it, and
-/// — `done`, Claude Code's `showTurnDuration` on — the turn's done row, its
-/// clock the try's minute.
 fn spend_answer(prompt: &str, done: bool) -> Vec<String> {
     let mut r = vec![
         format!("❯ {prompt}"),
@@ -6896,8 +6043,6 @@ fn spend_answer(prompt: &str, done: bool) -> Vec<String> {
     r
 }
 
-/// The transcript ending on `prompt` answered by the spend limit's notice,
-/// both written when the beat comes ([`TAIL_AT`]).
 fn spend_tail(prompt: &str) -> String {
     let rows = [
         format!(
@@ -6913,10 +6058,6 @@ fn spend_tail(prompt: &str) -> String {
     rows.join("\n") + "\n"
 }
 
-/// A spend limit the first loop tries four times, each try answered by the
-/// limit at once — drawn with its done row (`done`), or written to the
-/// transcript (`transcript`) — or, `held`, the second try's line held by
-/// Claude Code: no turn, nothing drawn or written.
 fn answered_tries(done: bool, transcript: bool, held: bool) -> Scenario {
     let w0 = work0();
     let mut h = with(&w0, &spend_turn(None, 3 * MIN, T0 + 3 * MIN));
@@ -6968,30 +6109,8 @@ fn answered_tries(done: bool, transcript: bool, held: bool) -> Scenario {
     }
 }
 
-/// A TRY'S ANSWER NO LOOP READ IS DATED BY THE SCREEN OR THE TRANSCRIPT
-/// ("a loop that follows another"; limits-1): the loop that
-/// typed a spend limit's second try stopped before any read after it, and a
-/// loop attached later — its books holding that try and nothing since —
-/// reads the limit's answer to it where the screen's done row (`Worked for
-/// 0s`, the try's minute) or the transcript's notice row (written at the
-/// try), or both, date it: the try met at once, as the loop that typed it
-/// read it, its first read dated at the latest the signs allow — no sooner
-/// than the answer drew, no later than the notice's second and the slack or
-/// the done row's minute's end, whichever is earlier — so the follower types
-/// the first loop's tries at their times — 6 h 1 min
-/// after the try (its rung due in the gap) at once, an hour after it at the
-/// rung — and so does a third loop attached on its books. Read as a new
-/// appearance (the rule before), the first follower typed 30 minutes after
-/// its attach and then every rung of a fresh ladder: a try more than the
-/// first loop by 12 h; and an hour after the try it counted the rung from
-/// its own read, an hour late. NEGATIVE CONTROL (in the test): the second
-/// try's line held (no turn, nothing drawn or written) dates nothing, and
-/// the follower keeps the rule before: a new appearance's first rung from
-/// its attach, or the rung from its own read.
 #[test]
 fn a_tries_answer_no_loop_read_is_dated_by_the_screen_or_the_transcript() {
-    // Each sign's case on a thread of its own, in a directory of its own:
-    // the six share nothing.
     std::thread::scope(|scope| {
         for (done, transcript) in [(true, false), (false, true), (true, true)] {
             for held in [false, true] {
@@ -7001,13 +6120,8 @@ fn a_tries_answer_no_loop_read_is_dated_by_the_screen_or_the_transcript() {
     });
 }
 
-/// [`a_tries_answer_no_loop_read_is_dated_by_the_screen_or_the_transcript`]
-/// where the screen's done row (`done`) or the transcript's notice row
-/// (`transcript`) dates the try, its line `held` (the control).
 fn a_tries_answer_dated_by(done: bool, transcript: bool, held: bool) {
     let dir = crate::supervise::test_scratch_path("seed-matrix", "dated-try");
-    // The first read a follower dated the try at (its record for the loop
-    // after it).
     let dated = |f: &Followed| -> Option<i64> {
         f.stamped.iter().find_map(|(_, row)| {
             let tag = "its first read_ms=";
@@ -7028,8 +6142,6 @@ fn a_tries_answer_dated_by(done: bool, transcript: bool, held: bool) {
         first.log.join("\n")
     );
     let tried = acts[1];
-    // The books as the loop that typed the second try left them: the
-    // try, and nothing read after it.
     let cut = first
         .stamped
         .iter()
@@ -7057,7 +6169,6 @@ fn a_tries_answer_dated_by(done: bool, transcript: bool, held: bool) {
             (false, _) => {
                 assert_eq!((v, f.diverged.as_ref()), (None, None), "{why}");
                 assert_eq!(f.at_k, first.acts.len(), "{why}");
-                // The answer drew a second after the try.
                 let drew = tried + 1;
                 let by_notice = transcript.then_some(drew + 10);
                 let by_done = done.then_some(drew - drew.rem_euclid(MIN) + MIN - 1);
@@ -7070,16 +6181,13 @@ fn a_tries_answer_dated_by(done: bool, transcript: bool, held: bool) {
                     dated(&f)
                 );
             }
-            // CONTROL: a new appearance, its first rung from attaching.
             (true, true) => assert!(
                 f.diverged.as_ref().is_some_and(|a| a.at >= h + 30 * MIN),
                 "CONTROL {why}"
             ),
-            // CONTROL: the rung from the follower's own read.
             (true, false) => assert_eq!(v, Some("LATER-UNBOUNDED"), "CONTROL {why}"),
         }
     }
-    // The whole matrix of handoffs over the same timeline.
     let (out, tally) = run_matrix(&sc, true);
     assert!(
         tally.broken.is_empty(),
@@ -7090,9 +6198,6 @@ fn a_tries_answer_dated_by(done: bool, transcript: bool, held: bool) {
         let _ = std::fs::remove_dir_all(&dir);
         return;
     }
-    // A THIRD LOOP on the follower's books, an hour after it attached
-    // — and five seconds after, inside the take window its first
-    // read would have opened.
     for h2 in [tried + 2 * HOUR, tried + HOUR + 5] {
         let second = run_follower(
             &sc,
@@ -7136,14 +6241,6 @@ fn a_tries_answer_dated_by(done: bool, transcript: bool, held: bool) {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A LEDGER NO LOOP RECORDED POINTS IN SEEDS NO YIELD (RS8-F2): an older
-/// build wrote no point records ([`crate::supervise::approvals::RULE_POINT`]),
-/// so its last act may have been answered already, and a turn a successor
-/// sees run is judged as someone else's, its short turn lengthening the
-/// streak, as before. A ledger this build wrote records every act's answer:
-/// its last act's yield is still to come, and moves the streak as the act's
-/// own arm does (a wall's retry: none). NEGATIVE CONTROL: the same acts with
-/// a point record before them.
 #[test]
 fn a_ledger_no_loop_recorded_points_in_seeds_no_yield() {
     use crate::supervise::approvals::{self, Outcome, Row};
@@ -7206,7 +6303,6 @@ fn a_ledger_no_loop_recorded_points_in_seeds_no_yield() {
         let open = s.seed_from_ledger(&ledger, now_ms, false);
         s.seed_wall_memory(open);
         assert_eq!(s.turn_end.short_streak(), 3, "{recorded}: the act's mark");
-        // A turn this loop sees run, and its short end.
         s.turn_end.took();
         let h = with(
             &work0(),
@@ -7230,17 +6326,6 @@ fn a_ledger_no_loop_recorded_points_in_seeds_no_yield() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A PERSON'S EXCHANGE THE LOOP BEFORE READ RUNNING IS DATED FROM THAT READ
-/// ([`TurnEndState::seed_ran_turn`]): the loop before judged a point 20
-/// minutes ago, read the person's turn running 2 minutes ago and stopped. A
-/// loop that attaches at the turn's box ([`TurnEndState::box_up`]: no gap
-/// left to take) and whose next read is the turn's end, the person's key
-/// 10 s old, leaves it to them, as the loop before would have: two minutes
-/// of work. Dated from the point, it was 20 minutes of work, a job, and
-/// continued. The key 2 min 10 s old, sent after the point but just before
-/// the turn was read running (inside
-/// [`crate::supervise::policy::turn_end::PERSON_TURN_SLACK`]), leaves it to
-/// them too. NEGATIVE CONTROL: a turn read running 15 minutes ago is a job.
 #[test]
 fn a_persons_exchange_read_running_by_the_loop_before_is_dated_from_that_read() {
     use crate::supervise::approvals::{self, Outcome, Row};
@@ -7311,15 +6396,6 @@ fn a_persons_exchange_read_running_by_the_loop_before_is_dated_from_that_read() 
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// THE GAP CELLS OF ONE SCENARIO ([`run_follower`] on books cut
-/// at a point the loop before never read): at every point of the first
-/// loop's timeline, a loop that stopped just before it (the first loop, and
-/// a loop that followed it from the point before: a chain) and a successor
-/// attached a second after it, on the screen as it stands. `unrecorded`:
-/// the books without the records of a turn read running
-/// ([`crate::supervise::approvals::RULE_TURN_RAN`]), the negative control.
-/// The cells counted, and those that break the rule (module docs) with
-/// their successor's log.
 fn gap_cells(sc: &Scenario, unrecorded: bool) -> (usize, Vec<String>) {
     let dir = crate::supervise::test_scratch_path("seed-matrix", "gap");
     let _ = std::fs::remove_dir_all(&dir);
@@ -7341,8 +6417,6 @@ fn gap_cells(sc: &Scenario, unrecorded: bool) -> (usize, Vec<String>) {
             })
             .cloned()
             .collect();
-        // The journal as the loop before left it: stopped before the
-        // point, it said nothing there.
         let journal = before_ms(&first.journal, t * 1000);
         let before: Vec<&Act> = first.acts.iter().filter(|a| a.at < *t).collect();
         let last = before.last().map(|a| a.at);
@@ -7368,8 +6442,6 @@ fn gap_cells(sc: &Scenario, unrecorded: bool) -> (usize, Vec<String>) {
             last,
             "the first loop",
         );
-        // The chain: a loop attached a second after the point before
-        // this one, stopped at this one.
         if let Some(&(t1, ..)) = first.events.iter().rev().find(|(t1, _, ev, _)| {
             t1 < t && *t1 > start && matches!(ev, Ev::Point(_) | Ev::Woke(..))
         }) {
@@ -7410,8 +6482,6 @@ fn gap_cells(sc: &Scenario, unrecorded: bool) -> (usize, Vec<String>) {
     (cells, broken)
 }
 
-/// [`gap_cells`] over `scenarios`, each on a thread of its own: the cells
-/// counted and those that break the rule.
 fn gap_matrix(scenarios: &[Scenario], unrecorded: bool) -> (usize, Vec<String>) {
     std::thread::scope(|scope| {
         let hs: Vec<_> = scenarios
@@ -7427,35 +6497,6 @@ fn gap_matrix(scenarios: &[Scenario], unrecorded: bool) -> (usize, Vec<String>) 
     })
 }
 
-/// THE END OF A TURN THE LOOP BEFORE READ RUNNING IS JUDGED AS THE FIRST
-/// LOOP JUDGES IT, AT EVERY GAP OF EVERY SCENARIO ('s "a loop
-/// that follows another": 17 of the matrix's 590 gap cells, in six shapes;
-/// and the verifier of 75b03ac6d, RS9-F1). A GAP HANDOFF: the loop before
-/// read a turn running and stopped before the turn ended (an update, a
-/// restart: its books end at a point it never read), and a successor
-/// attaches a second after that point, on the screen as it stands — and so
-/// does a loop that took the streak up from a record stopped before (a
-/// chain: attached a second after the point before, stopped at this one).
-/// A gap cell's successor reads the point the loop before never read as the
-/// end of a turn that ran, its work Claude Code's own done row
-/// ([`Session::turn_end_at_point`], [`TurnEndState::take_gap`]): the
-/// ledger says the turn ran — a turn read running since the point recorded
-/// last ([`crate::supervise::approvals::RULE_TURN_RAN`], a loop's first
-/// busy read among them), or the limit's try taken
-/// ([`crate::supervise::approvals::awaited_try`]). Read as the point
-/// recorded before it, the turn moved no streak and the back-off counted
-/// from the older point: the successor typed up to a rung sooner than the
-/// first loop, into a standing five-hour limit and a standing spend limit
-/// too, and read that turn's done report as the answer of the check judged
-/// before it. Read as a point no read saw run, a FINISHED that names open
-/// work ended the task unchallenged (since the owner's rule of 2026-10-19 a
-/// loop's first point judges its words whoever read it, so that shape no
-/// longer turns on the record), a spend limit's try met by its own turn
-/// counted its next rung from the try (272 s sooner) or kept the try's rung
-/// over its own 90 and 19 minutes of work (20 s sooner, 70 minutes later),
-/// and a person's `/compact` left the limit's track standing (78 minutes
-/// later). NEGATIVE CONTROL: the books with no record of a turn read running
-/// break the rule in each of those shapes the record still decides.
 #[test]
 fn the_end_of_a_turn_the_loop_before_read_running_is_judged_as_the_first_loop_judges_it() {
     let all = scenarios();
@@ -7467,8 +6508,6 @@ fn the_end_of_a_turn_the_loop_before_read_running_is_judged_as_the_first_loop_ju
         broken.len(),
         broken.join("\n")
     );
-    // The control's shapes, each with the rule its follower breaks there
-    // (empty: any).
     let shapes = [
         ("RS8-R3 3 short turns, then a person's short turn", "SOONER"),
         (
@@ -7501,22 +6540,8 @@ fn the_end_of_a_turn_the_loop_before_read_running_is_judged_as_the_first_loop_ju
     }
 }
 
-/// A LIMIT NO RESET ENDS COUNTS ITS FIRST RUNG FROM THE WALL FOR A LOOP THAT
-/// FOLLOWS ('s "a loop that follows another"): at a spend
-/// limit and at a bucket that names no reset, a loop attached between the
-/// wall and the first try tries when the first loop does, 30 minutes after
-/// the wall the loop before waited on (the open `wall-wait@v1` row, the
-/// point that judged it: [`TurnEndState::seed_unnamed_wall`]), not 30
-/// minutes after its own attach — which the matrix's rule allows as later
-/// (a fresh appearance's first rung), and so does not catch. So too where
-/// the wall is a five-hour try's answer: met at once, inside its take
-/// window (the appearance the point at the window's end), or met by the
-/// try's own turn (that turn's end). NEGATIVE CONTROL: a successor that
-/// takes nothing up does not try when the first loop does.
 #[test]
 fn a_limit_no_reset_ends_counts_its_first_rung_from_the_wall_for_a_loop_that_follows() {
-    // (scenario, the first loop's act that is the first try at the wall
-    // that names no reset, when that wall first shows)
     let picked: Vec<(Scenario, usize, i64)> = scenarios()
         .into_iter()
         .filter_map(|sc| match sc.name.as_str() {
@@ -7540,7 +6565,6 @@ fn a_limit_no_reset_ends_counts_its_first_rung_from_the_wall_for_a_loop_that_fol
         std::fs::create_dir_all(&dir).expect("dir");
         let first = run_first(sc, &dir);
         let try0 = first.acts.get(*k).expect("the first try").at;
-        // The wall's first read: the scenario's, or the act before's answer.
         let from = if *k == 0 {
             sc.t0 + shown
         } else {
@@ -7560,8 +6584,6 @@ fn a_limit_no_reset_ends_counts_its_first_rung_from_the_wall_for_a_loop_that_fol
         let mut blank_off = 0;
         for &h in &before {
             for seed in [true, false] {
-                // Run to a minute past the first loop's try: its own act by
-                // then (`last`), or the wait it left standing.
                 let acts: Vec<&Act> = first.acts.iter().filter(|a| a.at < h).collect();
                 let f = run_follower(
                     sc,
@@ -7598,32 +6620,6 @@ fn a_limit_no_reset_ends_counts_its_first_rung_from_the_wall_for_a_loop_that_fol
     }
 }
 
-/// A LOOP THAT FOLLOWS LEAVES A PERSON'S OWN EXCHANGE TO THEM AS THE FIRST
-/// LOOP DOES, EVERY READ STAMPED WITH THE PERSON, as
-/// production's reads carry `human_ms`. At every handoff of every scenario
-/// a person's keystroke reaches ([`Ev::Key`]; in one with none, or one whose
-/// reads carry it already, a stamped read is the read the base matrix makes:
-/// [`a_loop_that_follows_types_as_the_first_loop_at_every_handoff`]'s cells):
-/// a successor that takes up acts typed before the task's end, a person's
-/// exchange or a park under Off read them as carrying the task, and typed
-/// `keep going` into a person's short turn after it where the first loop
-/// left it to them (7 of 4051 cells: Off lifted in a back-off, then a
-/// person's exchange; a person's new short turn after the task's end;
-/// [`crate::supervise::approvals::carry_ended_in`]). And at every gap cell
-/// of the scenarios that hold a person's exchange: a follower whose first
-/// point ends a person's turn the loop before read running read it as a
-/// first point no read saw run, never left to a person, and typed
-/// `keep going` after the back-off ([`TurnEndState::seed_ran_turn`]).
-/// So too where the act's answer was stopped by an Esc that is no act of the
-/// harness's, then a person's short turn ran ([`person_scenarios`]): the
-/// first loop's carry ends at that answer, but a successor attached after it
-/// read the point's record as no end of the carry, and one attached before
-/// it judged the answer as the seeded act's yield and kept the carry, both
-/// typing `keep going` into the person's exchange (10 of 15 cells, the
-/// review's KR-P6-ESC; [`crate::supervise::approvals::carry_ended_in`],
-/// [`TurnEndState::seed_yield`]).
-/// NEGATIVE CONTROL: the same gap cells over books with no record of the
-/// turn read running type sooner.
 #[test]
 fn a_loop_that_follows_leaves_a_persons_exchange_as_the_first_loop_does() {
     let stamped = |sc: Scenario| Scenario {
@@ -7675,7 +6671,6 @@ fn a_loop_that_follows_leaves_a_persons_exchange_as_the_first_loop_does() {
         broken.len(),
         broken.join("\n")
     );
-    // NEGATIVE CONTROL.
     let (_, broken) = gap_matrix(&persons, true);
     assert!(
         !broken.is_empty(),
@@ -7683,18 +6678,6 @@ fn a_loop_that_follows_leaves_a_persons_exchange_as_the_first_loop_does() {
     );
 }
 
-/// AN ACT'S ANSWER NO LOOP READ RUN, STOPPED BY AN ESC THAT IS NO ACT OF THE
-/// HARNESS'S, ENDS THE CARRY FOR A LOOP THAT FOLLOWS (the review's
-/// KR-P6-ESC, [`person_scenarios`]). The loop that typed `keep going`
-/// stopped before any read saw its answer run (its books end at the act),
-/// and a follower attaches a second after the answer's Esc'd point: its
-/// first point is the act's yield, which the books say is still to come
-/// ([`TurnEndState::seed_yield`]), stopped by someone's Esc. The first loop
-/// ends its carry there, so the person's short turn after it is theirs;
-/// the follower must type nothing into it either — nor one on books that
-/// hold the act's answer read running (the gap cell). Mutation-checked:
-/// with the first point's arm keeping the carry the first case types
-/// `keep going` into the person's exchange.
 #[test]
 fn an_acts_answer_no_loop_read_run_stopped_by_an_esc_ends_the_carry_for_a_loop_that_follows() {
     let dir = crate::supervise::test_scratch_path("seed-matrix", "esc-unseen-yield");
@@ -7724,7 +6707,6 @@ fn an_acts_answer_no_loop_read_run_stopped_by_an_esc_ends_the_carry_for_a_loop_t
                 f.log.join("\n  "),
             )
         };
-        // The books end at the act: no read saw its answer run.
         let (v, log) = follow(act + 1, esc + 1);
         assert_eq!(
             v, None,
@@ -7737,16 +6719,6 @@ fn an_acts_answer_no_loop_read_run_stopped_by_an_esc_ends_the_carry_for_a_loop_t
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// THE BOOKS A BUILD THROUGH 0.106.0 WROTE of the first loop's run (`rows`,
-/// its ledger as this build wrote it): no record of a point, a turn read
-/// running, Off standing, a task's end, a Land episode's end, a try aged
-/// out, a person's exchange left to them, a fallback's turn asked or its
-/// relaunch waiting; no mark on an act (the short streak, the job's
-/// challenge, the wall's retries, the limit's try), no `made=` on a model
-/// switch, no `kind=` on a wall's row; and one end of a wall but a
-/// conversation with no task (that build's
-/// `the wall left the screen or the worker worked`). The journal is the
-/// same: every build writes its lines in these words.
 fn books_of_0_106(rows: &[(i64, String)]) -> Vec<(i64, String)> {
     use crate::supervise::approvals::{
         FALLBACK_ASKED, LIMIT_ENDED, RULE_LAND_OVER, RULE_OFF_STOOD, RULE_POINT, RULE_TASK_DONE,
@@ -7795,7 +6767,6 @@ fn books_of_0_106(rows: &[(i64, String)]) -> Vec<(i64, String)> {
                 }
                 ("typed", _) if reason.starts_with("the turn-end policy") => {
                     let mut r = reason.to_string();
-                    // A mark's words hold no `)` of their own.
                     for mark in MARKS {
                         while let Some(a) = r.find(mark) {
                             let from = a + mark.len() - 1;
@@ -7820,14 +6791,11 @@ fn books_of_0_106(rows: &[(i64, String)]) -> Vec<(i64, String)> {
                 }
                 _ => row.clone(),
             };
-            // Nor did that build count the machine's sleep on an act's row.
             Some((*ms, uncounted(&row)))
         })
         .collect()
 }
 
-/// `row` without the machine's count of its sleep an act's row ends on
-/// (`approvals::SLEPT_MS`, `approvals::BOOT`): a row an older build wrote.
 fn uncounted(row: &str) -> String {
     let field = format!(",\"{}\":", crate::supervise::approvals::SLEPT_MS);
     match row.find(&field) {
@@ -7836,9 +6804,6 @@ fn uncounted(row: &str) -> String {
     }
 }
 
-/// The cells of `sc` a loop breaks that follows, at every handoff, one of a
-/// build before the machine's count of its sleep: the first loop's books,
-/// no act's row counting it ([`uncounted`]), and its journal, on `machine`.
 fn uncounted_cells(sc: &Scenario, machine: Machine) -> (usize, Vec<String>) {
     let dir = crate::supervise::test_scratch_path("seed-matrix", "uncounted");
     let _ = std::fs::remove_dir_all(&dir);
@@ -7882,9 +6847,6 @@ fn uncounted_cells(sc: &Scenario, machine: Machine) -> (usize, Vec<String>) {
     (cells, broken)
 }
 
-/// The cells of `sc` a loop breaks that follows one of a build through
-/// 0.106.0 at every handoff: that build's books of the first loop's run
-/// ([`books_of_0_106`]), and its journal (`journal`) or none.
 fn older_cells(sc: &Scenario, i: usize, journal: bool, restored: bool) -> (usize, Vec<String>) {
     let dir = crate::supervise::test_scratch_path(
         "seed-matrix",
@@ -7894,11 +6856,6 @@ fn older_cells(sc: &Scenario, i: usize, journal: bool, restored: bool) -> (usize
     std::fs::create_dir_all(&dir).expect("dir");
     let first = run_first(sc, &dir);
     let rows = books_of_0_106(&first.stamped);
-    // That build's journal, its points' lines in it (`EVENT …`) as every
-    // build writes them, each before what the point decided: read as every
-    // point line ending what was held, a wall's wait lost the short streak
-    // across it and a point inside an act's take window the act it still
-    // awaited (`journaled_hold`, the review of 2026-10-20).
     let said = if journal {
         first.journal.clone()
     } else {
@@ -7939,32 +6896,6 @@ fn older_cells(sc: &Scenario, i: usize, journal: bool, restored: bool) -> (usize
     (cells, broken)
 }
 
-/// A LOOP THAT FOLLOWS ONE OF A BUILD THROUGH 0.106.0 — the update's first
-/// loop — TYPES AS THE FIRST LOOP AT EVERY HANDOFF (
-/// follow-5). That build's books hold no record of a point and no mark on
-/// an act ([`books_of_0_106`]): read alone, the follower backed off its
-/// first point from its own attach on the short ladder's first rung (up to
-/// the ladder's top sooner), retried an overload on its first rung (an
-/// hour sooner), read an unmarked spend limit's try as a usage window's
-/// first (2 hours sooner) and the screen a try was typed at as its answer,
-/// took a person's prompt that met a bucket as the fallback's redraw and
-/// typed into the standing bucket, and read past Off's park (done-6): a Land episode the park ended nudged
-/// where the first loop typed the instruction anew, and a done check a wall
-/// cut before the park ended by the retry's done reply where the first loop
-/// asked the check again. What that build's loop journaled says each: the
-/// waits it held and the streak they name, its retries' rungs, an act's
-/// take window, a task's end, the relaunch's first ask, the challenge, the
-/// park (`PARKED seq=<n> autopilot=off`, `with_parks_journaled`). And so in
-/// a tab a cold restore reopened after the update, from the earlier tab's
-/// books and journal (follow-7). The journal holds that build's point lines
-/// too, each before what the point decided: read as each ending what was
-/// held, the follower typed sooner across a wall's wait (the short streak
-/// lost) and at a point inside an act's take window (an overload's retry
-/// rung lost) — the review of 2026-10-20, 18 cells.
-/// NEGATIVE CONTROL: the same books with no
-/// journal beside them type sooner at the short ladder, an overload's
-/// retries, a spend limit's try and the bucket a person's prompt met, and
-/// read past the park a Land episode's instruction stood under.
 #[test]
 fn a_loop_after_an_older_builds_loop_types_as_that_loop_at_every_handoff() {
     let names = [
@@ -8010,9 +6941,6 @@ fn a_loop_after_an_older_builds_loop_types_as_that_loop_at_every_handoff() {
         broken.len(),
         broken.join("\n")
     );
-    // A cold restore after the update (aterm ended under that build, and
-    // this one reopened its tabs under new session ids): the earlier tab's
-    // books and journal, taken up from beside the new ledger (follow-7).
     let (cells, broken) = run(&picked, true, true);
     assert!(
         broken.is_empty(),
@@ -8020,7 +6948,6 @@ fn a_loop_after_an_older_builds_loop_types_as_that_loop_at_every_handoff() {
         broken.len(),
         broken.join("\n")
     );
-    // The control's shapes, each with the rule its follower breaks there.
     let controls = [
         (names[0], "SOONER"),
         (names[1], "SOONER"),
@@ -8047,16 +6974,6 @@ fn a_loop_after_an_older_builds_loop_types_as_that_loop_at_every_handoff() {
     }
 }
 
-/// [`a_loop_in_a_tab_a_cold_restore_reopened_types_as_the_first_loop_at_every_handoff`]'s
-/// cells for scenario `sc` (the `i`th): a follower attached at each handoff
-/// in a tab a cold restore reopened from tab [`WAS`], on that tab's books
-/// ([`Books::restored`]), the restore's note beside its own ledger or
-/// (`noted` false, the control) none; and the tab's loop STOPPED IN EACH
-/// POINT'S WINDOW ([`Window`]: aterm quit as the host's step took the point)
-/// and the restore reopening it a second on — and as Off lifts, where Off
-/// stood and lifts next ([`First::window_attach`]) — on the books it left
-/// ([`in_window`]; `owed`: without the task's end said in the window, the
-/// control).
 fn restored_cells(sc: &Scenario, i: usize, noted: bool, owed: bool) -> (usize, Vec<String>) {
     let dir =
         crate::supervise::test_scratch_path("seed-matrix", &format!("restored-{i}-{noted}-{owed}"));
@@ -8089,8 +7006,6 @@ fn restored_cells(sc: &Scenario, i: usize, noted: bool, owed: bool) -> (usize, V
         let last = before.last().map(|a| a.at);
         let f = run_follower(sc, &first, on, (h, before.len(), last), None, &dir, true);
         cell(format!("attached at +{}", h - sc.t0), &f);
-        // A loop that follows the restored tab's first (a seamless update, a
-        // new window): the earlier tab's books, then the tab's own.
         if let Some(&h2) = hs.get(i + 1) {
             let second = run_follower(
                 sc,
@@ -8152,23 +7067,6 @@ fn restored_cells(sc: &Scenario, i: usize, noted: bool, owed: bool) -> (usize, V
     (cells, broken)
 }
 
-/// A LOOP IN A TAB A COLD RESTORE REOPENED (follow-7): the
-/// restore reopens each tab under a new session id, so the loop's ledger is
-/// the new tab's and holds nothing; the books of the conversation's loop are
-/// the tab's it was reopened from, which the restore notes beside the new
-/// ledger (`upgrade_drive::note_earlier_tab`). Read from its own ledger
-/// alone, the follower backed off its first point from its attach, started a
-/// limit's ladder over, and typed Land's instruction anew where the loop
-/// before had nudged or spent the landing. Every scenario of the matrix, a
-/// follower at each handoff on the earlier tab's books: typed as the first
-/// loop. And at every point's window, the tab's loop stopped there (aterm
-/// quit as the host's step took the point) and the restore reopening it: as
-/// the first loop too. NEGATIVE CONTROL: the same books with no note beside
-/// the new ledger break the rule in each of those three shapes: the short
-/// ladder and a spend limit's ladder typed sooner, Land's instruction typed
-/// anew; and the window's books without the task's end said in it — its
-/// note owed to the point's act, as `look` owed it until 2026-10-20 — get
-/// a landing said in words the land instruction again as Off lifts.
 #[test]
 fn a_loop_in_a_tab_a_cold_restore_reopened_types_as_the_first_loop_at_every_handoff() {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -8208,7 +7106,6 @@ fn a_loop_in_a_tab_a_cold_restore_reopened_types_as_the_first_loop_at_every_hand
         broken.len(),
         broken.join("\n")
     );
-    // The control's shapes, each with the rule its follower breaks there.
     let shapes = [
         ("RS8-F3 short turns in a row to the ladder's top", "SOONER"),
         ("D spend (met again, the ladder)", "SOONER"),

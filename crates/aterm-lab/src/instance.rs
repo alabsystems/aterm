@@ -1,40 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A private aterm outside any lab's jail, for checking a change on a real
-//! instance (`instance`), and the instances `presence-flap` and
-//! `codex-alab-proof` drive.
-//!
-//! Its [`World`] is one `0700` directory under `/tmp` (a socket path must fit
-//! `sun_path`) holding a scratch `HOME`, an `XDG_CONFIG_HOME` whose
-//! `aterm.toml` turns the automatic lanes and the audible bell off
-//! ([`bell_off`]), and the `XDG_RUNTIME_DIR` its control socket and token
-//! live in. Cache, data, state and temporary roots are private directories
-//! under its HOME, including after an explicit rehome. Nothing of the caller's environment
-//! reaches it, and the control socket is its only door: every `ctl` call
-//! names that socket. It ends by its process group (`SIGTERM`, then
-//! `SIGKILL`), never by name, and it holds a lifeline (a headless aterm reads
-//! it, a windowed one's [`keeper_main`] does), so a launcher killed any way at
-//! all takes it along. The world is removed when it drops.
-//!
-//! `instance [--window] [--band app|agent] [--columns N] [--lines N]
-//! [--font-px N] [--scale N] [--toml LINE]… [--pre VERB]… [--image PNG]
-//! [--post VERB]… [--env NAME=VALUE]… [--keep] [-- PROGRAM ARGS…]` starts one headless (windowed
-//! with `--window`) and prints its socket and band; drive it with
-//! `aterm ctl --sock <sock> <verb>` (`image`, `text`, `send --stdin`,
-//! `metrics percentiles`, …) until this command ends
-//! (Ctrl-C or `SIGTERM`). A headless instance never presents (its pixels are
-//! offscreen captures), so what only a present publishes (`present_*`,
-//! `gpu_time_*`, `passes_last`) needs `--window`. `--toml` lines head its
-//! `aterm.toml` (top-level keys, such as `theme = "Aterm Day"`); each `--pre`
-//! verb runs once it is ready (`open app settings /themes`), each `--post`
-//! after the frame, and each reply is printed. With `--image`, it captures
-//! one frame once the band (no row still in its reveal's grace) and then
-//! the screen have settled, writes it there and ends. A headless instance
-//! runs in aterm.app's scheduling band by default (`--band app`: its own
-//! launchd job, coalition and role `UI_FOCAL`, [`crate::band`]), so what it
-//! measures is what the owner's app meets; `--band agent` keeps it a child of
-//! this command, inside the caller's coalition.
+//! A private aterm outside any lab's jail, for checking a change on a real instance (`instance`), and the instances `presence-flap` and `codex-alab-proof` drive.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -46,32 +13,14 @@ use crate::paths::{from_caller, paths};
 use crate::stop::{self, Stopped};
 use crate::{Fail, LAB, Res};
 
-/// The automatic lanes off: no update check, no package loop, no agent
-/// priming or supervision, the machine's own preferences left alone.
+/// The automatic lanes off: no update check, no package loop, no agent priming or supervision, the machine's own preferences left alone.
 pub const CONFIG_OFF: &str = "agents_auto_prime = false\n\
                               [update]\nenabled = false\nauto_apply = false\n\
                               [packages]\nenabled = false\n\
                               [harness]\nenabled = false\n\
                               [machine]\nuniversal_control = \"leave\"\n";
 
-/// `config` with the audible bell off (`bell_sound = false` at its head)
-/// unless the document sets a root `bell_sound` itself (`--toml 'bell_sound =
-/// true'`, which then stands alone: a key twice is invalid TOML, and aterm
-/// reads none of such a file). A document that does not parse is returned as
-/// it is: aterm reads none of it either way.
-///
-/// A lab instance is never the owner's terminal, yet the BEL its programs
-/// ring (zsh on a completion with no match, readline at the end of its
-/// history, vim's Escape in normal mode) played the owner's alert sound
-/// through the Mac's speakers with nothing on screen to say why. A headless
-/// aterm built since 2026-10-20 never beeps (`App::on_bell`), but a windowed
-/// one does (`instance --window`, `meta-keys --window`, `presence-flap
-/// --window`), and so does a headless build from before that gate that
-/// `--aterm` names: measured from systemsoundserverd's log on 2026-10-20, a
-/// windowed `instance --window -- /bin/zsh -f` driven through Ctrl-R and
-/// Escape played two. `bell_sound` has been a key since 2026-08-09, so the
-/// line silences every build a lab runs; the visual bell and the `bell`
-/// event stay.
+/// `config` with the audible bell off (`bell_sound = false` at its head) unless the document sets a root `bell_sound` itself (`--toml 'bell_sound = true'`, which then stands alone: a key twice is invalid TOML, and aterm reads none of such a file).
 #[must_use]
 pub fn bell_off(config: &str) -> String {
     match aterm_toml::from_str::<aterm_toml::Value>(config) {
@@ -80,8 +29,7 @@ pub fn bell_off(config: &str) -> String {
     }
 }
 
-/// How long an instance may take to listen: a hang detector, never a budget
-/// (a debug build on a loaded machine can take well past ten seconds).
+/// How long an instance may take to listen: a hang detector, never a budget (a debug build on a loaded machine can take well past ten seconds).
 pub const BOOT: Duration = Duration::from_secs(60);
 
 /// The scratch world an instance runs in.
@@ -97,18 +45,13 @@ pub struct World {
 }
 
 impl World {
-    /// Lay out a fresh world whose `aterm.toml` is `config` with the audible
-    /// bell off ([`bell_off`]).
-    ///
+    /// Lay out a fresh world whose `aterm.toml` is `config` with the audible bell off ([`bell_off`]).
     /// # Errors
     /// A directory or file could not be made.
     pub fn new(config: &str) -> Result<World, String> {
         let dir = crate::sys::make_temp_dir("/tmp/at.XXXXXX")
             .map_err(|e| format!("cannot make a scratch directory under /tmp: {e}"))?;
         let dir = PathBuf::from(dir);
-        // This is the root just made exclusively above, not an arbitrary store
-        // supplied by a caller. Publish its physical spelling before deriving
-        // HOME and state paths: the hosted store refuses linked ancestors.
         let dir = std::fs::canonicalize(&dir).map_err(|e| {
             let _ = std::fs::remove_dir(&dir);
             format!(
@@ -132,7 +75,6 @@ impl World {
             }
             std::fs::write(w.cfg.join("aterm/aterm.toml"), bell_off(config))?;
             private_home_roots(&w.home)?;
-            // A two-column `/bin/sh` prompt, so typed text never wraps on a long host name.
             std::fs::write(w.home.join(".profile"), "PS1='$ '\n")?;
             std::fs::write(w.home.join(".shrc"), "PS1='$ '\n")
         })();
@@ -145,10 +87,7 @@ impl World {
         self.keep = true;
     }
 
-    /// Put its `HOME` at a new `home` (made `0700`, with the world's shell
-    /// profile): a scratch volume's folder, so what the instance measures and
-    /// removes is that volume's (`disk-lane`, `instance --home`).
-    ///
+    /// Put its `HOME` at a new `home` (made `0700`, with the world's shell profile): a scratch volume's folder, so what the instance measures and removes is that volume's (`disk-lane`, `instance --home`).
     /// # Errors
     /// The folder already exists, or it or its profile could not be made.
     pub fn rehome(&mut self, home: &Path) -> Result<(), String> {
@@ -192,8 +131,6 @@ impl World {
             ("TEMP".into(), s(&self.home.join("tmp"))),
             ("HISTFILE".into(), "/dev/null".into()),
             ("xcrun_nocache".into(), "1".into()),
-            // Its hosted loops recorded to harness tapes, as a lab's are
-            // (`crate::tape`).
             crate::tape::seam(),
         ]
     }
@@ -216,7 +153,6 @@ fn private_home_roots(home: &Path) -> std::io::Result<()> {
 }
 
 /// Keep the platform's existing state location explicit; disk and proof
-/// readers already name this same root under the private HOME.
 fn private_state_home(home: &Path) -> PathBuf {
     #[cfg(target_os = "macos")]
     return home.join("Library/Application Support/aterm");
@@ -249,13 +185,12 @@ pub struct Launch {
 }
 
 /// An instance's process: this lab's child (the agent band), or its own
-/// launchd job (the app band).
 enum Proc {
     Child(Child),
     Job(Job),
 }
 
-/// A running private instance. Dropping it stops it.
+/// A running private instance.
 pub struct Instance {
     child: Proc,
     lifeline: Option<aterm_uds::lifeline::Lifeline>,
@@ -306,8 +241,6 @@ impl Reply {
 }
 
 /// A terminal's explicit selector from the instance-local roster. Native tabs
-/// can own the front while their underlying shell remains in this registry.
-/// An exited command remains readable and can still answer `ready` or `image`.
 fn terminal_selector(roster: &str) -> Option<String> {
     roster
         .lines()
@@ -318,13 +251,13 @@ fn terminal_selector(roster: &str) -> Option<String> {
             if crate::stub::first_sid(sid) != Some(sid) {
                 return None;
             }
-            words.next()?; // parent
+            words.next()?;
             let live = match words.next()? {
                 "alive" | "spawning" => true,
                 "exited" => false,
                 _ => return None,
             };
-            words.next()?; // title, which can itself look like a placement field
+            words.next()?;
             let focused = words.clone().any(|word| word == "wfocus=1");
             let active = words.any(|word| word == "active=1");
             Some(((live, focused, active), sid))
@@ -353,7 +286,6 @@ fn terminal_request(mut ctl: impl FnMut(&[&str]) -> Reply, args: &[&str]) -> Rep
 
 impl Instance {
     /// Start `l` in `world`, its output in `<world>/aterm.log`.
-    ///
     /// # Errors
     /// The log, the lifeline or the process could not be made.
     pub fn start(world: &World, l: Launch) -> Result<Instance, String> {
@@ -363,13 +295,8 @@ impl Instance {
         let err = out
             .try_clone()
             .map_err(|e| format!("cannot share the instance log: {e}"))?;
-        // The lifeline: a headless aterm reads it itself; a windowed one has
-        // no such flag, so the lab's keeper holds it and ends the window when
-        // it reads end of file.
         let (lifeline, far) = aterm_uds::lifeline::Lifeline::open(&world.dir)
             .map_err(|e| format!("the lifeline: {e}"))?;
-        // The command line, program first: the keeper (windowed), then the
-        // sandbox, then the aterm and its flags.
         let mut line: Vec<String> = Vec::new();
         if !l.headless {
             let exe = paths().exe.to_string_lossy().into_owned();
@@ -417,14 +344,9 @@ impl Instance {
         })
     }
 
-    /// [`Instance::start`] in `band`: [`Band::App`] starts the headless `l` as
-    /// its own launchd job ([`Job::start`]), so it heads a coalition of its
-    /// own at role `UI_FOCAL`, as aterm.app does; its lifeline is the job's
-    /// FIFO, held here.
-    ///
+    /// [`Instance::start`] in `band`: [`Band::App`] starts the headless `l` as its own launchd job ([`Job::start`]), so it heads a coalition of its own at role `UI_FOCAL`, as aterm.app does; its lifeline is the job's FIFO, held here.
     /// # Errors
-    /// As [`Instance::start`]; a windowed or sandboxed `l` in the app band; the
-    /// job could not start.
+    /// As [`Instance::start`]; a windowed or sandboxed `l` in the app band; the job could not start.
     pub fn start_in(world: &World, l: Launch, band: Band) -> Result<Instance, String> {
         if band == Band::Agent {
             return Instance::start(world, l);
@@ -458,7 +380,6 @@ impl Instance {
     }
 
     /// Wait until the control socket answers `version` (at most `limit`).
-    ///
     /// # Errors
     /// Interrupted, the instance exited first, or it never answered (its log tail says why).
     pub fn await_socket(&mut self, limit: Duration) -> Result<(), Fail> {
@@ -485,8 +406,7 @@ impl Instance {
         }
     }
 
-    /// `aterm ctl --sock <its socket> --timeout 90 <args>`, its environment
-    /// the world's, never the caller's.
+    /// `aterm ctl --sock <its socket> --timeout 90 <args>`, its environment the world's, never the caller's.
     #[must_use]
     pub fn ctl(&self, args: &[&str]) -> Reply {
         let sock = self.sock.to_string_lossy();
@@ -549,9 +469,7 @@ impl Instance {
         }
     }
 
-    /// One held control connection to it, for a schedule whose requests are
-    /// milliseconds apart (a client process per request costs more than that).
-    ///
+    /// One held control connection to it, for a schedule whose requests are milliseconds apart (a client process per request costs more than that).
     /// # Errors
     /// The socket did not answer.
     pub fn connect(&self) -> Result<aterm_agent::RelayClient<aterm_uds::CtlStream>, String> {
@@ -583,12 +501,7 @@ impl Instance {
         lines[lines.len().saturating_sub(n)..].join("\n")
     }
 
-    /// End it: cut its lifeline, then end an app-band job by its owned
-    /// launchd label after a cooperative grace. launchd reaps that process,
-    /// so its cached pid is only a liveness observation, never signal authority.
-    /// A child instance keeps its `SIGTERM`/`SIGKILL` group escalation and
-    /// handle-based kill/reap; its `setsid` group holds the windowed keeper
-    /// and its aterm.
+    /// End it: cut its lifeline, then end an app-band job by its owned launchd label after a cooperative grace. launchd reaps that process, so its cached pid is only a liveness observation, never signal authority.
     pub fn stop(&mut self) {
         if let Some(l) = self.lifeline.take() {
             l.cut();
@@ -599,8 +512,6 @@ impl Instance {
             while Instant::now() < end && j.running() {
                 std::thread::sleep(Duration::from_millis(50));
             }
-            // The label belongs to this world's loaded job. launchd may
-            // already have reaped its pid, which must never name a signal target.
             j.remove();
             return;
         }
@@ -619,7 +530,6 @@ impl Instance {
                 let _ = c.kill();
                 let _ = c.wait();
             }
-            // Removed by its label, so launchd never starts it again.
             Proc::Job(j) => j.remove(),
         }
     }
@@ -632,7 +542,6 @@ impl Drop for Instance {
 }
 
 /// The value of `--flag N` in `args`, removed from them.
-///
 /// # Errors
 /// The flag has no value.
 pub fn take_value(args: &mut Vec<String>, flag: &str) -> Result<Option<String>, Fail> {
@@ -648,7 +557,6 @@ pub fn take_value(args: &mut Vec<String>, flag: &str) -> Result<Option<String>, 
 }
 
 /// Every value of a repeatable `flag`, in order; removed from `args`.
-///
 /// # Errors
 /// An occurrence with no value.
 pub fn take_values(args: &mut Vec<String>, flag: &str) -> Result<Vec<String>, Fail> {
@@ -667,7 +575,6 @@ pub fn take_flag(args: &mut Vec<String>, flag: &str) -> bool {
 }
 
 /// A positive count, or the usage error naming the flag.
-///
 /// # Errors
 /// Not a positive number.
 pub fn count(flag: &str, v: &str) -> Result<u32, Fail> {
@@ -677,13 +584,9 @@ pub fn count(flag: &str, v: &str) -> Result<u32, Fail> {
         .ok_or_else(|| Fail::usage(format!("{flag} takes a positive count, not '{v}'")))
 }
 
-/// The aterm to drive: the `--aterm` value given, else the lab's own pick
-/// ([`crate::paths::Paths::need_aterm`]). Read after every argument is
-/// parsed, so a usage error is never reported as a missing build.
-///
+/// The aterm to drive: the `--aterm` value given, else the lab's own pick ([`crate::paths::Paths::need_aterm`]).
 /// # Errors
-/// Why there is none to drive: nothing was found, or the one given is not
-/// executable (the verbs' NOT RUN, never a usage error).
+/// Why there is none to drive: nothing was found, or the one given is not executable (the verbs' NOT RUN, never a usage error).
 pub fn resolve_aterm(given: Option<String>) -> Result<PathBuf, String> {
     if let Some(a) = given {
         let a = from_caller(&a);
@@ -695,9 +598,7 @@ pub fn resolve_aterm(given: Option<String>) -> Result<PathBuf, String> {
     paths().need_aterm().map(Path::to_path_buf)
 }
 
-/// `instance`: a private aterm, headless unless `--window`, held until this
-/// command ends.
-///
+/// `instance`: a private aterm, headless unless `--window`, held until this command ends.
 /// # Errors
 /// Usage, or the instance could not start or answer.
 pub fn cmd_instance(args: &[String]) -> Res {
@@ -718,8 +619,6 @@ pub fn cmd_instance(args: &[String]) -> Res {
     let image = take_value(&mut a, "--image")?.map(|p| from_caller(&p));
     let toml = take_values(&mut a, "--toml")?;
     let toml_after = take_values(&mut a, "--toml-after")?;
-    // Use the same restricted seam grammar as lab up. In particular, this
-    // cannot replace HOME or the private state root to reach the owner's Mac.
     let extra_env =
         crate::lab::instance_env(&take_values(&mut a, "--env")?.join(" ")).map_err(Fail::usage)?;
     let home = take_value(&mut a, "--home")?.map(|p| from_caller(&p));
@@ -799,9 +698,6 @@ pub fn cmd_instance(args: &[String]) -> Res {
     }
     run_verbs(&inst, &pre);
     if let Some(dest) = image {
-        // The band settles — every row a `--pre` verb raised past its
-        // reveal's grace — and then the screen (half a second without
-        // output) before the frame is taken.
         await_band(&inst)?;
         let _ = terminal_request(
             |args| inst.ctl(args),
@@ -828,7 +724,6 @@ pub fn cmd_instance(args: &[String]) -> Res {
         crate::sys::darwin_role(inst.pid).map_or_else(|_| "?".to_string(), |r| r.to_string());
     let main_pri = crate::sys::main_thread_priority(inst.pid)
         .map_or_else(|| "?".to_string(), |p| p.to_string());
-    // What the launch paged in by `ready`, of its copy's pages, all out of the cache before.
     let pages = cold.as_ref().map_or_else(String::new, |c| {
         crate::sys::resident_pages(&c.root).map_or_else(
             |e| format!(" pages=cold resident_at_ready=? ({e})"),
@@ -873,20 +768,10 @@ struct ColdCopy {
 }
 
 /// `--pages cold`: `aterm` copied into the world (its whole bundle when it is a bundle's
-/// executable), run once with `--version`, then every page of the copy dropped from the page
-/// cache ([`crate::sys::evict_pages`]) and checked gone, so the launch pays aterm's own page-ins
-/// and nothing else. The run is the proof the copy ran from its file: macOS scans a new file at
-/// its first exec (0.5 s for a 66 MB build, more for the universal app) and keeps the verdict,
-/// which no write or rename has voided by the launch. The dyld shared cache and the system's
-/// own files stay as warm as they were (r6 sweep #19, `docs/measured/cold-pages-2026-10-20.md`).
-///
 /// # Errors
 /// The copy, its run or its eviction failed, or a page of it stayed resident (or it had none,
 /// which proves nothing). A copy whose run gave no proof keeps the world (removing a file
-/// macOS may still be assessing strands every exec waiting on that assessment).
 fn cold_copy(world: &mut World, aterm: &Path) -> Result<ColdCopy, Fail> {
-    // The file a link names, not the link: a copied link (`~/.local/bin/aterm`) would launch
-    // the original with its pages warm, and hold no page of its own to check.
     let aterm = std::fs::canonicalize(aterm)
         .map_err(|e| format!("instance: cannot resolve {}: {e}", aterm.display()))?;
     let aterm = aterm.as_path();
@@ -960,8 +845,7 @@ fn copy_tree(from: &Path, to: &Path) -> std::io::Result<()> {
     }
 }
 
-/// [`CONFIG_OFF`] headed by `top`: top-level keys must come before the
-/// first table, or TOML files them under it.
+/// [`CONFIG_OFF`] headed by `top`: top-level keys must come before the first table, or TOML files them under it.
 #[must_use]
 pub fn config_with(top: &[String]) -> String {
     let mut config = String::new();
@@ -973,10 +857,7 @@ pub fn config_with(top: &[String]) -> String {
     config
 }
 
-/// `config` (a [`config_with`]) with the harness host ON when `harness` (its
-/// disk watch runs only while the host does; supervision still reaches no
-/// agent, none being primed) and each of `after` appended after its tables
-/// (`[disk]` lines, `instance --toml-after`).
+/// `config` (a [`config_with`]) with the harness host ON when `harness` (its disk watch runs only while the host does; supervision still reaches no agent, none being primed) and each of `after` appended after its tables (`[disk]` lines, `instance --toml-after`).
 #[must_use]
 pub fn config_after(config: &str, harness: bool, after: &[String]) -> String {
     let mut out = if harness {
@@ -995,19 +876,12 @@ pub fn config_after(config: &str, harness: bool, after: &[String]) -> String {
 }
 
 /// Whether a `messages live` reply names a row still in its reveal's grace
-/// (`reveal=pending`: a standing ask's two seconds), not yet on the band.
 fn reveal_pending(rows: &str) -> bool {
     rows.lines()
         .any(|row| row.starts_with("message ") && row.split(' ').any(|w| w == "reveal=pending"))
 }
 
 /// THE BAND SETTLED: no live row still in its reveal's grace, read through
-/// `messages live` (the review of the login carry, 2026-10-20: `--pre
-/// 'login-notice si' --image` waited half a second of quiet and imaged a
-/// band with no ask on it, the ask's two-second grace still running). A
-/// one-minute hang detector, never a budget; an instance whose `messages`
-/// does not answer has no band to wait for.
-///
 /// # Errors
 /// A row still pending after a minute, or the run interrupted.
 fn await_band(inst: &Instance) -> Result<(), Fail> {
@@ -1030,7 +904,6 @@ fn await_band(inst: &Instance) -> Result<(), Fail> {
 }
 
 /// Run each control verb (split on whitespace: a quoted multi-word value is
-/// not one word) against `inst`, printing its reply.
 fn run_verbs(inst: &Instance, verbs: &[String]) {
     for verb in verbs {
         let words: Vec<&str> = verb.split_whitespace().collect();
@@ -1055,15 +928,7 @@ enum KeeperEnd {
     Signal(i32),
 }
 
-/// The keeper of a windowed instance (`aterm-lab keeper -- <aterm> ARGS…`):
-/// it starts the aterm and holds the lifeline on its stdin, which a windowed
-/// aterm cannot read itself. When the lifeline is cut, or `SIGTERM`, `SIGINT`
-/// or `SIGHUP` reaches the keeper, it ends the aterm by pid (`SIGTERM`, then
-/// `SIGKILL` after 5 s), so a launcher ended any way at all takes its window
-/// along. It ends with the aterm.
-///
-/// The lifeline is waited on by a blocking read on a thread of its own: on
-/// macOS `poll(2)` never reports a FIFO whose last writer closed.
+/// The keeper of a windowed instance (`aterm-lab keeper -- <aterm> ARGS…`): it starts the aterm and holds the lifeline on its stdin, which a windowed aterm cannot read itself.
 #[must_use]
 pub fn keeper_main(args: &[String]) -> i32 {
     let Some((prog, rest)) = args
@@ -1081,9 +946,7 @@ pub fn keeper_main(args: &[String]) -> i32 {
             return 2;
         }
     };
-    // A copy of the held end leaked into this process would keep the cut from ever coming.
     let _ = aterm_uds::lifeline::close_inherited_copies(&lifeline);
-    // Caught before the aterm starts, so no signal can end the keeper and orphan it.
     let signals =
         match crate::sys::SignalPipe::install(&[libc::SIGTERM, libc::SIGINT, libc::SIGHUP]) {
             Ok(s) => s,
@@ -1265,9 +1128,6 @@ mod cold_copy_tests {
     use std::os::unix::fs::PermissionsExt as _;
 
     /// `--pages cold` given a link (`~/.local/bin/aterm`) copies the file it names, which then
-    /// holds every page out of the cache; a copied link would launch the original warm and hold
-    /// no page of its own. A script stands in for aterm: it prints the `aterm ` line the copy's
-    /// run must show.
     #[test]
     fn a_cold_copy_of_a_link_is_the_file_it_names_with_no_page_resident() {
         let world_source = World::new(CONFIG_OFF).expect("fixture world");
@@ -1366,8 +1226,6 @@ mod band_tests {
     use super::reveal_pending;
 
     /// A row in its reveal's grace holds the frame; none, or only revealed
-    /// rows, let it go. NEGATIVE CONTROL: the words in a title or a detail
-    /// are no marker.
     #[test]
     fn a_row_in_its_grace_holds_the_frame_and_nothing_else_does() {
         let row = |tail: &str| {
@@ -1390,7 +1248,6 @@ mod bell_off_tests {
     use super::*;
 
     /// The root `bell_sound` of an `aterm.toml` text, as aterm's own TOML
-    /// parser reads it (`None`: no such key, or no document at all).
     fn root_bell(text: &str) -> Option<bool> {
         aterm_toml::from_str::<aterm_toml::Value>(text)
             .ok()?
@@ -1399,9 +1256,6 @@ mod bell_off_tests {
     }
 
     /// Every lab world's `aterm.toml` starts with the audible bell off, and
-    /// keeps the lanes-off tables it was given. Non-vacuous: the base the
-    /// world is given sets no `bell_sound` (so aterm's default, on, would
-    /// rule), so the `false` read back is the world's writer at work.
     #[test]
     fn a_lab_world_starts_with_the_audible_bell_off() {
         assert_eq!(
@@ -1423,9 +1277,6 @@ mod bell_off_tests {
     }
 
     /// A `bell_sound` the caller sets at the root (`instance --toml`) is the
-    /// one the file holds, once. Negative control: the same caller line with
-    /// the bell line written in front regardless is two keys, which aterm's
-    /// parser refuses, so aterm would read none of that file.
     #[test]
     fn a_bell_the_caller_sets_stands_alone() {
         let asked = config_with(&["bell_sound = true".to_string()]);
@@ -1439,8 +1290,6 @@ mod bell_off_tests {
     }
 
     /// Only the root key is the caller's choice: a `bell_sound` inside a
-    /// table is some other key, and the root one still goes in, ahead of
-    /// every table, where TOML files it at the root.
     #[test]
     fn a_bell_sound_inside_a_table_is_not_the_root_key() {
         let text = bell_off("[x]\nbell_sound = true\n");

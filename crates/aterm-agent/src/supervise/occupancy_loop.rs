@@ -90,7 +90,7 @@ pub(super) const CARRY_GAP_MS: i64 = 5 * 60_000;
 
 /// How often the door asks the board at most: once a board look (the facts board is taken on the
 /// window's 60 s disk look), on the clock's milliseconds.
-pub(super) const ASK_EVERY_MS: i64 = 60_000;
+pub(super) const ASK_EVERY_MS: i64 = super::super::occupancy::reading::LOOK_EVERY_MS;
 
 /// The loop's hold: the clock, the origin of its milliseconds, what the ledger left to carry,
 /// whether the open hold is booked, and the door's own state.
@@ -379,7 +379,7 @@ impl<C: Ctl> Session<'_, C> {
         }
         self.hold.door.books.hold(since_ms);
         let reading = if rules::wants_reading(Some(hold), &self.hold.door.books, now_ms) {
-            self.occupancy_reading(now_ms)
+            self.occupancy_reading(now, now_ms)
         } else {
             OccupancyReading::default()
         };
@@ -392,19 +392,28 @@ impl<C: Ctl> Session<'_, C> {
 
     /// The board's reading for this break: the one asked within the last [`ASK_EVERY_MS`], else
     /// the host asked once more (the empty reading from a loop with no host).
-    fn occupancy_reading(&mut self, now_ms: i64) -> OccupancyReading {
-        if let Some((asked_ms, reading)) = &self.hold.door.asked
+    /// Re-age it at this break's existing clock pair, so retaining a fresh
+    /// producer verdict cannot extend its two-look lifetime. No clock is read here.
+    fn occupancy_reading(&mut self, now: Instant, now_ms: i64) -> OccupancyReading {
+        let reading = if let Some((asked_ms, reading)) = &self.hold.door.asked
             && (0..ASK_EVERY_MS).contains(&now_ms.saturating_sub(*asked_ms))
         {
-            return reading.clone();
-        }
-        let reading = self
-            .stall_host
-            .as_ref()
-            .map(|host| host.occupancy())
-            .unwrap_or_default();
-        self.hold.door.asked = Some((now_ms, reading.clone()));
-        reading
+            reading.clone()
+        } else {
+            let reading = self
+                .stall_host
+                .as_ref()
+                .map(|host| host.occupancy())
+                .unwrap_or_default();
+            self.hold.door.asked = Some((now_ms, reading.clone()));
+            reading
+        };
+        let wall_now = self.clock_marks.map(|(marked_at, wall_ms)| {
+            let elapsed = now.checked_duration_since(marked_at).unwrap_or_default();
+            let elapsed_ms = i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX);
+            wall_ms.saturating_add(elapsed_ms)
+        });
+        reading.aged_at(wall_now)
     }
 
     /// THE GUARDS, FROM WHAT THE LOOP HOLDS (F1): nothing is read for them. `now` is the break

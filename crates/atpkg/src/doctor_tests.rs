@@ -3254,6 +3254,58 @@ fn the_exec_root_claim_counts_what_cannot_run_and_what_may_not() {
     }
 }
 
+/// The installed targo's word on a `[trust]` workspace is read from its refusal, and a
+/// targo that never answers (one macOS's program check holds at its start) is a failed
+/// probe inside the bound, never a doctor that waits with it.
+#[cfg(unix)]
+#[test]
+fn the_workspace_policy_probe_reads_targos_refusal_and_never_waits_past_its_bound() {
+    let l = layout("wsprobe");
+    install(&l, "trust", 8589);
+    let targo = l.build_dir("trust", 8589).join("bin").join("targo");
+    let workspace = synthetic_home("wsprobe");
+    std::fs::write(
+        workspace.join("Cargo.toml"),
+        "[workspace]\n\n[trust]\ncompiler_timeout_secs = 1\n",
+    )
+    .unwrap();
+    let write = |script: &str| {
+        std::fs::write(&targo, script).unwrap();
+        std::fs::set_permissions(&targo, std::fs::Permissions::from_mode(0o755)).unwrap();
+    };
+    let said = || {
+        probe_workspace_policy(&l, &workspace)
+            .expect("a workspace with a [trust] table is probed")
+            .policy
+    };
+    write(
+        "#!/bin/sh\necho 'error: `[trust]` key `compiler_timeout_secs` was retired on \
+         2026-10-11: use `[trust.limits]`' >&2\nexit 101\n",
+    );
+    // A new file's first exec is macOS's to assess, unclocked, before the probe's bound.
+    aterm_spec::wait::first_exec(&targo, &[]);
+    assert_eq!(
+        said(),
+        WorkspacePolicy::RetiredKey {
+            key: "compiler_timeout_secs".into(),
+            replacement: "retired on 2026-10-11: use `[trust.limits]`".into(),
+        }
+    );
+    let _probes = ShorterProbes::of(std::time::Duration::from_millis(250));
+    let started = std::time::Instant::now();
+    write("#!/bin/sh\nexec sleep 120\n");
+    let policy = said();
+    assert!(
+        matches!(&policy, WorkspacePolicy::ProbeFailed { why } if why.contains("did not start or answer")),
+        "{policy:?}"
+    );
+    assert!(
+        started.elapsed() < aterm_spec::wait::MUST_HAPPEN,
+        "the probe was cut off by its own bound, not targo's two minutes: {:?}",
+        started.elapsed()
+    );
+}
+
 #[test]
 fn the_trust_table_is_found_on_the_nearest_ancestor_manifest() {
     let root = synthetic_home("wstable");

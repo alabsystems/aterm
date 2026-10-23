@@ -259,6 +259,7 @@ fn claude_signs_in_only_through_accounts_v2s_renewal() {
         limited_until: None,
         served_at: None,
         renewed_at: None,
+        next_sign_in: None,
     });
     let runner = FakeRunner::quiet();
     assert_eq!(
@@ -299,6 +300,7 @@ fn listed_view(renews: bool, refused: Option<&str>) -> ClaudeAccounts {
         limited_until: None,
         served_at: None,
         renewed_at: None,
+        next_sign_in: None,
     }
 }
 
@@ -414,4 +416,46 @@ fn claude_under_a_home_of_its_own_is_never_signed_in_here() {
         "{done:?}"
     );
     assert!(runner.calls().is_empty());
+}
+
+#[test]
+fn claude_limited_with_next_sign_in_renews_the_successor_account() {
+    let b = machine(&["claude"]);
+    let store = Store::at(&b.state);
+    let shim = b.pkg.agents_dir().join("claude");
+    let rig = Rig::new(&[]);
+    let mut f = facts(&CLAUDE, shim);
+    f.accounts = Some(ClaudeAccounts {
+        label: "m27-3".into(),
+        listed: true,
+        refused: None,
+        renews: true,
+        login: None,
+        made: true,
+        state: Some("ok"),
+        renew_by: None,
+        limited_until: Some(1_800_086_400),
+        served_at: None,
+        renewed_at: None,
+        next_sign_in: Some("m27".into()),
+    });
+    let runner = FakeRunner::quiet();
+    assert_eq!(
+        rig.sign_in(
+            &runner,
+            &store,
+            &f,
+            &row(&CLAUDE, State::Due(1_800_086_400)),
+            &[]
+        ),
+        Done::SignedIn(None)
+    );
+    assert_eq!(
+        runner
+            .calls()
+            .iter()
+            .map(|c| c.args.clone())
+            .collect::<Vec<_>>(),
+        [vec!["harness", "accounts", "renew", "m27"]]
+    );
 }

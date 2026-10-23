@@ -2,45 +2,6 @@
 // Copyright 2026 Andrew Yates
 
 //! Writing a machine's secrets to disk (docs/DESIGN-secrets-2026-10-20.md §7, Sync).
-//!
-//! A file name lands at `~/.secrets/<name>`, a `~/a/b` name at that path under home. Every
-//! write is atomic at 0600; `~/.secrets` is narrowed to 0700. The [`Manifest`] remembers what
-//! the vault wrote, so a file someone else wrote or edited is moved to
-//! `~/.secrets/.replaced/<flattened name>.<unix secs>` before it is overwritten, and a file
-//! is removed only while it still holds exactly what the vault wrote. Reports carry names,
-//! never values.
-//!
-//! A symlink at a target is never followed: it is moved aside (the link itself, not what it
-//! names) and a regular file takes its place. Nor is a symlinked directory written through:
-//! an entry behind one (`~/.secrets` itself, or a directory between home and a `~/a/b/c`
-//! target), or behind aterm's own key directory spelled another way, fails, naming it, and
-//! the rest proceed. A target equal to the new value is
-//! adopted silently, its mode narrowed to 0600 if it lets other users in. A file the vault
-//! did not write stays the machine's own when adopted: it is kept out of the manifest, so
-//! the vault never removes it, and a later value moves it aside like any file of its own.
-//!
-//! An ` if-absent` entry ([`Entry::if_absent`]) fills a gap: where it finds a file this
-//! vault never wrote, or one lands there before its write (a gap is filled by a link that
-//! refuses a taken name, never a rename over one), it leaves the file alone and out of the
-//! manifest, so no later sync replaces or removes it; one that lands while a pass runs fails
-//! that pass, so the next judges its anchors again. A file the vault wrote there itself
-//! takes each new value while it still holds what the vault wrote; once anything else
-//! changes it (git writes its config, gh its hosts.yml, the person their own) or a link or
-//! a directory takes its place, it is the machine's own: left as it is, nothing moved
-//! aside, and out of the manifest from then on. Deleted, it is a gap again.
-//!
-//! An anchored ` if-absent` entry ([`Entry::anchor`]) is the vault's on a machine only while
-//! its anchor is: the anchor's file holds what the vault wrote, or is a gap this pass fills
-//! ([`standings`]). Its gap is filled only then, and a file the vault wrote for it before
-//! takes new values only then; once the anchor is the machine's own, that file is taken back
-//! as a dropped entry's is (removed while it still holds what the vault wrote), so a file the
-//! vault filled beside the machine's own before the entry was anchored is not kept there. So
-//! a set of files that belong together (a release key and the profile naming it) lands whole
-//! on a machine with none of them and never stays beside one of the machine's own.
-//!
-//! Whether two names are one file is decided by (device, inode), never by spelling: `Token`
-//! and `token` are one file on a case-insensitive volume (APFS's default), where the second
-//! name to land on it is refused, and two files on a case-sensitive one.
 
 use crate::fsx::{self, Kind};
 use crate::text::{self, Entry};
@@ -65,15 +26,9 @@ pub struct Report {
     pub unchanged: Vec<String>,
     /// Moved aside before being overwritten: name and where it went.
     pub moved_aside: Vec<(String, PathBuf)>,
-    /// Removed because the vault dropped them, or because they are anchored ` if-absent`
-    /// entries whose anchor is the machine's own.
+    /// Removed because the vault dropped them, or because they are anchored ` if-absent` entries whose anchor is the machine's own.
     pub removed: Vec<String>,
-    /// Left in place: dropped (or taken back) by the vault but changed since it wrote them,
-    /// or not looked at (reached only through a symlinked or refused directory, or the file
-    /// an entry behind one names; these stay in the manifest), or ` if-absent` entries whose
-    /// target is the machine's own (a file the vault never wrote or that changed since it
-    /// did, a link, a directory) or whose anchor is (a gap left unfilled), or cannot be
-    /// looked at (a file the vault wrote, not written and still in the manifest).
+    /// Left in place: dropped (or taken back) by the vault but changed since it wrote them, or not looked at (reached only through a symlinked or refused directory, or the file an entry behind one names; these stay in the manifest), or ` if-absent` entries whose target is the machine's own (a file the vault never wrote or that changed since it did, a link, a directory) or whose anchor is (a gap left unfilled), or cannot be looked at (a file the vault wrote, not written and still in the manifest).
     pub left: Vec<String>,
     /// Not written: the name and why (never the value).
     pub failed: Vec<(String, String)>,
@@ -104,8 +59,7 @@ pub fn digest_hex(bytes: &[u8]) -> String {
 
 const HEX: &[u8; 16] = b"0123456789abcdef";
 
-/// Where entry `name` lands under `home`. Refuses an invalid name
-/// ([`crate::text::valid_entry_name`]).
+/// Where entry `name` lands under `home`.
 pub fn target_path(home: &Path, name: &str) -> crate::Result<PathBuf> {
     if !text::valid_entry_name(name) {
         return Err(Error::new(
@@ -120,13 +74,7 @@ pub fn target_path(home: &Path, name: &str) -> crate::Result<PathBuf> {
     })
 }
 
-/// The name a moved-aside copy of entry `name` gets (before any `.1`, `.2` suffix): the name
-/// with each `/` spelled `%2F`, then `.<now>`.
-///
-/// A name that would leave no room within [`NAME_MAX`] for the longest numbered suffix is
-/// cut, and `~` and the first 16 hex digits of the whole name's SHA-256 follow the cut, so
-/// two long names that share their start still get two names. (An entry name holds `~`
-/// only as its first byte, so a name that is not cut never meets one that is.)
+/// The name a moved-aside copy of entry `name` gets (before any `.1`, `.2` suffix): the name with each `/` spelled `%2F`, then `.<now>`.
 pub fn aside_name(name: &str, now: u64) -> String {
     let flat = name.replace('/', "%2F");
     let stamp = format!(".{now}");
@@ -137,37 +85,13 @@ pub fn aside_name(name: &str, now: u64) -> String {
     }
     let digest = digest_hex(name.as_bytes());
     let mut keep = room - 1 - ASIDE_DIGEST;
-    // Entry names are ASCII; any other text is cut at a character boundary.
     while !flat.is_char_boundary(keep) {
         keep -= 1;
     }
     format!("{}~{}{stamp}", &flat[..keep], &digest[..ASIDE_DIGEST])
 }
 
-/// Make the files under `home` match `entries` (already merged for this machine), given what
-/// the vault wrote last time (`held`). Returns the new manifest and the report. `now` names
-/// moved-aside copies. Missing directories of a home path are created 0700.
-///
-/// An entry that cannot be placed is reported failed with a reason naming the path (never
-/// the value), and the rest proceed: a directory or other non-file at its target, a
-/// symlinked or refused directory on its way (`~/.secrets` included, and aterm's own key
-/// directory by another spelling), a file another entry of this run already placed or found
-/// (two names for one file), or an ` if-absent` target that became the machine's own while
-/// the pass ran. So the `Err` arm is never taken today; it is kept for a refusal that would
-/// stop a whole sync.
-///
-/// The new manifest holds every entry written, or found holding its value where the vault
-/// wrote it before (a file the vault never wrote that holds the value is adopted but stays
-/// the machine's own, out of the manifest), and keeps `held`'s digest for an
-/// entry that failed (so a later sync still knows what the vault wrote there); an
-/// ` if-absent` entry left alone is not in it, nor is one whose file changed since the
-/// vault wrote it. A name the vault dropped, or an anchored entry it takes back, leaves the
-/// manifest once its file is removed, found changed, or found unable to exist (a file where
-/// one of its directories was); one that could not be looked at or removed (behind a
-/// symlinked or refused directory, the file such an entry names, a refused unlink, an error)
-/// keeps its digest, so the sync that can reach it still removes it, as does an anchored entry
-/// whose anchor could not be. An entry whose anchor is not another ` if-absent` entry of
-/// `entries` fails.
+/// Make the files under `home` match `entries` (already merged for this machine), given what the vault wrote last time (`held`).
 pub fn apply(
     home: &Path,
     entries: &[Entry],
@@ -184,28 +108,10 @@ pub fn apply(
     )
 }
 
-/// What a pass is to write, or what a pass cut short was writing: entry name → digest of the
-/// value ([`apply_resuming`]).
+/// What a pass is to write, or what a pass cut short was writing: entry name → digest of the value ([`apply_resuming`]).
 pub type Pending = BTreeMap<String, String>;
 
 /// [`apply`], resuming a pass cut short and saving ahead for this one.
-///
-/// A name of `resumed` (what the pass cut short was writing) whose file holds exactly that
-/// value, private and reached without a symlinked directory or a refused `~/.secrets`, is
-/// what the cut pass wrote: the vault's, as if `held` named it, so it takes the next value,
-/// anchors as the vault's file, and is removed when the vault drops it or takes it back with
-/// its anchor. Bytes a person put there since are judged the same way: they are the value the
-/// vault held when the pass pended it. A temp the cut pass left beside such a name's target
-/// that still holds that value (cut before its rename or link) is wiped ([`sweep_temps`]).
-///
-/// Then, before any entry is written (only `~/.secrets` is made private first), `ahead` gets
-/// that manifest and what this pass is to write: each entry whose value is not what the vault
-/// last wrote under its name, at a target it can write (reached as above; a gap, a file, or
-/// for a plain entry a link it moves aside), but an ` if-absent` one that does not stand as
-/// the vault's, which it leaves alone. The same standings decide what it writes, and a plain
-/// entry whose target changed since the look fails rather than be written unannounced, so it
-/// writes only what `ahead` was told of and what the manifest it got already records. An
-/// error of `ahead` stops the pass before any entry is written.
 pub fn apply_resuming(
     home: &Path,
     entries: &[Entry],
@@ -248,20 +154,13 @@ pub fn apply_resuming(
     ahead(held, &pending)?;
     let mut manifest = Manifest::default();
     let mut report = Report::default();
-    // (device, inode) → the entry that placed or found that file this run.
     let mut claimed: BTreeMap<(u64, u64), String> = BTreeMap::new();
-    // The files entries behind a symlinked or refused directory name (looked at through
-    // it, never written): no entry's to claim, and never wiped through another name.
     let mut spared: BTreeSet<(u64, u64)> = BTreeSet::new();
-    // Anchored entries whose anchor is the machine's own, with what the vault wrote for
-    // each: taken back with the dropped names, once every entry has claimed its file.
     let mut withdrawn: Vec<(String, String)> = Vec::new();
     for entry in entries {
         let mut held_digest = held.files.get(&entry.name);
         let placed = match target_path(home, &entry.name) {
             Err(error) => Err(error.0),
-            // A vault text refuses this; a set merged from lockers is held to it here, so
-            // nothing an anchor guards is ever written beside an anchor nobody can judge.
             Ok(_) if !text::anchor_received(entry, |name| by_name.get(name).copied()) => {
                 Err(format!(
                     "its anchor `{}` is not an if-absent entry this machine receives",
@@ -269,8 +168,6 @@ pub fn apply_resuming(
                 ))
             }
             Ok(target) => match places.prepare(&entry.name) {
-                // Refused before any look at the target: nothing seen through a link
-                // decides what this entry does.
                 Err(why) => {
                     spared.extend(fsx::file_id(&target));
                     Err(why)
@@ -281,9 +178,6 @@ pub fn apply_resuming(
                             fsx::file_id(&target).and_then(|id| history.get(&id).copied());
                     }
                     let digest = digest_hex(entry.value.as_slice());
-                    // A plain entry `ahead` was not told of, whose target a write would now
-                    // reach: a directory at it, or a symlinked one on its way, gave way since
-                    // the look, and a cut before the save would leave what it wrote nobody's.
                     let unannounced = !entry.if_absent
                         && !pending.contains_key(&entry.name)
                         && held_digest != Some(&digest)
@@ -291,15 +185,11 @@ pub fn apply_resuming(
                             fsx::kind(&target),
                             Ok(Kind::Missing | Kind::File | Kind::Symlink)
                         );
-                    // An ` if-absent` entry goes by its own standing, its anchors counted:
-                    // the one `ahead` was told of.
                     let standing = standings
                         .get(entry.name.as_str())
                         .copied()
                         .unwrap_or(Standing::Unseen);
                     let placed = if unannounced && adoptable(&target, entry, held_digest) {
-                        // The machine's own file already holds the value: nothing is
-                        // written, so `ahead` was rightly not told of it.
                         match fsx::file_id(&target).and_then(|id| claimed.get(&id)) {
                             Some(other) => {
                                 Err(format!("lands on the same file as entry `{other}`"))
@@ -361,8 +251,6 @@ pub fn apply_resuming(
             }
         }
     }
-    // What the vault takes back: each name it dropped, and each anchored entry it wrote
-    // whose anchor is the machine's own.
     let dropped = held
         .files
         .iter()
@@ -377,17 +265,12 @@ pub fn apply_resuming(
             continue;
         }
         if !places.reachable(name) || id.is_some_and(|id| spared.contains(&id)) {
-            // Reached only through a symlinked or refused directory, or the file an entry
-            // behind one names: never touched, and still what the vault wrote, so a sync
-            // that reaches it directly still removes it.
             manifest.files.insert(name.clone(), digest.clone());
             report.left.push(name.clone());
             continue;
         }
         match fsx::kind(&target) {
             Ok(Kind::Missing) => {}
-            // Judged by the descriptor it zeroes, and removed before it is zeroed: a file
-            // renamed over it since is left, and one whose unlink is refused keeps its bytes.
             Ok(Kind::File) => match fsx::wipe_if(&target, text::MAX_VALUE, |bytes| {
                 digest_hex(bytes) == *digest
             }) {
@@ -399,7 +282,6 @@ pub fn apply_resuming(
                 }
             },
             Ok(Kind::Symlink | Kind::Dir | Kind::Other) => report.left.push(name.clone()),
-            // A file where a directory of the path was: nothing can be there, as when missing.
             Err(_) if under_a_file(home, name) => {}
             Err(error) => {
                 manifest.files.insert(name.clone(), digest.clone());
@@ -443,8 +325,6 @@ fn to_write(
                     .and_then(fsx::file_id)
                     .and_then(|id| history.get(&id).copied())
             });
-            // A file of the machine's own that already holds the value is adopted, never
-            // written: told to `ahead`, a pass cut short would count it the vault's.
             let adopted = target
                 .as_deref()
                 .is_some_and(|target| adoptable(target, entry, wrote));
@@ -454,8 +334,6 @@ fn to_write(
 }
 
 /// What the vault wrote under a name of `held` that is none of `names` now, by the file it
-/// wrote: an entry respelled by case lands on that file on a case-insensitive volume, and
-/// keeps its history there.
 fn history<'m>(
     home: &Path,
     names: &BTreeSet<&str>,
@@ -481,14 +359,10 @@ struct Places<'a> {
     home: &'a Path,
     secrets: &'a Path,
     /// `~/.secrets` made private, or why it was refused (a symlink, not a directory, another
-    /// user's): the reason every entry that lands there, and every move aside, fails with.
     secrets_ok: Result<(), String>,
     /// What moved-aside copies are named by ([`aside_name`]).
     now: u64,
     /// aterm's own key and state directory (`~/.config/aterm/secrets`, links followed) by
-    /// (device, inode): a home path that reaches it by another spelling (through the real
-    /// directory a symlinked `~/.config` names) is refused as a symlinked directory is, so no
-    /// entry lands on the machine key or the manifest.
     own: Option<(u64, u64)>,
 }
 
@@ -507,7 +381,6 @@ impl<'a> Places<'a> {
     }
 
     /// Make entry `name`'s directory ready to write in: `~/.secrets` for a file name, the
-    /// directories between home and the file for a home path ([`make_parents`]).
     fn prepare(&self, name: &str) -> Result<(), String> {
         match name.strip_prefix("~/") {
             Some(rel) => make_parents(self.home, rel, self.own),
@@ -516,7 +389,6 @@ impl<'a> Places<'a> {
     }
 
     /// Whether entry `name`'s file is reached without a symlinked directory, aterm's own, or
-    /// a refused `~/.secrets` on the way.
     fn reachable(&self, name: &str) -> bool {
         match name.strip_prefix("~/") {
             Some(rel) => refused_dir(self.home, rel, self.own).is_none(),
@@ -530,16 +402,12 @@ enum Placed {
     Written,
     Unchanged,
     /// A plain entry whose target, a file the vault never wrote, already held its value:
-    /// narrowed and kept, and still the machine's own (out of the manifest), so dropping the
-    /// entry leaves it and a new value moves it aside first.
     Adopted,
     /// An ` if-absent` entry whose target, or anchor, is the machine's own.
     Left,
     /// An anchored ` if-absent` entry whose file the vault wrote and whose anchor is the
-    /// machine's own: taken back, as a dropped entry is.
     Withdrawn,
     /// An anchored ` if-absent` entry whose file the vault wrote and whose anchor could not
-    /// be looked at: left as it is, and still the vault's.
     Held,
 }
 
@@ -547,13 +415,10 @@ enum Placed {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Standing {
     /// The vault's: a gap, or a file still holding what the vault wrote. As an anchor, it
-    /// lets the entries anchored to it fill their gaps and update what the vault wrote.
     Vaults,
     /// The machine's own: a file the vault never wrote or that changed since, a link, a
-    /// directory. As an anchor, it keeps the vault's entries anchored to it away.
     Own,
     /// Not looked at (seen only through a symlinked or refused directory, or an error):
-    /// as an anchor, it lets nothing be written and takes nothing back.
     Unseen,
 }
 
@@ -568,9 +433,6 @@ enum Judged {
 }
 
 /// Place one entry at `target`, whose directory [`Places::prepare`] made ready; `Err` is
-/// the reason it was not written (a path and an OS error at most, never a value). A move
-/// aside is reported as it happens, even if the write then fails. `standing` is how an
-/// ` if-absent` entry stands, its anchors counted ([`standings`]).
 fn place(
     places: &Places<'_>,
     entry: &Entry,
@@ -596,7 +458,6 @@ fn place(
         Kind::File => match judge(target, value, held) {
             Judged::Same => {
                 narrow(target)?;
-                // Found holding the value where the vault never wrote: the machine's own.
                 return Ok(if held.is_some() {
                     Placed::Unchanged
                 } else {
@@ -616,16 +477,6 @@ fn place(
 }
 
 /// Place an ` if-absent` entry at `target`, which holds `kind`, given how it stands
-/// ([`standings`]: its own file, then its anchors). While it stands as the vault's, a gap is
-/// filled and a file that still holds what the vault wrote there (`held`) takes the new
-/// value. Once its anchor is the machine's own, a gap stays one and such a file is
-/// [`Placed::Withdrawn`]; while the anchor cannot be looked at, neither is written.
-/// Anything else is this machine's own, never replaced, moved or recorded: a file the vault
-/// never wrote, one changed since it wrote it (git and gh rewrite their own files, and a
-/// person edits theirs), a link, a directory, and a gap that was a file when the standings
-/// were judged. One that became the machine's own while this pass ran (a gap taken before
-/// its write, or the vault's file changed) fails, so the next pass judges it, and every entry
-/// anchored to it, again: the rest of its set does not stay beside it.
 fn fill(
     target: &Path,
     kind: Kind,
@@ -640,8 +491,6 @@ fn fill(
         ))
     };
     match kind {
-        // A gap is filled only while it is one: whatever lands there before the write is
-        // this machine's own.
         Kind::Missing if standing == Standing::Vaults => {
             if fsx::write_new(target, value, 0o600).map_err(|error| error.0)? {
                 Ok(Placed::Written)
@@ -652,7 +501,6 @@ fn fill(
         Kind::Missing => Ok(Placed::Left),
         Kind::File if held.is_some() => match (judge(target, value, held), standing) {
             (Judged::Foreign, Standing::Vaults) => changed(),
-            // Changed since the vault wrote it: the machine's own, whatever its anchor.
             (Judged::Foreign, _) => Ok(Placed::Left),
             (Judged::Same, Standing::Vaults) => {
                 narrow(target)?;
@@ -665,25 +513,12 @@ fn fill(
             (Judged::Same | Judged::Ours, Standing::Own) => Ok(Placed::Withdrawn),
             (Judged::Same | Judged::Ours, Standing::Unseen) => Ok(Placed::Held),
         },
-        // A gap when the standings were judged.
         _ if standing == Standing::Vaults => changed(),
         Kind::File | Kind::Symlink | Kind::Dir | Kind::Other => Ok(Placed::Left),
     }
 }
 
 /// How each ` if-absent` entry of `entries` stands, its anchors counted: an anchored entry
-/// goes by its anchor's standing ([`apply`]). Judged from the disk and `held` alone, before
-/// anything is written, so no verdict depends on the order the pass writes in.
-///
-/// Each entry starts from its own file: a gap, or a file still holding what the vault wrote
-/// (`held`, or the `history` of a name respelled by case), is the vault's; a file the vault
-/// never wrote or that changed since, a link or a directory is the machine's own; and one
-/// seen only through a symlinked or refused directory is unseen, since nothing seen through
-/// a link decides what another entry does. Then each entry that is the vault's but whose
-/// anchor is not takes its anchor's standing, until none changes. So two entries anchored
-/// to each other both fill a machine that has neither, and neither fills or stays beside
-/// the other's own file; an entry anchored to a gap that its own anchor keeps unfilled
-/// stays unfilled too.
 fn standings<'a>(
     places: &Places<'_>,
     entries: &'a [Entry],
@@ -700,10 +535,6 @@ fn standings<'a>(
                         .files
                         .get(&entry.name)
                         .or_else(|| fsx::file_id(&target).and_then(|id| history.get(&id).copied()));
-                    // A file the vault wrote that already holds the entry's value is the
-                    // vault's too, as `fill` judges it: a pass cut short after it wrote the
-                    // files but before it saved their digests leaves the new value under the
-                    // old digest.
                     if wrote.is_some_and(|digest| {
                         file_digest(&target).as_deref() == Some(digest.as_str())
                     }) || (wrote.is_some() && holds(&target, entry.value.as_slice()))
@@ -725,8 +556,6 @@ fn standings<'a>(
         .filter(|entry| entry.if_absent)
         .filter_map(|entry| Some((entry.name.as_str(), entry.anchor.as_deref()?)))
         .collect();
-    // A standing other than the vault's never changes, so each entry falls at most once,
-    // and with its anchor's final standing.
     loop {
         let fallen: Vec<(&str, Standing)> = anchors
             .iter()
@@ -746,7 +575,6 @@ fn standings<'a>(
 }
 
 /// Whether a plain entry's target is a regular file the vault never wrote (`wrote` is
-/// `None`) that already holds the entry's value: adopted, never written.
 fn adoptable(target: &Path, entry: &Entry, wrote: Option<&String>) -> bool {
     !entry.if_absent
         && wrote.is_none()
@@ -780,14 +608,12 @@ fn judge(target: &Path, value: &[u8], held: Option<&String>) -> Judged {
                 Judged::Foreign
             }
         }
-        // Gone since the look: nothing to keep.
         Ok(None) => Judged::Ours,
         Err(_) => Judged::Foreign,
     }
 }
 
 /// The digest of the regular file at `target`, if it can be read and is not larger than a
-/// value.
 fn file_digest(target: &Path) -> Option<String> {
     let bytes = fsx::read_public(target, text::MAX_VALUE).ok()??;
     let bytes = SecretBytes::new(bytes);
@@ -795,8 +621,6 @@ fn file_digest(target: &Path) -> Option<String> {
 }
 
 /// Narrow an adopted file this user owns to 0600 when group or other bits are set, through a
-/// descriptor opened without following a link: a link swapped in since the look is refused,
-/// and what it names keeps its mode.
 fn narrow(target: &Path) -> Result<(), String> {
     let at = |error: std::io::Error| format!("{}: {error}", target.display());
     let file = std::fs::OpenOptions::new()
@@ -826,9 +650,6 @@ fn parents(home: &Path, rel: &str) -> Vec<PathBuf> {
 }
 
 /// Create the missing directories between home and home path `rel`'s file at 0700. An
-/// existing directory is used as it is and never chmodded; a symlink in a directory's place
-/// is refused, never followed, as is anything else that is not a directory, and aterm's own
-/// directory (`own`, [`Places`]).
 fn make_parents(home: &Path, rel: &str, own: Option<(u64, u64)>) -> Result<(), String> {
     for dir in parents(home, rel) {
         match fsx::kind(&dir).map_err(|error| error.0)? {
@@ -841,7 +662,6 @@ fn make_parents(home: &Path, rel: &str, own: Option<(u64, u64)>) -> Result<(), S
             Kind::Dir => {}
             Kind::Missing => match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
                 Ok(()) => {}
-                // Made meanwhile: a directory will do, a link to one will not.
                 Err(error)
                     if error.kind() == std::io::ErrorKind::AlreadyExists
                         && fsx::kind(&dir).is_ok_and(|kind| kind == Kind::Dir) => {}
@@ -862,8 +682,6 @@ fn make_parents(home: &Path, rel: &str, own: Option<(u64, u64)>) -> Result<(), S
 }
 
 /// The first directory between home and home path `rel`'s file that is a symlink, or aterm's
-/// own directory (`own`, [`Places`]), if any. The look stops at one that is missing or not a
-/// directory: nothing past it is reached.
 fn refused_dir(home: &Path, rel: &str, own: Option<(u64, u64)>) -> Option<PathBuf> {
     for dir in parents(home, rel) {
         match fsx::kind(&dir) {
@@ -876,7 +694,6 @@ fn refused_dir(home: &Path, rel: &str, own: Option<(u64, u64)>) -> Option<PathBu
 }
 
 /// Whether a directory between home and home path `name`'s file is a file (or another
-/// non-directory), so nothing can be at that path.
 fn under_a_file(home: &Path, name: &str) -> bool {
     name.strip_prefix("~/").is_some_and(|rel| {
         parents(home, rel)
@@ -886,11 +703,6 @@ fn under_a_file(home: &Path, name: &str) -> bool {
 }
 
 /// Wipe what a pass cut short while writing `digest` left beside `target`: a temp, named as
-/// `aterm_uds::atomic_file` names one (`.<file>.tmp.<pid>.<hex>`), that holds that value, so
-/// another writer's temp is never touched. One that is still a second name of a file (a fill
-/// cut between its link and its unlink: of this target, of another entry whose name this one
-/// begins, or of a target renamed away since) loses only that name, never the bytes the
-/// file's other name holds.
 fn sweep_temps(target: &Path, digest: &str) {
     let (Some(dir), Some(file)) = (target.parent(), target.file_name()) else {
         return;
@@ -915,7 +727,6 @@ fn sweep_temps(target: &Path, digest: &str) {
 }
 
 /// Move `target` to `~/.secrets/.replaced/<`[`aside_name`]`>` (or that with `.1`, `.2`, …
-/// when taken), never replacing anything there. A symlink moves as itself.
 fn move_aside(places: &Places<'_>, name: &str, target: &Path) -> Result<PathBuf, String> {
     places.secrets_ok.clone()?;
     let dir = places.secrets.join(REPLACED_DIR);
@@ -933,7 +744,6 @@ fn move_aside(places: &Places<'_>, name: &str, target: &Path) -> Result<PathBuf,
         let moving = fsx::file_id(target);
         match fsx::rename_noreplace(target, &to) {
             Ok(()) => return Ok(to),
-            // Another file took the name between the look and the link: try the next one.
             Err(_) if fsx::file_id(&to).is_some_and(|id| Some(id) != moving) => {}
             Err(error) => return Err(error.0),
         }
@@ -1084,7 +894,6 @@ mod tests {
         );
         assert_eq!(mode(&secrets.join("t")), 0o600);
         assert!(!secrets.join(".replaced").exists());
-        // Every later pass adopts it again, and fails nothing.
         let (manifest, report) =
             apply(home.path(), &[entry("t", b"same")], &manifest, 2).expect("again");
         assert_eq!(report.unchanged, ["t"]);
@@ -1107,7 +916,6 @@ mod tests {
 
     #[test]
     fn dropping_an_adopted_entry_leaves_the_machines_own_file() {
-        // The audit's case: `set ~/.aws/credentials --file ~/.aws/credentials`, then unset.
         let home = scratch();
         let secrets = home.path().join(".secrets");
         std::fs::create_dir(&secrets).expect("dir");
@@ -1118,7 +926,6 @@ mod tests {
         assert!(report.removed.is_empty(), "{:?}", report.removed);
         assert_eq!(read(&secrets.join("token")), b"hand-made");
         assert!(!manifest.files.contains_key("token"));
-        // NEGATIVE CONTROL: what the vault wrote itself is still removed when dropped.
         let (_, report) = apply(home.path(), &[], &manifest, 3).expect("dropped");
         assert_eq!(report.removed, ["other"]);
         assert!(!secrets.join("other").exists());
@@ -1266,13 +1073,11 @@ mod tests {
             apply(home.path(), &[entry(name, b"v")], &Manifest::default(), 1).expect("first");
         let locked = home.path().join("locked");
         let target = locked.join("hosts.yml");
-        // Searchable, and the file still writable, but not its directory: the unlink fails.
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o500)).expect("lock");
         let refused = apply(home.path(), &[], &held, 2);
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).expect("unlock");
         let (manifest, report) = refused.expect("applied");
         if fsx::euid() == 0 {
-            // No directory mode refuses root an unlink: the file simply goes.
             assert_eq!(report.removed, [name]);
             return;
         }
@@ -1367,7 +1172,6 @@ mod tests {
         assert_eq!(fsx::kind(&aside).expect("kind"), Kind::Symlink);
         assert_eq!(std::fs::read_link(&aside).expect("link"), elsewhere);
 
-        // A link whose name the vault dropped is left alone.
         let held = Manifest {
             files: BTreeMap::from([("t".to_string(), digest_hex(b"vault value"))]),
         };
@@ -1481,7 +1285,6 @@ mod tests {
 
     #[test]
     fn a_second_name_for_a_placed_file_is_refused_whatever_its_spelling() {
-        // A hard link is two spellings of one file on every volume.
         let home = scratch();
         let first = home.path().join("first");
         plant(&first, b"v", 0o600);
@@ -1502,14 +1305,11 @@ mod tests {
         );
         assert!(report.moved_aside.is_empty());
         assert_eq!(read(&first), b"v", "never written through the second name");
-        // Found holding its value, `~/first` is adopted: still the machine's own.
         assert!(manifest.files.is_empty(), "{:?}", manifest.files);
     }
 
     #[test]
     fn a_dropped_name_for_another_entrys_file_is_never_wiped() {
-        // `~/old` and `~/new` are one file; the vault renamed the entry. Wiping `~/old`
-        // would zero the bytes `~/new` holds.
         let home = scratch();
         let old = home.path().join("old");
         plant(&old, b"v", 0o600);
@@ -1526,8 +1326,6 @@ mod tests {
         assert_eq!(read(&old), b"v");
         assert_eq!(manifest.files.keys().collect::<Vec<_>>(), ["~/new"]);
 
-        // A hard link no entry names is no copy: a dropped file's bytes go from every name
-        // (another user who can search the directory may have made one to keep them).
         let kept = home.path().join("kept");
         std::fs::hard_link(&new, &kept).expect("link");
         let (_, report) = apply(home.path(), &[], &manifest, 3).expect("dropped");
@@ -1554,11 +1352,9 @@ mod tests {
         assert_eq!(manifest.files.keys().collect::<Vec<_>>(), ["token"]);
         assert_eq!(read(&secrets.join("token")), b"v2");
         if folds_case(&secrets) {
-            // One file: the vault's own bytes, overwritten in place, nothing moved aside.
             assert!(report.moved_aside.is_empty(), "{:?}", report.moved_aside);
             assert!(report.removed.is_empty());
         } else {
-            // Two files: the old one, still as the vault wrote it, goes.
             assert_eq!(report.removed, ["Token"]);
             assert!(!secrets.join("Token").exists());
         }
@@ -1617,8 +1413,6 @@ mod tests {
         );
         assert!(!secrets.join(REPLACED_DIR).exists());
 
-        // The same sync again changes nothing; the vault dropping every entry removes only
-        // the file it wrote.
         let (again, report) = apply(home.path(), &entries, &manifest, 4).expect("again");
         assert_eq!(again, manifest);
         assert_eq!(report.unchanged, ["~/.aterm/missing.key"]);
@@ -1647,9 +1441,6 @@ mod tests {
         let (held, report) =
             apply(home.path(), &version(b"v1"), &Manifest::default(), 1).expect("first");
         assert_eq!(report.written, ["a", "~/.config/git/config", "c", "d"]);
-        // The config is edited where the vault put it (`git config --global` with no
-        // ~/.gitconfig, `gh auth setup-git`), `c` is deleted (a gap again), `d` becomes a
-        // link.
         plant(&config, b"edited since", 0o644);
         std::fs::remove_file(secrets.join("c")).expect("rm");
         let elsewhere = home.path().join("elsewhere");
@@ -1673,7 +1464,6 @@ mod tests {
             "a changed file is the machine's own now"
         );
 
-        // Every later version leaves them alone and still updates the vault's own.
         let (manifest, report) = apply(home.path(), &version(b"v3"), &manifest, 3).expect("third");
         assert_eq!(report.written, ["a", "c"]);
         assert_eq!(report.left, ["~/.config/git/config", "d"]);
@@ -1715,8 +1505,6 @@ mod tests {
     const PROFILE: &str = "~/.aterm/release-credentials.toml";
 
     /// The release identity as the vault carries it, sorted by name as a merge leaves it:
-    /// a ring, the key anchored to machine.toml, machine.toml to the profile and the profile
-    /// to the key, so any one of them the machine's own keeps the other two away.
     fn identity(value: &[u8]) -> [Entry; 3] {
         [
             anchored(KEY, value, TOML),
@@ -1727,7 +1515,6 @@ mod tests {
 
     #[test]
     fn a_machines_own_machine_toml_keeps_the_vaults_key_and_profile_away() {
-        // What a failed provision leaves when the operator removes only the key it made.
         let home = scratch();
         let at = |name: &str| target_path(home.path(), name).expect("valid");
         std::fs::create_dir(home.path().join(".aterm")).expect("dir");
@@ -1747,8 +1534,6 @@ mod tests {
         let at = |name: &str| target_path(home.path(), name).expect("valid");
         let (held, _) =
             apply(home.path(), &identity(b"v1"), &Manifest::default(), 1).expect("first");
-        // The next version's profile is written, and the pass ends before the manifest that
-        // records it is saved.
         plant(&at(PROFILE), b"v2", 0o600);
         let (manifest, report) = apply(home.path(), &identity(b"v2"), &held, 2).expect("again");
         assert!(report.removed.is_empty(), "{:?}", report.removed);
@@ -1765,9 +1550,6 @@ mod tests {
         let secrets = home.path().join(".secrets");
         let (held, _) =
             apply(home.path(), &[entry("t", b"v1")], &Manifest::default(), 1).expect("first");
-        // The cut pass was writing `t` = v2 and died after its temp was synced, before the
-        // rename; its fill of `f` died between the link and the unlink, leaving the temp a
-        // second name of the file. Another writer's temp beside `t` holds its own bytes.
         let cut = secrets.join(".t.tmp.4242.0badcafe");
         plant(&cut, b"v2", 0o600);
         plant(&secrets.join("f"), b"filled", 0o600);
@@ -1808,8 +1590,6 @@ mod tests {
         let secrets = home.path().join(".secrets");
         std::fs::create_dir(&secrets).expect("dir");
         std::fs::set_permissions(&secrets, std::fs::Permissions::from_mode(0o700)).expect("0700");
-        // The cut pass filled `t.tmp.1` and `g` and died between each link and its unlink:
-        // `t.tmp.1`'s temp also starts as `t`'s temps do, and `g` was renamed away since.
         plant(&secrets.join("t.tmp.1"), b"shared value", 0o600);
         let theirs = secrets.join(".t.tmp.1.tmp.4242.12345678");
         std::fs::hard_link(secrets.join("t.tmp.1"), &theirs).expect("link");
@@ -1845,8 +1625,6 @@ mod tests {
     fn a_gap_taken_while_the_pass_writes_fails_so_the_next_pass_takes_the_set_back() {
         let home = scratch();
         let at = |name: &str| target_path(home.path(), name).expect("valid");
-        // Every part of the set is a gap when the pass judges it; the machine makes its own
-        // machine.toml (`ship provision`) before the pass reaches it.
         let (manifest, report) = apply_resuming(
             home.path(),
             &identity(b"shared"),
@@ -1882,8 +1660,6 @@ mod tests {
         let at = |name: &str| target_path(home.path(), name).expect("valid");
         let (held, _) =
             apply(home.path(), &identity(b"v1"), &Manifest::default(), 1).expect("first");
-        // The whole set stands as the vault's when the next version's pass judges it; the
-        // machine rewrites its machine.toml before the pass reaches it.
         let (manifest, report) = apply_resuming(
             home.path(),
             &identity(b"v2"),
@@ -1922,8 +1698,6 @@ mod tests {
             assert_eq!(manifest.files[name], digest_hex(b"shared"), "{name}");
         }
 
-        // The set the vault wrote takes the next version, and a part deleted is filled
-        // again beside the rest.
         std::fs::remove_file(at(PROFILE)).expect("rm");
         let (manifest, report) =
             apply(home.path(), &identity(b"next"), &manifest, 2).expect("next");
@@ -1931,8 +1705,6 @@ mod tests {
         assert_eq!(read(&at(PROFILE)), b"next");
         assert_eq!(manifest.files.len(), 3);
 
-        // The machine makes its own key: the vault's profile is never filled beside it, and
-        // the machine.toml the vault wrote beside the vault's key is taken back.
         plant(&at(KEY), b"its own key", 0o600);
         std::fs::remove_file(at(PROFILE)).expect("rm");
         let (manifest, report) = apply(home.path(), &identity(b"next"), &manifest, 3).expect("own");
@@ -1948,9 +1720,6 @@ mod tests {
 
     #[test]
     fn a_profile_the_vault_filled_beside_a_machines_own_key_is_taken_back() {
-        // An older vault filled the profile alone, as a plain if-absent entry, on a Mac with
-        // its own key and machine.toml: the manifest records it. Anchored now, it goes, while
-        // it still holds what the vault wrote.
         let home = scratch();
         let at = |name: &str| target_path(home.path(), name).expect("valid");
         std::fs::create_dir(home.path().join(".aterm")).expect("dir");
@@ -1977,14 +1746,12 @@ mod tests {
         assert!(manifest.files.is_empty());
         assert!(!home.path().join(".secrets").join(REPLACED_DIR).exists());
 
-        // Every later version leaves the gap unfilled.
         let (manifest, report) = apply(home.path(), &identity(b"v3"), &manifest, 3).expect("again");
         assert_eq!(report.left, [KEY, TOML, PROFILE]);
         assert!(report.written.is_empty() && report.removed.is_empty());
         assert!(manifest.files.is_empty());
         assert!(!at(PROFILE).exists());
 
-        // A profile the person changed since the vault wrote it is theirs: it stays.
         let other = scratch();
         let at = |name: &str| target_path(other.path(), name).expect("valid");
         std::fs::create_dir(other.path().join(".aterm")).expect("dir");
@@ -2005,8 +1772,6 @@ mod tests {
 
     #[test]
     fn a_key_and_machine_toml_the_vault_filled_beside_a_machines_own_profile_are_taken_back() {
-        // machine.toml's anchor is the machine's own profile, and the key's is machine.toml:
-        // the ring falls whole.
         let home = scratch();
         let at = |name: &str| target_path(home.path(), name).expect("valid");
         std::fs::create_dir(home.path().join(".aterm")).expect("dir");
@@ -2030,8 +1795,6 @@ mod tests {
 
     #[test]
     fn a_file_the_vault_wrote_beside_an_anchor_it_cannot_look_at_stays_the_vaults() {
-        // The anchor lies behind a symlinked directory: the anchored file is neither updated
-        // nor taken back, and keeps its digest for a sync that can judge it.
         let home = scratch();
         let outside = scratch();
         let anchor = "~/link/key";
@@ -2068,7 +1831,6 @@ mod tests {
         assert!(!aterm.join("machine.toml").exists());
         assert!(!aterm.join("release-credentials.toml").exists());
 
-        // With its own machine.toml too, and every sync after.
         plant(&aterm.join("machine.toml"), b"its own id", 0o600);
         let (manifest, report) =
             apply(home.path(), &identity(b"shared"), &manifest, 2).expect("again");
@@ -2089,7 +1851,6 @@ mod tests {
         );
         let (manifest, report) =
             apply(home.path(), &identity(b"shared"), &Manifest::default(), 1).expect("applied");
-        // The key's anchor is a gap, machine.toml, but one its own anchor keeps from filling.
         assert_eq!(report.left, [KEY, TOML, PROFILE]);
         assert!(report.written.is_empty() && report.failed.is_empty());
         assert!(manifest.files.is_empty());
@@ -2127,7 +1888,6 @@ mod tests {
             "{:?}",
             report.failed
         );
-        // Seen only through a link, an anchor is not the vault's.
         assert_eq!(report.left, ["c"]);
         let secrets = home.path().join(".secrets");
         for name in ["a", "b", "c"] {
@@ -2174,8 +1934,6 @@ mod tests {
         );
         assert_eq!(manifest.files.keys().collect::<Vec<_>>(), ["~/a/fine"]);
 
-        // A dropped name behind a symlinked directory (one an older build wrote through) is
-        // never removed through it, and stays the vault's until a sync reaches it directly.
         plant(&outside.path().join("old.toml"), b"o", 0o600);
         let held = Manifest {
             files: BTreeMap::from([("~/.aterm/old.toml".to_string(), digest_hex(b"o"))]),
@@ -2189,7 +1947,6 @@ mod tests {
         assert_eq!(report.left, ["~/.aterm/old.toml"]);
         assert_eq!(again, held, "kept however many syncs meet the link");
 
-        // The person replaces the link with the directory it named: the file goes.
         std::fs::remove_file(home.path().join(".aterm")).expect("unlink");
         std::fs::create_dir(home.path().join(".aterm")).expect("dir");
         plant(&home.path().join(".aterm/old.toml"), b"o", 0o600);
@@ -2202,8 +1959,6 @@ mod tests {
 
     #[test]
     fn aterms_own_directory_by_another_spelling_is_refused() {
-        // `~/.config` is a link into a dotfiles checkout, so the real path of aterm's key
-        // spells past the name check and meets no symlinked directory on its way.
         let home = scratch();
         let real = home.path().join("dotfiles/config");
         let own = real.join("aterm/secrets");
@@ -2229,7 +1984,6 @@ mod tests {
         assert_eq!(read(&own.join("identity")), b"the machine key");
         assert_eq!(manifest.files.keys().collect::<Vec<_>>(), ["~/dotfiles/x"]);
 
-        // A dropped name that spells it (one an older build wrote) is never removed.
         let held = Manifest {
             files: BTreeMap::from([(name.to_string(), digest_hex(b"the machine key"))]),
         };
@@ -2290,8 +2044,6 @@ mod tests {
         );
         assert_eq!(fsx::kind(&secrets).expect("kind"), Kind::Symlink);
 
-        // The folder moved back in place of the link: the dropped file, still as the vault
-        // wrote it, goes; the rest are written.
         std::fs::remove_file(&secrets).expect("unlink");
         std::fs::rename(&real, &secrets).expect("move back");
         let (last, report) = apply(home.path(), &entries, &manifest, 2).expect("reached");
@@ -2326,17 +2078,13 @@ mod tests {
         ];
         let (manifest, report) =
             apply(home.path(), &entries, &Manifest::default(), 1).expect("applied");
-        // An existing file seen through the link is no reason to leave an if-absent entry:
-        // it fails, naming the link, like any entry there.
         assert_eq!(failed_names(&report), ["gh_token", "~/a/b/c", "~/link/x"]);
         for ((_, why), link) in report.failed.iter().zip([".secrets", "a/b", "link"]) {
             let link = home.path().join(link).display().to_string();
             assert!(why.contains(&link) && why.contains("symlink"), "{why}");
         }
         assert!(report.left.is_empty(), "{:?}", report.left);
-        // What the refused `~/link/x` saw through the link is not claimed by it.
         assert_eq!(report.unchanged, ["~/target/x"]);
-        // Adopted, it stays the machine's own; nothing else is the vault's either.
         assert!(manifest.files.is_empty(), "{:?}", manifest.files);
         assert_eq!(read(&real.join("gh_token")), b"theirs");
         assert_eq!(read(&deep.join("c")), b"theirs");
@@ -2344,9 +2092,6 @@ mod tests {
 
     #[test]
     fn a_dropped_name_for_a_file_a_refused_entry_names_is_kept() {
-        // `~/link/x` names the file the vault wrote as `~/real/x`, through a symlinked
-        // directory: removing `~/real/x` would wipe the file that entry names, through
-        // another name.
         let home = scratch();
         let real = home.path().join("real");
         std::fs::create_dir(&real).expect("dir");
@@ -2399,7 +2144,6 @@ mod tests {
             assert!(a.ends_with(&format!(".{now}")), "{a}");
         }
 
-        // On disk: a long home path's foreign file moves aside under the cut name, twice.
         let home = scratch();
         let target = target_path(home.path(), &one).expect("valid");
         std::fs::create_dir_all(target.parent().expect("parent")).expect("dirs");

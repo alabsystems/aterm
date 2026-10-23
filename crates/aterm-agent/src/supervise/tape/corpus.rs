@@ -1,46 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A CORPUS OF HOSTED-LOOP TAPES (the replay plan's T10): runs of the
-//! window's own harness, recorded in the real-agent lab
-//! (`targo --unverified lab`, `crates/aterm-lab`) against the real Claude
-//! Code, kept in the checkout (`crates/aterm-agent/tests/testdata/tapes/`)
-//! and replayed by every build (`tests/tape_corpus.rs`).
-//!
-//! * [`check`]: one tape replayed as a corpus replays it — in ACTS MODE
-//!   ([`super::acts`]) under the policy it recorded, so a build that reads
-//!   the screen once more, words a journal line otherwise or waits on another
-//!   schedule still passes, and one that takes another act where the
-//!   recorded run took its own does not. Strict replay is for the build that
-//!   recorded a tape; a corpus outlives that build. `aterm drive replay
-//!   --check FILE|DIR…` is this over every tape named ([`tapes_in`],
-//!   [`render`], [`worst`]).
-//! * [`Scrub`]: what makes a lab's tape portable before it is kept: the
-//!   recording machine's own names — the lab's state directory, the
-//!   checkout, the home, the temporary directory, the user and the host —
-//!   each written as a fixed token ([`token`]), the same way in the header
-//!   and in every record. A control round trip's words and reply are read
-//!   and written again (its encoding counts lengths); every other body is
-//!   text — a host's answer or a probe's in JSON, its arguments as `Debug`
-//!   lines, a journal row, a decision's mark — and is rewritten where it
-//!   stands.
-//! * [`lint`]: what a kept tape may not hold: `/Users/`, the recording
-//!   machine's home, any name a scrub was asked to take, more than
-//!   [`TEXT_MAX`] bytes of text.
-//! * [`promote`]: the three together, as `lab tape promote` runs them: the
-//!   tape must be whole and ended and replay as recorded on this build; its
-//!   scrubbed text must pass the lint, replay strictly REPRODUCED, replay in
-//!   acts mode REPRODUCED with every act taken, and take the very acts the
-//!   original's replay took, in the scrub's words — otherwise it is refused,
-//!   and nothing is kept.
-//! * [`census`]: what a tape holds that a corpus is kept for — approvals,
-//!   questions, turn ends, walls and acts — so the corpus test can refuse a
-//!   corpus that exercises nothing (its non-vacuity).
-//!
-//! A scrub maps names; it does not remove content. A corpus tape is read by
-//! a person before it is committed (its text form puts every screen a row
-//! to a line), and the lab's agents run against a local stub, never a model,
-//! so what a screen shows is the stub's.
+//! A CORPUS OF HOSTED-LOOP TAPES (the replay plan's T10): runs of the window's own harness, recorded in the real-agent lab (`targo --unverified lab`, `crates/aterm-lab`) against the real Claude Code, kept in the checkout (`crates/aterm-agent/tests/testdata/tapes/`) and replayed by every build (`tests/tape_corpus.rs`).
 
 use std::path::{Path, PathBuf};
 
@@ -54,31 +15,15 @@ use super::show::{self, Tape};
 use super::{doors, text};
 use crate::supervise::CtlReply;
 
-/// The most text a corpus tape may be: a tape a person reads before it is
-/// committed, and a corpus every build replays.
-///
-/// The replay plan's T10 said 256 KiB, before any hosted tape was measured.
-/// Measured on Claude Code 2.1.304 in the lab (2026-10-20), a hosted tape's
-/// text is mostly the window host's answer to `transcript_tail` — the
-/// transcript's tail as JSON inside the tape's JSON, about 160-190 KB of text
-/// a read once the first turn is on it — so one decision is 210-240 KB
-/// (`s1-plain` 209,535 bytes, `c1-approval` 225,859, `c2-question`
-/// 238,264) and a wall, which reads the tail again to confirm it and after
-/// the turn that continues past it, 351,506 (`c3-wall`). 512 KiB keeps one
-/// decision a tape, and refuses a tape that has grown into several.
+/// The most text a corpus tape may be: a tape a person reads before it is committed, and a corpus every build replays.
 pub const TEXT_MAX: usize = 512 * 1024;
 
 /// A corpus tape's file name ends so: its text form.
 pub const TEXT_SUFFIX: &str = ".atape.txt";
 
-/// The fixed tokens a [`Scrub`] writes in place of the recording machine's
-/// names. A path's token is an absolute path no machine has (`/lab` cannot
-/// be made on macOS, whose root is read-only), so the loop's reasoning about
-/// paths — one under another, absolute or not — is unchanged by the scrub,
-/// and a replay that opened one by mistake would find nothing.
+/// The fixed tokens a [`Scrub`] writes in place of the recording machine's names.
 pub mod token {
-    /// The lab's state directory (`$LAB_STATE`): every run's scratch home,
-    /// state root and project under it.
+    /// The lab's state directory (`$LAB_STATE`): every run's scratch home, state root and project under it.
     pub const STATE: &str = "/lab/state";
     /// The checkout the lab was built from.
     pub const CHECKOUT: &str = "/lab/checkout";
@@ -92,10 +37,7 @@ pub mod token {
     pub const HOST: &str = "lab-host";
 }
 
-// -- the tapes a corpus check is named ----------------------------------------
-
-/// Whether `path` names a tape file: `*.atape`, or its text form
-/// `*.atape.txt`.
+/// Whether `path` names a tape file: `*.atape`, or its text form `*.atape.txt`.
 #[must_use]
 pub fn is_tape(path: &Path) -> bool {
     path.file_name()
@@ -103,16 +45,9 @@ pub fn is_tape(path: &Path) -> bool {
         .is_some_and(|n| n.ends_with(".atape") || n.ends_with(TEXT_SUFFIX))
 }
 
-/// The tapes `named` names, in order: each file as it is named, and each
-/// directory's tapes at any depth, in path order. A link inside a directory
-/// is not followed (a corpus holds its tapes, never a pointer to another's),
-/// and a file there that is no tape is passed over.
-///
+/// The tapes `named` names, in order: each file as it is named, and each directory's tapes at any depth, in path order.
 /// # Errors
-///
-/// A name that is neither a file nor a directory, or a directory that does
-/// not read whole: a check over part of a corpus would pass what it never
-/// read.
+/// A name that is neither a file nor a directory, or a directory that does not read whole: a check over part of a corpus would pass what it never read.
 pub fn tapes_in(named: &[PathBuf]) -> Result<Vec<PathBuf>, String> {
     let mut out = Vec::new();
     for path in named {
@@ -144,14 +79,8 @@ pub fn tapes_in(named: &[PathBuf]) -> Result<Vec<PathBuf>, String> {
     Ok(out)
 }
 
-// -- the corpus check -----------------------------------------------------------
-
-/// The tape `bytes` (binary or text) replayed as a corpus replays it: in acts
-/// mode under `candidate` — the recorded policy itself for a corpus check,
-/// [`Candidate::default`] — every act held to the tape.
-///
+/// The tape `bytes` (binary or text) replayed as a corpus replays it: in acts mode under `candidate` — the recorded policy itself for a corpus check, [`Candidate::default`] — every act held to the tape.
 /// # Errors
-///
 /// A tape no replay can run, as [`replay::replay`] refuses one.
 pub fn check(bytes: &[u8], candidate: &Candidate) -> Result<Report, String> {
     replay::replay(
@@ -163,8 +92,7 @@ pub fn check(bytes: &[u8], candidate: &Candidate) -> Result<Report, String> {
     )
 }
 
-/// One tape of a corpus check: where it is, and its replay's report or why
-/// it was not replayed.
+/// One tape of a corpus check: where it is, and its replay's report or why it was not replayed.
 #[derive(Debug, Clone)]
 pub struct Checked {
     pub path: PathBuf,
@@ -179,10 +107,7 @@ impl Checked {
     }
 }
 
-/// A check's exit code from each tape's: 1 when any tape's acts diverge (the
-/// answer a check is asked for), else 2 when a tape was not replayed, else 3
-/// when one went STALE, else 4 when one reproduced its recorded panic, else
-/// 0 — every tape's acts taken as recorded.
+/// A check's exit code from each tape's: 1 when any tape's acts diverge (the answer a check is asked for), else 2 when a tape was not replayed, else 3 when one went STALE, else 4 when one reproduced its recorded panic, else 0 — every tape's acts taken as recorded.
 #[must_use]
 pub fn worst(codes: &[u8]) -> u8 {
     [1, 2, 3, 4]
@@ -191,9 +116,7 @@ pub fn worst(codes: &[u8]) -> u8 {
         .unwrap_or(0)
 }
 
-/// A check as text: a line per tape — its verdict, its path and how many of
-/// its acts it took — with the whole report under a tape that did not
-/// reproduce, then the count of each verdict.
+/// A check as text: a line per tape — its verdict, its path and how many of its acts it took — with the whole report under a tape that did not reproduce, then the count of each verdict.
 #[must_use]
 pub fn render(rows: &[Checked]) -> String {
     let mut out = String::new();
@@ -227,10 +150,7 @@ pub fn render(rows: &[Checked]) -> String {
     out
 }
 
-// -- the scrub ------------------------------------------------------------------
-
 /// One name a scrub takes: its bytes, its token, and whether it is a word
-/// (a user, a host) or a path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Rule {
     from: Vec<u8>,
@@ -239,15 +159,6 @@ struct Rule {
 }
 
 /// THE RECORDING MACHINE'S NAMES, EACH AS A FIXED TOKEN ([module docs](self)).
-///
-/// A PATH is taken wherever it stands — in `title=sh%20/Users/…` as in
-/// `"cwd":"/Users/…"` — up to its end: the byte after it is not one a path's
-/// last name goes on with (a letter, a digit, `_`, `-`, `.`), so `/Users//a`
-/// never takes the start of `/Users//ab`. Each of macOS's own spellings is
-/// taken too: `/private/tmp/x` for `/tmp/x`, and the other way. A WORD (the
-/// user, the host) is taken where no ASCII letter stands on either side of
-/// it, so `alice` goes in `%20alice` and `alice-mbp` but not in another
-/// word. The longest name goes first wherever two could start.
 #[derive(Debug, Clone, Default)]
 pub struct Scrub {
     rules: Vec<Rule>,
@@ -259,7 +170,6 @@ fn path_goes_on(b: u8) -> bool {
 }
 
 /// Whether a word goes on with `b` ([`Scrub`]): an ASCII letter, or a byte of
-/// a character past ASCII.
 fn word_goes_on(b: u8) -> bool {
     b.is_ascii_alphabetic() || b >= 0x80
 }
@@ -275,12 +185,8 @@ impl Scrub {
     }
 
     /// Take the directory `from` (and macOS's other spelling of it) as `to`.
-    ///
     /// # Errors
-    ///
-    /// A path that is not absolute UTF-8, or one too near the root to be a
-    /// machine's own (`/`, `/Users`, `/tmp`): taken everywhere, it would
-    /// rewrite paths that are no one's.
+    /// A path that is not absolute UTF-8, or one too near the root to be a machine's own (`/`, `/Users`, `/tmp`): taken everywhere, it would rewrite paths that are no one's.
     pub fn path(&mut self, from: &Path, to: &str) -> Result<&mut Self, String> {
         let text = from
             .to_str()
@@ -307,11 +213,8 @@ impl Scrub {
     }
 
     /// Take the word `from` (a user's or a host's name) as `to`.
-    ///
     /// # Errors
-    ///
-    /// A word shorter than three bytes, or one with a space or a `/`: taken
-    /// everywhere, it would rewrite the text around it.
+    /// A word shorter than three bytes, or one with a space or a `/`: taken everywhere, it would rewrite the text around it.
     pub fn word(&mut self, from: &str, to: &str) -> Result<&mut Self, String> {
         if from.len() < 3 || from.bytes().any(|b| b.is_ascii_whitespace() || b == b'/') {
             return Err(format!(
@@ -323,9 +226,6 @@ impl Scrub {
     }
 
     /// Take `from` as `to`, and — where the press guard spells it otherwise
-    /// (a `.` as `\.`, a space as `\x20`: `policy::guard::row_guard`, which
-    /// writes the `key if=<re>` a press is bound to the judged row by) — its
-    /// guard spelling as the token's.
     fn add(&mut self, from: &[u8], to: &str, word: bool) {
         let mut push = |from: Vec<u8>, to: String| {
             if !self.rules.iter().any(|r| r.from == from) {
@@ -379,22 +279,15 @@ impl Scrub {
         out
     }
 
-    /// `input` with every name taken. A name and its token are UTF-8, and a
-    /// UTF-8 name found in UTF-8 text starts and ends on its characters, so
-    /// the text stays UTF-8.
+    /// `input` with every name taken.
     #[must_use]
     pub fn text(&self, input: &str) -> String {
         String::from_utf8_lossy(&self.bytes(input.as_bytes())).into_owned()
     }
 
-    /// The tape `header` and `items` with every name taken: the header's text,
-    /// and each item's ([module docs](self)). Door names, stamps and clocks
-    /// are kept as they are.
-    ///
+    /// The tape `header` and `items` with every name taken: the header's text, and each item's ([module docs](self)).
     /// # Errors
-    ///
-    /// A control round trip whose request or reply does not read: its words
-    /// cannot be rewritten without its lengths.
+    /// A control round trip whose request or reply does not read: its words cannot be rewritten without its lengths.
     pub fn tape(
         &self,
         header: Option<&str>,
@@ -489,11 +382,7 @@ impl Scrub {
     }
 }
 
-// -- the lint -------------------------------------------------------------------
-
 /// Where `needle` stands in `text`, ASCII case aside: the 1-based line of
-/// each place. A word is found only where no ASCII letter stands on either
-/// side of it ([`Scrub`]); a path anywhere.
 fn found(text: &str, needle: &[u8], word: bool) -> Vec<usize> {
     let hay = text.as_bytes();
     let mut lines = Vec::new();
@@ -516,10 +405,7 @@ fn found(text: &str, needle: &[u8], word: bool) -> Vec<usize> {
     lines
 }
 
-/// What the tape text `text` holds that a corpus may not ([module
-/// docs](self)): `/Users/`, the recording machine's `home`, any name
-/// `scrub` takes, each with the line it is first on and how often; and a
-/// text over [`TEXT_MAX`]. Empty: nothing.
+/// What the tape text `text` holds that a corpus may not ([module docs](self)): `/Users/`, the recording machine's `home`, any name `scrub` takes, each with the line it is first on and how often; and a text over [`TEXT_MAX`].
 #[must_use]
 pub fn lint(text: &str, scrub: &Scrub, home: Option<&Path>) -> Vec<String> {
     let mut problems = Vec::new();
@@ -555,10 +441,7 @@ pub fn lint(text: &str, scrub: &Scrub, home: Option<&Path>) -> Vec<String> {
     problems
 }
 
-// -- what a tape holds ----------------------------------------------------------
-
-/// The acts on a tape's `items`, in order: each act's door and request
-/// ([`act_class`]).
+/// The acts on a tape's `items`, in order: each act's door and request ([`act_class`]).
 #[must_use]
 pub fn acts(items: &[Item]) -> Vec<(String, Vec<u8>)> {
     items
@@ -583,10 +466,7 @@ pub struct Census {
     pub questions: usize,
     /// Decisions at a turn's end.
     pub turn_ends: usize,
-    /// Turn ends decided at a WALL: the judged screen shows one (Claude
-    /// Code's reader of it, `aterm_phase::wall::wall`), or the rule that
-    /// decided is a wall's own continuation (a retry, a resume, a compact,
-    /// a login).
+    /// Turn ends decided at a WALL: the judged screen shows one (Claude Code's reader of it, `aterm_phase::wall::wall`), or the rule that decided is a wall's own continuation (a retry, a resume, a compact, a login).
     pub walls: usize,
     /// The acts on it ([`acts`]).
     pub acts: usize,
@@ -643,8 +523,6 @@ pub fn census(tape: &Tape) -> Census {
     census
 }
 
-// -- promote --------------------------------------------------------------------
-
 /// A tape made a corpus tape ([`promote`]).
 #[derive(Debug, Clone)]
 pub struct Promoted {
@@ -657,7 +535,6 @@ pub struct Promoted {
 }
 
 /// The requests a replay's loop asked that are acts, in order, each word
-/// passed through `map`.
 fn acts_asked(report: &Report, map: impl Fn(&str) -> String) -> Vec<Vec<String>> {
     report
         .requests
@@ -670,18 +547,9 @@ fn acts_asked(report: &Report, map: impl Fn(&str) -> String) -> Vec<Vec<String>>
         .collect()
 }
 
-/// THE TAPE `bytes` MADE A CORPUS TAPE, or refused ([module docs](self)):
-/// whole and ended, and REPRODUCED by a strict replay on this build as it
-/// was recorded; scrubbed by `scrub` into its text form; that text passing
-/// [`lint`] (`home`: the recording machine's), replaying strictly
-/// REPRODUCED, replaying in acts mode under its own policy REPRODUCED with
-/// every act on it taken, and its replay asking the very acts the original's
-/// replay asked, each in the scrub's words.
-///
+/// THE TAPE `bytes` MADE A CORPUS TAPE, or refused ([module docs](self)): whole and ended, and REPRODUCED by a strict replay on this build as it was recorded; scrubbed by `scrub` into its text form; that text passing [`lint`] (`home`: the recording machine's), replaying strictly REPRODUCED, replaying in acts mode under its own policy REPRODUCED with every act on it taken, and its replay asking the very acts the original's replay asked, each in the scrub's words.
 /// # Errors
-///
-/// Why the tape is not a corpus tape — each failed condition named, with
-/// the replay's report where a replay said so.
+/// Why the tape is not a corpus tape — each failed condition named, with the replay's report where a replay said so.
 pub fn promote(bytes: &[u8], scrub: &Scrub, home: Option<&Path>) -> Result<Promoted, String> {
     let tape = show::open(bytes, false)?;
     if let Some(tail) = show::tail_note(&tape) {

@@ -1,50 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The usage tap (`docs/DESIGN-claude-accounts-v2-2026-10-15.md` §3.1, §3.2). Claude Code's own
-//! status-line setting, passed as `--settings` on the relaunch lines aterm types, runs
-//! `<aterm> harness tap` after every main-agent reply and every [`TAP_REFRESH_S`] seconds. The
-//! tap writes the usage figures from its stdin into one private file per process ([`Reading`],
-//! under [`rl_dir`]) and prints the row Claude Code draws under its composer ([`Reading::line`]).
-//! The tab's host reads its own file at decided turn ends, keeps a reading only where it is
-//! [`Fresh`] and records it for the machine's own account ([`super::accounts::note_reading`]), with
-//! what the freshness rule saw of it ([`Fresh::beside`]: a figure that dropped under one reset, in a
-//! process served since, is a limit reset used inside the window). A reading moves no session: it
-//! feeds the accounts state and the `usage`, `accounts` and `accounts stats` reports.
-//!
-//! * The switch is `[harness] usage_tap`, off by default. A session tapped while it was on keeps
-//!   its tap until its next relaunch sheds it, and the host reads and records its file till then.
-//! * With autopilot Off (`docs/DESIGN-harness-autopilot-2026-10-15.md` §7) the host stops the
-//!   session's worker, or its loop parks, so no decided turn end reads the file: a tapped Claude
-//!   Code keeps drawing its row and writing its file until its next relaunch, but nothing of it is
-//!   recorded, nor a silent tap noticed. Another tapped session on the same login records the same
-//!   figures.
-//! * [`gate`] adds it only for a Claude Code on the machine's own stored login whose settings claim
-//!   neither the status line nor the login, from an aterm at a lasting, shell-inert path
-//!   ([`stable_exe`]); aterm never chains a person's own status line and never runs a command read
-//!   from settings. The machine's own login is the default one or, with a roster of one account,
-//!   the login its row is bound to ([`own_login`]), so the tap follows that account through its
-//!   renewals. The chain is read when the line is typed, and the line's `--settings` outranks the
-//!   user, project and local documents, so a status line set later shows only from the next
-//!   relaunch, whose gate refuses the tap.
-//! * [`super::upgrade::rewrite_argv`] drops a `--settings` value exactly [`is_ours`] and carries
-//!   every other verbatim, so the resume line a person is shown never carries it.
-//! * The file is `<sid>-<CLAUDE_PID>.json`, `sid` the tab's own id (`ATERM_PARENT_SESSION_ID`; a
-//!   nested aterm's `ATERM_SESSION_ID` is the id it adopts): mode 0600, temp file renamed, in a
-//!   0700 directory. It holds the figures (whole and in tenths, as the vendor sent them), the API
-//!   time, the cache's warmth, the vendor's version, the process's model id and the login
-//!   variables' values; never stdin as it came, nor a token.
-//! * The row, between the composer's bottom rule and the mode row, is never empty
-//!   (`5h 42% · 7d 61%`, or [`NO_FIGURES`]): on 2.1.282 a status line that prints nothing still
-//!   takes a row, and the footer's readers stop at a blank one, short of the mode row.
-//!
-//! Measured on Claude Code 2.1.300 (`docs/measured/real-claude-lab-2026-10-15.md`, "Usage
-//! figures"): stdin carries `rate_limits.{five_hour,seven_day}.{used_percentage,resets_at}`,
-//! `cost.total_api_duration_ms`, `session_id`, `prompt_cache.{warm,expires_at}` and `version`; the
-//! environment carries `CLAUDE_PID`, `ATERM_PARENT_SESSION_ID` and both login variables, not
-//! `CLAUDE_CODE_OAUTH_TOKEN`; an idle process re-reports the figures it holds, so a reading is only
-//! as fresh as its last request; `disableAllHooks` stops the command, and so does a standing
-//! permission box until it is answered, which is why silence is judged only at idle points.
+//! Claude Code status-line usage tap ([`TAP_REFRESH_S`], [`Reading`], [`rl_dir`],
+//! [`Reading::line`], [`NO_FIGURES`]): launch gating ([`gate`], [`stable_exe`], [`own_login`],
+//! [`is_ours`], [`super::upgrade::rewrite_argv`]) and fresh reading recording ([`Fresh`],
+//! [`Fresh::beside`], [`super::accounts::note_reading`]).
 
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -54,22 +14,19 @@ use aterm_json::{Map, Value};
 use super::accounts;
 use super::netwatch::{self, Source};
 
-/// How often Claude Code re-runs the tap while idle (`refreshInterval`,
-/// seconds): a constant, not a key.
+/// How often Claude Code re-runs the tap while idle (`refreshInterval`, seconds).
 pub const TAP_REFRESH_S: u32 = 10;
 
 /// The file's format version ([`Reading::to_json`]).
 pub const FORMAT_V: u64 = 1;
 
-/// The most of stdin the verb reads: a payload longer than this is unusable,
-/// drained and dropped.
+/// The most of stdin the verb reads.
 pub const STDIN_MAX: usize = 256 * 1024;
 
 /// The most of a reading's file the host reads.
 const FILE_MAX: u64 = 16 * 1024;
 
-/// A tapped process that served a turn, whose file is missing or older than this at two decided
-/// points this far apart, is silent ([`Silence`]).
+/// A tapped process that served a turn.
 pub const SILENT_S: i64 = 30;
 
 /// A file older than this is swept ([`sweep`]), whoever wrote it.
@@ -87,30 +44,13 @@ const VALUE_TAIL: &str = r#"","refreshInterval":10}}"#;
 /// The row printed when there are no figures ([`Reading::line`]).
 pub const NO_FIGURES: &str = "5h \u{2013} \u{b7} 7d \u{2013}";
 
-/// Whether `exe` can be named in the status-line command: an absolute UTF-8 path every byte of
-/// which is a letter, a digit or one of `/ . _ - +`. Claude Code runs the command through a shell,
-/// so the path must be inert to one. A space is refused too: its round trip through each shell's
-/// quoting of the relaunch line is unmeasured, and the installed `aterm.app` path has none.
-///
-/// On Windows it is a drive path, which the command names with `/` separators
-/// ([`command_spelling`]).
+/// Whether `exe` can be named in the status-line command.
 #[must_use]
 pub fn exe_admissible(exe: &Path) -> bool {
     command_spelling(exe).is_some()
 }
 
 /// How `exe` is spelled in the status-line command, or `None` where it is not
-/// [`exe_admissible`].
-///
-/// On Windows Claude Code runs a status-line command as it runs a hook's: through Git Bash where
-/// it finds one, else through PowerShell (Claude Code 2.1.x's hook runner, read 2026-10-17: a
-/// command with no `shell` runs in `bash` when Git Bash resolves). bash reads a `\` as an escape,
-/// so `C:\Users\…\aterm.exe` would name `C:Users…aterm.exe`; the same path with `/` separators,
-/// `C:/Users/…/aterm.exe`, is the file to Git Bash, pwsh 7 and Windows PowerShell 5.1 alike
-/// (measured 2026-10-17: each ran `C:/Users/…/aterm.exe --version`), and needs no JSON escape.
-/// So a Windows path is admitted as a drive letter, `:`, a separator and then the bytes above,
-/// `\` written as `/`; the `\\?\` prefix a canonical path carries is dropped first. A UNC or
-/// device path (`\\server\…`, `\\?\UNC\…`) is refused.
 fn command_spelling(exe: &Path) -> Option<String> {
     let text = exe.to_str()?;
     let inert = |b: u8| b.is_ascii_alphanumeric() || matches!(b, b'/' | b'.' | b'_' | b'-' | b'+');
@@ -127,17 +67,13 @@ fn command_spelling(exe: &Path) -> Option<String> {
     (exe.is_absolute() && text.len() > 1 && text.bytes().all(inert)).then(|| text.to_owned())
 }
 
-/// The `--settings` value for `exe`, byte for byte
-/// `{"statusLine":{"type":"command","command":"<exe> harness tap","refreshInterval":10}}`, or
-/// `None` where `exe` is not [`exe_admissible`]. `<exe>` is its [`command_spelling`].
+/// The `--settings` value for `exe`.
 #[must_use]
 pub fn settings_value(exe: &Path) -> Option<String> {
     command_spelling(exe).map(|exe| format!("{VALUE_HEAD}{exe}{COMMAND_TAIL}{VALUE_TAIL}"))
 }
 
-/// Whether a `--settings` value is exactly aterm's tap ([`settings_value`] of some admissible
-/// executable): the only `--settings` a relaunch drops. A key more, another command, an argument
-/// after `tap`, a relative path or a space anywhere makes it another's, carried verbatim.
+/// Whether a `--settings` value is exactly aterm's tap.
 #[must_use]
 pub fn is_ours(value: &str) -> bool {
     value
@@ -147,9 +83,7 @@ pub fn is_ours(value: &str) -> bool {
         .is_some_and(|exe| settings_value(Path::new(exe)).as_deref() == Some(value))
 }
 
-/// Whether `argv` (`argv[0]` first) carries aterm's tap: a `--settings` (as
-/// `--settings v` or `--settings=v`) whose value [`is_ours`]. The host reads
-/// a process's file only where its argv says it was tapped.
+/// Whether `argv` (`argv[0]` first) carries aterm's tap.
 #[must_use]
 pub fn carried_by(argv: &[String]) -> bool {
     let mut it = argv.iter().skip(1);
@@ -169,11 +103,7 @@ pub fn carried_by(argv: &[String]) -> bool {
     false
 }
 
-/// This aterm's canonical `current_exe`, where it is at a lasting place (`atpkg::stub::lasting`:
-/// not a temp or cargo target directory, nor a translocated or mounted copy) and
-/// [`exe_admissible`]; `None` otherwise, and then no line carries the tap. Computed once per
-/// process. On Windows the window runs the windowed image, which takes `harness tap` for a
-/// window's flags, so the tap names the console image beside it ([`tap_image`]).
+/// This aterm's canonical `current_exe`.
 #[must_use]
 pub fn stable_exe() -> Option<PathBuf> {
     static EXE: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
@@ -185,11 +115,7 @@ pub fn stable_exe() -> Option<PathBuf> {
     .clone()
 }
 
-/// The image the tap's command runs for a running `exe`: on Windows the console image
-/// `aterm.exe` beside a windowed one (`aterm-gui.exe`, a build tree's `aterm-windowed.exe`), or
-/// `None` where `is_file` finds none; `exe` itself otherwise. `aterm-gui harness tap` would open
-/// a window: the windowed image routes every verb but the windowing ones to the window
-/// (`alias_route` in crates/aterm/src/main.rs). `is_file` is injected for the tests.
+/// The image the tap's command runs for a running `exe`.
 pub(crate) fn tap_image(exe: &Path, is_file: impl Fn(&Path) -> bool) -> Option<PathBuf> {
     let windowed = cfg!(windows)
         && exe
@@ -206,8 +132,7 @@ pub(crate) fn tap_image(exe: &Path, is_file: impl Fn(&Path) -> bool) -> Option<P
     is_file(&console).then_some(console)
 }
 
-/// Where the readings are: `<aterm state>/harness/claude-harness/rl`. `None` where no state root
-/// resolves.
+/// Where the readings live.
 #[must_use]
 pub fn rl_dir() -> Option<PathBuf> {
     aterm_types::dirs::state_dir()
@@ -220,33 +145,27 @@ pub fn rl_dir_in(state: &Path) -> PathBuf {
     state.join("rl")
 }
 
-/// Whether `sid` is a tab id (`s-<hex>`): the only kind joined onto a path.
+/// Whether `sid` is a tab id (`s-<hex>`).
 pub(crate) fn is_tab_id(sid: &str) -> bool {
     sid.strip_prefix("s-").is_some_and(|hex| {
         (1..=64).contains(&hex.len()) && hex.bytes().all(|b| b.is_ascii_hexdigit())
     })
 }
 
-/// The file of process `pid` in tab `sid`: `<sid>-<pid>.json`. `None` for a
-/// `sid` that is not a tab id or a zero `pid`.
+/// The file of process `pid` in tab `sid`.
 #[must_use]
 pub fn file_name(sid: &str, pid: u32) -> Option<String> {
     (is_tab_id(sid) && pid > 0).then(|| format!("{sid}-{pid}.json"))
 }
 
-// The reading
-
-/// One window's figure as Claude Code hands it: percent used, whole and in
-/// tenths, and the instant (Unix seconds) the window resets.
+/// One window's figure as Claude Code hands it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Window {
-    /// `used_percentage`, rounded to a whole percent: what the row prints.
+    /// `used_percentage`, rounded to a whole percent.
     pub pct: u32,
     /// `resets_at`.
     pub resets_at: i64,
-    /// `used_percentage` in tenths of a percent, as Claude Code hands it
-    /// (one decimal: `Math.round(e*1000)/10`, READ in the 2.1.301 bundle;
-    /// `42.6` in the lab, design F1). `None` in a file an older tap wrote.
+    /// `used_percentage` in tenths of a percent.
     pub pct_x10: Option<u32>,
 }
 
@@ -261,9 +180,7 @@ impl Window {
 /// One run of the tap, as its file holds it (format [`FORMAT_V`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Reading {
-    /// When its figures were first reported since its process was last
-    /// served (Unix seconds): the run's own clock, kept by every re-report of
-    /// the same figures with no request between ([`run`]).
+    /// When its figures were first reported since its process was last served (Unix seconds).
     pub at: i64,
     /// The tab (`ATERM_PARENT_SESSION_ID`).
     pub sid: String,
@@ -275,7 +192,7 @@ pub struct Reading {
     pub login: Option<String>,
     /// The raw value of [`accounts::HOME_ENV`] there.
     pub home: Option<String>,
-    /// `cost.total_api_duration_ms`: the process's API time so far.
+    /// `cost.total_api_duration_ms`.
     pub api_ms: u64,
     /// `rate_limits.five_hour`.
     pub five_hour: Option<Window>,
@@ -287,16 +204,13 @@ pub struct Reading {
     pub cache_expires_at: Option<i64>,
     /// The vendor's `version`.
     pub version: Option<String>,
-    /// The process's model (`model.id`), where it is a model id. `None` in a
-    /// file an older tap wrote.
+    /// The process's model (`model.id`), where it is a model id.
     pub model: Option<String>,
-    /// How long the verb took up to its write, microseconds (the tap's own
-    /// cost, beside its process's start).
+    /// How long the verb took up to its write, microseconds.
     pub dur_us: u64,
 }
 
-/// What the tap reads of its environment ([`run`]): the tab, the process and
-/// the two login variables, raw. Nothing else.
+/// What the tap reads of its environment ([`run`]).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TapVars {
     /// `ATERM_PARENT_SESSION_ID`.
@@ -324,7 +238,6 @@ impl TapVars {
 }
 
 /// A percent from the vendor, an integer or a finite number in `0..=100`,
-/// as the whole percent it rounds to and in tenths, rounded.
 fn pct_of(value: &Value) -> Option<(u32, u32)> {
     if let Some(n) = value.as_u64() {
         let pct = u32::try_from(n).ok().filter(|p| *p <= 100)?;
@@ -333,7 +246,6 @@ fn pct_of(value: &Value) -> Option<(u32, u32)> {
     let f = value
         .as_f64()
         .filter(|f| f.is_finite() && (0.0..=100.0).contains(f))?;
-    // In range by the filter: the casts cannot truncate.
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     Some((f.round() as u32, (f * 10.0).round() as u32))
 }
@@ -360,10 +272,7 @@ fn word_of(value: Option<&Value>, max: usize) -> Option<String> {
 }
 
 impl Reading {
-    /// The vendor's status-line payload `text` as a reading for the tab and
-    /// process `vars` name, at `now`. `None` where `vars` names no tab or no
-    /// process (nothing is written then). A payload that is not a JSON
-    /// object is a reading with no figures.
+    /// The vendor's status-line payload `text` as a reading for the tab and process `vars` name.
     #[must_use]
     pub fn of_stdin(text: &str, vars: &TapVars, now: i64) -> Option<Reading> {
         let sid = vars.sid.clone().filter(|s| is_tab_id(s))?;
@@ -410,9 +319,7 @@ impl Reading {
         self.five_hour.is_some() || self.seven_day.is_some()
     }
 
-    /// The row the tap prints: `5h 42% · 7d 61%`, a window with no figure as
-    /// `–` ([`NO_FIGURES`] with none). At most 17 columns, so a vendor notice
-    /// drawn on the right of the same row keeps its place.
+    /// The row the tap prints.
     #[must_use]
     pub fn line(&self) -> String {
         line_of(self.five_hour, self.seven_day)
@@ -451,10 +358,7 @@ impl Reading {
         aterm_json::to_string(&Value::Object(o)).unwrap_or_default()
     }
 
-    /// A file's text as a reading: format [`FORMAT_V`] and every field of its
-    /// type, or `None`. The fields a newer tap added (`pct_x10`, `model`,
-    /// `dur_us`) are read where they are there and of their type, and are
-    /// `None` (`0`) otherwise, so a file an older tap wrote still reads.
+    /// A file's text as a reading.
     #[must_use]
     pub fn of_json(text: &str) -> Option<Reading> {
         let doc = aterm_json::from_str::<Value>(text).ok()?;
@@ -507,10 +411,7 @@ impl Reading {
         })
     }
 
-    /// The reading of process `pid` in tab `sid` from its own file in `dir` ([`file_name`]), with
-    /// the file's mtime (Unix seconds). Only a regular file (a symlink is refused) of bounded size,
-    /// modified at or after `started` (the process's kernel start, so a file a reused pid left is
-    /// not its), naming the same tab and process.
+    /// The reading of process `pid` in tab `sid` from its own file in `dir` ([`file_name`]).
     #[must_use]
     pub fn read(dir: &Path, sid: &str, pid: u32, started: i64) -> Option<(Reading, i64)> {
         let path = dir.join(file_name(sid, pid)?);
@@ -524,11 +425,7 @@ impl Reading {
             .map(|r| (r, mtime))
     }
 
-    /// The reading as the accounts state records it
-    /// ([`accounts::note_reading`]): the two windows in tenths, when they
-    /// were served ([`Self::at`]), what the freshness rule saw of it before
-    /// it was admitted (`beside`, [`Fresh::beside`]), and the key of the
-    /// account its home is signed in to (`key`, where the host read one).
+    /// The reading as the accounts state records it ([`accounts::note_reading`]).
     #[must_use]
     pub fn tap_read(
         &self,
@@ -562,7 +459,6 @@ pub fn line_of(five_hour: Option<Window>, seven_day: Option<Window>) -> String {
 }
 
 /// The modification time of the regular file at `path` (Unix seconds), not
-/// following a symlink; `None` for anything else.
 fn file_mtime(path: &Path) -> Option<i64> {
     let meta = std::fs::symlink_metadata(path).ok()?;
     if !meta.file_type().is_file() {
@@ -577,7 +473,6 @@ fn file_mtime(path: &Path) -> Option<i64> {
 }
 
 /// The text of the regular file at `path`, opened without following a
-/// symlink, at most [`FILE_MAX`] bytes.
 fn read_regular(path: &Path) -> Option<String> {
     let mut open = std::fs::OpenOptions::new();
     open.read(true);
@@ -595,11 +490,7 @@ fn read_regular(path: &Path) -> Option<String> {
     (text.len() as u64 <= FILE_MAX).then_some(text)
 }
 
-// The verb
-
 /// Write `text` to `dir/name`: the directory made 0700, a temp file of mode
-/// 0600 (never through a link) renamed over it. No sync: a reading lost to a
-/// crash is replaced within [`TAP_REFRESH_S`] seconds.
 fn write_reading(dir: &Path, name: &str, text: &str) -> io::Result<()> {
     aterm_types::fs_restricted::ensure_private_dir(dir)?;
     let path = dir.join(name);
@@ -611,9 +502,6 @@ fn write_reading(dir: &Path, name: &str, text: &str) -> io::Result<()> {
         use std::os::unix::fs::OpenOptionsExt as _;
         open.mode(0o600).custom_flags(libc::O_NOFOLLOW);
     }
-    // Until exclusive creation succeeds the candidate belongs to someone
-    // else. In particular, do not open an occupied FIFO or clean up a
-    // regular file left by another writer.
     let mut file = open.open(&tmp)?;
     let written = file.write_all(text.as_bytes());
     drop(file);
@@ -627,16 +515,7 @@ fn write_reading(dir: &Path, name: &str, text: &str) -> io::Result<()> {
 }
 
 /// WHEN `reading`'S FIGURES WERE FIRST REPORTED since its process was last
-/// served: the `at` of the reading already at `path` where that names the
-/// same tab and process with the same `api_ms` and the same figures — a
-/// re-report, which Claude Code makes every [`TAP_REFRESH_S`] seconds while
-/// idle — else the reading's own. So a reading's `at` is when its figure was
-/// served, however late the host reads the file ([`Reading::tap_read`]);
-/// the silence rule reads the file's modification time, which every write
-/// moves. Never later than the reading's own.
 fn first_reported(path: &Path, reading: &Reading) -> i64 {
-    // An older v1 file has only whole percentages. Adding their equivalent
-    // tenths is the same figure, not a newly served report.
     let figure = |w: Option<Window>| w.map(|w| (w.x10(), w.resets_at));
     read_regular(path)
         .and_then(|text| Reading::of_json(&text))
@@ -659,8 +538,6 @@ fn first_reported(path: &Path, reading: &Reading) -> i64 {
 }
 
 /// Read stdin as the verb takes it: at most [`STDIN_MAX`] bytes of UTF-8,
-/// the rest drained. `None` for a payload over the bound, not UTF-8, or one
-/// that could not be read.
 fn read_payload(stdin: &mut dyn Read) -> Option<String> {
     let mut bytes = Vec::new();
     let read = stdin
@@ -668,7 +545,6 @@ fn read_payload(stdin: &mut dyn Read) -> Option<String> {
         .read_to_end(&mut bytes)
         .ok();
     if bytes.len() > STDIN_MAX {
-        // Drained, so the writer never meets a closed pipe.
         let _ = io::copy(stdin, &mut io::sink());
         return None;
     }
@@ -676,12 +552,7 @@ fn read_payload(stdin: &mut dyn Read) -> Option<String> {
     String::from_utf8(bytes).ok()
 }
 
-/// `aterm harness tap`, Claude Code's status-line command: reads the payload from `stdin` (none
-/// where `stdin_is_tty`), writes the reading of the process `vars` name into `dir` (`None`:
-/// nothing written), stamped `now` or as the reading already there where this one re-reports it
-/// ([`first_reported`]), and prints its row on `out`. Always exits 0 with one non-empty line: a
-/// failing or silent command leaves the row blank or wrong. Reads no variable but the four of
-/// [`TapVars`].
+/// `aterm harness tap`, Claude Code's status-line command.
 pub fn run(
     stdin: &mut dyn Read,
     stdin_is_tty: bool,
@@ -715,10 +586,7 @@ pub fn run(
     std::process::ExitCode::SUCCESS
 }
 
-/// Remove from `dir` every reading whose process is gone (`alive` answers
-/// for a pid) or that is older than [`SWEEP_AFTER_S`] at `now`, and every
-/// temp file a tap left: what a host does as it starts. Only names this
-/// module writes are touched, and never through a link.
+/// Remove from `dir` every reading whose process is gone (`alive` answers for a pid).
 pub fn sweep(dir: &Path, now: i64, alive: &dyn Fn(u32) -> bool) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
@@ -754,24 +622,16 @@ pub fn sweep(dir: &Path, now: i64, alive: &dyn Fn(u32) -> bool) {
     }
 }
 
-// Where the tap is added
-
-/// `[harness] usage_tap` on, for the relaunch lines one pass types
-/// (`super::upgrade_drive::Opts::usage_tap`).
+/// `[harness] usage_tap` on, for the relaunch lines one pass types.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Armed {
     /// The aterm the tap's command names ([`stable_exe`]).
     pub exe: PathBuf,
-    /// The login of the machine's one account where it has a directory of its own, as this
-    /// machine's logins bind the row (a renewal rebinds it), read as the pass began
-    /// (`accounts::lone_login_at`). A line on it carries the tap as one on the default login does
-    /// ([`own_login`]). `None`: the default login alone.
+    /// The login of the machine's one account where it has a directory of its own.
     pub lone_login: Option<String>,
 }
 
-/// Whether a line's login is the machine's own, for [`gate`]: the default home (`home` unset), and
-/// the default login (`login` unset or empty) or the one account's (`lone`,
-/// [`Armed::lone_login`]), byte for byte.
+/// Whether a line's login is the machine's own, for [`gate`].
 #[must_use]
 pub fn own_login(login: Option<&str>, home: Option<&str>, lone: Option<&str>) -> bool {
     home.is_none() && (login.is_none_or(str::is_empty) || login == lone)
@@ -780,37 +640,25 @@ pub fn own_login(login: Option<&str>, home: Option<&str>, lone: Option<&str>) ->
 /// What [`gate`] decides on, gathered by the relaunch's plan.
 #[derive(Debug, Clone, Copy)]
 pub struct GateFacts<'a> {
-    /// `[harness] usage_tap` on: the executable to name ([`stable_exe`]);
-    /// `None`, off.
+    /// `[harness] usage_tap`.
     pub exe: Option<&'a Path>,
-    /// The process the line replaces authenticates by its stored login, as its exec environment
-    /// reads (`super::relaunch::Snapshot::stored_login`).
+    /// The process the line replaces authenticates by its stored login.
     pub stored_login: bool,
-    /// The login variable's value the line carries ([`accounts::LOGIN_ENV`]):
-    /// unset or empty is the machine's own login.
+    /// The login variable's value the line carries ([`accounts::LOGIN_ENV`]).
     pub login: Option<&'a str>,
-    /// The login of the machine's one account ([`Armed::lone_login`]), which [`own_login`] counts
-    /// as the machine's own.
+    /// The login of the machine's one account ([`Armed::lone_login`]).
     pub lone_login: Option<&'a str>,
-    /// The Claude home the line carries ([`accounts::HOME_ENV`]): set at all
-    /// is not the default home.
+    /// The Claude home the line carries ([`accounts::HOME_ENV`]).
     pub home: Option<&'a str>,
     /// The argv the line is made from, `argv[0]` first.
     pub argv: &'a [String],
-    /// Every document of the settings chain Claude Code reads for it, and
-    /// its managed preference domains, as the chain's reader returned them.
+    /// Every document of the settings chain Claude Code reads for it.
     pub settings: &'a [(String, Source)],
-    /// The vendor's profile store holds a config
-    /// ([`accounts::profile_configured`]).
+    /// The vendor's profile store holds a config ([`accounts::profile_configured`]).
     pub profile_store: bool,
 }
 
-/// The `--settings` value a relaunch line carries, or `None`. It needs the switch on and the
-/// executable admissible; the machine's own stored login in the default home ([`own_login`]); no
-/// `--settings` left once aterm's own is shed, and no `--bare` (which drops the status line); every
-/// settings document readable, none setting `statusLine`, `disableAllHooks: true`, `apiKeyHelper`
-/// or a credential, profile or route in an `env` block; no managed preference domain (this reader
-/// cannot open one); and no profile store config. Pure.
+/// The `--settings` value a relaunch line carries, or `None`.
 #[must_use]
 pub fn gate(f: &GateFacts<'_>) -> Option<String> {
     let value = settings_value(f.exe?)?;
@@ -824,9 +672,6 @@ pub fn gate(f: &GateFacts<'_>) -> Option<String> {
     {
         return None;
     }
-    // The credential side, as the accounts' judgment reads it: an `env`
-    // block naming a credential, a profile or a route, the login or the
-    // home; an `apiKeyHelper`; a document that cannot be read or parsed.
     let stored = accounts::ProcessLogin::of_env([])
         .with_settings(f.settings)
         .stored_login;
@@ -840,35 +685,24 @@ pub fn gate(f: &GateFacts<'_>) -> Option<String> {
     (stored && quiet).then_some(value)
 }
 
-// The host's half: freshness and silence
-
-/// The freshness rule (design §3.2), per tab: a reading counts only where it is the first with a
-/// figure for its process, its process was served a request since the last one (`api_ms` rose),
-/// or its figures changed. An idle process re-reports what it holds every [`TAP_REFRESH_S`]
-/// seconds; that is no news, and a figure it repeats may be another session's past.
+/// The freshness rule, per tab.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Fresh {
-    /// The last reading admitted: its process, API time and figures.
+    /// The last reading admitted.
     last: Option<(u32, u64, Option<Window>, Option<Window>)>,
 }
 
-/// WHAT A FRESH READING SAYS BESIDE THE ONE ADMITTED BEFORE IT ([`Fresh::beside`]).
+/// What a fresh reading says beside the one admitted before it ([`Fresh::beside`]).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Beside {
-    /// The last reading admitted was its own process's: what it reads now
-    /// was served since then ([`accounts::TapRead::seen_before`]).
+    /// The last reading admitted was its own.
     pub seen: bool,
-    /// Per window (five-hour, week), the figure the vendor refilled it from
-    /// ([`accounts::WindowRead::refilled`]): the same process's reading
-    /// before, where it was served since (`api_ms` rose), under the same
-    /// reset, and this reading is lower than it by
-    /// [`accounts::REFILL_MIN_X10`] or more.
+    /// Per window (five-hour, week), the figure the vendor refilled it to.
     pub refilled: [Option<u32>; 2],
 }
 
 impl Fresh {
-    /// What `reading` says beside the last reading admitted ([`Beside`]):
-    /// asked BEFORE [`Self::admit`] takes it.
+    /// What `reading` says beside the last reading admitted ([`Beside`]).
     #[must_use]
     pub fn beside(&self, reading: &Reading) -> Beside {
         let Some((_, api_ms, five, seven)) = self.last.filter(|(pid, ..)| *pid == reading.pid)
@@ -895,7 +729,7 @@ impl Fresh {
         }
     }
 
-    /// Whether `reading` is fresh; an admitted one becomes the last.
+    /// Whether `reading` is fresh.
     pub fn admit(&mut self, reading: &Reading) -> bool {
         if !reading.has_figures() {
             return false;
@@ -922,17 +756,13 @@ impl Fresh {
 pub enum Heard {
     /// Nothing changed.
     Same,
-    /// The process went silent at this point: marked once.
+    /// The process went silent at this point.
     Silent,
-    /// The mark ends: its process is heard again, or another process holds
-    /// the tab now ([`Silence::untapped`]).
+    /// The mark ends: its process is heard again, or another process holds the tab now.
     Again,
 }
 
-/// The silent-tap rule (design §3.1): a tapped process up at least [`SILENT_S`] seconds that has
-/// served a turn, whose file is missing or older than [`SILENT_S`] at two decided points at least
-/// that far apart, is marked silent, once per process. A fresh file unmarks it, and so does
-/// another process taking the tab: the mark ends with its process.
+/// The silent-tap rule.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Silence {
     /// The process the strikes are about.
@@ -944,10 +774,7 @@ pub struct Silence {
 }
 
 impl Silence {
-    /// One decided point at `now` for process `pid`, up `up_s` seconds,
-    /// `served` a turn since it started, its file `file_age` seconds old
-    /// (`None`: no file). A new process's first point takes a strike at
-    /// most, and a mark on the one before ends there ([`Heard::Again`]).
+    /// One decided point at `now` for process `pid`, up `up_s` seconds.
     pub fn step(
         &mut self,
         now: i64,
@@ -961,8 +788,7 @@ impl Silence {
         if ended { Heard::Again } else { heard }
     }
 
-    /// Process `pid` now holds the tab and carries no tap, so it is never judged: the rule starts
-    /// over on it, and a standing mark ends ([`Heard::Again`]).
+    /// Process `pid` now holds the tab and carries no tap, so it is never judged.
     pub fn untapped(&mut self, pid: u32) -> Heard {
         let before = std::mem::replace(
             self,

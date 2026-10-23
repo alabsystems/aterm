@@ -1,16 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The durable tagged log: a bounded ring of records, the line codec the host appends
-//! to `<log_dir>/messages.log`, and the pending-persist queue (the host appends, the
-//! engine encodes). One record per line, `m1<TAB>kind<TAB>k=v<TAB>k=v…`; values escape
-//! `\`, TAB, LF, CR and US; unknown keys are ignored and unknown kinds skipped, so an
-//! older build reads a newer file and vice versa. Every line ends with an `end=` field
-//! the decoder requires, so a line cut short mid-append (inside its last value
-//! included) fails to decode instead of reading as a shorter record, and so does one
-//! the next append was glued onto (a second `kind=`). The decoder clips every word to
-//! the model's caps and drops empty detail lines, so a hand-edited or hostile line
-//! cannot put in the ring what `post` would never have admitted.
+//! The durable tagged log.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
@@ -23,17 +14,10 @@ use crate::{
     TITLE_CAP, WIRE_LOG_SHARE,
 };
 
-/// The longest line the decoder accepts, sized from the model's caps so that every line
-/// the encoder writes for a message within them decodes: a char is up to four bytes, so
-/// [`TITLE_CAP`] + [`DETAIL_LINES_CAP`] × [`DETAIL_LINE_CAP`] + [`KEY_CAP`] chars, the
-/// escaped joints, the fixed fields and two encoded intents come to under 32 KiB, half
-/// of this. A longer line is foreign or corrupt and the loader skips it
-/// (`codec_reads_back_a_message_at_the_crates_own_caps` measures both).
+/// The longest line the decoder accepts, sized from the model's caps so that every line the encoder writes for a message within them decodes.
 pub const MAX_LINE_BYTES: usize = 64 * 1024;
 
 /// No id at or past this ever raises the sequence: a corrupt line or a
-/// forged carry cannot park `next_id` at the ceiling, where every later
-/// mint would hand out the same saturated id. No process reaches it.
 const ID_CEILING: u64 = 1 << 62;
 
 /// The unit separator that joins detail lines and actions inside one value.
@@ -66,16 +50,11 @@ pub enum Retired {
     Evicted,
     /// It went to the successor process in the handoff carry.
     Carried,
-    /// The reporter withdrew it with no outcome to claim — a live meter
-    /// whose source vanished before any marker said how the pass ended.
+    /// The reporter withdrew it with no outcome to claim — a live meter whose source vanished before any marker said how the pass ended.
     Withdrawn,
-    /// A record: posted [`crate::model::Hold::LogOnly`], never on the glass. The line
-    /// codec spells it `how=folded rec=1`, so an older build reads it as a fold.
+    /// A record: posted [`crate::model::Hold::LogOnly`], never on the glass.
     Recorded,
-    /// aterm quit while the row was still open: a live row's work, or a held row's
-    /// hold, was cut off by the process ending, not by its reporter. Its record keeps
-    /// its words and its mark and says where the work was. An older build skips the
-    /// unknown word, so the record reads as the dead process's open row.
+    /// aterm quit while the row was still open.
     Quit,
 }
 
@@ -148,9 +127,7 @@ pub enum LogState {
     Retired(Retired),
 }
 
-/// One message as the log keeps it: the words at post, updated to the final words when
-/// it retires (restatements are never logged, so the Retired line carries them). The
-/// mark is the exception: while the row lives the ring's record reads the mark it shows.
+/// One message as the log keeps it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LogRecord {
     /// The id.
@@ -159,14 +136,9 @@ pub struct LogRecord {
     pub stamp: WallStamp,
     /// The reporter family.
     pub tag: Tag,
-    /// The severity: the live row's while it lives, the one it retired
-    /// under once retired.
+    /// The severity: the live row's while it lives, the one it retired under once retired.
     pub severity: Severity,
-    /// The severity it was posted at, its `posted` line's: the one its
-    /// reporter told it in, whatever mark it shows later (restated, or
-    /// retired fixed or delivered under `✓`). Settings ▸ Messages reads it to
-    /// tell whether a later record told a failure on as a failure
-    /// ([`crate::page::MessagesState::told_on`]).
+    /// The severity it was posted at, its `posted` line's.
     pub posted_severity: Severity,
     /// The glyph, as the severity.
     pub glyph: Glyph,
@@ -186,15 +158,11 @@ pub struct LogRecord {
     pub state: LogState,
     /// The wall clock when it retired.
     pub retired_unix_ms: Option<u64>,
-    /// When it retired, in this process only (a record loaded from disk has `None`: the
-    /// `appstatus` ledger stays process-scoped).
+    /// When it retired, in this process only (a record loaded from disk has `None`: the `appstatus` ledger stays process-scoped).
     pub retired_at: Option<Instant>,
     /// The last capsule pressed, and when.
     pub last_action: Option<(String, u64)>,
-    /// An entry of the digest ([`crate::need::Need::Later`]): written as an optional
-    /// `need=later` key an older build ignores, and kept open by a replay (every other
-    /// posted-and-never-retired line loads as Stale), so the exception survives a
-    /// restart until it is filed.
+    /// An entry of the digest ([`crate::need::Need::Later`]).
     pub later: bool,
 }
 
@@ -229,9 +197,7 @@ impl LogRecord {
         self.state == LogState::Posted
     }
 
-    /// `true` for a digest entry the owner or the digest itself filed (`Dismissed`,
-    /// `Answered`, `Unseen`, `Evicted`): the retirements that keep the fact quiet for
-    /// its span. `Resolved` and `Superseded` end a cause, so its return is news.
+    /// `true` for a digest entry the owner or the digest itself filed (`Dismissed`, `Answered`, `Unseen`, `Evicted`).
     #[must_use]
     pub(crate) fn filed_exception(&self) -> bool {
         self.later
@@ -247,16 +213,12 @@ impl LogRecord {
     }
 
     /// The ring keeps a filed exception for [`crate::need::FILED_KEEP`] after its filing
-    /// (not its posting): the fact's quiet span counts from the dismissal, so
-    /// [`LOG_CAP`] later records must not push the dismissal out while it holds.
-    /// `since_ms` is the earliest filing worth keeping.
     #[must_use]
     fn kept_as_filing(&self, since_ms: u64) -> bool {
         self.filed_exception() && self.retired_unix_ms.is_some_and(|t| t >= since_ms)
     }
 
-    /// The wire's record ([`Origin::wire_owned`]): it counts against the
-    /// ring's [`WIRE_LOG_SHARE`].
+    /// The wire's record ([`Origin::wire_owned`]): it counts against the ring's [`WIRE_LOG_SHARE`].
     #[must_use]
     pub fn wire_owned(&self) -> bool {
         self.origin.wire_owned(self.key.as_deref())
@@ -271,10 +233,7 @@ impl LogRecord {
         }
     }
 
-    /// Whether this retired record still offers `intent` (the page's and the `messages`
-    /// verb's one rule): never one that acted on the live row itself
-    /// ([`Intent::ends_with_row`]), and never the word the row was answered with. A live
-    /// row offers every intent it carries.
+    /// Whether this retired record still offers `intent` (the page's and the `messages` verb's one rule).
     #[must_use]
     pub fn still_offers(&self, intent: &Intent) -> bool {
         !intent.ends_with_row()
@@ -302,9 +261,6 @@ pub enum LogLine {
         /// Duplicate posts folded in.
         repeats: u32,
         /// The outcome's mark when the retirement changed it: the severity and glyph
-        /// the record reads under from here (`✓` Success for delivered work, `⚠` Warn
-        /// for work that stopped). Written as `sev=` and `glyph=`, which an older build
-        /// ignores; `None` keeps the posted mark.
         mark: Option<(Severity, Glyph)>,
     },
     /// A capsule was pressed.
@@ -316,18 +272,14 @@ pub enum LogLine {
         /// The capsule's full label.
         label: String,
     },
-    /// This many pending lines were dropped before this one — the file is
-    /// honest about a gap.
+    /// This many pending lines were dropped before this one — the file is honest about a gap.
     Dropped {
         /// How many.
         count: u32,
     },
 }
 
-/// Which file a line lands in. The wire's lines (every line about a record
-/// [`LogRecord::wire_owned`]) rotate on their own budget in their own file, so a
-/// script's flood turns over only its own history on disk, never aterm's
-/// (`WIRE_LOG_SHARE` is the same rule in memory).
+/// Which file a line lands in.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Shelf {
     /// aterm's own record: `messages.log`.
@@ -349,8 +301,7 @@ pub enum CodecError {
     MissingField(&'static str),
     /// A field did not parse.
     BadField(&'static str),
-    /// No `end=` terminator: the line was cut short mid-append — or the
-    /// next append was glued onto the cut (a second `kind=`).
+    /// No `end=` terminator: the line was cut short mid-append — or the next append was glued onto the cut (a second `kind=`).
     Truncated,
 }
 
@@ -421,9 +372,6 @@ impl LogLine {
             } => {
                 field("kind", "retired");
                 field("id", &id.to_string());
-                // A record is spelled as the fold an older build wrote for it, plus a
-                // key that build ignores: `how=recorded` would be an unknown word there,
-                // and the line would be dropped.
                 if *how == Retired::Recorded {
                     field("how", Retired::Folded.as_word());
                     field("rec", "1");
@@ -450,21 +398,14 @@ impl LogLine {
                 field("n", &count.to_string());
             }
         }
-        // Written last: a line cut anywhere before here has no terminator.
         field("end", "");
         out
     }
 
-    /// One line back into a record; forward-compatible (unknown keys are
-    /// ignored). Every word comes back clipped to the model's caps and
-    /// control-free, empty detail lines dropped — what `post` would have
-    /// made of it.
+    /// One line back into a record; forward-compatible (unknown keys are ignored).
     ///
     /// # Errors
-    /// [`CodecError`] for a line that is not `m1`, is over the size cap,
-    /// names an unknown kind, lacks a required field, or has no `end=`
-    /// terminator of its own (it was cut short, perhaps with the next line
-    /// glued on). The loader skips such a line and keeps reading.
+    /// [`CodecError`] for a line that is not `m1`, is over the size cap, names an unknown kind, lacks a required field, or has no `end=` terminator of its own (it was cut short, perhaps with the next line glued on).
     pub fn decode(line: &str) -> Result<Self, CodecError> {
         let line = line.strip_suffix('\n').unwrap_or(line);
         let line = line.strip_suffix('\r').unwrap_or(line);
@@ -476,11 +417,6 @@ impl LogLine {
             return Err(CodecError::NotM1);
         }
         let fields = Fields::parse(tokens);
-        // Two lines glued: an append cut short (a short write, a full disk) leaves no
-        // newline, and the next append lands on the same physical line. Every line
-        // opens with its `kind=`, so a second one is the next line's start: the torn
-        // line has no terminator of its own, and the first-wins fields would read a
-        // chimera of the two under the next line's `end=`.
         if fields.0.iter().filter(|(k, _)| k == "kind").count() > 1 {
             return Err(CodecError::Truncated);
         }
@@ -505,8 +441,6 @@ impl LogLine {
             },
             _ => return Err(CodecError::UnknownKind),
         };
-        // The terminator is checked last so the error names a missing required field
-        // first; a line cut inside its last value has every field and no terminator.
         if fields.get("end").is_none() {
             return Err(CodecError::Truncated);
         }
@@ -532,7 +466,6 @@ fn decode_posted(fields: &Fields) -> Result<LogLine, CodecError> {
         .iter()
         .filter_map(|a| Intent::decode(a))
         .filter(|i| *i != Intent::Details)
-        // `post` keeps at most MAX_ACTIONS.
         .take(MAX_ACTIONS)
         .collect();
     let origin = Origin::parse(&fields.need("origin")?).ok_or(CodecError::BadField("origin"))?;
@@ -603,7 +536,6 @@ impl Fields {
     }
 
     /// The `how=` word, an answered capsule's label clipped like a title; a
-    /// fold carrying `rec=1` is a record.
     fn how(&self) -> Result<Retired, CodecError> {
         let how = Retired::decode(&self.need("how")?).ok_or(CodecError::BadField("how"))?;
         Ok(match how {
@@ -617,8 +549,6 @@ impl Fields {
 }
 
 /// A loaded `detail=` value under the model's caps: the lines split at US,
-/// each clipped to [`DETAIL_LINE_CAP`], empty ones dropped (as the builder
-/// drops them), at most [`DETAIL_LINES_CAP`].
 fn capped_detail(joined: &str) -> Vec<String> {
     split_us(joined)
         .iter()
@@ -628,9 +558,7 @@ fn capped_detail(joined: &str) -> Vec<String> {
         .collect()
 }
 
-/// Lines joined by US. A US inside a line would read back as a line break, so it is
-/// dropped here; every stored line is control-stripped already, so the codec is total
-/// without a second escape level.
+/// Lines joined by US.
 pub(crate) fn join_us(lines: &[String]) -> String {
     let mut out = String::new();
     for (i, line) in lines.iter().enumerate() {
@@ -642,8 +570,7 @@ pub(crate) fn join_us(lines: &[String]) -> String {
     out
 }
 
-/// The inverse of [`join_us`]: a value's lines, split at US (none for an
-/// empty value).
+/// The inverse of [`join_us`]: a value's lines, split at US (none for an empty value).
 pub(crate) fn split_us(s: &str) -> Vec<String> {
     if s.is_empty() {
         return Vec::new();
@@ -702,26 +629,18 @@ pub(crate) struct FinalWords<'a> {
     pub(crate) mark: Option<(Severity, Glyph)>,
 }
 
-/// The bounded ring of records plus the lines waiting for the host to
-/// append. Loaded by replaying the file's tail; written by draining.
+/// The bounded ring of records plus the lines waiting for the host to append.
 #[derive(Clone, Debug, Default)]
 pub struct MessageLog {
     ring: VecDeque<LogRecord>,
     /// How many of [`Self::ring`]'s records are the wire's
-    /// ([`LogRecord::wire_owned`], fixed for a record's life: its origin and
-    /// key never change in the ring), kept beside it so an eviction does not
-    /// count the whole ring.
     wire_records: usize,
     next_id: u64,
     pending: VecDeque<(LogLine, Shelf)>,
     dropped: u32,
     /// Replay only: a file id another writer posted again, mapped to the fresh ids its
-    /// later records were loaded under, oldest first, so no two records in the ring
-    /// share an id. A record the seed moves off a carried number is listed under its
-    /// file id too ([`Self::adopt_carried`]).
     remapped: BTreeMap<u64, Vec<MessageId>>,
     /// The fresh ids [`Self::remapped`] handed out: a record under one of
-    /// them is not the file's record of that number.
     minted_at_replay: BTreeSet<u64>,
 }
 
@@ -732,20 +651,7 @@ impl MessageLog {
         Self::default()
     }
 
-    /// Load one line from the file. `Posted` inserts as retired Stale (a digest entry
-    /// stays open): every line on disk came from a process that is gone, and a Posted
-    /// with no Retired is a row nobody folded. `Retired` and `Acted` merge into their
-    /// record (a later Retired line overrides the Stale reading); every id below the
-    /// ceiling raises `next_id`. The words arrive already clipped by the decoder.
-    ///
-    /// Two processes sharing the file mint ids from their own counters, so one number
-    /// can name two records. A Posted that repeats the same post (its stamp, tag and
-    /// title; the handoff can write one twice) is that record, deduped. Any other Posted
-    /// under a number the ring already holds is another writer's and loads under a fresh
-    /// id, whether the first record is closed or open, so Settings ▸ Messages never
-    /// draws two entries under one key. A later `Retired` or `Acted` for the number goes
-    /// to the open record whose title it names, else the newest open one, else the
-    /// newest.
+    /// Load one line from the file.
     pub fn replay(&mut self, line: LogLine) {
         if let Some(id) = line.id() {
             self.raise(id);
@@ -753,8 +659,6 @@ impl MessageLog {
         match line {
             LogLine::Posted(mut rec) => {
                 let file_id = rec.id;
-                // One look for the file id's own record serves both the
-                // candidates and the collision test below.
                 let held = self.get(file_id).is_some();
                 let candidates = self.candidates_given(file_id, held);
                 if candidates.iter().any(|id| {
@@ -774,7 +678,6 @@ impl MessageLog {
                     self.remapped.entry(file_id.raw()).or_default().push(fresh);
                     rec.id = fresh;
                 }
-                // A digest entry stays open until it is filed.
                 if !rec.later {
                     rec.state = LogState::Retired(Retired::Stale);
                 }
@@ -814,12 +717,7 @@ impl MessageLog {
         }
     }
 
-    /// Load a whole file's lines ([`Self::replay`] each, in the order given; the loader
-    /// sorts them by id), first raising past every id among them, so an id minted for a
-    /// collision is above the file's own and never renumbers a record later in the sort.
-    /// The top is the highest id that can raise the sequence: a corrupt or hand-edited
-    /// id at the ceiling raises nothing ([`Self::raise`]), and taken as the top it would
-    /// switch the pre-raise off for the whole file.
+    /// Replay a file's lines in order after advancing the id counter past all ids in the batch.
     pub fn replay_all(&mut self, lines: impl IntoIterator<Item = LogLine>) {
         let lines: Vec<LogLine> = lines.into_iter().collect();
         if let Some(top) = lines
@@ -835,14 +733,7 @@ impl MessageLog {
         }
     }
 
-    /// The number the file gave the record under `id`: `id` itself, unless a replay
-    /// minted it for a collision or the seed moved the record off a carried number
-    /// ([`Self::remapped`], [`Self::adopt_carried`]), then the file id it was remapped
-    /// from; `None` for an id a merge minted, whose file id is not kept.
-    ///
-    /// A host that asks which process wrote a record by the number it was written under
-    /// reads it here, never off [`LogRecord::id`]: another writer's record that collided
-    /// is loaded under a fresh id above the file's top.
+    /// The number the file gave the record under `id`.
     #[must_use]
     pub fn file_id_of(&self, id: MessageId) -> Option<u64> {
         if !self.minted_at_replay.contains(&id.raw()) {
@@ -855,14 +746,11 @@ impl MessageLog {
     }
 
     /// The records loaded for file id `file_id`, oldest first: the ring's
-    /// own record of that number (unless a remap minted it), then the ones
-    /// remapped from it.
     fn replay_candidates(&self, file_id: MessageId) -> Vec<MessageId> {
         self.candidates_given(file_id, self.get(file_id).is_some())
     }
 
     /// [`Self::replay_candidates`], given whether the ring `held` a record
-    /// under `file_id`.
     fn candidates_given(&self, file_id: MessageId, held: bool) -> Vec<MessageId> {
         let own = (held && !self.minted_at_replay.contains(&file_id.raw())).then_some(file_id);
         own.into_iter()
@@ -877,10 +765,6 @@ impl MessageLog {
     }
 
     /// Where a replayed line for file id `file_id` merges: the open record
-    /// whose posted title `title` names — the title itself, or one of the
-    /// final words the center derives from it ([`Self::final_words_of`]: a
-    /// delivered row retires `Deployed site`, never `Deploying site`) —
-    /// else the newest open one, else the newest.
     fn replay_target(&self, file_id: MessageId, title: Option<&str>) -> Option<MessageId> {
         let candidates = self.replay_candidates(file_id);
         let open = |id: &MessageId| self.get(*id).is_some_and(|r| !Self::closed_by_a_line(r));
@@ -899,10 +783,6 @@ impl MessageLog {
     }
 
     /// Whether `final_title` (a Retired line's words) can be how a row posted
-    /// as `posted` ended: the posted title kept, or its finished, `— done`,
-    /// stopped or ended form (`center::outcome_title`'s table forms). A
-    /// reporter's own declared words are not derivable and fall through to
-    /// the newest open record.
     fn final_words_of(posted: &str, final_title: &str) -> bool {
         posted == final_title
             || [
@@ -917,7 +797,6 @@ impl MessageLog {
     }
 
     /// Whether a replayed record was closed by a `Retired` line: its state
-    /// is a retirement other than the Stale every Posted line loads as.
     fn closed_by_a_line(rec: &LogRecord) -> bool {
         matches!(&rec.state, LogState::Retired(how) if *how != Retired::Stale)
     }
@@ -962,16 +841,13 @@ impl MessageLog {
         self.pending.len()
     }
 
-    /// The lines waiting for the host, oldest first, left in place (the
-    /// handoff carry reads them without draining).
+    /// The lines waiting for the host, oldest first, left in place (the handoff carry reads them without draining).
     #[cfg(test)]
     pub(crate) fn pending_lines(&self) -> impl Iterator<Item = &LogLine> {
         self.pending.iter().map(|(line, _)| line)
     }
 
-    /// Take every pending line, oldest first. When lines were dropped past
-    /// [`PENDING_PERSIST_CAP`] since the last drain, a trailing
-    /// [`LogLine::Dropped`] says how many.
+    /// Take every pending line, oldest first.
     #[cfg(test)]
     pub(crate) fn drain_pending(&mut self) -> Vec<LogLine> {
         self.drain_shelved()
@@ -980,11 +856,7 @@ impl MessageLog {
             .collect()
     }
 
-    /// Take every pending line, oldest first, each with the file it lands in
-    /// ([`Shelf`], decided when the line was queued). When lines were dropped
-    /// past [`PENDING_PERSIST_CAP`] since the last drain, a trailing
-    /// [`LogLine::Dropped`] says how many — the host's line: the gap is in
-    /// aterm's record.
+    /// Take every pending line, oldest first, each with the file it lands in ([`Shelf`], decided when the line was queued).
     pub(crate) fn drain_shelved(&mut self) -> Vec<(LogLine, Shelf)> {
         let mut out: Vec<(LogLine, Shelf)> = self.pending.drain(..).collect();
         if self.dropped > 0 {
@@ -999,13 +871,7 @@ impl MessageLog {
         out
     }
 
-    // ---- the center's side --------------------------------------------
-
-    /// The latest word on a fact: among the retired records under `key` (of the digest's
-    /// when `exceptions`, of every other class when not), the one that retired last, by
-    /// its retirement time, never by ring position. A record posted after an entry
-    /// opened and before the owner dismissed it sits later in the ring but is an older
-    /// word. Ties go to the higher id.
+    /// The latest word on a fact.
     #[must_use]
     pub(crate) fn last_word(&self, key: &str, exceptions: bool) -> Option<&LogRecord> {
         self.ring
@@ -1014,9 +880,7 @@ impl MessageLog {
             .max_by_key(|r| (r.retired_unix_ms.unwrap_or(0), r.id))
     }
 
-    /// The filings of `key`'s exception at or after `since_ms` — how often the
-    /// owner has put this same fact away lately, for the back-off of its
-    /// quiet span ([`crate::need::Resurface::backed_off`]).
+    /// The filings of `key`'s exception at or after `since_ms`.
     #[must_use]
     pub(crate) fn filings_since(&self, key: &str, since_ms: u64) -> u32 {
         let n = self
@@ -1043,13 +907,11 @@ impl MessageLog {
     }
 
     /// Never mint at or below `id` again — unless `id` sits at the ceiling,
-    /// where a corrupt line must not park the sequence.
     fn raise(&mut self, id: MessageId) {
         self.raise_to(id.next().raw());
     }
 
-    /// Never mint below `raw` again (the carry ships the parent's next id);
-    /// a `raw` at or past [`ID_CEILING`] is a forgery and is ignored.
+    /// Never mint below `raw` again (the carry ships the parent's next id).
     pub(crate) fn raise_to(&mut self, raw: u64) {
         if raw < ID_CEILING {
             self.next_id = self.next_id.max(raw);
@@ -1057,12 +919,6 @@ impl MessageLog {
     }
 
     /// Into the ring; past [`LOG_CAP`] the oldest retired record goes. A live row's
-    /// record stays while the band paints it (the `messages` verb and the Settings page
-    /// read it there; the Retired line merges its final words into it).
-    /// [`crate::MAX_LIVE`] ≤ [`LOG_CAP`], so a retired record is always there to evict.
-    /// Once [`WIRE_LOG_SHARE`] records are the wire's ([`Origin::wire_owned`]), the
-    /// oldest retired wire record goes first, so a script's records can never push
-    /// aterm's own out.
     fn push_record(&mut self, rec: LogRecord) {
         if self.ring.len() >= LOG_CAP {
             self.evict_one(rec.stamp.unix_ms);
@@ -1072,13 +928,6 @@ impl MessageLog {
     }
 
     /// Make room for one record stamped `at_ms`: the oldest retired wire record once the
-    /// wire holds its share, else the oldest retired record, else the oldest. A filed
-    /// exception outlives the ordinary FIFO for `FILED_KEEP` after its filing: the
-    /// dismissal is the fact's memory (`MessageCenter::quiet_record`), and the ring is
-    /// counted in records, not days. Inside the wire's share too (a tool's `notice later`
-    /// entry the owner dismissed): a script's ordinary records take each other first, and
-    /// a filing goes only when the share holds nothing else retired, so the share stays
-    /// bounded.
     fn evict_one(&mut self, at_ms: u64) {
         let wire_full = self.wire_records >= WIRE_LOG_SHARE;
         let keep_since = at_ms.saturating_sub(crate::need::FILED_KEEP_MS);
@@ -1107,33 +956,11 @@ impl MessageLog {
         }
     }
 
-    /// The file read again, merged into the ring. A seamless successor on the late-park
-    /// lane loads the file when it boots, and its parent keeps recording until Commit,
-    /// so the boot's load misses every record the parent wrote after it and reads a row
-    /// the parent closed after it as `Stale`. `disk` is the file loaded again once the
-    /// parent is gone (its last line flushed before Commit):
-    ///
-    /// * ids: never mint at or below the file's top again;
-    /// * a record the ring already holds (the same stamp and tag, and the same id,
-    ///   posted words or file id: a collision's fresh id differs between two loads once
-    ///   the file's top moved, and its words change when it retires; a ring record the
-    ///   file holds under its own id is paired by that id alone) stays as it is when it
-    ///   is live here (a carried row is this process's now); one the boot read as
-    ///   `Stale` takes the file's ending (its state, final words and mark), and a press
-    ///   the file records is kept;
-    /// * a record the ring does not hold is inserted in id order (under a fresh id when
-    ///   this process minted that number for a record of its own), unless it is older
-    ///   than everything a full ring keeps.
-    ///
-    /// Idempotent: merging the same file twice changes nothing more.
+    /// The file read again, merged into the ring.
     pub(crate) fn merge_reloaded(&mut self, disk: &MessageLog) {
         self.raise_to(disk.next_id);
         for rec in &disk.ring {
             let file_id = disk.file_id_of(rec.id);
-            // A ring record the file holds under its own id (the same stamp and tag) is
-            // that record, never another of the same words: of two records with one
-            // stamp, tag and title, the first evicted here before Commit, the second
-            // would take the first's ending. Only the id key pairs it.
             let claimed = |r: &LogRecord| {
                 disk.get(r.id)
                     .is_some_and(|d| d.id != rec.id && d.stamp == r.stamp && d.tag == r.tag)
@@ -1161,10 +988,6 @@ impl MessageLog {
                 });
             if let Some(i) = same {
                 let mine = &mut self.ring[i];
-                // A carried row may have been posted after this process's boot
-                // load. Its live words and mark stay its own, but its original
-                // severity is the authoritative file's, even for an older carry
-                // that knew only the row's current severity.
                 mine.posted_severity = rec.posted_severity;
                 if mine.is_live() {
                     continue;
@@ -1231,17 +1054,7 @@ impl MessageLog {
         self.push_record(rec);
     }
 
-    /// A carried row's record, live again in this process: re-opened when the tail the
-    /// successor loaded held the parent's own Posted line for it (its stamp and tag; the
-    /// title may have been restated since), else inserted.
-    ///
-    /// One id, one record: the carried id is the live row's and wins. Another writer's
-    /// record loaded under that number (a file id, or one [`Self::replay_all`] minted
-    /// for a collision above the file's top while the parent's Posted line was not yet
-    /// on disk) moves to a fresh id and keeps its own words and file id, never re-opened
-    /// under the carried row's. The parent's own record, if a collision loaded it under
-    /// a minted id, takes its number back. The center raises past the carry's `next_id`
-    /// first, so the fresh id is above every carried one.
+    /// A carried row's record, live again in this process.
     pub(crate) fn adopt_carried(&mut self, rec: LogRecord) {
         self.raise(rec.id);
         let mine = self.replay_candidates(rec.id).into_iter().find(|id| {
@@ -1249,9 +1062,6 @@ impl MessageLog {
                 .is_some_and(|r| r.stamp == rec.stamp && r.tag == rec.tag)
         });
         if mine != Some(rec.id) && self.get(rec.id).is_some() {
-            // The squatter keeps its file id: its fresh id takes the carried one's place
-            // among that number's remaps, so Commit's reload (`merge_reloaded`) knows it
-            // by it once its words have changed.
             let file_id = self.file_id_of(rec.id);
             let fresh = self.mint();
             self.minted_at_replay.insert(fresh.raw());
@@ -1277,10 +1087,7 @@ impl MessageLog {
         }
     }
 
-    /// The file's record of the row posted under file id `id` at `stamp` with `tag`,
-    /// under its own number or under the fresh id a collision with another writer's
-    /// record of that number moved it to; `None` when the file holds no such record.
-    /// [`Self::get`] by `id` alone answers the other writer's record there instead.
+    /// The file's record of the row posted under file id `id` at `stamp` with `tag`, under its own number or under the fresh id a collision with another writer's record of that number moved it to.
     #[must_use]
     pub fn record_of_file_id(
         &self,
@@ -1294,11 +1101,7 @@ impl MessageLog {
             .find(|r| r.stamp == stamp && r.tag == *tag && self.file_id_of(r.id) == Some(id.raw()))
     }
 
-    /// The mark the file gives the record posted under file id `id` at `stamp` with
-    /// `tag` (its own number, or a collision's remap of it) while no line has closed it
-    /// (its Posted line open, or retired `Stale`, which a later Retired line still lands
-    /// on): the mark a Retired line appended for that row is weighed against. `None`
-    /// when the file holds no such record.
+    /// Mark for the open or `Stale` record posted under file id `id` at `stamp` with `tag`.
     pub(crate) fn open_posted_mark(
         &self,
         id: MessageId,
@@ -1316,10 +1119,7 @@ impl MessageLog {
             .map(|r| (r.severity, r.glyph))
     }
 
-    /// A live row now shows `mark` (a restate, or a seeded row over the file's Posted
-    /// line): its record reads it while it lives, so the wire's `sev=` says what the
-    /// glass and the page say. No line: the Retired line carries the mark the row
-    /// retires under.
+    /// A live row now shows `mark` (a restate, or a seeded row over the file's Posted line).
     pub(crate) fn show_mark(&mut self, id: MessageId, mark: (Severity, Glyph)) {
         if let Some(rec) = self.get_mut(id).filter(|r| r.is_live()) {
             (rec.severity, rec.glyph) = mark;
@@ -1358,12 +1158,7 @@ impl MessageLog {
         });
     }
 
-    /// The parent's ending of a carried row, adopted at Commit
-    /// (`MessageCenter::end_carried_rows_the_parent_ended`): the ring's record of live row
-    /// `id` takes the ending `from` (the file's record of the same row) has, its state,
-    /// final words and mark and a press it records, without a line of its own: the
-    /// parent wrote that one. Like any record read from disk, it holds no instant of
-    /// this process's.
+    /// The parent's ending of a carried row, adopted at Commit (`MessageCenter::end_carried_rows_the_parent_ended`).
     pub(crate) fn adopt_ending(&mut self, id: MessageId, from: &LogRecord) {
         if let Some(rec) = self.get_mut(id) {
             rec.state = from.state.clone();
@@ -1380,11 +1175,7 @@ impl MessageLog {
         }
     }
 
-    /// The cause behind `key`'s digest entry ended while nothing was open: when
-    /// the latest word on the key is a filing, retire that record `Resolved`
-    /// at `unix_ms` (a second `Retired` line, which replay applies in order),
-    /// so [`Self::last_word`] no longer keeps the fact quiet. `true` when it
-    /// did.
+    /// The cause behind `key`'s digest entry ended while nothing was open.
     pub(crate) fn resolve_filing(&mut self, key: &str, unix_ms: u64, now: Instant) -> bool {
         let Some(last) = self.last_word(key, true).filter(|r| r.filed_exception()) else {
             return false;
@@ -1410,12 +1201,7 @@ impl MessageLog {
         true
     }
 
-    /// The read, dismissal or answer `id` that keeps a standing row's key quiet
-    /// no longer stands for the row's fact
-    /// ([`crate::MessageCenter::end_standing_quiet`]): it retires again
-    /// `Withdrawn` at `unix_ms`, its words kept (a second `Retired` line, which
-    /// replay applies in order), so [`Self::last_word`]'s quiet ends. `false`
-    /// when there is no such record.
+    /// The read, dismissal or answer `id` that keeps a standing row's key quiet no longer stands for the row's fact ([`crate::MessageCenter::end_standing_quiet`]).
     pub(crate) fn withdraw_read(&mut self, id: MessageId, unix_ms: u64, now: Instant) -> bool {
         let Some(read) = self.get(id) else {
             return false;
@@ -1436,14 +1222,7 @@ impl MessageLog {
         true
     }
 
-    /// A record re-worded in place ([`crate::MessageCenter::reword_record`]): the record
-    /// takes `title` and `detail`, and a second `retired` line carrying them goes to the
-    /// log under the same retirement, instant and repeats, so a relaunch (or an older
-    /// build) replays the one record with its latest words ([`Self::replay`] merges a
-    /// later Retired line into its record). Its retirement instant in this process
-    /// ([`LogRecord::retired_at`]) is untouched: nothing finished again. `false`
-    /// (nothing queued) when there is no such retired record, or its words are these
-    /// already.
+    /// A record re-worded in place ([`crate::MessageCenter::reword_record`]).
     pub(crate) fn record_reworded(
         &mut self,
         id: MessageId,
@@ -1475,12 +1254,7 @@ impl MessageLog {
         true
     }
 
-    /// A retired record retired again, as `how` ([`crate::MessageCenter::supersede_record`]):
-    /// its words, instant and repeats stay, and a second `retired` line carrying them
-    /// under `how` goes to the log, so a relaunch replays the new retirement
-    /// ([`Self::replay`] takes a later Retired line's). Its retirement instant in this
-    /// process ([`LogRecord::retired_at`]) is untouched. `false` (nothing queued) when
-    /// there is no such retired record, or it is retired `how` already.
+    /// A retired record retired again, as `how` ([`crate::MessageCenter::supersede_record`]).
     pub(crate) fn record_retired_again(&mut self, id: MessageId, how: Retired) -> bool {
         let Some(rec) = self.get_mut(id) else {
             return false;
@@ -1523,9 +1297,7 @@ pub(crate) mod tests {
     use super::*;
     use crate::model::{Decision, tags};
 
-    /// What the decoder hands back for `line`: every word clipped to the model's caps
-    /// and control-free, empty detail lines dropped; the identity for anything the
-    /// engine itself encodes.
+    /// What the decoder hands back for `line`: every word clipped to the model's caps and control-free, empty detail lines dropped.
     pub(crate) fn as_decoded(line: &LogLine) -> LogLine {
         let lines = |d: &[String]| -> Vec<String> {
             d.iter()
@@ -1608,10 +1380,6 @@ pub(crate) mod tests {
     }
 
     /// Encode/decode identity for every field the engine can hold; tabs, newlines,
-    /// backslashes and US in a value ride the escapes without breaking the framing (and
-    /// come back stripped, as `post` would strip them); a truncated line and an `m2`
-    /// line are skipped; ids keep rising after replay; a dead process's unretired Posted
-    /// reads back Stale.
     #[test]
     fn codec_round_trips_every_field_and_skips_junk() {
         let lines = vec![
@@ -1674,8 +1442,6 @@ pub(crate) mod tests {
                 "what the decoder hands back is the identity from then on"
             );
         }
-        // The escapes carry the hostile characters without breaking the framing: the
-        // fields after the title decode intact…
         let enc = lines[0].encode();
         assert!(
             enc.contains("\\t") && enc.contains("\\n") && enc.contains("\\r"),
@@ -1686,8 +1452,6 @@ pub(crate) mod tests {
                 assert_eq!(rec.origin, Origin::Wire);
                 assert_eq!(rec.key.as_deref(), Some("crash.last=k"));
                 assert_eq!(rec.actions.len(), 2);
-                // …and the words come back as `post` would have made them:
-                // controls stripped, the empty middle line dropped.
                 assert_eq!(rec.title, "tabhere \\ backnewcrus \u{00b7} end");
                 assert_eq!(
                     rec.detail,
@@ -1709,16 +1473,12 @@ pub(crate) mod tests {
         ] {
             assert_eq!(Retired::decode(&how.encode()), Some(how));
         }
-        // A US inside a detail line cannot read back as a line break: the
-        // join drops it (stored lines are control-stripped anyway).
         let mut us_inside = posted(5);
         us_inside.detail = vec!["b\u{1f}c".into()];
         match LogLine::decode(&LogLine::Posted(us_inside).encode()).unwrap() {
             LogLine::Posted(rec) => assert_eq!(rec.detail, vec!["bc".to_string()]),
             other => panic!("{other:?}"),
         }
-        // Junk: not m1, an m2 line, a truncated line, an unknown kind, an
-        // oversize line.
         assert_eq!(LogLine::decode("hello"), Err(CodecError::NotM1));
         assert_eq!(
             LogLine::decode("m2\tkind=posted\tid=1"),
@@ -1756,9 +1516,6 @@ pub(crate) mod tests {
         );
         let long = format!("m1\tkind=dropped\tn=1\tpad={}", "x".repeat(MAX_LINE_BYTES));
         assert_eq!(LogLine::decode(&long), Err(CodecError::TooLong));
-        // Forward-compatible: unknown keys are ignored, a missing optional
-        // field defaults, an unknown intent is dropped, an unknown glyph
-        // falls back.
         let novel = "m1\tkind=posted\tid=4\tt=1\ttag=system\tsev=info\tglyph=\u{2699}\ttitle=x\tactions=teleport:home\u{1f}new-window\tfuture=yes\torigin=host\tend=";
         match LogLine::decode(novel).unwrap() {
             LogLine::Posted(rec) => {
@@ -1771,8 +1528,6 @@ pub(crate) mod tests {
             other => panic!("{other:?}"),
         }
 
-        // Replay: a dead process's Posted reads Stale; a Retired line merges
-        // its final words; ids keep rising past the highest seen.
         let mut log = MessageLog::empty();
         for line in &lines {
             log.replay(line.clone());
@@ -1809,9 +1564,6 @@ pub(crate) mod tests {
     }
 
     /// Two instances, one id: one instance posted and retired its id 15, and another,
-    /// whose counter had not seen it, later posted and retired its own 15. Both records
-    /// load, each with its own words. Negative control: a Posted repeated for a record
-    /// still open (no Retired line yet) is the same record, deduped.
     #[test]
     fn a_closed_records_id_posted_again_is_another_record() {
         let id = MessageId::from_raw(15).unwrap();
@@ -1854,9 +1606,6 @@ pub(crate) mod tests {
         open.replay(LogLine::Posted(posted(15)));
         assert_eq!(open.len(), 1, "still open: the same record, deduped");
 
-        // The first record still open when another writer posts its own 15: both load,
-        // each under its own id, and each Retired line merges into the record whose
-        // words it names, whichever retires first.
         let mut both = MessageLog::empty();
         both.replay(LogLine::Posted(LogRecord {
             title: "Claude Code 2.1.283 is up to date".into(),
@@ -1895,8 +1644,6 @@ pub(crate) mod tests {
             Some(("Copy".to_string(), 10)),
             "a later line goes to the record still open"
         );
-        // A file whose own writer later reaches 16 does not collide with
-        // the fresh id: it is remapped in turn.
         both.replay(LogLine::Posted(LogRecord {
             title: "Paste stopped".into(),
             ..posted(16)
@@ -1904,8 +1651,6 @@ pub(crate) mod tests {
         let ids: Vec<u64> = both.records().map(|r| r.id.raw()).collect();
         assert_eq!(ids, [15, 16, 17]);
 
-        // The loader's whole-file replay mints above every id in the file,
-        // so a later record keeps its own number (no cascade).
         let mut file = MessageLog::empty();
         file.replay_all([
             LogLine::Posted(posted(15)),
@@ -1921,8 +1666,6 @@ pub(crate) mod tests {
     }
 
     /// A Retired line goes to the colliding record whose posted title derives its words
-    /// (`Deploying site` → `Deployed site`, or `— done`), whichever retires first.
-    /// Negative control: words no candidate's title derives go to the newest open record.
     #[test]
     fn a_delivered_retirement_goes_to_the_record_its_finished_words_name() {
         let id = MessageId::from_raw(15).unwrap();
@@ -1992,8 +1735,6 @@ pub(crate) mod tests {
             (15, "Deploying stopped".to_string(), Some(20)),
             "a stopped form names its record"
         );
-        // Negative control: words derived from no candidate go to the newest open
-        // record.
         assert_eq!(
             load(
                 "Deploying site",
@@ -2008,7 +1749,6 @@ pub(crate) mod tests {
     }
 
     /// Every line about a wire-owned record (its Posted, Retired and Acted) is shelved
-    /// for the wire's file; aterm's own lines, and the `Dropped` gap, for `messages.log`.
     #[test]
     fn every_line_is_shelved_with_its_records_owner() {
         let mut log = MessageLog::empty();
@@ -2049,7 +1789,6 @@ pub(crate) mod tests {
             };
             assert_eq!(*shelf, want, "{line:?}");
         }
-        // Overflow: the gap line is the host's.
         for _ in 0..(PENDING_PERSIST_CAP + 1) {
             post(&mut log, Origin::Wire, None);
         }
@@ -2062,9 +1801,6 @@ pub(crate) mod tests {
     }
 
     /// A script posting once a second must not push aterm's own history (the crash
-    /// record, a config error) out of the ring. The wire's records past
-    /// [`WIRE_LOG_SHARE`] evict each other; a host record goes only to another host
-    /// record.
     #[test]
     fn wire_records_never_push_aterms_own_out_of_the_ring() {
         let retire = |log: &mut MessageLog, rec: LogRecord| {
@@ -2101,7 +1837,6 @@ pub(crate) mod tests {
                 ..posted(1)
             }
         };
-        // One host record, then 600 wire records.
         let mut log = MessageLog::empty();
         let crash = host(&mut log);
         let crash_id = crash.id;
@@ -2112,7 +1847,6 @@ pub(crate) mod tests {
         }
         assert_eq!(log.len(), LOG_CAP);
         assert!(log.get(crash_id).is_some(), "the host record stays");
-        // A ring full of host records: the wire takes its share and no more.
         let mut log = MessageLog::empty();
         for _ in 0..LOG_CAP {
             let rec = host(&mut log);
@@ -2126,8 +1860,6 @@ pub(crate) mod tests {
         assert_eq!(wire_n, WIRE_LOG_SHARE);
         assert_eq!(log.len() - wire_n, LOG_CAP - WIRE_LOG_SHARE);
         assert_eq!(log.wire_records, wire_n, "the kept count is the ring's");
-        // A carried wire row's record (origin carried, a `wire.` key) is the
-        // wire's too; a host key is not.
         let carried = LogRecord {
             origin: Origin::Carried,
             key: Some("wire.build".into()),
@@ -2143,9 +1875,6 @@ pub(crate) mod tests {
     }
 
     /// A tool's exception the owner filed (`notice later`, then Dismiss) is the wire's
-    /// record and the fact's memory: inside the wire's share, the script's ordinary
-    /// records go before it. A share made only of filings still turns over within itself,
-    /// so the wire never takes more than its share of a ring of aterm's own.
     #[test]
     fn a_wire_filing_outlives_the_wires_own_churn_inside_its_share() {
         let file = |log: &mut MessageLog, rec: LogRecord, how: Retired| {
@@ -2194,7 +1923,6 @@ pub(crate) mod tests {
         let wire_n = log.records().filter(|r| r.wire_owned()).count();
         assert_eq!(wire_n, WIRE_LOG_SHARE, "the share holds");
         assert_eq!(log.wire_records, wire_n);
-        // The control: filings alone past the share turn over among themselves.
         let mut log = MessageLog::empty();
         fill_with_host(&mut log);
         for _ in 0..600 {
@@ -2210,8 +1938,6 @@ pub(crate) mod tests {
     }
 
     /// A message at the crate's own caps reads back from its own line. The caps are in
-    /// chars; [`MAX_LINE_BYTES`] is in bytes, sized from the caps at four bytes a char
-    /// with room to spare, so a line this encoder wrote is never `TooLong`.
     #[test]
     fn codec_reads_back_a_message_at_the_crates_own_caps() {
         for (name, unit) in [
@@ -2245,9 +1971,6 @@ pub(crate) mod tests {
                 enc.len()
             );
         }
-        // The cap is derived from the model's caps, not chosen: four bytes a
-        // char for every capped word, the escaped joints, and 8 KiB for the
-        // fixed fields and two encoded intents, all within half the cap.
         let worst = 4 * (TITLE_CAP + DETAIL_LINES_CAP * DETAIL_LINE_CAP + KEY_CAP)
             + 2 * DETAIL_LINES_CAP
             + 8 * 1024;
@@ -2259,8 +1982,6 @@ pub(crate) mod tests {
     }
 
     /// A line cut short mid-append fails to decode wherever the cut lands: a cut inside
-    /// the last field's value would read as a different record (`label=Open`, `rep=1`
-    /// for 12, `n=1` for 12); the `end=` terminator catches it.
     #[test]
     fn a_truncated_last_field_fails_to_decode() {
         let acted = LogLine::Acted {
@@ -2299,9 +2020,6 @@ pub(crate) mod tests {
     }
 
     /// Ids keep rising after replay, including past a replayed id at the ceiling (a
-    /// saturated `next_id` would make every later post share `u64::MAX`). An id at or
-    /// past [`ID_CEILING`] is kept as a record but never raises the sequence, and a
-    /// forged carry's `next_id` there is ignored the same.
     #[test]
     fn ids_keep_rising_after_replaying_a_max_id() {
         let mut log = MessageLog::empty();
@@ -2334,10 +2052,6 @@ pub(crate) mod tests {
     }
 
     /// The late-park successor loaded the file at its boot, and its parent kept
-    /// recording until Commit. Merging the file read again gives the row the parent
-    /// closed after the boot its real ending (never `Stale`), brings in the parent's
-    /// later records, leaves a row live here alone, moves a parent record off a number
-    /// this process minted for its own, raises the ids past the file, and is idempotent.
     #[test]
     fn a_reloaded_file_merges_what_the_parent_wrote_after_the_boot() {
         let line = |l: LogLine| LogLine::decode(&l.encode()).unwrap();
@@ -2350,7 +2064,6 @@ pub(crate) mod tests {
             repeats: 1,
             mark: None,
         };
-        // At the successor's boot: 1 (retired), 2 (open), 3 (open, carried).
         let boot_lines = vec![
             line(LogLine::Posted(posted(1))),
             line(retired(1)),
@@ -2364,18 +2077,14 @@ pub(crate) mod tests {
             Some(&Retired::Stale),
             "the boot reads the parent's open row as nobody's"
         );
-        // Row 3 is carried and live here again.
         let mut carried = posted(3);
         carried.title = "restated".into();
         ring.raise_to(5);
         ring.adopt_carried(carried);
-        // This process mints 5 for a record of its own before Commit.
         let mut own = posted(5);
         own.stamp.unix_ms = 1_758_470_900_000;
         own.title = "the successor's own".into();
         ring.record_posted(own);
-        // The parent, after the boot: retired 2, recorded 4 and 5 (its 5 is
-        // not ours), retired nothing else.
         let mut disk_lines = boot_lines;
         disk_lines.push(line(retired(2)));
         disk_lines.push(line(LogLine::Posted(posted(4))));
@@ -2414,7 +2123,6 @@ pub(crate) mod tests {
         let unique: std::collections::BTreeSet<u64> = ids.iter().copied().collect();
         assert_eq!(unique.len(), ids.len(), "one id, one record: {ids:?}");
         assert!(ring.next_id().raw() > *unique.last().unwrap());
-        // Idempotent.
         let before: Vec<LogRecord> = ring.records().cloned().collect();
         ring.merge_reloaded(&disk);
         assert_eq!(ring.records().cloned().collect::<Vec<_>>(), before);
@@ -2426,8 +2134,6 @@ pub(crate) mod tests {
     }
 
     /// Words the loader takes from the file are capped and sanitized like a
-    /// post's: a hand-edited or hostile line's 5000-char, ESC-bearing,
-    /// newline-bearing title never reaches the ring, `copy_text` or the page.
     #[test]
     fn loaded_records_are_capped_like_posted_ones() {
         let detail: Vec<String> = (0..30)
@@ -2479,9 +2185,6 @@ pub(crate) mod tests {
     }
 
     /// `detail=` on the wire is both `[]` and `[""]`, so `[""]` is
-    /// unrepresentable: the builder drops empty lines, and so does the
-    /// decoder, so no message the engine holds is ambiguous on the wire and
-    /// a compaction is the identity.
     #[test]
     fn a_lone_empty_detail_line_round_trips() {
         let msg = Message::new(tags::SYSTEM, Severity::Info, "t").line("");
@@ -2492,8 +2195,6 @@ pub(crate) mod tests {
             &msg,
         ));
         assert_eq!(LogLine::decode(&line.encode()).unwrap(), line);
-        // A record literal that bypasses the builder is read as the builder
-        // would have built it.
         let mut literal = posted(2);
         literal.detail = vec![String::new()];
         let back = LogLine::decode(&LogLine::Posted(literal.clone()).encode()).unwrap();

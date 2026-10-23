@@ -79,7 +79,7 @@ impl XtermKeyboardState {
     ///
     /// Sets the value to 0 (no modification) but keeps it enabled.
     #[inline]
-    pub fn reset_modify_other_keys(&mut self) {
+    pub const fn reset_modify_other_keys(&mut self) {
         self.modify_other_keys = Some(0);
     }
 
@@ -87,7 +87,7 @@ impl XtermKeyboardState {
     ///
     /// Corresponds to xterm resource value -1.
     #[inline]
-    pub fn disable_modify_other_keys(&mut self) {
+    pub const fn disable_modify_other_keys(&mut self) {
         self.modify_other_keys = None;
     }
 
@@ -101,13 +101,13 @@ impl XtermKeyboardState {
 
     /// Reset formatOtherKeys to default (XTFMTKEYS: CSI > 4 f).
     #[inline]
-    pub fn reset_format_other_keys(&mut self) {
+    pub const fn reset_format_other_keys(&mut self) {
         self.format_other_keys = 0;
     }
 
     /// Reset all xterm keyboard state to defaults.
     #[inline]
-    pub fn reset(&mut self) {
+    pub const fn reset(&mut self) {
         self.modify_other_keys = Some(0);
         self.format_other_keys = 0;
     }

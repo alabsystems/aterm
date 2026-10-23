@@ -1,14 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The agy lane's driver over scripted screens and a scripted kernel: a
-//! stand-in aterm instance on a real socket (every request recorded, nothing
-//! typed anywhere) whose screen is the shell after the agy's exit, and the
-//! relaunched agy once the relaunch line is typed; a kernel whose agy has
-//! exited (or stopped) and whose relaunch appears under the shell when its
-//! line is; and the conversation's presence lock and the dead pid's crash
-//! file on disk, as 1.4.0 lays them out. Screens are 1.4.0's (`aterm-phase`
-//! fixtures).
+//! The agy lane's driver over scripted screens and a scripted kernel: a stand-in aterm instance on a real socket (every request recorded, nothing typed anywhere) whose screen is the shell after the agy's exit, and the relaunched agy once the relaunch line is typed; a kernel whose agy has exited (or stopped) and whose relaunch appears under the shell when its line is; and the conversation's presence lock and the dead pid's crash file on disk, as 1.4.0 lays them out.
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -41,7 +34,6 @@ const WORKSPACE: &str = "/w/proj";
 const SHELL_CWD: &str = "/w";
 
 /// Ctrl-Z's status: `128` plus this platform's SIGTSTP (`146` on macOS,
-/// measured; `148` on Linux).
 fn ctrl_z() -> i64 {
     128 + i64::from(libc::SIGTSTP)
 }
@@ -85,7 +77,6 @@ fn at_caret(text: &str) -> String {
 }
 
 /// The relaunched agy at rest on its replayed turn: 1.4.0's end of a turn,
-/// the cursor on its empty caret row.
 fn agy_idle() -> String {
     at_caret(aterm_phase::agy::fixtures::END_OF_TURN)
 }
@@ -100,9 +91,6 @@ fn shell_after() -> String {
 }
 
 /// The shell integration's last two blocks: the command that ran the agy
-/// (block 7) finished with `exit`, then the prompt entering — `word` false:
-/// the prompt not back yet; `later`: another command's block (9) the newest
-/// since.
 fn blocks(exit: i64, word: bool, later: bool) -> String {
     let entering = r#"{"id":8,"state":"entering","exit":null,"prompt":4,"cmd":4,"cmdcol":2,"out":null,"end":null,"cmdline":""}"#;
     if !word {
@@ -117,8 +105,6 @@ fn blocks(exit: i64, word: bool, later: bool) -> String {
 }
 
 /// The shell's blocks once the relaunch line ran in block 8 (the prompt
-/// block [`blocks`] names newest): `exit` `None` while its agy runs, else
-/// that line's status and the prompt after it.
 fn line_blocks(exit: Option<i64>) -> String {
     let line = r#""cmdline":" ( cd -- '/w/proj' && exec '/p/agents/agy' '--conversation=c1' )""#;
     match exit {
@@ -132,19 +118,16 @@ fn line_blocks(exit: Option<i64>) -> String {
 }
 
 /// What the stand-in serves once the relaunch line is typed, which a test
-/// may change between attempts: `None` serves as before the line.
 #[derive(Default)]
 struct After {
     screen: Option<String>,
     status: Option<String>,
     blocks: Option<String>,
     /// The shell's blocks BEFORE the line, in place of the exit's
-    /// ([`blocks`]): the agy still running in its block ([`running`]).
     running: Option<String>,
 }
 
 /// The shell's blocks while the agy runs in block 7, the one [`blocks`]
-/// names finished once it exits.
 fn running() -> String {
     r#"{"blocks":[{"id":7,"state":"executing","exit":null,"prompt":2,"cmd":2,"cmdcol":2,"out":3,"end":null,"cmdline":"sh agy.sh"}]}"#.to_string()
 }
@@ -152,7 +135,6 @@ fn running() -> String {
 /// What the stand-in serves, and what it saw.
 struct World {
     /// The shell's blocks after the exit ([`blocks`]), which a reset rig
-    /// ([`Rig::reset`]) serves anew.
     blocks2: Arc<Mutex<String>>,
     after_exit: String,
     after_relaunch: String,
@@ -162,7 +144,6 @@ struct World {
 }
 
 /// A control socket at `<dir>/t.sock` standing in for the aterm instance of
-/// [`TAB`], and the requests it was asked, in order.
 fn instance(dir: &Path, w: World) -> (String, crate::harness::FakeInstanceLog) {
     crate::harness::fake_instance(&dir.join("t.sock"), TOKEN, move |line| {
         let verb = line
@@ -213,7 +194,6 @@ fn instance(dir: &Path, w: World) -> (String, crate::harness::FakeInstanceLog) {
 }
 
 /// What a test varies about the relaunch, each `false`/`None` as the plain
-/// relaunch goes.
 #[derive(Clone, Debug, Default)]
 struct Knobs {
     /// The host's roster never shows [`NEW`] leading the tab.
@@ -231,43 +211,30 @@ struct Knobs {
     /// Who holds the lock cannot be read.
     holders_unreadable: bool,
     /// Another live process ([`OTHER`]) holds the lock from this read of it
-    /// on (1 the first).
     holder_from_read: Option<usize>,
     /// Another live agy ([`OTHER`]) names the conversation in its argv,
-    /// holding no lock (opened on it while another held it).
     argv_holder: bool,
     /// The live agy's argv cannot be read.
     argv_unreadable: bool,
     /// Another live agy ([`OTHER`]) holds the conversation's database and
-    /// no presence lock: opened on it with `-c`/`--continue` or an in-TUI
-    /// `/resume` while another held it, its argv naming nothing.
     db_opener: bool,
     /// Who holds the conversation's database, or what such a holder holds,
-    /// cannot be read.
     openers_unreadable: bool,
     /// Another live agy ([`OTHER`]) holds the conversation's database and no
-    /// presence lock from this read of the database's holders on (1 the
-    /// first): it opened the conversation after the relaunch's first look.
     db_opener_from_read: Option<usize>,
     /// [`NEW`]'s number was taken by another process: alive, of another
-    /// kernel start, no agy under the shell.
     new_reborn: bool,
     /// The tab's shell is fish.
     fish: bool,
     /// The tab's shell is in the launch's directory ([`WORKSPACE`]), not its
-    /// own ([`SHELL_CWD`]).
     shell_in_workspace: bool,
     /// The launch's directory the kernel reads, in place of [`WORKSPACE`].
     workspace: Option<String>,
     /// Pid `0` ([`crate::harness::relaunch::NO_SHELL`]) reads as a zsh, as
-    /// no live process table answers (pid 0 has no argv on macOS): only the
-    /// lane's own guard keeps a tab program's dialect unread.
     zero_reads_as_zsh: bool,
 }
 
 /// The scripted kernel: [`TUI`] was [`SHELL`]'s foreground job and has
-/// exited (or is stopped, alive: `stopped`); its relaunch [`NEW`] appears
-/// under the shell when its line is typed, holding the conversation's lock.
 struct Script {
     exited: Arc<AtomicBool>,
     stopped: Arc<AtomicBool>,
@@ -310,7 +277,6 @@ impl Kernel for Script {
 
 impl AgyKernel for Script {
     /// `0` lives, as the live kernel's `kill(0, 0)` answers (the caller's
-    /// own process group).
     fn alive(&self, pid: u32) -> bool {
         match pid {
             0 => true,
@@ -393,8 +359,6 @@ impl AgyKernel for Script {
         if self.knobs.openers_unreadable {
             return None;
         }
-        // Asked under the config the conversation's lock is in, and nowhere
-        // else.
         let ours = self.lock.parent().and_then(Path::parent) == Some(config);
         let opener = self.knobs.db_opener
             || self
@@ -448,9 +412,6 @@ impl AgyKernel for Script {
 }
 
 /// One scripted rig: a home with agy's config (the conversation's presence
-/// lock, and the dead pid's crash file where it is left), a managed store
-/// build and its twin, the state directory, the stand-in instance and the
-/// kernel.
 struct Rig {
     dir: ScratchDir,
     opts: Opts,
@@ -464,15 +425,11 @@ struct Rig {
     blocks2: Arc<Mutex<String>>,
     after: Arc<Mutex<After>>,
     /// The harness's waits on the test's thread run on their own steps
-    /// ([`crate::harness::relaunch::virtual_waits`]): every stand-in here answers at once.
     _waits: crate::harness::relaunch::VirtualWaits,
 }
 
 impl Rig {
     /// `status`: the exit status the shell's block names; `word`, `later` as
-    /// [`blocks`]; `crash_left`: the dead pid's crash file still there (a
-    /// SIGKILL's, measured; a panic's only if it leaves it, unmeasured; every
-    /// graceful way out removes it).
     fn new(name: &str, status: i64, word: bool, later: bool, crash_left: bool) -> Rig {
         let dir = scratch(name);
         let base = std::fs::canonicalize(&*dir).expect("canonical scratch");
@@ -567,15 +524,6 @@ impl Rig {
     }
 
     /// The rig [`Rig::new`] makes for `status`, `word`, `later` and
-    /// `crash_left`, on this rig's scratch tree, store build and stand-in:
-    /// agy's config made afresh (the conversation's presence lock, the dead
-    /// pid's crash file where it is left, nothing else), the state and home
-    /// directories gone, the stand-in serving the exit's blocks and nothing
-    /// after the line, its log empty, and the kernel's agy exited, not
-    /// stopped, nothing relaunched, no other holder and no knob turned. A
-    /// walk over many worlds resets one rig per world instead of making and
-    /// removing one: the scratch tree and the stand-in's socket and thread
-    /// were most of its time.
     fn reset(&mut self, status: i64, word: bool, later: bool, crash_left: bool) {
         for dir in [&self.opts.state, &self.opts.home, &self.config] {
             match std::fs::remove_dir_all(dir) {
@@ -604,10 +552,6 @@ impl Rig {
     }
 
     /// The snapshot the host took of the agy while it ran: launched by its
-    /// store path with `--effort high`, a dropped `--agent`, its own
-    /// `--conversation` of another conversation (which a `/clear` moved
-    /// past), its conversation `conversation` (`None`: no witness), its
-    /// crash file, the block it ran in.
     fn snap(&self, conversation: Option<&str>) -> Snapshot {
         Snapshot {
             stored_login: false,
@@ -663,11 +607,6 @@ impl Rig {
     }
 
     /// [`exit_record`] over the real look at this rig's exit. Nothing a look
-    /// asks moves the stand-in or the kernel, so the world stands still while
-    /// it is looked at: the second look is real and must read what the first
-    /// did, and every later one is the first's again. `exit_record`'s loop runs
-    /// whole over them (its waits and their count are `relaunch_tests`'), but
-    /// an undecided exit's 81 looks are two connects to the stand-in, not 81.
     fn look(&self, snap: &Snapshot) -> ExitRecord {
         let (mut first, mut looks) = (None, 0);
         exit_record(
@@ -745,13 +684,6 @@ impl Drop for Rig {
 }
 
 /// A CRASH (SIGKILL, 137, its crash file left) IS RELAUNCHED ON ITS
-/// CONVERSATION, IN ITS LAUNCH DIRECTORY, ON THE MANAGED TWIN: the line `cd`s
-/// to the launch's directory and types the twin with the launch's `--effort`
-/// carried and `--conversation=<uuid>` of the witnessed conversation, behind
-/// the `HOME` the process ran under — never the store path argv[0] named, its
-/// `--agent` or its own stale `-conversation` — and once the relaunched agy
-/// holds the conversation's lock and reads idle, the continuation is typed and
-/// submitted (`continued`). The record is keyed `agy-<tab>`.
 #[test]
 fn a_crashed_agy_is_relaunched_on_its_conversation_in_its_directory() {
     let rig = Rig::new("crash", 137, true, false, true);
@@ -802,8 +734,6 @@ fn a_crashed_agy_is_relaunched_on_its_conversation_in_its_directory() {
 }
 
 /// The exit's word is the shell's: the finished block that ends where the
-/// entering prompt begins, its `exit` — of the block the agy ran in.
-/// NEGATIVE CONTROL: another command's block newest since is no word for it.
 #[test]
 fn the_agy_exit_is_read_off_its_command_block() {
     assert_eq!(
@@ -825,12 +755,6 @@ fn the_agy_exit_is_read_off_its_command_block() {
 }
 
 /// EVERY GRACEFUL WAY OUT (`0`: its own exit, someone's SIGTERM, SIGHUP or
-/// SIGINT, the crash file removed) IS LEFT, AND SO IS A REFUSED START (`2`,
-/// no crash file) AND AN END NO CRASH FILE WITNESSES (`137`, the file swept by
-/// another agy's start). An end `2` whose crash file is left (a Go panic
-/// that leaves it, unmeasured) is a crash.
-/// NEGATIVE CONTROL: the status alone (any nonzero a crash) would relaunch the
-/// refusal and the unwitnessed end; nothing is typed for any left exit.
 #[test]
 fn a_graceful_exit_a_refused_start_and_an_unwitnessed_end_are_never_relaunched() {
     let mut status_alone_differs = 0;
@@ -852,7 +776,6 @@ fn a_graceful_exit_a_refused_start_and_an_unwitnessed_end_are_never_relaunched()
         }
         let table_crash = ag::exit_kind(status, crash_left) == ExitKind::Crashed;
         assert_eq!(table_crash, want == "continued", "{status} {crash_left}");
-        // A table that reads the status alone (any nonzero a crash).
         if status != 0 && !table_crash {
             status_alone_differs += 1;
         }
@@ -870,11 +793,6 @@ fn a_graceful_exit_a_refused_start_and_an_unwitnessed_end_are_never_relaunched()
 }
 
 /// CTRL-Z ([`ctrl_z`]): agy is stopped and ALIVE, holding its lock and its crash
-/// file — never a crash, never relaunched (`wait:not-exited`, which the host
-/// leaves as a program still there). One gone with that word (killed while
-/// stopped, outside its block) is left too (`ended:stopped`), its crash file
-/// notwithstanding. NEGATIVE CONTROL: the crash file alone would relaunch
-/// both.
 #[test]
 fn a_stopped_agy_is_never_relaunched() {
     let rig = Rig::new("stopped", ctrl_z(), true, false, true);
@@ -889,7 +807,6 @@ fn a_stopped_agy_is_never_relaunched() {
         rig.crash.is_file(),
         "the control: its crash file is still there"
     );
-    // Gone with its block's Ctrl-Z status and its crash file left.
     rig.kernel.stopped.store(false, Ordering::SeqCst);
     let left = rig.look(&snap);
     assert_eq!(
@@ -903,9 +820,6 @@ fn a_stopped_agy_is_never_relaunched() {
 }
 
 /// A crash whose process held no proven conversation (a fresh agy that took
-/// no turn) is relaunched by nothing — a fresh `agy` would start another
-/// conversation — and neither is one whose presence lock is gone from its
-/// config. NEGATIVE CONTROL: the same crash with its witness is relaunched.
 #[test]
 fn no_witness_no_relaunch() {
     let rig = Rig::new("unwitnessed", 137, true, false, true);
@@ -926,12 +840,6 @@ fn no_witness_no_relaunch() {
 }
 
 /// A TAB'S OWN AGY (`aterm -e agy`, `exec agy`: shell
-/// [`crate::harness::relaunch::NO_SHELL`]) that crashed is relaunched by
-/// nothing, as a tab's own Muse Code or Claude Code is: no shell is left in
-/// its tab to type the line into, its plan is refused for good (never waited
-/// on), and the explicit restart is not carried for it. NEGATIVE CONTROLS:
-/// the same crash with a shell is relaunched, and the same agy run from no
-/// store (no twin asked) at a shell has its restart carried.
 #[test]
 fn a_tabs_own_agy_is_relaunched_by_nothing() {
     use crate::harness::relaunch::{NO_SHELL, carries_restart};
@@ -953,8 +861,6 @@ fn a_tabs_own_agy_is_relaunched_by_nothing() {
         plan(&rig.opts, &st, &rig.kernel),
         Err(NoPlan::Refused { why, .. }) if why == "not-a-shell-job"
     ));
-    // The restart's gate asks the shell itself, not only the dialect a
-    // snapshot of no shell lacks.
     let mut own = rig.snap(Some(C1));
     own.program = PathBuf::from("/opt/agy/bin/agy");
     assert!(
@@ -973,12 +879,6 @@ fn a_tabs_own_agy_is_relaunched_by_nothing() {
 }
 
 /// A CONVERSATION ANOTHER LIVE AGY HAS OPEN is never resumed a second time:
-/// its lock held, or — a second agy opened on it while another held it holds
-/// no lock, even once that holder is gone (measured) — its argv naming it,
-/// or its database held by an agy that holds no presence lock (opened with
-/// `-c` or an in-TUI `/resume`, its argv naming nothing: measured on 1.4.2),
-/// or any of these unreadable. NEGATIVE CONTROL: free by all three, the same
-/// record is relaunched.
 #[test]
 fn a_held_conversation_is_never_typed_at() {
     for (name, holder, knobs) in [
@@ -1030,10 +930,6 @@ fn a_held_conversation_is_never_typed_at() {
 }
 
 /// A RELAUNCH LEFT IN FLIGHT WHOSE CONVERSATION'S LOCK HAS GONE SINCE is
-/// stopped, never typed (agy would answer `conversation not found` and start
-/// afresh): the first attempt waited on a holder, the lock file was removed
-/// meanwhile, and the carried attempt fails `conversation-gone`. NEGATIVE
-/// CONTROL: the same wait with the lock kept is carried on and relaunched.
 #[test]
 fn a_relaunch_in_flight_whose_lock_went_is_never_typed() {
     for (name, remove, want) in [
@@ -1058,9 +954,6 @@ fn a_relaunch_in_flight_whose_lock_went_is_never_typed() {
 }
 
 /// A launch whose flags a relaunch cannot carry (`--remote-control`) is
-/// refused with its word, nothing typed; a store build with no twin to type
-/// is relaunched by nothing. NEGATIVE CONTROL: a program run from no store is
-/// relaunched on itself.
 #[test]
 fn an_uncarryable_launch_and_a_missing_twin_are_refused() {
     let rig = Rig::new("remote", 137, true, false, true);
@@ -1102,10 +995,6 @@ fn an_uncarryable_launch_and_a_missing_twin_are_refused() {
 }
 
 /// THE WITNESS: the one presence lock under its config the process holds
-/// open names its conversation, and the one crash file of its pid it holds is
-/// its crash file. NEGATIVE CONTROLS: a fresh agy holds no lock (no
-/// conversation yet); two locks name none; a lock under another config, and
-/// another pid's crash file, are not its; a one-shot is no TUI.
 #[test]
 fn the_witness_is_the_held_presence_lock() {
     let rig = Rig::new("witness", 0, true, false, true);
@@ -1132,11 +1021,6 @@ fn the_witness_is_the_held_presence_lock() {
     );
     assert_eq!(run.block, Some(7), "the shell's block it runs in");
     assert_eq!(snap.dialect, Some(Dialect::Zsh));
-    // A tab's own agy (`exec agy`, [`crate::harness::relaunch::NO_SHELL`])
-    // keeps its witness for its readers, and no shell's dialect or block is
-    // read for it, even where pid 0 reads as a zsh and the tab names a
-    // running block. NEGATIVE CONTROLS: the same kernel reads pid 0's dialect
-    // as zsh, and at its shell (above) its dialect and block are read.
     let zero_zsh = Script {
         knobs: Knobs {
             zero_reads_as_zsh: true,
@@ -1220,7 +1104,6 @@ fn the_witness_is_the_held_presence_lock() {
         .err(),
         Some("not-a-tui")
     );
-    // The hidden flags move the config the witness reads.
     let moved = atpkg::caller_shell::ProcArgs {
         argv: vec![
             rig.exe.to_string_lossy().into_owned(),
@@ -1261,10 +1144,6 @@ fn rig_kernel(rig: &Rig) -> Script {
 }
 
 /// THE CRASH FILE IS THE VERY ONE ITS PROCESS HELD: where the snapshot saw
-/// none, a crash file of its pid counts only when written since it started
-/// (a dead pid's file an earlier process of the same number left is no
-/// witness). NEGATIVE CONTROL: the file it held, or one written since its
-/// start, is.
 #[test]
 fn only_its_own_crash_file_witnesses_a_crash() {
     let rig = Rig::new("own-file", 137, true, false, true);
@@ -1282,9 +1161,6 @@ fn only_its_own_crash_file_witnesses_a_crash() {
 }
 
 /// A RESTORED LAYOUT'S RELAUNCH (aterm's own end): no shell word is asked,
-/// the conversation is named again by its id under its config, and the
-/// relaunch says aterm ended. NEGATIVE CONTROL: the same snapshot's own exit,
-/// clean, is left.
 #[test]
 fn aterm_ending_relaunches_the_restored_conversation() {
     let rig = Rig::new("host", 0, true, false, false);
@@ -1307,22 +1183,6 @@ fn aterm_ending_relaunches_the_restored_conversation() {
 }
 
 /// THE EXPLICIT RESTART IS CARRIED FOR AN AGY: its SIGTERM is one of agy's
-/// graceful ways out, mid-turn too (measured), so the act's end (its stamp's
-/// cause) is relaunched on the conversation though its exit is clean — and
-/// the act asks the relaunch's own predicate (`carries_restart_onto`), so it
-/// ends only what that relaunch then brings back: at a fish shell too, whose
-/// relaunch from the launch's own directory types no `cd` — a directory no
-/// `cd` could name included. The act's gate (`carries_restart`) reads the
-/// managed twin for a store build. NEGATIVE CONTROLS: an agy with no
-/// witnessed conversation, a launch its line cannot carry, a store build
-/// with no managed twin to type (whose relaunch says
-/// `refused:no-managed-agy`, through the act's gate too), a `HOME` no line
-/// can hold, and at zsh a directory no `cd` can name or one too long for the
-/// `cd` its relaunch from another directory types (which refuses the line
-/// for its length) are not; the same clean exit with no stamp is left; and a
-/// fish shell in another directory than the launch's refuses the `cd` its
-/// relaunch then needs — which no snapshot tells, so the predicate asks
-/// fish's line without it.
 #[test]
 fn the_explicit_restart_is_carried_for_an_agy() {
     use crate::harness::relaunch::carries_restart;
@@ -1356,10 +1216,6 @@ fn the_explicit_restart_is_carried_for_an_agy() {
             "{dialect:?}: a directory no `cd` names"
         );
     }
-    // A launch directory too long for the `cd` a zsh's relaunch from
-    // another directory types: not carried, as that relaunch refuses it.
-    // As long as the host kernel's line bound (1000 bytes on macOS, 4000 on
-    // Linux) on its own, so the `cd` alone passes it.
     let deep_dir = format!("/w/{}", "d".repeat(crate::harness::upgrade::MAX_LINE));
     let mut deep = rig.snap(Some(C1));
     deep.cwd = deep_dir.clone();
@@ -1372,7 +1228,6 @@ fn the_explicit_restart_is_carried_for_an_agy() {
         assert!(r.step.starts_with("failed:line:the line would be"), "{r:?}");
         assert_eq!(rig.lines(), 0, "{:#?}", rig.typed());
     }
-    // The store build with no twin: the act's own end, relaunched by nothing.
     let refused = after_exit_onto(
         &rig.opts,
         &snap,
@@ -1386,8 +1241,6 @@ fn the_explicit_restart_is_carried_for_an_agy() {
         !carries_restart_onto(&snap, home, None),
         "a store build with no twin: its relaunch refuses, so the act is not carried"
     );
-    // The act's own gate on the store build: carried through the managed
-    // twin it reads for one, in atpkg's `agents/`; not with none there.
     let agents = |dir: Option<PathBuf>| {
         super::super::AGENTS_DIR.with(|d| *d.borrow_mut() = dir);
     };
@@ -1402,8 +1255,6 @@ fn the_explicit_restart_is_carried_for_an_agy() {
         "a store build with no managed twin"
     );
     agents(None);
-    // The act's own gate, on a program run from no store (no twin read):
-    // the same predicate.
     let mut own = rig.snap(Some(C1));
     own.program = rig.dir.join("opt/bin/agy");
     assert!(carries_restart(&rig.opts.home, &own));
@@ -1421,9 +1272,6 @@ fn the_explicit_restart_is_carried_for_an_agy() {
     let own = Rig::new("restart-control", 0, true, false, false);
     let r = own.attempt(&own.snap(Some(C1)), &ExitRecord::Removed, ExitCause::Exit);
     assert_eq!(r.step, "ended:graceful-exit");
-    // At a fish shell: from the launch's own directory the act's end is
-    // relaunched with no `cd` (in a directory no `cd` could name too); from
-    // another, the `cd` it needs is refused.
     for (cwd, in_workspace, want) in [
         (WORKSPACE, true, "continued"),
         ("/w/pr\noj", true, "continued"),
@@ -1453,20 +1301,8 @@ fn the_explicit_restart_is_carried_for_an_agy() {
 }
 
 /// THE RESTART'S PREDICATE ASKS THE LINE ITS RELAUNCH TYPES AT WORST, heal
-/// included (`carries_restart_onto` against [`plan`], over launch
-/// directories of every length up to past the tty's bound): at zsh, where it
-/// carries the act the relaunch's line fits from any directory, and from
-/// another directory than the launch's (the `cd` typed) exactly where; at
-/// fish, exactly where the relaunch from the launch's own directory (no `cd`)
-/// fits, while from another it is refused at every length (the predicate's
-/// one boundary). NEGATIVE CONTROLS: the bound falls inside the range at
-/// zsh, fish carries lengths zsh's `cd` cannot, and at zsh the heal, once
-/// written, carries fewer.
 #[test]
 fn the_restart_predicate_asks_the_relaunch_line_at_worst() {
-    // Every directory length up to the host kernel's line bound (1000 bytes on
-    // macOS, 4000 on Linux), which the longest of them passes once its `cd`
-    // and relaunch are typed.
     let bound = crate::harness::upgrade::MAX_LINE;
     let mut rig = Rig::new("restart-bound", 0, true, false, false);
     let mut carried = std::collections::BTreeMap::new();
@@ -1530,10 +1366,6 @@ fn the_restart_predicate_asks_the_relaunch_line_at_worst() {
 }
 
 /// The records are the lane's: keyed `agy-<tab>`, read back by their tab,
-/// never a Claude Code conversation's key, the config and the carried home
-/// round-tripping; a settled record of a tab proven gone, unwritten a week,
-/// is pruned. NEGATIVE CONTROLS: a live tab's, an in-flight one, and another
-/// lane's record (which writes neither key) are kept.
 #[test]
 fn records_are_keyed_by_tab_and_pruned_once_gone() {
     assert_eq!(key(TAB), format!("agy-{TAB}"));
@@ -1595,8 +1427,6 @@ fn records_are_keyed_by_tab_and_pruned_once_gone() {
 }
 
 /// A rig for the relaunch's own end: the crash relaunched (`hand_back` as
-/// the host types it), its waits short — every one here ends on its bound
-/// only where nothing is ever coming.
 fn relaunch_rig(name: &str, hand_back: bool, knobs: Knobs) -> Rig {
     let mut rig = Rig::new(name, 137, true, false, true);
     rig.opts.hand_back = hand_back;
@@ -1605,7 +1435,6 @@ fn relaunch_rig(name: &str, hand_back: bool, knobs: Knobs) -> Rig {
     rig.opts.timings.carry_settle = Duration::from_millis(400);
     rig.opts.timings.agy_up = Duration::from_millis(400);
     rig.opts.timings.agy_lock = Duration::from_millis(300);
-    // A relaunched agy that never stays up leaves the shell's prompt.
     if knobs.new_dies || knobs.noappear {
         rig.after.lock().expect("after").screen = Some(shell_after());
     }
@@ -1614,13 +1443,6 @@ fn relaunch_rig(name: &str, hand_back: bool, knobs: Knobs) -> Rig {
 }
 
 /// A RELAUNCH AGY REFUSED IS NEVER TYPED AGAIN (critic X4): the relaunched
-/// agy came up under the shell and was gone before it led the tab — its
-/// line's own block then said `2` with no crash file of its pid (a carried
-/// flag a newer build rejects) — and the exit's next attempt reads that
-/// line's word: `refused:resume-refused`, the line typed once. So is a line
-/// the shell could not run (`127`), and one that ended with no crash file
-/// (`137`, unwitnessed) stops too. NEGATIVE CONTROL: the same relaunch whose
-/// own agy left its crash file (it crashed) is typed again.
 #[test]
 fn a_relaunch_agy_refused_is_never_typed_again() {
     for (exit, new_crash, want, lines) in [
@@ -1628,8 +1450,6 @@ fn a_relaunch_agy_refused_is_never_typed_again() {
         (127, false, "refused:resume-refused", 1),
         (0, false, "ended:relaunch-ended", 1),
         (137, false, "refused:relaunch-unwitnessed", 1),
-        // Typed again; that relaunch too is gone at once, its own line
-        // (block 9) still running as this attempt looks.
         (137, true, "wait:resume", 2),
         (2, true, "wait:resume", 2),
     ] {
@@ -1667,15 +1487,6 @@ fn a_relaunch_agy_refused_is_never_typed_again() {
 }
 
 /// A RELAUNCH THAT NEVER COMES UP is decided by its line's own end AT ONCE,
-/// never waited out and typed again: agy refused it (`2`), or the shell could
-/// not run it (`126`): `refused:resume-refused`. One whose agy was never
-/// found, its pid unknown, that ended `137` left no crash file anything can
-/// read as its: it stops too (`refused:relaunch-unwitnessed`), where Muse
-/// Code's lane types a `137` again — the crash an agy line is typed again for
-/// is one its own crash file witnesses
-/// (`a_relaunch_agy_refused_is_never_typed_again`). No agy found is no live
-/// relaunch, though the kernel answers pid `0` alive (`kill(0, 0)`, as the
-/// stand-in does).
 #[test]
 fn a_relaunch_that_never_comes_up_is_never_typed_again() {
     let knobs = Knobs {
@@ -1699,14 +1510,6 @@ fn a_relaunch_that_never_comes_up_is_never_typed_again() {
 }
 
 /// A RELAUNCH STOPPED BEFORE IT WAS ADOPTED IS NEVER TYPED AGAIN: its line's
-/// block ends while its agy lives (Ctrl-Z's status, SIGSTOP's, or a word the
-/// table does not name — `1` here — from a shell that says a stop otherwise),
-/// the agy alive, holding its lock and the crash file it made. That is
-/// `ended:relaunch-ended` at once, and so is every later attempt at the exit:
-/// while it lives, after the person `fg`s it and quits it (its crash file
-/// removed), and after it is killed while stopped (its crash file left, its
-/// block's word a stop's). NEGATIVE CONTROL: a line whose agy is gone with
-/// `137` and its crash file left crashed, and is typed again.
 #[test]
 fn a_relaunch_stopped_before_adoption_is_never_typed_again() {
     for (status, killed) in [
@@ -1731,8 +1534,6 @@ fn a_relaunch_stopped_before_adoption_is_never_typed_again() {
         let alive = rig.attempt(&snap, &ExitRecord::Crashed, ExitCause::Exit);
         assert_eq!(alive.step, "ended:relaunch-ended", "{status}: {alive:?}");
         if status == 1 {
-            // A word no table reads as a stop decides only while its agy
-            // lives.
             assert_eq!(rig.lines(), 1, "{status}: {:#?}", rig.typed());
             continue;
         }
@@ -1770,11 +1571,6 @@ fn a_relaunch_stopped_before_adoption_is_never_typed_again() {
 }
 
 /// THE RELAUNCHED AGY THAT HOLDS NO LOCK STARTED A FRESH CONVERSATION
-/// (another `HOME`, a hidden flag not carried: `conversation not found`):
-/// never adopted, nothing typed into it, the person told
-/// (`refused:started-fresh`, the host's `Cannot`). NEGATIVE CONTROL: one that
-/// takes the lock is adopted, and carried on (`continued`) where the step
-/// types.
 #[test]
 fn a_relaunch_that_started_fresh_is_told_and_typed_nothing() {
     for hand_back in [true, false] {
@@ -1815,15 +1611,6 @@ fn a_relaunch_that_started_fresh_is_told_and_typed_nothing() {
 }
 
 /// THE TYPING FENCE NAMES WHAT IT REFUSES, each arm on its own: a box `box`,
-/// a turn running `busy`, an exit pending (one key from gone) `busy`, a draft
-/// `draft`. agy's OWN BACKGROUND WORK is `busy` too (agy 1.4.0's lab
-/// screens): a turn ended over its task panel (`  ● [hh:mm:ss] <what>
-/// running`, a timer, a subagent `Working`, a daemon) is no rest — its reader
-/// reads the composer above the panel and the work as the agent's own, busy
-/// over the ended turn, and agy takes a turn of its own when the work ends —
-/// and so is a draft held over the panel and a turn sent meanwhile. NEGATIVE
-/// CONTROLS: the relaunched agy at rest is fenced on its read, and so is the
-/// same screen once its task ended (no panel, no count).
 #[test]
 fn the_typing_fence_names_what_it_refuses() {
     use aterm_phase::agy::fixtures as fx;
@@ -1862,11 +1649,6 @@ fn the_typing_fence_names_what_it_refuses() {
 }
 
 /// NOTHING IS TYPED INTO A RELAUNCHED AGY THAT IS NOT IDLE, EMPTY AND UNHELD:
-/// a turn running, its own background work running on under an ended turn
-/// (the task panel), a draft in its composer, a box over it, a person's hand
-/// within the grace, a process the host's roster does not show leading the
-/// tab — each leaves the continuation untyped. NEGATIVE CONTROL: the plain
-/// relaunch types it (`continued`).
 #[test]
 fn no_continuation_into_a_busy_drafted_or_held_agy() {
     use aterm_phase::agy::fixtures as fx;
@@ -1911,10 +1693,6 @@ fn no_continuation_into_a_busy_drafted_or_held_agy() {
 }
 
 /// ONLY OUR OWN RELAUNCH IS ADOPTED: an `agy` under the shell resuming
-/// another conversation, or one resuming this conversation that is no child
-/// of the shell the line was typed at, is never taken for the relaunch.
-/// NEGATIVE CONTROL: the shell's child resuming the conversation, any
-/// spelling, is adopted.
 #[test]
 fn only_the_lines_own_agy_is_adopted() {
     let other = Knobs {
@@ -1956,10 +1734,6 @@ fn only_the_lines_own_agy_is_adopted() {
 }
 
 /// WHO HOLDS THE CONVERSATION IS READ RIGHT BEFORE THE LINE TOO: a holder
-/// that appears after the relaunch's first look leaves the line untyped, so
-/// does an agy that opened the conversation's database with no lock after
-/// that look (`-c`, `/resume`), and so does a lock whose holders cannot be
-/// read. NEGATIVE CONTROL: free at both looks, the line is typed.
 #[test]
 fn the_conversations_holders_are_read_again_right_before_the_line() {
     for (name, knobs, want) in [
@@ -2004,10 +1778,6 @@ fn the_conversations_holders_are_read_again_right_before_the_line() {
 }
 
 /// Each agent's foreground process goes to its own lane's reader: agy to the
-/// agy lane, Muse Code to its own, an image itself named `gemini` (no such
-/// build was measured: Gemini CLI runs as `node`) to none ([`NO_LANE`]) —
-/// never read as Claude Code. NEGATIVE CONTROLS: a vendor Codex to none; an
-/// unnamed program to Claude Code's records.
 #[test]
 fn each_image_goes_to_its_own_lanes_reader() {
     use crate::harness::relaunch::{SnapshotLane, snapshot_lane};
@@ -2027,12 +1797,6 @@ fn each_image_goes_to_its_own_lanes_reader() {
 }
 
 /// A RELAUNCH WHOSE NUMBER ANOTHER PROCESS TOOK IS NO LIVE RELAUNCH: its
-/// agy was found (its kernel start on the record) and is gone, its line
-/// ended with a word no table reads as a stop (`1`), and another process —
-/// of another start, no agy under the shell — lives under that pid. The
-/// line's own word decides (`refused:resume-refused`), never the stop a live
-/// relaunch is. NEGATIVE CONTROL: the very relaunch alive, out of the tab
-/// (its start the recorded one), is that stop (`ended:relaunch-ended`).
 #[test]
 fn a_relaunch_whose_pid_was_taken_is_read_by_its_line() {
     for (reborn, want) in [
@@ -2069,26 +1833,11 @@ fn a_relaunch_whose_pid_was_taken_is_read_by_its_line() {
 }
 
 /// Tier-1 of `HarnessAgyExitWitness` (aterm-models-harness
-/// `harness_agy_exit_witness_model`): every look of the model — a SIGKILL
-/// (`137`, its crash file left or swept), a graceful way out (`0`, the file
-/// removed), Ctrl-Z ([`ctrl_z`], alive, its file held), a refused start (`2`, no
-/// file), a panic as the model has one (`2`, its file left or swept;
-/// unmeasured); witnessed or not; the
-/// shell's word drawn, not yet, or another command's block newest since — is
-/// replayed through the real `look_at_exit` and `exit_record` over a stand-in
-/// tab and the crash file on disk, and keeps what the model's does; every
-/// attempt goes through the real `after_exit`, and relaunches exactly where
-/// the model's `Decide` does. Negative controls: where the `Buggy = 1` model
-/// looks at the exit as Claude Code's (`LookAsClaude`), reads a refusal as a
-/// crash (`RefusalAsCrash`), ignores the crash file (`CrashFileIgnored`),
-/// reads Ctrl-Z as a crash (`StopAsCrash`) or relaunches with no witness
-/// (`DecideFresh`), the real code decides otherwise — each caught on its own.
 #[test]
 fn tier1_the_real_agy_exit_read_conforms_to_the_model() {
     use std::collections::{BTreeMap, BTreeSet, VecDeque};
     let m = aterm_models_harness::harness_agy_exit_witness_model();
     let buggy = aterm_spec::interp::with_buggy(&m, 1);
-    // One rig, reset to each world in turn ([`Rig::reset`]).
     let mut rig = Rig::new("tier1", 0, true, false, false);
     let draw = |rig: &mut Rig, exit: i64, word: bool, later: bool, swept: bool| {
         let status = match exit {
@@ -2195,6 +1944,5 @@ fn tier1_the_real_agy_exit_read_conforms_to_the_model() {
     }
 }
 
-// The live upgrade's quiet flow, driven over the same stand-ins.
 #[path = "upgrade_agy_live_drive_tests.rs"]
 mod live_tests;

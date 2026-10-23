@@ -288,6 +288,7 @@ fn a_reviewer_runs_from_its_shim_in_the_repository_with_the_askers_environment_a
         limited_until: None,
         served_at: None,
         renewed_at: None,
+        next_sign_in: None,
     });
     let facts = vec![claude, facts_of(&CODEX, b.pkg.agents_dir().join("codex"))];
     let rows = [row_of(&CLAUDE, State::Ok), row_of(&CODEX, State::Ok)];

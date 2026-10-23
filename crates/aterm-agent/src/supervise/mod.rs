@@ -26,6 +26,9 @@
 //! * [`report`]: what the worker said since the manager's turn, with the rows a
 //!   fullscreen app scrolled off.
 //! * [`limit`]: when a limit notice says it resets, as a Unix time.
+//! * [`tap_clock`]: the usage tap's reading of the walled process, which times
+//!   the continuation at a usage wall where it names the reset (`[harness]
+//!   usage_tap`).
 //! * [`occupancy`]: what the harness measures of a session's wait on its own background work
 //!   (the hold's clock), under `[harness] occupancy`; [`facts`]: which measured episodes a
 //!   session has been told.
@@ -51,6 +54,7 @@ pub mod policy;
 pub mod report;
 pub mod run;
 pub mod screen;
+pub mod tap_clock;
 pub mod tape;
 pub mod transport;
 

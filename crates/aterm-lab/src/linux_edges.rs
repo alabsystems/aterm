@@ -1,107 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The edges LW.5-LW.7 left untested (`docs/AUDIT-third-party-2026-10-15.md`,
-//! step L-HEADER-LW7): rows of `linux proof` on each arch, and `linux
-//! edges`, which runs them alone. Each row drives aterm-gui where the edge
-//! is and holds what it does there to a control the same row runs, so a
-//! pass cannot come from the lane alone.
-//!
-//! On X11 (Xvfb):
-//!
-//! * **Resource files that `#include`** ([`Edge::XresInclude`]): no
-//!   `RESOURCE_MANAGER` (`xrdb -remove`), and a `~/.Xresources` whose
-//!   `#include "xres/main"` includes `dpi` beside itself, which sets
-//!   `Xft.dpi: 144`, while a decoy `~/dpi` (what a loader resolving from HOME
-//!   would read) sets 192. aterm-gui must draw at scale 1.5; with the
-//!   `#include` line taken out, at 1.
-//! * **A server without RandR, XInput 2 or XKB** ([`Edge::NoRandr`],
-//!   [`Edge::NoXinput2`], [`Edge::NoXkb`]): Xvfb's `-extension RANDR`, and
-//!   `lane-bus xhide`, a proxy that answers `QueryExtension` for
-//!   XInputExtension or XKEYBOARD as absent (Xvfb cannot turn those off).
-//!   aterm-gui must refuse by name and exit 1, never panic. Its control
-//!   ([`Edge::XProxy`]): the same proxy hiding nothing, through which
-//!   aterm-gui runs and draws.
-//! * **A server with XInput 1 alone** ([`Edge::Xinput1`]): the proxy keeps
-//!   XInputExtension present and answers its `XIQueryVersion` with the
-//!   `Request` error an XInput 1 server answers; aterm-gui must refuse it
-//!   as a server without XInput 2, by name, exit 1.
-//!
-//! On Wayland, under sway (headless wlroots, pixman, no input devices):
-//!
-//! * **Server-side decorations** ([`Edge::SwayDecorations`]): sway grants
-//!   them through xdg-decoration, so the window's frame is the system's (no
-//!   header buttons) and a drag on the band asks the compositor for nothing;
-//!   with the decoration manager hidden (`lane-bus wlhide`) the same sway
-//!   leaves the client to decorate itself, the header has its buttons and
-//!   the same drag asks for `xdg_toplevel.move`.
-//! * **cursor-shape-v1** ([`Edge::CursorShape`]): a virtual pointer
-//!   (`lane-wl pointer`, wlroots' virtual-pointer protocol) over the text and
-//!   over a floating client-decorated window's right edge: the window must
-//!   name each shape through `wp_cursor_shape_device_v1.set_shape`; with the
-//!   shape manager hidden it must set a cursor surface instead.
-//! * **An output that comes and goes** ([`Edge::OutputHotplug`]): sway makes
-//!   a second output at scale 2 and the window moves there (aterm-gui at
-//!   scale 2), then the output is unplugged under it: the window must live
-//!   on the first output, still drawing and still reading its pointer, at
-//!   the scale the compositor last asked of its surface (`preferred_scale`
-//!   in the wire log).
-//! * **A seat's devices that come and go** ([`Edge::SeatHotplug`]): the seat
-//!   gains a pointer, loses it and gains another (the window releases and
-//!   makes its `wl_pointer`, reading each), and a second seat appears, then
-//!   goes (sway's reload drops a seat its config does not name): the window
-//!   releases the `wl_seat` it bound for it and keeps drawing.
-//! * **A compositor without `wl_compositor` 6** ([`Edge::LegacyCompositor`]):
-//!   `wlhide` announces `wl_compositor` at 5 and hides fractional scaling,
-//!   so the scale comes only from the outputs the surface is on: an output
-//!   at scale 2 must rescale the window at that output's `done`, and back;
-//!   on a second output at 2, then that output unplugged, the window must
-//!   forget it. Control: `wl_output` capped at 1 too (no `scale` event),
-//!   where the same output scale leaves the window at 1.
-//! * **The shadow margin** ([`Edge::ShadowMargin`]): sctk-adwaita's border
-//!   parts around a floating client-decorated window (decoration manager
-//!   hidden), restored after LW.5 took them away. A screenshot (`grim`, over
-//!   a grey background) must show the visible border against the window's
-//!   right edge and the shadow darkening the background beyond it. sway
-//!   draws a subsurface outside the window's geometry but gives it no input
-//!   there (a floating container takes the pointer only inside its own
-//!   rectangle), so the handles' presses are [`Edge::ShadowHandles`]'s, under
-//!   Mutter.
-//! * **`window_padding = 0`** ([`Edge::Padding0`]): a floating
-//!   client-decorated window; the virtual pointer pressed 1 px inside its
-//!   left edge on a grid row, and on the last row, and dragged: a selection,
-//!   and no `xdg_toplevel.resize`. Control: the default padding, where the
-//!   same press resizes.
-//!
-//! Under Mutter:
-//!
-//! * **fullscreen** ([`Edge::Fullscreen`]) at `tab_strip_rows = 0`: the
-//!   header's buttons and its row go while the window is fullscreen, and
-//!   come back when it leaves.
-//! * **The shadow margin's resize handles** ([`Edge::ShadowHandles`]): the
-//!   seat's pointer (`lane-bus seat`, a RemoteDesktop session) pressed 6 px
-//!   outside the window's right edge, on the right part's 12 px handle, must
-//!   ask for `xdg_toplevel.resize` by the right edge and set the east-west
-//!   resize cursor there; pressed 24 px outside it, past the handle, it must
-//!   ask for nothing.
-//! * **GNOME's `button-layout`** ([`Edge::ButtonLayout`]), set with
-//!   `gsettings` and served by the lane's Settings portal (xdg-desktop-portal
-//!   and its GTK backend, `linux_a11y::portal_up`): a layout that puts close
-//!   and minimize at the left end and maximize at the right must lay the
-//!   header out so; GNOME's own default (`appmenu:close`) must leave close
-//!   alone at the right; and with the portal stopped (no answer) the header
-//!   must fall back to minimize, maximize and close at the right, which is
-//!   what LW.5's fixed buttons showed for all three.
-//!
-//! Under weston:
-//!
-//! * **Its pixman renderer** ([`Edge::WestonPixman`]), the VM and kiosk case,
-//!   which LW.2 found crashing when a client grew a `wl_shm` pool it was
-//!   still reading (sctk's frame pool, before aterm's own presenter and
-//!   frame): aterm-gui on the CPU resized seven times, growing and shrinking,
-//!   each frame held to weston's own output pixels (`weston-screenshooter`)
-//!   and weston alive after each. Its control is the proof's CPU row under
-//!   weston's GL renderer, which holds the same frames.
+//! The edges LW.5-LW.7 left untested (`docs/AUDIT-third-party-2026-10-15.md`, step L-HEADER-LW7): rows of `linux proof` on each arch, and `linux edges`, which runs them alone.
 
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -132,7 +32,6 @@ const SWAY_OUTPUT: &str = "output HEADLESS-1 resolution 1280x800\n";
 const LAYOUT: (i32, i32) = (1280, 800);
 
 /// The protocol a client-decorated window's frame comes from, which
-/// `lane-bus wlhide` hides to make sway leave the client to decorate itself.
 const DECORATION: &str = "zxdg_decoration_manager_v1";
 
 /// One row.
@@ -246,7 +145,6 @@ impl Edge {
 }
 
 /// How a row ended: its verdict and detail. A row whose display or helper
-/// did not come up did not run.
 type Ended = (Verdict, String);
 
 fn not_run(why: impl Into<String>) -> Ended {
@@ -264,7 +162,6 @@ pub(crate) fn rows(
         .into_iter()
         .filter(|e| only.is_empty() || only.contains(e))
         .collect();
-    // `lane-wl pointer`, built once for the rows that point.
     let lane_wl = if built && wanted.iter().any(|e| e.points()) {
         println!("\n=== {}: build lane-wl ===", cell.tag);
         let out = cell.up.lima.shell_streamed(
@@ -368,8 +265,7 @@ pub const SHAPES: [&str; 34] = [
     "zoom_out",
 ];
 
-/// The shapes a client's wire log (`WAYLAND_DEBUG=client`) set, by name, in
-/// order, each once where it repeats in a row.
+/// The shapes a client's wire log (`WAYLAND_DEBUG=client`) set, by name, in order, each once where it repeats in a row.
 #[must_use]
 pub fn shapes_set(log: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
@@ -400,9 +296,7 @@ pub fn shapes_set(log: &str) -> Vec<String> {
     out
 }
 
-/// The cursors a client's wire log set through `wl_pointer.set_cursor`, each
-/// with the surface the pointer was on when it set it (from the pointer's
-/// `enter` and `leave`): `(wl_surface@N, (hotspot x, hotspot y))`, in order.
+/// The cursors a client's wire log set through `wl_pointer.set_cursor`, each with the surface the pointer was on when it set it (from the pointer's `enter` and `leave`): `(wl_surface@N, (hotspot x, hotspot y))`, in order.
 #[must_use]
 pub fn cursors_set(log: &str) -> Vec<(String, (i32, i32))> {
     let mut on = String::new();
@@ -444,8 +338,7 @@ pub fn window_surface(log: &str) -> Option<String> {
         .map(|(_, s)| s.trim_end().trim_end_matches(')').to_string())
 }
 
-/// Each `wl_seat` a wire log shows the client binding, in order: the
-/// global's name and the object it was bound as (`wl_seat@N`).
+/// Each `wl_seat` a wire log shows the client binding, in order: the global's name and the object it was bound as (`wl_seat@N`).
 #[must_use]
 pub fn seat_binds(log: &str) -> Vec<(u32, String)> {
     log.lines()
@@ -459,9 +352,7 @@ pub fn seat_binds(log: &str) -> Vec<(u32, String)> {
         .collect()
 }
 
-/// The last scale the compositor asked of `surface` (`wl_surface@N`) through
-/// fractional-scale-v1, in 120ths: the last `preferred_scale` of the
-/// `wp_fractional_scale_v1` the client made for that surface.
+/// The last scale the compositor asked of `surface` (`wl_surface@N`) through fractional-scale-v1, in 120ths: the last `preferred_scale` of the `wp_fractional_scale_v1` the client made for that surface.
 #[must_use]
 pub fn preferred_scale(log: &str, surface: &str) -> Option<u32> {
     let made_for = format!(", {surface})");
@@ -479,8 +370,7 @@ pub fn preferred_scale(log: &str, surface: &str) -> Option<u32> {
         .next_back()
 }
 
-/// How many requests of `method` on interface `iface` a wire log shows
-/// (`-> iface@N.method(`).
+/// How many requests of `method` on interface `iface` a wire log shows (`-> iface@N.method(`).
 #[must_use]
 pub fn requests_of(log: &str, iface: &str, method: &str) -> usize {
     log.lines()
@@ -494,8 +384,7 @@ pub fn requests_of(log: &str, iface: &str, method: &str) -> usize {
         .count()
 }
 
-/// How many events `event` of interface `iface` a wire log shows
-/// (` iface@N.event(` with no arrow).
+/// How many events `event` of interface `iface` a wire log shows (` iface@N.event(` with no arrow).
 #[must_use]
 pub fn events_of(log: &str, iface: &str, event: &str) -> usize {
     log.lines()
@@ -531,8 +420,6 @@ fn num(dims: &str, key: &str) -> Option<i32> {
 }
 
 /// The X display's socket, `/tmp/.X11-unix/X<n>`.
-/// Whether `swaymsg -t get_tree`'s answer holds a window whose `app_id` is
-/// `app_id` (however swaymsg spaces its JSON).
 #[must_use]
 pub fn sway_shows(tree: &str, app_id: &str) -> bool {
     let tree: String = tree.split_whitespace().collect();
@@ -598,7 +485,6 @@ impl Run<'_> {
     }
 
     /// The scratch world, with `top` (top-level config keys) put before the
-    /// lane's config, and an empty marks directory.
     fn prepare(&self, top: &str) -> Result<(), String> {
         self.gui.prepare()?;
         if !top.is_empty() {
@@ -629,8 +515,6 @@ impl Run<'_> {
     }
 
     /// Start aterm-gui on `client` with `extra` in its environment, its
-    /// stderr (a `WAYLAND_DEBUG` wire log too) to [`Run::stderr`], and wait
-    /// until it is ready.
     fn launch(
         &self,
         client: &[(String, String)],
@@ -680,7 +564,6 @@ impl Run<'_> {
 
     /// Photograph the frame (`image`) and keep it beside the report.
     fn photograph(&self, what: &str) -> Result<(), String> {
-        // `image` takes a bare name and answers `OK image <w>x<h> <path>`.
         let name = format!("{}-{what}.png", self.gui.name);
         let reply = self.ctl(&["image", &name])?;
         let guest_png = reply
@@ -824,8 +707,6 @@ impl Run<'_> {
         }
     }
 
-    // ---------------------------------------------------------------- X11
-
     fn xres_include(&self) -> Ended {
         if let Err(why) = linux::start_display(self.up(), Display::Xvfb) {
             return not_run(why);
@@ -853,13 +734,11 @@ impl Run<'_> {
             )?;
             self.put(&format!("{home}/xres/main"), "#include \"dpi\"\n")?;
             self.put(&format!("{home}/xres/dpi"), "Xft.dpi: 144\n")?;
-            // What a loader resolving the nested include from HOME reads.
             self.put(&format!("{home}/dpi"), "Xft.dpi: 192\n")?;
             let client = [Display::Xvfb.client_env(&self.up().runtime)];
             self.launch(&client, &[])?;
             let with = self.dims()?;
             self.gui.stop();
-            // The control: the same files, the include line taken out.
             self.put(&format!("{home}/.Xresources"), "! the lane's include row\n")?;
             self.launch(&client, &[])?;
             let without = self.dims()?;
@@ -880,7 +759,6 @@ impl Run<'_> {
     }
 
     /// aterm-gui on `client`, which must refuse the display naming
-    /// `extension` and exit 1, without a panic: the exit and its line.
     fn refused(&self, client: &[(String, String)], extension: &str) -> Result<String, String> {
         self.prepare("")?;
         let status = format!("{}/status", self.gui.dir);
@@ -943,7 +821,6 @@ impl Run<'_> {
     }
 
     /// `lane-bus xhide` on [`XHIDE_DISPLAY`] in front of the lane's Xvfb,
-    /// hiding `hide` (`-`: nothing).
     fn xhide(&self, hide: &str) -> Result<(), String> {
         linux::start_display(self.up(), Display::Xvfb)?;
         self.units(
@@ -984,7 +861,6 @@ impl Run<'_> {
     }
 
     /// XInputExtension present, its `XIQueryVersion` refused as an XInput 1
-    /// server refuses it: aterm-gui must say it lacks XInput 2.
     fn xinput1(&self) -> Ended {
         if let Err(why) = self.xhide("XInput2") {
             return not_run(why);
@@ -1026,8 +902,6 @@ impl Run<'_> {
             }
         })())
     }
-
-    // ---------------------------------------------------------------- sway
 
     fn sway(&self) -> Result<Sway, String> {
         let rt = format!("{SWAY_DIR}/rt");
@@ -1097,7 +971,6 @@ impl Run<'_> {
     }
 
     /// `lane-bus wlhide` in front of `sway` with `rules`: the socket a
-    /// client reaches the edited compositor by.
     fn wlhide(&self, sway: &Sway, rules: &[&str]) -> Result<String, String> {
         let socket = format!("{SWAY_DIR}/rt/hidden");
         let mut argv = vec![
@@ -1129,9 +1002,6 @@ impl Run<'_> {
     }
 
     /// Wait (a hang detector) until `sway` shows aterm-gui's window in its
-    /// tree. `ready` can answer before the window's first buffer has reached
-    /// sway: under Rosetta a `floating enable` right after it found "an empty
-    /// workspace" (`proof-20261020-212543`, x86_64, three rows).
     fn mapped(&self, sway: &Sway) -> Result<(), String> {
         let t0 = Instant::now();
         loop {
@@ -1150,7 +1020,6 @@ impl Run<'_> {
     }
 
     /// `lane-wl pointer` on `socket` with `steps`, as a lane unit that ends
-    /// with its last step.
     fn pointer(&self, socket: &str, steps: &[String]) -> Result<(), String> {
         let lane_wl = self.lane_wl.map_err(Clone::clone)?;
         let mut argv = vec![
@@ -1220,7 +1089,6 @@ impl Run<'_> {
     }
 
     /// The window pixel of grid cell `row`, `col` (the control socket's own
-    /// pointer, which reads back where that cell is).
     fn cell_px(&self, row: i32, col: i32) -> Result<(i32, i32), String> {
         let at = self.ctl(&["pointer", "move", &row.to_string(), &col.to_string()])?;
         proof::field(&at, "px")
@@ -1230,7 +1098,6 @@ impl Run<'_> {
     }
 
     /// Put the layout point for window pixel `px` (the window's top-left at
-    /// `origin` in the layout, scale 1) in the mark `name`, for `at:@`.
     fn aim(&self, name: &str, origin: (i32, i32), px: (i32, i32)) -> Result<(), String> {
         let (x, y) = (origin.0 + px.0, origin.1 + px.1);
         if x < 0 || y < 0 || x >= LAYOUT.0 || y >= LAYOUT.1 {
@@ -1240,7 +1107,6 @@ impl Run<'_> {
     }
 
     /// The window's top-left in the layout: the pointer was put at the
-    /// layout's centre and the window read it at `px`.
     fn origin(px: (i32, i32)) -> (i32, i32) {
         (LAYOUT.0 / 2 - px.0, LAYOUT.1 / 2 - px.1)
     }
@@ -1251,7 +1117,6 @@ impl Run<'_> {
             Err(why) => return not_run(why),
         };
         Self::verdict((|| {
-            // Server-side: sway's own socket.
             let ssd = self.band_drag(&sway, &sway.socket, "ssd")?;
             if ssd.0.client || !ssd.0.buttons.is_empty() {
                 return Err(format!(
@@ -1267,7 +1132,6 @@ impl Run<'_> {
                 ));
             }
             self.gui.stop();
-            // Client-side: the same sway with its decoration manager hidden.
             let hidden = self.wlhide(&sway, &[&format!("hide:{DECORATION}")])?;
             let csd = self.band_drag(&sway, &hidden, "csd")?;
             if !csd.0.client || csd.0.buttons.is_empty() {
@@ -1293,8 +1157,6 @@ impl Run<'_> {
     }
 
     /// aterm-gui on `socket`, photographed, then dragged by the band's
-    /// middle with the virtual pointer: its caption and the frame requests
-    /// its wire log shows.
     fn band_drag(
         &self,
         sway: &Sway,
@@ -1309,9 +1171,6 @@ impl Run<'_> {
         let band_y = num(&d, "pad_top").unwrap_or(0)
             + num(&d, "head").unwrap_or(0)
             + num(&d, "cell_h").unwrap_or(0) / 2;
-        // A bare stretch of the band, right of a lone tab and its `+`: four
-        // cells left of the first button, or of the strip's end where there
-        // is none.
         let (cw, pad) = (num(&d, "cell_w").unwrap_or(0), num(&d, "pad").unwrap_or(0));
         let cols = u16::try_from(num(&d, "window_cols").unwrap_or(0)).unwrap_or(0);
         let end = i32::from(caption.right_end(cols));
@@ -1352,7 +1211,6 @@ impl Run<'_> {
             Err(why) => return not_run(why),
         };
         Self::verdict((|| {
-            // Over the text, under server-side decorations.
             let text = self.hover(&sway, &sway.socket, "shapes", false)?;
             if !text.0.iter().any(|s| s == "text") {
                 return Err(format!(
@@ -1361,7 +1219,6 @@ impl Run<'_> {
                 ));
             }
             self.gui.stop();
-            // Over a floating client-decorated window's right edge.
             let hidden = self.wlhide(&sway, &[&format!("hide:{DECORATION}")])?;
             let edge = self.hover(&sway, &hidden, "shapes-edge", true)?;
             if !edge.0.iter().any(|s| s.ends_with("_resize")) {
@@ -1372,7 +1229,6 @@ impl Run<'_> {
             }
             self.gui.stop();
             self.stop_wlhide();
-            // The control: the shape manager hidden.
             let hidden = self.wlhide(&sway, &["hide:wp_cursor_shape_manager_v1"])?;
             let control = self.hover(&sway, &hidden, "shapes-hidden", false)?;
             if !control.0.is_empty() || control.1 == 0 {
@@ -1394,8 +1250,6 @@ impl Run<'_> {
     }
 
     /// aterm-gui on `socket` (floating when `edge`), the virtual pointer
-    /// put on its text, or on its right edge: the shapes it set, and how
-    /// many cursor surfaces it set.
     fn hover(
         &self,
         sway: &Sway,
@@ -1457,11 +1311,7 @@ impl Run<'_> {
             self.swaymsg(&sway, &["move", "container", "to", "output", "HEADLESS-2"])?;
             let there = self.scale_until("on HEADLESS-2", 2.0)?;
             self.swaymsg(&sway, &["output", "HEADLESS-2", "unplug"])?;
-            // sway carries the gone output's workspace to the first output but
-            // keeps showing that output's own; focusing the window shows its.
             self.swaymsg(&sway, &["[app_id=aterm]", "focus"])?;
-            // The window lives on the first output: it reads a pointer there
-            // (the layout's centre, HEADLESS-1's), and keeps drawing.
             let steps = [
                 "make".to_string(),
                 format!("at:{},{}", LAYOUT.0 / 2, LAYOUT.1 / 2),
@@ -1477,10 +1327,6 @@ impl Run<'_> {
             if render != "ok" {
                 return Err(format!("render={render} after the unplug"));
             }
-            // The scale after is the compositor's: the last preferred_scale it
-            // sent the window's surface (sway sends none at the unplug, so it
-            // stays HEADLESS-2's). The wire is read again until the two agree,
-            // in case one more came between the reads.
             let t0 = Instant::now();
             let (after, wire, preferred) = loop {
                 let after = self.dims()?;
@@ -1552,7 +1398,6 @@ impl Run<'_> {
             let first = self.pointer_px()?;
             self.go("first-read");
             self.reached("dropped")?;
-            // The window let its pointer go before the next one comes.
             let t0 = Instant::now();
             while requests_of(&self.wire(), "wl_pointer", "release") == 0 {
                 if t0.elapsed() > HANG {
@@ -1565,7 +1410,6 @@ impl Run<'_> {
             }
             self.go("again");
             self.reached("second")?;
-            // The new pointer, 40,20 left of where the first one was read.
             let t0 = Instant::now();
             let second = loop {
                 let px = self.pointer_px()?;
@@ -1575,7 +1419,6 @@ impl Run<'_> {
                 std::thread::sleep(Duration::from_millis(100));
             };
             self.go("done");
-            // A second seat.
             self.swaymsg(&sway, &["seat", "seat1", "fallback", "false"])?;
             let t0 = Instant::now();
             let wire = loop {
@@ -1611,9 +1454,6 @@ impl Run<'_> {
             if !(got >= 2 && released >= 1 && second != first && seats >= 2) {
                 return Err(line);
             }
-            // The second seat goes: sway's reload drops a seat its config does
-            // not name. The window must release the seat it bound for it
-            // (`wl_seat.release`, version 5 and later) and keep drawing.
             let Some((global, object)) = seat_binds(&wire).pop() else {
                 return Err(format!("{line}; no wl_seat bind in the wire log"));
             };
@@ -1670,7 +1510,6 @@ impl Run<'_> {
             let two = self.scale_until("at output scale 2", 2.0)?;
             self.swaymsg(&sway, &["output", "HEADLESS-1", "scale", "1"])?;
             let one = self.scale_until("at output scale 1", 1.0)?;
-            // A second output at 2, the window moved there, the output gone.
             self.swaymsg(&sway, &["create_output"])?;
             self.swaymsg(&sway, &["output", "HEADLESS-2", "scale", "2"])?;
             self.swaymsg(&sway, &["move", "container", "to", "output", "HEADLESS-2"])?;
@@ -1687,9 +1526,6 @@ impl Run<'_> {
             }
             self.gui.stop();
             self.stop_wlhide();
-            // The control: no `wl_output.scale` either. The output's scale
-            // changes the window's logical size, so once the window has
-            // resized it has read everything sent before.
             let control = self.wlhide(&sway, &[rules[0], rules[1], "cap:wl_output=1"])?;
             self.prepare("")?;
             self.launch_wayland(&sway, &control)?;
@@ -1732,8 +1568,6 @@ impl Run<'_> {
                  selected {:?})",
                 zero.0, zero.1, zero.2, control.2, control.1
             );
-            // Column 0 holds `0`, and the last row `LAST-ROW-…` from column 0, so
-            // its press at column 2 starts at `S`.
             if zero.0.starts_with("0123")
                 && zero.1.starts_with("ST-")
                 && !resized(&zero.2)
@@ -1747,10 +1581,6 @@ impl Run<'_> {
     }
 
     /// aterm-gui floating and client-decorated on `socket` with `top` in
-    /// its config; the pointer pressed 1 px inside the left edge on grid
-    /// row 0 and dragged four cells right, then pressed on the last row's
-    /// bottom pixel at column 2 and dragged right: what each selected (as
-    /// `selection` reads it) and the frame requests its wire log shows.
     fn edge_press(
         &self,
         sway: &Sway,
@@ -1762,10 +1592,6 @@ impl Run<'_> {
         self.launch_wayland(sway, socket)?;
         self.swaymsg(sway, &["floating", "enable"])?;
         self.caption_until("resize edges", &|c| c.edges)?;
-        // Text from the first column of the first row to the last row, so a
-        // drag there selects some: a screen of lines, then the last one
-        // without its newline while the shell sleeps (`LAST-%s` so the typed
-        // line is not what appears).
         self.ctl(&[
             "send",
             "clear; yes 0123456789abcdefghijklmnopqrstuvwxyz | head -n 99; \
@@ -1820,8 +1646,6 @@ impl Run<'_> {
         self.go("aimed");
         self.reached("left-done")?;
         let left = self.ctl(&["selection"])?;
-        // The last row's bottom pixel (the control socket's pointer reads
-        // back a cell's middle).
         let last = self.cell_px(rows - 1, 2)?;
         let bottom = (last.1 + ch / 2 - 1).min(h - 1);
         self.aim("bottom", origin, (last.0, bottom))?;
@@ -1831,8 +1655,6 @@ impl Run<'_> {
         let bottom = self.ctl(&["selection"])?;
         self.go("done");
         let wire = self.keep(&format!("{what}-wire"));
-        // aterm-ctl prints a selection's lines alone, and says `OK 0 (selection:
-        // no results)` for none.
         let text = |r: &str| {
             r.lines()
                 .filter(|l| !l.contains("OK 0 (selection"))
@@ -1848,17 +1670,13 @@ impl Run<'_> {
             Err(why) => return not_run(why),
         };
         Self::verdict((|| {
-            // A grey ground the shadow darkens (sway's own is black).
             self.swaymsg(&sway, &["output", "*", "bg", GROUND_HEX, "solid_color"])?;
             let hidden = self.wlhide(&sway, &[&format!("hide:{DECORATION}")])?;
             self.prepare("")?;
             self.launch_wayland(&sway, &hidden)?;
             self.swaymsg(&sway, &["floating", "enable"])?;
-            // sway's own border would sit where the window's is.
             self.swaymsg(&sway, &["[app_id=aterm]", "border", "none"])?;
             self.caption_until("resize edges", &|c| c.edges)?;
-            // The pointer at the layout's centre, where the window reads it:
-            // the window's place on the screen.
             let steps = [
                 "make".to_string(),
                 format!("at:{},{}", LAYOUT.0 / 2, LAYOUT.1 / 2),
@@ -1873,7 +1691,6 @@ impl Run<'_> {
                 num(&d, "frame_w").unwrap_or(0),
                 num(&d, "frame_h").unwrap_or(0),
             );
-            // grim leaves the cursor out.
             let shot = self.screenshot(&sway, "shadow-screen");
             self.go("shot");
             let shot = shot?;
@@ -1895,7 +1712,6 @@ impl Run<'_> {
     }
 
     /// The whole of sway's output, as `grim` takes it, kept beside the
-    /// report as `<name>-<what>.png` and decoded.
     fn screenshot(&self, sway: &Sway, what: &str) -> Result<Screen, String> {
         let guest_png = format!("{}/{what}.png", self.gui.dir);
         let rt = format!("{SWAY_DIR}/rt");
@@ -1928,8 +1744,6 @@ impl Run<'_> {
             .map(|(rgba, w, h)| Screen { rgba, w, h })
             .ok_or_else(|| format!("{}: not a PNG this lab decodes", host.display()))
     }
-
-    // --------------------------------------------------------------- Mutter
 
     fn fullscreen(&self) -> Ended {
         if let Err(why) = linux::start_display(self.up(), Display::Mutter) {
@@ -1975,9 +1789,6 @@ impl Run<'_> {
     }
 
     /// `lane-bus seat` on the lane's Mutter, as a lane unit that runs `steps`
-    /// and ends. It awaits no frame (`-`: the row has no accessibility bus);
-    /// the steps pace themselves with marks, and the unit is waited for until
-    /// its RemoteDesktop session has started (a hang detector).
     fn seat(&self, steps: &[String]) -> Result<(), String> {
         let unit_pid = |unit: &str| {
             let out = self.sh(&[
@@ -2041,8 +1852,6 @@ impl Run<'_> {
     }
 
     /// The window pixel the pointer rests on: the same reading twice,
-    /// 300 ms apart (a motion reaches the window a moment after
-    /// RemoteDesktop takes it), within the hang detector.
     fn settled_px(&self) -> Result<(i32, i32), String> {
         let t0 = Instant::now();
         let mut last = self.pointer_px()?;
@@ -2062,7 +1871,6 @@ impl Run<'_> {
     }
 
     /// The shadow margin's input under Mutter, which (unlike sway) gives a
-    /// subsurface outside the window's geometry the pointer.
     fn shadow_handles(&self) -> Ended {
         if let Err(why) = linux::start_display(self.up(), Display::Mutter) {
             return not_run(why);
@@ -2080,13 +1888,9 @@ impl Run<'_> {
                 num(&d, "frame_h").unwrap_or(0),
             );
             let scale = scale_of(&d).filter(|s| *s > 0.0).unwrap_or(1.0);
-            // The seat moves in logical pixels, the window reads device ones.
             let logical = |px: i32| (f64::from(px) / scale).round() as i32;
             let mark = |name: &str| self.mark(name);
             let steps = [
-                // Mutter makes the seat's pointer with its first motion: parked
-                // in the top-left corner, then to the screen's centre, on the
-                // window, which Mutter centres.
                 "move:-4000,-4000".into(),
                 "sleep:300".into(),
                 format!("move:{},{}", guest::SCREEN.0 / 2, guest::SCREEN.1 / 2),
@@ -2113,8 +1917,6 @@ impl Run<'_> {
             self.seat(&steps)?;
             self.seat_reached("centred")?;
             let (x, y) = self.settled_px()?;
-            // 6 px outside the right edge at mid-height (on the right part's
-            // 12 px handle), then 18 px further (past it).
             let to_handle = (logical(w - x) + 6, logical(h / 2 - y));
             self.put(
                 &mark("to-handle"),
@@ -2133,9 +1935,6 @@ impl Run<'_> {
             let resizes = requests_of(&wire, "xdg_toplevel", "resize");
             let shaped = bound_version(&wire, "wp_cursor_shape_manager_v1").is_some();
             let shapes = shapes_set(&wire);
-            // Without cursor-shape-v1 (Mutter 46) the window sets a cursor
-            // surface: on the part, one whose hotspot differs from every one
-            // it set on the window itself (the text's, the default's).
             let window = window_surface(&wire).unwrap_or_default();
             let set = cursors_set(&wire);
             let own: Vec<(i32, i32)> = set
@@ -2195,8 +1994,6 @@ impl Run<'_> {
     }
 
     /// Set GNOME's `button-layout` and wait until the Settings portal
-    /// answers it (its GTK backend hears dconf when it will: a hang
-    /// detector).
     fn set_button_layout(&self, value: &str) -> Result<(), String> {
         self.gsettings(&["set", WM_PREFERENCES, BUTTON_LAYOUT, &format!("'{value}'")])?;
         let bus = format!(
@@ -2231,7 +2028,6 @@ impl Run<'_> {
     }
 
     /// aterm-gui under Mutter, fresh (the layout is read once a process):
-    /// its header's buttons, the strip's width, and a photograph.
     fn header_under_mutter(&self, what: &str) -> Result<(Caption, u16), String> {
         self.gui.stop();
         self.prepare("")?;
@@ -2258,8 +2054,6 @@ impl Run<'_> {
             Err(why) => return not_run(why),
         };
         let r = (|| {
-            // Both ends: close and minimize flush left in that order, the
-            // strip after them, maximize flush right.
             self.set_button_layout("close,minimize:maximize")?;
             let (both, cols) = self.header_under_mutter("layout-both-ends")?;
             let w = both.buttons.first().map_or(0, |&(_, s, e)| e - s);
@@ -2277,7 +2071,6 @@ impl Run<'_> {
                     cols - w
                 ));
             }
-            // GNOME's default: close alone, at the right end.
             self.set_button_layout("appmenu:close")?;
             let (gnome, _) = self.header_under_mutter("layout-gnome-default")?;
             if gnome.buttons != vec![("close".to_string(), cols - w, cols)] {
@@ -2287,7 +2080,6 @@ impl Run<'_> {
                     cols - w
                 ));
             }
-            // No answer: the portal stopped, the same value still set.
             let portal = format!("{}portal", guest::UNIT_PREFIX);
             if !self.sh(&["systemctl", "--user", "stop", &portal]).ok() {
                 return Err(format!("{portal} did not stop"));
@@ -2326,14 +2118,11 @@ impl Run<'_> {
 }
 
 impl Run<'_> {
-    // ---------------------------------------------------------------- weston
-
     fn weston_pixman(&self) -> Ended {
         if let Err(why) = linux::start_weston_capturing_with(self.up(), "pixman") {
             return not_run(why);
         }
         let weston = format!("{}weston", guest::UNIT_PREFIX);
-        // What this weston said (the unit's journal since its last start).
         let log = self.sh(&[
             "journalctl",
             "--user",
@@ -2355,8 +2144,6 @@ impl Run<'_> {
         let r = (|| {
             self.prepare("")?;
             self.launch(&[Display::Weston.client_env(&self.up().runtime)], &[])?;
-            // Growing past each pool's size (a `wl_shm_pool.resize`) and
-            // shrinking back, twice over.
             let sizes = [
                 (30, 100),
                 (24, 80),
@@ -2404,8 +2191,6 @@ impl Run<'_> {
                 held.join("; ")
             ))
         })();
-        // A step aterm-gui could not answer, because weston died under it
-        // (its connection gone), says so first.
         let r = r.map_err(|e| {
             let alive = self.sh(&["systemctl", "--user", "is-active", "--quiet", &weston]);
             if alive.ok() {
@@ -2433,7 +2218,6 @@ impl Run<'_> {
 }
 
 /// The ground the shadow-margin row shows the window over, and the visible
-/// border's two colours (sctk-adwaita's light and dark themes').
 const GROUND_HEX: &str = "#a0a0a0";
 const GROUND: [u8; 3] = [0xa0, 0xa0, 0xa0];
 const BORDER_LIGHT: [u8; 3] = [220, 220, 220];
@@ -2460,7 +2244,6 @@ impl Screen {
 }
 
 /// GNOME's window-manager preferences, and the key that places the
-/// header's buttons.
 const WM_PREFERENCES: &str = "org.gnome.desktop.wm.preferences";
 const BUTTON_LAYOUT: &str = "button-layout";
 
@@ -2486,7 +2269,6 @@ mod tests {
     }
 
     /// sway's tree as swaymsg prints it: an output's empty workspace, then
-    /// the same with a view on it.
     #[test]
     fn a_window_is_found_in_swaymsg_tree_however_it_is_spaced() {
         let empty = r#"{ "id": 1, "name": "root", "type": "root", "nodes": [ { "id": 3, "name": "HEADLESS-1", "type": "output", "nodes": [ { "id": 4, "name": "1", "type": "workspace", "nodes": [ ], "floating_nodes": [ ] } ] } ] }"#;
@@ -2529,7 +2311,6 @@ mod tests {
     }
 
     /// Recorded under sway 1.9 (aarch64, `proof-20261020-230136`, the
-    /// seat-hotplug row): the first seat, and the second as sway made it.
     #[test]
     fn the_seats_bound_are_read_with_their_globals_and_objects() {
         let log = "\
@@ -2550,8 +2331,6 @@ mod tests {
     }
 
     /// Recorded under sway 1.9 (aarch64, `edges-20261020-222818`, the
-    /// output-hotplug row): the window's surface on HEADLESS-1 at 120, moved
-    /// to HEADLESS-2 at 240, which then went with no preferred_scale after.
     #[test]
     fn the_preferred_scale_is_the_last_one_sent_to_the_window_s_surface() {
         let log = "\
@@ -2575,8 +2354,6 @@ mod tests {
     }
 
     /// Recorded under Mutter 46 (aarch64, 2026-10-20): the text's cursor set
-    /// on the window, the pointer onto the right part, the resize cursor set
-    /// there, and a leave with nothing set.
     #[test]
     fn the_wire_log_says_which_surface_each_cursor_was_set_on() {
         let log = "\

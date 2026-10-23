@@ -35,10 +35,32 @@ const REAP_CHECK: Duration = Duration::from_millis(20);
 struct CaptureLifecycleObservation {
     child_reaped: AtomicBool,
     reader_done: AtomicBool,
-    /// Run after spawn and before the deadline is taken, so what a test's child
-    /// must have done by then (an escape test's holder leaving for its own
-    /// session) happens before the deadline under any load.
+    /// Run after spawn, and the deadline taken again after it, so what a
+    /// test's child must have done by then (an escape test's holder leaving
+    /// for its own session) happens before the deadline under any load.
     after_spawn: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// Run after the deadline is taken and before the spawn: a spawn that
+    /// takes this long, charged to the budget.
+    before_spawn: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
+}
+
+/// Take and run `step` of `observer`, if a test set one: `true` when one ran.
+#[cfg(all(test, unix))]
+fn observed_step(
+    observer: &CaptureObserver,
+    step: impl FnOnce(
+        &CaptureLifecycleObservation,
+    ) -> &std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
+) -> bool {
+    let Some(observer) = observer else {
+        return false;
+    };
+    let slot = step(observer);
+    let run = slot
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
+    run.map(|run| run()).is_some()
 }
 
 #[cfg(all(test, unix))]
@@ -80,7 +102,12 @@ impl Captured {
 /// mount or a looping command.
 ///
 /// The environment is cleared and rebuilt from `PATH`, `HOME`, `TMPDIR` plus
-/// what the caller set on `cmd`, and stdin is null. One thread reads stdout
+/// what the caller set on `cmd`, and stdin is null. `budget` starts before the
+/// spawn, so the time a slow spawn takes (a loaded machine, a binary the
+/// system assesses first) is charged to it, not added to it. A spawn that
+/// does not return at all still holds the caller: nothing interrupts a spawn
+/// on its own thread, and one moved to another would outlive this call with
+/// its child, which this runner never leaves behind. One thread reads stdout
 /// while this one blocks in `recv_timeout`, then checks `try_wait` until the
 /// same absolute deadline. On Unix the reader polls a nonblocking descriptor
 /// against the deadline, so a descendant that escapes the process group with
@@ -125,19 +152,17 @@ fn capture_bounded_impl(
     }
     #[cfg(unix)]
     cmd.process_group(0);
+    // Before the spawn: the budget bounds the spawn too.
+    let deadline = Instant::now() + budget;
+    #[cfg(all(test, unix))]
+    observed_step(&observer, |o| &o.before_spawn);
     let mut child = cmd.spawn().map_err(|e| format!("it will not run: {e}"))?;
     #[cfg(all(test, unix))]
-    if let Some(observer) = &observer {
-        let settle = observer
-            .after_spawn
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
-        if let Some(settle) = settle {
-            settle();
-        }
-    }
-    let deadline = Instant::now() + budget;
+    let deadline = if observed_step(&observer, |o| &o.after_spawn) {
+        Instant::now() + budget
+    } else {
+        deadline
+    };
     let Some(stdout) = child.stdout.take() else {
         kill_capture_child(&mut child, &observer);
         return Err(String::from("its stdout could not be captured"));

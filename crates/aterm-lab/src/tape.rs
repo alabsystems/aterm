@@ -1,54 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE LAB'S HARNESS TAPES. A lab's instance records every hosted loop it
-//! runs (the development seam `ATERM_HARNESS_TAPE`, which [`seam`] names and
-//! `lab::start_instance` sets), into its state root's tape store
-//! (`<state>/drive/tapes/<sid>/`, `aterm_agent::supervise::tape::store`).
-//! `down` keeps the whole `drive/` directory, tapes included; a scenario run
-//! whose lab is its own ends each loop as a person does first ([`end_loops`]),
-//! so each tape carries its end, then copies them beside its records and says
-//! what they cost in `summary.json` ([`summary`]); and the selftest replays
-//! each one ([`replay_all`]): a tape the lab's own harness recorded must run
-//! again, offline, from itself alone.
-//!
-//! THE CORPUS (the replay plan's T10, `aterm_agent::supervise::tape::corpus`):
-//! a run's tape kept in the checkout, `crates/aterm-agent/tests/testdata/
-//! tapes/<name>.atape.txt`, which every build replays in acts mode
-//! (`aterm drive replay --check`, the crate's `tape_corpus` test).
-//!
-//! ```text
-//! targo --unverified lab tape promote <results-run|dir|tape> [--as NAME] [--fewer]
-//! targo --unverified lab tape lint [FILE|DIR...]          (default: the corpus)
-//! targo --unverified lab tape replay-jailed [FILE|DIR...] (default: the corpus)
-//! targo --unverified lab tape rerecord NAME [--fewer]
-//! ```
-//!
-//! * `promote` ([`cmd_promote`]): the one tape of a scenario run that carries
-//!   its end (`results/<scenario>-NN`, named so or by its path) made a corpus
-//!   tape — the recording machine's names scrubbed to fixed tokens (the lab's
-//!   state, the checkout, the home, the temporary directory, the user, the
-//!   host: [`machine_scrub`]), linted, replayed strictly and in acts mode
-//!   from its scrubbed text and refused unless both reproduce it — and
-//!   written as `NAME` (by default the scenario's name, which `rerecord`
-//!   runs again). A results run whose `summary.json` records an `error` or
-//!   an `exception` is refused: a scenario that drew no card or journaled no
-//!   decision still ends cleanly with a whole tape, of something else. A
-//!   tape that loses what the corpus tape it would replace held — fewer
-//!   acts, or none of a kind of decision it held (an approval, a question,
-//!   a turn end, a wall; how many times a run decides is its timing's) — is
-//!   refused unless `--fewer` says the loss is a deliberate change of what
-//!   the loop does. A person reads it before it is committed.
-//! * `lint` ([`cmd_lint`]): what a corpus tape may not hold, on this machine.
-//! * `replay-jailed` ([`cmd_replay_jailed`]): each tape replayed by `aterm
-//!   drive replay --check` under `sandbox-exec` with a profile
-//!   (`replay_jail.sb`) that denies every file read but the binary's, the
-//!   tape's and the loader's, every write, the network, every program and
-//!   every fork — after a negative control: the same binary under the same
-//!   profile must fail to read a copy of the tape the profile does not name.
-//! * `rerecord` ([`cmd_rerecord`]): the scenario a corpus tape is named after
-//!   run again on a fresh lab, and its tape promoted over the old one, under
-//!   `promote`'s refusals.
+//! THE LAB'S HARNESS TAPES.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -64,15 +17,13 @@ use crate::pyjson::J;
 use crate::stop::{self, Stopped};
 use crate::{Fail, Res};
 
-/// The development seam an instance is started with so its hosted loops are
-/// taped: the name and its value.
+/// The development seam an instance is started with so its hosted loops are taped: the name and its value.
 #[must_use]
 pub fn seam() -> (String, String) {
     (store::HOSTED_SEAM.to_string(), "1".to_string())
 }
 
 /// Every tape file under `dir`, at any depth (a session's directory, `kept/`),
-/// in path order.
 fn tapes_under(dir: &Path) -> io::Result<Vec<PathBuf>> {
     let mut found = Vec::new();
     let mut dirs = vec![dir.to_path_buf()];
@@ -105,8 +56,6 @@ fn tapes_under(dir: &Path) -> io::Result<Vec<PathBuf>> {
 }
 
 /// Whether the tape at `path` carries its run's end: its loop ended (a tape
-/// whose loop the instance's end cut off mid-wait has none, and replays only
-/// as ENDED). A tape that does not read has none.
 fn ended(path: &Path) -> bool {
     std::fs::read(path)
         .ok()
@@ -115,8 +64,6 @@ fn ended(path: &Path) -> bool {
 }
 
 /// The sessions under the store `dir` with a tape that has no end yet — a
-/// loop still recording — each by its directory's name, which is its sid
-/// without the `@` (`store::session_dir`); `kept/` is a person's, never one.
 fn recording(dir: &Path) -> io::Result<Vec<String>> {
     let mut sids = Vec::new();
     for path in tapes_under(dir)? {
@@ -137,18 +84,7 @@ fn recording(dir: &Path) -> io::Result<Vec<String>> {
     Ok(sids)
 }
 
-/// END EVERY LOOP STILL RECORDING under the store `dir` as a person ends it:
-/// its session's Autopilot turned off (`ctl @<sid> meta set autopilot off`),
-/// which stops the session's supervisor at its next look, so its tape
-/// carries its end. `down`'s TERM would end the instance with the loop
-/// mid-wait and its tape endless, and a copy taken while it runs is cut off
-/// where the copy read it: either replays only as ENDED, and what it counts
-/// is a prefix. Only a lab that is the caller's own is ended so: an
-/// attached one's Autopilot is its owner's. The wait is a hang detector (a
-/// minute), never a budget; whether every inventoried tape now carries its end.
-/// An incomplete inventory returns `Ok(false)`, never an empty-success proof.
-/// The control calls and filesystem calls have their own inherited bounds.
-///
+/// END EVERY LOOP STILL RECORDING under the store `dir` as a person ends it: its session's Autopilot turned off (`ctl @<sid> meta set autopilot off`), which stops the session's supervisor at its next look, so its tape carries its end.
 /// # Errors
 /// Interrupted.
 pub fn end_loops(door: &Door<'_>, dir: &Path) -> Result<bool, Stopped> {
@@ -181,8 +117,7 @@ pub fn end_loops(door: &Door<'_>, dir: &Path) -> Result<bool, Stopped> {
 pub struct Cost {
     /// The tapes.
     pub tapes: u64,
-    /// The tapes with no end: cut off mid-run (a lab not this run's to
-    /// end, a loop that did not stop), what they count only a prefix.
+    /// The tapes with no end: cut off mid-run (a lab not this run's to end, a loop that did not stop), what they count only a prefix.
     pub open: u64,
     /// Their bytes.
     pub bytes: u64,
@@ -192,9 +127,7 @@ pub struct Cost {
     pub decisions: u64,
 }
 
-/// What the tapes under `dir` cost and hold, for `summary.json`. A tape that
-/// is malformed counts its bytes and stays open; an inventory or read error
-/// refuses a partial count. Concurrent mutation/copy completeness is not certified.
+/// What the tapes under `dir` cost and hold, for `summary.json`.
 pub fn summary(dir: &Path) -> Result<Cost, String> {
     let mut cost = Cost::default();
     for path in tapes_under(dir).map_err(|e| format!("incomplete tape inventory: {e}"))? {
@@ -202,9 +135,6 @@ pub fn summary(dir: &Path) -> Result<Cost, String> {
             std::fs::read(&path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
         cost.tapes += 1;
         cost.bytes += raw.len() as u64;
-        // A tape copied while its run still wrote may end torn: what it holds
-        // up to the tear is counted (the reader drops the tear and says so),
-        // and it is counted open.
         match show::open(&raw, true) {
             Ok(tape) => {
                 if !tape.items.iter().any(|i| matches!(i, Item::End(_))) {
@@ -220,13 +150,9 @@ pub fn summary(dir: &Path) -> Result<Cost, String> {
     Ok(cost)
 }
 
-/// Each tape under `dir` replayed strictly (`aterm drive replay`'s replay, in
-/// this process): its path and the verdict's word, or why it could not be
-/// replayed.
+/// Each tape under `dir` replayed strictly (`aterm drive replay`'s replay, in this process): its path and the verdict's word, or why it could not be replayed.
 #[must_use]
 pub fn replay_all(dir: &Path) -> Vec<(PathBuf, Result<report::Verdict, String>)> {
-    // A listing failure is one failed observation, not an empty successful
-    // result. The selftest's existing per-result failure path must see it.
     let tapes = match tapes_under(dir) {
         Ok(tapes) => tapes,
         Err(e) => {
@@ -248,15 +174,12 @@ pub fn replay_all(dir: &Path) -> Vec<(PathBuf, Result<report::Verdict, String>)>
         .collect()
 }
 
-// ------------------------------------------------------------------ the corpus
-
 /// `tape`'s usage.
 const USAGE: &str = "tape promote <results-run|dir|tape> [--as NAME] [--fewer] | tape lint \
                      [FILE|DIR...] | tape replay-jailed [FILE|DIR...] | tape rerecord NAME \
                      [--fewer]";
 
 /// `tape promote|lint|replay-jailed|rerecord` ([module docs](self)).
-///
 /// # Errors
 /// A usage error, or the verb's own refusal.
 pub fn cmd_tape(args: &[String]) -> Res {
@@ -292,17 +215,9 @@ fn hostnames() -> Vec<String> {
     names
 }
 
-/// THE RECORDING MACHINE'S NAMES, each as the corpus's fixed token
-/// ([`corpus::token`]): the lab's state directory, the checkout (as built
-/// and through every link), the owner's homes (the account's and the
-/// caller's `HOME`, [`crate::paths::Paths::guarded_homes`]: a lab run under a
-/// scratch HOME still names the account's store, and the scratch home), the
-/// user's temporary directory, the login name and the host's names; and the
-/// account's home, which the lint looks for besides.
-///
+/// THE RECORDING MACHINE'S NAMES, each as the corpus's fixed token ([`corpus::token`]): the lab's state directory, the checkout (as built and through every link), the owner's homes (the account's and the caller's `HOME`, [`crate::paths::Paths::guarded_homes`]: a lab run under a scratch HOME still names the account's store, and the scratch home), the user's temporary directory, the login name and the host's names; and the account's home, which the lint looks for besides.
 /// # Errors
-/// No home, or a name the scrub refuses (a home at the root, a login name of
-/// two letters): a promote that cannot take it must not keep the tape.
+/// No home, or a name the scrub refuses (a home at the root, a login name of two letters): a promote that cannot take it must not keep the tape.
 pub fn machine_scrub() -> Result<(Scrub, PathBuf), String> {
     machine_scrub_of(paths())
 }
@@ -329,7 +244,6 @@ fn machine_scrub_of(p: &crate::paths::Paths) -> Result<(Scrub, PathBuf), String>
 }
 
 /// A promote's source as named: a results run by its name
-/// (`s1-plain-01`, under `<state>/results/`), else the path given.
 fn source_path(from: &str) -> PathBuf {
     let run = crate::scn::results_dir().join(from);
     if !from.contains('/') && run.is_dir() {
@@ -340,7 +254,6 @@ fn source_path(from: &str) -> PathBuf {
 }
 
 /// The scenario a results run is a run of: its directory's name without
-/// the run's `-NN`.
 fn scenario_of(run: &Path) -> Option<String> {
     let name = run.file_name()?.to_str()?;
     let (scenario, k) = name.rsplit_once('-')?;
@@ -349,7 +262,6 @@ fn scenario_of(run: &Path) -> Option<String> {
 }
 
 /// Whether `name` may name a corpus tape: lower-case letters, digits, `-`
-/// and `.`, a letter or digit first, and a file name's length.
 fn corpus_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 64
@@ -363,8 +275,6 @@ fn corpus_name(name: &str) -> bool {
 }
 
 /// THE ONE TAPE of `source` to promote: the file itself, or the one tape
-/// under the directory that carries its end.
-///
 /// # Errors
 /// None ended there, or more than one (each named: give its path).
 fn the_tape(source: &Path) -> Result<PathBuf, String> {
@@ -393,11 +303,6 @@ fn the_tape(source: &Path) -> Result<PathBuf, String> {
 }
 
 /// Why a scenario run's summary says the run did not go as its scenario
-/// meant — the `error` it noted (no card, no idle row, a decision never
-/// journaled) or the `exception` it ended on — or `None`. A scenario run
-/// ends cleanly either way and its loop's tape is whole, so only the
-/// summary says its tape records something other than what the scenario is
-/// kept for.
 fn run_failed(summary: &J) -> Option<String> {
     ["error", "exception"].into_iter().find_map(|key| {
         let said = summary.get(key).filter(|v| v.truthy())?;
@@ -410,8 +315,6 @@ fn run_failed(summary: &J) -> Option<String> {
 }
 
 /// A results run's refusal ([`run_failed`]) from its `summary.json`, when
-/// `source` is a directory that holds one; a summary that does not read is
-/// refused too.
 fn summary_refusal(source: &Path) -> Result<(), String> {
     let path = source.join("summary.json");
     if !source.is_dir() || !path.exists() {
@@ -430,13 +333,6 @@ fn summary_refusal(source: &Path) -> Result<(), String> {
 }
 
 /// What `new` loses of the corpus tape it would replace, each by its census
-/// word ([`Census`]): acts by their count, each a step the corpus holds a
-/// build to; a kind of decision (an approval, a question, a turn end, a
-/// wall) only when `new` holds none of a kind `old` held. How many times a
-/// run decides is its timing's — an idle point judged again, a box decided
-/// again after a skip — so a count of decisions is no loss: c3-wall's
-/// rerecord on 2026-10-20 held 4 turn ends to the corpus tape's 5, with the
-/// same acts and walls.
 fn lost(old: &Census, new: &Census) -> Vec<&'static str> {
     let mut lost: Vec<&'static str> = [
         ("approval(s)", old.approvals, new.approvals),
@@ -455,7 +351,6 @@ fn lost(old: &Census, new: &Census) -> Vec<&'static str> {
 }
 
 /// What the corpus tape at `path` holds, when there is one (one that does
-/// not read holds nothing a promote could lose).
 fn held(path: &Path) -> Option<Census> {
     let raw = std::fs::read(path).ok()?;
     Some(
@@ -466,12 +361,6 @@ fn held(path: &Path) -> Option<Census> {
 }
 
 /// `source`'s tape promoted into the corpus as `name` ([module docs](self)):
-/// where it was written, what it is, and what the tape it replaced held.
-/// A results run whose summary says it failed is refused before its tape is
-/// read ([`summary_refusal`]); so is a tape that loses what the corpus tape
-/// it would replace held ([`lost`]), unless `fewer` says the loss is a
-/// deliberate change of what the loop does.
-///
 /// # Errors
 /// A failed run, no tape to promote, a name the scrub refuses, the
 /// promote's refusal (`corpus::promote`), a loss not allowed, or the write.
@@ -510,7 +399,6 @@ fn promote_into(
 }
 
 /// What a promote or a rerecord says it wrote: the tape, what it holds and
-/// costs, and what the tape it replaced held.
 fn said_promoted(verb: &str, out: &Path, kept: &corpus::Promoted, old: Option<&Census>) {
     println!(
         "{verb} {}: {}, {} effects, {} bytes of text",
@@ -524,12 +412,9 @@ fn said_promoted(verb: &str, out: &Path, kept: &corpus::Promoted, old: Option<&C
     }
 }
 
-/// `tape promote <results-run|dir|tape> [--as NAME] [--fewer]` ([module
-/// docs](self)).
-///
+/// `tape promote <results-run|dir|tape> [--as NAME] [--fewer]` ([module docs](self)).
 /// # Errors
-/// A usage error (no source; no name a results run gives, and no `--as`), or
-/// the promote's refusal, said.
+/// A usage error (no source; no name a results run gives, and no `--as`), or the promote's refusal, said.
 pub fn cmd_promote(args: &[String]) -> Res {
     let (mut from, mut name, mut fewer) = (None, None, false);
     let mut it = args.iter();
@@ -597,10 +482,7 @@ fn named_or_corpus(args: &[String]) -> Result<Vec<PathBuf>, Fail> {
     Ok(tapes)
 }
 
-/// `tape lint [FILE|DIR...]`: each tape's text form held to the corpus's
-/// lint on this machine (`corpus::lint`); exit 1 when any holds what a
-/// corpus may not.
-///
+/// `tape lint [FILE|DIR...]`: each tape's text form held to the corpus's lint on this machine (`corpus::lint`); exit 1 when any holds what a corpus may not.
 /// # Errors
 /// No tape, or the machine's names do not resolve.
 pub fn cmd_lint(args: &[String]) -> Res {
@@ -631,8 +513,6 @@ pub fn cmd_lint(args: &[String]) -> Res {
 }
 
 /// THE REPLAY'S JAIL for the binary `bin` and the tape `tape`, both physical
-/// paths (`replay_jail.sb`'s holes filled).
-///
 /// # Errors
 /// A path a sandbox profile cannot quote.
 fn jail_profile(bin: &Path, tape: &Path) -> Result<String, String> {
@@ -655,10 +535,6 @@ struct Jailed {
 }
 
 /// `aterm drive replay --check <asked>` run by `bin` in the jail whose
-/// profile names `allowed` (`sandbox-exec -p`), its environment cleared: what
-/// it did. A minute is the hang detector: a replay that has not ended by
-/// then is killed (it is this process's own child) and said to have hung.
-///
 /// # Errors
 /// The profile, the spawn, or an interrupt.
 fn jailed(bin: &Path, allowed: &Path, asked: &Path) -> Result<Jailed, Fail> {
@@ -707,7 +583,6 @@ fn jailed(bin: &Path, allowed: &Path, asked: &Path) -> Result<Jailed, Fail> {
 }
 
 /// A child's pipe read to its end on a thread of its own, so neither pipe
-/// fills while the other is read: its text, at the join.
 fn drain<P: io::Read + Send + 'static>(pipe: Option<P>) -> std::thread::JoinHandle<String> {
     std::thread::spawn(move || {
         let mut text = String::new();
@@ -718,13 +593,7 @@ fn drain<P: io::Read + Send + 'static>(pipe: Option<P>) -> std::thread::JoinHand
     })
 }
 
-/// `tape replay-jailed [FILE|DIR...]` ([module docs](self)): the negative
-/// control first — a copy of the first tape, which the profile does not
-/// name, must be refused by the very binary and profile (exit 2, the tape
-/// not read) — then each tape replayed in its own jail by `aterm drive
-/// replay --check`; exit 1 when the control was not refused or a tape did
-/// not take every act as recorded.
-///
+/// `tape replay-jailed [FILE|DIR...]` ([module docs](self)): the negative control first — a copy of the first tape, which the profile does not name, must be refused by the very binary and profile (exit 2, the tape not read) — then each tape replayed in its own jail by `aterm drive replay --check`; exit 1 when the control was not refused or a tape did not take every act as recorded.
 /// # Errors
 /// No tape, no aterm built beside the lab, or the control's copy.
 pub fn cmd_replay_jailed(args: &[String]) -> Res {
@@ -734,7 +603,6 @@ pub fn cmd_replay_jailed(args: &[String]) -> Res {
     stop::install();
     let physical_tape =
         |p: &Path| std::fs::canonicalize(p).map_err(|e| Fail::die(format!("{}: {e}", p.display())));
-    // THE NEGATIVE CONTROL: the same jail, asked for a tape it does not name.
     let first = physical_tape(&tapes[0])?;
     let scratch = paths().state.join("replay-jail");
     std::fs::create_dir_all(&scratch)
@@ -744,8 +612,6 @@ pub fn cmd_replay_jailed(args: &[String]) -> Res {
     let control = jailed(&bin, &first, &copy);
     let _ = std::fs::remove_file(&copy);
     let control = control?;
-    // `--check` says a tape it could not read on its own line (stdout), and
-    // exits 2: the tape was never opened.
     let said = format!("{}{}", control.out, control.err);
     let refused = said
         .lines()
@@ -792,16 +658,9 @@ pub fn cmd_replay_jailed(args: &[String]) -> Res {
     Ok(i32::from(failed > 0))
 }
 
-/// `tape rerecord NAME [--fewer]` ([module docs](self)): the scenario NAME
-/// on a fresh lab (`scn run NAME`, run 1, the tag `$LAB_TAG` or `survey`),
-/// then its tape promoted over the corpus's `NAME` — unless the run says it
-/// did not go as the scenario meant (its `error` or `exception`), or its
-/// tape loses what the one it would replace held ([`lost`]) and `--fewer`
-/// does not say the loss is deliberate ([`promote_into`]).
-///
+/// `tape rerecord NAME [--fewer]` ([module docs](self)): the scenario NAME on a fresh lab (`scn run NAME`, run 1, the tag `$LAB_TAG` or `survey`), then its tape promoted over the corpus's `NAME` — unless the run says it did not go as the scenario meant (its `error` or `exception`), or its tape loses what the one it would replace held ([`lost`]) and `--fewer` does not say the loss is deliberate ([`promote_into`]).
 /// # Errors
-/// No scenario of that name (a tape promoted `--as` another name is
-/// rerecorded by hand), an interrupt, a failed run, or the promote's refusal.
+/// No scenario of that name (a tape promoted `--as` another name is rerecorded by hand), an interrupt, a failed run, or the promote's refusal.
 pub fn cmd_rerecord(args: &[String]) -> Res {
     let (name, fewer) = match args {
         [name] => (name, false),
@@ -827,9 +686,6 @@ pub fn cmd_rerecord(args: &[String]) -> Res {
         .dir
         .clone()
         .ok_or_else(|| Fail::die("the scenario run kept no records"))?;
-    // The run's own summary, not only the file it wrote (which a failed
-    // write would leave out): a run that did not go as its scenario meant
-    // ends cleanly too, with a whole tape of something else.
     if let Some(why) = run_failed(&ctx.sumd) {
         return Err(Fail::die(format!(
             "{name} did not go as its scenario meant ({why}; its records: {}): the corpus's \
@@ -869,9 +725,6 @@ mod corpus_tests {
     }
 
     /// THE JAIL'S PROFILE names the binary and the tape it is given and no
-    /// other file: every read denied but theirs and the loader's, every
-    /// write, the network, every program but the binary and every fork; and
-    /// a path the profile cannot quote is refused.
     #[test]
     fn the_jails_profile_names_its_binary_and_tape_only() {
         let profile =
@@ -892,9 +745,6 @@ mod corpus_tests {
     }
 
     /// A RUN THAT DID NOT GO AS ITS SCENARIO MEANT IS NOT PROMOTED: a results
-    /// run whose summary records an `error` (no card, a decision never
-    /// journaled) or an `exception` is refused before its tape is read, and
-    /// so is one whose summary does not read; nothing is written.
     #[test]
     fn a_failed_run_is_not_promoted() {
         let owned = aterm_tempfile::tempdir().expect("owned scratch");
@@ -912,16 +762,12 @@ mod corpus_tests {
             let e = promote_into(&run, "s1-plain", true).expect_err(summary);
             assert!(e.contains(says), "{summary}: {e}");
         }
-        // A run that went as meant is not refused for its summary: it goes
-        // on to its tape (none here).
         std::fs::write(run.join("summary.json"), r#"{"k": 1, "error": ""}"#).expect("a summary");
         let e = promote_into(&run, "s1-plain", true).expect_err("no tape");
         assert!(e.contains("carries its end"), "{e}");
     }
 
     /// A RERECORD THAT LOSES WHAT THE CORPUS KEPT IS NAMED: every kind the
-    /// tape it replaces held more of — the survey's dismissal gone leaves
-    /// only the host's act; a box never drawn leaves no approval.
     #[test]
     fn a_tape_holding_fewer_names_what_it_lost() {
         let old = Census {
@@ -944,8 +790,6 @@ mod corpus_tests {
         };
         assert!(lost(&old, &more).is_empty(), "more of a kind loses nothing");
         assert_eq!(lost(&more, &old), ["question(s)", "act(s)"]);
-        // A decision taken fewer times, its kind still held and every act
-        // too, is the run's timing: c3-wall's rerecord, 5 turn ends then 4.
         let wall = Census {
             turn_ends: 5,
             walls: 2,
@@ -971,8 +815,6 @@ mod scrub_tests {
     use super::*;
 
     /// A tape recorded under a scratch HOME takes the account's home as the home (its
-    /// store's paths name it), and the scratch HOME's too. Negative control: the facts of a
-    /// run from the account's own HOME leave the scratch home in the text.
     #[test]
     fn under_a_scratch_home_the_account_home_is_scrubbed_too() {
         let top = aterm_tempfile::Builder::new()
@@ -1000,8 +842,6 @@ mod scrub_tests {
                 h = token::HOME
             )
         );
-        // NEGATIVE CONTROL: the account's own HOME leaves the scratch home unnamed as the home
-        // (a test's fake one sits in the temporary directory, which the scrub takes as that).
         let own = crate::paths::Paths::resolve_with(Some(account.clone()), Some(account.into()));
         let (scrub, _) = machine_scrub_of(&own).expect("scrub");
         let left = scrub.text(&text);

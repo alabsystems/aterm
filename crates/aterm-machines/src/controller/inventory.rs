@@ -1,13 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `machines.toml` (the inventory), the controller's directory layout, serials and reports
-//! (design §2, §4.2, §9).
-//!
-//! The inventory is the owner's file: they add comments, reorder hosts and edit values by
-//! hand. Every write here is a comment-preserving edit through `aterm_toml::edit`, read back
-//! as an inventory before it replaces the file, so a write never leaves a file this crate
-//! cannot read. Every file goes through the [`System`] port, 0600 under a 0700 root.
+//! `machines.toml` (the inventory), the controller's directory layout, serials and reports (design §2, §4.2, §9).
 
 use crate::model::HostReport;
 use crate::port::System;
@@ -16,12 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::io;
 use std::path::{Component, Path, PathBuf};
 
-/// The longest ControlPath OpenSSH's master can listen on. A Unix socket path holds 104 bytes
-/// with its NUL, and the master binds `<path>.<16 random characters>` before it renames the
-/// socket into place, so 104 - 1 - 17 bytes remain. Measured in the VM (macOS 27.0,
-/// OpenSSH_10.3p1): an 86-byte path served; an 87-byte one failed with
-/// `unix_listener: path "<path>.fJaxfho0oHKzs1lJ" too long for Unix domain socket`, and a
-/// 104-byte client path with `ControlPath too long ('<path>' >= 104 bytes)`.
+/// The longest ControlPath OpenSSH's master can listen on.
 pub const CONTROL_PATH_MAX: usize = 86;
 
 /// The mode of every file this module writes: the inventory, state, the serial.
@@ -46,10 +35,7 @@ impl Paths {
         })
     }
 
-    /// The directory `--controller <dir>` names, made absolute against the current
-    /// directory. Every child runs in `/` (the port), so a relative root handed to `ssh` or
-    /// `ssh-keygen` would name a file under `/`: `--controller ctl` read `/ctl/known_hosts`
-    /// and found no host key pinned.
+    /// The directory `--controller <dir>` names, made absolute against the current directory.
     #[must_use]
     pub fn at(dir: &Path) -> Self {
         Self {
@@ -111,13 +97,10 @@ impl Paths {
         self.root.join("known_hosts")
     }
 
-    /// Where control sockets live: `keys/ctl/` when a socket there fits
-    /// [`CONTROL_PATH_MAX`], else `/private/tmp/aterm-machines-<uid>/` (a deep root, e.g. a
-    /// scratch HOME, would make OpenSSH refuse the master).
+    /// Where control sockets live: `keys/ctl/` when a socket there fits [`CONTROL_PATH_MAX`], else `/private/tmp/aterm-machines-<uid>/` (a deep root, e.g. a scratch HOME, would make OpenSSH refuse the master).
     #[must_use]
     pub fn control_dir(&self) -> PathBuf {
         let under_root = self.keys().join("ctl");
-        // `<dir>/` and the eight hex digits of a socket name.
         if under_root.as_os_str().len() + 1 + 8 <= CONTROL_PATH_MAX {
             under_root
         } else {
@@ -128,8 +111,7 @@ impl Paths {
         }
     }
 
-    /// A short ControlPath for `host` (design §1.16): `<control dir>/<8 hex>`, the first eight
-    /// hex digits of the SHA-256 of `host`, so the path stays short whatever `host` is.
+    /// A short ControlPath for `host` (design §1.16): `<control dir>/<8 hex>`, the first eight hex digits of the SHA-256 of `host`, so the path stays short whatever `host` is.
     #[must_use]
     pub fn control_path(&self, host: &str) -> PathBuf {
         let digest = aterm_digest::Sha256::digest(host.as_bytes());
@@ -176,7 +158,6 @@ impl Paths {
     }
 
     /// Create the root and its directories (0700): `keys`, `baselines`, `state`, `cache`.
-    ///
     /// # Errors
     /// One line naming the directory that could not be made.
     pub fn ensure(&self, sys: &dyn System) -> Result<(), String> {
@@ -193,10 +174,7 @@ impl Paths {
         Ok(())
     }
 
-    /// Make [`Paths::control_dir`] and check it is this process's own: a real directory (not
-    /// a link), owned by this uid, open to nobody else. Under `/private/tmp` another account
-    /// could have made it first, and a socket there would then be theirs to swap.
-    ///
+    /// Make [`Paths::control_dir`] and check it is this process's own: a real directory (not a link), owned by this uid, open to nobody else.
     /// # Errors
     /// One line: the directory could not be made, or it is not ours alone.
     pub fn ensure_control_dir(&self, sys: &dyn System) -> Result<PathBuf, String> {
@@ -297,7 +275,6 @@ impl Inventory {
 }
 
 /// Read `machines.toml`.
-///
 /// # Errors
 /// One line: missing (run `aterm machines init`), unreadable, or not an inventory.
 pub fn load(sys: &dyn System, paths: &Paths) -> Result<Inventory, String> {
@@ -306,10 +283,7 @@ pub fn load(sys: &dyn System, paths: &Paths) -> Result<Inventory, String> {
     parse(&text).map_err(|e| format!("{}: {e}", path.display()))
 }
 
-/// Parse an inventory document and check it: `schema = 1`, no unknown key, and hosts the
-/// rest of the controller can use as they are (names and UUIDs unique, every word safe to
-/// hand to `ssh` and to name a file by).
-///
+/// Parse an inventory document and check it: `schema = 1`, no unknown key, and hosts the rest of the controller can use as they are (names and UUIDs unique, every word safe to hand to `ssh` and to name a file by).
 /// # Errors
 /// One line saying what is wrong.
 pub fn parse(text: &str) -> Result<Inventory, String> {
@@ -353,9 +327,7 @@ pub fn parse(text: &str) -> Result<Inventory, String> {
     Ok(inv)
 }
 
-/// Whether `host`'s words are usable: a name and accounts made of `[A-Za-z0-9._-]` not
-/// starting with `-` or `.`, an IOPlatformUUID, and an address `ssh` cannot read as an option.
-///
+/// Whether `host`'s words are usable: a name and accounts made of `[A-Za-z0-9._-]` not starting with `-` or `.`, an IOPlatformUUID, and an address `ssh` cannot read as an option.
 /// # Errors
 /// One line naming the field.
 pub fn check_host(host: &Host) -> Result<(), String> {
@@ -401,7 +373,6 @@ pub fn check_host(host: &Host) -> Result<(), String> {
 }
 
 /// A non-empty word of `[A-Za-z0-9._-]` that starts with neither `-` (an option to every
-/// tool) nor `.` (a hidden or parent path).
 fn plain_word(word: &str) -> bool {
     !word.is_empty()
         && !word.starts_with(['-', '.'])
@@ -411,7 +382,6 @@ fn plain_word(word: &str) -> bool {
 }
 
 /// A host name, IPv4 or IPv6 address (a `%zone` allowed): printable, no space, no `@`, and
-/// not starting with `-`, so `ssh` reads `user@address` as its destination.
 fn plain_address(address: &str) -> bool {
     !address.is_empty()
         && !address.starts_with('-')
@@ -445,19 +415,9 @@ fn read_inventory_text(sys: &dyn System, path: &Path) -> Result<String, String> 
     }
 }
 
-/// Append `host` to `machines.toml`, keeping every comment and hand edit, or update the
-/// block with the same `uuid` in place.
-///
-/// In place, only the values that differ are rewritten, each keeping the comment on its
-/// line. `baseline` and `users` are written when `host` carries them and otherwise left as
-/// the file has them. `enroll` refuses a hardware UUID the inventory already holds before it
-/// gets here, so in place is a guard against an edit made meanwhile: a Mac enrolled again
-/// after `unenroll` gets a new block, and its `baseline` and `users` are copied back by hand
-/// from the retired one.
-///
+/// Append `host` to `machines.toml`, keeping every comment and hand edit, or update the block with the same `uuid` in place.
 /// # Errors
-/// One line: no inventory, an inventory that does not parse, a name another host has, or a
-/// write that failed.
+/// One line: no inventory, an inventory that does not parse, a name another host has, or a write that failed.
 pub fn upsert_host(sys: &dyn System, paths: &Paths, host: &Host) -> Result<(), String> {
     check_host(host)?;
     let path = paths.inventory();
@@ -593,7 +553,6 @@ fn set_str(table: &mut Table, key: &str, value: &str) {
 }
 
 /// Set `key` to `value`, keeping the old value's surroundings: the spacing after `=` and the
-/// comment at the end of its line.
 fn replace_value(table: &mut Table, key: &str, mut value: Value) {
     if let Some(old) = table.get(key).and_then(Item::as_value) {
         *value.decor_mut() = old.decor().clone();
@@ -601,13 +560,7 @@ fn replace_value(table: &mut Table, key: &str, mut value: Value) {
     table.insert(key, Item::Value(value));
 }
 
-/// Comment out the `[[host]]` block with `uuid`, move its state to `state/retired/`, and
-/// drop its pinned key from `known_hosts` (design §4.2, `unenroll` step 3).
-///
-/// The block's lines, from its header to its last value, are prefixed `# ` under one marker
-/// line, so the owner can read what the host was and restore it by hand. Comment lines above
-/// and below it are left as they are.
-///
+/// Comment out the `[[host]]` block with `uuid`, move its state to `state/retired/`, and drop its pinned key from `known_hosts` (design §4.2, `unenroll` step 3).
 /// # Errors
 /// One line: no host with `uuid`, an inventory that does not parse, or a write that failed.
 pub fn retire_host(sys: &dyn System, paths: &Paths, uuid: &str) -> Result<(), String> {
@@ -669,7 +622,6 @@ pub fn retire_host(sys: &dyn System, paths: &Paths, uuid: &str) -> Result<(), St
 }
 
 /// The byte range of the `[[host]]` block with `uuid` in `text` (which `doc` was parsed
-/// from): from the start of its header's line to the end of the line its last value ends on.
 fn host_block(doc: &DocumentMut, text: &str, uuid: &str) -> Option<(usize, usize)> {
     let hosts = doc.get("host")?.as_array_of_tables()?;
     let table = hosts.iter().find(|t| {
@@ -707,9 +659,7 @@ fn retire_state(sys: &dyn System, paths: &Paths, uuid: &str) -> Result<(), Strin
         .map_err(|e| format!("{} -> {}: {e}", from.display(), to.display()))
 }
 
-/// Drop every `known_hosts` line pinned under `alias` (the host's UUID; OpenSSH matches it
-/// without regard to case). A missing file, or one with no such line, is left as it is.
-///
+/// Drop every `known_hosts` line pinned under `alias` (the host's UUID; OpenSSH matches it without regard to case).
 /// # Errors
 /// One line when the file cannot be read or written.
 pub fn forget_host_key(sys: &dyn System, paths: &Paths, alias: &str) -> Result<(), String> {
@@ -719,7 +669,6 @@ pub fn forget_host_key(sys: &dyn System, paths: &Paths, alias: &str) -> Result<(
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(format!("{}: {e}", path.display())),
     };
-    // A pattern is `alias`, or `[alias]:port` for a port other than 22.
     let pinned = |pattern: &str| {
         pattern
             .strip_prefix('[')
@@ -743,12 +692,9 @@ pub fn forget_host_key(sys: &dyn System, paths: &Paths, alias: &str) -> Result<(
         .map_err(|e| format!("{}: {e}", path.display()))
 }
 
-/// The hosts `names` select (`--all` when `all`), in inventory order. A name may be the
-/// inventory name, the UUID or the address, in any case; a host named twice is listed once.
-///
+/// The hosts `names` select (`--all` when `all`), in inventory order.
 /// # Errors
-/// One line for a selector that matches multiple hosts, each name that matches no host
-/// (and the hosts there are), or a request that names no host at all.
+/// One line for a selector that matches multiple hosts, each name that matches no host (and the hosts there are), or a request that names no host at all.
 pub fn select<'a>(
     inv: &'a Inventory,
     names: &[String],
@@ -824,14 +770,6 @@ fn known_hosts_hint(inv: &Inventory) -> String {
 }
 
 /// The next envelope serial: `max(stored, floor) + 1`, stored before it is returned.
-///
-/// Storing first is what keeps the counter monotonic within one command: a serial is not
-/// handed out again after the command that took it crashes. `floor` is what a host reported
-/// (`hello`), so a controller restored from an old backup still issues serials the host
-/// accepts. Nothing locks the counter: two commands that read it at the same moment take the
-/// same serial, and a host that gets both envelopes acts on the first and refuses the second
-/// as `replay serial=<n> floor=<n>`, which is safe and is fixed by running it again.
-///
 /// # Errors
 /// One line: an unreadable or corrupt counter (never silently reset), or a failed write.
 pub fn next_serial(sys: &dyn System, paths: &Paths, floor: u64) -> Result<u64, String> {
@@ -883,36 +821,25 @@ pub struct HostState {
     /// GitHub key ids registered for this host: `(user, key id)`.
     #[serde(default)]
     pub github_keys: Vec<(String, u64)>,
-    /// The key each id in `github_keys` registered: `(key id, "<type> <base64>")`. An id
-    /// recorded before this was kept has none, and is checked against the host's key once.
+    /// The key each id in `github_keys` registered: `(key id, "<type> <base64>")`.
     #[serde(default)]
     pub github_key_text: Vec<(u64, String)>,
-    /// Keys `github revoke` deleted (`<type> <base64>`): never registered again whatever a
-    /// report carries. A key the host makes anew is.
+    /// Keys `github revoke` deleted (`<type> <base64>`): never registered again whatever a report carries.
     #[serde(default)]
     pub github_revoked: Vec<String>,
-    /// A `hello` that reached something and was refused or answered wrong (a changed host
-    /// key, a fleet key it no longer takes, another Mac at the address): since when, and why.
-    /// Cleared by the next `hello` that answers.
+    /// A `hello` that reached something and was refused or answered wrong (a changed host key, a fleet key it no longer takes, another Mac at the address): since when, and why.
     #[serde(default)]
     pub contact_error: Option<(u64, String)>,
-    /// The agent's refusal of the newest run sent to it (busy, replay, expired, a bad
-    /// signature): when, and why. `report` stays the newest plan or apply report; the next
-    /// one clears this.
+    /// The agent's refusal of the newest run sent to it (busy, replay, expired, a bad signature): when, and why.
     #[serde(default)]
     pub last_refusal: Option<(u64, String)>,
-    /// The SHA-256 of the `allowed_signers` this host was last given (at enrollment, or by a
-    /// rekey it took).
+    /// The SHA-256 of the `allowed_signers` this host was last given (at enrollment, or by a rekey it took).
     #[serde(default)]
     pub signers_sha256: Option<String>,
-    /// `plan|apply --only` envelopes sent to this host and not yet reported: each one's serial
-    /// and the tables it carried. The report with that serial (the run's own, or the one
-    /// `attach` follows) covers those tables alone, so it is merged into `report`, never put
-    /// in its place.
+    /// `plan|apply --only` envelopes sent to this host and not yet reported: each one's serial and the tables it carried.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub only_sent: Vec<(u64, Vec<String>)>,
-    /// What `report` covers when its newest run was an `--only` one: `None` for a whole
-    /// baseline's report.
+    /// What `report` covers when its newest run was an `--only` one: `None` for a whole baseline's report.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub only: Option<Only>,
 }
@@ -922,14 +849,12 @@ pub struct HostState {
 pub struct Only {
     /// The tables `--only` runs have reported since the last whole run.
     pub tables: Vec<String>,
-    /// When the whole run whose rows the other tables keep finished; `None` when no whole
-    /// plan or apply was ever reported, so the other tables were never run at all.
+    /// When the whole run whose rows the other tables keep finished; `None` when no whole plan or apply was ever reported, so the other tables were never run at all.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rest: Option<u64>,
 }
 
 /// Read `state/<uuid>.json` (default when absent).
-///
 /// # Errors
 /// One line when `uuid` is not a UUID, or the file exists and does not parse.
 pub fn load_state(sys: &dyn System, paths: &Paths, uuid: &str) -> Result<HostState, String> {
@@ -945,7 +870,6 @@ pub fn load_state(sys: &dyn System, paths: &Paths, uuid: &str) -> Result<HostSta
 }
 
 /// Write `state/<uuid>.json` (0600, `state/` made 0700 when missing).
-///
 /// # Errors
 /// One line when `uuid` is not a UUID or the write failed.
 pub fn save_state(
@@ -967,8 +891,7 @@ pub fn save_state(
         .map_err(|e| format!("{}: {e}", path.display()))
 }
 
-/// Whether `path` is inside `root` (for refusing a `baseline` name that escapes): it starts
-/// with `root` and climbs out through no `..` after it.
+/// Whether `path` is inside `root` (for refusing a `baseline` name that escapes): it starts with `root` and climbs out through no `..` after it.
 #[must_use]
 pub fn inside(root: &Path, path: &Path) -> bool {
     path.strip_prefix(root).is_ok_and(|rest| {
@@ -977,8 +900,7 @@ pub fn inside(root: &Path, path: &Path) -> bool {
     })
 }
 
-/// Extract a canonical short tag from a host selector or Bonjour name (`m14` from
-/// `m14 Air M5 32GB 4TB prime`, `spark-49f7` from `spark-49f7-SSH`).
+/// Extract a canonical short tag from a host selector or Bonjour name (`m14` from `m14 Air M5 32GB 4TB prime`, `spark-49f7` from `spark-49f7-SSH`).
 #[must_use]
 pub fn host_tag_key(raw: &str) -> String {
     let clean = raw
@@ -1007,12 +929,7 @@ pub fn host_tag_key(raw: &str) -> String {
     clean.to_ascii_lowercase()
 }
 
-/// Normalize any discovered or local host name into a consistent canonical hyphenated
-/// identifier (`m1-MacBook-Air-M2-24GB-1TB`, `m4-MacBook-Pro-3.1GHz-i7-16GB-1TB`,
-/// `m8-MacBook-Pro-M4-Max-36GB-1TB`, `m9-MacBook-Pro-M2-32GB-8TB`,
-/// `m10-MacBook-Pro-M4-Max-36GB-1TB`, `m14-MacBook-Air-M5-32GB-4TB-prime`,
-/// `m100-MacBook-Pro-M4-Pro-48GB-500GB`, `spark-49f7`, …), honoring any custom override in
-/// `custom_names` (`[names]` in `machines.toml`).
+/// Normalize any discovered or local host name into a consistent canonical hyphenated identifier (`m1-MacBook-Air-M2-24GB-1TB`, `m4-MacBook-Pro-3.1GHz-i7-16GB-1TB`, `m8-MacBook-Pro-M4-Max-36GB-1TB`, `m9-MacBook-Pro-M2-32GB-8TB`, `m10-MacBook-Pro-M4-Max-36GB-1TB`, `m14-MacBook-Air-M5-32GB-4TB-prime`, `m100-MacBook-Pro-M4-Pro-48GB-500GB`, `spark-49f7`, …), honoring any custom override in `custom_names` (`[names]` in `machines.toml`).
 #[must_use]
 pub fn canonical_host_name(
     raw: &str,
@@ -1105,7 +1022,6 @@ pub fn canonical_host_name(
         };
         norm.push(mapped);
     }
-    // Ensure consistent `MacBook-Air` and `MacBook-Pro` family naming after `m<N>` tag:
     if norm.len() >= 2
         && norm[0].starts_with('m')
         && norm[0][1..].chars().all(|c| c.is_ascii_digit())
@@ -1125,13 +1041,7 @@ pub fn canonical_host_name(
     norm.join("-")
 }
 
-/// Set or rename any host (`selector` may be a tag like `m14`, a canonical or raw Bonjour
-/// name, an address, or an enrolled UUID) to `new_name` in `machines.toml`.
-///
-/// Updates both `[names]` (so LAN discovery and `this Mac` use `new_name` immediately) and
-/// any matching enrolled `[[host]]` entry in `machines.toml`. Creates `machines.toml` if it
-/// does not exist yet.
-///
+/// Set or rename any host (`selector` may be a tag like `m14`, a canonical or raw Bonjour name, an address, or an enrolled UUID) to `new_name` in `machines.toml`.
 /// # Errors
 /// One line if `new_name` is not a valid host name or the inventory cannot be written.
 pub fn set_host_name(
@@ -1178,7 +1088,6 @@ pub fn set_host_name(
         .map_err(|e| format!("{}: {e}", path.display()))?;
     let root = doc.as_table_mut();
 
-    // Update any matching `[[host]]` entry in place.
     if let Some(item) = root.get_mut("host")
         && let Some(old) = item.as_array_of_tables().cloned()
     {
@@ -1205,7 +1114,6 @@ pub fn set_host_name(
         *item = Item::ArrayOfTables(rebuilt);
     }
 
-    // Record in `[names]` under `tag_key` (and `sel` if distinct).
     if !root.contains_key("names") {
         root.insert("names", Item::Table(Table::new()));
     }
@@ -1345,7 +1253,6 @@ user = \"labadmin\"
     }
 
     /// A selector means one host, even when another host uses that word in
-    /// a different field. All fixtures are ordinary parsed inventory text.
     #[test]
     fn a_selector_must_not_expand_an_ambiguous_word_into_other_hosts() {
         let unique = parse(HAND_EDITED).expect("ordinary inventory");
@@ -1406,7 +1313,6 @@ user = \"labadmin\"
         let new = host("lab-09", "0A1B2C3D-0000-4000-8000-000000000009", "10.0.0.9");
         upsert_host(&fake, &paths(), &new).unwrap();
         let out = written_inventory(&fake);
-        // Everything that was there is still there, byte for byte.
         let kept = out.replace(
             "\n[[host]]\nname = \"lab-09\"\nuuid = \"0A1B2C3D-0000-4000-8000-000000000009\"\naddress = \"10.0.0.9\"\nuser = \"labadmin\"\n",
             "",
@@ -1425,8 +1331,6 @@ user = \"labadmin\"
     #[test]
     fn upserting_a_known_uuid_rewrites_only_what_changed_in_place() {
         let fake = fake_with(HAND_EDITED);
-        // Re-enrolled at a new address, under a lowercase spelling of its uuid, carrying no
-        // baseline: the hand-set baseline stays, and so does the comment on the address line.
         let moved = host("lab-07", &UUID_7.to_ascii_lowercase(), "10.0.1.7");
         upsert_host(&fake, &paths(), &moved).unwrap();
         let out = written_inventory(&fake);
@@ -1496,7 +1400,6 @@ user = \"labadmin\"
         let inv = parse(&out).unwrap();
         assert_eq!(inv.hosts.len(), 2);
         assert_eq!(inv.github.unwrap().account, "lab-bot");
-        // And an in-place update keeps the comment between the block's keys.
         let fake = fake_with(text);
         upsert_host(&fake, &paths(), &host("lab-07", UUID_7, "10.0.9.7")).unwrap();
         assert_eq!(
@@ -1538,7 +1441,6 @@ user = \"labadmin\"
         let inv = parse(&out).unwrap();
         assert_eq!(inv.hosts.len(), 1);
         assert_eq!(inv.hosts[0].name, "lab-08");
-        // Its state moved aside, and only its pinned key went.
         assert!(fake.calls().contains(&format!(
             "rename {ROOT}/state/{UUID_7}.json {ROOT}/state/retired/{UUID_7}.json"
         )));
@@ -1608,9 +1510,7 @@ user = \"labadmin\"
         assert_eq!(next_serial(&fake, &p, 0).unwrap(), 1);
         assert_eq!(fake.written("/ctl/machines/serial").unwrap(), b"1\n");
         assert_eq!(next_serial(&fake, &p, 0).unwrap(), 2);
-        // A host that has seen a higher serial (a controller restored from backup) wins.
         assert_eq!(next_serial(&fake, &p, 40).unwrap(), 41);
-        // A lower floor never pulls the counter back.
         assert_eq!(next_serial(&fake, &p, 3).unwrap(), 42);
         assert_eq!(fake.written("/ctl/machines/serial").unwrap(), b"42\n");
         assert!(
@@ -1705,7 +1605,6 @@ user = \"labadmin\"
             ))
         );
         assert!(path.as_os_str().len() <= CONTROL_PATH_MAX);
-        // The boundary: a socket path of exactly the limit stays under the root.
         let fits = "/".to_string() + &"r".repeat(CONTROL_PATH_MAX - "/keys/ctl/".len() - 8 - 1);
         let edge = Paths {
             root: PathBuf::from(&fits),

@@ -61,6 +61,10 @@
         reason = "test code: a stand-in child may inherit descriptors"
     )
 )]
+
+#[cfg(test)]
+aterm_durable::plain_durable_flushes_in_tests!();
+
 macro_rules! println {
     () => {
         $crate::meter::println(::std::format_args!(""))

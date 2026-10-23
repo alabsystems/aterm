@@ -73,7 +73,7 @@ impl Terminal {
     /// ([`Grid::older_history_claim_holds`]). A pure read.
     #[inline]
     #[must_use]
-    pub fn older_history_claim_holds(&self, claim: OlderHistoryClaim) -> bool {
+    pub const fn older_history_claim_holds(&self, claim: OlderHistoryClaim) -> bool {
         self.main_grid().older_history_claim_holds(claim)
     }
 

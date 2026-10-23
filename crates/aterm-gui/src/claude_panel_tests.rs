@@ -1,10 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The agents panel on the glass: what is lit and where, the gates, the
-//! skips, the record the undo points take back, the cost at rest, and the
-//! wakes — a real engine, real frames through the capture route's splices
-//! (`claude_footer::probe`), the real key and splice.
+//! Agents panel rendering, gates, and interaction tests.
 
 use super::*;
 
@@ -28,10 +25,8 @@ const BLUE: [u8; 3] = [51, 153, 255];
 const FOOTER: &str = "  \u{23F8} manual mode on \u{B7} ? for shortcuts \u{B7} \u{2193} to manage";
 
 /// The pane's rows under its bottom rule: the footer, the container's
-/// blank, then the panel's rows.
 const UNDER: usize = 7;
 /// Pane rows: the bottom rule, then the panel's main, agents, slot and
-/// workflow.
 const BOTTOM: usize = ROWS as usize - 1 - UNDER;
 const MAIN: usize = BOTTOM + 3;
 const FIRST: usize = BOTTOM + 4;
@@ -48,7 +43,6 @@ fn elapsed(s: u64) -> String {
 }
 
 /// An agent row: the prefix, the bullet, the name, its activity, its status
-/// right-aligned two cells short of the pane's edge.
 fn agent(name: &str, activity: &str, secs: u64, tokens: &str) -> String {
     let head = format!("  \u{25EF} {name}  {activity}");
     let status = format!("{} \u{B7} \u{2193} {tokens} tokens", elapsed(secs));
@@ -101,8 +95,6 @@ fn sgr([r, g, b]: [u8; 3]) -> String {
 }
 
 /// Paint the screen: the transcript and composer as the probe draws them
-/// (its rules in Claude's gray), the main row bold in the default ink, the
-/// agent and workflow rows in the panel grey, and the caret on the composer.
 fn feed(app: &App, session: u64, agents: Agents, inks: Inks) {
     let mut under = under(agents);
     if inks.first_pointed {
@@ -152,15 +144,11 @@ fn feed(app: &App, session: u64, agents: Agents, inks: Inks) {
         };
         out.push_str(&format!("\x1b[{};1H{painted}\x1b[0m", i + 1));
     }
-    // The caret on the composer's row, over the bottom rule.
     out.push_str(&format!("\x1b[{};3H", BOTTOM));
     probe::bytes(app, session, out.as_bytes());
 }
 
 /// The session is Claude Code's, its facts published — a card drawer of the
-/// build [`card`] paints (`probe::drawer`), in front before anything is
-/// painted, so the screen and the launch card it paints from here are its
-/// own (card engine §3.8's gate: a cut over painted cells taints its mark).
 fn claude(app: &App, session: u64) {
     probe::drawer(app, session, PGID, "claude", "2.1.283");
     let entry = app.pool.get(session).expect("session");
@@ -171,7 +159,6 @@ fn claude(app: &App, session: u64) {
 }
 
 /// A headless window `ROWS` × `COLS` on Claude Code with its agents panel,
-/// the test clock at `t0`.
 fn glass(t0: Instant) -> (App, WindowId, u64) {
     crate::claude_card::set_test_now(Some(t0));
     let mut app = App::headless_for_test();
@@ -212,7 +199,6 @@ fn painted_ink(app: &App, wid: WindowId) -> usize {
 }
 
 /// The panel's light on the glass: a dark ground's halos, a light ground's
-/// veils.
 fn light(app: &App, wid: WindowId) -> Vec<RainHalo> {
     let p = &app.windows[&wid].claude_card;
     let entry = p.panels().entries.iter().find(|e| e.shown);
@@ -236,11 +222,6 @@ fn col_of(row: &str, needle: &str) -> usize {
 }
 
 /// THE PANEL WEARS THE RAINBOW, ON THE GLASS ONLY: the main row's name, each
-/// running agent's name and dot, the workflow's name, bar and dot are inked
-/// — each row in its own stripe — and each task's dot lit (additive halos on
-/// the dark ground); the activity, the elapsed time and the tokens keep
-/// Claude's ink, and so does the main row's dot. The terminal's text and the
-/// frame's cells are Claude's.
 #[test]
 fn the_panel_wears_the_rainbow_on_the_glass_only() {
     let t0 = Instant::now();
@@ -272,7 +253,6 @@ fn the_panel_wears_the_rainbow_on_the_glass_only() {
     );
     assert_eq!(first.len(), 16);
     assert!(activity > name + 15);
-    // Each row in its own stripe: the rows' first letters differ.
     let second = ink_on(&app, wid, SECOND);
     let workflow = ink_on(&app, wid, WORKFLOW);
     let lead = |ink: &[(u16, [u8; 3])], col: usize| {
@@ -280,7 +260,6 @@ fn the_panel_wears_the_rainbow_on_the_glass_only() {
     };
     assert_ne!(lead(&main, 4), lead(&first, 4));
     assert_ne!(lead(&first, 4), lead(&second, 4));
-    // The workflow: its name, its whole bar, its dot.
     let wrow = text(WORKFLOW);
     let bar = col_of(&wrow, "\u{25B0}");
     let cols: Vec<usize> = workflow.iter().map(|(c, _)| usize::from(*c)).collect();
@@ -290,7 +269,6 @@ fn the_panel_wears_the_rainbow_on_the_glass_only() {
     );
     assert!(cols.contains(&2) && cols.contains(&4));
     assert!(!cols.iter().any(|&c| c >= bar + 12), "not its progress");
-    // Lit: a halo about each task's bullet, none about main's.
     let halos = light(&app, wid);
     assert!(
         halos
@@ -305,8 +283,6 @@ fn the_panel_wears_the_rainbow_on_the_glass_only() {
         );
     }
     assert!(!halos.iter().any(|h| usize::from(h.row) == strip + MAIN));
-    // GLASS ONLY: the grid's text is the panel Claude drew, and so are the
-    // frame's cells.
     let engine = engine_text(&app, session);
     for (row, drawn) in engine.iter().enumerate().take(WORKFLOW + 1).skip(MAIN) {
         assert_eq!(text(row).trim_end(), drawn.trim_end(), "row {row}");
@@ -324,8 +300,6 @@ fn the_panel_wears_the_rainbow_on_the_glass_only() {
 }
 
 /// The record goes back at the undo points: a re-splice of an unrefilled
-/// scratch never doubles the ink or the light, and the strip leaves the
-/// streams without any of it.
 #[test]
 fn the_undo_points_take_the_panel_back() {
     let (mut app, wid, _) = glass(Instant::now());
@@ -381,12 +355,6 @@ fn release(app: &App, session: u64) {
 }
 
 /// THE GATE IS THE BORDER'S (`autopilot::harness_theme`): the unhosted
-/// window's Cruise, a hosted Cruise and a hosted Off (in white, with no
-/// claim) light the panel; the master switch off, Claude Code's own switch
-/// off — hosted or not (the cross-track review of 2026-10-19: an unhosted
-/// window keeps the switches) — the unhosted window's word Off,
-/// `[claude_footer] agents = false` and another program leave it as Claude
-/// drew it. And Off reads near-neutral.
 #[test]
 fn the_panel_is_lit_wherever_the_border_is_drawn() {
     type Case = (&'static str, bool, fn(&mut App, u64));
@@ -484,9 +452,6 @@ fn the_panel_is_lit_wherever_the_border_is_drawn() {
 }
 
 /// AS DRAWN, OR NOT AT ALL: a name Claude drew in a colour keeps it (its dot
-/// still lit); an agent Claude marked done keeps its green dot, no light, and
-/// its name; the cursor's row and a selection in the window keep Claude's
-/// panel.
 #[test]
 fn coloured_cells_the_cursors_row_and_a_selection_keep_claudes_look() {
     let (mut app, wid, session) = glass(Instant::now());
@@ -512,13 +477,11 @@ fn coloured_cells_the_cursors_row_and_a_selection_keep_claudes_look() {
     let halos = light(&app, wid);
     assert!(!halos.iter().any(|h| usize::from(h.row) == strip + SECOND));
     assert!(halos.iter().any(|h| usize::from(h.row) == strip + FIRST));
-    // The cursor on the first agent's row.
     feed(&app, session, START, Inks::default());
     probe::bytes(&app, session, format!("\x1b[{};40H", FIRST + 1).as_bytes());
     frame(&mut app, wid);
     assert!(ink_on(&app, wid, FIRST).is_empty(), "the cursor's row");
     assert!(!ink_on(&app, wid, SECOND).is_empty(), "the others lit");
-    // A selection anywhere in the window.
     probe::bytes(&app, session, format!("\x1b[{};3H", BOTTOM).as_bytes());
     frame(&mut app, wid);
     assert!(painted_ink(&app, wid) > 0, "CONTROL: lit again");
@@ -543,9 +506,6 @@ fn coloured_cells_the_cursors_row_and_a_selection_keep_claudes_look() {
 }
 
 /// A LIGHT GROUND IS PRINTED, NOT LIT: its dots wear round source-over veils
-/// (a tint and the hollow's fill) on the glass over the glyph, no additive
-/// light and nothing under the glyph; SERIOUS MODE keeps the state ink and
-/// drops every light.
 #[test]
 fn a_light_ground_wears_round_veils_and_serious_mode_drops_the_light() {
     let (mut app, wid, session) = glass(Instant::now());
@@ -568,8 +528,6 @@ fn a_light_ground_wears_round_veils_and_serious_mode_drops_the_light() {
         app.windows[&wid].input_scratch.glow_under.is_empty(),
         "nothing under the glyph"
     );
-    // Each task's dot: a round tint, then its hollow's fill inside it, both
-    // centred on its bullet's row.
     let strip = strip_rows(&app, wid);
     let (_, ch) = app.win_cell_size(wid);
     let top = app.win_pad_top(wid) + app.win_head(wid);
@@ -621,10 +579,6 @@ fn cost(app: &mut App, wid: WindowId) -> Cost {
 }
 
 /// THE PANEL AT REST COSTS NOTHING: frame after frame of an unchanged screen
-/// — agents running, the bar on the glass — the pane's pass allocates
-/// nothing, with the panel switched on or off, reads no panel, folds
-/// nothing and makes no look; the glass the same. CONTROL: the clock
-/// Claude repaints reads, folds and makes the look once.
 #[test]
 fn a_panel_at_rest_costs_nothing() {
     let t0 = Instant::now();
@@ -662,7 +616,6 @@ fn a_panel_at_rest_costs_nothing() {
             "frame {i}: the panel's pass costs nothing"
         );
     }
-    // CONTROL: a second later, Claude repaints the clocks.
     crate::claude_card::set_test_now(Some(t0 + Duration::from_secs(1)));
     feed(
         &app,
@@ -696,11 +649,6 @@ fn breath_of(app: &App, wid: WindowId) -> (bool, Option<u64>) {
 }
 
 /// A STUCK DOT BREATHES, THEN RESTS: an agent whose clock runs on with no
-/// work for 150 s turns grey and arms the breath's wake, a step a
-/// `BREATH_STEP_MS`, the key moving with each; its light swells and falls.
-/// After `BREATH_FOR_MS` it rests — no step wakes — until the window
-/// regains focus. NEGATIVE CONTROL: a panel whose every task Claude marked
-/// done arms nothing and keys constant.
 #[test]
 fn a_stuck_dot_arms_the_breath_and_a_settled_panel_arms_nothing() {
     let t0 = Instant::now();
@@ -710,7 +658,6 @@ fn a_stuck_dot_arms_the_breath_and_a_settled_panel_arms_nothing() {
     frame(&mut app, wid);
     let at = |ms: u64| t0 + Duration::from_millis(ms);
     let set_now = |t: Instant| crate::claude_card::set_test_now(Some(t));
-    // 151 s on: the clocks ran on, the tokens did not move.
     let stuck_at = 151_000;
     set_now(at(stuck_at));
     let repaint = |app: &App, s: u64| {
@@ -761,7 +708,6 @@ fn a_stuck_dot_arms_the_breath_and_a_settled_panel_arms_nothing() {
         peaks[7] > floor,
         "it swells to half a period: {floor:?} {peaks:?}"
     );
-    // Its course: Claude's clock ticks on, a second a frame, for a minute.
     for s in 1..=61u64 {
         set_now(epoch + Duration::from_millis(since + s * 1000));
         repaint(&app, 151 + s);
@@ -775,14 +721,12 @@ fn a_stuck_dot_arms_the_breath_and_a_settled_panel_arms_nothing() {
             .is_none_or(|d| d >= rest + Duration::from_millis(1000)),
         "no breath step wakes once rested"
     );
-    // Focus regained: the breath again.
     app.rearm_claude_panels(wid, || rest);
     assert!(
         app.claude_panel_deadline()
             .is_some_and(|d| d <= rest + Duration::from_millis(glass::BREATH_STEP_MS))
     );
 
-    // NEGATIVE CONTROL: every task done.
     let (mut app, wid, session) = glass(t0);
     app.windows.get_mut(&wid).unwrap().band_on_screen_for_test = true;
     let done = "  \u{25EF} sweep  \u{25B0}\u{25B0}\u{25B0}  3/3 \u{B7} 12m05s \u{B7} \u{2193} 88.1k tokens";
@@ -831,15 +775,6 @@ fn a_stuck_dot_arms_the_breath_and_a_settled_panel_arms_nothing() {
 }
 
 /// A FOCUS BLIP BREATHES NO RESTED DOT AGAIN (`claude_card::RETURN_MS`), on
-/// a window whose launch card is not on show — the agents panel alone, so
-/// the breath alone decides what a regain is. A stuck dot breathes its
-/// course and rests; the window loses focus through the OS focus seam and
-/// has it back 20 ms later: the loss noted the window went away with a
-/// breath on show, so the gain is a blip and no breath step is asked (a
-/// course replayed on a blip is `BREATH_FOR_MS` of steps, each a wake of
-/// its own where no card's flow lends the grid slack). NEGATIVE CONTROL:
-/// away 2 s, the gain is a person's return, and the dot breathes its course
-/// again, its next step asked within a step.
 #[test]
 fn a_focus_blip_breathes_no_rested_dot_again() {
     let t0 = Instant::now();
@@ -862,7 +797,6 @@ fn a_focus_blip_breathes_no_rested_dot_again() {
             Inks::default(),
         );
     };
-    // 151 s on the clocks ran on and the tokens did not: stuck, breathing.
     set_now(t0 + Duration::from_secs(151));
     repaint(&app, 151);
     frame(&mut app, wid);
@@ -870,7 +804,6 @@ fn a_focus_blip_breathes_no_rested_dot_again() {
     assert!(breathing, "CONTROL: a stuck dot breathes");
     let since = since.unwrap();
     let epoch = app.windows[&wid].claude_card.panels().epoch.unwrap();
-    // Its course: Claude's clock ticks on, a second a frame, for a minute.
     for s in 1..=61u64 {
         set_now(epoch + Duration::from_millis(since + s * 1000));
         repaint(&app, 151 + s);
@@ -887,7 +820,6 @@ fn a_focus_blip_breathes_no_rested_dot_again() {
             .is_none_or(|d| d >= rest + Duration::from_millis(1000))
     };
     assert!(resting(&app), "CONTROL: no breath step wakes once rested");
-    // THE BLIP: 20 ms away.
     let lost = rest + Duration::from_millis(50);
     set_now(lost);
     app.window_focus_event(wid, false);
@@ -901,7 +833,6 @@ fn a_focus_blip_breathes_no_rested_dot_again() {
         "a blip breathes no rested dot again"
     );
     assert!(resting(&app), "and asks no breath step");
-    // NEGATIVE CONTROL: away 2 s — a return, and the breath again.
     let away = lost + Duration::from_secs(1);
     set_now(away);
     app.window_focus_event(wid, false);
@@ -938,12 +869,6 @@ fn lit_rows(app: &App, wid: WindowId) -> Vec<usize> {
 }
 
 /// A SECOND STUCK AGENT BREATHES A NEW COURSE: the first agent (no work from
-/// the start) turns stuck at 150 s, breathes its course and rests, and rests
-/// on while the stuck rows stay the same; when the second agent (its work
-/// stopped 90 s in) turns stuck too, the stuck rows gain one and the breath
-/// starts a new course — its next step asked within a step — capped like
-/// the first: it rests 60 s on. NEGATIVE CONTROL: the rest between, the same
-/// row stuck frame after frame, starts none.
 #[test]
 fn a_second_stuck_row_breathes_a_new_course() {
     let t0 = Instant::now();
@@ -964,8 +889,6 @@ fn a_second_stuck_row_breathes_a_new_course() {
             .map(|e| e.track.dots().iter().map(|d| d.state).collect())
             .unwrap()
     };
-    // Claude repaints every reading 3 s apart; the second agent's tokens move
-    // until 90 s.
     let at = |app: &mut App, s: u64| {
         crate::claude_card::set_test_now(Some(t0 + Duration::from_secs(s)));
         let tokens = TICKS[usize::try_from(s / 3).unwrap().min(TICKS.len() - 1)];
@@ -992,7 +915,6 @@ fn a_second_stuck_row_breathes_a_new_course() {
     }
     let since = first_course.expect("the first stuck dot breathes");
     assert_eq!(states(&app)[0], DotState::Stuck);
-    // Its course runs out; the same row stuck, the breath rests on.
     while s <= 237 {
         let (breathing, again) = at(&mut app, s);
         if s >= 213 {
@@ -1006,7 +928,6 @@ fn a_second_stuck_row_breathes_a_new_course() {
         }
         s += 3;
     }
-    // The second agent turns stuck: a new course.
     let (breathing, again) = at(&mut app, 240);
     assert_eq!(&states(&app)[..2], &[DotState::Stuck, DotState::Stuck]);
     assert!(breathing, "a new stuck row breathes");
@@ -1018,8 +939,6 @@ fn a_second_stuck_row_breathes_a_new_course() {
         "its next step asked"
     );
     assert!(lit_rows(&app, wid).contains(&FIRST) && lit_rows(&app, wid).contains(&SECOND));
-    // The new course is capped like the first: it rests `BREATH_FOR_MS`
-    // (a minute) on, the stuck rows unchanged.
     let course = again;
     let mut s = 243;
     while s <= 309 {
@@ -1060,19 +979,11 @@ fn image() -> aterm_core::grid::extra::ImageRef {
 }
 
 /// What a case does to the frame before the panel's pass: `(app, window,
-/// frame row of the first agent)`.
 type Touch = fn(&mut App, WindowId, usize);
 
 /// AS DRAWN WHERE THE CELLS ARE NOT PLAIN: a combining mark, an emoji
-/// cluster or an image on the first agent's name keeps its name in Claude's
-/// ink, its dot still inked and lit; an image on its bullet keeps the dot
-/// Claude's and unlit, its name inked; a row BiDi reordered or one the chrome
-/// owns keeps its whole row Claude's, unlit. The second agent's row is lit
-/// in every case. NEGATIVE CONTROL: the untouched frame inks and lights the
-/// first agent's dot and name.
 #[test]
 fn marks_images_bidi_and_chrome_rows_keep_claudes_look() {
-    // The name's columns (`  ◯ general-purpose`) and one inside it.
     let (name, inside) = (4..19, 6);
     let cases: [(&str, Touch, bool, bool); 7] = [
         ("untouched", |_, _, _| {}, true, true),
@@ -1176,12 +1087,9 @@ fn marks_images_bidi_and_chrome_rows_keep_claudes_look() {
 }
 
 /// A SCROLLED-BACK VIEW KEEPS CLAUDE'S PANEL: with the view one row into the
-/// scrollback, nothing of the panel is inked or lit. NEGATIVE CONTROL: at the
-/// live tail, before and after, it is.
 #[test]
 fn a_scrolled_back_view_keeps_claudes_panel() {
     let (mut app, wid, session) = glass(Instant::now());
-    // History above the screen, then the panel drawn again.
     probe::bytes(
         &app,
         session,
@@ -1206,14 +1114,11 @@ fn a_scrolled_back_view_keeps_claudes_panel() {
 }
 
 /// IDLE TO ZERO: a panel whose agents stop drawing — the clocks and the
-/// tokens still — asks for its dots' turns (halted, quiet's fade) and then
-/// for nothing at all.
 #[test]
 fn a_still_panel_goes_idle_to_zero() {
     let t0 = Instant::now();
     let (mut app, wid, _) = glass(t0);
     app.windows.get_mut(&wid).unwrap().band_on_screen_for_test = true;
-    // No crest: the window unfocused (its bar's ripple waits on focus).
     app.windows.get_mut(&wid).unwrap().focused = false;
     frame(&mut app, wid);
     let mut wakes = 0;
@@ -1233,10 +1138,6 @@ fn a_still_panel_goes_idle_to_zero() {
 }
 
 /// A TURN THAT MOVES NO DOT ASKS NO FRAME (the cross-track review of
-/// 2026-10-19): a still panel's looks fade on a tick (`LOOK_TICK_MS`) while
-/// Claude draws nothing new; the wake that judges each tick retimes the
-/// dots, and a frame is asked — and the repaint key moved — only where their
-/// look moved. CONTROL: some ticks move a dot's look, and some move none.
 #[test]
 fn a_turn_that_moves_no_dot_asks_no_frame() {
     let t0 = Instant::now();
@@ -1288,11 +1189,6 @@ fn a_turn_that_moves_no_dot_asks_no_frame() {
 }
 
 /// THE BAR CRESTS WHILE AN AGENT RUNS, AND ONLY ITS FILL MOVES: on a focused
-/// window with motion allowed, a frame a `FLOW_STEP_MS` is asked for and
-/// keyed, the ripple's crest passes along the bar's filled cells, and every
-/// other inked cell — the names, the bar's empty cells, the dots — stands
-/// still. NEGATIVE CONTROL: unfocused, the bar rests and no crest step is
-/// asked for.
 #[test]
 fn the_bar_crests_while_an_agent_runs_and_only_its_fill_moves() {
     let t0 = Instant::now();
@@ -1352,7 +1248,6 @@ fn the_bar_crests_while_an_agent_runs_and_only_its_fill_moves() {
         .filter(|(i, f)| fills[..*i].iter().all(|g| g != *f))
         .count();
     assert!(distinct > 4, "the crest passes along the fill: {distinct}");
-    // NEGATIVE CONTROL: the window unfocused.
     app.windows.get_mut(&wid).unwrap().focused = false;
     let t = epoch + Duration::from_millis(21 * FLOW_STEP_MS);
     crate::claude_card::set_test_now(Some(t));
@@ -1371,8 +1266,6 @@ fn the_bar_crests_while_an_agent_runs_and_only_its_fill_moves() {
 }
 
 /// The launch card of the facts' build ([`probe::facts`]), drawn over the
-/// transcript's first rows: a blank row, the banner, the model, the working
-/// directory in Claude's gray, a blank row.
 fn card(app: &App, session: u64) {
     let rows = [
         String::new(),
@@ -1394,7 +1287,6 @@ fn card(app: &App, session: u64) {
 }
 
 /// The wakes a window asks for `n` frames on from `t`, each frame drawn at
-/// the soonest: `(card's, panel's)` deadline, in ms since `epoch`.
 fn wakes(
     app: &mut App,
     wid: WindowId,
@@ -1421,7 +1313,6 @@ fn wakes(
 }
 
 /// A crest beside a stuck dot (`a_breath_beside_a_crest_steps_on_its_grid`):
-/// a focused window, motion allowed, an agent running and one stuck at 151 s.
 fn crest_and_breath(t0: Instant) -> (App, WindowId, Instant) {
     let (mut app, wid, session) = glass(t0);
     {
@@ -1446,11 +1337,6 @@ fn crest_and_breath(t0: Instant) -> (App, WindowId, Instant) {
 }
 
 /// A BREATH BESIDE A CREST STEPS ON ITS GRID (the cross-track review of
-/// 2026-10-19): a stuck dot's breath starts its course on the crest's grid
-/// and steps with it — every wake a `FLOW_STEP_MS` after the last, each on
-/// the crest's steps, one frame a step for both (two clocks, 125 ms beside
-/// 128 ms, woke the window twice a step). CONTROL: both move — the crest's
-/// and the breath's steps are on the key.
 #[test]
 fn a_breath_beside_a_crest_steps_on_its_grid() {
     let t0 = Instant::now();
@@ -1466,8 +1352,6 @@ fn a_breath_beside_a_crest_steps_on_its_grid() {
     let epoch = app.windows[&wid].claude_card.panels().epoch.unwrap();
     let seen = wakes(&mut app, wid, epoch, now, 32);
     let panel: Vec<u128> = seen.iter().filter_map(|w| w.1).collect();
-    // Every wake is a crest step's or a dot's turn (Claude's clock, a
-    // second apart) — none is a breath's of its own.
     let step = u128::from(FLOW_STEP_MS);
     assert!(
         panel.iter().all(|w| w % step == 0 || w % 1000 == 0),
@@ -1483,17 +1367,6 @@ fn a_breath_beside_a_crest_steps_on_its_grid() {
 }
 
 /// A PRESENT IN THE SLACK DRAWS THE BREATH'S STEP (the real-window lab of
-/// 2026-10-20: a stuck dot breathing beside a flowing card fired
-/// `agents_panel` 243 times in 30 s, 552 frames where Claude's repaints drew
-/// 301): with the card flowing on the window, its ripple 50 ms off the
-/// window's clock, a frame composed inside a step's slack — where the card's
-/// lock puts Claude's repaints, `FLARE_STEP_LEAD_MS` into each step — draws
-/// the breath's step, so the panel's next wake is the next step's and the
-/// window presents once a step for the card, the breath and Claude. The
-/// breath's step changes where the card's does, at the step's start, not at
-/// its wake. NEGATIVE CONTROL: a frame a millisecond before a step's start
-/// leaves that step's wake owed. CONTROL: the stuck dots breathe and the
-/// card flows throughout.
 #[test]
 fn a_present_in_the_slack_draws_the_breaths_step() {
     let t0 = Instant::now();
@@ -1508,8 +1381,6 @@ fn a_present_in_the_slack_draws_the_breaths_step() {
     crate::claude_card::set_test_now(Some(t0 + Duration::from_millis(50)));
     card(&app, session);
     frame(&mut app, wid);
-    // 151 s on: Claude's clocks ran on and no token moved — both stuck, so
-    // nothing crests and the breath is the panel's only motion.
     let now = t0 + Duration::from_millis(151_000);
     crate::claude_card::set_test_now(Some(now));
     feed(
@@ -1557,12 +1428,6 @@ fn a_present_in_the_slack_draws_the_breaths_step() {
 }
 
 /// THE PANEL'S SHIMMER RIDES THE CARD'S CLOCK (the panel's design, step 7;
-/// the cross-track review of 2026-10-19): with the harness card flowing on
-/// the same window — drawn 50 ms after the panel's clock started, so its
-/// ripple is 50 ms off the window's — the bar's crest steps on the card's
-/// ripple: each crest step's frame is asked at the card's own step's
-/// deadline, so the window wakes once a step for both. NEGATIVE CONTROL: with
-/// no card the crest keeps the window's own grid.
 #[test]
 fn the_panel_shimmer_rides_the_cards_clock() {
     let t0 = Instant::now();
@@ -1584,7 +1449,6 @@ fn the_panel_shimmer_rides_the_cards_clock() {
     );
     let t = t0 + Duration::from_millis(aterm_effects::harness_card::EPISODE_MS + 1000);
     crate::claude_card::set_test_now(Some(t));
-    // Claude's clock ran on and the tokens moved: the agents still run.
     feed(
         &app,
         session,
@@ -1597,8 +1461,6 @@ fn the_panel_shimmer_rides_the_cards_clock() {
     card(&app, session);
     frame(&mut app, wid);
     let seen = wakes(&mut app, wid, epoch, t, 12);
-    // Each of the panel's wakes is the card's step, or a dot's turn on
-    // Claude's clock (a second apart).
     assert!(
         seen.iter()
             .all(|w| w.0.is_some() && (w.0 == w.1 || w.1.is_some_and(|p| p % 1000 == 0))),
@@ -1616,7 +1478,6 @@ fn the_panel_shimmer_rides_the_cards_clock() {
         "CONTROL: the card flows a step a wake: {card_steps:?}"
     );
     host.shutdown_and_join();
-    // NEGATIVE CONTROL: no card — the window's own grid.
     let (mut app, wid, _) = glass(t0);
     {
         let ws = app.windows.get_mut(&wid).unwrap();
@@ -1635,11 +1496,6 @@ fn the_panel_shimmer_rides_the_cards_clock() {
 }
 
 /// MOTION WITHHELD, NO STEP ASKED: under OS Reduce Motion or serious mode, a
-/// focused window whose panel has an agent running beside a stuck one and a
-/// workflow bar neither crests the bar nor breathes the stuck dot — no frame
-/// is asked a crest or breath step away, and the repaint key stands still
-/// between the dots' turns. NEGATIVE CONTROL: with motion allowed the same
-/// panel crests and breathes, its next step asked within one.
 #[test]
 fn reduced_motion_and_serious_mode_ask_no_step() {
     let t0 = Instant::now();
@@ -1658,8 +1514,6 @@ fn reduced_motion_and_serious_mode_ask_no_step() {
         app.serious_mode = serious;
         let plan = app.active_visible_leaf_plan(wid).unwrap();
         frame(&mut app, wid);
-        // 151 s on: the first agent's tokens moved (running), the second's
-        // did not (stuck).
         let now = t0 + Duration::from_secs(151);
         crate::claude_card::set_test_now(Some(now));
         feed(
@@ -1717,17 +1571,10 @@ fn reduced_motion_and_serious_mode_ask_no_step() {
 }
 
 /// WHILE CLAUDE'S PANEL HAS THE KEYS, IT STAYS LIT: Claude replaces the mode
-/// row with its hint row (`  Enter to view · x to stop`, measured on 2.1.304),
-/// points `❯ ` at the selected agent's row from column 0 and draws that row
-/// in the default ink; the pointer is inked in the row's stripe beside the
-/// name and the dot, and the dot is lit. NEGATIVE CONTROL: a pointer drawn
-/// in a colour keeps it, the rest of the row still lit.
 #[test]
 fn the_panel_stays_lit_while_it_has_the_keys() {
     for pointer_ink in [None, Some(BLUE)] {
         let (mut app, wid, session) = glass(Instant::now());
-        // The panel as `under` lays it, its mode row replaced by Claude's
-        // hint row and its first agent's row selected.
         let mut under = under(START);
         under[0] = "  Enter to view \u{B7} x to stop".to_owned();
         under[3] = under[3].replacen("  ", "\u{276F} ", 1);
@@ -1744,8 +1591,6 @@ fn the_panel_stays_lit_while_it_has_the_keys() {
             } else if i == MAIN {
                 format!("\x1b[1m{row}")
             } else if i == FIRST {
-                // The selected row: Claude's default ink, its pointer in
-                // `pointer_ink` where the control colours it.
                 let (pointer, rest) = row.split_at('\u{276F}'.len_utf8());
                 match pointer_ink {
                     Some(rgb) => format!("{}{pointer}\x1b[39m{rest}", sgr(rgb)),
@@ -1781,8 +1626,6 @@ fn the_panel_stays_lit_while_it_has_the_keys() {
             "the pointer inked where Claude drew it plain: {cols:?}"
         );
         if pointer_ink.is_none() {
-            // In the row's stripe: the pointer and the name's first letter
-            // share the row's hue.
             let at = |col: u16| ink.iter().find(|(c, _)| *c == col).unwrap().1;
             assert_eq!(at(0), at(name), "the pointer leads the name");
         }
@@ -1812,7 +1655,6 @@ fn publish_flights(app: &App, session: u64, table: aterm_agent::harness::flight:
 }
 
 /// The first agent's file: `general-purpose`, `bling probe`, started 21 s
-/// before `W0` (its row's clock at the start), saying `flight`.
 fn bling_probe(
     flight: aterm_agent::harness::flight::FileFlight,
 ) -> aterm_agent::harness::flight::FlightTable {
@@ -1849,11 +1691,6 @@ fn dot_states(app: &App, wid: WindowId) -> Vec<DotState> {
 }
 
 /// A LONG CALL IN FLIGHT READS AS ITS TOOL ON THE GLASS: the first agent's
-/// tokens still for three minutes while its file says its Bash call is
-/// inside its budget — in its tool, its dot fresh and lit, not grey; the
-/// call answered with the screen unchanged, the dots take it at the next
-/// frame (running). At rest with the table published the pass still costs
-/// nothing. NEGATIVE CONTROL: the same screens with no table read stuck.
 #[test]
 fn a_long_call_in_flight_reads_as_its_tool_on_the_glass() {
     let t0 = Instant::now();
@@ -1903,11 +1740,9 @@ fn a_long_call_in_flight_reads_as_its_tool_on_the_glass() {
             .any(|h| usize::from(h.row) == strip + FIRST),
         "lit"
     );
-    // At rest with the table published: nothing read, folded or made.
     for i in 0..5 {
         assert_eq!(cost(&mut app, wid), Cost::default(), "frame {i}");
     }
-    // The call answered, the screen unchanged: the next frame takes it.
     publish_flights(
         &app,
         session,
@@ -1924,10 +1759,6 @@ fn a_long_call_in_flight_reads_as_its_tool_on_the_glass() {
 }
 
 /// THE TITLE SAYS WHAT IT WAITS ON: with Claude's own `❯` on the row in its
-/// tool (the person points at it), the footer's title slot on the bottom
-/// rule reads `in Bash 3m06s`; the glass only — the engine's text is
-/// Claude's. NEGATIVE CONTROL: the same screens with no `❯` title
-/// nothing, and neither does a `❯` on a row whose call was answered.
 #[test]
 fn the_title_says_what_a_pointed_row_waits_on() {
     let t0 = Instant::now();
@@ -1983,12 +1814,6 @@ fn the_title_says_what_a_pointed_row_waits_on() {
 }
 
 /// A WORKFLOW ALONE WEARS A TASK ROW'S HUE: for a workflow alone Claude Code
-/// draws no `⏺ main` row (measured on 2.1.304, `aterm-phase`'s
-/// `claude-2.1.304-agents-panel-workflow-long-bash-8s-120col.txt`), and its
-/// row takes the hue it wears under a main row — the first task row's, never
-/// the main row's stripe (Cruise's red, beside Claude's failed red; the lab
-/// read it there). NEGATIVE CONTROL: under a main row, the main row's own
-/// first letter is in another hue.
 #[test]
 fn a_workflow_alone_wears_a_task_rows_hue() {
     let flow = "  \u{25EF} stall-probe  \u{25B0}\u{25B0}\u{25B0}\u{25B1}\u{25B1}\u{25B1}  1/2 \u{B7} 8s \u{B7} \u{2193} 12.7k tokens";

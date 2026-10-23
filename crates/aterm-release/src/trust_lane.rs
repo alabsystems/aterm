@@ -1,26 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The trust lane: `targo --unverified ship trust run`.
-//!
-//! Runs `targo trust check -p <library> --lib --allow-l0-gaps` over the workspace
-//! libraries and the vendored forks, each check in its own slot target directory, and
-//! hands what each left to the judge ([`crate::trust_facts`]); a whole-tree run on a
-//! clean checkout can file facts for the explicit Trust verdict commands.
-//!
-//! - Every check's environment is built from a list ([`lane_env`]): a caller's
-//!   `TRUSTFLAGS` or `RUSTFLAGS` would move a proof the facts key does not cover.
-//! - The prover is resolved once ([`Driver`]): a store update mid-run would split the run
-//!   across two provers.
-//! - A check runs in its own session and is ended with its whole process tree, trustd's
-//!   left alone ([`proc_tree::end_tree`]).
-//! - Each check has a wall budget ([`Config::budget`]): a verifier stuck before its
-//!   solvers spins for hours, and a check that does not finish is not verified.
-//! - A second check starts only while this build's trustd serves the socket
-//!   ([`trustd::Keeper`]): two checks that each start a trustd race and the loser is
-//!   refused.
-//! - Nothing is retried: a check targo would not start is an undecided
-//!   NOT-VERIFIED(trustd) row that `--remeasure` measures again.
+//! Trust verification lane (`targo --unverified ship trust run`).
 
 use aterm_uds::spawnfd::{Stdio, command};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -32,40 +13,28 @@ use std::time::{Duration, Instant, SystemTime};
 use crate::ledger::GitCli;
 use crate::trust_facts::{self, Decision, Plan, Update, one_line};
 
-/// Forks the resolved graph carries that the lane does not verify yet, each with why:
-/// a QUEUED row, never gated and never a pass. Any other fork is gated like a member,
-/// so a new fork enters as NO-FLOOR until its floor is written; one listed here that
-/// leaves the graph is FORK-VANISHED ([`vanished`]). Empty since indexmap, the last
-/// vendored fork, went back to the registry (docs/AUDIT-third-party-2026-10-15.md, "The
-/// last fork").
+/// Forks in the resolved graph not yet verified by the lane, with their reasons.
 pub const QUEUED_FORKS: &[(&str, &str)] = &[];
 
 /// The lane's cargo profile: dev at opt-level 0 with every dev speed row zeroed
-/// ([`lane_profile_args`]); optimized, the MIR inliner pastes std internals into the
-/// verified library and proofs fall with no source changed.
 const LANE_PROFILE: &str = "trust-lane";
 
-/// A check still running this long after it started is ended and its library is
-/// OVER-BUDGET: far above the slowest honest check, so it tells stuck from slow.
+/// Per-check wall-clock budget (`6h`) before a check is terminated as `OVER-BUDGET`.
 pub const DEFAULT_BUDGET: Duration = Duration::from_secs(6 * 3600);
 
-/// How long the lane waits for a trustd of another build, or one that does not answer,
-/// to leave the socket before any check: a trustd retires 300 s after its last grant.
+/// Maximum time to wait for a foreign or silent `trustd` to leave the socket.
 pub const TRUSTD_WAIT: Duration = Duration::from_secs(330);
 
 /// A check whose largest process reached this is HEAVY: at most one per 64 GiB of RAM
-/// runs at once, so slots never stack several near-30 GiB checks on a shared machine.
 const HEAVY_BYTES: u64 = 16 << 30;
 
 /// How often the slots are polled.
 const POLL: Duration = Duration::from_millis(250);
 
 /// Variables every compile of the lane gets as constants of this file (so of the tree
-/// the facts key covers).
 const LANE_PINS: [(&str, &str); 2] = [("TRUST_NO_MIGRATE_WARN", "1"), ("CARGO_INCREMENTAL", "0")];
 
 /// Variables the lane passes from the host, by name: their values are no input the key
-/// covers, so the judge refuses a compile that read one (`dep_info_check`).
 const LANE_PASSED: [&str; 9] = [
     "PATH",
     "HOME",
@@ -78,59 +47,44 @@ const LANE_PASSED: [&str; 9] = [
     "CARGO_TARGET_DIR",
 ];
 
-// What a run is asked, and what it answers
-
-/// Which libraries a run verifies.
+/// Package scope verified by a lane run.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Scope {
-    /// Every library and fork: a run eligible to file whole-tree facts.
+    /// Every workspace library and fork (eligible to file whole-tree facts).
     WholeTree,
-    /// These libraries only (`-p`): files nothing.
+    /// Explicit package list (`-p`); files no whole-tree facts.
     Packages(Vec<String>),
-    /// Only what the stored facts of this tree and prover left undecided, folded into
-    /// that record.
+    /// Only libraries left undecided in stored facts for this tree and prover.
     Remeasure,
 }
 
-/// A run of the lane.
+/// Configuration for a trust lane run.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Config {
     pub repo: PathBuf,
     pub scope: Scope,
-    /// Slots at once; `None` is one per six cores and per 16 GiB, at least one.
+    /// Concurrent slot count (`None` selects automatic sizing from cores and memory).
     pub jobs: Option<usize>,
-    /// Where the slots' target directories and the logs go, never moved when named. `None`
-    /// is the first of `<repo>/target-trust.noindex` and this checkout's directory of the user's
-    /// cache ([`choose_root`]) whose every component `targo trust` admits
-    /// ([`refused_component`]): a checkout made under a login's umask `002` is `0775`, so
-    /// there the run says it falls back, and when neither is admitted it runs nothing. A
-    /// default run retires the checkout's cache directory once `<repo>/target-trust.noindex` is
-    /// admitted again, and prunes those whose checkout is gone ([`prune_orphans`]).
+    /// Root directory for slot target dirs and logs (`None` selects the default root).
     pub target_root: Option<PathBuf>,
     pub budget: Duration,
-    /// Write floors this run meets (never lowering one) and keep the memory record
-    /// current.
+    /// Whether to ratchet up floor counts and update the memory record.
     pub update_ratchet: bool,
-    /// Verify what this host would refuse for memory up front.
+    /// Whether to attempt libraries this host would otherwise refuse for memory.
     pub try_refused: bool,
-    /// Reduce each check's proof report to its per-obligation record, kept beside its
-    /// log ([`crate::trust_oblig`]). The report needs `--report-dir`, whose proof artifact
-    /// store a prover without trust a40ddc8e9c (the published seal 321aaeda75) caps at
-    /// 512 MiB by ending the check with exit 2 before its Summary, as aterm-agent's: such
-    /// a library's record needs a prover ([`Config::prover`]) that holds that commit.
+    /// Whether to write per-obligation records beside each check log ([`crate::trust_obligations`]).
     pub obligations: bool,
-    /// Stop before any check when this host refuses a library for memory.
+    /// Whether to stop before running any check if memory guard narrows the run.
     pub stop_if_narrowed: bool,
-    /// The prover's `bin/`; `None` is the toolchain the cut builds with.
+    /// Explicit prover `bin/` directory (`None` uses the active toolchain).
     pub prover: Option<PathBuf>,
-    /// Where the cost history and this host's memory observations live; `None` is
-    /// `<git common dir>/aterm-release`.
+    /// Directory for cost history and host memory records.
     pub state: Option<PathBuf>,
     pub trustd_wait: Duration,
 }
 
 impl Config {
-    /// A run of `scope` in `repo` with every default.
+    /// Creates a default [`Config`] for `scope` in `repo`.
     #[must_use]
     pub fn new(repo: &Path, scope: Scope) -> Config {
         Config {
@@ -150,25 +104,23 @@ impl Config {
     }
 }
 
-/// What a run decided.
+/// Final verdict of a trust lane run.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Outcome {
-    /// Every library it verified held its floor.
+    /// Every verified library met its floor.
     Pass,
-    /// A library fell below its floor, had none, or did not finish: each
-    /// `<crate> <STATUS> <proved>/<total>`.
+    /// One or more libraries fell below floor, lacked a floor, or failed.
     Fail(Vec<String>),
-    /// Nothing was decided about these (trustd or the clock kept them from a result):
-    /// `--remeasure` measures them again.
+    /// Libraries left undecided due to `trustd` or budget.
     Undecided(Vec<String>),
-    /// This host cannot verify every library: what it refused, and why.
+    /// Libraries refused on this host due to memory constraints.
     Narrowed(Vec<String>),
-    /// Nothing was decided: why.
+    /// Run could not start or complete.
     CouldNotRun(String),
 }
 
 impl Outcome {
-    /// The exit status: 0 pass, 1 fail, 2 nothing decided, 4 narrowed by memory.
+    /// Exit code (`0` pass, `1` fail, `2` undecided/could-not-run, `4` narrowed).
     #[must_use]
     pub fn exit(&self) -> i32 {
         match self {
@@ -198,10 +150,10 @@ impl Outcome {
     }
 }
 
-/// Parse `trust run …`.
+/// Parses CLI arguments after `trust run`.
 ///
 /// # Errors
-/// A flag this does not know, one without its value, or no scope named.
+/// Returns an error on an unknown flag, missing flag value, or missing scope.
 pub fn parse<'a>(it: &mut impl Iterator<Item = &'a str>) -> Result<Config, String> {
     let mut cfg = Config::new(Path::new(""), Scope::WholeTree);
     let (mut packages, mut whole, mut remeasure) = (Vec::new(), false, false);
@@ -258,27 +210,21 @@ pub fn parse<'a>(it: &mut impl Iterator<Item = &'a str>) -> Result<Config, Strin
     Ok(cfg)
 }
 
-// The prover
-
-/// The toolchain every compile of a run uses, resolved once.
+/// Resolved toolchain driver used for every compile in a run.
 #[derive(Clone, Debug)]
 pub struct Driver {
-    /// Its `bin/`, physical.
+    /// Physical `bin/` directory of the toolchain.
     pub bin: PathBuf,
     pub targo: PathBuf,
-    /// `targo --version`, empty when it said nothing.
+    /// Output of `targo --version`.
     pub id: String,
 }
 
 impl Driver {
-    /// The toolchain at `bin`: its `targo` a regular executable file (`targo trust`
-    /// refuses a symlinked driver, and a shim's body moves with the next update), with
-    /// `trustc` and `trustd` beside it, and nothing of it `targo trust` would refuse to run
-    /// or load from ([`toolchain_refusal`]): a refusal there fails every check before it
-    /// verifies anything, its cause buried in each log.
+    /// Resolves and validates the toolchain driver at `bin` ([`toolchain_refusal`]).
     ///
     /// # Errors
-    /// What is missing, and the fix.
+    /// Returns an error describing what is missing or refused and how to fix it.
     pub fn at(bin: &Path) -> Result<Driver, String> {
         use std::os::unix::fs::PermissionsExt as _;
         let bin =
@@ -339,10 +285,7 @@ fn host_var(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|v| !v.is_empty())
 }
 
-/// The lane's environment: the pins, then what it passes from the host (`host`), the
-/// driver's directory first on PATH so a nested `trustc`, `trustd` or `trustdoc` is the
-/// pinned build's, and the system's after it so a build script's `cc` is the system's. The
-/// caller adds each compile's `CARGO_TARGET_DIR`.
+/// Builds the environment variable list for a lane check subprocess.
 #[must_use]
 pub fn lane_env(bin: &Path, host: &dyn Fn(&str) -> Option<String>) -> Vec<(String, String)> {
     let mut env: Vec<(String, String)> = LANE_PINS
@@ -361,8 +304,6 @@ pub fn lane_env(bin: &Path, host: &dyn Fn(&str) -> Option<String>) -> Vec<(Strin
     if let Some(j) = host("CARGO_BUILD_JOBS").filter(|j| j.parse::<u32>().is_ok_and(|n| n > 0)) {
         env.push(("CARGO_BUILD_JOBS".into(), j));
     }
-    // `targo trust` refuses a doc driver that is a symlink; the pinned build's sibling
-    // is a plain file of the same build.
     let doc = bin.join("trustdoc");
     if fs::symlink_metadata(&doc).is_ok_and(|m| m.is_file()) {
         env.push(("RUSTDOC".into(), doc.display().to_string()));
@@ -370,45 +311,33 @@ pub fn lane_env(bin: &Path, host: &dyn Fn(&str) -> Option<String>) -> Vec<(Strin
     env
 }
 
-// The gate list, from the resolved graph
-
-/// What a package of the graph is to the lane.
+/// Classification of a package in the resolved Cargo graph.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
-    /// A workspace member with a library: `-p name@version --lib`, and once more per fork
-    /// feature ([`fork_features`]) as `<name>+<feature>`.
+    /// Workspace member with a library target.
     Member,
-    /// A workspace member with no library: nothing the library lane verifies.
+    /// Workspace member with binary targets only.
     MemberBin,
-    /// A path package outside the workspace (a `[patch]` fork under vendor/): checked
-    /// by its own manifest with the feature set the workspace resolve turns on.
+    /// Path dependency outside the workspace (`vendor/` fork).
     Fork,
 }
 
-/// One row of the gate list.
+/// Single verification row in the gate list.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Lib {
-    /// The package's name, or `<name>+<feature>` for a member's fork-feature row
-    /// ([`FEATURE_ROW`]). A twin (one of two packages of one name in the graph:
-    /// `windows-sys@0.52.0` and `windows-sys@0.61.2`) is named by its [`Self::spec`]
-    /// instead, so each has its own floor row.
+    /// Row name (`<package>` or `<package>+<feature>` via [`FEATURE_ROW`]).
     pub name: String,
     pub kind: Kind,
-    /// `name@version` (`name+feature@version` for a fork-feature row): never the
-    /// bare name, which two resolved versions make ambiguous.
+    /// Versioned package spec (`name@version` or `name+feature@version`).
     pub spec: String,
-    /// Everything `targo trust check` takes before `--allow-l0-gaps`; empty for a
-    /// [`Kind::MemberBin`].
+    /// Arguments passed to `targo trust check` before `--allow-l0-gaps`.
     pub argv: Vec<String>,
 }
 
-/// What joins a member to its feature in a fork-feature row's name and spec
-/// (`<member>+<feature>`). A package name holds only alphanumerics, `-` and `_`, so
-/// a name with it is always such a row, and the part before it is the package.
+/// Separator joining a workspace member and feature in a fork-feature row (`+`).
 pub const FEATURE_ROW: char = '+';
 
-/// The Cargo package a lane row names, its feature or twin version suffix ([`Lib::name`])
-/// dropped: Cargo's reports name the package.
+/// Strips any feature or twin-version suffix from `row` to return the Cargo package name.
 #[must_use]
 pub fn package_identity(row: &str) -> &str {
     row.split_once([FEATURE_ROW, '@'])
@@ -416,11 +345,6 @@ pub fn package_identity(row: &str) -> &str {
 }
 
 /// The features of `pkg`'s own that its default build leaves off and that name a path fork
-/// directly (`fork/feat`, `fork?/feat` or `dep:fork`, by the manifest's key for the
-/// dependency). The fork's lane verifies the fork code such a feature turns on (the graph is
-/// every feature's: [`gate_list`]), but the member's arms behind it, that code's call sites,
-/// compile only with it, so each is gated as a row of its own beside the default row, whose
-/// `cfg(not(..))` arms are the ones that ship.
 fn fork_features(pkg: &aterm_json::Value, forks: &BTreeSet<&str>) -> Vec<String> {
     use aterm_json::Value;
     let Some(features) = pkg.get("features").and_then(Value::as_object) else {
@@ -444,7 +368,6 @@ fn fork_features(pkg: &aterm_json::Value, forks: &BTreeSet<&str>) -> Vec<String>
             Some((key, name))
         })
         .collect();
-    // What the default build turns on: `default` and the features it names, transitively.
     let mut on: BTreeSet<&str> = BTreeSet::new();
     let mut next = vec!["default"];
     while let Some(f) = next.pop() {
@@ -478,8 +401,7 @@ fn manifest_of(argv: &[String]) -> Option<&str> {
     argv.get(i + 1).map(String::as_str)
 }
 
-/// `--profile trust-lane` and its definition: dev at opt-level 0, each named dev
-/// package row (`rows`) zeroed by name, since a named row outranks `package."*"`.
+/// Builds `--profile trust-lane` `--config` arguments clearing `opt-level` on `rows`.
 #[must_use]
 pub fn lane_profile_args(rows: &BTreeSet<String>) -> Vec<String> {
     let p = format!("profile.{LANE_PROFILE}");
@@ -499,8 +421,6 @@ pub fn lane_profile_args(rows: &BTreeSet<String>) -> Vec<String> {
 }
 
 /// The `[profile.dev.package.<spec>]` keys of a manifest or cargo config, none when it
-/// is not there.
-///
 /// # Errors
 /// A file that is there and does not parse: unread, it would verify optimized.
 fn dev_package_rows(path: &Path) -> Result<BTreeSet<String>, String> {
@@ -522,7 +442,6 @@ fn dev_package_rows(path: &Path) -> Result<BTreeSet<String>, String> {
 }
 
 /// The dev package rows a check of `manifest` sees: the manifest's own and the
-/// `.cargo/config.toml` beside it or at the workspace root.
 fn profile_rows_for(manifest: &Path, root: &Path) -> Result<BTreeSet<String>, String> {
     let mut rows = dev_package_rows(manifest)?;
     let mut dirs = BTreeSet::new();
@@ -536,15 +455,10 @@ fn profile_rows_for(manifest: &Path, root: &Path) -> Result<BTreeSet<String>, St
     Ok(rows)
 }
 
-/// The gate list, from `targo metadata --format-version 1 --all-features` with dependencies
-/// (a fork is found only in the resolve): members first, then forks, by name; a fork with
-/// the features that resolve turns on for it, a member once with its default features and
-/// once more per fork feature ([`fork_features`]). `rows` answers the dev package rows a
-/// manifest's check sees.
+/// Builds the gate list from `targo metadata --format-version 1 --all-features`.
 ///
 /// # Errors
-/// Metadata the lane cannot read a gate list from, or a name or spec that cannot go in an
-/// argv.
+/// Returns an error if `meta` is malformed or contains an invalid package name or spec.
 pub fn gate_list(
     meta: &aterm_json::Value,
     rows: &dyn Fn(&Path) -> Result<BTreeSet<String>, String>,
@@ -615,7 +529,6 @@ pub fn gate_list(
         }
         let spec = format!("{name}@{version}");
         if members.contains(id) {
-            // No `targets` array reads as a library: the safe direction gates more.
             let has_lib = pkg
                 .get("targets")
                 .and_then(aterm_json::Value::as_array)
@@ -664,7 +577,8 @@ pub fn gate_list(
             continue;
         }
         if !is_fork(pkg) {
-            continue; // a registry or git package: not ours
+            // a registry or git package: not ours
+            continue;
         }
         let manifest = PathBuf::from(s("manifest_path"));
         if manifest.as_os_str().is_empty() {
@@ -692,8 +606,6 @@ pub fn gate_list(
             argv,
         });
     }
-    // Twins: two packages of one name (a member and a path fork at another version) would
-    // share a floor row and be AMBIGUOUS, so each is named by its spec.
     let mut versions: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for lib in &out {
         let (_, version) = lib.spec.rsplit_once('@').unwrap_or((&lib.spec, ""));
@@ -716,9 +628,7 @@ pub fn gate_list(
     Ok(out)
 }
 
-/// The libraries that left: each name a floor row (`floors`, the ratchet's text) or
-/// [`QUEUED_FORKS`] holds that `libs` does not, sorted. The judge fails each as
-/// FORK-VANISHED, so a deleted `[patch]` row never stops a fork being counted silently.
+/// Returns floor or [`QUEUED_FORKS`] package names that no longer exist in `libs`.
 #[must_use]
 pub fn vanished(libs: &[Lib], floors: &str) -> Vec<String> {
     let present: BTreeSet<&str> = libs.iter().map(|l| l.name.as_str()).collect();
@@ -732,21 +642,17 @@ pub fn vanished(libs: &[Lib], floors: &str) -> Vec<String> {
     gone.into_iter().map(str::to_string).collect()
 }
 
-/// One selected library and what the lane decided about it before anything ran.
+/// Library row selected for a run along with its pre-check disposition.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Selected {
     pub lib: Lib,
     pub decision: Decision,
 }
 
-/// Selects `names` (all of `libs` when `None`), each decided: two selected rows of one name
-/// are AMBIGUOUS (one floor cannot judge both), a member with no library NO-LIB, a fork
-/// [`QUEUED_FORKS`] names QUEUED, the rest gated. A package's name also selects its
-/// fork-feature rows and both of a twin's rows; a twin's spec selects that one.
+/// Selects `names` (or all of `libs` when `None`) and assigns each row's pre-check status.
 ///
 /// # Errors
-/// A name in neither the workspace nor the graph's forks: a run over nothing it asked for
-/// must not print a verdict.
+/// Returns an error if any requested name matches neither a workspace member nor a fork.
 pub fn select(libs: &[Lib], names: Option<&[String]>) -> Result<Vec<Selected>, String> {
     let chosen: Vec<&Lib> = match names {
         None => libs.iter().collect(),
@@ -792,10 +698,7 @@ pub fn select(libs: &[Lib], names: Option<&[String]>) -> Result<Vec<Selected>, S
         .collect())
 }
 
-// Slots, order and the budget
-
-/// `--jobs auto`: one slot per six cores and per 16 GiB, at least one; memory that
-/// cannot be read allows one.
+/// Automatic slot count (`--jobs auto`) from logical cores and total memory in bytes.
 #[must_use]
 pub fn auto_slots(cores: usize, mem: u64) -> usize {
     let by_mem = if mem == 0 {
@@ -806,7 +709,7 @@ pub fn auto_slots(cores: usize, mem: u64) -> usize {
     (cores / 6).min(by_mem).max(1)
 }
 
-/// Heavy checks at once: one per 64 GiB, at least one.
+/// Maximum concurrent heavy checks for total memory `mem` in bytes.
 #[must_use]
 pub fn heavy_slots(mem: u64) -> usize {
     usize::try_from(mem / (64 << 30))
@@ -814,15 +717,14 @@ pub fn heavy_slots(mem: u64) -> usize {
         .max(1)
 }
 
-/// What a library's last finished check cost on this machine (the cost history).
+/// Historical resource cost of a library's last completed check.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Cost {
     pub cpu: u64,
     pub wall: u64,
-    /// Its largest process's resident peak, bytes.
+    /// Peak resident set size in bytes.
     pub maxrss: u64,
-    /// When it was measured (RFC 3339; empty when its row named no time): a row
-    /// carried over by a rewrite keeps its own.
+    /// RFC 3339 timestamp when the cost was recorded.
     pub when: String,
 }
 
@@ -831,8 +733,7 @@ const COSTS_HEADER: &str = "# trust lane cost history: <name> <CPU s> <wall s> <
 /// The committed seed's first line ([`trust_facts::COSTS`]), above [`COSTS_HEADER`].
 const SEED_HEADER: &str = "# The trust lane's cost-history SEED: the fallback a clone with no history of its own reads (a library its git directory's aterm-release/trust-costs.tsv has no row for takes its row here). `targo --unverified ship trust run --update-ratchet` rewrites it with floors.tsv and memory.tsv. A library in neither file runs first, as heavy.";
 
-/// What orders a run: this clone's history over the committed seed, a row of the
-/// history winning. Either may be absent.
+/// Loads cost history, overlaying local `history` onto the committed `seed`.
 #[must_use]
 pub fn read_costs(history: Option<&Path>, seed: &Path) -> BTreeMap<String, Cost> {
     let mut all = cost_file(seed);
@@ -847,11 +748,7 @@ fn cost_file(path: &Path) -> BTreeMap<String, Cost> {
         .unwrap_or_default()
 }
 
-/// What `--update-ratchet` writes back to the committed seed, before this run's own
-/// measurements go over it: for each library the graph still holds, the LATER of its
-/// committed row and this clone's history row (another host's newer measurement is not
-/// undone by an older one here; a row that names no time is the oldest), and no row for
-/// a library that left the graph (a deleted crate is not carried back in from a history).
+/// Merges existing seed rows with `history` for `--update-ratchet`.
 #[must_use]
 pub fn seed_rows(
     committed: BTreeMap<String, Cost>,
@@ -868,7 +765,7 @@ pub fn seed_rows(
     all
 }
 
-/// Read the cost history; rows that do not parse are skipped (it only orders a run).
+/// Parses cost history text into a map by row name.
 #[must_use]
 pub fn parse_costs(text: &str) -> BTreeMap<String, Cost> {
     text.lines()
@@ -888,9 +785,7 @@ pub fn parse_costs(text: &str) -> BTreeMap<String, Cost> {
         .collect()
 }
 
-/// The run order: libraries with no cost first (one could be the longest of all), in the
-/// given order, then the rest by CPU seconds, longest first. A library is heavy when its
-/// largest process reached [`HEAVY_BYTES`], or nothing says it did not.
+/// Orders `names` for execution: unknown cost first, then descending duration.
 #[must_use]
 pub fn order(names: &[&str], costs: &BTreeMap<String, Cost>) -> Vec<(usize, bool)> {
     let mut idx: Vec<usize> = (0..names.len()).collect();
@@ -908,34 +803,31 @@ pub fn order(names: &[&str], costs: &BTreeMap<String, Cost>) -> Vec<(usize, bool
         .collect()
 }
 
-/// One check a slot runs.
+/// Single verification check scheduled on a slot.
 #[derive(Clone, Debug)]
 pub struct Job {
     pub slot: usize,
     pub name: String,
     pub argv: Vec<String>,
     pub log: PathBuf,
-    /// `--report-dir`, under `--obligations`.
+    /// Per-check `--report-dir` when `--obligations` is enabled.
     pub report: Option<PathBuf>,
-    /// The slot's `CARGO_TARGET_DIR`, named when the check starts.
+    /// Slot `CARGO_TARGET_DIR` assigned when the check starts.
     pub target: PathBuf,
     pub heavy: bool,
-    /// A fork's lockfile, named when the check starts ([`fork_lock`]).
+    /// Fork `Cargo.lock` state tracked when checking a fork by manifest path ([`fork_lock`]).
     pub lock: Option<ForkLock>,
 }
 
-/// The lockfile cargo writes beside a fork's manifest when the fork is checked by its
-/// own path: a fork resolves on its own, never in the root lock.
+/// Lockfile path and pre-existence flag for a fork check.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ForkLock {
     pub path: PathBuf,
-    /// It was not there when the check started: this run's check created it, and a
-    /// lockfile left in vendor/ fails the forge's provenance check.
+    /// Whether this check created the lockfile (and must remove it afterward).
     pub created: bool,
 }
 
-/// The lockfile the check of `argv` (one with `--manifest-path`) uses in `repo`, and
-/// whether it is there now; `None` for a check by `-p`.
+/// Determines the [`ForkLock`] for `argv` in `repo`, if `--manifest-path` is used.
 #[must_use]
 pub fn fork_lock(repo: &Path, argv: &[String]) -> Option<ForkLock> {
     let path = repo.join(manifest_of(argv)?).parent()?.join("Cargo.lock");
@@ -945,73 +837,69 @@ pub fn fork_lock(repo: &Path, argv: &[String]) -> Option<ForkLock> {
     })
 }
 
-/// How a check ended.
+/// Exit status and resource usage of a finished check.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Ended {
-    /// Its exit status, 128 + N for a signal.
+    /// Exit status (`128 + signal` if signaled).
     pub code: i32,
-    /// User + system CPU of it and every process it reaped.
+    /// Total user and system CPU time across the check and reaped children.
     pub cpu: Duration,
-    /// Its largest process's resident peak, bytes.
+    /// Peak resident set size in bytes.
     pub maxrss: u64,
 }
 
-/// A running check.
+/// Handle to a running verification check.
 pub trait Check {
-    /// `Some` once it has ended (and is reaped).
+    /// Polls whether the check has finished and been reaped.
     ///
     /// # Errors
-    /// It cannot be waited for.
+    /// Returns an error if waiting on the child process fails.
     fn poll(&mut self) -> std::io::Result<Option<Ended>>;
-    /// End it and everything it started, trustd left alone, and reap it.
+    /// Terminates the check process tree (leaving `trustd` alone) and reaps it.
     fn end(&mut self) -> Ended;
 }
 
-/// What the slots run checks with: the real prover, or a test's.
+/// Execution backend that spawns and monitors slot checks.
 pub trait Checks {
-    /// Start `job` in its slot, naming the slot's target directory in it.
+    /// Starts `job` in its assigned slot target directory.
     ///
     /// # Errors
-    /// The driver could not be started: nothing this run decides.
+    /// Returns an error if the driver process cannot be spawned.
     fn start(&mut self, job: &mut Job) -> std::io::Result<Box<dyn Check>>;
-    /// This build's trustd serves the socket, held for the run: a second check may start.
+    /// Whether this build's `trustd` currently holds the socket.
     fn trustd_held(&self) -> bool;
-    /// What the socket holds now (`<none|ours|foreign|silent>\t<what>`), for a check
-    /// targo would not start.
+    /// Probes the current `trustd` socket state (`<none|ours|foreign|silent>\t<detail>`).
     fn probe_trustd(&mut self) -> String;
-    /// The run was interrupted.
+    /// Whether the run was interrupted by a signal.
     fn interrupted(&self) -> bool;
-    /// Time since the slots started.
+    /// Elapsed time since slot execution began.
     fn now(&self) -> Duration;
-    /// Wait a poll's length.
+    /// Sleeps for one poll interval.
     fn pause(&mut self);
 }
 
-/// A check that ended, as the slots saw it.
+/// Completed check result reported by [`run_slots`].
 #[derive(Clone, Debug)]
 pub struct Finished {
     pub job: Job,
     pub ended: Ended,
     pub wall: Duration,
-    /// The budget ended it.
+    /// Whether the check was terminated for exceeding its wall-clock budget.
     pub over_budget: bool,
 }
 
-/// Why the slots stopped before their queue was done.
+/// Reason [`run_slots`] stopped before draining its queue.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Stopped {
     Interrupted,
-    /// A check could not be started at all.
+    /// A check process could not be spawned.
     Unstartable(String),
 }
 
-/// Runs `jobs` (already in order, each with its slot unset) on `slots` slots, at most
-/// `heavy` heavy ones at once, each ended at `budget`; a second check starts only while
-/// [`Checks::trustd_held`]. `done` sees each check as it ends, before its slot is reused
-/// (its dep-info is the slot's newest).
+/// Runs `jobs` across `slots` concurrent slots (at most `heavy` heavy checks at once).
 ///
 /// # Errors
-/// An interrupt, or a check that could not be started: every running check is ended.
+/// Returns [`Stopped`] if interrupted or if a check fails to spawn.
 pub fn run_slots(
     jobs: Vec<Job>,
     slots: usize,
@@ -1096,12 +984,10 @@ pub fn run_slots(
     }
 }
 
-/// What a check leaves beside its log once it ends, for the judge: its exit status, the
-/// budget that ended it, and what the trustd socket held when targo would not start it.
-/// A fork's lockfile ([`ForkLock`]) the check created goes.
+/// Writes sidecar status, budget, and `trustd` marks for the judge after a check ends.
 ///
 /// # Errors
-/// A mark the judge needs could not be written.
+/// Returns an error if any sidecar mark file cannot be written.
 pub fn record(
     f: &Finished,
     budget: Duration,
@@ -1126,33 +1012,21 @@ pub fn record(
     Ok(())
 }
 
-// A run
-
 /// What a run needs of the machine: its prover, the graph that prover resolves, and
-/// checks run beside that prover's trustd. [`run`] uses the machine's ([`Machine`]); a
-/// test brings its own.
 trait Bench {
     /// The toolchain every compile of the run uses: [`Config::prover`], else the one
-    /// the cut builds with.
-    ///
     /// # Errors
     /// Why there is none.
     fn driver(&mut self, cfg: &Config) -> Result<Driver, String>;
     /// `targo metadata --format-version 1 --all-features` of `repo` by `driver`, as it
-    /// printed it.
-    ///
     /// # Errors
     /// Why it printed none.
     fn metadata(&mut self, driver: &Driver, repo: &Path) -> Result<Vec<u8>, String>;
     /// The cargo home the lane's compiles read: `$HOME/.cargo` (the lane passes HOME,
-    /// and neither `CARGO_HOME` nor `TARGO_HOME`).
     fn cargo_home(&self) -> String;
     /// The directory of the user's cache a fallback target root goes under
-    /// ([`cache_base`]); `None` with no home to hold one.
     fn cache(&self) -> Option<PathBuf>;
     /// Run `jobs` on `slots` slots ([`run_slots`]) beside this prover's trustd, `done`
-    /// seeing each check as it ends.
-    ///
     /// # Errors
     /// Why nothing was decided: every check it started is ended.
     fn checks(
@@ -1180,12 +1054,6 @@ impl Bench for Machine {
     }
 
     fn metadata(&mut self, driver: &Driver, repo: &Path) -> Result<Vec<u8>, String> {
-        // From the pinned driver: another toolchain's resolve could gate members this targo
-        // resolves otherwise. With every feature: a path package reachable only through an
-        // off-by-default feature is still forked code this tree builds, so it is decided
-        // like any fork and verified with the feature union a full build can turn on.
-        // Members are gated with their default features, plus a row per feature that turns
-        // on fork code (`fork_features`). aterm-forge's direct_vendor reads the same graph.
         let o = command(&driver.targo)
             .args(["metadata", "--format-version", "1", "--all-features"])
             .env_clear()
@@ -1294,7 +1162,6 @@ struct Prepared {
     cores: usize,
     costs_path: Option<PathBuf>,
     /// Every library the graph holds, by its row name: the committed cost seed keeps
-    /// rows for these alone ([`seed_rows`]).
     libraries: BTreeSet<String>,
     _lock: RunLock,
 }
@@ -1320,8 +1187,7 @@ impl From<String> for Stop {
     }
 }
 
-/// Runs the lane (`ship trust run`): progress and the judge's report go to `out`, and a run
-/// that decides nothing says why (`trust: COULD NOT RUN — …`).
+/// Executes the trust lane (`ship trust run`), writing progress and verdict output to `out`.
 pub fn run(cfg: &Config, out: &mut dyn Write) -> Outcome {
     crate::interrupt::install();
     run_on(cfg, &mut Machine, out)
@@ -1331,7 +1197,6 @@ fn run_on(cfg: &Config, bench: &mut dyn Bench, out: &mut dyn Write) -> Outcome {
     let ran = match prepare(cfg, bench, out) {
         Ok(prep) => {
             let judged = check_and_conclude(cfg, &prep, bench, out).map_err(Stop::CouldNotRun);
-            // the next run empties what this could not
             let _ = clear_slots(&prep.root);
             judged
         }
@@ -1381,12 +1246,8 @@ fn prepare(cfg: &Config, bench: &mut dyn Bench, out: &mut dyn Write) -> Result<P
     )?;
     if let Some(mine) = &mine {
         if *mine == root {
-            // This selected fallback root names its checkout without following an
-            // unknown marker into another file. Only the directory entry is replaced.
             write_checkout_record(&root, &canonical_repo(cfg))
                 .map_err(|e| format!("{}: {e}", root.join(CHECKOUT_RECORD).display()))?;
-            // The later reaper acts on this selected fallback too. Recheck every
-            // authority file and the held lock before handing the root to the bench.
             use std::os::unix::fs::MetadataExt as _;
             let stable_lock = lock
                 .0
@@ -1404,8 +1265,6 @@ fn prepare(cfg: &Config, bench: &mut dyn Bench, out: &mut dyn Write) -> Result<P
         } else if cleanup_checkout(mine).as_deref() == Some(canonical_repo(cfg).as_path())
             && retire(mine)
         {
-            // The checkout's own root is admitted again (a `chmod go-w` the fallback's
-            // note gave): what a killed fallback run left would otherwise stay for good.
             let _ = writeln!(
                 out,
                 "trust: removed {}, this checkout's fallback target root, now that {} is admitted",
@@ -1426,15 +1285,7 @@ fn prepare(cfg: &Config, bench: &mut dyn Bench, out: &mut dyn Write) -> Result<P
             );
         }
     }
-    // Only a run that files reads its slots' dep-info, and needs the prover's identity
-    // (a hash of the whole toolchain).
     let files = matches!(cfg.scope, Scope::WholeTree | Scope::Remeasure);
-    // THE SLOTS START EMPTY: a check a killed run left is ended and every slot goes, so
-    // each dep-info file the judge reads at the end was written by this run's compiles.
-    // Where a file is says whose it is; its stamp could not (it is its file system's
-    // clock, which can lag the wall clock). A run that files stops on a slot it cannot
-    // empty; a -p run reads none, and its checks name their units by a fresh session
-    // nonce, so it says so and goes on.
     reap_stale_checks(&root);
     if let Err(e) = clear_slots(&root) {
         let why = format!("{}: a slot could not be emptied ({e})", root.display());
@@ -1459,7 +1310,6 @@ fn prepare(cfg: &Config, bench: &mut dyn Bench, out: &mut dyn Write) -> Result<P
         .map_err(|e| format!("targo metadata printed no JSON: {e}"))?;
     let repo = cfg.repo.clone();
     let libs = gate_list(&meta, &|m| profile_rows_for(m, &repo))?;
-    // A run over the whole tree answers for every library the floors name.
     let gone = if files {
         let floors = cfg.repo.join(trust_facts::RATCHET);
         let text = fs::read_to_string(&floors)
@@ -1575,8 +1425,6 @@ fn prepare(cfg: &Config, bench: &mut dyn Bench, out: &mut dyn Write) -> Result<P
             s.decision.word()
         ));
     }
-    // A library whose floor this host's verifier ceiling cannot reproduce is refused up
-    // front, never run (the judge's `admit`).
     let parsed = Plan::parse(&plan)?;
     let (admit_lines, refusals) = parsed.admit()?;
     plan.push_str(&admit_lines);
@@ -1623,7 +1471,6 @@ fn check_and_conclude(
         .iter()
         .filter(|s| matches!(s.decision, Decision::Gate(_)) && !prep.refused.contains(&s.lib.name))
         .collect();
-    // A log is this run's or nothing: one an earlier run left would read as this one's.
     for stale in [".trustd-grants", ".trustd-seen"] {
         let _ = fs::remove_file(prep.logdir.join(stale));
     }
@@ -1680,16 +1527,12 @@ fn check_and_conclude(
             }
         };
         let ran = bench.checks(cfg, prep, jobs, slots, &mut done, out);
-        // Every record is written before the judge reads one; a run that decided
-        // nothing reduces no more.
         if let Some(r) = reducer {
             r.finish(ran.is_err());
         }
-        // A finished check's cost stands however the run ended.
         write_costs(prep.costs_path.as_deref(), &new_costs, out);
         ran?;
     }
-    // The plan's filing part, then the judge.
     let mut plan = prep.plan.clone();
     plan.push_str(&format!("trustd {}\n", trustd::socket().display()));
     if let Some(f) = &prep.files {
@@ -1743,9 +1586,6 @@ fn check_and_conclude(
     let done = trust_facts::conclude(&git, &cfg.repo, &mut parsed, update)
         .map_err(|e| format!("the judge could not conclude: {e}"))?;
     if cfg.update_ratchet && !new_costs.is_empty() {
-        // The seed follows the floors, written after the filing as they are: the later
-        // of the seed's and this clone's row for every library still in the graph,
-        // this run's measurements over them.
         let history = prep
             .costs_path
             .as_deref()
@@ -1774,8 +1614,6 @@ fn check_and_conclude(
 }
 
 /// `--obligations`: each check's proof report reduced on a thread of its own, so a
-/// report of gigabytes never holds the slots (no check polled or held to its budget
-/// meanwhile).
 struct Reducer {
     tx: Option<std::sync::mpsc::Sender<Job>>,
     skip: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -1813,7 +1651,6 @@ impl Reducer {
     }
 
     /// Wait for every reduction sent; with `skip`, those not begun only lose their
-    /// report.
     fn finish(mut self, skip: bool) {
         self.skip.store(skip, std::sync::atomic::Ordering::SeqCst);
         self.join();
@@ -1834,7 +1671,6 @@ impl Drop for Reducer {
 }
 
 /// The cost of a check that finished (a Summary, nothing cutting it short): what the
-/// order reads next time. A check that did not finish measured only part of its library.
 fn finished_cost(f: &Finished) -> Option<Cost> {
     if f.over_budget {
         return None;
@@ -1850,7 +1686,6 @@ fn finished_cost(f: &Finished) -> Option<Cost> {
 }
 
 /// Fold `new` into the cost history, one write: it only orders runs, so a write that
-/// fails is said and decides nothing.
 fn write_costs(path: Option<&Path>, new: &BTreeMap<String, Cost>, out: &mut dyn Write) {
     let Some(path) = path.filter(|_| !new.is_empty()) else {
         return;
@@ -1863,7 +1698,6 @@ fn write_costs(path: Option<&Path>, new: &BTreeMap<String, Cost>, out: &mut dyn 
 }
 
 /// Write `all` under `header` to `path`, atomically, each row stamped with when it was
-/// measured (now, for a row that named no time); a write that fails is said.
 fn write_cost_file(path: &Path, header: &str, all: &BTreeMap<String, Cost>, out: &mut dyn Write) {
     let now = utc_now();
     let mut text = header.to_string();
@@ -1891,7 +1725,6 @@ fn write_cost_file(path: &Path, header: &str, all: &BTreeMap<String, Cost>, out:
 }
 
 /// `--obligations`: reduce the check's proof report beside its log. Retire
-/// the raw directory only after success; a refusal keeps its input for diagnosis.
 fn reduce_report(job: &Job, repo: &Path) {
     let Some(report) = &job.report else {
         return;
@@ -1922,7 +1755,6 @@ fn reduce_report(job: &Job, repo: &Path) {
 }
 
 /// `<head> <tree>` when the checkout is HEAD's bytes ([`crate::clean::strictly_clean`]),
-/// else `None`: a run files facts under HEAD's tree for what its checks compiled.
 fn tree_state(repo: &Path) -> Option<(String, String)> {
     if !crate::clean::strictly_clean(repo)? {
         return None;
@@ -1933,8 +1765,6 @@ fn tree_state(repo: &Path) -> Option<(String, String)> {
 }
 
 /// The slots are scratch: every check names its units by a fresh session nonce, so
-/// nothing one check builds is reused, and a kept slot only grows.
-///
 /// # Errors
 /// A slot that could not be removed (the first such error).
 fn clear_slots(root: &Path) -> std::io::Result<()> {
@@ -1958,7 +1788,6 @@ fn clear_slots(root: &Path) -> std::io::Result<()> {
 }
 
 /// End the checks a killed run left (`.check.<slot>` names each by pid and start
-/// time), so no orphaned verifier runs on for hours.
 fn reap_stale_checks(root: &Path) {
     let Ok(rd) = fs::read_dir(root) else {
         return;
@@ -1981,7 +1810,6 @@ fn reap_stale_checks(root: &Path) {
 }
 
 /// This host's RAM in bytes and whether that is Linux's MemTotal (a few percent under
-/// what the machine was sold with); 0 when it cannot be read.
 fn host_memory() -> (u64, bool) {
     if let Some(b) = crate::artifact::host_memory_bytes() {
         return (b, false);
@@ -2008,36 +1836,27 @@ fn push_kv(plan: &mut String, k: &str, v: &str) {
     plan.push('\n');
 }
 
-// Where a run's slots go, and the toolchain they are checked with
-
-/// The checkout's own target root, `<repo>/target-trust.noindex`: a folder named
-/// `*.noindex` is skipped by Spotlight with all it holds, so no check's intermediates
-/// feed `mds_stores`.
+/// Default checkout-local target directory name (`target-trust.noindex`).
 pub(crate) const OWN_ROOT: &str = "target-trust.noindex";
 
 /// The checkout's own target root before it was named for Spotlight to skip: a run
-/// with no `--target-root` says when one is left, since nothing builds there now.
 const LEGACY_ROOT: &str = "target-trust";
 
 /// The fallback target roots' directory in the user's cache, beside the Linux worker's
-/// `aterm-linux-worker`.
 const CACHE_DIR: &str = "aterm-trust-lane";
 
 /// macOS's: `~/Library/Caches` is indexed, and a `.noindex` name is the Spotlight exclusion
-/// measured to work (the release cache's, `crate::snapshot::CacheRoot`).
 const MAC_CACHE_DIR: &str = "Library/Caches/aterm-trust-lane.noindex";
 
 /// The file in a fallback root that names its checkout ([`prune_orphans`]).
 const CHECKOUT_RECORD: &str = ".checkout";
 
-/// A component `targo trust` refuses, why, and the `chmod` that clears it when that is
-/// the caller's to run.
+/// Path component refused by `targo trust` along with its reason and optional `chmod` fix.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Refused {
     pub dir: PathBuf,
     pub why: String,
-    /// The `chmod` mode that clears the refusal (`go-w`, or `a-st` for a launcher's
-    /// special bits) when the caller owns it and only its mode is refused.
+    /// `chmod` mode (`go-w` or `a-st`) that clears the refusal when owned by the current user.
     pub chmod: Option<&'static str>,
 }
 
@@ -2055,8 +1874,7 @@ impl Refused {
         })
     }
 
-    /// What to do: run [`Refused::chmod`] on an object of the caller's that only its mode
-    /// keeps out, else `elsewhere` (another owner's object is not the caller's to change).
+    /// Formats the remediation advice for this refusal.
     pub(crate) fn fix(&self, elsewhere: &str) -> String {
         self.chmod_command()
             .map_or_else(|| elsewhere.to_string(), |c| format!("run: {c}"))
@@ -2067,9 +1885,6 @@ impl Refused {
 const ELSEWHERE_ROOT: &str = "give --target-root a directory under one you own";
 
 /// A run's target root: where; for a default root, this checkout's directory of the
-/// user's cache (the root itself when it falls back, else one an earlier fallback run may
-/// have left, which the run retires), beside the others whose orphans it prunes; and the
-/// line saying why it is not `<repo>/target-trust.noindex`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Root {
     path: PathBuf,
@@ -2078,8 +1893,6 @@ struct Root {
 }
 
 /// The line a default run prints when the checkout still holds the root it used before
-/// [`OWN_ROOT`] (a directory, never followed through a link): left for its owner to
-/// remove, because an older run may still hold it or its logs may still be read.
 fn legacy_root_note(cfg: &Config) -> Option<String> {
     if cfg.target_root.is_some() {
         return None;
@@ -2098,7 +1911,6 @@ fn legacy_root_note(cfg: &Config) -> Option<String> {
 }
 
 /// The line a run with a named `--target-root` prints on macOS when no component of it
-/// is named `*.noindex`: Spotlight indexes every file the run writes there.
 fn indexed_root_note(cfg: &Config, root: &Path) -> Option<String> {
     let skipped = |p: &Path| {
         p.components().any(|c| {
@@ -2123,8 +1935,6 @@ fn canonical_repo(cfg: &Config) -> PathBuf {
 }
 
 /// This run's target root: `--target-root` (relative to the checkout) as named, refused
-/// up front when `targo trust` would refuse a component of it, which would read as every
-/// check failing; else [`choose_root`]'s, the fallback under `cache`.
 fn target_root(cfg: &Config, cache: Option<&Path>) -> Result<Root, String> {
     if let Some(named) = &cfg.target_root {
         let path = if named.is_absolute() {
@@ -2156,8 +1966,6 @@ fn target_root(cfg: &Config, cache: Option<&Path>) -> Result<Root, String> {
 }
 
 /// The directory the fallback roots go under: macOS's `~/Library/Caches/aterm-trust-lane.noindex`;
-/// elsewhere `aterm-trust-lane` in `$XDG_CACHE_HOME` when that is absolute (the XDG rule:
-/// a relative one is ignored), else in `~/.cache`. `None` with no absolute home to put it in.
 fn cache_base(home: Option<&Path>, xdg_cache: Option<&Path>, macos: bool) -> Option<PathBuf> {
     let home = home.filter(|h| h.is_absolute());
     if macos {
@@ -2171,8 +1979,6 @@ fn cache_base(home: Option<&Path>, xdg_cache: Option<&Path>, macos: bool) -> Opt
 }
 
 /// A checkout's fallback root's name: its directory's name, then the first 12 hex of the
-/// SHA-256 of its canonical path. Per worktree, never per clone: two worktrees of one
-/// clone each hold their own run lock.
 fn checkout_key(repo: &Path) -> String {
     use std::os::unix::ffi::OsStrExt as _;
     let name: String = repo
@@ -2199,10 +2005,6 @@ fn checkout_key(repo: &Path) -> String {
 }
 
 /// The default target root: `<repo>/target-trust.noindex` wherever `targo trust` admits it (no
-/// change on a checkout writable by its owner alone), else `<cache>/<key>` (`cache` from
-/// [`cache_base`], `key` from [`checkout_key`]), said on one line; `refused` answers for a
-/// path as [`refused_component`] does.
-///
 /// # Errors
 /// Neither is admitted: each refusal and its fix.
 fn choose_root(
@@ -2271,7 +2073,6 @@ fn checkout_record(repo: &Path) -> Vec<u8> {
 }
 
 /// A real caller-owned cache directory under the existing target-root admission.
-/// Unknown metadata and another principal's writable path never admit automatic cleanup.
 fn owned_cache_dir(path: &Path) -> bool {
     use std::os::unix::fs::MetadataExt as _;
     let me = proc_tree::euid();
@@ -2281,7 +2082,6 @@ fn owned_cache_dir(path: &Path) -> bool {
     if !md.is_dir() || md.uid() != me || md.mode() & 0o022 != 0 {
         return false;
     }
-    // The existing component rule, but a cleanup cannot skip an unreadable chain.
     for logical in path.ancestors() {
         let Ok(physical) = fs::canonicalize(logical) else {
             return false;
@@ -2309,7 +2109,6 @@ fn owned_cache_file(path: &Path) -> Option<fs::Metadata> {
 }
 
 /// Admit an existing fallback lock without following links, or make a new owner-only
-/// one exclusively. The automatic root must not reach RunLock's writer on an unknown file.
 fn prepare_cache_lock(root: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::OpenOptionsExt as _;
     let path = root.join(".run.lock");
@@ -2322,8 +2121,6 @@ fn prepare_cache_lock(root: &Path) -> std::io::Result<()> {
     if !root.parent().is_some_and(owned_cache_dir) || !owned_cache_dir(root) {
         return Err(refused());
     }
-    // The selected automatic root is reaped after preparation. Refuse unknown
-    // stale-check entries before RunLock can write or any PID record is read.
     for entry in fs::read_dir(root)? {
         let entry = entry?;
         if entry.file_name().to_string_lossy().starts_with(".check.")
@@ -2350,7 +2147,6 @@ fn prepare_cache_lock(root: &Path) -> std::io::Result<()> {
 }
 
 /// Replace the selected fallback root's checkout marker through exclusive scratch,
-/// never by truncating/chmoding the target of an existing symlink or hard link.
 fn write_checkout_record(root: &Path, repo: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
     let marker = root.join(CHECKOUT_RECORD);
@@ -2372,8 +2168,6 @@ fn write_checkout_record(root: &Path, repo: &Path) -> std::io::Result<()> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(e),
     }
-    // An existing caller-owned regular marker may have a weak old umask. Replace
-    // it with a fresh 0644 file; its old contents never authorize this selected run.
     let scratch = aterm_tempfile::Builder::new()
         .prefix(".checkout-")
         .tempdir_in(root)?;
@@ -2389,14 +2183,12 @@ fn write_checkout_record(root: &Path, repo: &Path) -> std::io::Result<()> {
 }
 
 /// The checkout an automatic cleanup may act for. All authority files and the
-/// cache/child directory are admitted before a run lock can be opened or a PID read.
 fn cleanup_checkout(dir: &Path) -> Option<PathBuf> {
     use std::os::unix::ffi::OsStrExt as _;
     if !owned_cache_dir(dir.parent()?) || !owned_cache_dir(dir) {
         return None;
     }
     owned_cache_file(&dir.join(CHECKOUT_RECORD))?;
-    // A real run made this lock. A missing, weak, linked or unknown lock is retained.
     owned_cache_file(&dir.join(".run.lock"))?;
     for entry in fs::read_dir(dir).ok()? {
         let entry = entry.ok()?;
@@ -2413,7 +2205,6 @@ fn cleanup_checkout(dir: &Path) -> Option<PathBuf> {
 }
 
 /// Retire an admitted fallback root under its own existing run lock. The selected
-/// explicit run-root cleanup remains separate. Unknown cache state is left alone.
 fn retire(dir: &Path) -> bool {
     use std::os::unix::fs::MetadataExt as _;
     let Some(checkout) = cleanup_checkout(dir) else {
@@ -2438,7 +2229,6 @@ fn retire(dir: &Path) -> bool {
 }
 
 /// Retire only admitted cache children whose matching recorded checkout is known
-/// missing. Read/metadata failures, unknown entries and unadmitted caches are preserved.
 fn prune_orphans(cache: &Path, own: &Path) -> Vec<(PathBuf, PathBuf)> {
     let mut gone = Vec::new();
     if !owned_cache_dir(cache) {
@@ -2465,11 +2255,7 @@ fn prune_orphans(cache: &Path, own: &Path) -> Vec<(PathBuf, PathBuf)> {
     gone
 }
 
-/// A path component `targo trust` refuses for a verified runtime-library directory
-/// under `root` (one a principal other than the caller could swap): owned by neither
-/// root nor the caller, or group- or world-writable. Each logical ancestor of the
-/// deepest existing one is checked along its whole physical chain, since targo holds
-/// the directory that holds each symlink to the same rule.
+/// Checks whether any path component of `root` would be refused by `targo trust`.
 pub(crate) fn refused_component(root: &Path) -> Option<Refused> {
     let me = proc_tree::euid();
     let mut p = root.to_path_buf();
@@ -2483,7 +2269,6 @@ pub(crate) fn refused_component(root: &Path) -> Option<Refused> {
 }
 
 /// The first of `path`'s physical chain (it, then each directory above it) `targo trust`
-/// refuses ([`component_refusal`]).
 fn physical_chain_refusal(path: &Path, me: u32) -> Option<Refused> {
     let phys = fs::canonicalize(path).ok()?;
     phys.ancestors().find_map(|dir| {
@@ -2493,8 +2278,6 @@ fn physical_chain_refusal(path: &Path, me: u32) -> Option<Refused> {
 }
 
 /// [`component_refusal`] of the object at `path`, `acl` asking whether an ACL lets the
-/// caller write one another owns (targo asks it of a path component, not of what a
-/// runtime-library directory holds).
 fn refused_object(path: &Path, md: &fs::Metadata, me: u32, acl: bool) -> Option<Refused> {
     use std::os::unix::fs::MetadataExt as _;
     component_refusal(md.uid(), md.mode(), me, || acl && proc_tree::writable(path)).map(|why| {
@@ -2506,10 +2289,7 @@ fn refused_object(path: &Path, md: &fs::Metadata, me: u32, acl: bool) -> Option<
     })
 }
 
-/// Make `dir` and each missing parent as [`refused_component`] admits them: writable by
-/// their owner alone (`0755`, less what the caller's umask takes away). The target root and
-/// its slots lie above every runtime-library directory a check makes, and a login's umask
-/// `002` (Ubuntu's) would make them `0775`, which `targo trust` refuses whatever the group.
+/// Creates `dir` and missing parents with owner-only write permissions (`0o755`).
 pub(crate) fn owner_dirs(dir: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::DirBuilderExt as _;
     fs::DirBuilder::new()
@@ -2519,8 +2299,6 @@ pub(crate) fn owner_dirs(dir: &Path) -> std::io::Result<()> {
 }
 
 /// Why `targo trust` refuses a directory owned by `uid` with `mode`, for the caller
-/// `me`: owned by neither root nor the caller, group- or world-writable (a sticky bit
-/// exempts nothing), or owned by another and still `writable` by the caller (an ACL).
 fn component_refusal(
     uid: u32,
     mode: u32,
@@ -2540,22 +2318,10 @@ fn component_refusal(
         .then(|| format!("writable by you through an ACL although uid={uid} owns it"))
 }
 
-/// What `targo trust` would refuse to execute or load from the toolchain whose physical
-/// `bin/` is `bin`, before it verifies anything (targo's `process_authority`, trustd's
-/// executable check):
-/// - each launcher (`targo`, the `trustc` targo runs as the compiler, and `trustd`): a
-///   plain file held to [`component_refusal`], on a physical chain held to it too; and
-///   `targo` and `trustc`, which targo opens as verified tool launchers, with no setuid,
-///   setgid or sticky bit ([`special_bits_refusal`]);
-/// - each runtime-library directory, as targo lists them from the sysroot (`bin/..`):
-///   `lib`, every `lib/rustlib/<target>/lib`, and `<sysroot>-rustc/*/release/deps` beside
-///   it; reached through plain directories only, held to the rule along its physical chain,
-///   and each entry in it a plain file or directory of root's or the caller's that no group
-///   or world can write.
+/// Checks whether `targo trust` would refuse any binary or runtime library dir under `bin`.
 pub(crate) fn toolchain_refusal(bin: &Path) -> Option<Refused> {
     let me = proc_tree::euid();
     for tool in ["targo", "trustc", "trustd"] {
-        // `Driver::at` says what is missing.
         let Ok(path) = fs::canonicalize(bin.join(tool)) else {
             continue;
         };
@@ -2604,7 +2370,6 @@ pub(crate) fn toolchain_refusal(bin: &Path) -> Option<Refused> {
 }
 
 /// A verified tool launcher's mode bits targo refuses besides write (its
-/// `launcher_mode_is_safe`): setuid, setgid or sticky.
 fn special_bits_refusal(path: &Path, md: &fs::Metadata, me: u32) -> Option<Refused> {
     use std::os::unix::fs::MetadataExt as _;
     let mode = md.mode() & 0o7777;
@@ -2616,7 +2381,6 @@ fn special_bits_refusal(path: &Path, md: &fs::Metadata, me: u32) -> Option<Refus
 }
 
 /// The runtime-library directories targo lists for the toolchain at `sysroot`.
-///
 /// # Errors
 /// A component on the way to one that is there but is no plain directory.
 fn runtime_dirs(sysroot: &Path) -> Result<Vec<PathBuf>, Refused> {
@@ -2656,7 +2420,6 @@ fn runtime_dirs(sysroot: &Path) -> Result<Vec<PathBuf>, Refused> {
 }
 
 /// Whether `candidate` is there, reached from `root` through plain directories only.
-///
 /// # Errors
 /// A component that is there and is no plain directory (targo forbids a symlink inside a
 /// toolchain).
@@ -2690,12 +2453,11 @@ fn plain_dirs_to(root: &Path, candidate: &Path) -> Result<bool, Refused> {
     Ok(true)
 }
 
-/// One run per target root: a run empties the root's slots and ends what a killed run left
-/// there, so a second run on the same root would wreck the first.
+/// Exclusive file lock guarding a target root across concurrent lane runs.
 pub(crate) struct RunLock(fs::File);
 
 impl RunLock {
-    /// Take the lock at `path`, or say who holds it and `busy` (what to do).
+    /// Acquires the target-root lock at `path`, or returns an error naming the holder.
     pub(crate) fn take(path: &Path, busy: &str) -> Result<RunLock, String> {
         let f = fs::OpenOptions::new()
             .create(true)
@@ -2730,8 +2492,6 @@ impl Drop for RunLock {
     }
 }
 
-// The real checks
-
 struct RealChecks<'a> {
     driver: &'a Driver,
     repo: &'a Path,
@@ -2742,7 +2502,6 @@ struct RealChecks<'a> {
     want: &'a str,
     t0: Instant,
     /// Each fork lockfile a check used, and whether this run created it: what
-    /// [`record`] did not remove (a check an interrupt ended) goes after the slots.
     locks: BTreeMap<PathBuf, bool>,
 }
 
@@ -2876,12 +2635,7 @@ impl Check for RealCheck {
     }
 }
 
-// Process trees
-
 pub mod proc_tree {
-    //! A check's process tree: listed by parent pid (targo-trust starts its build in a
-    //! group of its own, so a group signal misses it), trustd and what it runs left
-    //! out (every run on the machine shares it, and a signalled one records DIRTY).
 
     use std::collections::BTreeSet;
     use std::time::Duration;
@@ -2903,14 +2657,14 @@ pub mod proc_tree {
         fn geteuid() -> u32;
     }
 
-    /// This process's effective uid.
+    /// Effective user ID of the current process.
     #[must_use]
     pub fn euid() -> u32 {
-        // SAFETY: `geteuid` takes nothing and cannot fail.
+        // SAFETY: `geteuid` takes no arguments and cannot fail.
         unsafe { geteuid() }
     }
 
-    /// Whether this process may write in `dir` (`access(2)`, so an ACL counts).
+    /// Whether the current process has write permission on `dir` (`access(2)`).
     #[must_use]
     pub fn writable(dir: &std::path::Path) -> bool {
         use std::os::unix::ffi::OsStrExt as _;
@@ -2918,18 +2672,16 @@ pub mod proc_tree {
         let Ok(c) = std::ffi::CString::new(dir.as_os_str().as_bytes()) else {
             return false;
         };
-        // SAFETY: `c` is a live NUL-terminated string `access` only reads.
+        // SAFETY: `c` is a live NUL-terminated string that `access` only reads.
         unsafe { access(c.as_ptr(), W_OK) == 0 }
     }
 
-    /// Start `cmd` as the leader of a session of its own: no controlling terminal to
-    /// stop it on, and a group no signal to the lane's reaches.
+    /// Configures `cmd` to start in a new session (`setsid`).
     pub fn new_session(cmd: &mut aterm_uds::spawnfd::Command) {
         cmd.setsid(true);
     }
 
-    /// A pid's start time (`ps -o lstart=`), `None` when no such process lives: a pid
-    /// the kernel reused is not the process recorded.
+    /// Start time (`ps -o lstart=`) of `pid`, or `None` if no such process exists.
     #[must_use]
     pub fn started(pid: u32) -> Option<String> {
         let out = aterm_uds::spawnfd::command("/bin/ps")
@@ -2956,8 +2708,7 @@ pub mod proc_tree {
             .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
     }
 
-    /// `root` and every descendant of it in a `ps -A -o pid=,ppid=,comm=` listing, but a
-    /// trustd (its command's last path component) and everything beneath one.
+    /// Returns `root` and all its non-`trustd` descendants from a `ps` listing.
     #[must_use]
     pub fn descendants(listing: &str, root: i32) -> Vec<i32> {
         let rows: Vec<(i32, i32, bool)> = listing
@@ -2994,10 +2745,7 @@ pub mod proc_tree {
         }
     }
 
-    /// Ends `root`'s whole tree, trustd's left out: stopped (listed again once stopped, so
-    /// nothing forked meanwhile is missed), sent SIGTERM and SIGCONT, given a second to go
-    /// (`gone` may reap `root`), then SIGKILLed. Once reaped, the root is never signalled
-    /// again: its pid may already name another process.
+    /// Stops, kills, and waits for `root`'s process tree while leaving `trustd` untouched.
     pub fn end_tree(root: u32, gone: &mut dyn FnMut() -> bool) {
         end_tree_with(root, gone, &mut listing, &mut send);
     }
@@ -3041,14 +2789,7 @@ pub mod proc_tree {
     }
 }
 
-// trustd, Trust's per-user memory jobserver
-
 pub mod trustd {
-    //! targo starts a check only beside the trustd packaged with it: it asks the daemon
-    //! on the socket for its IDENTITY (the SHA-256 of its executable), gives it half a
-    //! second, and refuses the check when the answer is another build's or none came.
-    //! The lane asks the same questions ([`probe`]) and holds a one-byte grant on this
-    //! build's trustd for the run ([`Keeper`]). Nothing here starts or signals a trustd.
 
     use std::io::{BufRead as _, BufReader, Read as _, Write as _};
     use std::os::unix::net::UnixStream;
@@ -3060,7 +2801,7 @@ pub mod trustd {
     /// targo's own deadline over connect, IDENTITY and STATUS.
     const TARGO_GIVES: Duration = Duration::from_millis(500);
 
-    /// Trust's per-user socket.
+    /// Path to `trustd`'s per-user Unix domain socket.
     #[must_use]
     pub fn socket() -> PathBuf {
         let tmp = std::fs::canonicalize("/tmp").unwrap_or_else(|_| PathBuf::from("/tmp"));
@@ -3068,7 +2809,7 @@ pub mod trustd {
             .join("trust-memory-jobserver.sock")
     }
 
-    /// The build identity a trustd answers IDENTITY with: its executable's SHA-256.
+    /// SHA-256 hex digest of `exe` used by `trustd` for `IDENTITY`.
     #[must_use]
     pub fn build_digest(exe: &Path) -> String {
         std::fs::read(exe)
@@ -3076,20 +2817,20 @@ pub mod trustd {
             .unwrap_or_default()
     }
 
-    /// What serves the socket.
+    /// What currently serves the `trustd` socket.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub enum Held {
-        /// Nothing: targo starts this build's.
+        /// Socket is absent or unconnected.
         None,
-        /// This build's, answering within targo's half second.
+        /// Served by this build's `trustd`.
         Ours,
-        /// Another build's, or one that answers no IDENTITY.
+        /// Served by another build's `trustd` or an unrecognized server.
         Foreign,
-        /// One that does not answer in time.
+        /// Connected but did not answer within the timeout.
         Silent,
     }
 
-    /// A probe of the socket.
+    /// Result of probing the `trustd` socket.
     #[derive(Clone, Debug, PartialEq, Eq)]
     pub struct Probe {
         pub held: Held,
@@ -3097,7 +2838,7 @@ pub mod trustd {
     }
 
     impl Probe {
-        /// `<none|ours|foreign|silent>\t<what>`, as a check's `.trustd` mark reads.
+        /// Formats `<none|ours|foreign|silent>\t<detail>` for a check's `.trustd` mark file.
         #[must_use]
         pub fn line(&self) -> String {
             let word = match self.held {
@@ -3203,9 +2944,7 @@ pub mod trustd {
         (p, t0.elapsed())
     }
 
-    /// What serves `sock`, each answer given `wait`. This build's trustd slower than
-    /// targo's half second three times running is [`Held::Silent`]: targo would refuse
-    /// every check beside it.
+    /// Probes `sock` against expected identity `want` with timeout `wait`.
     #[must_use]
     pub fn probe(sock: &Path, want: &str, wait: Duration) -> Probe {
         let mut took = Duration::ZERO;
@@ -3226,11 +2965,10 @@ pub mod trustd {
         }
     }
 
-    /// Before any check: wait up to `wait` for the socket to hold this build's trustd
-    /// or nothing.
+    /// Waits up to `wait` for `sock` to hold this build's `trustd` or nothing.
     ///
     /// # Errors
-    /// What held it through the wait, and what to do.
+    /// Returns an error describing what held the socket past `wait` and how to resolve it.
     pub fn wait_usable(
         sock: &Path,
         want: &str,
@@ -3276,11 +3014,7 @@ pub mod trustd {
         }
     }
 
-    /// While it lives, a one-byte grant on this build's trustd, so trustd does not go idle
-    /// while a check compiles; [`Keeper::held`] says the grant is live. It writes how many
-    /// grants it took to `grants` and what held the socket instead to `seen`. It never
-    /// starts or signals a trustd. Dropping it requests shutdown, closes the registered
-    /// connection and joins the keeper thread.
+    /// Holds a one-byte lease on this build's `trustd` so it does not idle out mid-run.
     pub struct Keeper {
         stop: Arc<AtomicBool>,
         held: Arc<AtomicBool>,
@@ -3344,7 +3078,6 @@ pub mod trustd {
 
     impl Kept {
         /// Register the cloned connection before waiting on it. A failed clone
-        /// or a stopping keeper refuses the wait: drop must be able to shut it.
         fn name(&self, stream: std::io::Result<UnixStream>) -> bool {
             let Ok(stream) = stream else { return false };
             let mut c = self
@@ -3504,7 +3237,6 @@ mod tests {
     }
 
     /// A resolved graph: two members (one bin-only), a fork with resolved features,
-    /// a registry package, all under `/ws`.
     fn meta() -> aterm_json::Value {
         aterm_json::from_str(
             r#"{
@@ -3532,8 +3264,6 @@ mod tests {
     }
 
     /// A member by `-p name@version --lib`, a bin-only member with nothing to check, a fork
-    /// by its own manifest with its resolved features, registry packages never; members
-    /// before forks; the lane profile first.
     #[test]
     fn the_gate_list_is_derived_from_the_resolved_graph() {
         let libs = gate_list(&meta(), &rows_none).unwrap();
@@ -3570,7 +3300,6 @@ mod tests {
     }
 
     /// A member and a path fork of one name each have their own floor row; the package's name
-    /// selects both, a spec selects one, and neither is AMBIGUOUS.
     #[test]
     fn two_versions_of_one_name_are_named_by_their_specs() {
         let mut meta = meta();
@@ -3661,10 +3390,6 @@ mod tests {
     }
 
     /// `sealed` names the fork `bus`, and `framed` the fork `wire` through its renamed,
-    /// optional dependency key; a feature the default build turns on (`std`), one that names
-    /// no package (`dev-seams`) and one that names a registry package (`derive`) get no row.
-    /// `-p link` selects every row of link's library, `-p link+sealed` that row alone, and a
-    /// floor row whose feature left the graph is FORK-VANISHED.
     #[test]
     fn a_member_feature_that_turns_on_fork_code_is_gated_as_a_row_of_its_own() {
         let meta: aterm_json::Value = aterm_json::from_str(
@@ -3848,8 +3573,6 @@ mod tests {
         );
         assert!(out.is_empty());
 
-        // THE SEED: what a clone with no history orders by; a history row wins, and a
-        // library the history lacks takes the seed's.
         let seed = d.path().join("costs.tsv");
         write_cost_file(
             &seed,
@@ -3869,7 +3592,6 @@ mod tests {
         assert_eq!(read_costs(Some(&none), &seed).len(), 2, "a fresh clone");
         assert_eq!(read_costs(None, &seed).len(), 2, "no state at all");
         assert!(read_costs(None, &none).is_empty(), "every library heavy");
-        // the committed seed is one a fresh clone reads
         let committed = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../..")
             .join(trust_facts::COSTS);
@@ -3879,8 +3601,6 @@ mod tests {
             committed.display()
         );
     }
-
-    // -- the slots, over a prover a test drives ---------------------------------
 
     #[derive(Default)]
     struct World {
@@ -4152,7 +3872,6 @@ mod tests {
             "the light one runs beside the heavy"
         );
         assert_eq!(done.len(), 4);
-        // the control: two heavy slots let two run at once
         drop(w);
         let mut g = fake(&[("h1", 3), ("h2", 3), ("h3", 3)]);
         let jobs = vec![job("h1", true), job("h2", true), job("h3", true)];
@@ -4206,7 +3925,6 @@ mod tests {
     }
 
     /// A driver that cannot be started is no finding about a library: the run stops,
-    /// its checks ended, with why.
     #[test]
     fn an_unstartable_check_stops_the_run() {
         let mut f = fake(&[]);
@@ -4216,8 +3934,6 @@ mod tests {
         assert!(matches!(r, Err(Stopped::Unstartable(why)) if why.contains("no targo")));
         assert_eq!(f.w.borrow().ended_by_lane, ["a"]);
     }
-
-    // -- what a check leaves for the judge --------------------------------------
 
     fn finished(dir: &Path, log_text: &str, code: i32, over: bool) -> Finished {
         let log = dir.join("alpha@1.0.0.log");
@@ -4257,7 +3973,6 @@ mod tests {
             probed, 0,
             "the socket is asked only about a check targo refused"
         );
-        // over budget, and refused by targo for want of its trustd
         let refused = format!("error: {}\n", trust_facts::TRUSTD_REFUSED);
         let f = finished(d.path(), &refused, 137, true);
         record(&f, Duration::from_secs(60), &mut || {
@@ -4281,22 +3996,17 @@ mod tests {
     }
 
     /// The env that turns [`probe_the_lanes_directories_under_umask_002`] on: the
-    /// directory it makes them under.
     const UMASK_PROBE_ENV: &str = "ATERM_RELEASE_TRUST_LANE_UMASK_DIR";
     /// That probe's name, as `--exact` wants it.
     const UMASK_PROBE: &str = "trust_lane::tests::probe_the_lanes_directories_under_umask_002";
 
     /// The child half of [`the_lanes_directories_are_admitted_under_umask_002`]: under umask
-    /// `002`, the slot the lane makes is one `targo trust` admits. Outside that child (the
-    /// env unset) it does nothing: the umask is the whole process's, so it is set only in a
-    /// process running this one test.
     #[test]
     fn probe_the_lanes_directories_under_umask_002() {
         let Some(dir) = std::env::var_os(UMASK_PROBE_ENV) else {
             return;
         };
-        // SAFETY: `umask(2)` swaps this process's file-creation mask and cannot fail; this
-        // process runs this one test (`--exact`), so no other create sees the mask.
+        // SAFETY: `umask(2)` swaps this process's file-creation mask and cannot fail in this single-test process.
         unsafe { umask(0o002) };
         let slot = PathBuf::from(dir).join("target-trust.noindex/j0");
         owner_dirs(&slot).unwrap();
@@ -4304,9 +4014,6 @@ mod tests {
     }
 
     /// The target root and slots the lane makes are ones `targo trust` admits under a
-    /// login's umask `002` (Ubuntu's), where a plain `create_dir_all` makes them `0775`. The
-    /// umask is the whole process's, so they are made in a child of this test binary that
-    /// runs only [`probe_the_lanes_directories_under_umask_002`].
     #[test]
     fn the_lanes_directories_are_admitted_under_umask_002() {
         let base = aterm_tempfile::Builder::new()
@@ -4365,11 +4072,7 @@ mod tests {
         assert!(!fork_lock(d.path(), &argv).unwrap().created);
     }
 
-    // -- a whole run, over a bench the test drives -------------------------------
-
     /// Checks that end at once, each having printed `log` and written one fresh
-    /// dep-info file in its slot, stamped `stamp` when that is set (as a file system
-    /// whose clock lags the wall clock would stamp it).
     struct Quick<'a> {
         root: PathBuf,
         log: &'static str,
@@ -4429,7 +4132,6 @@ mod tests {
     }
 
     /// A git checkout holding the library `alpha` with its floor, beside a stand-in
-    /// prover, and a bench whose checks are [`Quick`]; `meanwhile` runs while they do.
     struct Site {
         _dir: aterm_tempfile::TempDir,
         _slots: aterm_tempfile::TempDir,
@@ -4528,16 +4230,6 @@ mod tests {
     }
 
     /// Where a run's slots go: the first of the build's own scratch, the system's temporary
-    /// directory and a private `$XDG_RUNTIME_DIR` whose every component `targo trust`
-    /// admits ([`refused_component`]: no group- or world-writable one, whatever its group).
-    /// macOS's per-user temporary directory is private; a checkout made under Ubuntu's
-    /// umask `002` is `0775`, and Linux's /tmp is world-writable, so there it is the
-    /// runtime directory.
-    ///
-    /// Nor may a base lie under a `.cargo/config[.toml]`: the build's own scratch is
-    /// inside the checkout when its target directory is (a release clone's is), and the
-    /// site's repo would then read the checkout's config, so a run there files nothing
-    /// ([`trust_facts::outside_config`]).
     fn slots_base() -> PathBuf {
         let mut refused = Vec::new();
         for base in [
@@ -4570,8 +4262,6 @@ mod tests {
             .prefix("trust-lane-slots")
             .tempdir_in(slots_base())
             .unwrap();
-        // Under the slots' base, which targo admits, so a test can make the checkout's own
-        // `target-trust.noindex` admitted or refused by the checkout's mode alone.
         let repo = slots.path().join("repo");
         crate::ledger::testing::init(
             &repo,
@@ -4649,7 +4339,6 @@ mod tests {
     }
 
     /// A whole-tree run on a clean checkout files its facts under the tree's key; the plan
-    /// names the tree, the prover and the lane's environment.
     #[test]
     fn a_clean_whole_tree_run_files_its_facts() {
         let mut s = site(Scope::WholeTree);
@@ -4670,14 +4359,6 @@ mod tests {
     }
 
     /// THE RUN'S DEP-INFO IS WHAT ITS SLOTS HOLD, whatever the host's clocks say: every
-    /// bench empties the slots before its checks start, so a dep-info file a check wrote
-    /// counts however old its file system stamped it, and one a killed run left in a slot
-    /// is gone before the checks start, though it names the floors. (The start-of-run
-    /// stamp test this replaces read a file written within a tick of the run's start as
-    /// older than the run, which only an instant bench like this one did; and only the real
-    /// bench emptied its slots.) A slot that cannot be emptied, whoever runs the tests,
-    /// stops a run that files before any check, so nothing it holds is read as this run's;
-    /// a -p run reads no dep-info, says so and goes on.
     #[test]
     fn a_runs_dep_info_is_what_its_slots_hold_whatever_the_clock() {
         let mut lagged = site(Scope::WholeTree);
@@ -4693,8 +4374,6 @@ mod tests {
         assert_eq!((outcome, filed.len()), (Outcome::Pass, 1), "{said}");
         assert!(!stale.exists(), "a killed run's slot is gone");
 
-        // A file where a slot goes: removing a directory tree fails on it (not a
-        // directory) for every user, root too, which a permission bit would not.
         let stuck = |scope| {
             let s = site(scope);
             let root = root_of(&s);
@@ -4718,10 +4397,6 @@ mod tests {
     }
 
     /// `--update-ratchet` REWRITES THE COMMITTED COST SEED beside the floors: the row it
-    /// measured takes this run's cost, a row it did not measure keeps its own, with the
-    /// time it was measured — an older row of this clone's history does not undo it, and
-    /// a library that left the graph is not carried back in from that history; a run
-    /// without it leaves the seed alone.
     #[test]
     fn an_update_ratchet_run_rewrites_the_cost_seed() {
         let committed = format!(
@@ -4781,7 +4456,6 @@ mod tests {
     }
 
     /// THE SEED'S MERGE: the later row of each library still in the graph, whichever
-    /// file holds it; a row with no time is the oldest; a library the graph lost goes.
     #[test]
     fn the_seed_keeps_the_later_row_of_each_library_still_in_the_graph() {
         let row = |cpu: u64, when: &str| Cost {
@@ -4831,7 +4505,6 @@ mod tests {
     }
 
     /// A whole-tree record with alpha undecided and beta already above its floor:
-    /// both checks print the same report, but only alpha needs another measurement.
     fn undecided_site() -> Site {
         let mut s = site(Scope::WholeTree);
         s.libraries.push("beta");
@@ -4854,7 +4527,6 @@ mod tests {
     }
 
     /// Only the undecided library is measured and the decided one's facts are kept; a
-    /// second remeasure runs nothing.
     #[test]
     fn a_remeasure_completes_its_record_and_then_runs_nothing() {
         let mut s = undecided_site();
@@ -4907,7 +4579,6 @@ mod tests {
     }
 
     /// A source commit changes the facts key: it cannot resume the earlier record,
-    /// starts no checks and preserves that record for the commit it measured.
     #[test]
     fn a_remeasure_never_reuses_facts_after_a_source_commit() {
         let mut s = undecided_site();
@@ -4951,7 +4622,6 @@ mod tests {
     }
 
     /// Nothing is filed for bytes that are not HEAD's (dirty at the start, an edit or a
-    /// commit during the run), nor by a `-p` run.
     #[test]
     fn a_run_files_nothing_for_a_tree_it_did_not_verify() {
         let mut dirty = site(Scope::WholeTree);
@@ -4996,7 +4666,6 @@ mod tests {
     }
 
     /// A host that cannot reproduce a floor refuses that library before any check: with
-    /// `stop_if_narrowed` nothing runs, else the rest runs; either way the run is NARROWED.
     #[test]
     fn a_floor_this_host_cannot_reproduce_narrows_the_run() {
         for stop in [true, false] {
@@ -5025,7 +4694,6 @@ mod tests {
     }
 
     /// A floor the graph no longer carries fails the whole-tree run (FORK-VANISHED); a `-p`
-    /// run answers only for what it names.
     #[test]
     fn a_vanished_fork_fails_the_whole_tree_run() {
         for scope in [Scope::WholeTree, Scope::Packages(vec!["alpha".into()])] {
@@ -5053,12 +4721,6 @@ mod tests {
     }
 
     /// With no `--target-root`, a checkout `targo trust` refuses (`0775`, as a login's
-    /// umask `002` makes it) runs under its own directory of the user's cache: said on one
-    /// line, recorded with its checkout, made as targo admits it, the same directory the
-    /// next run; a root there whose checkout is gone is pruned, and the checkout is left
-    /// with no `target-trust.noindex`. Once the checkout is `chmod go-w`'d (the note's fix), the
-    /// run is back in `target-trust.noindex`, and the fallback root goes, with what a killed run
-    /// left in it, and orphans are still pruned.
     #[test]
     fn a_refused_checkout_runs_under_its_own_cache_root() {
         use std::os::unix::fs::PermissionsExt as _;
@@ -5080,7 +4742,6 @@ mod tests {
             dir
         };
         let first_orphan = orphan("deleted-0123456789ab");
-        // A record a group could rewrite (as a umask `002` writes one) is tightened.
         owner_dirs(&root).unwrap();
         fs::write(root.join(CHECKOUT_RECORD), "stale\n").unwrap();
         fs::set_permissions(
@@ -5093,7 +4754,6 @@ mod tests {
         for run in ["first", "second"] {
             let (outcome, said, _) = run_site(&mut s);
             assert_eq!(outcome, Outcome::Pass, "{run}: {said}");
-            // One line: the root it uses, the one refused, the component, and its fix.
             let note: Vec<&str> = said.lines().filter(|l| l.contains(&own_s)).collect();
             assert!(
                 note.len() == 1
@@ -5128,7 +4788,6 @@ mod tests {
         assert!(!first_orphan.exists(), "the orphan is pruned");
         assert!(!s.repo.join("target-trust.noindex").exists());
 
-        // What a SIGKILLed fallback run leaves: a slot, and a record of its check.
         fs::create_dir_all(root.join("j0/debug")).unwrap();
         fs::write(root.join(".check.0"), "4194304999 never\n").unwrap();
         fs::set_permissions(root.join(".check.0"), fs::Permissions::from_mode(0o600)).unwrap();
@@ -5140,7 +4799,6 @@ mod tests {
             s.repo.join("target-trust.noindex/logs/.plan").is_file(),
             "back in the checkout: {said}"
         );
-        // No fallback note; one line, saying the fallback root was removed.
         let naming: Vec<&str> = said.lines().filter(|l| l.contains(&root_s)).collect();
         assert!(naming.len() == 1 && naming[0].contains("removed"), "{said}");
         assert!(!root.exists(), "the fallback root is retired: {said}");
@@ -5149,8 +4807,6 @@ mod tests {
             "orphans are pruned on any default run"
         );
     }
-
-    // -- the environment, the root, the lock -------------------------------------
 
     #[test]
     fn the_lane_environment_is_built_from_a_list() {
@@ -5180,7 +4836,6 @@ mod tests {
     }
 
     /// A group- or world-writable component of the target root is COULD NOT RUN up front:
-    /// `targo trust` would refuse the check, which would read as a finding.
     #[test]
     fn a_world_writable_component_of_the_target_root_is_refused() {
         use std::os::unix::fs::PermissionsExt as _;
@@ -5194,8 +4849,6 @@ mod tests {
     }
 
     /// Each component rule `targo trust` holds: another owner, a group- or
-    /// world-writable mode (sticky or not), a root-owned directory an ACL lets the
-    /// caller write; root's or the caller's own, writable by its owner alone, passes.
     #[test]
     fn each_component_rule_targo_holds_is_said() {
         let me = 501;
@@ -5221,7 +4874,6 @@ mod tests {
     }
 
     /// Whether each of `parts` appears in `said`, in that order: a message names each
-    /// refused path and puts each fix after its refusal, however its prose is worded.
     fn says_in_order(said: &str, parts: &[&str]) -> bool {
         let mut rest = said;
         parts.iter().all(|p| {
@@ -5233,8 +4885,6 @@ mod tests {
     }
 
     /// A checkout that still holds the root from before the `.noindex` name is told so by
-    /// a default run, and nothing is removed; a named root, an absent one and a link are
-    /// not mentioned.
     #[test]
     fn a_default_run_names_the_root_left_from_before_the_noindex_name() {
         let dir = tmp("trust-legacy");
@@ -5262,8 +4912,6 @@ mod tests {
         std::os::unix::fs::symlink(dir.path(), &legacy).unwrap();
         assert_eq!(legacy_root_note(&cfg), None, "a link is never followed");
 
-        // A named root Spotlight would index is told so on macOS; the default and one
-        // under a `*.noindex` folder are not.
         let mine = Path::new("/w/target/trust-gui1");
         assert_eq!(
             indexed_root_note(&cfg, &repo.join(OWN_ROOT)),
@@ -5284,9 +4932,6 @@ mod tests {
     }
 
     /// THE DEFAULT TARGET ROOT: `<repo>/target-trust.noindex` wherever targo admits it; else this
-    /// checkout's directory of the user's cache, said with the fix that would bring the
-    /// first back; when neither is admitted, nothing runs and each refusal is named with
-    /// its fix.
     #[test]
     fn the_default_target_root_falls_back_only_when_targo_refuses_it() {
         let repo = Path::new("/w/aterm");
@@ -5354,8 +4999,6 @@ mod tests {
     }
 
     /// The fallback lies in the user's cache (`$XDG_CACHE_HOME` only when absolute, as the
-    /// XDG rule says; macOS's unindexed caches), under a name per checkout: two worktrees
-    /// of one name never share a run lock.
     #[test]
     fn the_fallback_root_is_the_users_cache_keyed_by_checkout() {
         let home = Some(Path::new("/h"));
@@ -5393,8 +5036,6 @@ mod tests {
     }
 
     /// A refusal's fix: `chmod go-w` on a component of the caller's that only its mode
-    /// keeps out (the target root's, said up front), another directory for another
-    /// owner's.
     #[test]
     fn a_refusal_names_its_fix() {
         use std::os::unix::fs::PermissionsExt as _;
@@ -5416,7 +5057,6 @@ mod tests {
         fs::create_dir(&open).unwrap();
         fs::set_permissions(&open, fs::Permissions::from_mode(0o775)).unwrap();
         let open = fs::canonicalize(&open).unwrap();
-        // A cache a fallback could use is there: a named root never falls back to it.
         let cache = base.path().join("cache");
         owner_dirs(&cache).unwrap();
         let mut cfg = Config::new(base.path(), Scope::WholeTree);
@@ -5451,9 +5091,6 @@ mod tests {
     }
 
     /// A FALLBACK ROOT WHOSE CHECKOUT IS GONE is removed when a run starts, under its
-    /// own run lock, the checks a killed run left there ended first; one a run holds, one
-    /// whose checkout is there, one with no record (or none this lane wrote) and the run's
-    /// own stay.
     #[test]
     fn a_fallback_root_whose_checkout_is_gone_is_pruned() {
         use std::os::unix::fs::PermissionsExt as _;
@@ -5514,12 +5151,10 @@ mod tests {
         assert!(prepare_cache_lock(&linked_check).is_err());
         let weak = make("weak", Some(&d.path().join("weak-gone")));
         fs::set_permissions(&weak, fs::Permissions::from_mode(0o775)).unwrap();
-        // A shared cache is never scanned for authority, even with an admitted own root.
         fs::set_permissions(&cache, fs::Permissions::from_mode(0o775)).unwrap();
         assert!(prune_orphans(&cache, &own).is_empty());
         assert!(orphan.exists());
         fs::set_permissions(&cache, fs::Permissions::from_mode(0o755)).unwrap();
-        // A check the orphan's killed run left running is ended with it.
         let mut check = command("/bin/sleep")
             .arg("600")
             .stdin(Stdio::null())
@@ -5571,9 +5206,6 @@ mod tests {
     }
 
     /// A stand-in toolchain under `base` as targo lists it: launchers in `bin/`, the
-    /// sysroot's `lib/`, a target's `lib/rustlib/<target>/lib` (beside a metadata file
-    /// and a target with no `lib`), and the compiler's build `deps` beside the sysroot;
-    /// every mode set explicitly (`0755`, a library `0644`), whatever the umask.
     fn toolchain(base: &Path) -> PathBuf {
         use std::os::unix::fs::PermissionsExt as _;
         let sysroot = base.join("trust-x");
@@ -5613,10 +5245,6 @@ mod tests {
     }
 
     /// THE TOOLCHAIN PRE-FLIGHT holds the prover to what `targo trust` admits before any
-    /// check: a toolchain writable by its owner alone passes; a launcher, a component of
-    /// its chain, a runtime-library directory or what one holds that a group could write
-    /// is refused with `chmod go-w`, and a symlink where targo wants a plain object is
-    /// refused.
     #[test]
     fn the_toolchain_is_held_to_what_targo_admits() {
         use std::os::unix::fs::PermissionsExt as _;
@@ -5650,10 +5278,6 @@ mod tests {
             assert_eq!((&r.dir, r.chmod), (&path, GO_W), "{part}: {}", r.why);
             assert!(r.why.contains(&format!("{open:o}")), "{part}: {}", r.why);
         }
-        // A verified tool launcher targo opens (targo, trustc) with a setuid, setgid or
-        // sticky bit is refused, with the chmod that clears it; trustd's own check has no
-        // such rule. (macOS forbids a non-root sticky file, and a setgid one outside the
-        // file's group, so there only setuid is made.)
         let mut special_modes = vec![
             ("trust-x/bin/targo", 0o4755),
             ("trust-x/bin/trustc", 0o4755),
@@ -5694,7 +5318,6 @@ mod tests {
         fs::remove_file(&target).unwrap();
         assert_eq!((r.dir, r.chmod), (target, None), "{}", r.why);
         assert_eq!(toolchain_refusal(&bin), None);
-        // The prover is refused before anything of it runs, with the fix.
         let lib = base.join("trust-x/lib");
         fs::set_permissions(&lib, fs::Permissions::from_mode(0o775)).unwrap();
         let why = Driver::at(&bin).map(|d| d.id).unwrap_err();
@@ -5732,10 +5355,7 @@ mod tests {
         assert_eq!(Outcome::Narrowed(vec!["a".into()]).exit(), 4);
     }
 
-    // -- process trees --------------------------------------------------------
-
     /// A check's tree is its descendants by parent, whatever their group; a trustd
-    /// and what it runs are never in it.
     #[test]
     fn a_trees_members_spare_trustd_and_its_solvers() {
         let listing = "\
@@ -5775,7 +5395,6 @@ mod tests {
     }
 
     /// The tree is ended to its last process, a grandchild in a session and group of
-    /// its own included (a signal to the check's group misses it).
     #[test]
     fn ending_a_check_ends_its_whole_tree() {
         let pgid = |pid: u32| {
@@ -5847,10 +5466,7 @@ mod tests {
         }
     }
 
-    // -- trustd ----------------------------------------------------------------
-
     /// A stand-in trustd on a socket of its own: answers IDENTITY with `sha`, STATUS,
-    /// and RESERVE with a grant it holds until the client goes.
     fn stand_in(sock: &Path, sha: &'static str) -> std::thread::JoinHandle<()> {
         use std::io::{BufRead as _, BufReader as Reader};
         let listener = std::os::unix::net::UnixListener::bind(sock).unwrap();
@@ -5879,7 +5495,6 @@ mod tests {
     }
 
     fn short_dir(tag: &str) -> aterm_tempfile::TempDir {
-        // A unix socket's path must fit in 104 bytes.
         aterm_tempfile::Builder::new()
             .prefix(&format!("tl{tag}-"))
             .tempdir_in("/tmp")
@@ -5899,7 +5514,6 @@ mod tests {
         let other = trustd::probe(&ours, "bb", wait);
         assert_eq!(other.held, trustd::Held::Foreign);
         assert!(other.line().starts_with("foreign\t"), "{}", other.line());
-        // one that takes the connection and never answers
         let mute = d.join("mute.sock");
         let listener = std::os::unix::net::UnixListener::bind(&mute).unwrap();
         let _held = std::thread::spawn(move || {
@@ -5941,7 +5555,6 @@ mod tests {
     }
 
     /// Dropping the keeper closes its outstanding IDENTITY connection without
-    /// needing a reply or a close from the peer.
     #[test]
     fn the_keeper_ends_while_a_trustd_keeps_it_waiting() {
         use std::io::{BufRead as _, Read as _};
@@ -5967,8 +5580,6 @@ mod tests {
             .expect("the keeper never requested IDENTITY");
         mute.join().unwrap();
 
-        // Keep the silent peer open until the keeper has ended. These waits
-        // detect a hang; no elapsed-time threshold is a performance assertion.
         let (ended_tx, ended_rx) = std::sync::mpsc::channel();
         let ending = std::thread::spawn(move || {
             drop(keeper);

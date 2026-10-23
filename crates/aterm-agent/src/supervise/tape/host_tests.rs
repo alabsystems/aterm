@@ -129,6 +129,25 @@ fn every_host_answer_reads_back_as_written() {
         at: None,
         row: None,
     }));
+    same(None::<TapWindow>);
+    for figure in [
+        None,
+        Some(crate::harness::tap::Window {
+            pct: 100,
+            resets_at: 1_789_660_500,
+            pct_x10: Some(996),
+        }),
+        Some(crate::harness::tap::Window {
+            pct: 42,
+            resets_at: 1_789_660_500,
+            pct_x10: None,
+        }),
+    ] {
+        same(Some(TapWindow {
+            figure,
+            read_at: 1_789_650_000,
+        }));
+    }
     same(None::<AgentMemory>);
     same(Some(AgentMemory::default()));
     for pressure in [Pressure::Normal, Pressure::Warn, Pressure::Critical] {

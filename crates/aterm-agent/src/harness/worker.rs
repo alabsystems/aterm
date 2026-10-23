@@ -1,98 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! THE WORKERS `spawn agent=<word>` STARTS, ONE ROW PER HARNESS
-//! ([`WORKERS`]): Claude Code, Gemini CLI, agy and Muse Code. One mechanism
-//! writes every worker's first line ([`line`]) and resolves the program it
-//! types ([`starter`]); a row says only what differs between the CLIs. Each
-//! row's flags were read in the CLI's own source or bundle (never by running
-//! it), and the relaunch lanes that already carry each one
-//! (`upgrade_gemini`, `upgrade_agy`, `upgrade_muse`) agree with them:
-//!
-//! * **The task is argv, never typed** ([`WorkerCli::operand`]): the task
-//!   file's whole text through `"$(command cat -- "$ATERM_TASK_FILE")"`, as
-//!   for Claude Code ([`upgrade::TASK_OPERAND`]).
-//!   * Claude Code: `claude [--model <m>] -- "<task>"`, its first prompt an
-//!     operand.
-//!   * Gemini CLI 0.46.0: `--prompt-interactive` (`-i`, "Execute the provided
-//!     prompt and continue in interactive mode"): `interactive =
-//!     !!argv.promptInteractive || …` in the bundle, so the TUI stays up after
-//!     the first turn. Its value is ATTACHED
-//!     ([`upgrade::TASK_PROMPT_INTERACTIVE`]): yargs splits `--name=value` at
-//!     its first `=` and keeps the rest whole (`/^--?([^=]+)=([\s\S]*)$/`),
-//!     where a next-word value opening with `-` is refused (`Not enough
-//!     arguments following`). Its positional, which 0.46.0 also reads as an
-//!     interactive prompt, would be read as a query list.
-//!   * agy 1.4: `--prompt-interactive` ("Run an initial prompt interactively
-//!     and continue the session"); it takes no positional prompt (exit 2).
-//!     Its flag set takes an attached value whatever it holds.
-//!   * Muse Code 1.4.10: `muse [OPTIONS] [PROMPT]` ("pass a prompt to start a
-//!     session", the TUI root's parser): `--` then the prompt, as Claude
-//!     Code takes it.
-//!
-//!   agy's task file holds no blank line ([`WorkerCli::blank_lines`], its
-//!   reader's word): its screen draws one inside a message as the gap under
-//!   a message, so the rows past it would read as the agent's reply.
-//!
-//!   Every lane drops that first prompt from a relaunch's argv
-//!   (`upgrade_gemini`'s and `upgrade_agy`'s `prompt-interactive` and `i`,
-//!   `upgrade_muse`'s positional): a crashed worker relaunched on its
-//!   session is never handed its task again.
-//! * **`model=`** is each CLI's own `--model <m>` ([`WorkerCli::model_flag`]):
-//!   all four take one, so none refuses it. A model opening with `-` is no
-//!   model: yargs (Gemini CLI) and clap (Muse Code) read it as a flag and
-//!   exit, so the line refuses it.
-//! * **The folder trust**: where the worker's shell stands in the one folder
-//!   its starter trusted for it (the spawn's `cwd=`), Muse Code's line
-//!   carries its trust-for-this-run flag ([`WorkerCli::trust_flag`]:
-//!   `--trust-workspace`, "Trust this workspace for this run …; does not
-//!   save trust") in place of a dialog a rule would answer. Gemini CLI's
-//!   folder is trusted by a TRUSTED-FOLDERS FILE OF THE WORKER'S OWN
-//!   ([`WorkerCli::trust_file_env`]: `GEMINI_CLI_TRUSTED_FOLDERS_PATH`,
-//!   bundle: `Storage.getTrustedFoldersPath`) naming that folder alone
-//!   ([`trusted_folders_text`]), never its `--skip-trust`: that flag sets
-//!   `GEMINI_CLI_TRUST_WORKSPACE=true` in the CLI's own environment (bundle
-//!   0.46.0), under which `checkPathTrust` trusts EVERY
-//!   path, and its tools' environment keeps every `GEMINI_CLI_*` name — so a
-//!   Gemini CLI the worker's shell tool starts in any other folder would load
-//!   that folder's settings, hooks and MCP servers with no dialog. The file
-//!   names the folder by its path, so it rides wherever the shell stands: a
-//!   Gemini CLI started anywhere else is untrusted by it. GEMINI CLI NEEDS NO
-//!   DIALOG ANSWERED: its first prompt is submitted while its folder-trust
-//!   dialog stands (the bundle's initial-prompt effect does not wait on that
-//!   dialog), and its `Trust folder` relaunches the CLI with the same argv
-//!   (`relaunchApp`), so a dialog answered on a worker's screen would send
-//!   the task a second time; the window harness never presses it on a
-//!   worker (`supervise::policy::approval`). Claude Code and agy have no
-//!   such flag: their dialog is answered by the window harness's rule, in
-//!   that same folder alone.
-//! * **Gemini CLI's own restart** ([`WorkerCli::session_flag`]): its
-//!   `/settings` restart, its IDE-trust and admin-settings restarts all exit
-//!   199, and its parent node runs the CLI again with the same argv — the
-//!   first prompt with it. So the line starts the session under an id of its
-//!   own (`--session-id <uuid>`, [`fresh_session_id`]): the restarted CLI
-//!   finds that session already written and refuses to start (`Session ID
-//!   … already exists`, exit 42) rather than send the task again. The
-//!   relaunch lane reads that `42` as the restart it is — the id its first
-//!   start wrote, which the start-time rule names for the process
-//!   (`upgrade_gemini::restart_id`, `ExitKind::Restarted`) — and finishes
-//!   it: `gemini --resume <uuid>` with the flag and the prompt dropped
-//!   (`upgrade_gemini::rewrite_argv`), behind the worker's homes and its
-//!   trusted-folders file while that stands, and nothing typed after it.
-//!   Keeping the task out of a restart's argv is not the CLI's to offer: its
-//!   parent spawns every run from the argv it read once.
-//! * **The program** ([`starter`]): the starter's own, where the starter runs
-//!   the same agent — Claude Code's as its relaunch reads it
-//!   (`relaunch::caller_claude`); agy's and Muse Code's image, or atpkg's
-//!   managed twin where it is a store build (as their relaunch lanes type
-//!   it); Gemini CLI's PATH word `gemini`, which its lane types too (its
-//!   process is `node` running a Cellar script) — with the homes its relaunch
-//!   carries ([`WorkerCli::dirs`]) and the flags of its argv that move its
-//!   config or say how it reaches its provider ([`Starter::args`]: agy's
-//!   `--gemini_dir` and `--app_data_dir`, Muse Code's `--provider`,
-//!   `--preset`, `--base-url` and `-c`/`--config`), which its relaunch lane
-//!   carries too. Else the CLI's word on the worker's PATH, where atpkg's
-//!   shell hook puts its managed link.
+//! Workers started by `spawn agent=<word>`, one row per harness ([`WORKERS`]).
 
 use std::path::{Path, PathBuf};
 
@@ -102,20 +11,15 @@ use atpkg::caller_shell::ProcArgs;
 use super::upgrade::{self, Dialect};
 
 /// How a starter's process is known to run a row's CLI, and the program a
-/// worker's line types for it ([`starter_of`]).
 #[derive(Clone, Copy)]
 enum Launches {
     /// Claude Code: read by its relaunch's own reader
-    /// (`relaunch::caller_claude`).
     Claude,
     /// A CLI known by its image and argv (`is`), typed by its PATH word:
-    /// Gemini CLI, whose image is `node` running its script.
     Word {
         is: fn(Option<&Path>, &[String]) -> bool,
     },
     /// A CLI whose image is named by its word: its own path, or — where
-    /// `store_build` says it is a build in atpkg's store — atpkg's managed
-    /// twin (the path its relaunch lane types), else the word.
     Image { store_build: fn(&Path) -> bool },
 }
 
@@ -129,50 +33,29 @@ pub struct WorkerCli {
     pub operand: &'static str,
     /// The flag `model=` names the model by, followed by the model.
     pub model_flag: &'static str,
-    /// The CLI's flag that trusts the folder it starts in for this run alone,
-    /// carried only where the worker's shell stands in the folder its starter
-    /// trusted for it ([`Fresh::trusted_here`]).
+    /// CLI flag that trusts the starting folder for this run alone ([`Fresh::trusted_here`]).
     pub trust_flag: Option<&'static str>,
-    /// The variable naming a TRUSTED-FOLDERS FILE the CLI reads in place of
-    /// its own (Gemini CLI's `GEMINI_CLI_TRUSTED_FOLDERS_PATH`): the line
-    /// names the file written for this worker ([`Fresh::trust_file`],
-    /// [`trusted_folders_text`]), which trusts the starter's folder alone,
-    /// wherever the shell stands ([module](self)).
+    /// Environment variable naming a per-worker trusted-folders file ([`Fresh::trust_file`]).
     pub trust_file_env: Option<&'static str>,
-    /// The flag that starts a NEW session under the id the line names
-    /// ([`Fresh::session`]): Gemini CLI's `--session-id`, so its own restart,
-    /// which runs the same argv again, refuses the id it already wrote rather
-    /// than send the task a second time ([module](self)).
+    /// CLI flag that starts a new session under [`Fresh::session`].
     pub session_flag: Option<&'static str>,
-    /// Environment a fresh start sets that the line drops first when it
-    /// would not fit (Claude Code's survey switch).
+    /// Environment pairs set on a fresh start and dropped first when tight on space.
     pub nicety: &'static [(&'static str, &'static str)],
-    /// The variables of a starter's environment the line carries that name a
-    /// DIRECTORY: each must be absolute, since the worker starts in its own
-    /// folder, where a relative one names another — save an XDG base
-    /// directory's set empty, which the XDG rule reads as unset (and Muse
-    /// Code's relaunch carries as set, [`super::upgrade_muse::relaunch_env`]).
+    /// Starter environment variables naming directories that must be absolute when carried.
     pub dirs: &'static [&'static str],
     launches: Launches,
     /// The starter's environment a worker's line carries: its relaunch lane's
-    /// own pairs, under the user's home.
     homes: fn(&ProcArgs, &Path) -> Vec<(String, String)>,
     /// The flags of the starter's argv a worker's line carries ([`Starter::args`]):
-    /// the ones its relaunch lane carries that move its config or say how it
-    /// reaches its provider. `Err` names a flag no table knows, which could
-    /// hold another's value: nothing guesses.
     flags: fn(&[String]) -> Result<Vec<String>, String>,
 }
 
 /// No flag of a starter's rides: Claude Code (whose relaunch reads none) and
-/// Gemini CLI (whose homes are its environment's).
 fn no_flags(_: &[String]) -> Result<Vec<String>, String> {
     Ok(Vec::new())
 }
 
-/// EVERY WORKER A SPAWN CAN START, one row per harness. Codex has none: its
-/// screen lane was retired (2026-10-16), and `spawn agent=codex` stays
-/// refused.
+/// Every worker harness `spawn` can start, one row per harness.
 pub static WORKERS: [WorkerCli; 4] = [
     WorkerCli {
         agent: Program::Claude,
@@ -204,8 +87,6 @@ pub static WORKERS: [WorkerCli; 4] = [
         launches: Launches::Word {
             is: super::upgrade_gemini::is_gemini_process,
         },
-        // Its relaunch carries a trusted-folders file a starter's own spawn
-        // named; a worker of that starter is trusted by its own alone.
         homes: |args, home| {
             super::upgrade_gemini::relaunch_env(|n| args.env_var(n), home)
                 .into_iter()
@@ -257,45 +138,29 @@ pub static WORKERS: [WorkerCli; 4] = [
     },
 ];
 
-/// The row of `agent`, `None` for one no worker runs (Codex, the generic
-/// reader).
+/// Worker row for `agent`, or `None` if unsupported by `spawn`.
 #[must_use]
 pub fn worker_cli(agent: Program) -> Option<&'static WorkerCli> {
     WORKERS.iter().find(|w| w.agent == agent)
 }
 
-/// What a worker's line types and carries: the program, and the starter's
-/// environment and flags when it runs the same agent.
+/// Program, environment, and argv flags carried from a starter onto a worker's launch line.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Starter {
     pub exe: PathBuf,
     pub env: Vec<(String, String)>,
-    /// The flags of the starter's argv the line carries
-    /// ([`WorkerCli::flags`]); `Err`: its argv held a flag no table knows,
-    /// and the line is refused rather than started on another config or
-    /// provider than the starter's.
+    /// Carried starter argv flags ([`WorkerCli::flags`]), or `Err` on an unrecognized flag.
     pub args: Result<Vec<String>, String>,
 }
 
 impl WorkerCli {
-    /// Whether the first prompt may hold a BLANK LINE: its reader's word
-    /// ([`aterm_phase::ScreenReader::bounds_messages`]), `false` where the
-    /// CLI's screen cannot bound a message holding one. agy draws a
-    /// message's blank line as a blank row with the rows under it two
-    /// columns in, as its reply's (measured in the lab 2026-10-21,
-    /// `aterm_phase::agy::fixtures::lab::WORKER_FIRST_PROMPT`), so its reader
-    /// reads the rows past it as the reply: a task's later paragraph, and the
-    /// fact line's `NEEDS YOU:` (a need nobody said, raised as the worker's
-    /// first turn ended), and both in the worker's result. Such a task file
-    /// drops its blank lines, the fact on the line under the task (the acts
-    /// the harness types later go as one line each).
+    /// Whether the worker's first prompt may hold a blank line ([`aterm_phase::ScreenReader::bounds_messages`]).
     #[must_use]
     pub fn blank_lines(&self) -> bool {
         self.agent.reader().bounds_messages()
     }
 
-    /// The worker's program when no starter's own rides the line: the word,
-    /// under the shell's own environment.
+    /// Plain [`Starter`] using the row's PATH word and empty environment/flags.
     #[must_use]
     pub fn plain(&self) -> Starter {
         Starter {
@@ -306,10 +171,7 @@ impl WorkerCli {
     }
 }
 
-/// THE STARTER'S OWN AGENT OF `cli`'S KIND, as a worker's line follows it:
-/// the program and the environment of process `pid` (the group in front of
-/// the starter's terminal) under the user's `home`; `None` where `pid` runs
-/// no such agent, or its argv cannot be read.
+/// Read process `pid` under `home` as a starter of `cli`'s kind, or `None`.
 #[must_use]
 pub fn starter(cli: &WorkerCli, pid: u32, home: &Path) -> Option<Starter> {
     if let Launches::Claude = cli.launches {
@@ -335,10 +197,7 @@ pub fn starter(cli: &WorkerCli, pid: u32, home: &Path) -> Option<Starter> {
     })
 }
 
-/// [`starter`]'s reading of one process, `image` its executable and `args`
-/// its exec arguments, `twin` atpkg's managed twin of `cli`'s word where
-/// asked (a store build). `None` for a process that runs no `cli`, and for
-/// Claude Code, which its relaunch's reader reads.
+/// Resolve `image` and `args` as a [`Starter`] for `cli`, or `None`.
 pub(crate) fn starter_of(
     cli: &WorkerCli,
     image: Option<&Path>,
@@ -371,22 +230,15 @@ pub(crate) fn starter_of(
 pub struct Fresh<'a> {
     /// `model=`: the CLI's `--model`.
     pub model: Option<&'a str>,
-    /// The shell stands in the folder its starter trusted for it: the row's
-    /// [`WorkerCli::trust_flag`] rides.
+    /// Whether the shell stands in the folder its starter trusted for it.
     pub trusted_here: bool,
-    /// The trusted-folders file written for this worker, which the row's
-    /// [`WorkerCli::trust_file_env`] names to the CLI.
+    /// Per-worker trusted-folders file passed via [`WorkerCli::trust_file_env`].
     pub trust_file: Option<&'a Path>,
-    /// The new session's id, which the row's [`WorkerCli::session_flag`]
-    /// starts it under ([`fresh_session_id`]).
+    /// New session id passed via [`WorkerCli::session_flag`].
     pub session: Option<&'a str>,
 }
 
-/// THE TEXT OF A WORKER'S TRUSTED-FOLDERS FILE ([`WorkerCli::trust_file_env`]):
-/// Gemini CLI's `trustedFolders.json` form, `{"<folder>": "TRUST_FOLDER"}`,
-/// the one folder its starter trusted for it (`TRUST_FOLDER` holds the folder
-/// and what is under it; bundle 0.46.0's `isPathTrusted`) and no other — not
-/// even one the user trusted in their own file.
+/// Render the JSON text of a worker's `trustedFolders.json` trusting `folder` alone.
 #[must_use]
 pub fn trusted_folders_text(folder: &str) -> String {
     let mut map = std::collections::BTreeMap::new();
@@ -394,12 +246,10 @@ pub fn trusted_folders_text(folder: &str) -> String {
     aterm_json::to_string(&map).unwrap_or_else(|_| String::from("{}"))
 }
 
-/// A NEW SESSION'S ID for [`Fresh::session`]: a random version-4 UUID, the
-/// form Gemini CLI's `--session-id` takes and its relaunch lane types back
-/// (`upgrade_gemini::is_session_uuid`).
+/// Generate a random v4 UUID for [`Fresh::session`].
 ///
 /// # Errors
-/// The system's random source failed ([`aterm_uds::rand::fill`]).
+/// The system random source failed ([`aterm_uds::rand::fill`]).
 pub fn fresh_session_id() -> std::io::Result<String> {
     let mut b = [0u8; 16];
     aterm_uds::rand::fill(&mut b)?;
@@ -422,21 +272,10 @@ pub(crate) fn session_id_of(mut b: [u8; 16]) -> String {
     )
 }
 
-/// THE LINE A WORKER'S SHELL RUNS AT ITS FIRST PROMPT: `starter`'s program
-/// started fresh with the starter's flags ([`Starter::args`]), the CLI's
-/// trust flag where the shell stands in the folder its starter trusted for
-/// it, `<model flag> <model>` where one is named, `<session flag> <id>`
-/// where the row has one, under the environment the starter's agent carries
-/// (refused rather than dropped), the trusted-folders file the row names, and
-/// the row's nicety (dropped first), its task the row's fixed operand. So
-/// the task is argv — the agent's first prompt — and the shell stays under
-/// the agent, as a relaunch needs it.
+/// Format the shell command line a worker runs at its first prompt.
 ///
 /// # Errors
-/// The line cannot be written ([`upgrade::task_line_env`]), a directory it
-/// carries is relative ([`WorkerCli::dirs`]: it would name another directory
-/// under the worker's `cwd=` than it named for the starter), the starter's
-/// argv could not be read ([`Starter::args`]), or the model opens with `-`.
+/// Line exceeds budget, a carried directory is relative, starter argv is unreadable, or `model` starts with `-`.
 pub fn line(
     cli: &WorkerCli,
     dialect: Dialect,
@@ -458,7 +297,6 @@ pub fn line(
 }
 
 /// Whether `name` is an XDG base directory's variable, which the XDG rule
-/// reads as unset where it is empty.
 fn xdg_base(name: &str) -> bool {
     name.starts_with("XDG_") && name.ends_with("_HOME")
 }
@@ -472,8 +310,6 @@ pub(super) fn line_of(
     env: &[(&str, &str)],
     fresh: &Fresh<'_>,
 ) -> Result<String, String> {
-    // Rootless: under the worker's own directory (a root alone, as Windows
-    // spells one with no drive, is not the worker's). An empty XDG base
     // directory is unset to the XDG rule, as it was to the starter.
     if let Some((name, value)) = env.iter().find(|(name, value)| {
         cli.dirs.contains(name)
@@ -518,8 +354,6 @@ pub(super) fn line_of(
         }
         _ => None,
     };
-    // The starter's own trusted-folders file never rides: the worker's is
-    // its own spawn's.
     let env: Vec<(&str, &str)> = env
         .iter()
         .copied()

@@ -128,6 +128,10 @@ pub enum ResetNo {
     /// The accounts store did not admit: a refused roster, a state that could
     /// not be written.
     State,
+    /// macOS's program check is stuck: nothing the resumed agent starts would
+    /// start. Nothing is claimed, so the wall's one attempt is kept for a
+    /// dialog raised after the check clears.
+    ProgramCheck,
 }
 
 impl ResetNo {
@@ -147,11 +151,12 @@ impl ResetNo {
             ResetNo::Held => "held",
             ResetNo::Attempted => "attempted",
             ResetNo::State => "state",
+            ResetNo::ProgramCheck => "program-check",
         }
     }
 
     /// Every refusal, in the order [`Self::word`] lists them.
-    pub const ALL: [ResetNo; 12] = [
+    pub const ALL: [ResetNo; 13] = [
         ResetNo::Off,
         ResetNo::NoHost,
         ResetNo::Unread,
@@ -164,6 +169,7 @@ impl ResetNo {
         ResetNo::Held,
         ResetNo::Attempted,
         ResetNo::State,
+        ResetNo::ProgramCheck,
     ];
 
     /// [`Self::word`] read back (a harness tape's host answer,

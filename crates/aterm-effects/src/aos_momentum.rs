@@ -1,92 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The typing-momentum glow as an Aos task, and the live wrapper every host calls
-//! (design of record: `docs/DESIGN-aos-hosted-execution-2026-10-21.md` §2 and §4.3).
-//!
-//! # Two modes, one field
-//!
-//! [`MomentumHost`] replaces `CursorFx::momentum: MomentumGlow`. It exposes exactly the
-//! calls the host already makes (`on_key`, `reset`, `tick`, `is_active`, `settling`,
-//! `cold_at`, `value`, `next_change_deadline`) and no `Deref` to the engine, so nothing can
-//! reach the glow except through it.
-//!
-//! * **Unattached** (the default, every production window): the shipped engine is called
-//!   directly, one predictable branch per call. Nothing is admitted, recorded or copied.
-//! * **Attached** ([`MomentumHost::aos_attach`]): an [`aterm_aos::publish::Boundary`] owns
-//!   the live (code, state) pair. Every call becomes one [`MomentumEvent`], is recorded in
-//!   the boundary's log, and is applied through [`MomentumCode::apply`], the same function
-//!   [`Code::step`] runs on replay, so live execution and replay cannot drift. On
-//!   [`MomentumHost::aos_detach`] the live state moves back as a whole and the shipped engine
-//!   runs it directly again.
-//!
-//! # Admission (attached only)
-//!
-//! Every attached input passes the momentum profile's admission
-//! ([`MOMENTUM_PROFILE`]) before the engine sees it: its time is in the horizon and no
-//! earlier than anything the task has seen ([`admit_time`]), a key's τ ([`admit_tau`]), a
-//! tick's geometry and config ([`admit_tick`], whose scratch budget is reserved on both host
-//! vectors before the tick) and a query's frame interval ([`admit_frame_interval`]). A
-//! refused input is a total step: its observation is [`MomentumObservation::Refused`], the
-//! state is untouched, nothing is appended, and it is still recorded, so a replay refuses it
-//! identically. What the host is shown for a refused input: nothing for a key, the inert
-//! frame for a tick, and for a schedule query the frame cadence while the glow is hot (the
-//! engine's own "no forecast fails onto the cadence"), never a parked lane with light on
-//! glass.
-//!
-//! # Time
-//!
-//! Every time is a signed nanosecond offset from the recording epoch, the `Instant` the host
-//! passes to [`MomentumHost::aos_attach`]; [`MomentumSchema`] carries it and maps offsets
-//! back with checked arithmetic. The state carries a clock (the latest admitted input's
-//! time), because a schedule query and an inert tick leave no other trace of their time and
-//! a replay must refuse a time that went back exactly as the live run did.
-//!
-//! A host stamps its calls from more than one clock read (an input event's timestamp, the
-//! frame's `now`), so two live calls can arrive with times that interleave, and the first
-//! call after attach can predate the epoch. The wrapper never drops or refuses a user's
-//! input for that: it records each live call at the task's logical time
-//! `max(floor, t)`, where `floor` is the latest time the task has seen (its clock, its last
-//! key and its last hot tick; never before the epoch) and, while paused, also the latest
-//! queued key's, so the queue is delivered in order after a resume or a commit. Every
-//! input whose time moved is counted ([`MomentumAosStatus::clamped`]). The log holds the
-//! logical times, so a replay reproduces the live run exactly, and
-//! [`AdmitRefusal::TimeWentBack`] stays the refusal for a decoded or replayed log whose
-//! own times go back. Apart from admission refusals and the paused overlay, this clamp is
-//! the one place attached execution differs from unattached: an input is applied up to the
-//! backward skew between the host's clocks later than the host stamped it, and never
-//! earlier. A time past the horizon is not moved; it is refused. Once a running attach's
-//! live time passes the horizon no timed input can be admitted again (logical time never goes
-//! back), so the next live call ends the attach: the shipped engine takes the state back
-//! whole and cools it on the host's own instants ([`MomentumHost::aos_detach`]).
-//!
-//! A reset that would change nothing (the glow already at rest, or, while paused, at rest
-//! once the queue is delivered) is not an input: nothing is recorded or queued for it, so a
-//! host that resets every turn (Serious Mode's drain) neither fills the log nor the queue.
-//!
-//! # Pause and repair
-//!
-//! While paused, keys and resets queue ([`PausedClass::Queue`]); ticks and queries are
-//! skipped ([`PausedClass::Skip`]): a tick is shown the held overlay (a copy of the last
-//! delivered tick's quads and frame) only while its own gates allow the glow (enabled, a
-//! positive intensity, a cursor, a non-degenerate geometry) and only for the caret it was
-//! drawn for (the same cell, geometry, page and caret shape); otherwise it is shown the inert
-//! frame and nothing is appended, as the engine would show it. `is_active` and `settling`
-//! read false and `next_change_deadline` answers `None`, so the host's lane parks with the
-//! held frame on glass. [`MomentumHost::aos_pause`] records a final schedule query at the pause instant
-//! first, so the trace ends with the schedule the live code would arm.
-//! [`MomentumHost::aos_repair`] requires a prior pause (it never pauses on its own: the
-//! final query needs the host's `now` and frame interval) and publishes the candidate
-//! only when [`NoStrandedLight`] passes on its replay over the recorded trace.
-//!
-//! # The demonstration fault
-//!
-//! [`MomentumCode::DemoStrandedSettle`] exists only under `cfg(any(test, debug_assertions))`.
-//! It is **an intentionally introduced demonstration fault, not a defect of shipped code**:
-//! the shipped engine except that `next_change_deadline` forgets the settle forecast
-//! (`Some(now + frame_interval)` while `is_active`, `None` otherwise). In the host a settling
-//! glow with no wake fails the frame lane's filter and the lane parks with the halo, tint and
-//! steady pin still on screen (design §2 item 2).
+//! The typing-momentum glow as an Aos task, and the live wrapper every host calls (design of record: `docs/DESIGN-aos-hosted-execution-2026-10-21.md` §2 and §4.3).
 
 use core::fmt;
 use std::time::Duration;
@@ -133,8 +48,7 @@ pub use trace::{
     TraceReplay,
 };
 
-/// The version of the input and observation encodings ([`MomentumSchema`]). The schema
-/// artifact's descriptor binds it with [`MOMENTUM_GLOW_SNAPSHOT_SCHEMA`].
+/// The version of the input and observation encodings ([`MomentumSchema`]).
 pub const MOMENTUM_EVENT_ENCODING: u16 = 1;
 
 /// The task artifact's name.
@@ -146,47 +60,30 @@ pub const CONTRACT_NAME: &str = "momentum-glow.no-stranded-light";
 /// The numerical half of the profile artifact's name, after the target.
 pub const NUMERIC_PROFILE: &str = "f32-ieee754/system-libm/single-thread";
 
-/// How many keys and resets may wait during a pause. The next one rejects the update before
-/// anything is dropped.
+/// How many keys and resets may wait during a pause.
 pub const MOMENTUM_QUEUE_CAP: usize = 1024;
 
-/// The most events a reader of a momentum log accepts (`EventLog::decode`'s limit), and the
-/// largest log epoch a hand-built attach may ask for.
+/// The most events a reader of a momentum log accepts (`EventLog::decode`'s limit), and the largest log epoch a hand-built attach may ask for.
 pub const MOMENTUM_MAX_EVENTS: usize = 1 << 16;
 
-/// How many inputs one log epoch of [`MomentumHost::aos_attach`] holds before the recorder
-/// re-anchors (a fresh checkpoint and an empty log of the next epoch; design §2 item 9). It
-/// bounds what one repair replays: `prepare` replays the live code and the candidate over at
-/// most this many inputs, on the host's main thread.
+/// How many inputs one log epoch of [`MomentumHost::aos_attach`] holds before the recorder re-anchors (a fresh checkpoint and an empty log of the next epoch; design §2 item 9).
 pub const MOMENTUM_HOST_MAX_EVENTS: usize = 1 << 12;
 
-/// The contract's settle margin: a wake may land this long after the forecast it was armed
-/// for, and a tick this long after the cold forecast must be inert. The engine's own wake
-/// lands the same 1 ms after its forecast, so a float ulp between the forecast and the tick
-/// never decides the law.
+/// The contract's settle margin.
 pub const SETTLE_MARGIN: Duration = Duration::from_millis(1);
 
 /// The law: at every schedule query, a hot glow (`is_active || settling`) names a wake.
 pub const HOT_HAS_WAKE: &str = "HotHasWake";
-/// The law: while settling, the wake is no sooner than a frame out and no later than
-/// `max(cold_at + SETTLE_MARGIN, at + frame_interval)`.
+/// The law: while settling, the wake is no sooner than a frame out and no later than `max(cold_at + SETTLE_MARGIN, at + frame_interval)`.
 pub const WAKE_NO_LATER_THAN_CLEAR: &str = "WakeNoLaterThanClear";
-/// The law: a tick at or after the latest cold forecast plus [`SETTLE_MARGIN`], under the
-/// config of the tick that latched it and with no key or reset since, is inert. A forecast
-/// counts only when it was read with no key or reset since that tick (a key moves the latch
-/// only at the next tick, so the state's `cold_at` is stale until then), and a tick under
-/// another config ends it (another intensity or τ re-latches).
+/// The law: a tick at or after the latest cold forecast plus [`SETTLE_MARGIN`], under the config of the tick that latched it and with no key or reset since, is inert.
 pub const COLD_TICK_CLEARS: &str = "ColdTickClears";
 /// The law: the run observed each recorded input once, with the observation its kind makes.
 pub const RUN_MATCHES_INPUTS: &str = "RunMatchesInputs";
 /// The entry law: the state is one the engine can reach (its snapshot validates).
 pub const SNAPSHOT_VALID: &str = "momentum-glow.snapshot-valid";
 
-// ---- time ----
-
 /// `t − epoch` in signed nanoseconds. Exact for every pair of instants a host can hold (an
-/// `i128` holds every `Duration`'s nanoseconds); the saturating fallbacks are unreachable,
-/// and admission refuses them as outside the horizon.
 #[inline]
 fn offset_of(epoch: Instant, t: Instant) -> i128 {
     if let Some(after) = t.checked_duration_since(epoch) {
@@ -211,8 +108,6 @@ fn instant_of(epoch: Instant, at: i128) -> Option<Instant> {
         epoch.checked_sub(span)
     }
 }
-
-// ---- the state ----
 
 /// The task's owned state: the engine and the latest admitted input's time.
 #[derive(Clone, Copy, Debug, Default)]
@@ -244,8 +139,6 @@ impl MomentumState {
     }
 
     /// The latest time the task has seen: its clock, the last key and the last hot tick.
-    /// Admission holds every input to it, so a replay refuses a time that went back exactly
-    /// as the live run did.
     fn last_time(&self, epoch: Instant) -> Option<i128> {
         let seen = self
             .glow
@@ -254,8 +147,6 @@ impl MomentumState {
         [self.clock, seen[0], seen[1]].into_iter().flatten().max()
     }
 }
-
-// ---- inputs ----
 
 /// [`Geom`], every field, as plain encodable data.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -380,8 +271,7 @@ impl ConfigRecord {
     }
 }
 
-/// One input to the task: one host call. `at` is signed nanoseconds from the recording
-/// epoch.
+/// One input to the task: one host call.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum MomentumEvent {
     /// `on_key(now, tau_s)`.
@@ -403,9 +293,7 @@ pub enum MomentumEvent {
     Query { at: i128, frame_interval: Duration },
 }
 
-// ---- observations ----
-
-/// What one step makes visible. Instants are offsets from the recording epoch.
+/// What one step makes visible.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MomentumObservation {
     /// A key was credited.
@@ -431,8 +319,7 @@ pub enum MomentumObservation {
     Refused(AdmitRefusal),
 }
 
-/// What [`MomentumCode::apply`] did, with the host's own instants (the observation maps
-/// them to offsets).
+/// What [`MomentumCode::apply`] did, with the host's own instants (the observation maps them to offsets).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Applied {
     /// A key was credited.
@@ -484,26 +371,7 @@ fn observe(
     }
 }
 
-// ---- the schema ----
-
-/// The task ABI: [`MomentumState`], [`MomentumEvent`] and [`MomentumObservation`], their
-/// canonical encodings, and the recording epoch every offset is taken from. The epoch is the
-/// host's, not part of the artifact: the engine reads time only through differences, so the
-/// same offsets behave identically on any epoch.
-///
-/// # Encodings (little-endian, [`aterm_aos::wire`])
-///
-/// * State: the 64-byte [`MomentumGlowSnapshot`] (schema [`MOMENTUM_GLOW_SNAPSHOT_SCHEMA`]),
-///   then the clock as an optional offset.
-/// * Input: a tag (`0` key, `1` reset, `2` tick, `3` query), then for a key `at`, `tau`
-///   bits; for a tick the optional `(row, col)`, `at`, the geometry (`cw`, `ch`, `rows`,
-///   `cols` as `u64`, then `origin_x`, `origin_y`, `win_w`, `win_h`, `head`) and the config
-///   in field order (floats as bits, the glyph span as an optional `i32` pair); for a query
-///   `at` and the frame interval.
-/// * Observation: a tag (`0` keyed, `1` reset, `2` frame, `3` schedule, `4` refused), then
-///   for a frame the optional fill, `hot`, `fp` and each stream as a `u64` count of quads
-///   (`row`, `x`, `y`, `w`, `h`, `color`, `alpha`, `color2`, `alpha2`); for a schedule the
-///   two predicates and the two optional offsets; for a refusal its variant's tag and fields.
+/// The task ABI: [`MomentumState`], [`MomentumEvent`] and [`MomentumObservation`], their canonical encodings, and the recording epoch every offset is taken from.
 #[derive(Clone, Debug)]
 pub struct MomentumSchema {
     id: ArtifactId,
@@ -553,8 +421,6 @@ const fn snapshot_fault(r: SnapshotRefusal) -> WireFault {
         | SnapshotRefusal::Instant { field, .. } => WireFault::NonCanonical {
             field: field.name(),
         },
-        // At rest a fingerprint history is the wrong field; otherwise τ is (it is 0 beside a
-        // hot tick's fingerprint, or non-zero at rest).
         SnapshotRefusal::History {
             rate_bits: 0,
             fp_prev: 1..,
@@ -589,16 +455,12 @@ const fn usize_u64(v: usize) -> u64 {
 }
 
 /// The length of one encoded quad: `row`, `x`, `y`, `w`, `h` as `u16`, then `color` (`u32`),
-/// `alpha` (`u8`), `color2` (`u32`) and `alpha2` (`u8`).
 const QUAD_LEN: usize = 20;
 
 /// The most a frame observation's encoding takes besides its quads: the tag, the optional
-/// fill (a tag and a `u32`), `hot`, `fp` and the two stream counts.
 const FRAME_HEAD_LEN: usize = 1 + 5 + 1 + 8 + 8 + 8;
 
 /// One quad's encoding: its nine fields in order, each little-endian, which is exactly what
-/// the nine field writes `e.u16(q.row)`, `e.u16(q.x)`, … `e.u8(q.alpha2)` append. Written as
-/// one 20-byte slice.
 const fn quad_bytes(q: &GlowQuad) -> [u8; QUAD_LEN] {
     let [r0, r1] = q.row.to_le_bytes();
     let [x0, x1] = q.x.to_le_bytes();
@@ -620,8 +482,6 @@ fn encode_quads(e: &mut Enc, quads: &[GlowQuad]) {
 }
 
 /// A frame observation's encoding from the frame and the quads it appended: the one encoder
-/// of [`MomentumObservation::Frame`], which the live host also calls on the quads in its own
-/// vectors, so its chain links the bytes a replay links without building the observation.
 fn encode_frame(e: &mut Enc, frame: &MomentumGlowFrame, out: &[GlowQuad], under: &[GlowQuad]) {
     e.u8(2);
     e.opt(frame.fill, |e, f| e.u32(f));
@@ -632,7 +492,6 @@ fn encode_frame(e: &mut Enc, frame: &MomentumGlowFrame, out: &[GlowQuad], under:
 }
 
 /// Room for a frame observation's encoding over `quads` quads: [`FRAME_HEAD_LEN`] and
-/// [`QUAD_LEN`] each. A capacity hint; it writes nothing.
 const fn frame_room(quads: usize) -> usize {
     FRAME_HEAD_LEN.saturating_add(QUAD_LEN.saturating_mul(quads))
 }
@@ -719,8 +578,6 @@ impl Schema for MomentumSchema {
     }
 
     fn encode_state(&self, s: &MomentumState, e: &mut Enc) {
-        // No pair of std instants is unrepresentable as i128 nanoseconds; were one, its
-        // all-zero bytes (schema 0) would be refused by every decoder.
         match s.glow.snapshot(self.epoch) {
             Ok(snap) => e.raw(&snap.encode()),
             Err(_) => e.raw(&[0u8; MomentumGlowSnapshot::LEN]),
@@ -881,11 +738,7 @@ impl Schema for MomentumSchema {
     }
 }
 
-// ---- artifacts ----
-
 /// The target this build runs on, as `arch-os[-env]` (`std::env::consts` and `target_env`).
-/// The target the profile artifact names (`<arch>-<os>[-<env>]`): a trace recorded on one
-/// target is refused on another (its profile differs).
 #[must_use]
 pub fn target_name() -> String {
     let env = if cfg!(target_env = "gnu") {
@@ -908,8 +761,7 @@ pub fn task_artifact() -> ArtifactId {
     ArtifactId::new(ArtifactKind::Task, TASK_NAME, 1, e.as_bytes())
 }
 
-/// The schema artifact `momentum-glow.state+events` v1: binds the snapshot schema and the
-/// event encoding version.
+/// The schema artifact `momentum-glow.state+events` v1: binds the snapshot schema and the event encoding version.
 #[must_use]
 pub fn schema_artifact() -> ArtifactId {
     let mut e = Enc::new();
@@ -919,8 +771,7 @@ pub fn schema_artifact() -> ArtifactId {
     ArtifactId::new(ArtifactKind::Schema, SCHEMA_NAME, 1, e.as_bytes())
 }
 
-/// The profile artifact: the target, the numerical host profile ([`NUMERIC_PROFILE`]) and
-/// [`MOMENTUM_PROFILE`]'s limits.
+/// The profile artifact: the target, the numerical host profile ([`NUMERIC_PROFILE`]) and [`MOMENTUM_PROFILE`]'s limits.
 #[must_use]
 pub fn profile_artifact() -> ArtifactId {
     let target = target_name();
@@ -953,17 +804,12 @@ pub fn momentum_identity(code: &PrebuiltMomentum) -> TaskIdentity {
     }
 }
 
-// ---- the code ----
-
 /// The prebuilt implementations compiled into this build (design §2 item 1).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum MomentumCode {
     /// The shipped engine, called directly.
     Shipped,
-    /// **An intentionally introduced demonstration fault, not a defect of shipped code**: the
-    /// shipped engine except that `next_change_deadline` forgets the settle forecast
-    /// (`Some(now + frame_interval)` while `is_active`, `None` otherwise), so a settling glow
-    /// names no wake and a host's lane parks with light on glass.
+    /// **An intentionally introduced demonstration fault, not a defect of shipped code**.
     #[cfg(any(test, debug_assertions))]
     DemoStrandedSettle,
 }
@@ -1021,8 +867,7 @@ impl MomentumCode {
         }
     }
 
-    /// Its artifact: version 1, the descriptor its name, version, the build id the host
-    /// supplies and its note.
+    /// Its artifact: version 1, the descriptor its name, version, the build id the host supplies and its note.
     #[must_use]
     pub fn artifact(self, build: &str) -> ArtifactId {
         let mut e = Enc::new();
@@ -1077,9 +922,7 @@ impl MomentumCode {
         }
     }
 
-    /// One input, admitted then applied: the one function both the live wrapper and
-    /// [`Code::step`] run. A tick's quads are appended to `out` / `under` after its scratch
-    /// budget is reserved on both; a refusal leaves `s` and both vectors untouched.
+    /// One input, admitted then applied: the one function both the live wrapper and [`Code::step`] run.
     pub fn apply(
         self,
         s: &mut MomentumState,
@@ -1142,9 +985,7 @@ impl MomentumCode {
     }
 }
 
-/// A prebuilt implementation bound to its artifact (which names the build it was compiled
-/// into): what a [`Boundary`] holds as code. [`Code::id`] returns a reference, and the
-/// descriptor carries the host's build id, so the id is stored beside the variant.
+/// A prebuilt implementation bound to its artifact (which names the build it was compiled into): what a [`Boundary`] holds as code.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PrebuiltMomentum {
     code: MomentumCode,
@@ -1187,7 +1028,6 @@ impl Code<MomentumSchema> for PrebuiltMomentum {
     }
 
     /// Total: an admission refusal is the observation [`MomentumObservation::Refused`], never
-    /// a [`StepRefusal`]. Momentum declares no external effects; `port` is never used.
     fn step(
         &self,
         schema: &MomentumSchema,
@@ -1203,12 +1043,7 @@ impl Code<MomentumSchema> for PrebuiltMomentum {
     }
 }
 
-// ---- the corrected contract ----
-
-/// `momentum-glow.no-stranded-light` v1 (design §2 item 3), judged over a replay's
-/// observations: [`HOT_HAS_WAKE`], [`WAKE_NO_LATER_THAN_CLEAR`], [`COLD_TICK_CLEARS`], and
-/// [`RUN_MATCHES_INPUTS`] (each input observed once, as its kind). A refused input changed
-/// nothing and is judged by no law. The first failure names its cursor and law.
+/// `momentum-glow.no-stranded-light` v1 (design §2 item 3), judged over a replay's observations.
 #[derive(Clone, Debug)]
 pub struct NoStrandedLight {
     id: ArtifactId,
@@ -1278,8 +1113,6 @@ impl Contract<MomentumSchema> for NoStrandedLight {
         run: &Run<MomentumSchema>,
     ) -> Verdict {
         let margin = nanos(SETTLE_MARGIN);
-        // The latest cold forecast and the config of the tick that latched it; the last
-        // tick's config; and whether no key or reset came after that tick.
         let mut forecast: Option<(i128, ConfigRecord)> = None;
         let mut last_tick: Option<ConfigRecord> = None;
         let mut latch_current = false;
@@ -1405,10 +1238,7 @@ impl Contract<MomentumSchema> for NoStrandedLight {
     }
 }
 
-// ---- the live wrapper ----
-
 /// The live observation chain since the current ancestor checkpoint: what a replay of the
-/// log from that checkpoint must reproduce.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct LiveChain {
     /// The log epoch and first cursor it folds from.
@@ -1418,7 +1248,6 @@ struct LiveChain {
 }
 
 /// The last delivered tick's frame and the quads it appended: the held overlay, with the
-/// caret it was drawn for.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Held {
     frame: MomentumGlowFrame,
@@ -1433,10 +1262,6 @@ struct Held {
 
 impl Held {
     /// Whether a paused tick at (`cur`, `geom`, `cfg`) is shown this overlay: only while the
-    /// tick's own gates allow the glow (the engine's inert arms: off, no positive intensity,
-    /// no cursor, a degenerate geometry) and only for the caret it was drawn for. Anything
-    /// else (Serious Mode, the glow's switch, focus, a scroll, a resize, a page or caret
-    /// change) is shown the inert frame.
     #[inline]
     fn shows(&self, cur: Option<(u16, u16)>, geom: &Geom, cfg: &MomentumGlowConfig) -> bool {
         cfg.enabled
@@ -1453,7 +1278,6 @@ impl Held {
 }
 
 /// Whether the glow is at rest: what `MomentumGlow::reset` leaves (its snapshot is the
-/// default's; `light_ink_memo` is a cache, design §2 item 7).
 #[inline]
 fn at_rest(s: &MomentumState, epoch: Instant) -> bool {
     s.glow.snapshot(epoch) == MomentumGlow::default().snapshot(epoch)
@@ -1468,21 +1292,14 @@ struct Hosted {
     /// The latest recorded query's time and the wake it was answered with.
     last_query: Option<(i128, Option<i128>)>,
     /// How many live inputs were recorded at the logical time instead of their own, earlier
-    /// one (the module docs' "Time").
     clamped: u64,
     /// The latest time among the keys queued in the current pause (within the horizon).
     queued_at: Option<i128>,
     /// The one encoder every live observation is encoded into before its chain link, cleared
-    /// for each: it keeps the room the largest recent frame took, and gives it back with the
-    /// held overlay's when a tick draws nothing (see [`Hosted::deliver`]).
     scratch: Enc,
 }
 
 /// Makes `v` hold exactly the quads of `from`, in the room it already has when that is
-/// enough: an overlay redrawn every frame is copied without an allocation per frame. Growing,
-/// it takes at least twice its old room (one allocation, then the old room is freed first).
-/// An empty `from` gives the room back, so an overlay that holds nothing keeps nothing,
-/// as a copy of no quads (`to_vec`) would.
 fn refill(v: &mut Vec<GlowQuad>, from: &[GlowQuad]) {
     if from.is_empty() {
         *v = Vec::new();
@@ -1521,9 +1338,7 @@ enum HostMode {
     Hosted(Box<Hosted>),
 }
 
-/// The momentum glow as the host holds it: the shipped engine directly while unattached,
-/// the published (code, state) pair while attached. Replaces `CursorFx::momentum:
-/// MomentumGlow`; no `Deref`/`DerefMut`, so nothing can bypass the pair.
+/// The momentum glow as the host holds it.
 pub struct MomentumHost {
     mode: HostMode,
 }
@@ -1570,7 +1385,6 @@ impl Hosted {
     }
 
     /// The logical time of a live call the host stamped `now`: `max(floor, now − epoch)`
-    /// (the module docs' "Time"), and whether that moved it.
     #[inline]
     fn logical(&self, now: Instant) -> (i128, bool) {
         let at = offset_of(self.epoch(), now);
@@ -1588,14 +1402,11 @@ impl Hosted {
     }
 
     /// Folds one recorded input's observation into the live chain, restarting it when the
-    /// boundary has re-anchored (a new log epoch or first cursor).
     fn fold(&mut self, cursor: u64, obs: &MomentumObservation) {
         self.link(cursor, |schema, e| schema.encode_observation(obs, e));
     }
 
     /// [`Hosted::fold`] of the observation `encode` writes: the chain links the bytes it
-    /// appends to the host's one encoder, cleared first, so they are exactly what a fresh
-    /// encoder would hold.
     fn link(&mut self, cursor: u64, encode: impl FnOnce(&MomentumSchema, &mut Enc)) {
         let Some(log) = self.boundary.log() else {
             return;
@@ -1618,7 +1429,6 @@ impl Hosted {
     }
 
     /// The live observation chain since the current log's anchor: the empty chain until the
-    /// first input of a fresh log (an attach, a commit, a restore or a re-anchor) is folded.
     fn live_chain(&self) -> Digest {
         match self.boundary.log() {
             Some(log)
@@ -1631,7 +1441,6 @@ impl Hosted {
     }
 
     /// Folds what the boundary delivered itself (a queue, an overflowing input), whose
-    /// accepted inputs took consecutive cursors from `first`.
     fn fold_delivered(
         &mut self,
         first: u64,
@@ -1645,8 +1454,6 @@ impl Hosted {
     }
 
     /// One host call as one input: recorded and applied through the live code while running,
-    /// queued or skipped while paused. `None` when the task did not run it now. `moved`: its
-    /// time is the logical time, not the host's own (counted unless the input is skipped).
     fn deliver(
         &mut self,
         ev: &MomentumEvent,
@@ -1683,9 +1490,6 @@ impl Hosted {
         let drawn = out.get(out_from..).unwrap_or(&[]);
         let drawn_under = under.get(under_from..).unwrap_or(&[]);
         if let (MomentumEvent::Tick { cur, geom, cfg, .. }, Applied::Frame(frame)) = (ev, applied) {
-            // A frame is linked from the quads it appended, through the encoder of the
-            // observation `observe` would build from them (`encode_frame`), and copied once,
-            // into the held overlay's own vectors: no observation is built to be taken apart.
             self.link(first, |_, e| {
                 e.reserve(frame_room(drawn.len().saturating_add(drawn_under.len())));
                 encode_frame(e, &frame, drawn, drawn_under);
@@ -1737,8 +1541,6 @@ impl Hosted {
     }
 
     /// Whether a reset now changes nothing: running, the glow is at rest; paused, it is at
-    /// rest once the queue is delivered (the queue ends in a reset, or holds nothing and the
-    /// paused state is at rest).
     fn reset_changes_nothing(&self) -> bool {
         if self.boundary.is_paused() {
             match self.boundary.last_queued() {
@@ -1756,7 +1558,6 @@ impl Hosted {
         let ev = MomentumEvent::Query { at, frame_interval };
         match self.deliver(&ev, moved, &mut Vec::new(), &mut Vec::new())? {
             Applied::Schedule { deadline, .. } => deadline,
-            // Refused: the frame cadence while hot, never a parked lane with light on glass.
             _ => {
                 let (code, s) = (self.code(), self.state());
                 (code.is_active(s) || code.settling(s))
@@ -1769,11 +1570,6 @@ impl Hosted {
 
 impl MomentumHost {
     /// A running attach whose live time at `now` is past the hosted horizon can admit no timed
-    /// input again (logical time never goes back, and every such input is refused `Horizon`),
-    /// so a hot glow would stay hot and undrawn for good: the attach ends here and the shipped
-    /// engine takes the state back whole, so the call that crossed the horizon already runs
-    /// on it. A paused attach is left alone: its glow reads neither active nor settling, and
-    /// ending it would end the operator's pause.
     #[inline]
     fn expire_past_horizon(&mut self, now: Instant) {
         if let HostMode::Hosted(h) = &self.mode
@@ -1783,8 +1579,6 @@ impl MomentumHost {
             self.aos_detach();
         }
     }
-
-    // ---- the calls the host makes today ----
 
     /// One printable key (`MomentumGlow::on_key`).
     #[inline]
@@ -1803,8 +1597,7 @@ impl MomentumHost {
         }
     }
 
-    /// Back to rest (`MomentumGlow::reset`). Attached, a reset that would change nothing is
-    /// not delivered: nothing is recorded or queued for it.
+    /// Back to rest (`MomentumGlow::reset`).
     #[inline]
     pub fn reset(&mut self) {
         match &mut self.mode {
@@ -1823,10 +1616,7 @@ impl MomentumHost {
         }
     }
 
-    /// One frame (`MomentumGlow::tick`). Attached, the quads go straight into the host's
-    /// vectors (other effects' prefixes untouched); paused, the held overlay is re-appended
-    /// and its frame returned while the frame's gates allow the glow for the caret it was
-    /// drawn for, and the inert frame (nothing appended) otherwise.
+    /// One frame (`MomentumGlow::tick`).
     #[inline]
     pub fn tick(
         &mut self,
@@ -1884,8 +1674,7 @@ impl MomentumHost {
         }
     }
 
-    /// The analytic cold instant (`MomentumGlow::cold_at`), read from the state (paused
-    /// too: it is a fact about the state, not a schedule answer).
+    /// The analytic cold instant (`MomentumGlow::cold_at`), read from the state (paused too: it is a fact about the state, not a schedule answer).
     #[inline]
     #[must_use]
     pub fn cold_at(&self) -> Option<Instant> {
@@ -1905,9 +1694,7 @@ impl MomentumHost {
         }
     }
 
-    /// The wake the live code names (`MomentumGlow::next_change_deadline`). `&mut`: attached,
-    /// it records the host's scheduler question as a [`MomentumEvent::Query`]. `None` while
-    /// paused (the lane parks; the held frame stays on glass).
+    /// The wake the live code names (`MomentumGlow::next_change_deadline`).
     #[inline]
     pub fn next_change_deadline(
         &mut self,
@@ -1921,16 +1708,7 @@ impl MomentumHost {
         }
     }
 
-    // ---- Aos control (the gui `aos` verb calls these) ----
-
-    /// Starts hosting: checkpoint C0 of the current state and an empty log of `log_epoch`,
-    /// with `code` running it from here on and `build` (the host's build id) in its
-    /// descriptor. Times are offsets from `epoch`. Re-attaching with the same epoch, code and
-    /// build re-anchors on the same boundary (a fresh checkpoint whose parent is the old one;
-    /// a pending update is rejected first, its queue delivered once to the old pair). Any
-    /// other re-attach detaches first and starts a fresh boundary.
-    /// Each log epoch holds [`MOMENTUM_HOST_MAX_EVENTS`] inputs, so a repair replays at most
-    /// that many.
+    /// Starts hosting: checkpoint C0 of the current state and an empty log of `log_epoch`, with `code` running it from here on and `build` (the host's build id) in its descriptor.
     pub fn aos_attach(&mut self, epoch: Instant, code: MomentumCode, build: &str, log_epoch: u64) {
         self.attach_with(
             epoch,
@@ -1957,9 +1735,6 @@ impl MomentumHost {
             && h.build == build
         {
             let first = h.cursor();
-            // The wrapper admits and advances each input within one call, so no input is
-            // pending here and `attach` has no `MidStep` to refuse; were it refused, nothing
-            // changed and the old recording goes on.
             if h.boundary.attach(log_epoch, max_events).is_ok() {
                 let delivered = h.boundary.take_delivered();
                 h.fold_delivered(first, &delivered);
@@ -1977,8 +1752,6 @@ impl MomentumHost {
             MomentumState::new(glow),
             queue_cap,
         );
-        // A new boundary has no input pending, so this attaches; were it refused, the glow
-        // stays unattached rather than hosted without a recording.
         if boundary.attach(log_epoch, max_events).is_err() {
             self.mode = HostMode::Direct(boundary.pair().state.glow);
             return;
@@ -2003,7 +1776,6 @@ impl MomentumHost {
     }
 
     /// Detaches and returns the engine (a pending update is rejected first: the queue goes to
-    /// the old pair once).
     fn take_glow(&mut self) -> MomentumGlow {
         match core::mem::replace(&mut self.mode, HostMode::Direct(MomentumGlow::default())) {
             HostMode::Direct(g) => g,
@@ -2014,21 +1786,16 @@ impl MomentumHost {
         }
     }
 
-    /// Stops hosting: the live state moves back as a whole and the shipped engine runs it
-    /// directly again. A pending update is rejected first (its queue is delivered once to
-    /// the old pair). Unattached: nothing.
+    /// Stops hosting: the live state moves back as a whole and the shipped engine runs it directly again.
     pub fn aos_detach(&mut self) {
         let glow = self.take_glow();
         self.mode = HostMode::Direct(glow);
     }
 
-    /// Pauses at this step boundary: first records a final schedule query at `now` (so the
-    /// trace ends with the schedule the live code would arm), then captures the expected head.
+    /// Pauses at this step boundary.
     ///
     /// # Errors
-    ///
-    /// [`PublishRefusal::NotAttached`] or [`PublishRefusal::AlreadyPaused`]; nothing is
-    /// recorded then.
+    /// [`PublishRefusal::NotAttached`] or [`PublishRefusal::AlreadyPaused`]; nothing is recorded then.
     pub fn aos_pause(
         &mut self,
         now: Instant,
@@ -2045,17 +1812,10 @@ impl MomentumHost {
         h.boundary.pause()
     }
 
-    /// Prepares `candidate` against the paused head (shadow replay of the live code and the
-    /// candidate from the ancestor checkpoint, judged by [`NoStrandedLight`]) and commits it.
-    /// Requires a prior [`Self::aos_pause`]: it never pauses on its own, because the final
-    /// query needs the host's `now` and frame interval. After a commit the host re-plans its
-    /// lane from the accepted state; the queued inputs were delivered once, in order, to the
-    /// new pair.
+    /// Prepares `candidate` against the paused head (shadow replay of the live code and the candidate from the ancestor checkpoint, judged by [`NoStrandedLight`]) and commits it.
     ///
     /// # Errors
-    ///
-    /// Any [`PublishRefusal`] `prepare` or `commit` returns (`NotAttached`, `NotPaused`,
-    /// `CandidateFailed`, …). The boundary is untouched: still paused, the queue intact.
+    /// Any [`PublishRefusal`] `prepare` or `commit` returns (`NotAttached`, `NotPaused`, `CandidateFailed`, …).
     pub fn aos_repair(
         &mut self,
         candidate: MomentumCode,
@@ -2071,8 +1831,7 @@ impl MomentumHost {
         Ok(commit)
     }
 
-    /// Rejects the pending update: the old pair resumes and receives each queued input once,
-    /// in order (returned). Not paused or not attached: nothing.
+    /// Rejects the pending update: the old pair resumes and receives each queued input once, in order (returned).
     pub fn aos_resume(&mut self) -> Vec<Result<MomentumObservation, StepRefusal>> {
         let HostMode::Hosted(h) = &mut self.mode else {
             return Vec::new();
@@ -2166,13 +1925,9 @@ impl MomentumHost {
         }
     }
 
-    /// The ancestor checkpoint and the log since it, encoded, with the identity they were
-    /// recorded under and the head the live run reached (the state digest and the observation
-    /// chain since the checkpoint): what a lab or a file dump keeps to replay the trace
-    /// elsewhere ([`MomentumTrace::encode`], [`MomentumTrace::replay`]).
+    /// The ancestor checkpoint and the log since it, encoded, with the identity they were recorded under and the head the live run reached (the state digest and the observation chain since the checkpoint).
     ///
     /// # Errors
-    ///
     /// [`TraceRefusal::NotAttached`], or an encoder's `TooLarge`.
     pub fn aos_trace(&self) -> Result<MomentumTrace, TraceRefusal> {
         let HostMode::Hosted(h) = &self.mode else {
@@ -2202,8 +1957,7 @@ pub struct FrameSummary {
     pub under: usize,
 }
 
-/// [`MomentumHost::aos_status`]: plain data. Times are signed ns from the recording epoch.
-/// `is_active` and `settling` are the state's own (the host reads `false` while paused).
+/// [`MomentumHost::aos_status`]: plain data.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct MomentumAosStatus {
     pub attached: bool,
@@ -2241,9 +1995,7 @@ pub struct MomentumAosStatus {
     pub next_deadline: Option<i128>,
     pub last_frame: Option<FrameSummary>,
     pub stats: Stats,
-    /// How many live inputs were recorded at the task's logical time instead of their own
-    /// earlier one (two host clocks interleaved, or a call before the epoch). Always 0
-    /// unattached.
+    /// How many live inputs were recorded at the task's logical time instead of their own earlier one (two host clocks interleaved, or a call before the epoch).
     pub clamped: u64,
 }
 
@@ -2312,7 +2064,7 @@ impl fmt::Display for MomentumAosStatus {
     }
 }
 
-/// Why [`MomentumHost::aos_trace`] exported nothing. Nothing is changed.
+/// Why [`MomentumHost::aos_trace`] exported nothing.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TraceRefusal {
     /// The glow is not attached: there is no checkpoint or log.

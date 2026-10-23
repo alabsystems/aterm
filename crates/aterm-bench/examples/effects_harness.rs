@@ -123,7 +123,6 @@ use aterm_gpu::{FrameShape, GpuContext, GpuRenderer, UnormAblation, WindowGpu};
 use aterm_render::{GlowQuad, RenderInput, Renderer, Theme, WindowCpu};
 
 /// The desk's cell: JetBrains Mono at 30 px is 18x40, the "2x Retina" cell the effects frame
-/// costs are stated at (`aterm-effects/tests/cursor_bench.rs`).
 const FONT_PX: f32 = 30.0;
 const ROWS: usize = 26;
 const COLS: usize = 190;
@@ -137,11 +136,9 @@ const RUNS: usize = 5;
 /// Keys typed into the composer under the settled card.
 const SETTLED_KEYS: usize = 120;
 /// Keys typed into the composer under the flowing card, and their pace (the typist's, 12 a
-/// second): a key falls between two of the flow's 128 ms steps or on one.
 const FLOWING_KEYS: usize = 48;
 const FLOWING_KEYS_HZ: u32 = 12;
 /// The glow's frame clock and the typist's pace: a key every 10 ticks at 120 Hz is 12 a
-/// second (the Rainbow Kitty frame-cost gate's prose pace), then a second of run-out.
 const TYPING_HZ: u32 = 120;
 const TYPING_KEYS: usize = 48;
 const KEY_TICKS: usize = 10;
@@ -165,20 +162,17 @@ const REF_EVERY: usize = 8;
 const HANG: Duration = Duration::from_secs(60);
 
 /// The launch card as Claude Code prints it: the mascot's block elements and two lines of
-/// text, the longest ending in column 31.
 const CARD: [&str; 3] = [
     " \u{2590}\u{259B}\u{2588}\u{2588}\u{2588}\u{259C}\u{258C}   Claude Code v2.1.304",
     "\u{259D}\u{259C}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{259B}\u{2598}  Opus 4.5 \u{00B7} Claude Max",
     "  \u{2598}\u{2598} \u{259D}\u{259D}    ~/src/aterm",
 ];
 /// The card's box: its three rows and the line's, 62 columns, the trail from past the text to
-/// the kitty, which stands three rows tall (the third card row is blank across both).
 const BOX_ROWS: u16 = 4;
 const BOX_COLS: u16 = 62;
 const TRAIL: (u16, u16) = (33, 41);
 const KITTY_COL: u16 = 41;
 /// The card's line, in the box's last row: its `✦` in the card's text column and its words
-/// two columns on (`claude_card::LINE_LEAD`), as the app writes it under the card.
 const LINE_ROW: u16 = 3;
 const LINE_STAR_COL: u16 = 12;
 const LINE_COL: u16 = LINE_STAR_COL + 2;
@@ -202,7 +196,6 @@ fn elapsed_ns(since: Instant) -> u64 {
 }
 
 /// This thread's CPU time: what a stretch of work cost the core, with the time the scheduler
-/// gave the core to someone else left out.
 #[cfg(unix)]
 fn thread_cpu_ns() -> u64 {
     let mut stamp = libc::timespec {
@@ -225,14 +218,11 @@ fn thread_cpu_ns() -> u64 {
 }
 
 /// The process's instructions retired so far, user and kernel, every thread: Apple's
-/// `proc_pid_rusage` (`ri_instructions`, read from the cores' fixed counters). The work a
-/// stretch of code does, which the desk's load does not move the way it moves time.
 #[cfg(target_os = "macos")]
 fn instructions() -> Option<u64> {
     let mut info = std::mem::MaybeUninit::<libc::rusage_info_v4>::zeroed();
     let pid = libc::c_int::try_from(std::process::id()).ok()?;
-    // SAFETY: `info` is writable for one `rusage_info_v4`, the flavor asked for; the call fills
-    // it or fails, and a zeroed one is a valid value either way.
+    // SAFETY: `info` is writable for one `rusage_info_v4`, the flavor asked for; the call fills it or fails, and a zeroed one is a valid value either way.
     let rc = unsafe {
         libc::proc_pid_rusage(
             pid,
@@ -251,14 +241,10 @@ fn instructions() -> Option<u64> {
 }
 
 /// The instructions a [`Stopwatch`] counts around nothing at all (its own reads), taken out of
-/// every reading. Set once by [`calibrate_counter`].
 static COUNTER_OVERHEAD: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
 
 /// Whether the instruction counter counts here: it reads, and a loop of known length moves it
-/// (a counter that reads a constant would report every frame as free). Measures the
-/// stopwatch's own reads on the way.
 fn calibrate_counter() -> bool {
-    // Uncalibrated, `stop` takes nothing out: an empty stretch reads the reads themselves.
     let empty = (0..64).filter_map(|_| Stopwatch::start().stop().ins).min();
     let Some(empty) = empty else {
         return false;
@@ -274,7 +260,6 @@ fn calibrate_counter() -> bool {
 }
 
 /// A stretch of work on this thread: its wall time, its CPU time and the process's
-/// instructions retired across it (`None` with no counter).
 #[derive(Clone, Copy, Debug, Default)]
 struct Spent {
     wall_ns: u64,
@@ -290,7 +275,6 @@ struct Stopwatch {
 
 impl Stopwatch {
     /// The counter first and the wall last, so each clock spans the reads inside it the same
-    /// way every time (a constant the overhead calibration takes out).
     fn start() -> Self {
         Self {
             ins: instructions(),
@@ -343,7 +327,6 @@ fn set_clocked(_: bool) {
 }
 
 /// One way the GPU presenter draws a frame: a plan of the pass-economy seam, timed or with the
-/// clock paused.
 #[derive(Clone, Copy, Debug)]
 struct Way {
     ablation: UnormAblation,
@@ -449,7 +432,6 @@ impl Sample {
 }
 
 /// One reference frame's costs, the calibration the `_rel` keys divide by, and the GPU time of
-/// the blank full repaint drawn beside it (the reference's own calibration).
 #[derive(Clone, Copy, Debug, Default)]
 struct RefSample {
     raster: Spent,
@@ -468,8 +450,6 @@ struct Run {
 }
 
 /// The calibration: two screens of plain text, each differing from the other in every row, so
-/// each reference frame is a full repaint, on windows of their own; and two blank screens (cell
-/// backgrounds of two shades, no glyph), each a full repaint of what every present pays.
 struct Reference {
     inputs: [RenderInput; 2],
     blanks: [RenderInput; 2],
@@ -596,7 +576,6 @@ impl Rig {
             GpuRenderer::from_parts(ctx, raster("GPU presenter"), Some(font.into()), theme)
                 .unwrap_or_else(|e| fail(format!("the GPU renderer did not assemble: {e}")));
         gpu.set_pad(PAD);
-        // The shipped rendering defaults.
         gpu.set_bloom(true);
         gpu.set_shimmer(true);
         gpu.debug_block_on_lazy_fallbacks();
@@ -641,8 +620,6 @@ impl Rig {
     }
 
     /// The card's scene with its banner on grid row `top`, as the app lays it for a pane that
-    /// fills the window: window pixels, the left border in the padding, half a row of air over
-    /// the banner and under the box, the pane as the clip.
     fn card_scene(&self, top: u16) -> CardScene {
         let origin_x = i32::from(self.pad);
         let origin_y = i32::from(self.grid_top);
@@ -668,13 +645,11 @@ impl Rig {
             kitty_col: Some(KITTY_COL),
             kitty_rows: 3,
             palette: CardPalette::Cruise,
-            // The pane's ground is the theme's background, read as the app reads it.
             dark: dark_ground(self.theme.bg),
             ground: self.theme.bg,
             serious: false,
             coat: 0x00E8_A060,
             eye: 0x0040_C080,
-            // No mascot read: the flow's glints start at the box's inner top-left corner.
             wand: None,
         }
     }
@@ -700,7 +675,6 @@ impl Rig {
     }
 
     /// The device time of the present this renderer just made: awaited (a hang detector, not a
-    /// budget), `None` on an arm with no clock.
     fn gpu_time(&mut self) -> Option<u64> {
         if self.clock == "none" {
             return None;
@@ -743,7 +717,6 @@ impl Rig {
         let raster = watch.stop();
 
         let mut arms = [Arm::default(); 4];
-        // The order rotates so no way always runs first, on a GPU the CPU raster left idle.
         for k in 0..WAYS.len() {
             let i = (k + self.frames) % WAYS.len();
             let way = WAYS[i];
@@ -801,11 +774,6 @@ impl Rig {
     }
 
     /// The three plans of one frame did what their names say, read off the plans the arm built
-    /// (`FrameShape::unorm_draws`, counted from the plan, and the mode it was built under), so
-    /// an arm that ignored the seam ends the run instead of pricing the passes at nothing:
-    /// dropped, no Unorm draw is left and the all-sRGB plan is one pass; thinned, every Unorm
-    /// draw and every pass stays, each drawing at most one instance; and no plan built other
-    /// instances than the shipped one.
     fn check_ablation(off: &FrameShape, thin: &FrameShape, dropped: &FrameShape) {
         for (shape, way) in [off, thin, dropped].into_iter().zip(WAYS) {
             if shape.ablation != way.ablation {
@@ -890,7 +858,6 @@ impl Rig {
     }
 
     /// An unmeasured frame: fresh windows draw it in full, so the scene's measured frames are
-    /// the ones the app would present next.
     fn settle_window(&mut self, win: &mut Win, input: &mut RenderInput) {
         input.refresh_cursor_effect_damage();
         let _ = self.present(win, input, Spent::default(), 0);
@@ -901,8 +868,6 @@ impl Rig {
 const CARD_ID: u64 = 1;
 
 /// The card's host: the app's replay-or-draw (`claude_card.rs`): the card's frames (its kept
-/// settled or flow frame, the ring its episode frames are built in, its arts), the frame the last
-/// emit made, which the splice lays as the card's two fx layers, and the card's line.
 #[derive(Default)]
 struct CardHost {
     card: HarnessCard,
@@ -912,9 +877,6 @@ struct CardHost {
 }
 
 /// The card's line on the glass (`claude_card::make_line` and `ink_lines`): its ink, re-made
-/// only where the line moved or the card is not still (the app keys the line by its row and
-/// keeps a still card's settled gradient), and its `✦`, which the splice lays on the frame in
-/// place of the last splice's.
 #[derive(Default)]
 struct LineHost {
     row: Option<u16>,
@@ -947,8 +909,6 @@ impl LineHost {
             &mut self.ink,
         );
         self.settled = still;
-        // The `✦` leads the line in its first letter's ink: light added on dark, opaque ink on
-        // light.
         let [r, g, b] = self.ink.first().map_or([0xFF; 3], |c| c.color);
         self.star = Some(WordDecoration {
             row,
@@ -967,7 +927,6 @@ impl LineHost {
     }
 
     /// Lay the line's ink and `✦` on the frame. The bench's frames carry no other producer's,
-    /// so the last splice's are taken back by clearing the two streams.
     fn lay(&self, input: &mut RenderInput) {
         input.ink.clone_from(&self.ink);
         input.word_decorations.clear();
@@ -977,9 +936,6 @@ impl LineHost {
 
 impl CardHost {
     /// The producer, in the app's order: replayed (`true`) when the card is held at the settled
-    /// frame it keeps for a scene of this shape (an inline scroll is the same shape at a new
-    /// origin), or flows and keeps the frame of `now`'s step, else drawn on `now`. `animate`
-    /// is the motion verdict the app ticks the card with.
     fn emit(&mut self, now: Instant, scene: &CardScene, animate: bool) -> (bool, Spent) {
         let watch = Stopwatch::start();
         let kept = self
@@ -996,8 +952,6 @@ impl CardHost {
     }
 
     /// The splice, as the app's (`claude_card.rs`) does it: the card's two layers from the last
-    /// splice taken back by id, then this frame's laid at its origin and clipped to the pane
-    /// (`scene.clip`, `CardFrame::layers`): two `Arc`s, nothing copied.
     fn splice(&mut self, scene: &CardScene, grid: (i32, i32), input: &mut RenderInput) -> u64 {
         let started = Instant::now();
         clear_streams(input);
@@ -1026,7 +980,6 @@ impl CardHost {
 }
 
 /// The cursor glow's host: the content witness fed from the terminal's rows, then the tick, as
-/// the app does under its frame hold.
 struct GlowHost {
     glow: CursorGlow,
     cfg: GlowConfig,
@@ -1038,7 +991,6 @@ struct GlowHost {
 
 impl GlowHost {
     /// The shipped dark-theme glow config (the Rainbow Kitty's, as its frame-cost gate builds
-    /// it), on this theme's colours, in `style`.
     fn new(rig: &Rig, style: GlowStyle) -> Self {
         Self {
             glow: CursorGlow::default(),
@@ -1088,7 +1040,6 @@ impl GlowHost {
     }
 
     /// The app's stream map: aurora, halos, fire patches, under-light, charred glyphs and fire
-    /// halo cells.
     fn splice(&self, input: &mut RenderInput) -> u64 {
         let started = Instant::now();
         clear_streams(input);
@@ -1109,7 +1060,6 @@ fn cup(row: u16, col: u16) -> String {
 }
 
 /// The card's three rows from `top`, with a blank row over and two under (the line's row in the
-/// box, its words as the app writes them there, then the air).
 fn print_card(term: &mut Terminal, top: u16) {
     for (i, line) in CARD.iter().enumerate() {
         term.process(format!("{}{line}", cup(top + i as u16, 0)).as_bytes());
@@ -1125,12 +1075,10 @@ fn banner_at(term: &Terminal, row: u16, scratch: &mut Vec<char>) -> bool {
 }
 
 /// The intro, then the flowing card under typing, then the held card under typing, on one
-/// launch.
 fn card_scenes(rig: &mut Rig, seed: u64) -> (Run, Run, Run) {
     let mut term = Terminal::new(ROWS as u16, COLS as u16);
     term.process(b"$ claude");
     print_card(&mut term, CARD_TOP);
-    // The composer under the card, the caret in it.
     let composer = CARD_TOP + BOX_ROWS + 2;
     term.process(format!("{}> ", cup(composer, 0)).as_bytes());
     let mut input = RenderInput::empty();
@@ -1146,8 +1094,6 @@ fn card_scenes(rig: &mut Rig, seed: u64) -> (Run, Run, Run) {
     let mut episode = Vec::new();
     let mut now = t0;
     let most = (EPISODE_MS / FRAME_MS) as usize + 8;
-    // The intro asks for a frame every FRAME_MS; the first tick past it lets the intro go and
-    // draws the flow's first frame, after which the card flows on the ripple's steps.
     loop {
         Rig::extract(&mut term, &mut input);
         let (replayed, emit) = host.emit(now, &scene, true);
@@ -1170,7 +1116,6 @@ fn card_scenes(rig: &mut Rig, seed: u64) -> (Run, Run, Run) {
     }
     let episode = rig.take_run(episode);
 
-    // The card flowing on: the app presents at each key and at each step the card asks for.
     let key_every = Duration::from_secs(1) / FLOWING_KEYS_HZ;
     let typed_from = now;
     let mut flowing = Vec::with_capacity(FLOWING_KEYS * 2);
@@ -1205,8 +1150,6 @@ fn card_scenes(rig: &mut Rig, seed: u64) -> (Run, Run, Run) {
     }
     let flowing = rig.take_run(flowing);
 
-    // The card held (the motion verdict false): its first held frame draws the settled frame,
-    // unmeasured, so the window shows it before the keys land; every later one replays it.
     Rig::extract(&mut term, &mut input);
     let (replayed, _) = host.emit(now, &scene, false);
     if replayed || host.frames.kept().is_none_or(|k| k.step().is_some()) {
@@ -1249,7 +1192,6 @@ impl Script {
 }
 
 /// The flood measures the frame the ribbon's budget caps, or it measures nothing it names: its
-/// fullest frame spends the budget, give or take the hand's two quads.
 fn at_the_ribbon_budget(flood: &Run) {
     use aterm_effects::rainbow_kitty::ribbon::RIBBON_QUAD_BUDGET;
     let fullest = flood
@@ -1334,11 +1276,9 @@ fn scroll_scene(rig: &mut Rig) -> Run {
         }
         term.process(b"$ claude");
         print_card(&mut term, SCROLL_TOP);
-        // The caret on the last row: every streamed line scrolls the screen by one.
         term.process(cup(ROWS as u16 - 1, 0).as_bytes());
         let mut input = RenderInput::empty();
         let mut win = Win::new();
-        // An unarmed card draws its settled frame: the launch's episode has played out.
         let mut host = CardHost::default();
         let now = Instant::now();
         Rig::extract(&mut term, &mut input);
@@ -1352,8 +1292,6 @@ fn scroll_scene(rig: &mut Rig) -> Run {
         let mut top = SCROLL_TOP;
         let mut line = 0usize;
         while top > 1 {
-            // A reply's lines are each their own: a screen of one line repeated would diff
-            // row for row against itself, a frame no stream makes.
             line += 1;
             term.process(format!("{STREAMED} {line}\r\n").as_bytes());
             top -= 1;
@@ -1386,7 +1324,6 @@ fn pct(v: &mut [f64], p: f64) -> f64 {
 }
 
 /// A per-frame figure in nanoseconds (signed: a paired difference can be negative), `None`
-/// where the frame has none (no GPU clock).
 type Figure = fn(&Sample) -> Option<f64>;
 
 /// The same for a reference frame.
@@ -1401,7 +1338,6 @@ struct Scene {
     name: &'static str,
     runs: Vec<Run>,
     /// The producer is a replay: well under a microsecond and about 500 instructions, beside
-    /// the counter's own read of about 6,200 it is taken from, so it is reported, not rated.
     rate_emit: bool,
 }
 
@@ -1440,11 +1376,9 @@ impl Report {
 
 impl Scene {
     /// A counted report describes every frame, not just the counter reads
-    /// that happened to succeed. Check before printing any report keys.
     fn require_cpu_samples(&self) -> Result<(), String> {
         for (run_index, run) in self.runs.iter().enumerate() {
             let frames_complete = run.samples.iter().all(|sample| {
-                // Every way's call: `clock` is the off and untimed calls' difference.
                 sample.emit.ins.is_some()
                     && sample.raster.ins.is_some()
                     && sample.arms.iter().all(|arm| arm.call_ins.is_some())
@@ -1486,7 +1420,6 @@ impl Scene {
     }
 
     /// Each run's reference p50 over its scene p50 of `f`; `None` for a run with no reference
-    /// frame or no reading.
     fn run_rels(&self, f: Figure, reference: RefFigure) -> Vec<Option<f64>> {
         self.runs
             .iter()
@@ -1506,7 +1439,6 @@ impl Scene {
             format!("{s}_n"),
             self.runs.iter().map(|run| run.samples.len()).sum::<usize>() as u64,
         );
-        // The timed costs, p50 and p95 in microseconds; `gpu` ones only on a clocked arm.
         let timed: [(&str, Figure); 16] = [
             ("emit", |x| Some(ns(x.emit.wall_ns))),
             ("emit_cpu", |x| Some(ns(x.emit.cpu_ns))),
@@ -1523,7 +1455,6 @@ impl Scene {
             ("thin_gpu", |x| x.thin().gpu_ns.map(ns)),
             ("drop_encode", |x| Some(ns(x.drop().encode_ns))),
             ("drop_gpu", |x| x.drop().gpu_ns.map(ns)),
-            // Paired per frame: the extra passes' own encode.
             ("pass_encode", |x| {
                 Some(ns(x.thin().encode_ns) - ns(x.drop().encode_ns))
             }),
@@ -1536,8 +1467,6 @@ impl Scene {
             r.num(format!("{s}_{what}_p50_us"), us(pct(&mut v, 50.0)));
             r.num(format!("{s}_{what}_p95_us"), us(pct(&mut v, 95.0)));
         }
-        // The pass economy, paired per frame (encode + GPU): what the passes cost, and what the
-        // One/One draws in them cost.
         let mut present = self.pooled(|x| Some(ns(x.off().present_ns())));
         let present_p95 = pct(&mut present, 95.0).max(1.0);
         if clocked {
@@ -1559,13 +1488,10 @@ impl Scene {
                 if what == "pass_cost" {
                     let cost = pct(&mut v, 50.0);
                     r.num(format!("{s}_pass_cost_pct"), 100.0 * cost / present_p95);
-                    // Over the p50 too: a loaded desk's preemption lands in the p95.
                     let present_p50 = pct(&mut present, 50.0).max(1.0);
                     r.num(format!("{s}_pass_cost_pct_p50"), 100.0 * cost / present_p50);
                 }
             }
-            // What timing a present costs its encode: the shipped plan timed against the same
-            // plan with the clock paused, paired per frame.
             let mut clock =
                 self.pooled(|x| Some(ns(x.off().encode_ns) - ns(x.untimed().encode_ns)));
             let clock_p50 = pct(&mut clock, 50.0);
@@ -1591,7 +1517,6 @@ impl Scene {
             format!("{s}_build_stage_pct"),
             100.0 * pct(&mut build_stage, 50.0) / present_p95,
         );
-        // The frame's shape.
         let counts: [(&str, Figure); 9] = [
             ("passes", |x| Some(f64::from(x.off().shape.passes))),
             ("drop_passes", |x| Some(f64::from(x.drop().shape.passes))),
@@ -1617,10 +1542,6 @@ impl Scene {
             r.int(format!("{s}_{what}_p50"), pct(&mut v, 50.0) as u64);
             r.int(format!("{s}_{what}_max"), pct(&mut v, 100.0) as u64);
         }
-        // Run-to-run spread, and the gated keys: the scene against the reference frames drawn
-        // among its own, per run, the median run.
-        // The CPU figures are thread CPU time (the core's work, not the scheduler's), the GPU's
-        // the device clock.
         let rated: [(&str, Figure, RefFigure); 4] = [
             (
                 "emit",
@@ -1667,9 +1588,6 @@ impl Scene {
                 hi / lo.max(f64::MIN_POSITIVE),
             );
         }
-        // The work: instructions retired per frame, which the desk's load does not move the
-        // way it moves time. `_per_ginsn` (frames per 10^9 instructions, bigger is cheaper) is
-        // the gated form of the p50.
         if !counted {
             return;
         }
@@ -1696,7 +1614,6 @@ impl Scene {
             r.num(format!("{s}_{what}_per_ginsn"), 1e9 / p50.max(1.0));
         }
         if clocked {
-            // The clock's work in the present call, paired per frame.
             let mut clock =
                 self.pooled(|x| Some(ns(x.off().call_ins?) - ns(x.untimed().call_ins?)));
             r.num(
@@ -1749,8 +1666,6 @@ fn report_reference(r: &mut Report, scenes: &[Scene], clocked: bool, counted: bo
     if !clocked {
         return;
     }
-    // The reference's own calibration: per scene run, the blank full repaint's GPU p50 over the
-    // text reference's, drawn side by side, the median run reported. Bigger is cheaper text.
     let mut blank: Vec<f64> = all().filter_map(|x| x.blank_gpu_ns.map(ns)).collect();
     r.num("ref_blank_gpu_p50_us", us(pct(&mut blank, 50.0)));
     r.num("ref_blank_gpu_p95_us", us(pct(&mut blank, 95.0)));
@@ -1785,8 +1700,6 @@ fn main() {
     if !gpu_time::install_sink(noop) && !gpu_time::sink_installed() {
         fail("could not install the GPU-time sink");
     }
-    // The app renders on a user-interactive thread; a default-QoS harness on a busy machine is
-    // the first thread the scheduler moves to an efficiency core.
     aterm_pty::declare_interactive_thread();
     let mut rig = Rig::new();
     let clocked = rig.clock != "none";

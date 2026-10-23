@@ -4,6 +4,9 @@
 
 //! agh's integration tests: one binary (autotests = false); a tests/*.rs that is not a mod line here never compiles.
 
+#[cfg(test)]
+aterm_durable::plain_durable_flushes_in_tests!();
+
 mod common;
 
 mod args;

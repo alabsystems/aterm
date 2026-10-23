@@ -45,7 +45,8 @@ use aterm_vitals::model::{Pressure, ProcSample, SlotsUnread, SlotsView, Snapshot
 use aterm_vitals::sys::predicate::{AwaitSys, Latch, Parsed, evaluate};
 
 /// A board whose snapshot is older than this (two disk looks) is stale.
-pub(crate) const STALE_AFTER: Duration = crate::harness_host::DISK_TICK.saturating_mul(2);
+pub(crate) const STALE_AFTER: Duration =
+    Duration::from_millis(aterm_agent::supervise::occupancy::reading::STALE_AFTER_MS as u64);
 
 /// How long the board remembers that a session's tab held a build slot: past
 /// any hold `hold-room` still asks about (four asks two hours apart, from two
@@ -280,10 +281,9 @@ impl Judged {
         let Some(b) = &self.board else {
             return OccupancyReading::default();
         };
-        let aged = now_unix_ms.saturating_sub(b.taken_unix_ms) > whole_ms(STALE_AFTER);
         OccupancyReading {
             taken_ms: b.taken_unix_ms,
-            stale: b.stale || aged,
+            stale: b.stale,
             avail_mib: b.avail_mib,
             pressure: b.pressure.and_then(memory_pressure),
             disk: b.disk,
@@ -303,6 +303,7 @@ impl Judged {
             room: self.room,
             held_slot_last_ms: self.held.get(sid).copied(),
         }
+        .aged_at(Some(now_unix_ms))
     }
 }
 

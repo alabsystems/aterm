@@ -2,125 +2,70 @@
 // Copyright 2026 Andrew Yates
 
 //! The paint scanner: did a captured take carry effect ink?
-//!
-//! Ink is a saturated pixel that changed against frame 0: static syntax colour
-//! is saturated but unchanged, echoed glyphs change but are grey, only an
-//! effect is both. Pixel count and hue spread are necessary, not sufficient, so
-//! the scanner also reads ribbon geometry (a thin detached strip, or a dense
-//! run attached to the block cursor), the band's own population (the litness
-//! the continuity terms charge), companion morphology (a tall foreground
-//! component, bound to the engine's `pet_body` rectangle when the producer
-//! emits one), and, when a `trail status` row is paired with every frame, the
-//! contradictions between what the engine claims and what the raster carries.
-//!
-//! [`scan_frames`] is the whole take; everything it composes is public so the
-//! classifiers are tested one at a time. Each threshold carries its
-//! calibration where it is declared.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 pub use super::frame::{Frame, FrameError, Rgb};
 
-// ------------------------------------------------------------ colour floor --
-
-/// The brightest channel an ink pixel needs: keeps a band's tapered fringe from
-/// voting. 60 keeps the luminance-capped rainbow's dimmest stops (yellow, green
-/// and cyan sit at 70-94) inside the domain.
+/// The brightest channel an ink pixel needs: keeps a band's tapered fringe from voting. 60 keeps the luminance-capped rainbow's dimmest stops (yellow, green and cyan sit at 70-94) inside the domain.
 pub const SAT_MIN: u8 = 60;
 /// The channel spread (max - min) an ink pixel needs: the colour discriminator.
-/// The sandbox ground spreads 7 and glyph anti-aliasing ~0, so 40 clears every
-/// grey on the glass by 30 levels.
 pub const SAT_SPREAD: u8 = 40;
-/// The human-facing hue diagnostic's bar: half a 30-degree bucket of real
-/// circular distance inside one painted object. Diagnostic only.
+/// The human-facing hue diagnostic's bar: half a 30-degree bucket of real circular distance inside one painted object.
 pub const ROW_RAINBOW_MIN_HUE_DEGREES: f64 = 15.0;
 
-/// The thin ribbon component (the underline highlighter): at least three
-/// quarters of a cell wide (floor [`RIBBON_COMPONENT_MIN_WIDTH_FLOOR`]), at most
-/// [`RIBBON_COMPONENT_MAX_HEIGHT`] tall, and two pixels more than its width.
-/// Width rejects sparkle noise, height rejects the cursor and glyph bodies,
-/// population a lone anti-aliased stroke.
+/// The thin ribbon component (the underline highlighter): at least three quarters of a cell wide (floor [`RIBBON_COMPONENT_MIN_WIDTH_FLOOR`]), at most [`RIBBON_COMPONENT_MAX_HEIGHT`] tall, and two pixels more than its width.
 pub const RIBBON_COMPONENT_MIN_PIXELS_FLOOR: usize = 8;
 pub const RIBBON_COMPONENT_MIN_WIDTH_FLOOR: usize = 6;
 pub const RIBBON_COMPONENT_MAX_HEIGHT: usize = 4;
 
-/// The attached run: a dense saturated run at least two cells wide on the
-/// bottom row of the solid block cursor, at least 3/4 dense. The row match
-/// keeps a wide pet or coloured glyph elsewhere from buying continuity.
+/// The attached run: a dense saturated run at least two cells wide on the bottom row of the solid block cursor, at least 3/4 dense.
 pub const ATTACHED_RIBBON_MIN_CELLS: usize = 2;
 pub const ATTACHED_RIBBON_DENSITY_NUM: usize = 3;
 pub const ATTACHED_RIBBON_DENSITY_DEN: usize = 4;
 
-/// The cyan bar: ROYGBIV has no cyan, so a paint-semantic pixel in
-/// [165, 195] degrees at saturation >= 0.35 names a real off-palette pixel.
-/// Reported, not gated.
+/// The cyan bar: ROYGBIV has no cyan, so a paint-semantic pixel in [165, 195] degrees at saturation >= 0.35 names a real off-palette pixel.
 pub const CYAN_HUE_LO: f64 = 165.0;
 pub const CYAN_HUE_HI: f64 = 195.0;
 pub const CYAN_SAT_MIN: f64 = 0.35;
 
-/// Companion morphology: a four-connected foreground component at least this
-/// wide, tall and populous. A one-cell text row (<= cell height) and the caret
-/// (one cell wide) cannot clear it.
+/// Companion morphology: a four-connected foreground component at least this wide, tall and populous.
 pub const COMP_MIN_W: usize = 12;
 pub const COMP_MIN_H: usize = 18;
 pub const COMP_MIN_PIXELS: usize = 24;
-/// The resident pet's compact idle pose: admitted only on the isolating frames
-/// (frame 0 and the three final cleared-plane stills) and only while the engine
-/// claims the pet.
+/// The resident pet's compact idle pose: admitted only on the isolating frames (frame 0 and the three final cleared-plane stills) and only while the engine claims the pet.
 pub const COMPACT_PET_MIN_H: usize = 9;
-/// The earned flying head at its momentum-zero resting size (measured 16 px
-/// tall at cell height 14): admitted on the isolating frames while the engine
-/// claims the cat. One pixel over the tallest one-cell impostor (14).
+/// The earned flying head at its momentum-zero resting size (measured 16 px tall at cell height 14): admitted on the isolating frames while the engine claims the cat.
 pub const CAT_STILL_MIN_H: usize = 15;
-/// How far a foreground pixel stands from the backdrop in some channel. A
-/// backdrop delta, not saturation: coats include white and charcoal.
+/// How far a foreground pixel stands from the backdrop in some channel.
 pub const FOREGROUND_DELTA: u8 = 24;
-/// A companion component wider than this many cell heights has fused with the
-/// typed row through a glyph, the caret or the band, so its box is the row's
-/// and excludes nothing. Both animals are sized in cell heights: the pet is
-/// ~2.9 wide, the flying head's slot 4 with the body well inside it.
+/// A companion component wider than this many cell heights has fused with the typed row through a glyph, the caret or the band, so its box is the row's and excludes nothing.
 pub const COMPANION_ALONE_MAX_WIDTH_CELL_HEIGHTS: usize = 3;
 
-/// The flat-slab hue diagnostic's column ceiling: the underline band's slabs
-/// stand 1-5 px, the caret 14+ and a coat 18+.
+/// The flat-slab hue diagnostic's column ceiling: the underline band's slabs stand 1-5 px, the caret 14+ and a coat 18+.
 pub const BAND_MAX_SLAB_HEIGHT_PX: usize = 6;
-/// A slab run must be this wide to join the row-union hue diagnostic, so a
-/// detached coat pixel cannot pair with the band.
+/// A slab run must be this wide to join the row-union hue diagnostic, so a detached coat pixel cannot pair with the band.
 pub const BAND_MIN_RUN_PX: usize = 3;
-/// The band domain's height cap above one cell: the tall body reaches 1.1 cell,
-/// every healthy band object measured <= cell + 1, the flying head's coat
-/// cell + 4 and more.
+/// The band domain's height cap above one cell: the tall body reaches 1.1 cell, every healthy band object measured <= cell + 1, the flying head's coat cell + 4 and more.
 pub const BAND_OBJECT_ABOVE_CELL_MAX_PX: usize = 2;
-/// The litness floor for one frame: one cell-row of band at the 7 px pitch,
-/// 3 px over the widest non-band residue (the pet's accents, 4 px) and 3 px
-/// under the weakest healthy frame (the per-mark decay trough, 10-12 px).
+/// The litness floor for one frame: one cell-row of band at the 7 px pitch, 3 px over the widest non-band residue (the pet's accents, 4 px) and 3 px under the weakest healthy frame (the per-mark decay trough, 10-12 px).
 pub const RIBBON_LIT_MIN_PX: usize = 7;
-/// The claim-bound window's close guard: the raster leads the ledger's close,
-/// so the last two driven frames belong to the exhale.
+/// The claim-bound window's close guard: the raster leads the ledger's close, so the last two driven frames belong to the exhale.
 pub const RIBBON_CLOSE_GUARD_FRAMES: i64 = 2;
 
-/// The driven window's far-end grace: one in-flight keystroke's PTY-to-glass
-/// latency past the closing bracket read.
+/// The driven window's far-end grace: one in-flight keystroke's PTY-to-glass latency past the closing bracket read.
 pub const DRIVEN_GRACE_US: i64 = 150_000;
-/// A dark run that reaches the driven window's final sampled frame is the
-/// authored exhale for its first 0.4 s; only the excess is charged. Interior
-/// runs are charged in full.
+/// A dark run that reaches the driven window's final sampled frame is the authored exhale for its first 0.4 s; only the excess is charged.
 pub const EXHALE_CLOSE_ALLOWANCE_US: i64 = 400_000;
 
-/// The resting sprites the engine authors under the strict floor (the curled
-/// sleepers and the gallop's low first frame), witnessed inside their emitted
-/// `pet_body` at the compact floor, more than two cells wide, unclipped by the
-/// cell on its left, right and top.
+/// The resting sprites the engine authors under the strict floor (the curled sleepers and the gallop's low first frame), witnessed inside their emitted `pet_body` at the compact floor, more than two cells wide, unclipped by the cell on its left, right and top.
 pub const RESTING_POSE_STEMS: [&str; 2] = ["sleep", "run_0"];
-
-// ------------------------------------------------------------------ types --
 
 /// Saturated changed pixels of one frame: pixel index -> hue in degrees.
 pub type SatMap = BTreeMap<usize, f64>;
 
-/// The terminal cell size the take was rendered at. Both edges positive, so
-/// every geometry floor derived from it is defined.
+/// The terminal cell size the take was rendered at.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Cell {
     pub w: usize,
@@ -210,8 +155,7 @@ impl Shape {
     }
 }
 
-/// An inclusive pixel box `(x0, y0)..=(x1, y1)`. Signed: an emitted body may
-/// start off the frame's top-left.
+/// An inclusive pixel box `(x0, y0)..=(x1, y1)`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PixelBox {
     pub x0: i64,
@@ -277,8 +221,7 @@ pub struct DynamicMetrics {
     pub hues: HueSet,
     /// The most hue buckets on any one raster row.
     pub row_hue_peak: usize,
-    /// The hue diagnostic: the widest in-object, in-row separation, or the
-    /// widest flat-slab row span.
+    /// The hue diagnostic: the widest in-object, in-row separation, or the widest flat-slab row span.
     pub row_hue_separation: f64,
     pub cyan_pixels: usize,
     pub cyan_worst: Option<CyanSample>,
@@ -289,15 +232,11 @@ pub struct DynamicMetrics {
     /// The band's own population (the litness domain).
     pub band_ink: usize,
     pub band_hues: HueSet,
-    /// Ink of objects standing wholly inside the drawn animal's box, refused to
-    /// `band_ink`.
+    /// Ink of objects standing wholly inside the drawn animal's box, refused to `band_ink`.
     pub animal_ink: usize,
 }
 
-// --------------------------------------------------------------- colour --
-
-/// The continuous hue angle of a paint-semantic pixel, else `None`: the
-/// colour floor ([`SAT_MIN`], [`SAT_SPREAD`]) and HSV hue in degrees.
+/// The continuous hue angle of a paint-semantic pixel, else `None`: the colour floor ([`SAT_MIN`], [`SAT_SPREAD`]) and HSV hue in degrees.
 #[must_use]
 pub fn saturated_hue_degrees(rgb: Rgb) -> Option<f64> {
     let [r, g, b] = rgb;
@@ -309,7 +248,6 @@ pub fn saturated_hue_degrees(rgb: Rgb) -> Option<f64> {
 }
 
 /// HSV hue in `[0, 1)`, computed as Python's `colorsys.rgb_to_hsv` does it so
-/// the calibrated bucket edges stay where they were measured.
 fn hsv_hue([r, g, b]: Rgb) -> f64 {
     let (r, g, b) = (
         f64::from(r) / 255.0,
@@ -382,11 +320,7 @@ pub fn max_circular_hue_distance_degrees(angles: &[f64]) -> f64 {
     best
 }
 
-// ---------------------------------------------------------- band domain --
-
-/// The four-connected components of a saturated pixel map, in ascending order
-/// of their first pixel. Touching, not merely nearby: diagonal sparkles do not
-/// vote themselves into one object.
+/// The four-connected components of a saturated pixel map, in ascending order of their first pixel.
 #[must_use]
 pub fn ink_objects(w: usize, h: usize, sat: &SatMap) -> Vec<Vec<usize>> {
     let mut seen = BTreeSet::new();
@@ -418,11 +352,6 @@ pub fn ink_objects(w: usize, h: usize, sat: &SatMap) -> Vec<Vec<usize>> {
 }
 
 /// The band's own population on glass: `(band_ink, band_hues)`.
-///
-/// Saturated pixels of four-connected objects no taller than one cell plus
-/// [`BAND_OBJECT_ABOVE_CELL_MAX_PX`], less each object's cell-height columns
-/// (the caret block's, merged or alone). An object standing wholly inside one
-/// of `exclude` (the drawn animal's box) is the animal's and counts nothing.
 #[must_use]
 pub fn band_ink_metrics(
     w: usize,
@@ -435,8 +364,7 @@ pub fn band_ink_metrics(
     (ink, hues)
 }
 
-/// [`band_ink_metrics`] plus the ink it refused as the animal's, counted
-/// before the band rules so the report names what the box removed.
+/// [`band_ink_metrics`] plus the ink it refused as the animal's, counted before the band rules so the report names what the box removed.
 #[must_use]
 pub fn band_ink_partition(
     w: usize,
@@ -462,10 +390,6 @@ pub fn band_ink_partition(
             band_hues.union_with(hues);
             continue;
         }
-        // The caret block is not a bridge: an object refused as too tall is
-        // re-split without its cell-height columns (the block was the only
-        // join between the stardust above and the ribbon below), and each
-        // piece is judged on its own rows.
         let mut columns: BTreeMap<usize, usize> = BTreeMap::new();
         for &p in &members {
             *columns.entry(p % w).or_default() += 1;
@@ -502,9 +426,6 @@ fn bounds(w: usize, members: &[usize]) -> (i64, i64, i64, i64) {
 }
 
 /// One object's band pixels under the height cap, or `None` when it is refused
-/// as too tall. A star on the band's edge does not cost the band its height:
-/// a too-tall object keeps the rows carrying at least half its densest row's
-/// ink and is judged on those.
 fn count_band_object(
     w: usize,
     members: &[usize],
@@ -558,8 +479,7 @@ fn count_band_object(
     Some((ink, hues))
 }
 
-/// The peak hue separation between samples sharing a raster row and one
-/// object. Diagnostic: two objects crossing one scanline cannot manufacture it.
+/// The peak hue separation between samples sharing a raster row and one object.
 #[must_use]
 pub fn object_row_hue_separation(w: usize, h: usize, sat: &SatMap) -> f64 {
     let mut best = 0.0_f64;
@@ -575,10 +495,7 @@ pub fn object_row_hue_separation(w: usize, h: usize, sat: &SatMap) -> f64 {
     best
 }
 
-/// The peak hue span across one raster row's flat slab runs: the quantized,
-/// seam-split band's diagnostic. Only columns no taller than
-/// [`BAND_MAX_SLAB_HEIGHT_PX`] and runs at least [`BAND_MIN_RUN_PX`] wide join,
-/// so the caret block and a detached coat pixel are out by geometry.
+/// The peak hue span across one raster row's flat slab runs: the quantized, seam-split band's diagnostic.
 #[must_use]
 pub fn banded_row_span(w: usize, sat: &SatMap) -> f64 {
     let mut columns: BTreeMap<usize, usize> = BTreeMap::new();
@@ -617,10 +534,7 @@ pub fn banded_row_span(w: usize, sat: &SatMap) -> f64 {
     best
 }
 
-// ------------------------------------------------------------ companion --
-
-/// The terminal backdrop: the majority colour of the four corners and the
-/// centre (ties go to the first in that order).
+/// The terminal backdrop: the majority colour of the four corners and the centre (ties go to the first in that order).
 #[must_use]
 pub fn frame_background(frame: &Frame) -> Rgb {
     let (w, h) = (frame.width(), frame.height());
@@ -645,10 +559,7 @@ pub fn frame_background(frame: &Frame) -> Rgb {
     best
 }
 
-/// Every foreground component meeting the companion floor
-/// ([`COMP_MIN_W`] x `min_height`, [`COMP_MIN_PIXELS`]), largest shape first
-/// (equal shapes keep scan order), with its bounding box. `region` (inclusive)
-/// limits the pixels inspected; a claimed rectangle is never itself evidence.
+/// Every foreground component meeting the companion floor ([`COMP_MIN_W`] x `min_height`, [`COMP_MIN_PIXELS`]), largest shape first (equal shapes keep scan order), with its bounding box.
 #[must_use]
 pub fn tall_component_records(
     frame: &Frame,
@@ -749,15 +660,13 @@ pub fn largest_tall_component(frame: &Frame) -> Shape {
         .unwrap_or(Shape::NONE)
 }
 
-/// Whether frame `frame_no` of `frame_count` is an isolating frame: frame 0
-/// (before typing) or one of the three final cleared-plane stills.
+/// Whether frame `frame_no` of `frame_count` is an isolating frame: frame 0 (before typing) or one of the three final cleared-plane stills.
 #[must_use]
 pub fn compact_pet_witness_frame(frame_no: usize, frame_count: usize) -> bool {
     frame_no == 0 || frame_no >= frame_count.saturating_sub(3)
 }
 
-/// The relaxed height floor an isolating frame may fall back to under the
-/// engine's own claim: the pet's compact pose, else the cat's resting head.
+/// The relaxed height floor an isolating frame may fall back to under the engine's own claim: the pet's compact pose, else the cat's resting head.
 #[must_use]
 pub fn companion_witness_floor(
     pet_active: bool,
@@ -777,9 +686,7 @@ pub fn companion_witness_floor(
     }
 }
 
-/// The companion component: the largest strict one, else the isolating
-/// frames' relaxed floor under the engine's claim. `strict` reuses a list the
-/// caller already has.
+/// The companion component: the largest strict one, else the isolating frames' relaxed floor under the engine's claim.
 #[must_use]
 pub fn companion_component(
     frame: &Frame,
@@ -851,8 +758,7 @@ fn companion_record(
         .copied()
 }
 
-/// Whether `pose` (`pet_<stem>` / `pet_dog_<stem>`) names a sprite authored
-/// under the strict floor ([`RESTING_POSE_STEMS`]).
+/// Whether `pose` (`pet_<stem>` / `pet_dog_<stem>`) names a sprite authored under the strict floor ([`RESTING_POSE_STEMS`]).
 #[must_use]
 pub fn resting_pose(pose: Option<&str>) -> bool {
     let Some(pose) = pose.filter(|p| !p.is_empty()) else {
@@ -873,10 +779,7 @@ pub fn resting_pet_min_width(cell_w: usize) -> usize {
     2 * cell_w + 1
 }
 
-/// The pet's morphology inside its emitted body rectangle. The rectangle says
-/// where to look; the unchanged floors say whether a body is there. With the
-/// engine's resting `pose` and the take's `cell_w`, a resting sprite is looked
-/// for at the compact floor on any frame ([`resting_pet_component`]).
+/// The pet's morphology inside its emitted body rectangle.
 #[must_use]
 #[allow(clippy::too_many_arguments)]
 pub fn located_pet_component(
@@ -903,9 +806,7 @@ pub fn located_pet_component(
     }
 }
 
-/// The claimed resting sprite inside its cell: the compact height floor, more
-/// than two cells wide, touching neither the cell's left, right nor top edge
-/// (a row running through the cell is clipped there and is the row's).
+/// The claimed resting sprite inside its cell: the compact height floor, more than two cells wide, touching neither the cell's left, right nor top edge (a row running through the cell is clipped there and is the row's).
 #[must_use]
 pub fn resting_pet_component(
     frame: &Frame,
@@ -924,14 +825,11 @@ pub fn resting_pet_component(
         .map_or(Shape::NONE, |c| c.shape)
 }
 
-// --------------------------------------------------------------- status --
-
 /// One `trail status` row, as the engine printed it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StatusRow(pub String);
 
-/// A required status token that is missing or malformed: the row is refused,
-/// never read as a default.
+/// A required status token that is missing or malformed: the row is refused, never read as a default.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StatusError {
     pub key: String,
@@ -981,7 +879,6 @@ impl StatusRow {
     }
 
     /// A required boolean token.
-    ///
     /// # Errors
     /// The token is missing or not `true`/`false`.
     pub fn bool(&self, key: &str) -> Result<bool, StatusError> {
@@ -993,7 +890,6 @@ impl StatusRow {
     }
 
     /// A required unsigned integer token.
-    ///
     /// # Errors
     /// The token is missing or not all ASCII digits.
     pub fn uint(&self, key: &str) -> Result<u64, StatusError> {
@@ -1003,9 +899,7 @@ impl StatusRow {
             .ok_or_else(|| self.malformed(key))
     }
 
-    /// A required finite, non-negative decimal token: `nan` and `inf` compare
-    /// false against every bound, which would switch a gate off.
-    ///
+    /// A required finite, non-negative decimal token: `nan` and `inf` compare false against every bound, which would switch a gate off.
     /// # Errors
     /// The token is missing, not a number, negative or not finite.
     pub fn nonneg_float(&self, key: &str) -> Result<f64, StatusError> {
@@ -1015,9 +909,7 @@ impl StatusRow {
             .ok_or_else(|| self.malformed(key))
     }
 
-    /// The emitted body's exclusive `x0,x1,y0,y1` as an inclusive box. `Ok(None)`
-    /// for an absent field (an older producer) or `none` (no body drawn).
-    ///
+    /// The emitted body's exclusive `x0,x1,y0,y1` as an inclusive box.
     /// # Errors
     /// Malformed, empty or reversed geometry.
     pub fn pet_body(&self) -> Result<Option<PixelBox>, StatusError> {
@@ -1046,18 +938,13 @@ impl StatusRow {
     }
 }
 
-/// The last frame whose paired row still reports the ribbon driven: the
-/// admission ledger advanced (`spawns` above the previous row's) or an older
-/// producer's glide spine is alive (`speed > 0`). `None` when no frame is.
-///
+/// The last frame whose paired row still reports the ribbon driven: the admission ledger advanced (`spawns` above the previous row's) or an older producer's glide spine is alive (`speed > 0`).
 /// # Errors
 /// A row with a malformed `spawns`, or a present but malformed `speed`.
 pub fn driven_last_frame(statuses: &[StatusRow]) -> Result<Option<usize>, StatusError> {
     let mut last = None;
     let mut previous: Option<u64> = None;
     for (frame_no, status) in statuses.iter().enumerate() {
-        // Both tokens are read before either is tested, so a skewed row is
-        // refused whatever the other one says.
         let spawns = status.uint("spawns")?;
         let speed = match status.value("speed") {
             Some(_) => status.nonneg_float("speed")?,
@@ -1071,8 +958,6 @@ pub fn driven_last_frame(statuses: &[StatusRow]) -> Result<Option<usize>, Status
     }
     Ok(last)
 }
-
-// ------------------------------------------------------------- runs --
 
 /// The longest false run strictly between the first and last true.
 #[must_use]
@@ -1095,8 +980,7 @@ pub fn longest_interior_gap(flags: &[bool]) -> usize {
     longest
 }
 
-/// `(original index, verdict)` for every frame that is not a byte-identical
-/// resample of the one before it.
+/// `(original index, verdict)` for every frame that is not a byte-identical resample of the one before it.
 #[must_use]
 pub fn distinct_samples(flags: &[bool], duplicates: &[bool]) -> Vec<(usize, bool)> {
     assert_eq!(
@@ -1113,8 +997,7 @@ pub fn distinct_samples(flags: &[bool], duplicates: &[bool]) -> Vec<(usize, bool
         .collect()
 }
 
-/// Original-index bounds of the first and last two-frame run of distinct
-/// positive samples: one onset glint cannot start a mature band.
+/// Original-index bounds of the first and last two-frame run of distinct positive samples: one onset glint cannot start a mature band.
 #[must_use]
 pub fn sustained_rainbow_bounds(flags: &[bool], duplicates: &[bool]) -> Option<(usize, usize)> {
     let samples = distinct_samples(flags, duplicates);
@@ -1175,11 +1058,7 @@ pub fn rainbow_summary(flags: &[bool], duplicates: &[bool]) -> (usize, usize, us
     )
 }
 
-// --------------------------------------------------------- driven window --
-
-/// A recording's own index (`index.json` beside a `ctl video` take): each
-/// frame's stamp on the recorder's clock, the covered span's start, and the
-/// ticks whose redraw proved the screen unchanged.
+/// A recording's own index (`index.json` beside a `ctl video` take): each frame's stamp on the recorder's clock, the covered span's start, and the ticks whose redraw proved the screen unchanged.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RecordingIndex {
     pub stamps: BTreeMap<String, i64>,
@@ -1188,8 +1067,7 @@ pub struct RecordingIndex {
 }
 
 impl RecordingIndex {
-    /// Parse `index.json`. Frames without an integer stamp are left out.
-    ///
+    /// Parse `index.json`.
     /// # Errors
     /// The bytes are not a JSON object.
     pub fn parse(bytes: &[u8]) -> Result<Self, String> {
@@ -1228,7 +1106,6 @@ impl RecordingIndex {
     }
 
     /// Read and parse `path`.
-    ///
     /// # Errors
     /// The file cannot be read or parsed.
     pub fn load(path: &Path) -> Result<Self, String> {
@@ -1240,8 +1117,7 @@ impl RecordingIndex {
 /// The continuity reading of a recorded take's driven window.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DrivenWindow {
-    /// The longest blackout in wall-clock microseconds, or `-1` when the take
-    /// carried no bracket to bound the window with (not measured).
+    /// The longest blackout in wall-clock microseconds, or `-1` when the take carried no bracket to bound the window with (not measured).
     pub dark_us: i64,
     pub frames: usize,
     /// The widest gap in the union of frame and tick instants.
@@ -1263,16 +1139,6 @@ impl DrivenWindow {
 }
 
 /// The longest blackout inside the window the trail is driven in.
-///
-/// `driven_ms` is the probe's `(before first key, after last key)` bracket in
-/// `video status` milliseconds; `flags` the per-frame [`driven_lit`] verdicts.
-/// The window opens at the first pair of adjacent distinct lit samples (the
-/// excused lead is reported, and bounded by the verdict); a take with no such
-/// pair excuses nothing. Darkness is charged only to frames sampled dark
-/// (first-dark to last-dark plus one nominal interval), so a render stall
-/// cannot manufacture a blackout. A dark run reaching the window's last frame
-/// keeps [`EXHALE_CLOSE_ALLOWANCE_US`] for the authored exhale, only once the
-/// band matured. A duplicate inherits the prior verdict, seeded dark.
 #[must_use]
 pub fn driven_window_darkness(
     index: Option<&RecordingIndex>,
@@ -1387,11 +1253,7 @@ pub fn driven_window_darkness(
     }
 }
 
-// --------------------------------------------------------------- ribbon --
-
-/// The strongest thin ribbon component over the saturated set: 8-connected,
-/// bridging one-pixel seams along the row (never vertically, which would merge
-/// separate glyph bodies).
+/// The strongest thin ribbon component over the saturated set: 8-connected, bridging one-pixel seams along the row (never vertically, which would merge separate glyph bodies).
 #[must_use]
 pub fn thin_ribbon_component(w: usize, h: usize, dynamic: &BTreeSet<usize>, cell: Cell) -> Shape {
     let min_width = RIBBON_COMPONENT_MIN_WIDTH_FLOOR.max((3 * cell.w).div_ceil(4));
@@ -1440,12 +1302,6 @@ pub fn thin_ribbon_component(w: usize, h: usize, dynamic: &BTreeSet<usize>, cell
 }
 
 /// A dense saturated run attached to the solid block cursor.
-///
-/// The cursor is found in `changed` (every pixel that differs from the
-/// baseline, any colour): a cell-sized solid rectangle. Its tint rolls with the
-/// arc and is not the ribbon's business. The run is measured in `dynamic` (the
-/// saturated subset) on the cursor's bottom row: two cells wide, 3/4 dense,
-/// and overlapping the cursor's span or within a one-pixel seam of it.
 #[must_use]
 pub fn attached_ribbon_run(
     w: usize,
@@ -1537,17 +1393,13 @@ pub fn ribbon_present(metrics: &DynamicMetrics) -> bool {
     metrics.ribbon_component.pixels > 0 || metrics.ribbon_run.pixels > 0
 }
 
-/// Whether one frame carries trail light for the continuity charge: ribbon
-/// geometry, or the band's own population at [`RIBBON_LIT_MIN_PX`]. The young
-/// tall band is taller than the thin arm's cap, so geometry alone reads it as
-/// a blackout; the band term can only move a frame from dark to lit.
+/// Whether one frame carries trail light for the continuity charge: ribbon geometry, or the band's own population at [`RIBBON_LIT_MIN_PX`].
 #[must_use]
 pub fn driven_lit(metrics: &DynamicMetrics) -> bool {
     ribbon_present(metrics) || metrics.band_ink >= RIBBON_LIT_MIN_PX
 }
 
-/// One frame's raster against the baseline. `exclude` (the drawn animal's box)
-/// reaches the band domain only.
+/// One frame's raster against the baseline.
 #[must_use]
 pub fn dynamic_metrics(
     base: &Frame,
@@ -1580,7 +1432,6 @@ pub fn dynamic_metrics(
             dynamic.insert(p);
             if cyan_band_hue(px).is_some() {
                 m.cyan_pixels += 1;
-                // The sample nearest pure cyan names the worst thing on glass.
                 if m.cyan_worst
                     .is_none_or(|c| (degrees - 180.0).abs() < (c.degrees - 180.0).abs())
                 {
@@ -1602,8 +1453,6 @@ pub fn dynamic_metrics(
     m.animal_ink = animal_ink;
     m
 }
-
-// ----------------------------------------------------------------- take --
 
 /// Something the scanner noticed on one frame, for the reader of a red row.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1680,8 +1529,7 @@ pub struct ScanReport {
     pub best_hues: usize,
     pub total_ink: usize,
     pub union_hues: usize,
-    /// The busiest single frame's cyan count, the frames with any, and the
-    /// take's total.
+    /// The busiest single frame's cyan count, the frames with any, and the take's total.
     pub cyan_px: usize,
     pub cyan_frames: usize,
     pub cyan_total: usize,
@@ -1693,8 +1541,7 @@ pub struct ScanReport {
     pub driven: DrivenWindow,
     pub status_frames: usize,
     pub ribbon_claimed: usize,
-    /// Frames the driven mature claim covered: a zero contradiction count is
-    /// only evidence when this is not zero.
+    /// Frames the driven mature claim covered: a zero contradiction count is only evidence when this is not zero.
     pub ribbon_bound: usize,
     pub ribbon_window_hues: usize,
     /// Bound frames that were unlit, in runs of two or more.
@@ -1773,7 +1620,6 @@ pub struct TakeContext {
 }
 
 /// The PNG frames in `dir`, sorted by name.
-///
 /// # Errors
 /// The directory cannot be read, or holds no PNG.
 pub fn take_frames(dir: &Path) -> Result<Vec<PathBuf>, ScanError> {
@@ -1790,7 +1636,6 @@ pub fn take_frames(dir: &Path) -> Result<Vec<PathBuf>, ScanError> {
 }
 
 /// Scan the PNG take in `dir` (decoded one frame at a time).
-///
 /// # Errors
 /// As [`scan_frames`], and a frame that cannot be decoded.
 pub fn scan_dir(dir: &Path, ctx: &TakeContext) -> Result<ScanReport, ScanError> {
@@ -1812,13 +1657,9 @@ pub fn scan_dir(dir: &Path, ctx: &TakeContext) -> Result<ScanReport, ScanError> 
     scan_frames(&names, frames, ctx)
 }
 
-/// Scan one take: `names[i]` is frame `i`'s file name (the index's key), and
-/// `frames` yields the decoded frames in the same order.
-///
+/// Scan one take: `names[i]` is frame `i`'s file name (the index's key), and `frames` yields the decoded frames in the same order.
 /// # Errors
-/// No frames, a status row count that differs from the frame count, a
-/// malformed status row, a frame of another size than frame 0, or a frame
-/// that could not be decoded.
+/// No frames, a status row count that differs from the frame count, a malformed status row, a frame of another size than frame 0, or a frame that could not be decoded.
 #[allow(clippy::too_many_lines)]
 pub fn scan_frames(
     names: &[String],
@@ -1940,7 +1781,6 @@ pub fn scan_frames(
         let companion_active = pet || cat;
         let isolating = compact_pet_witness_frame(frame_no, n);
 
-        // The animal's box first: the band count refuses ink inside it.
         let mut component = Shape::NONE;
         let mut animal_box = None;
         let mut strict: Vec<Component> = Vec::new();
@@ -1960,7 +1800,6 @@ pub fn scan_frames(
                 } else {
                     None
                 };
-                // A second companion is still counted over the whole plane.
                 if isolating {
                     strict = tall_component_records(&frame, background, COMP_MIN_H, None);
                 }
@@ -1986,7 +1825,6 @@ pub fn scan_frames(
         let exclude: Vec<PixelBox> = animal_box.filter(|_| !fused).into_iter().collect();
 
         let metrics = if frame_no == 0 || duplicate {
-            // Frame 0 is the baseline; a resample inherits its predecessor's
             // shape and adds no ink.
             prev_metrics.clone()
         } else {
@@ -2015,8 +1853,6 @@ pub fn scan_frames(
             }
         }
 
-        // The claim side: a mature claim (four live hue bands) the engine is
-        // still driving is held against the raster's band population.
         let frame_i = i64::try_from(frame_no).unwrap_or(i64::MAX);
         if statuses.is_some() && bands >= 4 {
             r.ribbon_claimed += 1;
@@ -2026,7 +1862,6 @@ pub fn scan_frames(
             } else {
                 bound_frames += 1;
                 r.ribbon_bound += 1;
-                // Frame 0 is the differencing baseline and cannot carry ink.
                 let dark = frame_no > 0 && metrics.band_ink < RIBBON_LIT_MIN_PX;
                 dark_candidates.push(dark);
                 if frame_no > 0 {
@@ -2066,8 +1901,6 @@ pub fn scan_frames(
                 r.cat_missing += usize::from(cat);
                 notes.push(FrameNote::CompanionMissing);
             }
-            // Two drawn companions, judged on the strict list and only where
-            // the plane is cleared enough for a second one to mean an animal.
             if strict.len() >= 2 && isolating {
                 r.companion_stack += 1;
                 notes.push(FrameNote::CompanionStack {
@@ -2076,8 +1909,6 @@ pub fn scan_frames(
             }
         }
         if statuses.is_some() {
-            // One verdict per captured frame, so earlier claimed frames cannot
-            // stand in for the final isolated stills.
             cat_visibility.push(cat && component.is_some());
             pet_visibility.push(pet && component.is_some());
         }
@@ -2097,13 +1928,9 @@ pub fn scan_frames(
 
     (r.rainbow_frames, r.rainbow_run, r.rainbow_gap) =
         rainbow_summary(&rainbow_flags, &duplicate_flags);
-    // With paired rows, continuity is charged where the design promises a
-    // visible band: between the first and last claim-bound frame.
     if statuses.is_some() && bound_frames > 0 {
         r.rainbow_gap = longest_interior_gap(&bound_lit);
     }
-    // Debounced: a lone unlit bound frame is the decay trough's phase lottery;
-    // a real blackout runs two frames or more and is charged whole.
     let mut run = 0;
     for dark in dark_candidates.into_iter().chain([false]) {
         if dark {

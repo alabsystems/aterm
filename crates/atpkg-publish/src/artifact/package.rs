@@ -1,41 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! `atpkg-publish pack-package <pkgdir> --build <YYYYMMDDNN>`: a prebuilt PACKAGE TREE
-//! (a [`Shape::Package`] row: codex-alab, as `alab/package.sh` in its repo lays it), packed
-//! WHOLE. No rebuild and no restrip: package.sh already built it with Trust, stripped it,
-//! signed it ad hoc and smoke-tested it, and every byte it laid is what ships.
-//!
-//! Each step is a gate that refuses before anything later runs, and nothing is signed or
-//! uploaded after a refusal:
-//!
-//! 1. the build id: given explicitly, inside the client's ALab store window
-//!    (`atpkg::alab::in_store_window`: above the final legacy pin, below every vendor id);
-//! 2. the package ([`read_package`]): an ALab package by the client's own marker
-//!    (`codex-package.json` layout 1 whose entrypoint is `bin/<the exposed tool>`, and
-//!    `alab-build.json`), for this target, whose two records name one version of the form
-//!    `MAJOR.MINOR.0-dev.<count>+g<sha9>` with `<sha9>` the recorded source commit;
-//! 3. the source ([`check_source`]): that commit is on `origin/main` of a checkout whose
-//!    origin is the program's repo on the staging owner, and `<count>` is its
-//!    `git rev-list --count`;
-//! 4. the compiler ([`check_compiler`]): the store's admitted Trust (or `--toolchain`), held
-//!    to what `alab-build.json` records it built with — its `-vV` byte for byte, its
-//!    sysroot, the digest of its binaries and the id package.sh derives from them;
-//! 5. the tree ([`check_tree`]): the arch gate over every object, then the client's ALab
-//!    pack gate (`atpkg::install::check_alab_pack`: the marker, the shimmed entrypoint,
-//!    `codesign --verify --strict` on every Mach-O, no other file executable);
-//! 6. the payload lineage scan (`super::lineage::scan_tree`) against the admitted compiler;
-//! 7. `codex-<build>.tar.zst` and `pkg-codex-<build>.toml`, signed with the machine key
-//!    (`--key` names another, e.g. a scratch roster key for a local proof), then the client's
-//!    whole stage of what was written ([`check_pack`]): the manifest verified under the
-//!    roster, the archive's digest and `tree_root`, the gate again on the staged tree;
-//! 8. only with `--upload`: the staging owner's `atpkg-<program>-<build>` release, whose
-//!    notes ([`staging_notes`]) name the version, the source commit and the upstream base
-//!    the package's record names ([`upstream_line`]).
-//!
-//! [`verify_pinned`] is the same [`check_pack`] over a pack an index is about to pin
-//! (`channel::index`): an ALab pin is signed only over a pack that verifies. The mirror's
-//! public release names the same base, read off the staged archive ([`staged_upstream`]).
+//! `atpkg-publish pack-package <pkgdir> --build <YYYYMMDDNN>`: a prebuilt PACKAGE TREE (a [`Shape::Package`] row: codex-alab, as `alab/package.sh` in its repo lays it), packed WHOLE.
 
 use std::path::{Path, PathBuf};
 
@@ -80,8 +46,7 @@ pub struct Package {
     pub count: u64,
     /// The compiler it was built with.
     pub compiler: CompilerRecord,
-    /// The upstream base its record names (`atpkg::alab::upstream_of`): none for a package
-    /// from before the field, or one whose field is malformed.
+    /// The upstream base its record names (`atpkg::alab::upstream_of`): none for a package from before the field, or one whose field is malformed.
     pub upstream: Option<atpkg::alab::Upstream>,
 }
 
@@ -125,11 +90,8 @@ pub struct PackageOutcome {
     pub uploaded: bool,
 }
 
-/// `program`'s package row: a [`Shape::Package`] row of an ALab-built agent program
-/// ([`programs::alab_package`]) with one exposed tool and one target.
-///
+/// `program`'s package row: a [`Shape::Package`] row of an ALab-built agent program ([`programs::alab_package`]) with one exposed tool and one target.
 /// # Errors
-///
 /// A usage error naming what the program is instead.
 pub fn package_row(program: &str) -> Result<(&'static ProgramDef, PackageDef, Triple)> {
     let def = programs::get(program)
@@ -157,9 +119,7 @@ pub fn package_row(program: &str) -> Result<(&'static ProgramDef, PackageDef, Tr
 }
 
 /// Refuse a build id outside the client's ALab store window.
-///
 /// # Errors
-///
 /// The refusal, naming the window.
 pub fn check_build(program: &str, build: Build) -> Result<()> {
     if atpkg::alab::in_store_window(build) {
@@ -216,13 +176,8 @@ fn is_commit(s: &str) -> bool {
     s.len() == 40 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
-/// Read and check the package at `dir` for `program` on `triple`: an ALab package by the
-/// client's marker whose entrypoint is `bin/<tool>`, both records for `triple` and naming
-/// one dev-form version whose sha is the recorded source commit's, and a full compiler
-/// record.
-///
+/// Read and check the package at `dir` for `program` on `triple`: an ALab package by the client's marker whose entrypoint is `bin/<tool>`, both records for `triple` and naming one dev-form version whose sha is the recorded source commit's, and a full compiler record.
 /// # Errors
-///
 /// A refusal naming the first thing that does not hold.
 pub fn read_package(dir: &Path, tool: &str, triple: Triple) -> Result<Package> {
     let root = std::fs::canonicalize(dir)
@@ -302,16 +257,13 @@ pub fn read_package(dir: &Path, tool: &str, triple: Triple) -> Result<Package> {
     })
 }
 
-/// The line a release page of `program`'s pack names its upstream base with
-/// (`atpkg::alab::Upstream::release_line`): none for a program ALab does not build, or a
-/// package whose record names no base.
+/// The line a release page of `program`'s pack names its upstream base with (`atpkg::alab::Upstream::release_line`): none for a program ALab does not build, or a package whose record names no base.
 #[must_use]
 pub fn upstream_line(program: &str, upstream: Option<&atpkg::alab::Upstream>) -> Option<String> {
     Some(upstream?.release_line(atpkg::alab::agent(program)?.upstream))
 }
 
-/// The staging release's notes for `pkg` packed as `program` for `triple`: the version
-/// and the source commit, then the upstream base when the package's record names one.
+/// The staging release's notes for `pkg` packed as `program` for `triple`: the version and the source commit, then the upstream base when the package's record names one.
 #[must_use]
 pub fn staging_notes(program: &str, pkg: &Package, triple: Triple) -> String {
     let notes = format!(
@@ -324,14 +276,8 @@ pub fn staging_notes(program: &str, pkg: &Package, triple: Triple) -> String {
     }
 }
 
-/// The upstream base the verified pack `pkg` of `program` records, read off its archive in
-/// `dir` as a client stages it (`atpkg::verify_and_stage`: digest, extract, `tree_root`)
-/// into scratch, never off any release's text: none for a program ALab does not build, a
-/// pack with no archive for a target ALab builds it for, or a package that names no base
-/// (a vendor package, or one from before the field).
-///
+/// The upstream base the verified pack `pkg` of `program` records, read off its archive in `dir` as a client stages it (`atpkg::verify_and_stage`: digest, extract, `tree_root`) into scratch, never off any release's text: none for a program ALab does not build, a pack with no archive for a target ALab builds it for, or a package that names no base (a vendor package, or one from before the field).
 /// # Errors
-///
 /// A refusal when the archive does not stage.
 pub fn staged_upstream(
     program: &str,
@@ -369,9 +315,7 @@ pub fn staged_upstream(
     Ok(atpkg::alab::upstream_of(&build_dir))
 }
 
-/// Whether the remote URL `url` names `owner/repo` on GitHub (https or ssh, with or without
-/// `.git`) or in a directory on this machine (a path or a `file://` URL: the operator's own
-/// mirror). Another host is refused: `owner/repo` there is not ALab's.
+/// Whether the remote URL `url` names `owner/repo` on GitHub (https or ssh, with or without `.git`) or in a directory on this machine (a path or a `file://` URL: the operator's own mirror).
 #[must_use]
 pub fn names_repo(url: &str, owner: &str, repo: &str) -> bool {
     let url = url.trim().trim_end_matches('/');
@@ -388,12 +332,8 @@ pub fn names_repo(url: &str, owner: &str, repo: &str) -> bool {
         || head.strip_prefix("file://").is_some_and(local)
 }
 
-/// The package's source commit is on `origin/main` of `repo_dir`, whose `origin` is
-/// `owner/repo`, and the version's `<count>` is that commit's `git rev-list --count`.
-/// Read only: nothing is fetched (a commit on a stale `origin/main` is on main still).
-///
+/// The package's source commit is on `origin/main` of `repo_dir`, whose `origin` is `owner/repo`, and the version's `<count>` is that commit's `git rev-list --count`.
 /// # Errors
-///
 /// A refusal naming what does not hold.
 pub fn check_source(repo_dir: &Path, owner: &str, repo: &str, pkg: &Package) -> Result<()> {
     let url = crate::git::run(repo_dir, &["remote", "get-url", "origin"])?;
@@ -446,12 +386,8 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// The digest package.sh records for a sysroot's compiler binaries: SHA-256 over, for
-/// `bin/trustc` (else `bin/rustc`) and then each `lib/librustc_driver-*.dylib` in name
-/// order, the file's name, a NUL and the raw SHA-256 of its bytes.
-///
+/// The digest package.sh records for a sysroot's compiler binaries: SHA-256 over, for `bin/trustc` (else `bin/rustc`) and then each `lib/librustc_driver-*.dylib` in name order, the file's name, a NUL and the raw SHA-256 of its bytes.
 /// # Errors
-///
 /// A refusal when the sysroot has no compiler, or a file does not read.
 pub fn binaries_sha256(sysroot: &Path) -> Result<String> {
     let exe = ["trustc", "rustc"]
@@ -485,20 +421,15 @@ pub fn binaries_sha256(sysroot: &Path) -> Result<String> {
     Ok(hex(&h.finalize()))
 }
 
-/// The id package.sh derives for a compiler: the first 16 hex of SHA-256 over its `-vV`,
-/// sysroot and [`binaries_sha256`], NUL-separated.
+/// The id package.sh derives for a compiler: the first 16 hex of SHA-256 over its `-vV`, sysroot and [`binaries_sha256`], NUL-separated.
 #[must_use]
 pub fn compiler_id(rustc_vv: &str, sysroot: &str, binaries: &str) -> String {
     let d = aterm_digest::Sha256::digest(format!("{rustc_vv}\0{sysroot}\0{binaries}").as_bytes());
     hex(&d)[..16].to_string()
 }
 
-/// The package was built by the compiler this pack admitted: `alab-build.json`'s record
-/// names `compiler`'s own root as its sysroot, its `-vV` (`vv`) byte for byte, the digest
-/// of that root's binaries, and the id derived from the three.
-///
+/// The package was built by the compiler this pack admitted: `alab-build.json`'s record names `compiler`'s own root as its sysroot, its `-vV` (`vv`) byte for byte, the digest of that root's binaries, and the id derived from the three.
 /// # Errors
-///
 /// A refusal naming the first difference.
 pub fn check_compiler(
     record: &CompilerRecord,
@@ -540,11 +471,8 @@ pub fn check_compiler(
     Ok(())
 }
 
-/// The arch gate over every object in `dir` (each must be `triple`'s; a fat Mach-O passes
-/// with that slice), then the client's ALab pack gate. Returns how many objects were read.
-///
+/// The arch gate over every object in `dir` (each must be `triple`'s; a fat Mach-O passes with that slice), then the client's ALab pack gate.
 /// # Errors
-///
 /// The first refusal.
 pub fn check_tree(dir: &Path, triple: Triple, exposes: &[String]) -> Result<usize> {
     let files = super::relocate::walk_files(dir)
@@ -564,14 +492,8 @@ pub fn check_tree(dir: &Path, triple: Triple, exposes: &[String]) -> Result<usiz
     Ok(n)
 }
 
-/// The client's whole stage of one pack: `pkg` (already verified under the roster) is
-/// `def`'s build `build`, exposes exactly the row's tools, carries a row for each of the
-/// row's targets and no other, and each row's archive (`archive_of(asset)`) stages through
-/// `atpkg::verify_and_stage` — digest, extract, `tree_root` — with the ALab pack gate run
-/// on the staged tree, whose package names the manifest's version.
-///
+/// The client's whole stage of one pack: `pkg` (already verified under the roster) is `def`'s build `build`, exposes exactly the row's tools, carries a row for each of the row's targets and no other, and each row's archive (`archive_of(asset)`) stages through `atpkg::verify_and_stage` — digest, extract, `tree_root` — with the ALab pack gate run on the staged tree, whose package names the manifest's version.
 /// # Errors
-///
 /// The first refusal.
 pub fn check_pack(
     def: &ProgramDef,
@@ -647,12 +569,8 @@ pub fn check_pack(
     Ok(())
 }
 
-/// The pack an index is about to pin for `def` at `build`, verified as a client would stage
-/// it ([`check_pack`]) under `quad` (the index being signed): from `pack_dir` when given (a
-/// local proof), else the public owner's download host, else the staging owner.
-///
+/// The pack an index is about to pin for `def` at `build`, verified as a client would stage it ([`check_pack`]) under `quad` (the index being signed): from `pack_dir` when given (a local proof), else the public owner's download host, else the staging owner.
 /// # Errors
-///
 /// A refusal when the pack cannot be read or does not verify.
 pub fn verify_pinned(
     ctx: &Ctx,
@@ -697,7 +615,6 @@ pub fn verify_pinned(
 }
 
 /// The manifest pair of `tag`, from the public owner's download host, else the staging
-/// owner, into `dir`: `(dir, where it came from)`.
 fn fetch_pair(
     ctx: &Ctx,
     repo: &str,
@@ -725,7 +642,6 @@ fn fetch_pair(
 }
 
 /// One asset of `tag` into `dir`, from where the pair came: the public download host when
-/// it serves it (at most the row's signed size), else the staging owner.
 fn fetch_asset(
     ctx: &Ctx,
     repo: &str,
@@ -757,9 +673,7 @@ fn fetch_asset(
 }
 
 /// [`pack_package`] over explicit tools — the seam the tests drive.
-///
 /// # Errors
-///
 /// Any gate's refusal; nothing is signed or uploaded after one.
 pub fn pack_package_with(
     ctx: &Ctx,
@@ -775,12 +689,8 @@ pub fn pack_package_with(
         ctx.identity.key.clone_from(key);
     }
     let ctx = &ctx;
-    // The key and the roster first: a pack that cannot sign stops in seconds.
     let signer = pack::Signer::load(ctx)?;
 
-    // THE SNAPSHOT: every gate below and the archive read one private copy of the package
-    // (a clone on APFS), so a `package.sh` run rewriting `<pkgdir>` meanwhile can change
-    // nothing between what the gates passed and the bytes that are signed.
     let original = std::fs::canonicalize(&request.package)
         .map_err(|e| Error::refused(format!("the package {} ({e})", request.package.display())))?;
     let snapshot = Scratch::new("pack-package")?;
@@ -859,7 +769,6 @@ pub fn pack_package_with(
     let signature = pack::write_manifest(ctx, &doc, &header, &row_doc, &manifest, Some(&signer))?
         .ok_or_else(|| Error::refused("the manifest was not signed"))?;
 
-    // What a client stages from these exact files.
     let read = |p: &Path| std::fs::read(p).map_err(|e| Error::io(ctx.shown(p), &e));
     let parsed = signer
         .authority()
@@ -903,12 +812,8 @@ pub fn pack_package_with(
 pub const SYNOPSIS: &str = "pack-package <pkgdir> --build YYYYMMDDNN [--program codex] \
      [--source-repo DIR] [--toolchain BIN] [--trust-repo DIR] [--key PATH] [--out DIR] [--upload]";
 
-/// The command line as a [`PackageRequest`]; `--trust-repo` moves where `ctx` reads the
-/// receipt switch. `--program` defaults to the one package row, `--source-repo` to
-/// `~/<repo>`, `--out` to `<state>/pack-package`.
-///
+/// The command line as a [`PackageRequest`]; `--trust-repo` moves where `ctx` reads the receipt switch.
 /// # Errors
-///
 /// A usage error naming what is wrong.
 pub fn parse_args(ctx: &mut Ctx, args: &[String]) -> Result<PackageRequest> {
     let usage = || Error::usage(SYNOPSIS);
@@ -977,9 +882,7 @@ pub fn parse_args(ctx: &mut Ctx, args: &[String]) -> Result<PackageRequest> {
 }
 
 /// `atpkg-publish pack-package …` ([`parse_args`]).
-///
 /// # Errors
-///
 /// A usage error for a malformed command line; the pack's refusals.
 pub fn run(ctx: &Ctx, args: &[String]) -> Result<()> {
     let mut ctx = ctx.clone();

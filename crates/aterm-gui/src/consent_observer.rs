@@ -1,43 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The `tccd` consent observer and the `EPERM` attention path.
-//!
-//! The observer streams `tccd`'s log. Its only verdict is a direct observation: an
-//! `AUTHREQ_CTX` with no `AUTHREQ_RESULT` after a threshold, whose accessing pid belongs to one
-//! of this instance's sessions. A quiet stream produces nothing. The attention path does not
-//! need the stream: when aterm's own file work takes `EPERM` under a protected root it
-//! re-renders the menu-bar glance and, in full mode, raises the tab mark and posts one
-//! notification (never one per `EPERM`) through `notify.rs`'s bounded queue.
-//!
-//! `[privacy] observer` is a tri-state ([`ObserverMode`]). Absent is the sentinel: one
-//! `log stream` whose predicate matches only `AUTHREQ_PROMPTING`, the line macOS writes when it
-//! shows a consent dialog, and whose job is to tell the access card a need exists and record
-//! which tab drew any other dialog it can name (`App::note_observed_prompts`). `false` is off.
-//! `true` is the full `tccd` stream with the correlation table, and the only mode with tab marks
-//! and banners: elsewhere they would repeat what the dialog and the card already say. There is no
-//! environment variable and no control verb: a knob a program in a session could flip is a
-//! consent surface an agent controls.
-//!
-//! Every failure to look lands on [`ObserverAvailability::Unavailable`], never on a false
-//! verdict: a standard account cannot read `/var/db/diagnostics` (`root:admin drwxr-x---`) and
-//! sees no events; Apple's `AUTHREQ_*` format is undocumented, so drift degrades to
-//! [`UnavailableReason::FormatUnrecognized`] and the pure parser is table-tested over recorded
-//! lines; a `<private>`-redacted attribution never completes a correlation and expires. The
-//! module streams rather than polling `log show`, because some info-level events never reach
-//! the archive, and names [`LOG_TOOL`] absolutely because a bare `log` is a zsh builtin.
-//!
-//! The full stream writes ~150 lines a second, so an orphan (its reader gone after an in-place
-//! update, whose `exec` runs no destructor) dies of `EPIPE` at once; a sentinel writes almost
-//! never. Each sentinel generation therefore runs with `--timeout 15m` and the worker respawns
-//! it on EOF ([`RotationPolicy`]), so an orphan lives at most fifteen minutes and no exit path
-//! needs a hook.
-//!
-//! The worker thread is spawned detached (`JoinHandle` dropped immediately, so joining on the
-//! event loop is structurally impossible) and posts over a bounded `sync_channel` (`try_send`,
-//! dropping on `Full`) with at most one payload-free event-loop poke per drain. The child
-//! process is signalled by pid and reaped by the worker that spawned it, so no `wait()` ever
-//! runs on the event loop.
+//! macOS `tccd` log consent observer ([`ObserverState`]) and `EPERM` attention gate ([`AttentionGate`]).
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -45,11 +9,9 @@ use std::sync::mpsc::{Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
-/// The observer's binary, absolute, from its one spelling in `aterm_containment::consent`: a
-/// bare `log` is a zsh builtin that shadows it and exits 0 silently.
+/// Absolute path to `/usr/bin/log` from `aterm_containment::consent`.
 #[cfg(any(target_os = "macos", test))]
 pub(crate) use aterm_containment::consent::LOG_TOOL;
-// Named absolutely, so a shell builtin can never shadow it.
 #[cfg(any(target_os = "macos", test))]
 const _: () = assert!(LOG_TOOL.as_bytes()[0] == b'/');
 
@@ -57,23 +19,20 @@ const _: () = assert!(LOG_TOOL.as_bytes()[0] == b'/');
 #[cfg(target_os = "macos")]
 use aterm_containment::consent::log_store_readable;
 
-/// The full-mode stream predicate: every `tccd` line.
+/// Full-mode `log stream` predicate matching all `tccd` messages.
 #[cfg(any(target_os = "macos", test))]
 pub(crate) const STREAM_PREDICATE: &str = "process == \"tccd\"";
 
-/// The sentinel predicate: `tccd`'s one line that means a consent dialog is on screen (silent
-/// between dialogs, where the full stream runs ~150 lines/s).
+/// Sentinel-mode `log stream` predicate matching `tccd` `AUTHREQ_PROMPTING` lines.
 #[cfg(any(target_os = "macos", test))]
 pub(crate) const SENTINEL_PREDICATE: &str =
     "process == \"tccd\" AND eventMessage CONTAINS \"AUTHREQ_PROMPTING\"";
 
-/// Every generation of the sentinel stream ends by itself after this long
-/// (`log stream --timeout`), so an orphan is bounded.
+/// Duration after which each sentinel `log stream` generation rotates (`--timeout`).
 #[cfg(any(target_os = "macos", test))]
 pub(crate) const SENTINEL_TIMEOUT: &str = "15m";
 
 /// A sentinel generation that ran at least this long ended because of its
-/// timeout (one second of slack under fifteen minutes).
 #[cfg(any(target_os = "macos", test))]
 const ROTATION_MIN: Duration = Duration::from_secs(14 * 60 + 59);
 
@@ -86,79 +45,64 @@ const EARLY_RESTARTS_PER_HOUR: usize = 3;
 const LOOKUP_TIMEOUT: Duration = Duration::from_secs(4);
 
 /// At most this many lookups run at once; a burst of dialogs beyond it counts
-/// as needs without a tab.
 #[cfg(target_os = "macos")]
 const MAX_LOOKUPS: usize = 2;
 
 /// Prompts waiting for the host to take them (bounded like everything fed by
-/// the stream).
 #[cfg(any(target_os = "macos", test))]
 const PROMPTS_CAP: usize = 16;
 
-/// Which observer the config asks for. See the module doc.
+/// Configured `tccd` observer mode.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ObserverMode {
-    /// `observer = false`: nothing is spawned or looked at.
+    /// `observer = false`: nothing is spawned or observed.
     Off,
-    /// `observer` absent: the narrow `AUTHREQ_PROMPTING` stream that feeds the
-    /// access card, records which tab drew any other dialog it can name, and
-    /// posts no banner.
+    /// Default sentinel stream (`AUTHREQ_PROMPTING`) feeding the access card.
     Sentinel,
-    /// `observer = true`: the whole `tccd` stream, the tab mark and the banner.
+    /// `observer = true`: full `tccd` stream with tab mark and notification banner.
     Full,
 }
 
 /// Bound on the observer's event queue. `tccd` is bursty, so it can fill: overflow is dropped,
-/// which loses at most one correlation, and a lost correlation expires into no verdict.
 const EVENT_QUEUE_CAP: usize = 256;
 
 /// Bound on the in-flight correlation table, a ring fed by a stream this process does not
-/// control: the oldest entry is evicted, and an evicted entry produces no verdict.
 #[cfg(any(target_os = "macos", test))]
 const PENDING_CAP: usize = 512;
 
-/// How long an uncorrelated entry may sit before it is discarded: the stream may have dropped
-/// its result line.
+/// Maximum age (`10m`) before an uncorrelated in-flight request is expired.
 pub(crate) const PENDING_MAX_AGE: Duration = Duration::from_secs(600);
 
-/// How long an `AUTHREQ_CTX` must sit unanswered to count as a pending prompt: a remembered
-/// decision comes back fast, and the dialog is what takes human time.
+/// Minimum unanswered duration (`3s`) before an `AUTHREQ_CTX` counts as a pending prompt.
 pub(crate) const PENDING_PROMPT_THRESHOLD: Duration = Duration::from_secs(3);
 
 /// Bound on the announced-`msgID` ring. Large enough that a normal session's
-/// dialogs are never re-announced, small enough to be a fixed cost.
 const ANNOUNCED_CAP: usize = 64;
 
 /// How many consecutive `AUTHREQ_*` lines may fail to parse, with nothing ever parsed, before
-/// the observer reports the format unrecognized.
 const FORMAT_DRIFT_LIMIT: u32 = 64;
 
-// The three-valued availability
-
-/// Why the observer cannot look. Every arm is a reason, never a measurement.
+/// Reason the `tccd` observer is unavailable.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum UnavailableReason {
-    /// This instance holds the inert arm: headless, a unit test, or a build
-    /// with no live observer.
+    /// Headless or unit-test inert probe arm.
     Inert,
-    /// Not macOS; there is no `tccd` and no unified log to stream.
+    /// Non-macOS platform without `tccd`.
     #[cfg(any(not(target_os = "macos"), test))]
     UnsupportedPlatform,
-    /// `aterm_containment::consent::DIAGNOSTICS_DIR` is not readable by this account (the
-    /// admin-group constraint). Not a negative verdict.
+    /// Current account cannot read `aterm_containment::consent::DIAGNOSTICS_DIR`.
     #[cfg(any(target_os = "macos", test))]
     NoLogAccess,
-    /// [`LOG_TOOL`] is missing or would not start.
+    /// [`LOG_TOOL`] is missing or failed to spawn.
     LogToolUnavailable,
-    /// The stream ended on its own. Nothing is being observed any more.
+    /// Log stream exited unexpectedly.
     StreamEnded,
-    /// `AUTHREQ_*` lines are arriving and none of them parse: Apple changed an
-    /// undocumented message format.
+    /// `AUTHREQ_*` lines arrived in an unrecognized format.
     FormatUnrecognized,
 }
 
 impl UnavailableReason {
-    /// The reason's report spelling.
+    /// Wire token for this unavailability reason.
     #[cfg(test)]
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
@@ -172,19 +116,16 @@ impl UnavailableReason {
     }
 }
 
-/// The `observer log=` value (§5.1). `Off` is "nobody asked", `Unavailable` "asked, and could
-/// not look", `Ok` "looking now": a quiet stream means nothing has been observed. `Unavailable`
-/// is never a negative.
+/// Current `observer log=` availability state.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum ObserverAvailability {
-    /// Not started, or [`ObserverMode::Off`].
+    /// Not started or [`ObserverMode::Off`].
     #[default]
     Off,
-    /// A stream is live and its lines are understood. Only the macOS log
-    /// stream ever starts one.
+    /// Stream is live and parsing lines.
     #[cfg(any(target_os = "macos", test))]
     Ok,
-    /// Asked for, and could not look.
+    /// Observer was requested but cannot run.
     Unavailable(UnavailableReason),
 }
 
@@ -201,7 +142,7 @@ impl ObserverAvailability {
         }
     }
 
-    /// The `observer log=` token.
+    /// Wire token for `observer log=`.
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::Off => "off",
@@ -211,7 +152,7 @@ impl ObserverAvailability {
         }
     }
 
-    /// The reason, when there is one: reported beside `unavailable`, never folded into the token.
+    /// Underlying [`UnavailableReason`], if unavailable.
     #[cfg(test)]
     pub(crate) const fn reason(self) -> Option<UnavailableReason> {
         match self {
@@ -221,54 +162,39 @@ impl ObserverAvailability {
     }
 }
 
-// The parser: pure, and the only place a log line is understood
-
-/// One recognized `tccd` message. `msg_id` stays raw text (`475.2921`): it is only a
-/// correlation key.
+/// Parsed `tccd` `AUTHREQ_*` log message correlated by `msg_id`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg(any(target_os = "macos", test))]
 pub(crate) enum TccEvent {
-    /// `AUTHREQ_CTX` — a request opened, naming the service.
+    /// `AUTHREQ_CTX`: request opened for `service`.
     Ctx {
         msg_id: String,
         service: String,
-        /// `preflight=yes` is a capability question, not a prompt. `None` when
-        /// the field was absent.
+        /// Whether `preflight=yes` was set (`None` if absent).
         preflight: Option<bool>,
     },
-    /// `AUTHREQ_ATTRIBUTION`: who is asking. The line carries up to three blocks,
-    /// `responsible=`, `accessing=` and `requesting=`; only the last two are kept, because
-    /// `responsible=` names the terminal application, the same pid for every session. A
-    /// self-request carries only `requesting=`, so both pids are optional; absent is `None`.
+    /// `AUTHREQ_ATTRIBUTION`: responsible, accessing, and requesting PIDs.
     Attribution {
         msg_id: String,
         accessing_pid: Option<i32>,
         requesting_pid: Option<i32>,
     },
-    /// `AUTHREQ_SUBJECT` — the code identity the request is about.
+    /// `AUTHREQ_SUBJECT`: code identity subject of the request.
     Subject { msg_id: String, subject: String },
-    /// `AUTHREQ_RESULT` — the request closed. This is what makes an open
-    /// request stop counting as pending.
+    /// `AUTHREQ_RESULT`: request completed.
     Result { msg_id: String },
-    /// `AUTHREQ_PROMPTING`: a consent dialog is on screen, the line the sentinel exists for.
-    /// `subject` is the code identity it is for (`Sub:{…}`), `resp_pid` the responsible process
-    /// (`Resp:{…}`): aterm's own window for a program in a live tab, the accessing program
-    /// itself for a tab that survived an update.
+    /// `AUTHREQ_PROMPTING`: consent dialog is on screen.
     Prompting {
         msg_id: String,
         service: String,
         subject: String,
         resp_pid: i32,
     },
-    /// An `AUTHREQ_*` line whose shape this parser does not recognize. Counted,
-    /// never guessed at: enough of these with nothing understood is what turns
-    /// the observer `unavailable`.
+    /// Unrecognized `AUTHREQ_*` line shape.
     Unparsed,
 }
 
 /// The value after `key`, up to the first `,`, `}` or whitespace. Deliberately naive: the
-/// format is undocumented, so only the shapes recorded in the tests are claimed, and everything
-/// else is [`TccEvent::Unparsed`].
 #[cfg(any(target_os = "macos", test))]
 fn field_after<'a>(haystack: &'a str, key: &str) -> Option<&'a str> {
     let start = haystack.find(key)? + key.len();
@@ -278,36 +204,26 @@ fn field_after<'a>(haystack: &'a str, key: &str) -> Option<&'a str> {
     (!value.is_empty()).then_some(value)
 }
 
-/// One log line to at most one event.
-///
-/// `None` for a line that is not a `tccd` `AUTHREQ_*` message: ordinary traffic, not a format
-/// change. [`TccEvent::Unparsed`] is an `AUTHREQ_*` message whose fields did not parse, which
-/// is what a format change produces.
+/// Parses a single `tccd` log line into a [`TccEvent`], if it is an `AUTHREQ_*` message.
 #[cfg(any(target_os = "macos", test))]
 pub(crate) fn parse_line(line: &str) -> Option<TccEvent> {
     // `log stream` opens every generation with a header echoing the predicate (`Filtering the
-    // log data using "… CONTAINS "AUTHREQ_PROMPTING""`). Counted as `Unparsed` once per
-    // rotation, it would trip the drift limit after 64 quiet generations (16 h).
     if line.trim_start().starts_with("Filtering the log data") {
         return None;
     }
     let marker = line.find("AUTHREQ_")?;
     let body = line.get(marker..)?;
-    // A message is `AUTHREQ_<KIND>: ...`. The kind is followed by a colon; a
-    // predicate echo (`AUTHREQ_PROMPTING""`) or any other mention is not one.
     let kind_end = body.find(|c: char| !(c.is_ascii_uppercase() || c == '_'))?;
     if body.as_bytes().get(kind_end) != Some(&b':') {
         return None;
     }
     let msg_id = field_after(body, "msgID=").map(str::to_owned);
     if body.starts_with("AUTHREQ_ATTRIBUTION") {
-        // Each pid is read inside its own block (`pid_in_block`): `responsible=` comes first.
         let Some(msg_id) = msg_id else {
             return Some(TccEvent::Unparsed);
         };
         if !body.contains("pid=") {
             // A recognized kind with no pid anywhere is the format-change
-            // signature, not a self-request.
             return Some(TccEvent::Unparsed);
         }
         return Some(TccEvent::Attribution {
@@ -326,9 +242,6 @@ pub(crate) fn parse_line(line: &str) -> Option<TccEvent> {
         });
     }
     if body.starts_with("AUTHREQ_PROMPTING") {
-        // `subject=Sub:{com.aterm.aterm}Resp:{TCCDProcess: …, pid=74756, …},`: the subject sits
-        // between `Sub:{` and the next `}`, the pid inside `Resp:{`. Anything short of all of it
-        // is Unparsed.
         let subject = body
             .split_once("Sub:{")
             .and_then(|(_, rest)| rest.split_once('}'))
@@ -366,13 +279,10 @@ pub(crate) fn parse_line(line: &str) -> Option<TccEvent> {
     if body.starts_with("AUTHREQ_RESULT") {
         return Some(msg_id.map_or(TccEvent::Unparsed, |msg_id| TccEvent::Result { msg_id }));
     }
-    // Another `AUTHREQ_*` kind: not needed, and not a format change, so not counted as drift.
     None
 }
 
 /// The first `pid=` inside one named attribution block. The blocks share one line and the first
-/// is `responsible=` (the terminal application, the same pid for every session), so a pid is
-/// never read off the line as a whole.
 #[cfg(any(target_os = "macos", test))]
 fn pid_in_block(body: &str, block: &str) -> Option<i32> {
     let at = body.find(block)?;
@@ -389,8 +299,7 @@ fn parse_yes_no(value: &str) -> bool {
     )
 }
 
-/// The `blocked_on=` token for one service (§5.1): `kTCCService` stripped, as
-/// `consent::Folder::tcc_service` does, and `unknown` when nothing is left.
+/// Formats the `blocked_on=` token for `service` by stripping `kTCCService`.
 pub(crate) fn blocked_on_token(service: &str) -> String {
     let short = service
         .trim()
@@ -401,8 +310,6 @@ pub(crate) fn blocked_on_token(service: &str) -> String {
     }
     format!("macos-permission:{short}")
 }
-
-// The correlation table (pure)
 
 /// One in-flight `tccd` request.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -416,44 +323,34 @@ struct PendingEntry {
     first_seen: Instant,
 }
 
-/// Which attribution block a prompt's pid came from.
+/// Attribution block from which a prompt's PID was taken.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PidSource {
-    /// `accessing={…}` — the process on whose behalf the check runs. Preferred.
+    /// `accessing={…}` block.
     Accessing,
-    /// `requesting={…}` — the process that asked. Used only when there is no
-    /// accessing block, which is what a self-request looks like.
+    /// `requesting={…}` fallback block.
     Requesting,
 }
 
-/// A request that has been open long enough, and is complete enough, to be a
-/// direct observation of a prompt. Borrowed from the table, so a read clones
-/// nothing; the announcement copies the two strings it keeps.
+/// Open `tccd` request that has exceeded [`PENDING_PROMPT_THRESHOLD`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PendingPrompt<'a> {
-    /// The correlation key, kept so a caller can tell two prompts apart.
+    /// Correlation `msgID`.
     pub(crate) msg_id: &'a str,
-    /// The TCC service, verbatim from the log.
+    /// TCC service name.
     pub(crate) service: &'a str,
-    /// The process parked in the syscall: the `accessing=` pid, else the `requesting=` pid (a
-    /// self-request carries only that). Never the `responsible=` pid.
+    /// PID of the process parked in the syscall.
     pub(crate) accessing_pid: i32,
-    /// Which block the pid came from, so a reader can tell a direct request
-    /// from a relayed one.
+    /// Attribution block that provided [`Self::accessing_pid`].
     pub(crate) pid_source: PidSource,
-    /// The code identity the request names, when the subject line arrived.
+    /// Code identity subject, if received.
     pub(crate) subject: Option<&'a str>,
-    /// How long it has been open.
+    /// Elapsed time since the request opened.
     pub(crate) age: Duration,
 }
 
 impl PendingEntry {
     /// The pid, its block and the service, when this request carries
-    /// everything a prompt needs: a known service, some pid (the accessing one
-    /// preferred) and no preflight bit. Age aside, this is the signature.
-    ///
-    /// A preflight is a capability question that raises no dialog, so folding
-    /// one in would manufacture a prompt out of a question nobody saw.
     fn signature(&self) -> Option<(i32, PidSource, &str)> {
         if self.preflight == Some(true) {
             return None;
@@ -467,27 +364,23 @@ impl PendingEntry {
     }
 }
 
-/// The in-flight requests, keyed by `msgID`.
-///
-/// Pure and bounded. Nothing here touches the OS, so the whole correlation is
-/// table-testable against recorded lines.
+/// Bounded table of in-flight `tccd` requests keyed by `msgID`.
 #[derive(Debug, Default)]
 pub(crate) struct PendingTable {
     entries: VecDeque<PendingEntry>,
     /// Consecutive [`TccEvent::Unparsed`] since the last understood event.
     unparsed_run: u32,
     /// How many events this table has ever understood. Zero plus a long
-    /// unparsed run is the format-change signature.
     parsed_total: u64,
 }
 
 impl PendingTable {
-    /// A fresh, empty table.
+    /// Creates an empty [`PendingTable`].
     pub(crate) fn new() -> Self {
         Self::default()
     }
 
-    /// Fold one event.
+    /// Folds a single [`TccEvent`] into the table at `now`.
     #[cfg(any(target_os = "macos", test))]
     pub(crate) fn note(&mut self, event: TccEvent, now: Instant) {
         if matches!(event, TccEvent::Unparsed) {
@@ -512,18 +405,13 @@ impl PendingTable {
                 requesting_pid,
             } => {
                 let slot = self.slot(&msg_id, now);
-                // Or-in, never overwrite with `None`: a later line with fewer blocks must not
-                // erase a pid an earlier one supplied.
                 slot.accessing_pid = accessing_pid.or(slot.accessing_pid);
                 slot.requesting_pid = requesting_pid.or(slot.requesting_pid);
             }
             TccEvent::Subject { msg_id, subject } => {
                 self.slot(&msg_id, now).subject = Some(subject);
             }
-            // Understood (it keeps the drift count honest) but opens no correlation: the host
-            // takes it as a need through `ObserverState::take_prompting`.
             TccEvent::Prompting { .. } => {}
-            // A result closes the request: the verdict rests on its absence.
             TccEvent::Result { msg_id } => self.entries.retain(|e| e.msg_id != msg_id),
             TccEvent::Unparsed => unreachable!("handled above"),
         }
@@ -550,14 +438,13 @@ impl PendingTable {
         self.entries.back_mut().expect("an entry was just pushed")
     }
 
-    /// Drop entries older than `max_age` ([`PENDING_MAX_AGE`]).
+    /// Removes entries older than `max_age` ([`PENDING_MAX_AGE`]).
     pub(crate) fn expire(&mut self, now: Instant, max_age: Duration) {
         self.entries
             .retain(|e| now.saturating_duration_since(e.first_seen) < max_age);
     }
 
-    /// Requests open for at least `threshold`, with a known service and a known accessing pid,
-    /// that are not preflights ([`PendingEntry::signature`]).
+    /// Returns non-preflight requests open for at least `threshold` with known service and PID.
     pub(crate) fn pending_prompts(
         &self,
         now: Instant,
@@ -584,10 +471,6 @@ impl PendingTable {
     }
 
     /// The earliest instant a request that is not `threshold` old yet, and
-    /// already carries the rest of the signature, becomes a pending prompt;
-    /// `None` when no request is on its way there. A request that gains the
-    /// rest later does so by a line, and a line is a drain the next verdict
-    /// pass reads anyway.
     fn next_crossing(&self, now: Instant, threshold: Duration) -> Option<Instant> {
         self.entries
             .iter()
@@ -597,27 +480,24 @@ impl PendingTable {
             .min()
     }
 
-    /// Whether the stream is delivering `AUTHREQ_*` lines this parser does not
-    /// understand, and has never understood one. The format-change signature.
+    /// Whether the stream has produced only unparsed `AUTHREQ_*` lines past the format-change threshold.
     pub(crate) const fn format_looks_changed(&self) -> bool {
         self.parsed_total == 0 && self.unparsed_run >= FORMAT_DRIFT_LIMIT
     }
 
-    /// In-flight request count.
+    /// Number of in-flight requests.
     pub(crate) fn len(&self) -> usize {
         self.entries.len()
     }
 
-    /// Whether nothing is in flight.
+    /// Whether no requests are in flight.
     #[cfg(test)]
     pub(crate) fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
 }
 
-/// Which session owns `accessing_pid`: a session whose shell is the pid itself or its process
-/// group. `sessions` is `(session id, shell pid)`; `pgid` is passed in so the join stays pure.
-/// `None` for a pid aterm cannot place in one of its sessions.
+/// Resolves which session in `sessions` owns `accessing_pid` by PID or process group.
 pub(crate) fn owning_session(
     accessing_pid: i32,
     pgid: Option<i32>,
@@ -636,9 +516,7 @@ pub(crate) fn owning_session(
         .map(|(session, _)| *session)
 }
 
-/// Which session a process belongs to, by ancestry: the [`owning_session`] rule on the pid, then
-/// on each parent (at most 32 levels, stopping at pid 1). Both lookups are passed in so the walk
-/// stays pure.
+/// Resolves which session owns `pid` by walking its parent chain via `ppid_of`.
 pub(crate) fn session_of_pid(
     pid: i32,
     sessions: &[(u64, i32)],
@@ -658,64 +536,49 @@ pub(crate) fn session_of_pid(
     None
 }
 
-// The injected stream arm
-
-/// One message from the streaming worker.
+/// Message sent from the background `log stream` worker to [`ObserverState`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ObserverEvent {
-    /// The child started and lines are on the way.
+    /// Child process started and is streaming lines.
     #[cfg(any(target_os = "macos", test))]
     Started,
-    /// The observer could not look. Terminal for this pass.
+    /// Observer could not start or continue.
     Unavailable(UnavailableReason),
-    /// One recognized (or explicitly unrecognized) `tccd` message.
+    /// Parsed `tccd` `AUTHREQ_*` event.
     #[cfg(any(target_os = "macos", test))]
     Line(TccEvent),
-    /// A consent dialog is on screen (`AUTHREQ_PROMPTING`), enriched with the
-    /// accessing pid where it could be found. Posted by the stream worker or,
-    /// after a bounded lookup, by a short-lived lookup thread.
+    /// On-screen consent dialog (`AUTHREQ_PROMPTING`).
     #[cfg(any(target_os = "macos", test))]
     Prompt(PromptNeed),
-    /// The stream ended and the child was reaped.
+    /// Stream exited and child process was reaped.
     #[cfg(any(target_os = "macos", test))]
     Ended,
 }
 
-/// One observed consent dialog, for this bundle or another's: what the host needs to judge
-/// whether it is this aterm's need, and from which tab.
+/// Observed on-screen consent dialog (`AUTHREQ_PROMPTING`) with PID attribution.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
 pub(crate) struct PromptNeed {
-    /// The dialog's `msgID`, its identity for de-duplication.
+    /// Dialog correlation `msgID`.
     pub(crate) msg_id: String,
-    /// The TCC service, verbatim (`kTCCServiceSystemPolicyAppData`).
+    /// TCC service name.
     pub(crate) service: String,
-    /// The code identity the dialog is for (`com.aterm.aterm`).
+    /// Code identity subject (`com.aterm.aterm`).
     pub(crate) subject: String,
-    /// The responsible process (`Resp:{…}`).
+    /// Responsible process PID (`Resp:{…}`).
     pub(crate) resp_pid: i32,
-    /// The process that actually accessed, when it could be found: the
-    /// responsible pid itself when that is not our window, else the result of
-    /// the on-demand lookup. Best effort, never a gate.
+    /// Accessing process PID, if resolved.
     pub(crate) accessing_pid: Option<i32>,
 }
 
-/// Everything the worker posts through, gathered so the streaming arm can be a
-/// plain function pointer with an inert twin. Cloneable: a short-lived lookup
-/// thread posts its answer through a clone.
+/// Channel and child-process state shared with the streaming worker thread.
 #[derive(Clone)]
 pub(crate) struct StreamSink {
     tx: SyncSender<ObserverEvent>,
     poke: Arc<std::sync::Mutex<Box<dyn Fn() + Send>>>,
     /// Set by the post that pokes, cleared by [`ObserverState::drain`]
-    /// before it reads the queue: one wake per drain, however many events a
-    /// burst queues. Shared with the host's end of the channel.
     poked: Arc<AtomicBool>,
     /// The child's pid while it lives and the stop flag, shared with
-    /// [`ObserverState::stop`] so a stop can SIGNAL the child without ever
-    /// holding its handle — the event loop must never own something it could
-    /// be tempted to `wait()` on. The worker reads the flag between lines and
-    /// before each generation. Only the macOS stream has a child.
     #[cfg(target_os = "macos")]
     child: Arc<ChildSlot>,
     /// Lookups in flight ([`MAX_LOOKUPS`]).
@@ -725,13 +588,6 @@ pub(crate) struct StreamSink {
 
 impl StreamSink {
     /// Queue one message and poke the event loop unless a poke is already
-    /// owed.
-    ///
-    /// `try_send` and DROP on `Full` — never block, exactly as `notify.rs` and
-    /// `consent_warmup.rs` do; a message is never merged into another. The
-    /// poke is the latch's, issued whether or not the message fit: the main
-    /// thread's drain is what discovers both the message and, at the end, the
-    /// disconnect.
     fn post(&self, event: ObserverEvent) {
         match self.tx.try_send(event) {
             Ok(()) | Err(TrySendError::Disconnected(_)) => {}
@@ -743,12 +599,6 @@ impl StreamSink {
     }
 
     /// Wake the event loop if no wake is owed since its last drain.
-    ///
-    /// The send happens BEFORE the latch and the drain clears the latch
-    /// BEFORE it reads, both as read-modify-writes, so no message is
-    /// stranded: a post whose swap finds the latch set is ordered before the
-    /// next drain's clear, which acquires it and so reads the message; a post
-    /// whose swap comes after the last clear finds it unset and pokes.
     fn poke_once(&self) {
         if self.poked.swap(true, Ordering::AcqRel) {
             return;
@@ -758,9 +608,7 @@ impl StreamSink {
     }
 }
 
-/// The one OS question this module asks, injected like every consent surface's:
-/// [`ObserverProbe::live`] spawns a real `log stream` (a windowed macOS instance), and
-/// [`ObserverProbe::inert`] answers [`UnavailableReason::Inert`] (headless, every unit test).
+/// Injected OS probe arm for the `tccd` log observer.
 #[derive(Clone, Copy)]
 pub(crate) struct ObserverProbe {
     run: fn(&StreamSink, ObserverMode),
@@ -770,7 +618,7 @@ pub(crate) struct ObserverProbe {
 }
 
 impl ObserverProbe {
-    /// The windowed macOS instance's arm.
+    /// Live macOS probe arm for windowed instances.
     pub(crate) const fn live() -> Self {
         Self {
             run: live_run_stream,
@@ -780,7 +628,7 @@ impl ObserverProbe {
         }
     }
 
-    /// The headless / unit-test arm: nothing spawned, and `unavailable(inert)` reported.
+    /// Inert probe arm for headless and unit-test instances.
     pub(crate) const fn inert() -> Self {
         Self {
             run: inert_run_stream,
@@ -790,7 +638,7 @@ impl ObserverProbe {
         }
     }
 
-    /// `live()` for a windowed instance, `inert()` for a headless one.
+    /// Returns [`Self::live`] when `!headless`, or [`Self::inert`] when `headless`.
     pub(crate) const fn for_instance(headless: bool) -> Self {
         if headless {
             Self::inert()
@@ -799,7 +647,7 @@ impl ObserverProbe {
         }
     }
 
-    /// Whether this instance's arm can reach the OS at all.
+    /// Whether this probe arm can access the OS log.
     #[cfg(test)]
     pub(crate) const fn is_live(self) -> bool {
         self.live
@@ -816,8 +664,7 @@ fn inert_run_stream(sink: &StreamSink, _mode: ObserverMode) {
     sink.post(ObserverEvent::Unavailable(UnavailableReason::Inert));
 }
 
-/// The arguments of one stream generation for `mode`: full is the whole `tccd` stream, ended by
-/// a stop or EOF; the sentinel is the narrow predicate with `--timeout` ([`SENTINEL_TIMEOUT`]).
+/// Builds `log stream` CLI arguments for `mode`.
 #[cfg(any(target_os = "macos", test))]
 pub(crate) fn stream_args(mode: ObserverMode) -> Vec<String> {
     let mut args = vec!["stream".to_owned(), "--predicate".to_owned()];
@@ -836,9 +683,7 @@ pub(crate) fn stream_args(mode: ObserverMode) -> Vec<String> {
     args
 }
 
-/// The arguments of the bounded attribution lookup for one dialog, from the log the stream
-/// reads (about 1.3 s). `None` unless `msg_id` is only digits and dots, so a log line cannot
-/// inject into the predicate.
+/// Builds `log show` CLI arguments to look up attribution for `msg_id`.
 #[cfg(any(target_os = "macos", test))]
 pub(crate) fn lookup_args(msg_id: &str) -> Option<Vec<String>> {
     if msg_id.is_empty() || !msg_id.chars().all(|c| c.is_ascii_digit() || c == '.') {
@@ -858,8 +703,7 @@ pub(crate) fn lookup_args(msg_id: &str) -> Option<Vec<String>> {
     ])
 }
 
-/// The accessing pid the lookup's output names for `msg_id`, from the
-/// `accessing=` block (else the `requesting=` one), or `None`.
+/// Extracts the accessing (or requesting) PID for `msg_id` from `log show` `output`.
 #[cfg(any(target_os = "macos", test))]
 pub(crate) fn accessing_pid_in(output: &str, msg_id: &str) -> Option<i32> {
     output.lines().find_map(|line| match parse_line(line)? {
@@ -872,21 +716,19 @@ pub(crate) fn accessing_pid_in(output: &str, msg_id: &str) -> Option<i32> {
     })
 }
 
-/// What to do when one sentinel generation's child has exited.
+/// Action to take after a sentinel stream child process exits.
 #[cfg(any(target_os = "macos", test))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum StreamEnd {
-    /// It ran to its timeout: a normal rotation, start the next generation.
+    /// Normal timeout rotation; start the next generation immediately.
     Rotate,
-    /// It ended early but the hourly budget allows one more start.
+    /// Early exit within the hourly restart budget; restart.
     Restart,
-    /// It ended early too often (or this is not a rotating stream): stop and
-    /// report `unavailable(StreamEnded)`.
+    /// Early-restart budget exhausted; stop and report `Unavailable(StreamEnded)`.
     GiveUp,
 }
 
-/// The sentinel's restart policy: rotation is free, an early end costs one of
-/// [`EARLY_RESTARTS_PER_HOUR`]. Pure over the times it is given.
+/// Restart budget policy for sentinel stream generations.
 #[cfg(any(target_os = "macos", test))]
 #[derive(Debug, Default)]
 pub(crate) struct RotationPolicy {
@@ -899,7 +741,7 @@ impl RotationPolicy {
         Self::default()
     }
 
-    /// One generation of `mode` ended after `ran_for`, at `now`.
+    /// Evaluates [`StreamEnd`] when a generation of `mode` exits after `ran_for` at `now`.
     pub(crate) fn on_end(
         &mut self,
         mode: ObserverMode,
@@ -924,16 +766,6 @@ impl RotationPolicy {
 }
 
 /// Run [`LOG_TOOL`] with `args`, feeding every stdout line to `on_line`, then kill and reap the
-/// child here, on the worker that spawned it: this module's one spawn and one `wait()`.
-///
-/// * `slot`: the pid is published there while the child lives, so
-///   [`ObserverState::stop`] can signal it by pid ([`ChildSlot`]). Its stop
-///   flag is checked between lines, and a child published after a stop is
-///   reaped unread.
-/// * `kill_after`: a bounded run — a watchdog thread SIGKILLs the child by pid
-///   when it still stands unreaped this long after its spawn.
-///
-/// `Err` only when the tool would not start.
 #[cfg(target_os = "macos")]
 fn run_log_tool(
     args: &[String],
@@ -945,9 +777,6 @@ fn run_log_tool(
     use aterm_uds::spawnfd::{ChildStdio, LaneCommand};
     use std::io::BufRead;
 
-    // `spawnfd::spawn` (`posix_spawn` with `POSIX_SPAWN_CLOEXEC_DEFAULT`): the child holds its
-    // stdout and nothing else. It lives as long as the observer, so any descriptor it inherited
-    // (a fabric lane caught before its `F_SETFD`) would be held open that long.
     let Ok((stdout, stdout_end)) = std::io::pipe() else {
         return Err(UnavailableReason::LogToolUnavailable);
     };
@@ -959,7 +788,6 @@ fn run_log_tool(
     let Ok(mut child) = aterm_uds::spawnfd::spawn(cmd) else {
         return Err(UnavailableReason::LogToolUnavailable);
     };
-    // A pid that did not fit is 0, which the slot never signals.
     let reading = slot.publish(i32::try_from(child.id()).unwrap_or(0), send_signal);
     if let Some(limit) = kill_after {
         let slot = Arc::clone(slot);
@@ -977,12 +805,6 @@ fn run_log_tool(
             on_line(&line);
         }
     }
-    // Reaped here, on the worker that spawned it. The pid is retired first,
-    // under the lock every signal is sent under, so nothing signals it once
-    // `wait` can free it for reuse. `kill` is idempotent enough for our
-    // purposes (an already-exited child just fails) and `wait` returns
-    // promptly once the child is gone, which is why this is safe on a thread
-    // nothing joins and would never be safe on the event loop.
     slot.retire();
     let _ = child.kill();
     let _ = child.wait();
@@ -990,10 +812,6 @@ fn run_log_tool(
 }
 
 /// One dialog on screen: post it, with the accessing pid where it can be found.
-///
-/// When the responsible pid is not our window (a tab that survived an update) it is the
-/// accessing pid. When it is our window, one bounded `log show` on a short-lived thread finds
-/// who accessed, so the stream keeps reading; a burst beyond [`MAX_LOOKUPS`] posts without a pid.
 #[cfg(target_os = "macos")]
 fn note_prompting(
     sink: &StreamSink,
@@ -1050,20 +868,14 @@ fn note_prompting(
 }
 
 /// The live arm: one `log stream` child for [`ObserverMode::Full`], a rotating series for the
-/// sentinel ([`RotationPolicy`]). Lines are parsed on this thread, so the event loop receives
-/// classified events.
 #[cfg(target_os = "macos")]
 fn live_run_stream(sink: &StreamSink, mode: ObserverMode) {
     if !log_store_readable() {
-        // The admin-group constraint, not a negative verdict.
         sink.post(ObserverEvent::Unavailable(UnavailableReason::NoLogAccess));
         return;
     }
     let mut policy = RotationPolicy::new();
     let mut started_posted = false;
-    // A stop spawns no further generation: it is read here, it ends the
-    // restart pause at once, and a stop that races the spawn meets the
-    // publication in the slot.
     while !sink.child.stopped() {
         let generation = Instant::now();
         let generation_wall = std::time::SystemTime::now();
@@ -1092,9 +904,6 @@ fn live_run_stream(sink: &StreamSink, mode: ObserverMode) {
             sink.post(ObserverEvent::Unavailable(reason));
             return;
         }
-        // The larger of the monotonic and wall clocks: the monotonic one stops while the Mac
-        // sleeps but `--timeout` may not, so a generation that spanned a sleep would read as an
-        // early end and spend the restart budget.
         let ran_for = generation
             .elapsed()
             .max(generation_wall.elapsed().unwrap_or_default());
@@ -1119,69 +928,46 @@ fn live_run_stream(sink: &StreamSink, _mode: ObserverMode) {
     ));
 }
 
-// The instance's observer state
-
-/// What a start attempt did.
+/// Outcome of [`ObserverState::start`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum StartOutcome {
-    /// A worker was spawned.
+    /// Streaming worker thread was spawned.
     Started,
-    /// The mode is [`ObserverMode::Off`]. Nothing spawned, nothing looked at.
+    /// Mode is [`ObserverMode::Off`]; nothing was spawned.
     Disabled,
-    /// A worker is already streaming; the call changed nothing.
+    /// Worker was already running.
     AlreadyLive,
-    /// The OS refused the thread.
+    /// Spawning the worker thread failed.
     SpawnFailed,
 }
 
-/// The instance's observer: its injected arm, its availability, its bounded
-/// receiver and its correlation table.
-///
-/// Instance-owned, with NO process-global anywhere in this module. An in-place
-/// apply builds a fresh `App` and therefore a fresh, empty observer — nothing
-/// claims anything about a request the previous process was correlating. A
-/// stream restarted within the process starts with an empty table for the
-/// same reason ([`Self::start`]).
+/// Per-instance `tccd` observer state and correlation table.
 pub(crate) struct ObserverState {
     probe: ObserverProbe,
     availability: ObserverAvailability,
     /// What the host last asked for: [`Self::start`] records its mode, `Off`
-    /// and a failed spawn included, and [`Self::stop`] records `Off`.
-    /// [`Self::reconcile`] compares against it, so a stream that ended by
-    /// itself (no log access, the early-restart budget spent) is not
-    /// respawned by a request for the mode it already had.
     requested: ObserverMode,
     /// The mode of the stream that is running: its worker's `Started` sets
-    /// it to `requested`, and [`Self::stop`] and the disconnect edge in
-    /// [`Self::drain`] return it to `Off`. A receiver is held only while
-    /// `requested` is the mode its worker was started with.
     running: ObserverMode,
     rx: Option<Receiver<ObserverEvent>>,
     /// The worker's child and stop flag ([`ChildSlot`]), new with each
-    /// channel.
     child: Arc<ChildSlot>,
     /// The worker's poke latch ([`StreamSink::poke_once`]), cleared by
-    /// [`Self::drain`].
     poked: Arc<AtomicBool>,
     table: PendingTable,
     /// Whether an event was folded since the last verdict pass
-    /// ([`Self::take_new_verdicts`]).
     verdicts_dirty: bool,
     /// The roster generation the last verdict pass judged against.
     judged_roster: Option<u64>,
     /// When the next request crosses [`PENDING_PROMPT_THRESHOLD`], as the last
-    /// verdict pass found it: the pass's deadline on a loop nothing else
-    /// wakes.
     verdict_due: Option<Instant>,
     /// Announced prompts and their tab owner. Only a matching result answers
-    /// a pending prompt; lost observations and expired correlations do not.
     announced: VecDeque<AnnouncedPrompt>,
     /// A tab contribution moved since the host last pushed its chrome.
     attention_dirty: bool,
     /// Observed dialogs waiting for the host ([`Self::take_prompting`]).
     prompts: VecDeque<PromptNeed>,
     /// `msgID`s of dialogs already queued, so one dialog is one need however
-    /// often its line repeats. Separate from `announced` (Full mode's banner).
     #[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
     prompt_seen: VecDeque<String>,
 }
@@ -1193,7 +979,7 @@ struct AnnouncedPrompt {
 }
 
 impl ObserverState {
-    /// Wire the arm for this instance. Nothing runs until [`Self::start`].
+    /// Creates an [`ObserverState`] for a windowed (`!headless`) or headless instance.
     pub(crate) fn new(headless: bool) -> Self {
         Self {
             probe: ObserverProbe::for_instance(headless),
@@ -1214,50 +1000,45 @@ impl ObserverState {
         }
     }
 
-    /// The headless / unit-test instance.
+    /// Creates an inert [`ObserverState`] for headless and unit tests.
     pub(crate) fn inert() -> Self {
         Self::new(true)
     }
 
-    /// Whether this instance's arm can reach the OS.
+    /// Whether the underlying probe arm is live.
     #[cfg(test)]
     pub(crate) const fn probe_is_live(&self) -> bool {
         self.probe.is_live()
     }
 
-    /// The `observer log=` value right now.
+    /// Current `observer log=` availability.
     pub(crate) const fn availability(&self) -> ObserverAvailability {
         self.availability
     }
 
-    /// Whether a stream is running.
+    /// Whether a log stream worker is currently running.
     #[cfg(test)]
     pub(crate) const fn is_live(&self) -> bool {
         self.rx.is_some()
     }
 
-    /// The mode the host last asked for.
+    /// Mode last requested via [`Self::start`] or [`Self::reconcile`].
     pub(crate) const fn requested(&self) -> ObserverMode {
         self.requested
     }
 
-    /// The mode of the stream that has started and not ended.
+    /// Mode of the currently running stream.
     pub(crate) const fn running(&self) -> ObserverMode {
         self.running
     }
 
-    /// In-flight correlations.
+    /// Number of in-flight request correlations.
     #[cfg(test)]
     pub(crate) fn pending_len(&self) -> usize {
         self.table.len()
     }
 
-    /// Start the stream. `mode` is `[privacy] observer` as the caller resolved it (the sentinel
-    /// is gated on the card's switches); this module reads no config or environment. `poke`
-    /// wakes the event loop.
-    ///
-    /// `Off` stops a stream that is running, so nothing is ever looked at
-    /// under a request for nothing.
+    /// Starts the log stream worker in `mode` if not already running.
     pub(crate) fn start<P>(&mut self, mode: ObserverMode, poke: P) -> StartOutcome
     where
         P: Fn() + Send + 'static,
@@ -1273,12 +1054,7 @@ impl ObserverState {
         if self.rx.is_some() {
             return StartOutcome::AlreadyLive;
         }
-        // Recorded before the spawn, so a failed one is retried only when the
-        // host asks for another mode.
         self.requested = mode;
-        // A new stream has nothing in flight. A request an earlier stream was
-        // correlating can no longer see its result, so a dialog it stood for
-        // may have been answered while nothing was reading.
         self.table = PendingTable::new();
         self.verdict_due = None;
         let (sink, rx) = self.channel(poke);
@@ -1286,8 +1062,6 @@ impl ObserverState {
         let spawned = std::thread::Builder::new()
             .name("consent-observer".into())
             .spawn(move || run(&sink, mode));
-        // Detached: the handle is never stored, so nothing can join a thread parked in a
-        // blocking read of the child's stdout.
         match spawned {
             Ok(_handle) => {}
             Err(err) => {
@@ -1302,8 +1076,6 @@ impl ObserverState {
     }
 
     /// A fresh channel and the worker's end of it. The child slot (its stop
-    /// flag and pid) and the poke latch are new too, so nothing a stopped
-    /// worker still holds reaches the new stream.
     fn channel<P>(&mut self, poke: P) -> (StreamSink, Receiver<ObserverEvent>)
     where
         P: Fn() + Send + 'static,
@@ -1323,10 +1095,7 @@ impl ObserverState {
         (sink, rx)
     }
 
-    /// Bring the stream to `mode`, the host's resolved wish. A wish equal to
-    /// the last request changes nothing and returns `None`. Otherwise the
-    /// running stream, if any, is stopped and `mode` started: `Off` leaves the
-    /// availability `off`, not `unavailable(stream_ended)`.
+    /// Reconciles the running stream with the desired `mode`.
     pub(crate) fn reconcile<P>(&mut self, mode: ObserverMode, poke: P) -> Option<StartOutcome>
     where
         P: Fn() + Send + 'static,
@@ -1338,13 +1107,7 @@ impl ObserverState {
         Some(self.start(mode, poke))
     }
 
-    /// Stop the stream. Never joins anything.
-    ///
-    /// Sets the stop flag and signals the child by pid while its worker has not
-    /// reaped it (a non-blocking `kill`, [`ChildSlot::stop`]), and drops the
-    /// receiver. The worker notices the EOF, the flag or the end of its restart
-    /// pause, reaps its own child, and exits; dropping the receiver also makes
-    /// every further `post` a no-op through `Disconnected`.
+    /// Signals the running log stream child to exit and drops the receiver.
     pub(crate) fn stop(&mut self) {
         self.child.stop(send_signal);
         self.rx = None;
@@ -1359,16 +1122,9 @@ impl ObserverState {
         }
     }
 
-    /// Fold every queued message into the table; returns how many were applied. `Disconnected`
-    /// (the worker exited) is the end-of-stream edge a full queue cannot drop, so the
-    /// availability settles even when every message was lost.
+    /// Drains queued worker events into the table at `now`, returning the number folded.
     pub(crate) fn drain(&mut self, now: Instant) -> usize {
-        // The poke latch is cleared BEFORE the queue is read: a post that
-        // lands after the last `try_recv` then finds it clear and pokes again
-        // ([`StreamSink::poke_once`]).
         self.poked.swap(false, Ordering::AcqRel);
-        // The receiver is taken for the pump and put back only while connected, so the
-        // disconnect edge retires it once and the fold below borrows `self` freely.
         let mut queued: Vec<ObserverEvent> = Vec::new();
         let mut disconnected = false;
         if let Some(rx) = self.rx.take() {
@@ -1402,11 +1158,8 @@ impl ObserverState {
     }
 
     /// After a fold: expire stale correlations and settle the availability
-    /// the format-drift count implies.
     fn settle(&mut self, now: Instant) {
         self.table.expire(now, PENDING_MAX_AGE);
-        // A format change degrades to `unavailable`, never to a verdict; the first understood
-        // line lifts it.
         let drifting = self.table.format_looks_changed();
         if drifting {
             self.availability =
@@ -1423,7 +1176,6 @@ impl ObserverState {
 
     /// Fold one message.
     fn apply(&mut self, event: ObserverEvent, now: Instant) {
-        // Only a macOS stream line is timed; elsewhere nothing reads the clock.
         #[cfg(not(any(target_os = "macos", test)))]
         let _ = now;
         self.verdicts_dirty = true;
@@ -1450,7 +1202,6 @@ impl ObserverState {
             }
             #[cfg(any(target_os = "macos", test))]
             ObserverEvent::Prompt(need) => {
-                // Counted as understood for format drift, then queued once per dialog.
                 self.table.note(
                     TccEvent::Prompting {
                         msg_id: need.msg_id.clone(),
@@ -1481,9 +1232,7 @@ impl ObserverState {
         }
     }
 
-    /// The non-consuming twin of [`Self::take_new_verdicts`]: every pending prompt that resolves
-    /// to a session, as `(session, blocked_on token)`. Empty means "nothing observed", never "not
-    /// blocked": read [`Self::availability`] beside it.
+    /// Returns all currently pending prompts attributed to `sessions` without marking them announced.
     #[cfg(test)]
     pub(crate) fn verdicts(
         &self,
@@ -1506,13 +1255,12 @@ impl ObserverState {
         out
     }
 
-    /// Attribute only through this instance's process arms. Tests/headless keep
-    /// them inert even when a fixture changes App's windowed-policy boolean.
+    /// Resolves which session in `sessions` owns `pid` using this instance's probe arm.
     pub(crate) fn session_for_pid(&self, pid: i32, sessions: &[(u64, i32)]) -> Option<u64> {
         session_of_pid(pid, sessions, self.probe.parent_of, self.probe.pgid_of)
     }
 
-    /// This observer's current tab contribution. No OS question is asked.
+    /// Whether `session` currently has an announced pending prompt.
     pub(crate) fn marks_session(&self, session: u64) -> bool {
         self.announced
             .iter()
@@ -1523,14 +1271,13 @@ impl ObserverState {
         std::mem::take(&mut self.attention_dirty)
     }
 
-    /// A retired session cannot own a prompt in a later tab.
+    /// Clears any announced prompts attributed to retired `session`.
     pub(crate) fn retire_session(&mut self, session: u64) {
         self.attention_dirty |= self.marks_session(session);
         self.announced.retain(|p| p.session != session);
     }
 
-    /// [`Self::take_new_verdicts`] through this instance's own process-group
-    /// arm: full-mode announcements use the same instance-owned observation.
+    /// [`Self::take_new_verdicts`] using this instance's live process-group resolver.
     pub(crate) fn take_new_verdicts_for_instance(
         &mut self,
         now: Instant,
@@ -1541,12 +1288,7 @@ impl ObserverState {
         self.take_new_verdicts(now, roster, sessions, pgid_of)
     }
 
-    /// Every observed consent dialog for this app (its subject is `bundle_id`), each once,
-    /// oldest first. A dialog for any other subject is dropped: it is not this aterm's need.
-    ///
-    /// `None` means the running bundle's identity is not warm yet: nothing is
-    /// taken and nothing is dropped, so a dialog that arrives before the
-    /// identity is known is judged when it is.
+    /// Drains newly observed consent dialogs whose subject matches `bundle_id`.
     #[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
     pub(crate) fn take_prompting(&mut self, bundle_id: Option<&str>) -> Vec<PromptNeed> {
         let Some(bundle_id) = bundle_id else {
@@ -1558,19 +1300,7 @@ impl ObserverState {
             .collect()
     }
 
-    /// Observed pending prompts this instance has not announced yet, marking each announced as
-    /// it goes.
-    ///
-    /// One `msgID` pages once: the rate limit is the identity of the dialog itself, not a
-    /// posture epoch, because two distinct dialogs are two distinct things a human has to answer.
-    /// A quiet stream returns an empty vector and nobody is woken.
-    ///
-    /// Per state change, not per call: a pass judges only when an answer can differ from the
-    /// last one (an event was folded since, `roster` moved, or a request reached the threshold
-    /// at [`Self::verdict_deadline`]). Any other call returns at once and asks the OS nothing.
-    /// `sessions` (`(session id, shell pid)`) is built only when an unannounced prompt stands,
-    /// and `pgid_of` resolves a pid's process group, passed in so the OS call belongs to the
-    /// caller's fence.
+    /// Returns newly observed pending prompts attributed to `sessions`, marking them announced.
     pub(crate) fn take_new_verdicts(
         &mut self,
         now: Instant,
@@ -1586,8 +1316,6 @@ impl ObserverState {
         }
         self.verdicts_dirty = false;
         self.judged_roster = Some(roster);
-        // Strictly later than `now`, so a passed deadline is never armed
-        // again.
         self.verdict_due = self.table.next_crossing(now, PENDING_PROMPT_THRESHOLD);
         if !self.availability.is_live() {
             return Vec::new();
@@ -1611,9 +1339,6 @@ impl ObserverState {
                 continue;
             };
             if self.announced.len() >= ANNOUNCED_CAP {
-                // Retain unanswered prompts under pressure: eviction is no
-                // evidence that their owner answered. An eventual result
-                // makes room for the next unannounced prompt.
                 let Some(done) = self.announced.iter().position(|p| !p.pending) else {
                     continue;
                 };
@@ -1634,30 +1359,19 @@ impl ObserverState {
         fresh
     }
 
-    /// When the next request crosses [`PENDING_PROMPT_THRESHOLD`], as the last
-    /// verdict pass found it: the instant [`Self::take_new_verdicts`] judges
-    /// again with nothing else moving. Later than the pass that set it; the
-    /// pass it wakes replaces it.
+    /// Earliest instant when an in-flight request will cross [`PENDING_PROMPT_THRESHOLD`].
     pub(crate) const fn verdict_deadline(&self) -> Option<Instant> {
         self.verdict_due
     }
 }
 
-/// A TCC service as `tccd` names it (`kTCCServiceMediaLibrary`, or already
-/// bare), as the short id every table here keys on (`MediaLibrary`): trimmed,
-/// one prefix stripped. The one normalization, so the app-data test, the words
-/// and a record's key all judge the same id.
+/// Strips the `kTCCService` prefix from `service`.
 pub(crate) fn short_service(service: &str) -> &str {
     let service = service.trim();
     service.strip_prefix("kTCCService").unwrap_or(service)
 }
 
-/// What a consent dialog for `short` (a [`short_service`] id) is about, in
-/// words: the folder's own name where the service is one of aterm's, and a
-/// fixed phrase where aterm knows the service. The service id itself
-/// ("AddressBook", "ListenEvent") is no name macOS shows a person, so an
-/// unknown one is `None`: the notice says "a permission", and no record is
-/// made.
+/// Human-readable description of the protected resource for short TCC service ID `short`.
 pub(crate) fn service_words(short: &str) -> Option<&'static str> {
     use aterm_containment::consent::Folder;
     match Folder::ALL.iter().find(|f| f.tcc_service() == short) {
@@ -1684,20 +1398,19 @@ pub(crate) fn service_words(short: &str) -> Option<&'static str> {
     }
 }
 
-/// One observed pending prompt, attributed to a session, that the human has not
-/// been told about yet.
+/// Newly observed pending prompt attributed to a session.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ObservedPrompt {
-    /// The session whose process is parked.
+    /// Session ID whose process is parked.
     pub(crate) session: u64,
-    /// The `blocked_on=` token (§5.1), already rendered.
+    /// Rendered `blocked_on=` token.
     pub(crate) blocked_on: String,
-    /// The TCC service verbatim, for the notification body.
+    /// Raw TCC service name.
     pub(crate) service: String,
 }
 
 impl ObservedPrompt {
-    /// The one native notification this prompt earns.
+    /// Builds the [`AttentionNotice`] for this prompt.
     pub(crate) fn notice(&self) -> AttentionNotice {
         let asked = service_words(short_service(&self.service)).map_or_else(
             || "macOS is asking for a permission.".to_string(),
@@ -1721,7 +1434,6 @@ impl Default for ObserverState {
 
 impl Drop for ObserverState {
     /// Signal and let go: a `Drop` that joins a worker freezes the UI, and the worker reaps its
-    /// own child.
     fn drop(&mut self) {
         self.stop();
     }
@@ -1752,7 +1464,6 @@ enum Signal {
 #[derive(Debug, Default)]
 struct ChildCell {
     /// The child's pid from its publication until its worker retires it to
-    /// reap, `0` otherwise.
     pid: i32,
     /// Set by [`ChildSlot::stop`], never cleared.
     #[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
@@ -1761,7 +1472,6 @@ struct ChildCell {
 
 impl ChildCell {
     /// Signal the child when one stands unreaped. Pid `0` is never signalled:
-    /// `kill(0, …)` reaches aterm's own process group.
     fn signal_if_unreaped(&self, signal: Signal, kill: impl Fn(i32, Signal)) {
         if self.pid > 0 {
             kill(self.pid, signal);
@@ -1770,14 +1480,6 @@ impl ChildCell {
 }
 
 /// One worker's child, shared by the worker that spawned it, the host's
-/// [`ObserverState::stop`] and a lookup's watchdog.
-///
-/// Every signal is sent under the lock, and only to a pid the worker has
-/// published and not retired. The worker retires the pid under the same lock
-/// before it reaps, so no signal reaches a pid `wait` has freed for reuse. A
-/// stop and a publication meet under the lock as well: whichever comes second
-/// signals the child, so a stop that lands while a child is being spawned, or
-/// between generations, still ends it.
 #[derive(Debug, Default)]
 struct ChildSlot {
     cell: Mutex<ChildCell>,
@@ -1791,7 +1493,6 @@ impl ChildSlot {
     }
 
     /// Ask the worker to stop: set the flag, signal a child that stands
-    /// unreaped, and end a restart pause. Never waits on the child.
     fn stop(&self, kill: impl Fn(i32, Signal)) {
         let mut cell = self.lock();
         cell.stopped = true;
@@ -1805,7 +1506,6 @@ impl ChildSlot {
 #[cfg(any(target_os = "macos", test))]
 impl ChildSlot {
     /// Publish a spawned child's pid. `false` when a stop came first: the
-    /// child is signalled here, and the worker reaps it without reading.
     fn publish(&self, pid: i32, kill: impl Fn(i32, Signal)) -> bool {
         let mut cell = self.lock();
         cell.pid = pid;
@@ -1828,7 +1528,6 @@ impl ChildSlot {
     }
 
     /// The lookup watchdog: wait until the worker retires the child or `limit`
-    /// passes, then SIGKILL it if it still stands unreaped.
     fn kill_unless_retired_within(&self, limit: Duration, kill: impl Fn(i32, Signal)) {
         let (cell, _) = self
             .changed
@@ -1838,7 +1537,6 @@ impl ChildSlot {
     }
 
     /// The pause before an early restart: `pause` long, ended at once by a
-    /// stop. Whether a stop was asked.
     fn pause_unless_stopped(&self, pause: Duration) -> bool {
         let (cell, _) = self
             .changed
@@ -1849,17 +1547,13 @@ impl ChildSlot {
 }
 
 /// Deliver `signal` to `pid`. NON-BLOCKING by construction: it signals and
-/// returns, and the worker that spawned the child is what reaps it. Only
-/// [`ChildSlot`] calls it, under its lock, with a pid not yet reaped.
 #[cfg(unix)]
 fn send_signal(pid: i32, signal: Signal) {
     let signal = match signal {
         Signal::Term => libc::SIGTERM,
         Signal::Kill => libc::SIGKILL,
     };
-    // SAFETY: `kill` with a positive pid is a plain signal delivery with no
-    // memory effects. The pid is a child of ours its worker has not reaped (one
-    // that exited stays a zombie until then), so it names no other process.
+    // SAFETY: `kill` with a positive PID delivers a signal to our unreaped child process without memory effects.
     unsafe {
         libc::kill(pid, signal);
     }
@@ -1869,65 +1563,56 @@ fn send_signal(pid: i32, signal: Signal) {
 #[cfg(not(unix))]
 fn send_signal(_pid: i32, _signal: Signal) {}
 
-/// The process group of `pid`, or `None` on any failure ("cannot attribute", never a negative).
-/// `getpgid` cannot raise a prompt.
+/// Process group ID of `pid` via `getpgid(2)`, or `None` on failure.
 #[cfg(unix)]
 pub(crate) fn live_pgid_of(pid: i32) -> Option<i32> {
     if pid <= 0 {
         return None;
     }
-    // SAFETY: `getpgid` reads process-table state for a pid and writes nothing.
+    // SAFETY: `getpgid` reads kernel process-table state for `pid` and writes no memory.
     let pgid = unsafe { libc::getpgid(pid) };
     (pgid > 0).then_some(pgid)
 }
 
-/// Off unix there are no process groups to consult.
+/// Non-Unix stub returning `None`.
 #[cfg(not(unix))]
 pub(crate) fn live_pgid_of(_pid: i32) -> Option<i32> {
     None
 }
 
-// The attention path (§3.6)
-
-/// One observed fact that may deserve the away human's attention.
+/// Observed consent or permission failure event.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AttentionEvent {
-    /// aterm's own file work returned `EPERM(1)` under a protected root. `session` names the tab
-    /// to mark; the warm-up is instance-level and carries `None`.
+    /// aterm's own file access returned `EPERM` under a protected root.
     ProtectedEperm { session: Option<u64> },
 }
 
-/// The one native notification an [`AttentionEvent`] may produce.
+/// Native notification payload produced by an [`AttentionEvent`] or [`ObservedPrompt`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct AttentionNotice {
-    /// The originating session, for `notify.rs`'s focus-aware suppression.
-    /// `u64::MAX` when the fact is instance-level: no session has that id, so
-    /// focus suppresses nothing (session `0` is the first tab).
+    /// Originating session ID (`u64::MAX` when instance-wide).
     pub(crate) session: u64,
     /// Notification title.
     pub(crate) title: &'static str,
     /// Notification body.
     pub(crate) body: String,
     /// Private: only this module's gate and prompts build a notice, so
-    /// [`crate::notify::NotifyMsg::consent`] posts nothing they did not decide.
     decided: (),
 }
 
-/// What the caller should do about one [`AttentionEvent`]: the gate decides and the caller acts,
-/// so the rate limit is testable without a window or a notifier.
+/// Host actions decided by [`AttentionGate::note`].
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct AttentionOutcome {
-    /// Raise this session's tab attention mark.
+    /// Session whose tab attention mark should be raised, if any.
     pub(crate) raise_tab: Option<u64>,
-    /// Post this one notification through `notify.rs`'s bounded queue.
+    /// Native notification to post, if any.
     pub(crate) notice: Option<AttentionNotice>,
-    /// Re-render the menu-bar glance.
+    /// Whether the status-bar menu glance needs refreshing.
     pub(crate) refresh_status_item: bool,
 }
 
 impl AttentionOutcome {
-    /// What the host may act on in `mode`: the tab mark and the banner repeat the access card's
-    /// question, so only [`ObserverMode::Full`] keeps them; the glance refresh stays in every mode.
+    /// Filters this outcome according to `mode`.
     pub(crate) fn for_mode(self, mode: ObserverMode) -> Self {
         if mode == ObserverMode::Full {
             self
@@ -1942,26 +1627,22 @@ impl AttentionOutcome {
 }
 
 /// The title of a denial ([`AttentionGate`]): macOS refused aterm's own file
-/// work under a protected folder.
 const DENIED_TITLE: &str = "aterm · file access denied";
 
 /// The title of an observed dialog ([`ObservedPrompt::notice`]): macOS is
-/// asking, for any permission — a file, the camera, another app.
 const PROMPT_TITLE: &str = "aterm · permission waiting";
 
-/// The `EPERM` rate limit: one notification per instance however many denials; a fresh `App`
-/// starts armed.
+/// Per-instance rate limiter and session tracker for `EPERM` attention events.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct AttentionGate {
     /// Whether the one notification has been spent.
     spent: bool,
     /// Live sessions whose own protected read was refused. This contribution
-    /// ends on a verified grant or session retirement, not on a dismissal.
     denied_sessions: Vec<(u64, Instant)>,
 }
 
 impl AttentionGate {
-    /// A fresh, armed gate.
+    /// Creates a fresh, armed [`AttentionGate`].
     pub(crate) const fn new() -> Self {
         Self {
             spent: false,
@@ -1975,8 +1656,6 @@ impl AttentionGate {
             .iter_mut()
             .find(|(id, _)| *id == session)
         {
-            // A repeated refusal is a new fact even while the same mark
-            // stands: an older queued grant cannot answer it.
             *at = now;
             return false;
         }
@@ -2003,13 +1682,13 @@ impl AttentionGate {
         self.denied_sessions.retain(|(id, _)| *id != session);
     }
 
-    /// Whether the notification has been spent.
+    /// Whether the per-instance notification has already been sent.
     #[cfg(all(test, unix))]
     pub(crate) const fn is_spent(&self) -> bool {
         self.spent
     }
 
-    /// One event to one outcome.
+    /// Records `event` and returns the resulting [`AttentionOutcome`].
     pub(crate) fn note(&mut self, event: AttentionEvent) -> AttentionOutcome {
         match event {
             AttentionEvent::ProtectedEperm { session } => self.note_eperm(session),
@@ -2017,7 +1696,6 @@ impl AttentionGate {
     }
 
     /// An observed `EPERM` under a protected root. The tab mark is raised every
-    /// time (it is per-tab and idempotent); the notification is spent once.
     fn note_eperm(&mut self, session: Option<u64>) -> AttentionOutcome {
         if self.spent {
             return AttentionOutcome {
@@ -2046,27 +1724,22 @@ impl AttentionGate {
 }
 
 impl crate::App {
-    /// The `privacy` verb's `observer log=` value: a read, never a start. It lives here so no
-    /// control module names the observer (`consent_retire`'s fence).
+    /// Returns the `observer log=` token for the `privacy` control verb.
     pub(crate) fn privacy_observer_log(&self) -> &'static str {
         self.consent_observer.availability().as_str()
     }
 }
 
-// Test seams
-
 #[cfg(test)]
 impl ObserverState {
-    /// Fold one worker message without a worker. Production folds through [`Self::drain`].
+    /// Folds a single [`ObserverEvent`] directly for tests.
     pub(crate) fn feed_for_test(&mut self, event: ObserverEvent, now: Instant) {
         self.apply(event, now);
         self.settle(now);
     }
 
-    /// Swap in a test arm, so a host test can watch what its reconcile
-    /// starts and stops. Test seam only: production wires the arm once, in
-    /// [`Self::new`].
-    #[cfg_attr(not(unix), allow(dead_code))] // its tests are unix-only
+    /// Overrides the streaming worker function for tests.
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub(crate) fn set_arm_for_test(&mut self, run: fn(&StreamSink, ObserverMode)) {
         self.probe = ObserverProbe {
             run,
@@ -2078,9 +1751,8 @@ impl ObserverState {
 
 #[cfg(test)]
 impl StreamSink {
-    /// Post as the worker does, and say whether the host still holds the
-    /// receiver: `false` once a stop dropped it. Test seam only.
-    #[cfg_attr(not(unix), allow(dead_code))] // its tests are unix-only
+    /// Posts `event` through the sink for tests, returning whether the receiver is still open.
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub(crate) fn post_for_test(&self, event: ObserverEvent) -> bool {
         let held = !matches!(self.tx.try_send(event), Err(TrySendError::Disconnected(_)));
         self.poke_once();
@@ -2094,12 +1766,7 @@ mod tests {
 
     use super::*;
 
-    // The parser, over recorded lines
-
     /// `AUTHREQ_*` lines in the shapes `/usr/bin/log stream` prints (app names anonymized),
-    /// keyed to one msgID. This attribution carries all three blocks: `responsible=` is the
-    /// terminal (pid 4059), `accessing=` the `mdfind` that ran the check (pid 18584), and
-    /// `requesting=` the daemon that relayed it (pid 378).
     const REC_ATTRIBUTION: &str = "2026-08-31 15:58:45.494008-0700 0x8de257   Default     \
         0x1579c5c            66389  0    tccd: [com.apple.TCC:access] AUTHREQ_ATTRIBUTION: \
         msgID=378.385, attribution={responsible={TCCDProcess: identifier=com.example.term, \
@@ -2249,8 +1916,6 @@ mod tests {
         );
     }
 
-    // Correlation
-
     fn feed(table: &mut PendingTable, line: &str, now: Instant) {
         let event = parse_line(line).expect("recorded line parses");
         table.note(event, now);
@@ -2365,8 +2030,6 @@ mod tests {
         assert!(table.is_empty(), "expired");
     }
 
-    // Session attribution
-
     #[test]
     fn owning_session_matches_the_pid_or_its_process_group_and_nothing_else() {
         let sessions = &[(7u64, 4711i32), (9, 4802)];
@@ -2395,7 +2058,6 @@ mod tests {
     }
 
     /// The `blocked_on=` token strips Apple's internal prefix and never renders
-    /// empty.
     #[test]
     fn the_blocked_on_token_is_the_short_service_name() {
         let cases: &[(&str, &str)] = &[
@@ -2415,8 +2077,6 @@ mod tests {
             assert_eq!(blocked_on_token(service), *expected);
         }
     }
-
-    // The three-valued availability
 
     #[test]
     fn unavailable_off_and_ok_are_three_distinct_values() {
@@ -2474,7 +2134,6 @@ mod tests {
             observer.start(ObserverMode::Full, || {}),
             StartOutcome::Started
         );
-        // The worker is detached: poll for its one message (there is no handle to join).
         let deadline = Instant::now() + Duration::from_secs(60);
         while observer.availability() == ObserverAvailability::Off && Instant::now() < deadline {
             observer.drain(Instant::now());
@@ -2509,10 +2168,6 @@ mod tests {
     }
 
     /// Reconcile acts on a CHANGED wish only. The inert arm's worker ends by
-    /// itself after its one message, the shape of a stream that lost its log
-    /// access: asking again for the mode it had respawns nothing, while a
-    /// different mode starts, and `Off` reads `off` rather than
-    /// `unavailable`.
     #[test]
     fn reconcile_restarts_only_on_a_changed_mode() {
         let mut observer = ObserverState::inert();
@@ -2526,8 +2181,6 @@ mod tests {
             Some(StartOutcome::Started)
         );
         assert_eq!(observer.requested(), ObserverMode::Full);
-        // A hang detector, not a budget: the detached worker's one message and
-        // its exit (this module owns no handle to join).
         let deadline = Instant::now() + Duration::from_secs(60);
         while observer.is_live() && Instant::now() < deadline {
             observer.drain(Instant::now());
@@ -2560,7 +2213,6 @@ mod tests {
     }
 
     /// `Started` records the requested mode as the running one; the worker's
-    /// disconnect and a stop each return it to `Off`.
     #[test]
     fn the_running_mode_is_set_by_started_and_cleared_by_an_end_or_a_stop() {
         let now = Instant::now();
@@ -2576,8 +2228,6 @@ mod tests {
         );
         observer.feed_for_test(ObserverEvent::Started, now);
         assert_eq!(observer.running(), ObserverMode::Full);
-        // The inert worker exits after its one message: a hang detector for
-        // the disconnect edge.
         let deadline = Instant::now() + Duration::from_secs(60);
         while observer.is_live() && Instant::now() < deadline {
             observer.drain(Instant::now());
@@ -2603,7 +2253,6 @@ mod tests {
     }
 
     /// A quiet stream is not a negative: a live stream with nothing in it publishes nothing and
-    /// stays `ok`.
     #[test]
     fn a_quiet_stream_publishes_nothing_and_stays_ok() {
         let now = Instant::now();
@@ -2625,7 +2274,6 @@ mod tests {
             observer.feed_for_test(ObserverEvent::Line(event), t0);
         }
         let later = t0 + PENDING_PROMPT_THRESHOLD + Duration::from_secs(1);
-        // 18584 is not a shell pid, but its process group is session 4's shell.
         let verdicts = observer.verdicts(later, &[(4, 4711)], |pid| (pid == 18584).then_some(4711));
         assert_eq!(
             verdicts,
@@ -2634,7 +2282,6 @@ mod tests {
                 "macos-permission:SystemPolicyDocumentsFolder".to_owned()
             )]
         );
-        // And an unrelated session set attributes nothing.
         assert!(
             observer.verdicts(later, &[(4, 9999)], |_| None).is_empty(),
             "a prompt we cannot attribute is nobody's prompt"
@@ -2642,7 +2289,6 @@ mod tests {
     }
 
     /// Both App-facing attribution routes keep headless process reads inert;
-    /// a fixture's synthetic process arms can then prove group and ancestor joins.
     #[test]
     fn the_instance_owns_its_process_attribution_probes() {
         fn parent(pid: i32) -> Option<i32> {
@@ -2691,7 +2337,6 @@ mod tests {
     }
 
     /// One observed dialog pages once, no matter how many times the correlation is re-read,
-    /// because `msgID` is the identity of the dialog a human still has to answer.
     #[test]
     fn one_observed_prompt_pages_once_and_a_second_dialog_pages_again() {
         let t0 = Instant::now();
@@ -2713,8 +2358,6 @@ mod tests {
             "macos-permission:SystemPolicyDocumentsFolder"
         );
         assert_eq!(first[0].notice().session, 4);
-        // A service aterm does not know is never printed as its id, which
-        // stays whole in `blocked_on=`.
         let unknown = ObservedPrompt {
             session: 4,
             blocked_on: blocked_on_token("kTCCServiceSomethingNew"),
@@ -2722,17 +2365,14 @@ mod tests {
         };
         assert!(!unknown.notice().body.contains("kTCCService"));
 
-        // A moved roster forces a pass, so the announced set is what answers.
         assert!(
             observer
                 .take_new_verdicts(later, 2, sessions, pgid)
                 .is_empty(),
             "the same dialog never pages twice"
         );
-        // The non-consuming read still reports it: the session is still blocked.
         assert_eq!(observer.verdicts(later, &sessions(), pgid).len(), 1);
 
-        // A SECOND, DISTINCT dialog pages again.
         for line in [
             "tccd: AUTHREQ_CTX: msgID=378.999, service=kTCCServiceSystemPolicyDesktopFolder, \
              preflight=no",
@@ -2768,7 +2408,6 @@ mod tests {
                 .is_empty(),
             "not ours"
         );
-        // A session joined: the roster generation moved.
         let ours = observer.take_new_verdicts(
             later,
             2,
@@ -2779,8 +2418,6 @@ mod tests {
     }
 
     /// Per state change, not per park: a prompt nobody owns is judged once for a roster, so idle
-    /// parks after it ask the OS nothing; a moved roster or a line that adds to its request
-    /// judges it again.
     #[test]
     fn an_unattributable_prompt_is_judged_once_per_roster() {
         let t0 = Instant::now();
@@ -2826,11 +2463,6 @@ mod tests {
     }
 
     /// The threshold is a deadline: a request that crosses it with no line and no roster change
-    /// after it is judged at the crossing.
-    ///
-    /// An older request nobody owns stands throughout, past the threshold, so every pass asks
-    /// the OS for its process group: a call before the crossing that ran a pass would show in
-    /// the count.
     #[test]
     fn the_threshold_crossing_is_judged_at_its_deadline() {
         let opened_before = Instant::now();
@@ -2875,8 +2507,6 @@ mod tests {
     }
 
     /// One wake per drain. Five posts before a drain poke once; the drain
-    /// clears the latch before it reads, so the next post pokes again (the
-    /// negative control: a latch that never re-arms would strand it).
     #[test]
     fn pokes_coalesce_until_the_queue_is_drained() {
         let pokes = Arc::new(AtomicUsize::new(0));
@@ -2942,7 +2572,6 @@ mod tests {
     }
 
     /// The two header lines `log stream` prints per generation (the first echoes the predicate)
-    /// are not messages, so a day of quiet rotations never drifts to `format-unrecognized`.
     #[test]
     fn the_stream_header_lines_are_not_messages_and_never_count_as_drift() {
         let filtering = "Filtering the log data using \"process == \"tccd\" AND \
@@ -2951,7 +2580,6 @@ mod tests {
             PID    TTL  ";
         assert_eq!(parse_line(filtering), None);
         assert_eq!(parse_line(columns), None);
-        // The same guard covers a bare mention that is not `AUTHREQ_<KIND>:`.
         assert_eq!(parse_line("x CONTAINS \"AUTHREQ_PROMPTING\"\""), None);
 
         let now = Instant::now();
@@ -2968,7 +2596,6 @@ mod tests {
     }
 
     /// The degradation is not sticky: once a line IS understood, the stream is
-    /// speaking a format this parser reads, so `unavailable` lifts.
     #[test]
     fn an_understood_line_lifts_a_format_drift() {
         let now = Instant::now();
@@ -2991,7 +2618,6 @@ mod tests {
     }
 
     /// The disconnect edge is authoritative: a worker that exits leaves the
-    /// observer `unavailable(stream-ended)`, never silently "ok".
     #[test]
     fn a_dropped_worker_ends_the_stream_honestly() {
         let now = Instant::now();
@@ -3004,10 +2630,7 @@ mod tests {
         );
     }
 
-    // The attention path
-
     /// A global grant answers each session only through its observation time.
-    /// Repeated refusals advance that session's fence without a new visible mark.
     #[test]
     fn consent_marks_recover_only_denials_the_grant_observed_after() {
         let now = Instant::now();
@@ -3045,7 +2668,6 @@ mod tests {
     }
 
     /// After `for_mode`, only a full observer marks a tab or posts a banner; the glance refreshes
-    /// in every mode.
     #[test]
     fn a_sentinel_instance_posts_no_banner_and_a_full_instance_still_does() {
         for mode in [ObserverMode::Sentinel, ObserverMode::Off] {
@@ -3069,7 +2691,6 @@ mod tests {
     }
 
     /// An instance-level denial (the warm-up) marks no tab — there is no session
-    /// it belongs to — but it still notifies once.
     #[test]
     fn an_instance_level_eperm_marks_no_tab_but_still_notifies() {
         let mut gate = AttentionGate::new();
@@ -3083,11 +2704,7 @@ mod tests {
         );
     }
 
-    // The sentinel
-
     /// `AUTHREQ_PROMPTING` lines in the recorded field grammar (timestamps, ids and paths are not
-    /// verbatim). The first is a program in a live tab (`Resp:` is aterm's window); the other two
-    /// are programs in tabs that survived an update (`Resp:` is the program itself).
     const REC_PROMPTING_WINDOW: &str = "2026-09-28 17:28:00.090411-0700 0x20dffbe  Default     \
         0x7265e15            3501   0    tccd: [com.apple.TCC:access] AUTHREQ_PROMPTING: \
         msgID=69745.137, service=kTCCServiceSystemPolicyAppData, \
@@ -3111,7 +2728,6 @@ mod tests {
         binary_path=/Users//someone/Library/Application Support/aterm/pkg/store/claude/1/bin/claude},";
 
     /// A dialog for another app's subject, and for a service that is not
-    /// app-data: both parse (they ARE dialogs) and neither is our need.
     const REC_PROMPTING_OTHER_SUBJECT: &str = "2026-09-28 17:31:00.000000-0700 0x1  Default     \
         0x1            3501   0    tccd: [com.apple.TCC:access] AUTHREQ_PROMPTING: \
         msgID=69745.300, service=kTCCServiceSystemPolicyAppData, \
@@ -3159,7 +2775,6 @@ mod tests {
     }
 
     /// A dialog missing any field is `Unparsed` (feeding the format-drift
-    /// limit), never a guess: no subject, no responsible pid, no service, no id.
     #[test]
     fn a_prompting_line_missing_its_fields_is_unparsed_never_guessed() {
         for broken in [
@@ -3202,7 +2817,6 @@ mod tests {
     }
 
     /// Every sentinel generation ends by itself (`--timeout 15m`), so an
-    /// orphan of an in-place update lives at most fifteen minutes.
     #[test]
     fn the_sentinel_stream_is_bounded_by_a_timeout_and_rotated_on_eof() {
         let args = stream_args(ObserverMode::Sentinel);
@@ -3211,7 +2825,6 @@ mod tests {
         assert_eq!(SENTINEL_TIMEOUT, "15m");
         assert!(ROTATION_MIN < Duration::from_secs(15 * 60));
         assert!(ROTATION_MIN >= Duration::from_secs(14 * 60));
-        // The lookup is bounded too, and cannot be steered by a log line.
         assert!(LOOKUP_TIMEOUT <= Duration::from_secs(5));
         assert!(lookup_args("69745.190").is_some());
         for hostile in ["", "1.2\" OR 1", "1.2,", "abc", "1.2 3"] {
@@ -3230,7 +2843,6 @@ mod tests {
     fn an_end_at_the_timeout_is_a_rotation_not_an_unavailable_observer() {
         let mut policy = RotationPolicy::new();
         let t0 = Instant::now();
-        // Any number of full-length generations rotate; none is charged.
         for i in 0..20u64 {
             assert_eq!(
                 policy.on_end(
@@ -3246,12 +2858,10 @@ mod tests {
             StreamEnd::Rotate,
             "14 min 59 s is the timeout"
         );
-        // The FULL stream has no timeout: any end is an end.
         assert_eq!(
             policy.on_end(ObserverMode::Full, Duration::from_secs(20 * 60), t0),
             StreamEnd::GiveUp
         );
-        // And a state fed a rotation stays `ok`: only `Ended` retires it.
         let mut observer = ObserverState::inert();
         let now = Instant::now();
         observer.feed_for_test(ObserverEvent::Started, now);
@@ -3279,7 +2889,6 @@ mod tests {
             StreamEnd::GiveUp,
             "a fourth early end inside the hour gives up"
         );
-        // A rotation in between does not refund the budget, and the hour does.
         assert_eq!(
             policy.on_end(
                 ObserverMode::Sentinel,
@@ -3300,8 +2909,6 @@ mod tests {
     }
 
     /// A stop signals the stream's child only while its worker has not reaped
-    /// it: once for a standing child, never pid 0 (aterm's own process group),
-    /// and never a pid the worker retired, which `wait` may free for reuse.
     #[test]
     fn a_stop_signals_the_child_only_while_it_is_unreaped() {
         let sent = std::cell::RefCell::new(Vec::new());
@@ -3333,10 +2940,6 @@ mod tests {
     }
 
     /// A stop that lands before the worker publishes its child's pid (the
-    /// spawn in flight, or the gap between generations) found pid 0 and
-    /// signalled nothing, so a sentinel child lived on until its next line or
-    /// its 15-minute timeout. The publication meets the stop under the slot's
-    /// lock and signals the child itself.
     #[test]
     fn a_stop_before_the_pid_is_published_signals_the_child_at_publication() {
         let sent = std::cell::RefCell::new(Vec::new());
@@ -3352,16 +2955,12 @@ mod tests {
             "signalled exactly once, at its publication"
         );
 
-        // Negative control: with no stop, a publication signals nothing.
         sent.borrow_mut().clear();
         assert!(ChildSlot::default().publish(4202, kill));
         assert!(sent.borrow().is_empty());
     }
 
     /// The lookup watchdog returns when the worker retires its child on another
-    /// thread, and signals nothing. Its limit is longer than anything waits
-    /// here, so only the retirement can return it; the minute is a hang
-    /// detector.
     #[test]
     fn the_lookup_watchdog_kills_only_a_child_unreaped_at_its_limit() {
         let sent = Arc::new(Mutex::new(Vec::new()));
@@ -3384,7 +2983,6 @@ mod tests {
             "a retired child is never killed"
         );
 
-        // Negative control: a child still unreaped at the limit is killed.
         let stuck = ChildSlot::default();
         assert!(stuck.publish(4302, |_, _| {}));
         stuck.kill_unless_retired_within(Duration::ZERO, |pid, signal| {
@@ -3394,12 +2992,9 @@ mod tests {
     }
 
     /// A stop ends the pause before an early restart, so a stream stopped
-    /// there spawns no further generation. The pause asked for is longer than
-    /// anything waits here; the minute is a hang detector.
     #[test]
     fn a_stop_ends_the_restart_pause() {
         let slot = Arc::new(ChildSlot::default());
-        // Negative control: unstopped, the pause runs out and says so.
         assert!(!slot.pause_unless_stopped(Duration::ZERO));
         let (done, returned) = std::sync::mpsc::channel();
         let paused = Arc::clone(&slot);
@@ -3415,8 +3010,6 @@ mod tests {
     }
 
     /// One dialog is one need, however often its line repeats; a dialog for
-    /// another subject is dropped; and nothing is taken (or dropped) until the
-    /// running bundle's identity is known.
     #[test]
     fn one_msg_id_is_one_need_however_often_the_line_repeats() {
         let mut observer = ObserverState::inert();
@@ -3437,10 +3030,8 @@ mod tests {
             "each dialog once, another app's not at all"
         );
         assert!(observer.take_prompting(Some("com.aterm.aterm")).is_empty());
-        // A repeat of an already-taken dialog is still the same dialog.
         observer.feed_for_test(prompting("69745.190", "com.aterm.aterm", 74756), now);
         assert!(observer.take_prompting(Some("com.aterm.aterm")).is_empty());
-        // A dev build's subject is its own bundle id.
         observer.feed_for_test(prompting("69745.400", "com.aterm.aterm.dev", 7), now);
         assert!(observer.take_prompting(Some("com.aterm.aterm")).is_empty());
     }
@@ -3488,7 +3079,6 @@ com.apple.sandboxd, pid=69745, auid=0, euid=0, binary_path=/usr/libexec/sandboxd
     #[test]
     fn a_program_is_placed_in_its_tab_by_ancestry() {
         let sessions = [(1_u64, 100), (2, 200)];
-        // 500 -> 400 -> 300 -> 200 (tab 2's shell).
         let parent = |pid: i32| match pid {
             500 => Some(400),
             400 => Some(300),
@@ -3501,10 +3091,8 @@ com.apple.sandboxd, pid=69745, auid=0, euid=0, binary_path=/usr/libexec/sandboxd
         assert_eq!(session_of_pid(200, &sessions, parent, no_group), Some(2));
         assert_eq!(session_of_pid(999, &sessions, parent, no_group), None);
         assert_eq!(session_of_pid(0, &sessions, parent, no_group), None);
-        // The group rule still applies at any level.
         let grouped = |pid: i32| (pid == 300).then_some(100);
         assert_eq!(session_of_pid(500, &sessions, parent, grouped), Some(1));
-        // A cycle cannot loop forever.
         let cyclic = |pid: i32| Some(if pid == 7 { 8 } else { 7 });
         assert_eq!(session_of_pid(7, &sessions, cyclic, no_group), None);
     }

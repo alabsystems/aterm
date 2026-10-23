@@ -5,11 +5,6 @@
 // modified by the aterm project in 2026 (see the repository NOTICE).
 
 // Modified by Andrew Yates for the aterm project in 2026; see the repository NOTICE.
-// Convert keyboard layout handles through the typed Windows handle helpers; count key-text
-// graphemes with aterm-grapheme instead of unicode-segmentation; drop the unused
-// physicalkey_to_scancode table; keep the character an Alt code composes (`AltCode`); read
-// Windows through `replay` in tests and debug builds, so a recorded message sequence can drive
-// the key path (`super::recorded`).
 
 use std::char;
 use std::ffi::OsString;
@@ -55,30 +50,10 @@ pub struct MessageAsKeyEvent {
 }
 
 /// Stores information required to make `KeyEvent`s.
-///
-/// A single Winit `KeyEvent` contains information which the Windows API passes to the application
-/// in multiple window messages. In other words: a Winit `KeyEvent` cannot be built from a single
-/// window message. Therefore, this type keeps track of certain information from previous events so
-/// that a `KeyEvent` can be constructed when the last event related to a keypress is received.
-///
-/// `PeekMessage` is sometimes used to determine whether the next window message still belongs to
-/// the current keypress. If it doesn't and the current state represents a key event waiting to be
-/// dispatched, then said event is considered complete and is dispatched.
-///
-/// The sequence of window messages for a key press event is the following:
-/// - Exactly one WM_KEYDOWN / WM_SYSKEYDOWN
-/// - Zero or one WM_DEADCHAR / WM_SYSDEADCHAR
-/// - Zero or more WM_CHAR / WM_SYSCHAR. These messages each come with a UTF-16 code unit which when
-///   put together in the sequence they arrived in, forms the text which is the result of pressing
-///   the key.
-///
-/// Key release messages are a bit different due to the fact that they don't contribute to
-/// text input. The "sequence" only consists of one WM_KEYUP / WM_SYSKEYUP event.
 pub struct KeyEventBuilder {
     event_info: Mutex<Option<PartialKeyEventInfo>>,
     pending: PendingEventQueue<MessageAsKeyEvent>,
-    /// LOCAL PATCH (aterm): the Alt code being typed, and the character the last one composed,
-    /// for the event loop to send as an IME commit ([`Self::take_alt_code_commit`]).
+    /// Local PATCH (aterm): the Alt code being typed, and the character the last one composed.
     alt_code: Mutex<AltCode>,
     alt_code_commit: Mutex<Option<String>>,
 }
@@ -93,9 +68,7 @@ impl Default for KeyEventBuilder {
     }
 }
 impl KeyEventBuilder {
-    /// LOCAL PATCH (aterm): the character the last Alt code composed, once. Windows posts it as
-    /// a WM_CHAR with no key-down of its own after Alt is released, which upstream drops as
-    /// "probably IME"; the event loop sends it on as `Ime::Commit`.
+    /// Local PATCH (aterm): the character the last Alt code composed.
     pub(crate) fn take_alt_code_commit(&self) -> Option<String> {
         self.alt_code_commit.lock().unwrap().take()
     }
@@ -108,8 +81,6 @@ impl KeyEventBuilder {
     }
 
     /// LOCAL PATCH (aterm): a WM_CHAR no key-down claimed. `true` when it belongs to an Alt
-    /// code; the last unit of the character stores it for [`Self::take_alt_code_commit`]. The
-    /// lock is released before `next_kbd_msg`, which can re-enter the window procedure.
     fn alt_code_char(&self, hwnd: HWND, unit: u16) -> bool {
         if !self.alt_code.lock().unwrap().push(unit) {
             return false;
@@ -126,8 +97,6 @@ impl KeyEventBuilder {
     }
 
     /// Call this function for every window message.
-    /// Returns Some() if this window message completes a KeyEvent.
-    /// Returns None otherwise.
     pub(crate) fn process_message(
         &self,
         hwnd: HWND,
@@ -145,21 +114,18 @@ impl KeyEventBuilder {
         let mut matcher = || -> MatchResult {
             match msg_kind {
                 WM_SETFOCUS => {
-                    // synthesize keydown events
                     let kbd_state = get_async_kbd_state();
                     let key_events = Self::synthesize_kbd_state(ElementState::Pressed, &kbd_state);
                     MatchResult::MessagesToDispatch(self.pending.complete_multi(key_events))
                 },
                 WM_KILLFOCUS => {
                     *self.alt_code.lock().unwrap() = AltCode::default();
-                    // synthesize keyup events
                     let kbd_state = get_kbd_state();
                     let key_events = Self::synthesize_kbd_state(ElementState::Released, &kbd_state);
                     MatchResult::MessagesToDispatch(self.pending.complete_multi(key_events))
                 },
                 WM_KEYDOWN | WM_SYSKEYDOWN => {
                     if msg_kind == WM_SYSKEYDOWN && wparam as VIRTUAL_KEY == VK_F4 {
-                        // Don't dispatch Alt+F4 to the application.
                         // This is handled in `event_loop.rs`
                         return MatchResult::Nothing;
                     }
@@ -185,7 +151,6 @@ impl KeyEventBuilder {
                             WM_KEYDOWN | WM_SYSKEYDOWN | WM_KEYUP | WM_SYSKEYUP
                         );
                         if next_belongs_to_this {
-                            // The next OS event belongs to this Winit event, so let's just
                             // store the partial information, and add to it in the upcoming events
                             *event_info = finished_event_info.take();
                         } else {
@@ -211,8 +176,6 @@ impl KeyEventBuilder {
                 WM_DEADCHAR | WM_SYSDEADCHAR => {
                     let pending_token = self.pending.add_pending();
                     *result = ProcResult::Value(0);
-                    // At this point, we know that there isn't going to be any more events related
-                    // to this key press
                     let event_info = self.event_info.lock().unwrap().take().unwrap();
                     let ev = event_info.finalize();
                     MatchResult::MessagesToDispatch(self.pending.complete_pending(
@@ -246,8 +209,6 @@ impl KeyEventBuilder {
                             ev_info.utf16parts.push(wparam as u16);
                         }
                     } else {
-                        // In this case, wparam holds a UTF-32 character.
-                        // Let's encode it as UTF-16 and append it to the end of `utf16parts`
                         let utf16parts = match event_info.as_mut() {
                             Some(ev_info) => &mut ev_info.utf16parts,
                             None => {
@@ -264,15 +225,12 @@ impl KeyEventBuilder {
                             utf16parts.resize(new_size, 0);
                         }
                     }
-                    // It's important that we unlock the mutex, and create the pending event token
-                    // before calling `next_msg`
                     std::mem::drop(event_info);
                     let next_msg = next_kbd_msg(hwnd);
                     let more_char_coming = next_msg
                         .map(|m| matches!(m.message, WM_CHAR | WM_SYSCHAR))
                         .unwrap_or(false);
                     if more_char_coming {
-                        // No need to produce an event just yet, because there are still more
                         // characters that need to be appended to this keyboard event
                         MatchResult::TokenToRemove(pending_token)
                     } else {
@@ -285,8 +243,6 @@ impl KeyEventBuilder {
                             },
                         };
                         let mut layouts = LAYOUT_CACHE.lock().unwrap();
-                        // It's okay to call `ToUnicode` here, because at this point the dead key
-                        // is already consumed by the character.
                         let kbd_state = get_kbd_state();
                         let mod_state = WindowsModifiers::active_modifiers(&kbd_state);
 
@@ -298,9 +254,6 @@ impl KeyEventBuilder {
                             mod_state.contains(WindowsModifiers::CONTROL)
                         };
 
-                        // If Ctrl is not pressed, just use the text with all
-                        // modifiers because that already consumed the dead key. Otherwise,
-                        // we would interpret the character incorrectly, missing the dead key.
                         if !ctrl_on {
                             event_info.text = PartialText::System(event_info.utf16parts.clone());
                         } else {
@@ -329,11 +282,7 @@ impl KeyEventBuilder {
                         ElementState::Released,
                         &mut layouts,
                     );
-                    // We MUST release the layout lock before calling `next_kbd_msg`, otherwise it
-                    // may deadlock
                     drop(layouts);
-                    // It's important that we create the pending token before reading the next
-                    // message.
                     let next_msg = next_kbd_msg(hwnd);
                     let mut valid_event_info = Some(event_info);
                     if let Some(next_msg) = next_msg {
@@ -367,8 +316,6 @@ impl KeyEventBuilder {
         }
     }
 
-    // Allowing nominimal_bool lint because the `is_key_pressed` macro triggers this warning
-    // and I don't know of another way to resolve it and also keeping the macro
     #[allow(clippy::nonminimal_bool)]
     fn synthesize_kbd_state(
         key_state: ElementState,
@@ -385,21 +332,9 @@ impl KeyEventBuilder {
             };
         }
 
-        // Is caps-lock active? Note that this is different from caps-lock
-        // being held down.
         let caps_lock_on = kbd_state[VK_CAPITAL as usize] & 1 != 0;
         let num_lock_on = kbd_state[VK_NUMLOCK as usize] & 1 != 0;
 
-        // We are synthesizing the press event for caps-lock first for the following reasons:
-        // 1. If caps-lock is *not* held down but *is* active, then we have to synthesize all
-        //    printable keys, respecting the caps-lock state.
-        // 2. If caps-lock is held down, we could choose to synthesize its keypress after every
-        //    other key, in which case all other keys *must* be synthesized as if the caps-lock
-        //    state was be the opposite of what it currently is.
-        // --
-        // For the sake of simplicity we are choosing to always synthesize
-        // caps-lock first, and always use the current caps-lock state
-        // to determine the produced text
         if is_key_pressed!(VK_CAPITAL) {
             let event = Self::create_synthetic(
                 VK_CAPITAL,
@@ -456,9 +391,6 @@ impl KeyEventBuilder {
             }
         };
 
-        // Be cheeky and sequence modifier and non-modifier
-        // key events such that non-modifier keys are not affected
-        // by modifiers (except for caps-lock)
         match key_state {
             ElementState::Pressed => {
                 do_non_modifier(&mut key_events, &mut layouts);
@@ -519,14 +451,6 @@ impl KeyEventBuilder {
 }
 
 /// LOCAL PATCH (aterm): Windows' Alt-code entry. Alt held, a code typed on the NumLock-on
-/// keypad (Alt, 0, 2, 3, 3), and on Alt's release the system posts the composed character
-/// (`é`) as a WM_CHAR no key-down belongs to. Upstream dropped it, so the code typed nothing;
-/// the digits' own key events reach the app, which types nothing for them.
-///
-/// A keypad digit pressed with Alt and without Ctrl arms it (Ctrl+Alt is AltGr, and its own
-/// chords); any other key that is not a modifier disarms it. An armed WM_CHAR is the composed
-/// character, gathered unit by unit (a code above U+FFFF arrives as a surrogate pair) and
-/// handed over whole. Focus loss resets it.
 #[derive(Default)]
 struct AltCode {
     armed: bool,
@@ -572,19 +496,15 @@ impl AltCode {
 }
 
 enum PartialText {
-    // Unicode
     System(Vec<u16>),
     Text(Option<SmolStr>),
 }
 
 enum PartialLogicalKey {
-    /// Use the text provided by the WM_CHAR messages and report that as a `Character` variant. If
-    /// the text consists of multiple grapheme clusters (user-perceived characters) that means that
-    /// dead key could not be combined with the second input, and in that case we should fall back
-    /// to using what would have without a dead-key input.
+    /// Use the text provided by the WM_CHAR messages and report that as a `Character` variant.
     TextOr(Key),
 
-    /// Use the value directly provided by this variant
+    /// Use the value directly provided by this variant.
     This(Key),
 }
 
@@ -599,7 +519,6 @@ struct PartialKeyEventInfo {
     key_without_modifiers: Key,
 
     /// The UTF-16 code units of the text that was produced by the keypress event.
-    /// This take all modifiers into account. Including CTRL
     utf16parts: Vec<u16>,
 
     text: PartialText,
@@ -618,8 +537,6 @@ impl PartialKeyEventInfo {
         let lparam_struct = destructure_key_lparam(lparam);
         let vkey = wparam as VIRTUAL_KEY;
         let scancode = if lparam_struct.scancode == 0 {
-            // In some cases (often with media keys) the device reports a scancode of 0 but a
-            // valid virtual key. In these cases we obtain the scancode from the virtual key.
             unsafe {
                 MapVirtualKeyExW(
                     vkey as u32,
@@ -638,12 +555,6 @@ impl PartialKeyEventInfo {
         let mods_without_ctrl = mods.remove_only_ctrl();
         let num_lock_on = kbd_state[VK_NUMLOCK as usize] & 1 != 0;
 
-        // On Windows Ctrl+NumLock = Pause (and apparently Ctrl+Pause -> NumLock). In these cases
-        // the KeyCode still stores the real key, so in the name of consistency across platforms, we
-        // circumvent this mapping and force the key values to match the keycode.
-        // For more on this, read the article by Raymond Chen, titled:
-        // "Why does Ctrl+ScrollLock cancel dialogs?"
-        // https://devblogs.microsoft.com/oldnewthing/20080211-00/?p=23503
         let code_as_key = if mods.contains(WindowsModifiers::CONTROL) {
             match physical_key {
                 PhysicalKey::Code(KeyCode::NumLock) => Some(Key::Named(NamedKey::NumLock)),
@@ -662,7 +573,6 @@ impl PartialKeyEventInfo {
         let logical_key = if let Some(key) = code_as_key.clone() {
             PartialLogicalKey::This(key)
         } else if is_pressed && key_is_char && !mods.contains(WindowsModifiers::CONTROL) {
-            // In some cases we want to use the UNICHAR text for logical_key in order to allow
             // dead keys to have an effect on the character reported by `logical_key`.
             PartialLogicalKey::TextOr(preliminary_logical_key)
         } else {
@@ -672,14 +582,8 @@ impl PartialKeyEventInfo {
             key
         } else {
             match layout.get_key(NO_MODS, false, vkey, &physical_key) {
-                // We convert dead keys into their character.
-                // The reason for this is that `key_without_modifiers` is designed for key-bindings,
-                // but the US International layout treats `'` (apostrophe) as a dead key and the
-                // regular US layout treats it a character. In order for a single binding
-                // configuration to work with both layouts, we forward each dead key as a character.
                 Key::Dead(k) => {
                     if let Some(ch) = k {
-                        // I'm avoiding the heap allocation. I don't want to talk about it :(
                         let mut utf8 = [0; 4];
                         let s = ch.encode_utf8(&mut utf8);
                         Key::Character(SmolStr::new(s))
@@ -713,7 +617,6 @@ impl PartialKeyEventInfo {
             }
         }
 
-        // The text without Ctrl
         let mut text = None;
         match self.text {
             PartialText::System(wide) => {
@@ -732,12 +635,6 @@ impl PartialKeyEventInfo {
         let logical_key = match self.logical_key {
             PartialLogicalKey::TextOr(fallback) => match text.as_ref() {
                 Some(s) => {
-                    // LOCAL PATCH (aterm): aterm-grapheme's UAX #29 segmenter (Unicode 16, the
-                    // one aterm segments terminal text with) replaces unicode-segmentation's
-                    // `grapheme_indices(true)` (Unicode 17). The two answer this question alike
-                    // except on Unicode 16 -> 17 property changes no keyboard layout types;
-                    // crates/aterm-grapheme/tests/uax29_conformance.rs
-                    // (`where_unicode_segmentation_disagreed_this_crate_follows_unicode_16`)
                     // records them.
                     if s.graphemes().count() > 1 {
                         fallback
@@ -770,8 +667,7 @@ struct KeyLParam {
     pub scancode: u8,
     pub extended: bool,
 
-    /// This is `previous_state XOR transition_state`. See the lParam for WM_KEYDOWN and WM_KEYUP
-    /// for further details.
+    /// This is `previous_state XOR transition_state`.
     pub is_repeat: bool,
 }
 
@@ -796,10 +692,7 @@ fn ex_scancode_from_lparam(lparam: LPARAM) -> ExScancode {
     new_ex_scancode(lparam.scancode, lparam.extended)
 }
 
-/// LOCAL PATCH (aterm): what the key path reads from Windows — the next key message
-/// (`PeekMessageW`), the keyboard state, one key's state and the thread's layout — answered from a
-/// RECORDED message sequence while one is replayed on this thread (`super::recorded`), and from
-/// Windows otherwise. Compiled into tests and debug builds only: a release build reads Windows.
+/// Local PATCH (aterm): what the key path reads from Windows.
 #[cfg(any(test, debug_assertions))]
 pub(crate) mod replay {
     use std::cell::RefCell;
@@ -813,7 +706,7 @@ pub(crate) mod replay {
         pub(crate) queue: VecDeque<MSG>,
         /// `GetKeyboardState` as of the message being handled.
         pub(crate) keys: [u8; 256],
-        /// What `GetKeyboardLayout(0)` answers: the recorded layout's handle.
+        /// What `GetKeyboardLayout(0)` answers.
         pub(crate) hkl: u64,
     }
 
@@ -826,8 +719,7 @@ pub(crate) mod replay {
         REPLAY.with(|cell| *cell.borrow_mut() = replay);
     }
 
-    /// `PeekMessageW(.., WM_KEYFIRST, WM_KEYLAST, PM_NOREMOVE)` while replaying: the first key
-    /// message still to come.
+    /// `PeekMessageW(.., WM_KEYFIRST, WM_KEYLAST, PM_NOREMOVE)` while replaying.
     pub(crate) fn next_key_message() -> Option<Option<MSG>> {
         REPLAY.with(|cell| {
             cell.borrow().as_ref().map(|replay| {
@@ -851,8 +743,7 @@ pub(crate) mod replay {
     }
 }
 
-/// LOCAL PATCH (aterm): `GetKeyState(vk)`: the high bit set while the key is down, the low bit
-/// while a toggle key is on (the replay's recorded state while one runs).
+/// Local PATCH (aterm): `GetKeyState(vk)`.
 pub(crate) fn key_state(vk: VIRTUAL_KEY) -> i16 {
     #[cfg(any(test, debug_assertions))]
     if let Some(keys) = replay::keys() {
@@ -862,10 +753,7 @@ pub(crate) fn key_state(vk: VIRTUAL_KEY) -> i16 {
     unsafe { GetKeyState(vk as i32) }
 }
 
-/// LOCAL PATCH (aterm): the layout `MapVirtualKeyExW` maps a scan code with. A recorded layout
-/// (`super::recorded`) is no layout Windows loaded, so a replay maps with the thread's own: the
-/// only keys mapped are the modifiers, the keypad and the navigation block, the same keys on every
-/// layout the recordings cover.
+/// Local PATCH (aterm): the layout `MapVirtualKeyExW` maps a scan code through.
 pub(crate) fn mapping_layout(hkl: HKL) -> HKL {
     #[cfg(any(test, debug_assertions))]
     if replay::layout().is_some() {
@@ -875,7 +763,6 @@ pub(crate) fn mapping_layout(hkl: HKL) -> HKL {
 }
 
 /// Gets the keyboard state as reported by messages that have been removed from the event queue.
-/// See also: get_async_kbd_state
 fn get_kbd_state() -> [u8; 256] {
     #[cfg(any(test, debug_assertions))]
     if let Some(keys) = replay::keys() {
@@ -889,7 +776,6 @@ fn get_kbd_state() -> [u8; 256] {
 }
 
 /// Gets the current keyboard state regardless of whether the corresponding keyboard events have
-/// been removed from the event queue. See also: get_kbd_state
 #[allow(clippy::uninit_assumed_init)]
 fn get_async_kbd_state() -> [u8; 256] {
     #[cfg(any(test, debug_assertions))]
@@ -905,7 +791,6 @@ fn get_async_kbd_state() -> [u8; 256] {
             *state = if is_down { 0x80 } else { 0 };
 
             if matches!(vk, VK_CAPITAL | VK_NUMLOCK | VK_SCROLL) {
-                // Toggle states aren't reported by `GetAsyncKeyState`
                 let toggle_state = GetKeyState(vk as i32);
                 let is_active = (toggle_state & 1) != 0;
                 *state |= u8::from(is_active);
@@ -916,17 +801,12 @@ fn get_async_kbd_state() -> [u8; 256] {
 }
 
 /// On windows, AltGr == Ctrl + Alt
-///
-/// Due to this equivalence, the system generates a fake Ctrl key-press (and key-release) preceding
-/// every AltGr key-press (and key-release). We check if the current event is a Ctrl event and if
-/// the next event is a right Alt (AltGr) event. If this is the case, the current event must be the
-/// fake Ctrl event.
 fn is_current_fake(curr_info: &PartialKeyEventInfo, next_msg: MSG, layout: &Layout) -> bool {
     let curr_is_ctrl =
         matches!(curr_info.logical_key, PartialLogicalKey::This(Key::Named(NamedKey::Control)));
     if layout.has_alt_graph {
         let next_code = ex_scancode_from_lparam(next_msg.lParam);
-        let next_is_altgr = next_code == 0xe038; // 0xE038 is right alt
+        let next_is_altgr = next_code == 0xe038;
         if curr_is_ctrl && next_is_altgr {
             return true;
         }
@@ -945,28 +825,13 @@ struct IdentifiedPendingMessage<T> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PendingMessageToken(u32);
 
-/// While processing keyboard events, we sometimes need
-/// to call `PeekMessageW` (`next_msg`). But `PeekMessageW`
-/// can also call the event handler, which means that the new event
-/// gets processed before finishing to process the one that came before.
-///
-/// This would mean that the application receives events in the wrong order.
-/// To avoid this, we keep track whether we are in the middle of processing
-/// an event. Such an event is an "incomplete pending event". A
-/// "complete pending event" is one that has already finished processing, but
-/// hasn't been dispatched to the application because there still are incomplete
-/// pending events that came before it.
-///
-/// When we finish processing an event, we call `complete_pending`,
-/// which returns an empty array if there are incomplete pending events, but
-/// if all pending events are complete, then it returns all pending events in
-/// the order they were encountered. These can then be dispatched to the application
+/// While processing keyboard events, we sometimes need to call `PeekMessageW` (`next_msg`).
 pub struct PendingEventQueue<T> {
     pending: Mutex<Vec<IdentifiedPendingMessage<T>>>,
     next_id: AtomicU32,
 }
 impl<T> PendingEventQueue<T> {
-    /// Add a new pending event to the "pending queue"
+    /// Add a new pending event to the "pending queue".
     pub fn add_pending(&self) -> PendingMessageToken {
         let token = self.next_token();
         let mut pending = self.pending.lock().unwrap();
@@ -974,11 +839,7 @@ impl<T> PendingEventQueue<T> {
         token
     }
 
-    /// Returns all finished pending events
-    ///
-    /// If the return value is non empty, it's guaranteed to contain `msg`
-    ///
-    /// See also: `add_pending`
+    /// Returns all finished pending events.
     pub fn complete_pending(&self, token: PendingMessageToken, msg: T) -> Vec<T> {
         let mut pending = self.pending.lock().unwrap();
         let mut target_is_first = false;
@@ -992,7 +853,6 @@ impl<T> PendingEventQueue<T> {
             }
         }
         if target_is_first {
-            // If the message that we just finished was the first one in the pending queue,
             // then we can empty the queue, and dispatch all of the messages.
             Self::drain_pending(&mut *pending)
         } else {
@@ -1015,11 +875,7 @@ impl<T> PendingEventQueue<T> {
         Vec::new()
     }
 
-    /// Returns all finished pending events
-    ///
-    /// It's safe to call this even if the element isn't in the list anymore
-    ///
-    /// See also: `add_pending`
+    /// Returns all finished pending events.
     pub fn remove_pending(&self, token: PendingMessageToken) -> Vec<T> {
         let mut pending = self.pending.lock().unwrap();
         let mut was_first = false;
@@ -1052,12 +908,6 @@ impl<T> PendingEventQueue<T> {
     }
 
     fn next_token(&self) -> PendingMessageToken {
-        // It's okay for the u32 to overflow here. Yes, that could mean
-        // that two different messages have the same token,
-        // but that would only happen after having about 4 billion
-        // messages sitting in the pending queue.
-        //
-        // In that case, having two identical tokens is the least of your concerns.
         let id = self.next_id.fetch_add(1, Relaxed);
         PendingMessageToken(id)
     }
@@ -1068,14 +918,7 @@ impl<T> Default for PendingEventQueue<T> {
     }
 }
 
-/// WARNING: Due to using PeekMessage, the event handler
-/// function may get called during this function.
-/// (Re-entrance to the event handler)
-///
-/// This can cause a deadlock if calling this function
-/// while having a mutex locked.
-///
-/// It can also cause code to get executed in a surprising order.
+/// Warning: Calls `PeekMessageW` internally.
 pub fn next_kbd_msg(hwnd: HWND) -> Option<MSG> {
     #[cfg(any(test, debug_assertions))]
     if let Some(next) = replay::next_key_message() {
@@ -1098,9 +941,6 @@ fn get_location(scancode: ExScancode, hkl: HKL) -> KeyLocation {
         MapVirtualKeyExW(scancode as u32, MAPVK_VSC_TO_VK_EX, mapping_layout(hkl)) as VIRTUAL_KEY
     };
 
-    // Use the native VKEY and the extended flag to cover most cases
-    // This is taken from the `druid` GUI library, specifically
-    // druid-shell/src/platform/windows/keyboard.rs
     match vkey {
         VK_LSHIFT | VK_LCONTROL | VK_LMENU | VK_LWIN => KeyLocation::Left,
         VK_RSHIFT | VK_RCONTROL | VK_RMENU | VK_RWIN => KeyLocation::Right,
@@ -1121,10 +961,6 @@ fn get_location(scancode: ExScancode, hkl: HKL) -> KeyLocation {
 }
 
 pub(crate) fn scancode_to_physicalkey(scancode: u32) -> PhysicalKey {
-    // See: https://www.win.tue.nl/~aeb/linux/kbd/scancodes-1.html
-    // and: https://www.w3.org/TR/uievents-code/
-    // and: The widget/NativeKeyToDOMCodeName.h file in the firefox source
-
     PhysicalKey::Code(match scancode {
         0x0029 => KeyCode::Backquote,
         0x002b => KeyCode::Backslash,
@@ -1191,10 +1027,10 @@ pub(crate) fn scancode_to_physicalkey(scancode: u32) -> PhysicalKey {
         0x0039 => KeyCode::Space,
         0x000f => KeyCode::Tab,
         0x0079 => KeyCode::Convert,
-        0x0072 => KeyCode::Lang1, // for non-Korean layout
-        0xe0f2 => KeyCode::Lang1, // for Korean layout
-        0x0071 => KeyCode::Lang2, // for non-Korean layout
-        0xe0f1 => KeyCode::Lang2, // for Korean layout
+        0x0072 => KeyCode::Lang1,
+        0xe0f2 => KeyCode::Lang1,
+        0x0071 => KeyCode::Lang2,
+        0xe0f1 => KeyCode::Lang2,
         0x0070 => KeyCode::KanaMode,
         0x007b => KeyCode::NonConvert,
         0xe053 => KeyCode::Delete,
@@ -1252,10 +1088,10 @@ pub(crate) fn scancode_to_physicalkey(scancode: u32) -> PhysicalKey {
         0x006e => KeyCode::F23,
         0x0076 => KeyCode::F24,
         0xe037 => KeyCode::PrintScreen,
-        0x0054 => KeyCode::PrintScreen, // Alt + PrintScreen
+        0x0054 => KeyCode::PrintScreen,
         0x0046 => KeyCode::ScrollLock,
         0x0045 => KeyCode::Pause,
-        0xe046 => KeyCode::Pause, // Ctrl + Pause
+        0xe046 => KeyCode::Pause,
         0xe06a => KeyCode::BrowserBack,
         0xe066 => KeyCode::BrowserFavorites,
         0xe069 => KeyCode::BrowserForward,
@@ -1287,7 +1123,6 @@ mod alt_code_tests {
     };
 
     /// Alt, 0, 2, 3, 3 on the keypad, then Alt's release posts `é` as one WM_CHAR: the
-    /// code takes it and hands it over whole, once.
     #[test]
     fn an_alt_code_hands_over_its_character() {
         let mut code = AltCode::default();
@@ -1311,7 +1146,6 @@ mod alt_code_tests {
     }
 
     /// Nothing arms without Alt, Ctrl+Alt (AltGr) does not, and a key that is not a
-    /// modifier disarms: those WM_CHARs stay upstream's (an IME's, or nobody's).
     #[test]
     fn only_alt_and_a_keypad_digit_arm_it() {
         let mut code = AltCode::default();

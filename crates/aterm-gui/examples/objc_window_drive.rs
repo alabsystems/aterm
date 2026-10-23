@@ -1,42 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The window driver: `crates/aterm-window`'s `window_delegate.rs` answering for
-//! real, on a real `NSWindow` with its `WindowDelegate` installed.
-//!
-//! `objc_live_class_audit` checks that the declared classes are shaped right, and a
-//! debug build compares every typed send's prototype with the runtime's
-//! `method_getTypeEncoding` (`aterm_objc::send`). Neither catches a correct send of
-//! the wrong selector, an inverted boolean, a constant that encodes fine and means
-//! something else, or an ownership mistake; this does. It goes through winit's
-//! public API, so every expectation is on the backend contract, not the port's
-//! internals.
-//!
-//! Two rows are unreachable through the public API and entered at their IMPs, as
-//! AppKit enters them:
-//!
-//! * `draggingEntered:`, registered `Q@:@` as `NSDraggingDestination` declares; its
-//!   return is checked against `NSDragOperationCopy`, which a `bool` return could
-//!   not get right on the x86_64 slice.
-//! * `windowShouldClose:`, which must answer NO and queue `CloseRequested`.
-//!
-//! Stage 11 drives `aterm_objc::weak` on this graph (a live `NSWindow`, its
-//! `NSView` and the delegate AppKit holds), since libtest cannot host AppKit and
-//! `aterm-objc`'s `tests/weak.rs` reaches only Foundation. Later stages read the
-//! default menu (`menu.rs`), the monitors (`monitor.rs`) and the `-sendEvent:`
-//! swizzle (`app.rs`).
-//!
-//! Absolute geometry depends on the display, menu bar, dock and compositor, so the
-//! stages assert round trips and invariants and print the numbers. Fullscreen is
-//! animated and refused during another space transition, so its completion is not
-//! required: the request must be accepted and the state machine must end in a legal
-//! state.
-//!
-//! # Exit codes (read by `aterm_verify::stages::OBJC_DRIVES`)
-//!
-//! * `0`: every stage that could run, ran, and agreed.
-//! * `1`: a finding.
-//! * `2`: not run: no event loop, no window server, or no window. Never a pass.
+//! Live AppKit driver exercising `aterm-window` delegate, view, and menu seams.
 
 /// Every stage agreed.
 #[cfg(target_os = "macos")]
@@ -78,56 +43,37 @@ mod macos {
     use super::{FAIL, NOT_RUN, PASS};
 
     /// Long enough for macOS to launch its `NSApplication`, hand back a window
-    /// and run every stage; past it the drive reports NOT RUN.
     const BUDGET: Duration = Duration::from_secs(60);
 
     /// `NSDragOperationCopy`, the value `draggingEntered:` must answer for a
-    /// pasteboard carrying filenames.
     const NS_DRAG_OPERATION_COPY: usize = 1;
     /// `NSDragOperationNone`, for a pasteboard carrying none.
     const NS_DRAG_OPERATION_NONE: usize = 0;
 
     /// `NSEventTypeKeyUp` and `NSEventModifierFlagCommand`, spelled here so the
-    /// driver's expectation is not the port's constant.
     const NS_EVENT_TYPE_KEY_UP: usize = 11;
     const NS_EVENT_MODIFIER_FLAG_COMMAND: usize = 1 << 20;
 
-    // ------------------------------------------------------------------ sends
-    //
-    // Entered as AppKit enters them: a typed `objc_msgSend` cast to the row's own
-    // prototype, not `aterm_objc::send::*`, so the driver and the port cannot agree
-    // about a shape they both got wrong.
-
-    /// `-draggingEntered:`, whose return is `NSDragOperation` (an `NSUInteger`, not a
-    /// `BOOL`).
-    ///
     /// # Safety
-    /// `delegate` must be a live `WinitWindowDelegate`; `info` a live object
-    /// conforming to `NSDraggingInfo`.
+    /// `delegate` and `info` must be live Objective-C objects matching `-draggingEntered:`.
     unsafe fn dragging_entered(delegate: Id, info: Id) -> usize {
-        // SAFETY: the row is registered `Q@:@`, which the live auditor checks
-        // against `NSDraggingDestination`'s own description.
+        // SAFETY: registered `Q@:@` matching `NSDraggingDestination`.
         unsafe {
             let f: unsafe extern "C-unwind" fn(Id, Sel, Id) -> usize = checked_msg();
             f(delegate, sel!(draggingEntered:), info)
         }
     }
 
-    /// `-windowShouldClose:`, a real `BOOL` row (`B@:@`).
-    ///
     /// # Safety
-    /// `delegate` must be a live `WinitWindowDelegate`.
+    /// `delegate` and `sender` must be live Objective-C objects.
     unsafe fn window_should_close(delegate: Id, sender: Id) -> bool {
-        // SAFETY: registered `B@:@`, per `NSWindowDelegate`.
+        // SAFETY: registered `B@:@` matching `NSWindowDelegate`.
         unsafe {
             let f: unsafe extern "C-unwind" fn(Id, Sel, Id) -> Bool = checked_msg();
             f(delegate, sel!(windowShouldClose:), sender).as_bool()
         }
     }
 
-    /// `-[NSWindow delegate]`: the delegate AppKit is actually holding, which
-    /// `setDelegate:` should have installed.
-    ///
     /// # Safety
     /// `window` must be a live `NSWindow`.
     unsafe fn window_delegate(window: Id) -> Id {
@@ -138,8 +84,6 @@ mod macos {
         }
     }
 
-    /// `-[NSWindow styleMask]`, read independently of the port.
-    ///
     /// # Safety
     /// `window` must be a live `NSWindow`.
     unsafe fn style_mask(window: Id) -> usize {
@@ -150,30 +94,20 @@ mod macos {
         }
     }
 
-    /// `-[NSWindow title]` as a Rust `String`, read independently of the port.
-    ///
     /// # Safety
     /// `window` must be a live `NSWindow`.
     unsafe fn window_title(window: Id) -> String {
-        // SAFETY: `-title` is `@16@0:8` on `NSWindow` and never answers nil.
+        // SAFETY: `-title` is `@16@0:8` on `NSWindow`.
         unsafe {
             let f: unsafe extern "C-unwind" fn(Id, Sel) -> Id = checked_msg();
             aterm_objc::ns_string_to_rust(f(window, sel!(title)))
         }
     }
 
-    // ------------------------------------------------------- the menu reads
-    //
-    // For `crates/aterm-window`'s `menu.rs`, by the same rule as the sends above.
-
-    /// `-[NSApplication mainMenu]` / `-[NSApplication servicesMenu]`, read off
-    /// the shared application.
-    ///
     /// # Safety
-    /// `sel` must be a nullary `@16@0:8` accessor on `NSApplication`.
+    /// Must be called on the main thread after `+sharedApplication`.
     unsafe fn app_menu(sel: Sel) -> Id {
-        // SAFETY: `+sharedApplication` is `@16#0:8`; both accessors are
-        // `@16@0:8`.
+        // SAFETY: `+sharedApplication` and menu getters are `@16@0:8`.
         unsafe {
             let f: unsafe extern "C-unwind" fn(Id, Sel) -> Id = checked_msg();
             let app = f(class(c"NSApplication").as_id(), sel!(sharedApplication));
@@ -181,10 +115,8 @@ mod macos {
         }
     }
 
-    /// `-[NSMenu numberOfItems]`.
-    ///
     /// # Safety
-    /// `menu` must be a live `NSMenu`.
+    /// `menu` must be nil or a live `NSMenu`.
     unsafe fn menu_count(menu: Id) -> isize {
         // SAFETY: `-numberOfItems` is `q16@0:8`.
         unsafe {
@@ -193,10 +125,8 @@ mod macos {
         }
     }
 
-    /// `-[NSMenu itemAtIndex:]`.
-    ///
     /// # Safety
-    /// `menu` must be a live `NSMenu` and `i` in range.
+    /// `menu` must be a live `NSMenu` and `0 <= i < menu_count(menu)`.
     unsafe fn menu_item_at(menu: Id, i: isize) -> Id {
         // SAFETY: `-itemAtIndex:` is `@24@0:8q16`.
         unsafe {
@@ -215,15 +145,10 @@ mod macos {
         submenu: Id,
     }
 
-    /// Read a row back off AppKit.
-    ///
     /// # Safety
     /// `item` must be a live `NSMenuItem`.
     unsafe fn read_row(item: Id) -> Row {
-        // SAFETY: `-title` and `-keyEquivalent` are `@16@0:8` and never nil;
-        // `-isSeparatorItem` is `B16@0:8`; `-action` is `:16@0:8`;
-        // `-keyEquivalentModifierMask` is `Q16@0:8`; `-submenu` is `@16@0:8`
-        // and MAY be nil.
+        // SAFETY: `NSMenuItem` property getters match their documented Objective-C encodings.
         unsafe {
             let id_of: unsafe extern "C-unwind" fn(Id, Sel) -> Id = checked_msg();
             let bool_of: unsafe extern "C-unwind" fn(Id, Sel) -> Bool = checked_msg();
@@ -241,10 +166,8 @@ mod macos {
     }
 
     /// `-[NSScreen backingScaleFactor]` for `+[NSScreen mainScreen]`, read without
-    /// the port.
     fn main_screen_backing_scale() -> Option<f64> {
-        // SAFETY: `+mainScreen` is `@16#0:8` and may answer nil;
-        // `-backingScaleFactor` is `d16@0:8`.
+        // SAFETY: `+mainScreen` is `@16#0:8`.
         unsafe {
             let id_of: unsafe extern "C-unwind" fn(Id, Sel) -> Id = checked_msg();
             let f64_of: unsafe extern "C-unwind" fn(Id, Sel) -> f64 = checked_msg();
@@ -262,15 +185,9 @@ mod macos {
         unsafe extern "C" {
             fn CGMainDisplayID() -> u32;
         }
-        // SAFETY: a nullary CoreGraphics call with no preconditions.
+        // SAFETY: nullary CoreGraphics query with no preconditions.
         unsafe { CGMainDisplayID() }
     }
-
-    // ----------------------------------------------- the swizzle's own reads
-    //
-    // For `crates/aterm-window`'s `app.rs`. Not through `aterm_objc::swizzle`: the
-    // runtime's own C functions read its tables, so a bug in that module cannot
-    // make this stage agree with it.
 
     #[repr(C)]
     struct DlInfo {
@@ -289,11 +206,8 @@ mod macos {
     }
 
     /// `(the Method handle, its IMP, its registered type encoding)` for an
-    /// instance method, read straight from libobjc.
     fn live_method(cls: *mut std::ffi::c_void, sel: Sel) -> Option<(usize, usize, String)> {
-        // SAFETY: `cls` is a live class object and `sel` an interned selector;
-        // `class_getInstanceMethod` tolerates a selector the class does not
-        // implement by answering NULL.
+        // SAFETY: `cls` is a live class and `sel` is an interned selector.
         unsafe {
             let m = class_getInstanceMethod(cls, sel);
             if m.is_null() {
@@ -320,25 +234,21 @@ mod macos {
             sname: std::ptr::null(),
             saddr: std::ptr::null_mut(),
         };
-        // SAFETY: `dladdr` reads the address only to locate its image and
-        // writes into the `DlInfo` we own.
+        // SAFETY: `dladdr` queries dyld image metadata for `addr`.
         let ok = unsafe { dladdr(addr as *const std::ffi::c_void, &mut info) };
         if ok == 0 || info.fname.is_null() {
             return "<unknown image>".to_owned();
         }
-        // SAFETY: a non-null NUL-terminated path owned by dyld.
+        // SAFETY: `info.fname` is a non-null NUL-terminated string owned by dyld.
         unsafe { std::ffi::CStr::from_ptr(info.fname) }
             .to_string_lossy()
             .into_owned()
     }
 
-    /// A synthetic key-up carrying a modifier mask, for the one window.
-    ///
     /// # Safety
     /// `chars` must be a live `NSString`.
     unsafe fn key_up_event(window_number: isize, modifiers: usize, chars: Id) -> Id {
-        // SAFETY: the ten-argument factory is `@@:Q{CGPoint=dd}Qdq@@@BS`, as read
-        // from `method_getTypeEncoding`.
+        // SAFETY: `NSEvent` key-event factory matches its 10-argument Objective-C signature.
         unsafe {
             #[allow(clippy::type_complexity)]
             let f: unsafe extern "C-unwind" fn(
@@ -369,15 +279,14 @@ mod macos {
                 chars,
                 chars,
                 Bool::NO,
-                4, // kVK_ANSI_H
+                4,
             )
         }
     }
 
     /// `+[NSProcessInfo processInfo].processName`, which the About, Hide and Quit
-    /// titles are built from.
     fn process_name() -> String {
-        // SAFETY: `+processInfo` is `@16#0:8` and `-processName` is `@16@0:8`.
+        // SAFETY: `+processInfo` and `-processName` return a live `NSString`.
         unsafe {
             let f: unsafe extern "C-unwind" fn(Id, Sel) -> Id = checked_msg();
             let pi = f(class(c"NSProcessInfo").as_id(), sel!(processInfo));
@@ -386,10 +295,8 @@ mod macos {
     }
 
     /// A pasteboard carrying `NSFilenamesPboardType` and a dragging-info stub that
-    /// answers it, as `(info, pasteboard)`, both +1 and owned by the caller.
     fn dragging_info(paths: &[&str]) -> Option<(Obj, Obj)> {
-        // SAFETY: every send below is a documented Foundation/AppKit selector
-        // on the class named, with the prototype cast to match.
+        // SAFETY: documented Foundation and AppKit selectors called on live objects.
         unsafe {
             let pb: unsafe extern "C-unwind" fn(Id, Sel, Id) -> Id = checked_msg();
             let name = ns_string("aterm-objc-window-drive")?;
@@ -400,8 +307,6 @@ mod macos {
             );
             let board = Obj::retain(board)?;
 
-            // `+arrayWithObjects:count:` for the declared types, then the
-            // property list for `NSFilenamesPboardType`.
             let arr: unsafe extern "C-unwind" fn(Id, Sel, *const Id, usize) -> Id = checked_msg();
             let ty = filenames_pboard_type();
             let types = [ty];
@@ -444,15 +349,12 @@ mod macos {
             #[link_name = "NSFilenamesPboardType"]
             static TY: Id;
         }
-        // SAFETY: an AppKit global that exists for the life of the process.
+        // SAFETY: `NSFilenamesPboardType` is a process-lifetime AppKit global.
         unsafe { TY }
     }
 
     aterm_objc::declare_class! {
         /// The smallest object that answers `-draggingPasteboard`, the only thing
-        /// `draggingEntered:` and `performDragOperation:` ask of their sender. It does
-        /// not claim `NSDraggingInfo`: the fork's rows take a bare `id`, and claiming
-        /// it would test AppKit's conformance machinery, not the port.
         pub(super) struct ATermDragInfo: NSObject {
             const NAME: &str = "ATermObjcWindowDriveDragInfo";
             type Ivars = Id;
@@ -463,8 +365,6 @@ mod macos {
             }
         }
     }
-
-    // ------------------------------------------------------------------ report
 
     #[derive(Default)]
     struct Report {
@@ -504,8 +404,6 @@ mod macos {
 
     impl Driver {
         /// The `WinitWindowDelegate` AppKit is holding and its `NSWindow`, reached
-        /// without the port: the window's content view, its window, that window's
-        /// `-delegate`.
         fn pair(&self) -> Option<(Id, Id)> {
             let view = self.ns_view();
             if view.is_null() {
@@ -519,7 +417,7 @@ mod macos {
             if window.is_null() {
                 return None;
             }
-            // SAFETY: `window` is the live `NSWindow` the view is installed in.
+            // SAFETY: `window` is the live `NSWindow` hosting the view.
             let delegate = unsafe { window_delegate(window) };
             if delegate.is_null() {
                 return None;
@@ -563,9 +461,6 @@ mod macos {
                 WindowEvent::HoveredFile(p) => {
                     self.hovered.push(p.to_string_lossy().into_owned());
                 }
-                // AppKit does not deliver `keyUp:` to the window while Command is
-                // held, so a release arriving here is the swizzled `-sendEvent:`'s
-                // forwarding.
                 WindowEvent::KeyboardInput { event, .. }
                     if event.state == aterm_window::event::ElementState::Released =>
                 {
@@ -586,8 +481,6 @@ mod macos {
                 el.exit();
                 return;
             };
-            // One stage per wait, so a stage's winit events are delivered by the
-            // pump before the next stage reads them.
             self.stage += 1;
             self.report.ran += 1;
             match self.stage {
@@ -619,7 +512,6 @@ mod macos {
         }
 
         /// `-setTitle:`/`-title`: the `NSString` round trip, and the one path where a
-        /// +1 string is handed to a copying setter.
         fn stage_title(&mut self, ns: Id) {
             println!("\n[1] title — setTitle: / title, through NSString");
             for t in ["objc-window-drive", "ünïcødé ⌘ 日本語", ""] {
@@ -635,8 +527,6 @@ mod macos {
         }
 
         /// The style mask the window was built with, read off AppKit's own `-styleMask`
-        /// rather than the port's state. Every window is built titled, closable,
-        /// miniaturizable and resizable.
         fn stage_style_mask(&mut self, ns: Id) {
             println!("\n[2] style mask — the mask the window was built with");
             const TITLED: usize = 1 << 0;
@@ -654,7 +544,6 @@ mod macos {
         }
 
         /// `-setFrameOrigin:`, `-frame`, `-contentRectForFrameRect:` and
-        /// `-setContentSize:`: the struct-passing sends an ABI mistake corrupts silently.
         fn stage_geometry(&mut self) {
             use aterm_window::dpi::{PhysicalPosition, PhysicalSize};
             println!("\n[3] geometry — position and size round trips");
@@ -694,7 +583,6 @@ mod macos {
         }
 
         /// `-setContentMinSize:` and the clamp that follows: the send whose effect is a
-        /// resize the caller did not ask for.
         fn stage_size_limits(&mut self) {
             use aterm_window::dpi::PhysicalSize;
             println!("\n[4] size limits — min clamps the current size");
@@ -717,14 +605,12 @@ mod macos {
                 ),
             );
 
-            // Stored for the next live resize; there is nothing to read back.
             self.w()
                 .set_resize_increments(Some(PhysicalSize::new(8_u32, 8)));
             self.w().set_resize_increments(None::<PhysicalSize<u32>>);
         }
 
         /// `-makeKeyAndOrderFront:`, `-orderOut:`, `-isVisible`,
-        /// `-isMiniaturized` and the `Focused` events the delegate queues.
         fn stage_visibility_and_focus(&mut self) {
             println!("\n[5] visibility and focus");
             self.w().set_visible(true);
@@ -761,8 +647,6 @@ mod macos {
         }
 
         /// `+appearanceNamed:`, `-setAppearance:`, `-appearance` and
-        /// `-bestMatchFromAppearancesWithNames:`: the round trip that decides light
-        /// vs dark.
         fn stage_theme(&mut self) {
             println!("\n[6] theme — appearanceNamed:/setAppearance:/bestMatch…");
             self.w().set_theme(Some(Theme::Dark));
@@ -786,8 +670,6 @@ mod macos {
         }
 
         /// `draggingEntered:` returns an eight-byte `NSDragOperation`, not a one-byte
-        /// `BOOL`: `NSDragOperationCopy` (1) for a pasteboard with filenames and
-        /// `NSDragOperationNone` (0) for one without.
         fn stage_drag_and_drop(&mut self, delegate: Id) {
             println!("\n[7] drag and drop — draggingEntered: returns NSDragOperation");
             let Some((info, _pb)) = dragging_info(&["/tmp/aterm-drive-a", "/tmp/aterm-drive-b"])
@@ -796,8 +678,7 @@ mod macos {
                     .note("could not build a dragging-info stub; stage skipped");
                 return;
             };
-            // SAFETY: `delegate` is the live `WinitWindowDelegate`; `info` is a
-            // live object answering `-draggingPasteboard`.
+            // SAFETY: `delegate` is the live `WinitWindowDelegate` and `info` is a live `FakeDragInfo`.
             let op = unsafe { dragging_entered(delegate, info.id()) };
             self.report.check(
                 op == NS_DRAG_OPERATION_COPY,
@@ -816,7 +697,7 @@ mod macos {
                     .note("could not build an empty dragging-info stub");
                 return;
             };
-            // SAFETY: as above, for a pasteboard carrying no filenames list.
+            // SAFETY: `delegate` and `empty` are live objects.
             let op = unsafe { dragging_entered(delegate, empty.id()) };
             self.report.check(
                 op == NS_DRAG_OPERATION_NONE,
@@ -825,11 +706,10 @@ mod macos {
         }
 
         /// `windowShouldClose:` must answer NO and queue `CloseRequested` — the
-        /// inversion that would make the window uncloseable or unstoppable.
         fn stage_close(&mut self, delegate: Id, ns: Id) {
             println!("\n[8] close — windowShouldClose: answers NO and queues CloseRequested");
             let before = self.close_requested;
-            // SAFETY: `delegate` is the live delegate; `ns` is a valid sender.
+            // SAFETY: `delegate` and `ns` are live objects.
             let answer = unsafe { window_should_close(delegate, ns) };
             self.report.check(
                 !answer,
@@ -842,7 +722,6 @@ mod macos {
         }
 
         /// The fullscreen state machine, entering; the exit is a pump later (see
-        /// [`Self::stage_fullscreen_exit`]).
         fn stage_fullscreen_enter(&mut self) {
             use aterm_window::window::Fullscreen;
             println!("\n[9] fullscreen — entering");
@@ -856,12 +735,6 @@ mod macos {
         }
 
         /// The fullscreen state machine, leaving. `set_fullscreen(None)` right after
-        /// `set_fullscreen(Some(_))` need not return `fullscreen()` to `None`: AppKit
-        /// delivers `windowWillEnterFullScreen:` synchronously inside
-        /// `-toggleFullScreen:`, setting `in_fullscreen_transition`, and winit defers a
-        /// change during a transition into `target_fullscreen`. Both states are legal,
-        /// so the exit runs a pump after the entry and the check accepts either; a raise
-        /// or a panic fails the process instead.
         fn stage_fullscreen_exit(&mut self) {
             println!("\n[10] fullscreen — leaving");
             let before = self.w().fullscreen().is_some();
@@ -884,11 +757,6 @@ mod macos {
         }
 
         /// `aterm_objc::weak` against the objects it exists for. `aterm-objc`'s
-        /// `tests/weak.rs` proves each property on `NSObject` and `NSMutableString`
-        /// (libtest cannot host AppKit); this runs the same experiments on the live
-        /// `NSWindow`, its `NSView` and the `WinitWindowDelegate`, AppKit classes with
-        /// their own `dealloc` and references. `view.rs` names its window this way,
-        /// because the window retains the view.
         fn stage_weak_references(&mut self, delegate: Id, ns: Id) {
             println!(
                 "\n[11] weak references — objc_initWeak/loadWeak/storeWeak/copyWeak/destroyWeak"
@@ -901,27 +769,14 @@ mod macos {
                 return;
             }
 
-            // The retain count is read before any weak reference exists, so a weak
-            // constructor that retains moves it.
-            //
-            // It was first read after the three below were made and compared
-            // only across `clone_weak`, and a plant that made `WeakObj::new`
-            // retain sailed past it — the baseline had already moved. A
-            // difference is only evidence if the measurement starts before the
-            // thing it is measuring.
-            //
-            // SAFETY: `-retainCount` is `- (NSUInteger)retainCount`, encoded
-            // `Q16@0:8`; compared for equality only, which is the only thing
-            // this number can honestly support.
+            // SAFETY: `-retainCount` is `Q16@0:8` on `NSObject`.
             let count = |id: Id| unsafe {
                 let f: unsafe extern "C-unwind" fn(Id, Sel) -> usize = checked_msg();
                 f(id, sel!(retainCount))
             };
             let before = count(view);
 
-            // ---- the live AppKit objects, weakly held -------------------
-            // SAFETY: `ns`, `view` and `delegate` are live instances this
-            // window owns for the whole stage — `self.window` is still held.
+            // SAFETY: `ns`, `view`, and `delegate` are live objects.
             let (w_win, w_view, w_del) =
                 unsafe { (WeakObj::new(ns), WeakObj::new(view), WeakObj::new(delegate)) };
             for (name, weak, want) in [
@@ -936,28 +791,21 @@ mod macos {
                 );
             }
 
-            // The raw +0 load against a live AppKit object; there is no safe +0
-            // wrapper (`aterm-objc`'s `weak.rs` module docs say why).
             let slot = WeakSlot::uninit();
             let borrowed = autoreleasepool(|_pool| {
-                // SAFETY: `slot` is freshly `uninit()` and does not move before
-                // `destroy` below; `ns` is a live NSWindow this stage holds. The +0
-                // answer is read inside the innermost pool, the one it lands in.
+                // SAFETY: `slot` is freshly `uninit()` and pinned in place.
                 unsafe {
                     slot.init(ns);
                     slot.load_autoreleased().addr()
                 }
             });
-            // SAFETY: `slot` was initialised immediately above and has not
-            // moved; the runtime must not be left holding this stack address.
+            // SAFETY: `slot` was initialized above and is destroyed once.
             unsafe { slot.destroy() };
             self.report.check(
                 borrowed == ns.addr(),
                 "the raw +0 weak load (objc_loadWeak) inside a pool answers the same NSWindow",
             );
 
-            // A weak reference must not keep an AppKit object alive, so neither
-            // `objc_initWeak` nor `objc_copyWeak` may retain it.
             let extra = w_view.clone_weak();
             let after = count(view);
             self.report.check(
@@ -973,9 +821,6 @@ mod macos {
                 "objc_copyWeak's second registration names the same NSView",
             );
 
-            // ---- moving the handle, against a real AppKit object ---------
-            // The Rust value moves; the registered address must not, because the
-            // runtime holds it.
             let registered = w_view.slot_addr();
             let moved = {
                 let boxed = Box::new(w_view);
@@ -995,20 +840,13 @@ mod macos {
                 "and still resolves to that NSView afterwards",
             );
 
-            // ---- the hazard, on a real AppKit class ----------------------
             self.stage_weak_dealloc();
         }
 
         /// The nil-on-dealloc half, and the memcpy hazard, against a standalone
-        /// `NSView`: AppKit holds references to the window's installed view, but a
-        /// free-standing `[[NSView alloc] initWithFrame:]` has exactly one owner, so
-        /// releasing it really runs `-dealloc`.
         fn stage_weak_dealloc(&mut self) {
-            // Built and destroyed inside a pool, so an autorelease anywhere in
-            // `-dealloc` cannot leave the object alive past the check.
             let observed = autoreleasepool(|_| {
-                // SAFETY: `+alloc` is `@16#0:8` and `-initWithFrame:` is
-                // `@48@0:8{CGRect=dddd}16` on `NSView`; the pair yields a +1.
+                // SAFETY: `+alloc` and `-initWithFrame:` return a +1 `NSView`.
                 let view = unsafe {
                     let alloc: unsafe extern "C-unwind" fn(Id, Sel) -> Id = checked_msg();
                     let init: unsafe extern "C-unwind" fn(Id, Sel, aterm_objc::CGRect) -> Id =
@@ -1029,29 +867,20 @@ mod macos {
                 let target = view.id().addr();
 
                 let weak = WeakObj::from_obj(&view);
-                // The naive inline move, by hand on two raw slots: what a
-                // `struct Weak { slot: Id }` would emit, since Rust has no move constructor.
                 let registered = WeakSlot::uninit();
                 let memcpyd = WeakSlot::uninit();
-                // SAFETY: `registered` is freshly `uninit()`, does not move for
-                // the rest of this closure, and `view` is a live +1.
+                // SAFETY: `registered` is freshly `uninit()` and pinned in place.
                 unsafe { registered.init(view.id()) };
-                // SAFETY: both slots are `#[repr(transparent)]` over one pointer word,
-                // live locals, and do not overlap. This creates on purpose the unsound
-                // state the check below measures.
+                // SAFETY: `WeakSlot` is `#[repr(transparent)]` over one pointer word.
                 unsafe { std::ptr::copy_nonoverlapping(registered.addr(), memcpyd.addr(), 1) };
 
-                // The handle is moved before the object dies.
                 let moved = weak;
                 drop(view);
 
-                // SAFETY: three plain pointer-word reads; none is dereferenced,
-                // messaged or retained (`memcpyd`'s value is dangling).
+                // SAFETY: plain pointer-word reads without dereferencing.
                 let (a, b, c) = unsafe { (registered.peek(), memcpyd.peek(), moved.peek()) };
                 let live = moved.is_live();
-                // SAFETY: `registered` is initialised and destroyed exactly
-                // once, here, before this frame dies. `memcpyd` was never
-                // registered and must NOT be destroyed.
+                // SAFETY: `registered` was initialized once and is destroyed at its original address.
                 unsafe { registered.destroy() };
                 Some((target, a, b, c, live))
             });
@@ -1086,20 +915,10 @@ mod macos {
         }
 
         /// The default application menu (`crates/aterm-window`'s `menu.rs`), read back
-        /// off `[NSApp mainMenu]`.
-        ///
-        /// `menu.rs` returns nothing any caller checks and hands every object to
-        /// AppKit, so an empty menu bar would leave every other test green. Checked:
-        /// eight rows in order (title, separator flag, action, key equivalent and
-        /// modifier mask, each read independently), the two submenu links and
-        /// `[NSApp servicesMenu]`. The process-name titles are built as `menu.rs`
-        /// builds them: "About " + name is the statement that
-        /// `-stringByAppendingString:` went to the right receiver.
         fn stage_default_menu(&mut self) {
             println!("\n[12] default menu — winit's menu.rs, off [NSApp mainMenu]");
             let name = process_name();
-            // SAFETY: the shared application is live; both accessors are
-            // `@16@0:8`.
+            // SAFETY: shared application is live on the main thread.
             let (menubar, services) =
                 unsafe { (app_menu(sel!(mainMenu)), app_menu(sel!(servicesMenu))) };
             if menubar.is_null() {
@@ -1107,7 +926,7 @@ mod macos {
                     .check(false, "[NSApp mainMenu] is nil — no menu was installed");
                 return;
             }
-            // SAFETY: `menubar` is the live `NSMenu` just read back.
+            // SAFETY: `menubar` is the live `NSMenu`.
             let top = unsafe { menu_count(menubar) };
             self.report.check(
                 top == 1,
@@ -1116,7 +935,7 @@ mod macos {
             if top < 1 {
                 return;
             }
-            // SAFETY: index 0 is in range by the check above.
+            // SAFETY: index 0 is in bounds.
             let app_item = unsafe { menu_item_at(menubar, 0) };
             // SAFETY: `app_item` is a live `NSMenuItem`.
             let app_row = unsafe { read_row(app_item) };
@@ -1128,7 +947,7 @@ mod macos {
                 return;
             }
             let app_menu = app_row.submenu;
-            // SAFETY: `app_menu` is the live submenu just read.
+            // SAFETY: `app_menu` is the live submenu.
             let n = unsafe { menu_count(app_menu) };
             self.report.check(
                 n == 8,
@@ -1138,13 +957,6 @@ mod macos {
                 return;
             }
 
-            // `(title, separator, action, key, mask)`, in `menu.rs`'s order. Two AppKit
-            // facts: `-keyEquivalentModifierMask` defaults to
-            // `NSEventModifierFlagCommand`, not 0 (`menu.rs` sets it only for the
-            // Option+Command row), and `-setSubmenu:` makes the Services row's action
-            // `submenuAction:`, AppKit's receipt that the send landed. The masks are
-            // spelled here, not imported from the seam, so the expectation is not the
-            // port's constant.
             const COMMAND: usize = 1 << 20;
             const OPTION_COMMAND: usize = (1 << 19) | (1 << 20);
             let expected: [(String, bool, Sel, &str, usize); 8] = [
@@ -1189,15 +1001,13 @@ mod macos {
             ];
 
             for (i, (title, separator, action, key, mask)) in expected.iter().enumerate() {
-                // SAFETY: `i < 8 == numberOfItems`, checked above.
+                // SAFETY: `i < 8 == numberOfItems`.
                 let row = unsafe { read_row(menu_item_at(app_menu, i as isize)) };
                 self.report.check(
                     row.separator == *separator,
                     &format!("row {i} separator={} (want {separator})", row.separator),
                 );
                 if *separator {
-                    // A separator's title, action and key equivalent are
-                    // AppKit's, not the fork's; asserting them would be
                     // asserting `+separatorItem`.
                     continue;
                 }
@@ -1223,9 +1033,7 @@ mod macos {
                 );
             }
 
-            // The Services row's submenu, and that `-setServicesMenu:` pointed
-            // NSApp at that same object. Two sends, one identity.
-            // SAFETY: index 2 is in range.
+            // SAFETY: index 2 is in bounds.
             let services_row = unsafe { read_row(menu_item_at(app_menu, 2)) };
             self.report.check(
                 !services_row.submenu.is_null(),
@@ -1241,15 +1049,6 @@ mod macos {
         }
 
         /// The monitor surface (`crates/aterm-window`'s `monitor.rs`).
-        ///
-        /// Its reads are a chain (`+[NSScreen screens]`, a `-count`/`-objectAtIndex:`
-        /// walk, `-deviceDescription`, `-objectForKey:`, `-unsignedIntValue`), each
-        /// link checked against a source that is not the port: CoreGraphics for the
-        /// display ID, AppKit's `-backingScaleFactor` for the scale. A walk that visits
-        /// no element and a wrong device-description entry both fail here. Not covered:
-        /// the width of the `-unsignedIntValue` read, since the upper word of `x0` is
-        /// zero for every value probed and the caller assigns to a `u32`; the debug
-        /// build's prototype check compares that letter with the runtime.
         fn stage_monitors(&mut self) {
             println!("\n[13] monitors — winit's monitor.rs, against CoreGraphics and AppKit");
             let cg_main = cg_main_display_id();
@@ -1276,9 +1075,6 @@ mod macos {
                 &format!("available_monitors {all:?} contains the main display {cg_main}"),
             );
 
-            // The `get_display_id` path: `current_monitor` goes `-[NSWindow screen]` ->
-            // `get_display_id` -> `CGDisplayCreateUUIDFromDisplayID` and back, so a
-            // wrong-width read cannot survive the round trip.
             match self.w().current_monitor() {
                 Some(m) => self.report.check(
                     m.native_id() == cg_main,
@@ -1294,7 +1090,6 @@ mod macos {
                     .check(false, "the window reports a current monitor"),
             }
 
-            // The `ns_screen` path: the scale factor it looks the screen up to read.
             match main_screen_backing_scale() {
                 Some(appkit) => self.report.check(
                     (primary.scale_factor() - appkit).abs() < f64::EPSILON,
@@ -1321,18 +1116,6 @@ mod macos {
         }
 
         /// The `-sendEvent:` swizzle (`crates/aterm-window`'s `app.rs`, through
-        /// `aterm_objc::swizzle`).
-        ///
-        /// The encoding proves nothing: `method_setImplementation` preserves the
-        /// registered types and `class_replaceMethod` ignores the ones it is given, so
-        /// `-sendEvent:` reads `v24@0:8@16` either way; it is printed, not asserted.
-        /// The evidence is the IMP's image by `dladdr`: inside AppKit (nothing
-        /// happened) or inside this executable (where `send_event` lives).
-        ///
-        /// The second half is the swizzle's purpose: AppKit does not deliver `keyUp:`
-        /// to a window while Command is held, so a synthetic Cmd-modified key-up
-        /// posted to `[NSApp sendEvent:]` reaches winit only through the replacement's
-        /// forward to `-[NSWindow sendEvent:]`. It is asserted after the pump.
         fn stage_send_event_swizzle(&mut self) {
             println!("\n[14] -sendEvent: swizzle — winit's app.rs, off the runtime's own tables");
             // SAFETY: `+sharedApplication` is `@16#0:8`.
@@ -1355,9 +1138,6 @@ mod macos {
                 return;
             };
 
-            // `class_getInstanceMethod` on the running application's class answers the
-            // same `Method` as on `NSApplication`, so swizzling "the application's
-            // class" patches the ancestor that owns the row.
             self.report.check(
                 m_via_instance == m_via_class,
                 &format!(
@@ -1382,10 +1162,6 @@ mod macos {
                     "-[NSApplication sendEvent:] no longer lands in AppKit (it is in {image})"
                 ),
             );
-            // Compare canonical paths: `image` is what dladdr resolved (symlinks
-            // followed), `current_exe` the path the process was launched through, and
-            // they differ when anything between is a link (e.g. `target` symlinked to
-            // `target.noindex`).
             let exe = std::env::current_exe().unwrap_or_default();
             let real = |p: &std::path::Path| {
                 std::fs::canonicalize(p)
@@ -1400,8 +1176,6 @@ mod macos {
                 &format!("…it lands in this executable ({image_real} vs {exe_real})"),
             );
 
-            // The swizzle's purpose, end to end. Needs a key window; without one this
-            // half is reported and skipped.
             // SAFETY: `-keyWindow` is `@16@0:8` on `NSApplication`.
             let key_window = unsafe {
                 let f: unsafe extern "C-unwind" fn(Id, Sel) -> Id = checked_msg();
@@ -1422,9 +1196,7 @@ mod macos {
                     .check(false, "Foundation accepts a one-character string");
                 return;
             };
-            // SAFETY: `chars` owns a +1 to a live `NSString`; `key_up_event` states the
-            // factory's prototype; `-sendEvent:` is `v24@0:8@16` on `NSApplication` and
-            // the event is +0 autoreleased into this pool.
+            // SAFETY: `chars` is a live `NSString` and `app` is the live `NSApplication`.
             autoreleasepool(|_| unsafe {
                 let ev = key_up_event(number, NS_EVENT_MODIFIER_FLAG_COMMAND, chars.id());
                 if ev.is_null() {
@@ -1441,10 +1213,8 @@ mod macos {
         }
     }
 
-    /// Drive the loop until every stage has run, then report.
+    /// Drive the window loop through every verification stage and return an exit code.
     pub fn run() -> i32 {
-        // The quiet builder (Accessory, no launch activation): `verify appkit` runs
-        // this drive beside a developer who is typing somewhere else.
         let mut el = match aterm_gui::quiet_driver_event_loop_builder::<()>().build() {
             Ok(el) => el,
             Err(e) => {
@@ -1483,8 +1253,6 @@ mod macos {
             }
         }
 
-        // The drag stage's HoveredFile events are delivered by the pump, so
-        // they are read after the loop rather than inside the stage.
         let hovered = std::mem::take(&mut driver.hovered);
         println!("\n[7b] the paths draggingEntered: queued");
         let want = ["/tmp/aterm-drive-a", "/tmp/aterm-drive-b"];
@@ -1497,7 +1265,6 @@ mod macos {
             &format!("CloseRequested arrived {} time(s)", driver.close_requested),
         );
 
-        // The swizzle stage's forwarded key-up, on the same terms.
         println!("\n[14b] the Cmd+keyUp the swizzled sendEvent: forwarded");
         if driver.posted_cmd_key_up {
             driver.report.check(

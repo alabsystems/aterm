@@ -18,8 +18,14 @@
 //! `Absent` only when its plist does not exist or `plutil` reads it as empty; otherwise
 //! it is `Unusable`. A user or host domain is read as the user it belongs to, so a file
 //! that user may not read is one their own programs may not read either; an empty export
-//! of one is still not told apart from a missing domain (not measured: a sandboxed app's
-//! container domain, which TCC can hide from a tool run over SSH).
+//! of one is still not told apart from a missing domain. One such domain is measured: an
+//! App-Sandboxed app's own domain lives in its container, which macOS guards as data from
+//! other apps, so a reader whose responsible app holds no Full Disk Access gets an empty
+//! export and the person a warning ([`CONTAINED`]). Those domains, and a path into any app's
+//! container or group container, are read and written only by a pass whose responsible app
+//! holds the grant ([`withheld`]): the Widgets row, the doctor's own reads, writes, rollback
+//! and Restore, and a raw `[[defaults]]` row alike, by name or by a path, which has no `..`
+//! ([`expand_rows`] refuses one with it, for every scope).
 //!
 //! Writes go through `defaults` too, never behind cfprefsd's back. A per-user write runs
 //! as that user: run as root, even with `HOME` pointing at the user's home, `defaults`
@@ -49,6 +55,87 @@ pub const LAUNCHCTL: &str = "/bin/launchctl";
 /// Reads a system plist file directly when `defaults export` printed an empty domain.
 pub const PLUTIL: &str = "/usr/bin/plutil";
 
+/// The preference domains macOS keeps in an App-Sandboxed app's container
+/// (`~/Library/Containers/<id>/Data/Library/Preferences`), each with its app's name. macOS
+/// guards a container as data from other apps (`kTCCServiceSystemPolicyAppDataDetailed`,
+/// which does not allow prompting). Measured 2026-10-22 in a macOS 27.0 VM, a fresh account
+/// and a dev build of aterm: aterm's child `defaults export com.apple.notificationcenterui -`
+/// was denied (tccd: responsible aterm, accessing `/usr/bin/defaults`, requesting
+/// `sandboxd`), printed an empty domain (181 bytes; `defaults read … widgets`: domain not
+/// found), and macOS showed the person a notice that aterm was prevented from accessing data
+/// from other apps (a dialog on 26.6); over SSH, whose `sshd-keygen-wrapper` holds Full Disk
+/// Access, it printed all 8053 bytes. Once aterm was granted Full Disk Access, the same read
+/// printed all of it with no relaunch: the grant lifts even a denial macOS already recorded.
+/// `com.apple.WindowManager` raised no such request.
+pub const CONTAINED: [(&str, &str); 1] =
+    [("com.apple.notificationcenterui", "Notification Center")];
+
+/// The app whose sandbox container `domain` is in: one of [`CONTAINED`] by name (in any
+/// case, as `defaults` finds the domain), or a path
+/// into any app's container or group container (`…/Library/Containers/<id>/…`,
+/// `…/Library/Group Containers/<id>/…`: the roots macOS guards as data from other apps,
+/// `aterm_containment::sbpl::APP_DATA_ROOTS`, matched without regard to case as the volume
+/// names them), by its [`CONTAINED`] name, else by its id. The match is lexical, so a path
+/// that reaches a container through `..` is not one: [`expand_rows`] refuses `..` in a
+/// domain. Only a container's is measured for `defaults`; a group container is gated alike
+/// by the App Data model (docs/DESIGN-macos-tcc-prompts-2026-08-30.md §1.6d), not measured.
+fn container_of(domain: &str) -> Option<&str> {
+    if let Some((_, app)) = CONTAINED
+        .iter()
+        .find(|(id, _)| id.eq_ignore_ascii_case(domain))
+    {
+        return Some(app);
+    }
+    let parts: Vec<&str> = Path::new(domain)
+        .components()
+        .filter_map(|part| match part {
+            Component::Normal(part) => part.to_str(),
+            _ => None,
+        })
+        .collect();
+    parts.windows(3).find_map(|at| {
+        (at[0].eq_ignore_ascii_case("Library")
+            && (at[1].eq_ignore_ascii_case("Containers")
+                || at[1].eq_ignore_ascii_case("Group Containers")))
+        .then(|| {
+            CONTAINED
+                .iter()
+                .find(|(id, _)| id.eq_ignore_ascii_case(at[2]))
+                .map_or(at[2], |(_, app)| *app)
+        })
+    })
+}
+
+/// Whether `domain` is in another app's sandbox container: one of [`CONTAINED`], or a path
+/// into an app's container or group container ([`container_of`]).
+#[must_use]
+pub fn contained(domain: &str) -> bool {
+    container_of(domain).is_some()
+}
+
+/// Why a process whose Full Disk Access is `full_disk_access`
+/// ([`crate::model::HostFacts::full_disk_access`]) leaves `domain` alone, neither read nor
+/// written: it is in another app's container ([`contained`]: one of [`CONTAINED`], by name or
+/// by a path into it, or a path into any app's container or group container) and the grant
+/// is not known to be held. `None`: it may touch it. The
+/// grant is the one macOS checks: that of the app responsible for the process running the
+/// pass (aterm for System State and a command in an aterm tab, the terminal for one run
+/// elsewhere, `sshd-keygen-wrapper` for one over SSH), measured once per run.
+#[must_use]
+pub fn withheld(domain: &str, full_disk_access: Option<bool>) -> Option<String> {
+    if full_disk_access == Some(true) {
+        return None;
+    }
+    container_of(domain).map(|app| {
+        format!(
+            "{app} keeps {domain} in its own app container, which macOS opens only to a \
+                 process whose app holds Full Disk Access (aterm, for System State or a command \
+                 in an aterm tab; else the app this ran from); left untouched until that app \
+                 has it"
+        )
+    })
+}
+
 /// `launchctl print gui/<uid>`'s exit when the user has no GUI session (27.0 VM: "Could
 /// not find domain for user gui: 599"). A usage error exits 64.
 const NO_SESSION: i32 = 112;
@@ -73,8 +160,9 @@ pub enum Scope {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Row {
-    /// The domain (`com.apple.dock`, `NSGlobalDomain`) or, for `system`, a domain under
-    /// `/Library/Preferences` or an absolute plist path without `.plist`.
+    /// The domain (`com.apple.dock`, `NSGlobalDomain`; for `user`, also a plist path without
+    /// `.plist`) or, for `system`, a domain under `/Library/Preferences` or an absolute plist
+    /// path without `.plist`; never with a `..`.
     pub domain: String,
     /// The key.
     pub key: String,
@@ -771,6 +859,18 @@ pub fn expand_rows(rows: &[Row], ctx: &Ctx) -> Result<Vec<Box<dyn Item>>, String
                 let target = Target::system(&row.domain, &row.key);
                 let title = format!("{} = {want} (system)", target.describe());
                 let id = format!("defaults.system.{}.{}", row.domain, row.key);
+                // Gated on the file the row resolves to: a name is one under
+                // /Library/Preferences, never a container, and a path into one waits for the
+                // grant as a user row's does.
+                if let Some(why) = withheld(&target.domain, ctx.facts.full_disk_access) {
+                    items.push(Box::new(Unmet {
+                        family: "defaults",
+                        id,
+                        title,
+                        why,
+                    }));
+                    continue;
+                }
                 items.push(Box::new(Pref::new("defaults", id, title, target, want)));
             }
             Scope::User | Scope::Host => {
@@ -778,6 +878,16 @@ pub fn expand_rows(rows: &[Row], ctx: &Ctx) -> Result<Vec<Box<dyn Item>>, String
                     let vars = [("user", user.name.as_str())];
                     let domain = fill_str(&row.domain, &vars);
                     let key = fill_str(&row.key, &vars);
+                    // A `..` would reach another app's container by a path the gate below,
+                    // which reads the path as written, does not see as one.
+                    if Path::new(&domain)
+                        .components()
+                        .any(|c| c == Component::ParentDir)
+                    {
+                        return Err(format!(
+                            "{at}: a user or host domain is a name or a path, without `..`"
+                        ));
+                    }
                     if row.scope == Scope::Host && domain.contains('/') {
                         return Err(format!(
                             "{at}: a host (-currentHost) domain is a name, not a path"
@@ -793,6 +903,17 @@ pub fn expand_rows(rows: &[Row], ctx: &Ctx) -> Result<Vec<Box<dyn Item>>, String
                     };
                     let title = format!("{} = {want} for {}", target.describe(), user.name);
                     let id = format!("defaults.{byhost}{domain}.{key}@{}", user.name);
+                    // Another app's container is neither read nor written without the
+                    // grant, by this row as by the Widgets row: the row is reported, blocked.
+                    if let Some(why) = withheld(&domain, ctx.facts.full_disk_access) {
+                        items.push(Box::new(Unmet {
+                            family: "defaults",
+                            id,
+                            title,
+                            why,
+                        }));
+                        continue;
+                    }
                     let mut pref = Pref::new("defaults", id, title, target, want);
                     if let Some(p) = &row.restart {
                         pref = pref.restart(p.as_str());
@@ -1653,5 +1774,214 @@ scope = "user"
         }
         let read = Target::system("com.apple.apsd", "Anything").read(&live);
         assert!(matches!(read, Read::Unusable(_)), "{read:?}");
+    }
+
+    /// Only a grant known to be held opens another app's container: refused and not
+    /// measured both leave it alone, and a domain outside a container is never withheld.
+    /// Negative control: treating an unmeasured grant as held hands the row a read that
+    /// macOS answers with its warning and an empty domain.
+    #[test]
+    fn a_container_domain_is_withheld_unless_full_disk_access_is_known_held() {
+        for unknown in [None, Some(false)] {
+            let why = withheld("com.apple.notificationcenterui", unknown).unwrap();
+            assert!(
+                why.contains("Notification Center") && why.contains("Full Disk Access"),
+                "{why}"
+            );
+        }
+        assert_eq!(withheld("com.apple.notificationcenterui", Some(true)), None);
+        for open in ["com.apple.WindowManager", "com.apple.dock", "-g"] {
+            assert_eq!(withheld(open, None), None, "{open}");
+            assert!(!contained(open), "{open}");
+        }
+        assert!(contained("com.apple.notificationcenterui"));
+        // A group container, as macOS spells it and in another case.
+        for path in [
+            "/Users//alice/Library/Group Containers/ABCDE12345.group.example/Library/Preferences/ABCDE12345.group.example",
+            "/Users//alice/Library/group containers/ABCDE12345.group.example/Library/Preferences/ABCDE12345.group.example",
+        ] {
+            assert!(contained(path), "{path}");
+            assert!(withheld(path, None).is_some(), "{path}");
+        }
+    }
+
+    /// A raw `[[defaults]]` row on another app's container (the agent's baseline, `aterm
+    /// machines here`) is gated as the Widgets row is, whether it names the domain or spells
+    /// a path into the container (Notification Center's, or any app's, in any case) or into
+    /// a group container (in any case), or names Notification Center's domain in another
+    /// case: without a grant known held (not measured, or refused) its item is
+    /// a blocked row under its usual id that runs nothing, apply included; with it, the row
+    /// reads its domain. A row on an open domain, by name or path, is never gated. Negative
+    /// controls: the granted arm's probe exports each container; matching the container's
+    /// name alone (as the gate did) exports the path rows without the grant, matching
+    /// `Library/Containers` alone, or `Group Containers` in its own case only, the group
+    /// container's, and matching the name in its own case only the other-case row.
+    #[test]
+    fn a_raw_row_on_another_apps_container_is_read_and_written_only_with_the_grant() {
+        const NC_PATH: &str = "/Users//alice/Library/Containers/com.apple.notificationcenterui/Data/Library/Preferences/com.apple.notificationcenterui";
+        const OTHER_PATH: &str = "/Users//alice/library/containers/com.example.Sandboxed/Data/Library/Preferences/com.example.Sandboxed";
+        const GROUP_PATH: &str = "/Users//alice/Library/group containers/ABCDE12345.group.example/Library/Preferences/ABCDE12345.group.example";
+        let rows = row(r#"
+[[defaults]]
+domain = "com.apple.notificationcenterui"
+key = "widgets"
+value = { instances = [] }
+scope = "user"
+
+[[defaults]]
+domain = "/Users/{user}/Library/Containers/com.apple.notificationcenterui/Data/Library/Preferences/com.apple.notificationcenterui"
+key = "widgets"
+value = { instances = [] }
+scope = "user"
+
+[[defaults]]
+domain = "/Users/{user}/library/containers/com.example.Sandboxed/Data/Library/Preferences/com.example.Sandboxed"
+key = "Shown"
+value = false
+scope = "user"
+
+[[defaults]]
+domain = "/Users/{user}/Library/group containers/ABCDE12345.group.example/Library/Preferences/ABCDE12345.group.example"
+key = "Shown"
+value = false
+scope = "user"
+
+[[defaults]]
+domain = "com.apple.NotificationCenterUI"
+key = "widgets"
+value = { instances = [] }
+scope = "user"
+
+[[defaults]]
+domain = "com.apple.dock"
+key = "autohide"
+value = true
+scope = "user"
+
+[[defaults]]
+domain = "/Users/{user}/Library/Preferences/com.apple.dock"
+key = "autohide"
+value = true
+scope = "user"
+"#);
+        let alice = user("alice", 501);
+        // As the fake shows a command: an argument with a space in single quotes.
+        let export = |domain: &str| {
+            let shown = if domain.contains(' ') {
+                format!("'{domain}'")
+            } else {
+                domain.to_owned()
+            };
+            format!("alice$ /usr/bin/defaults export {shown} -")
+        };
+        let contained = [
+            "com.apple.notificationcenterui",
+            NC_PATH,
+            OTHER_PATH,
+            GROUP_PATH,
+            "com.apple.NotificationCenterUI",
+        ];
+        let open = [
+            "com.apple.dock",
+            "/Users//alice/Library/Preferences/com.apple.dock",
+        ];
+        for full_disk_access in [None, Some(false), Some(true)] {
+            let mut context = ctx(std::slice::from_ref(&alice));
+            context.facts.full_disk_access = full_disk_access;
+            let items = expand_rows(&rows, &context).unwrap();
+            assert_eq!(items.len(), 7);
+            assert_eq!(
+                items[0].id(),
+                "defaults.com.apple.notificationcenterui.widgets@alice"
+            );
+            for (item, domain) in items.iter().zip(contained.into_iter().chain(open)) {
+                let sys = Fake::root();
+                sys.on(&export(domain), missing());
+                let probe = item.probe(&sys, &context);
+                let exported = sys.calls().contains(&export(domain));
+                if full_disk_access == Some(true) || open.contains(&domain) {
+                    assert!(matches!(probe, Probe::Change { .. }), "{domain}: {probe:?}");
+                    assert!(exported, "{domain}: {:?}", sys.calls());
+                } else {
+                    let Probe::Blocked { why } = probe else {
+                        panic!("{full_disk_access:?} {domain}: {probe:?}");
+                    };
+                    assert!(why.contains("Full Disk Access"), "{why}");
+                    assert!(item.apply(&sys, &context).is_err());
+                    assert!(sys.calls().is_empty(), "{domain}: {:?}", sys.calls());
+                }
+            }
+        }
+    }
+
+    /// A user row whose domain reaches a path through `..` is refused, whatever the grant,
+    /// as a system row's is: the gate reads a path as written, and a `..` through
+    /// another directory reaches another app's container by a spelling it does not see as
+    /// one (the kernel resolves the `..`, through a symbolic link as it is). Negative control:
+    /// without the refusal each row expands, the first into a read of Notification Center's
+    /// container without the grant, since the gate does not see that path as one.
+    #[test]
+    fn a_user_domain_that_climbs_with_dotdot_is_refused_whatever_the_grant() {
+        let alice = user("alice", 501);
+        for domain in [
+            "/Users/{user}/Library/Preferences/../Containers/com.apple.notificationcenterui/Data/Library/Preferences/com.apple.notificationcenterui",
+            "/Users/{user}/Library/Application Support/../Containers/com.example.Sandboxed/Data/Library/Preferences/com.example.Sandboxed",
+            "/Users/{user}/Library/Preferences/../../{user}/Library/Preferences/com.apple.dock",
+        ] {
+            let rows = row(&format!(
+                "[[defaults]]\ndomain = \"{domain}\"\nkey = \"widgets\"\nvalue = 1\nscope = \"user\"\n"
+            ));
+            for full_disk_access in [None, Some(false), Some(true)] {
+                let mut context = ctx(std::slice::from_ref(&alice));
+                context.facts.full_disk_access = full_disk_access;
+                let err = expand_rows(&rows, &context)
+                    .err()
+                    .unwrap_or_else(|| panic!("{full_disk_access:?}: {domain} expanded"));
+                assert!(err.contains("without `..`"), "{err}");
+            }
+        }
+    }
+
+    /// A system row is gated on the file it resolves to: one whose path is in an app's
+    /// container is, without a grant known held, a blocked row that runs nothing (no stat of
+    /// its directories, no export), and with the grant it reads its file; one that names
+    /// Notification Center's domain resolves under /Library/Preferences, no container, and
+    /// is never gated. Negative control: without the system arm's gate, the container row
+    /// probes its path without the grant.
+    #[test]
+    fn a_system_row_is_gated_on_the_file_it_resolves_to() {
+        let rows = row(r#"
+[[defaults]]
+domain = "/private/var/root/Library/Containers/com.example.Sandboxed/Data/Library/Preferences/com.example.Sandboxed"
+key = "Shown"
+value = false
+scope = "system"
+
+[[defaults]]
+domain = "com.apple.notificationcenterui"
+key = "widgets"
+value = false
+scope = "system"
+"#);
+        for full_disk_access in [None, Some(false), Some(true)] {
+            let mut context = ctx(&[]);
+            context.facts.full_disk_access = full_disk_access;
+            let items = expand_rows(&rows, &context).unwrap();
+            assert_eq!(items.len(), 2);
+            for (n, item) in items.iter().enumerate() {
+                let sys = Fake::root();
+                let probe = item.probe(&sys, &context);
+                let gated =
+                    matches!(&probe, Probe::Blocked { why } if why.contains("Full Disk Access"));
+                if n == 0 && full_disk_access != Some(true) {
+                    assert!(gated, "{full_disk_access:?}: {probe:?}");
+                    assert!(item.apply(&sys, &context).is_err());
+                    assert!(sys.calls().is_empty(), "{:?}", sys.calls());
+                } else {
+                    assert!(!gated, "{full_disk_access:?} row {n}: {probe:?}");
+                    assert!(!sys.calls().is_empty(), "{full_disk_access:?} row {n}");
+                }
+            }
+        }
     }
 }

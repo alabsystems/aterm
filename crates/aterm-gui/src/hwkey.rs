@@ -2,97 +2,15 @@
 // Copyright 2026 Andrew Yates
 
 //! Hardware-path key injection, for measuring keystroke latency.
-//!
-//! The control socket's `key` verb posts a [`crate::Wake::Input`] that the main thread applies
-//! through the App input seam: right for driving a session (byte-identical to a person's key at
-//! the PTY), wrong for measuring one. The NSEvent-queue backdate (`note_key_arrival_queued`),
-//! which counts the time a keystroke waited for a parked event loop into `key->write` and
-//! `input->present`, runs only in winit's `WindowEvent::KeyboardInput` arm; a `Wake::Input`
-//! stamps its arrival at `note_input()`, after the loop dequeued it, so it cannot see a stall
-//! while the main thread is parked.
-//!
-//! `hwkey` builds a real `NSEvent` keyDown/keyUp pair and posts it with
-//! `-[NSApplication postEvent:atStart:]` into the app's own event queue, the one WindowServer
-//! delivers a physical key into. From there the path is a physical key's (`sendEvent:`, winit's
-//! `keyDown:` and `create_key_event`, the same `KeyboardInput` arm with the same
-//! `NSApp.currentEvent()` visible to `current_event_queue_age_ns()`). The event carries a real
-//! `timestamp` on the `NSProcessInfo.systemUptime` clock, so the backdate measures its queue
-//! residence instead of discarding it as synthesized (`timestamp <= 0`). Unlike a physical key
-//! it never crosses WindowServer's mach port, and `CGEventSource`-level state (key repeat, the
-//! HID idle clock) does not move.
-//!
-//! `note_key_arrival_queued` — the NSEvent-queue BACKDATE that puts time a
-//! keystroke spent waiting for a parked event loop inside `key->write` and
-//! `input->present` — is called from exactly one site: the winit
-//! `WindowEvent::KeyboardInput` arm. A `Wake::Input` arrives on a `CFRunLoopSource`,
-//! not in the NSEvent queue, and it stamps its arrival at `note_input()`, i.e.
-//! AFTER the event loop already dequeued it. So a socket-injected key is
-//! structurally incapable of observing a typing stall that happens while the main
-//! thread is parked — historically the single largest documented one on macOS: a
-//! blocking `nextDrawable` parked the main thread and queued keyDowns in the OS
-//! event queue behind it (`metrics.rs` prices that at up to ~84 ms). Every latency
-//! number this project has published was driven by `ctl key`, so every one of them
-//! is a measurement with that slice removed.
-//!
-//! THAT PARTICULAR PARK IS GONE from the shipped macOS build, and the instrument
-//! outlives it on purpose. Since `ea581e158` an attached native Metal surface
-//! acquires its drawable on the `aterm-drawable-acquire` worker and every
-//! main-side call is non-blocking (`present.rs` `acquire` → `Pending`), and the
-//! `get_current_texture()` path named below is `cfg(wgpu_arm)`, emitted only for
-//! `!macos || wgpu-oracle`. What the queue-residence backdate measures is any
-//! main-thread park, whatever parks it; the drawable was the one worth naming.
-//!
-//! # What this does instead
-//!
-//! It builds a real `NSEvent` keyDown/keyUp pair and hands it to
-//! `-[NSApplication postEvent:atStart:]` — the app's OWN event queue, the same
-//! queue WindowServer delivers a physical key into. From that moment on there is
-//! no injected path at all: the run loop dequeues it, `-[NSApplication sendEvent:]`
-//! routes it to the key window, winit's `WinitView keyDown:` runs
-//! `interpretKeyEvents` and `create_key_event` on it, and the resulting
-//! `WindowEvent::KeyboardInput` reaches the same arm with the same
-//! `NSApp.currentEvent()` visible to `current_event_queue_age_ns()`. The event
-//! carries a REAL `timestamp` (taken from the same `NSProcessInfo.systemUptime`
-//! clock the age is computed against), so the backdate measures the true queue
-//! residence rather than being discarded as a synthesized event (`timestamp <= 0`).
-//!
-//! `shape=press` builds each event as a key press is instead, from a CoreGraphics keyboard
-//! event wrapped by `+[NSEvent eventWithCGEvent:]`: AppKit then reads its characters off the
-//! current layout, and the input method composes it as it would a physical key (Option+e
-//! starts the U.S. acute dead key), which no event built by `+keyEventWithType:…` does. The
-//! Option-as-Meta lane (`aterm-lab meta-keys --window`) presses its chords this way.
-//!
-//! # The one difference from a physical key, stated plainly
-//!
-//! The event is born inside this process instead of in WindowServer, so it never
-//! crosses the mach port from the window server, and `CGEventSource`-level state
-//! (key-repeat state, the HID idle clock) does not move. Everything the metrics
-//! path can see — the arm, the dispatch, the queue residence, the key translation,
-//! the modifier state, the PTY egress — is the same code on the same objects.
-//!
-//! Posting happens on the CONTROL thread, deliberately. Hopping to the main thread
-//! first would make every injected key arrive at the same phase of the render loop
-//! (just after a wake, just before the next park), which is exactly the phase
-//! relationship the measurement is trying to sample fairly. `postEvent:atStart:` is
-//! one of the few `NSApplication` methods Apple documents as safe from any thread —
-//! it is the canonical secondary-thread wakeup — and it is how a key posted while
-//! the main thread is parked can WAIT in the queue, which is the entire point.
-//! (The park that motivated this was `get_current_texture()`; that call is
-//! `cfg(wgpu_arm)` and no longer on the shipped macOS path — see the header. The
-//! measurement is of the queue, not of any one parker.)
 
-/// A parsed hardware-key injection request: everything needed to build the
-/// `NSEvent` pair, with no AppKit types, so the grammar is unit-testable.
+/// A parsed hardware-key injection request: everything needed to build the `NSEvent` pair, with no AppKit types, so the grammar is unit-testable.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct HwKeySpec {
-    /// macOS virtual keycode (`kVK_*`). winit's `create_key_event` derives the logical key from
-    /// this through `UCKeyTranslate`, so it, not `chars`, decides which key the app sees.
+    /// macOS virtual keycode (`kVK_*`). winit's `create_key_event` derives the logical key from this through `UCKeyTranslate`, so it, not `chars`, decides which key the app sees.
     pub keycode: u16,
     /// `-[NSEvent characters]`: the text the layout produces with modifiers applied.
     pub chars: String,
-    /// `-[NSEvent charactersIgnoringModifiers]`: winit dereferences this
-    /// unconditionally (`.expect("expected characters to be non-null")`), so it is
-    /// never empty here.
+    /// `-[NSEvent charactersIgnoringModifiers]`: winit dereferences this unconditionally (`.expect("expected characters to be non-null")`), so it is never empty here.
     pub chars_ignoring: String,
     /// Raw `NSEventModifierFlags` bits.
     pub flags: u64,
@@ -100,13 +18,7 @@ pub(crate) struct HwKeySpec {
     pub count: u32,
     /// Milliseconds between successive presses.
     pub interval_ms: u64,
-    /// `shape=press`: build each event as a key press is, from a CoreGraphics keyboard
-    /// event wrapped by `+[NSEvent eventWithCGEvent:]`, so AppKit reads its characters
-    /// off the CURRENT layout (Option+b is `∫` on the U.S. layout, Option+e the acute
-    /// dead key with empty characters) and the input method may compose it. The default
-    /// builds the event with `+keyEventWithType:…` from [`Self::chars`], a shape the
-    /// input method never composes (measured on macOS 27,
-    /// `docs/measured/desk-appkit-2026-10-19.md`).
+    /// `shape=press`: build each event as a key press is, from a CoreGraphics keyboard event wrapped by `+[NSEvent eventWithCGEvent:]`, so AppKit reads its characters off the CURRENT layout (Option+b is `∫` on the U.S. layout, Option+e the acute dead key with empty characters) and the input method may compose it.
     pub press: bool,
 }
 
@@ -116,22 +28,16 @@ const FLAG_CONTROL: u64 = 1 << 18;
 const FLAG_OPTION: u64 = 1 << 19;
 const FLAG_COMMAND: u64 = 1 << 20;
 /// `NSEventModifierFlagFunction` — AppKit sets it on arrows and F-keys, and some
-/// responders read it, so a synthetic arrow must carry it too.
 const FLAG_FUNCTION: u64 = 1 << 23;
 
 /// Upper bound on one `hwkey` invocation: the verb blocks while it paces the stream, so an
-/// unbounded count would pin a control worker.
 const MAX_COUNT: u32 = 5000;
 /// Upper bound on the pacing interval, for the same reason.
 const MAX_INTERVAL_MS: u64 = 1000;
 /// Default pacing: 40 ms ≈ 25 keys/s, brisk typing. Not zero: a zero-interval burst measures
-/// queue drain, not typing.
 const DEFAULT_INTERVAL_MS: u64 = 40;
 
 /// A named key: `(name, keycode, characters)`. `characters` uses the private-use
-/// function-key code points AppKit puts in `-[NSEvent characters]` for the
-/// non-printing keys, and the C0/DEL control characters for the rest — the same
-/// bytes a physical press produces.
 const NAMED: &[(&str, u16, &str)] = &[
     ("enter", 36, "\r"),
     ("return", 36, "\r"),
@@ -165,19 +71,13 @@ const NAMED: &[(&str, u16, &str)] = &[
 
 /// The keys that AppKit marks with `NSEventModifierFlagFunction` on a real press.
 const FUNCTION_FLAGGED: &[u16] = &[
-    123, 124, 125, 126, // arrows
-    115, 116, 117, 119, 121, // home/pageup/fwd-delete/end/pagedown
-    96, 97, 98, 99, 100, 101, 103, 109, 111, 118, 120, 122, // F1..F12
+    123, 124, 125, 126, 115, 116, 117, 119, 121, 96, 97, 98, 99, 100, 101, 103, 109, 111, 118, 120,
+    122,
 ];
 
 /// US-QWERTY virtual keycode for a printable ASCII character: `(keycode, needs_shift)`.
-///
-/// The module's one layout assumption: it maps the character back to the physical key that
-/// produces it on a US layout. winit then runs the active layout over the keycode, so on a
-/// non-US layout the app reports whatever that layout puts on that physical key.
 #[must_use]
 fn ansi_keycode(c: char) -> Option<(u16, bool)> {
-    // Shifted ASCII first: fold to the unshifted character and demand shift.
     let (base, shift) = match c {
         'A'..='Z' => (c.to_ascii_lowercase(), true),
         '!' => ('1', true),
@@ -258,7 +158,6 @@ fn ansi_keycode(c: char) -> Option<(u16, bool)> {
 }
 
 /// Strip leading inline modifier prefixes (`ctrl+`, `alt+`, …), mirroring
-/// [`crate::control_input::parse_key`]'s grammar so the two verbs read the same.
 fn take_inline_mods(body: &str) -> (u64, &str) {
     let mut m = 0u64;
     let mut rest = body;
@@ -277,8 +176,6 @@ fn take_inline_mods(body: &str) -> (u64, &str) {
 }
 
 /// Parse `mods=<list>` / `count=<n>` / `interval=<ms>` trailing tokens, returning them plus the
-/// residual body. Any unparsable token value is an error rather than a silent default: a typo'd
-/// `count=1oo` that injected one key would quietly invalidate a measurement run.
 fn take_tokens(rest: &str) -> Result<(u64, u32, u64, bool, String), String> {
     let mut mods = 0u64;
     let mut count = 1u32;
@@ -331,10 +228,6 @@ fn take_tokens(rest: &str) -> Result<(u64, u32, u64, bool, String), String> {
 }
 
 /// PURE parser for `hwkey <name> [mods=<list>] [count=<n>] [interval=<ms>] [shape=press|built]`.
-///
-/// Kept free of AppKit so the whole grammar — including the character→keycode
-/// table a measurement's fidelity rests on — is exercised by `#[test]` on every
-/// platform, not only when someone runs the verb by hand on a Mac.
 pub(crate) fn parse_hwkey(rest: &str) -> Result<HwKeySpec, String> {
     let (tok_mods, count, interval_ms, press, body) = take_tokens(rest)?;
     let (prefix_mods, body) = take_inline_mods(body.trim());
@@ -370,15 +263,11 @@ pub(crate) fn parse_hwkey(rest: &str) -> Result<HwKeySpec, String> {
     if needs_shift {
         flags |= FLAG_SHIFT;
     }
-    // `charactersIgnoringModifiers` heeds Shift only (as AppKit reports it), so an explicitly
-    // shifted letter carries its uppercase form.
     let ignoring = if flags & FLAG_SHIFT != 0 {
         c.to_ascii_uppercase().to_string()
     } else {
         c.to_ascii_lowercase().to_string()
     };
-    // `characters` heeds everything: Control folds an ASCII letter to its C0
-    // control byte, which is what a physical Ctrl-chord press delivers.
     let chars = if flags & FLAG_CONTROL != 0 && c.is_ascii_alphabetic() {
         let ctrl = (c.to_ascii_uppercase() as u8) & 0x1f;
         (ctrl as char).to_string()
@@ -406,12 +295,7 @@ fn usage() -> String {
         .to_string()
 }
 
-/// Post the request as real `NSEvent`s into this application's event queue; the number of
-/// presses posted.
-///
-/// `window_number` is the target window's `-[NSWindow windowNumber]`, resolved on the main
-/// thread by the caller: `sendEvent:` routes a key event by that number, so a zero would reach
-/// no window and the measurement would silently record nothing.
+/// Post the request as real `NSEvent`s into this application's event queue; the number of presses posted.
 #[cfg(target_os = "macos")]
 pub(crate) fn post(spec: &HwKeySpec, window_number: i64) -> Result<u32, String> {
     use aterm_objc::{Bool, CGPoint, Id, Sel, autoreleasepool, class, sel};
@@ -419,16 +303,12 @@ pub(crate) fn post(spec: &HwKeySpec, window_number: i64) -> Result<u32, String> 
     use crate::appkit;
 
     /// `NSEvent.h` — `NSEventTypeKeyDown = 10`, `NSEventTypeKeyUp = 11`.
-    /// Values, not names: `NSEventType` is an `NS_ENUM(NSUInteger, …)` in a
-    /// header, so there is no symbol to link (see `appkit::consts`).
     const NS_EVENT_TYPE_KEY_DOWN: usize = 10;
     const NS_EVENT_TYPE_KEY_UP: usize = 11;
 
     if window_number == 0 {
         return Err("ERR hwkey: no frontmost AppKit window to post into\n".to_string());
     }
-    // A headless process has no AppKit window to post into, and asking for
-    // `NSApp` below would CREATE the application object.
     if crate::platform::Windowed::get().is_none() {
         return Err("ERR hwkey: a headless instance has no AppKit event queue\n".to_string());
     }
@@ -438,12 +318,9 @@ pub(crate) fn post(spec: &HwKeySpec, window_number: i64) -> Result<u32, String> 
     ) else {
         return Err("ERR hwkey: could not build the key strings\n".to_string());
     };
-    // `NSEventModifierFlags` is an `NSUInteger`; every flag bit used here is below 1<<24.
     let flags = spec.flags as usize;
 
-    // SAFETY: `+sharedApplication` is `-(id)`; the caller resolved a live window number on the
-    // main thread first, so `NSApp` exists and this returns the singleton rather than
-    // constructing it off-main. The runtime retains it for the process lifetime; borrowed here.
+    // SAFETY: `+sharedApplication` is `-(id)`; the caller resolved a live window number on the main thread first, so `NSApp` exists and this returns the singleton rather than constructing it off-main.
     let app = unsafe { appkit::send_id(class(c"NSApplication").as_id(), sel!(sharedApplication)) };
     if app.is_null() {
         return Err("ERR hwkey: no shared NSApplication\n".to_string());
@@ -454,21 +331,11 @@ pub(crate) fn post(spec: &HwKeySpec, window_number: i64) -> Result<u32, String> 
         if i > 0 && spec.interval_ms > 0 {
             std::thread::sleep(std::time::Duration::from_millis(spec.interval_ms));
         }
-        // The permit spans only this event pair, never the target's main-thread
-        // round trip or pacing sleep. Sheet reservation waits for the pair, then
-        // refuses every later post before attaching the secure field.
         let _posting = crate::askpass::PROMPT_INPUT
             .posting_permit()
             .map_err(|()| "ERR hwkey: a sudo password sheet is up\n".to_string())?;
-        // One pool per key: one around the loop would hold every autoreleased NSEvent of a
-        // `count=5000` run alive, and with no pool Cocoa logs and leaks each one.
         autoreleasepool(|_| {
-            // Read immediately before the post, on the seconds-since-boot clock
-            // `current_event_queue_age_ns` subtracts it from, so the age is the real time the
-            // event sat in the queue, as for a key WindowServer delivered.
-            //
-            // SAFETY: `+processInfo` is `-(id)`, an immortal singleton, and
-            // `-systemUptime` is `-(NSTimeInterval)`, a plain scalar getter.
+            // SAFETY: `+processInfo` is `-(id)`, an immortal singleton, and `-systemUptime` is `-(NSTimeInterval)`, a plain scalar getter.
             let ts = unsafe {
                 let info = appkit::send_id(class(c"NSProcessInfo").as_id(), sel!(processInfo));
                 if info.is_null() {
@@ -476,21 +343,7 @@ pub(crate) fn post(spec: &HwKeySpec, window_number: i64) -> Result<u32, String> 
                 }
                 appkit::send_f64(info, sel!(systemUptime))
             };
-            // Ten arguments plus `self`/`_cmd` (twelve of `MsgFn`'s sixteen) and a 16-byte
-            // `NSPoint` by value in the second slot, where a wrong prototype would shift every
-            // later argument by a register on both ABIs.
-            //
-            // SAFETY: the AppKit event factory with a non-nil characters pair
-            // (winit dereferences both unconditionally) and a nil graphics
-            // context, exactly as upstream winit's `replace_event` builds a
-            // synthetic key event (aterm-window no longer carries it). The
-            // returned event is AUTORELEASED into this per-key pool.
-            // `postEvent:atStart:` is documented thread-safe — it is AppKit's
-            // sanctioned way for a secondary thread to hand work to the main
-            // run loop — and posting from this thread is the POINT: it
-            // lets the event arrive, and wait, while the main thread is parked
-            // (in whatever parks it — `nextDrawable` was the motivating case and
-            // is off the shipped macOS path since `ea581e158`; see the header).
+            // SAFETY: the AppKit event factory with a non-nil characters pair (winit dereferences both unconditionally) and a nil graphics context, exactly as upstream winit's `replace_event` builds a synthetic key event (aterm-window no longer carries it).
             let built = |kind: usize| unsafe {
                 let make: unsafe extern "C-unwind" fn(
                     Id,
@@ -524,8 +377,6 @@ pub(crate) fn post(spec: &HwKeySpec, window_number: i64) -> Result<u32, String> 
                     spec.keycode,
                 )
             };
-            // `shape=press`: the event AppKit would build for a key press (see
-            // [`press_event`]); its window is the key window `sendEvent:` routes it to.
             let key_event = |kind: usize| {
                 if spec.press {
                     press_event(spec.keycode, kind == NS_EVENT_TYPE_KEY_DOWN, spec.flags)
@@ -537,15 +388,11 @@ pub(crate) fn post(spec: &HwKeySpec, window_number: i64) -> Result<u32, String> 
             if down.is_null() {
                 return Err("ERR hwkey: NSEvent construction failed\n".to_string());
             }
-            // SAFETY: `-postEvent:atStart:` is `-(void)(NSEvent *, BOOL)` on the
-            // shared application with a live event; see the thread-safety note.
+            // SAFETY: `-postEvent:atStart:` is `-(void)(NSEvent *, BOOL)` on the shared application with a live event; see the thread-safety note.
             unsafe {
                 let post: unsafe extern "C-unwind" fn(Id, Sel, Id, Bool) =
                     aterm_objc::checked_msg();
                 post(app, sel!(postEvent:atStart:), down, Bool::NO);
-                // The release too: a real key always produces one, and an unmatched press
-                // would drift AppKit's pressed-key set over a long run. The metrics arm ignores
-                // `ElementState::Released`, so it changes no measurement.
                 let up = key_event(NS_EVENT_TYPE_KEY_UP);
                 if !up.is_null() {
                     post(app, sel!(postEvent:atStart:), up, Bool::NO);
@@ -559,11 +406,6 @@ pub(crate) fn post(spec: &HwKeySpec, window_number: i64) -> Result<u32, String> 
 }
 
 /// A key-down (`down`) or key-up `NSEvent` built as a key press is: a CoreGraphics
-/// keyboard event for `keycode` with `flags` (`CGEventFlags` share the bit positions of
-/// `NSEventModifierFlags`), wrapped by `+[NSEvent eventWithCGEvent:]`, so its
-/// `characters` are the current layout's for that key and modifiers and its timestamp is
-/// the CoreGraphics event's own (the same seconds-since-boot clock). Autoreleased into the
-/// caller's pool; nil when either constructor refuses.
 #[cfg(target_os = "macos")]
 fn press_event(keycode: u16, down: bool, flags: u64) -> aterm_objc::Id {
     use std::ffi::c_void;
@@ -583,10 +425,7 @@ fn press_event(keycode: u16, down: bool, flags: u64) -> aterm_objc::Id {
     unsafe extern "C" {
         fn CFRelease(cf: *const c_void);
     }
-    // SAFETY: the CoreGraphics prototypes above are the headers'; a null source is
-    // documented. `+eventWithCGEvent:` is `@@:^{__CGEvent=}`: its result is autoreleased
-    // and holds its own reference to the CGEvent, so releasing the one
-    // `CGEventCreateKeyboardEvent` returned is the documented balance.
+    // SAFETY: the CoreGraphics prototypes above are the headers'; a null source is documented.
     unsafe {
         let cg = CGEventCreateKeyboardEvent(std::ptr::null(), keycode, down);
         if cg.is_null() {
@@ -601,8 +440,7 @@ fn press_event(keycode: u16, down: bool, flags: u64) -> aterm_objc::Id {
     }
 }
 
-/// Non-macOS: there is no NSEvent queue to post into, and falling back to the socket path would
-/// hide the very stall this verb measures, so it refuses.
+/// Non-macOS: there is no NSEvent queue to post into, and falling back to the socket path would hide the very stall this verb measures, so it refuses.
 #[cfg(not(target_os = "macos"))]
 pub(crate) fn post(_spec: &HwKeySpec, _window_number: i64) -> Result<u32, String> {
     Err("ERR hwkey: hardware-path injection is implemented on macOS only\n".to_string())
@@ -613,7 +451,6 @@ mod tests {
     use super::{FLAG_CONTROL, FLAG_FUNCTION, FLAG_SHIFT, MAX_COUNT, parse_hwkey};
 
     /// A bare letter is the unshifted US-QWERTY key for it, with no modifiers and
-    /// both character strings equal — the shape AppKit reports for a plain press.
     #[test]
     fn a_plain_letter_is_its_unshifted_physical_key() {
         let s = parse_hwkey("x").expect("x parses");
@@ -625,10 +462,6 @@ mod tests {
     }
 
     /// SHIFT is DERIVED from the character, not demanded from the caller: `hwkey X`
-    /// must be the same physical key as `hwkey x` plus the shift flag, because that
-    /// is what the keyboard does. Getting this wrong would post keycode-for-`x`
-    /// with no shift and quietly measure the wrong keystroke. A shifted
-    /// punctuation character folds to its unshifted key too.
     #[test]
     fn an_uppercase_letter_shifts_the_same_physical_key() {
         for (plain, shifted) in [("x", "X"), ("1", "!")] {
@@ -641,8 +474,6 @@ mod tests {
     }
 
     /// Control chords carry the C0 byte in `characters` (what AppKit delivers) and
-    /// the bare letter in `charactersIgnoringModifiers` (what winit reads for the
-    /// logical key). Inline `ctrl+` and trailing `mods=ctrl` must agree.
     #[test]
     fn a_control_chord_carries_the_c0_byte_and_the_bare_letter() {
         let a = parse_hwkey("ctrl+u").unwrap();
@@ -654,7 +485,6 @@ mod tests {
     }
 
     /// Named keys resolve to their AppKit keycode and private-use character, and the ones AppKit
-    /// marks as function keys carry that flag.
     #[test]
     fn named_keys_match_appkit_codes_and_function_flag() {
         let enter = parse_hwkey("enter").unwrap();
@@ -679,7 +509,6 @@ mod tests {
     }
 
     /// winit unwraps `charactersIgnoringModifiers` with `.expect(...)`, so an empty string there
-    /// would panic on dispatch: no accepted spelling produces one.
     #[test]
     fn no_accepted_key_yields_empty_character_strings() {
         for spelling in [
@@ -717,7 +546,6 @@ mod tests {
     }
 
     /// Pacing tokens are additive and bounded; out-of-range or malformed values are refused,
-    /// never clamped or defaulted.
     #[test]
     fn pacing_tokens_are_additive_and_bounded() {
         let s = parse_hwkey("x count=200 interval=25").unwrap();
@@ -733,7 +561,6 @@ mod tests {
     }
 
     /// `shape=press` asks for the key-press shape and changes nothing else about the
-    /// key; the default is the built shape, and an unknown shape is refused.
     #[test]
     fn the_press_shape_is_asked_for_by_name_and_keeps_the_key() {
         let built = parse_hwkey("b mods=alt").unwrap();
@@ -753,7 +580,6 @@ mod tests {
         assert!(parse_hwkey("   ").is_err());
         assert!(parse_hwkey("notakey").is_err());
         assert!(parse_hwkey("ab").is_err());
-        // A modifier prefix with nothing after it is not a key.
         assert!(parse_hwkey("ctrl+").is_err());
     }
 }

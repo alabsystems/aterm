@@ -1,60 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE WINDOW'S READS OF A FOREVER RUN (
-//! `docs/DESIGN-harness-autopilot-2026-10-15.md` §12.5.4): what a person at the
-//! window would see of each chain, read at every look the run takes, and the
-//! wants each scenario holds it to beside its records ([`super::judge`]).
-//!
-//! The run lays its windows out before the chains' tabs ([`lay_windows`]): a
-//! window of its own for Settings ▸ Harness (`invoke NewWindow`, the window
-//! waited for in `inspect app/v1 tabs`, then `open app settings /harness`
-//! there; the same list names the page's view), then the chains' own
-//! (`invoke NewWindow` again, waited for), where every tab spawns,
-//! `cruise-n` first (the page lists its rows on its first screen). A headless
-//! instance's frontmost window is the newest, so the chains' window is the one
-//! `person look` and the `toolbar-tabs` line read. Once every tab is open, one
-//! is brought in front with `tab` ([`front_of`]: `cruise-n`, else the Off
-//! control, never a tab whose end END looks at): the one a capture draws.
-//! Each tab is titled with its chain's name (`meta set title`): the
-//! label the strip, the menu and the page name it by. At each look ([`glance`]):
-//!
-//! * `@<front> image forever-front.png`: the front tab captured, so its chip's
-//!   `drawn=` cells are the frame's (a headless window composes none until a
-//!   capture);
-//! * `chrome`: each tab's `autopilot` line ([`Window::chip`]), its entry of the
-//!   front window's `toolbar-tabs` ([`Window::strip`]: its `states`, `done` its
-//!   `•`) and its tooltip's who-drives line ([`Window::hover`]: `driven by aterm
-//!   (land: not landed yet, …)`), the `statusmenu` rows naming it ([`Window::menu`], by section, each
-//!   section's header with it), and the desk's `This Mac` and `presence` lines
-//!   ([`Desk`]);
-//! * `inspect app/v1 view <page> text`: its Settings ▸ Harness rows
-//!   ([`Window::page`]: its head, state and today rows), and the desk's
-//!   STATUS rows (`Sessions:`, the today line) and, where it is on the
-//!   page's screen, SESSIONS' Every session row ([`Desk`]);
-//! * `status`'s `end= end_seen= end_cheered=`, `needs_n=` and Land's hold's
-//!   `land_held= land_nudges= land_since=` ride the record's status words
-//!   ([`super::status_words`]; the hold's wants are [`hold`]'s).
-//!
-//! Each read is kept with its time where it changed, ages masked (`#`), so the
-//! report is a list of changes. After every chain is over, THE END
-//! ([`end_steps`]): a 20 s window with no read, clear of every tab's next act
-//! (its ends and pauses standing, the page open: [`Idle`]); This Mac and the
-//! page's counts at rest ([`Window::rest`]); then each chain's tab brought in
-//! front once with `person look off` (`tab <index>`, a capture, `chrome`:
-//! [`Window::front`]), which sees no end; then the look: the front tab (no
-//! end) brought back, `person look <the chains' window>` there (land-j's and
-//! land-k's ends still stand: `step=look-on`), `tab <land-j>` under the look
-//! (L16's end seen by the tab switch: `step=look`; land-k's still stands:
-//! `step=still`), `person menubar press` on `land-k`'s Done for you row
-//! (L17's: the press brings it in front and the look sees it:
-//! `step=press`), then `person look off` and the front tab back
-//! ([`Window::looked`]).
-//!
-//! The wants ([`WANTS`], a table a later slice extends) are read by token, row
-//! and field, never by prose; each is a named skip under `--no-surfaces`
-//! ([`Window::read`] false). Gemini CLI draws no chip: every line of its wants
-//! `face=- drawn=- why=no-footer`.
+//! Window surface reads and scenario assertions for `lab forever` ([`super::judge`]).
 
 use std::time::Duration;
 
@@ -67,12 +14,10 @@ use crate::stop;
 use crate::util::{now_ms, one_line};
 use crate::{Fail, wait_until};
 
-/// aterm-gui's `END_WORK_MS` (`harness_task.rs`): the least busy time since
-/// its task opened at which a landing marks the tab's end (its `•`, its Done
-/// for you row, `status end=`). Under it a landing ends nothing (L5).
+/// Minimum busy duration (`30s`) before a task end can land.
 pub const END_WORK_FLOOR_MS: i64 = 30_000;
 
-/// THE END's idle window: no read, no act due.
+/// Duration of the end-of-run idle measurement window.
 pub const IDLE_MS: i64 = 20_000;
 
 /// How long every tab's journal stood still before the idle window opens.
@@ -88,72 +33,44 @@ const IDLE_SEARCH_MS: i64 = 8 * 60_000;
 const IDLE_TRIES: usize = 3;
 
 /// The front tab's capture: one file, overwritten (a bare name is confined to
-/// the instance's images directory).
 const FRONT_IMAGE: &str = "forever-front.png";
 
 /// The hang detector of a look's or a press's effect (a wait for something
-/// that must happen).
 const STEP_WAIT: Duration = Duration::from_secs(60);
 
-/// What the window showed of one tab, each read with its time where it
-/// changed ([`Window::note`]).
+/// Recorded window surface observations for a single tab ([`Window::note`]).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Window {
-    /// The window was read: false under `--no-surfaces` (its wants are named
-    /// skips) and in a fixture that reads none.
+    /// Whether window surfaces were read (`false` under `--no-surfaces`).
     pub read: bool,
-    /// The tab's label on every surface: its title, the chain's name.
+    /// Tab label across surfaces (the chain's name).
     pub label: String,
-    /// The tab is the chains' window's front tab while the chains run: its
-    /// chip is drawn at each look (a capture), every other tab's is not.
+    /// Whether this tab is the front tab of the chains window.
     pub front_tab: bool,
-    /// Its `chrome` `autopilot` line after `sid=`: `window=<id>
-    /// program=<name> face=<word|-> drawn="<cells>"|drawn=- why=<word>
-    /// spoken=…`; `-` where chrome printed none for it.
+    /// Observed `chrome` `autopilot` lines after `sid=`.
     pub chip: Vec<(i64, String)>,
-    /// Its entry of the front window's `toolbar-tabs`: `index=<i>
-    /// selected=<0|1> states=<a,b|->`; `-` where the strip holds no tab of
-    /// its label.
+    /// Observed `toolbar-tabs` strip entries (`index=<i> selected=<0|1> states=<a,b|->`).
     pub strip: Vec<(i64, String)>,
-    /// Its tab's hover, who drives it: the `driven by aterm (…)` line of its
-    /// `toolbar-tabs` tooltip as the strip was last stamped with it
-    /// ([`StripTab::tip`]; §12.4.1; why a landing holds there,
-    /// `driven by aterm (land: not landed yet, …)`); `-` where the tooltip
-    /// names no driver, or the strip holds no tab of its label.
+    /// Observed `driven by aterm (…)` hover tooltip lines.
     pub hover: Vec<(i64, String)>,
-    /// Actual tooltip reads, including unchanged values. A change is also a read.
+    /// Timestamps of all tooltip reads, including unchanged values.
     pub hover_reads: Vec<i64>,
-    /// The `statusmenu` rows naming it, one a line, each `<section>|<label>`
-    /// (`needs`, `done`, `here`, `look` or `-`), ages masked, and before them
-    /// the header of each section one of them is in,
-    /// `<section>-head|<label> rows=<n>` (`needs-head|Needs you (2) rows=2`:
-    /// its rows the menu lists under it, every tab's); empty for none.
+    /// Observed `statusmenu` rows naming this tab (`<section>|<label>`).
     pub menu: Vec<(i64, String)>,
-    /// Its Settings ▸ Harness rows, one a line: `head=…`, `state=…`,
-    /// `today=…`; `-` where the page lists no session of its label.
+    /// Observed Settings ▸ Harness rows (`head=…`, `state=…`, `today=…`).
     pub page: Vec<(i64, String)>,
-    /// Actual Harness-page reads, including a row read off screen or unchanged.
+    /// Timestamps of all Harness-page reads.
     pub page_reads: Vec<i64>,
-    /// THE END's steps on it (L16, L17): `step=<sweep|look-on|look|still|press>
-    /// end=… end_seen=… selected=<0|1|-> states=… done_row=<yes|no>
-    /// [pressed=…]` — `sweep` brought in front with no look, `look-on` the
-    /// look on another tab, `look` (land-j) brought in front under it,
-    /// `still` (land-k) behind land-j under it, `press` (land-k) its row
-    /// pressed.
+    /// End-of-run look steps recorded for this tab (L16, L17).
     pub looked: Vec<(i64, String)>,
-    /// THE END's front sweep: its `autopilot` line read in front, after a
-    /// capture (`-`: none printed).
+    /// Front-sweep `autopilot` line read after capture.
     pub front: Option<(i64, String)>,
-    /// THE END at rest (L7, [`Rest`]): `here="<This Mac line>"
-    /// landed_tabs=<n> landing_tabs=<n> landings=<n> today="<the page's
-    /// today line>" every="<the page's Every session row>"` (`-` for a row
-    /// not read).
+    /// End-of-run resting summary line (L7, [`Rest`]).
     pub rest: Option<String>,
 }
 
 impl Window {
-    /// The window's reads of tab `sid` in glance `g` added where they changed:
-    /// each change, said (`chip`, `strip`, `menu`, `page`).
+    /// Appends changed surface observations for `sid` from `g`, returning each change.
     pub fn note(&mut self, g: &Glance, sid: &str) -> Vec<(&'static str, String)> {
         self.read = true;
         let label = self.label.clone();
@@ -200,37 +117,34 @@ fn put(list: &mut Vec<(i64, String)>, t: i64, v: String) -> bool {
     true
 }
 
-/// The desk's reads, every tab's at once: the run's windows, the `This Mac`
-/// and `presence` lines and the page's STATUS sessions row where they
-/// changed, and THE END's idle window.
+/// Whole-desk surface observations across all tabs and windows.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Desk {
-    /// The Settings window's id and the page's view id (`inspect app/v1 tabs`).
+    /// Settings window ID and Harness page view ID (`inspect app/v1 tabs`).
     pub page_window: String,
     pub page_view: String,
-    /// The chains' window's id (`ls`'s `window=`).
+    /// Chains window ID (`ls` `window=`).
     pub chains_window: String,
-    /// The front tab's session, captured at each look.
+    /// Session ID of the chains window's front tab.
     pub front_sid: String,
-    /// The menu's `This Mac — …` row.
+    /// Observed `This Mac — …` menu rows.
     pub here: Vec<(i64, String)>,
-    /// `presence rim=… pressing=… pill="…"`, ages masked.
+    /// Observed `presence` lines with ages masked.
     pub presence: Vec<(i64, String)>,
-    /// The page's `Sessions: …` row.
+    /// Observed `Sessions: …` page rows.
     pub sessions: Vec<(i64, String)>,
-    /// The page's today line under STATUS ([`today_of`]; 4c: landings first).
+    /// Observed today summary lines under STATUS ([`today_of`]).
     pub today: Vec<(i64, String)>,
-    /// SESSIONS' Every session row ([`every_of`]): `-` while it is past the
-    /// page's screen (it stands after every session's row).
+    /// Observed `Every session` rows under SESSIONS ([`every_of`]).
     pub every: Vec<(i64, String)>,
-    /// THE END's idle window (`None`: never reached).
+    /// End-of-run idle window observation, if reached.
     pub idle: Option<Idle>,
-    /// What THE END did, in order, as it said it.
+    /// Ordered end-of-run step log.
     pub steps: Vec<(i64, String)>,
 }
 
 impl Desk {
-    /// The desk's reads of glance `g` added where they changed: each change, said.
+    /// Appends changed desk observations from `g`, returning each change.
     pub fn note(&mut self, g: &Glance) -> Vec<(&'static str, String)> {
         let here = g
             .menu
@@ -265,51 +179,43 @@ impl Desk {
     }
 }
 
-/// THE END's idle window as read: when it opened, how long it held, the
-/// metrics after it, and why a better one was not had.
+/// End-of-run idle window metrics and activity log.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Idle {
     pub from: i64,
     pub ms: i64,
-    /// `metrics` after it: `timer_wakes`, `event_wakes`,
-    /// `deadline_arms_by_owner`, `deadline_fires_by_owner`,
-    /// `wakes_by_variant`, `deadline_owner` (as printed).
+    /// `metrics` snapshot captured after the idle window.
     pub metrics: String,
-    /// `metrics percentiles` after it: `n_render`, `render_p*`, `n_input`.
+    /// `metrics percentiles` snapshot captured after the idle window.
     pub percentiles: String,
-    /// What moved in it beside the window: a journal line or an act in some
-    /// tab (`<chain> +t <line>`); empty for none. A line the same as the
-    /// tab's line before it is no move ([`news`]): it is in `relogged`.
+    /// Tab journal lines or acts recorded during the idle window.
     pub moved: Vec<String>,
-    /// The journal lines written again in it, each the same as its tab's line
-    /// before it (`<chain> +t <line>`): the loop saying the same decision again.
+    /// Duplicate journal lines rewritten during the idle window.
     pub relogged: Vec<String>,
-    /// The tabs whose ends stood unseen in it, and whose holds stood: a pause
-    /// (`WAITING … until=` still ahead, [`due_and_quiet`]). §12.3's Land hold
-    /// is on `status` (`land_held=`, [`hold`]); 5d reads it here.
+    /// Tabs with unseen ends or active holds standing during the idle window.
     pub ends: Vec<String>,
     pub holds: Vec<String>,
-    /// The page was open in it (its view read after).
+    /// Whether the Harness page remained open during the idle window.
     pub page_open: bool,
 }
 
-/// One look's reads of the window, every tab's from the same calls.
+/// Single snapshot of `chrome` and Harness page text across all tabs.
 #[derive(Clone, Debug, Default)]
 pub struct Glance {
     pub t: i64,
     pub chrome: String,
     pub strip: Vec<StripTab>,
     pub menu: Vec<MenuRow>,
-    /// The page's `text key=… label=…` rows.
+    /// Parsed `text key=… label=…` rows from the Harness page.
     pub page: Vec<(String, String)>,
-    /// A complete tooltip table, rather than another or partial chrome read.
+    /// Whether `chrome` included a complete tooltip table.
     pub hover_read: bool,
-    /// The Harness page was read, rather than an omitted or unrelated page.
+    /// Whether the Harness page text was read.
     pub page_read: bool,
 }
 
 impl Glance {
-    /// A glance of `chrome`'s and the page's text at `t`.
+    /// Parses a [`Glance`] at timestamp `t` from `chrome` and `page` text.
     #[must_use]
     pub fn of(t: i64, chrome: &str, page: &str) -> Glance {
         let strip = strip_tabs(chrome);
@@ -337,23 +243,19 @@ impl Glance {
     }
 }
 
-/// One tab of the front window's `toolbar-tabs` line.
+/// Parsed tab entry from the front window's `toolbar-tabs` line.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct StripTab {
     pub index: usize,
     pub label: String,
     pub selected: bool,
     pub states: Vec<String>,
-    /// Its tooltip, the hover a person reads (`None`: none): as the strip
-    /// was last stamped with it (`pushed_tooltips=`, which a debug build's
-    /// stripless line prints), else as composed at the read (`tooltips=`).
-    /// Composed at the read, a hover whose push was never made again reads
-    /// fresh; as pushed, it reads stale, as the person would see it.
+    /// Tab tooltip string, if present.
     pub tip: Option<String>,
 }
 
 impl StripTab {
-    /// `index=<i> selected=<0|1> states=<a,b|->`.
+    /// Formats `index=<i> selected=<0|1> states=<a,b|->`.
     #[must_use]
     pub fn words(&self) -> String {
         format!(
@@ -368,8 +270,7 @@ impl StripTab {
         )
     }
 
-    /// Who drives it, as its hover says: the tooltip's `driven by aterm
-    /// (…)` line.
+    /// Extracts the `driven by aterm (…)` line from the tab's tooltip.
     #[must_use]
     pub fn driven(&self) -> Option<String> {
         self.tip.as_deref().and_then(|tip| {
@@ -380,12 +281,7 @@ impl StripTab {
     }
 }
 
-/// One `statusmenu` row: its section (the Info header above it: `needs`,
-/// `done`, `here`, `look`; `-` past a separator), its label, its `at=` and
-/// its `indent=` (how many levels in it is drawn within its own menu, 0
-/// where the line names none: a harness's further need, one level in under
-/// its session's row; never a submenu's row, which `chrome` leads
-/// with two spaces and this reader passes over).
+/// Parsed `statusmenu` row with its section header, label, enabled flag, and tip.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MenuRow {
     pub section: String,
@@ -394,8 +290,7 @@ pub struct MenuRow {
     pub indent: u8,
 }
 
-/// The value of a `key="…"` among `line`'s words, its escapes read back
-/// (`\"`, `\\`, `\n`, `\u{…}`: the quoting `chrome` and `inspect` print).
+/// Extracts and unescapes a `key="…"` value from `line`.
 #[must_use]
 pub fn quoted(line: &str, key: &str) -> Option<String> {
     let pat = format!("{key}=\"");
@@ -433,7 +328,6 @@ fn unquote(s: &str) -> (String, &str) {
                         {
                             out.push(ch);
                         }
-                        // `{`, the hex digits, `}`: one byte a character
                         for _ in 0..end + 2 {
                             it.next();
                         }
@@ -464,7 +358,6 @@ fn strings(s: &str) -> Option<(Vec<String>, &str)> {
 }
 
 /// A printed list of optional strings (`[None, Some("a")]`) at the head of
-/// `s`.
 fn options(s: &str) -> Option<Vec<Option<String>>> {
     let mut rest = s.strip_prefix('[')?;
     let mut v = Vec::new();
@@ -506,10 +399,7 @@ fn lists(s: &str) -> Option<Vec<Vec<String>>> {
     }
 }
 
-/// The front window's strip from `chrome`'s `toolbar-tabs count=… selected=<i>
-/// labels=[…] icons=[…] states=[[…], …] tooltips=[None, Some("…"), …]
-/// [pushed_tooltips=[…]]` line: each tab's tip the pushed one where the line
-/// prints them ([`StripTab::tip`]).
+/// Parses the front window's tab strip entries from `chrome`.
 #[must_use]
 pub fn strip_tabs(chrome: &str) -> Vec<StripTab> {
     let Some(line) = chrome.lines().find(|l| l.starts_with("toolbar-tabs ")) else {
@@ -549,8 +439,7 @@ fn section_of(label: &str) -> Option<&'static str> {
     .map(|(_, s)| s)
 }
 
-/// `chrome`'s `statusmenu "<label>" enabled=… [checked=…] [tip="…"] at=<path>`
-/// rows, each under the Info row that heads its section.
+/// Parses `statusmenu` rows from `chrome` under their section headers.
 #[must_use]
 pub fn menu_rows(chrome: &str) -> Vec<MenuRow> {
     let mut section = "-";
@@ -584,8 +473,7 @@ pub fn menu_rows(chrome: &str) -> Vec<MenuRow> {
     out
 }
 
-/// Whether a menu row names the tab labelled `tab`: its mark, a space, the
-/// label, then ` — ` or ` (worker of `.
+/// Whether menu row `row` names the tab labelled `tab`.
 #[must_use]
 pub fn row_names(row: &str, tab: &str) -> bool {
     let mut cs = row.chars();
@@ -601,13 +489,7 @@ fn is_head(r: &MenuRow) -> bool {
     section_of(&r.label) == Some(r.section.as_str())
 }
 
-/// The menu rows naming the tab labelled `tab`, as [`Window::menu`] keeps
-/// them: the header of each section a want counts under (Needs you, Done
-/// for you) with the rows the menu lists under it (`<section>-head|<label>
-/// rows=<n>`: the sessions' own rows, never a row one level in), then each
-/// row naming it (`<section>|<label>`), each followed by the rows one level
-/// in under it, its further needs (`<section>|<label> indent=<n>`),
-/// ages masked.
+/// Formats all menu rows in `menu` naming `tab` for [`Window::menu`].
 #[must_use]
 pub fn menu_of(menu: &[MenuRow], tab: &str) -> String {
     let named: Vec<(&MenuRow, &[MenuRow])> = menu
@@ -652,8 +534,7 @@ pub fn menu_of(menu: &[MenuRow], tab: &str) -> String {
     lines.join("\n")
 }
 
-/// `s` with every age word (`6s`, `3m`, `2h`, `1d`) read as `#`, so a row
-/// that only aged is no change.
+/// Replaces relative age tokens (`6s`, `3m`, `2h`, `1d`) in `s` with `#`.
 #[must_use]
 pub fn masked(s: &str) -> String {
     s.split(' ')
@@ -669,7 +550,7 @@ pub fn masked(s: &str) -> String {
         .join(" ")
 }
 
-/// `inspect app/v1 view <id> text`'s `text key="…" role=… label="…"` rows.
+/// Parses `(key, label)` pairs from `inspect app/v1 view <id> text` output.
 #[must_use]
 pub fn page_rows(text: &str) -> Vec<(String, String)> {
     text.lines()
@@ -683,14 +564,7 @@ pub fn page_rows(text: &str) -> Vec<(String, String)> {
         .collect()
 }
 
-/// The page's rows of the session labelled `tab`: `head=<its row>`, then its
-/// `state=` and `today=` rows where the page prints them. `None` where the
-/// row is not on the page's screen, and where only its top is: the text
-/// lists only what the page's screen shows, so a row whose head is drawn
-/// with no state row and nothing of the page after its own rows is cut off
-/// by the screen's bottom edge, and its state line is unread, never absent
-/// (r5's Gemini CLI L2: `land-b`'s head at the edge once the rows above it
-/// grew, `land-c` below it off the screen).
+/// Formats the Harness page rows (`head=`, `state=`, `today=`) for `tab`.
 #[must_use]
 pub fn page_of(rows: &[(String, String)], tab: &str) -> Option<String> {
     let head = format!("{tab}: ");
@@ -715,8 +589,7 @@ pub fn page_of(rows: &[(String, String)], tab: &str) -> Option<String> {
     (stated || more_below).then(|| out.join("\n"))
 }
 
-/// The page's today line (STATUS, §10.3.1; 4c puts landings first): its
-/// block's label, both lines (`5 landed today · 3 kept going · …`).
+/// Extracts the STATUS today summary line from Harness page `rows`.
 #[must_use]
 pub fn today_of(rows: &[(String, String)]) -> Option<String> {
     rows.iter()
@@ -724,8 +597,7 @@ pub fn today_of(rows: &[(String, String)]) -> Option<String> {
         .map(|(_, l)| l.clone())
 }
 
-/// SESSIONS' Every session row (`Every session, 16 sessions: 4 cruising,
-/// 6 landing, 5 landed, 1 off`; 4c splits Land's by the chips' faces).
+/// Extracts the SESSIONS `Every session` summary row from Harness page `rows`.
 #[must_use]
 pub fn every_of(rows: &[(String, String)]) -> Option<String> {
     rows.iter()
@@ -737,13 +609,9 @@ pub fn every_of(rows: &[(String, String)]) -> Option<String> {
 const EVERY_KEY: &str = "harness/session/all";
 
 /// Its Timer's disclosure (key and action alike): pressed open, the page
-/// brings the row on its screen first, as a hand reaching it would; pressed
-/// again, closed. It writes no session.
 const EVERY_TIMER: &str = "harness/session/all/timer";
 
-/// The count `word` has in a page line of `<n> <word>` parts (`5 landed`,
-/// `6 landing`, `5 landed today`), each part ended by `,`, `:`, `·` or the
-/// line; 0 where the line says none (a zero part is never said).
+/// Extracts the integer count preceding `word` in a summary `line`.
 #[must_use]
 pub fn count_in(line: &str, word: &str) -> usize {
     line.split([',', ':', '\u{b7}'])
@@ -755,7 +623,7 @@ pub fn count_in(line: &str, word: &str) -> usize {
         .unwrap_or(0)
 }
 
-/// Tab `sid`'s `autopilot` line in `chrome`, after its `sid=`.
+/// Extracts tab `sid`'s `autopilot` line from `chrome` after `sid=`.
 #[must_use]
 pub fn chip_of(chrome: &str, sid: &str) -> Option<String> {
     let head = format!("autopilot sid={sid} ");
@@ -765,8 +633,7 @@ pub fn chip_of(chrome: &str, sid: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-/// An `autopilot` line read: its face word (`-` for none), its drawn cells
-/// (`None` for `drawn=-`), its `why=`.
+/// Parsed fields of an `autopilot` chrome line.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Chip {
     pub face: String,
@@ -774,7 +641,7 @@ pub struct Chip {
     pub why: Option<String>,
 }
 
-/// [`Chip`] of an `autopilot` line (or [`Window::chip`]'s rest of one).
+/// Parses a [`Chip`] from an `autopilot` line.
 #[must_use]
 pub fn chip(line: &str) -> Chip {
     Chip {
@@ -784,8 +651,7 @@ pub fn chip(line: &str) -> Chip {
     }
 }
 
-/// The cells a face is drawn with at full width (§12.5.3's face table):
-/// `cruise-until`'s is the head its clock follows.
+/// Full-width drawn cell text expected for `face`.
 #[must_use]
 pub fn face_cells(face: &str) -> Option<&'static str> {
     Some(match face {
@@ -800,7 +666,7 @@ pub fn face_cells(face: &str) -> Option<&'static str> {
     })
 }
 
-/// Whether the drawn cells are the face's.
+/// Whether `c`'s drawn cells match its face.
 #[must_use]
 pub fn drawn_is_face(c: &Chip) -> bool {
     match (face_cells(&c.face), &c.drawn) {
@@ -811,7 +677,6 @@ pub fn drawn_is_face(c: &Chip) -> bool {
 }
 
 /// Whether harness `program` draws no chip (its line `face=- drawn=-
-/// why=no-footer`): Gemini CLI.
 fn footless(program: &str) -> bool {
     program == "gemini"
 }
@@ -822,7 +687,6 @@ fn no_footer(c: &Chip) -> bool {
 }
 
 /// The entries of `list` standing in `[from, until)`: the last one at or
-/// before `from` (what stood when it opened), then each one inside.
 fn standing(list: &[(i64, String)], from: i64, until: i64) -> Vec<&(i64, String)> {
     let first = list.iter().rposition(|(t, _)| *t <= from);
     list.iter()
@@ -832,8 +696,7 @@ fn standing(list: &[(i64, String)], from: i64, until: i64) -> Vec<&(i64, String)
         .collect()
 }
 
-/// Values actually observed in `(from, until)`. Unchanged reads resolve the
-/// value standing then; a value-change timestamp is itself an observation.
+/// Returns values from `series` observed within `(from, until)` using `reads` timestamps.
 pub(super) fn observed<'a>(
     list: &'a [(i64, String)],
     reads: &[i64],
@@ -884,7 +747,7 @@ fn page_field<'a>(page: &'a str, field: &str) -> Option<&'a str> {
         .find_map(|l| l.strip_prefix(field)?.strip_prefix('='))
 }
 
-/// What a want is judged with.
+/// Context passed to a window surface [`Want`] judge.
 #[derive(Clone, Copy, Debug)]
 pub struct Ctx<'a> {
     pub chain: Chain,
@@ -892,19 +755,15 @@ pub struct Ctx<'a> {
     pub t0: i64,
 }
 
-/// Where a want is judged: under one scenario, or under every chain's first
-/// scenario of those the chain names ([`Want::of`]).
+/// Scope where a [`Want`] is evaluated.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Under {
     Scenario(Scenario),
-    /// Every chain of the measured pass ([`Chain::ALL`]) but these.
+    /// Evaluated on the first scenario of every chain in [`Chain::ALL`] except the listed ones.
     First(&'static [Chain]),
 }
 
-/// ONE WANT ON THE WINDOW: where it is judged, its name and its judge. Each
-/// reads what the window showed ([`Window`]) or what `status` printed of it
-/// (`end=`, `needs_n=`, §12.5.2), and each is a named skip where the window
-/// was not read (`--no-surfaces`).
+/// Window surface assertion bound to an [`Under`] scope and judge function.
 #[derive(Clone, Copy)]
 pub struct Want {
     pub under: Under,
@@ -926,15 +785,10 @@ impl Want {
     }
 }
 
-/// The chains whose ends are scenarios of their own (L16, L17).
+/// Chains whose task ends have dedicated end-of-run scenarios (L16, L17).
 pub const ENDING: [Chain; 2] = [Chain::LandJ, Chain::LandK];
 
-/// The chains the chains' window's front tab is chosen from, the first the
-/// run holds ([`front_of`]): `cruise-n`, whose N1–N4 judge its drawn cells,
-/// then the Off control, which every pass mode holds, then the other Cruise
-/// chains. None of them lands, so none has a `•` or an end the front tab
-/// would hide (`App::stamp_presence_chips` never marks the front tab), and
-/// END's look begins on it, seeing no end.
+/// Priority order of chains for selecting the chains window's front tab ([`front_of`]).
 pub const FRONT: [Chain; 4] = [
     Chain::CruiseN,
     Chain::Off,
@@ -942,10 +796,7 @@ pub const FRONT: [Chain; 4] = [
     Chain::InstantCruise,
 ];
 
-/// The index in `chains` of the chains' window's front tab: the first of
-/// [`FRONT`] the run holds; `None` where it holds none (`--chains`
-/// brings the Off control into a run that reads the window and holds none,
-/// so only a run of no pass chain gets `None`).
+/// Index in `chains` of the chains window's front tab ([`FRONT`]).
 #[must_use]
 pub fn front_of(chains: &[Chain]) -> Option<usize> {
     FRONT
@@ -953,18 +804,13 @@ pub fn front_of(chains: &[Chain]) -> Option<usize> {
         .find_map(|f| chains.iter().position(|c| c == f))
 }
 
-/// Whether a chain's loop stands paused at END (a `WAITING` back-off after
-/// its last act): the pass's chains that neither land nor end (a Cruise
-/// chain, a Land chain held by its repository or its need), never the Off
-/// control. END wants a pause standing only in a run that holds one.
+/// Whether chain `c` stands paused in a `WAITING` back-off at the end of the run.
 #[must_use]
 pub fn pauses(c: Chain) -> bool {
     Chain::ALL.contains(&c) && !c.lands() && !ENDING.contains(&c) && c.autopilot() != "off"
 }
 
-/// Why a run of `chains` reads no window (`None`: it reads it):
-/// `--no-surfaces`, or no chain of the run with a window want (the cover,
-/// cap and wall chains: the wants are the main pass's, [`Chain::ALL`]).
+/// Reason a run of `chains` skips reading window surfaces, or `None` if it reads them.
 #[must_use]
 pub fn unread_why(surfaces_on: bool, chains: &[Chain]) -> Option<&'static str> {
     if !surfaces_on {
@@ -976,8 +822,7 @@ pub fn unread_why(surfaces_on: bool, chains: &[Chain]) -> Option<&'static str> {
     }
 }
 
-/// Whether END runs over a run of `chains`: only with both [`ENDING`]
-/// chains, whose ends it wants standing unseen, then seen.
+/// Whether the end-of-run surface sequence runs for `chains` (requires both [`ENDING`] chains).
 #[must_use]
 pub fn end_runs(chains: &[Chain]) -> bool {
     ENDING.iter().all(|c| chains.contains(c))
@@ -986,14 +831,7 @@ pub fn end_runs(chains: &[Chain]) -> bool {
 /// The chains a need is scripted for (L3, L6, N1–N4).
 const NEEDING: [Chain; 3] = [Chain::LandA, Chain::LandD, Chain::CruiseN];
 
-/// THE WINDOW'S WANTS (§12.5.4's table, the rows main gives, and §12.3.7's:
-/// why Land still holds, [`hold`]): each judged beside its
-/// scenario's records ([`with_window`]). The `indent=1` rows of a need's
-/// others (N1–N4) are 2d's, here ([`n_further`]). A later slice (5d) adds
-/// its rows here: END's holds read as Land's (`land_held=`, read as pauses
-/// until then: [`Idle::holds`]), the page's Landed row (4c's, in WHAT THE
-/// HARNESS DID, past the page's screen and no control's to bring on it),
-/// the title's words.
+/// All window surface assertions evaluated across scenarios.
 pub const WANTS: &[Want] = &[
     Want {
         under: Under::First(&[]),
@@ -1192,10 +1030,7 @@ pub const WANTS: &[Want] = &[
     },
 ];
 
-/// Scenario `s`'s verdict `v` from its records, with every want of
-/// [`WANTS`] under it composed in: FAIL over UNOBSERVED over PASS, each want
-/// named in the words; where the window was not read ([`Window::read`]),
-/// each a named skip.
+/// Folds applicable [`WANTS`] assertions into scenario `s`'s record verdict `v`.
 #[must_use]
 pub fn with_window(s: Scenario, seen: &Seen, cx: &Ctx<'_>, v: Verdict) -> Verdict {
     let mut skipped = Vec::new();
@@ -1233,8 +1068,6 @@ fn compose(a: Verdict, name: &str, b: Verdict) -> Verdict {
 }
 
 /// The faces a chain's chip may wear at `t`: its Autopilot's, a landing
-/// Land's `landed` from its DONE on (either within 10 s of it: the face moves
-/// at the next read), a person's exchange's `theirs` (L13).
 fn faces_at(chain: Chain, done: Option<i64>, t: i64) -> Vec<&'static str> {
     match chain.autopilot() {
         "cruise" => vec!["cruise"],
@@ -1254,10 +1087,6 @@ fn faces_at(chain: Chain, done: Option<i64>, t: i64) -> Vec<&'static str> {
 }
 
 /// EVERY CHIP FACE ITS AUTOPILOT'S (every chain): each `autopilot` line read
-/// since its first prompt wears a face its Autopilot allows ([`faces_at`]),
-/// and a tab behind the front one draws nothing (`drawn=- why=not-drawn`,
-/// never a stale face); Gemini CLI's every line `face=- drawn=-
-/// why=no-footer`.
 fn chip_faces(seen: &Seen, cx: &Ctx<'_>) -> Verdict {
     let w = &seen.window;
     let lines: Vec<&(i64, String)> = w
@@ -1314,7 +1143,6 @@ fn chip_faces(seen: &Seen, cx: &Ctx<'_>) -> Verdict {
 }
 
 /// NEVER AN END (every chain but L16's and L17's, and L5 under the floor):
-/// `status end=-` at every read; unread (`?`) throughout is unobserved.
 fn never_ended(seen: &Seen, cx: &Ctx<'_>) -> Verdict {
     let ends: Vec<&(i64, String)> = seen
         .status
@@ -1341,9 +1169,6 @@ fn never_ended(seen: &Seen, cx: &Ctx<'_>) -> Verdict {
 }
 
 /// NEVER A ROW (every chain but L16's and L17's, and L5 under the floor): no
-/// Done for you row and no `done` in its tab's states — but a worker's own
-/// task record's (L7: its row is that record's) — and no need row where its
-/// replies name none.
 fn never_a_row(seen: &Seen, cx: &Ctx<'_>) -> Verdict {
     let w = &seen.window;
     let mut bad = Vec::new();
@@ -1401,7 +1226,6 @@ fn chips_in(seen: &Seen, from: i64, until: i64) -> Vec<(i64, Chip, String)> {
 }
 
 /// L1: `face=land` while it lands: a chip line `face=land` standing between
-/// the land act and its landing (Gemini CLI: its no-footer line).
 fn l1_face(seen: &Seen, cx: &Ctx<'_>) -> Verdict {
     let Some((t1, _)) = seen
         .acts(aterm_agent::supervise::policy::turn_end::RULE_LAND)
@@ -1432,7 +1256,6 @@ fn l1_face(seen: &Seen, cx: &Ctx<'_>) -> Verdict {
 }
 
 /// The span its need stood in: from its `NEEDS` line to the `CLEARED …
-/// needs` (or the landing, or the watch's end) after it.
 fn need_span(seen: &Seen, t0: i64) -> Option<(i64, i64)> {
     let (tn, _) = seen.first_after("NEEDS ", t0)?;
     let until = seen
@@ -1482,7 +1305,6 @@ fn l3_count(seen: &Seen, cx: &Ctx<'_>) -> Verdict {
 }
 
 /// A [`Window::menu`] entry's `<section>-head|` line: the header's count
-/// (`Needs you (2)`: 2) and the rows the menu listed under it.
 fn head_of(menu: &str, section: &str) -> Option<(Option<usize>, usize)> {
     let head = menu
         .lines()
@@ -1496,9 +1318,6 @@ fn head_of(menu: &str, section: &str) -> Option<(Option<usize>, usize)> {
 }
 
 /// L3: its row under `Needs you (N)` in the worker's words (`◇ land-a —
-/// rotate the deploy key · #`, never `<program> needs you:`), the header's
-/// `N` the rows the menu lists under it (every tab's need, so 1 or more),
-/// and `attention` among its tab's states, while its need stood.
 fn l3_row(seen: &Seen, cx: &Ctx<'_>) -> Verdict {
     let Some((from, until)) = need_span(seen, cx.t0) else {
         return Verdict::Unobserved("no NEEDS line (L3's records)".into());
@@ -1574,7 +1393,6 @@ fn l3_row(seen: &Seen, cx: &Ctx<'_>) -> Verdict {
 }
 
 /// L5: `face=landed` after the landing (Gemini CLI: its no-footer line), and
-/// the page's state for it `landed <time>`.
 fn l5_landed(seen: &Seen, cx: &Ctx<'_>) -> Verdict {
     let Some((d, _)) = seen.first_after("DONE ", cx.t0) else {
         return Verdict::Unobserved("no landing (L5's records)".into());
@@ -1634,8 +1452,6 @@ fn l5_landed(seen: &Seen, cx: &Ctx<'_>) -> Verdict {
 }
 
 /// L7: the worker's row under Done for you, `✓ land-e — landed #`, after its
-/// landing; and at rest, the menu's This Mac `N landed` counting every tab
-/// whose `status` says `task=landed`, it among them.
 fn l7_rows(seen: &Seen, cx: &Ctx<'_>) -> Verdict {
     let Some((d, _)) = seen.first_after("DONE ", cx.t0) else {
         return Verdict::Unobserved("no landing (L7's records)".into());
@@ -1688,11 +1504,6 @@ fn l7_rows(seen: &Seen, cx: &Ctx<'_>) -> Verdict {
 const UNREST: &str = "the window never read at rest (END not reached)";
 
 /// L7 ON THE PAGE (4c), at rest: its today line leads with the run's
-/// landings this day (`5 landed today`: each landed tab's `DONE …
-/// rule=land@v1`, as the A/B book counts them), and SESSIONS' Every session
-/// row counts the tabs under Land by their faces — `N landed` every tab whose
-/// `status` says `task=landed` under Land, `M landing` the others under Land
-/// — never calling a landed tab landing.
 fn l7_page(seen: &Seen, _cx: &Ctx<'_>) -> Verdict {
     let Some(rest) = seen.window.rest.as_deref() else {
         return Verdict::Unobserved(UNREST.into());
@@ -1772,7 +1583,6 @@ fn end_stands(seen: &Seen, cx: &Ctx<'_>) -> Verdict {
 }
 
 /// Its `•` and its Done for you row (`✓ <label> — landed #`) once landed,
-/// before the END's look: what is wrong, and what was read.
 fn end_marks(seen: &Seen, cx: &Ctx<'_>) -> Result<String, Verdict> {
     let Some((d, _)) = seen.first_after("DONE ", cx.t0) else {
         return Err(Verdict::Unobserved("no landing (its records)".into()));
@@ -1826,10 +1636,6 @@ fn step<'a>(w: &'a Window, name: &str) -> Option<&'a (i64, String)> {
 }
 
 /// Its `step=<name>` line of END left its end standing, unseen with its `•`
-/// and its Done for you row (`end_seen=0 … done_row=yes`, `done` among its
-/// states where it is behind): `sweep`, a tab brought forward with no look,
-/// sees no end; `look-on`, the look begun on another tab, sees none behind
-/// it; `still`, a tab switch to land-j under the look, none of land-k's.
 fn left_it(w: &Window, cx: &Ctx<'_>, name: &str, why: &str) -> Result<String, Verdict> {
     let Some((t, l)) = step(w, name) else {
         return Err(Verdict::Unobserved(format!(
@@ -1850,8 +1656,6 @@ fn left_it(w: &Window, cx: &Ctx<'_>, name: &str, why: &str) -> Result<String, Ve
 }
 
 /// L16: its `•` and its row once landed; brought forward with no look, and
-/// behind the tab the look began on, its end stands; brought in front under
-/// the look (`tab <land-j>`): `end_seen=1`, the `•` and the row gone.
 fn l16_look(seen: &Seen, cx: &Ctx<'_>) -> Verdict {
     let marks = match end_marks(seen, cx) {
         Ok(s) => s,
@@ -1886,9 +1690,6 @@ fn l16_look(seen: &Seen, cx: &Ctx<'_>) -> Verdict {
 }
 
 /// L17: its `•` and its row once landed; brought forward with no look, behind
-/// the tab the look began on, and behind land-j once a tab switch under the
-/// look saw land-j's, its end stands; after the press on its row (the look
-/// on): it in front (`selected=1`), `end_seen=1`, the row gone.
 fn l17_press(seen: &Seen, cx: &Ctx<'_>) -> Verdict {
     let marks = match end_marks(seen, cx) {
         Ok(s) => s,
@@ -1927,14 +1728,9 @@ fn l17_press(seen: &Seen, cx: &Ctx<'_>) -> Verdict {
 }
 
 /// N1–N4: the words each step's reply's yield is told by (its last row,
-/// which `EVENT idle` quotes: its last need, or the defense) and the count
-/// `status` wants of its needs.
 const N_STEPS: [(&str, usize); 4] = [(NEED_B, 2), (DEFENSE_HEAD, 0), (NEED_A, 1), (NEED_C, 2)];
 
 /// Step `k` of N1–N4's span: from its reply's yield (the first `EVENT idle`
-/// holding its head after the act that asked it; the first prompt's for N1)
-/// to the next act, or the watch's end. `Err` names the step a failed one
-/// left unreached.
 fn n_span(seen: &Seen, t0: i64, k: usize) -> Result<(i64, i64), Verdict> {
     let acts: Vec<i64> = seen
         .all_acts()
@@ -1967,7 +1763,6 @@ fn n_span(seen: &Seen, t0: i64, k: usize) -> Result<(i64, i64), Verdict> {
 }
 
 /// The act that asked step `k` of N1–N4: none for N1 (the first prompt), a
-/// continuation for N2 and N4, the done check for N3.
 const N_ASKED: [Option<&str>; 4] = [
     None,
     Some(aterm_agent::supervise::policy::turn_end::RULE_CONTINUE),
@@ -1975,10 +1770,7 @@ const N_ASKED: [Option<&str>; 4] = [
     Some(aterm_agent::supervise::policy::turn_end::RULE_CONTINUE),
 ];
 
-/// N1–N4 ON THE RECORDS: step `k`'s reply read at its yield (its last row,
-/// [`N_STEPS`]) after the act that asked it ([`N_ASKED`]), and the needs
-/// entry moved with it — a `NEEDS … count=<n>` line in its span (N1 2, N3 1,
-/// N4 2), N2's `CLEARED … needs` — and never a DONE (Cruise).
+/// Judges step `k` of the N1–N4 needs chain from `seen`.
 #[must_use]
 pub fn judge_needs_step(seen: &Seen, t0: i64, k: usize) -> Verdict {
     let (from, until) = match n_span(seen, t0, k) {
@@ -2041,7 +1833,6 @@ pub fn judge_needs_step(seen: &Seen, t0: i64, k: usize) -> Verdict {
 }
 
 /// N1–N4 on `status` and `meta`: settled at the span's end, `needs_n=` the
-/// step's count (`-` for none) and the entry the first need's, carrying on.
 fn n_status(seen: &Seen, cx: &Ctx<'_>, k: usize) -> Verdict {
     let (from, until) = match n_span(seen, cx.t0, k) {
         Ok(s) => s,
@@ -2093,11 +1884,6 @@ fn n_status(seen: &Seen, cx: &Ctx<'_>, k: usize) -> Verdict {
 }
 
 /// N1–N4 on the window: every chip line standing in the span drawn as its
-/// face (the front tab; Gemini CLI its no-footer line), and, settled, its
-/// need row naming the first need with no count (every other need has a
-/// row of its own one level in, [`n_further`]), and its page
-/// state naming the first need with the others' count (` (+1 more)`), the
-/// need alone, or none.
 fn n_window(seen: &Seen, cx: &Ctx<'_>, k: usize) -> Verdict {
     let (from, until) = match n_span(seen, cx.t0, k) {
         Ok(s) => s,
@@ -2182,15 +1968,9 @@ fn n_window(seen: &Seen, cx: &Ctx<'_>, k: usize) -> Verdict {
 }
 
 /// N1–N4's further needs, each on a row of its own one level in under the
-/// tab's row (`indent=1`): (b) at N1, none at N2 and N3, (c) and
-/// never (b) at N4 — a set that moved under the same first need.
 const N_OTHERS: [&[&str]; 4] = [&[NEED_B], &[], &[], &[NEED_C]];
 
 /// N1–N4's ROWS ONE LEVEL IN (§12.2.1, §12.5.4's N1–N4 row):
-/// settled at the span's end, the rows the menu draws one level in under
-/// the tab's own need row ([`menu_of`]'s `indent=1` lines) are exactly that
-/// step's other needs, whole ([`N_OTHERS`]). A row printed as a submenu's
-/// (`chrome`'s two-space lead) is no such row.
 fn n_further(seen: &Seen, cx: &Ctx<'_>, k: usize) -> Verdict {
     let until = match n_span(seen, cx.t0, k) {
         Ok((_, until)) => until,
@@ -2215,14 +1995,11 @@ fn n_further(seen: &Seen, cx: &Ctx<'_>, k: usize) -> Verdict {
 }
 
 /// Why a want of a chain's page row is unread: its row was never on the
-/// page's screen (Settings ▸ Harness draws one screen of its rows, and
-/// `inspect … text` reads that screen), so the page judges nothing of it.
 fn off_page(label: &str) -> String {
     format!("{label}'s row was never on the page's screen")
 }
 
 /// A want's verdict from what it found wrong (`bad`: FAIL) and what it
-/// could not read (`unread`: UNOBSERVED), else PASS.
 fn told(said: String, bad: &[String], unread: &[String]) -> Verdict {
     if !bad.is_empty() {
         Verdict::Fail(format!("{said}: {}", bad.join("; ")))
@@ -2239,7 +2016,6 @@ fn metric(line: &str, key: &str) -> String {
 }
 
 /// The owners of a `deadline_arms_by_owner=` (`owner:n/m,…`) or
-/// `deadline_fires_by_owner=` (`owner:n,…`) value, `none` and `-` naming none.
 fn owners(v: &str) -> Vec<&str> {
     if matches!(v, "" | "-" | "none") {
         return Vec::new();
@@ -2257,14 +2033,7 @@ fn wakes_of(v: &str, variant: &str) -> u64 {
         .unwrap_or(0)
 }
 
-/// THE END (once a harness): the idle window — `timer_wakes=0`, `n_render=0`,
-/// no deadline fired, none armed but `presence`, with ends standing, a pause
-/// standing where the run holds a chain that pauses ([`pauses`]), and the
-/// page open (an act or a journal line in it is no rest: unobserved; a
-/// program's own writes are answered by the status sweep alone, at most
-/// [`SWEEP_FIRES_PER_WRITE`] fires a write) — then each chain brought in
-/// front, its chip's `drawn=` equal to its `face=` (Gemini CLI: its
-/// no-footer line).
+/// Judges the end-of-run idle window and resting surfaces across `desk` and `tabs`.
 #[must_use]
 pub fn judge_end(desk: &Desk, tabs: &[(Chain, &Window)], program: &str) -> Verdict {
     let Some(idle) = &desk.idle else {
@@ -2278,12 +2047,6 @@ pub fn judge_end(desk: &Desk, tabs: &[(Chain, &Window)], program: &str) -> Verdi
     let fires = metric(m, "deadline_fires_by_owner");
     let wakes = metric(m, "wakes_by_variant");
     let output = wakes_of(&wakes, "Output");
-    // What may wake the instance in it: with no Output wake, nothing
-    // (timer_wakes=0, no fire, nothing armed beside presence). A program
-    // that writes at idle (Muse Code puts an SGR reset and a cursor move,
-    // changing no cell, every 10 s) is answered by the status sweep alone:
-    // `session_status` arms and fires, every timer wake is one of its
-    // fires, and it fires at most `SWEEP_FIRES_PER_WRITE` times a write.
     let allowed: &[&str] = if output == 0 {
         &[PRESENCE]
     } else {
@@ -2352,7 +2115,6 @@ pub fn judge_end(desk: &Desk, tabs: &[(Chain, &Window)], program: &str) -> Verdi
             )
         }
     );
-    // the sweep: each chain in front, drawn as its face
     let mut sweep = Vec::new();
     let mut swept = 0;
     for (chain, w) in tabs {
@@ -2419,18 +2181,12 @@ pub fn judge_end(desk: &Desk, tabs: &[(Chain, &Window)], program: &str) -> Verdi
 }
 
 /// The deadline owner presence keeps (the pill's age, the claim's lapse):
-/// armed at rest, never fired there.
 const PRESENCE: &str = "presence";
 
 /// The deadline owner of the status sweep, which answers a program's output.
 const SWEEP: &str = "session_status";
 
 /// How many times the status sweep may fire for each `Output` wake at idle:
-/// a write owes the agent's follow-up look (`SessionStatus::next_wake`, once
-/// the output pauses) and the transition that look may owe — two, measured
-/// 1.75 and 2.1 a write over Muse Code's 16 tabs — with room for one more.
-/// More is a sweep that re-arms itself while output trickles: the timer spin
-/// END's idle window is there to catch.
 const SWEEP_FIRES_PER_WRITE: u64 = 3;
 
 /// `n / d` for the report (0 for none).
@@ -2443,7 +2199,6 @@ fn ratio(n: u64, d: u64) -> f64 {
 }
 
 /// The count `owner` has in a `deadline_fires_by_owner=` (`owner:n,…`) or
-/// `deadline_arms_by_owner=` (`owner:n/m,…`: its `n`) value; 0 where absent.
 fn count_of(v: &str, owner: &str) -> u64 {
     v.split(',')
         .find_map(|p| {
@@ -2453,7 +2208,7 @@ fn count_of(v: &str, owner: &str) -> u64 {
         .unwrap_or(0)
 }
 
-/// `chrome` and the page's text, after a capture of the front tab: one glance.
+/// Captures the front tab and reads `chrome` and the Harness page into a [`Glance`].
 pub fn glance(door: &Door<'_>, desk: &Desk) -> Glance {
     if !desk.front_sid.is_empty() {
         let _ = on(door, &desk.front_sid, &["image", FRONT_IMAGE]);
@@ -2468,7 +2223,6 @@ pub fn glance(door: &Door<'_>, desk: &Desk) -> Glance {
 }
 
 /// The windows' ids in `inspect app/v1 tabs`: each `window id=<n>`, and the
-/// Settings page's `(window, view)` where a leaf is `kind=app app=settings`.
 fn windows_of(tabs: &str) -> (Vec<String>, Option<(String, String)>) {
     let mut windows = Vec::new();
     let mut page = None;
@@ -2490,13 +2244,6 @@ fn windows_of(tabs: &str) -> (Vec<String>, Option<(String, String)>) {
 }
 
 /// The window an `invoke NewWindow` made: the first window of `inspect
-/// app/v1 tabs` (each `tabs()` read) that `before` does not hold, read again
-/// until one shows, for `within` at most. `invoke NewWindow` answers once the
-/// window's first shell is asked for; the shell spawns off the event loop and
-/// the window is made when it lands (aterm-gui's `MenuAction::NewWindow`), so
-/// a read right after the answer can come before the window does (on a loaded
-/// machine, `lab forever` on Gemini CLI, 2026-10-21: `no new window`). A wait
-/// for something that must happen: [`STEP_WAIT`] is its hang detector.
 fn new_window(
     before: &[String],
     within: Duration,
@@ -2513,16 +2260,10 @@ fn new_window(
     made.filter(|_| shown)
 }
 
-/// THE WINDOWS, LAID OUT BEFORE THE CHAINS' TABS: the Settings window
-/// (`invoke NewWindow`, waited for in `inspect app/v1 tabs` ([`new_window`]),
-/// `open app settings /harness` there, its view read off `inspect app/v1
-/// tabs`), then the chains' own (`invoke NewWindow`, waited for), the newest,
-/// so a headless instance's frontmost: where every flagless `spawn` opens its
-/// tab.
+/// Opens the Settings window (on `/harness`) and the chains window before spawning chain tabs.
 ///
 /// # Errors
-/// A step the instance refused, or a window it never made within
-/// [`STEP_WAIT`], named.
+/// Returns an error if a control verb fails or a window does not appear in time.
 pub fn lay_windows(door: &Door<'_>) -> Result<Desk, String> {
     let step = |args: &[&str]| -> Result<String, String> {
         let r = door.ctl(args)?;
@@ -2564,7 +2305,7 @@ pub fn lay_windows(door: &Door<'_>) -> Result<Desk, String> {
     })
 }
 
-/// A session's `window=` in `ls`.
+/// Extracts `sid`'s `window=` token from `ls` output.
 #[must_use]
 pub fn window_of(ls: &str, sid: &str) -> Option<String> {
     ls.lines()
@@ -2573,7 +2314,6 @@ pub fn window_of(ls: &str, sid: &str) -> Option<String> {
 }
 
 /// What one tab's END step read: `step=<name> end=… end_seen=…
-/// selected=<0|1|-> states=… done_row=<yes|no>[ pressed=…]`.
 fn step_line(door: &Door<'_>, tab: &Tab, name: &str, pressed: Option<&str>) -> String {
     let s = on(door, &tab.sid, &["status"]);
     let g = Glance::of(now_ms(), &door.out(&["chrome"]), "");
@@ -2603,9 +2343,6 @@ fn step_line(door: &Door<'_>, tab: &Tab, name: &str, pressed: Option<&str>) -> S
 }
 
 /// The soonest instant a tab's journal names its next act at (the last
-/// `WAITING … until=<stamp>`, `DONE` or `LEFT` after its last act, where a
-/// `WAITING`: its `until`, read as `now` where it passed within the last
-/// minute — the act is on its way) and the latest journal line's time.
 fn due_and_quiet(tabs: &[Tab], now: i64) -> (Option<i64>, i64) {
     let mut due: Option<i64> = None;
     let mut last = 0;
@@ -2638,8 +2375,6 @@ fn due_and_quiet(tabs: &[Tab], now: i64) -> (Option<i64>, i64) {
 }
 
 /// A journal's lines less those the same as the line before them: the loop
-/// writing one decision again (a `WAITING` with the same seq, `until` and
-/// reason) says nothing new.
 fn news(journal: &[(i64, String)]) -> impl Iterator<Item = &(i64, String)> {
     journal
         .iter()
@@ -2649,8 +2384,6 @@ fn news(journal: &[(i64, String)]) -> impl Iterator<Item = &(i64, String)> {
 }
 
 /// Tab `name`'s journal lines inside `[from, from + ms]` (`<name> +t
-/// <line>`): those that moved, and those written again, each the same as the
-/// line before it ([`news`]).
 fn moves_in(name: &str, j: &[(i64, String)], from: i64, ms: i64) -> (Vec<String>, Vec<String>) {
     let mut moved = Vec::new();
     let mut relogged = Vec::new();
@@ -2668,7 +2401,7 @@ fn moves_in(name: &str, j: &[(i64, String)], from: i64, ms: i64) -> (Vec<String>
     (moved, relogged)
 }
 
-/// The unix ms of an RFC 3339 UTC stamp (`2026-10-21T10:24:06Z`).
+/// Parses an RFC 3339 UTC timestamp (`YYYY-MM-DDTHH:MM:SSZ`) into unix milliseconds.
 #[must_use]
 pub fn unix_ms_of(stamp: &str) -> Option<i64> {
     let (y, m, d) = crate::reduce::iso_day(stamp)?;
@@ -2681,10 +2414,6 @@ pub fn unix_ms_of(stamp: &str) -> Option<i64> {
 }
 
 /// THE END'S IDLE WINDOW: once every tab's journal stood still
-/// [`IDLE_QUIET_BEFORE_MS`] and no tab's next act falls within it and
-/// [`IDLE_CLEAR_AFTER_MS`] after, `metrics reset`, [`IDLE_MS`] with no read,
-/// then `metrics` and `metrics percentiles`; a window an act or a journal
-/// line fell in is tried again, [`IDLE_TRIES`] in all.
 fn idle_window(
     run: &crate::run::Run,
     door: &Door<'_>,
@@ -2792,8 +2521,6 @@ fn idle_window(
             holds,
             page_open,
         };
-        // a window an act or a journal line fell in is no rest; a program's
-        // own writes are judged ([`judge_end`])
         let rest = idle.moved.is_empty();
         last_idle = Some(idle);
         if rest {
@@ -2803,11 +2530,7 @@ fn idle_window(
     Ok(last_idle.unwrap_or_default())
 }
 
-/// The landings a tab's journal notes on the day `today` holds (4b's rule,
-/// `aterm_agent::harness::stats`' THE LANDINGS): a `DONE … rule=land@v1`
-/// line counts where it is the tab's first such note or a land act
-/// (`land@v1`, `land-nudge@v1`, `land-answer@v1`) came since the last one; a
-/// note again with no act before it restates a landing and counts nothing.
+/// Counts landings recorded in `journal` on timestamps matching `today`.
 #[must_use]
 pub fn landings_of(journal: &[(i64, String)], today: impl Fn(i64) -> bool) -> usize {
     let mut open = true;
@@ -2843,20 +2566,10 @@ fn q(s: &str) -> String {
     format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
-/// THE END'S STEPS ON THE WINDOW, once every chain is over: the idle window
-/// ([`Desk::idle`]); This Mac and the page's counts at rest
-/// ([`Window::rest`]: SESSIONS' Every session row brought on the page's
-/// screen by its Timer's disclosure, pressed open and closed); each chain's
-/// tab brought in front with no look (`person look off`, `tab <index>`, a
-/// capture, its chip line: [`Window::front`]; L16's and L17's ends read
-/// after, still unseen: `step=sweep`); then the look, begun on the front
-/// tab, which has no end (`tab <front>`, `person look <the chains'
-/// window>`: `step=look-on`, both ends still standing), `tab <land-j>` under
-/// it (`step=look`, land-k's `step=still`), the press on `land-k`'s Done for
-/// you row (`step=press`), `person look off` and `tab <front>`.
+/// Runs the end-of-run idle measurement, front sweep, look, and menu press sequence.
 ///
 /// # Errors
-/// Only a stop.
+/// Returns an error only if the run is stopped.
 pub(super) fn end_steps(
     run: &crate::run::Run,
     door: &Door<'_>,
@@ -2868,7 +2581,6 @@ pub(super) fn end_steps(
         println!("  END       {what}");
         desk.steps.push((t, what));
     };
-    // ---- the idle window
     let idle = idle_window(run, door, tabs, desk)?;
     say(
         desk,
@@ -2895,16 +2607,12 @@ pub(super) fn end_steps(
         );
     }
     desk.idle = Some(idle);
-    // ---- This Mac and the page's counts at rest
     let g = Glance::of(now_ms(), &door.out(&["chrome"]), "");
     let here = g
         .menu
         .iter()
         .find(|r| r.section == "here")
         .map_or_else(String::new, |r| r.label.clone());
-    // the tabs under Land by their tasks: landed (the chip's `✓ landed`),
-    // or landing (`⤓ land`, the task open); a person's own exchange
-    // (`theirs`, the chip's `⤓ quiet`) is neither
     let (mut landed_tabs, mut landing_tabs) = (0, 0);
     for t in tabs.iter() {
         let s = on(door, &t.sid, &["status"]);
@@ -2930,8 +2638,6 @@ pub(super) fn end_steps(
         let rows = page_rows(&text());
         let every = match every_of(&rows) {
             Some(e) => Some(e),
-            // past the page's screen (it stands after every session's row):
-            // its Timer's disclosure, pressed, brings it on, as a hand does
             None => {
                 let open = door.out(&["act", "app/v1", "view", &view, EVERY_TIMER, EVERY_TIMER]);
                 let e = every_of(&page_rows(&text()));
@@ -2959,7 +2665,6 @@ pub(super) fn end_steps(
     for tab in tabs.iter_mut() {
         tab.seen.window.rest = Some(rest.clone());
     }
-    // ---- each chain in front, with no look
     let _ = door.out(&["person", "look", "off"]);
     let index_of = |door: &Door<'_>, label: &str| {
         strip_tabs(&door.out(&["chrome"]))
@@ -2987,9 +2692,6 @@ pub(super) fn end_steps(
         say(desk, format!("{}: {l}", tab.chain.name()));
         tab.seen.window.looked.push((now_ms(), l));
     }
-    // ---- the look, begun on the front tab: a look marks the SELECTED tab's
-    // end seen at once, so it begins where no end stands, and both ends behind
-    // it still stand
     let Some(front) = tabs
         .iter()
         .find(|t| t.sid == desk.front_sid && !ENDING.contains(&t.chain))
@@ -3022,7 +2724,6 @@ pub(super) fn end_steps(
         say(desk, format!("{}: {l}", tab.chain.name()));
         tab.seen.window.looked.push((now_ms(), l));
     }
-    // ---- land-j brought in front under the look: the tab switch sees its end
     if let Some(tab) = tabs.iter_mut().find(|t| t.chain == Chain::LandJ) {
         let label = tab.seen.window.label.clone();
         if let Some(i) = index_of(door, &label) {
@@ -3036,13 +2737,11 @@ pub(super) fn end_steps(
             tab.seen.window.looked.push((now_ms(), l));
         }
     }
-    // ---- land-k behind it, its end still standing
     if let Some(tab) = tabs.iter_mut().find(|t| t.chain == Chain::LandK) {
         let l = step_line(door, tab, "still", None);
         say(desk, format!("{}: {l}", tab.chain.name()));
         tab.seen.window.looked.push((now_ms(), l));
     }
-    // ---- the press: land-k's Done for you row, the look on
     if let Some(tab) = tabs.iter_mut().find(|t| t.chain == Chain::LandK) {
         let label = tab.seen.window.label.clone();
         let want = format!("\u{2713} {label} \u{2014} ");
@@ -3082,7 +2781,6 @@ pub(super) fn end_steps(
         say(desk, format!("{label}: {l}"));
         tab.seen.window.looked.push((now_ms(), l));
     }
-    // ---- the look off, the front tab back in front with no look
     let off = door.out(&["person", "look", "off"]);
     say(desk, format!("person look off: {}", off.trim()));
     if let Some(i) = index_of(door, &front) {

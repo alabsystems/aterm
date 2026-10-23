@@ -140,25 +140,25 @@ macro_rules! bitflags {
 
             /// Insert `other` flags into `self`.
             #[inline]
-            pub fn insert(&mut self, other: Self) {
+            pub const fn insert(&mut self, other: Self) {
                 self.bits |= other.bits;
             }
 
             /// Remove `other` flags from `self`.
             #[inline]
-            pub fn remove(&mut self, other: Self) {
+            pub const fn remove(&mut self, other: Self) {
                 self.bits &= !other.bits;
             }
 
             /// Toggle `other` flags in `self`.
             #[inline]
-            pub fn toggle(&mut self, other: Self) {
+            pub const fn toggle(&mut self, other: Self) {
                 self.bits ^= other.bits;
             }
 
             /// Set or unset `other` flags based on `value`.
             #[inline]
-            pub fn set(&mut self, other: Self, value: bool) {
+            pub const fn set(&mut self, other: Self, value: bool) {
                 if value {
                     self.insert(other);
                 } else {

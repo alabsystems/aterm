@@ -1,41 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! WHERE A TAPE IS KEPT: the store a HOSTED run's tapes go to, each made for
-//! its run and handed to its recorder. (The CLI's `--tape FILE` went with
-//! `aterm drive supervise|watch`, removed 2026-10-15: a tape is the window's
-//! own loop's.) A tape is made `0600` — it holds the screens the loop judged,
-//! as the journal and the ledger hold what it decided, and is kept as
-//! privately — and NEW ([`create`]): a tape already at a path is an earlier
-//! run's record, and a run never writes over it.
-//!
-//! A HOSTED run (the window's own loop, [`run_hosted_taped`]) is recorded
-//! only where the development seam [`HOSTED_SEAM`] asks for it — the lab's
-//! instances set it; no shipped build reads it, and recording by default in
-//! the product waits for the owner's decision (the replay plan's D1). Its
-//! tapes go beside the session's approval ledger, under the instance's own
-//! state root: `<state>/drive/tapes/<sid>/<yyyymmddThhmmss>-<run8>.atape`,
-//! each `0600`, with an admitted owned `0700` store and session directories.
-//! Directory components are opened without following links; a linked,
-//! foreign-owned or non-private store refuses recording and cleanup. At each
-//! hosted loop's start, oldest first, retention attempts to keep the newest
-//! tapes within [`KEEP_BYTES`] and [`KEEP_AGE`] ([`sweep`]); a supported
-//! writer hold, or an unknown hold observation, is preserved and counted; `tapes/kept/` is a person's and never swept. A seamless
-//! update ends the run as `suspended`, and its successor opens a tape of its
-//! own: each run's tape replays on its own (its ledger's seed is a file read
-//! on its own tape). This development store currently requires Apple, Linux
-//! or Android directory-handle operations; other platforms run untaped. It is
-//! not a hostile-same-uid security boundary or a continuous disk limit: active
-//! writers and later mutations are not frozen by one inventory.
-//!
-//! A tape that cannot be made — the path taken, its directory missing or
-//! not writable, the disk full, or the path one of the files the run writes
-//! itself (its journal, its ledger: [`beside_files`]) — is said
-//! once, on the run's warning stream,
-//! and the run goes on untaped, exactly as it would have run with no
-//! tape at all: recording must not change the run it records, and that
-//! includes whether it runs. A tape that fails later is the writer's to say
-//! ([`super::frame::TapeWriter`]); the loop never sees either.
+//! WHERE A TAPE IS KEPT: the store a HOSTED run's tapes go to, each made for its run and handed to its recorder.
 
 use std::io::Write;
 
@@ -53,9 +19,7 @@ use super::header::{Entry, Header};
 use crate::supervise::fx::Fx;
 use crate::supervise::run::{Ctl, Session, SessionSetup, SuperviseOpts};
 
-/// A tape's id: sixteen hex digits from this process and the moment the run
-/// starts, written in its header. It names the tape in a reader's output; it
-/// is no secret and no key.
+/// A tape's id: sixteen hex digits from this process and the moment the run starts, written in its header.
 #[must_use]
 pub fn tape_id() -> String {
     let ns = std::time::SystemTime::now()
@@ -68,9 +32,7 @@ pub fn tape_id() -> String {
 }
 
 /// The tape file at `path`, made new and `0600` ([module docs](self)).
-///
 /// # Errors
-///
 /// The path is taken, or the file cannot be made there.
 pub fn create(path: &Path) -> std::io::Result<std::fs::File> {
     let mut o = std::fs::OpenOptions::new();
@@ -84,28 +46,10 @@ pub fn create(path: &Path) -> std::io::Result<std::fs::File> {
 }
 
 /// The one way this module takes a lock: [`held::HeldTape`]'s fields are
-/// private to `held`, so its `hold` is the module's only `try_lock` and the
-/// only way to hold what it takes. No lock taken here is released by close
-/// alone.
 mod held {
     use super::super::frame::FrameSink;
 
-    /// A TAPE ITS WRITER HOLDS for as long as it writes: its `flock`, taken
-    /// exclusively as the file is handed to its writer and let go by
-    /// `LOCK_UN` as the writer drops it, before the close (clippy.toml's
-    /// flock release rule: a child forked meanwhile keeps a lock that close
-    /// alone released). The store's retention removes no tape a writer holds
-    /// ([`super::sweep`]): a hosted loop's tape is never unlinked under it —
-    /// by another loop's start in this process, or by the instance a
-    /// seamless update hands over to — while it still writes, nor once it
-    /// stopped at its cap with its loop still running.
-    ///
-    /// A file whose lock cannot be taken (a file system with no `flock`) is
-    /// written unheld, as before the hold: the tape is the record, the hold
-    /// only keeps the retention off it. So is every file where the retention
-    /// cannot see a hold (`aterm_uds::ownerlock::probe` reads none but on
-    /// macOS and Linux): Windows' file locks are mandatory, and would refuse
-    /// a reader of the live tape for nothing.
+    /// A TAPE ITS WRITER HOLDS for as long as it writes: its `flock`, taken exclusively as the file is handed to its writer and let go by `LOCK_UN` as the writer drops it, before the close (clippy.toml's flock release rule: a child forked meanwhile keeps a lock that close alone released).
     pub(super) struct HeldTape {
         file: std::fs::File,
         held: bool,
@@ -114,9 +58,6 @@ mod held {
     impl HeldTape {
         /// `file`, a tape just made, held while it is written.
         pub(super) fn hold(file: std::fs::File) -> Self {
-            // The ascription is the lock-order census's File evidence
-            // (aterm-census `is_file_binding_rhs`), keeping this site
-            // categorized as a cross-process advisory lock.
             let file: std::fs::File = file;
             #[cfg(any(target_vendor = "apple", target_os = "linux"))]
             let held = {
@@ -153,8 +94,6 @@ mod held {
 }
 
 /// Whether `other` names `file`, the tape just made at `path`: the same
-/// device and inode where there are such (unix), else the same resolved
-/// path. A path that names nothing is no clash.
 fn is_file(file: &std::fs::File, path: &Path, other: &Path) -> bool {
     #[cfg(unix)]
     {
@@ -175,9 +114,7 @@ fn is_file(file: &std::fs::File, path: &Path, other: &Path) -> bool {
     }
 }
 
-/// Run a loop's `body` and say how it ended on its tape: `end` of what it
-/// returned, or the message of the panic it unwound with — said, then the
-/// unwind goes on. With no tape the body runs as it is.
+/// Run a loop's `body` and say how it ended on its tape: `end` of what it returned, or the message of the panic it unwound with — said, then the unwind goes on.
 pub(crate) fn run_taped<T>(fx: &Fx, body: impl FnOnce() -> T, end: impl FnOnce(&T) -> End) -> T {
     if fx.tape().is_none() {
         return body();
@@ -195,9 +132,7 @@ pub(crate) fn run_taped<T>(fx: &Fx, body: impl FnOnce() -> T, end: impl FnOnce(&
     }
 }
 
-/// The files a run writes beside its loop, each with what it is: what a tape
-/// must not be — its `--journal` and its
-/// approval ledger (the setup's, else a hosted loop's `opts.ledger`).
+/// The files a run writes beside its loop, each with what it is: what a tape must not be — its `--journal` and its approval ledger (the setup's, else a hosted loop's `opts.ledger`).
 pub(crate) fn beside_files(
     setup: &SessionSetup,
     opts: &SuperviseOpts,
@@ -212,12 +147,7 @@ pub(crate) fn beside_files(
     .collect()
 }
 
-// -- the hosted store ----------------------------------------------------------
-
-/// THE DEVELOPMENT SEAM that records every hosted run ([module docs](self)),
-/// read by the window's host through `aterm_types::dev_seam!` — so no
-/// shipped binary reads it — and set by the lab's instances. Any value but
-/// an empty one or `0` asks for tapes ([`seam_on`]).
+/// THE DEVELOPMENT SEAM that records every hosted run ([module docs](self)), read by the window's host through `aterm_types::dev_seam!` — so no shipped binary reads it — and set by the lab's instances.
 pub const HOSTED_SEAM: &str = "ATERM_HARNESS_TAPE";
 
 /// Whether the seam's `value` asks for tapes: set, and neither empty nor `0`.
@@ -238,17 +168,13 @@ pub const KEPT: &str = "kept";
 /// A tape file's extension.
 const EXT: &str = "atape";
 
-/// The hosted tapes' store under the state root `state`:
-/// `<state>/drive/tapes`.
+/// The hosted tapes' store under the state root `state`: `<state>/drive/tapes`.
 #[must_use]
 pub fn store_under(state: &Path) -> PathBuf {
     state.join("drive").join("tapes")
 }
 
-/// A session's directory in the store `store`: the session's name as its
-/// approval ledger spells it (`s-1` for `@s-1`, `self` for none:
-/// `approvals::ledger_under`), so a session's tapes sit by the name its
-/// ledger does.
+/// A session's directory in the store `store`: the session's name as its approval ledger spells it (`s-1` for `@s-1`, `self` for none: `approvals::ledger_under`), so a session's tapes sit by the name its ledger does.
 #[must_use]
 pub fn session_dir(store: &Path, sid: Option<&str>) -> PathBuf {
     let ledger = crate::supervise::approvals::ledger_under(Path::new(""), sid);
@@ -258,9 +184,7 @@ pub fn session_dir(store: &Path, sid: Option<&str>) -> PathBuf {
     store.join(name)
 }
 
-/// A hosted tape's file name: `<yyyymmddThhmmss>-<run8>.atape`, the run's
-/// start in UTC and the first eight digits of its tape's id — names that
-/// sort as the runs began.
+/// A hosted tape's file name: `<yyyymmddThhmmss>-<run8>.atape`, the run's start in UTC and the first eight digits of its tape's id — names that sort as the runs began.
 #[must_use]
 pub fn hosted_name(at: SystemTime, tape: &str) -> String {
     let secs = at
@@ -291,26 +215,21 @@ pub struct Stored {
     pub kept: bool,
 }
 
-/// Every admitted tape in the held private store, newest first. This legacy
-/// diagnostic wrapper lists nothing on refusal; callers that report absence
-/// or mutate the store use [`try_list`] or retain the checked store itself.
+/// Every admitted tape in the held private store, newest first.
 #[must_use]
 pub fn list(store: &Path, sid: Option<&str>) -> Vec<Stored> {
     try_list(store, sid).unwrap_or_default()
 }
 
 /// List the hosted store without following any directory or tape link.
-///
 /// # Errors
-/// Any incomplete scan or non-private/non-owned store entry. Unsupported
-/// platforms refuse rather than fall back to path-based mutation.
+/// Any incomplete scan or non-private/non-owned store entry.
 pub fn try_list(store: &Path, sid: Option<&str>) -> std::io::Result<Vec<Stored>> {
     let store = custody::Store::open(store, false)?;
     Ok(store.tapes(sid)?.into_iter().map(|t| t.stored).collect())
 }
 
-/// Apply the hosted-store retention to admitted tapes. A refused or incomplete
-/// inventory removes nothing. Kept tapes are never removed or counted.
+/// Apply the hosted-store retention to admitted tapes.
 pub fn sweep(store: &Path, now: SystemTime) -> Vec<PathBuf> {
     sweep_within(store, now, KEEP_BYTES, KEEP_AGE)
 }
@@ -331,8 +250,6 @@ fn sweep_held(
     sweep_held_probing(store, now, bytes, age, custody::Tape::owner)
 }
 
-// The actual retention loop, with only its owner-lock observation injected.
-// Production probes each retained inventory descriptor, never its display path.
 fn sweep_held_probing(
     store: &custody::Store,
     now: SystemTime,
@@ -353,8 +270,6 @@ fn sweep_held_probing(
             !(young && held <= bytes)
         })
         .filter(|t| {
-            // Where writers hold a lock, only an observed free lock permits
-            // retirement. A failed observation is not evidence of no writer.
             let owner = probe(t);
             if cfg!(any(target_vendor = "apple", target_os = "linux")) {
                 owner == aterm_uds::ownerlock::Owner::Dead
@@ -372,13 +287,9 @@ fn sweep_held_probing(
         .collect())
 }
 
-/// Forget only paths in a complete admitted store inventory. All arguments
-/// are validated before any transfer. Parent handles and open tape identities
-/// are retained through retirement; changed entries are restored or preserved.
-///
+/// Forget only paths in a complete admitted store inventory.
 /// # Errors
-/// Admission, inventory, argument, or retirement failure. A late failure may
-/// follow earlier successful removals; this is not a transactional multi-delete.
+/// Admission, inventory, argument, or retirement failure.
 pub fn forget(store: &Path, paths: &[PathBuf]) -> Result<Vec<PathBuf>, String> {
     let store = custody::Store::open(store, false).map_err(|e| e.to_string())?;
     let held = store.tapes(None).map_err(|e| e.to_string())?;
@@ -406,16 +317,12 @@ pub fn forget(store: &Path, paths: &[PathBuf]) -> Result<Vec<PathBuf>, String> {
 }
 
 /// The door a hosted run reads its world through, recording to a new tape
-/// in the store beside its approval ledger ([module docs](self)) — after the
-/// store's retention has run — or the shipped live door, said to `warn`,
-/// when the run keeps no ledger or its tape cannot be made.
 fn hosted_fx(
     setup: &SessionSetup,
     opts: &SuperviseOpts,
     mut warn: Box<dyn Write + Send>,
     now: SystemTime,
 ) -> Fx {
-    // `<state>/drive/<sid>.jsonl`: the store is the ledger's directory's.
     let Some(ledger) = setup.ledger_path().or(opts.ledger.as_deref()) else {
         let _ = writeln!(
             warn,
@@ -487,21 +394,8 @@ fn hosted_fx(
     ))
 }
 
-/// THE WINDOW'S HOSTED LOOP, RECORDED ([module docs](self)): `setup`'s loop
-/// over the transport `ctl` under `opts` (`Session::run_hosted`, `stop` its
-/// stop), every value it observes taped — its control lane through the
-/// recording door, its window host through the taped host
-/// (`Fx::host_door`) — to a new tape in the store beside its ledger. The run
-/// ends its tape as it returned (`hosted_end`), as SUSPENDED when it
-/// returned for a seamless update's Commit (`suspended`, asked once it
-/// has), or as the panic it unwound with. A tape that cannot be made is
-/// said to `warn` and the run goes on exactly as untaped.
-///
-/// The caller reads the development seam ([`HOSTED_SEAM`]) and calls this
-/// only where it asks for tapes; recording changes nothing the loop does.
-///
+/// THE WINDOW'S HOSTED LOOP, RECORDED ([module docs](self)): `setup`'s loop over the transport `ctl` under `opts` (`Session::run_hosted`, `stop` its stop), every value it observes taped — its control lane through the recording door, its window host through the taped host (`Fx::host_door`) — to a new tape in the store beside its ledger.
 /// # Errors
-///
 /// What `Session::run_hosted` returned.
 pub fn run_hosted_taped<C: Ctl>(
     ctl: &mut C,
@@ -569,7 +463,6 @@ mod tests {
     }
 
     /// A hosted tape's name is the run's start in UTC and its tape's first
-    /// eight digits, so names sort as the runs began.
     #[test]
     fn a_hosted_tapes_name_sorts_as_the_runs_began() {
         let at = SystemTime::UNIX_EPOCH + Duration::from_secs(1_789_660_500);
@@ -594,10 +487,6 @@ mod tests {
     }
 
     /// THE STORE'S RETENTION: the sessions' tapes, newest first, are kept
-    /// within the bytes and the age, and every other is removed — by size
-    /// (the oldest that no longer fits, with every older one) and by age (a
-    /// tape past it, however small); a kept tape is neither removed nor
-    /// counted, and a file that is no tape is left alone.
     #[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
     #[test]
     fn the_store_keeps_the_newest_within_its_bytes_and_age() {
@@ -642,14 +531,6 @@ mod tests {
     }
 
     /// A TAPE ITS WRITER STILL HOLDS IS NEVER SWEPT, and its bytes count: a
-    /// running loop's tape past the store's bytes — the newer tape before it
-    /// in the walk already near the bound — and another past its age (a
-    /// capped tape whose loop runs on writes no more) both stay, while the
-    /// closed tape the held one's bytes push past the bound goes. Let go by
-    /// its writer, each is swept as any other. NEGATIVE CONTROL: the very
-    /// sweep of the same store with no writer holding either removes both
-    /// (the retention before the hold unlinked them under their writers).
-    /// Where a hold is kept: macOS and Linux (`held::HeldTape`).
     #[test]
     #[cfg(any(target_vendor = "apple", target_os = "linux"))]
     fn a_tape_its_writer_still_holds_is_never_swept() {
@@ -689,7 +570,6 @@ mod tests {
     }
 
     /// Forgetting removes tapes in the store and nothing else: a file outside
-    /// it, or one in it that is no tape, is refused before anything goes.
     #[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
     #[test]
     fn forgetting_removes_only_tapes_in_the_store() {
@@ -748,8 +628,6 @@ mod custody_tests {
     #[test]
     fn a_store_refuses_linked_or_nonprivate_roots_before_removing_any_tape() {
         let guard = aterm_tempfile::tempdir().expect("exclusive fixture");
-        // The fixture owns this path. Canonicalize it once so macOS /tmp's
-        // system alias is not a production-admission premise.
         let base = guard
             .path()
             .canonicalize()

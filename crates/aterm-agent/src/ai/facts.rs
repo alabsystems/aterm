@@ -182,6 +182,9 @@ pub struct ClaudeAccounts {
     /// When a renewal last bound it, unix seconds: a renewal is the newest proof of a
     /// working login.
     pub renewed_at: Option<i64>,
+    /// When the serving row is at a usage limit and another row in `accounts.toml` has an
+    /// email, is not limited, and is not enrolled/signed-in yet (`accounts::sign_in_next`).
+    pub next_sign_in: Option<String>,
 }
 
 /// Everything the doctor knows of one CLI.
@@ -321,6 +324,7 @@ fn claude_accounts(m: &Machine<'_>) -> Option<ClaudeAccounts> {
             limited_until: None,
             served_at: None,
             renewed_at: None,
+            next_sign_in: None,
         });
     }
     let listed_roster = match loaded {
@@ -331,16 +335,36 @@ fn claude_accounts(m: &Machine<'_>) -> Option<ClaudeAccounts> {
     let roster = listed_roster.unwrap_or_else(accounts::Roster::own);
     let (logins, _) = store.load_logins(m.now).ok()?;
     let bound = accounts::bound(&roster, &logins);
+    let state = store.load(m.now).map(|(s, _)| s).unwrap_or_default();
+    let enrolled = accounts::enrolled(&bound);
     // The machine's own row: the one on the default login, or the one a renewal moved off
     // it (bound to a staging directory of its own).
-    let row = bound
-        .row_for_login(None)
+    let own_row = bound.row_for_login(None).or_else(|| {
+        bound
+            .rows
+            .iter()
+            .find(|r| r.was.iter().any(Option::is_none))
+    })?;
+    let row_ready = |r: &accounts::Row| {
+        let here = r.dir.is_none() || enrolled.contains(&r.label);
+        here && matches!(
+            accounts::condition(r, &state, true, m.now),
+            accounts::Condition::Usable | accounts::Condition::Low | accounts::Condition::Unseen
+        )
+    };
+    let row = state
+        .active
+        .as_deref()
+        .and_then(|label| bound.row(label))
+        .filter(|r| row_ready(r))
         .or_else(|| {
-            bound
-                .rows
-                .iter()
-                .find(|r| r.was.iter().any(Option::is_none))
-        })?
+            if row_ready(own_row) {
+                Some(own_row)
+            } else {
+                bound.rows.iter().find(|r| row_ready(r))
+            }
+        })
+        .unwrap_or(own_row)
         .clone();
     let made = row
         .dir
@@ -348,10 +372,16 @@ fn claude_accounts(m: &Machine<'_>) -> Option<ClaudeAccounts> {
         .is_some_and(|d| accounts::login_made(Path::new(d)));
     let renews = row.email.is_some();
     let binding = logins.get(&row.label);
-    let state = store.load(m.now).map(|(s, _)| s).unwrap_or_default();
     let limited_until = match accounts::condition(&row, &state, true, m.now) {
         accounts::Condition::Limited { until } => Some(until),
         _ => None,
+    };
+    let next_sign_in = if limited_until.is_some() {
+        accounts::sign_in_next(&bound, &state, &enrolled, Some(&row.label), m.now)
+            .filter(|(_, has_email)| *has_email)
+            .map(|(label, _)| label)
+    } else {
+        None
     };
     let (login_state, renew_by) = if renews {
         let login = accounts::login_state(&row, &logins, &state, m.now);
@@ -375,6 +405,7 @@ fn claude_accounts(m: &Machine<'_>) -> Option<ClaudeAccounts> {
         limited_until,
         served_at: binding.and_then(|b| b.served_at),
         renewed_at: binding.and_then(|b| b.renewed_at),
+        next_sign_in,
     })
 }
 

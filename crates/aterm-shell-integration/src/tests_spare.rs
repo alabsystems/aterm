@@ -51,14 +51,7 @@ impl SpareRig {
         let home = root.path().join("home");
         let dir = root.path().join("si").join(script_set_address());
         let ctl = root.path().join("ctl");
-        // The rig's fish reads its data dir in this home and its cache dir in
-        // the hermetic one, which holds fish 4's mark: this home needs fish 3's.
-        for d in [
-            home.clone(),
-            home.join(FISH3_COMPLETIONS_MADE),
-            ctl.join("rekey"),
-            ctl.join(SPARE_DIR),
-        ] {
+        for d in [home.clone(), ctl.join("rekey"), ctl.join(SPARE_DIR)] {
             std::fs::create_dir_all(d).expect("rig dir");
         }
         ensure_scripts(&dir).expect("scripts");
@@ -1219,6 +1212,60 @@ fn spare_fish() -> &'static str {
     let fish = need_fish();
     need_pty_script();
     fish
+}
+
+/// No live fish of this crate's makes its man-page completions. A first prompt
+/// that finds the mark of their making missing starts fish_update_completions,
+/// a detached python that outlives the test ([`mark_fish_completions_made`]),
+/// and fish 3 and fish 4 alike ask `__fish_anypython` for that python first. A
+/// conf.d snippet of the test's answers the ask: it notes it in the home and
+/// says there is none, so no python starts. Two lanes each run a fish to its
+/// first prompt and a command typed after it, which runs once that prompt's
+/// handlers have: `spawn_live_fish`, whose cache and data dirs are the
+/// hermetic home's, and the spare rig's, whose data dir is its own home's.
+/// NEGATIVE CONTROL, in the test: the same snippet first removes the marks
+/// where the shell's environment points fish (`$XDG_CACHE_HOME`,
+/// `$XDG_DATA_HOME`), and that fish asks, so a fish that never asked could not
+/// pass the test.
+#[cfg(unix)]
+#[test]
+fn no_live_fish_starts_its_completion_generator() {
+    const ANSWER: &str = "function __fish_anypython; touch $HOME/python-asked; return 1; end\n";
+    const UNMARK: &str = "rmdir $XDG_CACHE_HOME/fish/generated_completions \
+                          $XDG_DATA_HOME/fish/generated_completions\n";
+    /// Whether `sh`, its home `home`, asked by the time a command typed at its
+    /// first prompt ran.
+    fn asked(mut sh: LiveShell, home: &Path) -> bool {
+        let prompt = sh.wait_for_after("\x1b]133;A", 0);
+        // Computed, so the echoed line never matches it.
+        sh.send("echo RAN(math 40 + 2)");
+        sh.wait_for_after("RAN42", prompt);
+        let asked = home.join("python-asked").exists();
+        sh.finish();
+        asked
+    }
+    let fish = spare_fish();
+    for unmarked in [false, true] {
+        let snippet = if unmarked {
+            format!("{UNMARK}{ANSWER}")
+        } else {
+            ANSWER.to_owned()
+        };
+        let fx = LiveFixture::new();
+        let conf_d = fx.home.join("config").join("fish").join("conf.d");
+        std::fs::create_dir_all(&conf_d).expect("conf.d");
+        std::fs::write(conf_d.join("python.fish"), &snippet).expect("snippet");
+        let hermetic = asked(spawn_live_fish(fish, &fx, &[]), &fx.home);
+        let rig = SpareRig::new();
+        rig.fish_rc("conf.d/python.fish", &snippet);
+        let spare_rig = asked(rig.spawn(ShellType::Fish, fish), &rig.home);
+        assert_eq!(
+            (hermetic, spare_rig),
+            (unmarked, unmarked),
+            "fish asked for a python (hermetic lane, spare rig), its marks {}",
+            if unmarked { "removed" } else { "kept" }
+        );
+    }
 }
 
 /// S1, fish: the WARM hold alone. fish reads no file of aterm's before its

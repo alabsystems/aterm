@@ -1,37 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Following aterm across a self-update: a `subscribe` stream and a blocking
-//! read go on with the instance that replaced the one they were talking to.
+//! Reconnecting `subscribe` streams and blocking reads across aterm self-updates.
 //!
-//! An update replaces the server process and its socket (`aterm.sock` is
-//! repointed at the successor's `aterm-<pid>.sock`), and the old process
-//! `_exit`s at its Commit, closing every connection it held. At a hang-up the
-//! stream did not announce:
-//!
-//! 1. every subscribed session already said `EVENT <local> exited`: the session
-//!    is over, exit 0;
-//! 2. the same server process still answers `version` on the dialled socket
-//!    ([`serving_pid_within`]) through the same listening socket
-//!    ([`ListenerId`]): it ended the stream on purpose, exit 0;
-//! 3. otherwise, within [`SUCCESSOR_BOUND`], another live server answering
-//!    where this call's own resolution now points ([`Follow`]) is the
-//!    successor: a different process, or the same pid through a fresh listening
-//!    socket (a cold update's `exec`). `subscribe` re-sends its request there
-//!    and keeps relaying; a blocking read is asked once more. No successor:
-//!    exit [`EXIT_REPLACED`] (75), never 0.
-//!
-//! Behind a forward, the relay reports its host's exit in place of the EOF
-//! ([`aterm_types::control_verbs::host_gone_line`]); rule 2 does not apply, and
-//! rule 3 follows the host ([`Follow::Host`]). An explicit `--timeout` bounds
-//! the whole relay, the successor wait included; a hang-up never extends it.
-//!
-//! A successor is never an instance the caller did not reach this way: not the
-//! dead-alias fallback a fresh flagless call takes, not another process for a
-//! `--pid` pin, and, inside a session, not the `latest` alias (with two windows
-//! up it names the newer one, whose active tab is a stranger's). A self
-//! `subscribe` moves to a successor's own session only on a relaunch at the
-//! fixed socket the call named ([`after_refusal`]).
+//! On unexpected hang-up or [`aterm_types::control_verbs::host_gone_line`], checks whether the
+//! server still answers ([`serving_pid_within`], [`ListenerId`]) or redials the successor within
+//! [`SUCCESSOR_BOUND`] via [`Follow`] ([`Follow::Host`], [`after_refusal`]), exiting with
+//! [`EXIT_REPLACED`] if none answers.
 
 use std::io::{self, BufReader, Read as _};
 use std::path::PathBuf;
@@ -42,11 +17,7 @@ use aterm_uds::CtlStream;
 use aterm_uds::exitwatch::ExitMoment;
 use aterm_uds::process::BootClock;
 
-/// The exit code of an exchange cut by its server going away with no successor
-/// answering (a failed update, a crash, a quit), or that is not asked again:
-/// EX_TEMPFAIL's number, distinct from 0 ("session over") and from 1/124 (a
-/// refusal, a timeout). Every client in this binary ends such an exchange with
-/// it.
+/// The exit code of an exchange cut by its server going away with no successor answering.
 pub const EXIT_REPLACED: u8 = 75;
 
 /// How long a successor may take to answer.
@@ -58,50 +29,32 @@ const SUCCESSOR_POLL: Duration = Duration::from_millis(100);
 /// Where a successor of the server this call reached may answer.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Follow {
-    /// A socket path the call pinned (`--sock`): a successor rebinds that
-    /// same path.
+    /// A socket path the call pinned (`--sock`).
     Path(String),
-    /// Nothing pinned: with a session to follow, the instance hosting it (its
-    /// graph entry, `<dir>/graph/<sid>`) and nothing else; with none, the
-    /// `latest` alias `<dir>/aterm.sock`. A successor republishes both and
-    /// binds a new per-instance socket (`aterm-<its pid>.sock`), so the socket
-    /// dialled never answers again.
+    /// Nothing pinned: with a session to follow.
     Flagless {
-        /// The rendezvous dir the call resolved against.
+        /// The rendezvous dir the call resolved.
         dir: PathBuf,
-        /// The session whose host the call reached: the one its request names
-        /// when that instance was dialled directly, else the caller's own
-        /// (`$ATERM_PARENT_SESSION_ID`).
+        /// The session whose host the call reached.
         sid: Option<String>,
     },
-    /// Behind a forward: the server this call dialled only relayed the request
-    /// to the aterm hosting its session, and that host went away under it
-    /// ([`aterm_types::control_verbs::host_gone_line`]). Its successor answers
-    /// at `sock` when it rebinds a fixed socket, else where it republishes the
-    /// session's graph entry, `<dir of sock>/graph/<sid>`. Followed there
-    /// directly with that instance's own token: through the relay it would meet
-    /// `ERR no such session` until the successor republished.
+    /// Behind a forward: the server this call dialled only relayed the request to the aterm.
     Host {
-        /// The socket the gone host was reached at.
+        /// The socket the gone host was reached.
         sock: String,
-        /// The session the request names (`@s-…`), whose graph entry the
-        /// host's successor republishes; `None` when the request names none.
+        /// The session the request names (`@s-…`).
         sid: Option<String>,
     },
-    /// No successor follows, for the reason given (a `--pid` pin still follows
-    /// its own process: [`Unfollowed::PidPin`]).
+    /// No successor follows, for the reason given.
     Nothing(Unfollowed),
 }
 
-/// Why a call follows no successor — the one reason its exit-75 note gives.
+/// Why a call follows no successor.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Unfollowed {
-    /// `--pid <n>` names one process. That process back on a fresh listening
-    /// socket (a cold update's `exec` keeps the pid) is followed while it lives
-    /// ([`Redial::after_hangup`]), identified by its kernel start record
-    /// ([`Redial::new`]).
+    /// `--pid <n>` names one process.
     PidPin(u32),
-    /// The redialled leg of a blocking read: this was already the one retry.
+    /// The redialled leg of a blocking read.
     AskedOnce,
 }
 
@@ -109,43 +62,33 @@ pub(crate) enum Unfollowed {
 #[derive(Clone, Debug)]
 pub(crate) struct Redial {
     follow: Follow,
-    /// The start record of the process a `--pid` pin names
-    /// ([`process_started`]), read when the call began; `None` otherwise.
+    /// The start record of the process a `--pid` pin names ([`process_started`]).
     pinned: Option<Stamp>,
     bound: Duration,
-    /// When a process started: [`process_started`], or a test's stand-in.
+    /// When a process started.
     started: fn(u32) -> Option<Stamp>,
-    /// The clock a hang-up is read on: [`Stamp::now`], or a test's stand-in.
+    /// The clock a hang-up is read.
     clock: fn() -> Stamp,
-    /// Told the pid of each server whose exit this relay watches, so a test
-    /// can start a relaunch only once a watched exit is stamped.
+    /// Told the pid of each server whose exit this relay watches.
     #[cfg(test)]
     on_watch: Option<fn(u32)>,
 }
 
-/// What a hang-up turned out to be.
+/// What a hang-up turned out.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Hangup {
-    /// The server we dialled still answers, through the listening socket the
-    /// stream was accepted through: it ended the exchange on purpose.
+    /// The server we dialled still answers.
     StillServing,
-    /// A live server answers where this call follows, and it is not the one
-    /// the stream was on: another process, or the same pid through a fresh
-    /// listening socket ([`ListenerId`]).
+    /// A live server answers where this call follows, and it is not the one the stream.
     Successor { path: String, pid: u32 },
-    /// Nothing answered within `waited`: [`SUCCESSOR_BOUND`], or less when the
-    /// caller's deadline had less left (`by_deadline`); zero when nothing
-    /// follows, or the process a `--pid` pin follows has ended.
+    /// Nothing answered within `waited`.
     Gone { waited: Duration, by_deadline: bool },
-    /// This platform cannot read a peer pid, so a replacement cannot be told
-    /// from a deliberate end: a stream ends 0, a blocking read reports its error.
+    /// This platform cannot read a peer pid, so a replacement cannot be told from a deliberate end.
     Unknown,
 }
 
 impl Redial {
-    /// The policy for a call that follows `follow`. A `--pid` pin is recorded
-    /// by its kernel start record: an `exec` keeps it, and a later process
-    /// given the same pid has another.
+    /// The policy for a call that follows `follow`.
     pub(crate) fn new(follow: Follow) -> Self {
         let pinned = match &follow {
             Follow::Nothing(Unfollowed::PidPin(pid)) => process_started(*pid),
@@ -162,8 +105,7 @@ impl Redial {
         }
     }
 
-    /// A policy that never follows — the redialled leg of a blocking read,
-    /// which is retried once.
+    /// A policy that never follows.
     pub(crate) fn none() -> Self {
         Self::new(Follow::Nothing(Unfollowed::AskedOnce))
     }
@@ -176,10 +118,7 @@ impl Redial {
         }
     }
 
-    /// The policy for what follows a forward's host that went away at `sock`
-    /// ([`Follow::Host`]), for a request naming the session `sid`. A `--pid` pin
-    /// (it names the relay, not the host) and a retry leg still follow nothing;
-    /// the bound, clocks and start-record reader stay the call's.
+    /// The policy for what follows a forward's host that went away at `sock` ([`Follow::Host`]).
     pub(crate) fn host(&self, sock: &str, sid: Option<&str>) -> Self {
         match &self.follow {
             Follow::Nothing(Unfollowed::PidPin(_) | Unfollowed::AskedOnce) => self.clone(),
@@ -201,24 +140,21 @@ impl Redial {
         self
     }
 
-    /// The same policy reading a successor's start from `started` (tests: an
-    /// in-process fake successor started long before any hang-up it serves).
+    /// The same policy reading a successor's start from `started`.
     #[cfg(all(test, unix))]
     pub(crate) fn with_started(mut self, started: fn(u32) -> Option<Stamp>) -> Self {
         self.started = started;
         self
     }
 
-    /// The same policy reading every moment it stamps from `clock` (tests: a
-    /// stepped or foreign clock, or one that records its readers).
+    /// The same policy reading every moment it stamps from `clock`.
     #[cfg(all(test, unix))]
     pub(crate) fn with_clock(mut self, clock: fn() -> Stamp) -> Self {
         self.clock = clock;
         self
     }
 
-    /// The same policy telling `note` the pid of each server whose exit it
-    /// watches, once the watch is registered.
+    /// The same policy telling `note` the pid of each server whose exit it watches.
     #[cfg(all(test, unix))]
     pub(crate) fn with_watch_note(mut self, note: fn(u32)) -> Self {
         self.on_watch = Some(note);
@@ -226,8 +162,6 @@ impl Redial {
     }
 
     /// Stamp the exit of the live server `pid` when the kernel reports it
-    /// ([`ExitMoment`]). `None` where it cannot be watched; [`HangupAt::seen`]
-    /// alone then orders a successor.
     fn watch_exit(&self, pid: Option<u32>) -> Option<ExitMoment<Stamp>> {
         let pid = pid?;
         let watch = ExitMoment::watch(pid, self.clock)?;
@@ -238,10 +172,7 @@ impl Redial {
         Some(watch)
     }
 
-    /// The [`Arrival`] of the successor `pid` answering at `path`, for a
-    /// stream whose server went away at `hung_up` ([`HangupAt::moment`]):
-    /// [`Arrival::Shared`] unless `path` is the fixed socket this call named
-    /// ([`only_a_relaunch_binds`]), else when it started.
+    /// The [`Arrival`] of the successor `pid` answering at `path`.
     pub(crate) fn arrival(&self, pid: u32, path: &str, hung_up: Stamp) -> Arrival {
         match &self.follow {
             Follow::Path(fixed) if fixed == path && only_a_relaunch_binds(path) => {
@@ -252,11 +183,6 @@ impl Redial {
     }
 
     /// Every path a successor of the server reached at `dialed` may answer on,
-    /// in order, resolved now. A call that reached a session's host follows
-    /// only that session's graph entry: the dialled path and the alias can name
-    /// another live window, and only the entry is republished by the hosting
-    /// instance's successor. Nothing is dialled here; the wait's own probe
-    /// asks each candidate.
     fn candidates(&self, dialed: &str) -> Vec<String> {
         match &self.follow {
             Follow::Path(path) => vec![dialed.to_string(), path.clone()],
@@ -278,16 +204,12 @@ impl Redial {
                     .chain(republished.filter(|entry| entry != sock))
                     .collect()
             }
-            // Where the pinned process was reached ([`Unfollowed::PidPin`]).
             Follow::Nothing(Unfollowed::PidPin(_)) => vec![dialed.to_string()],
             Follow::Nothing(_) => Vec::new(),
         }
     }
 
-    /// Classify a hang-up from the server `old` reached at `dialed` through
-    /// `listener` (the module rule). Waits for a successor up to the bound or
-    /// the caller's deadline `until`, whichever is first; returns at once when
-    /// the old server still serves or nothing can follow.
+    /// Classify a hang-up from the server `old` reached at `dialed` through `listener`.
     pub(crate) fn after_hangup(
         &self,
         dialed: &str,
@@ -308,19 +230,12 @@ impl Redial {
         self.successor(dialed, old, listener, &wait, true)
     }
 
-    /// Classify a hang-up a forward said was its host's: `old`, reached at
-    /// `sock`, went away under the relay, which already looked for a deliberate
-    /// end. Waits for a successor as [`Redial::after_hangup`] does, where this
-    /// policy follows ([`Redial::host`]); the host answering at `sock` again
-    /// counts as one, never as [`Hangup::StillServing`], which would end the
-    /// stream as one ended on purpose.
+    /// Classify a hang-up a forward said.
     pub(crate) fn after_host_gone(&self, sock: &str, old: u32, until: Option<Instant>) -> Hangup {
         self.successor(sock, old, None, &Wait::from_now(self.bound, until), false)
     }
 
     /// The successor wait of [`Redial::after_hangup`] and
-    /// [`Redial::after_host_gone`]: a live server answering where this policy
-    /// follows — never `old` through `listener` again, when `exclude_old`.
     fn successor(
         &self,
         dialed: &str,
@@ -329,12 +244,6 @@ impl Redial {
         wait: &Wait,
         exclude_old: bool,
     ) -> Hangup {
-        // A `--pid` pin follows that one process alone: back on a fresh
-        // listener where it was reached (only a listener identity tells that
-        // from the one that hung up), and only while its start record still
-        // names it. `kill(pid, 0)` is not enough: a zombie passes it, answers
-        // nothing, and has no start record. With no record read (another uid, a
-        // platform that keeps none) the pin follows nothing.
         let pin = match (&self.follow, self.pinned) {
             (Follow::Nothing(Unfollowed::PidPin(pin)), Some(born)) if listener.is_some() => {
                 Some((*pin, born))
@@ -379,7 +288,6 @@ impl Redial {
 }
 
 /// One wait for a successor: from when it began, to the bound or the caller's
-/// explicit deadline, whichever comes first (the rule on this module).
 struct Wait {
     started: Instant,
     deadline: Instant,
@@ -399,7 +307,6 @@ impl Wait {
     }
 
     /// The pid answering at `path`, waiting no longer than the wait has left
-    /// (never less than [`PROBE_FLOOR`], never more than [`PROBE_TIMEOUT`]).
     fn probe(&self, path: &str) -> Option<u32> {
         let left = self.deadline.saturating_duration_since(Instant::now());
         serving_pid_within(path, left.clamp(PROBE_FLOOR, PROBE_TIMEOUT))
@@ -407,7 +314,6 @@ impl Wait {
 }
 
 /// How long a probe waits for `OK` to its `version` — less when the caller's
-/// deadline has less left, never less than [`PROBE_FLOOR`].
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// The shortest probe: a live aterm answers `version` in well under this.
@@ -420,25 +326,12 @@ pub(crate) fn serving_pid(path: &str) -> Option<u32> {
 }
 
 /// The pid of the process answering at `path` right now (it accepted a
-/// connection and answered `version` with `OK` within `wait`), or `None`
-/// (nothing answers, or the platform cannot read a peer pid).
-///
-/// A bare connect is not enough: a killed server closes its streams before its
-/// listening socket, and a connect in between lands in the dying listener's
-/// backlog and reads the dead process's pid.
 fn serving_pid_within(path: &str, wait: Duration) -> Option<u32> {
     let (pid, line) = version_at(path, wait)?;
     super::is_ok_reply(&line).then_some(pid?)
 }
 
 /// What answered `version` at `path` within `wait`: the peer's pid, where it
-/// could be read, and its status line, including one a listener left when it
-/// closed before the request was written ([`ask_once`]). `None` when nothing
-/// connected, or nothing was said.
-///
-/// The pid can be missing even from a live process: Darwin answers `ENOTCONN`
-/// to `LOCAL_PEERPID` once the peer has closed, and a busy listener writes its
-/// line and closes at once.
 fn version_at(path: &str, wait: Duration) -> Option<(Option<u32>, String)> {
     let (stream, token) = super::connect_then_read(path, super::read_token_for).ok()?;
     let pid = server_pid(&stream);
@@ -452,15 +345,6 @@ fn version_at(path: &str, wait: Duration) -> Option<(Option<u32>, String)> {
 }
 
 /// Whether the server `pid` still answers at `path` through `listener`, with
-/// any answer to `version`: `OK`, or the busy refusal of a listener with every
-/// lane at work. Either is a live accept loop (a dying one, or its backlog,
-/// writes nothing), so a successor that closed on a resume ask without a word
-/// is still there to ask again ([`relay_subscription`]); by `OK` alone a
-/// saturated successor would read as gone.
-///
-/// A busy answer often has no pid ([`version_at`]); the listening socket, read
-/// once a connection to `pid` was up and unchanged since, then names the
-/// server. Without it, an answer with no pid proves nothing.
 fn answers_at(path: &str, pid: u32, listener: Option<ListenerId>) -> bool {
     let Some((answered, line)) = version_at(path, PROBE_TIMEOUT) else {
         return false;
@@ -477,27 +361,15 @@ pub(crate) fn server_pid(stream: &CtlStream) -> Option<u32> {
     aterm_uds::fdpass::peer_pid(stream).ok()
 }
 
-/// Which listening socket a path names, since a pid alone does not name a
-/// server ([`aterm_uds::listener`]).
+/// Which listening socket a path names, since a pid alone does not name a server.
 pub(crate) use aterm_uds::listener::{ListenerId, listener_at};
 
 /// Whether `pid`, answering at `path`, is the server `old` a stream reached
-/// through `listener`: the same process and, where both were read, the same
-/// listening socket ([`ListenerId`]).
 fn is_the_same_server(pid: u32, path: &str, old: u32, listener: Option<ListenerId>) -> bool {
     pid == old && aterm_uds::listener::still_names(path, listener)
 }
 
-/// The one session the request `line` names by id, read by the wire's one
-/// grammar ([`aterm_types::control_request::head`]): a leading `@s-<hex>`, or
-/// the single `@s-<hex>` a selectorless `subscribe` names second
-/// ([`aterm_types::control_request::subscribe_target`]) — the shapes a server
-/// relays to the aterm hosting the session. So it is the instance this client
-/// dials for the request ([`super::targets`]) and the one whose host a hang-up
-/// behind a forward follows ([`Follow::Host`]); and the connection a
-/// persistent client (aterm-agent's `RelayCtl`) sends it on. `None` for
-/// anything else: self, a local number, `@*`, a list. A trailing line end is
-/// no part of it.
+/// The one session the request `line` names by id, read by the wire's one grammar.
 #[must_use]
 pub fn target_sid(line: &str) -> Option<aterm_types::control_request::Sid<'_>> {
     use aterm_types::control_request::{self, Selector};
@@ -511,14 +383,10 @@ pub fn target_sid(line: &str) -> Option<aterm_types::control_request::Sid<'_>> {
     }
 }
 
-/// A moment as this machine's clocks read it: what a hang-up and a
-/// successor's start are ordered by ([`later`]).
+/// A moment as this machine's clocks read it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Stamp {
-    /// The kernel's boot clock ([`BootClock`]): monotonic, so a wall-clock step
-    /// cannot reorder two readings. `None` where this process cannot read it
-    /// in the kernel's unit: Windows, or a Rosetta-translated process
-    /// ([`aterm_uds::process::apple_boot_clock`]).
+    /// The kernel's boot clock ([`BootClock`]).
     pub(crate) boot: Option<BootClock>,
     /// The wall clock: the basis only where one side has no boot reading.
     pub(crate) wall: Option<SystemTime>,
@@ -534,12 +402,7 @@ impl Stamp {
     }
 }
 
-/// Whether `a` is strictly after `b`: on the boot clock where both were read
-/// there, else on the wall clock where both were; `None` when they share
-/// neither. The boot clock first, because a wall-clock step can reorder them;
-/// where one side has only the wall clock (an unreadable boot record, or a
-/// hang-up read under Rosetta, whose `mach_absolute_time` is in nanoseconds while
-/// start records are in kernel ticks), a step can still misjudge.
+/// Whether `a` is strictly after `b`.
 pub(crate) fn later(a: Stamp, b: Stamp) -> Option<bool> {
     match (a.boot, b.boot) {
         (Some(a), Some(b)) => Some(a > b),
@@ -547,11 +410,7 @@ pub(crate) fn later(a: Stamp, b: Stamp) -> Option<bool> {
     }
 }
 
-/// When the process `pid` started, as the kernel recorded it
-/// ([`aterm_uds::process::read_process_start`]: boot clock on macOS and Linux,
-/// with macOS's wall record beside it), or on the wall clock alone
-/// ([`aterm_uds::process::read_process_birth`]). `None` on another platform,
-/// for another uid's process, or one that has ended.
+/// When the process `pid` started.
 pub(crate) fn process_started(pid: u32) -> Option<Stamp> {
     let pid = i32::try_from(pid).ok()?;
     let wall = |birth: aterm_uds::process::ProcessBirth| {
@@ -573,11 +432,6 @@ pub(crate) fn process_started(pid: u32) -> Option<Stamp> {
 }
 
 /// Whether the socket at `path` is one only a relaunch of the instance
-/// configured on it can bind: a fixed `--control-sock` path. Not the `latest`
-/// alias (`aterm.sock` or any link, which names the newest instance and may be
-/// republished by another window's update successor), and not an instance's
-/// own `aterm-<pid>.sock` (a new process there only reuses the pid). On those
-/// a fresh process cannot be told from another aterm's.
 fn only_a_relaunch_binds(path: &str) -> bool {
     let path = std::path::Path::new(path);
     let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
@@ -589,8 +443,7 @@ fn only_a_relaunch_binds(path: &str) -> bool {
         && aterm_uds::latest::target_name(path).is_none()
 }
 
-/// Whether an I/O error means the peer went away (as opposed to a deadline or a
-/// local fault).
+/// Whether an I/O error means the peer went away (as opposed to a deadline or a local fault).
 pub(crate) fn is_hangup(e: &io::Error) -> bool {
     matches!(
         e.kind(),
@@ -602,28 +455,7 @@ pub(crate) fn is_hangup(e: &io::Error) -> bool {
     )
 }
 
-/// Whether a request is retried once on a successor after a hang-up before its
-/// reply: a blocking read with no instance-local anchor. Not retried (they end
-/// with [`EXIT_REPLACED`] and a [`not_asked_again_note`]):
-/// * `await seq <n>`, `await inbox since=<id>`, `await agent … since=<rev>`,
-///   `inbox get <id>` and `inbox since=<id>`: a successor restarts grid
-///   counters and agent verdict revs, and numbers the rows it re-delivers
-///   afresh; `await edit ticket=<t>`: a successor knows no ticket the old
-///   process minted (`await edit uri=` is retried: it waits on the file);
-/// * waits anchored at the moment they were armed (`await block`, a bare
-///   `await seq`, `await consent`, an `await log` with no `since=` other than
-///   the latching `need`): what they wait for may be what a parked producer
-///   deferred to the successor, parsed before any retry can arm (a resting
-///   turn's settle close, written by the successor before a retry arms at
-///   its head, would never answer). `await log … since=<seq> ep=<e>` is
-///   retried: the session log's seq space continues across an update, and
-///   the successor's read says the handoff's hole as `OK gap why=handoff`;
-///   so is a since-less `await log need`, which latches on the needs the
-///   carried fold holds open. A since-less predicate list is retried only
-///   when every member is `need`: any other member (`need,close=turn`)
-///   arms at the successor's head as it would alone;
-/// * a request naming its session by local number (`@<n>`,
-///   [`is_local_selector`]), which a successor assigns afresh.
+/// Whether a request is retried once on a successor after a hang-up before its reply.
 pub(crate) fn retries_across_replacement(request_parts: &[String]) -> bool {
     let rest = match request_parts.first() {
         Some(sel) if is_local_selector(sel) => return false,
@@ -647,16 +479,6 @@ pub(crate) fn retries_across_replacement(request_parts: &[String]) -> bool {
 }
 
 /// Whether an `await log` (its arguments, `log` first) names where it reads
-/// from on its own: a `since=` cursor, which means the same on a successor
-/// (the log's seq space continues across an update), or the `need` form,
-/// which latches on the needs the carried fold holds open. A predicate list
-/// latches only as far as its members do: every member
-/// `need` (`need,need`) resumes as `need` does, but one other member
-/// (`need,close=turn`) is anchored at the moment it was armed — a resting
-/// turn's settle close the successor wrote before a retry armed at its head
-/// would never answer it — so the list is not asked again, as that member
-/// alone is not. Every other since-less `await log` is anchored at the
-/// moment it was armed.
 fn log_wait_resumes(args: &[&str]) -> bool {
     args.iter()
         .skip(1)
@@ -664,17 +486,12 @@ fn log_wait_resumes(args: &[&str]) -> bool {
 }
 
 /// Whether an `inbox` request is a plain read of what is queued now: a
-/// count, `--peek` and `--meta` name nothing in the old process, unlike
-/// `get <id>`, `since=<id>` or a write such as `seen <id>`.
 fn inbox_plain_read(args: &[&str]) -> bool {
     args.iter()
         .all(|a| matches!(*a, "--peek" | "--meta") || a.parse::<u64>().is_ok())
 }
 
-/// The part of a blocking read that names something in the old process (a
-/// local session number `@3`, a grid counter `seq 40`, an inbox anchor
-/// `since=12` / `inbox get 4`, an agent verdict rev `since=7`); `None` when
-/// the request carries none.
+/// The part of a blocking read that names something in the old process.
 pub(crate) fn old_process_anchor(request_parts: &[String]) -> Option<String> {
     let rest = match request_parts.first() {
         Some(sel) if is_local_selector(sel) => return Some(sel.clone()),
@@ -703,7 +520,6 @@ pub(crate) fn old_process_anchor(request_parts: &[String]) -> Option<String> {
 }
 
 /// The first `subscribe` target named by local number (`@<n>`) that the
-/// stream never tied to a session id, which [`resume_request`] cannot follow.
 fn untied_local_target(request: &str, sids: &[(String, String)]) -> Option<String> {
     request
         .split_whitespace()
@@ -728,11 +544,6 @@ fn verb_and_args<S: AsRef<str>>(request_parts: &[S]) -> (Option<&str>, Vec<&str>
 }
 
 /// The wait a request is when it waits for a change after the moment it was
-/// armed, past a leading `@<selector>`: `await block`, `await consent`, or a
-/// bare `await seq` (no counter after `seq`; a `key=value` such as
-/// `timeout=0` is not one). `None` otherwise. Its event may have happened while
-/// the connection was down, so it is never asked again blind
-/// ([`not_asked_again_note`]).
 fn armed_wait<S: AsRef<str>>(request_parts: &[S]) -> Option<&'static str> {
     let (Some("await"), args) = verb_and_args(request_parts) else {
         return None;
@@ -746,9 +557,7 @@ fn armed_wait<S: AsRef<str>>(request_parts: &[S]) -> Option<&'static str> {
     }
 }
 
-/// What a request cut by a replacement and not asked again
-/// ([`retries_across_replacement`]) tells its caller: why, and what to do
-/// instead.
+/// What a request cut by a replacement and not asked again ([`retries_across_replacement`]) tells.
 pub(crate) fn not_asked_again_note(request_parts: &[String]) -> String {
     match (verb_and_args(request_parts).0, armed_wait(request_parts)) {
         (Some("turn"), _) => {
@@ -781,14 +590,11 @@ pub(crate) fn not_asked_again_note(request_parts: &[String]) -> String {
              waiting again"
                 .to_owned()
         }
-        // An edit's ticket: the successor waits on the file's views instead.
         _ if old_process_anchor(request_parts).is_some_and(|a| a.starts_with("ticket=")) => {
             "an edit's `ticket=` names a ticket of the old process — wait again by the file: \
              `await edit uri=<file-uri>`"
                 .to_owned()
         }
-        // The anchor itself, when the request names one ([`old_process_anchor`]);
-        // with none (a bare `await`), no reason is claimed.
         _ => match old_process_anchor(request_parts) {
             Some(anchor) => {
                 format!("`{anchor}` names a position in the old process — re-issue it")
@@ -798,12 +604,7 @@ pub(crate) fn not_asked_again_note(request_parts: &[String]) -> String {
     }
 }
 
-/// [`gone_note`] for the request it cut, and for a `turn` or a `post` — a
-/// write that may already have taken effect — what to do instead, as when a
-/// successor answers ([`not_asked_again_note`]). A crash the PTY keeper
-/// recovers the session from leaves its agent running whether or not a new
-/// aterm answers in time, so a blind retry of either could type the prompt
-/// twice or post twice.
+/// [`gone_note`] for the request it cut, and for a `turn` or a `post`.
 pub(crate) fn gone_request_note(gone: String, request_parts: &[String]) -> String {
     if !matches!(verb_and_args(request_parts).0, Some("turn" | "post")) {
         return gone;
@@ -815,19 +616,13 @@ pub(crate) fn gone_request_note(gone: String, request_parts: &[String]) -> Strin
     }
 }
 
-/// Whether a hang-up before the reply is reported as a replacement (followed
-/// to a successor, or [`EXIT_REPLACED`] with a note) rather than a bare
-/// connection error: every blocking read ([`is_blocking_read`]), `turn` and
-/// `post`. A caller retrying a `turn` after a bare error would type the prompt
-/// twice, and a `post --wait=` (or `--wait-ack`) queued before the park is sent
-/// by the successor; neither is asked again ([`retries_across_replacement`]).
+/// Whether a hang-up before the reply is reported as a replacement.
 pub(crate) fn reports_replacement(request_parts: &[String]) -> bool {
     is_blocking_read(request_parts)
         || matches!(verb_and_args(request_parts).0, Some("turn" | "post"))
 }
 
-/// Whether the request is a blocking read at all (so a hang-up before its reply
-/// is reported as a replacement rather than as a bare connection error).
+/// Whether the request is a blocking read at all.
 pub(crate) fn is_blocking_read(request_parts: &[String]) -> bool {
     let rest = match request_parts.first() {
         Some(sel) if sel.starts_with('@') => &request_parts[1..],
@@ -839,34 +634,13 @@ pub(crate) fn is_blocking_read(request_parts: &[String]) -> bool {
     )
 }
 
-/// Whether `sel` names a session by the process-local number the server gave
-/// it (`@<digits>`, `Selector::Local`), which a successor assigns afresh.
+/// Whether `sel` names a session by the process-local number the server gave it.
 pub(crate) fn is_local_selector(sel: &str) -> bool {
     sel.strip_prefix('@')
         .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
 }
 
 /// The request a redialled `subscribe` sends.
-///
-/// `since=` (the old process's per-grid content counter, which a successor
-/// restarts) is dropped, so the successor sends each target's screen fresh. The
-/// event anchors `since-block=` and `since-turn=` mean the same on the successor
-/// (the handoff carries blocks and turn ids), so they are kept and advanced past
-/// the newest this relay saw ([`EventAnchors`]); a successor below an anchor
-/// seeds at its live high. The `log` stream's `since-log=<seq> log-ep=<e>` is
-/// never the request's own once the relay knows better: it is the last record
-/// relayed and the epoch it was read in (a carried update continues the seq
-/// space, so the successor's read goes on from exactly there and says the
-/// handoff's hole as a `GAP … why=handoff`; the request's own would re-push
-/// what was relayed, and none would lose what came between the legs). Only a
-/// single-target stream carries them (the server takes resume anchors for one
-/// target only).
-///
-/// A self target (`@.`, `@`, or none) is pinned to the sid the stream's `sub`
-/// line named, since self resolves again on the successor; with no sid, the
-/// anchors are left off. A local-number target (`@<n>`) is rewritten to the sid
-/// its `sub <n> <sid>` line tied it to ([`FrameTracker::sids`]); `None` when one
-/// never was.
 pub(crate) fn resume_request(
     request: &str,
     sids: &[(String, String)],
@@ -875,11 +649,7 @@ pub(crate) fn resume_request(
     resume_request_with(request, sids, seen, true)
 }
 
-/// The same request with its self target as the client wrote it and no
-/// anchors: the fallback for a pinned resume a fresh successor refused with
-/// `ERR no such session` (a fresh instance names its sessions afresh). Asked
-/// only of a fresh successor ([`after_refusal`]). `None` when it would equal
-/// the pinned request.
+/// The same request with its self target as the client wrote it and no anchors.
 pub(crate) fn unpinned_resume_request(
     request: &str,
     sids: &[(String, String)],
@@ -890,14 +660,7 @@ pub(crate) fn unpinned_resume_request(
     (unpinned != pinned).then_some(unpinned)
 }
 
-/// What one resume leg may ask ([`relay_subscription`]): the last leg's
-/// `request` resumed ([`resume_request`]), and the original request's self
-/// target as written, with no anchors ([`unpinned_resume_request`]), when that
-/// differs; [`after_refusal`] decides whether it is asked. `None` as
-/// [`resume_request`].
-///
-/// The fallback derives from the original, not the last leg: after one pinned
-/// resume the leg names a sid, so a fallback derived from it would be `None`.
+/// What one resume leg may ask ([`relay_subscription`]).
 pub(crate) fn resume_lines(
     original: &str,
     request: &str,
@@ -918,7 +681,6 @@ fn resume_request_with(
     let mut out: Vec<String> = Vec::new();
     let mut block = seen.block;
     let mut turn = seen.turn;
-    // The request's own log cursor, which what the relay saw since replaces.
     let (mut log_seq, mut log_ep) = (None, None);
     let anchor = |v: &str| v.parse::<u64>().ok();
     for token in request.split_whitespace() {
@@ -963,8 +725,6 @@ fn resume_request_with(
         _ => false,
     };
     let self_target = selectors.first().is_none_or(|s| is_self_selector(s));
-    // The anchors are one session's ids: sent for a single target only, and for
-    // self only once it is pinned to its sid ([`resume_request`]).
     let pinned = single && (!self_target || (pin && pin_self(&mut out, sids)));
     if pinned {
         if let Some(id) = block {
@@ -973,7 +733,6 @@ fn resume_request_with(
         if let Some(id) = turn {
             out.push(format!("since-turn={id}"));
         }
-        // Both or neither: the server takes one only with the other.
         if let (Some(seq), Some(ep)) = (seen.log_seq.or(log_seq), seen.log_ep.or(log_ep)) {
             out.push(format!("since-log={seq} log-ep={ep}"));
         }
@@ -984,8 +743,6 @@ fn resume_request_with(
 }
 
 /// Rewrite a self target in `out` to `@<sid>` of the session the stream was
-/// tied to ([`self_sid`]), replacing `@.`/`@` or inserted after `subscribe`
-/// when no selector was named. `false` when there is no such sid.
 fn pin_self(out: &mut Vec<String>, sids: &[(String, String)]) -> bool {
     let Some(sid) = self_sid(sids) else {
         return false;
@@ -1005,14 +762,11 @@ fn pin_self(out: &mut Vec<String>, sids: &[(String, String)]) -> bool {
 }
 
 /// Whether a selector token names the connection's own session (`@.`), which
-/// the server resolves afresh on every request. A bare `@` names nothing and
-/// never leaves the client (`refuse_empty_selectors`).
 fn is_self_selector(token: &str) -> bool {
     token == "@."
 }
 
 /// The one session a single-target stream's `sub` lines tied it to, or `None`
-/// when they named none or more than one.
 fn self_sid(sids: &[(String, String)]) -> Option<&str> {
     let (_, first) = sids.first()?;
     sids.iter()
@@ -1020,31 +774,23 @@ fn self_sid(sids: &[(String, String)]) -> Option<&str> {
         .then_some(first.as_str())
 }
 
-/// The newest `block-complete` and `turn` ids a relayed `events` stream has
-/// shown, and where its `log` stream stands (the seq of the last `LOG` line
-/// relayed and the epoch it reads in), across every leg: what a resumed
-/// request continues after ([`resume_request`]).
+/// The newest `block-complete` and `turn` ids a relayed `events` stream has shown.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct EventAnchors {
     pub(crate) block: Option<u64>,
     pub(crate) turn: Option<u64>,
-    /// The `log` stream's cursor: the seq of the newest record relayed (or
-    /// the stream's start, its `sub` line's `log_seq=`, or a `GAP`'s
-    /// `resync_to=`) …
+    /// The `log` stream's cursor.
     pub(crate) log_seq: Option<u64>,
-    /// … and the epoch that seq is read in (the `sub` line's `log_ep=`, a
-    /// `GAP`'s `ep=`).
+    /// … and the epoch that seq is read in (the `sub` line's `log_ep=`, a `GAP`'s `ep=`).
     pub(crate) log_ep: Option<u32>,
 }
 
 /// Whether the subscription's target set is the live `@*` roster, which never
-/// ends by its sessions exiting.
 fn targets_everything(request: &str) -> bool {
     request.split_whitespace().any(|t| t == "@*")
 }
 
 /// Whether `request` names every session it follows by id, as a pinned resume
-/// does ([`resume_request`]), rather than `@*` or a self target.
 fn names_its_sessions(request: &str) -> bool {
     let mut pieces = request
         .split_whitespace()
@@ -1054,15 +800,7 @@ fn names_its_sessions(request: &str) -> bool {
     pieces.peek().is_some() && pieces.all(|piece| piece != "@*" && !is_self_selector(piece))
 }
 
-/// Follows the push stream's framing just far enough to know when every
-/// subscribed session has said `EVENT <local> exited`. Header lines are parsed;
-/// the bodies after some (a `screen` or `cells` DELTA, a `BYTES` frame) are
-/// skipped by count, so a body reading `EVENT 1 exited` is never taken for a
-/// frame. Anything it cannot frame makes it `lost`: it then never says the
-/// session is over.
-///
-/// It also relays the stream ([`FrameTracker::relay`]), keeping back a forward's
-/// host-gone line ([`aterm_types::control_verbs::host_gone_line`]).
+/// Follows the push stream's framing just far enough to know when every subscribed session.
 #[derive(Debug, Default)]
 pub(crate) struct FrameTracker {
     line: Vec<u8>,
@@ -1074,16 +812,13 @@ pub(crate) struct FrameTracker {
     lost: bool,
     /// The newest block and turn ids relayed, kept across legs.
     anchors: EventAnchors,
-    /// The host a forward said went away under this leg: its pid and the
-    /// socket it was reached at.
+    /// The host a forward said went away under this leg.
     gone: Option<(u32, String)>,
-    /// The instance said `EVENT * bye quit` on this leg: it is quitting, and
-    /// nothing replaces a quit.
+    /// The instance said `EVENT * bye quit` on this leg.
     quit: bool,
 }
 
 /// The longest header line the tracker keeps; a longer one is not a frame
-/// header this client knows.
 const MAX_HEADER: usize = 4096;
 
 impl FrameTracker {
@@ -1095,10 +830,7 @@ impl FrameTracker {
         }
     }
 
-    /// A redialled leg starts a new stream: new `sub` lines, new locals. The
-    /// event anchors carry over only when the leg relays the same session; on
-    /// another ([`LegSession::Other`], a fresh successor's own session) they
-    /// are dropped so the next resume cannot pin them to the wrong session.
+    /// A redialled leg starts a new stream.
     pub(crate) fn start_leg(&mut self, session: LegSession) {
         let everything = self.everything;
         let anchors = match session {
@@ -1117,9 +849,7 @@ impl FrameTracker {
         self.anchors
     }
 
-    /// Whether the instance said on this leg that it is quitting (`EVENT * bye
-    /// quit`, the `sessions` stream's last word): a hang-up after it has no
-    /// successor to wait for.
+    /// Whether the instance said on this leg that it is quitting.
     pub(crate) fn said_quit(&self) -> bool {
         self.quit && !self.lost
     }
@@ -1132,8 +862,7 @@ impl FrameTracker {
             && self.targets.iter().all(|(_, _, exited)| *exited)
     }
 
-    /// `(local, sid)` per `sub` line of the current leg, so a redial can name
-    /// by sid a target the request named by number ([`resume_request`]).
+    /// `(local, sid)` per `sub` line of the current leg.
     pub(crate) fn sids(&self) -> Vec<(String, String)> {
         self.targets
             .iter()
@@ -1148,10 +877,7 @@ impl FrameTracker {
             .expect("a sink takes every write");
     }
 
-    /// Account for `bytes` of the stream and write them on to `out`: a body
-    /// as it comes, a line once it is whole — the host-gone line excepted,
-    /// which is remembered ([`FrameTracker::take_host_gone`]), never relayed.
-    /// What cannot be framed goes on as it came.
+    /// Account for `bytes` of the stream and write them on to `out`.
     pub(crate) fn relay(&mut self, mut bytes: &[u8], out: &mut impl io::Write) -> io::Result<()> {
         while !bytes.is_empty() {
             if self.lost {
@@ -1193,13 +919,12 @@ impl FrameTracker {
         Ok(())
     }
 
-    /// At a leg's end: write on the part of a line the stream ended inside,
-    /// as it came.
+    /// At a leg's end: write on the part of a line the stream ended inside, as it came.
     pub(crate) fn finish(&mut self, out: &mut impl io::Write) -> io::Result<()> {
         out.write_all(&std::mem::take(&mut self.line))
     }
 
-    /// The host a forward said went away under this leg, once.
+    /// The host a forward said went away under this leg.
     pub(crate) fn take_host_gone(&mut self) -> Option<(u32, String)> {
         self.gone.take()
     }
@@ -1215,9 +940,6 @@ impl FrameTracker {
             ["sub", local, sid, ..] => {
                 self.targets
                     .push(((*local).to_string(), (*sid).to_string(), false));
-                // Where the target's `log` stream starts (a server that
-                // names it): the cursor a resume continues from until a
-                // record is relayed.
                 if let (Some(seq), Some(ep)) = (
                     value("log_seq").and_then(|v| v.parse().ok()),
                     value("log_ep").and_then(|v| v.parse().ok()),
@@ -1226,14 +948,11 @@ impl FrameTracker {
                     self.anchors.log_ep = Some(ep);
                 }
             }
-            // A session-log record: its seq is the stream's cursor now.
             ["LOG", _, seq, ..] => {
                 if let Ok(seq) = seq.parse::<u64>() {
                     self.anchors.log_seq = Some(seq);
                 }
             }
-            // A loss on the log stream: the read moved on to `resync_to=`,
-            // in epoch `ep=` (a reset or an update's).
             ["GAP", _, lost, ..] if lost.starts_with("log-lost=") => {
                 if let (Some(seq), Some(ep)) = (
                     value("resync_to").and_then(|v| v.parse().ok()),
@@ -1266,7 +985,6 @@ impl FrameTracker {
                 Err(_) => self.lost = true,
             },
             ["DELTA", _, _, "cells", len, ..] | ["BYTES", _, len, ..] => match len.parse::<u64>() {
-                // The body, then its trailing newline.
                 Ok(len) => self.skip_bytes = len.saturating_add(1),
                 Err(_) => self.lost = true,
             },
@@ -1276,62 +994,38 @@ impl FrameTracker {
 }
 
 /// The one refusal a pinned self stream is asked again after: the successor
-/// does not hold the session the pin names.
 const NO_SUCH_SESSION: &str = "ERR no such session";
 
-/// Which session a redialled leg relays, against the one the stream followed —
-/// what [`FrameTracker::start_leg`] keeps across it.
+/// Which session a redialled leg relays, against the one the stream followed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum LegSession {
-    /// The same one: the successor carried it (an update), so the event
-    /// anchors go on.
+    /// The same one: the successor carried it (an update), so the event anchors go.
     Same,
-    /// A fresh successor's own session ([`after_refusal`]): the anchors were
-    /// the lost session's ids.
+    /// A fresh successor's own session ([`after_refusal`]).
     Other,
 }
 
-/// One request put to a successor, and the session its leg relays when the
-/// successor accepts it.
+/// One request put to a successor, and the session its leg relays when the successor accepts it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Ask {
     pub(crate) request: String,
     pub(crate) session: LegSession,
 }
 
-/// What a successor lacking the stream's session is known to be: where it
-/// answers and when it started relative to the hang-up, which tells a
-/// relaunch of the old instance from another.
+/// What a successor lacking the stream's session is known.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Arrival {
-    /// On the fixed socket the call named, started after the hang-up: a
-    /// relaunch of the instance configured there (after a crash or quit). It
-    /// holds none of the old sessions, or with `[keeper]` on only those the
-    /// keeper recovered under their old sids (not the stream's, or it would
-    /// have taken the pinned request).
+    /// On the fixed socket the call named, started after the hang-up.
     Fresh,
-    /// On the fixed socket and already running when the old server went away
-    /// ([`HangupAt::moment`]): the update's own successor, whose copy of the
-    /// stream's session has since closed — or a relaunch within a moment of the
-    /// exit (before the watch woke or the relay read the hang-up, or within one
-    /// Linux clock tick). Each miss errs toward ending the stream.
+    /// On the fixed socket and already running when the old server went away ([`HangupAt::moment`])
     Predates,
-    /// On the fixed socket; its start could not be read ([`process_started`]:
-    /// no start record on this platform, another uid's process, or a zombie),
-    /// or cannot be ordered against the hang-up ([`later`]).
+    /// On the fixed socket.
     Unknown,
-    /// Not on a fixed `--sock` socket ([`only_a_relaunch_binds`]): the
-    /// `latest` alias, a link, an instance's own socket, or a session's graph
-    /// entry. Another instance can answer there, so when it started proves
-    /// nothing.
+    /// Not on a fixed `--sock` socket ([`only_a_relaunch_binds`]).
     Shared,
 }
 
-/// The [`Arrival`] of a successor on the fixed socket that started at
-/// `started`, for a stream whose server went away at `hung_up`
-/// ([`HangupAt::moment`]). `hung_up` is never earlier than the exit and a start
-/// never reads later than it was, so errors lean toward [`Arrival::Predates`],
-/// which ends the stream rather than moving it.
+/// The [`Arrival`] of a successor on the fixed socket that started at `started`.
 pub(crate) fn arrival_of(started: Option<Stamp>, hung_up: Stamp) -> Arrival {
     match started.and_then(|at| later(at, hung_up)) {
         Some(true) => Arrival::Fresh,
@@ -1340,25 +1034,16 @@ pub(crate) fn arrival_of(started: Option<Stamp>, hung_up: Stamp) -> Arrival {
     }
 }
 
-/// When the server a leg was on went away, against which a successor's start
-/// is ordered ([`arrival_of`]).
-///
-/// The kernel's exit report where one was watched ([`ExitMoment`]: kqueue
-/// `NOTE_EXIT` on macOS, a `pidfd` on Linux), not the relay's read: a relay
-/// blocked writing to a slow reader reads the EOF late, and a supervisor's quick
-/// restart would then look like it predates the hang-up.
+/// When the server a leg was on went away, against which a successor's start is ordered.
 pub(crate) struct HangupAt {
     /// When this relay read the hang-up (an EOF, a reset, a failed send).
     pub(crate) seen: Stamp,
-    /// The server's exit, stamped as the kernel reported it — `None` where
-    /// it could not be watched.
+    /// The server's exit, stamped as the kernel reported it.
     pub(crate) exit: Option<ExitMoment<Stamp>>,
 }
 
 impl HangupAt {
-    /// The earlier of [`HangupAt::seen`] and the stamped exit (both are at or
-    /// after the server's end). The read alone when there is no exit stamp or
-    /// the two cannot be ordered.
+    /// The earlier of [`HangupAt::seen`] and the stamped exit.
     pub(crate) fn moment(&self) -> Stamp {
         earliest(self.seen, self.exit.as_ref().and_then(ExitMoment::get))
     }
@@ -1373,8 +1058,6 @@ pub(crate) fn earliest(seen: Stamp, exited: Option<Stamp>) -> Stamp {
 }
 
 /// Whether a status line is the control socket's busy refusal
-/// ([`aterm_types::control_verbs::CONTROL_BUSY_REPLY`]): nothing was served,
-/// and the request may be sent again.
 fn is_busy(status: &str) -> bool {
     status.starts_with("ERR control server busy")
 }
@@ -1382,33 +1065,19 @@ fn is_busy(status: &str) -> bool {
 /// Why a successor's refusal ends the relay with [`EXIT_REPLACED`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Unresumed {
-    /// Nothing else to ask: a refusal other than [`NO_SUCH_SESSION`], a stream
-    /// that named its sessions, or the self fallback itself refused.
+    /// Nothing else to ask: a refusal other than [`NO_SUCH_SESSION`].
     Refused,
-    /// The successor answered busy, or closed on the ask without a word while
-    /// it still answered ([`answers_at`]), to every ask while the successor
-    /// wait lasted.
+    /// The successor answered busy.
     Busy,
-    /// The successor lacks the self stream's session and did not start after
-    /// the old server's end ([`Arrival::Predates`]).
+    /// The successor lacks the self stream's session and did not start after the old server's end.
     Predates,
-    /// The successor lacks the self stream's session, and when it started
-    /// cannot be read or ordered against that end ([`Arrival::Unknown`]).
+    /// The successor lacks the self stream's session.
     Unknown,
-    /// The successor lacks the self stream's session and answers where any
-    /// aterm may ([`Arrival::Shared`]).
+    /// The successor lacks the self stream's session and answers where any aterm.
     Shared,
 }
 
-/// What a relay does when a successor refused `asked` with `status`: ask the
-/// same successor once more, or end. `fallback` is the original request's self
-/// target as written ([`resume_lines`]).
-///
-/// Only `ERR no such session` to a pinned self stream is asked again, unpinned,
-/// and only of an [`Arrival::Fresh`] successor: a relaunch on the fixed socket,
-/// which lacks the stream's session, so the stream goes on with its own.
-/// Anywhere else self is another tab, and the stream ends with
-/// [`EXIT_REPLACED`]. A refused fallback is never followed by a third ask.
+/// What a relay does when a successor refused `asked` with `status`.
 pub(crate) fn after_refusal(
     asked: &Ask,
     status: &str,
@@ -1436,7 +1105,6 @@ pub(crate) fn after_refusal(
 }
 
 /// The self target of `request` as the caller wrote it, resolved on a fresh
-/// successor — never `@.` for a request that named none.
 fn self_resolved(request: &str) -> &'static str {
     match request.split_whitespace().find(|t| t.starts_with('@')) {
         Some("@.") => "`@.` resolved there",
@@ -1446,20 +1114,13 @@ fn self_resolved(request: &str) -> &'static str {
 
 /// What one ask of a successor came to ([`ask_once`]).
 pub(crate) enum Answer {
-    /// The status line: `OK subscribe …` or a refusal (`ERR control server
-    /// busy; retry`, `ERR no such session`); empty when the read failed some
-    /// other way or the connection closed after the request.
+    /// The status line: `OK subscribe …` or a refusal.
     Line(String),
-    /// The request could not be written and the successor left no word behind:
-    /// it went away between the probe and the ask.
+    /// The request could not be written and the successor left no word.
     Gone,
 }
 
-/// Put `request` to the successor `stream` is connected to and read its status
-/// line through `reader`. A failed write is not the successor going away: a
-/// listener with no lane free writes `ERR control server busy; retry` and closes
-/// without reading, so the line it left is the answer
-/// ([`super::pending_status_line`]).
+/// Put `request` to the successor `stream` is connected to and read its status line.
 pub(crate) fn ask_once(
     stream: &CtlStream,
     reader: &mut BufReader<&CtlStream>,
@@ -1479,9 +1140,7 @@ pub(crate) fn ask_once(
     }
 }
 
-/// The stderr note for a leg a successor accepted: `old` hung up, `pid` at
-/// `path` took the stream with `asked`; `original` is the caller's request. The
-/// successor is described only as far as `arrival` ([`Redial::arrival`]) knows it.
+/// The stderr note for a leg a successor accepted.
 pub(crate) fn resumed_note(
     old: u32,
     pid: u32,
@@ -1522,10 +1181,6 @@ pub(crate) fn resumed_note(
 }
 
 /// What a resumed leg's block and turn events go on from: after the last ones
-/// relayed where `request` — the resumed one — carries that anchor
-/// ([`resume_request`]); else from the successor's newest, so any that
-/// completed between the legs are not pushed (a multi-target stream carries
-/// none).
 fn events_after(request: &str) -> &'static str {
     let carries = |key: &str| request.split_whitespace().any(|t| t.starts_with(key));
     match (carries("since-block="), carries("since-turn=")) {
@@ -1542,10 +1197,7 @@ fn events_after(request: &str) -> &'static str {
     }
 }
 
-/// How a note names the server `old` giving way to `pid`, with `cause` said of a
-/// different process. The same pid is that process back on a fresh listening
-/// socket ([`ListenerId`]: a cold update's `exec`, or one that returned), which
-/// the note does not tell apart.
+/// How a note names the server `old` giving way to `pid`, with `cause` said of a different process.
 pub(crate) fn replaced_words(old: u32, pid: u32, cause: &str) -> String {
     if pid == old {
         format!("aterm (pid {pid}) reopened its control socket")
@@ -1554,7 +1206,7 @@ pub(crate) fn replaced_words(old: u32, pid: u32, cause: &str) -> String {
     }
 }
 
-/// The stderr note for a successor that did not take the stream over.
+/// The stderr note for a successor that did not take the stream.
 pub(crate) fn unresumed_note(old: u32, pid: u32, path: &str, why: Unresumed) -> String {
     match why {
         Unresumed::Refused => format!(
@@ -1587,8 +1239,6 @@ enum Leg {
 }
 
 /// Relay one connection's frames to `out` until the server hangs up or the
-/// `watch` wall clock (an explicit `--timeout`) runs out. Each frame is flushed
-/// as it arrives. A hang-up is read on `clock`.
 fn pump(
     stream: &CtlStream,
     reader: &mut BufReader<&CtlStream>,
@@ -1598,15 +1248,6 @@ fn pump(
     clock: fn() -> Stamp,
 ) -> io::Result<Leg> {
     let poll = Duration::from_millis(250);
-    // A read is never parked without a bound, watch or no watch: Darwin can lose
-    // the wakeup of a thread parked in a blocking `recv` for its peer's
-    // end-of-file when the peer writes and half-closes while another thread polls
-    // the peer's end — what a forward's relay does on every stream it ends. The
-    // end-of-file is there, but an unbounded read would park `aterm ctl subscribe`
-    // for good; on the tick the next read returns it.
-    // Ignored on failure: macOS answers `setsockopt` on a socket whose peer is
-    // gone with EINVAL, and such a socket's next read returns the buffered
-    // frames and then EOF without waiting.
     let _ = stream.set_read_timeout(Some(poll));
     let mut buf = [0u8; 8192];
     loop {
@@ -1619,7 +1260,6 @@ fn pump(
         }
         match reader.read(&mut buf) {
             Ok(0) => {
-                // Read at once: the flush can block on a slow consumer.
                 let at = clock();
                 tracker.finish(out)?;
                 out.flush()?;
@@ -1649,14 +1289,11 @@ pub(crate) struct FirstLeg<'a, 'b> {
     pub(crate) dialed: &'a str,
     /// The server's pid, when the platform can say.
     pub(crate) server: Option<u32>,
-    /// The listening socket it was accepted through ([`listener_at`], read
-    /// once connected).
+    /// The listening socket it was accepted through ([`listener_at`], read once connected).
     pub(crate) listener: Option<ListenerId>,
 }
 
-/// Relay a `subscribe` push stream to `out` across server replacements (the
-/// module rule). `watch` is the explicit `--timeout` wall clock over the whole
-/// relay, redials included.
+/// Relay a `subscribe` push stream to `out` across server replacements (the module rule).
 pub(crate) fn relay_subscription(
     first: FirstLeg<'_, '_>,
     request: &str,
@@ -1665,15 +1302,9 @@ pub(crate) fn relay_subscription(
     out: &mut impl io::Write,
 ) -> io::Result<ExitCode> {
     let watch = watch.map(|limit| (Instant::now(), limit));
-    // The wall clock the successor wait may not outlast (the rule on this
-    // module): a hang-up is inside the watch, never added to it.
     let until = watch.map(|(start, limit)| start + limit);
-    // What a hang-up follows: the call's own policy, until a forward says the
-    // host behind it went away ([`Redial::host`]).
     let mut redial = redial.clone();
     let mut tracker = FrameTracker::new(request);
-    // The server answered this stream's request a moment ago: watch for its
-    // exit now, while it can still be registered ([`HangupAt`]).
     let exit = redial.watch_exit(first.server);
     let mut hung_up = match pump(
         first.stream,
@@ -1686,37 +1317,21 @@ pub(crate) fn relay_subscription(
         Leg::Timeout => return Ok(ExitCode::from(super::EXIT_TIMEOUT)),
         Leg::HungUp(seen) => HangupAt { seen, exit },
     };
-    // Until when a successor that turns the resume away as busy, or closes on
-    // it without a word, is asked again: the successor wait from the last
-    // leg's hang-up.
     let mut ask_until = Wait::from_now(redial.bound, until).deadline;
-    // What the next leg asks for: the original, then each resumed form — whose
-    // local targets are already sids, so a later leg's new numbers never matter.
-    // The original stays at hand: a self stream is one on every leg, and its
-    // fallback names self as the caller wrote it ([`after_refusal`]).
     let original = request;
     let mut request = request.to_string();
     let mut dialed = first.dialed.to_string();
     let mut server = first.server;
     let mut listener = first.listener;
-    // A live successor that was asked and never took this stream, as `(the
-    // server it replaced, it, where it answers)`, while `server` names it: its
-    // still answering does not mean it ended the stream on purpose
-    // ([`Hangup::StillServing`]).
     let mut never_took: Option<(u32, u32, String)> = None;
     'leg: loop {
         if tracker.session_over() {
             return Ok(ExitCode::SUCCESS);
         }
-        // The instance said it was quitting before the hang-up: no successor
-        // comes, so the stream ends now instead of waiting one out.
         if tracker.said_quit() {
             super::stderr_line(&quit_note(server))?;
             return Ok(ExitCode::from(EXIT_REPLACED));
         }
-        // A forward's host that went away said so as the leg's last line: its
-        // relay still answering is no end on purpose, and from here the stream
-        // follows that host's successor, not the relay.
         let hangup = match tracker.take_host_gone() {
             Some((pid, sock)) => {
                 redial = redial.host(&sock, target_sid(&request).map(|sid| sid.as_str()));
@@ -1727,8 +1342,6 @@ pub(crate) fn relay_subscription(
             }
             None => redial.after_hangup(&dialed, server, listener, until),
         };
-        // A live successor that closed on the ask it was given: the stream
-        // is not over, and it did not go on — exit 75 and a note, never 0.
         if hangup == Hangup::StillServing
             && let Some((old, pid, path)) = never_took.take()
         {
@@ -1736,7 +1349,6 @@ pub(crate) fn relay_subscription(
             return Ok(ExitCode::from(EXIT_REPLACED));
         }
         let (path, pid) = match hangup {
-            // An end on purpose, or no peer pid to tell otherwise.
             Hangup::StillServing | Hangup::Unknown => return Ok(ExitCode::SUCCESS),
             Hangup::Gone {
                 waited,
@@ -1760,30 +1372,20 @@ pub(crate) fn relay_subscription(
             ))?;
             return Ok(ExitCode::from(EXIT_REPLACED));
         };
-        // The resumed request first — for a self stream, pinned to the session
-        // it followed; then, only as [`after_refusal`] allows, self as written.
         let mut ask = Ask {
             request: resumed,
             session: LegSession::Same,
         };
         loop {
             let Ok((stream, token)) = super::connect_then_read(&path, super::read_token_for) else {
-                // It answered a moment ago; look again from here.
                 dialed = path;
                 continue 'leg;
             };
-            // Judge the process actually asked: each ask is a new connection to
-            // `path`, and another process may have taken it since the probe
-            // named `pid` (an alias repointed, a socket rebound). Look again.
             if server_pid(&stream) != Some(pid) {
                 continue 'leg;
             }
             let leg_listener = listener_at(&path);
-            // The process asked is alive and connected: watch for its exit,
-            // which the leg it may open is judged by ([`HangupAt`]).
             let exit = redial.watch_exit(Some(pid));
-            // Bounded handshake — by the watch's remainder too; best effort for
-            // the same EINVAL reason as `pump`.
             let handshake = until.map_or(SUCCESSOR_BOUND, |until| {
                 until
                     .saturating_duration_since(Instant::now())
@@ -1793,11 +1395,6 @@ pub(crate) fn relay_subscription(
             let _ = stream.set_read_timeout(Some(handshake));
             let mut reader = BufReader::new(&stream);
             let answer = ask_once(&stream, &mut reader, token.as_deref(), &ask.request);
-            // Right after a Commit every client re-dials the successor at once,
-            // and a listener with no lane free answers `ERR control server busy;
-            // retry` and drops the connection unread, sometimes losing the line
-            // with the request. Either, from a successor that still gives any
-            // answer ([`answers_at`]), is asked again while the wait lasts.
             let busy = matches!(&answer, Answer::Line(line) if is_busy(line));
             let silent = matches!(&answer, Answer::Gone)
                 || matches!(&answer, Answer::Line(line) if line.is_empty());
@@ -1806,18 +1403,12 @@ pub(crate) fn relay_subscription(
                 std::thread::sleep(SUCCESSOR_POLL);
                 continue;
             }
-            // Turned away until the wait ran out, by a successor still there.
             if silent && live {
                 super::stderr_line(&unresumed_note(old, pid, &path, Unresumed::Busy))?;
                 return Ok(ExitCode::from(EXIT_REPLACED));
             }
             let status = match answer {
                 Answer::Line(line) if !silent => line,
-                // Nothing taken and nothing answers there now: this successor
-                // went away too. The next is judged against its hang-up (now, or
-                // its kernel-reported exit); against the first one, its own
-                // update successor would read as fresh. Should it still answer,
-                // it never took the stream and the relay ends 75 (`never_took`).
                 Answer::Line(_) | Answer::Gone => {
                     never_took = Some((old, pid, path.clone()));
                     dialed = path;
@@ -1840,8 +1431,6 @@ pub(crate) fn relay_subscription(
                     }
                     Err(why) => why,
                 };
-                // A busy refusal's own "retry" is not echoed: the note's
-                // "re-issue it" is the one remedy.
                 if !status.is_empty() && why != Unresumed::Busy {
                     super::stderr_line(status)?;
                 }
@@ -1851,10 +1440,6 @@ pub(crate) fn relay_subscription(
             super::stderr_line(status)?;
             let arrival = redial.arrival(pid, &path, hung_up.moment());
             super::stderr_line(&resumed_note(old, pid, &path, original, &ask, arrival))?;
-            // The successor's watch starts live, so what came between the legs
-            // (PTY bytes, mail, timeline records) was never pushed: each target
-            // the last leg named gets the stream's loss marker, under that leg's
-            // number, before any frame of the next.
             for (local, _) in tracker.sids() {
                 out.write_all(format!("GAP {local} replaced\n").as_bytes())?;
             }
@@ -1862,9 +1447,6 @@ pub(crate) fn relay_subscription(
             never_took = None;
             tracker.start_leg(ask.session);
             request = ask.request;
-            // Each leg's successor is judged against that leg's own hang-up, so
-            // a stream that rode an update to S1 and then lost S1 does not take
-            // S1's update successor for a relaunch.
             hung_up = match pump(&stream, &mut reader, out, &mut tracker, watch, redial.clock)? {
                 Leg::Timeout => return Ok(ExitCode::from(super::EXIT_TIMEOUT)),
                 Leg::HungUp(seen) => HangupAt { seen, exit },
@@ -1878,15 +1460,13 @@ pub(crate) fn relay_subscription(
     }
 }
 
-/// The note for a hang-up nothing replaced ([`Hangup::Gone`]'s fields, and
-/// [`Redial::unfollowed`]: the one reason a call that follows nothing gives).
+/// The note for a hang-up nothing replaced.
 pub(crate) fn gone_note(
     server: Option<u32>,
     waited: Duration,
     by_deadline: bool,
     unfollowed: Option<&Unfollowed>,
 ) -> String {
-    // A `--pid` call names its process even when no hello said it.
     let pinned = match unfollowed {
         Some(Unfollowed::PidPin(pin)) => Some(*pin),
         _ => None,
@@ -1898,8 +1478,6 @@ pub(crate) fn gone_note(
         format!("{:.1} s", waited.as_secs_f64())
     };
     let why = match unfollowed {
-        // The pinned process lived on through the wait for it to answer again
-        // ([`Redial::after_hangup`]; one that ended is gone with no wait).
         Some(Unfollowed::PidPin(_)) if !waited.is_zero() => {
             format!(
                 " and did not answer again within {within}; a --pid call follows no other instance"
@@ -1915,7 +1493,6 @@ pub(crate) fn gone_note(
 }
 
 /// The note for a stream whose instance said `bye quit` and hung up
-/// ([`FrameTracker::said_quit`]).
 fn quit_note(server: Option<u32>) -> String {
     let pid = server.map_or_else(|| "?".to_owned(), |pid| pid.to_string());
     format!(

@@ -24,6 +24,12 @@
 use crate::harness::disk::Level;
 use crate::supervise::memory::Pressure;
 
+/// The board's disk-look cadence, shared by its producer and cached readers.
+pub const LOOK_EVERY_MS: i64 = 60_000;
+
+/// A reading older than two board looks no longer speaks for now.
+pub const STALE_AFTER_MS: i64 = 2 * LOOK_EVERY_MS;
+
 /// The build slots as the board last proved them: those proven free less those an orphaned
 /// build still fills, and the slot files present (`slots=<usable>/<n>`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,6 +67,14 @@ pub struct OccupancyReading {
 }
 
 impl OccupancyReading {
+    /// Age a retained reading against the current Unix millisecond clock.
+    /// A missing clock is unknown, and a producer's stale verdict is never cleared.
+    #[must_use]
+    pub fn aged_at(mut self, now_ms: Option<i64>) -> Self {
+        self.stale |= now_ms.is_none_or(|now| now.saturating_sub(self.taken_ms) > STALE_AFTER_MS);
+        self
+    }
+
     /// Whether the reading speaks for now: a board taken from a snapshot no older than two
     /// looks. The empty reading never does.
     #[must_use]

@@ -1,11 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `lab forever`'s pure parts: the stub's per-turn script (each chain's reply
-//! to each act of the harness, by the real act texts), the request readers it
-//! reads conversations by, and THE JUDGE over records each scenario passes,
-//! fails and goes unobserved on — each pass beside the negative controls that
-//! must fail it.
+//! `lab forever`'s pure parts: the stub's per-turn script (each chain's reply to each act of the harness, by the real act texts), the request readers it reads conversations by, and THE JUDGE over records each scenario passes, fails and goes unobserved on — each pass beside the negative controls that must fail it.
 
 use aterm_agent::harness::repo_work::RepoWork;
 use aterm_agent::supervise::approvals::LEFT_REASON;
@@ -32,8 +28,6 @@ fn scripted_reply(spec: &J, users: &[String]) -> Option<String> {
 }
 
 /// The reply the lab's spec picks for a conversation of `chain` whose
-/// user texts after its prompt are `acts` (every mode's rules at once: no
-/// chain's word holds another's).
 fn reply(chain: Chain, acts: &[&str]) -> Option<String> {
     let mut u = vec![chain.prompt()];
     u.extend(acts.iter().map(|s| (*s).to_string()));
@@ -78,7 +72,6 @@ fn each_chain_is_scripted_turn_by_turn_by_the_harness_acts() {
         Some(DONE_CLAIM)
     );
     assert_eq!(reply(Chain::Off, &[]).as_deref(), Some(DONE_CLAIM));
-    // L16, L17: the land act (or a nudge) answered clean, long
     for c in [Chain::LandJ, Chain::LandK] {
         assert_eq!(reply(c, &[]).as_deref(), Some(WORK), "{c:?}");
         assert_eq!(reply(c, &[LAND]).as_deref(), Some(CLEAN), "{c:?}");
@@ -88,9 +81,6 @@ fn each_chain_is_scripted_turn_by_turn_by_the_harness_acts() {
             "{c:?}"
         );
     }
-    // N1-N4: two needs; the continuation answered with a defense naming none;
-    // the done check with the first again; the next continuation with it and
-    // another — told from the first continuation by the check before it
     let n1 = needs_reply(N1_HEAD, &[NEED_A, NEED_B]);
     assert_eq!(reply(Chain::CruiseN, &[]), Some(n1));
     assert_eq!(
@@ -105,9 +95,6 @@ fn each_chain_is_scripted_turn_by_turn_by_the_harness_acts() {
         reply(Chain::CruiseN, &[CONTINUE_TEXT, DONE_CHECK, CONTINUE_TEXT]),
         Some(needs_reply(N4_HEAD, &[NEED_A, NEED_C]))
     );
-    // C4: a work reply; the owner's continuation, typed as the harness
-    // types it (one line), answered with a done claim; the done check after
-    // it with a clean defense
     let owner = aterm_agent::supervise::limit::one_line(OWNER_CONTINUE);
     assert_eq!(reply(Chain::CruiseO, &[]).as_deref(), Some(WORK));
     assert_eq!(
@@ -118,15 +105,10 @@ fn each_chain_is_scripted_turn_by_turn_by_the_harness_acts() {
         reply(Chain::CruiseO, &[owner.as_str(), DONE_CHECK]).as_deref(),
         Some(CLEAN)
     );
-    // a conversation of no chain is left to the spec's own text
     assert_eq!(scripted_reply(&spec(&Chain::ALL), &users(&["hi"])), None);
 }
 
 /// C4'S CONTINUATION IS THE LAB'S `[harness] continue_text`, read back by
-/// the one reader of that table as the owner's two paragraphs, blank line
-/// and all, with no warning. NEGATIVE CONTROL: the line unescaped is no
-/// such text (TOML refuses a raw line break in a basic string, and the
-/// reader keeps the default).
 #[test]
 fn the_owners_continuation_is_the_labs_continue_text_blank_line_and_all() {
     use aterm_agent::supervise::SupervisorConfig;
@@ -144,15 +126,12 @@ fn the_owners_continuation_is_the_labs_continue_text_blank_line_and_all() {
     let raw = format!("[harness]\ncontinue_text = \"{OWNER_CONTINUE}\"\n");
     let (cfg, _) = SupervisorConfig::from_aterm_toml(&raw);
     assert_ne!(cfg.continue_text, OWNER_CONTINUE);
-    // only a run holding C4's chain sets it, and only cover runs it
     assert!(Chain::COVER.contains(&Chain::CruiseO));
     assert_eq!(Chain::CruiseO.autopilot(), "cruise");
     assert_eq!(Chain::CruiseO.scenarios(), [Scenario::C4]);
 }
 
 /// C4 as a live run that passes it records it: the work reply, its back-off,
-/// the owner's continuation typed as one line and sent so, its reply (the
-/// done claim) read and watched 20 s more.
 fn owner_continued() -> Seen {
     let owner = aterm_agent::supervise::limit::one_line(OWNER_CONTINUE);
     Seen {
@@ -186,19 +165,14 @@ fn cruise_o_passes_only_where_the_owners_continuation_is_one_line_and_never_the_
     let (w, why) = c4(&owner_continued());
     assert_eq!(w, "PASS", "{why}");
     assert!(why.contains("1 text(s) of it reached the agent"), "{why}");
-    // NEGATIVE CONTROLS. The owner's words reached the agent in two
-    // paragraphs (a typed act that kept its blank line):
     let mut s = owner_continued();
     s.cover.owner_texts = Some(vec![OWNER_CONTINUE.to_string()]);
     let (w, why) = c4(&s);
     assert_eq!(w, "FAIL", "{why}");
     assert!(why.contains("with a line break"), "{why}");
-    // never reached it at all:
     let mut s = owner_continued();
     s.cover.owner_texts = Some(Vec::new());
     assert_eq!(c4(&s).0, "FAIL");
-    // the act's rows read back as the agent's reply, and its NEEDS YOU line
-    // raised as a need:
     let mut s = owner_continued();
     s.journal[3].1 = format!("EVENT idle seq=2 NEEDS YOU: {OWNER_TAIL}");
     let (w, why) = c4(&s);
@@ -213,16 +187,12 @@ fn cruise_o_passes_only_where_the_owners_continuation_is_one_line_and_never_the_
     let (w, why) = c4(&s);
     assert_eq!(w, "FAIL", "{why}");
     assert!(why.contains("a need was raised"), "{why}");
-    // the owner's `Nothing left:` taken for a landing (none under Cruise):
     let mut s = owner_continued();
     s.journal.push(j(128_700, "DONE seq=2 rule=task-done@v1 x"));
     assert_eq!(c4(&s).0, "FAIL");
-    // another text typed in its place (the default continuation):
     let mut s = owner_continued();
     s.ledger[0].command = CONTINUE_TEXT.to_string();
     assert_eq!(c4(&s).0, "FAIL");
-    // its reply never read before the next act; no continuation at all;
-    // the dumps unread
     let mut s = owner_continued();
     s.journal[3] = j(
         128_500,
@@ -247,8 +217,6 @@ fn cruise_o_passes_only_where_the_owners_continuation_is_one_line_and_never_the_
 }
 
 /// C4'S WITNESS reads the user texts of the conversation's own requests
-/// that carry the owner's words, in each API's shape, each once. NEGATIVE
-/// CONTROLS: another conversation's request, and a text without them.
 #[test]
 fn the_owners_words_are_read_from_the_conversations_requests() {
     let token = Chain::CruiseO.token();
@@ -278,14 +246,6 @@ fn the_owners_words_are_read_from_the_conversations_requests() {
 }
 
 /// C4'S WITNESS READS THE TURNS ALONE ([`dumps_in`]): a side call's copy of
-/// the conversation is no text that reached the agent. Muse Code's reminder
-/// observer renders the whole conversation into ONE user text, its frame on
-/// rows of its own (the frame's opening lines and the conversation's tags as
-/// measured on 1.4.10-R6427.1, the lab's `r10-res-muse`, 2026-10-22; the
-/// conversation inside is C4's own), so read as a turn it held the owner's
-/// words "with a line break" and C4 FAILed on Muse Code alone (`r10-cv`).
-/// NEGATIVE CONTROL: the same observer dumped as a turn (`req-`, as the
-/// stub dumped every request before) fails C4 so.
 #[test]
 fn the_owners_words_are_read_from_the_turns_never_a_side_calls_copy() {
     let dir = aterm_tempfile::tempdir().unwrap();
@@ -331,7 +291,6 @@ fn the_owners_words_are_read_from_the_turns_never_a_side_calls_copy() {
     };
     let (w, why) = c4(texts);
     assert_eq!(w, "PASS", "{why}");
-    // NEGATIVE CONTROL: the observer dumped as a turn
     std::fs::rename(
         dir.path().join("side-00002.json"),
         dir.path().join("req-00002.json"),
@@ -346,16 +305,13 @@ fn the_owners_words_are_read_from_the_turns_never_a_side_calls_copy() {
 
 #[test]
 fn the_act_keys_stand_in_their_acts_alone() {
-    // each act is told by its own words, never another act's
     assert!(LAND.contains(LAND_KEY) && !LAND.contains(NUDGE_KEY));
     assert!(LAND_NUDGE.contains(NUDGE_KEY) && !LAND_NUDGE.contains(LAND_KEY));
     assert!(DONE_CHECK.contains(CHECK_KEY) && !DONE_CHECK.contains(CONTINUE_KEY));
     assert!(CONTINUE_TEXT.contains(CONTINUE_KEY) && !CONTINUE_TEXT.contains(CHECK_KEY));
-    // every act bears the mark the stub's witness counts
     for act in [LAND, LAND_NUDGE, DONE_CHECK, CONTINUE_TEXT] {
         assert!(act.contains(MARK), "{act}");
     }
-    // and no chain's word holds another's, in any mode
     for a in Chain::every() {
         for b in Chain::every() {
             assert!(a == b || !a.token().contains(&b.token()), "{a:?} {b:?}");
@@ -377,7 +333,6 @@ fn a_scripted_reply_takes_the_first_rule_its_conversation_meets() {
         scripted_reply(&spec, &users(&["A x", "go"])).as_deref(),
         Some("a-go")
     );
-    // `last` reads the newest user text only
     assert_eq!(
         scripted_reply(&spec, &users(&["A go", "x"])).as_deref(),
         Some("a")
@@ -388,8 +343,6 @@ fn a_scripted_reply_takes_the_first_rule_its_conversation_meets() {
     );
     assert_eq!(scripted_reply(&spec, &users(&["q"])), None);
     assert_eq!(scripted_reply(&spec, &[]), None);
-    // `after` reads the user texts before the newest one: a turn of the same
-    // words told apart by an act the conversation met earlier
     let after = J::parse(
         r#"{"replies": [
             {"when": "A", "last": "go", "after": "check", "text": "go-after-check"},
@@ -405,7 +358,6 @@ fn a_scripted_reply_takes_the_first_rule_its_conversation_meets() {
         scripted_reply(&after, &users(&["A", "check", "go"])).as_deref(),
         Some("go-after-check")
     );
-    // the newest text is not one before it
     assert_eq!(
         scripted_reply(&after, &users(&["A", "go check"])).as_deref(),
         Some("go")
@@ -443,7 +395,6 @@ fn the_request_readers_find_each_apis_user_texts() {
 }
 
 /// Whether a request carries a new harness turn past `baseline`, as
-/// [`StubSeen::of`] counts one.
 fn new_harness_turn(body: &[u8], tok: &str, baseline: usize) -> bool {
     StubSeen::of(
         &marked_turns(body, tok)
@@ -473,12 +424,6 @@ fn messages(tok: &str, texts: &[&str]) -> Vec<u8> {
 }
 
 /// THE STUB'S WITNESS COUNTS THE HARNESS'S TURNS: a request after the
-/// landing holding more harness-marked user texts than the conversation held
-/// at it is a new turn of the harness's — a new act, and THE SAME ACT TYPED
-/// AGAIN (the likeliest regression, which a reader that skipped texts typed
-/// before missed). NEGATIVE CONTROLS: the conversation as it stood (a side
-/// call carrying it), an agent's own question (no mark), another
-/// conversation.
 #[test]
 fn only_a_new_harness_turn_counts_after_the_landing() {
     let tok = Chain::LandA.token();
@@ -486,17 +431,13 @@ fn only_a_new_harness_turn_counts_after_the_landing() {
     assert_eq!(marked_turns(&messages(&tok, &at_landing), &tok), Some(2));
     let with = |more: &str| messages(&tok, &[LAND, LAND_NUDGE, more]);
     assert!(new_harness_turn(&with(CONTINUE_TEXT), &tok, 2));
-    // the nudge typed again after the landing
     assert!(new_harness_turn(&with(LAND_NUDGE), &tok, 2));
-    // the conversation as it stood, sent again (a side call carrying it)
     assert!(!new_harness_turn(&messages(&tok, &at_landing), &tok, 2));
-    // an agent's own side call: its question, no mark
     assert!(!new_harness_turn(
         &with("You are picking one optional feature tip for a user"),
         &tok,
         2
     ));
-    // another conversation
     assert!(!new_harness_turn(
         &with(CONTINUE_TEXT),
         &Chain::LandB.token(),
@@ -506,7 +447,6 @@ fn only_a_new_harness_turn_counts_after_the_landing() {
         marked_turns(&with(CONTINUE_TEXT), &Chain::LandB.token()),
         None
     );
-    // the Responses API's and the Gemini API's turns are counted too
     let responses = format!(
         r#"{{"input": [{{"type": "message", "role": "user", "content": [{{"type": "input_text", "text": "{tok}"}}]}},
         {{"type": "message", "role": "user", "content": [{{"type": "input_text", "text": "[aterm harness] one"}}]}},
@@ -522,7 +462,6 @@ fn only_a_new_harness_turn_counts_after_the_landing() {
 }
 
 /// The witness's baseline is the most harness turns any request before the
-/// landing held, or the acts typed, whichever is more; Off's is none.
 #[test]
 fn the_stub_witness_counts_from_the_landing() {
     let dumps = [(100, 0), (200, 1), (300, 2), (400, 2), (500, 3)];
@@ -534,9 +473,7 @@ fn the_stub_witness_counts_from_the_landing() {
             new_turns: 1
         }
     );
-    // a request the dumps missed before the landing: the acts typed hold the baseline
     assert_eq!(StubSeen::of(&[(100, 0), (400, 2)], 350, 2).new_turns, 0);
-    // Off: any marked text is a harness turn
     assert_eq!(StubSeen::of(&[(1, 0), (2, 0)], 0, 0).new_turns, 0);
     assert_eq!(StubSeen::of(&[(1, 0), (2, 1)], 0, 0).new_turns, 1);
 }
@@ -559,10 +496,6 @@ fn no_scripted_reply_opens_like_a_muse_tool_row() {
 }
 
 /// P2 LIVE: every reply of the P2 chains opens `Wrote ` with a SENTENCE after
-/// it, the shape Muse Code's fixed reader reads as the agent's words
-/// (`aterm_phase::muse`'s `names_a_path` is false: its first word holds no
-/// `/`, `.` or `…`, it is no lone word, and no `(+` or `— ` row tail follows
-/// it); before the fix any `Wrote ` head was its tool row.
 #[test]
 fn the_p2_replies_open_wrote_with_a_sentence_after_it() {
     let mut n = 0;
@@ -587,11 +520,6 @@ fn the_p2_replies_open_wrote_with_a_sentence_after_it() {
 }
 
 /// The coverage chains' words read as the product reads them: the question
-/// is a question (no choice, nothing destructive) and no done claim; the
-/// person's reply asks and claims nothing; P2's replies carry the claim, the
-/// need and the clean defenses L14 and C3 need; Land's answer opens with the
-/// key the stub picks its yield by; and the harness's answers, unmarked,
-/// still count as its turns.
 #[test]
 fn the_coverage_replies_read_as_their_scenarios_need() {
     assert_eq!(classify_said(Some(QUESTION)), Said::Question);
@@ -621,7 +549,6 @@ fn the_coverage_replies_read_as_their_scenarios_need() {
     for not in [PERSON_REPLY, WORK, QUESTION, ORCHESTRATED, RESUMED] {
         assert!(!harness_said(not), "{not}");
     }
-    // each act key stands in its act alone, the answer's included
     assert!(!LAND_ANSWER.contains(LAND_KEY) && !LAND_ANSWER.contains(NUDGE_KEY));
     assert!(!LAND.contains(ANSWER_KEY) && !LAND_NUDGE.contains(ANSWER_KEY));
     assert!(ORCHESTRATED.contains(ORCHESTRATED_KEY) && RESUMED.contains(RESUMED_KEY));
@@ -645,7 +572,6 @@ fn the_coverage_chains_are_scripted_turn_by_turn() {
         reply(LandQ, &[LAND, LAND_ANSWER, LAND_NUDGE]).as_deref(),
         Some(CLEAN)
     );
-    // the person's question, then the orchestrator's turn, then Land's act
     assert!(LandP.prompt().ends_with(PERSON_ASKS));
     assert_eq!(reply(LandP, &[]).as_deref(), Some(PERSON_REPLY));
     assert_eq!(reply(LandP, &[ORCHESTRATED]).as_deref(), Some(WORK));
@@ -662,7 +588,6 @@ fn the_coverage_chains_are_scripted_turn_by_turn() {
         reply(WroteC, &[DONE_CHECK, CONTINUE_TEXT]).as_deref(),
         Some(W_DONE)
     );
-    // P5: land@v1 answered as work (a second short turn), the nudge landing it
     assert_eq!(reply(LandT, &[]).as_deref(), Some(WORK));
     assert_eq!(reply(LandT, &[LAND]).as_deref(), Some(WORK));
     assert_eq!(reply(LandT, &[LAND, LAND_NUDGE]).as_deref(), Some(CLEAN));
@@ -676,14 +601,11 @@ fn the_coverage_chains_are_scripted_turn_by_turn() {
     assert_eq!(reply(Worker, &[]).as_deref(), Some(WORK));
     assert_eq!(reply(Worker, &[LAND]).as_deref(), Some(CLEAN));
     assert!(Mgr.rules().is_empty());
-    // W1: the land act meets the wall; whatever marked text goes on after
-    // it (the resume, Land's words) gets the clean defense
     assert_eq!(reply(Wall, &[]).as_deref(), Some(WORK));
     assert_eq!(reply(Wall, &[LAND]).as_deref(), Some(CLEAN));
     assert_eq!(reply(Wall, &[LAND, LAND_NUDGE]).as_deref(), Some(CLEAN));
     let resume = format!("{MARK} carry on");
     assert_eq!(reply(Wall, &[LAND, &resume]).as_deref(), Some(CLEAN));
-    // W2: scripted as W1, under its own word
     assert_eq!(reply(WallHid, &[]).as_deref(), Some(WORK));
     assert_eq!(reply(WallHid, &[LAND]).as_deref(), Some(CLEAN));
     assert_eq!(reply(WallHid, &[LAND, &resume]).as_deref(), Some(CLEAN));
@@ -691,8 +613,6 @@ fn the_coverage_chains_are_scripted_turn_by_turn() {
 }
 
 /// A walled run's Gemini CLI runs in a zone whose offset is not the
-/// machine's, and is a half-hour one, so the reset its dialog names is placed
-/// right only by reading its zone ([`foreign_tz`]).
 #[test]
 fn a_walled_gemini_cli_runs_in_a_zone_not_the_machines() {
     let now = crate::util::now_ms() / 1000;
@@ -706,9 +626,6 @@ fn a_walled_gemini_cli_runs_in_a_zone_not_the_machines() {
 }
 
 /// W2's wall resets far enough past the land act (two minutes on), its take
-/// window (half a minute) and every command the hide may enter (about four
-/// seconds each) that the notice is out of sight at least
-/// [`HIDE_BEFORE_RESET_MS`] before the reset; W1's is as it was.
 #[test]
 fn the_remembered_walls_reset_leaves_room_for_the_hide() {
     assert_eq!(Chain::Wall.wall_ahead_ms(), WALL_AHEAD_MS);
@@ -721,7 +638,6 @@ fn the_remembered_walls_reset_leaves_room_for_the_hide() {
 }
 
 /// W1's wall resets on a whole minute at least four minutes ahead, so the
-/// land act two minutes on meets it and Muse Code's words name its reset.
 #[test]
 fn the_wall_resets_on_a_whole_minute_past_the_land_act() {
     for now in [1_792_500_010_000_i64, 1_792_500_059_999, 1_792_500_060_000] {
@@ -748,8 +664,6 @@ fn the_coverage_modes_pick_their_chains() {
         ]
     );
     assert_eq!(Chain::of_mode(Mode::Cap), [Cap, Off]);
-    // `spawn agent=<harness>` starts a worker of every harness: L15's two
-    // run on each
     for h in Harness::ALL {
         assert_eq!(
             Chain::of_mode_on(Mode::Cover, h),
@@ -758,7 +672,6 @@ fn the_coverage_modes_pick_their_chains() {
             h.name()
         );
     }
-    // the measured modes are as they were
     assert_eq!(Chain::of_mode_on(Mode::Both, Harness::Muse), Chain::ALL);
     assert_eq!(
         [LandQ, LandP, LandW, WroteC, LandT, Mgr, Worker, Cap].map(Chain::autopilot),
@@ -789,7 +702,6 @@ fn the_coverage_modes_pick_their_chains() {
             .iter()
             .all(|c| !c.instant() || Chain::ALL.contains(c) || Chain::RESID.contains(c))
     );
-    // the wall alone, on every harness: the stub draws each one's own wall
     assert_eq!(Chain::of_mode(Mode::Wall), [Wall]);
     for h in Harness::ALL {
         assert_eq!(Chain::of_mode_on(Mode::Wall, h), [Wall], "{h:?}");
@@ -797,9 +709,6 @@ fn the_coverage_modes_pick_their_chains() {
     }
     assert!(Wall.lands() && !Wall.managed() && Wall.autopilot() == "land");
     assert_eq!(Wall.scenarios(), [Scenario::W1]);
-    // the remembered wall alone, on every harness: a local command on Muse
-    // Code and agy, the same once Esc has cancelled Claude Code's countdown,
-    // the dialog's Stop on Gemini CLI
     assert_eq!(Chain::of_mode(Mode::WallHid), [WallHid]);
     for h in Harness::ALL {
         assert_eq!(Chain::of_mode_on(Mode::WallHid, h), [WallHid], "{h:?}");
@@ -814,7 +723,6 @@ fn the_coverage_modes_pick_their_chains() {
             Ok((HideBy::Command(HIDE_COMMAND), None))
         ]
     );
-    // the claim each harness's wall is raised with, and its grace
     assert_eq!(
         Harness::ALL.map(wall_claim),
         ["five_hour", "code_assist", "five_hour", "five_hour"]
@@ -823,7 +731,6 @@ fn the_coverage_modes_pick_their_chains() {
         Harness::ALL.map(|h| wall_grace_ms(h.name())),
         [150_000, 60_000, 60_000, 60_000]
     );
-    // no other mode is out of reach anywhere
     for m in [Mode::Land, Mode::Cruise, Mode::Both, Mode::Cover, Mode::Cap] {
         assert!(
             Harness::ALL
@@ -833,9 +740,6 @@ fn the_coverage_modes_pick_their_chains() {
     }
     assert!(WallHid.lands() && !WallHid.managed() && WallHid.autopilot() == "land");
     assert_eq!(WallHid.scenarios(), [Scenario::W2]);
-    // the per-day quota's dialog alone, on Gemini CLI: the others name why
-    // not, and its wall is the key's spent day, lifted before the ladder's
-    // first rung
     assert_eq!(Chain::of_mode(Mode::WallDay), [WallDay]);
     assert_eq!(Chain::of_mode_on(Mode::WallDay, Harness::Gemini), [WallDay]);
     assert_eq!(wall_out_of_reach(Harness::Gemini, Mode::WallDay), None);
@@ -845,8 +749,6 @@ fn the_coverage_modes_pick_their_chains() {
     }
     assert!(WallDay.lands() && !WallDay.managed() && WallDay.autopilot() == "land");
     assert_eq!(WallDay.scenarios(), [Scenario::W1]);
-    // the climbing quota's: the same dialog, alone on Gemini CLI, lifted past
-    // the ladder's first rung and long before its second
     assert_eq!(Chain::of_mode(Mode::WallClimb), [WallClimb]);
     assert_eq!(
         Chain::of_mode_on(Mode::WallClimb, Harness::Gemini),
@@ -886,7 +788,6 @@ fn the_coverage_modes_pick_their_chains() {
             None
         ]
     );
-    // no other mode's chains meet the wall
     for m in [Mode::Land, Mode::Cruise, Mode::Both, Mode::Cover, Mode::Cap] {
         assert!(Chain::of_mode(m).iter().all(|c| !c.walled()), "{m:?}");
     }
@@ -945,9 +846,6 @@ fn the_modes_pick_their_chains_and_off_runs_in_each() {
         Chain::of_mode(Mode::Cruise),
         [Cruise, Off, InstantCruise, CruiseN]
     );
-    // the window's front tab: cruise-n, else the Off control, then the
-    // other Cruise chains; never a tab whose end END looks at, nor one that
-    // lands
     let front = |cs: &[Chain]| surfaces::front_of(cs).map(|i| cs[i]);
     assert_eq!(front(&Chain::ALL), Some(CruiseN));
     assert_eq!(front(&Chain::of_mode(Mode::Land)), Some(Off));
@@ -958,7 +856,6 @@ fn the_modes_pick_their_chains_and_off_runs_in_each() {
     for c in surfaces::FRONT {
         assert!(!c.lands() && !surfaces::ENDING.contains(&c), "{c:?}");
     }
-    // the chains that pause at END: neither landing nor ending, nor Off
     assert_eq!(
         Chain::ALL
             .into_iter()
@@ -998,9 +895,6 @@ fn the_modes_pick_their_chains_and_off_runs_in_each() {
 }
 
 /// THE P4 CHAINS ANSWER AT ONCE, THE OTHERS PACED: each rule of an instant
-/// chain carries a zero delay and pace of its own, which the stub's reply
-/// takes over the spec's; a paced chain's rules carry none, so its replies
-/// wait [`REPLY_DELAY_MS`].
 #[test]
 fn the_instant_chains_answer_at_once_and_the_others_are_paced() {
     let s = spec(&Chain::ALL);
@@ -1043,8 +937,6 @@ fn the_instant_chains_answer_at_once_and_the_others_are_paced() {
         reply(Chain::InstantCruise, &[DONE_CHECK]).as_deref(),
         Some(CLEAN)
     );
-    // L16, L17: the land reply held, then paced word by word, past the end's
-    // work floor; their work reply paced as any
     for chain in [Chain::LandJ, Chain::LandK] {
         let r = picked(chain, &[LAND]);
         assert_eq!(r.get("delay_ms").and_then(J::as_i64), Some(LONG_DELAY_MS));
@@ -1055,13 +947,11 @@ fn the_instant_chains_answer_at_once_and_the_others_are_paced() {
         );
     }
     assert!(long_reply_ms(CLEAN) > surfaces::END_WORK_FLOOR_MS + 5_000);
-    // one delta (words gathered to 12 characters), or two
     assert_eq!(long_reply_ms("one two"), LONG_DELAY_MS + LONG_PACE_MS);
     assert_eq!(
         long_reply_ms("one two three four"),
         LONG_DELAY_MS + 2 * LONG_PACE_MS
     );
-    // negative control: a paced chain's reply keeps the spec's hold
     for chain in [Chain::LandA, Chain::Cruise, Chain::Off, Chain::CruiseN] {
         let r = picked(chain, &[]);
         assert_eq!(
@@ -1114,11 +1004,6 @@ fn words_and_escapes_are_read() {
 }
 
 /// `status`'s `end= end_seen= end_cheered=` (§12.5.2) are read by key, and
-/// a line from an aterm without them (main before 5a) reads as before: its
-/// old keys the same, the new ones absent — never `-`, which says "no end".
-/// A key is the whole word before `=`: `end` is not `end_seen`'s prefix.
-/// NEGATIVE CONTROL (as run): a reader that drops the `=` anchor reads
-/// `end` off `end_seen=1` and fails the last row.
 #[test]
 fn the_end_fields_are_read_by_key_and_an_older_line_reads_as_before() {
     let tail = "task_state=done task_seq=3 editing=0 gen=1 seq=9";
@@ -1167,7 +1052,6 @@ fn the_words_are_read() {
     let b = parse_args(&v(&["--harness", "muse"])).unwrap().unwrap();
     assert_eq!(b.chains(Harness::Muse), Chain::ALL);
     assert_eq!((b.harnesses, b.mode), (vec![Harness::Muse], Mode::Both));
-    // --chains narrows the mode's chains
     let c = parse_args(&v(&[
         "--harness",
         "agy",
@@ -1178,8 +1062,6 @@ fn the_words_are_read() {
     ]))
     .unwrap()
     .unwrap();
-    // ...and, the window read and no chain of it to put in front, the Off
-    // control joins it (`--no-surfaces`: not)
     assert_eq!(
         c.chains(Harness::Agy),
         [Chain::LandA, Chain::Off, Chain::InstantLand]
@@ -1203,9 +1085,6 @@ fn the_words_are_read() {
         with_cruise.chains(Harness::Claude),
         [Chain::Cruise, Chain::LandJ, Chain::LandK]
     );
-    // --chains names a chain of any mode, narrowing the mode's on each
-    // harness: L15's two run on every harness, a chain of another mode runs
-    // nowhere
     let d = parse_args(&v(&[
         "--harness",
         "all",
@@ -1228,7 +1107,6 @@ fn the_words_are_read() {
             h.name()
         );
     }
-    // Worker-only selection retains its prerequisite, in the mode's order.
     let worker = parse_args(&v(&[
         "--harness",
         "all",
@@ -1247,7 +1125,6 @@ fn the_words_are_read() {
             h.name()
         );
     }
-    // Asking only for the manager starts no worker; unrelated chains gain none.
     let manager = parse_args(&v(&[
         "--harness",
         "claude",
@@ -1275,8 +1152,6 @@ fn the_words_are_read() {
         .unwrap();
     assert!(e.chains(Harness::Muse).is_empty());
     assert!(parse_args(&v(&["-h"])).unwrap().is_none());
-    // --window: L13's person types through hwkey in a windowed lab; a run
-    // with no chain a person opens has nothing to press (CONTROL: without it)
     let keys = parse_args(&v(&[
         "--harness",
         "all",
@@ -1336,13 +1211,9 @@ fn the_words_are_read() {
     }
 }
 
-// ---- the judge
-
 const T0: i64 = 1_000_000;
 
 /// A journal line at `t` after [`T0`]. A back-off's `until=x` reads as the
-/// due it names, the stamp the journal writes (cut to its second): `t` and
-/// its `M min back-off`.
 fn j(t: i64, line: &str) -> (i64, String) {
     let line = match line.split_once("until=x ") {
         Some((head, words)) => match words
@@ -1444,8 +1315,6 @@ fn needs_nudge() -> String {
 }
 
 /// L1, L3 and L5 as a live run that passes them records them: the landing
-/// at +375 s closed three short turns, so it is watched past the ladder's
-/// next step (8 min) and a minute more.
 fn landed_a() -> Seen {
     Seen {
         journal: vec![
@@ -1519,9 +1388,6 @@ fn land_a_passes_on_a_landing_with_its_need_raised_then_cleared() {
 }
 
 /// THE WATCH AFTER A LANDING RUNS PAST THE LADDER'S NEXT STEP: the step
-/// the streak at the landing would take next (2 min doubling: 8 min after
-/// three short turns, 16 after four), a minute more, at least 90 s; none for
-/// a worker its manager waits on through its first three.
 #[test]
 fn a_landing_is_watched_past_the_ladders_next_step() {
     let s = landed_a();
@@ -1532,7 +1398,6 @@ fn a_landing_is_watched_past_the_ladders_next_step() {
     assert_eq!(next_step_ms(2, true), 0);
     assert_eq!(next_step_ms(4, true), 16 * 60_000);
     assert_eq!(quiet_after_landed_ms(&Seen::default(), d, true), 90_000);
-    // with no point row, the last WAITING before it says the streak
     let mut w = landed_a();
     w.ledger.retain(|r| r.rule != RULE_POINT);
     assert_eq!(quiet_after_landed_ms(&w, d, false), 9 * 60_000);
@@ -1542,21 +1407,16 @@ fn a_landing_is_watched_past_the_ladders_next_step() {
 fn land_a_fails_what_it_must_and_says_what_it_did_not_see() {
     let l3 = |s: &Seen, p: &str| verdicts(Chain::LandA, s, p)[1];
     let l5 = |s: &Seen| verdicts(Chain::LandA, s, "gemini")[2];
-    // the needs entry names another program
     assert_eq!(l3(&landed_a(), "agy"), ("L3", "FAIL"));
-    // the entry does not say it carries on
     let mut s = landed_a();
     s.meta[1].1 = s.meta[1].1.replace("— carrying on", "— waiting for you");
     assert_eq!(l3(&s, "gemini"), ("L3", "FAIL"));
-    // status never said needs=ask while it stood
     let mut s = landed_a();
     s.status.remove(1);
     assert_eq!(l3(&s, "gemini"), ("L3", "FAIL"));
-    // the nudge did not tell the worker its need reached the person
     let mut s = landed_a();
     s.ledger[3].command = LAND_NUDGE.to_string();
     assert_eq!(l3(&s, "gemini"), ("L3", "FAIL"));
-    // something typed after the landing
     let mut s = landed_a();
     s.journal.push(j(
         430_000,
@@ -1566,23 +1426,19 @@ fn land_a_fails_what_it_must_and_says_what_it_did_not_see() {
     let mut s = landed_a();
     s.ledger.push(typed(430_000, "continue@v1", CONTINUE_TEXT));
     assert_eq!(l5(&s), ("L5", "FAIL"));
-    // a key pressed after the landing (a box approved) is an act too
     let mut s = landed_a();
     s.ledger
         .push(row(430_000, "approve@v1", "approved", "1", "a box"));
     assert_eq!(l5(&s), ("L5", "FAIL"));
-    // THE LADDER WENT ON: a WAITING after the DONE, even with nothing typed in the watch
     let mut s = landed_a();
     s.journal.push(j(
         375_000,
         "WAITING seq=3 until=x 3 short turn(s) in a row: 8 min back-off",
     ));
     assert_eq!(l5(&s), ("L5", "FAIL"));
-    // the ledger's last row is not the task's end (another point judged after it)
     let mut s = landed_a();
     s.ledger.push(point(500_000, 4));
     assert_eq!(l5(&s), ("L5", "FAIL"));
-    // a record written after the landing's own point, at its very moment
     let mut s = landed_a();
     let at = s.ledger.len() - 1;
     let ts = s.ledger[at].ts;
@@ -1591,7 +1447,6 @@ fn land_a_fails_what_it_must_and_says_what_it_did_not_see() {
     let mut s = landed_a();
     s.ledger.pop();
     assert_eq!(l5(&s), ("L5", "FAIL"));
-    // the stub answered a new harness turn of the conversation after the landing
     let mut s = landed_a();
     s.stub = Some(StubSeen {
         baseline: 2,
@@ -1599,34 +1454,27 @@ fn land_a_fails_what_it_must_and_says_what_it_did_not_see() {
         new_turns: 1,
     });
     assert_eq!(l5(&s), ("L5", "FAIL"));
-    // the stub's dumps were never read
     let mut s = landed_a();
     s.stub = None;
     assert_eq!(l5(&s), ("L5", "UNOBSERVED"));
-    // the need never cleared
     let mut s = landed_a();
     s.meta.pop();
     s.journal.remove(7);
     assert_eq!(l5(&s), ("L5", "FAIL"));
-    // a task record where none was given
     let mut s = landed_a();
     s.task
         .push(j(377_000, "OK task rev=4 state=done why=marker from=ctl"));
     assert_eq!(l5(&s), ("L5", "FAIL"));
-    // the land face never said landed
     let mut s = landed_a();
     s.status.pop();
     assert_eq!(l5(&s), ("L5", "FAIL"));
-    // the nudge that landed it named the repository
     let mut s = landed_a();
     s.ledger[3].command = format!("{} {REPO_SUFFIX}: x", needs_nudge());
     assert_eq!(l5(&s), ("L5", "FAIL"));
-    // watched 95 s after the landing: under the ladder's next step, not a pass
     let mut s = landed_a();
     s.end_ms = T0 + 470_000;
     let (w, why) = one(Chain::LandA, &s, "gemini", Scenario::L5);
     assert_eq!(w, "UNOBSERVED", "{why}");
-    // no land act at all: L1 fails, the rest were never reached
     let s = Seen {
         journal: vec![j(5_000, "EVENT idle seq=1 x")],
         end_ms: T0 + 900_000,
@@ -1636,11 +1484,9 @@ fn land_a_fails_what_it_must_and_says_what_it_did_not_see() {
         verdicts(Chain::LandA, &s, "gemini"),
         [("L1", "FAIL"), ("L3", "UNOBSERVED"), ("L5", "UNOBSERVED")]
     );
-    // the land act journaled with no ledger row
     let mut s = landed_a();
     s.ledger.retain(|r| r.rule != "land@v1");
     assert_eq!(verdicts(Chain::LandA, &s, "gemini")[0], ("L1", "FAIL"));
-    // landed at the need (no nudge first): L3 fails
     let mut s = landed_a();
     s.journal.retain(|(_, l)| !l.contains("land-nudge"));
     s.journal.push(j(131_000, "DONE seq=2 rule=land@v1 x"));
@@ -1649,7 +1495,6 @@ fn land_a_fails_what_it_must_and_says_what_it_did_not_see() {
 }
 
 /// The repository suffix the product types for `repo` (`repo_work_suffix`
-/// over the probe's own parse of what `git` says of it).
 fn repo_suffix(repo: Repo) -> String {
     let r = "/r/proj/land-x";
     let work = match repo {
@@ -1668,7 +1513,6 @@ fn open_suffix() -> String {
 }
 
 /// L2, L4 and L8–L11 as a live run that passes them records them: the
-/// nudge, and its yield read and waited on.
 fn nudged(suffix: &str) -> Seen {
     Seen {
         journal: vec![
@@ -1725,10 +1569,7 @@ fn land_b_and_the_repository_chains_pass_on_a_nudge_naming_what_is_left() {
             c.scenarios()[0],
         );
         assert_eq!((id, w), (id, "PASS"), "{c:?}: {why}");
-        // L5's judge is no part of it: it fails a chain that never landed by
-        // construction (F16 of the review of `b9/forever-gaps`)
         assert!(!why.contains("L5's judge"), "{why}");
-        // the wrong leg named, or none
         for other in [
             Repo::Untracked,
             Repo::Changed,
@@ -1753,22 +1594,18 @@ fn land_b_and_the_repository_chains_pass_on_a_nudge_naming_what_is_left() {
 fn the_nudge_chains_fail_a_stray_suffix_a_need_or_an_unread_yield() {
     let open = open_suffix();
     let repo = repo_suffix(Repo::Untracked);
-    // the wrong suffix, or none
     assert_eq!(
         verdicts(Chain::LandB, &nudged(&repo), "claude"),
         [("L2", "FAIL")]
     );
-    // L2's nudge names the repository beside the open work (its repository is clean)
     assert_eq!(
         verdicts(Chain::LandB, &nudged(&format!("{open} {repo}")), "claude"),
         [("L2", "FAIL")]
     );
-    // L4's names open work beside the repository (its defense named none)
     assert_eq!(
         verdicts(Chain::LandC, &nudged(&format!("{repo} {open}")), "claude"),
         [("L4", "FAIL")]
     );
-    // a needs carry-on where no need was named
     assert_eq!(
         verdicts(
             Chain::LandB,
@@ -1777,7 +1614,6 @@ fn the_nudge_chains_fail_a_stray_suffix_a_need_or_an_unread_yield() {
         ),
         [("L2", "FAIL")]
     );
-    // NEGATIVE CONTROL OF THE NEEDS ENTRY: none was named, none may be raised
     let mut s = nudged(&open);
     s.journal.insert(
         2,
@@ -1794,22 +1630,18 @@ fn the_nudge_chains_fail_a_stray_suffix_a_need_or_an_unread_yield() {
     s.status
         .push(status_of(131_000, "open", "ask", "land", "aterm-harness@1"));
     assert_eq!(verdicts(Chain::LandC, &s, "claude"), [("L4", "FAIL")]);
-    // a landing fails it
     let mut s = nudged(&open);
     s.journal.push(j(374_000, "DONE seq=3 rule=land@v1 x"));
     assert_eq!(verdicts(Chain::LandB, &s, "claude"), [("L2", "FAIL")]);
     let mut s = nudged(&repo);
     s.status.push(status(374_000, "landed", "land"));
     assert_eq!(verdicts(Chain::LandC, &s, "claude"), [("L4", "FAIL")]);
-    // the nudge's yield never read: unobserved
     let mut s = nudged(&repo);
     s.journal.truncate(4);
     assert_eq!(verdicts(Chain::LandC, &s, "claude"), [("L4", "UNOBSERVED")]);
-    // read, but no point decided there
     let mut s = nudged(&repo);
     s.journal.pop();
     assert_eq!(verdicts(Chain::LandC, &s, "claude"), [("L4", "FAIL")]);
-    // not nudged yet: unobserved
     let mut s = nudged(&open);
     s.journal.truncate(3);
     s.ledger.pop();
@@ -1840,9 +1672,6 @@ fn land_d_passes_unlanded_with_the_need_raised_and_carried_on() {
     unraised.journal.remove(1);
     unraised.meta.truncate(1);
     assert_eq!(verdicts(Chain::LandD, &unraised, "muse"), [("L6", "FAIL")]);
-    // THE NEED RAISED, THEN NOTHING MORE TYPED past the back-off's due (4 min
-    // from +130.1 s) and a minute more: PERSISTENCE LOST, a FAIL (F9 of the
-    // review of `b9/forever-gaps`; it read UNOBSERVED)
     let mut blocked = tall();
     blocked.journal.retain(|(_, l)| !l.contains("land-nudge"));
     blocked.ledger.pop();
@@ -1850,21 +1679,17 @@ fn land_d_passes_unlanded_with_the_need_raised_and_carried_on() {
     let (w, why) = one(Chain::LandD, &blocked, "muse", Scenario::L6);
     assert_eq!(w, "FAIL", "{why}");
     assert!(why.contains("PERSISTENCE LOST"), "{why}");
-    // watched to before that due and its minute: the carry-on unobserved, never a pass
     blocked.end_ms = T0 + 420_000;
     assert_eq!(
         verdicts(Chain::LandD, &blocked, "muse"),
         [("L6", "UNOBSERVED")]
     );
-    // a nudge with no word of the need
     let mut silent = tall();
     silent.ledger[1].command = LAND_NUDGE.to_string();
     assert_eq!(verdicts(Chain::LandD, &silent, "muse"), [("L6", "FAIL")]);
 }
 
 /// L7 as a live run that passes it records it: the record `working` before
-/// the agent started, the land act at once (its manager waits: no back-off),
-/// the landing at its yield, the record `done why=landed`.
 fn tasked() -> Seen {
     Seen {
         journal: vec![
@@ -1915,38 +1740,28 @@ fn tasked() -> Seen {
 fn land_e_passes_on_a_workers_task_marked_done_why_landed() {
     let (w, why) = one(Chain::LandE, &tasked(), "gemini", Scenario::L7);
     assert_eq!(w, "PASS", "{why}");
-    // the record done by another word
     let mut s = tasked();
     s.task[1].1 = s.task[1].1.replace("why=landed", "why=marker");
     assert_eq!(verdicts(Chain::LandE, &s, "gemini"), [("L7", "FAIL")]);
-    // never done
     let mut s = tasked();
     s.task.pop();
     assert_eq!(verdicts(Chain::LandE, &s, "gemini"), [("L7", "FAIL")]);
-    // no TASK line journaled
     let mut s = tasked();
     s.journal.pop();
     assert_eq!(verdicts(Chain::LandE, &s, "gemini"), [("L7", "FAIL")]);
-    // the ladder went on after the landing
     let mut s = tasked();
     s.journal
         .push(j(9_100, "WAITING seq=2 until=x 2 short turn(s) in a row"));
     assert_eq!(verdicts(Chain::LandE, &s, "gemini"), [("L7", "FAIL")]);
-    // no landing at all
     let mut s = tasked();
     s.journal.truncate(3);
     assert_eq!(verdicts(Chain::LandE, &s, "gemini"), [("L7", "FAIL")]);
-    // watched under its window
     let mut s = tasked();
     s.end_ms = T0 + 50_000;
     assert_eq!(verdicts(Chain::LandE, &s, "gemini"), [("L7", "UNOBSERVED")]);
-    // the mark never took: unobserved
     let mut s = tasked();
     s.task = vec![j(-2_000, "OK task -")];
     assert_eq!(verdicts(Chain::LandE, &s, "gemini"), [("L7", "UNOBSERVED")]);
-    // the startup deadline stalled the record while the worker worked (agy
-    // 1.4.0, wf8-agy: `stalled why=startup` at +111 s, "no Claude Code
-    // started; `agy` holds the tab"), then the landing marked it done: FAIL
     let mut s = tasked();
     s.task.insert(
         1,
@@ -1958,7 +1773,6 @@ fn land_e_passes_on_a_workers_task_marked_done_why_landed() {
     let (w, why) = one(Chain::LandE, &s, "agy", Scenario::L7);
     assert_eq!(w, "FAIL", "{why}");
     assert!(why.contains("state=stalled"), "{why}");
-    // a change of the record nobody read (F13): its rev moved by two
     let mut s = tasked();
     s.task[1].1 = s.task[1].1.replace("rev=2", "rev=3");
     let (w, why) = one(Chain::LandE, &s, "gemini", Scenario::L7);
@@ -1967,7 +1781,6 @@ fn land_e_passes_on_a_workers_task_marked_done_why_landed() {
         why.contains("changed between looks unread: rev 1 then 3"),
         "{why}"
     );
-    // a status need of any kind while it worked: FAIL
     let mut s = tasked();
     s.status.insert(
         1,
@@ -2032,7 +1845,6 @@ fn cruise_passes_on_a_check_whose_defense_is_read_and_a_next_point_that_goes_on(
     let mut waiting = cruised();
     waiting.journal.pop();
     assert_eq!(c2(&waiting), ("C2", "UNOBSERVED"));
-    // THE CHECK TYPED AGAIN WITH NOTHING READ BETWEEN: the defense never read
     let blind = Seen {
         journal: vec![
             j(
@@ -2052,8 +1864,6 @@ fn cruise_passes_on_a_check_whose_defense_is_read_and_a_next_point_that_goes_on(
         end_ms: T0 + 130_000,
         ..Seen::default()
     };
-    // F12 of the review of `b9/forever-gaps`: a doubled act fails every
-    // chain's scenarios, not P4's alone (C1 passed it)
     assert_eq!(
         verdicts(Chain::Cruise, &blind, "agy"),
         [("C1", "FAIL"), ("C2", "FAIL")]
@@ -2063,8 +1873,6 @@ fn cruise_passes_on_a_check_whose_defense_is_read_and_a_next_point_that_goes_on(
         why.contains("acts typed with no point judged between"),
         "{why}"
     );
-    // NO NEXT ACT past the check's defense's back-off (4 min from +128.6 s)
-    // and a minute more: PERSISTENCE LOST (F9; it read UNOBSERVED)
     let mut lost = cruised();
     lost.journal.pop();
     lost.ledger.pop();
@@ -2072,15 +1880,12 @@ fn cruise_passes_on_a_check_whose_defense_is_read_and_a_next_point_that_goes_on(
     let (w, why) = one(Chain::Cruise, &lost, "agy", Scenario::C2);
     assert_eq!(w, "FAIL", "{why}");
     assert!(why.contains("PERSISTENCE LOST"), "{why}");
-    // the defense read, but no point decided before the next act
     let mut undecided = cruised();
     undecided.journal.remove(4);
     assert_eq!(c2(&undecided), ("C2", "FAIL"));
-    // a need raised where none was named
     let mut needs = cruised();
     needs.meta.push(needs_meta(129_000, "agy"));
     assert_eq!(c2(&needs), ("C2", "FAIL"));
-    // C1: the check with no ledger row, or naming the (clean) repository
     let mut unledgered = cruised();
     unledgered.ledger.clear();
     assert_eq!(
@@ -2124,13 +1929,11 @@ fn off_passes_only_with_no_supervisor_and_quiet_past_a_four_minute_step() {
         .ledger
         .push(typed(125_000, "continue@v1", CONTINUE_TEXT));
     assert_eq!(off(&typed_off), [("OFF", "FAIL")]);
-    // a key pressed is an act too
     let mut approved = off_quiet();
     approved
         .ledger
         .push(row(60_000, "approve@v1", "approved", "1", "a box"));
     assert_eq!(off(&approved), [("OFF", "FAIL")]);
-    // a supervisor on the tab, though it typed nothing in the watch
     let mut supervised = off_quiet();
     supervised
         .status
@@ -2139,7 +1942,6 @@ fn off_passes_only_with_no_supervisor_and_quiet_past_a_four_minute_step() {
     let mut journaled = off_quiet();
     journaled.journal.push(j(5_000, "EVENT idle seq=1 x"));
     assert_eq!(off(&journaled), [("OFF", "FAIL")]);
-    // the stub saw a harness turn of the conversation
     let mut stubbed = off_quiet();
     stubbed.stub = Some(StubSeen {
         baseline: 0,
@@ -2147,7 +1949,6 @@ fn off_passes_only_with_no_supervisor_and_quiet_past_a_four_minute_step() {
         new_turns: 1,
     });
     assert_eq!(off(&stubbed), [("OFF", "FAIL")]);
-    // 150 s is no longer enough: a first act after a 4 min step comes at ~244 s
     let mut short = off_quiet();
     short.end_ms = T0 + 160_000;
     assert_eq!(off(&short), [("OFF", "UNOBSERVED")]);
@@ -2159,12 +1960,7 @@ fn off_passes_only_with_no_supervisor_and_quiet_past_a_four_minute_step() {
     assert_eq!(off(&not_off), [("OFF", "FAIL")]);
 }
 
-// ---- P4: replies sent at once
-
 /// P4L as a live run that passes it records it: the first prompt's reply
-/// read at once and backed off (one short turn), `land@v1` typed, its clean
-/// defense judged 1 s after it — the landing — and nothing typed through
-/// the ladder's next step (two short turns: 4 min) and a minute more.
 fn instant_landed() -> Seen {
     Seen {
         journal: vec![
@@ -2215,21 +2011,16 @@ fn p4_land_passes_only_where_every_instant_reply_is_judged_once() {
     let p4l = |s: &Seen| one(Chain::InstantLand, s, "gemini", Scenario::P4L);
     let (w, why) = p4l(&instant_landed());
     assert_eq!(w, "PASS", "{why}");
-    // THE FIRST INSTANT REPLY NEVER READ (F7 of the review of
-    // `b9/forever-gaps`, which passed it): its point read as no words, the
-    // land act typed at that point's back-off
     let mut unread = instant_landed();
     unread.journal[0].1 = "EVENT idle seq=1 -".into();
     let (w, why) = p4l(&unread);
     assert_eq!(w, "FAIL", "{why}");
     assert!(why.contains("was never read"), "{why}");
-    // read, but the back-off before the act another point's
     let mut other = instant_landed();
     other.journal[1].1 = other.journal[1].1.replace("seq=1", "seq=9");
     let (w, why) = p4l(&other);
     assert_eq!(w, "FAIL", "{why}");
     assert!(why.contains("no back-off decided at that point"), "{why}");
-    // P4 ITSELF: the first prompt's reply never judged — nothing typed
     let never = Seen {
         journal: vec![j(900, "EVENT idle seq=1 -")],
         status: vec![status(500, "open", "land")],
@@ -2239,7 +2030,6 @@ fn p4_land_passes_only_where_every_instant_reply_is_judged_once() {
     let (w, why) = p4l(&never);
     assert_eq!(w, "FAIL", "{why}");
     assert!(why.contains("never judged"), "{why}");
-    // the land act's instant defense never taken: no landing, the act again
     let mut again = instant_landed();
     again.journal.truncate(3);
     again.journal.push(j(
@@ -2253,7 +2043,6 @@ fn p4_land_passes_only_where_every_instant_reply_is_judged_once() {
     let (w, why) = p4l(&again);
     assert_eq!(w, "FAIL", "{why}");
     assert!(why.contains("never landed"), "{why}");
-    // landed, but at the take window's end, not as the answer showed
     let mut late = instant_landed();
     for (t, l) in &mut late.journal {
         if l.starts_with("EVENT idle seq=2") || l.starts_with("DONE ") {
@@ -2263,7 +2052,6 @@ fn p4_land_passes_only_where_every_instant_reply_is_judged_once() {
     let (w, why) = p4l(&late);
     assert_eq!(w, "FAIL", "{why}");
     assert!(why.contains("take window"), "{why}");
-    // a second act before the landing, no point judged between: doubled
     let mut doubled = instant_landed();
     doubled.journal.insert(
         3,
@@ -2275,22 +2063,18 @@ fn p4_land_passes_only_where_every_instant_reply_is_judged_once() {
     let (w, why) = p4l(&doubled);
     assert_eq!(w, "FAIL", "{why}");
     assert!(why.contains("2 acts before the landing"), "{why}");
-    // typed after the landing: the landing's own judge fails it
     let mut after = instant_landed();
     after.journal.push(j(
         250_000,
         "CONTINUED seq=3 rule=land-nudge@v1 [aterm harness] Still landing:",
     ));
     assert_eq!(p4l(&after).0, "FAIL");
-    // watched under the window: unobserved
     let mut short = instant_landed();
     short.end_ms = T0 + 200_000;
     assert_eq!(p4l(&short).0, "UNOBSERVED");
 }
 
 /// P4C as a live run that passes it records it: the done claim read at once
-/// and backed off, the check typed, its defense read 0.6 s after it and
-/// backed off (two short turns), the next point's act after it.
 fn instant_cruised() -> Seen {
     Seen {
         journal: vec![
@@ -2329,7 +2113,6 @@ fn p4_cruise_passes_only_where_the_checks_instant_defense_is_its_answer() {
     let p4c = |s: &Seen| one(Chain::InstantCruise, s, "muse", Scenario::P4C);
     let (w, why) = p4c(&instant_cruised());
     assert_eq!(w, "PASS", "{why}");
-    // P4 ITSELF: the done claim never judged
     let never = Seen {
         journal: vec![j(900, "EVENT idle seq=1 -")],
         end_ms: T0 + 900_000,
@@ -2338,7 +2121,6 @@ fn p4_cruise_passes_only_where_the_checks_instant_defense_is_its_answer() {
     let (w, why) = p4c(&never);
     assert_eq!(w, "FAIL", "{why}");
     assert!(why.contains("never judged"), "{why}");
-    // the defense judged at the take window's end: the act never taken
     let mut late = instant_cruised();
     late.journal[3].0 = T0 + 151_100;
     late.journal[4] = j(
@@ -2348,14 +2130,12 @@ fn p4_cruise_passes_only_where_the_checks_instant_defense_is_its_answer() {
     let (w, why) = p4c(&late);
     assert_eq!(w, "FAIL", "{why}");
     assert!(why.contains("take window"), "{why}");
-    // the take window's own wait is no decision of the point
     let mut window = instant_cruised();
     window.journal[4] = j(
         121_700,
         "WAITING seq=2 until=x the worker to take the continue-done-check@v1 act",
     );
     assert_eq!(p4c(&window).0, "FAIL");
-    // the check typed twice with no point judged between
     let mut doubled = instant_cruised();
     doubled.journal.insert(
         3,
@@ -2367,17 +2147,12 @@ fn p4_cruise_passes_only_where_the_checks_instant_defense_is_its_answer() {
     let (w, why) = p4c(&doubled);
     assert_eq!(w, "FAIL", "{why}");
     assert!(why.contains("no point judged between"), "{why}");
-    // ended under Cruise
     let mut ended = instant_cruised();
     ended.journal.push(j(362_000, "DONE seq=3 rule=land@v1 x"));
     assert_eq!(p4c(&ended).0, "FAIL");
-    // the next act not reached: unobserved
     let mut waiting = instant_cruised();
     waiting.journal.pop();
     assert_eq!(p4c(&waiting).0, "UNOBSERVED");
-    // A DECISION WITH NOTHING TYPED AFTER IT IS NO GOING ON (F5 of the review
-    // of `b9/forever-gaps`, where "then the person's prompt" passed): the
-    // person's point decided, nothing typed by its due and a minute more
     let mut stopped = instant_asked();
     stopped.journal.pop();
     stopped.ledger.pop();
@@ -2385,14 +2160,11 @@ fn p4_cruise_passes_only_where_the_checks_instant_defense_is_its_answer() {
     let (w, why) = p4c(&stopped);
     assert_eq!(w, "FAIL", "{why}");
     assert!(why.contains("PERSISTENCE LOST"), "{why}");
-    // …and watched 3 s past that decision, as the watch once ended: unobserved
     stopped.end_ms = T0 + 131_000;
     assert_eq!(p4c(&stopped).0, "UNOBSERVED");
 }
 
 /// P4P's record: the check's instant defense judged and decided at +121.7 s,
-/// a person's prompt at +127 s, its instant reply judged at +127.9 s and
-/// decided there (an 8 min back-off), the act at its due.
 fn instant_asked() -> Seen {
     let mut s = instant_cruised();
     s.journal.truncate(5);
@@ -2418,7 +2190,6 @@ fn p4_a_persons_instant_turn_passes_only_where_it_is_judged_as_it_shows() {
     let p4p = |s: &Seen| one(Chain::InstantCruise, s, "gemini", Scenario::P4P);
     let (w, why) = p4p(&instant_asked());
     assert_eq!(w, "PASS", "{why}");
-    // the check's own point stands when the person's prompt follows it
     let (w, why) = one(
         Chain::InstantCruise,
         &instant_asked(),
@@ -2426,29 +2197,24 @@ fn p4_a_persons_instant_turn_passes_only_where_it_is_judged_as_it_shows() {
         Scenario::P4C,
     );
     assert_eq!(w, "PASS", "{why}");
-    // never typed: unobserved, never a pass
     let mut untyped = instant_asked();
     untyped.asked_ms = None;
     assert_eq!(p4p(&untyped).0, "UNOBSERVED");
-    // typed but not taken by the composer: unobserved, and said so
     untyped.ask_refused_ms = Some(T0 + 127_000);
     let (w, why) = p4p(&untyped);
     assert_eq!(w, "UNOBSERVED", "{why}");
     assert!(why.contains("not taken by the composer"), "{why}");
-    // P4 ITSELF: the person's turn never judged
     let mut never = instant_asked();
     never.journal.truncate(5);
     let (w, why) = p4p(&never);
     assert_eq!(w, "FAIL", "{why}");
     assert!(why.contains("never judged"), "{why}");
-    // judged only past the take window: not as it showed
     let mut late = instant_asked();
     late.journal[5].0 = T0 + 158_000;
     late.journal[6].0 = T0 + 158_100;
     let (w, why) = p4p(&late);
     assert_eq!(w, "FAIL", "{why}");
     assert!(why.contains("not as it showed"), "{why}");
-    // an act typed into the person's turn before its reply was judged
     let mut typed_over = instant_asked();
     typed_over.journal.insert(
         5,
@@ -2460,7 +2226,6 @@ fn p4_a_persons_instant_turn_passes_only_where_it_is_judged_as_it_shows() {
     let (w, why) = p4p(&typed_over);
     assert_eq!(w, "FAIL", "{why}");
     assert!(why.contains("before its reply was judged"), "{why}");
-    // the take window's own wait decides nothing
     let mut window = instant_asked();
     window.journal[6] = j(
         128_000,
@@ -2469,9 +2234,6 @@ fn p4_a_persons_instant_turn_passes_only_where_it_is_judged_as_it_shows() {
     let (w, why) = p4p(&window);
     assert_eq!(w, "FAIL", "{why}");
     assert!(why.contains("no back-off decided at that point"), "{why}");
-    // DECIDED AT ANOTHER POINT, OR LEFT (F6 of the review of
-    // `b9/forever-gaps`, both passed): another point's back-off is no
-    // decision of this one, and the control verb stamps no person's hand
     let mut other = instant_asked();
     other.journal[6].1 = other.journal[6].1.replace("seq=3", "seq=2");
     let (w, why) = p4p(&other);
@@ -2488,9 +2250,6 @@ fn p4_a_persons_instant_turn_passes_only_where_it_is_judged_as_it_shows() {
     let (w, why) = p4p(&left);
     assert_eq!(w, "FAIL", "{why}");
     assert!(why.contains("though no person's hand typed it"), "{why}");
-    // NOTHING TYPED AFTER THE PERSON'S POINT (F5, it passed 3 s after the
-    // decision): past its due and a minute more, persistence lost; before
-    // it, unobserved
     let mut stopped = instant_asked();
     stopped.journal.pop();
     stopped.ledger.pop();
@@ -2500,7 +2259,6 @@ fn p4_a_persons_instant_turn_passes_only_where_it_is_judged_as_it_shows() {
     assert!(why.contains("PERSISTENCE LOST"), "{why}");
     stopped.end_ms = T0 + 131_000;
     assert_eq!(p4p(&stopped).0, "UNOBSERVED");
-    // the act after it typed before its due: every scenario of the chain fails
     let mut early = instant_asked();
     let n = early.journal.len() - 1;
     early.journal[n].0 = T0 + 300_000;
@@ -2508,7 +2266,6 @@ fn p4_a_persons_instant_turn_passes_only_where_it_is_judged_as_it_shows() {
     let (w, why) = p4p(&early);
     assert_eq!(w, "FAIL", "{why}");
     assert!(why.contains("BEFORE the due its back-off named"), "{why}");
-    // an act typed twice with no point judged between
     let mut doubled = instant_asked();
     doubled.journal.insert(
         3,
@@ -2525,34 +2282,29 @@ fn p4_a_persons_instant_turn_passes_only_where_it_is_judged_as_it_shows() {
 #[test]
 fn a_persons_prompt_is_due_only_while_the_loop_waits_out_a_decided_back_off() {
     let s = instant_asked();
-    // the check's defense decided at +121.7 s
     let at = |t: i64| T0 + t;
     let mut before = s.clone();
     before.journal.truncate(5);
     assert!(!ask_due(&before, at(126_000)), "under five seconds");
     assert!(ask_due(&before, at(127_000)));
-    // the take window's wait is no decision…
     let mut window = before.clone();
     window.journal[4] = j(
         121_700,
         "WAITING seq=2 until=x the worker to take the continue-done-check@v1 act",
     );
     assert!(!ask_due(&window, at(127_000)));
-    // …the back-off decided at its end is
     window.journal.push(j(
         151_700,
         "WAITING seq=2 until=x 2 short turn(s) in a row: 4 min back-off",
     ));
     assert!(!ask_due(&window, at(155_000)));
     assert!(ask_due(&window, at(157_000)));
-    // another act typed since: the back-off is over
     let mut moved = before.clone();
     moved.journal.push(j(
         126_500,
         "CONTINUED seq=2 rule=continue-done-check@v1 [aterm harness] x",
     ));
     assert!(!ask_due(&moved, at(127_000)));
-    // no check typed yet
     let mut early = before;
     early.journal.truncate(2);
     assert!(!ask_due(&early, at(127_000)));
@@ -2567,7 +2319,6 @@ fn the_persons_prompt_has_its_own_instant_reply() {
         reply(Chain::InstantCruise, &[DONE_CHECK, &ask]),
         Some(ASK_REPLY.to_string())
     );
-    // the turn after it is the chain's own again
     assert_eq!(
         reply(Chain::InstantCruise, &[&ask, DONE_CHECK]),
         reply(Chain::InstantCruise, &[DONE_CHECK])
@@ -2583,10 +2334,6 @@ fn the_persons_prompt_has_its_own_instant_reply() {
 }
 
 /// P3'S REPORT: a tab whose first point record follows its first prompt
-/// reports it, the first back-off at 2 min, and no point record before the
-/// prompt. NEGATIVE CONTROL: the records of Gemini CLI's `land-b` in the
-/// forever lab's `wf8b` pass — a `point@v1` 5.7 s before the first prompt —
-/// name that record, and the first reply's back-off at 4 min after it.
 #[test]
 fn a_point_before_the_first_prompt_is_reported_and_none_after_it() {
     let clean = Seen {
@@ -2616,7 +2363,6 @@ fn a_point_before_the_first_prompt_is_reported_and_none_after_it() {
         "first point +5.6 s (short turns in a row: 1), first back-off +5.6 s \
          \"1 short turn(s) in a row: 2 min back-off\", 0 point record(s) before the first prompt"
     );
-    // NEGATIVE CONTROL: the phantom.
     let mut phantom = clean.clone();
     phantom.ledger.insert(0, point(-5_700, 1));
     phantom.ledger[2] = point(5_600, 2);
@@ -2638,20 +2384,16 @@ fn a_point_before_the_first_prompt_is_reported_and_none_after_it() {
          \"1 short turn(s) in a row: 2 min back-off\", 1 point record(s) before the first prompt: \
          -5.7 s (1)"
     );
-    // No records at all (Off's chain: no loop): nothing to report.
     assert_eq!(
         first_point_line(&Seen::default(), T0),
         "no point, no back-off, 0 point record(s) before the first prompt"
     );
 }
 
-// ---- the coverage chains' judges
-
 /// The stub's witness of a window counts what falls inside it alone.
 #[test]
 fn the_window_witness_counts_inside_its_window() {
     let dumps = [(100, 0), (200, 1), (300, 1), (400, 2), (500, 3)];
-    // CAP's hour: from the act (the conversation then holds its one text) to the turn
     assert_eq!(
         StubSeen::within(&dumps, 150, 350, 1),
         StubSeen {
@@ -2661,10 +2403,8 @@ fn the_window_witness_counts_inside_its_window() {
         }
     );
     assert_eq!(StubSeen::within(&dumps, 150, 450, 1).new_turns, 1);
-    // L13's exchange: any harness text before the orchestrator's turn
     assert_eq!(StubSeen::within(&dumps, 0, 150, 0).new_turns, 0);
     assert_eq!(StubSeen::within(&dumps, 0, 250, 0).new_turns, 1);
-    // Land's answer carries no mark, and counts all the same
     let tok = Chain::LandQ.token();
     assert_eq!(
         marked_turns(&messages(&tok, &[LAND, LAND_ANSWER]), &tok),
@@ -2683,9 +2423,6 @@ fn the_window_witness_counts_inside_its_window() {
 }
 
 /// L12 as a live run that passes it records it: land@v1 at +125 s, the
-/// question read, Land's answer after the 4 min step, its clean defense
-/// landing the task at +375 s, watched past the next step (8 min) and a
-/// minute more.
 fn answered() -> Seen {
     Seen {
         journal: vec![
@@ -2698,7 +2435,6 @@ fn answered() -> Seen {
                 125_000,
                 "CONTINUED seq=1 rule=land@v1 [aterm harness] Autopilot is Land: land",
             ),
-            // the live shape (Claude Code 2.1.304): the point read as a question
             j(
                 130_000,
                 "EVENT question seq=2 ⏺ Should the parser also accept tab-indented input?",
@@ -2747,41 +2483,34 @@ fn land_q_passes_on_lands_answer_and_the_landing_at_its_yield() {
     let (w, why) = l12(&answered());
     assert_eq!(w, "PASS", "{why}");
     assert!(why.contains("EVENT question seq=2"), "{why}");
-    // the same point journaled idle reads the question too
     let mut s = answered();
     s.journal[3].1 = "EVENT idle seq=2 Should the parser also accept tab-indented input?".into();
     assert_eq!(l12(&s).0, "PASS", "{}", l12(&s).1);
-    // NEGATIVE CONTROLS. The question nudged as a defense would be:
     let mut s = answered();
     s.journal[5].1 = "CONTINUED seq=2 rule=land-nudge@v1 [aterm harness] Still landing:".into();
     s.ledger[3] = typed(370_000, "land-nudge@v1", LAND_NUDGE);
     assert_eq!(l12(&s).0, "FAIL", "{}", l12(&s).1);
-    // continued as Cruise would be
     let mut s = answered();
     s.journal[5].1 = "CONTINUED seq=2 rule=continue@v1 [aterm harness] x".into();
     assert_eq!(l12(&s).0, "FAIL");
-    // the question LANDED (no answer first)
     let mut s = answered();
     s.journal.insert(4, j(130_050, "DONE seq=2 rule=land@v1 x"));
     assert_eq!(l12(&s).0, "FAIL");
     let mut s = answered();
     s.status.insert(1, status(131_000, "landed", "land"));
     assert_eq!(l12(&s).0, "FAIL");
-    // the answer journaled with no ledger row, or not Land's words
     let mut s = answered();
     s.ledger.remove(3);
     assert_eq!(l12(&s).0, "FAIL");
     let mut s = answered();
     s.ledger[3].command = "Nobody is here to answer. Decide for yourself".into();
     assert_eq!(l12(&s).0, "FAIL");
-    // a suffix where nothing stood open
     let mut s = answered();
     s.ledger[3].command = format!("{LAND_ANSWER} {}", open_suffix());
     assert_eq!(l12(&s).0, "FAIL");
     let mut s = answered();
     s.ledger[3].command = format!("{LAND_ANSWER} {NEEDS_ACK}");
     assert_eq!(l12(&s).0, "FAIL");
-    // the question never read before the answer, or another point's words read
     let mut s = answered();
     s.journal.remove(3);
     assert_eq!(l12(&s).0, "FAIL");
@@ -2790,11 +2519,9 @@ fn land_q_passes_on_lands_answer_and_the_landing_at_its_yield() {
     let (w, why) = l12(&s);
     assert_eq!(w, "FAIL", "{why}");
     assert!(why.contains("no EVENT line read the question"), "{why}");
-    // the answer's clean defense did not land it
     let mut s = answered();
     s.journal.pop();
     assert_eq!(l12(&s).0, "FAIL");
-    // landed at another act's yield
     let mut s = answered();
     s.journal.insert(
         6,
@@ -2804,7 +2531,6 @@ fn land_q_passes_on_lands_answer_and_the_landing_at_its_yield() {
         ),
     );
     assert_eq!(l12(&s).0, "FAIL");
-    // typed after the landing, or the ladder went on
     let mut s = answered();
     s.journal
         .push(j(500_000, "CONTINUED seq=4 rule=land-nudge@v1 x"));
@@ -2816,11 +2542,9 @@ fn land_q_passes_on_lands_answer_and_the_landing_at_its_yield() {
         new_turns: 1,
     });
     assert_eq!(l12(&s).0, "FAIL");
-    // a need raised where none was named
     let mut s = answered();
     s.meta.push(needs_meta(131_000, "claude"));
     assert_eq!(l12(&s).0, "FAIL");
-    // unobserved: nothing typed for the question yet, or watched under the window
     let mut s = answered();
     s.journal.truncate(5);
     s.ledger.truncate(3);
@@ -2830,7 +2554,6 @@ fn land_q_passes_on_lands_answer_and_the_landing_at_its_yield() {
     let mut s = answered();
     s.end_ms = T0 + 500_000;
     assert_eq!(l12(&s).0, "UNOBSERVED");
-    // no land act at all
     assert_eq!(
         l12(&Seen {
             end_ms: T0 + 900_000,
@@ -2842,9 +2565,6 @@ fn land_q_passes_on_lands_answer_and_the_landing_at_its_yield() {
 }
 
 /// L13 as a live run that passes it records it: the person's Enter at +10 s,
-/// their answer left to them (LEFT, task=theirs; Claude Code's skipped row),
-/// nothing typed to the orchestrator's turn at +310 s, then Land's act after
-/// its 2 min step and the landing.
 fn left_to_them() -> Seen {
     Seen {
         journal: vec![
@@ -2905,8 +2625,6 @@ fn land_p_passes_only_on_a_persons_exchange_left_to_them() {
     let (w, why) = l13(&left_to_them());
     assert_eq!(w, "PASS", "{why}");
     assert!(why.contains("land@v1 typed at +434.0 s"), "{why}");
-    // NEGATIVE CONTROLS. The person's turn taken as the policy's: Land's act
-    // after the 2 min step, inside the exchange
     let mut s = left_to_them();
     s.journal.insert(
         2,
@@ -2921,18 +2639,15 @@ fn land_p_passes_only_on_a_persons_exchange_left_to_them() {
     let mut s = left_to_them();
     s.ledger.insert(2, typed(134_000, "land@v1", LAND));
     assert_eq!(l13(&s).0, "FAIL");
-    // no LEFT, or the face never theirs
     let mut s = left_to_them();
     s.journal.remove(1);
     assert_eq!(l13(&s).0, "FAIL");
     let mut s = left_to_them();
     s.status.remove(1);
     assert_eq!(l13(&s).0, "FAIL");
-    // the person's exchange landed
     let mut s = left_to_them();
     s.journal.insert(2, j(14_100, "DONE seq=1 rule=land@v1 x"));
     assert_eq!(l13(&s).0, "FAIL");
-    // the stub saw a harness text in the exchange
     let mut s = left_to_them();
     s.cover.window_stub = Some(StubSeen {
         baseline: 0,
@@ -2940,11 +2655,9 @@ fn land_p_passes_only_on_a_persons_exchange_left_to_them() {
         new_turns: 1,
     });
     assert_eq!(l13(&s).0, "FAIL");
-    // a need raised where none was named
     let mut s = left_to_them();
     s.meta.push(needs_meta(20_000, "claude"));
     assert_eq!(l13(&s).0, "FAIL");
-    // unobserved: watched under 270 s, the stub unread, no act after the turn, no person
     let mut s = left_to_them();
     s.cover.turn_ms = Some(T0 + 200_000);
     assert_eq!(l13(&s).0, "UNOBSERVED");
@@ -2955,9 +2668,6 @@ fn land_p_passes_only_on_a_persons_exchange_left_to_them() {
     s.journal.truncate(4);
     s.end_ms = T0 + 400_000;
     assert_eq!(l13(&s).0, "UNOBSERVED");
-    // THE ORCHESTRATOR'S TURN NOT JUDGED (F8 of the review of
-    // `b9/forever-gaps`, which passed any act after it): Land's act with no
-    // point read at the turn's reply, or before the due its back-off named
     let mut s = left_to_them();
     s.journal.drain(2..4);
     let (w, why) = l13(&s);
@@ -2969,16 +2679,12 @@ fn land_p_passes_only_on_a_persons_exchange_left_to_them() {
     let (w, why) = l13(&s);
     assert_eq!(w, "FAIL", "{why}");
     assert!(why.contains("BEFORE the due its back-off named"), "{why}");
-    // nothing typed after the turn past its back-off's due and a minute: lost
     let mut s = left_to_them();
     s.journal.truncate(4);
     s.end_ms = T0 + 500_000;
     let (w, why) = l13(&s);
     assert_eq!(w, "FAIL", "{why}");
     assert!(why.contains("PERSISTENCE LOST"), "{why}");
-    // P3 AS A VERDICT (F11, P3 was reported only): a point judged between the
-    // draft's typing and the person's Enter, or a first point after the
-    // Enter that counted a short turn though it was left to the person
     let mut s = left_to_them();
     s.ledger.insert(0, point(5_000, 1));
     let (w, why) = l13(&s);
@@ -2992,9 +2698,6 @@ fn land_p_passes_only_on_a_persons_exchange_left_to_them() {
     let mut s = left_to_them();
     s.cover.person_ms = None;
     assert_eq!(l13(&s).0, "UNOBSERVED");
-    // a prompt no person's hand stamped (typed over the control socket) is
-    // nobody's: what the harness did after it judges no exchange, the act in
-    // it included
     for stamp in [None, Some("-"), Some("?")] {
         let mut s = left_to_them();
         s.cover.person_stamp = stamp.map(str::to_string);
@@ -3015,9 +2718,6 @@ fn land_p_passes_only_on_a_persons_exchange_left_to_them() {
 }
 
 /// `--window` UNDER `LAB_RESTORE=1` IS A USAGE ERROR (exit 2), refused
-/// before any lab is made, never a harness's COULD NOT RUN. CONTROLS: the
-/// window alone carries the window, the person's seam and the lifeline; the
-/// seam alone stays headless; `--keep` holds no lifeline.
 #[test]
 fn forever_window_under_the_restore_seam_is_a_usage_error_not_could_not_run() {
     let restored = crate::lab::UpOpts {
@@ -3047,12 +2747,6 @@ fn forever_window_under_the_restore_seam_is_a_usage_error_not_could_not_run() {
 }
 
 /// L13 TYPED THROUGH HWKEY (`forever --window`): the stamp is the keys' and
-/// theirs alone (`status human_seq=` moved by exactly the presses `hwkey`
-/// posted), and the verdict says how the prompt was typed. NEGATIVE
-/// CONTROLS: a count short of the keys, past them, unread after the Enter,
-/// gone back, or no key posted is UNOBSERVED (no exchange is judged on it,
-/// the harness's act in it included); keys that account for the stamp are
-/// judged as the seam's are (Land's act in the exchange FAILS).
 #[test]
 fn land_p_typed_through_hwkey_passes_only_where_the_keys_account_for_the_stamp() {
     let l13 = |s: &Seen| one(Chain::LandP, s, "claude", Scenario::L13);
@@ -3076,14 +2770,12 @@ fn land_p_typed_through_hwkey_passes_only_where_the_keys_account_for_the_stamp()
         "{why}"
     );
     assert!(why.contains("land@v1 typed at +434.0 s"), "{why}");
-    // CONTROL: the seam's run says it was the seam's
     let (w, why) = l13(&left_to_them());
     assert_eq!(w, "PASS", "{why}");
     assert!(
         why.starts_with("typed through the `as=person` seam;"),
         "{why}"
     );
-    // keys that account for the stamp are judged: an act in the exchange fails
     let mut s = keyed(3, Some(3 + posted), posted);
     s.journal.insert(
         2,
@@ -3126,7 +2818,6 @@ fn land_p_typed_through_hwkey_passes_only_where_the_keys_account_for_the_stamp()
             "{why}"
         );
     }
-    // no stamp after hwkey's keys: nobody's, said as the keys'
     let mut s = keyed(0, Some(0), posted);
     s.cover.person_stamp = Some("-".into());
     let (w, why) = l13(&s);
@@ -3135,8 +2826,6 @@ fn land_p_typed_through_hwkey_passes_only_where_the_keys_account_for_the_stamp()
 }
 
 /// Every character of land-p's prompt is a key `hwkey` names (printable
-/// U.S. ASCII, the layout its key table maps), a space by its name (the verb
-/// splits its words on it); no `?` (Gemini CLI's shortcuts key).
 #[test]
 fn land_p_s_prompt_is_typed_key_by_key_through_hwkey() {
     let prompt = Chain::LandP.prompt();
@@ -3170,31 +2859,24 @@ fn land_w_passes_only_where_the_wrote_replies_are_read() {
     pass.meta[1] = needs_meta(131_000, "muse");
     let (w, why) = l14(&pass);
     assert_eq!(w, "PASS", "{why}");
-    // NEGATIVE CONTROL, P2 itself: the head read as Muse Code's tool row, no words
     let mut s = pass.clone();
     s.journal[0].1 = "EVENT idle seq=1 -".into();
     let (w, why) = l14(&s);
     assert_eq!(w, "FAIL", "{why}");
     assert!(why.contains("not the reply opening"), "{why}");
-    // …and so even where a later line read the words before the land act:
-    // the first point JUDGED read none (F15 of the review of
-    // `b9/forever-gaps`, which passed it)
     s.journal
         .insert(2, j(60_000, &format!("EVENT idle seq=7 {W_WORK}")));
     let (w, why) = l14(&s);
     assert_eq!(w, "FAIL", "{why}");
     assert!(why.contains("not the reply opening"), "{why}");
-    // the need in a `Wrote …` reply never raised (its words unread)
     let mut s = pass.clone();
     s.journal.remove(3);
     s.meta.truncate(1);
     s.status.remove(1);
     assert_eq!(l14(&s).0, "FAIL");
-    // the defense in one never landed it
     let mut s = pass.clone();
     s.journal.pop();
     assert_eq!(l14(&s).0, "FAIL");
-    // watched under the window after the landing
     let mut s = pass;
     s.end_ms = T0 + 470_000;
     assert_eq!(l14(&s).0, "UNOBSERVED");
@@ -3213,8 +2895,6 @@ fn wrote_c_passes_only_where_the_done_claim_is_read() {
     let c3 = |s: &Seen| one(Chain::WroteC, s, "muse", Scenario::C3);
     let (w, why) = c3(&wrote_cruised());
     assert_eq!(w, "PASS", "{why}");
-    // NEGATIVE CONTROLS: the claim read as a tool row (no words), and so
-    // continued as a plain turn; the check's defense unread
     let mut s = wrote_cruised();
     s.journal[0].1 = "EVENT idle seq=1 -".into();
     assert_eq!(c3(&s).0, "FAIL");
@@ -3227,7 +2907,6 @@ fn wrote_c_passes_only_where_the_done_claim_is_read() {
 }
 
 /// P5 as a live run that passes it records it: the record `working` from
-/// before the agent started to age 152 s, then landed.
 fn started() -> Seen {
     let rec = |age: i64| {
         format!(
@@ -3257,7 +2936,6 @@ fn land_t_passes_on_a_record_working_past_its_startup_deadline() {
     let (w, why) = p5(&started());
     assert_eq!(w, "PASS", "{why}");
     assert!(why.contains("then done why=landed"), "{why}");
-    // NEGATIVE CONTROL, P5 itself (wf8-agy): stalled why=startup at age 111 s
     let mut s = started();
     s.task.insert(
         2,
@@ -3269,7 +2947,6 @@ fn land_t_passes_on_a_record_working_past_its_startup_deadline() {
     let (w, why) = p5(&s);
     assert_eq!(w, "FAIL", "{why}");
     assert!(why.contains("why=startup"), "{why}");
-    // its other faces: the stall's need, the never-started attention
     let mut s = started();
     s.status.push(j(
         110_000,
@@ -3282,9 +2959,6 @@ fn land_t_passes_on_a_record_working_past_its_startup_deadline() {
         "attention_owners=1 attention_kinds=ask attention=the worker never started",
     ));
     assert_eq!(p5(&s).0, "FAIL");
-    // A STALL RAISED AND LIFTED BETWEEN TWO LOOKS (F13 of the review of
-    // `b9/forever-gaps`, which passed it): the record reads working at each
-    // look, but its rev moved by two
     let mut s = started();
     s.task[2].1 = s.task[2].1.replace("rev=1", "rev=3");
     s.task[3].1 = s.task[3].1.replace("rev=2", "rev=4");
@@ -3294,7 +2968,6 @@ fn land_t_passes_on_a_record_working_past_its_startup_deadline() {
         why.contains("changed between looks unread: rev 1 then 3"),
         "{why}"
     );
-    // unobserved: never read past the deadline and 30 s, or never working
     let mut s = started();
     s.task.truncate(2);
     assert_eq!(p5(&s).0, "UNOBSERVED");
@@ -3304,7 +2977,6 @@ fn land_t_passes_on_a_record_working_past_its_startup_deadline() {
 }
 
 /// The `result` header a worker of `program` answers with: Claude Code's
-/// from its transcript, every other harness's from its screen.
 fn result_head(program: &str) -> String {
     if program == "claude" {
         "OK 3 source=transcript session=8f0e uuid=41aa bytes=129".into()
@@ -3314,9 +2986,6 @@ fn result_head(program: &str) -> String {
 }
 
 /// L15 as a live run that passes it records it: L7's landing on a worker
-/// of `program` the manager `@s-mgr` (running it) spawned, `meta` naming
-/// it, its wait returning at the landing, the result as stubbed from the
-/// source its harness has.
 fn spawned_on(program: &str) -> Seen {
     let mut s = tasked();
     s.task[0].1 =
@@ -3350,22 +3019,16 @@ fn worker_passes_on_a_spawned_workers_landing_its_managers_wait_and_result() {
     let l15 = |s: &Seen| one(Chain::Worker, s, "claude", Scenario::L15);
     let (w, why) = l15(&spawned());
     assert_eq!(w, "PASS", "{why}");
-    // NEGATIVE CONTROLS. The record not from its manager
     let mut s = spawned();
     s.task[0].1 = s.task[0].1.replace("from=s-mgr", "from=ctl");
     assert_eq!(l15(&s).0, "FAIL");
-    // not under Land
     let mut s = spawned();
     s.status[0] = status(1_000, "open", "cruise");
     assert_eq!(l15(&s).0, "FAIL");
-    // A FIRST READ RACING THE AGENT'S START (measured: Gemini CLI 0.46.0's
-    // worker read `autopilot=- supervisor=-` at +0.0 s, `land` at +4.1 s):
-    // `-` until the tab runs an agent is no word, the first word is judged
     let mut s = spawned_on("gemini");
     s.status.insert(0, status(-1_000, "-", "-"));
     let (w, why) = one(Chain::Worker, &s, "gemini", Scenario::L15);
     assert_eq!(w, "PASS", "{why}");
-    // …and its first word other than land fails, as does no word at all
     s.status[1] = status(1_000, "open", "cruise");
     let (w, why) = one(Chain::Worker, &s, "gemini", Scenario::L15);
     assert_eq!(w, "FAIL", "{why}");
@@ -3374,7 +3037,6 @@ fn worker_passes_on_a_spawned_workers_landing_its_managers_wait_and_result() {
     let (w, why) = one(Chain::Worker, &s, "gemini", Scenario::L15);
     assert_eq!(w, "FAIL", "{why}");
     assert!(why.contains("none named one"), "{why}");
-    // the manager's wait returned before the landing (an attention, a stall)
     let mut s = spawned();
     s.cover.awaited = Some((
         T0 + 3_000,
@@ -3382,9 +3044,6 @@ fn worker_passes_on_a_spawned_workers_landing_its_managers_wait_and_result() {
         "OK 1\n@s-w1 rev=2 state=stalled agent=idle attention=x result_bytes=0\n".into(),
     ));
     assert_eq!(l15(&s).0, "FAIL");
-    // …and a wait that returned `state=done` 6 s before the landing fails by
-    // its time alone (F17 of the review of `b9/forever-gaps`: the control
-    // above fails on its `state=stalled` too)
     let mut s = spawned();
     s.cover.awaited = Some((
         T0 + 3_000,
@@ -3408,15 +3067,12 @@ fn worker_passes_on_a_spawned_workers_landing_its_managers_wait_and_result() {
     let mut s = spawned();
     s.cover.awaited = None;
     assert_eq!(l15(&s).0, "FAIL");
-    // the result not the report and the defense
     let mut s = spawned();
     s.cover.result = Some(format!("{CLEAN}\n"));
     assert_eq!(l15(&s).0, "FAIL");
-    // the landing L7 needs: no TASK line
     let mut s = spawned();
     s.journal.pop();
     assert_eq!(l15(&s).0, "FAIL");
-    // no worker spawned
     let mut s = spawned();
     s.cover.spawn = None;
     assert_eq!(l15(&s).0, "UNOBSERVED");
@@ -3429,8 +3085,6 @@ fn a_spawned_worker_of_each_harness_passes_as_that_harness_alone() {
         let (w, why) = l15(&spawned_on(program));
         assert_eq!(w, "PASS", "{program}: {why}");
         assert!(why.contains(&format!("spawned agent={program} ")), "{why}");
-        // NEGATIVE CONTROLS. The spawn named another agent than the harness
-        // under test (a worker of Claude Code on another harness's manager)
         let other = if program == "claude" {
             "gemini"
         } else {
@@ -3441,11 +3095,9 @@ fn a_spawned_worker_of_each_harness_passes_as_that_harness_alone() {
         let (w, why) = l15(&s);
         assert_eq!(w, "FAIL", "{program}: {why}");
         assert!(why.contains("not the harness under test's"), "{why}");
-        // …or none
         let mut s = spawned_on(program);
         s.cover.agent = None;
         assert_eq!(l15(&s).0, "FAIL", "{program}");
-        // `meta` names another worker, or none was read
         let mut s = spawned_on(program);
         s.cover.worker = Some(other.into());
         assert_eq!(l15(&s).0, "FAIL", "{program}");
@@ -3454,9 +3106,6 @@ fn a_spawned_worker_of_each_harness_passes_as_that_harness_alone() {
         let (w, why) = l15(&s);
         assert_eq!(w, "FAIL", "{program}: {why}");
         assert!(why.contains("meta names worker=(not read)"), "{why}");
-        // the result from the other source (a screen read for Claude Code,
-        // a transcript for a screen-read harness), or another program's
-        // screen, or no header at all
         let mut s = spawned_on(program);
         s.cover.result_head = Some(result_head(other));
         let (w, why) = l15(&s);
@@ -3465,11 +3114,9 @@ fn a_spawned_worker_of_each_harness_passes_as_that_harness_alone() {
         let mut s = spawned_on(program);
         s.cover.result_head = None;
         assert_eq!(l15(&s).0, "FAIL", "{program}");
-        // the same records judged as another harness's run fail
         let (w, _) = one(Chain::Worker, &spawned_on(program), other, Scenario::L15);
         assert_eq!(w, "FAIL", "{program} judged as {other}");
     }
-    // a screen worker's header naming another screen-read harness
     let mut s = spawned_on("agy");
     s.cover.result_head = Some(result_head("muse"));
     assert_eq!(one(Chain::Worker, &s, "agy", Scenario::L15).0, "FAIL");
@@ -3480,13 +3127,10 @@ fn a_worker_shells_gemini_runs_the_labs_build_and_its_project_is_trusted() {
     let w = gemini_wrapper("/opt/homebrew/bin/gemini");
     assert!(w.starts_with("#!/bin/sh\n"), "{w}");
     assert!(w.ends_with("exec /opt/homebrew/bin/gemini \"$@\"\n"), "{w}");
-    // a path a shell would split is quoted
     assert!(
         gemini_wrapper("/a b/gemini").ends_with("exec '/a b/gemini' \"$@\"\n"),
         "{w}"
     );
-    // the project, as named and as resolved (`/tmp` is `/private/tmp`):
-    // every folder under it trusted, nothing else named
     let j = crate::pyjson::J::parse(&gemini_trusted_project("/tmp")).unwrap();
     let crate::pyjson::J::Obj(rows) = &j else {
         panic!("{j:?}")
@@ -3498,7 +3142,6 @@ fn a_worker_shells_gemini_runs_the_labs_build_and_its_project_is_trusted() {
         rows.iter()
             .all(|(_, v)| *v == crate::pyjson::J::s("TRUST_FOLDER"))
     );
-    // a path that resolves to itself is named once
     let j = crate::pyjson::J::parse(&gemini_trusted_project("/nonexistent/proj")).unwrap();
     assert_eq!(
         j,
@@ -3507,8 +3150,6 @@ fn a_worker_shells_gemini_runs_the_labs_build_and_its_project_is_trusted() {
 }
 
 /// CAP as a live run that passes it records it: land@v1 at +125 s, the next
-/// point escalated at +370 s naming the cap, nothing typed for the hour, the
-/// orchestrator's turn 30 s past it, and the nudge after its 8 min step.
 fn capped() -> Seen {
     let turn = 125_000 + 3_600_000 + 30_000;
     Seen {
@@ -3542,8 +3183,6 @@ fn capped() -> Seen {
             typed(125_000, "land@v1", LAND),
             typed(turn + 484_000, "land-nudge@v1", LAND_NUDGE),
         ],
-        // the live shape (Claude Code 2.1.304): the escalation's own face is
-        // `needs=ask`, its entry the supervisor's
         status: vec![
             status(1_000, "open", "land"),
             status_of(371_000, "open", "ask", "land", "aterm-harness@1"),
@@ -3580,7 +3219,6 @@ fn cap_passes_on_acts_stopped_for_the_hour_and_resumed_at_a_new_point() {
         "{why}"
     );
     assert!(why.contains("land-nudge@v1 typed at +4239.0 s"), "{why}");
-    // NEGATIVE CONTROLS. No cap: the nudge typed at the 4 min step
     let mut s = capped();
     s.journal[5].1 = "CONTINUED seq=2 rule=land-nudge@v1 [aterm harness] Still landing:".into();
     assert_eq!(cap(&s).0, "FAIL");
@@ -3588,7 +3226,6 @@ fn cap_passes_on_acts_stopped_for_the_hour_and_resumed_at_a_new_point() {
     s.ledger
         .insert(1, typed(370_000, "land-nudge@v1", LAND_NUDGE));
     assert_eq!(cap(&s).0, "FAIL");
-    // the act typed again inside the hour after the escalation (a timer re-deciding it)
     let mut s = capped();
     s.journal.insert(
         6,
@@ -3598,15 +3235,12 @@ fn cap_passes_on_acts_stopped_for_the_hour_and_resumed_at_a_new_point() {
         ),
     );
     assert_eq!(cap(&s).0, "FAIL");
-    // the capped point never escalated, or its attention not the cap's
     let mut s = capped();
     s.journal.remove(5);
     assert_eq!(cap(&s).0, "FAIL");
     let mut s = capped();
     s.meta[1].1 = "attention_owners=1 attention_kinds=ask attention=claude: idle (a box)".into();
     assert_eq!(cap(&s).0, "FAIL");
-    // a NEEDS YOU need raised where no reply named one (the escalation's own
-    // `needs=ask` is the cap's, and passes above)
     let mut s = capped();
     s.journal
         .insert(6, j(372_000, "NEEDS seq=2 count=1 attention=OK x"));
@@ -3614,7 +3248,6 @@ fn cap_passes_on_acts_stopped_for_the_hour_and_resumed_at_a_new_point() {
     let mut s = capped();
     s.meta.push(needs_meta(372_000, "claude"));
     assert_eq!(cap(&s).0, "FAIL");
-    // the stub saw a harness text inside the hour
     let mut s = capped();
     s.cover.window_stub = Some(StubSeen {
         baseline: 1,
@@ -3622,12 +3255,9 @@ fn cap_passes_on_acts_stopped_for_the_hour_and_resumed_at_a_new_point() {
         new_turns: 1,
     });
     assert_eq!(cap(&s).0, "FAIL");
-    // the act after the turn journaled with no ledger row
     let mut s = capped();
     s.ledger.pop();
     assert_eq!(cap(&s).0, "FAIL");
-    // the hour freed, and the escalated point decided again on a timer: an
-    // act before the orchestrator's turn, or with no new point at all
     let window_end = 125_000 + 3_600_000;
     let mut s = capped();
     s.journal.insert(
@@ -3645,10 +3275,6 @@ fn cap_passes_on_acts_stopped_for_the_hour_and_resumed_at_a_new_point() {
     let mut s = capped();
     s.cover.turn_ms = None;
     assert_eq!(cap(&s).0, "FAIL");
-    // THE ORCHESTRATOR'S TURN NOT JUDGED (F8 of the review of
-    // `b9/forever-gaps`, where any act after it passed): an act after the
-    // turn with no point read at its reply, or none decided there, or one
-    // typed before the due its back-off named
     let mut s = capped();
     s.journal.drain(6..8);
     let (w, why) = cap(&s);
@@ -3665,15 +3291,12 @@ fn cap_passes_on_acts_stopped_for_the_hour_and_resumed_at_a_new_point() {
     let (w, why) = cap(&s);
     assert_eq!(w, "FAIL", "{why}");
     assert!(why.contains("BEFORE the due its back-off named"), "{why}");
-    // NO ACT AFTER THE TURN past its back-off's due (8 min) and a minute
-    // more: PERSISTENCE LOST (F9; it read UNOBSERVED)
     let mut s = capped();
     s.journal.pop();
     s.ledger.pop();
     let (w, why) = cap(&s);
     assert_eq!(w, "FAIL", "{why}");
     assert!(why.contains("PERSISTENCE LOST"), "{why}");
-    // unobserved: no act after the turn yet, no turn, the turn inside the hour, watched under it
     let mut s = capped();
     s.journal.pop();
     s.ledger.pop();
@@ -3693,7 +3316,6 @@ fn cap_passes_on_acts_stopped_for_the_hour_and_resumed_at_a_new_point() {
     s.cover.turn_ms = None;
     s.end_ms = T0 + 2_000_000;
     assert_eq!(cap(&s).0, "UNOBSERVED");
-    // no act at all
     assert_eq!(
         cap(&Seen {
             end_ms: T0 + 900_000,
@@ -3705,8 +3327,6 @@ fn cap_passes_on_acts_stopped_for_the_hour_and_resumed_at_a_new_point() {
 }
 
 /// The lab's drive of the coverage chains: each orchestrator turn once, at
-/// its time; CAP watched to an act in the hour or a minute past the act after
-/// the turn.
 #[test]
 fn the_orchestrator_turns_come_once_at_their_time_and_cap_is_watched_to_its_verdict() {
     let mut s = left_to_them();
@@ -3730,7 +3350,6 @@ fn the_orchestrator_turns_come_once_at_their_time_and_cap_is_watched_to_its_verd
     let hour = T0 + 125_000 + cap_window_ms();
     assert!(!orchestrator_due(Chain::Cap, &c, hour));
     assert!(orchestrator_due(Chain::Cap, &c, hour + PAST_WINDOW_MS));
-    // CAP: watched on through the hour, done a minute after the act after the turn
     let mut early = capped();
     early.journal.truncate(6);
     early.cover.turn_ms = None;
@@ -3739,7 +3358,6 @@ fn the_orchestrator_turns_come_once_at_their_time_and_cap_is_watched_to_its_verd
     let resumed = T0 + 125_000 + 3_600_000 + 30_000 + 484_000;
     assert!(!cover::cap_watched(&done, resumed + 59_000));
     assert!(cover::cap_watched(&done, resumed + 60_000));
-    // an act inside the hour ends the watch: the verdict is in
     let mut broken = early;
     broken.journal.push(j(
         900_000,
@@ -3749,9 +3367,6 @@ fn the_orchestrator_turns_come_once_at_their_time_and_cap_is_watched_to_its_verd
 }
 
 /// W1's records: the wall raised at the first point (+6 s), land@v1 meeting
-/// it, the limited point read and waited out, the resume typed past the
-/// reset (+300 s) and its grace, and the clean defense landing it.
-/// The record of a wall's track ending (`wall-wait-end@v1`).
 const WALL_END: &str = "wall-wait-end@v1";
 
 fn walled() -> Seen {
@@ -3784,8 +3399,6 @@ fn walled() -> Seen {
             j(365_000, "EVENT idle seq=3 Nothing left: the parser"),
             j(365_000, "DONE seq=3 rule=land@v1 x"),
         ],
-        // the live shape (`wall1-muse`): the wall's track ends twice, the
-        // second time 4 ms ahead of the landing's own point, at its read
         ledger: vec![
             point(5_000, 1),
             typed(125_000, "land@v1", LAND),
@@ -3838,17 +3451,12 @@ fn wall_passes_on_nothing_typed_into_it_gone_on_past_it_and_landed() {
         why.contains("gone on: usage-resume@v1 typed at +361.0 s"),
         "{why}"
     );
-    // THE PROGRAM'S OWN RETRY landed it past the reset: nothing of the
-    // harness's going on shows (F14 of the review of `b9/forever-gaps`, it
-    // passed)
     let mut s = walled();
     s.journal.remove(5);
     s.ledger.remove(4);
     let (w, why) = w1(&s);
     assert_eq!(w, "UNOBSERVED", "{why}");
     assert!(why.contains("the program's own retry landed it"), "{why}");
-    // …and so from the lab's lift (3 s before the reset), where the stub
-    // answers again: no landing while the wall stood (F14, a false FAIL)
     let mut s = walled();
     s.journal.remove(5);
     s.ledger.remove(4);
@@ -3861,7 +3469,6 @@ fn wall_passes_on_nothing_typed_into_it_gone_on_past_it_and_landed() {
     let (w, why) = w1(&s);
     assert_eq!(w, "UNOBSERVED", "{why}");
     assert!(!why.contains("while the wall stood"), "{why}");
-    // NEGATIVE CONTROLS. Typed into the wall (journal, or ledger alone)
     let mut s = walled();
     s.journal.insert(
         5,
@@ -3877,21 +3484,18 @@ fn wall_passes_on_nothing_typed_into_it_gone_on_past_it_and_landed() {
     s.ledger
         .insert(4, typed(200_000, "land-nudge@v1", LAND_NUDGE));
     assert_eq!(w1(&s).0, "FAIL");
-    // the wall's point read as an idle one
     let mut s = walled();
     s.journal[3].1 =
         "EVENT idle seq=2 ◆ Usage limit reached · /upgrade (x) for increased limits".into();
     let (w, why) = w1(&s);
     assert_eq!(w, "FAIL", "{why}");
     assert!(why.contains("never read as one"), "{why}");
-    // landed while the wall stood (the journal, or the status)
     let mut s = walled();
     s.journal.insert(4, j(140_050, "DONE seq=2 rule=land@v1 x"));
     assert_eq!(w1(&s).0, "FAIL");
     let mut s = walled();
     s.status.insert(1, status(150_000, "landed", "land"));
     assert_eq!(w1(&s).0, "FAIL");
-    // the stub saw a harness text in the wall
     let mut s = walled();
     s.cover.window_stub = Some(StubSeen {
         baseline: 1,
@@ -3899,15 +3503,12 @@ fn wall_passes_on_nothing_typed_into_it_gone_on_past_it_and_landed() {
         new_turns: 1,
     });
     assert_eq!(w1(&s).0, "FAIL");
-    // a need raised where none was named
     let mut s = walled();
     s.meta.push(needs_meta(150_000, "muse"));
     assert_eq!(w1(&s).0, "FAIL");
-    // the act past the reset journaled with no ledger row
     let mut s = walled();
     s.ledger.remove(4);
     assert_eq!(w1(&s).0, "FAIL");
-    // PERSISTENCE LOST: nothing goes on past the reset, or it never lands
     let lost = T0 + 300_000 + wall_grace_ms("muse") + WALL_LOST_MS;
     let mut s = walled();
     s.journal.truncate(5);
@@ -3925,9 +3526,6 @@ fn wall_passes_on_nothing_typed_into_it_gone_on_past_it_and_landed() {
     let (w, why) = w1(&s);
     assert_eq!(w, "FAIL", "{why}");
     assert!(why.contains("NO landing"), "{why}");
-    // A later recovery cannot erase a missed persistence deadline. Keep the
-    // observed order and the landing's quiet, but move the first resumed act
-    // and its answer/landing past the reset's grace and lost window.
     let mut s = walled();
     let late = lost - (T0 + 361_000) + 1_000;
     for (t, _) in s.journal.iter_mut().skip(5) {
@@ -3943,26 +3541,21 @@ fn wall_passes_on_nothing_typed_into_it_gone_on_past_it_and_landed() {
     let (w, why) = w1(&s);
     assert_eq!(w, "FAIL", "{why}");
     assert!(why.contains("first act after the reset"), "{why}");
-    // Even an on-time act must still land within that deadline.
     s.journal[5].0 = T0 + 361_000;
     s.ledger[4].ts = T0 + 361_000;
     let (w, why) = w1(&s);
     assert_eq!(w, "FAIL", "{why}");
     assert!(why.contains("the landing came"), "{why}");
-    // The program's own retry (no act) has the same landing deadline.
     s.journal.remove(5);
     s.ledger.remove(4);
     let (w, why) = w1(&s);
     assert_eq!(w, "FAIL", "{why}");
     assert!(why.contains("the landing came"), "{why}");
-    // The original on-time continuation and landing still pass.
     assert_eq!(w1(&walled()).0, "PASS");
-    // typed after the landing (L5's quiet)
     let mut s = walled();
     s.journal
         .push(j(500_000, "CONTINUED seq=4 rule=land-nudge@v1 x"));
     assert_eq!(w1(&s).0, "FAIL");
-    // the wall's track ended after the landing's own point, not at its read
     let mut s = walled();
     s.ledger
         .insert(8, row(365_002, WALL_END, "waiting", "", "x"));
@@ -3972,12 +3565,9 @@ fn wall_passes_on_nothing_typed_into_it_gone_on_past_it_and_landed() {
         why.contains("ledger rows after the landing's point"),
         "{why}"
     );
-    // no land act at all
     let mut s = walled();
     s.journal.remove(2);
     assert_eq!(w1(&s).0, "FAIL");
-    // UNOBSERVED: no wall raised; the land act before the raise or after the
-    // reset; the wall never drawn; the stub unread; watched short of the loss
     let mut s = walled();
     s.cover.wall = None;
     assert_eq!(w1(&s).0, "UNOBSERVED");
@@ -3987,8 +3577,6 @@ fn wall_passes_on_nothing_typed_into_it_gone_on_past_it_and_landed() {
     let mut s = walled();
     s.cover.wall = Some((T0 + 6_000, (T0 + 100_000) / 1000));
     assert_eq!(w1(&s).0, "UNOBSERVED");
-    // (and nothing typed for it: an act after the land act with no point
-    // between is an act typed twice, every chain's fault)
     let mut s = walled();
     s.journal.drain(3..6);
     s.ledger.drain(2..5);
@@ -4016,14 +3604,6 @@ fn wall_passes_on_nothing_typed_into_it_gone_on_past_it_and_landed() {
 }
 
 /// AN ACT BEFORE THE DUE ITS BACK-OFF NAMED FAILS EVERY SCENARIO OF ITS
-/// CHAIN (F10 of the review of `b9/forever-gaps`: no verdict compared an act
-/// with its `WAITING`'s `until=`). `landed_a`'s land act is due at +125.0 s
-/// (the 2 min back-off from +5.1 s, its stamp cut to the second): 1.9 s
-/// early passes (the stamp's cut and the act's re-read, [`DUE_SLACK_MS`]),
-/// 2.1 s early fails L1, L3 and L5, each of which passed it. NEGATIVE
-/// CONTROLS: a point judged after the back-off (its own decision typed the
-/// act), the take window's wait (no back-off), and a back-off whose stamp
-/// does not read (a fault of its own).
 #[test]
 fn an_act_before_the_due_its_back_off_named_fails_every_scenario_of_its_chain() {
     let moved = |t: i64| {
@@ -4051,29 +3631,24 @@ fn an_act_before_the_due_its_back_off_named_fails_every_scenario_of_its_chain() 
         verdicts(Chain::LandA, &moved(60_000), "gemini")[0],
         ("L1", "FAIL")
     );
-    // a nudge typed a minute into its 4 min back-off
     let mut s = landed_a();
     s.journal[6].0 = T0 + 190_000;
     s.ledger[3].ts = T0 + 190_000;
     let (w, why) = one(Chain::LandA, &s, "gemini", Scenario::L3);
     assert_eq!(w, "FAIL", "{why}");
     assert!(why.contains("land-nudge@v1 typed"), "{why}");
-    // NEGATIVE CONTROLS. A new point judged after the back-off, its act at once
     let mut s = moved(60_000);
     s.journal
         .insert(2, j(59_000, "EVENT idle seq=9 another turn ended"));
     assert_eq!(verdicts(Chain::LandA, &s, "gemini")[0], ("L1", "PASS"));
-    // the take window's wait names no back-off
     let mut s = moved(60_000);
     s.journal[1].1 = "WAITING seq=1 until=x the worker to take the land@v1 act".into();
     assert_eq!(verdicts(Chain::LandA, &s, "gemini")[0], ("L1", "PASS"));
-    // a back-off whose stamp does not read
     let mut s = landed_a();
     s.journal[1].1 = "WAITING seq=1 until=soon 1 short turn(s) in a row: 2 min back-off".into();
     let (w, why) = one(Chain::LandA, &s, "gemini", Scenario::L1);
     assert_eq!(w, "FAIL", "{why}");
     assert!(why.contains("names no due that reads"), "{why}");
-    // a wall's reset is a due too: W1's act a second into the wall
     let mut s = walled();
     s.journal[5].0 = T0 + 141_000;
     s.ledger[4].ts = T0 + 141_000;
@@ -4082,9 +3657,6 @@ fn an_act_before_the_due_its_back_off_named_fails_every_scenario_of_its_chain() 
 }
 
 /// AN ACT TYPED TWICE FAILS ANY CHAIN (F12 of the review of
-/// `b9/forever-gaps`: only P4's chains asked): `land-b`'s nudge typed again
-/// a second after itself, no point judged between, fails L2 (it passed).
-/// NEGATIVE CONTROLS: a back-off between, a `LEFT` between.
 #[test]
 fn an_act_typed_twice_with_no_point_between_fails_any_chain() {
     let open = open_suffix();
@@ -4103,7 +3675,6 @@ fn an_act_typed_twice_with_no_point_between_fails_any_chain() {
         "{why}"
     );
     assert!(why.contains("its own judge: PASS"), "{why}");
-    // a LEFT between is a point judged
     let mut s = nudged(&open);
     s.journal
         .insert(4, j(370_500, "LEFT seq=3 rule=left-to-person@v1 x"));
@@ -4119,10 +3690,6 @@ fn an_act_typed_twice_with_no_point_between_fails_any_chain() {
 }
 
 /// P3 IS A VERDICT (F11 of the review of `b9/forever-gaps`: it was reported
-/// only): a point judged before the first prompt, or a first point that
-/// closed two short turns, fails every scenario of the chain (each passed
-/// it); the first point closing one passes, and so does one closing none
-/// that was left to its person (L13's, above).
 #[test]
 fn a_point_before_the_first_prompt_or_a_late_ladder_fails_the_chain() {
     let mut s = landed_a();
@@ -4145,10 +3712,6 @@ fn a_point_before_the_first_prompt_or_a_late_ladder_fails_the_chain() {
 }
 
 /// THE INSTANT CRUISE CHAIN IS WATCHED UNTIL IT GOES ON (F5 of the review of
-/// `b9/forever-gaps`: the watch ended 3 s after the person's point was
-/// decided, so nothing after it was ever judged): past the decision, until
-/// an act follows it (3 s after that act), or past its back-off's due and a
-/// minute more.
 #[test]
 fn the_instant_cruise_tab_is_watched_until_the_chain_goes_on() {
     let tab = |seen: Seen| Tab {
@@ -4177,7 +3740,6 @@ fn the_instant_cruise_tab_is_watched_until_the_chain_goes_on() {
 }
 
 /// W1's records with everything from the resume on moved `by` ms later: the
-/// first act past the reset and the landing after it.
 fn walled_late(by: i64) -> Seen {
     let mut s = walled();
     for (t, _) in s.journal.iter_mut().skip(5) {
@@ -4194,12 +3756,6 @@ fn walled_late(by: i64) -> Seen {
 }
 
 /// W1 holds each harness to its OWN program's grace past the reset
-/// ([`wall_grace_ms`]): a resume 400 s past the reset is in time on Claude
-/// Code (150 s grace: its own continue comes 30 to 90 s past the reset), and
-/// persistence lost on the programs with no auto-continue (60 s). The
-/// records hold no continuation of Claude Code's own ([`Cover::went_on_ms`]
-/// `None`: its countdown cancelled): with one before the resume, the resume
-/// is typed on top of it ([`an_act_after_the_programs_own_continuation_fails_w1`]).
 #[test]
 fn the_walls_deadline_is_the_programs_own_grace() {
     let reset = T0 + 300_000;
@@ -4215,7 +3771,6 @@ fn the_walls_deadline_is_the_programs_own_grace() {
         why.contains("TYPED ON TOP of the program's own continuation"),
         "{why}"
     );
-    // NEGATIVE CONTROLS: the same records on every other harness
     for program in ["gemini", "agy", "muse"] {
         let (w, why) = one(Chain::Wall, &late, program, Scenario::W1);
         assert_eq!(w, "FAIL", "{program}: {why}");
@@ -4224,7 +3779,6 @@ fn the_walls_deadline_is_the_programs_own_grace() {
             "{program}: {why}"
         );
     }
-    // and past Claude Code's own deadline too
     let later = walled_late(reset + 451_000 - (T0 + 361_000));
     let (w, why) = one(Chain::Wall, &later, "claude", Scenario::W1);
     assert_eq!(w, "FAIL", "{why}");
@@ -4232,20 +3786,10 @@ fn the_walls_deadline_is_the_programs_own_grace() {
 }
 
 /// W1 WHERE THE PROGRAM GOES ON BY ITSELF (the review of the W1 judge on
-/// Claude Code): Claude Code's own continuation reached the stub past the
-/// reset ([`Cover::went_on_ms`]), and the loop's `usage-resume@v1` came after
-/// it, typed into a conversation the vendor had already carried past the
-/// wall — a double continue (`r21amc15b`'s class): FAIL by name, though it
-/// came inside the grace and the defense landed. The continuation answered
-/// and landed with nothing typed after the reset: PASS, the continuation
-/// named. NEGATIVE CONTROLS: the loop's act before the continuation (the
-/// loop went on first) and no continuation at all pass as before.
 #[test]
 fn an_act_after_the_programs_own_continuation_fails_w1() {
     let reset = T0 + 300_000;
     let w1 = |s: &Seen| one(Chain::Wall, s, "claude", Scenario::W1);
-    // Claude Code went on 60 s past the reset; the loop typed its resume at
-    // its grace, 150 s past it.
     let mut s = walled_late(reset + 150_000 - (T0 + 361_000));
     s.cover.went_on_ms = Some(reset + 60_000);
     let (w, why) = w1(&s);
@@ -4256,7 +3800,6 @@ fn an_act_after_the_programs_own_continuation_fails_w1() {
         ),
         "{why}"
     );
-    // The continuation answered and landed, nothing typed after the reset.
     let mut s = walled();
     s.journal.remove(5);
     s.ledger.remove(4);
@@ -4267,7 +3810,6 @@ fn an_act_after_the_programs_own_continuation_fails_w1() {
         why.contains("the program's own continuation at +362.0 s (62.0 s past the reset) answered"),
         "{why}"
     );
-    // NEGATIVE CONTROLS. The loop went on first (its act at +361 s).
     let mut s = walled();
     s.cover.went_on_ms = Some(T0 + 362_000);
     let (w, why) = w1(&s);
@@ -4276,18 +3818,11 @@ fn an_act_after_the_programs_own_continuation_fails_w1() {
         why.contains("gone on: usage-resume@v1 typed at +361.0 s"),
         "{why}"
     );
-    // No continuation of the program's own: the act is the harness going on.
     let (w, why) = w1(&walled_late(reset + 150_000 - (T0 + 361_000)));
     assert_eq!(w, "PASS", "{why}");
 }
 
 /// THE PROGRAM'S OWN CONTINUATION IN THE STUB'S DUMPS ([`first_continuation`],
-/// [`carries_continuation`]): the first request of the conversation from the
-/// wall's lift on whose user texts hold Claude Code's words for it
-/// ([`CLAUDE_CONTINUES`], as 2.1.306 sent them beside the cut act). NEGATIVE
-/// CONTROLS: a request before the lift (a retry the wall answered); another
-/// conversation's; the harness's own resume (marked, no such words); the
-/// words in the assistant's text, not a user's.
 #[test]
 fn the_programs_own_continuation_is_the_first_request_holding_its_words() {
     let tok = Chain::Wall.token();
@@ -4321,14 +3856,10 @@ fn the_programs_own_continuation_is_the_first_request_holding_its_words() {
 }
 
 /// The reason the policy escalates Gemini CLI's usage-limit dialog with
-/// (`approval.rs`'s `foreign_limit`).
 const GEMINI_LIMIT_HELD: &str = "Gemini CLI's usage limit: neither Keep trying nor Stop is \
      pressed; /stats model in this tab says which limit holds it";
 
 /// W1 on Gemini CLI as the live lab drew it (Gemini CLI 0.46.0 on the stub's
-/// `limit:code_assist`, 2026-10-21): the land act met by the usage-limit
-/// dialog, a box (`EVENT prompt … kind=usage-limit`), escalated to a person
-/// (`needs=ask`), and nothing going on past the reset.
 fn gemini_walled() -> Seen {
     let mut s = walled();
     s.journal.truncate(3);
@@ -4348,8 +3879,6 @@ fn gemini_walled() -> Seen {
 }
 
 /// A usage-limit DIALOG reads the wall (Gemini CLI draws its limit as a box,
-/// not a notice at a turn's end), and the dialog handed to a person is a stall
-/// W1 FAILS by name — never "typed into the wall", never unobserved.
 #[test]
 fn a_usage_limit_dialog_reads_the_wall_and_its_escalation_fails_w1() {
     let w1 = |s: &Seen| one(Chain::Wall, s, "gemini", Scenario::W1);
@@ -4364,14 +3893,10 @@ fn a_usage_limit_dialog_reads_the_wall_and_its_escalation_fails_w1() {
         "{why}"
     );
     assert!(!why.contains("TYPED into the wall"), "{why}");
-    // NEGATIVE CONTROLS. The dialog read, nothing escalated, gone on past the
-    // reset and landed: the box is the wall's point, and W1 passes
     let mut s = walled();
     s.journal[3].1 = "EVENT prompt seq=2 kind=usage-limit classify=- command=-".into();
     let (w, why) = w1(&s);
     assert_eq!(w, "PASS", "{why}");
-    // a box of another kind reads no wall (its point still judged, a wait
-    // that names no wall: two acts with none between fail every chain)
     s.journal[3].1 = "EVENT prompt seq=2 kind=permission classify=- command=touch".into();
     s.journal[4].1 = format!(
         "WAITING seq=2 until={} a person's answer to the box",
@@ -4381,7 +3906,6 @@ fn a_usage_limit_dialog_reads_the_wall_and_its_escalation_fails_w1() {
     let (w, why) = w1(&s);
     assert_eq!(w, "UNOBSERVED", "{why}");
     assert!(why.contains("never drawn as a limit point"), "{why}");
-    // an escalation after the reset is no stall of the wall
     let mut s = walled();
     s.ledger
         .insert(4, row(300_500, "-", "escalated", "", GEMINI_LIMIT_HELD));
@@ -4390,12 +3914,6 @@ fn a_usage_limit_dialog_reads_the_wall_and_its_escalation_fails_w1() {
 }
 
 /// W1's records on Gemini CLI kept trying (`limit-retry@v1`): the land act
-/// met by the account's usage-limit dialog, a box read as the wall's point,
-/// its reset named in the CLI's own zone (`1:05 PM GMT+5:30`, the walled
-/// run's `TZ`), waited on to the end of the minute it names and a minute's
-/// grace past the reset (+300 s, its wait ledgered `waiting`), its `Keep
-/// trying` pressed then (ledgered `approved`), and the turn it sent again
-/// landing the task.
 fn gemini_kept_trying() -> Seen {
     let mut s = walled();
     s.journal.truncate(3);
@@ -4450,13 +3968,6 @@ fn gemini_kept_trying() -> Seen {
 }
 
 /// GEMINI CLI KEPT TRYING PASSES W1: the usage-limit dialog takes no typing,
-/// so the harness going on past the wall is its `Keep trying` pressed past
-/// the reset (`limit-retry@v1`, ledgered `approved`) at the due its wait
-/// named, and the turn that press sent landing the task. NEGATIVE CONTROLS:
-/// the press in the wall is an act in it (FAIL); one past the reset but
-/// before its wait's due is pressed early (FAIL); with no press ledgered,
-/// the landing is the program's own retry (UNOBSERVED, F14); a press past
-/// the deadline is persistence lost.
 #[test]
 fn a_keep_trying_pressed_past_the_reset_goes_on_past_the_wall() {
     let w1 = |s: &Seen| one(Chain::Wall, s, "gemini", Scenario::W1);
@@ -4481,8 +3992,6 @@ fn a_keep_trying_pressed_past_the_reset_goes_on_past_the_wall() {
         why.contains("TYPED into the wall: 0 journal act(s), 1 ledger act(s) (the first limit-retry@v1 approved at +200.0 s)"),
         "{why}"
     );
-    // past the reset but before the due its wait named (the reset's minute
-    // and the grace, in the dialog's zone): pressed before its due
     let mut s = gemini_kept_trying();
     s.ledger[4].ts = T0 + 360_000;
     s.journal[5].0 = T0 + 360_000;
@@ -4508,17 +4017,10 @@ fn a_keep_trying_pressed_past_the_reset_goes_on_past_the_wall() {
 }
 
 /// The reason the loop raises its badge for Gemini CLI's usage-limit dialog
-/// that names no reset (`approval.rs`'s `limit_no_reset_reason`).
 const GEMINI_NO_RESET: &str = "Gemini CLI's usage limit names no reset: Keep trying is tried on a \
      back-off ladder; /stats model says which limit";
 
 /// W1's records on Gemini CLI's per-day quota (`--mode wall-day`): the land
-/// act met by the usage-limit dialog that names no reset (+140 s), the person
-/// told at once (`ESCALATED`, its `escalated` row, `needs=ask`) beside the
-/// ladder's own wait (`WAITING … rule=limit-retry@v1 … on the back-off
-/// ladder`, ledgered `waiting`) for its first rung 30 min on; the lab's wall
-/// lifted at +25 min; `Keep trying` pressed at the rung (+1941 s), the badge
-/// cleared, the task landed.
 fn gemini_day_kept_trying() -> Seen {
     let mut s = walled();
     let due = 140_000 + 1_800_000;
@@ -4583,15 +4085,6 @@ fn gemini_day_kept_trying() -> Seen {
 }
 
 /// THE PER-DAY QUOTA'S DIALOG KEPT TRYING ON ITS LADDER PASSES W1
-/// (`--mode wall-day`, T5 of the review of `b9/walls-2`): the person told
-/// beside the ladder's own wait is FOREVER's NEEDS YOU, no stall, and its
-/// `needs=ask` no reply's need; the harness goes on at the ladder's first
-/// due, past the lab's lift, and the deadline counts from there. NEGATIVE
-/// CONTROLS: the same escalation with no ladder wait beside it is the stall
-/// it was (FAIL, as the 2026-10-21 `wi1gw` run's); a press five minutes
-/// past the ladder's due is persistence lost; with the ladder's due unread
-/// the deadline is the lift's, and the press at the rung lost; a reply's
-/// need (`NEEDS`) still fails.
 #[test]
 fn a_per_day_dialogs_badge_is_no_stall_and_its_ladder_goes_on() {
     let w1 = |s: &Seen| one(Chain::WallDay, s, "gemini", Scenario::W1);
@@ -4633,12 +4126,6 @@ fn a_per_day_dialogs_badge_is_no_stall_and_its_ladder_goes_on() {
 }
 
 /// W1's records on Gemini CLI's per-day quota standing past the ladder's
-/// first rung (`--mode wall-climb`): [`gemini_day_kept_trying`]'s dialog and
-/// badge, its first `Keep trying` at the rung (+1941 s) in the wall, the
-/// dialog drawn again (`… (drawn again after its Keep trying, try 1)`, its
-/// next due 2 h on), the badge standing (`needs=ask`); the lab's wall
-/// lifted at +45 min; the climbed try (+9142 s) got through, the badge
-/// cleared, the task landed, watched past the ladder's window after it.
 fn gemini_day_climbed() -> Seen {
     let mut s = gemini_day_kept_trying();
     let due = 140_000 + 1_800_000;
@@ -4684,7 +4171,6 @@ fn gemini_day_climbed() -> Seen {
         point(due2 + 5_000, 5),
         task_done(due2 + 5_000),
     ]);
-    // as the lab records it: a status line where it changed, and every read
     s.status = vec![
         status(1_000, "open", "land"),
         status_of(141_000, "open", "ask", "land", "aterm-harness@1"),
@@ -4700,18 +4186,6 @@ fn gemini_day_climbed() -> Seen {
 }
 
 /// THE LADDER CLIMBED WHILE NEEDS YOU STOOD PASSES W1 (`--mode
-/// wall-climb`): the try at the first rung came in the wall — no act typed
-/// into it — and was answered by the dialog drawn again; the next due
-/// climbed (2 h after that try, past the first rung's 30 min); the badge
-/// stood (`needs=ask` at every status read, no `CLEARED`) until the climbed try got
-/// through, which took it down; the deadline counts from that climbed due.
-/// NEGATIVE CONTROLS: wall-day's records (no try in the wall) show nothing
-/// of the climb (UNOBSERVED); the return unrecorded, a next due that did not
-/// climb, the badge cleared while the quota stood, a status read without
-/// `needs=ask` in that span (the lab records a status line only where it
-/// changed: an unchanged read resolves to the line standing), no read after
-/// the try, the badge standing after the try that got through, and a try
-/// before its due (an act in the wall) each FAIL.
 #[test]
 fn the_per_day_dialogs_ladder_climbs_while_needs_you_stands() {
     let w1 = |s: &Seen| one(Chain::WallClimb, s, "gemini", Scenario::W1);
@@ -4726,7 +4200,6 @@ fn the_per_day_dialogs_ladder_climbs_while_needs_you_stands() {
             && why.contains("NEEDS YOU down at +9145.0 s"),
         "{why}"
     );
-    // wall-day's own records pass wall-day, and show no climb
     let (w, why) = w1(&gemini_day_kept_trying());
     assert_eq!(w, "UNOBSERVED", "{why}");
     assert!(why.contains("the climb unobserved"), "{why}");
@@ -4736,19 +4209,14 @@ fn the_per_day_dialogs_ladder_climbs_while_needs_you_stands() {
         assert!(why.contains(needle), "{needle}: {why}");
     };
     let try1 = 140_000 + 1_800_000 + 1_000;
-    // the return not on the record as one: the wait after the try names no
-    // return (a fresh episode's words)
     let mut s = gemini_day_climbed();
     for (_, l) in &mut s.journal {
         *l = l.replace(" (drawn again after its Keep trying, try 1)", "");
     }
     fail(&s, "was not answered by the dialog drawn again");
-    // and with no wait after the try at all, the climbed due is unread: the
-    // press that got through is persistence lost
     let mut s = gemini_day_climbed();
     s.journal.retain(|(_, l)| !l.contains("drawn again"));
     fail(&s, "PERSISTENCE LOST: the first press after the reset");
-    // the next due did not climb: 20 min after the try, under the first 30
     let mut s = gemini_day_climbed();
     let early = try1 + 1_200_000;
     for (t, l) in &mut s.journal {
@@ -4761,43 +4229,35 @@ fn the_per_day_dialogs_ladder_climbs_while_needs_you_stands() {
     let at = s.ledger.len() - 3;
     s.ledger[at].ts = T0 + early + 1_000;
     fail(&s, "the ladder did not climb at the try at +1941.0 s");
-    // the badge cleared while the quota stood
     let mut s = gemini_day_climbed();
     s.journal
         .push(j(try1 + 4_000, "CLEARED seq=4 box attention=OK"));
     s.journal.sort_by_key(|(t, _)| *t);
     fail(&s, "NEEDS YOU came down at +1945.0 s while the quota stood");
-    // the badge down at a status read while the quota stood (no CLEARED)
     let mut s = gemini_day_climbed();
     s.status.insert(2, status(try1 + 3_600_000, "open", "land"));
     fail(
         &s,
         "NEEDS YOU not standing at the status read at +5541.0 s while the quota stood",
     );
-    // no status read after the try
     let mut s = gemini_day_climbed();
     s.status_reads
         .retain(|t| *t <= T0 + try1 || *t > T0 + try1 + 7_200_000);
     fail(&s, "no status read between the last try in the wall");
-    // the badge stood after the try that got through
     let mut s = gemini_day_climbed();
     s.journal.retain(|(_, l)| !l.starts_with("CLEARED seq=5"));
     s.status[2] = status_of(try1 + 7_205_000, "landed", "ask", "land", "aterm-harness@1");
     fail(&s, "NEEDS YOU STOOD after the try that got through");
-    // a try before its due is an act in the wall
     let mut s = gemini_day_climbed();
     s.ledger[5].ts = T0 + try1 - 61_000;
     fail(&s, "TYPED into the wall: 0 journal act(s), 1 ledger act(s)");
 }
 
 /// Muse Code's `/rules` output, entered once ([`HIDE_COMMAND`]; measured on
-/// 1.4.10, 2026-10-21).
 const RULES_ROWS: &str =
     "  Rules loaded this session (in precedence order):\n  user: none\n  project: none\n";
 
 /// Muse Code's usage wall ([`USAGE_WALL`](aterm_phase::muse::fixtures::USAGE_WALL))
-/// split at its composer frame: the rows above it, and the frame with what
-/// follows.
 fn wall_split() -> (String, String) {
     let body = aterm_phase::muse::fixtures::USAGE_WALL
         .split_once('\n')
@@ -4807,10 +4267,6 @@ fn wall_split() -> (String, String) {
 }
 
 /// Muse Code's usage wall taken off the screen ([`notice_gone`]): `/rules`
-/// output over the composer, the notice's words scrolled out of sight (the
-/// tail of its wrapped reset still at the top, as measured). NEGATIVE
-/// CONTROLS: the wall's own screen; `/rules` output under the notice still in
-/// sight; a screen with no frame.
 #[test]
 fn the_notice_is_gone_only_when_no_row_draws_it() {
     let (above, frame) = wall_split();
@@ -4828,10 +4284,6 @@ fn the_notice_is_gone_only_when_no_row_draws_it() {
 }
 
 /// The hide's guard ([`menu_offers`]): Muse Code's composer holding
-/// `/rules` with its argument hint, the menu's first row that command — as
-/// measured. NEGATIVE CONTROLS: the first row another command, or a longer
-/// one; the composer holding another draft, or more after the command; no
-/// frame.
 #[test]
 fn the_hide_enters_only_the_command_the_menu_offers_first() {
     let (above, _) = wall_split();
@@ -4880,13 +4332,9 @@ fn the_hide_enters_only_the_command_the_menu_offers_first() {
 }
 
 /// agy's `/title` output, entered once ([`AGY_HIDE_COMMAND`]; measured on
-/// 1.4.0, 2026-10-21, with no `title` block in the lab's settings).
 const TITLE_ROWS: &str = "> /title\n  ⎿  Error: No title command configured in settings.json. Please add a \"title\" block.\n";
 
 /// agy's per-day quota wall ([`ERROR_429`](aterm_phase::agy::fixtures::lab::ERROR_429),
-/// measured) split at its composer frame: the rows above it (the `⚠ agent
-/// executor error: …` block and its `Error ID:` row), and the frame — its
-/// top rule, the empty composer, its bottom rule, the footer.
 fn agy_wall_split() -> (String, String) {
     let body = aterm_phase::agy::fixtures::lab::ERROR_429
         .split_once('\n')
@@ -4897,12 +4345,6 @@ fn agy_wall_split() -> (String, String) {
 }
 
 /// agy's quota wall taken off the screen ([`notice_gone`]): `/title` output
-/// over the composer, every row of the `⚠` block scrolled out of sight.
-/// NEGATIVE CONTROLS: the wall's own screen; `/title` output under the block
-/// still in sight — where agy's reader already reads no wall (the `> /title`
-/// row is the last message: [`aterm_phase::agy::wall`]), so the words alone
-/// say the notice stands; only its last row, `Error ID:`, still at the top;
-/// a screen with no frame; and Muse Code's and the harnesses with no hide.
 #[test]
 fn agys_notice_is_gone_only_when_no_row_of_its_block_draws() {
     let (above, frame) = agy_wall_split();
@@ -4929,17 +4371,12 @@ fn agys_notice_is_gone_only_when_no_row_of_its_block_draws() {
     let tail = format!("{id_row}\n\n{titles}{frame}");
     assert!(!notice_gone(Harness::Agy, &tail), "{tail}");
     assert!(!notice_gone(Harness::Agy, &titles));
-    // the scrolled screen is no other harness's
     for h in [Harness::Muse, Harness::Claude, Harness::Gemini] {
         assert!(!notice_gone(h, &scrolled), "{h:?}");
     }
 }
 
 /// The hide's guard on agy ([`menu_offers`]): the composer holding `/title`
-/// alone and the menu's focused row, right under the composer's bottom rule,
-/// that command — as measured. NEGATIVE CONTROLS: the focused row another
-/// command, or a longer one; the composer holding a prefix of it, or more
-/// after it; no frame; the same screen read as Muse Code's.
 #[test]
 fn agys_hide_enters_only_the_command_its_menu_offers_first() {
     let (above, frame) = agy_wall_split();
@@ -4981,11 +4418,6 @@ fn agys_hide_enters_only_the_command_its_menu_offers_first() {
 }
 
 /// W2's records: W1's ([`walled`]) with the wall resetting further ahead
-/// (+420 s), the loop waiting on it (+156 s), the notice scrolled away by ten
-/// `/rules` (from +160 s; the hiding Enter at +170 s, out of sight at +172.5 s,
-/// screen seq 40), a screen without the wall read (+168.4 s, seq 30, a row of
-/// the notice still in sight) and waited on, and the resume typed at the
-/// hidden screen past the reset and its grace, landed.
 fn walled_hidden() -> Seen {
     Seen {
         journal: vec![
@@ -5083,8 +4515,6 @@ fn walled_hidden() -> Seen {
 }
 
 /// The waits the remembered wall's look writes while the conversation is
-/// unread (`limit-conversation-unread`, 0ab6eaf3e6): five minutes at a time,
-/// the reset or not.
 const UNREAD_LOOK: &str =
     "until=x the remembered limit's conversation is unread; no act on its account";
 
@@ -5099,14 +4529,9 @@ fn the_remembered_wall_passes_where_the_screen_without_its_notice_was_waited_out
         why.contains("past the reset usage-resume@v1 typed at +481.0 s (seq=40)"),
         "{why}"
     );
-    // W1's records under W2's judge: the notice never left, the remembered
-    // wall never driven — W1 does not exercise it
     let (w, why) = w2(&walled());
     assert_eq!(w, "UNOBSERVED", "{why}");
     assert!(why.contains("the notice never left the screen"), "{why}");
-    // NEGATIVE CONTROL, the product's: 0ab6eaf3e6's look on a conversation
-    // nothing reads — the hidden screen held five minutes at a time, past the
-    // reset too, nothing typed, never landed: PERSISTENCE LOST, the look named
     let lost = T0 + 420_000 + wall_grace_ms("muse") + WALL_LOST_MS;
     let mut s = walled_hidden();
     s.journal.truncate(7);
@@ -5123,7 +4548,6 @@ fn the_remembered_wall_passes_where_the_screen_without_its_notice_was_waited_out
     assert_eq!(w, "FAIL", "{why}");
     assert!(why.contains("PERSISTENCE LOST"), "{why}");
     assert!(why.contains("conversation is unread"), "{why}");
-    // typed into the hidden wall before its reset
     let mut s = walled_hidden();
     s.journal.insert(
         8,
@@ -5135,23 +4559,18 @@ fn the_remembered_wall_passes_where_the_screen_without_its_notice_was_waited_out
     let (w, why) = w2(&s);
     assert_eq!(w, "FAIL", "{why}");
     assert!(why.contains("TYPED into the wall"), "{why}");
-    // UNOBSERVED: the hide given up, or never tried
     let mut s = walled_hidden();
     s.cover.hidden = None;
     s.cover.hide_gave_up = Some("the menu did not offer /rules first".into());
     let (w, why) = w2(&s);
     assert_eq!(w, "UNOBSERVED", "{why}");
     assert!(why.contains("did not offer /rules first"), "{why}");
-    // out of sight only at or after the reset
     let mut s = walled_hidden();
     s.cover.hidden.as_mut().unwrap().seen_ms = T0 + 420_000;
     assert_eq!(w2(&s).0, "UNOBSERVED");
-    // the hide begun before the land act met the wall
     let mut s = walled_hidden();
     s.cover.hidden.as_mut().unwrap().first_ms = T0 + 100_000;
     assert_eq!(w2(&s).0, "UNOBSERVED");
-    // no point read a screen without the wall: none after the first command,
-    // only the limit's own, or only one from before the hide began
     let mut s = walled_hidden();
     s.journal.remove(6);
     let (w, why) = w2(&s);
@@ -5166,32 +4585,25 @@ fn the_remembered_wall_passes_where_the_screen_without_its_notice_was_waited_out
     let mut s = walled_hidden();
     s.cover.hidden.as_mut().unwrap().first_ms = T0 + 168_500;
     assert_eq!(w2(&s).0, "UNOBSERVED");
-    // the resume typed at a screen from before the notice left
     let mut s = walled_hidden();
     s.journal[8].1 = "CONTINUED seq=2 rule=usage-resume@v1 [aterm harness] Still landing:".into();
     let (w, why) = w2(&s);
     assert_eq!(w, "UNOBSERVED", "{why}");
     assert!(why.contains("from before the notice left"), "{why}");
-    // nothing typed past the reset, the program's own retry landing it: no
-    // resume decided from the remembered wall
     let mut s = walled_hidden();
     s.journal.remove(8);
     s.ledger.remove(5);
     let (w, why) = w2(&s);
     assert_eq!(w, "UNOBSERVED", "{why}");
     assert!(why.contains("nothing typed past the reset"), "{why}");
-    // a screen seq the lab could not read: the times alone place the point
     let mut s = walled_hidden();
     s.cover.hidden.as_mut().unwrap().seq = None;
     assert_eq!(w2(&s).0, "PASS");
-    // W1's judge over W2's records passes: W2 holds W1 and more
     assert_eq!(
         one(Chain::Wall, &walled_hidden(), "muse", Scenario::W1).0,
         "PASS"
     );
 }
-
-// ---- the window (§12.5.4)
 
 /// The window as a run that read it records it of the tab labelled `label`.
 fn window(label: &str) -> surfaces::Window {
@@ -5213,7 +4625,6 @@ fn st(t: i64, task: &str, needs: &str, n: &str, end: &str, seen: &str) -> (i64, 
 }
 
 /// `line` with Land's hold's three fields (§12.3.1): `land_held=`
-/// its legs, `land_nudges=`, `land_since=` its land act's second.
 fn hold(line: (i64, String), held: &str, nudges: &str, since: &str) -> (i64, String) {
     (
         line.0,
@@ -5237,8 +4648,6 @@ fn behind(program: &str, face: &str) -> String {
 }
 
 /// L1, L3, L5 with the window read as a passing run reads it: land-a behind,
-/// its need's row and attention while it stood, landed under the floor (no
-/// end, no •, no row), the page's state `landed <time>`.
 fn seen_land_a(program: &str) -> Seen {
     let mut s = landed_a();
     s.meta[1] = needs_meta(131_000, program);
@@ -5322,28 +4731,23 @@ fn land_a_passes_on_the_window_a_person_would_see() {
 #[test]
 fn land_a_fails_a_wrong_window_read() {
     let l = |s: &Seen, program: &str, sc: Scenario| one(Chain::LandA, s, program, sc);
-    // a `done` state at L5: a • under the floor
     let mut s = seen_land_a("claude");
     s.window
         .strip
         .push(j(380_000, "index=1 selected=0 states=done"));
     assert_eq!(l(&s, "claude", Scenario::L5).0, "FAIL");
-    // an end under the floor
     let mut s = seen_land_a("claude");
     s.status
         .push(st(380_000, "landed", "-", "-", "1792578282", "0"));
     let (w, why) = l(&s, "claude", Scenario::L5);
     assert_eq!(w, "FAIL", "{why}");
     assert!(why.contains("an END"), "{why}");
-    // a Done for you row under the floor
     let mut s = seen_land_a("claude");
     s.window.menu.push(j(380_000, "done|✓ land-a — landed #"));
     assert_eq!(l(&s, "claude", Scenario::L5).0, "FAIL");
-    // the page never says landed
     let mut s = seen_land_a("claude");
     s.window.page.pop();
     assert_eq!(l(&s, "claude", Scenario::L5).0, "FAIL");
-    // its row never on the page's screen: unread, never a pass
     let mut s = seen_land_a("claude");
     for (_, p) in &mut s.window.page {
         *p = "-".into();
@@ -5351,11 +4755,9 @@ fn land_a_fails_a_wrong_window_read() {
     let (w, why) = l(&s, "claude", Scenario::L5);
     assert_eq!(w, "UNOBSERVED", "{why}");
     assert!(why.contains("never on the page's screen"), "{why}");
-    // no face=landed after the landing
     let mut s = seen_land_a("claude");
     s.window.chip.pop();
     assert_eq!(l(&s, "claude", Scenario::L5).0, "FAIL");
-    // a missing Needs you row at L3, and one in the entry's words
     let mut s = seen_land_a("claude");
     s.window.menu.remove(0);
     let (w, why) = l(&s, "claude", Scenario::L3);
@@ -5365,8 +4767,6 @@ fn land_a_fails_a_wrong_window_read() {
     s.window.menu[0].1 =
         format!("needs-head|Needs you (1) rows=1\nneeds|◇ land-a — claude needs you: {NEED} · #");
     assert_eq!(l(&s, "claude", Scenario::L3).0, "FAIL");
-    // its header counting another number than the rows under it, or none
-    // over it
     for head in ["needs-head|Needs you (2) rows=1\n", ""] {
         let mut s = seen_land_a("claude");
         s.window.menu[0].1 = format!("{head}needs|◇ land-a — {NEED} · #");
@@ -5374,11 +4774,9 @@ fn land_a_fails_a_wrong_window_read() {
         assert_eq!(w, "FAIL", "{head:?}: {why}");
         assert!(why.contains("header"), "{why}");
     }
-    // the tab's attention state never shown
     let mut s = seen_land_a("claude");
     s.window.strip[1].1 = "index=1 selected=0 states=busy".into();
     assert_eq!(l(&s, "claude", Scenario::L3).0, "FAIL");
-    // a count that is not the one need's
     let mut s = seen_land_a("claude");
     s.status[2] = hold(
         st(131_000, "open", "ask", "2", "-", "-"),
@@ -5387,16 +4785,12 @@ fn land_a_fails_a_wrong_window_read() {
         LAND_SINCE,
     );
     assert_eq!(l(&s, "claude", Scenario::L3).0, "FAIL");
-    // L1: a tab behind drawing a stale face, and a face not Land's
     let mut s = seen_land_a("claude");
     s.window.chip[0].1 = "window=2 program=claude face=land drawn=\"⤓ land\" spoken=\"x\"".into();
     assert_eq!(l(&s, "claude", Scenario::L1).0, "FAIL");
     let mut s = seen_land_a("claude");
     s.window.chip[0].1 = behind("claude", "cruise");
     assert_eq!(l(&s, "claude", Scenario::L1).0, "FAIL");
-    // each of L1's two face wants alone: a Cruise face before the land act,
-    // with `land` read while it landed, fails the Autopilot's faces and
-    // passes `face=land while it lands`...
     let mut s = seen_land_a("claude");
     s.window.chip = vec![
         j(1_000, &behind("claude", "cruise")),
@@ -5407,8 +4801,6 @@ fn land_a_fails_a_wrong_window_read() {
     assert_eq!(w, "FAIL", "{why}");
     assert!(why.contains("face=cruise (wanted"), "{why}");
     assert!(why.contains("face=land while it lands: PASS"), "{why}");
-    // ...and `landed` read first 5 s before its DONE (a face the Autopilot
-    // allows there) fails `face=land while it lands` alone
     let mut s = seen_land_a("claude");
     s.window.chip = vec![
         j(370_000, &behind("claude", "landed")),
@@ -5421,13 +4813,11 @@ fn land_a_fails_a_wrong_window_read() {
         why.contains("a tab behind drawn=- why=not-drawn: PASS"),
         "{why}"
     );
-    // a landed tab still reading `land` 35 s after its DONE: a stale face
     let mut s = seen_land_a("claude");
     s.window.chip.push(j(410_000, &behind("claude", "land")));
     let (w, why) = l(&s, "claude", Scenario::L1);
     assert_eq!(w, "FAIL", "{why}");
     assert!(why.contains("face=land (wanted [\"landed\"])"), "{why}");
-    // Gemini CLI draws no chip: a face on its line fails
     let mut s = seen_land_a("gemini");
     s.window.chip[0].1 = behind("claude", "land");
     assert_eq!(l(&s, "gemini", Scenario::L1).0, "FAIL");
@@ -5450,7 +4840,6 @@ fn the_window_wants_are_named_skips_without_the_window() {
 }
 
 /// N1–N4 as a passing run records them: cruise-n the front tab, its chip
-/// drawn `∞` throughout; two needs, none, one, two.
 fn seen_cruise_n() -> Seen {
     let need = |t: i64, more: &str| {
         j(
@@ -5468,8 +4857,6 @@ fn seen_cruise_n() -> Seen {
             ),
         )
     };
-    // Its row says the first need with no count: every other one has a row
-    // of its own one level in under it.
     let row = |t: i64, others: &[&str]| {
         let under: String = others
             .iter()
@@ -5590,7 +4977,6 @@ fn cruise_n_passes_on_its_needs_moving_drawn_as_its_face() {
 }
 
 /// §12.5.6's controls on cruise-n: `drawn=` unequal to `face=` fails each
-/// step; a step after a failed one is unobserved, never a pass.
 #[test]
 fn cruise_n_fails_a_wrong_window_read_and_leaves_a_step_after_a_failed_one_unobserved() {
     let mut s = seen_cruise_n();
@@ -5598,11 +4984,9 @@ fn cruise_n_fails_a_wrong_window_read_and_leaves_a_step_after_a_failed_one_unobs
     for (sc, w) in verdicts(Chain::CruiseN, &s, "claude") {
         assert_eq!(w, "FAIL", "{sc}");
     }
-    // the front tab undrawn: a frame never drew it
     let mut s = seen_cruise_n();
     s.window.chip[0].1 = behind("claude", "cruise");
     assert_eq!(one(Chain::CruiseN, &s, "claude", Scenario::N1).0, "FAIL");
-    // N4's count wrong
     let mut s = seen_cruise_n();
     s.status[4] = j(
         861_000,
@@ -5617,8 +5001,6 @@ fn cruise_n_fails_a_wrong_window_read_and_leaves_a_step_after_a_failed_one_unobs
             ("N4", "FAIL")
         ]
     );
-    // the records: N4's entry moved to the wrong count, N2's never cleared,
-    // N3 asked by a continuation rather than the done check
     let n = |s: &Seen, k| surfaces::judge_needs_step(s, T0, k).word();
     let good = seen_cruise_n();
     assert_eq!((0..4).map(|k| n(&good, k)).collect::<Vec<_>>(), ["PASS"; 4]);
@@ -5635,8 +5017,6 @@ fn cruise_n_fails_a_wrong_window_read_and_leaves_a_step_after_a_failed_one_unobs
         *l = l.replace("rule=continue-done-check@v1", "rule=continue@v1");
     }
     assert_eq!(n(&s, 2), "FAIL");
-    // its row never on the page's screen: N1 unread; a wrong row beside it
-    // still fails
     let mut s = seen_cruise_n();
     for (_, p) in &mut s.window.page {
         *p = "-".into();
@@ -5646,12 +5026,9 @@ fn cruise_n_fails_a_wrong_window_read_and_leaves_a_step_after_a_failed_one_unobs
     assert!(why.contains("never on the page's screen"), "{why}");
     s.window.menu[0].1 = format!("needs|◇ cruise-n — {NEED_A} · #");
     assert_eq!(one(Chain::CruiseN, &s, "claude", Scenario::N1).0, "FAIL");
-    // N2's need row left standing
     let mut s = seen_cruise_n();
     s.window.menu[1].1 = format!("needs|◇ cruise-n — {NEED_A} · #");
     assert_eq!(one(Chain::CruiseN, &s, "claude", Scenario::N2).0, "FAIL");
-    // the page alone: N1's state without the others' count, N2's still
-    // naming a need
     let page = |state: &str| format!("head=cruise-n: Window 2, tab 17\nstate={state}");
     let mut s = seen_cruise_n();
     s.window.page[0].1 = page(&format!("needs you: {NEED_A}; carrying on · pausing"));
@@ -5663,7 +5040,6 @@ fn cruise_n_fails_a_wrong_window_read_and_leaves_a_step_after_a_failed_one_unobs
     let (w, why) = one(Chain::CruiseN, &s, "claude", Scenario::N2);
     assert_eq!(w, "FAIL", "{why}");
     assert!(why.contains("the page still names a need"), "{why}");
-    // meta's entry alone: N1's naming the second need first, N2's left up
     let mut s = seen_cruise_n();
     s.meta[1].1 = s.meta[1].1.replace(NEED_A, NEED_B);
     let (w, why) = one(Chain::CruiseN, &s, "claude", Scenario::N1);
@@ -5675,14 +5051,12 @@ fn cruise_n_fails_a_wrong_window_read_and_leaves_a_step_after_a_failed_one_unobs
     let (w, why) = one(Chain::CruiseN, &s, "claude", Scenario::N2);
     assert_eq!(w, "FAIL", "{why}");
     assert!(why.contains("no needs entry"), "{why}");
-    // N1's row as 2a drew it: the others' count and no row one level in
     let mut s = seen_cruise_n();
     s.window.menu[0].1 = format!("needs|◇ cruise-n — {NEED_A} (+1 more) · #");
     let (w, why) = one(Chain::CruiseN, &s, "claude", Scenario::N1);
     assert_eq!(w, "FAIL", "{why}");
     assert!(why.contains("no need row"), "{why}");
     assert!(why.contains("wanted [\""), "{why}");
-    // the done check never typed: N3 and N4 unreached
     let mut s = seen_cruise_n();
     let before = |v: &mut Vec<(i64, String)>| v.retain(|(t, _)| *t < T0 + 370_000);
     for v in [
@@ -5704,11 +5078,9 @@ fn cruise_n_fails_a_wrong_window_read_and_leaves_a_step_after_a_failed_one_unobs
             ("N4", "UNOBSERVED")
         ]
     );
-    // a landing under Cruise ends nothing it should
     let mut s = seen_cruise_n();
     s.journal.push(j(870_000, "DONE seq=5 rule=land@v1 x"));
     assert_eq!(one(Chain::CruiseN, &s, "claude", Scenario::N4).0, "FAIL");
-    // not the front tab: its chip is never drawn, so its drawn= is unread
     let mut s = seen_cruise_n();
     s.window.front_tab = false;
     s.window.chip[0].1 = behind("claude", "cruise");
@@ -5719,13 +5091,6 @@ fn cruise_n_fails_a_wrong_window_read_and_leaves_a_step_after_a_failed_one_unobs
 }
 
 /// cruise-n's OTHER NEEDS ON ROWS ONE LEVEL IN (§12.5.4's
-/// N1–N4 row): each step wants exactly its other needs on rows one level in
-/// under its row — (b) at N1, none at N2 and N3, (c) at N4. NEGATIVE
-/// CONTROLS, each a FAIL: N4 still drawing (b) under the same first need
-/// (a set that moved, drawn stale); N1's (b) missing (a row the menu
-/// never drew, or one `chrome` printed as a submenu's, which the reader
-/// passes over); N3 with a row one level in that its one need has no
-/// reason for.
 #[test]
 fn cruise_n_wants_each_other_need_on_a_row_one_level_in() {
     let row = |others: &[&str]| {
@@ -5748,8 +5113,6 @@ fn cruise_n_wants_each_other_need_on_a_row_one_level_in() {
     let mut s = seen_cruise_n();
     s.window.menu[2].1 = row(&[NEED_B]);
     assert_eq!(one(Chain::CruiseN, &s, "claude", Scenario::N3).0, "FAIL");
-    // The menu as `chrome` printed it: (b) one level in is read as such; the
-    // same row printed as a submenu's is no row of the tab's.
     let chrome = |b: &str| {
         format!(
             "statusmenu \"Needs you (1)\" enabled=no at=0\n\
@@ -5777,7 +5140,6 @@ fn cruise_n_wants_each_other_need_on_a_row_one_level_in() {
 }
 
 /// A tab behind is judged by its face, never its cells: Cruise's C1 passes
-/// on `face=cruise drawn=- why=not-drawn` and fails on a stale face drawn.
 #[test]
 fn a_tab_behind_passes_on_its_face_with_nothing_drawn() {
     let mut s = cruised();
@@ -5797,7 +5159,6 @@ fn a_tab_behind_passes_on_its_face_with_nothing_drawn() {
     let mut stale = s.clone();
     stale.window.chip[0].1 = "window=2 program=claude face=cruise drawn=\"∞\" spoken=\"x\"".into();
     assert_eq!(one(Chain::Cruise, &stale, "claude", Scenario::C1).0, "FAIL");
-    // never an end, never a row
     let mut ended = s.clone();
     ended.status.push(j(
         9_000,
@@ -5813,11 +5174,6 @@ fn a_tab_behind_passes_on_its_face_with_nothing_drawn() {
 }
 
 /// L16 (land-j) as a passing run records it: the land act's defense long,
-/// landed 40 s after it, the end standing unseen with its • and its row;
-/// END's sweep left it, and so did the look begun on the front tab; under
-/// the look, `tab <land-j>` saw land-j's (`look`) and left land-k's
-/// (`still`); the press saw land-k's. One fixture for both chains: each
-/// judge reads its own steps.
 fn seen_land_j(label: &str) -> Seen {
     let status = |t: i64, task: &str, end: &str, seen: &str| {
         j(
@@ -5919,22 +5275,18 @@ fn land_j_and_land_k_pass_on_an_end_a_look_and_a_press_see() {
 fn land_j_and_land_k_fail_a_wrong_window_read() {
     let l16 = |s: &Seen| one(Chain::LandJ, s, "claude", Scenario::L16);
     let l17 = |s: &Seen| one(Chain::LandK, s, "claude", Scenario::L17);
-    // a • still standing after end_seen=1
     let mut s = seen_land_j("land-j");
     s.window.looked[2].1 =
         "step=look end=1792578282 end_seen=1 selected=1 states=selected,done done_row=no".into();
     assert_eq!(l16(&s).0, "FAIL");
-    // the row still standing after the look
     let mut s = seen_land_j("land-j");
     s.window.looked[2].1 =
         "step=look end=1792578282 end_seen=1 selected=1 states=selected done_row=yes".into();
     assert_eq!(l16(&s).0, "FAIL");
-    // the tab switch left land-j behind
     let mut s = seen_land_j("land-j");
     s.window.looked[2].1 =
         "step=look end=1792578282 end_seen=1 selected=0 states=- done_row=no".into();
     assert_eq!(l16(&s).0, "FAIL");
-    // the look begun on another tab saw an end behind it: each chain fails
     /// A scenario's judge of a fixture: its verdict word and its words.
     type Judge = fn(&Seen) -> (&'static str, String);
     let judges: [(&str, Judge); 2] = [("land-j", l16), ("land-k", l17)];
@@ -5945,18 +5297,15 @@ fn land_j_and_land_k_fail_a_wrong_window_read() {
         let (w, why) = judge(&s);
         assert_eq!(w, "FAIL", "{label}: {why}");
         assert!(why.contains("behind the tab the look began on"), "{why}");
-        // its end seen alone, its • and its row still drawn
         let mut s = seen_land_j(label);
         s.window.looked[1].1 =
             "step=look-on end=1792578282 end_seen=1 selected=0 states=busy,done done_row=yes"
                 .into();
         assert_eq!(judge(&s).0, "FAIL", "{label}");
-        // ...and never read there: unobserved, never a pass
         let mut s = seen_land_j(label);
         s.window.looked.remove(1);
         assert_eq!(judge(&s).0, "UNOBSERVED", "{label}");
     }
-    // the tab switch to land-j under the look saw land-k's too
     let mut s = seen_land_j("land-k");
     s.window.looked[3].1 =
         "step=still end=1792578282 end_seen=1 selected=0 states=- done_row=no".into();
@@ -5966,24 +5315,20 @@ fn land_j_and_land_k_fail_a_wrong_window_read() {
     let mut s = seen_land_j("land-k");
     s.window.looked.remove(3);
     assert_eq!(l17(&s).0, "UNOBSERVED");
-    // the press refused, the rest as a pass reads it
     let mut s = seen_land_j("land-k");
     s.window.looked[4].1 = s.window.looked[4].1.replace("pressed=OK", "pressed=ERR");
     let (w, why) = l17(&s);
     assert_eq!(w, "FAIL", "{why}");
     assert!(why.contains("wanted pressed=OK"), "{why}");
-    // no Done for you row once landed, its • standing
     let mut s = seen_land_j("land-j");
     s.window.menu.clear();
     let (w, why) = l16(&s);
     assert_eq!(w, "FAIL", "{why}");
     assert!(why.contains("yet no Done for you row once landed"), "{why}");
-    // the sweep with no look saw the end
     let mut s = seen_land_j("land-j");
     s.window.looked[0].1 =
         "step=sweep end=1792578282 end_seen=1 selected=0 states=- done_row=no".into();
     assert_eq!(l16(&s).0, "FAIL");
-    // no end ever marked, or one seen before anyone looked
     let mut s = seen_land_j("land-j");
     s.status[2] = hold(
         j(
@@ -5998,12 +5343,9 @@ fn land_j_and_land_k_fail_a_wrong_window_read() {
     let mut s = seen_land_j("land-j");
     s.status[2].1 = s.status[2].1.replace("end_seen=0", "end_seen=1");
     assert_eq!(l16(&s).0, "FAIL");
-    // no • once landed
     let mut s = seen_land_j("land-j");
     s.window.strip.pop();
     assert_eq!(l16(&s).0, "FAIL");
-    // in front when it landed: the • is never on the front tab, so no pass
-    // and no fail on it; behind again, a missing • fails once more
     let mut s = seen_land_j("land-k");
     s.window.strip = vec![
         j(1_000, "index=2 selected=1 states=selected"),
@@ -6014,18 +5356,15 @@ fn land_j_and_land_k_fail_a_wrong_window_read() {
     assert!(why.contains("never on the front tab"), "{why}");
     s.window.strip[1] = j(100_000, "index=2 selected=0 states=-");
     assert_eq!(l17(&s).0, "FAIL");
-    // landed under the floor: the record fails
     let mut s = seen_land_j("land-j");
     s.journal[3].0 = T0 + 140_000;
     s.journal[4].0 = T0 + 140_000;
     let (w, why) = l16(&s);
     assert_eq!(w, "FAIL", "{why}");
     assert!(why.contains("under the 30 s floor"), "{why}");
-    // the look never ran: unobserved, never a pass
     let mut s = seen_land_j("land-j");
     s.window.looked.truncate(2);
     assert_eq!(l16(&s).0, "UNOBSERVED");
-    // L17: the press left the tab behind, or did not take
     let mut s = seen_land_j("land-k");
     s.window.looked[4].1 =
         "step=press end=1792578282 end_seen=1 selected=0 states=- done_row=no pressed=OK".into();
@@ -6057,8 +5396,6 @@ fn land_e_passes_on_its_row_and_this_mac_counting_every_landed_tab() {
         };
         s
     };
-    // the rest line as END prints it: This Mac, the tabs under Land, the
-    // run's landings and the page's two counts
     let rest = |here: &str, landed: usize, today: &str, every: &str| {
         format!(
             "here=\"{here}\" landed_tabs={landed} landing_tabs=6 landings=3 today=\"{today}\" every=\"{every}\""
@@ -6076,10 +5413,7 @@ fn land_e_passes_on_its_row_and_this_mac_counting_every_landed_tab() {
     let (w, why) = l7(&good);
     assert_eq!(w, "PASS", "{why}");
     assert!(why.contains("today 3 landed today"), "{why}");
-    // its • and its row are its task record's: no fail for them
     assert_eq!(one(Chain::LandE, &good, "gemini", Scenario::L7).0, "PASS");
-    // This Mac with no landed count, or another count than the tabs', or
-    // 0 of 0 (a run that landed nothing proves no count)
     for (here, landed) in [
         ("This Mac — 2 shells", 3),
         ("This Mac — 2 landed · 2 shells", 3),
@@ -6089,20 +5423,15 @@ fn land_e_passes_on_its_row_and_this_mac_counting_every_landed_tab() {
         assert_eq!(w, "FAIL", "{here}: {why}");
         assert!(why.contains("This Mac reads"), "{why}");
     }
-    // no row for it
     let mut s = good.clone();
     s.window.menu.clear();
     assert_eq!(l7(&s).0, "FAIL");
-    // END never reached: unobserved; and with no row, a fail all the same
     assert_eq!(l7(&seen(None)).0, "UNOBSERVED");
     let mut s = seen(None);
     s.window.menu.clear();
     let (w, why) = l7(&s);
     assert_eq!(w, "FAIL", "{why}");
     assert!(why.contains("no Done for you row"), "{why}");
-    // THE PAGE (4c): the today line not led by the run's landings, or by
-    // another count; the Every row calling a landed tab landing, or
-    // counting fewer
     for (today, every) in [
         ("2 kept going today · 3 landed · 7 land prompts", EVERY),
         ("2 landed today · 2 kept going", EVERY),
@@ -6114,7 +5443,6 @@ fn land_e_passes_on_its_row_and_this_mac_counting_every_landed_tab() {
             TODAY,
             "Every session, 12 sessions: 2 cruising, 7 landing, 2 landed, 1 off",
         ),
-        // each count alone: the landing ones, then the landed ones
         (
             TODAY,
             "Every session, 12 sessions: 2 cruising, 5 landing, 3 landed, 1 off",
@@ -6133,7 +5461,6 @@ fn land_e_passes_on_its_row_and_this_mac_counting_every_landed_tab() {
         assert_eq!(w, "FAIL", "{today} / {every}: {why}");
         assert!(why.contains("beside the landing: FAIL"), "{why}");
     }
-    // a page row never read: unobserved, never a pass
     for (today, every) in [("-", EVERY), (TODAY, "-")] {
         let (w, why) = l7(&seen(Some(&rest(
             "This Mac — 3 landed · 2 shells",
@@ -6143,7 +5470,6 @@ fn land_e_passes_on_its_row_and_this_mac_counting_every_landed_tab() {
         ))));
         assert_eq!(w, "UNOBSERVED", "{today} / {every}: {why}");
     }
-    // no landing in the run, yet the page counts one
     let none =
         rest("This Mac — 3 landed · 2 shells", 3, TODAY, EVERY).replace("landings=3", "landings=0");
     assert_eq!(l7(&seen(Some(&none))).0, "FAIL");
@@ -6186,7 +5512,6 @@ fn end_passes_on_a_window_at_rest_and_each_chain_drawn_as_its_face() {
         surfaces::judge_end(d, t, "claude").word()
     };
     assert_eq!(end(&rest_desk(REST, "0"), &tabs), "PASS");
-    // timer_wakes=2 at rest
     assert_eq!(
         end(
             &rest_desk(&REST.replace("timer_wakes=0", "timer_wakes=2"), "0"),
@@ -6194,7 +5519,6 @@ fn end_passes_on_a_window_at_rest_and_each_chain_drawn_as_its_face() {
         ),
         "FAIL"
     );
-    // a frame composed, a deadline armed or fired beside presence
     assert_eq!(end(&rest_desk(REST, "1"), &tabs), "FAIL");
     assert_eq!(
         end(
@@ -6216,10 +5540,6 @@ fn end_passes_on_a_window_at_rest_and_each_chain_drawn_as_its_face() {
         ),
         "FAIL"
     );
-    // the programs wrote at idle (Muse Code, measured: 16 tabs, 32 Output
-    // wakes in 20 s), answered by the status sweep alone: a pass; a timer
-    // wake beside its fires, a fire or an arm of another owner, a frame: a
-    // fail
     let wrote = "timer_wakes=53 event_wakes=124 deadline_owner=session_status deadline_arms_by_owner=session_status:124/0 deadline_fires_by_owner=session_status:53 wakes_by_variant=ReadSessionStatus:39,Output:32";
     let (w, why) = {
         let v = surfaces::judge_end(&rest_desk(wrote, "0"), &tabs, "muse");
@@ -6245,8 +5565,6 @@ fn end_passes_on_a_window_at_rest_and_each_chain_drawn_as_its_face() {
         assert_eq!(end(&rest_desk(&bent, "0"), &tabs), "FAIL", "{bent}");
     }
     assert_eq!(end(&rest_desk(wrote, "2"), &tabs), "FAIL");
-    // a sweep that re-arms itself while output trickles: its timer wakes all
-    // its fires, yet past three a write
     let spun = wrote
         .replace("timer_wakes=53", "timer_wakes=400")
         .replace("session_status:53", "session_status:400")
@@ -6254,22 +5572,18 @@ fn end_passes_on_a_window_at_rest_and_each_chain_drawn_as_its_face() {
     let v = surfaces::judge_end(&rest_desk(&spun, "0"), &tabs, "muse");
     assert_eq!(v.word(), "FAIL", "{}", v.why());
     assert!(v.why().contains("past 3 a write"), "{}", v.why());
-    // three a write is the bound itself: a pass
     let three = wrote
         .replace("timer_wakes=53", "timer_wakes=96")
         .replace("session_status:53", "session_status:96");
     assert_eq!(end(&rest_desk(&three, "0"), &tabs), "PASS");
-    // the same with no Output wake: the sweep had nothing to answer
     let unasked = wrote.replace(",Output:32", "");
     assert_eq!(end(&rest_desk(&unasked, "0"), &tabs), "FAIL");
-    // an act or a journal line in the window: no rest, unobserved
     let mut d = rest_desk(wrote, "0");
     if let Some(i) = d.idle.as_mut() {
         i.moved
             .push("cruise +3.0 s CONTINUED seq=9 rule=continue@v1".into());
     }
     assert_eq!(end(&d, &tabs), "UNOBSERVED");
-    // a chain in front drawn as another face
     let stale = front("window=2 program=claude face=landed drawn=\"⤓ land\" spoken=\"x\"");
     assert_eq!(
         end(
@@ -6278,13 +5592,11 @@ fn end_passes_on_a_window_at_rest_and_each_chain_drawn_as_its_face() {
         ),
         "FAIL"
     );
-    // never brought in front
     let never = window("y");
     assert_eq!(
         end(&rest_desk(REST, "0"), &[(Chain::LandA, &never)]),
         "FAIL"
     );
-    // Gemini CLI: its no-footer line in front
     let g = front("window=2 program=gemini face=- drawn=- why=no-footer spoken=-");
     assert_eq!(
         surfaces::judge_end(&rest_desk(REST, "0"), &[(Chain::CruiseN, &g)], "gemini").word(),
@@ -6294,14 +5606,12 @@ fn end_passes_on_a_window_at_rest_and_each_chain_drawn_as_its_face() {
         surfaces::judge_end(&rest_desk(REST, "0"), &[(Chain::CruiseN, &n)], "gemini").word(),
         "FAIL"
     );
-    // no idle window, or no end standing in it
     assert_eq!(end(&surfaces::Desk::default(), &tabs), "UNOBSERVED");
     let mut d = rest_desk(REST, "0");
     if let Some(i) = d.idle.as_mut() {
         i.ends.clear();
     }
     assert_eq!(end(&d, &tabs), "UNOBSERVED");
-    // the page not open in it
     let mut d = rest_desk(REST, "0");
     if let Some(i) = d.idle.as_mut() {
         i.page_open = false;
@@ -6309,9 +5619,6 @@ fn end_passes_on_a_window_at_rest_and_each_chain_drawn_as_its_face() {
     let v = surfaces::judge_end(&d, &tabs, "claude");
     assert_eq!(v.word(), "UNOBSERVED", "{}", v.why());
     assert!(v.why().contains("the page was not open"), "{}", v.why());
-    // no pause standing in it, where the run holds a chain that pauses
-    // (cruise-n); a run of none (land-j, land-k and the Off control) wants
-    // none
     let mut d = rest_desk(REST, "0");
     if let Some(i) = d.idle.as_mut() {
         i.holds.clear();
@@ -6331,7 +5638,6 @@ fn end_passes_on_a_window_at_rest_and_each_chain_drawn_as_its_face() {
 }
 
 /// Every chain of the measured pass is held to the window, and every
-/// scenario §12.5.4 gives 5c has a want of its own.
 #[test]
 fn every_chain_and_scenario_of_the_pass_has_its_window_wants() {
     let wanted = |c: Chain, s: Scenario| {
@@ -6363,11 +5669,8 @@ fn every_chain_and_scenario_of_the_pass_has_its_window_wants() {
     ] {
         assert!(wanted(c, s), "{s:?}");
     }
-    // a coverage chain is held to none (not judged on the window in 5c)
     assert!(!wanted(Chain::LandQ, Scenario::L12));
 }
-
-// THE RESIDUALS, LIVE (`--mode resid`, `--mode ladder`)
 
 #[test]
 fn the_residual_modes_pick_their_chains_and_script_them() {
@@ -6384,7 +5687,6 @@ fn the_residual_modes_pick_their_chains_and_script_them() {
         ]
     );
     assert_eq!(Chain::of_mode(Mode::Ladder), [Ladder, Off]);
-    // F3 where a turn can end on a tool's row: not on agy, which asks again
     assert_eq!(
         Chain::of_mode_on(Mode::Resid, Harness::Agy),
         [InstantCruise, InstantPerson, SameWords, TallScroll, Off]
@@ -6406,8 +5708,6 @@ fn the_residual_modes_pick_their_chains_and_script_them() {
         assert_eq!(a.mode, m);
         assert_eq!(m.walled(), None);
     }
-    // F18's person's prompt is a person's; P4P's, its negative control in the
-    // same run, the control socket's
     assert!(InstantPerson.asks().is_some() && InstantPerson.asks_as_person());
     assert!(InstantCruise.asks().is_some() && !InstantCruise.asks_as_person());
     assert_eq!(InstantPerson.scenarios(), [Scenario::F18]);
@@ -6418,15 +5718,11 @@ fn the_residual_modes_pick_their_chains_and_script_them() {
     assert_eq!(ToolEnd.scenarios(), [Scenario::F3]);
     assert_eq!(TallScroll.scenarios(), [Scenario::Scrolled]);
     assert_eq!(Ladder.scenarios(), [Scenario::Ladder]);
-    // F1 by a scroll: Cruise, instant, never its landing; every turn
-    // answered with a reply taller than the screen, no row of it the
-    // chain's token (the opener is told by it alone)
     assert!(TallScroll.instant() && !TallScroll.lands() && TallScroll.autopilot() == "cruise");
     let tall = scroll_reply();
     assert_eq!(reply(TallScroll, &[]).as_deref(), Some(tall.as_str()));
     assert!(tall.lines().count() > 50 - 4 && tall.ends_with(WORK));
     assert!(!tall.contains(&TallScroll.token()));
-    // none's landing is its scenario: F3's is the first point, not the landing
     assert!(!ToolEnd.lands() && !SameWords.lands() && !Ladder.lands());
     assert_eq!(
         [InstantPerson, SameWords, ToolEnd, Ladder].map(Chain::autopilot),
@@ -6436,31 +5732,24 @@ fn the_residual_modes_pick_their_chains_and_script_them() {
     assert!(!Ladder.instant());
     assert_eq!(Ladder.limit_ms(), LADDER_LIMIT_MS);
     assert_eq!(SameWords.orchestrated(), Some(SAME_TURN));
-    // F18 is scripted as P4P is: the person's prompt answered at once
     let ask = InstantPerson.asks().unwrap();
     assert_eq!(
         reply(InstantPerson, &[DONE_CHECK, ask.as_str()]).as_deref(),
         Some(ASK_REPLY)
     );
     assert_eq!(reply(InstantPerson, &[]).as_deref(), Some(DONE_CLAIM));
-    // SAME: every turn, the orchestrator's too, answered with the very words
-    // of the reply before it, under its own opener carrying the long token
     assert_eq!(reply(SameWords, &[]).as_deref(), Some(WORK));
     assert_eq!(reply(SameWords, &[SAME_TURN]).as_deref(), Some(WORK));
     assert!(SameWords.prompt().contains(LONG_TOKEN));
-    // one composer row at the window's width, two at the resized one
     let len = SameWords.prompt().chars().count();
     assert!(len <= 120 && len > usize::from(RESIZED.0) + 8, "{len}");
     assert!(!LONG_TOKEN.contains(' ') && SAME_TURN.contains(SAME_TURN_KEY));
     assert!(!SAME_TURN.contains(LONG_TOKEN));
-    // F3: the prompt's call answered with no words; Land's acts clean
     assert_eq!(reply(ToolEnd, &[]).as_deref(), Some(TOOL_AFTER));
     assert_eq!(reply(ToolEnd, &[LAND]).as_deref(), Some(CLEAN));
     assert_eq!(reply(ToolEnd, &[LAND, LAND_NUDGE]).as_deref(), Some(CLEAN));
-    // LADDER: every turn short and plain, paced
     assert_eq!(reply(Ladder, &[]).as_deref(), Some(WORK));
     assert_eq!(reply(Ladder, &[CONTINUE_TEXT]).as_deref(), Some(WORK));
-    // the ladder's scale reaches the instance as a dev seam the lab hands it
     assert_eq!(ladder_env(), "ATERM_DEV_LADDER_SCALE=0.125");
     assert!(crate::lab::instance_env(&ladder_env()).is_ok());
 }
@@ -6485,7 +5774,6 @@ fn the_tool_ended_turn_is_scripted_per_harness_on_its_prompts_rule_alone() {
             tooled[0].get("when").and_then(J::as_str),
             Some(Chain::ToolEnd.token().as_str())
         );
-        // the prompt's first request answered with the call …
         let first = crate::stub::with_reply(sp.clone(), &[Chain::ToolEnd.prompt()]);
         let (n, input) = crate::stub::scripted_call(&first, false).expect("the call");
         assert_eq!(n, name, "{h:?}");
@@ -6501,18 +5789,14 @@ fn the_tool_ended_turn_is_scripted_per_harness_on_its_prompts_rule_alone() {
             }
             _ => assert_eq!(path("file_path").as_deref(), Some("/w/tool-end/README.md")),
         }
-        // … and the request carrying its result back with no words
         assert_eq!(crate::stub::scripted_call(&first, true), None);
         assert_eq!(first.get("text").and_then(J::as_str), Some(TOOL_AFTER));
-        // no other turn calls: Land's act is answered in words
         let land =
             crate::stub::with_reply(sp.clone(), &[Chain::ToolEnd.prompt(), LAND.to_string()]);
         assert_eq!(crate::stub::scripted_call(&land, false), None);
-        // nor another chain's prompt
         let other = crate::stub::with_reply(sp.clone(), &[Chain::SameWords.prompt()]);
         assert_eq!(crate::stub::scripted_call(&other, false), None);
     }
-    // a run without F3's chain is scripted as before
     assert_eq!(
         spec_on(&Chain::LADDER, Harness::Claude, &dirs[..2]),
         spec(&Chain::LADDER)
@@ -6522,17 +5806,12 @@ fn the_tool_ended_turn_is_scripted_per_harness_on_its_prompts_rule_alone() {
 #[test]
 fn each_apis_reader_tells_a_request_carrying_a_tools_result_back() {
     use crate::stub::{gemini, messages_answered, muse};
-    // Messages: the newest user message a tool_result
     let called = br#"{"messages": [
         {"role": "user", "content": [{"type": "text", "text": "go"}]},
         {"role": "assistant", "content": [{"type": "tool_use", "id": "t1", "name": "Read", "input": {}}]},
         {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "r"}]}
     ]}"#;
     assert!(messages_answered(called));
-    // ONCE A CONVERSATION (the review of `b9/resid3`): a result carried back
-    // by any request of it — a later message of the conversation, a retry
-    // after a user-role error turn (agy's 1.4.0 shape, which looped 2501
-    // calls) — is answered, so the call is never made again
     let asked = br#"{"messages": [
         {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "r"}]},
         {"role": "assistant", "content": "ok"},
@@ -6547,7 +5826,6 @@ fn each_apis_reader_tells_a_request_carrying_a_tools_result_back() {
         {"role": "user", "content": [{"type": "text", "text": "Error: the model's output was empty, please try again"}]}
     ]}"#;
     assert!(messages_answered(retried));
-    // NEGATIVE CONTROLS: no result in the conversation yet
     let unanswered = br#"{"messages": [
         {"role": "user", "content": [{"type": "text", "text": "go"}]},
         {"role": "assistant", "content": [{"type": "tool_use", "id": "t1", "name": "Read", "input": {}}]},
@@ -6555,8 +5833,6 @@ fn each_apis_reader_tells_a_request_carrying_a_tools_result_back() {
     ]}"#;
     assert!(!messages_answered(unanswered));
     assert!(!messages_answered(b"not json"));
-    // Gemini: the last content holds a functionResponse (Gemini CLI's user
-    // content, agy's model one)
     let g = |last: &str| {
         format!(
             r#"{{"contents": [{{"role": "user", "parts": [{{"text": "go"}}]}}, {{"role": "model", "parts": [{{"functionCall": {{"name": "read_file"}}}}]}}, {last}]}}"#
@@ -6572,12 +5848,8 @@ fn each_apis_reader_tells_a_request_carrying_a_tools_result_back() {
     assert!(!gemini::results_answered(&g(
         r#"{"role": "user", "parts": [{"text": "next"}]}"#
     )));
-    // answered once, then a turn the agent sent of its own (agy's error after
-    // an empty reply): never called again
     let retried = br#"{"contents": [{"role": "user", "parts": [{"text": "go"}]}, {"role": "model", "parts": [{"functionCall": {"name": "view_file"}}]}, {"role": "model", "parts": [{"functionResponse": {"name": "view_file"}}]}, {"role": "user", "parts": [{"text": "Error: model output error: model output must contain either output text or tool calls, these cannot both be empty, please try again"}]}]}"#;
     assert!(gemini::results_answered(retried));
-    // Responses: a result anywhere in the conversation's input, a person's
-    // message after it (a later turn, a retry's error) or a reminder aside
     let r = |tail: &str| {
         format!(
             r#"{{"input": [{{"type": "message", "role": "user", "content": [{{"type": "input_text", "text": "go"}}]}}, {{"type": "function_call", "name": "read_file"}}{tail}]}}"#
@@ -6594,15 +5866,12 @@ fn each_apis_reader_tells_a_request_carrying_a_tools_result_back() {
     assert!(muse::results_answered(&r(
         r#", {"type": "function_call_output", "output": "r"}, {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "next"}]}"#
     )));
-    // NEGATIVE CONTROL: the call made, a person's message after it, no
-    // result in
     assert!(!muse::results_answered(&r(
         r#", {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Error: try again"}]}"#
     )));
 }
 
 /// A standing one-short-turn back-off due at `due` (ms past [`T0`]) told
-/// again at `t` under `seq` — a re-read of its point.
 fn retold(t: i64, seq: u32, due: i64) -> (i64, String) {
     j(
         t,
@@ -6614,7 +5883,6 @@ fn retold(t: i64, seq: u32, due: i64) -> (i64, String) {
 }
 
 /// A turn-end back-off journaled at `t` (after [`T0`]): its point's `seq`,
-/// `streak` short turns, due `step` ms later (the stamp cut to its second).
 fn backoff(t: i64, seq: u32, streak: u32, step: i64) -> (i64, String) {
     let words = if step < 120_000 {
         format!("{} s", step / 1000)
@@ -6631,9 +5899,6 @@ fn backoff(t: i64, seq: u32, streak: u32, step: i64) -> (i64, String) {
 }
 
 /// F18 as a live run that passes it records it: P4P's record up to the
-/// person's Enter at +127 s, typed as a person types it (a stamp), its
-/// instant reply read at +127.9 s and LEFT to them there, `task=theirs`, and
-/// nothing typed in the 282 s watched after it.
 fn person_instant() -> Seen {
     let mut s = instant_cruised();
     s.journal.truncate(5);
@@ -6664,9 +5929,6 @@ fn f18_passes_only_where_the_persons_instant_turn_is_left_to_them() {
     let (w, why) = f18(&person_instant());
     assert_eq!(w, "PASS", "{why}");
     assert!(why.contains("left-to-person@v1"), "{why}");
-    // the standing back-off told again after the Enter at a re-read of its
-    // point, under the re-read's own seq (its streak and due): no turn
-    // judged there (the review of `b9/resid3`)
     let retold_at = |s: &mut Seen, due: i64| {
         s.journal[4] = j(
             121_700,
@@ -6691,7 +5953,6 @@ fn f18_passes_only_where_the_persons_instant_turn_is_left_to_them() {
     retold_at(&mut s, 361_700);
     let (w, why) = f18(&s);
     assert_eq!(w, "PASS", "{why}");
-    // NEGATIVE CONTROL: another due there is a back-off of its own
     let mut s = person_instant();
     retold_at(&mut s, 367_500);
     let (w, why) = f18(&s);
@@ -6700,8 +5961,6 @@ fn f18_passes_only_where_the_persons_instant_turn_is_left_to_them() {
         why.contains("JUDGED AS A TURN OF THE CONVERSATION"),
         "{why}"
     );
-    // NEGATIVE CONTROLS. Judged as a turn of the conversation, as a control
-    // socket's prompt is (P4P's record on a person's prompt)
     let mut s = person_instant();
     s.journal[6] = j(
         128_000,
@@ -6713,8 +5972,6 @@ fn f18_passes_only_where_the_persons_instant_turn_is_left_to_them() {
         why.contains("JUDGED AS A TURN OF THE CONVERSATION"),
         "{why}"
     );
-    // F18 ITSELF: the instant turn missed, and the standing back-off's act
-    // typed into the person's exchange at its due
     let mut s = person_instant();
     s.journal.truncate(6);
     s.ledger.truncate(1);
@@ -6728,7 +5985,6 @@ fn f18_passes_only_where_the_persons_instant_turn_is_left_to_them() {
     let (w, why) = f18(&s);
     assert_eq!(w, "FAIL", "{why}");
     assert!(why.contains("TYPED into the person's exchange"), "{why}");
-    // left, and typed all the same; a ledger act alone
     let mut s = person_instant();
     s.journal.push(j(
         361_700,
@@ -6738,8 +5994,6 @@ fn f18_passes_only_where_the_persons_instant_turn_is_left_to_them() {
     let mut s = person_instant();
     s.ledger.push(typed(361_700, "continue@v1", CONTINUE_TEXT));
     assert_eq!(f18(&s).0, "FAIL");
-    // left past the take window, the face never theirs, a DONE, the stub
-    // saw a harness text, a need raised
     let mut s = person_instant();
     s.journal[6].0 = T0 + 158_000;
     let (w, why) = f18(&s);
@@ -6761,7 +6015,6 @@ fn f18_passes_only_where_the_persons_instant_turn_is_left_to_them() {
     let mut s = person_instant();
     s.meta.push(needs_meta(130_000, "claude"));
     assert_eq!(f18(&s).0, "FAIL");
-    // nothing at all after the Enter: past the unjudged deadline, lost
     let mut s = person_instant();
     s.journal.truncate(6);
     s.ledger.truncate(1);
@@ -6772,15 +6025,12 @@ fn f18_passes_only_where_the_persons_instant_turn_is_left_to_them() {
     assert!(why.contains("PERSISTENCE LOST"), "{why}");
     s.end_ms = T0 + 400_000;
     assert_eq!(f18(&s).0, "UNOBSERVED");
-    // LEFT, task=theirs and quiet do not prove the reply was read.
     let mut s = person_instant();
     s.journal.remove(5);
     assert_eq!(f18(&s).0, "UNOBSERVED");
     let mut s = person_instant();
     s.journal[5] = j(127_900, "EVENT idle seq=3 -");
     assert_eq!(f18(&s).0, "UNOBSERVED");
-    // UNOBSERVED: watched under 270 s after the LEFT, the stub unread, a read
-    // that saw the turn run (no instant turn), no person's hand, never typed
     let mut s = person_instant();
     s.end_ms = T0 + 300_000;
     assert_eq!(f18(&s).0, "UNOBSERVED");
@@ -6812,9 +6062,6 @@ fn f18_passes_only_where_the_persons_instant_turn_is_left_to_them() {
     let (w, why) = f18(&s);
     assert_eq!(w, "UNOBSERVED", "{why}");
     assert!(why.contains("not taken by the composer"), "{why}");
-    // THE NEGATIVE CONTROL IN THE SAME RUN: the control socket's prompt
-    // judged as a turn of the conversation passes P4P, and its record LEFT
-    // fails it (no person's hand typed it)
     assert_eq!(
         one(
             Chain::InstantCruise,
@@ -6834,12 +6081,6 @@ fn f18_passes_only_where_the_persons_instant_turn_is_left_to_them() {
 }
 
 /// `same-words` as a live run that passes it records it: its first reply
-/// judged at +5 s (one short turn, due +125 s), the tab resized at +10.2 s
-/// and its screen read again at +11 s with nothing judged, the first point's
-/// back-off told again there under the re-read's own `seq=` (as
-/// `r3-res-claude`, agy and Muse Code journaled it), the orchestrator's turn
-/// at +40.3 s answered with the same words, judged at +44 s as its own point
-/// (two short turns, a 4 min step), its act at that due.
 fn same_words() -> Seen {
     Seen {
         journal: vec![
@@ -6883,40 +6124,31 @@ fn the_rewrapped_opener_is_judged_once_and_the_same_words_turn_as_its_own_point(
     assert_eq!(w, "PASS", "{why}");
     let (w, why) = same(&same_words());
     assert_eq!(w, "PASS", "{why}");
-    // F2 ITSELF: the re-wrapped opener judged again, a short turn more
     let mut s = same_words();
     s.journal[3] = backoff(11_100, 2, 2, 240_000);
     s.ledger.insert(1, point(11_000, 2));
     let (w, why) = f1f2(&s);
     assert_eq!(w, "FAIL", "{why}");
     assert!(why.contains("JUDGED AGAIN"), "{why}");
-    // …or a back-off of another point told there, no record written
     let mut s = same_words();
     s.journal[3] = backoff(11_100, 2, 2, 240_000);
     let (w, why) = f1f2(&s);
     assert_eq!(w, "FAIL", "{why}");
     assert!(why.contains("a back-off of another point"), "{why}");
-    // the first point's own back-off told again, under its own seq too: no
-    // fault
     let mut s = same_words();
     s.journal.insert(4, (T0 + 25_100, s.journal[1].1.clone()));
     assert_eq!(f1f2(&s).0, "PASS");
-    // THE BACK-OFF DROPPED (`r3-res-gemini`): the re-wrapped frame read as
-    // no words and decided nothing — no back-off told there, no due
-    // standing, though nothing was judged or typed
     let mut s = same_words();
     s.journal[2] = j(11_000, "EVENT idle seq=2 -");
     s.journal.remove(3);
     let (w, why) = f1f2(&s);
     assert_eq!(w, "FAIL", "{why}");
     assert!(why.contains("BACK-OFF DROPPED"), "{why}");
-    // …told again at the first re-read but not at the second
     let mut s = same_words();
     s.journal.insert(4, j(20_000, "EVENT idle seq=4 -"));
     let (w, why) = f1f2(&s);
     assert_eq!(w, "FAIL", "{why}");
     assert!(why.contains("BACK-OFF DROPPED"), "{why}");
-    // an act with nothing submitted
     let mut s = same_words();
     s.journal.insert(
         4,
@@ -6925,8 +6157,6 @@ fn the_rewrapped_opener_is_judged_once_and_the_same_words_turn_as_its_own_point(
     let (w, why) = f1f2(&s);
     assert_eq!(w, "FAIL", "{why}");
     assert!(why.contains("with nothing submitted"), "{why}");
-    // A successful resize and a later judged turn do not prove the resized
-    // opener was read. A busy read does not observe a turn-end point either.
     for busy in [false, true] {
         let mut s = same_words();
         s.journal.drain(2..4);
@@ -6936,7 +6166,6 @@ fn the_rewrapped_opener_is_judged_once_and_the_same_words_turn_as_its_own_point(
         assert_eq!(f1f2(&s).0, "UNOBSERVED");
         assert_eq!(same(&s).0, "PASS");
     }
-    // UNOBSERVED: never resized, a resize that did not take, watched under 20 s
     let mut s = same_words();
     s.cover.resized = None;
     assert_eq!(f1f2(&s).0, "UNOBSERVED");
@@ -6949,8 +6178,6 @@ fn the_rewrapped_opener_is_judged_once_and_the_same_words_turn_as_its_own_point(
     let mut s = same_words();
     s.cover.turn_ms = Some(T0 + 25_000);
     assert_eq!(f1f2(&s).0, "UNOBSERVED");
-    // F1 ITSELF: the same words under another opener taken for the turn
-    // before them — the old point's streak and due kept, acted on at it
     let mut s = same_words();
     s.journal[5] = (
         T0 + 44_100,
@@ -6966,7 +6193,6 @@ fn the_rewrapped_opener_is_judged_once_and_the_same_words_turn_as_its_own_point(
     assert_eq!(w, "FAIL", "{why}");
     assert!(why.contains("names 1 short turn(s), not 2"), "{why}");
     assert!(why.contains("no later"), "{why}");
-    // …or no back-off decided at it, the old one's act typed
     let mut s = same_words();
     s.journal.remove(5);
     s.journal[5].0 = T0 + 125_300;
@@ -6974,7 +6200,6 @@ fn the_rewrapped_opener_is_judged_once_and_the_same_words_turn_as_its_own_point(
     let (w, why) = same(&s);
     assert_eq!(w, "FAIL", "{why}");
     assert!(why.contains("at no point judged at its reply"), "{why}");
-    // nothing after the turn: past the due and a minute lost, before it unobserved
     let mut s = same_words();
     s.journal.pop();
     s.ledger.pop();
@@ -6990,9 +6215,6 @@ fn the_rewrapped_opener_is_judged_once_and_the_same_words_turn_as_its_own_point(
 }
 
 /// `tall-scroll` as the harness journals it: its first point (one short
-/// turn, 2 min back-off), the wheel from 6.8 s bringing the opener into
-/// sight (8 notches, the last at 8.3 s), the scrolled screen read as a point
-/// and the first back-off told again there, watched 40 s.
 fn tall_scroll() -> Seen {
     Seen {
         journal: vec![
@@ -7027,22 +6249,6 @@ fn tall_scroll() -> Seen {
 }
 
 /// F1 BY A SCROLL (`tall-scroll`, [`judge_scrolled`]): PASS where the
-/// scrolled screen was read as a point and the first point's back-off told
-/// again there, nothing judged or typed. NEGATIVE CONTROLS, each FAIL: F1
-/// itself (a point record and a short turn more on the scrolled screen), the
-/// same DURING THE NOTCHES (the screen the opener first came into sight on,
-/// read inside the last notch's wait before the drive stamped it: the review
-/// of `b9/resid4-lab` found it judged from the last notch, unchecked), a
-/// back-off of another point with no record, the back-off dropped (a read
-/// that told none), an act with nothing submitted. The same records before
-/// the first notch are no part of the scroll's watch (PASS). UNOBSERVED: a
-/// point read during the notches alone, none after the last; the wheel
-/// never turned, the opener in sight before it (no history), never in sight
-/// after it (with the screen's last rows), no point read on the scrolled
-/// screen (the composer scrolled away: nothing to judge, so no proof),
-/// watched under 20 s, and an agent that takes no wheel (the notches moved
-/// the tab's viewport, out of the harness's sight) — which still FAILs on a
-/// turn judged again after them.
 #[test]
 fn a_judged_opener_scrolled_into_sight_is_not_judged_again() {
     let f1s = |s: &Seen| one(Chain::TallScroll, s, "muse", Scenario::Scrolled);
@@ -7052,7 +6258,6 @@ fn a_judged_opener_scrolled_into_sight_is_not_judged_again() {
         why.contains("8 notch(es) up") && why.contains("still in sight"),
         "{why}"
     );
-    // F1 ITSELF: the revealed opener judged again, a short turn more
     let mut s = tall_scroll();
     s.journal[3] = backoff(9_600, 2, 2, 240_000);
     s.ledger.push(point(9_500, 2));
@@ -7062,9 +6267,6 @@ fn a_judged_opener_scrolled_into_sight_is_not_judged_again() {
         why.contains("JUDGED AGAIN") && why.contains("after the scroll"),
         "{why}"
     );
-    // F1 DURING THE NOTCHES: judged again on a screen read before the last
-    // notch was stamped; the same records before the first notch are the
-    // control
     for (t, judged) in [(7_000, true), (6_000, false)] {
         let mut s = tall_scroll();
         s.journal
@@ -7082,8 +6284,6 @@ fn a_judged_opener_scrolled_into_sight_is_not_judged_again() {
             assert_eq!(w, "PASS", "{why}");
         }
     }
-    // a point read during the notches alone (the first back-off told again
-    // there), none after the last: no point read on the scrolled screen
     let mut s = tall_scroll();
     s.journal[2].0 = T0 + 7_000;
     s.journal[3].0 = T0 + 7_100;
@@ -7093,19 +6293,16 @@ fn a_judged_opener_scrolled_into_sight_is_not_judged_again() {
         why.contains("no point read on the scrolled screen"),
         "{why}"
     );
-    // …or a back-off of another point told there, no record written
     let mut s = tall_scroll();
     s.journal[3] = backoff(9_600, 2, 2, 240_000);
     let (w, why) = f1s(&s);
     assert_eq!(w, "FAIL", "{why}");
     assert!(why.contains("a back-off of another point"), "{why}");
-    // the back-off dropped: the scrolled screen read and nothing told
     let mut s = tall_scroll();
     s.journal.remove(3);
     let (w, why) = f1s(&s);
     assert_eq!(w, "FAIL", "{why}");
     assert!(why.contains("BACK-OFF DROPPED"), "{why}");
-    // an act with nothing submitted
     let mut s = tall_scroll();
     s.journal.push(j(
         30_000,
@@ -7114,7 +6311,6 @@ fn a_judged_opener_scrolled_into_sight_is_not_judged_again() {
     let (w, why) = f1s(&s);
     assert_eq!(w, "FAIL", "{why}");
     assert!(why.contains("with nothing submitted"), "{why}");
-    // UNOBSERVED
     let mut s = tall_scroll();
     s.cover.scrolled = None;
     assert_eq!(f1s(&s).0, "UNOBSERVED");
@@ -7137,7 +6333,6 @@ fn a_judged_opener_scrolled_into_sight_is_not_judged_again() {
         why.contains("at no notch") && why.contains("lab-stub"),
         "{why}"
     );
-    // the scrolled screen read as no point (busy, or not read at all)
     for busy in [false, true] {
         let mut s = tall_scroll();
         s.journal.drain(2..4);
@@ -7154,7 +6349,6 @@ fn a_judged_opener_scrolled_into_sight_is_not_judged_again() {
     let mut s = tall_scroll();
     s.end_ms = T0 + 20_000;
     assert_eq!(f1s(&s).0, "UNOBSERVED");
-    // the agent took no wheel: its viewport scrolled, out of the harness's sight
     let viewport = |s: &mut Seen| {
         if let Some(sc) = s.cover.scrolled.as_mut() {
             sc.modes = "alt_screen=false mouse_mode=none".into();
@@ -7174,7 +6368,6 @@ fn a_judged_opener_scrolled_into_sight_is_not_judged_again() {
             && why.contains("out of the harness's"),
         "{why}"
     );
-    // …and a turn judged again after its notches still FAILs
     let mut s = tall_scroll();
     viewport(&mut s);
     s.journal[3] = backoff(9_600, 2, 2, 240_000);
@@ -7185,13 +6378,6 @@ fn a_judged_opener_scrolled_into_sight_is_not_judged_again() {
 }
 
 /// `tall-scroll`'s tab runs the renderer that takes the wheel
-/// ([`scroll_launcher`]): Claude Code's fullscreen one, Gemini CLI's
-/// alternate buffer (its system settings file), agy's no-flickering one in a
-/// home of the tab's own (the run's trust, onboarding done, its `HOME` after
-/// the run's, so it is the one `env` keeps); Muse Code, which has none, the
-/// run's own. Every file of it is under the run's scratch, which `down`
-/// removes whole (Gemini CLI's settings in the run's directory outlived
-/// `r4-f3`). NEGATIVE CONTROLS: the run's own launchers carry none of it.
 #[test]
 fn the_scroll_chains_tab_runs_the_renderer_that_takes_the_wheel() {
     let tmp = aterm_tempfile::tempdir().unwrap();
@@ -7225,8 +6411,6 @@ fn the_scroll_chains_tab_runs_the_renderer_that_takes_the_wheel() {
             .unwrap()
             .unwrap(),
     );
-    // under the scratch, which `down` removes whole: nothing of it outlives
-    // the run in its directory
     let settings = run.w.join(SCROLL_GEMINI_FILE);
     assert!(!run.run.join(SCROLL_GEMINI_FILE).exists(), "the run's dir");
     assert!(
@@ -7287,11 +6471,6 @@ fn the_scroll_chains_tab_runs_the_renderer_that_takes_the_wheel() {
 }
 
 /// `search` and `scroll` as the scroll drive reads them: the newest match's
-/// absolute row (the client's stdout) and the live screen's first (its
-/// header, which the client writes to stderr, measured `r4-f3`), the
-/// viewport's offset and its most. CONTROLS: no match, an `ERR`, rows with
-/// no header, and the header on stdout, where the client never writes it —
-/// read there, as `r4-f3`'s drive did, Muse Code's opener was found nowhere.
 #[test]
 fn the_scroll_drive_reads_search_and_scroll_replies() {
     let reply = |stderr: &str, stdout: &str| Reply {
@@ -7329,9 +6508,6 @@ fn the_scroll_drive_reads_search_and_scroll_replies() {
 }
 
 /// `tool-end` as a live run that passes it records it: the first reply's
-/// call run (its result carried back), the turn ended on the tool's row and
-/// judged at +6 s (one short turn, 2 min), Land's act at that due, its clean
-/// defense landing the task.
 fn tool_ended() -> Seen {
     Seen {
         journal: vec![
@@ -7374,7 +6550,6 @@ fn f3_passes_only_where_the_tool_ended_first_turn_is_judged() {
     let (w, why) = f3(&tool_ended());
     assert_eq!(w, "PASS", "{why}");
     assert!(why.contains("Read(README.md)"), "{why}");
-    // F3 ITSELF: the tool-ended turn taken for a launch's frame, never judged
     let mut s = tool_ended();
     s.journal.truncate(1);
     s.ledger.clear();
@@ -7386,7 +6561,6 @@ fn f3_passes_only_where_the_tool_ended_first_turn_is_judged() {
     assert!(why.contains("PERSISTENCE LOST"), "{why}");
     s.end_ms = T0 + 250_000;
     assert_eq!(f3(&s).0, "UNOBSERVED");
-    // judged a short turn late (a frame before it counted)
     let mut s = tool_ended();
     s.journal[1] = backoff(6_100, 1, 2, 240_000);
     s.journal[2].0 = T0 + 246_400;
@@ -7394,11 +6568,9 @@ fn f3_passes_only_where_the_tool_ended_first_turn_is_judged() {
     let (w, why) = f3(&s);
     assert_eq!(w, "FAIL", "{why}");
     assert!(why.contains("names 2 short turn(s), not 1"), "{why}");
-    // an act with no back-off before it
     let mut s = tool_ended();
     s.journal.remove(1);
     assert_eq!(f3(&s).0, "FAIL");
-    // judged, and nothing typed past its due and a minute
     let mut s = tool_ended();
     s.journal.truncate(2);
     s.ledger.truncate(1);
@@ -7408,9 +6580,6 @@ fn f3_passes_only_where_the_tool_ended_first_turn_is_judged() {
     assert!(why.contains("PERSISTENCE LOST"), "{why}");
     s.end_ms = T0 + 150_000;
     assert_eq!(f3(&s).0, "UNOBSERVED");
-    // THE LANDING (the review of `b9/resid3`): the land act typed at its
-    // due, and its clean defense landed nothing — past the window, a FAIL;
-    // inside it, unobserved
     let mut s = tool_ended();
     s.journal.truncate(4);
     s.ledger.truncate(2);
@@ -7422,7 +6591,6 @@ fn f3_passes_only_where_the_tool_ended_first_turn_is_judged() {
     let (w, why) = f3(&s);
     assert_eq!(w, "UNOBSERVED", "{why}");
     assert!(why.contains("not landed yet"), "{why}");
-    // the call never run: the turn did not end on a tool's row
     for n in [None, Some(0)] {
         let mut s = tool_ended();
         s.cover.tool_results = n;
@@ -7433,8 +6601,6 @@ fn f3_passes_only_where_the_tool_ended_first_turn_is_judged() {
 }
 
 /// `ladder` as a live run under the seam at `scale` records it: seven points,
-/// each one short turn more, each step the ladder's at that scale, each act
-/// 0.3 s past its due and its reply judged 3 s after.
 fn laddered(scale: f64) -> Seen {
     laddered_late(scale, 0, 0)
 }
@@ -7481,13 +6647,10 @@ fn the_ladder_passes_only_where_its_steps_double_to_the_cap_each_act_at_its_due(
         steps.iter().map(|s| s.streak).collect::<Vec<_>>(),
         [1, 2, 3, 4, 5, 6, 7]
     );
-    // the whole scaled ladder fits its watch
     assert!(good.end_ms - T0 < LADDER_LIMIT_MS);
-    // NEGATIVE CONTROLS. The seam not taken: the shipped ladder's first step
     let (w, why) = lad(&laddered(1.0));
     assert_eq!(w, "FAIL", "{why}");
     assert!(why.contains("the seam not taken"), "{why}");
-    // a step that does not double (the fourth at the third's), one past the cap
     for (i, bad) in [(3, 60_000), (6, 900_000), (2, 30_000)] {
         let mut s = laddered(LADDER_SCALE);
         let k = s
@@ -7505,7 +6668,6 @@ fn the_ladder_passes_only_where_its_steps_double_to_the_cap_each_act_at_its_due(
         let (w, why) = lad(&s);
         assert_eq!(w, "FAIL", "step {}: {why}", i + 1);
     }
-    // a streak out of its order
     let mut s = laddered(LADDER_SCALE);
     let k = s
         .journal
@@ -7518,9 +6680,6 @@ fn the_ladder_passes_only_where_its_steps_double_to_the_cap_each_act_at_its_due(
     let (w, why) = lad(&s);
     assert_eq!(w, "FAIL", "{why}");
     assert!(why.contains("step 3"), "{why}");
-    // NOTHING TYPED (the review of `b9/resid3`): seven well-formed steps, each
-    // a point judged again with no act between — a redraw counted as a
-    // short turn — climbs nothing
     let mut s = laddered(LADDER_SCALE);
     s.journal.retain(|(_, l)| !l.starts_with("CONTINUED "));
     s.ledger.retain(|r| r.rule != "continue@v1");
@@ -7528,15 +6687,12 @@ fn the_ladder_passes_only_where_its_steps_double_to_the_cap_each_act_at_its_due(
     let (w, why) = lad(&s);
     assert_eq!(w, "FAIL", "{why}");
     assert!(why.contains("NOTHING TYPED after step 1"), "{why}");
-    // …or one act missing, between the fourth step and the fifth
     let mut s = laddered(LADDER_SCALE);
     s.journal
         .retain(|(_, l)| !l.starts_with("CONTINUED seq=4 "));
     let (w, why) = lad(&s);
     assert_eq!(w, "FAIL", "{why}");
     assert!(why.contains("NOTHING TYPED after step 4"), "{why}");
-    // a step told again at a re-read of its point, under the re-read's own
-    // seq (its streak and due): no step of its own, no fault
     let mut s = laddered(LADDER_SCALE);
     let k = s
         .journal
@@ -7554,11 +6710,9 @@ fn the_ladder_passes_only_where_its_steps_double_to_the_cap_each_act_at_its_due(
     assert_eq!(ladder_steps(&s, T0).len(), LADDER_STEPS as usize);
     let (w, why) = lad(&s);
     assert_eq!(w, "PASS", "{why}");
-    // an act a minute and a half past its due
     let (w, why) = lad(&laddered_late(LADDER_SCALE, 2, 90_000));
     assert_eq!(w, "FAIL", "{why}");
     assert!(why.contains("past its due"), "{why}");
-    // an act before its due (the chain's own fault, every scenario fails)
     let mut s = laddered(LADDER_SCALE);
     let k = s
         .journal
@@ -7569,8 +6723,6 @@ fn the_ladder_passes_only_where_its_steps_double_to_the_cap_each_act_at_its_due(
     let (w, why) = lad(&s);
     assert_eq!(w, "FAIL", "{why}");
     assert!(why.contains("BEFORE the due its back-off named"), "{why}");
-    // five steps: past the fifth's due and a minute with nothing typed, lost;
-    // before it, unobserved
     let mut s = laddered(LADDER_SCALE);
     let k = s
         .journal
@@ -7618,7 +6770,6 @@ fn the_backoff_helpers_read_a_points_own_decision() {
         journal: vec![
             backoff(1_000, 1, 1, 120_000),
             j(5_000, "EVENT idle seq=2 x"),
-            // the standing back-off told again keeps its seq
             (T0 + 21_000, backoff(1_000, 1, 1, 120_000).1),
             backoff(30_000, 4, 2, 240_000),
             j(
@@ -7633,8 +6784,6 @@ fn the_backoff_helpers_read_a_points_own_decision() {
         Some(T0 + 30_000)
     );
     assert_eq!(own_backoff_after(&s, T0 + 30_000), None);
-    // the standing back-off told again under a re-read's own seq (its streak
-    // and due): no decision of a point of its own, no ladder step
     let mut again = Seen {
         journal: s.journal.clone(),
         ..Seen::default()
@@ -7651,8 +6800,6 @@ fn the_backoff_helpers_read_a_points_own_decision() {
             .collect::<Vec<_>>(),
         [(1, 1_000), (2, 30_000)]
     );
-    // NEGATIVE CONTROL: the same streak under another due is a decision of
-    // its own
     again.journal[3] = retold(22_000, 3, 142_000);
     assert_eq!(
         own_backoff_after(&again, T0 + 2_000).map(|(t, _)| *t),
@@ -7673,12 +6820,7 @@ fn the_backoff_helpers_read_a_points_own_decision() {
     );
 }
 
-// ---- W2 on Gemini CLI (its dialog's Stop) and Claude Code (Esc, then `/rename`)
-
 /// Gemini CLI's usage-limit dialog as measured (a Google account's spent
-/// quota, `Access resets at …`), its focus on `1. Keep trying`; the same
-/// answered `2. Stop`: the turn's `✕ [API Error: An unknown error occurred.]`
-/// and the composer back.
 fn gemini_dialog_and_stopped() -> (String, String) {
     let strip = |f: &str| {
         f.lines()
@@ -7693,11 +6835,6 @@ fn gemini_dialog_and_stopped() -> (String, String) {
 }
 
 /// GEMINI CLI'S NOTICE IS GONE ONCE ITS DIALOG IS ANSWERED `2. Stop`
-/// ([`notice_gone`]): the composer back, no usage-limit dialog, no row of its
-/// words — though the screen draws the error the Stop leaves, a wall its
-/// reader reads. The guard of the choice ([`dialog_focus`]) reads the focused
-/// option inside the box's borders. CONTROLS: the dialog itself (its focus on
-/// either option) is the notice; a screen holding its title row is too.
 #[test]
 fn gemini_clis_notice_is_gone_once_its_dialog_is_answered_stop() {
     let (dialog, stopped) = gemini_dialog_and_stopped();
@@ -7723,9 +6860,6 @@ fn gemini_clis_notice_is_gone_once_its_dialog_is_answered_stop() {
 }
 
 /// Claude Code 2.1.307's screen under the stub's five-hour limit (measured,
-/// 2026-10-21, `aterm ctl text` of the lab's tab): `armed` its countdown
-/// standing (the footer's banner), `cancelled` after Esc, `scrolled` after
-/// twelve `/rename w2probe` — the rule carrying the session's name.
 fn claude_limit_screens() -> (String, String, String) {
     let rule = "─".repeat(144);
     let named = format!("{} w2probe ─", "─".repeat(134));
@@ -7745,13 +6879,6 @@ fn claude_limit_screens() -> (String, String, String) {
 }
 
 /// CLAUDE CODE'S NOTICE IS GONE ONLY ONCE ITS COUNTDOWN IS CANCELLED AND ITS
-/// ROWS HAVE SCROLLED AWAY ([`notice_gone`]), the composer read between rules
-/// one of which carries the session's name ([`claude_composer`]); the
-/// countdown's key is pressed only where it stands armed ([`CLAUDE_CANCEL`]),
-/// and `/rename` entered only where the composer holds it with no menu row
-/// focused ([`menu_offers`]). CONTROLS: the armed footer and the cancelled
-/// turn's rows are the notice; a menu's focused row, or another draft, is no
-/// offer.
 #[test]
 fn claude_codes_notice_is_gone_once_cancelled_and_scrolled_away() {
     let (armed, cancelled, scrolled) = claude_limit_screens();
@@ -7776,9 +6903,6 @@ fn claude_codes_notice_is_gone_once_cancelled_and_scrolled_away() {
 }
 
 /// W2's records on Gemini CLI: the dialog read and waited on to its reset
-/// (`limit-retry@v1`), answered `2. Stop` at +160 s, the Stop's error read at
-/// the screen without the notice, waited on to the reset, and the resume
-/// typed past it there.
 fn gemini_stopped() -> Seen {
     let mut s = walled_hidden();
     s.journal[3].1 = "EVENT prompt seq=2 kind=usage-limit classify=- command=-".into();
@@ -7801,13 +6925,6 @@ fn gemini_stopped() -> Seen {
 }
 
 /// W2 ON GEMINI CLI ([`cover::judge_wall_hidden`] under [`Hidden::stopped`]):
-/// a point read after the Stop on the error it leaves — an `EVENT limited`
-/// that names none of the dialog's words — is the screen without the notice.
-/// NEGATIVE CONTROLS: that point still naming the limit, the dialog's own
-/// point again, or a point read at a screen from before the Stop is none;
-/// the Stop's error handed to a person (what the loop decided before the
-/// fix) FAILs; and under a local command's hide (`stopped` false) an `EVENT
-/// limited` point is never one.
 #[test]
 fn the_remembered_wall_on_gemini_cli_reads_the_stops_error_as_a_screen_without_the_notice() {
     let w2 = |s: &Seen| one(Chain::WallHid, s, "gemini", Scenario::W2);
@@ -7837,7 +6954,6 @@ fn the_remembered_wall_on_gemini_cli_reads_the_stops_error_as_a_screen_without_t
             "EVENT limited seq=20 message=[API Error: An unknown error occurred.] reset=-".into();
     });
     unobserved(&|s| s.cover.hidden.as_mut().expect("hidden").stopped = false);
-    // the Stop's error handed to a person, nothing typed past the reset
     let mut s = gemini_stopped();
     s.journal.truncate(8);
     s.ledger.truncate(5);

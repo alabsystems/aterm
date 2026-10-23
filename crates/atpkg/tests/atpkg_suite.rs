@@ -20,6 +20,9 @@
 //! Run one file's tests with
 //! `targo --unverified test -p atpkg --test atpkg_suite -- <file>::`.
 
+#[cfg(test)]
+aterm_durable::plain_durable_flushes_in_tests!();
+
 mod agent_warm;
 mod build_cache;
 mod hook_reroute_first;

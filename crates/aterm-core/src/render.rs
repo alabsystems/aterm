@@ -1,17 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The engine-owned render snapshot: [`RenderInput`] is the plain-owned, `Terminal`-free value
-//! a renderer reads to paint one frame. The engine produces it
-//! ([`Terminal::cell_frame_into`](crate::terminal::Terminal::cell_frame_into)); hosting the
-//! type here avoids a dependency cycle, and `aterm_render::render_api` re-exports it.
+//! The engine-owned render snapshot: [`RenderInput`] is the plain-owned, `Terminal`-free value a renderer reads to paint one frame.
 
 use crate::grid::LineSize;
 use crate::selection::TextSelection;
 use crate::terminal::{CursorStyle, RenderCell};
 use aterm_hash::FxHashMap;
 
-// The engine's sprite and bitmap primitive (design: docs/DESIGN-card-engine-2026-10-19.md §4).
 #[cfg(any(test, debug_assertions))]
 #[doc(hidden)]
 pub use crate::render_fx::fx_counts_here;
@@ -21,31 +17,18 @@ pub use crate::render_fx::{
     fx_layer_builds, fx_payload_copies,
 };
 
-/// One faded cell of the cursor motion trail, painted in the trail colour at `alpha` over its
-/// own background, in the cursor's viewport coordinates (after the tab-strip splice and any
-/// split-pane offset). The host owns the clock and resolves `alpha` each frame, keeping the
-/// renderer deterministic.
+/// One faded cell of the cursor motion trail, painted in the trail colour at `alpha` over its own background, in the cursor's viewport coordinates (after the tab-strip splice and any split-pane offset).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TrailCell {
     /// Viewport row (0-indexed from the top of the visible area).
     pub row: usize,
     /// Viewport column (0-indexed).
     pub col: usize,
-    /// Blend coverage `0..=255` of the trail colour over this cell's background, drawn opaque
-    /// as the pre-blended result so the CPU fill and the GPU `REPLACE` quad agree.
+    /// Blend coverage `0..=255` of the trail colour over this cell's background, drawn opaque as the pre-blended result so the CPU fill and the GPU `REPLACE` quad agree.
     pub alpha: u8,
 }
 
-/// One light quad of an effect stream (aurora comet, bloom crown, landing ring, sparks, nova,
-/// fire body). In additive mode the renderer saturating-adds the premultiplied colour:
-/// order-independent and byte-exact between the GPU (`One`/`One` over the linear `Rgba8Unorm`
-/// target) and the CPU (`add_sat`).
-///
-/// Host invariants: (1) coordinates are per stream: the cursor-effect streams
-/// (`cursor_glow_add`, `glow_under`) are window-absolute pixels clamped to the effects box,
-/// the grid-anchored `nova_add` grid-interior; (2) every quad lies within exactly one cell-row
-/// band (a halo spilling into a neighbour row is a separate quad), so the row-scoped dirty gate
-/// and GPU scissor cover it.
+/// One light quad of an effect stream (aurora comet, bloom crown, landing ring, sparks, nova, fire body).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct GlowQuad {
     /// The row band this quad lives in: a damage hint (above-grid quads tag row 0).
@@ -60,39 +43,16 @@ pub struct GlowQuad {
     pub h: u16,
     /// Premultiplied colour `0x00RRGGBB` (the colour times its coverage) in both modes.
     pub color: u32,
-    /// The source-over opacity `0..=255`, which also selects the mode; both are
-    /// `out = color + dst·(255 − alpha)/255`:
-    ///
-    /// * `alpha == 0`: premultiplied additive light, `out = dst + color` (saturating), the
-    ///   default: it only brightens and is order-independent.
-    /// * `alpha > 0`: premultiplied source-over paint: the destination is attenuated by
-    ///   `1 − alpha/255` first.
-    ///
-    /// Additive light is invisible over white and never darkens; source-over reads on any
-    /// ground but can darken one brighter than itself, so a stream that must never darken
-    /// stays at `0`.
+    /// The source-over opacity `0..=255`, which also selects the mode.
     pub alpha: u8,
-    /// Premultiplied colour `0x00RRGGBB` at the right edge of a horizontal gradient across the
-    /// quad's `w` columns ([`color`](GlowQuad::color) is the left); equal ends are flat.
-    /// Column `i` carries, per channel and for the opacity alike,
-    ///
-    /// ```text
-    /// c(i) = (c0·(2w − m) + c1·m + w) / (2w),   m = 2i + 1
-    /// ```
-    ///
-    /// in unsigned integer arithmetic (round half up): the line from `c0` to `c1` sampled at
-    /// the column centre (`w == 1` gives `(c0 + c1 + 1) / 2`). The CPU rasterizer and both GPU
-    /// shaders compute this same integer formula, never a float interpolant.
+    /// Premultiplied colour `0x00RRGGBB` at the right edge of a horizontal gradient across the quad's `w` columns ([`color`](GlowQuad::color) is the left).
     pub color2: u32,
-    /// The source-over opacity at the right edge ([`alpha`](GlowQuad::alpha) is the left). The
-    /// mode is per quad: `alpha == 0 ⇔ alpha2 == 0`. The colour is premultiplied by the same
-    /// coverage, so the composite is continuous where a ramp reaches `0`.
+    /// The source-over opacity at the right edge ([`alpha`](GlowQuad::alpha) is the left).
     pub alpha2: u8,
 }
 
 impl GlowQuad {
-    /// A flat quad: one colour and one opacity across its width
-    /// (`color2 == color`, `alpha2 == alpha`).
+    /// A flat quad: one colour and one opacity across its width (`color2 == color`, `alpha2 == alpha`).
     #[must_use]
     #[inline]
     pub const fn flat(row: u16, x: u16, y: u16, w: u16, h: u16, color: u32, alpha: u8) -> Self {
@@ -109,12 +69,7 @@ impl GlowQuad {
         }
     }
 
-    /// A gradient quad: `(color, alpha)` at the left edge ramping to `(color2, alpha2)` at
-    /// the right (see [`GlowQuad::color2`]).
-    ///
-    /// # Panics (debug)
-    /// When exactly one of `alpha`/`alpha2` is `0`: a quad is additive or source-over at both
-    /// ends.
+    /// A gradient quad: `(color, alpha)` at the left edge ramping to `(color2, alpha2)` at the right (see [`GlowQuad::color2`]).
     #[must_use]
     #[inline]
     #[allow(clippy::too_many_arguments)]
@@ -153,9 +108,7 @@ impl GlowQuad {
         self.color2 == self.color && self.alpha2 == self.alpha
     }
 
-    /// Canonical lossless words for cursor-effect fingerprints: two for a flat quad, plus a
-    /// tagged third word with the right edge for a gradient, so a gradient never folds as its
-    /// left-flat twin.
+    /// Canonical lossless words for cursor-effect fingerprints.
     #[doc(hidden)]
     #[must_use]
     #[inline]
@@ -180,8 +133,7 @@ impl GlowQuad {
     }
 }
 
-/// The fingerprint words of one [`GlowQuad`] (two flat, three gradient); iterates the live
-/// words only.
+/// The fingerprint words of one [`GlowQuad`] (two flat, three gradient); iterates the live words only.
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GlowQuadWords {
@@ -191,7 +143,6 @@ pub struct GlowQuadWords {
 
 impl GlowQuadWords {
     /// Bits 48..64 of a gradient quad's third word (`"GR"`), disjoint from `color2` and
-    /// `alpha2`, so the third word never resembles a following flat quad's `(row, x, y, w)`.
     const GRADIENT_TAG: u64 = 0x4752_0000_0000_0000;
 
     /// The live words as a slice.
@@ -212,22 +163,17 @@ impl IntoIterator for GlowQuadWords {
     }
 }
 
-/// Which [`GlowQuad::alpha`] convention an emitter stamps, so a rasterizer shared by additive
-/// and source-over streams knows which it produces.
+/// Which [`GlowQuad::alpha`] convention an emitter stamps, so a rasterizer shared by additive and source-over streams knows which it produces.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum GlowBlend {
     /// Premultiplied additive light: every quad has `alpha == 0`. The default.
     #[default]
     Add,
     /// Premultiplied source-over paint: each quad's `alpha` is the coverage that premultiplied
-    /// its colour.
     Over,
 }
 
-/// How a [`RainHalo`]'s radially-weighted colour composites. `Add` is premultiplied light,
-/// invisible over white; `Over` is a source-over veil (smoke, steam) that reads on any
-/// background. Within one stream every `Add` quad composites before every `Over` quad (the
-/// GPU's per-mode draw order, mirrored by the CPU), keeping overlaps parity-exact.
+/// How a [`RainHalo`]'s radially-weighted colour composites.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum HaloMode {
     /// Premultiplied saturating-add light (CPU `add_sat` == GPU One/One on the Unorm view).
@@ -237,13 +183,7 @@ pub enum HaloMode {
     Over,
 }
 
-/// A radial halo quad: like [`GlowQuad`] (one row band) but its light falls off radially from
-/// `(cx, cy)`. Each covered pixel at offset `(dx, dy)` scales `color` by
-/// `weight = ((256 − nsq)² >> 8)` (clamped), `nsq = (dx²·256)/rx² + (dy²·256)/ry²`, then
-/// `add_sat`s it (under [`HaloMode::Over`] the weight is the source-over alpha). Pure integer
-/// math, so the CPU and the GPU `fs_rain_glow`/`fs_rain_glow_over` shaders agree byte for
-/// byte. Coordinates follow [`GlowQuad`]'s per-stream rule: `glow_halo` is window-absolute,
-/// `rain_add` grid-interior.
+/// A radial halo quad: like [`GlowQuad`] (one row band) but its light falls off radially from `(cx, cy)`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct RainHalo {
     /// The row band this quad lives in: a damage hint (above-grid quads tag row 0).
@@ -256,15 +196,13 @@ pub struct RainHalo {
     pub w: u16,
     /// Quad height in pixels (kept within the single `row` cell band).
     pub h: u16,
-    /// The halo-centre colour `0x00RRGGBB`: premultiplied peak light ([`HaloMode::Add`]) or
-    /// a straight veil colour ([`HaloMode::Over`]), scaled per pixel by the falloff.
+    /// The halo-centre colour `0x00RRGGBB`.
     pub color: u32,
     /// Pixel X of the halo centre, the falloff origin; may lie outside this quad's row band.
     pub cx: u16,
     /// Pixel Y of the halo centre (same convention as `y`).
     pub cy: u16,
-    /// Horizontal falloff half-extent in pixels (light reaches 0 there); `>= 1`, guaranteed
-    /// by the emitter (0 would divide by zero).
+    /// Horizontal falloff half-extent in pixels (light reaches 0 there); `>= 1`, guaranteed by the emitter (0 would divide by zero).
     pub rx: u16,
     /// Vertical falloff half-extent in pixels; `>= 1`.
     pub ry: u16,
@@ -290,10 +228,7 @@ impl RainHalo {
     }
 }
 
-/// How a [`FirePatch`]'s field output composites. [`Add`](FireMode::Add) (dark theme)
-/// saturating-adds premultiplied light; [`Over`](FireMode::Over) (light theme) composites a
-/// straight ink palette source-over, the [`HaloMode::Over`] contract. Within one stream every
-/// `Add` patch composites before every `Over` patch, keeping overlaps parity-exact.
+/// How a [`FirePatch`]'s field output composites.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum FireMode {
     /// Premultiplied saturating-add flame light: the dark-theme mode.
@@ -303,12 +238,7 @@ pub enum FireMode {
     Over,
 }
 
-/// One fire patch: a stateless, float-free procedural fire field evaluated at every device
-/// pixel of the quad by both backends (`aterm_render::fire_field`, mirrored by the GPU's
-/// `fs_fire_add`/`fs_fire_over`), so they land the same byte. Window-absolute pixels, one
-/// cell-row band per patch. The field depends only on absolute pixel coordinates and the
-/// parameters, so patches of one burn are seamless and splitting a patch changes no byte;
-/// `base_y` may lie outside the patch's own band.
+/// One fire patch: a stateless, float-free procedural fire field evaluated at every device pixel of the quad by both backends (`aterm_render::fire_field`, mirrored by the GPU's `fs_fire_add`/`fs_fire_over`), so they land the same byte.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct FirePatch {
     /// The row band this patch lives in: a damage hint (above-grid patches tag row 0).
@@ -321,8 +251,7 @@ pub struct FirePatch {
     pub w: u16,
     /// Quad height in pixels (kept within the single `row` cell band).
     pub h: u16,
-    /// Window-absolute pixel Y of the flame root (field `v = 0`; flames rise, so live pixels
-    /// have `y < base_y`), shared by a burn's patches.
+    /// Window-absolute pixel Y of the flame root (field `v = 0`; flames rise, so live pixels have `y < base_y`), shared by a burn's patches.
     pub base_y: u16,
     /// Maximum flame height in pixels; `0` is treated as `1`.
     pub peak_h: u16,
@@ -368,17 +297,13 @@ impl FirePatch {
     }
 }
 
-/// Compact damage identity for a window-absolute cursor-effect stream: whether it changed and
-/// which rows it occupied, so a prior-frame cache need not clone thousands of quads. Opt-in:
-/// left at [`Default`], consumers compare and scan the vector. The GUI calls
-/// [`RenderInput::refresh_cursor_effect_damage`] after its final composition.
+/// Compact damage identity for a window-absolute cursor-effect stream.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct EffectStreamDamage {
     /// Two-lane content fingerprint; the explicit length prevents an empty/non-empty alias.
     fingerprint: u128,
     len: usize,
     /// One bit per grid row touched: compact even for an 8k-quad ribbon, and it keeps the
-    /// vacated rows after the cache drops the payload.
     rows: Vec<u64>,
     valid: bool,
 }
@@ -406,9 +331,7 @@ impl EffectStreamDamage {
         self.valid
     }
 
-    /// Whether the described stream was empty: the only reliable answer for a cached frame,
-    /// whose payload [`RenderInput::clone_damage_cache_from`] dropped. `None` without valid
-    /// metadata (the payload was cloned and answers directly).
+    /// Whether the described stream was empty.
     #[must_use]
     #[inline]
     pub const fn was_empty(&self) -> Option<bool> {
@@ -473,8 +396,6 @@ impl EffectStreamDamage {
 }
 
 /// A fixed-shape two-lane fingerprint for effect records, not a general hasher. The lanes
-/// differ in combination and constants, avoiding the affine relation of `FxHasher::with_seed`
-/// used twice.
 struct EffectStreamFingerprint {
     first: u64,
     second: u64,
@@ -498,7 +419,6 @@ impl EffectStreamFingerprint {
 
     #[inline]
     const fn write_pair(&mut self, first_word: u64, second_word: u64) {
-        // Both lanes consume both words; independent lanes let the multiplies issue together.
         self.first =
             (self.first ^ first_word ^ second_word.rotate_left(23)).wrapping_mul(Self::FIRST_MUL);
         self.second = (self.second ^ second_word ^ first_word.rotate_right(17))
@@ -523,7 +443,6 @@ const fn hash_glow_quad(quad: &GlowQuad, hasher: &mut EffectStreamFingerprint) {
         len,
     } = quad.damage_words();
     hasher.write_pair(first, second);
-    // A gradient's right edge rides a third word; a flat quad writes only the pair.
     if len == 3 {
         hasher.write_pair(third, 0);
     }
@@ -543,11 +462,7 @@ const fn hash_fire_patch(patch: &FirePatch, hasher: &mut EffectStreamFingerprint
     hasher.write_pair(third, fourth);
 }
 
-/// One textured sprite quad for an animated overlay: an atlas rectangle composited source-over
-/// (straight alpha), the blend the inline-image and colour-emoji paths use. The dest rect is
-/// grid-interior (the renderer offsets by `pad`), clamped to the grid, and lies within one
-/// cell-row band (`row`): a sprite spanning rows is emitted as per-row slices. Atlas
-/// coordinates are integer texels, so the type stays `Copy + Eq` for byte-exact damage compare.
+/// One textured sprite quad for an animated overlay.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct SpriteQuad {
     /// The viewport row band this quad lives in (its sole row, for the dirty gate).
@@ -576,16 +491,12 @@ pub struct SpriteQuad {
     pub flip_x: bool,
 }
 
-/// One free-floating decorative sprite: a pixel rectangle anywhere, even off-grid, with no row
-/// tag; its full `[y, y+h)` extent drives dirty tracking, so it may span rows. The origin is
-/// grid-interior and signed (a cat peeking in from outside the grid).
+/// One free-floating decorative sprite: a pixel rectangle anywhere, even off-grid, with no row tag.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct FreeSprite {
-    /// Grid-interior pixel X of the dest rect (pad-relative; may be negative
-    /// for an off-grid peek).
+    /// Grid-interior pixel X of the dest rect (pad-relative; may be negative for an off-grid peek).
     pub x: i32,
-    /// Grid-interior pixel Y of the dest rect (pad-relative; may be negative or past the
-    /// bottom edge).
+    /// Grid-interior pixel Y of the dest rect (pad-relative; may be negative or past the bottom edge).
     pub y: i32,
     /// Dest width in pixels (zero is a no-op, rejected in the stamp).
     pub w: u16,
@@ -611,8 +522,7 @@ pub struct FreeSprite {
     pub sampler: FreeSampler,
 }
 
-/// Where a [`FreeSprite`] sits relative to the terminal text (painter's order, not a depth
-/// test); part of the damage compare.
+/// Where a [`FreeSprite`] sits relative to the terminal text (painter's order, not a depth test); part of the damage compare.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum FreeZ {
     /// Drawn after the cell backgrounds / under-text sprites, before glyphs.
@@ -622,8 +532,7 @@ pub enum FreeZ {
     OverText,
 }
 
-/// How a [`FreeSprite`] samples its atlas. Renderers implement `Nearest` only (the host bakes
-/// at 1:1); `Linear` is carried in the type and the damage compare but not rendered.
+/// How a [`FreeSprite`] samples its atlas.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum FreeSampler {
     /// Nearest 1:1 (cats).
@@ -633,8 +542,7 @@ pub enum FreeSampler {
     Linear,
 }
 
-/// An RGBA8 sprite atlas (straight alpha, row-major, `width*height*4`), shared by `Arc`; the
-/// GPU re-uploads only when `version` changes.
+/// An RGBA8 sprite atlas (straight alpha, row-major, `width*height*4`), shared by `Arc`.
 #[derive(Debug)]
 pub struct SceneAtlas {
     /// Atlas width in texels.
@@ -647,8 +555,7 @@ pub struct SceneAtlas {
     pub version: u64,
 }
 
-/// Which small procedural sprite a [`WordDecoration`] paints, rasterized by the renderer
-/// (`deco_coverage`) into a coverage mask so CPU and GPU land the same pixels.
+/// Which small procedural sprite a [`WordDecoration`] paints, rasterized by the renderer (`deco_coverage`) into a coverage mask so CPU and GPU land the same pixels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DecoGlyph {
     /// A 4-pointed sparkle star (the default profanity spark).
@@ -663,10 +570,8 @@ pub enum DecoGlyph {
     /// A cat's paw print (the feline mark).
     Paw,
     /// A soft annulus-arc ring segment filling the cell: the singularity nova's darkening ring
-    /// (additive light cannot darken), one `DecoBlend::Over` stamp per covered cell.
     RingArc,
     /// A full-cell soft-edged square (~1 px ramp): the super nova's dark veil on light
-    /// backgrounds, one `DecoBlend::Over` stamp per covered cell.
     Shade,
 }
 
@@ -674,17 +579,13 @@ pub enum DecoGlyph {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DecoBlend {
     /// Premultiplied saturating add (`dst + src`) — the profanity sparkle, which
-    /// only ever brightens, exactly like [`GlowQuad`].
     #[default]
     Add,
     /// Source-over alpha blend (`dst*(1-a) + src*a`): the feline cat-paw, a
-    /// solid stamp tinted by `color` at `alpha`.
     Over,
 }
 
-/// One sparkle-word decoration: a small sprite stamped over or near a cell of a matched word,
-/// at the cursor's viewport coordinates plus the sub-cell `(dx, dy)`. Render-only: never
-/// touches grid cells, copied text or recordings.
+/// One sparkle-word decoration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WordDecoration {
     /// Viewport row (0-indexed from the top of the visible area).
@@ -705,11 +606,7 @@ pub struct WordDecoration {
     pub alpha: u8,
 }
 
-/// One animated-ink foreground override: `color` is the host-resolved final colour,
-/// substituted wherever [`RenderCell::fg`] would tint ink (glyph, combining marks, line
-/// decorations); SGR 58 still wins and colour emoji ignore it. [`RenderInput::ink`] is sorted
-/// by `(row, col)` with unique cells (renderers walk it in lockstep); a wide glyph is governed
-/// by its lead cell.
+/// One animated-ink foreground override.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InkCell {
     /// Viewport row (0-indexed from the top of the visible area).
@@ -720,10 +617,7 @@ pub struct InkCell {
     pub color: [u8; 3],
 }
 
-/// One per-cell glyph foreground override (fire's dark glyph cores: engulfed cells recoloured
-/// toward ember-black). Substituted exactly where an [`InkCell`] would be, before the
-/// contrast and selection floors; ink wins on a cell with both. [`RenderInput::char_fg`]
-/// keeps [`InkCell`]'s invariants.
+/// One per-cell glyph foreground override (fire's dark glyph cores: engulfed cells recoloured toward ember-black).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CharFg {
     /// Viewport row (0-indexed from the top of the visible area).
@@ -734,10 +628,7 @@ pub struct CharFg {
     pub fg: u32,
 }
 
-/// One contrast-halo cell (fire text legibility): the engulfment weight driving the alpha of
-/// the dark ring stamped under the glyph's ink so the letterform separates from the fire. The
-/// ink is never recoloured. [`RenderInput::fire_halo`] keeps [`InkCell`]'s invariants;
-/// colour-emoji cells are never haloed.
+/// One contrast-halo cell (fire text legibility).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FireHaloCell {
     /// Viewport row (0-indexed from the top of the visible area).
@@ -748,17 +639,13 @@ pub struct FireHaloCell {
     pub strength: u8,
 }
 
-/// Sentinel for an unresolved live frame color: the renderer uses its theme. Real colors are
-/// `0x00RRGGBB`, so a set high byte is unambiguous.
+/// Sentinel for an unresolved live frame color: the renderer uses its theme.
 pub const COLOR_UNSET: u32 = 0xFF00_0000;
 
-/// Sentinel for an explicitly dynamic selected-text foreground (`OSC 21;selection_foreground=`):
-/// automatic contrast, so a renderer must not reintroduce its static configured foreground.
+/// Sentinel for an explicitly dynamic selected-text foreground (`OSC 21;selection_foreground=`).
 pub const COLOR_DYNAMIC: u32 = 0xFE00_0000;
 
-/// One run of columns in a composed split row with its own DEC line size (side-by-side panes
-/// may differ in DECDWL/DECDHL). Columns are composite columns: a glyph at column `c` draws at
-/// `start_col * cell_w + (c - start_col) * run_cell_w`, clipped to the run.
+/// One run of columns in a composed split row with its own DEC line size (side-by-side panes may differ in DECDWL/DECDHL).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LineSizeSpan {
     /// First composite column of the run (inclusive).
@@ -782,39 +669,26 @@ impl LineSizeSpan {
     }
 }
 
-/// A host chrome row drawn at pixel resolution: the message band's meter
-/// (`docs/DESIGN-unified-messages-2026-09-21.md`), for fills that end inside a cell, gradients
-/// and a rail in the row's lowest pixels. Both renderers paint it after the row's cell
-/// backgrounds and before its glyphs: [`Self::ground`] over the full band height except
-/// [`Self::own`] columns, then [`Self::rail`]. The one cell [`Self::split`] names is drawn
-/// twice under complementary clips.
+/// A host chrome row drawn at pixel resolution.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ChromeRaster {
-    /// The frame row (counted from the top of the composed input, like
-    /// [`RenderInput::cells`]).
+    /// The frame row (counted from the top of the composed input, like [`RenderInput::cells`]).
     pub row: u16,
-    /// One `0x00RRGGBB` per frame pixel column, `[0, frame_w)`; empty for no
-    /// ground (the cells' own backgrounds stand).
+    /// One `0x00RRGGBB` per frame pixel column, `[0, frame_w)`; empty for no ground (the cells' own backgrounds stand).
     pub ground: std::sync::Arc<[u32]>,
-    /// One `0x00RRGGBB` per frame pixel column for the rail band ([`ChromeRaster::KEEP`]
-    /// keeps the ground); empty for no rail.
+    /// One `0x00RRGGBB` per frame pixel column for the rail band ([`ChromeRaster::KEEP`] keeps the ground); empty for no rail.
     pub rail: std::sync::Arc<[u32]>,
     /// The rail band's height in device pixels, at the bottom of the row.
     pub rail_h: u16,
-    /// This row's glyphs keep clear of the rail: the renderer lifts them (never past the room
-    /// above the tallest letter) and narrows the rail to what remains
-    /// (`aterm_render::chrome_fit`); [`Self::rail_h`] is then the maximum.
+    /// This row's glyphs keep clear of the rail.
     pub clear_rail: bool,
-    /// Cell columns `[start, end)` that keep their own cell background: the
-    /// ground is not painted there.
+    /// Cell columns `[start, end)` that keep their own cell background: the ground is not painted there.
     pub own: Vec<(u16, u16)>,
     /// The ink split, when the row's fill ends inside a cell.
     pub split: Option<InkSplit>,
     /// Outlined capsules, drawn after the ground and rail and before the glyphs.
     pub rings: Vec<ChromeRing>,
-    /// Cells whose glyph is drawn as a band icon instead of from a font; the cell keeps its
-    /// character (text grid, screen reader, copy read it), ink and ground. Between two blank
-    /// cells the icon draws at capital height and spills into them.
+    /// Cells whose glyph is drawn as a band icon instead of from a font.
     pub icons: Vec<ChromeIcon>,
 }
 
@@ -842,10 +716,7 @@ impl ChromeRaster {
     }
 }
 
-/// One outlined capsule on a [`ChromeRaster`] row over cells `[start, end)`. The renderer
-/// sizes the ring from the cell and the face (`aterm_render::chrome_ring_runs`); its straight
-/// floor is the end cells' single underline in `ring`, which the host sets
-/// (`aterm_render::chrome_ring_floor_cols`), so descender ink-skip carves it like any rule.
+/// One outlined capsule on a [`ChromeRaster`] row over cells `[start, end)` (`aterm_render::chrome_ring_runs`, `aterm_render::chrome_ring_floor_cols`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ChromeRing {
     /// First cell column of the capsule (inclusive).
@@ -856,8 +727,7 @@ pub struct ChromeRing {
     pub ring: u32,
     /// The ground inside the ring (`0x00RRGGBB`), the capsule cells' background.
     pub inner: u32,
-    /// The band's closing seam (`0x00RRGGBB`) on the stack's last row: the ring draws it
-    /// across its two end cells, which carry no underline of their own. `None` elsewhere.
+    /// The band's closing seam (`0x00RRGGBB`) on the stack's last row.
     pub seam: Option<u32>,
 }
 
@@ -870,13 +740,7 @@ pub struct ChromeIcon {
     pub icon: BandIcon,
 }
 
-/// The band's icon set: one drawn icon for every status glyph a message row can carry, so
-/// the glyph cell reads as one family whatever font holds `⚠` or `ℹ`. Each stands in for one
-/// character ([`Self::for_char`]), drawn from the cell's geometry and the face's stroke weight
-/// in the cell's ink. The set also draws the harness switch's three marks (`● ○ ◐`,
-/// [`Self::switch_mark`]), which no message carries: the default macOS face (SF Mono) has
-/// `●` and `○` but no half disc, and the fallback face's `◐` drew at about half their size at
-/// 1×, so the switch draws all three, one family.
+/// The band's icon set: one drawn icon for every status glyph a message row can carry, so the glyph cell reads as one family whatever font holds `⚠` or `ℹ`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum BandIcon {
     /// `ℹ` — an `i` cut out of a disc.
@@ -907,15 +771,28 @@ pub enum BandIcon {
     Remove,
     /// `●` — a disc: the harness switch on.
     Disc,
-    /// `○` — a ring: the harness switch off.
+    /// `○` — a ring: the harness switch off, Autopilot off.
     Ring,
-    /// `◐` — the ring with its left half filled: the harness switch turning on.
+    /// `◐` — the ring with its left half filled: the harness switch turning on, a
     HalfDisc,
+    /// `◌` — the ring drawn as dots: a light whose mode is not known.
+    DottedRing,
+    /// `⊘` — the ring struck through: no harness runs here.
+    SlashedRing,
+    /// `⤓` — an arrow down onto a bar: Autopilot's Land.
+    ToBar,
+    /// `◉` — the ring with a disc at its centre: the effort a fact menu shows.
+    Fisheye,
+    /// `◈` — a diamond, the ring's size, with a small one filled at its centre:
+    /// a fact menu's top-effort key row.
+    InsetDiamond,
+    /// `⌂` — a house, the ring's size: the path a fact menu shows.
+    House,
 }
 
 impl BandIcon {
     /// Every icon, in its index order ([`Self::index`]).
-    pub const ALL: [BandIcon; 16] = [
+    pub const ALL: [BandIcon; 22] = [
         Self::Info,
         Self::Success,
         Self::Warn,
@@ -932,23 +809,33 @@ impl BandIcon {
         Self::Disc,
         Self::Ring,
         Self::HalfDisc,
+        Self::DottedRing,
+        Self::SlashedRing,
+        Self::ToBar,
+        Self::Fisheye,
+        Self::InsetDiamond,
+        Self::House,
     ];
 
-    /// The harness switch's mark drawn for `ch` (`●` on, `○` off, `◐` turning on); `None`
-    /// for any other character. Not a band glyph: [`Self::for_char`] never names one.
+    /// THE GLASS'S DRAWN MARKS.
     #[must_use]
     #[inline]
-    pub const fn switch_mark(ch: char) -> Option<Self> {
+    pub const fn glass_mark(ch: char) -> Option<Self> {
         Some(match ch {
             '\u{25cf}' => Self::Disc,
             '\u{25cb}' => Self::Ring,
             '\u{25d0}' => Self::HalfDisc,
+            '\u{25cc}' => Self::DottedRing,
+            '\u{2298}' => Self::SlashedRing,
+            '\u{2913}' => Self::ToBar,
+            '\u{25c9}' => Self::Fisheye,
+            '\u{25c8}' => Self::InsetDiamond,
+            '\u{2302}' => Self::House,
             _ => return None,
         })
     }
 
-    /// The icon that stands in for `ch`, the band's glyph; `None` for any
-    /// character outside the set (it keeps its font glyph).
+    /// The icon that stands in for `ch`, the band's glyph; `None` for any character outside the set (it keeps its font glyph).
     #[must_use]
     #[inline]
     pub const fn for_char(ch: char) -> Option<Self> {
@@ -991,6 +878,12 @@ impl BandIcon {
             Self::Disc => '\u{25cf}',
             Self::Ring => '\u{25cb}',
             Self::HalfDisc => '\u{25d0}',
+            Self::DottedRing => '\u{25cc}',
+            Self::SlashedRing => '\u{2298}',
+            Self::ToBar => '\u{2913}',
+            Self::Fisheye => '\u{25c9}',
+            Self::InsetDiamond => '\u{25c8}',
+            Self::House => '\u{2302}',
         }
     }
 
@@ -1014,8 +907,7 @@ impl BandIcon {
     }
 }
 
-/// Where a chrome row's fill ends inside a cell ([`ChromeRaster::split`]): that cell's glyph
-/// pixels left of frame pixel `x` wear `ink` (over `bg`), the rest the cell's own colours.
+/// Where a chrome row's fill ends inside a cell ([`ChromeRaster::split`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct InkSplit {
     /// The cell column the split falls in.
@@ -1028,10 +920,7 @@ pub struct InkSplit {
     pub bg: u32,
 }
 
-/// One pane-local live default-background interval inside a composed [`RenderInput`] row:
-/// panes of a split can resolve different defaults (OSC 11/111, DECSCNM). Producers keep a
-/// row's spans sorted by `start_col`, non-overlapping and clipped to [`RenderInput::cols`];
-/// [`RenderInput::default_bg_at`] still validates containment.
+/// One pane-local live default-background interval inside a composed [`RenderInput`] row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DefaultBgSpan {
     /// First physical composite column owned by this pane.
@@ -1055,8 +944,7 @@ impl DefaultBgSpan {
     }
 }
 
-/// Half-open frame-space bounds for a composed text selection, so a projected pane's
-/// multi-row selection cannot span dividers and sibling panes.
+/// Half-open frame-space bounds for a composed text selection, so a projected pane's multi-row selection cannot span dividers and sibling panes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct SelectionClip {
     /// First included frame row.
@@ -1097,32 +985,22 @@ impl SelectionClip {
     }
 }
 
-/// One pane's selection, relocated into frame coordinates, with its own box and live
-/// colours. [`RenderInput::selections`] carries one per pane of a composed split frame; an
-/// empty list means the scalar path.
+/// One pane's selection, relocated into frame coordinates, with its own box and live colours.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PaneSelection {
-    /// The pane's selection with its anchors already moved into frame rows and
-    /// columns (pane origin + that pane's `display_offset`).
+    /// The pane's selection with its anchors already moved into frame rows and columns (pane origin + that pane's `display_offset`).
     pub selection: TextSelection,
-    /// The pane's half-open frame-space box; always present, since an unbounded pane
-    /// selection would tint its siblings.
+    /// The pane's half-open frame-space box; always present, since an unbounded pane selection would tint its siblings.
     pub clip: SelectionClip,
-    /// The pane's live selection background (`0x00RRGGBB`), or [`COLOR_UNSET`] for the
-    /// renderer's theme; per entry so an OSC 17 in one pane cannot recolour a sibling.
+    /// The pane's live selection background (`0x00RRGGBB`), or [`COLOR_UNSET`] for the renderer's theme.
     pub bg: u32,
-    /// The pane's live selected-text foreground, or [`COLOR_UNSET`] /
-    /// [`COLOR_DYNAMIC`]; same encoding as [`RenderInput::selection_fg`].
+    /// The pane's live selected-text foreground, or [`COLOR_UNSET`] / [`COLOR_DYNAMIC`]; same encoding as [`RenderInput::selection_fg`].
     pub fg: u32,
-    /// Whether this pane is unfocused, so its band takes the renderer's inactive selection
-    /// colour.
+    /// Whether this pane is unfocused, so its band takes the renderer's inactive selection colour.
     pub inactive: bool,
 }
 
-/// The per-row, per-entry selection key the row-damage diff
-/// (`aterm_render::compute_dirty_rows`) compares. Lossless, unlike the hull
-/// [`RenderInput::selection_row_span`], which dragging one of two panes' edges inward can
-/// leave unchanged.
+/// The per-row, per-entry selection key the row-damage diff (`aterm_render::compute_dirty_rows`) compares.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SelectionRowKey {
     /// First selected column on this frame row (inclusive, post-clip).
@@ -1131,16 +1009,13 @@ pub struct SelectionRowKey {
     pub hi: u16,
     /// The entry's live selection background (or [`COLOR_UNSET`]).
     pub bg: u32,
-    /// The entry's live selected-text foreground (or [`COLOR_UNSET`] /
-    /// [`COLOR_DYNAMIC`]).
+    /// The entry's live selected-text foreground (or [`COLOR_UNSET`] / [`COLOR_DYNAMIC`]).
     pub fg: u32,
     /// The entry's inactive flag (a different band colour).
     pub inactive: bool,
 }
 
 /// The inclusive selected column span one selection puts on one frame row, shared by the
-/// scalar path and every [`PaneSelection`] so a highlight and its damage band agree.
-/// `display_offset` is the viewport projection (zero for already-relocated entries).
 fn selection_row_span_of(
     selection: &TextSelection,
     clip: Option<SelectionClip>,
@@ -1210,14 +1085,7 @@ fn selection_row_span_of(
     (lo <= hi).then_some((lo, hi))
 }
 
-/// Everything a renderer reads for one frame, as plain owned data, emitted by
-/// [`crate::terminal::Terminal::cell_frame_into`]. The frontend holds the `Terminal` lock
-/// only to extract this, so the PTY reader is not starved while a frame renders.
-///
-/// `PartialEq`/`Eq` compare rendered content only: the CPU damage cache compares each frame
-/// against the cached one, and per-frame metadata ([`snapshot_seq`](RenderInput::snapshot_seq),
-/// the continuity tokens, present-time fields) would defeat it. Host-owned effect channels are
-/// usually empty.
+/// Everything a renderer reads for one frame, as plain owned data, emitted by [`crate::terminal::Terminal::cell_frame_into`].
 #[derive(Debug)]
 pub struct RenderInput {
     /// Number of visible rows this frame was extracted for.
@@ -1234,29 +1102,19 @@ pub struct RenderInput {
     pub cursor_visible: bool,
     /// The terminal's own DECSCUSR style; the renderer applies the unfocused override.
     pub cursor_style: CursorStyle,
-    /// Host/effect cursor shape for this frame, kept apart from
-    /// [`cursor_style`](Self::cursor_style) so an effect never overwrites DECSCUSR. Resolution:
-    /// backend override (the unfocused HollowBlock) > this > DECSCUSR.
+    /// Host/effect cursor shape for this frame, kept apart from [`cursor_style`](Self::cursor_style) so an effect never overwrites DECSCUSR.
     pub cursor_effect_style_override: Option<CursorStyle>,
-    /// The cursor motion trail ([`TrailCell`]), filled and decayed by the host's clock;
-    /// `cell_frame_into` leaves it untouched.
+    /// The cursor motion trail ([`TrailCell`]), filled and decayed by the host's clock; `cell_frame_into` leaves it untouched.
     pub cursor_trail: Vec<TrailCell>,
     /// The host-resolved trail colour (`0x00RRGGBB`) blended over each trail cell.
     pub cursor_trail_color: u32,
-    /// The cursor aurora's light quads (comet, bloom crown, landing ring, sparks), under the
-    /// crisp cursor; window-absolute ([`GlowQuad`] invariants).
+    /// The cursor aurora's light quads (comet, bloom crown, landing ring, sparks), under the crisp cursor.
     pub cursor_glow_add: Vec<GlowQuad>,
-    /// Radial cursor-effect light (fire embers, crown) with the [`RainHalo`] integer falloff,
-    /// drawn after the aurora and before the nova and rain streams. Window-absolute, one row
-    /// band per quad (a multi-row halo is per-row quads sharing a centre).
+    /// Radial cursor-effect light (fire embers, crown) with the [`RainHalo`] integer falloff, drawn after the aurora and before the nova and rain streams.
     pub glow_halo: Vec<RainHalo>,
-    /// Under-glyph additive light (the fire body glyphs sit inside as silhouettes): drawn after
-    /// the cell background and under-text sprites, before glyph ink. Pairs with
-    /// [`char_fg`](RenderInput::char_fg); window-absolute, one row band per quad.
+    /// Under-glyph additive light (the fire body glyphs sit inside as silhouettes).
     pub glow_under: Vec<GlowQuad>,
-    /// Per-pixel procedural fire-field patches, drawn at the
-    /// [`glow_under`](RenderInput::glow_under) slot so engulfed glyphs read as silhouettes;
-    /// [`FireMode::Add`] patches before [`FireMode::Over`]. Window-absolute, one row band each.
+    /// Per-pixel procedural fire-field patches, drawn at the [`glow_under`](RenderInput::glow_under) slot so engulfed glyphs read as silhouettes.
     pub fire_patch: Vec<FirePatch>,
     /// Producer-built compact damage metadata for [`cursor_glow_add`](Self::cursor_glow_add).
     pub cursor_glow_add_damage: EffectStreamDamage,
@@ -1266,279 +1124,123 @@ pub struct RenderInput {
     pub glow_under_damage: EffectStreamDamage,
     /// Producer-built compact damage metadata for [`fire_patch`](Self::fire_patch).
     pub fire_patch_damage: EffectStreamDamage,
-    /// Host-resolved cursor fill override (`0x00RRGGBB`), or `None` for the
-    /// theme/OSC-12 colour. Applies to every cursor shape (block, hollow, bar,
-    /// underline, Bolt). The host holds an effect-owned fill to its own page
-    /// floor before it lands here (aterm-effects `cursor_fx::floor_block_fill`);
-    /// the renderer then applies `floor_cursor_fill`, which is the user's
-    /// minimum-contrast knob (off by default: the fill is used as given), to the
-    /// fill and the block cut-out alike. Host-owned (rainbow, forge, phaser,
-    /// lightning, comet, droplet, light rod, momentum).
+    /// Host-resolved cursor fill override (`0x00RRGGBB`), or `None` for the theme/OSC-12 colour.
     pub cursor_fill_override: Option<u32>,
     /// Sparkle-word decorations: small sprites over cells of matched words.
     pub word_decorations: Vec<WordDecoration>,
-    /// Animated-ink per-cell fg overrides: final colours sorted by `(row, col)`, unique cells,
-    /// substituted for `fg` at every fg consult (SGR 58 still wins) before the contrast and
-    /// selection floors.
+    /// Animated-ink per-cell fg overrides.
     pub ink: Vec<InkCell>,
-    /// Per-cell final glyph fg overrides (fire's dark glyph cores), substituted at the same
-    /// seam as [`ink`](RenderInput::ink), which wins on a cell with both. Sorted by
-    /// `(row, col)`, unique cells.
+    /// Per-cell final glyph fg overrides (fire's dark glyph cores), substituted at the same seam as [`ink`](RenderInput::ink), which wins on a cell with both.
     pub char_fg: Vec<CharFg>,
-    /// Per-cell contrast-halo strengths (fire legibility): the engulfment weight of the dark
-    /// ring under a glyph's ink. Colour-free, sorted by `(row, col)`, unique cells.
+    /// Per-cell contrast-halo strengths (fire legibility): the engulfment weight of the dark ring under a glyph's ink.
     pub fire_halo: Vec<FireHaloCell>,
-    /// Peeking-cat sprites drawn under the glyphs and inline images on both backends. Each
-    /// quad lies in one row band ([`SpriteQuad`]; a two-row cat is a head quad in row `r-1`
-    /// plus a chin slice in row `r`), dirtied by its `row` tag alone. aterm's own cursor cat
-    /// uses [`free_sprites`](RenderInput::free_sprites); this channel stays in the public
-    /// contract, held by the GPU parity suites (`cat_parity.rs`).
+    /// Peeking-cat sprites drawn under the glyphs and inline images on both backends.
     pub cat_quads: Vec<SpriteQuad>,
-    /// RGBA8 atlas for [`cat_quads`](RenderInput::cat_quads) (the host's `CatBaker`). The GPU
-    /// re-uploads only when [`SceneAtlas::version`] changes, so a rebake must bump it.
+    /// RGBA8 atlas for [`cat_quads`](RenderInput::cat_quads) (the host's `CatBaker`).
     pub cat_atlas: Option<std::sync::Arc<SceneAtlas>>,
-    /// Free-floating decorative sprites ([`FreeSprite`]): pixel rects with no row tag; dirty
-    /// tracking unions each sprite's `[y, y+h)` extent.
+    /// Free-floating decorative sprites ([`FreeSprite`]): pixel rects with no row tag.
     pub free_sprites: Vec<FreeSprite>,
-    /// RGBA8 atlas for [`free_sprites`](RenderInput::free_sprites), versioned like
-    /// [`cat_atlas`](RenderInput::cat_atlas).
+    /// RGBA8 atlas for [`free_sprites`](RenderInput::free_sprites), versioned like [`cat_atlas`](RenderInput::cat_atlas).
     pub free_atlas: Option<std::sync::Arc<SceneAtlas>>,
-    /// Supernova additive light (crown, shockwave ring, rays), like
-    /// [`cursor_glow_add`](RenderInput::cursor_glow_add) but grid-interior; one row band per
-    /// quad. Drawn after the aurora, under the word decorations and the cursor.
+    /// Supernova additive light (crown, shockwave ring, rays), like [`cursor_glow_add`](RenderInput::cursor_glow_add) but grid-interior.
     pub nova_add: Vec<GlowQuad>,
-    /// Matrix-rain glyph sprites drawn under text, before
-    /// [`cat_quads`](RenderInput::cat_quads) (cats walk on rain). Each quad lies in one row
-    /// band (row-only dirty marking would ghost a violator).
+    /// Matrix-rain glyph sprites drawn under text, before [`cat_quads`](RenderInput::cat_quads) (cats walk on rain).
     pub rain_quads: Vec<SpriteQuad>,
-    /// RGBA8 white-coverage atlas for [`rain_quads`](RenderInput::rain_quads) (the
-    /// `RainBaker`'s); versioned like [`cat_atlas`](RenderInput::cat_atlas).
+    /// RGBA8 white-coverage atlas for [`rain_quads`](RenderInput::rain_quads) (the `RainBaker`'s).
     pub rain_atlas: Option<std::sync::Arc<SceneAtlas>>,
-    /// Rain bright-head additive halos, like [`nova_add`](RenderInput::nova_add):
-    /// grid-interior pixels, one row band per quad.
+    /// Rain bright-head additive halos, like [`nova_add`](RenderInput::nova_add): grid-interior pixels, one row band per quad.
     pub rain_add: Vec<RainHalo>,
-    /// Retained fx layers ([`FxLayer`]): the engine's sprite and bitmap
-    /// primitive, drawn at their [`FxSlot`]s and sliced by the renderer at the
-    /// cell-row bands, so a layer spans rows freely. Compared by identity (the
-    /// content `Arc`, never its bytes), so a settled layer is a pointer
-    /// compare. Host-owned; usually empty.
+    /// Retained fx layers ([`FxLayer`]).
     pub fx_layers: Vec<FxLayer>,
-    /// Host chrome painted over every fx layer, in window pixels (a find bar's
-    /// band, a menu card): the renderer subtracts each from every layer's draw
-    /// rect, so several compose. Rendered content: compared in `PartialEq`.
-    /// Host-owned; usually empty.
+    /// Host chrome painted over every fx layer, in window pixels (a find bar's band, a menu card).
     pub fx_occluders: Vec<PxRect>,
-    /// Arts a GPU renderer should make resident ahead of the frame that draws
-    /// them (the card's arts when a drawer image is published). Draws
-    /// nothing; excluded from `PartialEq` and from damage, and not kept in the
-    /// damage cache. Host-owned; usually empty.
+    /// Arts a GPU renderer should make resident ahead of the frame that draws them (the card's arts when a drawer image is published).
     pub fx_prefetch: Vec<std::sync::Arc<FxArt>>,
     /// Scrollback offset: viewport row `r` shows live row `r - display_offset`.
     pub display_offset: i32,
-    /// Absolute row of the top visible line at extraction (`Grid::base_y()`), under the cells'
-    /// lock: `viewport_row = absolute - base_y + display_offset` (e.g. the find bar's
-    /// highlights).
+    /// Absolute row of the top visible line at extraction (`Grid::base_y()`), under the cells' lock.
     pub base_y: i64,
-    /// Revision of top-anchored protected-footer row insertions at extraction, which one
-    /// `base_y` delta cannot re-anchor: hosts retaining absolute-row overlays reject stale
-    /// geometry with it.
+    /// Revision of top-anchored protected-footer row insertions at extraction, which one `base_y` delta cannot re-anchor.
     pub absolute_row_revision: u64,
-    /// `Grid::history_renumber_epoch()` at extraction: the wholesale counterpart of
-    /// `absolute_row_revision` (a width reflow renumbers every row, a Kitty CSI +T unscroll
-    /// drops the newest scrollback lines). A host re-anchoring absolute-row geometry fails
-    /// closed on both stamps.
+    /// `Grid::history_renumber_epoch()` at extraction.
     pub history_renumber_epoch: u64,
-    /// The holder fence at extraction ([`Terminal::holder_view`]), resolved to
-    /// absolute rows under the same lock as [`base_y`](Self::base_y): which
-    /// main-screen rows the current drawer wrote, and whether the alternate
-    /// screen is wholly its. A card is decorated only inside it. Metadata,
-    /// excluded from `PartialEq` like `base_y`; `HolderView::NONE` (token 0)
-    /// where nothing cuts (wasm, gpu-web, a replay).
-    ///
-    /// [`Terminal::holder_view`]: crate::terminal::Terminal::holder_view
+    /// The holder fence at extraction ([`Terminal::holder_view`]), resolved to absolute rows under the same lock as [`base_y`](Self::base_y).
     pub holder: crate::terminal::HolderView,
-    /// Sub-row scroll translate (display only): the signed fractional-pixel
-    /// residual smooth scrolling banks below one row
-    /// (`scroll_frac_px ∈ (-cell_h, cell_h)`). Positive is the `frac` half of
-    /// [`scroll_motion::decompose`] for a whole-row glide; negative is the
-    /// elastic-overscroll spring at a history end. The renderer shifts the
-    /// terminal-content band by this many device px at present time (up for
-    /// positive, down for negative), leaving glyph rasters untouched. `0` is an
-    /// identity. Present-time only, so excluded from `PartialEq`/`Eq`: a
-    /// frac-only change re-translates from the damage cache without dirtying a
-    /// cell.
+    /// Sub-row scroll translate (display only).
     pub scroll_frac_px: i32,
-    /// The terminal-content row band `[grid_top_row, grid_bot_row)`; chrome outside it is
-    /// pinned while [`scroll_frac_px`](Self::scroll_frac_px) translates the band.
-    /// `grid_bot_row == 0` means no band (no translate).
+    /// The terminal-content row band `[grid_top_row, grid_bot_row)` translated by [`scroll_frac_px`](Self::scroll_frac_px) (`0` = no band).
     pub grid_top_row: usize,
     /// One past the last terminal-content row — see [`grid_top_row`](Self::grid_top_row).
     pub grid_bot_row: usize,
-    /// The row just below the viewport, which a positive
-    /// [`scroll_frac_px`](Self::scroll_frac_px) glide slides in at the bottom. Stamped on
-    /// every fill (the damage-scoped arm included); absent at `display_offset == 0`.
+    /// The row just below the viewport, which a positive [`scroll_frac_px`](Self::scroll_frac_px) glide slides in at the bottom.
     pub apron_row: ApronRow,
-    /// The facts `apron_row` was last extracted under, so an unchanged fill keeps the row
-    /// (`Terminal::apron_row_into`). A writer that changes `apron_row` without an extraction
-    /// (the split compositor's clear) clears this too.
+    /// The facts `apron_row` was last extracted under, so an unchanged fill keeps the row (`Terminal::apron_row_into`).
     pub apron_stamp: Option<ApronStamp>,
-    /// Focused-pane effect clip `(x0, y0, x1, y1)` in window-absolute device pixels (`None`
-    /// outside a split). Present-time GPU post-fx (bloom halo, heat shimmer) intersect with it
-    /// so light never crosses a divider.
+    /// Focused-pane effect clip `(x0, y0, x1, y1)` in window-absolute device pixels (`None` outside a split).
     pub fx_clip: Option<(u16, u16, u16, u16)>,
     /// A clone of the active text selection, for per-cell highlighting.
     pub selection: TextSelection,
-    /// Optional frame-space box confining [`selection`](Self::selection), so a split's
-    /// focused-pane selection cannot tint a divider or sibling.
+    /// Optional frame-space box confining [`selection`](Self::selection), so a split's focused-pane selection cannot tint a divider or sibling.
     pub selection_clip: Option<SelectionClip>,
-    /// The live selection background (`0x00RRGGBB`, OSC 17/21); `COLOR_UNSET` uses the
-    /// renderer's theme. Separate from the selection so a colour-only change invalidates.
+    /// The live selection background (`0x00RRGGBB`, OSC 17/21); `COLOR_UNSET` uses the renderer's theme.
     pub selection_bg: u32,
-    /// The live selected-text foreground (`0x00RRGGBB`, OSC 19/21). [`COLOR_UNSET`] uses the
-    /// renderer's policy; [`COLOR_DYNAMIC`] selects the automatic WCAG contrast floor.
+    /// The live selected-text foreground (`0x00RRGGBB`, OSC 19/21).
     pub selection_fg: u32,
-    /// Every visible pane's selection in frame coordinates, each with its own clip and
-    /// colours. Empty for single-terminal frames, where the scalars above are the authority;
-    /// renderer predicates read the list when it is non-empty.
+    /// Every visible pane's selection in frame coordinates, each with its own clip and colours.
     pub selections: Vec<PaneSelection>,
-    /// Per-row, sparse emoji grapheme-cluster strings:
-    /// `(col, cluster)` for cells whose combining marks form a ZWJ / skin-tone /
-    /// keycap sequence. The renderer shapes each to a colour glyph, or composites
-    /// the several glyphs a colour face leaves it as; cells absent here take the
-    /// ordinary single-codepoint dispatch.
+    /// Per-row, sparse emoji grapheme-cluster strings.
     pub clusters: Vec<Vec<(usize, Box<str>)>>,
-    /// Per-row, sparse combining marks: `(col, marks)`
-    /// for cells with diacritics (é, ñ, …). The renderer overlays each mark's
-    /// glyph on the base so accents render.
+    /// Per-row, sparse combining marks: `(col, marks)` for cells with diacritics (é, ñ, …).
     pub combining: Vec<Vec<(usize, Box<[char]>)>>,
-    /// Per-row BiDi visual→logical column map: `visual_to_logical[r][v] == l` means the cell
-    /// painted at column `v` of row `r` is logical column `l`. An empty or missing row, and
-    /// any column past a row's map, is the identity. The engine fill records each
-    /// `apply_bidi_reorder` permutation; a composed row carries each pane's map at its
-    /// columns, and a host that paints a row over clears it. The selection is a logical range,
-    /// so [`Self::selection_hit`] tests `map[v]`: what is highlighted is what is copied.
+    /// Per-row BiDi visual→logical column map.
     pub visual_to_logical: Vec<Vec<u16>>,
-    /// Per-row DEC line size (DECDWL/DECDHL), drawn scaled. On a row with
-    /// [`line_size_spans`](Self::line_size_spans) it is only a summary (non-single when any
-    /// pane is), for row-level consumers; placement uses
-    /// [`line_size_run_at`](Self::line_size_run_at).
+    /// Per-row DEC line size (DECDWL/DECDHL), drawn scaled.
     pub line_sizes: Vec<LineSize>,
-    /// Per-row DEC line-size runs for composed split rows where panes disagree; non-empty runs
-    /// partition `0..cols` ascending. Empty means [`line_sizes`](Self::line_sizes) governs.
+    /// Per-row DEC line-size runs for composed split rows where panes disagree; non-empty runs partition `0..cols` ascending.
     pub line_size_spans: Vec<Vec<LineSizeSpan>>,
-    /// Pane-local live default-background intervals for composed split rows: one
-    /// [`DefaultBgSpan`] per pane, so opacity, image layering and cursor/trail fallbacks use
-    /// the default of the pane that supplied each cell. An empty row uses
-    /// [`default_bg`](Self::default_bg).
-    ///
-    /// scope-waiver: a default background is a colour, not an enforcement
-    /// budget; no instance count can make it wrong, and per-pane is correct.
+    /// Pane-local live default-background intervals for composed split rows.
     pub default_bg_spans: Vec<Vec<DefaultBgSpan>>,
-    /// Host chrome rows drawn at pixel resolution ([`ChromeRaster`]), at most one per row, in
-    /// any order; a changed raster dirties its row.
+    /// Host chrome rows drawn at pixel resolution ([`ChromeRaster`]), at most one per row, in any order.
     pub chrome_rasters: Vec<ChromeRaster>,
-    /// Per-row, sparse inline-image placements (`term.images_row(r)`): `(col, ImageRef)` for
-    /// every covered cell. The renderer decodes each image once (keyed by its `Arc`) and blits
-    /// the cell's tile.
+    /// Per-row, sparse inline-image placements (`term.images_row(r)`): `(col, ImageRef)` for every covered cell.
     pub images: Vec<Vec<(usize, aterm_grid::ImageRef)>>,
-    /// Wallpaper base layer: a host-prepared RGBA8 image, pre-scaled to the frame (cover-fit)
-    /// and pre-dimmed; the renderer only blits. It shows through the base clear, padding and
-    /// every unselected cell on its pane's live default bg; selected cells and SGR
-    /// backgrounds paint over it (kitty's below-bg-image rule). Compared by `Arc` identity; a
-    /// change forces a full repaint, and it disables the scroll-blit rescue.
+    /// Wallpaper base layer: a host-prepared RGBA8 image, pre-scaled to the frame (cover-fit) and pre-dimmed; the renderer only blits.
     pub wallpaper: Option<std::sync::Arc<SceneAtlas>>,
-    /// The live default background (`0x00RRGGBB`), DECSCNM folded in; the renderer paints the
-    /// padding band and base clear from it, so OSC 11/111 and DECSCNM reach the border.
-    /// `COLOR_UNSET` only for a pristine `Terminal::new` (renderers keep their theme).
+    /// The live default background (`0x00RRGGBB`), DECSCNM folded in.
     pub default_bg: u32,
-    /// The live default foreground (`0x00RRGGBB`), the twin of [`Self::default_bg`] (DECSCNM
-    /// swaps both or neither). The cursor-effect layer anchors its fresh-typed tint on it.
-    /// `COLOR_UNSET` is unknown, never a colour (masked, it reads as black).
+    /// The live default foreground (`0x00RRGGBB`), the twin of [`Self::default_bg`] (DECSCNM swaps both or neither).
     pub default_fg: u32,
-    /// The implicit empty cell resolved under the cells' lock. Always concrete, unlike
-    /// `default_fg` / `default_bg`, so host row overlays get the live ink and ground without a
-    /// second lock.
+    /// The implicit empty cell resolved under the cells' lock.
     pub implicit_blank: RenderCell,
-    /// The live cursor colour (`0x00RRGGBB`): OSC 12 or the configured OSC 112 baseline, or the
-    /// live OSC 10 foreground while OSC 21 `cursor=` is dynamic. `COLOR_UNSET` keeps the
-    /// renderer's theme cursor (a pristine `Terminal::new`).
+    /// The live cursor colour (`0x00RRGGBB`).
     pub cursor_color: u32,
-    /// The engine's damage epoch under the fill's lock
-    /// ([`Terminal::damage_epoch`](crate::terminal::Terminal::damage_epoch)), so a consumer
-    /// detects staleness against a later read.
+    /// The engine's damage epoch under the fill's lock ([`Terminal::damage_epoch`](crate::terminal::Terminal::damage_epoch)), so a consumer detects staleness against a later read.
     pub snapshot_seq: u64,
     /// Content-only arrival clock at the fill; damage-only frames do not advance it.
     pub content_seq: u64,
-    /// Parser batch sequence at the fill. Unlike the damage epoch it advances even when a batch
-    /// joins a pending damage session, so one-shot input evidence can reject intervening
-    /// output.
+    /// Parser batch sequence at the fill.
     pub process_sequence: u32,
-    /// Present-time latency hint: this frame is an immediate keystroke echo, so the GPU path
-    /// defers the bloom halo (a framebuffer copy plus a second `queue.submit`) to the next
-    /// settle frame. Must never dirty a cell; the CPU backend ignores it.
+    /// Present-time latency hint.
     pub input_hot: bool,
-    /// Identity of the engine instance that last filled this snapshot (`0`: never), so a
-    /// scratch reused across terminals (the split compositor's shared `pane_scratch`) never
-    /// serves one pane's retained rows as another's.
+    /// Identity of the engine instance that last filled this snapshot (`0`: never), so a scratch reused across terminals (the split compositor's shared `pane_scratch`) never serves one pane's retained rows as another's.
     pub terminal_id: u64,
-    /// The stamping terminal's extraction generation at fill time (`0`: never filled). A
-    /// damage-scoped refill is sound only while no consumer has taken the damage
-    /// (`Terminal::take_damage`) since.
+    /// The stamping terminal's extraction generation at fill time (`0`: never filled).
     pub extract_gen: u64,
-    /// `snapshot_seq` as stamped by the last engine fill. Host mutators that
-    /// touch content channels afterwards (prediction ghosts, the IME preedit,
-    /// the tab-strip splice) bump `snapshot_seq`, so `snapshot_seq !=
-    /// engine_fill_seq` means a host wrote cells since the engine fill, and the
-    /// damage-scoped refill falls back to a full refill. Metadata, excluded
-    /// from `PartialEq`/`Eq`.
+    /// `snapshot_seq` as stamped by the last engine fill.
     pub engine_fill_seq: u64,
-    /// Whether the stamping terminal's alternate screen was active at fill time: primary and
-    /// alt keep independent damage state, so the scoped refill full-refills on a mismatch.
+    /// Whether the stamping terminal's alternate screen was active at fill time.
     pub engine_alt: bool,
     /// Which column order the last engine fill left this snapshot's rows in.
-    ///
-    /// `apply_bidi_reorder` is an in-place, non-idempotent row permutation, so
-    /// retained rows may be kept only while they are still in logical order.
-    /// [`RowOrder::BidiVisual`] forces the next refill to the full arm; a
-    /// pure-LTR frame keeps the scoped arm. Metadata, excluded from
-    /// `PartialEq`/`Eq`.
     pub engine_row_order: RowOrder,
-    /// Per-row content revision ([`Grid::row_revisions`](crate::grid::Grid::row_revisions)),
-    /// captured under the cells' lock, so a consumer diffing two snapshots
-    /// (`aterm_render::compute_dirty_rows`) answers "did row `r` change?" with a `u64`
-    /// compare. Within one pinned lane ([`row_rev_lane`](Self::row_rev_lane)) a changed row
-    /// always has a different entry; an unchanged row may be re-stamped (over-repaint, never a
-    /// skip). `0` means unknown: compare content (host-built rows carry it).
+    /// Per-row content revision ([`Grid::row_revisions`](crate::grid::Grid::row_revisions)), captured under the cells' lock, so a consumer diffing two snapshots (`aterm_render::compute_dirty_rows`) answers "did row `r` change?" with a `u64` compare.
     pub row_rev: Vec<u64>,
-    /// Identity of the lane [`row_rev`](Self::row_rev) belongs to, or `0` when its stamps must
-    /// not be trusted. Only an engine fill sets it (the terminal's extraction identity);
-    /// stamps compare only when both lanes are non-zero and equal, since distinct terminals
-    /// mint revisions from independent clocks. A consumer must also pin row identity
-    /// (`base_y`, `absolute_row_revision`, `engine_alt`, zero `display_offset`,
-    /// `engine_row_order`) and `snapshot_seq == engine_fill_seq`.
+    /// Identity of the lane [`row_rev`](Self::row_rev) belongs to, or `0` when its stamps must not be trusted.
     pub row_rev_lane: u64,
-    /// How many host rows (the in-grid tab strip's chrome rows) have been prepended since the
-    /// engine fill: engine row `r` lives at index `r + row_shift`. Physical, not a provenance
-    /// claim: it counts rows prepended blessed or not, so an un-splice knows how many to
-    /// remove, and `aterm_render::compute_dirty_rows` compares it across frames.
+    /// How many host rows (the in-grid tab strip's chrome rows) have been prepended since the engine fill.
     pub row_shift: usize,
-    /// `snapshot_seq` as of the last operation that left this snapshot equal to an engine fill
-    /// shifted down by [`row_shift`](Self::row_shift) host rows (the fill itself, or a pure
-    /// row prepend on top of one). A second clock rather than a relaxed `engine_fill_seq`: the
-    /// strip splice writes no engine row, so the engine's revisions still describe index
-    /// `r + row_shift`. Any other host write bumps `snapshot_seq` alone, so both the stamp
-    /// gate and the un-splice fail closed. Only an engine fill and
-    /// [`note_host_row_prepend`](Self::note_host_row_prepend) advance it; `0` is the
-    /// never-blessed sentinel (`empty()`, every composed frame, a prepend over mutated cells).
+    /// `snapshot_seq` as of the last operation that left this snapshot equal to an engine fill shifted down by [`row_shift`](Self::row_shift) host rows (the fill itself, or a pure row prepend on top of one).
     pub shifted_fill_seq: u64,
-    /// `snapshot_seq` as of the last composed frame a host committed here: the split
-    /// compositor's row-retention token, the twin of
-    /// [`shifted_fill_seq`](Self::shifted_fill_seq) one level up. Retaining a composite's
-    /// unchanged cells is sound only while nothing touched them since the last compose; a host
-    /// write bumps `snapshot_seq` alone, so retention fails closed. An engine fill and every
-    /// row rebuild ([`invalidate_row_revisions`](Self::invalidate_row_revisions)) reset it to
-    /// `0`, the never-blessed sentinel; only [`bless_composed_fill`](Self::bless_composed_fill)
-    /// sets anything else.
+    /// `snapshot_seq` as of the last composed frame a host committed here.
     pub composed_fill_seq: u64,
 }
 
@@ -1546,78 +1248,50 @@ pub struct RenderInput {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum RowOrder {
     /// No row was permuted: logical order and visual order coincide, for every
-    /// row and every column-indexed channel (cells, clusters, combining marks,
-    /// images, and the cursor column). This is every frame of a pure-LTR
-    /// session.
     #[default]
     Logical,
     /// A row was permuted into BiDi visual order. The permutation is not idempotent, so these
-    /// rows may not be retained by a damage-scoped refill.
     BidiVisual,
 }
 
-/// The first continuity clause, in the check's short-circuit order, that refused the
-/// damage-scoped arm (`FrameRefill::Full`), so a Full-dominated steady state is diagnosable.
-///
-/// `#[repr(usize)]` keeps `FrameRefill` in rustc's ScalarPair ABI (`Scoped` carries a
-/// `usize`), so `cell_frame_damage_scoped_into` returns in two registers on the keystroke path.
+/// The first continuity clause, in the check's short-circuit order, that refused the damage-scoped arm (`FrameRefill::Full`), so a Full-dominated steady state is diagnosable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[repr(usize)]
 pub enum FullRefillCause {
     /// The last engine fill permuted a row into BiDi visual order; retained rows would be
-    /// double-permuted.
     BidiVisual,
     /// The scratch was never engine-filled (`terminal_id == 0`): every window's first frame.
     ScratchUnstamped,
     /// The scratch was last engine-filled by a different terminal (the split
-    /// compositor's shared pane scratch hands off between panes).
     TerminalMismatch,
     /// Another consumer called `take_damage` since the scratch's fill
-    /// (`extract_gen` moved), so the tracker's bits no longer describe every
-    /// row that changed under this scratch.
     DamageTaken,
     /// A host mutator wrote content channels after the engine fill and bumped
-    /// `snapshot_seq` (prediction ghosts, IME preedit, find bar, strip splice).
     HostMutation,
     /// A host row prepend is still in force (`row_shift != 0`): `undo_host_row_prepend` did
-    /// not run.
     RowShift,
     /// The alternate-screen bit differs between the scratch and the engine.
     AltScreen,
     /// The scratch's own `rows`/`cols` disagree with the requested frame size —
-    /// a resize the scratch has not been refilled at yet.
     ScratchRows,
     /// The scratch's row count (`cells.len()`) disagrees with the requested
-    /// rows while its `rows` field agrees: a host prepend that grew the
-    /// container without stamping a shift.
     ScratchRowCount,
     /// The requested frame size disagrees with the engine's own grid (a resize
-    /// in flight).
     EngineDims,
     /// The viewport is scrolled back and the scrolled continuity proof
-    /// (`Terminal::scrolled_scoped_refill_delta`) did not hold: the scratch entered history
-    /// from the live bottom, content or row identity moved under the parked viewport, the
-    /// tracker holds whole-grid damage, or the net move exposes the whole viewport (which is
-    /// also where output under a viewport parked deeper than one screen lands).
     EngineScrolled,
     /// The engine is at offset 0 but the scratch was filled while scrolled
-    /// back (the frame that returns to the bottom), so its retained rows use a
-    /// different viewport mapping.
     ScratchScrolled,
     /// `base_y` moved: the live grid scrolled, so retained rows shifted out from under their
-    /// indices. A scrolling workload reports this on nearly every frame.
     BaseY,
     /// The absolute row revision moved without `base_y` moving: a protected
-    /// footer insertion or another row-identity change.
     RowRevision,
     /// The tracker holds `Damage::Full` (a palette recolor, DECSCNM, a reflow,
-    /// or another whole-grid invalidation). Nothing is retainable.
     FullDamage,
 }
 
 impl FullRefillCause {
-    /// Every cause, in discriminant order; the tallies and the metrics wire format are built
-    /// from it.
+    /// Every cause, in discriminant order; the tallies and the metrics wire format are built from it.
     pub const ALL: [Self; Self::COUNT] = [
         Self::BidiVisual,
         Self::ScratchUnstamped,
@@ -1670,8 +1344,7 @@ impl FullRefillCause {
     }
 }
 
-/// How [`Terminal::cell_frame_damage_scoped_into`](crate::terminal::Terminal::cell_frame_damage_scoped_into)
-/// refilled a scratch, so callers and tests can assert a workload reaches the scoped arm.
+/// How [`Terminal::cell_frame_damage_scoped_into`](crate::terminal::Terminal::cell_frame_damage_scoped_into) refilled a scratch, so callers and tests can assert a workload reaches the scoped arm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FrameRefill {
     /// The whole viewport was re-extracted (continuity break, full damage, first fill).
@@ -1680,10 +1353,8 @@ pub enum FrameRefill {
         cause: FullRefillCause,
     },
     /// Only the damage tracker's rows were re-extracted; the rest are byte-identical by the
-    /// continuity invariant.
     Scoped {
         /// Viewport rows re-resolved (the tracker's damaged rows, clamped). 0 is legal: a
-        /// cursor-only move still restamps the cursor and selection scalars.
         rows_refilled: usize,
     },
 }
@@ -1705,10 +1376,6 @@ impl Clone for RenderInput {
 }
 
 /// Content equality for the per-row image placements: the derived `ImageRef` equality minus
-/// `ImageRef::kitty` (a tag that draws no pixel). A re-transmitting client allocates a fresh
-/// `Arc` per transmit, so the deep payload compare is memoized per `Arc` pair for this call
-/// (as `aterm-render`'s `ImageEqMemo` does). The raw-pointer key is sound only because the
-/// borrowed inputs keep every `Arc` alive for the call: never persist the map.
 fn images_eq(
     a: &[Vec<(usize, aterm_grid::ImageRef)>],
     b: &[Vec<(usize, aterm_grid::ImageRef)>],
@@ -1743,10 +1410,6 @@ fn images_eq(
         })
 }
 
-// Rendered-content equality: the CPU damage cache compares each snapshot against the previous
-// frame's, so per-frame metadata is excluded (listed at the end). Atlases compare by identity
-// (`Arc::as_ptr`), never `version`: a rebuilt engine replays its predecessor's versions with
-// different texels, and every rebake publishes a fresh `Arc`.
 impl PartialEq for RenderInput {
     fn eq(&self, other: &Self) -> bool {
         self.rows == other.rows
@@ -1779,8 +1442,6 @@ impl PartialEq for RenderInput {
             && self.rain_atlas.as_ref().map(std::sync::Arc::as_ptr)
                 == other.rain_atlas.as_ref().map(std::sync::Arc::as_ptr)
             && self.rain_add == other.rain_add
-            // Fx layers by identity (`FxLayer`'s `PartialEq`: the content
-            // `Arc` is pointer-compared, like every atlas above).
             && self.fx_layers == other.fx_layers
             && self.fx_occluders == other.fx_occluders
             && self.display_offset == other.display_offset
@@ -1803,24 +1464,12 @@ impl PartialEq for RenderInput {
             && self.default_fg == other.default_fg
             && self.implicit_blank == other.implicit_blank
             && self.cursor_color == other.cursor_color
-        // Not compared (metadata or present-time only, so a change must not
-        // force a raster repaint):
-        // - `snapshot_seq`, `base_y`, `absolute_row_revision`,
-        //   `history_renumber_epoch`, `holder`: host re-anchor metadata.
-        // - `scroll_frac_px`, `grid_top_row`, `grid_bot_row`, `apron_row`,
-        //   `input_hot`: consumed at present time, outside the damage cache.
-        // - `terminal_id`, `extract_gen`, `engine_fill_seq`, `engine_alt`,
-        //   `engine_row_order`, `row_rev`, `row_rev_lane`, `shifted_fill_seq`,
-        //   `composed_fill_seq`: continuity tokens that advance on every
-        //   damaged frame and would defeat the dirty gate they feed.
-        // - `fx_prefetch`: residency hints that draw nothing.
     }
 }
 
 impl Eq for RenderInput {}
 
 /// [`RenderInput::visual_to_logical`] equality by meaning: a missing row and an empty one are
-/// both the identity.
 #[inline]
 fn visual_to_logical_eq(a: &[Vec<u16>], b: &[Vec<u16>]) -> bool {
     fn row(rows: &[Vec<u16>], r: usize) -> &[u16] {
@@ -1829,10 +1478,7 @@ fn visual_to_logical_eq(a: &[Vec<u16>], b: &[Vec<u16>]) -> bool {
     (0..a.len().max(b.len())).all(|r| row(a, r) == row(b, r))
 }
 
-/// What [`RenderInput::apron_row`] was last extracted under: a fill that finds every term
-/// unchanged keeps the row. The row holds resolved colours, so presentation inputs that move
-/// no `content_gen` are part of its identity, and so is the terminal (tabs of one window share
-/// a scratch while per-grid counters collide).
+/// What [`RenderInput::apron_row`] was last extracted under: a fill that finds every term unchanged keeps the row.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ApronStamp {
     /// `display_offset` at extraction.
@@ -1845,23 +1491,18 @@ pub struct ApronStamp {
     pub rows: usize,
     /// Frame shape.
     pub cols: usize,
-    /// A fingerprint of every presentation input the row is resolved against
-    /// that moves no `content_gen` (`Terminal::presentation_fingerprint`).
+    /// A fingerprint of every presentation input the row is resolved against that moves no `content_gen` (`Terminal::presentation_fingerprint`).
     pub presentation: u64,
     /// The extracting terminal's identity nonce (`RenderInput::terminal_id`).
     pub terminal: u64,
 }
 
-/// The incoming-row apron: the one row just below the viewport, which the sub-row translate
-/// reveals ([`RenderInput::apron_row`]). A struct rather than an `Option` so the per-frame
-/// refill keeps its Vec capacity.
+/// The incoming-row apron: the one row just below the viewport, which the sub-row translate reveals ([`RenderInput::apron_row`]).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ApronRow {
-    /// `true` when a row lies below the viewport (`display_offset > 0`); the
-    /// remaining fields are meaningful only then.
+    /// `true` when a row lies below the viewport (`display_offset > 0`); the remaining fields are meaningful only then.
     pub present: bool,
-    /// The row's resolved cells, exactly as a viewport row's
-    /// [`RenderInput::cells`] entry.
+    /// The row's resolved cells, exactly as a viewport row's [`RenderInput::cells`] entry.
     pub cells: Vec<RenderCell>,
     /// Its sparse emoji clusters — one [`RenderInput::clusters`] row.
     pub clusters: Vec<(usize, Box<str>)>,
@@ -1869,8 +1510,7 @@ pub struct ApronRow {
     pub combining: Vec<(usize, Box<[char]>)>,
     /// Its DEC line size (`SingleWidth` for a history row).
     pub line_size: LineSize,
-    /// The cursor column when the cursor's projected row is exactly this row,
-    /// else `None`, so the caret rides in with its row.
+    /// The cursor column when the cursor's projected row is exactly this row, else `None`, so the caret rides in with its row.
     pub cursor_col: Option<usize>,
 }
 
@@ -1913,32 +1553,24 @@ impl Default for RenderInput {
     }
 }
 
-/// Where the producers placed the window-space effect streams (`cursor_glow_add`,
-/// `glow_under`, `fire_patch`, `glow_halo`, `fx_clip`) relative to a host row prepend.
+/// Where the producers placed the window-space effect streams (`cursor_glow_add`, `glow_under`, `fire_patch`, `glow_halo`, `fx_clip`) relative to a host row prepend.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HostRowPixels {
     /// Already placed below the prepended rows (the native window, whose
-    /// `effects_origin_win` counts them): pixels stay put; only the row tags are re-derived.
     Placed,
     /// Placed without the prepended rows (the web module, whose effects pipeline has one
-    /// chrome origin): every pixel `y` moves down by `rows · cell_h` first, then the tags are
-    /// re-derived as under [`Self::Placed`].
     Translate,
 }
 
 impl RenderInput {
-    /// The pixel-resolution chrome raster of frame row `r`, if the host drew
-    /// one ([`ChromeRaster`]).
+    /// The pixel-resolution chrome raster of frame row `r`, if the host drew one ([`ChromeRaster`]).
     #[must_use]
     #[inline]
     pub fn chrome_raster(&self, r: usize) -> Option<&ChromeRaster> {
         self.chrome_rasters.iter().find(|m| usize::from(m.row) == r)
     }
 
-    /// Update a damage-cache snapshot, dropping the four large cursor-effect payloads whose
-    /// producer supplied compact metadata. A cached frame is never drawn again, only read by
-    /// the dirty-row decision, so the metadata is a complete prior; input without metadata is
-    /// cloned in full.
+    /// Update a damage-cache snapshot, dropping the four large cursor-effect payloads whose producer supplied compact metadata.
     #[inline]
     pub fn clone_damage_cache_from(&mut self, source: &Self) {
         self.copy_from(source, false);
@@ -1984,11 +1616,8 @@ impl RenderInput {
         self.rain_quads.clone_from(&source.rain_quads);
         self.rain_atlas.clone_from(&source.rain_atlas);
         self.rain_add.clone_from(&source.rain_add);
-        // The layers clone their `Arc`s: the cache holds strong references,
-        // so the identity it compares against can never be reused (no ABA).
         self.fx_layers.clone_from(&source.fx_layers);
         self.fx_occluders.clone_from(&source.fx_occluders);
-        // Prefetch draws nothing, so the damage cache does not keep it.
         if retain_effect_payloads {
             self.fx_prefetch.clone_from(&source.fx_prefetch);
         } else {
@@ -2039,8 +1668,7 @@ impl RenderInput {
         self.composed_fill_seq = source.composed_fill_seq;
     }
 
-    /// Rebuild the four compact cursor-effect damage records, after all frontend composition
-    /// (splices, clipping, chrome suppression).
+    /// Rebuild the four compact cursor-effect damage records, after all frontend composition (splices, clipping, chrome suppression).
     pub fn refresh_cursor_effect_damage(&mut self) {
         let rows = self.rows;
         self.cursor_glow_add_damage.refresh(
@@ -2057,10 +1685,7 @@ impl RenderInput {
             .refresh(&self.fire_patch, rows, |patch| patch.row, hash_fire_patch);
     }
 
-    /// An empty 0×0 snapshot with no allocations: the seed for a scratch buffer that
-    /// [`Terminal::cell_frame_into`](crate::terminal::Terminal::cell_frame_into) refills each
-    /// frame. The fill overwrites the engine-owned grid, cursor, live colours, selection and
-    /// snapshot metadata; hosts stamp or clear their own overlay and presentation fields.
+    /// An empty 0×0 snapshot with no allocations.
     #[must_use]
     pub fn empty() -> Self {
         RenderInput {
@@ -2144,34 +1769,20 @@ impl RenderInput {
         }
     }
 
-    /// Disown the per-row revision lane: the rows are no longer the ones an engine fill
-    /// stamped. Every host producer that rebuilds rows (the split compositor) calls this; a
-    /// pure row prepend splices the lane instead
-    /// ([`note_host_row_prepend`](Self::note_host_row_prepend)). In-place host mutators
-    /// self-report through `snapshot_seq != shifted_fill_seq`, but calling it is always sound
-    /// (the cost is a whole-grid content compare). Also resets the prepend bookkeeping.
+    /// Disown the per-row revision lane: the rows are no longer the ones an engine fill stamped.
     #[inline]
     pub fn invalidate_row_revisions(&mut self) {
         self.row_rev_lane = 0;
         self.row_rev.clear();
         self.row_shift = 0;
         self.shifted_fill_seq = 0;
-        // Every divider-grid fill runs this, so no frame inherits the previous split
-        // frame's composed blessing.
         self.composed_fill_seq = 0;
     }
 
-    /// Record that a host just prepended `prepended` rows, after every per-row channel shifted
-    /// and after the `snapshot_seq` bump. `blessed` is
-    /// [`host_prepend_blessing`](Self::host_prepend_blessing), read before the mutation.
-    ///
-    /// Blessed, the lane gains `prepended` leading `0`s (unknown), so engine row `r` keeps its
-    /// revision at index `r + row_shift`; unblessed, the lane is disowned. `row_shift`
-    /// advances either way: it is the row count an un-splice removes.
+    /// Record that a host just prepended `prepended` rows, after every per-row channel shifted and after the `snapshot_seq` bump.
     #[inline]
     pub fn note_host_row_prepend(&mut self, prepended: usize, blessed: bool) {
         self.row_shift = self.row_shift.saturating_add(prepended);
-        // A prepend slides every composed row, so a composed-row ledger no longer applies.
         self.composed_fill_seq = 0;
         if blessed {
             self.row_rev.splice(0..0, (0..prepended).map(|_| 0u64));
@@ -2183,29 +1794,23 @@ impl RenderInput {
         }
     }
 
-    /// Bless this snapshot as a committed composed frame, so the next compose may retain rows
-    /// nothing changed. Called by the compositor after its last cell write and `snapshot_seq`
-    /// bump; a later host write bumps `snapshot_seq` alone and so revokes it.
+    /// Bless this snapshot as a committed composed frame, so the next compose may retain rows nothing changed.
     #[inline]
     pub const fn bless_composed_fill(&mut self) {
         self.composed_fill_seq = self.snapshot_seq;
     }
 
-    /// Whether this snapshot is still, cell for cell, the frame
-    /// [`bless_composed_fill`](Self::bless_composed_fill) last blessed: `false` if never
-    /// blessed, disowned by a fill or rebuild, or written by a host mutator.
+    /// Whether this snapshot is still, cell for cell, the frame [`bless_composed_fill`](Self::bless_composed_fill) last blessed.
     #[must_use]
     #[inline]
     pub const fn composed_fill_intact(&self) -> bool {
         self.composed_fill_seq != 0 && self.snapshot_seq == self.composed_fill_seq
     }
 
-    /// Whether a host row prepend may keep the revision lane: the snapshot is exactly the last
-    /// engine fill (possibly shifted by an earlier blessed prepend) with a lane covering every
-    /// row. Read before the prepend mutates anything.
+    /// Whether a host row prepend may keep the revision lane.
     #[must_use]
     #[inline]
-    pub fn host_prepend_blessing(&self) -> bool {
+    pub const fn host_prepend_blessing(&self) -> bool {
         self.row_rev_lane != 0
             && self.row_rev.len() == self.rows
             && self.cells.len() == self.rows
@@ -2213,15 +1818,7 @@ impl RenderInput {
             && (self.row_shift > 0 || self.snapshot_seq == self.engine_fill_seq)
     }
 
-    /// Undo a blessed host row prepend, restoring the engine fill it was made from, so a
-    /// tab-strip window's scratch can take the damage-scoped arm of
-    /// [`Terminal::cell_frame_damage_scoped_into`](crate::terminal::Terminal::cell_frame_damage_scoped_into).
-    ///
-    /// Returns `false`, changing nothing, unless a blessed prepend is the only change since
-    /// the engine fill and `cells`, `clusters` and `combining` are all
-    /// `engine_rows + row_shift` long. Restores those channels, the row count and the
-    /// continuity tokens only: an un-spliced scratch is an intermediate, never a presentable
-    /// frame. Drained row buffers go to `pool` (up to `pool_cap`).
+    /// Undo a blessed host row prepend, restoring the engine fill it was made from, so a tab-strip window's scratch can take the damage-scoped arm of [`Terminal::cell_frame_damage_scoped_into`](crate::terminal::Terminal::cell_frame_damage_scoped_into).
     pub fn undo_host_row_prepend(
         &mut self,
         engine_rows: usize,
@@ -2247,7 +1844,6 @@ impl RenderInput {
         }
         self.clusters.drain(0..strip);
         self.combining.drain(0..strip);
-        // Lenient like `row_rev`: a frame built without maps has none to drain.
         let maps = strip.min(self.visual_to_logical.len());
         self.visual_to_logical.drain(0..maps);
         if self.row_rev.len() >= strip {
@@ -2255,23 +1851,13 @@ impl RenderInput {
         }
         self.rows = engine_rows;
         self.row_shift = 0;
-        // The cells are the engine's again: the one place the engine-fill token is re-armed.
         self.snapshot_seq = self.engine_fill_seq;
         self.shifted_fill_seq = self.engine_fill_seq;
-        // An un-splice restores an engine fill, never a composite.
         self.composed_fill_seq = 0;
         true
     }
 
-    /// Prepend `strip` host rows (a tab strip, a message band, a presence row): every per-row
-    /// channel, the cursor, the selections and every row-tagged effect stream move down by
-    /// `strip` rows, the chrome rows are copied from `strip_rows`, and the revision lane is
-    /// spliced so [`undo_host_row_prepend`](Self::undo_host_row_prepend) can remove them.
-    ///
-    /// `cell_h` is the pixel cell height. `grid_top` is the grid-interior top before the
-    /// prepend (`pad_top + head`): a window-space quad above `grid_top + strip·cell_h` takes a
-    /// chrome row's damage tag. `pixels` says where the window-space producers placed their
-    /// streams. `pool` supplies reclaimed row buffers. The web host and `aterm-gui` share this.
+    /// Prepend `strip` host rows (a tab strip, a message band, a presence row).
     #[allow(
         clippy::too_many_lines,
         clippy::cast_possible_truncation,
@@ -2291,7 +1877,6 @@ impl RenderInput {
         if strip == 0 {
             return;
         }
-        // Read before anything moves; `note_host_row_prepend` shifts the lane at the end.
         let blessed = self.host_prepend_blessing();
         self.cells.splice(
             0..0,
@@ -2304,12 +1889,8 @@ impl RenderInput {
                 None => src.to_vec(),
             }),
         );
-        // Per-row channels gain empty/default rows so indices stay aligned with `cells`;
-        // `(0..strip).map` is exact-size, so each splice shifts the tail once.
         self.clusters.splice(0..0, (0..strip).map(|_| Vec::new()));
         self.combining.splice(0..0, (0..strip).map(|_| Vec::new()));
-        // Chrome rows are painted in logical order: identity maps, and every
-        // permuted terminal row's map moves down with its cells.
         self.visual_to_logical
             .splice(0..0, (0..strip).map(|_| Vec::new()));
         self.images.splice(0..0, (0..strip).map(|_| Vec::new()));
@@ -2319,14 +1900,11 @@ impl RenderInput {
             .splice(0..0, (0..strip).map(|_| Vec::new()));
         self.default_bg_spans
             .splice(0..0, (0..strip).map(|_| Vec::new()));
-        // The band's pixel-resolution chrome rows are row-tagged: they move down
-        // with the rows they belong to.
         for m in &mut self.chrome_rasters {
             m.row = m
                 .row
                 .saturating_add(u16::try_from(strip).unwrap_or(u16::MAX));
         }
-        // The cursor, selection anchors and trail cells move down with the terminal content.
         self.cursor_row += strip;
         self.selection
             .translate_rows_for_presentation(i32::try_from(strip).unwrap_or(i32::MAX));
@@ -2341,14 +1919,8 @@ impl RenderInput {
         for t in &mut self.cursor_trail {
             t.row += strip;
         }
-        // Window-space streams under `Placed` keep their pixels; only the damage row tag is
-        // re-derived from the pixel y against the composed frame's bands (row r spans
-        // `grid_top + r·cell_h ..`, row 0 open to the window top), so a quad above the
-        // terminal grid lands in its strip row and an in-grid quad on its shifted row.
         let dy = u16::try_from(strip * cell_h).unwrap_or(u16::MAX);
         let shift_tag = |y: u16| (usize::from(y).saturating_sub(grid_top) / cell_h.max(1)) as u16;
-        // Under `Translate` every pixel y (quad top, flame root, halo centre, the effect clip)
-        // first moves down by `pixel_dy`; the tag rule then applies as under `Placed`.
         let pixel_dy = if pixels == HostRowPixels::Translate {
             dy
         } else {
@@ -2366,67 +1938,49 @@ impl RenderInput {
             q.y = q.y.saturating_add(pixel_dy);
             q.row = shift_tag(q.y);
         }
-        // Fire patches: the quad and its flame-root pixel move by `pixel_dy`.
         for q in &mut self.fire_patch {
             q.y = q.y.saturating_add(pixel_dy);
             q.base_y = q.base_y.saturating_add(pixel_dy);
             q.row = shift_tag(q.y);
         }
-        // Charred-ink and contrast-halo overrides are cell-tagged (grid streams).
         for c in &mut self.char_fg {
             c.row = c.row.saturating_add(strip as u16);
         }
         for c in &mut self.fire_halo {
             c.row = c.row.saturating_add(strip as u16);
         }
-        // Radial halos: the quad and its falloff centre move by `pixel_dy`.
         for h in &mut self.glow_halo {
             h.y = h.y.saturating_add(pixel_dy);
             h.cy = h.cy.saturating_add(pixel_dy);
             h.row = shift_tag(h.y);
         }
-        // Sparkle-word decorations are cell-row tagged (no pixel y); shift the row down.
         for d in &mut self.word_decorations {
             d.row = d.row.saturating_add(strip as u16);
         }
-        // Animated-ink overrides are cell-row tagged too, emitted pre-splice.
         for c in &mut self.ink {
             c.row = c.row.saturating_add(strip as u16);
         }
-        // Peeking-cat quads carry a row band and a pixel-y dest rect: shift both.
         for q in &mut self.cat_quads {
             q.row = q.row.saturating_add(strip as u16);
             q.y = q.y.saturating_add(dy);
         }
-        // Free-overlay sprites are pixel rects with no row tag: shift the signed
-        // dest y alone (dirty tracking re-derives the covered bands).
         let dy_free = i32::from(dy);
         for s in &mut self.free_sprites {
             s.y = s.y.saturating_add(dy_free);
         }
-        // Supernova additive quads are a grid stream (grid-relative pixels):
-        // shift both the row tag and the pixel y.
         for q in &mut self.nova_add {
             q.row = q.row.saturating_add(strip as u16);
             q.y = q.y.saturating_add(dy);
         }
-        // Rain sprites carry a row band and a pixel-y dest rect: shift both.
         for q in &mut self.rain_quads {
             q.row = q.row.saturating_add(strip as u16);
             q.y = q.y.saturating_add(dy);
         }
-        // Rain head halos: also shift the falloff centre, or the radial light
-        // misregisters against its quad.
         for q in &mut self.rain_add {
             q.row = q.row.saturating_add(strip as u16);
             q.y = q.y.saturating_add(dy);
             q.cy = q.cy.saturating_add(dy);
         }
-        // Fx layers carry no row tag: O(layers). A layer's offset and its
-        // clip share its space, so both move: a Window layer by `pixel_dy`
-        // (the window streams' rule), a Grid layer by `dy` (the grid
-        // streams'). The occluders are window pixels and follow `pixel_dy`
-        // like the effect clip.
         let (fx_window_dy, fx_grid_dy) = (i32::from(pixel_dy), i32::from(dy));
         for layer in &mut self.fx_layers {
             let d = match layer.space {
@@ -2440,23 +1994,18 @@ impl RenderInput {
             *o = o.translate(0, fx_window_dy);
         }
         self.rows += strip;
-        // The strip changes the presented pixels: the renderer's content cache must see it.
         self.snapshot_seq = self.snapshot_seq.wrapping_add(1);
-        // Splice or disown the revision lane per the blessing read at the top.
         self.note_host_row_prepend(strip, blessed);
     }
 
-    /// Whether any selection is live (the scalar one or any pane entry); gates the sparkle
-    /// freeze, ligature breaks and the scroll-blit veto.
+    /// Whether any selection is live (the scalar one or any pane entry).
     #[must_use]
     #[inline]
-    pub fn any_selection(&self) -> bool {
+    pub const fn any_selection(&self) -> bool {
         self.selection.has_selection() || !self.selections.is_empty()
     }
 
-    /// Frame row `frame_row`'s BiDi visual→logical map
-    /// ([`visual_to_logical`](Self::visual_to_logical)); empty when the row is
-    /// in logical order.
+    /// Frame row `frame_row`'s BiDi visual→logical map ([`visual_to_logical`](Self::visual_to_logical)).
     #[must_use]
     #[inline]
     pub fn visual_to_logical_row(&self, frame_row: usize) -> &[u16] {
@@ -2465,8 +2014,7 @@ impl RenderInput {
             .map_or(&[][..], Vec::as_slice)
     }
 
-    /// The logical frame column of the cell painted at (`frame_row`,
-    /// `frame_col`): `frame_col` itself unless BiDi reordered that row.
+    /// The logical frame column of the cell painted at (`frame_row`, `frame_col`): `frame_col` itself unless BiDi reordered that row.
     #[must_use]
     #[inline]
     pub fn logical_col(&self, frame_row: usize, frame_col: usize) -> usize {
@@ -2475,10 +2023,7 @@ impl RenderInput {
             .map_or(frame_col, |&l| usize::from(l))
     }
 
-    /// Where frame row `frame_row` paints the cell of logical column
-    /// `logical`, the inverse of [`Self::logical_col`]: `logical` itself
-    /// unless BiDi reordered that row. A caret kept in logical columns is
-    /// painted here, on the cell it names.
+    /// Where frame row `frame_row` paints the cell of logical column `logical`, the inverse of [`Self::logical_col`].
     #[must_use]
     #[inline]
     pub fn visual_col(&self, frame_row: usize, logical: usize) -> usize {
@@ -2489,16 +2034,7 @@ impl RenderInput {
             .unwrap_or(logical)
     }
 
-    /// Which selection paints a frame-space cell, or `None` when unselected: the one renderer
-    /// predicate, applying the viewport (`display_offset`) projection before consulting
-    /// [`TextSelection`]. With [`selections`](Self::selections) empty it is the scalar test
-    /// (`Some(0)`); otherwise the first entry whose clip and selection accept the cell (pane
-    /// clips are disjoint).
-    ///
-    /// On a BiDi-reordered row the selection (a logical range) is tested at the cell's
-    /// logical column, so the highlight lands on the cells the copy reads; the clip (a pane
-    /// box no permutation leaves) at the painted column. The reorder moves a wide glyph's
-    /// lead and continuation as one unit, so the wide flags hold for the logical cell too.
+    /// Which selection paints a frame-space cell, or `None` when unselected.
     #[must_use]
     #[inline]
     pub fn selection_hit(
@@ -2527,7 +2063,6 @@ impl RenderInput {
                 .contains_cell(selection_row, selection_col, is_wide, is_wide_continuation)
                 .then_some(0);
         }
-        // Entry anchors are already in frame rows (pane origin + its `display_offset`).
         let selection_row = i32::try_from(frame_row).unwrap_or(i32::MAX);
         let Ok(selection_col) = u16::try_from(self.logical_col(frame_row, frame_col)) else {
             return None;
@@ -2557,16 +2092,7 @@ impl RenderInput {
             .is_some()
     }
 
-    /// The inclusive selected column span on one frame row, after the viewport projection and
-    /// any split-composition clip.
-    ///
-    /// A scan window, not an equality key: with [`selections`](Self::selections) non-empty it
-    /// is the hull over every pane's span, which suits the sparse-tail guards that re-test
-    /// each cell; damage diffs use [`Self::selection_row_key`]. A wide glyph snapped whole
-    /// may paint one column past `hi`, but that cell is always inside the materialized prefix,
-    /// never the omitted tail cell the window exists to catch. The span is in logical columns;
-    /// the BiDi reorder permutes only the materialized prefix, so past it logical and painted
-    /// columns agree.
+    /// The inclusive selected column span on one frame row, after the viewport projection and any split-composition clip.
     #[must_use]
     #[inline]
     pub fn selection_row_span(&self, frame_row: usize) -> Option<(u16, u16)> {
@@ -2575,9 +2101,7 @@ impl RenderInput {
             .reduce(|(a_lo, a_hi), (b_lo, b_hi)| (a_lo.min(b_lo), a_hi.max(b_hi)))
     }
 
-    /// The lossless per-row selection damage key: one [`SelectionRowKey`] per selection that
-    /// reaches `frame_row`, with its colours. Damage diffs compare this; unlike
-    /// [`Self::selection_row_span`] it never merges panes. Writes into `out` (cleared first).
+    /// The lossless per-row selection damage key: one [`SelectionRowKey`] per selection that reaches `frame_row`, with its colours.
     #[inline]
     pub fn selection_row_key(&self, frame_row: usize, out: &mut Vec<SelectionRowKey>) {
         out.clear();
@@ -2585,8 +2109,6 @@ impl RenderInput {
     }
 
     /// Every selection's [`SelectionRowKey`] on `frame_row`, in list order (the scalar
-    /// selection alone when [`selections`](Self::selections) is empty): the one walk behind
-    /// the row span and the row key.
     #[inline]
     fn selection_row_keys(&self, frame_row: usize) -> impl Iterator<Item = SelectionRowKey> + '_ {
         let scalar = if self.selections.is_empty() {
@@ -2621,13 +2143,7 @@ impl RenderInput {
             }))
     }
 
-    /// Drop every host-owned visual effect layer, leaving only terminal cell
-    /// content (grid, cursor position/colour, selection, images): the cursor
-    /// trail and shape override, cursor glow and halos, under-glyph flame light,
-    /// fire patches, charred-ink and contrast-halo overrides, sparkle-word
-    /// decorations, animated ink, cat sprites, supernova light, rain (atlas
-    /// `Arc`s nulled) and the fx layers with their occluders and prefetch. Used
-    /// by the `image plain` introspection capture.
+    /// Drop every host-owned visual effect layer, leaving only terminal cell content (grid, cursor position/colour, selection, images).
     pub fn clear_overlays(&mut self) {
         self.cursor_effect_style_override = None;
         self.cursor_trail.clear();
@@ -2635,8 +2151,6 @@ impl RenderInput {
         self.glow_halo.clear();
         self.glow_under.clear();
         self.fire_patch.clear();
-        // These records describe the vectors above: reset, they fail closed to exact vector
-        // comparison until a producer rebuilds them.
         self.cursor_glow_add_damage = EffectStreamDamage::default();
         self.glow_halo_damage = EffectStreamDamage::default();
         self.glow_under_damage = EffectStreamDamage::default();
@@ -2660,10 +2174,7 @@ impl RenderInput {
         self.wallpaper = None;
     }
 
-    /// The emoji grapheme-cluster string at viewport cell `(row, col)`, if the frame captured
-    /// one (a ZWJ / skin-tone / keycap sequence). The per-row list is sorted by column, one
-    /// entry per column (re-sorted after a BiDi reorder or pane compose), so this
-    /// binary-searches: the GPU atlas loops stay O(cols·log cols) on a dense row.
+    /// The emoji grapheme-cluster string at viewport cell `(row, col)`, if the frame captured one (a ZWJ / skin-tone / keycap sequence).
     #[must_use]
     #[inline]
     pub fn cluster_at(&self, row: usize, col: usize) -> Option<&str> {
@@ -2673,8 +2184,7 @@ impl RenderInput {
             .map(|i| row[i].1.as_ref())
     }
 
-    /// The combining marks to overlay at viewport cell `(row, col)`, if any (binary search,
-    /// as [`cluster_at`](Self::cluster_at)).
+    /// The combining marks to overlay at viewport cell `(row, col)`, if any (binary search, as [`cluster_at`](Self::cluster_at)).
     #[must_use]
     #[inline]
     pub fn combining_at(&self, row: usize, col: usize) -> Option<&[char]> {
@@ -2684,10 +2194,7 @@ impl RenderInput {
             .map(|i| row[i].1.as_ref())
     }
 
-    /// The live default background governing viewport cell `(row, col)`: the owning pane's
-    /// [`DefaultBgSpan`] on a composed frame, else (missing rows, divider gaps, malformed
-    /// spans) the frame-wide [`default_bg`](Self::default_bg). May be `COLOR_UNSET`, which
-    /// renderers resolve against their theme.
+    /// The live default background governing viewport cell `(row, col)`.
     #[must_use]
     #[inline]
     pub fn default_bg_at(&self, row: usize, col: usize) -> u32 {
@@ -2706,16 +2213,14 @@ impl RenderInput {
             .map_or(self.default_bg, |span| span.default_bg)
     }
 
-    /// The topmost inline-image layer covering viewport cell `(row, col)`, if
-    /// any ([`images_at`](Self::images_at) has them all).
+    /// The topmost inline-image layer covering viewport cell `(row, col)`, if any ([`images_at`](Self::images_at) has them all).
     #[must_use]
     #[inline]
     pub fn image_at(&self, row: usize, col: usize) -> Option<&aterm_grid::ImageRef> {
         self.images_at(row, col).last().map(|(_, image)| image)
     }
 
-    /// Every inline-image layer covering viewport cell `(row, col)`, bottom
-    /// first — the order both renderers draw them in.
+    /// Every inline-image layer covering viewport cell `(row, col)`, bottom first — the order both renderers draw them in.
     #[must_use]
     #[inline]
     pub fn images_at(&self, row: usize, col: usize) -> &[(usize, aterm_grid::ImageRef)] {
@@ -2724,11 +2229,7 @@ impl RenderInput {
             .map_or(&[], |row| images_in_row_at(row, col))
     }
 
-    /// The DEC line-size run governing (`row`, `col`): its line size and the column range
-    /// `start_col..end_col` it spans, which both renderers use for placement and as the clip,
-    /// so a double-width run never bleeds past its pane. An empty
-    /// [`line_size_spans`](Self::line_size_spans) row yields the uniform run `0..cols`; an
-    /// out-of-range column falls back to it rather than panicking.
+    /// The DEC line-size run governing (`row`, `col`).
     #[must_use]
     #[inline]
     pub fn line_size_run_at(&self, row: usize, col: usize) -> (LineSize, usize, usize) {
@@ -2745,11 +2246,7 @@ impl RenderInput {
         if spans.is_empty() {
             return uniform();
         }
-        // A row with runs ignores `line_sizes[row]` (only a summary); a column no run claims
-        // (a divider seam, padding) renders single-width.
         let gap = (LineSize::SingleWidth, 0, self.cols);
-        // Ascending, non-overlapping: the last run starting at or before `col` is the only
-        // candidate.
         match spans.binary_search_by_key(&col, |s| s.start_col) {
             Ok(i) => (spans[i].line_size, spans[i].start_col, spans[i].end_col),
             Err(0) => gap,
@@ -2764,8 +2261,7 @@ impl RenderInput {
         }
     }
 
-    /// Whether an image layer at (`row`,`col`) is drawn over the text (`z_index >= 0`, the
-    /// default) and so hides the glyph; a Kitty `z < 0` image draws behind it.
+    /// Whether an image layer at (`row`,`col`) is drawn over the text (`z_index >= 0`, the default) and so hides the glyph.
     #[must_use]
     #[inline]
     pub fn image_hides_glyph_at(&self, row: usize, col: usize) -> bool {
@@ -2775,41 +2271,22 @@ impl RenderInput {
     }
 
     /// Composite an IME preedit (the in-flight composition) into this frame at the cursor.
-    /// Frame-only: no terminal state changes; the committed text arrives through the PTY echo.
-    ///
-    /// * drawn from the cursor cell in its colors with a single underline, no bold/italic;
-    /// * wide characters take a lead cell plus a `wide` continuation;
-    /// * truncated at the right edge (no wrap); the platform popover shows the full text;
-    /// * zero-width characters merge into the preceding cell;
-    /// * the cursor moves to the caret: `caret_byte` is the platform's byte offset (winit
-    ///   `Ime::Preedit`'s cursor start); `None` or past-the-end parks it after the last
-    ///   composed cell, clamped to the final column.
-    ///
-    /// `cjk` selects East-Asian-Ambiguous width, as the write path's `char_width` does. A
-    /// snapshot row carries only its written prefix, so the overlay materializes the cells it
-    /// paints, padding any gap with the live implicit blank (a clone of the last written cell
-    /// would smear its background).
     pub fn overlay_ime_preedit(&mut self, preedit: &str, caret_byte: Option<usize>, cjk: bool) {
         if preedit.is_empty() || self.cursor_row >= self.rows {
             return;
         }
         let row = self.cursor_row;
         let cols = self.cols;
-        // Resolved before the row borrow: `default_bg_at` reads `self`.
         let implicit = self.implicit_blank_at(row, self.cursor_col);
         let Some(cells) = self.cells.get_mut(row) else {
             return;
         };
-        // The style seed: the cursor cell's colors; past the written prefix the live implicit
-        // blank (a default `RenderCell` is black on black); with no resolved defaults, the
-        // row's last real cell.
         let seed = cells
             .get(self.cursor_col)
             .copied()
             .or(implicit)
             .or_else(|| cells.last().copied())
             .unwrap_or_default();
-        // The pad between the row's end and the cursor: the seed's colors, no decoration.
         let pad = RenderCell {
             ch: ' ',
             fg: seed.fg,
@@ -2817,8 +2294,6 @@ impl RenderInput {
             ..RenderCell::default()
         };
         let start_col = self.cursor_col;
-        // A composition starting on a wide character's continuation takes its lead too, or the
-        // renderer draws the old glyph over it. Read before the walk overwrites it.
         let straddled_lead =
             (start_col > 0 && cells.get(start_col).is_some_and(|c| c.wide)).then(|| start_col - 1);
         let (end_col, caret_col) = walk_ime_preedit(
@@ -2828,7 +2303,6 @@ impl RenderInput {
             start_col,
             cols,
             |ch, col, width| {
-                // Materialize the ragged tail through this character's cells; the walk
                 // proves `col + width <= cols`.
                 if cells.len() < col + width {
                     cells.resize(col + width, pad);
@@ -2854,8 +2328,6 @@ impl RenderInput {
                 }
             },
         );
-        // A cell that held a multi-scalar grapheme also has it in `clusters` (and marks in
-        // `combining`), which both renderers prefer over `ch`: drop those.
         if end_col > start_col {
             let mut lo = start_col;
             let mut hi = end_col;
@@ -2865,8 +2337,6 @@ impl RenderInput {
                 *cell = pad;
                 lo = lead;
             }
-            // A composition that stops inside a wide character strands its
-            // continuation; blank it too.
             if cells.get(end_col).is_some_and(|c| c.wide) {
                 cells[end_col] = pad;
                 hi = end_col + 1;
@@ -2882,34 +2352,7 @@ impl RenderInput {
         self.cursor_col = caret_col;
     }
 
-    /// Paint one predictive-echo ghost — `aterm-predict`'s guess that the program
-    /// will echo `ch` at logical column `col` of frame row `row` — over this
-    /// frame. Returns whether it was painted. The one painter every host's ghost
-    /// pass goes through (`aterm-gui`'s single-pane and composed paths), and the
-    /// one `aterm-predict`'s safety theorem runs to build the DISPLAYED view.
-    ///
-    /// Pure frame compositing, like [`Self::overlay_ime_preedit`]. What it may
-    /// change is the guess's own cell and nothing else, which is what lets the
-    /// predictor promise that a prediction never overwrites content outside the
-    /// cells it predicted:
-    /// * the cell is found the way reconciliation reads it, through
-    ///   [`Self::visual_col`]: on a BiDi row already in visual order the logical
-    ///   column is not the frame column, and painting the logical one paints some
-    ///   other cell;
-    /// * a guess at or past `cols` is dropped (a composed pane's blit does not clip
-    ///   to its sub-rect, so it would bleed into the neighbour); a missing row too;
-    /// * a guess on EITHER half of a wide glyph is refused. A guess is one cell
-    ///   wide, and the wide glyph's two cells are drawn as one: painting its lead
-    ///   leaves the continuation with nothing to draw (the right half vanishes),
-    ///   and painting the continuation draws the guess under the lead's overflowing
-    ///   bitmap. Either changes a cell the guess did not predict, so the guess
-    ///   stays dark (it is still tracked; its echo, or its expiry, settles it);
-    /// * past a trimmed row's end the row is extended with `blank` (the terminal's
-    ///   implicit blank, not the last cell's SGR background);
-    /// * the glyph drops inherited geometry and SGR and its fg is dimmed halfway
-    ///   toward its bg (tentative, legible on any theme), and the cell's grapheme
-    ///   cluster and combining marks go, since both renderers prefer them to `ch`
-    ///   and would draw the old grapheme over the ghost.
+    /// Paint one predictive-echo ghost.
     pub fn paint_prediction_ghost(
         &mut self,
         row: usize,
@@ -2937,8 +2380,6 @@ impl RenderInput {
     }
 
     /// Drop the grapheme cluster and combining marks of frame cell
-    /// (`row`, `frame_col`): both renderers prefer them to the cell's `ch`, so a
-    /// cell a prediction repaints would draw the old grapheme over the new one.
     #[inline]
     fn drop_marks(&mut self, row: usize, frame_col: usize) {
         if let Some(clusters) = self.clusters.get_mut(row) {
@@ -2949,47 +2390,7 @@ impl RenderInput {
         }
     }
 
-    /// Paint a predictive-echo SPAN, `aterm-predict`'s state chain on one row:
-    /// each `(col, cell)` of `cells` (logical columns, strictly increasing) is
-    /// painted as its [`SpanCell`] says, ALL OR NOTHING. Returns whether it
-    /// painted; `false` leaves the frame untouched. An empty span paints nothing
-    /// and is painted (a pure motion's state changes no cell).
-    ///
-    /// A chain is a STATE: a glyph typed, or erased, inside a line moves the
-    /// text right of the cursor one cell, and a part of a state is a frame no
-    /// program draws. So every cell is checked before any is written, and the
-    /// span is refused when:
-    /// * the row is missing, drawn in another order (BiDi: a logical column is
-    ///   not its frame column, and moved text would land elsewhere) or at
-    ///   another size (DEC double width), or a column is at or past `cols`;
-    /// * the columns are not strictly increasing;
-    /// * a painted cell would SPLIT a wide glyph of the frame: a continuation
-    ///   painted without its lead, or a lead without its continuation (both
-    ///   halves painted replace the glyph as a unit);
-    /// * a moved cell's source is not a narrow cell without marks (a shift
-    ///   moves the plain text the predictor saw there, never half a glyph), or
-    ///   the moved cells reorder their sources (a shift keeps the text's order).
-    ///
-    /// Then every source is read before the cell it stands on is written: a
-    /// chain can shift both ways (a glyph typed, an erase further along), and the
-    /// moved cells are painted leftward-moving first, left to right, then
-    /// rightward-moving, right to left, then the typed and vacated cells, which
-    /// read nothing, and a moved cell whose source is its own column, which no
-    /// pass before it writes. Because the moved cells keep their order, no
-    /// source is written before it is read.
-    ///
-    /// * [`SpanCell::Typed`] is a ghost, as [`Self::paint_prediction_ghost`]
-    ///   paints one: its glyph dimmed toward the cell's background, inherited
-    ///   SGR and geometry dropped.
-    /// * [`SpanCell::Moved`] is the source cell itself, in its own colours and
-    ///   attributes (the text is certain, only its place is speculative), if it
-    ///   holds the expected glyph; else that glyph as a typed ghost, so the
-    ///   painted text is the span's whatever the frame holds.
-    /// * [`SpanCell::Vacated`] is `blank`, the terminal's implicit blank.
-    ///
-    /// Past a trimmed row's end the row is extended with `blank`, as the ghost
-    /// painter extends it, and a source past it reads as `blank`. Each painted
-    /// cell's grapheme cluster and combining marks go.
+    /// Paint a predictive-echo SPAN, `aterm-predict`'s state chain on one row.
     pub fn paint_prediction_span<I>(
         &mut self,
         row: usize,
@@ -3005,9 +2406,6 @@ impl RenderInput {
         if !self.prediction_span_paintable(row, cells.clone(), cols) {
             return false;
         }
-        // The furthest column the span writes: the row grows to it first, with
-        // the terminal's blank, so every write below lands inside it. (A source
-        // past the row's end reads that blank, before or after the growth.)
         if let Some(furthest) = cells.clone().map(|(c, _)| c).max()
             && let Some(frame_row) = self.cells.get_mut(row)
             && frame_row.len() <= furthest
@@ -3055,9 +2453,6 @@ impl RenderInput {
                 write(self, col, painted);
             }
         }
-        // A moved cell whose source is its own column moves nothing: its source
-        // is no other cell's, and none of the passes above writes it, so it is
-        // read here as it stands, and painted as every moved cell is.
         for (col, cell) in cells {
             let painted = match cell {
                 SpanCell::Typed(ch) => {
@@ -3078,8 +2473,7 @@ impl RenderInput {
         true
     }
 
-    /// Whether [`Self::paint_prediction_span`] would paint `cells` on `row`:
-    /// its refusal, asked without painting (see there for every condition).
+    /// Whether [`Self::paint_prediction_span`] would paint `cells` on `row`.
     #[must_use]
     pub fn prediction_span_paintable<I>(&self, row: usize, cells: I, cols: usize) -> bool
     where
@@ -3108,9 +2502,6 @@ impl RenderInput {
         };
         let mut previous: Option<usize> = None;
         let mut previous_source: Option<usize> = None;
-        // A painted continuation needs its lead painted just before it; a
-        // painted lead needs its continuation painted just after it, which the
-        // next cell is checked for (`owed`).
         let mut owed: Option<usize> = None;
         for (col, cell) in cells {
             if col >= cols || previous.is_some_and(|p| col <= p) {
@@ -3143,12 +2534,7 @@ impl RenderInput {
         owed.is_none()
     }
 
-    /// Whether [`Self::paint_prediction_ghost`] would paint a ghost at logical
-    /// column `col` of frame row `row`: the column is inside `cols`, the row
-    /// exists, and neither the cell nor the one after it is a wide glyph's
-    /// continuation. The painter's own refusal, with nothing painted, for a host
-    /// that must paint a set of ghosts ALL OR NONE (a state chain of predictive
-    /// editing: a part of a state is a frame no program draws).
+    /// Whether [`Self::paint_prediction_ghost`] would paint a ghost at logical column `col` of frame row `row`.
     #[must_use]
     #[inline]
     pub fn prediction_ghost_paintable(&self, row: usize, col: usize, cols: usize) -> bool {
@@ -3164,15 +2550,12 @@ impl RenderInput {
     }
 
     /// The frame's implicit blank at viewport cell (`row`, `col`): a space in the live default
-    /// colours (per pane on a composed frame), as the terminal paints an unwritten column.
-    /// `None` when the producer resolved no defaults ([`COLOR_UNSET`] is not a colour).
     #[inline]
     fn implicit_blank_at(&self, row: usize, col: usize) -> Option<RenderCell> {
         let (fg, bg) = (self.default_fg, self.default_bg_at(row, col));
         if fg == COLOR_UNSET || bg == COLOR_UNSET {
             return None;
         }
-        // `0x00RRGGBB` big-endian: a byte split, so nothing can truncate.
         let rgb = |c: u32| {
             let [_, r, g, b] = c.to_be_bytes();
             [r, g, b]
@@ -3187,9 +2570,6 @@ impl RenderInput {
 }
 
 /// The column walk an IME composition takes (widths under the ambiguous-width mode, right-edge
-/// truncation, where the caret byte lands), shared by the overlay's ink (`emit` per character
-/// that fits: scalar, column, width) and [`ime_preedit_caret_col`]. Returns
-/// `(end_col, caret_col)`, the caret clamped to the row.
 fn walk_ime_preedit(
     preedit: &str,
     caret_byte: Option<usize>,
@@ -3210,13 +2590,12 @@ fn walk_ime_preedit(
         } else {
             aterm_grapheme::char_width(ch)
         };
-        // Zero-width characters (a combining mark off a dead key) merge into the preceding
-        // cell, as the write path does.
         if width == 0 {
             continue;
         }
         if col + width > cols {
-            break; // truncate: a wide char never straddles the edge
+            // Distinct branch.
+            break;
         }
         emit(ch, col, width);
         col += width;
@@ -3224,10 +2603,7 @@ fn walk_ime_preedit(
     (col, caret_col.unwrap_or(col).min(cols.saturating_sub(1)))
 }
 
-/// The composition's caret column: what [`RenderInput::overlay_ime_preedit`] leaves in
-/// `cursor_col`, without painting. The host anchors the OS candidate window
-/// (`set_ime_cursor_area`) here; the engine cursor still sits at the composition's start.
-/// `start_col` and `cols` are in the overlay's coordinate space (pane-local for a split leaf).
+/// The composition's caret column: what [`RenderInput::overlay_ime_preedit`] leaves in `cursor_col`, without painting.
 #[must_use]
 #[inline]
 pub fn ime_preedit_caret_col(
@@ -3240,8 +2616,7 @@ pub fn ime_preedit_caret_col(
     walk_ime_preedit(preedit, caret_byte, cjk, start_col, cols, |_, _, _| {}).1
 }
 
-/// The entries of one row's sparse image list (`RenderInput::images[row]`,
-/// ascending by column) that cover column `col`, bottom layer first.
+/// The entries of one row's sparse image list (`RenderInput::images[row]`, ascending by column) that cover column `col`, bottom layer first.
 #[must_use]
 #[inline]
 pub fn images_in_row_at(
@@ -3298,7 +2673,6 @@ mod ime_preedit_tests {
     #[test]
     fn the_platform_caret_offset_places_the_cursor_mid_composition() {
         let mut f = frame(2, 10, (0, 0));
-        // Caret between 'a' and 'b' (byte offset 1).
         f.overlay_ime_preedit("ab", Some(1), false);
         assert_eq!(f.cursor_col, 1);
     }
@@ -3314,7 +2688,6 @@ mod ime_preedit_tests {
     #[test]
     fn zero_width_combining_marks_advance_nothing() {
         let mut f = frame(2, 10, (0, 0));
-        // 'e' + COMBINING ACUTE (U+0301, width 0): one visible column.
         f.overlay_ime_preedit("e\u{0301}", None, false);
         assert_eq!(f.cells[0][0].ch, 'e');
         assert_eq!(f.cursor_col, 1);
@@ -3322,14 +2695,12 @@ mod ime_preedit_tests {
 }
 
 /// Overlay tests on real `Terminal` extractions, whose rows are ragged: a row holds only its
-/// written prefix, and at a shell prompt the cursor sits at its end.
 #[cfg(test)]
 mod ime_preedit_ragged_row_tests {
     use super::{COLOR_UNSET, RenderInput};
     use crate::terminal::{RenderCell, Rgb, Terminal, UnderlineStyle};
 
     /// A terminal at a prompt: `$ ` written, cursor parked after it, with host-configured
-    /// colors (resolved `default_fg` / `default_bg`, not `COLOR_UNSET`).
     fn prompt_frame(rows: u16, cols: u16) -> RenderInput {
         let mut term = Terminal::new(rows, cols);
         term.set_default_foreground(Rgb::new(0xC0, 0xC5, 0xCE));
@@ -3341,7 +2712,6 @@ mod ime_preedit_ragged_row_tests {
     }
 
     /// Composing at a prompt paints the composition on the ragged row, not
-    /// only a cursor move.
     #[test]
     fn a_composition_at_the_prompt_caret_is_painted_not_swallowed() {
         let mut f = prompt_frame(4, 20);
@@ -3373,7 +2743,6 @@ mod ime_preedit_ragged_row_tests {
     }
 
     /// Materialized cells take the frame's live implicit blank as their style
-    /// seed, not a default `RenderCell` (black on black).
     #[test]
     fn the_style_seed_falls_back_to_the_live_default_colors() {
         let mut f = prompt_frame(4, 20);
@@ -3396,8 +2765,6 @@ mod ime_preedit_ragged_row_tests {
     }
 
     /// A producer that resolved no defaults (a pristine `Terminal::new`, a standalone
-    /// renderer harness) still gets legible composition: the row's own last cell seeds the
-    /// colors rather than a black placeholder.
     #[test]
     fn an_unresolved_frame_seeds_from_the_rows_last_real_cell() {
         let mut f = RenderInput {
@@ -3424,11 +2791,10 @@ mod ime_preedit_ragged_row_tests {
     }
 
     /// A cursor parked right of the row's end leaves a gap, padded with the
-    /// live implicit blank: no glyph and no underline.
     #[test]
     fn the_gap_before_the_caret_is_padded_with_undecorated_blanks() {
         let mut f = prompt_frame(4, 20);
-        f.cursor_col = 5; // row is 2 cells long; columns 2..5 do not exist yet
+        f.cursor_col = 5;
         f.overlay_ime_preedit("z", None, false);
         assert_eq!(f.cells[0].len(), 6);
         for col in 2..5 {
@@ -3445,11 +2811,9 @@ mod ime_preedit_ragged_row_tests {
     }
 
     /// Truncation must not grow the row. A composition that does not fit stops
-    /// at the edge, and the cells it never reached stay unmaterialized.
     #[test]
     fn a_truncated_composition_materializes_only_what_it_drew() {
         let mut f = prompt_frame(2, 5);
-        // Columns 2-3 hold '日'; '本' would need 4-5 and the row is 5 wide.
         f.overlay_ime_preedit("日本", None, false);
         assert_eq!(f.cells[0].len(), 4, "the straddling char extended nothing");
         assert_eq!(f.cells[0][2].ch, '日');
@@ -3457,11 +2821,9 @@ mod ime_preedit_ragged_row_tests {
     }
 
     /// Composing over a multi-scalar grapheme drops its `clusters` entry, which
-    /// both renderers would otherwise paint over the composition.
     #[test]
     fn composing_over_a_grapheme_drops_its_stale_cluster() {
         let mut term = Terminal::new(2, 10);
-        // Regional indicators J+P: one two-column flag cluster at column 0.
         term.process("\u{1F1EF}\u{1F1F5}xy\r".as_bytes());
         let mut f = RenderInput::empty();
         term.cell_frame_into(&mut f, 2, 10);
@@ -3490,7 +2852,6 @@ mod ime_preedit_neighbour_tests {
     use crate::terminal::{Rgb, Terminal, UnderlineStyle};
 
     /// A host-configured terminal (resolved defaults, as every windowed frame
-    /// has) after `bytes`.
     fn painted_frame(rows: u16, cols: u16, bytes: &[u8]) -> RenderInput {
         let mut term = Terminal::new(rows, cols);
         term.set_default_foreground(Rgb::new(0xC0, 0xC5, 0xCE));
@@ -3502,7 +2863,6 @@ mod ime_preedit_neighbour_tests {
     }
 
     /// A full row: `resize` never fires, and the seed comes from the existing
-    /// cursor cell, not the live default.
     #[test]
     fn a_full_row_keeps_its_length_and_still_seeds_from_its_own_cursor_cell() {
         let mut f = painted_frame(2, 10, b"abc\x1b[31;44mdefghij\r\x1b[4G");
@@ -3530,7 +2890,6 @@ mod ime_preedit_neighbour_tests {
     }
 
     /// Column 0 of a row with no written prefix (`cells[row]` empty): a wrapped prompt's second
-    /// line, or any line of a cleared screen.
     #[test]
     fn a_composition_at_column_zero_of_an_unwritten_row_is_painted() {
         let mut f = painted_frame(3, 20, b"$ \r\n");
@@ -3554,7 +2913,6 @@ mod ime_preedit_neighbour_tests {
     }
 
     /// A wide char with exactly one column left: nothing is painted or
-    /// materialized; only the caret is clamped.
     #[test]
     fn a_wide_composition_with_one_column_left_paints_nothing_and_grows_nothing() {
         let mut f = painted_frame(2, 8, b"$ ");
@@ -3566,7 +2924,6 @@ mod ime_preedit_neighbour_tests {
     }
 
     /// The platform caret at byte 0: the composition is painted in full and the
-    /// cursor sits at its start.
     #[test]
     fn the_platform_caret_at_offset_zero_anchors_at_the_composition_start() {
         let mut f = painted_frame(2, 20, b"$ ");
@@ -3577,7 +2934,6 @@ mod ime_preedit_neighbour_tests {
     }
 
     /// The `cjk` argument (DECSET 8840 / `ambiguous_width_double`) reaches the width call, so
-    /// the composition occupies the columns the committed text would.
     #[test]
     fn the_ambiguous_width_flag_widens_the_composition_it_is_given() {
         let mut narrow = painted_frame(2, 20, b"$ ");
@@ -3601,8 +2957,6 @@ mod ime_preedit_neighbour_tests {
     }
 
     /// Composing onto a wide character's continuation clears the whole
-    /// character, as the write path would; a stranded continuation would be a
-    /// blank in the old cell's background.
     #[test]
     fn composing_onto_a_wide_characters_lead_takes_its_continuation_too() {
         let mut f = painted_frame(2, 10, "日本\r".as_bytes());
@@ -3622,7 +2976,6 @@ mod ime_preedit_neighbour_tests {
     }
 
     /// Composing onto a wide character's lead clears its continuation; a
-    /// stranded lead would redraw the old glyph over the composition.
     #[test]
     fn composing_onto_a_wide_characters_continuation_takes_its_lead_too() {
         let mut f = painted_frame(2, 10, "日本\r\x1b[2G".as_bytes());
@@ -3642,8 +2995,6 @@ mod ime_preedit_neighbour_tests {
     }
 
     /// The cluster drop follows the cells it clears: a multi-scalar wide
-    /// grapheme composed onto from its continuation column has its `clusters`
-    /// entry at the lead, one column left of where the composition starts.
     #[test]
     fn composing_onto_a_graphemes_continuation_drops_the_cluster_at_its_lead() {
         let mut term = Terminal::new(2, 10);
@@ -3667,8 +3018,6 @@ mod ime_preedit_neighbour_tests {
 }
 
 /// [`ime_preedit_caret_col`] (the candidate-window anchor) and
-/// [`RenderInput::overlay_ime_preedit`] (the ink) agree on every shape the
-/// shared `walk_ime_preedit` has a branch for.
 #[cfg(test)]
 mod ime_preedit_caret_query_tests {
     use super::{RenderInput, ime_preedit_caret_col};
@@ -3687,19 +3036,18 @@ mod ime_preedit_caret_query_tests {
 
     #[test]
     fn the_caret_query_returns_exactly_the_column_the_paint_lands_on() {
-        // (preedit, caret byte, cjk, start column, frame cols)
         let cases: &[(&str, Option<usize>, bool, usize, u16)] = &[
-            ("にほん", None, false, 2, 20),      // caret trails
-            ("にほん", Some(0), false, 2, 20),   // caret at the start
-            ("にほん", Some(3), false, 2, 20),   // caret between に and ほ
-            ("ab", Some(1), false, 3, 20),       // narrow, mid-composition
-            ("にほんご", None, false, 2, 8),     // truncated at the edge
-            ("日", None, false, 7, 8),           // not one column fits
-            ("e\u{0301}", None, false, 0, 20),   // a zero-width combining mark
-            ("±", None, true, 2, 20),            // EA-Ambiguous, CJK mode
-            ("±", None, false, 2, 20),           // …and narrow mode
-            ("", None, false, 2, 20),            // no composition at all
-            ("にほん", Some(999), false, 2, 20), // caret past the end
+            ("にほん", None, false, 2, 20),
+            ("にほん", Some(0), false, 2, 20),
+            ("にほん", Some(3), false, 2, 20),
+            ("ab", Some(1), false, 3, 20),
+            ("にほんご", None, false, 2, 8),
+            ("日", None, false, 7, 8),
+            ("e\u{0301}", None, false, 0, 20),
+            ("±", None, true, 2, 20),
+            ("±", None, false, 2, 20),
+            ("", None, false, 2, 20),
+            ("にほん", Some(999), false, 2, 20),
         ];
         for &(preedit, caret, cjk, start, cols) in cases {
             let mut f = prompt(cols, start);
@@ -3714,14 +3062,12 @@ mod ime_preedit_caret_query_tests {
     }
 }
 
-/// One cell of a predictive-echo span ([`RenderInput::paint_prediction_span`]):
-/// what `aterm-predict`'s state chain shows there.
+/// One cell of a predictive-echo span ([`RenderInput::paint_prediction_span`]): what `aterm-predict`'s state chain shows there.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SpanCell {
     /// A glyph a key typed, whose echo has not come: painted as a ghost.
     Typed(char),
     /// The glyph `ch` the frame shows at logical column `from` of the same row,
-    /// moved here by a shift: painted as that cell, in its own style.
     Moved {
         /// The column the glyph stands on in the unpainted frame.
         from: usize,
@@ -3733,10 +3079,6 @@ pub enum SpanCell {
 }
 
 /// `cell` repainted as a predictive-echo ghost of `ch`: the glyph, its
-/// foreground dimmed halfway toward the cell's background (tentative, legible
-/// on any theme), its background kept, inherited SGR and geometry dropped. The
-/// one ghost style ([`RenderInput::paint_prediction_ghost`],
-/// [`RenderInput::paint_prediction_span`]).
 #[inline]
 const fn ghost_cell(cell: RenderCell, ch: char) -> RenderCell {
     let (fg, bg) = (cell.fg, cell.bg);
@@ -3795,7 +3137,6 @@ mod prediction_ghost_tests {
     }
 
     /// The ghost replaces its own cell (glyph, dimmed fg, no inherited SGR) and
-    /// nothing else, over a styled row.
     #[test]
     fn a_ghost_changes_its_own_cell_and_no_other() {
         let before = frame(2, 10, b"ab\x1b[1;31mcde\x1b[0mfg");
@@ -3810,8 +3151,6 @@ mod prediction_ghost_tests {
     }
 
     /// Either half of a wide glyph is refused: painting the lead leaves the
-    /// continuation with nothing to draw, painting the continuation draws under the
-    /// lead's bitmap. Both change a cell the guess never predicted.
     #[test]
     fn a_ghost_never_paints_over_half_of_a_wide_glyph() {
         let before = frame(1, 10, "ab日c".as_bytes());
@@ -3836,11 +3175,9 @@ mod prediction_ghost_tests {
     }
 
     /// On a BiDi row already in visual order the guess's logical column is found
-    /// where reconciliation reads it ([`RenderInput::visual_col`]).
     #[test]
     fn a_ghost_lands_on_the_visual_cell_of_its_logical_column() {
         let mut before = frame(1, 10, b"cba");
-        // Visual column v shows logical column map[v]: logical 0 is painted at 2.
         before.visual_to_logical = vec![vec![2, 1, 0]];
         let mut after = before.clone();
         assert!(after.paint_prediction_ghost(0, 0, 'x', 10, blank()));
@@ -3849,7 +3186,6 @@ mod prediction_ghost_tests {
     }
 
     /// A cell's combining marks (and grapheme cluster) are drawn in preference to
-    /// its `ch`, so they go with the glyph the ghost replaces — and only there.
     #[test]
     fn a_ghost_drops_its_cells_combining_marks_only() {
         let before = frame(1, 10, "e\u{301}xo\u{308}".as_bytes());
@@ -3862,9 +3198,6 @@ mod prediction_ghost_tests {
     }
 
     /// The painter's refusal, asked without painting, is the painter's: on every
-    /// column of a row holding a wide glyph, past `cols` and on a missing row,
-    /// `prediction_ghost_paintable` answers what `paint_prediction_ghost` then
-    /// does, and asking changes nothing.
     #[test]
     fn a_ghost_s_refusal_can_be_asked_without_painting() {
         let before = frame(2, 6, "ab日c".as_bytes());
@@ -3883,7 +3216,6 @@ mod prediction_ghost_tests {
     }
 
     /// Past a trimmed row's end the row is padded with the terminal blank; at or
-    /// past `cols`, or on a missing row, nothing is painted.
     #[test]
     fn a_ghost_pads_a_short_row_and_clips_to_the_frame() {
         let mut f = frame(2, 6, b"$ ");
@@ -3906,8 +3238,6 @@ mod prediction_ghost_tests {
     }
 
     /// A SHIFT: `x` typed before `c` of `ab` + bold red `cd`. The typed glyph is
-    /// a ghost (dimmed, no SGR); the text it moved is the very cells it came
-    /// from, bold and red; nothing outside the span changes.
     #[test]
     fn a_span_moves_text_in_its_own_style_and_types_its_glyph() {
         let before = frame(1, 10, b"ab\x1b[1;31mcd\x1b[0mef");
@@ -3936,13 +3266,6 @@ mod prediction_ghost_tests {
     }
 
     /// Text moving both ways in one span (an insert, and an erase further on):
-    /// every source is read before the cell it stands on is written. Rightward
-    /// `b`, leftward `g` and `h`, a vacated cell after them.
-    ///
-    /// The text alone cannot tell the order: a moved cell whose source was
-    /// written first falls back to a ghost of the glyph it expects, which reads
-    /// the same. So every moved glyph is bold red, which a ghost never is, and
-    /// each must land as the very cell it came from.
     #[test]
     fn a_span_reads_every_source_before_writing_it() {
         let before = frame(1, 12, b"a\x1b[1;31mb\x1b[0mcdef\x1b[1;31mgh\x1b[0mij");
@@ -3966,8 +3289,6 @@ mod prediction_ghost_tests {
     }
 
     /// A moved cell whose source is its own column is painted as every moved
-    /// cell is: itself, where it holds the glyph the span expects, else a ghost
-    /// of that glyph. Nothing else changes.
     #[test]
     fn a_span_cell_moved_onto_itself_is_painted() {
         let before = frame(1, 10, b"ab\x1b[1;31mcd\x1b[0m");
@@ -3982,9 +3303,6 @@ mod prediction_ghost_tests {
     }
 
     /// A span never SPLITS a wide glyph: painting either half alone is refused,
-    /// and both halves together replace the glyph as a unit. A wide glyph is no
-    /// moved cell's source. Asking (`prediction_span_paintable`) answers what
-    /// painting does, and paints nothing.
     #[test]
     fn a_span_never_splits_a_wide_glyph() {
         let before = frame(1, 10, "ab日c".as_bytes());
@@ -4012,8 +3330,6 @@ mod prediction_ghost_tests {
     }
 
     /// A span is refused on a row drawn in another order (BiDi) or at another
-    /// size, past `cols`, on a missing row, with columns out of order, and with
-    /// moved cells that reorder their sources or move a marked cell.
     #[test]
     fn a_span_is_refused_where_its_cells_are_not_what_it_names() {
         let plain = frame(2, 10, b"abcd");
@@ -4056,9 +3372,6 @@ mod prediction_ghost_tests {
     }
 
     /// A moved cell whose source does not hold the glyph the span expects is
-    /// painted as that glyph, a ghost: the painted text is the span's whatever
-    /// the frame holds. A painted cell's marks go; a short row is padded with
-    /// the terminal's blank; an empty span paints nothing and is painted.
     #[test]
     fn a_span_paints_its_own_text_whatever_the_frame_holds() {
         let mut f = frame(1, 10, "ae\u{301}b".as_bytes());
@@ -4092,7 +3405,6 @@ mod line_size_run_tests {
     }
 
     /// A uniform row (every single-pane frame) yields the row's own line size
-    /// over the whole grid.
     #[test]
     fn empty_spans_yield_the_row_line_size_over_the_whole_row() {
         let mut i = input(2, 10);
@@ -4103,8 +3415,6 @@ mod line_size_run_tests {
     }
 
     /// Boundaries: `start_col` is inclusive and `end_col` exclusive, and the
-    /// binary search must land correctly on a run's first column, its last, and
-    /// the gap between two runs.
     #[test]
     fn run_boundaries_are_half_open_and_gaps_fall_back() {
         let mut i = input(1, 12);
@@ -4122,7 +3432,6 @@ mod line_size_run_tests {
         ];
         assert_eq!(i.line_size_run_at(0, 0).0, LineSize::DoubleHeightTop);
         assert_eq!(i.line_size_run_at(0, 2).0, LineSize::DoubleHeightTop);
-        // 3..8 is the gap between the two panes.
         assert_eq!(i.line_size_run_at(0, 3), (LineSize::SingleWidth, 0, 12));
         assert_eq!(i.line_size_run_at(0, 7), (LineSize::SingleWidth, 0, 12));
         assert_eq!(i.line_size_run_at(0, 8).0, LineSize::DoubleWidth);
@@ -4130,12 +3439,9 @@ mod line_size_run_tests {
     }
 
     /// On a row with runs, `line_sizes[row]` is only a summary; placement
-    /// ignores it, so a divider seam between panes renders single-width even
-    /// when the summary is double-width.
     #[test]
     fn a_spanned_row_never_inherits_the_row_level_summary() {
         let mut i = input(1, 11);
-        // The compositor sets both: the run (authoritative) and the summary.
         i.line_sizes[0] = LineSize::DoubleWidth;
         i.line_size_spans[0] = vec![LineSizeSpan {
             start_col: 6,
@@ -4153,7 +3459,6 @@ mod line_size_run_tests {
     }
 
     /// The renderers index this from clamped-framebuffer loops, so an
-    /// out-of-range row or column must fall back, never panic.
     #[test]
     fn out_of_range_lookups_fall_back_instead_of_panicking() {
         let mut i = input(1, 4);
@@ -4175,8 +3480,6 @@ mod z_index_tests {
     use std::sync::Arc;
 
     /// [`super::images_eq`] matches derived equality with Kitty tags stripped; at the
-    /// `RenderInput` level a re-transmit (fresh `Arc`s, same bytes) is equal and a one-byte
-    /// payload change is not.
     #[test]
     fn images_eq_memo_matches_derived_equality() {
         let payload: Vec<u8> = (0..4096u32).map(|i| (i % 253) as u8).collect();
@@ -4216,7 +3519,6 @@ mod z_index_tests {
         let a = fill(&base);
         let mut flipped = payload.clone();
         flipped[17] ^= 0x80;
-        // The same cells stamped by a Kitty placement: identity, not pixels.
         let tagged = |serial: u32| {
             let mut t = a.clone();
             for (_, iref) in t.iter_mut().flatten() {
@@ -4247,13 +3549,13 @@ mod z_index_tests {
                 .collect::<Vec<_>>()
         };
         let cases = [
-            Vec::new(),                     // empty vs covered
-            a.clone(),                      // same Arcs (ptr_eq path)
-            fill(&mk(payload.clone(), 0)),  // re-transmit: distinct Arc, equal bytes
-            fill(&mk(flipped, 0)),          // one payload byte differs
-            fill(&mk(payload.clone(), -1)), // z-only difference
-            tagged(7),                      // tag-only difference — EQUAL
-            a[..1].to_vec(),                // row-count mismatch
+            Vec::new(),
+            a.clone(),
+            fill(&mk(payload.clone(), 0)),
+            fill(&mk(flipped, 0)),
+            fill(&mk(payload.clone(), -1)),
+            tagged(7),
+            a[..1].to_vec(),
         ];
         for (i, b) in cases.iter().enumerate() {
             assert_eq!(
@@ -4262,12 +3564,9 @@ mod z_index_tests {
                 "case {i}: memoized equality must match the derived equality"
             );
         }
-        // A Kitty re-put under a new serial is equal, though the derived
-        // `ImageRef` equality (which sees the tag) says otherwise.
         assert!(super::images_eq(&tagged(7), &tagged(8)));
         assert_ne!(tagged(7), tagged(8), "the tag is part of derived equality");
 
-        // RenderInput-level pin of both directions.
         let mut left = RenderInput::empty();
         left.images = a.clone();
         let mut right = RenderInput::empty();
@@ -4308,8 +3607,6 @@ mod z_index_tests {
     #[test]
     fn image_hides_glyph_only_when_z_is_nonnegative() {
         let mut input = RenderInput::empty();
-        // col 0: z=0 (over text, default) — hides; col 1: z=-1 (behind) — does not;
-        // col 2: z=5 (over) — hides; col 3: no image.
         input.images = vec![vec![
             (0, image_ref(0)),
             (1, image_ref(-1)),
@@ -4335,8 +3632,6 @@ mod z_index_tests {
 
     #[test]
     fn per_column_accessors_binary_search_sparse_sorted_lists() {
-        // The per-row (col, _) lists are sorted by column and binary-searched: populated
-        // columns (0, 5, 100) resolve their entry, gaps return None.
         let mut input = RenderInput::empty();
         input.clusters = vec![vec![
             (0, "a".into()),
@@ -4512,7 +3807,6 @@ mod default_bg_span_tests {
             "split selection bounds change rendered pixels"
         );
 
-        // Every field of a per-pane entry paints, so every one moves `PartialEq`.
         let mut changed = source.clone();
         changed.selections[0].clip = SelectionClip::new(0, 1, 5, 8);
         assert_ne!(changed, source, "a pane's selection box changes pixels");
@@ -4582,8 +3876,6 @@ mod selection_clip_tests {
     }
 
     /// Two panes selected on one frame row: the predicate resolves each cell to
-    /// the pane that owns it, the hull spans both (a scan window), and the
-    /// per-entry key keeps them apart (an equality key).
     #[test]
     fn per_pane_selections_resolve_per_cell_while_the_span_is_a_hull() {
         let pane = |lo: u16, hi: u16, clip: SelectionClip, bg: u32| {
@@ -4653,7 +3945,6 @@ mod selection_clip_tests {
     }
 
     /// An empty list is the scalar path: the scalar selection is the whole
-    /// authority, and `any_selection` agrees.
     #[test]
     fn an_empty_pane_list_leaves_the_scalar_path_untouched() {
         let mut input = RenderInput::empty();
@@ -4669,7 +3960,6 @@ mod selection_clip_tests {
         assert_eq!(input.selection_hit(0, 1, false, false), Some(0));
         assert_eq!(input.selection_row_span(0), Some((1, 2)));
 
-        // A non-empty list replaces the scalar authority entirely.
         input.selections = vec![PaneSelection {
             selection: TextSelection::new(),
             clip: SelectionClip::new(0, 2, 0, 4),
@@ -4683,8 +3973,6 @@ mod selection_clip_tests {
         );
         assert!(input.any_selection(), "…and it still counts as a selection");
 
-        // The list clause of `any_selection` alone: scalar empty, one live entry (an
-        // unfocused pane). The scroll-blit veto, sparkle freeze and ligature break ask it.
         let mut list_only = RenderInput::empty();
         list_only.rows = 2;
         list_only.cols = 4;
@@ -4772,7 +4060,6 @@ mod rain_channel_tests {
             w: 12,
             h: 10,
             color: 0x0060_2008,
-            // Additive light (see `GlowQuad::alpha`).
             alpha: 0,
             color2: 0x0060_2008,
             alpha2: 0,
@@ -4828,8 +4115,6 @@ mod rain_channel_tests {
     }
 
     /// `composed_fill_seq`: only `bless_composed_fill` arms it, and every other
-    /// producer revokes it through the `snapshot_seq` discipline, without
-    /// naming the field.
     #[test]
     fn the_composed_fill_blessing_is_revoked_by_every_other_producer() {
         let mut input = RenderInput::empty();
@@ -4842,7 +4127,6 @@ mod rain_channel_tests {
         input.bless_composed_fill();
         assert!(input.composed_fill_intact(), "the blessing did not take");
 
-        // 1. A host cell write: one `snapshot_seq` bump; no mutator touches the token.
         let mut host = input.clone();
         host.snapshot_seq = host.snapshot_seq.wrapping_add(1);
         assert!(
@@ -4851,7 +4135,6 @@ mod rain_channel_tests {
              this is the clause every unenumerated composite producer relies on"
         );
 
-        // 2. A row rebuild, which every divider-grid fill opens with.
         let mut rebuilt = input.clone();
         rebuilt.invalidate_row_revisions();
         assert!(
@@ -4859,7 +4142,6 @@ mod rain_channel_tests {
             "a row rebuild must revoke the blessing"
         );
 
-        // 3. A host row prepend, blessed or not: it slides every composed row.
         for blessed in [false, true] {
             let mut spliced = input.clone();
             spliced.note_host_row_prepend(1, blessed);
@@ -4871,7 +4153,6 @@ mod rain_channel_tests {
             );
         }
 
-        // 4. The un-splice, which restores an engine fill, never a composite.
         let mut unspliced = RenderInput::empty();
         unspliced.rows = 1;
         unspliced.cells = vec![Vec::new()];
@@ -4900,8 +4181,6 @@ mod rain_channel_tests {
     }
 
     /// Atlases compare by identity (`Arc::as_ptr`), since baker versions replay
-    /// across rebuilt engines: a fresh publish is unequal, and the same `Arc`
-    /// re-presented stays equal.
     #[test]
     fn partial_eq_sees_atlas_identity() {
         let base = populated();
@@ -4910,8 +4189,6 @@ mod rain_channel_tests {
         version_bumped.rain_atlas = Some(rain_atlas(8, 0xFF));
         assert_ne!(base, version_bumped, "a fresh atlas publish must be seen");
 
-        // A rebuilt engine replays version numbers with different texels;
-        // identity, not version, catches it.
         let mut same_version_rebake = base.clone();
         same_version_rebake.rain_atlas = Some(rain_atlas(7, 0x00));
         assert_ne!(
@@ -4919,7 +4196,6 @@ mod rain_channel_tests {
             "a same-version DIFFERENT-Arc publish (rebuilt engine) compares UNEQUAL"
         );
 
-        // The steady state: the same published snapshot re-presented.
         let mut same_arc = base.clone();
         same_arc.rain_atlas.clone_from(&base.rain_atlas);
         assert_eq!(
@@ -4963,7 +4239,6 @@ mod rain_channel_tests {
     }
 
     /// The canonical record words cover every renderer-visible field (producer damage and the
-    /// cursor scheduler both fingerprint with them).
     #[test]
     fn cursor_effect_damage_words_cover_every_visible_field() {
         macro_rules! assert_fields_change {
@@ -5033,7 +4308,6 @@ mod rain_channel_tests {
     }
 
     /// The damage cache keeps only a row bitmap for an 8k-quad `glow_under` stream, and the
-    /// compact revision still sees a payload change.
     #[test]
     fn damage_record_covers_8k_glow_under_without_retaining_its_payload() {
         const QUADS: usize = 8_191;
@@ -5097,8 +4371,6 @@ mod host_row_prepend_tests {
     }
 
     /// A 4-row frame whose window-space streams each carry a quad on a
-    /// terminal row (and the aurora one above the grid too), plus the
-    /// focused pane's effect clip.
     fn frame() -> RenderInput {
         let blank = RenderCell {
             ch: ' ',
@@ -5150,7 +4422,6 @@ mod host_row_prepend_tests {
     }
 
     /// `f`'s window-space pixels moved down by `dy` — what a producer whose
-    /// origin already counted the prepended rows would have emitted.
     fn placed_below(mut f: RenderInput, dy: u16) -> RenderInput {
         for q in &mut f.cursor_glow_add {
             q.y += dy;
@@ -5174,9 +4445,6 @@ mod host_row_prepend_tests {
     }
 
     /// `Translate` is "placed below, then placed": a web frame whose producers never counted
-    /// the prepended rows splices exactly as a native frame whose producers did, and `Placed`
-    /// moves no window-space pixel. Negative control: `Placed` on the web frame leaves the
-    /// aurora on its old row.
     #[test]
     fn translate_is_the_native_splice_of_a_frame_placed_below_the_rows() {
         let strip = 2;
@@ -5201,8 +4469,6 @@ mod host_row_prepend_tests {
         assert_eq!(web.fire_patch, native.fire_patch);
         assert_eq!(web.glow_halo, native.glow_halo);
         assert_eq!(web.fx_clip, native.fx_clip);
-        // Every in-grid quad lands on its terminal row, now `strip` lower; the
-        // aurora above the grid lands on the chrome row its pixel lies in.
         assert_eq!(web.cursor_glow_add[0].row, 4);
         assert_eq!(web.cursor_glow_add[1].row, 1);
         assert_eq!(web.glow_under[0].row, 4);
@@ -5223,12 +4489,10 @@ mod host_row_prepend_tests {
         );
     }
     /// A prepend moves each BiDi row's visual→logical map down with its cells and selection;
-    /// the chrome rows get none.
     #[test]
     fn a_prepend_moves_each_bidi_row_map_with_its_row() {
         use crate::selection::{SelectionSide, SelectionType};
         let mut f = frame();
-        // Row 1 painted `a`, then a reversed two-cell run: logical 2 at visual 1.
         f.visual_to_logical = vec![Vec::new(), vec![0, 2, 1], Vec::new(), Vec::new()];
         f.selection
             .start_selection(1, 2, SelectionSide::Left, SelectionType::Simple);
@@ -5257,7 +4521,6 @@ mod host_row_prepend_tests {
     }
 
     /// Equality reads the map by meaning: no entry and an empty entry are both
-    /// the identity, while two different orders of a row are different frames.
     #[test]
     fn frames_compare_bidi_maps_by_meaning() {
         let plain = frame();
@@ -5298,7 +4561,6 @@ mod fx_input_tests {
     }
 
     /// A frame carrying a clipped Window layer, a clipped Grid layer, an
-    /// unclipped Window layer, an occluder and a prefetched art.
     fn frame(c: &Arc<FxContent>) -> RenderInput {
         let mut window = FxLayer::new(1, c.clone(), FxSlot::Over, FxSpace::Window, FxBlend::Exact);
         window.clip = PxRect::new(-3, 2, 60, 25);
@@ -5318,9 +4580,6 @@ mod fx_input_tests {
     }
 
     /// Frames compare their layers by identity and their occluders by value,
-    /// and never read the prefetch. Each `!=` is a negative control: equal
-    /// bytes behind another `Arc`, a moved offset, another slot and a moved
-    /// occluder are each a different frame.
     #[test]
     fn fx_channels_compare_by_identity_and_prefetch_draws_nothing() {
         let c = content();
@@ -5346,9 +4605,6 @@ mod fx_input_tests {
     }
 
     /// The damage cache keeps the layers' `Arc`s (so the identity it compares
-    /// against can never be reused) and the occluders, and drops the
-    /// prefetch; a full clone keeps all three; `clear_overlays` clears all
-    /// three.
     #[test]
     fn the_damage_cache_keeps_the_layer_arcs_and_drops_the_prefetch() {
         let c = content();
@@ -5373,10 +4629,6 @@ mod fx_input_tests {
     }
 
     /// A prepend moves a Window layer and the occluders by the window streams'
-    /// `pixel_dy` (zero under `Placed`) and a Grid layer by the grid streams'
-    /// `dy`, offset and clip together, each clip in its layer's own space; an
-    /// unbounded clip stays unbounded. Negative control: under `Placed` the
-    /// Window layers and the occluders stay.
     #[test]
     fn a_prepend_moves_each_layer_in_its_own_space() {
         let (strip, ch, top) = (2, 10, 6);

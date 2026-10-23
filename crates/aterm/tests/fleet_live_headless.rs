@@ -1,70 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE FLEET LISTENER through the one `aterm` binary against a real `aterm
-//! --headless` (`docs/DESIGN-sessions-as-subagents-2026-10-15.md` §5): this
-//! test dials the instance's `[fleet]` port as a fleet member does
-//! (`aterm_net::fleet::client_handshake`) and holds it to the design's laws.
-//!
-//! * The port is the lock: while this test holds the configured port the
-//!   instance says `fleet=retrying`, and it binds once the holder lets go;
-//!   an address this machine does not have (yet) is retried the same way.
-//! * A proved peer runs `version` (twice on one connection) and `survey` — at
-//!   the level `[fleet] allow` names, never more: facts carry no cwd, no title,
-//!   no prompt — four requests a connection, which then closes, and nothing
-//!   else: a selector, a verb the table does not mark
-//!   `fleet` — the drive, the push flip, the retired network dial, the inbox,
-//!   the roster — and a frame are each answered one `ERR denied` line and the
-//!   connection closed.
-//! * A wrong secret is refused before any byte of the dialer's proof, and a
-//!   `join` at a machine that holds no join code — no fleet's issuer — is
-//!   answered `ERR` and recorded nowhere.
-//! * A config edit rebinds: the old port closes, the new one is taken once
-//!   free, and the level it proves follows `allow`.
-//! * The key is watched: rotated while served, every connection is cut and
-//!   the old secret is refused; removed, the port closes and `status` says
-//!   why, with no config edit either time.
-//! * `aterm fleet init|join|peers|leave` through the binary: `init` makes
-//!   the instance's machine the issuer (the code's path printed, never the
-//!   code), `join` refuses a code on its argument list and registers with the
-//!   instance from a code on stdin — its record lands in the instance's book
-//!   of peers, never in its control server — and each side's `peers` checks
-//!   the other.
-//! * A `book` read of the real listeners: the issuer answers its book
-//!   naming itself and its members; a member refuses `no-book`, naming
-//!   itself, so a reader can tell it from its issuer.
-//! * Node keys through the real listeners: each join binds the member's
-//!   node key in the issuer's book and the issuer's in the member's; the
-//!   book read and the member's whole read are proven by those keys; a
-//!   target that binds the issuer's node to another key gets no book from
-//!   it; and the member's node id under another key is refused at the
-//!   issuer, naming `aterm fleet peers rm <node>`.
-//! * `aterm ctl survey --fleet` on the member reads the issuer's sessions over
-//!   the fleet port and, through the issuer's book of members, a second real
-//!   aterm that joined the issuer and that the member never named — its
-//!   sessions read, its entry kept as a copy of the issuer's book in a file
-//!   of its own, never in the member's book — and gives a closed port and one
-//!   that never speaks one line each with its reason; `--host` refuses a
-//!   word that names more than one peer and reads the one it names in full.
-//! * THE STEP-IN (§5.1): a member that lets the issuer drive it (`aterm
-//!   fleet allow drive --from`) is driven with `aterm ctl --host` — a turn
-//!   into its worker, `await task`, `result` — and says who typed; a member
-//!   its list does not name is refused; the person's Take Over refuses every
-//!   remote write.
-//!
-//! Every wait that must end is a one-minute hang detector (AGENTS.md), each
-//! a poll of `status` or a read with that timeout; no sleep is a budget. The
-//! fleet reads of the real issuer through the CLI take `--timeout 10`, the
-//! longest a read may name, since its per-peer deadline covers that
-//! instance's answer too; the reach it shows is checked first in process
-//! under the hang detector. A port that never speaks spends a read's whole
-//! deadline, so it is read under a short one of its own (half a second, the
-//! window under test), never under the ten seconds a real instance gets.
-//!
-//! ISOLATION: `support/launch_isolation.rs` and `support/headless_boot.rs`
-//! (a product that cannot start fails; a scratch/spawn refusal is COULD NOT
-//! RUN, `boot_with`); the key lives under the scratch world's own state
-//! root.
+//! THE FLEET LISTENER through the one `aterm` binary against a real `aterm --headless` (`docs/DESIGN-sessions-as-subagents-2026-10-15.md` §5).
 
 #![cfg(unix)]
 
@@ -88,8 +25,6 @@ use crate::headless_boot::{self, Instance, POLL_GAP, boot_session, ctl, ctl_ok, 
 const HANG: Duration = aterm_spec::wait::MUST_HAPPEN;
 
 /// The stand-in `claude` a worker spawned over the drive runs: `--version`
-/// answers at once (`headless_boot::standin` runs every fake once so), and
-/// any other call exits 0, so its pane's shell draws its next prompt.
 const STANDIN_CLAUDE: &str = "#!/bin/sh\n\
     case \"$1\" in --version) echo '2.1.0 (Claude Code)'; exit 0 ;; esac\n\
     exit 0\n";
@@ -108,7 +43,6 @@ fn hold_a_port() -> (TcpListener, u16) {
 }
 
 /// `state/fleet.key` as `aterm fleet init` writes it: `secret`'s lowercase
-/// hex and a newline, 0600, in the 0700 state root.
 fn write_key(state: &Path, secret: &[u8]) {
     use std::os::unix::fs::PermissionsExt as _;
     let key = state.join(KEY_FILE);
@@ -123,13 +57,9 @@ fn fleet_table(port: u16, allow: &str) -> String {
 }
 
 /// How often this instance's listener tries a held port or an unusable key
-/// again, and reads its served key again: the product's `RETRY` (2 s) through
-/// its development seam. The test's port and key changes are about what the
-/// listener does at its next try, and each waited out up to a whole 2 s of it.
 const RETRY_MS: &str = "100";
 
 /// A refused boot ends the test COULD NOT RUN, never a pass that checked
-/// nothing (`headless_boot::boot_with`).
 fn boot(port: u16) -> Instance {
     headless_boot::boot_with(
         "aflt",
@@ -195,7 +125,6 @@ fn ask_lines<S: Read + Write>(stream: &mut S, line: &str) -> Vec<String> {
 }
 
 /// Whether the peer has closed: the next read ends (EOF, or the TLS end of a
-/// shut socket), never by the hang detector's timeout.
 fn closed<S: Read>(stream: &mut S) -> bool {
     let mut rest = Vec::new();
     match stream.read_to_end(&mut rest) {
@@ -212,9 +141,6 @@ fn closed<S: Read>(stream: &mut S) -> bool {
 
 #[test]
 fn a_fleet_peer_reads_version_and_is_refused_everything_else() {
-    // One fleet connection to `port`, proved with `secret` for `op`, its reads
-    // bounded by the hang detector. A closure, so the transport's rustls type
-    // is inferred, never named here.
     let dial = |port: u16, secret: &[u8], op: FleetOp| {
         let tcp = TcpStream::connect(("127.0.0.1", port)).map_err(FleetError::Io)?;
         let secret = FleetSecret::new(secret).expect("a fleet secret");
@@ -231,19 +157,16 @@ fn a_fleet_peer_reads_version_and_is_refused_everything_else() {
     let inst = boot(port);
     let (_, sid) = boot_session(&inst);
 
-    // The port is the lock: held, the instance waits its turn; let go, it binds.
     fleet_reads(&inst, &sid, "retrying");
     drop(holder);
     fleet_reads(&inst, &sid, "listening");
 
-    // A proved peer runs `version`, and the connection serves another request.
     let (mut peer, scope) = dial(port, &SECRET, FleetOp::Survey).expect("a proved peer");
     assert_eq!(scope, FleetScope::Facts, "the level [fleet] allow names");
     for _ in 0..2 {
         let reply = ask(peer.stream(), "version");
         assert!(reply.starts_with("OK version="), "{reply}");
     }
-    // The survey, at the level the listener proved: facts, whatever is asked.
     for asked in ["survey", "survey content"] {
         let lines = ask_lines(peer.stream(), asked);
         assert!(
@@ -258,13 +181,10 @@ fn a_fleet_peer_reads_version_and_is_refused_everything_else() {
             assert!(!row.contains(content), "{content} at facts: {row}");
         }
     }
-    // Four requests are all one fleet connection is served: then it is
-    // closed, unasked, and a member that wants more dials (and proves) again.
     assert!(
         closed(peer.stream()),
         "a fleet connection closes after its fourth request"
     );
-    // A refused line on a connection that was served still ends it.
     let (mut peer, _) = dial(port, &SECRET, FleetOp::Survey).expect("a proved peer");
     let reply = ask(peer.stream(), "version");
     assert!(reply.starts_with("OK version="), "{reply}");
@@ -272,7 +192,6 @@ fn a_fleet_peer_reads_version_and_is_refused_everything_else() {
     assert!(reply.starts_with("ERR denied: "), "{reply}");
     assert!(closed(peer.stream()), "a refusal closes the connection");
 
-    // Each of these is answered one ERR line, then the connection closes.
     let refused = [
         format!("@{sid} text"),
         format!("@{sid} version"),
@@ -295,7 +214,6 @@ fn a_fleet_peer_reads_version_and_is_refused_everything_else() {
         );
         assert!(closed(peer.stream()), "{line}: the connection must close");
     }
-    // A frame: its header is refused before a byte of its body is taken.
     let (mut peer, _) = dial(port, &SECRET, FleetOp::Survey).expect("a proved peer");
     peer.stream()
         .write_all(b"feed-bin 5\nhello")
@@ -307,16 +225,12 @@ fn a_fleet_peer_reads_version_and_is_refused_everything_else() {
         "{reply}"
     );
     assert!(closed(peer.stream()), "a frame closes the connection");
-    // Nothing reached the session: its screen has no `fleet` and no `hello`.
     let screen = headless_boot::ctl_ok(&inst, &[&format!("@{sid}"), "text"]);
     assert!(
         !screen.contains("echo fleet") && !screen.contains("hello"),
         "a refused line reached the session: {screen}"
     );
 
-    // Another fleet's machine is refused before it sends its proof; a join
-    // here, where no `aterm fleet init` wrote a code, is refused: only the
-    // issuer records members.
     let wrong = dial(port, &[0x11; 20], FleetOp::Survey).err();
     assert!(
         matches!(wrong, Some(FleetError::ListenerWrongSecret)),
@@ -334,9 +248,6 @@ fn a_fleet_peer_reads_version_and_is_refused_everything_else() {
         "a machine that issued no code records no member"
     );
 
-    // A config edit rebinds: the new port is held, so the instance retries it,
-    // and the old one is already closed (the generation serving it ends before
-    // the next begins).
     let (holder, moved) = hold_a_port();
     let config = inst.tmp.join("cfg/aterm/aterm.toml");
     let text = std::fs::read_to_string(&config).expect("the config");
@@ -367,9 +278,6 @@ fn a_fleet_peer_reads_version_and_is_refused_everything_else() {
         "content carries the excerpts: {lines:?}"
     );
 
-    // A rotation while that connection is served: it is cut, the listener
-    // binds again with the new secret, and the old one is refused, all with
-    // no config edit (`status` reads `listening` throughout).
     let state = inst.tmp.join("state");
     write_key(&state, &ROTATED);
     assert!(
@@ -388,9 +296,6 @@ fn a_fleet_peer_reads_version_and_is_refused_everything_else() {
         "the old secret is refused: {old:?}"
     );
 
-    // Removed, no key, no listener, and `status` says why; the key is read
-    // again until it comes, so `aterm fleet init` may write it after the
-    // table.
     std::fs::remove_file(state.join(KEY_FILE)).expect("remove the key");
     fleet_reads(&inst, &sid, "refused:no-key");
     assert!(
@@ -406,8 +311,6 @@ fn a_fleet_peer_reads_version_and_is_refused_everything_else() {
     let (_, scope) = dial(moved, &SECRET, FleetOp::Survey).expect("a proved peer");
     assert_eq!(scope, FleetScope::Content);
 
-    // An address that is not this machine's (TEST-NET-1, which no machine
-    // has: as an interface that is not up yet) is tried again, not refused.
     let text = std::fs::read_to_string(&config).expect("the config");
     let elsewhere = format!("[fleet]\nlisten = \"192.0.2.1:{moved}\"\nallow = \"content\"\n");
     std::fs::write(
@@ -419,7 +322,6 @@ fn a_fleet_peer_reads_version_and_is_refused_everything_else() {
 }
 
 /// A scratch world of its own (HOME, config, state), removed on drop: a fleet
-/// member with no aterm running.
 struct World(PathBuf);
 
 impl Drop for World {
@@ -429,8 +331,6 @@ impl Drop for World {
 }
 
 /// `aterm fleet <args>` in the scratch world `root` — its HOME and config,
-/// `root/state` the state directory — with `stdin` piped in (or none); its
-/// output once it exits, within the hang detector.
 fn fleet(root: &Path, args: &[&str], stdin: Option<&str>) -> Output {
     let aterm = crate::launch_isolation::aterm_executable();
     #[expect(
@@ -459,15 +359,11 @@ fn fleet(root: &Path, args: &[&str], stdin: Option<&str>) -> Output {
 }
 
 /// `aterm ctl <args>` in the scratch world `root`, as [`fleet`] runs `aterm
-/// fleet`: its output once it exits, within the hang detector.
 fn ctl_in(root: &Path, args: &[&str]) -> Output {
     ctl_fed(root, args, None)
 }
 
 /// [`ctl_in`] with `stdin` its standard input (`None`: nothing). Asked again, a
-/// fresh client each time, while the instance has not yet accepted it or answers
-/// it busy ([`headless_boot::until_served`]): the client's own 10 s accept budget
-/// is a person's, and a loaded machine can miss it.
 fn ctl_fed(root: &Path, args: &[&str], stdin: Option<&[u8]>) -> Output {
     headless_boot::until_served(|| {
         let aterm = crate::launch_isolation::aterm_executable();
@@ -544,7 +440,6 @@ fn fleet_init_and_join_through_the_binary_register_a_member() {
         init.contains(&code_file.display().to_string()) && !init.contains(code.trim()),
         "init prints the code's path, never the code:\n{init}"
     );
-    // The instance follows the [fleet] table init wrote.
     fleet_reads(&inst, &sid, "listening");
 
     let member = World(headless_boot::scratch_root("aflm"));
@@ -558,9 +453,6 @@ fn fleet_init_and_join_through_the_binary_register_a_member() {
     let (holder, member_port) = hold_a_port();
     drop(holder);
     let member_port = member_port.to_string();
-    // Registered by its loopback address: a member left to name itself
-    // (`lan_host_name`) is dialled by that name once its address refuses,
-    // which asks the network's resolver for this Mac's name.
     fleet_ok(
         &member.0,
         &["join", "--host", "127.0.0.1", "--port", &member_port],
@@ -584,7 +476,6 @@ fn fleet_init_and_join_through_the_binary_register_a_member() {
         ),
         "the issuer's book holds the member, bound to the key its join proved: {book}"
     );
-    // The member binds the key the real listener proved: the issuer's own.
     let issuer_key = key_of(&inst.tmp.join("state"));
     let theirs = read_peers(&member.0.join("state")).expect("the member's book");
     assert!(
@@ -594,10 +485,6 @@ fn fleet_init_and_join_through_the_binary_register_a_member() {
         "{theirs:?}"
     );
 
-    // Each side checks the other: the member runs no aterm, so the issuer's
-    // check of it is a reason naming where it dialled; the issuer does, so
-    // the member's check of it says what it serves. A row's CHECK is its
-    // last column (columns are two spaces apart).
     let check_of = |row: &str| {
         row.split("  ")
             .map(str::trim)
@@ -616,9 +503,6 @@ fn fleet_init_and_join_through_the_binary_register_a_member() {
         unreached.contains(&format!("127.0.0.1:{member_port}")),
         "{issuer_view}"
     );
-    // The issuer's real instance must answer the check, so it is given the
-    // longest deadline a check takes (10 s), the most room a hang detector
-    // gets here; the issuer's check of the member is refused at once.
     let member_view = fleet_ok(&member.0, &["peers", "--timeout", "10"], None);
     let row = member_view
         .lines()
@@ -632,9 +516,6 @@ fn fleet_init_and_join_through_the_binary_register_a_member() {
     );
     assert_ne!(reached, unreached, "{member_view}\n{issuer_view}");
 
-    // A SECOND MEMBER, a real aterm: it joins the issuer from its own world
-    // before it boots, so the issuer's book names it. The first member never
-    // names it: only the issuer's book leads its read there.
     let (holder, other_port) = hold_a_port();
     drop(holder);
     let other_port_word = other_port.to_string();
@@ -667,8 +548,6 @@ fn fleet_init_and_join_through_the_binary_register_a_member() {
         "the member never named the second member"
     );
 
-    // THE BOOK over the real listeners: the issuer's names itself and its
-    // members; a member's is a refusal naming that member, never a book.
     let secret = aterm_net::fleet::read_key_file(&inst.tmp.join("state")).expect("the fleet's key");
     let issuer_node =
         std::fs::read_to_string(inst.tmp.join("state/fleet-node")).expect("the issuer's node id");
@@ -698,8 +577,6 @@ fn fleet_init_and_join_through_the_binary_register_a_member() {
         "the issuer proves the key the member binds, and its book binds each member's: \
          {issuers:?}"
     );
-    // A machine that claims the issuer's node under another key is no
-    // issuer: the real listener proves its own key, never the one claimed.
     let claimed = book_of(
         port.parse().expect("the issuer's port"),
         issuer_node,
@@ -710,9 +587,6 @@ fn fleet_init_and_join_through_the_binary_register_a_member() {
         "{claimed:?}"
     );
 
-    // A MACHINE THAT TAKES A MEMBER'S NODE ID: the member's node id under
-    // another key, registering with the real issuer, is refused naming the
-    // remedy, and the member's entry stands, bound to its own key.
     let taker = NodeIdentity::from_seed(node, &[0x99; 32]).expect("a node key");
     let mut reached = dial(
         "127.0.0.1",
@@ -753,10 +627,6 @@ fn fleet_init_and_join_through_the_binary_register_a_member() {
         "{members:?}"
     );
 
-    // THE REACH, in process under the hang detector: the member's whole read
-    // (what its `survey --fleet` runs) of its own book, which holds the
-    // issuer alone, comes to the second member through the issuer's book,
-    // and reads its session.
     let own_book = read_peers(&member.0.join("state")).expect("the member's book");
     let me = read_node_identity(&member.0.join("state")).expect("the member's node key");
     let (reads, whole) = read_whole(
@@ -792,13 +662,6 @@ fn fleet_init_and_join_through_the_binary_register_a_member() {
         reads[1].read
     );
 
-    // THE FLEET READ through the CLI, which composes and keeps what that read
-    // found: a closed port is named beside the issuer by hand. Its deadline
-    // is the CLI's own and the longest a read takes (`--timeout 10`): the
-    // issuer's real instance must answer inside it, so it is the most room a
-    // hang detector gets here; every peer in it answers (the closed one at
-    // once), so the read ends when they have, and the reach above does not
-    // hang on it.
     let (closed, closed_port) = hold_a_port();
     drop(closed);
     let add = |port: u16| {
@@ -824,8 +687,6 @@ fn fleet_init_and_join_through_the_binary_register_a_member() {
             .any(|r| r.starts_with("== this machine did not answer: ")),
         "no aterm runs on the member:\n{text}"
     );
-    // A peer's unreached row in a read's `text`: its reason, whole before its
-    // label. The closed port's is this read's, refused at once.
     let reason = |text: &str, port: u16| {
         let head = format!("== 127.0.0.1:{port} did not answer: ");
         text.lines()
@@ -834,9 +695,6 @@ fn fleet_init_and_join_through_the_binary_register_a_member() {
             .unwrap_or_else(|| panic!("an unreached row for :{port}:\n{text}"))
     };
     let refused = reason(&text, closed_port);
-    // Headed by the name dialled — the host the issuer's join code names
-    // (here an address, so no ` at <address>` beside it), as its join answer
-    // gave it — never by what the reply says of itself.
     assert!(
         rows.iter()
             .any(|r| r.starts_with(&format!("== fleet 127.0.0.1:{port} "))
@@ -848,9 +706,6 @@ fn fleet_init_and_join_through_the_binary_register_a_member() {
         text.lines().any(|l| l.starts_with(&sid)),
         "the issuer's session is listed:\n{text}"
     );
-    // The member the issuer's book names answered, its block headed by where
-    // it was dialled, its session listed; the member keeps it as a copy of
-    // the issuer's book, which `aterm fleet peers` lists.
     assert!(
         rows.iter().any(
             |r| r.starts_with(&format!("== fleet 127.0.0.1:{other_port} "))
@@ -885,24 +740,12 @@ fn fleet_init_and_join_through_the_binary_register_a_member() {
         "{listed}"
     );
 
-    // A PORT THAT ACCEPTS AND NEVER SPEAKS, named by hand too, spends the
-    // read's whole deadline: so it is read under a short one, the window
-    // under test, whose close is its answer (what the other peers answer
-    // inside it, and so the rows they get, is the read above's, and nothing
-    // here judges it). Its unreached row has a reason too, and it is not the
-    // closed port's.
     let (silent, silent_port) = hold_a_port();
     add(silent_port);
     let read = ctl_in(&member.0, &["survey", "--fleet", "--timeout", "0.5"]);
     let text = String::from_utf8_lossy(&read.stdout);
     assert_ne!(refused, reason(&text, silent_port), "{text}");
 
-    // `--host`: a word that names more than one peer is refused, naming them;
-    // the issuer's own address and port is one, read in full. The word is
-    // looked up among the peers a key binds first (c3a2a44a1b, as a drive
-    // does): the issuer and the other node answer to it, so the refusal names
-    // those two, and the entries added by hand at the same address, which a
-    // lookup reaches only when no bound peer answers, are not among them.
     let ambiguous = ctl_in(&member.0, &["survey", "--host", "127.0.0.1"]);
     assert_eq!(ambiguous.status.code(), Some(1), "{ambiguous:?}");
     assert!(ambiguous.stdout.is_empty(), "{ambiguous:?}");
@@ -936,10 +779,6 @@ fn fleet_init_and_join_through_the_binary_register_a_member() {
     let left = fleet_ok(&member.0, &["leave"], None);
     assert!(left.contains("fleet.key"), "{left}");
     assert!(!member.0.join("state").join(KEY_FILE).exists());
-    // In no fleet, `--fleet` still prints this machine's, and why no peer was
-    // asked; `--host` is refused.
-    // Two unreached rows, this machine's and the fleet's, each reason whole
-    // before its label.
     let alone = ctl_in(&member.0, &["survey", "--fleet"]);
     let text = String::from_utf8_lossy(&alone.stdout);
     assert_eq!(alone.status.code(), Some(1), "nothing answered: {alone:?}");
@@ -960,8 +799,6 @@ fn fleet_init_and_join_through_the_binary_register_a_member() {
 }
 
 /// `aterm ctl --host <args>` in the scratch world `root`: [`ctl_in`] with
-/// `--host` before the request — the step-in, which dials the fleet and no
-/// control socket.
 fn drive_in(root: &Path, host: &str, args: &[&str]) -> Output {
     let mut all = vec!["--host", host];
     all.extend_from_slice(args);
@@ -1000,26 +837,6 @@ fn drive_refused(root: &Path, host: &str, args: &[&str]) -> String {
 }
 
 /// THE STEP-IN between two real aterms (§5.1): an issuer, and a member whose
-/// person lets the issuer drive it (`aterm fleet allow drive --from <the
-/// issuer's node>`) and nobody else, its boot session a worker.
-///
-/// * The issuer reads the worker over the fleet, types a turn into it that
-///   opens its record again, waits on it with `await task` until its done,
-///   and reads its `result`; the member's `status` says the issuer typed it
-///   (`typed_by=<host> (node <8 hex>) over the fleet`), and its Messages log
-///   records it.
-/// * A verb past the allowlist, and a close of a worker it did not spawn,
-///   are refused by name; a worker it spawned there (a stand-in `claude`
-///   under the member's harness) it closes.
-/// * A member of the same fleet that the list does not name is refused at
-///   the member, however its proof holds.
-/// * The issuer's hold stands as `hold_by=remote`, refusing the member's own
-///   local writes while the issuer's still type, and the issuer's fleet read
-///   names it as its own (`held_from=` its node) until the person takes it.
-/// * The person wins: their Take Over (the dev seam that stands where the
-///   person does, `ATERM_DEBUG_PERSON_INVOKE`) takes that hold away, and
-///   under it every remote write and the remote hold are refused, naming the
-///   person; their Hand Back leaves the session held by no one.
 #[test]
 fn a_mac_its_member_lets_drive_it_drives_a_worker_and_no_other_does() {
     let (holder, port) = hold_a_port();
@@ -1057,7 +874,6 @@ fn a_mac_its_member_lets_drive_it_drives_a_worker_and_no_other_does() {
         std::fs::read_to_string(issuer.tmp.join("state/fleet-node")).expect("its node id");
     let issuer_node = issuer_node.trim().to_owned();
 
-    // A MEMBER NO ONE LETS DRIVE: another machine of the fleet, no aterm.
     let stranger = World(headless_boot::scratch_root("afds"));
     let (holder, stranger_port) = hold_a_port();
     drop(holder);
@@ -1073,7 +889,6 @@ fn a_mac_its_member_lets_drive_it_drives_a_worker_and_no_other_does() {
         Some(&code),
     );
 
-    // THE MEMBER that is driven: its person lets the issuer drive it.
     let (holder, member_port) = hold_a_port();
     drop(holder);
     let member_port_word = member_port.to_string();
@@ -1087,8 +902,6 @@ fn a_mac_its_member_lets_drive_it_drives_a_worker_and_no_other_does() {
                 Some(&code),
             );
             allowed = fleet_ok(tmp, &["allow", "drive", "--from", &issuer_node], None);
-            // A worker's spawn needs the harness on; its stand-in `claude`
-            // exits at once, so nothing is relaunched or upgraded.
             let cfg = tmp.join("cfg/aterm/aterm.toml");
             let base = std::fs::read_to_string(&cfg).expect("the isolation config");
             assert!(
@@ -1106,7 +919,6 @@ fn a_mac_its_member_lets_drive_it_drives_a_worker_and_no_other_does() {
             let bin = tmp.join("bin");
             headless_boot::standin(&bin.join("claude"), STANDIN_CLAUDE);
             std::fs::create_dir_all(tmp.join("work")).expect("the worker's folder");
-            // A worker's tab runs a login shell aterm can type into.
             cmd.env("SHELL", "/bin/zsh")
                 .env("ATERM_STATE_HOME", tmp.join("state"))
                 .env("ATERM_DEBUG_PERSON_INVOKE", "1")
@@ -1127,7 +939,6 @@ fn a_mac_its_member_lets_drive_it_drives_a_worker_and_no_other_does() {
     let target = format!("127.0.0.1:{member_port}");
     let at = format!("@{worker}");
 
-    // A READ over the fleet, and a WORKER's record, as its harness marks it.
     let (read, _) = drive_ok(&issuer.tmp, &target, &[&at, "status"]);
     assert!(
         read.starts_with("OK schema=") && field(&read, "fleet") == Some("listening"),
@@ -1136,8 +947,6 @@ fn a_mac_its_member_lets_drive_it_drives_a_worker_and_no_other_does() {
     ctl_ok(&member, &[&at, "task", "mark", "working"]);
     ctl_ok(&member, &[&at, "task", "mark", "done", "why=landed"]);
 
-    // A TURN over the fleet opens the done worker again, and its verdict
-    // names the record's rev the Enter found.
     let (_, verdict) = drive_ok(
         &issuer.tmp,
         &target,
@@ -1150,8 +959,6 @@ fn a_mac_its_member_lets_drive_it_drives_a_worker_and_no_other_does() {
     let record = ctl_ok(&member, &[&at, "task"]);
     assert_eq!(field(&record, "why"), Some("turn"), "{record}");
     let typed = status(&member, &worker);
-    // By the host the book names the issuer and the node it proved: a host
-    // is the node's own word.
     let credit = format!(
         "127.0.0.1%20(node%20{})%20over%20the%20fleet",
         &issuer_node[..8]
@@ -1169,8 +976,6 @@ fn a_mac_its_member_lets_drive_it_drives_a_worker_and_no_other_does() {
         "the member's Messages records the write: {log}"
     );
 
-    // The worker finishes: its harness writes the result and marks it done.
-    // The issuer's wait over the fleet answers, and it reads the result back.
     let tasks = member.tmp.join("state/tasks");
     std::fs::create_dir_all(&tasks).expect("tasks");
     let md = tasks.join(format!("{worker}-1.result.md"));
@@ -1220,7 +1025,6 @@ fn a_mac_its_member_lets_drive_it_drives_a_worker_and_no_other_does() {
     let (text, stamp) = drive_ok(&issuer.tmp, &target, &[&at, "result"]);
     assert_eq!(text, "Driven from the issuer.\n", "{stamp}");
 
-    // Past the allowlist, by name; a worker it did not spawn stays open.
     let refused = drive_refused(&issuer.tmp, &target, &[&at, "inbox"]);
     assert!(refused.contains("ERR denied: a drive serves"), "{refused}");
     let refused = drive_refused(&issuer.tmp, &target, &[&at, "close"]);
@@ -1228,7 +1032,6 @@ fn a_mac_its_member_lets_drive_it_drives_a_worker_and_no_other_does() {
         refused.contains("ERR denied: a drive closes only a worker it spawned"),
         "{refused}"
     );
-    // THE POSITIVE CONTROL: a worker the issuer spawned there, it closes.
     let work = member.tmp.join("work");
     let work = work.to_str().expect("a UTF-8 scratch path");
     let spawned = drive_fed(
@@ -1255,9 +1058,6 @@ fn a_mac_its_member_lets_drive_it_drives_a_worker_and_no_other_does() {
     let (closed, _) = drive_ok(&issuer.tmp, &target, &[&format!("@{spawned_sid}"), "close"]);
     assert!(closed.starts_with("OK closed"), "{closed}");
 
-    // A MEMBER THE LIST DOES NOT NAME, its proof whole: each side reads the
-    // issuer's book (so each binds the other's key), and the member refuses
-    // it.
     fleet_ok(&stranger.0, &["peers", "--timeout", "10"], None);
     fleet_ok(&member.tmp, &["peers", "--timeout", "10"], None);
     let refused = drive_refused(&stranger.0, &target, &[&at, "status"]);
@@ -1267,8 +1067,6 @@ fn a_mac_its_member_lets_drive_it_drives_a_worker_and_no_other_does() {
         "{refused}"
     );
 
-    // The issuer TAKES the session: its hold is the remote slot's, refusing
-    // the member's own local writes while the issuer's type.
     let (took, _) = drive_ok(&issuer.tmp, &target, &["hold", &worker, "on"]);
     assert_eq!(took.trim(), "OK hold=1", "{took}");
     let held = status(&member, &worker);
@@ -1280,8 +1078,6 @@ fn a_mac_its_member_lets_drive_it_drives_a_worker_and_no_other_does() {
         "{local:?}"
     );
     drive_ok(&issuer.tmp, &target, &[&at, "send", "x"]);
-    // The issuer reads its hold back, as its menu bar's Held from here does:
-    // the member's row names the issuer's node.
     let holds_read = || {
         let read = ctl_in(
             &issuer.tmp,
@@ -1297,9 +1093,6 @@ fn a_mac_its_member_lets_drive_it_drives_a_worker_and_no_other_does() {
         "the member's row names the node that holds it"
     );
 
-    // THE PERSON WINS: their Take Over takes the issuer's hold away, and
-    // under it every remote write is refused naming the person, the remote
-    // hold too; their Hand Back leaves the session held by no one.
     ctl_ok(&member, &["invoke", "TakeOver"]);
     let held = status(&member, &worker);
     assert_eq!(field(&held, "hold_by"), Some("person"), "{held}");

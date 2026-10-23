@@ -1,172 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The Windows half of `aterm-dirfd`: NT handle-relative opens, by-handle
-//! facts, directory listings and POSIX deletes, over `ntdll` and `kernel32`
-//! directly. Its items are the crate's root on a Windows target, named and
-//! shaped as the unix half's where the semantics carry, so the disk reclaim's
-//! two `fd` modules read alike.
+//! Windows implementation of `aterm-dirfd`: NT handle-relative opens ([`openat`], [`pin`]),
+//! metadata ([`fstat`], [`file_id`], [`FileId`], [`volume_guid`]), directory iteration ([`Dir`],
+//! [`DirEntry`]), ownership ([`owner`], [`Sid`]), and identity-checked [`unlinkat`].
 //!
-//! ## What a handle and a name mean here
-//!
-//! * [`OwnedFd`] is `std`'s `OwnedHandle` (and [`AsFd`]/[`BorrowedFd`] its
-//!   `AsHandle`/`BorrowedHandle`), under the unix names. `File::from(handle)`
-//!   makes any of them a `std::fs::File` — which is how a caller reads a
-//!   file's metadata through its handle, or probes cargo's `.cargo-lock` with
-//!   `File::try_lock` (`LockFileEx`, which needs the data right [`OFlags::RDONLY`]
-//!   or [`OFlags::RDWR`] asks for).
-//! * Every open below is `NtCreateFile` with `OBJECT_ATTRIBUTES.RootDirectory`
-//!   set to the caller's directory handle and ONE component as the name: a
-//!   name with a separator (`\` or `/`), a stream colon (`:`), a NUL, or that
-//!   is empty or `..`, is refused with [`Errno::INVAL`] before any call
-//!   ([`Arg`]). `.` names the directory itself (an empty relative name: the
-//!   handle's own file, opened afresh). So no intermediate component is ever
-//!   resolved, and a Win32 spelling rule (trailing dots and spaces, `CON`)
-//!   never applies: the name is the exact on-disk name a listing returned.
-//! * Absolute paths enter only through [`pin`]: a LOCAL volume's root, opened
-//!   by its verbatim `\\?\` spelling (so `MAX_PATH` never applies, whatever
-//!   `LongPathsEnabled` says), then every component relative to the last, as
-//!   the unix reclaim's `pin` walks from `/`. A network path or drive, or a
-//!   `subst` letter, is refused before anything is opened.
-//! * No open asks for backup intent, so each is checked against its file's
-//!   DACL even when the token holds the backup or restore privilege enabled:
-//!   a reclaim lists and deletes only what its user may.
-//!
-//! ## Nothing is ever followed (rule S4 of the Windows disk port)
-//!
-//! Every open passes `FILE_OPEN_REPARSE_POINT`, so a reparse point at the name
-//! is opened AS ITSELF, never reparsed, and `OBJ_DONT_REPARSE` besides (a
-//! kernel older than Windows 10 1709 refuses it with
-//! `STATUS_INVALID_PARAMETER`; the open is then made without it, which the
-//! one-component rule leaves equally safe). A reparse point is then one of
-//! two things, told apart by its tag:
-//!
-//! * a **link** — a name surrogate: a symbolic link, a junction or volume
-//!   mount point, a WSL symlink. [`OFlags::NOFOLLOW`] refuses it with
-//!   [`Errno::LOOP`] (unix's `ELOOP`), and [`unlinkat`] without
-//!   [`AtFlags::REMOVEDIR`] removes it as itself, as `unlink(2)` removes a
-//!   symlink: the link goes, whatever it points at stays. The one exception
-//!   is a folder a VOLUME is mounted on (a junction's tag, a volume's GUID
-//!   name for its target): removing it would unmount that volume, so
-//!   [`unlinkat`] refuses it with [`Errno::MOUNT_POINT`], as unix never
-//!   unlinks a mount point and its tree delete keeps one as another device.
-//! * **anything else** — a cloud-files placeholder, a deduplicated or
-//!   WOF-compressed file, an app-execution alias. Removing one can reach past
-//!   this machine (a cloud placeholder's delete syncs), so it is never
-//!   entered and never removed: [`OFlags::NOFOLLOW`] and [`unlinkat`] refuse
-//!   it with [`Errno::FOREIGN_REPARSE`], and the caller keeps and reports it.
-//!
-//! ## Cloud placeholders are seen as what they are
-//!
-//! A process runs in the Cloud Files placeholder mode
-//! `PHCM_DISGUISE_PLACEHOLDER` unless it says otherwise, and in it the cloud
-//! filter shows every placeholder INSIDE a sync root (OneDrive's, with
-//! Documents and Desktop moved there by Known Folder Move) as a plain file
-//! or folder: no `FILE_ATTRIBUTE_REPARSE_POINT`, tag 0, both in a listing
-//! and through a handle — so the rule above would never fire there, [`pin`]
-//! would walk into a sync root, and a tree delete would remove synced files,
-//! each delete reaching the cloud and every other synced device. Measured
-//! 2026-10-20 on a scratch sync root: in that mode the root reads `0x30`
-//! through its handle and a converted placeholder `0x10`/`0x20`, tag 0;
-//! exposed, `0x430` with tag `0x9000301A` and `0x410`/`0x420` with
-//! `0x9000601A`. So EVERY call here that opens, lists, reads facts or
-//! deletes runs with its thread switched to `PHCM_EXPOSE_PLACEHOLDERS` and
-//! back ([`ExposedPlaceholders`]: a field of the thread's TEB, no system
-//! call, invisible to other threads), and a placeholder reads as the
-//! reparse point it is: kept as [`Errno::FOREIGN_REPARSE`], and a sync root
-//! on a path refuses [`pin`]. A caller that reads attributes through `std`
-//! to decide what is foreign holds [`expose_placeholders`] around it too.
-//!
-//! ## Identity
-//!
-//! A file's identity is [`FileId`]: `FILE_ID_INFO`'s 64-bit volume serial
-//! number and 128-bit file id, read from a handle ([`file_id`], [`fstat`]) or
-//! from a listing ([`DirEntry::ino`]). A file system without `FileIdInfo`
-//! (FAT, exFAT) answers an error, never a narrower id. [`unlinkat`] takes the
-//! identity the name must still carry and checks it on the very handle it
-//! deletes through, so a name swapped between a listing and the delete is
-//! refused ([`Errno::CHANGED`]), never deleted.
-//!
-//! The serial is not a volume's own name: a sector-cloned disk, or an
-//! attached copy of a VHD, carries its source's. [`volume_guid`] reads the
-//! one two volumes never share — the mount manager's GUID name of the volume
-//! holding a handle's file — for a caller that must know a handle is on the
-//! very volume it measured.
-//!
-//! ## Facts without data, and ownership
-//!
-//! [`OFlags::PATH`] opens a name for its facts alone (`FILE_READ_ATTRIBUTES
-//! | READ_CONTROL`, no data right), as Linux's `O_PATH`: a sizing or
-//! ownership walk reads every entry that way, so a file someone holds without
-//! read sharing is still read, and no on-access scanner reads its data.
-//! [`owner`] reads the owner [`Sid`] through such a handle; the disk reclaim
-//! refuses a whole removal over any entry whose owner is neither this
-//! process's user ([`Sid::current_user`]) nor `BUILTIN\Administrators`
-//! ([`Sid::administrators`], an elevated build's).
-//!
-//! ## Deletion
-//!
-//! [`unlinkat`] opens the name with `DELETE` (sharing everything), checks it,
-//! and sets `FileDispositionInfoEx` with `DELETE | POSIX_SEMANTICS |
-//! IGNORE_READONLY_ATTRIBUTE`: the name is gone when the call returns, even
-//! while another process holds the file open with delete sharing, and a
-//! read-only file goes too. A file system without the extended class gets the
-//! legacy `FileDispositionInfo` (delete on last close; a read-only file then
-//! refuses with `ERROR_ACCESS_DENIED`). A file someone holds open WITHOUT
-//! delete sharing refuses the open with [`Errno::SHARING_VIOLATION`], which is
-//! returned at once: nothing here retries, and a refusal is never evidence
-//! that anyone uses the file — only that this delete stopped.
-//!
-//! ## A tree delete
-//!
-//! The walk the reclaim makes, each step checked against what the listing
-//! said, so a name swapped at any moment is refused rather than followed:
-//!
-//! 1. Hold the parent — from [`pin`], or the walk's own open one level up —
-//!    and list it with [`Dir`]. Each entry's identity is
-//!    `FileId { dev: file_id(parent)?.dev, ino: entry.ino() }`.
-//! 2. A real directory ([`FileType::is_dir`]): [`openat`] it with
-//!    `RDONLY | DIRECTORY | NOFOLLOW` and require
-//!    `file_id(&child)? == <its enumerated identity>` BEFORE descending
-//!    ([`Errno::CHANGED`] otherwise: something else now has the name), then
-//!    recurse, then `unlinkat(parent, name, REMOVEDIR, <enumerated id>)`.
-//! 3. Anything else — a file, or a link ([`FileType::is_link`], removed as
-//!    itself) — `unlinkat(parent, name, AtFlags::empty(), <enumerated id>)`.
-//!    A non-link reparse point ([`FileType::is_foreign_reparse`]) is kept
-//!    and reported, never handed to [`unlinkat`] (which would refuse it); a
-//!    volume's mount point, which the listing cannot tell from a junction,
-//!    [`unlinkat`] refuses ([`Errno::MOUNT_POINT`]).
-//! 4. Every refusal ([`Errno::SHARING_VIOLATION`], [`Errno::ACCESS_DENIED`],
-//!    [`Errno::FOREIGN_REPARSE`], [`Errno::MOUNT_POINT`], …) is recorded and
-//!    the rest still tried;
-//!    the directory holding a kept entry then answers [`Errno::NOTEMPTY`].
-//!
-//! `tests/windows.rs`'s `remove_tree` is this walk in miniature.
-//!
-//! ## Errors
-//!
-//! [`Errno`] is a Win32 error code (`GetLastError`'s space; an NTSTATUS goes
-//! through `RtlNtStatusToDosError`, except `STATUS_DELETE_PENDING` and
-//! `STATUS_FILE_IS_A_DIRECTORY`, which it would flatten into
-//! `ERROR_ACCESS_DENIED`), plus this crate's own. "Gone" is
-//! [`Errno::NOENT`] — `ERROR_FILE_NOT_FOUND` — ONLY. `ERROR_PATH_NOT_FOUND`
-//! ([`Errno::PATH_NOT_FOUND`]) says something on the way to the name is
-//! missing (a volume that is not there; a one-component relative name's own
-//! absence is `ERROR_FILE_NOT_FOUND`), which is not "this name is gone". std
-//! files it under `io::ErrorKind::NotFound`, and with it `ERROR_INVALID_DRIVE`,
-//! `ERROR_BAD_NETPATH` and `ERROR_BAD_NET_NAME` (a share that is down): so
-//! [`Errno`]'s conversion to `io::Error` files EVERY code but
-//! `ERROR_FILE_NOT_FOUND` that std would call `NotFound` under `Other`, and a
-//! caller that reads `kind() == NotFound` as "gone" is right. A name under a
-//! directory deleted while its handle was held answers
-//! [`Errno::DELETE_PENDING`].
-//!
-//! ## Freshness
-//!
-//! A listing ([`Dir`]) is the directory index, which lags a file open for
-//! writing; it serves sizes and type and attribute skips, so [`DirEntry`]
-//! carries no time at all. A write time comes from a handle ([`fstat`], or
-//! `File::metadata`).
+//! * [`OwnedFd`], [`BorrowedFd`], and [`AsFd`] wrap `std` handle types; single-component [`Arg`]
+//!   names open with `FILE_OPEN_REPARSE_POINT | OBJ_DONT_REPARSE` under [`OFlags::NOFOLLOW`].
+//! * [`ExposedPlaceholders`] ([`expose_placeholders`]) exposes Cloud Files placeholders so foreign
+//!   reparse points and mount points fail closed ([`Errno::FOREIGN_REPARSE`],
+//!   [`Errno::MOUNT_POINT`], [`Errno::LOOP`]).
+//! * [`Errno`] maps Win32 and NT statuses, reserving [`Errno::NOENT`] for `ERROR_FILE_NOT_FOUND`.
 
 mod ffi;
 
@@ -179,82 +23,48 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, SystemTime};
 
 pub use std::os::windows::io::{AsHandle, AsRawHandle, BorrowedHandle, OwnedHandle};
-/// The unix half's names for `std`'s handle types, so a call site reads the
-/// same on both: `OwnedFd` is `OwnedHandle`, `BorrowedFd` is
-/// `BorrowedHandle`, `AsFd` is `AsHandle`.
+/// The unix half's names for `std`'s handle types, so a call site reads the same.
 pub use std::os::windows::io::{
     AsHandle as AsFd, BorrowedHandle as BorrowedFd, OwnedHandle as OwnedFd,
 };
 
-// Errno
-
-/// A Win32 error code — the Windows reading of the unix half's `errno` (see
-/// the module docs' "Errors" for the mapping and for why only [`Self::NOENT`]
-/// means "gone").
-///
-/// Not an `io::Error`, so callers can match specific values (`Errno::NOENT`,
-/// `Errno::SHARING_VIOLATION`) in patterns. Converting to `io::Error` is one
-/// `.into()`.
+/// A Win32 error code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Errno(pub i32);
 
 /// Bit 29 of a Win32 error code: the customer bit, set by no system code, so
-/// this crate's own refusals can never collide with one.
 const CUSTOMER: i32 = 0x2000_0000;
 
 impl Errno {
-    /// `ERROR_FILE_NOT_FOUND` — the name is not in the directory. The ONE
-    /// code that means "gone".
+    /// `ERROR_FILE_NOT_FOUND`.
     pub const NOENT: Self = Self(ffi::ERROR_FILE_NOT_FOUND);
-    /// `ERROR_PATH_NOT_FOUND` — something on the way to the name is missing
-    /// (a volume root that is not there). NOT "gone": see the module docs.
+    /// `ERROR_PATH_NOT_FOUND`.
     pub const PATH_NOT_FOUND: Self = Self(ffi::ERROR_PATH_NOT_FOUND);
-    /// `ERROR_INVALID_NAME` — a name this crate refuses before any call
-    /// ([`Arg`]), or a path [`pin`] cannot walk.
+    /// `ERROR_INVALID_NAME`.
     pub const INVAL: Self = Self(ffi::ERROR_INVALID_NAME);
-    /// `ERROR_ACCESS_DENIED` — the ACL, a mapped image, a delete the file
-    /// system refuses. A refusal, never a witness of use.
+    /// `ERROR_ACCESS_DENIED`.
     pub const ACCESS_DENIED: Self = Self(ffi::ERROR_ACCESS_DENIED);
-    /// `ERROR_SHARING_VIOLATION` — someone holds the file open without
-    /// sharing what this open asked for (for a delete: without
-    /// `FILE_SHARE_DELETE`). Returned at once, never retried.
+    /// `ERROR_SHARING_VIOLATION`.
     pub const SHARING_VIOLATION: Self = Self(ffi::ERROR_SHARING_VIOLATION);
-    /// `ERROR_DIR_NOT_EMPTY` — unix's `ENOTEMPTY`.
+    /// `ERROR_DIR_NOT_EMPTY`.
     pub const NOTEMPTY: Self = Self(ffi::ERROR_DIR_NOT_EMPTY);
-    /// `ERROR_DIRECTORY` — not a directory (`STATUS_NOT_A_DIRECTORY`), unix's
-    /// `ENOTDIR`; also a link handed to [`unlinkat`] with
-    /// [`AtFlags::REMOVEDIR`], as `rmdir(2)` of a symlink answers.
+    /// `ERROR_DIRECTORY`.
     pub const NOTDIR: Self = Self(ffi::ERROR_DIRECTORY);
-    /// `ERROR_DIRECTORY_NOT_SUPPORTED` — a directory where a file was asked
-    /// for, unix's `EISDIR`.
+    /// `ERROR_DIRECTORY_NOT_SUPPORTED`.
     pub const ISDIR: Self = Self(ffi::ERROR_DIRECTORY_NOT_SUPPORTED);
-    /// `ERROR_DELETE_PENDING` — the file is being deleted (a legacy delete
-    /// waits for its last handle to close); also every open of a name under a
-    /// directory deleted while its handle was held (measured 2026-10-19,
-    /// NTFS): what was in it is gone or going.
+    /// `ERROR_DELETE_PENDING`.
     pub const DELETE_PENDING: Self = Self(ffi::ERROR_DELETE_PENDING);
-    /// `ERROR_REPARSE_POINT_ENCOUNTERED` — the name is a link (a name-surrogate
-    /// reparse point) and [`OFlags::NOFOLLOW`] refused it: unix's `ELOOP`.
+    /// `ERROR_REPARSE_POINT_ENCOUNTERED`.
     pub const LOOP: Self = Self(ffi::ERROR_REPARSE_POINT_ENCOUNTERED);
-    /// This crate's own: the name is a reparse point that is NOT a link (a
-    /// cloud placeholder, a deduplicated file, …), never entered or removed.
+    /// This crate's own: the name is a reparse point that is not a link.
     pub const FOREIGN_REPARSE: Self = Self(CUSTOMER | 1);
-    /// This crate's own: the name no longer carries the identity the caller
-    /// expected ([`unlinkat`]): something renamed another file into its place.
+    /// This crate's own: the name no longer carries the identity the caller expected ([`unlinkat`])
     pub const CHANGED: Self = Self(CUSTOMER | 2);
-    /// This crate's own: [`pin`] was handed a path that does not start at a
-    /// local volume's own root — a UNC path, a mapped network drive, a
-    /// `subst` letter — and walked none of it.
+    /// This crate's own: [`pin`] was handed a path that does not start at a local volume's own root
     pub const NOT_VOLUME_ROOT: Self = Self(CUSTOMER | 3);
-    /// This crate's own: the name is a folder a VOLUME is mounted on — a link
-    /// by its tag, which [`unlinkat`] still never removes: removing it would
-    /// unmount that volume from the folder. unix's `unlink(2)` of a mount
-    /// point refuses alike (`EBUSY`), and its tree delete keeps one as on
-    /// another device.
+    /// This crate's own: the name is a folder a volume is mounted.
     pub const MOUNT_POINT: Self = Self(CUSTOMER | 4);
-    /// This crate's own: this thread's cloud placeholders could not be
-    /// exposed ([`expose_placeholders`]), so a placeholder would read as a
-    /// plain file: nothing was opened, listed or deleted.
+    /// This crate's own: this thread's cloud placeholders could not be exposed.
     pub const PLACEHOLDERS_HIDDEN: Self = Self(CUSTOMER | 5);
 
     /// The raw code.
@@ -263,8 +73,7 @@ impl Errno {
         self.0
     }
 
-    /// Return `true` when this is [`Self::NOENT`] — and only then: see the
-    /// module docs for why `ERROR_PATH_NOT_FOUND` is not.
+    /// Return `true` when this is [`Self::NOENT`].
     #[must_use]
     pub const fn is_noent(self) -> bool {
         self.0 == ffi::ERROR_FILE_NOT_FOUND
@@ -290,7 +99,7 @@ impl Errno {
         match status as u32 {
             ffi::STATUS_DELETE_PENDING => Self::DELETE_PENDING,
             ffi::STATUS_FILE_IS_A_DIRECTORY => Self::ISDIR,
-            // SAFETY: a pure table lookup on a plain integer.
+            // SAFETY: A pure table lookup on a plain integer.
             _ => Self(unsafe { ffi::RtlNtStatusToDosError(status) } as i32),
         }
     }
@@ -333,14 +142,6 @@ impl std::fmt::Display for Errno {
 impl std::error::Error for Errno {}
 
 /// A system code becomes `io::Error::from_raw_os_error`, so its kind is
-/// std's, EXCEPT where std's kind would be `ErrorKind::NotFound` for a code
-/// other than [`Errno::NOENT`] — `ERROR_PATH_NOT_FOUND`,
-/// `ERROR_INVALID_DRIVE`, `ERROR_BAD_NETPATH`, `ERROR_BAD_NET_NAME`, and
-/// whatever std's table adds — which a caller would read as "gone" (module
-/// docs). Those, and this crate's own codes, become `ErrorKind::Other`
-/// carrying the [`Errno`] (recoverable with
-/// `get_ref()?.downcast_ref::<Errno>()`). So `NotFound` out of this crate
-/// always means `ERROR_FILE_NOT_FOUND`.
 impl From<Errno> for std::io::Error {
     fn from(e: Errno) -> Self {
         if e.own_text().is_some() {
@@ -358,22 +159,9 @@ impl From<Errno> for std::io::Error {
 /// This crate's result type.
 pub type Result<T> = std::result::Result<T, Errno>;
 
-// Names
-
-/// A name handed to a handle-relative call: ONE component, as UTF-16.
-///
-/// Stricter than the unix half's (which checks NUL only), because an NT
-/// relative name with a separator resolves its intermediate components and a
-/// colon addresses a stream: refused ([`Errno::INVAL`]) are the empty name,
-/// `..`, and any name holding `\`, `/`, `:` or NUL. `.` is the directory
-/// itself (an empty relative name). Everything else is passed exactly — no
-/// trailing-dot or device-name rewriting applies to a relative NT name.
-///
-/// Implemented once, over `AsRef<OsStr>`, which covers `&str`, `&OsStr`,
-/// `&OsString`, `&Path` and `&PathBuf`.
+/// A name handed to a handle-relative call.
 pub trait Arg {
     /// Encode the name as UTF-16 (empty for `.`) and run `f`.
-    ///
     /// # Errors
     /// [`Errno::INVAL`] for a name refused above.
     fn with_name<T>(self, f: impl FnOnce(&[u16]) -> Result<T>) -> Result<T>;
@@ -390,7 +178,6 @@ impl<A: AsRef<OsStr>> Arg for A {
         if wide.is_empty()
             || name == ".."
             || wide.iter().any(refused)
-            // `UNICODE_STRING` counts bytes in a u16.
             || wide.len() > usize::from(u16::MAX) / 2
         {
             return Err(Errno::INVAL);
@@ -399,42 +186,28 @@ impl<A: AsRef<OsStr>> Arg for A {
     }
 }
 
-// Flags
-
 flags! {
-    /// How [`openat`] opens: the unix flag names, read as Windows rights and
-    /// options (each constant says how). Nothing here is ever followed, with
-    /// or without [`Self::NOFOLLOW`] (module docs).
+    /// How [`openat`] opens: the unix flag names, read as Windows rights and options.
     OFlags(u32) {
-        /// Read: a file's data and attributes (`FILE_GENERIC_READ`), or with
-        /// [`Self::DIRECTORY`] a directory's listing.
+        /// Read: a file's data and attributes (`FILE_GENERIC_READ`).
         RDONLY = 0;
         /// Write a file (`FILE_GENERIC_WRITE`).
         WRONLY = 1;
-        /// Read and write a file — what `File::try_lock` on a lock file needs.
+        /// Read and write a file.
         RDWR = 2;
         /// Create the file when absent (`FILE_OPEN_IF`).
         CREATE = 0x40;
         /// With [`Self::CREATE`], fail if the name exists (`FILE_CREATE`).
         EXCL = 0x80;
-        /// Accepted for the unix call shape; every handle here is synchronous.
+        /// Accepted for the unix call shape.
         NONBLOCK = 0x800;
-        /// The name must be a directory (`FILE_DIRECTORY_FILE`), else
-        /// [`Errno::NOTDIR`]. Read-only; never with [`Self::CREATE`].
+        /// The name must be a directory (`FILE_DIRECTORY_FILE`), else [`Errno::NOTDIR`].
         DIRECTORY = 0x1_0000;
-        /// Refuse a reparse point at the name: [`Errno::LOOP`] for a link,
-        /// [`Errno::FOREIGN_REPARSE`] for anything else. Without it, a reparse
-        /// point opens as itself.
+        /// Refuse a reparse point at the name.
         NOFOLLOW = 0x2_0000;
-        /// Accepted for the unix call shape; no handle here is inheritable.
+        /// Accepted for the unix call shape.
         CLOEXEC = 0x8_0000;
-        /// Open for the file's facts only — `FILE_READ_ATTRIBUTES |
-        /// READ_CONTROL`, no data right, whatever the access mode says (a
-        /// write mode is refused): Linux's `O_PATH`. Enough for [`fstat`],
-        /// [`file_id`] and [`owner`], on a file or (with
-        /// [`Self::DIRECTORY`]) a directory. Asking no data right, it is never
-        /// refused by a holder that shares no reading (a linker writing its
-        /// output), and an on-access scanner has no data open to scan.
+        /// Open for the file's facts.
         PATH = 0x20_0000;
     }
 }
@@ -454,10 +227,9 @@ impl OFlags {
 flags! {
     /// [`unlinkat`]'s flags.
     AtFlags(u32) {
-        /// Remove a directory (it must be empty), as `rmdir(2)`; without it,
-        /// a file or a link.
+        /// Remove a directory (it must be empty), as `rmdir(2)`.
         REMOVEDIR = 0x200;
-        /// Accepted for the unix call shape: nothing here follows a link.
+        /// Accepted for the unix call shape.
         SYMLINK_NOFOLLOW = 0x100;
     }
 }
@@ -470,9 +242,7 @@ impl AtFlags {
 }
 
 flags! {
-    /// File mode bits, accepted for the unix call shape and IGNORED: a file
-    /// created here takes its directory's inheritable ACL, as every Windows
-    /// file does (and as cargo's own lock files do).
+    /// File mode bits, accepted for the unix call shape and ignored.
     Mode(u32) {
         /// 0o700.
         RWXU = 0o700;
@@ -493,31 +263,16 @@ flags! {
     }
 }
 
-// Cloud placeholders
-
-/// This thread switched to seeing cloud placeholders as what they are
-/// (`PHCM_EXPOSE_PLACEHOLDERS`) until the guard drops, which puts back the
-/// mode the thread had — so guards nest, and a caller's own mode survives
-/// every call here (module docs, "Cloud placeholders are seen as what they
-/// are"). Every call of this crate that opens, lists, reads facts or
-/// deletes holds one; a caller that reads attributes or reparse tags
-/// through `std` to decide what is foreign holds one too
-/// ([`expose_placeholders`]).
-///
-/// Tied to its thread (neither `Send` nor `Sync`): the mode is the
-/// thread's, and a guard dropped on another would restore that one's.
+/// This thread switched to seeing cloud placeholders as what they are (`PHCM_EXPOSE_PLACEHOLDERS`).
 #[must_use = "placeholders are exposed only while the guard lives"]
 #[derive(Debug)]
 pub struct ExposedPlaceholders {
-    /// The mode to put back; `None` when nothing was changed (the test
-    /// seam's `seam::leave_placeholders_disguised`).
+    /// The mode to put back.
     previous: Option<i8>,
     _thread: std::marker::PhantomData<*const ()>,
 }
 
-/// Switch this thread to seeing cloud placeholders as reparse points until
-/// the returned guard drops ([`ExposedPlaceholders`]).
-///
+/// Switch this thread to seeing cloud placeholders as reparse points until the returned guard.
 /// # Errors
 /// [`Errno::PLACEHOLDERS_HIDDEN`] when the system refused the mode (it
 /// answers so only for an invalid mode or a thread with no TEB): the caller
@@ -530,7 +285,7 @@ pub fn expose_placeholders() -> Result<ExposedPlaceholders> {
             _thread: std::marker::PhantomData,
         });
     }
-    // SAFETY: writes one field of this thread's own TEB; no pointer.
+    // SAFETY: Writes one field of this thread's own TEB; no pointer.
     let previous =
         unsafe { ffi::RtlSetThreadPlaceholderCompatibilityMode(ffi::PHCM_EXPOSE_PLACEHOLDERS) };
     if previous < 0 {
@@ -545,22 +300,13 @@ pub fn expose_placeholders() -> Result<ExposedPlaceholders> {
 impl Drop for ExposedPlaceholders {
     fn drop(&mut self) {
         if let Some(previous) = self.previous {
-            // SAFETY: as in `expose_placeholders`: this thread's own TEB, the
-            // mode it answered there.
+            // SAFETY: As in `expose_placeholders`: this thread's own TEB, the mode it answered.
             unsafe { ffi::RtlSetThreadPlaceholderCompatibilityMode(previous) };
         }
     }
 }
 
-// Identity and stat
-
 /// A file's identity: `FILE_ID_INFO`'s volume serial number and file id.
-///
-/// `ino` is the 16-byte `FILE_ID_128` read little-endian, so on NTFS (whose
-/// 64-bit file reference fills the low half) it equals the 64-bit id a
-/// `FileIdBothDirectoryInfo` listing gives, zero-extended. The same shape as
-/// `aterm_sysprobe::volumes::FileId`; `dev` is the 64-bit serial, never the
-/// 32-bit `dwVolumeSerialNumber`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct FileId {
     /// `FILE_ID_INFO.VolumeSerialNumber`.
@@ -569,9 +315,7 @@ pub struct FileId {
     pub ino: u128,
 }
 
-/// What a handle says about its file, read through the handle: the unix
-/// half's `st_dev`/`st_ino`/`st_nlink` (the identity widened to [`FileId`]'s),
-/// plus what a Windows caller needs on top.
+/// What a handle says about its file, read through the handle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Stat {
     /// [`FileId::dev`].
@@ -588,11 +332,11 @@ pub struct Stat {
     pub size: u64,
     /// Space allocated on the volume (`AllocationSize`).
     pub allocation: u64,
-    /// Last write, in FILETIME ticks (100 ns since 1601-01-01 UTC).
+    /// Last write, in filetime ticks (100 ns since 1601-01-01 UTC).
     pub last_write: i64,
-    /// Last change of data or metadata (unix's `ctime`), in FILETIME ticks.
+    /// Last change of data or metadata (unix's `ctime`), in filetime ticks.
     pub change_time: i64,
-    /// A legacy delete is pending: the file goes when its last handle closes.
+    /// A legacy delete is pending.
     pub delete_pending: bool,
 }
 
@@ -609,7 +353,7 @@ impl Stat {
         }
     }
 
-    /// What kind of entry this is.
+    /// What kind of entry.
     #[must_use]
     pub const fn file_type(&self) -> FileType {
         FileType::from_attributes(self.attributes, self.reparse_tag)
@@ -631,8 +375,7 @@ pub struct FileType {
 }
 
 impl FileType {
-    /// The kind `attributes` and `reparse_tag` (0 when not a reparse point)
-    /// describe.
+    /// The kind `attributes` and `reparse_tag` (0 when not a reparse point) describe.
     #[must_use]
     pub const fn from_attributes(attributes: u32, reparse_tag: u32) -> Self {
         Self {
@@ -653,7 +396,7 @@ impl FileType {
         self.is_reparse() && self.reparse_tag & ffi::REPARSE_TAG_NAME_SURROGATE != 0
     }
 
-    /// A reparse point that is not a link: kept, never entered or removed.
+    /// A reparse point that is not a link.
     #[must_use]
     pub const fn is_foreign_reparse(self) -> bool {
         self.is_reparse() && !self.is_link()
@@ -671,7 +414,7 @@ impl FileType {
         self.attributes & ffi::FILE_ATTRIBUTE_DIRECTORY == 0 && !self.is_reparse()
     }
 
-    /// `FILE_ATTRIBUTE_READONLY`, which [`unlinkat`] deletes through.
+    /// `FILE_ATTRIBUTE_READONLY`, which [`unlinkat`] deletes.
     #[must_use]
     pub const fn is_readonly(self) -> bool {
         self.attributes & ffi::FILE_ATTRIBUTE_READONLY != 0
@@ -679,7 +422,6 @@ impl FileType {
 }
 
 /// A by-handle information struct: its class, every field a plain integer.
-///
 /// # Safety
 /// `CLASS` must be the `FILE_INFO_BY_HANDLE_CLASS` whose output layout is
 /// exactly `Self`, and every bit pattern must be a valid `Self`.
@@ -687,19 +429,19 @@ unsafe trait Info: Sized {
     const CLASS: i32;
 }
 
-// SAFETY: each is the SDK layout of its class (pinned in `ffi`), integers only.
+// SAFETY: Each is the SDK layout of its class (pinned in `ffi`), integers.
 unsafe impl Info for ffi::FILE_BASIC_INFO {
     const CLASS: i32 = ffi::FileBasicInfo;
 }
-// SAFETY: as above.
+// SAFETY: As above.
 unsafe impl Info for ffi::FILE_STANDARD_INFO {
     const CLASS: i32 = ffi::FileStandardInfo;
 }
-// SAFETY: as above.
+// SAFETY: As above.
 unsafe impl Info for ffi::FILE_ATTRIBUTE_TAG_INFO {
     const CLASS: i32 = ffi::FileAttributeTagInfo;
 }
-// SAFETY: as above.
+// SAFETY: As above.
 unsafe impl Info for ffi::FILE_ID_INFO {
     const CLASS: i32 = ffi::FileIdInfo;
 }
@@ -707,8 +449,7 @@ unsafe impl Info for ffi::FILE_ID_INFO {
 /// Read `T`'s class through `fd` into `out`.
 fn query<T: Info>(fd: BorrowedHandle<'_>, mut out: T) -> Result<T> {
     let len = u32::try_from(size_of::<T>()).map_err(|_| Errno(ffi::ERROR_INVALID_PARAMETER))?;
-    // SAFETY: `fd` is live for the call; `out` is a writable `T` of `len`
-    // bytes, and `T: Info` makes whatever the class writes there a valid `T`.
+    // SAFETY: `fd` is live for the call.
     let ok = unsafe {
         ffi::GetFileInformationByHandleEx(
             fd.as_raw_handle(),
@@ -735,9 +476,7 @@ fn kind_of(fd: BorrowedHandle<'_>) -> Result<FileType> {
     ))
 }
 
-/// The identity of what `fd` is open on: one `FileIdInfo` query, the cheap
-/// half of [`fstat`].
-///
+/// The identity of what `fd` is open.
 /// # Errors
 /// The query's code — `ERROR_INVALID_PARAMETER` on a file system with no
 /// `FileIdInfo` (FAT, exFAT), which has no identity to give.
@@ -756,9 +495,7 @@ pub fn file_id<Fd: AsHandle>(fd: Fd) -> Result<FileId> {
     })
 }
 
-/// Identity, kind, sizes, link count and times of an already-open handle,
-/// independent of whatever a name points at now: the unix half's `fstat`.
-///
+/// Identity, kind, sizes, link count and times of an already-open handle.
 /// # Errors
 /// The first failed query's code; see [`file_id`] for a file system with no
 /// identity.
@@ -808,15 +545,7 @@ pub fn fstat<Fd: AsHandle>(fd: Fd) -> Result<Stat> {
     })
 }
 
-/// The GUID of the volume the file `fd` is open on, as the mount manager
-/// names the volume (`\\?\Volume{6140fc3b-…}\`): `{6140fc3b-…}`, lowercase —
-/// the spelling `aterm_sysprobe`'s `VolumeKey::Volume` keys a volume by.
-/// Read through the handle (`GetFinalPathNameByHandleW` with
-/// `VOLUME_NAME_GUID`), so it names the volume holding THIS file, whatever
-/// letter, folder mount point or `subst` alias reached it. Two volumes never
-/// share it, where they can share [`FileId::dev`] (a sector-cloned disk, an
-/// attached copy of a VHD, keeps its source's serial).
-///
+/// The GUID of the volume the file `fd` is open on, as the mount manager names the volume.
 /// # Errors
 /// The query's code (a volume the mount manager does not name answers one);
 /// `ERROR_INVALID_DATA` for an answer that names no volume GUID.
@@ -825,15 +554,12 @@ pub fn volume_guid<Fd: AsHandle>(fd: Fd) -> Result<String> {
     let mut buf = vec![0u16; 512];
     let path = loop {
         let len = u32::try_from(buf.len()).map_err(|_| Errno(ffi::ERROR_INVALID_DATA))?;
-        // SAFETY: `fd` is live for the call; `buf` is writable for `len`
-        // units and outlives it.
+        // SAFETY: `fd` is live for the call; `buf` is writable for `len` units and outlives it.
         let got = unsafe {
             ffi::GetFinalPathNameByHandleW(raw, buf.as_mut_ptr(), len, ffi::VOLUME_NAME_GUID)
         };
         match got as usize {
             0 => return Err(Errno::last()),
-            // Too small: `got` is the length wanted, its NUL counted. A
-            // second answer that still does not fit is no path.
             wanted if wanted > buf.len() => {
                 if buf.len() > 512 {
                     return Err(Errno(ffi::ERROR_INVALID_DATA));
@@ -847,14 +573,11 @@ pub fn volume_guid<Fd: AsHandle>(fd: Fd) -> Result<String> {
 }
 
 /// The lowercase `{…}` GUID a `\\?\Volume{…}\…` path (UTF-16) starts with,
-/// or `None` when it starts with no such name: `{`, 32 hexadecimal digits
-/// grouped 8-4-4-4-12 by `-`, `}`.
 fn guid_of_volume_path(path: &[u16]) -> Option<String> {
     const HEAD: &str = r"\\?\Volume{";
     let text = String::from_utf16(path).ok()?;
     text.get(..HEAD.len())
         .filter(|head| head.eq_ignore_ascii_case(HEAD))?;
-    // From the `{` the head ends with: 38 characters.
     let guid = text.get(HEAD.len() - 1..HEAD.len() + 37)?;
     let shaped = guid.ends_with('}')
         && guid[1..37].char_indices().all(|(i, c)| {
@@ -867,60 +590,42 @@ fn guid_of_volume_path(path: &[u16]) -> Option<String> {
     shaped.then(|| guid.to_ascii_lowercase())
 }
 
-// Ownership
-
-/// A security identifier (`SID`) in its binary form: who owns a file
-/// ([`owner`]), or who this process runs as ([`Sid::current_user`]).
-/// Two SIDs are the same account exactly when their bytes are equal (what
-/// `EqualSid` compares). It prints in the `S-1-5-…` form.
+/// A security identifier (`SID`) in its binary form.
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct Sid(Vec<u8>);
 
 impl Sid {
-    /// `BUILTIN\Administrators` (`S-1-5-32-544`): the owner Windows gives what
-    /// an ELEVATED process of an administrator creates, by the default
-    /// "objects created by members of the Administrators group" policy — an
-    /// elevated `cargo build` of this same user owns its outputs this way.
+    /// `BUILTIN\Administrators` (`S-1-5-32-544`).
     #[must_use]
     pub fn administrators() -> Self {
         // Revision 1, two sub-authorities, SECURITY_NT_AUTHORITY (5),
-        // SECURITY_BUILTIN_DOMAIN_RID (32), DOMAIN_ALIAS_RID_ADMINS (544).
         Self(vec![1, 2, 0, 0, 0, 0, 0, 5, 32, 0, 0, 0, 0x20, 0x02, 0, 0])
     }
 
-    /// `NT AUTHORITY\SYSTEM` (`S-1-5-18`): the owner of what the system and
-    /// its services create — another user's to every interactive account.
+    /// `NT AUTHORITY\SYSTEM` (`S-1-5-18`).
     #[must_use]
     pub fn local_system() -> Self {
         // Revision 1, one sub-authority, SECURITY_NT_AUTHORITY (5),
-        // SECURITY_LOCAL_SYSTEM_RID (18).
         Self(vec![1, 1, 0, 0, 0, 0, 0, 5, 18, 0, 0, 0])
     }
 
-    /// The user of this process's token (`GetTokenInformation(TokenUser)`):
-    /// whom a file this process creates belongs to, unelevated.
-    ///
+    /// The user of this process's token (`GetTokenInformation(TokenUser)`).
     /// # Errors
     /// The token could not be opened or read.
     pub fn current_user() -> Result<Self> {
         let mut raw: ffi::HANDLE = std::ptr::null_mut();
-        // SAFETY: the process pseudo-handle needs no closing; `raw` is a
-        // writable HANDLE that receives a token handle owned below.
+        // SAFETY: The process pseudo-handle needs no closing.
         if unsafe {
             ffi::OpenProcessToken(ffi::GetCurrentProcess(), ffi::TOKEN_QUERY, &raw mut raw)
         } == 0
         {
             return Err(Errno::last());
         }
-        // SAFETY: a successful OpenProcessToken returned a fresh handle this
-        // function now owns exclusively.
+        // SAFETY: A successful OpenProcessToken returned a fresh handle this function now owns.
         let token = unsafe { OwnedHandle::from_raw_handle(raw) };
-        // A TOKEN_USER and the SID after it, as u64s for the struct's
-        // alignment; a SID is at most 68 bytes, so 128 bytes always do.
         let mut buf = [0u64; 16];
         let mut used = 0u32;
-        // SAFETY: `token` is live; `buf` is writable for the length passed,
-        // aligned for TOKEN_USER; `used` is a writable u32.
+        // SAFETY: `token` is live.
         let ok = unsafe {
             ffi::GetTokenInformation(
                 token.as_raw_handle(),
@@ -933,27 +638,23 @@ impl Sid {
         if ok == 0 {
             return Err(Errno::last());
         }
-        // SAFETY: on success the buffer starts with a TOKEN_USER (aligned, as
-        // `buf` is u64s); its SID pointer points into `buf`, alive here.
+        // SAFETY: On success the buffer starts with a TOKEN_USER (aligned, as `buf` is u64s).
         let sid = unsafe { (*buf.as_ptr().cast::<ffi::TOKEN_USER>()).User.Sid };
         // SAFETY: `sid` points at the token's SID, inside `buf`.
         unsafe { Self::copied(sid) }
     }
 
     /// The SID at `sid`, copied out.
-    ///
     /// # Safety
     /// `sid` must be null or point at memory readable for a SID's length.
     unsafe fn copied(sid: *const c_void) -> Result<Self> {
-        // SAFETY: the caller's contract; IsValidSid reads the header only
-        // after its own checks.
+        // SAFETY: The caller's contract; IsValidSid reads the header only after its own checks.
         if sid.is_null() || unsafe { ffi::IsValidSid(sid) } == 0 {
             return Err(Errno(ffi::ERROR_INVALID_DATA));
         }
-        // SAFETY: a valid SID's length is what GetLengthSid answers, and the
-        // caller's contract makes that many bytes readable.
+        // SAFETY: A valid SID's length is what GetLengthSid answers.
         let len = unsafe { ffi::GetLengthSid(sid) } as usize;
-        // SAFETY: as above: `len` readable bytes at `sid`, copied at once.
+        // SAFETY: As above: `len` readable bytes at `sid`, copied.
         Ok(Self(
             unsafe { std::slice::from_raw_parts(sid.cast::<u8>(), len) }.to_vec(),
         ))
@@ -968,7 +669,6 @@ impl Sid {
 
 impl std::fmt::Display for Sid {
     /// `S-<revision>-<authority>-<sub-authority>…`, the authority in decimal
-    /// (hex past 32 bits, as `ConvertSidToStringSidW` writes it).
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let (Some(&revision), Some(authority)) = (self.0.first(), self.0.get(2..8)) else {
             return f.write_str("S-?");
@@ -998,11 +698,7 @@ impl std::fmt::Debug for Sid {
     }
 }
 
-/// The owner of the file or directory `fd` is open on, read through that
-/// handle (`GetSecurityInfo(OWNER_SECURITY_INFORMATION)`): `fd` needs
-/// `READ_CONTROL`, which [`OFlags::PATH`] asks for (and a file's
-/// [`OFlags::RDONLY`]).
-///
+/// The owner of the file or directory `fd` is open.
 /// # Errors
 /// The query's code (`ERROR_ACCESS_DENIED` without `READ_CONTROL`), or
 /// `ERROR_INVALID_DATA` for a descriptor with no owner.
@@ -1010,8 +706,7 @@ pub fn owner<Fd: AsHandle>(fd: Fd) -> Result<Sid> {
     let _exposed = expose_placeholders()?;
     let mut owner: *mut c_void = std::ptr::null_mut();
     let mut descriptor: *mut c_void = std::ptr::null_mut();
-    // SAFETY: `fd` is live for the call; the two out-pointers are writable
-    // locals; the parts not asked for are null.
+    // SAFETY: `fd` is live for the call.
     let code = unsafe {
         ffi::GetSecurityInfo(
             fd.as_handle().as_raw_handle(),
@@ -1027,24 +722,17 @@ pub fn owner<Fd: AsHandle>(fd: Fd) -> Result<Sid> {
     if code != 0 {
         return Err(Errno(code as i32));
     }
-    // SAFETY: on success `owner` is null or points into `descriptor`, which
-    // stays allocated until the LocalFree below.
+    // SAFETY: On success `owner` is null or points into `descriptor`, which stays allocated.
     let sid = unsafe { Sid::copied(owner) };
-    // SAFETY: `descriptor` was allocated by GetSecurityInfo for this caller
-    // and is freed once, here.
+    // SAFETY: `descriptor` was allocated by GetSecurityInfo for this caller and is freed.
     unsafe { ffi::LocalFree(descriptor) };
     sid
 }
 
-// The opens
-
 /// Whether `OBJ_DONT_REPARSE` is still passed: cleared once a kernel refuses
-/// it (module docs).
 static DONT_REPARSE: AtomicU32 = AtomicU32::new(ffi::OBJ_DONT_REPARSE);
 
 /// `NtCreateFile` of the one-component `name` (empty: `dir` itself) relative
-/// to `dir`, sharing everything, never reparsing, synchronous, without backup
-/// intent: every open in this module but a volume root's.
 fn nt_open(
     dir: BorrowedHandle<'_>,
     name: &[u16],
@@ -1057,8 +745,6 @@ fn nt_open(
         let mut object_name = ffi::UNICODE_STRING {
             Length: bytes,
             MaximumLength: bytes,
-            // Never written through: NtCreateFile reads the name only. An
-            // empty name's dangling pointer is never read (`Length` 0).
             Buffer: name.as_ptr().cast_mut(),
         };
         let attributes = ffi::OBJECT_ATTRIBUTES {
@@ -1074,9 +760,7 @@ fn nt_open(
             Information: 0,
         };
         let mut raw: ffi::HANDLE = std::ptr::null_mut();
-        // SAFETY: every pointer is to a live local (`object_name` outlives the
-        // call, its buffer is `name`, valid for `bytes`), `dir` is a live
-        // handle, and no EA buffer or allocation size is passed.
+        // SAFETY: Every pointer is to a live local.
         let status = unsafe {
             ffi::NtCreateFile(
                 &raw mut raw,
@@ -1087,8 +771,6 @@ fn nt_open(
                 0,
                 ffi::FILE_SHARE_ALL,
                 disposition,
-                // No FILE_OPEN_FOR_BACKUP_INTENT (`ffi` says why): the DACL
-                // applies to every open, whatever privileges the token holds.
                 options | ffi::FILE_OPEN_REPARSE_POINT | ffi::FILE_SYNCHRONOUS_IO_NONALERT,
                 std::ptr::null(),
                 0,
@@ -1097,18 +779,13 @@ fn nt_open(
         if status < 0 {
             return Err(status);
         }
-        // SAFETY: a successful NtCreateFile returned a fresh handle this
-        // function now owns exclusively.
+        // SAFETY: A successful NtCreateFile returned a fresh handle this function now owns.
         Ok(unsafe { OwnedHandle::from_raw_handle(raw) })
     };
     let extra = DONT_REPARSE.load(Ordering::Relaxed);
     match attempt(extra) {
         Ok(handle) => Ok(handle),
         Err(status) if status as u32 == ffi::STATUS_INVALID_PARAMETER && extra != 0 => {
-            // A kernel without OBJ_DONT_REPARSE refuses it this way. Without
-            // it the open is equally safe: one component, FILE_OPEN_REPARSE_POINT.
-            // Remember only when the bare open answers something else (the
-            // refusal was the flag's, not the call's).
             let retried = attempt(0);
             if retried
                 .as_ref()
@@ -1124,7 +801,6 @@ fn nt_open(
 }
 
 /// Refuse a reparse point `kind` describes: a link as [`Errno::LOOP`], any
-/// other as [`Errno::FOREIGN_REPARSE`].
 const fn refuse_reparse(kind: FileType) -> Result<()> {
     if kind.is_link() {
         Err(Errno::LOOP)
@@ -1135,12 +811,7 @@ const fn refuse_reparse(kind: FileType) -> Result<()> {
     }
 }
 
-/// `openat(2)`'s twin: open `name` relative to the directory `dirfd`, never
-/// following anything ([`OFlags`] says what each flag means here).
-/// `mode` is ignored ([`Mode`]).
-///
-/// The returned handle is owned; `File::from` makes it a `std::fs::File`.
-///
+/// `openat(2)`'s twin: open `name` relative to the directory `dirfd`, never following anything.
 /// # Errors
 /// The open's code; [`Errno::LOOP`]/[`Errno::FOREIGN_REPARSE`] for a reparse
 /// point under [`OFlags::NOFOLLOW`]; [`Errno::ISDIR`] for a directory opened
@@ -1202,38 +873,7 @@ pub fn openat<Fd: AsHandle, P: Arg>(
     })
 }
 
-/// Open the directory at the absolute `path` from its LOCAL volume's root,
-/// component by component, never through a reparse point: the unix
-/// reclaim's `pin`, which walks from `/`.
-///
-/// `path` is a drive-letter or volume-GUID absolute path, verbatim or not;
-/// callers pass canonical paths (`std::fs::canonicalize` spells the volume's
-/// own letter). Before anything is opened, the letter's (or `Volume{…}`'s)
-/// DOS device must be a device — `QueryDosDeviceW` answers `\Device\` and
-/// one name, as `\Device\HarddiskVolume3` — and not a redirector's share (a
-/// mapped network drive, `\Device\LanmanRedirector\;Z:…\server\share`,
-/// whose open waits tens of seconds on a host that does not answer) or a
-/// `subst` alias (`\??\C:\some\dir`, a directory reached by a path the
-/// system resolves, links included). A UNC path is refused outright. WHICH
-/// local volumes a reclaim may touch is the caller's to decide (the volume
-/// table's allowlist); this check keeps `pin` itself from waiting on a
-/// network or starting anywhere but a volume's root.
-///
-/// The root is then opened by its verbatim spelling (`\\?\C:\`,
-/// `\\?\Volume{…}\`) with `FILE_FLAG_OPEN_REPARSE_POINT |
-/// FILE_FLAG_BACKUP_SEMANTICS`, critical-error boxes off, and must be its
-/// volume's root (`FileNameInfo` is `\`), which catches a letter redefined
-/// between the check and the open. Every later component is opened with
-/// [`openat`]'s rules, and a reparse point at any of them — a junction, a
-/// symlink, a folder a volume is mounted on — refuses the whole path, as a
-/// symlink component refuses the unix walk. Holding the returned handle keeps
-/// every ancestor where it is: NTFS refuses to rename a directory with a
-/// handle open beneath it.
-///
-/// A verbatim path's `/` is a character of its component, so refused
-/// ([`Arg`]). A non-verbatim component ending in `.` or ` ` (which a Win32
-/// open would silently strip) is refused rather than read two ways.
-///
+/// Open the directory at the absolute `path` from its local volume's root, component by component.
 /// # Errors
 /// [`Errno::NOT_VOLUME_ROOT`] for a UNC path, a network drive or a `subst`
 /// letter; [`Errno::PATH_NOT_FOUND`] for a letter or volume with no device
@@ -1243,8 +883,6 @@ pub fn openat<Fd: AsHandle, P: Arg>(
 /// `\\.\`); [`Errno::LOOP`]/[`Errno::FOREIGN_REPARSE`] for a reparse point;
 /// [`Errno::NOTDIR`] for a file; or the open's code.
 pub fn pin(path: &Path) -> Result<OwnedHandle> {
-    // A sync root on the path, or a placeholder folder under one, is then a
-    // reparse point that is no link: refused as any other.
     let _exposed = expose_placeholders()?;
     let mut parts = path.components();
     let Some(Component::Prefix(prefix)) = parts.next() else {
@@ -1261,7 +899,6 @@ pub fn pin(path: &Path) -> Result<OwnedHandle> {
         {
             (volume.to_owned(), true)
         }
-        // A share: never a local volume, and its open can wait on a host.
         Prefix::UNC(..) | Prefix::VerbatimUNC(..) => return Err(Errno::NOT_VOLUME_ROOT),
         _ => return Err(Errno::INVAL),
     };
@@ -1300,26 +937,19 @@ pub fn pin(path: &Path) -> Result<OwnedHandle> {
 }
 
 /// Check that the DOS device `name` (`C:`, `Volume{…}`) is a device and not
-/// an alias of a share or a path ([`pin`]), asking the object manager only:
-/// nothing here reads a file system or waits on a network.
 fn volume_device(name: &OsStr) -> Result<()> {
     let wide: Vec<u16> = name.encode_wide().chain([0]).collect();
-    // Far longer than any device name; a longer target is not one.
     let mut target = vec![0u16; 1024];
-    // SAFETY: `wide` is NUL-terminated and `target` writable for the length
-    // passed; both outlive the call.
+    // SAFETY: `wide` is NUL-terminated and `target` writable for the length passed.
     let stored =
         unsafe { ffi::QueryDosDeviceW(wide.as_ptr(), target.as_mut_ptr(), target.len() as u32) };
     if stored == 0 {
         return Err(match Errno::last() {
-            // No such device: the drive or volume is not here, which says
-            // nothing about the directory the caller asked for.
             Errno::NOENT => Errno::PATH_NOT_FOUND,
             Errno(ffi::ERROR_INSUFFICIENT_BUFFER) => Errno::NOT_VOLUME_ROOT,
             other => other,
         });
     }
-    // The current target is the first of the list.
     let current = target
         .get(..stored as usize)
         .unwrap_or_default()
@@ -1334,10 +964,6 @@ fn volume_device(name: &OsStr) -> Result<()> {
 }
 
 /// Whether the object-manager target `target` names a device itself:
-/// `\Device\` (any case) and one non-empty name. A mapped network drive's
-/// target is a share under its redirector (`\Device\LanmanRedirector\;Z:…`,
-/// `\Device\Mup\;…`) and a `subst` letter's is a path (`\??\C:\dir`), so
-/// neither is.
 fn is_volume_device(target: &[u16]) -> bool {
     let head: Vec<u16> = r"\device\".encode_utf16().collect();
     let lower = |unit: u16| {
@@ -1356,14 +982,9 @@ fn is_volume_device(target: &[u16]) -> bool {
 }
 
 /// Whether `fd` is open on the root directory of its volume: its
-/// `FileNameInfo`, the path within the volume, is `\`.
 fn is_volume_root(fd: BorrowedHandle<'_>) -> Result<bool> {
-    // A FILE_NAME_INFO with room for 64 UTF-16 units, as `u32`s for its
-    // alignment. A root's name is one unit; a name too long for the buffer
-    // answers ERROR_MORE_DATA, and is not a root either.
     let mut buf = [0u32; 1 + 32];
-    // SAFETY: `fd` is live; `buf` is writable for the length passed and
-    // aligned as FILE_NAME_INFO is, and the class writes only within it.
+    // SAFETY: `fd` is live.
     let ok = unsafe {
         ffi::GetFileInformationByHandleEx(
             fd.as_raw_handle(),
@@ -1393,7 +1014,6 @@ fn is_volume_root(fd: BorrowedHandle<'_>) -> Result<bool> {
 }
 
 /// Open the volume root spelled `root` (verbatim, trailing `\`) as itself,
-/// and refuse it unless it is its volume's root directory.
 fn open_root(root: &OsStr) -> Result<OwnedHandle> {
     let wide: Vec<u16> = root.encode_wide().chain([0]).collect();
     let mut old = 0;
@@ -1404,8 +1024,7 @@ fn open_root(root: &OsStr) -> Result<OwnedHandle> {
             &raw mut old,
         )
     } != 0;
-    // SAFETY: `wide` is NUL-terminated and outlives the call; no security
-    // attributes or template.
+    // SAFETY: `wide` is NUL-terminated and outlives the call; no security attributes or template.
     let raw = unsafe {
         ffi::CreateFileW(
             wide.as_ptr(),
@@ -1417,17 +1036,15 @@ fn open_root(root: &OsStr) -> Result<OwnedHandle> {
             std::ptr::null_mut(),
         )
     };
-    // Read before the mode is restored, which may set it.
     let err = Errno::last();
     if quiet {
-        // SAFETY: restores this thread's previous mode; no out-pointer.
+        // SAFETY: Restores this thread's previous mode; no out-pointer.
         unsafe { ffi::SetThreadErrorMode(old, std::ptr::null_mut()) };
     }
     if raw == ffi::INVALID_HANDLE_VALUE || raw.is_null() {
         return Err(err);
     }
-    // SAFETY: a successful CreateFileW returned a fresh handle this function
-    // now owns exclusively.
+    // SAFETY: A successful CreateFileW returned a fresh handle this function now owns exclusively.
     let handle = unsafe { OwnedHandle::from_raw_handle(raw) };
     if !is_volume_root(handle.as_handle())? {
         return Err(Errno::NOT_VOLUME_ROOT);
@@ -1440,26 +1057,7 @@ fn open_root(root: &OsStr) -> Result<OwnedHandle> {
     Ok(handle)
 }
 
-// Deletion
-
-/// `unlinkat(2)`'s twin, with the identity the name must still carry: open
-/// `name` under `dirfd` for `DELETE` (sharing everything, never following),
-/// check that it is `expect` and the kind `flags` asks for, then delete it
-/// through that same handle with POSIX semantics (module docs, "Deletion").
-///
-/// Without [`AtFlags::REMOVEDIR`]: a file, or a link removed as itself (a
-/// junction's target is never touched) — but never a folder a volume is
-/// mounted on, whose target is read through the deleting handle
-/// ([`Errno::MOUNT_POINT`]). With it: an empty real directory. `.` is
-/// refused: a directory is removed by its name in its parent.
-///
-/// `expect` is the identity the caller ENUMERATED: `FileId { dev: <the
-/// parent's dev>, ino: entry.ino() }` from the [`Dir`] listing that named
-/// this entry. For a directory the caller descended into, that is the id it
-/// checked the opened child against before descending (module docs, "A tree
-/// delete") — never an id read afresh from a handle opened on the name, which
-/// would only prove the name did not change after that open.
-///
+/// `unlinkat(2)`'s twin, with the identity the name must still carry.
 /// # Errors
 /// * [`Errno::CHANGED`] — the name now names another file than `expect`;
 /// * [`Errno::FOREIGN_REPARSE`] — a reparse point that is not a link: kept;
@@ -1477,8 +1075,6 @@ pub fn unlinkat<Fd: AsHandle, P: Arg>(
     expect: FileId,
 ) -> Result<()> {
     let rmdir = flags.has(AtFlags::REMOVEDIR);
-    // Opened and judged with placeholders exposed: a synced file or folder
-    // reads as the reparse point it is, and is kept.
     let _exposed = expose_placeholders()?;
     name.with_name(|name| {
         if name.is_empty() {
@@ -1512,12 +1108,6 @@ pub fn unlinkat<Fd: AsHandle, P: Arg>(
 }
 
 /// Whether the reparse point `fd` is open on (as itself, of kind `kind`) is
-/// a folder a VOLUME is mounted on: an `IO_REPARSE_TAG_MOUNT_POINT` whose
-/// target is a volume's GUID name (`\??\Volume{…}`, what
-/// `SetVolumeMountPointW` writes), where a junction's names a path
-/// (`\??\C:\dir`). Read through `fd` itself, so the reparse point judged is
-/// the one about to be deleted. Any other kind answers `false` unread.
-///
 /// # Errors
 /// `FSCTL_GET_REPARSE_POINT`'s code, or `ERROR_INVALID_DATA` for data that
 /// does not hold the name it says it does: the caller keeps what it could
@@ -1526,12 +1116,9 @@ fn mounts_volume(fd: BorrowedHandle<'_>, kind: FileType) -> Result<bool> {
     if !kind.is_link() || kind.reparse_tag != ffi::IO_REPARSE_TAG_MOUNT_POINT {
         return Ok(false);
     }
-    // As u32s for the header's alignment.
     let mut buf = vec![0u32; ffi::MAXIMUM_REPARSE_DATA_BUFFER_SIZE / 4];
     let mut returned = 0u32;
-    // SAFETY: `fd` is live; no input buffer; `buf` is writable for the length
-    // passed and outlives the call; `returned` is a writable u32; synchronous
-    // (no OVERLAPPED).
+    // SAFETY: `fd` is live.
     let ok = unsafe {
         ffi::DeviceIoControl(
             fd.as_raw_handle(),
@@ -1585,7 +1172,6 @@ fn mounts_volume(fd: BorrowedHandle<'_>, kind: FileType) -> Result<bool> {
 }
 
 /// Whether the NT name `target` is a volume's GUID name, `\??\Volume{…`
-/// (any case) — a volume mount point's target, never a junction's.
 fn is_volume_name(target: &[u16]) -> bool {
     let head: Vec<u16> = r"\??\volume{".encode_utf16().collect();
     target.len() > head.len()
@@ -1600,11 +1186,9 @@ fn is_volume_name(target: &[u16]) -> bool {
 }
 
 /// Delete the file `handle` is open on: the POSIX disposition, or the legacy
-/// one where the file system has no extended class.
 fn dispose(handle: BorrowedHandle<'_>) -> Result<()> {
     let set = |class: i32, info: *const c_void, len: usize| -> Result<()> {
-        // SAFETY: `handle` is live and `info` points at `len` readable bytes
-        // of `class`'s input struct, alive for the call.
+        // SAFETY: `handle` is live and `info` points at `len` readable bytes of `class`'s input.
         let ok = unsafe {
             ffi::SetFileInformationByHandle(handle.as_raw_handle(), class, info, len as u32)
         };
@@ -1644,10 +1228,7 @@ fn unsupported(e: Errno) -> bool {
     .contains(&e.0)
 }
 
-// Directory reading
-
-/// One directory entry, as the directory index lists it: name, identity,
-/// kind and sizes — and no time (module docs, "Freshness").
+/// One directory entry, as the directory index lists it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DirEntry {
     name: OsString,
@@ -1659,21 +1240,19 @@ pub struct DirEntry {
 }
 
 impl DirEntry {
-    /// The entry's exact name. `.` and `..` are never listed (the unix half
-    /// returns them and its callers filter).
+    /// The entry's exact name.
     #[must_use]
     pub fn file_name(&self) -> &OsStr {
         &self.name
     }
 
-    /// The listed file id ([`FileId::ino`]'s reading), the identity a later
-    /// [`unlinkat`] of this name expects, with the directory's own `dev`.
+    /// The listed file id ([`FileId::ino`]'s reading).
     #[must_use]
     pub const fn ino(&self) -> u128 {
         self.ino
     }
 
-    /// What kind of entry this is.
+    /// What kind of entry.
     #[must_use]
     pub const fn file_type(&self) -> FileType {
         FileType::from_attributes(self.attributes, self.reparse_tag)
@@ -1707,9 +1286,9 @@ impl DirEntry {
 /// Which listing class a [`Dir`] reads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Class {
-    /// `FileIdExtdDirectoryInfo`: the 128-bit id and the tag in their own fields.
+    /// `FileIdExtdDirectoryInfo`.
     Extd,
-    /// `FileIdBothDirectoryInfo`: a 64-bit id; the tag rides in `EaSize`.
+    /// `FileIdBothDirectoryInfo`.
     Both,
 }
 
@@ -1728,18 +1307,10 @@ impl Class {
 const LISTING: usize = 64 * 1024;
 
 /// A directory being listed, over its own handle.
-///
-/// The listing position belongs to a handle's file object, so the stream
-/// opens the directory afresh (an empty name relative to the caller's handle)
-/// and the caller's handle is neither consumed nor moved: two streams over
-/// one handle each see every entry. The first query restarts the scan; a file
-/// system without `FileIdExtdDirectoryInfo` is read with
-/// `FileIdBothDirectoryInfo` instead.
 pub struct Dir {
-    /// `None`: the directory was being deleted when opened; it lists nothing.
+    /// `None`: the directory was being deleted when opened.
     handle: Option<OwnedHandle>,
-    /// The query buffer, as `u64`s so it is 8-byte aligned as the classes
-    /// require.
+    /// The query buffer, as `u64`s so it is 8-byte aligned as the classes require.
     buf: Vec<u64>,
     /// The next entry's byte offset in `buf`, `None` when a query is due.
     at: Option<usize>,
@@ -1750,17 +1321,7 @@ pub struct Dir {
 }
 
 impl Dir {
-    /// Open a listing of the directory `fd` is open on, positioned at its
-    /// start.
-    ///
-    /// A directory deleted while the caller held it lists nothing, as the
-    /// unix half reads a removed directory: the sweep's work is done. On NTFS
-    /// both a POSIX delete and a pending legacy one leave it re-openable by
-    /// the empty relative name, and empty (only an empty directory can be
-    /// deleted), measured 2026-10-19. A file system that refuses that
-    /// re-open with `STATUS_DELETE_PENDING` instead is read as empty too —
-    /// a branch NTFS never takes, so `tests/windows.rs` cannot reach it.
-    ///
+    /// Open a listing of the directory `fd` is open on, positioned at its start.
     /// # Errors
     /// The re-open's code.
     pub fn read_from<Fd: AsHandle>(fd: Fd) -> Result<Self> {
@@ -1787,7 +1348,6 @@ impl Dir {
     }
 
     /// Run the next listing query into `buf`: `Ok(false)` at the end. Each
-    /// query lists placeholders exposed, whatever thread iterates.
     fn fill(&mut self) -> Result<bool> {
         let Some(handle) = self.handle.as_ref() else {
             return Ok(false);
@@ -1795,8 +1355,7 @@ impl Dir {
         let _exposed = expose_placeholders()?;
         loop {
             let restart = !self.started;
-            // SAFETY: `handle` is live; `buf` is LISTING writable, 8-aligned
-            // bytes, and the class writes only within them.
+            // SAFETY: `handle` is live.
             let ok = unsafe {
                 ffi::GetFileInformationByHandleEx(
                     handle.as_raw_handle(),
@@ -1812,8 +1371,6 @@ impl Dir {
             let err = Errno::last();
             match err.0 {
                 ffi::ERROR_NO_MORE_FILES => return Ok(false),
-                // A restart that matches nothing (no `.` either: a volume root
-                // with nothing in it).
                 ffi::ERROR_FILE_NOT_FOUND if restart => return Ok(false),
                 _ if restart && self.class == Class::Extd && unsupported(err) => {
                     self.class = Class::Both;
@@ -1825,8 +1382,7 @@ impl Dir {
 
     /// The entry at byte `at` of the buffer, and the next entry's offset.
     fn parse(&self, at: usize) -> Result<(DirEntry, Option<usize>)> {
-        // SAFETY: any `u64` buffer is a valid `u8` buffer of eight times the
-        // length, and the borrow of `self.buf` outlives `bytes`.
+        // SAFETY: Any `u64` buffer is a valid `u8` buffer of eight times the length.
         let bytes: &[u8] = unsafe {
             std::slice::from_raw_parts(self.buf.as_ptr().cast::<u8>(), self.buf.len() * 8)
         };
@@ -1862,7 +1418,6 @@ impl Dir {
                 offset_of!(B, FileName),
             ),
         };
-        // Both layouts share the leading fields.
         let size = i64_at(offset_of!(E, EndOfFile))?;
         let allocation = i64_at(offset_of!(E, AllocationSize))?;
         let next = u32_at(offset_of!(E, NextEntryOffset))? as usize;
@@ -1922,8 +1477,6 @@ impl Iterator for Dir {
     }
 }
 
-// Test seam
-
 #[cfg(any(test, debug_assertions))]
 thread_local! {
     static LEGACY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -1932,7 +1485,6 @@ thread_local! {
 }
 
 /// Whether this thread reads listings with `FileIdBothDirectoryInfo` and
-/// deletes with the legacy disposition ([`seam::legacy_classes`]).
 fn legacy() -> bool {
     #[cfg(any(test, debug_assertions))]
     {
@@ -1944,64 +1496,44 @@ fn legacy() -> bool {
     }
 }
 
-/// What a test drives that this machine's NTFS never reaches on its own, and
-/// what it observes that no caller needs. All of the tests' FFI is here, so
-/// it stays in this crate's one audited FFI file.
+/// What a test drives that this machine's ntfs never reaches on its own.
 #[cfg(any(test, debug_assertions))]
 pub mod seam {
     use super::{AsHandle, AsRawHandle as _, Errno, Result, ffi};
     use std::os::windows::ffi::OsStrExt as _;
     use std::path::Path;
 
-    /// On this thread, read listings with `FileIdBothDirectoryInfo` and delete
-    /// with the legacy `FileDispositionInfo` — the paths a file system without
-    /// the extended classes takes — until turned off.
+    /// On this thread, read listings with `FileIdBothDirectoryInfo` and delete with the legacy.
     pub fn legacy_classes(on: bool) {
         super::LEGACY.with(|legacy| legacy.set(on));
     }
 
-    /// On this thread, every [`super::ExposedPlaceholders`] leaves the
-    /// thread's mode as it is — a process's default disguises a placeholder
-    /// as a plain file — until turned off: the negative control of the
-    /// placeholder rule, what this crate saw before it exposed them.
+    /// On this thread, every [`super::ExposedPlaceholders`] leaves the thread's mode as it.
     pub fn leave_placeholders_disguised(on: bool) {
         super::DISGUISED.with(|disguised| disguised.set(on));
     }
 
-    /// This thread's cloud-placeholder mode as the system holds it now:
-    /// `0` (the process's default applies), or a `PHCM_*` it set — `2` while
-    /// placeholders are exposed.
+    /// This thread's cloud-placeholder mode as the system holds it now.
     #[must_use]
     pub fn thread_placeholder_mode() -> i8 {
-        // SAFETY: reads one field of this thread's own TEB.
+        // SAFETY: Reads one field of this thread's own TEB.
         unsafe { ffi::RtlQueryThreadPlaceholderCompatibilityMode() }
     }
 
-    /// [`super::volume_guid`]'s reading of the path the system answered:
-    /// the lowercase `{…}` GUID a `\\?\Volume{…}\…` path starts with.
+    /// [`super::volume_guid`]'s reading of the path the system answered.
     #[must_use]
     pub fn guid_of_volume_path(path: &str) -> Option<String> {
         super::guid_of_volume_path(&path.encode_utf16().collect::<Vec<u16>>())
     }
 
-    /// A cloud sync root registered on a test's own scratch folder, as a
-    /// sync client registers one (`CfRegisterSyncRoot`: per user, no
-    /// administrator, no registry entry — measured 2026-10-20) with no
-    /// provider ever connected: every folder whole on disk
-    /// (`CF_POPULATION_POLICY_ALWAYS_FULL`), so a listing never waits on a
-    /// provider. The folder reads as a reparse point of the cloud tag, and
-    /// [`Self::convert`] makes what lies under it placeholders. Dropped, it
-    /// is unregistered (`CfUnregisterSyncRoot`), and the folder and every
-    /// placeholder under it read as plain files and folders again, which a
-    /// scratch directory then removes as any other.
+    /// A cloud sync root registered on a test's own scratch folder.
     pub struct SyncRoot {
         /// The folder, NUL-terminated, as registered.
         path: Vec<u16>,
     }
 
     impl SyncRoot {
-        /// Register the existing folder `path` (absolute; on NTFS).
-        ///
+        /// Register the existing folder `path` (absolute; on ntfs).
         /// # Errors
         /// The `HRESULT` refusing it, as the Win32 code it carries (or the
         /// raw `HRESULT`).
@@ -2017,7 +1549,6 @@ pub mod seam {
                 SyncRootIdentityLength: 0,
                 FileIdentity: std::ptr::null(),
                 FileIdentityLength: 0,
-                // Any GUID: this crate's tests are the only provider of it.
                 ProviderId: [0x6174_6572, 0x6d2d_6469, 0x7266_642d, 0x7465_7374],
             };
             let policies = ffi::CF_SYNC_POLICIES {
@@ -2030,9 +1561,7 @@ pub mod seam {
                 HardLink: 0,
                 PlaceholderManagement: 0,
             };
-            // SAFETY: `wide`, `name` and `version` are NUL-terminated and
-            // outlive the call; both structs are live locals of their SDK
-            // layout (pinned in `ffi`), their sizes in `StructSize`.
+            // SAFETY: `wide`, `name` and `version` are NUL-terminated and outlive the call.
             let hr = unsafe {
                 ffi::CfRegisterSyncRoot(
                     wide.as_ptr(),
@@ -2045,10 +1574,7 @@ pub mod seam {
             Ok(SyncRoot { path: wide })
         }
 
-        /// Make the existing file or folder `path`, under this root, a
-        /// placeholder of it: in sync, its data local — a synced file as a
-        /// sync client leaves one after uploading it.
-        ///
+        /// Make the existing file or folder `path`, under this root, a placeholder of it.
         /// # Errors
         /// The open's code, or the `HRESULT` refusing the conversion.
         pub fn convert(&self, path: &Path) -> Result<()> {
@@ -2063,9 +1589,7 @@ pub mod seam {
                 .map_err(|e| Errno(e.raw_os_error().unwrap_or(ffi::ERROR_INVALID_FUNCTION)))?;
             let identity = b"aterm-dirfd test";
             let mut usn = 0i64;
-            // SAFETY: `file` is open for writing and live for the call;
-            // `identity` is readable for its length; `usn` is a writable
-            // i64; no OVERLAPPED, so the call completes before returning.
+            // SAFETY: `file` is open for writing and live for the call.
             let hr = unsafe {
                 ffi::CfConvertToPlaceholder(
                     file.as_raw_handle(),
@@ -2082,12 +1606,8 @@ pub mod seam {
 
     impl Drop for SyncRoot {
         fn drop(&mut self) {
-            // SAFETY: `path` is the NUL-terminated folder this root was
-            // registered on, alive for the call.
+            // SAFETY: `path` is the NUL-terminated folder this root was registered on, alive.
             let hr = unsafe { ffi::CfUnregisterSyncRoot(self.path.as_ptr()) };
-            // A root left registered outlives the test: said loudly — as a
-            // failure, unless the test is already failing (a second panic
-            // would abort the run).
             if hr < 0 {
                 let path = String::from_utf16_lossy(&self.path);
                 if std::thread::panicking() {
@@ -2100,8 +1620,6 @@ pub mod seam {
     }
 
     /// An `HRESULT` as this crate's result: a failure carrying a Win32 code
-    /// (`HRESULT_FROM_WIN32`'s `0x8007xxxx`) as that code, any other as the
-    /// raw `HRESULT`.
     fn hresult(hr: ffi::HRESULT) -> Result<()> {
         if hr >= 0 {
             Ok(())
@@ -2112,8 +1630,7 @@ pub mod seam {
         }
     }
 
-    /// The SDK name of the listing class `dir` reads with now (it can change
-    /// at the first query, when the extended class is refused).
+    /// The SDK name of the listing class `dir` reads with now.
     #[must_use]
     pub fn listing_class(dir: &super::Dir) -> &'static str {
         match dir.class {
@@ -2122,17 +1639,13 @@ pub mod seam {
         }
     }
 
-    /// [`super::pin`]'s device check on an object-manager target as
-    /// `QueryDosDeviceW` spells it: whether it names a device itself.
+    /// [`super::pin`]'s device check on an object-manager target as `QueryDosDeviceW` spells it.
     #[must_use]
     pub fn is_volume_device(target: &str) -> bool {
         super::is_volume_device(&target.encode_utf16().collect::<Vec<u16>>())
     }
 
-    /// [`super::pin`]'s device check on the live DOS device `name` (`C:`,
-    /// `Volume{…}`, or any other DOS name, which `pin` itself never passes):
-    /// the same query and classification `pin` makes before opening a root.
-    ///
+    /// [`super::pin`]'s device check on the live dos device `name`.
     /// # Errors
     /// [`Errno::NOT_VOLUME_ROOT`] for a device that is not a volume's,
     /// [`Errno::PATH_NOT_FOUND`] for no such device.
@@ -2140,21 +1653,14 @@ pub mod seam {
         super::volume_device(std::ffi::OsStr::new(name))
     }
 
-    /// [`super::pin`]'s check on an opened root: whether `fd` is open on its
-    /// volume's root directory.
-    ///
+    /// [`super::pin`]'s check on an opened root.
     /// # Errors
     /// The `FileNameInfo` query's code.
     pub fn is_volume_root<Fd: AsHandle>(fd: Fd) -> Result<bool> {
         super::is_volume_root(fd.as_handle())
     }
 
-    /// Make the file `fd` is open on a reparse point with `tag` and `guid`
-    /// and no payload, as a third party's file-system filter does — a stand-in
-    /// for a cloud placeholder that needs no sync provider. `fd` must be open
-    /// for writing with `FILE_FLAG_OPEN_REPARSE_POINT`; `tag` must be a
-    /// non-Microsoft one (bit 31 clear), which a standard user may set.
-    ///
+    /// Make the file `fd` is open on a reparse point with `tag` and `guid` and no payload.
     /// # Errors
     /// `FSCTL_SET_REPARSE_POINT`'s code.
     pub fn set_reparse_tag<Fd: AsHandle>(fd: Fd, tag: u32, guid: [u8; 16]) -> Result<()> {
@@ -2165,8 +1671,7 @@ pub mod seam {
             ReparseGuid: guid,
         };
         let mut returned = 0u32;
-        // SAFETY: a live handle; the input is `buffer`, alive for the call and
-        // exactly its length; no output buffer; synchronous (no OVERLAPPED).
+        // SAFETY: A live handle.
         let ok = unsafe {
             ffi::DeviceIoControl(
                 fd.as_handle().as_raw_handle(),
@@ -2182,29 +1687,15 @@ pub mod seam {
         if ok == 0 { Err(Errno::last()) } else { Ok(()) }
     }
 
-    /// Make the EMPTY directory `fd` is open on an
-    /// `IO_REPARSE_TAG_MOUNT_POINT` reparse point whose target is the NT name
-    /// `substitute` — `\??\C:\dir` for a junction, `\??\Volume{…}\` for a
-    /// folder a volume is mounted on — the data `mklink /J` and
-    /// `SetVolumeMountPointW` write. Set directly, a volume mount point needs
-    /// no administrator (as `SetVolumeMountPointW` does) and nothing is
-    /// mounted: the mount manager never hears of it, and a target volume
-    /// that does not exist is never reached. `fd` must be open for writing
-    /// with `FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS`.
-    ///
+    /// Make the empty directory `fd` is open on an `IO_REPARSE_TAG_MOUNT_POINT` reparse point.
     /// # Errors
     /// [`Errno::INVAL`] for a name too long for reparse data;
     /// `FSCTL_SET_REPARSE_POINT`'s code.
     pub fn set_mount_point<Fd: AsHandle>(fd: Fd, substitute: &str) -> Result<()> {
         let target: Vec<u16> = substitute.encode_utf16().collect();
         let field = |bytes: usize| u16::try_from(bytes).map_err(|_| Errno::INVAL);
-        // The substitute name, then an empty print name, each NUL-terminated
-        // as the system writes them.
         let names = (target.len() + 1 + 1) * 2;
         let header = size_of::<ffi::MOUNT_POINT_REPARSE_HEADER>();
-        // The header's fields in its order: the tag, the length of all that
-        // follows the first eight bytes, `Reserved`, then each name's offset
-        // and length (no NUL) from the path buffer.
         let fields = [
             field(header - 8 + names)?,
             0,
@@ -2219,8 +1710,7 @@ pub mod seam {
             data.extend(value.to_ne_bytes());
         }
         let mut returned = 0u32;
-        // SAFETY: a live handle; the input is `data`, alive for the call and
-        // exactly its length; no output buffer; synchronous (no OVERLAPPED).
+        // SAFETY: A live handle.
         let ok = unsafe {
             ffi::DeviceIoControl(
                 fd.as_handle().as_raw_handle(),

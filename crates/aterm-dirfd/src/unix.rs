@@ -1,55 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The unix half of `aterm-dirfd`: the fd-relative POSIX directory operations
-//! aterm's confined artifact and media paths are built on, over `libc`
-//! directly. Its items are the crate's root on a unix target.
-//!
-//! ## The property this exists to preserve
-//!
-//! Every operation here is **fd-relative and re-resolves nothing**. A `PathBuf`
-//! is a claim about one instant: a same-uid process can rename an ancestor and
-//! leave a symlink at the old pathname before a worker writes. `PinnedDir`
-//! answers that by opening each absolute-path component with `O_NOFOLLOW`,
-//! RETAINING the descriptors, and doing all later work relative to the leaf.
-//!
-//! So the contract of this crate is narrow and strict:
-//!
-//! * Every entry point takes a directory descriptor plus a NAME (or the `/` and
-//!   `.` paths `PinnedDir`'s chain opens), and issues the `*at` syscall for it.
-//!   No wrapper here ever joins, canonicalizes, walks or re-opens a path.
-//!   [`Arg`] checks NUL only; it does NOT check that a name is one component,
-//!   so a caller taking a name from elsewhere judges it first (ruling
-//!   2026-10-10, FS-1: see [`Arg`]).
-//! * No entry point follows a symlink on its own initiative; whether links are
-//!   followed is the caller's [`OFlags`]/[`AtFlags`] decision, unchanged. Those
-//!   flags govern the FINAL component only: the kernel resolves every earlier
-//!   one, so `"link/"` reaches through the symlink `link`.
-//! * Errors are the raw `errno`, never collapsed into a boolean or an
-//!   `Option` — `remove_file_if_exists` distinguishes `ENOENT` from every other
-//!   failure, and a wrapper that lost that distinction would turn "permission
-//!   denied" into "already gone".
-//!
-//! ## Platform semantics that are NOT approximated
-//!
-//! [`renameat_with`] is the one place where the two platforms genuinely differ,
-//! and it is implemented per-platform rather than emulated:
-//!
-//! * **Linux** — `renameat2(2)` with `RENAME_NOREPLACE`,
-//!   issued through `syscall(2)` so it works on a musl or pre-2.28 glibc that
-//!   has no wrapper for it.
-//! * **macOS** — `renameatx_np(2)` with `RENAME_EXCL`, the documented Darwin
-//!   equivalent.
-//! * **Anywhere else** — [`RenameFlags`] operations are REFUSED with `ENOSYS`:
-//!   a plain `renameat` would clobber an existing destination, the race
-//!   `RENAME_NOREPLACE` exists to close. Callers select a `linkat` + `unlinkat`
-//!   fallback there at compile time.
-//!
-//! ## Tests
-//!
-//! `tests/dirfd.rs` drives this crate and `std::fs` over identical real trees
-//! and requires agreement on every result, errno, `stat` field, listing and
-//! the tree left behind.
+//! The unix half of `aterm-dirfd`.
 
 use std::ffi::{CStr, OsStr};
 use std::os::fd::{FromRawFd as _, IntoRawFd as _};
@@ -57,23 +9,16 @@ use std::os::unix::ffi::OsStrExt as _;
 
 pub use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 
-// Errno
-
 /// A raw POSIX `errno`.
-///
-/// Not an `io::Error`, so callers can match specific values (`Errno::NOENT`)
-/// in patterns. Converting to `io::Error` is one `.into()`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Errno(pub i32);
 
 impl Errno {
-    /// `ENOENT` — no such file or directory. The one code the artifact cleanup
-    /// path treats as success rather than failure.
+    /// `ENOENT` — no such file or directory.
     pub const NOENT: Self = Self(libc::ENOENT);
     /// `EINVAL` — used here for a name that cannot become a C string.
     pub const INVAL: Self = Self(libc::EINVAL);
-    /// `ENOSYS` — the platform has no such operation. Returned instead of
-    /// approximating one, by the flagged rename on a platform with none.
+    /// `ENOSYS` — the platform has no such operation.
     #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
     pub const NOSYS: Self = Self(libc::ENOSYS);
 
@@ -174,27 +119,12 @@ fn check(ret: libc::c_int) -> Result<()> {
     if ret < 0 { Err(Errno::last()) } else { Ok(()) }
 }
 
-// Path arguments
-
-/// A name handed to a `*at` syscall, or one of the `/` and `.` paths
-/// `PinnedDir`'s chain opens (`openat(CWD, "/")`, `openat(leaf, ".")`).
-///
-/// It checks NUL only and does NOT check that a name is one component: any
-/// path passes. (FS-1): `Arg` stays able to carry those
-/// paths, so the one-name rule belongs to the caller. A caller taking a name
-/// from elsewhere judges it on its RAW bytes first (aterm-gui's
-/// `pinned_dir::validate_component`), never through `Path::components()`,
-/// which normalizes a trailing `/`, `/.` and `//` away. `O_NOFOLLOW`,
-/// `unlinkat` and `renameat` govern only the final component, so `"link/"`
-/// reaches through the symlink `link`.
-///
-/// Implemented once, over `AsRef<OsStr>`, which covers `&str`, `&OsStr`,
-/// `&OsString`, `&Path` and `&PathBuf` — every shape the call sites use.
+/// A name handed to a `*at` syscall, or one of the `/` and `.` paths `PinnedDir`'s chain opens (`openat(CWD, "/")`, `openat(leaf, ".")`).
 pub trait Arg {
     /// Materialise the argument as a NUL-terminated C string and run `f`.
-    ///
     /// # Errors
     /// [`Errno::INVAL`] if the name contains an interior NUL (truncating would
+    /// address a different file).
     /// address a different file).
     fn with_c_str<T>(self, f: impl FnOnce(&CStr) -> Result<T>) -> Result<T>;
 }
@@ -205,13 +135,10 @@ impl<A: AsRef<OsStr>> Arg for A {
         if bytes.contains(&0) {
             return Err(Errno::INVAL);
         }
-        // Names are single path components or short absolute paths; keep them
-        // off the heap. `SMALL` comfortably covers NAME_MAX (255) plus the NUL.
         const SMALL: usize = 512;
         if bytes.len() < SMALL {
             let mut buf = [0u8; SMALL];
             buf[..bytes.len()].copy_from_slice(bytes);
-            // The tail is already zero, so the string is NUL-terminated.
             let c = CStr::from_bytes_until_nul(&buf[..=bytes.len()]).map_err(|_| Errno::INVAL)?;
             f(c)
         } else {
@@ -223,8 +150,6 @@ impl<A: AsRef<OsStr>> Arg for A {
         }
     }
 }
-
-// Flags
 
 flags! {
     /// `open(2)` flags.
@@ -240,15 +165,12 @@ flags! {
         /// `O_APPEND` — every write lands at the file's end.
         APPEND = libc::O_APPEND;
         /// `O_EXCL` — with `O_CREAT`, fail if the name already exists. The
-        /// atomic "create or lose" the private-file path depends on.
         EXCL = libc::O_EXCL;
         /// `O_DIRECTORY` — fail unless the name is a directory.
         DIRECTORY = libc::O_DIRECTORY;
         /// `O_NOFOLLOW` — fail if the final component is a symlink. Applies to
-        /// the last component only, which is why the callers pin every ancestor.
         NOFOLLOW = libc::O_NOFOLLOW;
         /// `O_NONBLOCK` — so opening a FIFO left in place by another process
-        /// cannot wedge the server thread.
         NONBLOCK = libc::O_NONBLOCK;
         /// `O_CLOEXEC`.
         CLOEXEC = libc::O_CLOEXEC;
@@ -288,16 +210,11 @@ flags! {
 }
 
 /// Flags for [`renameat_with`].
-///
-/// Carried abstractly and translated at the syscall, because the platforms use
-/// different values for the same idea; a caller cannot pass a Linux constant on
-/// Darwin.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct RenameFlags(u8);
 
 impl RenameFlags {
-    /// Fail with `EEXIST` if the destination already exists, instead of
-    /// replacing it. `RENAME_NOREPLACE` on Linux, `RENAME_EXCL` on Darwin.
+    /// Fail with `EEXIST` if the destination already exists, instead of replacing it.
     pub const NOREPLACE: Self = Self(1);
 
     /// No flags — equivalent to a plain [`renameat`].
@@ -324,20 +241,12 @@ impl std::ops::BitOr for RenameFlags {
 }
 
 /// `AT_FDCWD`, as a descriptor usable wherever a directory descriptor is taken.
-///
-/// Resolves names against the current directory; callers use it only to open
-/// `/` and to re-open an absolute path for an identity check.
 pub const CWD: BorrowedFd<'static> = {
-    // SAFETY: `AT_FDCWD` is the kernel's "current directory" sentinel, valid for
-    // every `*at` call, and is not -1 as `borrow_raw` requires.
+    // SAFETY: `AT_FDCWD` is the kernel's "current directory" sentinel, valid for every `*at` call, and is not -1 as `borrow_raw` requires.
     unsafe { BorrowedFd::borrow_raw(libc::AT_FDCWD) }
 };
 
-// stat
-
-/// The subset of `struct stat` these callers read, widened to fixed sizes so
-/// the call sites do not vary by platform. All four fields answer identity
-/// questions: which inode on which device, what kind, how many names.
+/// The subset of `struct stat` these callers read, widened to fixed sizes so the call sites do not vary by platform.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Stat {
     /// Device the inode lives on.
@@ -346,8 +255,7 @@ pub struct Stat {
     pub st_ino: u64,
     /// Type and permission bits.
     pub st_mode: u32,
-    /// Hard-link count. Zero means fully unlinked; one means this is the only
-    /// name, which the private-file guarantee rests on.
+    /// Hard-link count.
     pub st_nlink: u64,
 }
 
@@ -388,18 +296,13 @@ impl FileType {
     }
 }
 
-// The operations
-
 /// `openat(2)`: open `name` relative to the directory `dirfd`.
-///
-/// The returned descriptor is owned; nothing here ever re-resolves `name`.
 ///
 /// # Errors
 /// The raw `errno` from the syscall, or [`Errno::INVAL`] for an unusable name.
 pub fn openat<Fd: AsFd, P: Arg>(dirfd: Fd, name: P, flags: OFlags, mode: Mode) -> Result<OwnedFd> {
     name.with_c_str(|name| {
-        // SAFETY: `dirfd` is a live descriptor for the duration of the call and
-        // `name` is a NUL-terminated C string valid for it.
+        // SAFETY: `dirfd` is a live descriptor for the duration of the call and `name` is a NUL-terminated C string valid for it.
         let fd = unsafe {
             libc::openat(
                 dirfd.as_fd().as_raw_fd(),
@@ -416,14 +319,12 @@ pub fn openat<Fd: AsFd, P: Arg>(dirfd: Fd, name: P, flags: OFlags, mode: Mode) -
     })
 }
 
-/// `fstat(2)`: identity and type of an already-open descriptor, independent of
-/// whatever a name points at now.
+/// `fstat(2)`: identity and type of an already-open descriptor, independent of whatever a name points at now.
 ///
 /// # Errors
 /// The raw `errno` from the syscall.
 pub fn fstat<Fd: AsFd>(fd: Fd) -> Result<Stat> {
-    // SAFETY: `stat` is a plain C struct with no invalid bit patterns for the
-    // fields read below, and `fstat` fills it before we look.
+    // SAFETY: `stat` is a plain C struct with no invalid bit patterns for the fields read below, and `fstat` fills it before we look.
     let mut raw: libc::stat = unsafe { std::mem::zeroed() };
     // SAFETY: `fd` is live and `raw` is a writable `struct stat`.
     check(unsafe { libc::fstat(fd.as_fd().as_raw_fd(), &raw mut raw) })?;
@@ -453,7 +354,7 @@ pub fn mkdirat<Fd: AsFd, P: Arg>(dirfd: Fd, name: P, mode: Mode) -> Result<()> {
     })
 }
 
-/// `unlinkat(2)`. Pass [`AtFlags::REMOVEDIR`] to remove a directory.
+/// `unlinkat(2)`.
 ///
 /// # Errors
 /// The raw `errno` from the syscall, or [`Errno::INVAL`] for an unusable name.
@@ -464,10 +365,7 @@ pub fn unlinkat<Fd: AsFd, P: Arg>(dirfd: Fd, name: P, flags: AtFlags) -> Result<
     })
 }
 
-/// `renameat(2)`: rename `from` under `from_dir` to `to` under `to_dir`.
-///
-/// Replaces an existing destination, as POSIX specifies; use [`renameat_with`]
-/// with [`RenameFlags::NOREPLACE`] to refuse instead.
+/// `renameat(2)`.
 ///
 /// # Errors
 /// The raw `errno` from the syscall, or [`Errno::INVAL`] for an unusable name.
@@ -492,8 +390,7 @@ pub fn renameat<F1: AsFd, F2: AsFd, P: Arg, Q: Arg>(
     })
 }
 
-/// `linkat(2)`: create `to` under `to_dir` as a new hard link to `from` under
-/// `from_dir`.
+/// `linkat(2)`: create `to` under `to_dir` as a new hard link to `from` under `from_dir`.
 ///
 /// # Errors
 /// The raw `errno` from the syscall, or [`Errno::INVAL`] for an unusable name.
@@ -520,13 +417,10 @@ pub fn linkat<F1: AsFd, F2: AsFd, P: Arg, Q: Arg>(
     })
 }
 
-/// A rename with platform rename flags: the non-clobbering publish (see the
-/// crate docs for the per-platform implementation).
+/// A rename with platform rename flags.
 ///
 /// # Errors
-/// The raw `errno` from the syscall (a flag combination the kernel refuses is
-/// passed through); [`Errno::INVAL`] for an unusable name; `ENOSYS` on a
-/// platform with no flagged rename.
+/// The raw `errno` from the syscall (a flag combination the kernel refuses is passed through).
 pub fn renameat_with<F1: AsFd, F2: AsFd, P: Arg, Q: Arg>(
     from_dir: F1,
     from: P,
@@ -549,9 +443,7 @@ pub fn renameat_with<F1: AsFd, F2: AsFd, P: Arg, Q: Arg>(
                 if flags.contains(RenameFlags::NOREPLACE) {
                     raw |= RENAME_NOREPLACE;
                 }
-                // SAFETY: raw syscall form because not every libc has a
-                // `renameat2` wrapper; the argument list is the kernel's and all
-                // four inputs are live.
+                // SAFETY: raw syscall form because not every libc has a `renameat2` wrapper.
                 let ret = unsafe {
                     libc::syscall(
                         libc::SYS_renameat2,
@@ -570,8 +462,7 @@ pub fn renameat_with<F1: AsFd, F2: AsFd, P: Arg, Q: Arg>(
                 if flags.contains(RenameFlags::NOREPLACE) {
                     raw |= libc::RENAME_EXCL;
                 }
-                // SAFETY: both descriptors are live and both names are
-                // NUL-terminated for the duration of the call.
+                // SAFETY: both descriptors are live and both names are NUL-terminated for the duration of the call.
                 check(unsafe {
                     libc::renameatx_np(from_fd, from_c.as_ptr(), to_fd, to_c.as_ptr(), raw)
                 })
@@ -579,8 +470,6 @@ pub fn renameat_with<F1: AsFd, F2: AsFd, P: Arg, Q: Arg>(
             #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
             {
                 let _ = (from_fd, to_fd, from_c, to_c);
-                // Not a plain renameat: that would replace the destination,
-                // which is the exact race NOREPLACE exists to close.
                 Err(Errno::NOSYS)
             }
         })
@@ -605,17 +494,14 @@ pub fn fsync<Fd: AsFd>(fd: Fd) -> Result<()> {
     check(unsafe { libc::fsync(fd.as_fd().as_raw_fd()) })
 }
 
-// Directory reading
-
-/// One directory entry. Owns its name, so the iterator may advance.
+/// One directory entry.
 #[derive(Debug, Clone)]
 pub struct DirEntry {
     name: std::ffi::CString,
 }
 
 impl DirEntry {
-    /// The entry's name. `.` and `..` are returned, as `readdir` returns them;
-    /// callers filter.
+    /// The entry's name.
     #[inline]
     #[must_use]
     pub fn file_name(&self) -> &CStr {
@@ -624,37 +510,22 @@ impl DirEntry {
 }
 
 /// A directory being read, over an independent open file description.
-///
-/// * `fdopendir` takes ownership of its descriptor and `closedir` closes it,
-///   so the caller's retained pin cannot be handed over.
-/// * A `dup` shares the original's open file description and offset. A pinned
-///   directory is cloned across threads over one `Arc<OwnedFd>`, so two
-///   dup-based streams would split the entries between them and a `rewinddir`
-///   on one would restart the other.
-///
-/// So the stream is built from `openat(fd, ".")`, which is still fd-relative
-/// and starts at offset 0.
 pub struct Dir {
     dirp: *mut libc::DIR,
     /// Latched by the first failed `readdir`; iteration ends there, since a
-    /// faulted stream need not return anything meaningful.
     errored: bool,
 }
 
-// SAFETY: this type owns its `DIR*` exclusively and closes it on drop, so it may
-// move between threads. Not `Sync`: `readdir` mutates the stream position.
+// SAFETY: this type owns its `DIR*` exclusively and closes it on drop, so it may move between threads.
 unsafe impl Send for Dir {}
 
 impl Dir {
-    /// Open a directory stream over `fd`, on its own file description,
-    /// positioned at the start.
+    /// Open a directory stream over `fd`, on its own file description, positioned at the start.
     ///
     /// # Errors
     /// The raw `errno` from `fcntl`, `openat` or `fdopendir`.
     pub fn read_from<Fd: AsFd>(fd: Fd) -> Result<Self> {
         let borrowed = fd.as_fd();
-        // Carry the caller's status flags so the stream opens like the pin, plus
-        // `O_CLOEXEC` (every descriptor this crate creates is close-on-exec).
         // SAFETY: `borrowed` is a live descriptor.
         let status = unsafe { libc::fcntl(borrowed.as_raw_fd(), libc::F_GETFL) };
         if status < 0 {
@@ -668,13 +539,9 @@ impl Dir {
             Mode::empty(),
         ) {
             Ok(owned) => owned,
-            // `"."` is gone: the directory was removed while the pin held it.
-            // Read it as empty rather than failing a sweep whose work is done.
             Err(Errno::NOENT) => {
                 errored = true;
-                // SAFETY: `borrowed` is live; F_DUPFD_CLOEXEC returns a new
-                // descriptor. Sharing the offset is harmless because `errored`
-                // makes the stream yield nothing.
+                // SAFETY: `borrowed` is live.
                 let dup = unsafe { libc::fcntl(borrowed.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
                 if dup < 0 {
                     return Err(Errno::last());
@@ -685,12 +552,10 @@ impl Dir {
             Err(err) => return Err(err),
         };
         let raw = owned.into_raw_fd();
-        // SAFETY: `raw` is a fresh directory descriptor this function owns; on
-        // success `fdopendir` takes ownership of it.
+        // SAFETY: `raw` is a fresh directory descriptor this function owns.
         let dirp = unsafe { libc::fdopendir(raw) };
         if dirp.is_null() {
             let err = Errno::last();
-            // `fdopendir` does not take ownership on failure.
             // SAFETY: `raw` is a live descriptor this function owns.
             unsafe { libc::close(raw) };
             return Err(err);
@@ -700,8 +565,6 @@ impl Dir {
 }
 
 /// `readdir` under the name that returns 64-bit inode and offset fields: on a
-/// 32-bit glibc without `_FILE_OFFSET_BITS=64`, plain `readdir` can fail with
-/// `EOVERFLOW`.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 unsafe fn readdir_ffi(dirp: *mut libc::DIR) -> *mut libc::dirent64 {
     // SAFETY: forwarded from the caller, which owns a live stream.
@@ -715,10 +578,6 @@ unsafe fn readdir_ffi(dirp: *mut libc::DIR) -> *mut libc::dirent {
 }
 
 /// The thread's `errno` slot, cleared before each `readdir`.
-///
-/// `readdir` returns NULL for both end-of-directory and error and sets `errno`
-/// only on error. On platforms other than the two named, the slot is
-/// unavailable and a NULL reads as end-of-directory.
 #[cfg(target_vendor = "apple")]
 fn errno_slot() -> Option<*mut libc::c_int> {
     // SAFETY: `__error` returns this thread's errno location.
@@ -752,8 +611,6 @@ impl Iterator for Dir {
         let entry = unsafe { readdir_ffi(self.dirp) };
         if entry.is_null() {
             let err = Errno::last();
-            // With no way to clear errno beforehand, a stale value would turn
-            // a clean end-of-directory into a spurious error; end it instead.
             return if slot.is_none() || err.0 == 0 {
                 None
             } else {
@@ -761,9 +618,7 @@ impl Iterator for Dir {
                 Some(Err(err))
             };
         }
-        // SAFETY: a non-null `readdir` result points at a valid `dirent` owned
-        // by the stream with a NUL-terminated `d_name`; the name is copied
-        // before the next `readdir` invalidates it.
+        // SAFETY: a non-null `readdir` result points at a valid `dirent` owned by the stream with a NUL-terminated `d_name`.
         let name = unsafe { CStr::from_ptr((&raw const (*entry).d_name).cast()) };
         Some(Ok(DirEntry {
             name: name.to_owned(),

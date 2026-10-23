@@ -25,7 +25,14 @@
 //!   with no member left keeps its last name and part (RD §2.4).
 //! * With the lane off (Linux and Windows have no coalitions; macOS's launch
 //!   self-check missed), the facts are the built split by subtraction
-//!   ([`crate::Split`]), [`Via::Subtraction`].
+//!   ([`crate::Split`]), [`Via::Subtraction`], each whole reading's: none
+//!   after one that made no split.
+//! * [`detect()`]: the causes that hold over each split tick's window; the
+//!   facts carry them, the episodes open after them ([`Episodes`]) and the
+//!   Deck's clause ([`ClauseHold`]).
+//! * [`account()`]: one subject's account for a caller's tab, its `you` role
+//!   among it, the one reading `sys why` and the CPU close-up render; and
+//!   [`bare_subject`], what a bare `sys why` answers for.
 //!
 //! Pure: no clock, no platform, no I/O.
 //!
@@ -37,11 +44,19 @@ use std::sync::Arc;
 
 use crate::model::{Membership, Sample, Snapshot, TabRoot};
 
+pub mod account;
+pub mod detect;
+pub mod episodes;
 pub mod split;
 
 #[cfg(any(test, debug_assertions))]
 pub mod fixtures;
 
+pub use account::{Account, Bare, Role, Shown, WhySubject, You, account, bare_subject, you_role};
+pub use detect::{
+    ACTIVITIES, Activity, ActivityId, Candidate, CauseId, Context, Evidence, Term, WakeFact, detect,
+};
+pub use episodes::{ClauseHold, DeckCause, Episodes, OpenCause, deck_cause};
 pub use split::{CoalBase, SplitIn, WINDOW_MAX_NS, split};
 
 /// Whether the coalition lane reads.
@@ -65,15 +80,12 @@ impl CoalLane {
         self == Self::On
     }
 
-    /// The unavailable word a reply prints for the coalitions: `unsupported`,
-    /// `lane_off:coalitions`, or `None` while the lane reads.
+    /// The unavailable word a reply prints for the coalitions:
+    /// `lane_off:coalitions` on every OS whose lane does not read (the built
+    /// views' word, D39), or `None` while it reads.
     #[must_use]
     pub fn word(self) -> Option<&'static str> {
-        match self {
-            Self::Unsupported => Some("unsupported"),
-            Self::On => None,
-            Self::Off => Some("lane_off:coalitions"),
-        }
+        (!self.on()).then_some("lane_off:coalitions")
     }
 }
 
@@ -287,6 +299,11 @@ pub struct CoalRow {
     /// Of [`Self::cpu_mc`], what ran at maintenance or background QoS
     /// (deferred work), millicores.
     pub deferred_mc: i64,
+    /// Its seven QoS buckets' growth over the window, millicores: what
+    /// [`Self::deferred_mc`] is a share of. The buckets sum to a little more
+    /// than the CPU time (0.7–6 % on macOS 27.0.1), so a share of the CPU
+    /// time could pass 100 % ([`Self::deferred_pm`]).
+    pub qos_mc: i64,
     /// Bytes per second it read from storage over the window.
     pub read_bps: u64,
     /// Its live members' footprint now, bytes, where read.
@@ -300,6 +317,25 @@ pub struct CoalRow {
     pub lead: Option<Lead>,
 }
 
+impl CoalRow {
+    /// Its deferred share, per mille of its QoS buckets ([`Self::qos_mc`]),
+    /// never past 1000; `None` where the buckets did not grow.
+    #[must_use]
+    pub fn deferred_pm(&self) -> Option<u16> {
+        deferred_pm(self.deferred_mc, self.qos_mc)
+    }
+}
+
+/// `deferred` of `qos` millicores, per mille, rounded and never past 1000;
+/// `None` for no QoS time.
+#[must_use]
+pub fn deferred_pm(deferred: i64, qos: i64) -> Option<u16> {
+    (qos > 0).then(|| {
+        let pm = (deferred.clamp(0, qos) * 1000 + qos / 2) / qos;
+        u16::try_from(pm.min(1000)).unwrap_or(1000)
+    })
+}
+
 /// The busy CPU over one matched window, millicores: every figure is over the
 /// same window, and `global = aterm + delegated + others + services +
 /// unaccounted` exactly.
@@ -311,6 +347,9 @@ pub struct CoalSplit {
     /// of the window, so every row is measured (`exact`), or not
     /// (`heuristic`, as every split by subtraction is).
     pub exact: bool,
+    /// Whether the kernel's list of coalitions stopped short at either end
+    /// of the window (`cannot what=coalition_list why=truncated`).
+    pub list_truncated: bool,
     /// Coalitions the kernel listed (0 by subtraction).
     pub listed: u32,
     /// The machine's busy figure (the cores' own ticks).
@@ -393,16 +432,29 @@ pub struct WhyFacts {
     pub lane: CoalLane,
     /// The split.
     pub split: CoalSplit,
+    /// Whether the split tick's sweep stopped at its cap, so each tab's
+    /// figure may be short of its work.
+    pub procs_truncated: bool,
     /// The machine's timeline, where read.
     pub timeline: Option<TimelineSample>,
     /// When userspace started, unix ms: the earliest birth among the live
     /// processes above pid 1 (launchd outlives a userspace restart), where
     /// births were read and the sweep was whole.
     pub userspace_ms: Option<i64>,
+    /// This aterm's user, where read.
+    pub self_uid: Option<u32>,
+    /// The causes that hold over the window, ranked ([`detect()`]).
+    pub causes: Vec<Candidate>,
+    /// The episodes open after this tick, ranked the same way: covering
+    /// causes only, since a context keeps no episode.
+    pub open: Vec<OpenCause>,
+    /// The Deck's cause clause after this tick ([`deck_cause`] reads it).
+    pub clause: Option<DeckCause>,
 }
 
-/// A defect the scope balance's conformance controls inject into the real
-/// split (`tests/conformance_scope_balance.rs`), through
+/// A defect the negative controls inject into the real split or its cause
+/// engine (`tests/conformance_scope_balance.rs`,
+/// `tests/conformance_explain.rs`), through
 /// [`Vitals::with_fault`](crate::Vitals::with_fault).
 #[cfg(any(test, debug_assertions))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -413,12 +465,18 @@ pub enum Fault {
     /// The tab's figure is its last sweep's rate (a 1 s window) against the
     /// split's window.
     TabOverProcsWindow,
+    /// A named activity's members are matched by signing id alone, under
+    /// any voucher (`tests/conformance_explain.rs`).
+    MatchBySigningIdOnly,
+    /// The Deck's clause shows and goes with its candidate, with no hold.
+    NoHold,
 }
 
 #[cfg(any(test, debug_assertions))]
 impl Fault {
     /// `facts` with this defect in their split by coalition (`snap` the
-    /// snapshot they are of); facts by subtraction as they are.
+    /// snapshot they are of); facts by subtraction as they are. The cause
+    /// engine's defects act in `WhyState::explain`, not here.
     fn inject(self, mut facts: WhyFacts, snap: &Snapshot) -> WhyFacts {
         let split = &mut facts.split;
         if split.via != Via::Coalitions {
@@ -436,6 +494,7 @@ impl Fault {
                     .map(|t| (t.key, millicores(t.scope.cores.raw)))
                     .collect();
             }
+            Self::MatchBySigningIdOnly | Self::NoHold => {}
         }
         facts
     }
@@ -553,6 +612,8 @@ pub(crate) struct WhyState {
     /// cut at its cap, while it leads a listed coalition).
     identities: HashMap<(u32, i64), LeadIdentity>,
     facts: Option<Arc<WhyFacts>>,
+    episodes: Episodes,
+    clause: ClauseHold,
     /// Whether a read misread the record's layout ([`misread`]): the lane
     /// stays off for good, since the kernel's layout does not change under a
     /// running process.
@@ -564,6 +625,16 @@ pub(crate) struct WhyState {
 }
 
 impl WhyState {
+    /// The lane sample `s` reads under: its host's word, or `Off` once a
+    /// read misread the layout.
+    pub(crate) fn lane(&self, s: &Sample) -> CoalLane {
+        if s.coal_lane.on() && self.misread {
+            CoalLane::Off
+        } else {
+            s.coal_lane
+        }
+    }
+
     /// The facts snapshot `snap` (of sample `s`) carries: new ones for a
     /// split tick with a window, else the last ones. `attribution` is the
     /// model's pass over `s`'s sweep: each process's scopes and, for a
@@ -575,20 +646,70 @@ impl WhyState {
         attribution: Option<(&[Membership], &[Option<usize>])>,
     ) -> Option<Arc<WhyFacts>> {
         self.misread = self.misread || (s.coal_lane.on() && misread(s));
+        let lane = self.lane(s);
+        // With the lane off no covering cause holds, so none stays open and
+        // the clause never shows (RD §3.3): a misread that turns it off ends
+        // every episode and the clause's hold at once.
+        if !lane.on() {
+            self.episodes = Episodes::default();
+            self.clause = ClauseHold::default();
+        }
         let fresh = match s.coal_lane {
             CoalLane::On if self.misread => by_subtraction(s, snap, CoalLane::Off),
             CoalLane::On => self.by_coalitions(s, attribution),
             lane => by_subtraction(s, snap, lane),
         };
-        if let Some(facts) = fresh {
-            #[cfg(any(test, debug_assertions))]
-            let facts = match self.fault {
-                Some(fault) => fault.inject(facts, snap),
-                None => facts,
-            };
-            self.facts = Some(Arc::new(facts));
+        match fresh {
+            Some(facts) => {
+                #[cfg(any(test, debug_assertions))]
+                let facts = match self.fault {
+                    Some(fault) => fault.inject(facts, snap),
+                    None => facts,
+                };
+                self.facts = Some(Arc::new(self.explain(facts, s, snap)));
+            }
+            // A split tick that only set the base (the first, or the first
+            // after a gap) evaluates nothing: it ends every episode and
+            // resets the clause's hold, and the facts it carries hold none.
+            None if s.coal_lane.on() && !self.misread && s.coalitions.is_some() => {
+                self.episodes = Episodes::default();
+                self.clause = ClauseHold::default();
+                if let Some(f) = self
+                    .facts
+                    .as_mut()
+                    .filter(|f| !f.open.is_empty() || f.clause.is_some())
+                {
+                    let f = Arc::make_mut(f);
+                    f.open.clear();
+                    f.clause = None;
+                }
+            }
+            // With the lane off the facts are each whole reading's split: one
+            // that made none (an owner outside aterm unread) leaves none,
+            // never the last one's figures as if they were now (RD §3.2).
+            None if !lane.on() && s.procs.is_some() => self.facts = None,
+            None => {}
         }
         self.facts.clone()
+    }
+
+    /// `facts` with the causes that hold over their window, the episodes
+    /// open after it and the Deck's clause.
+    fn explain(&mut self, mut facts: WhyFacts, s: &Sample, snap: &Snapshot) -> WhyFacts {
+        #[cfg(any(test, debug_assertions))]
+        let vouched = self.fault != Some(Fault::MatchBySigningIdOnly);
+        #[cfg(any(test, debug_assertions))]
+        {
+            self.clause.no_hold = self.fault == Some(Fault::NoHold);
+        }
+        #[cfg(not(any(test, debug_assertions)))]
+        let vouched = true;
+        facts.causes = detect::detect_as(&facts, snap, vouched);
+        facts.open = self
+            .episodes
+            .step(s.mono_ms, s.at_unix_ms, &facts.causes, s.procs_truncated);
+        facts.clause = self.clause.step(s.mono_ms, &facts.open, &facts.split);
+        facts
     }
 
     fn by_coalitions(
@@ -653,8 +774,11 @@ impl WhyState {
             window_ns,
             lane: CoalLane::On,
             split,
+            procs_truncated: s.procs_truncated,
             timeline: s.timeline.clone(),
             userspace_ms: userspace_ms(s),
+            self_uid: Some(uid),
+            ..WhyFacts::default()
         })
     }
 }
@@ -693,8 +817,11 @@ fn by_subtraction(s: &Sample, snap: &Snapshot, lane: CoalLane) -> Option<WhyFact
         window_ns: snap.procs_window_ns?,
         lane,
         split: CoalSplit::by_subtraction(&built, &snap.tabs),
+        procs_truncated: snap.procs_truncated,
         timeline: s.timeline.clone(),
         userspace_ms: userspace_ms(s),
+        self_uid: s.self_uid,
+        ..WhyFacts::default()
     })
 }
 
@@ -721,3 +848,7 @@ fn millicores(cores: f32) -> i64 {
 #[cfg(test)]
 #[path = "split_tests.rs"]
 mod split_tests;
+
+#[cfg(test)]
+#[path = "explain_tests.rs"]
+mod explain_tests;

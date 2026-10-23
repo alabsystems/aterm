@@ -1,43 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The CPU rasterizer of the fx layers (`docs/DESIGN-card-engine-2026-10-19.md`
-//! §4.2-§4.3): pixel law F, the engine's band slicing and the occluder
-//! subtraction.
-//!
-//! **Pixel law F.** For a window pixel `(px, py)` of an item whose origin is
-//! `O = item.xy + layer.offset` (plus `(pad, grid_top)` in Grid space):
-//!
-//! * Rect: `i = px − O.x`, `c = glow_lerp_rgb(c0, c1, i, w)`,
-//!   `a = glow_lerp(a0, a1, i, w)` over palette entries `ink`, `ink + 1`.
-//! * Ramps: row `r = py − O.y` is the Rect rule over entries `ink + 2r`,
-//!   `ink + 2r + 1`.
-//! * Sprite: `l = (px, py) − O`, texel `t = (l.x·w / dw, l.y·h / dh)`,
-//!   `t.x = w − 1 − t.x` under `flip_x`. Index8 texel `k = 0` writes nothing,
-//!   else entry `j = ink + k − 1`, and `j` past the palette writes nothing.
-//!   An Rgba8Premul texel is its own `(c, a)`. An Rgba8Straight texel takes
-//!   entry `ink` as tint and opacity.
-//! * Exact: `dst = over_premul(dst, c, a)` (`add_sat` at `a = 0`, a store at
-//!   `a = 255`). Linear: FreeSprite's `blend`.
-//!
-//! Every term reads the absolute pixel and the UNCLAMPED item origin, never
-//! the slice, so cutting an item at a band edge, a clip or an occluder changes
-//! no byte (the free-sprite argument). That is what lets the engine own the
-//! one-band law: an item's draw rect (its box ∩ its clip ∩ the layer clip ∩
-//! the frame, minus every occluder) is cut at the cell-row bands, and a slice
-//! is stamped only when its band is being repainted.
-//!
-//! Sprites are stamped from the art's per-row run lists ([`FxArt::runs`]):
-//! the destination rows that read one art row share its runs' spans (from a
-//! column table per art width and size, [`SpriteCols`]) and paints, resolved
-//! once and filled on each row, byte-equal to the per-pixel oracle the tests
-//! keep.
-//!
-//! **One slicer.** [`slice_layers`] is the engine's only statement of which
-//! slices a frame draws: this rasterizer stamps them, the GPU renderer turns
-//! each into one instance, and [`fx_bloom_quads`] into the bloom source. So
-//! the band gate, the clips and the occluder subtraction cannot drift between
-//! the backends.
+//! The CPU rasterizer of the fx layers (`docs/DESIGN-card-engine-2026-10-19.md` §4.2-§4.3): pixel law F, the engine's band slicing and the occluder subtraction.
 
 use std::sync::Arc;
 
@@ -49,13 +13,7 @@ use aterm_hash::FxHashSet;
 
 use crate::{add_sat, blend, glow_lerp, glow_lerp_rgb, over_premul};
 
-/// Row `r`'s pixel band in a frame of height `h` whose grid starts at
-/// `grid_top` with `cell_h`-tall rows: `[grid_top + r·cell_h, grid_top +
-/// (r + 1)·cell_h)` clamped to `h`, with row 0 opened to the window top and
-/// the last row run to the frame bottom. The ONE statement of the band rule:
-/// [`crate::Renderer::row_pixel_band`] (Phase A's band reset, the free-sprite
-/// stamp, a presenter's partial copy) and the fx slicer both read it, and it
-/// is the GPU scissor's edge rule (`frame_load_and_scissor`).
+/// Row `r`'s pixel band in a frame of height `h` whose grid starts at `grid_top` with `cell_h`-tall rows: `grid_top + r·cell_h, grid_top + (r + 1)·cell_h)` clamped to `h`, with row 0 opened to the window top and the last row run to the frame bottom.
 #[inline]
 pub(crate) const fn band_px(
     r: usize,
@@ -79,8 +37,7 @@ pub(crate) const fn band_px(
     (y0, y1)
 }
 
-/// The frame the engine slices against ([`crate::Renderer::fx_frame`] gives
-/// a renderer's own).
+/// The frame the engine slices against ([`crate::Renderer::fx_frame`] gives a renderer's own).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FxFrame {
     /// Framebuffer width in pixels.
@@ -116,8 +73,7 @@ impl FxFrame {
     }
 }
 
-/// A half-open rectangle in `i64` window pixels: the slicer's working type,
-/// wide enough that no item origin, offset or grid shift can overflow.
+/// A half-open rectangle in `i64` window pixels: the slicer's working type, wide enough that no item origin, offset or grid shift can overflow.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Area {
     x0: i64,
@@ -172,8 +128,7 @@ impl Area {
     }
 }
 
-/// One stamp: a rectangle of window pixels inside the frame and inside one
-/// band.
+/// One stamp: a rectangle of window pixels inside the frame and inside one band.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FxSlice {
     /// Left edge (inclusive).
@@ -189,24 +144,16 @@ pub struct FxSlice {
 /// The internal canvas spelling retained for spill replay.
 pub(crate) type Slice = FxSlice;
 
-/// Where the stamps land: the frame's pixels ([`FramePx`]) or a spill
-/// strip's replay planes (`crate::spill`). Every span is in window pixels,
-/// inside [`Self::bounds`], and carries pixel law F's paint for those pixels;
-/// a target applies it with the frame's kernels and may note what else it
-/// needs (the spill's coverage), so the frame and its replays cannot drift.
+/// Where the stamps land: the frame's pixels ([`FramePx`]) or a spill strip's replay planes (`crate::spill`).
 pub(crate) trait FxCanvas {
     /// The window pixels this target holds; nothing outside is handed to it.
     fn bounds(&self) -> Slice;
-    /// The Exact flat paint `(c, a)` over row `y`, columns `[x0, x1)`
-    /// ([`fill_flat`]).
+    /// The Exact flat paint `(c, a)` over row `y`, columns `x0, x1)` (`fill_flat`).
     fn flat(&mut self, y: usize, x0: usize, x1: usize, c: u32, a: u8);
-    /// The Exact ramp over row `y`, columns `[x0, x1)`: column `x0 + k` is
-    /// ramp column `i0 + k` of a `qw`-wide ramp from `c0` to `c1`
-    /// ([`fill_glow_span`]).
+    /// The Exact ramp over row `y`, columns `x0, x1)`: column `x0 + k` is ramp column `i0 + k` of a `qw`-wide ramp from `c0` to `c1` (`fill_glow_span`).
     #[allow(clippy::too_many_arguments)]
     fn ramp(&mut self, y: usize, x0: usize, x1: usize, i0: u32, qw: u32, c0: FxInk, c1: FxInk);
-    /// The Linear paint `(c, a)` over row `y`, columns `[x0, x1)` (the
-    /// FreeSprite [`blend`]; `a > 0`).
+    /// The Linear paint `(c, a)` over row `y`, columns `x0, x1)` (the FreeSprite `blend`; `a > 0`).
     fn linear(&mut self, y: usize, x0: usize, x1: usize, c: u32, a: u8);
 }
 
@@ -258,8 +205,7 @@ impl FxCanvas for FramePx<'_> {
     }
 }
 
-/// The slicer's resident scratch: the occluder-subtraction stack, the pieces
-/// it leaves, and the frame's art budget. Capacity is kept across frames.
+/// The slicer's resident scratch: the occluder-subtraction stack, the pieces it leaves, and the frame's art budget.
 #[derive(Debug, Default)]
 pub struct FxSlicer {
     stack: Vec<(Area, usize)>,
@@ -268,18 +214,13 @@ pub struct FxSlicer {
 }
 
 /// Whether the engine draws `layer` at all: its blend accepts its content,
-/// and it is not a Linear layer at Glow (§4.5 has no Linear Glow group).
 #[inline]
 fn layer_draws(layer: &FxLayer) -> bool {
     layer.content.accepts(layer.blend)
         && !(layer.blend == FxBlend::Linear && layer.slot == FxSlot::Glow)
 }
 
-/// Every sprite the frame's layers can draw, in draw order (layers in list
-/// order, items in content order): a sprite of its layer's blend, over a
-/// non-empty art, at a non-zero size, in a layer the engine draws. Its clip
-/// and the frame do not matter: the art budget is ruled on what the layers
-/// hold, so a sprite's drawing never depends on damage or scroll.
+/// Every sprite the frame's layers can draw, in draw order (layers in list order, items in content order): a sprite of its layer's blend, over a non-empty art, at a non-zero size, in a layer the engine draws.
 #[inline]
 pub fn for_each_drawn_sprite<'a>(layers: &'a [FxLayer], mut f: impl FnMut(&'a FxSprite)) {
     for layer in layers.iter().filter(|l| layer_draws(l)) {
@@ -297,7 +238,6 @@ pub fn for_each_drawn_sprite<'a>(layers: &'a [FxLayer], mut f: impl FnMut(&'a Fx
 }
 
 /// The frame art budget's two widths: the one-byte arts (Index8) and the
-/// four-byte ones (Rgba8Premul and Rgba8Straight), one GPU atlas each.
 #[inline]
 const fn budget_width(t: FxTexels) -> usize {
     match t {
@@ -306,32 +246,18 @@ const fn budget_width(t: FxTexels) -> usize {
     }
 }
 
-/// The frame art budget's ruling ([`FX_FRAME_ART_TEXELS`]): which arts the
-/// frame's sprites may not draw. One statement for every backend: the CPU
-/// stamps, the GPU instances, its atlas admission and the bloom source all
-/// read it through [`slice_layers`] or [`Self::rule`], so a sprite the budget
-/// refuses draws nothing anywhere. Capacity is kept across frames.
+/// The frame art budget's ruling ([`FX_FRAME_ART_TEXELS`]): which arts the frame's sprites may not draw.
 #[derive(Debug, Default)]
 pub struct FxBudget {
     seen: FxHashSet<u128>,
     refused: FxHashSet<u128>,
     refused_items: u64,
     /// The layers the ruling is for: each one's content, slot and blend, all
-    /// that a ruling reads (the walk filters on them, and a content is
-    /// immutable). The contents are held, so an address cannot be a freed
-    /// content's, reused.
     ruled: Vec<(Arc<FxContent>, FxSlot, FxBlend)>,
 }
 
 impl FxBudget {
-    /// Rule on `layers`: walk the drawn sprites ([`for_each_drawn_sprite`])
-    /// and refuse each distinct art that would take its width's total of
-    /// distinct texels past [`FX_FRAME_ART_TEXELS`]; a refused art's sprites
-    /// draw nothing. A frame whose sprites fit counting every repeat (every
-    /// real frame) is ruled by one sum, touching no set. Layers of the contents,
-    /// slots and blends last ruled on keep that ruling unwalked: the slicer
-    /// rules once per pass and a frame takes up to six passes, and a card at
-    /// rest keeps its contents for many frames.
+    /// Rule on `layers`: walk the drawn sprites ([`for_each_drawn_sprite`]) and refuse each distinct art that would take its width's total of distinct texels past [`FX_FRAME_ART_TEXELS`]; a refused art's sprites draw nothing.
     pub fn rule(&mut self, layers: &[FxLayer]) {
         if self.ruled.len() == layers.len()
             && self
@@ -415,20 +341,14 @@ impl FxSlicer {
     }
 }
 
-/// The rasterizer's resident scratch: the slicer's, and the sprite column
-/// table ([`SpriteCols`]). Capacity is kept across frames.
+/// The rasterizer's resident scratch: the slicer's, and the sprite column table ([`SpriteCols`]).
 #[derive(Debug, Default)]
 pub(crate) struct FxScratch {
     slicer: FxSlicer,
     cols: SpriteCols,
 }
 
-/// A sprite's column table ([`sprite_cols`]), built when a slice of the
-/// sprite is first drawn and kept while the sprites drawn after it have the
-/// same art width and destination width. The table is a function of those
-/// two alone, so a run of sprites of one size (a rim laid as its cover's
-/// rectangles, each one item over the same art) builds it once, and a sprite
-/// whose every band is kept builds none. Capacity is kept across frames.
+/// A sprite's column table ([`sprite_cols`]), built when a slice of the sprite is first drawn and kept while the sprites drawn after it have the same art width and destination width.
 #[derive(Debug, Default)]
 pub struct SpriteCols {
     /// The `(art width, dw)` that `cols` was built for.
@@ -437,8 +357,7 @@ pub struct SpriteCols {
 }
 
 impl SpriteCols {
-    /// `sp`'s column table: the kept one when its `(art width, dw)` matches,
-    /// else built afresh.
+    /// `sp`'s column table: the kept one when its `(art width, dw)` matches, else built afresh.
     #[inline]
     pub(crate) fn of(&mut self, sp: &FxSprite) -> &[u32] {
         let key = (sp.art.w(), sp.dw);
@@ -454,24 +373,13 @@ impl SpriteCols {
 
 /// What [`slice_layers`] hands its slices to.
 pub trait FxSliceSink<'a> {
-    /// The next drawable item of `layer`, addressed from the window-pixel
-    /// origin `origin` (pixel law F's unclamped `O`). `false` skips its
-    /// slices (a backend that cannot draw it fails closed).
+    /// The next drawable item of `layer`, addressed from the window-pixel origin `origin` (pixel law F's unclamped `O`).
     fn item(&mut self, layer: &'a FxLayer, item: &'a FxItem, origin: (i64, i64)) -> bool;
     /// One slice of the last accepted item, in band `band`.
     fn slice(&mut self, s: FxSlice, band: usize);
 }
 
-/// Slice every layer `select` takes against `f`: per item, its draw rect (its
-/// box ∩ its clip ∩ the layer clip ∩ the frame, minus every occluder) cut at
-/// the cell-row bands, handing `sink` each slice whose band `band_open`
-/// admits. Layers go in list order, items in content order, so a sink that
-/// draws what it is handed composites in the engine's order.
-///
-/// Fail closed: a layer whose content its blend does not accept (or a Linear
-/// layer at Glow), an item of the other blend, and a sprite whose art the
-/// frame's art budget refuses ([`FxBudget`], ruled here on all of `layers`)
-/// hand over nothing.
+/// Slice every layer `select` takes against `f`: per item, its draw rect (its box ∩ its clip ∩ the layer clip ∩ the frame, minus every occluder) cut at the cell-row bands, handing `sink` each slice whose band `band_open` admits.
 pub fn slice_layers<'a>(
     f: &FxFrame,
     layers: &'a [FxLayer],
@@ -496,8 +404,6 @@ pub fn slice_layers<'a>(
             continue;
         };
         for item in layer.content.items() {
-            // Per item, fail closed: an item the layer's blend does not draw
-            // draws nothing, and nor does a sprite whose art the frame's art
             // budget refuses.
             if item.blend() != layer.blend {
                 continue;
@@ -552,17 +458,12 @@ impl<'a, C: FxCanvas> FxSliceSink<'a> for Stamper<'_, 'a, C> {
                 FxItem::Sprite(sp) => self.cols.of(sp),
                 FxItem::Rect(_) | FxItem::Ramps(_) => &[],
             };
-            // Clipping changes only the destination, never pixel law F's origin.
             stamp(self.canvas, s, item, origin, palette, cols);
         }
     }
 }
 
 /// Draw every layer of `slot` and `blend` into `px` (row-major, `f.w` wide).
-///
-/// `dirty` is the row-repaint gate: `None` on a full repaint, else a slice is
-/// stamped only when its band's flag is set, so light never re-accumulates on
-/// a row the frame keeps. Layers draw in list order, items in content order.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn draw_layers(
     px: &mut [u32],
@@ -590,9 +491,7 @@ pub(crate) fn draw_layers(
     );
 }
 
-/// [`draw_layers`] onto any [`FxCanvas`]: the shared slicer still owns
-/// geometry, bands and occluders; the CPU sink intersects its slices with
-/// the target while retaining each item's original window-pixel origin.
+/// [`draw_layers`] onto any [`FxCanvas`]: the shared slicer still owns geometry, bands and occluders; the CPU sink intersects its slices with the target while retaining each item's original window-pixel origin.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn draw_layers_on<C: FxCanvas>(
     canvas: &mut C,
@@ -622,8 +521,6 @@ pub(crate) fn draw_layers_on<C: FxCanvas>(
 }
 
 /// Where `layer` lands in the frame: the window-pixel shift of its content
-/// origin (offset plus the Grid origin) and its clip in window pixels within
-/// the frame, or `None` when that clip is empty.
 #[inline]
 const fn layer_place(f: &FxFrame, layer: &FxLayer) -> Option<((i64, i64), Area)> {
     let (gx, gy) = space_origin(f, layer);
@@ -639,7 +536,6 @@ const fn layer_place(f: &FxFrame, layer: &FxLayer) -> Option<((i64, i64), Area)>
 }
 
 /// The window pixel of `layer`'s space origin: `(0, 0)`, or the Grid origin
-/// `(pad, grid_top)`.
 #[inline]
 const fn space_origin(f: &FxFrame, layer: &FxLayer) -> (i64, i64) {
     match layer.space {
@@ -660,17 +556,6 @@ const fn frame_area(f: &FxFrame) -> Area {
 }
 
 /// Whether any band `band_open` admits meets `layer`'s extent in the frame
-/// ([`FxLayer::extent`] at its space origin): every pixel the layer draws lies
-/// there (`fx_placement_is_the_spec`), so a layer for which this is `false`
-/// hands over no slice, and the slicer passes it over without reading its
-/// items (a card whose rows the frame keeps costs nothing).
-///
-/// Out of line, with the band gate behind `dyn`: one call per layer. Inlined
-/// as a generic, it grew the GPU's `slice_layers` instance until the
-/// optimizer put the GPU sink's `item` and `layer_place` out of line, a call
-/// per item, and the Metal encode of a scrolling frame took 0.6 % more
-/// instructions than with no test at all (the effects bench); out of line
-/// it is within 0.3 %.
 #[inline(never)]
 fn reaches_an_open_band(f: &FxFrame, layer: &FxLayer, band_open: &dyn Fn(usize) -> bool) -> bool {
     let (gx, gy) = space_origin(f, layer);
@@ -680,7 +565,6 @@ fn reaches_an_open_band(f: &FxFrame, layer: &FxLayer, band_open: &dyn Fn(usize) 
 }
 
 /// An item's window-pixel origin `O` under the layer shift `(lx, ly)`, and its
-/// box at `O` within its own clip (a sprite's), before the layer clip.
 #[inline]
 const fn item_place(item: &FxItem, (lx, ly): (i64, i64)) -> ((i64, i64), Area) {
     match item {
@@ -703,10 +587,6 @@ const fn item_place(item: &FxItem, (lx, ly): (i64, i64)) -> ((i64, i64), Area) {
 }
 
 /// `draw` minus every occluder, as disjoint pieces in `scratch.pieces`.
-///
-/// Each occluder cuts every piece it overlaps into at most four (above,
-/// below, left, right), so any number of occluders compose; an explicit stack
-/// keeps the depth off the call stack.
 fn subtract_occluders(draw: Area, occluders: &[PxRect], scratch: &mut FxSlicer) {
     scratch.pieces.clear();
     if occluders.is_empty() {
@@ -750,7 +630,6 @@ fn subtract_occluders(draw: Area, occluders: &[PxRect], scratch: &mut FxSlicer) 
 }
 
 /// Cut `piece` (inside the frame) at the band edges and hand each slice whose
-/// band is open, with its band, to `stamp`.
 fn for_each_slice(
     f: &FxFrame,
     piece: Area,
@@ -789,8 +668,7 @@ fn ink_at(palette: &[FxInk], j: u64) -> Option<FxInk> {
         .and_then(|j| palette.get(j).copied())
 }
 
-/// Stamp one item over one slice, addressed from the item origin `o`. `cols`
-/// is a sprite's column table ([`sprite_cols`]); a rect ignores it.
+/// Stamp one item over one slice, addressed from the item origin `o`.
 #[inline]
 pub(crate) fn stamp<C: FxCanvas>(
     canvas: &mut C,
@@ -807,19 +685,13 @@ pub(crate) fn stamp<C: FxCanvas>(
     }
 }
 
-/// A sprite's column table: `cols[d] = ⌈d·dw / w⌉` for `d` in `0..=w`, the
-/// first destination column whose displayed index `l·w / dw` is at least
-/// `d`. Texel run `[d0, d1)` covers destination columns
-/// `[cols[d0], cols[d1])`. Built at most once per item ([`SpriteCols`]; not
-/// per run and row: two divisions per run per row were a fifth of the stamp),
-/// into `out`'s kept capacity; empty for an empty art.
+/// A sprite's column table: `cols[d] = ⌈d·dw / w⌉` for `d` in `0..=w`, the first destination column whose displayed index `l·w / dw` is at least `d`.
 pub(crate) fn sprite_cols(sp: &FxSprite, out: &mut Vec<u32>) {
     out.clear();
     let (aw, dw) = (u64::from(sp.art.w()), u64::from(sp.dw));
     if aw == 0 {
         return;
     }
-    // `⌈d·dw / w⌉ <= dw <= u16::MAX`: the cast is lossless.
     out.extend((0..=aw).map(|d| (d * dw).div_ceil(aw) as u32));
 }
 
@@ -829,7 +701,6 @@ fn stamp_rect<C: FxCanvas>(canvas: &mut C, s: Slice, o: (i64, i64), r: &FxRect, 
     let (Some(c0), Some(c1)) = (ink_at(palette, j), ink_at(palette, j + 1)) else {
         return;
     };
-    // The ramp index of the slice's first column, from the item origin.
     let i0 = (s.x0 as i64 - o.0) as u32;
     for y in s.y0..s.y1 {
         canvas.ramp(y, s.x0, s.x1, i0, u32::from(r.w), c0, c1);
@@ -855,7 +726,6 @@ fn stamp_ramps<C: FxCanvas>(
 }
 
 /// The linear-light paint of a straight texel `A<<24 | RGB` under `tint`:
-/// FreeSprite's law, `(mul8(rgb, tint.rgb), mul8(A, tint.alpha))`.
 #[inline]
 const fn straight_paint(texel: u32, tint: FxInk) -> (u32, u8) {
     #[inline]
@@ -875,7 +745,6 @@ const fn straight_paint(texel: u32, tint: FxInk) -> (u32, u8) {
 }
 
 /// The Linear tint a sprite draws with, or `None` when it draws nothing
-/// (an Exact art needs none: `Some(FxInk::default())`).
 #[inline]
 fn sprite_tint(art: &FxArt, sp: &FxSprite, palette: &[FxInk]) -> Option<FxInk> {
     match art.texels() {
@@ -885,7 +754,6 @@ fn sprite_tint(art: &FxArt, sp: &FxSprite, palette: &[FxInk]) -> Option<FxInk> {
 }
 
 /// The paint of one sprite span: an Exact `(c, a)` (`over_premul`), or a
-/// Linear straight paint `(c, a)` (`blend`, never `a == 0`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SpanPaint {
     Exact(u32, u8),
@@ -893,10 +761,6 @@ enum SpanPaint {
 }
 
 /// Walk one sprite slice as flat spans: every `(x0, x1, y0, y1, paint)` the
-/// slice paints, from the art's run lists. Pixels outside every span are
-/// written nothing (index 0, a palette miss, a clear texel, a zero straight
-/// opacity). The one statement of the run walk: [`stamp_sprite`] fills the
-/// spans, [`fx_bloom_quads`] turns them into light.
 fn sprite_spans(
     s: FxSlice,
     o: (i64, i64),
@@ -923,19 +787,11 @@ fn sprite_spans(
     let runs = art.runs();
     let mut y = s.y0;
     while y < s.y1 {
-        // Destination row `m` reads art row `ty = m·h / dh`, and so do the
-        // rows up to `⌈(ty + 1)·dh / h⌉`: the whole group shares its run
-        // spans and paints, resolved once (the quad stream's shape: a span
-        // computed once and filled on every row it covers).
         let m = (y as i64 - o.1) as u64;
         let ty = m * ah / dh;
         let y_end = ((o.1 + ((ty + 1) * dh).div_ceil(ah) as i64) as usize).min(s.y1);
         debug_assert!(y_end > y, "row {m} lies in art row {ty}'s group");
         for run in runs.row(ty as usize) {
-            // The run's texels `[t0, t1)` show where the displayed index
-            // `l·w / dw` lies in `[d0, d1)` (mirrored under `flip_x`), i.e. at
-            // destination columns `[cols[d0], cols[d1])`. Runs are disjoint,
-            // so their spans are, and the order they stamp in changes no byte.
             let (t0, t1) = (
                 usize::from(run.x),
                 usize::from(run.x) + usize::from(run.len),
@@ -992,18 +848,7 @@ fn stamp_sprite<C: FxCanvas>(
     });
 }
 
-/// The bloom source of every `bloom` layer, as [`GlowQuad`]s in window pixels
-/// appended to `out` (design §4.6: bloom layers are also fed, ungated, to the
-/// GPU's `bloom_glow` source; bloom is GPU-only, outside CPU parity).
-///
-/// Every band is open (the bloom is recomposed whole each frame), the clips
-/// and occluders apply, and each quad is tagged with its band. An Exact
-/// layer's quads paint, through the [`GlowQuad`] law, exactly what pixel law F
-/// stamps: a rect slice that spans its item, or a flat one, is one quad over
-/// the slice; a horizontally cut gradient is one column per quad, its
-/// lerped ink; a Ramps row is its own rect; a sprite span is one flat quad. A
-/// Linear layer's straight paint enters as source-over light premultiplied
-/// by its opacity.
+/// The bloom source of every `bloom` layer, as [`GlowQuad`]s in window pixels appended to `out` (design §4.6: bloom layers are also fed, ungated, to the GPU's `bloom_glow` source; bloom is GPU-only, outside CPU parity).
 pub fn fx_bloom_quads(
     f: &FxFrame,
     layers: &[FxLayer],
@@ -1019,7 +864,6 @@ pub fn fx_bloom_quads(
     }
     impl Bloom<'_, '_> {
         /// A Rect-law ramp over `[x0, x1) × [y0, y1)`, its item `qw` wide
-        /// from `ox`, between `c0` and `c1`.
         #[allow(clippy::too_many_arguments)]
         fn ramp(
             &mut self,
@@ -1088,7 +932,6 @@ pub fn fx_bloom_quads(
                     sprite_spans(s, o, sp, palette, cols, |x0, x1, y0, y1, paint| {
                         let (color, alpha) = match paint {
                             SpanPaint::Exact(c, a) => (c, a),
-                            // Straight `(c, a)` as premultiplied source-over light.
                             SpanPaint::Straight(c, a) => {
                                 let mul8 = |v: u32| (v * u32::from(a) + 127) / 255;
                                 let ch = |sh: u32| mul8((c >> sh) & 0xff) << sh;
@@ -1127,10 +970,7 @@ pub fn fx_bloom_quads(
     );
 }
 
-/// One span of a [`GlowQuad`](aterm_core::render::GlowQuad)-law rect: column
-/// `k` of `span` is ramp column `i0 + k` of a `qw`-wide ramp from `c0` to
-/// `c1`. Shared with `Renderer::draw_flat_add`, so the glow streams and the fx
-/// rects are one loop.
+/// One span of a [`GlowQuad`](aterm_core::render::GlowQuad)-law rect: column `k` of `span` is ramp column `i0 + k` of a `qw`-wide ramp from `c0` to `c1`.
 #[inline]
 pub(crate) fn fill_glow_span(span: &mut [u32], i0: u32, qw: u32, c0: FxInk, c1: FxInk) {
     if c0 == c1 {
@@ -1146,10 +986,7 @@ pub(crate) fn fill_glow_span(span: &mut [u32], i0: u32, qw: u32, c0: FxInk, c1: 
     }
 }
 
-/// A flat span of the Exact law: `add_sat` at alpha 0, a store at 255,
-/// `over_premul` between. The three arms are one equation
-/// (`over_premul(d, c, 0) == add_sat(d, c)`, `over_premul(d, c, 255)` is `c`
-/// over `d`'s transmittance byte), specialized out of the pixel loop.
+/// A flat span of the Exact law: `add_sat` at alpha 0, a store at 255, `over_premul` between.
 #[inline]
 pub(crate) fn fill_flat(span: &mut [u32], c: u32, a: u8) {
     match a {
@@ -1172,11 +1009,7 @@ pub(crate) fn fill_flat(span: &mut [u32], c: u32, a: u8) {
     }
 }
 
-/// The per-pixel statement of pixel law F for a sprite slice: the oracle the
-/// run-list stamp is held to. It reads every texel through the law itself and
-/// never through [`FxTexels::is_clear`] (the run-list builder's filter), so a
-/// filter that dropped drawing texels (an additive Premul one, `a = 0` with
-/// colour) would diverge here instead of hiding in both.
+/// The per-pixel statement of pixel law F for a sprite slice: the oracle the run-list stamp is held to.
 #[cfg(test)]
 pub(crate) fn stamp_sprite_per_pixel(
     px: &mut [u32],
@@ -1203,12 +1036,10 @@ pub(crate) fn stamp_sprite_per_pixel(
             if sp.flip_x {
                 tx = art.w() as usize - 1 - tx;
             }
-            // `texel_bias` is the tests' off-by-one control.
             let tx = (tx + texel_bias).min(art.w() as usize - 1);
             let v = art.texel(tx, (m * ah / dh) as usize);
             let p = &mut px[y * w + x];
             match art.texels() {
-                // Index 0 writes nothing; `k` names entry `ink + k − 1`.
                 FxTexels::Index8 => {
                     if v != 0
                         && let Some(ink) = ink_at(palette, u64::from(sp.ink) + u64::from(v) - 1)
@@ -1216,8 +1047,6 @@ pub(crate) fn stamp_sprite_per_pixel(
                         *p = over_premul(*p, ink.color, ink.alpha);
                     }
                 }
-                // Every Premul texel is its own paint: an all-zero one is
-                // `add_sat(dst, 0)`, a no-op by the law, not by a filter.
                 FxTexels::Rgba8Premul => *p = over_premul(*p, v & 0x00FF_FFFF, (v >> 24) as u8),
                 FxTexels::Rgba8Straight => {
                     let (c, a) = straight_paint(v, tint);

@@ -66,6 +66,8 @@ pub struct CoalBase {
     pub procs: HashMap<u32, (Option<u64>, u64)>,
     /// Whether the list or the sweep stopped short.
     pub truncated: bool,
+    /// Whether the list stopped short.
+    pub list_truncated: bool,
 }
 
 impl CoalBase {
@@ -87,6 +89,7 @@ impl CoalBase {
                 .filter_map(|p| Some((p.pid, (p.start, p.cpu_ns?))))
                 .collect(),
             truncated: read.truncated || s.procs_truncated,
+            list_truncated: read.truncated,
         })
     }
 
@@ -180,6 +183,11 @@ pub fn split(i: &SplitIn) -> CoalSplit {
         // Not measured: no growth over the window.
         let before = before.unwrap_or(*u);
         let deferred = |e: &CoalUsage| e.eqos_ns[1].saturating_add(e.eqos_ns[2]);
+        let qos = |e: &CoalUsage| {
+            e.eqos_ns
+                .iter()
+                .fold(0, |sum: u64, ns| sum.saturating_add(*ns))
+        };
         let named = i.names.get(&u.id);
         let part = named.map_or(Part::Services, |n| n.part);
         let cpu_ns = u.cpu_ns - before.cpu_ns;
@@ -197,6 +205,7 @@ pub fn split(i: &SplitIn) -> CoalSplit {
             measured,
             delegated_mc: mc(delegated),
             deferred_mc: mc(deferred(u).saturating_sub(deferred(&before))),
+            qos_mc: mc(qos(u).saturating_sub(qos(&before))),
             read_bps: u64::try_from(
                 u128::from(u.bytes_read.saturating_sub(before.bytes_read)) * 1_000_000_000
                     / u128::from(window),
@@ -216,6 +225,7 @@ pub fn split(i: &SplitIn) -> CoalSplit {
     CoalSplit {
         via: Via::Coalitions,
         exact: !(i.now.truncated || i.base.truncated) && rows.iter().all(|r| r.measured),
+        list_truncated: i.now.list_truncated || i.base.list_truncated,
         listed: i.listed,
         global_mc,
         aterm_mc,
@@ -266,6 +276,7 @@ impl CoalSplit {
         Self {
             via: Via::Subtraction,
             exact: false,
+            list_truncated: false,
             listed: 0,
             global_mc,
             aterm_mc,

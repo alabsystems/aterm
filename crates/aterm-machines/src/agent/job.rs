@@ -74,6 +74,9 @@ fn run_job_at(sys: &dyn System, layout: &Layout, exe: &Path, run: &str, pid: u32
         }
     };
     let mut progress = Progress::resume(sys, &layout.run_dir(run));
+    // Once per run, with this job's own Full Disk Access (`HostFacts::full_disk_access`:
+    // root's open of the system TCC database, never aterm's grant), which decides whether
+    // an item may touch another app's container (`items::defaults::withheld`).
     let mut facts = crate::facts::gather(sys);
     facts.cached = super::hello::cached(sys, layout);
     let mut report = HostReport {

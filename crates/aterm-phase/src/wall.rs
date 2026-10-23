@@ -1,133 +1,47 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Classifies the wall a worker's turn ended on: usage window, model bucket,
-//! spend, full context, expired login, API error, overload, or Claude Code's
-//! critical-memory banner ([`memory_wall`], detected by screen position rather
-//! than [`PHRASES`]).
-//!
-//! [`crate::phase::worker_phase`] reports `limited` only for usage-limit kinds;
-//! turns ending on `API Error: 529 Overloaded` or `Please run /login` read as
-//! `idle` there. [`wall`] inspects the same rows as [`crate::phase::limit_notice`]
-//! (footer item, parked banner, `⎿` gutter row, and `⏺` error row) and classifies
-//! the kind from [`PHRASES`].
-//!
-//! ## Placement vs. Phrase Classification
-//! Placement decides whether a row belongs to the vendor; [`PHRASES`] decides the
-//! wall kind.
-//!
-//! * **Owner walk (`phase::block_is_vendors`)**: Claude Code draws its own `⎿`
-//!   rows at column 2 (`  ⎿  …`), whereas tool output continues at column 5 or
-//!   deeper. Walking up from a column-2 `⎿` block to the first column-0 row:
-//!   - If that owner is a tool call (`phase::is_tool_call`: `⏺ Bash(…)`, MCP
-//!     calls, `⏺ Claude in Chrome[…](…)`, or shell-mode `! cmd`), its first
-//!     column-2 `⎿` row is tool output and never a wall. Later column-2 `⎿` rows
-//!     under a call are read with `under_call = true` (where Claude Code draws a
-//!     wall when the post-tool request fails).
-//!   - Column-2 `⎿` rows under any other owner (`❯` prompt, hook summary past its
-//!     labelled rows, completion notice, worker message, `⏺ Monitor event: …`, or
-//!     blocks whose owner scrolled off or sits above a collapsed tool group) are
-//!     read with `under_call = false`.
-//! * **Labels (`opens_with_label`)**: Rows that open with a colon-terminated
-//!   label within the first [`OPENING_WORDS`] words (other than `API Error:`,
-//!   `Error during compaction:`, or `Error:`) carry program or hook text
-//!   (`Monitor event: …`, `Stop hook error: …`, `Stop says: …`) and are ignored.
-//! * **Hook output rows (`phase::programs_words`)**: Unlabelled hook output rows
-//!   under a stop-hook summary (`stopReason`) or hook error row are treated as
-//!   program output and skipped by [`wall`], [`since_limit`],
-//!   [`auto_continue_end`], and [`named_by_the_turn`].
-//! * **Transcript confirmation**: Because multi-block MCP output or hook rows
-//!   under a tool call can visually resemble a post-tool vendor wall, supervisors
-//!   confirm walls against the session's transcript before acting, or ignore
-//!   [`Wall::under_call`] walls when no transcript is available.
-//! * **Error rows ([`Placement::ErrorRow`])**: Single-paragraph column-0 `⏺`
-//!   rows at the end of the transcript that open with `API Error` or join a
-//!   notice and remedy with ` · ` (`⏺ Login expired · Please run /login`) are
-//!   classified as vendor error rows (`phase::error_row_notice`).
-//! * **Wrapped notices (`crate::wrap`)**: Notices word-wrapped by Ink in narrow
-//!   panes are joined across continuation rows (`phase::line_at`) before
-//!   classification.
-//! * **Non-wall limits**: Subagent concurrency/nesting/budget limits and
-//!   fast-mode fallbacks do not stop the worker and are listed first in
-//!   [`PHRASES`] as [`Tag::NotAWall`].
+//! Classifies the wall a worker's turn ended on: usage window, model bucket, spend, full context, expired login, API error, overload, or Claude Code's critical-memory banner ([`memory_wall`], detected by screen position rather than [`PHRASES`]).
 
 /// Which wall.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WallKind {
-    /// The five-hour session window (`You've hit your session limit · resets
-    /// 3pm`), or a usage limit that does not say which window (`Usage limit
-    /// reached · continuing automatically at 1:50pm`, `Goal paused · usage
-    /// limit reached`).
+    /// The five-hour session window (`You've hit your session limit · resets 3pm`), or a usage limit that does not say which window (`Usage limit reached · continuing automatically at 1:50pm`, `Goal paused · usage limit reached`).
     UsageSession,
-    /// The seven-day window (`You've hit your weekly limit · resets Sep 19 at
-    /// 11am`).
+    /// The seven-day window (`You've hit your weekly limit · resets Sep 19 at 11am`).
     UsageWeekly,
-    /// A per-model bucket (`You've reached your Fable limit. Run
-    /// /usage-credits to continue or switch models with /model.`). `consent`:
-    /// the vendor is asking whether to go on on usage credits (`Fable limit
-    /// reached · continuing on Sonnet uses usage credits, and the prompt to
-    /// confirm …`, from the binary) rather than stopping.
+    /// A per-model bucket (`You've reached your Fable limit.`
     ModelBucket { consent: bool },
     /// Money: a monthly spend limit, a shared budget, no usage credits left.
     Spend,
-    /// The context is full (`Context limit reached · /compact or /clear to
-    /// continue`, `Prompt is too long`): `/compact` moves it, waiting does not.
-    /// A `/compact` that failed (`Compaction failed · conversation could not
-    /// be reduced below the context limit`, `Error during compaction: …`) left
-    /// it as full as it was, and its row is the same wall, bar a detail that
-    /// names a wall of its own.
+    /// The context is full (`Context limit reached · /compact or /clear to continue`, `Prompt is too long`): `/compact` moves it, waiting does not.
     Context,
-    /// The login is gone (`Not logged in · Please run /login`, `API Error:
-    /// 401 Invalid API key · Please run /login`, `Login expired · Please run
-    /// /login` — the row Claude Code 2.1.281 writes as its `<synthetic>`
-    /// `authentication_failed` answer and draws as `⏺ Login expired · …`,
-    /// [`Placement::ErrorRow`]): a human's browser moves it, and until it
-    /// does every turn ends on it in milliseconds, whatever was typed. What
-    /// lifts it on the screen is [`login_restored`].
+    /// The login is gone (`Not logged in · Please run /login`, `API Error: 401 Invalid API key · Please run /login`, `Login expired · Please run /login` — the row Claude Code 2.1.281 writes as its `<synthetic>` `authentication_failed` answer and draws as `⏺ Login expired · …`, [`Placement::ErrorRow`]): a human's browser moves it, and until it does every turn ends on it in milliseconds, whatever was typed.
     Auth,
-    /// Any other `API Error: …` the turn ended on, and Claude Code's own
-    /// refusal of the request ([`ApiCause::Request`]). `code` is the HTTP
-    /// status when the notice prints one; `retryable` is the vendor's own
-    /// rule — 408, 409, 429 and every 5xx retry, a 4xx it does not retry is a
-    /// refused request (2.1.300's `aMr`: 400-499 but 401, 408, 409, 429 and
-    /// 451), and a notice with no status retries unless it names a TLS or
-    /// proxy refusal or a refused request. `cause` says what went wrong on
-    /// the way ([`ApiCause`]), which decides what answers it. `API Error:
-    /// Rate limit reached for requests` is `code: Some(429)`: that is the
-    /// status the vendor maps to `rate_limit`.
+    /// Any other `API Error: …` the turn ended on, and Claude Code's own refusal of the request ([`ApiCause::Request`]).
     ApiError {
         code: Option<u16>,
         retryable: bool,
         cause: ApiCause,
     },
-    /// The service is overloaded (`API Error: 529 Overloaded. This is a
-    /// server-side issue, usually temporary — try again in a moment.`,
-    /// `Repeated 529 Overloaded errors`, `Opus is experiencing high load`).
+    /// The service is overloaded (`API Error: 529 Overloaded.`
     Overloaded,
-    /// Claude Code's critical-memory banner: indicates the process must be
-    /// restarted and resumed on its conversation (`claude --resume <id>`, never
-    /// `claude --continue`: [`memory_banner_head`]). Detected by position
-    /// ([`memory_wall`]) even while the worker is busy.
+    /// Claude Code's critical-memory banner: indicates the process must be restarted and resumed on its conversation (`claude --resume <id>`, never `claude --continue`: [`memory_banner_head`]).
     Memory,
 }
 
 /// Failure category of an [`WallKind::ApiError`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApiCause {
-    /// Server-side failure: a retryable HTTP status (5xx, 408, 409, 429; or 401/451)
-    /// or an unclassified `API Error` without a status (`API Error: terminated`,
-    /// `API Error: fetch failed`, `API Error: Please wait a moment and try again.`).
+    /// Server-side failure: a retryable HTTP status (5xx, 408, 409, 429; or 401/451) or an unclassified `API Error` without a status (`API Error: terminated`, `API Error: fetch failed`, `API Error: Please wait a moment and try again.`).
     Server,
-    /// Network or DNS failure before reaching the API (e.g. `ENOTFOUND`,
-    /// `ECONNREFUSED`, timeout, or sleep).
+    /// Network or DNS failure before reaching the API (e.g.
     Unreachable,
     /// Response cut off mid-stream or stalled before a response was produced.
     CutOff,
     /// TLS, certificate, or proxy-tunnel refusal (not retried by the vendor).
     Config,
-    /// Request refused by the API (non-retryable 4xx statuses other than 401,
-    /// 408, 409, 429, 451, or [`Tag::Refused`] notices such as safeguards,
-    /// unsupported model/effort, or account holds).
+    /// Request refused by the API (non-retryable 4xx statuses other than 401, 408, 409, 429, 451, or [`Tag::Refused`] notices such as safeguards, unsupported model/effort, or account holds).
     Request,
     /// Response exceeded the output token maximum (`CLAUDE_CODE_MAX_OUTPUT_TOKENS`).
     Overlong,
@@ -151,9 +65,7 @@ impl WallKind {
         }
     }
 
-    /// The whole word `status agent=` publishes for this wall: `wall:` and
-    /// [`Self::name`] (`wall:overloaded`). Static because a published
-    /// verdict word is.
+    /// The whole word `status agent=` publishes for this wall: `wall:` and [`Self::name`] (`wall:overloaded`).
     #[inline]
     #[must_use]
     pub const fn wire(&self) -> &'static str {
@@ -170,10 +82,7 @@ impl WallKind {
         }
     }
 
-    /// Whether [`crate::phase::worker_phase`] reads this wall as
-    /// [`crate::phase::Phase::Limited`]: the usage windows, a model bucket,
-    /// spend, and an API rate limit (429) — the kinds it has always read so.
-    /// The others end a turn that reads `idle` there; [`wall`] names them.
+    /// Whether [`crate::phase::worker_phase`] reads this wall as [`crate::phase::Phase::Limited`]: the usage windows, a model bucket, spend, and an API rate limit (429) — the kinds it has always read so.
     #[inline]
     #[must_use]
     pub const fn reads_limited(&self) -> bool {
@@ -193,15 +102,11 @@ impl WallKind {
 pub enum Placement {
     /// An item of the footer, under the composer's bottom rule.
     Footer,
-    /// A banner row Claude Code parks under the last thing said (`⚠ Usage
-    /// limit reached · …`).
+    /// A banner row Claude Code parks under the last thing said (`⚠ Usage limit reached · …`).
     Banner,
     /// The vendor row: a `⎿` block under the worker's last message.
     Gutter,
-    /// The vendor's error row: an `isApiErrorMessage` row Claude Code 2.1.281
-    /// draws with its `⏺` bullet in column 0, as the last thing said (`⏺
-    /// Login expired · Please run /login`; `crate::phase`'s
-    /// `error_row_notice`).
+    /// The vendor's error row: an `isApiErrorMessage` row Claude Code 2.1.281 draws with its `⏺` bullet in column 0, as the last thing said (`⏺ Login expired · Please run /login`; `crate::phase`'s `error_row_notice`).
     ErrorRow,
 }
 
@@ -211,23 +116,17 @@ pub struct Wall {
     pub kind: WallKind,
     /// The notice as Claude Code says it, its continuation rows joined.
     pub message: String,
-    /// When it resets or goes on by itself, if the notice says
-    /// (`7:30pm (America/Los_Angeles)`, `in 3h`, `shortly`).
+    /// When it resets or goes on by itself, if the notice says (`7:30pm (America/Los_Angeles)`, `in 3h`, `shortly`).
     pub reset: Option<String>,
     /// The row the notice opens on — for a guard bound to it.
     pub row: usize,
     pub placement: Placement,
-    /// Whether a [`Placement::Gutter`] wall was read on a later column-2 row
-    /// under a tool call (`phase::block_is_vendors`). When no transcript is
-    /// available to confirm the wall, supervisors ignore walls with
-    /// `under_call = true`. `false` for all other owners and placements.
+    /// Whether a [`Placement::Gutter`] wall was read on a later column-2 row under a tool call (`phase::block_is_vendors`).
     pub under_call: bool,
 }
 
 impl Wall {
-    /// A sign-in menu drawn INSTEAD of the composer, `rows[row]` its message
-    /// ([`WallKind::Auth`]): agy's and Muse Code's, whose options open a
-    /// browser and are never read.
+    /// A sign-in menu drawn INSTEAD of the composer, `rows[row]` its message ([`WallKind::Auth`]): agy's and Muse Code's, whose options open a browser and are never read.
     pub(crate) fn sign_in(rows: &[String], row: usize) -> Self {
         Self {
             kind: WallKind::Auth,
@@ -252,28 +151,15 @@ pub enum Tag {
     Context,
     Auth,
     Overloaded,
-    /// An account the harness cannot lift from here (seat
-    /// type, admin allocation, group cap, org switched off): read as
-    /// [`WallKind::Spend`] — waited out on the limit ladder, with a person
-    /// told once ([`aterm-agent`'s exception]).
+    /// An account the harness cannot lift from here (seat type, admin allocation, group cap, org switched off): read as [`WallKind::Spend`] — waited out on the limit ladder, with a person told once ([`aterm-agent`'s exception]).
     Blocked,
     /// `Goal paused · the request was rate limited`.
     RateLimit,
-    /// The API refused the request itself, by the vendor's own words (a
-    /// safeguards refusal, a model not found or not on the plan, an account
-    /// on hold, an effort it does not take): read as
-    /// [`WallKind::ApiError`] with [`ApiCause::Request`], the status it
-    /// prints kept.
+    /// The API refused the request itself, by the vendor's own words (a safeguards refusal, a model not found or not on the plan, an account on hold, an effort it does not take): read as [`WallKind::ApiError`] with [`ApiCause::Request`], the status it prints kept.
     Refused,
 }
 
-/// THE phrase table: the first row whose phrase occurs in a notice's head
-/// (its text up to the first sentence end, `·`, `∙` or `|`, lowercased, `’`
-/// as `'`, number tokens dropped so `Fable 5 limit` and `Opus 4.1 limit`
-/// read as `fable limit` and `opus limit`) names
-/// it. Order matters: the not-walls first, then the specific kinds before
-/// the generic `usage limit`. Taken from `aterm-agent`'s
-/// `harness::limits::banner_class` needles and the 2.1.280 binary's strings.
+/// THE phrase table: the first row whose phrase occurs in a notice's head (its text up to the first sentence end, `·`, `∙` or `|`, lowercased, `’` as `'`, number tokens dropped so `Fable 5 limit` and `Opus 4.1 limit` read as `fable limit` and `opus limit`) names it.
 pub const PHRASES: &[(&str, Tag)] = &[
     ("approaching", Tag::NotAWall),
     ("concurrent subagent limit", Tag::NotAWall),
@@ -283,14 +169,7 @@ pub const PHRASES: &[(&str, Tag)] = &[
     ("fast mode", Tag::NotAWall),
     ("request was aborted", Tag::NotAWall),
     ("update installed", Tag::NotAWall),
-    // Claude Code's own model fallback (`Switched to Sonnet due to high
-    // demand for Opus`, 2.1.300): it went on, on another model. Ahead of
-    // `high demand`.
     ("due to high demand", Tag::NotAWall),
-    // Usage credits carry the session past its limit: the vendor's own list of
-    // those notices (the 2.1.300 bundle; the first two and the fourth measured
-    // in the lab), and its per-model ones. Work goes on under each, so none is a
-    // wall: `crate::credits` reads them, for the record.
     ("you're now using usage credits", Tag::NotAWall),
     ("now using usage credits", Tag::NotAWall),
     ("you're now using your usage allocation", Tag::NotAWall),
@@ -299,19 +178,10 @@ pub const PHRASES: &[(&str, Tag)] = &[
     ("now using extra usage", Tag::NotAWall),
     ("is drawing from usage credits", Tag::NotAWall),
     ("is now using usage credits instead", Tag::NotAWall),
-    // The auto-continue lifecycle's notices that are NOT a
-    // standing limit (2.1.283/284): the reset came (`Usage limit reset ·
-    // continuing automatically`, `Usage limit available again · continuing
-    // now`, the stale `(Your) usage limit has reset · press enter to
-    // continue`) and the 284 countdown toast (`Continuing automatically at
-    // 4pm · esc to cancel`).
     ("usage limit has reset", Tag::NotAWall),
     ("usage limit reset", Tag::NotAWall),
     ("usage limit available again", Tag::NotAWall),
     ("continuing automatically", Tag::NotAWall),
-    // Weekly and 5-hour session-limit reset notices and in-flight messages:
-    // ahead of `session limit` and `weekly limit` so `reset` is not read as a
-    // standing limit.
     ("session limit reset", Tag::NotAWall),
     ("reset your session limit", Tag::NotAWall),
     ("resetting your session limit", Tag::NotAWall),
@@ -320,8 +190,6 @@ pub const PHRASES: &[(&str, Tag)] = &[
     ("context limit reached", Tag::Context),
     ("prompt is too long", Tag::Context),
     ("context exceeds", Tag::Context),
-    // Failed `/compact` notices leave the context full and classify as Context
-    // (unless `Error during compaction: <detail>` names an Auth/Spend/Usage wall).
     ("compaction failed", Tag::Context),
     ("error during compaction", Tag::Context),
     ("the request was rate limited", Tag::RateLimit),
@@ -329,9 +197,6 @@ pub const PHRASES: &[(&str, Tag)] = &[
     ("repeated overloaded errors", Tag::Overloaded),
     ("overloaded", Tag::Overloaded),
     ("high load", Tag::Overloaded),
-    // What 2.1.300 DRAWS under the gutter for the row its transcript writes
-    // as `Opus is experiencing high load, …` (its renderer's own case, read
-    // from the binary): `We are experiencing high demand for Opus 4.`
     ("high demand", Tag::Overloaded),
     ("please run /login", Tag::Auth),
     ("run /login", Tag::Auth),
@@ -348,27 +213,17 @@ pub const PHRASES: &[(&str, Tag)] = &[
         Tag::Auth,
     ),
     ("token expired", Tag::Auth),
-    // Cloud gateway sign-in notices (`API Error: Not signed in to the Cloud
-    // gateway — run /login.` and `Cloud gateway session expired — run /login to
-    // reconnect.`), where `run /login` appears past the first four words.
     ("not signed in to the cloud gateway", Tag::Auth),
     ("gateway session expired", Tag::Auth),
-    // Request refusals ([`ApiCause::Request`]): repeating the same request will
-    // be refused again until the session, model, effort, or account changes.
     ("can't help with this", Tag::Refused),
     ("safeguards flagged", Tag::Refused),
     ("run /rewind", Tag::Refused),
     ("isn't available with thinking", Tag::Refused),
-    // Read anywhere in an `API Error` (`… · The configured advisor model is
-    // not compatible with this request model — …`): not the bare `advisor
-    // model`, which `/advisor`'s own `Invalid advisor model: <name>` opens.
     ("advisor model is not compatible", Tag::Refused),
     ("verify your identity", Tag::Refused),
     ("data loss prevention", Tag::Refused),
     ("does not support this model", Tag::Refused),
     ("issue with the selected model", Tag::Refused),
-    // A model not found, as the remedy both of 2.1.300's own notices for it
-    // end on (`… Run /model to pick a different model.`).
     ("to pick a different model", Tag::Refused),
     ("not available on your", Tag::Refused),
     ("account is on hold", Tag::Refused),
@@ -401,10 +256,6 @@ pub const PHRASES: &[(&str, Tag)] = &[
         Tag::Blocked,
     ),
     ("extra usage is required for long context", Tag::Blocked),
-    // The same entitlement as 2.1.300 words it (`API Error: Usage credits
-    // required for 1M context · run /model to switch to standard context`,
-    // `rate_limit`, `long_context_credits_required`): read as no wall, it was
-    // answered `keep going` hourly for good.
     ("usage credits required", Tag::Blocked),
     ("session limit", Tag::Session),
     ("5-hour limit", Tag::Session),
@@ -414,14 +265,7 @@ pub const PHRASES: &[(&str, Tag)] = &[
     ("limit will reset", Tag::Session),
 ];
 
-/// The wall `text` names, if it is one — `text` being a notice as it OPENS
-/// a vendor row (a leading status glyph such as `⚠` is skipped). `None` for
-/// anything the table does not place, for the not-walls it lists, and for a
-/// warning (`Approaching usage limit`); an `API Error` the table places
-/// nothing of is still one ([`api_error`]: by its status, else the server's).
-/// A `Goal paused · <reason> · …` notice is read by its reason. A text that
-/// opens with a LABEL ([`opens_with_label`]: `Monitor event: …`, `Stop says:
-/// …`) is a program's words, and no wall.
+/// The wall `text` names, if it is one — `text` being a notice as it OPENS a vendor row (a leading status glyph such as `⚠` is skipped).
 #[must_use]
 pub fn classify_wall(text: &str) -> Option<WallKind> {
     let text = text.trim_start_matches(|c: char| !c.is_alphanumeric());
@@ -435,11 +279,6 @@ pub fn classify_wall(text: &str) -> Option<WallKind> {
     if opens_with_label(&lower) {
         return None;
     }
-    // Two notices the vendor files under authentication that
-    // pass by themselves — `Authentication error · This may be a temporary
-    // network issue, please try again` and `Could not refresh your login
-    // because another Claude Code process is refreshing it … Try again in a
-    // minute` — are an API that was not reached, never a lost login.
     if lower.contains("temporary network issue")
         || lower.contains("another claude code process is refreshing it")
     {
@@ -449,9 +288,6 @@ pub fn classify_wall(text: &str) -> Option<WallKind> {
             cause: ApiCause::Unreachable,
         });
     }
-    // `Goal cleared after an unrecoverable error
-    // (<label>): "<goal>". Run /goal again to continue.` is the goal loop's
-    // echo of a cause that ended it; the label says which.
     if let Some(rest) = lower.strip_prefix("goal cleared after an unrecoverable error (") {
         return match rest.split(')').next().unwrap_or_default() {
             "authentication failed" | "organization verification required" => Some(WallKind::Auth),
@@ -460,11 +296,6 @@ pub fn classify_wall(text: &str) -> Option<WallKind> {
             _ => None,
         };
     }
-    // `Error during compaction: <detail>` is a `/compact` whose own request failed.
-    // Where the detail names a wall with an answer of its own (a lost login, no
-    // credit, a usage limit, a model's bucket) that wall stands, as it did before
-    // the wrapper was read: `/compact` is no answer to them. Anything else (an
-    // API error, a network error) leaves the context as full as it was.
     let bare = lower
         .strip_prefix("error:")
         .map_or(lower.as_str(), str::trim_start);
@@ -481,17 +312,12 @@ pub fn classify_wall(text: &str) -> Option<WallKind> {
         };
     }
     let head = notice_head(&lower);
-    // `API Error: 529 Overloaded` keeps its number for the code; the table
-    // reads the words.
     let opening = Opening::of(head);
     let tag = PHRASES
         .iter()
         .find(|(phrase, _)| opening.opens_with(phrase))
         .map(|&(_, tag)| tag);
     let api = head.starts_with("api error");
-    // The usage kinds need the notice's own verb (`… limit reached`, `hit
-    // your …`, `… will reset`, `out of …`, `requires usage credits`): a
-    // sentence that merely names a weekly or usage limit is not one.
     let usage_verb = || USAGE_VERBS.iter().any(|v| head.contains(v));
     match tag {
         Some(Tag::NotAWall) => None,
@@ -515,18 +341,12 @@ pub fn classify_wall(text: &str) -> Option<WallKind> {
             retryable: false,
             cause: ApiCause::Request,
         }),
-        // The exact `Request timed out` is drawn under `⎿` with no prefix:
-        // the whole row, never a tool's line that begins so.
         None if api || crate::text::trim(&lower) == "request timed out" => api_error(head, &lower),
         None => None,
     }
 }
 
-/// Whether the table reads `text` — a notice as it OPENS, its words held
-/// from elsewhere (aterm-agent's transcript of the session) — as one that is
-/// NOT a wall ([`Tag::NotAWall`]: `API Error: Request was aborted.`, a
-/// subagent's quota, the auto-continue's lifecycle): a reader that names a
-/// wall the table does not ([`classify_wall`] `None`) names none for it.
+/// Whether the table reads `text` — a notice as it OPENS, its words held from elsewhere (aterm-agent's transcript of the session) — as one that is NOT a wall ([`Tag::NotAWall`]: `API Error: Request was aborted.`, a subagent's quota, the auto-continue's lifecycle): a reader that names a wall the table does not ([`classify_wall`] `None`) names none for it.
 #[must_use]
 pub fn not_a_wall(text: &str) -> bool {
     let text = text.trim_start_matches(|c: char| !c.is_alphanumeric());
@@ -538,17 +358,7 @@ pub fn not_a_wall(text: &str) -> bool {
         .is_some_and(|&(_, tag)| tag == Tag::NotAWall)
 }
 
-/// Whether [`classify_wall`] reads `text` BY THE STATUS ITS `API Error` HEAD
-/// PRINTS ALONE ([`api_error`] with a status: `API Error: 403 Forbidden`,
-/// `API Error: 401 Unauthorized`, the API's own JSON body behind its
-/// status): no phrase of the table opens the notice ([`Opening`]) and no
-/// refusal's row is anywhere in it ([`Tag::Refused`]'s: `API Error: 403
-/// Request blocked by your organization's data loss prevention policy.` is
-/// named by its words). Such a reading says only what the status's range
-/// does (a 4xx the vendor does not retry is a refused request), not which
-/// wall it is: a reader that holds the notice's typed fields as well
-/// (aterm-agent's transcript: an `error` word `authentication_failed`)
-/// names it more closely.
+/// Whether [`classify_wall`] reads `text` BY THE STATUS ITS `API Error` HEAD PRINTS ALONE ([`api_error`] with a status: `API Error: 403 Forbidden`, `API Error: 401 Unauthorized`, the API's own JSON body behind its status): no phrase of the table opens the notice ([`Opening`]) and no refusal's row is anywhere in it ([`Tag::Refused`]'s: `API Error: 403 Request blocked by your organization's data loss prevention policy.` is named by its words).
 #[must_use]
 pub fn named_by_status_alone(text: &str) -> bool {
     let trimmed = text.trim_start_matches(|c: char| !c.is_alphanumeric());
@@ -562,9 +372,6 @@ pub fn named_by_status_alone(text: &str) -> bool {
     })
 }
 
-/// A notice's head: its text up to the first sentence end (a `.` before a
-/// space or at the end, so a model's `4.1` or `4.5` stays whole), `·`, `∙`
-/// or `|`.
 fn notice_head(text: &str) -> &str {
     let end = text
         .char_indices()
@@ -576,28 +383,14 @@ fn notice_head(text: &str) -> &str {
     crate::text::trim(&text[..end])
 }
 
-/// The verbs a usage, model-bucket or spend notice opens with.
 const USAGE_VERBS: &[&str] = &[
     "reached", "hit your", "reset", "out of", "requires", "now uses", "too low",
 ];
 
-/// How many words may come before a phrase that still OPENS the notice:
-/// `you've hit your team's shared budget` is the longest measured lead.
 const OPENING_WORDS: usize = 4;
 
-/// The heads of Claude Code's OWN notices that end in a colon: an API error
-/// (`API Error: 529 …`), a `/compact` whose request failed (`Error during
-/// compaction: <detail>`, read by its detail), and the bare `Error:` such a
-/// detail can open with. Never a label ([`opens_with_label`]).
 const NOTICE_HEADS: &[&str] = &["api error:", "error during compaction:", "error:"];
 
-/// Whether `lower` (a row's text, lowercased) opens with a colon-terminated
-/// label within the first [`OPENING_WORDS`] words of [`notice_head`] that is not
-/// in [`NOTICE_HEADS`] (a parenthesized qualifier such as `API Error (<model>):`
-/// is stripped before checking [`NOTICE_HEADS`]). Rows opening with a label
-/// (`Monitor event: …`, `Stop hook error: …`, `Stop says: …`) introduce program
-/// or hook output rather than a vendor wall notice. Numeric tokens (`10:25:`)
-/// are not labels.
 fn opens_with_label(lower: &str) -> bool {
     let mut lead: Vec<&str> = Vec::new();
     for word in notice_head(lower).split_whitespace().take(OPENING_WORDS) {
@@ -606,9 +399,6 @@ fn opens_with_label(lower: &str) -> bool {
             .chars()
             .all(|c| c.is_ascii_digit() || c == '.' || c == ':');
         if word.ends_with(':') && !number {
-            // A parenthesized word qualifies the head before it and closes it
-            // (`API Error (claude-opus-9): …`, the model a request named):
-            // that head, with the colon, is the one asked of NOTICE_HEADS.
             let head = if word.starts_with('(') {
                 format!("{}:", lead[..lead.len() - 1].join(" "))
             } else {
@@ -620,17 +410,12 @@ fn opens_with_label(lower: &str) -> bool {
     false
 }
 
-/// Whether `text`, a row's text as drawn (a leading glyph such as `⎿` or `⏺`
-/// passed over), OPENS WITH A LABEL ([`opens_with_label`]): a program's words
-/// follow it, never a notice of Claude Code's own.
+/// Whether `text`, a row's text as drawn (a leading glyph such as `⎿` or `⏺` passed over), OPENS WITH A LABEL ([`opens_with_label`]): a program's words follow it, never a notice of Claude Code's own.
 pub(crate) fn labelled(text: &str) -> bool {
     let text = text.trim_start_matches(|c: char| !c.is_alphanumeric());
     opens_with_label(&text.replace('\u{2019}', "'").to_lowercase())
 }
 
-/// Non-numeric words of a notice head joined with single spaces, plus the byte
-/// offsets of the first [`OPENING_WORDS`] + 1 word boundaries so [`PHRASES`] can
-/// be matched by prefix at word starts in a single pass.
 struct Opening {
     words: String,
     starts: Vec<usize>,
@@ -653,8 +438,6 @@ impl Opening {
         Self { words, starts }
     }
 
-    /// Whether `phrase` starts on a word boundary within the first
-    /// [`OPENING_WORDS`] words.
     fn opens_with(&self, phrase: &str) -> bool {
         self.starts
             .iter()
@@ -662,12 +445,6 @@ impl Opening {
     }
 }
 
-/// Classifies an `API Error` notice from its `head` (for status code) and `full`
-/// lowercased text. Status 529 is [`WallKind::Overloaded`]; `context window
-/// limit` is [`WallKind::Context`]; non-retryable 4xx statuses
-/// ([`refused_status`]) and [`Tag::Refused`] phrases are [`ApiCause::Request`];
-/// otherwise [`CONFIG_WORDS`], [`OVERLONG_WORDS`], [`CUT_OFF_WORDS`], and
-/// [`UNREACHABLE_WORDS`] are checked in order, defaulting to [`ApiCause::Server`].
 fn api_error(head: &str, full: &str) -> Option<WallKind> {
     let code = api_status(head.strip_prefix("api error").unwrap_or(head));
     if code == Some(529) {
@@ -705,9 +482,6 @@ fn api_error(head: &str, full: &str) -> Option<WallKind> {
     })
 }
 
-/// The HTTP status an API error's head prints after `API Error`: three
-/// digits first (`: 400 …`), `rate limit` (the status the vendor maps to
-/// `rate_limit`), or a status in parentheses (`Request rejected (429)`).
 fn api_status(rest: &str) -> Option<u16> {
     let rest = rest.trim_start_matches([':', ' ']);
     let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
@@ -720,14 +494,10 @@ fn api_status(rest: &str) -> Option<u16> {
     }
 }
 
-/// A status the vendor does not retry, the request itself refused: 2.1.300's
-/// own predicate (`aMr`), 400-499 but 401 (a token it refreshes itself), 408,
-/// 409, 429 and 451.
 fn refused_status(code: u16) -> bool {
     (400..500).contains(&code) && !matches!(code, 401 | 408 | 409 | 429 | 451)
 }
 
-/// A 4xx or 5xx status printed in parentheses (`request rejected (429)`).
 fn status_in_parens(rest: &str) -> Option<u16> {
     rest.match_indices('(').find_map(|(at, _)| {
         let inner = rest.get(at + 1..at + 5)?;
@@ -736,16 +506,6 @@ fn status_in_parens(rest: &str) -> Option<u16> {
     })
 }
 
-/// A certificate or proxy-tunnel refusal: `Unable to connect to API: SSL
-/// certificate verification failed` (… has expired, … has been revoked, …
-/// hostname mismatch, … is not yet valid), `Self-signed certificate
-/// detected`, `(<code>). The certificate comes from an authority Claude Code
-/// doesn't trust …`, `Couldn't connect through your proxy
-/// (ERR_PROXY_TUNNEL)`, and Node's certificate codes. Not a bare `SSL error
-/// (<code>)`: 2.1.283 names a handshake that timed out or a record that
-/// broke so (`ERR_TLS_HANDSHAKE_TIMEOUT`, `ERR_SSL_WRONG_VERSION_NUMBER`),
-/// and those pass with the network — it reads unreachable, by its `unable
-/// to connect`.
 const CONFIG_WORDS: &[&str] = &[
     "certificate",
     "self-signed",
@@ -757,16 +517,6 @@ const CONFIG_WORDS: &[&str] = &[
     "cert_",
 ];
 
-/// A reply cut off mid-stream or before it began: `The response stopped
-/// arriving.`, `Server error mid-response.`, `The response stream was
-/// malformed.`, `Part of the response never arrived.`, `Your computer went
-/// to sleep mid-response.`, `Connection lost mid-response.` (each `… The
-/// response above may be incomplete.`), `The response stalled before a
-/// response was produced. Try again.` and its kin.
-///
-/// So is a reply whose image was dropped (`… in the conversation could not
-/// be processed and was removed.`). Not a reply past its output token
-/// maximum: that is [`OVERLONG_WORDS`], whose answer is no plain retry.
 const CUT_OFF_WORDS: &[&str] = &[
     "mid-response",
     "could not be processed and was removed",
@@ -778,20 +528,8 @@ const CUT_OFF_WORDS: &[&str] = &[
     "before a response was produced",
 ];
 
-/// A reply past its output token maximum ([`ApiCause::Overlong`]): `Claude's
-/// response exceeded the 32000 output token maximum. To configure this
-/// behavior, set the CLAUDE_CODE_MAX_OUTPUT_TOKENS environment variable.`,
-/// and its kin for a request sent without streaming (2.1.300).
 const OVERLONG_WORDS: &[&str] = &["output token maximum"];
 
-/// A network never reached: `Can't reach the API server — check your
-/// internet or DNS (ENOTFOUND)`, `No internet route — check your connection
-/// or VPN (ENETUNREACH)`, `Unable to connect to API. Check your internet
-/// connection`, `Unable to connect to API (<code>)`, `Connection refused — a
-/// firewall or proxy may be blocking it`, `Connection dropped (ECONNRESET)`,
-/// `Request timed out. Check your internet connection and proxy settings`,
-/// `No response from API`, `Connection lost while your computer was
-/// asleep`, `Connection closed before the response finished`.
 const UNREACHABLE_WORDS: &[&str] = &[
     "can't reach",
     "no internet route",
@@ -820,29 +558,13 @@ const UNREACHABLE_WORDS: &[&str] = &[
     "connectionclosed",
 ];
 
-/// The wall the worker's last turn ended on, if any: Claude Code's
-/// critical-memory banner first ([`memory_wall`]), then [`classify_wall`]
-/// over the rows [`crate::phase::limit_notice`] reads, every kind. It does
-/// not ask whether the worker is busy — a notice stays on the screen while
-/// the vendor retries under it — so read it beside
-/// [`crate::phase::busy_signal`], as [`crate::reader::read`] does.
+/// The wall the worker's last turn ended on, if any: Claude Code's critical-memory banner first ([`memory_wall`]), then [`classify_wall`] over the rows [`crate::phase::limit_notice`] reads, every kind.
 #[must_use]
 pub fn wall(rows: &[String]) -> Option<Wall> {
     memory_wall(rows).or_else(|| crate::phase::notice(rows, &classify_wall))
 }
 
-/// Whether the screen says the login is back: the last thing said is the
-/// vendor's own word that a `/login` finished — `⎿  Login successful`, or
-/// `⎿  Login successful · account or organization changed` — hanging from
-/// the `❯ /login` a person typed. It is what
-/// lifts a [`WallKind::Auth`] wall on the screen: the wall's row is no longer
-/// the last thing said, and this says why. A `/login` that did not finish —
-/// its dialog dismissed — leaves no such row, and a login finished in another
-/// tab says nothing here: the wall's row stays the last thing said until
-/// something is typed into this one. In a pane narrower than the row Ink
-/// wraps it (`crate::wrap`), and the last thing said is its rest
-/// (`organization changed`): the row is read as the line the last thing said
-/// belongs to.
+/// Whether the screen says the login is back: the last thing said is the vendor's own word that a `/login` finished — `⎿  Login successful`, or `⎿  Login successful · account or organization changed` — hanging from the `❯ /login` a person typed.
 #[must_use]
 pub fn login_restored(rows: &[String]) -> bool {
     use crate::phase::{gutter_open, last_said_index, line_at};
@@ -865,25 +587,9 @@ pub fn login_restored(rows: &[String]) -> bool {
             .is_some_and(|r| crate::text::trim_end(r) == "❯ /login")
 }
 
-/// How many rows above the composer's top rule a notification is looked
-/// for in ([`login_expires_in`]): Claude Code parks its notifications on the
-/// row right above it, right-aligned (`✔ Update installed · Restart to
-/// update`), and
-/// the slack is a row or two of a banner under it.
 const NOTICE_ROWS: usize = 3;
 
-/// The days Claude Code says the stored login has left — its own `Your login
-/// expires in N days · run /login to renew` (anchors `login.expires_in`,
-/// `login.renew_hint`, N from 1 to 3) — or
-/// `None`. Read where Claude Code draws a notification and nowhere a
-/// conversation is: the right segment of a row just above the composer's top
-/// rule ([`NOTICE_ROWS`]) or under its bottom rule (the footer, where the
-/// bundle draws the same words at a day or less), starting at the hint
-/// column or against the right edge as a notification does, after at most a
-/// status glyph, and followed by `day`/`days` and the renew hint (or the
-/// row's end, where the width cut it). A reply (`⏺`), a tool's output
-/// (`⎿`), a tool row or a person's words quoting the sentence are none of
-/// those rows' right segments, and read `None`.
+/// The days Claude Code says the stored login has left — its own `Your login expires in N days · run /login to renew` (anchors `login.expires_in`, `login.renew_hint`, N from 1 to 3) — or `None`.
 #[must_use]
 pub fn login_expires_in(rows: &[String]) -> Option<u32> {
     use crate::phase::{HINT_COLUMN, composer_frame, is_against_right_edge};
@@ -914,62 +620,18 @@ pub fn login_expires_in(rows: &[String]) -> Option<u32> {
     })
 }
 
-/// How Claude Code's own auto-continue of a usage limit ended, by the
-/// vendor's word on the screen ([`auto_continue_end`]).
+/// How Claude Code's own auto-continue of a usage limit ended, by the vendor's word on the screen ([`auto_continue_end`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AutoContinue {
-    /// It went on: the vendor sent the continuation itself — `Usage limit
-    /// reset · continuing automatically` at the reset, `Usage limit available
-    /// again · continuing now` before it.
+    /// It went on: the vendor sent the continuation itself — `Usage limit reset · continuing automatically` at the reset, `Usage limit available again · continuing now` before it.
     Fired,
-    /// It will not go on by itself: `Automatic continue cancelled · …` (Esc
-    /// on its countdown; the session moved, relaunched or exited), `Automatic
-    /// continue stopped · …`, `Automatic continue was turned off · …`, or a
-    /// reset that passed with nothing sent (`Usage limit has reset · press
-    /// enter to continue`).
+    /// It will not go on by itself: `Automatic continue cancelled · …` (Esc on its countdown; the session moved, relaunched or exited), `Automatic continue stopped · …`, `Automatic continue was turned off · …`, or a reset that passed with nothing sent (`Usage limit has reset · press enter to continue`).
     Unkept,
-    /// It has not ended: its countdown is still drawn (`Continuing
-    /// automatically at 3:15pm · esc to cancel`, `Continuing shortly · esc to
-    /// cancel` — the footer's row under the banner from 2.1.295 on, a
-    /// notification under the wall's row in 2.1.284). Where no limit's notice
-    /// is read, this is what says the vendor still goes on by itself; where
-    /// nothing is drawn, it does not: a `/resume` or a `/clear` drops the
-    /// countdown without a word.
+    /// It has not ended: its countdown is still drawn (`Continuing automatically at 3:15pm · esc to cancel`, `Continuing shortly · esc to cancel` — the footer's row under the banner from 2.1.295 on, a notification under the wall's row in 2.1.284).
     Armed,
 }
 
-/// What the screen last says of Claude Code's own auto-continue, once the
-/// limit it was armed for has left the screen: Esc on `Continuing automatically
-/// at 3:50pm · esc to cancel` draws `⏺ Automatic continue cancelled ·
-/// /rate-limit-options to re-arm` in the transcript and as the footer's
-/// notification; at the reset the vendor draws `⏺ Usage limit reset ·
-/// continuing automatically` and sends the continuation itself, with no `❯`
-/// row, its reply under it. Either way the limit's notice is no longer the
-/// last thing said, so [`wall`] finds none, and only these rows say which way
-/// the limit's end went.
-///
-/// Read where the vendor draws them: the footer's notification first (when it
-/// shows it is the newest word), then up from the composer through the
-/// transcript, the first row or wide-gapped item that opens with one of the
-/// words ([`crate::anchors`]' `wall.auto_continue.*`, a leading glyph
-/// passed over) — each row read as the line it opens, across the rows Ink
-/// wrapped it onto (`crate::wrap`; at 26 columns `⏺ Automatic` stands over
-/// `continue` over `cancelled · /rat…`).
-/// The walk up ends at the turn's own `❯` row — a person's `/usage` after the
-/// cancel is a new turn, and what came before it is that turn's history — and
-/// at a limit notice: a limit below the vendor's word stands (its
-/// continuation met the limit again). A countdown still drawn there is
-/// [`AutoContinue::Armed`]: not ended. `None` when nothing says — and once a
-/// countdown was armed, nothing drawn says it was dropped (a `/resume`, a
-/// `/clear`). A row of a program's words in the
-/// transcript (`phase::programs_words`, as [`since_limit`] passes it over)
-/// says neither.
-///
-/// Only the footer's word is the live process's own ([`auto_continue_toast`]);
-/// a word in the transcript may be a `/resume`d conversation's history, an
-/// older limit's `Fired` under a notice of its own, and
-/// says which limit it ended only by the notice it is drawn under
-/// ([`SinceLimit::fired`]).
+/// What the screen last says of Claude Code's own auto-continue, once the limit it was armed for has left the screen: Esc on `Continuing automatically at 3:50pm · esc to cancel` draws `⏺ Automatic continue cancelled · /rate-limit-options to re-arm` in the transcript and as the footer's notification; at the reset the vendor draws `⏺ Usage limit reset · continuing automatically` and sends the continuation itself, with no `❯` row, its reply under it.
 #[must_use]
 pub fn auto_continue_end(rows: &[String]) -> Option<AutoContinue> {
     if let Some(end) = auto_continue_toast(rows) {
@@ -978,9 +640,6 @@ pub fn auto_continue_end(rows: &[String]) -> Option<AutoContinue> {
     auto_continue_said_row(rows).and_then(|(end, _)| end)
 }
 
-/// [`auto_continue_end`]'s walk up the transcript: the row that decided it
-/// and what it says there — the vendor's word, or `None` for a limit's
-/// notice below any word. `None` where no row decides.
 fn auto_continue_said_row(rows: &[String]) -> Option<(Option<AutoContinue>, usize)> {
     use crate::phase::line_at;
     let frame = crate::phase::composer_frame(rows)?;
@@ -1005,8 +664,7 @@ fn auto_continue_said_row(rows: &[String]) -> Option<(Option<AutoContinue>, usiz
     None
 }
 
-/// The row a limit reader read as Claude Code's for want of the rows above
-/// ([`limit_words_above`]).
+/// The row a limit reader read as Claude Code's for want of the rows above ([`limit_words_above`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WordsAbove {
     /// The row its line opens on.
@@ -1015,20 +673,7 @@ pub struct WordsAbove {
     pub end: usize,
 }
 
-/// The row a limit reader decided on without its owner:
-/// the newest limit notice [`since_limit`] reads, its `/goal` echo, or the
-/// transcript's row [`auto_continue_end`] reads — where the walk that tells
-/// a program's words from Claude Code's own reached the first of `rows`
-/// undecided ([`crate::phase::WordsOf::Above`]), the lowest such row. When a
-/// Stop hook's `stopReason` is taller than the rows read (on a 40-row tail of
-/// its screen, or a screen whose summary row scrolled into the history), its
-/// last line `Usage limit reached · resets 3pm` can otherwise read as a session
-/// limit's notice with no turn served under it. A
-/// caller that can read the rows above — the whole grid over a tail, the
-/// history over the grid — reads the row again with them
-/// ([`crate::phase::words_of`]), and a program's words it then finds are no
-/// rows to hand these readers. `None` where every row they decided on was
-/// decided within `rows`, or the screen draws no composer.
+/// The row a limit reader decided on without its owner: the newest limit notice [`since_limit`] reads, its `/goal` echo, or the transcript's row [`auto_continue_end`] reads — where the walk that tells a program's words from Claude Code's own reached the first of `rows` undecided ([`crate::phase::WordsOf::Above`]), the lowest such row.
 #[must_use]
 pub fn limit_words_above(rows: &[String]) -> Option<WordsAbove> {
     let frame = crate::phase::composer_frame(rows)?;
@@ -1052,10 +697,7 @@ pub fn limit_words_above(rows: &[String]) -> Option<WordsAbove> {
         })
 }
 
-/// What the footer's notification says of Claude Code's own auto-continue
-/// ([`auto_continue_end`]'s first read): the live process's own toast, drawn
-/// under the composer, never a row of a conversation's history. `None` where
-/// the footer says nothing of it, or the screen draws no composer.
+/// What the footer's notification says of Claude Code's own auto-continue ([`auto_continue_end`]'s first read): the live process's own toast, drawn under the composer, never a row of a conversation's history.
 #[must_use]
 pub fn auto_continue_toast(rows: &[String]) -> Option<AutoContinue> {
     use crate::phase::{footer_end, line_at};
@@ -1068,95 +710,31 @@ pub fn auto_continue_toast(rows: &[String]) -> Option<AutoContinue> {
     })
 }
 
-/// The screen's newest usage limit notice and what was served, or chosen,
-/// since it ([`since_limit`]).
+/// The screen's newest usage limit notice and what was served, or chosen, since it ([`since_limit`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SinceLimit {
-    /// The notice's kind ([`classify_wall`]); a generic countdown row's
-    /// (`Usage limit reached · continuing automatically at …`), the turn's
-    /// own notice's above it naming the same reset ([`named_by_the_turn`]).
+    /// The notice's kind ([`classify_wall`]); a generic countdown row's (`Usage limit reached · continuing automatically at …`), the turn's own notice's above it naming the same reset ([`named_by_the_turn`]).
     pub kind: WallKind,
-    /// The reset it names, as printed ([`crate::notice_reset`]: `10:38am`,
-    /// `Oct 20 at 9am (…)`): what tells one limit's notice from another's.
+    /// The reset it names, as printed ([`crate::notice_reset`]: `10:38am`, `Oct 20 at 9am (…)`): what tells one limit's notice from another's.
     pub reset: Option<String>,
-    /// A turn was served since it: a person's prompt below it (a `❯` row in
-    /// column zero with text, no local command — `❯ /usage`, `❯ /model`, a
-    /// `/resume`: no turn) with the model's reply drawn under that prompt (a
-    /// `⏺` row in column zero, `●` off macOS, that is no notice of the
-    /// vendor's: the model's words or a tool's call).
+    /// A turn was served since it: a person's prompt below it (a `❯` row in column zero with text, no local command — `❯ /usage`, `❯ /model`, a `/resume`: no turn) with the model's reply drawn under that prompt (a `⏺` row in column zero, `●` off macOS, that is no notice of the vendor's: the model's words or a tool's call).
     pub served: bool,
-    /// The vendor went on by itself under it: its `⏺ Usage limit reset ·
-    /// continuing automatically` (or `Usage limit available again ·
-    /// continuing now`, [`AutoContinue::Fired`]) drawn in column zero below
-    /// this notice. The notice's reset says whose continuation it was: a
-    /// `/resume`d conversation redraws an older limit's `Fired` under that
-    /// limit's own notice.
+    /// The vendor went on by itself under it: its `⏺ Usage limit reset · continuing automatically` (or `Usage limit available again · continuing now`, [`AutoContinue::Fired`]) drawn in column zero below this notice.
     pub fired: bool,
-    /// A model was chosen since it: a person's `/model` below it (`❯ /model`,
-    /// `❯ /model opus`) with its result drawn under that prompt (`⎿  Set model
-    /// to …`, the anchor `model.set`). This alone says nothing about whether
-    /// the choice left the model family a bucket limits.
+    /// A model was chosen since it: a person's `/model` below it (`❯ /model`, `❯ /model opus`) with its result drawn under that prompt (`⎿  Set model to …`, the anchor `model.set`).
     pub model_set: bool,
     /// The newest completed `/model` choice's words after `Set model to `.
-    /// Kept without interpreting model names: a caller can compare the chosen
-    /// family with the bucket's, and an unknown choice remains unknown rather
-    /// than falling back to an older choice it recognizes.
     pub chosen_model: Option<String>,
-    /// The notice names no limit: Claude Code's generic row (`Usage limit
-    /// reached · continuing automatically at …`) with no notice of its turn
-    /// drawn above it ([`turns_notice`]: scrolled off, or cut to its wrapped
-    /// rows). [`Self::kind`] is then its own words' (a usage window's), and the
-    /// row stands for whichever limit names its reset: a model bucket draws it
-    /// too, and on a short pane the bucket's own notice scrolls off first. A
-    /// caller that waits on a limit of that reset reads it as that limit's
-    /// notice. `false` for a notice that names its limit, and for a generic
-    /// row whose turn's notice is drawn.
+    /// The notice names no limit: Claude Code's generic row (`Usage limit reached · continuing automatically at …`) with no notice of its turn drawn above it ([`turns_notice`]: scrolled off, or cut to its wrapped rows).
     pub generic: bool,
 }
 
-/// The newest usage limit notice the screen draws and whether a turn was
-/// served since it ([`SinceLimit`]): up from the composer, the first line (or
-/// wide-gapped item) Claude Code's limit notice opens (`You've hit your
-/// session limit · …`, its `Usage limit reached · continuing automatically …`
-/// row; a line that names no reset — the `/goal` echo of the notice above it —
-/// takes its reset from that notice), and the rows below it. The screen's
-/// order is the conversation's, so
-/// a prompt drawn below the notice was submitted after it; where the limit
-/// still stood, its turn met it again and drew a notice below the prompt,
-/// which the walk meets first; where the API never answered it (an Esc
-/// before its reply: `⎿  Interrupted · …`), no `⏺` row hangs under it. The
-/// notice's reset says which limit it is: a conversation `/resume`d redraws
-/// its own history, an older limit's notice with turns served under it, and
-/// the caller ties the notice to the limit it waits on by that reset. `None`
-/// where the screen above
-/// the composer draws no limit's notice (scrolled off, cleared) or no
-/// composer: the screen says nothing of the limit. Read where the limit's
-/// notice has left the screen's end (Esc on the vendor's countdown), and a
-/// person's turn ran there that no read saw busy. A shell-mode `! cmd` is
-/// drawn without the `❯`
-/// and is not read here. The vendor's own continuation drawn under the
-/// notice ([`SinceLimit::fired`]) is read the same way, and tied to its limit
-/// by the same reset.
-///
-/// Each row is read as the line it opens, across the rows Ink wrapped it
-/// onto (`crate::wrap`, as [`auto_continue_end`] reads them). A row
-/// of a program's words (`phase::programs_words`: behind a label, or a
-/// hook's words under the stop-hook summary or its error row) names no limit
-/// however its items split.
+/// The newest usage limit notice the screen draws and whether a turn was served since it ([`SinceLimit`]): up from the composer, the first line (or wide-gapped item) Claude Code's limit notice opens (`You've hit your session limit · …`, its `Usage limit reached · continuing automatically …` row; a line that names no reset — the `/goal` echo of the notice above it — takes its reset from that notice), and the rows below it.
 #[must_use]
 pub fn since_limit(rows: &[String]) -> Option<SinceLimit> {
     newest_limit(rows).map(|newest| newest.since)
 }
 
-/// What a line drawn with the model's dot says: `line`, opened by `row`, a
-/// row the caller found in column 0 ([`since_limit`]), says `⏺` — `●` where
-/// the platform draws that (Claude Code draws `●` off macOS), never the
-/// session survey ([`crate::phase::is_survey`]) — and is no notice of a wall
-/// ([`classify_wall`]); its words after the dot. They are a line of the
-/// model's (a reply or a tool's call) unless they are the vendor's own word on
-/// its auto-continue ([`auto_continue_said`], [`auto_continue_end`]'s words),
-/// which [`since_limit`] reads as that word ([`SinceLimit::fired`]), never as
-/// a reply.
 fn dotted_said<'a>(row: &str, line: &'a str) -> Option<&'a str> {
     if crate::phase::is_survey(row) {
         return None;
@@ -1166,9 +744,6 @@ fn dotted_said<'a>(row: &str, line: &'a str) -> Option<&'a str> {
         .filter(|said| classify_wall(said).is_none())
 }
 
-/// What [`newest_limit`] read: the notice ([`SinceLimit`]), the row its line
-/// opens on, its words as said (the item, its leading glyph dropped), and the
-/// row its `/goal` echo opens on below it, if one took its reset from it.
 struct Newest {
     since: SinceLimit,
     row: usize,
@@ -1176,8 +751,6 @@ struct Newest {
     echo: Option<usize>,
 }
 
-/// [`since_limit`]'s walk, keeping the notice's row and words for
-/// [`left_wall`].
 fn newest_limit(rows: &[String]) -> Option<Newest> {
     use crate::phase::line_at;
     let frame = crate::phase::composer_frame(rows)?;
@@ -1186,19 +759,10 @@ fn newest_limit(rows: &[String]) -> Option<Newest> {
         item.trim_start_matches(|c: char| !c.is_alphanumeric())
             .to_string()
     };
-    // A reply of the model's below the rows walked so far, and a prompt
-    // that drew one.
     let (mut replied, mut served) = (false, false);
-    // The vendor's own continuation (`Fired`) below the rows walked so far.
     let mut fired = false;
-    // A model's choice below the rows walked so far (`⎿  Set model to …`),
-    // and a `/model` that drew one.
     let mut set: Option<String> = None;
     let (mut model_set, mut chosen_model) = (false, None);
-    // The newest limit line met, where it named no reset: an echo of the
-    // notice above it (`⏺ Goal paused · usage limit reached · send a message
-    // after it resets to continue`), whose reset the notice names. The walk
-    // goes on up to it, through no prompt.
     let mut echo: Option<(WallKind, usize, String)> = None;
     let echoed = |(kind, row, message): (WallKind, usize, String),
                   served,
@@ -1249,11 +813,6 @@ fn newest_limit(rows: &[String]) -> Option<Newest> {
         if let Some((kind, item)) = limit.filter(|_| !crate::phase::programs_words(rows, i)) {
             match crate::phase::notice_reset(item) {
                 Some(reset) => {
-                    // The generic countdown row (`⏺ Usage limit reached ·
-                    // continuing automatically at 9:13am · …`, drawn under a
-                    // model's bucket as under a usage window) takes its kind
-                    // from the notice above it that names the same reset, as
-                    // the footer's banner's does ([`named_by_the_turn`]).
                     let found = named_by_the_turn(
                         rows,
                         Wall {
@@ -1266,9 +825,6 @@ fn newest_limit(rows: &[String]) -> Option<Newest> {
                         },
                         &classify_wall,
                     );
-                    // With no notice of its turn drawn above it (scrolled off a
-                    // short pane), the generic row names no limit
-                    // ([`SinceLimit::generic`]).
                     let generic = generic_limit(item)
                         && turns_notice(rows, i, width, &classify_wall).is_none();
                     return Some(Newest {
@@ -1313,45 +869,19 @@ fn newest_limit(rows: &[String]) -> Option<Newest> {
     echo.map(|echo| echoed(echo, served, fired, model_set, chosen_model))
 }
 
-/// The words a generic usage limit notice opens with: Claude Code 2.1.295 and
-/// later draw every subscription limit's footer banner so (`⚠ Usage limit
-/// reached · limit resets 3:34pm`), and its auto-continue's transcript row
-/// (`⏺ Usage limit reached · continuing automatically at 3:34pm · …`), whatever
-/// the limit is — the five-hour window, the weekly one, a model's bucket.
-/// Only the turn's own `⎿` notice names which (`You've hit your Sonnet limit ·
-/// resets …`).
 const GENERIC_LIMIT: &str = "usage limit reached";
 
-/// Whether `item` is a generic usage limit notice ([`GENERIC_LIMIT`]): it
-/// names no window and no bucket.
 fn generic_limit(item: &str) -> bool {
     let words = item.trim_start_matches(|c: char| !c.is_alphanumeric());
     strip_ci(words, GENERIC_LIMIT).is_some()
 }
 
-/// A reset as its notice prints it, its zone left out (the footer's banner
-/// names none: `Oct 17 at 3:34pm`; the turn's notice does: `Oct 17 at 3:34pm
-/// (America/Los_Angeles)`), so that two notices of one limit compare equal.
 fn reset_clock_words(reset: &str) -> String {
     let cut = reset.find('(').unwrap_or(reset.len());
     crate::text::trim(&reset[..cut]).to_ascii_lowercase()
 }
 
-/// The wall a generic banner stands for: `found` is the notice the reader placed
-/// (`crate::phase::notice`'s placement: the footer, a banner) and, where it
-/// is the generic `Usage limit reached` ([`generic_limit`]), the kind is the
-/// turn's own notice's — the newest limit notice above the composer that
-/// names its limit, read as [`since_limit`] reads one (each row as the line
-/// it opens, across the rows Ink wrapped it onto), up through local commands
-/// (`❯ /rate-limit-options`, which Claude Code types itself to open its
-/// dialog) but no person's prompt, and naming the same reset as `found` (the
-/// zone aside): the notice of this limit, never an older one a `/resume`d
-/// history redraws. Its words then open the message, the banner's follow
-/// (`You've hit your Sonnet limit · resets … — ⚠ Usage limit reached · …`),
-/// so the bucket's model is read off it and a loop that takes the wall up
-/// from its ledger row classifies it the same. `found` as it is anywhere else:
-/// a banner that names its limit, a turn's notice of the same kind, one naming
-/// another reset or none, one under a tool's call, a screen with no composer.
+/// The wall a generic banner stands for: `found` is the notice the reader placed (`crate::phase::notice`'s placement: the footer, a banner) and, where it is the generic `Usage limit reached` ([`generic_limit`]), the kind is the turn's own notice's — the newest limit notice above the composer that names its limit, read as [`since_limit`] reads one (each row as the line it opens, across the rows Ink wrapped it onto), up through local commands (`❯ /rate-limit-options`, which Claude Code types itself to open its dialog) but no person's prompt, and naming the same reset as `found` (the zone aside): the notice of this limit, never an older one a `/resume`d history redraws.
 pub(crate) fn named_by_the_turn(
     rows: &[String],
     found: Wall,
@@ -1380,16 +910,6 @@ pub(crate) fn named_by_the_turn(
     }
 }
 
-/// The turn's own notice of its limit, drawn above a generic notice
-/// ([`named_by_the_turn`], [`newest_limit`]): up from row `top` (the generic
-/// notice's own, or the composer's), the newest limit notice that names its
-/// limit ([`generic_limit`] none), read as [`since_limit`] reads one (each
-/// row as the line it opens, across the rows Ink wrapped it onto at `width`),
-/// up through local commands (`❯ /rate-limit-options`, which Claude Code
-/// types itself to open its dialog) but no person's prompt: its kind and the
-/// item. Whether it is the limit the generic notice stands for is
-/// [`names_the_reset`]'s to say. `None` where the screen draws none: the
-/// notice scrolled off, or only the rows Ink wrapped it onto are left.
 fn turns_notice(
     rows: &[String],
     top: usize,
@@ -1421,11 +941,6 @@ fn turns_notice(
         else {
             continue;
         };
-        // A tool's output quoting a limit (`⏺ Bash(cat limits.log)` over
-        // `⎿  You've hit your Sonnet limit · …`) is no word of the vendor's
-        // on this turn: the footer stands, and no model fallback runs on it.
-        // Claude Code's own row drawn under a call reads the same here; the
-        // session's transcript names it ([`crate::phase::under_a_call`]).
         if crate::phase::under_a_call(rows, i) {
             return None;
         }
@@ -1434,11 +949,6 @@ fn turns_notice(
     None
 }
 
-/// `item`, a limit notice of `kind` that names its limit, as the limit a
-/// generic notice of kind `generic` naming the reset `said`
-/// ([`reset_clock_words`]) stands for: its kind and its words (its leading
-/// glyph dropped) where it names that reset and is of another kind. `None`
-/// otherwise.
 fn names_the_reset(
     item: &str,
     kind: WallKind,
@@ -1450,31 +960,7 @@ fn names_the_reset(
     (same && kind != generic).then(|| (kind, words.to_string()))
 }
 
-/// The limit a cancel left on the screen: the vendor's own word that its
-/// auto-continue will not go on ([`auto_continue_end`] `Unkept`: Esc on its
-/// countdown, `⏺ Automatic continue cancelled · /rate-limit-options to
-/// re-arm`) drawn as the last thing said, its `⏺` row in column 0, right
-/// under the screen's newest usage limit notice ([`since_limit`]: the first
-/// thing said above the cancel is that notice's block, or its `/goal` echo)
-/// — a notice that names
-/// its reset and that no turn has been served since — read as the wall that
-/// notice was before the cancel took it off the screen's end: its kind, its
-/// words, its reset, the row it opens on ([`Placement::ErrorRow`] for the
-/// vendor's `⏺` row, its countdown's `Usage limit reached · continuing
-/// automatically at …`; [`Placement::Gutter`] for a `⎿` notice), never under
-/// a call. [`wall`] reads none there: the cancel is the last thing said.
-///
-/// This says only what the screen draws; whether the notice is the limit a
-/// supervisor must wait on — the answer to an act of its own, not an older
-/// limit a `/resume`d conversation redraws — is the caller's
-/// (`aterm_agent::policy::turn_end::left_answer`). `None` where the vendor's
-/// last word is not the cancel, anything is said after it or between it and
-/// the notice (a tool's output that quotes both lines ends on the model's
-/// reply, and its rows are no `⏺` row in column 0) but Claude Code's own
-/// limit dialog (its `❯ /rate-limit-options` and the answer under it, which
-/// it draws at a reset over 24 h away before it arms the countdown:
-/// [`limit_dialog_at`]), the newest notice names no reset or has a turn
-/// served under it, or the screen draws no composer.
+/// The limit a cancel left on the screen: the vendor's own word that its auto-continue will not go on ([`auto_continue_end`] `Unkept`: Esc on its countdown, `⏺ Automatic continue cancelled · /rate-limit-options to re-arm`) drawn as the last thing said, its `⏺` row in column 0, right under the screen's newest usage limit notice ([`since_limit`]: the first thing said above the cancel is that notice's block, or its `/goal` echo) — a notice that names its reset and that no turn has been served since — read as the wall that notice was before the cancel took it off the screen's end: its kind, its words, its reset, the row it opens on ([`Placement::ErrorRow`] for the vendor's `⏺` row, its countdown's `Usage limit reached · continuing automatically at …`; [`Placement::Gutter`] for a `⎿` notice), never under a call.
 #[must_use]
 pub fn left_wall(rows: &[String]) -> Option<Wall> {
     use crate::phase::{is_said, leading_spaces, line_at};
@@ -1483,8 +969,6 @@ pub fn left_wall(rows: &[String]) -> Option<Wall> {
     }
     let frame = crate::phase::composer_frame(rows)?;
     let width = crate::text::trim_end(&rows[frame.bottom]).chars().count();
-    // The cancel is the last thing said: its `⏺` row and the rows Ink
-    // wrapped it onto.
     let last = crate::phase::last_said_index(rows)?;
     let cancel = (0..=last)
         .rev()
@@ -1499,11 +983,6 @@ pub fn left_wall(rows: &[String]) -> Option<Wall> {
         return None;
     }
     let reset = newest.since.reset?;
-    // Right under the notice: the first thing said above the cancel is a row
-    // of the notice's block (its wrapped rows, a gutter block's rows under
-    // it, up to the first blank row or row in column 0), or of its `/goal`
-    // echo (`⏺ Goal paused · usage limit reached · continues automatically
-    // when it resets`, whose reset the notice names).
     let block_end = match newest.echo {
         Some(echo) => line_at(rows, echo, frame.top, width).0,
         None => {
@@ -1513,9 +992,6 @@ pub fn left_wall(rows: &[String]) -> Option<Wall> {
                 - 1
         }
     };
-    // The first thing said above row `from`; a wrapped row of a line that
-    // is no thing said (`✻ Brewed for 0s · done` over `10:40 AM` at 26
-    // columns) is that line's.
     let opener = |i: usize| {
         (0..=i)
             .rev()
@@ -1540,12 +1016,6 @@ pub fn left_wall(rows: &[String]) -> Option<Wall> {
             }
         }
     };
-    // Claude Code's own limit dialog between the notice and the cancel is the
-    // notice's: at a reset over 24 h away it opens its usage-limit dialog
-    // itself, and once that is answered `Wait here, …` the dialog's command
-    // (`❯ /rate-limit-options`) and its answer under it (`⎿  Claude Code
-    // will continue automatically at …`) are said before the countdown the
-    // cancel ended. The first thing said above them stands for them.
     let mut above = said_above(cancel)?;
     while let Some(dialog) = limit_dialog_at(rows, above) {
         above = said_above(dialog)?;
@@ -1567,12 +1037,6 @@ pub fn left_wall(rows: &[String]) -> Option<Wall> {
     })
 }
 
-/// The row of Claude Code's own limit dialog whose rows hold row `i`
-/// ([`left_wall`]): its command echoed in column 0 (`❯ /rate-limit-options`,
-/// the anchor `wall.limit_dialog`), at `i` or above it with only the rows of
-/// its output block between (indented, no blank row: `⎿  Claude Code will
-/// continue automatically at …` and the rows Ink wrapped it onto). `None`
-/// for any other row: another command's, a person's prompt, a reply.
 fn limit_dialog_at(rows: &[String], i: usize) -> Option<usize> {
     let j = (0..=i).rev().find(|&j| {
         crate::text::trim(&rows[j]).is_empty() || crate::phase::leading_spaces(&rows[j]) == 0
@@ -1583,8 +1047,6 @@ fn limit_dialog_at(rows: &[String], i: usize) -> Option<usize> {
     (command == Some(crate::anchors::anchor("wall.limit_dialog"))).then_some(j)
 }
 
-/// A row's items: its text split at each run of two or more spaces (a
-/// footer's notification is drawn right of its mode line).
 fn gapped_items(row: &str) -> impl Iterator<Item = &str> {
     crate::text::trim(row)
         .split("  ")
@@ -1592,14 +1054,12 @@ fn gapped_items(row: &str) -> impl Iterator<Item = &str> {
         .filter(|item| !item.is_empty())
 }
 
-/// The auto-continue's end an item opens with ([`auto_continue_end`]).
 fn auto_continue_said(item: &str) -> Option<AutoContinue> {
     let text = item
         .trim_start_matches(|c: char| !c.is_alphanumeric())
         .replace('\u{2219}', "\u{b7}");
     let opens = |id: &str| {
         let words = crate::anchors::anchor(id);
-        // `Your usage limit has reset · …` is the stale notice too.
         [text.as_str(), strip_ci(&text, "your ").unwrap_or("")]
             .iter()
             .any(|t| strip_ci(t, words).is_some())
@@ -1617,8 +1077,6 @@ fn auto_continue_said(item: &str) -> Option<AutoContinue> {
     {
         Some(AutoContinue::Unkept)
     } else if opens("wall.auto_continue") || strip_ci(&text, "continuing shortly").is_some() {
-        // The countdown's own row opens with its words; the transcript's
-        // `Usage limit reached · continuing automatically at …` is the
         // limit's notice, and the walk stops there.
         Some(AutoContinue::Armed)
     } else {
@@ -1626,28 +1084,15 @@ fn auto_continue_said(item: &str) -> Option<AutoContinue> {
     }
 }
 
-/// `text` past its opening `prefix`, ignoring ASCII case.
 fn strip_ci<'a>(text: &'a str, prefix: &str) -> Option<&'a str> {
     text.get(..prefix.len())
         .filter(|head| head.eq_ignore_ascii_case(prefix))
         .map(|_| &text[prefix.len()..])
 }
 
-/// How far above the composer's top rule [`memory_wall`] looks: the live
-/// zone's parked rows (a spinner, its `⎿  Tip:` or todo rows, the context
-/// indicator, a hint), never the transcript above them.
 const MEMORY_ROWS: usize = 6;
 
-/// The fact half of a [`memory_wall`]'s message — `Critical memory usage
-/// (140.4GB)` — without the vendor's remedy tail after its ` — `
-/// (`restart and resume with claude --continue`); the whole message when it
-/// has no such tail.
-///
-/// `claude --continue` resumes the newest conversation filed under the
-/// working directory, and several live Claude Code processes can share one
-/// directory — a person following the banner's words in one tab resumes a sibling's
-/// conversation. aterm names the tab's own (`aterm_agent::harness::resume`),
-/// so whatever of the banner it quotes stops at the fact.
+/// The fact half of a [`memory_wall`]'s message — `Critical memory usage (140.4GB)` — without the vendor's remedy tail after its ` — ` (`restart and resume with claude --continue`); the whole message when it has no such tail.
 #[must_use]
 pub fn memory_banner_head(message: &str) -> &str {
     message
@@ -1657,48 +1102,6 @@ pub fn memory_banner_head(message: &str) -> &str {
 }
 
 /// Claude Code's critical-memory banner, as a [`WallKind::Memory`] wall.
-///
-/// The vendor's banner — `<anchor> (140.4GB) — restart and resume with claude
-/// --continue`, where `<anchor>` is [`crate::anchors`]' `wall.memory` — is
-/// right-aligned on a row between the spinner and the composer's top rule,
-/// while the composer or transcript may quote the banner word for word. So the
-/// banner is read by place, as [`crate::phase::context_left`] reads the
-/// context indicator:
-///
-/// * the screen has the composer frame, `width` being its rule's width;
-/// * the row lies between the status row (or, with none, the row under the
-///   last transcript row) and the top rule, and among the [`MEMORY_ROWS`]
-///   rows right above that rule — never inside the composer or under it,
-///   where the draft is, and never up in the transcript;
-/// * the row ends against the right edge (within three columns of `width`),
-///   and its right segment is the text after its last run of two or more
-///   spaces: the whole row when the banner is alone on it, its tail when it
-///   shares the status row with the spinner;
-/// * a row under the status row is the live zone — no transcript row is
-///   drawn there — so any such row will do, whatever column it starts at,
-///   except a row of a message a person queued there
-///   ([`in_queued_message`]). Every other row — the status row itself, and
-///   with no status row every row, where the last transcript block runs
-///   down to the rule — must start its segment at the hint column or later,
-///   or be a hint against the edge
-///   ([`crate::phase::is_against_right_edge`]);
-/// * that segment opens with the anchor followed by ` (` (the size).
-///
-/// The column rule is not asked under a status row because the banner is 75
-/// columns wide: at aterm's default 80 columns it starts at column 3, left
-/// of both the hint column and a hint's column-6 floor, so a reader that
-/// asked it everywhere would read nothing at 82 columns or fewer.
-///
-/// A transcript row quoting the banner starts at the transcript's columns,
-/// not the hint column, a draft quoting it is under the top rule, and a
-/// queued message quoting it is a `❯` block; all read `None`. The copies
-/// this cannot tell from the banner: with no status row, a row of the last
-/// transcript block that ends against this very edge with the banner as its
-/// right segment from column 6 on; under a status row, a paragraph of a
-/// queued message after a blank row inside it. And the banner it misses: with
-/// no status row (an idle screen without a done row) in a window of 82 columns
-/// or fewer, and at those widths right under a queued message. Under a box it
-/// is not read at all ([`crate::reader::ScreenReader::read`]).
 #[must_use]
 pub fn memory_wall(rows: &[String]) -> Option<Wall> {
     use crate::phase::{HINT_COLUMN, composer_frame, is_against_right_edge, status_block};
@@ -1736,12 +1139,7 @@ pub fn memory_wall(rows: &[String]) -> Option<Wall> {
     })
 }
 
-/// Whether row `i`, under the status row `status`, belongs to a message a
-/// person queued in the live zone — `❯ …`, then its wrapped rows indented
-/// under the caret's text: the nearest row at or above `i` and under the
-/// status row that is blank or starts in column 0 is a `❯` row. The
-/// person's words are the one text the live zone holds that can quote the
-/// banner, so they are never read as it, however narrow the window.
+/// Whether row `i`, under the status row `status`, belongs to a message a person queued in the live zone — `❯ …`, then its wrapped rows indented under the caret's text: the nearest row at or above `i` and under the status row that is blank or starts in column 0 is a `❯` row.
 pub(crate) fn in_queued_message(rows: &[String], status: usize, i: usize) -> bool {
     (status + 1..=i)
         .rev()
@@ -1750,9 +1148,7 @@ pub(crate) fn in_queued_message(rows: &[String], status: usize, i: usize) -> boo
         .is_some_and(|row| row.starts_with('❯'))
 }
 
-/// A row's right segment and the column it starts at: the text after its
-/// last run of two or more spaces, or the whole row (its indent skipped)
-/// when it has none. `row` is trimmed at the end.
+/// A row's right segment and the column it starts at: the text after its last run of two or more spaces, or the whole row (its indent skipped) when it has none.
 pub(crate) fn right_segment(row: &str) -> (usize, &str) {
     match row.rfind("  ") {
         Some(gap) => (row[..gap + 2].chars().count(), &row[gap + 2..]),
@@ -1767,10 +1163,6 @@ pub(crate) fn right_segment(row: &str) -> (usize, &str) {
 mod tests {
     use super::*;
 
-    /// The vendor's own limit catalog (the limit functions, the auto-continue
-    /// notices, the `/goal` interruption table, the authentication notices)
-    /// and every other phrase the binary and the captures carry, one string
-    /// per row and the kind the reader must give it.
     #[test]
     fn the_vendor_limit_catalog_classifies() {
         let catalog: &[(&str, Option<WallKind>)] = &[
@@ -1970,8 +1362,6 @@ mod tests {
                 "Your organization has disabled API key authentication · Sign in again with your claude.ai account",
                 Some(WallKind::Auth),
             ),
-            // A model that is not found is a refused request (2.1.300's
-            // `model_not_found`): sent again unchanged it is refused again.
             (
                 "There's an issue with the selected model (x). It may not exist or you may not have access to it. Run /model to pick a different model.",
                 Some(WallKind::ApiError {
@@ -1988,7 +1378,6 @@ mod tests {
                 "Extra usage is required for long context · run /extra-usage",
                 Some(WallKind::Spend),
             ),
-            // The same entitlement as 2.1.300 words it.
             (
                 "API Error: Usage credits required for 1M context · run /model to switch to standard context",
                 Some(WallKind::Spend),
@@ -2006,7 +1395,6 @@ mod tests {
                 "Server is temporarily limiting requests (not your usage limit)",
                 Some(WallKind::Overloaded),
             ),
-            // What 2.1.300 draws under the gutter for the high load row.
             (
                 "We are experiencing high demand for Opus 4.",
                 Some(WallKind::Overloaded),
@@ -2035,9 +1423,6 @@ mod tests {
                 "You've reached your Fable 5 limit.",
                 Some(WallKind::ModelBucket { consent: false }),
             ),
-            // A model name with a decimal keeps its verb: the head ends at a
-            // sentence end, not at the `.` of `4.1` (the binary builds
-            // `${name} requires usage credits.` from the display name).
             (
                 "Opus 4.1 requires usage credits.",
                 Some(WallKind::ModelBucket { consent: false }),
@@ -2054,7 +1439,6 @@ mod tests {
                 "Opus 4.1 now uses usage credits",
                 Some(WallKind::ModelBucket { consent: false }),
             ),
-            // The control: a decimal does not make a sentence a wall.
             ("Opus 4.1 is the default model. Limit reached nowhere", None),
             (
                 "Fable limit reached · continuing on Sonnet uses usage credits, and the prompt to confirm",
@@ -2096,8 +1480,6 @@ mod tests {
                     cause: ApiCause::Server,
                 }),
             ),
-            // A 400 the vendor does not retry is the request refused: it
-            // says so itself (`Run /rewind to recover the conversation`).
             (
                 "API Error: 400 due to tool use concurrency issues.",
                 Some(WallKind::ApiError {
@@ -2118,9 +1500,6 @@ mod tests {
         for (text, want) in catalog {
             assert_eq!(classify_wall(text), *want, "{text}");
         }
-        // The negative controls: notices the worker goes on under, a warning,
-        // the update banner, an interrupt, and words that merely mention a
-        // limit.
         for text in [
             "Concurrent subagent limit reached. You can run 5 subagents at once. Do not retry.",
             "Subagent nesting limit reached (depth 3 of 3). Complete this task directly",
@@ -2136,7 +1515,6 @@ mod tests {
             "Monthly limit reached",
             "Checked the weekly limit handling in the parser",
             "The parser now reads the Fable limit notice too, and the session limit one.",
-            // Claude Code's own model fallback goes on, on another model.
             "Switched to Sonnet due to high demand for Opus",
             "Switched to claude-sonnet-4-5 due to high demand for claude-opus-4-1",
         ] {
@@ -2144,12 +1522,6 @@ mod tests {
         }
     }
 
-    /// A cloud gateway sign-in is the lost login: 2.1.301's two gateway
-    /// notices (`Not signed in to the Cloud gateway — run /login.` and `Cloud
-    /// gateway session expired — run /login to reconnect.`, each behind `API
-    /// Error: `) name `run /login` past the table's opening words. Negative
-    /// controls: `API Error: terminated` is still the server's, retried; the
-    /// env-token notice still reads Auth by `token expired`.
     #[test]
     fn a_cloud_gateway_sign_in_is_the_lost_login() {
         for text in [
@@ -2187,27 +1559,6 @@ mod tests {
     const FOOTER: &str = "  ⏵⏵ bypass permissions on (shift+tab to cycle)";
     const API_529: &str = "API Error: 529 Overloaded. This is a server-side issue, usually temporary — try again in a moment. If it persists, check https://status.claude.com.";
 
-    /// Never a wall: a wall's words in a call's first column-2 `⎿` row — the
-    /// first line of its output — under every row Claude Code draws for a
-    /// call or a command (the MCP forms: no arguments, spaces in the server
-    /// or the title, the unknown-tool stub; the shell mode's two; a name of
-    /// several words; an integration's `Name[tool](…)`), and a `⎿` at any
-    /// column but 2, which is what an output prints (after a blank row of it
-    /// or not), and the first row under a call whose own row wraps (the
-    /// wrapped row is no `⎿` row) or whose command holds a blank row (a
-    /// heredoc's, its rows at column 6).
-    /// Read, for recall: a later column-2 row under every call — Claude
-    /// Code's wall after a tool's output — an MCP call's
-    /// and one a hook's row opens included, where the screen cannot tell the
-    /// wall from the output's own row and the transcript decides: each says
-    /// it was read under a call ([`Wall::under_call`]), which a supervisor
-    /// with no transcript does not act on — behind a blank row of the output
-    /// too, and behind blank rows that end a block of it (the walk goes on
-    /// over a blank row whose next row is at column 5 or a column-2 `⎿`
-    /// row); and a column-2 row whose owner the walk does not reach (a blank
-    /// row over a column-2 row that opens an item, or the top of the screen,
-    /// comes first). Controls: every owner
-    /// that is no call reads its wall, and none of those is under a call.
     #[test]
     fn the_owner_walk_reads_a_wall_but_never_in_a_calls_first_row() {
         const WALLS: [(&str, WallKind); 4] = [
@@ -2252,22 +1603,18 @@ mod tests {
         let mut wrong = Vec::new();
         for (wall, kind) in WALLS {
             let gutter = format!("  ⎿  {wall}");
-            // Read under a call's later row, or anywhere else.
             let under = Some((kind, Placement::Gutter, true));
             let want = Some((kind, Placement::Gutter, false));
             for owner in calls {
                 assert!(crate::phase::is_tool_call(owner), "{owner}");
-                // The output's first row: never a wall.
                 let first = screen_of(&[owner, &gutter, "     the second row of the output"]);
                 if let Some(w) = read(&first) {
                     wrong.push(format!("first row under {owner}: {w:?}"));
                 }
-                // A later row: read, whatever the call.
                 let later = screen_of(&[owner, "  ⎿  stamped", "     a second row", &gutter]);
                 if read(&later) != under {
                     wrong.push(format!("later row under {owner}: {:?}", read(&later)));
                 }
-                // Under a hook's row above the output: read too.
                 let hooked = screen_of(&[
                     owner,
                     "  ⎿  PreToolUse:Bash says: remember to run the tests",
@@ -2276,9 +1623,6 @@ mod tests {
                 if read(&hooked) != under {
                     wrong.push(format!("hooked under {owner}: {:?}", read(&hooked)));
                 }
-                // Behind a blank row of the output (its next row at column
-                // 5): the walk goes on over it to the call, and reads the
-                // row under the call too.
                 let blank = screen_of(&[
                     owner,
                     "  ⎿  Issue 7: the parser drops a row",
@@ -2292,8 +1636,6 @@ mod tests {
                         read(&blank)
                     ));
                 }
-                // Behind blank rows that END a block of the output (the row
-                // under them a column-2 `⎿` row): read under the call too.
                 let ended = screen_of(&[
                     owner,
                     "  ⎿  Issue 7: the parser drops a row",
@@ -2308,8 +1650,6 @@ mod tests {
                     ));
                 }
             }
-            // A call's own wrapped row is no `⎿` row, at column 2 or not: the
-            // output's first row under it is still its first.
             for wrapped in [
                 screen_of(&[
                     "⏺ Bash(cargo test --workspace --no-fail-fast -- --nocapture",
@@ -2321,8 +1661,6 @@ mod tests {
                     "  issue_number: 7)",
                     &gutter,
                 ]),
-                // A heredoc command, its blank line a blank row of the call's
-                // own (its rows at column 6): the walk goes on over it.
                 screen_of(&[
                     "⏺ Bash(python3 - <<'EOF'",
                     "      print('first line')",
@@ -2336,8 +1674,6 @@ mod tests {
                     wrong.push(format!("first row under a wrapped call: {w:?}"));
                 }
             }
-            // A `⎿` the output printed: at column 5 (after a blank row of the
-            // output or not), at any column but 2.
             for (name, r) in [
                 (
                     "column 5, after a blank row",
@@ -2365,7 +1701,6 @@ mod tests {
                     wrong.push(format!("{name}: {w:?}"));
                 }
             }
-            // No owner the walk reaches: read.
             for (name, r) in [
                 (
                     "scrolled off",
@@ -2394,8 +1729,6 @@ mod tests {
                         &gutter,
                     ]),
                 ),
-                // A blank row ends the walk where the row under it opens a new
-                // item, so a call's block above it does not own the wall.
                 (
                     "under a group row behind a call's block",
                     screen_of(&[
@@ -2411,11 +1744,9 @@ mod tests {
                     wrong.push(format!("{name}: {:?}", read(&r)));
                 }
             }
-            // Controls: every other owner's column-2 rows are Claude Code's.
             for owner in [
                 &["❯ fourth turn: the stub says the prompt is too long"][..],
                 &["⏺ Suites are running; I'll report the number when it lands."],
-                // Prose with a call's punctuation in it is no call.
                 &["⏺ Suites are running (all three)."],
                 &["⏺ Wired the github server in (MCP), and it answers."],
                 &["⏺ Fixed rows[i] so the parser keeps the last one (it dropped it)."],
@@ -2447,27 +1778,6 @@ mod tests {
         assert!(wrong.is_empty(), "{wrong:#?}");
     }
 
-    /// The owner walk on measured screens. Walls, each a real context wall
-    /// read from the gutter: under a collapsed tool group, under a Stop
-    /// hook's summary, under a Bash call's output (plain, holding a blank
-    /// row, a PostToolUse hook's row between), under a prompt's second
-    /// paragraph, under an MCP call's one-block output, under a long output
-    /// whose call scrolled off, and under a group row wrapped in a narrow pane.
-    /// Outputs the screen tells from a wall, each the last
-    /// thing said, `idle` and no wall: an MCP result's first row, a
-    /// shell-mode command's output, a file's own `⎿` at column 5, and a
-    /// heredoc command's output (the first row under its call, the walk gone
-    /// on over the command's own blank row). Outputs it cannot tell from
-    /// one, read as walls here and refused by the session's transcript
-    /// (`aterm_agent::supervise::wall_confirm`): an MCP result of three
-    /// blocks (its last a login phrase), two of two whose first block holds
-    /// or ends on a blank line, one whose long first block scrolled its call
-    /// off, and a
-    /// Bash output under a PreToolUse hook's row and under its error rows.
-    /// Each wall says whether it was read under a call ([`Wall::under_call`]);
-    /// of the outputs, all but the scrolled-off MCP block are; of the walls,
-    /// the ones after a Bash, a PostToolUse hook's and an MCP output, a blank
-    /// row in the output or not.
     #[test]
     fn the_owner_walk_on_its_measured_screens() {
         use crate::prompt::fixtures::{
@@ -2494,8 +1804,6 @@ mod tests {
             (wall(&r), reading)
         };
         const CONTEXT: &str = "Context limit reached · /compact or /clear to continue";
-        // Each with whether it was read under a call (a later column-2 row
-        // under it): the walls a supervisor with no transcript leaves alone.
         for (name, capture, under_call) in [
             (
                 "collapsed group",
@@ -2504,8 +1812,6 @@ mod tests {
             ),
             ("stop hook", STOP_HOOK_CONTEXT_WALL_MEASURED, false),
             ("bash output", BASH_OUTPUT_THEN_CONTEXT_WALL_MEASURED, true),
-            // Under the call since the walk goes on over the output's
-            // blank row.
             (
                 "bash output, a blank row",
                 BASH_BLANK_ROW_THEN_CONTEXT_WALL_MEASURED,
@@ -2543,8 +1849,6 @@ mod tests {
             ("mcp", MCP_OUTPUT_ENDS_TURN_MEASURED),
             ("shell mode", SHELL_MODE_OUTPUT_ENDS_TURN_MEASURED),
             ("column 5", GUTTER_PHRASE_IN_OUTPUT_MEASURED),
-            // The first row under its call, the walk gone on over the
-            // command's own blank row.
             ("heredoc", MULTILINE_COMMAND_OUTPUT_MEASURED),
         ] {
             let (w, reading) = read(capture);
@@ -2552,9 +1856,6 @@ mod tests {
             assert_eq!(reading.phase, Phase::Idle, "{name}");
             assert!(reading.phase_authoritative, "{name}");
         }
-        // Under a call: the MCP ones, the two whose first block holds or ends
-        // on a blank line among them, and the two hook ones; not under one:
-        // the one whose walk reaches the top of the screen.
         for (name, capture, under_call) in [
             ("mcp, three blocks", MCP_MULTI_BLOCK_OUTPUT_MEASURED, true),
             (
@@ -2584,12 +1885,6 @@ mod tests {
         }
     }
 
-    /// Claude Code's synthetic `authentication_failed` row (`⏺ Login expired ·
-    /// Please run /login` in column 0) reads as the auth wall,
-    /// from the vendor's error row: alone, over a done row, wrapped by a
-    /// narrow window, and in its other wording;
-    /// an `API Error` in the same form is its own kind. The screen stays
-    /// idle for every other reader (`worker_phase`, `limit_notice`).
     #[test]
     fn the_login_expired_error_row_is_the_auth_wall() {
         use crate::prompt::fixtures::LOGIN_EXPIRED;
@@ -2648,15 +1943,6 @@ mod tests {
         }
     }
 
-    /// Negative controls for the error row: the worker's own `⏺` words
-    /// (a sentence that names a login with no remedy joined on, one that
-    /// quotes the notice deep in it, a block longer than a notice), a tool
-    /// call that echoes it, a tool's output that prints it, and the row made
-    /// history — the person's `/login` finished under it (which
-    /// [`login_restored`] reads), or the worker answering after it — are no
-    /// wall. `login_restored` answers only the vendor's own `Login successful`
-    /// under the `❯ /login` a person typed: not an interrupted login, not the
-    /// words in a tool's output.
     #[test]
     fn the_workers_words_and_a_finished_login_are_no_login_wall() {
         use crate::prompt::fixtures::LOGIN_EXPIRED;
@@ -2745,11 +2031,6 @@ mod tests {
         }
     }
 
-    /// The login back, its row wrapped (`⎿  Login successful · account or
-    /// organization changed` as Ink's word wrap breaks it in a 40-column pane).
-    /// The last thing said is the row's rest, `organization changed`: read a row
-    /// at a time, nothing said the login is back. Negative control: the same
-    /// rows under a tool's call.
     #[test]
     fn a_login_back_wrapped_in_a_narrow_pane_is_read() {
         let rule = "─".repeat(40);
@@ -2771,15 +2052,6 @@ mod tests {
         assert!(!login_restored(&screen_with("⏺ Bash(tail -2 login.log)")));
     }
 
-    /// How the vendor's own auto-continue ended: armed, the wall stands and its
-    /// countdown is drawn (`Armed`: nothing ended it); after
-    /// Esc on its countdown, unkept — the transcript's row and the footer's
-    /// notification each say so alone; past the reset, fired. The lifecycle's
-    /// other words in the cancelled row's place read as theirs. Negative
-    /// controls: a turn's `❯` row under the word makes it history (a person's
-    /// `/usage` after the cancel); a limit notice under it stands (the
-    /// vendor's continuation met the limit again); the armed countdown is no
-    /// end (`Armed`); a screen with no composer says nothing.
     #[test]
     fn the_auto_continues_end_is_read_off_the_vendors_word() {
         use crate::prompt::fixtures::{
@@ -2804,7 +2076,6 @@ mod tests {
         };
         let cancel_row = row(&cancelled, "⏺ Automatic continue cancelled");
         let footer = row(&cancelled, "  ⏵⏵ auto mode on");
-        // Each place says it alone.
         let mut only_footer = cancelled.clone();
         only_footer[cancel_row] = String::new();
         assert_eq!(auto_continue_end(&only_footer), Some(AutoContinue::Unkept));
@@ -2815,7 +2086,6 @@ mod tests {
             auto_continue_end(&only_transcript),
             Some(AutoContinue::Unkept)
         );
-        // The lifecycle's other words, in the transcript row's place.
         for (said, want) in [
             (
                 "⏺ Usage limit available again · continuing now",
@@ -2847,14 +2117,12 @@ mod tests {
             v[cancel_row] = said.to_string();
             assert_eq!(auto_continue_end(&v), Some(want), "{said}");
         }
-        // NEGATIVE CONTROLS. A turn after the word.
         let mut later = only_transcript.clone();
         later.splice(
             cancel_row + 1..cancel_row + 1,
             ["", "❯ /usage", "  ⎿  Status dialog dismissed"].map(str::to_string),
         );
         assert_eq!(auto_continue_end(&later), None);
-        // A limit under the vendor's word: its continuation met it again.
         let fired = row(&resumed, "⏺ Usage limit reset");
         let mut again = resumed.clone();
         again.splice(
@@ -2866,7 +2134,6 @@ mod tests {
             .map(str::to_string),
         );
         assert_eq!(auto_continue_end(&again), None);
-        // The countdown alone is no end: it stands. No composer says nothing.
         let mut countdown = only_transcript.clone();
         countdown[cancel_row] = "  Continuing automatically at 3:50pm · esc to cancel".to_string();
         assert_eq!(auto_continue_end(&countdown), Some(AutoContinue::Armed));
@@ -2877,15 +2144,6 @@ mod tests {
         assert_eq!(auto_continue_end(&cancelled[..top]), None);
     }
 
-    /// The live process's own word is the footer's notification alone
-    /// ([`auto_continue_toast`]): a `Fired` drawn in the transcript may be a
-    /// `/resume`d conversation's history, and is tied to its
-    /// limit by the notice it stands under ([`SinceLimit::fired`]). The
-    /// cancel's footer notification is the toast; the vendor's continuation
-    /// drawn in the transcript (no toast) is none; a `Fired` toast in the
-    /// footer's place is; the armed countdown in the footer is the toast's word
-    /// that it still stands (`Armed`), no end. Negative controls: the cancel in
-    /// the transcript alone, no composer.
     #[test]
     fn only_the_footers_notification_is_the_live_processs_toast() {
         use crate::prompt::fixtures::{
@@ -2909,7 +2167,6 @@ mod tests {
             " ".repeat(29)
         );
         assert_eq!(auto_continue_toast(&toasted), Some(AutoContinue::Fired));
-        // NEGATIVE CONTROLS.
         let mut only_transcript = cancelled.clone();
         only_transcript[footer] =
             "  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents".to_string();
@@ -2929,12 +2186,6 @@ mod tests {
         assert_eq!(auto_continue_toast(&cancelled[..top]), None);
     }
 
-    /// What a `/resume` at an armed limit leaves of its countdown: armed, the
-    /// countdown is drawn (`Armed`); after a `/resume`, the history redrawn
-    /// says what the vendor did with its own limit — `Fired` under that
-    /// limit's notice (`8:48am`), which names it, not the armed one
-    /// (`9:19am`) — or nothing at all, where the history holds no limit: the
-    /// countdown dropped without a word. A `/clear` the same.
     #[test]
     fn a_resume_at_an_armed_limit_draws_no_countdown() {
         use crate::prompt::fixtures::{
@@ -2976,15 +2227,6 @@ mod tests {
         }
     }
 
-    /// The generic countdown row is the turn's own notice's. A Sonnet bucket
-    /// whose reset is under a day away is drawn as a usage window is: its `⎿`
-    /// notice, then `⏺ Usage limit reached · continuing automatically at
-    /// 9:13am · esc to cancel`, the newest limit line.
-    /// Its kind is the notice's above it naming the same reset; the vendor's
-    /// continuation under it, and the wall its cancel left (the bucket's words
-    /// opening its message), the bucket's. Negative controls: a session
-    /// window's countdown stays the window's, its words its own; a generic
-    /// row under a notice naming another reset is the generic row's.
     #[test]
     fn a_generic_countdown_row_is_the_turns_own_notices() {
         use crate::prompt::fixtures::{
@@ -3012,7 +2254,6 @@ mod tests {
             left.message.starts_with("You've hit your Sonnet limit"),
             "{left:?}"
         );
-        // NEGATIVE CONTROLS.
         let session = screen(WALL_SESSION_AUTO_CONTINUE_ARMED_MEASURED);
         let window = since_limit(&session).expect("the window");
         assert_eq!(window.kind, WallKind::UsageSession);
@@ -3071,9 +2312,6 @@ mod tests {
             ["❯ /usage", "  ⎿  Status dialog dismissed", ""].map(str::to_string),
         );
         assert_eq!(since_limit(&after_usage), since(countdown, "10:38am", true));
-        // Negative controls: a limit, nothing served since — and only the
-        // vendor's own continuation under its notice fired (its reset says
-        // whose).
         for (name, text, reset, fired) in [
             (
                 "armed",
@@ -3101,9 +2339,6 @@ mod tests {
                 "{name}"
             );
         }
-        // A `/resume`d conversation's history: an older
-        // session limit, the vendor's continuation under it, a reply and its
-        // done row — fired under that notice, by its reset.
         let history = rows(&[
             "❯ carry on with the task",
             "  ⎿  You've hit your session limit · resets 3pm (America/Los_Angeles)",
@@ -3131,7 +2366,6 @@ mod tests {
                 generic: false,
             })
         );
-        // The continuation above the newest notice is none of its.
         let mut met_after = history.clone();
         met_after.splice(
             8..8,
@@ -3164,7 +2398,6 @@ mod tests {
         let mut unanswered = turned.clone();
         unanswered[reply] = "  ⎿  Interrupted · What should Claude do instead?".to_string();
         assert_eq!(since_limit(&unanswered), since(countdown, "10:38am", false));
-        // A `/goal` echo names no reset: the notice it echoes does.
         let weekly = screen(include_str!(
             "fixtures/claude-2.1.283-wall-weekly-goal-paused-shell-measured.txt"
         ));
@@ -3172,7 +2405,6 @@ mod tests {
             since_limit(&weekly),
             since(WallKind::UsageWeekly, "4pm (America/Los_Angeles)", false)
         );
-        // No limit on the screen.
         let notice = row("❯ carry on with the task");
         let cancel = row("⏺ Automatic continue cancelled");
         let mut unordered = turned.clone();
@@ -3185,12 +2417,6 @@ mod tests {
         assert_eq!(since_limit(&turned[..top]), None);
     }
 
-    /// A model chosen since the newest limit is read off the screen's order
-    /// ([`SinceLimit::model_set`]): a person's `/model` below the notice, its
-    /// `⎿  Set model to …` under the prompt. Negative controls, none
-    /// chosen: the armed bucket; the same result row under another local
-    /// command; a `/model` above the notice (chosen before the limit); the
-    /// words in a reply of the model's.
     #[test]
     fn a_model_chosen_since_the_newest_limit_is_read_off_the_screens_order() {
         use crate::prompt::fixtures::{
@@ -3250,7 +2476,6 @@ mod tests {
             Some("new-default".to_string()),
             "the newest completed choice stands even when its model is unknown"
         );
-        // NEGATIVE CONTROLS.
         assert_eq!(since_limit(&armed), bucket(false));
         assert_eq!(since_limit(&under("❯ /usage", set_row)), bucket(false));
         assert_eq!(
@@ -3278,18 +2503,6 @@ mod tests {
         );
     }
 
-    /// The limit a cancel left is read as the wall its notice was: the
-    /// vendor's `Automatic continue cancelled` under the newest notice, nothing
-    /// served since — the notice's kind, its words, its reset, its row, the
-    /// vendor's `⏺` row's placement. At 26 columns the countdown's line is
-    /// read across its rows (`⏺ Usage limit` over `reached ·` over
-    /// `continuing`), and so is the cancel's (`⏺ Automatic` over `continue`).
-    /// Negative controls: the armed wall (no cancel: the reader's own wall), the
-    /// vendor's own continuation (`Fired`), a person's turn served under the
-    /// cancel, a local command after it (a new turn: the cancel is history),
-    /// a turn sent into the limit after the cancel (its notice is the newest
-    /// and stands: the reader's wall), a notice naming no reset, and no
-    /// composer.
     #[test]
     fn the_limit_a_cancel_left_is_read_as_the_wall_it_was() {
         use crate::prompt::fixtures::{
@@ -3317,7 +2530,6 @@ mod tests {
                 under_call: false,
             })
         );
-        // At 26 columns, every line wrapped.
         let narrow = screen(WALL_SESSION_AUTO_CONTINUE_CANCELLED_26_2_1_299);
         assert_eq!(wall(&narrow), None);
         assert_eq!(
@@ -3352,8 +2564,6 @@ mod tests {
                 .starts_with("Usage limit reached · continuing automatically at 10:50am"),
             "{left:?}"
         );
-        // Under a `/goal` echo of the notice, the cancel drawn under the echo:
-        // the notice under the `⎿` gutter, its reset the echo's.
         let mut goal = screen(include_str!(
             "fixtures/claude-2.1.283-wall-weekly-goal-paused-shell-measured.txt"
         ));
@@ -3384,7 +2594,6 @@ mod tests {
             ),
             "{left:?}"
         );
-        // NEGATIVE CONTROLS.
         for (name, rows) in [
             ("armed", screen(WALL_SESSION_AUTO_CONTINUE_ARMED_MEASURED)),
             ("fired", screen(WALL_SESSION_RESUMED_BY_ITSELF_MEASURED)),
@@ -3417,9 +2626,6 @@ mod tests {
             *r = r.replace("resets 3:50pm (America/Los_Angeles)", "limit reached");
         }
         assert_eq!(left_wall(&no_reset), None, "no reset named");
-        // A tool's output that quotes the notice and the cancel: with the
-        // model's reply after it, or as the last thing said (its rows no `⏺`
-        // row in column 0), it is no cancel of the vendor's.
         let asked = cancelled
             .iter()
             .rposition(|r| r == "❯ carry on with the task")
@@ -3455,13 +2661,6 @@ mod tests {
         assert_eq!(left_wall(&cancelled[..top]), None, "no composer");
     }
 
-    /// A wall's line Ink wrapped in a narrow pane is read as one: the footer's
-    /// banner (`⚠ Usage limit reached · limit` over `resets 10:25am` at 34
-    /// columns, `⚠ Usage limit reached` over `· limit resets 10:51am` at 26),
-    /// its countdown (`Continuing automatically at` over `10:25am · esc to
-    /// cancel`; `Continuing` alone at 26), the turn's `⎿` notice (`You've hit
-    /// your` over `session limit ·` at 26) and the cancel's `⏺` row (`⏺
-    /// Automatic` over `continue` over `cancelled · /rat`).
     #[test]
     fn a_walls_line_ink_wrapped_is_read_as_one() {
         use crate::prompt::fixtures::{
@@ -3487,9 +2686,6 @@ mod tests {
             "Continuing automatically at 10:25am · esc to cancel",
             "10:25am",
         );
-        // The weekly limit's banner is the same generic one: the turn's own
-        // notice names the limit, wrapped over three rows too
-        // ([`a_generic_banner_is_the_limit_the_turns_own_notice_names`]).
         let r = screen(WALL_WEEKLY_AUTO_CONTINUE_ARMED_34_2_1_299);
         let w = wall(&r).expect("the weekly wall");
         assert_eq!(
@@ -3514,7 +2710,6 @@ mod tests {
             "10:51am",
         );
 
-        // The turn's notice, the last thing said once the banner has gone.
         let r = screen(WALL_SESSION_AFTER_CANCEL_26_2_1_299);
         let w = wall(&r).expect("the turn's notice");
         assert_eq!(
@@ -3535,16 +2730,10 @@ mod tests {
             }
         );
 
-        // The cancel: no wall, and the vendor's word that it will not go on.
         let r = screen(WALL_SESSION_AUTO_CONTINUE_CANCELLED_26_2_1_299);
         assert_eq!(wall(&r), None);
         assert_eq!(auto_continue_end(&r), Some(AutoContinue::Unkept));
 
-        // The transcript's own `⏺ Usage limit reached · continuing
-        // automatically at 10:25am · esc to cancel`, the last thing said above
-        // the composer (the footer's banner and countdown left out, as the
-        // footer is read first): four rows at 34 columns, two at 80, where it
-        // is read.
         let mut r = screen(WALL_SESSION_AUTO_CONTINUE_ARMED_34_2_1_299);
         let at = |r: &[String], opens: &str| r.iter().position(|x| x.starts_with(opens));
         let banner = at(&r, "  ⚠ Usage limit").expect("the banner");
@@ -3562,17 +2751,6 @@ mod tests {
         assert_eq!(w.reset.as_deref(), Some("10:25am"));
     }
 
-    /// A status line's words are no footer notice. The footer is two
-    /// columns: on the left the vendor's `⚠` banner, then the `statusLine`
-    /// command's rows, then the mode row; on the right, right-aligned, the
-    /// vendor's notifications — stacked under the mode row in a pane too
-    /// narrow for both. Never a wall: a status line printing `Not logged in ·
-    /// Run /login` at column 2 after an ordinary turn, and the same under a
-    /// usage limit's banner and after its countdown was cancelled (the wall
-    /// there is the limit, not a lost login). Still a wall (the controls):
-    /// Claude Code's own notice right-aligned on the mode row, on the status
-    /// line's row beside the same words, and stacked under the mode row at 26
-    /// columns — beside and under the status line too.
     #[test]
     fn a_status_lines_words_are_no_footer_notice() {
         use crate::prompt::fixtures::{
@@ -3585,10 +2763,6 @@ mod tests {
         let r = screen(STATUS_LINE_LOGIN_WORDS_MEASURED);
         assert_eq!(wall(&r), None, "a status line's words after a turn");
         assert_eq!(worker_phase(&r), Phase::Idle);
-        // A status line of several fields, two spaces between them, its
-        // notice words in a later field short of the right edge.
-        // Control: the same row ending against the right edge, as a
-        // notification stands.
         let status_row = r
             .iter()
             .position(|x| x == "  Not logged in · Run /login")
@@ -3624,8 +2798,6 @@ mod tests {
         let w = wall(&armed).expect("the limit under the banner");
         assert_eq!(w.kind, WallKind::UsageSession, "{w:#?}");
         assert_eq!(auto_continue_end(&armed), Some(AutoContinue::Armed));
-        // Cancelled, the limit is left to the person (as on 2.1.296, where
-        // no status line stood): no wall, the countdown unkept.
         let cancelled = screen(WALL_SESSION_CANCELLED_STATUS_LINE_LOGIN_WORDS_MEASURED);
         assert_eq!(wall(&cancelled), None);
         assert_eq!(auto_continue_end(&cancelled), Some(AutoContinue::Unkept));
@@ -3667,16 +2839,6 @@ mod tests {
         }
     }
 
-    /// A generic banner is the limit the turn's own notice names. From
-    /// 2.1.295 on, every subscription limit's footer banner reads `⚠ Usage
-    /// limit reached · limit resets …`, whatever the limit: only the turn's `⎿`
-    /// notice names it. Read as the turn's
-    /// notice names it, with that notice's words opening the message (the
-    /// bucket's model is read off them, and a loop that takes the wall up from
-    /// its ledger row classifies the same words). Negative controls, the
-    /// banner as it reads: a five-hour limit (the turn's notice of the same
-    /// kind), a turn's notice naming another reset (an older limit, not this
-    /// one's), and one above a person's prompt (history).
     #[test]
     fn a_generic_banner_is_the_limit_the_turns_own_notice_names() {
         use crate::prompt::fixtures::{
@@ -3703,7 +2865,6 @@ mod tests {
         );
         assert_eq!(classify_wall(&w.message), Some(w.kind));
         assert_eq!(limit_notice(&sonnet), Some((w.message, w.reset)));
-        // A weekly limit at 34 columns: its notice wrapped over three rows.
         let weekly = screen(WALL_WEEKLY_AUTO_CONTINUE_ARMED_34_2_1_299);
         let w = wall(&weekly).expect("the weekly limit");
         assert_eq!(
@@ -3722,8 +2883,6 @@ mod tests {
             ),
             "{w:#?}"
         );
-        // `/goal`'s own resetless echo row (`⏺ Goal paused · usage limit reached · send a
-        // message after it resets to continue`) under the turn's notice never shadows it.
         for (rows, kind, prefix) in [
             (
                 &sonnet,
@@ -3755,7 +2914,6 @@ mod tests {
             assert!(w.message.starts_with(prefix), "{w:#?}");
         }
 
-        // NEGATIVE CONTROLS. A five-hour limit: its banner as it reads.
         let session = screen(WALL_SESSION_AUTO_CONTINUE_ARMED_34_2_1_299);
         let w = wall(&session).expect("the session limit");
         assert_eq!(
@@ -3770,7 +2928,6 @@ mod tests {
             let w = wall(rows).expect("the banner");
             (w.kind, w.message.starts_with("⚠ Usage limit reached"))
         };
-        // The turn's notice names another reset: an older limit's.
         let older: Vec<String> = sonnet
             .iter()
             .map(|r| {
@@ -3781,7 +2938,6 @@ mod tests {
             })
             .collect();
         assert_eq!(banner_only(&older), (WallKind::UsageSession, true));
-        // The notice above a person's prompt: history.
         let notice = sonnet
             .iter()
             .position(|r| r.contains("You've hit your Sonnet limit"))
@@ -3794,18 +2950,6 @@ mod tests {
         assert_eq!(banner_only(&history), (WallKind::UsageSession, true));
     }
 
-    /// Every notice's line runs on over the rows Ink wrapped it onto, in the
-    /// three places no capture shows a wrapped one in:
-    /// * the `⎿` notice's rows at 34 columns in UTC (`⎿  You've hit your
-    ///   session limit` over `· resets 8:15pm (UTC)`), here the last thing
-    ///   said. Its last row opens with `·`, which reads as a status row, so the
-    ///   last thing said ends on the row above it: the notice's line runs on
-    ///   past it, or the reset is lost;
-    /// * the footer's notification `Automatic continue cancelled ·
-    ///   /rate-limit-options to re-arm`, wrapped as the banner and its
-    ///   countdown wrap there;
-    /// * the usage banner above the composer, wrapped as the footer's is at
-    ///   26 columns (`⚠ Usage limit reached` over `· limit resets 10:51am`).
     #[test]
     fn every_notices_line_runs_on_over_its_wrapped_rows() {
         let framed_at = |width: usize, body: &[&str], footer: &[&str]| {
@@ -3888,11 +3032,6 @@ mod tests {
         assert_eq!(w.message, "⚠ Usage limit reached · limit resets 10:51am");
     }
 
-    /// `text` as Claude Code draws its error row or notice in a pane `width`
-    /// columns wide (2.1.300's `su` and `ig`: a column `columns - 10` cells
-    /// wide beside the `⏺`, Ink's greedy word wrap), the last thing said over
-    /// a composer `width` cells wide. Panics on a word wider than the column
-    /// (Ink would break it).
     fn vendor_box(text: &str, width: usize) -> Vec<String> {
         let room = width - 10;
         let mut lines: Vec<String> = vec![String::new()];
@@ -3924,14 +3063,6 @@ mod tests {
         r
     }
 
-    /// The worker's prose is no error row, in a pane of any width. The
-    /// vendor's error row and notices are drawn in a column ten columns short
-    /// of the pane, the worker's reply to the pane's edge; and at 80 columns or
-    /// wider a `<notice> · <remedy>` row is the vendor's only in at most three
-    /// rows (`phase`'s `ERROR_ROWS`). Negative control: the vendor's own
-    /// notice, drawn in its column, is its wall at every width, and a text as
-    /// long as that paragraph drawn in the vendor's column is no wall at any
-    /// width under 80, as it is none at 80.
     #[test]
     fn the_workers_prose_is_no_error_row_in_a_pane_of_any_width() {
         use crate::prompt::fixtures::{PROSE_LIMIT_WORDS_34_2_1_300, PROSE_LIMIT_WORDS_80_2_1_300};
@@ -3943,9 +3074,6 @@ mod tests {
             assert_eq!(wall(&r), None, "{label}");
             assert_eq!(worker_phase(&r), Phase::Idle, "{label}");
         }
-        // Four hard lines at 80 columns, the first and the third a word short
-        // of the 70 cells of the vendor's column there. At 80 columns and
-        // wider the rows themselves are counted.
         let rule = "─".repeat(80);
         let mut r = rows(&[
             "❯ status?",
@@ -3981,17 +3109,6 @@ mod tests {
         }
     }
 
-    /// A program's words behind one of Claude Code's own labels — a Monitor's
-    /// event row (`Monitor event: <the line the command printed> · <the
-    /// watch>`), a hook's stderr (`Stop hook error: [./h]: …`) or
-    /// `systemMessage` (`Stop says: …`, `UserPromptSubmit says: …`,
-    /// `PostToolUse:Bash says: …`) — are no wall, though each opens with a
-    /// wall's words in its first four: the screen ends idle, or soft busy
-    /// below a composer where the event's monitor is still running (`· 1
-    /// monitor still running`, the phase it has with no wall in the way).
-    /// The event's body in the detailed transcript is no wall either. Control:
-    /// Claude Code's own context wall under a Monitor's event, its first
-    /// column-2 `⎿` row, is the wall it is, read under no call.
     #[test]
     fn a_programs_words_behind_a_vendor_label_are_no_wall() {
         use crate::prompt::fixtures::{
@@ -4012,7 +3129,6 @@ mod tests {
                 MONITOR_EVENT_CONTEXT_PHRASE_MEASURED,
                 Phase::Busy,
             ),
-            // The detailed transcript draws no composer, so no soft busy.
             (
                 "monitor event, detailed",
                 MONITOR_EVENT_LOGIN_PHRASE_DETAILED_MEASURED,
@@ -4062,10 +3178,6 @@ mod tests {
         );
     }
 
-    /// A stopReason's later line, drawn at column 2 with no `⎿` of its own,
-    /// is the program's words through the `⎿` row that opens it
-    /// (`programs_words`' owning-gutter walk): a limit spelled there names
-    /// no limit and ends no countdown.
     #[test]
     fn a_stop_reasons_later_line_at_column_two_names_no_limit() {
         let capture = crate::prompt::fixtures::STOP_HOOK_STOP_REASON_TWO_LINES_MEASURED;
@@ -4086,15 +3198,6 @@ mod tests {
         );
     }
 
-    /// Background work's delivered output is not drawn under its notice at
-    /// column 2. A background Bash whose command printed `Not logged in ·
-    /// Please run /login` and a background Agent whose reply was those words
-    /// each draw their completion notice alone (`⏺ Background command "…"
-    /// completed (exit code 0)`, `⏺ Agent "…" finished · 0s`) — in the
-    /// transcript, in ctrl+o's detailed one and in ctrl+e's show-all alike —
-    /// so no row of the program's words stands where Claude Code's own notice
-    /// would. The words appear only in the call's own row (`⏺ Bash(… echo "Not
-    /// logged in · …")`), a call, never read.
     #[test]
     fn background_works_delivered_output_is_not_drawn_under_its_notice() {
         use crate::prompt::fixtures::{
@@ -4130,13 +3233,6 @@ mod tests {
         }
     }
 
-    /// When a verbose Bash output of 80 rows scrolls its call row and its first
-    /// 40 rows into the history and the real context wall stands under the
-    /// rest, on the screen alone the owner walk reaches the first row with
-    /// no owner (`owner_above_rows`) and the wall reads under none; with the
-    /// history `line` read right above the screen joined on, the walk
-    /// reaches `⏺ Bash(…)` and the wall stands under the call. Control: a
-    /// wall whose owner is on the screen is no such wall.
     #[test]
     fn a_wall_whose_call_scrolled_off_stands_under_it_with_the_history() {
         use crate::phase::owner_above_rows;
@@ -4158,13 +3254,6 @@ mod tests {
         assert!(!owner_above_rows(&on_screen, w.row));
     }
 
-    /// A labelled `⏺` message's wrapped row is its label's words: a
-    /// UserPromptSubmit hook's `stopReason` of 108 characters and `Usage limit
-    /// reached · resets 3pm` behind `⏺ Operation stopped by hook: …` wraps, and
-    /// its row at column 2 opens with the limit's words. Control: the same rows
-    /// with no label over them are read as the worker's or Claude Code's
-    /// message. A Monitor's event row (`⏺ Monitor event: …`) never wraps — a
-    /// line of 147 characters is cut with `…` at the pane's edge, one row.
     #[test]
     fn a_labelled_messages_wrapped_row_names_no_limit() {
         let monitor = screen(crate::prompt::fixtures::MONITOR_EVENT_LONG_LINE_MEASURED);
@@ -4190,19 +3279,6 @@ mod tests {
         );
     }
 
-    /// A Stop hook's `stopReason` taller than the rows read: 35 lines, the last
-    /// `Usage limit reached · resets 3pm`, draw the summary on row 6 and the
-    /// limit's words on row 41 — the whole screen reads no limit, its 40-row
-    /// tail a session limit with no turn served under it, the summary above it.
-    /// 60 lines draw the summary in the history right above the screen,
-    /// which alone reads the limit. Neither read can tell the hook's words
-    /// from Claude Code's notice, and [`limit_words_above`] names the row
-    /// for a caller to read again with the rows above; read with them, the
-    /// row is the hook's ([`crate::phase::words_of`]) and nothing is a
-    /// limit. Controls: the same history with the worker's message where
-    /// the summary was reads the limit; a labelled message's wrapped row cut at
-    /// the top of the rows is named too; a real limit notice decided within the
-    /// rows names nothing.
     #[test]
     fn a_stop_reason_taller_than_the_rows_read_is_read_with_the_rows_above() {
         use crate::phase::{WordsOf, words_of};
@@ -4220,8 +3296,6 @@ mod tests {
                 .rposition(|x| x == "  Usage limit reached · resets 3pm")
                 .expect("the limit's words")
         };
-        // 35 lines: the whole screen, and its 40-row tail.
-        // The pane's 50 rows: the capture leaves its trailing blank row off.
         let mut whole = screen(STOP_HOOK_STOP_REASON_35_LINES_LIMIT_PHRASE_MEASURED);
         assert_eq!(whole.len(), 49, "the capture's rows");
         whole.push(String::new());
@@ -4247,7 +3321,6 @@ mod tests {
         );
         assert_eq!(words_of(&tail, at), WordsOf::Above);
         assert_eq!(words_of(&whole, first + at), WordsOf::Program);
-        // 60 lines: the screen, and the history right above it.
         let screen60 = screen(STOP_HOOK_STOP_REASON_60_LINES_LIMIT_PHRASE_MEASURED);
         let history = screen(STOP_HOOK_STOP_REASON_60_LINES_SCROLLBACK_MEASURED);
         assert_eq!(read(&screen60), session, "the screen alone reads it");
@@ -4265,20 +3338,17 @@ mod tests {
         assert_eq!(words_of(&joined, above + at), WordsOf::Program);
         assert_eq!(read(&joined), None);
         assert_eq!(limit_words_above(&joined), None);
-        // CONTROL: the worker's message where the summary was.
         let mut worker = joined.clone();
         worker[0] = "⏺ The nightly notes:".to_string();
         assert_eq!(words_of(&worker, above + at), WordsOf::Vendor);
         assert_eq!(read(&worker), session);
         assert_eq!(limit_words_above(&worker), None);
-        // A labelled message's wrapped row at the top of the rows.
         let wrapped = screen(PROMPT_HOOK_STOPPED_WRAPPED_LIMIT_PHRASE_MEASURED);
         let at = phrase(&wrapped);
         let cut = wrapped[at..].to_vec();
         assert_eq!(read(&cut), session);
         assert_eq!(limit_words_above(&cut), Some(WordsAbove { row: 0, end: 0 }));
         assert_eq!(words_of(&wrapped, at), WordsOf::Program);
-        // A real notice, decided within the rows.
         let real = screen(WALL_SESSION_AUTO_CONTINUE_ARMED_MEASURED);
         assert!(since_limit(&real).is_some());
         assert_eq!(limit_words_above(&real), None);
@@ -4305,13 +3375,6 @@ mod tests {
             STOP_HOOKS_VERBOSE_LABELLED_PROMPT_ROW_MEASURED,
             STOP_HOOKS_VERBOSE_PROMPT_ROW_MEASURED,
         };
-        // A PostToolUse hook blocking with a reason of blank space draws no row
-        // of its own under its error row, and Claude Code's real context wall
-        // stands right there; a reason that is the wall's words draws the same
-        // screen. Neither is a wall on the screen: the row is offered to a
-        // caller holding the transcript as the hook's place
-        // (`SaidNotice::hook_words`), which tells them apart
-        // (`aterm_agent`'s `transcript_found`).
         for capture in [
             POST_HOOK_BLANK_REASON_THEN_CONTEXT_WALL_MEASURED,
             POST_HOOK_REASON_CONTEXT_PHRASE_MEASURED,
@@ -4335,14 +3398,10 @@ mod tests {
                 "post-tool hook, the wall's words as its reason",
                 POST_HOOK_REASON_CONTEXT_PHRASE_MEASURED,
             ),
-            // `⏺ Operation stopped by hook: …` wrapped, its row at column 2
-            // opening with a limit's words.
             (
                 "prompt hook stopped, wrapped",
                 PROMPT_HOOK_STOPPED_WRAPPED_LIMIT_PHRASE_MEASURED,
             ),
-            // `--verbose`: a row per hook over the `stopReason`, a prompt
-            // hook's text opening with a label or not.
             ("verbose stop hooks", STOP_HOOKS_VERBOSE_PROMPT_ROW_MEASURED),
             (
                 "verbose stop hooks, a labelled prompt row",
@@ -4457,12 +3516,6 @@ mod tests {
         }
     }
 
-    /// A program's words name no limit and no end of the auto-continue,
-    /// however their items split. The readers that walk every row
-    /// above the composer split a row at wide gaps before they classify it
-    /// (`since_limit`, `auto_continue_end`, the turn's own notice behind a
-    /// generic banner). Control: the same words as Claude Code's own row under
-    /// the person's turn are read.
     #[test]
     fn a_programs_words_name_no_limit_and_no_continue_however_they_split() {
         use crate::prompt::fixtures::{
@@ -4470,7 +3523,6 @@ mod tests {
             WALL_SONNET_BUCKET_AUTO_CONTINUE_ARMED_2_1_300,
         };
         let measured = screen(STOP_HOOK_WORDS_DOUBLE_SPACE_LIMIT_PHRASE_MEASURED);
-        // The `Stop says:` row alone: the summary and its stopReason dropped.
         let labelled: Vec<String> = measured
             .iter()
             .filter(|r| {
@@ -4526,7 +3578,6 @@ mod tests {
         }
         assert!(read.is_empty(), "{read:#?}");
 
-        // CONTROL: Claude Code's own rows, the same words.
         let vendors: Vec<String> = labelled
             .iter()
             .map(|r| r.replace("⎿ \u{a0}Stop says: note  ", "⎿ \u{a0}"))
@@ -4549,11 +3600,6 @@ mod tests {
         assert_eq!(wall(&named).map(|w| w.kind), Some(WallKind::UsageWeekly));
     }
 
-    /// Both forms of the Fable wall are the model bucket, the one with
-    /// a reset naming it and the one without naming none (the second is
-    /// drawn under the first, and the newest is read). Negative control: the
-    /// Fable warning on the footer's last row is no wall, and the session
-    /// reads idle.
     #[test]
     fn the_2_1_301_fable_walls_are_the_model_bucket_with_and_without_a_reset() {
         use crate::prompt::fixtures::{
@@ -4572,15 +3618,6 @@ mod tests {
         assert_eq!(worker_phase(&warning), Phase::Idle);
     }
 
-    /// `Context limit reached` is a wall of its own, and not a usage limit;
-    /// a subagent quota, a subagent budget and
-    /// fast mode's fallback are no wall at all, in the gutter or the footer.
-    ///
-    /// So is the row of a `/compact` that failed — `Compaction failed · …`,
-    /// `Error during compaction: …`, drawn under the `❯ /compact` echo with no
-    /// done row after it: the context is as full as it was. Negative controls:
-    /// `Compacted (ctrl+o to see full summary)` and a person's `/compact` on a
-    /// chat with `Not enough messages to compact.` are no wall.
     #[test]
     fn context_is_its_own_wall_and_the_quota_notices_are_none() {
         const CONTEXT: &str = "Context limit reached · /compact or /clear to continue";
@@ -4607,7 +3644,6 @@ mod tests {
             assert_eq!(wall(&r), None, "{quota}");
             assert_eq!(worker_phase(&r), Phase::Idle, "{quota}");
         }
-        // The screens of a full context and of its `/compact`.
         for (name, capture, notice) in [
             (
                 "the wall",
@@ -4658,8 +3694,6 @@ mod tests {
             assert_eq!(limit_notice(&r), None, "{name}");
             assert_eq!(worker_phase(&r), Phase::Idle, "{name}");
         }
-        // The detail of a failed compaction wins where it names a wall with an
-        // answer of its own: a lost login met by `/compact` is still a lost login.
         for (text, kind) in [
             (
                 "Error during compaction: Invalid API key · Fix external API key",
@@ -4678,10 +3712,6 @@ mod tests {
         }
     }
 
-    /// The banner as the incident drew it, and as it would be drawn beside
-    /// the spinner: a memory wall read from the banner row, its message the
-    /// banner's whole text. The draft quoting it five rows lower is inside
-    /// the composer and never read.
     #[test]
     fn the_memory_banner_is_read_by_its_place() {
         use crate::anchors::anchor_text;
@@ -4693,7 +3723,6 @@ mod tests {
         assert_eq!(w.reset, None);
         assert!(w.message.starts_with(anchor_text("wall.memory")));
         assert!(w.message.ends_with("claude --continue"), "{}", w.message);
-        // The same banner sharing the spinner's row reads the same.
         let mut shared = r.clone();
         let spinner = w.row - 1;
         let pad = 142 - shared[spinner].chars().count() - w.message.chars().count();
@@ -4701,16 +3730,11 @@ mod tests {
         shared[w.row] = String::new();
         let s = memory_wall(&shared).expect("beside the spinner");
         assert_eq!((s.row, s.message.as_str()), (spinner, w.message.as_str()));
-        // And the idle layout (synthetic, unconfirmed).
         let idle = memory_wall(&screen(MEMORY_BANNER_IDLE)).expect("idle");
         assert_eq!(idle.message, w.message);
-        // `wall` asks it first.
         assert_eq!(wall(&r).map(|w| w.kind), Some(WallKind::Memory));
     }
 
-    /// The busy fixture at `width` columns: its rules that wide, every other
-    /// row cut to it, and row `at` the banner right-aligned two columns
-    /// short of the edge, as it was measured at 144.
     fn narrowed(rows: &[String], at: usize, width: usize, banner: &str) -> Vec<String> {
         rows.iter()
             .enumerate()
@@ -4726,8 +3750,6 @@ mod tests {
             .collect()
     }
 
-    /// `text`, then words, to two columns short of `width`: a quote that
-    /// runs on to the banner's own edge.
     fn to_edge(text: &str, width: usize) -> String {
         let mut row = format!("{text}, it said, so the run stops here");
         while row.chars().count() < width - 2 {
@@ -4736,12 +3758,6 @@ mod tests {
         row.chars().take(width - 2).collect()
     }
 
-    /// The banner is 75 columns wide, so a narrow window starts it left of
-    /// the hint column: at aterm's default 80 columns it starts at column 3.
-    /// Under a status row every row down to the top rule is the live zone —
-    /// no transcript row sits there — so there it is read at every width it
-    /// fits, 80 included (a column-6 floor reads `None` at 82 columns or
-    /// fewer, however busy the spinner over it).
     #[test]
     fn the_memory_banner_reads_at_every_width_under_a_spinner() {
         use crate::prompt::fixtures::MEMORY_BANNER_BUSY;
@@ -4762,12 +3778,6 @@ mod tests {
         }
     }
 
-    /// Negative control under the spinner: the one person's text the live
-    /// zone holds is a message queued there — `❯ …`, its wrapped rows
-    /// indented under the caret's text. One that quotes the banner, wrapped so
-    /// a row opens with it and runs to the edge, is no wall at 80 columns or
-    /// at 144, two rows under its `❯` or one. Control: the banner itself right
-    /// above that message is still read.
     #[test]
     fn a_queued_message_quoting_the_memory_banner_is_not_a_wall() {
         use crate::prompt::fixtures::MEMORY_BANNER_BUSY;
@@ -4802,14 +3812,6 @@ mod tests {
         }
     }
 
-    /// Negative controls: every copy of the banner that is not the vendor's
-    /// banner row reads `None` — the composer draft alone, a copy ending short
-    /// of the edge, one up in the transcript beyond the live zone, the anchor
-    /// with no size after it, and a screen with no composer frame; and, where
-    /// the transcript meets the live zone — at idle, with no status row, the
-    /// last transcript block runs down to the rows the banner is parked in —
-    /// the words in the worker's message, in a paragraph of it, in a tool's
-    /// output and in that output's continuation row, each running to the edge.
     #[test]
     fn a_quoted_memory_banner_is_not_a_wall() {
         use crate::anchors::anchor_text;
@@ -4822,8 +3824,6 @@ mod tests {
             v[at] = row;
             v
         };
-        // Right-aligned as the banner is, ending two columns short of the
-        // 144-column rule.
         let right_aligned = |text: &str| format!("{text:>142}");
         let no_size = format!("{} is back to normal", anchor_text("wall.memory"));
         assert_eq!(
@@ -4833,7 +3833,6 @@ mod tests {
         let blank = with(String::new());
         let idle = screen(MEMORY_BANNER_IDLE);
         let at_idle = memory_wall(&idle).expect("the idle control").row;
-        // The banner row replaced by the last rows of a transcript block.
         let ending = |tail: &[&str]| {
             let mut v = idle.clone();
             v.splice(at_idle..=at_idle, tail.iter().map(|row| row.to_string()));
@@ -4875,12 +3874,10 @@ mod tests {
             assert_eq!(memory_wall(v), None, "{name}");
             assert_eq!(wall(v), None, "{name}");
         }
-        // Up in the transcript, over the spinner: not the live zone.
         let mut above = r.clone();
         above[at] = String::new();
         above.insert(1, r[at].clone());
         assert_eq!(memory_wall(&above), None, "above the status row");
-        // No composer frame (the rules gone): nothing is read by place.
         let unframed: Vec<String> = r
             .iter()
             .filter(|row| !row.starts_with('─'))
@@ -4923,10 +3920,6 @@ mod tests {
         cause: ApiCause::Unreachable,
     };
 
-    /// Claude Code 2.1.283 draws `API Error: …` as a `⏺` message of its own.
-    /// It is a wall — at 144 columns, at 80 where `(ENOTFOUND)` wraps onto the
-    /// second row, without a done row, with the `●` off macOS, and under the
-    /// vendor's expand hint — and the message is the whole of it, joined.
     #[test]
     fn a_283_api_error_message_row_is_a_wall_at_every_width() {
         for (name, r) in [
@@ -4941,17 +3934,12 @@ mod tests {
             assert_eq!(w.message, ENOTFOUND, "{name}");
             assert!(r[w.row].starts_with("⏺ API Error"), "{name}");
         }
-        // Two errors on screen (a queued message was sent under the first):
-        // the wall is the last one, the turn's end.
         let twice = screen(API_ERROR_TWICE_MEASURED);
         let last = twice
             .iter()
             .rposition(|r| r.starts_with("⏺ API Error"))
             .expect("the second error");
         assert_eq!(wall(&twice).map(|w| w.row), Some(last));
-        // Negative control: the retries spent with a message queued, which
-        // Claude sends under the error at once — the error is history, the
-        // next turn retrying: busy, no wall.
         let sent = screen(API_ERROR_QUEUED_SENT_MEASURED);
         assert_eq!(worker_phase(&sent), Phase::Busy);
         assert_eq!(wall(&sent), None);
@@ -4975,14 +3963,6 @@ mod tests {
         }
     }
 
-    /// Negative controls for the message row. The table names a wall within
-    /// a notice's first four words, so a worker's prose that opens so would
-    /// read as one if any last `⏺` row were offered: the literal vendor
-    /// prefix is required. And the error is history once anything is said
-    /// under it — a person's `keep going`, the worker's next words, a tool
-    /// call — or when it is not the whole paragraph, not in column 0, or a
-    /// person's own row. A `⎿` notice under it is still read, by the
-    /// gutter; `Request was aborted.` is still no wall.
     #[test]
     fn the_workers_prose_and_history_are_not_a_message_wall() {
         let error = format!("⏺ {ENOTFOUND}");
@@ -5074,13 +4054,6 @@ mod tests {
         );
     }
 
-    /// Claude Code 2.1.283's whole connection catalog, each text as it
-    /// follows `API Error: `, lands on its cause: a network never reached, a
-    /// reply cut off, a TLS or proxy refusal (never retried) — with the
-    /// traps: a refused connection that names a proxy, and a timeout that
-    /// names proxy settings, are unreachable; `Unable to connect to API.
-    /// Check your internet connection` says so only after its first
-    /// sentence. A status keeps its server cause.
     #[test]
     fn every_api_error_family_of_the_283_catalog_classifies() {
         let unreachable = [
@@ -5115,8 +4088,6 @@ mod tests {
             "Connection lost before a response was produced. Try again.",
             "An image in the conversation could not be processed and was removed. Re-read the file with a different approach if you still need it.",
         ];
-        // A reply past its output token maximum is no cut-off: it is retried
-        // on a ladder work does not reset.
         let overlong = [
             "Claude's response exceeded the 32000 output token maximum. To configure this behavior, set the CLAUDE_CODE_MAX_OUTPUT_TOKENS environment variable.",
             "Claude's response exceeded the 32000 output token maximum for a request sent without streaming. The CLAUDE_CODE_MAX_OUTPUT_TOKENS environment variable cannot raise this limit.",
@@ -5174,9 +4145,6 @@ mod tests {
             classify_wall("API Error: The model has reached its context window limit."),
             Some(WallKind::Context)
         );
-        // What the catalog does not name is the server's, retried (the
-        // vendor's rule for a notice with no status); the vendor's refusals
-        // are refused requests.
         for text in [
             "API Error: Claude Opus 5.5 can't help with this. Start a new session to continue.",
             "API Error (claude-x-1): The provided model identifier is invalid. Run /model to pick a different model.",
@@ -5208,15 +4176,6 @@ mod tests {
         }
     }
 
-    /// A refused request is a wall of its own, and an unnamed API error the
-    /// server's. Each text is the 2.1.300 error builder's, the status a 4xx
-    /// the vendor does not retry (its `aMr`: 400-499 but 401, 408, 409, 429 and
-    /// 451). Negative controls: the vendor's own generic fallbacks (`API Error:
-    /// terminated`, the bare `API Error` drawn as `Please wait a moment and try
-    /// again.`) are the server's and retried, never refused; a statused failure
-    /// the vendor retries stays the server's; an aborted request, `/advisor`'s
-    /// own answer to a name it does not know, and prose that mentions an API
-    /// error or a refusal's words past its opening, are no wall.
     #[test]
     fn a_refused_request_is_its_own_wall_and_an_unnamed_api_error_the_servers() {
         let refused = |code| {
@@ -5229,8 +4188,6 @@ mod tests {
         for text in [
             "API Error: Claude can't help with this. Start a new session to continue. Send feedback with /feedback or learn more: https://www.anthropic.com/legal/aup",
             "API Error: Opus 4.1's safeguards flagged this message (https://www.anthropic.com/legal/aup). This sometimes happens with safe, normal conversations.",
-            // The model's name puts the words past the table's opening four:
-            // read anywhere in an `API Error` with no status.
             "API Error: Claude Opus 5.5's safeguards flagged this message (https://www.anthropic.com/legal/aup). This sometimes happens with safe, normal conversations.",
             "API Error: Effort 'max' isn't available with thinking turned off on this model · run /effort high to continue, or turn thinking back on (unset MAX_THINKING_TOKENS=0)",
             "API Error: advisor tool is not supported · The configured advisor model is not compatible with this request model — run /advisor to change or disable the advisor",
@@ -5271,8 +4228,6 @@ mod tests {
                 cause: ApiCause::Server,
             })
         };
-        // The vendor's own generic fallbacks, and a status it retries (or a
-        // 401: a token it refreshes; a 451): the server's.
         for text in [
             "API Error: Please wait a moment and try again.",
             "API Error: terminated",
@@ -5295,23 +4250,12 @@ mod tests {
             "I hit API Error: 400 earlier in the logs, so I patched the retry",
             "The tests check that the advisor model is not compatible with Haiku.",
             "Fixed the parser so it reads an account that is on hold as a wall.",
-            // `/advisor`'s own answer to a name it does not know (2.1.300): a
-            // person's typo, no request refused.
             "Invalid advisor model: claude-haiku-9",
         ] {
             assert_eq!(classify_wall(text), None, "{text}");
         }
     }
 
-    /// Which readings the status alone makes: an `API
-    /// Error` whose words name nothing but the status it prints (`403
-    /// Forbidden`, `401 Unauthorized`, the API's JSON body) is read by its
-    /// status's range alone, so a reader holding the notice's typed fields may
-    /// name it more closely. Negative controls: a refusal the table's words
-    /// name, opening the notice or anywhere in it (a DLP policy's past the
-    /// opening words), a phrase of another wall opening it (the lost login's,
-    /// a rate limit's), an `API Error` with no status, and a notice that is
-    /// no API error, are not.
     #[test]
     fn a_reading_by_the_status_alone_is_told_from_one_the_words_make() {
         for text in [
@@ -5337,11 +4281,6 @@ mod tests {
         }
     }
 
-    /// The same on the screen: the vendor's `⏺` error row (2.1.300's `su`,
-    /// the text at column 2) reads as the wall it names — a refusal, an
-    /// unnamed API error, the long context's entitlement — and the gutter's
-    /// high-demand row as an overload. Negative controls: the worker's prose
-    /// that mentions an API error, and the vendor's model fallback.
     #[test]
     fn the_refusals_and_the_unnamed_api_errors_read_on_the_screen() {
         let row = |text: &str| framed(&["⏺ Working.", "", &format!("⏺ {text}"), ""], FOOTER);
@@ -5413,12 +4352,6 @@ mod tests {
         }
     }
 
-    /// The last thing said where the vendor draws its own notices
-    /// ([`crate::phase::last_said_notice`]), for a caller that holds a
-    /// notice's words: a `⏺` row in column 0 — drawn like prose or in the
-    /// error row's shape, wrapped or not — and a vendor `⎿` block are given
-    /// with their text. Negative controls: a call's first output row, a call
-    /// row, the person's `❯` row, and a row said before the last.
     #[test]
     fn the_last_thing_said_is_given_where_the_vendor_draws_a_notice() {
         use crate::phase::last_said_notice;
@@ -5475,9 +4408,6 @@ mod tests {
         }
     }
 
-    /// The one connection failure 2.1.283 draws under `⎿` with no prefix,
-    /// `Request timed out`, is unreachable there — and a tool's output that
-    /// says it is no wall.
     #[test]
     fn request_timed_out_under_the_gutter_is_unreachable() {
         let r = framed(
@@ -5502,12 +4432,6 @@ mod tests {
         assert_eq!(wall(&longer), None, "only the whole row");
     }
 
-    /// Usage credits carrying a session are no wall: the vendor's own list of
-    /// its credits notices, the notice credits start on, the warning that a
-    /// window is filling and the one that credits near their cap read as
-    /// nothing. Negative control: a model's bucket that the vendor says now
-    /// uses usage credits is still that bucket, and running out of credits
-    /// still spend.
     #[test]
     fn usage_credits_and_the_vendors_warnings_are_no_wall() {
         for notice in [
@@ -5537,11 +4461,6 @@ mod tests {
         );
     }
 
-    /// Off macOS, Claude Code draws the model's lines with `●` (`⏺` on macOS,
-    /// `●` elsewhere), and a reply so drawn is the model's as one drawn with
-    /// `⏺` is: a person's turn served under a limit's notice is served since it
-    /// ([`since_limit`]). Negative control: the same turn's prompt with no
-    /// reply under it serves nothing.
     #[test]
     fn off_macos_a_line_of_the_models_drawn_with_a_dot_is_its_reply() {
         use crate::prompt::fixtures::{WALL_SESSION_CANCELLED_THEN_PERSON_TURN_MEASURED, screen};
@@ -5568,12 +4487,6 @@ mod tests {
         );
     }
 
-    /// The expiry notice (`login_expires_in`), composed on the notification
-    /// row (`✔ Update installed · Restart to update`, right-aligned above the
-    /// composer's top rule) it stands in for: read there and in the footer, by
-    /// its day count. Negative controls: the same words in a reply (`⏺`), a
-    /// tool row, a tool's output, the composer itself, and a notice that names
-    /// no day count read nothing.
     #[test]
     fn the_login_expiry_notice_is_read_where_a_notification_is_drawn_and_only_there() {
         const CAPTURE: &str = include_str!("fixtures/idle-after-limit-and-model-switch.txt");
@@ -5598,7 +4511,6 @@ mod tests {
         ] {
             assert_eq!(login_expires_in(&notice(words)), Some(days), "{words}");
         }
-        // The footer's segment, at the right edge under the bottom rule.
         let mut footer = rows.clone();
         let last = footer.len() - 1;
         footer[last] = format!(
@@ -5606,7 +4518,6 @@ mod tests {
             "Your login expires in 1 day \u{b7} run /login to renew"
         );
         assert_eq!(login_expires_in(&footer), Some(1));
-        // Negative controls: a conversation's rows, and words that are not it.
         let quoted = |row: String| {
             let mut r = rows.clone();
             r.insert(at, row);
@@ -5639,18 +4550,6 @@ mod tests {
         assert_eq!(login_expires_in(&drafted), None, "a draft is the person's");
     }
 
-    /// A generic row with no notice of its turn drawn names no limit. A Sonnet
-    /// bucket under 24 h from its reset on a pane 15 rows tall: armed, the
-    /// turn's `⎿  You've hit your Sonnet limit · resets 1:56am (…)` is drawn
-    /// over the generic row, and the row is the bucket; once Claude Code went
-    /// on by itself that notice has scrolled off, and the generic `⏺ Usage
-    /// limit reached · continuing automatically at 1:56am · …` is the newest
-    /// notice drawn. Its words are a usage window's and are read as they are,
-    /// but flagged [`SinceLimit::generic`]. CONTROLS, not generic: the armed
-    /// pane, the taller pane's continuation, and a session limit's row under
-    /// its turn's notice. Under the lone generic row a person's `/model` (18
-    /// rows: the switch box pushed the notice off) is read as the choice it
-    /// is, the row still generic.
     #[test]
     fn a_generic_row_with_no_notice_of_its_turn_names_no_limit() {
         use crate::prompt::fixtures::{
@@ -5692,7 +4591,6 @@ mod tests {
         let session = screen(WALL_SESSION_RESUMED_BY_ITSELF_MEASURED);
         let read = since_limit(&session).expect("the session limit's notice");
         assert_eq!((read.kind, read.generic), (WallKind::UsageSession, false));
-        // A `/model` under the lone generic row (18 rows).
         let chosen = screen(SONNET_BUCKET_UNDER_24H_CANCELLED_THEN_MODEL_18_ROWS_2_1_302);
         assert!(
             chosen[0].starts_with("⏺ Usage limit reached")
@@ -5715,18 +4613,6 @@ mod tests {
         );
     }
 
-    /// The limit a cancel left under Claude Code's limit dialog is that limit.
-    /// A Sonnet bucket whose reset is over 24 h away: Claude Code opens its
-    /// usage-limit dialog, and once it is answered `Wait here, …` the
-    /// dialog's own rows stand between the turn's notice and the cancel —
-    /// `❯ /rate-limit-options`, which Claude Code types itself, and its answer
-    /// `⎿  Claude Code will continue automatically at Oct 19 at 2:25am. …`.
-    /// They are that limit's own: the cancel is still the vendor's word on
-    /// the countdown the bucket's notice armed, and the limit it left is the
-    /// bucket — its kind, its reset, its `⎿` row. NEGATIVE CONTROLS: a
-    /// person's local command in the dialog's place (`❯ /usage`, said between
-    /// the notice and the cancel), and the dialog's rows after the cancel (a
-    /// new turn: the cancel is history).
     #[test]
     fn the_limit_a_cancel_left_under_the_limit_dialog_is_that_limit() {
         use crate::prompt::fixtures::{WALL_SONNET_BUCKET_CANCELLED_OVER_24H_2_1_302, screen};
@@ -5763,7 +4649,6 @@ mod tests {
             ),
             "{left:?}"
         );
-        // NEGATIVE CONTROLS.
         let mut usage = cancelled.clone();
         usage.splice(
             dialog..cancel - 1,

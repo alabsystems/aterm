@@ -120,7 +120,7 @@ unsafe extern "C" {
 /// another user can write into lets them swap in a symlink or pre-create the file (CWE-379);
 /// read bits are the caller's business (a 0755 home subdir passes, /tmp does not).
 #[must_use]
-pub fn dir_safe_for_private_write(uid: u32, owner_uid: u32, mode: u32) -> bool {
+pub const fn dir_safe_for_private_write(uid: u32, owner_uid: u32, mode: u32) -> bool {
     owner_uid == uid && mode & 0o022 == 0
 }
 

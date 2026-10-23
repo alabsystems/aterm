@@ -1,61 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The live install-progress protocol: `progress.json` v1 + the `bump` file, and the
-//! promise of a pass that has not begun yet (`pass-owed.json`, [`pass_owed`]).
-//!
-//! `<prefix>/progress.json`, the live complement to `status.toml`, is a snapshot of the pass
-//! in flight, written only by the process holding the store flock, atomically (temp +
-//! rename), on change only and at most every [`WRITE_MIN_INTERVAL_MS`]. Readers treat a
-//! heartbeat older than [`HEARTBEAT_STALE_SECS`] or a dead pid as "not running" (the
-//! heartbeat window covers pid reuse). A clean pass end rewrites a terminal snapshot with
-//! `pid` cleared; a pass start truncates.
-//!
-//! Both files live in the user-owned prefix and are read as untrusted input
-//! (defense-in-depth, not a trust boundary):
-//!
-//! * a `symlink_metadata` regular-file check before any read or write;
-//! * reads capped at [`PROGRESS_READ_CAP`] / [`BUMP_READ_CAP`]; oversize ⇒ absent;
-//! * unknown fields ignored, so a newer writer never breaks an older reader; an unknown `v`
-//!   renders a generic "installing…";
-//! * program names pass `store::ToolName` and roster intersection, and error strings
-//!   [`sanitize_for_tty`], before reaching a TTY;
-//! * a malformed file is ignored, never a crash.
-//!
-//! `<prefix>/bump` is the priority channel: stubs append the program the user just ran, one
-//! name per line, and the installer reads it between items. Each line passes
-//! `store::ToolName` and is intersected with the set planned from the signed index, so the
-//! file can only reorder installs already authorized, never add work, name a version or
-//! touch trust. A clean pass end deletes it.
-//!
-//! * open with a `symlink_metadata` regular-file check BEFORE any read or write — never
-//!   follow a symlink out of the prefix (the same discipline gc's staging sweep states in
-//!   code: "Regular files only: never follow a symlink out of the prefix");
-//! * cap reads at [`PROGRESS_READ_CAP`] / [`BUMP_READ_CAP`]; oversize ⇒ treated as
-//!   absent, never partially parsed;
-//! * ignore unknown fields (serde's default here — nothing derives
-//!   `deny_unknown_fields`), so a newer writer never breaks an older reader;
-//! * an unknown `v` renders a generic "installing…", never a guess at fields whose
-//!   meaning may have changed;
-//! * strings that reach a TTY are hostile until proven otherwise: program names must
-//!   round-trip through `store::ToolName` + roster intersection before printing, and
-//!   error strings are control-character-stripped and length-capped (terminal
-//!   escape-sequence injection);
-//! * malformed/oversized files are ignored identically — render nothing or the generic
-//!   line; never crash, never trust.
-//!
-//! # The `bump` file: reorder-only by construction
-//!
-//! `<prefix>/bump` is the priority-queue channel: **plain text, one program name per
-//! line, append-only by writers** (stubs append the name of the program the user just
-//! ran — followed by [`UNATTENDED_BUMP`] when a script ran it, not a person:
-//! [`Asker`]), consumed by the installer between items. The installer reads it capped at
-//! [`BUMP_READ_CAP`] (same symlink discipline), parses each line through the
-//! `store::ToolName` gate, and **intersects with the set it already planned** from the
-//! signed index. Unknown names, installed names, removed names, garbage and oversized
-//! files are ignored. The file can therefore never ADD work, name a version, supply a
-//! URL, or touch trust — it can only permute the order of installs the signed index
-//! already authorized. It is deleted at clean pass end.
+//! The live install-progress protocol: `progress.json` v1 + the `bump` file, and the promise of a pass that has not begun yet (`pass-owed.json`, [`pass_owed`]).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -65,33 +11,26 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
-/// The schema version writers stamp. Readers render a generic "installing…" for any `v`
-/// they do not know.
+/// The schema version writers stamp.
 pub const PROGRESS_VERSION: u32 = 1;
 
-/// Read cap for `progress.json`; a larger file is treated as absent. Far above any honest
-/// snapshot (the roster is a couple dozen programs).
+/// Read cap for `progress.json`; a larger file is treated as absent.
 pub const PROGRESS_READ_CAP: u64 = 256 * 1024;
 
-/// Read cap for the `bump` file: one program name per line; a file past this is treated
-/// as absent. A user hammering stubs cannot push an honest file anywhere near it.
+/// Read cap for the `bump` file: one program name per line; a file past this is treated as absent.
 pub const BUMP_READ_CAP: u64 = 4 * 1024;
 
-/// A heartbeat older than this many seconds means "installer not running", whatever the
-/// snapshot claims.
+/// A heartbeat older than this many seconds means "installer not running", whatever the snapshot claims.
 pub const HEARTBEAT_STALE_SECS: u64 = 10;
 
-/// Writer rate cap: write only on change and at least this many milliseconds after the
-/// last write (≤ 10 Hz), so a fast extract loop never becomes an fsync storm.
+/// Writer rate cap: write only on change and at least this many milliseconds after the last write (≤ 10 Hz), so a fast extract loop never becomes an fsync storm.
 pub const WRITE_MIN_INTERVAL_MS: u64 = 100;
 
-/// Where one program is in its install, in pass order, serialized lowercase. `download`
-/// and `extract` carry real byte meters (the `.part` poller and the `write_capped` loop);
-/// `verify` and `link` are labels only.
+/// Where one program is in its install, in pass order, serialized lowercase.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Phase {
-    /// Planned, not yet started. The `ProgressFile::queue` array carries the order.
+    /// Planned, not yet started.
     Queued,
     /// Bytes moving from the network into the staged `.part`.
     Download,
@@ -103,17 +42,13 @@ pub enum Phase {
     Link,
     /// Installed and live in this pass.
     Done,
-    /// This program failed; `ProgramProgress::error` names why. One failure never aborts
-    /// the set.
+    /// This program failed; `ProgramProgress::error` names why.
     Failed,
     /// Nothing to do — already current (zero bytes moved) or excluded.
     Skipped,
 }
 
-/// The whole-pass rollup the overall bar renders. Byte totals are the signed
-/// `artifact.size` sums of the pass's planned work, so the denominator is fixed;
-/// already-current programs contribute zero. Every counter defaults, so a partial
-/// `overall` degrades to zeros rather than blinding the reader to the whole file.
+/// The whole-pass rollup the overall bar renders.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Overall {
@@ -127,18 +62,15 @@ pub struct Overall {
     pub bytes_total: u64,
 }
 
-/// One program's row. Every field but `phase` defaults, so a snapshot written mid-change
-/// degrades to zeros rather than failing the parse.
+/// One program's row.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProgramProgress {
     /// Where this program is now.
     pub phase: Phase,
-    /// Bytes landed in the current metered phase (download: `.part` size on disk;
-    /// extract: bytes written). Zero in label-only phases.
+    /// Bytes landed in the current metered phase (download: `.part` size on disk; extract: bytes written).
     #[serde(default)]
     pub bytes_done: u64,
-    /// The metered phase's denominator: the signed `artifact.size` for download, the
-    /// signed uncompressed size for extract. Zero when unmetered.
+    /// The metered phase's denominator: the signed `artifact.size` for download, the signed uncompressed size for extract.
     #[serde(default)]
     pub bytes_total: u64,
     /// The pinned build number being installed, once resolved from the signed index.
@@ -147,16 +79,13 @@ pub struct ProgramProgress {
     /// Whether a bump-file entry moved this program forward in the queue.
     #[serde(default)]
     pub bumped: bool,
-    /// Why `phase` is `failed`. Untrusted for display: control-strip and length-cap before
-    /// any TTY.
+    /// Why `phase` is `failed`.
     #[serde(default)]
     pub error: Option<String>,
 }
 
 impl ProgramProgress {
-    /// A download whose every byte is in, waiting for the pass to stage it: the set
-    /// completion fetches archives ahead of the program it is staging. Nothing moves for it,
-    /// so a reader naming what the pass is doing now names a row that is moving first.
+    /// A download whose every byte is in, waiting for the pass to stage it: the set completion fetches archives ahead of the program it is staging.
     #[must_use]
     pub fn downloaded(&self) -> bool {
         self.phase == Phase::Download && self.bytes_total > 0 && self.bytes_done >= self.bytes_total
@@ -164,34 +93,23 @@ impl ProgramProgress {
 }
 
 /// The `progress.json` snapshot: everything a reader needs to render the pass.
-///
-/// `v` is the only required field: every other field defaults, so missing data degrades
-/// toward the safe reading (no pid + zero heartbeat ⇒ "not running"), never a parse
-/// failure or a live-looking lie.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProgressFile {
     /// Schema version ([`PROGRESS_VERSION`]).
     pub v: u32,
     /// The writing installer's pid while the pass is live; `None` once it ended cleanly.
-    /// A dead pid means "not running" however fresh the file looks.
     #[serde(default)]
     pub pid: Option<u32>,
-    /// Which pass is writing: `"net"` (the default-set pass), or a typed pass that plans
-    /// no default set, `"update"` (the channel apply) or `"install"` (one program). A
-    /// string, not an enum, so an old reader renders an unknown future pass generically.
+    /// Which pass is writing: `"net"` (the default-set pass), or a typed pass that plans no default set, `"update"` (the channel apply) or `"install"` (one program).
     #[serde(default)]
     pub pass: String,
     /// Unix seconds when the pass started.
     #[serde(default)]
     pub started_unix: u64,
-    /// An opaque per-pass identity, minted once and retained in the terminal
-    /// snapshot. Unix seconds alone cannot distinguish consecutive short passes.
-    /// Older writers (or unavailable OS entropy) leave this absent; readers then
-    /// require a live-pass observation instead of guessing from an ended timestamp.
+    /// An opaque per-pass identity, minted once and retained in the terminal snapshot.
     #[serde(default)]
     pub generation: Option<String>,
     /// Unix seconds of the last write, the staleness input for [`HEARTBEAT_STALE_SECS`].
-    /// Absent ⇒ 0, epoch-stale: the safe "not running" reading.
     #[serde(default)]
     pub heartbeat_unix: u64,
     /// The whole-pass rollup.
@@ -200,28 +118,20 @@ pub struct ProgressFile {
     /// Remaining install order, front first.
     #[serde(default)]
     pub queue: Vec<String>,
-    /// Per-program rows, keyed by program name. Names are untrusted until
-    /// `ToolName`/roster-intersected (see the module docs).
+    /// Per-program rows, keyed by program name.
     #[serde(default)]
     pub programs: BTreeMap<String, ProgramProgress>,
-    /// Unix seconds when the pass ended cleanly, written with `pid: None`. `None` while
-    /// live and on any snapshot from a writer that died mid-pass.
+    /// Unix seconds when the pass ended cleanly, written with `pid: None`.
     #[serde(default)]
     pub ended_unix: Option<u64>,
 }
 
-// The writer: ProgressSink.
-
 /// Current unix seconds, saturating at 0 for a clock before the epoch (backward skew
-/// then reads as epoch-stale — the safe, "not running" direction).
 fn unix_now() -> u64 {
     aterm_time::unix_secs().unwrap_or(0)
 }
 
 /// The clocks a pass's writer reads: the monotonic one its write policy ages the last
-/// write by ([`maybe_write`]), and the unix seconds every write stamps. The system's in
-/// every build; a test hands the passes its thread opens a manual one it moves itself
-/// (`CLOCK_OVERRIDE`), so a heartbeat interval is a step of that clock, not seconds slept.
 #[derive(Clone)]
 enum PassClock {
     /// [`Instant::now`] and [`unix_now`].
@@ -233,7 +143,6 @@ enum PassClock {
 
 impl PassClock {
     /// The clock a sink opened NOW runs on: the system's, unless a test set
-    /// `CLOCK_OVERRIDE` on this thread.
     fn for_new_sink() -> Self {
         #[cfg(test)]
         {
@@ -261,8 +170,7 @@ impl PassClock {
     }
 }
 
-/// TESTS ONLY: a pass clock standing at the moment it was made until [`Self::advance`]
-/// moves it — both its instant and its unix seconds, together.
+/// TESTS ONLY: a pass clock standing at the moment it was made until [`Self::advance`] moves it — both its instant and its unix seconds, together.
 #[cfg(test)]
 pub(crate) struct ManualPassClock {
     origin: Instant,
@@ -308,8 +216,7 @@ impl ManualPassClock {
     }
 }
 
-/// TESTS ONLY: restores the thread's previous pass clock on drop
-/// ([`ManualPassClock::drive_passes`]).
+/// TESTS ONLY: restores the thread's previous pass clock on drop ([`ManualPassClock::drive_passes`]).
 #[cfg(test)]
 pub(crate) struct ClockOverride(Option<Arc<ManualPassClock>>);
 
@@ -324,7 +231,6 @@ impl Drop for ClockOverride {
 #[cfg(test)]
 thread_local! {
     /// TESTS ONLY: the clock [`PassClock::for_new_sink`] hands the sinks THIS thread
-    /// opens, read on it and moved into the sink, so no other test's passes see it.
     static CLOCK_OVERRIDE: std::cell::RefCell<Option<Arc<ManualPassClock>>> =
         const { std::cell::RefCell::new(None) };
 }
@@ -338,35 +244,23 @@ struct SinkState {
     /// The snapshot being built — serialized verbatim on every write.
     file: ProgressFile,
     /// Per-program download credit `(done, total)` for the overall rollup, kept apart from
-    /// the wire rows: a row's `bytes_done/bytes_total` switch meaning per phase, while the
-    /// overall denominator stays the signed asset sums the plan fixed.
     dl: BTreeMap<String, (u64, u64)>,
     /// When the last snapshot hit disk — the ≤10 Hz rate cap's clock.
     last_write: Option<Instant>,
     /// Whether the snapshot changed since the last write.
     dirty: bool,
     /// Set when the destination is not a regular file (a symlink or FIFO planted at the
-    /// path): the sink goes silent rather than follow it. The install never depends on
-    /// this file.
     disabled: bool,
 }
 
 /// The live-progress writer: one per pass, held by the process with the store flock.
-///
-/// Cheap to clone (an `Arc` over one mutex). Every mutation funnels through
-/// [`SinkState`] and lands on disk via the `status.rs` atomic temp+rename discipline.
-/// Ordinary meters are rate-capped to [`WRITE_MIN_INTERVAL_MS`] and heartbeat-refreshed
-/// at least every [`HEARTBEAT_MIN_INTERVAL_SECS`] (the download poller guarantees the
-/// cadence during long transfers); the plan and terminal snapshot land immediately.
 #[derive(Clone)]
 pub struct ProgressSink {
     inner: Arc<Mutex<SinkState>>,
 }
 
 impl ProgressSink {
-    /// The pass as it stands now (the snapshot the next write would land, its download
-    /// credit summed as [`write_now`] sums it), for the terminal meter ([`crate::meter`]),
-    /// which must not wait out the write cap or read the file back.
+    /// The pass as it stands now (the snapshot the next write would land, its download credit summed as [`write_now`] sums it), for the terminal meter ([`crate::meter`]), which must not wait out the write cap or read the file back.
     #[must_use]
     pub fn snapshot(&self) -> Option<ProgressFile> {
         self.inner.lock().ok().map(|st| {
@@ -380,14 +274,11 @@ impl ProgressSink {
     }
 }
 
-/// The writer must refresh `heartbeat_unix` at least this often, even with nothing to
-/// report — a reader's staleness window ([`HEARTBEAT_STALE_SECS`]) is only meaningful
-/// against a writer that keeps this promise.
+/// The writer must refresh `heartbeat_unix` at least this often, even with nothing to report — a reader's staleness window ([`HEARTBEAT_STALE_SECS`]) is only meaningful against a writer that keeps this promise.
 pub const HEARTBEAT_MIN_INTERVAL_SECS: u64 = 2;
 
 impl ProgressSink {
     /// Open a sink writing to `path` for the named pass, truncating any previous snapshot.
-    /// `None` when the path exists as anything but a regular file or the first write fails.
     #[must_use]
     pub fn create(path: &Path, pass: &str) -> Option<Self> {
         let clock = PassClock::for_new_sink();
@@ -417,10 +308,6 @@ impl ProgressSink {
         };
         let mut guard = sink.inner.lock().ok()?;
         write_now(&mut guard);
-        // `disabled` covers only a non-regular destination; a first write that simply
-        // failed (no prefix yet, not writable) leaves `last_write` None. A live sink over
-        // either would spin the heartbeat and every `.part` poller against a write that
-        // cannot land.
         if guard.disabled || guard.last_write.is_none() {
             return None;
         }
@@ -428,12 +315,7 @@ impl ProgressSink {
         Some(sink)
     }
 
-    /// Fix the pass's plan: the queue order and each planned program's signed asset
-    /// size. This is what makes the overall denominator honest and FIXED — already-
-    /// current programs are simply not in the plan and contribute zero. Publish
-    /// it before returning, bypassing the ordinary meter's write cap: a caller
-    /// may stop promising the pass only once its actual rows are readable.
-    /// Returns whether this publication landed.
+    /// Fix the pass's plan: the queue order and each planned program's signed asset size.
     pub fn plan(&self, planned: &[(String, u64)]) -> bool {
         let Ok(mut s) = self.inner.lock() else {
             return false;
@@ -461,8 +343,7 @@ impl ProgressSink {
         write_now(&mut s)
     }
 
-    /// Transfer a default-set pass's promise to its live planned rows. A stub reads
-    /// those rows from here on, including when the plan leaves its program out.
+    /// Transfer a default-set pass's promise to its live planned rows.
     pub(crate) fn plan_promised_pass(
         &self,
         layout: &crate::store::Layout,
@@ -473,8 +354,7 @@ impl ProgressSink {
         }
     }
 
-    /// Move `program` to `phase`, resetting the row's byte meter so a download count never
-    /// renders under an extract label.
+    /// Move `program` to `phase`, resetting the row's byte meter so a download count never renders under an extract label.
     pub fn phase(&self, program: &str, phase: Phase) {
         self.with(|s| {
             let row = s
@@ -510,9 +390,7 @@ impl ProgressSink {
         });
     }
 
-    /// Download meter: `done` of `total` bytes landed in the staged `.part`. Flips the
-    /// row to [`Phase::Download`] (the poller can observe bytes before the phase call
-    /// lands) and feeds the overall rollup's download credit.
+    /// Download meter: `done` of `total` bytes landed in the staged `.part`.
     pub fn download_bytes(&self, program: &str, done: u64, total: u64) {
         self.with(|s| {
             let done = if total > 0 { done.min(total) } else { done };
@@ -537,8 +415,7 @@ impl ProgressSink {
         });
     }
 
-    /// Size `program`'s extract meter (denominator: the signed `disk_installed` size,
-    /// 0 ⇒ unmetered) as its extract begins ([`extract_scope`]).
+    /// Size `program`'s extract meter (denominator: the signed `disk_installed` size, 0 ⇒ unmetered) as its extract begins ([`extract_scope`]).
     pub fn extract_begin(&self, program: &str, total: u64) {
         self.with(|s| {
             if let Some(row) = s.file.programs.get_mut(program) {
@@ -547,14 +424,10 @@ impl ProgressSink {
         });
     }
 
-    /// Credit `n` freshly-extracted bytes to `program`, flipping its row to
-    /// [`Phase::Extract`] on the first tick (the verify→extract boundary lives inside
-    /// `verify_and_stage`, which this module deliberately does not modify — the first
-    /// written byte IS that boundary).
+    /// Credit `n` freshly-extracted bytes to `program`, flipping its row to [`Phase::Extract`] on the first tick (the verify→extract boundary lives inside `verify_and_stage`, which this module deliberately does not modify — the first written byte IS that boundary).
     pub fn extract_add(&self, program: &str, n: u64) {
         self.with(|s| {
             // A download credit for this program is complete the moment extraction
-            // starts (the asset fully landed before its sha256 could pass).
             if let Some(credit) = s.dl.get_mut(program)
                 && credit.1 > 0
             {
@@ -571,8 +444,7 @@ impl ProgressSink {
         });
     }
 
-    /// Mark `program` bumped (a user asked for it via the bump file) and re-order the
-    /// visible queue to match the installer's re-sorted remainder.
+    /// Mark `program` bumped (a user asked for it via the bump file) and re-order the visible queue to match the installer's re-sorted remainder.
     pub fn bumped(&self, program: &str) {
         self.with(|s| {
             if let Some(row) = s.file.programs.get_mut(program)
@@ -584,9 +456,7 @@ impl ProgressSink {
         });
     }
 
-    /// Replace the remaining-order queue (front first). A second lane may have finished
-    /// a row since the caller assembled its order: retire terminal rows under this same
-    /// lock, so reordering cannot put one back in the queue.
+    /// Replace the remaining-order queue (front first).
     pub fn queue(&self, order: &[String]) {
         self.with(|s| {
             let order: Vec<String> = order
@@ -606,8 +476,6 @@ impl ProgressSink {
     }
 
     /// A program reached a terminal phase: `Done`, `Failed` (with its error) or `Skipped`.
-    /// Advances the overall counter and retires the program from the queue; `Done`
-    /// completes its download credit so the overall bar never regresses.
     pub fn finished(&self, program: &str, phase: Phase, error: Option<String>) {
         self.with(|s| {
             if let Some(row) = s.file.programs.get_mut(program) {
@@ -625,8 +493,7 @@ impl ProgressSink {
         });
     }
 
-    /// The clean-pass terminal snapshot: `pid` cleared, `ended_unix` stamped, written
-    /// unconditionally, so a reader can tell an ended pass from a dead writer.
+    /// The clean-pass terminal snapshot: `pid` cleared, `ended_unix` stamped, written unconditionally, so a reader can tell an ended pass from a dead writer.
     pub fn finish(&self) {
         if let Ok(mut s) = self.inner.lock() {
             s.file.pid = None;
@@ -644,16 +511,13 @@ impl ProgressSink {
         }
     }
 
-    /// A content-free tick: lets the write policy refresh `heartbeat_unix` if it is due. The
-    /// pass heartbeat thread calls it (see [`begin_pass`]).
+    /// A content-free tick: lets the write policy refresh `heartbeat_unix` if it is due.
     pub fn heartbeat(&self) {
         self.with(|_| {});
     }
 }
 
 /// The write policy: on change and ≥ [`WRITE_MIN_INTERVAL_MS`] since the last write, plus
-/// an unconditional heartbeat refresh every [`HEARTBEAT_MIN_INTERVAL_SECS`] so a quiet
-/// transfer never lets a live writer's file go stale.
 fn maybe_write(s: &mut SinkState) {
     if s.disabled {
         return;
@@ -669,8 +533,6 @@ fn maybe_write(s: &mut SinkState) {
 }
 
 /// Serialize and land the snapshot atomically (temp + rename), refreshing the heartbeat
-/// and the overall download rollup. A non-regular file at the path (symlink, FIFO) disables
-/// the sink rather than being written through. Best-effort: progress is diagnostics.
 fn write_now(s: &mut SinkState) -> bool {
     if s.disabled {
         return false;
@@ -704,22 +566,7 @@ fn write_now(s: &mut SinkState) -> bool {
     }
 }
 
-// The process-global sink and its flow hooks.
-//
-// The download/extract meters live deep inside `flow`/`extract`, behind API
-// signatures shared with every caller and test in this workspace. The sink is
-// therefore process-global — which is also simply TRUE to the domain: at most one
-// process holds the store flock, and that process runs at most one pass at a time.
-// The slot's `enabled` flag keeps the disabled path to one relaxed atomic load, so the
-// extract loop's per-chunk tick costs nothing when no pass is live (a pipe with no
-// `--progress-file`, every test that begins none).
-
-/// The wait both pass-owned threads use between ticks: hold for `tick`, but return as soon
-/// as [`stop_and_join`] raises `stop`. The joiner is the pass thread, which holds the store
-/// flock, so an uninterruptible `sleep` would idle it for the rest of a tick on every
-/// download and at [`end_pass`]. The unpark token is sticky, so a stop landing between the
-/// flag check and the park makes the next park return at once; the deadline is recomputed
-/// because `park_timeout` may return early, so the cadence stays exactly `tick`.
+/// The wait both pass-owned threads use between ticks: hold for `tick`, but return as soon as [`stop_and_join`] raises `stop`.
 pub(crate) fn tick_or_stop(stop: &AtomicBool, tick: Duration) {
     let deadline = Instant::now() + tick;
     while !stop.load(Ordering::Acquire) {
@@ -731,7 +578,6 @@ pub(crate) fn tick_or_stop(stop: &AtomicBool, tick: Duration) {
 }
 
 /// Stop a thread parked in [`tick_or_stop`] and join it: raise the flag, unpark, then join.
-/// The order matters: a thread woken by the unpark must see the flag.
 pub(crate) fn stop_and_join(stop: &AtomicBool, handle: Option<std::thread::JoinHandle<()>>) {
     stop.store(true, Ordering::Release);
     if let Some(h) = handle {
@@ -741,21 +587,15 @@ pub(crate) fn stop_and_join(stop: &AtomicBool, handle: Option<std::thread::JoinH
 }
 
 /// The pass heartbeat: a thread that ticks the live sink every [`HEARTBEAT_TICK_MS`] for the
-/// whole pass, independent of flow calls, so a phase with no sink calls (a multi-GB Verify,
-/// an Extract) never ages the file past [`HEARTBEAT_STALE_SECS`]. Spawned in
-/// [`begin_pass`], stopped and joined in [`end_pass`].
 struct PassHeartbeat {
     stop: Arc<AtomicBool>,
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
 /// How often the pass heartbeat ticks: well under [`HEARTBEAT_MIN_INTERVAL_SECS`] (the write
-/// policy decides whether a tick lands) and the readers' [`HEARTBEAT_STALE_SECS`].
 const HEARTBEAT_TICK_MS: u64 = 500;
 
 /// The tick a pass-owned thread spawned now parks for: `ms`, unless a test set
-/// `TICK_OVERRIDE` on the spawning thread (read there and moved into the new thread, so no
-/// other test's threads see it). Plain backticks: the override is `cfg(test)`.
 fn pass_tick(ms: u64) -> Duration {
     #[cfg(test)]
     {
@@ -769,7 +609,6 @@ fn pass_tick(ms: u64) -> Duration {
 #[cfg(test)]
 thread_local! {
     /// Tests only: the tick [`pass_tick`] hands the pass-owned threads this thread spawns.
-    /// The doc sits inside the macro: on the invocation it is `unused_doc_comments`.
     static TICK_OVERRIDE: std::cell::Cell<Option<Duration>> =
         const { std::cell::Cell::new(None) };
 }
@@ -799,17 +638,7 @@ impl PassHeartbeat {
 /// Where an orphaned pass's output goes, beside `progress.json`: `<prefix>/orphan-pass.log`.
 pub const ORPHAN_LOG_NAME: &str = "orphan-pass.log";
 
-/// Keep an orphaned pass working. A window's pass child has stdout and stderr piped to the
-/// window; once the window exits under it (a self-update exec, a quit-and-reopen) nobody
-/// reads the pipes, Rust leaves SIGPIPE ignored, and the next print panics on EPIPE with the
-/// flock held.
-///
-/// `crate::cli::main_entry` arms this when the spawner passed `--wait-lock` (the window
-/// always does; a typed `aterm pkg update` never does). Every [`ORPHAN_POLL_MS`] the thread
-/// checks for a changed parent ([`crate::cli::parent_is_gone`]) or a stdio pipe with no
-/// reader ([`stdio_lost_its_reader`]), then points fds 1 and 2 at `log` once; the successor
-/// window tails `progress.json`. A print in the gap before the next poll still dies, costing
-/// one program's redo on a crash-consistent store (`crate::lock`).
+/// Keep an orphaned pass working.
 pub fn watch_for_orphaning(log: PathBuf) {
     let _ = std::thread::Builder::new()
         .name("atpkg-orphan-watch".into())
@@ -825,9 +654,6 @@ pub fn watch_for_orphaning(log: PathBuf) {
 }
 
 /// Whether fd 1 or fd 2 is a pipe with no reader, which a parent that `exec`s in place
-/// produces without changing its pid. On macOS, `poll(2)` with `POLLOUT` on a pipe's write
-/// end reports `POLLHUP` once the read end closes (nothing when no events are requested); a
-/// tty or regular file reports `POLLOUT` alone. `POLLERR`/`POLLNVAL` count as gone too.
 #[cfg(unix)]
 fn stdio_lost_its_reader() -> bool {
     let mut fds = [
@@ -842,8 +668,7 @@ fn stdio_lost_its_reader() -> bool {
             revents: 0,
         },
     ];
-    // SAFETY: `poll` reads and writes only the array handed to it, for its stated
-    // length, and a zero timeout never blocks.
+    // SAFETY: `poll` reads and writes only the array handed to it, for its stated length, and a zero timeout never blocks.
     let rc = unsafe { libc::poll(fds.as_mut_ptr(), 2, 0) };
     if rc < 0 {
         return false;
@@ -858,11 +683,9 @@ fn stdio_lost_its_reader() -> bool {
 }
 
 /// How often the orphan watch polls: each poll is two cheap syscalls, so the residual
-/// EPIPE window, not the cost, sets it.
 const ORPHAN_POLL_MS: u64 = 100;
 
 /// Point stdout and stderr at `log` (appended, `0600`) and say so there. A log that cannot
-/// be opened leaves the fds alone.
 #[cfg(unix)]
 fn quiet_stdio(log: &Path) {
     use std::os::unix::fs::OpenOptionsExt as _;
@@ -876,9 +699,7 @@ fn quiet_stdio(log: &Path) {
         return;
     };
     let fd = file.as_raw_fd();
-    // SAFETY: `dup2` re-points fds 1 and 2 at an open file this process owns; `file` is
-    // leaked right after, so its descriptor stays valid for the rest of the process. No
-    // other thread relies on what fds 1 and 2 are.
+    // SAFETY: `dup2` re-points fds 1 and 2 at an open file this process owns; `file` is leaked right after, so its descriptor stays valid for the rest of the process.
     unsafe {
         libc::dup2(fd, 1);
         libc::dup2(fd, 2);
@@ -895,8 +716,6 @@ fn quiet_stdio(log: &Path) {
 fn quiet_stdio(_log: &Path) {}
 
 /// A process's live pass: its sink, the thread that owns it and its heartbeat — at most
-/// one at a time ([`begin_pass`]) — and whether one is live, the one atomic load the
-/// flow hooks' idle path costs.
 struct PassSlot {
     live: Mutex<Option<(ProgressSink, std::thread::ThreadId, PassHeartbeat)>>,
     enabled: AtomicBool,
@@ -915,9 +734,6 @@ impl PassSlot {
 static PROCESS_PASS: PassSlot = PassSlot::new();
 
 /// The pass slot this thread's calls answer to: [`PROCESS_PASS`], in every build. A test
-/// thread may hold one of its own (`own_pass_slot`), and lends it with its pass
-/// ([`lend`]), so tests that begin passes run side by side, each its own process's one
-/// pass, and none sees another's — the production rule, one slot per process, unbent.
 fn slot() -> &'static PassSlot {
     #[cfg(test)]
     {
@@ -935,10 +751,7 @@ thread_local! {
         const { std::cell::Cell::new(None) };
 }
 
-/// TESTS ONLY: give this thread a pass slot of its own until the guard drops — a test
-/// that begins a pass sees no other test's, and none sees its. The slot is leaked (a few
-/// words per test); a pass a failing test left live is stopped on drop, its heartbeat
-/// joined, so no thread outlives the test.
+/// TESTS ONLY: give this thread a pass slot of its own until the guard drops — a test that begins a pass sees no other test's, and none sees its.
 #[cfg(test)]
 pub(crate) fn own_pass_slot() -> OwnPassSlot {
     let own: &'static PassSlot = Box::leak(Box::new(PassSlot::new()));
@@ -972,16 +785,7 @@ impl Drop for OwnPassSlot {
     }
 }
 
-/// Install the process-global sink for one pass, owned by the calling thread. `false` (and
-/// no change) when a pass is already live or the file cannot be created; callers then
-/// proceed without progress.
-///
-/// Thread affinity is truthful, not defensive convenience: a real pass runs the
-/// install pipeline on the thread that holds the store flock (the `.part` pollers carry
-/// their own sink clone and never come back through here), and a lane thread it starts
-/// inside the pass is handed the pass explicitly ([`lend`]), so [`active`] answering
-/// only those threads costs production nothing — and keeps a concurrently-running test's
-/// installs from crediting a pass they are not part of.
+/// Install the process-global sink for one pass, owned by the calling thread.
 pub fn begin_pass(path: &Path, pass: &str) -> bool {
     let slot = slot();
     let Ok(mut g) = slot.live.lock() else {
@@ -993,15 +797,13 @@ pub fn begin_pass(path: &Path, pass: &str) -> bool {
     let Some(sink) = ProgressSink::create(path, pass) else {
         return false;
     };
-    // Its own clone: the heartbeat thread is not the owner `active()` answers.
     let heartbeat = PassHeartbeat::spawn(sink.clone());
     *g = Some((sink, std::thread::current().id(), heartbeat));
     slot.enabled.store(true, Ordering::Release);
     true
 }
 
-/// Write the terminal snapshot and retire the global sink. Safe to call without a
-/// live pass (no-op). Only the pass-owning thread ends it.
+/// Write the terminal snapshot and retire the global sink.
 pub fn end_pass() {
     let slot = slot();
     let Ok(mut g) = slot.live.lock() else {
@@ -1012,16 +814,12 @@ pub fn end_pass() {
         && let Some((sink, _, heartbeat)) = g.take()
     {
         slot.enabled.store(false, Ordering::Release);
-        // Heartbeat first: a tick after the terminal snapshot would restamp a live
-        // heartbeat onto a pid-cleared file.
         heartbeat.stop();
         sink.finish();
     }
 }
 
-/// The live pass's sink — for the OWNING thread (see [`begin_pass`]), and for a lane
-/// thread that owner started and LENT it to ([`lend`]). One relaxed load answers "no pass
-/// anywhere" for free.
+/// The live pass's sink — for the OWNING thread (see [`begin_pass`]), and for a lane thread that owner started and LENT it to ([`lend`]).
 #[must_use]
 pub fn active() -> Option<ProgressSink> {
     let slot = slot();
@@ -1043,18 +841,14 @@ thread_local! {
     /// The pass a lane thread was lent ([`Lent::adopt`]): what [`active`] answers on it.
     static LENT: std::cell::RefCell<Option<ProgressSink>> = const { std::cell::RefCell::new(None) };
     /// The program THIS thread's extract loop credits ([`extract_scope`]): two lanes of one
-    /// pass extract at once, each into its own row.
     static EXTRACTING: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
 }
 
-/// The live pass, as its owning thread hands it to a lane thread it starts — one that lands
-/// programs beside the owner's own, inside the pass and under its store lock. Empty when no
-/// pass is live, or off the owning thread.
+/// The live pass, as its owning thread hands it to a lane thread it starts — one that lands programs beside the owner's own, inside the pass and under its store lock.
 #[derive(Clone)]
 pub struct Lent {
     sink: Option<ProgressSink>,
     /// TESTS ONLY: the lender's own pass slot (`own_pass_slot`), which the lane answers
-    /// to while it holds the pass — [`active`]'s first load is that slot's.
     #[cfg(test)]
     slot: Option<&'static PassSlot>,
 }
@@ -1070,9 +864,7 @@ pub fn lend() -> Lent {
 }
 
 impl Lent {
-    /// Credit this thread's flow hooks to the lent pass until the guard drops. The owner
-    /// joins the thread before it ends the pass, and an ended pass is credited by no one
-    /// ([`active`]'s first load).
+    /// Credit this thread's flow hooks to the lent pass until the guard drops.
     #[must_use]
     pub fn adopt(self) -> Adopted {
         LENT.with(|lent| *lent.borrow_mut() = self.sink);
@@ -1101,9 +893,7 @@ impl Drop for Adopted {
     }
 }
 
-/// The live pass's snapshot, from any thread: [`active`] answers only the pass's own
-/// thread, and the terminal meter ([`crate::meter`]) draws from a thread of its own. Read
-/// only: nothing reached through this can move the pass.
+/// The live pass's snapshot, from any thread: [`active`] answers only the pass's own thread, and the terminal meter ([`crate::meter`]) draws from a thread of its own.
 #[must_use]
 pub fn live_snapshot() -> Option<ProgressFile> {
     let slot = slot();
@@ -1132,18 +922,14 @@ pub fn note_build(program: &str, build: u64) {
     }
 }
 
-/// Flow hook: `program`'s download of `total` signed bytes is complete, and its row waits
-/// for the stage at that whole size ([`ProgramProgress::downloaded`]) — the set completion's
-/// download-ahead lane finishes archives the pass reaches later.
+/// Flow hook: `program`'s download of `total` signed bytes is complete, and its row waits for the stage at that whole size ([`ProgramProgress::downloaded`]) — the set completion's download-ahead lane finishes archives the pass reaches later.
 pub fn note_downloaded(program: &str, total: u64) {
     if let Some(sink) = active() {
         sink.download_bytes(program, total, total);
     }
 }
 
-/// Flow hook: credit `n` extracted bytes to this thread's extract program (the loop
-/// itself cannot name it). Called from `write_capped`'s 64 KiB loop — the one in-process
-/// byte loop — so the disabled path must stay one atomic load.
+/// Flow hook: credit `n` extracted bytes to this thread's extract program (the loop itself cannot name it).
 pub fn extract_tick(n: u64) {
     if !slot().enabled.load(Ordering::Relaxed) {
         return;
@@ -1169,8 +955,7 @@ pub fn extract_scope(program: &str, total: u64) -> ExtractScope {
     }
 }
 
-/// Ends the extract crediting scope on drop (panic-safe, so a failing stage can
-/// never leave a later program's extract bytes credited to this one).
+/// Ends the extract crediting scope on drop (panic-safe, so a failing stage can never leave a later program's extract bytes credited to this one).
 pub struct ExtractScope {
     live: bool,
 }
@@ -1184,15 +969,9 @@ impl Drop for ExtractScope {
 }
 
 /// How often the `.part` poller stats the growing asset: the 10 Hz the sink's
-/// own write cap is sized for.
 const PART_POLL_TICK_MS: u64 = 100;
 
 /// Flow hook: watch a growing `<asset>.part` while a download runs.
-///
-/// Downloads run in a curl child, so a poller thread stats the `.part` against the signed
-/// `artifact.size` and feeds [`ProgressSink::download_bytes`], which also keeps the
-/// heartbeat fresh. The guard stops, wakes and joins the thread on drop ([`tick_or_stop`]);
-/// with no live pass it spawns nothing.
 #[must_use]
 pub fn watch_download(program: &str, asset_path: &Path, total: u64) -> DownloadWatch {
     let Some(sink) = active() else {
@@ -1203,8 +982,6 @@ pub fn watch_download(program: &str, asset_path: &Path, total: u64) -> DownloadW
     };
     sink.phase(program, Phase::Download);
     sink.download_bytes(program, 0, total);
-    // `<asset>.part` appended, as `aterm_update_core`'s `part_path` names it (never
-    // `with_extension`, which would collide across builds).
     let Some(name) = asset_path.file_name() else {
         return DownloadWatch {
             stop: Arc::new(AtomicBool::new(true)),
@@ -1229,7 +1006,6 @@ pub fn watch_download(program: &str, asset_path: &Path, total: u64) -> DownloadW
                     sink.download_bytes(&program, m.len(), total);
                 } else {
                     // No .part (yet, or a dir-registry copy): still let the sink
-                    // refresh its heartbeat through the rate-cap policy.
                     sink.download_bytes(&program, 0, total);
                 }
                 tick_or_stop(&stop2, tick);
@@ -1251,12 +1027,7 @@ impl Drop for DownloadWatch {
     }
 }
 
-// The readers: untrusted progress and bump access.
-
-/// Read `<prefix>/progress.json` under the untrusted-reader rules: symlink-refusing bounded
-/// open ([`crate::metadata_io`]), [`PROGRESS_READ_CAP`], malformed or oversize ⇒ `None`.
-/// The snapshot is still data: apply [`snapshot_running`] before rendering live state and
-/// sanitize every string bound for a TTY.
+/// Read `<prefix>/progress.json` under the untrusted-reader rules: symlink-refusing bounded open ([`crate::metadata_io`]), [`PROGRESS_READ_CAP`], malformed or oversize ⇒ `None`.
 #[must_use]
 pub fn read_progress(layout: &crate::store::Layout) -> Option<ProgressFile> {
     let cap = usize::try_from(PROGRESS_READ_CAP).unwrap_or(usize::MAX);
@@ -1264,9 +1035,7 @@ pub fn read_progress(layout: &crate::store::Layout) -> Option<ProgressFile> {
     aterm_json::from_str(&text).ok()
 }
 
-/// Whether `file` was written by an installer running now: a live pid and a heartbeat
-/// within [`HEARTBEAT_STALE_SECS`] of `now_unix` in either direction (a far-future stamp
-/// from backward clock skew is stale too). A cleared pid is not running.
+/// Whether `file` was written by an installer running now: a live pid and a heartbeat within [`HEARTBEAT_STALE_SECS`] of `now_unix` in either direction (a far-future stamp from backward clock skew is stale too).
 #[must_use]
 pub fn snapshot_running(file: &ProgressFile, now_unix: u64) -> bool {
     let Some(pid) = file.pid else {
@@ -1278,24 +1047,19 @@ pub fn snapshot_running(file: &ProgressFile, now_unix: u64) -> bool {
     fresh && pid_alive(pid)
 }
 
-/// Whether a pass is installing on `layout`'s store now ([`snapshot_running`]): what a
-/// scheduler reads beside `status.toml` so it never queues a pass behind one in flight.
+/// Whether a pass is installing on `layout`'s store now ([`snapshot_running`]): what a scheduler reads beside `status.toml` so it never queues a pass behind one in flight.
 #[must_use]
 pub fn pass_running(layout: &crate::store::Layout, now_unix: u64) -> bool {
     read_progress(layout).is_some_and(|file| snapshot_running(&file, now_unix))
 }
 
-/// Shared kernel pid liveness: Unix signal-zero and Windows process-handle probes
-/// both distinguish a dead owner from an existing process we may not query. A
-/// promise ends with its owner on either platform, without spawning a child.
+/// Shared kernel pid liveness: Unix signal-zero and Windows process-handle probes both distinguish a dead owner from an existing process we may not query.
 #[must_use]
 pub(crate) fn pid_alive(pid: u32) -> bool {
     aterm_uds::process::pid_alive(pid)
 }
 
-/// Strip control characters (terminal escape-sequence injection) and cap length
-/// before a progress/status string reaches a TTY. The cap is in characters, applied
-/// after the strip; an elided tail is marked so truncation is visible.
+/// Strip control characters (terminal escape-sequence injection) and cap length before a progress/status string reaches a TTY.
 #[must_use]
 pub fn sanitize_for_tty(s: &str, cap: usize) -> String {
     let mut out = String::new();
@@ -1312,11 +1076,9 @@ pub fn sanitize_for_tty(s: &str, cap: usize) -> String {
 /// Who asked for a program the bump file names ([`append_bump`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Asker {
-    /// A person at a terminal: the stub's stdin and stderr are both terminals. A plain name
-    /// line, the only line the file ever held, so an older reader and an older writer agree.
+    /// A person at a terminal: the stub's stdin and stderr are both terminals.
     Person,
-    /// A script, a pipe or an agent's tool call: the name and [`UNATTENDED_BUMP`] on one
-    /// line. An older reader takes the line for a name no pass plans, and ignores it.
+    /// A script, a pipe or an agent's tool call: the name and [`UNATTENDED_BUMP`] on one line.
     Script,
 }
 
@@ -1332,18 +1094,12 @@ pub struct Bump {
     pub person: bool,
 }
 
-/// Append `program` to `<prefix>/bump` — the stub's whole write privilege — as `asker`'s
-/// line. The path is refused unless absent or a regular non-link file (`symlink_metadata`
-/// before open, `O_NOFOLLOW` on the open itself where the OS has it), and the name arrives
-/// as an already-admitted [`crate::store::ToolName`] so nothing shim-refused can be
-/// written. Append-only: the installer is the only consumer and deleter.
+/// Append `program` to `<prefix>/bump` — the stub's whole write privilege — as `asker`'s line.
 pub fn append_bump(
     layout: &crate::store::Layout,
     program: &crate::store::ToolName,
     asker: Asker,
 ) -> std::io::Result<()> {
-    // A prefix that does not exist yet still records the wish (the first provisioning pass
-    // is the one to front-load). Through the layout so a system prefix keeps its mode.
     layout.ensure_dir(&layout.prefix)?;
     let path = layout.bump_file();
     match std::fs::symlink_metadata(&path) {
@@ -1373,11 +1129,7 @@ pub fn append_bump(
     f.write_all(line.as_bytes())
 }
 
-/// Read the bump file's admitted names, in file order, first mention wins, each with
-/// whether a person asked for it on any line: size-capped ([`BUMP_READ_CAP`], oversize ⇒
-/// absent), symlink-refusing, each name gated through [`crate::store::ToolName`]. Garbage
-/// lines are ignored. The caller STILL intersects with its own planned work — this
-/// returns candidate names, never authority.
+/// Read the bump file's admitted names, in file order, first mention wins, each with whether a person asked for it on any line: size-capped ([`BUMP_READ_CAP`], oversize ⇒ absent), symlink-refusing, each name gated through [`crate::store::ToolName`].
 #[must_use]
 pub fn read_bumps(layout: &crate::store::Layout) -> Vec<Bump> {
     let cap = usize::try_from(BUMP_READ_CAP).unwrap_or(usize::MAX);
@@ -1408,8 +1160,7 @@ pub fn read_bumps(layout: &crate::store::Layout) -> Vec<Bump> {
     out
 }
 
-/// The bump file's admitted names, whoever asked ([`read_bumps`]): what reorders a pass's
-/// remaining work and wakes a window's pass.
+/// The bump file's admitted names, whoever asked ([`read_bumps`]): what reorders a pass's remaining work and wakes a window's pass.
 #[must_use]
 pub fn read_bump(layout: &crate::store::Layout) -> Vec<String> {
     read_bumps(layout).into_iter().map(|b| b.program).collect()
@@ -1420,32 +1171,13 @@ pub fn clear_bump(layout: &crate::store::Layout) {
     let _ = std::fs::remove_file(layout.bump_file());
 }
 
-// The promise: `pass-owed.json`.
-//
-// `progress.json` appears only once a pass begins, seconds into a first launch: the
-// window's seed lays the pending stubs and the shell hooks within milliseconds, and the
-// update it spawns next resolves the index and plans before it writes a plan. A stub run
-// in between used to find nothing installing and exit 127. The promise says a default-set
-// pass is coming and has not planned yet: written under the store lock by whoever knows
-// it is owed — the window's seed on a first run, its process the owner; a whole update
-// that completes the set on a first install or over a promise it finds, itself the owner —
-// and retired by that update once its plan lands or it ends (an update retires only its own
-// promise or its spawner's, [`retire_promise_of`]). A promise names a deadline and an owner
-// — its pid and, where it can be read, its start time — and lapses at either. No
-// other reader looks at it: to every `progress.json` reader nothing is running until the
-// pass begins.
-
 /// Read cap for `pass-owed.json`; a larger file reads as no promise.
 pub const PROMISE_READ_CAP: usize = 1024;
 
-/// How long the window's seed promises the update it spawns next (the login shell's PATH
-/// is that update's only wait, five seconds at most).
+/// How long the window's seed promises the update it spawns next (the login shell's PATH is that update's only wait, five seconds at most).
 pub const SEED_PROMISE_SECS: u64 = 60;
 
-/// How long a whole update promises its own plan: its index resolve, vendor lane and
-/// manifest prefetch come first. It retires the promise itself, and its death breaks it —
-/// a pid a crash freed for another process included ([`PassPromise::born`]) — so this bounds
-/// only an owner that hangs before it plans, or one whose start time no reader could read.
+/// How long a whole update promises its own plan: its index resolve, vendor lane and manifest prefetch come first.
 pub const PASS_PROMISE_SECS: u64 = 10 * 60;
 
 /// `pass-owed.json`: the process the promise rides on and when it lapses.
@@ -1453,24 +1185,16 @@ pub const PASS_PROMISE_SECS: u64 = 10 * 60;
 pub struct PassPromise {
     /// Schema version ([`PROGRESS_VERSION`]); any other reads as no promise.
     pub v: u32,
-    /// The pid whose death breaks the promise: the window that will spawn the pass, or
-    /// the pass itself.
+    /// The pid whose death breaks the promise: the window that will spawn the pass, or the pass itself.
     pub owner: u32,
     /// Unix seconds after which the promise is broken.
     pub until_unix: u64,
-    /// The owner's start time as the writer read it ([`crate::platform::process_birth`]): a
-    /// process that took over the pid of an owner that died does not keep the promise. A
-    /// field an older reader ignores, so it keeps reading the promise by the pid alone; a
-    /// promise without it (an older writer's, or one whose writer could not read it) is read
-    /// that way too, and so is one whose READER cannot ([`same_owner`]).
+    /// The owner's start time as the writer read it ([`crate::platform::process_birth`]): a process that took over the pid of an owner that died does not keep the promise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub born: Option<u64>,
 }
 
-/// Promise a default-set pass on `layout`'s store until `owner` dies or `secs` pass. The
-/// caller holds the store lock. Lands atomically (temp + rename, `0600`), never through a
-/// symlink or anything else that is not a regular file. Best-effort: a promise that
-/// cannot be written leaves a stub where it was before (exit 127).
+/// Promise a default-set pass on `layout`'s store until `owner` dies or `secs` pass.
 pub fn promise_pass(layout: &crate::store::Layout, owner: u32, secs: u64) {
     let path = layout.pass_owed_file();
     if std::fs::symlink_metadata(&path).is_ok_and(|m| !m.file_type().is_file()) {
@@ -1486,8 +1210,6 @@ pub fn promise_pass(layout: &crate::store::Layout, owner: u32, secs: u64) {
         return;
     };
     let tmp = path.with_file_name(format!("pass-owed.json.tmp-{}", std::process::id()));
-    // Only a newly created temp belongs to this call. A colliding entry may be
-    // a FIFO or a hardlink to unrelated metadata; never open or remove it.
     let Ok(mut file) = crate::platform::create_private_new(&tmp) else {
         return;
     };
@@ -1504,11 +1226,7 @@ pub fn retire_promise(layout: &crate::store::Layout) {
     let _ = std::fs::remove_file(layout.pass_owed_file());
 }
 
-/// Retire the promise only when one of `holders` owns it: an update ending retires the
-/// promise it wrote, or the seed's of the window that spawned it — never one another
-/// window's seed wrote for the update that window spawns next. The caller holds the store
-/// lock, as every writer does, so nothing replaces the file between the read and the
-/// removal. An unreadable promise is left as it is (it promises nothing).
+/// Retire the promise only when one of `holders` owns it: an update ending retires the promise it wrote, or the seed's of the window that spawned it — never one another window's seed wrote for the update that window spawns next.
 pub fn retire_promise_of(layout: &crate::store::Layout, holders: &[u32]) {
     if read_promise(layout).is_some_and(|promise| holders.contains(&promise.owner)) {
         retire_promise(layout);
@@ -1523,11 +1241,7 @@ fn read_promise(layout: &crate::store::Layout) -> Option<PassPromise> {
     aterm_json::from_str::<PassPromise>(&text).ok()
 }
 
-/// Whether a promised pass is still coming at `now_unix`: a readable promise (bounded,
-/// symlink-refusing, [`PROMISE_READ_CAP`]) whose deadline has not passed — nor lies
-/// further ahead than any writer promises, a clock that stepped back — and whose owner is
-/// alive ([`pid_alive`]) and, when the writer read its start time, the same process that
-/// wrote it ([`same_owner`]): a pid a crash freed and another process took promises nothing.
+/// Whether a promised pass is still coming at `now_unix`: a readable promise (bounded, symlink-refusing, [`PROMISE_READ_CAP`]) whose deadline has not passed — nor lies further ahead than any writer promises, a clock that stepped back — and whose owner is alive ([`pid_alive`]) and, when the writer read its start time, the same process that wrote it ([`same_owner`]): a pid a crash freed and another process took promises nothing.
 #[must_use]
 pub fn pass_owed(layout: &crate::store::Layout, now_unix: u64) -> bool {
     let Some(promise) = read_promise(layout) else {
@@ -1540,12 +1254,7 @@ pub fn pass_owed(layout: &crate::store::Layout, now_unix: u64) -> bool {
         && same_owner(promise.born, crate::platform::process_birth(promise.owner))
 }
 
-/// Whether the process under a promise's owner pid, whose start time reads `now`, is the one
-/// the writer read as `born`: no recorded start time ⇒ the pid alone answers; another start
-/// time, or nothing under the pid (a zombie), ⇒ another process, or none; a start time the
-/// reader cannot read — a stub run in a sandbox that denies process-info, where `kill(pid, 0)`
-/// still answers ([`pid_alive`]) — says nothing, and the pid alone answers, as it does for
-/// `EPERM` there. Pure for the test.
+/// Whether the process under a promise's owner pid, whose start time reads `now`, is the one the writer read as `born`: no recorded start time ⇒ the pid alone answers; another start time, or nothing under the pid (a zombie), ⇒ another process, or none; a start time the reader cannot read — a stub run in a sandbox that denies process-info, where `kill(pid, 0)` still answers ([`pid_alive`]) — says nothing, and the pid alone answers, as it does for `EPERM` there.
 #[must_use]
 pub fn same_owner(born: Option<u64>, now: crate::platform::Birth) -> bool {
     use crate::platform::Birth;
@@ -1579,14 +1288,12 @@ mod tests {
         assert_eq!(trust.bytes_done, 4_300_800);
         assert_eq!(trust.build, Some(210));
         assert!(trust.bumped && trust.error.is_none());
-        // Round-trip: serialize → parse → identical.
         let reparsed: ProgressFile =
             aterm_json::from_str(&aterm_json::to_string(&parsed).unwrap()).unwrap();
         assert_eq!(reparsed, parsed);
     }
 
     /// The wire vocabulary, pinned string by string: a renamed variant is a protocol
-    /// break for every reader, and this is the test that makes it loud.
     #[test]
     fn phase_strings_are_the_documented_lowercase_vocabulary() {
         for (phase, wire) in [
@@ -1605,7 +1312,6 @@ mod tests {
     }
 
     /// A newer writer's extra fields never break an older reader, and a minimal snapshot
-    /// degrades to the safe reading (no pid, epoch-stale heartbeat), not a parse failure.
     #[test]
     fn unknown_fields_are_ignored_and_missing_fields_fail_safe() {
         let future = r#"{"v":1, "hologram":true,
@@ -1617,7 +1323,6 @@ mod tests {
             "a missing heartbeat is epoch-stale — the safe direction"
         );
         assert_eq!(parsed.programs["trust"].phase, Phase::Done);
-        // An unknown version still parses the envelope; the reader renders the generic line.
         let v2: ProgressFile = aterm_json::from_str(r#"{"v":2}"#).unwrap();
         assert_ne!(v2.v, PROGRESS_VERSION);
     }
@@ -1640,7 +1345,6 @@ mod writer_tests {
     }
 
     /// The writer's landing is atomic (temp+rename — no temp survives) and the pass
-    /// start truncates: a stale snapshot from a previous run never bleeds through.
     #[test]
     fn create_truncates_and_leaves_no_temp() {
         let l = layout("create");
@@ -1662,7 +1366,6 @@ mod writer_tests {
     }
 
     /// The terminal snapshot: `finish` clears the pid, stamps `ended_unix`, and writes
-    /// unconditionally (no rate cap can swallow the last word).
     #[test]
     fn finish_writes_the_terminal_snapshot() {
         let l = layout("finish");
@@ -1704,8 +1407,6 @@ mod writer_tests {
     }
 
     /// A first write that cannot land (the prefix does not exist yet, or is not writable)
-    /// yields no sink, so [`begin_pass`] reports no pass rather than an owned one whose file
-    /// never appears.
     #[test]
     fn writer_refuses_a_destination_the_first_write_cannot_reach() {
         let l = layout("unreachable");
@@ -1731,12 +1432,11 @@ mod writer_tests {
     }
 
     /// Staleness is the reader's law: a fresh-heartbeat live-pid file is running; a
-    /// cleared pid, an old heartbeat, or a far-future heartbeat (backward skew) is not.
     #[test]
     fn snapshot_running_applies_the_heartbeat_window() {
         let now = 1_000_000u64;
         let mut file: ProgressFile = aterm_json::from_str(r#"{"v":1}"#).unwrap();
-        file.pid = Some(std::process::id()); // this test process: provably alive
+        file.pid = Some(std::process::id());
         file.heartbeat_unix = now;
         assert!(snapshot_running(&file, now));
         file.heartbeat_unix = now - HEARTBEAT_STALE_SECS - 1;
@@ -1755,7 +1455,6 @@ mod writer_tests {
     }
 
     /// A scheduler's in-flight read: no file, a file whose writer ended or went stale,
-    /// and a live writer's — only the last is a pass running now.
     #[test]
     fn pass_running_reads_a_live_writer_off_the_progress_file() {
         let l = layout("pass-running");
@@ -1777,7 +1476,6 @@ mod writer_tests {
     }
 
     /// A pid we may not signal (`EPERM`; pid 1 stands in for another user's installer) still
-    /// exists, so its fresh heartbeat reads as running.
     #[cfg(unix)]
     #[test]
     fn pid_alive_reads_an_unsignalable_foreign_pid_as_alive() {
@@ -1793,10 +1491,7 @@ mod writer_tests {
             snapshot_running(&file, 1_000_000),
             "a fresh heartbeat from a live pid we cannot signal is a RUNNING installer"
         );
-        // Wider than `pid_t`: cannot name a process.
         assert!(!pid_alive(u32::MAX), "an impossible pid is not alive");
-        // A reaped child's pid is known dead (`ESRCH`, the one "no"): a crashed installer's
-        // record never reads as running under a fresh heartbeat.
         let mut child = std::process::Command::new("/usr/bin/true")
             .spawn()
             .expect("spawn /usr/bin/true");
@@ -1808,7 +1503,6 @@ mod writer_tests {
     }
 
     /// TTY sanitization: control characters (escape injection) stripped, length capped
-    /// with a visible elision.
     #[test]
     fn sanitize_for_tty_strips_and_caps() {
         assert_eq!(sanitize_for_tty("plain error", 64), "plain error");
@@ -1821,8 +1515,6 @@ mod writer_tests {
     }
 
     /// The bump channel: appended names round-trip; garbage and shim-refused names
-    /// are ignored; an oversized file reads as absent; a symlinked bump is refused on
-    /// both the append and the read.
     #[test]
     fn bump_round_trips_and_refuses_garbage() {
         let l = layout("bump");
@@ -1830,16 +1522,14 @@ mod writer_tests {
         let ty = crate::store::ToolName::new("ty").unwrap();
         append_bump(&l, &trust, Asker::Person).unwrap();
         append_bump(&l, &ty, Asker::Person).unwrap();
-        append_bump(&l, &trust, Asker::Person).unwrap(); // duplicate: first mention wins
+        append_bump(&l, &trust, Asker::Person).unwrap();
         assert_eq!(read_bump(&l), vec!["trust".to_string(), "ty".to_string()]);
-        // Garbage lines: ignored, never a crash, never a name.
         std::fs::write(l.bump_file(), "sudo\n../evil\na/b\ntrust\n\n").unwrap();
         assert_eq!(
             read_bump(&l),
             vec!["trust".to_string()],
             "shim-refused and malformed names never come back"
         );
-        // Oversize ⇒ absent.
         std::fs::write(l.bump_file(), "x".repeat(BUMP_READ_CAP as usize + 1)).unwrap();
         assert!(read_bump(&l).is_empty());
         clear_bump(&l);
@@ -1848,8 +1538,6 @@ mod writer_tests {
     }
 
     /// A script's bump names its program as a person's does, for every reader that orders
-    /// work by it, and says nobody at a terminal asked: a person's line for the same name,
-    /// before or after it, makes it a person's. A line an older writer wrote is a person's.
     #[test]
     fn a_bump_says_whether_a_person_asked() {
         let l = layout("bump-asker");
@@ -1897,38 +1585,15 @@ mod writer_tests {
     }
 
     /// STOPPING A PASS POLLER MUST NOT COST ITS TICK. Both pass-owned threads
-    /// are joined by the PASS thread — the one holding the store flock — and an
-    /// uninterruptible `sleep` made each join wait out whatever remained of the
-    /// current tick: up to 100 ms between download-complete and the sha256 on
-    /// EVERY downloaded artifact, and up to 500 ms at `end_pass` before the
-    /// terminal snapshot the GUI retires its row on. Asserted on the STOP itself,
-    /// from inside a tick, never on the tick cadence — which production keeps
-    /// deliberately unchanged, and is what the heartbeat tests above pin.
-    ///
-    /// PROVEN BY RETURNING, NOT BY A STOPWATCH (2026-09-25). Both threads here
-    /// park for an HOUR ([`TICK_OVERRIDE`]): a stop that waited out its tick
-    /// cannot come back inside this test at all, and one that wakes the thread
-    /// comes back however loaded the machine is. The stopwatch this replaced —
-    /// four drops under 80 ms, `end_pass` under 150 ms — timed two thread wakes
-    /// per drop and an APFS write+rename as much as the stop, and a loaded machine
-    /// failed a correct `end_pass` at 220 ms against a regression
-    /// worth ~250 ms: no clock separates the two. The 60 s below is only the
-    /// fail-safe for that hour: a regression fails there, a slow machine never
-    /// does. That no tick lands after the terminal snapshot is structural:
-    /// `end_pass` stops and joins the heartbeat before it writes that snapshot.
     #[test]
     fn stopping_a_pass_poller_does_not_wait_out_its_tick() {
         let l = layout("prompt-stop");
         let progress = l.progress_file();
         let asset = l.prefix.join("trust-1.tar.zst");
-        // Seven bytes of `.part`: a reported 7 proves the poller ran its first tick and is
-        // on its way into its hour-long park (`watch_download`'s synchronous start says 0).
         std::fs::write(l.prefix.join("trust-1.tar.zst.part"), [0u8; 7]).unwrap();
         let reported =
             || live_snapshot().and_then(|f| f.programs.get("trust").map(|r| r.bytes_done));
         let (ended_tx, ended_rx) = std::sync::mpsc::channel();
-        // The pass runs on a thread of its own (`end_pass` answers only its
-        // owner), so this one can bound the whole of it.
         let pass = std::thread::spawn(move || {
             let _slot = own_pass_slot();
             TICK_OVERRIDE.set(Some(Duration::from_secs(3600)));
@@ -1941,7 +1606,6 @@ mod writer_tests {
                 }
                 drop(watch);
             }
-            // `end_pass` joins the heartbeat before `finish()` writes the terminal snapshot.
             end_pass();
             let _ = ended_tx.send(read_file(&progress));
         });
@@ -1961,13 +1625,6 @@ mod writer_tests {
     }
 
     /// A pass that makes no sink calls for longer than the writer's minimum interval (a
-    /// multi-GB Verify, an Extract) still reads as running: the heartbeat thread ticks the
-    /// file on its own.
-    ///
-    /// The interval passes on the PASS'S clock ([`ManualPassClock`]), not in seconds
-    /// slept, and the heartbeat thread looks every millisecond ([`TICK_OVERRIDE`]): the
-    /// write policy under it is the production one, and decides
-    /// (`a_quiet_sink_refreshes_its_heartbeat_at_the_interval_and_not_before`).
     #[test]
     fn a_silent_phase_keeps_the_pass_heartbeat_live() {
         let _slot = own_pass_slot();
@@ -1979,9 +1636,6 @@ mod writer_tests {
         TICK_OVERRIDE.set(None);
         let h0 = read_file(&l.progress_file()).heartbeat_unix;
         clock.advance(Duration::from_secs(HEARTBEAT_MIN_INTERVAL_SECS));
-        // With NO sink call from the pass thread, only the heartbeat thread can
-        // move the stamp, so wait for THAT: a thread that never ticks fails at
-        // the hang detector.
         let deadline = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
         let file = loop {
             let file = read_file(&l.progress_file());
@@ -2000,7 +1654,6 @@ mod writer_tests {
             "a silent-but-live pass reads as running"
         );
         end_pass();
-        // `end_pass` joins the heartbeat before the terminal snapshot: nothing restamps it.
         let ended = read_file(&l.progress_file());
         assert_eq!(ended.pid, None);
         assert!(!snapshot_running(&ended, clock.unix_now()));
@@ -2008,10 +1661,6 @@ mod writer_tests {
     }
 
     /// THE HEARTBEAT INTERVAL IS THE WRITE POLICY'S, TO THE MILLISECOND: a sink with
-    /// nothing new to say rewrites its file once [`HEARTBEAT_MIN_INTERVAL_SECS`] have
-    /// passed on its clock since its last write, and a tick a millisecond before writes
-    /// nothing — the stamp a reader's staleness window ([`HEARTBEAT_STALE_SECS`]) is
-    /// sized against.
     #[test]
     fn a_quiet_sink_refreshes_its_heartbeat_at_the_interval_and_not_before() {
         let clock = ManualPassClock::new();
@@ -2040,9 +1689,6 @@ mod writer_tests {
     }
 
     /// A LANE THREAD CREDITS THE PASS IT WAS LENT, and no other thread does: `active`
-    /// answers the owner and the thread that adopted the pass, never a bystander. Two lanes
-    /// extracting at once each credit their own row — one pass-wide extract slot handed
-    /// both lanes' bytes to whichever began last.
     #[test]
     fn a_lent_pass_credits_its_lane_and_each_lane_extracts_into_its_own_row() {
         let _slot = own_pass_slot();
@@ -2082,9 +1728,6 @@ mod writer_tests {
     }
 
     /// The promise holds while its owner lives and its deadline is ahead, and not a moment
-    /// longer: retired, past its deadline, from a clock that stepped back (a deadline
-    /// further ahead than any writer promises), of another version, oversized or malformed,
-    /// it promises nothing. It lands `0600`, and never through a symlink.
     #[test]
     fn a_promise_holds_only_while_its_owner_lives_and_its_deadline_is_ahead() {
         let l = layout("promise");
@@ -2148,8 +1791,6 @@ mod writer_tests {
     }
 
     /// A promise records its owner's start time, and a process that took over the owner's
-    /// pid — another start time — keeps nothing: the stub stops waiting for a pass that is
-    /// not coming. A promise with no start time (an older writer's) is read by the pid alone.
     #[test]
     fn a_promise_ends_when_its_owners_pid_is_another_process() {
         let l = layout("promise-born");
@@ -2181,9 +1822,6 @@ mod writer_tests {
     }
 
     /// The owner's start time decides only when the reader can read it: another start time,
-    /// or nothing under the pid, breaks the promise; a start time the kernel will not give
-    /// this reader (a sandbox denying process-info) leaves the pid to answer, as a promise
-    /// recorded without one does.
     #[test]
     fn an_owner_start_time_the_reader_cannot_read_leaves_the_pid_to_answer() {
         use crate::platform::Birth;
@@ -2200,11 +1838,6 @@ mod writer_tests {
     }
 
     /// The platform's start-time reader as [`same_owner`] judges it, on every platform that
-    /// has one: this process, read twice, is the owner it recorded; a child that has exited
-    /// is no owner — reaped on Unix (`ESRCH`; no `/proc/<pid>`), and on Windows still held by
-    /// its `Child`'s handle, so the pid names that exited process and no other
-    /// (`GetExitCodeProcess` no longer `STILL_ACTIVE`). Negative control: a reader that says
-    /// nothing (the Windows stub's `Unreadable`) fails the first assertion.
     #[cfg(any(target_os = "macos", target_os = "linux", windows))]
     #[test]
     fn the_platform_reader_tells_a_live_owner_from_one_that_exited() {
@@ -2239,7 +1872,6 @@ mod writer_tests {
     }
 
     /// An update ending retires only a promise its own process or its spawner holds: a
-    /// promise another window's seed wrote stays for the update that window spawns.
     #[test]
     fn a_promise_is_retired_only_by_its_holders() {
         let l = layout("promise-holders");
@@ -2272,7 +1904,6 @@ mod writer_tests {
         let fifo = std::ffi::CString::new(tmp.as_os_str().as_bytes()).unwrap();
         // SAFETY: the path is NUL-terminated and belongs to this private fixture.
         assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
-        // Keep both ends open so even the defective writer returns without waiting.
         let _fifo = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -2327,7 +1958,6 @@ mod writer_tests {
         );
         assert!(tmp.exists(), "an unowned colliding entry is left untouched");
 
-        // With no collision, an ordinary refresh still replaces the promise.
         std::fs::remove_file(&tmp).unwrap();
         promise_pass(&l, std::process::id(), PASS_PROMISE_SECS);
         let refreshed: PassPromise =

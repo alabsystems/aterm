@@ -1,81 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE SESSION LOG, host side (`docs/DESIGN-session-log-2026-10-15.md`, slice
-//! 1 and phase 2A): one [`aterm_slog::Log`] per session, a field of
-//! [`crate::session_timeline::SessionTimeline`] and so under its lock (design
-//! §4.1: the allowed orderings meta → timeline and fabric → timeline are
-//! unchanged, and the timeline lock stays a strict leaf — nothing here takes
-//! another lock), and the producers that write it from the signals aterm
-//! already observes:
-//!
-//! | Site | Records |
-//! |---|---|
-//! | `SessionStore::register` | `open - spawn\|adopt\|restore parent=<sid> epoch=<ep> state=<w>`, a restore's with `prev=<sid> lineage=<sid>`; `mark - state state=<w> carried=1` for a carried session already open (phase 6, 6F-7) |
-//! | `App::carry_restored_lineage` | `amend - restore prev= lineage=` when a window's already-open bootstrap fills a restored leaf |
-//! | `SessionStore::deregister_local_as` | `close - out=<reason> by= code= closer=<raw actor>` (the closer at the content tier) |
-//! | the status sweep's block read | `open r<n> cmd blk= detail=` at OSC 133 C; `close r<n> out= code= dur_ms=` at D (the program and agent runs under it first, at the same instant); both, `dur=wall`, for a block the sweep saw only finished; `gap why=evicted` for blocks the terminal dropped unread |
-//! | `note_foreground_group`, `set_program` | `open`/`close r<n> prog\|agent prog=`; `amend r<n> agent prog=` when a group's name confirms the agent the screen named |
-//! | `settle_agent_word` | `mark agent word= rev= gen= fp=`, and the [`TurnTracker`]'s turns and steps |
-//! | `note_person` | the tracker's attribution, and `mark - human by=human` once per 30 s burst |
-//! | `cmd_turn` | the tracker's `by=` and `ledger=` for the turn the exchange opens, noted at its first byte and at each Enter |
-//! | `FailureMark`'s seen (the sweep, `note_session_seen`, a carried exit) | `mark - seen by=human`, which lifts `need=failure` |
-//! | control input (`send`, `key`, `paste`, `feed`, their binary twins; phase 3A) | the tracker's attribution by the connection's actor with its `cause=`, and `mark - input verb= by=` once per author's 30 s burst |
-//!
-//! THE WATCHERS' WAKE (phase 3A, `session_log_mark`): every producer site takes
-//! the owed wake ([`SessionLog::take_log_wake`]) in the timeline lock it holds,
-//! through [`crate::session_timeline::SessionTimeline::slog_take_wake`], which
-//! rings the session's watchers there, so `await log` and `subscribe … log`
-//! never poll.
-//!
-//! The sweep writes the block read BEFORE the foreground move: a command's D
-//! closes the programs that ran under it at its own stamp, so no child closes
-//! after its parent ([`SessionLog::shell_blocks`]).
-//!
-//! The producers make typed calls into `aterm-slog`; no payload is formatted to
-//! be parsed back, nothing they write reaches a PTY, and none of them blocks on
-//! a lock its caller does not already take there. Time enters as a [`Stamp`]
-//! from [`Clock`], which a test replaces.
-//!
-//! THE SETTLE WAKE. A turn closes when its resting word has held for a second
-//! (`aterm_slog::SETTLE_MS`), and nothing else may come to say so: the tracker
-//! returns the instant it wants to be ticked, [`SessionLog::wake`]. The only
-//! producers that can arm one run on the event loop (the sweep's
-//! `publish_agent` and the input watch's `set_input`); they hand it to
-//! [`Wakes`], which the loop folds under its own deadline owner
-//! (`DeadlineOwner::SessionLog`) and ticks when due. An idle machine has no
-//! entry and arms nothing; a `ctl turn` never leaves a settle armed (it closes
-//! a resting turn at once).
-//!
-//! SEAMLESS UPDATES. The log itself rides the session's control sidecar
-//! (`handoff_carry`, its `log` member: at most 128 KiB of carry lines cut in
-//! the eviction order, with the producers' own state, `session_log_carry`),
-//! for a successor that reads it. The successor continues it at the next
-//! epoch with `mark - handoff carried=<n> shed=<m> build=<n>` (the
-//! predecessor's build, phase 6, 6F-7; the uncarried gap names it too),
-//! every run, turn and step
-//! still open (an agent mid-turn stays in that turn, a command running
-//! across the update closes with its real code when its D comes), and the
-//! outgoing process's readers are fenced at what it carried until it exits
-//! or the update stands down. An update that carries no log starts the
-//! successor's log with `gap why=handoff epoch=<ep+1>` ([`Log::after_handoff`]).
-//! What every update carries is the epoch, the three node-id counters and the seq count,
-//! on the session's handoff record ([`LogCarry`], `SessionRecord::log_ids`;
-//! `SessionRecord::log_seq`; additive fields an older or newer build skips),
-//! so `t17` names one turn and seq 412 one record for as long as the session
-//! lives. The counts are carried with a reserve, like the timeline's ids
-//! ([`LOG_ID_RESERVE`], [`LOG_SEQ_RESERVE`]), because the outgoing process
-//! keeps writing until its Commit; one that passes a reserve makes the Commit
-//! stand down ([`SessionLog::past_handoff_ceiling`]).
-//!
-//! MEMORY AND CLOSED SESSIONS. [`LOG_MEMORY_CAP`] is a deferred estimated-heap
-//! target for the live logs and closed-session index. The event loop's sweep
-//! ([`crate::App::sweep_session_log_memory`]) reserves the charge of logs at
-//! their configured minimum and shares the remaining target among the others.
-//! Busy timelines and retained state can exceed it. The sweep never runs
-//! inside an append or holds two locks at once. A session that closes leaves
-//! its log in the index ([`ClosedLog`], `session_log_closed`), which
-//! `log @<sid>` and `brief @<sid>` answer from.
+//! Host-side session log (`docs/DESIGN-session-log-2026-10-15.md`): one [`aterm_slog::Log`] per session under [`crate::session_timeline::SessionTimeline`].
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -86,64 +12,20 @@ use aterm_slog::{
     Val, Verdict,
 };
 
-/// The floor of every epoch: a test's log (`SessionLog::for_test`) takes it,
-/// and no log this build starts in production takes it or anything below
-/// [`FIRST_EPOCH`] + 1 ([`Epochs::issue`]).
+/// The floor of every epoch: a test's log (`SessionLog::for_test`) takes it, and no log this build starts in production takes it or anything below [`FIRST_EPOCH`] + 1 ([`Epochs::issue`]).
 pub(crate) const FIRST_EPOCH: u32 = 1;
 
-/// THE CEILING OF EVERY EPOCH THIS PROCESS IS TOLD (the review of 6A-2): an
-/// epoch read from outside it (a restore leaf's `log_ep`, a keeper tag's
-/// `slog_ep`, a claim's recorded epoch, a carried row's) above this is
-/// foreign or corrupt and is dropped, never noted, so the allocator keeps
-/// 2^20 issues of room below `u32::MAX` and one bad value cannot make every
-/// later log of the process share `u32::MAX`. Wall seconds reach it only in
-/// 2106, as the 32 bits do ([`Epochs`]).
+/// THE CEILING OF EVERY EPOCH THIS PROCESS IS TOLD (the review of 6A-2): an epoch read from outside it (a restore leaf's `log_ep`, a keeper tag's `slog_ep`, a claim's recorded epoch, a carried row's) above this is foreign or corrupt and is dropped, never noted, so the allocator keeps 2^20 issues of room below `u32::MAX` and one bad value cannot make every later log of the process share `u32::MAX`.
 pub(crate) const EPOCH_CEILING: u32 = u32::MAX - (1 << 20);
 
-/// An epoch read from outside this process ([`EPOCH_CEILING`]), or `None`
-/// for one no producer of this build writes: 0 or above the ceiling.
+/// An epoch read from outside this process ([`EPOCH_CEILING`]), or `None` for one no producer of this build writes: 0 or above the ceiling.
 pub(crate) fn told_epoch(ep: u32) -> Option<u32> {
     (FIRST_EPOCH..=EPOCH_CEILING).contains(&ep).then_some(ep)
 }
 
-/// THE EPOCH ALLOCATOR: it
-/// issues the first epoch of every log this process starts, fresh or
-/// uncarried (a spawn's, a restore's, an adoption told nothing of its
-/// predecessor's, a crash recovery's) as
-/// `max(wall seconds, every epoch this process issued or noted + 1, floor,
-/// 2)`, where the floor is a crash recovery's keeper tag plus one
-/// ([`Epochs::crash`]) and the noted epochs are the ones this process
-/// adopted (a carried successor's, which stays its predecessor's plus one)
-/// and the ones its restore leaves recorded (`TerminalLeafRestore::log_ep`,
-/// noted before any session starts, [`Epochs::note_leaves`]) or an adopted
-/// id's claim recorded (`identity_claim::recorded_epoch_in`, noted once the
-/// claim is held, before the id's log starts).
-///
-/// WHY. An epoch names a seq space: a reader's cursor `since=<seq> ep=<e>`
-/// reads on only in a log whose space holds `e`, and a remote fold starts
-/// over only at a gap naming a LARGER epoch (`aterm_slog::starts_epoch`). A
-/// fresh log at a fixed first epoch (the 1 every log took before this step)
-/// gave every process the same number: a relaunch under the same sid (a
-/// `$ATERM_SESSION_ID` re-adoption) let its predecessor's cursor read on into
-/// it with no gap, the journal merged the two processes' records into one
-/// space, and one session's cursor read on in another's log. The wall
-/// seconds make a later process's epoch larger; the issued and noted epochs
-/// make two in one second distinct and keep a chain that ran ahead of the
-/// wall clock (handoffs less than a second apart) from being repeated by a
-/// later adoption in this build. A relaunch under an adopted id with no
-/// restore leaf (a headless one, restore off, a nested aterm with no kept
-/// desk) inside its predecessor's wall second, or after the wall clock
-/// stepped back, is held above the predecessor by the epoch recorded beside
-/// the id's claim (`identity_claim`'s module doc, "The epoch record"). THE
-/// REMAINING WINDOW: a build older than the leaf's `log_ep` and the claim's
-/// record adopts at the plain seconds, so it, or a relaunch after it, can
-/// repeat an epoch only within a chain's lead over the wall clock or the
-/// predecessor's wall second. The 32 bits last until 2106. An epoch
-/// a process is told above [`EPOCH_CEILING`] is dropped ([`told_epoch`]), so
-/// the allocator never saturates on one bad value.
+/// THE EPOCH ALLOCATOR: it issues the first epoch of every log this process starts, fresh or uncarried (a spawn's, a restore's, an adoption told nothing of its predecessor's, a crash recovery's) as `max(wall seconds, every epoch this process issued or noted + 1, floor, 2)`, where the floor is a crash recovery's keeper tag plus one ([`Epochs::crash`]) and the noted epochs are the ones this process adopted (a carried successor's, which stays its predecessor's plus one) and the ones its restore leaves recorded (`TerminalLeafRestore::log_ep`, noted before any session starts, [`Epochs::note_leaves`]) or an adopted id's claim recorded (`identity_claim::recorded_epoch_in`, noted once the claim is held, before the id's log starts).
 #[derive(Debug, Default)]
 pub(crate) struct Epochs {
-    /// The largest epoch issued or noted (0: none).
     last: std::sync::atomic::AtomicU32,
 }
 
@@ -161,9 +43,7 @@ impl Epochs {
         PROCESS.get_or_init(|| std::sync::Arc::new(Epochs::new()))
     }
 
-    /// The next epoch at `at`, no lower than `floor`: above every epoch
-    /// issued or noted, never below the wall clock's Unix seconds or
-    /// [`FIRST_EPOCH`] + 1. Issued once: no other caller gets it.
+    /// The next epoch at `at`, no lower than `floor`: above every epoch issued or noted, never below the wall clock's Unix seconds or [`FIRST_EPOCH`] + 1.
     pub(crate) fn issue(&self, at: Stamp, floor: u32) -> u32 {
         use std::sync::atomic::Ordering;
         let wall = u32::try_from(at.wall_ms / 1000).unwrap_or(u32::MAX);
@@ -171,9 +51,6 @@ impl Epochs {
         let base = wall.max(floor).max(FIRST_EPOCH + 1);
         let mut last = self.last.load(Ordering::Acquire);
         loop {
-            // Above every epoch issued or noted, which never pass the
-            // ceiling but by this process's own issues: 2^20 of them before
-            // the last would repeat.
             let Some(next) = last.checked_add(1) else {
                 aterm_log::warn!(
                     "session log: this process issued every epoch up to the last; a log repeats it"
@@ -191,22 +68,7 @@ impl Epochs {
         }
     }
 
-    /// The epoch of a crash recovery (a shell the PTY keeper held after its
-    /// window died): above the one the keeper's tag names for the crashed
-    /// window's log (`tag_ep`, `keeper_link::Tag::slog_ep`), and issued as
-    /// every other ([`Self::issue`]). Two recoveries of one shell within one
-    /// wall second therefore take growing epochs: each window registers its
-    /// own log's epoch with the keeper before it can crash.
-    ///
-    /// Why the tag's plus one is a floor and not the epoch: a successor that
-    /// crashes after its log was readable but before its registration
-    /// reached the keeper leaves its predecessor's tag in the keeper's
-    /// custody, and the tag's plus one would repeat that successor's epoch
-    /// whatever the time. With the seconds and this process's issued epochs
-    /// as floors, a repeat needs both a registration lost that way and two
-    /// recoveries in the same wall second; a window older than the tag's key
-    /// (`tag_ep` `None`) is the seconds alone. A wall clock stepped back is
-    /// held off by the tag.
+    /// The epoch of a crash recovery (a shell the PTY keeper held after its window died): above the one the keeper's tag names for the crashed window's log (`tag_ep`, `keeper_link::Tag::slog_ep`), and issued as every other ([`Self::issue`]).
     pub(crate) fn crash(&self, tag_ep: Option<u32>, at: Stamp) -> u32 {
         self.issue(
             at,
@@ -216,10 +78,7 @@ impl Epochs {
         )
     }
 
-    /// An epoch this process holds without issuing it (a carried successor's
-    /// predecessor-plus-one) or was told a predecessor held (a restore
-    /// leaf's, a claim's): every later issue is above it. One above
-    /// [`EPOCH_CEILING`] is dropped with a WARN ([`told_epoch`]).
+    /// Record an epoch this process holds without issuing it.
     pub(crate) fn note(&self, ep: u32) {
         if ep > EPOCH_CEILING {
             aterm_log::warn!(
@@ -230,11 +89,7 @@ impl Epochs {
         self.last.fetch_max(ep, std::sync::atomic::Ordering::AcqRel);
     }
 
-    /// Note every epoch `layout`'s terminal leaves recorded
-    /// (`TerminalLeafRestore::log_ep`): called before any session of this
-    /// process starts, so a restored sid's log, an adoption told nothing and
-    /// a crash recovery all take an epoch above the one its predecessor's
-    /// log was at when the layout was saved.
+    /// Note every epoch `layout`'s terminal leaves recorded (`TerminalLeafRestore::log_ep`): called before any session of this process starts, so a restored sid's log, an adoption told nothing and a crash recovery all take an epoch above the one its predecessor's log was at when the layout was saved.
     pub(crate) fn note_leaves(&self, layout: &crate::restore::RestoreManifest) {
         if let Some(ep) = layout.max_log_ep() {
             self.note(ep);
@@ -242,57 +97,30 @@ impl Epochs {
     }
 }
 
-/// How far past its last issued id each numbered level's counter is carried
-/// across a seamless update: the ids the outgoing process may still issue
-/// between drawing the manifest and its Commit. A process that issues more
-/// refuses its Commit (a lossless retry) rather than let the successor issue
-/// one of them again ([`SessionLog::past_handoff_ceiling`]). Sized like the
-/// turn ledger's reserve (`control::TURN_ID_RESERVE`): every shell command
-/// issues a run id, so a script that runs a few hundred commands while an
-/// update stages must not keep the Commit retrying.
+/// How far past its last issued id each numbered level's counter is carried across a seamless update: the ids the outgoing process may still issue between drawing the manifest and its Commit.
 #[cfg(any(unix, test))]
 pub(crate) const LOG_ID_RESERVE: u32 = 1 << 12;
 
-/// How far past its last seq a session log's seq count is carried across a
-/// seamless update (`SessionRecord::log_seq`, design §2.2): the records the
-/// outgoing process may still append between drawing the manifest and its
-/// Commit (a verdict mark at every published move, its turns and steps).
-/// Sized like the timeline's (`session_timeline::HANDOFF_ID_RESERVE`); a
-/// process that appends more refuses its Commit, a lossless retry
-/// ([`SessionLog::past_handoff_ceiling`]).
+/// How far past its last seq a session log's seq count is carried across a seamless update (`SessionRecord::log_seq`, design §2.2): the records the outgoing process may still append between drawing the manifest and its Commit (a verdict mark at every published move, its turns and steps).
 pub(crate) const LOG_SEQ_RESERVE: u64 = 1 << 16;
-// Every count drawn ([`SessionLog::handoff_seq`]) fits the manifest's TOML.
 const _: () = assert!(aterm_slog::SEQ_LIMIT + LOG_SEQ_RESERVE <= i64::MAX as u64);
 
-/// What an adopted session's log is told of its predecessor's: the
-/// manifest's node-id counters and epoch ([`LogCarry`],
-/// `SessionRecord::log_ids`) and seq count (`SessionRecord::log_seq`, 0:
-/// none carried, an older producer's).
+/// What an adopted session's log is told of its predecessor's: the manifest's node-id counters and epoch ([`LogCarry`], `SessionRecord::log_ids`) and seq count (`SessionRecord::log_seq`, 0: none carried, an older producer's).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct LogAdopt {
     /// The epoch and node-id counters, with their reserve.
     pub(crate) ids: Option<LogCarry>,
     /// The seq count, with its reserve: the successor's first seq is above it.
     pub(crate) seq: u64,
-    /// The carried log (the control sidecar's `log` member,
-    /// `handoff_carry::ControlCarry::take_log`): `None` when the update
-    /// carried none, and the log starts over.
+    /// The carried log (the control sidecar's `log` member, `handoff_carry::ControlCarry::take_log`): `None` when the update carried none, and the log starts over.
     pub(crate) lines: Option<Vec<String>>,
-    /// For a shell the PTY keeper held through a crash: the epoch its
-    /// crashed window's log was at, as the keeper's tag names it
-    /// (`keeper_link::Tag::slog_ep`; `None`: an older window's tag).
+    /// For a shell the PTY keeper held through a crash: the epoch its crashed window's log was at (`keeper_link::Tag::slog_ep`).
     pub(crate) keeper_ep: Option<u32>,
-    /// THE BUS MIRROR's cursor and `ms` head in the predecessor's seq space,
-    /// as its export drew them under the readers' fence (the control
-    /// sidecar's `log_mirror` member): only
-    /// for a mirrored log the update did NOT carry, whose successor then says
-    /// the old space's tail as one exact `gap why=reset`. `None` otherwise.
+    /// THE BUS MIRROR's cursor and `ms` head in the predecessor's seq space, as its export drew them under the readers' fence (the control sidecar's `log_mirror` member): only for a mirrored log the update did NOT carry, whose successor then says the old space's tail as one exact `gap why=reset`.
     pub(crate) mirror: Option<aterm_slog::Prior>,
 }
 
-/// The host's reading of both clocks: wall Unix ms (the clock shell blocks are
-/// stamped with, `aterm_types::current_time_ms`) and the process's
-/// monotonic ms ([`crate::turn_ledger::now_ms`]).
+/// The host's reading of both clocks: wall Unix ms (the clock shell blocks are stamped with, `aterm_types::current_time_ms`) and the process's monotonic ms ([`crate::turn_ledger::now_ms`]).
 pub(crate) fn host_stamp() -> Stamp {
     Stamp::new(
         aterm_types::current_time_ms().unwrap_or(0),
@@ -300,26 +128,17 @@ pub(crate) fn host_stamp() -> Stamp {
     )
 }
 
-/// `at` moved back to the wall instant `wall_ms` on both clocks: a block stamp
-/// read at `at` becomes the stamp of the moment it names, so a run opened late
-/// still measures its `dur_ms` from when it began. Never later than `at`. An
-/// instant before this process's monotonic clock began clamps to its 0
-/// ([`predates_clock`]).
+/// `at` moved back to the wall instant `wall_ms` on both clocks: a block stamp read at `at` becomes the stamp of the moment it names, so a run opened late still measures its `dur_ms` from when it began.
 pub(crate) fn stamp_at_wall(at: Stamp, wall_ms: u64) -> Stamp {
     let wall = wall_ms.min(at.wall_ms);
     Stamp::new(wall, at.mono_ms.saturating_sub(at.wall_ms - wall))
 }
 
-/// The later of two stamps (by the wall clock; `a` when they tie).
 fn later(a: Stamp, b: Stamp) -> Stamp {
     if b.wall_ms > a.wall_ms { b } else { a }
 }
 
-/// Whether the wall instant `wall_ms`, read at `at`, lies before this
-/// process's monotonic clock began (a command a predecessor started before a
-/// seamless update): [`stamp_at_wall`] can only clamp it to 0 there, and a
-/// `dur_ms` measured from it would be this process's uptime, not the run's.
-/// Such a run's duration is the wall clock's (`dur=wall`).
+/// Whether the wall instant `wall_ms`, read at `at`, lies before this process's monotonic clock began (a command a predecessor started before a seamless update): [`stamp_at_wall`] can only clamp it to 0 there, and a `dur_ms` measured from it would be this process's uptime, not the run's.
 pub(crate) fn predates_clock(at: Stamp, wall_ms: u64) -> bool {
     at.wall_ms.saturating_sub(wall_ms) > at.mono_ms
 }
@@ -344,8 +163,7 @@ impl Clock {
     }
 }
 
-/// What a seamless update carries of a session's log: its epoch and its node-id
-/// counters (with the reserve). The wire row is `"<ep> <run> <turn> <step>"`.
+/// What a seamless update carries of a session's log: its epoch and its node-id counters (with the reserve).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct LogCarry {
     /// The outgoing process's epoch.
@@ -364,11 +182,7 @@ impl LogCarry {
         )
     }
 
-    /// A carried row read back, or `None`: four integers, an epoch of at least
-    /// one and at most [`EPOCH_CEILING`] ([`told_epoch`]). Anything else
-    /// carries nothing, and the successor starts at
-    /// an epoch issued as for a log told nothing ([`Epochs::issue`]; its log
-    /// still opens with `gap why=handoff`).
+    /// A carried row read back, or `None`: four integers, an epoch of at least one and at most [`EPOCH_CEILING`] ([`told_epoch`]).
     pub(crate) fn parse(row: &str) -> Option<LogCarry> {
         let mut it = row.split_ascii_whitespace().map(str::parse::<u32>);
         let (ep, run, turn, step) = (
@@ -391,15 +205,9 @@ impl LogCarry {
 /// How a block the status sweep read stands.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum BlockEnd {
-    /// Executing now (after its OSC 133 C).
     Running,
-    /// Finished (OSC 133 D): its exit code and stamps.
     Done(crate::session_status::CompletedBlock),
-    /// A prompt closed it with no D; `ended_ms` is that prompt's stamp.
-    Unended {
-        /// The closing prompt's OSC 133 A stamp, if stamped.
-        ended_ms: Option<u64>,
-    },
+    Unended { ended_ms: Option<u64> },
 }
 
 /// One block that ran a command, as the sweep read it.
@@ -411,52 +219,30 @@ pub(crate) struct BlockFact {
     pub(crate) started_ms: Option<u64>,
     /// How it stands.
     pub(crate) end: BlockEnd,
-    /// Its command reduced to the program
-    /// ([`crate::session_status::command_detail`]): the line itself is never
-    /// stored.
+    /// Its command reduced to the program ([`crate::session_status::command_detail`]): the line itself is never stored.
     pub(crate) detail: Option<String>,
 }
 
-/// What the status sweep read of the shell's blocks under its one terminal
-/// guard ([`crate::session_status::block_read`]): the blocks that ran a
-/// command from the log's [`SessionLog::block_cursor`] on, OLDEST first, at
-/// most [`crate::session_status::BLOCK_READ_MAX`] of them; the rest wait for
-/// the next sweep (`more`), so a burst of commands is late, never lost.
+/// What the status sweep read of the shell's blocks under its one terminal guard ([`crate::session_status::block_read`]): the blocks that ran a command from the log's [`SessionLog::block_cursor`] on, OLDEST first, at most [`crate::session_status::BLOCK_READ_MAX`] of them.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct BlockRead {
     /// The blocks, oldest first.
     pub(crate) facts: Vec<BlockFact>,
-    /// The newest block id this read covered: every block up to it is in
-    /// `facts`, ran nothing (and never will: the prompt in front, which may
-    /// yet run a command, is never covered), finished before the log opened
-    /// here, or is gone from the terminal (`dropped`).
+    /// The newest block id this read covered: every block up to it is in `facts`, ran nothing (and never will: the prompt in front, which may yet run a command, is never covered), finished before the log opened here, or is gone from the terminal (`dropped`).
     pub(crate) through: Option<u64>,
     /// The cursor the read started from ([`SessionLog::block_cursor`]).
     pub(crate) from: Option<u64>,
-    /// Block ids from the cursor on that the terminal no longer holds: a RIS
-    /// cleared its block history, an ED 3 (`clear`) or a Cmd-K erased the
-    /// history they lay wholly in, or it dropped its oldest before a read
-    /// reached them. Counted once: `through` covers
-    /// them, so the next read starts at the first block still held.
+    /// Block ids from the cursor on that the terminal no longer holds: a RIS cleared its block history, an ED 3 (`clear`) or a Cmd-K erased the history they lay wholly in, or it dropped its oldest before a read reached them.
     pub(crate) dropped: u64,
-    /// The terminal's count of commands the shell started (each accepted OSC
-    /// 133 C, [`aterm_core::terminal::Terminal::started_command_seq`]), which
-    /// no clear takes back and no swallowed D hides; read whether or not a
-    /// block is held. `None`: no count (a read built by hand). With
-    /// [`Self::started_held`] it says whether a command ran on a block no
-    /// read will see ([`SessionLog::lost_unread`]).
+    /// The terminal's count of commands the shell started (each accepted OSC 133 C, [`aterm_core::terminal::Terminal::started_command_seq`]), which no clear takes back and no swallowed D hides.
     pub(crate) started: Option<u64>,
-    /// The blocks from the cursor on, still held, that reached C (executing,
-    /// finished, or closed by a prompt with no D).
+    /// The blocks from the cursor on, still held, that reached C (executing, finished, or closed by a prompt with no D).
     pub(crate) started_held: u64,
-    /// Whether the block at the cursor itself is one of
-    /// [`Self::started_held`] (the open `cmd` run's, whose C the log has).
+    /// Whether the block at the cursor itself is one of [`Self::started_held`] (the open `cmd` run's, whose C the log has).
     pub(crate) started_at_from: bool,
-    /// Of [`Self::started_held`], the ones past where a read cut at its cap
-    /// stopped: their C's are counted, their blocks not yet read.
+    /// Of [`Self::started_held`], the ones past where a read cut at its cap stopped: their C's are counted, their blocks not yet read.
     pub(crate) started_unread: u64,
-    /// The read stopped at its cap with a block left that may yet be a fact
-    /// (one that reached C): the sweep owes one more look.
+    /// The read stopped at its cap with a block left that may yet be a fact (one that reached C): the sweep owes one more look.
     pub(crate) more: bool,
 }
 
@@ -481,80 +267,39 @@ pub(crate) struct AgentMove<'a> {
 struct CmdRun {
     blk: u64,
     node: Node,
-    /// The wall ms it opened at, when that predates this process's clock
-    /// ([`predates_clock`]): its close measures `dur=wall`.
     wall_from: Option<u64>,
-    /// The latest close of a front run that ran under it: the run itself
-    /// never closes before it ([`SessionLog::end_cmd`]).
     child_end: Option<Stamp>,
 }
 
-/// How a `cmd` run ends.
 #[derive(Clone, Copy, Debug)]
 enum CmdEnd {
-    /// Its OSC 133 D, with the exit code the shell reported, if any.
     Exit(Option<i32>),
-    /// No D said how (`out=unknown`).
     Unknown,
 }
 
-/// [`SessionLog::c_snap`]: the terminal's C count every command up to the
-/// cursor accounts for, and that cursor.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct CSnap {
-    /// The C count at the read, less its unread blocks' C's.
     base: u64,
-    /// The cursor the read left ([`SessionLog::block_cursor`]).
     cursor: Option<u64>,
 }
 
-/// A name the resolver gave the group in front ([`SessionLog::program_named`])
-/// that waits for the next block read: which command it ran under is known
-/// only once the blocks are read ([`SessionLog::shell_blocks`]).
 #[derive(Clone, Debug)]
 struct PendingName {
     pgid: i32,
     name: Option<String>,
-    /// The published verdict its tracker starts from, as it stood.
     word: String,
     detail: Option<String>,
     at: Stamp,
-    /// When it came, in the order of [`SessionLog::arrivals`]: its run is
-    /// told the input and `ctl turn` that came after it ([`Typed`]).
     seq: u64,
 }
 
-/// What reached the session that a turn tracker attributes a turn to (a
-/// person's input, [`SessionLog::person_input`]; control input,
-/// [`SessionLog::ctl_input`]; a `ctl turn`, [`SessionLog::ctl_turn`]): the
-/// latest of each, with when it came in the order of
-/// [`SessionLog::arrivals`]. A name waits for a block read
-/// ([`SessionLog::program_named`]), and the run it opens then is told what
-/// came after the name — and what came after the command it runs under
-/// began (its C), though before the name: input sent once the agent drew its
-/// composer but before the status sweep named its group went to the program,
-/// never to the shell's command line — in arrival order and at its own stamps
-/// ([`Self::replay`]), as it would have been had it opened when the command
-/// began. The latest of each is all a tracker keeps: the newest input is the
-/// one a turn is attributed to, and a `ctl turn`'s ledger stands unless input
-/// from another sender came after it.
 #[derive(Clone, Copy, Debug, Default)]
 struct Typed {
-    /// The latest input — a person's, or a control verb's (phase 3A): when it
-    /// came, who sent it, what it said it acted on (`cause=`) and its stamp.
     input: Option<(u64, Actor, Option<ShortId>, Stamp)>,
-    /// A `ctl turn`: when it came, its sender, its ledger id, its cause and
-    /// its stamp.
     ctl: Option<(u64, Actor, u64, Option<ShortId>, Stamp)>,
 }
 
 impl Typed {
-    /// Tell `tracker` (of a run just opened, its first verdict observed) what
-    /// came after arrival `after`, or after `began` (the wall instant the
-    /// command the run is under began, when it runs under one), in arrival
-    /// order. Input before both (the Enter that started the command, at the
-    /// shell) is not the run's. A fresh tracker has no settle armed, so this
-    /// only records: the 5 s window applies when a turn opens.
     fn replay(&self, after: u64, began: Option<Stamp>, log: &mut Log, tracker: &mut TurnTracker) {
         let came =
             |seq: u64, at: Stamp| seq > after || began.is_some_and(|b| at.wall_ms > b.wall_ms);
@@ -581,29 +326,17 @@ impl Typed {
     }
 }
 
-/// The most names that wait for one block read: a group's exec chain
-/// between two sweeps is a few; past it the oldest, which a later name
-/// superseded anyway, gives way.
 const PENDING_NAMES_MAX: usize = 8;
 
-/// The most commands [`SessionLog::agent_cmds`] holds: the old agent's and
-/// the relaunched one's are two; past it the oldest, whose failure a later
-/// command's end has long replaced, gives way.
 const AGENT_CMDS_MAX: usize = 4;
 
 #[derive(Clone, Copy, Debug)]
 struct FgRun {
     pgid: i32,
     node: Node,
-    /// The latest name the resolver gave the group, as its fingerprint
-    /// ([`name_fp`]; 0: none): the program a successor's resolver names the
-    /// group again after a seamless update, whose run then goes on.
     name_fp: u64,
 }
 
-/// A program name's fingerprint (64-bit FNV-1a over its bytes; 0 for none):
-/// stable across builds, so a carried run's name compares with the name the
-/// successor's resolver gives (`session_log_carry`).
 fn name_fp(name: Option<&str>) -> u64 {
     name.map_or(0, |n| {
         let mut h: u64 = 0xcbf2_9ce4_8422_2325;
@@ -619,10 +352,7 @@ fn name_fp(name: Option<&str>) -> u64 {
 struct AgentRun {
     pgid: i32,
     node: Node,
-    /// The agent it is.
     who: aterm_phase::Program,
-    /// Opened because the screen named an agent no program name did (a Claude
-    /// Code run as `node`): it closes when the screen stops naming it.
     by_screen: bool,
     tracker: TurnTracker,
 }
@@ -631,119 +361,45 @@ struct AgentRun {
 pub(crate) struct SessionLog {
     log: Log,
     clock: Clock,
-    /// THE EPOCH ALLOCATOR this log's epochs come from ([`Epochs`]): the
-    /// process's, or a test's own (a simulated process).
     epochs: std::sync::Arc<Epochs>,
-    /// The consumer half's own state (phase 3A, `session_log_mark`): the
-    /// mark limiter, the control-input bursts and the watchers' wake.
     consumers: mark::Consumers,
-    /// How the session came to this process: `spawn`, `adopt` or `restore`.
     origin: Kind,
-    /// When the session node opened here (wall ms): a block that finished
-    /// before it is another process's.
     opened_wall: Option<u64>,
-    /// The `cmd` run of the block executing.
     cmd: Option<CmdRun>,
-    /// The newest block id logged (or passed over as another process's).
     last_blk: Option<u64>,
-    /// The C count at the last block read, less the C's of the blocks from
-    /// the cursor on that read left unread, and the cursor it left: every C
-    /// since landed on a block from that cursor on (or on none), so the ones
-    /// no held block shows went with blocks a clear took
-    /// ([`Self::lost_unread`]).
     c_snap: Option<CSnap>,
-    /// The latest close of a `cmd` run: the next command never opens before
-    /// it ([`Self::after_last_cmd`]).
     cmd_end: Option<Stamp>,
-    /// The session's own process group (its shell's pid): the shell in front
-    /// is the session at its prompt, never a run.
     root_pgid: i32,
-    /// The run of the program in front.
     fg: Option<FgRun>,
-    /// The agent run and its turn tracker.
     agent: Option<AgentRun>,
-    /// THE COMMANDS AN AGENT RAN UNDER: the `cmd` runs
-    /// the session's newest agent runs hung under, oldest first, at most
-    /// [`AGENT_CMDS_MAX`] ([`Self::note_agent_cmd`]). A relaunch lifts a
-    /// failure only on one of them ([`Self::harness_saw_failure`]): an
-    /// agent's end, never a command's that ran no agent.
     agent_cmds: Vec<Node>,
-    /// Names given since the last block read, oldest first
-    /// ([`Self::program_named`]).
     pending: Vec<PendingName>,
-    /// How many names, inputs and `ctl turn`s have come: their order.
     arrivals: u64,
-    /// The latest input and `ctl turn`, for a run a waiting name opens.
     typed: Typed,
-    /// The counters the last handoff manifest carried ([`Self::handoff_carry`]).
     ceiling: Option<IdCounters>,
-    /// The seq count the last handoff manifest carried ([`Self::handoff_seq`]).
     seq_ceiling: Option<u64>,
-    /// A cold restore's new shell: the session its leaf was (`prev=` on its
-    /// `open - restore`), until the open writes it.
     restored_from: Option<ShortId>,
-    /// THE LINEAGE: the first session of the chain of restores this one
-    /// continues (`None`: it began it). A restore leaf carries it
-    /// ([`crate::restore::TerminalLeafRestore::lineage`]), so a chain of
-    /// restores keeps naming the session it began with; a seamless update's
-    /// leaf hands it to the shell it names ([`Self::seed_lineage`]).
     lineage: Option<ShortId>,
-    /// THE JOURNAL'S START: the carried head a seamless
-    /// update's predecessor journaled up to (its carry's `journal` host
-    /// line), which this process's journal writer starts after; `None`: from
-    /// the log's first record. Written once, at the adoption.
     journal_start: Option<u64>,
-    /// THE BUS MIRROR's state the store shares with this log, once the store
-    /// registered the session (`session_log_mirror::Shared`), and the bus
-    /// log generation this log last synced under ([`Self::mirror_log`]).
     mirror_shared: Option<std::sync::Arc<crate::session_log_mirror::Shared>>,
     mirror_seen: u64,
-    /// What the remaining §4.1 marks last wrote (phase 3B,
-    /// `session_log_observed`): one mark per value.
     observed: observed::Observed,
-    /// THE PERSON'S COUNT: the session's lock-free gesture count
-    /// (`HumanInputStamp::seq`, the `if-human=` fence), bound when the store
-    /// registers the session, and what this log last delivered of it
-    /// (`HumanInputStamp::counts`): the count, and the number of the last
-    /// gesture that reached the program. A key whose delivery found the
-    /// timeline held is delivered by the next entry that reaches the tracker
-    /// or writes mail ([`Self::reconcile_person`]), and each count is
-    /// delivered ONCE, whichever entry gets there first
-    /// ([`Self::person_input`]); `marked_through` is the count the last
-    /// burst's `human` mark covered, so a burst a reconcile already marked
-    /// is not marked again (a mark of the mail latch alone, `why=mail`,
-    /// covers no burst: phase 6, 6F-8).
     person: Option<std::sync::Arc<crate::human_input::HumanInputStamp>>,
     person_seen: u64,
     reached_seen: u64,
     marked_through: u64,
-    /// THE `human` ROWS THE TIMELINE OWES (the review of 6F-8):
-    /// one per burst mark [`Self::person_input`] wrote, the
-    /// key's own delivery's or a reconcile's that took over a burst whose
-    /// own call had not run yet. The timeline pays them
-    /// ([`crate::session_timeline::SessionTimeline::pay_burst_rows`]) before
-    /// its next row and at the end of the key's own delivery, so the ring's
-    /// `human` row stands where its mark stands, row for record, in order.
     burst_rows: u32,
-    /// What the codex-alab rollout tap answered for this session
-    /// (`status rollout= rollout_asks=`, [`transcript::TapAnswers`]).
     rollout: transcript::TapAnswers,
 }
 
-/// A person's gesture as [`SessionLog::person_input`] takes it from the
-/// seam (`crate::app_input::note_person_reaching`): the number of the
-/// gesture when it opened a burst (`HumanInputStamp::note_reaching`), and
-/// whether it reached the program ([`crate::human_input::reaches_program`]).
+/// A person's gesture as [`SessionLog::person_input`] takes it from the seam (`crate::app_input::note_person_reaching`): the number of the gesture when it opened a burst (`HumanInputStamp::note_reaching`), and whether it reached the program ([`crate::human_input::reaches_program`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct PersonGesture {
     pub(crate) burst: Option<u64>,
     pub(crate) reaches: bool,
 }
 
-/// A session ring's bounds: [`Limits::SESSION`], or, in a development build
-/// only, `ATERM_SLOG_RING=<records>,<bytes>` (`aterm_types::dev_seam!`, `None`
-/// in a release build), read once: the bus mirror's world tests reach an
-/// eviction in a handful of commands with it.
+/// A session ring's bounds: [`Limits::SESSION`], or, in a development build only, `ATERM_SLOG_RING=<records>,<bytes>` (`aterm_types::dev_seam!`, `None` in a release build), read once: the bus mirror's world tests reach an eviction in a handful of commands with it.
 pub(crate) fn ring_limits() -> Limits {
     static RING: std::sync::OnceLock<Limits> = std::sync::OnceLock::new();
     *RING.get_or_init(|| {
@@ -757,27 +413,19 @@ pub(crate) fn ring_limits() -> Limits {
 }
 
 impl Default for SessionLog {
-    /// A fresh log on the host's clocks, its first epoch the process
-    /// allocator's next ([`Epochs::process`]).
     fn default() -> Self {
         SessionLog::starting(std::sync::Arc::clone(Epochs::process()), host_stamp())
     }
 }
 
 impl SessionLog {
-    /// A fresh log whose first epoch `epochs` issues at `at`
-    /// ([`Epochs::issue`]); a later adoption's comes from it too.
+    /// A fresh log whose first epoch `epochs` issues at `at` ([`Epochs::issue`]); a later adoption's comes from it too.
     pub(crate) fn starting(epochs: std::sync::Arc<Epochs>, at: Stamp) -> SessionLog {
         let ep = epochs.issue(at, 0);
         SessionLog::at_epoch(epochs, ep)
     }
 
-    /// THE TEST CONSTRUCTOR: a fresh log at [`FIRST_EPOCH`],
-    /// with an allocator of its own (a simulated process that issued
-    /// nothing else), so a unit test that sets its clock by hand reads
-    /// `ep=1` and an adoption it drives takes its hand clock's seconds. No
-    /// build pins the epoch: a debug build's and the dev seams' logs run the
-    /// process allocator, as a release's do.
+    /// THE TEST CONSTRUCTOR: a fresh log at [`FIRST_EPOCH`], with an allocator of its own (a simulated process that issued nothing else), so a unit test that sets its clock by hand reads `ep=1` and an adoption it drives takes its hand clock's seconds.
     #[cfg(test)]
     pub(crate) fn for_test() -> SessionLog {
         let epochs = std::sync::Arc::new(Epochs::new());
@@ -787,11 +435,7 @@ impl SessionLog {
 
     fn at_epoch(epochs: std::sync::Arc<Epochs>, ep: u32) -> SessionLog {
         let mut log = Log::with_limits(ep, ring_limits());
-        // The journal writer's wake, when this process keeps a
-        // journal: every append and eviction of this log rings it.
         log.set_notify(crate::session_log_journal::notify());
-        // THE TIMELINE'S ROWS (6G-1/6G-2): the view's
-        // grammar flags each record it prints, numbered from 1.
         log.keep_rows(crate::session_timeline_view::row_span, 0);
         SessionLog {
             log,
@@ -829,7 +473,6 @@ impl SessionLog {
     }
 }
 
-/// The run outcome an exit status says.
 const fn run_out(code: Option<i32>) -> (RunOut, Conf) {
     match code {
         Some(0) => (RunOut::Ok, Conf::Exact),
@@ -842,8 +485,6 @@ const fn run_out(code: Option<i32>) -> (RunOut, Conf) {
 pub(crate) fn exit_actor(actor: &crate::session_store::ExitActor) -> Actor {
     use crate::session_store::ExitActor;
     match actor {
-        // An edge's source as `grant` took it: a session only when it reads
-        // as a minted sid.
         ExitActor::Sid(sid) => sid_actor(sid).unwrap_or(Actor::Nobody),
         ExitActor::Human => Actor::Human,
         ExitActor::Ctl => Actor::Ctl,
@@ -853,9 +494,7 @@ pub(crate) fn exit_actor(actor: &crate::session_store::ExitActor) -> Actor {
     }
 }
 
-/// The session `sid` names as the log's actor: a minted sid's
-/// ([`aterm_session::is_minted_sid`]), else none (a name
-/// someone chose is never a session's, and never a trusted actor).
+/// The session `sid` names as the log's actor: a minted sid's ([`aterm_session::is_minted_sid`]), else none (a name someone chose is never a session's, and never a trusted actor).
 pub(crate) fn sid_actor(sid: &str) -> Option<Actor> {
     aterm_session::is_minted_sid(sid)
         .then(|| ShortId::new(sid))
@@ -877,8 +516,6 @@ pub(crate) fn exit_out(reason: crate::session_store::ExitReason) -> SessionOut {
     }
 }
 
-/// `f` with `key` set to `val`, or `f` unchanged when the value does not fit
-/// (a producer never fails on a field).
 fn with(mut f: Fields, key: Key, val: Option<Val>) -> Fields {
     if let Some(val) = val {
         let _ = f.set(key, val);
@@ -886,7 +523,6 @@ fn with(mut f: Fields, key: Key, val: Option<Val>) -> Fields {
     f
 }
 
-/// A token value for `key`, sanitized and clamped, or `None`.
 fn tok(key: Key, raw: &str) -> Option<Val> {
     aterm_slog::BoundedToken::new(key, raw).map(Val::Tok)
 }
@@ -897,34 +533,24 @@ impl SessionLog {
         &self.log
     }
 
-    /// The log, for the journal writer's one write into it: installing its
-    /// wake on a log that has none (a log made before the lane published it).
+    /// The log, for the journal writer's one write into it: installing its wake on a log that has none (a log made before the lane published it).
     pub(crate) fn log_mut_for_journal(&mut self) -> &mut Log {
         &mut self.log
     }
 
-    /// The log, for the bus mirror's take, landing and close
-    /// (`session_log_mirror`, phase 4): the writes a bridge makes into a log,
-    /// all of the mirror's own state (`aterm_slog::Log::bus_copy`,
-    /// `aterm_slog::Log::land`), under the timeline's lock — first synced
-    /// with the store's mirror state (`session_log_mirror::sync`: a replaced
-    /// bus log's cursor forgotten, the log engaged while the node mirrors).
+    /// The log, for the bus mirror's take, landing and close (`session_log_mirror`, phase 4): the writes a bridge makes into a log, all of the mirror's own state (`aterm_slog::Log::bus_copy`, `aterm_slog::Log::land`), under the timeline's lock.
     pub(crate) fn mirror_log(&mut self) -> &mut Log {
         self.sync_mirror();
         &mut self.log
     }
 
-    /// The log, to write records into in a test, never synced with the
-    /// mirror's state (what a session's own appends are).
+    /// The log, to write records into in a test, never synced with the mirror's state (what a session's own appends are).
     #[cfg(test)]
     pub(crate) fn log_mut_for_tests(&mut self) -> &mut Log {
         &mut self.log
     }
 
     /// THE STORE'S MIRROR STATE, bound when the store registers the session.
-    /// The generation starts at 0, so a bus log replaced in this process
-    /// before the session registered (a carried cursor among them) is
-    /// forgotten at its first sync.
     pub(crate) fn bind_mirror(
         &mut self,
         shared: std::sync::Arc<crate::session_log_mirror::Shared>,
@@ -940,9 +566,7 @@ impl SessionLog {
         self.mirror_seen = 0;
     }
 
-    /// THE PERSON'S COUNT, bound when the store registers the session:
-    /// every gesture counted so far has been delivered (each
-    /// reached [`Self::person_input`], or found no session to attribute).
+    /// THE PERSON'S COUNT, bound when the store registers the session: every gesture counted so far has been delivered (each reached [`Self::person_input`], or found no session to attribute).
     pub(crate) fn bind_person(
         &mut self,
         count: std::sync::Arc<crate::human_input::HumanInputStamp>,
@@ -954,11 +578,7 @@ impl SessionLog {
         self.person = Some(count);
     }
 
-    /// RECONCILE THE PERSON: when the count moved past what this
-    /// log last delivered, a person's key found the timeline held
-    /// (`note_person`'s `try_lock`): it is delivered now, before the entry
-    /// that called this reaches the tracker or writes mail, so it binds the
-    /// step open now (T1) and stands between mail and the turn after it.
+    /// RECONCILE THE PERSON: when the count moved past what this log last delivered, a person's key found the timeline held (`note_person`'s `try_lock`): it is delivered now, before the entry that called this reaches the tracker or writes mail, so it binds the step open now (T1) and stands between mail and the turn after it.
     pub(crate) fn reconcile_person(&mut self, at: Stamp) {
         if self.person.as_ref().is_some_and(|p| {
             let c = p.counts();
@@ -968,27 +588,18 @@ impl SessionLog {
         }
     }
 
-    /// [`crate::session_log_mirror::sync`], when the store bound its state.
     fn sync_mirror(&mut self) {
         if let Some(shared) = self.mirror_shared.as_deref() {
             crate::session_log_mirror::sync(shared, &mut self.log, &mut self.mirror_seen);
         }
     }
 
-    /// Where this process's journal starts this session's records (after the
-    /// predecessor's journaled head, `journal_start`), or `None`: from its
-    /// first.
+    /// Where this process's journal starts this session's records (after the predecessor's journaled head, `journal_start`), or `None`: from its first.
     pub(crate) fn journal_start(&self) -> Option<u64> {
         self.journal_start
     }
 
-    /// Put `log` in place of this one, keeping its journal wake: no path that
-    /// replaces a session's log can leave it unrung. And its rows (6G-1,
-    /// 6G-2): the view's grammar flags the new log's own records, numbered
-    /// on past every id this one issued or was continued at (a seamless
-    /// update's carried count, [`Self::continue_rows`]), so no row id of this
-    /// process is handed out twice; a crash adoption's log, whose host
-    /// carried no count, counts on from this process's own.
+    /// Put `log` in place of this one, keeping its journal wake: no path that replaces a session's log can leave it unrung.
     pub(crate) fn replace_log(&mut self, log: Log) {
         let notify = self.log.notify().cloned();
         let rows = self.log.row_head();
@@ -998,17 +609,12 @@ impl SessionLog {
             .keep_rows(crate::session_timeline_view::row_span, rows);
     }
 
-    /// Continue the timeline's row ids past `carried`, the count a seamless
-    /// update's manifest carried (`SessionRecord::timeline_id`, which holds
-    /// the predecessor's overlap reserve): called before the successor's
-    /// first record ([`crate::session_timeline::SessionTimeline::continue_ids`]).
+    /// Continue the timeline's row ids past `carried`, the count a seamless update's manifest carried (`SessionRecord::timeline_id`, which holds the predecessor's overlap reserve): called before the successor's first record ([`crate::session_timeline::SessionTimeline::continue_ids`]).
     pub(crate) fn continue_rows(&mut self, carried: u64) {
         self.log.continue_rows(carried);
     }
 
-    /// The last timeline row id this log issued, or the count it was
-    /// continued at (read by the seamless update's id ceiling, as its
-    /// callers are compiled: unix, and tests).
+    /// The last timeline row id this log issued, or the count it was continued at (read by the seamless update's id ceiling, as its callers are compiled: unix, and tests).
     #[cfg(any(unix, test))]
     pub(crate) fn row_head(&self) -> u64 {
         self.log.row_head()
@@ -1019,13 +625,7 @@ impl SessionLog {
         self.clock.now()
     }
 
-    /// THE CHROME'S CLAUSE (phase 3B, plan §5)
-    /// at `now_ms` on [`crate::turn_ledger::now_ms`]'s clock: the
-    /// clause a person's tooltip may show ([`aterm_slog::clause_of_proven`]:
-    /// a `ctl` label neither shows nor hides the row beneath it) over the
-    /// state a reader is shown, as the cache's key and the line it composes.
-    /// The line's instants are put on the process clock (the clause's start,
-    /// and a shown label's `until`).
+    /// THE CHROME'S CLAUSE (phase 3B, plan §5) at `now_ms` on [`crate::turn_ledger::now_ms`]'s clock: the clause a person's tooltip may show ([`aterm_slog::clause_of_proven`]: a `ctl` label neither shows nor hides the row beneath it) over the state a reader is shown, as the cache's key and the line it composes.
     pub(crate) fn chrome_clause(
         &self,
         now_ms: u64,
@@ -1048,7 +648,6 @@ impl SessionLog {
             by: clause.by,
             since_wall: now_wall.saturating_sub(clause.age_ms),
         };
-        // A shown label says whose it is; no other row does.
         let by = (clause.row == aterm_slog::ClauseRow::Label)
             .then(|| crate::session_chrome::ClauseAuthor::of(&clause.by))
             .flatten();
@@ -1067,8 +666,7 @@ impl SessionLog {
         self.clock = clock;
     }
 
-    /// The instant the turn tracker wants [`Self::tick`] at (monotonic ms), if
-    /// a settle is pending.
+    /// The instant the turn tracker wants [`Self::tick`] at (monotonic ms), if a settle is pending.
     pub(crate) fn wake(&self) -> Option<u64> {
         self.agent
             .as_ref()
@@ -1076,8 +674,6 @@ impl SessionLog {
             .and_then(|a| a.tracker.wake_at())
     }
 
-    /// Forget a run the log no longer holds open (a cascade closed it with its
-    /// parent).
     fn resync(&mut self) {
         let log = &self.log;
         if self.agent.as_ref().is_some_and(|a| !log.is_open(a.node)) {
@@ -1091,24 +687,8 @@ impl SessionLog {
         }
     }
 
-    // ---- the session -------------------------------------------------
-
-    /// This session came across a seamless update (or out of the PTY keeper's
-    /// custody, `keeper`): its log starts over, with the loss said first —
-    /// `gap why=handoff epoch=<ep+1>` continuing the carried node ids and,
-    /// past the carried seq count, the seqs, or `gap why=crash` for a shell
-    /// whose window died. A successor told nothing of the predecessor's epoch
-    /// takes one this log's allocator issues ([`Epochs::issue`], a crash
-    /// recovery's above its keeper tag's, [`Epochs::crash`]), so no cursor of
-    /// the predecessor's reads on past the loss. Called before anything else
-    /// is written. The record that says the loss names `build`, the
-    /// predecessor's build when the update said it (`build=`, the
-    /// timeline's `handoff from_build=`; phase 6, 6F-7).
+    /// This session came across a seamless update (or out of the PTY keeper's custody, `keeper`): its log starts over, with the loss said first.
     pub(crate) fn adopt(&mut self, carry: LogAdopt, keeper: bool, build: Option<u64>, at: Stamp) {
-        // A seq count no log reaches (`aterm_slog::SEQ_LIMIT`: a manifest
-        // that is corrupt or another program's) is none: `Log::from_carry`
-        // refuses it, and `Log::after_handoff` starts a new seq space for it,
-        // so this process's ceiling is always above its own head.
         // A carry that reads continues the predecessor's log as it stood.
         if !keeper && let (Some(lines), Some(ids)) = (carry.lines.as_deref(), carry.ids) {
             match self.adopt_carried(lines, ids, carry.seq, build, at) {
@@ -1144,31 +724,13 @@ impl SessionLog {
             ),
         };
         self.replace_log(log);
-        // A mirrored log the update did not carry: its old space's tail is
-        // owed to the bus as one exact cover.
         if !keeper && let Some(prior) = carry.mirror {
             self.log.note_prior_space(prior);
         }
         self.origin = Kind::Adopt;
     }
 
-    /// THE CARRIED BLOCK CURSOR MEETS ITS ENGINE: called once the adopted
-    /// session's engine is hydrated, before its reader starts, with that
-    /// engine's next block id and C count
-    /// (`aterm_core::terminal::Terminal::next_block_id`,
-    /// `started_command_seq`). A carried log's block producer (the open
-    /// `cmd` run's block, the newest block handled, the C-count snapshot)
-    /// names the predecessor's engine; when the successor's is another (its
-    /// screen did not cross, so it started blank and its ids start at 0), a
-    /// cursor at or past the engine's next id would pass every block until
-    /// the ids caught up, logging no command and no `gap`, and a carried
-    /// `cmd` run would close on a later block that happens to take its id.
-    /// So a cursor the engine cannot hold is dropped, as the uncarried path
-    /// starts: the carried command closes `out=unknown` (its block is gone),
-    /// the reads start from the engine's own blocks, finished ones before now
-    /// passed over, and one `gap why=evicted` says the blocks between the
-    /// predecessor's last read and the update went with its screen. A cursor
-    /// the engine holds (the screen crossed with its blocks) is kept whole.
+    /// THE CARRIED BLOCK CURSOR MEETS ITS ENGINE: called once the adopted session's engine is hydrated, before its reader starts, with that engine's next block id and C count (`aterm_core::terminal::Terminal::next_block_id`, `started_command_seq`).
     pub(crate) fn fit_engine(&mut self, next_block: u64, started: u64, at: Stamp) {
         let fits = self.cmd.is_none_or(|c| c.blk < next_block)
             && self.last_blk.is_none_or(|l| l < next_block)
@@ -1192,8 +754,6 @@ impl SessionLog {
         self.log.gap(GapWhy::Evicted, 0, at);
     }
 
-    /// The producers' state as a fresh adoption has it: nothing known of the
-    /// predecessor's.
     fn reset_producers(&mut self) {
         self.cmd = None;
         self.fg = None;
@@ -1208,14 +768,7 @@ impl SessionLog {
         self.seq_ceiling = None;
     }
 
-    /// This session is a restore's new shell, standing in for `prev` (the
-    /// session its leaf was, when the leaf names one), whose chain of
-    /// restores began at `lineage` (`prev` itself when none is named). Said
-    /// before its registration opens it, the open is `open - restore
-    /// prev=<sid> lineage=<sid>`; said of a session already open (a window's
-    /// bootstrap shell filling the leaf), an `amend - restore prev= lineage=`
-    /// on the session says it, at `at`. Either way the lineage is this
-    /// session's from now on, for its own next restore.
+    /// This session is a restore's new shell, standing in for `prev` (the session its leaf was, when the leaf names one), whose chain of restores began at `lineage` (`prev` itself when none is named).
     pub(crate) fn note_restored(&mut self, prev: Option<&str>, lineage: Option<&str>, at: Stamp) {
         let prev = prev.and_then(ShortId::new);
         self.lineage = lineage.and_then(ShortId::new).or(prev);
@@ -1236,28 +789,19 @@ impl SessionLog {
         );
     }
 
-    /// The lineage a seamless update's leaf names for the shell it hands
-    /// over (the same session, so no record): kept unless this log already
-    /// has one.
+    /// The lineage a seamless update's leaf names for the shell it hands over (the same session, so no record): kept unless this log already has one.
     pub(crate) fn seed_lineage(&mut self, lineage: Option<&str>) {
         if self.lineage.is_none() {
             self.lineage = lineage.and_then(ShortId::new);
         }
     }
 
-    /// The first session of the chain of restores this one continues, or
-    /// `None` when it began it.
+    /// The first session of the chain of restores this one continues, or `None` when it began it.
     pub(crate) fn lineage(&self) -> Option<ShortId> {
         self.lineage
     }
 
-    /// `open - spawn|adopt|restore parent=<sid> epoch=<ep> state=<w>`: the
-    /// registry took the session in, in lifecycle state `state` (the
-    /// timeline's `spawned state=` row, in its hold; phase 6, 6F-7). A
-    /// session whose carried log holds its open already (a seamless
-    /// update's successor) says the registration as `mark - state
-    /// state=<w> carried=1`: local, as the row is, where an amend of the
-    /// session would be the bus class's.
+    /// `open - spawn|adopt|restore parent=<sid> epoch=<ep> state=<w>`: the registry took the session in, in lifecycle state `state`.
     pub(crate) fn open_session(&mut self, parent: Option<&str>, state: Option<&str>, at: Stamp) {
         let f = with(
             Fields::new(),
@@ -1301,11 +845,7 @@ impl SessionLog {
         }
     }
 
-    /// `close - out=<reason> by=<actor> code=<n> closer=<raw>`: the registry
-    /// let it go. Everything still open closes under it, innermost first,
-    /// `out=gone`. `closer` is the raw actor that closed it (the timeline's
-    /// `closing by=`, `-` for none): CONTENT tier, RAM only, beside `by=`,
-    /// which says `-` for a sid no one minted (3A's R1).
+    /// `close - out=<reason> by=<actor> code=<n> closer=<raw>`: the registry let it go.
     pub(crate) fn close_session(
         &mut self,
         out: SessionOut,
@@ -1314,10 +854,7 @@ impl SessionLog {
         code: Option<i32>,
         at: Stamp,
     ) {
-        // A name still waiting ran too: it opens, and closes with the rest.
         self.name_pending(self.cmd, None);
-        // The program's newest state its bucket held is written, never lost,
-        // and the newest tuple the person was shown (6F-9).
         self.flush_program(at);
         self.flush_shown(at);
         let f = with(Fields::new(), Key::Code, code.map(|c| Val::I(i64::from(c))));
@@ -1336,64 +873,22 @@ impl SessionLog {
         self.cmd = None;
         self.fg = None;
         self.agent = None;
-        // The close a parked `await log` waited for is written, in the same
-        // hold of this lock: nothing more is due (`note_close_due`).
         let _ = self.take_close_due();
     }
 
-    // ---- shell blocks ------------------------------------------------
-
-    /// The first block id the sweep's next block read must report: the open
-    /// `cmd` run's block, else the one past the newest the log handled
-    /// (`None`: every block the terminal holds).
+    /// The first block id the sweep's next block read must report: the open `cmd` run's block, else the one past the newest the log handled (`None`: every block the terminal holds).
     pub(crate) fn block_cursor(&self) -> Option<u64> {
         self.cmd
             .map(|c| c.blk)
             .or(self.last_blk.map(|b| b.saturating_add(1)))
     }
 
-    /// When the session node opened here (wall ms): a block that finished
-    /// before it is another process's, which the block read passes over
-    /// without counting it against its cap.
+    /// When the session node opened here (wall ms): a block that finished before it is another process's, which the block read passes over without counting it against its cap.
     pub(crate) fn opened_wall(&self) -> Option<u64> {
         self.opened_wall
     }
 
-    /// The status sweep's block read: OSC 133 C opens a `cmd` run (dated at its
-    /// own stamp, `detail=` the program), D closes it with `out=`, `code=` and
-    /// `dur_ms`, and a block that ran and finished between two sweeps gets both
-    /// records from its stamps (`dur=wall`). A block a prompt closed with no D
-    /// (an interrupted or replaced command) ends `out=unknown`. A block that
-    /// finished before this process opened the session is the predecessor's,
-    /// and is passed over. Blocks the terminal dropped before any read reached
-    /// them, when one of them may have run a command, are said with one `gap
-    /// why=evicted` ([`Self::lost_unread`]), and the cursor moves past
-    /// them.
-    ///
-    /// A `cmd` run's close first closes, at the same instant, the program and
-    /// agent runs that ran under it ([`Self::end_cmd`]): the shell's D proves
-    /// they had ended, so a child never closes after its parent. No run closes
-    /// before it opened, and a command never opens before the one before it
-    /// closed.
-    ///
-    /// The names given since the last read ([`Self::program_named`]) open
-    /// here, now that the blocks say which command each ran under: the first
-    /// command, in the read's order, that had not ended by the name's instant
-    /// (a name the resolver gave after the D of the command the log still
-    /// held belongs to the next one, typed ahead), stamped no earlier than
-    /// that command opened; with no command left open, the session's. A read
-    /// cut at its cap (`more`) has not reached the present: a name given
-    /// after every command it closed may be one of the unread commands', so
-    /// it waits for the read that goes on from the cut, which places it by
-    /// the same rule. A name given before that command began is its own only
-    /// when `front` agrees ([`Self::open_names_before`]); otherwise it ran
-    /// the command (a nested shell's), and opens first.
-    ///
-    /// `front` is the group in front as the sweep read it, after the blocks
-    /// (`None`: not read). A command still running hangs only under a run
-    /// whose group that is ([`Self::open_cmd`]), so the foreground move the
-    /// same sweep applies next never closes a command's parent before its D
-    /// is read.
+    /// The status sweep's block read: OSC 133 C opens a `cmd` run (dated at its own stamp, `detail=` the program), D closes it with `out=`, `code=` and `dur_ms`, and a block that ran and finished between two sweeps gets both records from its stamps (`dur=wall`).
     pub(crate) fn shell_blocks(&mut self, read: &BlockRead, front: Option<i32>, at: Stamp) {
         self.resync();
         if self.lost_unread(read) > 0 {
@@ -1414,7 +909,6 @@ impl SessionLog {
                 }
                 (None, _) if self.last_blk.is_some_and(|l| fact.id <= l) => {}
                 (None, end) => {
-                    // A newer block: the open one ended unseen, before this
                     // one began.
                     if let Some(c) = self.cmd.take() {
                         let began = stamp_at_wall(at, fact.started_ms.unwrap_or(at.wall_ms));
@@ -1426,27 +920,18 @@ impl SessionLog {
                 }
             }
         }
-        // The open run's block is gone from the terminal (a reset cleared it).
         if let Some(c) = self.cmd
             && !read.facts.iter().any(|f| f.id == c.blk)
         {
             self.cmd = None;
             self.end_cmd(c, CmdEnd::Unknown, at);
         }
-        // Names given after every command the read closed: the one still
-        // open ran them, or none did, once the read reached the present. A
-        // cut read leaves them for the next.
         if !read.more {
             self.name_pending(self.cmd, None);
         }
-        // Blocks the read passed over (nothing ran, another process's, or
-        // gone from the terminal) are handled too: the next read starts past
-        // them.
         if let Some(t) = read.through {
             self.last_blk = Some(self.last_blk.map_or(t, |l| l.max(t)));
         }
-        // Every C up to now is accounted for, but those of the blocks a cut
-        // read left unread: the next read counts its C's from here.
         if let Some(started) = read.started {
             self.c_snap = Some(CSnap {
                 base: started.saturating_sub(read.started_unread),
@@ -1455,19 +940,6 @@ impl SessionLog {
         }
     }
 
-    /// How many commands ran on blocks `read` cannot show and no read saw:
-    /// the shell's C count since the last read (which every block before
-    /// its cursor, and the open `cmd` run's own, accounts for), less the
-    /// blocks from the cursor on still held that reached C. A clear at an
-    /// idle prompt (Cmd-K, RIS) took no C; a `clear`, `reset` or any command
-    /// run and cleared between two sweeps took its own; the open `cmd` run's
-    /// block was read (it closes `out=unknown`), however its D fared. A count
-    /// taken at an open run's block holds that run's C, so it holds too once
-    /// the run went without a read (a front run's close took it and a
-    /// person's key dropped it, or its carry line did not read) and the
-    /// cursor moved one past that block. With no count from the read before
-    /// at this cursor (the first read, or a read built by hand), every
-    /// dropped id but the open run's counts.
     fn lost_unread(&self, read: &BlockRead) -> u64 {
         let own = self.cmd.is_some_and(|c| read.from == Some(c.blk));
         let at_gone_run = |snap: CSnap| self.cmd.is_none() && snap.cursor == self.last_blk;
@@ -1482,28 +954,10 @@ impl SessionLog {
         }
     }
 
-    /// `start` moved on to the last `cmd` run's close, if that is later: the
-    /// shell runs one command at a time, so a run whose C reads earlier (a
-    /// typed-ahead command whose predecessor's front run a late sweep closed
-    /// after the D) opens as that one closes.
     fn after_last_cmd(&self, start: Stamp) -> Stamp {
         self.cmd_end.map_or(start, |end| later(start, end))
     }
 
-    /// The names still waiting that were given before `fact`'s command began
-    /// (its C), no command held then: every command this read handled before
-    /// it had ended by their instant, else its close placed them. Whether the
-    /// named program ran AS that command, its C read late (the PTY reader
-    /// behind the sweep that saw the group), or ran it (a nested shell, whose
-    /// prompt was in front first), the group in front at the read, `front`,
-    /// tells: a command's program holds the front exactly while it runs (the
-    /// shell takes the terminal back before it writes the D). A name whose
-    /// group is in front though the command ended, or gone from the front
-    /// though it runs, is not the command's: it opens now, at its own instant
-    /// and at the session, and the command hangs under it
-    /// ([`Self::open_cmd`]). One whose place agrees waits, to open under the
-    /// command. Without a `front`, or a C stamp, or for a block never seen
-    /// running whose end no D reported, every name waits.
     fn open_names_before(&mut self, fact: &BlockFact, front: Option<i32>) {
         let (Some(start), Some(front)) = (fact.started_ms, front) else {
             return;
@@ -1523,9 +977,6 @@ impl SessionLog {
         }
     }
 
-    /// A block the log has not seen: one running opens its run; one finished
-    /// since the session opened here gets both records from its stamps.
-    /// `front` is the group in front at the read ([`Self::open_cmd`]).
     fn new_block(&mut self, fact: &BlockFact, end: BlockEnd, front: Option<i32>, at: Stamp) {
         match end {
             BlockEnd::Running => {
@@ -1550,8 +1001,6 @@ impl SessionLog {
                     self.after_last_cmd(stamp_at_wall(end, fact.started_ms.unwrap_or(end.wall_ms)));
                 let end = later(end, start);
                 if let Some(node) = self.open_cmd(fact.id, fact.detail.as_deref(), None, start) {
-                    // Both records from its stamps (`dur=wall`), and a name
-                    // given while it ran under it.
                     let c = CmdRun {
                         blk: fact.id,
                         node,
@@ -1561,28 +1010,10 @@ impl SessionLog {
                     self.end_cmd(c, CmdEnd::Exit(done.exit_code), end);
                 }
             }
-            // Never seen running and its end never reported: nothing to say
-            // that is not a guess.
             BlockEnd::Unended { .. } => {}
         }
     }
 
-    /// Open block `blk`'s `cmd` run at `at`, its start, under the newest open
-    /// run that had opened by then (a nested shell's command, under the
-    /// program that runs that shell), else the session: never under a run
-    /// that opened after the command began, which did not run it (an agent
-    /// run the log could hang only at the session, past a cut read, as its
-    /// verdict moved before the read reached the command it ran in). No
-    /// node opens before its parent.
-    ///
-    /// A command still running (`front`: the group in front at the read)
-    /// hangs only under a run whose group that is. The sweep's foreground
-    /// move closes every other front run next, and its close would take the
-    /// command with it, `out=gone`, before its D is read: the D, its exit
-    /// code and a failure's need would be lost, as the cursor has passed its
-    /// block. A nested shell's command running in its own group is the
-    /// session's; one that finished between two sweeps (`front` `None`:
-    /// its run closes as it opens) still hangs under the shell.
     fn open_cmd(
         &mut self,
         blk: u64,
@@ -1618,16 +1049,6 @@ impl SessionLog {
             .ok()
     }
 
-    /// End the open `cmd` run `c` at `end`. First the names given before
-    /// `end` open under it ([`Self::name_pending`]); then the program and agent
-    /// runs that ran under it close at the same instant, `out=unknown` (the end of
-    /// the command proves theirs; leaving the front is not an exit status),
-    /// or as they opened if that is later ([`Self::end_front_under`]). The
-    /// run itself never closes before it opened, nor before a child that
-    /// closed later (a sweep that saw the group leave before it read the D),
-    /// and one that opened before this process's clock began measures
-    /// `dur=wall`. The front runs that came to the front while it ran but
-    /// hang beside it close at its end too ([`Self::end_front_beside`]).
     fn end_cmd(&mut self, c: CmdRun, how: CmdEnd, end: Stamp) {
         self.name_pending(Some(c), Some(end));
         self.end_front_beside(c.node, end);
@@ -1641,7 +1062,6 @@ impl SessionLog {
         self.close_cmd(c.node, how, wall, end);
     }
 
-    /// When the open node `node` opened, on both clocks.
     fn opened_at(&self, node: Node) -> Option<Stamp> {
         self.log.open_entry(node).map(|e| Stamp::new(e.t, e.mono))
     }
@@ -1664,12 +1084,6 @@ impl SessionLog {
         }
     }
 
-    /// EVERY RUN THIS LOG CLOSES CLOSES HERE (the session's own close is
-    /// [`Self::close_session`]): the program state the program marks'
-    /// bucket still holds for the run `node` closes (it is that run or holds
-    /// it) is written on that run first ([`Self::settle_program`]; 6F-4,
-    /// U44), so a run's newest state is its own, never the next run's in
-    /// front nor the deepest node left open.
     fn close_node(
         &mut self,
         node: Node,
@@ -1680,7 +1094,6 @@ impl SessionLog {
         self.log.close(node, close, at)
     }
 
-    /// Whether the open node `node` lies under the open node `root`.
     fn descends(&self, node: Node, root: Node) -> bool {
         let mut at = node;
         for _ in 0..=aterm_slog::MAX_OPEN {
@@ -1693,10 +1106,6 @@ impl SessionLog {
         false
     }
 
-    /// The agent run `node` opened (or was carried across an update): the
-    /// `cmd` run it hangs under, the nearest open one above it, joins
-    /// [`Self::agent_cmds`]. An agent hung under no command (the session
-    /// itself, past a cut) names none.
     fn note_agent_cmd(&mut self, node: Node) {
         let mut at = node;
         for _ in 0..=aterm_slog::MAX_OPEN {
@@ -1716,13 +1125,6 @@ impl SessionLog {
         }
     }
 
-    /// Close the front runs (the agent run, then the program run) that ran
-    /// under `parent`, at `at` or, when something open under `parent` opened
-    /// later (a program the resolver named after the D, which the log could
-    /// only hang under the command it still held open), as the latest of
-    /// them opened: nothing closes before it opened, and every one closes at
-    /// the same instant, so none closes after its parent. Returns that
-    /// instant, when anything closed.
     fn end_front_under(&mut self, parent: Node, at: Stamp) -> Option<Stamp> {
         let agent = self
             .agent
@@ -1749,20 +1151,6 @@ impl SessionLog {
         Some(at)
     }
 
-    /// Close the front runs (the agent run, then the program run) that came
-    /// to the front while the open `cmd` run `cmd` ran, which ends at `end`,
-    /// but hang beside it, not under it: they opened no earlier than it and
-    /// no later than `end`, and it does not hang under them (the run it hangs
-    /// under ran it). Such a run is one the log had to open before a read
-    /// reached the command it ran in: an agent's, at the session, as its
-    /// verdict moved past a cut read ([`Self::agent_moved`]), or the agent
-    /// run a screen named before any read saw its command. The command's end
-    /// proves theirs, as it proves its children's, so they close with it, at
-    /// `end` or as the latest node under them opened (nothing closes before
-    /// it opened). Left open, the next command would hang under a run that
-    /// did not run it, and the foreground move that closes the run would
-    /// close that command with it, its D unread. The command's own close is
-    /// not moved: they are not its children.
     fn end_front_beside(&mut self, cmd: Node, end: Stamp) {
         let Some(from) = self.log.open_entry(cmd).map(|e| e.t) else {
             return;
@@ -1802,8 +1190,7 @@ impl SessionLog {
         }
     }
 
-    /// A failure the person saw (`FailureMark`, the status observer's seen
-    /// acknowledgement): `mark - seen by=human`, which lifts `need=failure`.
+    /// A failure the person saw (`FailureMark`, the status observer's seen acknowledgement): `mark - seen by=human`, which lifts `need=failure`.
     pub(crate) fn failure_seen(&mut self, at: Stamp) {
         let _ = self.log.mark(
             Mark::new(Kind::Seen, Src::Status, Conf::Strong)
@@ -1814,31 +1201,6 @@ impl SessionLog {
     }
 
     /// A HARNESS RELAUNCH LIFTS THE FAILURE IT CAUSED, AND ONLY THAT ONE.
-    /// Run right after the act
-    /// mark of a relaunch row whose step brought a new agent process up
-    /// ([`Self::observe_relaunch_act`] with `started`,
-    /// [`aterm_agent::harness::upgrade_drive::started`]); a row that typed a
-    /// turn into the running agent, stopped it with no start yet, or waited
-    /// never comes here. It writes `mark - seen by=harness src=aterm
-    /// conf=strong` when all five hold:
-    /// - the fold holds a `failure` need on a run N;
-    /// - that need is the session's only failure need, because a `seen`
-    ///   lifts every one (the fold's `seen` arm): with another standing the
-    ///   harness writes nothing, and the session still says it failed, which
-    ///   is true;
-    /// - N is closed;
-    /// - an agent ran under N ([`Self::agent_cmds`]): the failure is an
-    ///   agent's end, never a command's that ran none (a `make` that failed
-    ///   before the person started the agent);
-    /// - a run of N's kind that opened after N's close is open now: the
-    ///   relaunched program, so the failure is the old agent's end the
-    ///   restart replaced (the stop's 143, or the crash a crash relaunch
-    ///   answers), not one the new run reported.
-    ///
-    /// `seen` is bus class, so the mirror's fold lifts the need as the
-    /// local one does. No fold law moves, and 3B's rule (a later run of the
-    /// kind ending `ok` or `fail` lifts it, `lifts_failure`) stays the
-    /// shell's. Returns whether the mark was written.
     pub(crate) fn harness_saw_failure(&mut self, at: Stamp) -> bool {
         let mut failures = self
             .log
@@ -1854,9 +1216,6 @@ impl SessionLog {
         if n.lvl != Lvl::Run || self.log.is_open(n) || !self.agent_cmds.contains(&n) {
             return false;
         }
-        // Node ids rise in the order nodes open, so a run that opened after
-        // N closed has a larger number than N; `t` says it opened no earlier
-        // than N's close.
         let relaunched =
             self.log.open_nodes().iter().any(|e| {
                 e.node.lvl == Lvl::Run && e.kind == kind && e.node.n > n.n && e.t >= closed_t
@@ -1873,20 +1232,14 @@ impl SessionLog {
                 .is_ok()
     }
 
-    // ---- the program in front ----------------------------------------
-
-    /// The session's own process group: its shell, which in front is the
-    /// session at its prompt.
+    /// The session's own process group: its shell, which in front is the session at its prompt.
     pub(crate) fn note_root(&mut self, pgid: i32) {
         self.root_pgid = pgid;
     }
 
-    /// The foreground group moved to `pgid`: the runs of the group that left
-    /// close (`out=unknown`: leaving the front is not an exit status).
+    /// The foreground group moved to `pgid`: the runs of the group that left close (`out=unknown`: leaving the front is not an exit status).
     pub(crate) fn foreground_moved(&mut self, pgid: i32, at: Stamp) {
         self.resync();
-        // A name still waiting (no block read since it came) was the group's
-        // that leaves: it opens under the command held, then closes.
         self.name_pending(self.cmd, None);
         if self.agent.as_ref().is_some_and(|a| a.pgid != pgid) {
             self.close_agent(at);
@@ -1897,18 +1250,7 @@ impl SessionLog {
         }
     }
 
-    /// The group in front, `pgid`, named its program (the resolver's answer,
-    /// off the sweep): the name waits for the next block read
-    /// ([`Self::shell_blocks`]), which knows the command it ran under. The
-    /// log may still hold the command before it open (its D not yet read: a
-    /// typed-ahead program named after it), so the run is not hung yet. That
-    /// read comes at the session's next due look (the follow-up the answer
-    /// arms is never earlier than it: up to one observation interval, more
-    /// when the sweep skips the session under contention). Until then the
-    /// name has no run: a person's input and a `ctl turn` that come meanwhile
-    /// are kept, and the run is told them when it opens ([`Typed`]); the
-    /// settle tick has no turn to settle. `word`/`detail` are the published
-    /// verdict a new tracker starts from.
+    /// The group in front, `pgid`, named its program (the resolver's answer, off the sweep): the name waits for the next block read ([`Self::shell_blocks`]), which knows the command it ran under.
     pub(crate) fn program_named(
         &mut self,
         pgid: i32,
@@ -1931,8 +1273,6 @@ impl SessionLog {
         });
     }
 
-    /// Open the names given up to `until` (all, for `None`), oldest first,
-    /// under `under` ([`Self::open_named`]).
     fn name_pending(&mut self, under: Option<CmdRun>, until: Option<Stamp>) {
         while self
             .pending
@@ -1944,15 +1284,6 @@ impl SessionLog {
         }
     }
 
-    /// A name for the group in front, `p.pgid`, opens its run: a `prog` run
-    /// (an `agent` run, with a turn tracker, for an agent's name) under the
-    /// `cmd` run `under`, no earlier than that opened. The shell in front is
-    /// no run. A group that names another program (an exec) supersedes its
-    /// run. A group whose agent the screen already named, now naming that
-    /// agent (an interpreter, `node`, renamed `claude`), CONFIRMS that run: it
-    /// is amended `prog=` and lives as long as its group, its turn going on
-    /// undisturbed. A new agent run's tracker, its first verdict observed, is
-    /// told the input and `ctl turn` that came after the name ([`Typed`]).
     fn open_named(&mut self, under: Option<CmdRun>, p: PendingName) {
         self.resync();
         let under = under.filter(|c| self.log.is_open(c.node));
@@ -1977,8 +1308,6 @@ impl SessionLog {
             return;
         }
         if let Some(fg) = self.fg.filter(|f| f.pgid == pgid) {
-            // The same group naming the program it already runs: nothing
-            // changed (a seamless update's successor, whose resolver names
             // every group again, keeps the run, its agent and its turn).
             if name.is_some() && fg.name_fp == name_fp(name) {
                 return;
@@ -1986,7 +1315,6 @@ impl SessionLog {
             if self.agent.as_ref().is_some_and(|a| a.node == fg.node) {
                 self.agent = None;
             }
-            // Another name replaced it (an exec); no name says nothing more.
             let out = if program.is_some() {
                 RunOut::Superseded
             } else {
@@ -1994,8 +1322,6 @@ impl SessionLog {
             };
             self.close_run(fg.node, out, at);
             self.fg = None;
-            // Its close took the runs under it (a screen-named agent run):
-            // never amend a closed node.
             self.resync();
         }
         let Some(name) = name else {
@@ -2006,8 +1332,6 @@ impl SessionLog {
             return;
         }
         if let Some(a) = self.agent.as_mut().filter(|a| a.pgid == pgid) {
-            // The screen named the agent before any name was read for its
-            // group: the name refines that run.
             let f = with(Fields::new(), Key::Prog, tok(Key::Prog, name));
             let _ = self.log.amend(
                 a.node,
@@ -2046,8 +1370,6 @@ impl SessionLog {
                 detail,
                 at,
             );
-            // What came after the command it runs under began, though the
-            // name came later, is the run's too.
             let began = under.and_then(|c| self.opened_at(c.node));
             self.typed.replay(p.seq, began, &mut self.log, &mut tracker);
             self.agent = Some(AgentRun {
@@ -2061,11 +1383,6 @@ impl SessionLog {
         }
     }
 
-    /// The screen-named agent run of group `pgid` is confirmed by its own
-    /// name `name`: amended `prog=<name>`, it is the program's run now and
-    /// closes with its group, not when the screen stops naming it. Nothing
-    /// closes: the program run it hangs under (the interpreter's, `node`)
-    /// stays the group's front run, and the turn in progress stays open.
     fn confirm_agent(&mut self, pgid: i32, name: &str, at: Stamp) {
         let Some(a) = self.agent.as_mut() else {
             return;
@@ -2078,8 +1395,6 @@ impl SessionLog {
         );
         a.by_screen = false;
         let node = a.node;
-        // The group's front run (the interpreter's, or this one) is the
-        // confirmed program's now: its name is the group's latest.
         match self.fg.as_mut() {
             Some(fg) if fg.pgid == pgid => fg.name_fp = name_fp(Some(name)),
             _ => {
@@ -2092,8 +1407,6 @@ impl SessionLog {
         }
     }
 
-    /// Close a front run (`prog` or `agent`). One that ran under the open
-    /// `cmd` run is remembered there, so the command never closes before it.
     fn close_run(&mut self, node: Node, out: RunOut, at: Stamp) {
         let under_cmd = self.cmd.is_some_and(|c| self.descends(node, c.node));
         let closed = self.close_node(
@@ -2114,7 +1427,6 @@ impl SessionLog {
 
     fn close_agent(&mut self, at: Stamp) {
         if let Some(a) = self.agent.take() {
-            // The named agent's run is the front run: closing it is the
             // front run's to do (`foreground_moved`).
             if self.fg.is_none_or(|f| f.node != a.node) {
                 self.close_run(a.node, RunOut::Unknown, at);
@@ -2122,22 +1434,11 @@ impl SessionLog {
         }
     }
 
-    // ---- the agent verdict -------------------------------------------
-
-    /// The published agent verdict moved: `mark agent word= rev= gen= fp=`,
-    /// then the turn tracker's transitions. A screen that names an agent no
-    /// program name did opens its `agent` run first. Returns the tracker's
-    /// wake ([`Self::wake`]).
+    /// The published agent verdict moved: `mark agent word= rev= gen= fp=`, then the turn tracker's transitions.
     pub(crate) fn agent_moved(&mut self, m: AgentMove<'_>, at: Stamp) -> Option<u64> {
         self.reconcile_person(at);
         self.resync();
-        // The sweep publishes after its block read, which opened every name
-        // but past a cut; one still waiting (a publish off the sweep, or
-        // past a cut read) opens first, under the command held (none, past
-        // a cut), so the verdict finds its run.
         self.name_pending(self.cmd, None);
-        // Only an agent's reader names a run (an exhaustive match: a new
-        // agent must answer here).
         let named = m.reader.filter(|r| match r {
             aterm_phase::Program::Claude
             | aterm_phase::Program::Codex
@@ -2204,7 +1505,6 @@ impl SessionLog {
                 at,
             )
         });
-        // A run the screen opened ends when the screen stops naming an agent.
         if m.word == "-" && self.agent.as_ref().is_some_and(|a| a.by_screen) {
             self.close_agent(at);
             return None;
@@ -2212,45 +1512,7 @@ impl SessionLog {
         wake
     }
 
-    // ---- input and control -------------------------------------------
-
-    /// A person's hands were on the session: the tracker attributes a turn
-    /// that opens within 5 s to them (a run a waiting name opens later too,
-    /// [`Typed`]); a gesture that reached the program
-    /// ([`crate::human_input::reaches_program`]) makes the approval or
-    /// question step open now the person's to dismiss; and the
-    /// first input of a burst writes `mark - human by=human` on the session
-    /// (the bytes are never recorded), as does the first program-bound one
-    /// after a `mail dir=in` mark, whatever its burst (the mail
-    /// latch is [`aterm_slog::Fold::in_since_human`], the log's own fold's,
-    /// which a carry crosses an update with: 6C-5). A burst's
-    /// mark that no program-bound input is delivered with says so,
-    /// `reached=0` (a view scroll, a
-    /// selection, a composition): the fold reads it as no answer to waiting
-    /// mail, and the latch stays for the input that does reach the program.
-    /// THE LATCH'S MARK ALONE SAYS SO: a mark
-    /// no burst opened, the timeline's `human` row's none, is `why=mail`,
-    /// which the log's view of the timeline filters on (the fold reads no
-    /// `why=`), so every row is one mark and every other mark is a
-    /// `why=mail` one. A reconciling delivery (`own` none) that writes the
-    /// latch's mark over a burst whose own call has not run yet (the
-    /// reading's `burst` past `marked_through`) writes the burst's, and that
-    /// call then marks nothing. EVERY BURST MARK OWES ITS ROW WHERE IT IS
-    /// WRITTEN (the review of 6F-8): the timeline pays it before its next
-    /// row ([`Self::take_burst_rows`]), so a reconcile inside an entry that
-    /// writes its mark before its row (the agent verdict, a fabric fact)
-    /// puts the `human` row before that entry's, as the mark is.
-    /// `own` is the calling gesture's ([`PersonGesture`]), `None` for
-    /// [`Self::reconcile_person`]'s.
-    ///
-    /// ONCE PER COUNT: on a log bound to the person's count, what
-    /// the counts moved past since the last delivery is delivered, whoever
-    /// calls first — a key whose own call waited on the timeline while a
-    /// reconciling entry delivered it does nothing twice — and a burst's mark
-    /// is written unless a mark already covers its number. The counts are
-    /// one reading (`HumanInputStamp::counts`), so a delivery that sees a
-    /// gesture's class covers its number however a note interleaved. A log
-    /// no store bound has no count: its gesture is delivered whole.
+    /// A person's hands were on the session: the tracker attributes a turn that opens within 5 s to them (a run a waiting name opens later too, [`Typed`]).
     pub(crate) fn person_input(&mut self, own: Option<PersonGesture>, at: Stamp) {
         let own_reaches = own.is_some_and(|g| g.reaches);
         let Some(p) = self.person.as_ref() else {
@@ -2273,8 +1535,6 @@ impl SessionLog {
         let burst = own
             .and_then(|g| g.burst)
             .is_some_and(|n| n > self.marked_through);
-        // A burst counted and published whose own delivery is still to come:
-        // a mark this delivery writes is that burst's.
         let unmarked_burst = c.burst > self.marked_through;
         self.person_seen = self.person_seen.max(c.seq);
         self.reached_seen = self.reached_seen.max(c.reached);
@@ -2289,17 +1549,12 @@ impl SessionLog {
         self.burst_rows += u32::from(marked);
     }
 
-    /// The `human` rows the burst marks [`Self::person_input`] wrote owe the
-    /// timeline, taken: the timeline records them before its next row and at
-    /// the end of the key's own delivery
-    /// ([`crate::session_timeline::SessionTimeline::pay_burst_rows`]).
+    /// The `human` rows the burst marks [`Self::person_input`] wrote owe the timeline, taken: the timeline records them before its next row and at the end of the key's own delivery ([`crate::session_timeline::SessionTimeline::pay_burst_rows`]).
     pub(crate) fn take_burst_rows(&mut self) -> u32 {
         std::mem::take(&mut self.burst_rows)
     }
 
-    /// [`Self::person_input`] for a gesture no count names (a test's, or a
-    /// log no store bound): delivered whole, as one that reached the
-    /// program, `burst` its own.
+    /// [`Self::person_input`] for a gesture no count names (a test's, or a log no store bound): delivered whole, as one that reached the program, `burst` its own.
     #[cfg(test)]
     pub(crate) fn human_input(&mut self, burst: bool, at: Stamp) {
         let c = self.person.as_ref().map(|p| p.counts()).unwrap_or_default();
@@ -2308,14 +1563,6 @@ impl SessionLog {
         let _ = self.deliver_person(true, true, (burst, false), true, c.seq, at);
     }
 
-    /// The delivery itself: the tracker and the arrivals for a `fresh`
-    /// count, the step's binding and the mail latch for a `reached` one,
-    /// and the `human` mark for a burst (`burst.0`, the calling gesture's
-    /// own) or the latch: a burst's covering `seq`, the latch's alone
-    /// `why=mail` unless an unmarked burst is counted (`burst.1`), whose
-    /// mark it then is; `reached=0` on a mark that neither `reached` nor
-    /// the calling gesture (`own_reaches`) brings a program-bound input to.
-    /// Whether it wrote a burst's mark (whose `human` row the timeline owes).
     fn deliver_person(
         &mut self,
         fresh: bool,
@@ -2342,11 +1589,8 @@ impl SessionLog {
                 let _ = a.tracker.person(log, at);
             }
         }
-        // The latch is the fold's: the mark written below
-        // clears it, as its record folds.
         let after_mail = reached && self.log.fold().in_since_human();
         if burst || after_mail {
-            // The burst's mark (its row's record), or the latch's alone.
             let a_bursts = burst || unmarked_burst;
             let mut f = Fields::new();
             if !(reached || own_reaches) {
@@ -2368,15 +1612,7 @@ impl SessionLog {
         false
     }
 
-    /// A `ctl turn` exchange from `by`, ledger id `ledger`, handed its input to
-    /// the seam (`cmd_turn` calls this at the exchange's first byte and again
-    /// at each Enter): the turn it opens carries `by=` and `ledger=` (of a run
-    /// a waiting name opens later too, [`Typed`]); a resting turn closes now.
-    /// Returns the tracker's wake (none: the exchange leaves no settle
-    /// pending).
-    ///
-    /// `cause` is what the exchange said it acted on (`turn cause=`, validated
-    /// by the verb): the turn it opens names it.
+    /// A `ctl turn` exchange from `by`, ledger id `ledger`, handed its input to the seam (`cmd_turn` calls this at the exchange's first byte and again at each Enter): the turn it opens carries `by=` and `ledger=` (of a run a waiting name opens later too, [`Typed`]).
     pub(crate) fn ctl_turn(
         &mut self,
         by: Actor,
@@ -2395,7 +1631,6 @@ impl SessionLog {
     }
 
     /// The host's settle wake: a resting word that has held closes its turn.
-    /// Returns the next wake.
     pub(crate) fn tick(&mut self, at: Stamp) -> Option<u64> {
         self.reconcile_person(at);
         self.resync();
@@ -2403,10 +1638,7 @@ impl SessionLog {
         agent.as_mut().and_then(|a| a.tracker.tick(log, at))
     }
 
-    // ---- seamless updates --------------------------------------------
-
-    /// What the handoff manifest carries: the epoch and the node-id counters
-    /// plus [`LOG_ID_RESERVE`], remembered as this process's ceiling.
+    /// What the handoff manifest carries: the epoch and the node-id counters plus [`LOG_ID_RESERVE`], remembered as this process's ceiling.
     #[cfg(any(unix, test))]
     pub(crate) fn handoff_carry(&mut self) -> LogCarry {
         let ids = self.log.id_counters();
@@ -2422,20 +1654,12 @@ impl SessionLog {
         }
     }
 
-    /// Set the log's byte budget (the instance-wide sweep's share,
-    /// [`crate::App::sweep_session_log_memory`]): it evicts level-aware to
-    /// it at once, and `usize::MAX` gives the session bound back.
+    /// Set the log's byte budget (the instance-wide sweep's share, [`crate::App::sweep_session_log_memory`]): it evicts level-aware to it at once, and `usize::MAX` gives the session bound back.
     pub(crate) fn set_log_byte_budget(&mut self, bytes: usize) {
         self.log.set_byte_budget(bytes);
     }
 
-    /// What the handoff manifest carries of the seq count
-    /// (`SessionRecord::log_seq`): the last seq plus [`LOG_SEQ_RESERVE`],
-    /// remembered as this process's ceiling. A head past
-    /// `aterm_slog::SEQ_LIMIT` (only a log adopted at the very limit and
-    /// written past it) carries no count and keeps no ceiling: its successor
-    /// starts a new seq space, and no Commit waits on a ceiling the manifest
-    /// could never write above the head.
+    /// What the handoff manifest carries of the seq count (`SessionRecord::log_seq`): the last seq plus [`LOG_SEQ_RESERVE`], remembered as this process's ceiling.
     #[cfg(any(unix, test))]
     pub(crate) fn handoff_seq(&mut self) -> u64 {
         let last = self.log.last_seq();
@@ -2443,15 +1667,12 @@ impl SessionLog {
             self.seq_ceiling = None;
             return 0;
         }
-        // At most `SEQ_LIMIT` plus the reserve: within what TOML writes.
         let carried = last + LOG_SEQ_RESERVE;
         self.seq_ceiling = Some(carried);
         carried
     }
 
-    /// Whether this process issued a node id or a seq past the counts the
-    /// last manifest carried: the successor would issue it again, so the
-    /// Commit stands down.
+    /// Whether this process issued a node id or a seq past the counts the last manifest carried: the successor would issue it again, so the Commit stands down.
     #[cfg(any(unix, test))]
     pub(crate) fn past_handoff_ceiling(&self) -> bool {
         self.ceiling.is_some_and(|c| {
@@ -2461,37 +1682,23 @@ impl SessionLog {
     }
 }
 
-// The instance-wide cap on session log memory (design §5.1, phase 2A).
-
-/// THE INSTANCE CAP: every session log's estimated heap together
-/// (`aterm_slog::Log::footprint`, about three times what its ring's encoded
-/// bytes count), the closed-session index's included.
+/// THE INSTANCE CAP: every session log's estimated heap together (`aterm_slog::Log::footprint`, about three times what its ring's encoded bytes count), the closed-session index's included.
 pub(crate) const LOG_MEMORY_CAP: usize = 64 * 1024 * 1024;
-/// How often the event loop's sweep looks: at most once a second, on a turn
-/// the loop takes anyway (it arms no deadline of its own).
+/// How often the event loop's sweep looks: at most once a second, on a turn the loop takes anyway (it arms no deadline of its own).
 pub(crate) const SLOG_SWEEP_EVERY: std::time::Duration = std::time::Duration::from_secs(1);
-/// The most logs one pass lowers while the whole is within an eighth over
-/// the cap: the rest wait for the next pass. Past that, a pass lowers every
-/// log over its share. A log that reaches its configured minimum reserves
-/// its retained charge before the next pass divides the remaining target.
+/// The most logs one pass lowers while the whole is within an eighth over the cap: the rest wait for the next pass.
 pub(crate) const SLOG_SWEEP_MAX_SHRINK: usize = 8;
 
-/// One log's charge, as the sweep last read it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct Charge {
     footprint: usize,
     bytes: usize,
     pinned: usize,
-    /// Whether the sweep lowered its budget (and owes it a raise once there
-    /// is room again).
     lowered: bool,
-    /// The byte budget the sweep last set it to; an over-target sweep does
-    /// not raise it unless the aggregate has room again.
     budget: Option<usize>,
 }
 
-/// THE SWEEP'S STATE: the cap (a test lowers it), when it looks next, and
-/// what it last read of each pooled session's log.
+/// THE SWEEP'S STATE: the cap (a test lowers it), when it looks next, and what it last read of each pooled session's log.
 #[derive(Debug)]
 pub(crate) struct MemorySweep {
     /// The estimated-heap target for all live logs and the closed index.
@@ -2510,9 +1717,6 @@ impl Default for MemorySweep {
     }
 }
 
-/// `budget` shared out max-min fair over `wants`: every want that fits an
-/// even share gets all of it, and what it leaves goes to the larger ones,
-/// cut alike (the control carry's `core_shares` shape).
 fn fair_shares(wants: &[usize], budget: usize) -> Vec<usize> {
     if wants.iter().fold(0usize, |a, w| a.saturating_add(*w)) <= budget {
         return wants.to_vec();
@@ -2530,32 +1734,12 @@ fn fair_shares(wants: &[usize], budget: usize) -> Vec<usize> {
 }
 
 impl crate::App {
-    /// THE INSTANCE-WIDE SWEEP (design §5.1): hold every session log, and
-    /// the closed-session index, under [`MemorySweep::cap`]. At most once per
-    /// [`SLOG_SWEEP_EVERY`], on a loop turn taken anyway; never inside an
-    /// append, and never two locks at once: each timeline is taken by
-    /// `try_lock` alone, a busy one skipped (its last reading stands). Over
-    /// the cap, logs at their configured minimum reserve their observed
-    /// charge; the remaining target is shared max-min fair among the others.
-    /// Logs most over their share get a lower byte budget, which they evict
-    /// to level-aware, never below their open path: at most
-    /// [`SLOG_SWEEP_MAX_SHRINK`] a pass while the whole is within an eighth
-    /// over the cap, every one of them past that. Once the whole is an eighth
-    /// under the cap again, every lowered log gets its session bound back.
-    ///
-    /// This is a deferred estimated-heap target, not an allocator or RSS
-    /// bound. Discovering a log's configured minimum takes a pass before
-    /// its excess can be redistributed. Busy timelines, retained state
-    /// (including a handoff fence), and growth between passes can keep the
-    /// aggregate above the target. The minimum is reassessed from current
-    /// pinned bytes each pass, so closing an open path makes it shrinkable
-    /// again.
+    /// THE INSTANCE-WIDE SWEEP (design §5.1): hold every session log, and the closed-session index, under [`MemorySweep::cap`].
     pub(crate) fn sweep_session_log_memory(&mut self, now: std::time::Instant) {
         let sweep = &mut self.session_status.slog_memory;
         if sweep.due.is_some_and(|d| now < d) {
             return;
         }
-        // The journal writer's word, once a turn (≤ 1 Hz): one relaxed load.
         self.poll_session_journal();
         let sweep = &mut self.session_status.slog_memory;
         sweep.due = Some(now + SLOG_SWEEP_EVERY);
@@ -2617,10 +1801,6 @@ impl crate::App {
             })
             .collect();
         over.sort_by_key(|o| std::cmp::Reverse(o.0));
-        // Room again (an eighth of the cap free, so a raised log's regrowth
-        // does not swing straight back over): every lowered log gets its
-        // session bound back; growing past its share later is the next
-        // pass's to lower.
         let raise: Vec<u64> = if total < cap - cap / 8 {
             ids.iter()
                 .filter(|id| sweep.known.get(id).is_some_and(|c| c.lowered))
@@ -2629,9 +1809,6 @@ impl crate::App {
         } else {
             Vec::new()
         };
-        // Far over (an eighth past the cap), lower every eligible log at
-        // once. A newly discovered minimum reserves its charge on the next
-        // pass, when the remaining target can be redistributed.
         let shrink = if total > cap.saturating_add(cap / 8) {
             over.len()
         } else {
@@ -2643,10 +1820,8 @@ impl crate::App {
                 break;
             }
             let c = sweep.known[&id];
-            // The share in encoded bytes: the log's own heap to bytes ratio.
             let bytes = (c.bytes as u128 * share as u128 / c.footprint.max(1) as u128) as usize;
             let budget = bytes.max(c.pinned.saturating_add(aterm_slog::MAX_RECORD_BYTES));
-            // Keep a lowered budget while the aggregate is still over-target.
             if c.lowered && c.budget.is_some_and(|b| budget >= b) {
                 continue;
             }
@@ -2673,8 +1848,6 @@ impl crate::App {
         }
     }
 
-    /// The closed-session index's charge against the cap (its entries'
-    /// estimated heap, [`ClosedLogs::charge`]), under the store's read lock.
     fn closed_log_charge(&self) -> usize {
         self.store
             .read()
@@ -2684,11 +1857,7 @@ impl crate::App {
     }
 }
 
-// The settle wakes the event loop owes.
-
-/// The settle wakes the event loop owes, by session: one entry per session
-/// whose turn tracker has a pending settle. Empty on an idle machine, so the
-/// loop folds nothing (`DeadlineOwner::SessionLog`).
+/// The settle wakes the event loop owes, by session: one entry per session whose turn tracker has a pending settle.
 #[derive(Debug, Default)]
 pub(crate) struct Wakes {
     at: BTreeMap<u64, u64>,
@@ -2728,12 +1897,9 @@ impl Wakes {
 }
 
 impl crate::App {
-    /// Lift every session log's readers' fence (an update stood down after
-    /// its worker carried the logs, `SessionLog::carry_source`): each
-    /// timeline's leaf lock, one at a time.
+    /// Lift every session log's readers' fence (an update stood down after its worker carried the logs, `SessionLog::carry_source`): each timeline's leaf lock, one at a time.
     #[cfg(unix)]
     pub(crate) fn lift_session_log_fences(&mut self) {
-        // The journal writer goes on past the fences, in a new segment.
         crate::session_log_journal::note_stood_down();
         for session in self.pool.iter() {
             let mut timeline = session
@@ -2742,11 +1908,8 @@ impl crate::App {
                 .lock()
                 .unwrap_or_else(|p| p.into_inner());
             timeline.slog_mut().lift_read_fence();
-            // The readers see past the overlap now: the owed wake
-            // rings them in this hold.
             let _ = timeline.slog_take_wake();
         }
-        // The bus mirror's closed sessions land again (`StoreMirror::past_draw`).
         self.store
             .read()
             .unwrap_or_else(|p| p.into_inner())
@@ -2754,20 +1917,12 @@ impl crate::App {
             .lift_commit_fence();
     }
 
-    /// What a footer read wakes when it moves a session's log (phase 3B,
-    /// `claude_footer::LogWake`): the loop, under the `[session_log] clause`
-    /// switch. The session's watchers were rung where the read took the log's
-    /// owed wake (`SessionTimeline::slog_take_wake`).
+    /// What a footer read wakes when it moves a session's log (phase 3B, `claude_footer::LogWake`): the loop, under the `[session_log] clause` switch.
     pub(crate) fn footer_log_wake(&self) -> crate::claude_footer::LogWake {
         crate::claude_footer::LogWake::new(self.config.session_log_clause())
     }
 
-    /// Whether session `id`'s clause moved past what its tab's chrome was
-    /// composed with (phase 3B; addendum A12 item 4): `[session_log] clause`
-    /// on, a composition cached for the tab, and the clause's key
-    /// ([`crate::session_chrome::ClauseKey`]) another now. The timeline under
-    /// a `try_lock` (contended: no move said; the next producer's wake asks
-    /// again). Off, nothing is read.
+    /// Whether session `id`'s clause moved past what its tab's chrome was composed with (phase 3B).
     pub(crate) fn clause_moved(&self, id: u64) -> bool {
         if !self.config.session_log_clause() {
             return false;
@@ -2785,19 +1940,14 @@ impl crate::App {
         now != cached.clause
     }
 
-    /// Refresh session `id`'s tab chrome when its clause moved
-    /// ([`Self::clause_moved`]): one compose per key change, never per record
-    /// and never on a clock.
+    /// Refresh session `id`'s tab chrome when its clause moved ([`Self::clause_moved`]): one compose per key change, never per record and never on a clock.
     pub(crate) fn follow_clause(&mut self, id: u64) {
         if self.clause_moved(id) {
             self.refresh_session_status_chrome(id);
         }
     }
 
-    /// `Wake::SessionLogMoved`: the footer thread or the render path moved
-    /// session `id`'s log (phase 3B), and its watchers were rung where the
-    /// move took the log's owed wake; the loop notes the turn tracker's
-    /// settle wake, which only its tick keeps.
+    /// `Wake::SessionLogMoved`: the footer thread or the render path moved session `id`'s log (phase 3B), and its watchers were rung where the move took the log's owed wake.
     pub(crate) fn on_session_log_moved(&mut self, id: u64) {
         let Some(s) = self.pool.get(id) else {
             return;
@@ -2809,26 +1959,16 @@ impl crate::App {
             .unwrap_or_else(|p| p.into_inner())
             .slog_wake();
         self.session_status.slog_wakes.note(id, wake);
-        // An off-loop producer's move (the footer's transcript steps) reaches
-        // the tab's clause here, with the switch on.
         self.follow_clause(id);
     }
 
-    /// THE SESSION LOG's settle ticks: each session whose turn tracker's wake
-    /// is due is ticked under its timeline's leaf lock (the lock the sweep
-    /// takes on this thread), and its next wake replaces the entry. Nothing
-    /// owed, nothing done. A wake the tick hands back that is not in the future
-    /// is dropped, never re-armed: the loop cannot spin on one, and the next
-    /// verdict applies an overdue settle first, dated when its word first held.
+    /// THE SESSION LOG's settle ticks: each session whose turn tracker's wake is due is ticked under its timeline's leaf lock (the lock the sweep takes on this thread), and its next wake replaces the entry.
     pub(crate) fn tick_session_logs(&mut self) {
         if self.session_status.slog_wakes.is_empty() {
             return;
         }
         let now = crate::turn_ledger::now_ms();
         for id in self.session_status.slog_wakes.due(now) {
-            // A settle closes a turn with no output: nothing else would wake a
-            // reader parked on it (`await log close=turn`), so the tick's owed
-            // wake rings it.
             let (wake, owed) = self.pool.get(id).map_or((None, false), |s| {
                 let mut timeline = s.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
                 (timeline.slog_tick(), timeline.slog_take_wake())
@@ -2836,23 +1976,19 @@ impl crate::App {
             self.session_status
                 .slog_wakes
                 .note(id, wake.filter(|w| *w > now));
-            // A settle closes a turn: the clause moves off it.
             if owed {
                 self.follow_clause(id);
             }
         }
     }
 
-    /// The soonest settle tick owed, as an instant for the loop's deadline
-    /// fold (`DeadlineOwner::SessionLog`), or `None` while no turn rests.
+    /// The soonest settle tick owed, as an instant for the loop's deadline fold (`DeadlineOwner::SessionLog`), or `None` while no turn rests.
     pub(crate) fn next_session_log_wake(&self) -> Option<std::time::Instant> {
         let wake = self.session_status.slog_wakes.next()?;
         let now = crate::turn_ledger::now_ms();
         Some(std::time::Instant::now() + std::time::Duration::from_millis(wake.saturating_sub(now)))
     }
 }
-
-// The `log` and `brief` verbs' reading of a log.
 
 /// The `log` verb's usage line.
 pub(crate) const LOG_USAGE: &str = "ERR usage: log [<node>] [lvl=session|run|turn|step] [since=<seq> ep=<epoch>] [n=<count>] [kinds=<k>[,...]] [class=turn] [tier=content] [--json]\n";
@@ -2884,8 +2020,6 @@ pub(crate) struct LogQuery {
     pub(crate) json: bool,
 }
 
-/// The `since=` / `ep=` pair: both, or neither (`since=` alone cannot say which
-/// epoch's seq it is: seqs restart at a seamless update).
 fn cursor_of(since: Option<u64>, ep: Option<u32>) -> Result<Option<Cursor>, ()> {
     match (since, ep) {
         (None, None) => Ok(None),
@@ -2906,9 +2040,7 @@ fn parse_lvl(word: &str) -> Option<Lvl> {
 }
 
 impl LogQuery {
-    /// Parse a `log` request's arguments. The flag `--json` (or bare `json`,
-    /// the spelling every json-capable verb takes) and the one `<node>` may
-    /// stand anywhere among them.
+    /// Parse a `log` request's arguments.
     pub(crate) fn parse(rest: &str) -> Result<LogQuery, &'static str> {
         let mut q = LogQuery {
             node: Node::SESSION,
@@ -2976,8 +2108,7 @@ pub(crate) struct BriefQuery {
 }
 
 impl BriefQuery {
-    /// Parse a `brief` request's arguments; the one `<node>` (or `all`) may
-    /// stand anywhere among them.
+    /// Parse a `brief` request's arguments; the one `<node>` (or `all`) may stand anywhere among them.
     pub(crate) fn parse(rest: &str) -> Result<BriefQuery, &'static str> {
         let mut q = BriefQuery {
             node: Node::SESSION,
@@ -3022,18 +2153,11 @@ impl BriefQuery {
     }
 }
 
-/// THE `lvl=` / `class=turn` FILTER, the one the `log` verb and `subscribe …
-/// log` share (phase 3A), so the two never disagree: no record of a level
-/// deeper than `lvl`, and with `turn_class` only the turn class (what the bus
-/// mirror would carry).
+/// THE `lvl=` / `class=turn` FILTER, the one the `log` verb and `subscribe … log` share (phase 3A), so the two never disagree: no record of a level deeper than `lvl`, and with `turn_class` only the turn class (what the bus mirror would carry).
 pub(crate) fn shows(r: &Rec, lvl: Option<Lvl>, turn_class: bool) -> bool {
     lvl.is_none_or(|l| r.node.lvl <= l) && (!turn_class || r.is_turn_class())
 }
 
-/// Whether `node` lies in the subtree of `root`, by the log's own index of
-/// parents ([`Log::parent_of`]): level-aware eviction takes the open records
-/// of closed nodes, which named their parents, while records under them
-/// stay, so the parents are not read from the window.
 fn in_subtree(log: &Log, node: Node, root: Node) -> bool {
     if root == Node::SESSION {
         return true;
@@ -3051,8 +2175,6 @@ fn in_subtree(log: &Log, node: Node, root: Node) -> bool {
     false
 }
 
-/// A record as one JSON object: the line's tokens as keys, fields at or below
-/// `tier`, tokens and text unencoded.
 fn rec_json(r: &Rec, tier: Tier) -> String {
     use aterm_json::Value;
     let mut o = aterm_json::Map::new();
@@ -3086,8 +2208,6 @@ fn rec_json(r: &Rec, tier: Tier) -> String {
     aterm_json::to_string(&Value::Object(o)).unwrap_or_else(|_| "{}".to_string())
 }
 
-/// The cursor gap as one JSON object, in a `--json` reply: `{"op":"gap",
-/// "why":…,"lost":…,"resync_to":…}`, so every body line parses.
 fn gap_json(g: &Gap) -> String {
     use aterm_json::Value;
     let mut o = aterm_json::Map::new();
@@ -3098,7 +2218,6 @@ fn gap_json(g: &Gap) -> String {
     aterm_json::to_string(&Value::Object(o)).unwrap_or_else(|_| "{}".to_string())
 }
 
-/// The cursor gap as `log` and `brief` print it.
 fn gap_line(g: &Gap) -> String {
     format!(
         "gap why={} lost={} resync_to={}",
@@ -3108,31 +2227,20 @@ fn gap_line(g: &Gap) -> String {
     )
 }
 
-/// What a `log` reply needs of a log, copied under the timeline's leaf lock:
-/// the records it shows, shared with the ring (a count bump each, no field
-/// copied), and the header's numbers. The reply is rendered from the copy
-/// after the lock is released ([`crate::control::cmd_log`]), so a reader
-/// asking for the whole ring as JSON never holds the lock the event loop's
-/// status sweep takes, under the terminal guard, for the length of the
-/// encoding.
+/// What a `log` reply needs of a log, copied under the timeline's leaf lock: the records it shows, shared with the ring (a count bump each, no field copied), and the header's numbers.
 #[derive(Clone, Debug)]
 pub(crate) struct LogCopy {
     recs: Vec<Arc<Rec>>,
     gap: Option<Gap>,
-    /// Matching records left out by `n=`.
     more: usize,
     as_of: u64,
     ep: u32,
-    /// The seq from which the window is whole ([`Log::complete_from`]): the
-    /// open path is never evicted, so the oldest live record says little.
     oldest: u64,
     lost: u64,
 }
 
 impl LogCopy {
-    /// The records `q` asks for, and the header: a filter and a share of the
-    /// records shown, nothing encoded. (Named apart from every other `of`:
-    /// the lock-order census resolves a call by its name.)
+    /// The records `q` asks for, and the header: a filter and a share of the records shown, nothing encoded.
     pub(crate) fn copied_from(log: &Log, q: &LogQuery) -> LogCopy {
         let read = log.read_shared(q.cursor.unwrap_or(Cursor::new(log.ep(), 0)), usize::MAX);
         let matching: Vec<&Arc<Rec>> = read
@@ -3154,10 +2262,7 @@ impl LogCopy {
         }
     }
 
-    /// The node log's records `q` asks for (`log n`): the
-    /// same header, `oldest=` the oldest live seq (the ring is a FIFO, whole
-    /// from there). Only `since=`/`ep=`, `n=` and `kinds=` select; every
-    /// record is node `n`'s.
+    /// The node log's records `q` asks for (`log n`): the same header, `oldest=` the oldest live seq (the ring is a FIFO, whole from there).
     pub(crate) fn copied_from_node(log: &aterm_slog::NodeLog, q: &LogQuery) -> LogCopy {
         let read = log.read(q.cursor.unwrap_or(Cursor::new(log.ep(), 0)), usize::MAX);
         let matching: Vec<&Rec> = read
@@ -3167,7 +2272,6 @@ impl LogCopy {
             .collect();
         let more = q.n.map_or(0, |n| matching.len().saturating_sub(n));
         LogCopy {
-            // The node log keeps its records by value: each shown is copied.
             recs: matching[more..]
                 .iter()
                 .map(|r| Arc::new((*r).clone()))
@@ -3181,10 +2285,7 @@ impl LogCopy {
         }
     }
 
-    /// The copy with its header handing out `c` (`as_of=` its seq, `ep=` its
-    /// epoch) in place of the log's head: a journal reply's
-    /// (`aterm_slog::journal::View::reply_cursor`), which names none of the
-    /// records the reply derived past the journal's head.
+    /// The copy with its header handing out `c` (`as_of=` its seq, `ep=` its epoch) in place of the log's head: a journal reply's (`aterm_slog::journal::View::reply_cursor`), which names none of the records the reply derived past the journal's head.
     pub(crate) fn handing(mut self, c: Cursor) -> LogCopy {
         self.as_of = c.seq;
         self.ep = c.ep;
@@ -3192,12 +2293,7 @@ impl LogCopy {
     }
 }
 
-/// The `log` reply from its copy: `OK <n> v=2 as_of=<seq> ep=<e>
-/// oldest=<seq>[ lost=<n>][ more=<k>]` (`oldest=` the seq from which the
-/// window is whole, [`Log::complete_from`]), a gap line when the read crossed
-/// records the reader will never see or names another epoch (`gap why=
-/// lost= resync_to=`, or under `--json` a `{"op":"gap",…}` object, so every
-/// body line is one object), then one record per line, oldest first.
+/// The `log` reply from its copy: `OK <n> v=2 as_of=<seq> ep=<e> oldest=<seq>[ lost=<n>][ more=<k>]` (`oldest=` the seq from which the window is whole, [`Log::complete_from`]), a gap line when the read crossed records the reader will never see or names another epoch (`gap why= lost= resync_to=`, or under `--json` a `{"op":"gap",…}` object, so every body line is one object), then one record per line, oldest first.
 pub(crate) fn render_log_copy(c: &LogCopy, q: &LogQuery) -> String {
     #[cfg(test)]
     encode_probe();
@@ -3236,11 +2332,7 @@ pub(crate) fn render_log_copy(c: &LogCopy, q: &LogQuery) -> String {
 
 #[cfg(test)]
 thread_local! {
-    /// A test's probe, called as a `log`, `brief`, `history`, `timeline` or
-    /// `exits` reply starts encoding ([`render_log_copy`],
-    /// [`BriefCopy::brief`], [`render_brief_all`], and the ring verbs'
-    /// formatters in `control_session`) on this thread: what it finds held
-    /// there, the encoding runs under.
+    /// A test's probe, called as a `log`, `brief`, `history`, `timeline` or `exits` reply starts encoding ([`render_log_copy`], [`BriefCopy::brief`], [`render_brief_all`], and the ring verbs' formatters in `control_session`) on this thread: what it finds held there, the encoding runs under.
     pub(crate) static ENCODE_PROBE: std::cell::RefCell<Option<Box<dyn Fn()>>> =
         const { std::cell::RefCell::new(None) };
 }
@@ -3255,29 +2347,23 @@ pub(crate) fn encode_probe() {
     });
 }
 
-/// The `log` reply ([`render_log_copy`] over [`LogCopy::copied_from`]), in one call
-/// (tests; the verb copies under the lock and renders after it).
+/// The `log` reply ([`render_log_copy`] over [`LogCopy::copied_from`]), in one call (tests).
 #[cfg(test)]
 pub(crate) fn render_log(log: &Log, q: &LogQuery) -> String {
     render_log_copy(&LogCopy::copied_from(log, q), q)
 }
 
-/// What a brief needs of a log, copied under the timeline's leaf lock (as
-/// [`LogCopy`]): the records the reader asked for, shared with the ring, the
-/// gap that read crossed, the fold's state, and the fold's mail links.
+/// What a brief needs of a log, copied under the timeline's leaf lock (as [`LogCopy`]): the records the reader asked for, shared with the ring, the gap that read crossed, the fold's state, and the fold's mail links.
 #[derive(Clone, Debug)]
 pub(crate) struct BriefCopy {
     recs: Vec<Arc<Rec>>,
     gap: Option<Gap>,
     state: aterm_slog::SessionState,
-    /// The fold's heuristic mail links, which the brief prints as
-    /// `mail=@<off>~`.
     links: Vec<(Node, aterm_slog::MailLink)>,
 }
 
 impl BriefCopy {
-    /// The records past `cursor` (all of them: none) in `node`'s subtree, the
-    /// gap that read crossed, the state, and the mail links.
+    /// The records past `cursor` (all of them: none) in `node`'s subtree, the gap that read crossed, the state, and the mail links.
     pub(crate) fn copied_from(log: &Log, node: Node, cursor: Option<Cursor>) -> BriefCopy {
         let read = log.read_shared(cursor.unwrap_or(Cursor::new(log.ep(), 0)), usize::MAX);
         BriefCopy {
@@ -3293,15 +2379,13 @@ impl BriefCopy {
         }
     }
 
-    /// The copy with its header handing out `c` in place of the log's head
-    /// ([`LogCopy::handing`]).
+    /// The copy with its header handing out `c` in place of the log's head ([`LogCopy::handing`]).
     pub(crate) fn handing(mut self, c: Cursor) -> BriefCopy {
         self.state.as_of = c.seq;
         self.state.ep = c.ep;
         self
     }
 
-    /// What its brief reads at any budget.
     fn input(&self) -> aterm_slog::BriefInput<'_> {
         aterm_slog::BriefInput::new(
             self.recs.iter().map(|r| &**r),
@@ -3319,11 +2403,7 @@ impl BriefCopy {
     }
 }
 
-/// One session's brief: the records past the reader's cursor in the subtree
-/// asked for, against the whole fold, within `budget` tokens, with the gap
-/// that read crossed (a cursor of another epoch, ahead of the head, or behind
-/// the ring) said as `log` says it. The text starts `OK <n> brief sid=…`.
-/// In one call (tests; the verb copies under the lock and renders after it).
+/// One session's brief: the records past the reader's cursor in the subtree asked for, against the whole fold, within `budget` tokens, with the gap that read crossed (a cursor of another epoch, ahead of the head, or behind the ring) said as `log` says it.
 #[cfg(test)]
 pub(crate) fn render_brief(
     log: &Log,
@@ -3350,8 +2430,6 @@ pub(crate) struct BriefPart {
 }
 
 impl BriefPart {
-    /// Its rank among the parts `brief all` keeps first: a session that needs
-    /// something (most urgent first), then the most recently active.
     fn rank(&self) -> (u8, std::cmp::Reverse<u64>) {
         let need = self
             .copy
@@ -3362,7 +2440,6 @@ impl BriefPart {
     }
 }
 
-/// A brief's text past its `OK <n> ` prefix.
 fn past_ok_count(text: &str) -> &str {
     match text.split_once(' ') {
         Some(("OK", tail)) => tail.split_once(' ').map_or(tail, |(_, t)| t),
@@ -3370,16 +2447,7 @@ fn past_ok_count(text: &str) -> &str {
     }
 }
 
-/// The instance-wide brief (`brief all`): `OK <n> brief all sessions=<k>
-/// v=2 budget=<b> used=<u>`, then each kept session's brief without its `OK
-/// <n> ` prefix, then `more=sessions:<k>` when sessions were left out. The
-/// whole reply fits `budget` (`used=` is its estimate): the budget, less the
-/// header and the trailer, is shared out evenly among the most sessions
-/// whose one-line form fits their share, ranked by need then by recent
-/// activity ([`BriefPart::rank`]); each brief within its share sheds as one
-/// session's brief does. When not even one fits, the header and the trailer
-/// alone answer. Each part's window is scanned once, for its floor and its
-/// share alike ([`aterm_slog::Briefing`]).
+/// The instance-wide brief (`brief all`): `OK <n> brief all sessions=<k> v=2 budget=<b> used=<u>`, then each kept session's brief without its `OK <n> ` prefix, then `more=sessions:<k>` when sessions were left out.
 pub(crate) fn render_brief_all(parts: &[BriefPart], budget: usize) -> String {
     #[cfg(test)]
     encode_probe();
@@ -3394,14 +2462,11 @@ pub(crate) fn render_brief_all(parts: &[BriefPart], budget: usize) -> String {
     let inputs: Vec<aterm_slog::BriefInput<'_>> = parts.iter().map(|p| p.copy.input()).collect();
     let briefings: Vec<aterm_slog::Briefing<'_>> =
         inputs.iter().map(aterm_slog::BriefInput::scanned).collect();
-    // Each part's one-line floor (its brief at budget 0).
     let floor: Vec<usize> = parts
         .iter()
         .zip(&briefings)
         .map(|(p, b)| b.floor(&p.sid, p.now_wall).used)
         .collect();
-    // The most sessions, top-ranked, whose floors all fit an even share: then
-    // each brief at that share uses at most it, and the sum fits.
     let kept = (1..=n)
         .rev()
         .find(|&k| {
@@ -3471,8 +2536,6 @@ mod tests;
 #[path = "session_log_mark_tests.rs"]
 mod mark_tests;
 
-// Unix only, as the pipe-backed handles of `control_input_ack::testing` it
-// drives are.
 #[cfg(all(test, unix))]
 #[path = "session_log_attribution_tests.rs"]
 mod attribution_tests;

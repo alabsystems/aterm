@@ -1,84 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! CLAUDE CODE'S PROFILE, READ BY AN ALLOWLIST
-//! (`docs/DESIGN-account-stats-2026-10-15.md` §3.1, §3.3, §4.2): what the
-//! `.claude.json` Claude Code keeps beside or inside a home says about the
-//! account it is signed in to — the plan and its tiers, whether usage
-//! credits are on, the `/usage` body it caches, the two flags that say how
-//! Fable is billed — and the account's [`AccountKey`].
-//!
-//! THE SAME FILE CAN HOLD CREDENTIALS (design F17): an API key under
-//! `primaryApiKey`, `customApiKeyResponses`, and `mcpServers` — at the top
-//! level and under every project — whose `env` and `headers` often carry
-//! tokens. So it is never parsed whole. [`parse`] is a typed reader of the
-//! keys below and no others: the value of every other key is skipped as the
-//! parser scans past it (`aterm_json`'s ignored-value path, which checks a
-//! string without decoding it), so none is ever built as a value — no
-//! `aterm_json::Value` of the file exists. A kept field of the wrong type
-//! reads as absent and the rest still reads; a file that is not JSON is
-//! [`NoProfile::Unreadable`], one word, never the parser's message. [`read`]
-//! zeroes the file's bytes before it frees them, so what was skipped does
-//! not stay behind in freed memory either. `tests/profile_sentinels.rs`
-//! checks typed-output canaries and bounds allocation requests for large escaped
-//! secrets, with a materializing-reader negative control; it never scans freed
-//! or potentially uninitialized allocation contents.
-//!
-//! THE KEYS READ, by their names in Claude Code 2.1.301 (READ in its
-//! bundle; names only were surveyed on disk):
-//!
-//! * `oauthAccount`: `accountUuid` (hashed as it is read: [`AccountKey`]),
-//!   `organizationType`, `userRateLimitTier`, `organizationRateLimitTier`,
-//!   `seatTier`, `billingType`, `subscriptionCreatedAt`,
-//!   `hasExtraUsageEnabled`, `planDisplayName`, `profileFetchedAt`. Never its
-//!   `displayName`, `fullName`, `organizationName` or `organizationUuid`,
-//!   and its `emailAddress` only in the in-memory login check [`answers_to`]
-//!   and the explicitly requested, volatile footer display [`subscription_for`]
-//!   (whose roster gate [`plan_usage_for`] shares). An address the display does
-//!   not return — refused, gating only the plan, or another login's — is zeroed
-//!   before it is freed. The general [`Profile`] and account-stat records
-//!   retain no email.
-//! * `cachedExtraUsageDisabledReason`: [`Credits`].
-//! * `cachedUsageUtilization`: `fetchedAtMs`, `accountUuid` (hashed, and the
-//!   body is dropped unless it names the profile's own account, as Claude
-//!   Code drops it; one that names another keeps only its `fetchedAtMs`,
-//!   [`Profile::usage_of_another_at`]) and the usage body's windows, its
-//!   per-model weekly rows, its usage-credits spend and its two one-time
-//!   credit blocks ([`UsageCache`]).
-//! * `cachedGrowthBookFeatures`: the two Fable billing flags by name,
-//!   `tengu_saffron_credits_only_tiers` and `tengu_saffron_lattice`
-//!   ([`FablePlan`]), and `tengu_calm_seal`, the model families billed to
-//!   usage credits only ([`Profile::credits_only`]). Their names stay in this
-//!   file: what leaves it is aterm's own word.
-//! * `fableOverageConsentV2` and `usageCreditsOnlyModelConsent`: the
-//!   consents Claude Code stores to bill a model to usage credits with no
-//!   dialog (READ in the 2.1.304 bundle: `{ "<org or acct:id>": true }`, the
-//!   second per family), as the families consented
-//!   ([`Profile::consented`]). The ids they are keyed by are read past,
-//!   never kept.
-//!
-//! WHERE THE FILE IS: the home's own profile is [`path_of`], by the one
-//! resolver of a Claude home (`upgrade_drive`'s `Records`):
-//! `CLAUDE_CONFIG_DIR`'s rule, the process's own `HOME`, and an empty
-//! `CLAUDE_CONFIG_DIR`'s profile in `$HOME`. The file Claude Code reads for
-//! that home is [`effective`]: a legacy `.config.json` in its records
-//! directory can stand in for it, and a custom OAuth URL renames it.
-//!
-//! What this module answers is a record (design §8.2): it reads and
-//! decides nothing, and nothing that decides — no supervisor, no rotation —
-//! reads it, but for THREE keys: whether a login signed in again in its tab
-//! is its roster row's own account ([`answers_to`], a yes or a no), the
-//! method `/login`'s picker is answered with
-//! ([`login_method`], a plan word and nothing else), and under `[harness]
-//! usage_credits = false` which models it bills to usage credits
-//! ([`FablePlan`], [`Profile::consented`], [`Profile::credits_only`]): such a
-//! model is moved onto by no upgrade, fallback or return
-//! (`upgrade_drive::credits_billed_for`, `upgrade_models::credits_billed`;
-//! the owner, 2026-10-19) — and where the profile cannot say (no profile
-//! read, a plan not known, two logins listed), Fable is taken for billed:
-//! the review of 2026-10-19, P4. Its [`AccountKey`] and [`Word`] types are shared: the Codex
-//! rollout reader (`ai::codex_limits`) keys each usage reading by the
-//! account its rollout names, and keeps the vendor's words, in them.
+//! CLAUDE CODE'S PROFILE, READ BY AN ALLOWLIST (`docs/DESIGN-account-stats-2026-10-15.md` §3.1, §3.3, §4.2).
 
 use std::fmt;
 use std::io::Read as _;
@@ -90,10 +13,7 @@ use serde::de::{self, IgnoredAny, MapAccess, SeqAccess, Visitor};
 
 use super::upgrade_drive::{HomeVars, Records};
 
-/// The most of a `.claude.json` that is read. A larger one is
-/// [`NoProfile::TooLarge`], unread. The file holds the profile, caches and
-/// one entry per project the person opened; surveyed, a machine's was about
-/// 100 KB.
+/// The most of a `.claude.json` that is read.
 pub const PROFILE_MAX: u64 = 32 * 1024 * 1024;
 
 /// The longest text kept from the file ([`Word`]).
@@ -108,14 +28,7 @@ const KEY_DOMAIN: &[u8] = b"aterm-account-v1";
 /// The digest bytes a key keeps: twelve hex digits.
 const KEY_BYTES: usize = 6;
 
-// The key
-
-/// ONE ACCOUNT'S KEY, the same on every machine and holding no secret
-/// (design §3.1): `<c|x>-` and the first twelve hex digits of
-/// `sha256("aterm-account-v1" 0 agent 0 id)`. The id is the account's own
-/// non-secret id — Claude Code's `oauthAccount.accountUuid`, Codex's
-/// `creator_account_id` 0 `creator_user_id` — and it goes straight into the
-/// hash: no key keeps it, and nothing prints it.
+/// ONE ACCOUNT'S KEY, the same on every machine and holding no secret (design §3.1).
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct AccountKey {
     /// `c` for Claude Code, `x` for Codex.
@@ -125,16 +38,13 @@ pub struct AccountKey {
 }
 
 impl AccountKey {
-    /// The key of the Claude Code account whose `accountUuid` is `id`;
-    /// `None` for an empty or overlong id.
+    /// The key of the Claude Code account whose `accountUuid` is `id`; `None` for an empty or overlong id.
     #[must_use]
     pub fn claude(id: &str) -> Option<AccountKey> {
         Self::hashed(b'c', "claude", &[id])
     }
 
-    /// The key of the Codex account a rollout's `session_meta` names: its
-    /// `creator_account_id` and `creator_user_id` together (a Team workspace
-    /// shares the account id); `None` where either is empty or overlong.
+    /// The key of the Codex account a rollout's `session_meta` names.
     #[must_use]
     pub fn codex(account_id: &str, user_id: &str) -> Option<AccountKey> {
         Self::hashed(b'x', "codex", &[account_id, user_id])
@@ -158,8 +68,7 @@ impl AccountKey {
         Some(AccountKey { agent, digest })
     }
 
-    /// The key's first six hex digits, for a label made from it
-    /// (`home-<key6>`, design §3.1).
+    /// The key's first six hex digits, for a label made from it (`home-<key6>`, design §3.1).
     #[must_use]
     pub fn short(&self) -> String {
         let mut out = String::with_capacity(6);
@@ -167,9 +76,7 @@ impl AccountKey {
         out
     }
 
-    /// A key back from its text ([`fmt::Display`]: `c-` or `x-` and twelve
-    /// lowercase hex digits), as the accounts state keeps it; `None` for any
-    /// other text.
+    /// A key back from its text ([`fmt::Display`]: `c-` or `x-` and twelve lowercase hex digits), as the accounts state keeps it.
     #[must_use]
     pub fn parse(text: &str) -> Option<AccountKey> {
         let (agent, hex) = match text.split_once('-')? {
@@ -177,7 +84,6 @@ impl AccountKey {
             ("x", hex) => (b'x', hex),
             _ => return None,
         };
-        // Lowercase only, as the key is written: one key, one spelling.
         if !aterm_codec::hex::is_lower(hex, 2 * KEY_BYTES) {
             return None;
         }
@@ -203,11 +109,7 @@ impl fmt::Debug for AccountKey {
     }
 }
 
-// What is answered
-
-/// A WORD FROM THE VENDOR'S FILE: kept only when it is 1 to [`WORD_MAX`]
-/// bytes of printable ASCII, so nothing kept from the file can carry an
-/// escape sequence to a terminal or run on past a line.
+/// A WORD FROM THE VENDOR'S FILE.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Word(Box<str>);
 
@@ -226,9 +128,7 @@ impl Word {
     }
 }
 
-/// THE PLAN, from `oauthAccount.organizationType` as Claude Code maps it
-/// (`claude_max` → `max`, … — READ in 2.1.301), any other value
-/// [`PlanWord::Other`].
+/// THE PLAN, from `oauthAccount.organizationType` as Claude Code maps it (`claude_max` → `max`, … — READ in 2.1.301), any other value [`PlanWord::Other`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PlanWord {
     /// `claude_max`.
@@ -254,8 +154,7 @@ impl PlanWord {
         }
     }
 
-    /// The word JSON carries; for the four plans also the subscription
-    /// word Claude Code compares with its flags.
+    /// The word JSON carries; for the four plans also the subscription word Claude Code compares with its flags.
     #[must_use]
     pub fn word(self) -> &'static str {
         match self {
@@ -280,15 +179,12 @@ impl PlanWord {
     }
 }
 
-/// THE PLAN AND ITS TIERS (design §3.3), each `None` where the profile
-/// does not say.
+/// THE PLAN AND ITS TIERS (design §3.3), each `None` where the profile does not say.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Plan {
     /// [`PlanWord`].
     pub word: Option<PlanWord>,
-    /// The served rate-limit tier — `userRateLimitTier`, else
-    /// `organizationRateLimitTier` — with a trailing multiple taken as
-    /// itself (`default_claude_max_5x` → `5x`), else the word as it is.
+    /// The served rate-limit tier.
     pub tier: Option<Word>,
     /// `seatTier`.
     pub seat: Option<Word>,
@@ -300,14 +196,12 @@ pub struct Plan {
     pub subscribed_at: Option<i64>,
     /// `hasExtraUsageEnabled`.
     pub extra_usage: Option<bool>,
-    /// `profileFetchedAt`, Unix seconds: when Claude Code last fetched the
-    /// profile (it refetches one 24 h old at a start).
+    /// `profileFetchedAt`, Unix seconds: when Claude Code last fetched the profile (it refetches one 24 h old at a start).
     pub fetched_at: Option<i64>,
 }
 
 impl Plan {
-    /// The plan as a person reads it: its word and, where the tier is a
-    /// multiple, the multiple (`Max 5x`, `Pro`); `None` with no plan word.
+    /// The plan as a person reads it: its word and, where the tier is a multiple, the multiple (`Max 5x`, `Pro`).
     #[must_use]
     pub fn title(&self) -> Option<String> {
         let word = self.word?.title();
@@ -320,9 +214,7 @@ impl Plan {
     }
 }
 
-/// WHETHER USAGE CREDITS ARE ON, from `cachedExtraUsageDisabledReason`,
-/// which Claude Code rewrites from every served reply's headers (design
-/// F5): `null` when the header is absent.
+/// WHETHER USAGE CREDITS ARE ON, from `cachedExtraUsageDisabledReason`, which Claude Code rewrites from every served reply's headers (design F5).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Credits {
     /// The key is absent, or holds neither text nor `null`.
@@ -357,8 +249,7 @@ impl Credits {
     }
 }
 
-/// WHICH WINDOW A CACHED READING IS OF: aterm's closed bucket ids (design
-/// §7.2).
+/// WHICH WINDOW A CACHED READING IS OF: aterm's closed bucket ids (design §7.2).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Bucket {
     /// `five_hour`.
@@ -369,9 +260,7 @@ pub enum Bucket {
     SevenDaySonnet,
     /// `seven_day_opus`.
     SevenDayOpus,
-    /// `seven_day_overage_included`: Fable's weekly bucket, every Fable
-    /// name (`Fable`, `Fable 5`, …) — the body's `limits[]` row of kind
-    /// `weekly_scoped` (design F2).
+    /// `seven_day_overage_included`: Fable's weekly bucket, every Fable name (`Fable`, `Fable 5`, …).
     Fable,
     /// `seven_day_other`: a `weekly_scoped` row of any other name.
     Other,
@@ -405,8 +294,7 @@ pub struct CachedWindow {
     pub resets_at: Option<i64>,
 }
 
-/// THE USAGE-CREDITS SPEND the body carries (`extra_usage`): amounts in the
-/// currency's minor units (cents for USD), as the vendor sends them.
+/// THE USAGE-CREDITS SPEND the body carries (`extra_usage`).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CreditsMoney {
     /// `is_enabled`: whether credits can cover sends now.
@@ -423,8 +311,7 @@ pub struct CreditsMoney {
     pub disabled_reason: Option<Word>,
 }
 
-/// WHICH ONE-TIME CREDIT BLOCK, in aterm's words for the panel's titles
-/// (the vendor's keys for them are codenames, which stay here).
+/// WHICH ONE-TIME CREDIT BLOCK, in aterm's words for the panel's titles (the vendor's keys for them are codenames, which stay here).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OneTimeKind {
     /// The panel's "Claude Code and Cowork credit".
@@ -459,9 +346,7 @@ pub struct OneTime {
     pub limit_usd: Option<f64>,
 }
 
-/// THE `/usage` BODY CLAUDE CODE CACHED (`cachedUsageUtilization`, design
-/// F3): written when a person opens `/usage`, at most once a minute per
-/// home. Kept only when it names the profile's own account.
+/// THE `/usage` BODY CLAUDE CODE CACHED (`cachedUsageUtilization`, design F3).
 #[derive(Clone, Debug, PartialEq)]
 pub struct UsageCache {
     /// `fetchedAtMs`.
@@ -474,31 +359,16 @@ pub struct UsageCache {
     pub one_time: Vec<OneTime>,
 }
 
-/// HOW THE PLAN BILLS FABLE — a hint, in aterm's words (design §3.3, F18,
-/// Q16), decided in the order Claude Code 2.1.301 decides it (READ in its
-/// bundle): a login billed per request — an Enterprise seat
-/// `enterprise_usage_based`, or the tier `default_claude_zero` — gates Fable
-/// as it does the plan's own models, so included; else Enterprise on any
-/// other seat, or a plan whose subscription word is in
-/// `tengu_saffron_credits_only_tiers`, is credits only; else
-/// `tengu_saffron_lattice` says whether a Fable model is billed to usage
-/// credits (a `perModel` entry for a Fable id first; then `enabled: false`
-/// says no, and `overageConsentRequired` or a `planLimitsEndDate` says yes),
-/// with the date where it names one. A flag the answer needs that is absent,
-/// or whose value or plan-wide keys are of another shape than Claude Code
-/// parses, is [`FablePlan::Unknown`]: Claude Code would fall back to a
-/// default there, and a hint does not guess which.
+/// HOW THE PLAN BILLS FABLE.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FablePlan {
     /// Fable counts against the plan's own limits.
     Included,
     /// Fable runs on usage credits only.
     CreditsOnly,
-    /// The plan's Fable limits end at a date (`None`: a date that did not
-    /// read), and Fable goes to usage credits.
+    /// The plan's Fable limits end at a date (`None`: a date that did not read), and Fable goes to usage credits.
     LimitsEnd(Option<i64>),
-    /// A flag is absent or did not read (renamed, or another shape), or the
-    /// plan is not known.
+    /// A flag is absent or did not read (renamed, or another shape), or the plan is not known.
     Unknown,
 }
 
@@ -535,30 +405,20 @@ pub struct Profile {
     pub credits: Credits,
     /// [`UsageCache`].
     pub usage: Option<UsageCache>,
-    /// When a cached `/usage` body that names ANOTHER ACCOUNT than this
-    /// profile's was fetched (`fetchedAtMs`, Unix seconds): that account was
-    /// signed in to the home then. The body itself is not kept
-    /// ([`Self::usage`]); `None` where none names another, or the profile
-    /// names no account.
+    /// When a cached `/usage` body that names ANOTHER ACCOUNT than this profile's was fetched (`fetchedAtMs`, Unix seconds).
     pub usage_of_another_at: Option<i64>,
     /// [`FablePlan`].
     pub fable: FablePlan,
-    /// The model families a stored consent bills to usage credits with no
-    /// dialog, lowercased (`fable` by `fableOverageConsentV2`, a family of
-    /// `usageCreditsOnlyModelConsent`): any id's `true` counts — a home two
-    /// logins share keeps both theirs.
+    /// The model families a stored consent bills to usage credits with no dialog, lowercased (`fable` by `fableOverageConsentV2`, a family of `usageCreditsOnlyModelConsent`).
     pub consented: Vec<String>,
-    /// The model families billed to usage credits only, lowercased
-    /// (`tengu_calm_seal`); `None`: the flag absent or of another shape.
+    /// The model families billed to usage credits only, lowercased (`tengu_calm_seal`); `None`: the flag absent or of another shape.
     pub credits_only: Option<Vec<String>>,
 }
 
 /// WHY NO PROFILE WAS READ, one closed word each ([`NoProfile::word`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NoProfile {
-    /// The home could not be resolved, so no file was looked for: a
-    /// relative `CLAUDE_CONFIG_DIR` with no `CLAUDE_PID` whose working
-    /// directory it resolves under could be read, or no absolute `HOME`.
+    /// The home could not be resolved, so no file was looked for.
     NoHome,
     /// No file there.
     Missing,
@@ -584,19 +444,7 @@ impl NoProfile {
     }
 }
 
-// Where, and the read
-
-/// THE PROFILE CLAUDE CODE KEEPS FOR THE HOME a process's environment names
-/// — its raw `CLAUDE_CONFIG_DIR` (`config`, `None` unset) and its raw
-/// `HOME` (`home`, `None` for the user's) — for a user whose home is
-/// `user_home`, by the one resolver aterm names every Claude home with
-/// (`Records::at`, `Records::profile`): `~/.claude.json` beside the user's
-/// own `~/.claude` with `CLAUDE_CONFIG_DIR` unset, `<dir>/.claude.json`
-/// inside the directory a set one names (`~/.claude` itself included), and
-/// `$HOME`'s for an empty one. `cwd` reads the working directory a relative
-/// one resolves under; `None` where there is none. The home's own profile,
-/// which names the home; the file Claude Code reads for it is
-/// [`effective`].
+/// THE PROFILE CLAUDE CODE KEEPS FOR THE HOME a process's environment names.
 #[must_use]
 pub fn path_of(
     user_home: &Path,
@@ -607,28 +455,13 @@ pub fn path_of(
     Records::at(user_home, HomeVars { config, home }, cwd).profile(user_home)
 }
 
-/// The profile of the home whose records are in `dir`, the raw
-/// `CLAUDE_CONFIG_DIR` that named it being `config` ([`path_of`], for a
-/// caller that resolved the directory already).
+/// The profile of the home whose records are in `dir`, the raw `CLAUDE_CONFIG_DIR` that named it being `config` ([`path_of`], for a caller that resolved the directory already).
 #[must_use]
 pub fn path_in(user_home: &Path, config: Option<&str>, dir: &Path) -> PathBuf {
     super::upgrade_drive::profile_in(user_home, HomeVars::config(config), dir)
 }
 
-/// THE FILE CLAUDE CODE READS AS THE PROFILE OF THE HOME whose own
-/// profile is `plain` ([`path_of`]) and whose records are in `records`
-/// (`CLAUDE_CONFIG_DIR ?? ~/.claude`), picked as Claude Code 2.1.301's
-/// `v_()` picks it (READ in its bundle; a launch with its diskless option
-/// takes the plain file): `<records>/.config.json` (the bundle's
-/// `legacyPath`) when it is a regular file (a link followed) and either
-/// holds a byte or, with a write bit set, stands where no plain file is;
-/// else the plain file, which Claude Code names
-/// `.claude-custom-oauth.json` when `CLAUDE_CODE_CUSTOM_OAUTH_URL` is set
-/// and not empty (`custom_oauth`, [`custom_oauth`]: `R9()`). With
-/// `records` unknown (an empty `CLAUDE_CONFIG_DIR` whose working
-/// directory could not be read) no `.config.json` is looked for. `plain`
-/// stays the home's identity; this names only the file that holds its
-/// login.
+/// Profile file Claude Code reads for the home whose plain profile is `plain` ([`path_of`]) and whose records live in `records`.
 #[must_use]
 pub fn effective(plain: &Path, records: Option<&Path>, custom_oauth: bool) -> PathBuf {
     let plain = if custom_oauth {
@@ -646,15 +479,7 @@ pub fn effective(plain: &Path, records: Option<&Path>, custom_oauth: bool) -> Pa
     plain
 }
 
-/// THE KEY OF THE ACCOUNT SIGNED IN TO THE DEFAULT HOME of a user whose
-/// home is `user_home` — `CLAUDE_CONFIG_DIR` unset, the one home the usage
-/// tap serves (`super::tap::own_login`) — read from the file Claude Code
-/// reads for it ([`effective`]: `~/.claude.json`, or a `.config.json` in
-/// `~/.claude` standing in for it) through [`read`], the allowlist. `None`
-/// where no profile reads or it names no account. A process launched with a
-/// custom OAuth URL keeps its login in another file ([`custom_oauth`]),
-/// which this does not follow: the tap's own reading carries no such
-/// variable to tell.
+/// THE KEY OF THE ACCOUNT SIGNED IN TO THE DEFAULT HOME of a user whose home is `user_home`.
 #[must_use]
 pub fn default_home_key(user_home: &Path) -> Option<AccountKey> {
     let plain = path_of(user_home, None, None, || None)?;
@@ -663,7 +488,6 @@ pub fn default_home_key(user_home: &Path) -> Option<AccountKey> {
 }
 
 /// The profile filename selected by a process's own exec environment.
-/// Unknown context never grants a billing decision. No URL or credential is kept.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Selection {
     /// The exec environment was not read, or disagrees on the selector.
@@ -676,8 +500,7 @@ pub enum Selection {
 }
 
 impl Selection {
-    /// Read only the selector from a captured exec environment. Empty means
-    /// unread, not a known default. Conflicting duplicate values are unknown.
+    /// Read only the selector from a captured exec environment.
     #[must_use]
     pub fn of_exec_env(env: &[String]) -> Self {
         if env.is_empty() {
@@ -703,9 +526,7 @@ impl Selection {
     }
 }
 
-/// The process's captured profile identity for a billing decision. This
-/// live-only context is separate from older model/access-cache path identity.
-/// It contains paths and a filename choice, never profile bytes or an OAuth URL.
+/// The process's captured profile identity for a billing decision.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Context {
     /// The exact plain profile path resolved from the process's HOME/config.
@@ -714,8 +535,7 @@ pub struct Context {
     pub records: PathBuf,
     /// The filename choice from its own captured exec environment.
     pub selection: Selection,
-    /// The captured HOME, USERPROFILE on Windows ([`super::accounts::HOMEDIR_ENV`];
-    /// unset/empty remain distinct).
+    /// The captured HOME, USERPROFILE on Windows ([`super::accounts::HOMEDIR_ENV`]; unset/empty remain distinct).
     pub home: Option<String>,
     /// The captured CLAUDE_CONFIG_DIR (unset/empty remain distinct).
     pub config: Option<String>,
@@ -724,7 +544,6 @@ pub struct Context {
 }
 
 /// One exec variable, known unset versus unknown/conflicting. No environment
-/// of the supervising process is consulted.
 fn exec_var<'a>(env: &'a [String], name: &str) -> Option<Option<&'a str>> {
     if env.is_empty() {
         return None;
@@ -744,8 +563,7 @@ fn exec_var<'a>(env: &'a [String], name: &str) -> Option<Option<&'a str>> {
 }
 
 impl Context {
-    /// The profile paths of already-resolved records, with the process's
-    /// own HOME/config/login and filename selector. Pure captured data.
+    /// The profile paths of already-resolved records, with the process's own HOME/config/login and filename selector.
     pub(super) fn of_exec_env(user_home: &Path, records: &Path, env: &[String]) -> Option<Self> {
         let vars = HomeVars {
             config: exec_var(env, super::accounts::HOME_ENV)?,
@@ -765,12 +583,7 @@ impl Context {
         })
     }
 
-    /// A Standard model move's complete profile environment. Each relevant
-    /// variable is set or explicitly removed, so a shell's mutable inherited
-    /// environment is never evidence of the target's billing context. The
-    /// required home/login overlay remains authoritative; a changed context
-    /// is refused by the caller. Custom OAuth needs its URL, which is never
-    /// retained here: it cannot take this path with billing disabled.
+    /// A Standard model move's complete profile environment.
     pub(super) fn for_launch(
         &self,
         user_home: &Path,
@@ -804,8 +617,6 @@ impl Context {
         }) {
             return None;
         }
-        // The vendor's selector tests truthiness: an explicit empty value
-        // selects Standard even if the shell currently holds a custom URL.
         values.push(("CLAUDE_CODE_CUSTOM_OAUTH_URL", String::new()));
         let env: Vec<String> = values
             .iter()
@@ -827,20 +638,14 @@ impl Context {
     }
 }
 
-/// Required values and removals, plus the context resolved only from those
-/// words. No shell environment, OAuth URL or profile bytes are retained.
+/// Required values and removals, plus the context resolved only from those words.
 pub(super) struct LaunchEnv {
     pub values: Vec<(&'static str, String)>,
     pub unset: Vec<&'static str>,
     pub context: Context,
 }
 
-/// The effective profile, with selection uncertainty preserved for a billing
-/// decision. Unlike [`effective`]'s informational fallback, an unreadable
-/// selector is an error; only `NotFound` proves a candidate absent.
-/// A usable legacy file is also unknown here: the documented diskless
-/// branch ignores it, and the captured context does not identify that branch.
-/// This refuses a decision rather than merging two possible accounts.
+/// The effective profile, with selection uncertainty preserved for a billing decision.
 ///
 /// # Errors
 /// Missing process context or records, or selection metadata that cannot be read.
@@ -876,32 +681,13 @@ pub(super) fn effective_for_billing(
     }
 }
 
-/// Whether a raw `CLAUDE_CODE_CUSTOM_OAUTH_URL` renames the profile
-/// ([`effective`]): set and not empty, as JavaScript tests it.
+/// Whether a raw `CLAUDE_CODE_CUSTOM_OAUTH_URL` renames the profile ([`effective`]): set and not empty, as JavaScript tests it.
 #[must_use]
 pub fn custom_oauth(raw: Option<&std::ffi::OsStr>) -> bool {
     raw.is_some_and(|url| !url.is_empty())
 }
 
-/// THE METHOD A CLAUDE CODE PROCESS'S LOGIN IS, for the one key the harness
-/// presses on `/login`'s method picker (`supervise::policy::login`): the ONE
-/// decision this module's record feeds. `env` is the process's own exec
-/// environment (`KEY=value`), `user_home` the user's home; `renewable` says a
-/// roster row with an email names the process's login (a claude.ai account:
-/// a renewal's check holds it to `authMethod: claude.ai`).
-///
-/// A SUBSCRIPTION — the picker's `Claude account with subscription` — only
-/// where the process authenticates by a stored login (nothing in its
-/// environment gives it a key, a token, a provider or a route of its own:
-/// [`super::accounts::ProcessLogin::of_exec_env`]) and that login is a
-/// renewable row's, or the profile of its home names one of claude.ai's four
-/// plans (`oauthAccount.organizationType`, [`PlanWord`]): a login Claude
-/// Code's subscription sign-in made. `None` everywhere else — an environment
-/// credential (`/login` cannot change it), a Console login, a profile that
-/// cannot be read or names no plan: never a guess. The profile is the file
-/// [`effective`] selects; unknown records (a relative or empty config directory
-/// with no working directory) name no method. Reads only that allowlisted
-/// profile ([`read`]) and its selection metadata.
+/// THE METHOD A CLAUDE CODE PROCESS'S LOGIN IS, for the one key the harness presses on `/login`'s method picker (`supervise::policy::login`).
 #[must_use]
 pub fn login_method(
     env: &[String],
@@ -921,9 +707,6 @@ pub fn login_method(
 }
 
 /// The profile Claude Code reads for the home a process's exec environment
-/// `env` names ([`effective`] over [`path_of`]'s home), for a user whose
-/// home is `user_home`; `None` where the records cannot be named (a
-/// relative or empty config directory with no working directory).
 fn effective_of(env: &[String], user_home: &Path) -> Option<PathBuf> {
     let var = |name: &str| {
         env.iter()
@@ -947,16 +730,7 @@ fn effective_of(env: &[String], user_home: &Path) -> Option<PathBuf> {
     ))
 }
 
-/// WHETHER THE LOGIN A CLAUDE CODE PROCESS'S HOME HOLDS ANSWERS TO `email`,
-/// a roster row's address ([`super::accounts::email_matches`]): the identity
-/// check of a login signed in again in its tab, as a renewal's check is of
-/// its staging login — so a row is restored only for its own account
-/// (`accounts::note_signed_back`; the review's acct-6). `env` is the
-/// process's own exec environment, `user_home` the user's home; the profile
-/// is the one [`effective`] selects. This login check reads
-/// `oauthAccount.emailAddress` by a reader of that key alone:
-/// compared in memory and its bytes zeroed, never returned, kept, logged or
-/// printed. `None`: no profile read, or none that names an address.
+/// WHETHER THE LOGIN A CLAUDE CODE PROCESS'S HOME HOLDS ANSWERS TO `email`, a roster row's address ([`super::accounts::email_matches`]).
 #[must_use]
 pub fn answers_to(env: &[String], user_home: &Path, email: &str) -> Option<bool> {
     let path = effective_of(env, user_home)?;
@@ -977,12 +751,9 @@ pub fn answers_to(env: &[String], user_home: &Path, email: &str) -> Option<bool>
 }
 
 /// How long a cached `/usage` reading stays current ([`current_windows`]). Claude Code
-/// writes the cache only when a person opens `/usage`, so an older reading cannot say
-/// what is used now.
 const USAGE_CURRENT_S: i64 = 15 * 60;
 
-/// Facts for the requested on-screen account/subscription display. These are volatile
-/// presentation values, never account-stat records, settings or authentication material.
+/// Facts for the requested on-screen account/subscription display.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct SubscriptionDisplay {
     /// The email the selected profile actually names; never a configured roster guess.
@@ -991,13 +762,11 @@ pub struct SubscriptionDisplay {
     pub plan: Option<String>,
     /// Its weekly quota, only while the selected account's cached sample is current.
     pub weekly: Option<String>,
-    /// The screen reading's placed reset, retained after expiry so an
-    /// unchanged card cannot revive the same window.
+    /// The screen reading's placed reset, retained after expiry so an unchanged card cannot revive the same window.
     pub weekly_reset: Option<WeeklyReset>,
 }
 
-/// One reset occurrence, placed when the card is first observed. The words
-/// distinguish a later window without re-placing a relative time on every read.
+/// One reset occurrence, placed when the card is first observed.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct WeeklyReset {
     /// The card's reset words, which identify the observed window.
@@ -1006,10 +775,7 @@ pub struct WeeklyReset {
     pub at: Option<i64>,
 }
 
-/// THE PLAN AS A DATED FACT (`docs/DESIGN-stats-deck-v2-2026-10-20.md` §8.4): the
-/// window that binds a tab's model, from the cached `/usage` reading of the profile
-/// [`plan_usage_for`] selects. Volatile, like [`SubscriptionDisplay`]: never an
-/// account-stat record.
+/// THE PLAN AS A DATED FACT (`docs/DESIGN-stats-deck-v2-2026-10-20.md` §8.4).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct PlanUsage {
     /// The account the reading is of.
@@ -1025,10 +791,7 @@ pub struct PlanUsage {
 }
 
 impl PlanUsage {
-    /// Whether this reading still says what is used at `now` (Unix seconds), by the
-    /// currency rule [`plan_usage_for`] read it under ([`current_windows`]): fetched at
-    /// most [`USAGE_CURRENT_S`] ago and not after `now`, and its window resetting after
-    /// `now`. A caller that keeps a reading past the read that made it asks this.
+    /// Whether this reading still says what is used at `now` (Unix seconds), by the currency rule [`plan_usage_for`] read it under ([`current_windows`]).
     #[must_use]
     pub fn current_at(&self, now: i64) -> bool {
         self.read_at <= now
@@ -1037,20 +800,7 @@ impl PlanUsage {
     }
 }
 
-/// Read the on-screen subscription facts from this process's selected profile. The
-/// address, plan and account-validated usage come from the same bounded file read.
-/// An environment credential route, unknown selector or unreadable profile answers nothing;
-/// callers replace their previous display rather than retaining another account's facts.
-/// The caller must also verify the process's settings and provider/profile-store sources
-/// leave its stored login selected; this reader inspects the captured environment only.
-/// Named secure-storage logins share their home's profile: its email must match the
-/// roster binding for this exact login. The default login needs the same check when
-/// its home lists several logins. A roster email gates the read, never supplies text.
-/// `Some(empty)` means no logins are configured; `None` means the roster is unknown,
-/// so the default shared home cannot establish which login the profile describes.
-///
-/// The window's resolver reads both halves at once ([`subscription_and_plan_for`]); this
-/// and [`plan_usage_for`] are each half alone, over the same selection.
+/// Read the on-screen subscription facts from this process's selected profile.
 #[must_use]
 pub fn subscription_for(
     env: &[String],
@@ -1062,20 +812,7 @@ pub fn subscription_for(
     selected_profile(env, user_home, records, roster).map(|selected| selected.subscription(now))
 }
 
-/// The plan usage of this process's selected profile at `now`, for the tab's `model`: an
-/// id (`claude-opus-5-5`), an alias (`opus`) or a display name (`Opus 5.5`), `None` when
-/// it is not known. The profile is the one [`subscription_for`] reads, by the same
-/// selection and the same roster gate, so it never answers with another login's plan;
-/// the caller's duties and the roster's meaning are the same as there. The binding window
-/// is the most used of the current windows ([`current_windows`]) that gate the model: the
-/// five-hour, the seven-day, and the model's own weekly bucket (Opus, Sonnet or Fable;
-/// of Fable's per-version rows, the one named for the model where one is). `None` where
-/// nothing is selected, no reading is current, no window that gates the model is current,
-/// or one that is has a share that did not read (which window binds is then not known).
-///
-/// The window's resolver reads this with the display ([`subscription_and_plan_for`]);
-/// this is that half alone, as the Stats Deck design names it. The address that gated
-/// the read is zeroed with it, never returned.
+/// The plan usage of this process's selected profile at `now`, for the tab's `model`.
 #[must_use]
 pub fn plan_usage_for(
     env: &[String],
@@ -1088,9 +825,7 @@ pub fn plan_usage_for(
     selected_profile(env, user_home, records, roster)?.plan_usage(now, model)
 }
 
-/// [`subscription_for`] and [`plan_usage_for`] from one read of the selected profile, for
-/// the caller that keeps both (the Claude footer's resolver): the two never describe two
-/// versions of a profile a login rewrote between reads.
+/// [`subscription_for`] and [`plan_usage_for`] from one read of the selected profile, for the caller that keeps both (the Claude footer's resolver).
 #[must_use]
 pub fn subscription_and_plan_for(
     env: &[String],
@@ -1105,24 +840,7 @@ pub fn subscription_and_plan_for(
     Some((selected.subscription(now), plan))
 }
 
-/// THE ACCOUNT A MUSE CODE PROCESS IS SIGNED IN AS, for the footer's
-/// volatile display ([`SubscriptionDisplay`]): Muse Code's own login
-/// store, `muse/auth.json` under the config home its environment names
-/// (`XDG_CONFIG_HOME`, else `~/.config`; MEASURED on 1.4.11-R6667.1,
-/// where the `meta` provider's row carries `user_email` beside its
-/// `oauth` mechanism and the credential itself in the keychain), for a
-/// process on the Meta provider alone: an explicit `--provider` or
-/// `-c provider=…` in its argv, else its global `settings.json`'s
-/// `provider`, else Muse Code's own `meta` default. The
-/// tier and the weekly quota are not in the store; the window reads
-/// those off Muse Code's own `/status` and `/usage` cards
-/// (`aterm_phase::muse::status_card_account`,
-/// `aterm_phase::muse::usage_card_weekly`). `None` where the process
-/// runs on another provider, on an API key (`META_API_KEY` in its
-/// environment: its `/status` card then names no account), no store
-/// reads, or its `meta` row names no address: nothing shown rather
-/// than guessed, and the address is returned only as this display,
-/// never logged or recorded.
+/// THE ACCOUNT A MUSE CODE PROCESS IS SIGNED IN AS, for the footer's volatile display ([`SubscriptionDisplay`]).
 #[must_use]
 pub fn muse_subscription_for(
     argv: &[String],
@@ -1188,9 +906,6 @@ pub fn muse_subscription_for(
 }
 
 /// The provider a Muse Code command line names (`--provider` in either
-/// spelling, a `-c`/`--config provider=…` for this run; the last one
-/// named, as its launch flags read), lower-cased. Words after `--` are
-/// its prompt, not its flags.
 fn muse_provider_arg(argv: &[String]) -> Option<String> {
     let config_provider = |spec: &str| {
         let (key, value) = spec.split_once('=')?;
@@ -1239,7 +954,6 @@ struct Selected {
 
 impl Drop for Selected {
     /// An address no display took — a refused selection's, or one that only gated the
-    /// plan — is zeroed before it is freed, as [`answers_to`]'s is.
     fn drop(&mut self) {
         if let Some(email) = self.email.take() {
             wipe(&mut email.into_bytes());
@@ -1248,9 +962,6 @@ impl Drop for Selected {
 }
 
 /// THE ONE SELECTION behind [`subscription_for`] and [`plan_usage_for`]: the profile the
-/// process's own exec environment selects, for a stored login only, read once, and kept
-/// only where the roster binds that login to the address the profile names (see
-/// [`subscription_for`] for the cases).
 fn selected_profile(
     env: &[String],
     user_home: &Path,
@@ -1268,8 +979,6 @@ fn selected_profile(
         context.selection == Selection::CustomOauth,
     );
     let read = read_with(&file, parse_selected).ok()?;
-    // CLAUDE_SECURESTORAGE_CONFIG_DIR changes the keychain item, not this file.
-    // A different login can overwrite the shared profile while this tab stays open.
     let selected = (who.default_home || who.login.is_some())
         .then(|| {
             roster.and_then(|listed| {
@@ -1299,8 +1008,6 @@ fn selected_profile(
 /// The profile ([`parse`]) and its address, from one file's bytes.
 fn parse_selected(bytes: &[u8]) -> Result<Selected, NoProfile> {
     let profile = parse(bytes)?;
-    // This second typed allowlist reads only the address. The general Profile stays
-    // unchanged, and unrelated values (including credential strings) remain skipped.
     let Obj(raw) =
         aterm_json::from_slice::<Obj<RawWho>>(bytes).map_err(|_| NoProfile::Unreadable)?;
     let email = raw
@@ -1319,7 +1026,6 @@ fn parse_selected(bytes: &[u8]) -> Result<Selected, NoProfile> {
 impl Selected {
     /// The footer's display of this read at `now`.
     fn subscription(mut self, now: i64) -> SubscriptionDisplay {
-        // The underlying parser discards cached usage with a different accountUuid.
         let weekly = self.profile.usage.as_ref().and_then(|usage| {
             let window = current_windows(usage, now).find(|row| row.bucket == Bucket::SevenDay)?;
             let left = 1000_u16.saturating_sub(window.used_pct_x10?);
@@ -1353,8 +1059,6 @@ impl Selected {
                 matches!(row.bucket, Bucket::FiveHour | Bucket::SevenDay) || Some(row.bucket) == own
             })
             .collect();
-        // Fable's weekly rows are per version (`Fable 5`, `Fable 5.1`): the row named for
-        // the model is its own. Where none is, which one gates it is not known, so all do.
         let shown = model.map(super::footer::model_display);
         let named = |row: &CachedWindow| {
             row.bucket == Bucket::Fable
@@ -1368,11 +1072,9 @@ impl Selected {
         let (used_x10, window) = gating
             .into_iter()
             .filter(|row| !by_name || row.bucket != Bucket::Fable || named(row))
-            // A gating window whose share did not read may be the one that binds.
             .map(|row| Some((row.used_pct_x10?, row)))
             .collect::<Option<Vec<_>>>()?
             .into_iter()
-            // Of two windows used alike, the one that resets later binds longer.
             .max_by_key(|(used, row)| (*used, row.resets_at))?;
         Some(PlanUsage {
             account: self.profile.key?,
@@ -1385,9 +1087,6 @@ impl Selected {
 }
 
 /// THE CURRENCY RULE of a cached `/usage` reading: the windows of `usage` that still say
-/// what is used at `now`. None when Claude Code fetched it over [`USAGE_CURRENT_S`] ago or
-/// after `now`, and of the rest only those that reset after `now`: an expired window, or one
-/// that names no reset, cannot say what remains.
 fn current_windows(usage: &UsageCache, now: i64) -> impl Iterator<Item = &CachedWindow> {
     let current = usage
         .fetched_at_ms
@@ -1403,8 +1102,6 @@ fn current_windows(usage: &UsageCache, now: i64) -> impl Iterator<Item = &Cached
 }
 
 /// The weekly bucket of `model`'s own family, for a model named by id
-/// (`claude-opus-5-5`), alias (`opus`) or display name (`Opus 5.5`); `None` for a family
-/// the usage body keeps no bucket of.
 fn model_bucket(model: &str) -> Option<Bucket> {
     let short = super::usage::model_short(model);
     let family: String = short
@@ -1419,20 +1116,15 @@ fn model_bucket(model: &str) -> Option<Bucket> {
     }
 }
 
-/// READ THE PROFILE AT `path` ([`parse`]). Opened without blocking (a FIFO
-/// planted there cannot hold the reader), judged a regular file on the open
-/// handle, read whole into one buffer sized once — never grown, so no copy
-/// of it is left behind — and that buffer is zeroed before it is freed.
+/// READ THE PROFILE AT `path` ([`parse`]).
 ///
 /// # Errors
-///
 /// [`NoProfile`]: why nothing was read.
 pub fn read(path: &Path) -> Result<Profile, NoProfile> {
     read_with(path, parse)
 }
 
 /// [`read`]'s file handling, its bytes handed to `parse` before they are
-/// zeroed.
 fn read_with<T>(
     path: &Path,
     parse: impl FnOnce(&[u8]) -> Result<T, NoProfile>,
@@ -1440,8 +1132,6 @@ fn read_with<T>(
     let mut file = match open_nonblocking(path) {
         Ok(file) => file,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(NoProfile::Missing),
-        // Windows refuses to open a directory as a file at all (access
-        // denied): what stands there is told by its metadata, nothing read.
         Err(_) if std::fs::metadata(path).is_ok_and(|meta| !meta.is_file()) => {
             return Err(NoProfile::NotAFile);
         }
@@ -1454,8 +1144,6 @@ fn read_with<T>(
     if meta.len() > PROFILE_MAX {
         return Err(NoProfile::TooLarge);
     }
-    // One byte past the length the handle reported: a file that grew while
-    // it was read fills it, and reads as unreadable rather than as a cut.
     let size = usize::try_from(meta.len()).map_err(|_| NoProfile::TooLarge)?;
     let mut buf = vec![0_u8; size.saturating_add(1)];
     let mut filled = 0;
@@ -1479,7 +1167,6 @@ fn read_with<T>(
 }
 
 /// Zero `buf`, and keep the compiler from dropping the writes as dead
-/// before the free.
 fn wipe(buf: &mut [u8]) {
     buf.fill(0);
     std::hint::black_box(&*buf);
@@ -1497,11 +1184,9 @@ fn open_nonblocking(path: &Path) -> std::io::Result<std::fs::File> {
     options.open(path)
 }
 
-/// READ A PROFILE FROM ITS BYTES: the allowlist and nothing else (the
-/// module docs say how).
+/// READ A PROFILE FROM ITS BYTES: the allowlist and nothing else (the module docs say how).
 ///
 /// # Errors
-///
 /// [`NoProfile::Unreadable`] for bytes that are not one JSON object.
 pub fn parse(bytes: &[u8]) -> Result<Profile, NoProfile> {
     let Obj(raw) =
@@ -1566,7 +1251,6 @@ fn profile_of(raw: RawFile) -> Profile {
 }
 
 /// A rate-limit tier's word: a trailing `_<digits>x` taken as the multiple
-/// (`default_claude_max_20x` → `20x`), else the word itself.
 fn tier_word(raw: Word) -> Word {
     let multiple = raw
         .as_str()
@@ -1688,8 +1372,6 @@ fn fable_plan(plan: &Plan, flags: RawFeatures) -> FablePlan {
     let Obj(Some(lattice)) = flags.lattice else {
         return FablePlan::Unknown;
     };
-    // The plan-wide keys as Claude Code's parse admits them: absent, or a
-    // boolean (a string for the date). Any other shape fails its parse.
     let flag = |leaf: &Leaf| match leaf {
         Leaf::Absent => Some(None),
         Leaf::Flag(b) => Some(Some(*b)),
@@ -1715,12 +1397,10 @@ fn fable_plan(plan: &Plan, flags: RawFeatures) -> FablePlan {
 }
 
 /// A share in percent (0-100, as the body carries it) in tenths, capped at
-/// 100%; `None` for a negative or non-finite one.
 fn pct_x10(pct: f64) -> Option<u16> {
     if !pct.is_finite() || pct < 0.0 {
         return None;
     }
-    // Bounded to 0..=1000 by the `min`, so the cast keeps every value.
     #[expect(
         clippy::cast_possible_truncation,
         clippy::cast_sign_loss,
@@ -1730,9 +1410,7 @@ fn pct_x10(pct: f64) -> Option<u16> {
 }
 
 /// A whole number the file wrote as a JSON number; `None` past `i64` or not
-/// finite.
 fn whole(n: f64) -> Option<i64> {
-    // Bounded by the range check, so the cast keeps every value.
     #[expect(clippy::cast_possible_truncation, reason = "range checked")]
     (n.is_finite() && n.abs() < 9.0e15).then(|| n.round() as i64)
 }
@@ -1742,9 +1420,7 @@ fn ms_to_s(ms: f64) -> Option<i64> {
     whole(ms).map(|ms| ms.div_euclid(1000))
 }
 
-/// AN INSTANT AS THE VENDOR WRITES ONE: RFC 3339 with or without a fraction,
-/// in UTC (`Z`) or at an offset (`+00:00`, applied), or a bare date
-/// (`YYYY-MM-DD`, its midnight UTC). Unix seconds.
+/// AN INSTANT AS THE VENDOR WRITES ONE.
 #[must_use]
 pub fn instant(text: &str) -> Option<i64> {
     use aterm_types::rfc3339::{parse_utc, parse_utc_fractional};
@@ -1774,10 +1450,7 @@ pub fn instant(text: &str) -> Option<i64> {
     Some(at - sign * (hours * 3600 + minutes * 60))
 }
 
-// The typed reader: the allowlist's shapes, every leaf lenient
-
 /// A MODEL FAMILY'S NAME as a key or a flag spells it (`Fable`, `nimbus`),
-/// lowercased: letters alone, at most 32 — an id (digits, hyphens) is none.
 fn family(name: &str) -> Option<String> {
     (!name.is_empty() && name.len() <= 32 && name.bytes().all(|b| b.is_ascii_alphabetic()))
         .then(|| name.to_ascii_lowercase())
@@ -1927,7 +1600,6 @@ struct RawEnabled {
 }
 
 /// Drain one container's values unread, for a visitor handed a shape it
-/// does not keep.
 fn drain_seq<'de, A: SeqAccess<'de>>(mut seq: A) -> Result<(), A::Error> {
     while seq.next_element::<IgnoredAny>()?.is_some() {}
     Ok(())
@@ -1938,8 +1610,7 @@ fn drain_map<'de, A: MapAccess<'de>>(mut map: A) -> Result<(), A::Error> {
     Ok(())
 }
 
-/// The scalar visitor methods of a reader that keeps no scalar: each
-/// answers `$none`.
+/// The scalar visitor methods of a reader that keeps no scalar: each answers `$none`.
 macro_rules! lenient_scalars {
     ($none:expr) => {
         fn visit_bool<E: de::Error>(self, _: bool) -> Result<Self::Value, E> {
@@ -1967,8 +1638,6 @@ macro_rules! lenient_scalars {
 }
 
 /// Muse Code's login store (`auth.json`), the `meta` provider's address
-/// alone kept: every other key read past unkept, as [`RawWho`]'s are, so
-/// no credential material another mechanism keeps there is materialized.
 #[derive(Default, Deserialize)]
 #[serde(default)]
 struct RawMuseAuth {
@@ -1990,8 +1659,6 @@ struct RawMuseMeta {
 }
 
 /// Muse Code's global `settings.json`, its `provider` alone kept: what
-/// tells a Meta-account process from an `echo` or `local` one running
-/// under the same login store.
 #[derive(Default, Deserialize)]
 #[serde(default)]
 struct RawMuseSettings {
@@ -2058,8 +1725,6 @@ impl<'de> Deserialize<'de> for Address {
 }
 
 /// AN OBJECT OF THE ALLOWLIST: `T` where the value is an object, `None`
-/// for any other value (read past, unkept). `T`'s own keys are the only
-/// ones read.
 struct Obj<T>(Option<T>);
 
 impl<T> Default for Obj<T> {
@@ -2089,7 +1754,6 @@ impl<'de, T: Deserialize<'de>> Deserialize<'de> for Obj<T> {
 }
 
 /// AN ARRAY OF ALLOWLIST OBJECTS: each object element read as `T`, every
-/// other element read past; empty for any value that is not an array.
 struct List<T>(Vec<T>);
 
 impl<T> Default for List<T> {
@@ -2123,7 +1787,6 @@ impl<'de, T: Deserialize<'de>> Deserialize<'de> for List<T> {
 }
 
 /// ONE SCALAR OF THE ALLOWLIST, whatever its type turned out to be: an
-/// array or an object where a scalar was expected is read past, unkept.
 #[derive(Default)]
 enum Leaf {
     /// The key was not there.
@@ -2207,8 +1870,6 @@ impl<'de> Deserialize<'de> for Leaf {
 }
 
 /// A CLAUDE ACCOUNT ID, HASHED AS IT IS READ ([`AccountKey::claude`]): the
-/// parser hands the string over borrowed from the file's bytes, and only
-/// the key is kept.
 #[derive(Default)]
 struct Hashed(Option<AccountKey>);
 
@@ -2253,7 +1914,6 @@ impl<'de> Deserialize<'de> for Hashed {
 }
 
 /// AN ARRAY OF WORDS, `None` unless the value is an array of strings that
-/// are all words (Claude Code reads anything else as unparseable).
 #[derive(Default)]
 struct Words(Option<Vec<Word>>);
 
@@ -2285,11 +1945,6 @@ impl<'de> Deserialize<'de> for Words {
 }
 
 /// `tengu_saffron_lattice.perModel`, as the one answer this reader needs:
-/// whether a FABLE model is billed to usage credits — `Some(true)` where any
-/// entry for an id that names Fable says `enabled: true` (Claude Code's own
-/// rule where two spellings of a model disagree), `Some(false)` where every
-/// such entry says `false`, `None` with no such entry or a value that is
-/// not an object. The ids are read for that and not kept.
 #[derive(Default)]
 struct FableEntries(Option<bool>);
 
@@ -2324,8 +1979,6 @@ impl<'de> Deserialize<'de> for FableEntries {
 }
 
 /// A STORED CONSENT (`{ "<org or acct:id>": true }`): whether any entry
-/// holds `true`. The keys — an organization's or an account's id — are read
-/// past by the parser's ignored-value path, never built.
 #[derive(Default)]
 struct Consent(bool);
 
@@ -2354,8 +2007,6 @@ impl<'de> Deserialize<'de> for Consent {
 }
 
 /// THE STORED CONSENTS PER FAMILY (`{ "<family>": { "<org or acct:id>":
-/// true } }`): the families ([`family`]) whose [`Consent`] holds. A key that
-/// names no family is read past, unkept.
 #[derive(Default)]
 struct Consents(Vec<String>);
 

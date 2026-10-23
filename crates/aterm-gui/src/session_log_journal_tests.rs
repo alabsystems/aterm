@@ -1,11 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The session journal's tests (phase 2B). The writer is driven pass by pass
-//! with an injected clock and an in-memory directory with faults
-//! ([`MemFs`]); the real directory's rules (pinned, exclusive, private, the
-//! lock, retention among hostile entries) run against a scratch directory.
-//! Every wait for something that must happen is a one-minute hang detector.
+//! The session journal's tests (phase 2B).
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -245,17 +241,7 @@ fn host(r: &aterm_slog::Rec) -> aterm_slog::Rec {
         .expect("decodes")
 }
 
-// ---- the gate and the default ------------------------------------------
-
 /// D3 ON: with no `[session_log]` table the
-/// journal is asked for, and the gate opens on a window's desk and the lab's
-/// seam, on macOS and Linux. It stays shut for an explicit `journal =
-/// false`, a plain headless instance, `restore_session = false` and a
-/// platform with no writer.
-///
-/// NEGATIVE CONTROLS: the old default (`unwrap_or(false)`) fails the
-/// default's arms; a gate without its restore leg fails the
-/// `restore_session = false` arm.
 #[test]
 fn the_gate_is_on_by_default_and_follows_the_desk() {
     use crate::app_config::{Config, SessionLogConfig};
@@ -301,9 +287,6 @@ fn the_gate_is_on_by_default_and_follows_the_desk() {
 }
 
 /// with `journal = false` (the opt-out since D3 is on) the lane
-/// is inert on every path: no thread, no wake in any log, no read, no file;
-/// and the reader's open creates nothing. NEGATIVE CONTROL: the writer's
-/// open makes the directory, 0700.
 #[cfg(unix)]
 #[test]
 fn journal_false_creates_nothing() {
@@ -319,7 +302,6 @@ fn journal_false_creates_nothing() {
         }),
         ..crate::app_config::Config::default()
     };
-    // The launch's own expression (`lib.rs`): the gate decides the folder.
     let mut lane = Lane::new(
         gate(&off, crate::desk::Desk::Window).then(|| logs.clone()),
         false,
@@ -333,8 +315,6 @@ fn journal_false_creates_nothing() {
             .expect("an absent journal is no error")
             .is_none()
     );
-    // Refusing the actual spawn path must not leave a phantom armed writer or
-    // retain the store in a closure that never ran.
     let failed_shared = Shared::new();
     let store = crate::session_store::new_store();
     let mut failed = Lane {
@@ -366,7 +346,6 @@ fn journal_false_creates_nothing() {
         None,
         "inert differs from a failed writer"
     );
-    // An armed lane's thread (an update candidate) finished before its Commit.
     let shared = Shared::new();
     let thread = {
         let shared = Arc::clone(&shared);
@@ -398,7 +377,6 @@ fn journal_false_creates_nothing() {
         .map(|e| e.file_name())
         .collect();
     assert!(entries.is_empty(), "nothing created: {entries:?}");
-    // NEGATIVE CONTROL: the writer's own open makes it.
     let _dir = super::fs::PinnedJournalFs::open(&logs, true)
         .expect("opens")
         .expect("made");
@@ -413,8 +391,6 @@ pub(crate) fn tempdir(stem: &str) -> aterm_tempfile::TempDir {
         .tempdir_in(base)
         .expect("exclusive scratch")
 }
-
-// ---- the writer -------------------------------------------------------
 
 #[test]
 fn one_pass_journals_the_ring_at_the_host_tier() {
@@ -443,9 +419,7 @@ fn one_pass_journals_the_ring_at_the_host_tier() {
         live,
         "exactly the ring's records"
     );
-    // A second pass with nothing new writes nothing.
     assert_eq!(w.pass(), 0);
-    // The lock was taken before the first segment.
     let names = rig.fs.names();
     assert!(names.contains(&"p1-a1.lock".to_string()), "{names:?}");
 }
@@ -473,8 +447,6 @@ fn every_segment_restates_every_session() {
         .collect();
     assert!(segs.len() > 3, "rotated: {segs:?}");
     for name in &segs {
-        // A snap restates the open path AS OF ITS HEAD: the first segment's,
-        // at cursor 0, restates nothing (the opens follow as records).
         let first = name == "p1-a1.1.slog";
         let frames: Vec<Frame> = complete_lines(&rig.fs.bytes(name))
             .filter_map(|l| decode_line(l).ok())
@@ -520,8 +492,6 @@ fn a_busy_lock_is_skipped_counted_and_written_next_pass() {
     drop(held);
     assert!(w.pass() > 0, "written the pass after");
     assert_eq!(recs_of(&rig.frames(), "s-busy").len(), 2);
-    // A busy registry: the sessions already followed are written, a new one
-    // waits for the pass that reads the registry.
     rig.sessions.busy.store(true, Ordering::Relaxed);
     let _new = rig.sessions.add("s-new");
     mark(&tl, 2);
@@ -573,7 +543,6 @@ fn records_evicted_between_passes_read_as_one_counted_gap() {
 }
 
 /// a session that closes between passes, forty of them at once,
-/// still gets its close journaled through the timeline the writer kept.
 #[test]
 fn sessions_closed_between_passes_still_get_their_closes() {
     let rig = Rig::new();
@@ -611,8 +580,6 @@ fn sessions_closed_between_passes_still_get_their_closes() {
 }
 
 /// The real registry must hand a closed timeline to the writer even when
-/// no writer snapshot ever included that session. All fixtures are fd-less
-/// SessionHandles and the actual Store adapter over an in-memory JournalFs.
 #[test]
 fn the_real_store_keeps_a_session_that_retires_before_its_first_writer_snapshot() {
     fn retired(observed_live: bool, prime_empty: bool, local: u64) -> (bool, usize) {
@@ -687,9 +654,6 @@ fn the_real_store_keeps_a_session_that_retires_before_its_first_writer_snapshot(
             "the actual deregister produced its session close",
         );
         drop(timeline);
-        // No fixture-owned timeline survives to supply what Store dropped.
-        // A second pass catches an accidentally live (rather than retired)
-        // import and checks that a completed retire is no longer retained.
         writer.pass();
         writer.pass();
         let actual = recs_of(&rig.frames(), &sid);
@@ -710,10 +674,6 @@ fn the_real_store_keeps_a_session_that_retires_before_its_first_writer_snapshot(
 }
 
 /// A full disk (ENOSPC after `k` bytes, for every `k` of a batch): only
-/// whole lines are kept, the segment is abandoned, the writer backs off, the
-/// paused attention is raised once, and the pass after the backoff writes the
-/// rest into a new segment and clears it. The view loses nothing and shows
-/// each seq once.
 #[test]
 fn a_full_disk_keeps_whole_lines_backs_off_and_resumes() {
     for k in 0..400u64 {
@@ -753,7 +713,6 @@ fn a_full_disk_keeps_whole_lines_backs_off_and_resumes() {
 }
 
 /// NEVER SPINS: ten simulated minutes of dirty marks against a disk that is
-/// always full make at most ⌈log₂(600/30)⌉ + 2 write attempts.
 #[test]
 fn a_full_disk_never_spins() {
     let rig = Rig::new();
@@ -776,19 +735,16 @@ fn a_full_disk_never_spins() {
 
 #[test]
 fn eio_eacces_eintr_and_eagain_each_do_what_the_table_says() {
-    // EINTR: retried, the lines land.
     let rig = Rig::new();
     let tl = rig.sessions.add("s-err");
     let mut w = rig.writer();
     rig.fs.fault(Some(Fault::Eintr(2)));
     assert!(w.pass() > 0, "EINTR retried");
-    // EAGAIN: owed, no escalation.
     mark(&tl, 1);
     rig.fs.fault(Some(Fault::Always(libc::EAGAIN)));
     w.pass();
     assert!(w.owed && matches!(w.state, State::Running));
     assert_eq!(rig.report.attention().1, Attention::None);
-    // EIO three times: backoff, then stopped.
     rig.fs.fault(Some(Fault::Always(libc::EIO)));
     for _ in 0..3 {
         w.pass();
@@ -797,7 +753,6 @@ fn eio_eacces_eintr_and_eagain_each_do_what_the_table_says() {
     assert!(w.is_stopped(), "three EIOs stop it");
     assert_eq!(rig.report.attention().1, Attention::Stopped(Cause::Io));
     assert!(w.tracks.is_empty(), "a stopped writer holds no session");
-    // EACCES: stopped at once.
     let rig = Rig::new();
     let _tl = rig.sessions.add("s-acc");
     let mut w = rig.writer();
@@ -808,7 +763,6 @@ fn eio_eacces_eintr_and_eagain_each_do_what_the_table_says() {
 }
 
 /// no `flock`, no journal: the lock is refused, nothing is
-/// written, and the owner is told why.
 #[test]
 fn without_flock_there_is_no_journal() {
     let rig = Rig::new();
@@ -856,8 +810,6 @@ fn a_panic_in_the_writer_stops_the_journal_and_producers_append_on() {
 }
 
 /// NEVER BLOCKS: while the writer is stuck in a write, a producer appends a
-/// thousand records and the writer holds no timeline lock. NEGATIVE CONTROL:
-/// a writer that held the lock across its write is seen by the same probe.
 #[test]
 fn the_writer_never_blocks_a_producer() {
     let rig = Rig::new();
@@ -873,7 +825,6 @@ fn the_writer_never_blocks_a_producer() {
         w
     });
     let deadline = std::time::Instant::now() + HANG;
-    // The writer is inside its write once it has begun one.
     while rig.fs.state().entered == before {
         assert!(
             std::time::Instant::now() < deadline,
@@ -893,7 +844,6 @@ fn the_writer_never_blocks_a_producer() {
     cv.notify_all();
     let w = writer.join().expect("the writer returns");
     drop(w);
-    // NEGATIVE CONTROL: a lock held across I/O is what the probe sees.
     let held = Arc::clone(&tl);
     let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
     let g2 = Arc::clone(&gate);
@@ -920,9 +870,6 @@ fn the_writer_never_blocks_a_producer() {
 }
 
 /// content-tier fields written straight through the log never
-/// reach the journal's bytes; a command's later argument never reaches its
-/// `detail=`. NEGATIVE CONTROL: the same record with the title mistiered as
-/// host carries it.
 #[test]
 fn the_content_tier_never_reaches_the_journal() {
     let rig = Rig::new();
@@ -983,12 +930,7 @@ fn the_content_tier_never_reaches_the_journal() {
     assert!(leaked.contains("SECRET-TITLE-42"));
 }
 
-// ---- an update, the quit, the reader ---------------------------------
-
 /// the outgoing writer drains each fenced log to its fence and
-/// ends its chain `#handed`; the successor journals above the fence; a
-/// reader shows each seq once across both. A drain cut short reads as `gap
-/// why=handoff lost=<k>`. A rollback writes on in a new segment.
 #[test]
 fn an_update_hands_off_at_the_fence_and_the_successor_goes_on() {
     for cut in [false, true] {
@@ -1004,8 +946,6 @@ fn an_update_hands_off_at_the_fence_and_the_successor_goes_on() {
             // The disk stalls: A journals nothing more before its exit.
             rig.fs.fault(Some(Fault::Always(libc::EAGAIN)));
         }
-        // The export: carry (with the journal's host line, as a running lane
-        // writes it) and fence.
         let (lines, head) = {
             let mut g = tl.lock().expect("tl");
             let snap = g.slog().log().carry_snapshot();
@@ -1038,7 +978,6 @@ fn an_update_hands_off_at_the_fence_and_the_successor_goes_on() {
         assert_eq!(ended, !cut);
         rig.fs.fault(None);
         drop(a);
-        // The successor: the carried log, its journal from the fence.
         let b_tl: Timeline = Arc::new(Mutex::new(SessionTimeline::for_test()));
         {
             let mut g = b_tl.lock().expect("b");
@@ -1061,7 +1000,6 @@ fn an_update_hands_off_at_the_fence_and_the_successor_goes_on() {
             .lock()
             .expect("list")
             .push((ShortId::new("s-up").expect("sid"), Arc::clone(&b_tl)));
-        // B's producers close the carried run (no producer state crossed).
         assert!(!b_tl.lock().expect("b").slog().log().is_open(r));
         mark(&b_tl, 110);
         let mut b = rig.writer_as("p2-b2", WriterLimits::default());
@@ -1078,7 +1016,6 @@ fn an_update_hands_off_at_the_fence_and_the_successor_goes_on() {
         assert!(!v.log.is_open(r));
         assert!(!v.crashed);
     }
-    // A rollback: the writer goes on in a new segment.
     let rig = Rig::new();
     let tl = rig.sessions.add("s-back");
     let mut a = rig.writer();
@@ -1105,20 +1042,6 @@ fn an_update_hands_off_at_the_fence_and_the_successor_goes_on() {
 }
 
 /// D3 ON ACROSS AN UPDATE: a predecessor
-/// that kept no journal (`journal = false`, or an older build that shipped it
-/// off) carries no `journal v=1` host line, so a successor on the default
-/// config, whose gate is open, journals each carried log itself from its
-/// first record, and only once its Commit lands: its armed lane (an update
-/// candidate's, `lib.rs`) creates nothing before. The read shows every
-/// carried seq once, from the first, losing none, and the run the
-/// predecessor opened.
-///
-/// NEGATIVE CONTROLS: the predecessor's `journal = false` shuts the gate the
-/// default opens (the old default fails the second assertion); a carry that
-/// claims the journal (`journal v=1`) would start the successor's journal
-/// after the head and lose the first records (the `journal_start` arm); a
-/// lane that ignores `armed` starts its writer before the Commit (the
-/// `Phase::Armed` assertion, read only once the lane's first pass decided).
 #[cfg(unix)]
 #[test]
 fn a_journal_off_predecessor_hands_to_a_default_on_successor() {
@@ -1139,7 +1062,6 @@ fn a_journal_off_predecessor_hands_to_a_default_on_successor() {
         gate(&Config::default(), Desk::Window),
         "the successor's default keeps one"
     );
-    // The predecessor: no lane, a command and four marks, then its take.
     let a: Timeline = Arc::new(Mutex::new(SessionTimeline::for_test()));
     with_log(&a, |log| {
         log.open_session(
@@ -1172,7 +1094,6 @@ fn a_journal_off_predecessor_hands_to_a_default_on_successor() {
             .any(|l| l == crate::session_log::JOURNAL_HOST_LINE),
         "a lane-less predecessor claims no journal: {lines:?}"
     );
-    // The successor: a session of the real store adopts the carry.
     let handle = crate::session_store::test_handle(7);
     let sid = handle.sid.as_str().to_string();
     {
@@ -1198,8 +1119,6 @@ fn a_journal_off_predecessor_hands_to_a_default_on_successor() {
     let logs = scratch.join("logs");
     std::fs::create_dir_all(&logs).expect("logs");
     let shared = Shared::new();
-    // Join this lane before its scratch guard drops, including assertion
-    // unwind. The finish request also wakes an armed or parked lane.
     struct Worker {
         shared: Arc<Shared>,
         thread: Option<std::thread::JoinHandle<()>>,
@@ -1219,8 +1138,6 @@ fn a_journal_off_predecessor_hands_to_a_default_on_successor() {
             std::thread::spawn(move || run(&shared, &logs, store, inst("p2-b2"), true))
         }),
     };
-    // A hang detector: the lane's first pass decides, either to wait for
-    // the Commit (the armed lane's park) or to start a writer.
     let decided = aterm_spec::wait::within(HANG, Duration::from_millis(5), || {
         (shared.armed_waits.load(Ordering::Acquire) > 0 || shared.phase() != Phase::Armed)
             .then_some(())
@@ -1236,9 +1153,7 @@ fn a_journal_off_predecessor_hands_to_a_default_on_successor() {
         0,
         "an armed successor writes nothing before its Commit"
     );
-    // The Commit lands (`commit_landed`): the writer starts.
     shared.request(REQ_COMMIT);
-    // A hang detector: the pass the Commit asks for must come.
     let view = aterm_spec::wait::within(HANG, Duration::from_millis(20), || {
         let fs = super::fs::PinnedJournalFs::open(&logs, false).ok()??;
         match view_with(
@@ -1264,7 +1179,6 @@ fn a_journal_off_predecessor_hands_to_a_default_on_successor() {
         .join()
         .expect("the writer thread ends");
     let read = view.log.read(Cursor::new(view.log.ep(), 0), usize::MAX);
-    // The epoch the adoption took is said as a handoff, and nothing is lost.
     assert!(
         read.gap.is_none_or(|g| g.lost == 0),
         "nothing lost: {:?}",
@@ -1288,8 +1202,6 @@ fn a_journal_off_predecessor_hands_to_a_default_on_successor() {
 }
 
 /// a clean quit writes each open session's closes and `#fin`; the
-/// next read finds no crash. A deadline that passes first writes no `#fin`,
-/// and the chain then reads as a crash.
 #[test]
 fn a_clean_quit_closes_its_journal_and_a_late_one_reads_as_a_crash() {
     let rig = Rig::new();
@@ -1321,7 +1233,6 @@ fn a_clean_quit_closes_its_journal_and_a_late_one_reads_as_a_crash() {
         tl.lock().expect("tl").slog().log().is_open(r),
         "the live log unchanged"
     );
-    // Late: the deadline already passed.
     let rig = Rig::new();
     let tl = rig.sessions.add("s-late");
     let _ = cmd(&tl, 1);
@@ -1335,8 +1246,6 @@ fn a_clean_quit_closes_its_journal_and_a_late_one_reads_as_a_crash() {
 }
 
 /// THE FINISH NEVER HOLDS THE EXIT: a lane whose writer is stuck in a write
-/// answers its quit within the budget's wait (the hang detector bounds the
-/// test, never a latency).
 #[test]
 fn a_stuck_writer_never_holds_the_exit() {
     let shared = Shared::new();
@@ -1346,7 +1255,6 @@ fn a_stuck_writer_never_holds_the_exit() {
         armed: false,
         started: true,
     };
-    // No thread answers at all: the wait ends at its budget.
     let _ = shared.wake.thread.set(std::thread::current());
     let t = std::time::Instant::now();
     lane.finish_at_quit(Duration::from_millis(10));
@@ -1356,7 +1264,6 @@ fn a_stuck_writer_never_holds_the_exit() {
 #[test]
 fn retention_keeps_the_budget_oldest_first_and_spares_the_live() {
     let rig = Rig::new();
-    // Three dead instances' old segments, and a live one's.
     for (i, name) in ["p7-aa.1.slog", "p7-aa.2.slog", "p8-bb.1.slog"]
         .iter()
         .enumerate()
@@ -1398,9 +1305,6 @@ fn retention_keeps_the_budget_oldest_first_and_spares_the_live() {
 }
 
 /// The reader's bounds: a decode budget cut reads `why=unread`; a segment
-/// over the read limit is not read and reads `why=unread` too; a partial
-/// last line and a newer format are skipped; lines appended after a read are
-/// found by the next, which reads only the tail.
 #[test]
 fn the_reader_is_bounded_and_skips_what_is_not_a_line() {
     let rig = Rig::new();
@@ -1428,14 +1332,12 @@ fn the_reader_is_bounded_and_skips_what_is_not_a_line() {
     assert_eq!(read.gap.map(|g| g.why), Some(GapWhy::Unread));
     let whole = read_view(&rig.fs, "s-read", Budgets::READER);
     assert_eq!(all(&whole.log).len(), 31);
-    // Appended later: found.
     mark(&tl, 99);
     w.pass();
     let JournalRead::View(again) = view_with(&rig.fs, &index, &sid, Budgets::READER) else {
         panic!("a view");
     };
     assert_eq!(all(&again.log).len(), 32);
-    // A partial last line and a newer format add nothing.
     let mut torn = rig.fs.bytes("p1-a1.1.slog");
     torn.extend_from_slice(b"s1\ts-read\t999 mark - human src=input conf=exact t=1");
     rig.fs.put("p3-dd.1.slog", &torn, false, false);
@@ -1447,7 +1349,6 @@ fn the_reader_is_bounded_and_skips_what_is_not_a_line() {
         "nothing torn or newer"
     );
     assert!(!says(&v, "unread"), "a whole read says nothing unread");
-    // A segment past the read limit: not read, and said unread.
     let big = vec![b'\n'; usize::try_from(aterm_slog::journal::SEGMENT_READ_MAX).unwrap_or(0) + 1];
     rig.fs.put("p5-ff.1.slog", &big, false, false);
     let v = read_view(&rig.fs, "s-read", Budgets::READER);
@@ -1461,13 +1362,7 @@ fn the_reader_is_bounded_and_skips_what_is_not_a_line() {
     };
 }
 
-// ---- the real directory -------------------------------------------------
-
 /// The real directory's file rules: a segment is created exclusive (an
-/// existing name, a symlink and a FIFO refused) at 0600; the instance lock
-/// probes live while held and dead once let go (and gone); a symlinked
-/// `session-log` is refused with its target untouched, and a foreign mode is
-/// reset only by the writer.
 #[cfg(unix)]
 #[test]
 fn the_real_directory_keeps_its_rules() {
@@ -1480,7 +1375,6 @@ fn the_real_directory_keeps_its_rules() {
         .expect("opens")
         .expect("made");
     let journal = logs.join("session-log");
-    // Exclusive, private, appendable.
     let mut seg = dir.create_segment("p1-aa.1.slog").expect("a segment");
     assert_eq!(seg.write(b"x\n").expect("writes"), 2);
     let md = std::fs::metadata(journal.join("p1-aa.1.slog")).expect("made");
@@ -1494,10 +1388,9 @@ fn the_real_directory_keeps_its_rules() {
     assert!(!scratch.join("victim").exists(), "nothing made behind it");
     let fifo = std::ffi::CString::new(journal.join("p1-aa.3.slog").to_string_lossy().as_bytes())
         .expect("a path");
-    // SAFETY: a NUL-terminated path; mkfifo makes one node.
+    // SAFETY: a NUL-terminated path.
     assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
     assert!(dir.create_segment("p1-aa.3.slog").is_err(), "a FIFO");
-    // The lock: live while held, dead once let go.
     let me = inst("p1-aa");
     let held = dir.lock_instance(&me).expect("locks");
     assert_eq!(dir.probe("p1-aa.lock"), Liveness::Live);
@@ -1514,7 +1407,6 @@ fn the_real_directory_keeps_its_rules() {
         "the clean end removes it"
     );
     assert_eq!(dir.probe("p2-bb.lock"), Liveness::Dead);
-    // A wider mode is the writer's to reset; a reader changes nothing.
     std::fs::set_permissions(&journal, std::fs::Permissions::from_mode(0o755)).expect("chmod");
     let _reader = super::fs::PinnedJournalFs::open(&logs, false)
         .expect("opens")
@@ -1525,7 +1417,6 @@ fn the_real_directory_keeps_its_rules() {
         .expect("opens")
         .expect("exists");
     assert_eq!(mode(&journal), 0o700, "the writer resets it");
-    // A symlinked `session-log`: refused, its target untouched.
     let other = scratch.join("other-logs");
     std::fs::create_dir_all(&other).expect("other");
     let target = scratch.join("target");
@@ -1537,11 +1428,6 @@ fn the_real_directory_keeps_its_rules() {
 }
 
 /// THE HOSTILE DIRECTORY: retention, with a 1 KiB budget, removes
-/// only real, private segments of dead instances, oldest first, and stops at
-/// the budget. A symlink, a directory, a hard link, a FIFO, a 0644 file and
-/// foreign names that match loose patterns are all left as they are, and
-/// nothing outside the directory is touched; a live instance's segments
-/// stay; a dead instance's lock goes once its segments are gone.
 #[cfg(unix)]
 #[test]
 fn retention_in_a_hostile_directory_removes_only_what_it_may() {
@@ -1565,7 +1451,7 @@ fn retention_in_a_hostile_directory_removes_only_what_it_may() {
     std::fs::hard_link(scratch.join("outside"), j.join("p3-cc.1.slog")).expect("a hard link");
     let fifo = std::ffi::CString::new(j.join("p4-dd.1.slog").to_string_lossy().as_bytes())
         .expect("a path");
-    // SAFETY: a NUL-terminated path; mkfifo makes one node.
+    // SAFETY: a NUL-terminated path.
     assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
     std::fs::write(j.join("p5-ee.1.slog"), vec![b'w'; 3000]).expect("a 0644 file");
     std::fs::set_permissions(
@@ -1575,13 +1461,11 @@ fn retention_in_a_hostile_directory_removes_only_what_it_may() {
     .expect("0644");
     std::fs::write(j.join("notes.txt"), vec![b'n'; 100_000]).expect("notes");
     std::fs::write(j.join("p6-ff.1.slog.bak"), vec![b'b'; 3000]).expect("bak");
-    // Real old segments of a dead instance (and its lock file), oldest first.
     for n in 1..=3 {
         write(&format!("p7-aa.{n}.slog"), 900);
     }
     let dead = dir.lock_instance(&inst("p7-aa")).expect("locks");
     drop(dead);
-    // A live instance's segment.
     let live = dir.lock_instance(&inst("p8-bb")).expect("locks");
     write("p8-bb.1.slog", 900);
     let clock = Arc::new(TestClock::default());
@@ -1627,8 +1511,6 @@ fn retention_in_a_hostile_directory_removes_only_what_it_may() {
         std::fs::read(scratch.join("outside")).expect("outside"),
         b"outside"
     );
-    // Stops at the budget: two dead segments of 900 B, a 1 KiB budget, the
-    // oldest goes and the newer stays.
     for n in 1..=2 {
         write(&format!("p6-dd.{n}.slog"), 900);
     }
@@ -1654,9 +1536,6 @@ fn retention_in_a_hostile_directory_removes_only_what_it_may() {
 }
 
 /// VERSION SKEW: a config with a key this build does not know under
-/// `[session_log]` reads (the key ignored); a carry without the journal's
-/// host line (an older outgoing build, or a journal off or stopped) starts
-/// the successor's journal at the log's first record.
 #[test]
 fn version_skew_both_ways() {
     let cfg: crate::app_config::Config =
@@ -1691,16 +1570,12 @@ fn version_skew_both_ways() {
         None,
         "no host line: from the first record"
     );
-    // An older build's config reads a table it does not know the same way:
-    // skipped, not refused; a config without `[session_log]` asks for the
-    // journal (D3 on).
     let older: crate::app_config::Config =
         aterm_toml::from_str("[a_future_table]\nanything = true\n").expect("skipped");
     assert!(older.session_log_journal());
 }
 
 /// A writer that runs long stays within the budget: it removes its own
-/// segments it has rotated past, oldest first, never the one it writes.
 #[test]
 fn a_long_running_writer_keeps_its_own_segments_within_the_budget() {
     let rig = Rig::new();
@@ -1731,13 +1606,7 @@ fn a_long_running_writer_keeps_its_own_segments_within_the_budget() {
     );
 }
 
-// ---- the fixer's findings: bounds, a rollback, the quit, the backstop -----
-
 /// RETENTION BOUNDS THE COUNT AS WELL AS THE BYTES: a journal of
-/// 5000 small dead segments (far under the byte budget, far over a
-/// listing's 4096 names, some of the oldest visited last) is pruned, oldest
-/// first, to within `journal::FILES_MAX` files and the byte budget, so one
-/// listing sees the whole journal again.
 #[test]
 fn retention_keeps_the_count_budget_and_sees_past_a_listing() {
     let rig = Rig::new();
@@ -1747,7 +1616,6 @@ fn retention_keeps_the_count_budget_and_sees_past_a_listing() {
             .put(&format!("p7-aa.{n}.slog"), &[b'x'; 100], false, false);
     }
     rig.fs.put("p7-aa.lock", b"", false, false);
-    // The oldest are where a readdir may put them: past 4096 names.
     for n in 1..=50u32 {
         rig.fs.state().listed_last.insert(format!("p7-aa.{n}.slog"));
     }
@@ -1792,9 +1660,6 @@ fn retention_keeps_the_count_budget_and_sees_past_a_listing() {
 use std::ops::Not as _;
 
 /// A CUT LISTING DERIVES NO CRASH: a chain that quit cleanly
-/// across two segments, its second (holding the closes and `#fin`) past a
-/// listing's 4096 names, reads `gap why=unread`, never a crash. CONTROL: the
-/// same chain listed whole reads its `out=app-quit` close.
 #[test]
 fn a_cut_listing_reads_unread_and_never_a_crash() {
     let rig = Rig::new();
@@ -1837,11 +1702,6 @@ fn a_cut_listing_reads_unread_and_never_a_crash() {
 }
 
 /// PRESENCE IS NEVER GUESSED FROM A DECODE BUDGET: a session
-/// whose segments are all older than a decode budget's reach is still read
-/// (the index knows where it is, and its newest segments are decoded
-/// whatever their size), the same on every request; a read whose index
-/// could not reach it says it was cut, never `ERR no such session`; a sid in
-/// no segment of a whole read is absent.
 #[test]
 fn a_session_past_the_decode_budget_is_found_and_a_cut_is_said() {
     let rig = Rig::new();
@@ -1890,9 +1750,6 @@ fn a_session_past_the_decode_budget_is_found_and_a_cut_is_said() {
 }
 
 /// NO SEGMENT A READER SKIPS: a pass over many retired sessions with
-/// backlogs (retired ones are exempt from the pass's byte bound) stops at
-/// the segment's rotation size, so no segment passes it by more than one
-/// take's lines; every session's close is still written.
 #[test]
 fn a_pass_never_writes_past_the_rotation_size_by_more_than_one_take() {
     let rig = Rig::new();
@@ -1939,9 +1796,6 @@ fn a_pass_never_writes_past_the_rotation_size_by_more_than_one_take() {
 }
 
 /// A transient error (EAGAIN, or EINTR past its retries) wrote nothing: the
-/// segment is kept, never a new file per retry, and a run of them backs off.
-/// A hundred retry ticks of EAGAIN make one segment and a bounded number of
-/// write attempts.
 #[test]
 fn transient_errors_keep_the_segment_and_back_off() {
     let rig = Rig::new();
@@ -1967,8 +1821,6 @@ fn transient_errors_keep_the_segment_and_back_off() {
 }
 
 /// an idle session that
-/// wrote its `#handed` while a busy one held the drain back is restated
-/// when the update stands down, so a later crash reads it closed.
 #[test]
 fn a_rollback_mid_drain_then_a_crash_reads_closed() {
     let rig = Rig::new();
@@ -2005,8 +1857,6 @@ fn a_rollback_mid_drain_then_a_crash_reads_closed() {
 }
 
 /// A SESSION CLOSED IN AN UPDATE'S OVERLAP, THEN A ROLLBACK: its close lies
-/// past the fence, so its take is not done and its track is kept; after the
-/// rollback the close is journaled.
 #[test]
 fn a_session_closed_in_the_overlap_gets_its_close_after_a_rollback() {
     let rig = Rig::new();
@@ -2032,7 +1882,6 @@ fn a_session_closed_in_the_overlap_gets_its_close_after_a_rollback() {
 }
 
 /// THE QUIT'S CLOSES MEASURE THEIR NODES on each session's own clock: a
-/// session open 4.2 s and a run open 4.1 s say so, not `dur_ms=0`.
 #[test]
 fn the_quit_closes_say_how_long_each_node_lived() {
     let rig = Rig::new();
@@ -2059,7 +1908,6 @@ fn the_quit_closes_say_how_long_each_node_lived() {
 }
 
 /// A QUIT WHILE BACKING OFF from a full disk tries once more: the disk has
-/// room again, so the closes and `#fin` land and no crash is read.
 #[test]
 fn a_quit_while_backing_off_tries_once_more() {
     let rig = Rig::new();
@@ -2085,9 +1933,6 @@ fn a_quit_while_backing_off_tries_once_more() {
 }
 
 /// THE BACKSTOP SAYS EVERY SESSION IT LETS GO: past
-/// `retired_max`, a retired session gives up its timeline but keeps what its
-/// `#gap why=dropped` says until that is written whole, a snap first, so a
-/// write that fails meanwhile loses nothing and the reader places the loss.
 #[test]
 fn the_backstop_says_every_session_it_lets_go() {
     let rig = Rig::new();
@@ -2145,7 +1990,6 @@ fn the_backstop_says_every_session_it_lets_go() {
 }
 
 /// A BURST BETWEEN TWO PASSES, smaller than the ring, writes no `#gap
-/// why=evicted`: the ring evicts what the writer already holds first.
 #[test]
 fn a_burst_between_passes_writes_no_evicted_gap() {
     let rig = Rig::new();
@@ -2191,7 +2035,6 @@ fn a_burst_between_passes_writes_no_evicted_gap() {
 }
 
 /// VERSION SKEW: a segment whose first line names another format is opaque,
-/// even when that line does not decode (a field this build does not know).
 #[test]
 fn a_segment_of_another_format_is_opaque_however_its_header_reads() {
     let rig = Rig::new();
@@ -2214,7 +2057,6 @@ fn a_segment_of_another_format_is_opaque_however_its_header_reads() {
 }
 
 /// THE READER'S INDEX LOCK IS A LEAF: never held while a chain's lock is
-/// probed (a slow or hung filesystem stalls only its own read).
 #[test]
 fn the_reader_probes_with_its_index_lock_free() {
     struct Spy<'a> {
@@ -2282,20 +2124,12 @@ fn the_reader_probes_with_its_index_lock_free() {
     ));
     assert!(spy.probes.load(Ordering::Relaxed) > 0, "a probe ran");
     assert!(!spy.held.load(Ordering::Relaxed), "the index lock was free");
-    // NEGATIVE CONTROL: the spy sees a held lock.
     let _guard = index.lock().expect("index");
     let _ = spy.probe("p1-a1.lock");
     assert!(spy.held.load(Ordering::Relaxed));
 }
 
 /// A QUIT WHOSE DRAIN OUTLASTS ITS PASSES ENDS NOTHING: every
-/// session is journaled and snapped, then each gains a backlog, more
-/// sessions than [`FINISH_PASSES`] passes reach (one session a pass). The
-/// quit writes no closes and no `#fin`, so each session reads as a crash
-/// after what its chain holds, none with a range said pruned that was only
-/// never written. CONTROL: the same backlog within the passes drains, ends
-/// the chain with `#fin` and closes every session `out=app-quit` over all
-/// its records.
 #[test]
 fn a_quit_whose_drain_outlasts_its_passes_reads_as_a_crash() {
     let run = |sessions: usize| -> (Rig, Vec<String>) {
@@ -2307,7 +2141,6 @@ fn a_quit_whose_drain_outlasts_its_passes_reads_as_a_crash() {
             ..WriterLimits::default()
         };
         let mut w = rig.writer_as("p1-a1", limits);
-        // Every session snapped with its open, one a pass.
         for _ in 0..=sessions {
             w.pass();
         }
@@ -2317,7 +2150,6 @@ fn a_quit_whose_drain_outlasts_its_passes_reads_as_a_crash() {
                 mark(tl, 1 + i);
             }
         }
-        // The deadline never passes: only the pass cap can cut the drain.
         w.finish(rig.clock.mono() + HANG);
         drop(w);
         (rig, names)
@@ -2335,7 +2167,6 @@ fn a_quit_whose_drain_outlasts_its_passes_reads_as_a_crash() {
             "{name}: no quit close"
         );
     }
-    // CONTROL.
     let (rig, names) = run(FINISH_PASSES / 2);
     assert!(fin(&rig));
     for name in &names {
@@ -2348,9 +2179,6 @@ fn a_quit_whose_drain_outlasts_its_passes_reads_as_a_crash() {
 }
 
 /// A QUIT NEVER ENDS A CHAIN OVER A SESSION BEHIND ITS LOG: a
-/// session busy at the drain's last pass, or one a producer appended to
-/// after it, is behind its head, so no closes and no `#fin` are written
-/// while it is; once the drain catches it up they are.
 #[test]
 fn a_quit_never_ends_a_chain_over_a_session_behind_its_log() {
     let rig = Rig::new();
@@ -2372,9 +2200,6 @@ fn a_quit_never_ends_a_chain_over_a_session_behind_its_log() {
 }
 
 /// A COLD READ DECODES WHAT A WARM ONE DOES: the index refresh
-/// reads the whole journal but decodes none of it, so the first read after
-/// launch decodes the newest segments holding the session within the decode
-/// budget, exactly as a later one does, and answers the same.
 #[test]
 fn a_cold_read_decodes_no_more_than_a_warm_one() {
     let rig = Rig::new();
@@ -2427,7 +2252,6 @@ fn a_cold_read_decodes_no_more_than_a_warm_one() {
         "the refresh read it all"
     );
     assert_eq!(warm.indexed, 0, "nothing new to index");
-    // CONTROL: the counter counts; a whole budget decodes every segment.
     let mut whole = super::read::ReadCost::default();
     let _ = super::read::view_costed(&rig.fs, &index, &sid, Budgets::READER, &mut whole);
     assert!(whole.decoded > bound, "{whole:?}");
@@ -2540,7 +2364,6 @@ fn actual_store_retire(
 fn the_real_store_bounds_unseen_retirements_and_says_the_overflow() {
     let rig = Rig::new();
     let store = crate::session_store::new_store();
-    // Shrink the actual staging bounds; Writer setup must not reset this arm.
     store
         .write()
         .unwrap_or_else(|p| p.into_inner())
@@ -2656,11 +2479,7 @@ fn the_store_handoff_is_inert_off_and_releases_only_its_current_owner() {
         stopped.upgrade().is_none(),
         "stop detaches all pending timelines"
     );
-    // Stop deliberately keeps the old instance lock until Writer drops.
-    // The separate old guard remains, so its late-drop ownership is tested.
     drop(old_writer);
-    // A stopped instance leaves its lock as a crash marker. The replacement is a
-    // new instance, and must actually start before this tests retirement ownership.
     let mut new_writer = Writer::new(
         Arc::new(rig.fs.clone()),
         Arc::clone(&store),
@@ -2793,10 +2612,6 @@ fn queuing_a_retirement_wakes_even_when_its_close_is_already_recorded() {
 }
 
 /// The real journal's flushes are only ordered (aterm-durable's counting seam): a
-/// segment's sync (rotation, handoff and quit `#fin`), the instance lock's entry and
-/// the directory flush the rotation, the quit and retention take. A reader drops a
-/// torn tail and reads a missing `#fin` as a crash, segments are created exclusively
-/// and retention runs again at start, and liveness is a flock no reboot keeps.
 #[cfg(unix)]
 #[test]
 fn the_real_journals_flushes_are_only_ordered() {

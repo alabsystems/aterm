@@ -1,12 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Deterministic persistence contracts for native documents.
-//!
-//! This module performs no filesystem I/O. It produces generation-stamped file-save and
-//! draft-append plans, then reduces host-reported outcomes only when their generation and
-//! durability proof match the still-pending plan. The draft format is bounded, checksummed,
-//! and fail-closed: recovery never returns a valid prefix when a later record is corrupt.
+//! Deterministic persistence contracts, file-save plans, and bounded draft journal recovery for
+//! native documents.
 
 use std::ops::Range;
 use std::path::PathBuf;
@@ -27,21 +23,10 @@ pub(crate) const MAX_JOURNAL_EDITS: usize = 4_096;
 pub const MAX_INSERT_BYTES: usize = 32 * 1024 * 1024;
 
 /// Restart-stable identity embedded in a private draft stream.
-///
-/// `DocumentId` is process-local, so it cannot name a journal after relaunch. This key is
-/// the first 64 bits of an HMAC-SHA256 of the canonical URI under the install's
-/// [`JournalSecret`]; the URI itself is never written into the draft directory. The key is
-/// a journal's whole identity (it names the file, every record carries it, and recovery
-/// accepts any record whose key matches), so it must be keyed: with a public hash, whoever
-/// names the files a person opens could make two documents share one journal, showing one's
-/// unsaved draft as the other's content. Nobody without the secret can aim a collision; a
-/// chance one is 2^-64 per pair. The 64-bit width keeps the legacy record format.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct JournalDocumentKey(pub u64);
 
 /// What the MAC of a document key covers ahead of the URI: a fixed,
-/// NUL-terminated label, so the tag of one purpose is never the tag of another
-/// under the same secret.
 const JOURNAL_KEY_DOMAIN: &[u8] = b"aterm draft journal document key v1\0";
 
 impl JournalDocumentKey {
@@ -55,9 +40,7 @@ impl JournalDocumentKey {
         Self(u64::from_be_bytes([b0, b1, b2, b3, b4, b5, b6, b7]).max(1))
     }
 
-    /// The unkeyed identity every journal written before 2026-10-10 carries
-    /// (FNV-1a/64 of the URI, length-mixed). Read only to migrate those
-    /// journals ([`LegacyJournal`]), never to name or write a new one.
+    /// The unkeyed legacy identity.
     pub fn legacy_unkeyed(uri: &str) -> Self {
         Self(ContentFingerprint::of(uri.as_bytes()).0.max(1))
     }
@@ -66,16 +49,12 @@ impl JournalDocumentKey {
 /// Length of the per-install journal secret.
 pub const JOURNAL_SECRET_LEN: usize = 32;
 
-/// The per-install secret every [`JournalDocumentKey`] is a MAC under. 32
-/// bytes from the OS CSPRNG, minted once into the private draft directory and
-/// read back from there by every aterm of this user (an update's successor
-/// included), so the same URI keys the same journal across processes.
+/// The per-install secret every [`JournalDocumentKey`] is a MAC under.
 #[derive(Clone)]
 pub struct JournalSecret([u8; JOURNAL_SECRET_LEN]);
 
 impl JournalSecret {
-    /// `None` for all zeros: the CSPRNG never draws that (2^-256), so such a
-    /// file is a hole a crash left, not a secret.
+    /// `None` for all zeros: the csprng never draws that (2^-256).
     pub fn from_bytes(bytes: [u8; JOURNAL_SECRET_LEN]) -> Option<Self> {
         (bytes != [0; JOURNAL_SECRET_LEN]).then_some(Self(bytes))
     }
@@ -95,16 +74,11 @@ impl std::fmt::Debug for JournalSecret {
 }
 
 /// Stable, deterministic, non-cryptographic content fingerprint.
-///
-/// This is for conflict detection and effect correlation, not authenticity. Security UI
-/// must never present it as a signature or cryptographic digest.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct ContentFingerprint(pub u64);
 
 impl ContentFingerprint {
     pub fn of(bytes: &[u8]) -> Self {
-        // FNV-1a with a final length mix. Unlike DefaultHasher, this encoding is stable
-        // across processes and Rust releases, which a durable journal requires.
         Self(aterm_hash::fnv_mix_u64(
             aterm_hash::fnv1a_64(bytes),
             bytes.len() as u64,
@@ -112,15 +86,10 @@ impl ContentFingerprint {
     }
 }
 
-/// How a document's text maps back to its file's bytes (design §4.7). amacs is
-/// UTF-8 only, and keeps a file's byte order mark and its CRLF line endings byte
-/// for byte: admission takes them off ([`Decoded::hold`]) and every save puts
-/// them back ([`encode_for_disk`]), so a file saved without edits is rewritten
-/// with the bytes it had.
+/// How a document's text maps back to its file's bytes.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct DiskEncoding {
-    /// The file starts with the UTF-8 byte order mark (EF BB BF), which the
-    /// text does not hold.
+    /// The file starts with the UTF-8 byte order mark (ef bb bf), which the text does not hold.
     pub bom: bool,
     pub eol: LineEnding,
 }
@@ -128,19 +97,15 @@ pub struct DiskEncoding {
 /// How a document holds its file's line breaks.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum LineEnding {
-    /// The text is the file's, byte for byte: every line break is LF, there is
-    /// none, or the file is MIXED (some line feed has no carriage return before
-    /// it), whose carriage returns stay in the text.
+    /// The text is the file's, byte for byte.
     #[default]
     Lf,
-    /// Every line break of the file is CRLF, and it has at least one: the text
-    /// holds LF, and a save writes each one back as CRLF.
+    /// Every line break of the file is CRLF, and it has at least one.
     CrLf,
 }
 
 impl DiskEncoding {
-    /// No mark, line breaks as held: a save writes the text's own bytes. A file
-    /// that does not exist yet is created this way.
+    /// No mark, line breaks as held.
     pub const PLAIN: Self = Self {
         bom: false,
         eol: LineEnding::Lf,
@@ -154,7 +119,7 @@ impl DiskEncoding {
     }
 }
 
-/// A file's bytes as a buffer holds them: the text, and how it maps back.
+/// A file's bytes as a buffer holds them.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Decoded {
     pub text: String,
@@ -162,14 +127,10 @@ pub struct Decoded {
 }
 
 impl Decoded {
-    /// Hold `text`, the UTF-8 that followed the byte order mark when `bom`, or
-    /// else the whole file. A file whose every line break is CRLF is held with
-    /// LF ([`line_ending_of`]); every other file keeps its text byte for byte.
+    /// Hold `text`, the UTF-8 that followed the byte order mark when `bom`, or else the whole file.
     pub fn hold(text: String, bom: bool) -> Self {
         let eol = line_ending_of(text.as_bytes());
         let text = match eol {
-            // Every line feed has a carriage return before it, so this takes
-            // off exactly one byte before each line feed, which a save puts back.
             LineEnding::CrLf => text.replace("\r\n", "\n"),
             LineEnding::Lf => text,
         };
@@ -180,13 +141,8 @@ impl Decoded {
     }
 }
 
-/// How `bytes`, a file after its byte order mark, holds its line breaks:
-/// [`LineEnding::CrLf`] when it has a line feed and none is bare
-/// ([`is_bare_line_feed`]), [`LineEnding::Lf`] otherwise. One bare line feed
-/// anywhere keeps the whole file as it is, so a mixed file is never normalized.
+/// How `bytes`, a file after its byte order mark, holds its line breaks.
 pub fn line_ending_of(bytes: &[u8]) -> LineEnding {
-    // No byte comes before the first, and 0 is not a carriage return: a file
-    // that starts with a line feed starts with a bare one.
     let mut previous = 0;
     let mut saw_line_feed = false;
     for &byte in bytes {
@@ -205,8 +161,6 @@ pub fn line_ending_of(bytes: &[u8]) -> LineEnding {
 
 trust_contract_fn! {
     /// Whether `byte`, read after `previous`, is a bare line feed: an LF with no
-    /// CR before it, which keeps a file's line breaks as they are
-    /// ([`line_ending_of`]).
     #[must_use]
     fn is_bare_line_feed(previous: u8, byte: u8) -> bool
     clauses [ensures result == (byte == 10 && previous != 13) by is_bare_line_feed_is_lf_after_no_cr]
@@ -215,9 +169,6 @@ trust_contract_fn! {
     }
 }
 
-// Spec `bare-line-feed` (SPECS.md): for every byte pair, the second is a bare
-// line feed exactly when it is LF (10) and the first is not CR (13).
-// Kernel-checked against the compiled body.
 verify_island! {
     clean {
         theorem is_bare_line_feed_is_lf_after_no_cr (previous : UInt8) (byte : UInt8) :
@@ -227,18 +178,13 @@ verify_island! {
     }
 }
 
-/// The UTF-8 byte order mark, U+FEFF.
+/// The UTF-8 byte order mark, U+feff.
 pub const UTF8_BOM: [u8; 3] = [0xef, 0xbb, 0xbf];
 
 /// The most [`encode_for_disk`] reserves before it writes: a byte order mark
-/// past the document limit, which no save may exceed (its preflight refuses a
-/// longer image). A longer image still grows as it is written.
 const ENCODE_RESERVE_CEILING: usize = crate::host::DEFAULT_DOCUMENT_LIMIT + UTF8_BOM.len();
 
-/// The bytes a save of `text` writes for a file held with `encoding`: the byte
-/// order mark again when the file had one, and CRLF for each line feed when
-/// every line break was CRLF. For each file [`Decoded::hold`] admits, encoding
-/// its text with its encoding gives back the file's bytes exactly.
+/// The bytes a save of `text` writes for a file held with `encoding`.
 pub fn encode_for_disk(text: &str, encoding: DiskEncoding) -> Vec<u8> {
     let crlf = matches!(encoding.eol, LineEnding::CrLf);
     let line_feeds = if crlf {
@@ -268,10 +214,6 @@ pub fn encode_for_disk(text: &str, encoding: DiskEncoding) -> Vec<u8> {
 }
 
 /// Version observed by the host from one target identity and its current bytes.
-///
-/// `identity` is an opaque platform file identity when the host can supply one. `modified_ns`
-/// is an observation token, not wall-clock time used for ordering. Content remains decisive
-/// even on filesystems with coarse timestamps.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ObservedFileVersion {
     pub exists: bool,
@@ -279,10 +221,7 @@ pub struct ObservedFileVersion {
     pub(crate) modified_ns: Option<u64>,
     pub len: u64,
     pub content: ContentFingerprint,
-    /// How the text read with this version maps back to its bytes, which the
-    /// next save of that text encodes with: [`DiskEncoding::PLAIN`] for an
-    /// observation that decoded no text (a missing file, a save's own proof).
-    /// No version check reads it.
+    /// How the text read with this version maps back to its bytes.
     pub(crate) encoding: DiskEncoding,
 }
 
@@ -370,14 +309,11 @@ pub struct FileWatchInput {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FileWatchReduction {
     Unchanged,
-    /// Same content through the still-valid file capability, but the identity or
-    /// metadata token advanced (e.g. an atomic replace with identical bytes). Rebind only
-    /// the save baseline; a dirty in-memory draft stays untouched.
+    /// Same content through the still-valid file capability.
     RebindEquivalent {
         change: VersionConflict,
     },
-    /// The canonical document is clean, so the observed bytes may atomically
-    /// replace it and become the new save baseline.
+    /// The canonical document is clean.
     ReloadClean {
         change: VersionConflict,
     },
@@ -385,15 +321,13 @@ pub enum FileWatchReduction {
     ConflictDirty {
         change: VersionConflict,
     },
-    /// A save owns the baseline transition. Watch observations are retried only
-    /// after its proof is reduced.
+    /// A save owns the baseline transition.
     DeferredSaving {
         change: VersionConflict,
     },
 }
 
-/// Stateless file-watch reducer shared by polling, platform notifications, and
-/// explicit refresh. Event duplication and ordering cannot change its verdict.
+/// Stateless file-watch reducer shared by polling, platform notifications, and explicit refresh.
 pub fn reduce_file_watch(input: FileWatchInput) -> FileWatchReduction {
     let Some(change) = detect_version_conflict(input.baseline, input.observed) else {
         return FileWatchReduction::Unchanged;
@@ -401,8 +335,6 @@ pub fn reduce_file_watch(input: FileWatchInput) -> FileWatchReduction {
     if input.save_in_flight {
         FileWatchReduction::DeferredSaving { change }
     } else if content_is_equivalent(input.baseline, input.observed) {
-        // A save CAS still treats identity/metadata as decisive. This narrower verdict is
-        // safe only after the host revalidated the path/symlink capability, and it never
         // authorizes a write by itself.
         FileWatchReduction::RebindEquivalent { change }
     } else if input.document_dirty {
@@ -425,9 +357,7 @@ pub struct SavePlan {
     pub(crate) desired: ContentFingerprint,
     /// The snapshot's text, as the buffer holds it.
     pub bytes: Arc<[u8]>,
-    /// What the save writes: `bytes` with the file's byte order mark and line
-    /// endings put back ([`encode_for_disk`] with `encoding`); the same
-    /// allocation as `bytes` for a plain file.
+    /// What the save writes: `bytes` with the file's byte order mark and line endings put back.
     pub file_bytes: Arc<[u8]>,
     /// How the saved text maps to `file_bytes`, which the saved version keeps.
     pub(crate) encoding: DiskEncoding,
@@ -453,14 +383,10 @@ pub enum AtomicSaveStage {
     VerifyProof,
 }
 
-/// What a step of a save was doing when the I/O error behind its failure
-/// came: the one thing besides the error's kind a caller needs to say what
-/// went wrong in a person's words (the folder is not writable, the file is
-/// not readable, another user's save lock is in the way).
+/// What a step of a save was doing when the I/O error behind its failure came.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SaveTouch {
-    /// Making the save lock or the new file in the document's folder,
-    /// writing or syncing that new file, or syncing the folder.
+    /// Making the save lock or the new file in the document's folder.
     Folder,
     /// Opening, or taking, the save lock already beside the document.
     Lock,
@@ -470,11 +396,7 @@ pub enum SaveTouch {
     Replace,
 }
 
-/// The I/O error behind a failed save step, for a caller to word: its kind
-/// and what the step was doing ([`SaveTouch`]). A step that refused on its
-/// own account (a hostile lock entry, an observation that moved) has none.
-/// `WouldBlock` is a save lock another writer kept past the retry budget,
-/// `FileTooLarge` new bytes over the document limit.
+/// The I/O error behind a failed save step, for a caller to word.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SaveCause {
     pub kind: std::io::ErrorKind,
@@ -482,8 +404,6 @@ pub struct SaveCause {
 }
 
 /// Host assertion supplied only after the atomic replacement protocol completes.
-///
-/// The booleans intentionally make partial implementations fail closed in the reducer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AtomicSaveProof {
     pub observed: ObservedFileVersion,
@@ -497,21 +417,17 @@ pub enum AtomicSaveResult {
     Committed(AtomicSaveProof),
     Conflict {
         observed: ObservedFileVersion,
-        /// The host revalidated the original logical path/symlink capability
-        /// after observing this conflict. Only such a conflict may use the
-        /// byte-equivalent baseline-rebind path.
+        /// The host revalidated the original logical path/symlink capability after divergence.
         equivalent_rebind_allowed: bool,
     },
     Failed {
         stage: AtomicSaveStage,
-        /// The step's own account, for a log; never words for a person.
+        /// The step's own account, for a log.
         message: String,
         /// What the step met, for a caller to word ([`SaveCause`]).
         cause: Option<SaveCause>,
     },
-    /// Replacement may already be visible, but the host could not complete its
-    /// durability/content proof. The reducer must retain the old baseline and
-    /// refuse another save until an explicit disk observation reconciles it.
+    /// Replacement may already be visible.
     PublishedUnverified {
         stage: AtomicSaveStage,
         observed: Option<ObservedFileVersion>,
@@ -576,14 +492,12 @@ pub enum SaveError {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SaveReduction {
     Durable(DurableCheckpoint),
-    /// Preflight observed the same disk bytes through a newer regular-file
-    /// generation. The baseline is rebound and the draft remains dirty; the
-    /// caller may immediately offer a fresh, generation-bound Save.
+    /// Preflight observed the same disk bytes through a newer regular-file generation.
     ReboundEquivalent(VersionConflict),
     Conflict(VersionConflict),
     Failed {
         stage: AtomicSaveStage,
-        /// The step's own account, for a log; never words for a person.
+        /// The step's own account, for a log.
         message: String,
         /// What the step met, for a caller to word ([`SaveCause`]).
         cause: Option<SaveCause>,
@@ -592,7 +506,7 @@ pub enum SaveReduction {
         expected: ObservedFileVersion,
         observed: Option<ObservedFileVersion>,
         stage: AtomicSaveStage,
-        /// The step's own account, for a log; never words for a person.
+        /// The step's own account, for a log.
         message: String,
         /// What the step met, for a caller to word ([`SaveCause`]).
         cause: Option<SaveCause>,
@@ -647,7 +561,6 @@ impl SaveReducer {
         }
         let generation = SaveGeneration(self.allocate_generation()?);
         let bytes: Arc<[u8]> = Arc::from(snapshot.text.as_bytes());
-        // The text goes back to disk with the mapping it was read with.
         let encoding = self.observed.encoding;
         let file_bytes = if encoding.is_plain() {
             Arc::clone(&bytes)
@@ -673,7 +586,6 @@ impl SaveReducer {
     }
 
     /// Accept an explicitly chosen external version (for reload or overwrite conflict UI).
-    /// A live save cannot silently have its baseline replaced.
     pub(crate) fn accept_observation(
         &mut self,
         observed: ObservedFileVersion,
@@ -715,9 +627,6 @@ impl SaveReducer {
                         None,
                     );
                 }
-                // The proof read bytes, not text. The buffer keeps the mapping
-                // it saved with, even where those bytes alone would not say it
-                // (a CRLF file with no line break left).
                 self.observed = proof.observed.with_encoding(plan.encoding);
                 self.phase = SavePhase::Saved { seq: plan.seq };
                 SaveReduction::Durable(DurableCheckpoint {
@@ -748,7 +657,6 @@ impl SaveReducer {
                     );
                 };
                 if content_is_equivalent(plan.expected, observed) {
-                    // The same bytes: the buffer's mapping stands.
                     self.observed = observed.with_encoding(plan.encoding);
                     self.phase = SavePhase::Idle;
                     return SaveReduction::ReboundEquivalent(kind);
@@ -833,7 +741,7 @@ pub enum JournalPayload {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct JournalRecord {
-    /// The raw [`JournalDocumentKey`]. Decoding never mints a `DocumentId`.
+    /// The raw [`JournalDocumentKey`].
     document_raw: u64,
     pub(crate) base_seq: Seq,
     pub(crate) seq: Seq,
@@ -936,7 +844,7 @@ pub(crate) fn encode_journal_record(record: &JournalRecord) -> Result<Vec<u8>, J
     Ok(encoded)
 }
 
-/// Encode a complete bounded journal image; the append path encodes one record at a time.
+/// Encode a complete bounded journal image.
 pub fn encode_journal(records: &[JournalRecord]) -> Result<Vec<u8>, JournalError> {
     if records.len() > MAX_JOURNAL_RECORDS {
         return Err(JournalError::TooManyRecords);
@@ -956,7 +864,7 @@ pub fn encode_journal(records: &[JournalRecord]) -> Result<Vec<u8>, JournalError
     Ok(encoded)
 }
 
-/// Decode every record or return one error. No valid-prefix result escapes corruption.
+/// Decode every record or return one error.
 pub fn decode_journal(bytes: &[u8]) -> Result<Vec<JournalRecord>, JournalError> {
     if bytes.len() > MAX_JOURNAL_BYTES {
         return Err(JournalError::TooLarge);
@@ -1065,10 +973,7 @@ pub fn recover_journal_for(
     })
 }
 
-/// Bound an append stream without losing either its disk-baseline witness or
-/// its latest durable draft. The first snapshot is retained for conflict
-/// classification; all intermediate deltas/snapshots collapse into one latest
-/// snapshot. The returned image is independently re-encoded and checksummed.
+/// Bound an append stream without losing its disk-baseline witness or latest durable draft.
 pub fn compact_journal(
     key: JournalDocumentKey,
     bytes: &[u8],
@@ -1106,66 +1011,15 @@ pub fn compact_journal(
     encode_journal(&[first, latest])
 }
 
-/// A journal an aterm from before 2026-10-10 wrote under the unkeyed name
-/// (`JournalDocumentKey::legacy_unkeyed`), found by an open of a URI with that
-/// name and migrated into the keyed journal: the open replays it, `initialize`
-/// publishes the keyed image, and the legacy file is RETIRED — unlinked, under
-/// its own lock, and only while it is still the image the open read. One whose
-/// draft was not carried over (a disk conflict, or an image that does not
-/// decode) is set aside first, as any image an open replaces is.
-///
-/// MIGRATION RULINGS (hashclock-2, 2026-10-10):
-/// - FOUND ON OPEN, NEVER SWEPT. A legacy name says nothing of its URI, so a
-///   legacy journal is found only by an open of a URI that names it.
-/// - A LEGACY IMAGE THAT CARRIES NOTHING NEVER DECIDES (amended at review,
-///   2026-10-10). One that holds no draft (an older aterm's open or save,
-///   never edited), or whose draft was made against other contents and is the
-///   file now, is retired at the open, and the keyed journal decides what the
-///   open shows. An older aterm that runs after this one (a concurrent
-///   instance of another build, a downgrade, a rollback release) cannot see a
-///   keyed journal, so its clean image of the file says nothing about the
-///   keyed draft and never hides it.
-/// - A LEGACY DRAFT WINS while it exists. Only an older aterm writes one, and
-///   the journal retires it before the keyed journal's first write after the
-///   migration (`native_document_journal::retire_legacy_journal`, bound into
-///   every write plan). So a keyed journal beside a legacy draft is that
-///   draft's migration, or older than it, unless aterms of two builds edit the
-///   document at once, when neither can tell which is newer. Either way nothing
-///   is lost: a keyed image that holds a draft the legacy one does not (or does
-///   not decode) is set aside, never replaced, and NEVER BY A SILENT OPEN. The
-///   legacy draft's own notice (`Recovered`, `DiskConflict`) says what is
-///   shown. A legacy draft that is the file itself (typed, then undone) has
-///   none, so the set-aside says `DiskConflict` (`Corrupt` for an undecodable
-///   image).
-/// - A CARRIED DRAFT'S LEGACY FILE STAYS UNTIL THAT FIRST WRITE. An update
-///   from an older aterm hands its unsaved drafts over by journal, and the
-///   outgoing process's Commit check reads ITS (legacy) file back: retiring it
-///   at the successor's open would refuse every such update while a draft is
-///   open. A clean image, a conflict and a corrupt one carry nothing to check,
-///   so they are retired at the open.
-/// - RESIDUAL COLLISION RISK, BOUNDED: the legacy lookup is still by the
-///   unkeyed name, so a URI that collides with one owning a legacy journal can
-///   read it — exactly the defect, confined to journals an older aterm wrote.
-///   No legacy journal is ever written by this version. Each one is retired by
-///   the first open that reads it, or, when that open carries its draft (an
-///   unedited document re-carries it at every open), by the document's first
-///   write. One an older aterm rewrote after the read is never retired (the
-///   write that would retire it refuses instead). So that set only shrinks.
-///
-/// The fields are `pub` only while the journal that builds one stays in
-/// aterm-gui; what holds retirement to the image the open read is the check
-/// under the journal lock (`retire_legacy_journal` compares `image` with the
-/// file before it unlinks). The terminal face's journal move (T5) brings that
-/// builder here and narrows them back to `pub(crate)`.
+/// A journal an aterm from before wrote under the unkeyed name.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LegacyJournal {
     pub path: PathBuf,
-    /// The image the open read: the only one retirement removes.
+    /// The image the open read.
     pub image: JournalImageGeneration,
-    /// Its draft was carried into the keyed journal: it stays until that
-    /// journal's first write.
+    /// Its draft was carried into the keyed journal.
     pub carried: bool,
-    /// Set aside before it goes: its draft was not carried over.
+    /// Set aside before it goes.
     pub keep_aside: bool,
 }
 
@@ -1191,11 +1045,7 @@ impl JournalImageGeneration {
     }
 }
 
-/// One process's identity as a journal owner: nonzero, random, and never reused
-/// while its lease file exists (each is created exclusively). aterm-gui's
-/// journal takes one per process (`native_document_journal_owner::establish`)
-/// and names it on every image a write plan publishes
-/// ([`JournalAppendPlan::owner`]).
+/// One process's identity as a journal owner.
 #[cfg(any(unix, windows))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct JournalOwnerId(u64);
@@ -1224,8 +1074,7 @@ impl JournalOwnerId {
     }
 }
 
-/// Where no image can carry an owner set (neither an extended attribute nor an
-/// alternate data stream), no process is an owner: the type has no value.
+/// Where no image can carry an owner set.
 #[cfg(not(any(unix, windows)))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum JournalOwnerId {}
@@ -1238,9 +1087,7 @@ pub fn parse_hex16(text: &str) -> Option<u64> {
 }
 
 trust_contract_fn! {
-    /// Whether `byte` is one of the 16 digits an owner id is spelled in:
-    /// `0`-`9` or a LOWERCASE `a`-`f`. An uppercase digit is refused, so each id
-    /// has one spelling and one lease name.
+    /// Whether `byte` is one of the 16 digits an owner id is spelled with.
     #[must_use]
     #[expect(
         clippy::manual_range_contains,
@@ -1253,9 +1100,6 @@ trust_contract_fn! {
     }
 }
 
-// Spec `lower-hex-digit-class` (SPECS.md): for every byte, the digit test holds
-// exactly on `0`-`9` (48-57) and `a`-`f` (97-102). Kernel-checked against the
-// compiled body.
 verify_island! {
     clean {
         theorem is_lower_hex_digit_is_class (byte : UInt8) :
@@ -1275,14 +1119,11 @@ pub struct JournalAppendPlan {
     pub generation: JournalGeneration,
     pub base_durable: Seq,
     pub target_seq: Seq,
-    /// Exact durable journal image observed by the host that scheduled this
-    /// plan. `None` is a pure reducer plan and must be bound before filesystem I/O.
+    /// Exact durable journal image observed by the host that scheduled this plan.
     pub expected_image: Option<ContentFingerprint>,
-    /// A legacy journal the host must retire before this append publishes
-    /// ([`LegacyJournal`]); bound with `expected_image`.
+    /// A legacy journal the host must retire before this append publishes ([`LegacyJournal`]).
     pub retire_legacy: Option<LegacyJournal>,
-    /// Named on the image this append publishes; bound with `expected_image`
-    /// (`native_document_journal::DraftJournalHost::owner_id`).
+    /// Named on the image this append publishes.
     pub owner: Option<JournalOwnerId>,
     pub bytes: Arc<[u8]>,
     pub encoded_fingerprint: ContentFingerprint,
@@ -1548,7 +1389,6 @@ fn validate_edits_shape(edits: &[JournalEdit]) -> Result<(), JournalError> {
             JournalError::TooManyEdits
         });
     }
-    // The first edit is held to an end of 0, which every start meets.
     let mut previous_end = 0;
     for edit in edits {
         if !journal_edit_in_order(
@@ -1566,17 +1406,10 @@ fn validate_edits_shape(edits: &[JournalEdit]) -> Result<(), JournalError> {
 
 /// [`MAX_INSERT_BYTES`] as a byte count the contracted predicates compare.
 const MAX_INSERT_LEN: u64 = MAX_INSERT_BYTES as u64;
-// `journal_edit_in_order`'s clause and theorem spell this limit as the literal
-// 32 MiB, and no landing check runs the Trust lane that would reject them once
-// the constant moved: an ordinary build fails here instead.
 const _: () = assert!(MAX_INSERT_LEN == 33_554_432);
 
 trust_contract_fn! {
     /// Whether one journal edit may follow an edit that ended at `previous_end`
-    /// (0 before the first): its range runs forward, it starts at or after that
-    /// end, so a record's edits are sorted and never overlap, and it inserts at
-    /// most [`MAX_INSERT_BYTES`]. Replay applies a record's edits back to front
-    /// on exactly this promise.
     #[must_use]
     fn journal_edit_in_order(start: u64, end: u64, previous_end: u64, insert_len: u64) -> bool
     clauses [ensures result == (start <= end && (previous_end <= start && insert_len <= 33554432)) by journal_edit_in_order_is_shape]
@@ -1585,9 +1418,6 @@ trust_contract_fn! {
     }
 }
 
-// Spec `journal-edit-order` (SPECS.md): an edit is accepted exactly when its
-// range is forward, it starts at or after the previous edit's end, and its
-// insert is at most 32 MiB. Kernel-checked against the compiled body.
 verify_island! {
     clean {
         theorem journal_edit_in_order_is_shape
@@ -1662,8 +1492,6 @@ fn decode_record(bytes: &[u8]) -> Result<(JournalRecord, usize), JournalError> {
     if total_len != expected_len {
         return Err(JournalError::LengthMismatch);
     }
-    // `total_len` is in `[header + checksum, bytes.len]` here; the slices are
-    // taken with `get` all the same, so their bounds need no reasoning at all.
     let checksum_at = total_len - JOURNAL_CHECKSUM_LEN;
     let checked = bytes.get(..checksum_at).ok_or(JournalError::Truncated)?;
     let mut checksum_reader = Reader::new(
@@ -1975,12 +1803,9 @@ mod tests {
             }
         ));
 
-        // Negative controls: a blind reload would lose local bytes, and accepting an
-        // observation mid-save would invalidate the save proof.
         assert_ne!(reduce(true, false), reduce(false, false));
         assert_ne!(reduce(false, true), reduce(false, false));
 
-        // Tier-1: exhaust the bounded input projection against the derived priority model.
         let model = native_file_watch_model();
         for changed in [false, true] {
             for equivalent in [false, true] {
@@ -2020,8 +1845,6 @@ mod tests {
             }
         }
 
-        // Negative control: conflict cannot outrank deferral while a save owns
-        // the baseline transition.
         let mut before = model.init_state();
         before.insert("changed", 1);
         before.insert("equivalent", 0);
@@ -2112,8 +1935,6 @@ mod tests {
         );
         assert_eq!(reducer.begin(&snapshot), Err(SaveError::ReconcileRequired));
 
-        // Tier-1: this state is the model's published-but-unverified transition, where a
-        // retry is a rejected self-loop.
         let model = config_file_commit_cas_model();
         let begun = model.successors("BeginManual", &model.init_state())[0].clone();
         let locked = model.successors("LockManual", &begun)[0].clone();
@@ -2123,8 +1944,6 @@ mod tests {
         let rejected = model.successors("RetryIndeterminate", &indeterminate);
         assert_eq!(rejected, vec![indeterminate.clone()]);
         assert!(model.check_invariant("IndeterminateDoesNotClaimDurability", &indeterminate));
-        // Negative control: booking the unverified publication as committed (adopting
-        // `visible`, which the reducer refused) is no transition of the healthy model.
         let claimed = aterm_spec::interp::with_buggy(&model, 1)
             .successors("ResolveManualIndeterminate", &locked)[0]
             .clone();
@@ -2208,7 +2027,6 @@ mod tests {
         assert_eq!(rebound_plan.expected, replaced);
         assert_eq!(rebound_plan.preflight(replaced), Ok(()));
 
-        // Tier-1: the save-preflight and watch paths project the same byte-equivalent rebind.
         let model = native_file_watch_model();
         let mut before = model.init_state();
         before.insert("changed", 1);
@@ -2439,10 +2257,6 @@ mod tests {
     }
 
     /// Every string of up to 8 characters over `a`, CR and LF, with and without
-    /// a byte order mark: the held text encodes back to exactly the file's
-    /// bytes; the file is held as CRLF exactly when it has a line feed and each
-    /// one has a CR before it; and then exactly one CR goes per line feed. Any
-    /// text saved as CRLF reads back as the same text.
     #[test]
     fn held_text_encodes_back_to_the_files_bytes() {
         let mut files = vec![String::new()];
@@ -2495,8 +2309,6 @@ mod tests {
     }
 
     /// A plan carries the buffer's text and, apart from it, the bytes the file
-    /// gets; a plain document's are one allocation. A save's proof (a read of
-    /// bytes, which may no longer show the mapping) keeps the buffer's mapping.
     #[test]
     fn a_save_plan_encodes_the_text_with_the_mapping_it_was_read_with() {
         let crlf = DiskEncoding {
@@ -2543,11 +2355,9 @@ mod tests {
     }
 
     /// `journal_edit_in_order` is proved for one edit (SPECS.md); this holds
-    /// the loop that threads each edit's end into the next check.
     #[test]
     fn a_delta_takes_sorted_disjoint_forward_edits_only() {
         let (_store, id, snapshot) = snapshot("abcd");
-        // Each edit as (start, end) of its range.
         let delta = |ranges: &[(usize, usize)]| {
             let edits = ranges
                 .iter()

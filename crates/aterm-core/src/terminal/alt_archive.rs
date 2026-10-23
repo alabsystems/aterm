@@ -207,7 +207,7 @@ impl AltArchiveRead {
     /// none): the exclusive `since` of the next page or poll.
     #[inline]
     #[must_use]
-    pub fn page_last(&self) -> u64 {
+    pub const fn page_last(&self) -> u64 {
         match self.rows.len() {
             0 => self.last,
             n => self.first + n as u64 - 1,
@@ -301,7 +301,7 @@ impl AltArchiveCarry {
     /// The newest index this carry names (`first - 1` plus its rows).
     #[inline]
     #[must_use]
-    pub fn last(&self) -> u64 {
+    pub const fn last(&self) -> u64 {
         (self.first + self.rows.len() as u64).saturating_sub(1)
     }
 }
@@ -354,7 +354,7 @@ struct Frame {
 
 impl Frame {
     #[inline]
-    fn rows(&self) -> usize {
+    const fn rows(&self) -> usize {
         self.text.len()
     }
 
@@ -792,7 +792,7 @@ impl AltArchive {
     /// `pid << 32 ^ launch nanos`), so another archive's indices are never mistaken for this
     /// one's. A carrying handoff keeps it ([`AltArchive::import`]).
     #[inline]
-    pub fn set_origin(&mut self, origin: u64) {
+    pub const fn set_origin(&mut self, origin: u64) {
         self.origin = origin;
     }
 
@@ -966,7 +966,7 @@ impl AltArchive {
         self.install_cur(key);
     }
 
-    fn install_cur(&mut self, key: Option<u64>) {
+    const fn install_cur(&mut self, key: Option<u64>) {
         std::mem::swap(&mut self.prev, &mut self.cur);
         self.have_prev = true;
         self.prev_key = key;
@@ -2083,7 +2083,7 @@ struct DecModeMatcher {
 
 impl DecModeMatcher {
     #[inline]
-    fn finish_param(&mut self) {
+    const fn finish_param(&mut self) {
         match self.param {
             2026 => self.esu = true,
             47 => self.alt |= ALT_47,
@@ -2280,7 +2280,7 @@ impl Terminal {
     /// Set the archive's origin: unique to this process, so indices are never compared across
     /// a restart or an archive-less handoff.
     #[inline]
-    pub fn set_alt_archive_origin(&mut self, origin: u64) {
+    pub const fn set_alt_archive_origin(&mut self, origin: u64) {
         self.alt_archive.archive.set_origin(origin);
     }
 

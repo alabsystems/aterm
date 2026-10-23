@@ -1,44 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE VITALS HOST'S JOBS PASS: the stuck-process engine
-//! (`aterm_vitals::jobs`, design §11) fed on the probe thread, so the stats
-//! bars' marks (⊘ ◔ ☠ ◇ and the drawn pause) and the lens's Jobs well show
-//! the verdicts the engine reaches.
-//!
-//! Each reading the probe thread takes ([`crate::vitals_host`]) hands its
-//! process sweep here. When the engine is due (its own cadence: every 2 s
-//! while a job runs or can accrue suspicion, every 30 s while only
-//! legitimate waits stand, §11.3 "Demand"), [`JobsPass::tick`] asks the
-//! engine which processes to read in detail ([`Jobs::plan`]), reads them
-//! with the job probe (`aterm_sysprobe::jobs::JobsReader`), and folds them
-//! in ([`Jobs::absorb`]). The view rides on every snapshot until the next
-//! pass replaces it.
-//!
-//! The conversion below is a move, field for field: the engine's input types
-//! mirror the probe's readings (`examples/stuck_live.rs` in aterm-sysprobe
-//! is the same hand-off, run live).
-//!
-//! The host hands the engine each tab's terminal mode word
-//! (`vitals_host::TtyWord`, design §6.6), while it is current, so a program
-//! waiting for the person at its prompt reads `tty-raw` or `tty-password`
-//! and arms no job demand (§6.1). What it does not yet hand: OSC 133
-//! blocks, the unread-input gate's word and PTY output times (the loop owns
-//! those), so the engine reads each tab's jobs from kernel facts and that
-//! word, as the design's no-shell-integration case does.
-//!
-//! THE JOBS BOARD ([`JobsBoard`], the process's [`BOARD`]): the view the loop
-//! last adopted, posted with each tab's session id, for the harness workers'
-//! stall canary (`harness_host::WorkerIdle::background_jobs`, the hung-call
-//! design's R1). A row's `tab` is the key the loop gave the engine
-//! (`vitals_host`'s `TabRoot::key`): the pool session's process-local id,
-//! which the session store maps to the session id a worker goes by
-//! (`SessionHandle::{local_id, sid}`); the map is taken at the post, under
-//! the store's lock, so a worker reads the board by its session id alone.
-//! The loop reads with no window too (`vitals_host`: one reading at each of
-//! the disk watch's looks, then at the engine's own cadence while an agent
-//! call stands suspect, [`windowless_after`]), so the board speaks whether or not
-//! anyone looks at the bars (the hung-call design's D1).
+//! THE VITALS HOST'S JOBS PASS: the stuck-process engine (`aterm_vitals::jobs`, design §11) fed on the probe thread, so the stats bars' marks (⊘ ◔ ☠ ◇ and the drawn pause) and the lens's Jobs well show the verdicts the engine reaches.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -56,7 +19,6 @@ use aterm_vitals::jobs::{
 use aterm_vitals::model::TabRoot;
 
 /// The engine's fast cadence (§11.3): also the floor between passes, so a
-/// 2 Hz lens does not double the detailed reads.
 const FAST_MS: u64 = 2_000;
 
 /// The engine, its reader and the last view, on the probe thread.
@@ -80,12 +42,7 @@ impl JobsPass {
         }
     }
 
-    /// One reading's pass: run the engine when it is due, or whenever `now`
-    /// (a reading an edge asked: the loop paces those itself, on its own
-    /// clock, and one that lands a little inside this pass's cadence must
-    /// still look, or the job it was asked for goes unseen until the next
-    /// edge), and return the view to publish (the last one when it is not
-    /// due). `None` before the first pass and without a sweep.
+    /// One reading's pass: run the engine when it is due, or whenever `now` (a reading an edge asked: the loop paces those itself, on its own clock, and one that lands a little inside this pass's cadence must still look, or the job it was asked for goes unseen until the next edge), and return the view to publish (the last one when it is not due).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn tick(
         &mut self,
@@ -140,29 +97,10 @@ impl JobsPass {
     }
 }
 
-/// How old the board's view may be and still speak for the canary
-/// ([`JobsBoard::evidence`]). A view that can name a call holds a suspect
-/// one (a `no_progress` row is quiet, and only a suspect standing reads
-/// quiet), and every reader re-reads such a view within 35 s: the engine
-/// every 2 s while a job can accrue suspicion, the probe thread at least
-/// every 5 s while a window shows the bars, and with none at the engine's
-/// own cadence ([`windowless_after`]). A view only the disk watch's look
-/// refreshes holds no suspect call and names nothing, so its age does not
-/// matter. Older than this, the reader stopped (no harness host to look,
-/// the probe thread gone), and the view says nothing of now.
+/// How old the board's view may be and still speak for the canary ([`JobsBoard::evidence`]).
 pub(crate) const JOBS_FRESH: Duration = Duration::from_secs(60);
 
-/// WHETHER A JOBS VIEW `age` OLD SPEAKS FOR NOW: one at most [`JOBS_FRESH`]
-/// old does; so does a PARKED one (its demand idle: every live job waits only
-/// for the person, or none is live) of any age while its reader runs
-/// (`reader`), because a parked engine is read again only on an edge (output
-/// that moves a screen, a parked screen's redraw at most once a floor, a
-/// session's fork, `exec` or exit the kernel watch hears, the disk watch's
-/// look; design §6.1), so no reading since says nothing changed that drew or
-/// that the kernel told of. An idle Claude Code, vim, less or a
-/// password prompt keeps its `job=` and its brief line for as long as it
-/// waits. A view that is not parked, or whose reader stopped, says nothing of
-/// now past the minute.
+/// WHETHER A JOBS VIEW `age` OLD SPEAKS FOR NOW: one at most [`JOBS_FRESH`] old does; so does a PARKED one (its demand idle: every live job waits only for the person, or none is live) of any age while its reader runs (`reader`), because a parked engine is read again only on an edge (output that moves a screen, a parked screen's redraw at most once a floor, a session's fork, `exec` or exit the kernel watch hears, the disk watch's look; design §6.1), so no reading since says nothing changed that drew or that the kernel told of.
 pub(crate) fn speaks_for_now(view: &JobsView, age: Duration, reader: bool) -> bool {
     age <= JOBS_FRESH || (reader && view.demand == Demand::Idle)
 }
@@ -174,9 +112,7 @@ struct Posted {
     at: Instant,
 }
 
-/// THE JOBS BOARD ([module docs](self)): one leaf-locked slot. Nothing is
-/// locked, read or logged under its lock; a reader copies one row's words
-/// and lets go.
+/// THE JOBS BOARD ([module docs](self)): one leaf-locked slot.
 pub(crate) struct JobsBoard {
     slot: Mutex<Option<Posted>>,
 }
@@ -189,9 +125,7 @@ impl JobsBoard {
         }
     }
 
-    /// Post `view`, its tabs' session ids `sids`, read at `now`. The same
-    /// view posted again (the engine not due: the snapshot carries the last
-    /// one) keeps the time it was first posted, so its age is the reading's.
+    /// Post `view`, its tabs' session ids `sids`, read at `now`.
     pub(crate) fn post(&self, view: Arc<JobsView>, sids: BTreeMap<u64, String>, now: Instant) {
         let mut slot = self.slot.lock().unwrap_or_else(PoisonError::into_inner);
         let at = match slot.as_ref() {
@@ -201,17 +135,7 @@ impl JobsBoard {
         *slot = Some(Posted { view, sids, at });
     }
 
-    /// WHAT THE VIEW SAYS OF SESSION `sid`'S AGENT'S BACKGROUND WORK at
-    /// `now`: [`BackgroundEvidence::NoProgress`] with the call quiet longest
-    /// when every live agent call of this session's tab that is background
-    /// (or not known to be foreground: `Consumer::Agent`, which no join can
-    /// tell apart today) reads `no_progress`; else `Unknown` — no view, one
-    /// older than [`JOBS_FRESH`], none of this session's, or a live call of
-    /// the agent's that does not read `no_progress`, which may be the work
-    /// the screen waits on (system awareness §14.5's `AllStuck` asks every
-    /// live job; its `Progressing` is not built), so the ladder is today's.
-    /// A foreground call holds the agent's turn live, and the canary climbs
-    /// on no live turn.
+    /// WHAT THE VIEW SAYS OF SESSION `sid`'S AGENT'S BACKGROUND WORK at `now`: [`BackgroundEvidence::NoProgress`] with the call quiet longest when every live agent call of this session's tab that is background (or not known to be foreground: `Consumer::Agent`, which no join can tell apart today) reads `no_progress`; else `Unknown` — no view, one older than [`JOBS_FRESH`], none of this session's, or a live call of the agent's that does not read `no_progress`, which may be the work the screen waits on (system awareness §14.5's `AllStuck` asks every live job; its `Progressing` is not built), so the ladder is today's.
     pub(crate) fn evidence(&self, sid: &str, now: Instant) -> BackgroundEvidence {
         let slot = self.slot.lock().unwrap_or_else(PoisonError::into_inner);
         let Some(posted) = slot
@@ -241,9 +165,7 @@ impl JobsBoard {
     }
 }
 
-/// The process's board: the loop posts each view it adopts
-/// (`App::post_jobs_reading`, to `VitalsHost`'s board: this one live, a
-/// test's own in a test), the workers read it.
+/// The process's board: the loop posts each view it adopts (`App::post_jobs_reading`, to `VitalsHost`'s board: this one live, a test's own in a test), the workers read it.
 pub(crate) static BOARD: JobsBoard = JobsBoard::new();
 
 /// A row the canary reads as a live background call of the agent's.
@@ -254,9 +176,6 @@ fn background_call_live(r: &JobRow) -> bool {
 }
 
 /// The canary's plain form of a row: the process it names (the waiting one
-/// for a wait, else the leader) and that process's name, the group, the
-/// agent's task id, the quiet age and a Tier B naming's word. aterm-agent
-/// says only the plain words of these (`BackgroundCall::fact`).
 fn background_call(r: &JobRow) -> BackgroundCall {
     BackgroundCall {
         pid: r.wait.as_ref().map_or(r.leader.0, |w| w.leaf),
@@ -269,22 +188,11 @@ fn background_call(r: &JobRow) -> BackgroundCall {
 }
 
 /// How long until the next pass after one whose demand was `demand`: the
-/// engine's interval, never under [`FAST_MS`]; an idle engine (no job, or
-/// only waits for the person) looks again at the fast cadence, since a job
-/// can start at any keystroke.
 fn next_pass_ms(demand: Demand) -> u64 {
     demand.every_ms().unwrap_or(FAST_MS).max(FAST_MS)
 }
 
-/// HOW SOON A READING NO WINDOW SHOWS IS DUE AGAIN after one that gave
-/// `view` (the hung-call design's D1, "while any agent-call job is
-/// suspect"; leftover §9): while a live agent call (any consumer) stands
-/// suspect (`Standing::Capable | Capped`, the only rows that accrue φ;
-/// every `no_progress` row is one), the engine's own cadence
-/// ([`next_pass_ms`] of its `Demand`); else `None`, and the disk watch's
-/// next look reads. A call that runs or legitimately waits (an agent's dev
-/// server in `accept`), or another tab's job, keeps no reading going: no
-/// window means no keystroke a job could start at that the bars would show.
+/// HOW SOON A READING NO WINDOW SHOWS IS DUE AGAIN after one that gave `view` (the hung-call design's D1, "while any agent-call job is suspect"; leftover §9): while a live agent call (any consumer) stands suspect (`Standing::Capable | Capped`, the only rows that accrue φ; every `no_progress` row is one), the engine's own cadence ([`next_pass_ms`] of its `Demand`); else `None`, and the disk watch's next look reads.
 pub(crate) fn windowless_after(view: &JobsView) -> Option<Duration> {
     let suspect = view.rows.iter().any(|r| {
         r.kind == JobKind::AgentCall
@@ -296,8 +204,6 @@ pub(crate) fn windowless_after(view: &JobsView) -> Option<Duration> {
 }
 
 /// The engine's tabs from the host's request: its session key, the number
-/// the person sees (`Tab 2` is 2), its shell, and its terminal mode word
-/// where `ttys` holds a current one.
 fn job_tabs(tabs: &[TabRoot], ttys: &[(u64, TtyMode)]) -> Vec<JobTab> {
     tabs.iter()
         .map(|t| JobTab {
@@ -467,9 +373,6 @@ pub(crate) mod tests {
     use super::*;
 
     /// The engine's cadence, and with no window the reading's: while a live
-    /// agent call stands, the engine's demand (2 s fast, 30 s slow); an idle
-    /// engine, an exited call or jobs that are no agent's ask nothing before
-    /// the disk watch's next look.
     #[test]
     fn the_engine_is_asked_again_at_its_own_cadence_never_faster_than_two_seconds() {
         assert_eq!(next_pass_ms(Demand::Fast), 2_000);
@@ -503,13 +406,11 @@ pub(crate) mod tests {
         assert_eq!(windowless_after(&view(vec![shell], Demand::Fast)), None);
         assert_eq!(windowless_after(&view(vec![ended], Demand::Fast)), None);
         assert_eq!(windowless_after(&view(Vec::new(), Demand::Idle)), None);
-        // Healthy calls keep no reading going: a running one, a listening one.
         assert_eq!(windowless_after(&view(vec![running], Demand::Fast)), None);
         assert_eq!(windowless_after(&view(vec![serving], Demand::Slow)), None);
     }
 
     /// An agent's call in tab `tab` read `no_progress` (or not), by `consumer`,
-    /// quiet `min` minutes, naming process `pid` (`exe`).
     pub(crate) fn call_row(
         tab: u64,
         consumer: Consumer,
@@ -537,17 +438,6 @@ pub(crate) mod tests {
     }
 
     /// THE CANARY'S EVIDENCE IS THIS SESSION'S BACKGROUND CALL THAT MADE NO
-    /// PROGRESS, the one quiet longest: of tab 4's rows (session `s-hung`),
-    /// an agent call of no known consumer at 20 minutes and a background one
-    /// at 31 minutes waiting in process 27098, the 31-minute one, named by
-    /// its waiting process; never a foreground call, a person's job or
-    /// another session's call, however long their quiet, and an exited call
-    /// does not count. A live background call of the agent's that does not
-    /// read `no_progress` may be the work the screen waits on: with one, the
-    /// answer is `Unknown`. A view older than [`JOBS_FRESH`] says nothing,
-    /// and posting that same view again does not make it fresh; a new view
-    /// does. NEGATIVE CONTROL: an empty board and a session with no rows are
-    /// `Unknown`.
     #[test]
     fn the_board_names_this_sessions_background_call_quiet_longest() {
         use aterm_vitals::jobs::{NamedRow, Standing, TierB, Wait, WaitName};
@@ -611,8 +501,6 @@ pub(crate) mod tests {
         );
         board.post(view(), sids.clone(), late);
         assert_eq!(board.evidence("s-hung", late), hung, "a new view is fresh");
-        // A build of the agent's runs beside the hung call: it may be the
-        // work the screen waits on.
         let mut building = rows.clone();
         building.push(call_row(4, Consumer::AgentBg, false, 2, 506, "cargo"));
         let view = Arc::new(JobsView {
@@ -628,8 +516,6 @@ pub(crate) mod tests {
     }
 
     /// Each tab keeps its key, number and shell, and takes the terminal word
-    /// handed for its key. NEGATIVE CONTROL: a tab with no word handed gets
-    /// none (its wait is named from kernel facts alone).
     #[test]
     fn a_tab_keeps_its_session_key_shell_and_number_and_its_own_terminal_word() {
         let root = |key, label: &str| TabRoot {
@@ -652,12 +538,11 @@ pub(crate) mod tests {
     }
 
     /// The pass on this host's real process table: this test process stands
-    /// in for a tab's shell. The engine plans, the probe reads, and a view
-    /// comes back; a second reading inside the cadence keeps that view.
     #[test]
     fn a_pass_over_the_live_table_yields_a_view_and_keeps_it_between_passes() {
         let Some(sweep) = aterm_sysprobe::processes() else {
-            return; // A host without a process sweep publishes no jobs.
+            // A host without a process sweep publishes no jobs.
+            return;
         };
         let me = std::process::id();
         let tabs = [TabRoot {
@@ -685,14 +570,11 @@ pub(crate) mod tests {
     }
 
     /// AN EDGE'S READING LOOKS (the loop paces edges on its own clock): one
-    /// asked inside the pass's cadence runs the engine anyway, so the job it
-    /// was asked for is seen now. NEGATIVE CONTROL: the same reading at the
-    /// same instant, not an edge's, keeps the last view (the engine's cadence,
-    /// which skipped a job typed 1 s after quitting `less`).
     #[test]
     fn an_edges_reading_inside_the_cadence_runs_the_engine() {
         let Some(sweep) = aterm_sysprobe::processes() else {
-            return; // A host without a process sweep publishes no jobs.
+            // A host without a process sweep publishes no jobs.
+            return;
         };
         let me = std::process::id();
         let tabs = [TabRoot {
@@ -716,9 +598,6 @@ pub(crate) mod tests {
     }
 
     /// A view speaks for now for a minute; a PARKED one (demand idle) for as
-    /// long as its reader runs. NEGATIVE CONTROLS: a view that is not parked
-    /// says nothing past the minute, and neither does a parked one whose
-    /// reader stopped.
     #[test]
     fn a_parked_view_speaks_for_now_while_its_reader_runs() {
         let parked = JobsView::default();

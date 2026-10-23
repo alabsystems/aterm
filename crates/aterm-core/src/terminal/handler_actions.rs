@@ -2644,7 +2644,7 @@ impl KittyLayout {
 
     /// The image of `bytes` in `format`, with this layout.
     #[inline]
-    fn image(self, bytes: Vec<u8>, format: ImageFormat) -> ImageData {
+    const fn image(self, bytes: Vec<u8>, format: ImageFormat) -> ImageData {
         ImageData {
             bytes,
             format,
@@ -2696,7 +2696,7 @@ fn kitty_rgba(frame: &ImageData) -> Result<KittyRgba<'_>, &'static str> {
 
 /// A raw RGBA8 frame of `width × height` pixels, laid out as `like`.
 #[inline]
-fn raw_frame(bytes: Vec<u8>, width: u16, height: u16, like: &ImageData) -> ImageData {
+const fn raw_frame(bytes: Vec<u8>, width: u16, height: u16, like: &ImageData) -> ImageData {
     KittyLayout::of(like).image(bytes, ImageFormat::RawRgba8 { width, height })
 }
 

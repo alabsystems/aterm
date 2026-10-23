@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1 conformance for the native updater: the shipping service, predicates and `App`
-//! arcs, each bound to its `aterm_spec::derive` model. Each test projects shipping state onto
-//! the model independently; none reconstructs an expected state from the action definition.
+//! Tier-1 conformance for the native updater: the shipping service, predicates and `App` arcs, each bound to its `aterm_spec::derive` model.
 
 #![cfg(test)]
 
@@ -132,15 +130,11 @@ fn real_updater_service_conforms_for_single_flight_stage_defer_and_safe_apply() 
     };
     assert_last_batch(&model, &service);
 
-    // Single-flight negative control: a second view joins the exact service ticket;
-    // neither generation nor model state advances and no second worker is minted.
     let running = service.model_state();
     assert_eq!(service.request_check(), CheckStart::Joined(check));
     assert_eq!(service.model_state(), running);
     assert!(service.last_transitions().is_empty());
 
-    // The updater API checks, downloads, verifies and stages in one worker; the reducer
-    // exposes the three model transitions as one atomic completion.
     assert_eq!(
         service.finish_check(check, status(Some(11), 0)),
         CheckCompletion::Reduced
@@ -165,8 +159,6 @@ fn real_updater_service_conforms_for_single_flight_stage_defer_and_safe_apply() 
     command.execute(|| process_reexec_calls += 1);
     assert_eq!(process_reexec_calls, 1);
 
-    // A replay cannot produce a second command, and the model catches the independent
-    // double-reexec mutant rather than trusting the service's own decision bit.
     assert!(matches!(
         service.finish_apply_preflight(preflight, ClosePreflight::Ready),
         ApplyDecision::Ignored
@@ -213,8 +205,6 @@ fn real_service_retries_and_drops_a_stale_stage_completion() {
     );
     assert_last_batch(&model, &service);
 
-    // Negative control: an old artifact generation marked staged violates
-    // `CurrentStagedArtifact`, so the conformance assertion is not vacuous.
     let current = project(&model, service.model_state());
     let mut stale = current.clone();
     stale.insert("artifact_generation", current["request_generation"] - 1);
@@ -302,9 +292,6 @@ fn failed_apply_rearms_exact_stage_and_stale_attempt_cannot_abort_retry() {
         other => panic!("expected retry command, got {other:?}"),
     };
     assert_last_batch(&model, &service);
-    // Negative control for the fresh-nonce law: the real retry below mints a new
-    // attempt. Re-arming under the failed attempt's own nonce is the one identity
-    // a late replay of that failure would still match.
     let buggy_identity = aterm_spec::interp::with_buggy(&identity_model, 1);
     assert!(
         identity_model
@@ -320,8 +307,6 @@ fn failed_apply_rearms_exact_stage_and_stale_attempt_cannot_abort_retry() {
     assert_ne!(retry_attempt, first_attempt);
     assert!(identity_model.check_invariant("RetryUsesFreshIdentity", &identity));
 
-    // Negative control for the attempt nonce: a delayed failure from attempt A
-    // cannot cancel the live authority for attempt B.
     assert!(!service.abort_apply(&first_attempt, "stale attempt callback"));
     assert!(service.last_transitions().is_empty());
     assert_eq!(service.model_state().phase, 5);
@@ -367,8 +352,6 @@ fn healthy_no_update_completion_returns_to_idle_through_the_derived_action() {
 }
 
 /// Bind the real event-loop dispatch predicate to the disk transaction's
-/// first-present boundary. Negative control: allocating a window must not
-/// enable proof/disarm before a successful drawable present.
 #[test]
 fn real_gui_boot_health_dispatch_requires_first_present_before_model_disarm() {
     let model = native_update_disk_transaction_model();
@@ -425,10 +408,6 @@ fn real_gui_boot_health_dispatch_requires_first_present_before_model_disarm() {
     );
     let proved = model.successors("ProveInstalledHealth", &presented)[0].clone();
     assert_exact_model_action(&model, "ProveInstalledHealth", &presented, &proved);
-    // A predecessor the running build's verifier refuses (RunningVerifierRefusesRetainedOld)
-    // needs no binding of its own here: the predicate reads no predecessor fact, so the
-    // pre-present refusal bound above is the one that branch gets, and its counted
-    // launch's SettleWithoutRevert, which proves no health, is bound in aterm-update.
 }
 
 fn admission_before(model: &Model, facts: AdmissionFacts) -> State {
@@ -442,9 +421,6 @@ fn admission_before(model: &Model, facts: AdmissionFacts) -> State {
     if facts.live_ptys > 0 || facts.foreground_jobs > 0 {
         state = model.successors("ObserveForegroundJob", &state)[0].clone();
     }
-    // `unknown_foregrounds` matters only to the cold lane; it enters the model through
-    // `ObserveForegroundJob` (fired whenever `live_ptys > 0`; the matrix never has
-    // `unknown_foregrounds > live_ptys`).
     if !facts.native_state_certified {
         state = model.successors("ObserveUnsafeNativeState", &state)[0].clone();
     }
@@ -489,9 +465,6 @@ fn admission_action(decision: AdmissionDecision) -> &'static str {
         AdmissionDecision::Block(AdmissionBlock::NativeStateUncertified) => {
             "BlockUnsafeNativeState"
         }
-        // An unprobeable foreground blocks for the same reason as `LivePtysNeedSeamless`
-        // (a destructive swap could hang up a PTY job and the lossless lane is unavailable),
-        // so it refines the same action.
         AdmissionDecision::Block(AdmissionBlock::ForegroundProbeUnknown)
         | AdmissionDecision::Block(AdmissionBlock::LivePtysNeedSeamless) => {
             "BlockForegroundWithoutSeamless"
@@ -503,9 +476,6 @@ fn admission_action(decision: AdmissionDecision) -> &'static str {
 }
 
 /// Exhaust the bounded admission fact matrix against the genuine shipping
-/// classifier. This binds the model's foreground-job progress and cold-fallback
-/// safety predicates, and the kept image's refusal of the cold lane, to compiled
-/// code rather than duplicating the policy in a test-only oracle.
 #[test]
 fn real_update_admission_classifier_conforms_for_every_bounded_fact_combination() {
     let model = native_update_admission_model();
@@ -557,8 +527,6 @@ fn real_update_admission_classifier_conforms_for_every_bounded_fact_combination(
         }
     }
 
-    // Negative control: blocking a safe seamless handoff only because a
-    // foreground job exists violates the named progress invariant.
     let facts = AdmissionFacts {
         staged_verified: true,
         seamless_capable: true,
@@ -579,8 +547,6 @@ fn real_update_admission_classifier_conforms_for_every_bounded_fact_combination(
     regressed.insert("retry_eligible", 1);
     assert!(!model.check_invariant("ForegroundJobsDoNotBlockSeamless", &regressed));
     assert_eq!(admits(&model, &before, &regressed), None);
-    // The same block is the model's `BlockForegroundDespiteSeamless` mutant, which the
-    // healthy model never admits and the progress law refuses.
     let buggy = aterm_spec::interp::with_buggy(&model, 1);
     let v053 = buggy.successors("BlockForegroundDespiteSeamless", &before)[0].clone();
     assert_eq!(
@@ -590,9 +556,6 @@ fn real_update_admission_classifier_conforms_for_every_bounded_fact_combination(
     assert_eq!(admits(&model, &before, &v053), None);
     assert!(!buggy.check_invariant("ForegroundJobsDoNotBlockSeamless", &v053));
 
-    // Negative control for the cold lane: with no seamless lane and a live job on a PTY the
-    // real classifier blocks; without that check a release macOS build (whose cold arm
-    // re-checks only by `debug_assert!`) would re-exec over the job.
     let facts = AdmissionFacts {
         seamless_capable: false,
         ..facts
@@ -606,10 +569,6 @@ fn real_update_admission_classifier_conforms_for_every_bounded_fact_combination(
     assert_eq!(admits(&model, &before, &hung_up), None);
     assert!(!buggy.check_invariant("ColdFallbackNeverDropsForeground", &hung_up));
 
-    // Negative control for the kept image: with no terminal and no seamless lane, a
-    // process that kept its image is refused, retryably. Without that check the
-    // classifier would admit the cold lane, which execs in place and leaves
-    // LaunchServices answering pid -1 for the app.
     let facts = AdmissionFacts {
         live_ptys: 0,
         foreground_jobs: 0,
@@ -644,14 +603,6 @@ fn assert_exact_model_action(model: &Model, action: &'static str, before: &State
 }
 
 /// The real park gate, bound to the model step it implements.
-///
-/// `Attempt` is the launch, gated by the poll policy (`native_update_auto_intent`'s
-/// tests); `ParkReaders` is the freeze, gated by `prelaunch_park_admitted`. The
-/// shipping predicate is bound to the model's guard over every combination of
-/// facts the model expresses (the model's `quiet` is the ladder's first phase
-/// asking for a quiet moment; `grace_expired` is every later phase).
-///
-/// Unix-only like the gate: the in-place handoff has no Windows lane.
 #[cfg(unix)]
 #[test]
 fn real_park_gate_admits_exactly_the_model_s_reader_park() {
@@ -661,8 +612,6 @@ fn real_park_gate_admits_exactly_the_model_s_reader_park() {
     };
     use crate::native_update_auto_intent::ActivityFacts;
     let model = native_update_auto_intent_model();
-    // Walk to the Attempting phase (launched, nothing parked) the way the
-    // reducer does: a stage lands while idle, the quiet epoch elapses, attempt.
     let mut state = model.init_state();
     for action in ["StageWakeIdle", "QuietElapsed", "Attempt"] {
         let next = model.successors(action, &state)[0].clone();
@@ -672,10 +621,6 @@ fn real_park_gate_admits_exactly_the_model_s_reader_park() {
     assert_eq!(state["phase"], 3);
     assert_eq!(state["parked"], 0);
 
-    // The model's two facts, over both automatic modes and both ways of being
-    // admissible. `held_for` is zero throughout: the cap is the other gate,
-    // enumerated in `app_update_handoff::park_gate_tests` along with the
-    // ladder's finer preferences (keys, output).
     let calm = |quiet: bool| ActivityFacts {
         quiet,
         hands_off_keys: true,
@@ -684,9 +629,6 @@ fn real_park_gate_admits_exactly_the_model_s_reader_park() {
         consent_warmup: false,
         harness_restored_pending: false,
     };
-    // Real masters. An exited pane: its command wrote, then its slave closed, the state a
-    // `--hold` pane sits in while it stays open. The pair is close-on-exec, so a child another
-    // test spawns never keeps the slave open past its exec.
     let openpty = || aterm_pty::open_pty_pair().expect("open_pty_pair");
     let write_byte = |fd: i32| {
         // SAFETY: bounded write of a stack byte to a test-owned slave.
@@ -699,8 +641,6 @@ fn real_park_gate_admits_exactly_the_model_s_reader_park() {
     write_byte(exited_slave);
     aterm_pty::close_fd(exited_slave);
     let exited = vec![(3u64, exited_master, 4003i32)];
-    // A hang detector: the hang-up waits for every copy of the slave, and a child another
-    // test is forking holds one until it execs. A slave that never closes still fails.
     let deadline = std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN;
     while !handoff_masters_closed(&exited) {
         assert!(
@@ -743,8 +683,6 @@ fn real_park_gate_admits_exactly_the_model_s_reader_park() {
                     quiet || grace_expired,
                     "the model's guard is quiet-or-past-grace"
                 );
-                // The shipping predicate, given the same two facts: the
-                // model's `grace_expired` is any phase after the first.
                 let phases: &[ApplyPhase] = if grace_expired {
                     &[
                         ApplyPhase::PreferOutputGap,
@@ -776,8 +714,6 @@ fn real_park_gate_admits_exactly_the_model_s_reader_park() {
                                 },
                                 prelaunch_hold_cap(mode),
                             ) == ParkGate::Park;
-                            // The successor's policy brings the
-                            // bound forward; it relaxes nothing else.
                             let bound_waited = phase == ApplyPhase::Land
                                 && (land_waits >= PRELAUNCH_LAND_MAX_WAITS || land_gate_relaxed);
                             assert_eq!(
@@ -803,8 +739,6 @@ fn real_park_gate_admits_exactly_the_model_s_reader_park() {
         aterm_pty::close_fd(fd);
     }
 
-    // Negative control: the mutant parks with neither fact, and the invariant
-    // catches it.
     let buggy = aterm_spec::interp::with_buggy(&model, 1);
     let mut busy = state.clone();
     busy.insert("quiet", 0);
@@ -818,14 +752,6 @@ fn real_park_gate_admits_exactly_the_model_s_reader_park() {
 }
 
 /// The ladder, bound to its model (docs/DESIGN-auto-apply-ladder-2026-09-21.md).
-///
-/// The shipping `apply_phase` tiles the wall clock into the model's four
-/// phases, and the shipping `automatic_park_refusal` (the one predicate the
-/// entry gate and the park gate both read) must admit exactly the states in
-/// which the model's `Park` is enabled, over every phase and every combination
-/// of the six facts: four about the terminal, and two bounded holds no phase
-/// relaxes (the user's consent warm-up and a cold restore's agents still being
-/// relaunched, both projected onto the model's one `warmup`).
 #[test]
 fn real_apply_ladder_admits_exactly_the_model_s_park() {
     use crate::native_update_auto_intent::{
@@ -834,7 +760,6 @@ fn real_apply_ladder_admits_exactly_the_model_s_park() {
     };
     let model = native_update_apply_ladder_model();
 
-    // The wall clock tiles into the model's phases, in order, ending at the bound.
     let phases = [
         (ApplyPhase::PreferIdle, 0, std::time::Duration::ZERO),
         (ApplyPhase::PreferOutputGap, 1, PREFER_IDLE_WINDOW),
@@ -866,9 +791,6 @@ fn real_apply_ladder_admits_exactly_the_model_s_park() {
             state.insert("keys", i64::from(facts.hands_off_keys));
             state.insert("output", i64::from(facts.output_quiet));
             state.insert("focused", i64::from(facts.focused));
-            // The model's bounded hold: either of the two the shipping facts
-            // name. If the shipping predicate ignored the restored queue, the
-            // model would refuse with `warmup = 1` and the real one would park.
             state.insert(
                 "warmup",
                 i64::from(facts.consent_warmup || facts.harness_restored_pending),
@@ -886,9 +808,6 @@ fn real_apply_ladder_admits_exactly_the_model_s_park() {
         }
     }
 
-    // Negative control: the mutant's ruleless park lands over the warm-up at
-    // the bound, and the invariant catches it. (The ladder's liveness, which
-    // the mutant's stand-down wedges, is model-checked in `aterm-spec`.)
     let mut warming = model.init_state();
     for action in ["Advance", "Advance", "Advance", "WarmupStarts"] {
         assert!(model.fire(action, &mut warming), "{action}");
@@ -899,14 +818,6 @@ fn real_apply_ladder_admits_exactly_the_model_s_park() {
 }
 
 /// The `Lapse` and `ParkMissed` model steps, bound to shipping code.
-///
-/// `Lapse`: `lapse_expired_auto_apply_manual_only` releases a physical-failure latch and
-/// leaves `App::auto_apply_ladder` alone, so `automatic_apply_phase` after the lapse is the
-/// model's post-`Lapse` phase (`Land` when the latch held past the bound), never `PreferIdle`.
-///
-/// `ParkMissed`: a park that missed every freeze rung stands down as activity
-/// (`park_miss_disposition` answers `ActivityRevoked`), which `HandoffFailureLane::classify`
-/// keeps out of every physical shape, so the model's `manual_only` stays 0.
 #[cfg(unix)]
 #[test]
 fn real_lapse_keeps_the_anchor_and_a_park_miss_stays_in_the_activity_lane() {
@@ -917,8 +828,6 @@ fn real_lapse_keeps_the_anchor_and_a_park_miss_stays_in_the_activity_lane() {
     use crate::native_update_auto_intent::LANDS_WITHIN;
     let model = native_update_apply_ladder_model();
 
-    // The model: KeysOnly, a physical failure, the clock reaches Land under
-    // the latch, and the lapse keeps Land.
     let mut keys_only = model.init_state();
     for _ in 0..2 {
         keys_only = model.successors("Advance", &keys_only)[0].clone();
@@ -927,15 +836,12 @@ fn real_lapse_keeps_the_anchor_and_a_park_miss_stays_in_the_activity_lane() {
     assert_exact_model_action(&model, "PhysicalFailure", &keys_only, &latched);
     let aged = model.successors("Advance", &latched)[0].clone();
     assert_exact_model_action(&model, "Advance", &latched, &aged);
-    // The latch's deadline passes first: a lapse is only ever at the deadline.
     let due = model.successors("Due", &aged)[0].clone();
     assert_exact_model_action(&model, "Due", &aged, &due);
     let lapsed = model.successors("Lapse", &due)[0].clone();
     assert_exact_model_action(&model, "Lapse", &due, &lapsed);
     assert_eq!(lapsed["phase"], 3);
 
-    // The shipping App on the same arc: anchored past the bound, latched with
-    // a deadline that has passed.
     let mut app = crate::App::headless_for_test();
     let build = app.native_updater_service.snapshot().current_build + 1;
     let now = std::time::Instant::now();
@@ -969,9 +875,6 @@ fn real_lapse_keeps_the_anchor_and_a_park_miss_stays_in_the_activity_lane() {
         lapsed["phase"]
     );
 
-    // The park miss: the model keeps the lane; the shipping disposition and
-    // classifier keep it in the activity lane. From a quiet terminal, so the
-    // miss is its own transition.
     let quiet = model.successors("Quiet", &keys_only)[0].clone();
     let missed = model.successors("ParkMissed", &quiet)[0].clone();
     assert_exact_model_action(&model, "ParkMissed", &quiet, &missed);
@@ -999,15 +902,6 @@ fn real_lapse_keeps_the_anchor_and_a_park_miss_stays_in_the_activity_lane() {
 }
 
 /// The `BundleSwap` model step: when the failed candidate had already boot-applied the
-/// bundle, the next reconcile retires the download for the installed-bundle activation of the
-/// same update and keeps the latch and its deadline.
-///
-/// A structural failure returns through `abort_reaped_native_apply_before_reconcile`, then
-/// `reconcile_native_update_facts` is fed the disk that failure left (the installed bundle is
-/// the target build); the real latch, projected onto `latched`/`due`/`swapped`, must be exactly
-/// the post-`BundleSwap` state. Negative control: `BundleSwapClearsLatch` (clearing the latch
-/// lets the confirming retry, ten minutes out, run seconds after the failure) is caught by
-/// `NoEarlyRelease`.
 #[test]
 fn real_bundle_swap_keeps_the_latch_as_the_model_s_bundle_swap() {
     use crate::app_native::{
@@ -1017,14 +911,12 @@ fn real_bundle_swap_keeps_the_latch_as_the_model_s_bundle_swap() {
     use crate::native_updater_service::{ApplyAttemptTicket, InstalledUpdate};
     let model = native_update_apply_ladder_model();
 
-    // The model: KeysOnly, a physical failure latches, and the bundle swaps.
     let mut keys_only = model.init_state();
     for _ in 0..2 {
         keys_only = model.successors("Advance", &keys_only)[0].clone();
     }
     let latched = model.successors("PhysicalFailure", &keys_only)[0].clone();
 
-    // The shipping App on the same arc.
     let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
     let mut app = crate::App::headless_for_test();
     let build = app.native_updater_service.snapshot().current_build + 1;
@@ -1067,7 +959,6 @@ fn real_bundle_swap_keeps_the_latch_as_the_model_s_bundle_swap() {
         "PRECONDITION: the download retired for the activation of the same build"
     );
 
-    // Project the real latch onto the model's variables.
     let after = app.auto_apply_manual_only;
     let now = std::time::Instant::now();
     let mut projected = latched.clone();
@@ -1088,8 +979,6 @@ fn real_bundle_swap_keeps_the_latch_as_the_model_s_bundle_swap() {
         "the deadline is the one the failure bought"
     );
 
-    // Negative control: the mutant clears the latch before its deadline, the
-    // invariant catches it, and the shipping reducer did not take that step.
     let buggy = aterm_spec::interp::with_buggy(&model, 1);
     let cleared = buggy.successors("BundleSwapClearsLatch", &latched)[0].clone();
     assert!(!buggy.check_invariant("NoEarlyRelease", &cleared));
@@ -1100,23 +989,6 @@ fn real_bundle_swap_keeps_the_latch_as_the_model_s_bundle_swap() {
 }
 
 /// A capture failure is sorted into a miss or a refusal by its type, and a refusal never
-/// reaches the activity lane.
-///
-/// Every `CaptureFailure` variant goes through the shipping
-/// `classify_capture_failure`. Timing and storage are `Missed` (the model's
-/// `ParkMissed`, re-parked on the next rung). A `Refused` is `Refused`, never
-/// `Missed`; its stand-down is typed `CaptureRefused`, and
-/// `HandoffFailureLane::classify` files that in the refusal lane on both
-/// automatic modes, even with the main thread's activity flag raised: the
-/// model's healthy `CaptureRefused` (`quiet` and `refusals` untouched).
-///
-/// Every `CaptureFailure` variant goes through the shipping `classify_capture_failure`: timing
-/// and storage are `Missed` (the model's `ParkMissed`, re-parked on the next rung); a `Refused`
-/// is `Refused`, its stand-down typed `CaptureRefused`, which `HandoffFailureLane::classify`
-/// files in the refusal lane on both automatic modes even with the activity flag raised (the
-/// model's healthy `CaptureRefused`). Negative control: mapping every `Err` to
-/// `ParkAttempt::Missed`, replayed through the shipping functions, ends in the activity lane:
-/// the model's `CaptureRefusedAsActivity`, which `RefusalNeverRetriesAsActivity` catches.
 #[cfg(unix)]
 #[test]
 fn real_capture_refusal_is_never_a_park_miss_and_never_activity() {
@@ -1128,8 +1000,6 @@ fn real_capture_refusal_is_never_a_park_miss_and_never_activity() {
     };
     let model = native_update_apply_ladder_model();
 
-    // The model at Land with a refusing desk and a quiet terminal: every one of
-    // the park's alternatives is enabled there.
     let mut land = model.init_state();
     for _ in 0..3 {
         land = model.successors("Advance", &land)[0].clone();
@@ -1138,7 +1008,6 @@ fn real_capture_refusal_is_never_a_park_miss_and_never_activity() {
     let refusing = model.successors("DeskRefuses", &quiet)[0].clone();
     assert_exact_model_action(&model, "DeskRefuses", &quiet, &refusing);
 
-    // Timing and storage are misses: the model's `ParkMissed`.
     for failure in [
         CaptureFailure::Deadline { freeze_ms: 20 },
         CaptureFailure::EngineBusy,
@@ -1152,7 +1021,6 @@ fn real_capture_refusal_is_never_a_park_miss_and_never_activity() {
         assert_exact_model_action(&model, "ParkMissed", &refusing, &missed);
     }
 
-    // A refusal is a refusal, whether or not it names a session.
     for failure in [
         CaptureFailure::Refused {
             local_id: Some(3),
@@ -1201,13 +1069,11 @@ fn real_capture_refusal_is_never_a_park_miss_and_never_activity() {
                 );
             }
         }
-        // …which is the model's healthy `CaptureRefused`: answered, not busy.
         let answered = model.successors("CaptureRefused", &refusing)[0].clone();
         assert_exact_model_action(&model, "CaptureRefused", &refusing, &answered);
         assert_eq!(answered["quiet"], refusing["quiet"]);
         assert_eq!(answered["refusals"], 0);
 
-        // Negative control: every `Err` as `Missed`, through the shipping functions.
         let retired = ParkAttempt::Missed(failure.to_string());
         let ParkAttempt::Missed(reason) = retired else {
             unreachable!("the retired mapping");
@@ -1244,11 +1110,6 @@ fn real_capture_refusal_is_never_a_park_miss_and_never_activity() {
 }
 
 /// Real refused desks through the shipping park capture: a NUL in a reported
-/// cwd, a 5K fullscreen grid (99x338), a styled full-width row ending in a
-/// combining mark, and a parser left inside an unterminated OSC. Each either
-/// parks (degraded, if it must) or comes back `Refused`, never `Missed`: a
-/// miss would re-park the same refusal on a wider rung and then retry it as
-/// the machine being busy, forever.
 #[cfg(unix)]
 #[test]
 fn real_refused_desks_park_degraded_or_refused_and_never_missed() {
@@ -1282,8 +1143,6 @@ fn real_refused_desks_park_degraded_or_refused_and_never_missed() {
     for (desk, geometry, bytes) in desks {
         let mut app = crate::App::headless_for_test();
         for session in app.pool.iter() {
-            // A fresh engine at the desk's geometry rather than a resize under
-            // the held guard: the resize would trip the main-loop census, whose
             // `#[cfg(test)]` mask does not see this file's inner attribute.
             if let Some((rows, cols)) = geometry {
                 *crate::term_lock(&session.term) = aterm_core::terminal::Terminal::new(rows, cols);
@@ -1302,8 +1161,6 @@ fn real_refused_desks_park_degraded_or_refused_and_never_missed() {
 }
 
 /// Bind the hidden-output model to the genuine monotonic admission predicate,
-/// future-deadline constructor and auto-intent reducer. Negative control: a
-/// presentation-ack predicate, which makes a background tab block forever.
 #[test]
 fn real_hidden_output_quiet_clock_ages_without_present_ack() {
     let model = native_update_hidden_output_quiet_model();
@@ -1322,11 +1179,6 @@ fn real_hidden_output_quiet_clock_ages_without_present_ack() {
     ));
     let recent = model.successors("PollRecentActivity", &state)[0].clone();
     assert_exact_model_action(&model, "PollRecentActivity", &state, &recent);
-    // Negative control on the shipping predicate: output inside the epoch is
-    // activity to the real clock. Fed the hidden tab's present stamp instead
-    // (zero, for a tab that never presented), the same predicate calls it
-    // quiet mid-output: the mutant's reading, whose following attempt the
-    // clock rule refuses.
     let hidden_present_ns = 0_u64;
     assert!(crate::automatic_output_activity_quiet(
         recent_now_ns,
@@ -1380,9 +1232,6 @@ fn real_hidden_output_quiet_clock_ages_without_present_ack() {
     let attempted = model.successors("Attempt", &state)[0].clone();
     assert_exact_model_action(&model, "Attempt", &state, &attempted);
 
-    // The presentation-ack mutant: an unacknowledged latency sample makes quiet
-    // false even after arbitrarily old output, and the model's mutant also
-    // derives retry_at from that expired output deadline, exposing both.
     let mut stuck = buggy.init_state();
     for action in [
         "HiddenOutput",
@@ -1396,26 +1245,17 @@ fn real_hidden_output_quiet_clock_ages_without_present_ack() {
     assert!(!buggy.check_invariant("ActivityRetryIsStrictlyFuture", &stuck));
 }
 
-/// The observable state of a structural latch, as the Tier-1 bind of
-/// `NativeUpdateStructuralLatch` reads it. `day`, `newer`, `pending` and `room`
-/// are the environment (the clock, the checker's stage, the lane having
-/// looked, the boot sentinel's count), which the test drives and waives; the
-/// rest is read off the shipping state.
+/// The observable state of a structural latch, as the Tier-1 bind of `NativeUpdateStructuralLatch` reads it.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct StructuralLatchObservation {
     pub(crate) room: bool,
-    /// The installed facts no longer report the latched build, so no count can
-    /// be read (`App::native_installed_trial` is not the latch's); `room` is
-    /// then no reading.
+    /// The installed facts no longer report the latched build, so no count can be read (`App::native_installed_trial` is not the latch's); `room` is then no reading.
     pub(crate) unread: bool,
-    /// …and the latest read could not prove the installed bundle at all
-    /// (`App::native_installed_trial_unproven`): the model's `unread = 2`.
+    /// …and the latest read could not prove the installed bundle at all (`App::native_installed_trial_unproven`): the model's `unread = 2`.
     pub(crate) unproven: bool,
-    /// Due looks in a row that found no count
-    /// (`AutoApplyStructuralVerdict::unmeasured_looks`).
+    /// Due looks in a row that found no count (`AutoApplyStructuralVerdict::unmeasured_looks`).
     pub(crate) looks: u8,
-    /// Due looks in a row over an unproven read
-    /// (`AutoApplyStructuralVerdict::unproven_looks`; the model's `doubts`).
+    /// Due looks in a row over an unproven read (`AutoApplyStructuralVerdict::unproven_looks`; the model's `doubts`).
     pub(crate) doubts: u8,
     pub(crate) latched: bool,
     pub(crate) pending: bool,
@@ -1425,25 +1265,19 @@ pub(crate) struct StructuralLatchObservation {
     pub(crate) newer_spent: bool,
     pub(crate) said: bool,
     pub(crate) escaped: bool,
-    /// A retire of the latched activation is in flight
-    /// (`App::native_activation_supersede`).
+    /// A retire of the latched activation is in flight (`App::native_activation_supersede`).
     pub(crate) superseding: bool,
-    /// It landed: the newer release is the lane's stage in the activation's
-    /// place.
+    /// It landed: the newer release is the lane's stage in the activation's place.
     pub(crate) superseded: bool,
     /// It was refused, and said.
     pub(crate) refused: bool,
-    /// A refused retire's release waits out its retry deadline
-    /// (`AutoApplyStructuralVerdict::newer_retry`, not yet due).
+    /// A refused retire's release waits out its retry deadline (`AutoApplyStructuralVerdict::newer_retry`, not yet due).
     pub(crate) backoff: bool,
-    /// The latched build was launched for an attempt while a newer release
-    /// waited behind it.
+    /// The latched build was launched for an attempt while a newer release waited behind it.
     pub(crate) booted_old: bool,
 }
 
-/// Project one [`StructuralLatchObservation`] onto the model's variables. The
-/// re-sample is owed or spent, never both and never neither, in shipping state
-/// (`AutoApplyStructuralVerdict::resample_at`): `spent` is its complement.
+/// Project one [`StructuralLatchObservation`] onto the model's variables.
 pub(crate) fn project_structural_latch(
     model: &Model,
     observed: StructuralLatchObservation,
@@ -1497,7 +1331,6 @@ fn installed_bundle(
 }
 
 /// One facts-worker observation: the installed bundle (`None`: not found, or
-/// found but not `proven`) and a verified download of `newer`, if any.
 fn observation(
     sequence: u64,
     installed: Option<crate::native_updater_service::InstalledUpdate>,
@@ -1519,7 +1352,6 @@ fn observation(
 }
 
 /// A structural failure of build 11's installed activation: an overlap
-/// handoff that failed safely, returned through the completion lane.
 fn fail_activation_11(app: &mut crate::App) {
     use crate::app_native::{HandoffFailureLane, PhysicalFailureShape};
     let activation = crate::native_updater_service::installed_activation_digest(11, COMMIT);
@@ -1534,7 +1366,6 @@ fn fail_activation_11(app: &mut crate::App) {
 }
 
 /// A headless App running build 10 whose lane converged on the installed
-/// activation of build 11 (`installed`): two structural failures.
 fn converged_on_11(installed: crate::native_updater_service::InstalledUpdate) -> crate::App {
     let mut app = crate::App::headless_for_test();
     app.native_updater_service = NativeUpdaterService::new(10, "1.0.10", true);
@@ -1545,9 +1376,6 @@ fn converged_on_11(installed: crate::native_updater_service::InstalledUpdate) ->
 }
 
 /// The real lane on build 11's latch with room in the trial and nothing
-/// newer, projected onto the model. `day` and `pending` are the test's
-/// bookkeeping (the clock it moves, the look a counted look asked for); the
-/// rest is read off the latch, the verdict, the installed count and the notice.
 fn observe_latch(model: &Model, app: &crate::App, day: bool, pending: bool) -> State {
     let verdict = app.auto_apply_structural_verdict.expect("the verdict");
     project_structural_latch(
@@ -1593,17 +1421,6 @@ fn due_look(app: &mut crate::App) -> bool {
 }
 
 /// The decision, exhaustively: for every reachable model state in which `Decide` is enabled,
-/// the shipping `structural_latch` is fed the facts that state names (the day's re-sample due,
-/// an unspent newer download, the trial's room), and its answer, applied as
-/// `App::look_at_structural_latch` applies it, must be exactly the model's `Decide` successor.
-///
-/// Negative control: the `Buggy = 1` `Decide` answers a newer release looked at before the day
-/// with one more attempt at the older build (room) or a release held for the Version menu (no
-/// room), and strands the latch with a trial-blind re-sample where nothing newer is on offer;
-/// the shipping decision differs wherever anything was earned, and the invariants catch it
-/// there. After the day, `Buggy = 1` starts the retire as the shipping look does; its defect is
-/// the refusal that follows (`SupersedeRefused`, bound in
-/// [`real_structural_latch_arc_is_the_model_s_arc`]).
 #[test]
 fn real_structural_latch_decision_is_exactly_the_model_s_decide() {
     use crate::native_update_auto_intent::{
@@ -1666,18 +1483,11 @@ fn real_structural_latch_decision_is_exactly_the_model_s_decide() {
         };
         let decision = structural_latch(facts);
         let looks = u8::try_from(state["looks"]).expect("a small count");
-        // The host's count of unreadable looks (`App::look_at_structural_latch`,
-        // each over a new observation): kept by a look that is not due,
-        // cleared by a reading.
         let mut looks_after = if unread { looks } else { 0 };
-        // The host's count of due looks over unproven reads
-        // (`App::look_over_unproven_reads`): kept by a look that is not due,
-        // cleared by any proven read.
         let doubts = u8::try_from(state["doubts"]).expect("a small count");
         let mut doubts_after = if unproven { doubts } else { 0 };
         let mut moved = false;
         let mut asked = false;
-        // (latched, re-sample spent, release offered, said, retire started)
         let (latched, resample_spent, newer_spent, said, superseding) = match decision {
             StructuralLatchDecision::Hold => (true, false, false, false, false),
             StructuralLatchDecision::Supersede { newer } => {
@@ -1700,8 +1510,6 @@ fn real_structural_latch_decision_is_exactly_the_model_s_decide() {
                 );
                 if unproven {
                     if doubts >= crate::app_native::STRUCTURAL_TRIAL_UNPROVEN_LOOKS {
-                        // The unproven bound: the re-sample moves to the next
-                        // day, still owed; nothing asked, nothing held.
                         unproven_moved += 1;
                         doubts_after = 0;
                         moved = true;
@@ -1712,12 +1520,10 @@ fn real_structural_latch_decision_is_exactly_the_model_s_decide() {
                     }
                     (true, false, false, false, false)
                 } else if looks >= crate::app_native::STRUCTURAL_TRIAL_UNMEASURED_LOOKS {
-                    // The bound: held, nothing promised, said.
                     unread_held += 1;
                     looks_after = 0;
                     (true, true, false, true, false)
                 } else {
-                    // Counted, and another observation asked for.
                     unread_counted += 1;
                     looks_after = looks + 1;
                     asked = true;
@@ -1745,9 +1551,6 @@ fn real_structural_latch_decision_is_exactly_the_model_s_decide() {
                 superseded: state["superseded"] == 1,
                 refused: state["refused"] == 1,
                 backoff: state["backoff"] == 1,
-                // The shipping lane releases the latch only for the re-sample,
-                // and only with no unspent newer release behind it (offered or
-                // waiting out a refusal's retry deadline).
                 booted_old: state["booted_old"] == 1 || (!latched && unspent),
             },
         );
@@ -1756,11 +1559,8 @@ fn real_structural_latch_decision_is_exactly_the_model_s_decide() {
             waited += 1;
         }
         let mutant = buggy.successors("Decide", &state);
-        // After the day, `Buggy = 1` looks at an offered release as the shipping
-        // lane does (the retire starts); its defect is in the refusal.
         let refusal_scope = facts.unspent_newer_download.is_some() && state["day"] == 1;
         if asked {
-            // A counted look is the same under `Buggy = 1`: its defect is at
             // the bound.
             assert_eq!(mutant.as_slice(), std::slice::from_ref(&after));
         } else if refusal_scope {
@@ -1800,25 +1600,6 @@ fn real_structural_latch_decision_is_exactly_the_model_s_decide() {
 }
 
 /// The shipping arc, projected step by step: the real `App` converges on build 11's installed
-/// activation through the completion lane, and every later step, read off the real latch,
-/// verdict, retire and notice, is checked against the model's own step:
-///
-/// * the first count read (`TrialHasRoom`/`TrialIsSpent`, `Decide`);
-/// * a re-publish of 11 offered (`ArmSameBuild`);
-/// * a verified download of 12 reconciled (`NewerArrives`, `Decide`: the
-///   retire of 11 starts);
-/// * the retire landing (`Supersede`: 12 staged and armed, 11 never launched)
-///   or refused for the moment (`SupersedeRefused`, `Decide`:
-///   the latch stands, said, and the release is given back to wait out its
-///   retry deadline);
-/// * after a refusal, the day passing (`DayPasses`, `Decide`: the waiting
-///   release outranks it), the retry coming due (`RetryDue`, `Decide`: the
-///   retire starts again) and landing (`Supersede`).
-///
-/// Run with room in the boot trial and with the trial one launch from its revert, where the
-/// first count withdraws the promised re-sample and a newer release supersedes all the same.
-/// The day's one re-sample with nothing newer on disk (`DayPasses`, `Decide`, `AttemptFails`)
-/// is its own arc below. Every `#[refines]` anchor of the machine must be entered on the way.
 #[test]
 fn real_structural_latch_arc_is_the_model_s_arc() {
     use crate::app_native::ActivationSupersedeCompletion;
@@ -1831,7 +1612,6 @@ fn real_structural_latch_arc_is_the_model_s_arc() {
     );
 
     for room in [true, false] {
-        // The retire lands, or is refused for the moment.
         for lands in [true, false] {
             let launches = if room {
                 0
@@ -1848,10 +1628,6 @@ fn real_structural_latch_arc_is_the_model_s_arc() {
                 )
             };
             let mut app = converged_on_11(installed_bundle(11, launches));
-            // Everything the environment drove, and the lane's own looks, are
-            // the test's bookkeeping; everything else is read off the shipping
-            // state. `refused` is the environment's answer (the model's
-            // `said` is a record, so it stays said).
             let observe =
                 |app: &crate::App, day: bool, newer: bool, escaped: bool, refused: bool| {
                     let verdict = app
@@ -1877,9 +1653,6 @@ fn real_structural_latch_arc_is_the_model_s_arc() {
                             owed: verdict.resample_at.is_some(),
                             newer,
                             newer_spent: verdict.newer_spent >= 12,
-                            // A hold says the stranded notice again; a refused retire
-                            // says it in `update status`. With room and no refusal
-                            // nothing on this arc is said.
                             said: (!room && app.auto_apply_stranded_announced == Some((11, false)))
                                 || refused,
                             escaped,
@@ -1895,14 +1668,10 @@ fn real_structural_latch_arc_is_the_model_s_arc() {
                 };
             let arc = format!("room={room} lands={lands}");
 
-            // Converged, and no count read yet: the attempt that converged just
-            // returned, and its launch may still be given back.
             assert!(
                 app.native_installed_trial.is_none(),
                 "{arc}: a returned attempt leaves the count unmeasured"
             );
-            // The first count read after it — the model's `TrialHasRoom` /
-            // `TrialIsSpent`, a look like any other observation — then its Decide.
             let mut counted = model.init_state();
             assert!(model.fire(
                 if room { "TrialHasRoom" } else { "TrialIsSpent" },
@@ -1912,19 +1681,15 @@ fn real_structural_latch_arc_is_the_model_s_arc() {
             let converged = observe(&app, false, false, false, false);
             assert_exact_model_action(&model, "Decide", &counted, &converged);
             if !room {
-                // Negative control: the promise left standing (a retry on the
-                // notice for a day) is caught.
                 let promise = buggy.successors("Decide", &counted)[0].clone();
                 assert_ne!(promise, converged);
                 assert!(!buggy.check_invariant("NoRetryPromisedPastTheTrial", &promise));
             }
 
-            // ArmSameBuild: build 11 under another digest is offered, and stays out.
             let escaped = app.arm_native_auto_apply(11, &"ef".repeat(32));
             let after = observe(&app, false, false, escaped, false);
             assert_exact_model_action(&model, "ArmSameBuild", &converged, &after);
 
-            // NewerArrives, then the reconcile's look: Decide starts the retire.
             let arrived = model.successors("NewerArrives", &after)[0].clone();
             let _ = app.reconcile_native_update_facts(facts(3, 11, Some(12)));
             let decided = observe(&app, false, true, false, false);
@@ -1942,8 +1707,6 @@ fn real_structural_latch_arc_is_the_model_s_arc() {
                 app.auto_apply_manual_only.is_some() && app.auto_apply_intent.is_none(),
                 "{arc}: the latch holds while it runs, and nothing arms 11"
             );
-            // Negative control: looking before the day, one more attempt at 11
-            // (room) or 12 held for the Version menu (no room); caught.
             let mutant = buggy.successors("Decide", &arrived)[0].clone();
             assert_ne!(
                 mutant, decided,
@@ -1974,8 +1737,6 @@ fn real_structural_latch_arc_is_the_model_s_arc() {
                     }),
                     facts: Some(facts(sequence, 10, Some(12))),
                 });
-                // The newer build is armed on a ladder of its own, whose phase
-                // starts over (the model's `Supersede`), and 11 never launched.
                 assert_eq!(
                     app.auto_apply_ladder.map(|ladder| ladder.build),
                     Some(12),
@@ -1993,9 +1754,6 @@ fn real_structural_latch_arc_is_the_model_s_arc() {
             };
 
             if lands {
-                // Supersede: the retire answered (10 back at the install path,
-                // 11's trial disarmed), and the disk read after it names the
-                // running build installed and 12 staged.
                 let landed = model.successors("Supersede", &decided)[0].clone();
                 land(&mut app, job, 4);
                 let after_retire = observe(&app, false, true, false, false);
@@ -2013,9 +1771,6 @@ fn real_structural_latch_arc_is_the_model_s_arc() {
                 continue;
             }
 
-            // Supersede refused: the latch stands, the refusal is said, the
-            // release is given back to wait out its retry deadline, and the
-            // observation read after it is the lane's next look.
             let refused = model.successors("SupersedeRefused", &decided)[0].clone();
             let relooked = model.successors("Decide", &refused)[0].clone();
             app.finish_activation_supersede(ActivationSupersedeCompletion {
@@ -2039,8 +1794,6 @@ fn real_structural_latch_arc_is_the_model_s_arc() {
                         .is_some_and(|latch| latch.activation),
                 "{arc}: the activation latch stands"
             );
-            // Negative control: a refusal that spends the release (never offered
-            // again) is caught at the look after it.
             let spent = buggy.successors("SupersedeRefused", &decided)[0].clone();
             assert_ne!(
                 spent, refused,
@@ -2051,11 +1804,9 @@ fn real_structural_latch_arc_is_the_model_s_arc() {
                 !buggy.check_invariant("ANewerReleaseClearsTheLatch", &stranded),
                 "{arc}: the spent release is caught"
             );
-            // Not before its retry deadline.
             let _ = app.reconcile_native_update_facts(facts(5, 11, Some(12)));
             assert!(app.native_activation_supersede.is_none(), "{arc}");
 
-            // The day passes and the lane looks: the waiting release outranks it.
             let dawn = model.successors("DayPasses", &relooked)[0].clone();
             let dawn_look = model.successors("Decide", &dawn)[0].clone();
             if room {
@@ -2087,8 +1838,6 @@ fn real_structural_latch_arc_is_the_model_s_arc() {
             assert_exact_model_action(&model, "Decide", &dawn, &outranked);
             assert_eq!(outranked, dawn_look);
 
-            // The retry comes due: the lapse is the lane's look, and the retire
-            // starts again.
             let due = model.successors("RetryDue", &outranked)[0].clone();
             let verdict = app.auto_apply_structural_verdict.expect("the verdict");
             let retry = verdict.newer_retry.expect("{arc}: a retry waits");
@@ -2106,7 +1855,6 @@ fn real_structural_latch_arc_is_the_model_s_arc() {
                 .native_activation_supersede
                 .clone()
                 .expect("the retire of 11 for 12 is under way again");
-            // …and this time it lands.
             let landed = model.successors("Supersede", &retried)[0].clone();
             land(&mut app, job, 7);
             let after_retire = observe(&app, true, true, false, true);
@@ -2120,16 +1868,10 @@ fn real_structural_latch_arc_is_the_model_s_arc() {
         }
     }
 
-    // The day's one re-sample, with nothing newer on disk: the lapse is the
-    // lane's look (`DayPasses`, `Decide`: released for one attempt at 11), and
-    // the re-sample failing the same way re-latches with nothing owed
-    // (`AttemptFails`).
     {
         let facts =
             |sequence: u64| observation(sequence, Some(installed_bundle(11, 0)), None, false);
         let mut app = converged_on_11(installed_bundle(11, 0));
-        // This arc is given its room: the count the failed re-sample leaves
-        // unread, and the notice it says, are the latch tests' below.
         let observe = |app: &crate::App, day: bool| {
             let mut state = observe_latch(&model, app, day, false);
             state.insert("unread", 0);
@@ -2155,7 +1897,6 @@ fn real_structural_latch_arc_is_the_model_s_arc() {
         assert!(app.lapse_expired_auto_apply_manual_only());
         let resampled = observe(&app, true);
         assert_exact_model_action(&model, "Decide", &dawn, &resampled);
-        // The one re-sample fails the same way: re-latched, nothing owed.
         let activation = crate::native_updater_service::installed_activation_digest(11, COMMIT);
         assert!(app.arm_native_auto_apply(11, &activation));
         fail_activation_11(&mut app);
@@ -2168,7 +1909,6 @@ fn real_structural_latch_arc_is_the_model_s_arc() {
         );
     }
 
-    // Every anchored shipping function of the machine ran.
     let entered = aterm_spec::xref::entered_anchor_ids();
     aterm_spec::xref::disarm_entered_anchors();
     for anchor in aterm_spec::xref::refinements()
@@ -2183,14 +1923,6 @@ fn real_structural_latch_arc_is_the_model_s_arc() {
 }
 
 /// A latch whose activation leaves the installed facts is decided within a bound, projected
-/// step by step onto the model. After build 11's first count (`TrialHasRoom`), the channel's
-/// floor rises above 11 and the facts worker drops it from every observation
-/// (`installed: None`, `TrialUnreadable`), so its boot trial is never measured again. Once the
-/// day's re-sample is due, each due look over a new observation counts (`looks`); at
-/// `STRUCTURAL_TRIAL_UNMEASURED_LOOKS` the re-sample is held, the latch loses its deadline and
-/// the hold is said. A due look with no new observation behind it counts nothing. Negative
-/// controls: the `Buggy = 1` look at the bound, which keeps the promise, is caught; a reading
-/// that comes back (`TrialReadAgain`) clears the count and, with room, releases the re-sample.
 #[test]
 fn a_latch_whose_activation_leaves_the_installed_facts_is_decided_within_a_bound() {
     use crate::app_native::STRUCTURAL_TRIAL_UNMEASURED_LOOKS;
@@ -2207,7 +1939,6 @@ fn a_latch_whose_activation_leaves_the_installed_facts_is_decided_within_a_bound
         let observe =
             |app: &crate::App, day: bool, pending: bool| observe_latch(&model, app, day, pending);
 
-        // The first count, with room.
         let mut modeled = model.init_state();
         assert!(model.fire("TrialHasRoom", &mut modeled));
         let _ = app.reconcile_native_update_facts(facts(2, Some(bundle.clone())));
@@ -2215,7 +1946,6 @@ fn a_latch_whose_activation_leaves_the_installed_facts_is_decided_within_a_bound
         assert_exact_model_action(&model, "Decide", &modeled, &real);
         modeled = real;
 
-        // The floor rises above 11: the facts no longer name it.
         assert!(model.fire("TrialUnreadable", &mut modeled));
         let mut sequence = 3;
         let _ = app.reconcile_native_update_facts(facts(sequence, None));
@@ -2224,7 +1954,6 @@ fn a_latch_whose_activation_leaves_the_installed_facts_is_decided_within_a_bound
         assert_exact_model_action(&model, "Decide", &modeled, &real);
         modeled = real;
 
-        // The day passes.
         assert!(model.fire("DayPasses", &mut modeled));
         let verdict = app.auto_apply_structural_verdict.expect("the verdict");
         app.auto_apply_structural_verdict = Some(crate::AutoApplyStructuralVerdict {
@@ -2233,15 +1962,11 @@ fn a_latch_whose_activation_leaves_the_installed_facts_is_decided_within_a_bound
         });
         let bound = STRUCTURAL_TRIAL_UNMEASURED_LOOKS;
         for look in 1..=bound {
-            // A due look over the observation read since the last one counts,
-            // and asks for the next.
             assert!(!due_look(&mut app), "{case}: look {look}");
             let real = observe(&app, true, true);
             assert_exact_model_action(&model, "Decide", &modeled, &real);
             assert_eq!(real["looks"], i64::from(look), "{case}");
             modeled = real;
-            // A due look with nothing new behind it (the facts worker had no
-            // observation for it) counts nothing: a stutter.
             assert!(!due_look(&mut app), "{case}: look {look} again");
             assert_eq!(
                 observe(&app, true, true),
@@ -2251,8 +1976,6 @@ fn a_latch_whose_activation_leaves_the_installed_facts_is_decided_within_a_bound
             if measured_again && look == 2 {
                 break;
             }
-            // The observation it asked for: still no count. The reconcile's
-            // own look is not a due one, and counts nothing either.
             sequence += 1;
             let _ = app.reconcile_native_update_facts(facts(sequence, None));
             assert_eq!(
@@ -2262,8 +1985,6 @@ fn a_latch_whose_activation_leaves_the_installed_facts_is_decided_within_a_bound
             );
         }
         if measured_again {
-            // Negative control: the count comes back with room, so it is
-            // cleared and the re-sample released.
             assert!(model.fire("TrialReadAgain", &mut modeled));
             sequence += 1;
             let _ = app.reconcile_native_update_facts(facts(sequence, Some(bundle.clone())));
@@ -2281,8 +2002,6 @@ fn a_latch_whose_activation_leaves_the_installed_facts_is_decided_within_a_bound
             );
             continue;
         }
-        // The bound: the next due look over a new observation holds, loses
-        // the deadline, and says so.
         let mutant = buggy.successors("Decide", &modeled)[0].clone();
         assert!(!due_look(&mut app), "{case}: the bound holds");
         let real = observe(&app, true, false);
@@ -2299,13 +2018,8 @@ fn a_latch_whose_activation_leaves_the_installed_facts_is_decided_within_a_bound
             Some((11, false)),
             "{case}: the hold is said"
         );
-        // Negative control: the promise kept forever is not what ships, and
-        // the model catches it.
         assert_ne!(mutant, real, "{case}: the shipping look is not the mutant");
         assert!(!buggy.check_invariant("NoRetryPromisedPastTheBound", &mutant));
-        // The count comes back spent: the bound's hold named the Version menu,
-        // whose start is now the one the trial rolls back, so the hold is said
-        // again, once, in the trial's words (as the staged record says it).
         let spent = installed_bundle(11, crate::app_native::BOOT_TRIAL_LAUNCH_LIMIT - 1);
         sequence += 1;
         let _ = app.reconcile_native_update_facts(facts(sequence, Some(spent)));
@@ -2330,20 +2044,6 @@ fn a_latch_whose_activation_leaves_the_installed_facts_is_decided_within_a_bound
 }
 
 /// A count that could not be checked is not a count that is gone, projected step by step onto
-/// the model. The latch on build 11 has room and its day's re-sample comes due on a
-/// captive-portal network: every facts read finds the installed bundle but cannot prove it
-/// (`spctl` past its ceiling, `installed_unproven`), so `installed` is `None`. Counting those
-/// reads as gone would drop the re-sample for good; ignoring them would re-arm the latch (a
-/// deep `codesign` and an `spctl`) on every look. So an unproven read is `TrialUnproven`: each
-/// due look over a new one counts on its own bound (`doubts`), and at
-/// `STRUCTURAL_TRIAL_UNPROVEN_LOOKS` the re-sample moves to the next day, still owed, recorded
-/// on `update status` and raised nowhere. The next day counts afresh, and the first proven read
-/// with room releases the re-sample.
-///
-/// NEGATIVE CONTROL: the `Buggy = 1` look at the bound, which keeps the day due and
-/// asks again, is not the shipping one and is caught (`UnprovenLooksAreBounded`).
-/// (The same reads PROVEN to name no bundle — the yank — count to the unread bound and
-/// hold: `a_latch_whose_activation_leaves_the_installed_facts_is_decided_within_a_bound`.)
 #[test]
 fn a_latch_whose_count_could_not_be_checked_keeps_its_re_sample() {
     use crate::app_native::STRUCTURAL_TRIAL_UNPROVEN_LOOKS;
@@ -2360,7 +2060,6 @@ fn a_latch_whose_count_could_not_be_checked_keeps_its_re_sample() {
     let observe =
         |app: &crate::App, day: bool, pending: bool| observe_latch(&model, app, day, pending);
 
-    // The first count, with room.
     let mut modeled = model.init_state();
     assert!(model.fire("TrialHasRoom", &mut modeled));
     let _ = app.reconcile_native_update_facts(facts(2, Some(bundle.clone()), false));
@@ -2368,8 +2067,6 @@ fn a_latch_whose_count_could_not_be_checked_keeps_its_re_sample() {
     assert_exact_model_action(&model, "Decide", &modeled, &real);
     modeled = real;
 
-    // The count can no longer be read: the bundle is found but unproven (a
-    // captive portal).
     assert!(model.fire("TrialUnproven", &mut modeled));
     let mut sequence = 3;
     let _ = app.reconcile_native_update_facts(facts(sequence, None, true));
@@ -2377,7 +2074,6 @@ fn a_latch_whose_count_could_not_be_checked_keeps_its_re_sample() {
     assert_exact_model_action(&model, "Decide", &modeled, &real);
     modeled = real;
 
-    // The day passes.
     let day_passes = |app: &mut crate::App, modeled: &mut State| {
         assert!(model.fire("DayPasses", modeled));
         let verdict = app.auto_apply_structural_verdict.expect("the verdict");
@@ -2388,22 +2084,17 @@ fn a_latch_whose_count_could_not_be_checked_keeps_its_re_sample() {
     };
     day_passes(&mut app, &mut modeled);
     for look in 1..=STRUCTURAL_TRIAL_UNPROVEN_LOOKS {
-        // A due look over the read since the last one counts, on its own
-        // bound, and asks for the next.
         assert!(!due_look(&mut app), "{case}: look {look}");
         let real = observe(&app, true, true);
         assert_exact_model_action(&model, "Decide", &modeled, &real);
         assert_eq!(real["doubts"], i64::from(look), "{case}: look {look}");
         modeled = real;
-        // A due look with nothing new behind it counts nothing: a stutter.
         assert!(!due_look(&mut app), "{case}: look {look} again");
         assert_eq!(
             observe(&app, true, true),
             modeled,
             "{case}: look {look} again"
         );
-        // The observation it asked for, no better; the reconcile's own look is
-        // not a due one.
         sequence += 1;
         let _ = app.reconcile_native_update_facts(facts(sequence, None, true));
         assert_eq!(
@@ -2414,8 +2105,6 @@ fn a_latch_whose_count_could_not_be_checked_keeps_its_re_sample() {
     }
     let mutant = buggy.successors("Decide", &modeled)[0].clone();
     assert!(!due_look(&mut app), "{case}: the look at the bound");
-    // THE UNPROVEN BOUND: the re-sample moves to the next day — still owed, the
-    // latch's deadline with it — and is recorded, raised nowhere.
     let real = observe(&app, false, false);
     assert_exact_model_action(&model, "Decide", &modeled, &real);
     let latch = app.auto_apply_manual_only.expect("the latch stands");
@@ -2437,13 +2126,10 @@ fn a_latch_whose_count_could_not_be_checked_keeps_its_re_sample() {
         real["said"], 0,
         "{case}: nothing asked of a person, so no hold raised"
     );
-    // NEGATIVE CONTROL: the re-promise with no bound is not what shipped, and the
-    // model catches it.
     assert_ne!(mutant, real, "{case}: the shipping look is not the mutant");
     assert!(!buggy.check_invariant("UnprovenLooksAreBounded", &mutant));
     modeled = real;
 
-    // The next day: still unproven, it counts afresh.
     day_passes(&mut app, &mut modeled);
     sequence += 1;
     let _ = app.reconcile_native_update_facts(facts(sequence, None, true));
@@ -2453,7 +2139,6 @@ fn a_latch_whose_count_could_not_be_checked_keeps_its_re_sample() {
     assert_eq!(real["doubts"], 1, "{case}: counted afresh");
     modeled = real;
 
-    // The network recovers: a PROVEN read with room releases the re-sample.
     assert!(model.fire("TrialReadAgain", &mut modeled));
     sequence += 1;
     let _ = app.reconcile_native_update_facts(facts(sequence, Some(bundle.clone()), false));

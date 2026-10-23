@@ -17,11 +17,12 @@
 //!   lagging or resetting account is decided again.
 //!
 //! The supervise loop's own turn-end and idle waits are aterm-agent's, read
-//! under the same development seam. Two host timers stay at production in
+//! under the same development seam. Three host timers stay at production in
 //! every build: the disk watch's first look and its period (a fast one would
 //! reclaim the machine's real build caches within a second of a test
-//! instance's boot), and the activation wake's fallback poll (a test pulls its
-//! trigger instead).
+//! instance's boot), the program check watch's period (a fast one would start
+//! a setuid `ps` every 60 ms in each live test instance), and the activation
+//! wake's fallback poll (a test pulls its trigger instead).
 //!
 //! * [`Timing::PRODUCTION`] — the constant itself. The default, and the only
 //!   value a shipped build can have: production lengths never change.

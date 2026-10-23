@@ -3,36 +3,6 @@
 // Author: Andrew Yates
 
 //! Policy engine: precompiled decision tree + `PolicyEngine::evaluate`.
-//!
-//! The engine is the runtime consumer of [`Policy`]. It
-//!
-//! 1. Pre-compiles every [`crate::Rule::sequence`] selector string into a
-//!    [`SequenceSelector`] at construction time.
-//! 2. Buckets the compiled rules by `(function, major)` so evaluation can
-//!    narrow the candidate list to a handful of rules before walking them in
-//!    declared order.
-//! 3. Walks the matching bucket plus the wildcard bucket top-to-bottom,
-//!    applying the §4.2 algorithm: first rule whose selector matches **and**
-//!    whose `origin_min` is dominated by the caller-supplied origin wins.
-//!    Rules that match by selector but fail the origin gate **do not**
-//!    short-circuit — evaluation continues.
-//! 4. If no rule matches, returns `policy.defaults.unmatched`.
-//!
-//! Rules whose selector string fails to parse are treated as never-matching
-//! (fail-closed at the rule level).
-//!
-//! # Totality
-//!
-//! Evaluation never panics, never allocates (the rate-limit id in a
-//! [`Decision`] is a precomputed `Arc<str>`), and always returns a defined
-//! value — including when the rule list is empty or every selector failed to
-//! compile.
-//!
-//! # Rate limits
-//!
-//! [`PolicyEngine::evaluate`] only names the matched rule's bucket
-//! ([`Decision::rate_limit`]); the handler debits it through
-//! [`PolicyEngine::rate_limit_try_consume`] or a resolved [`RateLimitSlot`].
 
 use std::collections::HashMap as BucketMap;
 use std::sync::Arc;
@@ -44,21 +14,13 @@ use crate::{
 };
 
 /// Result of [`PolicyEngine::evaluate`].
-///
-/// The winning [`Response`] plus the matched rule's rate-limit id, a key into
-/// [`Policy::rate_limits`].
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Decision {
     /// The effective response for the evaluated sequence.
     pub response: Response,
-    /// Zero-based index of the matched rule inside the policy's `rules`
-    /// vector, or `None` when evaluation fell through to
-    /// `policy.defaults.unmatched`.
+    /// Zero-based index of the matched rule inside the policy's `rules` vector, or `None` when evaluation fell through to `policy.defaults.unmatched`.
     pub matched_rule: Option<usize>,
-    /// Rate-limit id copied from the matched rule (if any). `None` when the
-    /// decision came from the default path or the matched rule had no rate
-    /// limit. An `Arc<str>` precomputed in [`PolicyEngine::new`], so a match
-    /// does not allocate; it still compares and hashes by value.
+    /// Rate-limit id copied from the matched rule (if any).
     pub rate_limit: Option<Arc<str>>,
 }
 
@@ -76,42 +38,23 @@ impl Decision {
 }
 
 /// Precompiled policy with a bucketed decision table.
-///
-/// Built from a [`Policy`] via [`Self::new`]. Holds the policy verbatim
-/// alongside:
-///
-/// * `compiled[i]` — the parsed [`SequenceSelector`] for `policy.rules[i]`,
-///   or `None` if the rule's `sequence` string failed to parse.
-/// * `buckets` — map from `(function, major)` to the indices of rules whose
-///   selector has that bucket key, in declared order.
-/// * `wildcard_bucket` — indices of rules whose selector bucket is the
-///   universal matcher. Consulted after the specific bucket in declared
-///   order (same as inline wildcards, per §4.3).
 #[derive(Debug, Clone)]
 pub struct PolicyEngine {
     policy: Policy,
     /// One slot per rule. `None` means the selector string failed to parse
-    /// and the rule must be skipped at evaluation time.
     compiled: Vec<Option<SequenceSelector>>,
     /// Buckets keyed by `(function, major)`. Wildcard selectors are stored
-    /// separately in [`Self::wildcard_bucket`].
     buckets: BucketMap<BucketKey, Vec<usize>>,
     /// Indices of rules whose bucket is the universal matcher
-    /// (`FunctionKind::Wildcard`).
     wildcard_bucket: Vec<usize>,
     /// One slot per rule: its rate-limit id, shared into every [`Decision`].
     rate_limit_ids: Vec<Option<Arc<str>>>,
     /// Runtime rate-limiter buckets seeded from `policy.rate_limits`.
-    /// Consulted by [`Self::rate_limit_try_consume`] at handler call sites.
     limiters: RateLimiterSet,
 }
 
 impl PolicyEngine {
-    /// Construct an engine from a [`Policy`]. Compiles every rule's selector
-    /// up front.
-    ///
-    /// Rules whose selector fails to parse remain in the policy (so round-trip
-    /// serialization is lossless) but will never match at evaluation time.
+    /// Construct an engine from a [`Policy`].
     #[must_use]
     pub fn new(policy: Policy) -> Self {
         let mut compiled = Vec::with_capacity(policy.rules.len());
@@ -155,25 +98,6 @@ impl PolicyEngine {
     }
 
     /// Evaluate the policy against a dispatched sequence and its origin.
-    ///
-    /// Implements design §4.2. Never panics.
-    ///
-    /// Algorithm:
-    ///
-    /// 1. Look up rule indices in the `(function, major)` bucket.
-    /// 2. For each index in declared order: if the selector matches the
-    ///    sequence and `origin.dominates(rule.origin_min)`, return the
-    ///    rule's response. A selector-match without an origin-match
-    ///    **continues** to the next rule.
-    /// 3. Repeat step 2 for the same function's `major = None` bucket
-    ///    (e.g. `"CSI t"`), then for the universal wildcard bucket.
-    /// 4. Fall through to `policy.defaults.unmatched`.
-    ///
-    /// The wildcard bucket is consulted last because a rule that matches by
-    /// wildcard is strictly weaker evidence than an exact-bucket match; the
-    /// operator's declared ordering is preserved **within** each bucket, not
-    /// across buckets. This matches the xterm-style intuition where
-    /// `OSC 52 set` rules override a `*` fallback regardless of line number.
     #[must_use]
     pub fn evaluate(&self, sequence: &DispatchedSequence, origin: OriginTag) -> Decision {
         let bucket_key = BucketKey {
@@ -186,8 +110,6 @@ impl PolicyEngine {
             return decision;
         }
 
-        // 2. Major-wildcard bucket: same function, `major = None`. Handles
-        //    selectors like `"CSI t"` where the major is unspecified.
         let major_wildcard_key = BucketKey {
             function: sequence.function,
             major: None,
@@ -207,8 +129,6 @@ impl PolicyEngine {
     }
 
     /// Walk a slice of rule indices in declared order, returning the first
-    /// full match (selector + origin gate). Rules that fail either check
-    /// continue to the next index.
     fn walk_bucket(
         &self,
         indices: &[usize],
@@ -216,7 +136,6 @@ impl PolicyEngine {
         origin: OriginTag,
     ) -> Option<Decision> {
         for &idx in indices {
-            // Only parsed selectors are bucketed; re-checked for totality.
             let Some(selector) = self.compiled.get(idx).and_then(Option::as_ref) else {
                 continue;
             };
@@ -240,24 +159,6 @@ impl PolicyEngine {
     }
 
     /// Attempt to debit `amount` tokens from the named rate-limit bucket.
-    ///
-    /// The `id` must match a [`RateLimit::id`] declared in the active
-    /// [`Policy`]. Unknown ids are permitted (treated as "no limit
-    /// declared"); the engine's fail-closed posture applies to rule
-    /// evaluation, not to rate-limit lookups.
-    ///
-    /// Returns `true` when the call is permitted (and the bucket was
-    /// debited), `false` when the bucket denies. Semantics follow
-    /// [`crate::limits::TokenBucket::try_consume`]:
-    ///
-    /// * zero-capacity ⇒ always deny (hard block);
-    /// * `per_sequence_max > 0 && amount > per_sequence_max` ⇒ deny
-    ///   without debiting;
-    /// * insufficient balance ⇒ deny without debiting.
-    ///
-    /// `amount` is `u64` so the handler-side byte counts (up to a 64 KiB
-    /// response) and the pair counts used by the OSC 4/21 handlers both
-    /// fit without overflow.
     #[inline]
     pub fn rate_limit_try_consume<T: TimeSource>(
         &mut self,
@@ -268,14 +169,7 @@ impl PolicyEngine {
         self.limiters.try_consume(id, amount, clock)
     }
 
-    /// Resolve a rate-limit id to its [`RateLimitSlot`] in this engine's
-    /// bucket set — for call sites that debit the same literal id on every
-    /// dispatch and would otherwise re-hash it each time.
-    ///
-    /// The slot belongs to THIS engine (see [`RateLimitSlot`]); a caller that
-    /// swaps engines must re-resolve. Unknown ids resolve to
-    /// [`RateLimitSlot::UNDECLARED`], which debits as "allow" — the same
-    /// answer [`Self::rate_limit_try_consume`] gives them.
+    /// Resolve a rate-limit id to its [`RateLimitSlot`] in this engine's bucket set — for call sites that debit the same literal id on every dispatch and would otherwise re-hash it each time.
     #[must_use]
     #[inline]
     pub fn rate_limit_slot(&self, id: &str) -> RateLimitSlot {
@@ -283,9 +177,6 @@ impl PolicyEngine {
     }
 
     /// Debit a bucket resolved earlier by [`Self::rate_limit_slot`].
-    ///
-    /// Identical semantics to [`Self::rate_limit_try_consume`], minus the
-    /// per-call hash of the id.
     #[inline]
     pub fn rate_limit_try_consume_slot<T: TimeSource>(
         &mut self,
@@ -296,8 +187,7 @@ impl PolicyEngine {
         self.limiters.try_consume_slot(slot, amount, clock)
     }
 
-    /// Look up a [`RateLimit`] configuration by id. Returns `None` when
-    /// the active policy does not declare a bucket with that id.
+    /// Look up a [`RateLimit`] configuration by id.
     #[must_use]
     #[inline]
     pub fn rate_limit_config(&self, id: &str) -> Option<&RateLimit> {
@@ -319,8 +209,6 @@ mod tests {
     }
 
     /// One sequence from one origin under one built-in profile:
-    /// `(what, profile, sequence, origin, response, rate-limit id)`. The
-    /// rate-limit id is asserted only where a row names one.
     type ProfileRow = (
         &'static str,
         fn() -> crate::Policy,
@@ -342,43 +230,25 @@ mod tests {
         let palette_query = || osc(4, &["3", "?"]);
         let modal = || DispatchedSequence::dcs("2000p");
         let rows: Vec<ProfileRow> = vec![
-            // Permissive: `response any` is its only rule; everything else
-            // falls through to `unmatched = Execute`.
             ("permissive unmatched", permissive, osc(52, &["c", "SGk="]), O::Pty, R::Execute, None),
             ("permissive window op", permissive, csi(Some(20), 't', &[]), O::Pty, R::Execute, None),
             ("standard clip set, user", standard, clip_set(), O::User, R::Ask,
              Some("clipboard")),
-            // PTY origin fails the `User`-or-higher gate on the OSC 52 set
-            // rule; evaluation continues past the OSC 52 query rule to the
-            // `response any` rule, whose origin_min = NetworkUntrusted (the
-            // loosest tag) every origin dominates. That rule responds Execute.
             ("standard clip set, pty", standard, clip_set(), O::Pty, R::Execute, None),
             ("standard clip query, host", standard, clip_query(), O::Host, R::Drop, None),
             ("standard palette query, pty-safe", standard, palette_query(), O::PtySafe, R::Execute,
              None),
-            // Pty does not dominate PtySafe, so the OSC 4 query rule continues;
-            // OSC 4 set has a different param pattern; the wildcard catches it.
             ("standard palette query, pty", standard, palette_query(), O::Pty, R::Execute,
              None),
-            // CSI t requires Host; Pty falls through to the wildcard. By
-            // design: CSI responses go through the response rate limiter, and
-            // Host-only blocking of non-query window ops is the capability
-            // module's job — this rule gates dispatch, not the ops.
             ("standard window op, pty", standard, csi(Some(20), 't', &[]), O::Pty, R::Execute,
              None),
             ("standard notification, user", standard, osc(9, &["build done"]), O::User, R::Warn,
              Some("notifications")),
-            // Standard's wildcard matches every origin, so its unmatched
-            // default (asserted below) is unreachable: an obscure DCS with no
-            // rule of its own is caught by the wildcard instead.
             ("standard dcs 3000p, host", standard, DispatchedSequence::dcs("3000p"), O::Host,
              R::Execute, None),
-            // Hardened requires Host for OSC 52 set: User falls through to
-            // `unmatched = Drop`; Host fires the rule, whose response is Drop.
             ("hardened clip set, user", hardened, clip_set(), O::User, R::Drop, None),
             ("hardened clip set, host", hardened, clip_set(), O::Host, R::Drop, None),
             ("hardened clip query, host", hardened, clip_query(), O::Host, R::Drop, None),
-            // The OSC 4 query rule requires ConfigFile; Pty falls through.
             ("hardened palette query, pty", hardened, palette_query(), O::Pty, R::Drop, None),
             ("hardened palette query, config", hardened, palette_query(), O::ConfigFile, R::Execute,
              None),
@@ -386,8 +256,6 @@ mod tests {
             ("hardened modal activation, pty", hardened, modal(), O::Pty, R::Drop, None),
             ("hardened unknown, network", hardened, osc(1337, &["leet"]), O::NetworkUntrusted,
              R::Drop, None),
-            // No rule matches OSC 1337; the `response any` rule (origin_min =
-            // Host, response = Execute) fires for response sequences from Host.
             ("hardened unknown, host", hardened, osc(1337, &["leet"]), O::Host, R::Execute,
              None),
         ];
@@ -403,8 +271,6 @@ mod tests {
     #[test]
     fn malformed_rule_selector_is_skipped() {
         let mut p = profiles::standard();
-        // Inject a rule with a garbage selector. It must never match;
-        // evaluation continues to subsequent rules.
         p.rules.insert(
             0,
             crate::Rule {
@@ -416,19 +282,12 @@ mod tests {
             },
         );
         let eng = PolicyEngine::new(p);
-        // Clipboard set from User still reaches the Standard OSC 52 set rule.
         let d = eng.evaluate(&osc(52, &["c", "SGVsbG8="]), OriginTag::User);
         assert_eq!(d.response, Response::Ask);
     }
 
     #[test]
     fn origin_gate_failure_does_not_short_circuit() {
-        // Build a policy where:
-        //   rule 0: OSC 9, origin_min = Host,            response = Drop
-        //   rule 1: OSC 9, origin_min = NetworkUntrusted, response = Warn
-        // With origin = Pty (does not dominate Host, but dominates
-        // NetworkUntrusted), the correct behavior is to skip rule 0 and
-        // match rule 1 → Warn.
         let p = Policy {
             schema_version: crate::SCHEMA_VERSION,
             profile: Profile::Standard,

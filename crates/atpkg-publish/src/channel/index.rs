@@ -1,47 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! `atpkg-publish index`: index N+1 = the verified head N + one [`Delta`], signed by this
-//! machine, self-verified, and (with `--upload`) published after every pack it pins is
-//! public.
-//!
-//! [`plan`] is pure, over typed data:
-//! * the head is fetched and verified ([`crate::quad::fetch_head_with`]), its own horizon
-//!   aside: a lapsed head is what every client refuses, and re-signing it with
-//!   `--valid-until` is the recovery. Its blocks may carry only keys this writer renders
-//!   ([`CHANNEL_KEYS`], [`PROGRAM_KEYS`]); anything else is refused, never dropped;
-//! * `index_build` = head + 1; `roster_seq` never below the head's; the roster shipped is
-//!   [`newest_roster`] among the head's, the checkout's `dist/` and `~/.aterm/roster/`,
-//!   and must list this machine ([`crate::identity::signer_for`]);
-//! * pins are carried unless moved; a move below the head's pin is refused (a rollback is
-//!   a yank or `min_build`); a pinned program is dropped only by retiring it; a
-//!   vendor-direct program (`atpkg::vendor_direct::is_vendor`) is never pinned, and a head
-//!   pin of one is carried until retired — except an ALab-built agent program
-//!   ([`crate::programs::alab_package`], codex): an explicit `--pin` of a NEW build inside
-//!   the client's ALab store window switches its block to the table's row (repo
-//!   `codex-alab`), and without one the head's block and pin are carried byte for byte (the
-//!   live index's legacy row names `aterm`, which the client never routes to ALab); a
-//!   `--target-pin` never pins it. A new program must be a [`crate::programs::PROGRAMS`]
-//!   row. Per-target overlays likewise: each cell its own
-//!   downgrade floor, retired only by name, naming only programs `pin` pins;
-//! * `yanked` is carried plus the delta's additions (of a pinned or vendor-direct program)
-//!   and named lifts; a vendor-direct program's yanks bind its client whether or not the
-//!   index pins it, so they outlive its retirement; yanking the pinned build is said loudly;
-//!   `min_build` is carried, lowered only on purpose;
-//! * `valid_until` is carried or moved, never lapsed, warned under 30 days, and the
-//!   roster's horizon is said when it is the earlier cliff;
-//! * every `[programs.<name>]` block renders from the table, metadata changes printed; a
-//!   program the head lists that the table does not keeps the head's block.
-//!
-//! Then [`render`], sign, and self-verify the four files ([`crate::quad::verify_dir`]).
-//! An ALab pin this publish moves or adds is then held to its pack, dry run or not
-//! ([`crate::artifact::package::verify_pinned`]: the manifest under the new index's roster,
-//! the archive staged as a client stages it, the ALab pack gate), read from `--pack-dir` (a
-//! local proof) or the hosts; a pack that does not verify removes the signed quad again.
-//! With `--upload`: refuse a baseline the download host does not serve; run the darwin
-//! triple-drop gate per moved pin; mirror the packs ([`super::mirror`]); then
-//! [`compare_and_swap`] on `atpkg-index-N+1`; finally confirm the index answers on the
-//! download host.
+//! `atpkg-publish index`: index N+1 = the verified head N + one [`Delta`], signed by this machine, self-verified, and (with `--upload`) published after every pack it pins is public.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
@@ -65,9 +25,7 @@ use crate::programs::{self, POLICY};
 use crate::quad::{self, Freshness, QUAD_FILES, VerifiedQuad, index_tag};
 use crate::triple::{Os, Triple};
 
-/// The keys of a `[[channels]]` table this writer renders. A head whose channel carries
-/// any other is refused: carrying a key means rendering it, and a key dropped on the way
-/// is a change nobody asked for inside signed bytes.
+/// The keys of a `[[channels]]` table this writer renders.
 pub const CHANNEL_KEYS: &[&str] = &[
     "name",
     "channel_build",
@@ -78,9 +36,7 @@ pub const CHANNEL_KEYS: &[&str] = &[
     "pin_by_target",
 ];
 
-/// The keys of a `[programs.<name>]` block this writer renders (and `requires`, read so
-/// that a program naming it is refused by name). A head block carrying any other is
-/// refused, for the reason [`CHANNEL_KEYS`] gives.
+/// The keys of a `[programs.<name>]` block this writer renders (and `requires`, read so that a program naming it is refused by name).
 pub const PROGRAM_KEYS: &[&str] = &[
     "repo",
     "policy",
@@ -103,8 +59,7 @@ impl Indexer for Index {
     }
 }
 
-/// What a publish is built over: the head's typed state (or an empty channel for a first
-/// publish).
+/// What a publish is built over: the head's typed state (or an empty channel for a first publish).
 #[derive(Clone, Debug)]
 pub struct Base {
     /// The head's number; the new index is this + 1.
@@ -120,12 +75,8 @@ pub struct Base {
 }
 
 impl Base {
-    /// The verified head `quad`, held to what this writer can carry: exactly one
-    /// `[[channels]]` block, carrying only [`CHANNEL_KEYS`], and program blocks carrying
-    /// only [`PROGRAM_KEYS`].
-    ///
+    /// The verified head `quad`, held to what this writer can carry: exactly one `[[channels]]` block, carrying only [`CHANNEL_KEYS`], and program blocks carrying only [`PROGRAM_KEYS`].
     /// # Errors
-    ///
     /// A refusal naming the block count or the keys it cannot carry.
     pub fn of_head(quad: &VerifiedQuad) -> Result<Self> {
         let raw = std::fs::read_to_string(quad.file(QUAD_FILES[0]))
@@ -184,11 +135,8 @@ impl Base {
         })
     }
 
-    /// A channel's genuine first publish: nothing to carry, no floors. The new index is
-    /// `index_build`.
-    ///
+    /// A channel's genuine first publish: nothing to carry, no floors.
     /// # Errors
-    ///
     /// A usage error for index 0 or an empty channel name.
     pub fn first(channel: &str, index_build: u64) -> Result<Self> {
         if index_build == 0 || channel.is_empty() {
@@ -265,13 +213,8 @@ fn yank_program(y: &Yank) -> &str {
     }
 }
 
-/// A `yanked` entry: `<name>@<digits>` (the client's `is_yanked`) or `<name>@<version>` (a
-/// vendor-direct program's version latch: `x.y.z` or `x.y.z-R<n>[.<s>]`, in the one
-/// spelling `atpkg::vendor_direct::Version::parse` reads). With `accept_eq`,
-/// `<name>=<build>` is the runbook's spelling of the first.
-///
+/// A `yanked` entry: `<name>@<digits>` (the client's `is_yanked`) or `<name>@<version>` (a vendor-direct program's version latch: `x.y.z` or `x.y.z-R<n>[.<s>]`, in the one spelling `atpkg::vendor_direct::Version::parse` reads).
 /// # Errors
-///
 /// A usage error naming the accepted spellings.
 pub fn parse_yank(s: &str, accept_eq: bool) -> Result<Yank> {
     let bad = || {
@@ -303,9 +246,6 @@ pub fn parse_yank(s: &str, accept_eq: bool) -> Result<Yank> {
 }
 
 /// Why a new yank's version names nothing its program's client can hold, if it does: a
-/// version (or a vendor build id) binds only a vendor-direct program, in that program's
-/// own grammar (`VendorSpec::revision_versions`), which is all `Policy::is_yanked` matches.
-/// A legacy build number is the client's `is_yanked` spelling and is not judged here.
 fn version_mismatch(y: &Yank) -> Option<String> {
     use atpkg::vendor_direct::{Version, is_vendor_build, spec};
     let (p, version) = match y {
@@ -342,10 +282,6 @@ fn vendor_pin(p: &str) -> Error {
 }
 
 /// Admit `--pin <p>=<b>` of an ALab-built agent program `def` (its
-/// [`programs::alab_package`] row): `b` is inside the client's ALab store window, and a pin
-/// that switches the block from another repo (the live index's legacy row names `aterm`)
-/// names a NEW build above the head's pin, which is that other repo's build. Whether the
-/// pack verifies is asked once the index is signed ([`publish_with`]).
 fn admit_alab_pin(
     def: &programs::ProgramDef,
     b: Build,
@@ -399,15 +335,9 @@ fn describe(p: &Program) -> String {
     )
 }
 
-/// The index `delta` makes of `base`, signed by `machine_id` under `roster_seq`, valid
-/// until `valid_until` (already held to the clock). Pure: every refusal is decided here,
-/// before a byte is written.
-///
+/// The index `delta` makes of `base`, signed by `machine_id` under `roster_seq`, valid until `valid_until` (already held to the clock).
 /// # Errors
-///
-/// A refusal for a downgrade, an unknown or vendor-direct program, an overlay naming an
-/// unpinned program, a yank of an unpinned program that is not vendor-direct, a lift of an
-/// absent yank, a lowered floor not asked for, or a roster older than the head's.
+/// A refusal for a downgrade, an unknown or vendor-direct program, an overlay naming an unpinned program, a yank of an unpinned program that is not vendor-direct, a lift of an absent yank, a lowered floor not asked for, or a roster older than the head's.
 pub fn plan(
     base: &Base,
     delta: &Delta,
@@ -428,7 +358,6 @@ pub fn plan(
     }
     let head = &base.channel;
 
-    // Retirements first: a retired program is neither moved nor carried.
     let mut retired = Vec::new();
     for p in &delta.retire {
         if !head.pin.contains_key(p) {
@@ -442,7 +371,6 @@ pub fn plan(
         retired.push(p.clone());
     }
 
-    // `pin`.
     let mut pin: BTreeMap<String, Build> = head
         .pin
         .iter()
@@ -451,8 +379,6 @@ pub fn plan(
         .collect();
     let mut moved = Vec::new();
     let mut added = Vec::new();
-    // The ALab-built agent programs whose row this publish switches to (or keeps on) ALab's
-    // repo by an explicit pin; every other one keeps the head's block as it stands.
     let mut switched: BTreeSet<&str> = BTreeSet::new();
     for (p, &b) in &delta.pins {
         if atpkg::vendor_direct::is_vendor(p) {
@@ -491,7 +417,6 @@ pub fn plan(
         .map(|(p, b)| (p.clone(), *b))
         .collect();
 
-    // `pin_by_target`.
     let mut overlays: BTreeMap<String, BTreeMap<String, Build>> = BTreeMap::new();
     let mut dropped = Vec::new();
     for (t, cells) in &head.pin_by_target {
@@ -604,7 +529,6 @@ pub fn plan(
         ));
     }
 
-    // `yanked`: the head's list, with named lifts and additions.
     let mut yanked: Vec<Yank> = Vec::new();
     for entry in &head.yanked {
         let y = parse_yank(entry, false).map_err(|_| {
@@ -627,7 +551,6 @@ pub fn plan(
         yanked.remove(at);
         log.note(format!("--unyank lifts {}", yank_entry(u)));
     }
-    // A vendor-direct program's yank binds its client in any channel, pinned or not.
     let binds = |y: &Yank| {
         let p = yank_program(y);
         pin.contains_key(p) || atpkg::vendor_direct::is_vendor(p)
@@ -682,7 +605,6 @@ pub fn plan(
         ));
     }
 
-    // `min_build`.
     let min_build = match delta.min_build {
         Some(m) if m < head.min_build && !delta.lower_min_build => {
             return Err(Error::refused(format!(
@@ -697,11 +619,7 @@ pub fn plan(
     let mut min_build_by_program = head.min_build_by_program.clone();
     min_build_by_program.retain(|p, _| pin.contains_key(p));
 
-    // Program blocks: the table's, else the head's; table order, then the rest sorted.
     let mut programs_out = Vec::new();
-    // An ALab package row renders from the table only once its head block already names
-    // ALab's repo or this publish pins it explicitly; until then the head's block is carried
-    // byte for byte, in the head-only order it always had.
     let carried_alab = |name: &str| {
         programs::alab_package(name).is_some_and(|def| {
             !switched.contains(name) && base.programs.get(name).is_none_or(|b| b.repo != def.repo)
@@ -896,8 +814,7 @@ fn inline(map: &BTreeMap<String, Build>) -> String {
     )
 }
 
-/// The signed `index.toml`, byte for byte. One deterministic writer: programs and `pin`
-/// in table order, `pin_by_target` and `min_build_by_program` sorted.
+/// The signed `index.toml`, byte for byte.
 #[must_use]
 pub fn render(plan: &Plan) -> String {
     let mut s = String::from(
@@ -975,13 +892,8 @@ pub struct RosterPair {
     pub roster: aterm_update_core::Roster,
 }
 
-/// The newest master-verified roster pair among `candidates` (each `<path>` beside its
-/// `<path>.sig`); the head's own pair is one, so the generation shipped is never below the
-/// head's. An absent candidate is skipped; one that does not verify is skipped and said.
-/// Two different documents at the newest generation are a lineage fork, refused.
-///
+/// The newest master-verified roster pair among `candidates` (each `<path>` beside its `<path>.sig`); the head's own pair is one, so the generation shipped is never below the head's.
 /// # Errors
-///
 /// A refusal when no candidate verifies, or at a fork.
 pub fn newest_roster(ctx: &Ctx, candidates: &[PathBuf], log: &mut Log) -> Result<RosterPair> {
     let anchor: Vec<&str> = ctx.anchor.iter().map(String::as_str).collect();
@@ -1070,11 +982,8 @@ fn within(e: Error, what: &str) -> Error {
 }
 
 /// [`Indexer::publish`], its transcript in `log`.
-///
 /// # Errors
-///
-/// Every refusal the plan, the self-check, the triple gate, the mirror or the
-/// compare-and-swap raises; nothing is published after one.
+/// Every refusal the plan, the self-check, the triple gate, the mirror or the compare-and-swap raises; nothing is published after one.
 pub fn publish_with(ctx: &Ctx, request: &IndexRequest, log: &mut Log) -> Result<Outcome> {
     let out = &request.out;
     if ctx.anchor.is_empty() {
@@ -1095,8 +1004,6 @@ pub fn publish_with(ctx: &Ctx, request: &IndexRequest, log: &mut Log) -> Result<
             )));
         }
     }
-    // The head is read into scratch of its own: --out is not touched until the plan holds.
-    // Its own horizon is not held against it: re-signing a lapsed head is the recovery.
     let head_dir = Scratch::new("head")?;
 
     let (base, head) = read_baseline(ctx, request, head_dir.path(), log)?;
@@ -1227,7 +1134,6 @@ pub fn publish_with(ctx: &Ctx, request: &IndexRequest, log: &mut Log) -> Result<
 }
 
 /// Read the verified baseline without touching the output. The caller owns `head_dir`
-/// until publication finishes, because the triple gate reads the head's signed files.
 fn read_baseline(
     ctx: &Ctx,
     request: &IndexRequest,
@@ -1287,7 +1193,6 @@ fn read_baseline(
 }
 
 /// Emit and self-verify the quad while the caller holds the output lock. A prior
-/// unpublished quad is cleared only after the caller has accepted the complete plan.
 fn write_quad(
     ctx: &Ctx,
     plan: &Plan,
@@ -1296,13 +1201,10 @@ fn write_quad(
     out: &Path,
     log: &mut Log,
 ) -> Result<VerifiedQuad> {
-    // An earlier run's quad never sits beside this one's: a signed, unpublished quad in
-    // the output is an invitation to upload it by hand.
     for f in QUAD_FILES {
         let _ = std::fs::remove_file(out.join(f));
     }
 
-    // Render, sign, stage the roster beside it, and self-verify the exact four files.
     let text = render(plan);
     let index_path = out.join(QUAD_FILES[0]);
     let write = |path: &Path, bytes: &[u8]| {
@@ -1336,7 +1238,6 @@ fn write_quad(
 }
 
 /// Make the packs public before the index, and keep the output locked through the
-/// compare-and-swap and the final anonymous download-host confirmation.
 fn publish_quad(
     ctx: &Ctx,
     request: &IndexRequest,
@@ -1349,9 +1250,6 @@ fn publish_quad(
     let out = &request.out;
     let slug = ctx.index_slug();
     let tag = index_tag(plan.index_build);
-    // The baseline must be published: clients find this index by walking tags up from the
-    // one they hold, on the download host, where a draft answers 404, so N+1 above an
-    // unpublished N is unreachable.
     if head.is_some() {
         let base_tag = index_tag(base.index_build);
         match ctx
@@ -1379,7 +1277,6 @@ fn publish_quad(
     if let Some(h) = head {
         triple_gate(ctx, plan, h, new, &request.delta.triple_drops, out, log)?;
     }
-    // Packs first: a public index never pins a pack the public lane cannot fetch.
     mirror::mirror(ctx, new, &MirrorOptions::publish(), log).map_err(|e| {
         within(
             e,
@@ -1407,7 +1304,6 @@ fn publish_quad(
 }
 
 /// The release notes every index release carries: what it is, first, because these tags
-/// interleave with the app's.
 fn notes(plan: &Plan) -> String {
     format!(
         "Machine-readable package index for the aterm toolchain — not an app release. For \
@@ -1419,16 +1315,9 @@ fn notes(plan: &Plan) -> String {
     )
 }
 
-/// The compare-and-swap on `atpkg-index-N`: two publishers baselined on one head both
-/// mint N; whichever creates it first wins, and the other never clobbers it. An existing
-/// release converges only onto this publisher's own byte-identical quad (upload what is
-/// missing, publish an orphaned draft a killed create left).
-///
+/// The compare-and-swap on `atpkg-index-N`: two publishers baselined on one head both mint N; whichever creates it first wins, and the other never clobbers it.
 /// # Errors
-///
-/// A refusal for another publisher's bytes, a release with no index.toml, a create that
-/// failed (a racing publisher: re-run, never fall back to an upload), or a release whose
-/// state cannot be read.
+/// A refusal for another publisher's bytes, a release with no index.toml, a create that failed (a racing publisher: re-run, never fall back to an upload), or a release whose state cannot be read.
 pub fn compare_and_swap(ctx: &Ctx, plan: &Plan, out: &Path, log: &mut Log) -> Result<()> {
     let slug = ctx.index_slug();
     let host = &*ctx.hosts.channel;
@@ -1515,8 +1404,6 @@ pub fn compare_and_swap(ctx: &Ctx, plan: &Plan, out: &Path, log: &mut Log) -> Re
             "{tag} is already on {slug}, byte-identical — nothing to upload"
         ));
     } else {
-        // Never a clobber: these names were just seen absent, and one appearing in the
-        // window is another publisher's.
         host.upload(&slug, &tag, &missing, Replace::Never)
             .map_err(|e| host_error(format!("uploading the missing quad files to {tag}"), &e))?;
         log.say(format!(
@@ -1551,7 +1438,6 @@ fn darwin_targets(pkg: &atpkg::PkgManifest) -> BTreeSet<String> {
 }
 
 /// A manifest pair read where a client reads it (the public owner's download host), else
-/// from the staging owner, and verified under `quad`.
 fn read_manifest(
     ctx: &Ctx,
     quad: &VerifiedQuad,
@@ -1593,10 +1479,6 @@ fn read_manifest(
 }
 
 /// A pin may not silently drop a darwin target: clients on a target the previous pin
-/// served would stay on that build with nothing said. For each moved pin, the darwin
-/// targets of the head pin's signed manifest must all be in the new one's, unless the
-/// delta names the drop with a reason. A manifest that cannot be read or verified is a
-/// refusal, never a pass.
 fn triple_gate(
     ctx: &Ctx,
     plan: &Plan,
@@ -1610,9 +1492,6 @@ fn triple_gate(
     let _ = std::fs::remove_dir_all(&dir);
     let result = (|| {
         for m in &plan.moved {
-            // An ALab pin's targets are the row's own, and its pack was verified to carry
-            // exactly them (`artifact::package::check_pack`); its head pin may be another
-            // repo's legacy build, and everywhere ALab does not build it the client follows
             // the vendor.
             if programs::alab_package(&m.program).is_some() {
                 continue;
@@ -1683,15 +1562,9 @@ struct Options {
     pack_dir: Option<PathBuf>,
 }
 
-/// The change a command line names (`--pin name=build`, `--target-pin
-/// <triple>:name=build[,…]`, `--yank`, `--unyank`, `--min-build`, `--lower-min-build`,
-/// `--retire`, `--retire-target <triple>[:name]`, `--allow-triple-drop name=<triple>
-/// --reason …`, `--valid-until`).
-///
+/// The change a command line names (`--pin name=build`, `--target-pin <triple>:name=build[,…]`, `--yank`, `--unyank`, `--min-build`, `--lower-min-build`, `--retire`, `--retire-target <triple>[:name]`, `--allow-triple-drop name=<triple> --reason …`, `--valid-until`).
 /// # Errors
-///
-/// A usage error for an unknown flag, a malformed value, a repeated `(target, program)`,
-/// or a triple drop without a reason.
+/// A usage error for an unknown flag, a malformed value, a repeated `(target, program)`, or a triple drop without a reason.
 pub fn parse_delta(args: &[String]) -> Result<Delta> {
     parse(args, false).map(|(d, _)| d)
 }
@@ -1840,12 +1713,8 @@ fn parse(args: &[String], verb: bool) -> Result<(Delta, Options)> {
     Ok((d, o))
 }
 
-/// The request a command line names: [`parse_delta`]'s flags, plus `--out DIR` (default
-/// `dist`), `--upload`, `--baseline DIR` (a verified quad on disk instead of the channel
-/// head), and `--first <channel> --index-build N` (a channel's genuine first publish).
-///
+/// The request a command line names: [`parse_delta`]'s flags, plus `--out DIR` (default `dist`), `--upload`, `--baseline DIR` (a verified quad on disk instead of the channel head), and `--first <channel> --index-build N` (a channel's genuine first publish).
 /// # Errors
-///
 /// A usage error for a bad command line.
 pub fn parse_request(args: &[String]) -> Result<IndexRequest> {
     let (delta, o) = parse(args, true)?;
@@ -1883,9 +1752,7 @@ pub fn parse_request(args: &[String]) -> Result<IndexRequest> {
 }
 
 /// `atpkg-publish index …` ([`parse_request`]).
-///
 /// # Errors
-///
 /// A usage error for a bad command line; whatever the publish refuses.
 pub fn run(ctx: &Ctx, args: &[String]) -> Result<()> {
     let request = parse_request(args)?;

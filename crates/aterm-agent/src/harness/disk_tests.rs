@@ -1,12 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tests for the disk report and the one apply path (design §5.5).
-//!
-//! Tests on synthetic surveys use the literal [`NOW`]; tests that date files
-//! they wrote take `now` from [`now_after_write`]. Every build-directory
-//! fixture is laid out as cargo lays one out ([`lay_target`]): build locks
-//! inside each profile and none at the root.
+//! Tests for the disk report and apply path ([`NOW`], [`now_after_write`], [`lay_target`]).
 
 use super::*;
 use crate::harness::host_path::abs;
@@ -36,8 +31,6 @@ impl Tmp {
 
 impl Drop for Tmp {
     fn drop(&mut self) {
-        // A test may leave a read-only directory behind (the undeletable
-        // entry); make everything writable again first.
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
@@ -58,17 +51,12 @@ impl Drop for Tmp {
 }
 
 /// `now`, `days` past the real wall clock: the files a test just wrote carry
-/// the real clock, so the survey is moved later rather than the files back-dated.
 pub(crate) fn now_after_write(days: i64) -> i64 {
     let real = aterm_time::unix_secs().map_or(0, |s| i64::try_from(s).unwrap_or(i64::MAX));
     real + days * 86_400
 }
 
 /// A build directory as cargo lays one out, at `dir`: the two root markers
-/// (`CACHEDIR.TAG` with its signature, `.rustc_info.json`) and no root lock;
-/// one profile, `debug/`, holding all three build locks, `.fingerprint/`,
-/// `deps/` (an rlib), `build/` and `incremental/` (8 KiB). Written for real,
-/// because the marker check reads bytes and the reclaim takes real locks.
 pub(crate) fn lay_target(dir: &Path) -> PathBuf {
     lay_profile(&dir.join("debug"));
     std::fs::write(
@@ -81,10 +69,6 @@ pub(crate) fn lay_target(dir: &Path) -> PathBuf {
 }
 
 /// One cargo profile at `profile`: every build lock, `.fingerprint/`,
-/// `deps/liblay.rlib` (4 KiB), `build/`, and one incremental session holding
-/// an 8 KiB query cache. Each `/`-separated name is joined one component at a
-/// time: under a verbatim `\\?\` profile (what `canonicalize` answers on
-/// Windows) a `/` is a character of the name, not a separator.
 pub(crate) fn lay_profile(profile: &Path) {
     let at = |rel: &str| rel.split('/').fold(profile.to_path_buf(), |p, c| p.join(c));
     for d in [
@@ -112,7 +96,6 @@ pub(crate) fn lay_profile(profile: &Path) {
 }
 
 /// [`lay_target`] at `<tmp>/<name>`, answered canonical (the report names
-/// the real path; macOS's temp dir sits behind the `/var` link).
 pub(crate) fn synthetic_target(tmp: &Tmp, name: &str) -> PathBuf {
     let dir = lay_target(&tmp.path().join(name));
     std::fs::canonicalize(&dir).expect("canonical")
@@ -133,7 +116,6 @@ fn real(now: i64) -> impl FnMut(&Row) -> std::io::Result<Removed> {
 }
 
 /// A remover that counts its calls and removes nothing, answering the row's
-/// own size as freed.
 fn counting(calls: &mut usize) -> impl FnMut(&Row) -> std::io::Result<Removed> + '_ {
     move |row: &Row| {
         *calls += 1;
@@ -145,7 +127,6 @@ fn counting(calls: &mut usize) -> impl FnMut(&Row) -> std::io::Result<Removed> +
 }
 
 /// The re-measure of a pass with no pressure row: never read (a pressure
-/// row reaching it is a test's mistake, said loudly).
 pub(crate) fn no_pressure() -> Option<u64> {
     panic!("free space was measured again, but this pass has no pressure row")
 }
@@ -157,8 +138,6 @@ fn applying() -> Config {
         ..Config::default()
     }
 }
-
-// -- the report ----------------------------------------------------------------
 
 #[cfg(unix)]
 #[test]
@@ -214,7 +193,6 @@ fn a_synthetic_stale_target_is_reported_and_then_removed_with_its_witness_in_the
         row.witness
     );
 
-    // Now reclaim it, through the real primitive.
     let done = apply(
         &rep,
         survey.transcripts_root.as_deref(),
@@ -236,7 +214,6 @@ fn a_synthetic_stale_target_is_reported_and_then_removed_with_its_witness_in_the
         "deps/ is never touched"
     );
 
-    // The removal row carries the witness: why it was safe, not only what went.
     let (row, removed) = &done.removed[0];
     let line = removal_row(now, "sid-1", row, removed);
     assert!(line.contains("\"kind\":\"removed\""), "{line}");
@@ -259,8 +236,6 @@ fn a_target_without_a_marker_or_with_a_fresh_clock_is_never_a_candidate() {
     let tmp = Tmp::new("negatives");
     let now = now_after_write(DEFAULT_TARGET_STALE_DAYS + 1);
 
-    // Negative 1: old enough, a profile in it, but nothing proves a build tool
-    // laid it.
     let bare = tmp.path().join("bare");
     lay_profile(&bare.join("debug"));
     let scanned =
@@ -271,7 +246,6 @@ fn a_target_without_a_marker_or_with_a_fresh_clock_is_never_a_candidate() {
     let rep = report(&survey, applying());
     assert!(rep.rows_of(Class::CargoTargets).is_empty(), "{rep:?}");
 
-    // Negative 2: a marker, but the files this test just wrote are seconds old.
     let fresh = synthetic_target(&tmp, "fresh");
     let now_fresh = now_after_write(0);
     let scanned =
@@ -281,8 +255,6 @@ fn a_target_without_a_marker_or_with_a_fresh_clock_is_never_a_candidate() {
     let rep = report(&survey, applying());
     assert!(rep.rows_of(Class::CargoTargets).is_empty(), "{rep:?}");
 
-    // Negative 3: a marker and an idle profile, but a build holds one of its
-    // locks. The held lock wins over the clock.
     let busy = synthetic_target(&tmp, "busy");
     let held = target::Build::holds(&busy.join("debug/.cargo-build-lock"));
     let mut survey = Survey::new(now);
@@ -293,8 +265,6 @@ fn a_target_without_a_marker_or_with_a_fresh_clock_is_never_a_candidate() {
     assert!(rep.rows_of(Class::CargoTargets).is_empty(), "{rep:?}");
     drop(held);
 
-    // Negative 4: a marker but no cargo profile (no build lock beside
-    // deps/): nothing to date and nothing cargo laid.
     let nolock = synthetic_target(&tmp, "nolock");
     for lock in CARGO_LOCKS {
         std::fs::remove_file(nolock.join("debug").join(lock)).expect("unlock");
@@ -363,11 +333,6 @@ fn an_unresolvable_live_symlink_blocks_every_version_row_rather_than_guessing() 
 }
 
 /// A superseded store build is a row only when atpkg's retention would take
-/// it: the live build and its rollback target (the newest below the live
-/// one) are kept by `aterm pkg gc`, so neither is a row; the older one and a
-/// staged-but-never-activated build above the live one are. NEGATIVE
-/// CONTROL: the rollback target, which the report listed before 2026-10-17
-/// although `aterm pkg gc` never frees it, is not among the rows.
 #[test]
 fn a_superseded_store_build_is_reported_and_delegated_never_removed_here() {
     let mut survey = Survey::new(NOW);
@@ -412,7 +377,6 @@ fn a_superseded_store_build_is_reported_and_delegated_never_removed_here() {
         rows[0].blocked
     );
 
-    // Even with apply on and the class named, this removes nothing.
     let mut calls = 0;
     let done = apply(
         &rep,
@@ -436,8 +400,6 @@ fn free_space_warns_only_on_a_figure_it_actually_has() {
     survey.free_bytes = Some(100 * GIB);
     assert!(!report(&survey, Config::default()).warn);
 
-    // Negative: a failed query fails open, with no warning on a number we do
-    // not have, and the headline says `unknown` rather than 0.
     survey.free_bytes = None;
     let rep = report(&survey, Config::default());
     assert!(!rep.warn);
@@ -453,8 +415,6 @@ fn free_space_warns_only_on_a_figure_it_actually_has() {
     );
 }
 
-// -- apply: the default, the fences ---------------------------------------------
-
 #[cfg(unix)]
 #[test]
 fn report_only_is_the_default_and_apply_without_a_class_does_nothing() {
@@ -466,13 +426,11 @@ fn report_only_is_the_default_and_apply_without_a_class_does_nothing() {
         .targets
         .push(scan_target(&dir, now, DEFAULT_TARGET_STALE_DAYS, false).expect("a real directory"));
 
-    // The default config: apply off.
     let rep = report(&survey, Config::default());
     assert!(!rep.config.apply, "disk.apply defaults to false");
     assert_eq!(rep.rows_of(Class::CargoTargets).len(), 1, "still REPORTED");
     assert!(rep.headline().contains("apply=off"), "{}", rep.headline());
 
-    // No class named: report-only, whatever the switch says.
     assert!(matches!(
         plan(&rep, None),
         Plan::ReportOnly(Refusal::NoClass)
@@ -502,7 +460,6 @@ fn report_only_is_the_default_and_apply_without_a_class_does_nothing() {
     assert_eq!(done.denials[0].code(), "no-class");
     assert!(dir.exists(), "the directory is untouched");
 
-    // A class named, but `disk.apply` off: still nothing.
     let done = apply(
         &rep,
         None,
@@ -515,7 +472,6 @@ fn report_only_is_the_default_and_apply_without_a_class_does_nothing() {
     assert_eq!(done.denials[0].code(), "apply-off");
     assert!(dir.exists());
 
-    // And the denial row records the refusal rather than dropping it.
     let line = denial_row(now, "sid-1", &done.denials[0]);
     assert!(line.contains("\"kind\":\"denial\""), "{line}");
     assert!(line.contains("\"reason\":\"apply-off\""), "{line}");
@@ -535,7 +491,6 @@ fn a_path_outside_the_list_is_refused_with_a_denial_row() {
     survey.live_version = Some(PathBuf::from(abs("/v/2.1.265")));
     let rep = report(&survey, applying());
 
-    // A path that is simply not on the report.
     let outside = abs("/etc/passwd");
     let err = guard(&rep, None, Class::ClaudeStaleVersions, Path::new(&outside))
         .expect_err("a path nothing reported has no witness");
@@ -546,7 +501,6 @@ fn a_path_outside_the_list_is_refused_with_a_denial_row() {
     assert!(line.contains(&outside), "{line}");
     assert!(!line.contains('\n'), "one row is one line: {line}");
 
-    // A reported path, but under the wrong class: the grant does not carry.
     assert_eq!(
         guard(&rep, None, Class::CargoTargets, &reported)
             .expect_err("a cargo-targets grant cannot reach a versions row")
@@ -554,7 +508,6 @@ fn a_path_outside_the_list_is_refused_with_a_denial_row() {
         "not-reported"
     );
 
-    // A relative path and a `..` walk are refused before anything is looked up.
     assert_eq!(
         guard(
             &rep,
@@ -578,14 +531,11 @@ fn a_path_outside_the_list_is_refused_with_a_denial_row() {
         "not-anchored"
     );
 
-    // The path that is on the report passes the same fence.
     guard(&rep, None, Class::ClaudeStaleVersions, &reported).expect("the reported row passes");
 }
 
 #[test]
 fn nothing_under_the_transcripts_root_is_ever_removed_even_when_it_is_on_the_report() {
-    // A report that (wrongly) carries a transcript path as a removable row:
-    // the SECOND fence is what this test is about, so the first is bypassed.
     let mut survey = Survey::new(NOW);
     let root = PathBuf::from(abs("/home/a/.claude/projects"));
     survey.transcripts_root = Some(root.clone());
@@ -617,7 +567,6 @@ fn nothing_under_the_transcripts_root_is_ever_removed_even_when_it_is_on_the_rep
     assert_eq!(done.denials.len(), 1);
     assert_eq!(done.denials[0].code(), "transcript");
 
-    // The root itself is refused too, not only what is under it.
     assert_eq!(
         guard(
             &rep,
@@ -632,12 +581,6 @@ fn nothing_under_the_transcripts_root_is_ever_removed_even_when_it_is_on_the_rep
 }
 
 /// WINDOWS: THE TRANSCRIPTS FENCE HOLDS IN EVERY SPELLING. The root is
-/// spelled plain (`home.join(".claude").join("projects")`) and a row as
-/// `canonicalize` spells it (`\\?\C:\…`, the case on disk) or in capitals:
-/// both are refused, on the report or not. A path the key cannot place (an
-/// 8.3-shaped name) is placed by file identity: refused under the root,
-/// passed beside it, and refused where an ancestor cannot be read.
-/// NEGATIVE CONTROL: a folder beside the root passes the fence.
 #[cfg(windows)]
 #[test]
 fn the_transcripts_fence_holds_in_every_windows_spelling() {
@@ -671,14 +614,6 @@ fn the_transcripts_fence_holds_in_every_windows_spelling() {
 }
 
 /// WINDOWS: THE TRANSCRIPTS FENCE SEES THROUGH A LINKED `~\.claude`. The
-/// root comes as the home names it, through a junction to another folder of
-/// the same drive, where the key alone reads a canonical row under the real
-/// folder as beside it: the row is refused all the same, on the report or
-/// not, by the root's file identity among the row's ancestors. A root that
-/// is not there holds nothing: a path the key cannot place (8.3-shaped)
-/// passes rather than being called a transcript, while one the key places
-/// under it is still refused. NEGATIVE CONTROL: a folder beside the real one
-/// passes.
 #[cfg(windows)]
 #[test]
 fn the_transcripts_fence_sees_through_a_linked_claude_folder() {
@@ -756,7 +691,6 @@ fn a_removal_that_fails_is_a_denial_row_and_does_not_abandon_the_rest() {
         },
     );
     assert_eq!(done.removed.len(), 1, "the other row still went");
-    // Each removal's intent is told before it, its outcome after.
     let kinds: Vec<&str> = steps
         .iter()
         .map(|l| {
@@ -798,10 +732,6 @@ fn remove_tree_refuses_a_symlink() {
 }
 
 /// A STALE VERSION IN A REAL CLOUD SYNC ROOT STAYS. A scratch folder registered as a cloud
-/// sync root ([`aterm_dirfd::seam::SyncRoot`]) holds a versions folder whose version file and
-/// version folder are in-sync placeholders; [`remove_tree`] refuses both and every byte stays,
-/// whatever placeholder mode the calling thread is in. NEGATIVE CONTROL: with `aterm-dirfd`'s
-/// placeholders left disguised, the sync root reads as a plain folder and both go.
 #[cfg(windows)]
 #[test]
 fn remove_tree_refuses_a_version_in_a_cloud_sync_root() {
@@ -832,7 +762,6 @@ fn remove_tree_refuses_a_version_in_a_cloud_sync_root() {
         b"x"
     );
 
-    // NEGATIVE CONTROL: disguised, the sync root is a plain folder and both go.
     aterm_dirfd::seam::leave_placeholders_disguised(true);
     let file = remove_tree(&versions.join("2.0.0"));
     let dir = remove_tree(&versions.join("2.0.0-dir"));
@@ -845,18 +774,10 @@ fn remove_tree_refuses_a_version_in_a_cloud_sync_root() {
 }
 
 /// A VERSION WHOSE FOLDER CANNOT BE PINNED STAYS, WHATEVER THE REASON: a versions folder
-/// reached through a junction (no cloud sync root anywhere: `aterm_dirfd::pin` answers `LOOP`
-/// at the junction) holds a version file and a version folder; [`remove_tree`] of each,
-/// spelled through the junction, refuses, names why, and every byte stays — the refusal that
-/// fired for a sync root alone let this through to a delete by path, which followed the
-/// junction. A version entry that is itself a junction is refused as a link, its target
-/// whole. NEGATIVE CONTROL: the same two entries by their real path go, the folder with
-/// everything in it, and the junctions stay as they were.
 #[cfg(windows)]
 #[test]
 fn remove_tree_refuses_a_version_whose_folder_is_reached_through_a_junction() {
     let tmp = Tmp::new("win-junction-versions");
-    // Plain, as `mklink /J` takes its operands (it refuses the verbatim spelling).
     let base = tmp.path().to_path_buf();
     let versions = base.join("real").join("versions");
     std::fs::create_dir_all(versions.join("2.0.0-dir").join("sub")).expect("dir");
@@ -888,7 +809,6 @@ fn remove_tree_refuses_a_version_whose_folder_is_reached_through_a_junction() {
     );
     assert_eq!(std::fs::read(elsewhere.join("g")).expect("kept"), b"y");
 
-    // NEGATIVE CONTROL: by their real path, both go; the junctions stay.
     remove_tree(&versions.join("2.0.0")).expect("the real path: the file goes");
     remove_tree(&versions.join("2.0.0-dir")).expect("the real path: the folder goes");
     assert!(!versions.join("2.0.0").exists());
@@ -899,10 +819,6 @@ fn remove_tree_refuses_a_version_whose_folder_is_reached_through_a_junction() {
 }
 
 /// A VERSION OFF A FIXED DISK STAYS: the volume fence every reclaim clears first holds for a
-/// Claude Code version too. A versions folder whose volume reads as not fixed (a removable
-/// stick, through the drive seam: this machine has fixed disks only) or as of a kind that
-/// cannot be read holds a version file and a version folder; [`remove_tree`] of each refuses,
-/// says why, and every byte stays. NEGATIVE CONTROL: the drive read as it is (fixed), both go.
 #[cfg(windows)]
 #[test]
 fn remove_tree_refuses_a_version_off_a_fixed_disk() {
@@ -926,7 +842,6 @@ fn remove_tree_refuses_a_version_off_a_fixed_disk() {
         );
     }
 
-    // NEGATIVE CONTROL: the drive read as it is, both go.
     target::pretend_drive_kind(None);
     remove_tree(&versions.join("2.0.0")).expect("a fixed disk: the file goes");
     remove_tree(&versions.join("2.0.0-dir")).expect("a fixed disk: the folder goes");
@@ -934,15 +849,11 @@ fn remove_tree_refuses_a_version_off_a_fixed_disk() {
     assert!(!versions.join("2.0.0-dir").exists());
 }
 
-// -- the vocabulary -------------------------------------------------------------
-
 #[test]
 fn the_safelist_is_closed_and_its_spellings_round_trip() {
     for c in Class::ALL {
         assert_eq!(Class::parse(c.as_str()), Some(*c));
     }
-    // Negative: no prefix matching, no case folding, no empty name; a typo
-    // that resolved to another class would be a grant nobody gave.
     for bad in ["", "cargo", "Cargo-Targets", "cargo-targets ", "everything"] {
         assert_eq!(Class::parse(bad), None, "{bad:?}");
     }
@@ -963,8 +874,6 @@ fn age_days_never_reads_a_future_mtime_as_old() {
     assert_eq!(age_days(NOW, NOW - 86_399), 0);
     assert_eq!(age_days(NOW, NOW - 86_400), 1);
     assert_eq!(age_days(NOW, NOW - 14 * 86_400), 14);
-    // Negative: a clock that moved backwards must not age a directory into
-    // the removable set.
     assert_eq!(age_days(NOW, NOW + 999 * 86_400), 0);
 }
 
@@ -986,7 +895,6 @@ fn the_purge_row_is_surfaced_and_never_run_from_here() {
         Plan::Denied(Refusal::Delegated(Class::ClaudePurge, _))
     ));
 
-    // Negative: with the vendor command absent there is no row at all.
     let mut survey = Survey::new(NOW);
     survey.purge_available = false;
     assert!(
@@ -1018,7 +926,6 @@ fn the_report_json_carries_every_row_with_its_witness() {
     assert!(json.contains("\"bytes_partial\":true"), "{json}");
     assert!(!json.contains('\n'), "one object, one line");
 
-    // The report row is the durable measurement, and it is not the rows.
     let line = report_row(NOW, "sid-1", &rep);
     assert!(line.contains("\"kind\":\"report\""), "{line}");
     assert!(line.contains("\"rows\":1"), "{line}");
@@ -1026,10 +933,6 @@ fn the_report_json_carries_every_row_with_its_witness() {
 }
 
 /// THE FREE FIGURE IS ONE SYSCALL ON THE MOUNT POINT, never a fork: this
-/// test's own temp directory reads a figure no larger than its volume, a path
-/// that does not exist yet reads its nearest ancestor's volume (where it would
-/// be written), and a spelling through a link (`/tmp` on macOS) reads the
-/// volume it resolves to. NEGATIVE CONTROL: a relative path reads nothing.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
 fn the_free_figure_is_read_on_the_volume_a_path_resolves_to() {
@@ -1047,14 +950,6 @@ fn the_free_figure_is_read_on_the_volume_a_path_resolves_to() {
 }
 
 /// A DIRECTORY SPELLED WITH 8.3 SHORT NAMES READS ITS VOLUME (live1's first
-/// finding: a tab or an agent working under a short `%TEMP%` read
-/// `NoMount`, so no volume and no disk line): the short spelling of a real
-/// long-named folder reads the volume its long spelling reads, and so does
-/// a directory under it that is not made yet (the 8.3 branch's review,
-/// rev4-6: `await sys vol=` naming a folder still to be made, or a tab whose
-/// directory was removed, read `NoMount`). NEGATIVE CONTROL: the short
-/// spelling alone places on no mount. PREMISE, stated where it fails: the
-/// volume generates short names.
 #[cfg(windows)]
 #[test]
 fn a_short_spelled_directory_reads_its_volume() {
@@ -1083,13 +978,6 @@ fn a_short_spelled_directory_reads_its_volume() {
 }
 
 /// A VOLUME IS PLACED WITH THE SYSTEM'S ERROR BOXES OFF, on whatever thread
-/// asks (its first finding: the control socket's
-/// `await sys` holds no guard of its own): [`volume_of`] resolves the path,
-/// and on Windows a query of an empty card reader or optical drive otherwise
-/// puts a box on the owner's desktop and parks the asker. Read inside the
-/// resolve through its seam; the caller's mode is back once it returns.
-/// NEGATIVE CONTROL: this test's thread, before and after, reads the boxes
-/// on (Windows; elsewhere no such box exists and the seam answers quiet).
 #[test]
 fn a_volume_is_placed_with_the_error_boxes_off() {
     let tmp = Tmp::new("volume-quiet");
@@ -1151,8 +1039,6 @@ fn scan_reads_the_versions_dir_and_resolves_the_live_link() {
     assert_eq!(survey.trigger, Trigger::OnDemand);
     #[cfg(unix)]
     {
-        // The link points at the binary; the class is about the version
-        // directory, so the resolved target is walked up to it.
         let live = survey.live_version.clone().expect("the link resolved");
         assert!(
             live.ends_with("2.1.265"),
@@ -1168,9 +1054,6 @@ fn scan_reads_the_versions_dir_and_resolves_the_live_link() {
 }
 
 /// One build directory is one row, however it was named: a `target` link and
-/// the `target.noindex` it names canonicalize to one directory, which the
-/// survey holds once, so the report does not count its bytes twice and an
-/// apply does not reclaim it twice.
 #[cfg(unix)]
 #[test]
 fn a_build_directory_named_twice_is_one_row() {
@@ -1200,11 +1083,6 @@ fn a_build_directory_named_twice_is_one_row() {
 }
 
 /// A build directory nested in another (`o/target/nested/target`) is surveyed
-/// twice; only the inner survey decides the nested profile (its row, or its
-/// note keeping it while a build holds a lock at that survey), and the outer
-/// row neither counts it nor, applied, takes it. Run with the outer profile
-/// idle and recent. Negative control: held at neither survey, each idle profile
-/// is counted and taken once.
 #[cfg(unix)]
 #[test]
 fn the_innermost_build_directory_decides_a_nested_profile_in_the_idle_pass() {
@@ -1226,8 +1104,6 @@ fn the_innermost_build_directory_decides_a_nested_profile_in_the_idle_pass() {
             let tmp = Tmp::new("idle-verdict");
             let outer = lay_target(&tmp.path().join("o/target"));
             let inner = lay_target(&outer.join("nested/target"));
-            // The nested profile's cache is 64 KiB larger than the outer
-            // one's, so a row's bytes say which profiles it counts.
             std::fs::write(
                 inner.join("debug/incremental/lay-1x2y3z/s-abc-def/more.bin"),
                 vec![5u8; 65_536],
@@ -1242,8 +1118,6 @@ fn the_innermost_build_directory_decides_a_nested_profile_in_the_idle_pass() {
             let size = |p: &Path| target::cache_bytes(&p.join(INCREMENTAL), None).0;
             let (bo, bn) = (size(&o), size(&n));
             assert!(bo > 0 && bn > bo, "{case}: {bo} {bn}");
-            // One survey of `dir`, a build holding the nested profile's lock
-            // around it when `held` — taken before, released after.
             let survey_of = |dir: &Path, held: bool| {
                 let _build = held.then(|| target::Build::holds(&n.join(".cargo-lock")));
                 let roots = Roots {
@@ -1264,7 +1138,6 @@ fn the_innermost_build_directory_decides_a_nested_profile_in_the_idle_pass() {
             assert_eq!(survey.targets.len(), 2, "{case}");
             let rep = report(&survey, applying());
 
-            // The profiles a removable row counts, read off its bytes.
             let counts = |r: &Row| -> Vec<PathBuf> {
                 match r.bytes {
                     b if b == bo => vec![o.clone()],
@@ -1278,13 +1151,10 @@ fn the_innermost_build_directory_decides_a_nested_profile_in_the_idle_pass() {
                 .into_iter()
                 .filter(|r| r.removable)
                 .collect();
-            // The build directory's note, when it has one.
             let note = |dir: &Path| -> Option<&str> {
                 let head = format!("cargo-targets: {} — ", dir.display());
                 rep.notes.iter().find_map(|x| x.strip_prefix(head.as_str()))
             };
-            // The profiles a note keeps because a build holds one of their
-            // locks.
             let kept: Vec<PathBuf> = rep
                 .notes
                 .iter()
@@ -1298,8 +1168,6 @@ fn the_innermost_build_directory_decides_a_nested_profile_in_the_idle_pass() {
                 })
                 .collect();
 
-            // No removable row counts a profile a note keeps, and none is
-            // counted twice.
             let counted: Vec<PathBuf> = removable.iter().flat_map(|r| counts(r)).collect();
             for p in &counted {
                 assert!(
@@ -1314,8 +1182,6 @@ fn the_innermost_build_directory_decides_a_nested_profile_in_the_idle_pass() {
                     p.display()
                 );
             }
-            // The outer row, when it has one, counts its own profile alone
-            // and leaves the nested build directory to its own survey.
             let outer_row = removable.iter().find(|r| r.path == outer);
             assert_eq!(outer_row.is_some(), own_idle, "{case}: {rep:?}");
             if let Some(r) = outer_row {
@@ -1331,8 +1197,6 @@ fn the_innermost_build_directory_decides_a_nested_profile_in_the_idle_pass() {
                     "{case}: the outer directory speaks for its own profile only: {why}"
                 );
             }
-            // The inner directory decides the nested profile: its row, or,
-            // held at its survey, its note keeping it.
             let inner_row = removable.iter().find(|r| r.path == inner);
             if build == HeldAt::Inner {
                 assert!(inner_row.is_none(), "{case}: {rep:?}");
@@ -1350,8 +1214,6 @@ fn the_innermost_build_directory_decides_a_nested_profile_in_the_idle_pass() {
                 assert!(kept.is_empty(), "{case}: {:?}", rep.notes);
             }
 
-            // Applied, the build gone: each row takes exactly what it counts,
-            // once, and a profile its note kept stays.
             let done = apply(
                 &rep,
                 None,
@@ -1380,16 +1242,7 @@ fn the_innermost_build_directory_decides_a_nested_profile_in_the_idle_pass() {
     }
 }
 
-// -- the automatic floor --------------------------------------------------------
-
 /// The automatic grant: once the volume is LOW (below the warning) the idle
-/// build cache goes — tier 2 — with `disk.apply` off, since the automatic
-/// removal is its own grant, and nothing of another class does; free space is
-/// measured again before it and the tier stops at the warning, so an hourly
-/// pass at `low` cannot take every idle cache. At or above the warning, or on
-/// an unknown free figure, nothing is planned and the remover is never
-/// called. NEGATIVE CONTROL: a re-measure that already reads the warning
-/// stops the tier with the cache kept.
 #[cfg(unix)]
 #[test]
 fn from_low_the_stale_target_goes_re_measured_and_nothing_else_does() {
@@ -1404,7 +1257,6 @@ fn from_low_the_stale_target_goes_re_measured_and_nothing_else_does() {
         survey
             .targets
             .push(scan_target(&dir, now, config.target_stale_days, false).expect("the target"));
-        // Another class's stale row, which the floor must never reach.
         let versions = tmp.path().join("versions");
         std::fs::create_dir_all(versions.join("2.1.1")).expect("old version");
         survey.versions.push(VersionDir {
@@ -1417,7 +1269,6 @@ fn from_low_the_stale_target_goes_re_measured_and_nothing_else_does() {
         survey
     };
 
-    // At and above the warning, and unknown: nothing.
     for free in [Some(DEFAULT_WARN_FREE_GIB * GIB), Some(500 * GIB), None] {
         let rep = report(&survey_at(free), config);
         assert_eq!(auto_plan(&rep), None, "free={free:?}");
@@ -1432,14 +1283,12 @@ fn from_low_the_stale_target_goes_re_measured_and_nothing_else_does() {
         assert_eq!(done, None);
         assert_eq!(calls, 0, "free={free:?}: the remover was called");
     }
-    // Off: nothing, however low.
     let off = Config {
         auto_free_gib: 0,
         ..config
     };
     assert_eq!(auto_plan(&report(&survey_at(Some(GIB)), off)), None);
 
-    // Low, but the re-measure reads the warning already: the tier stops.
     let low = Some(20 * GIB);
     let rep = report(&survey_at(low), config);
     let plan = pass_plan(&rep).expect("low");
@@ -1461,7 +1310,6 @@ fn from_low_the_stale_target_goes_re_measured_and_nothing_else_does() {
     assert_eq!(done.stopped.as_ref().map(|s| s.by), Some(StopBy::Measured));
     assert_eq!(done.stopped.as_ref().and_then(|s| s.tier), Some(2));
 
-    // Low, and still short of the warning: the stale target, and only it.
     let rows = auto_plan(&rep).expect("low");
     assert_eq!(rows.len(), 1, "{rows:?}");
     assert_eq!(rows[0].class, Class::CargoTargets);
@@ -1486,13 +1334,6 @@ fn from_low_the_stale_target_goes_re_measured_and_nothing_else_does() {
 }
 
 /// THE THRESHOLDS ARE THE LARGER OF THE KNOB AND A SHARE OF THE VOLUME, and
-/// the level is read against them at both edges: a 460 GiB volume's floor is
-/// 5% (23 GiB, above the 10 GiB knob), its warning 8% (37 GiB is below the
-/// 40 GiB knob, so 40), its emergency 4 GiB (1% is 4.6 GiB: that); a 40 GiB
-/// volume keeps the knobs and the 4 GiB emergency. Too few inodes is an
-/// emergency at any byte figure. NEGATIVE CONTROLS: a floor of 0 (off)
-/// stays off at any size, and an unknown size or free figure decides
-/// nothing.
 #[test]
 fn thresholds_are_the_larger_of_the_knob_and_the_volumes_share() {
     let big = 460 * GIB;
@@ -1522,9 +1363,6 @@ fn thresholds_are_the_larger_of_the_knob_and_the_volumes_share() {
         assert_eq!(t.level(free, files), want, "free {free:?} files {files:?}");
     }
 
-    // A small volume holds the unwritten fixed defaults to its share
-    // ([`SMALL_WARN_MAX_PCT`], [`SMALL_FLOOR_MAX_PCT`]): 40 GiB is all of a
-    // 40 GiB disk.
     let small = Config::default().thresholds(Some(40 * GIB));
     assert_eq!(
         (small.floor, small.warn, small.emergency),
@@ -1548,12 +1386,6 @@ fn thresholds_are_the_larger_of_the_knob_and_the_volumes_share() {
 }
 
 /// THE LINES ON FOUR VOLUMES, no room measured (design
-/// `docs/DESIGN-disk-awareness-2026-10-17.md` §2.4's table): a 128 GB disk
-/// warns at 20 % of itself, no longer at 40 GiB (34 %, `low` for good); a
-/// 256 GB one keeps today's lines; the owner's 1.81 TiB volume and a 4 TB
-/// one hold the capped shares. NEGATIVE CONTROL: the same knobs WRITTEN on
-/// the 128 GB disk are read as written, so the hold is the unwritten
-/// default's alone; and a 10 GiB disk keeps a floor that is on (never `0`).
 #[test]
 fn the_lines_on_four_volumes_hold_the_unwritten_defaults_to_a_small_volumes_share() {
     let owners_mac = 1_948_404_040 * 1024;
@@ -1585,11 +1417,6 @@ fn the_lines_on_four_volumes_hold_the_unwritten_defaults_to_a_small_volumes_shar
 }
 
 /// THE VOLUME'S SHARE IS CAPPED AND NEVER RAISES A VALUE THE OWNER WROTE:
-/// on a 4 TB volume the unwritten floor is [`AUTO_FREE_SHARE_MAX_GIB`] (not
-/// 5%, 200 GiB), the warning [`WARN_FREE_SHARE_MAX_GIB`] and the emergency
-/// [`EMERGENCY_FREE_SHARE_MAX_GIB`]; a written floor of 10 GiB and warning of
-/// 20 GiB stay 10 and 20 on any volume, the emergency then no higher than
-/// that floor. NEGATIVE CONTROL: the same values unwritten are raised.
 #[test]
 fn the_volume_share_is_capped_and_a_written_knob_is_read_as_written() {
     let huge = 4096 * GIB;
@@ -1626,10 +1453,6 @@ fn the_volume_share_is_capped_and_a_written_knob_is_read_as_written() {
 }
 
 /// CLAUDE CODE'S WINDOWS TEMP ROOT is `claude` under Node's `os.tmpdir()`:
-/// `%TEMP%`, else `%TMP%` — the user's own directory, so no uid. NEGATIVE
-/// CONTROLS: an empty `%TEMP%` is unset, a relative one names none, and on
-/// Windows the root a survey walks is absolute (the Unix spelling,
-/// `/tmp/claude-0`, names no drive).
 #[test]
 fn claude_codes_windows_temp_root_is_under_its_temp() {
     let (temp, tmp) = (abs("/Users//u/AppData/Local/Temp"), abs("/t"));
@@ -1654,11 +1477,6 @@ fn claude_codes_windows_temp_root_is_under_its_temp() {
 }
 
 /// THE CLAUDE CENSUS PASSES OVER ITS OWN PROCESS, every OS
-/// ([`discover::census_of_running`]): this process (aterm's verb, or the window whose look
-/// asks) is never read, never counted a Claude Code however its path reads — on Windows one
-/// run from a Claude Code scratchpad has a `claude` component in its image — and never
-/// refuses the census unread. NEGATIVE CONTROLS: another pid read the same is a Claude Code,
-/// and another one that cannot be read refuses the census.
 #[test]
 fn the_claude_census_passes_over_its_own_process() {
     use discover::{Exe, Exec, Process};
@@ -1710,9 +1528,6 @@ fn the_claude_census_passes_over_its_own_process() {
 }
 
 /// A live checkout at `<tmp>/repo` (its git files, a source file) whose
-/// whole build directory `target/` (one profile) was last used at `now`,
-/// and its tier-3 row, eight days idle in a seven-day window: the canonical
-/// checkout, the canonical build directory, the row.
 fn idle_whole(tmp: &Tmp, now: i64) -> (PathBuf, PathBuf, Row) {
     let repo = tmp.path().join("repo");
     std::fs::create_dir_all(repo.join(".git").join("logs")).expect("git");
@@ -1744,7 +1559,6 @@ fn idle_whole(tmp: &Tmp, now: i64) -> (PathBuf, PathBuf, Row) {
 }
 
 /// The real remover at `now` on a tier-3 `row`: no process runs, no Claude
-/// Code, the sessions `sessions` reads and the mount tables `tables` reads.
 fn remove_idle_whole(
     row: &Row,
     now: i64,
@@ -1766,15 +1580,6 @@ fn remove_idle_whole(
 }
 
 /// TIER 3'S CLAUSE 4A IS READ AGAIN AT THE REMOVAL, from the sessions as they
-/// stand then — never the survey's copy, a look old by the delete (on
-/// Windows the only witness of a PowerShell tab, whose `Set-Location` moves
-/// no process's working directory). Every OS: a session reporting the
-/// checkout after the survey refuses the removal before anything is opened;
-/// a tab whose working directory turns unknown refuses it with that reason;
-/// one that moves into the build directory after that first reading, while
-/// the reclaim holds the profile's locks, refuses it there. Nothing is
-/// emptied. NEGATIVE CONTROL: with no session in it, the same row's profile
-/// is emptied.
 #[test]
 fn a_session_that_moves_into_the_checkout_after_the_survey_keeps_it() {
     let now = now_after_write(8);
@@ -1804,8 +1609,6 @@ fn a_session_that_moves_into_the_checkout_after_the_survey_keeps_it() {
     let refused = remove(&unknown).expect_err("a tab's directory is unknown");
     assert!(refused.to_string().contains(why), "{refused}");
 
-    // Clear at the first reading, in the build directory at the next: under
-    // the profile's locks, right before its delete.
     let reads = std::cell::Cell::new(0usize);
     let moves_in = || {
         reads.set(reads.get() + 1);
@@ -1839,18 +1642,6 @@ fn a_session_that_moves_into_the_checkout_after_the_survey_keeps_it() {
 }
 
 /// TIER 3'S REMOVAL READS ITS SESSIONS ON A MOUNT TABLE READ WHOLE
-/// ([`remover`]). Every OS: a table read before the reclaim that is not
-/// whole refuses the removal there, before anything is opened — on it
-/// clause 4a resolves no working directory (unix would compare each as
-/// written), and the fence under the locks, which reads a table of its own,
-/// would find that one whole and let the reclaim go on (the old removal
-/// emptied the profile). Windows: under the locks the sessions are judged on
-/// the table the mount fence read there, not on the one read before — a
-/// session beside the checkout, resolved on the table as read, keeps it
-/// once the table read under the locks calls its volume remote (not
-/// resolved, it keeps every candidate of its volume). Nothing is emptied.
-/// NEGATIVE CONTROL: with every table as read, the same session keeps
-/// nothing and the profile is emptied.
 #[test]
 fn the_removal_reads_its_sessions_on_a_mount_table_read_whole() {
     use aterm_sysprobe::volumes::{self, Table};
@@ -1861,8 +1652,6 @@ fn the_removal_reads_its_sessions_on_a_mount_table_read_whole() {
     std::fs::create_dir_all(&beside).expect("beside");
     let rlib = target.join("debug").join("deps").join("liblay.rlib");
     let reads = std::cell::Cell::new(0usize);
-    // Each table as read, the `n`th of this removal (from 1) as `shape`
-    // leaves it.
     let tables = |shape: &dyn Fn(usize, Table) -> Table| {
         reads.set(reads.get() + 1);
         shape(reads.get(), volumes::table())
@@ -1883,7 +1672,6 @@ fn the_removal_reads_its_sessions_on_a_mount_table_read_whole() {
     };
     #[cfg(windows)]
     {
-        // As read before the locks; under them its volume is remote.
         let on = volumes::mount_of(&target, &volumes::table())
             .expect("a mount holds it")
             .on
@@ -1915,16 +1703,6 @@ fn the_removal_reads_its_sessions_on_a_mount_table_read_whole() {
 }
 
 /// A SESSION'S WORKING DIRECTORY IS OPENED ONLY ON A LOCAL VOLUME
-/// ([`idle::SessionCwd::on`], the one reading of the survey and of the
-/// removal, which reads it again under cargo's locks): where the mount table
-/// calls the folder's volume remote (a share that may stall) or automounted,
-/// it is never opened and reads as written: `Unresolved`, though it exists.
-/// So does one reached through a link onto a folder the table calls remote
-/// — the old gate placed the link's own folder, local, and opened it, and
-/// the open followed the link onto the share — and every one with no table,
-/// or one not read whole, to say which volumes are local. Every OS.
-/// NEGATIVE CONTROLS: on the table as read the folder, and the link, are
-/// resolved: placed where the folder is, as the one path rule compares it.
 #[test]
 fn a_session_cwd_on_a_share_or_an_automount_is_never_opened() {
     use aterm_sysprobe::paths::is_under;
@@ -1937,7 +1715,6 @@ fn a_session_cwd_on_a_share_or_an_automount_is_never_opened() {
         .expect("a mount holds it")
         .on
         .clone();
-    // Resolved to `want`'s place, in whatever spelling it resolved to.
     let at = |cwd: &idle::SessionCwd, want: &Path| {
         matches!(cwd, idle::SessionCwd::Placed(p)
             if is_under(p, want) == Some(true) && is_under(want, p) == Some(true))
@@ -1997,13 +1774,6 @@ fn a_session_cwd_on_a_share_or_an_automount_is_never_opened() {
 }
 
 /// THE TEXT FORM SPELLS PATHS AS A PERSON READS THEM (Windows): a row's line
-/// and a hog's line show `C:\…` where the row holds the canonical `\\?\C:\…`
-/// — the row's own path, in its line, in its blocked reason, in its witness —
-/// a share `\\srv\share\…`, and a hog under `$HOME` `~\…` whichever spelling
-/// `$HOME` is in; the row keeps its verbatim path, the one that opens past
-/// `MAX_PATH` and the one the journal and `--json` carry. NEGATIVE CONTROLS:
-/// a volume GUID path, which has no plain spelling, stays as it is; off
-/// Windows nothing is respelled (a `\` is a character of a unix name).
 #[test]
 fn the_text_form_spells_paths_plain_and_the_row_keeps_its_own() {
     let verbatim = PathBuf::from(r"\\?\C:\Users\u\repo\target");

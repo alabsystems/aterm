@@ -1,114 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! THE AGY LIVE UPGRADE, ITS PURE HALF: the QUIET FLOW only (`[harness]
-//! upgrade_ask = false`, the default, and the one flow agy ever takes). When
-//! atpkg lands a newer agy build under a supervised agy, the window's host ends
-//! it at a genuinely idle point — SIGTERM, which agy answers with `0` (mid-turn
-//! too: measured) — and relaunches it through the managed twin on the same
-//! conversation (the relaunch lane's own line, `--conversation=<uuid>`), and
-//! NOTHING is typed after. The I/O half is `upgrade_drive`'s `agy::live`
-//! module (`upgrade_agy_live_drive.rs`, its `upgrade_visit`). Every fact here
-//! was measured on 1.4.0 in the lab (`crates/aterm-lab`, the real binary
-//! against its Gemini API stub, no account; the measurements of
-//! 2026-10-17 and their critic, and the measurements of 2026-10-18):
-//!
-//! * **A running agy sees nothing of a landing** (30 s with no frame, the same
-//!   inode; the twin's `AGY_CLI_DISABLE_AUTO_UPDATE` keeps its own updater
-//!   off). The new build runs once the process is ended and started again
-//!   through the twin, and `--conversation=<uuid>` through it came back on the
-//!   same conversation, every prior turn in the next request.
-//! * **The order of two builds** ([`order`]): agy's versions are plain
-//!   `x.y.z`, read in atpkg's own grammar (`atpkg::vendor_direct::Version`,
-//!   the order Muse Code's lane reads its revision form in); a store build's
-//!   directory is its version's build id (`1.4.0` is `1000001000004000000`),
-//!   so a record whose directory names another build is no version
-//!   ([`build_version`]). Never `--version`.
-//! * **The status substitute, G-A1**: agy keeps no status file as Claude Code
-//!   does. Its reader's idle reading (Idle, authoritative, an empty composer,
-//!   no wall; the drive's) and the conversation's row in
-//!   `conversation_summaries.db` ([`summary_rows`]) reading
-//!   `CASCADE_RUN_STATUS_IDLE` both stand for it. The row reads `RUNNING` from
-//!   a turn's first moment to a few hundred milliseconds AFTER the reader
-//!   reads it over (measured: the screen idle at …674.6, the row `RUNNING`
-//!   until …675.4), so at a turn's end the row says the turn is still open
-//!   (`wait:turn-open`), the point the restart then owns
-//!   (`upgrade_drive::log_settles`). The database is read live WITH NO LOCK ON
-//!   IT (the drive's, `aterm_uds::foreign_db::read`): with agy's connection
-//!   open (its `-wal` beside it) from a private copy of the file and its
-//!   `-wal`; with it closed — agy closes it some 30 s after its last write,
-//!   deleting both, so an idle agy's is closed most of the time — as an
-//!   immutable file; either kept only where the files are the same before and
-//!   after the read. SQLite's own read-only open of the live file, the read
-//!   this replaced, can take the WAL index's write lock to build it, which
-//!   agy's writes wait on for up to their 5 s busy timeout and are dropped
-//!   past it (measured 2026-10-20: an 8 s hold cost agy that turn's row
-//!   update; 136 389 such reads in a tight loop over 24 turns cost none).
-//! * **No running work is interrupted, G-A2.** agy's background work — a
-//!   `run_command` past its `WaitMsBeforeAsync` (a daemon one too), a
-//!   `schedule` timer or cron, an `invoke_subagent` subagent — runs on after
-//!   the turn that started it ended, and agy's SIGTERM kills it all silently
-//!   (and nothing is revived on resume). So five witnesses must each say none
-//!   runs, every one failing closed:
-//!   (a) THE SCREEN: no panel row and no `task(s)`/`subagent(s)` count
-//!   (`aterm_phase::agy::background_shown`; the count alone is drawn with the
-//!   panel turned off, `hideActiveItems`: measured);
-//!   (b) THE TRANSCRIPT ([`open_work`]): of this process's rows (created at or
-//!   after its start, less [`START_SLACK_S`]), every background task's
-//!   `RUNNING` row has its end — the `SYSTEM_MESSAGE` its `sender=` names, or
-//!   `Task "<id>" cancelled.` (a `manage_task` kill: measured) — a cron's
-//!   only once it fired its `MaxIterations` (each firing is a `sender=` row,
-//!   `(iteration N)`, while it runs on: measured), and every subagent
-//!   `Created the following subagents` names has gone idle (`Subagent <id> has
-//!   gone idle`) or was killed (`manage_subagents`, then `Successfully killed`:
-//!   measured, its row naming roles alone);
-//!   (c) THE SUMMARY DATABASE, reinforcement: `not_fully_idle` 0, and no row
-//!   whose parent is this conversation reads other than `IDLE` (blind to a
-//!   daemon task, and stale after a kill until agy opens the conversation
-//!   again: reinforcement only);
-//!   (d) THE PROCESSES: no descendant at all (an idle agy has none; a command
-//!   task is a `zsh -c` session leader on its own pty, a daemon task's simple
-//!   command a bare `sleep`, which Claude Code's shell-name list misses: the
-//!   drive's);
-//!   (e) A PENDING WAKE ([`wakes`]): no message in
-//!   `brain/<conv>/.system_generated/messages/` that wakes agy (every one
-//!   but `MESSAGE_PRIORITY_LOW`) unread by `read.json`, nor one written
-//!   within [`WAKE_SETTLE_MS`]. A task's end, a timer's or cron's firing and a
-//!   subagent going idle each write one, HIGH, and agy takes a turn on it by
-//!   itself: idle, the message is marked read 12 ms after it is written and
-//!   its `SYSTEM_MESSAGE` row starts that turn; busy, it waits unread (and in
-//!   `undelivered/`) until the running turn ends, and agy's turn on it
-//!   follows at once (both measured). A LOW one (a cancelled task's, the
-//!   restart notice) wakes nothing and waits for the next person's message.
-//! * **Its SIGTERM is the restart's own, G-A3**: `0`, the crash file removed —
-//!   every graceful way out's status, which the relaunch on exit reads as
-//!   someone's end and never relaunches. So the record that ends it is written
-//!   BEFORE the signal (its cause the upgrade's,
-//!   [`super::relaunch::ends_its_agent`]), and the exit is carried as the
-//!   harness's own restart (`relaunch::ended_by_restart`), onto the twin,
-//!   adopted by the new process holding `presence/<uuid>.lock`; quiet, so
-//!   nothing is typed after (`done:resumed`).
-//! * **Its relaunch must be able to type, G-A4**: the relaunch lane types its
-//!   line only once the conversation is free — no other live agy names it in
-//!   its argv, and none holds its database with no presence lock: one opened
-//!   on it while this agy held it (`--conversation`, `-c`, an in-TUI
-//!   `/resume`) holds no lock and keeps holding that database once this agy is
-//!   gone (measured). So the restart is never begun while another agy has the
-//!   conversation open ([`Look::shared`], `wait:conversation-shared`): its
-//!   SIGTERM would end an idle agy that nothing could bring back. And a launch
-//!   that set its environment on its own line (`GEMINI_API_KEY=… agy`,
-//!   [`inline_env`]) is never restarted (`skip:env-not-carried`): the relaunch
-//!   line runs in the shell's environment and carries only `HOME`, so its key,
-//!   endpoint or proxy would be gone.
-//! * **The ask flow stays OFF for agy.** Its transcript has no model id and no
-//!   process identity (measured), its notice would say "Claude Code", and its
-//!   resumed screen replays an old READY. `[harness] upgrade_ask` moves
-//!   nothing here.
-//!
-//! [`gate`] is the order the drive takes these in, one wait word each; the
-//! derived model is `HarnessAgyQuietUpgrade`
-//! (`aterm_models_harness::harness_agy_quiet_upgrade_model`), bound to this
-//! gate, the order and the claim in `upgrade_agy_live_drive_tests.rs`.
+//! Pure quiet-flow gate and transcript/summary/wake inspection for live `agy` upgrades.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -116,26 +9,21 @@ use aterm_json::Value;
 
 pub use super::upgrade_muse_live::{build_version, moves_onto, order};
 
-// ---------------------------------------------------------------- the transcript
-
-/// What in the conversation's transcript holds a restart off (G-A2(b)), or
-/// why it proves nothing.
+/// Condition in the conversation transcript that holds off a live `agy` restart.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Open {
-    /// No process start to read the window from, or a tail of the transcript
-    /// that does not reach back to it.
+    /// Missing process start timestamp or truncated transcript tail.
     Unproved,
-    /// A row that does not parse (a torn tail), a row with no time, or the
-    /// transcript could not be read at all.
+    /// Unparseable transcript line, missing timestamp, or unreadable file.
     Unreadable,
-    /// A background task (a command, a timer, a cron) started with no end.
+    /// Background command, timer, or cron task still open.
     Task,
-    /// A subagent spawned that neither went idle nor was killed.
+    /// Spawned subagent has neither gone idle nor been killed.
     Subagent,
 }
 
 impl Open {
-    /// The wait word the drive says (`wait:<word>`).
+    /// Wait reason word (`wait:<word>`).
     #[must_use]
     pub fn word(self) -> &'static str {
         match self {
@@ -147,9 +35,7 @@ impl Open {
     }
 }
 
-/// The slack on a row's time against the process's start: `created_at` is
-/// whole seconds (truncated), and the kernel's start as the drive reads it is
-/// to the second too.
+/// Timestamp slack in seconds between `created_at` and process start.
 pub const START_SLACK_S: u64 = 2;
 
 /// The text a task's `RUNNING` row names its id after.
@@ -162,7 +48,6 @@ const SUBAGENTS_CREATED: &str = "Created the following subagents:";
 const SUBAGENTS_KILLED: &str = "Successfully killed";
 
 /// A tool call's argument as agy's transcript keeps it: each a JSON value
-/// written as a string (`"Action": "\"kill\""`, `"MaxIterations": "1"`).
 fn arg(call: &Value, name: &str) -> Option<Value> {
     let raw = call.get("args")?.get(name)?;
     match raw.as_str() {
@@ -189,8 +74,6 @@ fn started_task(content: &str) -> Option<&str> {
 }
 
 /// A cron's expression and prompt in a `RUNNING` row's description (`Task
-/// Description: Cron: */1 * * * *, Prompt: lab cron fired`); `None` for any
-/// other task.
 fn cron_of(content: &str) -> Option<(String, String)> {
     let line = content
         .lines()
@@ -200,7 +83,6 @@ fn cron_of(content: &str) -> Option<(String, String)> {
 }
 
 /// The id a `manage_task` kill's result row names cancelled (`Task "<id>"
-/// cancelled.`).
 fn cancelled_task(content: &str) -> Option<&str> {
     let rest = content.split_once("Task \"")?.1;
     let (id, tail) = rest.split_once('"')?;
@@ -217,7 +99,6 @@ fn sender(content: &str) -> Option<&str> {
 }
 
 /// The subagent a `SYSTEM_MESSAGE` row says went idle (`Subagent <id> has gone
-/// idle`).
 fn gone_idle(content: &str) -> Option<String> {
     let (head, _) = content.split_once(" has gone idle")?;
     let id = head.rsplit("Subagent ").next()?;
@@ -228,8 +109,6 @@ fn gone_idle(content: &str) -> Option<String> {
 #[derive(Debug)]
 struct Task {
     /// A cron's `MaxIterations` (its schedule call's), `Some(None)` for a cron
-    /// with none: it runs until it is cancelled. `None` for a command or a
-    /// timer, which its first end row ends.
     cron: Option<Option<u64>>,
     /// A cron's firings read so far.
     fired: u64,
@@ -241,21 +120,10 @@ enum Kill {
     These(Vec<String>),
 }
 
-/// NO RUNNING WORK IN THE TRANSCRIPT `text` FROM `from_s` ON (G-A2(b)):
-/// every row created at or after `from_s` (unix seconds) read in order —
-/// every background task's `RUNNING` row ended by a `SYSTEM_MESSAGE` its
-/// `sender=` names or by `Task "<id>" cancelled.`, a cron only once it fired
-/// the `MaxIterations` its `schedule` call named (none: never by firing);
-/// every subagent a spawn row names gone idle or killed (a `manage_subagents`
-/// call naming it, or `kill_all`, then `Successfully killed`). A line that
-/// does not parse, or a row with no time, is [`Open::Unreadable`]: the gate
-/// fails closed. A task open first ([`Open::Task`]), then a subagent
-/// ([`Open::Subagent`]).
+/// Check that no background task or subagent remains open in `text` at or after `from_s`.
 pub fn open_work(text: &str, from_s: u64) -> Result<(), Open> {
     let mut tasks: BTreeMap<String, Task> = BTreeMap::new();
     let mut subagents: BTreeSet<String> = BTreeSet::new();
-    // Cron schedule calls not yet matched to their task: expression, prompt,
-    // `MaxIterations`.
     let mut schedules: Vec<(String, String, Option<u64>)> = Vec::new();
     let mut kill: Option<Kill> = None;
     for line in text.lines().filter(|l| !l.trim().is_empty()) {
@@ -371,11 +239,7 @@ pub fn open_work(text: &str, from_s: u64) -> Result<(), Open> {
     Ok(())
 }
 
-/// G-A2(b) OVER THE TRANSCRIPT AS READ: `text` the whole file, or a tail of
-/// it (`truncated`, its partial first line dropped), the process started at
-/// `started_ms` (the kernel's, unix ms; `0`: unread). Its window starts
-/// [`START_SLACK_S`] before that start; a tail must reach back before it
-/// (its first row older), else [`Open::Unproved`], as is no start at all.
+/// Evaluate transcript quietness over `text` (full or `truncated` tail) for a process started at `started_ms`.
 pub fn quiet_transcript(text: &str, truncated: bool, started_ms: u64) -> Result<(), Open> {
     if started_ms == 0 {
         return Err(Open::Unproved);
@@ -398,32 +262,25 @@ pub fn quiet_transcript(text: &str, truncated: bool, started_ms: u64) -> Result<
     open_work(text, from_s)
 }
 
-// ---------------------------------------------------------------- the summary
-
-/// The status a conversation's summary row reads between turns.
+/// Summary row status value when a conversation is idle between turns.
 pub const STATUS_IDLE: &str = "CASCADE_RUN_STATUS_IDLE";
 
-/// The conversation's row in `conversation_summaries.db` and its subagents'
-/// (rows whose parent it is), as the drive's read-only query answers them.
+/// Conversation summary row and child-subagent busy count from `conversation_summaries.db`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Summary {
-    /// Its own row's `status` (`CASCADE_RUN_STATUS_IDLE` between turns).
+    /// Conversation row `status` string.
     pub status: String,
-    /// Its own row's `not_fully_idle`: background work (not a daemon task's)
-    /// still runs, or ran when agy was killed.
+    /// Conversation row `not_fully_idle` flag.
     pub not_fully_idle: bool,
-    /// Its subagents' rows that read other than idle.
+    /// Number of child subagent rows not in idle status.
     pub children_busy: usize,
 }
 
-/// AN ANSWER OR A FILE OF AGY'S THAT DOES NOT READ AS MEASURED (a summary
-/// line of another shape, a torn message, a `read.json` that does not parse):
-/// the witness reading it fails closed, never an idle point.
+/// Error returned when an `agy` summary query output, message file, or `read.json` is malformed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Unreadable;
 
 /// A `numeric` boolean column as sqlite prints it (`0`/`1`, `false`/`true`);
-/// `None` for anything else.
 fn flag(text: &str) -> Option<bool> {
     match text.trim() {
         "0" | "false" => Some(false),
@@ -432,10 +289,7 @@ fn flag(text: &str) -> Option<bool> {
     }
 }
 
-/// THE SUMMARY OF `conversation` FROM THE QUERY'S ANSWER `out`: one line per
-/// row, `conversation_id|status|not_fully_idle|parent_conversation_id`.
-/// `Ok(None)` where no row is the conversation's own (agy has not summarized
-/// it: nothing proved); `Err` for a line of any other shape (fail closed).
+/// Parse `sqlite3` summary query output `out` for `conversation`.
 pub fn summary_rows(conversation: &str, out: &str) -> Result<Option<Summary>, Unreadable> {
     let mut own: Option<(String, bool)> = None;
     let mut children_busy = 0;
@@ -462,11 +316,7 @@ pub fn summary_rows(conversation: &str, out: &str) -> Result<Option<Summary>, Un
     }))
 }
 
-/// G-A1'S AND G-A2(c)'S RULE over the summary as read: `Ok` where its row
-/// reads idle with nothing not fully idle and no subagent busy; else the
-/// wait word — the database unread (`summary-unreadable`), no row of it
-/// (`summary-unproved`), a turn's status (`turn-open`), background work by
-/// its flag (`background-work`), a subagent's row (`subagent-working`).
+/// Evaluate the summary idle gate (`G-A1` / `G-A2(c)`), returning the wait reason on failure.
 pub fn summary_gate(s: &Result<Option<Summary>, Unreadable>) -> Result<(), &'static str> {
     match s {
         Err(Unreadable) => Err("summary-unreadable"),
@@ -478,36 +328,24 @@ pub fn summary_gate(s: &Result<Option<Summary>, Unreadable>) -> Result<(), &'sta
     }
 }
 
-// ---------------------------------------------------------------- the messages
-
-/// How long after a waking message is WRITTEN the restart still waits, read
-/// or not: idle, agy marks it read 12 ms after writing it and its turn on it
-/// starts there (measured); the restart never lands between the mark and the
-/// turn showing on the screen and in the summary row.
+/// Settle window in milliseconds after a waking message file is written.
 pub const WAKE_SETTLE_MS: u64 = 5_000;
 
 /// The priority of a message that wakes nothing (the restart notice, a
-/// cancelled task's end): it waits for the person's next message.
 const QUIET_PRIORITY: &str = "MESSAGE_PRIORITY_LOW";
 
-/// One message file of the conversation: its id (the file's name without
-/// `.json`), its text, and when it was written (unix ms).
+/// Single inbox message file metadata and contents.
 #[derive(Clone, Debug)]
 pub struct Message {
-    /// The id `read.json` marks.
+    /// Message ID (filename stem referenced in `read.json`).
     pub id: String,
-    /// The file's text.
+    /// Raw JSON file contents.
     pub body: String,
-    /// Its modification time, unix ms.
+    /// File modification timestamp in Unix milliseconds.
     pub written_ms: u64,
 }
 
-/// THE WAKES PENDING (G-A2(e)): of `messages`, those that wake agy (every
-/// priority but [`QUIET_PRIORITY`], an unknown one too) that `read`
-/// (`read.json`'s text: `{"<id>": true, …}`; `None`, no such file: nothing
-/// read) does not mark read, or that were written within [`WAKE_SETTLE_MS`]
-/// of `now_ms`. `Err` where a message or `read.json` does not parse: fail
-/// closed.
+/// Count unread or newly settled waking messages in `messages` against `read.json` (`read`).
 pub fn wakes(read: Option<&str>, messages: &[Message], now_ms: u64) -> Result<usize, Unreadable> {
     let read: Value = match read {
         Some(text) => aterm_json::from_str(text).map_err(|_| Unreadable)?,
@@ -528,48 +366,30 @@ pub fn wakes(read: Option<&str>, messages: &[Message], now_ms: u64) -> Result<us
     Ok(pending)
 }
 
-// ---------------------------------------------------------------- the gate
-
-/// One look at a supervised agy that is behind its twin's build, everything
-/// the quiet flow's restart waits on, read by the drive.
+/// Snapshot of all signals inspected by the live `agy` quiet-upgrade [`gate`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Look {
-    /// A hold, a hand other than the harness's, unread input, or a person's
-    /// keystroke within the grace (`upgrade_drive::held`).
+    /// Whether the session is held by a user or non-harness actor.
     pub held: bool,
-    /// What the screen shows of agy's own background work (G-A2(a),
-    /// `aterm_phase::agy::background_shown`).
+    /// Background work indicator shown on screen (`aterm_phase::agy::background_shown`).
     pub shown: Option<&'static str>,
-    /// agy's reader reads the screen Idle, authoritatively, with no wall (its
-    /// own background work reads busy).
+    /// Whether the screen phase reader reports `agy` authoritatively idle.
     pub idle: bool,
-    /// Its composer holds nothing (a person's draft is theirs).
+    /// Whether the prompt composer is empty.
     pub composer_empty: bool,
-    /// The conversation's summary rows (G-A1, G-A2(c); [`summary_rows`]).
+    /// Parsed conversation summary result ([`summary_rows`]).
     pub summary: Result<Option<Summary>, Unreadable>,
-    /// The transcript (G-A2(b), [`quiet_transcript`]).
+    /// Transcript open-work check result ([`quiet_transcript`]).
     pub transcript: Result<(), Open>,
-    /// The process's descendants (G-A2(d)): `None` where the table could not
-    /// be read.
+    /// Number of live child processes (`None` if process table read failed).
     pub children: Option<usize>,
-    /// The wakes pending (G-A2(e), [`wakes`]): `None` where the messages
-    /// could not be read.
+    /// Number of pending waking messages (`None` if inbox read failed).
     pub wakes: Option<usize>,
-    /// The OTHER live agys that have the conversation open (G-A4): one whose
-    /// argv names it, or one holding its database with no presence lock —
-    /// never the agy the look is of. `None` where they cannot be read.
+    /// Number of other live `agy` processes sharing the conversation (`None` if unknown).
     pub shared: Option<usize>,
 }
 
-/// THE QUIET FLOW'S GATE: `Ok` where the restart may go now; else the wait,
-/// the first of — a person's hold (`held`), background work the screen shows
-/// (`background-work`), a screen not idle (`screen-not-idle`), a draft
-/// (`draft`), the summary ([`summary_gate`]), the transcript ([`Open::word`]),
-/// an unreadable process table (`process-table`) or any descendant at all
-/// (`child-process`), another agy on the conversation or none readable
-/// (`conversation-shared`), unreadable messages (`messages-unreadable`) or a
-/// wake pending (`queued-work`). Nothing past the gate is decided here: the
-/// build's proof to start, the claim and the last look are the drive's.
+/// Evaluate the quiet-upgrade gate over `l`, returning the first blocking wait word on `Err`.
 pub fn gate(l: &Look) -> Result<(), &'static str> {
     if l.held {
         return Err("held");
@@ -600,10 +420,7 @@ pub fn gate(l: &Look) -> Result<(), &'static str> {
     }
 }
 
-// ---------------------------------------------------------------- the launch
-
 /// What a character of a word sits inside, innermost last in
-/// [`simple_commands`]' stack.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Nest {
     Single,
@@ -616,10 +433,6 @@ enum Nest {
 }
 
 /// The words of `line` (a command line as the shell's integration recorded
-/// it, as typed), one list per simple command: split at every blank and every
-/// `;`, `&`, `|`, `(`, `)`, `{`, `}` or newline that no quote, `$(…)`, `${…}`
-/// or backtick holds. A word keeps its quotes, escapes and substitutions whole
-/// (`KEY=$(security … -w)` is one word); an open one runs to the line's end.
 fn simple_commands(line: &str) -> Vec<Vec<String>> {
     let mut commands: Vec<Vec<String>> = Vec::new();
     let mut current: Vec<String> = Vec::new();
@@ -723,20 +536,7 @@ fn unquoted(word: &str) -> String {
     out
 }
 
-/// WHAT A TYPED LAUNCH SET IN AGY'S ENVIRONMENT ON ITS OWN LINE, which no
-/// relaunch line carries (G-A4): in `cmdline` — the shell integration's record
-/// of the command the tab runs, as typed — the first `NAME=…` word other than
-/// `HOME` (which the relaunch carries: `upgrade_agy::relaunch_env`), or the
-/// first option of an `env` (`-u NAME`, `-i`), ahead of a word naming agy
-/// (`agy`, or a path whose last part is `agy`, quoted or not) in the same
-/// simple command. The relaunch line runs in the shell's environment, so a
-/// `GEMINI_API_KEY=k GOOGLE_GEMINI_BASE_URL=… agy` restarted would come back
-/// with no key and no endpoint. `None` for a launch that set nothing there —
-/// an `export` of its own, a `cd … &&` before it, the relaunch's own
-/// `HOME='…' '<twin>' …` — and for a line naming no agy: a function, an alias
-/// or a script that sets a variable is beyond this witness, and so is the rest
-/// of a bash line its history kept no record of (`ignorespace`), whose
-/// integration names only its first simple command.
+/// Return the first inline `NAME=VALUE` assignment prefixing the `agy` command in `cmdline`.
 #[must_use]
 pub fn inline_env(cmdline: &str) -> Option<String> {
     for words in simple_commands(cmdline) {

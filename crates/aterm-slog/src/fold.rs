@@ -1,65 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The fold (design §7.1): one pure reduction of a session's records to its
-//! current state, the same in the server, in a supervisor and over the bus.
-//!
-//! - [`Fold::apply`] reads no clock and is idempotent by seq: a record whose
-//!   seq was already applied changes nothing. A `gap why=handoff epoch=<e>`
-//!   of an epoch newer than the fold's starts that epoch over; the same gap
-//!   seen again is a seq already applied. A carried update's `mark - handoff
-//!   epoch=<e>` only raises the epoch: what was open stays open.
-//! - [`Fold::snapshot`] and [`Fold::from_snapshot`] carry the fold across a
-//!   seamless update as it stands (`fold_snap.rs`).
-//! - Time enters only when the state is read: [`Fold::clause`] and
-//!   [`Fold::hints`] take `now_wall`.
-//! - **Needs** open when their step opens (`approval`, `question`, `wall`,
-//!   `stall` as `unresponsive`), when a run fails (`failure`), when the
-//!   session closes (`exited`), and on a `need` mark (`escalated`, `review`,
-//!   `decision`, `help`). They close when the step closes, on `seen` (a
-//!   failure), or on a `clear` from whoever raised them or from the owner
-//!   (a claim's `clear`, src=mark, lifts only needs a claim raised:
-//!   [`clear_lifts`]).
-//!   A `seen` lifts EVERY failure need, whoever wrote it and whichever run
-//!   failed: the person's (`by=human`, a failure looked at) or the
-//!   harness's after a relaunch (`by=harness`). The fold does not scope it,
-//!   so its producer does: the harness writes one only beside a relaunch
-//!   row whose step brought a new agent process up (never a turn it typed
-//!   into the running agent, a stop or a wait), and only when the session's
-//!   only failure need is on a closed run an agent ran under and a run of
-//!   its kind that opened after that close is open: the agent's end the
-//!   restart replaced (
-//!   `SessionLog::harness_saw_failure`).
-//!   A run's failure also closes when a later run of its kind ends `ok` or
-//!   `fail` ([`lifts_failure`]). That is the log's own rule, not `status
-//!   outcome=`'s: status clears its outcome when the next unit of work
-//!   starts, while the need stands until a later run ENDS or a `seen`.
-//!   A `need` mark raises only `review`, `decision` or `help` (`escalated`
-//!   only from `src=meta`, the owner's attention flag): a claim never
-//!   raises an observed need's word. A need is its raiser's: one raised
-//!   again by ANOTHER author is that author's own need beside it, never a
-//!   takeover of the first (whose raiser alone, or an author that
-//!   [`Actor::overrides`] it, may lift it).
-//!   Precedence: approval > question > wall > unresponsive > failure >
-//!   escalated > exited > raised by a mark, a proven author's before an
-//!   Owner client's before any other's ([`need_precedence`]).
-//! - **Silence never raises a need**: [`Hints::quiet_for_ms`] is a hint.
-//! - **The confidence law** (§3.7): for each (node, key) the value of the
-//!   highest confidence wins, ties to the later seq; a claim never overrides
-//!   an observation. A closed node's OUTCOME is refined only by an exact
-//!   amend ([`amend_refines_out`], an unmeasured build's
-//!   transcript adds facts and never overrules the screen), which moves a
-//!   held turn between the totals' buckets ([`turn_out_rebucket`]); an exact
-//!   `confirmed=1` raises its step's need to the amend's source and
-//!   confidence ([`need_takes_amend`]).
-//! - **Claims** (`verdict`, `label`) are kept as made, the newest of any
-//!   author; beside it the newest of a trusted author (the harness or the
-//!   owner class, [`Actor::is_trusted`]), which no other author displaces;
-//!   and beside that the newest of a PROVEN author (the harness or the
-//!   person, [`Actor::is_proven`]), which no `ctl` claim displaces — `ctl`
-//!   is every in-session client, the supervised agent included. The clause
-//!   and `brief` show a label only from the proven slot, else the trusted
-//!   one.
+//! The fold (design §7.1): one pure reduction of a session's records to its current state, the same in the server, in a supervisor and over the bus.
 
 use crate::field::{Key, Val};
 use crate::rec::Rec;
@@ -87,8 +29,7 @@ pub const LABEL_TTL_MAX_MS: u64 = 3_600_000;
 /// The clause's byte budget (§7.3).
 pub const CLAUSE_BYTES: usize = 48;
 
-/// One field of a node as the fold holds it: the value, and the confidence
-/// and seq that put it there.
+/// One field of a node as the fold holds it: the value, and the confidence and seq that put it there.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Held {
     /// The key.
@@ -106,9 +47,7 @@ pub struct Held {
 pub struct NodeFields(Vec<Held>);
 
 impl NodeFields {
-    /// Offer `val` for `key` at `conf` from record `seq`: kept when no value
-    /// is held, or the held one ranks lower, or ranks the same from an
-    /// earlier seq ([`confidence_law`]).
+    /// Offer `val` for `key` at `conf` from record `seq`: kept when no value is held, or the held one ranks lower, or ranks the same from an earlier seq ([`confidence_law`]).
     pub fn offer(&mut self, key: Key, val: Val, conf: Conf, seq: u64) {
         if let Some(h) = self.0.iter_mut().find(|h| h.key == key) {
             if confidence_law(h.conf, h.seq, conf, seq) {
@@ -132,7 +71,6 @@ impl NodeFields {
     }
 
     /// Hold `val` for `key` at `conf` from record `seq` whatever is held:
-    /// in the held one's place, so the fields keep their order.
     fn put(&mut self, key: Key, val: Val, conf: Conf, seq: u64) {
         let held = Held {
             key,
@@ -208,10 +146,7 @@ impl NodeFields {
     }
 }
 
-/// THE confidence law (§3.7): does an offered value (`conf`, `seq`) replace
-/// the held one (`held_conf`, `held_seq`)? Yes when it ranks higher, or
-/// ranks the same and is later. A claim ranks below every observation, so it
-/// never overrides one.
+/// THE confidence law (§3.7): does an offered value (`conf`, `seq`) replace the held one (`held_conf`, `held_seq`)? Yes when it ranks higher, or ranks the same and is later.
 #[must_use]
 pub const fn confidence_law(held_conf: Conf, held_seq: u64, conf: Conf, seq: u64) -> bool {
     conf.rank() > held_conf.rank() || (conf.rank() == held_conf.rank() && seq > held_seq)
@@ -272,8 +207,7 @@ pub struct Need {
     pub word: &'static str,
     /// The node that raised it (a step, a run, the session, a mark's node).
     pub node: Node,
-    /// The kind of the record that raised it: its node's (`cmd` for a shell
-    /// command's failure, `approval` for a box), or `need` for a mark's.
+    /// The kind of the record that raised it: its node's (`cmd` for a shell command's failure, `approval` for a box), or `need` for a mark's.
     pub kind: Kind,
     /// The seq that raised it.
     pub since_seq: u64,
@@ -290,19 +224,14 @@ pub struct Need {
 }
 
 impl Need {
-    /// Whether it was OBSERVED, not claimed: raised by a record of its own
-    /// (a box, a wall, a run's failure), never by a `need` mark, which any
-    /// author can write. What `brief`'s session line names, and what a
-    /// bus reader's machine form names as the session's need (`aterm fabric
-    /// brief --json`): one rule for both.
+    /// Whether it was OBSERVED, not claimed: raised by a record of its own (a box, a wall, a run's failure), never by a `need` mark, which any author can write.
     #[must_use]
     pub fn observed(&self) -> bool {
         self.src != Src::Mark && self.conf != Conf::Claim
     }
 }
 
-/// A consumer's claim (`verdict`, `label`): attributed, never an
-/// observation.
+/// A consumer's claim (`verdict`, `label`): attributed, never an observation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Claim {
     /// The claim's word (`on-track`), for a verdict.
@@ -317,8 +246,7 @@ pub struct Claim {
     pub until: Option<u64>,
     /// The seq that set it.
     pub seq: u64,
-    /// The name its author declared for itself (`as=`): a claim about a
-    /// claim, printed as `as=`, never as `by=`.
+    /// The name its author declared for itself (`as=`): a claim about a claim, printed as `as=`, never as `by=`.
     pub as_name: Option<String>,
     /// The record or mail it is about (`re=<seq|@off>`).
     pub re: Option<crate::vocab::ShortId>,
@@ -326,8 +254,6 @@ pub struct Claim {
 
 impl Claim {
     /// The claim a `verdict` or `label` mark makes: its word or text and
-    /// `ttl=`, `as=` and `re=` (`None` for a mark that carries neither a word
-    /// nor a text).
     fn of(r: &Rec, label: bool) -> Option<Claim> {
         let (word, text, until) = if label {
             let text = r.f.get_str(Key::Text)?.to_string();
@@ -356,8 +282,7 @@ impl Claim {
     }
 }
 
-/// What the session is doing, by its newest verdict: the agent word, else
-/// the shell phase.
+/// What the session is doing, by its newest verdict: the agent word, else the shell phase.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Phase {
     /// The word (`busy`, `idle`, `running`, `-`).
@@ -418,12 +343,11 @@ pub struct Totals {
     pub human: u32,
     /// Records reported lost by gaps.
     pub lost: u64,
-    /// Turns that found two or more mails waiting and linked none
-    /// ([`mail::MailLinkOf::Ambiguous`], phase 5 ruling T10c).
+    /// Turns that found two or more mails waiting and linked none ([`mail::MailLinkOf::Ambiguous`], phase 5 ruling T10c).
     pub mail_amb: u32,
 }
 
-/// A session's current state (§7.1). About 1 KiB; kept outside the ring.
+/// A session's current state (§7.1).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SessionState {
     /// The last seq applied.
@@ -432,8 +356,7 @@ pub struct SessionState {
     pub ep: u32,
     /// Bumps on every applied record: the chrome's cache key.
     pub rev: u64,
-    /// The open path: the deepest open run, the open turn, the deepest open
-    /// step.
+    /// The open path: the deepest open run, the open turn, the deepest open step.
     pub open: [Option<OpenNode>; 3],
     /// The newest verdict.
     pub phase: Phase,
@@ -449,20 +372,13 @@ pub struct SessionState {
     pub verdict: Option<Claim>,
     /// The newest label claim, of any author.
     pub label: Option<Claim>,
-    /// The newest verdict claim of a trusted author ([`Actor::is_trusted`]:
-    /// the harness or the owner), kept beside [`Self::verdict`] so no other
-    /// author's newer verdict displaces it.
+    /// The newest verdict claim of a trusted author ([`Actor::is_trusted`]: the harness or the owner), kept beside [`Self::verdict`] so no other author's newer verdict displaces it.
     pub verdict_trusted: Option<Claim>,
-    /// The newest label claim of a trusted author: the label `brief` and
-    /// the clause show when no proven author's stands (§7.3, D6).
+    /// The newest label claim of a trusted author: the label `brief` and the clause show when no proven author's stands (§7.3, D6).
     pub label_trusted: Option<Claim>,
-    /// The newest verdict claim of a PROVEN author ([`Actor::is_proven`]:
-    /// the harness or the person), kept beside the trusted one so no `ctl`
-    /// claim — which any process in a session can make, the agent the
-    /// harness judges among them — displaces the harness's verdict.
+    /// The newest verdict claim of a PROVEN author ([`Actor::is_proven`]: the harness or the person), kept beside the trusted one so no `ctl` claim — which any process in a session can make, the agent the harness judges among them — displaces the harness's verdict.
     pub verdict_proven: Option<Claim>,
-    /// The newest label claim of a proven author: the label `brief` and the
-    /// clause show first.
+    /// The newest label claim of a proven author: the label `brief` and the clause show first.
     pub label_proven: Option<Claim>,
     /// The session's own close, once it closed.
     pub closed: Option<ClosedNode>,
@@ -477,8 +393,7 @@ impl SessionState {
         self.needs.iter().flatten().next()
     }
 
-    /// The most urgent OBSERVED need ([`Need::observed`]): the one `brief`'s
-    /// session line names.
+    /// The most urgent OBSERVED need ([`Need::observed`]): the one `brief`'s session line names.
     #[must_use]
     pub fn top_observed_need(&self) -> Option<&Need> {
         self.needs.iter().flatten().find(|n| n.observed())
@@ -486,19 +401,19 @@ impl SessionState {
 
     /// The open run.
     #[must_use]
-    pub fn run(&self) -> Option<&OpenNode> {
+    pub const fn run(&self) -> Option<&OpenNode> {
         self.open[0].as_ref()
     }
 
     /// The open turn.
     #[must_use]
-    pub fn turn(&self) -> Option<&OpenNode> {
+    pub const fn turn(&self) -> Option<&OpenNode> {
         self.open[1].as_ref()
     }
 
     /// The deepest open step.
     #[must_use]
-    pub fn step(&self) -> Option<&OpenNode> {
+    pub const fn step(&self) -> Option<&OpenNode> {
         self.open[2].as_ref()
     }
 }
@@ -524,9 +439,7 @@ pub struct Words {
 }
 
 impl Words {
-    /// `subject · suffix`, the subject cut (never mid-character, never
-    /// before a combining mark or joiner) until the whole fits; `subject`
-    /// alone when `suffix` is empty.
+    /// `subject · suffix`, the subject cut (never mid-character, never before a combining mark or joiner) until the whole fits; `subject` alone when `suffix` is empty.
     #[must_use]
     pub fn fit(subject: &str, suffix: &str) -> Words {
         let owned;
@@ -564,8 +477,6 @@ impl std::fmt::Debug for Words {
 }
 
 /// Whether `c` extends the character before it (a combining mark, a joiner,
-/// a variation selector, an emoji modifier): a cut is never placed before
-/// one.
 const fn is_extend(c: char) -> bool {
     matches!(c,
         '\u{0300}'..='\u{036f}'
@@ -591,8 +502,6 @@ fn cut_subject(s: &str, room: usize) -> &str {
         if after > room {
             break;
         }
-        // An extending char joins the cluster before it: a cut falls only
-        // where the next char starts a cluster of its own.
         if !chars.peek().is_some_and(|&(_, n)| is_extend(n)) {
             end = after;
         }
@@ -600,15 +509,12 @@ fn cut_subject(s: &str, room: usize) -> &str {
     &s[..end]
 }
 
-/// Which row of the clause policy (§7.3) a clause came from: what the
-/// tooltip attributes (a label is said to be one; an observation never is).
-/// Never serialised.
+/// Which row of the clause policy (§7.3) a clause came from: what the tooltip attributes (a label is said to be one; an observation never is).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ClauseRow {
     /// The most urgent need.
     Need,
-    /// A live label of a trusted (or, for [`clause_of_proven`], a proven)
-    /// author.
+    /// A live label of a trusted (or, for [`clause_of_proven`], a proven) author.
     Label,
     /// The open tool or subagent step.
     Step,
@@ -618,8 +524,7 @@ pub enum ClauseRow {
     Run,
 }
 
-/// The tab's "what is it doing" clause (§7.3): drawn as is, never parsed
-/// back.
+/// The tab's "what is it doing" clause (§7.3): drawn as is, never parsed back.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Clause {
     /// The words, at most 48 bytes.
@@ -632,18 +537,14 @@ pub struct Clause {
     pub by: Actor,
     /// The row it came from (phase 3B).
     pub row: ClauseRow,
-    /// The words without the coarse age [`Clause::words`] ends with on a
-    /// label, step, turn or command row (the same words on a need's): what
-    /// a clock-free cache may key on, since they move only when the state
-    /// does (phase 3B).
+    /// The words without the coarse age [`Clause::words`] ends with on a label, step, turn or command row (the same words on a need's): what a clock-free cache may key on, since they move only when the state does (phase 3B).
     pub head: Words,
 }
 
 /// What the fold can say without claiming a need.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Hints {
-    /// How long since the newest record. A hint, never a need: long quiet is
-    /// not stuck.
+    /// How long since the newest record.
     pub quiet_for_ms: u64,
 }
 
@@ -671,8 +572,7 @@ pub struct BusFacts {
     pub needs: Vec<(&'static str, Node, Actor, Src)>,
 }
 
-/// [`Fold::bus_totals`]: the counters a bus fold holding a session from its
-/// first record agrees on.
+/// [`Fold::bus_totals`]: the counters a bus fold holding a session from its first record agrees on.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BusTotals {
     /// Turns opened.
@@ -713,19 +613,10 @@ pub struct Fold {
     /// The shell phase, kept apart from the agent word.
     shell_phase: Option<Phase>,
     /// The delivered `kind=task` mails no turn has taken, oldest first
-    /// (phase 5, [`mail`]), at most [`MAX_MAIL_WAITING`]: carried in the
-    /// local carry since Phase 6.
     mail: Vec<MailWaiting>,
     /// THE MAIL LATCH (phase 5's T39):
-    /// a `mail dir=in` record since the last `human` mark of an
-    /// input that reached the program (one without `reached=0`). The host
-    /// reads it ([`Fold::in_since_human`]) to mark the person's next such
-    /// input whatever its burst, so the fold can read "no person between the
-    /// mail and the turn" from records; it is the one source, and it crosses
-    /// a seamless update in the local carry with the waiting mails.
     in_since_human: bool,
     /// The heuristic mail links of the open turns and the newest closed
-    /// one ([`Fold::mail_link`]).
     links: Vec<(Node, MailLink)>,
 }
 
@@ -744,9 +635,7 @@ impl Fold {
         &self.st
     }
 
-    /// The fold's estimated heap: its state, tracked nodes, field slots and
-    /// owned content in fields, needs and claims. Spare capacity and
-    /// allocator overhead are not counted.
+    /// The fold's estimated heap: its state, tracked nodes, field slots and owned content in fields, needs and claims.
     #[must_use]
     pub fn footprint(&self) -> usize {
         let fields = |f: &NodeFields| {
@@ -799,9 +688,7 @@ impl Fold {
                 .sum::<usize>()
     }
 
-    /// Apply one record. Pure and idempotent by seq: a record at or below
-    /// `as_of` changes nothing, unless it starts an epoch newer than the
-    /// fold's ([`starts_epoch`]), whose seqs restart.
+    /// Apply one record.
     pub fn apply(&mut self, r: &Rec) {
         let reset = starts_epoch(r, self.st.ep);
         if r.seq <= self.st.as_of && !reset {
@@ -820,20 +707,13 @@ impl Fold {
         }
     }
 
-    /// THE HEURISTIC MAIL LINK of turn `node` (phase 5, [`mail`]): the
-    /// delivered mail it most likely acted on, always
-    /// [`Conf::Heuristic`]; held for the open turns and the newest closed
-    /// one. Only the local `brief` prints it, as `mail=@<off>~` on the
-    /// turn's line; `log`, the bus and the ledger never do (rulings T10b,
-    /// T36).
+    /// THE HEURISTIC MAIL LINK of turn `node` (phase 5, [`mail`]): the delivered mail it most likely acted on, always [`Conf::Heuristic`]; held for the open turns and the newest closed one.
     #[must_use]
     pub fn mail_link(&self, node: Node) -> Option<MailLink> {
         self.links.iter().find(|(n, _)| *n == node).map(|(_, l)| *l)
     }
 
-    /// Every heuristic mail link the fold holds ([`Fold::mail_link`]), for
-    /// the local `brief` to print (6C-3, U5). A bus fold holds none: the
-    /// waiting mails it would link are never on the bus.
+    /// Every heuristic mail link the fold holds ([`Fold::mail_link`]), for the local `brief` to print (6C-3, U5).
     #[must_use]
     pub fn mail_links(&self) -> &[(Node, MailLink)] {
         &self.links
@@ -845,18 +725,13 @@ impl Fold {
         &self.mail
     }
 
-    /// THE MAIL LATCH ([`Fold`]'s `in_since_human`): mail was delivered
-    /// (`mail dir=in`) since the last `human` mark of an input that reached
-    /// the program. Set by the mail's record, cleared by such a mark and by a
-    /// reset, never by a `reached=0` mark.
+    /// THE MAIL LATCH ([`Fold`]'s `in_since_human`): mail was delivered (`mail dir=in`) since the last `human` mark of an input that reached the program.
     #[must_use]
     pub const fn in_since_human(&self) -> bool {
         self.in_since_human
     }
 
     /// A turn opened: link it to the one mail waiting in its window, or
-    /// count it ambiguous, and take what it weighed off the waiting list
-    /// ([`mail::mail_link_of`], [`mail::after_turn`]).
     fn link_turn(&mut self, r: &Rec) {
         let decided = mail_link_of(&self.mail, r);
         match decided {
@@ -891,16 +766,13 @@ impl Fold {
 
     /// Hints at `now_wall`: never a need.
     #[must_use]
-    pub fn hints(&self, now_wall: u64) -> Hints {
+    pub const fn hints(&self, now_wall: u64) -> Hints {
         Hints {
             quiet_for_ms: now_wall.saturating_sub(self.st.last_t),
         }
     }
 
-    /// THE BUS'S OPEN PATH: the deepest open run, the
-    /// open turn and the deepest open step of the bus class (a step a need
-    /// is raised from) — never a tool, subagent or compact step, which stays
-    /// local, even when one is open beneath it.
+    /// THE BUS'S OPEN PATH: the deepest open run, the open turn and the deepest open step of the bus class (a step a need is raised from) — never a tool, subagent or compact step, which stays local, even when one is open beneath it.
     #[must_use]
     pub fn bus_open_path(&self) -> [Option<(Node, Kind)>; 3] {
         let deepest = |want: &dyn Fn(&OpenNode) -> bool| {
@@ -917,14 +789,7 @@ impl Fold {
         ]
     }
 
-    /// SEED A LATE READER FROM A BUS SNAPSHOT (phase 4, §5.5): this fold
-    /// becomes the state `snap` (an `op=snap` body's record) names — its open
-    /// path, its open needs, its mail counts and epoch — as of the snap's
-    /// seq, so the records after it apply as they would have. What a snap
-    /// does not say (the totals, the closed nodes, the claims) starts empty:
-    /// a reader that holds the space's records from its first folds those
-    /// instead and never seeds. `false` (nothing changes) for a record that
-    /// is no snap.
+    /// SEED A LATE READER FROM A BUS SNAPSHOT (phase 4, §5.5): this fold becomes the state `snap` (an `op=snap` body's record) names — its open path, its open needs, its mail counts and epoch — as of the snap's seq, so the records after it apply as they would have.
     pub fn seed_snap(&mut self, snap: &Rec) -> bool {
         if snap.op != Op::Snap {
             return false;
@@ -998,13 +863,7 @@ impl Fold {
         true
     }
 
-    /// A VIEW THAT LOST RECORDS (phase 4, `crate::bus`), folded from its
-    /// start up to `snap` — a snapshot past every record it lost: the open
-    /// needs as of the snapshot are the snapshot's (a claim or a failed run's
-    /// close the view never held raised one; a clear it never held lifted
-    /// one), and the rest of this fold (its totals, its close, its open
-    /// nodes) is what the held records made of it. `false` for a body that
-    /// is no snapshot; nothing changed.
+    /// A VIEW THAT LOST RECORDS (phase 4, `crate::bus`), folded from its start up to `snap` — a snapshot past every record it lost: the open needs as of the snapshot are the snapshot's (a claim or a failed run's close the view never held raised one; a clear it never held lifted one), and the rest of this fold (its totals, its close, its open nodes) is what the held records made of it.
     pub fn reseed_needs(&mut self, snap: &Rec) -> bool {
         let mut seeded = Fold::new(self.st.ep);
         if !seeded.seed_snap(snap) {
@@ -1015,10 +874,7 @@ impl Fold {
         true
     }
 
-    /// WHAT A BUS FOLD AND THIS ONE MUST AGREE ON (phase 4, design §5.5's
-    /// projection): the epoch, the open path and the open needs of the bus
-    /// class, an edge's actor as `alias` names it on the bus. A fold seeded
-    /// from a snapshot holds exactly these.
+    /// WHAT A BUS FOLD AND THIS ONE MUST AGREE ON (phase 4, design §5.5's projection): the epoch, the open path and the open needs of the bus class, an edge's actor as `alias` names it on the bus.
     #[must_use]
     pub fn bus_facts(
         &self,
@@ -1041,9 +897,7 @@ impl Fold {
         }
     }
 
-    /// The counters a bus fold that holds a session's records from its first
-    /// agrees on with the local one: turns by outcome, the need-bearing
-    /// steps, who closed the approvals, and the session's close.
+    /// The counters a bus fold that holds a session's records from its first agrees on with the local one: turns by outcome, the need-bearing steps, who closed the approvals, and the session's close.
     #[must_use]
     pub fn bus_totals(&self) -> BusTotals {
         let t = &self.st.totals;
@@ -1098,9 +952,6 @@ impl Fold {
             conf: r.conf,
             f,
         };
-        // A step that continues another (`cont=`, a wall that outlived its
-        // turn) is the same fact: counted once, and its need keeps the time
-        // the continued step opened.
         let continued = (r.node.lvl == Lvl::Step)
             .then(|| r.f.get_str(Key::Cont).and_then(Node::parse))
             .flatten();
@@ -1141,7 +992,6 @@ impl Fold {
             });
         }
         self.tracked.push(open);
-        // Bounded: a link outlives its turn only as the newest closed one.
         self.prune_links();
         self.reproject();
     }
@@ -1172,8 +1022,6 @@ impl Fold {
             .iter()
             .position(|o| o.node == r.node)
             .map(|i| self.tracked.remove(i));
-        // A reader that joined late may hold children the log already
-        // closed before it; none outlives its parent.
         let node = r.node;
         let mut ended = vec![node];
         let mut walk = vec![node];
@@ -1193,10 +1041,6 @@ impl Fold {
         for (k, v) in r.f.iter() {
             f.offer(*k, v.clone(), r.conf, r.seq);
         }
-        // THE OUTCOME: the close's, unless an exact amend
-        // made while the node was open refines it ([`amend_refines_out`]:
-        // the transcript's word outranks a screen close that came after it).
-        // Either way the held `out=` field says the same as `out`.
         let out = match amended.filter(|h| amend_refines_out(r.conf, r.seq, h.conf, h.seq)) {
             Some(Held {
                 val: Val::Word(w), ..
@@ -1292,7 +1136,6 @@ impl Fold {
         match r.k {
             Kind::Need => {
                 // A mark's need is the session's: it outlives the node the
-                // mark attached to, and only a `clear` lifts it.
                 if let Some(w) = need_raised(r) {
                     self.raise(Need {
                         word: w,
@@ -1309,20 +1152,9 @@ impl Fold {
             }
             Kind::Clear => {
                 let (by, src) = (r.by, r.src);
-                // A step's need lives as long as its step; a clear lifts the
-                // others, from whoever raised them or from the owner. A
-                // CLAIM's clear (`mark … clear`, src=mark) lifts only claims
-                // (§3.7: a claim never overrides an observation): an
-                // observed need closes by observation alone.
                 self.drop_needs(|n| clear_lifts(src, by, word, n));
             }
-            // Every failure need, unscoped: the harness's `seen` is guarded
-            // at its producer (module doc, 6C-1).
             Kind::Seen => self.drop_needs(|n| n.word == "failure"),
-            // Claims are stored as made, whoever made them (every one stays
-            // in the ring and in `log`); a trusted author's newest is kept
-            // beside the newest of any, so no other author displaces it, and
-            // a proven author's newest beside that, so no `ctl` claim does.
             Kind::Verdict | Kind::Label => {
                 let label = r.k == Kind::Label;
                 if let Some(claim) = Claim::of(r, label) {
@@ -1353,10 +1185,7 @@ impl Fold {
                 Some("in") => {
                     self.st.totals.mail_in = self.st.totals.mail_in.saturating_add(1);
                     self.st.mail_open = self.st.mail_open.saturating_add(1);
-                    // The person's next input that reaches the program is
-                    // marked (T39), whatever its burst.
                     self.in_since_human = true;
-                    // A task waits for the turn it may have started (phase 5).
                     if let (Some("task"), Some(off)) =
                         (r.f.get_word(Key::MailKind), r.f.get_u(Key::Off))
                     {
@@ -1371,18 +1200,9 @@ impl Fold {
                 }
                 _ => {}
             },
-            // Every `inbox seen` is a mark since 6F-6, and only one that
-            // moved the watermark or decided a verdict closes mail: a
-            // repeat (`moved=0`) folds as nothing. An older writer's mark,
-            // with no `moved=`, was written only on a move.
             Kind::MailSeen if r.f.get_u(Key::Moved) != Some(0) => {
                 self.st.mail_open = self.st.mail_open.saturating_sub(1);
             }
-            // A carried update (`mark - handoff carried= shed= epoch=`): the
-            // successor's epoch, and nothing else changes. Its open runs,
-            // turns and steps stay open in every fold, a remote one too (the
-            // mark is turn class), where an uncarried update's `gap
-            // why=handoff` starts over ([`starts_epoch`]).
             Kind::Handoff => {
                 if let Some(e) = r.f.get_u(Key::Epoch)
                     && e > u64::from(self.st.ep)
@@ -1392,9 +1212,6 @@ impl Fold {
             }
             Kind::Human => {
                 self.st.totals.human = self.st.totals.human.saturating_add(1);
-                // A person acted on the program: no waiting mail is a later
-                // turn's (T39). A gesture that reached none (`reached=0`: a
-                // view scroll, a selection) answered nothing.
                 if r.f.get_u(Key::Reached) != Some(0) {
                     self.mail.clear();
                     self.in_since_human = false;
@@ -1435,9 +1252,6 @@ impl Fold {
                 o.f.offer(*k, v.clone(), r.conf, r.seq);
             }
         } else if let Some(c) = self.st.last.iter_mut().flatten().find(|c| c.node == node) {
-            // A held closed node: every field under the confidence law, but
-            // its outcome only by an exact amend ([`amend_refines_out`]), so
-            // `out` and its held field never disagree.
             for (k, v) in r.f.iter().filter(|(k, _)| *k != Key::Out) {
                 c.f.offer(*k, v.clone(), r.conf, r.seq);
             }
@@ -1472,11 +1286,8 @@ impl Fold {
             if let Some(ep) = r.f.get_u(Key::Epoch) {
                 self.st.ep = u32::try_from(ep).unwrap_or(u32::MAX);
             }
-            // Carries no open node across an update: what was open
-            // is unknown now, and a step's need cannot be closed any more.
             self.tracked.clear();
             self.drop_needs(|n| n.node.lvl == Lvl::Step);
-            // What waited for a turn of the old space waits for none now.
             self.mail.clear();
             self.in_since_human = false;
             self.prune_links();
@@ -1485,11 +1296,6 @@ impl Fold {
     }
 
     /// Add a need in precedence order; when full, the least urgent (newest
-    /// among equals) gives way to a more urgent one. The same need raised
-    /// again BY ITS RAISER replaces it; raised by another author it is that
-    /// author's own need beside it: a raise never rewrites who raised a need
-    /// (which would let any author take another's escalation over, then
-    /// lift it with its own `clear`).
     fn raise(&mut self, need: Need) {
         let mut all: Vec<Need> = self.st.needs.iter_mut().filter_map(Option::take).collect();
         all.retain(|n| !(n.node == need.node && n.word == need.word && n.by == need.by));
@@ -1515,17 +1321,7 @@ impl Fold {
     }
 }
 
-/// Whether the close of run `closed` (kind `kind`, outcome `out`) lifts
-/// `need`: THE failure-supersede rule. A later run of the same kind that
-/// ends `ok` or `fail` replaces a run's failure (a `fail` raises its own),
-/// so the session's failure is the newest finished run's. It is the log's
-/// own rule, not `status outcome=`'s: status clears its remembered outcome
-/// as soon as the next unit of work starts (`session_status`'s publish
-/// step), while this need stands until a later run of the kind ENDS, or a
-/// `seen` lifts it (every failure need at once, see the module doc). A run
-/// that ended `unknown` (interrupted, its block gone) says nothing about
-/// the earlier failure, and a run of another kind (a program in front) is
-/// not the next command.
+/// Whether the close of run `closed` (kind `kind`, outcome `out`) lifts `need`: THE failure-supersede rule.
 #[must_use]
 pub fn lifts_failure(kind: Kind, out: &str, closed: Node, need: &Need) -> bool {
     matches!(out, "ok" | "fail")
@@ -1535,12 +1331,7 @@ pub fn lifts_failure(kind: Kind, out: &str, closed: Node, need: &Need) -> bool {
         && need.node != closed
 }
 
-/// THE OUTCOME REFINEMENT (§2.3, §3.7):
-/// whether an amend's `out=` at (`conf`, `seq`) replaces the outcome a
-/// closed node holds at (`held_conf`, `held_seq`). Only an EXACT amend
-/// refines an outcome (a transcript read on a measured build), and then
-/// under the confidence law: a strong amend, an unmeasured build's
-/// transcript among them, adds facts and never overrules the screen's close.
+/// THE OUTCOME REFINEMENT (§2.3, §3.7): whether an amend's `out=` at (`conf`, `seq`) replaces the outcome a closed node holds at (`held_conf`, `held_seq`).
 #[must_use]
 pub const fn amend_refines_out(held_conf: Conf, held_seq: u64, conf: Conf, seq: u64) -> bool {
     matches!(conf, Conf::Exact) && confidence_law(held_conf, held_seq, conf, seq)
@@ -1558,11 +1349,7 @@ fn turn_bucket<'a>(t: &'a mut Totals, out: &str) -> &'a mut u32 {
     }
 }
 
-/// A held turn's outcome refined from `old` to `new`
-/// ([`amend_refines_out`]): it leaves its old bucket and joins the new one,
-/// so the totals still count each closed turn once. A turn no longer held
-/// (a newer one closed since) keeps its totals: the stated approximation
-/// (plan §11 Q9, accepted).
+/// A held turn's outcome refined from `old` to `new` ([`amend_refines_out`]): it leaves its old bucket and joins the new one, so the totals still count each closed turn once.
 pub fn turn_out_rebucket(t: &mut Totals, old: &str, new: &str) {
     let from = turn_bucket(t, old);
     *from = from.saturating_sub(1);
@@ -1570,10 +1357,7 @@ pub fn turn_out_rebucket(t: &mut Totals, old: &str, new: &str) {
     *to = to.saturating_add(1);
 }
 
-/// Whether amend `r` raises `need` to its own source and confidence (phase
-/// 3B, A5): an exact `confirmed=1` of the step that raised it — the
-/// transcript confirmed the wall the screen saw — and never anything below
-/// exact.
+/// Whether amend `r` raises `need` to its own source and confidence (phase 3B, A5): an exact `confirmed=1` of the step that raised it — the transcript confirmed the wall the screen saw — and never anything below exact.
 #[must_use]
 pub fn need_takes_amend(need: &Need, r: &Rec) -> bool {
     r.op == Op::Amend
@@ -1584,9 +1368,7 @@ pub fn need_takes_amend(need: &Need, r: &Rec) -> bool {
         && r.conf.rank() > need.conf.rank()
 }
 
-/// Whether `r` starts an epoch newer than `ep`: a `gap why=handoff` (or
-/// `why=reset`) naming `epoch=` above it. Epochs only grow (§2.2), so the
-/// same gap applied again, or a stale one, starts nothing.
+/// Whether `r` starts an epoch newer than `ep`: a `gap why=handoff` (or `why=reset`) naming `epoch=` above it.
 #[must_use]
 pub fn starts_epoch(r: &Rec, ep: u32) -> bool {
     r.op == Op::Gap
@@ -1594,21 +1376,13 @@ pub fn starts_epoch(r: &Rec, ep: u32) -> bool {
         && r.f.get_u(Key::Epoch).is_some_and(|e| e > u64::from(ep))
 }
 
-/// The need words a `need` mark may raise (§7.4): `review`, `decision`,
-/// `help`, and `escalated` from the owner's attention flag (`src=meta`,
-/// §7.1). An observed need's word (`approval:*`, `unresponsive`,
-/// `failure`, `exited`) is never a mark's to raise.
+/// The need words a `need` mark may raise (§7.4): `review`, `decision`, `help`, and `escalated` from the owner's attention flag (`src=meta`, §7.1).
 #[must_use]
 pub fn mark_may_raise(src: Src, word: &str) -> bool {
     matches!(word, "review" | "decision" | "help") || (word == "escalated" && src == Src::Meta)
 }
 
-/// THE NEED A RECORD RAISES (§7.1), or `None`: a step's open
-/// ([`step_need`]), a run's close `out=fail` (`failure`), the session's close
-/// (`exited`), or a `need` mark [`mark_may_raise`] admits. The fold raises a
-/// need exactly when this says one (its `on_open`, `on_close` and `on_mark`
-/// ask it), and `await log need` waits for exactly these records, so the two
-/// can never disagree.
+/// THE NEED A RECORD RAISES (§7.1), or `None`: a step's open ([`step_need`]), a run's close `out=fail` (`failure`), the session's close (`exited`), or a `need` mark [`mark_may_raise`] admits.
 #[must_use]
 pub fn need_raised(r: &Rec) -> Option<&'static str> {
     match (r.op, r.node.lvl) {
@@ -1622,14 +1396,7 @@ pub fn need_raised(r: &Rec) -> Option<&'static str> {
     }
 }
 
-/// THE CLEAR RULE (§7.1, §3.7): whether a `clear` from `by` at `src`
-/// (naming need `word`, or every need) lifts `need`. Never a step's need
-/// (it lives as long as its step); otherwise a need its raiser clears, or an
-/// author that overrides the raiser ([`Actor::overrides`]: the person any;
-/// `ctl` any but a proven author's, so the agent a harness supervises — a
-/// `ctl` client too — never lifts the harness's need). A CLAIM's clear
-/// (`src=mark`) lifts only needs a claim raised: an observed need
-/// (`failure`, `escalated`, `exited`, …) closes by observation alone.
+/// THE CLEAR RULE (§7.1, §3.7): whether a `clear` from `by` at `src` (naming need `word`, or every need) lifts `need`.
 #[must_use]
 pub fn clear_lifts(src: Src, by: Actor, word: Option<&str>, need: &Need) -> bool {
     word.is_none_or(|w| need.word == w)
@@ -1638,12 +1405,7 @@ pub fn clear_lifts(src: Src, by: Actor, word: Option<&str>, need: &Need) -> bool
         && (src != Src::Mark || need.src == Src::Mark)
 }
 
-/// THE NEED PRECEDENCE (§7.1), lower first: a need raised by a mark ranks
-/// last whatever its word, so a claim never outranks an observation — a
-/// proven author's ([`Actor::is_proven`]) first among claims, an Owner
-/// client's next, any other author's last, so a flood of other authors'
-/// needs gives way before the harness's when the needs are full; every
-/// other need ranks by its word ([`need_rank`]).
+/// THE NEED PRECEDENCE (§7.1), lower first: a need raised by a mark ranks last whatever its word, so a claim never outranks an observation — a proven author's ([`Actor::is_proven`]) first among claims, an Owner client's next, any other author's last, so a flood of other authors' needs gives way before the harness's when the needs are full; every other need ranks by its word ([`need_rank`]).
 #[must_use]
 pub fn need_precedence(n: &Need) -> u8 {
     if n.src == Src::Mark || (n.conf == Conf::Claim && n.src != Src::Meta) {
@@ -1659,8 +1421,7 @@ pub fn need_precedence(n: &Need) -> u8 {
     }
 }
 
-/// The need a step's open raises (§7.1): `approval:<kind>`, `question`,
-/// `wall:<kind>`, or `unresponsive` for an input stall.
+/// The need a step's open raises (§7.1): `approval:<kind>`, `question`, `wall:<kind>`, or `unresponsive` for an input stall.
 #[must_use]
 pub fn step_need(r: &Rec) -> Option<&'static str> {
     if r.op != Op::Open || r.node.lvl != Lvl::Step {
@@ -1697,11 +1458,7 @@ fn tool_words(cls: Option<&str>) -> &'static str {
     }
 }
 
-/// THE LABEL A READER IS SHOWN (§7.3, D6):
-/// a proven author's live label ([`Actor::is_proven`]: the
-/// harness's), else a trusted author's (the owner class, `ctl` among it), at
-/// `now_wall`; never another author's. The clause and `brief` both read it,
-/// so the two can never show different labels.
+/// THE LABEL A READER IS SHOWN (§7.3, D6): a proven author's live label ([`Actor::is_proven`]: the harness's), else a trusted author's (the owner class, `ctl` among it), at `now_wall`; never another author's.
 #[must_use]
 pub fn shown_label(st: &SessionState, now_wall: u64) -> Option<&Claim> {
     let live = |c: &&Claim| c.text.is_some() && c.until.is_some_and(|u| u > now_wall);
@@ -1717,10 +1474,7 @@ pub fn shown_label(st: &SessionState, now_wall: u64) -> Option<&Claim> {
         })
 }
 
-/// The verdict claims a reader is shown, in order: a proven author's newest
-/// (the harness's), the newest trusted one when it is another claim, then
-/// the newest of any author when that is yet another. No `ctl` verdict
-/// hides the harness's, and no other author's hides either.
+/// The verdict claims a reader is shown, in order: a proven author's newest (the harness's), the newest trusted one when it is another claim, then the newest of any author when that is yet another.
 #[must_use]
 pub fn shown_verdicts(st: &SessionState) -> Vec<&Claim> {
     let mut out: Vec<&Claim> = Vec::with_capacity(3);
@@ -1739,9 +1493,7 @@ pub fn shown_verdicts(st: &SessionState) -> Vec<&Claim> {
     out
 }
 
-/// The label a PROVEN author's slot shows at `now_wall` (the harness's or the
-/// person's), never a `ctl` client's or another author's: what a person's
-/// tooltip may show.
+/// The label a PROVEN author's slot shows at `now_wall` (the harness's or the person's), never a `ctl` client's or another author's: what a person's tooltip may show.
 #[must_use]
 pub fn shown_proven_label(st: &SessionState, now_wall: u64) -> Option<&Claim> {
     st.label_proven
@@ -1756,22 +1508,13 @@ pub fn clause_of(st: &SessionState, now_wall: u64) -> Option<Clause> {
     clause_with(st, now_wall, shown_label)
 }
 
-/// [`clause_of`] with only a PROVEN author's label admitted
-/// ([`shown_proven_label`]): a `ctl` label
-/// neither shows nor hides the step or turn row beneath it. The tooltip's
-/// clause; `brief` and [`Fold::clause`] keep [`clause_of`].
+/// [`clause_of`] with only a PROVEN author's label admitted ([`shown_proven_label`]): a `ctl` label neither shows nor hides the step or turn row beneath it.
 #[must_use]
 pub fn clause_of_proven(st: &SessionState, now_wall: u64) -> Option<Clause> {
     clause_with(st, now_wall, shown_proven_label)
 }
 
-/// THE NEED ROW'S WORDS (§7.3): what the clause says of a need `word` with
-/// its `detail` (a wall's reset, a failure's exit code), and its tone —
-/// `approval · bash`, `limit · 3pm`, `failed · exit 2` — or `None` for a
-/// word the clause gives no row (it reads on to the label and the open
-/// path). The clause's own need row, and what a bus reader shows of a
-/// remote session's need (the Overview's "On the fabric" group):
-/// one rendering for both.
+/// THE NEED ROW'S WORDS (§7.3): what the clause says of a need `word` with its `detail` (a wall's reset, a failure's exit code), and its tone — `approval · bash`, `limit · 3pm`, `failed · exit 2` — or `None` for a word the clause gives no row (it reads on to the label and the open path).
 #[must_use]
 pub fn need_words(word: &str, detail: Option<&str>) -> Option<(Words, Tone)> {
     match word {
@@ -1819,7 +1562,6 @@ fn clause_with(
         row: ClauseRow::Need,
         head: words,
     };
-    // A row whose words end with a coarse age keeps its head apart.
     let aged = |subject: &str, a: u64, tone: Tone, by: Actor, row: ClauseRow| Clause {
         words: Words::fit(subject, &age_short(a)),
         age_ms: a,

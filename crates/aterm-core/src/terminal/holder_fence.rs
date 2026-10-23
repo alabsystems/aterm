@@ -223,7 +223,7 @@ impl HolderFence {
     /// Whether any mark exists (the fence is free while none does).
     #[inline]
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.marks.is_empty()
     }
 

@@ -1,17 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Runtime class creation: `objc_allocateClassPair`, `class_addMethod`,
-//! `class_addIvar`, `class_addProtocol`, `objc_registerClassPair`, plus
-//! `objc_msgSendSuper` for `[super …]`.
-//!
-//! A declared class has any superclass, one Rust value per instance
-//! (`type Ivars = T`) rather than per-field ivars, an automatic `dealloc` that
-//! drops the ivars and calls `[super dealloc]` ([`IvarSlot`]'s flag keeps that
-//! sound if `dealloc` runs before the ivars were written), and protocol claims.
-//!
-//! Ivars drop on whatever thread performs the last release (`S3` in the crate
-//! docs). Instantiation is gated by [`MainThread`]; the release end is not.
+//! Runtime class creation: `objc_allocateClassPair`, `class_addMethod`, `class_addIvar`, `class_addProtocol`, `objc_registerClassPair`, plus `objc_msgSendSuper` for `[super …]`.
 
 use std::ffi::{CStr, CString, c_void};
 use std::mem::MaybeUninit;
@@ -25,31 +15,16 @@ use crate::runtime::{
 /// The name of the single ivar every declared class carries.
 pub(crate) const IVAR_NAME: &CStr = c"_atermIvars";
 
-/// A witness that the caller asked `+[NSThread isMainThread]` on this thread
-/// and got yes.
-///
-/// `alloc_init` and `alloc_ivars` take one, so a declared class cannot be
-/// instantiated (and its Rust ivars born) off the main thread without an
-/// `unsafe` [`Self::new_unchecked`]. [`crate::Retained`] being `!Send` limits
-/// where an instance travels, not where it is born.
-///
-/// A witness, not a capability: it records that the question was asked. It is
-/// `!Send`/`!Sync`, so it cannot be carried off the main thread. [`Self::new`]
-/// asks `+[NSThread isMainThread]`, the question AppKit itself asks.
-///
-/// Class registration is not gated: `objc_allocateClassPair` and
-/// `objc_registerClassPair` are thread-safe, run no Rust destructor and produce
-/// an immortal class, so `Self::class()` works anywhere (e.g. to read a method
-/// table from a test worker). The `S3` hazard lives in the instance.
+/// A witness that the caller asked `+[NSThread isMainThread]` on this thread and got yes.
 #[derive(Clone, Copy, Debug)]
 pub struct MainThread {
+    /// `!Send`/`!Sync`: a witness is only true on the thread that minted it.
     /// `!Send`/`!Sync`: a witness is only true on the thread that minted it.
     _not_send: std::marker::PhantomData<*const u8>,
 }
 
 impl MainThread {
-    /// A witness, or `None` off the main thread. Never panics; callers treat
-    /// `None` as "do nothing".
+    /// A witness, or `None` off the main thread.
     #[must_use]
     pub fn new() -> Option<Self> {
         static NS_THREAD_CLS: std::sync::atomic::AtomicPtr<c_void> =
@@ -66,8 +41,7 @@ impl MainThread {
                 id
             }
         };
-        // SAFETY: `+[NSThread isMainThread]` is a side-effect-free `BOOL` class
-        // query on an always-linked Foundation class, cast as `-(BOOL)(id, SEL)`.
+        // SAFETY: `+[NSThread isMainThread]` is a side-effect-free `BOOL` class query on an always-linked Foundation class, cast as `-(BOOL)(id, SEL)`.
         let is_main = unsafe {
             let f: unsafe extern "C-unwind" fn(Id, Sel) -> crate::encode::Bool =
                 crate::checked_msg();
@@ -76,13 +50,9 @@ impl MainThread {
         is_main.as_bool().then(Self::mint)
     }
 
-    /// A witness without asking, for a caller with its own proof and for tests
-    /// of classes that touch no AppKit state.
-    ///
+    /// A witness without asking, for a caller with its own proof and for tests of classes that touch no AppKit state.
     /// # Safety
-    /// The caller must be on the process main thread, or know that the class
-    /// has no main-thread affinity and its `Ivars` may be dropped on any thread
-    /// (`S3`).
+    /// The caller must be on the process main thread, or know that the class has no main-thread affinity and its `Ivars` may be dropped on any thread (`S3`).
     #[must_use]
     pub const unsafe fn new_unchecked() -> Self {
         Self::mint()
@@ -98,9 +68,6 @@ impl MainThread {
 }
 
 /// Per-class facts resolved once at registration and read on every ivar access.
-///
-/// The class pointer is kept as a `usize` so this is `Send + Sync` and can live
-/// in a `OnceLock`; a class object is immortal, so the address is stable.
 #[derive(Clone, Copy, Debug)]
 pub struct ClassMeta {
     class_addr: usize,
@@ -112,9 +79,7 @@ impl ClassMeta {
     #[inline]
     #[must_use]
     pub fn class(&self) -> ClassPtr {
-        // SAFETY: `class_addr` is private and written only by
-        // `ClassBuilder::register`, from the pair `objc_registerClassPair` just
-        // registered; classes are never disposed, so it is still a class.
+        // SAFETY: `class_addr` is private and written only by `ClassBuilder::register`, from the pair `objc_registerClassPair` just registered; classes are never disposed, so it is still a class.
         unsafe { ClassPtr::from_ptr(std::ptr::with_exposed_provenance_mut(self.class_addr)) }
     }
 
@@ -127,11 +92,6 @@ impl ClassMeta {
 }
 
 /// The per-instance ivar payload: an initialised flag plus the Rust value.
-///
-/// `class_createInstance` (behind `+alloc`) returns zeroed memory, so the flag
-/// reads `false` until the ivars are written. If a superclass `init` fails and
-/// releases `self`, `dealloc` then drops nothing instead of running
-/// `drop_in_place` over zero bytes.
 #[repr(C)]
 pub struct IvarSlot<T> {
     initialized: bool,
@@ -140,15 +100,10 @@ pub struct IvarSlot<T> {
 
 impl<T> IvarSlot<T> {
     /// Fill an all-zero slot.
-    ///
     /// # Safety
-    /// `slot` must point at a properly aligned, writable `IvarSlot<T>` whose
-    /// `initialized` flag is `false` (freshly `+alloc`ed; refilling would leak
-    /// the old value). Alignment holds because `add_rust_ivar` refuses a `T`
-    /// aligned above 16 (`S4`).
+    /// `slot` must point at a properly aligned, writable `IvarSlot<T>` whose `initialized` flag is `false` (freshly `+alloc`ed; refilling would leak the old value).
     pub unsafe fn init(slot: *mut Self, value: T) {
-        // SAFETY: `slot` is aligned, writable and unfilled. Writing the whole
-        // struct is one initialising store with no read of the old bytes.
+        // SAFETY: `slot` is aligned, writable and unfilled.
         unsafe {
             slot.write(Self {
                 initialized: true,
@@ -158,25 +113,11 @@ impl<T> IvarSlot<T> {
     }
 
     /// Borrow the value.
-    ///
-    /// The initialised flag is checked in release builds too: the class is
-    /// registered under a public name, so Objective-C code (a nib,
-    /// `NSClassFromString`) can mint an instance whose slot was never written.
-    ///
-    /// The flag does not guard against a substituting initializer (one that
-    /// releases `self` and returns a different object): a sibling class whose
-    /// ivar lands at the same offset reads `true` and hands out a `&T` over its
-    /// bytes, and a smaller survivor puts the read past its allocation. A class whose
-    /// `Ivars` carry state must ensure its designated initializer does not
-    /// substitute.
-    ///
     /// # Safety
-    /// `slot` must point at an aligned, readable `IvarSlot<T>` (initialised or
-    /// zeroed) that outlives `'a`.
+    /// `slot` must point at an aligned, readable `IvarSlot<T>` (initialised or zeroed) that outlives `'a`.
     #[must_use]
     pub unsafe fn get<'a>(slot: *const Self) -> &'a T {
-        // SAFETY: `slot` is aligned, readable and live for `'a`; the flag is
-        // readable either way because `+alloc` zeroed the instance.
+        // SAFETY: `slot` is aligned, readable and live for `'a`; the flag is readable either way because `+alloc` zeroed the instance.
         let this = unsafe { &*slot };
         assert!(
             this.initialized,
@@ -184,26 +125,19 @@ impl<T> IvarSlot<T> {
              not created by `alloc_init`, or a message reached it between \
              `+alloc` and the ivar store"
         );
-        // SAFETY: only `init` sets `initialized`, in the same store that wrote a
-        // valid `T`, and `dispose` clears it before dropping; checked above.
+        // SAFETY: only `init` sets `initialized`, in the same store that wrote a valid `T`, and `dispose` clears it before dropping; checked above.
         unsafe { this.value.assume_init_ref() }
     }
 
     /// Drop the value in place if it was ever written; idempotent.
-    ///
     /// # Safety
-    /// `slot` must point at an aligned, writable `IvarSlot<T>` (initialised or
-    /// zeroed) that nothing else is borrowing. Alignment is discharged as for
-    /// [`Self::init`].
+    /// `slot` must point at an aligned, writable `IvarSlot<T>` (initialised or zeroed) that nothing else is borrowing.
     pub unsafe fn dispose(slot: *mut Self) {
-        // SAFETY: the caller pins `slot` as writable; reading the flag is
-        // always valid because `+alloc` zeroed it.
+        // SAFETY: the caller pins `slot` as writable; reading the flag is always valid because `+alloc` zeroed it.
         let initialized = unsafe { (*slot).initialized };
         if !initialized {
             return;
         }
-        // Clear the flag first, so a re-entrant `dealloc` (e.g. a superclass
-        // `dealloc` that resurrected `self`) cannot drop the value twice.
         // SAFETY: as above.
         unsafe {
             (*slot).initialized = false;
@@ -212,22 +146,16 @@ impl<T> IvarSlot<T> {
     }
 }
 
-/// A class pair under construction. Consumed by [`ClassBuilder::register`].
-///
-/// Every mutator must run before registration: `class_addIvar` is legal only on
-/// an unregistered pair, since it changes the instance size.
+/// A class pair under construction.
 pub struct ClassBuilder {
     cls: ClassPtr,
     name: CString,
 }
 
 impl ClassBuilder {
-    /// Start a new class pair. `None` if a class of that name already exists
-    /// (two [`crate::declare_class!`] sites picked the same `NAME`).
-    ///
+    /// Start a new class pair.
     /// # Safety
-    /// `superclass` must be a live class object; the runtime reads it to lay
-    /// out the new class.
+    /// `superclass` must be a live class object; the runtime reads it to lay out the new class.
     #[must_use]
     pub unsafe fn new(superclass: ClassPtr, name: &CStr) -> Option<Self> {
         assert!(
@@ -235,9 +163,7 @@ impl ClassBuilder {
             "aterm-objc: superclass not found for class {name:?} — the framework \
              that defines it is not linked into this binary"
         );
-        // SAFETY: `superclass` is a live, immortal class (non-null asserted
-        // above); `name` is a valid C string the runtime copies. `extra_bytes`
-        // is 0: the payload lives in a named ivar, which survives subclassing.
+        // SAFETY: `superclass` is a live, immortal class (non-null asserted above); `name` is a valid C string the runtime copies.
         let cls = unsafe { objc_allocateClassPair(superclass, name.as_ptr(), 0) };
         if cls.is_null() {
             return None;
@@ -256,39 +182,7 @@ impl ClassBuilder {
     }
 
     /// Add an ivar big enough for `T`, named `_atermIvars`.
-    ///
-    /// The encoding is `[Nc]` (N opaque bytes), deliberately not a pointer
-    /// encoding, so the runtime never treats the bytes as an object to retain,
-    /// release or scan.
-    ///
-    /// `T` may not be aligned above 16 (`S4`): `class_createInstance` allocates
-    /// with `malloc`, which guarantees only 16-byte alignment, and
-    /// `class_addIvar` aligns the ivar's offset but not the base (a 32-aligned
-    /// slot landed misaligned in 19 of 4,096 `+alloc`s). A misaligned slot
-    /// makes every `&T` undefined behaviour, so an over-aligned `T` is refused
-    /// at compile time:
-    ///
-    /// ```compile_fail
-    /// #[repr(align(32))]
-    /// struct WideIvars(u64);
-    /// aterm_objc::declare_class! {
-    ///     struct DocOverAligned: NSObject {
-    ///         const NAME: &str = "ATermDocOverAligned";
-    ///         type Ivars = WideIvars;
-    ///
-    ///         @sel(ping)
-    ///         fn ping(&self) {}
-    ///     }
-    /// }
-    /// // SAFETY: never reached — the `const` assertion above rejects the
-    /// // over-aligned `Ivars` before this line can run.
-    /// let _ = DocOverAligned::alloc_init(
-    ///     unsafe { aterm_objc::MainThread::new_unchecked() },
-    ///     WideIvars(1),
-    /// );
-    /// ```
     pub fn add_rust_ivar<T>(&mut self) {
-        // `S4`: see the doc above.
         const {
             assert!(
                 align_of::<IvarSlot<T>>() <= 16,
@@ -301,9 +195,7 @@ impl ClassBuilder {
         debug_assert!(align.is_power_of_two());
         let align_log2 = u8::try_from(align.trailing_zeros()).expect("ivar alignment fits in u8");
         let encoding = CString::new(format!("[{size}c]")).expect("encoding has no interior NUL");
-        // SAFETY: `self.cls` is an allocated, unregistered pair (the only state
-        // where `class_addIvar` is legal); the strings are valid C strings the
-        // runtime copies; `size`/`align_log2` describe a real Rust type.
+        // SAFETY: `self.cls` is an allocated, unregistered pair (the only state where `class_addIvar` is legal); the strings are valid C strings the runtime copies; `size`/`align_log2` describe a real Rust type.
         let ok = unsafe {
             class_addIvar(
                 self.cls,
@@ -321,15 +213,11 @@ impl ClassBuilder {
     }
 
     /// Add a method implementation.
-    ///
     /// # Safety
-    /// `imp` must be an `extern "C"` function whose prototype is exactly
-    /// `(Id, Sel, ..args)` matching `types`, and it must not unwind. The
-    /// [`crate::declare_class!`] macro is what normally guarantees both.
+    /// `imp` must be an `extern "C"` function whose prototype is exactly `(Id, Sel, ..args)` matching `types`, and it must not unwind.
     pub unsafe fn add_method(&mut self, name: Sel, imp: *const c_void, types: &str) {
         let types = CString::new(types).expect("type encoding has no interior NUL");
-        // SAFETY: the caller pins `imp`'s prototype; `self.cls` is a live class
-        // pair and `name` a live selector. The runtime copies `types`.
+        // SAFETY: the caller pins `imp`'s prototype; `self.cls` is a live class pair and `name` a live selector.
         let ok = unsafe { class_addMethod(self.cls, name, imp, types.as_ptr()) };
         assert!(
             ok.as_bool(),
@@ -340,14 +228,9 @@ impl ClassBuilder {
     }
 
     /// Declare conformance to a protocol, by name.
-    ///
-    /// [`protocol_or_register`] supplies a name-only protocol when the host
-    /// framework does not register one, so launch never depends on it. Panics only
-    /// if `class_addProtocol` answers NO.
     pub fn add_protocol(&mut self, name: &'static CStr) {
         let proto = protocol_or_register(name);
-        // SAFETY: `self.cls` is a live class pair and `proto` a live, immortal
-        // protocol object — `protocol_or_register` never returns null.
+        // SAFETY: `self.cls` is a live class pair and `proto` a live, immortal protocol object — `protocol_or_register` never returns null.
         let ok = unsafe { class_addProtocol(self.cls, proto) };
         assert!(
             ok.as_bool(),
@@ -357,16 +240,11 @@ impl ClassBuilder {
     }
 
     /// Register the pair and resolve the ivar offset.
-    ///
-    /// The class is then live and immortal; `objc_disposeClassPair` is not
-    /// bound, since every class created here is a process-lifetime singleton.
     #[must_use]
     pub fn register(self) -> ClassMeta {
-        // SAFETY: `self.cls` is an allocated, unregistered pair; registering it
-        // is the documented terminal operation and makes the class usable.
+        // SAFETY: `self.cls` is an allocated, unregistered pair; registering it is the documented terminal operation and makes the class usable.
         unsafe { objc_registerClassPair(self.cls) };
-        // SAFETY: the class is registered, so its ivar table is final; the name
-        // is the one `add_rust_ivar` used.
+        // SAFETY: the class is registered, so its ivar table is final; the name is the one `add_rust_ivar` used.
         let ivar = unsafe { class_getInstanceVariable(self.cls, IVAR_NAME.as_ptr()) };
         assert!(
             !ivar.is_null(),
@@ -382,13 +260,11 @@ impl ClassBuilder {
     }
 }
 
-/// Resolve a superclass by name and start a builder, panicking with a message
-/// that names the class on the two failures that can happen.
+/// Resolve a superclass by name and start a builder, panicking with a message that names the class on the two failures that can happen.
 #[must_use]
 pub fn begin(superclass_name: &'static CStr, class_name: &'static CStr) -> ClassBuilder {
     let sup = class(superclass_name);
-    // SAFETY: `sup` came from `objc_getClass`, so it is an immortal class or
-    // null, and `ClassBuilder::new` asserts non-null before the runtime reads it.
+    // SAFETY: `sup` came from `objc_getClass`, so it is an immortal class or null, and `ClassBuilder::new` asserts non-null before the runtime reads it.
     unsafe { ClassBuilder::new(sup, class_name) }.unwrap_or_else(|| {
         panic!(
             "aterm-objc: objc_allocateClassPair({class_name:?}) returned nil — a \
@@ -397,13 +273,7 @@ pub fn begin(superclass_name: &'static CStr, class_name: &'static CStr) -> Class
     })
 }
 
-/// Build the `objc_super` a `[super …]` send needs from inside a method of
-/// `cls`.
-///
-/// `cls` must be the class that defines the sending method, not
-/// `object_getClass(this)`, which recurses forever once the class is
-/// subclassed.
-///
+/// Build the `objc_super` a `[super …]` send needs from inside a method of `cls`.
 /// # Safety
 /// `cls` must be a live class object and `this` a live instance of it.
 #[inline]
@@ -417,17 +287,12 @@ pub unsafe fn super_of(this: Id, cls: ClassPtr) -> crate::runtime::ObjcSuper {
 }
 
 /// The `[super dealloc]` every declared class owes.
-///
 /// # Safety
-/// `this` must be the instance currently being deallocated, and `cls` the class
-/// that defines the `dealloc` being run (so the send starts at its superclass).
+/// `this` must be the instance currently being deallocated, and `cls` the class that defines the `dealloc` being run (so the send starts at its superclass).
 pub unsafe fn send_super_dealloc(this: Id, cls: ClassPtr) {
-    // SAFETY: the caller pins `this` as the instance being deallocated and
-    // `cls` as the class defining that `dealloc`, so both are live.
+    // SAFETY: the caller pins `this` as the instance being deallocated and `cls` as the class defining that `dealloc`, so both are live.
     let sup = unsafe { super_of(this, cls) };
-    // SAFETY: the prototype is `-(void)dealloc`'s exact signature and the
-    // receiver slot holds a well-formed `objc_super`. Every class created here
-    // descends from `NSObject`, which implements `dealloc`.
+    // SAFETY: the prototype is `-(void)dealloc`'s exact signature and the receiver slot holds a well-formed `objc_super`.
     unsafe {
         let f: unsafe extern "C-unwind" fn(*const crate::runtime::ObjcSuper, Sel) =
             crate::runtime::msg_super();
@@ -436,10 +301,6 @@ pub unsafe fn send_super_dealloc(this: Id, cls: ClassPtr) {
 }
 
 /// Abort the process after a Rust panic reached an `extern "C"` boundary.
-///
-/// Writes straight to stderr and ignores the result: `eprintln!` panics on a
-/// closed or full stderr (normal for a GUI app), and a panic here would unwind
-/// out of the frame this exists to protect.
 #[cold]
 #[inline(never)]
 pub fn abort_on_unwind(method: &str) -> ! {

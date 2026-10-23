@@ -1,84 +1,8 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! THE SESSION JOURNAL (`docs/DESIGN-session-log-2026-10-15.md` §5.3, §5.4;
-//! phase 2B): every session's log, appended to disk by one thread,
-//! `aterm-session-log`, so `log @<sid>` and `brief @<sid>` answer for a
-//! session from an earlier run or a crash (`session_log_journal_read`).
-//!
-//! ON BY DEFAULT (D3, ruled 2026-10-19): the journal
-//! follows the desk ([`gate`]: `restore_session` and `Desk::kept`, whose lab
-//! seam gives a private headless instance a window's desk), on macOS and
-//! Linux. `[session_log] journal = false` is the opt-out: then,
-//! as headless, with `restore_session` off and on Windows, [`Lane::new`]
-//! makes an inert lane: no directory, no file, no thread, no wake installed
-//! in any log, no read, no deletion, on every path. No data migration: an
-//! older build after a downgrade neither writes nor prunes the folder.
-//!
-//! THE WRITER pulls. A producer's append does no I/O and touches no channel:
-//! the log rings the lane's [`aterm_slog::Notify`] (inside the
-//! log, so no producer path bypasses it), one relaxed swap and at most one
-//! unpark per writer pass. The thread parks while clean (an idle machine arms
-//! nothing), coalesces wakes to one pass per [`COALESCE`], and ticks once a
-//! second only while a retry is owed. A pass:
-//! 1. takes the store's write lock with `try_write`, clones live timelines
-//!    and moves the bounded retirement handoff out atomically (a session
-//!    that retired before its first snapshot is included);
-//! 2. for each track takes its timeline with `try_lock` (busy: skipped and
-//!    owed), copies at most [`BATCH_RECORDS`] records past its cursor
-//!    (`aterm_slog::journal::take`), and lets go: the lock is held for the
-//!    copy only, never across I/O;
-//! 3. encodes the lines (`journal::take_frames`: a snap restating the open
-//!    path first in each segment and after any loss) and appends them in one
-//!    `write(2)`.
-//!
-//! Every process writes only its own fresh files: segments
-//! `<inst>.<n>.slog` created exclusive, 0600, rotated at
-//! `journal::SEGMENT_BYTES` (a pass stops adding lines at that size, so no
-//! segment passes it by more than one take's lines, and every segment is one
-//! a reader reads). A segment's `#seg` header goes out with its first lines,
-//! in the same `write(2)`. After a short or failed write the segment is
-//! abandoned, never repaired: the cursors of lines not wholly written stay,
-//! and the next pass writes them into a new segment (a reader drops the torn
-//! tail). The instance's liveness is its `<inst>.lock`, taken before any
-//! segment and held for the journal's life; no `flock`, no
-//! journal. Retention runs at start and at each rotation, under
-//! `prune.lock`, removing eligible inactive files toward
-//! `journal::BUDGET_BYTES` and `journal::FILES_MAX`. Live or locked files
-//! can keep the directory above those targets.
-//!
-//! ERRORS. EINTR is retried (at most three times); EINTR past that and
-//! EAGAIN wrote nothing, so the segment is kept and the pass retried at the
-//! next tick, and [`TRANSIENT_TO_BACKOFF`] of them in a row back off as EIO
-//! does (no new file for any of it); a full disk (ENOSPC, EDQUOT, a short
-//! write, or free space under [`FREE_FLOOR`]) backs off 30 s doubling to
-//! 10 min; EIO backs off, and stops the journal after three in a row;
-//! anything else (EACCES, EPERM, EROFS, a symlinked or foreign directory, a
-//! caught panic) stops it. None of it touches a shell: the worst a disk does
-//! is stop the journal. Each is a fact for later (`exceptions::Entry`, never
-//! an alert).
-//!
-//! THE RING AND THE WRITER. Each take tells its log how far the writer has
-//! read (`Log::note_journaled`), so a ring past its bounds evicts what the
-//! journal already holds before what it has not reached: a burst between two
-//! coalesced passes loses nothing the writer could still write.
-//!
-//! ACROSS AN UPDATE the outgoing process drains each fenced log
-//! to its carry's fence and ends its chain with `#handed fence=<H>` per
-//! session and `#fin why=handoff`; the Commit never waits on it. The
-//! successor is ARMED until its Commit lands: it writes nothing, takes no
-//! lock and lists nothing before, and a candidate that never commits writes
-//! nothing on any exit path. Its journal then starts each carried session
-//! after the carried head (`SessionLog::journal_start`).
-//!
-//! A CLEAN QUIT drains, writes each open session's `out=app-quit`
-//! closes (each stamped by its own session's clock, so each says how long it
-//! lived) and `#fin why=quit`, within [`QUIT_BUDGET`] on the writer thread,
-//! only once every session is journaled to its log's head; the exit never
-//! waits past it, and a missed deadline or an unfinished drain writes
-//! neither and reads as a crash. A
-//! writer backing off from a full disk tries once more at the quit; a
-//! stopped one writes nothing, and its chain reads as a crash.
+//! Persistent session log journal writer ([`gate`], [`Lane::new`], [`aterm_slog::Notify`],
+//! [`COALESCE`], [`BATCH_RECORDS`], [`TRANSIENT_TO_BACKOFF`], [`FREE_FLOOR`], [`QUIT_BUDGET`]).
 
 use std::collections::{BTreeMap, VecDeque};
 use std::io;
@@ -107,8 +31,6 @@ mod tests;
 use fs::{Appender, Held, JournalFs};
 
 /// The errnos the journal tells apart (module docs). A target without POSIX
-/// errnos (Windows) gets values no raw OS error carries, so there only the
-/// `io::ErrorKind` arms and the defaults decide.
 #[cfg(unix)]
 mod errno {
     pub(super) use libc::{EAGAIN, EDQUOT, EINTR, EIO, ENOLCK, ENOSPC, ENOTSUP, EWOULDBLOCK};
@@ -127,8 +49,7 @@ mod errno {
 
 /// The most records one take copies under a timeline's lock.
 pub(crate) const BATCH_RECORDS: usize = 512;
-/// A pass stops reading live sessions past this many bytes (and owes the
-/// rest); a closed session's lines are written whatever the size.
+/// A pass stops reading live sessions past this many bytes (and owes the rest).
 pub(crate) const PASS_BYTES: usize = 1 << 20;
 /// Wakes closer than this coalesce into one pass.
 pub(crate) const COALESCE: Duration = Duration::from_millis(250);
@@ -138,25 +59,18 @@ pub(crate) const RETRY_TICK: Duration = Duration::from_secs(1);
 pub(crate) const BACKOFF_FIRST: Duration = Duration::from_secs(30);
 /// See [`BACKOFF_FIRST`].
 pub(crate) const BACKOFF_MAX: Duration = Duration::from_secs(600);
-/// The most retired sessions held unwritten (backstop): past it
-/// the oldest gives up its timeline and keeps only what its `#gap
-/// why=dropped` says, until that is written.
+/// The most retired sessions held unwritten.
 pub(crate) const RETIRED_MAX: usize = 4096;
-/// The most sessions held only to say their loss (a few hundred bytes each,
-/// while a disk refuses every write); past it the oldest is forgotten,
-/// counted.
+/// The most sessions held only to say their loss.
 pub(crate) const DROPPED_MAX: usize = 1 << 16;
-/// Transient write errors in a row (EAGAIN, EINTR past its retries) before
-/// the writer backs off.
+/// Transient write errors in a row (EAGAIN, EINTR past its retries) before backoff.
 pub(crate) const TRANSIENT_TO_BACKOFF: u32 = 3;
-/// A volume with less free than this pauses the journal before ENOSPC does.
+/// A volume with less free than this pauses the journal before ENOSPC.
 pub(crate) const FREE_FLOOR: u64 = 1 << 30;
 /// What a clean quit may spend on the journal's last lines.
 pub(crate) const QUIT_BUDGET: Duration = Duration::from_millis(500);
 const EINTR_RETRIES: u32 = 3;
-/// The most passes a quit's drain runs, beside its deadline: a drain that
-/// only ever restates (a segment filled by snaps alone) ends too, unfinished,
-/// so it writes no closes and no `#fin` and reads as the crash it was.
+/// The most passes a quit's drain runs, beside its deadline.
 pub(crate) const FINISH_PASSES: usize = 64;
 const EEXIST_RETRIES: u32 = 16;
 const IO_ERRORS_TO_STOP: u32 = 3;
@@ -203,7 +117,7 @@ pub(crate) fn eligibility(
     }
 }
 
-/// Read once at launch; changing the switch does not stop an existing writer.
+/// Read once at launch.
 pub(crate) fn gate(config: &crate::app_config::Config, desk: crate::desk::Desk) -> bool {
     eligibility(
         config.session_log_journal(),
@@ -214,8 +128,6 @@ pub(crate) fn gate(config: &crate::app_config::Config, desk: crate::desk::Desk) 
     .is_none()
 }
 
-// ---- the wake and the lane's shared state ----------------------------
-
 /// The writer's wake: a dirty flag and the writer's thread.
 #[derive(Default)]
 pub(crate) struct Wake {
@@ -224,8 +136,7 @@ pub(crate) struct Wake {
 }
 
 impl Wake {
-    /// A record was appended or evicted: mark the journal dirty and, the
-    /// first time since the writer last looked, unpark it.
+    /// A record was appended or evicted.
     pub(crate) fn ring(&self) {
         if !self.dirty.swap(true, Ordering::AcqRel)
             && let Some(t) = self.thread.get()
@@ -257,10 +168,9 @@ pub(crate) enum Cause {
     Full,
     /// The disk failed a write.
     Io,
-    /// The directory or a file was refused (permission, a symlink, a
-    /// foreign owner, a read-only volume).
+    /// The directory or a file was refused.
     Denied,
-    /// The filesystem takes no `flock`: liveness cannot be told.
+    /// The filesystem takes no `flock`.
     Unsupported,
     /// The writer panicked.
     Panic,
@@ -305,7 +215,7 @@ impl Cause {
     }
 }
 
-/// The writer's counters and its word for the UI thread: atomics only.
+/// The writer's counters and its word for the UI thread.
 #[derive(Default)]
 pub(crate) struct Report {
     pub(crate) lines: AtomicU64,
@@ -319,11 +229,9 @@ pub(crate) struct Report {
     pub(crate) err_denied: AtomicU64,
     pub(crate) err_transient: AtomicU64,
     pub(crate) dropped: AtomicU64,
-    /// Conservative retirement handoff overflow, counted before checking whether
-    /// an existing writer track already holds stronger data. Not an exact count
-    /// of lost sessions or records.
+    /// Conservative retirement handoff overflow.
     pub(crate) forgotten: AtomicU64,
-    /// 0 none, 1 paused, 2 stopped; the cause's code in the high nibble.
+    /// 0 none, 1 paused, 2 stopped.
     attention: AtomicU8,
     attention_gen: AtomicU32,
 }
@@ -381,8 +289,7 @@ struct Shared {
     report: Arc<Report>,
     ack: Mutex<Option<std::sync::mpsc::SyncSender<()>>>,
     finish_budget_ms: AtomicU64,
-    /// The armed lane's passes that found no Commit and parked: how a test
-    /// knows the lane chose to wait, not merely that it has yet to run.
+    /// The armed lane's passes that found no Commit and parked.
     #[cfg(test)]
     armed_waits: AtomicU64,
 }
@@ -426,14 +333,12 @@ impl Shared {
 /// This process's lane, once a journal-keeping launch made one.
 static LANE: OnceLock<Arc<Shared>> = OnceLock::new();
 
-/// The wake a new session log installs ([`aterm_slog::Log::set_notify`]):
-/// `None` while this process keeps no journal, so a log rings nothing.
+/// The wake a new session log installs ([`aterm_slog::Log::set_notify`]).
 pub(crate) fn notify() -> Option<aterm_slog::Notify> {
     LANE.get().map(|s| s.notify.clone())
 }
 
-/// The successor's Commit landed: an armed lane starts (the commit waiter's
-/// `release_committed_readers`).
+/// The successor's Commit landed.
 #[cfg(unix)]
 pub(crate) fn commit_landed() {
     if let Some(s) = LANE.get() {
@@ -441,8 +346,7 @@ pub(crate) fn commit_landed() {
     }
 }
 
-/// The handoff worker fenced every carried log: the writer drains each to
-/// its fence and ends its chain `#handed`.
+/// The handoff worker fenced every carried log.
 #[cfg(any(unix, test))]
 pub(crate) fn note_handing() {
     if let Some(s) = LANE.get() {
@@ -458,17 +362,14 @@ pub(crate) fn note_stood_down() {
     }
 }
 
-/// Whether this process's journal is writing (or retrying), so a carried
-/// session's records up to its fence will be on disk: what the carry's
-/// `journal v=1` host line says to the successor.
+/// Whether this process's journal is writing (or retrying).
 #[cfg(any(unix, test))]
 pub(crate) fn journals_to_fence() -> bool {
     LANE.get()
         .is_some_and(|s| matches!(s.phase(), Phase::Running | Phase::Backoff))
 }
 
-/// A memory-only observation. Running says the writer is active, not that every
-/// dirty record has already reached disk.
+/// A memory-only observation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Status {
     pub(crate) phase: Option<Phase>,
@@ -484,8 +385,7 @@ pub(crate) struct Lane {
 }
 
 impl Lane {
-    /// A lane that does nothing: `journal = false`, headless,
-    /// `restore_session` off, Windows.
+    /// A lane that does nothing.
     pub(crate) fn inert() -> Lane {
         Lane {
             shared: None,
@@ -495,11 +395,7 @@ impl Lane {
         }
     }
 
-    /// This launch's lane: inert unless `logs` names the logs directory (the
-    /// [`gate`] passed). On, it publishes the wake every session log made
-    /// from now on installs, and the reader, before any session exists; it
-    /// touches no file until [`Lane::start`]'s thread runs, and an `armed`
-    /// lane (an update's candidate) none before its Commit.
+    /// This launch's lane: inert unless `logs` names the logs directory (the [`gate`] passed).
     pub(crate) fn new(logs: Option<PathBuf>, armed: bool) -> Lane {
         let Some(logs) = logs else {
             return Lane::inert();
@@ -518,8 +414,7 @@ impl Lane {
         }
     }
 
-    /// Start the writer thread over `store`'s sessions. A spawn failure
-    /// leaves the lane stopped.
+    /// Start the writer thread over `store`'s sessions.
     pub(crate) fn start(&mut self, store: crate::session_store::Store) {
         self.start_with(store, |writer| {
             std::thread::Builder::new()
@@ -546,8 +441,6 @@ impl Lane {
             shared.phase.store(Phase::Stopped as u8, Ordering::Release);
             return;
         };
-        // Arm before spawning and before the first session registration.
-        // The guard moves into the closure; a failed spawn drops it here.
         let retirement = RetirementLease::arm(Arc::clone(&store), shared.notify.clone());
         let armed = self.armed;
         let worker_shared = Arc::clone(&shared);
@@ -570,9 +463,7 @@ impl Lane {
         }
     }
 
-    /// THE QUIT: ask the writer for its last lines and wait at
-    /// most `budget` for them. An armed, stopped or inert lane answers at
-    /// once, having written nothing.
+    /// The quit: ask the writer for its last lines and wait at most `budget` for them.
     pub(crate) fn finish_at_quit(&self, budget: Duration) {
         let Some(shared) = &self.shared else {
             return;
@@ -628,7 +519,6 @@ fn run(
     let mut writer: Option<Writer<crate::session_store::Store>> = None;
     let mut last_pass: Option<Instant> = None;
     let mut store = Some(store);
-    // The first pass restates every session, dirty or not.
     shared.wake.ring();
     loop {
         let req = shared.req.swap(0, Ordering::AcqRel);
@@ -712,8 +602,6 @@ fn run(
 }
 
 /// The directory a running lane writes, or a stand-in that refuses
-/// everything (a symlinked, foreign or unreadable one stops the journal at
-/// its first step).
 fn open_dir(logs: &std::path::Path) -> Arc<dyn JournalFs> {
     #[cfg(unix)]
     match fs::PinnedJournalFs::open(logs, true) {
@@ -770,7 +658,6 @@ impl JournalFs for Refused {
 }
 
 /// Run one writer step; a panic stops the journal (its attention raised),
-/// and the producers go on appending.
 fn guarded<T: Targets>(w: &mut Writer<T>, f: impl FnOnce(&mut Writer<T>)) {
     let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(w)));
     if caught.is_err() {
@@ -778,8 +665,6 @@ fn guarded<T: Targets>(w: &mut Writer<T>, f: impl FnOnce(&mut Writer<T>)) {
         w.stop(Cause::Panic);
     }
 }
-
-// ---- the writer -------------------------------------------------------
 
 /// The writer's clock: monotonic for its own waits, wall for the lines.
 pub(crate) trait Clock: Send + Sync {
@@ -830,9 +715,7 @@ enum RetiredTarget {
     Dropped(ShortId, Weak<Mutex<SessionTimeline>>, Box<Dropped>),
 }
 
-/// A bounded handoff at the actual deregistration funnel. Full timelines
-/// and compact losses have separate caps, as the writer's backstop does.
-/// These are additional staging caps, not a global RETIRED_MAX heap bound.
+/// A bounded handoff at the actual deregistration funnel.
 pub(crate) struct Retirements {
     owner: Arc<()>,
     wake: Option<aterm_slog::Notify>,
@@ -868,8 +751,7 @@ impl Retirements {
         Arc::ptr_eq(&self.owner, owner)
     }
 
-    /// Called while the CURRENT timeline's existing close lock stands.
-    /// Overflow never locks another timeline or copies a record batch.
+    /// Called while the current timeline's existing close lock stands.
     pub(crate) fn retire(
         &mut self,
         sid: &aterm_session::SessionId,
@@ -901,7 +783,6 @@ impl Retirements {
                     .push_back((sid, Arc::downgrade(timeline), dropped));
             }
         }
-        // An idempotent close need not append; enqueuing itself must wake.
         if let Some(wake) = &self.wake {
             wake.ring();
         }
@@ -921,7 +802,6 @@ impl Retirements {
 }
 
 /// Caller-owned before spawn, worker-owned afterward. The owner token
-/// prevents a late old guard from disarming a newer writer on that store.
 struct RetirementLease {
     store: crate::session_store::Store,
     owner: Arc<()>,
@@ -952,7 +832,7 @@ fn release_retirements(store: &crate::session_store::Store, owner: &Arc<()>) {
     drop(retired);
 }
 
-/// Where the writer finds the sessions. One writer owns a target source.
+/// Where the writer finds the sessions.
 pub(crate) trait Targets: Send {
     fn begin_targets(&self, _retired_max: usize) -> Option<Arc<()>> {
         None
@@ -960,7 +840,7 @@ pub(crate) trait Targets: Send {
     fn end_targets(&self, _owner: &Arc<()>) {}
     /// The live+retired snapshot, or None while the registry is busy.
     fn try_targets(&self) -> Option<TargetSnapshot>;
-    /// True also while its lock is busy: no final marker over unseen work.
+    /// True also while its lock is busy.
     fn pending_targets(&self) -> bool {
         false
     }
@@ -1036,30 +916,27 @@ struct Track {
     sid: ShortId,
     /// Its timeline; `None` once the backstop let it go ([`Track::dropped`]).
     timeline: Option<Arc<Mutex<SessionTimeline>>>,
-    /// Still in the store; `false`: retired, kept until its close is written.
+    /// Still in the store.
     in_store: bool,
     /// When it retired (order for the backstop).
     retired: u64,
-    /// The last seq journaled (or accounted); `None` until first taken.
+    /// The last seq journaled (or accounted).
     cursor: Option<u64>,
-    /// The seq space it was last written in: (base, ep).
+    /// The seq space it was last written from.
     space: Option<(u32, u32)>,
-    /// The segment its snap was written in.
+    /// The segment its snap was written to.
     snapped: Option<u32>,
-    /// Its session's close is written: nothing more to say.
+    /// Its session's close is written.
     done: bool,
     /// Its `#handed` is written (an update's drain).
     handed: bool,
     /// The fence its log stood at when last taken.
     fence: Option<u64>,
-    /// Let go by the backstop: what its `#gap why=dropped`
-    /// says, kept until that is written whole.
+    /// Let go by the backstop.
     dropped: Option<Box<Dropped>>,
 }
 
 /// A session the backstop let go: a probe of its log when it went (its
-/// space, the open path), the seq it had reached and how many it held past
-/// the writer's cursor.
 struct Dropped {
     take: journal::Take,
     through: u64,
@@ -1092,8 +969,7 @@ struct LineMark {
     fence: Option<u64>,
 }
 
-/// THE WRITER: one per process, on the `aterm-session-log` thread (tests
-/// drive it directly, with an injected clock and directory).
+/// The writer: one per process, on the `aterm-session-log` thread.
 pub(crate) struct Writer<T: Targets> {
     fs: Arc<dyn JournalFs>,
     targets: T,
@@ -1159,8 +1035,7 @@ impl<T: Targets> Writer<T> {
         }
     }
 
-    /// THE START: this instance's lock, before any segment, then
-    /// retention. Without the lock there is no journal.
+    /// The start: this instance's lock, before any segment, then retention.
     pub(crate) fn start(&mut self) {
         match self.fs.lock_instance(&self.inst) {
             Ok(held) => self.lock = Some(held),
@@ -1206,9 +1081,7 @@ impl<T: Targets> Writer<T> {
         }
     }
 
-    /// Stop the journal for this run: no more lines, no session held. The
-    /// instance lock stays held, so a reader never reads this live process
-    /// as a crash.
+    /// Stop the journal for this run.
     pub(crate) fn stop(&mut self, cause: Cause) {
         if !matches!(self.state, State::Stopped) {
             aterm_log::warn!("session journal stopped: {}", cause.word());
@@ -1256,8 +1129,6 @@ impl<T: Targets> Writer<T> {
                 }
             }
             Some(e) if is_transient(e) => {
-                // Nothing was written: the segment is kept, and the pass is
-                // retried at the next tick, until too many in a row.
                 Report::bump(&self.report.err_transient, 1);
                 self.owed = true;
                 self.transient += 1;
@@ -1277,11 +1148,7 @@ impl<T: Targets> Writer<T> {
         self.handing = true;
     }
 
-    /// The update stood down. Every session restates itself on the next
-    /// pass (a snap voids the `#handed` of an update that did not happen,
-    /// however far its drain got), and a chain whose drain was whole goes on
-    /// in a new segment, so its newest segment never holds that update's
-    /// `#fin`.
+    /// Stand down the update and resume in a new segment.
     pub(crate) fn stood_down(&mut self) {
         let was = self.handing || self.handed_done || self.tracks.values().any(|t| t.handed);
         self.handing = false;
@@ -1298,15 +1165,12 @@ impl<T: Targets> Writer<T> {
     }
 
     /// Merge the store's sessions into the tracks: a new one starts, one
-    /// that left retires (its timeline kept until its close is written).
     fn refresh(&mut self) {
         let Some(targets) = self.targets.try_targets() else {
             self.owed = true;
             return;
         };
         Report::bump(&self.report.forgotten, targets.forgotten);
-        // Import retirements first: an actually live replacement timeline in
-        // the same snapshot retains the existing live-replacement precedence.
         for retired in targets.retired {
             self.import_retired(retired);
         }
@@ -1355,7 +1219,6 @@ impl<T: Targets> Writer<T> {
     }
 
     /// Keep the stronger existing cursor/Arc when the queued packet names
-    /// that exact timeline; a compact fallback must not re-count its records.
     fn import_retired(&mut self, retired: RetiredTarget) {
         let (sid, timeline, dropped) = match retired {
             RetiredTarget::Timeline(sid, timeline) => (sid, Some(timeline), None),
@@ -1416,8 +1279,6 @@ impl<T: Targets> Writer<T> {
     }
 
     /// A new segment: the old one flushed, the volume's room checked, the
-    /// next number created exclusive, its header written, every session to
-    /// restate itself, then retention.
     fn rotate(&mut self) -> bool {
         if let Some(mut old) = self.seg.take() {
             let _ = old.file.sync();
@@ -1473,7 +1334,6 @@ impl<T: Targets> Writer<T> {
     }
 
     /// Whether the volume has room: checked at each rotation and once a
-    /// minute; under [`FREE_FLOOR`] the journal pauses before ENOSPC.
     fn room(&mut self) -> bool {
         let now = self.clock.mono();
         if self
@@ -1493,7 +1353,7 @@ impl<T: Targets> Writer<T> {
         }
     }
 
-    /// ONE PASS (module docs). Returns the bytes written.
+    /// One pass (module docs).
     pub(crate) fn pass(&mut self) -> usize {
         match self.state {
             State::Stopped => return 0,
@@ -1533,9 +1393,6 @@ impl<T: Targets> Writer<T> {
     }
 
     /// The pass's lines: retired tracks first (exempt from the pass's byte
-    /// bound), then the live ones; no track's lines once the
-    /// segment (`size` so far) would pass its rotation size, so a segment is
-    /// never more than one take's lines past it.
     fn batch(&mut self, n: u32, size: u64) -> (Vec<u8>, Vec<LineMark>) {
         let mut buf: Vec<u8> = Vec::new();
         let mut marks: Vec<LineMark> = Vec::new();
@@ -1570,7 +1427,6 @@ impl<T: Targets> Writer<T> {
                         wall,
                     );
                     if frames.is_empty() {
-                        // Nothing left to say: let go.
                         t.done = true;
                         continue;
                     }
@@ -1603,7 +1459,6 @@ impl<T: Targets> Writer<T> {
                 }
                 Err(TryLockError::Poisoned(p)) => p.into_inner(),
             };
-            // A log made before the lane published its wake gets it now.
             if guard.slog().log().notify().is_none()
                 && let Some(wake) = notify()
             {
@@ -1616,15 +1471,12 @@ impl<T: Targets> Writer<T> {
             let log = guard.slog().log();
             let space = (log.base_ep(), log.ep());
             if t.space.is_some_and(|(base, _)| base != space.0) {
-                // The log was replaced (a new seq space): from its start.
                 t.cursor = Some(0);
                 t.snapped = None;
             }
             let cursor = *t.cursor.get_or_insert(start.unwrap_or(0));
             let snap = t.snapped != Some(n) || t.space.is_some_and(|s| s != space);
             let take = journal::take(log, cursor, self.limits.batch, snap);
-            // The ring evicts what the writer holds before what it has not
-            // reached.
             guard
                 .slog_mut()
                 .log_mut_for_journal()
@@ -1642,7 +1494,6 @@ impl<T: Targets> Writer<T> {
                 handed = true;
             }
             if frames.is_empty() {
-                // A closed session with nothing left to write is done.
                 t.done |= take.done;
                 continue;
             }
@@ -1670,8 +1521,6 @@ impl<T: Targets> Writer<T> {
     }
 
     /// Write `buf` in one `write(2)` (EINTR retried): every mark whose lines
-    /// are wholly on disk moves its track's cursor; after a short or failed
-    /// write the segment is abandoned, never repaired.
     fn write(&mut self, buf: &[u8], marks: &[LineMark]) -> usize {
         if buf.is_empty() {
             return 0;
@@ -1679,7 +1528,6 @@ impl<T: Targets> Writer<T> {
         let Some(seg) = self.seg.as_mut() else {
             return 0;
         };
-        // A new segment's header goes out with its first lines, in one write.
         let head = seg.header.as_ref().map_or(0, Vec::len);
         let result = match &seg.header {
             Some(h) => {
@@ -1698,7 +1546,6 @@ impl<T: Targets> Writer<T> {
         if head > 0 && landed >= head {
             seg.header = None;
         }
-        // The lines' bytes on disk, the header's not counted.
         let wrote = landed.saturating_sub(head);
         for m in marks.iter().filter(|m| m.end <= wrote) {
             if let Some(t) = self.tracks.get_mut(&m.key) {
@@ -1728,7 +1575,6 @@ impl<T: Targets> Writer<T> {
                 }
             }
             Ok(_) => {
-                // A short write: the disk is full. Abandon the segment.
                 self.seg = None;
                 Report::bump(&self.report.err_full, 1);
                 self.backoff(Cause::Full);
@@ -1745,11 +1591,6 @@ impl<T: Targets> Writer<T> {
     }
 
     /// Let go of retired tracks whose close is written (or whose loss is).
-    /// Past the backstop the oldest retired session gives up its
-    /// timeline and keeps only what its `#gap why=dropped` says, written by
-    /// the next pass (a snap first, in its space) and only then forgotten:
-    /// no session is let go unsaid. Past [`DROPPED_MAX`] of those, the
-    /// oldest is forgotten, counted.
     fn drop_finished(&mut self) {
         self.tracks.retain(|_, t| t.in_store || !t.done);
         let mut retired: Vec<(u64, String)> = self
@@ -1769,7 +1610,6 @@ impl<T: Targets> Writer<T> {
                     continue;
                 };
                 let Ok(guard) = timeline.try_lock() else {
-                    // Busy: let go on a later pass.
                     self.owed = true;
                     continue;
                 };
@@ -1809,7 +1649,6 @@ impl<T: Targets> Writer<T> {
     }
 
     /// The update's drain is whole when every fenced session is `#handed`:
-    /// then the chain's trailer, and nothing more.
     fn maybe_hand_off(&mut self) {
         if self.owed || !self.saw_all {
             return;
@@ -1840,15 +1679,7 @@ impl<T: Targets> Writer<T> {
         }
     }
 
-    /// THE QUIT: drain until a pass has nothing left and every
-    /// session is wholly journaled ([`Writer::quit_lines`]), then each open
-    /// session's closes and `#fin why=quit`, all before `deadline` on this
-    /// writer's clock and within [`FINISH_PASSES`]. Anything cut short, the
-    /// drain unfinished included, writes no closes and no `#fin`: a reader
-    /// then reads a crash after what the chain holds, which is what it was,
-    /// never a clean end over records it never held. A writer backing off (a
-    /// full disk) tries once more, now: the disk may have room again. A
-    /// stopped one writes nothing, and its chain reads as a crash.
+    /// The quit: drain until a pass has nothing left and every session is wholly journaled.
     pub(crate) fn finish(&mut self, deadline: Duration) {
         if matches!(self.state, State::Backoff { .. }) {
             self.state = State::Running;
@@ -1866,8 +1697,6 @@ impl<T: Targets> Writer<T> {
                 return;
             }
             if wrote == 0 && !self.owed {
-                // Behind again (a producer appended, a lock was busy): one
-                // more pass.
                 last = self.quit_lines();
                 if last.is_some() {
                     break;
@@ -1900,12 +1729,6 @@ impl<T: Targets> Writer<T> {
     }
 
     /// The quit's closes, only while every session is wholly journaled: each
-    /// track not done holds its timeline, its cursor at its log's head in the
-    /// space it last wrote, and its snap in this segment (so a reader places
-    /// the closes); a retired session not done (its close or its loss not yet
-    /// written) is behind too. `None` when one is behind or busy: closes and
-    /// `#fin` now would end the chain over records it never held, read then
-    /// as pruned ranges or not at all.
     fn quit_lines(&self) -> Option<Vec<u8>> {
         if self.targets.pending_targets() {
             return None;
@@ -1925,8 +1748,6 @@ impl<T: Targets> Writer<T> {
             if !whole {
                 return None;
             }
-            // On the session's own clock, so each close measures how long
-            // its node lived.
             let closes = log.quit_closes(guard.slog().now());
             drop(guard);
             for rec in closes {
@@ -1943,17 +1764,7 @@ impl<T: Targets> Writer<T> {
         Some(buf)
     }
 
-    /// RETENTION, under `prune.lock` (busy: skipped this time):
-    /// only private files of the exact segment pattern count; the oldest are
-    /// removed, through the pinned directory, until the journal's own files
-    /// are within the byte budget AND the count budget
-    /// (`journal::FILES_MAX`: segments and lock files, so however small its
-    /// segments, one listing sees the whole journal): never a segment of
-    /// another live instance, and of this writer's own only those it has
-    /// rotated past; a vanished file counts as freed. The lock files of dead
-    /// instances with no segment left go too. The directory is visited in
-    /// one streaming pass of at most `journal::RETENTION_SCAN_MAX` names,
-    /// holding only the journal's own.
+    /// Retention, under `prune.lock` (busy: skipped this time).
     pub(crate) fn retention(&mut self) {
         let Ok(Some(_prune)) = self.fs.try_prune_lock() else {
             return;
@@ -2000,9 +1811,6 @@ impl<T: Targets> Writer<T> {
             if total <= self.limits.budget_bytes && count <= self.limits.files_max {
                 break;
             }
-            // Never another live instance's segment; of its own, this writer
-            // removes only the ones it has rotated past (a process that runs
-            // for weeks stays within the budget too).
             let mine = *inst == self.inst;
             if (mine && current == Some(*n)) || (!mine && live.get(inst).copied().unwrap_or(true)) {
                 continue;
@@ -2023,7 +1831,6 @@ impl<T: Targets> Writer<T> {
                 *k = k.saturating_sub(1);
                 *k
             });
-            // A dead instance's last segment gone: its lock file goes too.
             if now_left == 0
                 && !mine
                 && let Some(lock) = lock_of.get(inst)
@@ -2081,9 +1888,7 @@ fn write_all_once(file: &mut dyn Appender, bytes: &[u8]) -> io::Result<usize> {
 }
 
 impl crate::App {
-    /// The journal writer's word for the owner, read once per memory sweep
-    /// turn: a pause or a stop posts its `exceptions::Entry` (never an
-    /// on-screen alert); a resume clears it.
+    /// The journal writer's word for the owner, read once per memory sweep turn.
     pub(crate) fn poll_session_journal(&mut self) {
         let Some((changes, attention)) = self.session_log_journal.attention() else {
             return;

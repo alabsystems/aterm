@@ -1,41 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE BUS MIRROR, BRIDGE HALF, its pure parts (`docs/DESIGN-session-log-2026-10-15.md`
-//! §5.5): the `[fabric] log` mode, a take's slots as the
-//! endpoint frames them, the PIN that holds one batch across a crash, the
-//! landing line and its answer, the rate bucket and the node's alias key
-//! (minted once, kept durably in `logkey` and copied into the pin,
-//! [`Pin::key`]). The bridge's wiring (`bridge_mirror.rs`) does the I/O.
-//!
-//! WHAT OUTLIVES A REBOOT HAS A DURABLE COPY. The pin is atomic only, so a
-//! power cut may roll it back or tear it, and two things in it no reboot ends:
-//! the alias key and the node's lifetime total. The
-//! key is written durably to `logkey` before the first take that names it, so
-//! no alias derived from it reaches the bus before it is on the media; the
-//! total has a durable FLOOR, `logfloor`, raised by [`FLOOR_LEASE_BYTES`] past
-//! a batch's bytes before any byte of the batch is sent, so it is at or above
-//! every byte the node ever mirrored. A pin a power cut tore is then set aside
-//! like any torn file, a whole one written from the copies in its place, and
-//! the mirror resumes at the same key with the floor as its total: no second
-//! alias, never a total below what was counted (`StateDir::reconcile_logpin`).
-//! The copies hold only while no build that keeps neither writes the pin, so
-//! this build's pins are of a version an older build refuses ([`Pin`]'s
-//! `v=2`). A recovered `v=1` pin is replaced durably by `v=2` before any
-//! copies are made or recovered slot sent, even while its landing is owed.
-//!
-//! ONE BATCH IN FLIGHT. A take (`log-take`) is pinned before a byte of it is
-//! sent: each slot gets a producer sequence from the bridge's reserved block,
-//! and the pin (`logpin`, 0600, replaced atomically) names each slot's
-//! sequence, session, cursor and body. A bridge killed at any point after the
-//! pin republishes exactly the pinned bytes at exactly the pinned sequences,
-//! which the broker answers with the original offsets, and a deduped answer
-//! is read back and compared before it counts: a foreign record
-//! at a pinned sequence is a collision, never a landing. Only when every slot
-//! is on the bus does the bridge say `log-landed`, and only once every
-//! session has answered for its pairs is the pin emptied. Readers dedupe by
-//! the body's `(node, sid, ep, seq)`, so what the pin buys is a
-//! duplicate-free bus in the ordinary case, not a correctness claim.
+//! Pure bridge-half bus mirror types: `[fabric] log` modes, take/pin slots, landing replies, and rate bucket.
 
 use std::fmt::Write as _;
 
@@ -44,20 +10,12 @@ use aterm_slog::BusCursor;
 /// `[fabric] log`: whether the bridge mirrors the session logs.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum LogMode {
-    /// THE DEFAULT (owner decision D4): the
-    /// bus class is mirrored while the broker RETAINS it, its `Hello`
-    /// advertising a prefix rule over this node's `ev` faces
-    /// ([`crate::broker_rules::retains_ev`]), as `aterm link broker` does by
-    /// default. Over any other broker nothing is asked, taken or published,
-    /// and `fabric status` says `mirror=unretained`.
+    /// Mirror the bus class while the broker retains this node's `ev` faces (`[fabric] log = "auto"`).
     #[default]
     Auto,
-    /// `[fabric] log = "off"`, the opt-out: nothing is asked, taken, pinned
-    /// or published; the bridge's lanes carry the bytes they did.
+    /// Opt out of mirroring (`[fabric] log = "off"`).
     Off,
-    /// `[fabric] log = "turns"`: the bus class of every session log is
-    /// mirrored onto its session's `ev` face over any broker; over one that
-    /// retains nothing, up to [`TOTAL_MAX_BYTES`] (`mirror=capped`).
+    /// Mirror the bus class of every session log onto its `ev` face (`[fabric] log = "turns"`).
     Turns,
 }
 
@@ -84,52 +42,19 @@ impl LogMode {
     }
 }
 
-/// The most slots one batch takes: half the publisher's pipeline window, so
-/// a batch never fills it and another publish never waits behind it in line.
+/// Maximum slots taken in one batch.
 pub const BATCH_MAX: usize = 32;
-/// The rate bucket's sustained records a second, before retention exists in
-/// the broker (§8.1): past it records wait in their rings and become exact
-/// covers if evicted.
+/// Sustained records per second of the rate bucket before broker retention.
 pub const RATE_PER_SEC: u64 = 10;
 /// The rate bucket's burst.
 pub const RATE_BURST: u64 = 2048;
-/// THE NODE'S TOTAL of mirrored body bytes on a broker that retains nothing:
-/// past it the mirror stops, said in `fabric status`
-/// (`mirror=capped`). 256 MiB of bodies is about two million records, some
-/// two hundred days of a busy agent node at the sustained rate's typical use.
-/// A lifetime gate, so it holds only where nothing is ever given up: on a
-/// broker whose `Hello` advertises a prefix rule over this node's `ev` faces
-/// ([`crate::broker_rules::retains_ev`]) the [`NODE_WINDOW_BYTES`] window
-/// budget replaces it.
+/// Maximum mirrored body bytes on a broker that retains nothing (`mirror=capped`).
 pub const TOTAL_MAX_BYTES: u64 = 256 * 1024 * 1024;
-/// THE NODE'S WINDOW BUDGET on a retaining broker (§5.5's "64 MiB per node"): the mirrored body bytes this
-/// node landed at offsets at or above the broker's `oldest=` for its `ev`
-/// faces are at most this, held by the producer. The broker's bulk stream
-/// keeps 256 MiB ([`crate::broker_rules::EV_BYTES`]): four nodes at their
-/// full share. Past it the mirror WAITS (`mirror=budget`), asks `oldest=`
-/// again at its retry cadence, and goes on once the broker's cut has passed
-/// enough of it; records wait in their rings and become exact covers if
-/// evicted, as past [`RATE_PER_SEC`]. It never stops for good.
+/// Per-node mirrored body byte budget in the broker's retention window.
 pub const NODE_WINDOW_BYTES: u64 = 64 * 1024 * 1024;
-/// The most entries the pin's window ledger keeps ([`Pin::win`]): past it the
-/// two NEIGHBOURS WHOSE BYTES SUM LEAST are merged into one (the higher
-/// offset, the bytes summed, [`Pin::note_window`]). A merge only ever counts
-/// bytes in the window longer, never shorter, and by at most one entry's
-/// bytes: of 64 neighbour pairs, 32 are disjoint, so the cheapest sums to at
-/// most 1/32 of the ledger, which the budget keeps near [`NODE_WINDOW_BYTES`]
-/// (2 MiB of a full window). So a node at its budget goes on once the cut has
-/// passed that much more than its exact share, whatever its batch sizes.
+/// Maximum entries kept in the pin's window ledger ([`Pin::win`]).
 pub const WINDOW_LEDGER_MAX: usize = 64;
-/// THE FLOOR'S LEASE: how far past a batch's
-/// bytes `logfloor` is raised, durably, when the batch would pass it — so the
-/// floor costs one durable write per MiB of bodies (some eight thousand
-/// records, minutes at the sustained rate). The price is paid at each reboot
-/// after an unclean stop, which cannot tell the newest pin from an older
-/// one a power cut brought back: the total resumes at the floor, at most
-/// this much AND ONE BATCH'S BODIES ([`BATCH_MAX`]) more than was mirrored
-/// — the batch in flight is in the floor, and when it lands again its bytes
-/// are counted once more — so some 256 such reboots in a node's life bring
-/// [`TOTAL_MAX_BYTES`] nearer by what they did not send. Never a byte less.
+/// Lease step in bytes by which `logfloor` is raised ahead of a batch.
 pub const FLOOR_LEASE_BYTES: u64 = 1024 * 1024;
 
 /// One slot of a take: its session, its cursor and its `v=2` body.
@@ -143,14 +68,10 @@ pub struct TakeSlot {
     pub body: String,
 }
 
-/// A `log-take` reply read: `OK <nbytes> slots=<k>[ more=1]` (or `OK 0
-/// slots=0 stale=1`) and its body of `<sid> <ep>:<seq>:<ms> <body>` lines.
-/// Answers the slots and whether the endpoint holds more.
+/// Parse a `log-take` reply header and body into slots and whether more remain.
 ///
 /// # Errors
-///
-/// A header without its count, a line that does not read, or a count that
-/// is not the lines'.
+/// Missing count in header, malformed slot line, or mismatched slot count.
 pub fn parse_take(header: &str, body: &[u8]) -> Result<(Vec<TakeSlot>, bool), String> {
     let mut toks = header.split_whitespace();
     if toks.next() != Some("OK") {
@@ -203,40 +124,7 @@ pub struct PinSlot {
     pub body: String,
 }
 
-/// THE PIN: the one batch in flight, the node's running total of mirrored
-/// body bytes, the node's ALIAS KEY and its WINDOW
-/// LEDGER, as `logpin` holds them.
-///
-/// ```text
-/// logpin v=2 inc=<inc> n=<k> total=<bytes> key=<32 hex> win=<off>:<bytes>,…
-/// <pseq> <sid> <ep>:<seq>:<ms> <body>        (k lines)
-/// ```
-///
-/// `win=` is read past by a reader from
-/// before it, as every word after `total=` is; a pin without it has an empty
-/// ledger.
-///
-/// `n=0` is a bridge between batches. A pin that does not read stops the
-/// mirror for this bridge's life and is never deleted — save one a power cut
-/// tore, which the first bridge after the unclean stop sets aside once the
-/// state dir holds its durable copies (`logkey`, `logfloor`), and the mirror
-/// resumes from them. `key=` is minted once, 16 random bytes, the first time
-/// a bridge of this state dir mirrors, written durably to `logkey` before any
-/// take names it, and kept by every rewrite of the pin: never derived from
-/// the node's caps (a renewed cap, a changed grant set, an unguarded broker's
-/// empty ring), so an edge's alias on the bus is the same for the node's
-/// life, and nobody holding the fleet's mint secret can recompute it.
-///
-/// `v=2` IS A PIN WITH ITS COPIES. A build before `logkey` and `logfloor`
-/// wrote `v=1`, and reads nothing else: it refuses a `v=2` pin as one of
-/// another version, stops its mirror and keeps the pin, so it never mirrors
-/// past a floor it does not raise nor under a key it minted itself (the
-/// bridge binary is whatever `[fabric] command` names, so an older build can
-/// run on the same state dir). This build reads both, and writes `v=2` only;
-/// its first `v=2` over a `v=1` pin or none is durable, so no power cut
-/// brings back a pin that an older build would read. A recovered `v=1` is
-/// upgraded before the copies are written or its batch sent; its own durable
-/// key and total protect the interval before those copies exist.
+/// Durable `logpin` state: in-flight batch, running byte total, alias key, and window ledger.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Pin {
     /// The incarnation the sequences were reserved under.
@@ -245,18 +133,13 @@ pub struct Pin {
     pub total: u64,
     /// The node's alias key (`None`: a pin written before it, or none minted).
     pub key: Option<[u8; 16]>,
-    /// THE WINDOW LEDGER: per landed batch, oldest first, the
-    /// highest offset it landed at and its body bytes. A batch counts against
-    /// [`NODE_WINDOW_BYTES`] while its highest offset is at or above the
-    /// broker's `oldest=` ([`Pin::window_bytes`]); at most
-    /// [`WINDOW_LEDGER_MAX`] entries ([`Pin::note_window`]).
+    /// Per landed batch (oldest first), its highest offset and body bytes.
     pub win: Vec<(u64, u64)>,
     /// The batch.
     pub slots: Vec<PinSlot>,
 }
 
-/// A fresh alias key: 16 bytes from the one audited entropy helper, `None`
-/// when it fails (the mirror then names every edge `-`, never its sid).
+/// Mint a fresh 16-byte alias key from the entropy helper, or `None` on failure.
 #[must_use]
 pub fn mint_alias_key() -> Option<[u8; 16]> {
     let bytes = crate::enable::random_bytes(16).ok()?;
@@ -269,18 +152,10 @@ pub fn mint_alias_key() -> Option<[u8; 16]> {
 pub const PIN_HEADER: &str = "logpin v=2";
 
 /// The head of a pin a build before the durable copies wrote: it reads
-/// nothing else ([`Pin`]'s `v=2`).
 const OLDER_PIN_HEADER: &str = "logpin v=1";
 
 impl Pin {
-    /// A batch of `bytes` landed, the highest of it at `hi`: one ledger
-    /// entry; while it holds more than [`WINDOW_LEDGER_MAX`], the two
-    /// neighbours whose bytes sum least (the oldest such pair on a tie) are
-    /// merged under the higher offset. Merging the two OLDEST instead piled
-    /// every batch but the newest few into one entry keyed near the window's
-    /// top, which the cut passed only once it had passed nearly all of them:
-    /// a node at its budget then waited for days its oldest batches had
-    /// already aged out of.
+    /// Record a landed batch of `bytes` at highest offset `hi`, merging smallest neighbours past [`WINDOW_LEDGER_MAX`].
     pub fn note_window(&mut self, hi: u64, bytes: u64) {
         self.win.push((hi, bytes));
         while self.win.len() > WINDOW_LEDGER_MAX {
@@ -295,8 +170,7 @@ impl Pin {
         }
     }
 
-    /// The body bytes the ledger counts in the broker's window from `oldest`:
-    /// every batch whose highest offset is at or above it.
+    /// Body bytes in the ledger whose highest offset is at or above `oldest`.
     #[must_use]
     pub fn window_bytes(&self, oldest: u64) -> u64 {
         self.win
@@ -310,19 +184,13 @@ impl Pin {
         self.win.retain(|(hi, _)| *hi >= oldest);
     }
 
-    /// Whether `bytes`, whole or cut short, begin as an OLDER BUILD'S pin
-    /// (`v=1`): one written by a build that keeps neither `logkey` nor
-    /// `logfloor`, so those copies need not cover what it holds. A prefix too
-    /// short to name its version is not one: this build wrote no `v=1`, and
-    /// once it pinned, no older build writes over its pin.
+    /// Whether `bytes` begin as an older build's `v=1` pin.
     #[must_use]
     pub fn by_an_older_build(bytes: &[u8]) -> bool {
         bytes.starts_with(OLDER_PIN_HEADER.as_bytes())
     }
 
-    /// Whether `bytes` begin as a pin of THIS build (`v=2`), which an older
-    /// build refuses: what a rewrite of the pin may replace atomically, since
-    /// no power cut can then bring back a version an older build reads.
+    /// Whether `bytes` begin as this build's `v=2` pin.
     #[must_use]
     pub fn by_this_build(bytes: &[u8]) -> bool {
         bytes
@@ -352,19 +220,10 @@ impl Pin {
         out
     }
 
-    /// The file read back.
+    /// Parse a rendered `logpin` text.
     ///
     /// # Errors
-    ///
-    /// Anything that does not read: a header of another version, a slot line
-    /// that does not parse, a count that is not the lines' — and a pin that does
-    /// not end at the newline every line of it ends with ([`Pin::render`]): a
-    /// power cut may leave a prefix, and one cut inside its header still reads
-    /// as a pin with a lower total and no key (reset), one
-    /// cut inside its last slot as that slot with its body's tail gone. So
-    /// what this refuses is exactly what is not PROVABLY WHOLE, the rule the
-    /// state dir's sweep sets a torn file aside by (`StateDir::reconcile_logpin`).
-    /// An older build's `v=1` pin reads as this build's `v=2` does.
+    /// Unknown version header, malformed line, count mismatch, or missing trailing newline.
     pub fn parse(text: &str) -> Result<Pin, String> {
         if !text.ends_with('\n') {
             return Err(if text.is_empty() {
@@ -392,8 +251,6 @@ impl Pin {
         let inc = field("inc")?;
         let n = field("n")?;
         let total = field("total")?;
-        // Past the total, a newer writer's words are read past; `key=` and
-        // `win=` are read, and refused when they do not.
         let rest: Vec<&str> = toks.collect();
         let key = match rest.iter().find_map(|t| t.strip_prefix("key=")) {
             None => None,
@@ -448,11 +305,7 @@ impl Pin {
     }
 }
 
-/// Each session's last cursor IN EACH SEQ SPACE of `slots`, in the order
-/// they first appear: what one `log-landed` names. A take can hold two spaces
-/// of one session (an uncarried update's old-space `why=reset` cover, then
-/// the new space's records); each lands, or the old space's cover
-/// is owed again on every take.
+/// Last cursor of each session in each seq space of `slots`, in first-appearance order.
 #[must_use]
 pub fn landed_pairs(slots: &[PinSlot]) -> Vec<(String, BusCursor)> {
     let mut out: Vec<(String, BusCursor)> = Vec::new();
@@ -485,15 +338,13 @@ pub enum LandedWord {
     Ok,
     /// Already there, or another seq space: on the bus already.
     Stale,
-    /// A closed session's tail is all on the bus and forgotten: its `ev` face
-    /// may be retired.
+    /// Closed session's tail is all on the bus and forgotten; its `ev` face may be retired.
     Done,
     /// An update's export holds the cursor: keep the slots, land again later.
     Fenced,
     /// A seamless successor has not adopted the session yet: keep them.
     Adopting,
-    /// No such session (after adoption): the slots are on the bus; nothing
-    /// more is owed.
+    /// No such session after adoption; nothing more is owed.
     Gone,
     /// Past anything the session's log numbered: nothing to land on.
     Ahead,
@@ -507,12 +358,10 @@ impl LandedWord {
     }
 }
 
-/// A `log-landed` reply read: one word a pair, or `OK stale=1` from a lane
-/// that no longer owns the link (`None`: nothing landed, keep the pin).
+/// Parse a `log-landed` reply into per-pair answers, or `None` on `OK stale=1`.
 ///
 /// # Errors
-///
-/// An `ERR`, or a word count that is not the pairs'.
+/// Reply is an `ERR` or its word count does not match `pairs`.
 pub fn parse_landed(reply: &str, pairs: usize) -> Result<Option<Vec<LandedWord>>, String> {
     let rest = reply
         .strip_prefix("OK")
@@ -542,9 +391,7 @@ pub fn parse_landed(reply: &str, pairs: usize) -> Result<Option<Vec<LandedWord>>
     Ok(Some(words))
 }
 
-/// THE RATE BUCKET (§8.1): [`RATE_PER_SEC`] records a second sustained, a
-/// [`RATE_BURST`] burst, on a clock the caller passes (milliseconds), so a
-/// test steps it.
+/// Rate bucket of [`RATE_PER_SEC`] sustained records/s and [`RATE_BURST`] burst.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Bucket {
     /// Thousandths of a record.

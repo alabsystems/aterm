@@ -1,60 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! [`Command`], [`Stdio`] and [`Child`]: `std::process`'s shapes for a child that holds its
-//! stdio and nothing else of this process, started on Darwin by one `posix_spawn` with
-//! `POSIX_SPAWN_CLOEXEC_DEFAULT`, so this process never forks for it. [`super::command`] is
-//! the constructor product code uses; the parent module's docs say why.
-//!
-//! It is `std::process::Command` where a caller can tell, and differs only where std would hand
-//! the child more than its stdio:
-//!
-//! * Arguments, environment, working directory: std's rules. `env`, `envs`, `env_remove` and
-//!   `env_clear` edit a copy of this process's environment taken at the spawn (a changed one
-//!   is passed sorted by key, as std passes it); a NUL anywhere is `InvalidInput`.
-//! * The program: `execvp`'s search. A name holding a `/` is that file (relative to the
-//!   child's working directory); a bare name is searched on the `PATH` the child will hold
-//!   (`/usr/bin:/bin` when it holds none); a candidate that may not be run (`EACCES`) is passed
-//!   over and reported only when nothing later starts; an `ENOEXEC` file is run by `/bin/sh`.
-//!   A `PATH` entry too long to join to the name ends the search with `ENAMETOOLONG` when the
-//!   child's `PATH` is this process's own (std then takes `posix_spawnp`) and is passed over
-//!   when it was edited (std then forks and takes `execvp`). Failures carry std's errno:
-//!   `NotFound` for a missing program or working directory, `PermissionDenied` for one that may
-//!   not be run. A failed exec is an `Err`, never a child.
-//! * Stdio: std's defaults (`spawn` and `status` inherit all three; `output` reads `/dev/null`
-//!   and pipes stdout and stderr) and modes: [`Stdio::inherit`], [`Stdio::null`],
-//!   [`Stdio::piped`] (the parent's end comes back as std's own `ChildStdin` / `ChildStdout` /
-//!   `ChildStderr`), or a descriptor placed at that number. One difference, on Darwin: an
-//!   inherited slot this process has closed is given `/dev/null`, since a child born with
-//!   stdout closed hands its first `open` that number (off Darwin std's rule stands). This
-//!   process's end of a pipe never sits on 0..=2, where it would pass for an inherited slot.
-//! * Signals: `SIGPIPE` back to its default, the others as this process has them (both as
-//!   std), and `SIGHUP` back to its default for a child started stopped
-//!   ([`Command::start_suspended`]); the signal mask starts empty, where std copies the
-//!   spawning thread's, which in the window blocks `SIGUSR1` (aterm-gui's snapshot thread).
-//! * Process group and session: [`Command::process_group`] and [`Command::setsid`], spawn
-//!   attributes on Darwin; with both, the session wins and the child leads its own group.
-//! * Responsibility, which std has no word for: [`Command::disclaim_responsibility`] starts the
-//!   child as its own responsible process (Darwin's private spawn attribute), so macOS asks its
-//!   TCC and syspolicyd questions about the child's code identity instead of this process's
-//!   responsible app. Fail-closed: off Darwin, where the SPI is missing, and beside `exec` it is
-//!   `Unsupported` and nothing is started.
-//! * A child started stopped at its exec ([`Command::start_suspended`], Darwin's spawn flag),
-//!   for [`Child::resume`] to run; std has no word for it either. Off Darwin and beside `exec`
-//!   it is `Unsupported` and nothing is started.
-//! * No `pre_exec`: code between a fork and an exec is what this type exists to avoid. A
-//!   spawn that needs it (a PTY child's `setrlimit` and controlling terminal, a descriptor
-//!   handed over above stdio) builds a `std::process::Command` with
-//!   [`super::InheritNothing`] and is a reviewed exception.
-//!
-//! [`Child`] reaps exactly once: the first `wait`/`try_wait` that collects the exit keeps it
-//! and later calls answer from it; `kill` after the reap signals nothing (the pid may name
-//! another process by then) and answers `Ok`, and `wait` closes the child's stdin first, both
-//! as std does; dropping an unreaped handle collects an exited child and leaves a running one
-//! to [`crate::reaper`] (std leaves it unreaped).
-//!
-//! Off Darwin the same type starts its child through std, forked, with
-//! [`super::InheritStrip`] in the child and the mask emptied there too.
+//! [`Command`], [`Stdio`] and [`Child`]: `std::process`'s shapes for a child that holds its stdio and nothing else of this process, started on Darwin by one `posix_spawn` with `POSIX_SPAWN_CLOEXEC_DEFAULT`, so this process never forks for it.
 
 use super::{DISCLAIM_SPI, F_GETFL, F_SETFL, fcntl};
 use std::collections::BTreeMap;
@@ -104,8 +51,6 @@ impl fmt::Debug for Stdio {
 
 impl From<OwnedFd> for Stdio {
     /// This descriptor, placed at the slot's number. The command keeps it
-    /// (open in this process) until the command is dropped, as `std` keeps a
-    /// `Stdio::from(fd)`.
     fn from(fd: OwnedFd) -> Self {
         Self(Kind::Fd(fd))
     }
@@ -148,7 +93,6 @@ impl From<io::PipeWriter> for Stdio {
 }
 
 /// `std`'s `CommandEnv`: the edits a command makes to the environment it
-/// will copy at the spawn.
 #[derive(Debug, Default)]
 struct Env {
     clear: bool,
@@ -174,17 +118,12 @@ impl Env {
     }
 
     /// Whether the child's `PATH` may differ from this process's: std's `have_changed_path`,
-    /// the test that sends a bare name from `posix_spawnp` (which searches this process's
-    /// `PATH`) to `execvp`.
     #[cfg(target_vendor = "apple")]
     fn saw_path(&self) -> bool {
         self.clear || self.vars.contains_key(OsStr::new("PATH"))
     }
 
     /// The child's whole environment: this process's as it stands (in
-    /// `environ`'s order) when nothing was edited, else this process's (or
-    /// none, after `env_clear`) with the edits applied, sorted by key —
-    /// exactly the block `std` hands the child.
     #[cfg(target_vendor = "apple")]
     fn capture(&self) -> Vec<(OsString, OsString)> {
         if !self.clear && self.vars.is_empty() {
@@ -208,8 +147,7 @@ impl Env {
     }
 }
 
-/// `std::process::Command`, whose child holds its stdio and nothing else
-/// (the module docs list where it differs). Built by [`super::command`].
+/// `std::process::Command`, whose child holds its stdio and nothing else (the module docs list where it differs).
 pub struct Command {
     program: OsString,
     arg0: Option<OsString>,
@@ -222,8 +160,6 @@ pub struct Command {
     pgroup: Option<i32>,
     setsid: bool,
     /// The SPI that makes the child its own responsible process, when asked
-    /// ([`Self::disclaim_responsibility`]): always [`DISCLAIM_SPI`] but in a
-    /// test that names one no image exports.
     disclaim: Option<&'static CStr>,
     /// Start the child stopped at its exec ([`Self::start_suspended`]).
     suspended: bool,
@@ -237,8 +173,7 @@ enum Fallback {
 }
 
 impl Command {
-    /// `program` with no arguments, this process's environment and working
-    /// directory, and stdio inherited (`spawn`/`status`) or piped (`output`).
+    /// `program` with no arguments, this process's environment and working directory, and stdio inherited (`spawn`/`status`) or piped (`output`).
     #[must_use]
     pub fn new(program: impl AsRef<OsStr>) -> Self {
         Self {
@@ -257,9 +192,7 @@ impl Command {
         }
     }
 
-    /// The child's `argv[0]`, in place of the program as it was named (which
-    /// is still what is searched for and run) —
-    /// `std::os::unix::process::CommandExt::arg0`'s.
+    /// The child's `argv[0]`, in place of the program as it was named (which is still what is searched for and run) — `std::os::unix::process::CommandExt::arg0`'s.
     pub fn arg0(&mut self, arg0: impl AsRef<OsStr>) -> &mut Self {
         self.arg0 = Some(arg0.as_ref().to_owned());
         self
@@ -307,15 +240,13 @@ impl Command {
         self
     }
 
-    /// Start the child's environment empty: only what `env`/`envs` set after
-    /// this reaches it.
+    /// Start the child's environment empty: only what `env`/`envs` set after this reaches it.
     pub fn env_clear(&mut self) -> &mut Self {
         self.env.clear();
         self
     }
 
-    /// The child's working directory. A relative program or `PATH` entry is
-    /// resolved against it, as `execvp` after a `chdir` resolves it.
+    /// The child's working directory.
     pub fn current_dir(&mut self, dir: impl AsRef<Path>) -> &mut Self {
         self.cwd = Some(dir.as_ref().to_owned());
         self
@@ -339,78 +270,31 @@ impl Command {
         self
     }
 
-    /// Start the child in process group `pgroup` (`0`: a new group of its
-    /// own, led by the child) — `std::os::unix::process::CommandExt`'s.
-    /// Beside [`Self::setsid`] the session wins, as the kernel orders the two
-    /// (`setpgid`, then `setsid`): the child leads a group of its own whatever
-    /// group was asked, and `0` — which would make it a group leader that
-    /// `setsid` then refuses — is not asked of the kernel at all.
+    /// Start the child in process group `pgroup` (`0`: a new group of its own, led by the child) — `std::os::unix::process::CommandExt`'s.
     pub fn process_group(&mut self, pgroup: i32) -> &mut Self {
         self.pgroup = Some(pgroup);
         self
     }
 
-    /// Start the child in a new session of its own (`setsid`), with no
-    /// controlling terminal. The child then leads its own process group too,
-    /// so [`Self::process_group`]`(0)` beside it changes nothing.
+    /// Start the child in a new session of its own (`setsid`), with no controlling terminal.
     pub fn setsid(&mut self, setsid: bool) -> &mut Self {
         self.setsid = setsid;
         self
     }
 
-    /// Start the child as its OWN RESPONSIBLE PROCESS (`true`), not charged to
-    /// the one this process is charged to. macOS attributes a process's TCC
-    /// and syspolicyd questions — a privacy grant, the Developer Tools verdict
-    /// — to its responsible process, which a child inherits from a parent that
-    /// has one (a shell's child under an app is asked about as that app).
-    /// Disclaimed, the child is asked about as its own code identity, and
-    /// evaluated afresh (aterm starts its own executable this way once the
-    /// owner adds aterm to Privacy & Security ▸ Developer Tools: a process
-    /// checked before the grant keeps a stale "not a developer tool" verdict,
-    /// a fresh responsible process with aterm's identity clears it — measured
-    /// in a VM 2026-10-16). A plain child of a disclaimed one is charged to it.
-    ///
-    /// Darwin's private SPI `responsibility_spawnattrs_setdisclaim`, looked up
-    /// at each spawn and set on the spawn's attributes. FAIL-CLOSED: a child
-    /// asked to disclaim is never started without it. The spawn answers
-    /// `Unsupported`, starting nothing, off Darwin, on a macOS whose libSystem
-    /// exports no such SPI, and beside [`Self::exec`] (`POSIX_SPAWN_SETEXEC`
-    /// with a disclaim is unmeasured); a refusal by the SPI itself is the
-    /// spawn's error, likewise before anything starts. `false` (the default)
-    /// asks for nothing.
+    /// Start the child as its OWN RESPONSIBLE PROCESS (`true`), not charged to the one this process is charged to. macOS attributes a process's TCC and syspolicyd questions — a privacy grant, the Developer Tools verdict — to its responsible process, which a child inherits from a parent that has one (a shell's child under an app is asked about as that app).
     pub fn disclaim_responsibility(&mut self, disclaim: bool) -> &mut Self {
         self.disclaim = disclaim.then_some(DISCLAIM_SPI);
         self
     }
 
-    /// Start the child STOPPED AT ITS EXEC (`true`): `spawn` returns once the kernel has
-    /// exec'd the program — its image mapped and its code signature checked — and not one
-    /// instruction of the program, nor of the dynamic loader before it, runs until
-    /// [`Child::resume`]. What the system does at a binary's first exec, syspolicyd's
-    /// assessment included, goes on while it is stopped (measured on the 96 MB `aterm`: the
-    /// spawn returned in 9.7 ms; resumed at once it exited 898 ms later, resumed after
-    /// 1.2 s stopped 18 ms later). One killed before its resume never runs; one dropped
-    /// neither resumed nor killed stays stopped until its holder exits
-    /// ([`crate::deadline::Held`] kills it on drop).
-    ///
-    /// ITS HOLDER'S DEATH KILLS IT UNRUN, in a process group of its own
-    /// ([`Self::process_group`]`(0)`): the kernel sends a stopped group orphaned by its
-    /// holder's exit `SIGHUP` then `SIGCONT`, and the child starts with `SIGHUP` at its
-    /// default whatever this process has it as, so the hangup ends it before it runs (an
-    /// inherited `SIG_IGN` would let the `SIGCONT` run it).
-    ///
-    /// Darwin's `POSIX_SPAWN_START_SUSPENDED`. FAIL-CLOSED like
-    /// [`Self::disclaim_responsibility`]: off Darwin (where no spawn can stop a child after
-    /// its exec) and beside [`Self::exec`] the spawn answers `Unsupported` and starts
-    /// nothing; it never starts the child running instead. `false` (the default) asks for
-    /// nothing.
+    /// Start the child STOPPED AT ITS EXEC (`true`): `spawn` returns once the kernel has exec'd the program — its image mapped and its code signature checked — and not one instruction of the program, nor of the dynamic loader before it, runs until [`Child::resume`].
     pub fn start_suspended(&mut self, suspended: bool) -> &mut Self {
         self.suspended = suspended;
         self
     }
 
-    /// TEST SEAM: disclaim through the SPI named `spi` instead of
-    /// [`DISCLAIM_SPI`] — one no image exports, to drive the fail-closed path.
+    /// TEST SEAM: disclaim through the SPI named `spi` instead of [`DISCLAIM_SPI`] — one no image exports, to drive the fail-closed path.
     #[cfg(test)]
     pub(super) fn disclaim_through(&mut self, spi: &'static CStr) -> &mut Self {
         self.disclaim = Some(spi);
@@ -418,9 +302,6 @@ impl Command {
     }
 
     /// The group the spawn asks for: none beside `setsid` when the group
-    /// asked is `0`, which the session gives anyway. Asked as well, `setpgid`
-    /// makes the child a group leader and `setsid` then refuses it: the spawn
-    /// failed `EPERM` (Darwin's `posix_spawn` and `std`'s fork alike).
     fn group(&self) -> Option<i32> {
         self.pgroup.filter(|&pgroup| !(self.setsid && pgroup == 0))
     }
@@ -437,7 +318,6 @@ impl Command {
     }
 
     /// The environment edits, sorted by key: `None` for a removed variable.
-    /// (After `env_clear`, the variables set since.)
     pub fn get_envs(&self) -> impl ExactSizeIterator<Item = (&OsStr, Option<&OsStr>)> {
         self.env
             .vars
@@ -452,18 +332,13 @@ impl Command {
     }
 
     /// Start the child; unset stdio is inherited.
-    ///
     /// # Errors
-    /// As `std`'s: `InvalidInput` for a NUL, `NotFound` for a program (or a
-    /// working directory) that does not exist, `PermissionDenied` for one
-    /// that may not be run, and whatever else the spawn answers.
+    /// As `std`'s: `InvalidInput` for a NUL, `NotFound` for a program (or a working directory) that does not exist, `PermissionDenied` for one that may not be run, and whatever else the spawn answers.
     pub fn spawn(&mut self) -> io::Result<Child> {
         self.start(Fallback::Inherit, true)
     }
 
-    /// Run the child to its end with stdin `/dev/null` and stdout and stderr
-    /// captured (unless set otherwise).
-    ///
+    /// Run the child to its end with stdin `/dev/null` and stdout and stderr captured (unless set otherwise).
     /// # Errors
     /// As [`Self::spawn`]'s, and reading or waiting.
     pub fn output(&mut self) -> io::Result<Output> {
@@ -471,7 +346,6 @@ impl Command {
     }
 
     /// Run the child to its end with unset stdio inherited.
-    ///
     /// # Errors
     /// As [`Self::spawn`]'s, and waiting.
     pub fn status(&mut self) -> io::Result<ExitStatus> {
@@ -509,8 +383,7 @@ impl fmt::Debug for Command {
     }
 }
 
-/// A child [`Command`] started: `std::process::Child`'s shape, with `std`'s
-/// own pipe types in the three public fields.
+/// A child [`Command`] started: `std::process::Child`'s shape, with `std`'s own pipe types in the three public fields.
 pub struct Child {
     /// The parent's end of a piped stdin.
     pub stdin: Option<ChildStdin>,
@@ -523,7 +396,6 @@ pub struct Child {
 }
 
 /// A child's exit status and the resources it and the descendants it reaped used.
-/// Collected with `wait4` on Darwin and Linux, under the child's own reaping handle.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Rusage {
     pub status: ExitStatus,
@@ -548,14 +420,9 @@ impl fmt::Debug for Child {
 }
 
 impl Child {
-    /// Wait for the child and collect its resource accounting. Repeated calls return
-    /// the same result; ordinary `wait` and `try_wait` then share its cached status.
-    /// Call this before reaping through either ordinary method: resource accounting
-    /// cannot be recovered after another wait collected the child.
-    ///
+    /// Wait for the child and collect its resource accounting.
     /// # Errors
-    /// `wait4`'s, or `Unsupported` off 64-bit Darwin/Linux. An already reaped child whose
-    /// accounting was not collected returns an error without asking its old pid.
+    /// `wait4`'s, or `Unsupported` off 64-bit Darwin/Linux.
     pub fn wait_with_rusage(&mut self) -> io::Result<Rusage> {
         drop(self.stdin.take());
         self.collect_rusage(true)?
@@ -563,8 +430,6 @@ impl Child {
     }
 
     /// Collect status and resource accounting if the child has exited, else `None`.
-    /// The same ownership and caching rules as [`Self::wait_with_rusage`].
-    ///
     /// # Errors
     /// As [`Self::wait_with_rusage`].
     pub fn try_wait_with_rusage(&mut self) -> io::Result<Option<Rusage>> {
@@ -595,16 +460,13 @@ impl Child {
     }
 
     /// `SIGKILL` the child — never once it is reaped (the module docs).
-    ///
     /// # Errors
     /// `kill`'s.
     pub fn kill(&mut self) -> io::Result<()> {
         self.handle.kill()
     }
 
-    /// Run a child started stopped ([`Command::start_suspended`]): `SIGCONT`, which a
-    /// running child carries on through. Never once it is reaped, as [`Self::kill`].
-    ///
+    /// Run a child started stopped ([`Command::start_suspended`]): `SIGCONT`, which a running child carries on through.
     /// # Errors
     /// `kill`'s.
     pub fn resume(&mut self) -> io::Result<()> {
@@ -612,7 +474,6 @@ impl Child {
     }
 
     /// Close the child's stdin, then wait for it to exit and reap it (once).
-    ///
     /// # Errors
     /// `waitpid`'s, other than `EINTR` (retried).
     pub fn wait(&mut self) -> io::Result<ExitStatus> {
@@ -621,17 +482,13 @@ impl Child {
     }
 
     /// The exit status if the child has exited (reaping it), else `None`.
-    ///
     /// # Errors
     /// `waitpid`'s, other than `EINTR` (retried).
     pub fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
         self.handle.try_wait()
     }
 
-    /// Close the child's stdin, read its piped stdout and stderr to their
-    /// ends (both at once, so neither can fill and stall the child), and
-    /// wait for it.
-    ///
+    /// Close the child's stdin, read its piped stdout and stderr to their ends (both at once, so neither can fill and stall the child), and wait for it.
     /// # Errors
     /// Reading's, or waiting's.
     pub fn wait_with_output(mut self) -> io::Result<Output> {
@@ -657,8 +514,6 @@ impl Child {
 }
 
 /// Read two pipes to their ends at once: `poll` both, read whichever is
-/// ready, and once one ends read the other to its end — `std`'s
-/// `read_output`.
 fn read2(
     mut out: ChildStdout,
     out_buf: &mut Vec<u8>,
@@ -694,8 +549,7 @@ fn read2(
         },
     ];
     loop {
-        // SAFETY: `fds` is a live array of two `struct pollfd`, which `poll`
-        // reads and writes and does not retain.
+        // SAFETY: `fds` is a live array of two `struct pollfd`, which `poll` reads and writes and does not retain.
         if unsafe { poll(fds.as_mut_ptr(), 2, -1) } < 0 {
             let error = io::Error::last_os_error();
             if error.kind() == io::ErrorKind::Interrupted {
@@ -728,8 +582,7 @@ fn set_nonblocking(fd: RawFd, on: bool) -> io::Result<()> {
     const O_NONBLOCK: i32 = 0x0004;
     #[cfg(not(target_vendor = "apple"))]
     const O_NONBLOCK: i32 = 0o4000;
-    // SAFETY: `F_GETFL`/`F_SETFL` read and set one descriptor's status flags
-    // and touch no memory; `fd` is a pipe end owned by the caller.
+    // SAFETY: `F_GETFL`/`F_SETFL` read and set one descriptor's status flags and touch no memory; `fd` is a pipe end owned by the caller.
     unsafe {
         let flags = fcntl(fd, F_GETFL);
         if flags < 0 {
@@ -747,17 +600,12 @@ fn set_nonblocking(fd: RawFd, on: bool) -> io::Result<()> {
     Ok(())
 }
 
-// Darwin: posix_spawn, CLOEXEC_DEFAULT
-
 #[cfg(target_vendor = "apple")]
 type Handle = super::LaneChild;
 
 #[cfg(target_vendor = "apple")]
 impl Command {
-    /// Replace this process with the program (`POSIX_SPAWN_SETEXEC`): it holds this process's
-    /// stdio and nothing else, and this process's own table is untouched if the exec fails.
-    /// Unset stdio is inherited. Returns only on failure — at once, `Unsupported` and this
-    /// process untouched, beside [`Self::disclaim_responsibility`].
+    /// Replace this process with the program (`POSIX_SPAWN_SETEXEC`): it holds this process's stdio and nothing else, and this process's own table is untouched if the exec fails.
     pub fn exec(&mut self) -> io::Error {
         match self.launch(Fallback::Inherit, true, true) {
             Ok(_) => io::Error::other("the exec returned a child"),
@@ -777,8 +625,6 @@ impl Command {
     }
 
     /// The spawn: the child's pid, and this process's ends of its pipes.
-    /// Every descriptor the child is handed (a pipe's far end, a copy moved
-    /// above the targets) is closed here when it returns, either way.
     fn launch(
         &mut self,
         fallback: Fallback,
@@ -790,17 +636,12 @@ impl Command {
             placeable_copy,
         };
         use std::os::unix::ffi::OsStrExt as _;
-        // An exec that disclaims would make THIS process, replaced, its own responsible
-        // process: `POSIX_SPAWN_SETEXEC` with the disclaim attribute was never measured, so it
-        // is refused before anything is built, never tried.
         if replace && self.disclaim.is_some() {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "an exec cannot disclaim responsibility: spawn the disclaimed child instead",
             ));
         }
-        // An exec started stopped would stop THIS process, replaced, with nobody holding it
-        // to resume: refused before anything is built.
         if replace && self.suspended {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -816,9 +657,6 @@ impl Command {
             .as_ref()
             .map(|dir| c_string(dir.as_os_str().as_bytes()))
             .transpose()?;
-        // The directory a relative program or `PATH` entry resolves against
-        // in the child. Without this process's own directory a relative one
-        // cannot be made absolute; it is then passed as it is.
         let base = match &self.cwd {
             Some(dir) if dir.is_absolute() => Some(dir.clone()),
             Some(dir) => std::env::current_dir().ok().map(|here| here.join(dir)),
@@ -865,22 +703,13 @@ impl Command {
             };
         }
         if replace {
-            // `POSIX_SPAWN_SETEXEC` closes this process's close-on-exec descriptors before it
-            // runs the file actions, so a `dup2` or an inherit from one answers `EBADF`, and
-            // every descriptor std opens carries the flag. The exec takes each such source from
-            // a copy without it: `CLOEXEC_DEFAULT` still keeps the copy itself out of the new
-            // image, and a failed exec closes it with the rest of `handed`. A fork on another
-            // thread in that instant would inherit the copy: exec from a quiescent process (the
-            // keeper's re-exec is one). An unflagged source is inherited as it is.
             for (target, source) in (0..).zip(sources.iter_mut()) {
                 let fd = match *source {
                     Source::Fd(fd) => fd,
                     Source::Inherit => target,
                     Source::Null => continue,
                 };
-                // SAFETY: `F_GETFD` reads one descriptor's flags; a closed
-                // number answers -1 (an inherited slot this process has closed,
-                // which the spawn gives `/dev/null`).
+                // SAFETY: `F_GETFD` reads one descriptor's flags; a closed number answers -1 (an inherited slot this process has closed, which the spawn gives `/dev/null`).
                 let flags = unsafe { fcntl(fd, F_GETFD) };
                 if flags < 0 || flags & FD_CLOEXEC == 0 {
                     continue;
@@ -915,10 +744,7 @@ impl Command {
     }
 }
 
-// Elsewhere: std's fork, with the strip in the child
-
 /// A `std` child: on drop collected if it has exited, else handed to
-/// [`crate::reaper`].
 #[cfg(not(target_vendor = "apple"))]
 #[derive(Debug)]
 struct Handle {
@@ -985,7 +811,6 @@ impl Drop for Handle {
 #[cfg(not(target_vendor = "apple"))]
 impl Stdio {
     /// The same mode as `std`'s; a descriptor is duplicated, so the command
-    /// keeps its own for a later spawn, as `std` keeps one.
     fn to_std(&self) -> io::Result<std::process::Stdio> {
         Ok(match &self.0 {
             Kind::Inherit => std::process::Stdio::inherit(),
@@ -996,7 +821,6 @@ impl Stdio {
     }
 }
 
-// The forked child's two calls, and `SIG_SETMASK` on Linux.
 #[cfg(not(target_vendor = "apple"))]
 unsafe extern "C" {
     fn sigprocmask(how: i32, set: *const u64, old: *mut u64) -> i32;
@@ -1008,13 +832,7 @@ const SIG_SETMASK: i32 = 2;
 
 #[cfg(not(target_vendor = "apple"))]
 impl Command {
-    /// Replace this process with the program: [`super::InheritStrip`] marks this process's
-    /// own table first, so a failed exec leaves every descriptor close-on-exec
-    /// ([`super::InheritNothing`] says what that means). The hooks run in this process, so a
-    /// failed exec also leaves its signal mask empty and, with [`Self::setsid`], this process
-    /// leading a new session (Darwin's `exec` changes nothing when it fails). Returns only on
-    /// failure — at once, `Unsupported` and nothing run, beside
-    /// [`Self::disclaim_responsibility`].
+    /// Replace this process with the program: [`super::InheritStrip`] marks this process's own table first, so a failed exec leaves every descriptor close-on-exec ([`super::InheritNothing`] says what that means).
     pub fn exec(&mut self) -> io::Error {
         use std::os::unix::process::CommandExt as _;
         match self.forked() {
@@ -1054,11 +872,6 @@ impl Command {
     }
 
     /// The `std` command this one is: [`super::InheritNothing`]'s strip
-    /// first, then the empty mask and the session in one more hook. A
-    /// disclaim is refused first of all — Darwin's responsibility SPI has no
-    /// counterpart here, and a child asked to disclaim is never started
-    /// without it — so `spawn`, `output`, `status` and `exec` all answer
-    /// `Unsupported` with nothing started and this process untouched.
     fn forked(&self) -> io::Result<super::StdCommand> {
         use super::InheritNothing as _;
         use std::os::unix::process::CommandExt as _;
@@ -1068,8 +881,6 @@ impl Command {
                 "disclaiming responsibility is Darwin's: no child is started without it",
             ));
         }
-        // A fork can stop its child before the exec, never after it: nothing here gives what
-        // the flag promises, so nothing is started.
         if self.suspended {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -1110,8 +921,7 @@ impl Command {
             command.process_group(pgroup);
         }
         let setsid = self.setsid;
-        // SAFETY: the hook runs between fork and exec and calls only
-        // `sigprocmask` and `setsid`, async-signal-safe, on a stack array.
+        // SAFETY: the hook runs between fork and exec and calls only `sigprocmask` and `setsid`, async-signal-safe, on a stack array.
         unsafe {
             command.pre_exec(move || {
                 let empty = [0u64; 16];

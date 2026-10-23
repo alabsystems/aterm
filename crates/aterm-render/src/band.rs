@@ -647,7 +647,7 @@ mod tests {
 
     /// Every char the renderer draws as a band icon is the engine's icon of that char, and
     /// no other char is an engine icon. Every drawn icon is the engine's or one of the
-    /// harness switch's marks, never both.
+    /// harness glass's marks, never both.
     #[test]
     fn band_icon_ids_match_the_renderers() {
         for ch in (0..=0x10_ffffu32).filter_map(char::from_u32) {
@@ -658,7 +658,7 @@ mod tests {
             );
         }
         for icon in BandIcon::ALL {
-            match BandIcon::switch_mark(icon.ch()) {
+            match BandIcon::glass_mark(icon.ch()) {
                 Some(mark) => {
                     assert_eq!(mark, icon);
                     assert_eq!(Icon::for_char(icon.ch()), None, "{icon:?}: no band glyph");

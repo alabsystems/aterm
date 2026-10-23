@@ -1,61 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Where the OS light/dark appearance comes from, read independently of any
-//! window's chrome.
-//!
-//! The appearance picks the side of a `dark:…,light:…` `theme`
-//! ([`App::sync_app_theme_to_appearance`](crate::App::sync_app_theme_to_appearance)).
-//! It used to come from winit's per-window theme (`Window::theme()` at attach,
-//! `WindowEvent::ThemeChanged` after), which is the WINDOW's appearance, not
-//! the desktop's:
-//!
-//! * macOS: `window_theme = "dark"|"light"` pins the `NSWindow`'s appearance, so
-//!   `Window::theme()` answered the forced value and no `ThemeChanged` ever
-//!   arrived (the KVO observer returns early on a window with its own
-//!   appearance). A forced chrome froze the split theme and DEC 2031.
-//! * Linux: X11 answers `None` and Wayland echoes aterm's own decoration
-//!   override, and neither sends `ThemeChanged`, so the split stayed on its dark
-//!   side and every program was told "dark". Reading Wayland's echo would loop:
-//!   the decoration follows the terminal background, which follows the theme.
-//!
-//! So the source is now its own seam, an [`OsAppearanceSource`] field on `App`
-//! with an inert arm for headless instances and tests:
-//!
-//! * macOS observes `NSApp.effectiveAppearance` (KVO), the application-level
-//!   appearance no window's forced chrome can pin; before any window or
-//!   `NSApplication` exists it reads the `AppleInterfaceStyle` default.
-//! * Linux asks the XDG desktop portal (`org.freedesktop.appearance
-//!   color-scheme`) and watches its `SettingChanged` signal, falling back to
-//!   GNOME's `color-scheme` key through `gsettings`, on a worker thread, with
-//!   bounded CLI reads (`gdbus`, `gsettings`). The launch read, on the main
-//!   thread before session 0, asks a running portal only, over aterm-dbus
-//!   (`portal_settings`), then `gsettings`: one that is not running is left to
-//!   the worker, whose `gdbus` read starts it.
-//! * Windows keeps winit's window theme, which there IS the OS setting (its
-//!   caption is resolved separately, `platform_win`).
-//!
-//! Every reading reaches the App as [`Wake::OsAppearance`](crate::Wake), the
-//! same event the development `appearance dark|light` control verb posts.
+//! Where the OS light/dark appearance comes from, read independently of any window's chrome.
 
 use aterm_types::Appearance;
 use aterm_window::event_loop::EventLoopProxy;
 
 use crate::Wake;
 
-/// Where `App` reads the OS appearance from. Injected so headless code never
-/// reaches a platform service: a headless instance or a test-built `App` holds
-/// [`Self::Inert`], whose appearance moves only through
-/// [`App::on_os_appearance`](crate::App::on_os_appearance) (the control verb,
-/// a test).
+/// Where `App` reads the OS appearance from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum OsAppearanceSource {
     /// No OS read, no observer, and window theme events are ignored.
     Inert,
-    /// A development build's launch reading, from `$ATERM_OS_APPEARANCE`
-    /// (`dark`|`light`, [`aterm_types::dev_seam!`]): the appearance launch
-    /// builds for, with nothing observed after. It lets a headless instance
-    /// check the launch path; a shipped build never takes this arm.
+    /// A development build's launch reading, from `$ATERM_OS_APPEARANCE` (`dark`|`light`, [`aterm_types::dev_seam!`]).
     Injected(Appearance),
     /// This platform's reader (see the module doc).
     Platform,
@@ -65,8 +23,7 @@ pub(crate) enum OsAppearanceSource {
 const LAUNCH_SEAM: &str = "ATERM_OS_APPEARANCE";
 
 impl OsAppearanceSource {
-    /// The source a launch uses: [`Self::Inert`] headless (captures stay
-    /// deterministic, and nothing reaches WindowServer), else the platform's.
+    /// The source a launch uses.
     #[must_use]
     pub(crate) fn for_launch(headless: bool) -> Self {
         let injected = aterm_types::dev_seam!(LAUNCH_SEAM)
@@ -75,7 +32,6 @@ impl OsAppearanceSource {
     }
 
     /// [`Self::for_launch`] with the seam already read: an injected reading
-    /// wins, then headless is inert.
     #[must_use]
     fn choose(headless: bool, injected: Option<Appearance>) -> Self {
         match injected {
@@ -85,10 +41,7 @@ impl OsAppearanceSource {
         }
     }
 
-    /// The OS appearance read BEFORE any window, backend or session exists, so
-    /// the renderer and session 0 are built for the side the desktop shows and
-    /// attach has nothing to correct. `None` when it cannot be read (and the
-    /// engine default, dark, stands).
+    /// Read the OS appearance before any window, backend, or session is created.
     #[must_use]
     pub(crate) fn initial(self) -> Option<Appearance> {
         match self {
@@ -98,10 +51,7 @@ impl OsAppearanceSource {
         }
     }
 
-    /// The OS appearance at window attach. macOS reads the application's
-    /// effective appearance (never the window's, which a forced
-    /// `window_theme` pins); Windows maps `window_theme()` as before; Linux
-    /// answers `None` (its worker posts what it reads).
+    /// The OS appearance at window attach.
     #[must_use]
     pub(crate) fn at_attach(
         self,
@@ -126,18 +76,13 @@ impl OsAppearanceSource {
         }
     }
 
-    /// Whether winit's per-window theme events (`WindowEvent::ThemeChanged`)
-    /// report the OS appearance. Only on Windows: on macOS they carry the
-    /// window's (possibly forced) appearance, and on Linux aterm's own
-    /// decoration choice.
+    /// Whether winit's per-window theme events (`WindowEvent::ThemeChanged`) report the OS appearance.
     #[must_use]
     pub(crate) fn reads_window_theme(self) -> bool {
         self == Self::Platform && cfg!(windows)
     }
 
     /// Start observing live OS flips, each posted as `Wake::OsAppearance`.
-    /// Called once, at the first window attach; the caller keeps the returned
-    /// handle for the process's life. `None` when there is nothing to observe.
     pub(crate) fn observe(self, proxy: &EventLoopProxy<Wake>) -> Option<OsAppearanceObserver> {
         match self {
             Self::Inert | Self::Injected(_) => None,
@@ -158,8 +103,7 @@ impl OsAppearanceSource {
     }
 }
 
-/// The wire word for an appearance (`dark`/`light`), as the control verbs
-/// print and parse it.
+/// The wire word for an appearance (`dark`/`light`), as the control verbs print and parse it.
 #[must_use]
 pub(crate) fn appearance_word(appearance: Appearance) -> &'static str {
     match appearance {
@@ -168,7 +112,7 @@ pub(crate) fn appearance_word(appearance: Appearance) -> &'static str {
     }
 }
 
-/// [`appearance_word`]'s inverse; anything else is `None`.
+/// [`appearance_word`]'s inverse.
 #[must_use]
 pub(crate) fn parse_appearance_word(word: &str) -> Option<Appearance> {
     match word {
@@ -179,14 +123,9 @@ pub(crate) fn parse_appearance_word(word: &str) -> Option<Appearance> {
 }
 
 /// Whether this build accepts an injected flip (`appearance dark|light`): a
-/// development build only, like every `dev_seam!`.
 const INJECTION_ENABLED: bool = cfg!(any(debug_assertions, feature = "dev-seams"));
 
-/// The `appearance [dark|light]` control verb, on a control worker. Bare, it
-/// answers the appearance line; with a word, a development build injects that
-/// OS reading through [`App::on_os_appearance`](crate::App::on_os_appearance),
-/// the path the platform observer's [`Wake::OsAppearance`] takes, and answers
-/// the line after it landed.
+/// The `appearance [dark|light]` control verb, on a control worker.
 pub(crate) fn cmd_appearance(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
     let set = match appearance_request(rest, INJECTION_ENABLED) {
         Ok(set) => set,
@@ -202,7 +141,6 @@ pub(crate) fn cmd_appearance(proxy: &EventLoopProxy<Wake>, rest: &str) -> String
 }
 
 /// The `appearance` verb's arguments: none (read), or one `dark`|`light` to
-/// inject, which only a build with `injection` admits.
 fn appearance_request(rest: &str, injection: bool) -> Result<Option<Appearance>, &'static str> {
     let mut words = rest.split_whitespace();
     let set = match (words.next(), words.next()) {
@@ -218,9 +156,7 @@ fn appearance_request(rest: &str, injection: bool) -> Result<Option<Appearance>,
     Ok(set)
 }
 
-/// What [`OsAppearanceSource::observe`] hands back, kept alive by `App`: the
-/// KVO target on macOS, nothing elsewhere (the Linux worker is detached and
-/// tethered to this process by a pipe, see `desktop::tethered`).
+/// What [`OsAppearanceSource::observe`] hands back, kept alive by `App`.
 #[cfg_attr(
     windows,
     allow(
@@ -264,7 +200,6 @@ fn platform_observe(proxy: &EventLoopProxy<Wake>) -> Option<OsAppearanceObserver
 }
 
 /// The Linux/BSD desktop reader: the XDG portal, else GNOME's gsettings key.
-/// The parsers are pure and compiled into every test build.
 #[cfg(any(all(not(target_os = "macos"), not(windows)), test))]
 #[cfg_attr(
     not(all(not(target_os = "macos"), not(windows))),
@@ -285,24 +220,12 @@ mod desktop {
     const GNOME_SCHEMA: &str = "org.gnome.desktop.interface";
 
     /// How long one read may take. The launch read runs on the main thread
-    /// before the first window, so it is bounded well under a visible delay;
-    /// a slower desktop answers "unknown" and the engine default stands until
-    /// the watcher's own read lands. On Linux it never waits for a portal to
-    /// start ([`read_now`]): one installed with no backend for the desktop
-    /// never starts, and every launch waited out this bound for it.
     const READ_BOUND: std::time::Duration = std::time::Duration::from_millis(200);
 
     /// How long the watcher's portal read may take, on its own thread: `gdbus`'s
-    /// own call timeout (`--timeout=1`, [`portal_read_args`]). On Linux it is the
-    /// first read that may start the portal ([`read_now`] never does), at the
-    /// first window's attach; held to [`READ_BOUND`], a portal whose start took
-    /// longer than that was never followed, and the watcher settled on gsettings.
     const WATCH_READ_BOUND: std::time::Duration = std::time::Duration::from_secs(1);
 
-    /// The portal's `color-scheme` value: `1` prefer dark, `2` prefer light,
-    /// `0` no preference. No preference is LIGHT: the desktops that answer it
-    /// (GNOME's `default`) draw their light style, and browsers and
-    /// libadwaita read it the same way. Any other value is not a reading.
+    /// The portal's `color-scheme` value.
     #[must_use]
     pub(super) fn portal_color_scheme(value: u32) -> Option<Appearance> {
         match value {
@@ -312,8 +235,7 @@ mod desktop {
         }
     }
 
-    /// The `uint32` a `gdbus call … Settings.Read` printed: `(<<uint32 1>>,)`
-    /// (`ReadOne`'s `(<uint32 1>,)` too). `None` for an error or other type.
+    /// The `uint32` a `gdbus call … Settings.Read` printed.
     #[must_use]
     pub(super) fn parse_portal_read(stdout: &str) -> Option<u32> {
         let (_, tail) = stdout.rsplit_once("uint32 ")?;
@@ -321,9 +243,7 @@ mod desktop {
         digits.parse().ok()
     }
 
-    /// The `color-scheme` value in one `gdbus monitor` line, when the line is
-    /// the portal's `SettingChanged` for that key:
-    /// `…Settings.SettingChanged ('org.freedesktop.appearance', 'color-scheme', <uint32 1>)`.
+    /// The `color-scheme` value in one `gdbus monitor` line, when the line is the portal's `SettingChanged` for that key.
     #[must_use]
     pub(super) fn parse_portal_signal(line: &str) -> Option<u32> {
         let (_, args) = line.split_once("SettingChanged")?;
@@ -336,9 +256,7 @@ mod desktop {
         parse_portal_read(args)
     }
 
-    /// GNOME's `color-scheme` as `gsettings get` prints it (`'prefer-dark'`),
-    /// or a `gsettings monitor` line (`color-scheme: 'prefer-dark'`).
-    /// `default` is GNOME's light style, as the portal's no-preference.
+    /// GNOME's `color-scheme` as `gsettings get` prints it (`'prefer-dark'`), or a `gsettings monitor` line (`color-scheme: 'prefer-dark'`).
     #[must_use]
     pub(super) fn parse_gsettings(text: &str) -> Option<Appearance> {
         let value = text.trim();
@@ -390,17 +308,12 @@ mod desktop {
         .and_then(parse_gsettings)
     }
 
-    /// The desktop's appearance now, the launch read: the portal, else
-    /// gsettings.
+    /// The desktop's appearance now, the launch read.
     pub(super) fn read_now() -> Option<Appearance> {
         read_running_portal().or_else(read_gsettings)
     }
 
     /// The portal's reading if it is running, asked in-process
-    /// (`portal_settings`, which never starts it): no `gdbus` child, and no
-    /// wait for a portal that cannot start (200 ms of a Linux window's launch
-    /// before, 2026-10-20). The watcher's `gdbus` read starts one that can
-    /// ([`WATCH_READ_BOUND`]).
     #[cfg(target_os = "linux")]
     fn read_running_portal() -> Option<Appearance> {
         crate::portal_settings::read(APPEARANCE_NAMESPACE, COLOR_SCHEME_KEY, READ_BOUND)
@@ -410,19 +323,12 @@ mod desktop {
     }
 
     /// The other unixes have no in-process portal reader (aterm-dbus is a
-    /// Linux dependency): the bounded `gdbus` read.
     #[cfg(not(target_os = "linux"))]
     fn read_running_portal() -> Option<Appearance> {
         read_portal(READ_BOUND)
     }
 
-    /// A long-running watcher (`gdbus monitor`, `gsettings monitor`) TETHERED
-    /// to this process: it runs under a `sh` that holds a pipe whose write end
-    /// only this process has, and kills the watcher when that pipe closes.
-    /// A watcher started bare would outlive aterm until its next print, since
-    /// nothing tells it the reader is gone; the tether ends it the moment aterm
-    /// exits, however it exits. The `sh` gives up its own copy of stdout, so
-    /// the watcher's death reads as end-of-file here.
+    /// A long-running watcher (`gdbus monitor`, `gsettings monitor`) TETHERED to this process.
     pub(super) struct Tethered {
         child: aterm_uds::spawnfd::Child,
         /// The tether: dropping it ends the watcher.
@@ -431,15 +337,13 @@ mod desktop {
     }
 
     impl Tethered {
-        /// Close the tether: the shell kills the watcher, whose stdout then
-        /// reads end-of-file.
+        /// Close the tether.
         pub(super) fn release(&mut self) {
             drop(self.tether.take());
         }
     }
 
     /// The shell around a tethered watcher: start it, drop this shell's own
-    /// stdout, wait for the tether to close, then end it.
     const TETHER_SCRIPT: &str =
         r#""$@" & pid=$!; exec >/dev/null; read -r _line || :; kill "$pid" 2>/dev/null; wait"#;
 
@@ -467,14 +371,12 @@ mod desktop {
 
     impl Drop for Tethered {
         fn drop(&mut self) {
-            // Closing the tether makes the shell kill the watcher and exit.
             self.release();
             let _ = self.child.wait();
         }
     }
 
-    /// Start the worker that posts every desktop appearance it reads. `false`
-    /// when the thread could not start.
+    /// Start the worker that posts every desktop appearance it reads.
     #[cfg(all(not(target_os = "macos"), not(windows)))]
     pub(super) fn spawn_watch(
         proxy: aterm_window::event_loop::EventLoopProxy<crate::Wake>,
@@ -492,8 +394,6 @@ mod desktop {
     }
 
     /// The worker body: watch the portal, else gsettings, posting the current
-    /// value first and then every change. The watcher starts BEFORE the read,
-    /// so a flip between the two is not lost. Returns when the watcher ends.
     #[cfg(all(not(target_os = "macos"), not(windows)))]
     fn watch(post: &dyn Fn(Appearance)) {
         let portal_monitor = [
@@ -531,7 +431,6 @@ mod desktop {
     }
 
     /// Post `now`, then every reading `parse` finds in the watcher's lines,
-    /// until the watcher ends.
     #[cfg(all(not(target_os = "macos"), not(windows)))]
     fn follow(
         mut watcher: Tethered,
@@ -565,17 +464,13 @@ mod mac {
     const KEY_PATH: &str = "effectiveAppearance";
 
     /// The appearance a `-bestMatchFromAppearancesWithNames:` answer names:
-    /// dark for `NSAppearanceNameDarkAqua`, light for anything else it picked
-    /// (only Aqua is offered), `None` for no match.
-    ///
     /// # Safety
     /// `best` must be nil or a live `NSString`.
     unsafe fn appearance_of_best_match(best: Id) -> Option<Appearance> {
         if best.is_null() {
             return None;
         }
-        // SAFETY: `-isEqualToString:` is `B@:@` on `NSString`; `best` is a live
-        // NSString (caller) and the name a live AppKit global.
+        // SAFETY: `-isEqualToString:` is `B@:@` on `NSString`.
         let dark = unsafe {
             appkit::send_bool_id(best, sel!(isEqualToString:), appkit::appearance_name(true))
         };
@@ -587,7 +482,6 @@ mod mac {
     }
 
     /// The light/dark side of `appearance`, an `NSAppearance`.
-    ///
     /// # Safety
     /// `appearance` must be nil or a live `NSAppearance`.
     unsafe fn appearance_of(appearance: Id) -> Option<Appearance> {
@@ -598,11 +492,7 @@ mod mac {
             appkit::appearance_name(false),
             appkit::appearance_name(true),
         ];
-        // SAFETY: `+arrayWithObjects:count:` is `@@:r^@Q` and reads `count`
-        // live, non-nil objects (two AppKit globals); the array is
-        // autoreleased and borrowed inside the caller's pool.
-        // `-bestMatchFromAppearancesWithNames:` is `@@:@` on `NSAppearance`
-        // and answers a borrowed `NSString` or nil.
+        // SAFETY: `+arrayWithObjects:count:` is `@@:r^@Q` and reads `count` live, non-nil objects (two AppKit globals).
         unsafe {
             let array = appkit::send_id_idptr_usize(
                 class(c"NSArray").as_id(),
@@ -619,30 +509,21 @@ mod mac {
         }
     }
 
-    /// `NSApp.effectiveAppearance`, the application-level appearance a
-    /// window's forced `appearance` does not change. Main thread only, with
-    /// the application already created (window attach): `None` elsewhere.
+    /// `NSApp.effectiveAppearance`, the application-level appearance a window's forced `appearance` does not change.
     pub(super) fn app_appearance() -> Option<Appearance> {
         let main_thread = MainThread::new()?;
         let app = appkit::existing_application(main_thread)?;
         aterm_objc::autoreleasepool(|_| {
-            // SAFETY: `app` is the existing main-thread AppKit application;
-            // `-effectiveAppearance` is `@@:` on
-            // `NSApplication` (10.14+) and answers a borrowed `NSAppearance`.
+            // SAFETY: `app` is the existing main-thread AppKit application.
             unsafe { appearance_of(appkit::send_id(app, sel!(effectiveAppearance))) }
         })
     }
 
-    /// The `AppleInterfaceStyle` user default: `Dark` while the desktop is
-    /// dark (including under the automatic schedule), absent while light. The
-    /// one reading available before `NSApplication` exists; Foundation only,
-    /// thread-safe, and no WindowServer connection.
+    /// The `AppleInterfaceStyle` user default.
     pub(super) fn defaults_appearance() -> Option<Appearance> {
         aterm_objc::autoreleasepool(|_| {
             let key = appkit::nsstring("AppleInterfaceStyle")?;
-            // SAFETY: `+standardUserDefaults` is `-(id)`, the process
-            // singleton; `-stringForKey:` is `@@:@` and answers a borrowed
-            // `NSString` or nil, read into a Rust string at once.
+            // SAFETY: `+standardUserDefaults` is `-(id)`, the process singleton.
             let style = unsafe {
                 let defaults =
                     appkit::send_id(class(c"NSUserDefaults").as_id(), sel!(standardUserDefaults));
@@ -659,8 +540,7 @@ mod mac {
         })
     }
 
-    /// `AppleInterfaceStyle`'s value: `Dark` is dark, anything else (absent
-    /// reads as empty) is light.
+    /// `AppleInterfaceStyle`'s value.
     pub(super) fn style_appearance(style: &str) -> Appearance {
         if style.eq_ignore_ascii_case("dark") {
             Appearance::Dark
@@ -669,23 +549,18 @@ mod mac {
         }
     }
 
-    /// The KVO target's ivars: a relay, so a test can drive the real class
-    /// without an event loop (see `reduce_motion::ReduceMotionIvars`).
+    /// The KVO target's ivars.
     pub(crate) struct OsAppearanceIvars {
         relay: Box<dyn Fn()>,
     }
 
     aterm_objc::declare_class! {
-        /// The observer of `NSApp.effectiveAppearance`. One method, the KVO
-        /// callback, which runs the relay; production's posts the
-        /// application's appearance as `Wake::OsAppearance`.
+        /// The observer of `NSApp.effectiveAppearance`.
         pub(crate) struct OsAppearanceTarget: NSObject {
             const NAME: &str = "ATermOsAppearanceTarget";
             type Ivars = OsAppearanceIvars;
 
             /// `v@:@@@^v`. Registered for one key path on one object, so
-            /// every call is an appearance change; options are 0, so `change`
-            /// is not read.
             @sel(observeValueForKeyPath:ofObject:change:context:)
             fn observe_value(
                 &self,
@@ -706,9 +581,7 @@ mod mac {
         OsAppearanceTarget::alloc_init(mtm, OsAppearanceIvars { relay })
     }
 
-    /// Observe `NSApp.effectiveAppearance` for the process's life. KVO does
-    /// not retain the observer and it is never removed: the caller keeps the
-    /// target, as `App` keeps the reduce-motion one, and `NSApp` is immortal.
+    /// Observe `NSApp.effectiveAppearance` for the process's life.
     pub(super) fn observe(
         proxy: &EventLoopProxy<Wake>,
     ) -> Option<aterm_objc::Retained<OsAppearanceTarget>> {
@@ -727,11 +600,7 @@ mod mac {
             let Some(key) = appkit::nsstring(KEY_PATH) else {
                 return false;
             };
-            // SAFETY: `app` is the existing main-thread AppKit application;
-            // `-addObserver:forKeyPath:options:context:` is `v@:@@Q^v` on
-            // every `NSObject` — `target` lives for the process (the caller
-            // keeps it), `key` is a live +1 NSString KVO copies, options 0,
-            // and a NULL context it never dereferences.
+            // SAFETY: `app` is the existing main-thread AppKit application.
             unsafe {
                 appkit::send_v_id_id_usize_ptr(
                     app,
@@ -755,9 +624,6 @@ mod mac {
         use aterm_types::Appearance;
 
         /// The KVO callback the runtime dispatches reaches the relay: the
-        /// class is registered under its name, and a real
-        /// `observeValueForKeyPath:ofObject:change:context:` send runs the
-        /// Rust body.
         #[test]
         fn the_kvo_callback_runs_the_relay() {
             use aterm_objc::{ClassType, class};
@@ -774,8 +640,7 @@ mod mac {
                 class(c"ATermOsAppearanceTarget"),
                 super::OsAppearanceTarget::class()
             );
-            // SAFETY: the declared selector's exact prototype, on a live
-            // instance; nil arguments are what the body ignores.
+            // SAFETY: the declared selector's exact prototype, on a live instance.
             unsafe {
                 let send: unsafe extern "C-unwind" fn(
                     aterm_objc::Id,
@@ -798,7 +663,6 @@ mod mac {
         }
 
         /// The best-match answer maps DarkAqua to dark and Aqua to light;
-        /// nil is no reading.
         #[test]
         fn best_match_names_map_to_appearances() {
             // SAFETY: AppKit's own name globals, and nil.
@@ -834,7 +698,6 @@ mod tests {
     use aterm_types::Appearance;
 
     /// The portal's three values: prefer-dark, prefer-light and no preference
-    /// (light, as GNOME draws it); an unknown value is no reading.
     #[test]
     fn the_portal_mapping_covers_prefer_dark_prefer_light_and_none() {
         assert_eq!(portal_color_scheme(1), Some(Appearance::Dark));
@@ -848,7 +711,6 @@ mod tests {
     }
 
     /// `gdbus call` prints Read's double variant and ReadOne's single one;
-    /// an error prints neither.
     #[test]
     fn a_portal_read_parses_both_variant_depths() {
         assert_eq!(parse_portal_read("(<<uint32 1>>,)\n"), Some(1));
@@ -862,7 +724,6 @@ mod tests {
     }
 
     /// Only the appearance key's `SettingChanged` is a reading; another
-    /// setting's signal on the same interface is not.
     #[test]
     fn a_portal_signal_is_read_only_for_the_color_scheme_key() {
         let line = "/org/freedesktop/portal/desktop: org.freedesktop.portal.Settings.SettingChanged \
@@ -912,7 +773,6 @@ mod tests {
     }
 
     /// A development build's injected launch reading is what launch builds
-    /// for, on any lane, and nothing is observed after it.
     #[test]
     fn an_injected_launch_reading_wins_and_observes_nothing() {
         for headless in [true, false] {
@@ -928,7 +788,6 @@ mod tests {
     }
 
     /// The verb reads bare, injects one word, and refuses anything else; a
-    /// shipped build (no injection) refuses the injection but still reads.
     #[test]
     fn the_appearance_verb_parses_and_gates_injection() {
         use super::appearance_request;
@@ -956,12 +815,6 @@ mod tests {
     }
 
     /// The tether law: closing the tether ends the watched program, so a
-    /// watcher never outlives the process holding it. Negative control: while
-    /// the tether is held, the watcher keeps running and printing, through
-    /// eleven ticks a tenth of a second apart (a second held, as when it ticked
-    /// once a second). The wait for end-of-file is a one-minute hang detector.
-    /// The ticks are short because the watcher's last `sleep` keeps the pipe
-    /// open until it ends.
     #[cfg(unix)]
     #[test]
     fn closing_the_tether_ends_the_watcher() {
@@ -975,8 +828,6 @@ mod tests {
         watcher.release();
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            // Only the watcher holds the pipe's write end, so end-of-file
-            // means the watcher is gone.
             for line in watcher.lines.by_ref() {
                 if line.is_err() {
                     break;

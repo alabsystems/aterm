@@ -72,7 +72,7 @@ impl Terminal {
     /// carrying `(x, y)`, for [`Self::mouse_motion_repeats_last_report`]. The input seam writes
     /// it under this terminal's lock.
     #[inline]
-    pub fn note_mouse_report(&mut self, x: u16, y: u16) {
+    pub const fn note_mouse_report(&mut self, x: u16, y: u16) {
         self.mouse_report_memo = Some(self.mouse_report_at(x, y));
     }
 

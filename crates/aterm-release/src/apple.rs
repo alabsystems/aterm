@@ -1,29 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The Apple half of `targo --unverified ship provision`: this machine gets its own
-//! Developer ID Application identity, and no private key crosses a machine boundary.
-//!
-//! Apple creates Developer ID certificates only through the developer website or Xcode: the
-//! App Store Connect API refuses every `DEVELOPER_ID_*` type, a cloud-managed identity keeps
-//! its key on Apple's servers where `codesign` cannot use it, and the website's private
-//! endpoint needs a 2FA session and is forbidden by the site terms. So the command prints
-//! the browser errand and waits, matching the arriving certificate by public key: one
-//! invocation from an unprovisioned machine to ready.
-//!
-//! There is no progress marker: every fact is derived from disk and the keychain on every
-//! pass, so Ctrl-C loses nothing and a re-run resumes where the world is. Without a
-//! terminal it reports the errand and returns.
-//!
-//! Two rules:
-//! 1. A slot is permanent: a team gets five Developer ID Application certificates, and
-//!    revocation stops already-shipped apps from launching. So it asks before spending one,
-//!    never regenerates over a CSR already out for signature, and never revokes.
-//!    `--check` never reaches that question.
-//! 2. A green verdict is demonstrated: `find-identity` proves a certificate is paired with
-//!    a key, not that `codesign` can use the key unattended (the partition-list ACL
-//!    decides). So every run that would report ready first signs something disposable,
-//!    and the verdict carries the certificate's expiry.
+//! Apple Developer ID and notarization provisioning for `ship provision`.
 
 #![cfg(unix)]
 
@@ -39,7 +17,6 @@ use crate::publish::step;
 pub(crate) const APPLE_LABEL: &str = "apple id";
 
 /// Where this machine's own Apple key material lives: beside `~/.aterm/machine.key`, and
-/// outside the repo so no `git clean` can sweep a key whose slot is spent.
 fn apple_dir() -> Option<PathBuf> {
     std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".aterm").join("apple"))
 }
@@ -53,7 +30,6 @@ fn csr_path(dir: &Path, id: &str) -> PathBuf {
 }
 
 /// A certificate file and the encoding the matcher proved it parses as (DER or PEM), so
-/// the installer cannot read it differently.
 struct MatchedCert {
     path: PathBuf,
     form: &'static str,
@@ -64,10 +40,8 @@ pub(crate) struct Observed {
     /// 40-hex SHA-1 of each VALID `Developer ID Application` identity for our team.
     pub identities: Vec<String>,
     /// Set when `security find-identity` could not run: "could not look" is not "nothing
-    /// there", and only the latter may lead to spending a slot.
     pub lookup_failed: Option<String>,
     /// Our team's Developer ID certificates present but not valid (expired, or without
-    /// their private key), so an expired one is not mistaken for none.
     pub invalid_present: usize,
     pub key: Option<PathBuf>,
     pub csr: Option<PathBuf>,
@@ -101,7 +75,6 @@ fn valid_identities() -> (Vec<String>, Option<String>) {
         .args(["find-identity", "-v", "-p", "codesigning"])
         .output()
     {
-        // One definition of "which lines count", shared with the audit that reports them.
         Ok(out) => (
             crate::provision::devid_identities(
                 &String::from_utf8_lossy(&out.stdout),
@@ -114,7 +87,6 @@ fn valid_identities() -> (Vec<String>, Option<String>) {
 }
 
 /// How many of our team's Developer ID identities the keychain holds but will not vouch
-/// for: all identities (no `-v`) minus the valid ones.
 fn invalid_identity_count() -> usize {
     let all = Command::new("/usr/bin/security")
         .args(["find-identity", "-p", "codesigning"])
@@ -133,7 +105,6 @@ fn invalid_identity_count() -> usize {
 /// What the Apple step decided.
 pub(crate) enum Outcome {
     /// An identity is installed and proved usable. `ids` holds only 40-hex SHA-1s;
-    /// anything else rides in `note`.
     Ready {
         ids: Vec<String>,
         note: Option<String>,
@@ -141,7 +112,6 @@ pub(crate) enum Outcome {
     /// Progress, waiting on the operator: not a fault to fix, which is `Blocked`.
     Waiting { what: String, next: String },
     /// `Waiting`'s shape for the read-only mode: nothing was attempted, only what a real
-    /// run would do.
     Todo { what: String, next: String },
     /// Something is wrong and the tool will not proceed past it.
     Blocked { what: String, fix: String },
@@ -150,12 +120,6 @@ pub(crate) enum Outcome {
 }
 
 /// The driver: it reads the world, and only one branch creates anything.
-///
-/// `cert_dir` is the one folder the operator named for the browser errand (`--cert-dir`):
-/// the request is copied there and the certificate looked for there. `None` touches
-/// nothing outside `~/.aterm/apple`, not even `~/Downloads`: reading a folder macOS guards
-/// from an aterm shell raises a consent dialog for aterm (`atpkg::protected`), so naming
-/// the folder is the consent.
 pub(crate) fn acquire(id: &str, may_change: bool, cert_dir: Option<&Path>) -> Outcome {
     if !cfg!(target_os = "macos") {
         return Outcome::Skipped("cuts run on macOS (Tier APPLE); no keychain on this host".into());
@@ -168,8 +132,6 @@ pub(crate) fn acquire(id: &str, may_change: bool, cert_dir: Option<&Path>) -> Ou
     };
     let mut seen = Observed::look(id);
 
-    // "Could not look" reaches neither the slot-spending branch nor the read-only one,
-    // which would report "no identity" about a keychain it never opened.
     if let Some(why) = seen.lookup_failed.as_deref() {
         return Outcome::Blocked {
             what: format!(
@@ -179,13 +141,9 @@ pub(crate) fn acquire(id: &str, may_change: bool, cert_dir: Option<&Path>) -> Ou
         };
     }
 
-    // `--check` writes nothing: generating a CSR spends a permanent slot and writes a
-    // private key, and importing mutates the keychain.
     if !may_change {
         return match (seen.identities.is_empty(), seen.key.is_some()) {
             (false, _) => verdict(seen.identities),
-            // Only a key on disk is observable; whether its request was uploaded is
-            // Apple's state.
             (true, true) => Outcome::Todo {
                 what: format!("'{id}' holds a request key and no installed certificate"),
                 next: "re-run without --check to import the certificate once you have \
@@ -205,23 +163,15 @@ pub(crate) fn acquire(id: &str, may_change: bool, cert_dir: Option<&Path>) -> Ou
         };
     }
 
-    // A leaf whose issuing intermediate is missing is invisible to `find-identity -v` (see
-    // `install_issuer_intermediate`), so it arrives as "nothing installed" and would be
-    // routed toward spending a second slot. `install()` repairs the chain on import; this
-    // repairs a machine that already held the certificate and lost the intermediate (a new
-    // login keychain, a migration, a cleanup). `invalid_present` separates the two.
     if seen.identities.is_empty()
         && seen.invalid_present > 0
         && let Some(note) = repair_installed_chain()
     {
         step(APPLE_LABEL, &note);
-        // `look` sampled before the repair; re-read so the now-valid identity is seen.
         seen = Observed::look(id);
     }
 
-    // An identity is installed: prove it can sign, every run.
     if !seen.identities.is_empty() {
-        // The spent request is public and finished, so it is removed silently. The
         // private key is never touched automatically: its slot cannot be reclaimed.
         if let Some(csr) = &seen.csr
             && paired_with_installed(&seen.key, &seen.identities[0])
@@ -231,18 +181,12 @@ pub(crate) fn acquire(id: &str, may_change: bool, cert_dir: Option<&Path>) -> Ou
         return verdict(seen.identities);
     }
 
-    // K && C, no identity — install if Apple has answered, otherwise wait for it.
     if let (Some(key), Some(csr)) = (&seen.key, &seen.csr) {
         return await_then_install(key, csr, id, &dir, seen.invalid_present, cert_dir);
     }
 
-    // A CSR with no key is unusable: a certificate issued against it could never sign,
-    // and the slot it spent does not come back.
     if seen.key.is_none() && seen.csr.is_some() {
         let csr = csr_path(&dir, id);
-        // Zero is the ordinary abandoned request. Above zero, the keychain holds a Developer
-        // ID certificate it cannot vouch for, which may be the one issued against the lost
-        // key.
         let fix = if seen.invalid_present > 0 {
             format!(
                 "delete {} and re-run to mint a fresh key and request. The {} invalid \
@@ -268,8 +212,6 @@ pub(crate) fn acquire(id: &str, may_change: bool, cert_dir: Option<&Path>) -> Ou
         };
     }
 
-    // A key with no CSR is recoverable: rebuild the request from the key (spends nothing)
-    // rather than deleting a key whose slot may be spent.
     if let Some(key) = &seen.key {
         return match write_csr(key, &csr_path(&dir, id)) {
             Ok(csr) => {
@@ -289,7 +231,6 @@ pub(crate) fn acquire(id: &str, may_change: bool, cert_dir: Option<&Path>) -> Ou
         };
     }
 
-    // !I && !K && !C — run 1. This is the only branch that spends a slot.
     match confirm_slot(id, seen.invalid_present) {
         Ok(true) => match generate(&dir, id) {
             Ok(csr) => await_then_install(
@@ -317,13 +258,9 @@ pub(crate) fn acquire(id: &str, may_change: bool, cert_dir: Option<&Path>) -> Ou
 }
 
 /// How long the command waits for the browser errand: long enough to sign in to Apple as
-/// the Account Holder, short enough that a forgotten terminal does not hold a session all
-/// night.
 const WAIT_FOR_CERT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 
 /// Print the browser errand and wait for the certificate, matched by public key as it
-/// lands in `~/.aterm/apple` or the `--cert-dir` folder, then install it. Without a
-/// terminal it reports the errand and returns.
 fn await_then_install(
     key: &Path,
     csr: &Path,
@@ -333,9 +270,6 @@ fn await_then_install(
     cert_dir: Option<&Path>,
 ) -> Outcome {
     let watch = Watch::new(cert_dir);
-    // Two causes, two remedies: an unreadable directory, or this machine's own request
-    // key unreadable. The second is not a certificate problem; sending the operator to move
-    // a .cer would loop past a key that may be corrupt.
     let blocked = |why: String| {
         let about_our_key = why.contains("could not read the public half");
         if about_our_key {
@@ -369,30 +303,17 @@ fn await_then_install(
         Err(why) => return blocked(why),
         Ok((None, rejected)) => rejected,
     };
-    // Nobody to wait for (CI, a pipe), and no errand printed on this path, so the verdict
-    // carries the only copy.
     if !has_terminal() {
         return Outcome::Waiting {
             what: waiting_text(id, invalid, &rejected, None, &watch),
-            // The same errand from the same function, minus the wait paragraph.
             next: errand_lines(csr, false, &watch).join("\n"),
         };
     }
-    // Said before the errand and the wait: "the file you downloaded is not this one" must
-    // not hide behind thirty minutes of "Apple has not answered", or the operator creates
-    // a second certificate to fix a download.
-    //
-    // The request is surfaced in the folder the operator named (and revealed in Finder)
-    // before the errand names it, since an upload dialog cannot see hidden ~/.aterm. With
-    // no folder named nothing is copied: the errand names the hidden path and how a dialog
-    // reaches it (⌘⇧G). `~/Downloads` is never touched on the operator's behalf.
     let visible = watch
         .named
         .as_deref()
         .and_then(|named| surface_csr(csr, id, named));
     let upload = visible.as_deref().unwrap_or(csr);
-    // Built here so it captures `upload`, the copy a dialog can see: the timeout verdict is
-    // the last line on screen when the command exits.
     let waiting = |rejected: &[PathBuf]| Outcome::Waiting {
         what: waiting_text(id, invalid, rejected, Some(upload), &watch),
         next: format!(
@@ -415,9 +336,6 @@ fn await_then_install(
         step(label, &note);
         label = "";
     }
-    // Nothing is printed after the errand: it ends with the trap, which must be the last
-    // thing on screen (a trailing "waiting…" reads as permission to take whatever the
-    // portal lists). The wait's facts live inside the errand, above the trap.
     for line in errand_lines(upload, true, &watch) {
         step(label, &line);
         label = "";
@@ -436,9 +354,6 @@ fn await_then_install(
                 return install(&cer, key, id);
             }
             Err(why) => return blocked(why),
-            // Kept current and said the moment a file appears: the likeliest .cer is one
-            // downloaded during the wait, and if it is the wrong one, "still waiting"
-            // would hide that and send the operator to spend a second slot.
             Ok((None, seen)) => {
                 let fresh: Vec<PathBuf> = seen
                     .iter()
@@ -446,8 +361,6 @@ fn await_then_install(
                     .cloned()
                     .collect();
                 if let Some(note) = rejected_note(&fresh, Some(upload), &watch) {
-                    // A header, so the note reads as a refusal of the file just
-                    // downloaded, not as progress.
                     step(
                         APPLE_LABEL,
                         "⚠ THE .cer THAT JUST ARRIVED IS NOT THIS REQUEST'S",
@@ -457,7 +370,6 @@ fn await_then_install(
                 rejected = seen;
             }
         }
-        // A heartbeat naming its horizon, so a long wait never looks like a hang.
         let mins = started.elapsed().as_secs() / 60;
         if mins > announced {
             announced = mins;
@@ -468,7 +380,6 @@ fn await_then_install(
             );
         }
     }
-    // Said, so the verdict cannot be mistaken for a crash.
     step(
         APPLE_LABEL,
         &format!(
@@ -480,7 +391,6 @@ fn await_then_install(
 }
 
 /// Whether there is a human to ask: the prompts' test, so "will it wait?" and "will it
-/// prompt?" never disagree.
 fn has_terminal() -> bool {
     std::fs::OpenOptions::new()
         .read(true)
@@ -490,11 +400,6 @@ fn has_terminal() -> bool {
 }
 
 /// Prove that a pinned identity (the profile's `signing_identity_sha1`) is one of this
-/// machine's valid Developer ID Application identities and can sign unattended: the test
-/// signature [`verdict`] runs, aimed at the pinned certificate. `find-identity`'s order is
-/// not stable across runs, so blessing only `ids[0]` would flip between pass and fail with
-/// two valid certificates; a valid pin that signs is what the cut accepts
-/// (`sign::select_devid_identity`).
 pub(crate) fn pinned_identity_proves(sha1: &str) -> Result<(), String> {
     let (ids, lookup_failed) = valid_identities();
     if let Some(why) = lookup_failed {
@@ -510,11 +415,9 @@ pub(crate) fn pinned_identity_proves(sha1: &str) -> Result<(), String> {
 }
 
 /// The single place a green Apple verdict is produced, so no path skips the proof. A
-/// signature that fails is not ready.
 fn verdict(ids: Vec<String>) -> Outcome {
     match prove_can_sign(&ids[0]) {
         Ok(()) => {
-            // The expiry rides here, with the proof, so every green line carries it.
             let note = expiry_note(&ids[0]);
             Outcome::Ready { ids, note }
         }
@@ -538,7 +441,6 @@ fn verdict(ids: Vec<String>) -> Outcome {
 }
 
 /// Whether the on-disk request key is the private half of the certificate this identity
-/// names. Decides only whether the spent request may be removed, never the key.
 fn paired_with_installed(key: &Option<PathBuf>, sha1: &str) -> bool {
     let Some(key) = key else { return false };
     installed_cert_spki(sha1)
@@ -546,8 +448,6 @@ fn paired_with_installed(key: &Option<PathBuf>, sha1: &str) -> bool {
 }
 
 /// The SPKI digest of the certificate the identity `sha1` names. Selected by digest:
-/// `openssl x509` parses only the first block of a `find-certificate -a` stream, and a
-/// renewal leaves two overlapping Developer ID certificates.
 fn installed_cert_spki(sha1: &str) -> Option<String> {
     let pem = installed_leaf_pem(sha1)?;
     let der = capture(
@@ -564,10 +464,6 @@ fn installed_cert_spki(sha1: &str) -> Option<String> {
 }
 
 /// The PEM of the installed `Developer ID Application` certificate whose SHA-1 (the digest
-/// `find-identity` names an identity by) is `sha1`.
-///
-/// `security find-certificate -a -p -Z` prints, per certificate, a `SHA-256 hash:` line, a
-/// `SHA-1 hash:` line, then the PEM block; nothing else separates one from the next.
 fn installed_leaf_pem(sha1: &str) -> Option<String> {
     let out = capture(
         "/usr/bin/security",
@@ -614,29 +510,19 @@ fn leaf_pem_by_sha1(text: &str, sha1: &str) -> Option<String> {
 }
 
 /// How close to expiry the green line starts naming the renewal errand: ninety days, the
-/// window Apple's renewal flow assumes.
 const RENEWAL_WINDOW_SECS: u64 = 90 * 24 * 60 * 60;
 
 /// The expiry clause on a green Apple line: `valid to 2031-08-18`, or the renewal errand
-/// once the certificate is inside its last [`RENEWAL_WINDOW_SECS`]. `find-identity -v` is
-/// a boolean, so without a date a certificate lapsing next week audits green until the
-/// day it reads as "no identity".
 fn expiry_note(sha1: &str) -> Option<String> {
     let leaf = installed_leaf_pem(sha1)?;
     let mut soonest = (cert_enddate_iso(&leaf)?, leaf.clone());
-    // A chain lives as long as its shortest link, and that is not always the leaf: the
-    // original Developer ID intermediate expires 2027-02-01, and when it passes every
-    // certificate under it stops being an identity.
     if let Some(ca) = issuer_in_keychain(&leaf) {
-        // ISO-8601 sorts chronologically.
         match cert_enddate_iso(&ca) {
             Some(iso) if iso < soonest.0 => soonest = (iso, ca),
             _ => {}
         }
     }
     let (iso, pem) = soonest;
-    // `-checkend` answers "does this outlive N seconds?" (exit 0 beyond the window, 1
-    // inside it on LibreSSL 3.3.6), so there is no date arithmetic and no second "now".
     match outlives(&pem, RENEWAL_WINDOW_SECS) {
         Some(true) => Some(format!("valid to {iso}")),
         Some(false) => Some(format!(
@@ -687,7 +573,6 @@ fn enddate_iso(line: &str) -> Option<String> {
 }
 
 /// Whether `openssl x509 -checkend` says this certificate outlives `secs`; `None` when it
-/// could not be asked, which reports no clause rather than a date.
 fn outlives(pem: &str, secs: u64) -> Option<bool> {
     let mut child = Command::new("/usr/bin/openssl")
         .args(["x509", "-noout", "-checkend", &secs.to_string()])
@@ -701,7 +586,6 @@ fn outlives(pem: &str, secs: u64) -> Option<bool> {
 }
 
 /// The label macOS gives the paired private key (the certificate's common name), for the
-/// partition-list remediation.
 fn identity_label(sha1: &str) -> Option<String> {
     let out = capture(
         "/usr/bin/security",
@@ -721,11 +605,6 @@ fn plural(n: usize) -> &'static str {
 }
 
 /// The verdict when no certificate has arrived.
-///
-/// `csr` is `Some` once a request has been surfaced to a path the operator can act on, and
-/// selects the strong half of [`rejected_note`] ("not a download problem: upload <path>").
-/// `None` selects the weak half ("move the .cer into a watched folder"); the
-/// non-interactive path keeps `None` because nothing was surfaced there.
 fn waiting_text(
     id: &str,
     invalid: usize,
@@ -752,10 +631,6 @@ fn waiting_text(
 }
 
 /// Ask a question on the controlling terminal and read one whole line back.
-///
-/// A whole line, so no leftover of "yes" answers the next prompt. `/dev/tty` must be a
-/// real terminal (the master phrase's rule), so a piped run can never answer a question
-/// about spending a permanent slot.
 fn tty_line(prompt: &str, max: usize) -> Result<String, String> {
     let mut tty = std::fs::OpenOptions::new()
         .read(true)
@@ -769,9 +644,6 @@ fn tty_line(prompt: &str, max: usize) -> Result<String, String> {
     tty.flush().ok();
     let mut line = String::new();
     let mut byte = [0u8; 1];
-    // Always drain to the newline: `max` bounds what is kept, never where reading stops.
-    // An early break leaves the answer's tail queued for the next `/dev/tty` read, which
-    // here is the echo-off master phrase.
     loop {
         match tty.read(&mut byte) {
             Ok(0) => break,
@@ -788,11 +660,6 @@ fn tty_line(prompt: &str, max: usize) -> Result<String, String> {
 }
 
 /// The one irreversible question, printed through [`crate::publish::grid_block`] under
-/// [`APPLE_LABEL`] like every line above it.
-///
-/// Both answers state their cost: `y` spends a slot forever, and `N` costs nothing and
-/// comes back next run. An operator unsure whether declining aborts the run would take the
-/// irreversible path.
 fn confirm_slot(id: &str, invalid: usize) -> Result<bool, String> {
     let mut msg = format!(
         "generating a CSR for '{id}' spends one of team {}'s five Developer ID Application \
@@ -816,7 +683,6 @@ fn confirm_slot(id: &str, invalid: usize) -> Result<bool, String> {
     let prompt = format!("\n{}", crate::publish::grid_block(APPLE_LABEL, &msg));
     let answer = tty_line(&prompt, 64)?.to_ascii_lowercase();
     let yes = answer == "y" || answer == "yes";
-    // Say when an answer that is neither yes nor no was taken as no.
     if !yes && !answer.is_empty() && answer != "n" && answer != "no" {
         step(
             APPLE_LABEL,
@@ -827,17 +693,9 @@ fn confirm_slot(id: &str, invalid: usize) -> Result<bool, String> {
 }
 
 /// The keychain profile name the notarytool credential is stored under: a local keychain
-/// label, the same on every machine. `ensure_notary` stores it, `write_credentials_profile`
-/// writes it, `provision::notary_check` live-tests it and the cut reads it back.
-/// Per-machine revocability lives in the app-specific password behind it, minted per
-/// machine at https://account.apple.com.
 pub(crate) const NOTARY_PROFILE: &str = "notary";
 
 /// Store a notarytool credential in this machine's keychain.
-///
-/// `notarytool store-credentials` owns the password prompt on this terminal's inherited
-/// stdio, so an app-specific password never passes through this process or its argv. Its
-/// default `--validate` round-trips to Apple, so a stored credential has authenticated.
 pub(crate) fn ensure_notary(may_change: bool) -> Outcome {
     if !cfg!(target_os = "macos") {
         return Outcome::Skipped("cuts run on macOS (Tier APPLE); no keychain on this host".into());
@@ -848,12 +706,7 @@ pub(crate) fn ensure_notary(may_change: bool) -> Outcome {
             next: "re-run without --check to store one".into(),
         };
     }
-    // No "already stored?" probe: the caller (`provision::notary_acquire`) live-checks with
-    // `notarytool history` first, the only test that means anything.
     let profile = NOTARY_PROFILE;
-    // Said before the prompts: the password notarytool asks for exists nowhere until the
-    // operator mints it, and an Apple ID password pasted there fails only after a round
-    // trip to Apple. Numbered, with the shown-once fact read before the tab is closed.
     step(
         "notary",
         "the password this step asks for is an APP-SPECIFIC password, NOT your Apple ID \
@@ -863,9 +716,6 @@ pub(crate) fn ensure_notary(may_change: bool) -> Outcome {
          3. copy the xxxx-xxxx-xxxx-xxxx string\n\
          then paste it at the password prompt below.",
     );
-    // Through the grid, aligned with the `notary` line above. "Blank" names its
-    // consequence: a blank answer is `Waiting`, which defers the mint, so on a first run no
-    // roster id is minted.
     let apple_id = match tty_line(
         &format!(
             "\n{}",
@@ -913,10 +763,6 @@ pub(crate) fn ensure_notary(may_change: bool) -> Outcome {
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .status();
-    // notarytool's exit status is the verdict. `security find-generic-password` cannot
-    // confirm it: notarytool stores the credential in the data-protection keychain, which
-    // `security` never sees. The caller's live `notarytool history` check confirms it
-    // authenticates and prints the line the operator reads.
     match status {
         Ok(s) if s.success() => Outcome::Ready {
             ids: Vec::new(),
@@ -939,7 +785,6 @@ pub(crate) fn ensure_notary(may_change: bool) -> Outcome {
 }
 
 /// Run 1: an RSA-2048 keypair and a CSR, both born here. `/usr/bin/openssl` explicitly: a
-/// Homebrew OpenSSL 3 ahead of it on PATH changes defaults and output formats.
 fn generate(dir: &Path, id: &str) -> Result<PathBuf, Outcome> {
     if let Err(e) = std::fs::create_dir_all(dir) {
         return Err(Outcome::Blocked {
@@ -956,8 +801,6 @@ fn generate(dir: &Path, id: &str) -> Result<PathBuf, Outcome> {
     let key = key_path(dir, id);
     let csr = csr_path(dir, id);
 
-    // Belt and braces over the state machine: `openssl genrsa -out` silently truncates an
-    // existing file, and that key may be the private half of a spent slot.
     if key.exists() || csr.exists() {
         return Err(Outcome::Blocked {
             what: format!(
@@ -978,7 +821,6 @@ fn generate(dir: &Path, id: &str) -> Result<PathBuf, Outcome> {
             fix: "install the Xcode command-line tools (`xcode-select --install`)".into(),
         });
     }
-    // The key is the half that never travels.
     if let Err(e) = chmod(&key, 0o600) {
         let _ = std::fs::remove_file(&key);
         return Err(Outcome::Blocked {
@@ -993,10 +835,7 @@ fn generate(dir: &Path, id: &str) -> Result<PathBuf, Outcome> {
 }
 
 /// Derive the request from the key: separate from [`generate`] because a lost request can
-/// be redone and a lost key cannot.
 fn write_csr(key: &Path, csr: &Path) -> Result<PathBuf, String> {
-    // The subject Keychain Access produces for a Developer ID request; Apple replaces the
-    // common name on issuance, so it only has to parse.
     let subject = format!(
         "/CN=Developer ID Application/O={}/C=US",
         pins::APPLE_TEAM_ID
@@ -1018,14 +857,8 @@ fn write_csr(key: &Path, csr: &Path) -> Result<PathBuf, String> {
 }
 
 /// The one unavoidable human step, one instruction per line, and its only spelling: both
-/// paths print these lines. The upload target has a line of its own and the trap comes
-/// last, where the eye lands. Only the Account Holder can create a Developer ID
-/// certificate (a delegate can see the list); the download is matched by public key.
-///
-/// `waiting` is set only by the interactive path, the only one that then waits.
 pub(crate) fn errand_lines(csr: &Path, waiting: bool, watch: &Watch) -> Vec<String> {
     let mut out = vec![
-        // The file first, on its own line, and named again at the step that uploads it.
         "you will upload THIS file (and only this one):".to_string(),
         format!("     {}", csr.display()),
         String::new(),
@@ -1034,8 +867,6 @@ pub(crate) fn errand_lines(csr: &Path, waiting: bool, watch: &Watch) -> Vec<Stri
          ID certificate"
             .to_string(),
         String::new(),
-        // The portal's own click order: the request is uploaded after the type and
-        // profile are chosen.
         "1. + → Software → 'Developer ID Application'".to_string(),
         "2. Profile Type 'G2 Sub-CA'".to_string(),
         "     NOT 'Previous Sub-CA' — its intermediate expires 2027-02-01".to_string(),
@@ -1045,8 +876,6 @@ pub(crate) fn errand_lines(csr: &Path, waiting: bool, watch: &Watch) -> Vec<Stri
             .to_string(),
     ];
     if watch.named.is_none() {
-        // No visible folder was named, so the download comes back to hidden ~/.aterm: say
-        // how a file dialog reaches it, and how to name a folder next time.
         out.push(
             "     (hidden folders: press ⌘⇧G in the file dialog and paste the path; or \
              re-run with --cert-dir <folder> to have the request copied to, and the \
@@ -1055,8 +884,6 @@ pub(crate) fn errand_lines(csr: &Path, waiting: bool, watch: &Watch) -> Vec<Stri
         );
     }
     if waiting {
-        // The wait's facts go above the trap: printed last, "waiting for the certificate"
-        // reads as permission to collect whatever the portal lists.
         out.push(String::new());
         out.push(format!(
             "watching {}: this step finishes the instant the matching .cer lands, and \
@@ -1067,8 +894,6 @@ pub(crate) fn errand_lines(csr: &Path, waiting: bool, watch: &Watch) -> Vec<Stri
         ));
     }
     out.push(String::new());
-    // The trap states both halves: a certificate issued from this request is the right one
-    // and costs nothing, and creating another spends one of five permanent slots.
     out.push(
         "⚠ THE TRAP: the portal's list may ALREADY show a Developer ID certificate.".to_string(),
     );
@@ -1088,9 +913,6 @@ pub(crate) fn errand_lines(csr: &Path, waiting: bool, watch: &Watch) -> Vec<Stri
          request above."
             .to_string(),
     );
-    // The common case: a wrong .cer is already in the watched folder. The act is to look
-    // again, not "delete it and start over": a non-matching .cer is ignored, and starting
-    // over mints a second certificate.
     out.push(
         "  Already downloaded one? Nothing to undo — a .cer that does not match is \
          ignored, never installed."
@@ -1105,9 +927,6 @@ pub(crate) fn errand_lines(csr: &Path, waiting: bool, watch: &Watch) -> Vec<Stri
 }
 
 /// Where the certificate is looked for and the request surfaced: `~/.aterm/apple`, plus
-/// the one folder the operator named with `--cert-dir`. Naming it is the consent, so it may
-/// be a folder macOS guards; nothing else is read, because from an aterm shell aterm owns
-/// a guarded folder's consent dialog (`atpkg::protected`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Watch {
     /// `~/.aterm/apple`, or `None` without a `$HOME` (then only `named` is read).
@@ -1125,13 +944,11 @@ impl Watch {
     }
 
     /// The folders `find_matching_cert` reads: the named one first (where the download
-    /// lands), then aterm's own.
     fn dirs(&self) -> Vec<PathBuf> {
         self.named.iter().chain(self.own.iter()).cloned().collect()
     }
 
     /// The folders, spoken for the errand (`~/Downloads or ~/.aterm/apple`), `$HOME` folded
-    /// to `~`.
     pub(crate) fn spoken(&self) -> String {
         let home = std::env::var_os("HOME").map(PathBuf::from);
         let tilde = |p: &Path| -> String {
@@ -1152,9 +969,6 @@ impl Watch {
     }
 
     /// A line, printed before the errand, saying the named folder is one macOS guards, so
-    /// a consent dialog is explained before it appears; `None` when nothing named is
-    /// guarded. Judged on the canonical path, which is what gets opened (`canonicalize` is
-    /// not itself gated); a path that cannot be resolved is judged as given.
     fn consent_note(&self) -> Option<String> {
         let named = self.named.as_deref()?;
         let home = std::env::var_os("HOME").map(PathBuf::from)?;
@@ -1181,10 +995,6 @@ impl Watch {
 }
 
 /// Copy the request into the folder the operator named, where an upload dialog can see it
-/// and where the certificate comes back, and reveal it in Finder. The CSR is public
-/// material, so the copy leaks nothing; best-effort, since the hidden path still works.
-/// Never called with an unnamed folder: writing into a guarded folder raises the
-/// terminal's consent dialog.
 #[cfg(unix)]
 fn surface_csr(csr: &Path, id: &str, named: &Path) -> Option<PathBuf> {
     let visible = named.join(format!("devid-{id}.certSigningRequest"));
@@ -1197,17 +1007,6 @@ fn surface_csr(csr: &Path, id: &str, named: &Path) -> Option<PathBuf> {
 }
 
 /// Find a downloaded certificate that belongs to this key, by comparing public keys: the
-/// machine holds the only thing that identifies the right file, so there is no `--cer`
-/// flag and no trusted filename.
-///
-/// Looks only in [`Watch::dirs`]: this polls every three seconds for up to thirty
-/// minutes, and reading an unnamed guarded folder from an aterm shell raises a consent
-/// dialog nobody asked for.
-///
-/// `Err` means "could not look"; `Ok((None, …))` means "looked, not there". The second
-/// half of the pair is every `.cer` examined and refused, so a wrong file in the folder
-/// does not read as "Apple has not answered". Paths only, no `openssl` reads: the reasons
-/// are read once, in [`rejected_note`].
 fn find_matching_cert(
     key: &Path,
     watch: &Watch,
@@ -1219,7 +1018,6 @@ fn find_matching_cert(
     for dir in watch.dirs() {
         let entries = match std::fs::read_dir(&dir) {
             Ok(e) => e,
-            // A missing folder is normal; one that exists but cannot be read is not.
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(e) => {
                 unreadable.push(format!("{}: {e}", dir.display()));
@@ -1251,10 +1049,7 @@ fn find_matching_cert(
 }
 
 /// The `.cer` files examined and refused, as one line: which file, why, and what fixes it.
-/// Named, because "no matching certificate" about a folder the operator can see a
-/// certificate in sends them to spend another slot.
 fn rejected_note(rejected: &[PathBuf], csr: Option<&Path>, watch: &Watch) -> Option<String> {
-    // Enough to recognise the one just downloaded.
     const SHOWN: usize = 3;
     if rejected.is_empty() {
         return None;
@@ -1274,8 +1069,6 @@ fn rejected_note(rejected: &[PathBuf], csr: Option<&Path>, watch: &Watch) -> Opt
         0 => String::new(),
         n => format!(" +{n} more"),
     };
-    // Name the act that fixes it, or "a different public key" reads as a bad download
-    // and the next move is a second certificate.
     let fix = match csr {
         Some(csr) => format!(
             " — this is not a download problem: upload {} at the portal and download the \
@@ -1311,7 +1104,6 @@ fn key_spki_sha256(key: &Path) -> Option<String> {
 }
 
 /// The same digest taken from a certificate in a known encoding, comparable with
-/// [`key_spki_sha256`].
 fn cert_spki_sha256(cer: &Path, form: &str) -> Option<String> {
     let pem_pub = capture(
         "/usr/bin/openssl",
@@ -1335,7 +1127,6 @@ fn cert_spki_sha256(cer: &Path, form: &str) -> Option<String> {
 }
 
 /// SHA-256 of `der`, as hex. `/usr/bin/openssl dgst -sha256` on stdin prints the bare hex
-/// (no `(stdin)= ` prefix); given a file it prints `SHA2-256(path)= <hex>`. Both parse.
 fn digest(der: &[u8]) -> Option<String> {
     let out = capture("/usr/bin/openssl", &["dgst", "-sha256"], Some(der))?;
     let text = String::from_utf8_lossy(&out);
@@ -1350,13 +1141,9 @@ fn digest(der: &[u8]) -> Option<String> {
 }
 
 /// Run 2: check the certificate, import it and the key so macOS binds them into an
-/// identity, widen the key's ACL, and prove the result signs. Retry-safe: an item already
-/// in the keychain is success.
 fn install(cer: &MatchedCert, key: &Path, id: &str) -> Outcome {
     let subject = match cert_subject(&cer.path, cer.form) {
         Some(s) => s,
-        // Not "wrong team": that would send the operator to re-issue a probably fine
-        // certificate.
         None => {
             return Outcome::Blocked {
                 what: format!("could not read the subject of {}", cer.path.display()),
@@ -1394,8 +1181,6 @@ fn install(cer: &MatchedCert, key: &Path, id: &str) -> Outcome {
     ]) {
         return Outcome::Blocked {
             what: format!("could not import {}: {e}", cer.path.display()),
-            // The failing argv, so its own error can be read; a second publishing machine is
-            // usually provisioned over SSH, where Finder is out of reach.
             fix: format!(
                 "run it yourself and read the error: security import {} -k {kc} -T \
                  /usr/bin/codesign\n\
@@ -1420,9 +1205,6 @@ fn install(cer: &MatchedCert, key: &Path, id: &str) -> Outcome {
     ]) {
         return Outcome::Blocked {
             what: format!("could not import the private key: {e}"),
-            // The exact command, never "import it by hand": a key imported without the -T
-            // flags looks installed and then cannot sign unattended (securityd raises a
-            // modal dialog the first time codesign touches it).
             fix: format!(
                 "run it yourself and read the error: security import {} -k {kc} -t priv -f \
                  openssl -T /usr/bin/codesign -T /usr/bin/security\n\
@@ -1433,8 +1215,6 @@ fn install(cer: &MatchedCert, key: &Path, id: &str) -> Outcome {
         };
     }
 
-    // A paired certificate and key still report no valid identity when the issuing
-    // intermediate is absent (normal on a Mac that has never signed): supply it.
     let mut found = valid_identities().0;
     if found.is_empty() {
         match install_issuer_intermediate(cer) {
@@ -1451,7 +1231,6 @@ fn install(cer: &MatchedCert, key: &Path, id: &str) -> Outcome {
                          installed: {e}",
                         cer.path.display()
                     ),
-                    // The form is known: `find_matching_cert` matched in that encoding.
                     fix: format!(
                         "name it: openssl x509 -inform {} -in {} -noout -issuer\n\
                          then install that intermediate from \
@@ -1470,8 +1249,6 @@ fn install(cer: &MatchedCert, key: &Path, id: &str) -> Outcome {
                  issuing intermediate present",
                 cer.path.display()
             ),
-            // Both halves get a command; the key not being in this keychain is the likelier
-            // cause.
             fix: format!(
                 "check the dates:  openssl x509 -inform {} -in {} -noout -dates\n\
                  list what this keychain can actually sign with:  security find-identity \
@@ -1484,12 +1261,6 @@ fn install(cer: &MatchedCert, key: &Path, id: &str) -> Outcome {
         };
     }
 
-    // -T alone is not enough: the partition list is a second ACL dimension, and without it
-    // securityd raises a modal dialog the first time `codesign` uses the key. Match by label
-    // (`-l`, the common name the key takes once paired) on private keys: `-D` matches a
-    // description, which private keys lack, so it would silently match nothing. Stdio is
-    // inherited so `security` can ask for the login keychain password here; no `-k`,
-    // because a password on argv shows in `ps`.
     let label =
         cert_common_name(&subject).unwrap_or_else(|| format!("Developer ID Application: {id}"));
     let _ = Command::new("/usr/bin/security")
@@ -1509,12 +1280,10 @@ fn install(cer: &MatchedCert, key: &Path, id: &str) -> Outcome {
         .stderr(Stdio::inherit())
         .status();
 
-    // Not asserted: measured by the same proof every other path uses.
     verdict(found)
 }
 
 /// `security import` fails on an item already present; a duplicate is success, so a re-run
-/// after a half-finished install does not dead-end.
 fn import_idempotent(args: &[&str]) -> Result<(), String> {
     match run("/usr/bin/security", args) {
         Ok(()) => Ok(()),
@@ -1530,20 +1299,6 @@ fn import_idempotent(args: &[&str]) -> Result<(), String> {
 }
 
 /// Install the intermediate that issued this certificate, if the keychain lacks it.
-///
-/// Without the "Developer ID Certification Authority (G2)" intermediate, macOS cannot chain
-/// the leaf to Apple Root CA: `find-identity -p codesigning` lists the identity and
-/// `find-identity -v` refuses it, while `security verify-cert` passes (it fetches
-/// intermediates over the network).
-///
-/// Trust is not widened: an intermediate is a chain link signed by Apple Root CA, and it is
-/// imported only when provably the issuer of the operator's own leaf, by subject DN and by
-/// issuing key. The key decides: Apple's two Developer ID generations share a common name,
-/// so the DN only picks which published file to try first, and the leaf's Authority Key
-/// Identifier (RFC 5280) must equal the candidate's Subject Key Identifier.
-///
-/// macOS's LibreSSL 3.3.6 has no `verify -partial_chain` and no `x509 -ext`, so both
-/// identifiers are read out of `-text`.
 fn install_issuer_intermediate(cer: &MatchedCert) -> Result<Option<String>, String> {
     /// Apple publishes both generations at fixed paths, and the leaf says which is which.
     const CA_URLS: [&str; 2] = [
@@ -1556,7 +1311,6 @@ fn install_issuer_intermediate(cer: &MatchedCert) -> Result<Option<String>, Stri
     if !issuer.contains("Developer ID Certification Authority") {
         return Ok(None);
     }
-    // Already present? Then a missing intermediate is not what is wrong here.
     if keychain_has_subject(&issuer) {
         return Ok(None);
     }
@@ -1571,8 +1325,6 @@ fn install_issuer_intermediate(cer: &MatchedCert) -> Result<Option<String>, Stri
         if !issuer.contains("G2") {
             urls.swap(0, 1);
         }
-        // Why each candidate was refused, so "could not reach apple.com" is not reported
-        // as "Apple does not publish your issuer".
         let mut refused: Vec<String> = Vec::new();
         for url in urls {
             let name = url.rsplit('/').next().unwrap_or(url);
@@ -1597,8 +1349,6 @@ fn install_issuer_intermediate(cer: &MatchedCert) -> Result<Option<String>, Stri
                 refused.push(format!("{name}: not downloadable"));
                 continue;
             }
-            // The encoding is proved, not assumed (as in [`find_matching_cert`]): a DER
-            // guess about a PEM file would read as "a different issuer".
             let Some(form) = ["DER", "PEM"]
                 .into_iter()
                 .find(|f| cert_subject(&tmp, f).is_some())
@@ -1660,14 +1410,9 @@ fn cert_key_id(cer: &Path, form: &str, header: &str) -> Option<String> {
 }
 
 /// The hex of the key identifier under `header`, uppercase and colon-free.
-///
-/// On LibreSSL 3.3.6 the value is on the line after the header, and the Authority form
-/// prefixes it with `keyid:` (OpenSSL 3 drops the prefix on both). An AKI may be followed
-/// by `DirName:`/`serial:` lines, so only the first value line counts, and it must be hex.
 fn key_id_from_text(text: &str, header: &str) -> Option<String> {
     let mut lines = text.lines().skip_while(|l| !l.trim().starts_with(header));
     let header_line = lines.next()?;
-    // OpenSSL has printed the value on the header line itself in some releases.
     let inline = header_line.trim().strip_prefix(header).unwrap_or("").trim();
     let raw = if inline.is_empty() {
         lines.next()?.trim()
@@ -1685,12 +1430,6 @@ fn key_id_from_text(text: &str, header: &str) -> Option<String> {
 }
 
 /// The same repair for a machine that already holds the certificate and lost the
-/// intermediate (a login-keychain rebuild, a Keychain Access cleanup), which an import
-/// never sees: each of our team's leaves is exported and run through
-/// [`install_issuer_intermediate`]'s gate.
-///
-/// Errors are dropped: this is opportunistic, an unrelated certificate must not become a
-/// Blocked verdict, and the branch table after it reports the real state either way.
 fn repair_installed_chain() -> Option<String> {
     let pems = capture(
         "/usr/bin/security",
@@ -1703,8 +1442,6 @@ fn repair_installed_chain() -> Option<String> {
         ],
         None,
     )?;
-    // `-c` matches on the common name alone, so other teams' blocks can be in this stream;
-    // the team check below filters them.
     for block in String::from_utf8_lossy(&pems).split_inclusive("-----END CERTIFICATE-----") {
         if !block.contains("BEGIN CERTIFICATE") {
             continue;
@@ -1732,7 +1469,6 @@ fn repair_installed_chain() -> Option<String> {
 }
 
 /// A temp file nobody else can hold: `create_new` fails on an existing path or planted
-/// symlink rather than overwriting it, and the pid in the name separates concurrent runs.
 fn temp_cert(bytes: &[u8]) -> Result<PathBuf, String> {
     use std::os::unix::fs::OpenOptionsExt as _;
     let dir = std::env::temp_dir();
@@ -1777,8 +1513,6 @@ fn keychain_cert_with_subject(subject: &str) -> Option<String> {
         ],
         None,
     )?;
-    // One PEM block per certificate; compare each subject rather than trusting the
-    // common-name filter, because both generations share a common name.
     String::from_utf8_lossy(&pems)
         .split_inclusive("-----END CERTIFICATE-----")
         .find(|block| {
@@ -1835,9 +1569,6 @@ fn cert_subject(cer: &Path, form: &str) -> Option<String> {
 }
 
 /// The common name out of an `openssl x509 -subject` line, in both dialects: LibreSSL
-/// (macOS) prints `subject= /CN=Developer ID Application: Name (TEAM)/OU=TEAM/O=Name/C=US`,
-/// OpenSSL 3 `subject=CN = Name, OU = ...`. A wrong label makes the partition-list call
-/// match nothing.
 fn cert_common_name(subject: &str) -> Option<String> {
     let after = subject
         .split_once("CN=")
@@ -1853,9 +1584,6 @@ fn cert_common_name(subject: &str) -> Option<String> {
 }
 
 /// Sign a throwaway copy of a system binary with the identity, proving the ACL as well as
-/// the pairing. A per-run directory and `create_new` on the file: a predictable path in a
-/// world-writable TMPDIR lets a concurrent audit remove the copy before `codesign`, and
-/// `fs::copy` follows a pre-created symlink.
 fn prove_can_sign(sha1: &str) -> Result<(), String> {
     use std::os::unix::fs::OpenOptionsExt as _;
     let dir = temp_run_dir("probe")?;
@@ -1888,9 +1616,6 @@ fn prove_can_sign(sha1: &str) -> Result<(), String> {
 }
 
 /// A directory this run alone can hold: `create_dir` fails on an existing entry or planted
-/// symlink, and the 0700 mode is set at creation, so a shared /tmp never lets anyone else
-/// write inside. The pid separates concurrent runs; the counter steps over a directory a
-/// killed run left behind.
 fn temp_run_dir(what: &str) -> Result<PathBuf, String> {
     use std::os::unix::fs::DirBuilderExt as _;
     let base = std::env::temp_dir();
@@ -1906,12 +1631,6 @@ fn temp_run_dir(what: &str) -> Result<PathBuf, String> {
 }
 
 /// The `--release-credentials` profile a Tier APPLE cut is given, written only when every
-/// part of it is already true, so its existence means "this machine can cut".
-///
-/// `create_new`: an existing profile is never clobbered; it may hold a headless
-/// `notary_password`, a hand-chosen `signing_identity_sha1` or a different key. The Ed25519
-/// key is copied in because `sign.rs` reads `signing_key` only from here, so the file is
-/// created 0600 with the mode (never readable for an instant).
 pub(crate) fn write_credentials_profile(
     id: &str,
     roster: &Path,
@@ -2060,9 +1779,6 @@ mod tests {
             downloads_note.contains("would like to access files"),
             "{downloads_note}"
         );
-        // App Data (`~/Library/Containers/...`) gets its own wording: the dialog
-        // says "would like to access data from other apps" and is asked on every
-        // run (not one-time).
         let app_data = Watch::new(Some(
             &home.join("Library/Containers/com.aterm.nonexistent-test"),
         ));
@@ -2076,7 +1792,6 @@ mod tests {
         );
         let plain = Watch::new(Some(&home.join(".aterm").join("apple-scratch")));
         assert!(plain.consent_note().is_none());
-        // Per component, never a string prefix: `Downloadsx` is not `Downloads`.
         let lookalike = Watch::new(Some(&home.join("Downloadsx")));
         assert!(lookalike.consent_note().is_none());
     }
@@ -2092,7 +1807,6 @@ mod tests {
             .expect("the second certificate");
         assert!(second.contains("newer"), "{second}");
         assert!(!second.contains("older"), "{second}");
-        // `find-identity` prints the digest uppercase; the comparison may not care.
         assert!(
             leaf_pem_by_sha1(stream, "1111111111111111111111111111111111111111")
                 .is_some_and(|p| p.contains("older"))
@@ -2101,7 +1815,6 @@ mod tests {
     }
 
     /// Verbatim LibreSSL 3.3.6 `x509 -text` over the Developer ID leaf and its G2 issuer:
-    /// the authority form carries a `keyid:` prefix, the subject form does not.
     #[test]
     fn the_issuing_key_is_read_out_of_both_identifier_forms() {
         let leaf = "        X509v3 extensions:\n            \
@@ -2118,7 +1831,6 @@ mod tests {
             key_id_from_text(leaf, SUBJECT_KEY_ID).as_deref(),
             Some("7A7CDC1EA9B4E0951A801B6C69468D94C26D6157")
         );
-        // A certificate carrying neither is not one this code may guess about.
         assert!(
             key_id_from_text("X509v3 Basic Constraints: critical\n", AUTHORITY_KEY_ID).is_none()
         );

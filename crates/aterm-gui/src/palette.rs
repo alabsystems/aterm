@@ -1,26 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The own-rendered, introspectable command palette: a [`DrawPrim`] card built from the
-//! platform-neutral [`crate::menu::MENU_MODEL`], so the application menu works on every
-//! platform, including Linux, which has no native menu bar ([`crate::menu`] stubs
-//! `install` there).
-//!
-//! Each command flattens to a [`PaletteRow`]. Menu rows resolve `enabled` / `checked` from
-//! live `App` state as `validateMenuItem:` would. The active native tab app contributes its
-//! own section; those rows keep the exact window, instance, view, lifecycle generation and
-//! reducer action that produced them. A `query` narrows the list (fuzzy subsequence over
-//! `label` + `section`, plus a theme row's appearance). Menu activation converges on
-//! `Wake::MenuAction`; a shared menu row supplied by a native command keeps that
-//! native destination. Native activation is generation-checked before it becomes
-//! `AppEvent::Action`.
-//!
-//! A Theme section follows the menu rows: one row per theme the catalog can draw
-//! ([`PaletteTheme`], built-ins then loaded theme files), its appearance as the hint.
-//! Highlighting one previews it ([`PaletteState::take_theme_highlight_change`], read by
-//! `App::sync_palette_theme_preview` once per event-loop turn), Enter writes it, and
-//! closing the palette reverts. View ▸ Choose Theme… opens the palette scoped to that
-//! section ([`PaletteState::themes_only`]).
+//! Self-rendered command palette ([`PaletteState`], [`PaletteRow`]) built from [`crate::menu::MENU_MODEL`].
 
 use std::borrow::Cow;
 use std::time::Instant;
@@ -37,26 +18,18 @@ use crate::type_scale::{StepPx, TypeStep};
 use crate::widget::{DrawPrim, TextFace, TextWeight, TrayInput, rgba, text_prim};
 
 /// The most command rows the palette shows at once; beyond this the filtered list scrolls
-/// (the `body` band the painter, the scroll clamp, and the selection move all agree on).
 const MAX_CMD_ROWS: usize = 14;
 
 /// Chrome rows framing the command band: the title and pinned query row on top, the
-/// key-hint footer below.
 const CHROME_ROWS: usize = 3;
 
 /// Maximum logical width of the floating command card, so wide windows keep enough of the
-/// owning app visible to read as a modal layer.
 const MAX_CARD_WIDTH: f32 = 820.0;
 
 /// Windows sets the palette as a Fluent flyout: its words in the system UI face (Segoe
-/// UI) where they were the terminal's monospace, the section chips in one right-aligned
-/// column instead of trailing each label, a scroll indicator when the list overflows, and
-/// the window behind it dimmed ([`palette_scrim`]). macOS and Linux keep the look they
-/// had (the 2026-10-17 Windows audit; appearance changes there are Windows-only).
 const PALETTE_FLUENT: bool = cfg!(windows);
 
 /// Windows lists the application menu (About, Settings…, Exit) after every other
-/// section ([`PaletteState::new`]).
 const PALETTE_APP_MENU_LAST: bool = PALETTE_FLUENT;
 
 /// The face the palette sets its words in ([`PALETTE_FLUENT`]).
@@ -67,8 +40,6 @@ const PALETTE_FACE: TextFace = if PALETTE_FLUENT {
 };
 
 /// The width of `s` at `px` in `face`, measured the way that face is drawn: the chrome
-/// stack's real advances for the monospace face ([`text_w`]), the UI face's own
-/// advances, kerning and tracking otherwise.
 fn face_w(face: TextFace, s: &str, px: f32) -> f32 {
     match face {
         TextFace::Mono => text_w(s, px),
@@ -76,10 +47,7 @@ fn face_w(face: TextFace, s: &str, px: f32) -> f32 {
     }
 }
 
-/// The smoke layer behind the palette's card where it is a Fluent flyout
-/// ([`PALETTE_FLUENT`]): `SmokeFillColorDefault`, black at 30% in both themes, so the
-/// text behind the card stops competing with it. The overlay splice lays it over the
-/// whole window behind the card (`OverlayModel::scrim`). `None` elsewhere.
+/// Smoke scrim colour behind the palette card under [`PALETTE_FLUENT`].
 pub(crate) fn palette_scrim() -> Option<crate::widget::Rgba> {
     PALETTE_FLUENT.then(|| rgba([0, 0, 0], 0x4D))
 }
@@ -92,9 +60,6 @@ struct PaletteLayout {
 }
 
 /// One pure geometry projection shared by paint and hit-testing. The overlay supplies the
-/// whole available viewport; the command card remains content-height, width-capped, and
-/// centred within it. Tiny windows retain at least a two-cell-wide card before margins
-/// collapse, and height clamps to the rows that actually exist.
 fn palette_layout_for_count(count: usize, g: &SettingsGeom) -> PaletteLayout {
     let tray_w = (g.cols as f32 * g.cw).max(0.0);
     let tray_h = (g.panel_rows as f32 * g.ch).max(0.0);
@@ -120,9 +85,7 @@ fn palette_layout(state: &PaletteState, g: &SettingsGeom) -> PaletteLayout {
     palette_layout_for_count(state.filtered_count(), g)
 }
 
-/// Exact native reducer destination captured when its command row enters the palette.
-/// Stable identity plus the lifecycle generation prevent a delayed activation from being
-/// redirected to whichever app happens to be active later.
+/// Exact native reducer destination captured when a native command row enters the palette.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct NativeCommandTarget {
     pub(crate) window: crate::WindowId,
@@ -134,7 +97,6 @@ pub(crate) struct NativeCommandTarget {
 
 impl NativeCommandTarget {
     /// A native command may supply the exact destination of a shared menu command.
-    /// Derive that overlap from the canonical command identities, not display labels.
     fn menu_action(&self) -> Option<MenuAction> {
         let native = crate::command_registry::native_document_action(self.action.as_str())?;
         MENU_MODEL
@@ -146,14 +108,12 @@ impl NativeCommandTarget {
     }
 }
 
-/// The command domains share pixels, filtering, controls, and accessibility while
-/// keeping their dispatch authorities distinct.
+/// Dispatch target of a [`PaletteRow`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum PaletteTarget {
     Menu(MenuAction),
     Native(NativeCommandTarget),
-    /// A Theme-section row: the theme id `theme = "…"` takes (a built-in's canonical
-    /// name or a theme file's stem).
+    /// Theme-section row carrying the theme ID (`theme = "…"`).
     Theme(String),
 }
 
@@ -181,24 +141,22 @@ impl PaletteTarget {
     }
 }
 
-/// The Theme section's chip, and the word the theme rows' filter haystack carries.
+/// Section chip and filter token for theme rows.
 pub(crate) const THEME_SECTION: &str = "Theme";
 
-/// The Theme section's last row: Settings ▸ Themes, the Theme Showcase.
+/// Label of the final Theme-section row that opens Settings ▸ Themes.
 pub(crate) const BROWSE_THEMES_LABEL: &str = "Browse all themes\u{2026}";
 
-/// One theme the palette offers: a built-in or a theme file that loaded. Built by
-/// `App::palette_themes` from the admitted catalog, so the palette reads no file and
-/// resolves nothing.
+/// Theme entry offered in the palette's Theme section.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PaletteTheme {
-    /// What `theme = "…"` takes.
+    /// Config theme identifier (`theme = "…"`).
     pub(crate) id: String,
-    /// The row's text: the theme's name, joined by its id when the two differ.
+    /// Display label for the theme row.
     pub(crate) label: String,
-    /// The appearance it is drawn for, shown as the row's hint.
+    /// Target appearance shown as the row's right-hand hint.
     pub(crate) appearance: aterm_types::Appearance,
-    /// The theme the config draws (checked).
+    /// Whether this theme is currently active in the config.
     pub(crate) current: bool,
 }
 
@@ -221,42 +179,32 @@ impl PaletteTheme {
     }
 }
 
-// Retain the compact `row.action == MenuAction::…` idiom used by the menu-model tests.
 impl PartialEq<MenuAction> for PaletteTarget {
     fn eq(&self, other: &MenuAction) -> bool {
         self.menu() == Some(*other)
     }
 }
 
-/// One flattened command, a single row of the palette. Menu rows come from a
-/// `MenuEntry::Item`, native rows from the active app's [`Command`] metadata, theme rows
-/// from [`PaletteTheme`].
-/// Disabled commands remain visible but cannot produce a target.
+/// Single flattened command row in the palette.
 #[derive(Clone, Debug)]
 pub(crate) struct PaletteRow {
-    /// The dim section chip: the menu's title (or submenu label), the native app's name, or
-    /// [`THEME_SECTION`].
+    /// Section chip (menu title, native app name, or [`THEME_SECTION`]).
     pub section: Cow<'static, str>,
-    /// The command label. `Cow` because [`PaletteState::resolve`] writes some live ones:
-    /// the update row's version, a fleet hold's reason.
+    /// Command display label.
     pub label: Cow<'static, str>,
-    /// The command this row dispatches. A shared menu label may carry an exact native target.
+    /// Dispatch target activated by this row.
     pub action: PaletteTarget,
     /// A shared menu row's identity while its dispatch target is native. Recovery-only
-    /// native rows have no alias and retain their reducer-supplied labels and ordering.
     menu_alias: Option<MenuAction>,
-    /// The visual key-equivalent character ("" for none), right-aligned as an accelerator.
+    /// Visual key-equivalent character (`""` for none).
     pub key: &'static str,
-    /// The accelerator's modifier mask (rendered ⌘ / ⇧⌘ / ⌃⌘ before `key`).
+    /// Modifier mask for [`Self::key`].
     pub mods: MenuMods,
-    /// Native-app shortcut metadata, a theme row's appearance, or off macOS a menu row's
-    /// effective chord hint; when empty, a menu row derives its accelerator from `mods` +
-    /// `key`.
+    /// Right-aligned shortcut hint or theme appearance label.
     pub shortcut: Cow<'static, str>,
-    /// Whether the command is currently actionable; a disabled row paints dim and Enter
-    /// on it is a no-op (mirroring `validateMenuItem:` greying).
+    /// Whether the command is currently actionable.
     pub enabled: bool,
-    /// A checkbox state for toggle commands (e.g. Serious Mode); `None` for plain commands.
+    /// Checkbox state for toggle commands (`None` for plain commands).
     pub checked: Option<bool>,
 }
 
@@ -266,9 +214,7 @@ impl PaletteRow {
     }
 }
 
-/// Native command snapshot prepended to the shared command surface. The section is owned
-/// because app names are selected dynamically, while command titles/shortcuts arrive as
-/// owned reducer metadata.
+/// Snapshot of active native-app commands prepended to the palette.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct NativeCommandScope {
     pub(crate) window: crate::WindowId,
@@ -279,108 +225,72 @@ pub(crate) struct NativeCommandScope {
     pub(crate) commands: Vec<Command>,
 }
 
-/// Live `App` predicates that resolve per-row `enabled`/`checked`, the conditions
-/// `validateMenuItem:` uses. Computed by `App::palette_live` and fed to
-/// [`PaletteState::resolve`], so this module stays `App`-free.
+/// Live `App` state used by [`PaletteState::resolve`] to compute per-row `enabled` and `checked`.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct PaletteLive {
-    /// A text selection exists (gates Copy).
+    /// Whether a text selection exists (gates Copy).
     pub has_selection: bool,
-    /// The active editor has changes its file grant can save.
+    /// Whether the active editor has savable changes.
     pub can_save: bool,
-    /// The focused content can open a search.
+    /// Whether the focused content supports search.
     pub can_find: bool,
-    /// The focused content has a query Find Next/Previous can navigate.
+    /// Whether the focused content has an active search query for Find Next/Previous.
     pub can_find_again: bool,
-    /// The front session's effective matrix-rain state (its runtime override, else the
-    /// config bit): the checkmark on Matrix Rain. False with no front terminal.
+    /// Whether matrix rain is active on the front session.
     pub rain_on: bool,
-    /// The front window's promotable kitty (its tenured program cat on glass, else the
-    /// launch kitty) is the pinned favourite: the checkmark on Favourite This Kitty.
+    /// Whether the front window's kitty is the saved favourite.
     pub kitty_favourited: bool,
-    /// Process-wide serious mode is active (checkmark on Serious Mode).
+    /// Whether process-wide serious mode is active.
     pub serious_mode: bool,
-    /// The window is full-screen (the row reads Exit Full Screen).
+    /// Whether the window is in full-screen mode.
     pub fullscreen: bool,
-    /// The window is maximized (on Windows Window ▸ Zoom reads Restore Down,
-    /// [`crate::menu::zoom_title`]).
+    /// Whether the window is maximized ([`crate::menu::zoom_title`]).
     pub maximized: bool,
-    /// The front tab is split, so ⌘W closes the focused pane (the row reads
-    /// Close Pane).
+    /// Whether the front tab is split (Close Pane vs Close Tab).
     pub front_tab_split: bool,
-    /// The front window has more than one tab (gates Next/Previous Tab).
+    /// Whether the front window has more than one tab.
     pub multi_tab: bool,
-    /// The active whole tab is a native app rather than a terminal pane tree. Terminal-only
-    /// split/session-window commands stay visible but disabled.
+    /// Whether the active tab is a native app rather than a terminal pane tree.
     pub native_tab_active: bool,
-    /// The frontmost window's front content is a terminal session. Unlike
-    /// `!native_tab_active`, also false with no window frontmost (macOS runs
-    /// windowless), so per-session rows refuse instead of silently no-op'ing.
+    /// Whether the frontmost content is a terminal session.
     pub terminal_front: bool,
-    /// Whether the front window can present a rename editor (the tab strip, else a native
-    /// toolbar); without one the row greys rather than accept a dead click.
+    /// Whether the front window can present a rename editor.
     pub can_rename: bool,
-    /// The front session has a theme of its own (gates Clear Tab Theme).
+    /// Whether the front session has a per-tab theme override.
     pub tab_theme: bool,
-    /// At least one native tab snapshot is available for identity-fresh reopen.
+    /// Whether a closed native tab snapshot is available to reopen.
     pub can_reopen_closed_tab: bool,
-    /// A non-expired split-leaf recovery record is available.
+    /// Whether a closed split-pane recovery record is available to reopen.
     pub can_reopen_closed_view: bool,
-    /// This platform has a real local-file picker. Picker-backed rows remain visible but
-    /// disabled where `menu::choose_local_file` cannot produce a path.
+    /// Whether this platform provides a local file picker.
     pub local_file_picker_available: bool,
-    /// Hand Back has a hold to lift on the front session: the PERSON'S
-    /// (Take Over, `origin=person`), or an Owner client's where no person's
-    /// stands (`fabric::Holds::hand_back_origin`): Hand Back is live, Take
-    /// Over is not. A fleet hold moves neither row.
+    /// Whether Hand Back has a person or remote hold to lift on the front session.
     pub front_person_hold: bool,
-    /// The hold Hand Back would lift is ANOTHER MAC'S (the step-in's
-    /// `origin=remote`): Take Over is live beside Hand Back, the person
-    /// winning over it.
+    /// Whether the front session's hold belongs to another Mac (`origin=remote`).
     pub front_remote_hold: bool,
-    /// View ▸ Show Needs in Windows' checkmark (`[presence] rim`, as the App
-    /// currently applies it).
+    /// Whether View ▸ Show Needs in Windows (`[presence] rim`) is enabled.
     pub needs_in_windows: bool,
-    /// View ▸ Stats Bars' radio: the form the App applies (`[sys]
-    /// stats_bars`); `None` in a pure test that names none.
+    /// Active View ▸ Stats Bars setting (`[sys] stats_bars`).
     pub stats_bars: Option<crate::stats_deck::StatsBars>,
-    /// View ▸ Deck Size's radio: the choice the App applies (`[sys]
-    /// stats_deck_size`); `None` in a pure test that names none.
+    /// Active View ▸ Deck Size setting (`[sys] stats_deck_size`).
     pub deck_size: Option<crate::stats_plan::DeckSizePref>,
-    /// The Agents rows' live bits: a local need (Next That Needs You), a
-    /// fleet (Read the Fleet, Fleet Machines), a window (Overview), and why
-    /// Summarize cannot start, `None` when it can.
+    /// Live state for Agents menu rows.
     pub agents: crate::menu::AgentsLive,
-    /// A strictly newer `(build, version)` is staged (`App.relaunch`): the Version section
-    /// shows the one-click "↑ Install aterm v<staged> now" row.
+    /// Newer `(build, version)` staged for one-click install, if any.
     pub staged: Option<(u64, String)>,
-    /// The apply lane's standing failure for that staged build (`App::apply_trouble_for`):
-    /// it replaces the row's "now" with the attempt count, the cause, and whether the
-    /// automatic lane will retry, through the same [`crate::menu::staged_apply_label`]
-    /// as the Version menu.
+    /// Standing apply-lane failure for the staged build, if any.
     pub staged_trouble: Option<crate::update_apply_trouble::ApplyTrouble>,
-    /// That staged build is on hold (`App::latched_activation_trial_spent`): the row reads
-    /// "is on hold" and opens the details, as the Version menu does.
+    /// Whether the staged build is on hold after an activation trial.
     pub staged_on_hold: bool,
-    /// The post-update realized arrow is live, as `(new version, spawn instant)`: the
-    /// Version section shows the "↑ Updated to aterm v<new>" row, fading over
-    /// [`crate::relaunch_notice::REALIZED_ARROW_TTL`]. Ignored while `staged` is `Some`.
+    /// Live post-update `(new_version, spawn_instant)` indicator, if any.
     pub realized: Option<(String, Instant)>,
-    /// `MotionPolicy::Reduced` is in force: the realized row's fade freezes at full alpha.
+    /// Whether reduced motion is active.
     pub reduced_motion: bool,
-    /// Accelerator hints for menu rows: the effective `[keybindings]` chord per menu
-    /// action (`Keybindings::display_chord_for`). Filled off macOS only, where they
-    /// replace the "" that [`accel`] blanks ⌘ chords to; macOS rows keep their native ⌘
-    /// key-equivalents. Empty in pure tests.
+    /// Effective `[keybindings]` chord hints per [`MenuAction`].
     pub menu_accels: Vec<(MenuAction, String)>,
 }
 
-/// The Version section's dynamic row label, or `None` when the row is removed: the
-/// staged install offer, else the post-update row. [`PaletteState::resolve`] shows it and
-/// the off-macOS `chrome` menu lines print it (`menu::menu_chrome_lines`).
-///
-/// Same label law as the macOS Version menu (`menu::staged_apply_label`). Plain `↑`, not
-/// the colour emoji: the palette is own-rendered text with no emoji face.
+/// Dynamic label for the Version section's update row, or `None` when hidden.
 pub(crate) fn apply_row_label(live: &PaletteLive) -> Option<String> {
     if let Some((build, v)) = &live.staged {
         return Some(crate::menu::staged_apply_label(
@@ -397,21 +307,7 @@ pub(crate) fn apply_row_label(live: &PaletteLive) -> Option<String> {
 }
 
 impl PaletteState {
-    /// Build the palette from [`MENU_MODEL`], every command enabled and unchecked (the pure,
-    /// `App`-free default the unit tests use). The palette MIRRORS the bar and nothing
-    /// else: every row is a model item, in model order, its section chip the menu's
-    /// title — or, for a submenu's rows, the submenu's label, the word a human
-    /// would say — plus the [`crate::menu::PALETTE_ONLY`] rows, right after the
-    /// Agents menu's, the one place they are offered. `App::palette_enter` calls
-    /// [`Self::resolve`] right after to fold in live enabled/checked state.
-    ///
-    /// Two departures from the bar. A command this platform can never perform
-    /// ([`MenuAction::offered_on_this_platform`]: Check for Updates… where no in-app
-    /// updater exists) is left out rather than listed grey forever, as the `chrome`
-    /// verb's menu lines leave it out. And on Windows the application menu (About,
-    /// Settings…, Exit) comes LAST: there it is the Help and File ▸ Exit corners of a
-    /// Windows app, and a palette that opened on "About aterm" put a destination
-    /// where the everyday commands belong ([`PALETTE_APP_MENU_LAST`]).
+    /// Builds the default palette from [`MENU_MODEL`] with all commands enabled and unchecked.
     pub(crate) fn new() -> Self {
         let mut rows = Vec::new();
         let (app, rest) = MENU_MODEL.split_at(1);
@@ -439,9 +335,6 @@ impl PaletteState {
                     });
                 }
             }
-            // The palette-only rows sit right after the bar menu whose matter
-            // they are (the message bus's three and Fleet Machines: no bar
-            // item each).
             if section.title == crate::menu::PALETTE_ONLY_SECTION {
                 for (label, action) in crate::menu::PALETTE_ONLY {
                     rows.push(PaletteRow {
@@ -472,9 +365,7 @@ impl PaletteState {
         }
     }
 
-    /// Append the Theme section, replacing any earlier one: one row per theme in the order
-    /// given, then the Browse row. The row the cursor starts on counts as already
-    /// previewed, so opening the palette changes nothing on screen.
+    /// Replaces the Theme section with `themes` followed by [`BROWSE_THEMES_LABEL`].
     pub(crate) fn with_themes(mut self, themes: Vec<PaletteTheme>) -> Self {
         self.rows.retain(|row| row.section != THEME_SECTION);
         self.rows.extend(themes.into_iter().map(PaletteTheme::row));
@@ -494,9 +385,7 @@ impl PaletteState {
         self
     }
 
-    /// Scope the palette to its Theme section (View ▸ Choose Theme…): only that section
-    /// passes the filter, and the cursor starts on the checked row (the theme the config
-    /// draws), which counts as already previewed.
+    /// Scopes the palette to the Theme section (View ▸ Choose Theme…).
     pub(crate) fn themes_only(mut self) -> Self {
         self.themes_only = true;
         let current = self
@@ -509,22 +398,18 @@ impl PaletteState {
         self
     }
 
-    /// Whether the palette is scoped to its Theme section.
+    /// Whether the palette is scoped to the Theme section.
     pub(crate) fn is_themes_only(&self) -> bool {
         self.themes_only
     }
 
-    /// The theme id under the cursor, when the cursor is on a Theme row.
+    /// Theme ID currently under the cursor, if on a Theme row.
     pub(crate) fn highlighted_theme(&self) -> Option<&str> {
         let idx = self.filtered_indices().nth(self.selected)?;
         self.rows[idx].action.theme()
     }
 
-    /// The highlight's theme when it differs from what the palette last asked the App
-    /// to preview, recording it as asked: `Some(Some(id))` to preview `id`,
-    /// `Some(None)` when the highlight left the Theme section, `None` when nothing
-    /// moved. Edge-triggered, so a run of moves inside one event-loop turn costs one
-    /// install, and a preview something else replaced is not fought over.
+    /// Returns the newly highlighted theme ID (or `None`) when it changes for live preview.
     pub(crate) fn take_theme_highlight_change(&mut self) -> Option<Option<String>> {
         let now = self.highlighted_theme().map(str::to_string);
         if now == self.theme_previewed {
@@ -534,17 +419,13 @@ impl PaletteState {
         Some(now)
     }
 
-    /// Prepend the active native app's command metadata, above the menu rows so the scoped
-    /// commands are visible without scrolling.
+    /// Prepends the active native app's commands above the menu rows.
     pub(crate) fn with_native_commands(mut self, scope: NativeCommandScope) -> Self {
         self.replace_native_commands(Some(scope));
         self
     }
 
-    /// Build the focused recovery surface returned by a native app's blocked
-    /// close transaction. Unlike the ordinary palette, this contains exactly
-    /// the recovery capabilities supplied by `CloseReadiness::Blocked`; global
-    /// menu rows cannot push the explanation/actions out of the visible band.
+    /// Builds a recovery-only palette surface for a blocked native close transaction.
     pub(crate) fn native_close_recovery(scope: NativeCommandScope) -> Self {
         let mut state = Self::new();
         state.rows.clear();
@@ -555,10 +436,7 @@ impl PaletteState {
         state
     }
 
-    /// Whether this is the recovery-only surface for one exact live native
-    /// target. Ordinary palettes always retain menu rows, so they cannot be
-    /// mistaken for a close refusal when deferred teardown replay decides
-    /// whether the blocker must keep focus.
+    /// Whether this palette is the close-recovery surface for the exact native target.
     pub(crate) fn is_native_close_recovery_for(
         &self,
         window: crate::WindowId,
@@ -574,14 +452,10 @@ impl PaletteState {
             })
     }
 
-    /// Replace only app-scoped rows, keeping the menu and Theme rows, the live query, and
-    /// menu resolution. Active-tab changes use this to remove native commands on terminal
-    /// tabs or retarget a different native app without rebuilding menu state.
+    /// Replaces only native-app rows while preserving menu/theme rows and the query.
     pub(crate) fn replace_native_commands(&mut self, scope: Option<NativeCommandScope>) {
         self.pointer_over = None;
         self.pointer_armed = None;
-        // Restore shared menu rows before removing the previous native scope. Their
-        // labels, positions and accelerators survive switching back to a terminal.
         for row in &mut self.rows {
             if let Some(action) = row.menu_alias.take() {
                 row.action = PaletteTarget::Menu(action);
@@ -607,8 +481,6 @@ impl PaletteState {
             if let Some(action) = target.menu_action()
                 && let Some(row) = self.rows.iter_mut().find(|row| row.action == action)
             {
-                // One menu-labelled row, with the native view's captured custody. It
-                // must not become an unscoped MenuAction queued for a later front tab.
                 row.action = PaletteTarget::Native(target);
                 row.menu_alias = Some(action);
                 row.enabled = command.enabled;
@@ -634,22 +506,8 @@ impl PaletteState {
         self.clamp_scroll();
     }
 
-    /// Fold live `App` state into per-row `enabled`/`checked`, mirroring `validateMenuItem:`:
-    /// toggles get a checkmark; gated commands disable when their precondition is absent;
-    /// everything else stays enabled.
-    ///
-    /// The Version section's ApplyUpdate row is dynamic, like the macOS Version menu
-    /// (`menu::update_version_menu`):
-    /// * staged: "↑ Install aterm v<staged> now", one Enter installs in place;
-    /// * realized (fresh post-update): the time-faded "↑ Updated to aterm v<new>" row,
-    ///   which takes ApplyUpdate's nothing-staged fallback, the Software Update route;
-    /// * neither: the row is removed.
-    ///
-    /// Idempotent: called at every open and on live transitions (`palette_refresh_live`),
-    /// so it inserts, rewrites or removes from any prior state.
+    /// Resolves per-row `enabled`, `checked`, and dynamic labels from `live`.
     pub(crate) fn resolve(&mut self, live: &PaletteLive) {
-        // Metadata changed under the gesture: a later release must not inherit authority
-        // from the row set painted before this resolve.
         self.pointer_over = None;
         self.pointer_armed = None;
         self.realized_since = None;
@@ -667,8 +525,6 @@ impl PaletteState {
         match (dynamic_label, pos) {
             (Some(label), Some(i)) => self.rows[i].label = label,
             (Some(label), None) => {
-                // Re-insert at the head of the Version section (before its About row),
-                // the slot `PaletteState::new` gave it.
                 let at = self
                     .rows
                     .iter()
@@ -697,56 +553,38 @@ impl PaletteState {
         for row in &mut self.rows {
             let Some(action) = row.menu() else {
                 // Native enabled state is reducer-owned command metadata. It is revalidated
-                // immediately before dispatch as well as represented faithfully here.
                 continue;
             };
-            // Off macOS the effective chord fills `shortcut`, so `row_accel` and the accessibility
-            // description show the chord that works here, not the "" [`accel`] blanks ⌘ to.
             row.shortcut = match live.menu_accels.iter().find(|(a, _)| *a == action) {
                 Some((_, chord)) => Cow::Owned(chord.clone()),
                 None => Cow::Borrowed(""),
             };
-            // A shared menu label retains the captured native view's enabled state,
-            // not the global front window's. Dispatch refreshes that view's metadata.
             if matches!(row.action, PaletteTarget::Native(_)) {
                 continue;
             }
             row.checked = None;
             row.enabled = true;
             match action {
-                // The verb carries the state, as the native View item does.
                 MenuAction::ToggleFullScreen => {
                     row.label = Cow::Borrowed(crate::menu::full_screen_title(live.fullscreen));
                 }
-                // …as the caption's maximize button does on Windows.
                 MenuAction::Zoom => {
                     row.label = Cow::Borrowed(crate::menu::zoom_title(live.maximized));
                 }
-                // ⌘W closes the focused pane of a split tab; the row says which.
                 MenuAction::CloseTab => {
                     row.label = Cow::Borrowed(crate::menu::close_row_title(live.front_tab_split));
                 }
                 MenuAction::ToggleSeriousMode => row.checked = Some(live.serious_mode),
-                // Per-session: the checkmark mirrors the front session's effective
-                // rain; with no front session the row disables (and the invoke fence
-                // refuses) instead of silently no-op'ing.
                 MenuAction::ToggleMatrixRain => {
                     row.checked = Some(live.rain_on);
                     row.enabled = live.terminal_front;
                 }
-                // Process-wide: the launch kitty exists with no front terminal, so the row
-                // stays enabled everywhere.
                 MenuAction::FavouriteKitty => {
                     row.checked = Some(live.kitty_favourited);
                 }
-                // The name is session metadata: with no front session the row
-                // disables (and the invoke fence refuses).
                 MenuAction::RenameSession => {
                     row.enabled = live.terminal_front && live.can_rename;
                 }
-                // Check for Updates… is not gated on updater state: where it is
-                // listed at all (`Self::new` drops the rows this platform does not
-                // offer) the action always at least opens the Software Update route.
                 MenuAction::Copy => row.enabled = live.has_selection,
                 MenuAction::Save => row.enabled = live.can_save,
                 MenuAction::Find => row.enabled = live.can_find,
@@ -762,17 +600,12 @@ impl PaletteState {
                 | MenuAction::ViewSessionInNewWindow => {
                     row.enabled = !live.native_tab_active;
                 }
-                // The focused session's own rows: its harness log,
-                // reset and tab theme.
                 MenuAction::HarnessLog | MenuAction::ResetTerminal | MenuAction::ChooseTabTheme => {
                     row.enabled = live.terminal_front;
                 }
-                // Only a tab with a theme of its own has one to clear.
                 MenuAction::ClearTabTheme => {
                     row.enabled = live.terminal_front && live.tab_theme;
                 }
-                // The Agents rows read their live bits (the native bar's
-                // `validateMenuItem:` reads the same, published).
                 MenuAction::NextNeed => row.enabled = live.agents.needs_local,
                 MenuAction::Overview => row.enabled = live.agents.any_window,
                 MenuAction::ReadFleet | MenuAction::FleetMachines => {
@@ -782,14 +615,9 @@ impl PaletteState {
                     row.label = Cow::Borrowed(crate::menu::summarize_title(live.agents.in_fleet));
                     row.enabled = live.agents.summarize_block.is_none();
                 }
-                // Same editor as the pin, same surface rule.
                 MenuAction::SetRole => {
                     row.enabled = live.terminal_front && live.can_rename;
                 }
-                // THE PERSON'S HOLD PAIR reads the live hold (the Packages
-                // doctrine): Take Over without the person's hold, Hand Back
-                // with it, both on a front terminal — and both under another
-                // Mac's.
                 MenuAction::TakeOver => {
                     row.enabled =
                         live.terminal_front && (!live.front_person_hold || live.front_remote_hold);
@@ -817,7 +645,6 @@ impl PaletteState {
                             == action.deck_size_pref().unwrap_or_default(),
                     );
                 }
-                // The lens hangs from the bars: none to hang from, nothing to open.
                 MenuAction::ToggleStatsLens => {
                     row.enabled = live
                         .stats_bars
@@ -827,21 +654,17 @@ impl PaletteState {
                 _ => {}
             }
         }
-        // A live re-resolve can shrink the row set (the update row was removed) while a
-        // filter/cursor is active — re-clamp so painter and cursor never diverge.
         self.clamp_scroll();
     }
 
-    /// The paint alpha for `row` at `now`: `1.0` except the realized "↑ Updated to aterm
-    /// v<new>" row, which fades per `relaunch_notice::realized_alpha`. Computed at paint
-    /// time so an open palette steps down as the fingerprint's elapsed bucket advances;
-    /// frozen at full under `MotionPolicy::Reduced`.
+    /// Paint alpha (`0.0..=1.0`) for `row` at `now`.
     pub(crate) fn row_alpha(&self, row: &PaletteRow, now: Instant) -> f32 {
         if row.action != MenuAction::ApplyUpdate {
             return 1.0;
         }
         let Some(since) = self.realized_since else {
-            return 1.0; // the staged "install now" row never fades
+            // the staged "install now" row never fades
+            return 1.0;
         };
         if self.realized_frozen {
             return 1.0;
@@ -849,27 +672,14 @@ impl PaletteState {
         crate::relaunch_notice::realized_alpha(now.duration_since(since))
     }
 
-    /// Append a character to the filter and reset the cursor to the top of the (renarrowed)
-    /// list: the tests' typing seam ([`Self::edit`] is the keyboard's and the control
-    /// seam's). Non-printing controls are ignored by the caller before this point.
+    /// Appends `c` to the filter query and resets selection to the top.
     #[cfg(test)]
     pub(crate) fn push_char(&mut self, c: char) {
         self.query.push(c);
         self.renarrowed();
     }
 
-    /// Apply one keyboard edit to the filter through the editing model every in-grid
-    /// one-line field shares ([`crate::app_search::apply_field_edit`]: the find bar and
-    /// the inline rename), so the palette answers the same readline chords they do.
-    ///
-    /// The filter has no caret: it paints none and typing always appends, so the edit
-    /// runs with the caret at the END and the caret it leaves is discarded. A motion
-    /// (`^A`/`^E`/`^B`/`^F`, `←`/`→`, Home/End, word motion) therefore changes nothing,
-    /// and a forward kill (`^K`, `^D`, `⌦`) has nothing after the caret to remove. What
-    /// edits the filter is typing and the backward kills: `⌫`/`^H` a character,
-    /// `^W`/`⌥⌫` (and Ctrl+`⌫` off macOS) a word, `^U`/`⌘⌫` the whole query. A changed
-    /// query resets the cursor to the top of the renarrowed list, as typing does.
-    /// Returns whether the query changed.
+    /// Applies a [`crate::app_search::SearchEdit`] to the filter query.
     pub(crate) fn edit(&mut self, edit: crate::app_search::SearchEdit) -> bool {
         let mut caret = self.query.len();
         let changed = crate::app_search::apply_field_edit(&mut self.query, &mut caret, edit);
@@ -880,7 +690,6 @@ impl PaletteState {
     }
 
     /// The query changed: the list re-narrows from its top, and the pointer's row
-    /// identity no longer names what is under it.
     fn renarrowed(&mut self) {
         self.selected = 0;
         self.scroll = 0;
@@ -888,10 +697,7 @@ impl PaletteState {
         self.pointer_armed = None;
     }
 
-    /// The indices into `rows` in scope that pass the fuzzy filter, in row order: every
-    /// query char appears, in order, in the lowercased `"label  section"`, plus a theme
-    /// row's appearance (an empty query matches all). The haystack streams lazily, and
-    /// count-only callers skip the list.
+    /// Indices into `rows` that pass the active scope and fuzzy query filter.
     pub(crate) fn filtered(&self) -> Vec<usize> {
         self.filtered_indices().collect()
     }
@@ -903,7 +709,6 @@ impl PaletteState {
             if !self.in_scope(r) {
                 return false;
             }
-            // A theme row's hint is its appearance, so "light" finds the light themes.
             let hint = if r.action.theme().is_some() {
                 &*r.shortcut
             } else {
@@ -922,7 +727,6 @@ impl PaletteState {
     }
 
     /// Whether `row` belongs to the palette's scope: every row, or only the Theme
-    /// section under View ▸ Choose Theme….
     fn in_scope(&self, row: &PaletteRow) -> bool {
         !self.themes_only || row.section == THEME_SECTION
     }
@@ -945,12 +749,11 @@ impl PaletteState {
     }
 
     /// The visible command band height: the filtered count, capped at [`MAX_CMD_ROWS`]. The
-    /// single value the painter, the scroll clamp, and [`Self::move_selection`] agree on.
     fn body(&self) -> usize {
         self.filtered_count().min(MAX_CMD_ROWS)
     }
 
-    /// Move the cursor by `delta` over the filtered set (wrapping), keeping it on-screen.
+    /// Moves the selection by `delta` over the filtered set (wrapping) and keeps it visible.
     pub(crate) fn move_selection(&mut self, delta: isize) {
         self.pointer_over = None;
         self.pointer_armed = None;
@@ -962,9 +765,7 @@ impl PaletteState {
         self.clamp_scroll_for_count(n);
     }
 
-    /// Scroll the visible filtered band without wrapping. The selection keeps its slot in
-    /// the viewport, so `scroll <= selected < scroll + body` holds at both clamps. A wheel
-    /// gesture cancels any armed click.
+    /// Scrolls the visible command band by `delta` without wrapping.
     pub(crate) fn scroll_by(&mut self, delta: isize) -> bool {
         let n = self.filtered_count();
         let body = n.min(MAX_CMD_ROWS);
@@ -995,8 +796,7 @@ impl PaletteState {
             )
     }
 
-    /// Move the cursor to a filtered-set index (an OS accessibility Focus/Click on a row
-    /// lands here), clamped into range and kept on-screen. A no-op when nothing matches.
+    /// Clamps and moves the selection to filtered index `idx`.
     #[cfg(a11y_tree)]
     pub(crate) fn select(&mut self, idx: usize) {
         self.pointer_over = None;
@@ -1013,8 +813,7 @@ impl PaletteState {
         self.clamp_scroll_for_count(n);
     }
 
-    /// Hover a filtered row, moving the visible selection wash with the pointer. `None`
-    /// means the modal still owns the pointer but it is outside a painted command row.
+    /// Updates pointer hover to filtered index `idx`.
     pub(crate) fn pointer_hover(&mut self, idx: Option<usize>) -> bool {
         let target = idx.and_then(|idx| {
             self.filtered_indices()
@@ -1029,8 +828,7 @@ impl PaletteState {
         before != (self.selected, self.scroll, self.pointer_over.clone())
     }
 
-    /// Arm the exact hovered target on left press. Disabled rows still get selection
-    /// feedback; [`Self::pointer_release`] keeps them inert.
+    /// Arms the hovered target at filtered index `idx` on left mouse press.
     pub(crate) fn pointer_press(&mut self, idx: Option<usize>) -> bool {
         let mut changed = self.pointer_hover(idx);
         let armed = self.pointer_over.clone();
@@ -1039,8 +837,7 @@ impl PaletteState {
         changed
     }
 
-    /// Settle a left release. Activation requires the exact same typed target at press and
-    /// release, and that target must still be enabled in the current row snapshot.
+    /// Settles a left mouse release at `idx`, returning `(changed, activated_target)`.
     pub(crate) fn pointer_release(&mut self, idx: Option<usize>) -> (bool, bool) {
         let mut changed = self.pointer_hover(idx);
         let armed = self.pointer_armed.take();
@@ -1059,7 +856,6 @@ impl PaletteState {
     }
 
     /// Keep `selected` within `[scroll, scroll + body)` and `scroll` within bounds, so
-    /// painter and cursor never diverge.
     fn clamp_scroll(&mut self) {
         self.clamp_scroll_for_count(self.filtered_count());
     }
@@ -1084,15 +880,14 @@ impl PaletteState {
         }
     }
 
-    /// The typed target the cursor's row dispatches, or `None` when the filtered list is
-    /// empty or the selected row is disabled.
+    /// Dispatch target of the currently selected row, if enabled.
     pub(crate) fn selected_target(&self) -> Option<PaletteTarget> {
         let idx = self.filtered_indices().nth(self.selected)?;
         let row = &self.rows[idx];
         row.enabled.then(|| row.action.clone())
     }
 
-    /// [`Self::selected_target`] narrowed to a menu action, for the menu-model tests.
+    /// [`Self::selected_target`] narrowed to a [`MenuAction`].
     #[cfg(test)]
     pub(crate) fn selected_action(&self) -> Option<MenuAction> {
         let idx = self.filtered_indices().nth(self.selected)?;
@@ -1100,20 +895,18 @@ impl PaletteState {
         row.enabled.then(|| row.menu()).flatten()
     }
 
-    /// The overlay height (rows) the card wants: chrome plus the capped command band, never
-    /// fewer than one band row.
+    /// Desired card height in grid rows.
     #[cfg(test)]
     pub(crate) fn wanted_rows(&self) -> usize {
         CHROME_ROWS + self.filtered_count().clamp(1, MAX_CMD_ROWS)
     }
 
-    /// `(scroll, total, visible)` for `controls front`: rows scrolled past, the scope's row
-    /// count, and the command rows shown (capped at `MAX_CMD_ROWS`).
+    /// Returns `(scroll, total, visible)` row counts for `controls front`.
     pub(crate) fn scroll_extent(&self) -> (usize, usize, usize) {
         (self.scroll, self.scope_len(), self.body())
     }
 
-    /// Machine-readable lines for the `controls menu` verb: the rows the card paints.
+    /// Machine-readable row descriptions for `controls menu`.
     pub(crate) fn controls_lines(&self) -> Vec<String> {
         let vis = self.filtered();
         let mut out = Vec::with_capacity(vis.len() + 2);
@@ -1153,11 +946,7 @@ impl PaletteState {
         out
     }
 
-    /// A fingerprint of everything the card paints (query, cursor, scroll, scope, every row),
-    /// folded into the frame's `RepaintKey`; never `0` while open (`0` is the closed
-    /// sentinel). While the realized row is live and unfrozen the elapsed fade bucket is
-    /// folded too, so an open palette re-presents once per fade step (the `about_to_wait`
-    /// sweep arms the matching wake).
+    /// Hash fingerprint of everything painted by the palette card.
     pub(crate) fn fingerprint(&self) -> u64 {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -1199,42 +988,24 @@ impl PaletteState {
     }
 }
 
-/// The command palette's accessibility tree, read from the same [`PaletteState`] as the
-/// pixels ([`palette_tray`]) and `controls menu` ([`PaletteState::controls_lines`]). A
-/// window root parents a [`aterm_a11y::model::Role::ListBox`] of the filtered rows, one
-/// [`aterm_a11y::model::Role::MenuItem`] each (label = command label, description = section,
-/// `toggled` for checkable rows). An enabled row carries [`aterm_a11y::model::Action::Click`] and
-/// [`aterm_a11y::model::Action::Focus`]; a disabled row omits `Click`, as Enter on it is inert.
-/// Focus follows `selected`.
-///
-/// Id contract (the Palette branch of `App::on_accessibility_action`): the window root is
-/// `NodeId(0)`; each row id combines a hash of the filtered target set with its slot, so a
-/// request queued against an old native view/generation cannot address a new row after a
-/// tab switch. The ListBox lives at a disjoint sentinel id.
+/// Builds the accessibility tree for the command palette from `state`.
 #[cfg(a11y_tree)]
 pub(crate) fn palette_a11y(state: &PaletteState) -> aterm_a11y::model::TreeUpdate {
     use aterm_a11y::model::{Action, Node, Role, Toggled};
 
     let vis = state.filtered();
-    // Derived once: the epoch is slot-independent, and each derivation walks the whole
-    // filtered set.
     let epoch = state.a11y_epoch();
 
     let rows = vis.iter().map(|&i| {
         let row = &state.rows[i];
         let mut node = Node::new(Role::MenuItem);
         node.set_label(row.label.as_ref());
-        // A screen reader speaks this, so it goes through `platform_accel` (no
-        // macOS-only "Cmd-F" read aloud elsewhere). Not the full `row_accel`, which
-        // would also add a menu row's ⌘ key-equivalent to what VoiceOver says.
         let accel = platform_accel(&row.shortcut);
         let mut description = if accel.is_empty() {
             row.section.to_string()
         } else {
             format!("{} \u{b7} {accel}", row.section)
         };
-        // The row's help sentence: the words the native item carries as its tool tip,
-        // so a screen reader hears what a hover shows.
         if let Some(action) = row.menu() {
             description.push_str(": ");
             description.push_str(action.help());
@@ -1257,11 +1028,7 @@ pub(crate) fn palette_a11y(state: &PaletteState) -> aterm_a11y::model::TreeUpdat
     list_overlay_a11y(root, epoch, state.selected, rows)
 }
 
-/// The accessibility tree of a list overlay (the palette, the session picker, the
-/// Overview): a Window root (`NodeId(0)`) labelled `root_label` parents a ListBox
-/// at a disjoint sentinel id whose children are `rows`, one node per slot with its id
-/// minted from `epoch` ([`a11y_node_id_for`]). Focus is the `selected` row's node
-/// (clamped); the root when the list is empty.
+/// Builds the accessibility tree for a modal list overlay (palette, session picker, Overview).
 #[cfg(a11y_tree)]
 pub(crate) fn list_overlay_a11y(
     root_label: &str,
@@ -1271,7 +1038,6 @@ pub(crate) fn list_overlay_a11y(
 ) -> aterm_a11y::model::TreeUpdate {
     use aterm_a11y::model::{Node, NodeId, Role, Tree, TreeId, TreeUpdate};
 
-    // High + disjoint from the `slot + 1` row ids.
     const LIST: NodeId = NodeId(u64::MAX);
     let root_id = NodeId(0);
     let mut nodes: Vec<(NodeId, Node)> = Vec::with_capacity(rows.len() + 2);
@@ -1304,15 +1070,13 @@ pub(crate) fn list_overlay_a11y(
     }
 }
 
-/// Mint a list-overlay row node id from an already-derived epoch: the epoch in the high
-/// half, `slot + 1` in the low.
+/// Mints a list-overlay row [`aterm_a11y::model::NodeId`] from `epoch` and `slot`.
 #[cfg(a11y_tree)]
 pub(crate) fn a11y_node_id_for(epoch: u32, slot: usize) -> aterm_a11y::model::NodeId {
     aterm_a11y::model::NodeId((u64::from(epoch) << 32) | (slot as u64 + 1))
 }
 
-/// Decode a row node back to its slot: `None` unless `node` was minted by `epoch` for
-/// one of the `count` live rows, so a stale platform request fails closed.
+/// Decodes a row `node` back to its slot index if it matches `epoch` and `count`.
 #[cfg(a11y_tree)]
 pub(crate) fn a11y_slot_for(
     epoch: u32,
@@ -1325,8 +1089,7 @@ pub(crate) fn a11y_slot_for(
     (a11y_node_id_for(epoch, slot) == node && slot < count).then_some(slot)
 }
 
-/// Fold a row-set hash to a row-id epoch, never `u32::MAX` (the high half of the ListBox
-/// sentinel id).
+/// Folds a 64-bit hash into a non-`u32::MAX` accessibility epoch.
 #[cfg(a11y_tree)]
 pub(crate) fn a11y_epoch_from(hash: u64) -> u32 {
     let epoch = hash as u32;
@@ -1337,12 +1100,9 @@ pub(crate) fn a11y_epoch_from(hash: u64) -> u32 {
     }
 }
 
-/// Transient per-window command palette state. While a window holds `Some(PaletteState)`,
-/// printable chars filter, Up/Down move the cursor, Enter dispatches, Esc closes.
+/// Transient per-window command palette state.
 pub(crate) struct PaletteState {
     /// Native rows, then every flattened command from [`MENU_MODEL`] in menu order, then
-    /// the Theme section. [`PaletteState::resolve`] rewrites or removes the Version
-    /// section's ApplyUpdate row.
     rows: Vec<PaletteRow>,
     /// The type-to-filter query ([`Self::filtered`]).
     query: String,
@@ -1351,48 +1111,38 @@ pub(crate) struct PaletteState {
     /// First filtered row shown in the command band (scroll offset).
     scroll: usize,
     /// Exact row currently under the pointer. Keyboard/accessibility selection does not
-    /// imply pointer ownership, so this remains distinct from `selected`.
     pointer_over: Option<PaletteTarget>,
     /// Exact target armed by a left press. It prevents release after a filter/tab change
-    /// from activating a different command that happens to occupy the same visual slot.
     pointer_armed: Option<PaletteTarget>,
     /// When the realized row spawned (`Some` only while `resolve` saw a live realized
-    /// state and no staged build): drives [`Self::row_alpha`] and the fingerprint's bucket.
     realized_since: Option<Instant>,
     /// `MotionPolicy::Reduced` snapshot: freeze the realized fade at full alpha.
     realized_frozen: bool,
     /// Scoped to the Theme section (View ▸ Choose Theme…).
     themes_only: bool,
     /// The theme the palette last asked the App to preview (`None` off the Theme section):
-    /// the edge [`Self::take_theme_highlight_change`] detects.
     theme_previewed: Option<String>,
 }
 
 impl PaletteState {
-    /// The resolved rows, in order: what the painter, `controls menu` and the a11y tree
-    /// read.
+    /// All resolved rows in display order.
     #[cfg(test)]
     pub(crate) fn rows(&self) -> &[PaletteRow] {
         &self.rows
     }
 
-    /// The filter as typed, for the key-routing tests of other modules.
+    /// Current filter query string.
     #[cfg(test)]
     pub(crate) fn query(&self) -> &str {
         &self.query
     }
 
-    /// Resolve an action by name (the `action=` token [`Self::controls_lines`] prints,
-    /// e.g. `NewTab`) for the socket `invoke` verb. A row [`Self::resolve`] disabled
-    /// errs as disabled, an unmatched name as unknown; an enabled row wins over a
-    /// disabled duplicate.
+    /// Resolves an enabled [`MenuAction`] by its `action=` token name.
     pub(crate) fn action_by_name(&self, name: &str) -> Result<MenuAction, String> {
         // A RETIRED name answers with what to use instead, never "unknown".
         if let Some(instead) = crate::menu::retired_invoke_name(name) {
             return Err(format!("retired: {instead}"));
         }
-        // Accepted aliases (`OpenLedger`, `HoldSession`, `ShowConnectionMap`, …)
-        // reach their current action ([`crate::menu::canonical_invoke_name`]).
         let name = crate::menu::canonical_invoke_name(name);
         let mut seen_disabled = false;
         for r in &self.rows {
@@ -1416,8 +1166,6 @@ impl PaletteState {
     }
 
     /// Accessibility row identity epoch. Cursor/focus movement deliberately does not enter this
-    /// hash (Focus followed by Click remains valid); row targets, lifecycle generations,
-    /// enabled state, and filtering do, so stale platform requests fail closed.
     #[cfg(a11y_tree)]
     fn a11y_epoch(&self) -> u32 {
         use std::hash::{Hash, Hasher};
@@ -1441,8 +1189,7 @@ impl PaletteState {
         a11y_node_id_for(self.a11y_epoch(), slot)
     }
 
-    /// Decode only a node minted by the current filtered target epoch. An old native
-    /// generation or tab scope cannot redirect a delayed screen-reader Click.
+    /// Decodes an accessibility `node` minted by the current filtered target epoch into a filtered index.
     #[cfg(a11y_tree)]
     pub(crate) fn a11y_filtered_index(&self, node: aterm_a11y::model::NodeId) -> Option<usize> {
         a11y_slot_for(self.a11y_epoch(), node, self.filtered_count())
@@ -1450,11 +1197,8 @@ impl PaletteState {
 }
 
 /// Format a visual accelerator, e.g. `⌘K` / `⇧⌘N` / `⌃⌘F`; empty when the command has no
-/// key-equivalent. Cosmetic: the keystroke itself is handled by `App::on_key` / the
-/// native bar.
 fn accel(mods: MenuMods, key: &str) -> String {
     // Off macOS there is no ⌘ key and the real chord differs (see `platform_accel`): blank,
-    // and `resolve` writes the true chord from `PaletteLive::menu_accels` into `shortcut`.
     if key.is_empty() || !cfg!(target_os = "macos") {
         return String::new();
     }
@@ -1468,13 +1212,6 @@ fn accel(mods: MenuMods, key: &str) -> String {
 }
 
 /// Off macOS, drops the macOS-only key-equivalents from a native app's `shortcut` string,
-/// keeping each `·`-separated alternative on its own ("Cmd-S · C-x C-s" becomes "C-x C-s").
-/// The string also feeds the accessibility description.
-///
-/// Never rewrite `Cmd-` to `Ctrl-` mechanically: Settings ▸ Search is `Ctrl+Shift+F` off
-/// macOS, Reader ▸ Copy `Ctrl+Shift+C`, and the editor's `Cmd-S` has no Ctrl twin outside
-/// Windows. Each `commands()` site emits the platform-true string where one exists; this is
-/// the backstop.
 fn platform_accel(shortcut: &str) -> String {
     if cfg!(target_os = "macos") {
         return shortcut.to_string();
@@ -1488,25 +1225,16 @@ fn platform_accel(shortcut: &str) -> String {
 }
 
 /// Whether one accelerator alternative names a macOS-only chord, in any spelling. Pure
-/// and cfg-free so both platforms' answers test in one build.
-///
-/// - ⌘ / `Cmd` / `Command`: no Command key exists elsewhere.
-/// - ⌥ / `Opt` / `Option`: the key exists as Alt, but the spelling is macOS notation,
-///   so it is dropped; a part meaning the Windows/Linux key is spelled `Alt-`/`M-`.
 fn accel_is_mac_only(part: &str) -> bool {
     const MAC_ONLY_WORDS: &[&str] = &["Cmd", "Command", "Opt", "Option"];
     if part.contains('\u{2318}') || part.contains('\u{2325}') {
         return true;
     }
-    // A modifier word in either separator spelling, anywhere in the part, so
-    // `Shift-Cmd-S` is caught too.
     part.split(['-', '+'])
         .any(|segment| MAC_ONLY_WORDS.contains(&segment))
 }
 
 /// The one accelerator projection for every observer: native rows through
-/// [`platform_accel`], menu rows through [`accel`]. The painted card and the accessibility
-/// description both read it, so what is shown and what is said agree.
 fn row_accel(row: &PaletteRow) -> String {
     if row.shortcut.is_empty() {
         accel(row.mods, row.key)
@@ -1515,9 +1243,7 @@ fn row_accel(row: &PaletteRow) -> String {
     }
 }
 
-/// The painted selection/hit rectangle for one visible command slot, deriving the layout
-/// itself. Test-only: painter and hit-test call `palette_row_rect_in` with the layout they
-/// hold, and tests assert both against this one rectangle.
+/// Painted selection/hit rectangle for visible slot `visible_slot`.
 #[cfg(test)]
 pub(crate) fn palette_row_rect(
     state: &PaletteState,
@@ -1545,8 +1271,7 @@ fn palette_row_rect_in(
     ))
 }
 
-/// Filtered-list index under a card-local point. Only rows actually painted after the
-/// current scroll offset participate; chrome, row gaps, and outside-card points miss.
+/// Filtered row index under card-local point `(px, py)`.
 pub(crate) fn palette_row_hit(
     state: &PaletteState,
     g: &SettingsGeom,
@@ -1565,9 +1290,7 @@ pub(crate) fn palette_row_hit(
     None
 }
 
-/// True iff every char of `needle` appears in `haystack` in order (both already
-/// lowercased); an empty needle always matches. The haystack is an iterator so
-/// [`PaletteState::filtered`] lowercases lazily.
+/// Whether every character of lowercased `needle` appears in order in `haystack`.
 pub(crate) fn fuzzy_subsequence(needle: &str, haystack: impl Iterator<Item = char>) -> bool {
     let mut hay = haystack;
     'outer: for nc in needle.chars() {
@@ -1581,17 +1304,7 @@ pub(crate) fn fuzzy_subsequence(needle: &str, haystack: impl Iterator<Item = cha
     true
 }
 
-/// Paint the command palette as an opaque floating [`DrawPrim`] card: a centred title, a
-/// pinned query row with a shown/total count, then one row per filtered command with the
-/// accelerator right-aligned, a checkmark for `checked`, dim text for disabled, and the
-/// cursor row washed and ringed. Pure Panel / Stroke / Text, so CPU and GPU render alike.
-///
-/// The words are set in [`PALETTE_FACE`] and measured in it ([`face_w`]); a Fluent
-/// palette ([`PALETTE_FLUENT`]) also aligns the section chips in one column, marks an
-/// overflowing list with a scroll indicator, tops the card with a filter box instead
-/// of the title and query row ([`palette_filter_box`]), selects with a neutral fill
-/// and an accent pill, and sets its secondary words in the secondary ink
-/// ([`overlay_secondary_ink`]).
+/// Appends [`DrawPrim`] primitives for the command palette card to `out`.
 pub(crate) fn palette_tray(
     state: &PaletteState,
     g: &SettingsGeom,
@@ -1605,8 +1318,6 @@ pub(crate) fn palette_tray(
     let mut prims = overlay_card_frame(layout.card, ch, &r, true);
     let face = PALETTE_FACE;
 
-    // A run at an explicit baseline (mixed sizes on one row share the dominant size's
-    // baseline), in full RGBA so the realized row can fade.
     let text_at = |prims: &mut Vec<DrawPrim>,
                    x: f32,
                    baseline: f32,
@@ -1626,7 +1337,6 @@ pub(crate) fn palette_tray(
             color,
         ));
     };
-    // A single-size run cap-height-centred in the `ch`-tall row at `y0`.
     let text =
         |prims: &mut Vec<DrawPrim>, x: f32, y0: f32, size: StepPx, s: String, color: [u8; 4]| {
             text_at(prims, x, row_baseline(y0, ch, size.get()), size, s, color);
@@ -1661,9 +1371,7 @@ pub(crate) fn palette_tray(
             rgba(r.text_primary, 0xFF),
         ));
 
-        // Pinned query row: a framed field with the live filter + a "shown of total"
-        // count.
-        let qy = card_y + ch; // row 1
+        let qy = card_y + ch;
         prims.push(DrawPrim::Stroke {
             x: card_x + cw * 1.5,
             y: qy + 2.0,
@@ -1703,15 +1411,11 @@ pub(crate) fn palette_tray(
         );
     }
 
-    // The scrolling command band, from `scroll`. Cap to the rows the card actually has.
     let body = layout.body_rows;
     let label_x = card_x + cw * 2.0;
     let accel_right = card_x + card_w - cw * 2.0;
     let (body_px, cap) = (TypeStep::Body.px(px), TypeStep::Caption.px(px));
     let shown = || (0..body).filter_map(|slot| vis.get(state.scroll + slot));
-    // A Fluent palette sets the section chips in ONE column, right-aligned a gap
-    // before the widest accelerator the visible rows carry; trailing each label they
-    // formed a ragged edge down the card. Elsewhere a chip trails its label.
     let chip_right = PALETTE_FLUENT.then(|| {
         let widest = shown()
             .map(|&idx| face_w(face, &row_accel(&state.rows[idx]), cap.get()))
@@ -1722,8 +1426,6 @@ pub(crate) fn palette_tray(
             accel_right
         }
     });
-    // Sampled once per paint for `row_alpha`; the fingerprint's elapsed bucket schedules
-    // the re-presents.
     let now = Instant::now();
     for slot in 0..body {
         let Some(&idx) = vis.get(state.scroll + slot) else {
@@ -1735,15 +1437,9 @@ pub(crate) fn palette_tray(
         let y0 = card_y + (2 + slot) as f32 * ch;
         let is_sel = state.scroll + slot == state.selected;
         if is_sel {
-            // The card's own `layout`: re-deriving it would rerun the filter.
             let (x, y, width, height) = palette_row_rect_in(&layout, g, slot)
                 .expect("painted palette slot has a row rectangle");
             if PALETTE_FLUENT {
-                // WinUI's list selection, the Settings rail's own
-                // (`native_ui::FLUENT_RAIL_SELECTION`): a subtle neutral fill and a
-                // 3-wide accent pill at the row's leading edge, the ink unchanged.
-                // The accent-outlined box it replaces selected unlike every other
-                // list in the app (the 2026-10-18 judge).
                 prims.push(DrawPrim::Panel {
                     x,
                     y,
@@ -1781,9 +1477,7 @@ pub(crate) fn palette_tray(
                 });
             }
         }
-        // Body label, Caption chip and accelerator share the Body run's baseline.
         let row_base = row_baseline(y0, ch, body_px.get());
-        // Checkbox glyph column (toggle commands only).
         if let Some(on) = row.checked {
             let glyph = if on { "\u{2713}" } else { " " };
             text_at(
@@ -1818,9 +1512,6 @@ pub(crate) fn palette_tray(
         let chip_x = chip_right.map_or(trailing, |right| {
             (right - face_w(face, &row.section, cap.get())).max(trailing)
         });
-        // The section chip is metadata, in the secondary ink where the palette is a
-        // Fluent flyout; the disabled-row grey is only a disabled row's, its chip's
-        // too, so a row's `File` tag never reads as disabled.
         let chip_ink = if PALETTE_FLUENT && row.enabled {
             r.text_secondary
         } else {
@@ -1846,8 +1537,6 @@ pub(crate) fn palette_tray(
             );
         }
     }
-    // A Fluent list that overflows says so: a thin rounded thumb along the card's
-    // right edge, its length the shown share of the list and its offset the scroll.
     if PALETTE_FLUENT && vis.len() > body && body > 0 {
         let track_y = card_y + 2.0 * ch;
         let track_h = body as f32 * ch;
@@ -1875,11 +1564,6 @@ pub(crate) fn palette_tray(
 }
 
 /// The secondary words of a list overlay: the palette's placeholder, count and
-/// section chips, and every overlay's key-hint footer. Where the palette is a Fluent
-/// flyout ([`PALETTE_FLUENT`]) they are `text_secondary`, floored at AA, WinUI's
-/// `TextFillColorSecondary`; the disabled-row grey (`text_tertiary`, 3:1) is only a
-/// disabled row's. In that grey, at 3.1-3.6:1, every row's `File` tag and the
-/// footer read as disabled (the 2026-10-18 judge). Elsewhere the look they had.
 fn overlay_secondary_ink(r: &Roles) -> [u8; 3] {
     if PALETTE_FLUENT {
         r.text_secondary
@@ -1889,26 +1573,14 @@ fn overlay_secondary_ink(r: &Roles) -> [u8; 3] {
 }
 
 /// The corner radius of a Fluent palette's selected row and filter box: WinUI's
-/// `ControlCornerRadius`.
 const PALETTE_ROW_RADIUS: f32 = 4.0;
 
 /// A Fluent palette's selected-row fill ([`PALETTE_FLUENT`]): the card's surface a
-/// step toward the ink, the subtle neutral the Settings rail selects with
-/// (`native_ui::FLUENT_RAIL_SELECTION`) over its own ground.
 fn palette_selected_fill(r: &Roles) -> [u8; 3] {
     crate::native_appearance::mix_srgb(r.surface, r.text_primary, 0.09)
 }
 
 /// The Fluent palette's filter box ([`PALETTE_FLUENT`]): a text box across the
-/// card's two top rows, where a centred `Commands` title and a one-row framed field
-/// were. That field was shorter than its own words (19 px at 1x for Body text, its
-/// descenders on the bottom stroke and the count across both, the 2026-10-18
-/// judge); this box is one and a half rows tall, Windows Terminal's palette has no
-/// title, and the placeholder names the scope (`Search commands` or `Search
-/// themes`). A WinUI TextBox with focus: the resting control fill, a hairline, a
-/// 2-pixel accent focus line along its foot, the placeholder in the secondary ink,
-/// the query in the primary with a caret after it (the palette's query edits at its
-/// end), and the shown/total count in Caption at its right.
 fn palette_filter_box(
     prims: &mut Vec<DrawPrim>,
     state: &PaletteState,
@@ -1920,7 +1592,6 @@ fn palette_filter_box(
     let (card_x, card_y, card_w, _) = card;
     let (cw, ch) = (g.cw, g.ch);
     let face = PALETTE_FACE;
-    // Over rows 0 and 1, aligned with the command rows' rectangles.
     let band = 2.0 * ch;
     let h = (ch * 1.5).min(band - 4.0).max(0.0).round();
     let (x, w) = (card_x + cw, (card_w - cw * 2.0).max(0.0));
@@ -1942,8 +1613,6 @@ fn palette_filter_box(
         width: 1.0,
         color: rgba(r.separator, 0xCC),
     });
-    // The focus line: the box's own rounded shape in the accent, clipped to its
-    // foot, so the line curves up into the corners as a WinUI TextBox's does.
     prims.push(DrawPrim::ClipPush {
         x,
         y: y + h - 2.0,
@@ -2011,10 +1680,8 @@ fn palette_filter_box(
             face,
             rgba(overlay_secondary_ink(r), 0xFF),
         ));
-        // A pixel clear of the placeholder's first stem.
         caret(prims, text_x - 2.0);
     } else {
-        // A query wider than the box shows its tail, where the caret is.
         let qw = face_w(face, &state.query, size.get());
         let qx = text_x.min(right - 2.0 - qw);
         prims.push(text_prim(
@@ -2031,10 +1698,7 @@ fn palette_filter_box(
     prims.push(DrawPrim::ClipPop);
 }
 
-/// Open a list overlay's tray (the palette, the session picker, the Overview): a
-/// drop shadow (two-step with `contact_shadow`), the card surface and its hairline, then
-/// the clip the body paints inside ([`finish_overlay_card`] pops it). Opaque: the tray
-/// rasterizer has no backdrop blur, so translucency would ghost the owner's text through.
+/// Appends the outer drop shadow, background, border, and title for a list overlay card.
 pub(crate) fn overlay_card_frame(
     card: (f32, f32, f32, f32),
     ch: f32,
@@ -2089,9 +1753,7 @@ pub(crate) fn overlay_card_frame(
     prims
 }
 
-/// Close a list overlay's tray: the key-`hint` footer centred on the card's last
-/// row (Caption, in [`overlay_secondary_ink`]), then the pop of the body clip
-/// [`overlay_card_frame`] pushed.
+/// Appends the bottom border rule and centered footer `hint` for a list overlay card.
 pub(crate) fn finish_overlay_card(
     prims: Vec<DrawPrim>,
     hint: &str,
@@ -2104,7 +1766,6 @@ pub(crate) fn finish_overlay_card(
 }
 
 /// [`finish_overlay_card`] with its footer set (and centred by measure) in `face`: the
-/// palette's own [`PALETTE_FACE`].
 fn finish_overlay_card_in(
     mut prims: Vec<DrawPrim>,
     hint: &str,
@@ -2135,8 +1796,7 @@ fn finish_overlay_card_in(
     TrayInput { prims, card }
 }
 
-/// The row text writer the list overlays paint with: a Mono `step` run
-/// cap-height-centred in the `ch`-tall row at `y0`; empty text paints nothing.
+/// Creates a cap-height-centered monospace [`TextWriter`] for an overlay row.
 pub(crate) fn row_text_writer(
     px: f32,
     ch: f32,
@@ -2165,13 +1825,9 @@ mod tests {
     #[test]
     fn palette_flattens_every_command() {
         let s = PaletteState::new();
-        // MENU_MODEL's non-separator items all appear (About, Copy, Settings…, Help, …).
         assert!(s.rows.iter().any(|r| r.action == MenuAction::About));
         assert!(s.rows.iter().any(|r| r.action == MenuAction::Copy));
         assert!(s.rows.iter().any(|r| r.action == MenuAction::Help));
-        // Exactly the model's items this platform offers, submenus flattened,
-        // plus the palette-only rows — the palette mirrors the bar and adds
-        // only those.
         let model_items = MENU_MODEL
             .iter()
             .flat_map(|sec| sec.entries.iter())
@@ -2179,9 +1835,6 @@ mod tests {
             .filter(|(_, action, _, _)| action.offered_on_this_platform())
             .count();
         assert_eq!(s.rows.len(), model_items + crate::menu::PALETTE_ONLY.len());
-        // The section chips are the bar's titles, in bar order (the
-        // application menu last where the palette puts it last); the
-        // palette-only rows sit in the Agents section.
         let mut chips: Vec<&str> = s.rows.iter().map(|r| r.section.as_ref()).collect();
         chips.dedup();
         let mut bar = vec![
@@ -2203,9 +1856,6 @@ mod tests {
     }
 
     /// WHERE THE PALETTE OPENS: on Windows the application menu (About, Settings…, Exit)
-    /// comes after every other section, so the list opens on the everyday commands
-    /// rather than on About aterm; macOS and Linux keep the menu bar's order. The order
-    /// within each section is the model's either way.
     #[test]
     fn the_application_menu_comes_last_on_windows() {
         let s = PaletteState::new();
@@ -2222,8 +1872,6 @@ mod tests {
     }
 
     /// Windows words: Window ▸ Zoom is Maximize (Restore Down on a maximized window,
-    /// the caption button's own words) and Quit is Exit; macOS and Linux keep Zoom
-    /// and Quit aterm.
     #[test]
     fn window_rows_use_this_platforms_words() {
         let label = |maximized: bool, action: MenuAction| {
@@ -2250,12 +1898,6 @@ mod tests {
     }
 
     /// THE AGENTS ROWS resolve from their live bits: Next That Needs You only
-    /// with a local need, Overview only with a window, Read the Fleet and
-    /// Fleet Machines only in a fleet, Summarize greyed with its block and
-    /// titled for the fleet or this Mac; the session rows (Take Over, Hand
-    /// Back, Harness Log, Set Role…, Reset Terminal) need a
-    /// front terminal; the reads and the bus commands never grey for want of
-    /// one. Each greyed row refuses `invoke` as disabled.
     #[test]
     fn the_agents_rows_resolve_from_their_live_bits() {
         let mut s = PaletteState::new();
@@ -2331,9 +1973,6 @@ mod tests {
     }
 
     /// The person's hold pair follows the live hold — Take Over live without
-    /// the person's hold, Hand Back live with it (and `invoke` refuses the
-    /// greyed one as disabled) — and Show Needs in Windows is checkable from
-    /// its live bit.
     #[test]
     fn the_person_pair_follows_the_hold_and_the_needs_row_checks() {
         let mut s = PaletteState::new();
@@ -2373,7 +2012,6 @@ mod tests {
                 .is_err_and(|e| e.contains("disabled")),
             "a greyed Take Over refuses with the disabled reason"
         );
-        // Another Mac's hold: the person may take it or hand it back.
         s.resolve(&PaletteLive {
             front_person_hold: true,
             front_remote_hold: true,
@@ -2387,17 +2025,13 @@ mod tests {
     }
 
     /// The accelerator projection, both platforms in one table: macOS keeps every string;
-    /// elsewhere `Cmd-` alternatives drop, a `·`-separated pair keeps its portable half,
-    /// and a lone `Cmd-*` becomes empty.
     #[test]
     fn platform_accel_keeps_only_chords_that_exist_here() {
         let cases = [
-            // (source, macOS, elsewhere)
             ("Cmd-S \u{b7} C-x C-s", "Cmd-S \u{b7} C-x C-s", "C-x C-s"),
             ("Cmd-Z \u{b7} C-/", "Cmd-Z \u{b7} C-/", "C-/"),
             ("Cmd-F", "Cmd-F", ""),
             ("Cmd-Shift-Z", "Cmd-Shift-Z", ""),
-            // Nothing macOS-only in these: they survive everywhere.
             ("C-s", "C-s", "C-s"),
             ("M-g g", "M-g g", "M-g g"),
             ("Shift-F8", "Shift-F8", "Shift-F8"),
@@ -2416,8 +2050,6 @@ mod tests {
     }
 
     /// `resolve` writes `PaletteLive::menu_accels` chords into menu rows' `shortcut` slot,
-    /// so `row_accel` shows the chord that works here; an action with no hint keeps its
-    /// platform default, and a re-resolve without hints clears them.
     #[test]
     fn resolve_applies_menu_accel_hints_to_row_accel() {
         let by_action = |s: &PaletteState, action: MenuAction| {
@@ -2435,8 +2067,6 @@ mod tests {
         });
         assert_eq!(by_action(&s, MenuAction::Copy), "Ctrl+Shift+C");
         assert_eq!(by_action(&s, MenuAction::ToggleFullScreen), "F11");
-        // In full screen the toggle's row names what it does now, and a
-        // re-resolve out of full screen names it back.
         let label = |s: &PaletteState| {
             let row = s
                 .rows
@@ -2453,7 +2083,6 @@ mod tests {
         assert_eq!(label(&full), ("Exit Full Screen".to_string(), None));
         full.resolve(&PaletteLive::default());
         assert_eq!(label(&full), ("Enter Full Screen".to_string(), None));
-        // ⌘W's row names what it closes: the focused pane of a split tab.
         let close = |s: &PaletteState| {
             s.rows
                 .iter()
@@ -2469,8 +2098,6 @@ mod tests {
         assert_eq!(close(&full), "Close Pane");
         full.resolve(&PaletteLive::default());
         assert_eq!(close(&full), "Close Tab");
-        // No hint for Paste in this live set: the row paints its platform
-        // default — the ⌘ menu mirror on macOS, blank elsewhere.
         assert_eq!(
             by_action(&s, MenuAction::Paste),
             if cfg!(target_os = "macos") {
@@ -2479,7 +2106,6 @@ mod tests {
                 ""
             }
         );
-        // Hints are per-resolve live state: resolving without them clears them.
         s.resolve(&PaletteLive {
             has_selection: true,
             ..Default::default()
@@ -2495,7 +2121,6 @@ mod tests {
     }
 
     /// [`accel_is_mac_only`] directly (`platform_accel` is `cfg!`-selected, so a table
-    /// through it runs one column per build), in every spelling of a macOS chord.
     #[test]
     fn accel_mac_only_catches_every_spelling_of_a_macos_chord() {
         for mac_only in [
@@ -2515,8 +2140,6 @@ mod tests {
                 "{mac_only:?} names a chord that does not exist off macOS"
             );
         }
-        // …and everything reachable off macOS survives, including the Alt/Meta
-        // spellings of the ⌥ key.
         for portable in [
             "C-s",
             "C-x C-s",
@@ -2680,15 +2303,10 @@ mod tests {
     }
 
     /// The Theme section follows the menu rows, each row naming its theme as
-    /// its target and its appearance as the hint; the scoped palette shows only
-    /// those rows, starts on the checked one, and its highlight is an edge:
-    /// asked once per move, never for the row it opened on, `Some(None)` when
-    /// it leaves the section.
     #[test]
     fn theme_rows_scope_and_highlight_edge() {
         let mut s = PaletteState::new().with_themes(themes());
         let menu_rows = PaletteState::new().rows.len();
-        // The three themes, then the Browse row.
         assert_eq!(s.rows.len(), menu_rows + 4);
         assert!(
             s.rows[..menu_rows]
@@ -2698,7 +2316,6 @@ mod tests {
         let browse = s.rows.last().expect("the Browse row");
         assert_eq!(browse.section, THEME_SECTION);
         assert!(browse.action == MenuAction::BrowseThemes);
-        // Rebuilding the section replaces it, never stacks a second.
         let rebuilt = PaletteState::new()
             .with_themes(themes())
             .with_themes(themes());
@@ -2758,15 +2375,11 @@ mod tests {
         assert_eq!(scoped.take_theme_highlight_change(), Some(None));
         scoped.move_selection(-1);
         assert_eq!(scoped.highlighted_theme(), Some("Gruvbox Light"));
-        // A native scope change keeps the Theme rows.
         scoped.replace_native_commands(None);
         assert_eq!(scoped.filtered().len(), 4);
     }
 
     /// The theme picker previews on the terminal behind the card, so the palette
-    /// lifts its scrim while it picks a theme: scoped to the Theme section, or
-    /// with a Theme row highlighted. The command list keeps it (Windows; there is
-    /// no scrim elsewhere). Negative control: the same palette back on a command.
     #[test]
     fn the_scrim_lifts_while_the_palette_picks_a_theme() {
         use crate::overlay::OverlayModel as _;
@@ -2823,20 +2436,15 @@ mod tests {
             )),
             "every survivor is a subsequence match"
         );
-        // Backspace widens again.
         s.edit(crate::app_search::SearchEdit::DeleteBack);
         assert!(s.filtered().len() >= narrowed.len());
     }
 
     /// The filter edits through the shared one-line field model with its caret held
-    /// at the end: typing appends, the backward kills delete, and the motions and
-    /// forward kills (which need a caret before the end) change nothing. Only a
-    /// changed query re-narrows from the top.
     #[test]
     fn edit_applies_the_field_model_with_the_caret_at_the_end() {
         use crate::app_search::SearchEdit;
         let mut s = PaletteState::new();
-        // Most rows carry an `e`, so the cursor has somewhere to move.
         assert!(s.edit(SearchEdit::Insert("new e".to_string())));
         assert_eq!(s.query, "new e");
         assert!(s.edit(SearchEdit::DeleteBack));
@@ -2860,7 +2468,6 @@ mod tests {
             s.selected, 1,
             "an edit that changed nothing keeps the cursor"
         );
-        // The caret a motion left is not kept: typing still appends.
         assert!(s.edit(SearchEdit::Insert("tab".to_string())));
         assert_eq!(s.query, "new tab");
         assert_eq!(s.selected, 0, "a changed query re-narrows from the top");
@@ -2877,9 +2484,7 @@ mod tests {
         for c in "copy".chars() {
             s.push_char(c);
         }
-        // First filtered row is the Copy command; enabled by default.
         assert_eq!(s.selected_action(), Some(MenuAction::Copy));
-        // Disable it (no selection) → Enter is inert.
         let live = PaletteLive::default();
         s.resolve(&live);
         assert_eq!(
@@ -2887,7 +2492,6 @@ mod tests {
             None,
             "a disabled command does not activate"
         );
-        // With a selection it activates again.
         s.resolve(&PaletteLive {
             has_selection: true,
             ..Default::default()
@@ -2925,7 +2529,6 @@ mod tests {
     }
 
     /// The View ▸ Matrix Rain row checks with the front session's effective rain and
-    /// disables with no front terminal (a native whole tab, or no window).
     #[test]
     fn matrix_rain_row_checkmark_tracks_front_session_and_disables_native() {
         let mut s = PaletteState::new();
@@ -2956,8 +2559,6 @@ mod tests {
         assert_eq!(rain.checked, Some(false));
         assert!(!rain.enabled, "native whole tab: no session to toggle");
 
-        // Windowless (macOS runs with every window closed): no native tab but no
-        // terminal either, so the row disables and the invoke fence refuses.
         s.resolve(&PaletteLive::default());
         let rain = s
             .rows
@@ -2971,8 +2572,6 @@ mod tests {
     }
 
     /// The View ▸ Favourite This Kitty row checks when the launch kitty is the pin and,
-    /// unlike the rain toggle, stays enabled with no front terminal: the launch kitty is
-    /// process-wide.
     #[test]
     fn favourite_row_checks_when_pinned_and_stays_enabled_without_a_terminal() {
         let mut s = PaletteState::new();
@@ -2982,7 +2581,6 @@ mod tests {
             can_rename: true,
             ..Default::default()
         });
-        // (checked, enabled): the two bits this test pins.
         let row = |s: &PaletteState| {
             s.rows
                 .iter()
@@ -3006,7 +2604,6 @@ mod tests {
             "native whole tab: the launch kitty is still there to pin"
         );
 
-        // Windowless (macOS runs with every window closed): no native tab, no terminal.
         s.resolve(&PaletteLive::default());
         assert_eq!(
             row(&s),
@@ -3093,7 +2690,6 @@ mod tests {
     }
 
     /// Staged: resolve adds the one-click "↑ Install aterm v<staged> now" row at the head
-    /// of the Version section, enabled, full-alpha, and activatable to `ApplyUpdate`.
     #[test]
     fn resolve_staged_adds_one_click_update_row() {
         let model = aterm_models_misc::native_update_menu_activation_model();
@@ -3116,11 +2712,8 @@ mod tests {
         assert_eq!(row.label, "\u{2191} Install aterm v9.9 now");
         assert!(!row.label.contains("restart"), "{}", row.label);
         assert!(row.enabled, "one click must work");
-        // It sits directly before the About row, at the head of the Version section.
         assert_eq!(s.rows[i + 1].action, MenuAction::Version);
-        // The staged row never fades (it is not the realized arrow).
         assert_eq!(s.row_alpha(&s.rows[i], Instant::now()), 1.0);
-        // Filtering to it and pressing Enter dispatches ApplyUpdate.
         for c in "install aterm".chars() {
             s.push_char(c);
         }
@@ -3128,7 +2721,6 @@ mod tests {
         assert!(model.fire("DecodeApplyTag", &mut model_state));
         assert!(model.fire("DispatchApply", &mut model_state));
         assert_eq!(model_state["apply_dispatched"], 1);
-        // `controls menu` lists it too.
         assert!(
             s.controls_lines()
                 .iter()
@@ -3138,7 +2730,6 @@ mod tests {
     }
 
     /// Neither staged nor realized: the ApplyUpdate row is removed, and a later resolve
-    /// with a staged build re-inserts it.
     #[test]
     fn resolve_without_update_state_removes_the_row() {
         let mut s = PaletteState::new();
@@ -3152,8 +2743,6 @@ mod tests {
             !s.rows.iter().any(|r| r.action == MenuAction::ApplyUpdate),
             "no update state ⇒ no update row"
         );
-        // Live transition: a build stages while the palette is open → re-resolve
-        // re-inserts the row (the `palette_refresh_live` path).
         s.resolve(&PaletteLive {
             staged: Some((999, "9.9".to_string())),
             ..Default::default()
@@ -3162,10 +2751,6 @@ mod tests {
     }
 
     /// "Check for Updates…" is listed, and enabled, here exactly where the `chrome` verb's
-    /// menu lines list it: both read [`MenuAction::offered_on_this_platform`]. Where no
-    /// updater exists the row is left out rather than listed grey forever (the Windows
-    /// palette opened on it, disabled, under About). With nothing staged the apply-now
-    /// row is absent everywhere.
     #[test]
     fn update_rows_follow_the_platform_updater_on_every_surface() {
         let mut s = PaletteState::new();
@@ -3221,7 +2806,6 @@ mod tests {
     }
 
     /// Realized: the post-update row fades (full at boot, partial mid-TTL, zero at TTL),
-    /// freezes at full under reduced motion, and yields to a staged build.
     #[test]
     fn resolve_realized_adds_fading_row() {
         use crate::relaunch_notice::REALIZED_ARROW_TTL;
@@ -3241,14 +2825,12 @@ mod tests {
         let mid = s.row_alpha(row, now + REALIZED_ARROW_TTL / 2);
         assert!(mid > 0.0 && mid < 1.0, "mid-TTL alpha {mid}");
         assert_eq!(s.row_alpha(row, now + REALIZED_ARROW_TTL), 0.0, "expired");
-        // Ordinary rows never fade.
         let about = s
             .rows
             .iter()
             .find(|r| r.action == MenuAction::Version)
             .unwrap();
         assert_eq!(s.row_alpha(about, now + REALIZED_ARROW_TTL / 2), 1.0);
-        // Reduced motion freezes the fade at full.
         s.resolve(&PaletteLive {
             realized: Some(("9.9".to_string(), now)),
             reduced_motion: true,
@@ -3260,7 +2842,6 @@ mod tests {
             .find(|r| r.action == MenuAction::ApplyUpdate)
             .unwrap();
         assert_eq!(s.row_alpha(frozen, now + REALIZED_ARROW_TTL / 2), 1.0);
-        // A staged build supersedes the celebration wording.
         s.resolve(&PaletteLive {
             staged: Some((999, "10.0".to_string())),
             realized: Some(("9.9".to_string(), now)),
@@ -3275,7 +2856,6 @@ mod tests {
     }
 
     /// The fingerprint folds the realized row's elapsed bucket while unexpired, so an open
-    /// palette re-presents per fade step; under reduced motion it does not.
     #[test]
     fn fingerprint_folds_the_realized_bucket() {
         use std::time::Duration;
@@ -3297,7 +2877,6 @@ mod tests {
             bucket0, bucket1,
             "a bucket edge re-fingerprints (→ one present)"
         );
-        // Frozen: the bucket is not folded, so elapsed time leaves the fingerprint alone.
         let frozen0 = mk(now, true);
         let frozen1 = mk(now - REALIZED_BUCKET - Duration::from_secs(1), true);
         assert_eq!(frozen0, frozen1, "reduced motion pins the fp");
@@ -3405,7 +2984,6 @@ mod tests {
         assert_eq!(palette_row_hit(&state, &geom, x, y - 0.01), None);
         assert_eq!(palette_row_hit(&state, &geom, x, y + height), None);
 
-        // The selected wash emitted by the painter uses this very rectangle.
         state.selected = state.scroll;
         let tray = palette_tray(&state, &geom, Theme::default());
         assert!(tray.prims.iter().any(|primitive| {
@@ -3475,11 +3053,6 @@ mod tests {
     }
 
     /// SECONDARY WORDS WEAR THE SECONDARY INK, DISABLED ROWS ALONE THE GREY: in a
-    /// Fluent palette ([`PALETTE_FLUENT`]) the placeholder, the count, an enabled
-    /// row's section chip and the footer are `text_secondary` (AA on the card);
-    /// only a disabled row's label and chip keep `text_tertiary`. NEGATIVE CONTROL:
-    /// the two inks differ in both themes, and elsewhere every one of these words
-    /// keeps the tertiary grey it had.
     #[test]
     fn fluent_secondary_words_wear_the_secondary_ink() {
         let g = fluent_geom();
@@ -3513,7 +3086,6 @@ mod tests {
                 "\u{203a} type to filter"
             };
             assert_eq!(ink_of(&|s| s == placeholder), want, "the placeholder");
-            // Row by row: a label and its chip share the row's baseline.
             let (mut enabled, mut disabled) = (0, 0);
             for &idx in state.filtered().iter().take(state.body()) {
                 let row = &state.rows[idx];
@@ -3548,9 +3120,6 @@ mod tests {
     }
 
     /// THE SELECTED ROW IS A FILL AND A PILL in a Fluent palette, as the Settings
-    /// rail selects: a neutral fill on the row's rectangle and a 3-wide accent pill
-    /// at its leading edge, no accent outline. NEGATIVE CONTROL: elsewhere the row
-    /// keeps its accent wash and ring.
     #[test]
     fn fluent_selection_is_a_neutral_fill_and_an_accent_pill() {
         let g = fluent_geom();
@@ -3589,11 +3158,6 @@ mod tests {
     }
 
     /// THE FILTER BOX HOLDS ITS WORDS: a Fluent palette's filter box is one and a
-    /// half rows tall, and the placeholder's ascenders and descenders and the count
-    /// sit inside it, clear of its hairline and its focus line, with the accent
-    /// focus line along its foot. NEGATIVE CONTROL: the one-row field it replaced
-    /// (`ch - 4` tall, its Body run centred in the full row) put the placeholder's
-    /// descenders within 3 pixels of its bottom stroke.
     #[test]
     fn fluent_filter_box_holds_its_words() {
         let g = fluent_geom();
@@ -3677,7 +3241,6 @@ mod tests {
     }
 
     /// The a11y MenuItem set equals `filtered()` (the rows the card paints and `controls
-    /// menu` counts as `shown=`), focus follows `selected`, and a disabled row omits `Click`.
     #[cfg(a11y_tree)]
     #[test]
     fn palette_a11y_lists_filtered_rows() {
@@ -3691,7 +3254,6 @@ mod tests {
         assert!(vis.len() >= 2, "expected several tab commands");
         let update = palette_a11y(&s);
 
-        // One MenuItem per filtered row, at the current epoch + slot, labelled like the row.
         let items = update
             .nodes
             .iter()
@@ -3703,9 +3265,7 @@ mod tests {
             let (_, node) = update.nodes.iter().find(|(nid, _)| *nid == id).unwrap();
             assert_eq!(node.label(), Some(s.rows[i].label.as_ref()));
         }
-        // Focus = the selected row's node.
         assert_eq!(update.focus, s.a11y_node_id(s.selected));
-        // The a11y item count agrees with `controls menu`'s shown= count.
         let header = s
             .controls_lines()
             .into_iter()
@@ -3713,7 +3273,6 @@ mod tests {
             .unwrap();
         assert!(header.contains(&format!("shown={}", vis.len())));
 
-        // A disabled row (Copy with no selection) is focusable but not clickable.
         let mut s2 = PaletteState::new();
         for c in "copy".chars() {
             s2.push_char(c);
@@ -3776,7 +3335,6 @@ mod tests {
             .find(|(id, _)| *id == s.a11y_node_id(0))
             .expect("first native command");
         assert_eq!(search.label(), Some("Settings: Search"));
-        // What a screen reader speaks: off macOS it omits the macOS-only chord.
         assert_eq!(
             search.description(),
             Some(if cfg!(target_os = "macos") {
@@ -3802,7 +3360,6 @@ mod tests {
     }
 
     /// A screen-reader Click that arrives after a native tab switch fails closed instead
-    /// of selecting the same slot in the replacement app.
     #[cfg(a11y_tree)]
     #[test]
     fn stale_native_a11y_row_cannot_redirect_after_scope_replacement() {

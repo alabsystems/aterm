@@ -840,11 +840,11 @@ impl RepaintNudge {
         }
     }
 
-    fn answered(&self, f: &Facts) -> bool {
+    const fn answered(&self, f: &Facts) -> bool {
         f.full_clears > self.base_clears || f.screen_replaced > self.base_replaced
     }
 
-    fn settled(f: &Facts) -> bool {
+    const fn settled(f: &Facts) -> bool {
         !f.frame_open && f.output_quiet_ms >= SETTLE_MS
     }
 

@@ -1,20 +1,32 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Scenes the split's tests and the scope balance's conformance
-//! (`tests/conformance_scope_balance.rs`) read through the real
-//! [`Vitals::absorb`](crate::Vitals::absorb): one window of work, as the host
-//! reads it — a split tick, a sweep [`Scene::sweep_ms`] before the next one,
-//! and that next split tick [`Scene::window_ms`] after the first. Each sweep
-//! lists the processes newest first, as the kernel does (`proc_listallpids`),
-//! so a coalition's first-swept member is seldom its lead.
+//! Scenes the split's and the cause engine's tests and the conformance of
+//! the scope balance and of the explanation's honesty
+//! (`tests/conformance_scope_balance.rs`, `tests/conformance_explain.rs`)
+//! read through the real [`Vitals::absorb`](crate::Vitals::absorb): one
+//! window of work, as the host reads it — a split tick, a sweep
+//! [`Scene::sweep_ms`] before the next one, and that next split tick
+//! [`Scene::window_ms`] after the first ([`Scene::samples`]), or the same
+//! work held over several windows ([`Scene::series`]). Each sweep lists the
+//! processes newest first, as the kernel does (`proc_listallpids`), so a
+//! coalition's first-swept member is seldom its lead.
 //!
 //! Figures are millicores over the window. A coalition's counters and a
 //! process's CPU time grow by exactly its figure, so a split of the scene
 //! reads the figures back with no rounding.
+//!
+//! Identities are transcribed from `probes/ident-out-1.txt` (the signing ids
+//! and categories m22's processes read on 2026-10-20) and launchd's from
+//! `probes/why-out-1.txt`; a process neither read is left with no identity.
+//! The coalitions' figures are from RD's constructed 10:32 moment and the
+//! moments its §17 names.
 
-use super::{CoalLane, CoalSample, CoalUsage, LeadIdentity, TimelineSample};
-use crate::model::{DelegatedJob, ProcSample, ProcState, Sample, TabRoot, Ticks};
+use super::{CoalLane, CoalSample, CoalUsage, LeadIdentity, TimelineSample, Voucher};
+use crate::model::{
+    DelegatedJob, MemCounters, MemSample, Pressure, ProcSample, ProcState, Sample, TabRoot,
+    Thermal, Ticks,
+};
 
 /// When a coalition or a process is there: at both reads, or made, or gone,
 /// inside the window.
@@ -48,6 +60,10 @@ pub struct Coal {
     pub started: u64,
     /// Its tasks that had exited, at both ticks.
     pub exited: u64,
+    /// How far its QoS buckets' sum runs past its CPU time over the window,
+    /// millicores, at the legacy QoS (macOS 27.0.1's buckets sum 0.7–6 %
+    /// past `cpu_time`, `probes/skeptic-mac6-eqos-out.txt`).
+    pub qos_over_mc: u64,
 }
 
 impl Coal {
@@ -101,6 +117,8 @@ pub struct Proc {
     /// Its CPU over the last sweep's window, millicores (its figure, unless
     /// a build is starting).
     pub fast_mc: u64,
+    /// Its footprint, bytes (16 MiB unless set).
+    pub footprint: u64,
     /// When it is swept.
     pub span: Span,
 }
@@ -128,8 +146,15 @@ impl Proc {
             name: name.to_owned(),
             mc,
             fast_mc: mc,
+            footprint: 16 << 20,
             span: Span::Whole,
         }
+    }
+
+    /// The same with a footprint of `footprint` bytes.
+    #[must_use]
+    pub fn holding(self, footprint: u64) -> Self {
+        Self { footprint, ..self }
     }
 
     /// The same at `fast_mc` over the last sweep's window.
@@ -191,6 +216,13 @@ pub struct Scene {
     pub timeline: Option<TimelineSample>,
     /// The lane.
     pub lane: CoalLane,
+    /// The second split tick's wall clock, unix ms; `None`: RD's 10:32
+    /// moment, 17:32:41.200Z.
+    pub at_ms: Option<i64>,
+    /// Memory, at every reading.
+    pub mem: Option<MemSample>,
+    /// The thermal state, at every reading.
+    pub thermal: Option<Thermal>,
 }
 
 /// The first tick's monotonic stamp, ms.
@@ -216,22 +248,40 @@ impl Scene {
         ]
     }
 
-    /// The reading `at_ms` into the window: a split tick reads the
-    /// coalitions, each process's coalition and birth, and the leads.
+    /// The same work held over `windows` windows: the first split tick, then
+    /// for each window the sweep before its end and its split tick. A span
+    /// is the first window's: made inside it, or gone from its end on.
+    #[must_use]
+    pub fn series(&self, windows: u64) -> Vec<Sample> {
+        let w = self.window_ms;
+        std::iter::once(self.reading(0, true))
+            .chain((1..=windows).flat_map(|k| {
+                [
+                    self.reading(k * w - self.sweep_ms, false),
+                    self.reading(k * w, true),
+                ]
+            }))
+            .collect()
+    }
+
+    /// The reading `at_ms` from the first split tick: a split tick (at a
+    /// whole number of windows) reads the coalitions, each process's
+    /// coalition and birth, and the leads.
     fn reading(&self, at_ms: u64, split: bool) -> Sample {
         let w = self.window_ms;
-        let end = at_ms == w;
         let there = |span: Span| match span {
             Span::Whole => true,
             Span::Born => at_ms > 0,
-            Span::Gone => !end,
+            Span::Gone => at_ms < w,
         };
-        // `at_ms` of `mc` millicores over the window, ns: the second tick
-        // reads all of it, the sweep its figure less the last sweep's.
-        let grown = |mc: u64, fast: u64| match at_ms {
-            0 => 0,
-            a if a == w => mc * w * 1000,
-            _ => mc * w * 1000 - fast * self.sweep_ms * 1000,
+        // `at_ms` of `mc` millicores a window, ns: a split tick reads all of
+        // it, the sweep before it its figure less the last sweep's.
+        let grown = |mc: u64, fast: u64| {
+            if at_ms.is_multiple_of(w) {
+                mc * at_ms * 1000
+            } else {
+                mc * (at_ms + self.sweep_ms) * 1000 - fast * self.sweep_ms * 1000
+            }
         };
         let busy = self.busy_mc * w / 1000;
         let cores = (0..self.cores)
@@ -254,7 +304,7 @@ impl Scene {
                 start: Some(u64::try_from(p.birth_ms).unwrap_or(0)),
                 ppid: p.ppid,
                 cpu_ns: Some(CPU0_NS + grown(p.mc, p.fast_mc)),
-                footprint: Some(16 << 20),
+                footprint: Some(p.footprint),
                 name: p.name.clone(),
                 uid: Some(p.uid),
                 pgid: p.pid,
@@ -275,7 +325,7 @@ impl Scene {
                     let mut eqos_ns = [0; super::QOS_CLASSES];
                     eqos_ns[1] = c.maint_mc * at_ms * 1000;
                     eqos_ns[2] = base / 2 + (c.deferred_mc - c.maint_mc) * at_ms * 1000;
-                    eqos_ns[4] = base / 2 + (c.mc - c.deferred_mc) * at_ms * 1000;
+                    eqos_ns[4] = base / 2 + (c.mc - c.deferred_mc + c.qos_over_mc) * at_ms * 1000;
                     CoalUsage {
                         id: c.id,
                         tasks_started: c.started,
@@ -296,15 +346,20 @@ impl Scene {
             }
         });
         let mono_ms = T0_MS + at_ms;
+        let wall = self
+            .at_ms
+            .map_or(WALL_MS, |at| at - i64::try_from(T0_MS + w).unwrap_or(0));
         Sample {
             at_ns: mono_ms * 1_000_000,
             cores: Some(cores),
+            mem: self.mem,
+            thermal: self.thermal,
             procs: Some(procs),
             self_pid: self.self_pid,
             self_uid: Some(self.self_uid),
             tabs: self.tabs.clone(),
             delegated: self.delegated.clone(),
-            at_unix_ms: WALL_MS + i64::try_from(mono_ms).unwrap_or(0),
+            at_unix_ms: wall + i64::try_from(mono_ms).unwrap_or(0),
             mono_ms,
             cadence_ms: 1000,
             coalitions,
@@ -318,6 +373,63 @@ impl Scene {
             ..Sample::default()
         }
     }
+}
+
+/// Apple's identity for the process `pid` born at `birth_ms`, named `exe`,
+/// signed as `id` (the platform flag, category 1).
+#[must_use]
+pub fn apple(pid: u32, birth_ms: i64, exe: &str, id: &str) -> LeadIdentity {
+    LeadIdentity {
+        pid,
+        birth_ms,
+        exe: exe.to_owned(),
+        voucher: Voucher::Apple,
+        signing_id: Some(id.to_owned()),
+        team: None,
+    }
+}
+
+/// The 2026-10-20 machine's timeline (`brief-macos-why.md`,
+/// `probes/pidwrap-out-1.txt`): the kernel booted at 16:06:13Z, launchd a
+/// second later; the Mac slept at 16:26:38Z and woke on a trackpad touch at
+/// 17:28:33Z, and userspace started at 17:28:38Z ([`USERSPACE_MS`]).
+#[must_use]
+pub fn timeline_1020() -> TimelineSample {
+    TimelineSample {
+        boot_ms: LAUNCHD_MS - 1_000,
+        sleep_ms: Some(1_792_513_598_000),
+        wake_ms: Some(USERSPACE_MS - 5_000),
+        wake_reason: Some("RTP.multi-touch".into()),
+    }
+}
+
+/// When userspace started on 2026-10-20, 17:28:38Z (10:28:38 PDT): `logd`'s,
+/// `mds`'s and `contextstored`'s birth.
+pub const USERSPACE_MS: i64 = 1_792_517_318_000;
+/// When launchd was born on 2026-10-20, 16:06:14Z.
+pub const LAUNCHD_MS: i64 = 1_792_512_374_000;
+
+/// The identities of the 10:32 moment's leads (`probes/ident-out-1.txt`,
+/// launchd's `probes/why-out-1.txt`): Apple's daemons, and aterm under its
+/// Developer ID. Finder's was not read, so it has none.
+fn identities_1032() -> Vec<LeadIdentity> {
+    let start = USERSPACE_MS;
+    vec![
+        apple(1, LAUNCHD_MS, "launchd", "com.apple.xpc.launchd"),
+        apple(357, start, "logd", "com.apple.logd"),
+        apple(387, start, "mds", "com.apple.mds"),
+        apple(397, start, "contextstored", "com.apple.contextstored"),
+        apple(533, start + 1_000, "mds_stores", "com.apple.mds_stores"),
+        apple(916, start + 7_000, "siriactionsd", "com.apple.siriactionsd"),
+        LeadIdentity {
+            pid: 1187,
+            birth_ms: start + 197_000,
+            exe: "aterm".into(),
+            voucher: Voucher::DeveloperId,
+            signing_id: Some("com.aterm.aterm".into()),
+            team: Some("A66A9P66Z7".into()),
+        },
+    ]
 }
 
 /// A tab with key `key`, labelled `Tab <key>`, whose shell is `shell_pid`.
@@ -352,8 +464,8 @@ pub fn tab(key: u64, shell_pid: u32) -> TabRoot {
 #[must_use]
 pub fn spotlight_1032() -> Scene {
     // The births of RD's `who` rows (17:28:38–17:31:55Z).
-    let start = 1_792_517_318_000;
-    let launchd = 1_792_512_374_000;
+    let start = USERSPACE_MS;
+    let launchd = LAUNCHD_MS;
     Scene {
         window_ms: 5000,
         sweep_ms: 1000,
@@ -410,12 +522,8 @@ pub fn spotlight_1032() -> Scene {
             Proc::new(1200, 1187, 501, 1342, start + 199_000, "zsh", 0),
             Proc::new(1210, 1200, 501, 1342, start + 200_000, "claude", 200),
         ],
-        timeline: Some(TimelineSample {
-            boot_ms: launchd - 1_000,
-            sleep_ms: Some(1_792_513_598_000),
-            wake_ms: Some(start - 5_000),
-            wake_reason: Some("RTP.multi-touch".into()),
-        }),
+        leads: identities_1032(),
+        timeline: Some(timeline_1020()),
         lane: CoalLane::On,
         ..Scene::default()
     }
@@ -578,5 +686,248 @@ pub fn build_start_1032() -> Scene {
             .fast(3000);
         }
     }
+    scene
+}
+
+/// The liar (RD §17): the 10:32 moment with Spotlight's two coalitions led
+/// by programs that SAY they are `mds` and `mds_stores` (their signing ids
+/// are Apple's) under ad-hoc signatures, category 10, as the probe's
+/// re-signed copy of a binary reads (`probes/liar`). Nothing Apple vouches
+/// for is busy, so no Spotlight cause may open.
+#[must_use]
+pub fn liar_1032() -> Scene {
+    let mut scene = spotlight_1032();
+    for l in &mut scene.leads {
+        if l.pid == 387 || l.pid == 533 {
+            l.voucher = Voucher::AdHoc;
+        }
+    }
+    scene
+}
+
+/// The 10:32 moment with `corespotlightd` (the user's, as on m22,
+/// `probes/ident-out-1.txt:110-112`) restarted 2½ minutes after start-up in
+/// its own coalition 1330 and indexing at 2.00 cores, 600 ‰ deferred
+/// (constructed): 5.30 busy. Spotlight covers its three coalitions, 3.42;
+/// two of them are led by processes born in start-up's first second, but
+/// only 1.42 of the 3.42 cores, so by CPU it is not start-up's. Its 2.23
+/// cores deferred, 4 minutes after the wake, make it the wake's. The busiest
+/// coalition outside aterm's is the user's, and still Spotlight's, never an
+/// app's.
+#[must_use]
+pub fn spotlight_late_1032() -> Scene {
+    let born = USERSPACE_MS + 150_000;
+    let mut scene = spotlight_1032();
+    scene.busy_mc += 2000;
+    scene.coalitions.push(Coal {
+        deferred_mc: 1200,
+        ..Coal::new(1330, 2000)
+    });
+    scene
+        .procs
+        .push(Proc::new(1150, 1, 501, 1330, born, "corespotlightd", 2000));
+    scene.leads.push(apple(
+        1150,
+        born,
+        "corespotlightd",
+        "com.apple.corespotlightd",
+    ));
+    scene
+}
+
+/// The 10:32 moment with the coalition lane off (macOS's self-check
+/// missed): the facts are the split by subtraction, and no coalition is
+/// read.
+#[must_use]
+pub fn lane_off_1032() -> Scene {
+    Scene {
+        lane: CoalLane::Off,
+        ..spotlight_1032()
+    }
+}
+
+/// The 10:32 moment with a build in tab 1 whose compilers exited between
+/// sweeps: aterm's coalition read 3.00 cores more than any live process of
+/// aterm's holds (SA measured 98.6 % of a build tab's CPU in exited
+/// processes), so the tab's role cannot be read without reap credit.
+#[must_use]
+pub fn finished_1032() -> Scene {
+    let mut scene = spotlight_1032();
+    scene.busy_mc += 3000;
+    for c in &mut scene.coalitions {
+        if c.id == 1342 {
+            c.mc += 3000;
+        }
+    }
+    scene
+}
+
+/// RD's calm Mac (§5.6; plan Example B), 15:10:02.120 PDT (22:10:02.120Z),
+/// 4 h 41 min after start-up: 0.40 of 18 cores busy over 5 s — aterm's
+/// coalition 0.20 (aterm 0.08, tab 1's `claude` 0.12), Caffeine 0.01 (its
+/// permanent display assertion, which S1 does not read), WindowServer 0.09,
+/// `mds` 0.02 and the kernel and launchd 0.08. Nothing passes a floor.
+/// Memory reads 16.6 of 128 GiB used at normal pressure, its swap still
+/// (counters at every reading), and the Mac nominal, Low Power Mode off:
+/// every deviation read, none there. Caffeine's signing id is not in the
+/// probes, so it is left unread.
+#[must_use]
+pub fn calm_1510() -> Scene {
+    let start = USERSPACE_MS;
+    let mut leads = identities_1032();
+    leads.push(apple(
+        430,
+        start + 500,
+        "WindowServer",
+        "com.apple.WindowServer",
+    ));
+    leads.push(LeadIdentity {
+        pid: 784,
+        birth_ms: start + 8_000,
+        exe: "Caffeine".into(),
+        voucher: Voucher::DeveloperId,
+        signing_id: None,
+        team: Some("YD6LEYT6WZ".into()),
+    });
+    Scene {
+        window_ms: 5000,
+        sweep_ms: 1000,
+        cores: 18,
+        busy_mc: 400,
+        self_pid: 1187,
+        self_uid: 501,
+        tabs: vec![tab(1, 1200)],
+        coalitions: vec![
+            Coal::new(1342, 200),
+            Coal::new(896, 10),
+            Coal::new(393, 90),
+            Coal {
+                deferred_mc: 15,
+                ..Coal::new(307, 20)
+            },
+            Coal::new(1, 80),
+        ],
+        procs: vec![
+            Proc::new(1, 0, 0, 1, LAUNCHD_MS, "launchd", 80),
+            Proc::new(387, 1, 0, 307, start, "mds", 20),
+            Proc::new(430, 1, 88, 393, start + 500, "WindowServer", 90),
+            Proc::new(784, 1, 501, 896, start + 8_000, "Caffeine", 10),
+            Proc::new(1187, 1, 501, 1342, start + 197_000, "aterm", 80),
+            Proc::new(1200, 1187, 501, 1342, start + 199_000, "zsh", 0),
+            Proc::new(1210, 1200, 501, 1342, start + 200_000, "claude", 120),
+        ],
+        leads,
+        timeline: Some(timeline_1020()),
+        lane: CoalLane::On,
+        at_ms: Some(1_792_534_202_120),
+        mem: Some(MemSample {
+            total: 128 << 30,
+            app: (12 << 30) + (600 << 20),
+            wired: 4 << 30,
+            compressed: Some(0),
+            pressure: Pressure::Normal,
+            counters: Some(MemCounters::default()),
+            ..MemSample::default()
+        }),
+        thermal: Some(Thermal {
+            low_power: Some(false),
+            exact: true,
+            ..Thermal::default()
+        }),
+        ..Scene::default()
+    }
+}
+
+/// A tab-2 build 20 minutes after start-up (RD §17), 10:48:41.200 PDT: tab
+/// 2's `cargo` and four `rustc` 6.00 cores, live, of 8.20 busy; aterm itself
+/// 0.30 and tab 1's `claude` 0.20; the boot daemons idle-busy (`mds` 0.30 at
+/// 80 % deferred, `contextstored` 0.20, `logd` 0.10, WindowServer 0.20),
+/// every one born at start-up, and the kernel and launchd 0.90 (a build's
+/// I/O and paging run in the kernel; constructed). Tab 2's work is the
+/// cause, and never "after start-up"; services' 1.70 cores are unexplained,
+/// and not after start-up either: four of their five coalitions are
+/// start-up's, but they hold only 0.80 of the 1.70.
+#[must_use]
+pub fn tab2_build_1048() -> Scene {
+    let start = USERSPACE_MS;
+    let built = start + 1_150_000;
+    let mut leads = identities_1032();
+    leads.push(apple(
+        430,
+        start + 500,
+        "WindowServer",
+        "com.apple.WindowServer",
+    ));
+    let mut procs = vec![
+        Proc::new(1, 0, 0, 1, LAUNCHD_MS, "launchd", 900),
+        Proc::new(357, 1, 0, 247, start, "logd", 100),
+        Proc::new(387, 1, 0, 307, start, "mds", 300),
+        Proc::new(397, 1, 0, 327, start, "contextstored", 200),
+        Proc::new(430, 1, 88, 393, start + 500, "WindowServer", 200),
+        Proc::new(1187, 1, 501, 1342, start + 197_000, "aterm", 300),
+        Proc::new(1200, 1187, 501, 1342, start + 199_000, "zsh", 0),
+        Proc::new(1210, 1200, 501, 1342, start + 200_000, "claude", 200),
+        Proc::new(1300, 1187, 501, 1342, start + 900_000, "zsh", 0),
+        Proc::new(1310, 1300, 501, 1342, built, "cargo", 200),
+    ];
+    procs.extend((0..4).map(|i| {
+        Proc::new(
+            1320 + i,
+            1310,
+            501,
+            1342,
+            built + 1_000 + i64::from(i),
+            "rustc",
+            1450,
+        )
+    }));
+    Scene {
+        window_ms: 5000,
+        sweep_ms: 1000,
+        cores: 18,
+        busy_mc: 8200,
+        self_pid: 1187,
+        self_uid: 501,
+        tabs: vec![tab(1, 1200), tab(2, 1300)],
+        coalitions: vec![
+            Coal::new(1342, 6500),
+            Coal {
+                deferred_mc: 240,
+                ..Coal::new(307, 300)
+            },
+            Coal::new(327, 200),
+            Coal::new(247, 100),
+            Coal::new(393, 200),
+            Coal::new(1, 900),
+        ],
+        procs,
+        leads,
+        timeline: Some(timeline_1020()),
+        lane: CoalLane::On,
+        at_ms: Some(1_792_518_521_200),
+        ..Scene::default()
+    }
+}
+
+/// The wrapped pid space (RD §2.4, §17; `probes/pidwrap-out-1.txt`), 12:18:30
+/// PDT (19:18:30Z): Spotlight still at the 10:32 moment's rates, and tab 2's
+/// shell is pid 159, born 12:16:07 PDT after the pid counter wrapped, in
+/// aterm's coalition 1342. Userspace still started at 10:28:38 (`logd`,
+/// pid 357), aterm still leads its coalition, and it is 110 minutes after
+/// start-up and the wake, so neither `startup` nor `wake` holds.
+#[must_use]
+pub fn wrapped_1218() -> Scene {
+    let mut scene = spotlight_1032();
+    scene.tabs.push(tab(2, 159));
+    scene.procs.push(Proc::new(
+        159,
+        1187,
+        501,
+        1342,
+        USERSPACE_MS + 6_449_000,
+        "zsh",
+        0,
+    ));
+    scene.at_ms = Some(1_792_523_910_000);
     scene
 }

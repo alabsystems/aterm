@@ -2,48 +2,6 @@
 // Copyright 2026 Andrew Yates
 
 //! Who may talk to the keeper, both ways (`docs/DESIGN-pty-keeper-2026-09-26.md` §5.7).
-//!
-//! The floor is the same uid, always: `getpeereid` on every connection, the socket in a 0700
-//! directory. Above it, by default, code identity: the peer's audit token (`LOCAL_PEERTOKEN`,
-//! never a recyclable pid) must name code that satisfies this build's own designated
-//! requirement. The keeper and the window are the same binary, so:
-//!
-//! * the installed app carries its Developer ID requirement (identifier `com.aterm.aterm`, Team
-//!   `A66A9P66Z7`; §11.1), which every future signed build also meets;
-//! * a dev or ad-hoc build carries only its cdhash, so only the very same build passes;
-//! * [`IdentityPolicy::SameUid`] is the explicit floor, for tests and by-hand runs. A keeper
-//!   states its policy in its WELCOME, and a window that checks code registers nothing with one
-//!   at the floor (`crate::client`): it would offer an orphaned master to any same-uid process.
-//!
-//! What the code check does not bind: on Darwin the audit token names the process that last
-//! used the connection, read live, not the one that connected (`aterm_uds::peer::AuditToken`),
-//! and each side reads it once, at accept or dial. A same-uid process can keep a copy of a
-//! connection in a second process and `exec` a genuine aterm at its own pid before the check,
-//! and the copy then speaks for genuine code. So against a same-uid process that knows this, the
-//! gate is the same-uid floor. The fix, a binding to the connecting process no later use can
-//! move, is a transport decision shared with the update's launched-lane rendezvous
-//! (`docs/AUDIT-update-robustness-r8-2026-09-30.md`, #904).
-//!
-//! That rendezvous checks its dialer with this machinery against a requirement that need not be
-//! this build's: a release's ([`Identity::for_requirement`]) or the launched code's
-//! ([`Identity::for_code_at`]). There a [`CheckError::Unanswered`] holds the dialer for another
-//! check rather than turning it away.
-//!
-//! The calls are Security.framework's guest lookup (`SecCodeCopyGuestWithAttributes` with
-//! `kSecGuestAttributeAudit`) and `SecCodeCheckValidity` against `SecCodeCopySelf`'s designated
-//! requirement. The guest lookup re-opens the file the process was started from: with that file
-//! deleted it fails `ENOENT` (OSStatus 100002), and with another build at the path
-//! `errSecCSStaticCodeChanged` (-67034) or -67049; `kSecCSMatchGuestRequirementInKernel` does
-//! not help (`errSecCSReqInvalid`). So a process that must stay checkable runs from code that
-//! outlives it, as the keeper does (`crate::code`), and [`Identity::admits_code_at`] checks that
-//! code before the keeper re-runs from it.
-//!
-//! Both checks wait on macOS's `trustd` for certificate-chained code and never return when it
-//! stops answering. So each runs through the process's one `trustd` gate,
-//! `aterm_uds::deadline::TRUST`, under a deadline: an unanswered check is
-//! [`CheckError::Unanswered`], a refusal, never a pass, and while one is overdue every later check
-//! is refused at once. It is its own variant because it is about the machine's moment, not the
-//! peer. Reading this process's own requirement does not wait on `trustd`, so it runs inline.
 
 use std::path::Path;
 #[cfg(target_vendor = "apple")]
@@ -53,22 +11,12 @@ use std::time::Duration;
 use aterm_uds::CtlStream;
 
 /// How long the on-disk check of a copy of this build ([`Identity::admits_code_at`]) may take.
-/// It hashes every page of a bundle, for many seconds on a loaded machine, so this is a hang
-/// detector: no honest check is cut, and a `trustd` that never answers is named in a minute.
 pub const CODE_CHECK_HANG: Duration = Duration::from_secs(60);
 
-/// How long a peer's code check ([`Identity::check`]) may take, at least: a hang detector with
-/// room for a loaded cold launch (one `SecCodeCheckValidity` answers in a quarter second), so an
-/// honest slow check is never cut into a refused dial. It is also the check's suspect age, no
-/// shorter than a TLS evaluation's (`aterm-http`'s five seconds), so a slow peer check never
-/// makes the process's certificate checks refuse. Not a minute, because the keeper's accept loop
-/// and the window's boot dial wait on it in line; a caller that does not
-/// ([`Identity::start_check_named`]) waits for the check's answer as long as it chooses.
+/// How long a peer's code check ([`Identity::check`]) may take, at least.
 pub const PEER_CHECK_HANG: Duration = Duration::from_secs(10);
 
 /// The words for a check `trustd` did not answer — at its deadline, or at once
-/// because an earlier check (of any kind, sharing the gate) is overdue — so
-/// they claim no wait.
 fn unanswered(what: &str) -> String {
     format!("macOS's code-signing service (trustd) is not answering; {what} was not checked")
 }
@@ -80,7 +28,6 @@ const THE_PEERS_CODE: &str = "the peer's code";
 #[cfg(target_vendor = "apple")]
 enum GateRefusal {
     /// `trustd` did not answer: at the deadline, or at once because an earlier
-    /// check sharing the gate is overdue.
     Unanswered(String),
     /// The check could not run at all (no thread, or it panicked).
     Failed(String),
@@ -96,8 +43,6 @@ impl From<GateRefusal> for String {
 }
 
 /// `work`, a code check that waits on `trustd`, through the process's one
-/// `trustd` gate: suspect after `suspect`, abandoned at `deadline`. Its own
-/// answer, or why there is none.
 #[cfg(target_vendor = "apple")]
 fn through_trust_gate<T: Send + 'static>(
     suspect: Duration,
@@ -131,17 +76,13 @@ fn peer_refusal(refused: aterm_uds::deadline::Refused) -> CheckError {
     }
 }
 
-/// A peer check [`Identity::start_check_named`] began, its wait on `trustd` left to the caller:
-/// for one that watches other things while `trustd` takes its time, and keeps waiting for this
-/// check rather than abandoning it and asking again (the update handoff's rendezvous, which
-/// holds its dialer meanwhile).
+/// A peer check [`Identity::start_check_named`] began, its wait on `trustd` left to the caller.
 #[derive(Debug)]
 pub struct PeerCheck(PeerCheckState);
 
 #[derive(Debug)]
 enum PeerCheckState {
     /// Settled without waiting on `trustd`: the uid floor, a peer the kernel did not name, a
-    /// gate that refused at once, or no code requirement in force.
     Settled(Result<(), CheckError>),
     /// Waiting on `trustd`.
     #[cfg(target_vendor = "apple")]
@@ -153,9 +94,7 @@ impl PeerCheck {
         Self(PeerCheckState::Settled(answer))
     }
 
-    /// `work`, a peer check, started through the process's `trustd` gate with `suspect` as its
-    /// suspect age: [`Identity::start_check_named`]'s, and a test's stand-in for `trustd` in
-    /// its place. Unanswered at once while an earlier check through the gate is overdue.
+    /// `work`, a peer check, started through the process's `trustd` gate with `suspect` as its suspect age.
     #[cfg(target_vendor = "apple")]
     pub fn start(
         suspect: Duration,
@@ -185,8 +124,7 @@ impl PeerCheck {
         }
     }
 
-    /// What this check says while `trustd` has not answered it: [`CheckError::Unanswered`]'s
-    /// words.
+    /// What this check says while `trustd` has not answered it.
     #[must_use]
     pub fn unanswered(&self) -> String {
         unanswered(THE_PEERS_CODE)
@@ -205,16 +143,11 @@ pub enum IdentityPolicy {
 /// Why [`Identity::check`] did not admit a peer.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CheckError {
-    /// The peer was checked and refused: another uid, or code that does not
-    /// satisfy this build's requirement.
+    /// The peer was checked and refused.
     Refused(String),
-    /// The check could not run: the kernel did not name the peer, or its code
-    /// could not be looked up (it may have exited, or the file it was started
-    /// from was replaced).
+    /// The check could not run.
     Unchecked(String),
-    /// The check could not run because `trustd` did not answer (at the deadline, or at once while
-    /// an earlier check through the gate is overdue). A refusal, never a pass, and about the
-    /// machine's moment rather than the peer: the same check may pass once `trustd` answers.
+    /// The check could not run because `trustd` did not answer (at the deadline, or at once while an earlier check through the gate is overdue).
     Unanswered(String),
 }
 
@@ -250,9 +183,7 @@ impl Identity {
     /// The identity `policy` asks for, derived from this process's own code.
     ///
     /// # Errors
-    /// `Designated` on a platform without code signing, or when this process's
-    /// own requirement cannot be read. The caller refuses to serve rather than
-    /// falling to the floor silently.
+    /// `Designated` on a platform without code signing, or when this process's own requirement cannot be read.
     pub fn for_self(policy: IdentityPolicy) -> Result<Self, String> {
         match policy {
             IdentityPolicy::SameUid => Ok(Self::same_uid()),
@@ -275,11 +206,7 @@ impl Identity {
         Err("code identity is checked on macOS only".to_string())
     }
 
-    /// Code that satisfies `requirement`: requirement-language text, as
-    /// `codesign -R` takes it after its `=` — for a peer whose code is not
-    /// this build's but must meet a requirement this build states, as an update
-    /// candidate meets an aterm release's (its signing identifier and the
-    /// Developer ID requirement pinned to the release team).
+    /// Code that satisfies `requirement`.
     ///
     /// # Errors
     /// Off macOS, or when Security.framework does not compile the text.
@@ -300,11 +227,7 @@ impl Identity {
         }
     }
 
-    /// Code that satisfies the designated requirement of the code at `path` (an
-    /// executable or an app bundle): a peer started from that code passes, and,
-    /// for an ad-hoc signature (whose requirement is its cdhash), only one.
-    /// Reading a requirement does not wait on `trustd`; checking a peer against
-    /// it may, as every check does.
+    /// Code that satisfies the designated requirement of the code at `path` (an executable or an app bundle).
     ///
     /// # Errors
     /// Off macOS, or when the code at `path` is unsigned or unreadable.
@@ -337,13 +260,10 @@ impl Identity {
         &self.description
     }
 
-    /// Whether the code at `path` — an executable, or an app bundle — meets the
-    /// requirement in force, with its signature intact: what a peer checking a
-    /// process started from it will find. Always `Ok` under the same-uid floor.
+    /// Whether the code at `path`.
     ///
     /// # Errors
-    /// Why the code does not pass, or could not be read — including a
-    /// `trustd` that did not answer within [`CODE_CHECK_HANG`].
+    /// Why the code does not pass, or could not be read.
     pub fn admits_code_at(&self, path: &Path) -> Result<(), String> {
         #[cfg(target_vendor = "apple")]
         if let Some(req) = &self.requirement {
@@ -359,22 +279,15 @@ impl Identity {
         Ok(())
     }
 
-    /// Check the peer on `stream`: same uid, then (Designated) its code, which
-    /// `trustd` must answer within `within` or [`PEER_CHECK_HANG`], whichever
-    /// is longer.
+    /// Check the peer on `stream`.
     ///
     /// # Errors
-    /// Why the peer is refused, or why it could not be checked (a `trustd`
-    /// that did not answer in time is [`CheckError::Unanswered`]).
+    /// Why the peer is refused, or why it could not be checked (a `trustd` that did not answer in time is [`CheckError::Unanswered`]).
     pub fn check(&self, stream: &CtlStream, within: Duration) -> Result<(), CheckError> {
         self.check_named(stream, aterm_uds::peer::peer_audit_token(stream), within)
     }
 
-    /// [`Self::check`] of the process `token` names, read from `stream` earlier
-    /// ([`aterm_uds::peer::peer_audit_token`]): for a caller that must judge the same process
-    /// across several checks (the update handoff's rendezvous). A token whose process has gone or
-    /// been replaced at its pid fails the code lookup ([`CheckError::Unchecked`]); so does `None`
-    /// (a peer the kernel did not name) where a requirement is in force.
+    /// [`Self::check`] of the process `token` names, read from `stream` earlier ([`aterm_uds::peer::peer_audit_token`]).
     ///
     /// # Errors
     /// As [`Self::check`].
@@ -390,10 +303,7 @@ impl Identity {
             .unwrap_or_else(|check| Err(CheckError::Unanswered(check.unanswered())))
     }
 
-    /// [`Self::check_named`] started, its wait on `trustd` left to the caller
-    /// ([`PeerCheck::wait`]); its suspect age in the process's `trustd` gate is
-    /// [`PEER_CHECK_HANG`], so a check that outlives it refuses the gate's other calls
-    /// meanwhile, as one of `check_named` does.
+    /// [`Self::check_named`] started, its wait on `trustd` left to the caller ([`PeerCheck::wait`]).
     #[must_use]
     pub fn start_check_named(
         &self,
@@ -404,7 +314,6 @@ impl Identity {
     }
 
     /// The peer check, its code check (if one is in force) started through the process's
-    /// `trustd` gate with `suspect` as its suspect age.
     fn begin_check(
         &self,
         stream: &CtlStream,
@@ -445,7 +354,6 @@ impl Identity {
             let req = Arc::clone(req);
             return PeerCheck::start(suspect, move || sec::check_guest(&token, &req));
         }
-        // Off Apple nothing judges the code, so neither the suspect age nor the token is read.
         #[cfg(all(unix, not(target_vendor = "apple")))]
         let _ = (suspect, token);
         #[allow(unreachable_code)]
@@ -464,8 +372,7 @@ mod sec {
     #[derive(Debug)]
     pub struct Owned(CFTypeRef);
 
-    // SAFETY: a SecRequirement is immutable once created and CoreFoundation's
-    // retain/release are thread-safe.
+    // SAFETY: a SecRequirement is immutable once created and CoreFoundation's retain/release are thread-safe.
     unsafe impl Send for Owned {}
     // SAFETY: see `Send`: only read (checked against) after creation.
     unsafe impl Sync for Owned {}
@@ -562,7 +469,6 @@ mod sec {
     }
 
     /// This process's designated requirement, and its text.
-    // Skip: bottoms out at Security.framework FFI.
     #[cfg_attr(trust_verify, trust::skip)]
     pub fn own_designated_requirement() -> Result<(Owned, String), String> {
         let mut me: CFTypeRef = std::ptr::null();
@@ -572,19 +478,14 @@ mod sec {
         designated_requirement_of(&me)
     }
 
-    /// The designated requirement of the code on disk at `path` (an executable
-    /// or a bundle), and its text: the requirement a process started from that
-    /// code satisfies. Unsigned code has none.
-    // Skip: bottoms out at Security.framework FFI.
+    /// The designated requirement of the code on disk at `path` (an executable or a bundle), and its text.
     #[cfg_attr(trust_verify, trust::skip)]
     pub fn designated_requirement_at(path: &std::path::Path) -> Result<(Owned, String), String> {
         let code = static_code_at(path)?;
         designated_requirement_of(&code)
     }
 
-    /// `requirement` (requirement-language text) compiled, and its text as
-    /// Security.framework prints it back.
-    // Skip: bottoms out at Security.framework FFI.
+    /// `requirement` (requirement-language text) compiled, and its text as Security.framework prints it back.
     #[cfg_attr(trust_verify, trust::skip)]
     pub fn requirement_from_text(requirement: &str) -> Result<(Owned, String), String> {
         let bytes = requirement.as_bytes();
@@ -602,7 +503,7 @@ mod sec {
             "CFStringCreateWithBytes",
         )?;
         let mut req: CFTypeRef = std::ptr::null();
-        // SAFETY: `source` is a live CFString; an out-parameter for one reference.
+        // SAFETY: `source` is a live CFString.
         status(
             unsafe { SecRequirementCreateWithString(source.0, 0, &mut req) },
             "SecRequirementCreateWithString",
@@ -613,12 +514,10 @@ mod sec {
     }
 
     /// The designated requirement of `code` (a static or a running code
-    /// object), and its text.
-    // Skip: bottoms out at Security.framework FFI.
     #[cfg_attr(trust_verify, trust::skip)]
     fn designated_requirement_of(code: &Owned) -> Result<(Owned, String), String> {
         let mut req: CFTypeRef = std::ptr::null();
-        // SAFETY: `code` is a live code object; an out-parameter for one reference.
+        // SAFETY: `code` is a live code object.
         status(
             unsafe { SecCodeCopyDesignatedRequirement(code.0, 0, &mut req) },
             "SecCodeCopyDesignatedRequirement",
@@ -629,18 +528,17 @@ mod sec {
     }
 
     /// A requirement's text, as Security.framework prints it.
-    // Skip: bottoms out at Security.framework FFI.
     #[cfg_attr(trust_verify, trust::skip)]
     fn requirement_text(req: &Owned) -> Result<String, String> {
         let mut text: CFTypeRef = std::ptr::null();
-        // SAFETY: `req` is a live requirement; an out-parameter for one reference.
+        // SAFETY: `req` is a live requirement.
         status(
             unsafe { SecRequirementCopyString(req.0, 0, &mut text) },
             "SecRequirementCopyString",
         )?;
         let text = owned(text, "SecRequirementCopyString")?;
         let mut buf = vec![0u8; 4096];
-        // SAFETY: `text` is a live CFString; `buf` is its stated size.
+        // SAFETY: `text` is a live CFString.
         let ok = unsafe {
             CFStringGetCString(
                 text.0,
@@ -658,7 +556,6 @@ mod sec {
     }
 
     /// The static code object for the code on disk at `path`.
-    // Skip: bottoms out at Security.framework FFI.
     #[cfg_attr(trust_verify, trust::skip)]
     fn static_code_at(path: &std::path::Path) -> Result<Owned, String> {
         use std::os::unix::ffi::OsStrExt as _;
@@ -677,7 +574,7 @@ mod sec {
             "CFURLCreateFromFileSystemRepresentation",
         )?;
         let mut code: CFTypeRef = std::ptr::null();
-        // SAFETY: `url` is a live CFURL; an out-parameter for one reference.
+        // SAFETY: `url` is a live CFURL.
         status(
             unsafe { SecStaticCodeCreateWithPath(url.0, 0, &mut code) },
             "SecStaticCodeCreateWithPath",
@@ -685,13 +582,7 @@ mod sec {
         owned(code, "SecStaticCodeCreateWithPath")
     }
 
-    /// Whether the process `token` names runs code satisfying `req`: a failed
-    /// lookup of its code is [`CheckError::Unchecked`], code that fails `req`
-    /// [`CheckError::Refused`].
-    ///
-    /// [`CheckError::Unchecked`]: super::CheckError::Unchecked
-    /// [`CheckError::Refused`]: super::CheckError::Refused
-    // Skip: bottoms out at Security.framework FFI.
+    /// Whether the process `token` names runs code satisfying `req`.
     #[cfg_attr(trust_verify, trust::skip)]
     pub fn check_guest(
         token: &aterm_uds::peer::AuditToken,
@@ -706,11 +597,7 @@ mod sec {
         .map_err(super::CheckError::Refused)
     }
 
-    /// Whether the code on disk at `path` (an executable or a bundle) is
-    /// intact and satisfies `req`: `SecStaticCodeCheckValidity` with the
-    /// default flags, which validate the signature, its resources and every
-    /// page of the executable.
-    // Skip: bottoms out at Security.framework FFI.
+    /// Whether the code on disk at `path` (an executable or a bundle) is intact and satisfies `req`.
     #[cfg_attr(trust_verify, trust::skip)]
     pub fn check_static(path: &std::path::Path, req: &Owned) -> Result<(), String> {
         let code = static_code_at(path)?;
@@ -722,7 +609,6 @@ mod sec {
     }
 
     /// The code object of the process `token` names.
-    // Skip: bottoms out at Security.framework FFI.
     #[cfg_attr(trust_verify, trust::skip)]
     fn copy_guest(token: &aterm_uds::peer::AuditToken) -> Result<Owned, String> {
         let bytes = token.to_bytes();
@@ -735,8 +621,7 @@ mod sec {
         let key = unsafe { kSecGuestAttributeAudit };
         let keys = [key];
         let values = [data.0];
-        // SAFETY: one key and one value, both live; the standard CFType
-        // callbacks retain them for the dictionary's life.
+        // SAFETY: one key and one value, both live.
         let attrs = owned(
             unsafe {
                 CFDictionaryCreate(
@@ -751,7 +636,7 @@ mod sec {
             "CFDictionaryCreate",
         )?;
         let mut guest: CFTypeRef = std::ptr::null();
-        // SAFETY: `attrs` is a live dictionary; an out-parameter for one reference.
+        // SAFETY: `attrs` is a live dictionary.
         status(
             unsafe { SecCodeCopyGuestWithAttributes(std::ptr::null(), attrs.0, 0, &mut guest) },
             "the peer's code (SecCodeCopyGuestWithAttributes)",
@@ -768,8 +653,6 @@ mod tests {
     const WITHIN: Duration = Duration::from_secs(60);
 
     /// `trustd` going silent after the one probe above refuses every later
-    /// check through the gate: the machine's moment, never the code's verdict,
-    /// so it is neither a pass nor a refusal a negative control may count.
     const TRUSTD_SILENT: &str =
         "COULD NOT RUN: the process trustd gate was silent — the machine's, not the code's";
 
@@ -782,7 +665,6 @@ mod tests {
     }
 
     /// [`Identity::admits_code_at`]'s `r`, unless the gate refused it
-    /// unanswered (its words are [`unanswered`]'s).
     fn answered(r: Result<(), String>) -> Result<(), String> {
         if let Err(why) = &r
             && why.starts_with("macOS's code-signing service (trustd) is not answering")
@@ -793,10 +675,8 @@ mod tests {
     }
 
     /// This process satisfies its own requirement: a socketpair's peer is
-    /// ourselves, and the designated check passes. The floor names itself.
     #[test]
     fn a_process_satisfies_its_own_requirement() {
-        // An ad-hoc build's check needs no `trustd`, but every check shares the gate.
         aterm_uds::deadline::require_trust_service();
         let id = Identity::for_self(IdentityPolicy::Designated).expect("own requirement");
         assert!(
@@ -813,8 +693,6 @@ mod tests {
     }
 
     /// A held token is judged as the process it names: the token read from the connection
-    /// passes. Negative controls: the token with its pid version moved on (a later image at the
-    /// same pid) and no token at all are `Unchecked`, never a pass, under a requirement.
     #[test]
     fn a_held_token_is_checked_as_the_process_it_named() {
         aterm_uds::deadline::require_trust_service();
@@ -842,8 +720,6 @@ mod tests {
     }
 
     /// The code a keeper re-runs from is checked as a peer would check it: this test binary's
-    /// file and a byte-for-byte copy pass. Negative controls: `/usr/bin/true` and the copy with
-    /// one byte changed do not; the same-uid floor admits any.
     #[test]
     fn code_on_disk_is_checked_against_the_requirement() {
         aterm_uds::deadline::require_trust_service();
@@ -870,8 +746,6 @@ mod tests {
     }
 
     /// A stated requirement for another build's code (the Developer ID requirement pinned to a
-    /// team, as an update candidate meets it): this ad-hoc test binary is refused, never
-    /// unchecked, and text that is no requirement is refused when compiled.
     #[test]
     fn a_stated_requirement_refuses_code_that_does_not_meet_it() {
         aterm_uds::deadline::require_trust_service();
@@ -898,7 +772,6 @@ mod tests {
     }
 
     /// The code at a path, as its own designated requirement: this test binary passes, and the
-    /// same process against `/usr/bin/true`'s code is refused. Unsigned code has no requirement.
     #[test]
     fn the_code_at_a_path_admits_exactly_its_own_processes() {
         aterm_uds::deadline::require_trust_service();
@@ -929,7 +802,6 @@ mod tests {
     }
 
     /// `nc -U` dials a listener here: its audit token names `nc`, which fails the designated
-    /// check and passes the floor.
     #[test]
     fn another_program_fails_the_designated_check() {
         aterm_uds::deadline::require_trust_service();

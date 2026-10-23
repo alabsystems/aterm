@@ -176,7 +176,7 @@ impl Log {
     /// so a host whose reader holds the predecessor's id tells that jump
     /// itself (aterm-gui's timeline view, as its ring's digest tells the
     /// update's).
-    pub fn continue_rows(&mut self, carried: u64) {
+    pub const fn continue_rows(&mut self, carried: u64) {
         if carried > SEQ_LIMIT || carried <= self.rows.head {
             return;
         }

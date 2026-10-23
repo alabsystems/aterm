@@ -1,10 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! what a seamless
-//! update carries of a session's mailbox beside its topics and hold
-//! ([`FabricCarry`]), driven through the real manifest — `from_store`, TOML
-//! out and back, and the spawn's own seed.
+//! what a seamless update carries of a session's mailbox beside its topics and hold ([`FabricCarry`]), driven through the real manifest.
 
 use super::*;
 use crate::SessionCtx;
@@ -13,7 +10,6 @@ use crate::session_store::{SessionHandoff, Store, new_store, test_handle};
 use super::with_link_reset as with_link;
 
 /// A registered session with process-local id `local_id`: the real
-/// `SessionHandle` the store builds.
 fn registered(store: &Store, local_id: u64) -> (String, std::sync::Arc<SessionCtx>) {
     let h = test_handle(local_id);
     let sid = h.sid.as_str().to_string();
@@ -31,7 +27,6 @@ fn deliver(store: &Store, sid: &str, off: u64, from: &str, kind: &str, text: &st
 }
 
 /// A broadcast delivery on `topic`, as the bridge sends one to a subscribed
-/// session.
 fn broadcast(store: &Store, sid: &str, off: u64, topic: &str, text: &str) -> String {
     cmd_deliver(
         store,
@@ -42,8 +37,6 @@ fn broadcast(store: &Store, sid: &str, off: u64, topic: &str, text: &str) -> Str
 }
 
 /// The outgoing store drawn into a manifest and read back as the
-/// successor reads it, each record seeded onto a FRESH session through
-/// the spawn's seam and registered in a fresh store.
 fn hand_over(store: &Store) -> (Store, Vec<(String, std::sync::Arc<SessionCtx>)>) {
     let manifest = SessionHandoff::from_store(&store.read().unwrap());
     let wire = manifest.to_toml().expect("serializes");
@@ -67,18 +60,6 @@ fn hand_over(store: &Store) -> (Store, Vec<(String, std::sync::Arc<SessionCtx>)>
 }
 
 /// **`dropped=` SURVIVES A SEAMLESS UPDATE, AND THE UNREAD BROADCASTS THE
-/// UPDATE DROPS ARE COUNTED IN IT AND LOGGED.** The ring is not carried,
-/// and under a bridge that does not refill broadcasts (no `hello`, as
-/// here) every broadcast a session held unhandled at the draw is gone from
-/// the successor's inbox; the counter is monotone so that a loss is
-/// visible to the next drain, and the successor used to start it at 0 —
-/// erasing the update's own loss and every drop counted before it.
-/// NEGATIVE CONTROLS: a session that handled its broadcasts before the
-/// draw keeps only its earlier drops, and an unhandled ADDRESSED row
-/// (refilled from the floor) is never counted. The refilling bridge's
-/// case is the next test.
-///
-/// FAILS WITHOUT THE FIX: both successors report `dropped=0`.
 #[test]
 fn a_seamless_update_keeps_dropped_and_counts_the_unread_broadcasts_it_drops() {
     crate::test_log::install();
@@ -98,8 +79,6 @@ fn a_seamless_update_keeps_dropped_and_counts_the_unread_broadcasts_it_drops() {
                 "an addressed row is refilled, so it is not counted"
             );
         }
-        // Session 2 handled all three broadcasts before the draw; session 1
-        // handled none of them.
         assert_eq!(cmd_inbox_seen(&bctx, "3"), "OK seen=3\n");
 
         let (_successor, adopted) = hand_over(&store);
@@ -134,19 +113,6 @@ fn a_seamless_update_keeps_dropped_and_counts_the_unread_broadcasts_it_drops() {
 }
 
 /// **A BROADCAST ITS BRIDGE OFFERS AGAIN IS NOT COUNTED LOST.** Under a
-/// bridge that said `refill=…say`, the successor's bridge rewinds each
-/// topic to its oldest unhandled broadcast and offers it again, so
-/// counting it in `dropped=` as well would report a loss that did not
-/// happen. The carry says both numbers, so a successor from before the
-/// refill (whose own bridge refills nothing) still counts every one.
-/// NEGATIVE CONTROLS, each counted: a row a bridge from before the key
-/// delivered (its floor was never written), and a row on a topic the
-/// session dropped before the draw (a successor refuses it
-/// `ERR not-subscribed`). A carry from an older aterm, with no
-/// `broadcasts_refilled`, counts all of them.
-///
-/// FAILS WITHOUT THE FIX: the successor reports `dropped=6`, every unread
-/// broadcast counted though four come back.
 #[test]
 fn a_seamless_update_does_not_count_the_broadcasts_its_bridge_offers_again() {
     crate::test_log::install();
@@ -157,7 +123,6 @@ fn a_seamless_update_does_not_count_the_broadcasts_its_bridge_offers_again() {
             assert_eq!(ctx.fabric.topic_add(t, "head", &ctx.timeline), Ok(true));
         }
         ctx.fabric.with_inbox_for_test(|i| i.dropped = 2);
-        // Delivered by a bridge from before `refill=`.
         assert_eq!(broadcast(&store, &sid, 10, "news", "b"), "OK 1\n");
         let generation = next_bridge_generation();
         bridge_attached(generation);
@@ -197,7 +162,6 @@ fn a_seamless_update_does_not_count_the_broadcasts_its_bridge_offers_again() {
             "and so is what comes back"
         );
 
-        // An older aterm's carry: no `broadcasts_refilled`.
         let older = FabricCarry {
             broadcasts_refilled: 0,
             ..carry
@@ -210,21 +174,6 @@ fn a_seamless_update_does_not_count_the_broadcasts_its_bridge_offers_again() {
 }
 
 /// **A BROADCAST ITS REFILLING BRIDGE HAS LET GO OF IS COUNTED LOST.** Two
-/// ways that bridge stops holding the refill floor of a row this ring
-/// still holds unhandled, and no successor is offered it: a `topic drop`
-/// takes the topic's floor with it (aterm-link's
-/// `Bridge::forget_unhandled_topic`) — and a `topic add` of the same name
-/// resumes from a new cursor, so the topic being held again at the draw
-/// says nothing about the old rows; and the bridge remembers a session's
-/// newest [`RING_CAP`] unhandled broadcasts only (`UNHANDLED_KEEP`), so a
-/// person's broadcast the ring keeps ahead of that many newer agent ones
-/// (evicting those instead) is gone from the floor. Each is counted in
-/// `dropped=`, not carried. NEGATIVE CONTROLS: the broadcast taken after
-/// the re-add is carried, and the person's is carried while fewer than
-/// [`RING_CAP`] rows came after it — the bridge still holds it then.
-///
-/// FAILS WITHOUT THE FIX: both are counted as offered again, so the
-/// successor's `dropped=` misses them.
 #[test]
 fn a_broadcast_its_refilling_bridge_let_go_of_is_counted_lost() {
     with_link(|| {
@@ -240,7 +189,6 @@ fn a_broadcast_its_refilling_bridge_let_go_of_is_counted_lost() {
             (carry.broadcasts_uncarried, carry.broadcasts_refilled)
         };
 
-        // DROPPED AND ADDED AGAIN, through the verb.
         assert!(cmd_topic(&ctx, "add news").contains("added=1"));
         assert_eq!(broadcast(&store, &sid, 10, "news", "b"), "OK 1\n");
         assert!(cmd_topic(&ctx, "drop news").contains("dropped=1"));
@@ -248,8 +196,6 @@ fn a_broadcast_its_refilling_bridge_let_go_of_is_counted_lost() {
         assert_eq!(broadcast(&store, &sid, 11, "news", "b"), "OK 2\n");
         assert_eq!(carried(&ctx), (2, 1), "only the row taken since the add");
 
-        // A PERSON'S BROADCAST, then agents' from distinct peers (one
-        // quota each): the ring evicts the agents' first.
         assert!(cmd_topic(&pctx, "add news").contains("added=1"));
         let shout = |off: u64, from: &str| {
             cmd_deliver(
@@ -282,16 +228,6 @@ fn a_broadcast_its_refilling_bridge_let_go_of_is_counted_lost() {
 }
 
 /// a post still queued and a receipt still owed at the park are
-/// on the SUCCESSOR's `outbox` peek — its bridge drains them — under the
-/// ids the old process gave them. every id the
-/// successor hands out after that is above the old process's, so a
-/// pre-update anchor or sequence pin never names a new row, post or
-/// receipt. NEGATIVE CONTROL: a post the bridge already retired is not
-/// carried (it would go on the bus twice).
-///
-/// FAILS WITHOUT THE FIX: the successor's outbox is empty and its ids
-/// start over at 1 (measured: `seed_carry` a no-op leaves `outbox` at
-/// `OK 0`).
 #[test]
 fn a_seamless_update_carries_the_outbox_the_receipts_and_the_ids() {
     with_link(|| {
@@ -315,8 +251,6 @@ fn a_seamless_update_carries_the_outbox_the_receipts_and_the_ids() {
             deliver(&store, &sid, 11, "h-andrew", "task", "two"),
             "OK 2\n"
         );
-        // No bridge: both posts queue. The first is published and retired
-        // before the park; the second waits.
         assert_eq!(cmd_post(&ctx, "to=@s-peer kind=note gone", None), "OK 1\n");
         assert_eq!(
             cmd_post(&ctx, "to=@s-peer kind=note waiting", None),
@@ -326,7 +260,6 @@ fn a_seamless_update_carries_the_outbox_the_receipts_and_the_ids() {
             cmd_outbox_verb(&store, &format!("sent {sid} 1 off=70")),
             "OK\n"
         );
-        // A verdict on the ask owes its sender a receipt.
         assert_eq!(cmd_inbox_seen(&ctx, "1 handled"), "OK seen=1\n");
 
         let (successor, adopted) = hand_over(&store);
@@ -348,8 +281,6 @@ fn a_seamless_update_carries_the_outbox_the_receipts_and_the_ids() {
             )),
             "the owed receipt is on the successor's drain: {drain}"
         );
-        // The ids go on above the old process's — the inbox's above its
-        // overlap reserve too ([`INBOX_ID_RESERVE`]).
         let next_row = 2 + INBOX_ID_RESERVE + 1;
         assert_eq!(
             deliver(&successor, new_sid, 12, "h-andrew", "task", "three"),
@@ -367,7 +298,6 @@ fn a_seamless_update_carries_the_outbox_the_receipts_and_the_ids() {
             cmd_outbox(&successor, "").contains("rid=2 off=12"),
             "the next receipt is rid 2, never a second rid 1"
         );
-        // An old id the successor never minted names nothing.
         assert_eq!(
             cmd_inbox_seen(new_ctx, "1 handled"),
             "ERR no such message\n"
@@ -376,13 +306,6 @@ fn a_seamless_update_carries_the_outbox_the_receipts_and_the_ids() {
 }
 
 /// **A RECEIPT FOR A ROW OF AN EARLIER LOG IS LISTED AS ONE, AND STAYS
-/// ONE ACROSS AN UPDATE** (r2-01's residual). Told log A, two asks land at
-/// 10 and 11 and the first is decided. Told log B, both of A's rows'
-/// receipts — the one owed at the switch and the one a verdict on A's
-/// second row owes after it — are listed `log=earlier`, which the bridge
-/// retires rather than put `re=` on B; an ask B delivers at A's offset 10
-/// owes a plain receipt. The successor lists each as the old process did.
-/// Negative control, run: without the mark all three are listed as B's.
 #[test]
 fn a_receipt_for_a_row_of_an_earlier_log_is_listed_as_one_across_an_update() {
     with_link(|| {
@@ -446,7 +369,6 @@ fn a_receipt_for_a_row_of_an_earlier_log_is_listed_as_one_across_an_update() {
             "old receipts cannot lose their provenance"
         );
         assert_eq!(legacy.receipts[0].rid, 3);
-        // Both lists spend one shared budget, and both are counted on shed.
         let mut budget = carry.receipts[0].cost();
         let mut limited = ctx.fabric.handoff_carry(&mut budget);
         assert_eq!(limited.receipts.len() + limited.earlier_receipts.len(), 1);
@@ -487,19 +409,6 @@ fn unknown_carried_receipts_stay_fenced_before_the_first_log_report() {
 }
 
 /// A PTY KEEPER RECOVERY IS NOT A FRESH MAILBOX (the fabric audit's fourth
-/// round). A session the keeper kept through a crash keeps
-/// its sid and its agent, and comes back from its META's fabric: HELD
-/// again before it answers a verb, its broadcast opt-in listed (so the new
-/// bridge keeps the topic's cursor), every id above the dead window's (an
-/// old inbox id names no row, and no post or receipt meets a sequence pin
-/// the crash left), and each post it was told is queued retired dead
-/// `not-carried`, said on its timeline. NEGATIVE CONTROL: a META without
-/// the fabric (an older window's) carries no hold or topic, and its
-/// counters are fenced far above any window's, not restarted.
-///
-/// FAILS WITHOUT THE FIX: the recovery's `Adopted` held `hold: None`,
-/// `topics: []` and an empty carry — `send` went through, `topic ls` read
-/// `OK 0` and the next post was id 1.
 #[cfg(unix)]
 #[test]
 fn a_keeper_recovery_holds_resubscribes_and_counts_above_the_dead_window() {
@@ -528,7 +437,6 @@ fn a_keeper_recovery_holds_resubscribes_and_counts_above_the_dead_window() {
             origin: "local".to_string(),
         };
         assert!(apply_hold_for_test(&ctx, Some(stop.clone())));
-        // …and the fleet's halt over it, which stands beside it.
         let halt = Hold {
             reason: "main%20broken".to_string(),
             origin: "fleet".to_string(),
@@ -593,8 +501,6 @@ fn a_keeper_recovery_holds_resubscribes_and_counts_above_the_dead_window() {
                 .any(|(_, payload)| payload.starts_with("1 off=")),
             "the landed post is not: {rows:?}"
         );
-        // Every id is above the dead window's: the next of each kind
-        // starts past the lease.
         let lease = 2 * INBOX_ID_RESERVE;
         assert_eq!(
             cmd_inbox_seen(&new_ctx, "2 handled"),
@@ -618,7 +524,6 @@ fn a_keeper_recovery_holds_resubscribes_and_counts_above_the_dead_window() {
             "the next receipt is past the lease"
         );
 
-        // NEGATIVE CONTROL: the same screen, no fabric.
         let bare = crate::seamless::keeper_meta_of(screen, None).expect("a META");
         let recovered = crate::seamless::recovered_fabric(&bare);
         assert_eq!((recovered.holds, recovered.topics.len()), (Vec::new(), 0));
@@ -631,7 +536,6 @@ fn a_keeper_recovery_holds_resubscribes_and_counts_above_the_dead_window() {
             "fenced, not restarted: {:?}",
             recovered.carry
         );
-        // A fabric no window writes is read as a halt, never as none.
         let unreadable = Hold {
             reason: CARRIED_UNREADABLE.to_string(),
             origin: "local".to_string(),
@@ -645,8 +549,6 @@ fn a_keeper_recovery_holds_resubscribes_and_counts_above_the_dead_window() {
                 std::slice::from_ref(&unreadable)
             );
         }
-        // So is a `more_holds` that does not read, beside a fleet hold
-        // that does: both stand.
         for garbled in [
             &br#"{"fabric":{"hold":"fleet x","more_holds":7}}"#[..],
             br#"{"fabric":{"hold":"fleet x","more_holds":[7]}}"#,
@@ -663,8 +565,6 @@ fn a_keeper_recovery_holds_resubscribes_and_counts_above_the_dead_window() {
                 [fleet, unreadable.clone()]
             );
         }
-        // A META from before the two slots carries `hold` alone: exactly
-        // that hold, of that origin.
         let holds = crate::seamless::recovered_fabric(
             br#"{"fabric":{"hold":"local stop%20driving","ids":[1,1,1]}}"#,
         )
@@ -679,16 +579,6 @@ fn a_keeper_recovery_holds_resubscribes_and_counts_above_the_dead_window() {
 }
 
 /// `dropped=` GOES ON COUNTING ACROSS A PTY KEEPER RECOVERY (audit r3-07,
-/// the keeper half), as it does across an update: the META carries the
-/// session's count and the recovered session's `inbox` header reads it,
-/// then counts on from it. NEGATIVE CONTROL: the same session's META from
-/// a window before the count (no `dropped` member) reads `dropped=0`, which
-/// is what every recovery read before — the reader, not the default, is
-/// what carries it. FAILS WITHOUT THE FIX: the carry had no such member and
-/// the recovered header read `dropped=0`. AND THE COUNT IS BOUNDED as the
-/// writer bounds it: a META naming more than `i64::MAX` (no window writes
-/// one; the reader is lenient) recovers at `i64::MAX`, from which the
-/// ring's next eviction counts on, where `u64::MAX` overflowed it.
 #[cfg(unix)]
 #[test]
 fn a_keeper_recovery_goes_on_counting_dropped() {
@@ -731,11 +621,9 @@ fn a_keeper_recovery_goes_on_counting_dropped() {
         let (_store, recovered, _) = recover(&meta);
         let header = cmd_inbox(&recovered, "--peek");
         assert!(header.contains(" dropped=7 "), "{header}");
-        // NEGATIVE CONTROL: the META without the member.
         let (_store, older, _) = recover(&older);
         let header = cmd_inbox(&older, "--peek");
         assert!(header.contains(" dropped=0 "), "{header}");
-        // PAST THE BOUND: the count past any carry's `i64::MAX`.
         let past = crate::seamless::keeper_meta_of(
             aterm_core::terminal::Terminal::new(24, 80).carry_meta_abandoning_partial(),
             Some(&KeeperCarry {
@@ -754,8 +642,6 @@ fn a_keeper_recovery_goes_on_counting_dropped() {
             header.contains(&format!(" dropped={} ", i64::MAX)),
             "{header}"
         );
-        // And the ring's next eviction counts on from it. One sender per
-        // row keeps the per-sender quota out of it.
         for off in 1..=u64::try_from(RING_CAP).expect("cap fits") + 1 {
             let from = format!("a-svc{off}");
             assert!(deliver(&store, &sid, off, &from, "note", "x").starts_with("OK "));
@@ -769,12 +655,7 @@ fn a_keeper_recovery_goes_on_counting_dropped() {
 }
 
 /// THE COMMIT SEES THE OUTBOX MOVE, and a move past its reading WAITS: a
-/// post queued, a receipt owed or a post retired after the park changes
-/// [`SessionFabric::carry_serial`] (the Commit then stands down, a lossless
-/// retry), and under the fence ([`SessionFabric::fence_hold`]) a post is
-/// not answered until the attempt stands down — never `OK` for a row the
-/// successor would not carry. NEGATIVE CONTROL: a read moves nothing.
-#[cfg(unix)] // the update fence (`lift_hold_fence`) is unix-only
+#[cfg(unix)]
 #[test]
 fn the_commit_sees_the_outbox_move_and_a_post_waits_on_its_fence() {
     with_link(|| {
@@ -800,8 +681,6 @@ fn the_commit_sees_the_outbox_move_and_a_post_waits_on_its_fence() {
             "a retirement moves it"
         );
 
-        // The Commit's reading raises the fence: a post waits for it —
-        // past any test value, so only the lift can answer it.
         ctx.fabric.set_fence_wait(aterm_spec::wait::MUST_HAPPEN);
         let fenced = ctx.fabric.fence_hold(true);
         assert_eq!(fenced, ctx.fabric.carry_serial());
@@ -827,11 +706,6 @@ fn the_commit_sees_the_outbox_move_and_a_post_waits_on_its_fence() {
 }
 
 /// an `await inbox since=` above every id this session has handed out
-/// names no row of this process's, and is refused at once — never parked
-/// over unread mail until `OK timeout`.
-///
-/// FAILS WITHOUT THE FIX: the wait parks its whole timeout and answers `OK
-/// timeout` with rows 1 and 2 unread.
 #[test]
 fn an_inbox_anchor_this_process_never_minted_is_refused() {
     with_link(|| {
@@ -839,8 +713,6 @@ fn an_inbox_anchor_this_process_never_minted_is_refused() {
         let (sid, ctx) = registered(&store, 1);
         deliver(&store, &sid, 10, "h-andrew", "task", "one");
         deliver(&store, &sid, 11, "h-andrew", "task", "two");
-        // A ten-minute timeout against a minute's hang detector: a wait
-        // that parks its timeout cannot pass on a loaded machine's luck.
         let started = std::time::Instant::now();
         assert_eq!(
             cmd_await_inbox(&ctx, &["since=37"], 600_000),
@@ -851,20 +723,12 @@ fn an_inbox_anchor_this_process_never_minted_is_refused() {
             "refused at once, not parked: {:?}",
             started.elapsed()
         );
-        // NEGATIVE CONTROL: an anchor it minted still waits and latches.
         assert_eq!(cmd_await_inbox(&ctx, &["since=1"], 50), "OK inbox 2\n");
         assert_eq!(cmd_await_inbox(&ctx, &["since=2"], 50), "OK timeout\n");
     });
 }
 
 /// THE MAIL BUDGET CHARGES WHAT TOML WRITES,
-/// AND IT HOLDS THE RECEIPTS TOO. A post of ANSI colour codes escapes to up
-/// to six bytes per byte in the manifest, so it is charged that — a budget
-/// its RAW length fits leaves it uncarried, said — and owed receipts are
-/// charged against the same budget, counted when they do not fit.
-///
-/// FAILS WITHOUT THE FIX: the post was charged its raw length and carried,
-/// and every receipt rode with no budget at all.
 #[test]
 fn the_mail_budget_charges_what_toml_writes_and_holds_the_receipts() {
     with_link(|| {
@@ -897,7 +761,6 @@ fn the_mail_budget_charges_what_toml_writes_and_holds_the_receipts() {
         let carry = ctx.fabric.handoff_carry(&mut left);
         assert_eq!(carry.uncarried, [1], "the escaped cost does not fit");
         assert!(carry.posts.is_empty());
-        // The charge is an upper bound on what the TOML writer spends.
         let mut roomy = CARRY_MAIL_BYTES;
         let carried = ctx.fabric.handoff_carry(&mut roomy);
         assert_eq!(carried.posts[0].body, coloured);
@@ -910,7 +773,6 @@ fn the_mail_budget_charges_what_toml_writes_and_holds_the_receipts() {
         );
         assert!(toml_cost(&coloured) > coloured.len() * 3 / 2);
 
-        // Receipts share the budget.
         deliver(&store, &sid, 10, "s-peer@n-lab", "ask", "one");
         deliver(&store, &sid, 11, "s-peer@n-lab", "ask", "two");
         assert_eq!(cmd_inbox_seen(&ctx, "1 handled"), "OK seen=1\n");
@@ -931,7 +793,6 @@ fn the_mail_budget_charges_what_toml_writes_and_holds_the_receipts() {
         assert_eq!(carry.receipts.len(), 1);
         assert_eq!(carry.receipts_uncarried, 1);
         assert_eq!(one, 0, "the budget is spent");
-        // NEGATIVE CONTROL: a roomy budget carries everything.
         let mut roomy = CARRY_MAIL_BYTES;
         let carry = ctx.fabric.handoff_carry(&mut roomy);
         assert_eq!((carry.posts.len(), carry.receipts.len()), (1, 2));
@@ -941,9 +802,6 @@ fn the_mail_budget_charges_what_toml_writes_and_holds_the_receipts() {
 }
 
 /// SHEDDING THE CARRY keeps the counters and
-/// retires every post dead in the successor, `not-carried`, said; the
-/// receipts are counted. What the manifest writer does before it would
-/// refuse an update over its cap.
 #[test]
 fn a_shed_carry_keeps_its_counters_and_says_what_it_dropped() {
     with_link(|| {
@@ -991,18 +849,7 @@ fn a_shed_carry_keeps_its_counters_and_says_what_it_dropped() {
 }
 
 /// INBOUND MAIL IN THE OVERLAP
-/// NEVER VETOES THE UPDATE. A row delivered after the park's draw moves no
-/// serial the Commit compares, and one delivered under the Commit's fence
-/// is answered at once: the manifest carried the last id plus
-/// [`INBOX_ID_RESERVE`], so both are numbered below every id the successor
-/// hands out. Only a process that outruns the reserve stands its Commit
-/// down ([`SessionFabric::past_handoff_ceiling`]). NEGATIVE CONTROL: the
-/// last row inside the reserve does not.
-///
-/// FAILS WITHOUT THE FIX: the row's id was in the carry serial, so the
-/// first delivery after the draw revoked the attempt, and one under the
-/// fence waited.
-#[cfg(unix)] // the update fence (`lift_hold_fence`) is unix-only
+#[cfg(unix)]
 #[test]
 fn mail_in_the_overlap_is_numbered_below_the_successor_and_vetoes_nothing() {
     with_link(|| {
@@ -1030,7 +877,6 @@ fn mail_in_the_overlap_is_numbered_below_the_successor_and_vetoes_nothing() {
         assert!(!ctx.fabric.past_handoff_ceiling());
         ctx.fabric.lift_hold_fence();
 
-        // The last id inside the reserve is still no veto; one past it is.
         ctx.fabric
             .with_inbox_for_test(|i| i.last_msg_id = carried.last_msg_id - 1);
         assert_eq!(
@@ -1050,27 +896,18 @@ fn mail_in_the_overlap_is_numbered_below_the_successor_and_vetoes_nothing() {
 }
 
 /// The notice cadence this test process waits on: the production one
-/// read through the timing value.
 #[cfg(unix)]
 fn notice_every() -> std::time::Duration {
     aterm_gui_timing::current().of(MSG_ROOM_NOTICE_EVERY)
 }
 
 /// Watch deliveries waiting on the Commit's fence until each of `sids`
-/// has logged a WARN whose own `waited` is past `bound` — those sessions'
-/// [`SessionFabric::fence_wait`], the longest any fenced path on them waits
-/// before a `hold`, a post and a retirement answer [`HOLD_BUSY`] — failing
-/// the moment one answers. A watch that ended inside the bound would pass a
-/// wait that times out into `ERR busy` (
-/// open problem 202). The minute is a hang detector, never a budget.
-#[cfg(unix)] // the update fence (`lift_hold_fence`) is unix-only
+#[cfg(unix)]
 fn still_waiting_past_every_fenced_bound(
     waiters: Vec<std::thread::JoinHandle<String>>,
     sids: &[&str],
     bound: std::time::Duration,
 ) -> Vec<std::thread::JoinHandle<String>> {
-    // The WARN prints `waited` to a tenth of a second, so a printed value a
-    // tenth past the bound is past it whatever the rounding.
     let past = bound.as_secs_f64() + 0.1;
     let waited_past = |sid: &str| {
         crate::test_log::containing(&format!("for session {sid} has waited "))
@@ -1105,43 +942,13 @@ fn still_waiting_past_every_fenced_bound(
 }
 
 /// A
-/// DELIVERY THAT MUST NOT BE ANSWERED UNDER THE COMMIT'S FENCE WAITS FOR
-/// THE ATTEMPT, for as long as the fence stands, and is never answered an
-/// `ERR`: the bridge books any non-`OK` reply as a verdict (the
-/// record refused to its sender, a broadcast dropped) and commits its
-/// cursor past it. Two such deliveries, on two sessions: an addressed row
-/// that would pass the carried id, and a broadcast well inside it. Both
-/// still wait past [`SessionFabric::fence_wait`] — the bound every other
-/// fenced path answers `ERR busy` at, and the only door to it — until each
-/// session's own WARN (a notice in `aterm.log`, not on the GUI's stderr)
-/// says it has waited past it. The bound is the sessions' own
-/// ([`SessionFabric::set_fence_wait`]), so the watch is a few notice rounds
-/// long. Once the attempt stands down each lands under the next id.
-/// NEGATIVE CONTROL: a redelivery of the same offset answers the id it
-/// first got.
-///
-/// FAILS WITHOUT THE FIX: the first pass answered the row `ERR busy
-/// update-committing` after the fence wait, which the bridge refused to
-/// the sender for good; the broadcast was answered `OK` at once, and lost
-/// with the `_exit`; and the wait's notice went to stderr, which nobody
-/// reads. A watch that ends inside the bound passes against the first pass
-/// as well (open problem 202).
-///
-/// NO LINK SECTION ([`with_link_reset`]), unlike its siblings: nothing here
-/// reads or writes the bridge link. The fence, the carry and both waits are
-/// the sessions' own state, the deliveries speak for no bridge (no lane
-/// generation: [`link_evidence`] returns before it writes), and `deliver`
-/// outside the section is the schedule-proof shape 27 `inbox_hold` tests
-/// already use ([`touched_contains`]); inside it, the wait would hold the
-/// section's mutex and park every link test the runner started meanwhile.
-#[cfg(unix)] // the update fence (`lift_hold_fence`) is unix-only
+#[cfg(unix)]
 #[test]
 fn a_fenced_delivery_waits_past_every_bound_and_is_never_refused() {
     crate::test_log::install();
     let store = new_store();
     let (sid, ctx) = registered(&store, 1);
     let (bsid, bctx) = registered(&store, 2);
-    // A broadcast reaches only a session that asked for its topic.
     assert_eq!(
         bctx.fabric.topic_add("news", "head", &bctx.timeline),
         Ok(true)
@@ -1153,8 +960,6 @@ fn a_fenced_delivery_waits_past_every_bound_and_is_never_refused() {
     let _ = bctx.fabric.handoff_carry(&mut CARRY_MAIL_BYTES.clone());
     ctx.fabric
         .with_inbox_for_test(|i| i.last_msg_id = carried.last_msg_id);
-    // Every fenced path on these sessions answers busy past a bound of a
-    // few notice rounds, not the real ten seconds.
     let bound = notice_every() * 5;
     for fabric in [&ctx.fabric, &bctx.fabric] {
         fabric.set_fence_wait(bound);
@@ -1194,12 +999,7 @@ fn a_fenced_delivery_waits_past_every_bound_and_is_never_refused() {
 }
 
 /// THE FENCE HOLDS A RETIREMENT BACK ONLY FOR
-/// A SUCCESSOR THAT READS THE CARRY. An older one restarts the post ids
-/// under the same sid, so a retirement left unanswered keeps a sequence
-/// pin its own post would be deduplicated into; for it the retirement is
-/// answered, as every earlier build answered it. NEGATIVE CONTROL: for a
-/// successor that reads the carry, it waits.
-#[cfg(unix)] // the update fence (`lift_hold_fence`) is unix-only
+#[cfg(unix)]
 #[test]
 fn the_fence_holds_a_retirement_back_only_for_a_successor_that_reads_the_carry() {
     with_link(|| {

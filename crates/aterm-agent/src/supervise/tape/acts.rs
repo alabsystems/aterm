@@ -1,81 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! ACTS MODE: the cursor a COUNTERFACTUAL replay serves the loop from (the
-//! replay plan's §5.2) — `aterm drive replay FILE --set k=v…|--policy FILE`,
-//! the recorded hosted loop run again under another policy, up to the first
-//! act it takes otherwise.
-//!
-//! A strict replay ([`super::replay`]) serves the record under its cursor and
-//! nothing else: the loop must ask exactly what the recorded one asked, in
-//! its order, so a policy that reads one more screen before it presses, or
-//! waits a second longer, diverges at its first extra read — long before the
-//! question a counterfactual asks, "would it have pressed the same key?". In
-//! acts mode the tape is cut into SEGMENTS by its ACTS ([`act_class`]: a key,
-//! a send, a post, a badge, a signal, a restart, a host's act), and only the
-//! acts are held to the tape exactly:
-//!
-//! * **an act** must be the segment's closing act, byte for byte: taken, the
-//!   cursor moves to the next segment; any other act — or one past the
-//!   tape's last — is the FIRST DIVERGENT ACT, and nothing more is served;
-//! * **a read** (a screen, a meta, a host's answer, a probe, a file) is the
-//!   first unconsumed record of the segment that holds that very request —
-//!   the records skipped on the way DROPPED — else the latest one the segment
-//!   already held before the cursor, served REPEATED; a derived probe the
-//!   segment does not hold is answered from before the cursor by the rule of
-//!   astream-effects' keyed view (the latest answer
-//!   [`astream_effects::keyed_hit_within_cutoff`] admits at the cursor, the
-//!   very predicate [`astream_effects::KeyedView::lookup`] and
-//!   [`astream_effects::KeyedIndex::lookup`] admit by — the latter the
-//!   reader `--why` decides again with); anything else is STALE — the build
-//!   asks a read the tape never answered there (a read held only past the
-//!   act included: a policy that looks once more before it acts asks one);
-//! * **a wait** (`await …`) as a read, and one with other arguments takes the
-//!   segment's next wait of the same kind, flagged SCHEDULE TAINT; a wait the
-//!   recorded run waited for (its timeout aside: `await seq 102`, the very
-//!   screen) only AFTER the segment's closing act is that act SKIPPED — the
-//!   candidate went on without it, a divergent act (nothing is served);
-//! * **housekeeping** (the claim's renewal and release, the teller's `story`)
-//!   is NEVER COMPARED and never refused (its cadence is the clock's, its
-//!   words the prose's): the identical request ahead in the segment, else the
-//!   latest identical one before the cursor in any segment, else the latest
-//!   of its kind (`meta set supervisor`, `meta unset supervisor`, `story`)
-//!   before the cursor, else its door's success;
-//! * **an output** (a line printed, the ledger's bound, a journal or ledger
-//!   row, a decision's mark, a host's notification) is never compared: the
-//!   record under the cursor is taken when it is one of the same door, and a
-//!   write's outcome is the last one recorded at its door (or success).
-//!
-//! NOTHING CROSSES AN ACT AND NOTHING IS SERVED FROM THE FUTURE: every
-//! answer comes from the loop's own segment or from before the cursor, never
-//! from past the act it has not taken (the model's `NoActSkipped` and
-//! `NothingFromTheFuture`, `aterm_models_harness::supervise_replay_cursor_model`
-//! at `Acts = 1`, whose reads are the control lane's; a derived probe and
-//! housekeeping are answered from before the cursor across an act, which the
-//! model leaves out and neither law forbids).
-//!
-//! **Clocks and sleeps.** A clock read takes the `Mono`/`Clock` record under
-//! the cursor when there is one, and a sleep the identical sleep under it —
-//! so a run that reads as the recorded one did gets the recorded times, and
-//! acts mode over an unchanged run consumes every record exactly as a strict
-//! replay does ([`ActsAccount::exact`]: the equivalence suite holds every
-//! tape to it). Otherwise the clock is VIRTUAL: the stamp of the last record
-//! consumed (where the clocks stood when its door was crossed, `codec::Stamp`)
-//! plus the sleeps — and the waits' timeouts — served since; the monotonic
-//! clock never runs back. That is why a build that reads the clock more often
-//! still replays. (The plan's §5.2 has the clocks ignore their records
-//! outright; taking the one under the cursor first is what makes an unchanged
-//! run replay exactly, and adding a read changes nothing it says.)
-//!
-//! **A raised flag** (the hosted loop's stop) is true once the cursor has
-//! passed its record — taken where the loop reads it as the recorded loop
-//! did, dropped by a resync past it — or, once the loop has strayed from the
-//! tape in the segment that holds it, once the virtual clock has reached the
-//! moment it was raised.
-//!
-//! The cursor is a pure function of the records and the requests: no clock, no
-//! file, no live call. [`super::replay::ReplayCore`] holds one in place of
-//! astream's strict seam when a replay is a counterfactual.
+//! ACTS MODE: the cursor a COUNTERFACTUAL replay serves the loop from (the replay plan's §5.2) — `aterm drive replay FILE --set k=v…|--policy FILE`, the recorded hosted loop run again under another policy, up to the first act it takes otherwise.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
@@ -86,15 +12,7 @@ use super::codec::{self, Stamp};
 use super::{ctl, doors};
 use crate::supervise::SupervisorConfig;
 
-/// THE CANDIDATE: the policy a counterfactual decides under, made from the
-/// recorded one — `--policy FILE`, a whole `[harness]` table read by the
-/// owner's own reader in its place, then each `--set k=v` over it through the
-/// very [`SupervisorConfig::set`] a header's policy is rebuilt with. None of
-/// either is the recorded policy itself: acts mode on the run as it was. A
-/// counterfactual says exactly what it runs, or nothing: a file its reader
-/// did not take as written (a key or a value refused, a key misplaced) is
-/// refused where it is read (`drive_cli`'s `candidate_file`), as a `--set`
-/// the reader refuses is here.
+/// THE CANDIDATE: the policy a counterfactual decides under, made from the recorded one — `--policy FILE`, a whole `[harness]` table read by the owner's own reader in its place, then each `--set k=v` over it through the very [`SupervisorConfig::set`] a header's policy is rebuilt with.
 #[derive(Debug, Clone, Default)]
 pub struct Candidate {
     /// `--policy FILE`: what was named, and the policy read from it.
@@ -105,12 +23,8 @@ pub struct Candidate {
 
 impl Candidate {
     /// The candidate's policy, made from the run's `recorded` one.
-    ///
     /// # Errors
-    ///
-    /// A `--set` the reader refuses — an unknown key, or a value that is not
-    /// the key's own (an off spelled for a key included: a counterfactual
-    /// says exactly what it runs, or nothing).
+    /// A `--set` the reader refuses — an unknown key, or a value that is not the key's own (an off spelled for a key included: a counterfactual says exactly what it runs, or nothing).
     pub fn policy(&self, recorded: &SupervisorConfig) -> Result<SupervisorConfig, String> {
         let mut policy = match &self.file {
             Some((_, file)) => file.clone(),
@@ -125,8 +39,7 @@ impl Candidate {
         Ok(policy)
     }
 
-    /// What the candidate changes, as a report says it: the file named, then
-    /// each key set.
+    /// What the candidate changes, as a report says it: the file named, then each key set.
     #[must_use]
     pub fn said(&self) -> Vec<String> {
         let mut out = Vec::new();
@@ -144,17 +57,13 @@ impl Candidate {
 /// What a request is, for acts mode (the replay plan's §5.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActClass {
-    /// A write into the session ([`ctl::is_act`]: a key, a send, a turn, a
-    /// paste, a post, an attention write, a task mark, a signal, a restart)
-    /// or a host's act (`doors::is_host_act`): held to the tape exactly.
+    /// A write into the session ([`ctl::is_act`]: a key, a send, a turn, a paste, a post, an attention write, a task mark, a signal, a restart) or a host's act (`doors::is_host_act`): held to the tape exactly.
     Act,
-    /// The claim's renewal and release (`meta set|unset supervisor`), the
-    /// teller's `story`: the clock's cadence, never compared.
+    /// The claim's renewal and release (`meta set|unset supervisor`), the teller's `story`: the clock's cadence, never compared.
     Housekeeping,
     /// A wait: `await …`.
     Wait,
-    /// A round trip whose reply is a write's outcome — a line printed, a
-    /// notes line, the ledger's bound (`write.*`): an output, never compared.
+    /// A round trip whose reply is a write's outcome — a line printed, a notes line, the ledger's bound (`write.*`): an output, never compared.
     Output,
     /// Everything else: a look at the session, the host or the machine.
     Read,
@@ -216,7 +125,6 @@ fn is_act_record(record: &EffectRecord) -> bool {
 }
 
 /// A wait's kind (the word after `await`: `seq`, `agent`, `gone` …) and its
-/// timeout in milliseconds, when it names one.
 fn wait_of(request: &[u8]) -> (Option<String>, Option<u64>) {
     let words: Vec<String> = codec::ctl_args(request)
         .unwrap_or_default()
@@ -233,7 +141,6 @@ fn wait_of(request: &[u8]) -> (Option<String>, Option<u64>) {
 }
 
 /// A wait's TARGET: its words, its timeout (the loop's schedule, not what it
-/// waits for) left out — `await seq 102`.
 fn wait_key(request: &[u8]) -> Vec<String> {
     let words: Vec<String> = codec::ctl_args(request)
         .unwrap_or_default()
@@ -253,8 +160,6 @@ fn wait_key(request: &[u8]) -> Vec<String> {
 }
 
 /// A housekeeping request's KIND: its verb's words, its values left out —
-/// `meta set supervisor`, `meta unset supervisor`, `story` — what a request
-/// in other words is answered by when its very words are not on the tape.
 fn housekeeping_kind(request: &[u8]) -> Vec<String> {
     let words: Vec<String> = codec::ctl_args(request)
         .unwrap_or_default()
@@ -269,7 +174,6 @@ fn housekeeping_kind(request: &[u8]) -> Vec<String> {
 }
 
 /// A control lane's success, saying nothing: what housekeeping no record of
-/// its kind answered is answered with.
 fn lane_success() -> Vec<u8> {
     codec::ctl_reply(&Ok(crate::supervise::CtlReply {
         code: 0,
@@ -278,9 +182,7 @@ fn lane_success() -> Vec<u8> {
     }))
 }
 
-/// What a counterfactual replay did to the tape, counted: the measure of how
-/// far the candidate strayed from the recorded run before (or without) taking
-/// another act.
+/// What a counterfactual replay did to the tape, counted: the measure of how far the candidate strayed from the recorded run before (or without) taking another act.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ActsAccount {
     /// The acts on the tape.
@@ -289,38 +191,26 @@ pub struct ActsAccount {
     pub taken: usize,
     /// Records the candidate consumed.
     pub consumed: usize,
-    /// Records a resync skipped (each a read, a clock, an output — never an
-    /// act).
+    /// Records a resync skipped (each a read, a clock, an output — never an act).
     pub dropped: usize,
     /// Reads served again from earlier in their segment.
     pub repeated: usize,
-    /// Derived probes the segment did not hold, answered from before the
-    /// cursor by astream-effects' keyed rule (the latest recorded answer
-    /// [`astream_effects::keyed_hit_within_cutoff`] admits at the cursor),
-    /// read from the cursor's own index.
+    /// Derived probes the segment did not hold, answered from before the cursor by astream-effects' keyed rule (the latest recorded answer [`astream_effects::keyed_hit_within_cutoff`] admits at the cursor), read from the cursor's own index.
     pub keyed: usize,
-    /// Waits served by the segment's next wait of their kind, with other
-    /// arguments (schedule taint).
+    /// Waits served by the segment's next wait of their kind, with other arguments (schedule taint).
     pub tainted: usize,
     /// Clock reads with no clock record under the cursor: virtual time.
     pub virtual_clock: usize,
     /// Sleeps with no identical sleep under the cursor: virtual time.
     pub slept: usize,
-    /// Housekeeping its identical request in the loop's segment did not
-    /// answer (never compared): served from a segment before the loop's
-    /// own, by the latest of its kind before the cursor, or as its door's
-    /// success.
+    /// Housekeeping its identical request in the loop's segment did not answer (never compared): served from a segment before the loop's own, by the latest of its kind before the cursor, or as its door's success.
     pub housekept: usize,
-    /// Outputs (a line, a row, a mark, a notification) with no record of
-    /// their door under the cursor, and writes whose outcome no record of
-    /// their door gave.
+    /// Outputs (a line, a row, a mark, a notification) with no record of their door under the cursor, and writes whose outcome no record of their door gave.
     pub unmatched_outputs: usize,
 }
 
 impl ActsAccount {
-    /// Whether the candidate followed the tape record for record, as a strict
-    /// replay would: nothing dropped, repeated, keyed, tainted, made up or
-    /// left unmatched.
+    /// Whether the candidate followed the tape record for record, as a strict replay would: nothing dropped, repeated, keyed, tainted, made up or left unmatched.
     #[must_use]
     pub fn exact(&self) -> bool {
         self.dropped == 0
@@ -337,16 +227,11 @@ impl ActsAccount {
 /// Why the cursor would not serve a request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Refusal {
-    /// A read (a wait, housekeeping, a file) the loop's segment does not hold
-    /// and nothing before the cursor may stand for: STALE.
+    /// A read (a wait, housekeeping, a file) the loop's segment does not hold and nothing before the cursor may stand for: STALE.
     Stale { class: ActClass },
-    /// An act that is not the segment's closing act; `closing` is that act's
-    /// ordinal, `None` past the tape's last act.
+    /// An act that is not the segment's closing act; `closing` is that act's ordinal, `None` past the tape's last act.
     ActDiffers { closing: Option<usize> },
-    /// A wait (of the class `class`) the segment does not hold and the
-    /// recorded run waited for (its timeout aside) only after the segment's
-    /// closing act, `closing`: the candidate went on without that act — the
-    /// first divergent act, the act it skipped.
+    /// A wait (of the class `class`) the segment does not hold and the recorded run waited for (its timeout aside) only after the segment's closing act, `closing`: the candidate went on without that act — the first divergent act, the act it skipped.
     Skipped { closing: usize, class: ActClass },
 }
 
@@ -372,8 +257,6 @@ pub(crate) struct ActsCursor {
     /// The loop has strayed from the tape in this segment.
     strayed: bool,
     /// The virtual clocks: where the last record consumed stood (monotonic ns
-    /// since the tape's origin; wall ns since the epoch), the sleeps served
-    /// since, and the last monotonic value served (it never runs back).
     base_mono: u64,
     base_wall: i64,
     slept_mono: u64,
@@ -386,22 +269,15 @@ pub(crate) struct ActsCursor {
     pub(crate) idle: u64,
     pub(crate) account: ActsAccount,
     /// Where each round trip sits, by its door and request; each door's
-    /// round trips; each wait by its kind; each file read by its path —
-    /// every list ascending, so a lookup is a halving, never a walk of the
-    /// segment (a candidate stuck asking again in a long segment asks up to
-    /// the progress guard's count of times).
     by_request: BTreeMap<(String, Vec<u8>), Vec<usize>>,
     by_door: BTreeMap<String, Vec<usize>>,
     waits: BTreeMap<Option<String>, Vec<usize>>,
     by_path: BTreeMap<String, Vec<usize>>,
     /// Each wait by its door and target ([`wait_key`]): where the same wait
-    /// sits whatever its timeout.
     wait_keys: BTreeMap<(String, Vec<String>), Vec<usize>>,
     /// Each housekeeping round trip by its door and kind
-    /// ([`housekeeping_kind`]).
     housekeeping: BTreeMap<(String, Vec<String>), Vec<usize>>,
     /// The round trips and file reads a candidate may ask (every one but an
-    /// output's): where the tape is spent ([`ActsCursor::spent`]).
     askable: Vec<usize>,
 }
 
@@ -422,8 +298,7 @@ fn last_in(list: Option<&Vec<usize>>, lo: usize, hi: usize) -> Option<usize> {
 }
 
 impl ActsCursor {
-    /// A cursor over `records`, each with its stamp (`stamps[i]` is
-    /// `records[i]`'s).
+    /// A cursor over `records`, each with its stamp (`stamps[i]` is `records[i]`'s).
     pub(crate) fn new(records: Vec<EffectRecord>, mut stamps: Vec<Option<Stamp>>) -> Self {
         stamps.resize(records.len(), None);
         let acts: Vec<usize> = records
@@ -479,7 +354,6 @@ impl ActsCursor {
                 _ => {}
             }
         }
-        // The wall clock starts where the tape's first wall reading stands.
         let base_wall = records
             .iter()
             .zip(&stamps)
@@ -552,8 +426,7 @@ impl ActsCursor {
         (self.acts.get(i).copied(), self.acts.len() - i)
     }
 
-    /// Where the virtual clocks stand: monotonic ns since the tape's origin,
-    /// wall ns since the epoch.
+    /// Where the virtual clocks stand: monotonic ns since the tape's origin, wall ns since the epoch.
     pub(crate) fn now(&self) -> (u64, i64) {
         (
             self.mono_floor
@@ -639,35 +512,17 @@ impl ActsCursor {
     }
 
     /// The segment's closing act, when the tape holds the wait `list` names
-    /// only past it — what the recorded run waited for only once it had taken
-    /// that act. A candidate that waits for it there went on without the act.
     fn skipped(&self, list: Option<&Vec<usize>>) -> Option<usize> {
         let closing = self.closing()?;
         first_in(list, closing + 1, self.records.len()).map(|_| closing)
     }
 
-    /// Whether the tape is SPENT where the cursor stands: no round trip a
-    /// candidate may ask (an output's aside) and no file read at or past it —
-    /// what a tape with no end holds past its last record is not on it.
+    /// Whether the tape is SPENT where the cursor stands: no round trip a candidate may ask (an output's aside) and no file read at or past it — what a tape with no end holds past its last record is not on it.
     pub(crate) fn spent(&self) -> bool {
         first_in(Some(&self.askable), self.pos, self.records.len()).is_none()
     }
 
     /// A DERIVED PROBE's answer from before the cursor: the latest round trip
-    /// at `door` asking `request` that astream-effects' keyed rule admits at
-    /// `seen = pos` — [`astream_effects::keyed_hit_within_cutoff`], the very
-    /// predicate [`astream_effects::KeyedView::lookup`] admits a recorded
-    /// answer by, so a change of astream's admission rule is acts mode's too
-    /// (`a_keyed_answer_is_astreams_at_every_cursor` holds the two equal at
-    /// every position of a generated tape). It is read from the index the
-    /// cursor keeps anyway — every key's run of positions, which its segment
-    /// rules walk too — not from a view built for the ask: a view built per
-    /// ask indexes the whole tape while a candidate stuck in a segment asks
-    /// again up to the progress guard's count of times — 2.7 ms an ask on a
-    /// 20,000-record tape (a busy day), about 270 s to the guard, measured in
-    /// a debug build. (astream-effects' owned `KeyedIndex`, which every keyed
-    /// probe of a `--why` or `--shadow` shares, answers by the same rule; the
-    /// cursor needs the runs it does not expose.)
     fn keyed(&self, door: &str, request: &[u8]) -> Option<usize> {
         let list = self.asked(door, request)?;
         let admitted =
@@ -729,8 +584,6 @@ impl ActsCursor {
                 }
                 if let Some(at) = self.behind(same, self.seg_start) {
                     self.account.repeated += 1;
-                    // A wait served again took its whole timeout: nothing it
-                    // waited for came.
                     self.pass(timeout.unwrap_or(0).saturating_mul(1_000_000));
                     return Ok(self.again(at));
                 }
@@ -742,12 +595,6 @@ impl ActsCursor {
                     self.strayed = true;
                     return Ok(self.take(at));
                 }
-                // The same wait, its timeout aside, held only past the act:
-                // what the candidate waits for came, in the recorded run,
-                // only once it had acted — a wait names the very screen it
-                // waits for, so this is the act skipped. (A plain read held
-                // only past the act is no such sign: a policy that looks once
-                // more before it acts asks one. It is STALE.)
                 let target = (door.to_string(), wait_key(request));
                 Err(match self.skipped(self.wait_keys.get(&target)) {
                     Some(closing) => Refusal::Skipped {
@@ -759,10 +606,6 @@ impl ActsCursor {
                     },
                 })
             }
-            // NEVER COMPARED, never refused (the plan's §5.1): its very
-            // request in the segment, else before the cursor, else the
-            // latest of its kind before the cursor, else its door's success
-            // — never one from past the act.
             ActClass::Housekeeping => {
                 if let Some(at) = self.ahead(same) {
                     return Ok(self.take(at));
@@ -792,8 +635,6 @@ impl ActsCursor {
                     let at = self.pos;
                     return Ok(self.take(at));
                 }
-                // The write's outcome: the last one recorded at its door, or
-                // success (each output door's success is no bytes).
                 let served = match self.behind(self.by_door.get(door), 0) {
                     Some(at) => Served {
                         reply: self.reply(at),
@@ -812,7 +653,6 @@ impl ActsCursor {
     }
 
     /// A SLEEP whose request is its length in nanoseconds: the identical
-    /// sleep under the cursor, else virtual time.
     fn sleep(&mut self, request: &[u8]) -> Served {
         if self.pos < self.records.len() && self.holds(self.pos, doors::SLEEP, request) {
             let at = self.pos;
@@ -831,8 +671,7 @@ impl ActsCursor {
         }
     }
 
-    /// An OUTPUT at `door`, never compared: the record under the cursor taken
-    /// when it is one of that door.
+    /// An OUTPUT at `door`, never compared: the record under the cursor taken when it is one of that door.
     pub(crate) fn emit(&mut self, door: &str) -> Option<usize> {
         let at = self.pos;
         if at < self.seg_end()
@@ -862,8 +701,7 @@ impl ActsCursor {
         now
     }
 
-    /// A WALL read (ns since the epoch, two's complement): the record under
-    /// the cursor, else virtual time.
+    /// A WALL read (ns since the epoch, two's complement): the record under the cursor, else virtual time.
     pub(crate) fn clock(&mut self) -> u64 {
         if let Some(EffectRecord::Clock(ns)) = self.records.get(self.pos) {
             let ns = *ns;
@@ -876,9 +714,7 @@ impl ActsCursor {
         self.now().1 as u64
     }
 
-    /// A FILE read at `path` (as the run's roots write it): the first record
-    /// of the segment that read it, else the latest the segment already did,
-    /// else STALE.
+    /// A FILE read at `path` (as the run's roots write it): the first record of the segment that read it, else the latest the segment already did, else STALE.
     pub(crate) fn file(&mut self, path: &str) -> Result<io::Result<Vec<u8>>, Refusal> {
         let read = self.by_path.get(path);
         let outcome = |r: &EffectRecord| match r {

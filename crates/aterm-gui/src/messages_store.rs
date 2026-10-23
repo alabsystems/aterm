@@ -1,66 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `<log_dir>/messages.log`, the durable half of the unified message system
-//! (docs/DESIGN-unified-messages-2026-09-21.md §3.7). `aterm_messages::log` encodes
-//! lines and keeps the ring; this module does the IO: the bounded tail read at launch,
-//! the writer thread every drain appends through, and rotation.
-//!
-//! # Contract
-//!
-//! * The file lives beside `aterm.log` and the crash artifacts, created
-//!   `0600`; always on, never gated by the log level — a person opening
-//!   Settings ▸ Messages after a crash must find the record whatever their
-//!   logging preference was.
-//! * **The log never drops, and never reorders.** Appends go through a
-//!   bounded channel to the writer thread; when the channel is full the
-//!   line waits in an ordered OVERFLOW shared with the worker, which drains
-//!   it after the channel's older jobs without another UI call, so the
-//!   UI thread never waits for a slot — the ux-first design's drop-on-full
-//!   was rejected because D4 asks for a complete log, and the first cut's
-//!   write-it-yourself fallback was rejected on review (2026-09-22) because
-//!   it put the caller's line on disk AHEAD of the lines still queued, and
-//!   the engine's replay reads a `Retired` line before its `Posted` as a dead
-//!   process's open row. Only a dead thread makes the caller write.
-//! * **Every wait on the thread has a deadline** ([`Writer::flush_within`];
-//!   design law L5). A flush lends the waiter's urgency to the thread
-//!   ([`crate::qos::Boost`]) until the thread answers it, so a short bound is
-//!   enough; a miss leaves the lines queued, to land when the thread catches
-//!   up.
-//! * One `write_all` per line, `O_APPEND`. POSIX guarantees atomicity only for
-//!   writes ≤ `PIPE_BUF` on pipes, not on regular files, so line integrity
-//!   comes from the codec's `end=` terminator — a torn line fails to decode
-//!   and the loader skips it — not from the OS. A second aterm instance of
-//!   the same user (a `--diagnose` beside the GUI) may interleave whole lines;
-//!   the loader keeps both.
-//! * **The handoff.** The parent's record is its own to the end: it keeps
-//!   appending through a pending handoff and [`Writer::flush_within`]es —
-//!   every queued line on disk — right before it execs the successor (`exec`
-//!   runs no destructor, so the drop-time join would never happen). The
-//!   successor's drain stays frozen until Commit (`App::sync_messages`), so
-//!   a refused successor writes nothing; after Commit the two records meet
-//!   as whole lines, which the loader takes in any order.
-//! * **Bounded while running** (design ruling 65, the ux/status-reporting
-//!   merge). The writer appends through [`crate::logging::RotatingFile`], the
-//!   one rotation `aterm.log` already proves (`aterm_spec`'s `LogRotation`
-//!   model and its Tier-1 bind): past [`TAIL_BYTES`] the file is renamed to
-//!   `messages.log.1` (one older copy), one rotation at a time under the
-//!   sibling `messages.log.lock` (the lock a pre-merge build's load-time
-//!   compaction takes too, so the two never overlap), and every writer —
-//!   this process's, a second instance's, a successor's — follows the rename
-//!   by inode within [`BUDGET`]'s look. A launch reads the last
-//!   [`TAIL_BYTES`] across the two files ([`load_tail`]). The load-time
-//!   compaction this replaced ran only for a cold launch — never for a
-//!   seamless successor, which is every automatic update's launch — and its
-//!   rename stranded any other running writer's lines in an unlinked inode.
-//! * **The wire rotates on its own budget** (design ruling 200). Every line
-//!   about a record a script made (`notice`, [`aterm_messages::Shelf::Wire`])
-//!   goes to the sibling `messages.wire.log` — opened at the first such line,
-//!   rotated past [`WIRE_TAIL_BYTES`] to `messages.wire.log.1` — so a flood
-//!   turns over only the wire's history on disk, never aterm's crash record
-//!   or config errors. A launch reads both tails and replays them merged by
-//!   id (every line of one record is in one file, in order). Should the wire
-//!   file not open, its lines go to `messages.log`: the log never drops.
+//! `<log_dir>/messages.log`, the durable half of the unified message system (docs/DESIGN-unified-messages-2026-09-21.md §3.7).
 
 use std::collections::VecDeque;
 use std::fs::File;
@@ -79,35 +20,27 @@ use crate::logging::{RotatingFile, RotationBudget};
 
 /// The file's name under the log directory.
 pub(crate) const FILE_NAME: &str = "messages.log";
-/// How much of the file's tail a launch reads. The largest record in practice is a
-/// crash record with a 1.5 KiB head, so 1 MiB holds a full `LOG_CAP` ring of real
-/// records (not of records at every cap, which run up to 32 KiB).
+/// How much of the file's tail a launch reads.
 pub(crate) const TAIL_BYTES: u64 = 1024 * 1024;
-/// The file's rotation: renamed to `messages.log.1` past the [`TAIL_BYTES`] a launch
-/// reads, so the pair stays near 2 MiB; every writer looks within 64 KiB or 30 s, as
-/// `aterm.log` does (the `LogRotation` model's assumption that a file takes longer than
-/// one look to fill holds easily for a log that grows kilobytes a day).
+/// The file's rotation.
 pub(crate) const BUDGET: crate::logging::RotationBudget = crate::logging::RotationBudget {
     rotate_at: TAIL_BYTES,
     check_bytes: 64 * 1024,
     check_every: std::time::Duration::from_secs(30),
 };
-/// The writer channel's depth: how many lines may wait for the thread before
-/// the next ones wait in the writer's overflow.
+/// The writer channel's depth.
 pub(crate) const QUEUE_CAP: usize = 512;
 /// The wire's file, beside [`FILE_NAME`].
 pub(crate) const WIRE_FILE_NAME: &str = "messages.wire.log";
-/// The wire's file rotates past this, and a launch reads this much of its tail: 256 KiB
-/// holds the ring's wire share (`aterm_messages`'s `WIRE_LOG_SHARE`) of ordinary notices
-/// several times over.
+/// The wire's file rotates past this, and a launch reads this much of its tail.
 pub(crate) const WIRE_TAIL_BYTES: u64 = 256 * 1024;
-/// The wire file's rotation: [`BUDGET`]'s looks at [`WIRE_TAIL_BYTES`].
+/// The wire file's rotation.
 pub(crate) const WIRE_BUDGET: RotationBudget = RotationBudget {
     rotate_at: WIRE_TAIL_BYTES,
     ..BUDGET
 };
 
-/// `<log_dir>/messages.log`; `None` when there is no log dir (no `$HOME`).
+/// `<log_dir>/messages.log`.
 pub(crate) fn path() -> Option<PathBuf> {
     crate::logging::log_dir().map(|dir| dir.join(FILE_NAME))
 }
@@ -120,15 +53,13 @@ pub(crate) fn wire_path(path: &Path) -> PathBuf {
 /// What a launch read.
 #[derive(Debug)]
 pub(crate) struct Loaded {
-    /// The records the tail held, replayed (a `Posted` with no `Retired` from
-    /// the dead process reads as Stale, the engine's rule).
+    /// The records the tail held, replayed (a `Posted` with no `Retired` from the dead process reads as Stale, the engine's rule).
     pub(crate) log: MessageLog,
-    /// Lines the codec refused (torn, foreign, corrupt) — the log line says
-    /// how many, and the loader carries on.
+    /// Lines the codec refused (torn, foreign, corrupt).
     pub(crate) skipped: usize,
 }
 
-/// The launch load: the last [`TAIL_BYTES`] of `path`, decoded line by line.
+/// The launch load.
 pub(crate) fn load_for_launch(path: &Path) -> Loaded {
     let loaded = load_tail(path, TAIL_BYTES);
     if loaded.skipped > 0 {
@@ -141,17 +72,7 @@ pub(crate) fn load_for_launch(path: &Path) -> Loaded {
     loaded
 }
 
-/// A bounded, no-follow read of the last `tail` bytes of the log across its rotation:
-/// when `path` holds fewer than `tail` bytes, the rest comes from the end of
-/// `messages.log.1`, read first so ids keep rising and a `Posted` in the older copy
-/// meets its `Retired` (the replay ignores an orphan `Retired`). Only regular files are
-/// read; the partial first line of a cut is dropped and junk is counted and skipped. A
-/// symlink, a directory or an unreadable file reads as nothing: a message log is never
-/// worth refusing to launch over.
-///
-/// The wire's pair ([`wire_path`]) is read the same way, at most [`WIRE_TAIL_BYTES`],
-/// and the two are replayed as one sequence by a stable sort on id, so a record's own
-/// lines (all in one file) keep their order.
+/// A bounded, no-follow read of the last `tail` bytes of the log across its rotation.
 pub(crate) fn load_tail(path: &Path, tail: u64) -> Loaded {
     let (lines, skipped) = tail_lines(path, tail);
     let mut log = MessageLog::empty();
@@ -159,11 +80,7 @@ pub(crate) fn load_tail(path: &Path, tail: u64) -> Loaded {
     Loaded { log, skipped }
 }
 
-/// The decoded lines of the last `tail` bytes across the pair (and the wire's pair), in
-/// replay order, and how many the codec refused. The launch load builds the ring from
-/// them; a successor's Commit reads them again
-/// ([`aterm_messages::MessageCenter::catch_up`]) for what its parent wrote while the two
-/// overlapped.
+/// The decoded lines of the last `tail` bytes across the pair (and the wire's pair), in replay order, and how many the codec refused.
 pub(crate) fn tail_lines(path: &Path, tail: u64) -> (Vec<LogLine>, usize) {
     let mut lines = Vec::new();
     let mut skipped = read_pair(path, tail, &mut lines);
@@ -173,7 +90,6 @@ pub(crate) fn tail_lines(path: &Path, tail: u64) -> (Vec<LogLine>, usize) {
 }
 
 /// The last `tail` bytes across `path` and its `.1`, decoded into `out`
-/// oldest first; the count of lines the codec refused.
 fn read_pair(path: &Path, tail: u64, out: &mut Vec<LogLine>) -> usize {
     let mut skipped = 0;
     let current = regular_len(path);
@@ -201,7 +117,6 @@ fn regular_len(path: &Path) -> Option<u64> {
 }
 
 /// The last `tail` bytes of the regular file `path` as text, the partial first
-/// line of a cut dropped; `None` when it is not a regular file or unreadable.
 fn read_tail(path: &Path, tail: u64) -> Option<String> {
     let bytes = regular_len(path)?;
     let mut file = File::open(path).ok()?;
@@ -213,7 +128,6 @@ fn read_tail(path: &Path, tail: u64) -> Option<String> {
     (&mut file).take(tail).read_to_end(&mut buf).ok()?;
     let text = String::from_utf8_lossy(&buf).into_owned();
     Some(if partial {
-        // The cut landed inside a line: what is left of it is not a record.
         text.split_once('\n')
             .map_or_else(String::new, |(_, rest)| rest.to_string())
     } else {
@@ -222,7 +136,6 @@ fn read_tail(path: &Path, tail: u64) -> Option<String> {
 }
 
 /// Decode every whole line of `text` into `out`; the count of lines the
-/// codec refused.
 fn decode_into(out: &mut Vec<LogLine>, text: &str) -> usize {
     let mut skipped = 0;
     for line in text.split('\n').filter(|l| !l.is_empty()) {
@@ -235,8 +148,6 @@ fn decode_into(out: &mut Vec<LogLine>, text: &str) -> usize {
 }
 
 /// One line as it lands on disk: the codec's form plus the newline. A line
-/// past [`MAX_LINE_BYTES`] would never read back, so it is not written; the
-/// caps make that unreachable for a message the engine admitted.
 fn encoded(line: &LogLine) -> String {
     let mut s = line.encode();
     if s.len() >= MAX_LINE_BYTES {
@@ -247,14 +158,12 @@ fn encoded(line: &LogLine) -> String {
 }
 
 /// The two appenders behind the one lock: aterm's own file, and the wire's, opened at
-/// its first line.
 struct Files {
     host: RotatingFile,
     wire: WireFile,
 }
 
 /// The wire's file: not yet needed, open, or refused (its lines then go to
-/// the host's file — the log never drops).
 enum WireFile {
     Unopened(PathBuf, RotationBudget),
     Open(RotatingFile),
@@ -287,9 +196,6 @@ impl Files {
 }
 
 /// Append one line under the file lock, rotating first when a look is due
-/// ([`BUDGET`], [`WIRE_BUDGET`]). No rotation note is written: a note is not
-/// a codec line, and the loader would count it as junk. A write the disk
-/// refuses is the one path that loses a line.
 fn write_line(files: &Mutex<Files>, line: &str, shelf: Shelf) {
     if line.is_empty() {
         return;
@@ -303,24 +209,16 @@ fn write_line(files: &Mutex<Files>, line: &str, shelf: Shelf) {
 }
 
 /// What the caller hands the writer thread: a line to append, or a flush
-/// mark the thread answers once every line queued before it is on disk —
-/// raised by the flush's [`qos::Boost`] until then.
 enum Job {
     Line(String, Shelf),
     Flush(mpsc::SyncSender<()>, qos::Boost),
 }
 
-/// The appender: a bounded channel into the `aterm-messages-log` thread,
-/// which owns the append handle behind a lock the dead-thread fallback
-/// shares.
+/// The appender.
 pub(crate) struct Writer {
     /// `None` only during drop, so the receiver sees the channel close.
     tx: Option<mpsc::SyncSender<Job>>,
     /// Lines the channel had no room for, oldest first: handed over ahead of
-    /// every later line ([`Self::hand_over`]). `overflowed` mirrors its
-    /// length, so an append with nothing to add or hand over costs one load.
-    /// The worker also takes from it, never holding it across a write or a
-    /// wait; each use takes it in place, where the census sees the hold.
     overflow: Arc<Mutex<VecDeque<(String, Shelf)>>>,
     overflowed: Arc<AtomicUsize>,
     files: Arc<Mutex<Files>>,
@@ -330,15 +228,12 @@ pub(crate) struct Writer {
 }
 
 impl Writer {
-    /// Open `path` for appending (`0600`) and start the writer thread; `None`
-    /// when the file cannot be opened or the thread not spawned (logged —
-    /// the app runs, the record does not).
+    /// Open `path` for appending (`0600`) and start the writer thread.
     pub(crate) fn spawn(path: &Path) -> Option<Writer> {
         Self::spawn_with(path, BUDGET, WIRE_BUDGET)
     }
 
-    /// [`Self::spawn`] under `budget` (and `wire_budget` for the wire's
-    /// file) — the tests' way to rotate a small file.
+    /// [`Self::spawn`] under `budget` (and `wire_budget` for the wire's file).
     pub(crate) fn spawn_with(
         path: &Path,
         budget: RotationBudget,
@@ -354,8 +249,6 @@ impl Writer {
         let files = Arc::clone(&writer.files);
         let overflow = Arc::clone(&writer.overflow);
         let overflowed = Arc::clone(&writer.overflowed);
-        // The UI takes the same short queue lock, so this follows the
-        // lock-holder floor. No disk I/O or wait holds that lock.
         let spawned =
             qos::spawn_lane_thread("aterm-messages-log", qos::Role::Responsive, move || {
                 loop {
@@ -365,10 +258,6 @@ impl Writer {
                             let next = {
                                 let mut queued =
                                     overflow.lock().unwrap_or_else(PoisonError::into_inner);
-                                // Append/flush hand over under this lock too:
-                                // check the channel again before taking an
-                                // overflow line, or a just-enqueued older job
-                                // (including a flush mark) could be overtaken.
                                 match rx.try_recv() {
                                     Ok(job) => Some(job),
                                     Err(_) => {
@@ -382,10 +271,6 @@ impl Writer {
                             };
                             match next {
                                 Some(job) => job,
-                                // With neither queue holding a job, only a
-                                // new send can create work. Never keep a
-                                // sender on the worker: closing Writer's
-                                // sender must end this wait and allow join.
                                 None => match rx.recv() {
                                     Ok(job) => job,
                                     Err(_) => break,
@@ -395,7 +280,6 @@ impl Writer {
                     };
                     match job {
                         Job::Line(line, shelf) => write_line(&files, &line, shelf),
-                        // Answered, then back to this thread's own class.
                         Job::Flush(done, _boost) => {
                             let _ = done.send(());
                         }
@@ -437,35 +321,25 @@ impl Writer {
         ))
     }
 
-    /// The folder the log lives in (read once, at open — never a directory
-    /// probe per publish).
+    /// The folder the log lives in (read once, at open — never a directory probe per publish).
     pub(crate) fn folder(&self) -> Option<&Path> {
         self.folder.as_deref()
     }
 
     /// A writer with no thread — the test's way of standing in for a dead
-    /// one deterministically (drop the receiver and every send is
-    /// `Disconnected`).
     #[cfg(test)]
     fn unattended(path: &Path, cap: usize) -> (Writer, mpsc::Receiver<Job>) {
         Self::open(path, cap, BUDGET, WIRE_BUDGET).expect("a temp file opens")
     }
 
-    /// A writer whose thread never answers: every [`Self::flush_within`]
-    /// waits out its whole bound, as one throttled behind a busy disk does.
-    /// The second value holds the channel open while the test keeps it.
+    /// A writer whose thread never answers.
     #[cfg(test)]
     pub(crate) fn stalled(path: &Path) -> (Writer, Box<dyn std::any::Any>) {
         let (writer, rx) = Self::unattended(path, 1);
         (writer, Box::new(rx))
     }
 
-    /// Append `lines`, oldest first, in that order on disk, each to its
-    /// shelf's file. `try_send` to the thread; on `Full` (the thread is
-    /// behind) the line waits in the overflow, which the worker drains after
-    /// the channel's older jobs, so the file keeps the order the engine emitted and
-    /// the caller never waits; on `Disconnected` (the thread died) the line is
-    /// written here, after every line the overflow held, so nothing is dropped.
+    /// Append `lines`, oldest first, in that order on disk, each to its shelf's file.
     pub(crate) fn append(&self, lines: &[(LogLine, Shelf)]) {
         if lines.is_empty() && self.overflowed.load(Ordering::Relaxed) == 0 {
             return;
@@ -479,8 +353,6 @@ impl Writer {
     }
 
     /// Hand `queued` to the thread, oldest first, until the channel is full;
-    /// what is left waits there, in order. A dead thread's lines are written
-    /// here.
     fn hand_over(&self, queued: &mut VecDeque<(String, Shelf)>) {
         while let Some((line, shelf)) = queued.pop_front() {
             let Some(tx) = &self.tx else {
@@ -505,8 +377,7 @@ impl Writer {
         self.overflowed.store(queued.len(), Ordering::Relaxed);
     }
 
-    /// Wait until every line appended so far is on disk, a minute at most —
-    /// the tests' way to read the file back.
+    /// Wait until every line appended so far is on disk, a minute at most.
     #[cfg(test)]
     pub(crate) fn flush(&self) {
         assert!(
@@ -515,15 +386,7 @@ impl Writer {
         );
     }
 
-    /// Wait no longer than `within` for every line appended so far to land —
-    /// the record a person's dismissal, an update's start, or the process's
-    /// last write wants on disk before the caller goes on (design law L5: no
-    /// wait without a deadline). The thread runs raised ([`qos::Boost`]) until
-    /// it answers, so a short bound is enough for a thread that is merely
-    /// behind. `true` when everything is on disk; `false` when the thread is
-    /// still behind at the deadline: the lines stay queued and land when it
-    /// catches up — unless the process ends first (an `exec` or `_exit` runs
-    /// no destructor), which the caller says.
+    /// Wait no longer than `within` for every line appended so far to land.
     pub(crate) fn flush_within(&self, within: std::time::Duration) -> bool {
         let deadline = std::time::Instant::now() + within;
         let Some(tx) = &self.tx else {
@@ -533,8 +396,6 @@ impl Writer {
         };
         let (done, landed) = mpsc::sync_channel::<()>(1);
         let mut job = Job::Flush(done, qos::Boost::start(self.thread.as_ref()));
-        // The overflow goes first, then the mark; a full channel is a thread
-        // behind by a queue's worth: wait for a slot only until the deadline.
         loop {
             {
                 let mut queued = self.overflow.lock().unwrap_or_else(PoisonError::into_inner);
@@ -560,11 +421,7 @@ impl Writer {
 
 impl Drop for Writer {
     /// Hand over what the overflow holds, close the channel, then wait for
-    /// the thread to write what it holds: the lines a process queued in its
-    /// last moments are its record.
     fn drop(&mut self) {
-        // The thread is alive and draining, so a slot comes; with no thread
-        // (a test's stand-in) nothing would ever take one.
         let attended = self.thread.is_some();
         let queued =
             std::mem::take(&mut *self.overflow.lock().unwrap_or_else(PoisonError::into_inner));
@@ -676,13 +533,11 @@ mod tests {
             MessageId::from_raw(41).unwrap(),
             "ids continue past the loaded ones"
         );
-        // A tail that starts mid-line drops the cut line and reads the rest.
         let last_ten: usize = lines[lines.len() - 10..].iter().map(String::len).sum();
         let cut = load_tail(&path, last_ten as u64 + 7);
         assert_eq!(cut.log.len(), 10, "the partial first line is not a record");
         let ids: Vec<u64> = cut.log.records().map(|r| r.id.raw()).collect();
         assert_eq!(ids, (31..=40).collect::<Vec<_>>());
-        // A missing file and a directory are empty rings.
         assert!(load_tail(&dir.join("absent"), TAIL_BYTES).log.is_empty());
         assert!(
             load_tail(&dir, TAIL_BYTES).log.is_empty(),
@@ -708,7 +563,6 @@ mod tests {
     fn append_never_drops_and_keeps_the_engines_order_past_the_channels_depth() {
         let dir = scratch("append");
         let path = dir.join(FILE_NAME);
-        // A dead thread (receiver gone): the caller writes every line, in order.
         let (writer, rx) = Writer::unattended(&path, 2);
         drop(rx);
         let lines: Vec<LogLine> = (1..=5).map(|i| posted(i, &format!("m{i}"))).collect();
@@ -726,15 +580,12 @@ mod tests {
             );
         }
         drop(writer);
-        // The real thread, pushed past the channel's depth in one append: every line
-        // lands in the order appended (the caller waited for a slot).
         let path = dir.join("threaded.log");
         let writer = Writer::spawn(&path).expect("a writer over a temp file");
         let many: Vec<LogLine> = (1..=(QUEUE_CAP as u64 + 50))
             .map(|i| posted(i, &format!("m{i}")))
             .collect();
         writer.append(&host(&many));
-        // A flush returns only once everything before it is on disk.
         writer.flush();
         let flushed = read_lines(&path);
         assert_eq!(flushed.len(), QUEUE_CAP + 50, "flushed before the drop");
@@ -763,10 +614,6 @@ mod tests {
     }
 
     /// A WRITER THAT FALLS BEHIND NEVER HOLDS THE CALLER: with its thread
-    /// paused mid-write (the files lock held, as a disk that stopped
-    /// answering would), four queues' worth of lines are appended at once and
-    /// a bounded flush answers `false` at its deadline; once the thread runs
-    /// again every line lands, none lost and in the order appended.
     #[test]
     fn a_paused_writer_holds_no_caller_and_lands_every_line_in_order_after() {
         let dir = scratch("paused");
@@ -782,9 +629,6 @@ mod tests {
                 writer_ref.append(&host(lines_ref));
                 let _ = appended_tx.send(());
             });
-            // A hang detector: an append that waits for a slot never returns
-            // while the thread is paused, so the pause is let go before the
-            // failure, or the scope's join would wait on that append forever.
             if appended
                 .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
                 .is_err()
@@ -809,8 +653,6 @@ mod tests {
     }
 
     /// Once a paused disk resumes, the writer lands every accepted line even
-    /// if the UI has gone idle. No append, flush, settle, drop or other kick
-    /// follows the release: only the actual log file witnesses completion.
     #[test]
     fn a_recovered_writer_drains_overflow_without_another_ui_call() {
         let dir = aterm_tempfile::tempdir().expect("a temp dir");
@@ -847,7 +689,6 @@ mod tests {
     }
 
     /// A budget small enough to rotate in a test: 4 KiB files, a look after
-    /// every write.
     const TINY: crate::logging::RotationBudget = crate::logging::RotationBudget {
         rotate_at: 4096,
         check_bytes: 0,
@@ -855,7 +696,6 @@ mod tests {
     };
 
     /// Three budgets' worth of appends leave the current file and one older copy, each
-    /// within the budget plus one look and one line.
     #[test]
     fn the_log_rotates_while_running_and_stays_bounded() {
         let dir = scratch("rotate");
@@ -876,7 +716,6 @@ mod tests {
         let mut second = crate::logging::rotated_path(&path).into_os_string();
         second.push(".1");
         assert!(!Path::new(&second).exists(), "one older copy, never two");
-        // Nothing but codec lines: no rotation note in a file the loader reads.
         let reloaded = load_tail(&path, TAIL_BYTES);
         assert_eq!(reloaded.skipped, 0);
         drop(writer);
@@ -884,7 +723,6 @@ mod tests {
     }
 
     /// The older copy's tail is read first: a `Posted` in `.1` meets its `Retired` in
-    /// the current file, and ids rise past the newest.
     #[test]
     fn a_launch_reads_across_the_rotation() {
         let dir = scratch("across");
@@ -910,7 +748,6 @@ mod tests {
             "its Retired, from the current file"
         );
         assert_eq!(loaded.log.next_id(), MessageId::from_raw(n + 2).unwrap());
-        // The older copy is read only for what the current file lacks.
         let current_len = std::fs::metadata(&path).unwrap().len();
         let only_current = load_tail(&path, current_len);
         assert_eq!(only_current.log.len(), 1, "the orphan Retired is ignored");
@@ -918,7 +755,6 @@ mod tests {
     }
 
     /// Posted/Retired pairs pushed past the channel's depth all read back `Folded`: a
-    /// `Retired` written ahead of its `Posted` would replay as `Stale`.
     #[test]
     fn a_full_channel_never_puts_a_retired_line_ahead_of_its_posted_line() {
         let dir = scratch("reorder");
@@ -942,7 +778,6 @@ mod tests {
     }
 
     /// Wire lines rotate in `messages.wire.log`, bounded; `messages.log` keeps its one
-    /// host record unrotated, and a launch reads it back beside the wire's newest.
     #[test]
     fn a_wire_flood_never_rotates_aterms_own_record_off_disk() {
         let dir = scratch("wire-shelf");
@@ -994,8 +829,6 @@ mod tests {
     }
 
     /// Records interleaved across the two files load oldest-first by id, each meeting
-    /// its own `Retired`; ids continue past the newest; the wire's tail is read at most
-    /// [`WIRE_TAIL_BYTES`].
     #[test]
     fn a_launch_merges_the_two_files_by_id() {
         let dir = scratch("wire-merge");
@@ -1030,7 +863,6 @@ mod tests {
             assert_eq!(rec.state, LogState::Retired(how), "record {id}");
         }
         assert_eq!(loaded.log.next_id(), MessageId::from_raw(7).unwrap());
-        // A wire file past its tail is read only for its last WIRE_TAIL_BYTES.
         let big: Vec<String> = (10..10 + 2 * WIRE_TAIL_BYTES / 64)
             .map(|i| encoded(&wire_posted(i, &format!("w{i}"))))
             .collect();

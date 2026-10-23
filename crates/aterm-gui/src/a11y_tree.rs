@@ -378,6 +378,8 @@ pub(crate) enum HarnessChip {
     Context,
     /// Token/time usage fact.
     Usage,
+    /// The subscription and account fact (`⎆ email · ◇ plan · ◷ weekly`).
+    Account,
     /// Permission-mode indicator.
     Mode,
     /// Top-rule harness on/off switch.
@@ -408,6 +410,7 @@ impl HarnessChip {
             Self::Title => 10,
             Self::Context => 11,
             Self::SwitchOn => 12,
+            Self::Account => 13,
         }
     }
 
@@ -427,6 +430,7 @@ impl HarnessChip {
             10 => Self::Title,
             11 => Self::Context,
             12 => Self::SwitchOn,
+            13 => Self::Account,
             _ => return None,
         })
     }
@@ -442,6 +446,7 @@ impl HarnessChip {
             Fact::Context => Self::Context,
             Fact::Usage => Self::Usage,
             Fact::TopEffort => Self::TopEffort,
+            Fact::Account => Self::Account,
         }
     }
 
@@ -456,6 +461,7 @@ impl HarnessChip {
             Self::Context => Some(Fact::Context),
             Self::Usage => Some(Fact::Usage),
             Self::TopEffort => Some(Fact::TopEffort),
+            Self::Account => Some(Fact::Account),
             Self::Autopilot
             | Self::Team
             | Self::Mode
@@ -2281,6 +2287,7 @@ mod tests {
             HarnessChip::Title,
             HarnessChip::Context,
             HarnessChip::SwitchOn,
+            HarnessChip::Account,
         ];
         let mut ids = std::collections::HashSet::new();
         for session in [0, 1, 7] {

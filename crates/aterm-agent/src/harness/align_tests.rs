@@ -65,6 +65,40 @@ fn a_child_that_never_returns_is_killed_at_the_deadline() {
     );
 }
 
+/// THE BUDGET STARTS BEFORE THE SPAWN: a spawn held past the whole budget
+/// (the capture's `before_spawn` step, as a loaded machine or a first exec
+/// the system assesses holds one) leaves the child no time, so the capture
+/// gives up on its deadline although the child prints and exits at once
+/// (FAILS with the deadline taken after the spawn: the slow spawn was added
+/// to the budget and the child's output came back). NEGATIVE CONTROL: the
+/// same slow spawn under a budget that covers it captures the child.
+#[cfg(unix)]
+#[test]
+fn a_slow_spawn_spends_the_budget() {
+    let slow_spawn = |held: Duration| {
+        let observed = Arc::new(CaptureLifecycleObservation::default());
+        *observed
+            .before_spawn
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(Box::new(move || std::thread::sleep(held)));
+        Some(observed)
+    };
+    let budget = Duration::from_millis(50);
+    capture_bounded_impl(shell("printf hello"), budget, 1024, slow_spawn(budget * 2))
+        .expect_err("a spawn held past the budget leaves the child no time");
+
+    // NEGATIVE CONTROL: the budget covers the slow spawn.
+    let got = capture_bounded_impl(
+        shell("printf hello"),
+        HANG_DETECTOR,
+        1024,
+        slow_spawn(budget * 2),
+    )
+    .expect("the child runs within a budget that covers its spawn");
+    assert_eq!(got.stdout, b"hello");
+}
+
 // How long a stdout-hang fixture sleeps. The tests read survival off the
 // kernel (the group must empty), not a clock.
 #[cfg(unix)]

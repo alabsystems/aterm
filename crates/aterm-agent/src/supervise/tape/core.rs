@@ -1,53 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE RECORDER: what a run's door ([`crate::supervise::fx::Fx`] in its
-//! recording mode) hands every value it observed to, and what puts each one
-//! on the run's tape in the order the loop observed it.
-//!
-//! The values go through astream-effects' own recording seam
-//! ([`RecordingSeam::with_sink`]) — the same seam a replay's counterpart
-//! reads back — so what a record IS (a monotonic read, a round trip, an
-//! output, a flag's first true read with the false reads before it counted)
-//! is astream's definition, not a second one kept beside it. The seam streams
-//! each record into the run's [`TapeWriter`], which frames it on disk
-//! ([`super::frame`]); nothing is kept in memory but the open frame.
-//!
-//! **The live value is the loop's.** The door makes its live call first and
-//! hands the recorder the value it got; the seam is handed that value back
-//! (a closure that returns it, never the live call itself), and the door
-//! returns its own copy. So the recorder holds its lock only to append — never
-//! across a live call, which may be a twenty-second wait or a call into a
-//! host that itself crosses a door — and nothing the recorder does, a codec
-//! bug included, can change what the loop saw.
-//!
-//! **Doors do not nest** (the replay plan's §4.4). A door reached while
-//! another door's live call is running — a read of the clock inside a write
-//! the loop asked for, a control request inside a host's step — runs live and
-//! is taped nowhere: the outer door's record already holds its effect, and a
-//! replay, which answers the outer door from the tape and never runs its live
-//! call, would never ask the inner one, so a record of it would be one the
-//! replay never consumes. The recorder counts the live calls in progress
-//! ([`TapeCore::enter`]: an atomic, as a host's door must be `Sync`), says
-//! each pair of nested doors once on the tape ([`Mark::Nested`]), and in this
-//! crate's own tests a nesting is a failed assertion, so the suite keeps every
-//! door's boundary clean. The count is the run's, not a thread's: every door
-//! is crossed on the loop's own thread, so a door crossed while another's
-//! live call runs is one reached inside it.
-//!
-//! **Stamps.** A round trip and a flag's first true read carry where the
-//! clocks stood ([`Stamp`]) — the monotonic clock in nanoseconds since the
-//! tape's origin and the wall clock in Unix milliseconds — PEEKED when the
-//! live call came back, the moment the loop went on from it: a counterfactual
-//! replay runs its virtual time on them, so a build that reads the clock more
-//! often still replays. A peek is no read: a test's scripted clock is not
-//! advanced by it.
-//!
-//! **What a decision's mark names.** Each screen the loop parses from a
-//! round trip is told to the recorder ([`TapeCore::screen_read`]), so a
-//! decision's mark ([`TapeCore::decide`]) can name the record of the very
-//! screen it judged — by the screen's own sequence and generation, never
-//! "the last read", which a carried or re-read screen is not.
+//! THE RECORDER: what a run's door ([`crate::supervise::fx::Fx`] in its recording mode) hands every value it observed to, and what puts each one on the run's tape in the order the loop observed it.
 
 use std::collections::VecDeque;
 use std::convert::Infallible;
@@ -70,18 +24,10 @@ use crate::supervise::policy::sleeps::{Boot, SleepStamp};
 /// A note's kind: a turn-end decision's fold and reading, as `Debug`.
 pub(crate) const NOTE_TURN_END: &str = "turn_end";
 
-/// A note's kind: something happened that no replay of the tape can make
-/// (an older build's mail delivery received under a recorder), said once;
-/// this build writes none, and refuses to replay a tape that holds one.
+/// A note's kind: something happened that no replay of the tape can make (an older build's mail delivery received under a recorder), said once; this build writes none, and refuses to replay a tape that holds one.
 pub(crate) const NOTE_UNREPLAYABLE: &str = "unreplayable";
 
-/// A note's kind: the run UNWOUND INSIDE A DOOR'S LIVE CALL — a probe's body
-/// or the transport panicked between the request and its value, so the
-/// round trip has no record (there is no value to tape). The text is the
-/// door, a newline, and the request as lower-case hex ([`unwound_in_text`]):
-/// a replay that reaches that door asking that very request, every record
-/// before it reproduced, has reached the place the recorded run died, which
-/// it can only say — a replay never makes the live call that panicked.
+/// A note's kind: the run UNWOUND INSIDE A DOOR'S LIVE CALL — a probe's body or the transport panicked between the request and its value, so the round trip has no record (there is no value to tape).
 pub(crate) const NOTE_UNWOUND_IN: &str = "unwound_in";
 
 /// [`NOTE_UNWOUND_IN`]'s text for a panic at `door` asking `request`.
@@ -89,8 +35,7 @@ pub(crate) fn unwound_in_text(door: &str, request: &[u8]) -> String {
     format!("{door}\n{}", aterm_codec::hex::encode_lower(request))
 }
 
-/// [`NOTE_UNWOUND_IN`]'s text read back: the door and the request, or `None`
-/// for a text [`unwound_in_text`] did not write.
+/// [`NOTE_UNWOUND_IN`]'s text read back: the door and the request, or `None` for a text [`unwound_in_text`] did not write.
 pub(crate) fn unwound_in_of(text: &str) -> Option<(String, Vec<u8>)> {
     let (door, hex) = text.split_once('\n')?;
     Some((
@@ -100,33 +45,19 @@ pub(crate) fn unwound_in_of(text: &str) -> Option<(String, Vec<u8>)> {
 }
 
 /// How many screens the recorder remembers the records of
-/// ([`TapeCore::screen_read`]): a decision judges a screen read in the
-/// same look, or one carried from the look before.
 const SCREENS: usize = 64;
 
-/// A value a round trip returns, as a tape holds it: what a recorder writes
-/// ([`Self::to_tape`]) and what a replay or a reader of the tape reads back
-/// ([`Self::from_tape`]).
+/// A value a round trip returns, as a tape holds it: what a recorder writes ([`Self::to_tape`]) and what a replay or a reader of the tape reads back ([`Self::from_tape`]).
 pub(crate) trait TapeValue: Sized {
     /// The value's bytes on the tape.
     fn to_tape(&self) -> Vec<u8>;
 
     /// The value [`Self::to_tape`] wrote.
-    ///
     /// # Errors
-    ///
     /// Bytes [`Self::to_tape`] did not write.
     fn from_tape(bytes: &[u8]) -> Result<Self, CodecError>;
 
-    /// THE ANSWER AT A DOOR NEWER THAN THE TAPE (the occupancy red-team's
-    /// F8): what a replay answers at a host door the tape's recording build
-    /// did not have, as its header's `host_doors` names them
-    /// (`header::Header::host_doors`), without taking a record. `None`, the
-    /// default: such a door diverges like any other the tape does not hold.
-    /// Only a value whose door was added after headers named their doors may
-    /// say `Some` — an older header names none, so every door it was asked
-    /// at reads as lacked — and only one whose loop judged nothing where
-    /// the old build asked nothing (the empty reading).
+    /// THE ANSWER AT A DOOR NEWER THAN THE TAPE (the occupancy red-team's F8): what a replay answers at a host door the tape's recording build did not have, as its header's `host_doors` names them (`header::Header::host_doors`), without taking a record.
     fn absent() -> Option<Self> {
         None
     }
@@ -151,7 +82,6 @@ impl TapeValue for () {
 }
 
 /// A control request's reply, or the transport's error
-/// ([`codec::ctl_reply`]).
 impl TapeValue for Result<CtlReply, String> {
     fn to_tape(&self) -> Vec<u8> {
         codec::ctl_reply(self)
@@ -163,7 +93,6 @@ impl TapeValue for Result<CtlReply, String> {
 }
 
 /// A line written where the loop's own failure ends it (a printed line, a
-/// notes line): nothing for done, else `1` and the error the loop ends on.
 impl TapeValue for Result<(), String> {
     fn to_tape(&self) -> Vec<u8> {
         match self {
@@ -190,8 +119,6 @@ impl TapeValue for Result<(), String> {
 }
 
 /// A write's outcome: nothing for done, else its error's kind
-/// ([`codec::KINDS`]); the error's text is not kept (no write the loop
-/// asks reads it).
 impl TapeValue for io::Result<()> {
     fn to_tape(&self) -> Vec<u8> {
         match self {
@@ -245,19 +172,6 @@ impl TapeValue for Option<i64> {
 }
 
 /// The machine's count of its sleep ([`SleepStamp`]): its milliseconds and,
-/// after a space, the boot's id in the kernel's spelling ([`Boot::text`]);
-/// nothing for none.
-///
-/// A boot's text reads back through astream's reader of it ([`Boot::of`]),
-/// its case kept, so a replay writes each act's ledger row exactly as the
-/// recorded run did, whichever host recorded it: a tape recorded before the
-/// boot was read as bytes (the kernel's text as it came: Linux's lower-case,
-/// macOS's upper-case) replays the same boot and the same rows. Text that
-/// names no boot — the all-zero id a damaged answer reads as — replays as a
-/// count on no named boot, which is what this build's own probe reads that
-/// answer as live: a replay decides as the loop would now, so an act a tape
-/// recorded on that answer writes its row with no count, and the replay
-/// reports the divergence that change of behaviour is.
 impl TapeValue for Option<SleepStamp> {
     fn to_tape(&self) -> Vec<u8> {
         self.as_ref().map_or_else(Vec::new, |s| {
@@ -292,7 +206,6 @@ impl TapeValue for Option<SleepStamp> {
 }
 
 /// Two times or none (the machine's last sleep: when it slept and woke, unix
-/// ms): their decimal texts, a space between; nothing for none.
 impl TapeValue for Option<(i64, i64)> {
     fn to_tape(&self) -> Vec<u8> {
         self.map_or_else(Vec::new, |(a, b)| format!("{a} {b}").into_bytes())
@@ -342,13 +255,8 @@ pub(crate) struct TapeCore {
     /// The monotonic instant the tape's `Mono` reads and stamps count from.
     origin: Instant,
     /// The run's roots: every path is taped under one ([`Roots::encode`]).
-    /// Locked only to encode a path; a test that captures its run's header
-    /// after its door was made names them then ([`Self::reroot`]).
     roots: Mutex<Roots>,
     /// The seed of the worker's digest on this tape (an xxh64 of the tape's
-    /// id): a policy probe names the worker by its digest under it
-    /// (`WorkerEnv::digest`), so the same worker reads as another digest on
-    /// another tape, and no digest is compared across tapes.
     seed: u64,
 }
 
@@ -374,7 +282,6 @@ struct Recorder {
 }
 
 /// A screen the loop parsed: its sequence and generation, and the ordinal of
-/// the round trip it came in.
 #[derive(Debug)]
 struct Screened {
     seq: u64,
@@ -382,10 +289,7 @@ struct Screened {
     record: u64,
 }
 
-/// The screens a run parsed, each with the ordinal of the round trip whose
-/// reply it came in: what a decision's mark names as the screen it judged.
-/// The recorder keeps one and a replay keeps one (`super::replay`), the same
-/// book, so a replayed decision names the record the recorded one named.
+/// The screens a run parsed, each with the ordinal of the round trip whose reply it came in: what a decision's mark names as the screen it judged.
 #[derive(Debug, Default)]
 pub(crate) struct Screens(VecDeque<Screened>);
 
@@ -402,8 +306,7 @@ impl Screens {
         });
     }
 
-    /// The record the screen of `seq` and `generation` came in, the latest
-    /// one first; `None` when it was never parsed (or is long forgotten).
+    /// The record the screen of `seq` and `generation` came in, the latest one first; `None` when it was never parsed (or is long forgotten).
     pub(crate) fn find(&self, seq: u64, generation: Option<&str>) -> Option<u64> {
         self.0
             .iter()
@@ -414,10 +317,6 @@ impl Screens {
 }
 
 /// What the seam's two ends share: the value staged for the seam to tape
-/// (the seam draws a clock or a file from its backend, which here only hands
-/// back what the door already read), the stamp the next round trip or flag
-/// carries, and the writer the records stream into. Locked only while the
-/// recorder's own lock is held, so never contended.
 struct Stage {
     writer: TapeWriter,
     mono: u64,
@@ -425,14 +324,12 @@ struct Stage {
     file: Option<io::Result<Vec<u8>>>,
     stamp: Option<Stamp>,
     /// Effects taped so far: the next one's ordinal (0-based, as
-    /// [`Mark::Truncated`] counts them).
     effects: u64,
     /// The ordinal of the last round trip taped.
     last_exchange: Option<u64>,
 }
 
 /// The seam's backend: it reads nothing of its own, and hands the seam the
-/// value the door staged.
 struct Handed(Arc<Mutex<Stage>>);
 
 impl RealEffects for Handed {
@@ -459,7 +356,6 @@ impl RealEffects for Handed {
 }
 
 /// The seam's sink: each record, stamped where it carries a stamp, appended
-/// to the writer.
 struct Streamed(Arc<Mutex<Stage>>);
 
 impl RecordSink for Streamed {
@@ -488,8 +384,7 @@ fn answered<T>(r: Result<T, Infallible>) -> T {
     }
 }
 
-/// A door's live call in progress ([`TapeCore::enter`]); ended when dropped,
-/// an unwind included.
+/// A door's live call in progress ([`TapeCore::enter`]); ended when dropped, an unwind included.
 pub(crate) struct Entered<'a>(&'a TapeCore);
 
 impl Drop for Entered<'_> {
@@ -499,10 +394,7 @@ impl Drop for Entered<'_> {
 }
 
 impl TapeCore {
-    /// The recorder of a run whose tape `writer` writes (its header already
-    /// written), its paths under `roots`, its monotonic reads counted from
-    /// `origin` (the loop's clock as the run starts, peeked), the tape's id
-    /// `tape` (its header's) seeding the worker's digest ([`Self::seed`]).
+    /// The recorder of a run whose tape `writer` writes (its header already written), its paths under `roots`, its monotonic reads counted from `origin` (the loop's clock as the run starts, peeked), the tape's id `tape` (its header's) seeding the worker's digest ([`Self::seed`]).
     pub(crate) fn start(
         writer: TapeWriter,
         roots: Roots,
@@ -540,9 +432,7 @@ impl TapeCore {
         self.seed
     }
 
-    /// The monotonic instant the tape counts from: what a host's answer
-    /// that holds an `Instant` is written as an offset from
-    /// ([`super::host::HostReply`]).
+    /// The monotonic instant the tape counts from: what a host's answer that holds an `Instant` is written as an offset from ([`super::host::HostReply`]).
     pub(crate) fn origin(&self) -> Instant {
         self.origin
     }
@@ -551,39 +441,28 @@ impl TapeCore {
         self.recorder.lock_or_recover()
     }
 
-    /// `at` in nanoseconds since the tape's origin (zero for an instant
-    /// before it; the loop's clock never runs back).
+    /// `at` in nanoseconds since the tape's origin (zero for an instant before it; the loop's clock never runs back).
     pub(crate) fn mono_ns(&self, at: Instant) -> u64 {
         u64::try_from(at.saturating_duration_since(self.origin).as_nanos()).unwrap_or(u64::MAX)
     }
 
-    /// `at` as a signed offset from the tape's origin, `+<ns>ns` or
-    /// `-<ns>ns`: how an `Instant` in a decision's outcome is written — and
-    /// in a note ([`instants_as_offsets`]) — so a tape never holds this
-    /// process's raw clock.
+    /// `at` as a signed offset from the tape's origin, `+<ns>ns` or `-<ns>ns`: how an `Instant` in a decision's outcome is written — and in a note ([`instants_as_offsets`]) — so a tape never holds this process's raw clock.
     pub(crate) fn offset_text(&self, at: Instant) -> String {
         offset_from(self.origin, at)
     }
 
-    /// `path` as the run's roots write it (`@ledger/s-1.jsonl`); a byte that
-    /// is not UTF-8 is replaced, a documented loss (the record's path is
-    /// text).
+    /// `path` as the run's roots write it (`@ledger/s-1.jsonl`); a byte that is not UTF-8 is replaced, a documented loss (the record's path is text).
     pub(crate) fn path(&self, path: &Path) -> String {
         String::from_utf8_lossy(&self.roots.lock_or_recover().encode(path)).into_owned()
     }
 
-    /// The run's roots are `roots` from now on: a whole-run test helper's,
-    /// whose run's header (and so its roots) is captured once its setup is
-    /// done, after the door it records through was handed to the transport.
-    /// Called before the run crosses its first door.
+    /// The run's roots are `roots` from now on: a whole-run test helper's, whose run's header (and so its roots) is captured once its setup is done, after the door it records through was handed to the transport.
     #[cfg(test)]
     pub(crate) fn reroot(&self, roots: Roots) {
         *self.roots.lock_or_recover() = roots;
     }
 
-    /// A live call of `door` begins: `None` when another door's live call is
-    /// already in progress — the nesting rule ([module docs](self)): the
-    /// caller runs live and tapes nothing.
+    /// A live call of `door` begins: `None` when another door's live call is already in progress — the nesting rule ([module docs](self)): the caller runs live and tapes nothing.
     pub(crate) fn enter(&self, door: &str) -> Option<Entered<'_>> {
         if self.depth.fetch_add(1, Ordering::SeqCst) > 0 {
             self.depth.fetch_sub(1, Ordering::SeqCst);
@@ -604,7 +483,6 @@ impl TapeCore {
     }
 
     /// `inner` was reached inside the outer door's live call: said once a
-    /// pair, and a failed assertion in this crate's tests.
     fn nested(&self, inner: &str) {
         let outer = self.outer.lock_or_recover().clone();
         {
@@ -620,9 +498,6 @@ impl TapeCore {
                     }));
             }
         }
-        // This crate's tests keep every boundary clean (a failed assertion, as a
-        // `debug_assert!` under `cfg(test)`); a shipped run says it on the
-        // tape and goes on.
         #[cfg(test)]
         panic!(
             "the door {inner:?} was reached inside the live call of {outer:?}: doors do not nest \
@@ -641,8 +516,7 @@ impl TapeCore {
         answered(rec.seam.mono_nanos());
     }
 
-    /// A wall read of `ns` nanoseconds since the epoch (negative before it,
-    /// written as its two's complement).
+    /// A wall read of `ns` nanoseconds since the epoch (negative before it, written as its two's complement).
     pub(crate) fn clock(&self, ns: i64) {
         if self.inside("clock") {
             return;
@@ -652,8 +526,7 @@ impl TapeCore {
         answered(rec.seam.now_nanos());
     }
 
-    /// A round trip that came back: `door`, its `request` and `reply`,
-    /// stamped `stamp`.
+    /// A round trip that came back: `door`, its `request` and `reply`, stamped `stamp`.
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -683,8 +556,7 @@ impl TapeCore {
         answered(rec.seam.emit(door, &bytes));
     }
 
-    /// A flag read at `door` that answered `up`: what the loop sees (true
-    /// from its first true read on), the first true read taped with `stamp`.
+    /// A flag read at `door` that answered `up`: what the loop sees (true from its first true read on), the first true read taped with `stamp`.
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -711,9 +583,7 @@ impl TapeCore {
         seen
     }
 
-    /// A note of kind `kind`, its text built only here: a `Debug` rendering
-    /// (a turn-end fold's state and reading), every `Instant` in it written
-    /// as an offset from the tape's origin ([`instants_as_offsets`]).
+    /// A note of kind `kind`, its text built only here: a `Debug` rendering (a turn-end fold's state and reading), every `Instant` in it written as an offset from the tape's origin ([`instants_as_offsets`]).
     pub(crate) fn note(&self, kind: &str, text: impl FnOnce() -> String) {
         let item = Item::Note {
             kind: kind.to_string(),
@@ -722,8 +592,7 @@ impl TapeCore {
         self.lock().stage.lock_or_recover().writer.append(&item);
     }
 
-    /// A file read at `path` that came back `read`: taped under the run's
-    /// roots, and handed back to the door.
+    /// A file read at `path` that came back `read`: taped under the run's roots, and handed back to the door.
     pub(crate) fn file(&self, path: &Path, read: io::Result<Vec<u8>>) -> io::Result<Vec<u8>> {
         let path = self.path(path);
         let mut rec = self.lock();
@@ -731,9 +600,7 @@ impl TapeCore {
         answered(rec.seam.try_read_file(&path))
     }
 
-    /// The live call of the door `door`, asking `request`, unwound
-    /// ([`NOTE_UNWOUND_IN`]): said as it is, never rewritten (a request's hex
-    /// holds no instant), and before the run's end the unwind goes on to.
+    /// The live call of the door `door`, asking `request`, unwound ([`NOTE_UNWOUND_IN`]): said as it is, never rewritten (a request's hex holds no instant), and before the run's end the unwind goes on to.
     pub(crate) fn unwound_in(&self, door: &str, request: &[u8]) {
         self.lock()
             .stage
@@ -750,8 +617,7 @@ impl TapeCore {
         self.lock().stage.lock_or_recover().writer.flush_hint(why);
     }
 
-    /// The loop parsed the screen of sequence `seq` and generation
-    /// `generation` from the last round trip ([module docs](self)).
+    /// The loop parsed the screen of sequence `seq` and generation `generation` from the last round trip ([module docs](self)).
     pub(crate) fn screen_read(&self, seq: u64, generation: Option<&str>) {
         let mut rec = self.lock();
         let Some(record) = rec.stage.lock_or_recover().last_exchange else {
@@ -760,10 +626,7 @@ impl TapeCore {
         rec.screens.push(seq, generation, record);
     }
 
-    /// A decision's mark at `door`: the record of the judged screen (by its
-    /// `seq` and `generation`, `-` when the recorder never saw it parsed),
-    /// the screen's own words, the `rule`, the `outcome` and the box's `facts`,
-    /// as `key=value` lines ([`DecideMark`]).
+    /// A decision's mark at `door`: the record of the judged screen (by its `seq` and `generation`, `-` when the recorder never saw it parsed), the screen's own words, the `rule`, the `outcome` and the box's `facts`, as `key=value` lines ([`DecideMark`]).
     pub(crate) fn decide(
         &self,
         door: &str,
@@ -813,9 +676,7 @@ impl TapeCore {
     }
 }
 
-/// `at` as a signed offset from `origin`, `+<ns>ns` or `-<ns>ns`
-/// ([`TapeCore::offset_text`]; a replay's core writes the same instant of
-/// the replayed run the same way from its own origin).
+/// `at` as a signed offset from `origin`, `+<ns>ns` or `-<ns>ns` ([`TapeCore::offset_text`]; a replay's core writes the same instant of the replayed run the same way from its own origin).
 pub(crate) fn offset_from(origin: Instant, at: Instant) -> String {
     match at.checked_duration_since(origin) {
         Some(after) => format!("+{}ns", after.as_nanos()),
@@ -823,31 +684,7 @@ pub(crate) fn offset_from(origin: Instant, at: Instant) -> String {
     }
 }
 
-/// `text`, a `Debug` rendering, with every `Instant` in it written as an
-/// offset from `origin` — `+<ns>ns`, or `-<ns>ns` for one before it — as a
-/// decision's outcome writes one ([`TapeCore::offset_text`]).
-///
-/// WHY A NOTE IS REWRITTEN AND NOT RENDERED BY HAND: a turn-end note is the
-/// `Debug` of the policy's whole fold and reading, which hold some thirty
-/// `Instant`s in a dozen nested types (a typed act's time, a point's first
-/// showing, an Esc, a wall's reset, a switch's press …). An `Instant`'s own
-/// `Debug` is this process's raw monotonic clock — on macOS the seconds
-/// since boot — which no other record on the tape is placed on (they count
-/// from the origin, which is never written), so a note left as it was
-/// could say nothing of WHEN anything happened, and would tell a reader the
-/// machine's uptime. Rendering each type by hand would be a second `Debug`
-/// to keep in step with every field the policy grows; instead the one
-/// `Debug` is kept and each `Instant` in it is rewritten.
-///
-/// How this build's std writes an `Instant` is LEARNT, not assumed: the
-/// origin's own `Debug` must be text, a seconds count, text, a nanoseconds
-/// count, text ([`InstantForm`]), and an instant a known span after it must
-/// read back as that span — else nothing is guessed, and the note is
-/// withheld but for saying so, so no raw clock reaches a tape whatever the
-/// toolchain writes. Only the exact form, numbers in place, is rewritten —
-/// wherever it stands, a string in the rendering included: a screen's text
-/// that spells an `Instant` out reads as an offset too, the safe side for a
-/// text that is only ever read.
+/// `text`, a `Debug` rendering, with every `Instant` in it written as an offset from `origin` — `+<ns>ns`, or `-<ns>ns` for one before it — as a decision's outcome writes one ([`TapeCore::offset_text`]).
 pub(crate) fn instants_as_offsets(text: &str, origin: Instant) -> String {
     let Some(form) = InstantForm::learn(origin) else {
         return "(withheld: this build writes an Instant in a form the recorder cannot place on \
@@ -882,12 +719,7 @@ pub(crate) fn instants_as_offsets(text: &str, origin: Instant) -> String {
     out
 }
 
-/// Whether `text`, a `Debug` rendering, holds an `Instant` as this build's
-/// std writes one ([`InstantForm`]): what a host's argument must never hold
-/// (`super::host::request`), since a raw clock in a compared request makes
-/// every replay diverge there. A build whose form cannot be learnt answers
-/// `false`: nothing is guessed. A test's check: a shipped run says what it
-/// was asked and goes on.
+/// Whether `text`, a `Debug` rendering, holds an `Instant` as this build's std writes one ([`InstantForm`]): what a host's argument must never hold (`super::host::request`), since a raw clock in a compared request makes every replay diverge there.
 #[cfg(test)]
 pub(crate) fn holds_instant(text: &str) -> bool {
     let Some(form) = InstantForm::learn(Instant::now()) else {
@@ -898,8 +730,6 @@ pub(crate) fn holds_instant(text: &str) -> bool {
 }
 
 /// How this build's std writes an `Instant` in `Debug`
-/// ([`instants_as_offsets`]): `head`, the seconds, `mid`, the nanoseconds,
-/// `tail` — `Instant { tv_sec: `, `, tv_nsec: `, ` }` on unix today.
 struct InstantForm {
     head: String,
     mid: String,
@@ -910,7 +740,6 @@ struct InstantForm {
 
 impl InstantForm {
     /// The form, from `origin`'s own `Debug`; `None` unless it has exactly
-    /// that shape and an instant a known span on reads as that span.
     fn learn(origin: Instant) -> Option<Self> {
         const SPAN: Duration = Duration::new(1, 500_000_001);
         let written = format!("{origin:?}");
@@ -950,7 +779,6 @@ impl InstantForm {
     }
 
     /// The instant `text` begins with in this form: its length in `text`
-    /// and its nanoseconds on the clock.
     fn read(&self, text: &str) -> Option<(usize, i128)> {
         let rest = text.strip_prefix(&self.head)?;
         let (secs, rest) = number(rest)?;
@@ -966,7 +794,6 @@ impl InstantForm {
 }
 
 /// The decimal number `text` begins with (a `-` before it allowed), and the
-/// text after it.
 fn number(text: &str) -> Option<(i128, &str)> {
     let digits = text.strip_prefix('-').unwrap_or(text);
     let len = digits.bytes().take_while(u8::is_ascii_digit).count();
@@ -977,15 +804,7 @@ fn number(text: &str) -> Option<(i128, &str)> {
     Some((text[..end].parse().ok()?, &text[end..]))
 }
 
-/// A decision's mark, as its `Emit` holds it: `key=value` lines, each value
-/// escaped as the header's are ([`escape`]), a field the decision lacks
-/// written `-`, and the box's facts on a line of their own only where the
-/// decision has them.
-///
-/// A later build may write a key this one does not know: it is IGNORED on a
-/// read, never a reason to refuse the mark — a reader of a tape (`tape show
-/// --decisions`, `why`) is the one place an older build meets a newer tape's
-/// marks, and each key it does know still says what it said.
+/// A decision's mark, as its `Emit` holds it: `key=value` lines, each value escaped as the header's are ([`escape`]), a field the decision lacks written `-`, and the box's facts on a line of their own only where the decision has them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DecideMark {
     /// The ordinal of the round trip whose reply was the judged screen.
@@ -998,10 +817,7 @@ pub struct DecideMark {
     pub rule: Option<String>,
     /// The decision, every `Instant` in it an offset from the tape's origin.
     pub outcome: String,
-    /// What an approval or a question was decided on
-    /// (`policy::box_facts::BoxFacts::to_json`): the facts its context was
-    /// built from alone. `None` for a turn end (its fold is a note), and for
-    /// a box the loop handed over before the policy was asked.
+    /// What an approval or a question was decided on (`policy::box_facts::BoxFacts::to_json`): the facts its context was built from alone.
     pub facts: Option<String>,
 }
 
@@ -1027,9 +843,7 @@ impl DecideMark {
         out
     }
 
-    /// A mark's text read back; `None` for text [`Self::encode`] did not
-    /// write (a line that is no `key=value`, a field missing or unreadable).
-    /// A key this build does not know is skipped ([`DecideMark`]).
+    /// A mark's text read back; `None` for text [`Self::encode`] did not write (a line that is no `key=value`, a field missing or unreadable).
     #[must_use]
     pub fn decode(text: &str) -> Option<Self> {
         let mut screen = None;

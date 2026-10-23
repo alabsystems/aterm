@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A Settings row's anatomy (its label line, second line, Reset's place),
-//! the list's peek, drafts and refusals, the bars, and the keyboard.
+//! Tests for Settings row layout, inline drafts, validation refusals, and keyboard navigation.
 
 use super::modified::{Lab, rect_of};
 use super::*;
@@ -24,11 +23,7 @@ fn dispatch(lab: &mut Lab, event: AppEvent) {
     lab.dispatch(event);
 }
 
-/// Page Down, each press drawn at `width`×`height` as the window draws
-/// between presses, until a press moves the list no further: its last
-/// screen, as the 40 presses these tests made before reached it after its
-/// few screens (test-run speed: the presses past the end were most of their
-/// layouts). That frame.
+/// Page Down, each press drawn at `width`×`height` as the window draws between presses.
 fn to_the_last_screen(lab: &mut Lab, width: f32, height: f32) -> crate::native_ui::CompiledUi {
     let shown = |lab: &Lab| {
         (
@@ -36,7 +31,6 @@ fn to_the_last_screen(lab: &mut Lab, width: f32, height: f32) -> crate::native_u
             lab.state().scroll_shown().map(|(_, view)| view),
         )
     };
-    // The first screen, drawn before the first press.
     let _ = lab.compile(width, height);
     for _ in 0..40 {
         let at = shown(lab);
@@ -49,10 +43,7 @@ fn to_the_last_screen(lab: &mut Lab, width: f32, height: f32) -> crate::native_u
     panic!("forty presses of Page Down never reached the list's end")
 }
 
-/// A wide window whose Security list scrolls: the shipped 1074×684 where the
-/// page holds This Mac's Universal Control and Secure Keyboard Entry (macOS's
-/// rows: `row_available_here`, the platform half of a row's admission), a
-/// shorter one where its six other rows fit 684 whole.
+/// A wide window whose Security list scrolls.
 fn wide_scrolling_security() -> (f32, f32) {
     let macos_rows = row_available_here(
         prefs::EDIT_MACHINE_UNIVERSAL_CONTROL,
@@ -61,8 +52,6 @@ fn wide_scrolling_security() -> (f32, f32) {
     (1_074.0, if macos_rows { 684.0 } else { 560.0 })
 }
 
-/// A switch keeps its place when its Reset comes: every row keeps Reset's
-/// place, on a wide page and a compact one.
 #[test]
 fn a_switch_stays_where_it_is_when_its_reset_comes() {
     for (width, height) in [(1_074.0, 684.0), (584.0, 348.0)] {
@@ -93,8 +82,6 @@ fn a_switch_stays_where_it_is_when_its_reset_comes() {
     }
 }
 
-/// A value set on a color field's control over a refused draft saves, and
-/// the stale draft goes with it; Reset drops a draft too.
 #[test]
 fn a_valid_color_over_a_refused_draft_clears_the_draft() {
     let mut lab = Lab::new("");
@@ -129,9 +116,6 @@ fn a_valid_color_over_a_refused_draft_clears_the_draft() {
     assert!(!lab.text().contains("background"));
 }
 
-/// A refused value's reason lives as long as its draft: on Modified too,
-/// spoken by a Status and by the field's name, never telling Return will
-/// save it; discarding the draft takes the reason.
 #[test]
 fn a_refused_value_says_why_wherever_its_draft_is() {
     let mut lab = Lab::new("");
@@ -156,8 +140,6 @@ fn a_refused_value_says_why_wherever_its_draft_is() {
         .semantic(&UiKey::new(format!("settings/control/{key}")))
         .expect("the field");
     assert!(control.state.is_some_and(|state| state.invalid));
-    // The field's description says why, and how to put it right; its name
-    // is the setting's.
     let description = control.description.clone().unwrap_or_default();
     assert!(description.contains("was not saved"), "{description}");
     assert!(description.contains("correct it"), "{description}");
@@ -180,8 +162,6 @@ fn a_refused_value_says_why_wherever_its_draft_is() {
     );
 }
 
-/// Reset All asks with the keyboard on Cancel, and answering No puts it
-/// back on Reset All…, never on a button the question turned off.
 #[test]
 fn reset_all_puts_the_keyboard_on_cancel_and_back() {
     let mut lab = Lab::new("cursor_blink = false\n");
@@ -213,10 +193,6 @@ fn reset_all_puts_the_keyboard_on_cancel_and_back() {
     );
 }
 
-/// Home and End move the list to its top and bottom, and take the keyboard
-/// with it as Page Up and Page Down do: End to the last control of the
-/// bottom screen, Home to the first of the top one, ringed, so the next
-/// arrow steps on from there instead of jumping the list back.
 #[test]
 fn home_and_end_move_the_list_to_its_ends() {
     let mut lab = Lab::new("");
@@ -271,11 +247,6 @@ fn home_and_end_move_the_list_to_its_ends() {
     assert!(lab.state().common.focus_visible);
 }
 
-/// Home and End on a sidebar row move the keyboard to the sidebar's first or
-/// last row and never open it, and the page's list stays where it is. Page
-/// Down from a sidebar row turns the list and takes the keyboard into it, so
-/// the Home after it goes back to the list's top, never to the sidebar; Page
-/// Up does the same, to the screen's first control too.
 #[test]
 fn the_sidebar_keys_act_on_what_the_keyboard_is_in() {
     let (width, height) = wide_scrolling_security();
@@ -333,9 +304,6 @@ fn the_sidebar_keys_act_on_what_the_keyboard_is_in() {
     );
     assert_eq!(lab.state().route, SettingsRoute::Security);
 
-    // Page Up from the sidebar at the list's top: the list cannot turn back,
-    // and the keyboard goes to the screen's first control, never down to its
-    // last.
     lab.state_mut().common.last_focus = Some(UiKey::new("settings/nav/security"));
     let _ = lab.compile(width, height);
     dispatch(&mut lab, AppEvent::ScrollPage(-1));
@@ -349,9 +317,6 @@ fn the_sidebar_keys_act_on_what_the_keyboard_is_in() {
     );
 }
 
-/// Return and Escape in a text field end the edit, never the keyboard: it
-/// stays on the field, ringed, and Down goes on to the next control, where
-/// it used to land on nothing and the next Tab started over at the toolbar.
 #[test]
 fn return_and_escape_in_a_field_keep_the_keyboard_on_it() {
     let field = UiKey::new(format!("settings/control/{}", prefs::EDIT_SCROLLBACK));
@@ -401,8 +366,6 @@ fn return_and_escape_in_a_field_keep_the_keyboard_on_it() {
     }
 }
 
-/// Home and End on the compact category sheet reach its first and last
-/// category, ringed and on screen.
 #[test]
 fn home_and_end_reach_the_first_and_last_category() {
     let mut lab = Lab::new("");
@@ -435,12 +398,6 @@ fn home_and_end_reach_the_first_and_last_category() {
     }
 }
 
-/// THE ROWS A SCREEN SHOWS NEVER CHANGE FOR A STATUS BAR: the room a page
-/// keeps under its list for the bar a change brings up holds only the list's
-/// peek, so while no bar is up the list reaches the page's bottom (no blank
-/// band), and when the bar comes every control the screen shows is still
-/// whole and live where it was, and only the peek gives the bar its room —
-/// on a compact page and a wide one.
 #[test]
 fn a_status_bar_never_takes_a_row_from_the_screen() {
     let key = prefs::EDIT_ALLOW_OSC52_QUERY;
@@ -505,14 +462,6 @@ fn a_status_bar_never_takes_a_row_from_the_screen() {
     }
 }
 
-/// THE LAST SCREEN IS FULL: on every list page at the common sizes, a last
-/// screen whose last stops leave room in the list draws the stop before them
-/// over them, cut at the list's top and live over what shows, and draws on
-/// to its room's edge, its last stop's controls ending there at the latest
-/// and its words no further than the page's bottom (the strip kept for a
-/// status bar that is not up) — never a screen that ends on a band of
-/// blank, and never one scrolled past its end to hide a cut. CONTROL: some
-/// last screen draws such a stop cut.
 #[test]
 fn the_end_of_a_scrolled_page_fills_its_screen() {
     let mut peeked = 0;
@@ -549,8 +498,6 @@ fn the_end_of_a_scrolled_page_fills_its_screen() {
                     && node.rect.x >= list.x - 0.01
                     && node.rect.right() <= list.right() + 0.01
             };
-            // Cut at the list's top, or under the caption its group keeps
-            // whole there.
             if compiled
                 .paint
                 .iter()
@@ -620,9 +567,6 @@ fn the_end_of_a_scrolled_page_fills_its_screen() {
     assert!(peeked > 0, "some last screen draws the stop before it cut");
 }
 
-/// The docked compact toolbar's Reset All question and draft bar keep their
-/// buttons inside their group and the status box: the last one ends at the
-/// box's edge, never past it toward the window's.
 #[test]
 fn the_docked_bar_keeps_its_buttons_inside_its_box() {
     for variant in ["reset", "draft"] {
@@ -673,8 +617,6 @@ fn the_docked_bar_keeps_its_buttons_inside_its_box() {
     }
 }
 
-/// The sidebar is one Tab stop: Tab leaves it for the page, entering it
-/// lands on the selected row, and its arrows open the next page.
 #[test]
 fn the_sidebar_is_one_tab_stop_and_its_arrows_open_pages() {
     let mut lab = Lab::new("");
@@ -732,11 +674,6 @@ fn the_sidebar_is_one_tab_stop_and_its_arrows_open_pages() {
     );
 }
 
-/// SETTINGS ▸ THEMES HAS A RAIL ROW THE KEYBOARD REACHES. Opening it from
-/// the rail leaves the keyboard on its own row, a node the tree has (it was
-/// a key with no node when the rail listed no Themes row, so the keyboard
-/// was lost); Up from it opens Appearance and the row goes, Down opens
-/// Wallpaper, and Tab into the sidebar lands on it.
 #[test]
 fn arrows_and_tab_reach_the_themes_row() {
     let key = |key: &str| UiKey::new(key);
@@ -793,8 +730,6 @@ fn arrows_and_tab_reach_the_themes_row() {
     assert_eq!(lab.state().route, SettingsRoute::Wallpaper);
     assert_eq!(focus(&lab).as_deref(), Some("settings/nav/wallpaper"));
 
-    // From Appearance's row while Themes shows, Down is the Themes row: the
-    // page it already shows.
     open_themes(&mut lab);
     let _ = lab.compile(1_200.0, 820.0);
     dispatch(
@@ -806,8 +741,6 @@ fn arrows_and_tab_reach_the_themes_row() {
     assert_eq!(focus(&lab).as_deref(), Some("settings/nav/themes"));
 }
 
-/// The compact category sheet opens on the page it came from, and its arrow
-/// keys move down a column and along a row.
 #[test]
 fn the_category_grid_moves_by_column_and_row() {
     let mut lab = Lab::new("");
@@ -826,7 +759,6 @@ fn the_category_grid_moves_by_column_and_row() {
             .as_ref()
             .map(|key| key.as_str().to_string())
     };
-    // Top Settings | Modified, then Manual alone: Down lands on Manual.
     dispatch(&mut lab, AppEvent::StepFocus(1));
     assert_eq!(focus(&lab).as_deref(), Some("settings/categories/manual"));
     dispatch(&mut lab, AppEvent::StepFocus(1));
@@ -846,8 +778,6 @@ fn the_category_grid_moves_by_column_and_row() {
     assert_eq!(focus(&lab).as_deref(), Some("settings/categories/manual"));
 }
 
-/// A row's note is drawn inside its own row: Minimum contrast's under it,
-/// none under Faint text opacity.
 #[test]
 fn a_note_is_drawn_in_its_own_row() {
     let mut lab = Lab::new("");
@@ -884,17 +814,12 @@ fn a_note_is_drawn_in_its_own_row() {
     );
 }
 
-/// When a change takes effect is plain words on the row's second line; a
-/// change that applies at once says nothing.
 #[test]
 fn timing_is_plain_words_and_says_nothing_when_live() {
     let mut lab = Lab::new("");
     lab.state_mut().navigate(SettingsRoute::Security);
     let compiled = lab.compile(1_074.0, 900.0);
     let key = prefs::EDIT_MACHINE_UNIVERSAL_CONTROL;
-    // Universal Control is a Security row only where it actuates (macOS's
-    // `defaults`, `row_available_here`); elsewhere it is listed only once
-    // written, saying it has no effect (`settings_modified_tests`).
     if row_available_here(key, SettingsAvailability::for_state(lab.state())) {
         assert!(
             painted_text(&compiled, &format!("settings/detail/{key}/"))
@@ -928,11 +853,6 @@ fn timing_is_plain_words_and_says_nothing_when_live() {
     }
 }
 
-/// AN UNSAVED DRAFT'S BAR IS AS TALL AS ITS WORDS NEED: where its sentence
-/// fits whole beside its buttons (the shipped 102×29 window, on a page and
-/// on Modified) it is one row, as tall as the status bar the page keeps room
-/// for, so the list keeps its room; a sentence too long for that puts the
-/// buttons on a row under it.
 #[test]
 fn the_draft_bar_is_one_row_where_its_words_fit_beside_its_buttons() {
     let (width, height) = (738.0, 418.0);
@@ -969,12 +889,6 @@ fn the_draft_bar_is_one_row_where_its_words_fit_beside_its_buttons() {
         }
     }
 
-    // A refused draft's longer sentence does not fit beside its buttons in a
-    // window too narrow for it: the buttons go under it. Too narrow is
-    // measured in this host's UI face, so the check holds in any face: a bar
-    // whose row could not hold the sentence even with no button beside it
-    // (its 16pt edges and the 8pt gap before the buttons), while the column
-    // under it (8pt edges) holds the sentence whole.
     let mut lab = Lab::new("");
     lab.state_mut().navigate(SettingsRoute::Terminal);
     let _ = lab.invoke(
@@ -992,8 +906,6 @@ fn the_draft_bar_is_one_row_where_its_words_fit_beside_its_buttons() {
         &sentence,
         crate::native_ui::native_type_px(crate::type_scale::TypeStep::Caption).get(),
     );
-    // The bar spans the page beside the sidebar: a first compile says how
-    // much of the window that is at this narrow a width.
     let mut narrow = (need + 28.0).ceil();
     let beside = narrow - rect_of(&lab.compile(narrow, height), "settings/feedback").width;
     narrow += beside;
@@ -1012,19 +924,6 @@ fn the_draft_bar_is_one_row_where_its_words_fit_beside_its_buttons() {
     assert!(painted.ends_with("or discard it."), "{painted}");
 }
 
-/// A FONT ROW'S VALUE IS WHOLE ON EVERY FORM OF ITS ROW (the
-/// audit): with the terminal's report of the faces it draws in ("SF Mono
-/// Light Italic", "Apple Color Emoji") and a long saved family, Text &
-/// Fonts at a short compact window (738x180), a tall one (738x420), a
-/// medium (1095x700) and a wide one (1564x712), at 1×, 1.5× and 2× text,
-/// paints every control's words whole on every screen — its button takes
-/// from the name's column the room its words need, or sets them on lines,
-/// or the row stacks. A one-line row kept its 375pt control whatever its
-/// value: at 2× text "Automatic (SF Mono Light Italic)" read "Automatic
-/// (SF Mono Light…" and "Automatic (Apple Color Emoji)" read "Automatic
-/// (Apple Color E…" at every window width, and at 1× a saved "Iosevka Term
-/// Curly Slab Extended ExtraLight Italic" lost "ght Italic". The sweeps
-/// missed it: with no report the rows say only "Automatic".
 #[test]
 fn a_font_rows_value_is_whole_on_every_form_of_its_row() {
     let drawn = aterm_render::DrawnFaces {
@@ -1120,14 +1019,6 @@ fn a_font_rows_value_is_whole_on_every_form_of_its_row() {
     });
 }
 
-/// A REFUSED DRAFT'S SENTENCE IS READ WHOLE UNDER ITS BAR'S BUTTONS (the
-/// audit): from the 164pt window floor up to where the sentence
-/// fits beside its buttons, 1× and 2× text, the unsaved-draft bar sets its
-/// words over its buttons on the lines they take — every word on a line,
-/// none cut — its words' box holding its lines and its buttons under them.
-/// It was cut to one line: a refused draft in a 192pt window read
-/// "Scrollback limit was not saved.…", "Correct it and press Return, or
-/// discard it." gone.
 #[test]
 fn a_refused_drafts_sentence_is_read_whole_under_its_buttons() {
     at_each_text_scale(&[1.0, 2.0], "draft words", |scale| {
@@ -1151,8 +1042,6 @@ fn a_refused_drafts_sentence_is_read_whole_under_its_buttons() {
                 "{context}: {}",
                 status.label
             );
-            // Under the page the bar paints its sentence; docked in the
-            // compact toolbar, its authored short words.
             let docked = compiled
                 .semantic(&UiKey::new("settings/status-dock"))
                 .is_some();
@@ -1164,7 +1053,6 @@ fn a_refused_drafts_sentence_is_read_whole_under_its_buttons() {
                 height,
                 "settings/draft-recovery/status/visual",
             );
-            // A word wider than the box goes on with a hyphen.
             let bare = |text: &str| text.split_whitespace().collect::<String>().replace('-', "");
             assert_eq!(
                 bare(&every.concat()),
@@ -1213,12 +1101,6 @@ fn a_refused_drafts_sentence_is_read_whole_under_its_buttons() {
     });
 }
 
-/// A STATUS BAR'S STACKED BUTTONS KEEP THEIR WORDS (the review):
-/// where a bar's buttons go one under another — the unsaved-draft dock
-/// beside the compact toolbar's back button at 2× text in a 22- or
-/// 24-column window — each paints its whole words, on lines where one line
-/// cannot hold them, the bar as tall as they are: nothing it offers is cut.
-/// Held to one touch row, the dock painted "Rev…" and "Dis…".
 #[test]
 fn a_status_bars_stacked_buttons_keep_their_words() {
     at_each_text_scale(&[1.0, 2.0], "stacked bar buttons", |scale| {
@@ -1263,14 +1145,6 @@ fn a_status_bars_stacked_buttons_keep_their_words() {
     });
 }
 
-/// A DOCKED STATUS'S ACTIONS UNDER ITS WORDS STAND ACROSS THE TOOLBAR (the
-/// review): where the compact toolbar's dock lays a refused
-/// draft's Review and Discard under its words (2× text in a 22-column
-/// window), they take the toolbar's whole width, under its leading button
-/// too, each word whole on one line, and the page keeps the room the
-/// toolbar leaves it. Held to the dock's column beside the back button they
-/// broke "Re-" / "view" and "Dis-" / "card" and grew the toolbar to 322pt of
-/// the window's 348.
 #[test]
 fn a_docked_statuss_actions_stand_across_the_toolbar() {
     at_each_text_scale(&[2.0], "docked actions", |_| {
@@ -1314,9 +1188,6 @@ fn a_docked_statuss_actions_stand_across_the_toolbar() {
     });
 }
 
-/// The draft bar names a refused draft's reason and offers buttons as wide
-/// as their words; asked to confirm, it names the one draft and offers
-/// Cancel; on Modified it does not offer to go to Modified.
 #[test]
 fn the_draft_bar_says_why_names_the_draft_and_offers_cancel() {
     let mut lab = Lab::new("");
@@ -1331,8 +1202,6 @@ fn the_draft_bar_says_why_names_the_draft_and_offers_cancel() {
         .semantic(&UiKey::new("settings/draft-recovery/status"))
         .expect("the draft bar");
     assert!(status.label.contains("was not saved"), "{}", status.label);
-    // The red line under the field paints the reason; the bar names the
-    // setting and what to do, so one screen never paints it twice.
     let painted = painted_text(&compiled, "settings/draft-recovery/status/visual");
     assert!(
         painted.starts_with("Searchable scrollback lines was not saved.")
@@ -1380,7 +1249,6 @@ fn the_draft_bar_says_why_names_the_draft_and_offers_cancel() {
     );
 }
 
-/// A number's status reads as its slider does.
 #[test]
 fn a_saved_number_reads_as_its_slider() {
     let mut lab = Lab::new("");
@@ -1395,8 +1263,6 @@ fn a_saved_number_reads_as_its_slider() {
     );
 }
 
-/// A choice set in the words it shows saves its option; a token saves as it
-/// is.
 #[test]
 fn a_choice_set_in_its_words_saves_its_option() {
     let state = SettingsViewState::new(&Config::default());
@@ -1413,12 +1279,8 @@ fn a_choice_set_in_its_words_saves_its_option() {
     assert_eq!(set("explicit").as_deref(), Some("explicit"));
 }
 
-/// Choose… beside the selected tab color is in the list's keyboard order,
-/// between its field and its Reset.
 #[test]
 fn choose_beside_the_tab_color_is_in_the_keyboard_order() {
-    // On the Window page the row is itself the way to Tab Color, then its
-    // Reset.
     let mut lab = Lab::new("active_tab_color = \"#336699\"\n");
     lab.state_mut().navigate(SettingsRoute::WindowTabs);
     let _ = lab.compile(1_074.0, 684.0);
@@ -1436,7 +1298,6 @@ fn choose_beside_the_tab_color_is_in_the_keyboard_order() {
         .position(|key| *key == field)
         .expect("the row");
     assert_eq!(controls.get(at + 1), Some(&reset));
-    // In Search the field keeps its Choose… after it, ahead of its Reset.
     lab.state_mut().set_search("tab color".to_string());
     let _ = lab.compile(1_074.0, 684.0);
     let controls = order(&lab);
@@ -1451,14 +1312,11 @@ fn choose_beside_the_tab_color_is_in_the_keyboard_order() {
     assert_eq!(controls.get(at + 2), Some(&reset));
 }
 
-/// The Tab Color page's own hex row offers no Choose…: the wheel it would
-/// open is the page it is on.
 #[test]
 fn the_tab_color_page_does_not_offer_to_open_itself() {
     for (width, height) in [(1_074.0, 684.0), (738.0, 420.0), (584.0, 348.0)] {
         let mut lab = Lab::new("");
         lab.state_mut().navigate(SettingsRoute::TabColor);
-        // The list's last screen, where the hex row is.
         lab.state_mut().scroll_page_to(1_000);
         let compiled = lab.compile(width, height);
         assert!(
@@ -1476,11 +1334,6 @@ fn the_tab_color_page_does_not_offer_to_open_itself() {
     }
 }
 
-/// ONE LAW FOR THE SCROLLBACK: whatever the file can hold and the engine
-/// keeps, Settings saves. A hand-written 50,000,000 is in effect, so
-/// pressing Return on it (or typing a larger one) saves rather than being
-/// refused by a writer-only cap the load never applied; the memory budget,
-/// not a line count, bounds what history costs.
 #[test]
 fn a_hand_authored_scrollback_saves_again() {
     let key = prefs::EDIT_SCROLLBACK;
@@ -1490,7 +1343,6 @@ fn a_hand_authored_scrollback_saves_again() {
     lab.commit(&set, Some(SemanticInput::Text("60000000".to_string())));
     assert_eq!(lab.text(), "scrollback_lines = 60000000\n");
     assert!(!lab.state().field_errors.contains_key(key));
-    // Return on the value in effect is not refused.
     let _ = lab.invoke(&set, Some(SemanticInput::Text("60000000".to_string())));
     assert!(
         !lab.state().field_errors.contains_key(key),
@@ -1503,7 +1355,6 @@ fn a_hand_authored_scrollback_saves_again() {
     for refused in ["-1", "1.5", "9223372036854775808"] {
         assert!(prefs::check_edit_value(key, refused).is_err(), "{refused}");
     }
-    // What Settings saves, the engine keeps.
     let config: Config = aterm_toml::from_str("scrollback_lines = 50000000").unwrap();
     assert_eq!(
         config.engine_behaviour_config().scrollback_limit,
@@ -1511,7 +1362,6 @@ fn a_hand_authored_scrollback_saves_again() {
     );
 }
 
-/// The first Top Settings card keeps its title at 80×24.
 #[test]
 fn the_first_top_card_keeps_its_title_at_80_by_24() {
     let lab = Lab::new("");
@@ -1525,12 +1375,6 @@ fn the_first_top_card_keeps_its_title_at_80_by_24() {
     );
 }
 
-/// A TOP CARD HAS ONE NAME AT EVERY WIDTH: the colors card's semantics say
-/// "Terminal colors & window appearance" however narrow the window, and
-/// only what is painted is fitted — measured in the face it is painted in,
-/// so it never overflows its rect. NEGATIVE CONTROLS: at 374pt the painted
-/// copy is the short title (the fitting runs), and at 584pt at 1.35× the
-/// whole title is painted (the Caption face it is painted in holds it).
 #[test]
 fn the_top_colors_card_has_one_name_at_every_width() {
     const TITLE: &str = "Terminal colors & window appearance";
@@ -1576,9 +1420,6 @@ fn the_top_colors_card_has_one_name_at_every_width() {
     });
 }
 
-/// The Text card's size is Text & Fonts' `font_px`: setting it from Top
-/// Settings writes the key to aterm.toml, and the card's specimen reports
-/// the new size.
 #[test]
 fn the_top_text_card_writes_font_px() {
     let mut lab = Lab::new("");
@@ -1605,8 +1446,6 @@ fn the_top_text_card_writes_font_px() {
     );
 }
 
-/// The accent as text reads at 4.5:1 on every backdrop it is inked on, in a
-/// light theme too, while the accent itself keeps its own floor.
 #[test]
 fn accent_text_reads_at_four_and_a_half_to_one() {
     let light = aterm_render::Theme {
@@ -1634,12 +1473,6 @@ fn accent_text_reads_at_four_and_a_half_to_one() {
     }
 }
 
-/// THE LIST'S EDGE RULE ([`UiNode::room`]): inside a list's room a control
-/// is live over exactly what of it shows — whole, or cut by the room's edge
-/// — read out, in the Tab order, its hit its visible part; what the list
-/// draws in the strip under its room is a picture that fades, never live;
-/// and the list's cuts are on purpose, so the paint audit counts none of them.
-/// CONTROL: a node an inner card clips (not the list) is still counted.
 #[test]
 fn a_list_is_live_where_its_room_shows_a_control_and_its_strip_is_a_picture() {
     let button = |key: &str| {
@@ -1672,13 +1505,9 @@ fn a_list_is_live_where_its_room_shows_a_control_and_its_strip_is_a_picture() {
             )
             .room(80.0, true)
             .children(vec![
-                // 0..30: whole in the room.
                 button("shown"),
-                // 34..64: whole in the room.
                 button("whole"),
-                // 68..98: the room's edge at 80 cuts it.
                 button("cut"),
-                // 102..132: in the strip, cut at the list's edge.
                 button("strip"),
             ]),
             UiNode::new(
@@ -1740,15 +1569,6 @@ fn a_list_is_live_where_its_room_shows_a_control_and_its_strip_is_a_picture() {
     );
 }
 
-/// A row the list's top edge cuts is drawn as it shows, and what of it
-/// shows is live, WHERE IT SHOWS ITS NAME: a button the edge cuts only
-/// through its padding, its words whole under the edge, answers over the
-/// part that shows, as in any native scroll view, and focusing it scrolls its
-/// stop whole. One the edge cuts through its words, and one it leaves a
-/// sliver of, paints nothing and answers no press but the list's — a press
-/// there scrolls it whole into view — so no nameless half control, and no
-/// stray line, is pressed blind (a 4pt sliver of Cursor & Motion's Serious
-/// Mode switch under its preview at 80x24 turned it on).
 #[test]
 fn a_row_the_top_edge_cuts_is_drawn_and_live_where_it_shows() {
     let row = |key: &str, label: f32, control: f32| {
@@ -1792,8 +1612,6 @@ fn a_row_the_top_edge_cuts_is_drawn_and_live_where_it_shows() {
         .compile(LogicalRect::new(0.0, 0.0, 300.0, 200.0))
         .expect("compiles")
     };
-    // -24..36: the top edge cuts its label away and 4pt of its 40pt
-    // button's padding, its words whole under it.
     let tree = list(
         24.0,
         vec![row("padded", 20.0, 40.0), row("whole", 20.0, 40.0)],
@@ -1817,7 +1635,6 @@ fn a_row_the_top_edge_cuts_is_drawn_and_live_where_it_shows() {
     let whole = UiKey::new("whole/control");
     assert!(tree.semantic(&whole).is_some() && tree.hits.iter().any(|hit| hit.key == whole));
     assert!(tree.fit_failures().is_empty(), "{:?}", tree.fit_failures());
-    // -40..20: the edge cuts through its words; -56..4: a 4pt sliver of it.
     for (scrolled, what) in [(40.0, "its words"), (56.0, "all but a sliver")] {
         let tree = list(
             scrolled,
@@ -1839,9 +1656,7 @@ fn a_row_the_top_edge_cuts_is_drawn_and_live_where_it_shows() {
     }
 }
 
-/// Each paint node of `compiled` and the draw primitives it lays down, in
-/// paint order, as [`crate::native_ui::CompiledUi::tray`] paints them: its
-/// fade and clip around what the node itself draws.
+/// Each paint node of `compiled` and the draw primitives it lays down, in paint order.
 fn prims_by_node(
     compiled: &crate::native_ui::CompiledUi,
 ) -> Vec<(&crate::native_ui::PaintNode, Vec<crate::widget::DrawPrim>)> {
@@ -1879,15 +1694,7 @@ fn prims_by_node(
     out
 }
 
-/// What the tops of the lists on `compiled` paint — the page's list under
-/// its pinned heading or preview, the rows a list scrolls under a caption it
-/// keeps whole over them (`…/scrolled-rows`), the sidebar's list under its
-/// search field: no line of words cut through by the list's top edge — a
-/// line reaching an em over its baseline and a quarter of one under it —
-/// and, under a kept caption, every node that edge leaves whole in the
-/// list's room (over `room_bottom`; the strip under it holds a picture)
-/// judged by the fit audit as any other, never flagged a cut on purpose. The
-/// number of kept captions it read.
+/// What the tops of the lists on `compiled` paint.
 fn assert_list_tops(
     compiled: &crate::native_ui::CompiledUi,
     room_bottom: f32,
@@ -1912,9 +1719,6 @@ fn assert_list_tops(
                 && clip.bottom() <= rows.clip.bottom() + 0.01
         };
         for (node, prims) in painted.iter().filter(|(node, _)| within(node.clip)) {
-            // A line the edge cuts shows below it, inside the node's clip,
-            // which the edge sets (an edge an inner list's clip hides it
-            // under shows nothing of it).
             let at_edge = (node.clip.y - edge).abs() <= 0.5;
             for prim in prims {
                 if let crate::widget::DrawPrim::Text {
@@ -1927,8 +1731,6 @@ fn assert_list_tops(
                     sliced.push(format!("{:?} paints {s:?}", node.key.as_str()));
                 }
             }
-            // Whole under the caption and in the list's room: a node drawn
-            // in the strip under the room is a picture, cut on purpose.
             let whole = node.rect.y >= edge - 0.01
                 && node.rect.bottom() <= rows.clip.bottom().min(room_bottom) + 0.01;
             if caption && whole && node.peek {
@@ -1944,13 +1746,6 @@ fn assert_list_tops(
     kept
 }
 
-/// ROWS UNDER A KEPT CAPTION ARE PAINTED WHOLE OR NOT AT ALL, AND AUDITED
-/// (#45, #63): on the last screen of every list page at 80×24, 102×29 and
-/// 150×48, where a caption is kept whole over the rows that scroll under it,
-/// no row cut there paints a line of words sliced just under the caption
-/// (Sound's last screen at 102×29 painted its note's line so under SOUND
-/// EFFECTS), and the fit audit excuses none of the rows under it, whole
-/// ones too (every row under the caption was flagged a cut on purpose).
 #[test]
 fn rows_under_a_kept_caption_paint_no_cut_line_and_are_audited() {
     let mut kept = 0;
@@ -1977,12 +1772,6 @@ fn rows_under_a_kept_caption_paint_no_cut_line_and_are_audited() {
     assert!(kept > 0, "some last screen keeps a caption over its rows");
 }
 
-/// NO LIST'S TOP EDGE SLICES A LINE OF WORDS IN A SHORT WINDOW: at 220×12
-/// and 220×16 with 2× text, on every page, first screen and last, the page's
-/// list under its pinned heading and the sidebar's under its search field —
-/// that one scrolled part of a row past its top, as the wheel leaves it —
-/// paint no line of words cut through by the edge. The sidebar painted the
-/// foot of a row's name under the search field.
 #[test]
 fn no_list_top_slices_a_line_in_a_short_window() {
     at_each_text_scale(&[2.0], "short list tops", |_| {
@@ -1996,7 +1785,6 @@ fn no_list_top_slices_a_line_in_a_short_window() {
                     lab.state_mut().scroll_page_to(top);
                     lab.state_mut().page_reveal = None;
                     let _ = lab.compile(width, height);
-                    // The rail's place, a part of a row past its top.
                     let rail = lab.state().navigation_scroll.get();
                     let rail_limit = lab.state().navigation_scroll_limit.get();
                     lab.state().navigation_scroll.set(if rail >= 20.0 {
@@ -2021,8 +1809,7 @@ fn no_list_top_slices_a_line_in_a_short_window() {
     });
 }
 
-/// The list pages the edge sweeps cover, the Themes gallery's 190pt cards
-/// and Software Update's status card among them.
+/// The list pages the edge sweeps cover.
 const LIST_ROUTES: [SettingsRoute; 12] = [
     SettingsRoute::Home,
     SettingsRoute::Appearance,
@@ -2038,9 +1825,7 @@ const LIST_ROUTES: [SettingsRoute; 12] = [
     SettingsRoute::SoftwareUpdate,
 ];
 
-/// The shipped and common window sizes the edge sweeps cover: 80×24, 100×34
-/// (where Software Update's compact forms trade places), the shipped 102×29,
-/// 150×48, 167×36 and 220×60.
+/// The shipped and common window sizes the edge sweeps cover.
 const LIST_SIZES: [(f32, f32); 6] = [
     (584.0, 348.0),
     (724.0, 488.0),
@@ -2050,8 +1835,7 @@ const LIST_SIZES: [(f32, f32); 6] = [
     (1_564.0, 854.0),
 ];
 
-/// The list a compiled Settings page draws, its room and whether a peek
-/// follows the screen: the list's rect, how far from its top it is live.
+/// The list a compiled Settings page draws, its room and whether a peek follows the screen.
 fn compiled_list(
     compiled: &crate::native_ui::CompiledUi,
     plan: &scroll::ScrollPlan,
@@ -2064,8 +1848,7 @@ fn compiled_list(
     Some((list, plan.room().min(list.height)))
 }
 
-/// Whether `node` is a scrolling list: the page's (whatever its page calls
-/// it — `settings/list`, Tab Color's, About's, Packages'…) or the sidebar's.
+/// Whether `node` is a scrolling list.
 fn is_list_node(node: &crate::native_ui::PaintNode) -> bool {
     matches!(&node.content, UiContent::Group(spec) if spec.role == SemanticRole::List)
 }
@@ -2080,24 +1863,6 @@ fn is_control(content: &UiContent) -> bool {
     )
 }
 
-/// EVERY SCREEN FILLS ITS LIST AND EVERY CONTROL IT DRAWS IN ITS ROOM IS
-/// LIVE: on every screen of the list pages, at the shipped and common
-/// window sizes, a control any part of which the list's room shows is live
-/// over exactly that part (its semantic and hit rects are its clip inside the
-/// room), cut by the top edge or whole; one the screen draws as its peek —
-/// from the first control after the stops it shows that the room does not
-/// hold whole, and any drawn only in the strip under the room — is a fading
-/// picture over all it shows, never live, and a control the list lists,
-/// which a press there scrolls in; a screen with stops after
-/// it reaches the page's bottom (its room and the strip), and the last screen
-/// ends on its last stop at the room's edge — no screen ends on a band of
-/// blank, and the list never stops short to hide a cut. And THE AUDIT JUDGES
-/// EVERY ROW IT PAINTS: at 1× and 2× text, no screen paints a word cut off,
-/// overflowing or clipped by accident — the rows scrolled under a caption a
-/// screen keeps whole included — and no list's top edge slices a line of
-/// words ([`assert_list_tops`]): the last screen's first stop, peeking in
-/// over the list's top, painted Cursor & Motion's "Typing momentum glow"
-/// half under its pinned preview at 150×48.
 #[test]
 fn every_screen_fills_its_list_and_every_control_its_room_shows_is_live() {
     at_each_text_scale(&[1.0, 2.0], "the list edge sweep", |scale| {
@@ -2122,10 +1887,6 @@ fn list_edge_sweep(scale: f32) {
                 assert_list_tops(compiled, list.y + room, &context);
                 let failures = compiled.fit_failures();
                 assert!(failures.is_empty(), "{context}: {failures:#?}");
-                // A press on the picture of a control in the strip scrolls
-                // that control in: every one is a control the list lists.
-                // (A sidebar row its edge draws without its name is the
-                // sidebar's: the press brings it into view there.)
                 for picture in &compiled.list_pictures {
                     assert!(
                         plan.stop_holding(&picture.key).is_some()
@@ -2151,10 +1912,6 @@ fn list_edge_sweep(scale: f32) {
                         node.rect,
                         node.clip
                     );
-                    // ONE BOUNDARY: a control the screen draws past the
-                    // stops it shows, from the first the room does not hold
-                    // whole, is its peek — fading from its top, a picture
-                    // over all it shows, never live in part.
                     if node.fade.is_some_and(|(top, _)| top <= node.rect.y + 0.5) {
                         assert!(
                             compiled.semantic(&node.key).is_none(),
@@ -2203,14 +1960,6 @@ fn list_edge_sweep(scale: f32) {
                         }
                     }
                 }
-                // A screen with stops after it draws on to the page's bottom.
-                // Only on a hard edge — no strip fading under the room — and
-                // where no card after it would show, does it end on a cut of
-                // the last card it draws instead, never on one that looks
-                // complete; where the strip fades, the fade says the list goes
-                // on, and a cut short of the page's bottom would leave a band
-                // of blank under it (Cursor Styles at 150×48 cut its fourth
-                // style 34pt short, Appearance at 102×29 a note 42pt short).
                 let ends_on_cut = compiled.paint.iter().any(|node| {
                     node.key.as_str() != "settings/list"
                         && node.rect.x >= list.x - 0.5
@@ -2250,13 +1999,6 @@ fn list_edge_sweep(scale: f32) {
     }
 }
 
-/// CHOOSING A CURSOR STYLE NEVER RESIZES THE PREVIEW OR MOVES ITS ROW: the
-/// preview keeps room for the tallest stop any style's Adjust card can take,
-/// so whichever style is saved (Off has no card), in a dark theme or a light
-/// one (whose Bloom rows say why they are idle), with Bloom on or off, the
-/// 80×24 and shipped 102×29 windows give one preview height; the page lands
-/// on Off and the saved style whole; and a style chosen from the keyboard
-/// keeps its place, and the preview its height, when the status bar comes.
 #[test]
 fn choosing_a_cursor_style_never_resizes_the_preview_or_moves_its_row() {
     let rect = |compiled: &crate::native_ui::CompiledUi, key: &str| {
@@ -2276,7 +2018,6 @@ fn choosing_a_cursor_style_never_resizes_the_preview_or_moves_its_row() {
                         "comet",
                         "rainbow kitty flying",
                     ] {
-                        // The saved style drawn, on every host (`trail_drawn`).
                         let mut lab = Lab::new(&trail_drawn(&format!(
                             "theme = \"{theme}\"\ncursor_trail_bloom = {bloom}\ncursor_trail_style = \"{saved}\"\n"
                         )));
@@ -2287,9 +2028,6 @@ fn choosing_a_cursor_style_never_resizes_the_preview_or_moves_its_row() {
                             .unwrap_or_else(|| panic!("{context}: the preview"));
                         previews.insert((preview.height * 100.0).round() as i64);
                         let list = rect(&compiled, "settings/list").expect("the list");
-                        // The saved style lands whole in the room the list
-                        // keeps with a bar up; Off too where the list's first
-                        // screen shows them both.
                         let (plan, _) = lab.state().scroll_shown().expect("a list");
                         let saved_row = cursor_style_row_key(saved);
                         let both = plan
@@ -2318,7 +2056,6 @@ fn choosing_a_cursor_style_never_resizes_the_preview_or_moves_its_row() {
                 "{context}: one preview height whichever style, theme and Bloom: {previews:?}"
             );
 
-            // A style reached from the keyboard and chosen keeps its place.
             for theme in ["Dracula", "GitHub Light"] {
                 let mut lab = Lab::new(&trail_drawn(&format!("theme = \"{theme}\"\n")));
                 lab.state_mut().navigate(SettingsRoute::CursorStyles);
@@ -2357,12 +2094,6 @@ fn choosing_a_cursor_style_never_resizes_the_preview_or_moves_its_row() {
     }
 }
 
-/// A BAR TALLER THAN THE ROOM KEPT FOR ONE TAKES THE REST FROM THE CURSOR
-/// STYLES LIST: a reload warning is taller than the room the page keeps
-/// under its list for a status bar, and the list gives up the difference, so
-/// it ends above the bar and no part of a style row under it is live (the
-/// list used to keep its full room and run 45pt under the warning at 102×29,
-/// a row there cut by the bar but still live).
 #[test]
 fn a_tall_bar_takes_its_room_from_the_cursor_styles_list() {
     for (width, height) in [(738.0, 418.0), (1_193.0, 516.0)] {
@@ -2401,11 +2132,6 @@ fn a_tall_bar_takes_its_room_from_the_cursor_styles_list() {
     }
 }
 
-/// ONE SEPARATOR, WHEREVER A ROW'S FACTS GO: the facts a row paints beside
-/// its name where they fit read exactly as the line they move to under it
-/// where they do not, both joined by [`FACT_SEPARATOR`] (the label line once
-/// used a wider joiner than its second line, so the same tags changed spacing
-/// with the window's width).
 #[test]
 fn a_rows_facts_read_the_same_beside_its_name_and_under_it() {
     let mut lab = Lab::new("allow_window_ops = true\n");
@@ -2435,11 +2161,6 @@ fn a_rows_facts_read_the_same_beside_its_name_and_under_it() {
     );
 }
 
-/// A SETTING'S NAME WRAPS, NEVER CUT: on a narrow window, and at large text,
-/// every row's painted name is whole — its lines joined start with the
-/// setting's name and carry no ellipsis, and the renderer's fit audit finds
-/// none of them overflowing — so two settings never read alike for the words
-/// a narrow column would cut (Security's "Allow programs to read the c…").
 #[test]
 fn a_setting_name_wraps_and_is_never_cut_off() {
     at_each_text_scale(&[1.0, 1.5], "name wrap", |scale| {
@@ -2490,8 +2211,6 @@ fn a_setting_name_wraps_and_is_never_cut_off() {
                             let Some(painted) = painted_row_label(compiled, key) else {
                                 continue;
                             };
-                            // A peek or a list's edge cuts a label on purpose;
-                            // only labels whole on screen.
                             if !row_label_shown_whole(compiled, key) {
                                 continue;
                             }
@@ -2531,17 +2250,6 @@ fn a_setting_name_wraps_and_is_never_cut_off() {
     });
 }
 
-/// THE THEME CARD'S ROWS KEEP THE ROW RULE, at every width and text scale:
-/// each row's name is painted whole, wrapped between its words, never cut —
-/// a row stacks its control under the name where both cannot share a line,
-/// and seats its Reset (or the place it keeps) as every stacked row does —
-/// and no control, nor the words drawn in it, runs out of its box. On
-/// Appearance, Top Settings and Modified, over one theme, a pair, and a pair
-/// of aterm's own (the Follow system row's Reset). (The Follow system row
-/// kept its name beside the switch and Reset's place whatever the column: at
-/// 22 columns its name got 40pt, broken inside "system", and 8pt at 2×; and
-/// Top's Window appearance kept its three segments on one line, "A…", "Li…",
-/// "D…".)
 #[test]
 fn the_theme_cards_rows_keep_the_row_rule_at_every_size() {
     const ROWS: [(&str, &str); 6] = [
@@ -2550,7 +2258,6 @@ fn the_theme_cards_rows_keep_the_row_rule_at_every_size() {
         ("theme-slot/light", "Light theme"),
         ("theme-preview-side", "Preview"),
         ("theme-browse", "More themes"),
-        // The card's other row: Top's short name at large text is "Window".
         ("window_theme", "Window"),
     ];
     const OWN: [&str; 11] = [
@@ -2577,7 +2284,6 @@ fn the_theme_cards_rows_keep_the_row_rule_at_every_size() {
                 SettingsRoute::Home,
                 SettingsRoute::Modified,
             ] {
-                // 22, 26 and 34 columns of the 12px cell, then wider.
                 for (width, height) in [
                     (178.0, 420.0),
                     (206.0, 420.0),
@@ -2638,13 +2344,6 @@ fn the_theme_cards_rows_keep_the_row_rule_at_every_size() {
     });
 }
 
-/// A ROW'S LAYOUT NEVER DEPENDS ON ITS STATE: writing a row (Changed comes)
-/// or typing into it (a draft) neither makes it taller nor moves its control
-/// or anything under it, at every width a row is laid out in — the tags are
-/// placed for the row's fullest state ([`place_row_tags`]), and a draft says
-/// so in its field. (Typing one digit into Scrollback limit used to add an
-/// "Unsaved draft" line and push the next row down; turning a permission on
-/// put "Changed" on a line of its own.)
 #[test]
 fn a_rows_layout_never_depends_on_its_state() {
     let clean = SettingsViewState::new(&Config::default());
@@ -2654,12 +2353,6 @@ fn a_rows_layout_never_depends_on_its_state() {
         if !native_advanced_key(key) {
             continue;
         }
-        // Written with its default's own value, so writing changes nothing
-        // but that it is written. A row with no default value to write (an
-        // automatic color) is written with a plain value of its kind; the
-        // theme and the fonts, whose every name is a lookup this
-        // catalog-less view may fail (a real fact the row states), are
-        // left to the tests of their own cards.
         let kind = clean.legacy.fields[index].kind;
         let raw = match crate::prefs::unset_literal(&clean.legacy.fields[index]) {
             _ if key == prefs::EDIT_THEME || font_picker_key(key) => continue,
@@ -2667,8 +2360,6 @@ fn a_rows_layout_never_depends_on_its_state() {
             _ if matches!(kind, EditKind::Color) => "#808080".to_string(),
             _ => continue,
         };
-        // As a hand-written aterm.toml holds it: a Settings write of a
-        // default removes the key, so only the file can write one.
         let item = crate::prefs::typed_toml_item(key, &raw)
             .unwrap_or_else(|error| panic!("{key} = {raw}: {error:?}"));
         let source = crate::prefs::with_toml_item("", key, item)
@@ -2706,18 +2397,12 @@ fn a_rows_layout_never_depends_on_its_state() {
                 };
                 let before = measure(&clean);
                 let after = measure(&written);
-                // A draft its row would take (an invalid one says why under
-                // the row, as a refused value does).
                 let draft = match kind {
                     EditKind::Color => "#123456",
                     EditKind::Integer => "7",
                     EditKind::Float => "1.5",
                     _ => "a draft",
                 };
-                // (The selected tab color off its own page is a way to Tab
-                // Color while it holds no draft: a draft comes from a field
-                // that shows it — search, Modified, Tab Color — and the row
-                // keeps that field while the draft lasts.)
                 let links = color_picker::tab_color_row_links(
                     &written,
                     &written.legacy.fields[index],
@@ -2746,16 +2431,9 @@ fn a_rows_layout_never_depends_on_its_state() {
             }
         }
     }
-    // The sweep reaches rows whose Changed does not fit beside the name, so
-    // the room kept for it under the name is exercised.
     assert!(reserved > 0, "a row keeps room for Changed under its name");
 }
 
-/// A BOX LAYS OUT ITS ROWS' FACTS ALIKE: Modified's two Size rows, one name
-/// a little longer than the other, put their facts beside both names or
-/// under both, at every width — never one beside and one under (the facts
-/// were fitted per row, so "Initial columns" moved them below while "Initial
-/// lines" kept them inline).
 #[test]
 fn sibling_rows_place_their_facts_alike() {
     let mut lab = Lab::new("columns = 100\nlines = 30\n");
@@ -2776,8 +2454,6 @@ fn sibling_rows_place_their_facts_alike() {
         )
         .facts_fit_inline()
     };
-    // The rows disagree on their own somewhere in the sweep: the box rule is
-    // what keeps them alike there.
     assert!(
         (200..=900)
             .step_by(2)
@@ -2799,10 +2475,6 @@ fn sibling_rows_place_their_facts_alike() {
     }
 }
 
-/// A REFUSED VALUE SAYS WHY UNDER ITS ROW ON EVERY PAGE: the reason is the
-/// row's own, so the Tab Color page and the Cursor Styles Adjust card paint
-/// it under their fields as the registry pages do (they painted only a red
-/// rim, the reason reaching the accessible name alone).
 #[test]
 fn a_refused_value_is_painted_under_its_row_on_every_page() {
     for (source, route, key, typed) in [
@@ -2838,8 +2510,6 @@ fn a_refused_value_is_painted_under_its_row_on_every_page() {
             Some(SemanticInput::Text(typed.to_string())),
         );
         assert!(lab.state().field_errors.contains_key(key), "{key}: refused");
-        // At the shipped size the picker kept room for the reason: the
-        // refusal moves nothing of it.
         assert_eq!(wheel(&lab), wheel_before, "{key}: the wheel stays put");
         let mut seen = false;
         for (width, height) in [(738.0, 418.0), (1_564.0, 854.0), (640.0, 418.0)] {
@@ -2869,10 +2539,6 @@ fn a_refused_value_is_painted_under_its_row_on_every_page() {
     }
 }
 
-/// TOP SETTINGS IS DIRECT AT EVERY SIZE: its rows' labels are the bare name,
-/// painted and never a second accessibility stop — no "Changed" spoken that
-/// is never painted, at any width or text size — while the Sound page's Music
-/// effects row, an ordinary row, still says Changed both ways.
 #[test]
 fn top_rows_speak_and_paint_their_bare_name_at_every_size() {
     at_each_text_scale(&[1.0, 1.25, 2.0], "top direct rows", |scale| {
@@ -2904,7 +2570,6 @@ fn top_rows_speak_and_paint_their_bare_name_at_every_size() {
             }
         }
     });
-    // The Sound page's Music effects row is an ordinary row: it says Changed.
     let mut lab = Lab::new("trail_sounds = false\n");
     lab.state_mut().navigate(SettingsRoute::Sound);
     let compiled = lab.compile(1_074.0, 900.0);
@@ -2923,12 +2588,6 @@ fn top_rows_speak_and_paint_their_bare_name_at_every_size() {
     );
 }
 
-/// A LANDING OPENS NO EDIT: the list's own keys (Page Down from the sidebar,
-/// Home, End, the arrows) put the keyboard on a text field as on any control,
-/// ringed and with no caret, so Home and End go on moving through the list;
-/// the field takes them for its caret only once it is typed into. (A Page
-/// Down that landed on Searchable scrollback lines used to open an edit
-/// there, and End and Home then moved a caret in an empty draft.)
 #[test]
 fn a_landing_on_a_text_field_leaves_home_and_end_to_the_list() {
     let (width, height) = (1_074.0, 684.0);
@@ -2955,8 +2614,6 @@ fn a_landing_on_a_text_field_leaves_home_and_end_to_the_list() {
         assert_eq!(lab.state().common.last_focus, want, "home={home}");
         assert!(lab.state().editing_field.is_none(), "home={home}: no edit");
     };
-    // Every landing on a text field (Home and End too: Scrollback limit is
-    // the list's first control) leaves the list's keys to the list.
     lab.state_mut().common.last_focus = Some(UiKey::new("settings/nav/terminal"));
     compile(&mut lab);
     dispatch(&mut lab, AppEvent::ScrollPage(1));
@@ -2986,7 +2643,6 @@ fn a_landing_on_a_text_field_leaves_home_and_end_to_the_list() {
     );
     edge(&mut lab, false);
     edge(&mut lab, true);
-    // Typed into, the field takes Home and End for its caret.
     dispatch(
         &mut lab,
         AppEvent::TextInput(TextInputEvent::Commit("5".to_string())),
@@ -3008,15 +2664,11 @@ fn a_landing_on_a_text_field_leaves_home_and_end_to_the_list() {
         scroll,
         "the caret moves, not the list"
     );
-    // Escape ends the edit, and End is the list's again.
     dispatch(&mut lab, AppEvent::TextInput(TextInputEvent::Cancel));
     compile(&mut lab);
     edge(&mut lab, false);
 }
 
-/// A closed font row is a list button for every key: Home and End move the
-/// list from it (they used to count as caret keys for a caret it does not
-/// draw).
 #[test]
 fn home_and_end_on_a_closed_font_row_move_the_list() {
     let (width, height) = (1_074.0, 684.0);
@@ -3050,13 +2702,6 @@ fn home_and_end_on_a_closed_font_row_move_the_list() {
     }
 }
 
-/// A SLIDER'S KEYS REACH ITS WHOLE DOMAIN, whatever span its bar draws: Font
-/// size's bar shows 8–36 px, but Right at 36 writes 37, Left at 8 writes 7,
-/// Shift-Right ten more, and a size set past the bar comes back up (59 →
-/// 60); automation reaches the domain's ends. (The bar's span had become the
-/// value's limit: Right at 36 did nothing, and after one Left from 60 the
-/// span closed behind the user at 59.) Its value keys are the arrows alone:
-/// Home and End are the list's, and write nothing.
 #[test]
 fn font_size_keys_reach_the_whole_runtime_range() {
     let key = UiKey::new(format!("settings/control/{}", prefs::EDIT_FONT_PX));
@@ -3107,8 +2752,6 @@ fn font_size_keys_reach_the_whole_runtime_range() {
             "{edge:?} on a slider is the list's key, never a value"
         );
     }
-    // A size set by automation anywhere in the domain, its ends included,
-    // is taken.
     for size in [6.0, 60.0, 200.0] {
         let mut lab = Lab::new("");
         lab.state_mut().navigate(SettingsRoute::TextFonts);
@@ -3123,11 +2766,6 @@ fn font_size_keys_reach_the_whole_runtime_range() {
     }
 }
 
-/// EVERY CONTROL SAYS ITS ROW'S NOTE: a slider and a text field carry it as
-/// their description, as a switch and a button do (Top padding's "The top
-/// cannot be more than Sides and bottom." and Scrollback limit's "0 keeps
-/// every line." reached no assistive technology: their painted lines are
-/// paint only, and their specs had no description).
 #[test]
 fn slider_and_text_field_rows_say_their_notes() {
     let mut lab = Lab::new("");
@@ -3168,12 +2806,6 @@ fn slider_and_text_field_rows_say_their_notes() {
     );
 }
 
-/// A CARD'S UNSET FIELDS MARK THEIR DEFAULTS ALIKE: on Cursor Styles'
-/// Adjust card the trail colour and its accent, both unset, either both
-/// paint "(default)" or neither does, at every text size and width, whatever
-/// each colour's name is long ("Brighter cursor color" lost its mark beside
-/// "Shifting colors (default)", "Pale blue (default)" and "Cursor color
-/// (default)"). Each field's value keeps the whole words.
 #[test]
 fn a_cards_unset_fields_mark_their_defaults_alike() {
     at_each_text_scale(&[1.0, 1.5, 2.0], "default marks", |scale| {
@@ -3239,11 +2871,6 @@ fn a_cards_unset_fields_mark_their_defaults_alike() {
     });
 }
 
-/// THE TRAIL COLOURS' NOTE SAYS WHAT THEY DO FOR THE SAVED STYLE: blank
-/// Classic shifts through colours (never "follows the cursor color"), Fire
-/// on a block does not use them, Laser keeps its violet, Comet its pale blue
-/// until a cursor colour is set; the note Modified paints and each control
-/// says is that style's, the one [`prefs::trail_color_note`] composes.
 #[test]
 fn the_trail_colors_note_names_the_saved_styles_law() {
     let words = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -3310,15 +2937,8 @@ fn the_trail_colors_note_names_the_saved_styles_law() {
     }
 }
 
-/// A NOTE A RUN OF ROWS SHARES IS THE RUN'S ([`prefs::RowNote::Shared`]):
-/// Modified listing both trail colors draws their one note once, as the stop
-/// after the second (`settings/shared-note/<key>`), apart from that row's own
-/// lines, never inside them as if that row's alone; each color's control
-/// says it. Negative control: one trail color listed alone draws the note as
-/// its own, inside its row, and no run note.
 #[test]
 fn a_note_a_run_shares_is_the_stop_after_the_run() {
-    // The two trail colours' one note, for the default style on a block.
     let note = &prefs::trail_color_note(prefs::DEFAULT_CURSOR_TRAIL_STYLE, true, false);
     let words = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
     for (width, height) in [(1_074.0, 900.0), (584.0, 900.0), (390.0, 900.0)] {
@@ -3374,7 +2994,6 @@ fn a_note_a_run_shares_is_the_stop_after_the_run() {
                 "{width}: {key}'s control says the note"
             );
         }
-        // After the closing row, whole, set apart.
         let row_bottom = compiled
             .paint
             .iter()
@@ -3391,8 +3010,6 @@ fn a_note_a_run_shares_is_the_stop_after_the_run() {
             "{width}: the run note {:?} follows its run's last row (bottom {row_bottom})",
             shared[0].rect
         );
-        // Read by no one twice: no words of its own for assistive
-        // technology (the controls say it), its lines paint only.
         assert!(
             compiled
                 .semantic(&shared[0].key)
@@ -3411,7 +3028,6 @@ fn a_note_a_run_shares_is_the_stop_after_the_run() {
             "{width}: the run note's lines paint only"
         );
     }
-    // One trail color alone: the note is its row's own.
     let mut lab = Lab::new("cursor_trail_color = \"#FF0000\"\n");
     lab.state_mut().navigate(SettingsRoute::Modified);
     let compiled = lab.compile(1_074.0, 900.0);
@@ -3439,13 +3055,6 @@ fn a_note_a_run_shares_is_the_stop_after_the_run() {
     );
 }
 
-/// A ONE-LINE ROW LEAVES ITS NAME ITS MEASURE BESIDE EVERYTHING ITS LINE
-/// HOLDS: what a row seats beside its control (the Theme row's Browse
-/// themes…, a search hit's Choose… for the tab color) comes out of the
-/// control's room, and the row stacks before its name would get less than
-/// its floor ([`one_line_name_floor`]). (At 80x24 Appearance's Color theme row went
-/// one line with its name cut to "Color" / "the…" in 32pt, beside its picker
-/// and Browse themes….)
 #[test]
 fn a_one_line_row_leaves_its_name_room_beside_everything_on_its_line() {
     for search in ["", "tab color"] {
@@ -3482,8 +3091,6 @@ fn a_one_line_row_leaves_its_name_room_beside_everything_on_its_line() {
                 text_width += 4.0;
             }
         }
-        // The sweep reaches one-line rows that seat something beside their
-        // control, so the measure above is the one under test.
         assert!(
             seated > 0,
             "{search:?}: a one-line row with something beside its control"
@@ -3491,18 +3098,6 @@ fn a_one_line_row_leaves_its_name_room_beside_everything_on_its_line() {
     }
 }
 
-/// PAGE DOWN NEVER SHOWS AGAIN A ROW IT SHOWED WHOLE (ONE MEASURE): a row a
-/// screen draws whole and live in its room — the one a status bar leaves it
-/// — with the words under it (its note) whole too counts as shown, its
-/// card's padding cut or not, so the next screen starts after it; and a row
-/// drawn in the strip under the room is a fading picture, never one the
-/// screen showed. Judged from what is drawn, on the field pages at 80×24 and
-/// the shipped 102×29, until the last screen (which fills itself from the
-/// stops before it). A line of the note that the room's edge cuts away
-/// entirely is not drawn at all, so the note's block is judged whole too: in
-/// Noto Sans, Security's notifications row keeps a blank line for its tags
-/// and has its words on the line under it, which the 80×24 room's edge cuts
-/// away whole.
 #[test]
 fn page_down_never_repeats_a_row_it_showed_whole() {
     let whole_rows = |compiled: &crate::native_ui::CompiledUi, list: LogicalRect, room: f32| {
@@ -3517,7 +3112,6 @@ fn page_down_never_repeats_a_row_it_showed_whole() {
         rows.iter()
             .enumerate()
             .filter(|(index, row)| {
-                // The words under the row, down to the next row: its note.
                 let below = rows
                     .get(index + 1)
                     .map_or(f32::INFINITY, |next| next.rect.y);
@@ -3565,8 +3159,6 @@ fn page_down_never_repeats_a_row_it_showed_whole() {
                 let (plan, view) = lab.state().scroll_shown().expect("a list");
                 let (list, room) = compiled_list(&compiled, &plan).expect("the list");
                 let next = whole_rows(&compiled, list, room);
-                // The last screen, seated where the list's end puts it (it
-                // may show whole a stop over its seat, drawn over its top).
                 let top = lab
                     .state()
                     .scroll_record
@@ -3590,14 +3182,6 @@ fn page_down_never_repeats_a_row_it_showed_whole() {
     assert!(turned > 0, "some screen turns to one that is not the last");
 }
 
-/// A PRESS NEVER MOVES A CONTROL THE SCREEN SHOWS WHOLE, AND THE BAR IT
-/// BRINGS NEVER COVERS IT: on the field pages at the shipped 102×29 and
-/// 150×48, toggling the last switch the list's room shows whole leaves
-/// it where it was, under the status bar's edge — the strip under the room,
-/// which the bar takes, holds only a picture — and the first switch the
-/// room's edge cuts, the screen's fading peek, comes whole into the room
-/// for a press on its picture and then toggles where it is, never under
-/// the bar.
 #[test]
 fn a_press_never_moves_a_whole_control_and_brings_a_cut_one_whole() {
     let mut cut_pressed = 0;
@@ -3650,9 +3234,6 @@ fn a_press_never_moves_a_whole_control_and_brings_a_cut_one_whole() {
                             _ => None,
                         })
                 };
-                // A switch over the room's edge is the screen's peek, a
-                // picture: a press on it scrolls it whole into the room and
-                // works nothing, and the next one works it.
                 let (rect, before) = if cut {
                     assert_eq!(
                         value(&before),
@@ -3675,7 +3256,6 @@ fn a_press_never_moves_a_whole_control_and_brings_a_cut_one_whole() {
                 let Some(on) = value(&before) else {
                     continue;
                 };
-                // A pointer press moves the keyboard to the control first.
                 lab.state_mut().common.last_focus = Some(control.clone());
                 lab.commit(
                     &format!("settings/set/{key}"),
@@ -3710,19 +3290,6 @@ fn a_press_never_moves_a_whole_control_and_brings_a_cut_one_whole() {
     );
 }
 
-/// A PRESS ON A CONTROL AN EDGE OF THE ROOM CUTS KEEPS IT UNDER THE POINTER
-/// (lead-known-open #31), as a platform list scrolls a clicked row into view
-/// by its hidden part: pressed anywhere it shows in the room, the switch
-/// lands whole in the room and the point it was pressed at is on it still —
-/// one cut at the top of a last screen, live where it shows, turns once; one
-/// the room's bottom edge cuts on a first screen is the screen's peek,
-/// fading from its top, a picture a press scrolls in and works nothing on
-/// (ONE BOUNDARY, [`scroll::ScrollPlan::screen`]): drawn whole and at full
-/// strength over the edge, it answered a press over its upper part only, and
-/// Page Down turned onto it again. A stop's worth of scroll (the least whole
-/// stop, 48pt or more) carried a bottom one out from under the pointer: at
-/// 150×48 Window's last switch went from 592 to 526 under a pointer at 597,
-/// its hover left behind; a top one came down past a pointer near its cut.
 #[test]
 fn a_press_on_a_cut_control_keeps_it_under_the_pointer() {
     let mut pressed = [0, 0];
@@ -3744,7 +3311,6 @@ fn a_press_on_a_cut_control_keeps_it_under_the_pointer() {
             (1_193.0, 516.0),
             (1_564.0, 854.0),
         ] {
-            // The first screen (its bottom edge) and the last (its top).
             for last in [false, true] {
                 let mut lab = Lab::new("");
                 lab.state_mut().navigate(route);
@@ -3775,8 +3341,6 @@ fn a_press_on_a_cut_control_keeps_it_under_the_pointer() {
                         (key.to_string(), top, bottom, node.fade)
                     })
                 });
-                // At the last screen's top, a switch the edge drew without its
-                // name, or a sliver of: not drawn, its picture the list's.
                 let veiled = || {
                     before.list_pictures.iter().find_map(|picture| {
                         let key = picture.key.as_str().strip_prefix("settings/control/")?;
@@ -3801,9 +3365,6 @@ fn a_press_on_a_cut_control_keeps_it_under_the_pointer() {
                 let control = UiKey::new(format!("settings/control/{key}"));
                 let was_picture = live.is_none();
                 let on = if last && live.is_none() {
-                    // Drawn without its name, or a sliver of it: a press on
-                    // its picture scrolls it whole into view and works
-                    // nothing.
                     lab.dispatch(AppEvent::PressListPicture(control.clone()));
                     match lab
                         .compile(width, height)
@@ -3815,9 +3376,6 @@ fn a_press_on_a_cut_control_keeps_it_under_the_pointer() {
                         None => panic!("{route:?} {width}×{height}: {key} scrolled in"),
                     }
                 } else if last {
-                    // The press names its control, not a point (a commit
-                    // with the switch focused), so one press answers for a
-                    // pointer anywhere on what shows.
                     let Some(crate::native_ui::SemanticValue::Bool(on)) = live else {
                         panic!("{route:?} {width}×{height}: {key} cut at the top is live");
                     };
@@ -3828,7 +3386,6 @@ fn a_press_on_a_cut_control_keeps_it_under_the_pointer() {
                     );
                     !on
                 } else {
-                    // The peek: fading from its top, a picture.
                     assert!(
                         live.is_none() && fade.is_some_and(|(top, _)| top <= shown_top + 0.5),
                         "{route:?} {width}×{height}: {key} over the room's edge is a fading \
@@ -3848,7 +3405,6 @@ fn a_press_on_a_cut_control_keeps_it_under_the_pointer() {
                 let now = rect_of(&after, control.as_str());
                 let (plan, _) = lab.state().scroll_shown().expect("a list");
                 let (list, room) = compiled_list(&after, &plan).expect("the list");
-                // Pressed at the top, the middle and the bottom of what shows.
                 for at in [
                     shown_top + 1.0,
                     (shown_top + shown_bottom) / 2.0,
@@ -3872,7 +3428,6 @@ fn a_press_on_a_cut_control_keeps_it_under_the_pointer() {
                     );
                 }
                 if was_picture {
-                    // Whole now, the next press works it and moves nothing.
                     lab.state_mut().common.last_focus = Some(control.clone());
                     lab.commit(
                         &format!("settings/set/{key}"),
@@ -3895,23 +3450,9 @@ fn a_press_on_a_cut_control_keeps_it_under_the_pointer() {
     );
 }
 
-/// THE NUDGE A PRESS GAVE THE LIST STANDS UNTIL THE LIST SCROLLS: after a
-/// press scrolled a cut switch whole by its hidden part — up at a first
-/// screen's bottom edge (a press on its picture there), down at a last
-/// screen's top — a press on another
-/// switch the screen shows whole, and the keyboard moving to a control it
-/// shows whole, move nothing, as a platform list holds the place a click
-/// scrolled it to; and a scroll puts the list back on its stops, at an end of
-/// the list too (the wheel up at its top shows the top again, down at its end
-/// the end). The nudge was the pressed control's alone: at 150×48 Window, a
-/// press on Tab status badge after Mark connected sessions on tabs had nudged
-/// the list sent the list back down 20pt, the switch out from under a
-/// pointer at its top and the first one cut again.
 #[test]
 fn a_press_nudge_stands_until_the_list_scrolls() {
     let mut checked = [0, 0];
-    // The keyboard's moves that held the nudge, at each edge, and those that
-    // showed a stop the nudged screen cut.
     let mut held = [0, 0];
     let mut revealed_whole = 0;
     for route in [
@@ -3952,7 +3493,6 @@ fn a_press_nudge_stands_until_the_list_scrolls() {
                         })
                         .collect::<Vec<_>>()
                 };
-                // The first press: a switch an edge of the room cuts.
                 let nudged = |lab: &mut Lab| {
                     lab.state_mut().navigate(route);
                     let before = if last {
@@ -3963,9 +3503,6 @@ fn a_press_nudge_stands_until_the_list_scrolls() {
                     let (plan, _) = lab.state().scroll_shown().expect("a list");
                     let (list, room) = compiled_list(&before, &plan).expect("the list");
                     let edge = list.y + room;
-                    // At the last screen's top: a switch the edge cuts, live
-                    // under its name — or, drawn without its name or a sliver
-                    // of, its picture (`None` for its rect until it shows).
                     let (key, rect) = if last {
                         match switches(&before)
                             .into_iter()
@@ -3980,7 +3517,6 @@ fn a_press_nudge_stands_until_the_list_scrolls() {
                             })?,
                         }
                     } else {
-                        // Over the room's edge, the screen's peek: a picture.
                         before
                             .paint
                             .iter()
@@ -4017,7 +3553,6 @@ fn a_press_nudge_stands_until_the_list_scrolls() {
                     }
                     let after = lab.compile(width, height);
                     let now = rect_of(&after, &control);
-                    // A picture cut at the top showed the switch's foot.
                     let rect = rect.or_else(|| {
                         picture.map(|shown| {
                             LogicalRect::new(
@@ -4029,7 +3564,6 @@ fn a_press_nudge_stands_until_the_list_scrolls() {
                         })
                     })?;
                     let moved = now.y - rect.y;
-                    // Nudged by its hidden part, not seated a stop further on.
                     let nudged = if last {
                         moved > 0.5 && moved < rect.height
                     } else {
@@ -4041,10 +3575,6 @@ fn a_press_nudge_stands_until_the_list_scrolls() {
                 let Some((_, after, first, list, edge)) = nudged(&mut lab) else {
                     continue;
                 };
-                // Shown whole as the keyboard reads it — the switch and its
-                // stop's words ([`Reveal::Keep`]) — so its move to it has
-                // nothing to bring into view: a nudge back at a last screen's
-                // top cuts what ended flush at its bottom.
                 let (shown, view) = lab.state().scroll_shown().expect("a list");
                 let whole = switches(&after)
                     .into_iter()
@@ -4062,15 +3592,6 @@ fn a_press_nudge_stands_until_the_list_scrolls() {
                 let Some((second, _, _, on)) = whole.last().cloned() else {
                     continue;
                 };
-                // The keyboard shows a control's whole stop, its words too
-                // (`Reveal::Keep`), so the control it moves to here is the
-                // last the nudged screen shows whole with its row and the
-                // lines under it — whole as the keyboard reads it: all it
-                // draws, its name, control and lines, its row's padding
-                // over them cut or not. (A press's 3pt nudge cut that much
-                // of Music effects' row over its name and switch at Sound's
-                // 584×376 in Cantarell, which the keyboard's move to it
-                // rightly left as it was.)
                 let stop_whole = |key: &str| {
                     let drawn_top = after
                         .paint
@@ -4107,8 +3628,6 @@ fn a_press_nudge_stands_until_the_list_scrolls() {
                 let context =
                     format!("{route:?} {width}×{height} last={last} {first} then {second}");
                 let second = format!("settings/control/{second}");
-                // Where each is drawn: before the first press, the switch the
-                // room's edge cut was the screen's peek, a picture.
                 let place = |compiled: &crate::native_ui::CompiledUi| {
                     let drawn = |key: &str| {
                         compiled
@@ -4120,8 +3639,6 @@ fn a_press_nudge_stands_until_the_list_scrolls() {
                     };
                     (drawn(&first), drawn(&second))
                 };
-                // A press on another switch the nudged screen shows whole, the
-                // keyboard moved to it by the pointer's press first.
                 lab.state_mut().common.last_focus = Some(UiKey::new(second.as_str()));
                 lab.commit(
                     &format!(
@@ -4130,8 +3647,6 @@ fn a_press_nudge_stands_until_the_list_scrolls() {
                     ),
                     Some(SemanticInput::Bool(!on)),
                 );
-                // (What it turned may retell the rows around it, so only the
-                // pressed switch is held to its place.)
                 let pressed = lab.compile(width, height);
                 assert_eq!(
                     rect_of(&pressed, &second),
@@ -4145,11 +3660,6 @@ fn a_press_nudge_stands_until_the_list_scrolls() {
                     Some(crate::native_ui::SemanticValue::Bool(!on)),
                     "{context}: the second switch turned"
                 );
-                // The keyboard moving to a control it shows whole, words too,
-                // moves nothing. Where the nudged screen shows no control's
-                // whole stop (the edge cuts the words under the last whole
-                // switch), the keyboard's move to that switch shows its whole
-                // stop, as the keyboard always does.
                 let mut lab = Lab::new("");
                 let (before, after, ..) = nudged(&mut lab).expect("nudged as before");
                 if let Some(keyboard) = &keyboard {
@@ -4191,10 +3701,6 @@ fn a_press_nudge_stands_until_the_list_scrolls() {
                     );
                     revealed_whole += 1;
                 }
-                // A scroll past the end it is at puts the list back on its
-                // stops: the wheel up at its top shows the top; down at its
-                // end, the end — as it sits with the bar the press brought up,
-                // its last card whole in the room the bar leaves.
                 dispatch(&mut lab, AppEvent::ScrollLines(if last { 1 } else { -1 }));
                 let wheeled = lab.compile(width, height);
                 if last {
@@ -4225,13 +3731,6 @@ fn a_press_nudge_stands_until_the_list_scrolls() {
     );
 }
 
-/// A STYLE CHOSEN STAYS UNDER THE POINTER: on the Cursor Styles landing and
-/// the screen after it, every style row a person can press, saved or not,
-/// whole in the list's room keeps its place when pressed — the bar the
-/// choice brings up takes only the strip under that room, which holds a
-/// picture, never a row to press — and one the room's edge cuts comes whole
-/// into the room; the bar never covers either (cs-32, cs-35: a row drawn whole in that strip
-/// was live, and pressing it scrolled the list a stop under the pointer).
 #[test]
 fn a_style_chosen_from_the_list_stays_under_the_pointer_when_the_bar_comes() {
     for (width, height) in [
@@ -4276,7 +3775,6 @@ fn a_style_chosen_from_the_list_stays_under_the_pointer_when_the_bar_comes() {
                     let mut lab = Lab::new(&config);
                     let _ = landing(&mut lab);
                     let context = format!("{width}×{height} {saved} screen {screen}: {key}");
-                    // A pointer press moves the keyboard to the row first.
                     lab.state_mut().common.last_focus = Some(UiKey::new(key.as_str()));
                     let _ = lab.press(&key);
                     let after = lab.compile(width, height);
@@ -4314,20 +3812,6 @@ fn a_style_chosen_from_the_list_stays_under_the_pointer_when_the_bar_comes() {
     }
 }
 
-/// A CHANGE MOVES NOTHING ON A COMPACT PAGE (THE COMPACT STATUS RULE): at
-/// 80×24, 60×20 and the shipped 102×29 at 1× text, and at 568×320 and
-/// 102×29 at 1.5×, a change's status and Undo come where the page kept room
-/// for them — in the compact toolbar at its own height where stacking them
-/// would leave the page under its floor, else in the bar under the list, in
-/// the room the list kept — so the toolbar, the page's heading, its preview,
-/// its list's place, and every control the list showed over the changed row
-/// keep their rects (the changed row's own tags are a row's anatomy, not the
-/// bar's); its list's room too, but for what a status whose words take more
-/// than that room (read whole, on their lines) takes from its bottom. A docked
-/// status gives Search back, and the change stays undoable. NEGATIVE
-/// CONTROL: under the fixed 480pt cutoff the 60×20 dock stacked Undo under
-/// the words and the toolbar grew by 60pt; under the 220pt dock floor 80×24
-/// neither docked the bar nor kept its room, and the list lost 44pt.
 #[test]
 fn a_change_moves_nothing_at_any_compact_size() {
     at_each_text_scale(&[1.0, 1.5], "a change moves nothing", |scale| {
@@ -4366,17 +3850,11 @@ fn a_change_moves_nothing_at_any_compact_size() {
                     .state()
                     .scroll_plan()
                     .map_or(0.0, |plan| plan.overhang());
-                // Whether the list fitted whole in its room and the strip the
-                // page keeps for a bar (`scroll::seat_room`: only words and
-                // padding in the strip), and so took both.
                 let whole_before = lab
                     .state()
                     .scroll_plan()
                     .is_some_and(|plan| plan.limit() == 0 && plan.view(0).end == plan.len());
                 let list = rect_of(&before, "settings/list");
-                // The page's own anchors. A title the compact toolbar carries gives
-                // its place to a status the toolbar docks, as Search does; the
-                // page under the toolbar keeps its place.
                 let fixed = |compiled: &crate::native_ui::CompiledUi| {
                     let toolbar = compiled
                         .semantic(&UiKey::new("settings/compact-toolbar"))
@@ -4427,13 +3905,6 @@ fn a_change_moves_nothing_at_any_compact_size() {
                 assert_eq!(fixed_before, fixed(&after), "{context}: the page moved");
                 let room_after = lab.state().scroll_plan().map(|plan| plan.room());
                 if room_after != room {
-                    // A list that took the strip as well gives the bar that
-                    // comes exactly the strip, and nothing it showed moves.
-                    // A status whose words take more than the room the page
-                    // kept for one (two lines in the dock's row at 60x20, so
-                    // it stands under the page) takes the rest from the
-                    // page's bottom inset, down to the leanest, then from the
-                    // list's bottom, and nothing over it moves.
                     let bar = rect_of(&after, "settings/feedback").height;
                     let lost = room.zip(room_after).map(|(before, after)| before - after);
                     let inset = page_chrome_insets(
@@ -4457,8 +3928,6 @@ fn a_change_moves_nothing_at_any_compact_size() {
                     );
                 }
                 assert_eq!(rect_of(&after, "settings/list").y, list.y, "{context}");
-                // The rows over the changed one: its own row may take a line
-                // for the tag the change gives it, and move what is under it.
                 let changed_top = shown_before
                     .iter()
                     .find(|(key, _)| *key == control)
@@ -4515,12 +3984,6 @@ fn a_change_moves_nothing_at_any_compact_size() {
     });
 }
 
-/// A CHANGE FROM THE KEYBOARD MOVES NOTHING ON THE FIRST SCREEN EITHER: at
-/// 80x16, Follow system turned on with Space grew the theme card's rows; the
-/// page, choosing its chrome again, gave the bar's room to its list, the
-/// preview went into the list, and the switch the keyboard was on jumped
-/// 78pt up. The chrome, and where the preview stands, are kept until the
-/// list scrolls, as for a press.
 #[test]
 fn a_change_from_the_keyboard_moves_nothing_on_the_first_screen() {
     at_each_text_scale(&[1.0], "keyboard change", |_| {
@@ -4543,13 +4006,6 @@ fn a_change_from_the_keyboard_moves_nothing_on_the_first_screen() {
     });
 }
 
-/// A STATUS SEARCH SET ASIDE NEVER HIDES A LATER ONE: at 80×24, where a
-/// change's status docks in Search's place, pressing the dock's Search sets
-/// that status aside; the next change's status shows, and so does the one
-/// after it, though its words are those of the status set aside (a switch
-/// turned off, on, and off again), with its Undo. NEGATIVE CONTROL: the
-/// status set aside was matched by its words alone, so the third change
-/// showed no status and no Undo at all.
 #[test]
 fn a_status_search_set_aside_never_hides_a_later_one() {
     let (width, height) = (584.0, 348.0);
@@ -4598,15 +4054,6 @@ fn a_status_search_set_aside_never_hides_a_later_one() {
     }
 }
 
-/// A BAR BUTTON KEEPS ITS WORDS AND SAYS THEM: in every bar that offers
-/// buttons — one draft and two, on a page and on Modified, the discard
-/// question for one and for all, the Reset All question — at 1×, 1.5× and
-/// 2× text, from a phone's 286.5pt to a wide window, each button paints its
-/// own words whole (the layout gives — side by side, equal shares, one under
-/// another — never the words), its accessible name holds those words, and
-/// it is drawn whole inside the window, clear of the status and the other
-/// buttons. NEGATIVE CONTROL: the short-words fallback painted "View",
-/// "Drop", "Keep" and "Reset", none of them in their buttons' names.
 #[test]
 fn a_bar_button_keeps_its_words_and_says_them() {
     const BUTTONS: [&str; 5] = [
@@ -4704,7 +4151,6 @@ fn a_bar_button_keeps_its_words_and_says_them() {
                     );
                     painted.push(node.rect);
                 }
-                // Modified offers Discard alone: it is where Review leads.
                 let offered = if variant == "modified" { 1 } else { 2 };
                 assert_eq!(
                     painted.len(),
@@ -4725,15 +4171,6 @@ fn a_bar_button_keeps_its_words_and_says_them() {
     });
 }
 
-/// THE RESET ALL QUESTION IS NEVER CUT: in compact windows (80x24, 60x12
-/// and a 22-column window, at 1.5x and 2x text) it stands whole over the
-/// page where it can, and where the window is too short for that it takes
-/// the page's place, Cancel and Reset All whole in the window under it;
-/// either way the keyboard is on Cancel, nothing docks it in the toolbar's
-/// one line, and every line of its words is painted whole on some screen
-/// (Page Down walks them), together the whole question. Escape gives the
-/// page's list back where it was. NEGATIVE CONTROL: where it takes the page,
-/// the dock it took before cut its words ("Reset 9 settings? It a…").
 #[test]
 fn the_reset_all_question_is_never_cut() {
     let source = "theme = \"Nord\"\ncursor_blink = false\nfont_px = 18\n\
@@ -4747,7 +4184,6 @@ fn the_reset_all_question_is_never_cut() {
             let mut lab = Lab::new(source);
             lab.state_mut().navigate(SettingsRoute::Modified);
             let _ = lab.compile(width, height);
-            // The page's list, scrolled on, to come back to.
             lab.dispatch(AppEvent::ScrollPage(1));
             let _ = lab.compile(width, height);
             let scrolled = lab.state().page_scroll;
@@ -4884,13 +4320,6 @@ fn the_reset_all_question_is_never_cut() {
     );
 }
 
-/// THE RESET ALL QUESTION TAKES THE PAGE WHERE ITS BAR IS TALLER THAN THE
-/// WINDOW, AT ANY WIDTH (#92): at 220x12 at 2× text its bar under the page
-/// was 192pt in a 180pt window, Cancel and Reset All cut by the window's
-/// bottom (clipped, their words overflowing). It takes the page's place
-/// beside the sidebar instead: its words on lines of a list of their own,
-/// each whole on some screen, Cancel and Reset All whole under it, the
-/// page audit clean on every screen.
 #[test]
 fn the_reset_all_question_takes_the_page_where_its_bar_is_taller_than_the_window() {
     at_each_text_scale(&[2.0], "wide question", |_| {
@@ -4898,7 +4327,6 @@ fn the_reset_all_question_takes_the_page_where_its_bar_is_taller_than_the_window
         let mut lab = Lab::new("");
         lab.state_mut().navigate(SettingsRoute::Security);
         let _ = lab.compile(width, height);
-        // A change Reset All turns back, and says it does.
         lab.commit("settings/set/allow_osc52_query", None);
         let _ = lab.compile(width, height);
         assert!(lab.invoke("settings/reset-all", None).is_none());
@@ -4938,7 +4366,6 @@ fn the_reset_all_question_takes_the_page_where_its_bar_is_taller_than_the_window
             before = Some(top);
             lab.dispatch(AppEvent::ScrollPage(1));
         }
-        // Its question, what else it reaches, and what it keeps.
         for part in [
             "settings/status/visual",
             "settings/status/reach",
@@ -4952,16 +4379,6 @@ fn the_reset_all_question_takes_the_page_where_its_bar_is_taller_than_the_window
     });
 }
 
-/// RESET ALL NAMES WHAT IT TURNS BACK ON: where the reset clears keys that
-/// act beyond the window — aterm's updates, its tool downloads, the
-/// harness's approvals — set away from their defaults, its question names
-/// each with the default it goes back to and says the downloads may follow,
-/// on its bar (wrapped whole, standing over the waiting page even at 80×24,
-/// never cut to the dock's one line) and in its accessible words, and the
-/// confirm button's name says it too; nothing is written before the
-/// confirm. A reset of a theme and a cursor blink says no
-/// more than its count. NEGATIVE CONTROL: the question was built from the
-/// count alone ("Reset 6 settings? Keys only in aterm.toml stay.").
 #[test]
 fn reset_all_names_what_it_turns_back_on() {
     let source = "theme = \"Nord\"\n[update]\nenabled = false\nauto_apply = false\n\
@@ -4998,8 +4415,6 @@ fn reset_all_names_what_it_turns_back_on() {
                 confirm.label
             );
         }
-        // The question stands whole over the waiting page, never cut to the
-        // dock's one line: the reach wrapped in lines of its own.
         assert!(
             compiled
                 .semantic(&UiKey::new("settings/status-dock"))
@@ -5039,11 +4454,6 @@ fn reset_all_names_what_it_turns_back_on() {
                 "{context}: {key} {button:?} is in the window"
             );
         }
-        // The waiting page gives way to the question without being cut by its
-        // own edge: what it has no room for is not drawn (at 80×24 the
-        // summary under the heading used to be cut 5pt by the page's edge),
-        // and its list never runs past the room it has
-        // ([`scroll::ScrollPlan::screen`]).
         let audit = compiled.paint_audit_lines().remove(0);
         assert!(
             audit.contains(" overflow=0 ") && audit.contains(" clipped=0 "),
@@ -5078,12 +4488,6 @@ fn reset_all_names_what_it_turns_back_on() {
     );
 }
 
-/// THE COLOR THEME ROW HOLDS EVERYTHING ON ITS LINE, at every window width
-/// and text scale: on the screen that shows it whole (its picker live over
-/// all of it), its name is whole and its picker and Reset lie inside the
-/// row, none cut by an edge. (With Browse themes… beside them, the row
-/// overran its 488pt at 80 columns of a 15px font: Reset cut to 56 of its
-/// 72pt.)
 #[test]
 fn the_color_theme_row_holds_its_picker_and_reset_at_every_width() {
     const OWN: [&str; 4] = [
@@ -5095,8 +4499,6 @@ fn the_color_theme_row_holds_its_picker_and_reset_at_every_width() {
     let picker = UiKey::new("settings/control/theme");
     at_each_text_scale(&[1.0, 1.25, 1.5, 2.0], "color theme row", |scale| {
         for route in [SettingsRoute::Appearance, SettingsRoute::Modified] {
-            // 22 columns of the 12px cell up to a wide window, in steps
-            // finer than any control.
             let mut width = 178.0;
             while width <= 1_480.0 {
                 let height = 760.0;
@@ -5152,9 +4554,6 @@ fn the_color_theme_row_holds_its_picker_and_reset_at_every_width() {
                                 "{context}: the row paints its whole name: {painted:?}"
                             );
                         }
-                        // Beside the picker, the name keeps its floor on its
-                        // line; where it cannot, the row stacks the picker
-                        // under it.
                         let label = compiled
                             .paint
                             .iter()
@@ -5201,13 +4600,6 @@ fn the_color_theme_row_holds_its_picker_and_reset_at_every_width() {
     });
 }
 
-/// EVERY ONE-LINE ROW LEAVES ITS NAME ITS FLOOR beside everything on its
-/// line ([`one_line_name_floor`]), on every page, at every window width and
-/// text scale: where the control cannot give up enough width, the row
-/// stacks it under the name. (Harness' Question priority kept its three
-/// segments and Reset beside a 44pt name at 760pt, broken inside the word
-/// "Question"; Music effects on a phone-width Sound page at 1.25× was
-/// measured without the place Reset keeps, its name 80 of its 96pt.)
 #[test]
 fn a_one_line_rows_name_keeps_its_floor_on_every_page() {
     at_each_text_scale(&[1.0, 1.25, 1.5, 2.0], "one-line rows", |scale| {
@@ -5239,7 +4631,6 @@ fn a_one_line_rows_name_keeps_its_floor_on_every_page() {
                             let Some(semantic) = compiled.semantic(&label.key) else {
                                 continue;
                             };
-                            // The name, without the tags after it.
                             let name = semantic.label.split(" \u{b7} ").next().unwrap_or_default();
                             let control = format!("settings/control/{key}");
                             let segments = format!("settings/segments/{key}");
@@ -5272,26 +4663,6 @@ fn a_one_line_rows_name_keeps_its_floor_on_every_page() {
     });
 }
 
-/// THE LIST KEEPS ITS PLACE BY ITS STOPS, NOT THEIR NUMBER (#62): a text
-/// size change measures the list into other stops — Themes at 80×24 lists
-/// its demo and strip as its first stops at 2× text, where they were pinned
-/// over it at 1×; Harness splits rows into parts and lists notes that hold
-/// no control — and the list kept the NUMBER of the stop it was at, so it
-/// showed another part of the list. It keeps the stop itself, by what it
-/// lists: the screen starts with the stop that lists what the last one
-/// started with — or, where no stop lists that any more, the first stop
-/// after it that is listed — at 2× and back at 1×, with the keyboard off the
-/// list (on the search field, on the sidebar row that opened the page) as
-/// with none, whether or not the scroll settled on the 2× screen before the
-/// change back (a 2× screen past the 1× list's last kept its place too), and
-/// the next frame at either size, nothing between, draws the same screen:
-/// Home at 1564x180 drew its 2× screen from the stop it was at, and the next
-/// frame from the stop after, where the scroll it was asked for stood. On
-/// a list's last screen, which starts where the list's end puts it, the
-/// stop is on the screen whole. At 80×24 and 102×29, and at the short
-/// windows 60×20, 102×12, 80×16 and 220×12, where what a screen starts with
-/// is often listed otherwise at the other size
-/// ([`a_text_size_change_keeps_a_screen_that_starts_with_what_it_lists_otherwise`]).
 #[test]
 fn a_text_size_change_keeps_the_list_at_the_stop_it_was_at() {
     let set_scale = |scale: f32| {
@@ -5302,8 +4673,6 @@ fn a_text_size_change_keeps_the_list_at_the_stop_it_was_at() {
             },
         );
     };
-    // The list as it is, where its screen starts, and whether that screen
-    // is the list's last.
     let place = |lab: &Lab| {
         let (plan, shown) = lab.state().scroll_shown().expect("a list");
         let top = lab
@@ -5315,9 +4684,6 @@ fn a_text_size_change_keeps_the_list_at_the_stop_it_was_at() {
         let last = top >= plan.limit();
         (plan, shown, last, top)
     };
-    // The stop of `to` the screen of `from` starting at `start` is kept at:
-    // the one that lists what `start` did, else as far over the first stop
-    // after it `to` lists as that stop was.
     let kept = |from: &scroll::ScrollPlan, start: usize, to: &scroll::ScrollPlan| {
         (start..from.len()).find_map(|stop| {
             from.identities(stop)
@@ -5325,16 +4691,12 @@ fn a_text_size_change_keeps_the_list_at_the_stop_it_was_at() {
                 .map(|index| (start + index).saturating_sub(stop).min(to.limit()))
         })
     };
-    // Whether a screen showing `shown` keeps stop `want`: it starts with
-    // it, or, the list's last screen, shows it.
     let keeps = |shown: &std::ops::Range<usize>, last: bool, want: Option<usize>| {
         want.is_none_or(|want| shown.start == want || (last && shown.contains(&want)))
     };
     let moved = std::sync::atomic::AtomicUsize::new(0);
     let checked = std::sync::atomic::AtomicUsize::new(0);
     let faults = std::sync::Mutex::new(Vec::new());
-    // Each window of each page under each keyboard place is a fresh lab of
-    // its own: spread over a few threads, each at its own text size.
     let places = [None, Some("settings/search"), Some("settings/nav/themes")]
         .into_iter()
         .flat_map(|focus| {
@@ -5421,7 +4783,6 @@ fn a_text_size_change_keeps_the_list_at_the_stop_it_was_at() {
                             ));
                     }
                     let (_, shown_back, last, _) = place(&lab);
-                    // A list at its top stays there.
                     let want = if top_two == 0 {
                         Some(0)
                     } else {
@@ -5456,17 +4817,6 @@ fn a_text_size_change_keeps_the_list_at_the_stop_it_was_at() {
     );
 }
 
-/// A SCREEN THAT STARTS WITH WHAT THE OTHER TEXT SIZE LISTS OTHERWISE KEEPS
-/// ITS PLACE (the narrow-width check of #88): from a 1× screen whose first
-/// stop 2× text lists otherwise, the 2× screen starts with what it started
-/// with. Themes at 60x20: the Built-in caption, a stop at 1×, heads the
-/// Default card at 2×, and the screen started a card up, with Linen. Home at
-/// 220x12: the Playful effects title row, a stop at 1×, is its heading alone
-/// at 2×, over the Trail sounds row, and the screen started a row up. Home at
-/// 102x12: the cursor-trail specimen, which 2× lists no more under its
-/// card's title, kept the stop's number, and the Text card showed.
-/// Appearance at 220x12: the list's last screen, whose first stop the Output
-/// streak row is, started a stop past it at 2×, on the row's note.
 #[test]
 fn a_text_size_change_keeps_a_screen_that_starts_with_what_it_lists_otherwise() {
     let set_scale = |scale: f32| {
@@ -5497,7 +4847,6 @@ fn a_text_size_change_keeps_a_screen_that_starts_with_what_it_lists_otherwise() 
             Some("settings/top/cursor-trail/preview"),
             "settings/top/cursor-trail/title-row",
         ),
-        // The list's last screen.
         (
             SettingsRoute::Appearance,
             (1_564.0, 180.0),
@@ -5536,14 +4885,6 @@ fn a_text_size_change_keeps_a_screen_that_starts_with_what_it_lists_otherwise() 
     assert!(faults.is_empty(), "{faults:#?}");
 }
 
-/// THE AUDIT JUDGES EVERY SCREEN OF EVERY PAGE, OVERLAPS INCLUDED (#50): on
-/// every page, at the 80×24, 102×29 and 150×48 windows, at 1× and 2× text,
-/// in a dark theme and a light one, every screen of its list paints no word
-/// cut off, overflowing or clipped by accident, no two marks over each
-/// other ([`crate::native_ui::CompiledUi::ink_overlaps`]) and no line sliced
-/// by a list's top edge ([`assert_list_tops`]): Cursor & Motion's and Cursor
-/// Styles' preview header once ran its state, "… · Live trail", under its
-/// Pause glyph, and no audit said so.
 #[test]
 fn every_screen_of_every_page_paints_no_cut_or_overlapping_mark() {
     at_each_text_scale(&[1.0, 2.0], "the page audit", |scale| {
@@ -5590,8 +4931,7 @@ fn every_screen_of_every_page_paints_no_cut_or_overlapping_mark() {
     });
 }
 
-/// Every line a status paints under `prefix` (`settings/status/visual`), in
-/// order: what the status reads as.
+/// Every line a status paints under `prefix` (`settings/status/visual`), in order.
 fn status_words(compiled: &crate::native_ui::CompiledUi, prefix: &str) -> String {
     compiled
         .paint
@@ -5613,10 +4953,7 @@ fn status_words(compiled: &crate::native_ui::CompiledUi, prefix: &str) -> String
         .join(" ")
 }
 
-/// Every line of a status's words under `prefix` in `lab`'s `width`x`height`
-/// window, those its bar shows and those the wheel over the bar scrolls to
-/// ([`status_words_node`]), in order; the words are scrolled back to their
-/// top after.
+/// Every line of a status's words under `prefix` in `lab`'s `width`x`height` window.
 fn every_status_line(lab: &mut Lab, width: f32, height: f32, prefix: &str) -> Vec<String> {
     let mut lines: std::collections::BTreeMap<usize, String> = std::collections::BTreeMap::new();
     let mut read = |compiled: &crate::native_ui::CompiledUi| {
@@ -5660,24 +4997,6 @@ fn every_status_line(lab: &mut Lab, width: f32, height: f32, prefix: &str) -> Ve
     lines.into_values().collect()
 }
 
-/// A STATUS IS READ WHOLE AND NOTHING THE PERSON PRESSED MOVES (#92): on
-/// every page with a switch on its first screen (Messages and Themes keep
-/// statuses of their own), at 80x24, 60x20 and 22x24 and the short windows
-/// 220x12, 102x12 and 80x16, 1× and 2× text, both themes, every status a
-/// change brings up — a saved change and its Undo, the Redo an Undo
-/// offers, a refused write, a save failure, one with a long path — paints
-/// all its words, on as many lines as they take, its bar (or the toolbar it
-/// docks in) as tall as they are — but where that would leave the list
-/// less than the switch the person pressed, or the window fewer lines,
-/// when its words scroll in the bar from their first line, every one of
-/// them on a line, none cut; the page audits clean; the
-/// switch the person pressed stays whole, and where it was wherever the bar
-/// leaves it there (the bar takes its room from the page's bottom inset,
-/// then the list's bottom), else moved by its hidden part; and the Reset
-/// All question is read whole. The status line at 2× text read "Color
-/// theme was not saved…", hiding why; a long one covered the switch just
-/// pressed (22x24 at 2×: a saved status left the list 40pt), and a
-/// one-line bar at 220x12 at 2× cut Sound's 72pt switch to 52.
 #[test]
 fn a_status_is_read_whole_and_nothing_pressed_moves() {
     const FAILURE: &str = "~/.config/aterm isn\u{2019}t writable \u{b7} check its permissions";
@@ -5686,8 +5005,6 @@ fn a_status_is_read_whole_and_nothing_pressed_moves() {
     at_each_text_scale(&[1.0, 2.0], "status kinds", |scale| {
         let faults = std::sync::Mutex::new(Vec::new());
         let kinds = std::sync::atomic::AtomicUsize::new(0);
-        // Each window of each page in each theme, every status kind on it,
-        // spread over a few threads at the rung's text size.
         let windows = ["", "theme = \"GitHub Light\"\n"]
             .into_iter()
             .flat_map(|source| {
@@ -5729,10 +5046,6 @@ fn a_status_is_read_whole_and_nothing_pressed_moves() {
                     let mut lab = Lab::new(source);
                     lab.state_mut().navigate(route);
                     let before = lab.compile(width, height);
-                    // The first switch the screen shows whole — its stop too,
-                    // as the keyboard that comes to it reads it (the words
-                    // under it, which a keyboard landing brings into view) —
-                    // as a person presses it.
                     let keyboard_whole = |key: &UiKey| {
                         lab.state().scroll_plan().is_none_or(|plan| {
                             let top = lab.state().page_scroll.min(plan.limit());
@@ -5756,22 +5069,14 @@ fn a_status_is_read_whole_and_nothing_pressed_moves() {
                     };
                     let was = before.semantic(&pressed).map(|node| node.rect);
                     if kind == "pointer" {
-                        // As the host's pointer does: the press puts the
-                        // keyboard on the control itself and draws, the
-                        // release sends its action, the page draws while the
-                        // write is on its way, then the result comes.
                         lab.state_mut().common.last_focus = Some(pressed.clone());
                         let _ = lab.compile(width, height);
                     } else {
-                        // A click puts the keyboard on what it presses.
                         lab.dispatch(AppEvent::FocusChanged(Some(pressed.clone())));
                         let _ = lab.compile(width, height);
                     }
                     match kind {
                         "saved" | "pointer" => {
-                            // As the host does: the page renders while the
-                            // write is on its way ("Applying…"), then the
-                            // result comes.
                             let (patch, operation) = lab
                                 .invoke(&action, None)
                                 .unwrap_or_else(|| panic!("{context}: {action} writes"));
@@ -5806,13 +5111,8 @@ fn a_status_is_read_whole_and_nothing_pressed_moves() {
                     kinds.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let feedback = lab.state().feedback.clone().unwrap_or_default();
                     if kind != "reset-all" {
-                        // Every word, in order; a word wider than the bar
-                        // (a path at 22 columns) is set across lines whole.
                         let bare = |text: &str| text.split_whitespace().collect::<String>();
                         let read = status_words(&after, "settings/status/visual");
-                        // No word set across two lines that a line's box
-                        // holds whole (the dock beside the back button at
-                        // 22 columns broke "Restore" / "d Color").
                         let (px, face) = crate::native_ui::text_paint_metrics(
                             SemanticRole::Status,
                             StyleRef::Plain,
@@ -5830,8 +5130,6 @@ fn a_status_is_read_whole_and_nothing_pressed_moves() {
                                 _ => None,
                             })
                             .collect();
-                        // Every word on a line of the bar: those it shows,
-                        // and those it scrolls to.
                         let every =
                             every_status_line(&mut lab, width, height, "settings/status/visual");
                         let all = every.join(" ");
@@ -5842,9 +5140,6 @@ fn a_status_is_read_whole_and_nothing_pressed_moves() {
                                 .push(format!("{context}: sets {every:?} of {feedback:?}"));
                         }
                         for word in feedback.split_whitespace() {
-                            // Each piece a line may break between (a path's
-                            // folders, a word's hyphen) whole on a line where
-                            // a line's box holds it.
                             for (_, piece) in line_pieces(word) {
                                 let whole = every.len() <= 1
                                     || every.iter().any(|line| {
@@ -5865,12 +5160,6 @@ fn a_status_is_read_whole_and_nothing_pressed_moves() {
                                 }
                             }
                         }
-                        // Only where the window under the toolbar holds
-                        // fewer lines than the words take — the bar filling
-                        // it — or where one more line would leave the list
-                        // less than the switch pressed, does the bar show
-                        // fewer lines than its words take: they scroll in
-                        // it, a thumb saying so, from their first line.
                         let scrolls = after
                             .paint
                             .iter()
@@ -5905,10 +5194,6 @@ fn a_status_is_read_whole_and_nothing_pressed_moves() {
                             .unwrap_or_else(std::sync::PoisonError::into_inner)
                             .push(format!("{context}: {fault}"));
                     }
-                    // The switch stays whole, the bar never over it: but
-                    // where the bar is as short as it gets (one line) and
-                    // the window still holds no more (102x12 at 2× text: an
-                    // 80pt toolbar, a 64pt bar and a 36pt list).
                     let least_bar = after
                         .paint
                         .iter()
@@ -5934,10 +5219,6 @@ fn a_status_is_read_whole_and_nothing_pressed_moves() {
                                 "{context}: the pressed switch is not whole under the status"
                             ));
                     }
-                    // The switch stays under the pointer wherever the list's
-                    // room, the taller bar's share given up from its bottom,
-                    // still holds it whole; where that cuts it, it moves the
-                    // least that shows it whole: its hidden part.
                     let now = after.semantic(&pressed).map(|node| node.rect);
                     let room_bottom = lab.state().scroll_plan().and_then(|plan| {
                         after
@@ -5986,16 +5267,6 @@ fn a_status_is_read_whole_and_nothing_pressed_moves() {
     });
 }
 
-/// A CONTROL THE WHEEL LEFT CUT STAYS WHERE IT WAS DRAWN: the control the
-/// keyboard is on is kept in view where the last screen showed it whole and
-/// something since cut it (a status that came), but one the last screen drew
-/// cut is drawn so again until an event moves the list. Home at 444x292 at
-/// 2× text, the keyboard on Follow system light/dark under a refused write's
-/// status: the wheel down the list and back drew the switch cut by the
-/// room's edge, 8pt of it under a short status and all of it under a long
-/// path's, and the next frame, with nothing between, drew it whole, 8pt
-/// higher or back in view. CONTROL: the status that came kept the same
-/// switch whole.
 #[test]
 fn a_control_the_wheel_left_cut_stays_where_it_was_drawn() {
     at_each_text_scale(&[2.0], "a control the wheel left cut", |_| {
@@ -6060,15 +5331,6 @@ fn a_control_the_wheel_left_cut_stays_where_it_was_drawn() {
     });
 }
 
-/// A STATUS NEVER COVERS WHAT THE PERSON IS ON, THOUGH THE WHEEL LEFT IT CUT
-/// (#92): the switch the wheel left cut stays so only while nothing comes;
-/// a bar that comes over it keeps it in view. Home at 300x292 at 2× text,
-/// the keyboard on Follow system light/dark, the switch pressed (its write
-/// out, the switch whole at y 164), the wheel down the list and back (the
-/// switch cut at y 174, 54 of its 64pt showing), then the write refused
-/// under a long path's status: the switch was not painted at all, the
-/// refusal over the control just pressed. It is drawn whole, and the next
-/// frame draws the same screen.
 #[test]
 fn a_status_that_comes_over_a_control_the_wheel_left_cut_keeps_it_in_view() {
     at_each_text_scale(&[2.0], "a status over a cut control", |_| {
@@ -6120,12 +5382,6 @@ fn a_status_that_comes_over_a_control_the_wheel_left_cut_keeps_it_in_view() {
     });
 }
 
-/// A STATUS'S BAR TAKES THE PAGE'S BOTTOM INSET BEFORE ITS LIST (#92): at
-/// 220x12 at 2× text, Sound's Music effects switch pressed, its one-line
-/// saved status (64pt, Undo beside it) took all it needs from the list's
-/// room, which the page had given the bar's, and cut the 72pt switch to 52
-/// while the page kept 24pt of blank under the list. The bar takes that
-/// inset first: the switch stays whole where it was pressed.
 #[test]
 fn a_status_bar_takes_the_pages_bottom_inset_before_its_list() {
     at_each_text_scale(&[2.0], "bottom inset", |_| {
@@ -6151,15 +5407,6 @@ fn a_status_bar_takes_the_pages_bottom_inset_before_its_list() {
     });
 }
 
-/// A STATUS NEVER COVERS THE SWITCH THE PERSON PRESSED (#92): at 22x24 at
-/// 2× text "Allow programs to read the clipboard turned on", on five lines
-/// with Undo under them, took 228pt of the 348pt window and left the list
-/// 40pt: the switch just pressed was under the bar, where a second click
-/// landed on Undo. The bar is as tall as leaves the switch whole, its words
-/// scrolling in it from their first line — every one of them reached by
-/// the wheel over the bar, none cut: the middle cut that took "read" out
-/// of them is gone. NEGATIVE CONTROL: the wheel over the page's list
-/// scrolls the list, not the status.
 #[test]
 fn a_status_never_covers_the_switch_the_person_pressed() {
     at_each_text_scale(&[2.0], "covered switch", |_| {
@@ -6204,7 +5451,6 @@ fn a_status_never_covers_the_switch_the_person_pressed() {
                 .any(|node| node.key.as_str() == "settings/status/visual/thumb"),
             "a thumb says the words scroll"
         );
-        // The wheel over the page's list scrolls the list, not the words.
         lab.dispatch(AppEvent::ScrollAt {
             lines: 1,
             key: UiKey::new("settings/list"),
@@ -6214,8 +5460,6 @@ fn a_status_never_covers_the_switch_the_person_pressed() {
             "the wheel over the list leaves the status where it was"
         );
         let _ = lab.compile(178.0, 348.0);
-        // The wheel over the bar scrolls its words to their end, a line at
-        // a time.
         let mut end = read.clone();
         for _ in 0..8 {
             lab.dispatch(AppEvent::ScrollAt {
@@ -6232,13 +5476,6 @@ fn a_status_never_covers_the_switch_the_person_pressed() {
     });
 }
 
-/// A STATUS AFTER A WRITE IN FLIGHT NEVER COVERS THE SWITCH EITHER (#92):
-/// the host renders while a write is on its way ("Applying…", its own bar)
-/// and the switch pressed is nudged whole above that bar; the result's
-/// taller bar then came over it, and the list read the switch as whole
-/// still, the first stop being "live" past the room's edge under the bar:
-/// at 22x24 at 2× text Keyboard & Input's Copy on select switch was cut to
-/// 32 of 64pt, Security's clipboard switch went under the bar altogether.
 #[test]
 fn a_status_after_a_write_in_flight_never_covers_the_switch() {
     at_each_text_scale(&[2.0], "write in flight", |_| {
@@ -6272,15 +5509,6 @@ fn a_status_after_a_write_in_flight_never_covers_the_switch() {
     });
 }
 
-/// A POINTER PRESS KEEPS ITS CONTROL IN VIEW (#92): the host's pointer
-/// puts the keyboard on the control itself, with no focus change the
-/// reducer sees, then sends the action, and nothing kept the control in
-/// view: at 80x16 Follow system pressed on added the Dark and Light theme
-/// rows, the page chose its chrome again, the preview went into the list,
-/// and the switch jumped 78pt up from under the pointer; at 80x24 at 2×
-/// text on Modified, pressed off, the Color theme row came back, the
-/// summary went into the list, and the switch jumped 68pt. Keyboard and
-/// pointer presses keep it alike: the switch and what the page pins stay.
 #[test]
 fn a_pointer_press_keeps_its_control_in_view() {
     for (scale, route, source, (width, height), pinned) in [
@@ -6318,8 +5546,6 @@ fn a_pointer_press_keeps_its_control_in_view() {
                 rect(&before, pinned),
                 "{route:?} at {scale}x: {pinned} stays where it was"
             );
-            // The switch stays, but for the hidden part a bar under the
-            // page took from it (a docked status takes none).
             let (was, now) = (rect(&before, key.as_str()), rect(&after, key.as_str()));
             let hidden = rect(&after, "settings/feedback")
                 .filter(|bar| bar.y > 100.0)
@@ -6335,11 +5561,6 @@ fn a_pointer_press_keeps_its_control_in_view() {
     }
 }
 
-/// A STATUS'S PATH WRAPS AT ITS FOLDERS: a status is broken where every line
-/// of aterm's chrome breaks ([`wrap_to_box`]) — between words, after a
-/// path's `/` or a `-` — never inside a folder's name where the box holds
-/// it: wrapped by the terminal's own rule, a save failure read
-/// "…/scratchpad/labs/r1" / "3d-p4/cfg/aterm isn't writable".
 #[test]
 fn a_status_path_wraps_at_its_folders() {
     at_each_text_scale(&[1.0, 2.0], "status path", |_| {
@@ -6364,15 +5585,6 @@ fn a_status_path_wraps_at_its_folders() {
     });
 }
 
-/// THE KEYBOARD ON A STATUS BAR READS ITS WORDS (the review): at
-/// 22x24 at 2× text, where a status takes more lines than its bar shows
-/// over the switch just pressed — the switch's own, and a save that failed,
-/// which offers no Undo — the words' box is the keyboard's next stop after
-/// the switch, and Down on it scrolls the words a line at a time to their
-/// end, the keyboard staying on it, every word on a line reached; Up
-/// scrolls them back to their first line. Only the wheel over the bar
-/// reached them: a keyboard saw the thumb, never the words under it.
-/// NEGATIVE CONTROL: Down on the switch moves the keyboard, not the words.
 #[test]
 fn the_keyboard_on_a_status_bar_reads_its_words() {
     at_each_text_scale(&[2.0], "status keys", |_| {
@@ -6409,7 +5621,6 @@ fn the_keyboard_on_a_status_bar_reads_its_words() {
                 at(&key).map(|switch| switch + 1),
                 "{context}: the words are the keyboard's next stop: {order:?}"
             );
-            // NEGATIVE CONTROL: on the switch, Down is the list's.
             lab.dispatch(AppEvent::StepFocus(1));
             let _ = lab.compile(178.0, 348.0);
             assert!(
@@ -6417,7 +5628,6 @@ fn the_keyboard_on_a_status_bar_reads_its_words() {
                 "{context}: Down off the bar leaves the words where they were"
             );
             lab.dispatch(AppEvent::FocusChanged(Some(words.clone())));
-            // Each line the bar shows whole, by its place in the words.
             let mut seen = std::collections::BTreeMap::<usize, String>::new();
             let read = |lab: &Lab, seen: &mut std::collections::BTreeMap<usize, String>| {
                 let compiled = lab.compile(178.0, 348.0);
@@ -6446,7 +5656,6 @@ fn the_keyboard_on_a_status_bar_reads_its_words() {
                 );
             }
             let whole = seen.values().cloned().collect::<Vec<_>>().join(" ");
-            // A path goes on at its folders, with no space between.
             let bare = |text: &str| text.split_whitespace().collect::<String>();
             assert_eq!(
                 bare(&whole),
@@ -6467,13 +5676,6 @@ fn the_keyboard_on_a_status_bar_reads_its_words() {
     });
 }
 
-/// A SAVE THAT FAILED IS READ WHOLE IN A SHORT BAR (the audit):
-/// at 22x24 at 2× text a save failure that names the folder to fix, set on
-/// more lines than the bar holds over the switch just pressed, keeps every
-/// word — which change was not saved, the folder, and what to do — on a
-/// line the wheel over the bar scrolls to. The bar took its middle out:
-/// "Allow / programs to / read the … / isn’t writable · / check its /
-/// permissions", "clipboard was not saved:" and the folder gone.
 #[test]
 fn a_save_that_failed_is_read_whole_in_a_short_bar() {
     at_each_text_scale(&[2.0], "failure in a short bar", |_| {
@@ -6524,7 +5726,6 @@ fn a_save_that_failed_is_read_whole_in_a_short_bar() {
         for word in ["clipboard", "was", "not", "saved:", "permissions"] {
             assert!(read.contains(word), "{word:?} is reached: {read:?}");
         }
-        // CONTROL: a status its bar holds shows whole, and no thumb.
         let mut wide = Lab::new("");
         wide.state_mut().navigate(SettingsRoute::Security);
         let _ = wide.compile(1_095.0, 700.0);
@@ -6540,12 +5741,6 @@ fn a_save_that_failed_is_read_whole_in_a_short_bar() {
     });
 }
 
-/// A SWITCH A TALLER STATUS MOVES KEEPS ITS NAME (#92): Appearance's Follow
-/// system switch at 80x24 at 2× text, pressed, brings up a two-line status
-/// over it with Undo; the list scrolls it 40pt up, by its hidden part, and
-/// the THEME caption the screen kept came down over the row's name, so the
-/// switch stood alone. A whole stop beats its caption: the caption goes and
-/// the row shows whole, its name over its switch.
 #[test]
 fn a_switch_a_taller_status_moves_keeps_its_name() {
     at_each_text_scale(&[2.0], "status press", |_| {
@@ -6581,25 +5776,16 @@ fn a_switch_a_taller_status_moves_keeps_its_name() {
     });
 }
 
-/// A CJK STATUS BREAKS NO WORD WHERE IT BREAKS BETWEEN CHARACTERS: the
-/// shared wrap sets CJK lines between characters, a break as good as a
-/// space, so the bar that weighs where its Undo goes by the words it breaks
-/// ([`broken_words`]) counts none there, as for a Latin status that breaks
-/// only at its spaces, and keeps its Undo beside the words. Counted as
-/// broken words, a narrower box broke more of them, and every CJK status
-/// that took two lines put its Undo under them.
 #[test]
 fn a_cjk_status_breaks_no_word_between_its_characters() {
     let cjk = "設定を保存できませんでした。フォルダーの権限を確認してください";
     assert!(status_word_lines(cjk, 120.0).len() > 1, "two lines or more");
     assert_eq!(broken_words(cjk, 120.0), 0);
-    // A Latin word wider than its box is still broken inside.
     assert!(broken_words("Restored", 20.0) > 0);
     assert_eq!(broken_words("Color theme set to Default", 60.0), 0);
 }
 
-/// The group cards a compiled list draws (`settings/group/…`), each painted
-/// rect and clip.
+/// The group cards a compiled list draws (`settings/group/…`), each painted rect and clip.
 fn group_cards(
     compiled: &crate::native_ui::CompiledUi,
     list: LogicalRect,
@@ -6618,13 +5804,6 @@ fn group_cards(
         .collect()
 }
 
-/// WITH A STATUS BAR UP, END AND THE WHEEL SHOW THE LAST CARD WHOLE: on every
-/// list page at 80x24, 102x29 and 150x48, a plain status up first, End — and
-/// a wheel run past the end — draws the list's last card whole inside the
-/// list, its closing padding and bottom border on screen. The last screen let
-/// that padding fall in the strip the page keeps for a bar, which the bar
-/// takes, and cut the card there on every screen (Terminal at 102x29: the
-/// SYSTEM card 14pt short; Modified at 80x24: 18pt; Appearance at 150x48).
 #[test]
 fn with_a_status_bar_up_end_shows_the_last_card_whole() {
     let mut ended = 0;
@@ -6684,13 +5863,6 @@ fn with_a_status_bar_up_end_shows_the_last_card_whole() {
     assert!(ended > 0, "some page scrolls to its end");
 }
 
-/// NOTHING SCROLLED, NO ROW MOVES: a list on its last screen holds the place
-/// it drew when a press adds a stop after its end. Cursor Styles at 220x60
-/// with Off saved, wheeled to its end: pressing Lightning there saves it and
-/// brings its Adjust card after the list's end, and the screen at the same
-/// first stop was no longer the last one — every row went 40pt up from under
-/// the pointer, Comet in Lightning's place (SC12). Lightning, and Classic,
-/// stay where they were.
 #[test]
 fn a_stop_added_after_the_end_moves_no_row_on_the_last_screen() {
     for style in ["laser", "classic"] {
@@ -6716,7 +5888,6 @@ fn a_stop_added_after_the_end_moves_no_row_on_the_last_screen() {
             lab.state().page_scroll >= plan.limit(),
             "the wheel reached the last screen"
         );
-        // A pointer press moves the keyboard to the row first.
         lab.state_mut().common.last_focus = Some(UiKey::new(key.as_str()));
         let _ = lab.press(&key);
         let after = lab.compile(width, height);
@@ -6725,17 +5896,6 @@ fn a_stop_added_after_the_end_moves_no_row_on_the_last_screen() {
     }
 }
 
-/// ONE BOUNDARY FOR WHAT A SCREEN SHOWS AND WHAT IT DRAWS AS SHOWN: on every
-/// list page's screens before the last, at 80x24 and the shipped 102x29, a
-/// control the room's bottom edge cuts — part of it in the room, the rest
-/// past the edge — is the screen's peek: fading from its top, live nowhere,
-/// a press on any of it the list's. It was painted at full strength over
-/// the edge (0.87 of it and more where it ran a few points past), live above
-/// the edge only, and Page Down turned onto it again (Terminal's Accent color
-/// at 102x29, Sound's Ambient sound bed, Appearance's Selection color); at
-/// 80x24, where no strip fades, its words were dropped and its face left live
-/// with no name (Software Update's Install updates automatically, Terminal's
-/// Bidirectional text).
 #[test]
 fn a_control_the_rooms_edge_cuts_is_a_picture_from_its_top() {
     let mut cut = 0;
@@ -6745,7 +5905,6 @@ fn a_control_the_rooms_edge_cuts_is_a_picture_from_its_top() {
             let mut lab = Lab::new("");
             lab.state_mut().navigate(route);
             lab.each_screen(width, height, |state, compiled, top| {
-                // The screens before the last.
                 let Some((plan, _)) = state.scroll_shown().filter(|(plan, _)| top < plan.limit())
                 else {
                     return;
@@ -6792,15 +5951,6 @@ fn a_control_the_rooms_edge_cuts_is_a_picture_from_its_top() {
     assert!(cut > 0, "some screen draws a control over its room's edge");
 }
 
-/// A CUT CONTROL IS DRAWN WITH ITS NAME OR NOT AT ALL: on every screen of
-/// the list pages at 80x24, 102x29 and 150x48, no list draws a sliver of a
-/// control — less than [`scroll::PEEK_MIN`] of it — and every control an edge
-/// cuts that is drawn and live shows its row's name. A 4pt sliver of Cursor
-/// & Motion's Serious Mode switch under the preview at 80x24 read as a stray
-/// line and a click on it turned Serious Mode on; Terminal's search match
-/// color field and Sound's detonation switch showed 9pt under a kept
-/// caption; at 102x29 Keyboard & Input's multi-line paste switch was 64%
-/// drawn under its caption with neither its name nor its On.
 #[test]
 fn a_cut_control_is_drawn_with_its_name_or_not_at_all() {
     let mut faults = Vec::new();
@@ -6867,13 +6017,6 @@ fn a_cut_control_is_drawn_with_its_name_or_not_at_all() {
     assert!(cut_live > 0, "some screen draws a cut control live, named");
 }
 
-/// A KEPT CAPTION HEADS WHAT IS UNDER IT: on the last screen of every list
-/// page at 80x24, 102x29 and 150x48, a group caption the list keeps at its
-/// top has a row of the group drawn under it — a control or a line of
-/// words in the room under the caption. Kept over a row the end's scroll
-/// had left whole, the caption cut that row, the edge rule took its cut
-/// control with its name, and the screen drew a caption over an empty card
-/// (Cursor & Motion at 102x29: EFFECT POLICY, Serious Mode gone under it).
 #[test]
 fn a_kept_caption_heads_a_row_on_every_last_screen() {
     let mut faults = Vec::new();
@@ -6925,13 +6068,6 @@ fn a_kept_caption_heads_a_row_on_every_last_screen() {
     assert!(kept > 0, "some last screen keeps a caption");
 }
 
-/// A NAMELESS HALF SWITCH IS NO SWITCH TO PRESS: Software Update at 80x24,
-/// whose first screen ends on Install updates automatically cut by the list's
-/// edge, draws that row as the screen's peek, fading from its top — no hit
-/// where its half switch and its Reset show, so a press there works nothing
-/// and only scrolls the row whole into the list; the next press works it
-/// (SC9: the cut switch, its name dropped, turned on for a press on its half,
-/// and its Reset reset it for a press on blank backdrop).
 #[test]
 fn a_press_on_softwares_cut_auto_update_row_only_scrolls_it_in() {
     let (width, height) = (584.0, 348.0);
@@ -6979,16 +6115,6 @@ fn a_press_on_softwares_cut_auto_update_row_only_scrolls_it_in() {
     );
 }
 
-/// A STATUS NEVER MOVES THE SWITCH A PRESS FOUND WHOLE ON A COMPACT PAGE
-/// THAT KEEPS NO ROOM FOR IT: at 80x24 and 80x26, where the page keeps no
-/// room under its list for the status bar a change brings up (its toolbar
-/// docks that bar), every page's last switch drawn whole is pressed, and the
-/// status the press brings up takes the dock — its words on the dock's one
-/// row, whole in its label — so the switch stays where it was, under the
-/// pointer, and no bar stands over it. Software Update's "Install updates
-/// automatically turned on · This copy can't update; the setting is saved"
-/// took two lines of the dock, stood under the page instead, and took its
-/// room from the list's bottom: the switch went 23pt up at 80x26 (SC7).
 #[test]
 fn a_status_never_moves_a_switch_pressed_whole_on_a_compact_page() {
     let mut pressed = 0;
@@ -7022,7 +6148,6 @@ fn a_status_never_moves_a_switch_pressed_whole_on_a_compact_page() {
                 .as_str()
                 .trim_start_matches("settings/control/")
                 .to_string();
-            // A pointer press puts the keyboard on the control first.
             lab.state_mut().common.last_focus = Some(key.clone());
             let Some((patch, operation)) = lab.invoke(
                 &format!("settings/set/{setting}"),

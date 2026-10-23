@@ -1,152 +1,36 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The rule at the door: a message outlives a glance only if it says why a person is
-//! needed and what the one action is. The rule is a type:
-//!
-//! * A message classed by the rule ([`crate::Message::now`]) gets its hold from its
-//!   [`Ask`]: a reason from a closed vocabulary with no word for "waiting" or "retrying"
-//!   ([`StandingWhy`]) and the one action that changes the outcome ([`Then`]), never a
-//!   snooze. A persistent hold ([`Hold::Standing`], [`Hold::Ask`]) carries a [`Persist`]
-//!   seal only an [`Ask`] (and the carry decoder) can mint. A row an older parent carried
-//!   across an update is adopted once, and the reporters re-assert it at Commit.
-//! * A person needed but not now ([`Need::Later`]) is an exception, kept in the digest
-//!   ([`crate::MessageCenter::digest`]), which can never ask for a band row.
-//! * Everything else is a record.
-//!
-//! The types cannot prove the words true: a producer can still write [`Why::OnlyYou`] for
-//! a fact that heals itself. The small vocabulary, the roster tests that assert the class
-//! of every state a producer can reach, and [`LaterAsk::outlasted`] (`None` until a wait
-//! has outlasted a named [`Horizon`]) guard that.
-//!
-//! # The locks (each a `compile_fail` doctest with its rustc error code)
-//!
-//! A persistent hold cannot be written by hand: the bare spelling is a type error, a
-//! forged token has no constructor, and the decision row's seal is not optional:
-//!
-//! ```compile_fail,E0308
-//! use aterm_messages::{Hold, Message, Severity, tags};
-//! let _ = Message::new(tags::UPDATE, Severity::Warn, "x").hold(Hold::Standing);
-//! ```
-//!
-//! ```compile_fail,E0423
-//! use aterm_messages::{Hold, need::Persist};
-//! let _ = Hold::Standing(Persist(()));
-//! ```
-//!
-//! ```compile_fail,E0063
-//! use aterm_messages::{Duration, Hold};
-//! let _ = Hold::Ask { for_: Duration::from_secs(600) };
-//! ```
-//!
-//! A message's class is not a public field:
-//!
-//! ```compile_fail,E0616
-//! use aterm_messages::{Message, Severity, need::Need, tags};
-//! let mut m = Message::new(tags::UPDATE, Severity::Warn, "x");
-//! m.need = Need::Record;
-//! ```
-//!
-//! The vocabulary has no word for "waiting":
-//!
-//! ```compile_fail,E0599
-//! use aterm_messages::need::{Reason, Why};
-//! let _ = Why::Waiting(Reason::new("it is waiting for its work"));
-//! ```
-//!
-//! A snooze is not "the one action" — there is no constructor for it:
-//!
-//! ```compile_fail,E0599
-//! use aterm_messages::need::Mover;
-//! let _ = Mover::not_today("s-1", "2.1.284");
-//! ```
-//!
-//! ...and a raw [`crate::Intent`] is not a [`Mover`]:
-//!
-//! ```compile_fail,E0308
-//! use aterm_messages::{Intent, UpgradeWord, need::Then};
-//! let skip = Intent::AgentUpgrade { tab: "s-1".into(), to: "2.1.284".into(), word: UpgradeWord::Skip };
-//! let _ = Then::press(skip, "Skip this build");
-//! ```
-//!
-//! ...whose intent field cannot be written around the whitelist:
-//!
-//! ```compile_fail,E0423
-//! use aterm_messages::{Intent, UpgradeWord, need::Mover};
-//! let _ = Mover(Intent::AgentUpgrade { tab: "s-1".into(), to: "2.1.284".into(), word: UpgradeWord::Skip });
-//! ```
-//!
-//! A reason that may only be a flash cannot be made standing:
-//!
-//! ```compile_fail,E0308
-//! use aterm_messages::need::{Ask, Reason, Then, Why};
-//! let _ = Ask::standing(
-//!     Why::YourAction(Reason::new("you typed a bad key")),
-//!     Then::step("fix aterm.toml"),
-//! );
-//! ```
-//!
-//! An exception can never be promoted to an interrupt:
-//!
-//! ```compile_fail,E0277
-//! use aterm_messages::need::{Ask, LaterAsk};
-//! fn promote(later: LaterAsk) -> Ask { later.into() }
-//! ```
-//!
-//! ...and a horizon cannot be invented at a call site:
-//!
-//! ```compile_fail,E0423
-//! use aterm_messages::{Duration, need::Horizon};
-//! let _ = Horizon(Duration::ZERO);
-//! ```
+//! The rule at the door.
 
 use crate::model::{Hold, Intent};
 use crate::text::clip;
 use crate::{Duration, HOLD_ASK, HOLD_GESTURE, HOLD_STAGED_MANUAL, HOLD_WARN, KEY_CAP};
 
-/// Chars of a [`Reason`]: one clause read at a glance. At 90 an entry's one-line form
-/// (`what — why → then`, 48 + 90 + 90 + 6) fits a detail line ([`crate::DETAIL_LINE_CAP`]).
+/// Chars of a [`Reason`].
 pub const REASON_CAP: usize = 90;
-/// Chars of a [`Step`]: one imperative sentence (see [`REASON_CAP`]).
+/// Chars of a [`Step`].
 pub const STEP_CAP: usize = 90;
-/// The longest a transient row may hold: two minutes (the GUI's crash-last-time
-/// `HOLD_LAUNCH`). Past it a hold is persistent, and only a [`Need::Now`] may persist.
+/// The longest a transient row may hold.
 pub const MAX_TRANSIENT: Duration = Duration::from_mins(2);
-/// An open exception files itself (`Retired::Unseen`) after this long: nothing
-/// waits forever, and nothing is lost — the log keeps its words.
+/// An open exception files itself (`Retired::Unseen`) after this long.
 pub const DIGEST_EXPIRY: Duration = Duration::from_hours(14 * 24);
-/// Open exceptions kept. The 13th files the oldest, lowest-severity one
-/// (`Retired::Evicted`), with its log line.
+/// Open exceptions kept.
 pub const DIGEST_CAP: usize = 12;
-/// How long an entry a family pass no longer names stays open before it ends
-/// (`Resolved`), at the next look or at the digest's own settle
-/// (`MessageCenter::settle_digest`, armed by `MessageCenter::digest_deadline`), whichever
-/// comes first. A look that names it again clears the clock, so a flickering fact neither
-/// ends nor re-posts. Time-based because a reporter's looks are not: the upgrade sends
-/// them only when its rows change.
+/// How long an omitted family entry stays open before resolving at the next look or `MessageCenter::settle_digest`.
 pub const RESOLVE_AFTER: Duration = Duration::from_mins(10);
-/// How long a filed exception (`Dismissed`, `Answered`, `Unseen`, `Evicted`) stays in the
-/// log's ring after its filing, whatever else is posted: twice [`Resurface::MAX`], so a
-/// dismissal still holds and [`Resurface::backed_off`] can count the filings that earned
-/// its span. The ring is counted in records, so without this [`crate::LOG_CAP`] unrelated
-/// records would forget a dismissal that still holds.
+/// How long a filed exception (`Dismissed`, `Answered`, `Unseen`, `Evicted`) stays in the log's ring after its filing, whatever else is posted.
 pub const FILED_KEEP: Duration = Duration::from_hours(180 * 24);
 /// [`FILED_KEEP`] in milliseconds.
 pub(crate) const FILED_KEEP_MS: u64 = 180 * 86_400_000;
 const _: () = assert!(FILED_KEEP.as_secs() * 1000 == FILED_KEEP_MS);
 const _: () = assert!(FILED_KEEP_MS >= 2 * Resurface::MAX.millis());
-/// The least gap between two restatements of one entry that change only its words
-/// (holder counts and ages move every look). A change of severity or of a capsule
-/// restates at once.
+/// The least gap between two restatements of one entry that change only its words (holder counts and ages move every look).
 pub const RESTATE_QUIET: Duration = Duration::from_mins(10);
-/// A standing row the owner has read (it folded) or answered is not raised again for this
-/// long, unless its key changes.
+/// A standing row the owner has read (it folded) or answered is not raised again for this long, unless its key changes.
 pub const STANDING_QUIET: Duration = Duration::from_hours(24);
 
-// Words
-
 /// Stems a reason may not lean on: it says why a person is needed, not that something
-/// is pending.
 const WAITING_STEMS: [&str; 10] = [
     "waiting",
     "retry",
@@ -164,8 +48,7 @@ const SNOOZE_LEADS: [&str; 8] = [
     "skip", "snooze", "dismiss", "ignore", "wait", "defer", "postpone", "not",
 ];
 
-/// One clause: why a person, and not the machine, is needed. Sanitized and capped at
-/// [`REASON_CAP`].
+/// One clause: why a person, and not the machine, is needed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Reason(String);
 
@@ -182,8 +65,7 @@ impl Reason {
         &self.0
     }
 
-    /// Why these words are not a reason a person is needed, or `None`: empty, or leaning
-    /// on "waiting" / "retrying" / "will heal".
+    /// Why these words are not a reason a person is needed, or `None`.
     #[must_use]
     pub fn fault(&self) -> Option<&'static str> {
         let words = self.0.to_lowercase();
@@ -197,8 +79,7 @@ impl Reason {
     }
 }
 
-/// One imperative sentence: a step outside aterm, or what a button is for.
-/// Sanitized and capped at [`STEP_CAP`].
+/// One imperative sentence.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Step(String);
 
@@ -215,8 +96,7 @@ impl Step {
         &self.0
     }
 
-    /// Why these words are not one action, or `None`: empty; a snooze in words (`Skip
-    /// this build`, `Wait for it`); or two actions in a sentence (`; ` or ` or `).
+    /// Why these words are not one action, or `None`.
     #[must_use]
     pub fn fault(&self) -> Option<&'static str> {
         let words = self.0.to_lowercase();
@@ -233,12 +113,10 @@ impl Step {
     }
 }
 
-/// Why a person is needed. Closed: there is no word for "waiting", "retrying" or
-/// "healing"; a fact aterm, the vendor or the clock will end is a record.
+/// Why a person is needed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Why {
-    /// A step no software can take: a browser sign-in, a macOS switch, a
-    /// drag in Finder.
+    /// A step no software can take.
     OnlyYou(Reason),
     /// Something waits on a yes or a no.
     Question(Reason),
@@ -276,8 +154,7 @@ impl Why {
     }
 }
 
-/// The reasons that may outlast a look, a subset of [`Why`]: a question or a failed
-/// gesture is transient by nature.
+/// The reasons that may outlast a look, a subset of [`Why`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StandingWhy {
     /// See [`Why::OnlyYou`].
@@ -308,11 +185,7 @@ impl From<StandingWhy> for Why {
     }
 }
 
-// The one action
-
-/// A button that moves the outcome. Only whitelisted constructors exist: none for `Not
-/// today`, `Skip version`, `Not now`, `Details`, `Show tab` or `Open log`, since a snooze,
-/// a decline or a navigation is not the one action.
+/// A button that moves the outcome.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Mover(Intent);
 
@@ -345,9 +218,7 @@ impl Mover {
         Self(Intent::NewWindow)
     }
 
-    /// Open the web page where the fix is made (`notice later … url=`): `None` for an
-    /// address [`crate::model::link_host`] refuses. Crate only: the wire's door is its one
-    /// caller.
+    /// Open the web page where the fix is made (`notice later … url=`).
     #[must_use]
     pub(crate) fn open_link(url: &str) -> Option<Self> {
         crate::model::link_host(url)?;
@@ -363,9 +234,7 @@ impl Mover {
     }
 }
 
-/// The one action: a sentence that says it, and (when one press does it) the button.
-/// Built by [`Then::press`] or [`Then::step`] only, with a short form where the
-/// sentence must never be cut ([`Then::or_short`]).
+/// The one action.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Then {
     step: Step,
@@ -374,8 +243,7 @@ pub struct Then {
 }
 
 impl Then {
-    /// One button that changes the outcome, and the sentence that says what it
-    /// is for (`Turn on aterm in Full Disk Access`).
+    /// One button that changes the outcome, and the sentence that says what it is for (`Turn on aterm in Full Disk Access`).
     #[must_use]
     pub fn press(mover: Mover, step: impl AsRef<str>) -> Self {
         Self {
@@ -407,12 +275,7 @@ impl Then {
         self.mover.as_ref()
     }
 
-    /// THE WORDS THE BAND SHOWS IN THE STEP'S PLACE where the step does not
-    /// stand whole beside the title (`Run the command under Details.`): a
-    /// step whose cut says something else than the step does — a command,
-    /// whose cut label is another account's command — is shown whole or
-    /// replaced by these, never cut (the review of the band, 2026-10-20).
-    /// Details shows the step whole; the short form, too, is one action.
+    /// THE WORDS THE BAND SHOWS IN THE STEP'S PLACE where the step does not stand whole beside the title (`Run the command under Details.`).
     #[must_use]
     pub fn or_short(mut self, short: impl AsRef<str>) -> Self {
         self.short = Some(Step::new(short));
@@ -425,8 +288,7 @@ impl Then {
         self.short.as_ref().map(Step::as_str)
     }
 
-    /// Why the sentence, or its short form, is not one action
-    /// ([`Step::fault`]).
+    /// Why the sentence, or its short form, is not one action ([`Step::fault`]).
     #[must_use]
     pub fn fault(&self) -> Option<&'static str> {
         self.step
@@ -435,9 +297,7 @@ impl Then {
     }
 }
 
-// Spans, fingerprints, horizons
-
-/// How long a transient ask stays: a named span, never a number.
+/// How long a transient ask stays.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Span {
     /// A failed gesture (12 s).
@@ -467,22 +327,17 @@ impl Span {
     }
 }
 
-/// The identity of a fact (not of its moving parts): the key its entry is filed under,
-/// so a dismissal is remembered by the fact and a changed cause is news.
+/// The identity of a fact (not of its moving parts).
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Fingerprint(String);
 
 impl Fingerprint {
-    /// `family.subject.cause`; `cause` is a short lowercase word (`own-work`,
-    /// `typed-draft`, `denied`). Held to [`KEY_CAP`]: the family and the cause are kept,
-    /// and a subject that does not fit is shortened to at most 12 chars and a stable hash
-    /// suffix (`s-3e79b5b~a1b2`), or to `~` and the hash alone when there is no room.
+    /// `family.subject.cause`.
     #[must_use]
     pub fn new(family: &str, subject: &str, cause: &str) -> Self {
         let family = clip(family, 24);
         let cause = clip(cause, 20);
         let subject = clip(subject, usize::MAX);
-        // One action for every place (no subject): `family.cause`.
         if subject.is_empty() {
             return Self(format!("{family}.{cause}"));
         }
@@ -491,7 +346,6 @@ impl Fingerprint {
         let subject = if subject.chars().count() <= room {
             subject
         } else {
-            // FNV-1a over the whole subject: stable across runs and builds.
             let hash = subject.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
                 (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
             });
@@ -502,9 +356,7 @@ impl Fingerprint {
         Self(format!("{family}.{subject}.{cause}"))
     }
 
-    /// A wire key (`wire.<key>`, which the wire's rule already holds to [`KEY_CAP`]) kept
-    /// whole: [`Self::new`] would cut its last segment to a 20-char cause, so two keys
-    /// that differ past it would share one entry and one dismissal. Crate only.
+    /// A wire key (`wire.<key>`, which the wire's rule already holds to [`KEY_CAP`]) kept whole.
     pub(crate) fn wire(full: &str) -> Self {
         Self(clip(full, KEY_CAP))
     }
@@ -516,18 +368,16 @@ impl Fingerprint {
     }
 }
 
-/// How long a dismissal of an entry holds before the same fact may be shown
-/// again. Bounded: a dismissal never hides a fact for good.
+/// How long a dismissal of an entry holds before the same fact may be shown again.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Resurface(u16);
 
 impl Resurface {
-    /// A wait that outlasted its horizon: a week.
+    /// A wait that outlasted its horizon.
     pub const WAIT: Self = Self(7);
-    /// A fact about the owner's own choice (tmux, a wrapper, Full Disk
-    /// Access declined): a month.
+    /// A fact about the owner's own choice (tmux, a wrapper, Full Disk Access declined).
     pub const CHOICE: Self = Self(30);
-    /// The longest a fact stays put away, however often it is dismissed: three months.
+    /// The longest a fact stays put away, however often it is dismissed.
     pub const MAX: Self = Self(90);
 
     /// The quiet span in milliseconds, for a first dismissal.
@@ -537,9 +387,7 @@ impl Resurface {
         self.0 as u64 * 86_400_000
     }
 
-    /// The quiet span after the `n`th dismissal of the same fact inside [`FILED_KEEP`]
-    /// (`n` counts this one): the base, then four times it, then at most [`Self::MAX`],
-    /// where it stays: a fact the owner keeps putting away is one they live with.
+    /// The quiet span after the `n`th dismissal of the same fact inside [`FILED_KEEP`] (`n` counts this one).
     #[inline]
     #[must_use]
     pub const fn backed_off(self, n: u32) -> u64 {
@@ -557,8 +405,7 @@ impl Resurface {
     }
 }
 
-/// A named horizon: how long a self-healing fact may go on before it is worth a line in
-/// the digest. The field is private: a call site cannot invent one.
+/// A named horizon.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Horizon(Duration);
 
@@ -580,11 +427,7 @@ impl Horizon {
     }
 }
 
-// The asks
-
-/// The seal on a persistent hold ([`Hold::Standing`], [`Hold::Ask`]): no public
-/// constructor, so only this crate mints it, from an [`Ask`] or the carry decoder. A
-/// reporter that wants a row past a glance writes `.now(Ask::standing(..))`.
+/// The seal on a persistent hold ([`Hold::Standing`], [`Hold::Ask`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Persist(());
 
@@ -596,7 +439,7 @@ impl Persist {
     }
 }
 
-/// The owner is needed now: why, the one action, and how long it stays.
+/// The owner is needed now.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Ask {
     why: Why,
@@ -609,7 +452,6 @@ enum Stay {
     /// A transient row.
     For(Span),
     /// A decision row: a question that waits ten minutes for a yes or a no
-    /// ([`Hold::Ask`]).
     Question,
     /// Until resolved or read. The fact's identity is the row's key.
     Standing,
@@ -618,7 +460,7 @@ enum Stay {
 }
 
 impl Ask {
-    /// A transient ask: any reason, a named span.
+    /// A transient ask.
     #[must_use]
     pub fn flash(why: Why, then: Then, span: Span) -> Self {
         Self {
@@ -628,10 +470,7 @@ impl Ask {
         }
     }
 
-    /// A standing ask: it outlasts a look, so the reason must be one no retry ends
-    /// ([`StandingWhy`]). The fact's identity is the row's key (the door demotes a
-    /// standing row without one); once read, the same key is not raised again for
-    /// [`STANDING_QUIET`].
+    /// A standing ask.
     #[must_use]
     pub fn standing(why: StandingWhy, then: Then) -> Self {
         Self {
@@ -641,9 +480,7 @@ impl Ask {
         }
     }
 
-    /// A decision row: a question that waits for a yes or a no, ranks first and leaves
-    /// on `Not now`, a supersede or its ten minutes ([`Hold::Ask`]). It still names the
-    /// one action that answers it.
+    /// A decision row.
     #[must_use]
     pub fn question(why: Reason, then: Then) -> Self {
         Self {
@@ -653,8 +490,7 @@ impl Ask {
         }
     }
 
-    /// A row from an older parent's carry, which had no need: the parent
-    /// admitted it and the reporters re-assert it at Commit. Crate only.
+    /// A row from an older parent's carry, which had no need.
     pub(crate) fn adopted(then_words: &str) -> Self {
         Self {
             why: Why::OnlyYou(Reason::new("carried across the update")),
@@ -663,7 +499,7 @@ impl Ask {
         }
     }
 
-    /// The hold the ask earns: derived, never chosen.
+    /// The hold the ask earns.
     #[must_use]
     pub fn hold(&self) -> Hold {
         match &self.stay {
@@ -688,8 +524,7 @@ impl Ask {
         &self.then
     }
 
-    /// `true` for an ask adopted from an older parent's carry (or lent to a
-    /// test fixture): the hold it came with stands.
+    /// `true` for an ask adopted from an older parent's carry (or lent to a test fixture).
     #[must_use]
     pub(crate) fn is_adopted(&self) -> bool {
         matches!(self.stay, Stay::Adopted)
@@ -707,9 +542,7 @@ impl Ask {
         self.fault().is_none()
     }
 
-    /// Why this ask cannot stand as it is, or `None`: a reason that says
-    /// nothing or only that something is pending, an action that says nothing,
-    /// is a snooze or is two actions. The door records such an ask.
+    /// Why this ask cannot stand as it is, or `None`.
     #[must_use]
     pub fn fault(&self) -> Option<&'static str> {
         why_fault(&self.why).or_else(|| self.then.fault())
@@ -738,8 +571,7 @@ pub enum LaterWhy {
     },
 }
 
-/// The owner is needed, but not now: one entry of the digest. It has no hold
-/// and no row — the band never sees it — and it can never become an [`Ask`].
+/// The owner is needed, but not now.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LaterAsk {
     why: LaterWhy,
@@ -747,7 +579,6 @@ pub struct LaterAsk {
     fingerprint: Fingerprint,
     resurface: Resurface,
     /// Its words move only when its fact does, never every look
-    /// ([`Self::restated_at_once`]).
     at_once: bool,
 }
 
@@ -764,26 +595,20 @@ impl LaterAsk {
         }
     }
 
-    /// Words that move only when the fact itself does (the tabs an outage
-    /// holds, counted as they join and leave it) are news each time: a
-    /// restatement of this ask is shown at once, never held back by
-    /// [`RESTATE_QUIET`], which is for words that move every look (an age, a
-    /// holder count read at each pass).
+    /// Words that move only when the fact itself does (the tabs an outage holds, counted as they join and leave it) are news each time.
     #[must_use]
     pub fn restated_at_once(mut self) -> Self {
         self.at_once = true;
         self
     }
 
-    /// Whether a restatement of its words is shown at once
-    /// ([`Self::restated_at_once`]).
+    /// Whether a restatement of its words is shown at once ([`Self::restated_at_once`]).
     #[must_use]
     pub fn restates_at_once(&self) -> bool {
         self.at_once
     }
 
-    /// A self-healing fact, promoted only once it has gone on for `horizon`: `None`
-    /// while `age` is under it.
+    /// A self-healing fact, promoted only once it has gone on for `horizon`.
     #[must_use]
     pub fn outlasted(
         what: Reason,
@@ -805,11 +630,7 @@ impl LaterAsk {
         })
     }
 
-    /// An exception the replayed log left open, rebuilt from its words (the reporter
-    /// re-asserts the real one at its first look). `first` is the record's first action:
-    /// an `Open in browser` there is the button only [`Mover::open_link`] makes (`notice
-    /// later … url=`), so it is the entry's own again and a press answers the entry, as
-    /// before the restart, though the tool may not say it again for days. Crate only.
+    /// An exception the replayed log left open, rebuilt from its words (the reporter re-asserts the real one at its first look).
     pub(crate) fn adopted(why: &str, then: &str, key: &str, first: Option<&Intent>) -> Self {
         let link = match first {
             Some(Intent::OpenLink { url }) => Mover::open_link(url),
@@ -824,9 +645,7 @@ impl LaterAsk {
         }
     }
 
-    /// Take the action half of `other` (what a press does, how long a dismissal holds),
-    /// keeping this ask's reason: an entry's words move at most once per `RESTATE_QUIET`,
-    /// what a press does never waits. Crate only.
+    /// Take the action half of `other` (what a press does, how long a dismissal holds), keeping this ask's reason.
     pub(crate) fn take_action_of(&mut self, other: &LaterAsk) {
         if self.then != other.then {
             self.then = other.then.clone();
@@ -846,7 +665,7 @@ impl LaterAsk {
         &self.then
     }
 
-    /// The fact's identity: the entry's key.
+    /// The fact's identity.
     #[must_use]
     pub fn fingerprint(&self) -> &Fingerprint {
         &self.fingerprint
@@ -898,18 +717,14 @@ fn hours_words(d: Duration) -> String {
     }
 }
 
-// The class
-
 /// The closed list of transient rows that ask nothing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NoticeKind {
-    /// The crash-last-time rows: a loss already suffered, two minutes.
+    /// The crash-last-time rows.
     LastRun,
-    /// A script's warn or error over the socket (`notice post`): it can name
-    /// no reason and no capsule, so it never persists.
+    /// A script's warn or error over the socket (`notice post`).
     Script,
-    /// The answer to the owner's own press (`Upgrade now`): what it waits on
-    /// and that it moves once that ends. Two minutes; then it is in the log.
+    /// The answer to the owner's own press (`Upgrade now`).
     Answer,
 }
 
@@ -923,13 +738,10 @@ impl NoticeKind {
     }
 }
 
-/// What a message is to the person. The engine derives the hold, the band
-/// eligibility and the channel from it; a producer cannot choose them.
+/// What a message is to the person.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Need {
-    /// Not yet classified: what [`crate::Message::new`] makes. A transient row or a
-    /// record, never a persistent one ([`Persist`]); the door cuts a transient hold past
-    /// [`MAX_TRANSIENT`].
+    /// Not yet classified.
     Unclassified,
     /// The log only.
     Record,
@@ -937,9 +749,9 @@ pub enum Need {
     Working,
     /// A closed list of transient rows that ask nothing.
     Notice(NoticeKind),
-    /// The owner is needed now: a band row.
+    /// The owner is needed now.
     Now(Ask),
-    /// The owner is needed, but not now: the digest. Never a row.
+    /// The owner is needed, but not now.
     Later(LaterAsk),
 }
 

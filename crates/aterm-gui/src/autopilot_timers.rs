@@ -1,46 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! AUTOPILOT'S TIMER: Cruise until a time, then Land
-//! (`docs/DESIGN-harness-autopilot-2026-10-15.md` §9.3). A timer only ever
-//! takes power away: one timed transition, Cruise → Land at a wall-clock
-//! instant, never Land → Off and never Off → Cruise.
-//!
-//! **The truth is the stored pair** — the word `cruise` and its `land_at`
-//! (`SessionMeta::land_at`, unix ms), written together by one method
-//! (`SessionMeta::set_autopilot`) under the session's meta guard. Every
-//! write of the word by hand (the chip, the menu, Settings, `meta set
-//! autopilot <word>` with no `until=`, the same word included, `meta unset
-//! autopilot`) drops the timer.
-//!
-//! **This index only says WHEN to look, never WHAT to write** (§9.3.6,
-//! item 3): [`AutopilotTimers`] maps a session's local id to its instant,
-//! the monotonic `due` it was derived to and the face's time, formatted
-//! once when indexed. The App folds its earliest `due` as ONE deadline
-//! (`metrics::DeadlineOwner::AutopilotTimer`, in `about_to_wait`); with no
-//! entry nothing is folded and no clock is read. It is updated by the
-//! window's writer, by `on_meta_changed` (a wire write's wake), after each
-//! restore path, rebuilt from every session at a handoff's Commit (a
-//! successor drops `MetaChanged` until then), re-derived from the wall clock
-//! when the watchdog sees the wall move under the monotonic clock (a sleep,
-//! a clock set forward: `Wake::WallMoved`) and on a window's focus gain, and
-//! an entry goes with its session.
-//!
-//! **The fire is a compare-and-set** ([`App::expire_autopilot_timers`],
-//! `session_timeline::fire_land_at`): each due entry is taken OUT of the
-//! index whatever follows, the wall clock is read once, and `land` is stored
-//! only where the STORED pair is still the entry's and the wall is at or
-//! past it. A clock set back, or a monotonic deadline that ran early, finds
-//! the wall short and indexes the remainder; a hand write stored first finds
-//! a pair that is no longer the entry's and wins.
-//!
-//! **`until=`** ([`parse_when`], [`resolve`]): a local `HH:MM` is the
-//! earliest instant strictly after now whose local reading is `HH:MM`,
-//! looked for today, then tomorrow; on a fall-back night that reads it twice
-//! it is the earlier reading still ahead, and a time a spring-forward skips
-//! on the day it would fall is refused with the reason. So an `HH:MM` lies at
-//! most 25 h of elapsed time ahead. `+<n>h`, `+<n>m` and `+<n>h<n>m` are 1
-//! minute to 24 hours of elapsed time.
+//! AUTOPILOT'S TIMER: Cruise until a time, then Land (`docs/DESIGN-harness-autopilot-2026-10-15.md` §9.3).
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -62,9 +23,7 @@ pub(crate) enum When {
     In(u32),
 }
 
-/// Parse `<when>`: `HH:MM` (two digits each, `00:00` to `23:59`), or `+<n>h`,
-/// `+<n>m`, `+<n>h<n>m` from 1 minute to 24 hours (`+90m`, `+1h30m`, `+24h`).
-/// `None` for anything else, `+0m` and `+24h1m` included.
+/// Parse `<when>`: `HH:MM` (two digits each, `00:00` to `23:59`), or `+<n>h`, `+<n>m`, `+<n>h<n>m` from 1 minute to 24 hours (`+90m`, `+1h30m`, `+24h`).
 #[must_use]
 pub(crate) fn parse_when(text: &str) -> Option<When> {
     if let Some(span) = text.strip_prefix('+') {
@@ -103,8 +62,7 @@ pub(crate) struct Date {
 }
 
 impl Date {
-    /// The date `days` days after 1970-01-01 (Howard Hinnant's
-    /// `civil_from_days`).
+    /// The date `days` days after 1970-01-01 (Howard Hinnant's `civil_from_days`).
     #[must_use]
     pub(crate) fn of_days(days: i64) -> Self {
         let z = days + 719_468;
@@ -131,7 +89,6 @@ impl std::fmt::Display for Date {
 }
 
 /// The local day number (days since 1970-01-01, local) of unix second `at`
-/// under offset `offset_s`.
 fn local_days(at: i64, offset_s: i64) -> i64 {
     (at + offset_s).div_euclid(86_400)
 }
@@ -141,16 +98,14 @@ fn local_days(at: i64, offset_s: i64) -> i64 {
 pub(crate) enum UntilRefused {
     /// Not `HH:MM` or a duration in range: the usage line alone.
     Malformed,
-    /// `HH:MM` does not exist on `date`, the day it would fall: the clocks go
-    /// forward over it.
+    /// `HH:MM` does not exist on `date`, the day it would fall: the clocks go forward over it.
     Skipped { clock: String, date: Date },
     /// The local zone cannot be read here, so no `HH:MM` can be placed.
     NoZone,
 }
 
 impl UntilRefused {
-    /// The reason an `ERR` names before the usage line, or `None` for the
-    /// usage line alone.
+    /// The reason an `ERR` names before the usage line, or `None` for the usage line alone.
     #[must_use]
     pub(crate) fn reason(&self) -> Option<String> {
         match self {
@@ -170,15 +125,12 @@ impl UntilRefused {
 pub(crate) struct Resolved {
     /// When the timed Cruise lands, unix ms (whole seconds).
     pub(crate) at_ms: i64,
-    /// The local zone's offset from UTC at that instant, in seconds, where
-    /// it could be read.
+    /// The local zone's offset from UTC at that instant, in seconds, where it could be read.
     pub(crate) offset_s: Option<i64>,
 }
 
 impl Resolved {
-    /// The reply's tail (§9.3.5): `land_at=<unix s> local=<date>T<HH:MM><±HH:MM>`
-    /// (`local=-` where the zone cannot be read), so a time that fell on the
-    /// next day is never a surprise.
+    /// The reply's tail (§9.3.5): `land_at=<unix s> local=<date>T<HH:MM><±HH:MM>` (`local=-` where the zone cannot be read), so a time that fell on the next day is never a surprise.
     #[must_use]
     pub(crate) fn reply(self) -> String {
         format!(
@@ -189,8 +141,7 @@ impl Resolved {
     }
 }
 
-/// `2026-10-17T16:00+01:00`: the local reading of unix ms `at_ms` at
-/// `offset_s`, or `-` without one.
+/// `2026-10-17T16:00+01:00`: the local reading of unix ms `at_ms` at `offset_s`, or `-` without one.
 #[must_use]
 pub(crate) fn local_stamp(at_ms: i64, offset_s: Option<i64>) -> String {
     let Some(offset) = offset_s else {
@@ -210,18 +161,7 @@ pub(crate) fn local_stamp(at_ms: i64, offset_s: Option<i64>) -> String {
     )
 }
 
-/// Resolve `when` against `now_ms` (unix ms) in the zone `offset_at` reads
-/// (unix second → its offset from UTC in seconds; `presence::local_offset_at`
-/// in the window, a fixed or a DST zone in a test). §9.3.5's rules:
-///
-/// * `In(m)`: `m` minutes of elapsed time from now, from the next whole
-///   second, so the instant is never short of what was asked;
-/// * `Clock(hh:mm)`: the earliest instant STRICTLY after now whose local
-///   reading is `hh:mm`, looked for on today's local date, then tomorrow's.
-///   A fall-back night that reads it twice gives the earlier reading still
-///   ahead. A reading a spring-forward skips refuses with the date, but only
-///   on the day it would fall: a skipped reading already behind now is no
-///   refusal, and tomorrow's is taken.
+/// Resolve `when` against `now_ms` (unix ms) in the zone `offset_at` reads (unix second → its offset from UTC in seconds; `presence::local_offset_at` in the window, a fixed or a DST zone in a test). §9.3.5's rules:
 pub(crate) fn resolve(
     when: When,
     now_ms: i64,
@@ -243,9 +183,6 @@ pub(crate) fn resolve(
         offset_at(now_ms.div_euclid(1000)).ok_or(UntilRefused::NoZone)?,
     );
     for day in [today, today + 1] {
-        // The local reading as a count of local seconds; each offset in force
-        // around it (|offset| < a day, and a zone moves at most once a day)
-        // names one candidate instant, a reading where the zone agrees.
         let local = day * 86_400 + minute * 60;
         let around = [local - 86_400, local, local + 86_400];
         let mut readings: Vec<(i64, i64)> = Vec::with_capacity(3);
@@ -260,8 +197,6 @@ pub(crate) fn resolve(
         }
         readings.sort_unstable();
         if readings.is_empty() {
-            // Skipped: where it would have fallen, by the offset before the
-            // jump. Ahead of now, this is the day it would fall: refused.
             let before = offset_at(local - 86_400).ok_or(UntilRefused::NoZone)?;
             if (local - before) * 1000 > now_ms {
                 return Err(UntilRefused::Skipped {
@@ -281,9 +216,7 @@ pub(crate) fn resolve(
     Err(UntilRefused::Malformed)
 }
 
-/// The face's time for an instant (§9.3.2): its local `HH:MM` and, where it
-/// falls on another local date than `now_ms`'s, its weekday. `None` where
-/// the zone cannot be read.
+/// The face's time for an instant (§9.3.2): its local `HH:MM` and, where it falls on another local date than `now_ms`'s, its weekday.
 #[must_use]
 pub(crate) fn glass_of(
     at_ms: i64,
@@ -301,15 +234,7 @@ pub(crate) fn glass_of(
     })
 }
 
-/// THE OFFER'S WORDS (§9.3.3, §9.3.4): the face of the instant `[harness]
-/// land_at` (`at`) arms when chosen at `now_ms` ([`resolve`]: today, or
-/// tomorrow once today's reading has passed) — its clock and, where that
-/// instant is not today, its weekday — so the menu's `Cruise until Sat
-/// 18:36, then land` and the page's `at Sat 18:36` say what the state line
-/// will say once it is armed (`lands Sat 18:36`). Where the zone cannot be
-/// read, or the time does not exist on the day it would fall, the clock
-/// alone: a choice there arms nothing ([`App::resolve_timer_choice`]). One
-/// read of the zone, at the event that builds the offer, never per frame.
+/// THE OFFER'S WORDS (§9.3.3, §9.3.4): the face of the instant `[harness] land_at` (`at`) arms when chosen at `now_ms` ([`resolve`]: today, or tomorrow once today's reading has passed) — its clock and, where that instant is not today, its weekday — so the menu's `Cruise until Sat 18:36, then land` and the page's `at Sat 18:36` say what the state line will say once it is armed (`lands Sat 18:36`).
 #[must_use]
 pub(crate) fn offer_glass(
     at: aterm_agent::supervise::LandAt,
@@ -325,12 +250,7 @@ pub(crate) fn offer_glass(
         })
 }
 
-/// WHEN THE OFFER'S WORDS TURN (§9.3.3): the first wall instant after
-/// `now_ms` at which [`offer_glass`] reads differently — the instant the
-/// offer arms now (at it, the next one is tomorrow's, which names its day),
-/// or the next local midnight (past it, tomorrow is today, and the day goes),
-/// whichever is sooner. `None` where the zone cannot be read: the offer is
-/// then the clock alone, which never turns.
+/// WHEN THE OFFER'S WORDS TURN (§9.3.3): the first wall instant after `now_ms` at which [`offer_glass`] reads differently — the instant the offer arms now (at it, the next one is tomorrow's, which names its day), or the next local midnight (past it, tomorrow is today, and the day goes), whichever is sooner.
 #[must_use]
 pub(crate) fn offer_turns_at(
     at: aterm_agent::supervise::LandAt,
@@ -349,13 +269,10 @@ pub(crate) fn offer_turns_at(
 }
 
 /// When the next local date starts: the day words an open menu or page
-/// shows need refreshing there, whether or not an exact 00:00 exists.
 fn day_words_turn_at(now_ms: i64, offset_at: &dyn Fn(i64) -> Option<i64>) -> Option<i64> {
     const DAY_S: i64 = 86_400;
     let offset = offset_at(now_ms.div_euclid(1000))?;
     let local = now_ms.div_euclid(1000).checked_add(offset)?;
-    // Tomorrow's noon under the current offset lies beyond its day start,
-    // including the one-hour midnight shifts local_midnight_ms handles.
     let noon = local
         .div_euclid(DAY_S)
         .checked_add(1)?
@@ -367,8 +284,7 @@ fn day_words_turn_at(now_ms: i64, offset_at: &dyn Fn(i64) -> Option<i64>) -> Opt
     (turn > now_ms).then_some(turn)
 }
 
-/// The wall clock, unix ms: read once per event that needs it (an arm, a
-/// fire, a moved wall), never per frame.
+/// The wall clock, unix ms: read once per event that needs it (an arm, a fire, a moved wall), never per frame.
 #[must_use]
 pub(crate) fn wall_ms() -> i64 {
     #[cfg(test)]
@@ -397,15 +313,13 @@ thread_local! {
         const { std::cell::Cell::new(None) };
 }
 
-/// Pin this test thread's clocks (`None`: the real ones again): the index,
-/// the fire and the wire's `until=` read them.
+/// Pin this test thread's clocks (`None`: the real ones again): the index, the fire and the wire's `until=` read them.
 #[cfg(test)]
 pub(crate) fn set_fake_clocks(clocks: Option<(Instant, i64)>) {
     FAKE_CLOCKS.set(clocks);
 }
 
-/// The local zone the window reads: the C library's rules for this process's
-/// zone at each instant (`presence::local_offset_at`).
+/// The local zone the window reads: the C library's rules for this process's zone at each instant (`presence::local_offset_at`).
 pub(crate) fn local_offset_at(unix: i64) -> Option<i64> {
     crate::presence::local_offset_at(unix)
 }
@@ -413,30 +327,22 @@ pub(crate) fn local_offset_at(unix: i64) -> Option<i64> {
 /// One armed timer in the index.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct TimerEntry {
-    /// The stored instant it was indexed from, unix ms: what the fire
-    /// compares against the store.
+    /// The stored instant it was indexed from, unix ms: what the fire compares against the store.
     pub(crate) land_at_ms: i64,
-    /// When to look, on the monotonic clock: derived from the wall when
-    /// indexed or re-derived ([`AutopilotTimers::rederive`]).
+    /// When to look, on the monotonic clock: derived from the wall when indexed or re-derived ([`AutopilotTimers::rederive`]).
     pub(crate) due: Instant,
-    /// The face's time, formatted once ([`glass_of`]); `None` where the zone
-    /// cannot be read.
+    /// The face's time, formatted once ([`glass_of`]); `None` where the zone cannot be read.
     pub(crate) glass: Option<LandAtGlass>,
-    /// Indexed by a restore with its instant already passed: what was
-    /// closed while it passed, which the record names (§9.3.7).
+    /// Indexed by a restore with its instant already passed: what was closed while it passed, which the record names (§9.3.7).
     pub(crate) passed_while: Option<ClosedOver>,
 }
 
-/// What was closed over the gap a restore path indexed a timer across — and
-/// so, where its instant passed meanwhile, what the fire's record says it
-/// passed while (§9.3.7).
+/// What was closed over the gap a restore path indexed a timer across — and so, where its instant passed meanwhile, what the fire's record says it passed while (§9.3.7).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ClosedOver {
-    /// aterm itself: a cold restore, a crash's, or a seamless update's
-    /// carry — "passed while aterm was closed".
+    /// aterm itself: a cold restore, a crash's, or a seamless update's carry — "passed while aterm was closed".
     Aterm,
-    /// Only the tab, with aterm running (a reopened closed tab): "passed
-    /// while the tab was closed".
+    /// Only the tab, with aterm running (a reopened closed tab): "passed while the tab was closed".
     Tab,
 }
 
@@ -445,19 +351,13 @@ pub(crate) enum ClosedOver {
 pub(crate) struct AutopilotTimers {
     entries: HashMap<u64, TimerEntry>,
     /// A seamless update's successor rebuilt the index after its Commit
-    /// ([`App::settle_autopilot_commit`]): owed once, then never again.
     committed: bool,
     /// When an open Autopilot menu's or Settings ▸ Harness page's `land_at`
-    /// offer turns its words ([`offer_turns_at`]): the wall instant, unix ms,
-    /// and the monotonic `due` derived from it, noted where the offer is
-    /// built ([`App::note_land_at_offer`]); `None` with nothing offered. Not
-    /// an armed timer: [`Self::clear`] keeps it.
     offer_due: Option<(i64, Instant)>,
 }
 
 impl AutopilotTimers {
-    /// Whether no timer is armed: the frame then looks nothing up here
-    /// (`App::chip_glass`).
+    /// Whether no timer is armed: the frame then looks nothing up here (`App::chip_glass`).
     #[must_use]
     pub(crate) fn is_empty(&self) -> bool {
         self.entries.is_empty()
@@ -476,9 +376,7 @@ impl AutopilotTimers {
         self.entries.get(&local_id)
     }
 
-    /// The instant session `local_id`'s armed timer was indexed at, unix ms:
-    /// what a cancel offered beside its face names
-    /// ([`App::cancel_autopilot_timer`]).
+    /// The instant session `local_id`'s armed timer was indexed at, unix ms: what a cancel offered beside its face names ([`App::cancel_autopilot_timer`]).
     #[must_use]
     pub(crate) fn land_at_ms(&self, local_id: u64) -> Option<i64> {
         self.entries.get(&local_id).map(|entry| entry.land_at_ms)
@@ -492,8 +390,7 @@ impl AutopilotTimers {
         ids
     }
 
-    /// Session `local_id` is retired, or holds no timer any more: its entry
-    /// goes, so no past instant is folded again. Whether one went.
+    /// Session `local_id` is retired, or holds no timer any more: its entry goes, so no past instant is folded again.
     pub(crate) fn forget(&mut self, local_id: u64) -> bool {
         self.entries.remove(&local_id).is_some()
     }
@@ -510,17 +407,7 @@ impl AutopilotTimers {
         self.entries.clear();
     }
 
-    /// Index session `local_id` at `land_at_ms`, its `due` derived from the
-    /// wall (`wall_ms`, read at `now`): an instant already passed is due at
-    /// once. `closed`: what a restore path indexed it across (`None` for a
-    /// live index), which a passed instant passed while — kept when the same
-    /// instant is indexed again live before its fire (a meta write in
-    /// between), so the record still says what it passed while. Whether the
-    /// entry moved: its instant, its face or what it passed while. The `due`
-    /// alone, derived again from two clocks read later, is no move — every
-    /// read lands it a few microseconds apart, and a meta write that touched
-    /// neither half of the pair (a title, an attention, a claim) must not
-    /// cost the footer a wake (§9.3.6, item 1).
+    /// Index session `local_id` at `land_at_ms`, its `due` derived from the wall (`wall_ms`, read at `now`): an instant already passed is due at once.
     pub(crate) fn arm(
         &mut self,
         local_id: u64,
@@ -555,8 +442,7 @@ impl AutopilotTimers {
         self.entries.values().map(|entry| entry.due).min()
     }
 
-    /// Take every entry due at `now` OUT of the index, in id order: each is
-    /// looked at once, whatever follows.
+    /// Take every entry due at `now` OUT of the index, in id order: each is looked at once, whatever follows.
     pub(crate) fn take_due(&mut self, now: Instant) -> Vec<(u64, TimerEntry)> {
         let mut due: Vec<(u64, TimerEntry)> = self
             .entries
@@ -571,9 +457,7 @@ impl AutopilotTimers {
         due
     }
 
-    /// The wall clock moved under the monotonic one (a sleep, a clock set
-    /// forward, a zone change): every `due`, face time and weekday is derived
-    /// again from the wall. Which entries' faces moved.
+    /// The wall clock moved under the monotonic one (a sleep, a clock set forward, a zone change): every `due`, face time and weekday is derived again from the wall.
     pub(crate) fn rederive(
         &mut self,
         now: Instant,
@@ -595,14 +479,12 @@ impl AutopilotTimers {
 }
 
 /// The monotonic instant the wall reads `land_at_ms` at, from a reading of
-/// both clocks (`now`, `wall_ms`): `now` itself where it has passed.
 fn due_at(land_at_ms: i64, now: Instant, wall_ms: i64) -> Instant {
     let ahead = u64::try_from(land_at_ms.saturating_sub(wall_ms)).unwrap_or(0);
     now + Duration::from_millis(ahead)
 }
 
-/// What a timer choice from the window names (the menu, Settings ▸ Harness:
-/// `HarnessTimerRequest`; §9.3.3, §9.3.4).
+/// What a timer choice from the window names (the menu, Settings ▸ Harness: `HarnessTimerRequest`; §9.3.3, §9.3.4).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TimerChoice {
     /// Cruise this many minutes, then land.
@@ -614,12 +496,7 @@ pub(crate) enum TimerChoice {
 }
 
 impl App {
-    /// The earliest instant an armed timer is due, or `None` with none
-    /// armed: then nothing is folded. `None` too in a seamless update's
-    /// successor before its Commit, which fires nothing (it is a candidate:
-    /// the outgoing process still owns the sessions, and a record minted
-    /// here would land below the parent's merged log); its Commit rebuilds
-    /// the index, and a time that came meanwhile lands then.
+    /// The earliest instant an armed timer is due, or `None` with none armed: then nothing is folded.
     #[must_use]
     pub(crate) fn autopilot_timer_deadline(&self) -> Option<Instant> {
         if self.incoming_handoff_pending {
@@ -628,26 +505,14 @@ impl App {
         self.autopilot_timers.earliest()
     }
 
-    /// Index session `local_id`'s timer from its STORED pair (read under its
-    /// meta guard): armed where the word is `cruise` with a `land_at`, gone
-    /// otherwise. `closed` names what a restore path indexed it across
-    /// (`None` for a live index): a passed instant is then said to have
-    /// passed while that was closed. Where what the chip shows moved, the
-    /// footer is posted and an open Autopilot menu for the session is built
-    /// again ([`Self::refresh_autopilot_menu`]), and the strips that show it
-    /// are stamped again, since the tab's hover names the timer (`driven by
-    /// aterm (cruise, lands at 18:00)`, §12.4.1; `App::restamp_for_hover`).
-    /// Reads the clocks only where a timer is stored.
+    /// Index session `local_id`'s timer from its STORED pair (read under its meta guard): armed where the word is `cruise` with a `land_at`, gone otherwise.
     pub(crate) fn index_autopilot_timer(&mut self, local_id: u64, closed: Option<ClosedOver>) {
         if self.index_autopilot_timer_unstamped(local_id, closed) {
             self.restamp_for_hover(local_id);
         }
     }
 
-    /// [`Self::index_autopilot_timer`] for a caller that stamps the strips
-    /// itself after it (a meta move's `refresh_meta_dependent_chrome`), so a
-    /// timed write stamps each strip once: whether what the chip shows moved,
-    /// for the caller to stamp where it does not.
+    /// [`Self::index_autopilot_timer`] for a caller that stamps the strips itself after it (a meta move's `refresh_meta_dependent_chrome`), so a timed write stamps each strip once: whether what the chip shows moved, for the caller to stamp where it does not.
     pub(crate) fn index_autopilot_timer_unstamped(
         &mut self,
         local_id: u64,
@@ -660,8 +525,7 @@ impl App {
         self.index_autopilot_timer_at(local_id, stored, closed)
     }
 
-    /// [`Self::index_autopilot_timer`] for a session not yet registered
-    /// (a cold restore's respawn, a reopened closed tab): its own context.
+    /// [`Self::index_autopilot_timer`] for a session not yet registered (a cold restore's respawn, a reopened closed tab): its own context.
     pub(crate) fn index_autopilot_timer_of(
         &mut self,
         local_id: u64,
@@ -674,8 +538,6 @@ impl App {
     }
 
     /// The index follows `stored`; where what the chip shows moved, the
-    /// footer is posted and an open menu built again. Whether it moved: the
-    /// caller stamps the strips (the hover names the timer).
     fn index_autopilot_timer_at(
         &mut self,
         local_id: u64,
@@ -700,17 +562,7 @@ impl App {
         moved
     }
 
-    /// THE OFFER IS BUILT (the Autopilot menu's rows, Settings ▸ Harness's
-    /// publish): note when its words turn ([`offer_turns_at`]), so a menu or
-    /// a page held open across that minute is built again then
-    /// ([`Self::expire_autopilot_offer`]) and never offers `18:36` for a
-    /// press that arms tomorrow's. Called BEFORE the offer is read, so a turn
-    /// that falls between the two reads is already due. With no `[harness]
-    /// land_at` the next local midnight is noted all the same (§10.2.3, item
-    /// 6): past it the page's day words move (`landed 18:11` becomes `landed
-    /// Fri 18:11`), so a page held open across it is published again. One
-    /// read of each clock, at the build (an event); folded only while a menu
-    /// or the page shows ([`Self::autopilot_offer_deadline`]).
+    /// THE OFFER IS BUILT (the Autopilot menu's rows, Settings ▸ Harness's publish): note when its words turn ([`offer_turns_at`]), so a menu or a page held open across that minute is built again then ([`Self::expire_autopilot_offer`]) and never offers `18:36` for a press that arms tomorrow's.
     pub(crate) fn note_land_at_offer(&mut self) {
         let land_at = self.harness_policy.get().policy.land_at;
         let (now, wall) = (mono_now(), wall_ms());
@@ -721,17 +573,14 @@ impl App {
         self.autopilot_timers.offer_due = turn.map(|turn| (turn, due_at(turn, now, wall)));
     }
 
-    /// When the offer an open menu or page shows turns its words, or `None`:
-    /// with neither open, or nothing offered, nothing is folded.
+    /// When the offer an open menu or page shows turns its words, or `None`: with neither open, or nothing offered, nothing is folded.
     #[must_use]
     pub(crate) fn autopilot_offer_deadline(&self) -> Option<Instant> {
         let (_, due) = self.autopilot_timers.offer_due?;
         (self.autopilot_menu.is_some() || self.harness_page_shown()).then_some(due)
     }
 
-    /// The offer's words turned under an open menu or page: build them again
-    /// (each notes its next turn). With neither open the note is dropped, so
-    /// a closed menu or page owes no wake.
+    /// The offer's words turned under an open menu or page: build them again (each notes its next turn).
     pub(crate) fn expire_autopilot_offer(&mut self) {
         if self.autopilot_timers.offer_due.is_none() {
             return;
@@ -744,16 +593,11 @@ impl App {
     }
 
     /// The menu's rows and the page built again from the wall as it reads
-    /// now (each notes the next turn); the note dropped first, so with
-    /// neither open none is left.
     fn autopilot_offer_turned(&mut self) {
         self.autopilot_timers.offer_due = None;
         if let Some(session) = self.autopilot_menu.as_ref().map(|menu| menu.session) {
             self.refresh_autopilot_menu(session);
         }
-        // Past midnight the page's today is yesterday's (§10.3.3, item 10):
-        // the shown page reads the ledgers again. One wall read, and only
-        // with the page on screen.
         if self.harness_page_shown()
             && self
                 .harness_screen
@@ -765,14 +609,7 @@ impl App {
         self.harness_screen_moved();
     }
 
-    /// THE COMMIT'S REBUILD, owed once (§9.3.6, item 3): a seamless update's
-    /// successor drops `MetaChanged` until its Commit
-    /// (`Wake::ActivateCommittedHandoff` lifts `incoming_handoff_pending`),
-    /// while drivers may already write meta, so the first park after the
-    /// Commit builds the index again from every session's stored pair
-    /// ([`Self::rebuild_autopilot_timers`]) — run by
-    /// [`Self::expire_autopilot_timers`] before anything fires, so no path
-    /// that lifts the gate can skip it. Two `bool` reads at every other park.
+    /// THE COMMIT'S REBUILD, owed once (§9.3.6, item 3): a seamless update's successor drops `MetaChanged` until its Commit (`Wake::ActivateCommittedHandoff` lifts `incoming_handoff_pending`), while drivers may already write meta, so the first park after the Commit builds the index again from every session's stored pair ([`Self::rebuild_autopilot_timers`]) — run by [`Self::expire_autopilot_timers`] before anything fires, so no path that lifts the gate can skip it.
     pub(crate) fn settle_autopilot_commit(&mut self) {
         if !self.handoff_successor
             || self.incoming_handoff_pending
@@ -785,8 +622,6 @@ impl App {
     }
 
     /// The index built again from every session's stored pair (the Commit's,
-    /// [`Self::settle_autopilot_commit`]). Reads the clocks only where some
-    /// session stores a timer.
     fn rebuild_autopilot_timers(&mut self) {
         let stored: Vec<(u64, i64)> = self
             .pool
@@ -802,8 +637,6 @@ impl App {
                     .arm(*id, *land_at_ms, now, wall, &local_offset_at, None);
             }
         }
-        // Each session once, though it both had an entry and stores one:
-        // its strips are stamped once.
         let ids: std::collections::BTreeSet<u64> = had
             .into_iter()
             .chain(stored.iter().map(|(id, _)| *id))
@@ -815,20 +648,9 @@ impl App {
         }
     }
 
-    /// THE WALL CLOCK MOVED under the monotonic deadline (`Wake::WallMoved`:
-    /// the watchdog saw the Mac sleep or the clock set forward), or a window
-    /// gained focus: every armed timer is derived again from the wall — its
-    /// due, its face's time and weekday — with one wall read, and none at
-    /// all while nothing is armed. A due already passed fires at the next
-    /// park. The A/B book's next midnight is read again as well, where the
-    /// book was ever fed (`App::harness_ab_wall_moved`).
+    /// THE WALL CLOCK MOVED under the monotonic deadline (`Wake::WallMoved`: the watchdog saw the Mac sleep or the clock set forward), or a window gained focus: every armed timer is derived again from the wall — its due, its face's time and weekday — with one wall read, and none at all while nothing is armed.
     pub(crate) fn on_wall_moved(&mut self) {
-        // The A/B book's calendar too, where the book was ever fed: the
-        // next local midnight on the ledger clock, which a sleep stopped.
         self.harness_ab_wall_moved();
-        // An open menu's or page's offer turn is derived again from the wall
-        // too (a sleep left its monotonic due late), and where the wall is
-        // past it, the offer is built again now.
         if let Some((turn, _)) = self.autopilot_timers.offer_due {
             let (now, wall) = (mono_now(), wall_ms());
             if turn <= wall {
@@ -849,10 +671,7 @@ impl App {
         }
     }
 
-    /// Fire every due timer, each a compare-and-set on its session's stored
-    /// pair (§9.3.6, item 5) — after a successor's Commit, from the index
-    /// that Commit owes ([`Self::settle_autopilot_commit`]). With none armed,
-    /// nothing is read.
+    /// Fire every due timer, each a compare-and-set on its session's stored pair (§9.3.6, item 5) — after a successor's Commit, from the index that Commit owes ([`Self::settle_autopilot_commit`]).
     pub(crate) fn expire_autopilot_timers(&mut self) {
         self.settle_autopilot_commit();
         let Some(earliest) = self.autopilot_timer_deadline() else {
@@ -865,15 +684,12 @@ impl App {
         self.expire_autopilot_timers_at(now, wall_ms());
     }
 
-    /// [`Self::expire_autopilot_timers`] on given clocks: `now` decides which
-    /// entries are due, `wall_ms` what each fire compares against. Nothing
-    /// before a successor's Commit ([`Self::autopilot_timer_deadline`]).
+    /// [`Self::expire_autopilot_timers`] on given clocks: `now` decides which entries are due, `wall_ms` what each fire compares against.
     pub(crate) fn expire_autopilot_timers_at(&mut self, now: Instant, wall_ms: i64) {
         if self.incoming_handoff_pending {
             return;
         }
         for (local_id, entry) in self.autopilot_timers.take_due(now) {
-            // A session gone by the fire leaves no entry behind.
             let Some(ctx) = self.pool.get(local_id).map(|s| s.ctx.clone()) else {
                 continue;
             };
@@ -881,8 +697,6 @@ impl App {
                 crate::session_timeline::Fired::Landed { revision } => {
                     self.autopilot_timer_landed(local_id, entry, revision);
                 }
-                // The wall is short of it (set back, or the monotonic due ran
-                // early): indexed again from the remainder.
                 crate::session_timeline::Fired::NotYet(remaining) => {
                     let again = TimerEntry {
                         due: now + Duration::from_millis(u64::try_from(remaining).unwrap_or(0)),
@@ -890,9 +704,6 @@ impl App {
                     };
                     self.autopilot_timers.entries.insert(local_id, again);
                 }
-                // The store moved first (a hand write, a new arm): indexed
-                // again from what it holds — a `land_at` is only ever stored
-                // beside `cruise` — or not at all.
                 crate::session_timeline::Fired::Moved(stored) => {
                     if let Some(land_at_ms) = stored {
                         self.autopilot_timers.arm(
@@ -913,25 +724,14 @@ impl App {
     }
 
     /// The fan-out after a fire stored `land` (the same as a click's): the
-    /// tab chrome and the session's `events` watchers, the footer, the A/B
-    /// arm, the page, and the message log's record — which says what the
-    /// fire found ([`Self::autopilot_fire_over`]), and who set it: the timer
-    /// (§11.7.1, `set at the 18:00 timer`). The fire's `revision` is noted as
-    /// recorded (`App::record_wire_autopilot`).
     fn autopilot_timer_landed(&mut self, local_id: u64, entry: TimerEntry, revision: u64) {
         self.autopilot_recorded.insert(local_id, revision);
-        // `land` is the person's word, written for them at the instant they
-        // chose: the crash journal carries it on this turn — the fire runs
-        // after the park's own capture, and nothing else may wake the loop,
-        // so the turn's last look takes it (`App::journal_owner_words`,
-        // `App::crash_journal_wake`).
         self.journal_owner_words(local_id);
         self.refresh_meta_dependent_chrome(local_id);
         if let Some(session) = self.pool.get(local_id) {
             session.ctx.watchers.ring_watchers();
         }
         crate::claude_footer::post_changed(local_id);
-        // An open menu for it checks `⤓ Land now` and drops its cancel.
         self.refresh_autopilot_menu(local_id);
         self.note_harness_arm(local_id);
         self.harness_screen_moved();
@@ -940,18 +740,11 @@ impl App {
             .get(local_id)
             .map(|s| s.ctx.self_id.as_str().to_string());
         if let Some(sid) = sid {
-            // The record's line leads with its place, the pane named where
-            // the tab holds two agents; its title names none (§10.3.3, item
-            // 9). A fire over a pane no agent runs in is about that pane:
-            // named wherever its tab holds another (behaviour-4).
             let over = self.autopilot_fire_over(local_id, &sid);
             let place = match over {
                 crate::message_reporters::FireOver::NoAgent { .. } => self.pane_place(&sid).0,
                 _ => self.session_place(&sid),
             };
-            // Who set it: the timer the fire stored as the setter, named by
-            // its own clock — not the fire's, which a sleeping Mac or a
-            // restore makes later (§11.7.1).
             let clock = entry.glass.as_ref().map(|g| g.clock.as_str());
             let set_by = clock.map_or_else(
                 || "set by its timer".to_string(),
@@ -969,12 +762,6 @@ impl App {
     }
 
     /// WHAT THE FIRE FOUND on session `local_id` (`sid`, §10.2.3 item 8),
-    /// for its record: the window's harness off (no host, the master
-    /// switch), no agent in the pane (and whether its tab holds other
-    /// panes, [`Self::pane_place`]: the line then says `this pane`, since
-    /// another may run an agent), the agent's own switch off, else work the
-    /// harness lands. In that order: a switch that supervises nothing
-    /// outranks what the pane runs.
     fn autopilot_fire_over(&self, local_id: u64, sid: &str) -> crate::message_reporters::FireOver {
         use crate::autopilot::HarnessPosture;
         use crate::message_reporters::FireOver;
@@ -997,10 +784,7 @@ impl App {
         FireOver::Work
     }
 
-    /// The instant a timed choice from the window arms for session
-    /// `local_id` (§9.3.3, §9.3.4), unix ms, or `None` where it names
-    /// nothing (`At` with no `[harness] land_at`, a zone that cannot be read,
-    /// or the cancel, which arms nothing). One wall read.
+    /// The instant a timed choice from the window arms for session `local_id` (§9.3.3, §9.3.4), unix ms, or `None` where it names nothing (`At` with no `[harness] land_at`, a zone that cannot be read, or the cancel, which arms nothing).
     #[must_use]
     pub(crate) fn resolve_timer_choice(&self, choice: TimerChoice) -> Option<i64> {
         let when = match choice {
@@ -1015,10 +799,7 @@ impl App {
             .map(|resolved| resolved.at_ms)
     }
 
-    /// Settings ▸ Harness's timer press (`AppEffect::HarnessTimer`): the
-    /// session's choice written ([`Self::choose_autopilot_timer`]) from the
-    /// page, and the page republished either way so it converges on what is
-    /// stored.
+    /// Settings ▸ Harness's timer press (`AppEffect::HarnessTimer`): the session's choice written ([`Self::choose_autopilot_timer`]) from the page, and the page republished either way so it converges on what is stored.
     pub(crate) fn execute_harness_timer(
         &mut self,
         request: crate::native_app::HarnessTimerRequest,
@@ -1031,13 +812,7 @@ impl App {
         self.harness_screen_moved();
     }
 
-    /// A timer choice from the window (the menu, Settings ▸ Harness's
-    /// disclosure): a timed Cruise written through the window's one writer
-    /// ([`Self::set_session_autopilot_timed`]) with its instant, or the
-    /// cancel of whatever timer is armed ([`Self::cancel_autopilot_timer`]),
-    /// from `surface` (its setter, §11.7.3, item 2). Writes nothing where the
-    /// harness runs no mode here, or the choice names no instant. Whether the
-    /// pair moved.
+    /// A timer choice from the window (the menu, Settings ▸ Harness's disclosure): a timed Cruise written through the window's one writer ([`Self::set_session_autopilot_timed`]) with its instant, or the cancel of whatever timer is armed ([`Self::cancel_autopilot_timer`]), from `surface` (its setter, §11.7.3, item 2).
     pub(crate) fn choose_autopilot_timer(
         &mut self,
         local_id: u64,
@@ -1047,10 +822,7 @@ impl App {
         self.choose_autopilot_timer_naming(local_id, choice, None, surface)
     }
 
-    /// [`Self::choose_autopilot_timer`] from a row that named the instant
-    /// its cancel drops (`cancels`, the open menu's): the cancel then drops
-    /// that timer and no other. Judged by the session's own posture (the
-    /// window's joined with its agent's switch), as its mode buttons are.
+    /// [`Self::choose_autopilot_timer`] from a row that named the instant its cancel drops (`cancels`, the open menu's): the cancel then drops that timer and no other.
     pub(crate) fn choose_autopilot_timer_naming(
         &mut self,
         local_id: u64,
@@ -1074,15 +846,7 @@ impl App {
         self.set_session_autopilot_timed(local_id, Some(Autopilot::Cruise), Some(land_at), surface)
     }
 
-    /// "Cancel landing" (the menu's row, Settings' `Cancel`): session
-    /// `local_id`'s timer dropped with its Cruise kept — a COMPARE-AND-SET
-    /// on the stored pair (`session_timeline::cancel_land_at`), so it writes
-    /// nothing unless the store still holds `cruise` with a timer (the very
-    /// instant `expected` names, where the row named one). A cancel from a
-    /// page or a menu that went stale never writes `cruise` over a hand-
-    /// written word or the timer's own `land`. Fanned out as the window's
-    /// writer fans out a write ([`Self::autopilot_pair_written`]), its
-    /// setter the person at `surface`. Whether the pair moved.
+    /// "Cancel landing" (the menu's row, Settings' `Cancel`): session `local_id`'s timer dropped with its Cruise kept — a COMPARE-AND-SET on the stored pair (`session_timeline::cancel_land_at`), so it writes nothing unless the store still holds `cruise` with a timer (the very instant `expected` names, where the row named one).
     pub(crate) fn cancel_autopilot_timer(
         &mut self,
         local_id: u64,

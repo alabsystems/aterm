@@ -1,83 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Same-schema boundary publication (plan §4, design §3.9): replacing a hosted task's code at
-//! a step boundary without ever running new code over old state, or old code over new state.
-//!
-//! # The protocol
-//!
-//! * **Construct** with the task's schema, identity, live code, state and **acceptance
-//!   contract**: the boundary owns the contract it judges every candidate by, so no caller of
-//!   `prepare` or `commit` can hand it another judge (see "What the contract check
-//!   guarantees").
-//! * **Attach** takes checkpoint C0 of the live state at the current boundary and starts an
-//!   empty log; re-attaching re-anchors (a new checkpoint whose parent is the old one). An
-//!   attach between an admitted input and its advance is refused ([`PublishRefusal::MidStep`]):
-//!   no checkpoint is ever captured mid-step.
-//! * **Live**: [`Boundary::admit`] records each input before the host applies it through the
-//!   live code and calls [`Boundary::advance`] (or [`Boundary::withdraw`] when the step
-//!   refused it, which takes it back out of the log). A full or broken log re-anchors at the
-//!   next boundary rather than dropping anything. A second `admit` before the first one's
-//!   `advance` breaks the log and captures nothing: the next input admitted at a true boundary
-//!   re-anchors.
-//! * **Pause** at a boundary captures the expected live head H (revision, branch, identity,
-//!   state digest, cursors). While paused, queue-class inputs wait in a bounded queue and
-//!   skip-class inputs are skipped.
-//! * **Prepare** replays the *live* code from the ancestor checkpoint over the complete log
-//!   range `[checkpoint cursor, H cursor)` and requires it to reproduce H's state digest
-//!   exactly; checks the candidate's entry invariants on the ancestor state; replays the
-//!   candidate from the same ancestor over the same inputs; judges both runs by the
-//!   boundary's own contract (which must be the one the task identity names); and builds the
-//!   [`Witness`] (private fields), which records that contract. The candidate's new state is
-//!   never compared with H: it is meant to differ.
-//! * **Commit** re-checks that the paused live head still equals H ([`PublishRefusal::StaleHead`])
-//!   and that the witness matches this boundary's own ancestor and log; then installs the new
-//!   [`Pair`] — candidate code, replayed state, a new revision, the identity with the
-//!   candidate's code, a fresh checkpoint of the accepted state as the next ancestor and a
-//!   new log epoch — in **one assignment**, and delivers the queue once, in order, through the
-//!   new code.
-//! * **Reject** resumes the old pair and delivers the queue once, in order, through it. A
-//!   queue-class input that finds the queue full rejects the update **before** anything is
-//!   dropped: the queue, then that input, are delivered to the old pair.
-//!
-//! A second candidate prepared against the same head is stale once the first commits: the
-//! head's revision moved. A [`Boundary::restore`] mints a new branch and revision, so a
-//! candidate keyed to the pre-restore head is refused even when the restored state's bytes
-//! equal it.
-//!
-//! # What the contract check guarantees
-//!
-//! The acceptance contract is given once, to [`Boundary::new`], and `prepare` takes only the
-//! candidate: after construction no caller can substitute a judge, and every witness a
-//! boundary builds records the boundary's own contract artifact. `prepare` refuses
-//! ([`PublishRefusal::ContractMismatch`]) when that contract's declared artifact is not the
-//! one the task identity names, and `commit` refuses a witness naming any other contract.
-//!
-//! What is trusted: the constructor. A [`Contract`] is identified by the artifact id it
-//! declares, so whoever constructs a boundary is trusted to give it the first-party contract
-//! that id names (`TESTED_ASSUMPTIONS`). A second boundary constructed with a lenient
-//! contract under the same id, the same identity, ancestor, log and head would build a
-//! witness this boundary's `commit` cannot tell from its own; that is the same constructor
-//! trust, not a gap a caller of `prepare` or `commit` can open.
-//!
-//! # What is refused, and what a refusal leaves
-//!
-//! Every [`PublishRefusal`] leaves the boundary exactly as it was: still paused (if it was),
-//! the queue intact, the live pair untouched. `prepare` replays on private values only.
-//!
-//! # External effects
-//!
-//! The boundary holds no live effect sink: the inputs it delivers itself (the queue, the
-//! overflowing input) run under [`NoEffects`], and its replays run under a [`ShadowPort`]
-//! over an empty recording. A task that submits an external effect is therefore refused at
-//! `prepare` ([`PublishRefusal::LiveEffects`] / [`PublishRefusal::CandidateEffects`]) rather
-//! than published: an effect policy past the frontier is later work (plan §3).
-//!
-//! # Fault injection
-//!
-//! Under `cfg(any(test, debug_assertions))`, [`Boundary::commit_stopping_after`] runs the
-//! same commit code but stops after its `k`-th primitive store; every `k` leaves either the
-//! complete old pair or the complete new pair.
+//! Same-schema boundary publication (plan §4, design §3.9).
 
 use core::convert::Infallible;
 use core::fmt;
@@ -92,7 +16,7 @@ use crate::log::{EventLog, IdentityMismatch, LogHeader, RangeFault};
 use crate::replay::{Divergence, Run, replay};
 use crate::task::{Code, PausedClass, Schema, StepRefusal, state_digest};
 
-/// The live head: everything a publication must find unchanged.
+/// The live head.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Head {
     /// The task identity's digest ([`TaskIdentity::digest`]).
@@ -109,14 +33,13 @@ pub struct Head {
     pub effect_cursor: u64,
 }
 
-/// The live (code, state, head) published as one value: replaced only as a whole.
+/// The live (code, state, head) published as one value.
 pub struct Pair<S: Schema, C> {
     /// The live code.
     pub code: C,
     /// The live state.
     pub state: S::State,
-    /// Its head. `head.state_digest` is refreshed lazily while running: it is exact after
-    /// [`Boundary::pause`], [`Boundary::head`], `attach`, `commit` and `restore`.
+    /// Its head. `head.state_digest` is refreshed lazily while running.
     pub head: Head,
 }
 
@@ -142,25 +65,21 @@ impl<S: Schema, C: Code<S>> fmt::Debug for Pair<S, C> {
 /// What [`Boundary::admit`] did with an input.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Admit {
-    /// Running: the input is recorded (if attached); the host applies it through the live
-    /// code and then calls [`Boundary::advance`] (or [`Boundary::withdraw`] if the step
-    /// refused it).
+    /// Running: the input is recorded (if attached).
     Run,
     /// Paused: the input waits in the queue.
     Queued,
     /// Paused: a skip-class input the task does not observe while paused.
     Skipped,
     /// Paused with a full queue: the update was rejected, and the `delivered_after` queued
-    /// inputs and then this one were delivered, in order, to the old pair
-    /// ([`Boundary::take_delivered`] holds what each returned).
     Rejected {
+        /// How many queued inputs were delivered before this one.
         /// How many queued inputs were delivered before this one.
         delivered_after: usize,
     },
 }
 
-/// A candidate ready to commit: its code, its replayed state, and the witness `prepare`
-/// built. Private fields: only [`Boundary::prepare`] builds one.
+/// A candidate ready to commit.
 pub struct Prepared<S: Schema, C> {
     candidate: C,
     state: S::State,
@@ -212,8 +131,7 @@ pub struct Commit<S: Schema> {
     pub revision: Revision,
     /// The witness it was published on.
     pub witness: Witness,
-    /// What each queued input returned when delivered, once each, in order, through the new
-    /// code.
+    /// What each queued input returned when delivered, once each, in order, through the new code.
     pub delivered: Vec<Result<S::Observation, StepRefusal>>,
 }
 
@@ -227,7 +145,7 @@ impl<S: Schema> fmt::Debug for Commit<S> {
     }
 }
 
-/// What a boundary has done. Counters saturate.
+/// What a boundary has done.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Stats {
     /// Replays run by `prepare` (two per prepare that reached the candidate).
@@ -252,24 +170,22 @@ pub struct Stats {
     pub restores: u64,
 }
 
-/// Why a boundary operation was refused. The boundary is untouched: still paused if it was,
-/// the queue intact, the live pair and its log unchanged.
+/// Why a boundary operation was refused.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PublishRefusal {
-    /// No checkpoint and log: attach first.
+    /// No checkpoint and log.
     NotAttached,
     /// The operation needs a paused boundary.
     NotPaused,
     /// The boundary is already paused.
     AlreadyPaused,
-    /// An input was admitted and neither advanced nor withdrawn: not a step boundary.
+    /// An input was admitted and neither advanced nor withdrawn.
     MidStep,
-    /// The log is broken: some delivered input is missing, so no replay can cross it.
+    /// The log is broken.
     TraceIncomplete(&'static str),
     /// The replay range is not inside the log.
     Range(RangeFault),
     /// The candidate (or the boundary's schema) has another schema digest than the live
-    /// identity.
     SchemaChanged {
         /// The live identity's schema digest.
         live: Digest,
@@ -279,10 +195,10 @@ pub enum PublishRefusal {
     /// The candidate's artifact is not of kind code.
     NotCode {
         /// Its kind.
+        /// Its kind.
         kind: ArtifactKind,
     },
     /// The boundary's own contract (the one it was constructed with) is not the one the task
-    /// identity names.
     ContractMismatch {
         /// The identity's contract digest.
         live: Digest,
@@ -302,12 +218,12 @@ pub enum PublishRefusal {
     /// The candidate's replay refused the input at `cursor`.
     CandidateRefused {
         /// The cursor of the refused input.
+        /// The cursor of the refused input.
         cursor: u64,
     },
     /// The candidate's replay met the effect frontier.
     CandidateEffects(EffectDivergence),
-    /// The live head moved since the candidate was prepared. Both heads are boxed so a
-    /// `Result<_, PublishRefusal>` stays small.
+    /// The live head moved since the candidate was prepared.
     StaleHead {
         /// The head the candidate was prepared against.
         expected: Box<Head>,
@@ -317,7 +233,6 @@ pub enum PublishRefusal {
     /// The checkpoint, log and identity of the live pair do not descend from one another.
     LineageMismatch,
     /// The log extends another checkpoint than the boundary's ancestor: its header names
-    /// another ancestor digest.
     AncestorMismatch {
         /// The digest of the boundary's ancestor checkpoint.
         checkpoint: Digest,
@@ -327,9 +242,8 @@ pub enum PublishRefusal {
     /// The witness does not match this boundary's own ancestor, log or pair (the named part).
     WitnessMismatch(&'static str),
     /// The queue holds `cap` inputs. No operation of this boundary returns it: an input that
-    /// finds the queue full rejects the update instead ([`Admit::Rejected`]), so nothing is
-    /// ever dropped. It names the condition for a host's own report of that rejection.
     QueueFull {
+        /// The queue's capacity.
         /// The queue's capacity.
         cap: usize,
     },
@@ -436,8 +350,6 @@ impl<S: Schema> Clone for Recording<S> {
 }
 
 /// Everything a commit or restore replaces, held in one value so that replacing it is one
-/// assignment: the pair, the identity, the recording, and whether the head's state digest is
-/// current.
 struct Live<S: Schema, C> {
     pair: Pair<S, C>,
     identity: TaskIdentity,
@@ -495,7 +407,6 @@ enum Pending {
 }
 
 /// The gate every primitive store of `commit` passes. The production gate never stops
-/// (its stop type is uninhabited); the fault-injection gate stops after its `k`-th store.
 trait StoreGate {
     type Stop;
     fn store(&mut self) -> Result<(), Self::Stop>;
@@ -530,8 +441,7 @@ impl StoreGate for Countdown {
     }
 }
 
-/// One hosted task's live pair, its recording, its acceptance contract, and the
-/// publication protocol over them.
+/// One hosted task's live pair, its recording, its acceptance contract, and the publication protocol over them.
 pub struct Boundary<S: Schema, C: Code<S> + Clone, K: Contract<S>> {
     schema: S,
     /// The contract every candidate is judged by, fixed at construction.
@@ -584,14 +494,7 @@ fn bump(n: &mut u64) {
 }
 
 impl<S: Schema, C: Code<S> + Clone, K: Contract<S>> Boundary<S, C, K> {
-    /// A running, detached boundary over `state`, at revision 0 on branch 0 with both
-    /// cursors at 0, judging every candidate by `contract`. `queue_cap` bounds the inputs that
-    /// may wait during a pause.
-    ///
-    /// The constructor is trusted to pass the first-party contract the identity's contract
-    /// artifact names (module docs, "What the contract check guarantees"); a contract whose
-    /// declared artifact is another one makes every `prepare` refuse
-    /// ([`PublishRefusal::ContractMismatch`]).
+    /// A running, detached boundary over `state`, at revision 0 on branch 0 with both cursors at 0, judging every candidate by `contract`.
     pub fn new(
         schema: S,
         identity: TaskIdentity,
@@ -628,7 +531,7 @@ impl<S: Schema, C: Code<S> + Clone, K: Contract<S>> Boundary<S, C, K> {
         }
     }
 
-    /// The live pair. Its head's state digest may lag while running (see [`Pair::head`]).
+    /// The live pair.
     #[inline]
     #[must_use]
     pub const fn pair(&self) -> &Pair<S, C> {
@@ -707,28 +610,18 @@ impl<S: Schema, C: Code<S> + Clone, K: Contract<S>> Boundary<S, C, K> {
         }
     }
 
-    /// Fault injection: replaces the current recording's log with `log`, returning the one it
-    /// held (`None`, and `log` dropped, when detached). Nothing else changes, so a test can
-    /// hold a foreign log beside this boundary's ancestor and watch `prepare` and `commit`
-    /// refuse it ([`PublishRefusal::AncestorMismatch`]); no production path replaces a log.
+    /// Fault injection.
     #[cfg(any(test, debug_assertions))]
     pub fn graft_log(&mut self, log: EventLog<S>) -> Option<EventLog<S>> {
         let rec = self.live.recording.as_mut()?;
         Some(core::mem::replace(&mut rec.log, log))
     }
 
-    /// Live path. Running: records the input if attached, returns Run (the caller then applies
-    /// it to `pair_mut().state` through the SAME code functions `C::step` uses, and calls
-    /// `advance()`, or `withdraw()` if the step refused it). Paused: Queue-class inputs queue
-    /// (Queued), Skip-class ones are Skipped; a full queue rejects the update and returns
-    /// Rejected after delivering the queue and this input to the old pair through `C::step`.
+    /// Live path. Running.
     pub fn admit(&mut self, input: &S::Input) -> Admit {
         match &mut self.mode {
             Mode::Running => {
                 if self.pending != Pending::None {
-                    // Not a step boundary: the previous input may already be applied, so no
-                    // checkpoint may be captured now. The log breaks, this input is not
-                    // recorded, and the next input admitted at a true boundary re-anchors.
                     self.break_log("an admitted input was neither advanced nor withdrawn");
                     self.pending = Pending::Admitted { recorded: false };
                     return Admit::Run;
@@ -769,17 +662,14 @@ impl<S: Schema, C: Code<S> + Clone, K: Contract<S>> Boundary<S, C, K> {
         }
     }
 
-    /// The live code and state, for the host's live step. The head's state digest is
-    /// refreshed lazily afterwards.
+    /// The live code and state, for the host's live step.
     #[inline]
     pub fn pair_mut(&mut self) -> (&C, &mut S::State) {
         self.live.digest_fresh = false;
         (&self.live.pair.code, &mut self.live.pair.state)
     }
 
-    /// One delivered input: cursor + 1, state digest refresh deferred. Called without an
-    /// admitted input it still counts the delivery, and breaks the log (the input is not in
-    /// it).
+    /// One delivered input.
     pub fn advance(&mut self) {
         if self.pending == Pending::None {
             self.break_log("an input was advanced without being admitted");
@@ -789,8 +679,7 @@ impl<S: Schema, C: Code<S> + Clone, K: Contract<S>> Boundary<S, C, K> {
         self.bump_cursor();
     }
 
-    /// The admitted input's step refused it and left the state untouched: it leaves the log
-    /// and the head stays where it was.
+    /// The admitted input's step refused it and left the state untouched.
     pub fn withdraw(&mut self) {
         match self.pending {
             Pending::None => self.break_log("an input was withdrawn without being admitted"),
@@ -806,23 +695,15 @@ impl<S: Schema, C: Code<S> + Clone, K: Contract<S>> Boundary<S, C, K> {
         bump(&mut self.stats.refused);
     }
 
-    /// Marks a recording break (an input the host could not record): no repair replays
-    /// across it. The next live input re-anchors at a fresh checkpoint.
+    /// Marks a recording break (an input the host could not record).
     pub fn mark_broken(&mut self, why: &'static str) {
         self.break_log(why);
     }
 
-    /// Checkpoint C0 of the current state at the current boundary, and an empty log of
-    /// epoch `log_epoch` holding at most `max_events` inputs. Re-attaching re-anchors (the
-    /// new checkpoint's parent is the old one). A pending update is rejected first (the queue
-    /// is delivered to the old pair; [`Boundary::take_delivered`] holds what it returned).
+    /// Checkpoint C0 of the current state at the current boundary, and an empty log of epoch `log_epoch` holding at most `max_events` inputs.
     ///
     /// # Errors
-    ///
-    /// [`PublishRefusal::MidStep`] between an admitted input and its advance or withdraw: the
-    /// state may already hold the input the cursor does not count yet, so no checkpoint is
-    /// captured, and nothing changes (the recording, the pause and its queue stay as they
-    /// were).
+    /// [`PublishRefusal::MidStep`] between an admitted input and its advance or withdraw.
     pub fn attach(&mut self, log_epoch: u64, max_events: usize) -> Result<(), PublishRefusal> {
         if self.pending != Pending::None {
             return Err(PublishRefusal::MidStep);
@@ -837,8 +718,7 @@ impl<S: Schema, C: Code<S> + Clone, K: Contract<S>> Boundary<S, C, K> {
         Ok(())
     }
 
-    /// Stops recording. A pending update is rejected first (the queue is delivered to the old
-    /// pair).
+    /// Stops recording.
     pub fn detach(&mut self) {
         if self.is_paused() {
             self.last_delivered = self.resume_old(None);
@@ -863,8 +743,7 @@ impl<S: Schema, C: Code<S> + Clone, K: Contract<S>> Boundary<S, C, K> {
         self.live.recording.as_ref().map(|r| &r.log)
     }
 
-    /// Pauses at the current step boundary and returns the expected live head (with an exact
-    /// state digest).
+    /// Pauses at the current step boundary and returns the expected live head (with an exact state digest).
     pub fn pause(&mut self) -> Result<Head, PublishRefusal> {
         if self.is_paused() {
             return Err(PublishRefusal::AlreadyPaused);
@@ -884,9 +763,7 @@ impl<S: Schema, C: Code<S> + Clone, K: Contract<S>> Boundary<S, C, K> {
         Ok(expected)
     }
 
-    /// Replays the live code and the candidate from the ancestor checkpoint over the log up
-    /// to the paused head, judges both by the boundary's own contract, and returns the
-    /// candidate ready to commit with its witness. Changes nothing but [`Stats::replays`].
+    /// Replays live and candidate code from the ancestor checkpoint to the paused head, judges both by the boundary contract, and returns a prepared candidate.
     pub fn prepare(&mut self, candidate: C) -> Result<Prepared<S, C>, PublishRefusal> {
         let mut replays = 0u64;
         let r = self.prepare_runs(candidate, &mut replays);
@@ -963,13 +840,7 @@ impl<S: Schema, C: Code<S> + Clone, K: Contract<S>> Boundary<S, C, K> {
             .restore(schema, identity)
             .map_err(PublishRefusal::Restore)?;
 
-        // The live code, from the ancestor, over the complete range, must land exactly on the
-        // paused head: otherwise the log is not the history that produced it.
         let none: &[EffectRecord] = &[];
-        // The live run is judged as soon as it is checked, and only its verdict and chain
-        // outlive this block: its observations are not held through the candidate's replay,
-        // so a repair holds one run's observations at a time. A contract is a pure judgement
-        // of (inputs, run), so the verdict is the one a later judgement would give.
         let (live_verdict, live_observation_chain) = {
             let mut live_port = ShadowPort::new(none);
             let live_run = replay(
@@ -996,15 +867,12 @@ impl<S: Schema, C: Code<S> + Clone, K: Contract<S>> Boundary<S, C, K> {
                 }));
             }
             live_port.finish().map_err(PublishRefusal::LiveEffects)?;
-            // Repair is judged by the corrected contract, never by equivalence to the live
-            // code: the live verdict is recorded, not required.
             (
                 contract.judge(schema, inputs, &live_run),
                 live_run.observation_chain,
             )
         };
 
-        // The candidate continues from the same ancestor over the same inputs.
         candidate
             .entry(schema, &ancestor)
             .map_err(PublishRefusal::Entry)?;
@@ -1021,14 +889,10 @@ impl<S: Schema, C: Code<S> + Clone, K: Contract<S>> Boundary<S, C, K> {
             .finish()
             .map_err(PublishRefusal::CandidateEffects)?;
 
-        // Repair is judged by the corrected contract, never by equivalence to the live code.
         let candidate_verdict = contract.judge(schema, inputs, &cand_run);
         if !candidate_verdict.passed() {
             return Err(PublishRefusal::CandidateFailed(candidate_verdict));
         }
-        // Judged: the candidate's observations go here too, before the trace digest. They are
-        // moved out and dropped by name, since a field a pattern leaves behind would stay
-        // allocated in `cand_run` until `prepare` returns. `refused` is `None` here.
         let Run {
             state: candidate_state,
             state_digest: candidate_state_digest,
@@ -1064,11 +928,7 @@ impl<S: Schema, C: Code<S> + Clone, K: Contract<S>> Boundary<S, C, K> {
         })
     }
 
-    /// Publishes a prepared candidate iff the paused live head still equals the head it was
-    /// prepared against and its witness is this boundary's own: the new pair (code, replayed
-    /// state, new revision, identity with the candidate's code, fresh checkpoint and log
-    /// epoch) is installed in one assignment, then the queue is delivered once, in order,
-    /// through the new code.
+    /// Publishes a prepared candidate iff the paused live head still equals the head it was prepared against and its witness is this boundary's own.
     pub fn commit(&mut self, prepared: Prepared<S, C>) -> Result<Commit<S>, PublishRefusal> {
         match self.commit_gated(prepared, &mut Always) {
             Ok(r) => r,
@@ -1076,9 +936,7 @@ impl<S: Schema, C: Code<S> + Clone, K: Contract<S>> Boundary<S, C, K> {
         }
     }
 
-    /// Fault injection: [`Boundary::commit`], stopped after its `stores`-th primitive store.
-    /// `None` when it stopped; the boundary then holds either the complete old pair or the
-    /// complete new pair, and the queue is intact unless delivery began.
+    /// Fault injection.
     #[cfg(any(test, debug_assertions))]
     pub fn commit_stopping_after(
         &mut self,
@@ -1112,8 +970,6 @@ impl<S: Schema, C: Code<S> + Clone, K: Contract<S>> Boundary<S, C, K> {
             recording: Some(next.recording),
             digest_fresh: true,
         };
-        // The primitive stores. Everything above only read; a stop before the second store
-        // leaves the complete old pair, a stop after it the complete new one.
         gate.store()?;
         self.next_revision = next.revision_after;
         gate.store()?;
@@ -1125,7 +981,6 @@ impl<S: Schema, C: Code<S> + Clone, K: Contract<S>> Boundary<S, C, K> {
             Mode::Paused { queue, .. } => queue,
             Mode::Running => VecDeque::new(),
         };
-        // The pause is over and the new pair is live: the queue goes to it, once, in order.
         let mut delivered = Vec::with_capacity(queue.len());
         for input in queue {
             delivered.push(self.deliver(input));
@@ -1138,7 +993,6 @@ impl<S: Schema, C: Code<S> + Clone, K: Contract<S>> Boundary<S, C, K> {
     }
 
     /// Every check commit makes, and everything it installs besides the prepared code and
-    /// state. Reads only.
     fn next_publication(
         &self,
         prepared: &Prepared<S, C>,
@@ -1260,8 +1114,7 @@ impl<S: Schema, C: Code<S> + Clone, K: Contract<S>> Boundary<S, C, K> {
         })
     }
 
-    /// Rejects the pending update: the old pair resumes and receives the queue once, in
-    /// order. Running: nothing to reject, nothing delivered.
+    /// Rejects the pending update.
     pub fn reject(&mut self) -> Vec<Result<S::Observation, StepRefusal>> {
         if !self.is_paused() {
             return Vec::new();
@@ -1269,10 +1122,7 @@ impl<S: Schema, C: Code<S> + Clone, K: Contract<S>> Boundary<S, C, K> {
         self.resume_old(None)
     }
 
-    /// Restores a checkpoint of this task under the live identity (same code: applying other
-    /// code is `prepare`/`commit`) as a recorded transition, never an unchecked rewind: a new
-    /// branch and revision are minted, the restored checkpoint stays untouched as the parent
-    /// of a fresh one, and (if attached) a new log epoch starts.
+    /// Restores a checkpoint under the live identity as a recorded transition.
     pub fn restore(&mut self, checkpoint: &Checkpoint) -> Result<Head, PublishRefusal> {
         if self.is_paused() {
             return Err(PublishRefusal::AlreadyPaused);
@@ -1287,8 +1137,6 @@ impl<S: Schema, C: Code<S> + Clone, K: Contract<S>> Boundary<S, C, K> {
         let state = checkpoint
             .restore(&self.schema, &self.live.identity)
             .map_err(PublishRefusal::Restore)?;
-        // `Checkpoint::restore` re-derived the stored digest under this schema; the head still
-        // takes the digest of the state it now holds, never the checkpoint's word for it.
         let restored_digest = state_digest(&self.schema, &state);
         let rev = self.next_revision;
         let rev_after = rev
@@ -1365,14 +1213,11 @@ impl<S: Schema, C: Code<S> + Clone, K: Contract<S>> Boundary<S, C, K> {
         self.stats
     }
 
-    /// What each input delivered by the last overflow rejection, `attach` or `detach` returned
-    /// (once each, in order); empties the record.
+    /// What each input delivered by the last overflow rejection, `attach` or `detach` returned (once each, in order).
     #[inline]
     pub fn take_delivered(&mut self) -> Vec<Result<S::Observation, StepRefusal>> {
         core::mem::take(&mut self.last_delivered)
     }
-
-    // ---- internals ----
 
     #[inline]
     fn refresh_digest(&mut self) {
@@ -1427,10 +1272,6 @@ impl<S: Schema, C: Code<S> + Clone, K: Contract<S>> Boundary<S, C, K> {
     }
 
     /// Before an input is recorded: a broken or full log is replaced by a fresh checkpoint
-    /// of the current state (a true boundary) and an empty log of the next epoch, whose
-    /// parent is the checkpoint it replaces. That parent's digest is taken only then: it is
-    /// read by nothing else here, and an admit that needs no re-anchor (nearly every one)
-    /// would hash the checkpoint for nothing.
     fn ensure_room(&mut self) {
         let Some(rec) = &self.live.recording else {
             return;
@@ -1452,13 +1293,8 @@ impl<S: Schema, C: Code<S> + Clone, K: Contract<S>> Boundary<S, C, K> {
     }
 
     /// Delivers one input the boundary holds (queued or overflowing) to the live pair through
-    /// `C::step`, recording it if the step accepted it.
     fn deliver(&mut self, input: S::Input) -> Result<S::Observation, StepRefusal> {
         self.ensure_room();
-        // The step holds `&mut` state whatever it returns: as on the live path
-        // (`pair_mut`), the head's digest is re-derived before anyone reads it, so a step that
-        // breaks the refusal law (a refusal that still moved the state) is caught by `pause`
-        // and `prepare` (`LiveNotReproduced`) instead of hiding behind a stale digest.
         self.live.digest_fresh = false;
         let r = self.live.pair.code.step(
             &self.schema,
@@ -1484,7 +1320,6 @@ impl<S: Schema, C: Code<S> + Clone, K: Contract<S>> Boundary<S, C, K> {
     }
 
     /// Ends a pause without publishing: the old pair resumes and receives the queue, then
-    /// `extra`, once each, in order.
     fn resume_old(&mut self, extra: Option<S::Input>) -> Vec<Result<S::Observation, StepRefusal>> {
         let queue = match core::mem::replace(&mut self.mode, Mode::Running) {
             Mode::Paused { queue, .. } => queue,

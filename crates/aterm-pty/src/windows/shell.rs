@@ -1,17 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Shell selection + argv mapping for the Windows spawn.
-//!
-//! Selection order: the caller's override (config `shell` / `--shell`) →
-//! `pwsh.exe` → `powershell.exe` → `%COMSPEC%` → literal `cmd.exe`. `%SHELL%` is deliberately NOT consulted: in
-//! git-bash/MSYS sessions it holds a POSIX path (`/usr/bin/bash`) that
-//! `CreateProcessW` cannot exec. No login-dash `argv[0]` either — that is a
-//! POSIX login-shell convention; PowerShell/cmd would treat it as a bad path.
-//! Default interactive argv is the bare `[shell]` (transparency, same as
-//! Windows Terminal). The pure pieces (family detection, argv shapes, the
-//! path-like classifier) are unit-tested below; only `SearchPathW` touches the
-//! OS.
+//! Shell selection and `argv` mapping for Windows process spawning.
 
 use std::ffi::{OsStr, OsString};
 use std::os::windows::ffi::OsStringExt;
@@ -20,9 +10,7 @@ use std::path::Path;
 use super::cmdline::wide_nul;
 use super::ffi;
 
-/// Whether the resolved shell is `wsl.exe` (by file stem, case-insensitive) —
-/// the one shell whose `shell_args` are launcher options rather than shell
-/// options. See [`resolve_spawn_target`].
+/// Whether the resolved shell is `wsl.exe` (by file stem, case-insensitive).
 pub(crate) fn is_wsl_shell(shell: &OsStr) -> bool {
     Path::new(shell)
         .file_stem()
@@ -30,21 +18,12 @@ pub(crate) fn is_wsl_shell(shell: &OsStr) -> bool {
         .is_some_and(|s| s.eq_ignore_ascii_case("wsl"))
 }
 
-/// Whether `name` is used VERBATIM (an explicit absolute/relative path) rather
-/// than PATH-searched: it contains a separator (`\` or `/`) or a drive colon.
+/// Whether `name` is used verbatim (an explicit absolute/relative path) rather than PATH-searched.
 pub(crate) fn is_path_like(name: &str) -> bool {
     name.contains('\\') || name.contains('/') || name.contains(':')
 }
 
-/// PATH-resolve a `-e` program name, the Windows twin of the Unix
-/// `resolve_program`: a path-like name is used verbatim; otherwise
-/// `SearchPathW` probes with `.exe` first, then each remaining `%PATHEXT%`
-/// entry — the `.cmd`/`.bat` shims Node tooling ships (npm/yarn/pnpm) live only
-/// there, and `CreateProcessW` never PATH-searches a bare `lpApplicationName`
-/// itself (it does run a RESOLVED full `.cmd`/`.bat` path fine). Falls back to
-/// the name verbatim when nothing matches, so `CreateProcessW` fails cleanly
-/// (the `_exit(127)` analog) instead of this resolver masking a not-found
-/// command.
+/// PATH-resolve a `-e` program name, the Windows twin of the Unix `resolve_program`.
 pub(crate) fn resolve_program_windows(name: &str) -> OsString {
     if name.is_empty() || is_path_like(name) {
         return OsString::from(name);
@@ -54,7 +33,8 @@ pub(crate) fn resolve_program_windows(name: &str) -> OsString {
     }
     for ext in pathext() {
         if ext.eq_ignore_ascii_case(".exe") {
-            continue; // already probed above
+            // already probed above
+            continue;
         }
         if let Some(hit) = search_path_with_ext(name, &ext) {
             return hit;
@@ -67,8 +47,6 @@ pub(crate) fn resolve_program_windows(name: &str) -> OsString {
 const PATHEXT_DEFAULT: &str = ".COM;.EXE;.BAT;.CMD";
 
 /// Parse a `%PATHEXT%`-shaped list into its `.<ext>` entries; entries without a
-/// leading dot (or a bare `.`) are dropped, unset/empty falls back to the OS
-/// default. Pure, so it is unit-tested without mutating the process env.
 fn parse_pathext(raw: Option<&str>) -> Vec<String> {
     let raw = match raw {
         Some(s) if !s.trim().is_empty() => s,
@@ -87,8 +65,7 @@ fn pathext() -> Vec<String> {
     parse_pathext(raw.as_deref())
 }
 
-/// `SearchPathW(NULL, name, L".exe", …)`: the standard search order (app dir,
-/// system dirs, `%PATH%`), appending `.exe` when `name` has no extension.
+/// `SearchPathW(NULL, name, L".exe", …)`.
 pub(crate) fn search_path(name: &str) -> Option<OsString> {
     search_path_with_ext(name, ".exe")
 }
@@ -99,8 +76,7 @@ fn search_path_with_ext(name: &str, ext: &str) -> Option<OsString> {
     let ext_w = wide_nul(OsStr::new(ext));
     let mut buf: Vec<u16> = vec![0; 260];
     loop {
-        // SAFETY: `name_w`/`ext_w` are NUL-terminated wide strings live for the
-        // call; `buf` is a writable buffer of the advertised length.
+        // SAFETY: `name_w`/`ext_w` are NUL-terminated wide strings live for the call.
         let n = unsafe {
             ffi::SearchPathW(
                 std::ptr::null(),
@@ -112,45 +88,29 @@ fn search_path_with_ext(name: &str, ext: &str) -> Option<OsString> {
             )
         };
         if n == 0 {
-            return None; // not found
+            // not found
+            return None;
         }
         let n = n as usize;
         if n < buf.len() {
             return Some(OsString::from_wide(&buf[..n]));
         }
-        buf = vec![0; n + 1]; // n = required length (incl. NUL) when too small
+        buf = vec![0; n + 1];
     }
 }
 
-/// What the spawn's own name resolution made of a requested shell — the verdict
-/// [`resolve_shell_name`] acts on, published so a VALIDATOR can ask the real
-/// resolver instead of modelling it.
-///
-/// On Windows a bare name is the normal spelling: it is resolved here, before
-/// `CreateProcessW` — which is handed the result as `lpApplicationName` and
-/// does no searching of its own. Exposing the verdict rather than the rule
-/// keeps the validator and the spawn in step.
+/// What the spawn's own name resolution made of a requested shell.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ShellResolution {
-    /// A bare name the spawn's own resolution FOUND (alias discovery or
-    /// `SearchPathW`), carrying the absolute program it will actually run.
+    /// A bare name the spawn's own resolution found (alias discovery or `SearchPathW`).
     Resolved(OsString),
-    /// A bare name that resolved to nothing: `CreateProcessW` receives it
-    /// verbatim as `lpApplicationName` and fails `ERROR_FILE_NOT_FOUND`.
+    /// A bare name that resolved to nothing.
     Unresolved,
-    /// Path-like (`\`, `/`, or a drive colon) — the user gave an explicit path,
-    /// used VERBATIM. No search, and no extension is appended.
+    /// Path-like (`\`, `/`, or a drive colon).
     Verbatim(OsString),
 }
 
-/// Classify a shell NAME exactly as the spawn will (see [`ShellResolution`]).
-/// Precedence per name:
-///   1. path-like (`\`, `/`, or drive colon) → verbatim (the user gave a path);
-///   2. a KNOWN ALIAS that is not on PATH → its well-known install location
-///      ([`discover_shell`] — this is what makes `shell = "bash"` find Git Bash
-///      even though its `bin` is off the user's PATH);
-///   3. `SearchPathW` (`.exe` + `%PATHEXT%`) — a bare name on PATH;
-///   4. nothing matched → [`ShellResolution::Unresolved`].
+/// Classify a shell name exactly as the spawn will (see [`ShellResolution`]).
 pub fn classify_shell_name(name: &OsStr) -> ShellResolution {
     let s = name.to_string_lossy();
     if is_path_like(&s) {
@@ -165,14 +125,7 @@ pub fn classify_shell_name(name: &OsStr) -> ShellResolution {
     ShellResolution::Unresolved
 }
 
-/// Resolve a shell NAME the user asked for (config `shell` key or `--shell` flag)
-/// to a runnable program.
-///
-/// Defined IN TERMS OF [`classify_shell_name`] so the spawn and the config
-/// validator can never drift: there is one resolution, and this is the arm that
-/// turns its verdict into a program. An unresolved name falls back to the name
-/// verbatim so `CreateProcessW` fails cleanly, never a silent substitution of a
-/// different shell than the user named.
+/// Resolve a shell name the user asked for (config `shell` key or `--shell` flag) to a runnable.
 pub(crate) fn resolve_shell_name(name: &OsStr) -> OsString {
     match classify_shell_name(name) {
         ShellResolution::Resolved(hit) | ShellResolution::Verbatim(hit) => hit,
@@ -180,17 +133,7 @@ pub(crate) fn resolve_shell_name(name: &OsStr) -> OsString {
     }
 }
 
-/// Find a KNOWN shell by alias at its standard install location — the discovery
-/// that lets a user name a shell that isn't on `%PATH%`. Case-insensitive.
-///   * `bash` / `git-bash` / `gitbash` → Git for Windows `bin\bash.exe` (probed
-///     beside a PATH-resolved `git.exe`, then the standard Program Files /
-///     per-user install dirs);
-///   * `wsl` → `wsl.exe` (a `.exe` on the system PATH, but aliased for symmetry
-///     so `shell = "wsl"` reads naturally);
-///   * `nu` / `nushell` → `nu.exe` on PATH.
-///
-/// Returns `None` for an unknown alias or a known one that isn't installed, so
-/// the caller falls through to `SearchPathW`.
+/// Find a known shell by alias at its standard install location.
 pub(crate) fn discover_shell(name: &str) -> Option<OsString> {
     let lname = name.trim().to_ascii_lowercase();
     match lname.as_str() {
@@ -202,8 +145,6 @@ pub(crate) fn discover_shell(name: &str) -> Option<OsString> {
 }
 
 /// Locate Git for Windows' `bash.exe`. First beside a PATH-resolved `git.exe`
-/// (`<gitroot>\bin\bash.exe`, where `git.exe` sits in `<gitroot>\cmd`), then the
-/// standard machine + per-user install roots. The FIRST existing hit wins.
 fn discover_git_bash() -> Option<OsString> {
     // Beside git.exe: cmd\git.exe → ..\bin\bash.exe.
     if let Some(git) = search_path("git") {
@@ -215,7 +156,6 @@ fn discover_git_bash() -> Option<OsString> {
             }
         }
     }
-    // Standard install roots (machine + WOW64 + per-user).
     let roots = [
         std::env::var_os("ProgramFiles"),
         std::env::var_os("ProgramFiles(x86)"),
@@ -235,30 +175,23 @@ fn discover_git_bash() -> Option<OsString> {
     None
 }
 
-/// WHICH arm of [`select_shell_with_origin`] chose the shell — published so
-/// `aterm doctor` / `show-config` can name the program a new tab will run AND
-/// say why this machine gets it, instead of reporting the CLI process's own
-/// `$SHELL`/`%COMSPEC%` (which this resolver never reads).
+/// Which arm of [`select_shell_with_origin`] chose the shell.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShellOrigin {
-    /// The caller's `override_shell` (the window passes config `shell`, with
-    /// `--shell` already collapsed over it), through [`resolve_shell_name`].
+    /// The caller's `override_shell`.
     Override,
-    /// `pwsh.exe` on PATH — the first platform default.
+    /// `pwsh.exe` on PATH.
     Pwsh,
-    /// `powershell.exe` on PATH — no pwsh.
+    /// `powershell.exe` on PATH.
     PowerShell,
     /// `%COMSPEC%` — neither PowerShell on PATH.
     Comspec,
-    /// The literal `cmd.exe`: nothing else resolved and COMSPEC is unset/empty.
+    /// The literal `cmd.exe`: nothing else resolved and comspec is unset/empty.
     CmdLiteral,
 }
 
 impl ShellOrigin {
-    /// The one word a report prints for this arm (`shell_origin=default:<word>`):
-    /// the program or variable that chose the shell. `override` for
-    /// [`Self::Override`], which a caller names by its own input (`--shell`,
-    /// `aterm.toml`, the tab's own shell).
+    /// The one word a report prints for this arm (`shell_origin=default:<word>`).
     #[must_use]
     pub const fn word(self) -> &'static str {
         match self {
@@ -271,18 +204,12 @@ impl ShellOrigin {
     }
 }
 
-/// Select the interactive shell. Precedence: the caller's `override_shell`
-/// (config `shell` / `--shell`) → `pwsh.exe` → `powershell.exe` → `%COMSPEC%` →
-/// literal `cmd.exe`. See the module docs for the deliberate `%SHELL%` omission;
-/// `override_shell` goes through [`resolve_shell_name`] (path-like verbatim, else
-/// alias discovery, else PATH).
+/// Select the interactive shell.
 pub(crate) fn select_shell(override_shell: Option<&OsStr>) -> OsString {
     select_shell_with_origin(override_shell).0
 }
 
-/// [`select_shell`] with the arm that decided attached — the SAME resolution
-/// (the spawn calls this through `select_shell`), so a diagnostic built on it
-/// cannot name a shell the spawn would not run.
+/// [`select_shell`] with the arm that decided attached.
 pub fn select_shell_with_origin(override_shell: Option<&OsStr>) -> (OsString, ShellOrigin) {
     if let Some(ov) = override_shell.filter(|o| !o.is_empty()) {
         return (resolve_shell_name(ov), ShellOrigin::Override);
@@ -301,11 +228,7 @@ pub fn select_shell_with_origin(override_shell: Option<&OsStr>) -> (OsString, Sh
     (OsString::from("cmd.exe"), ShellOrigin::CmdLiteral)
 }
 
-/// Resolve the spawn target: `(program, argv)`. Precedence is identical to the
-/// Unix seam: `exec_command` (`-e`, runs the command directly — when it exits
-/// the session closes) > `argv_override` (the future shell-integration hook;
-/// program stays the selected shell) > the config `shell_args` > bare
-/// interactive `[shell]`.
+/// Resolve the spawn target.
 pub(crate) fn resolve_spawn_target(
     shell_override: Option<&str>,
     shell_args: Option<&[String]>,
@@ -313,9 +236,6 @@ pub(crate) fn resolve_spawn_target(
     exec_command: Option<&[OsString]>,
 ) -> (OsString, Vec<OsString>) {
     if let Some(cmd) = exec_command.filter(|c| !c.is_empty()) {
-        // The arguments pass as the OS gave them. A program name that is not
-        // Unicode (an unpaired surrogate) is not searched for: it is run as
-        // given, and `CreateProcessW` names it if it is not there.
         let program = cmd[0]
             .to_str()
             .map_or_else(|| cmd[0].clone(), resolve_program_windows);
@@ -323,19 +243,6 @@ pub(crate) fn resolve_spawn_target(
     }
     let shell = select_shell(shell_override.map(OsStr::new));
     if let Some(ov) = argv_override {
-        // `wsl.exe` is the one shell whose `shell_args` are OPTIONS OF THE
-        // LAUNCHER rather than of the interactive shell: `-d <distro>`,
-        // `-u <user>`, `--system` choose WHICH Linux the tab is. Splice them
-        // in ahead of the override's own arguments (wsl.exe takes options
-        // before the command), keeping argv[0] — the display token — first.
-        //
-        // Deliberately WSL-only. bash's override is `bash --rcfile <wrapper>`,
-        // and splicing a `shell_args = ["-l"]` in front of it would make bash a
-        // LOGIN shell, which reads `.bash_profile` INSTEAD of the `--rcfile` —
-        // i.e. it would disable the very integration the override installs.
-        // bash's and pwsh's own arguments reach them anyway: the frontend puts
-        // them inside the override where each accepts them, before it gets here
-        // (`aterm_shell_integration::merge_shell_args`).
         let args = shell_args.unwrap_or(&[]);
         if args.is_empty() || !is_wsl_shell(&shell) {
             let argv = ov.iter().map(OsString::from).collect();
@@ -347,8 +254,6 @@ pub(crate) fn resolve_spawn_target(
         argv.extend(ov.iter().skip(1).map(OsString::from));
         return (shell, argv);
     }
-    // Configured `shell_args` (e.g. `["-l", "-i"]` for a login bash) — argv[0] is
-    // the resolved shell, then the user's args verbatim. Empty is the bare shell.
     if let Some(args) = shell_args.filter(|a| !a.is_empty()) {
         let mut argv = vec![shell.clone()];
         argv.extend(args.iter().map(OsString::from));
@@ -363,19 +268,9 @@ mod tests {
     use super::*;
 
     /// Ask `CreateProcessW` what it makes of `program` as `lpApplicationName` —
-    /// the exact parameter [`super::super::spawn_shell_with_pid`] passes the
-    /// resolved shell in. `Ok(())` = it would run; `Err(code)` = the Win32 error
-    /// the spawn would surface.
-    ///
-    /// The probe is `CREATE_SUSPENDED` and terminates immediately on success:
-    /// the child runs ZERO instructions, so it never reaches the ntdll console
-    /// init that would allocate a console (and, on a box where Windows Terminal
-    /// is the default terminal, a WINDOW). Measuring must not litter the desktop.
     fn create_process_verdict(program: &str) -> Result<(), u32> {
         let app_w = wide_nul(OsStr::new(program));
-        // SAFETY: zeroed STARTUPINFOW is valid once `cb` is set; PROCESS_INFORMATION
-        // is POD out-memory; `app_w` is a NUL-terminated wide string alive across
-        // the call and every other pointer is NULL.
+        // SAFETY: Zeroed startupinfow is valid once `cb` is set.
         unsafe {
             let mut si: ffi::STARTUPINFOW = std::mem::zeroed();
             si.cb = u32::try_from(std::mem::size_of::<ffi::STARTUPINFOW>()).unwrap();
@@ -403,17 +298,6 @@ mod tests {
     }
 
     /// MEASURED, not assumed: what `lpApplicationName` accepts is the entire
-    /// justification for what `--validate-config` accepts and rejects, and a
-    /// validator that models it from POSIX habit is how a Windows user came to
-    /// be told to write `/bin/zsh`. Every arm below is a message that lane emits.
-    ///
-    /// The shape of the contract (and how it differs from `execve`):
-    ///   * an absolute path runs — with EITHER separator, Win32 canonicalizes
-    ///     `/` to `\`, so a forward-slash spelling is not a defect;
-    ///   * no default extension is appended — `…\cmd` is NOT `…\cmd.exe`;
-    ///   * NO path search — a bare name that got past resolution cannot run;
-    ///   * a quoted value is a FILENAME containing `"`, which is not a legal
-    ///     Windows filename character.
     #[test]
     fn create_process_application_name_contract() {
         /// `ERROR_FILE_NOT_FOUND`.
@@ -464,11 +348,6 @@ mod tests {
             "`%VAR%` is never expanded by CreateProcessW"
         );
 
-        // A `.cmd` SCRIPT reached by full path: `resolve_program_windows`
-        // deliberately resolves the `.cmd`/`.bat` shims Node tooling ships, and
-        // the config validator offers a missing extension back to the author, so
-        // whether a batch file is a runnable `lpApplicationName` decides what
-        // both are allowed to say. Probe a real one under temp.
         let script_dir = std::env::temp_dir().join(format!("aterm-lpan-{}", std::process::id()));
         std::fs::create_dir_all(&script_dir).unwrap();
         let script = script_dir.join("probe.cmd");
@@ -487,16 +366,13 @@ mod tests {
     fn path_like_classifier() {
         assert!(is_path_like("C:\\Windows\\cmd.exe"));
         assert!(is_path_like("bin/tool.exe"));
-        assert!(is_path_like("C:cmd")); // drive-relative counts as explicit
+        assert!(is_path_like("C:cmd"));
         assert!(!is_path_like("cmd"));
         assert!(!is_path_like("pwsh"));
     }
 
     #[test]
     fn search_path_finds_cmd_and_misses_nonsense() {
-        // cmd.exe lives in a system dir SearchPathW always probes, so this is
-        // hermetic (no PATH mutation needed — the harness is multi-threaded and
-        // env writes are UB-adjacent under edition 2024).
         let hit = search_path("cmd").expect("cmd.exe must resolve on Windows");
         assert!(
             hit.to_string_lossy()
@@ -555,9 +431,6 @@ mod tests {
 
     #[test]
     fn resolve_program_finds_cmd_and_bat_shims_via_pathext() {
-        // Hermetic (no PATH/PATHEXT mutation — multi-threaded harness): probe a
-        // stock System32 `.cmd`, a dir SearchPathW always searches. winrm.cmd
-        // ships on every Windows; a trimmed SKU that lacks it ends COULD NOT RUN.
         let sysroot = match std::env::var_os("SystemRoot") {
             Some(r) => r,
             None => aterm_spec::host::could_not_run("no %SystemRoot% here"),
@@ -596,7 +469,6 @@ mod tests {
 
     #[test]
     fn shell_override_selects_and_resolves_the_named_shell() {
-        // A bare known name resolves via SearchPathW (cmd is always present).
         let (program, argv) = resolve_spawn_target(Some("cmd"), None, None, None);
         assert!(
             program
@@ -606,7 +478,6 @@ mod tests {
             "override 'cmd' resolves to cmd.exe: {program:?}"
         );
         assert_eq!(argv, vec![program], "bare interactive argv is [shell]");
-        // A path-like override is used verbatim (even if absent → fails cleanly).
         let (p2, _) = resolve_spawn_target(Some("C:\\x\\my.exe"), None, None, None);
         assert_eq!(p2, OsString::from("C:\\x\\my.exe"), "path-like verbatim");
     }
@@ -627,16 +498,10 @@ mod tests {
             discover_shell("definitely-not-a-shell").is_none(),
             "unknown alias falls through to SearchPathW"
         );
-        // `bash` discovery is environment-dependent (Git for Windows may or may
-        // not be installed on CI), so we only assert the None path here; the
-        // positive path is covered by the live smoke on the owner's machine.
     }
 
     #[test]
     fn wsl_shell_args_survive_the_integration_argv_override() {
-        // `shell = "wsl"` + `shell_args = ["-d", "Debian"]` chooses WHICH distro
-        // the tab is; the options must be spliced in ahead of the override's own
-        // arguments (wsl.exe takes options before the command).
         let args = vec!["-d".to_string(), "Debian".to_string()];
         let ov = vec![
             "wsl".to_string(),
@@ -667,17 +532,12 @@ mod tests {
             .map(OsString::from)
             .to_vec()
         );
-        // No shell_args → the override is used exactly as given.
         let (_, plain) = resolve_spawn_target(Some("wsl"), None, Some(&ov), None);
         assert_eq!(plain, ov.iter().map(OsString::from).collect::<Vec<_>>());
     }
 
     #[test]
     fn non_wsl_argv_override_still_replaces_argv_entirely() {
-        // bash's override IS the integration: splicing `-l` in front of
-        // `--rcfile` would make bash a LOGIN shell, which reads .bash_profile
-        // instead of the rcfile — i.e. it would disable the injection. Only
-        // wsl.exe gets the splice.
         let args = vec!["-l".to_string()];
         let ov = vec![
             "bash".to_string(),
@@ -703,13 +563,8 @@ mod tests {
     }
 
     /// The verdict config validation reads. A bare name that RESOLVES is the
-    /// normal Windows spelling — the whole reason `--validate-config` must not
-    /// warn about `pwsh` — and `resolve_shell_name` must be exactly this
-    /// classification with the verdict collapsed, so the spawn and the
-    /// validator cannot disagree about the same string.
     #[test]
     fn classify_shell_name_is_the_resolution_the_spawn_performs() {
-        // A bare name on PATH: RESOLVED, to the program the spawn will run.
         let cmd = classify_shell_name(OsStr::new("cmd"));
         match &cmd {
             ShellResolution::Resolved(p) => assert!(
@@ -720,7 +575,6 @@ mod tests {
             ),
             other => panic!("a bare name on PATH must be Resolved, got {other:?}"),
         }
-        // Case-insensitive, and an explicit extension is fine too.
         for spelling in ["CMD", "cmd.exe"] {
             assert!(
                 matches!(
@@ -730,19 +584,16 @@ mod tests {
                 "{spelling:?} must resolve"
             );
         }
-        // A bare name that is nowhere: UNRESOLVED (CreateProcessW would fail).
         assert_eq!(
             classify_shell_name(OsStr::new("aterm-no-such-shell-xyz")),
             ShellResolution::Unresolved
         );
-        // Path-like, in every Windows spelling: VERBATIM, never searched — and
-        // never second-guessed for existing, which is the validator's job.
         for path in [
             "C:\\Windows\\System32\\cmd.exe",
             "C:/Windows/System32/cmd.exe",
             "C:\\Program Files\\Git\\bin\\bash.exe",
             "\\\\server\\share\\sh.exe",
-            "C:cmd", // drive-relative
+            "C:cmd",
             "C:\\nonexistent\\x.exe",
         ] {
             assert_eq!(
@@ -751,7 +602,6 @@ mod tests {
                 "{path:?} is path-like and must pass through verbatim"
             );
         }
-        // The collapse law: `resolve_shell_name` IS this classification.
         for name in [
             "cmd",
             "aterm-no-such-shell-xyz",
@@ -770,10 +620,6 @@ mod tests {
     }
 
     /// `select_shell_with_origin` IS `select_shell` with the deciding arm named:
-    /// the program never differs, an override is always `Override`, and with
-    /// nothing named the origin is one of the platform-default arms — `Pwsh`
-    /// whenever pwsh is on PATH, as it is on the owner's box. (The resolver
-    /// reads no aterm environment variable: `%ATERM_SHELL%` is retired.)
     #[test]
     fn select_shell_with_origin_names_the_arm_select_shell_took() {
         let (program, origin) = select_shell_with_origin(Some(OsStr::new("cmd")));
@@ -786,8 +632,6 @@ mod tests {
                 .ends_with("cmd.exe"),
             "an override resolves exactly as select_shell resolves it: {program:?}"
         );
-        // An unresolvable override is still the override, verbatim (CreateProcessW
-        // then fails cleanly) — the origin says where the bad name came from.
         assert_eq!(
             select_shell_with_origin(Some(OsStr::new("aterm-no-such-shell-xyz"))),
             (
@@ -795,7 +639,6 @@ mod tests {
                 ShellOrigin::Override
             )
         );
-        // An empty override is no override.
         let (program, origin) = select_shell_with_origin(Some(OsStr::new("")));
         assert_eq!((program.clone(), origin), select_shell_with_origin(None));
         assert_eq!(program, select_shell(None));
@@ -816,7 +659,6 @@ mod tests {
 
     #[test]
     fn path_like_names_bypass_discovery() {
-        // resolve_shell_name must pass an explicit path verbatim without probing.
         assert_eq!(
             resolve_shell_name(OsStr::new("C:\\Program Files\\Git\\bin\\bash.exe")),
             OsString::from("C:\\Program Files\\Git\\bin\\bash.exe")

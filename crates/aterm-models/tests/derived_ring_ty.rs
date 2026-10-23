@@ -1,13 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
-//
-//! Tier-0 for `ty_model!` models (`aterm_spec::derive`'s module docs): each
-//! model's generated TLA+ (`Model::to_tla()` / `.to_cfg()`) is exhaustively
-//! checked over its bounded state space, so a model change re-checks the spec.
-//!
-//! Two tiers ([`aterm_spec::verify`]): the in-process interpreter always
-//! discharges every obligation, and the external `ty` re-checks it wherever it
-//! is installed. The tiers must agree; disagreement panics.
+//! Tier-0 for `ty_model!` models (`aterm_spec::derive`'s module docs).
 
 #![allow(
     clippy::disallowed_types,
@@ -25,22 +18,7 @@ use aterm_models_session::{
 use aterm_spec::derive::Model;
 use aterm_spec::verify;
 
-// --- What the registry sweeps do not cover ---
-//
-// A REGISTERED model needs no test here, and every model written with
-// `ty_model!` or `#[aterm_spec::model]` registers itself: `tests/non_vacuity.rs`
-// holds each one, in every configuration it declares, to `verify::sweep_faults`
-// (it holds with no mutant on, and each of its claims is broken by a `Buggy`
-// mutant), and `spec-check models` walks the same space with `ty`. What is left
-// is what that sweep does not ask: deadlock freedom, a scenario matrix whose
-// corners must hold or break, the multiplication defect of a scope-aggregate
-// model, and a law that must break alone, pinned by name with the paths it is
-// about.
-
 /// NO WEDGE: deadlock-free at `Buggy = 0` and a DEADLOCK (not an invariant
-/// violation) at `Buggy = 1`, on both tiers — the blocking-call class (the
-/// `drain_buffered` `fill_buf` hang) no reachable-bad-STATE invariant can see.
-/// `is_final` marks the legitimate work-complete terminal.
 #[test]
 fn designs_that_must_not_wedge_are_deadlock_free_and_catch_the_wedge() {
     type Final = fn(&aterm_spec::interp::State) -> bool;
@@ -50,7 +28,6 @@ fn designs_that_must_not_wedge_are_deadlock_free_and_catch_the_wedge() {
         (forward_handshake_model(), |s| {
             s.get("client_waiting") == Some(&0)
         }),
-        // The fleet listener's TLS relay (aterm-net's `tls::relay_answers`).
         (tls_buffered_relay_model(), |s| {
             s.get("service_waiting") == Some(&0)
         }),
@@ -62,13 +39,6 @@ fn designs_that_must_not_wedge_are_deadlock_free_and_catch_the_wedge() {
 }
 
 /// Sparkle-words v2 flash limiter (design §6.4/§9): WCAG 2.3.1, model-checked.
-/// The interpreter PROVES `IgnitionBound` (≤ 2 ignitions per rolling second, ≤ 1 under
-/// overlap) and the REGION-scoped `RegionFlashPairs ≤ 3` at `Buggy = 0` for
-/// BOTH `Overlap ∈ {0, 1}`, and CATCHES the overlap-blind limiter at
-/// `Buggy = 1, Overlap = 1` (two overlapping ignitions in one second ⇒ 4
-/// transition pairs on the shared region). `Buggy = 1, Overlap = 0` stays
-/// green by design — disjoint novas at 2/s are legal, which is why the pair
-/// bound is per-region, not window-global (the §9 binding-spec erratum).
 #[test]
 fn derived_flash_limiter_proves_and_catches_overlap_blindness() {
     for (buggy, overlap, holds) in [(0, 0, true), (0, 1, true), (1, 0, true), (1, 1, false)] {
@@ -85,28 +55,16 @@ fn derived_flash_limiter_proves_and_catches_overlap_blindness() {
 }
 
 /// Scope-aggregate models: a budget charged against EVERY live instance at
-/// once — the window's WCAG flash budget (`FlashLimiterWindow`, the
-/// machine-checked form of the scope-cardinality census's `flash-limiter`
-/// claim), the process's alt-screen archive pool (`AltArchivePool`), one live
-/// holder per session id (`SessionIdClaim`). A per-instance theorem stays true
-/// however many instances exist, so each model also carries `Local = 1` (every
-/// instance deciding alone), which must break it at every corner: the
-/// multiplication defect (`verify::prove_catch_and_multiply_scalar`'s five
-/// gates).
 #[test]
 fn scope_aggregate_models_prove_catch_and_multiply() {
     type Corner = &'static [(&'static str, i64)];
     let rows: [(Model, &[Corner], Corner); 3] = [
-        // An overlap-blind limiter misbehaves only where regions coincide, but
-        // multiplying enforcers is wrong at both `Overlap` corners.
         (
             flash_limiter_window_model(),
             &[&[], &[("Overlap", 1)]],
             &[("Overlap", 1)],
         ),
         (alt_archive_pool_model(), &[&[]], &[]),
-        // The lock goes free across a seamless handoff while the successor's
-        // own entry holds the id, so the entry gate's mutant shows only there.
         (
             session_id_claim_model(),
             &[&[], &[("Handoff", 1)]],
@@ -119,36 +77,15 @@ fn scope_aggregate_models_prove_catch_and_multiply() {
 }
 
 /// A model using the `Buggy` convention: the invariant must be PROVEN at the
-/// committed `Buggy=0`, and a COUNTEREXAMPLE found at `Buggy=1` — so the
-/// invariant is non-trivial AND genuinely catches the bug
-/// ([`verify::prove_and_catch_scalar`]; a function-valued model is
-/// `spec-check models`'s, under `ty`).
 fn assert_proves_and_catches(m: &Model) {
     verify::prove_and_catch_scalar(m, m.name);
 }
 
 /// Every design invariant must be the ONLY law some `Buggy = 1` step breaks — a
-/// transition out of a reachable state where every invariant still holds, into
-/// one where that law, and no other, fails.
-///
-/// Isolation alone accepts an invariant that is only ever reached through a
-/// state another law already refused: an inline `Buggy` arm that makes one
-/// slip unavoidable before the next can fire, or a mutant whose harm is a
-/// consequence of an earlier one. Being among the laws a first step breaks is
-/// not enough either: a law that repeats clauses of others breaks on exactly
-/// their steps, never alone, and its catch is theirs. Such a law carries no
-/// catch of its own, and the per-invariant ratchet cannot see that. This walks
-/// the `Buggy = 1` space from every all-good state and demands that each design
-/// law be the sole law some single step breaks. A model written for more than
-/// one `Buggy` dial ([`Model::mutant_dials`]) is walked at each: a law's
-/// first break may come from any member of its mutant family.
 fn assert_every_invariant_breaks_first(m: &Model) {
     let mut alone: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
     for dial in m.mutant_dials() {
         let buggy = aterm_spec::interp::with_buggy(m, dial);
-        // Walked resolved (`aterm_spec::interp::Resolved`): the same states
-        // and verdicts as `successors` / `check_invariant` by name, without
-        // the string-keyed map each of those builds per call.
         let r = aterm_spec::interp::Resolved::new(&buggy).expect("the model resolves");
         let laws = 0..buggy.invariants.len();
         let mut seen = std::collections::HashSet::new();
@@ -200,12 +137,6 @@ fn assert_every_invariant_breaks_first(m: &Model) {
 }
 
 /// The committed-dead actions of `m` are exactly `expected`, pinned where the
-/// mutants are written, so a mutant folded back into a live action — which masks
-/// its neighbours and removes a healthy path from the `Buggy=1` world — fails
-/// here by name. That each one is an independently caught mutant (the all-live
-/// `Buggy=1` baseline is safe, and each dead action, added back ALONE, fires and
-/// is caught) is `verify::sweep_faults`' audit of every registered model, the
-/// `non_vacuity` test's, over these same configurations.
 fn assert_committed_dead_actions(m: &Model, expected: &[&str]) {
     let healthy_fired = aterm_spec::interp::fired_actions(&aterm_spec::interp::with_buggy(m, 0));
     let dead: Vec<_> = m
@@ -322,8 +253,6 @@ fn derived_same_caret_typed_echo_requires_exact_oldest_key_and_fresh_probe() {
 fn derived_erased_key_echo_order_keeps_the_next_key_lit() {
     let model = erased_key_echo_order_model();
     assert_proves_and_catches(&model);
-    // The owner's take: `s` erased before its echo, the Space typed, the late
-    // `s` echo, then the retreat and the Space apart or as one repaint.
     let apart = [
         "EraseUnechoed",
         "NextKey",
@@ -354,14 +283,6 @@ fn derived_erased_key_echo_order_keeps_the_next_key_lit() {
 }
 
 /// The session log's ring (`docs/DESIGN-session-log-2026-10-15.md` §5.1,
-/// §9; phase 2A): each law is the only one some single
-/// `Buggy = 1` step breaks, every mutant is a dead action at the committed
-/// config that is caught on its own, and the paths the laws are about are
-/// reachable: a batch takes a closed turn's detail before its open and keeps
-/// its close, the open path alone may overfill the ring by the one record just
-/// appended, an orphan step outlives a turn beside it, and a run closed
-/// mid-turn cascades over its turn and step. Tier-1: aterm-slog's
-/// `slog_ring_conforms_to_derived_model`.
 #[test]
 fn derived_session_log_ring_proves_and_catches_each_law() {
     let model = aterm_models_session::session_log_ring_model();
@@ -384,7 +305,6 @@ fn derived_session_log_ring_proves_and_catches_each_law() {
             "RefoldFromRing",
         ],
     );
-    // Fire `action`, then the batch it armed, one eviction at a time.
     let settle = |m: &aterm_spec::derive::Model, s: &mut aterm_spec::interp::State| {
         for _ in 0..16 {
             if s["ev"] == 0 {
@@ -407,7 +327,6 @@ fn derived_session_log_ring_proves_and_catches_each_law() {
         panic!("a batch that never ends: {s:?}");
     };
 
-    // A closed turn's detail goes first, then its open; its close stays.
     let mut s = model.init_state();
     for action in ["OpenRun", "OpenTurn", "Mark", "CloseTurn"] {
         assert!(model.fire(action, &mut s), "{action}: {s:?}");
@@ -423,7 +342,6 @@ fn derived_session_log_ring_proves_and_catches_each_law() {
         "the close outlives its detail and its open"
     );
 
-    // The open path alone may overfill the ring by the record just appended.
     let mut p = model.init_state();
     for action in ["OpenRun", "OpenTurn", "OpenStep", "Mark"] {
         assert!(model.fire(action, &mut p), "{action}: {p:?}");
@@ -435,8 +353,6 @@ fn derived_session_log_ring_proves_and_catches_each_law() {
         "nothing to take: the open path and the newest stay"
     );
 
-    // An orphan step on the run outlives a turn opened and closed beside it;
-    // the run's close then cascades over it (a wider `MaxSeq` leaves room).
     let wide = aterm_spec::interp::with_consts(&model, &[("MaxSeq", 9)]);
     let mut o = wide.init_state();
     for action in [
@@ -454,7 +370,6 @@ fn derived_session_log_ring_proves_and_catches_each_law() {
         (0, 0, 0, 0, 1)
     );
     assert_eq!(o["seq"], 6);
-    // A run closed over its open turn and step writes three records.
     let mut c = wide.init_state();
     for action in ["OpenRun", "OpenTurn", "OpenStep", "CloseRunCascade"] {
         assert!(wide.fire(action, &mut c), "{action}: {c:?}");
@@ -462,10 +377,6 @@ fn derived_session_log_ring_proves_and_catches_each_law() {
     }
     assert_eq!((c["seq"], c["tclose"], c["tn"], c["fturns"]), (6, 1, 1, 1));
 
-    // An update that carries no records: the manifest draws the count, the
-    // outgoing process writes on within the reserve, and the successor's
-    // seqs start above everything it wrote. Past the reserve the Commit
-    // stands down.
     let mut u = model.init_state();
     for action in ["OpenRun", "Mark", "Draw", "Mark"] {
         assert!(model.fire(action, &mut u), "{action}: {u:?}");
@@ -487,8 +398,6 @@ fn derived_session_log_ring_proves_and_catches_each_law() {
         "the successor's gap at the drawn count plus one"
     );
 
-    // A carry cannot shed its mandatory path to fit a hard record bound.
-    // The uncarried handoff remains available at that same manifest.
     let mut too_wide = model.init_state();
     for action in ["OpenRun", "OpenTurn", "OpenStep", "Draw"] {
         assert!(model.fire(action, &mut too_wide), "{action}: {too_wide:?}");
@@ -500,10 +409,6 @@ fn derived_session_log_ring_proves_and_catches_each_law() {
         !aterm_spec::interp::with_buggy(&model, 1).action_enabled("HandoffForgetsOpen", &too_wide)
     );
 
-    // A carried update: the open run stays open, the carry sheds in the
-    // eviction order down to its bound (one of the two marks, counted), and
-    // the successor's handoff mark lands above the reserve, in the same seq
-    // space.
     let mut c = model.init_state();
     for action in ["OpenRun", "Mark", "Mark", "Draw"] {
         assert!(model.fire(action, &mut c), "{action}: {c:?}");
@@ -540,7 +445,6 @@ fn derived_session_log_ring_proves_and_catches_each_law() {
         "the mark above the reserve; the seq space goes on"
     );
 
-    // A crash adoption: a new seq space from 1, at an epoch above the last.
     let mut k = model.init_state();
     for action in ["OpenRun", "Mark"] {
         assert!(model.fire(action, &mut k), "{action}: {k:?}");
@@ -561,13 +465,6 @@ fn derived_session_log_ring_proves_and_catches_each_law() {
 }
 
 /// THE BUS MIRROR (design §5.5, phase 4): each of the reader's-view laws is
-/// the only one some single `Buggy = 1` step breaks, every mutant is dead at
-/// the committed config and caught on its own, and the paths are reachable:
-/// a hole said by one cover; a slot pinned under the update's fence that no
-/// landing passes, landed by the successor only after it adopted the session,
-/// its carried cursor moved past the pin; another writer's record
-/// at the pinned seq re-pinned, never landed. Tier-1: aterm-link's
-/// `log_mirror_conforms_to_derived_model`.
 #[test]
 fn derived_log_mirror_proves_and_catches_each_law() {
     let model = aterm_models_session::log_mirror_model();
@@ -585,10 +482,6 @@ fn derived_log_mirror_proves_and_catches_each_law() {
             "CloseDropsTail",
         ],
     );
-    // A session that closes under the update's fence, its close the record
-    // past the fence: the Commit stands down (it needs every session it
-    // drew), and once the fence is lifted the closed session's tail lands
-    // whole.
     let mut c = model.init_state();
     for action in [
         "Append",
@@ -628,7 +521,6 @@ fn derived_log_mirror_proves_and_catches_each_law() {
         (3, 1, 1, 1),
         "the closed session's tail, all of it on the bus"
     );
-    // A hole between two live records: one cover, then the record after it.
     let mut g = model.init_state();
     for action in [
         "Append",
@@ -660,8 +552,6 @@ fn derived_log_mirror_proves_and_catches_each_law() {
         (1, 1, 0, 1, 3),
         "said once each, dense"
     );
-    // The update: a slot pinned and published under the fence is refused its
-    // landing; the successor lands it only once it has adopted the session.
     let mut u = model.init_state();
     for action in [
         "Append",
@@ -696,7 +586,6 @@ fn derived_log_mirror_proves_and_catches_each_law() {
         (2, 1, 0),
         "landed past the shed record, never covered"
     );
-    // Another writer's record at the pinned seq: re-pinned, then published.
     let mut f = model.init_state();
     for action in ["Append", "TakeRecord", "Foreign"] {
         assert!(model.fire(action, &mut f), "{action}: {f:?}");
@@ -709,11 +598,6 @@ fn derived_log_mirror_proves_and_catches_each_law() {
 }
 
 /// The session log's reader (§5.1, phase 2A): each law is the
-/// only one some single `Buggy = 1` step breaks, every mutant is dead at the
-/// committed config and caught on its own, and the paths are reachable: a
-/// read across a hole is told so and counts it as no loss, and a read cut at
-/// a live record past an eviction in the middle counts the eviction once.
-/// Tier-1: aterm-slog's `slog_cursor_conforms_to_derived_model`.
 #[test]
 fn derived_session_log_cursor_proves_and_catches_each_law() {
     let model = aterm_models_session::session_log_cursor_model();
@@ -746,8 +630,6 @@ fn derived_session_log_cursor_proves_and_catches_each_law() {
     assert!(model.fire("ReadAll", &mut m));
     assert_eq!((m["cur"], m["got"], m["rlost"]), (4, 3, 1), "told once");
 
-    // The overlap: a reader fenced at the carry reads nothing the outgoing
-    // process wrote after it; once committed those seqs are holes, said.
     let mut f = model.init_state();
     for action in ["Append", "Append", "Export", "OverlapAppend", "ReadAll"] {
         assert!(model.fire(action, &mut f), "{action}: {f:?}");
@@ -765,14 +647,6 @@ fn derived_session_log_cursor_proves_and_catches_each_law() {
 }
 
 /// The journal reader's view: each of its five laws
-/// is the only one some single `Buggy = 1` step breaks, every mutant is dead
-/// at the committed config and caught on its own, and the paths: a line
-/// journaled twice reads once, a dead chain reads its crash closes innermost
-/// first (turn, run, session) after a crash gap at the journal's head, a lost
-/// run's turn closes before the session, a loss is said, a crash with a
-/// backlog and a snap written behind says `after=` the writer's cursor, a
-/// `#handed` chain reads open and a rolled-back one closed. Tier-1:
-/// aterm-slog's `slog_journal_view_conforms_to_derived_model`.
 #[test]
 fn derived_session_log_journal_proves_and_catches_each_law() {
     let model = aterm_models_session::session_log_journal_model();
@@ -825,8 +699,6 @@ fn derived_session_log_journal_proves_and_catches_each_law() {
         (1, 1, 0, 2),
         "a lost run"
     );
-    // Behind: the log at 3, the writer at 1, a snap written there; the crash
-    // gap says the writer's cursor.
     let mut b = model.init_state();
     fire(
         &mut b,
@@ -835,7 +707,6 @@ fn derived_session_log_journal_proves_and_catches_each_law() {
         ],
     );
     assert_eq!((b["sb"], b["ca"], b["vs"]), (3, 1, 0), "after= the cursor");
-    // Handed, then the update stood down (a snap voids it), then a crash.
     let mut h = model.init_state();
     fire(&mut h, &["Append", "Write", "Hand", "Crash", "Read"]);
     assert_eq!((h["vs"], h["ca"]), (1, 0), "handed on: open, no crash");
@@ -848,11 +719,6 @@ fn derived_session_log_journal_proves_and_catches_each_law() {
 }
 
 /// The mark quota (§7.4): each of its four laws is the
-/// only one some single `Buggy = 1` step breaks, every mutant is dead at the
-/// committed config and caught on its own, and the paths: a third mark takes
-/// the first, a fence keeps its marks past the quota (only the newest beside
-/// them), lifting it trims them, and a lowered budget lowers the share.
-/// Tier-1: aterm-slog's `slog_mark_quota_conforms_to_derived_model`.
 #[test]
 fn derived_session_log_mark_quota_proves_and_catches_each_law() {
     let model = aterm_models_session::session_log_mark_quota_model();
@@ -895,12 +761,6 @@ fn derived_session_log_mark_quota_proves_and_catches_each_law() {
 }
 
 /// The program share: each of its four laws
-/// is the only one some single `Buggy = 1` step breaks, every mutant is dead
-/// at the committed config and caught on its own, and the paths: a third
-/// program mark of a node takes its first and nothing beside it, another
-/// node's marks are its own share, a fence keeps its marks past the share
-/// (only the newest beside them), and lifting it trims each node to its
-/// share. Tier-1: aterm-slog's `slog_program_share_conforms_to_derived_model`.
 #[test]
 fn derived_session_log_program_share_proves_and_catches_each_law() {
     let model = aterm_models_session::session_log_program_share_model();
@@ -946,13 +806,6 @@ fn derived_session_log_program_share_proves_and_catches_each_law() {
 }
 
 /// The rows: each of its three laws is the
-/// only one some single `Buggy = 1` step breaks, every mutant is dead at
-/// the committed config and caught on its own, and the paths: the floor's
-/// rows outlive every other record a batch may take, a third row moves the
-/// oldest out of the floor and that one goes first, each row takes the next
-/// id, a carried update's ids continue past the predecessor's ceiling,
-/// and a crash adoption's start at 1 in its own epoch. Tier-1: aterm-slog's
-/// `slog_rows_conform_to_derived_model`.
 #[test]
 fn derived_session_log_rows_proves_and_catches_each_law() {
     let model = aterm_models_session::session_log_rows_model();
@@ -1023,15 +876,6 @@ fn derived_session_log_rows_proves_and_catches_each_law() {
 }
 
 /// The claims (§3.7, §7.3):
-/// each of its seven laws is the only one some single `Buggy = 1` step
-/// breaks, every mutant is dead at the committed config and caught on its
-/// own, and the paths: a claim's clear leaves an observed need standing, a
-/// claim ranks below it, another author's label is stored but never shown,
-/// another author's verdict leaves the trusted one held, a `ctl` verdict and
-/// label leave the harness's held and shown, a `ctl` clear and an edge's
-/// raise of the same word leave the harness's need standing, and the owner's
-/// non-claim clear lifts every need but the harness's. Tier-1: aterm-slog's
-/// `fold_claims_conform_to_derived_model`.
 #[test]
 fn derived_session_log_claims_proves_and_catches_each_law() {
     let model = aterm_models_session::session_log_claims_model();
@@ -1099,16 +943,6 @@ fn derived_session_log_claims_proves_and_catches_each_law() {
 }
 
 /// The turn tracker (§2.4): each of its six laws is the only one some
-/// single `Buggy = 1` step breaks, and every mutant is dead at the
-/// committed config and caught on its own. The paths: a Codex mid-answer
-/// idle that busy interrupts within the settle keeps its turn open, a
-/// question dialog stays in its turn, a stall never closes it, a wall held
-/// at rest closes the turn and stays open on the run, and a `ctl turn`
-/// while resting closes the turn as a ctl close. Tier-1: aterm-slog's
-/// `turn_tracker_conforms_to_derived_model`.
-/// TRANSCRIPT JOIN (phase 3B): every law proves on the committed model,
-/// each is the only law some Buggy step breaks first, and every dead action
-/// is a caught mutant; then the rows of §2.5's join, by name.
 #[test]
 fn derived_transcript_join_proves_and_catches_each_law() {
     let model = aterm_models_session::transcript_join_model();
@@ -1133,7 +967,6 @@ fn derived_transcript_join_proves_and_catches_each_law() {
         ],
     );
 
-    // Nothing is read before a bind seeds the watermark (S1).
     let mut s = model.init_state();
     assert!(model.fire("ScreenBusy", &mut s));
     for row in ["PromptAttach", "ToolUse", "TxEndCloses", "Replay"] {
@@ -1141,16 +974,12 @@ fn derived_transcript_join_proves_and_catches_each_law() {
     }
     assert!(model.fire("Bind", &mut s));
 
-    // The screen's turn takes the prompt in the window; its tool closes
-    // with the turn's end, which closes the turn when no screen step holds it.
     assert!(model.fire("PromptAttach", &mut s));
     assert!(model.fire("ToolUse", &mut s));
     assert_eq!((s["lt"], s["vm"], s["ts"]), (2, 1, 1));
     assert!(model.fire("TxEndCloses", &mut s));
     assert_eq!((s["lt"], s["vm"], s["ve"], s["ts"]), (0, 2, 1, 0));
 
-    // A screen turn older than the window is superseded by the next prompt,
-    // unless a box holds it: then the vendor turn shares it (S4).
     let mut aged = model.init_state();
     for a in ["Bind", "ScreenBusy", "Age"] {
         assert!(model.fire(a, &mut aged));
@@ -1171,8 +1000,6 @@ fn derived_transcript_join_proves_and_catches_each_law() {
     assert!(model.fire("PromptSupersede", &mut aged));
     assert_eq!((aged["lt"], aged["old"], aged["vm"]), (2, 0, 1));
 
-    // The screen's settle closed the turn, then the prompt came: the closed
-    // turn takes it (the transcript opens nothing), and only that one.
     let mut late = model.init_state();
     for a in ["Bind", "ScreenBusy", "ScreenRest"] {
         assert!(model.fire(a, &mut late));
@@ -1185,8 +1012,6 @@ fn derived_transcript_join_proves_and_catches_each_law() {
         "a closed turn takes one"
     );
 
-    // An unmeasured build adds only: it shares, never supersedes or closes
-    // (S9), and a prompt with no turn to attach maps nothing.
     let mut partial = model.init_state();
     for a in ["Bind", "SetPartial", "ScreenBusy", "Age", "PromptShare"] {
         assert!(model.fire(a, &mut partial));
@@ -1195,7 +1020,6 @@ fn derived_transcript_join_proves_and_catches_each_law() {
     assert!(model.fire("TxEndHeld", &mut partial));
     assert_eq!(partial["lt"], 1);
 
-    // The judge refutes the screen's wall: it shuts with its settle (S2).
     let mut wall = model.init_state();
     for a in ["Bind", "ScreenBusy", "PromptAttach", "ScreenWall"] {
         assert!(model.fire(a, &mut wall));
@@ -1208,9 +1032,6 @@ fn derived_transcript_join_proves_and_catches_each_law() {
     assert_eq!((wall["ss"], wall["pend"], wall["rf"]), (0, 0, 1));
     assert!(model.fire("TxEndCloses", &mut wall));
 
-    // Esc ends the vendor turn (Claude Code writes no turn end after it):
-    // the screen's next turn never continues it. NEGATIVE CONTROL: a vendor
-    // turn still running when the screen settled is continued.
     let fired = |path: &[&str]| {
         let mut s = model.init_state();
         for a in path {
@@ -1228,20 +1049,11 @@ fn derived_transcript_join_proves_and_catches_each_law() {
     let running = fired(&[&ran[..], &["ScreenRest", "ScreenBusy"]].concat());
     assert_eq!((running["lt"], running["vm"]), (1, 1), "continued");
 
-    // A prompt read while no screen turn was open is the turn the screen
-    // opens within the window: it takes `vref=`. NEGATIVE CONTROL: once the
-    // window passed, the screen's turn is its own.
     let first = fired(&["Bind", "SetPartial", "PromptUnmapped", "ScreenBusy"]);
     assert_eq!((first["lt"], first["vm"]), (2, 1));
     let stale = fired(&["Bind", "SetPartial", "PromptUnmapped", "Age", "ScreenBusy"]);
     assert_eq!((stale["lt"], stale["vm"], stale["vo"]), (1, 3, 1));
 
-    // A prompt row dated in the past while a turn is open (the window is
-    // two-sided): older than the open turn by more than the window, it is
-    // an earlier turn's and maps to nothing, and the screen's next turn
-    // does not take it; dated near the newest closed turn's open, that turn
-    // takes it though a turn is open. NEGATIVE CONTROL: a closed turn that
-    // holds a `vref` takes none.
     let old = fired(&["Bind", "ScreenBusy", "PromptOld"]);
     assert_eq!((old["lt"], old["vm"], old["vo"]), (1, 3, 1));
     let next = fired(&[
@@ -1324,9 +1136,6 @@ fn derived_turn_tracker_proves_and_catches_each_law() {
         "a wall at rest closes the turn and stays open on the run"
     );
 
-    // A `ctl turn` while the agent rests closes the resting turn at once,
-    // as a ctl close (never an early idle close); once the settle is due,
-    // only the settle closes it.
     let mut c = model.init_state();
     for action in ["SeeBusy", "SeeIdle", "Tick"] {
         assert!(model.fire(action, &mut c));
@@ -1342,9 +1151,6 @@ fn derived_turn_tracker_proves_and_catches_each_law() {
         "a due settle is the settle's"
     );
 
-    // The transcript's end closes a turn whose screen step is done, never
-    // one a wall the screen still shows is open under; refuting that wall
-    // shuts it and disarms its settle, and the turn then rests as idle.
     let mut w = model.init_state();
     for action in ["SeeBusy", "SeeWall"] {
         assert!(model.fire(action, &mut w));
@@ -1368,10 +1174,6 @@ fn derived_turn_tracker_proves_and_catches_each_law() {
         "the transcript's end closes a settling turn and disarms its settle"
     );
 
-    // T1: an input admitted under box 1 and accepted after box 2 replaced
-    // it binds nothing; one admitted with no box binds the box that opens
-    // in its lead; a person's later input takes the step; a close consumes
-    // the binding; an input past the bound attributes nothing.
     let mut b = model.init_state();
     for action in ["SeeBusy", "SeeBox", "AdmitHarness", "SeeNextBox"] {
         assert!(model.fire(action, &mut b), "{action}");
@@ -1436,14 +1238,6 @@ fn derived_turn_tracker_proves_and_catches_each_law() {
 }
 
 /// The session log fold (phase 3B, plan §4.2 as amended by A31 and S13):
-/// each of its seven laws is the only one some single `Buggy = 1` step
-/// breaks, and every mutant is dead at the committed config and caught on
-/// its own. The paths: an exact amend refines a strong close and moves the
-/// turn between the totals' buckets, a strong amend after it changes
-/// nothing, an exact amend made while the turn is open outranks the screen's
-/// later close, an exact confirmation raises the step need's rank, the need
-/// leaves with its step, and an expired label gives the clause back to the
-/// run. Tier-1: aterm-slog's `fold_conforms_to_derived_model`.
 #[test]
 fn derived_session_log_fold_proves_and_catches_each_law() {
     let model = aterm_models_session::session_log_fold_model();
@@ -1522,13 +1316,6 @@ fn derived_session_log_fold_proves_and_catches_each_law() {
 }
 
 /// The heuristic mail → turn link (phase 5, plan 5D-5; T10, T39): each of
-/// its seven laws is the only one some single `Buggy = 1` step breaks, and
-/// every mutant is dead at the committed config and caught on its own. The
-/// paths: one task mail links the next turn, at `~`; a note links none;
-/// a person between takes it, a gesture that reached no program does not; time past the window drops it; an explicit
-/// cause links none heuristically and takes the mail it names; two mails
-/// link none and count the turn ambiguous; a person's turn links none.
-/// Tier-1: aterm-slog's `mail_link_conforms_to_derived_model`.
 #[test]
 fn derived_session_log_mail_link_proves_and_catches_each_law() {
     let model = aterm_models_session::session_log_mail_link_model();

@@ -1,52 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! LIVE: the warm spare shell a plain new tab adopts
-//! (`docs/DESIGN-warm-spare-2026-10-16.md`, tests L1–L11).
-//!
-//! Driven through the real binary, headless, with a scratch home whose rc each
-//! test writes, the host's login shell for a test as `SHELL` (zsh where the
-//! host has one, else bash: [`headless_boot::login_shell`]; the spare is one
-//! machine under both, and each rc here reads the same in either), and
-//! `spare_shell_needs_person = false` (a wire-driven instance has no person;
-//! L10 is the default's own test):
-//!
-//! * L1 a parked spare is nobody's session (`sessions` lists only the boot
-//!   one), and a `spawn` adopts it: `born=spare-parked`, its prompt drawn;
-//! * L2/L11 with learning skipped (`ATERM_DEBUG_SPARE_ELIGIBLE=1`) the spare
-//!   runs its rc unseen and a `spawn` adopts it at its hold (`born=spare-ready`)
-//!   or while its rc still runs (`born=spare-warming`, the buffered `go` kept
-//!   until its first prompt);
-//! * L3 three clean visible runs teach the gate, and the next spare is warm;
-//! * L4 an rc that reads input, sleeps, `exec`s another program, rings the bell
-//!   or asks the control socket never makes a generation eligible;
-//! * L6 an rc edited while a spare is ready sends the next tab cold
-//!   (`spare_miss=stale`);
-//! * L7 asks the spare cannot serve go cold, with their reason, and the spare
-//!   stays;
-//! * L13 a tab from a held pane adopts the spare booked in its folder, and
-//!   the next one too while the pane is held;
-//! * L14 a parked spare serves a tab asked for in another folder, `cd`ing
-//!   there at its release;
-//! * L8 `spare_shell = "off"` retires it; `parked` retires a warm one;
-//! * L9 quitting retires a warm spare before the exit: its FIFO and link
-//!   gone, and its shell, though its rc ignores the hangup;
-//! * L10 with the default (a person must be present) a wire-driven instance
-//!   never spawns one;
-//! * L12 a SIGKILLed instance's warm spare whose rc ignores the hangup is
-//!   released by the next launch on its control dir, and its FIFO removed.
-//!
-//! Every wait for something that must happen is a one-minute hang detector,
-//! never a latency budget; no check retries.
-//!
-//! Linux runs the suite too (2026-10-19, R6), on the lab's lane. Where the
-//! host's shell reads a system file before aterm's parked hold (Ubuntu's
-//! `/etc/zsh/zshenv`, or `/etc/bash.bashrc` for bash:
-//! [`runs_a_system_file_first`]), a parked spare has run it before anyone
-//! asked, so the product parks only for an eligible gate and never moves such
-//! a spare to another folder: the visible runs that teach the gate are cold
-//! tabs there, a `spare_shell = "parked"` instance is given the eligible gate,
-//! and L14 reads the refusal.
+//! End-to-end tests for the warm spare shell adopted by a new tab.
 
 #![cfg(any(target_os = "macos", target_os = "linux"))]
 
@@ -59,11 +14,6 @@ use aterm_shell_integration::ShellType;
 use headless_boot::{Instance, LoginShell, boot_session, boot_with, ctl_ok, field, status};
 
 /// The escape scan's spacing these instances run (the product's 2 s through
-/// its development seam, `ATERM_DEBUG_SPARE_SCAN_MS`): a visible run, or a
-/// warm spare's verification, is judged only once the spacing since the last
-/// scan has passed, and these tests drive runs one after another — the
-/// boot session's, then each adopted one's — so each waited out up to 2 s.
-/// What the spacing itself does is `aterm-gui`'s `a_scan_lists_after_its_window`.
 const SCAN_MS: &str = "100";
 
 /// The login shell every instance here runs ([`headless_boot::login_shell`]).
@@ -72,16 +22,6 @@ fn shell() -> LoginShell {
 }
 
 /// Boot an instance whose home holds `rc` as its shell's startup file, with
-/// `config` prepended to its aterm.toml, the scan's spacing [`SCAN_MS`], the
-/// parked deadline at the hang detector and `seams` in its environment.
-///
-/// NO TEST HERE PROVES THE PARKED DEADLINE, and the product's 1 s
-/// (`PARKED_DEADLINE`, which `aterm-gui`'s
-/// `a_spawned_spare_unparked_at_its_deadline_is_retired_and_a_younger_one_kept`
-/// holds) was a latency budget every one of them inherited: 2 of 160 module
-/// runs at load ~189 had a one-line rc's spare park past it, retired
-/// `no_park`, with spares off for the rest of the instance. At the hang
-/// detector a slow park is only slow.
 fn boot_spare(prefix: &str, rc: &str, config: &str, seams: &[(&str, &str)]) -> Instance {
     let rc = rc.to_owned();
     let config = config.to_owned();
@@ -97,8 +37,6 @@ fn boot_spare(prefix: &str, rc: &str, config: &str, seams: &[(&str, &str)]) -> I
             let base = std::fs::read_to_string(&toml).expect("aterm.toml");
             std::fs::write(&toml, format!("{config}\n{base}")).expect("aterm.toml");
             cmd.env("SHELL", shell().path);
-            // The gate's own account of every run it judged, for a failure
-            // message ([`gate_log`]).
             cmd.env("ATERM_LOG", "info");
             cmd.env("ATERM_DEBUG_SPARE_SCAN_MS", SCAN_MS);
             cmd.env(
@@ -120,7 +58,6 @@ fn metric(inst: &Instance, key: &str) -> String {
 }
 
 /// Where the instance keeps its state and its log: its scratch home, and the
-/// `XDG_STATE_HOME` the boot gave it (macOS reads only the home).
 fn instance_dirs(inst: &Instance) -> aterm_types::dirs::StatePlatform {
     aterm_types::dirs::StatePlatform {
         home: Some(inst.tmp.join("home")),
@@ -130,8 +67,6 @@ fn instance_dirs(inst: &Instance) -> aterm_types::dirs::StatePlatform {
 }
 
 /// Whether this host's shell reads a system file before aterm's parked hold
-/// (`pre_hold_files`): then its parked spare waits for the gate, and serves
-/// only the folder it was spawned in.
 fn runs_a_system_file_first() -> bool {
     aterm_shell_integration::pre_hold_files(shell().kind)
         .iter()
@@ -139,8 +74,6 @@ fn runs_a_system_file_first() -> bool {
 }
 
 /// A `spare_shell = "parked"` instance's seams: where the shell runs a system
-/// file before its hold, the eligible gate parking needs there (parked mode
-/// teaches no gate, and never promotes).
 fn parked_seams() -> &'static [(&'static str, &'static str)] {
     if runs_a_system_file_first() {
         &[("ATERM_DEBUG_SPARE_ELIGIBLE", "1")]
@@ -150,8 +83,6 @@ fn parked_seams() -> &'static [(&'static str, &'static str)] {
 }
 
 /// The instance log's spare lines (`boot_spare` logs at `info`): the gate's
-/// verdict on each visible run, and why a run was unclean, for a failure
-/// message.
 fn gate_log(inst: &Instance) -> String {
     let log = aterm_types::dirs::resolve_logs_dir(None, instance_dirs(inst))
         .and_then(|dir| std::fs::read_to_string(dir.join("aterm.log")).ok())
@@ -163,10 +94,6 @@ fn gate_log(inst: &Instance) -> String {
 }
 
 /// A spare wait's hang message: the gate's lines, and where the instance's
-/// `aterm-spare` thread is now ([`headless_boot::thread_stack`]): the gate's
-/// folds, the spares' spawns and their verifications all run there, and a
-/// stalled one held a boot run's fold 46 s and a warm spare's verification
-/// past the minute (L9, 1 of 15 runs at load ~200), its log silent meanwhile.
 fn hang_report(inst: &Instance) -> String {
     format!(
         "{}\nits aterm-spare thread now:\n{}",
@@ -193,13 +120,6 @@ fn await_spare(inst: &Instance, state: &str) {
 }
 
 /// End the test on a product time budget `missed` (a gate fold's, or a warm
-/// rc's `T_READY`): COULD NOT RUN on an oversubscribed host
-/// ([`aterm_spec::host::oversubscribed`]), where the miss is the load's — the
-/// rcs here are one line — and FAIL on a host with CPU to spare, where the
-/// same miss is a slowdown of the code. Measured
-/// (`docs/DESIGN-warm-spare-2026-10-16.md`, As built): 3 of 160 module runs
-/// at load ~100 on 18 CPUs folded a boot run `failed=start`; each waited out
-/// its minute and failed.
 fn a_budget_decided_it(inst: &Instance, missed: &str) -> ! {
     let log = gate_log(inst);
     if let Some(load) = aterm_spec::host::oversubscribed() {
@@ -212,9 +132,6 @@ fn a_budget_decided_it(inst: &Instance, missed: &str) -> ! {
 }
 
 /// The rules the gate's last verdict in `log` failed, when that verdict is a
-/// visible run's `Unclean` fold, with the line that names them: its `failed=`
-/// rules, or `escape` where the escape scan decided it (the scan runs once
-/// every rule held, and logs what it found just before the verdict).
 fn fold_failed(log: &str) -> Option<(Vec<String>, String)> {
     let lines: Vec<&str> = log.lines().collect();
     let verdict = lines
@@ -241,8 +158,6 @@ fn fold_failed(log: &str) -> Option<(Vec<String>, String)> {
 }
 
 /// The line of the gate's last verdict in `log` when it is an `Unclean` fold
-/// that failed only time budgets ([`fold_failed`]; `start`: no start record
-/// within the 2 s window, `slow`: one past it).
 fn a_budget_fold(log: &str) -> Option<String> {
     let (rules, line) = fold_failed(log)?;
     rules
@@ -252,9 +167,6 @@ fn a_budget_fold(log: &str) -> Option<String> {
 }
 
 /// The gate log through its `n`th line that says `verdict`, once the
-/// instance's log has it: a fold, or a verification, publishes its state from
-/// the gate's thread and its lines through the log's writer thread, so a test
-/// that read the state can find the log a line short. A hang detector.
 fn log_through(inst: &Instance, verdict: &str, n: usize) -> String {
     let give_up = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
     loop {
@@ -330,10 +242,7 @@ fn adopted(inst: &Instance, tier: &str) -> u32 {
 const PROMPT_RC: &str = "PS1='SPARE%# '\n";
 
 /// The current generation's one owned persisted snapshot. The fixture starts
-/// from an exclusive empty state root and never changes its rc generation.
-/// Open nonblocking/no-follow and read at most the production snapshot ceiling.
 struct GateSnapshot {
-    // Keep this inode alive until the next snapshot is observed.
     _file: std::fs::File,
     identity: (u64, u64),
     generation: String,
@@ -418,7 +327,6 @@ fn await_metric(inst: &Instance, key: &str, word: &str) {
 }
 
 /// The first published snapshot: the boot session's fold (the fixture's state
-/// root starts empty, and every fold publishes one). A hang detector.
 fn await_first_sample(inst: &Instance) -> GateSnapshot {
     let give_up = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
     loop {
@@ -435,28 +343,9 @@ fn await_first_sample(inst: &Instance) -> GateSnapshot {
 }
 
 /// The gate's verdict lines: a visible run's fold, and a warm spare's
-/// verification at its hold. Each scan that finds an escape logs it just
-/// before its verdict, on the one thread that judges both.
 const VERDICTS: [&str; 2] = ["saw a visible run:", "verified at its hold:"];
 
 /// The escape line the last escape verdict in `log` rests on (a visible run's
-/// `Unclean` fold, or a warm spare's `Backoff("escaped")` at its hold), when it names a
-/// process of another session with no terminal flag that the shell's line
-/// never held: an orphan of a session whose leader is gone (or of its own),
-/// adopted in the run's window, born on no terminal, its stdio on no revoked
-/// terminal. The scan counts one, as it must count the run's double-fork
-/// daemon, which looks the same (`docs/DESIGN-warm-spare-2026-10-16.md` §7.1);
-/// a clean rc makes none, so it is another program's on this host (a daemon
-/// whose environment Darwin withholds). Measured: 960 runs of this module
-/// beside three more loops of it and other agents' test loops (load up to 246)
-/// read two, in L3 a `locale` and in L5 a `sleep`, each flags `0x21404010`.
-/// The scan now tells such a `locale` apart (another tab's `$(locale ...)`
-/// child exec'd once its tab was gone: its stdio on the revoked terminal), and
-/// `aterm-gui`'s escape-scan fixtures, `setsid`'d `sleep`s that read so in 14
-/// of 160 runs of this module beside two loops of `spare::`, name a session of
-/// their own now (0 of 160). One with the terminal flag, or on a revoked
-/// terminal, is no such line: the scan tells those apart, and a verdict that
-/// counts one still fails.
 fn a_strangers_orphan(log: &str) -> Option<String> {
     let lines: Vec<&str> = log.lines().collect();
     let verdict = lines.iter().rposition(|l| {
@@ -475,24 +364,12 @@ fn a_strangers_orphan(log: &str) -> Option<String> {
             .map(str::to_owned)
     };
     let flags = u32::from_str_radix(word("flags=0x")?.as_str(), 16).ok()?;
-    let terminal_born = flags & 0x80 != 0; // `PROC_FLAG_CONTROLT`
+    let terminal_born = flags & 0x80 != 0;
     (word("in_session=")? == "false" && word("attached=")? == "false" && !terminal_born)
         .then(|| (*escape).to_owned())
 }
 
 /// The line the gate's last verdict in `log` rests on when the escape scan
-/// left it none for the listing's sake: a visible run's `Inconclusive` fold on
-/// `scan Unknown`, or a warm spare's `Backoff("scan-unknown")` at its hold,
-/// with no scan of it that could not read the run's own shell
-/// ([`SHELL_UNKNOWN`]). The scan lists every process of this account (this
-/// suite's other instances and `aterm ctl` clients, every other program's),
-/// and reads `Unknown` when it cannot settle that listing: a process still
-/// exiting past its settling listings, a record it cannot read again. The gate
-/// counts such a run as no sample, as it must, so the streak a test expected
-/// never comes, and that decides nothing about the code: a test ends COULD NOT
-/// RUN on it ([`an_unsettled_scan_decided_it`]). A scan that could not read the
-/// run's shell (none named, unread, gone, unlisted) is the run's or the gate's
-/// (a wrong pid handed to the scan), and still fails.
 fn an_unsettled_scan(log: &str) -> Option<String> {
     let lines: Vec<&str> = log.lines().collect();
     let verdict = lines
@@ -517,11 +394,9 @@ fn an_unsettled_scan(log: &str) -> Option<String> {
 }
 
 /// The escape scan's line for an `Unknown` on the run's own shell
-/// (`aterm-gui`'s `spare::shell_unknown`), logged before the verdict it leaves.
 const SHELL_UNKNOWN: &str = "spare gate: scan unknown: the run's shell";
 
 /// End the test COULD NOT RUN on `line`, a verdict the escape scan could not
-/// give ([`an_unsettled_scan`]), with the gate's `log`.
 fn an_unsettled_scan_decided_it(line: &str, log: &str) -> ! {
     aterm_spec::host::could_not_run(format!(
         "the escape scan could not settle this account's process listing, so the gate \
@@ -531,9 +406,6 @@ fn an_unsettled_scan_decided_it(line: &str, log: &str) -> ! {
 }
 
 /// [`an_unsettled_scan`] reads the scan's own two words for no verdict, and
-/// nothing else: an `Inconclusive` fold for another reason (input moved before
-/// the start record), another backoff, and a scan that could not read the
-/// run's own shell still fail their test.
 #[test]
 fn only_a_scan_with_no_verdict_is_the_hosts() {
     let fold = |why: &str, verdict: &str| {
@@ -551,7 +423,6 @@ fn only_a_scan_with_no_verdict_is_the_hosts() {
         an_unsettled_scan("spare 3: verified at its hold: Backoff(\"scan-unknown\")").as_deref(),
         Some("spare 3: verified at its hold: Backoff(\"scan-unknown\")")
     );
-    // NEGATIVE CONTROLS: what a test must still fail on.
     for log in [
         fold(
             "inconclusive run: input moved before its start record",
@@ -560,13 +431,10 @@ fn only_a_scan_with_no_verdict_is_the_hosts() {
         fold("inconclusive run: scan RateLimited", "Inconclusive"),
         fold("unclean run: failed=flags", "Unclean"),
         "spare 3: verified at its hold: Backoff(\"stale\")".to_owned(),
-        // An earlier run's unsettled scan is not the last verdict's.
         format!(
             "{}\nspare gate: generation 00000000000000aa saw a visible run: Clean {{ rc_ms: 9 }}",
             fold("inconclusive run: scan Unknown", "Inconclusive")
         ),
-        // The run's own shell unread (a wrong pid handed to the scan), in a
-        // fold and at a hold: the run's or the gate's, never the host's.
         fold(
             "scan unknown: the run's shell -1 unread\n\
              spare gate: inconclusive run: scan Unknown",
@@ -581,14 +449,8 @@ fn only_a_scan_with_no_verdict_is_the_hosts() {
 }
 
 /// Hold a visible run's fold to `expected` clean runs in a row; a fold a
-/// stranger's orphan spoiled ([`a_strangers_orphan`]), or the escape scan left
-/// with no verdict ([`an_unsettled_scan`]), decides nothing about the code,
-/// and ends the test as COULD NOT RUN; one that failed only a time budget
-/// ([`a_budget_fold`]) is decided by the host's load
-/// ([`a_budget_decided_it`]).
 fn expect_streak(inst: &Instance, streak: u32, expected: u32) {
     if streak != expected {
-        // Every caller's fold is the run that `expected` counts.
         let log = log_through(inst, "saw a visible run:", expected as usize);
         if let Some(escape) = a_strangers_orphan(&log) {
             a_stranger_decided_it(&escape);
@@ -612,7 +474,6 @@ fn expect_streak(inst: &Instance, streak: u32, expected: u32) {
 }
 
 /// End the test COULD NOT RUN on `escape`, a stranger's orphan
-/// ([`a_strangers_orphan`]).
 fn a_stranger_decided_it(escape: &str) -> ! {
     aterm_spec::host::could_not_run(format!(
         "another program's orphan was adopted in a clean run's window, which \
@@ -621,19 +482,6 @@ fn a_stranger_decided_it(escape: &str) -> ! {
 }
 
 /// Wait until the learned generation's first warm spare is ready; a hang
-/// detector. Its verification at the hold scans its rc's window as a visible
-/// run's fold does, so a stranger's orphan born there backs the generation off
-/// ([`a_strangers_orphan`]: COULD NOT RUN); a warm rc past its learned
-/// deadline (`T_READY`, 4 × the slowest clean run, at least 1 s:
-/// `spare_discard=rc_timeout`) is a time budget's miss
-/// ([`a_budget_decided_it`]); and a backoff for any other reason, or a
-/// generation found ineligible, fails at once, not after a minute's wait for a
-/// spare that cannot come. Measured:
-/// 600 runs of this module beside a loop of `aterm-gui`'s suite read L5's
-/// `spare never reached ready` twice, a minute after `verified at its hold:
-/// Backoff("escaped")` on a `sleep` with no terminal flag; an orphan
-/// generator started once the gate opened did so 2 of 2 times, and with this
-/// wait reads COULD NOT RUN 4 of 4.
 fn await_learned_spare_ready(inst: &Instance) {
     let give_up = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
     loop {
@@ -655,17 +503,12 @@ fn await_learned_spare_ready(inst: &Instance) {
                     "the learned generation's warm rc ran past its T_READY deadline",
                 );
             }
-            // An escape's backoff discards the spare as `escaped`, once its
-            // verification's line was logged: the generation's first such
-            // line is the one that backed it off.
             if field(&m, "spare_discard").is_some_and(|d| d.contains("escaped:"))
                 && let Some(escape) =
                     a_strangers_orphan(&log_through(inst, "verified at its hold: Backoff", 1))
             {
                 a_stranger_decided_it(&escape);
             }
-            // Discarded `scan-unknown` once its verification's line was logged,
-            // the generation's first such line.
             if field(&m, "spare_discard").is_some_and(|d| d.contains("scan-unknown:")) {
                 let log = log_through(inst, "verified at its hold: Backoff", 1);
                 if let Some(line) = an_unsettled_scan(&log) {
@@ -695,11 +538,6 @@ fn boot_run_is_clean(inst: &Instance) {
 }
 
 /// The boot session is itself the first visible run. Settle it before making
-/// the next two runs, and observe each fold before asking for another spare.
-/// Each is a parked spare's adoption, or, where the shell runs a system file
-/// before its hold (no parking before the gate opens), a cold tab. The third
-/// fold teaches the gate ([`await_learned`]); every caller then waits for the
-/// learned generation's first warm spare ([`await_learned_spare_ready`]).
 fn learn_three_visible_runs(inst: &Instance) {
     boot_run_is_clean(inst);
     for expected in [2, 3] {
@@ -720,15 +558,6 @@ fn learn_three_visible_runs(inst: &Instance) {
 }
 
 /// Wait until the third clean fold has taught the gate: `eligible`, or past
-/// it already. The learned generation's first warm spare spawns at once, and
-/// its verification at the hold can back the generation off (a stranger's
-/// orphan in its rc's window, [`a_strangers_orphan`]) or find it ineligible
-/// before a look here reads `eligible`: 228 ms after the third fold, once in
-/// 160 runs of this module beside two loops of `spare::` on platform-binary
-/// fixtures, and the wait for `eligible` then sat out its minute and FAILED
-/// (`spare_gate never reached eligible`) where the stranger should have read
-/// COULD NOT RUN. [`await_learned_spare_ready`], which every caller calls next,
-/// judges such a verdict. A hang detector.
 fn await_learned(inst: &Instance) {
     let give_up = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
     loop {
@@ -747,9 +576,6 @@ fn await_learned(inst: &Instance) {
 }
 
 /// Before a visible run that teaches the gate: wait for the parked spare it
-/// adopts, and answer the tier it is born from; where the shell runs a system
-/// file before its hold nothing parks before the gate opens, and the run is a
-/// cold tab.
 fn await_visible_run_tier(inst: &Instance) -> &'static str {
     if runs_a_system_file_first() {
         "cold"
@@ -777,14 +603,6 @@ fn await_private_file(inst: &Instance, path: &Path) {
 }
 
 /// Wait until L5's warm rc has entered its slow part (it wrote `entered`); a
-/// hang detector. Its 1 s `T_READY` can run out first on a busy host, before
-/// the rc gets that far: the spare is then discarded `rc_timeout` with
-/// `entered` never written, so the kill proves nothing about the slow rc
-/// ([`a_budget_decided_it`]). The discard is read before the file: an rc that
-/// wrote it before its kill is seen as entered. Measured: 2 of 113 runs of
-/// this module at load 128-329 on 18 CPUs (two loops of `spare::` and two of
-/// the whole `aterm-gui` suite beside it) waited out the minute for a file no
-/// rc would write.
 fn await_slow_part(inst: &Instance, entered: &Path) {
     let give_up = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
     loop {
@@ -809,7 +627,6 @@ fn await_slow_part(inst: &Instance, entered: &Path) {
 }
 
 /// Release an owned rc barrier on assertion unwind too. Exclusive creation
-/// never truncates a standing path; InstanceDrop still owns the App/lifeline.
 struct RcRelease(PathBuf);
 
 impl RcRelease {
@@ -891,31 +708,12 @@ fn three_clean_visible_runs_make_the_next_spare_warm() {
 }
 
 /// L4: the boot session is the first clean visible run (`learning_1/3`); the
-/// spare adopted once the rc misbehaves must fold as unclean and reset the
-/// streak to 0, so no number of such runs reaches the three clean ones the gate
-/// needs. Each negative run finishes its gate fold before the test closes it.
-/// The daemon lives until that fold is read — it waits on a release the test
-/// makes then (or on unwind, [`RcRelease`]), bounded by the hang detector —
-/// and records its own finite completion before this fixture proceeds; no
-/// discovered PID is signalled. (It slept 8 s instead: a margin over the fold,
-/// and 8 s of every run.) Each misbehaviour boots its own instance and scratch
-/// world, so they run side by side.
 #[test]
 fn an_unclean_rc_never_opens_the_gate() {
-    // The `ctl` case's client is the binary its instance runs, whose first
-    // exec the boot already paid (`aterm_spec::wait::first_exec`). The
-    // compile-time `CARGO_BIN_EXE_aterm` is another file whenever
-    // `ATERM_TEST_EXECUTABLE` names the build under test, and a binary's first
-    // exec waits on macOS's assessment of it (2.1-2.2 s for a fresh copy of the
-    // debug `aterm`, against 0.00 s after): past the gate's 2 s window, so the
-    // case folded `failed=start` before its control rule was asked.
     let aterm = crate::launch_isolation::aterm_executable();
     let aterm = aterm.display();
-    // Each case's misbehaviour, and the rules its fold may fail for it.
     let cases: [(&str, &[&str], String); 6] = [
         ("read", &["start"], "read -r x".to_owned()),
-        // Past the window: judged at its end with no record, or, where the
-        // record lands before the gate's thread judges, as slow.
         ("slow", &["start", "slow"], "sleep 3".to_owned()),
         ("exec", &["start"], "exec /bin/cat".to_owned()),
         ("bell", &["host"], "printf '\\a'".to_owned()),
@@ -950,11 +748,6 @@ fn an_unclean_rc_never_opens_the_gate() {
 }
 
 /// The end to report of cases run side by side: one that FAILED before any
-/// that COULD NOT RUN, so a case the host decided (a `ctl` run that missed
-/// the gate's window on load alone, a stranger's orphan in a boot run's
-/// window) never hides another case's failure. Resumed in case order, the
-/// `ctl` case's COULD NOT RUN hid whatever the `daemon` case, joined after it,
-/// said.
 fn worst_end(
     mut ends: Vec<Box<dyn std::any::Any + Send>>,
 ) -> Option<Box<dyn std::any::Any + Send>> {
@@ -969,11 +762,6 @@ fn worst_end(
 }
 
 /// [`worst_end`]: a case that failed is reported over one that could not run
-/// ahead of it, whichever its payload's type; with no failure, the COULD NOT
-/// RUN; with no end, nothing. The assertions name no payload: a failure
-/// message carrying the COULD NOT RUN words would itself be recorded as one.
-/// NEGATIVE CONTROL: the first end in case order, as before, reported the
-/// COULD NOT RUN.
 #[test]
 fn a_failed_case_is_reported_over_one_that_could_not_run() {
     let said = |end: Option<Box<dyn std::any::Any + Send>>| {
@@ -1007,9 +795,6 @@ fn a_failed_case_is_reported_over_one_that_could_not_run() {
 }
 
 /// One L4 case: `misbehave` armed after the boot session's clean run, whose
-/// fold must fail one of `rules` ([`fold_failed`]): a fold that failed only
-/// the window before the case's rule was asked (a `bell` run whose record
-/// came past it) proves nothing about that rule ([`a_budget_decided_it`]).
 fn an_unclean_run(name: &str, rules: &[&str], misbehave: &str) {
     let rc = format!("[[ -e $HOME/armed ]] && {{ {misbehave}; }}\nPS1='SPARE%# '\n");
     let inst = boot_spare(
@@ -1018,8 +803,6 @@ fn an_unclean_run(name: &str, rules: &[&str], misbehave: &str) {
         "spare_shell_needs_person = false",
         &[("ATERM_DEBUG_SPARE_IDLE_MS", "100")],
     );
-    // The daemon's release, made on unwind too: a failed run leaves no
-    // daemon waiting out the hang detector.
     let daemon = RcRelease(inst.tmp.join("home/daemon-release"));
     boot_run_is_clean(&inst);
     std::fs::write(inst.tmp.join("home/armed"), b"").expect("arm");
@@ -1028,7 +811,6 @@ fn an_unclean_run(name: &str, rules: &[&str], misbehave: &str) {
     let sid = spawn(&inst, &[]);
     assert_eq!(born(&inst, &sid), tier, "{name}");
     let after = await_sample_after(&inst, &before);
-    // The boot session's fold was the first.
     let log = log_through(&inst, "saw a visible run:", 2);
     if after.streak != 0
         && let Some(line) = an_unsettled_scan(&log)
@@ -1063,7 +845,6 @@ fn an_unclean_run(name: &str, rules: &[&str], misbehave: &str) {
 }
 
 /// L6: an rc edited while a warm spare waits sends the next tab cold, and the
-/// spawner says why.
 #[test]
 fn an_rc_edited_under_a_ready_spare_sends_the_next_tab_cold() {
     let inst = boot_spare(
@@ -1088,14 +869,6 @@ fn an_rc_edited_under_a_ready_spare_sends_the_next_tab_cold() {
 }
 
 /// L7: another folder for a warm spare (its rc ran in its own) goes cold
-/// with its reason, and the spare stays.
-///
-/// The ask lands behind the boot tab (`raise=f`), so the focused pane, whose
-/// folder the spare follows, never moves: a tab raised in `/usr` would move
-/// it, and the follow rule retires a misplaced warm spare 10 s later
-/// (`REPLACE_WARM_AFTER`; a parked one 1 s later), a race with this test's own
-/// pace on a loaded host. NEGATIVE CONTROL: raised asks and a pause past that
-/// hold before the last check read `spare=absent`.
 #[test]
 fn asks_a_spare_cannot_serve_go_cold_and_the_spare_stays() {
     let inst = boot_spare(
@@ -1122,7 +895,6 @@ fn asks_a_spare_cannot_serve_go_cold_and_the_spare_stays() {
 }
 
 /// Wait until session `sid`'s foreground program is `program`: the pane is
-/// held; a hang detector.
 fn await_program(inst: &Instance, sid: &str, program: &str) {
     let give_up = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
     while field(&status(inst, sid), "program") != Some(program) {
@@ -1132,9 +904,6 @@ fn await_program(inst: &Instance, sid: &str, program: &str) {
 }
 
 /// L13 (2026-10-18): Cmd-T while a program holds the focused pane (an agent,
-/// here `sleep`) adopts the warm spare booked in that pane's folder, and the
-/// next spare is booked, warmed and adopted while the pane is still held.
-/// NEGATIVE CONTROL (the code before): a held pane's tab went cold, `held`.
 #[test]
 fn a_tab_from_a_held_pane_adopts_the_spare_booked_in_its_folder() {
     let inst = boot_spare(
@@ -1171,11 +940,6 @@ fn a_tab_from_a_held_pane_adopts_the_spare_booked_in_its_folder() {
 }
 
 /// L14 (2026-10-18): a parked spare serves a tab asked for in another folder:
-/// it `cd`s there at its release, before its startup files, and the shell
-/// reads as one started there (`$PWD`; zsh's `$OLDPWD` the same, where bash
-/// keeps the one it inherited: aterm-shell-integration's
-/// `spare_parked_hold`). A warm spare does not (L7). NEGATIVE CONTROL (the
-/// code before): `cwd=` went cold, `folder`.
 #[test]
 fn a_parked_spare_serves_a_tab_asked_for_in_another_folder() {
     let inst = boot_spare(
@@ -1188,8 +952,6 @@ fn a_parked_spare_serves_a_tab_asked_for_in_another_folder() {
     await_spare(&inst, "parked");
     let sid = spawn(&inst, &["cwd=/usr"]);
     if runs_a_system_file_first() {
-        // The system file ran in the spare's own folder before its hold:
-        // the tab goes cold where it was asked for, and the spare stays.
         assert_eq!(born(&inst, &sid), "cold", "{}", ctl_ok(&inst, &["metrics"]));
         assert!(metric(&inst, "spare_miss").contains("folder:1"));
         await_text(&inst, &sid, "SPARE%");
@@ -1257,18 +1019,14 @@ fn spare_shell_off_retires_the_spare_on_reload() {
     )
     .expect("aterm.toml");
     await_spare(&inst, "off");
-    // The retire hands the session to the spare thread, which drops its PTY
-    // after the state already reads off.
     await_metric(&inst, "spare_ptys", "0");
 }
 
 /// L10: by default a spare exists only after a person's gesture: a wire-driven
-/// instance never spawns one.
 #[test]
 fn without_a_person_no_spare_is_spawned() {
     let inst = boot_spare("aterm-spare-l10", PROMPT_RC, "", &[]);
     let (_, boot) = boot_session(&inst);
-    // Past the boot grace and a landing's settle.
     let sid = spawn(&inst, &[]);
     await_text(&inst, &sid, "SPARE%");
     std::thread::sleep(std::time::Duration::from_millis(1_500));
@@ -1279,8 +1037,6 @@ fn without_a_person_no_spare_is_spawned() {
 }
 
 /// L11: an actual spare-only rc barrier holds Warming until the test has
-/// adopted that spare and then explicitly releases it. The host's buffered
-/// go still waits for the first prompt hook.
 #[test]
 fn a_warming_spare_is_adopted_and_its_buffered_release_survives() {
     let inst = boot_spare(
@@ -1328,7 +1084,6 @@ fn spare_entries(dir: &Path) -> Vec<String> {
 }
 
 /// A shell this test left running, SIGKILLed on every exit path while it is
-/// still the process born at `birth`, so a failing run leaks no blocked shell.
 struct Leftover {
     pid: i32,
     birth: u64,
@@ -1343,18 +1098,13 @@ impl Leftover {
 impl Drop for Leftover {
     fn drop(&mut self) {
         if self.alive() {
-            // SAFETY: a signal to the shell this test's instance spawned, its
-            // birth checked just above.
+            // SAFETY: sends SIGKILL to the shell pid spawned by this test's instance.
             let _ = unsafe { libc::kill(self.pid, libc::SIGKILL) };
         }
     }
 }
 
 /// L12: an instance SIGKILLed while it holds a warm spare whose rc ignores the
-/// hangup leaves that shell blocked opening its FIFO. The next launch on the
-/// same control dir finds the FIFO's owner dead, releases the shell (it exits) and
-/// removes the FIFO and its link. The new instance books no spare of its own
-/// (no person), so the folder ends empty.
 #[test]
 fn a_crashed_instances_spare_is_released_by_the_next_launch() {
     let mut crashed = boot_spare(
@@ -1409,8 +1159,6 @@ fn a_crashed_instances_spare_is_released_by_the_next_launch() {
 }
 
 /// L5: learn from observed folds, then hold only the refill's warm rc until
-/// the explicitly selected product timeout retires it. The test waits for the
-/// timeout verdict; it asserts no wall-clock latency.
 #[test]
 fn a_warm_spare_past_t_ready_is_killed_and_its_generation_backs_off() {
     let inst = boot_spare(
@@ -1449,14 +1197,6 @@ PS1='SPARE%# '
 }
 
 /// L9: quitting with a warm spare held retires it before the exit: once the
-/// instance has exited, the spare's FIFO and its link are gone from the control
-/// dir, and its shell, whose rc ignores the hangup, has ended. An exit that
-/// skips the retire leaves both: the kernel's hangup does not end that shell,
-/// which waits opening its FIFO, and only the next launch's sweep releases it
-/// (L12, a crash). (No history either way: aterm-shell-integration's
-/// `a_discarded_spare_writes_no_history_and_ends_without_its_fifo`.)
-/// NEGATIVE CONTROL: `shutdown_spares` with its retire skipped left the FIFO
-/// and its link (the first assertion below).
 #[test]
 fn quitting_with_a_spare_retires_it_before_the_exit() {
     let mut inst = boot_spare(
@@ -1484,7 +1224,7 @@ fn quitting_with_a_spare_retires_it_before_the_exit() {
         "the ready spare holds its FIFO"
     );
     let aterm = inst.child.id();
-    // SAFETY: a signal to the instance this test launched.
+    // SAFETY: sends SIGTERM to the instance pid launched by this test.
     assert_eq!(unsafe { libc::kill(aterm as i32, libc::SIGTERM) }, 0);
     let give_up = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
     while inst.child.try_wait().expect("wait").is_none() {

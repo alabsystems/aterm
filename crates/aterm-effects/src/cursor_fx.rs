@@ -1,22 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The cursor family's frame step: the aurora ([`CursorGlow`]), the cadence
-//! comet ([`CursorTrail`]) and the block-cursor bodies (rainbow block, water
-//! droplet, typing-momentum glow, comet nucleus, phaser emitter, light rod,
-//! laser bolt), ticked in one order with one fill-precedence law deciding who
-//! owns the caret.
-//!
-//! Every host calls [`CursorFx::tick`] (`docs/DESIGN-host-boundary-2026-08-30.md`).
-//! The host resolves its policy (motion, focus, the load-shed envelope, Serious
-//! Mode, config) into a [`CursorFxInput`] and a folded
-//! [`GlowConfig`]/[`TrailConfig`], feeds the glow engine its per-frame
-//! observations (row probe, print anchor, delivered inserts) between
-//! [`CursorFx::begin`] and the tick, and drains the engine's cues (sound, the
-//! cat's motion pulse) after it.
-//!
-//! Clockless: `now` is injected; nothing here reads a clock, a file or a
-//! platform type.
+//! The cursor family's frame step.
 
 use aterm_core::terminal::CursorStyle;
 use aterm_render::{GlowQuad, TrailCell};
@@ -34,140 +19,90 @@ use crate::cursor_phaser::{CursorPhaser, PhaserConfig};
 use crate::cursor_rainbow::{CursorRainbow, RainbowConfig};
 use crate::cursor_trail::{CursorTrail, TrailConfig, TypingCadence};
 
-/// The cursor family's engines and per-frame scratch, one per drawing surface
-/// (a native window, a web page); holds no flash budget.
-///
-/// Fields are public because the host feeds the engines between frames (a
-/// typed glyph, a backspace, a repaint blink, a scroll) and reads them for its
-/// sensors (`trail status`, `tone`); the frame step itself is [`Self::tick`].
+/// The cursor family's engines and per-frame scratch, one per drawing surface (a native window, a web page); holds no flash budget.
 #[derive(Default)]
 pub struct CursorFx {
     /// The aurora — every style's light, the rainbow kitty ribbon included.
     pub glow: CursorGlow,
-    /// The cadence comet — the directional `TrailCell` body of the `comet`
-    /// style (disabled for every other style).
+    /// The cadence comet — the directional `TrailCell` body of the `comet` style (disabled for every other style).
     pub trail: CursorTrail,
     /// Typing-cadence heat: comet ignition and the rainbow/phaser block energy.
-    /// Fed by the host's input path (`on_keystroke`); sampled once per tick.
     pub cadence: TypingCadence,
     /// The `rainbow kitty` block body.
     pub rainbow: CursorRainbow,
     /// The `water` block body.
     pub droplet: CursorDroplet,
-    /// The typing-momentum glow — every style, every shape, unless the rainbow
-    /// owns the caret. The shipped engine directly, or the Aos-hosted pair once
-    /// attached; nothing reaches the engine except through it.
+    /// The typing-momentum glow — every style, every shape, unless the rainbow owns the caret.
     pub momentum: MomentumHost,
-    /// The light rod — the bar shape of every style, and the emitter block of
-    /// the styles with no bespoke body.
+    /// The light rod — the bar shape of every style, and the emitter block of the styles with no bespoke body.
     pub beamrod: CursorBeamRod,
     /// The `comet` block body.
     pub comet: CursorComet,
     /// The `phaser` block body.
     pub phaser: CursorPhaser,
-    /// The additive light this tick produced — the aurora first, then every
-    /// body's halo appended in tick order. Cleared by the aurora's tick.
+    /// The additive light this tick produced — the aurora first, then every body's halo appended in tick order.
     pub glow_scratch: Vec<GlowQuad>,
-    /// The comet cells this tick produced, already projected through the
-    /// load-shed envelope × the bed brightness
-    /// ([`CursorFxInput::trail_brightness`]) × the bed's legibility share
-    /// ([`bed_legible_share`]).
+    /// The comet cells this tick produced, already projected through the load-shed envelope × the bed brightness ([`CursorFxInput::trail_brightness`]) × the bed's legibility share ([`bed_legible_share`]).
     pub trail_scratch: Vec<TrailCell>,
 }
 
-/// Everything one [`CursorFx::tick`] reads besides the two folded configs —
-/// the host's per-frame facts and its resolved policy, as plain data.
+/// Everything one [`CursorFx::tick`] reads besides the two folded configs.
 #[derive(Clone, Copy)]
 pub struct CursorFxInput {
     /// The animation clock (one `Instant` per frame).
     pub now: Instant,
-    /// The caret cell the engines chase, `None` while the viewport shows
-    /// history. The native host does not fold a DECTCEM hide in here; the web
-    /// host does (its snapshot drops the caret).
+    /// The caret cell the engines chase, `None` while the viewport shows history.
     pub cur: Option<(u16, u16)>,
     /// The frame presents the active grid, not retained scrollback.
     pub live_viewport: bool,
     /// The live cursor shape (a body needs a block; the rod takes a bar).
     pub cursor_style: CursorStyle,
-    /// This window's blink phase (unused by the rainbow body; kept on its tick
-    /// signature).
+    /// This window's blink phase (unused by the rainbow body; kept on its tick signature).
     pub blink_phase: bool,
-    /// The effective live cursor colour, `0x00RRGGBB`: OSC 12 when set, else
-    /// the configured/theme cursor colour, else the live foreground.
+    /// The effective live cursor colour, `0x00RRGGBB`.
     pub live_cursor: u32,
-    /// Whether that colour was pinned (by config or a program's OSC 12) rather
-    /// than the theme's seed. A pinned colour is the rainbow/phaser block's
-    /// base; an unpinned caret builds from white.
+    /// Whether that colour was pinned (by config or a program's OSC 12) rather than the theme's seed.
     pub cursor_color_pinned: bool,
-    /// The live default background (DECSCNM-folded), `0x00RRGGBB`: the
-    /// ground every body solves its light against.
+    /// The live default background (DECSCNM-folded), `0x00RRGGBB`: the ground every body solves its light against.
     pub default_bg: u32,
-    /// The background of the cell under the caret, `0x00RRGGBB`, as the
-    /// renderer cuts a block caret's glyph out in it (`RenderCell::bg`: the
-    /// palette, SGR inverse and DECSCNM resolved), read from the frame the
-    /// host renders. The caret's page floor ([`floor_block_fill`]) holds the
-    /// fill against it, so a caret on a TUI-coloured or reverse-video cell
-    /// keeps its letter. `None` when the host has no cell there: the page
-    /// ([`Self::default_bg`]) stands in.
+    /// The background of the cell under the caret, `0x00RRGGBB`, as the renderer cuts a block caret's glyph out in it (`RenderCell::bg`: the palette, SGR inverse and DECSCNM resolved), read from the frame the host renders.
     pub cursor_cell_bg: Option<u32>,
     /// The window-space effect geometry (grid origin, frame extent).
     pub geom: Geom,
-    /// The cursor-effect focus fold (OS focus, the recording pin, the typed
-    /// wake) — the `focused=` `trail status` prints.
+    /// The cursor-effect focus fold (OS focus, the recording pin, the typed wake) — the `focused=` `trail status` prints.
     pub focused: bool,
-    /// The SOFT load-shed envelope, `0..=1`, applied after the tick to the
-    /// comet's cell bed and the caret fill. The bodies' amplitude is the
-    /// folded `GlowConfig::intensity` (brightness × motion amplitude × this
-    /// envelope), which the host has already multiplied out.
+    /// The SOFT load-shed envelope, `0..=1`, applied after the tick to the comet's cell bed and the caret fill.
     pub shed_envelope: f32,
-    /// The user's brightness for the comet's cell bed, `0..=1`: native
-    /// `cursor_trail_intensity`, the same dial the aurora's intensity starts
-    /// from, so one slider dims every body and the bed. Multiplied with
-    /// [`Self::shed_envelope`] into the bed's presentation opacity; `0` (or
-    /// non-finite) switches the bed off — no cadence sample, no cells. A
-    /// page's opaque trail is its own effect (`set_cursor_trail` takes no
-    /// brightness), so the web host passes `1.0`.
+    /// The user's brightness for the comet's cell bed, `0..=1`.
     pub trail_brightness: f32,
-    /// Serious Mode's `CursorBody` allowance. The live viewport and a present
-    /// caret are folded in here, by the step.
+    /// Serious Mode's `CursorBody` allowance.
     pub body_allowed: bool,
-    /// The user's typing-momentum glow switch (`cursor_momentum_glow`; a
-    /// page's glow switch): its own effect on every style, `off` included.
+    /// The user's typing-momentum glow switch (`cursor_momentum_glow`; a page's glow switch).
     pub momentum_glow: bool,
-    /// The user pinned an explicit trail colour (`cursor_trail_color`): the
-    /// rod then wears it instead of the style's signature shade.
+    /// The user pinned an explicit trail colour (`cursor_trail_color`): the rod then wears it instead of the style's signature shade.
     pub user_tinted: bool,
 }
 
-/// What one [`CursorFx::tick`] produced for the host's frame; the quads are in
-/// [`CursorFx::glow_scratch`] / [`CursorFx::trail_scratch`].
+/// What one [`CursorFx::tick`] produced for the host's frame.
 #[derive(Clone, Copy, Debug)]
 pub struct CursorFxFrame {
-    /// The aurora + every body's fingerprint + the final caret fill, folded
-    /// (0 when idle-empty).
+    /// The aurora + every body's fingerprint + the final caret fill, folded (0 when idle-empty).
     pub glow_fp: u64,
     /// The comet's presentation fingerprint (0 when idle-empty).
     pub trail_fp: u64,
-    /// The comet colour the presented cells render at: the host's resolved
-    /// trail colour ([`automatic_glow_color`] unless pinned by
-    /// `cursor_trail_color`), heat-blended by ignition.
+    /// The comet colour the presented cells render at.
     pub trail_color: u32,
-    /// The caret body this tick resolved through the fill-precedence law and
-    /// the load-shed projection. It becomes status truth only at the host's
-    /// final projection seam (a focus outline, a composed clip).
+    /// The caret body this tick resolved through the fill-precedence law and the load-shed projection.
     pub block_fill: Option<BlockFill>,
     /// The laser bolt owns the block: the caret's shape is `Bolt`.
     pub bolt_cursor: bool,
     /// The rainbow owns a blinking block: the shape is pinned steady.
     pub twinkle_cursor: bool,
-    /// The momentum glow is hot: this Blinking* style pinned to its Steady*
-    /// twin (`None` when cold, or when the style does not blink).
+    /// The momentum glow is hot: this Blinking* style pinned to its Steady* twin (`None` when cold, or when the style does not blink).
     pub momentum_steady: Option<CursorStyle>,
 }
 
-/// Where the streak's head attaches in its cell: a thin bar's insertion point,
-/// else the cell centre. With a bar shape (DECSCUSR bar / `cursor_style beam`)
-/// the light noses into the bar instead of overshooting it by half a cell.
+/// Where the streak's head attaches in its cell: a thin bar's insertion point, else the cell centre.
 #[inline]
 #[must_use]
 pub const fn head_dx_for(style: CursorStyle) -> f32 {
@@ -178,8 +113,7 @@ pub const fn head_dx_for(style: CursorStyle) -> f32 {
     }
 }
 
-/// The Fire style's decorative cursor-body fill, through the same gates in
-/// every render path. Lazy, so a disabled effect never samples forge state.
+/// The Fire style's decorative cursor-body fill, through the same gates in every render path.
 #[inline]
 pub fn forge_cursor_fill(
     cursor_body_allowed: bool,
@@ -194,10 +128,7 @@ pub fn forge_cursor_fill(
     .flatten()
 }
 
-/// The cursor-body fills one tick can produce (plus the momentum tint), in the
-/// order the frame path splices them into `RenderInput::cursor_fill_override`.
-/// At most one style body is `Some` (their styles are mutually exclusive); the
-/// order matches the splice so an overlap would report the actual winner.
+/// The cursor-body fills one tick can produce (plus the momentum tint), in the order the frame path splices them into `RenderInput::cursor_fill_override`.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct BlockFillSplice {
     pub rainbow: Option<u32>,
@@ -211,18 +142,7 @@ pub struct BlockFillSplice {
     pub momentum: Option<u32>,
 }
 
-/// The blink law, by who owns the caret. Precedence, first wins:
-///
-/// 1. the bolt (the `laser` body's own shape);
-/// 2. the rainbow owns the caret (`twinkle_cursor`): pinned `SteadyBlock`,
-///    since its halo, rim and spin already encode momentum;
-/// 3. the momentum glow is hot on any other style: a Blinking* style is pinned
-///    to its Steady* twin while warm (`momentum_steady`), and `None` once cool,
-///    so the configured blink returns.
-///
-/// Every site that spells the caret's shape (native render paths, the
-/// introspection mirror, the web pipeline) calls this, so a capture cannot
-/// contradict the glass.
+/// The blink law, by who owns the caret.
 #[inline]
 #[must_use]
 pub const fn compose_caret_style_override(
@@ -240,11 +160,7 @@ pub const fn compose_caret_style_override(
     }
 }
 
-/// Whether the typing-momentum glow engine runs this frame: the user's switch
-/// (default on) and the host's gates (serious mode, focus, live viewport,
-/// folded into `host_allows`), and not while the rainbow owns the caret. The
-/// rainbow already encodes momentum in its rim and halo, so the momentum
-/// engine gets `enabled: false`, paints nothing and reports `hot: false`.
+/// Whether the typing-momentum glow engine runs this frame.
 #[inline]
 #[must_use]
 pub const fn momentum_glow_allowed(
@@ -255,12 +171,7 @@ pub const fn momentum_glow_allowed(
     user_on && host_allows && !rainbow_owns_caret
 }
 
-/// Who owns the block cursor's body this frame and the colour they built it
-/// from: the reading behind `trail status`'s `block_fill=…` fields.
-///
-/// `fill` is what the override carried; `base` is what the host handed that
-/// owner ([`BlockFillOwner::base_from`]; `None` for owners whose style is their
-/// colour). A body that ignores its base shows as the two disagreeing.
+/// Who owns the block cursor's body this frame and the colour they built it from.
 #[inline]
 #[must_use]
 pub const fn resolve_block_fill(
@@ -280,9 +191,6 @@ pub const fn resolve_block_fill(
             return None;
         };
         let base = match owner.base_from() {
-            // Report what was handed: a `CursorColor` owner with no pinned
-            // colour was handed `None` and built from white, so its base is
-            // `None` here too.
             BlockFillBase::CursorColor => {
                 if cursor_base_pinned {
                     Some(cursor_color)
@@ -291,8 +199,6 @@ pub const fn resolve_block_fill(
                 }
             }
             BlockFillBase::TrailColor => Some(trail_color),
-            // Handed nothing, and the row says so: the identity ramp is
-            // the whole story for these two.
             BlockFillBase::StyleIdentity | BlockFillBase::White => None,
         };
         Some(BlockFill { owner, fill, base })
@@ -369,57 +275,20 @@ pub const fn resolve_block_fill(
     )
 }
 
-/// The least WCAG contrast an effect-owned caret fill keeps against the
-/// ground under it: the 4.5:1 of AA text, not only the 3:1 a focus indicator
-/// needs (WCAG 1.4.11). The renderer cuts the glyph under a block caret out
-/// in its cell's background, so this one floor, held against that background
-/// ([`CursorFxInput::cursor_cell_bg`], the page on an ordinary cell), holds
-/// the caret against its ground AND the letter drawn on it (1.4.3), with the
-/// letter staying the cell's colour (no flip between a light and a dark glyph
-/// as the fill heats through the middle band).
-///
-/// It is a floor of the effect, not of the terminal: the renderer's
-/// `floor_cursor_fill` still applies the user's `minimum_contrast` on top
-/// (off by default, so a plain OSC 12 cursor keeps xterm's semantics), which
-/// makes the effective floor `max(this, minimum_contrast)`.
+/// The least WCAG contrast an effect-owned caret fill keeps against the ground under it.
 pub const CARET_PAGE_MIN_CONTRAST: f32 = 4.5;
 
-/// The least WCAG contrast the comet's cell bed alone leaves a letter it lies
-/// under: the theme's ink over the bed's tint of the page.
-///
-/// The bed is a background (`TrailCell`, drawn under the glyph), blended in
-/// LINEAR light by the renderer (`aterm_render::blend_rgb`), so its fixed
-/// birth ceiling of ~27% coverage (`cursor_trail::BED_PEAK_ALPHA`) of a pale
-/// glacial colour lifted the dark default page to a mid grey under the newest
-/// letters: 2.6:1 from the bed alone, 1.5:1 with the streak, crown and typing
-/// glow on top (the 2026-10 gallery's comet-dark.mid read 1.9:1). Each of
-/// those lights alone leaves the letter 5.8:1 or better, but they stack: held
-/// at 6:1 alone the bed still left 2.3:1 together, at 8:1 2.7:1, at 10:1 3.3:1
-/// (the host frame step at 57 ms a key, momentum glow on). So the bed is a
-/// whisper under the letters it crosses: at most a couple of levels of
-/// coverage of the default glacial colour on the dark default page.
+/// The least WCAG contrast the comet's cell bed alone leaves a letter it lies under: the theme's ink over the bed's tint of the page.
 pub const BED_INK_FLOOR: f32 = 10.0;
 
-/// Whether `glow` is the comet style drawing its own streak (its beam on):
-/// its tail is then the streak itself (the bed under the letters on a dark
-/// ground, the ink wedge on a light one), and a native window, whose cadence
-/// comet is that style's cell tint, runs no cadence comet beside it (the
-/// tint would only box the letters under the tail). A page's separately
-/// configured trail is its own.
+/// Whether `glow` is the comet style drawing its own streak (its beam on).
 #[inline]
 #[must_use]
 pub const fn comet_tail_is_its_streak(glow: &GlowConfig) -> bool {
     glow.beam && matches!(glow.style, GlowStyle::Comet)
 }
 
-/// The share of the comet bed's presentation opacity at which its brightest
-/// possible cell (`cursor_trail::BED_PEAK_ALPHA`) in `color` over `ground`
-/// still leaves `ink` [`BED_INK_FLOOR`] of contrast (or, on a theme whose own
-/// pair is under that floor, the pair's own contrast): `1.0` when the full
-/// bed already holds it. Every cell scales by it, so the bed keeps its fade
-/// and its head-to-tail shape and only its peak comes down (the
-/// streak budget's rule). `1.0` when the ink is unknown (a page that stamps no
-/// default foreground).
+/// Share of the comet bed's opacity at which `cursor_trail::BED_PEAK_ALPHA` in `color` over `ground` keeps `ink` at [`BED_INK_FLOOR`] contrast.
 #[inline]
 #[must_use]
 pub fn bed_legible_share(color: u32, ground: u32, ink: u32) -> f32 {
@@ -440,8 +309,6 @@ pub fn bed_legible_share(color: u32, ground: u32, ink: u32) -> f32 {
     if holds(peak) {
         return 1.0;
     }
-    // The tint moves the ground monotonically toward `color`, so the ink's
-    // contrast crosses the target once: bisect the alpha that still holds.
     let (mut lo, mut hi) = (0u8, peak);
     while hi - lo > 1 {
         let mid = lo + (hi - lo) / 2;
@@ -451,34 +318,10 @@ pub fn bed_legible_share(color: u32, ground: u32, ink: u32) -> f32 {
             hi = mid;
         }
     }
-    // A cell is projected with rounding (`project_trail_presentation`), so
-    // the share lands half a level under the solved alpha.
     ((f32::from(lo) - 0.5).max(0.0) / f32::from(peak)).clamp(0.0, 1.0)
 }
 
-/// Floor an effect-owned caret fill against the page `ground`
-/// ([`caret_page_floor`]), by lightness alone
-/// ([`crate::color_math::floor_contrast_keeping_hue`]): an ember stays an
-/// ember, a violet stays violet, and nothing blends toward the theme cursor
-/// (the owner rejected a green ember, 9235efe09).
-///
-/// A fill built on a PINNED cursor colour (`pinned_cursor`: a configured
-/// `cursor_color` or a program's OSC 12) is the user's colour and passes
-/// untouched, as the same cursor with effects off would (owner, 2026-08-29):
-/// that is a fill whose reported base is the pinned colour, a rainbow,
-/// phaser or momentum body wearing it, or a rod, bolt or nucleus whose trail
-/// colour follows it.
-///
-/// The momentum tint is the one owner built on the `live_cursor` even
-/// unpinned, and at its cold edge it IS that cursor, so it is floored no
-/// harder than the plain cursor keeps on the page by itself. A stricter floor
-/// would switch on with the heat and off as it cools, a step at the hot
-/// threshold on a theme whose own cursor sits under the floor (Catppuccin
-/// Latte's rosewater is 2.3:1, Solarized Light's 4.1:1). That cursor's
-/// contrast is the theme's choice, which the renderer also leaves alone.
-///
-/// Runs on the candidate BEFORE [`project_block_fill`], so the load-shed fade
-/// still ends exactly on the terminal cursor colour.
+/// Floor an effect-owned caret fill against the page `ground` ([`caret_page_floor`]), by lightness alone ([`crate::color_math::floor_contrast_keeping_hue`]).
 #[inline]
 #[must_use]
 pub fn floor_block_fill(
@@ -504,15 +347,7 @@ pub fn floor_block_fill(
     }
 }
 
-/// The page floor [`floor_block_fill`] holds `owner`'s caret to:
-/// [`CARET_PAGE_MIN_CONTRAST`], except the rainbow kitty's. Its caret is its
-/// ribbon's stop in the paper law's caret ink, which keeps 3:1 on the page
-/// with its hue (`rainbow_kitty::ribbon::paper_caret_ink`) and is lifted
-/// toward light on a dark one, so it is held to that 3:1: on the page the
-/// floor is the identity and the ribbon's caret stays its own, while a
-/// rainbow caret on a reverse-video or TUI-coloured cell is still lifted.
-/// (The momentum tint's floor also reads the live cursor, in
-/// [`floor_block_fill`].)
+/// The page floor [`floor_block_fill`] holds `owner`'s caret to: [`CARET_PAGE_MIN_CONTRAST`], except the rainbow kitty's.
 #[inline]
 #[must_use]
 pub const fn caret_page_floor(owner: BlockFillOwner) -> f32 {
@@ -522,11 +357,6 @@ pub const fn caret_page_floor(owner: BlockFillOwner) -> f32 {
     }
 }
 
-/// The laser BOLT's body colour from its hue at `blaze` `0..=1`: on a dark
-/// page it whitens with the heat and the strike flare (`0.55 · blaze` of the
-/// way to white); on a light page it deepens instead
-/// ([`crate::color_math::light_body_fill`]), since a whitening bolt sinks
-/// into a white page. [`floor_block_fill`] then holds it to the page.
 #[inline]
 #[must_use]
 fn bolt_body(color: u32, blaze: f32, dark: bool) -> u32 {
@@ -543,12 +373,6 @@ fn bolt_body(color: u32, blaze: f32, dark: bool) -> u32 {
 }
 
 /// Project the resolved effect-owned cursor body through adaptive shedding.
-///
-/// Runs after owner precedence, so every body and presentation path shares one
-/// fade law. The endpoint is always the terminal cursor colour (`BlockFill::base`
-/// is provenance and may be a pinned trail colour the renderer does not
-/// restore). At exact zero the override disappears. Accessibility and Serious
-/// Mode are hard zeros because those gates produce no candidate.
 #[inline]
 #[must_use]
 pub fn project_block_fill(
@@ -574,13 +398,10 @@ pub fn project_block_fill(
     })
 }
 
-/// What a host resolved from a trail-style spelling. The native app resolves it
-/// once per config generation against its alias table; a page parses a raw
-/// spelling with [`GlowSpelling::parse`].
+/// What a host resolved from a trail-style spelling.
 #[derive(Clone, Copy, Debug)]
 pub struct GlowSpelling {
-    /// The style, or `None` for the resolution that genuinely means "draw
-    /// nothing" (`off`).
+    /// The style, or `None` for the resolution that genuinely means "draw nothing" (`off`).
     pub style: Option<GlowStyle>,
     /// The additive beam ([`crate::cursor_glow::style_has_beam_of`]).
     pub beam: bool,
@@ -593,14 +414,7 @@ pub struct GlowSpelling {
 }
 
 impl GlowSpelling {
-    /// A page's reading of a raw spelling: the spelling is canonicalised once
-    /// ([`crate::cursor_glow::spellings::canonical`], the table the native
-    /// host reads) and every fork reads that one token, except the classic
-    /// wake's mono face, which reads the AUTHORED spelling (the old `classic
-    /// mono` spellings are aliases of `classic` that still draw the mono
-    /// face, [`GlowStyle::style_names_classic_mono`]). `off` is no style
-    /// (disabled). An unknown spelling reads as Lumen, the page's documented
-    /// fallback (the native host substitutes its default spelling instead).
+    /// A page's reading of a raw spelling.
     #[inline]
     #[must_use]
     pub fn parse(raw: &str) -> Self {
@@ -615,9 +429,7 @@ impl GlowSpelling {
         }
     }
 
-    /// The companion a page's raw spelling names: the resident pet's species,
-    /// or `None` for the flying head and every style without a pet. Read
-    /// through the same table as [`Self::parse`].
+    /// The companion a page's raw spelling names.
     #[inline]
     #[must_use]
     pub fn pet_of(raw: &str) -> Option<crate::kitty_pet::PetSpecies> {
@@ -631,12 +443,10 @@ impl GlowSpelling {
     }
 }
 
-/// The numeric knobs of the cursor family's config (native `cursor_trail_*`,
-/// a page's `set_cursor_glow` arguments).
+/// The numeric knobs of the cursor family's config (native `cursor_trail_*`, a page's `set_cursor_glow` arguments).
 #[derive(Clone, Copy, Debug)]
 pub struct GlowKnobs {
-    /// Whether the trail may draw at all (Serious Mode folded in by the host;
-    /// the style decides the rest).
+    /// Whether the trail may draw at all (Serious Mode folded in by the host; the style decides the rest).
     pub enabled: bool,
     /// An explicit trail colour; `None` takes the style's default.
     pub color: Option<u32>,
@@ -649,21 +459,10 @@ pub struct GlowKnobs {
     pub ring: bool,
 }
 
-/// Classic's brightness while its user sets none: the v0.28 release's own
-/// default (every style read 0.7 until 2026-09-13, when the rest went to
-/// 1.0). Classic is that release's wake restored byte for byte on a dark
-/// ground (owner ruling), and that is the level it shipped at: its additive
-/// tracer and box crown lie over the letters they cross, and at 1.0 the
-/// tracer's white core left the newest letter under 4.5:1 (3.0-3.4 measured),
-/// at 0.7 over it (4.8 and up).
+/// Classic's brightness while its user sets none.
 pub const CLASSIC_DEFAULT_INTENSITY: f32 = 0.7;
 
-/// The trail brightness `style` draws at while `cursor_trail_intensity` is
-/// unset, in every host: [`CLASSIC_DEFAULT_INTENSITY`] for Classic's spectrum
-/// face, full brightness for every other style (and for no style) and for
-/// Classic's one-colour face (`classic_mono`: a trail colour, or the old
-/// `classic mono` spelling), whose dark tracer lies under the letters as a
-/// bed and was designed at full brightness. A set brightness is read as set.
+/// The trail brightness `style` draws at while `cursor_trail_intensity` is unset, in every host.
 #[inline]
 #[must_use]
 pub const fn default_trail_intensity(style: Option<GlowStyle>, classic_mono: bool) -> f32 {
@@ -673,7 +472,6 @@ pub const fn default_trail_intensity(style: Option<GlowStyle>, classic_mono: boo
     }
 }
 
-/// A non-finite knob is off, never NaN in the engine; a finite one clamps.
 #[inline]
 const fn finite_clamp_or_off(value: f32, min: f32, max: f32) -> f32 {
     if value.is_finite() {
@@ -683,8 +481,7 @@ const fn finite_clamp_or_off(value: f32, min: f32, max: f32) -> f32 {
     }
 }
 
-/// Brighten a packed `0x00RRGGBB` by `factor` (the auto-accent law: an
-/// automatic accent is the colour brightened 1.5×, in every host).
+/// Brighten a packed `0x00RRGGBB` by `factor` (the auto-accent law: an automatic accent is the colour brightened 1.5×, in every host).
 #[inline]
 #[must_use]
 pub const fn brighten(color: u32, factor: f32) -> u32 {
@@ -696,9 +493,7 @@ pub const fn brighten(color: u32, factor: f32) -> u32 {
         | channel(color, 0, factor)
 }
 
-/// The style's own hue, `0x00RRGGBB`, or `None` for the styles whose
-/// automatic colour is the cursor's: Laser storm violet, Beam photon ice,
-/// Comet glacial blue, Sparkle starlight gold (the 2026-07-22 live review).
+/// The style's own hue, `0x00RRGGBB`, or `None` for the styles whose automatic colour is the cursor's.
 #[inline]
 #[must_use]
 pub const fn canonical_glow_color(style: GlowStyle) -> Option<u32> {
@@ -714,21 +509,7 @@ pub const fn canonical_glow_color(style: GlowStyle) -> Option<u32> {
     }
 }
 
-/// Whether an AUTOMATIC glow colour (no explicit `cursor_trail_color`) takes
-/// the live cursor colour this frame: the one colour law every host's
-/// per-frame fold asks.
-///
-/// * A style with no hue of its own (lumen, rainbow, fire, …)
-///   always follows the effective cursor colour (OSC 12, else the theme's or
-///   the live OSC 10 foreground).
-/// * Beam, Comet and Sparkle keep their canonical hue unless the cursor
-///   colour is PINNED — a configured `cursor_color` or a program's live
-///   OSC 12 — and then wear it. The theme's seed is not a request: it and a
-///   requested colour arrive as the same three bytes, so only the host's
-///   `cursor_color_pinned` verdict tells them apart (owner, 2026-08-29).
-/// * Laser follows nothing: only an explicit `cursor_trail_color` recolours
-///   the lightning (live review: a rosewater storm reads as a smudge, not a
-///   strike).
+/// Whether an AUTOMATIC glow colour (no explicit `cursor_trail_color`) takes the live cursor colour this frame.
 #[inline]
 #[must_use]
 pub const fn glow_color_follows_live_cursor(style: GlowStyle, cursor_color_pinned: bool) -> bool {
@@ -738,11 +519,7 @@ pub const fn glow_color_follows_live_cursor(style: GlowStyle, cursor_color_pinne
     }
 }
 
-/// The automatic glow colour for a frame, `0x00RRGGBB`:
-/// [`glow_color_follows_live_cursor`] picks between the live cursor colour
-/// and the style's [`canonical_glow_color`]. [`resolve_glow_config`] asks it
-/// with the theme cursor and no pin; each host's frame asks it again with the
-/// live colour and its pinned verdict.
+/// The automatic glow colour for a frame, `0x00RRGGBB`.
 #[inline]
 #[must_use]
 pub const fn automatic_glow_color(
@@ -757,19 +534,7 @@ pub const fn automatic_glow_color(
     color & 0x00ff_ffff
 }
 
-/// The cursor family's config law: the one construction of a [`GlowConfig`]
-/// from a spelling and knobs, for every host (native window, its Settings
-/// preview, the web pipeline). The live terminal differs from a preview only
-/// in the injected theme/geometry facts (`dark_theme`, the ground pair,
-/// `head_dx`) and in a pinned cursor colour, which the frame path folds per
-/// frame through [`automatic_glow_color`].
-///
-/// Defaults ([`automatic_glow_color`] with nothing pinned): Laser storm
-/// violet, Sparkle starlight gold, Beam and Comet their canonical hues, every
-/// other style the theme's cursor colour; an explicit colour overrides any.
-/// `beam` is the tube alone (`radius` 0, no ring).
-/// `audible` is `false` at construction: only a frame knows whose window a key
-/// lands in (native `sound_policy::fold_window_audibility`).
+/// The cursor family's config law.
 #[must_use]
 pub fn resolve_glow_config(
     knobs: GlowKnobs,
@@ -781,16 +546,9 @@ pub fn resolve_glow_config(
     head_dx: f32,
 ) -> GlowConfig {
     use crate::cursor_glow::{KnobContext, TrailKnob};
-    // Off values carry a concrete enum because GlowConfig is
-    // POD; `enabled = false` is the sole engine gate.
     let glow_style = spelling.style.unwrap_or(GlowStyle::Lumen);
     let default_color = automatic_glow_color(glow_style, theme_cursor, false);
     let color = knobs.color.unwrap_or(default_color) & 0x00ff_ffff;
-    // The knob law (`GlowStyle::reads_knob`): a knob the style does not
-    // read is folded here to the value that leaves its frame unchanged, so
-    // no hidden path can make it act. The auto accent brightens the colour
-    // the style draws: a style that colours from its own ramp keeps its
-    // accent on the cursor colour whatever `cursor_trail_color` says.
     let accent_base = if glow_style.draws_trail_color() {
         color
     } else {
@@ -823,18 +581,12 @@ pub fn resolve_glow_config(
         head_dx,
         ribbon_tall: spelling.ribbon_tall,
         ribbon_flat: spelling.ribbon_flat,
-        // Classic's one-colour face is a colour choice: a trail colour draws
-        // it, as the old `classic mono` spelling (still read) does in the
-        // cursor's colour; unset, Classic shifts through the spectrum.
         classic_mono: spelling.classic_mono
             || (glow_style == GlowStyle::Classic && knobs.color.is_some()),
     }
 }
 
-/// The plain name Settings gives a style's own hue ([`canonical_glow_color`]):
-/// Laser "Violet", Beam "Ice blue", Comet "Pale blue", Sparkle "Gold", and
-/// `None` for every style whose automatic colour is the cursor's. One
-/// exhaustive match, so a style that gains a hue of its own must gain a name.
+/// The plain name Settings gives a style's own hue ([`canonical_glow_color`]).
 #[inline]
 #[must_use]
 pub const fn canonical_glow_color_name(style: GlowStyle) -> Option<&'static str> {
@@ -852,12 +604,7 @@ pub const fn canonical_glow_color_name(style: GlowStyle) -> Option<&'static str>
     }
 }
 
-/// The colour `style` draws with when `cursor_trail_color` is unset and it
-/// does not follow the cursor ([`glow_color_follows_live_cursor`] with this
-/// pin), and its plain name, so Settings can say which colour a row's default
-/// is. `None` when the automatic colour is the cursor's: every style without
-/// a hue of its own, and Beam, Comet and Sparkle once the cursor colour is
-/// pinned (Laser keeps its violet whatever is pinned).
+/// The colour `style` draws with when `cursor_trail_color` is unset and it does not follow the cursor ([`glow_color_follows_live_cursor`] with this pin), and its plain name, so Settings can say which colour a row's default is.
 #[inline]
 #[must_use]
 pub const fn own_trail_color(
@@ -876,12 +623,7 @@ pub const fn own_trail_color(
     Some((color, name))
 }
 
-/// What an unset `cursor_trail_color` draws for `style`'s trail on a block,
-/// by name, where that is not the live cursor's colour: a colour of the
-/// style's own ([`own_trail_color`] under the host's pinned verdict:
-/// Laser's violet, and Beam's ice blue, Comet's pale blue and Sparkle's gold
-/// while no cursor colour is pinned) or Classic's shifting spectrum, which a
-/// trail colour turns into its one-colour face.
+/// What an unset `cursor_trail_color` draws for `style`'s trail on a block, by name, where that is not the live cursor's colour.
 #[inline]
 #[must_use]
 pub const fn trail_color_default_name(
@@ -900,22 +642,12 @@ pub const fn trail_color_default_name(
 /// The colour an unset accent (native `cursor_trail_accent`) brightens.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AccentBase {
-    /// The live cursor colour (OSC 12, else the theme's).
     Cursor,
-    /// The style's own colour ([`own_trail_color`]) and its plain name.
     Own(u32, &'static str),
-    /// The trail colour chosen (`0x00RRGGBB`).
     Trail(u32),
 }
 
-/// What an unset accent brightens for `style` under the trail colour setting
-/// `color` and the host's pinned verdict, as a window and its Settings
-/// preview draw it ([`resolve_glow_config`], then [`follow_live_cursor`]):
-/// the automatic colour ([`automatic_glow_color`]: a style's own hue where
-/// the colour law keeps one, [`own_trail_color`], else the live cursor) while
-/// no trail colour is chosen, and on a style that does not draw the trail
-/// colour on a block ([`GlowStyle::draws_trail_color`]); else the colour
-/// chosen, the cursor's among them. Settings names an accent's Reset by it.
+/// What an unset accent brightens for `style` under the trail colour setting `color` and the host's pinned verdict, as a window and its Settings preview draw it ([`resolve_glow_config`], then [`follow_live_cursor`]).
 #[inline]
 #[must_use]
 pub const fn unset_accent_base(
@@ -940,18 +672,8 @@ pub const fn unset_accent_base(
 /// What a host's trail colour setting (native `cursor_trail_color`) says.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum TrailColor {
-    /// Unset: each style's automatic colour ([`automatic_glow_color`]: its
-    /// own hue where the colour law keeps one, else the live cursor colour)
-    /// and Classic's shifting spectrum.
     Automatic,
-    /// The cursor's colour, chosen (`cursor_trail_color = "cursor"`): a trail
-    /// colour like any other, whose value is the live cursor colour (OSC 12,
-    /// else the theme's) — so Classic draws its one-colour face, Laser drops
-    /// its violet, Beam, Comet and Sparkle wear it with no cursor colour
-    /// pinned, and a bar's rod wears it — and follows the cursor as it is
-    /// recoloured.
     Cursor,
-    /// An explicit colour (`0x00RRGGBB`): it stays.
     Pinned(u32),
 }
 
@@ -959,10 +681,7 @@ impl TrailColor {
     /// The word for the cursor's colour in a trail colour setting.
     pub const CURSOR_WORD: &'static str = "cursor";
 
-    /// A trail colour setting as written (native `cursor_trail_color`, a
-    /// page's `set_cursor_glow_color`): blank is [`Self::Automatic`], the
-    /// word `cursor` (any case) [`Self::Cursor`], an `RRGGBB` or `#RRGGBB`
-    /// colour [`Self::Pinned`]; `None` for anything else.
+    /// A trail colour setting as written (native `cursor_trail_color`, a page's `set_cursor_glow_color`).
     #[must_use]
     pub fn parse(raw: &str) -> Option<Self> {
         let raw = raw.trim();
@@ -979,8 +698,7 @@ impl TrailColor {
         }
     }
 
-    /// An explicit colour where one is given, else [`Self::Automatic`]: a
-    /// colour knob that cannot say "the cursor's".
+    /// An explicit colour where one is given, else [`Self::Automatic`]: a colour knob that cannot say "the cursor's".
     #[inline]
     #[must_use]
     pub const fn automatic_or_pinned(color: Option<u32>) -> Self {
@@ -990,10 +708,7 @@ impl TrailColor {
         }
     }
 
-    /// The colour [`GlowKnobs::color`] takes for this setting, given the
-    /// cursor colour the config resolves against (the per-frame step,
-    /// [`follow_live_cursor`], moves a cursor-coloured trail with the live
-    /// cursor after that).
+    /// The colour [`GlowKnobs::color`] takes for this setting, given the cursor colour the config resolves against (the per-frame step, [`follow_live_cursor`], moves a cursor-coloured trail with the live cursor after that).
     #[inline]
     #[must_use]
     pub const fn knob(self, cursor: u32) -> Option<u32> {
@@ -1014,8 +729,7 @@ impl TrailColor {
         }
     }
 
-    /// Whether a colour was chosen at all: the rod wears it
-    /// ([`CursorFxInput::user_tinted`]) and Classic draws its one-colour face.
+    /// Whether a colour was chosen at all: the rod wears it ([`CursorFxInput::user_tinted`]) and Classic draws its one-colour face.
     #[inline]
     #[must_use]
     pub const fn chosen(self) -> bool {
@@ -1023,26 +737,7 @@ impl TrailColor {
     }
 }
 
-/// THE FRAME'S AUTOMATIC TRAIL COLOUR STEP — the one step every host runs
-/// between [`resolve_glow_config`] and the tick (a native window, its
-/// Settings preview), so a preview draws the colour the terminal does. With
-/// no trail colour ([`TrailColor::Automatic`]) the glow and the comet body
-/// take [`automatic_glow_color`] for the live cursor colour and the host's
-/// pinned verdict: a style with no hue of its own follows the live cursor;
-/// Beam, Comet and Sparkle keep their own hue until the cursor colour is
-/// pinned (a configured `cursor_color` or a program's OSC 12), then wear it;
-/// Laser keeps storm violet whatever is pinned. The cursor's colour, chosen
-/// ([`TrailColor::Cursor`]), is the live cursor colour on every style, a hue
-/// of its own or not. With no explicit accent the accent is the drawn colour
-/// brightened 1.5x. An explicit colour stays, and so does the accent it
-/// brightens, except on a style that does not draw the trail colour on a
-/// block ([`GlowStyle::draws_trail_color`]): it keeps its automatic accent
-/// even while a colour is chosen for the rod.
-///
-/// The comet body wears the colour the glow draws, so trail, nucleus and
-/// crown are one hue — unless the host gives the body a colour of its own
-/// (`body_color`: a web page's `set_cursor_trail` colour, which it configures
-/// apart from the glow; a native window has none), which it then keeps.
+/// THE FRAME'S AUTOMATIC TRAIL COLOUR STEP.
 #[inline]
 pub const fn follow_live_cursor(
     glow: &mut GlowConfig,
@@ -1076,9 +771,6 @@ pub const fn follow_live_cursor(
     }
 }
 
-/// The fold of the over-ink shares a frame's bodies were admitted at
-/// ([`CursorGlow::admit_over_ink`]): `0` while every body was admitted whole,
-/// so an idle frame's fingerprint stays `0`.
 #[derive(Default)]
 struct OverInkShares(u64);
 
@@ -1091,18 +783,13 @@ impl OverInkShares {
     }
 }
 
-/// A block cursor shape, the one every block body needs.
 #[inline]
 const fn is_block(style: CursorStyle) -> bool {
     matches!(style, CursorStyle::BlinkingBlock | CursorStyle::SteadyBlock)
 }
 
 impl CursorFx {
-    /// The per-frame preamble, before the host feeds the glow engine its row
-    /// probe, print anchor and delivered inserts. A history viewport shows
-    /// other rows than the active grid the effects live in, so both engines
-    /// retire there, except Rainbow Kitty, which is hidden (its clocks run,
-    /// nothing is written). It also arms the fresh-ink pop's reduced motion.
+    /// The per-frame preamble, before the host feeds the glow engine its row probe, print anchor and delivered inserts.
     #[inline]
     pub fn begin(&mut self, live_viewport: bool, animate: bool) {
         if !live_viewport {
@@ -1114,10 +801,7 @@ impl CursorFx {
         self.glow.set_reduced_motion(!animate);
     }
 
-    /// Retire every body engine, the comet, the momentum rate and the typing
-    /// cadence: Serious Mode's cursor drain, and the web pipeline's all-off arm
-    /// and hidden-page edge. The aurora is the caller's (its drain is a `reset`
-    /// that keeps cumulative sensors).
+    /// Retire every body engine, the comet, the momentum rate and the typing cadence.
     #[inline]
     pub fn retire_bodies(&mut self) {
         self.retire_body_geometry();
@@ -1125,11 +809,7 @@ impl CursorFx {
         self.cadence = TypingCadence::default();
     }
 
-    /// The caret's coordinate space was replaced (re-grid, new owner, alternate
-    /// screen swap, torn frame): every body's caret geometry and the comet's
-    /// cells retire with this frame's scratch. The aurora (whose law differs by
-    /// seam), the cadence and the momentum rate (facts about the hand) are the
-    /// caller's.
+    /// The caret's coordinate space was replaced (re-grid, new owner, alternate screen swap, torn frame).
     #[inline]
     pub fn retire_body_geometry(&mut self) {
         self.trail.reset();
@@ -1142,11 +822,7 @@ impl CursorFx {
         self.trail_scratch.clear();
     }
 
-    /// Content-scroll law, whole-plane arm: the content moved up by `rows`, so
-    /// both engines translate their retained light with the text (earned light
-    /// leaves by decay, translation or reset, never by someone else's output).
-    /// The row probe is fenced so pre-scroll bytes never compare against the
-    /// new row.
+    /// Content-scroll law, whole-plane arm.
     #[inline]
     pub fn scroll_translate(&mut self, rows: u16) {
         self.glow.note_scroll(rows);
@@ -1154,10 +830,7 @@ impl CursorFx {
         self.glow.drop_row_probe();
     }
 
-    /// Content-scroll law, row-band arm: every invalidating batch since the last
-    /// snapshot was explained by the `count` row-band moves from `first_seq`
-    /// (an inline viewport's region scroll), replayed oldest first. The row
-    /// probe is fenced as under a whole-plane translation.
+    /// Content-scroll law, row-band arm.
     #[inline]
     pub fn scroll_bands(
         &mut self,
@@ -1173,18 +846,14 @@ impl CursorFx {
         self.glow.drop_row_probe();
     }
 
-    /// Content-scroll law, invalidation arm: the retained coordinates no longer
-    /// share one transform, so every live point retires: Rainbow Kitty's ribbon
-    /// through its 0.24 s curtain (a reset for other styles), and the comet at
-    /// once.
+    /// Content-scroll law, invalidation arm.
     #[inline]
     pub fn scroll_invalidate(&mut self, now: Instant) {
         self.glow.curtain(now);
         self.trail.reset();
     }
 
-    /// Any body (not the aurora, not the comet) still animating — the part of
-    /// the scheduler's frame-cadence set this step owns.
+    /// Any body (not the aurora, not the comet) still animating — the part of the scheduler's frame-cadence set this step owns.
     #[inline]
     #[must_use]
     pub const fn bodies_active(&self) -> bool {
@@ -1196,22 +865,14 @@ impl CursorFx {
             || self.phaser.is_active()
     }
 
-    /// A body that still owes frames but not the frame cadence, once its
-    /// fingerprint stops moving frame to frame: the rainbow caret's colour
-    /// release ([`CursorRainbow::settling`]) and the momentum glow's
-    /// cool-down ([`MomentumHost::settling`]). Disjoint from
-    /// [`Self::bodies_active`]; a host paces it by
-    /// [`Self::bodies_next_change_deadline`] on its coarse one-shot arm.
+    /// A body that still owes frames but not the frame cadence, once its fingerprint stops moving frame to frame.
     #[inline]
     #[must_use]
     pub const fn bodies_settling(&self) -> bool {
         self.rainbow.settling() || self.momentum.settling()
     }
 
-    /// The earliest next visible step of the settling bodies (see
-    /// [`CursorRainbow::next_change_deadline`] and
-    /// [`MomentumHost::next_change_deadline`]), `None` when none is settling.
-    /// `&mut` because the rainbow's is a memoised dry run of its tick.
+    /// The earliest next visible step of the settling bodies (see [`CursorRainbow::next_change_deadline`] and [`MomentumHost::next_change_deadline`]), `None` when none is settling.
     #[inline]
     #[must_use]
     pub fn bodies_next_change_deadline(
@@ -1235,14 +896,7 @@ impl CursorFx {
         }
     }
 
-    /// The frame step: the aurora, then every block body off the aurora's
-    /// post-tick state, then the comet, then the caret's one owner.
-    ///
-    /// `glow_cfg` is the host's folded config (the brightness dial × motion
-    /// amplitude × shed on the intensity, the [`automatic_glow_color`] rewire,
-    /// the ground, `head_dx`); `trail_cfg` likewise, `enabled` folded by the
-    /// motion policy and its colour rewired. The comet's ignition from the
-    /// typing cadence is stamped here.
+    /// The frame step: the aurora, then every block body off the aurora's post-tick state, then the comet, then the caret's one owner.
     #[inline]
     pub fn tick(
         &mut self,
@@ -1253,34 +907,14 @@ impl CursorFx {
         let now = f.now;
         let cur = f.cur;
         let geom = f.geom;
-        // Every block body's amplitude is the aurora's folded intensity: the
-        // user's brightness dial × the motion amplitude × the shed envelope,
-        // already multiplied out by the host. Taken once, never re-multiplied,
-        // so the dial dims the comet nucleus, the rainbow, droplet and phaser
-        // blocks, the light rod and the momentum glow exactly as it dims the
-        // aurora ("every style").
         let body_amp = finite_clamp_or_off(glow_cfg.intensity, 0.0, 1.0);
-        // The bed's own dial ([`CursorFxInput::trail_brightness`]): zero is
-        // the person's explicit off, so the comet samples no cadence and lays
-        // no cell, rather than painting a full-strength bed under a dark crown.
         let bed_brightness = finite_clamp_or_off(f.trail_brightness, 0.0, 1.0);
         trail_cfg.enabled &= bed_brightness > 0.0;
         let dark = aterm_render::theme_is_dark(f.default_bg);
         let glow_fp = self
             .glow
             .tick(cur, now, glow_cfg, geom, &mut self.glow_scratch);
-        // The host resolves the style (Off draws nothing), Serious Mode, the
-        // brightness dial and the motion/load-shed amplitude into
-        // `GlowConfig::enabled` + `intensity`; every block body reads that
-        // pair (the folded intensity, `body_amp`), so a hot-reloaded style
-        // takes effect next frame.
         let body_allowed = f.body_allowed && f.live_viewport && cur.is_some();
-        // The forge cursor fill (fire style): the block heats along the
-        // black-body ramp with sustained momentum and cools to its resting
-        // ember, a ramp point solved to read against this page
-        // (`CursorGlow::forge_fill`). It is the style's own colour, never the
-        // theme's cursor colour or OSC 12 (by design). Its colour is already
-        // folded into `glow_fp`.
         let forge_fill = forge_cursor_fill(body_allowed, glow_cfg, || self.glow.forge_fill());
         let rainbow_block = body_allowed
             && glow_cfg.enabled
@@ -1288,40 +922,25 @@ impl CursorFx {
             && f.focused
             && is_block(f.cursor_style);
         let pinned_base = f.cursor_color_pinned.then_some(f.live_cursor);
-        // Rainbow block (`rainbow kitty`): the fill moves from its base toward a
-        // spinning rainbow and a halo blooms with typing momentum. The base is
-        // a pinned cursor colour, else white; only the host's pinned verdict
-        // tells OSC 12 from the theme's seed.
         let rainbow_enabled = matches!(glow_cfg.style, GlowStyle::RainbowKitty) && rainbow_block;
         let rainbow_cfg = RainbowConfig {
             enabled: rainbow_enabled,
             intensity: body_amp,
             blinking: matches!(f.cursor_style, CursorStyle::BlinkingBlock),
             base: pinned_base,
-            // The ribbon emitter is the colour authority at the nozzle, so the
-            // hot block cannot run a plausible-but-different rainbow beside
-            // the trail it leads.
             head_rgb: if rainbow_enabled {
                 self.glow.rainbow_head_rgb(glow_cfg)
             } else {
                 None
             },
-            // The caret cools with its trail: the ribbon's eased display spine
-            // (floored by v2's landing re-light), not the 220 ms cadence alone.
             paint: rainbow_enabled.then(|| self.glow.caret_paint(now)),
-            // The ground the ribbon solves against.
             ground: Some(f.default_bg & 0x00FF_FFFF),
-            // When a v2 meteor's frame-0 flare fired, while its spring-snap relax
-            // is live; `None` is the identity.
             flare_at: if rainbow_enabled {
                 self.glow.caret_flare_at()
             } else {
                 None
             },
         };
-        // Sample the cadence only when something listens: the rainbow/phaser
-        // bodies or an enabled comet. Reads are pure, so skipping one changes
-        // nothing a later sample sees.
         let cadence_heard = trail_cfg.enabled
             || (rainbow_block
                 && rainbow_cfg.intensity > 0.0
@@ -1331,9 +950,6 @@ impl CursorFx {
         } else {
             (0.0, 0.0)
         };
-        // One field (`docs/design/RAINBOW-KITTY-V2.md` §2.3, C2): body, halo,
-        // kitty ribbon and sparkle rail resolve one spectrum band this frame
-        // from the glow engine's family clock.
         let family_phase = self.glow.rainbow_phase();
         let family_field = self.glow.rainbow_field();
         let rainbow_frame = self.rainbow.tick_with_family_phase(
@@ -1348,18 +964,9 @@ impl CursorFx {
             &rainbow_cfg,
             &mut self.glow_scratch,
         );
-        // The rainbow owns the caret; on a blinking block the shape is pinned
-        // steady. Reduced motion / load shed leave `fill` None, restoring the blink.
         let twinkle_cursor = rainbow_frame.fill.is_some() && rainbow_cfg.blinking;
         let rainbow_owns_caret = rainbow_frame.fill.is_some();
         let glow_fp = glow_fp ^ rainbow_frame.fp.rotate_left(23);
-        // Every body laid after the aurora spends the frame's over-ink account
-        // where its light reaches a letter (`CursorGlow::admit_over_ink`; an
-        // idle account, as on a light ground, admits it whole): the bodies in
-        // the order they are laid, the momentum glow last.
-        //
-        // Liquid droplet cursor (the `water` body), riding the aurora's surge
-        // read after its tick.
         let body_from = self.glow_scratch.len();
         let droplet_frame = self.droplet.tick(
             cur,
@@ -1369,7 +976,6 @@ impl CursorFx {
             &DropletConfig {
                 enabled: matches!(glow_cfg.style, GlowStyle::Water) && rainbow_block,
                 intensity: body_amp,
-                // The page the water's ramp is solved against.
                 ground: Some(f.default_bg & 0x00FF_FFFF),
             },
             &mut self.glow_scratch,
@@ -1382,19 +988,12 @@ impl CursorFx {
             OverInkTier::Body,
         ));
         let glow_fp = glow_fp ^ droplet_frame.fp.rotate_left(47);
-        // The light rod's shape: a thin bar becomes a rod of the style's light
-        // (keeping its DECSCUSR shape).
         let bar_shape = body_allowed
             && f.focused
             && matches!(
                 f.cursor_style,
                 CursorStyle::BlinkingBar | CursorStyle::SteadyBar
             );
-        // The rod's tint: the config colour where it already carries the style
-        // identity, the signature shade where the style paints outside it,
-        // and an explicit trail colour on the bar wherever the knob law says
-        // the rod wears it. Resolved before the momentum glow, which wears it
-        // on a light page.
         let tinted = f.user_tinted
             && glow_cfg.style.reads_knob(
                 crate::cursor_glow::TrailKnob::Color,
@@ -1405,28 +1004,20 @@ impl CursorFx {
             );
         let (rod_color, rod_haze) = match glow_cfg.style {
             GlowStyle::Beam => (glow_cfg.color, aterm_render::BEAM_SPACE_HAZE),
-            GlowStyle::Water if !tinted => (0x0032_DCDE, 0x000E_66B4), // droplet crest over deep ocean
-            GlowStyle::Fire if !tinted => (0x00FF_9632, 0x0078_1E00),  // ember over char
-            GlowStyle::RainbowKitty if !tinted => (0x00FF_66CC, 0x0046_1E64), // the cat's pink over dusk purple
+            GlowStyle::Water if !tinted => (0x0032_DCDE, 0x000E_66B4),
+            GlowStyle::Fire if !tinted => (0x00FF_9632, 0x0078_1E00),
+            GlowStyle::RainbowKitty if !tinted => (0x00FF_66CC, 0x0046_1E64),
             GlowStyle::Phaser if !tinted => {
-                // On paper the beam's wheel steps over the muddy hues, as
-                // its bar and emitter do.
                 let hue = if dark {
                     self.glow.beam_hue()
                 } else {
                     crate::color_math::light_spectrum_hue(self.glow.beam_hue())
                 };
-                // `beam_hue` is in turns: the wheel that takes turns.
                 let c = crate::cursor_glow::hsv2rgb(hue, 0.75, 0.95);
                 (c, (c >> 1) & 0x007F_7F7F)
             }
             _ => (glow_cfg.color, (glow_cfg.color >> 1) & 0x007F_7F7F),
         };
-        // Typing-momentum glow: a halo that brightens with key rate and cools
-        // in silence, on any style and shape: warm light within the over-ink
-        // budget on a dark page, the style's own hue as ink beneath the
-        // letters of the caret's row on a light one; a hot cursor does not
-        // blink (owner, 2026-09-08).
         let momentum_enabled = momentum_glow_allowed(
             f.momentum_glow,
             body_allowed && f.focused,
@@ -1438,18 +1029,12 @@ impl CursorFx {
             now,
             geom,
             &MomentumGlowConfig {
-                // Gated by its own switch, not the style: it is its own
-                // effect on every style, `off` included.
                 enabled: momentum_enabled,
                 intensity: body_amp,
                 tau_s: MOMENTUM_GLOW_TAU_S,
                 radius_cells: MOMENTUM_GLOW_RADIUS_CELLS,
                 base: f.live_cursor,
-                // The page the halo lands on, as every body reads it.
                 dark_theme: dark,
-                // On a light page the glow is the style's own hue, the one
-                // its caret wears; with no trail drawn (`off`), the caret's
-                // own colour.
                 hue: if glow_cfg.enabled {
                     rod_color
                 } else {
@@ -1458,7 +1043,6 @@ impl CursorFx {
                 theme_fg: glow_cfg.theme_fg,
                 theme_bg: glow_cfg.theme_bg,
                 block: is_block(f.cursor_style),
-                // On a light page its ink stays off the caret row's letters.
                 glyph_span: if momentum_enabled && !dark {
                     cur.and_then(|cell| self.glow.caret_row_glyphs(cell))
                 } else {
@@ -1479,9 +1063,6 @@ impl CursorFx {
             })
             .filter(|s| *s != f.cursor_style);
         let glow_fp = glow_fp ^ momentum_frame.fp.rotate_left(53);
-        // Comet nucleus cursor (the `comet` body), riding the aurora's blaze in
-        // the frame's resolved glow colours: its coma is light on a dark
-        // ground and ink under the letters on a light one.
         let blaze = self.glow.blaze();
         let body_from = self.glow_scratch.len();
         let comet_frame = self.comet.tick(
@@ -1497,8 +1078,6 @@ impl CursorFx {
                 dark_theme: dark,
                 theme_fg: glow_cfg.theme_fg,
                 theme_bg: glow_cfg.theme_bg,
-                // The nucleus wears the trail colour, which follows a pinned
-                // cursor colour; then the settled caret is that colour.
                 pinned: pinned_base.map(|c| c & 0x00FF_FFFF) == Some(glow_cfg.color & 0x00FF_FFFF),
             },
             &mut self.glow_scratch,
@@ -1511,9 +1090,6 @@ impl CursorFx {
             OverInkTier::Body,
         ));
         let glow_fp = glow_fp ^ comet_frame.fp.rotate_left(29);
-        // Phaser emitter cursor: the block is the emitter, its fill locked to
-        // the beam's rolling hue over the same pinned-or-white base as the
-        // rainbow block.
         let body_from = self.glow_scratch.len();
         let phaser_frame = self.phaser.tick(
             cur,
@@ -1536,10 +1112,6 @@ impl CursorFx {
             OverInkTier::Body,
         ));
         let glow_fp = glow_fp ^ phaser_frame.fp.rotate_left(53);
-        // Light-rod cursor, every style's shape-completion seam: the bar's
-        // rod (`bar_shape`, above), and the charged emitter block for the
-        // styles without a bespoke block body (lumen, sparkle, beam).
-        // `Classic` draws a plain caret.
         let emitter_block = matches!(
             glow_cfg.style,
             GlowStyle::Beam | GlowStyle::Lumen | GlowStyle::Sparkle
@@ -1573,42 +1145,24 @@ impl CursorFx {
             body_from..body_to,
             OverInkTier::Body,
         ));
-        // The momentum glow, laid before the comet, phaser and rod bodies,
-        // spends what they left.
         shares.fold(self.glow.admit_over_ink(
             &mut self.glow_scratch,
             momentum_from..momentum_to,
             OverInkTier::Momentum,
         ));
-        // A bound share is visible state the bodies' own prints do not see,
-        // and so is where each light was cut.
         let glow_fp =
             glow_fp ^ shares.0.rotate_left(41) ^ self.glow.over_ink_print().rotate_left(13);
         let glow_fp = glow_fp ^ beamrod_frame.fp.rotate_left(17);
-        // Lightning-bolt cursor (the `laser` block): a jagged bolt in the beam's
-        // hue, charged by typing heat and the strike flare (whitening on a dark
-        // page, deepening on a light one), cooling as it calms.
         let bolt_cursor = rainbow_block
             && glow_cfg.enabled
             && glow_cfg.intensity > 0.0
             && matches!(glow_cfg.style, GlowStyle::Laser);
         let bolt_fill = bolt_cursor.then(|| bolt_body(glow_cfg.color, self.glow.blaze(), dark));
         let glow_fp = glow_fp ^ u64::from(bolt_fill.unwrap_or(0)).rotate_left(59);
-        // The cadence comet off the same caret cell, ignited from the frame's
-        // one cadence sample; a steady screen produces no cells.
         crate::cursor_trail::ignite(&mut trail_cfg, energy, warmth);
         let _ = self
             .trail
             .tick(cur, now, &trail_cfg, &mut self.trail_scratch);
-        // Ignition is baked at spawn; adaptive shedding and the bed's
-        // brightness dial are presentation opacity, projected after the tick so
-        // resident cells fade with new ones (a dial move dims the bed already
-        // on screen), and the fingerprint covers the exact alphas consumers
-        // copy.
-        // The bed lies under the letters just typed, so its peak is held to
-        // what leaves them [`BED_INK_FLOOR`] against this frame's tint
-        // ([`bed_legible_share`]); the share scales every cell, keeping the
-        // bed's fade.
         let legible = if self.trail_scratch.is_empty() {
             1.0
         } else {
@@ -1619,10 +1173,6 @@ impl CursorFx {
             trail_cfg.color,
             f.shed_envelope * bed_brightness * legible,
         );
-        // One candidate from the fill precedence, held to the page floor
-        // (unless it wears a pinned cursor colour), then projected through the
-        // envelope; a focus outline or composed clip can still keep it off the
-        // frame.
         let candidate = resolve_block_fill(
             BlockFillSplice {
                 rainbow: rainbow_frame.fill,
@@ -1638,16 +1188,11 @@ impl CursorFx {
             glow_cfg.color,
             f.cursor_color_pinned,
         )
-        // The floor's ground is the cell the caret sits on, whose background
-        // the renderer cuts the glyph out in; the page stands in for a host
-        // with no cell there.
         .map(|owned| {
             let ground = f.cursor_cell_bg.unwrap_or(f.default_bg);
             floor_block_fill(owned, ground, f.live_cursor, pinned_base)
         });
         let block_fill = project_block_fill(candidate, f.live_cursor, f.shed_envelope);
-        // The final caret RGB must move the repaint key even when an engine's
-        // raw fill rounded to the same adjacent sample.
         let glow_fp = block_fill.map_or(glow_fp, |owned| {
             glow_fp
                 .wrapping_mul(1_000_003)
@@ -1673,23 +1218,18 @@ mod frame_tests;
 mod tests {
     use super::*;
 
-    /// The caret-style law, as one truth table of
-    /// `compose_caret_style_override(bolt, rainbow, momentum)`.
     #[test]
     fn the_caret_style_law_is_one_truth_table() {
         use CursorStyle::{Bolt, SteadyBar, SteadyBlock, SteadyUnderline};
         let rows = [
-            // The rainbow owns the caret: a steady block, whatever the momentum.
             (false, true, None, Some(SteadyBlock)),
             (false, true, Some(SteadyBlock), Some(SteadyBlock)),
             (false, true, Some(SteadyBar), Some(SteadyBlock)),
             (false, true, Some(SteadyUnderline), Some(SteadyBlock)),
-            // No rainbow: cool means no override, warm the Steady* twin.
             (false, false, None, None),
             (false, false, Some(SteadyBlock), Some(SteadyBlock)),
             (false, false, Some(SteadyBar), Some(SteadyBar)),
             (false, false, Some(SteadyUnderline), Some(SteadyUnderline)),
-            // The bolt outranks both.
             (true, true, Some(SteadyBlock), Some(Bolt)),
             (true, false, None, Some(Bolt)),
         ];
@@ -1702,8 +1242,6 @@ mod tests {
         }
     }
 
-    /// The momentum engine yields the caret cell to the rainbow; otherwise it is
-    /// the user's switch and the host's gates.
     #[test]
     fn the_momentum_engine_yields_the_caret_cell_to_the_rainbow() {
         assert!(!momentum_glow_allowed(true, true, true));
@@ -1736,8 +1274,6 @@ mod tests {
             let candidate = BlockFill {
                 owner,
                 fill: effect_fill,
-                // Deliberately unlike the terminal endpoint: Comet/Bolt/BeamRod
-                // may carry this exact pinned trail-colour provenance.
                 base: (!identity).then_some(pinned_trail_base),
             };
             assert_eq!(
@@ -1815,12 +1351,6 @@ mod tests {
         }
     }
 
-    /// The one colour law ([`automatic_glow_color`]) as a truth table: the
-    /// styles with no hue of their own follow the live cursor whatever the pin;
-    /// Beam, Comet and Sparkle keep their canonical hue until a cursor colour
-    /// is pinned, then wear it; Laser keeps storm violet even under a pin.
-    /// [`resolve_glow_config`]'s default is the same law with nothing pinned,
-    /// and an explicit colour beats every arm.
     #[test]
     fn the_automatic_glow_colour_law_is_one_truth_table() {
         use crate::cursor_glow::{
@@ -1885,8 +1415,6 @@ mod tests {
         }
     }
 
-    /// The comet's glow and bed config at one brightness dial, folded as a
-    /// host folds it (motion amplitude and shed both 1 here).
     fn comet_cfgs(knob: f32) -> (GlowConfig, TrailConfig) {
         let glow = resolve_glow_config(
             GlowKnobs {
@@ -1923,9 +1451,6 @@ mod tests {
         (glow, trail)
     }
 
-    /// One fast typed burst on a comet block caret at a brightness dial:
-    /// the last frame's comet nucleus fill, and the bed's brightest cell and
-    /// total cells across the burst.
     fn typed_comet_burst(knob: f32) -> (Option<u32>, u8, usize) {
         let (glow, trail) = comet_cfgs(knob);
         let mut fx = CursorFx::default();
@@ -1955,10 +1480,6 @@ mod tests {
         (fill, alpha_max, cells)
     }
 
-    /// The Trail intensity dial reaches the comet's BODY, not only its crown:
-    /// a quarter dial frosts the nucleus less and lays a fainter bed than a
-    /// full one under the same typed burst, and a zero dial draws neither (the
-    /// documented "0 = off", which the Settings preview already shows).
     #[test]
     fn the_brightness_dial_dims_the_comet_nucleus_and_its_bed() {
         let luma = |rgb: u32| (rgb >> 16 & 0xff) + (rgb >> 8 & 0xff) + (rgb & 0xff);
@@ -2015,10 +1536,6 @@ mod tests {
         (glow, trail)
     }
 
-    /// The typing-momentum glow obeys its own switch, on any style: with
-    /// `cursor_momentum_glow` off, fast typing paints no halo and claims no
-    /// caret. Negative control: with it on and the style off, the same keys
-    /// light it.
     #[test]
     fn the_momentum_glow_obeys_its_own_switch() {
         for momentum_glow in [true, false] {
@@ -2031,7 +1548,6 @@ mod tests {
                 );
             }
             let now = t0 + std::time::Duration::from_millis(24 * 40);
-            // The style is `off` either way: only the switch differs.
             let (glow, trail) = classic_cfg(false);
             let frame = fx.tick(
                 &CursorFxInput {
@@ -2058,12 +1574,6 @@ mod tests {
         }
     }
 
-    /// The momentum glow's cool-down is a settling body: once its frames stop
-    /// moving, [`CursorFx::bodies_settling`] holds the lane and
-    /// [`CursorFx::bodies_next_change_deadline`] names the glow's next step,
-    /// a frame or more out, with no rainbow settling beside it. Negative
-    /// control: the frame-cadence set ([`CursorFx::bodies_active`]) has let go
-    /// there while the halo is still on glass.
     #[test]
     fn a_cooling_momentum_glow_is_a_settling_body() {
         let lane = std::time::Duration::from_micros(16_667);
@@ -2075,7 +1585,6 @@ mod tests {
                 MOMENTUM_GLOW_TAU_S,
             );
         }
-        // The style is `off`; the momentum glow is its own effect.
         let (glow, trail) = classic_cfg(false);
         let mut now = t0 + std::time::Duration::from_millis(23 * 60);
         loop {
@@ -2104,13 +1613,6 @@ mod tests {
         assert!(next >= now + lane, "never sooner than a frame out");
     }
 
-    /// The page floor as a law over every owner: a candidate under its
-    /// owner's floor ([`caret_page_floor`]: 4.5:1, the rainbow kitty's 3:1)
-    /// leaves at or above it on a dark and a light page with its hue, and one
-    /// already above it is untouched. A fill
-    /// wearing the pinned cursor colour passes as is; negative control: the
-    /// same fill with nothing pinned is floored, so the exemption is what
-    /// spared it.
     #[test]
     fn effect_caret_fills_keep_the_page_floor_unless_they_wear_a_pinned_cursor() {
         use crate::color_math::{contrast_ratio, rgb2hsv};
@@ -2124,7 +1626,6 @@ mod tests {
             BlockFillOwner::BeamRod,
             BlockFillOwner::Momentum,
         ];
-        // Each page's own cursor clears the floor, so momentum floors fully.
         for (ground, low, live) in [
             (0x0011_1318u32, 0x0051_0A00u32, 0x0050_FA7Bu32),
             (0x00FF_FFFF, 0x00B4_8CFF, 0x0009_69DA),
@@ -2163,8 +1664,6 @@ mod tests {
                 assert_eq!(floor_block_fill(fine, ground, live, None), fine);
             }
         }
-        // A pinned cursor colour too dark for the page: a rainbow wearing it
-        // (and a rod whose trail colour follows it) keeps it.
         let pinned = 0x0000_00FF;
         for owner in [BlockFillOwner::Rainbow, BlockFillOwner::BeamRod] {
             let worn = BlockFill {
@@ -2183,8 +1682,6 @@ mod tests {
                 owner.label()
             );
         }
-        // The laser keeps storm violet under a pin, so its base is not the
-        // pinned colour and its fill is still floored.
         let bolt = BlockFill {
             owner: BlockFillOwner::Bolt,
             fill: 0x00B4_8CFF,
@@ -2194,10 +1691,6 @@ mod tests {
             floor_block_fill(bolt, 0x00FF_FFFF, 0x0000_00FF, Some(0x0000_00FF)),
             bolt
         );
-        // The momentum tint over a theme cursor under the floor (Catppuccin
-        // Latte's rosewater, 2.3:1) is held only to that cursor's own
-        // contrast, so its cold edge is the plain cursor; negative control:
-        // the same fill owned by any other body is floored in full.
         let (latte, rosewater) = (0x00EF_F1F5, 0x00DC_8A78);
         let tint = BlockFill {
             owner: BlockFillOwner::Momentum,
@@ -2215,8 +1708,6 @@ mod tests {
         );
     }
 
-    /// A style's folded configs on a dark or a light page, as a host folds
-    /// them (dial, motion amplitude and shed all 1).
     fn style_cfgs(style: GlowStyle, page: u32) -> (GlowConfig, TrailConfig) {
         let dark = aterm_render::theme_is_dark(page);
         let glow = resolve_glow_config(
@@ -2254,16 +1745,6 @@ mod tests {
         (glow, trail)
     }
 
-    /// Every body that owns a block caret, on the dark default page, a dark
-    /// grey (Dracula), white and Solarized's off-white, with the momentum glow
-    /// off (its halo is its own body's business): a fast typed burst and the
-    /// rest after it keep every
-    /// frame's caret fill (what the renderer paints, opaque, over the effect
-    /// light, and cuts the glyph out of in the page colour) at the page
-    /// floor. The burst must actually run hot. Each body's own light
-    /// composited over its caret is pinned beside the body
-    /// (`the_light_emitter_keeps_its_caret_on_a_white_page` and its droplet
-    /// and comet twins).
     #[test]
     fn every_effect_caret_keeps_the_page_floor_while_typing_and_at_rest() {
         for page in [0x0011_1318u32, 0x0028_2A36, 0x00FF_FFFF, 0x00FD_F6E3] {
@@ -2291,7 +1772,6 @@ mod tests {
                     ..frame_input(now)
                 };
                 let mut hottest = 0.0f32;
-                // 24 keys at 20 cps, then the caret left alone for 12 s.
                 for k in 0..25u16 {
                     let now = if k < 24 {
                         let now = t0 + std::time::Duration::from_millis(50 * u64::from(k));
@@ -2328,16 +1808,6 @@ mod tests {
         }
     }
 
-    /// The caret's floor holds against the cell it sits on, the background the
-    /// renderer cuts the block's glyph out in: a reverse-video cell (the
-    /// default ink as its ground) and a TUI's blue band, on the dark default
-    /// page. Over a hot typed burst and the rest after it, every frame's fill
-    /// keeps its owner's floor ([`caret_page_floor`]) against that cell.
-    /// Negative control:
-    /// the same frames with no cell reported (the page stands in) leave some
-    /// fill under 3:1 on the reverse-video cell, so the cell is what the floor
-    /// read. A caret wearing a pinned cursor colour is still the user's colour
-    /// on any cell.
     #[test]
     fn the_caret_floor_holds_against_the_cell_it_sits_on() {
         use crate::color_math::contrast_ratio;
@@ -2403,10 +1873,6 @@ mod tests {
             sunk,
             "control: with the page standing in, some caret must sink on the reverse cell"
         );
-        // A pinned cursor colour on the reverse cell: the rainbow built on it
-        // passes as it would on the page, though it reads under the floor
-        // there, so the pinned exemption (not a fill already clear of the
-        // floor) is what leaves it alone.
         let (glow, trail) = style_cfgs(GlowStyle::RainbowKitty, PAGE);
         let pinned = 0x00A0_A0A0;
         let fill = |cell: Option<u32>| {
@@ -2440,12 +1906,6 @@ mod tests {
         );
     }
 
-    /// On a light page the typing-momentum glow is ink beneath the letters in
-    /// the hue the caret wears: with no trail drawn (`off`, whose config
-    /// colour is never drawn) the caret's own colour, under a style that
-    /// style's colour. It lands in the under-ink stream and lays no additive
-    /// light. Negative control: under a lit style with an explicit colour,
-    /// the glow wears that colour, not the caret's.
     #[test]
     fn the_light_momentum_glow_wears_the_carets_hue_beneath_the_letters() {
         use crate::color_math::rgb2hsv;
@@ -2482,7 +1942,6 @@ mod tests {
                 .iter()
                 .max_by_key(|q| q.alpha)
                 .unwrap_or_else(|| panic!("{style:?}: the glow lies beneath the letters"));
-            // Un-premultiply the deepest ink to read its hue.
             let a = u32::from(deepest.alpha).max(1);
             let ch = |sh: u32| (((deepest.color >> sh) & 0xff) * 255 / a).min(255);
             rgb2hsv((ch(16) << 16) | (ch(8) << 8) | ch(0)).0
@@ -2500,16 +1959,6 @@ mod tests {
         );
     }
 
-    /// A pinned cursor colour is the caret AT REST (owner, 2026-08-29): on the
-    /// dark default page, white and Default Light, every body that builds its
-    /// block on the cursor or trail colour (the comet nucleus, the emitter
-    /// block of lumen, sparkle and beam, the phaser emitter, the rainbow)
-    /// settles, after a hot typed burst and 12 s alone, on exactly that
-    /// colour, the one the same cursor draws with effects off. The burst
-    /// still moves the fill off it: the animation around the base stays.
-    /// Negative control: the same colour worn as an explicit trail colour with
-    /// nothing pinned rests where each body's own look puts it, so the pin
-    /// (not the colour) is what holds the caret.
     #[test]
     fn a_pinned_cursor_colour_is_the_caret_at_rest() {
         const PINNED: u32 = 0x00FF_3399;
@@ -2553,8 +2002,6 @@ mod tests {
                     (burst, fill(fx.tick(&input(rest, 27), &glow, trail)))
                 };
                 let (burst, rest) = run(true);
-                // No owner at rest hands the caret back to the terminal,
-                // which draws the pinned colour itself.
                 let rest = rest.unwrap_or(PINNED);
                 assert_eq!(
                     rest, PINNED,
@@ -2575,16 +2022,6 @@ mod tests {
         }
     }
 
-    /// The default trail's caret on every shipped light theme (each built-in
-    /// whose page [`aterm_render::theme_is_dark`] calls light, swept from
-    /// [`aterm_types::scheme`] so a new theme is judged automatically), with
-    /// that theme's own unpinned cursor and ink, the momentum glow off: every
-    /// frame of a hot typed burst and the rest after it, the rainbow owns the
-    /// block and its fill (what the renderer paints) reads at 3:1 or better
-    /// against the page. Negative control: the dark page's white lift
-    /// (`RAINBOW_CARET_LIGHT_FLOOR`, the lift that once reached light pages
-    /// too) applied to those same fills leaves every hot frame under 3:1 on
-    /// the white page, so the probe sees the regression this pins.
     #[test]
     fn the_rainbow_kitty_caret_reads_on_every_shipped_light_theme() {
         use crate::color_math::contrast_ratio;
@@ -2659,12 +2096,6 @@ mod tests {
         );
     }
 
-    /// The momentum tint cools onto the plain cursor without a step, on a
-    /// theme whose own cursor sits under the page floor (Catppuccin Latte's
-    /// rosewater `#DC8A78` on `#EFF1F5`, 2.3:1): its last hot frame is that
-    /// cursor within a couple of levels, as the next, cold frame (no
-    /// override) is exactly. Negative control: on GitHub Light, whose cursor
-    /// clears the floor, the hot tint is still held to it at peak heat.
     #[test]
     fn the_momentum_tint_cools_onto_the_plain_cursor_without_a_step() {
         let run = |page: u32, cursor: u32| {
@@ -2690,7 +2121,6 @@ mod tests {
                 ..frame_input(now)
             };
             let (mut peak, mut last_hot) = (None, None);
-            // From the last key until the tint has gone cold, every 5 ms.
             for i in 0..2000u64 {
                 let now = t0 + std::time::Duration::from_millis(23 * 40 + 5 * i);
                 let frame = fx.tick(&input(now), &glow, trail);
@@ -2726,15 +2156,6 @@ mod tests {
         );
     }
 
-    /// Fire on the dark default page, cold: the resting ember is held to the
-    /// page floor and is still an ember (red over green over blue). The forge
-    /// band (`cursor_glow::thermal::ForgeBand`) already rests the ember at the
-    /// floor's contrast on the page its config names, so the host floor leaves
-    /// that colour alone; the two never double-lift. Negative control: when
-    /// the page the terminal paints (`default_bg`) is darker than the one the
-    /// forge solved its band for (here the light page's deep-red rest, far
-    /// under 2:1 on the dark page), the raw ember is the defect the floor
-    /// exists for, and the same tick lifts it to the floor.
     #[test]
     fn the_resting_forge_ember_is_floored_on_the_dark_page() {
         const PAGE: u32 = 0x0011_1318;
@@ -2782,8 +2203,6 @@ mod tests {
         );
     }
 
-    /// The bolt's two arms at full blaze: whitening on a dark page (the
-    /// shipped look, byte for byte), deepening on a light one.
     #[test]
     fn the_bolt_whitens_on_dark_and_deepens_on_light() {
         use crate::color_math::relative_luminance;
@@ -2799,17 +2218,6 @@ mod tests {
         );
     }
 
-    /// The frame's automatic colour step applies the one colour law, as a
-    /// window and its Settings preview both run it. Unpinned, Lumen takes the
-    /// live cursor and Comet, Beam and Sparkle keep their own hues; pinned,
-    /// every style but Laser takes the live cursor; Laser keeps its violet
-    /// either way. The comet body always matches the glow, the accent is the
-    /// brightened colour, an explicit colour stays (and so does its accent,
-    /// except on a style that does not draw the trail colour on a block,
-    /// whose accent stays automatic) and an explicit accent stays. Settings'
-    /// [`own_trail_color`] names exactly the
-    /// styles that do not follow. Negative control: a law that let the theme
-    /// seed recolour Comet (the 56e50f415 regression) fails the first loop.
     #[test]
     fn the_frame_colour_step_applies_the_law() {
         use crate::cursor_glow::{
@@ -2861,7 +2269,6 @@ mod tests {
                 );
             }
         }
-        // Settings names a style's own colour exactly when it does not follow.
         for style in [
             GlowStyle::Lumen,
             GlowStyle::Phaser,
@@ -2891,7 +2298,6 @@ mod tests {
                 }
             }
         }
-        // An explicit colour leaves glow and trail untouched.
         let (mut glow, mut trail) = classic_cfg(true);
         glow.style = GlowStyle::Comet;
         glow.color = 0x00E0_218A;
@@ -2911,8 +2317,6 @@ mod tests {
             glow.accent, accent,
             "a style drawing its colour keeps its accent"
         );
-        // …but a style that colours from its own ramp keeps its automatic
-        // accent while a colour is pinned for the rod.
         for style in [
             GlowStyle::Fire,
             GlowStyle::Water,
@@ -2934,7 +2338,6 @@ mod tests {
             assert_eq!(glow.color, 0x00E0_218A, "{style:?}");
             assert_eq!(glow.accent, brighten(live, 1.5), "{style:?}");
         }
-        // An explicit accent stays while the colour follows.
         let (mut glow, mut trail) = classic_cfg(true);
         glow.style = GlowStyle::Lumen;
         glow.accent = 0x0012_3456;
@@ -2948,9 +2351,6 @@ mod tests {
             None,
         );
         assert_eq!((glow.color, glow.accent), (live, 0x0012_3456));
-        // The cursor's colour, chosen, is the live cursor on every style,
-        // pinned or not, a hue of its own (Laser's violet, Comet's blue)
-        // included, accent and all.
         for style in [GlowStyle::Laser, GlowStyle::Classic, GlowStyle::Comet] {
             for pinned in [false, true] {
                 let (mut glow, mut trail) = classic_cfg(true);
@@ -2975,13 +2375,6 @@ mod tests {
         assert!(TrailColor::Cursor.chosen() && !TrailColor::Automatic.chosen());
     }
 
-    /// THE UNSET ACCENT'S BASE IS WHAT A WINDOW BRIGHTENS: for every style
-    /// under each trail colour setting, the accent a window draws with no
-    /// accent set ([`resolve_glow_config`], then [`follow_live_cursor`]) is
-    /// [`unset_accent_base`]'s colour brightened — the live cursor's, the
-    /// style's own, or the chosen colour. The theme's cursor, the live cursor
-    /// and the chosen colour all differ, so a base read from the wrong one
-    /// is caught.
     #[test]
     fn the_unset_accent_brightens_the_base_a_window_draws() {
         let (theme_cursor, live, chosen) = (0x0009_69DA, 0x0050_FA7B, 0x00E0_218A);

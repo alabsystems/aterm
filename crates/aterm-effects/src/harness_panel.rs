@@ -1,72 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE AGENTS PANEL'S GLASS, pure: what colour each cell of Claude Code's
-//! agents panel (`◯ general-purpose  …  4m 28s · ↓ 115.4k tokens`, `◯ sweep
-//! ▰▰▰▰▱▱  3/4 · …`) is inked in, and what light each agent's dot wears,
-//! while the harness's theme is on (owner, 2026-10-19: "for more bling, aterm
-//! bling the subagents display at the bottom. I want to see rainbow" — "and
-//! some more informative coloring about the agent status in those dots …
-//! I want to know if the subagent is stuck or running and how much work it is
-//! doing in some visual indication of brightness and glow and maybe
-//! saturation"). The host (`aterm-gui`'s `claude_panel`) places the cells and
-//! folds the dots' states (`aterm_agent::harness::agents`); nothing here reads
-//! a clock, a screen or a config.
-//!
-//! # The rainbow
-//!
-//! The main row takes the palette's first stripe; the task rows below it take
-//! the palette's DOT HUES top down ([`row_hue`], [`dot_stripes`]: Cruise's
-//! spectrum, Land's sunset, Off's moonbow — the card's and the border's
-//! palette, `CardPalette` — less every stripe whose hue lies near Claude's own
-//! success green or error red), so the panel reads as one vertical rainbow
-//! and a dot never wears done's or failed's colour. Each row's NAME runs on
-//! from its row's hue across [`NAME_SPAN`] of the palette ([`name_x`]), the
-//! whole rainbow included; a workflow's BAR runs the whole palette from its
-//! first cell to its last ([`bar_x`]), so a fuller bar shows more of the
-//! rainbow. Text (names, the `❯` pointer, the bar's empty cells) keeps
-//! CLAUDE'S LIGHTNESS ([`match_luminance`]): the hue is the palette's, the
-//! luminance the one Claude drew the cell in, so Claude's contrast and its
-//! dim/bold hierarchy stand on every theme by construction. The bar's filled
-//! cells are shapes and go vivid (the card's line ink, lifted on dark; the
-//! card's print on light), and only they carry the crest of Claude's mascot
-//! ripple ([`crest`], `crate::ripple`): text never shimmers.
-//!
-//! # The dots
-//!
-//! Each agent's or workflow's bullet says what the fold says of it
-//! ([`dot_look`]): HUE = which agent (its row's hue); SATURATION = freshness
-//! (a quiet dot keeps [`QUIET_KEEP`] of its chroma times its freshness, a
-//! stuck one the fold's tenth: nearly grey; faded in OKLab, so the hue never
-//! turns); BRIGHTNESS and GLOW = how much work (its ink lifted, and a light
-//! about it that grows with the work rate). A running dot reads LIT — its `◯`
-//! filled with light; a quiet one's light fades with its freshness; one
-//! WAITING ON A TOOL CALL of its own, inside that call's budget, keeps its
-//! full hue with a dimmer light ([`TOOL_GLOW`]) held INSIDE its ring
-//! ([`TOOL_RADIUS`]: a lit core, no glow past the ring, on paper its hollow
-//! half lit) — live, but doing no token work, and told by its light's shape
-//! from a running dot (whose light spreads past the ring) and from an
-//! awaiting one (no light); a STUCK one is grey, hollow and BREATHES
-//! ([`breath`], 0.5 Hz, settling after [`BREATH_FOR_MS`]); one AWAITING approval is a still amber ring with no
-//! light (light is work, and it does none); one Claude marked done or
-//! failed, halted or waiting keeps Claude's own ink and no light
-//! ([`DotMood::Still`]). So LIT says live and UNLIT says a status, whatever
-//! the hue: the amber lies within 5° of Land's gold and Cruise's print gold. On a dark ground the light is an additive
-//! halo over the bullet ([`RainHalo`], [`HaloMode::Add`], never wider than
-//! [`DOT_RADIUS_MAX`] cells, so it never reaches the pointer, the tree or the
-//! name); on a light one, where added light is invisible, the dot is printed:
-//! its ring the hue as a print ink solved to hold [`PRINT_RING_CONTRAST`]
-//! against the paper, its hollow filled with the hue by the work, and round it
-//! a soft tint of the hue (a source-over veil, [`HaloMode::Over`]) whose
-//! radius grows with the work exactly as the dark halo's does
-//! ([`dot_light_quads`]). Serious mode keeps the state ink and drops every
-//! light and every breath.
-//!
-//! # Photosensitivity
-//!
-//! The crest passes a cell at most twice a ripple cycle (`crate::ripple`'s
-//! bound); the breath is one swell every [`BREATH_PERIOD_MS`] (0.5 Hz):
-//! both under the crate's certified `TWINKLE_FLASH_BOUND_HZ` (const-asserted).
+//! THE AGENTS PANEL'S GLASS, pure: what colour each cell of Claude Code's agents panel (`◯ general-purpose  …  4m 28s · ↓ 115.4k tokens`, `◯ sweep ▰▰▰▰▱▱  3/4 · …`) is inked in, and what light each agent's dot wears, while the harness's theme is on (owner, 2026-10-19: "for more bling, aterm bling the subagents display at the bottom.
 
 use aterm_render::{HaloMode, RainHalo, over_rgb, premul_rgb};
 
@@ -84,8 +19,7 @@ pub const NAME_SPAN: f32 = 0.5;
 pub const DOT_RADIUS_MIN: f32 = 0.55;
 /// How much wider full work makes it.
 pub const DOT_RADIUS_GAIN: f32 = 0.95;
-/// The widest a dot's light ever is, in cell widths: the pointer, the tree
-/// glyph and the name all start 1.5 cells from the bullet's centre.
+/// The widest a dot's light ever is, in cell widths: the pointer, the tree glyph and the name all start 1.5 cells from the bullet's centre.
 pub const DOT_RADIUS_MAX: f32 = 1.5;
 /// A dot's light is at most this many cell HEIGHTS tall from its centre.
 pub const DOT_RISE_MAX: f32 = 0.9;
@@ -93,108 +27,66 @@ pub const DOT_RISE_MAX: f32 = 0.9;
 pub const HALO_PEAK_MIN: f32 = 0.25;
 /// …and how much more full work adds.
 pub const HALO_PEAK_GAIN: f32 = 0.55;
-/// A light ground's round tint about a dot (a source-over veil): its opacity
-/// ceiling at no work…
+/// A light ground's round tint about a dot (a source-over veil): its opacity ceiling at no work…
 pub const TINT_ALPHA_MIN: f32 = 0.10;
 /// …and how much more full work adds.
 pub const TINT_ALPHA_GAIN: f32 = 0.20;
-/// The light filling a dot's hollow on a light ground (a lit dot): its
-/// opacity ceiling at no work…
+/// The light filling a dot's hollow on a light ground (a lit dot): its opacity ceiling at no work…
 pub const FILL_ALPHA_MIN: f32 = 0.30;
 /// …and how much more full work adds.
 pub const FILL_ALPHA_GAIN: f32 = 0.55;
-/// The hollow's fill, in cell widths from the bullet's centre: inside the
-/// `◯`'s ring, which runs about 0.36 to 0.5 cell widths out in the bundled
-/// faces (JetBrains Mono with Noto Sans Symbols 2, measured in the preview).
+/// The hollow's fill, in cell widths from the bullet's centre: inside the `◯`'s ring, which runs about 0.36 to 0.5 cell widths out in the bundled faces (JetBrains Mono with Noto Sans Symbols 2, measured in the preview).
 pub const FILL_RADIUS: f32 = 0.42;
 /// A veil's ceiling under this (of 255) is not drawn: a ceiling of `0` reads
-/// as none at all (`aterm_render::halo_over_cap`), and so faint a veil shows
-/// nothing.
 const VEIL_ALPHA_FLOOR: u8 = 4;
-/// A dot waiting on its own tool call wears this share of a running dot's
-/// light at the same work (its strength, and on paper its hollow's fill): a
-/// vivid ring that waits, dimmer than any running dot and, unlike a stuck
-/// one, in its full hue and still.
+/// A dot waiting on its own tool call wears this share of a running dot's light at the same work (its strength, and on paper its hollow's fill): a vivid ring that waits, dimmer than any running dot and, unlike a stuck one, in its full hue and still.
 pub const TOOL_GLOW: f32 = 0.5;
-/// …and holds that light inside its ring: a core of the hollow's own radius
-/// ([`FILL_RADIUS`]), never the halo a running dot's work spreads past the
-/// ring ([`DOT_RADIUS_MIN`] and up). The SHAPE tells it apart where a hue
-/// cannot: on dark from a running dot of a near hue at a lower level (its
-/// halo's alpha alone was 32 to a running dot's 64), on paper from an
-/// awaiting ring (Cruise's gold Tool ring and the awaiting amber print lie
-/// 0.051 apart in OKLab), whose hollow stays bare.
+/// …and holds that light inside its ring: a core of the hollow's own radius ([`FILL_RADIUS`]), never the halo a running dot's work spreads past the ring ([`DOT_RADIUS_MIN`] and up).
 pub const TOOL_RADIUS: f32 = FILL_RADIUS;
 const _: () = assert!(
     TOOL_RADIUS < DOT_RADIUS_MIN,
     "a tool dot's light stays in its ring"
 );
-/// A dark-ground dot's ink is drawn at this WCAG luminance at no work (the
-/// card line's floor: about 5:1 on a near-black ground)…
+/// A dark-ground dot's ink is drawn at this WCAG luminance at no work (the card line's floor: about 5:1 on a near-black ground)…
 pub const DOT_LUMA_MIN: f32 = LINE_DARK_LUMA_FLOOR;
 /// …and this much more at full work.
 pub const DOT_LUMA_GAIN: f32 = 0.35;
-/// The palest a running or quiet dot's ring is on a light ground, as a WCAG
-/// luminance: a print ink of its hue, never a pastel…
+/// The palest a running or quiet dot's ring is on a light ground, as a WCAG luminance: a print ink of its hue, never a pastel…
 pub const PRINT_RING_LUMA: f32 = 0.22;
 /// …which full work deepens by this share of its luminance.
 pub const DOT_DEEPEN_LIGHT: f32 = 0.15;
-/// The contrast a light-ground dot's ring holds against its paper, the two
-/// under the dot's own tint at its ceiling: a graphic's 3:1 and a margin.
+/// The contrast a light-ground dot's ring holds against its paper, the two under the dot's own tint at its ceiling: a graphic's 3:1 and a margin.
 pub const PRINT_RING_CONTRAST: f32 = 3.2;
-/// The share of its chroma a QUIET dot keeps at full freshness: its chroma is
-/// `QUIET_KEEP · freshness` of a running dot's, so quiet reads paler from its
-/// first second (90 s quiet, freshness 0.54: 0.30 of it).
+/// The share of its chroma a QUIET dot keeps at full freshness: its chroma is `QUIET_KEEP · freshness` of a running dot's, so quiet reads paler from its first second (90 s quiet, freshness 0.54: 0.30 of it).
 pub const QUIET_KEEP: f32 = 0.55;
-/// Claude Code's success green, on a dark and on a light theme (read in the
-/// 2.1.271 bundle's theme tables: `success:"rgb(78,186,101)"`,
-/// `success:"rgb(44,122,57)"`): a done agent's bullet.
+/// Claude Code's success green, on a dark and on a light theme (read in the 2.1.271 bundle's theme tables: `success:"rgb(78,186,101)"`, `success:"rgb(44,122,57)"`): a done agent's bullet.
 pub const CLAUDE_SUCCESS: [u32; 2] = [0x004E_BA65, 0x002C_7A39];
-/// Claude Code's error red, dark then light (`error:"rgb(255,107,128)"`,
-/// `error:"rgb(171,43,63)"`): a failed agent's bullet.
+/// Claude Code's error red, dark then light (`error:"rgb(255,107,128)"`, `error:"rgb(171,43,63)"`): a failed agent's bullet.
 pub const CLAUDE_ERROR: [u32; 2] = [0x00FF_6B80, 0x00AB_2B3F];
-/// The nearest a live dot's ink or light comes to the hue (OKLCh, degrees) of
-/// Claude's success green or error red: a dot never mimics done or failed.
+/// The nearest a live dot's ink or light comes to the hue (OKLCh, degrees) of Claude's success green or error red: a dot never mimics done or failed.
 pub const STATUS_HUE_GUARD_DEG: f32 = 20.0;
-/// What a stripe's own hue keeps beyond [`STATUS_HUE_GUARD_DEG`] to be a dot
-/// hue ([`dot_stripes`]): more than the most a dot's lift and fade turn a hue
-/// (both hue-true in OKLab but for the gamut's edge, 3.7° at most).
+/// What a stripe's own hue keeps beyond [`STATUS_HUE_GUARD_DEG`] to be a dot hue ([`dot_stripes`]): more than the most a dot's lift and fade turn a hue (both hue-true in OKLab but for the gamut's edge, 3.7° at most).
 pub const STATUS_HUE_DRIFT_DEG: f32 = 4.0;
-/// Under this OKLab chroma an ink has no hue to mistake (Off's moonbow lies
-/// at 0.015 to 0.028).
+/// Under this OKLab chroma an ink has no hue to mistake (Off's moonbow lies at 0.015 to 0.028).
 pub const HUE_CHROMA_GATE: f32 = 0.04;
 /// A stuck dot's light, in cell widths (fixed: a stuck agent does no work).
 pub const STUCK_RADIUS: f32 = 0.7;
-/// The amber of a dot awaiting approval on a dark ground: Claude's own
-/// `auto mode` pill's (measured on 2.1.304: `ESC[38;2;255;193;7m`), its dark
-/// theme's `warning` (2.1.271: `warning:"rgb(255,193,7)"`).
+/// The amber of a dot awaiting approval on a dark ground: Claude's own `auto mode` pill's (measured on 2.1.304: `ESC38;2;255;193;7m`), its dark theme's `warning` (2.1.271: `warning:"rgb(255,193,7)"`).
 pub const AWAITING_AMBER: u32 = 0x00FF_C107;
-/// …and on a light one: Claude's light theme's `warning`
-/// (`warning:"rgb(150,108,30)"`), as its done and failed keep its
-/// `success` and `error`: 4.2:1 on Linen, an ochre ring where the over-text
-/// ink of the amber (`#5A4402`) read as a dark ring beside the stuck one's.
+/// …and on a light one: Claude's light theme's `warning` (`warning:"rgb(150,108,30)"`), as its done and failed keep its `success` and `error`: 4.2:1 on Linen, an ochre ring where the over-text ink of the amber (`#5A4402`) read as a dark ring beside the stuck one's.
 pub const AWAITING_AMBER_PRINT: u32 = 0x0096_6C1E;
 
 /// One breath of a stuck dot, in ms (sixteen steps, 0.49 Hz).
 pub const BREATH_PERIOD_MS: u64 = 16 * BREATH_STEP_MS;
-/// The step a breath is drawn on, in ms: the flow's
-/// ([`crate::ripple::FLOW_STEP_MS`]), so a panel whose bar crests while a
-/// dot breathes — and a card flowing beside it — steps once for all of
-/// them (the host starts the breath's course on the crest's grid).
+/// The step a breath is drawn on, in ms: the flow's ([`crate::ripple::FLOW_STEP_MS`]), so a panel whose bar crests while a dot breathes — and a card flowing beside it — steps once for all of them (the host starts the breath's course on the crest's grid).
 pub const BREATH_STEP_MS: u64 = crate::ripple::FLOW_STEP_MS;
-/// How long a stuck dot breathes before it rests ([`BREATH_REST`]), a
-/// minute on the steps' grid; the host re-arms it when the window regains
-/// focus.
+/// How long a stuck dot breathes before it rests ([`BREATH_REST`]), a minute on the steps' grid; the host re-arms it when the window regains focus.
 pub const BREATH_FOR_MS: u64 = 469 * BREATH_STEP_MS;
 /// The breath's floor: a stuck dot's light never falls under this share.
 pub const BREATH_FLOOR: f32 = 0.55;
-/// The breath at rest (settled, reduced motion, serious mode): the middle of
-/// its swing.
+/// The breath at rest (settled, reduced motion, serious mode): the middle of its swing.
 pub const BREATH_REST: f32 = BREATH_FLOOR + (1.0 - BREATH_FLOOR) / 2.0;
-/// The palest a stuck dot's breath takes its ring on a LIGHT ground, as a
-/// WCAG luminance: 4:1 on white, so the ring holds 3:1 (a graphic's floor)
-/// on any paper at luminance 0.74 or more (Aterm Day 0.95, Linen 0.90), its
-/// faint tint over it too. A paler trough (the ring mixed 45 % toward
-/// white) fell to 2.6:1 on Linen.
+/// The palest a stuck dot's breath takes its ring on a LIGHT ground, as a WCAG luminance: 4:1 on white, so the ring holds 3:1 (a graphic's floor) on any paper at luminance 0.74 or more (Aterm Day 0.95, Linen 0.90), its faint tint over it too.
 pub const STUCK_PALE_LUMA_LIGHT: f32 = 1.05 / 4.0 - 0.05;
 
 const _: () = {
@@ -255,10 +147,7 @@ fn hue_gap(a: f32, b: f32) -> f32 {
     d.min(360.0 - d)
 }
 
-/// How far (OKLCh hue, degrees) `ink` lies from the nearer of Claude's
-/// success green and error red ([`CLAUDE_SUCCESS`], [`CLAUDE_ERROR`]) on a
-/// dark or a light theme; `None` where `ink` has no hue to mistake (chroma
-/// under [`HUE_CHROMA_GATE`]).
+/// How far (OKLCh hue, degrees) `ink` lies from the nearer of Claude's success green and error red ([`CLAUDE_SUCCESS`], [`CLAUDE_ERROR`]) on a dark or a light theme; `None` where `ink` has no hue to mistake (chroma under [`HUE_CHROMA_GATE`]).
 #[must_use]
 #[inline]
 pub fn status_gap(ink: u32, dark: bool) -> Option<f32> {
@@ -275,15 +164,7 @@ pub fn status_gap(ink: u32, dark: bool) -> Option<f32> {
     )
 }
 
-/// THE DOT HUES: the stripes of `palette` a dot may wear on a dark or a light
-/// ground, in palette order (the first `n` of the array): each whose art lies
-/// [`STATUS_HUE_GUARD_DEG`] and [`STATUS_HUE_DRIFT_DEG`] or more from
-/// Claude's status hues ([`status_gap`]), so no ink its dot wears comes
-/// within the guard. Cruise keeps its orange, yellow (gold in print), blue
-/// and violet: its red lies 15° or less from Claude's error red, its green 6°
-/// or less from its success green. Land keeps its vermilion, orange, gold
-/// and apricot on dark, its orange and gold in print; Off, colourless, all
-/// six. Every stripe where none keeps clear.
+/// THE DOT HUES: the stripes of `palette` a dot may wear on a dark or a light ground, in palette order (the first `n` of the array): each whose art lies [`STATUS_HUE_GUARD_DEG`] and [`STATUS_HUE_DRIFT_DEG`] or more from Claude's status hues ([`status_gap`]), so no ink its dot wears comes within the guard.
 #[must_use]
 #[inline]
 pub fn dot_stripes(palette: CardPalette, dark: bool) -> ([usize; STRIPES], usize) {
@@ -302,11 +183,7 @@ pub fn dot_stripes(palette: CardPalette, dark: bool) -> ([usize; STRIPES], usize
     (out, n)
 }
 
-/// Row `k`'s place on `palette` on a dark or a light ground (`k` counted down
-/// the panel from its first row, the main row): the main row's is the
-/// palette's first stripe; task row `k` takes the `k − 1`th of the dot hues
-/// ([`dot_stripes`]), wrapping, so its dot, its pointer and its name's first
-/// letter share one hue, and adjacent rows differ.
+/// Row `k`'s place on `palette` on a dark or a light ground (`k` counted down the panel from its first row, the main row): the main row's is the palette's first stripe; task row `k` takes the `k − 1`th of the dot hues ([`dot_stripes`]), wrapping, so its dot, its pointer and its name's first letter share one hue, and adjacent rows differ.
 #[must_use]
 #[inline]
 pub fn row_hue(palette: CardPalette, k: usize, dark: bool) -> f32 {
@@ -317,9 +194,7 @@ pub fn row_hue(palette: CardPalette, k: usize, dark: bool) -> f32 {
     palette.stripe_t(stripes[(k - 1) % n])
 }
 
-/// Letter `j` of a `len`-letter name on a row at `row_t`: from the row's
-/// stripe on across [`NAME_SPAN`] of the palette, folded back at its end
-/// (Cruise's violet runs back toward blue, never jumps to red).
+/// Letter `j` of a `len`-letter name on a row at `row_t`: from the row's stripe on across [`NAME_SPAN`] of the palette, folded back at its end (Cruise's violet runs back toward blue, never jumps to red).
 #[must_use]
 #[inline]
 pub fn name_x(row_t: f32, j: usize, len: usize) -> f32 {
@@ -342,9 +217,7 @@ pub const fn bar_x(i: usize, cells: usize) -> f32 {
     }
 }
 
-/// The crest of Claude's mascot ripple at `d_cells` cells from the bar's
-/// first cell, `ms` into the ripple's clock (`crate::ripple::glint`, the
-/// ring train): `0..=1` in eighths.
+/// The crest of Claude's mascot ripple at `d_cells` cells from the bar's first cell, `ms` into the ripple's clock (`crate::ripple::glint`, the ring train): `0..=1` in eighths.
 #[must_use]
 #[inline]
 pub fn crest(d_cells: f32, ms: u64) -> f32 {
@@ -352,7 +225,6 @@ pub fn crest(d_cells: f32, ms: u64) -> f32 {
 }
 
 /// `0x00RRGGBB` channel `sh` in linear light (the WCAG transfer the crate's
-/// [`relative_luminance`] uses).
 #[inline]
 fn lin(rgb: u32, sh: u32) -> f32 {
     let n = ((rgb >> sh) & 0xff) as f32 / 255.0;
@@ -376,7 +248,6 @@ fn srgb(l: f32) -> u32 {
 }
 
 /// `ink`'s hue with `target`'s luminance — CLAUDE'S LIGHTNESS ([`at_luminance`]).
-/// A black ink takes the target itself (no hue to keep).
 #[must_use]
 #[inline]
 pub fn match_luminance(ink: u32, target: u32) -> u32 {
@@ -386,11 +257,7 @@ pub fn match_luminance(ink: u32, target: u32) -> u32 {
     at_luminance(ink, relative_luminance(target))
 }
 
-/// `ink`'s hue at WCAG luminance `lt`, in closed form in linear light (`Lc`
-/// the ink's luminance): scaled by `lt / Lc` where `lt` is darker (every
-/// channel alike, so the hue holds), lifted toward white by
-/// `k = (lt − Lc) / (1 − Lc)` where it is lighter. Exact but for each
-/// channel's rounding to a byte; a black ink lifts to grey.
+/// `ink`'s hue at WCAG luminance `lt`, in closed form in linear light (`Lc` the ink's luminance): scaled by `lt / Lc` where `lt` is darker (every channel alike, so the hue holds), lifted toward white by `k = (lt − Lc) / (1 − Lc)` where it is lighter.
 #[must_use]
 #[inline]
 pub fn at_luminance(ink: u32, lt: f32) -> u32 {
@@ -411,9 +278,7 @@ pub fn at_luminance(ink: u32, lt: f32) -> u32 {
     }
 }
 
-/// `ink` with its OKLab chroma times `keep` (`0..=1`), its OKLab lightness
-/// and hue held: a fade toward grey that never turns the hue (where sRGB
-/// holds the colour; [`oklab_to_rgb`] clamps at the gamut's edge).
+/// `ink` with its OKLab chroma times `keep` (`0..=1`), its OKLab lightness and hue held: a fade toward grey that never turns the hue (where sRGB holds the colour; [`oklab_to_rgb`] clamps at the gamut's edge).
 #[must_use]
 #[inline]
 pub fn fade_chroma(ink: u32, keep: f32) -> u32 {
@@ -429,13 +294,7 @@ pub fn fade_chroma(ink: u32, keep: f32) -> u32 {
     oklab_to_rgb([l, a * keep, b * keep])
 }
 
-/// `ink` at WCAG luminance `lt`, its OKLab hue held: where `lt` is darker,
-/// [`at_luminance`]'s scaling (every linear channel alike, so the hue is
-/// exact); where lighter, a mix toward white IN OKLAB (lightness up, chroma
-/// down in step, the hue held but for the gamut's edge), bisected to the
-/// luminance. [`at_luminance`]'s lift mixes in linear light, which turns an
-/// orange 13° toward red at luminance 0.65: a dot brightened that way could
-/// drift into Claude's error red.
+/// `ink` at WCAG luminance `lt`, its OKLab hue held: where `lt` is darker, [`at_luminance`]'s scaling (every linear channel alike, so the hue is exact); where lighter, a mix toward white IN OKLAB (lightness up, chroma down in step, the hue held but for the gamut's edge), bisected to the luminance.
 #[must_use]
 #[inline]
 pub fn at_luminance_hue(ink: u32, lt: f32) -> u32 {
@@ -466,11 +325,6 @@ fn contrast(a: u32, b: u32) -> f32 {
 }
 
 /// A light-ground dot's ring: `fresh` (the dot's hue, darkened by
-/// [`at_luminance`]'s scaling, so hue-true) at the palest luminance up to
-/// `top` whose contrast with `ground` holds [`PRINT_RING_CONTRAST`] with both
-/// under the dot's own tint at its ceiling `veil` (`over_rgb`, the renderer's
-/// source-over: the ring lies inside the tint's plateau, never under more of
-/// it). Bisected, 12 steps; black where nothing holds.
 #[inline]
 fn print_ring(fresh: u32, ground: u32, veil: u8, top: f32) -> u32 {
     let ring = |l: f32| at_luminance(fresh, l);
@@ -501,21 +355,7 @@ fn alpha_byte(share: f32) -> u8 {
     (share.clamp(0.0, 1.0) * 255.0).round() as u8
 }
 
-/// The colour of a panel cell of kind `mark` at palette position `x`
-/// ([`name_x`], [`bar_x`], [`row_hue`]) on a dark or a light ground, Claude
-/// having drawn it in `cell_fg`:
-///
-/// * TEXT ([`PanelMark::Name`], [`PanelMark::Pointer`], [`PanelMark::BarEmpty`]):
-///   the palette's legible letter ink (`CardPalette::letter`), mixed toward
-///   `cell_fg` by `1 − sat` (a quiet row's name greys with its dot), at
-///   `cell_fg`'s luminance ([`match_luminance`]). Never crested.
-/// * A FILLED BAR CELL ([`PanelMark::BarFill`]): the palette's art at full
-///   chroma — on dark lifted to the card line's floor, on light the card's
-///   one-pixel print (its luma held to the print bar) — and, where `crest`
-///   is the ripple's field at the cell (`0..=1`, [`crest`]), mixed toward
-///   white by `crest · GLINT_CREST_DARK` on dark, deepened toward black by
-///   `crest · GLINT_CREST_LIGHT / 2` on light: a crest never lowers the
-///   cell's contrast on paper.
+/// The colour of a panel cell of kind `mark` at palette position `x` ([`name_x`], [`bar_x`], [`row_hue`]) on a dark or a light ground, Claude having drawn it in `cell_fg`:
 #[must_use]
 #[inline]
 pub fn panel_ink(
@@ -552,32 +392,24 @@ pub fn panel_ink(
     }
 }
 
-/// What the fold says of a dot, as its look needs it (the host maps
-/// `aterm_agent::harness::agents::DotState` onto it).
+/// What the fold says of a dot, as its look needs it (the host maps `aterm_agent::harness::agents::DotState` onto it).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DotMood {
     /// Evidence of work lately: lit.
     Running,
     /// No evidence for a while: its light fades with its freshness.
     Quiet,
-    /// No evidence for a while, but waiting on a tool call of its own inside
-    /// that call's budget: fresh, its light dimmed by [`TOOL_GLOW`] and held
-    /// inside its ring ([`TOOL_RADIUS`]).
+    /// No evidence for a while, but waiting on a tool call of its own inside that call's budget: fresh, its light dimmed by [`TOOL_GLOW`] and held inside its ring ([`TOOL_RADIUS`]).
     Tool,
     /// No evidence for long: grey, breathing.
     Stuck,
     /// Awaiting approval: a still amber ring.
     Awaiting,
-    /// Claude marked it done or failed, its clock halted, or it waits with
-    /// nothing in flight (idle, paused): Claude's own ink, no light.
+    /// Claude marked it done or failed, its clock halted, or it waits with nothing in flight (idle, paused): Claude's own ink, no light.
     Still,
 }
 
-/// A dot's light: `color` (straight) at `strength` (`0..=1`: a dark
-/// ground's halo peak, a light ground's tint ceiling, of the colour),
-/// `radius` cell widths from the bullet's centre, and on a light ground the
-/// hollow's fill at `fill` (`0..=1`, its ceiling; none on dark, where the
-/// halo fills the hollow).
+/// A dot's light: `color` (straight) at `strength` (`0..=1`: a dark ground's halo peak, a light ground's tint ceiling, of the colour), `radius` cell widths from the bullet's centre, and on a light ground the hollow's fill at `fill` (`0..=1`, its ceiling; none on dark, where the halo fills the hollow).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DotLight {
     pub color: u32,
@@ -593,11 +425,7 @@ pub struct DotLook {
     pub light: Option<DotLight>,
 }
 
-/// The breath of a stuck dot `ms` after it began to breathe, on the
-/// [`BREATH_STEP_MS`] grid: `BREATH_FLOOR + (1 − BREATH_FLOOR)·(1 − cos(2πt/T))/2`
-/// (`T` = [`BREATH_PERIOD_MS`]), so it starts at its floor and swells to
-/// `1` once a period; [`BREATH_REST`] with no breath (`None`) and from
-/// [`BREATH_FOR_MS`] on.
+/// The breath of a stuck dot `ms` after it began to breathe, on the [`BREATH_STEP_MS`] grid: `BREATH_FLOOR + (1 − BREATH_FLOOR)·(1 − cos(2πt/T))/2` (`T` = [`BREATH_PERIOD_MS`]), so it starts at its floor and swells to `1` once a period; [`BREATH_REST`] with no breath (`None`) and from [`BREATH_FOR_MS`] on.
 #[must_use]
 #[inline]
 pub fn breath(ms: Option<u64>) -> f32 {
@@ -609,43 +437,7 @@ pub fn breath(ms: Option<u64>) -> f32 {
     BREATH_FLOOR + (1.0 - BREATH_FLOOR) * (1.0 - phase.cos()) / 2.0
 }
 
-/// The dot of the panel's row `k` (its hue, [`row_hue`]) in mood `mood`,
-/// its work `level` and freshness `sat` (`0..=1`, the fold's), on a dark or a
-/// light ground (`ground`, the pane's own: the paper a light ring is solved
-/// against); `breath` the stuck dot's swell ([`breath`]); `serious` drops the
-/// light.
-///
-/// * [`DotMood::Running`], [`DotMood::Quiet`]: the row's hue, a quiet one's
-///   chroma faded to `QUIET_KEEP · sat` of it ([`fade_chroma`]: hue-true). On
-///   dark drawn at luminance `DOT_LUMA_MIN + DOT_LUMA_GAIN·level`
-///   ([`at_luminance_hue`]: a yellow dims at rest as a blue lifts, so
-///   brightness reads as work on every hue); its light the fresh hue itself,
-///   an additive halo `DOT_RADIUS_MIN + DOT_RADIUS_GAIN·level` cells wide (at
-///   most [`DOT_RADIUS_MAX`]) peaking at `HALO_PEAK_MIN + HALO_PEAK_GAIN·level`.
-///   On light the ring is the hue as a print ink ([`PRINT_RING_LUMA`],
-///   deepened by `DOT_DEEPEN_LIGHT·level`, then as dark as it must be to hold
-///   [`PRINT_RING_CONTRAST`] on `ground` under its own tint); its light a
-///   round tint of the same radius at `TINT_ALPHA_MIN + TINT_ALPHA_GAIN·level`
-///   and its hollow filled at `FILL_ALPHA_MIN + FILL_ALPHA_GAIN·level`. A
-///   quiet dot's light, every part, is times its freshness.
-/// * [`DotMood::Tool`]: a running dot's ink, in its full hue, at its level;
-///   its light [`TOOL_GLOW`] of a running dot's at that level (its strength,
-///   and on paper its hollow's fill), [`TOOL_RADIUS`] wide: a core inside the
-///   ring, never a halo past it — so it is fresh (never the stuck dot's
-///   grey), never breathes, is dimmer than any running dot, and its light's
-///   shape tells it from a running dot and from an awaiting ring.
-/// * [`DotMood::Stuck`]: the hue faded to its freshness (the fold's
-///   `SAT_STUCK`, nearly grey), its lightness swung by the breath (on dark
-///   drawn at luminance `DOT_LUMA_MIN·breath`, on light paled from the
-///   over-text ink at its swell to [`STUCK_PALE_LUMA_LIGHT`] at its floor, so
-///   it holds 3:1 on paper); its light [`STUCK_RADIUS`] wide at the strength
-///   of no work times the breath, its hollow never filled, so a stuck dot is
-///   never brighter than a running one (on Off's colourless moonbow too).
-/// * [`DotMood::Awaiting`]: [`AWAITING_AMBER`] ([`AWAITING_AMBER_PRINT`] on light),
-///   UNLIT — a still, hollow ring beside Claude's done and failed ones, so
-///   it is never a running dot of a near hue (every running dot is lit) —
-///   and never breathing.
-/// * [`DotMood::Still`]: nothing — Claude's ink, no light.
+/// The dot of the panel's row `k` (its hue, [`row_hue`]) in mood `mood`, its work `level` and freshness `sat` (`0..=1`, the fold's), on a dark or a light ground (`ground`, the pane's own: the paper a light ring is solved against); `breath` the stuck dot's swell ([`breath`]); `serious` drops the light.
 #[must_use]
 #[inline]
 #[allow(clippy::too_many_arguments)]
@@ -668,10 +460,6 @@ pub fn dot_look(
             };
         }
         DotMood::Awaiting => {
-            // No light: light is work, and an agent awaiting approval does
-            // none. Lit (as it once was, at a level-0.3 light) it was a
-            // running dot of a near hue — Land's gold lies 5° from the amber,
-            // Cruise's print gold 0.4° — and only its form tells them apart.
             let ink = if dark {
                 AWAITING_AMBER
             } else {
@@ -741,10 +529,6 @@ pub fn dot_look(
         }
         DotMood::Stuck => {
             let fresh = fade_chroma(hue, sat);
-            // The breath swings the ring's own lightness, so the pulse reads in
-            // the glyph and not only in its faint light. On paper it pales
-            // from the over-text ink at its swell to STUCK_PALE_LUMA_LIGHT at
-            // its floor, never past it: the ring stays legible.
             let ink = if dark {
                 at_luminance_hue(fresh, DOT_LUMA_MIN * breath)
             } else {
@@ -771,10 +555,7 @@ pub fn dot_look(
     }
 }
 
-/// Where a dot is on the glass, in the light streams' window pixels: its
-/// bullet cell's centre `(cx, cy)`, the cell `(cw, ch)`, the bullet's frame
-/// row `row` (the streams' row tag; its band `[cy − ch/2, cy + ch/2)`), and
-/// the pixel rows `clip` the light may reach (the pane's).
+/// Where a dot is on the glass, in the light streams' window pixels: its bullet cell's centre `(cx, cy)`, the cell `(cw, ch)`, the bullet's frame row `row` (the streams' row tag; its band `cy − ch/2, cy + ch/2)`), and the pixel rows `clip` the light may reach (the pane's).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DotPlace {
     pub cx: u16,
@@ -785,22 +566,7 @@ pub struct DotPlace {
     pub clip: (u16, u16),
 }
 
-/// The quads of dot light `light` at `place`, pushed onto `halos` (the
-/// light stream over the glyphs), each a [`RainHalo`] split one quad per row
-/// band it reaches (the stream's one-band rule; the bands about the bullet's
-/// row share its centre), never wider than [`DOT_RADIUS_MAX`] cell widths nor
-/// taller than [`DOT_RISE_MAX`] cell heights from the bullet's centre, nor
-/// past the pane's clip:
-///
-/// * on a dark ground one additive halo ([`HaloMode::Add`]): its peak the
-///   light's colour premultiplied by its strength, falling to nothing at its
-///   radius;
-/// * on a light ground, where added light is invisible, two source-over
-///   veils ([`HaloMode::Over`], each its ceiling in the colour's high byte,
-///   `aterm_render::halo_over_cap`): the ROUND TINT, at the light's radius
-///   (the dark halo's) and strength, then the hollow's FILL, [`FILL_RADIUS`]
-///   round, at the light's fill. A veil whose ceiling would be under
-///   `VEIL_ALPHA_FLOOR` is not drawn.
+/// The quads of dot light `light` at `place`, pushed onto `halos` (the light stream over the glyphs), each a [`RainHalo`] split one quad per row band it reaches (the stream's one-band rule; the bands about the bullet's row share its centre), never wider than [`DOT_RADIUS_MAX`] cell widths nor taller than [`DOT_RISE_MAX`] cell heights from the bullet's centre, nor past the pane's clip:
 #[inline]
 pub fn dot_light_quads(light: &DotLight, dark: bool, place: DotPlace, halos: &mut Vec<RainHalo>) {
     let (cw, ch) = (f32::from(place.cw), f32::from(place.ch));
@@ -828,8 +594,6 @@ pub fn dot_light_quads(light: &DotLight, dark: bool, place: DotPlace, halos: &mu
 }
 
 /// One radial light of `color` (the stream's word for `mode`) about the
-/// bullet at `place`, `(rx, ry)` pixels, as one quad per row band it reaches
-/// inside the clip.
 #[inline]
 fn push_radial(
     halos: &mut Vec<RainHalo>,

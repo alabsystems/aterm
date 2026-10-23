@@ -1,40 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! FX LAYERS: the engine's sprite and bitmap primitive
-//! (`docs/DESIGN-card-engine-2026-10-19.md` §4).
-//!
-//! A host hands the renderer retained [`FxLayer`]s on
-//! [`RenderInput::fx_layers`](crate::render::RenderInput::fx_layers). Each
-//! layer is a shared, sealed [`FxContent`] (items plus a palette) placed by an
-//! offset, clipped by a box, and drawn at one of three z-slots ([`FxSlot`]).
-//! Items are rectangles ([`FxRect`]), stacks of one-row ramps ([`FxRamps`]) and
-//! images ([`FxSprite`] over an [`FxArt`]). The renderers own the rest:
-//!
-//! * **Pixel law F.** Every pixel an item writes is a pure function of the
-//!   absolute pixel, the item and the palette: integer nearest mapping
-//!   `t = l·w / dw` from the UNCLAMPED item origin, no sampler, no float UV.
-//! * **Band slicing.** The engine cuts every item at the cell-row band edges
-//!   and draws a slice only where the row is being repainted, so producers
-//!   split nothing and the one-band law cannot be broken by one.
-//! * **Occluders.** [`RenderInput::fx_occluders`](crate::render::RenderInput::fx_occluders)
-//!   subtracts host chrome (a find bar, a menu) from every layer, however many
-//!   overlap.
-//! * **Identity damage.** Layers compare by identity (`id`, the content `Arc`,
-//!   placement), so a settled layer is a pointer compare.
-//!
-//! Byte order of every `u32` colour here is `0x00RRGGBB`. An [`FxInk`] is
-//! premultiplied by its own opacity, the [`GlowQuad`](crate::render::GlowQuad)
-//! paint: `alpha == 0` is additive light, `alpha > 0` is source-over.
+//! FX LAYERS: the engine's sprite and bitmap primitive (`docs/DESIGN-card-engine-2026-10-19.md` §4).
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
 /// A half-open pixel rectangle `[x0, x1) × [y0, y1)` in signed pixels.
-///
-/// An edge at `i32::MIN` or `i32::MAX` is UNBOUNDED: [`Self::translate`]
-/// leaves it in place, so [`Self::EVERYWHERE`] stays everywhere when a layer
-/// moves. A rectangle with `x0 >= x1` or `y0 >= y1` is empty.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PxRect {
     /// Left edge (inclusive).
@@ -48,7 +20,7 @@ pub struct PxRect {
 }
 
 impl PxRect {
-    /// The unbounded rectangle: "no clip".
+    /// The unbounded rectangle.
     pub const EVERYWHERE: Self = Self {
         x0: i32::MIN,
         y0: i32::MIN,
@@ -71,8 +43,7 @@ impl PxRect {
         Self { x0, y0, x1, y1 }
     }
 
-    /// The `w × h` rectangle with its top-left corner at `(x, y)`; the far
-    /// edges saturate at `i32::MAX`.
+    /// The `w × h` rectangle with its top-left corner at `(x, y)`.
     #[must_use]
     #[inline]
     pub const fn at(x: i32, y: i32, w: u32, h: u32) -> Self {
@@ -126,8 +97,7 @@ impl PxRect {
         !self.intersect(other).is_empty()
     }
 
-    /// The smallest rectangle holding both; an empty operand contributes
-    /// nothing, and two empties give [`Self::EMPTY`].
+    /// The smallest rectangle holding both.
     #[must_use]
     #[inline]
     pub const fn hull(self, other: Self) -> Self {
@@ -160,8 +130,7 @@ impl PxRect {
         }
     }
 
-    /// The rectangle moved by `(dx, dy)`, saturating; unbounded edges stay
-    /// unbounded.
+    /// The rectangle moved by `(dx, dy)`, saturating.
     #[must_use]
     #[inline]
     pub const fn translate(self, dx: i32, dy: i32) -> Self {
@@ -175,7 +144,6 @@ impl PxRect {
 }
 
 /// One edge moved by `d`: an unbounded edge (`i32::MIN`/`i32::MAX`) stays put,
-/// a bounded one saturates short of them.
 #[expect(
     clippy::cast_possible_truncation,
     reason = "the cast arm is reached only with v strictly inside i32's range"
@@ -212,18 +180,12 @@ const fn sat_i32(v: i64) -> i32 {
     }
 }
 
-/// One palette entry: the [`GlowQuad`](crate::render::GlowQuad) paint.
-///
-/// `color` is premultiplied by `alpha` (`0x00RRGGBB`). `alpha == 0` is
-/// additive light (`add_sat`), `alpha == 255` displaces the ground (a store),
-/// anything between is source-over (`over_premul`). Under
-/// [`FxBlend::Linear`] the entry a sprite names is instead its multiply tint
-/// (`color`, straight) and extra opacity (`alpha`), FreeSprite's law.
+/// One palette entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct FxInk {
     /// Premultiplied colour `0x00RRGGBB` (the tint under [`FxBlend::Linear`]).
     pub color: u32,
-    /// Opacity `0..=255`; `0` is additive light.
+    /// Opacity `0..=255`.
     pub alpha: u8,
 }
 
@@ -235,7 +197,7 @@ impl FxInk {
         Self { color, alpha: 0 }
     }
 
-    /// Source-over paint: `color` already premultiplied by `alpha`.
+    /// Source-over paint.
     #[must_use]
     #[inline]
     pub const fn over(color: u32, alpha: u8) -> Self {
@@ -246,15 +208,11 @@ impl FxInk {
 /// How an [`FxArt`]'s bytes are read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FxTexels {
-    /// One byte per texel: `0` is transparent, `k > 0` names palette entry
-    /// `ink + k − 1` of the drawing sprite.
+    /// One byte per texel.
     Index8,
-    /// Four bytes per texel, `R, G, B, A`, premultiplied: the texel is its
-    /// own paint (`A == 0` with colour is additive light). Drawn under
-    /// [`FxBlend::Exact`].
+    /// Four bytes per texel, `R, G, B, A`, premultiplied.
     Rgba8Premul,
-    /// Four bytes per texel, `R, G, B, A`, straight alpha, drawn under
-    /// [`FxBlend::Linear`] with the sprite's palette entry as tint and opacity.
+    /// Four bytes per texel, `R, G, B, A`, straight alpha, drawn under [`FxBlend::Linear`] with the sprite's palette entry as tint and opacity.
     Rgba8Straight,
 }
 
@@ -279,9 +237,7 @@ impl FxTexels {
         }
     }
 
-    /// Whether a packed texel value ([`FxArt::texel`]) writes nothing under
-    /// pixel law F: index 0, an all-zero premultiplied texel, a zero straight
-    /// alpha.
+    /// Whether a packed texel value ([`FxArt::texel`]) writes nothing under pixel law F.
     #[must_use]
     #[inline]
     pub const fn is_clear(self, value: u32) -> bool {
@@ -303,13 +259,7 @@ pub struct FxRun {
     pub value: u32,
 }
 
-/// An art's per-row run lists: every maximal run of identical texels that
-/// draws (clear texels, [`FxTexels::is_clear`], are left out), row by row.
-///
-/// The CPU rasterizer stamps a sprite from these instead of visiting each
-/// texel: one paint resolution per run and one tight span fill, byte-equal to
-/// the per-pixel law (the design probe: 13.2 vs 20.1 µs against rectangles,
-/// per-pixel 2× slower). Built once per art, on first use.
+/// An art's per-row run lists.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FxRowRuns {
     /// `starts[y]..starts[y + 1]` indexes row `y`'s runs (`h + 1` entries).
@@ -362,33 +312,13 @@ impl FxRowRuns {
     }
 }
 
-/// The longest side, in texels, an [`FxArt`] may have: [`FxArt::new`] refuses
-/// a longer one. With [`FX_FRAME_ART_TEXELS`] it is what lets every backend
-/// draw every art a frame admits (design §4.6).
+/// The longest side, in texels, an [`FxArt`] may have.
 pub const FX_ART_MAX_SIDE: u16 = 2048;
 
-/// The art one frame may draw per texel width (the one-byte Index8 arts, and
-/// the four-byte RGBA ones): at most this many texels of DISTINCT arts, each
-/// counted once however many sprites draw it.
-///
-/// The renderers walk the frame's sprites in draw order (layers in list
-/// order, items in content order) and refuse a sprite whose art would take its
-/// width's total past this: it draws nothing, on every backend alike, so the
-/// CPU and the GPU agree on every frame. The bound is the GPU atlas's: arts of
-/// sides at most [`FX_ART_MAX_SIDE`] totalling at most 2²² texels always
-/// shelf-pack, tallest first, into one 4096² texture (each shelf is opened by
-/// an art that fit on no earlier one, so the packing's height stays below
-/// `h_max + 2·area / 4096 <= 2048 + 2048`).
+/// The art one frame may draw per texel width (the one-byte Index8 arts, and the four-byte RGBA ones).
 pub const FX_FRAME_ART_TEXELS: u64 = 1 << 22;
 
-/// An image the engine draws: `w × h` texels of one [`FxTexels`] kind,
-/// content-addressed.
-///
-/// Immutable once built, and shared by `Arc` between frames, layers and
-/// renderers. [`Self::id`] is the FNV-1a/128 hash of the kind, the size and
-/// the bytes, so two arts with the same id are the same image and a GPU atlas
-/// keys residency on it. The fields are read through accessors so the id and
-/// the run lists can never disagree with the bytes.
+/// An image the engine draws.
 pub struct FxArt {
     id: u128,
     w: u16,
@@ -396,7 +326,6 @@ pub struct FxArt {
     texels: FxTexels,
     data: Box<[u8]>,
     /// The largest Index8 texel (0 for an RGBA art): the palette reach
-    /// `FxContent`'s seal checks.
     max_index: u8,
     /// CPU run lists, built once on first use.
     runs: OnceLock<FxRowRuns>,
@@ -404,13 +333,6 @@ pub struct FxArt {
 
 impl FxArt {
     /// An art of `w × h` texels of kind `texels`, row-major, top row first.
-    ///
-    /// `None` when `data` is not exactly `w · h ·`
-    /// [`bytes_per_texel`](FxTexels::bytes_per_texel) bytes long, or when a
-    /// side is longer than [`FX_ART_MAX_SIDE`] (no backend is bound to hold
-    /// it; a producer tiles a larger image). A zero-size art (`w == 0` or
-    /// `h == 0`, no bytes) is accepted and draws nothing; [`FxContent`]'s seal
-    /// refuses one in a debug build.
     #[must_use]
     pub fn new(w: u16, h: u16, texels: FxTexels, data: impl Into<Box<[u8]>>) -> Option<Self> {
         if w > FX_ART_MAX_SIDE || h > FX_ART_MAX_SIDE {
@@ -448,7 +370,7 @@ impl FxArt {
         })
     }
 
-    /// The content address: FNV-1a/128 over kind, size and bytes.
+    /// The content address.
     #[must_use]
     #[inline]
     pub const fn id(&self) -> u128 {
@@ -497,8 +419,7 @@ impl FxArt {
         self.max_index
     }
 
-    /// The packed value of texel `(x, y)`: the index for Index8, and
-    /// `A << 24 | R << 16 | G << 8 | B` for the RGBA kinds.
+    /// The packed value of texel `(x, y)`.
     ///
     /// # Panics
     /// When `(x, y)` lies outside the art.
@@ -524,8 +445,7 @@ impl FxArt {
         }
     }
 
-    /// The per-row run lists the CPU rasterizer stamps from, built on first
-    /// call and kept.
+    /// The per-row run lists the CPU rasterizer stamps from, built on first call and kept.
     #[inline]
     pub fn runs(&self) -> &FxRowRuns {
         self.runs.get_or_init(|| FxRowRuns::build(self))
@@ -543,13 +463,7 @@ impl std::fmt::Debug for FxArt {
     }
 }
 
-/// An image item: `art` drawn into a `dw × dh` destination at `(x, y)`.
-///
-/// Destination column `l` reads texel `l · w / dw` (integer division), and
-/// row `m` reads `m · h / dh`; an integer scale `s` is `dw = w · s`. Under
-/// `flip_x` column `l` reads `w − 1 − l · w / dw`. Index8 texels resolve
-/// through palette entry `ink + k − 1`; RGBA texels are their own paint
-/// (Premul) or take entry `ink` as tint and opacity (Straight).
+/// An image item.
 #[derive(Debug, Clone)]
 pub struct FxSprite {
     /// Left edge of the destination, in the content's space.
@@ -564,18 +478,13 @@ pub struct FxSprite {
     pub flip_x: bool,
     /// The image.
     pub art: Arc<FxArt>,
-    /// The palette base: Index8 texel `k` paints entry `ink + k − 1`; a
-    /// Straight art takes entry `ink` as its tint.
+    /// The palette base.
     pub ink: u32,
     /// The sprite's own clip, in the content's space (moves with the layer).
-    /// [`PxRect::EVERYWHERE`] for none.
     pub clip: PxRect,
 }
 
-/// A rectangle item: the [`GlowQuad`](crate::render::GlowQuad) law with no row
-/// tag. Column `i` of a `w`-wide rect carries the integer ramp between
-/// palette entries `ink` (left edge) and `ink + 1` (right edge); equal entries
-/// are a flat fill.
+/// A rectangle item.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FxRect {
     /// Left edge, in the content's space.
@@ -586,13 +495,11 @@ pub struct FxRect {
     pub w: u16,
     /// Height in pixels.
     pub h: u16,
-    /// Palette base: entries `ink` and `ink + 1` are the ramp's two ends.
+    /// Palette base.
     pub ink: u32,
 }
 
-/// A stack of `h` one-row ramps sharing `x` and `w`: row `r` is the
-/// [`FxRect`] law between palette entries `ink + 2r` and `ink + 2r + 1` (the
-/// ribbon or Bolt shape, each row with its own ends).
+/// A stack of `h` one-row ramps sharing `x` and `w`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FxRamps {
     /// Left edge, in the content's space.
@@ -603,7 +510,7 @@ pub struct FxRamps {
     pub w: u16,
     /// Number of rows.
     pub h: u16,
-    /// Palette base: `2 · h` entries, per row a left and a right end.
+    /// Palette base.
     pub ink: u32,
 }
 
@@ -619,8 +526,7 @@ pub enum FxItem {
 }
 
 impl FxItem {
-    /// The pixels the item may write, in the content's space: its box, and
-    /// for a sprite that box within the sprite's clip.
+    /// The pixels the item may write, in the content's space.
     #[must_use]
     #[inline]
     pub const fn bounds(&self) -> PxRect {
@@ -631,9 +537,7 @@ impl FxItem {
         }
     }
 
-    /// The blend this item is drawn under: Rect, Ramps and Index8 or
-    /// Premul sprites are [`FxBlend::Exact`]; Straight sprites
-    /// [`FxBlend::Linear`].
+    /// The blend this item is drawn under.
     #[must_use]
     #[inline]
     pub fn blend(&self) -> FxBlend {
@@ -652,23 +556,10 @@ enum FxClass {
     /// Only items one blend draws.
     Only(FxBlend),
     /// Items of both blends: refused at seal in a debug build, drawn by
-    /// neither in release.
     Mixed,
 }
 
-/// A layer's retained payload: items, their palette, and the sealed hull.
-///
-/// Built by [`Self::new`] and changed only through [`Self::edit`], both of
-/// which SEAL it: compute the extent (the hull of every item's
-/// [`bounds`](FxItem::bounds)) and, in a debug build, refuse a mixture of
-/// blends, a zero-size art and any palette index past the end. So the extent
-/// the damage tracker reads can never be stale. Shared by `Arc`; a settled
-/// layer hands the renderer the same `Arc` frame after frame.
-///
-/// Every seal is booked on [`fx_layer_builds`] and every deep copy (a
-/// [`Clone`], as `Arc::make_mut` makes of a shared payload) on
-/// [`fx_payload_copies`]: the engine's cost at rest is both counters standing
-/// still (design §7).
+/// A layer's retained payload.
 #[derive(Debug)]
 pub struct FxContent {
     items: Vec<FxItem>,
@@ -682,20 +573,14 @@ static FX_LAYER_BUILDS: AtomicU64 = AtomicU64::new(0);
 /// [`fx_payload_copies`]'s counter.
 static FX_PAYLOAD_COPIES: AtomicU64 = AtomicU64::new(0);
 
-/// How many [`FxContent`] payloads this process has sealed: one per
-/// [`FxContent::new`] and one per [`FxContent::edit`], a layer's content being
-/// (re)built. A settled layer hands the renderer the same `Arc` and seals
-/// nothing, so this stands still at rest (`metrics`' `fx_layer_builds`).
+/// How many [`FxContent`] payloads this process has sealed.
 #[must_use]
 #[inline]
 pub fn fx_layer_builds() -> u64 {
     FX_LAYER_BUILDS.load(Ordering::Relaxed)
 }
 
-/// How many deep copies of an [`FxContent`] payload this process has made
-/// (`metrics`' `fx_payload_copies`): a producer that edits a payload some
-/// frame still holds pays a copy of its items and palette here, so a nonzero
-/// count at rest names a producer that should keep its own ring.
+/// How many deep copies of an [`FxContent`] payload this process has made (`metrics`' `fx_payload_copies`).
 #[must_use]
 #[inline]
 pub fn fx_payload_copies() -> u64 {
@@ -721,9 +606,7 @@ fn count_here(builds: u64, copies: u64) {
     let _ = (builds, copies);
 }
 
-/// [`fx_layer_builds`] and [`fx_payload_copies`] booked on THIS thread: the
-/// cost tests' counters, which the work of tests running beside them on
-/// other threads does not move.
+/// [`fx_layer_builds`] and [`fx_payload_copies`] booked on THIS thread.
 #[cfg(any(test, debug_assertions))]
 #[doc(hidden)]
 #[must_use]
@@ -762,8 +645,7 @@ impl FxContent {
     /// Sealed content of `items` over `palette`.
     ///
     /// # Panics (debug)
-    /// On a mixture of blends, a sprite over a zero-size art, or a palette
-    /// index past the end (see [`Self::edit`]).
+    /// On a mixture of blends, a sprite over a zero-size art, or a palette index past the end (see [`Self::edit`]).
     #[must_use]
     pub fn new(items: Vec<FxItem>, palette: Vec<FxInk>) -> Self {
         let mut content = Self {
@@ -775,26 +657,11 @@ impl FxContent {
         content
     }
 
-    /// Change the items and the palette in place, then re-seal. The vectors
-    /// keep their capacity, so an emitter refilling a ring of contents through
-    /// `Arc::get_mut` allocates nothing in the steady state. If the callback
-    /// unwinds, completed edits remain, with their extent and blend re-sealed.
+    /// Change the items and the palette in place, then re-seal.
     ///
     /// # Panics (debug)
-    /// When the edited content mixes [`FxBlend::Exact`] and
-    /// [`FxBlend::Linear`] items, a sprite draws a zero-size art, a Rect,
-    /// a Ramps row or an Index8 sprite reaches past the palette, a Straight
-    /// sprite's tint entry is missing, or a Rect or Ramps row is additive at
-    /// one end and source-over at the other (the [`GlowQuad`](crate::render::GlowQuad)
-    /// per-quad mode law). Release draws what pixel law F defines: a mixture
-    /// draws nothing under either blend, a zero-size art, an index or an end
-    /// past the palette and a missing tint write nothing, and a one-end-additive
-    /// row draws its lerped ink per column (`over_premul` of the ramp, additive
-    /// only where the lerped opacity is 0).
+    /// When content mixes [`FxBlend::Exact`] and [`FxBlend::Linear`], references out-of-bounds palette entries, or mixes additive and source-over stops.
     pub fn edit(&mut self, f: impl FnOnce(&mut Vec<FxItem>, &mut Vec<FxInk>)) {
-        // A caught callback (or debug-refusal) unwind keeps the edits it
-        // already made. Re-seal those items without a second refusal while
-        // unwinding, so their class and extent still describe the payload.
         struct Reseal<'a> {
             content: &'a mut FxContent,
             sealed: bool,
@@ -815,8 +682,7 @@ impl FxContent {
         guard.sealed = true;
     }
 
-    /// Sealed content WITHOUT the debug refusals, for the tests of what the
-    /// renderers draw for a malformed item (nothing, per pixel law F).
+    /// Sealed content WITHOUT the debug refusals, for the tests of what the renderers draw for a malformed item (nothing, per pixel law F).
     #[cfg(any(test, debug_assertions))]
     #[doc(hidden)]
     #[must_use]
@@ -844,16 +710,14 @@ impl FxContent {
         &self.palette
     }
 
-    /// The hull of every item's bounds, in the content's space
-    /// ([`PxRect::EMPTY`] when nothing can draw).
+    /// The hull of every item's bounds, in the content's space ([`PxRect::EMPTY`] when nothing can draw).
     #[must_use]
     #[inline]
     pub const fn extent(&self) -> PxRect {
         self.extent
     }
 
-    /// Whether a layer of blend `blend` draws this content: an empty content
-    /// suits either, a mixed one neither.
+    /// Whether a layer of blend `blend` draws this content.
     #[must_use]
     #[inline]
     pub const fn accepts(&self, blend: FxBlend) -> bool {
@@ -899,7 +763,6 @@ impl FxContent {
         if !cfg!(debug_assertions) {
             return;
         }
-        // Whether ramp ends `k`, `k + 1` share a mode (`None`: past the end).
         let one_mode = |k: u64| {
             let at = |k: u64| usize::try_from(k).ok().and_then(|k| palette.get(k));
             Some((at(k)?.alpha == 0) == (at(k + 1)?.alpha == 0))
@@ -955,20 +818,14 @@ impl FxContent {
     }
 }
 
-/// Where a layer sits in the frame's painter's order
-/// (`docs/DESIGN-card-engine-2026-10-19.md` §4.5).
+/// Where a layer sits in the frame's painter's order (`docs/DESIGN-card-engine-2026-10-19.md` §4.5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FxSlot {
-    /// Under the glyph ink: right after the `glow_under` light, before the
-    /// fire body. A [`FxBlend::Linear`] layer here draws right after the
-    /// under-text free sprites.
+    /// Under the glyph ink.
     Under,
-    /// Over the glyphs, right after the cursor aurora (`cursor_glow_add`) and
-    /// before the radial halos. [`FxBlend::Exact`] only.
+    /// Over the glyphs, right after the cursor aurora (`cursor_glow_add`) and before the radial halos.
     Glow,
-    /// Over the glyphs, right after the nova light (so over pane chrome such
-    /// as the scrollbar) and before the rain halos. A [`FxBlend::Linear`]
-    /// layer here draws right after the over-text free sprites.
+    /// Over the glyphs, right after the nova light (so over pane chrome such as the scrollbar) and before the rain halos.
     Over,
 }
 
@@ -977,30 +834,20 @@ pub enum FxSlot {
 pub enum FxSpace {
     /// Window pixels (the cursor-effect streams' space).
     Window,
-    /// Grid-interior pixels: the renderer adds `(pad, grid_top)`, like
-    /// `nova_add`.
+    /// Grid-interior pixels.
     Grid,
 }
 
 /// How a layer composites.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FxBlend {
-    /// The Unorm byte law: `over_premul` of an integer ink (`add_sat` at
-    /// alpha 0, a store at 255). Byte-exact on every backend with a Unorm
-    /// view. Draws Rect, Ramps, Index8 and Rgba8Premul.
+    /// The Unorm byte law.
     Exact,
-    /// FreeSprite's linear-light law over an sRGB view (CPU `blend`), within
-    /// its declared parity tolerance. Draws Rgba8Straight sprites, at
-    /// [`FxSlot::Under`] or [`FxSlot::Over`].
+    /// FreeSprite's linear-light law over an sRGB view (CPU `blend`), within its declared parity tolerance.
     Linear,
 }
 
 /// One retained fx layer of a frame.
-///
-/// Equality is IDENTITY: `id`, the content `Arc` (`Arc::ptr_eq`, never a deep
-/// compare), slot, space, blend, bloom, offset and clip. A host that keeps
-/// handing the same `Arc` at the same place costs the renderer a pointer
-/// compare; any new `Arc` is a change, even with equal bytes.
 #[derive(Debug, Clone)]
 pub struct FxLayer {
     /// The host's stable name for the layer (damage matches layers by it).
@@ -1017,8 +864,7 @@ pub struct FxLayer {
     pub bloom: bool,
     /// Where the content's origin lands, in `space`.
     pub offset: (i32, i32),
-    /// The layer's clip in `space` (a pane box); [`PxRect::EVERYWHERE`] for
-    /// none.
+    /// The layer's clip in `space` (a pane box).
     pub clip: PxRect,
 }
 
@@ -1026,8 +872,7 @@ impl FxLayer {
     /// A layer at offset `(0, 0)`, unclipped, without bloom.
     ///
     /// # Panics (debug)
-    /// When the content cannot be drawn under `blend`, or a
-    /// [`FxBlend::Linear`] layer asks for [`FxSlot::Glow`].
+    /// When the content cannot be drawn under `blend`, or a [`FxBlend::Linear`] layer asks for [`FxSlot::Glow`].
     #[must_use]
     #[inline]
     pub fn new(
@@ -1057,8 +902,7 @@ impl FxLayer {
         }
     }
 
-    /// The pixels the layer may write, in its space: the content's extent at
-    /// the offset, within the clip.
+    /// The pixels the layer may write, in its space.
     #[must_use]
     #[inline]
     pub fn extent(&self) -> PxRect {
@@ -1108,11 +952,9 @@ mod tests {
         assert_ne!(kind.id(), kind2.id());
         assert_eq!(a.max_index(), 3);
         assert_eq!(kind.max_index(), 0);
-        // The length must be exactly w·h·bpp.
         assert!(FxArt::new(2, 2, FxTexels::Index8, vec![0; 3]).is_none());
         assert!(FxArt::new(1, 1, FxTexels::Rgba8Premul, vec![0; 3]).is_none());
         assert!(FxArt::new(0, 5, FxTexels::Index8, Vec::new()).is_some_and(|a| a.is_empty()));
-        // The byte count cannot wrap before the length refusal on 32-bit.
         let max = FX_ART_MAX_SIDE;
         assert!(FxArt::new(max, max, FxTexels::Rgba8Premul, Vec::new()).is_none());
         assert!(FxArt::new(max, max, FxTexels::Rgba8Straight, Vec::new()).is_none());
@@ -1120,8 +962,6 @@ mod tests {
             FxArt::new(max, 0, FxTexels::Rgba8Straight, Vec::new())
                 .is_some_and(|art| art.is_empty())
         );
-        // A side past the cap is refused whatever its bytes: no backend is
-        // bound to hold it. Its largest neighbour is an art.
         let side = usize::from(max);
         assert!(FxArt::new(max, 1, FxTexels::Index8, vec![1; side]).is_some());
         assert!(FxArt::new(max + 1, 1, FxTexels::Index8, vec![1; side + 1]).is_none());
@@ -1131,8 +971,6 @@ mod tests {
     }
 
     /// The run lists, expanded, are exactly the drawing texels: every
-    /// non-clear texel lies in one run of its own value, no clear texel lies
-    /// in any, runs are maximal and ordered.
     #[test]
     fn run_lists_expand_to_exactly_the_drawing_texels() {
         let empty = FxArt::new(0, 0, FxTexels::Index8, Vec::new()).unwrap();
@@ -1153,7 +991,6 @@ mod tests {
                 FxTexels::Rgba8Straight,
             ][case % 3];
             let n = usize::from(w) * usize::from(h) * texels.bytes_per_texel();
-            // A small alphabet so runs form; zero-heavy so clear texels occur.
             let data: Vec<u8> = (0..n)
                 .map(|_| [0u8, 0, 1, 2, 200][(next() % 5) as usize])
                 .collect();
@@ -1166,7 +1003,6 @@ mod tests {
                     let (x0, x1) = (usize::from(run.x), usize::from(run.x + run.len));
                     assert!(run.len >= 1 && x0 >= last_end && x1 <= usize::from(w));
                     assert!(!texels.is_clear(run.value), "case {case}: a clear run");
-                    // Maximal: the neighbours differ in value.
                     if x0 > 0 {
                         assert_ne!(art.texel(x0 - 1, y), run.value, "case {case} run {k}");
                     }
@@ -1213,7 +1049,6 @@ mod tests {
                     ink: 0,
                     clip: PxRect::new(12, -100, 15, 100),
                 }),
-                // A zero-width rect contributes nothing.
                 FxItem::Rect(FxRect {
                     x: 1000,
                     y: 1000,
@@ -1293,7 +1128,6 @@ mod tests {
         assert!(!content.accepts(FxBlend::Exact));
         assert_eq!(content.items().as_ptr(), cap, "resealing keeps the Vec");
 
-        // A later ordinary edit still seals normally after the caught unwind.
         content.edit(|items, _| items.clear());
         assert!(content.items().is_empty());
         assert_eq!(content.extent(), PxRect::EMPTY);
@@ -1350,7 +1184,6 @@ mod tests {
     #[test]
     #[should_panic(expected = "past a 3-entry palette")]
     fn seal_refuses_an_index_past_the_palette() {
-        // Index 3 at ink 1 names entry 3 of a 3-entry palette.
         let _ = FxContent::new(
             vec![FxItem::Sprite(FxSprite {
                 x: 0,
@@ -1399,7 +1232,6 @@ mod tests {
     #[test]
     #[should_panic(expected = "ramps row 1 is additive at one end only")]
     fn seal_refuses_a_ramps_row_additive_at_one_end() {
-        // Row 0 is additive at both ends; row 1 adds on the left only.
         let _ = FxContent::new(
             vec![FxItem::Ramps(FxRamps {
                 x: 0,
@@ -1455,7 +1287,6 @@ mod tests {
     #[test]
     #[should_panic(expected = "fx layer 5: a Linear layer draws at Under or Over")]
     fn a_layer_refuses_linear_at_glow() {
-        // Empty content suits either blend, so only the slot rule fires.
         let _ = FxLayer::new(
             5,
             Arc::new(FxContent::default()),
@@ -1466,7 +1297,6 @@ mod tests {
     }
 
     /// The unchecked seam seals the hull and the class but refuses nothing,
-    /// so the renderers' fail-closed law can be tested.
     #[test]
     fn the_unchecked_seam_seals_without_refusing() {
         let content = FxContent::new_unchecked(

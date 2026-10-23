@@ -1,40 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The owner's debugger-access change (`docs/DESIGN-macos-debugger-access-2026-09-29.md`
-//! §3.4, §3.5, §5.1).
-//!
-//! The owner presses *Allow debugger access…* (or *Turn off debugger access…*) on
-//! Settings ▸ Security; aterm's `confirm_owner` alert states the whole-Mac scope and
-//! defaults to Cancel. On a yes the park drains the change into
-//! `App::begin_debugger_access_change`, which re-checks its gates and starts one
-//! detached `consent-devtools` worker through `ConsentGestures::run_devtools`. The
-//! worker takes the Mac-wide [`CHANGE_LOCK`], re-reads `DevToolsSecurity -status`
-//! and runs `-enable` / `-disable` unprivileged only if the read still shows the
-//! change's precondition (`aterm_containment::consent::run_devtools_change`). macOS
-//! asks for an administrator in its own dialog, which aterm never sees or answers;
-//! then aterm re-probes and reports only what it reads.
-//!
-//! THE LAUNCH ASK: once per Mac, aterm raises the same
-//! alert by itself — after the first-launch Full Disk Access and Developer Tools pages,
-//! at a quiet moment, and only to turn debugger access on where it reads off and was
-//! never seen on or turned off here ([`admit_launch_ask`]). The Mac is written into
-//! [`ASKED_RECORD`] before the alert is raised, and the owner's yes takes the same
-//! path as a press ([`DebuggerChangeLane::offer`], then the same worker).
-//!
-//! The deciding parts live here, testable without a window, process or dialog:
-//! the pure reducer [`DebuggerAccessFlow`], the worker's result slot
-//! [`ChangeSlot`] (the result never rides the wake, because an uncommitted
-//! incoming handoff drops every wake but Commit), the [`DriftWatch`], the
-//! `App`-owned [`DebuggerChangeLane`] that bundles them, [`DebuggerFacts`], and the
-//! launch ask's admission, record and queue ([`LaunchAskQueue`]).
-//!
-//! It never answers SecurityAgent, retries a change the re-probe reads unchanged,
-//! re-enables after drift, trusts an exit code, or starts a change without the
-//! owner's yes in aterm's alert — the one their press raises, or the launch ask's.
-//! No control verb, config key, environment variable or band capsule reaches it (a
-//! key can only silence the launch ask: `[privacy] notice = false`), and the two
-//! action ids sit under `MACOS_ACCESS_GESTURE_PREFIX`, which `app act` refuses.
+//! The owner's debugger-access change (`docs/DESIGN-macos-debugger-access-2026-09-29.md` §3.4, §3.5, §5.1).
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -46,40 +13,26 @@ use aterm_containment::consent::{
 };
 
 /// How often the park re-reads the shared result slot while a change is under way.
-/// The worker's wake is only a nudge; this re-read is what guarantees an exited
-/// change is read (the model's `WF(Notice)`).
 pub(crate) const RESULT_RECHECK: Duration = Duration::from_secs(5);
 
-/// The marker beside `aterm.toml` naming a change child in flight: its
-/// direction, pid, birth and when it started (design §3.4 step 3.3). A
-/// successor that finds its child still running keeps the button disabled.
+/// The marker beside `aterm.toml` naming a change child in flight.
 pub(crate) const CHANGE_MARKER: &str = "privacy-debugger-change";
 
-/// The marker beside `aterm.toml` holding the last observed mode, when aterm
-/// first saw it, and who set it (design §3.5).
+/// The marker beside `aterm.toml` holding the last observed mode, when aterm first saw it, and who set it (design §3.5).
 pub(crate) const OBSERVED_MARKER: &str = "privacy-debugger-observed";
 
-/// The Mac-wide change lock beside `aterm.toml`. Every aterm sharing the config (a
-/// successor mid-handoff, or a development build beside the installed app) takes
-/// it before its worker re-reads `-status`, holds it until the child exits, and
-/// writes or removes [`CHANGE_MARKER`] only while holding it. `flock` binds to the
-/// open file description, so a second worker in this process is refused too, and
-/// the kernel drops the lock when its holder dies.
+/// The Mac-wide change lock beside `aterm.toml`.
 pub(crate) const CHANGE_LOCK: &str = "privacy-debugger-change.lock";
 
-/// Both markers hold one short line; anything bigger is not a record this
-/// build wrote and reads as nothing.
+/// Both markers hold one short line; anything bigger is not a record this build wrote and reads as nothing.
 pub(crate) const MAX_MARKER_BYTES: usize = 96;
 
 /// Wall-clock seconds since the epoch: the markers' and the page's clock.
-/// `Instant` stops while the Mac sleeps, and a change can wait out a night.
 pub(crate) fn now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs())
 }
-
-// The markers
 
 /// The `privacy-debugger-change` record: `<on|off> <pid> <secs>.<usecs> <since>`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -91,9 +44,7 @@ pub(crate) struct ChangeMarker {
 }
 
 impl ChangeMarker {
-    /// A record for `child`, or `None` when its birth could not be read at
-    /// spawn: a successor could never prove such a child running, so a marker
-    /// naming it would only ever read as stale.
+    /// A record for `child`, or `None` when its birth could not be read at spawn.
     pub(crate) fn new(change: DebuggerChange, child: DevtoolsChild, since: u64) -> Option<Self> {
         child.birth.map(|_| Self {
             change,
@@ -145,11 +96,8 @@ impl ChangeMarker {
 /// Who set the mode an [`ObservedMarker`] records.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Origin {
-    /// The owner's change from aterm, observed by its re-probe.
     Aterm,
-    /// A transition aterm observed with no change of its own under way.
     Outside,
-    /// First sight: aterm did not see it change.
     Unknown,
 }
 
@@ -173,8 +121,6 @@ impl Origin {
 }
 
 /// The `privacy-debugger-observed` record: `<enabled|disabled> <since> <origin>`.
-/// Only the two modes a change moves between are recorded; `unrecognized` and
-/// `unknown` are not drift and write nothing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ObservedMarker {
     pub(crate) mode: DebuggerMode,
@@ -217,9 +163,6 @@ fn marker_path(config_path: &Path, name: &str) -> Option<PathBuf> {
     config_path.parent().map(|dir| dir.join(name))
 }
 
-/// Every debugger marker write in this process holds this, so the worker's
-/// change marker and the park's observed marker never interleave with a
-/// removal of the same file.
 static DEBUGGER_MARKS: Mutex<()> = Mutex::new(());
 
 fn write_debugger_marker(
@@ -248,13 +191,7 @@ fn read_debugger_marker(config_path: &Path, name: &str) -> Option<String> {
         .and_then(|path| crate::config_marker::read_marker(&path, MAX_MARKER_BYTES))
 }
 
-/// The held change lock, released by `LOCK_UN` when this drops
-/// ([`HeldAdvisoryLock`]), or by the kernel when its process dies. Not by the
-/// close alone: a child this process forks while the lock is held keeps a copy of
-/// the description until it execs, and the lock would stay taken in it. `LOCK_UN`
-/// releases the description, the child's copy included.
-///
-/// [`HeldAdvisoryLock`]: crate::native_document_host::HeldAdvisoryLock
+/// The held change lock, released by `LOCK_UN` when this drops ([`HeldAdvisoryLock`]), or by the kernel when its process dies.
 #[derive(Debug)]
 pub(crate) struct ChangeLock {
     _held: crate::native_document_host::HeldAdvisoryLock,
@@ -267,12 +204,8 @@ pub(crate) struct ChangeLock {
     expect(dead_code, reason = "only unix takes the change lock")
 )]
 pub(crate) enum LockTry {
-    /// This caller holds it now.
     Held(ChangeLock),
-    /// Another worker — in this process or another aterm — holds it.
     Busy,
-    /// The lock file could not be opened (no config directory, a planted link,
-    /// an unwritable folder): fail closed.
     Unavailable(std::io::Error),
 }
 
@@ -283,15 +216,9 @@ pub(crate) fn try_change_lock(config_path: &Path) -> LockTry {
     take_change_lock(config_path, Duration::ZERO)
 }
 
-/// How long [`take_change_lock`] waits out a busy lock: long enough for a short
-/// hold ([`settle_markers`], the records reader) here or in a peer, or a peer's
-/// forked child that still holds a copy until it execs. A real change holder,
-/// whose child waits on macOS's administrator dialog, keeps it for seconds to
-/// hours and reads `Busy`.
+/// How long [`take_change_lock`] waits out a busy lock.
 pub(crate) const CHANGE_LOCK_PATIENCE: Duration = Duration::from_secs(1);
 
-/// The patience every taker gives a busy change lock: [`CHANGE_LOCK_PATIENCE`], or a test
-/// thread's own ([`patience_for_test`]) when it holds the lock itself across the read.
 fn change_lock_patience() -> Duration {
     #[cfg(test)]
     if let Some(patience) = PATIENCE_FOR_TEST.with(std::cell::Cell::get) {
@@ -324,11 +251,7 @@ impl Drop for PatienceForTest {
     }
 }
 
-/// Take the change lock beside `config_path`, waiting out a busy lock for up to
-/// `patience` ([`acquire_advisory_lock_within`]). Worker threads only: it sleeps.
-/// The file is opened owner-only and never through a final-component link.
-///
-/// [`acquire_advisory_lock_within`]: crate::native_document_host::acquire_advisory_lock_within
+/// Take the change lock beside `config_path`, waiting out a busy lock for up to `patience` ([`acquire_advisory_lock_within`]).
 pub(crate) fn take_change_lock(config_path: &Path, patience: Duration) -> LockTry {
     let Some(path) = marker_path(config_path, CHANGE_LOCK) else {
         return LockTry::Unavailable(std::io::Error::new(
@@ -368,12 +291,7 @@ pub(crate) fn take_change_lock(config_path: &Path, patience: Duration) -> LockTr
     }
 }
 
-/// Write the observed record, then, under the change lock, remove an ended
-/// change's marker if it still names `release`'s child. In that order, a peer
-/// reading in between finds either the marker (its child dead, so the change is
-/// re-read as aterm's) or the record. A lock held past its patience may be a newer
-/// change writing its own marker: that one is left alone; the record is written
-/// regardless.
+/// Write the observed record, then, under the change lock, remove an ended change's marker if it still names `release`'s child.
 #[cfg_attr(
     any(test, debug_assertions),
     aterm_spec_anchor::refines(
@@ -388,8 +306,6 @@ pub(crate) fn settle_markers(
     release: Option<&DevtoolsChild>,
 ) {
     let lock = release.map(|_| take_change_lock(config_path, change_lock_patience()));
-    // Ordered: the next probe observes the mode again and the drift watch tells the
-    // person of any change; the marker only has to be whole or absent.
     if let Some(marker) = observed
         && let Err(error) = write_debugger_marker(
             config_path,
@@ -420,8 +336,7 @@ pub(crate) fn settle_markers(
     }
 }
 
-/// [`settle_markers`] off the UI thread (two tiny files, still disk I/O, and
-/// a lock it may wait a second for).
+/// [`settle_markers`] off the UI thread (two tiny files, still disk I/O, and a lock it may wait a second for).
 pub(crate) fn settle_markers_detached(
     config_path: PathBuf,
     observed: Option<ObservedMarker>,
@@ -431,7 +346,6 @@ pub(crate) fn settle_markers_detached(
         "aterm-debugger-marker",
         crate::qos::Role::Background,
         move || {
-            // Background: it takes no lock the UI thread contends (only this
             // module's own marker mutex and the change lock).
             settle_markers(&config_path, observed, release.as_ref());
         },
@@ -446,31 +360,15 @@ pub(crate) fn settle_markers_detached(
 pub(crate) struct RecordsRead {
     /// A predecessor's change child, still running.
     pub(crate) inherited: Option<ChangeMarker>,
-    /// A change marker naming a child that is gone, whose change was never judged
-    /// (aterm quit before the re-probe, or a peer sits between taking its result
-    /// and recording its re-probe). Left on disk: the lane re-reads the change as
-    /// aterm's own, so the re-probe is attributed to aterm, and removes the marker
-    /// once that re-probe is recorded ([`DebuggerChangeLane::poll`]).
+    /// A change marker naming a child that is gone, whose change was never judged (aterm quit before the re-probe, or a peer sits between taking its result and recording its re-probe).
     pub(crate) stale: Option<ChangeMarker>,
     /// The last observed mode.
     pub(crate) observed: Option<ObservedMarker>,
-    /// No change marker, but the change lock was held past its patience: a worker
-    /// sits between its `-status` re-read and its spawn (the marker is written once
-    /// the child starts), or holds a child whose birth it could not record. This
-    /// read settles nothing; the lane reads again after [`RESULT_RECHECK`].
+    /// No change marker, but the change lock was held past its patience.
     pub(crate) unsettled: bool,
 }
 
-/// Read both markers, off the UI thread, judging a change marker's child by pid
-/// and birth (`alive`), since a pid may be reused. A stale marker is reported and
-/// left for the lane ([`RecordsRead::stale`]); only an unparsable one is removed
-/// here, under the change lock and only if it still reads the same. A missing
-/// marker means nothing is in flight only under the lock (workers write it while
-/// holding the lock), so a lock held with no marker is [`RecordsRead::unsettled`].
-///
-/// The change marker is read before the observed record: [`settle_markers`]
-/// writes the record before it removes the marker, so a read that finds no marker
-/// finds the record that change left.
+/// Read both markers, off the UI thread, judging a change marker's child by pid and birth (`alive`), since a pid may be reused.
 #[cfg_attr(
     any(test, debug_assertions),
     aterm_spec_anchor::refines(
@@ -491,23 +389,17 @@ pub(crate) fn read_records(config_path: &Path, alive: fn(&DevtoolsChild) -> bool
     let mut read = RecordsRead::default();
     let change = match read_debugger_marker(config_path, CHANGE_MARKER) {
         Some(text) => Some(text),
-        // No lock file: no worker ever took it here (a launch does not create
-        // one), so none holds it now.
         None if !marker_path(config_path, CHANGE_LOCK)
             .is_some_and(|path| path.symlink_metadata().is_ok()) =>
         {
             None
         }
         None => match take_change_lock(config_path, change_lock_patience()) {
-            // A marker written between the read above and the lock was written
-            // by a worker that has let go since: judge it like any other.
             LockTry::Held(_lock) => read_debugger_marker(config_path, CHANGE_MARKER),
             LockTry::Busy => {
                 read.unsettled = true;
                 return read;
             }
-            // No lock to read under is no lock a worker could take either: it
-            // refuses to start without one (`WorkerRefusal::NoLock`).
             LockTry::Unavailable(_) => None,
         },
     };
@@ -526,7 +418,6 @@ pub(crate) fn read_records(config_path: &Path, alive: fn(&DevtoolsChild) -> bool
                         );
                     }
                 }
-                // A newer change holds the lock and overwrites it.
                 LockTry::Busy => {}
                 LockTry::Unavailable(error) => {
                     aterm_log::warn!(
@@ -541,8 +432,7 @@ pub(crate) fn read_records(config_path: &Path, alive: fn(&DevtoolsChild) -> bool
     read
 }
 
-/// Start the one records reader. `false` when its thread could not start (the
-/// park then settles on "no records" rather than waiting forever).
+/// Start the one records reader.
 pub(crate) fn spawn_records_reader(
     config_path: PathBuf,
     into: Arc<Mutex<Option<RecordsRead>>>,
@@ -553,8 +443,6 @@ pub(crate) fn spawn_records_reader(
         "aterm-debugger-records",
         crate::qos::Role::Responsive,
         move || {
-            // Responsive, not Background: it publishes under a mutex the UI
-            // thread's park takes.
             let read = read_records(&config_path, alive);
             *into.lock().unwrap_or_else(|p| p.into_inner()) = Some(read);
             wake();
@@ -563,55 +451,30 @@ pub(crate) fn spawn_records_reader(
     .is_ok()
 }
 
-// The reducer
-
-/// Where the owner's change stands. The numbers are the model's `phase`.
+/// Where the owner's change stands.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Phase {
-    /// Nothing under way (0).
     Idle,
-    /// aterm's alert is up for this change (1).
     Confirming(DebuggerChange),
-    /// The owner said yes; the worker is re-reading `-status` (2). The model's
-    /// phase 3 (the re-read showed the precondition) lives inside the worker,
-    /// between the re-read and the spawn.
     Rechecking(DebuggerChange),
-    /// The child is in flight (4): macOS's dialog may be up, for hours.
-    /// `inherited` is a predecessor's child, read from its marker.
     InFlight {
         change: DebuggerChange,
         child: DevtoolsChild,
         since: u64,
         inherited: bool,
     },
-    /// The child exited, or its result was lost (5): only a fresh probe says
-    /// what the rule is now.
     Exited(DebuggerChange),
 }
 
-/// What a change came to. Only the re-probe decides it; an exit code never
-/// does.
+/// What a change came to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Outcome {
-    /// The re-probe reads the change's target.
     Changed(DebuggerChange),
-    /// The re-probe reads the precondition still: Cancel in macOS's dialog, a
-    /// wrong password, or a write that failed. Counted as a decline, never
-    /// retried.
     NotChanged(DebuggerChange),
-    /// The re-probe reads a rule Apple's tool does not recognise.
     Unrecognized(DebuggerChange),
-    /// The re-probe gave no answer (refused, failed, timed out).
     Unobserved(DebuggerChange),
-    /// The worker's fresh re-read no longer showed the precondition, so
-    /// nothing was spawned; it read this.
     NotDue(DebuggerChange, DebuggerMode),
-    /// No child was started: the tool is absent, could not be spawned, the
-    /// change lock could not be opened, or the worker ended before it got that
-    /// far.
     NotStarted(DebuggerChange),
-    /// Another aterm's change holds the change lock: nothing was read or
-    /// spawned here.
     PeerInFlight(DebuggerChange),
 }
 
@@ -622,25 +485,17 @@ impl Outcome {
     }
 }
 
-/// Why a press, or the host's start of a confirmed one, did nothing — in the
-/// owner's words, for "Nothing was changed: {why}.".
+/// Why a press, or the host's start of a confirmed one, did nothing — in the owner's words, for "Nothing was changed: {why}.".
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Refusal {
     NoWindow,
     NotMacos,
     PrivacyOff,
-    /// A predecessor may have a change in flight, and its marker is unread.
     RecordsUnread,
-    /// A change child is in flight (this process's or a predecessor's).
     InFlight,
-    /// The owner did not say yes in aterm's alert.
     NotConfirmed,
-    /// The alert is up, the worker is re-reading, or the last change's result
-    /// has not been re-read yet.
     Busy,
-    /// The cached probe does not show the change's precondition.
     State(DebuggerChange, DebuggerMode),
-    /// Its worker could not start.
     CouldNotStart,
 }
 
@@ -668,29 +523,17 @@ impl Refusal {
 /// How the owner answered aterm's alert, as the reducer took it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Answer {
-    /// No alert was up: nothing changed.
     NotAsked,
-    /// Cancel, or nobody could be asked: nothing is spawned.
     Declined,
-    /// "Allow…" / "Turn Off…": the worker may re-read and spawn.
     Consented,
 }
 
-/// The reducer. Pure: it performs nothing, reads no clock and asks no OS; the
-/// host feeds it what happened and does what it allows. Its refusals are the
-/// model's guards. Nothing here reads aterm's own hardening: an unhardened aterm
-/// offers the gesture too, and the alert says what that exposes.
+/// The reducer.
 #[derive(Clone, Debug)]
 pub(crate) struct DebuggerAccessFlow {
     phase: Phase,
-    /// Whether a predecessor's change marker has been read (or there was
-    /// nothing to read). Until then a press is refused: the predecessor's
-    /// child may still have macOS's dialog up.
     records_read: bool,
-    /// The last completed probe this reducer was handed. `Unknown` is "not
-    /// read". What a surface says comes from here, never from an exit code.
     observed: DebuggerMode,
-    /// The change the projection normalises by: the last one pressed.
     direction: DebuggerChange,
     last: Option<Outcome>,
 }
@@ -735,8 +578,7 @@ impl DebuggerAccessFlow {
         self.records_read
     }
 
-    /// Anything under way, or the predecessor's records unread: the buttons
-    /// are disabled.
+    /// Anything under way, or the predecessor's records unread: the buttons are disabled.
     pub(crate) fn busy(&self) -> bool {
         !self.records_read || self.phase != Phase::Idle
     }
@@ -754,12 +596,7 @@ impl DebuggerAccessFlow {
         }
     }
 
-    /// The shared records were read, at launch or again mid-session. `inherited`
-    /// is a change child proven running by pid and birth (a predecessor's or a
-    /// peer's): the change is in flight here too. `stale` is a change whose child
-    /// is gone and whose re-probe nobody recorded: a fresh probe ends it as this
-    /// aterm's change. `true` when `stale` was taken; a flow with something under
-    /// way takes neither.
+    /// The shared records were read, at launch or again mid-session.
     pub(crate) fn on_records(
         &mut self,
         inherited: Option<ChangeMarker>,
@@ -785,16 +622,12 @@ impl DebuggerAccessFlow {
         false
     }
 
-    /// Whether a probe is taken now: idle, or after the child exited (the
-    /// model's `Probe` guard). While the alert is up, the worker re-reads or
-    /// the child is in flight, the page's cached reads are not this flow's.
+    /// Whether a probe is taken now: idle, or after the child exited (the model's `Probe` guard).
     pub(crate) fn accepts_probe(&self) -> bool {
         matches!(self.phase, Phase::Idle | Phase::Exited(_))
     }
 
-    /// A completed probe. After an exit it ends the change and says what it
-    /// came to; idle, it only refreshes what the next press is checked
-    /// against. A pending probe is no probe.
+    /// A completed probe.
     pub(crate) fn on_probe(&mut self, probe: DebuggerProbe) -> Option<Outcome> {
         if probe.label == DebuggerProbeLabel::Pending || !self.accepts_probe() {
             return None;
@@ -814,9 +647,7 @@ impl DebuggerAccessFlow {
         Some(outcome)
     }
 
-    /// Why a press of `change` would be refused now, taking nothing: what
-    /// [`Self::on_press`] checks, for the launch ask, which writes its record
-    /// only where the press it stands for would be taken.
+    /// Why a press of `change` would be refused now, taking nothing.
     pub(crate) fn press_refusal(&self, change: DebuggerChange) -> Option<Refusal> {
         if !self.records_read {
             return Some(Refusal::RecordsUnread);
@@ -829,9 +660,7 @@ impl DebuggerAccessFlow {
         (self.observed != change.precondition()).then_some(Refusal::State(change, self.observed))
     }
 
-    /// The owner pressed the button for `change`. Refused unless the
-    /// predecessor's records are read, nothing is under way, and the last probe
-    /// shows the change's precondition. Never refused for aterm's own hardening.
+    /// The owner pressed the button for `change`.
     pub(crate) fn on_press(&mut self, change: DebuggerChange) -> Result<(), Refusal> {
         if let Some(refusal) = self.press_refusal(change) {
             return Err(refusal);
@@ -841,8 +670,7 @@ impl DebuggerAccessFlow {
         Ok(())
     }
 
-    /// The owner's answer in aterm's alert. `None` — no alert could be shown
-    /// — is not a yes.
+    /// The owner's answer in aterm's alert.
     pub(crate) fn on_owner_answer(&mut self, answer: Option<bool>) -> Answer {
         let Phase::Confirming(change) = self.phase else {
             return Answer::NotAsked;
@@ -870,8 +698,7 @@ impl DebuggerAccessFlow {
         true
     }
 
-    /// The worker's re-read did not show the precondition: nothing was spawned,
-    /// and what it read is the flow's observation now.
+    /// The worker's re-read did not show the precondition: nothing was spawned, and what it read is the flow's observation now.
     pub(crate) fn on_not_due(&mut self, observed: DebuggerProbe) -> Option<Outcome> {
         let Phase::Rechecking(change) = self.phase else {
             return None;
@@ -883,8 +710,7 @@ impl DebuggerAccessFlow {
         Some(outcome)
     }
 
-    /// Another aterm holds the change lock: nothing was read or spawned for
-    /// the change being re-checked.
+    /// Another aterm holds the change lock: nothing was read or spawned for the change being re-checked.
     pub(crate) fn on_peer_busy(&mut self) -> Option<Outcome> {
         let Phase::Rechecking(change) = self.phase else {
             return None;
@@ -906,9 +732,7 @@ impl DebuggerAccessFlow {
         Some(outcome)
     }
 
-    /// The park took the exited child's result, or the child is gone with none
-    /// (lost). Either way only a fresh probe says what happened, so the model's
-    /// three exits are all taken the same way.
+    /// The park took the exited child's result, or the child is gone with none (lost).
     pub(crate) fn on_child_exit(&mut self) -> bool {
         let Phase::InFlight { change, .. } = self.phase else {
             return false;
@@ -919,7 +743,6 @@ impl DebuggerAccessFlow {
 }
 
 /// What the host's start re-checks besides the reducer (design §3.4 step 2).
-/// `self_hardened` is carried so the refusal table can be pinned; it is not a gate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct BeginInputs {
     pub(crate) windowed: bool,
@@ -942,15 +765,10 @@ pub(crate) const fn admit_begin(inputs: BeginInputs) -> Result<(), Refusal> {
     Ok(())
 }
 
-// The shared result slot and the worker
-
 /// Why a worker ran nothing at all.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum WorkerRefusal {
-    /// Another worker — another aterm's, or a second one here — holds the
-    /// change lock, or the change marker names a child still running.
     PeerChanging,
-    /// The change lock could not be opened: fail closed.
     NoLock,
 }
 
@@ -960,14 +778,10 @@ struct SlotInner {
     spawned: Option<DevtoolsChild>,
     result: Option<DevtoolsChangeRun>,
     refused: Option<WorkerRefusal>,
-    /// The worker for `job` has ended (normally or not): a result it never
-    /// published is lost.
     gone: bool,
 }
 
-/// The shared result slot (design §3.4 step 3.5). The worker publishes the
-/// child as soon as it starts and the result when it exits; the park reads
-/// both. Keyed by job, so a late publication from an older job is dropped.
+/// The shared result slot (design §3.4 step 3.5).
 #[derive(Debug, Default)]
 pub(crate) struct ChangeSlot {
     inner: Mutex<SlotInner>,
@@ -1016,8 +830,7 @@ impl ChangeSlot {
         }
     }
 
-    /// Whether `job`'s worker has ended with something the park has not
-    /// taken yet (the model's phase 5 when a child ran). Reads, takes nothing.
+    /// Whether `job`'s worker has ended with something the park has not taken yet (the model's phase 5 when a child ran).
     #[cfg(test)]
     pub(crate) fn unread(&self, job: u64) -> bool {
         let inner = self.lock();
@@ -1031,8 +844,7 @@ impl ChangeSlot {
         }
     }
 
-    /// Take what the worker published for `job` since the last read. `gone`
-    /// stays set.
+    /// Take what the worker published for `job` since the last read.
     pub(crate) fn take(&self, job: u64) -> SlotRead {
         let mut inner = self.lock();
         if inner.job != job {
@@ -1047,15 +859,7 @@ impl ChangeSlot {
     }
 }
 
-/// One confirmed change: the direction, its job number and the owner's yes. Only
-/// [`DebuggerChangeLane::begin`] mints one (for a press, or inside
-/// [`DebuggerChangeLane::offer`] for the launch ask), on an [`OwnerAnswer::Yes`]
-/// whose [`OwnerYes`] only `native_settings::owner_confirms_with` mints, after
-/// aterm's alert, so a [`DevtoolsJob`] and its `DevToolsSecurity` worker exist only
-/// after the owner's yes in that alert. Not `Clone`: one yes, one job.
-///
-/// [`OwnerAnswer::Yes`]: crate::native_settings::OwnerAnswer::Yes
-/// [`OwnerYes`]: crate::native_settings::OwnerYes
+/// One confirmed change: the direction, its job number and the owner's yes.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct ChangeTicket {
     change: DebuggerChange,
@@ -1081,32 +885,19 @@ impl ChangeTicket {
     }
 }
 
-/// Everything the worker needs, handed through `ConsentGestures::run_devtools`
-/// (a plain function pointer, so the job carries its captures). Its fields are
-/// private and [`Self::new`] takes a [`ChangeTicket`], so no job — and no
-/// worker — exists without the owner's yes.
+/// Everything the worker needs, handed through `ConsentGestures::run_devtools` (a plain function pointer, so the job carries its captures).
 pub(crate) struct DevtoolsJob {
     change: DebuggerChange,
-    /// `[privacy] enabled && check`: the worker's re-read goes through it.
     gate: ProbeGate,
     job: u64,
     slot: Arc<ChangeSlot>,
-    /// The `aterm.toml` beside which the change lock is taken and the change
-    /// marker written. `None` on an instance with no config location: it has
-    /// neither, so nothing beyond this process's own reducer keeps a second
-    /// child out.
     config_path: Option<PathBuf>,
-    /// The nudge (`Wake::DebuggerAccessResult`). The result is in `slot`.
     wake: Arc<dyn Fn() + Send + Sync>,
-    /// The lane's liveness check (pid and birth): a change marker naming a child
-    /// it proves running is a change in flight on this Mac, and the worker runs
-    /// nothing over it.
     alive: fn(&DevtoolsChild) -> bool,
 }
 
 impl DevtoolsJob {
-    /// The job for one confirmed change; `ticket` carries the direction, the
-    /// job number and the owner's yes.
+    /// The job for one confirmed change; `ticket` carries the direction, the job number and the owner's yes.
     pub(crate) fn new(
         ticket: ChangeTicket,
         gate: ProbeGate,
@@ -1140,36 +931,27 @@ impl std::fmt::Debug for DevtoolsJob {
 /// What `ConsentGestures::run_devtools` did.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DevtoolsSpawn {
-    /// The detached worker is running.
     Started,
-    /// The inert arm: nothing was started.
     Inert,
-    /// The worker thread could not start: nothing ran.
     SpawnFailed,
 }
 
-/// The inert arm: a headless instance and every unit test. Starts nothing.
+/// The inert arm: a headless instance and every unit test.
 pub(crate) fn inert_run_devtools(_job: DevtoolsJob) -> DevtoolsSpawn {
     DevtoolsSpawn::Inert
 }
 
-/// The live arm: one detached `consent-devtools` worker whose handle is dropped;
-/// it may wait hours on macOS's dialog, so nothing may join it. Never called
-/// from a test.
+/// The live arm: one detached `consent-devtools` worker whose handle is dropped.
 pub(crate) fn spawn_devtools_worker(job: DevtoolsJob) -> DevtoolsSpawn {
     let spawned = crate::qos::spawn_lane_thread(
         "consent-devtools",
         crate::qos::Role::Responsive,
         move || {
-            // Responsive: it publishes into the result slot under the mutex the
-            // UI thread's park reads; it spends nearly all its life waiting on
-            // one child.
             run_devtools_job(job, |change, gate, on_spawn| {
                 aterm_containment::consent::run_devtools_change(change, gate, on_spawn)
             });
         },
     );
-    // Detached on purpose: the handle is never stored.
     match spawned {
         Ok(_handle) => DevtoolsSpawn::Started,
         Err(error) => {
@@ -1179,8 +961,6 @@ pub(crate) fn spawn_devtools_worker(job: DevtoolsJob) -> DevtoolsSpawn {
     }
 }
 
-/// Sets `gone` and posts the one nudge when the worker ends, however it ends:
-/// a worker that panics still tells the park its result is lost.
 struct WorkerGone {
     slot: Arc<ChangeSlot>,
     job: u64,
@@ -1194,14 +974,7 @@ impl Drop for WorkerGone {
     }
 }
 
-/// The worker's body, with the change runner injected (live:
-/// `aterm_containment::consent::run_devtools_change`; the Tier-1 bind uses
-/// `devtools_change_with_for_test` with a scripted read and a stand-in child).
-/// It takes the change lock first (a lock held elsewhere runs nothing), publishes
-/// the child the moment it starts and writes the change marker, publishes the
-/// result when the child exits, releases the lock, and through [`WorkerGone`] sets
-/// `gone` and posts the nudge. The marker stays until the park has re-probed and
-/// recorded the result ([`LaneStep::remove_change_marker`]).
+/// The worker's body, with the change runner injected (live: `aterm_containment::consent::run_devtools_change`; the Tier-1 bind uses `devtools_change_with_for_test` with a scripted read and a stand-in child).
 #[cfg_attr(
     any(test, debug_assertions),
     aterm_spec_anchor::refines(
@@ -1254,10 +1027,6 @@ where
     let (change, id) = (job.change, job.job);
     let config_path = job.config_path.as_deref();
     let (slot, wake) = (&job.slot, &job.wake);
-    // Held through the re-read, the spawn and the wait, and released before the
-    // result is published: the park that takes the result removes the change
-    // marker after its re-probe and must find the lock free, or the stale marker
-    // outlives the change.
     let lock = match config_path.map(|path| take_change_lock(path, change_lock_patience())) {
         None => None,
         Some(LockTry::Held(lock)) => Some(lock),
@@ -1271,8 +1040,6 @@ where
             return;
         }
     };
-    // A holder that died while its child waited left the lock free but the child
-    // running; its marker still names that child, so a second child is refused.
     if let Some(path) = config_path
         && read_debugger_marker(path, CHANGE_MARKER)
             .and_then(|text| ChangeMarker::parse(&text))
@@ -1304,7 +1071,6 @@ where
                 }
                 (None, _) => {}
             }
-            // The child is in flight: the page disables its button now.
             wake();
         }),
     );
@@ -1312,21 +1078,12 @@ where
     slot.publish_result(id, result);
 }
 
-// Drift and the records (§3.5, §3.8)
-
-/// The `LogOnly` records of design §3.8, as a fact; the words are
-/// `message_reporters::debugger_access_record`'s.
+/// The `LogOnly` records of design §3.8, as a fact; the words are `message_reporters::debugger_access_record`'s.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DebuggerRecord {
-    /// Observed on after this process's change.
     On,
-    /// Observed on with no change of aterm's under way.
     OnOutside,
-    /// Observed off after this process's change.
     Off,
-    /// Was observed on; a probe reads it off now, and aterm did not turn it
-    /// off. The cause is not named: a macOS upgrade, an administrator and
-    /// `-disable` all look the same.
     WasOnNowOff,
 }
 
@@ -1338,27 +1095,12 @@ pub(crate) struct DriftStep {
     pub(crate) write: Option<ObservedMarker>,
 }
 
-/// The observed-mode record and drift (design §3.5). It acts only on the two
-/// modes a change moves between; `unrecognized` and `unknown` are not drift. It
-/// never re-enables anything.
-///
-/// The record is shared by every aterm on this config, and a peer records its own
-/// changes. So a mode this process did not change is judged against the marker as
-/// it is on disk now, never this process's copy: the watch un-seeds, keeps the
-/// mode, and the lane reads the records again ([`DebuggerChangeLane::poll`]), so a
-/// peer's change is neither re-filed as outside or drift nor overwritten.
+/// The observed-mode record and drift (design §3.5).
 #[derive(Clone, Debug, Default)]
 pub(crate) struct DriftWatch {
-    /// The observed marker has been read (or there was none to read), and no
-    /// mode seen since waits to be judged against a fresh read.
     seeded: bool,
-    /// The last recorded mode: from disk, then from this process's writes.
     recorded: Option<ObservedMarker>,
-    /// The latest mode seen while unseeded, with this process's change when
-    /// that probe was the re-probe that ended it.
     early: Option<(DebuggerMode, Option<DebuggerChange>)>,
-    /// While the page should say "Was allowed (<date>); it is off now": when
-    /// it was first seen allowed.
     drift_since: Option<u64>,
 }
 
@@ -1371,16 +1113,12 @@ impl DriftWatch {
         self.drift_since
     }
 
-    /// Whether the watch judges now; `false` until the marker is read, and
-    /// again while a mode waits for a fresh read of it.
+    /// Whether the watch judges now; `false` until the marker is read, and again while a mode waits for a fresh read of it.
     pub(crate) const fn seeded(&self) -> bool {
         self.seeded
     }
 
-    /// The marker was read. A mode seen before then is judged against it now,
-    /// unless the same read put a change under way and the mode carries no
-    /// attribution: that early probe may predate the change's end, so it is
-    /// dropped and the re-probe that ends the change is judged, as aterm's.
+    /// The marker was read.
     pub(crate) fn seed(
         &mut self,
         recorded: Option<ObservedMarker>,
@@ -1400,10 +1138,7 @@ impl DriftWatch {
         }
     }
 
-    /// One completed probe's mode. `attributed` is this process's change, when
-    /// the probe is the re-probe that ended it. A mode the record does not
-    /// hold that this process did not set waits, unseeded, for a fresh read of
-    /// the shared marker (see the type's doc).
+    /// One completed probe's mode.
     pub(crate) fn on_observed(
         &mut self,
         mode: DebuggerMode,
@@ -1416,7 +1151,6 @@ impl DriftWatch {
         let ours = attributed.is_some_and(|change| change.target() == mode);
         let transition = self.recorded.map(|m| m.mode) != Some(mode);
         if !self.seeded || (transition && !ours) {
-            // A re-probe's attribution survives a later read of the same mode.
             let kept = self
                 .early
                 .and_then(|(seen, change)| change.filter(|_| seen == mode));
@@ -1427,7 +1161,6 @@ impl DriftWatch {
         self.judge(mode, attributed, now)
     }
 
-    /// Judge `mode` against the record held now.
     fn judge(
         &mut self,
         mode: DebuggerMode,
@@ -1482,17 +1215,12 @@ impl DriftWatch {
     }
 }
 
-// The lane: what `App` owns
-
 /// What one poll or observation asks the host to do.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct LaneStep {
     /// Retire the cached probe: the rule may have changed under it.
     pub(crate) invalidate_probe: bool,
-    /// The change marker naming this child may go: the change it names has
-    /// ended, its re-probe has been judged, and the observed record that
-    /// judgment writes (`drift.write`, here or in an earlier step) goes to
-    /// disk first ([`settle_markers`]). Removed only if it still names it.
+    /// The change marker naming this child may go.
     pub(crate) remove_change_marker: Option<DevtoolsChild>,
     pub(crate) outcome: Option<Outcome>,
     pub(crate) drift: DriftStep,
@@ -1508,40 +1236,19 @@ impl LaneStep {
     }
 }
 
-/// The `App`-owned lane: the reducer, the shared result slot, the records
-/// reader's answer and the drift watch. Pure apart from the liveness check it
-/// was built with (`DevtoolsChild::is_running` for a windowed instance; a
-/// headless one never has a child to ask about).
+/// The `App`-owned lane: the reducer, the shared result slot, the records reader's answer and the drift watch.
 pub(crate) struct DebuggerChangeLane {
     flow: DebuggerAccessFlow,
     slot: Arc<ChangeSlot>,
     job: u64,
-    /// The current job's result has been taken.
     job_done: bool,
-    /// The current job's child, once the park has read it from the slot.
     child: Option<DevtoolsChild>,
-    /// The child of the change that exited and waits to be judged: this
-    /// process's own, an inherited one, or one a stale marker named. Its marker
-    /// stays on disk until the re-probe is judged and the observed record written,
-    /// so a peer re-reading in between re-reads the change as aterm's rather than
-    /// filing it as set outside aterm.
     settling: Option<DevtoolsChild>,
-    /// The last child whose marker this lane let go. Its removal runs on
-    /// another thread, so a records read can still find that marker; the
-    /// lane follows it and never adopts its own finished change twice.
     released: Option<DevtoolsChild>,
-    /// Whether this instance has a window to change anything from. The App's
-    /// park and deadline consult this, not `App::headless`, so a test can
-    /// drive the park's fairness site on a headless `App`.
     windowed: bool,
     records: Arc<Mutex<Option<RecordsRead>>>,
-    /// A records read was ever asked for.
     records_asked: bool,
-    /// A records read is out: asked for, and not yet taken by [`Self::poll`].
     records_out: bool,
-    /// Another read is wanted from this wall second: an unsettled read is
-    /// read again after [`RESULT_RECHECK`], and a mode the drift watch must
-    /// judge against the shared record at once.
     records_again_at: Option<u64>,
     alive: fn(&DevtoolsChild) -> bool,
     drift: DriftWatch,
@@ -1557,14 +1264,12 @@ impl std::fmt::Debug for DebuggerChangeLane {
     }
 }
 
-/// A headless instance's liveness answer: it has no child to ask about.
 const fn never_alive(_child: &DevtoolsChild) -> bool {
     false
 }
 
 impl DebuggerChangeLane {
-    /// A windowed instance reads liveness by pid and birth; a headless one
-    /// never has a change child, and asks nothing.
+    /// A windowed instance reads liveness by pid and birth; a headless one never has a change child, and asks nothing.
     pub(crate) fn new(headless: bool) -> Self {
         let mut lane = Self::with_liveness(if headless {
             never_alive
@@ -1575,8 +1280,7 @@ impl DebuggerChangeLane {
         lane
     }
 
-    /// A windowed lane with an injected liveness check (the successor's
-    /// pid-and-birth read); tests pass a stand-in.
+    /// A windowed lane with an injected liveness check (the successor's pid-and-birth read); tests pass a stand-in.
     pub(crate) fn with_liveness(alive: fn(&DevtoolsChild) -> bool) -> Self {
         Self {
             flow: DebuggerAccessFlow::new(),
@@ -1611,9 +1315,7 @@ impl DebuggerChangeLane {
         self.windowed
     }
 
-    /// Whether the park would find something unread: the current job's worker
-    /// ended with its result, refusal or loss still in the slot, or a
-    /// predecessor's child is gone. The model's phase 5 when a child ran.
+    /// Whether the park would find something unread.
     #[cfg(test)]
     pub(crate) fn result_unread(&self) -> bool {
         (!self.job_done && self.slot.unread(self.job))
@@ -1628,15 +1330,13 @@ impl DebuggerChangeLane {
         self.records_asked
     }
 
-    /// Whether the park starts a records reader now: none is out, and this is
-    /// the first read or a read again is due (`now_wall` in wall seconds).
+    /// Whether the park starts a records reader now.
     pub(crate) fn records_due(&self, now_wall: u64) -> bool {
         !self.records_out
             && (!self.records_asked || self.records_again_at.is_some_and(|at| now_wall >= at))
     }
 
-    /// The records reader was started, or there is nothing to read: the slot
-    /// it publishes into.
+    /// The records reader was started, or there is nothing to read: the slot it publishes into.
     pub(crate) fn ask_records(&mut self) -> Arc<Mutex<Option<RecordsRead>>> {
         self.records_asked = true;
         self.records_out = true;
@@ -1644,20 +1344,17 @@ impl DebuggerChangeLane {
         Arc::clone(&self.records)
     }
 
-    /// Settle the records without a reader: no marker location (headless,
-    /// tests), or its thread could not start.
+    /// Settle the records without a reader: no marker location (headless, tests), or its thread could not start.
     pub(crate) fn settle_records(&mut self, read: RecordsRead) {
         *self.ask_records().lock().unwrap_or_else(|p| p.into_inner()) = Some(read);
     }
 
-    /// Record why the last confirmed change — a press, or the launch ask's yes —
-    /// started nothing (the page shows it until the next one starts).
+    /// Record why the last confirmed change.
     pub(crate) fn note_refusal(&mut self, refusal: Option<Refusal>) {
         self.refusal = refusal;
     }
 
-    /// Whether the park must keep re-reading: a change under way, or the
-    /// records asked for and not yet read.
+    /// Whether the park must keep re-reading: a change under way, or the records asked for and not yet read.
     pub(crate) fn needs_poll(&self) -> bool {
         (self.records_asked && !self.flow.records_read())
             || matches!(
@@ -1666,15 +1363,12 @@ impl DebuggerChangeLane {
             )
     }
 
-    /// Whether the park calls [`Self::poll`]: [`Self::needs_poll`] (the
-    /// model's `polling`), or a records read out or wanted — also a re-read
-    /// the drift watch asked for with nothing under way.
+    /// Whether the park calls [`Self::poll`]: [`Self::needs_poll`] (the model's `polling`), or a records read out or wanted.
     pub(crate) fn wants_poll(&self) -> bool {
         self.needs_poll() || self.records_out || self.records_again_at.is_some()
     }
 
-    /// The park's deadline for [`Self::poll`]: [`RESULT_RECHECK`] while it is
-    /// wanted, nothing otherwise (an idle lane never wakes the loop).
+    /// The park's deadline for [`Self::poll`].
     pub(crate) fn next_deadline(&self, now: Instant) -> Option<Instant> {
         self.wants_poll().then(|| now + RESULT_RECHECK)
     }
@@ -1689,19 +1383,12 @@ impl DebuggerChangeLane {
         self.flow.records_read()
     }
 
-    /// Whether a change is under way: aterm's alert, the worker's re-read, a
-    /// child in flight (this process's or an inherited one, whose macOS dialog
-    /// may be up), or the re-probe that ends it.
+    /// Whether a change is under way.
     pub(crate) fn under_way(&self) -> bool {
         self.flow.phase() != Phase::Idle
     }
 
-    /// The owner's press and their answer in aterm's alert (`menu::confirm_owner`,
-    /// which only the owner's press and the once-per-Mac launch ask reach, the
-    /// latter through [`Self::offer`]), and on a yes only, a new job armed in the
-    /// slot. The press is refused unless the records are read, nothing is under
-    /// way and the last probe shows the precondition. `Err` names why nothing may
-    /// start.
+    /// The owner's press and their answer in aterm's alert (`menu::confirm_owner`, which only the owner's press and the once-per-Mac launch ask reach, the latter through [`Self::offer`]), and on a yes only, a new job armed in the slot.
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -1765,9 +1452,7 @@ impl DebuggerChangeLane {
         }
     }
 
-    /// One park re-read (design §3.4 steps 4 and 6): the worker's slot, then the
-    /// records, then a predecessor's child's liveness. It takes an exited child's
-    /// result whether or not its wake arrived (the model's weakly fair `Notice`).
+    /// One park re-read (design §3.4 steps 4 and 6): the worker's slot, then the records, then a predecessor's child's liveness.
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -1802,10 +1487,6 @@ impl DebuggerChangeLane {
     )]
     pub(crate) fn poll(&mut self, now_wall: u64) -> LaneStep {
         let mut step = LaneStep::default();
-        // The records read is taken before the worker's slot and handled after it.
-        // A read names a marker its worker wrote after `publish_spawned`, so the
-        // slot take then holds that child, and the job's own child is followed by
-        // the time the read is judged, never taken for a peer's.
         let records_read = if self.records_out {
             self.records
                 .lock()
@@ -1849,9 +1530,6 @@ impl DebuggerChangeLane {
                     step.outcome = self.flow.on_not_started();
                 }
                 (None, None) if read.gone => {
-                    // The worker ended with no result: lost. A child it
-                    // started is re-read by probe; one it never started ran
-                    // nothing.
                     self.job_done = true;
                     step.invalidate_probe = true;
                     self.settling = self.child.take();
@@ -1865,13 +1543,9 @@ impl DebuggerChangeLane {
         if let Some(read) = records_read {
             self.records_out = false;
             if read.unsettled {
-                // A worker holds the lock with no marker yet: read again
                 // once it has written one, or let go.
                 self.records_again_at = Some(now_wall.saturating_add(RESULT_RECHECK.as_secs()));
             } else {
-                // A marker naming a child this lane already follows — in
-                // flight, its result not yet taken, or kept until its
-                // change is recorded — is not a change to re-read.
                 let stale = read.stale.filter(|m| !self.follows(&m.child));
                 if self
                     .flow
@@ -1879,7 +1553,6 @@ impl DebuggerChangeLane {
                 {
                     self.settling = stale.map(|m| m.child);
                 } else {
-                    // Something is under way here: nobody re-reads that
                     // change, so its dead marker goes now.
                     step.remove_change_marker = stale.map(|m| m.child);
                 }
@@ -1894,8 +1567,6 @@ impl DebuggerChangeLane {
         if let Some((_, child, _, true)) = self.flow.in_flight()
             && !(self.alive)(&child)
         {
-            // A predecessor's child exited: its worker died with that
-            // process, so nothing will publish its result. Read the rule.
             self.flow.on_child_exit();
             step.invalidate_probe = true;
             self.settling = Some(child);
@@ -1904,9 +1575,7 @@ impl DebuggerChangeLane {
         step
     }
 
-    /// A completed probe (the cached `ConsentState::debugger` answer). Ends an exited
-    /// change and feeds the drift watch; while a change is under way the drift
-    /// watch waits for the re-probe that can attribute it.
+    /// A completed probe (the cached `ConsentState::debugger` answer).
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -1944,14 +1613,10 @@ impl DebuggerChangeLane {
         step
     }
 
-    /// Whether `child` is one this lane already follows: the current job's, the
-    /// flow's in flight (a predecessor's included), the settling one, or the one
-    /// last released.
     fn follows(&self, child: &DevtoolsChild) -> bool {
         self.followed().contains(&Some(*child))
     }
 
-    /// The children [`Self::follows`] names.
     fn followed(&self) -> [Option<DevtoolsChild>; 4] {
         [
             self.child,
@@ -1961,22 +1626,14 @@ impl DebuggerChangeLane {
         ]
     }
 
-    /// Let the settling child's marker go once its change is judged: the re-probe
-    /// ended it and the drift watch judged that probe, its observed record in this
-    /// step or an earlier one. A watch waiting for a fresh records read judges the
-    /// probe at that read's `seed`, and the marker waits for it.
     fn release_settled(&mut self, step: &mut LaneStep) {
         if !matches!(self.flow.phase(), Phase::Exited(_)) && self.drift.seeded() {
-            // A dead marker this step read off disk names what is there now.
             let settled = self.settling.take();
             self.released = settled.or(self.released);
             step.remove_change_marker = step.remove_change_marker.or(settled);
         }
     }
 
-    /// Feed the drift watch. A mode it must judge against the shared record
-    /// as it is on disk now (one this process did not set) asks for a records
-    /// read at once; the read's `seed` judges it.
     fn drift_observed(
         &mut self,
         mode: DebuggerMode,
@@ -2022,36 +1679,21 @@ impl DebuggerChangeLane {
     }
 }
 
-// The launch ask
-
-/// The record beside `aterm.toml` of the Macs on which aterm has asked, by itself,
-/// whether to allow debugger access: one `<host-uuid> <secs>` line per Mac
-/// (`aterm_containment::consent::host_uuid`), oldest first. The config folder may
-/// sync between Macs, hence the host key: a Mac whose synced record names only
-/// others is asked once too.
+/// The record beside `aterm.toml` of the Macs on which aterm has asked, by itself, whether to allow debugger access.
 pub(crate) const ASKED_RECORD: &str = "privacy-debugger-asked";
 
-/// The Macs the asked record keeps. Past that the oldest line goes, and that Mac
-/// is asked again, once, the next time aterm runs there.
+/// The Macs the asked record keeps.
 pub(crate) const MAX_ASKED_LINES: usize = 8;
 
-/// A host key's longest spelling (the kernel's UUID is 36 bytes).
 const MAX_HOST_BYTES: usize = 64;
 
-/// The asked record's bound: [`MAX_ASKED_LINES`] lines of the longest host key
-/// and a `u64`. Anything bigger is not a record this build wrote.
 const MAX_ASKED_BYTES: usize = MAX_ASKED_LINES * (MAX_HOST_BYTES + 1 + 20 + 1);
 
-/// A host key the record can hold: one plain word (ASCII letters, digits and `-`,
-/// as the kernel's UUID is spelled), so every line splits back exactly.
 fn host_key_ok(host: &str) -> bool {
     (1..=MAX_HOST_BYTES).contains(&host.len())
         && host.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
 }
 
-/// The asked record's lines, strictly as [`note_asked`] writes them, or `None`:
-/// newline-terminated, each line a host key, one space and its seconds, and at
-/// most [`MAX_ASKED_LINES`] of them.
 fn parse_asked(text: &str) -> Option<Vec<(&str, u64)>> {
     let body = text.strip_suffix('\n')?;
     let mut lines = Vec::new();
@@ -2065,7 +1707,6 @@ fn parse_asked(text: &str) -> Option<Vec<(&str, u64)>> {
     (lines.len() <= MAX_ASKED_LINES).then_some(lines)
 }
 
-/// Where the host record `record` lives beside `config_path`.
 fn record_path(config_path: &Path, record: &str) -> std::io::Result<PathBuf> {
     marker_path(config_path, record).ok_or_else(|| {
         std::io::Error::new(
@@ -2075,10 +1716,6 @@ fn record_path(config_path: &Path, record: &str) -> std::io::Result<PathBuf> {
     })
 }
 
-/// The asked record's text: `Ok(None)` for a genuine absence. Anything else at
-/// the path goes through the bounded, regular, no-final-link marker reader, and
-/// what it refuses — a link, a folder, an oversized or non-UTF-8 file — is an
-/// error, as is a folder that cannot be read.
 fn read_asked_text(path: &Path) -> std::io::Result<Option<String>> {
     match std::fs::symlink_metadata(path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -2094,20 +1731,12 @@ fn read_asked_text(path: &Path) -> std::io::Result<Option<String>> {
     }
 }
 
-/// Whether the asked record names `host`. It fails toward NOT asking: a record
-/// that is there but cannot be read whole — a link, a folder, too big, not UTF-8,
-/// malformed — a folder that cannot be read, and a host key no record could hold
-/// all read as asked. Only an absent record, or a whole one naming other Macs
-/// only, is not asked.
+/// Whether the asked record names `host`.
 pub(crate) fn read_asked(config_path: &Path, host: &str) -> bool {
     read_host_record(config_path, ASKED_RECORD, host)
 }
 
-/// Whether the once-per-Mac record `record` beside `config_path` names `host`,
-/// read as [`read_asked`] reads [`ASKED_RECORD`]: anything but an absent record
-/// or a whole one naming other Macs only reads as named. The secrets vault's
-/// declined record (`secrets_join::DECLINED_RECORD`) is the other one; its owed
-/// record is read the other way ([`host_record_lists`]).
+/// Whether the once-per-Mac record `record` beside `config_path` names `host`, read as [`read_asked`] reads [`ASKED_RECORD`].
 pub(crate) fn read_host_record(config_path: &Path, record: &str, host: &str) -> bool {
     if !host_key_ok(host) {
         return true;
@@ -2121,23 +1750,12 @@ pub(crate) fn read_host_record(config_path: &Path, record: &str, host: &str) -> 
     }
 }
 
-/// Write `host` into the asked record, AHEAD of the alert it stands for
-/// ([`Flush::Durable`]: once the alert is up, a crash, quit or update must never
-/// ask again, and this record is all that remembers it). A record that names
-/// `host` already is left as it is; past [`MAX_ASKED_LINES`] the oldest lines go.
-/// A record that cannot be read whole is never overwritten (`InvalidData`; it
-/// reads as asked anyway), and nothing is written through a link
-/// (`config_marker::write_marker`).
-///
-/// [`Flush::Durable`]: crate::durable::Flush::Durable
+/// Write `host` into the asked record, AHEAD of the alert it stands for ([`Flush::Durable`]: once the alert is up, a crash, quit or update must never ask again, and this record is all that remembers it).
 pub(crate) fn note_asked(config_path: &Path, host: &str, now: u64) -> std::io::Result<()> {
     note_host_record(config_path, ASKED_RECORD, host, now)
 }
 
-/// Write `host` into the once-per-Mac record `record` beside `config_path`, as
-/// [`note_asked`] writes [`ASKED_RECORD`]: durably, never over a record that
-/// cannot be read whole, never through a link, keeping at most
-/// [`MAX_ASKED_LINES`] Macs.
+/// Write `host` into the once-per-Mac record `record` beside `config_path`, as [`note_asked`] writes [`ASKED_RECORD`].
 pub(crate) fn note_host_record(
     config_path: &Path,
     record: &str,
@@ -2180,12 +1798,7 @@ pub(crate) fn note_host_record(
     )
 }
 
-/// Whether the once-per-Mac record `record` beside `config_path` names `host`,
-/// read the other way from [`read_host_record`]: `Ok(false)` for an absent
-/// record or a whole one naming other Macs only, and an error for a record that
-/// cannot be read whole or a host key no record could hold. For a record whose
-/// line starts work rather than holding it back (`secrets_join::OWED_RECORD`),
-/// where a record that cannot be read must start nothing.
+/// Whether the once-per-Mac record `record` beside `config_path` names `host`, read the other way from [`read_host_record`].
 pub(crate) fn host_record_lists(
     config_path: &Path,
     record: &str,
@@ -2207,10 +1820,7 @@ pub(crate) fn host_record_lists(
         })
 }
 
-/// Take `host` out of the record `record` beside `config_path`, written as
-/// [`note_host_record`] writes it: durably, never through a link, never over a
-/// record that cannot be read whole (`InvalidData`). A record left naming no Mac
-/// is removed; an absent one, or one not naming `host`, is left as it is.
+/// Take `host` out of the record `record` beside `config_path`, written as [`note_host_record`] writes it.
 pub(crate) fn forget_host_record(
     config_path: &Path,
     record: &str,
@@ -2250,41 +1860,16 @@ pub(crate) fn forget_host_record(
 }
 
 /// What the disk half of a launch offer found, and did ([`OfferDisk::prepare`]).
-/// The change marker and lock beside `aterm.toml` are judged as the worker
-/// ([`run_devtools_job`]) and the records reader ([`read_records`]) judge them,
-/// so the three never disagree about one disk.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum OfferPrep {
-    /// Nothing a press's worker would be refused over, and this Mac was not in
-    /// the record: it is now, durably, and the change lock is let go. Nothing a
-    /// press would be refused over means no change marker, or one that names
-    /// no change (a link, a folder, a file too big, not UTF-8 or malformed —
-    /// the records reader ignores or removes it and the worker ignores it) or a
-    /// gone child the lane follows already; and no lock file, or a free one.
     Recorded,
-    /// A change the lane does not follow, or one still running: a marker naming
-    /// a running child (a peer's, or a predecessor's whose worker died with it),
-    /// a marker naming a gone child nobody has recorded (the model's `stale`),
-    /// or the lock held (a peer's worker, from its re-read through its child's
-    /// exit; or, for a moment, a peer's own launch offer or records read).
-    /// Nothing was written. `read_records`: the lane should read the shared
-    /// records now, to follow a change it finds there (not a child it follows
-    /// already); after a peer's offer it finds none, and the next offer reads
-    /// the record that peer wrote.
     Change { read_records: bool },
-    /// The lock file is there but cannot be opened or locked (a link, a folder,
-    /// another owner's file, a filesystem that refuses `flock`): the worker
-    /// would refuse a yes (`WorkerRefusal::NoLock`), so nothing can start.
     NoLock,
-    /// The record names this Mac (or cannot be read whole).
     Asked,
-    /// The record could not be written: nothing of it is on disk.
     NotRecorded,
 }
 
-/// What the disk half of a launch offer needs from the lane, copied so it can run
-/// off the event loop: the children the lane follows, and how it reads whether
-/// one is running ([`DebuggerChangeLane::offer_disk`]).
+/// What the disk half of a launch offer needs from the lane, copied so it can run off the event loop.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct OfferDisk {
     followed: [Option<DevtoolsChild>; 4],
@@ -2292,17 +1877,8 @@ pub(crate) struct OfferDisk {
 }
 
 impl OfferDisk {
-    /// THE DISK HALF OF A LAUNCH OFFER: take the change lock (one try, never a
-    /// wait), judge the change marker under it, read the record, and write this
-    /// Mac into it durably — ahead of the alert, so an alert left up through a
-    /// crash, quit or update never comes back. The lock is kept from the
-    /// record's read through its durable write, so another process cannot pass
-    /// the same absent-host reading meanwhile; it is let go before the alert.
-    /// Touches only the disk, so the App runs it on a thread of its own: the
-    /// config folder lives in the home folder, which can sit on a volume that
-    /// stopped answering ([`RecordRead::Thread`]).
+    /// THE DISK HALF OF A LAUNCH OFFER.
     pub(crate) fn prepare(self, config_path: &Path, host: &str, now: u64) -> OfferPrep {
-        // A first launch may have no config directory yet. The record writer
         // already creates it; the lock must be able to precede that write.
         if let Some(parent) = config_path.parent() {
             let _ = std::fs::create_dir_all(parent);
@@ -2332,8 +1908,6 @@ impl OfferDisk {
             aterm_log::warn!("debugger launch ask: this Mac could not be recorded: {error}");
             return OfferPrep::NotRecorded;
         }
-        // The record is now visible to every contender. Never keep the change
-        // lock while an alert runs its modal loop or a confirmed worker starts.
         drop(claim);
         OfferPrep::Recorded
     }
@@ -2342,19 +1916,13 @@ impl OfferDisk {
 /// This Mac in the asked record, as the launch ask reads it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum HostAsked {
-    /// The host key is not read yet, or the record not read for it: each is
-    /// read once, off the event loop.
     Cold,
-    /// The kernel names no host, so no record could be keyed to this Mac.
     Unnamed,
-    /// The record names this Mac, or cannot be read whole.
     Asked,
-    /// The record is absent, or names other Macs only.
     NotAsked,
 }
 
-/// What the launch ask is judged on (design §3.4 step 0). Pure
-/// data, gathered by the App at its look.
+/// What the launch ask is judged on (design §3.4 step 0).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct LaunchAskFacts {
     /// A windowed instance.
@@ -2362,33 +1930,20 @@ pub(crate) struct LaunchAskFacts {
     pub(crate) macos: bool,
     /// `[privacy] enabled && check`.
     pub(crate) privacy: bool,
-    /// `[privacy] notice`, the switch that silences aterm's launch questions. A
-    /// key may only silence the ask, never start it (design §3.9).
+    /// `[privacy] notice`, the switch that silences aterm's launch questions.
     pub(crate) notice: bool,
-    /// A config folder to keep the record in: without one nothing would remember
-    /// the answer, and every launch would ask again.
+    /// A config folder to keep the record in: without one nothing would remember the answer, and every launch would ask again.
     pub(crate) config: bool,
     pub(crate) host: HostAsked,
-    /// The shared debugger records (a predecessor's change, the observed mode)
-    /// are read.
+    /// The shared debugger records (a predecessor's change, the observed mode) are read.
     pub(crate) records_read: bool,
-    /// A change under way ([`DebuggerChangeLane::under_way`]), this process's or
-    /// an inherited one.
+    /// A change under way ([`DebuggerChangeLane::under_way`]), this process's or an inherited one.
     pub(crate) under_way: bool,
-    /// The owner answered a debugger-access alert in this process, yes or no
-    /// (`OwnerQuiet::debugger_answered`).
+    /// The owner answered a debugger-access alert in this process, yes or no (`OwnerQuiet::debugger_answered`).
     pub(crate) answered: bool,
-    /// The cached probe, `None` until the look reads it: a look dispatches the
-    /// probe worker only while no answer is cached, so an ask a gate above
-    /// already decides reads nothing, and one waiting for its moment re-reads
-    /// nothing.
+    /// The cached probe, `None` until the look reads it.
     pub(crate) probe: Option<DebuggerProbe>,
-    /// The probe was read within [`ASK_PROBE_FRESH`] (or by an instance's
-    /// syscall-free arm, which answers at every read). The alert is raised only
-    /// on such a reading, so a rule switched on meanwhile — by the owner's own
-    /// `sudo DevToolsSecurity -enable` in an aterm tab, which retires no cached
-    /// answer — settles [`AskSettle::AlreadyOn`] instead of asking to allow
-    /// what is allowed.
+    /// The probe was read within [`ASK_PROBE_FRESH`] (or by an instance's syscall-free arm, which answers at every read).
     pub(crate) probe_fresh: bool,
     /// The observed record, as the lane holds it.
     pub(crate) recorded: Option<ObservedMarker>,
@@ -2396,20 +1951,15 @@ pub(crate) struct LaunchAskFacts {
     pub(crate) drift: bool,
     /// aterm's own hardening, read with the probe.
     pub(crate) self_hardened: SelfHardening,
-    /// This process's Full Disk Access launch decision is made (not
-    /// `FdaLaunch::Undecided`). Its hand-over still queued, or its panel up, is
-    /// [`Self::page`]; a hand-over gone with nothing to end it holds nothing.
+    /// This process's Full Disk Access launch decision is made (not `FdaLaunch::Undecided`).
     pub(crate) fda_decided: bool,
-    /// This process's Developer Tools launch reading has completed, whatever it
-    /// read (a refusal included).
+    /// This process's Developer Tools launch reading has completed, whatever it read (a refusal included).
     pub(crate) devtools_decided: bool,
-    /// A Full Disk Access or Developer Tools hand-over waits, or aterm's helper
-    /// panel is up.
+    /// A Full Disk Access or Developer Tools hand-over waits, or aterm's helper panel is up.
     pub(crate) page: bool,
     /// The folder warm-up is walking (a macOS folder dialog may be up).
     pub(crate) warmup: bool,
-    /// The quiet moment (`App::devtools_moment_is_quiet`): an aterm window
-    /// focused, the owner present but hands off, this process settled.
+    /// The quiet moment (`App::devtools_moment_is_quiet`).
     pub(crate) quiet: bool,
     /// The owner declined a Security gesture recently (`OwnerQuiet`).
     pub(crate) owner_quiet: bool,
@@ -2418,46 +1968,25 @@ pub(crate) struct LaunchAskFacts {
 /// What the launch ask does now ([`admit_launch_ask`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum LaunchAsk {
-    /// Write the record, then raise the alert ([`DebuggerChangeLane::offer`]).
     Ask,
-    /// Look again later ([`AskWait::look_again`]).
     Wait(AskWait),
-    /// Write the record and raise nothing: the question is answered on this Mac
-    /// ([`DebuggerChangeLane::forgo`]).
     Settle(AskSettle),
-    /// Nothing more this process, and nothing written: a later launch judges
-    /// again.
     Drop(AskDrop),
 }
 
 /// Why the launch ask asks nothing this process and writes nothing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AskDrop {
-    /// A headless instance: nobody to ask.
     Headless,
-    /// Debugger access is a macOS setting.
     NotMacos,
-    /// `[privacy] enabled` or `check` is off.
     PrivacyOff,
-    /// `[privacy] notice` is off.
     NoticeOff,
-    /// No config folder to keep the record in.
     NoConfig,
-    /// The kernel names no host.
     NoHost,
-    /// The record names this Mac, or cannot be read whole.
     Asked,
-    /// The probe reads a rule Apple's tool does not recognise, which `-enable`
-    /// would overwrite.
     Unrecognized,
-    /// The probe gave no answer (refused, failed, timed out).
     Unread,
-    /// The account is in neither admin nor _developer, or that is unknown: the
-    /// switch might not help it.
     NotMember,
-    /// This aterm is not hardened, or that is unknown: the ask is aterm's own
-    /// initiative, which design §3.6 keeps to a hardened aterm. Its button still
-    /// offers the change (O8).
     NotHardened,
 }
 
@@ -2482,43 +2011,21 @@ impl AskDrop {
 /// Why the launch ask looks again later.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AskWait {
-    /// The host key is not read yet.
     HostCold,
-    /// The shared debugger records are not read yet.
     RecordsUnread,
-    /// The probe has not answered yet.
     ProbePending,
-    /// The Full Disk Access launch decision is not made yet.
     BehindFullDiskAccess,
-    /// The Developer Tools launch reading has not completed.
     BehindDeveloperTools,
-    /// A hand-over waits, or aterm's helper panel is up.
     BehindPage,
-    /// The folder warm-up is walking.
     BehindWarmup,
-    /// Not the quiet moment.
     NotQuiet,
-    /// The owner declined a Security gesture recently.
     OwnerQuiet,
-    /// The moment has come, but the probe is older than [`ASK_PROBE_FRESH`]:
-    /// it is read again before the alert.
     ProbeStale,
-    /// The moment has come, but the rule's fresh reading read nothing (a
-    /// `-status` that timed out, did not start or answered what the classifier
-    /// does not claim) after the offer recorded this Mac: it is retired and read
-    /// again, within [`LaunchAskQueue::unread`]'s bound. The App's wait, not
-    /// [`admit_launch_ask`]'s.
     ProbeUnread,
-    /// The offer's disk half is out: the change lock, the record's read and
-    /// this Mac's durable line, on a thread of their own. The App's wait, not
-    /// [`admit_launch_ask`]'s.
     Recording,
 }
 
-/// How old a probe the launch ask raises its alert on may be. Older, it is
-/// retired and read again first ([`AskWait::ProbeStale`]). Longer than
-/// [`crate::devtools_helper::PANEL_TICK`], the look's cadence while that read
-/// is out, so the reading it waited for is fresh at the next look.
+/// How old a probe the launch ask raises its alert on may be.
 pub(crate) const ASK_PROBE_FRESH: Duration = Duration::from_secs(5);
 
 impl AskWait {
@@ -2539,11 +2046,7 @@ impl AskWait {
         }
     }
 
-    /// How long until the next look: [`crate::devtools_helper::PANEL_TICK`]
-    /// while a read the look started (the host key, the probe) completes — its
-    /// completion wakes the window; this is the backstop — and
-    /// [`crate::devtools_helper::RECHECK_EVERY`] otherwise, as the hand-overs'
-    /// looks for their quiet moment do. Never zero, so a park never spins on it.
+    /// How long until the next look.
     pub(crate) const fn look_again(self) -> Duration {
         match self {
             Self::HostCold | Self::ProbePending | Self::ProbeStale | Self::Recording => {
@@ -2554,19 +2057,12 @@ impl AskWait {
     }
 }
 
-/// Why the launch ask settles: the question is answered on this Mac, and the
-/// record says so with no alert.
+/// Why the launch ask settles: the question is answered on this Mac, and the record says so with no alert.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AskSettle {
-    /// A change is under way: the owner is answering one already.
     Underway,
-    /// The owner answered a debugger-access alert in this process.
     Answered,
-    /// Debugger access is allowed already.
     AlreadyOn,
-    /// It reads off, but this process saw it go off, or the record says it was
-    /// allowed or that aterm or something else turned it off: aterm never turns
-    /// it back on (design §6).
     TurnedOff,
 }
 
@@ -2581,13 +2077,7 @@ impl AskSettle {
     }
 }
 
-/// THE LAUNCH ASK'S ADMISSION. Pure, and the order is the
-/// contract: the instance's gates; this Mac in the record; the reads it waits
-/// on; whether the question is answered here already; whether turning debugger
-/// access on can help this account from this aterm; then the moment — behind
-/// the Full Disk Access and Developer Tools launch pages, with no page, panel
-/// or folder dialog up, the owner present and paused, and no recent decline;
-/// and last a probe fresh enough to raise the alert on.
+/// THE LAUNCH ASK'S ADMISSION.
 pub(crate) fn admit_launch_ask(facts: &LaunchAskFacts) -> LaunchAsk {
     let gates = [
         (facts.windowed, AskDrop::Headless),
@@ -2661,22 +2151,11 @@ pub(crate) fn admit_launch_ask(facts: &LaunchAskFacts) -> LaunchAsk {
 /// Why [`DebuggerChangeLane::offer`] gave no ticket.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum OfferEnd {
-    /// The press the ask stands for would be refused now (here, or a change on
-    /// disk): nothing was written or asked.
     Refused(Refusal),
-    /// The change lock beside `aterm.toml` is there but cannot be opened or
-    /// locked, so the worker would refuse a yes (`WorkerRefusal::NoLock`):
-    /// nothing was written or asked, and looking again changes nothing.
     NoLock,
-    /// The record names this Mac (or cannot be read whole): nothing was asked.
     Asked,
-    /// The record could not be written: nothing was asked, since an alert no
-    /// record remembers would come back at every launch.
     NotRecorded,
-    /// The owner said no. The record stands: they are not asked again.
     Declined,
-    /// No alert could be shown, or a recent decline quieted it: not a yes. The
-    /// record stands.
     NotAsked,
 }
 
@@ -2694,23 +2173,7 @@ impl OfferEnd {
 }
 
 impl DebuggerChangeLane {
-    /// THE LAUNCH ASK'S ALERT AND ANSWER: raise aterm's alert
-    /// through `confirm` for a Mac its disk half has just written into
-    /// [`ASKED_RECORD`] (`prepared`, from [`OfferDisk::prepare`]), and take the
-    /// answer exactly as a press of *Allow debugger access…* ([`Self::begin`]: a
-    /// yes arms a job and mints the ticket the worker needs). Nothing is written
-    /// or asked unless that press would be taken now — the records read, nothing
-    /// under way here, no change on disk the worker would be refused over, the
-    /// last probe reading debugger access off — and the record did not name this
-    /// Mac yet. A change lock that cannot be taken at all ends it
-    /// ([`OfferEnd::NoLock`]): no yes could start anything. The record went to
-    /// disk before `confirm` runs, so an alert left up through a crash, quit or
-    /// update never comes back; a record that could not be written asks nothing.
-    /// Only On: aterm never asks by itself to turn it off.
-    ///
-    /// The App runs the offer in three steps: [`Self::offer_refusal`], then
-    /// [`Self::offer_disk`]'s [`OfferDisk::prepare`] on a thread of its own, then
-    /// this at a later look. `offer_now` (tests) runs them in one call.
+    /// THE LAUNCH ASK'S ALERT AND ANSWER.
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -2729,8 +2192,7 @@ impl DebuggerChangeLane {
         self.offer_confirm(confirm)
     }
 
-    /// [`Self::offer`] with its disk half run here, as the App runs the three
-    /// steps apart.
+    /// [`Self::offer`] with its disk half run here, as the App runs the three steps apart.
     #[cfg(test)]
     pub(crate) fn offer_now(
         &mut self,
@@ -2745,15 +2207,12 @@ impl DebuggerChangeLane {
         self.offer(prepared, now_secs(), confirm)
     }
 
-    /// Why the press [`Self::offer`] stands for would be refused now, taking
-    /// nothing: checked before the disk half starts, so nothing is written for
-    /// a press that would be refused.
+    /// Why the press [`Self::offer`] stands for would be refused now, taking nothing.
     pub(crate) fn offer_refusal(&self) -> Option<Refusal> {
         self.flow.press_refusal(DebuggerChange::On)
     }
 
-    /// What the disk half of [`Self::offer`] needs from this lane, copied, so it
-    /// can run off the event loop ([`OfferDisk::prepare`]).
+    /// What the disk half of [`Self::offer`] needs from this lane, copied, so it can run off the event loop ([`OfferDisk::prepare`]).
     pub(crate) fn offer_disk(&self) -> OfferDisk {
         OfferDisk {
             followed: self.followed(),
@@ -2761,15 +2220,6 @@ impl DebuggerChangeLane {
         }
     }
 
-    /// The disk half's answer, taken on the lane's own thread: `Ok` when this
-    /// Mac is recorded and the alert may be raised. A change on disk this lane
-    /// does not follow, or a change lock held by another process (a peer's
-    /// worker for as long as its child runs, or a peer's offer for a moment),
-    /// asks for a records read at once (`now_wall`): the park then follows a
-    /// change it finds, or adopts a gone one and re-probes it, and the next look
-    /// finds it under way and settles, rather than waiting on a change an idle
-    /// lane would never read again; after a peer's offer the next offer finds
-    /// this Mac in the record.
     fn offer_prepared(&mut self, prepared: OfferPrep, now_wall: u64) -> Result<(), OfferEnd> {
         match prepared {
             OfferPrep::Recorded => Ok(()),
@@ -2785,10 +2235,6 @@ impl DebuggerChangeLane {
         }
     }
 
-    /// The alert half of [`Self::offer`], on the event loop once this Mac is
-    /// recorded: raise the alert through `confirm` unless the press would be
-    /// refused now — it may have become one while the disk half ran — and take
-    /// the answer as a press. The record stands either way.
     fn offer_confirm(
         &mut self,
         confirm: impl FnOnce() -> crate::native_settings::OwnerAnswer,
@@ -2807,11 +2253,7 @@ impl DebuggerChangeLane {
             })
     }
 
-    /// THE LAUNCH ASK SETTLED: write this Mac into
-    /// [`ASKED_RECORD`] and nothing else. The question is answered here — a
-    /// change is under way, the owner answered the alert in this process,
-    /// debugger access is on, or it was on or turned off before — so no later
-    /// launch asks it.
+    /// THE LAUNCH ASK SETTLED: write this Mac into [`ASKED_RECORD`] and nothing else.
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -2831,70 +2273,32 @@ impl DebuggerChangeLane {
     }
 }
 
-/// The App's launch ask: queued on a windowed macOS instance until it asks,
-/// settles or drops, with the park's next look. It holds the host-key reader
-/// (injected; the live one, `host_uuid_if_warm`, never makes a syscall) and the
-/// record's answer for this Mac, read once, off the event loop.
+/// The App's launch ask: queued on a windowed macOS instance until it asks, settles or drops, with the park's next look.
 #[derive(Debug)]
 pub(crate) struct LaunchAskQueue {
     queued: bool,
-    /// When the next look is due; `None`: at the next park.
     next_look: Option<Instant>,
     host: fn() -> Option<&'static str>,
-    /// The host key's read off the event loop: `None` until it is started, then
-    /// whether it has ended.
     host_read: Option<Arc<std::sync::atomic::AtomicBool>>,
-    /// The record's read for a host: `None` until it is started, then its
-    /// answer once it has ended.
     asked: Option<(&'static str, Arc<std::sync::OnceLock<bool>>)>,
-    /// The offer's disk half ([`OfferDisk::prepare`]) and the rule's reading
-    /// its alert will state: `None` until it is started, then its answer once
-    /// it has ended, until a look takes it (or puts it back for later,
-    /// [`Self::keep_prepared`]).
     prepared: Option<(Arc<std::sync::OnceLock<OfferPrep>>, DebuggerFacts)>,
-    /// Where the record is read: on a thread of its own (a launch's), or on
-    /// the asking thread (a test's stand-in, beside its stand-in host key).
     record_read: RecordRead,
-    /// What the last look waited on.
     waiting: Option<AskWait>,
-    /// When the first offer this process was refused before anything was
-    /// written ([`Self::refused`]).
     refused_since: Option<Instant>,
-    /// When the spend first found the rule unread after this Mac was recorded
-    /// ([`Self::unread`]), and how many such readings it has met.
     unread_since: Option<Instant>,
     unread_reads: u32,
 }
 
-/// How long offers refused before anything was written (a change on disk, the
-/// lane busy) may keep the launch ask queued, from the first refusal. A change
-/// that is really under way is followed or adopted by the lane well within it
-/// and settles the ask; past it the ask ends for this process with nothing
-/// written, so a disk state nothing here settles can never hold the folder
-/// warm-up, which waits while the ask is queued, for longer.
+/// How long offers refused before anything was written (a change on disk, the lane busy) may keep the launch ask queued, from the first refusal.
 pub(crate) const REFUSED_FOR: Duration = Duration::from_secs(5 * 60);
 
-/// How many reads of the rule that read nothing a recorded launch ask meets
-/// before [`REFUSED_FOR`] from the first can end it ([`LaunchAskQueue::unread`]).
-/// No look runs while no aterm window is focused, so the span alone would let
-/// one failure met after an absence end an ask on a Mac already recorded; a
-/// read that keeps failing meets this many within seconds.
+/// How many reads of the rule that read nothing a recorded launch ask meets before [`REFUSED_FOR`] from the first can end it ([`LaunchAskQueue::unread`]).
 pub(crate) const UNREAD_READS: u32 = 3;
 
-/// Where [`LaunchAskQueue`] does its disk work: the record's read
-/// ([`LaunchAskQueue::start_record_read`]), the offer's disk half
-/// ([`LaunchAskQueue::start_prepare`]) and a settle's record.
+/// Where [`LaunchAskQueue`] does its disk work.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RecordRead {
-    /// On a thread of its own, which wakes the window when it has the answer:
-    /// the record lives beside `aterm.toml`, in the home folder, and a home on
-    /// a network volume that stopped answering held the window on this read —
-    /// every key, frame and control verb — until the server came back
-    /// (measured in a macOS 27 guest, 2026-10-20: a `call_main` verb waited
-    /// out its 30 s twice). The offer's lock, record and durable write, and a
-    /// settle's record, would hold it the same way.
     Thread,
-    /// On the asking thread: a test's stand-in, as its host key is.
     #[cfg(test)]
     Inline,
 }
@@ -2917,8 +2321,7 @@ impl LaunchAskQueue {
         }
     }
 
-    /// A queued ask with a stand-in host key whose read has ended, its record
-    /// read on the asking thread.
+    /// A queued ask with a stand-in host key whose read has ended, its record read on the asking thread.
     #[cfg(test)]
     pub(crate) fn queued_for_test(host: fn() -> Option<&'static str>) -> Self {
         Self {
@@ -2929,8 +2332,7 @@ impl LaunchAskQueue {
         }
     }
 
-    /// A queued ask with a stand-in host key whose read is out, ended once
-    /// `done` is set, its record read on the asking thread.
+    /// A queued ask with a stand-in host key whose read is out, ended once `done` is set, its record read on the asking thread.
     #[cfg(all(test, target_os = "macos"))]
     pub(crate) fn reading_host_for_test(
         host: fn() -> Option<&'static str>,
@@ -2944,9 +2346,7 @@ impl LaunchAskQueue {
         }
     }
 
-    /// A queued ask with a stand-in host key whose read has ended, its record
-    /// read off the asking thread as a launch's is. Only macOS's access-refresh
-    /// tests ask for one.
+    /// A queued ask with a stand-in host key whose read has ended, its record read off the asking thread as a launch's is.
     #[cfg(all(test, target_os = "macos"))]
     pub(crate) fn reading_record_for_test(host: fn() -> Option<&'static str>) -> Self {
         Self {
@@ -2960,11 +2360,7 @@ impl LaunchAskQueue {
         self.queued
     }
 
-    /// Whether a look is due at `now`: at its time, or, while the look waits on
-    /// the offer's disk half ([`AskWait::Recording`]), as soon as it has ended,
-    /// so the wake its end sends runs the look that raises the alert for the
-    /// Mac it has just recorded. An answer put back ([`Self::keep_prepared`])
-    /// waits for its time.
+    /// Whether a look is due at `now`.
     pub(crate) fn due(&self, now: Instant) -> bool {
         self.queued
             && (self.next_look.is_none_or(|at| now >= at)
@@ -2980,20 +2376,13 @@ impl LaunchAskQueue {
         self.next_look = Some(at);
     }
 
-    /// The look waits on `why`: look again at `at`. `true` when that is not
-    /// what the last look waited on (worth one line in the log).
+    /// The look waits on `why`: look again at `at`.
     pub(crate) fn wait(&mut self, why: AskWait, at: Instant) -> bool {
         self.look_later(at);
         self.waiting.replace(why) != Some(why)
     }
 
-    /// The offer at `now` was refused before anything was written or asked
-    /// ([`OfferEnd::Refused`]): look again after
-    /// [`crate::devtools_helper::RECHECK_EVERY`], unless refusals have kept the
-    /// ask queued for [`REFUSED_FOR`] since the first one — then it is over for
-    /// this process (`false`), with nothing written, and a later launch judges
-    /// again. The span is never restarted, so refusals met only at the quiet
-    /// moments between the owner's typing still end it.
+    /// The offer at `now` was refused before anything was written or asked ([`OfferEnd::Refused`]).
     pub(crate) fn refused(&mut self, now: Instant) -> bool {
         let since = *self.refused_since.get_or_insert(now);
         if now.saturating_duration_since(since) >= REFUSED_FOR {
@@ -3004,13 +2393,7 @@ impl LaunchAskQueue {
         true
     }
 
-    /// The spend's fresh reading did not read the rule (a `-status` that timed
-    /// out, did not start or answered what the classifier does not claim,
-    /// [`DebuggerMode::Unknown`] with an age) after the disk half recorded this Mac: the
-    /// rule is read again, unless such readings have held the answer for
-    /// [`REFUSED_FOR`] since the first one and number at least [`UNREAD_READS`]
-    /// — then it is over for this process (`false`), the record standing. The
-    /// span is never restarted.
+    /// The spend's fresh reading did not read the rule (a `-status` that timed out, did not start or answered what the classifier does not claim, [`DebuggerMode::Unknown`] with an age) after the disk half recorded this Mac.
     pub(crate) fn unread(&mut self, now: Instant) -> bool {
         let since = *self.unread_since.get_or_insert(now);
         self.unread_reads = self.unread_reads.saturating_add(1);
@@ -3032,8 +2415,7 @@ impl LaunchAskQueue {
         (self.host)()
     }
 
-    /// A cold host key's read: `Some(done)` the first time — the caller reads it
-    /// off the event loop and sets `done` when that read ends — `None` after.
+    /// A cold host key's read: `Some(done)` the first time.
     pub(crate) fn start_host_read(&mut self) -> Option<Arc<std::sync::atomic::AtomicBool>> {
         if self.host_read.is_some() {
             return None;
@@ -3050,8 +2432,7 @@ impl LaunchAskQueue {
             .is_some_and(|done| done.load(std::sync::atomic::Ordering::Acquire))
     }
 
-    /// Whether the record names `host` ([`read_asked`]): `None` until its
-    /// read, once per process ([`Self::start_record_read`]), has ended.
+    /// Whether the record names `host` ([`read_asked`]).
     pub(crate) fn asked(&self, host: &'static str) -> Option<bool> {
         self.asked
             .as_ref()
@@ -3059,9 +2440,7 @@ impl LaunchAskQueue {
             .and_then(|(_, answer)| answer.get().copied())
     }
 
-    /// The record's read for `host`, the first time it is asked for that host:
-    /// `Some((slot, where))` — the caller reads [`read_asked`] into `slot`,
-    /// where `where` says — and `None` once it is out or done.
+    /// The record's read for `host`, the first time it is asked for that host: `Some((slot, where))`.
     pub(crate) fn start_record_read(
         &mut self,
         host: &'static str,
@@ -3078,16 +2457,12 @@ impl LaunchAskQueue {
         Some((slot, self.record_read))
     }
 
-    /// Where this queue does its disk work: the record's read, the offer's
-    /// disk half and a settle's record.
+    /// Where this queue does its disk work: the record's read, the offer's disk half and a settle's record.
     pub(crate) const fn record_read(&self) -> RecordRead {
         self.record_read
     }
 
-    /// The offer's disk half, once per offer, for an alert that will state
-    /// `read`: `Some(slot)` when none is out or untaken — the caller runs
-    /// [`OfferDisk::prepare`] into `slot`, where [`Self::record_read`] says —
-    /// and `None` otherwise.
+    /// The offer's disk half, once per offer, for an alert that will state `read`: `Some(slot)` when none is out or untaken.
     pub(crate) fn start_prepare(
         &mut self,
         read: DebuggerFacts,
@@ -3100,17 +2475,14 @@ impl LaunchAskQueue {
         Some(slot)
     }
 
-    /// Whether the offer's disk half is out: started and not ended. It may be
-    /// writing this Mac into the record, so nothing ends the ask meanwhile.
+    /// Whether the offer's disk half is out: started and not ended.
     pub(crate) fn preparing(&self) -> bool {
         self.prepared
             .as_ref()
             .is_some_and(|(slot, _)| slot.get().is_none())
     }
 
-    /// The disk half's answer once it has ended, with the reading its alert
-    /// states, taken: the next offer starts another. `None` while it is out,
-    /// or when none was started.
+    /// The disk half's answer once it has ended, with the reading its alert states, taken: the next offer starts another.
     pub(crate) fn take_prepared(&mut self) -> Option<(OfferPrep, DebuggerFacts)> {
         let (slot, read) = self.prepared.as_ref()?;
         let answer = (*slot.get()?, *read);
@@ -3118,18 +2490,14 @@ impl LaunchAskQueue {
         Some(answer)
     }
 
-    /// The disk half's answer, taken by a look that could not spend it yet (a
-    /// recent decline quiets every Security alert), put back: the next look at
-    /// its time spends it before anything else.
+    /// The disk half's answer, taken by a look that could not spend it yet (a recent decline quiets every Security alert), put back.
     pub(crate) fn keep_prepared(&mut self, prepared: OfferPrep, read: DebuggerFacts) {
         let slot = Arc::new(std::sync::OnceLock::new());
         let _ = slot.set(prepared);
         self.prepared = Some((slot, read));
     }
 
-    /// Whether an offer's disk half is out, or its answer waits to be spent:
-    /// the ask owes this Mac its alert, or the end of an offer, whatever holds
-    /// the permission lanes.
+    /// Whether an offer's disk half is out, or its answer waits to be spent.
     pub(crate) const fn offering(&self) -> bool {
         self.prepared.is_some()
     }
@@ -3141,8 +2509,6 @@ impl LaunchAskQueue {
     }
 }
 
-// What the Security page renders
-
 /// A change child in flight, for the row's "waiting" line (since <time>).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct InFlightFacts {
@@ -3153,40 +2519,30 @@ pub(crate) struct InFlightFacts {
     pub(crate) inherited: bool,
 }
 
-/// The debugger row's facts (design §3.3). Pure data: the copy is a total
-/// function of it.
+/// The debugger row's facts (design §3.3).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct DebuggerFacts {
-    /// `[privacy] enabled && check`. `false`: aterm did not look, and offers
-    /// nothing.
+    /// `[privacy] enabled && check`.
     pub(crate) enabled: bool,
-    /// The cached probe: the rule's mode, the account's membership, and why. The
-    /// only source of what the row says the rule is.
+    /// The cached probe: the rule's mode, the account's membership, and why.
     pub(crate) probe: DebuggerProbe,
-    /// aterm's own hardening. Not a gate for the owner's press (O8): when it is
-    /// not `Hardened` the row and the alert say what that exposes. aterm's own
-    /// launch ask does gate on it ([`admit_launch_ask`]).
+    /// aterm's own hardening.
     pub(crate) self_hardened: SelfHardening,
     /// A change child in flight, this process's or a predecessor's.
     pub(crate) in_flight: Option<InFlightFacts>,
-    /// Anything under way (the alert, the re-read, the child, the re-probe)
-    /// or the predecessor's records unread: no button is live.
+    /// Anything under way (the alert, the re-read, the child, the re-probe) or the predecessor's records unread: no button is live.
     pub(crate) busy: bool,
-    /// The last recorded mode, when aterm first saw it, and who set it: "turned
-    /// on from aterm on <date>" / "set outside aterm".
+    /// The last recorded mode, when aterm first saw it, and who set it: "turned on from aterm on <date>" / "set outside aterm".
     pub(crate) recorded: Option<ObservedMarker>,
     /// Drift: allowed since this time, off now (in this process).
     pub(crate) drift_since: Option<u64>,
     /// What the last change in this process came to.
     pub(crate) last_outcome: Option<Outcome>,
-    /// Why the last confirmed change (a press, or the launch ask's yes)
-    /// started nothing.
+    /// Why the last confirmed change (a press, or the launch ask's yes) started nothing.
     pub(crate) refusal: Option<Refusal>,
 }
 
 impl Default for DebuggerFacts {
-    /// The zero state: aterm did not look, nothing is under way that it knows of,
-    /// and nothing is offered.
     fn default() -> Self {
         Self {
             enabled: false,
@@ -3203,9 +2559,7 @@ impl Default for DebuggerFacts {
 }
 
 impl DebuggerFacts {
-    /// Whether the button for `change` is drawn live: aterm looked, nothing is
-    /// under way, the probe shows the change's precondition, and for *Allow* the
-    /// account is one the switch would help. aterm's own hardening is not consulted.
+    /// Whether the button for `change` is drawn live.
     pub(crate) fn offers(&self, change: DebuggerChange) -> bool {
         self.enabled
             && !self.busy
@@ -3213,14 +2567,11 @@ impl DebuggerFacts {
             && (change == DebuggerChange::Off || self.probe.member != DebuggerMember::NotMember)
     }
 
-    /// Whether the row and the alert must add that this aterm is not
-    /// hardened, so any program the owner runs could take control of it.
+    /// Whether the row and the alert must add that this aterm is not hardened, so any program the owner runs could take control of it.
     pub(crate) fn not_hardened(&self) -> bool {
         self.self_hardened != SelfHardening::Hardened
     }
 }
-
-// Tests
 
 #[cfg(test)]
 mod tests {
@@ -3303,7 +2654,6 @@ mod tests {
         ] {
             assert_eq!(ChangeMarker::parse(bad), None, "{bad:?}");
         }
-        // A child whose birth was not read gets no marker at all.
         assert_eq!(
             ChangeMarker::new(
                 DebuggerChange::On,
@@ -3334,8 +2684,6 @@ mod tests {
         }
     }
 
-    /// A held change lock is waited out for the patience given and no longer;
-    /// one released inside it is taken.
     #[cfg(unix)]
     #[test]
     fn a_busy_change_lock_is_waited_out_only_for_its_patience() {
@@ -3344,13 +2692,10 @@ mod tests {
         let LockTry::Held(held) = try_change_lock(&config) else {
             panic!("a fresh lock is free");
         };
-        // Held throughout: the patience runs out and the answer is Busy.
         assert!(matches!(
             take_change_lock(&config, std::time::Duration::from_millis(1)),
             LockTry::Busy
         ));
-        // Released inside the patience (a minute: a hang detector, never a
-        // budget): the waiter takes it.
         let releaser = std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(60));
             drop(held);
@@ -3363,9 +2708,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The change lock is exclusive — across open descriptions, so a second
-    /// worker in this process is refused too — released on drop (free at once,
-    /// in one try), and never taken through a planted link.
     #[cfg(unix)]
     #[test]
     fn the_change_lock_is_exclusive_released_on_drop_and_never_followed() {
@@ -3394,10 +2736,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The worker's lock is free the moment it ends, even while a child forked
-    /// under it has yet to exec: [`ChangeLock`] lets go by `LOCK_UN`, so the park's
-    /// marker removal takes the lock in one try. Negative control: the same lock
-    /// let go by the close alone stays taken in the parked child's copy.
     #[cfg(unix)]
     #[test]
     fn the_workers_lock_is_free_while_a_child_forked_under_it_has_yet_to_exec() {
@@ -3435,8 +2773,6 @@ mod tests {
         );
         forked.release();
 
-        // Negative control: released by the close alone, the lock lives on in
-        // the parked child's copy of the description until that child execs.
         let closed_only = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -3457,10 +2793,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The debugger's two markers name their flushes (aterm-durable's counting seam):
-    /// the change marker a worker records for the child it spawned stays durable; the
-    /// observed mode is only ordered, since the next probe observes it again and the
-    /// drift watch tells the person of any change.
     #[cfg(unix)]
     #[test]
     fn the_change_marker_stays_durable_and_the_observed_mode_is_only_ordered() {
@@ -3499,7 +2831,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn the_records_reader_keeps_a_live_child_names_a_stale_one_and_drops_an_unreadable_one() {
-        // A lock this thread holds is never let go mid-read: `Busy` at once.
         let _patience = patience_for_test(Duration::ZERO);
         let dir = scratch("records");
         let config = dir.join("aterm.toml");
@@ -3531,8 +2862,6 @@ mod tests {
             dir.join(CHANGE_MARKER).exists(),
             "a live child's marker stays"
         );
-        // A dead child's marker: named stale, whole, and left on disk for the
-        // lane that re-reads its change to remove once that is recorded.
         let dead = read_records(&config, |_| false);
         assert_eq!(dead.inherited, None);
         assert_eq!(dead.stale, Some(marker), "its direction and child are kept");
@@ -3541,8 +2870,6 @@ mod tests {
             dir.join(CHANGE_MARKER).exists(),
             "a stale marker waits for its change to be recorded"
         );
-        // A marker this build cannot parse is nothing, and goes — never from
-        // under a holder, who overwrites it.
         write_debugger_marker(
             &config,
             CHANGE_MARKER,
@@ -3570,7 +2897,6 @@ mod tests {
             !dir.join(CHANGE_MARKER).exists(),
             "an unreadable marker is removed"
         );
-        // Only the marker naming the child goes.
         write_debugger_marker(
             &config,
             CHANGE_MARKER,
@@ -3588,13 +2914,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A records read while a worker holds the change lock before its child (and
-    /// marker) exist settles nothing: the lane keeps its buttons off and reads
-    /// again, and the second read finds the orphaned child in flight.
     #[cfg(unix)]
     #[test]
     fn a_change_lock_held_before_its_marker_is_written_is_read_again() {
-        // A lock this thread holds is never let go mid-read: `Busy` at once.
         let _patience = patience_for_test(Duration::ZERO);
         let dir = scratch("unsettled");
         let config = dir.join("aterm.toml");
@@ -3623,7 +2945,6 @@ mod tests {
         assert!(lane.needs_poll(), "the park keeps its RESULT_RECHECK");
         assert!(!lane.records_due(104), "not before RESULT_RECHECK");
         assert!(lane.records_due(105), "read again after it");
-        // The worker spawned its child and recorded it; its aterm is gone.
         let marker = ChangeMarker::new(DebuggerChange::On, child(77), 101).unwrap();
         write_debugger_marker(
             &config,
@@ -3651,8 +2972,6 @@ mod tests {
             Err(Refusal::InFlight)
         );
         assert!(!lane.records_due(200), "settled: never read again");
-        // A lock let go with no marker (the re-read found nothing to do)
-        // settles on nothing in flight.
         std::fs::remove_file(dir.join(CHANGE_MARKER)).unwrap();
         assert_eq!(read_records(&config, |_| true), RecordsRead::default());
         let _ = std::fs::remove_dir_all(&dir);
@@ -3720,15 +3039,9 @@ mod tests {
         );
     }
 
-    /// The worker body, with a stand-in runner: it holds the change lock for the
-    /// whole run, publishes and marks the child the moment it starts, then the
-    /// result, leaves the marker for the park, and nudges once per event. A
-    /// panicking runner still reads as gone; a lock or live marker held elsewhere
-    /// runs nothing.
     #[cfg(unix)]
     #[test]
     fn the_worker_holds_the_lock_publishes_the_child_then_the_result_and_leaves_the_marker() {
-        // A lock this thread holds is never let go mid-read: `Busy` at once.
         let _patience = patience_for_test(Duration::ZERO);
         let dir = scratch("worker");
         let config = dir.join("aterm.toml");
@@ -3778,8 +3091,6 @@ mod tests {
         assert!(read.gone);
         assert_eq!(wakes.load(std::sync::atomic::Ordering::SeqCst), 2);
 
-        // A live child named by that marker (a holder that quit mid-change):
-        // the next worker runs nothing.
         slot.arm(4);
         let mut over_live = job(DebuggerChange::On, 4, &slot);
         over_live.config_path = Some(config.clone());
@@ -3789,7 +3100,6 @@ mod tests {
         });
         assert_eq!(slot.take(4).refused, Some(WorkerRefusal::PeerChanging));
 
-        // A lock held elsewhere: nothing runs.
         let LockTry::Held(held) = try_change_lock(&config) else {
             panic!("free");
         };
@@ -3802,12 +3112,10 @@ mod tests {
         assert!(refused.gone && refused.spawned.is_none() && refused.result.is_none());
         drop(held);
 
-        // A later job's slot drops an older job's publications.
         slot.arm(6);
         slot.publish_result(5, DevtoolsChangeRun::SpawnFailed);
         slot.publish_refused(5, WorkerRefusal::NoLock);
         assert_eq!(slot.take(6), SlotRead::default());
-        // A worker that panics mid-run still sets `gone` for the park.
         slot.arm(7);
         let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             run_devtools_job(job(DebuggerChange::Off, 7, &slot), |_, _, _| {
@@ -3828,7 +3136,6 @@ mod tests {
     #[test]
     fn drift_records_only_transitions_names_no_cause_and_never_asks_to_re_enable() {
         let mut watch = DriftWatch::default();
-        // Seen before the marker is read: judged once it is.
         assert_eq!(
             watch.on_observed(DebuggerMode::Disabled, None, 1),
             DriftStep::default()
@@ -3842,26 +3149,20 @@ mod tests {
         assert_eq!(step.record, Some(DebuggerRecord::WasOnNowOff));
         assert_eq!(step.write.map(|m| m.mode), Some(DebuggerMode::Disabled));
         assert_eq!(watch.drift_since(), Some(100));
-        // The same mode again: nothing, no write.
         assert_eq!(
             watch.on_observed(DebuggerMode::Disabled, None, 300),
             DriftStep::default()
         );
-        // Unrecognized and unknown are not drift.
         for mode in [DebuggerMode::Unrecognized, DebuggerMode::Unknown] {
             assert_eq!(watch.on_observed(mode, None, 301), DriftStep::default());
         }
-        // Turned on from aterm: "Debugger access on", origin aterm, drift cleared.
         let on = watch.on_observed(DebuggerMode::Enabled, Some(DebuggerChange::On), 400);
         assert_eq!(on.record, Some(DebuggerRecord::On));
         assert_eq!(on.write.map(|m| m.origin), Some(Origin::Aterm));
         assert_eq!(watch.drift_since(), None);
-        // Turned off from aterm: "Debugger access off", not drift.
         let off = watch.on_observed(DebuggerMode::Disabled, Some(DebuggerChange::Off), 500);
         assert_eq!(off.record, Some(DebuggerRecord::Off));
         assert_eq!(watch.drift_since(), None);
-        // Turned on elsewhere: judged once the shared record is read again,
-        // and still off there: "Debugger access on, set outside aterm".
         let on_disk = watch.recorded();
         assert_eq!(
             watch.on_observed(DebuggerMode::Enabled, None, 600),
@@ -3871,7 +3172,6 @@ mod tests {
         let outside = watch.seed(on_disk, 601, false);
         assert_eq!(outside.record, Some(DebuggerRecord::OnOutside));
         assert_eq!(outside.write.map(|m| m.origin), Some(Origin::Outside));
-        // First sight, no marker: recorded, no record (no transition was seen).
         let mut fresh = DriftWatch::default();
         assert_eq!(fresh.seed(None, 1, false), DriftStep::default());
         assert_eq!(
@@ -3883,10 +3183,6 @@ mod tests {
         assert_eq!(first.write.map(|m| m.origin), Some(Origin::Unknown));
     }
 
-    /// Two windowed aterms share one config. The idle one judges the other's
-    /// change against the shared record: never set outside aterm, never drift,
-    /// never overwriting the peer's `aterm` origin. A change neither made is
-    /// still recorded as outside.
     #[test]
     fn a_peer_aterms_change_is_judged_against_the_shared_record() {
         let dir = scratch("peer-drift");
@@ -3917,7 +3213,6 @@ mod tests {
             LaneStep::default()
         );
         assert!(!b.records_due(201), "nothing new: nothing to read");
-        // The peer turns it on and records it (its re-probe's write).
         write(ObservedMarker {
             mode: DebuggerMode::Enabled,
             since: 302,
@@ -3944,7 +3239,6 @@ mod tests {
             Some((302, Origin::Aterm)),
             "the peer's record stands"
         );
-        // The peer turns it off again: aterm's change, not drift.
         write(ObservedMarker {
             mode: DebuggerMode::Disabled,
             since: 600,
@@ -3957,7 +3251,6 @@ mod tests {
         assert_eq!(reread(&mut b, 700).drift, DriftStep::default());
         let facts = b.facts(true, probe(DebuggerMode::Disabled), SelfHardening::Hardened);
         assert_eq!(facts.drift_since, None, "no \"it is off now\" line");
-        // Turned on outside every aterm: the record still says off.
         assert_eq!(
             b.observe(probe(DebuggerMode::Enabled), 800).drift,
             DriftStep::default()
@@ -3968,16 +3261,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A's change child exits; A takes the result, re-probes, and only then
-    /// records it. Peer B, re-reading the shared records inside that window, finds
-    /// A's change marker (its child dead) and re-reads the change as aterm's, not
-    /// as set outside aterm. The marker goes once the change is recorded.
     #[cfg(unix)]
     #[test]
     fn a_peer_reading_between_a_changes_result_and_its_record_files_it_as_aterms() {
         let dir = scratch("result-window");
         let config = dir.join("aterm.toml");
-        // What `App::apply_debugger_step` does with a step's markers.
         let apply = |step: &LaneStep| {
             settle_markers(
                 &config,
@@ -4009,8 +3297,6 @@ mod tests {
             reread(lane, 200);
             apply(&lane.observe(probe(DebuggerMode::Disabled), 201));
         }
-        // A's change: the real worker body writes the marker under the lock,
-        // and its child exits with the rule turned on.
         let ticket = a
             .begin(DebuggerChange::On, OwnerAnswer::yes_for_test())
             .unwrap();
@@ -4033,7 +3319,6 @@ mod tests {
         apply(&a.poll(300));
         assert!(a.awaiting_probe(), "A took the result; its re-probe is out");
 
-        // Inside the window, B sees the rule on and judges it against a fresh read.
         apply(&b.observe(probe(DebuggerMode::Enabled), 301));
         assert!(b.records_due(301), "B asks for the shared records");
         let read = reread(&mut b, 301);
@@ -4070,9 +3355,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A released change is not adopted again: a records read that still finds
-    /// this aterm's own dead marker (its removal runs on another thread) neither
-    /// re-opens the change nor asks to remove the marker twice.
     #[cfg(unix)]
     #[test]
     fn a_released_changes_marker_read_before_its_removal_is_not_adopted_again() {
@@ -4114,7 +3396,6 @@ mod tests {
         );
         run_devtools_job(worker, |_, _, on_spawn| {
             on_spawn(child(81));
-            // The owner cancelled macOS's dialog: nothing changed.
             DevtoolsChangeRun::Exited {
                 code: Some(1),
                 stdout_head: String::new(),
@@ -4125,7 +3406,6 @@ mod tests {
         let ended = lane.observe(probe(DebuggerMode::Disabled), 301);
         assert_eq!(ended.outcome, Some(Outcome::NotChanged(DebuggerChange::On)));
         assert_eq!(ended.remove_change_marker, Some(child(81)));
-        // The removal has not run yet: a records read finds the marker.
         let out = lane.ask_records();
         let read = read_records(&config, |_| false);
         assert_eq!(read.stale.map(|m| m.child), Some(child(81)));
@@ -4145,10 +3425,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A records read that finds this aterm's own change's marker, its child
-    /// gone, before the park read the child from the slot: one park re-read takes
-    /// both, and the marker stays until the re-probe is recorded rather than being
-    /// removed as a stranger's.
     #[cfg(unix)]
     #[test]
     fn a_records_read_naming_the_jobs_own_exited_child_keeps_its_marker() {
@@ -4177,7 +3453,6 @@ mod tests {
         lane.settle_records(read_records(&config, |_| false));
         apply(&lane.poll(200));
         apply(&lane.observe(probe(DebuggerMode::Disabled), 201));
-        // A records re-read is asked; its reader runs after the worker.
         let out = lane.ask_records();
         let ticket = lane
             .begin(DebuggerChange::On, OwnerAnswer::yes_for_test())
@@ -4225,9 +3500,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A re-probe that lands while the drift watch waits for a fresh records read
-    /// is judged at that read, and the change's marker waits with it, so a peer
-    /// re-reading in between files the change as aterm's.
     #[cfg(unix)]
     #[test]
     fn a_re_probe_judged_at_a_pending_records_read_keeps_the_marker_until_then() {
@@ -4264,18 +3536,15 @@ mod tests {
             reread(lane, 200);
             apply(&lane.observe(probe(DebuggerMode::Enabled), 201));
         }
-        // The rule is turned off outside aterm; B sees it first and records it.
         apply(&b.observe(probe(DebuggerMode::Disabled), 210));
         assert!(b.records_due(210));
         assert_eq!(
             reread(&mut b, 210).drift.record,
             Some(DebuggerRecord::WasOnNowOff)
         );
-        // A sees it too and asks for the records; its reader is slow.
         apply(&a.observe(probe(DebuggerMode::Disabled), 211));
         assert!(a.records_due(211), "A judges it against a fresh read");
         let out = a.ask_records();
-        // Meanwhile the owner turns it back on from A.
         let ticket = a
             .begin(DebuggerChange::On, OwnerAnswer::yes_for_test())
             .unwrap();
@@ -4306,7 +3575,6 @@ mod tests {
         );
         assert!(dir.join(CHANGE_MARKER).exists());
 
-        // B re-reads in that window: A's marker, its child gone.
         apply(&b.observe(probe(DebuggerMode::Enabled), 302));
         let read = reread(&mut b, 302);
         assert_ne!(
@@ -4319,7 +3587,6 @@ mod tests {
         apply(&b_ended);
         assert_eq!(b_ended.drift.record, Some(DebuggerRecord::On));
 
-        // A's read answers: the watch judges, and the marker may go.
         *out.lock().unwrap_or_else(|p| p.into_inner()) = Some(read_records(&config, |_| false));
         let settled = a.poll(304);
         apply(&settled);
@@ -4333,9 +3600,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A change whose child finished while no aterm read its result is still
-    /// aterm's: the re-probe records it as the owner's change from aterm, never as
-    /// outside or drift, also when a probe landed before the records did.
     #[test]
     fn a_stale_change_marker_is_re_read_as_this_aterms_change() {
         for ((change, before, after, want), early) in [
@@ -4401,7 +3665,6 @@ mod tests {
             );
             assert_eq!(lane.drift.drift_since(), None, "{change:?}: no drift line");
         }
-        // Read unchanged: the owner's decline, never retried.
         let mut lane = DebuggerChangeLane::with_liveness(|_| false);
         lane.settle_records(RecordsRead {
             stale: ChangeMarker::new(DebuggerChange::On, child(32), 1),
@@ -4412,9 +3675,6 @@ mod tests {
         assert_eq!(ended.outcome, Some(Outcome::NotChanged(DebuggerChange::On)));
     }
 
-    /// The `WF(Notice)` site, lane level: while a child is in flight the park keeps
-    /// re-reading, so a result whose wake was dropped is found by the next re-read,
-    /// and so is a predecessor's child that died with an empty slot.
     #[test]
     fn a_lost_debugger_result_is_re_read() {
         let mut lane = DebuggerChangeLane::with_liveness(|_| false);
@@ -4428,7 +3688,6 @@ mod tests {
             "idle parks forever"
         );
         lane.observe(probe(DebuggerMode::Disabled), 2);
-        // First sight is judged against a fresh read of the shared record.
         assert!(lane.records_due(2));
         lane.settle_records(RecordsRead::default());
         assert_eq!(
@@ -4441,8 +3700,6 @@ mod tests {
             .job();
         let now = Instant::now();
         assert_eq!(lane.next_deadline(now), Some(now + RESULT_RECHECK));
-        // The child started and the park read it: in flight, and still re-reading
-        // every RESULT_RECHECK, since the wake of its exit may never come.
         let slot = lane.slot();
         slot.publish_spawned(job, child(11));
         assert_eq!(lane.poll(3), LaneStep::default());
@@ -4454,7 +3711,6 @@ mod tests {
             "a child in flight keeps the park re-reading"
         );
         assert!(!lane.result_unread());
-        // The child exited and the worker published; no wake arrived.
         slot.publish_result(
             job,
             DevtoolsChangeRun::Exited {
@@ -4489,7 +3745,6 @@ mod tests {
         );
         assert!(!lane.needs_poll());
 
-        // A predecessor's child, alive at launch, dead now, nothing in the slot.
         static ALIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
         let mut successor =
             DebuggerChangeLane::with_liveness(|_| ALIVE.load(std::sync::atomic::Ordering::SeqCst));
@@ -4512,7 +3767,6 @@ mod tests {
                 .map(|(c, _, _, inherited)| (c, inherited)),
             Some((DebuggerChange::On, true))
         );
-        // …and a press is refused while it is: the cross-process OneChild.
         assert_eq!(
             successor.begin(DebuggerChange::On, OwnerAnswer::yes_for_test()),
             Err(Refusal::InFlight)
@@ -4533,7 +3787,6 @@ mod tests {
 
     #[test]
     fn a_worker_that_ends_without_a_result_is_lost_and_a_not_due_read_is_observed() {
-        // Gone before spawning: nothing ran.
         let mut lane = DebuggerChangeLane::with_liveness(|_| false);
         lane.settle_records(RecordsRead {
             observed: Some(ObservedMarker {
@@ -4553,7 +3806,6 @@ mod tests {
         let step = lane.poll(2);
         assert_eq!(step.outcome, Some(Outcome::NotStarted(DebuggerChange::On)));
         assert_eq!(lane.flow().phase(), Phase::Idle);
-        // Gone after spawning: the child is re-read by probe.
         let job = lane
             .begin(DebuggerChange::On, OwnerAnswer::yes_for_test())
             .unwrap()
@@ -4568,7 +3820,6 @@ mod tests {
                 .remove_change_marker,
             Some(child(5))
         );
-        // Another aterm's change holds the lock: nothing ran here, said so.
         let job = lane
             .begin(DebuggerChange::On, OwnerAnswer::yes_for_test())
             .unwrap()
@@ -4589,8 +3840,6 @@ mod tests {
             lane.poll(7).outcome,
             Some(Outcome::NotStarted(DebuggerChange::On))
         );
-        // NotDue: the worker's fresh read showed a customised rule; it is the
-        // flow's observation now, and the drift watch sees it.
         let job = lane
             .begin(DebuggerChange::On, OwnerAnswer::yes_for_test())
             .unwrap()
@@ -4689,11 +3938,6 @@ mod tests {
         );
     }
 
-    // The launch ask
-
-    /// Facts under which the launch ask asks: every gate open, this Mac not in
-    /// the record, the records and the probe read (off, an admin), a hardened
-    /// aterm, both launch pages over, nothing up, and a quiet moment.
     fn ready() -> LaunchAskFacts {
         LaunchAskFacts {
             windowed: true,
@@ -4734,16 +3978,9 @@ mod tests {
         })
     }
 
-    /// THE LAUNCH ASK'S TABLE: every named outcome, each from the ready facts with
-    /// one fact changed, then the order between neighbours. An aterm that is not
-    /// hardened, or cannot tell, asks nothing by itself (its button still offers
-    /// the change); neither does an account whose membership is unknown; debugger
-    /// access on, or seen go off, settles the question for this Mac; and
-    /// `[privacy] notice = false` silences it.
     #[test]
     fn the_launch_ask_names_every_outcome_in_its_order() {
         use LaunchAsk::{Ask, Drop, Settle, Wait};
-        /// A row: its name, the one change to the ready facts, the outcome.
         type Row = (&'static str, fn(&mut LaunchAskFacts), LaunchAsk);
         assert_eq!(admit_launch_ask(&ready()), Ask);
         let rows: &[Row] = &[
@@ -4879,7 +4116,6 @@ mod tests {
                 |f| f.probe_fresh = false,
                 Wait(AskWait::ProbeStale),
             ),
-            // Off at first sight is no reason to hold back: asked.
             (
                 "first sight off",
                 |f| f.recorded = recorded(DebuggerMode::Disabled, Origin::Unknown),
@@ -4896,7 +4132,6 @@ mod tests {
             change(&mut facts);
             assert_eq!(admit_launch_ask(&facts), *expected, "{name}");
         }
-        // Every named outcome is reached by some row.
         let every = [
             Ask,
             Drop(AskDrop::Headless),
@@ -4942,7 +4177,6 @@ mod tests {
             assert!(words.insert(word), "{word} names one outcome");
         }
 
-        // The order between neighbours: the first that holds decides.
         let order: &[Row] = &[
             (
                 "a gate before the host",
@@ -5010,8 +4244,6 @@ mod tests {
                 },
                 Wait(AskWait::ProbePending),
             ),
-            // An answer the owner gave in this process settles, whatever the
-            // rule, the account or aterm's hardening would have dropped.
             (
                 "answered before an unrecognized rule",
                 |f| {
@@ -5112,8 +4344,6 @@ mod tests {
                 },
                 Wait(AskWait::NotQuiet),
             ),
-            // A stale reading is re-read only at the moment, never while the ask
-            // waits for it; and a stale `Enabled` still settles at once.
             (
                 "the moment before a stale probe",
                 |f| {
@@ -5138,8 +4368,6 @@ mod tests {
         }
     }
 
-    /// A wait looks again soon only while a read it started completes, and
-    /// never at once: a past deadline would spin the park.
     #[test]
     fn a_waiting_launch_ask_looks_again_soon_only_for_a_read() {
         use crate::devtools_helper::{PANEL_TICK, RECHECK_EVERY};
@@ -5179,10 +4407,6 @@ mod tests {
         );
     }
 
-    /// THE ASKED RECORD: absent is not asked; the write is DURABLE (it goes down
-    /// before the alert it stands for); one line per Mac, the same Mac never
-    /// twice; bounded to the newest [`MAX_ASKED_LINES`] Macs, the oldest dropped
-    /// (and so asked again); and a host key no line could hold is refused.
     #[test]
     fn the_asked_record_is_durable_one_line_per_mac_and_bounded() {
         use aterm_durable::{Flush, seam::Recording};
@@ -5228,7 +4452,6 @@ mod tests {
         assert_eq!(text.lines().count(), MAX_ASKED_LINES);
         assert!(text.starts_with("MAC-B 300\n") && text.ends_with("MAC-I 400\n"));
         assert!(!read_asked(&config, "MAC-A"), "the oldest Mac went");
-        // The longest record this build writes fits its own bound.
         let long = |i: u8| format!("{}{}", "F".repeat(MAX_HOST_BYTES - 1), char::from(b'0' + i));
         for i in 0..8 {
             note_asked(&config, &long(i), u64::MAX).unwrap();
@@ -5256,10 +4479,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A record that is there but cannot be read whole reads as ASKED — fail
-    /// toward not asking — and is never followed, overwritten or replaced: a
-    /// planted link (to a record naming another Mac), a folder, an oversized
-    /// file, and every malformed shape.
     #[cfg(unix)]
     #[test]
     fn an_unreadable_asked_record_reads_as_asked_and_is_left_as_found() {
@@ -5317,14 +4536,11 @@ mod tests {
             assert!(note_asked(&config, "MAC-A", 2).is_err());
             assert_eq!(std::fs::read(&path).unwrap(), bytes, "left as found");
         }
-        // A whole record naming other Macs only is not this Mac's answer.
         std::fs::write(&path, "MAC-B 1\nMAC-C 2\n").unwrap();
         assert!(!read_asked(&config, "MAC-A"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A lane where a press of *Allow debugger access…* would be taken: records
-    /// read, the probe reading it off.
     #[cfg(unix)]
     fn askable() -> DebuggerChangeLane {
         let mut lane = DebuggerChangeLane::with_liveness(|_| false);
@@ -5339,11 +4555,6 @@ mod tests {
         panic!("no alert may be raised here")
     }
 
-    /// THE LAUNCH OFFER takes the owner's answer exactly as a press: a yes arms the
-    /// same job a press arms and gives the ticket; no, nobody asked, and a quiet
-    /// give none. The record is written BEFORE the alert in every case, so a
-    /// second offer on the same config folder — this lane, or a new one as after
-    /// a relaunch — asks nothing; another Mac on that folder is asked.
     #[cfg(unix)]
     #[test]
     fn the_launch_offer_writes_ahead_and_takes_the_answer_as_a_press() {
@@ -5405,11 +4616,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// An offer the press would refuse writes NOTHING and raises nothing: records
-    /// unread, the probe not showing it off, a change under way here, a peer's
-    /// change lock held, a change marker on disk. A lock that cannot be made, or
-    /// a record that cannot be written, raises nothing either. `forgo` writes the
-    /// record alone.
     #[cfg(unix)]
     #[test]
     fn a_refused_launch_offer_writes_nothing_and_forgo_writes_only_the_record() {
@@ -5457,7 +4663,6 @@ mod tests {
         std::fs::remove_file(dir.join(CHANGE_MARKER)).unwrap();
         assert!(unwritten(&dir), "no refusal wrote the record");
 
-        // A folder the lock cannot be created in: nothing is asked.
         let locked = dir.join("locked");
         std::fs::create_dir(&locked).unwrap();
         {
@@ -5475,8 +4680,6 @@ mod tests {
             std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
         }
 
-        // A lock that opens, in a folder the record cannot be written to:
-        // nothing is asked, and no part of a record is left behind.
         let sealed = dir.join("sealed");
         std::fs::create_dir(&sealed).unwrap();
         let sealed_config = sealed.join("aterm.toml");
@@ -5514,9 +4717,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The App's queue: queued only when asked to be, due at once, then at the
-    /// look it was put off to; the record read once per process; the offer's disk
-    /// half one at a time; over at `end`.
     #[test]
     fn the_launch_ask_queue_looks_when_due_and_reads_the_record_once() {
         let idle = LaunchAskQueue::new(false);
@@ -5566,9 +4766,6 @@ mod tests {
             Some(RecordRead::Thread),
             "a launch reads it off the event loop"
         );
-        // The offer's disk half: one out at a time; its end makes the ask due
-        // before its time; its answer is taken once, with the reading it went
-        // out for.
         let read = DebuggerFacts::default();
         assert_eq!(queue.take_prepared(), None, "none started");
         assert!(!queue.preparing());
@@ -5600,10 +4797,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Refused offers keep the ask queued, looking again later, for at most
-    /// [`REFUSED_FOR`] from the first refusal, whatever waits came between: then
-    /// it is over for this process, so a disk state the lane never settles cannot
-    /// hold the folder warm-up (which waits while the ask is queued) for longer.
     #[test]
     fn refused_offers_hold_the_launch_ask_for_a_bounded_span() {
         use crate::devtools_helper::RECHECK_EVERY;
@@ -5616,7 +4809,6 @@ mod tests {
         while at + RECHECK_EVERY < first + REFUSED_FOR {
             at += RECHECK_EVERY;
             assert!(queue.due(at));
-            // A wait between refusals does not restart the span.
             queue.wait(AskWait::NotQuiet, at + RECHECK_EVERY);
             assert!(queue.refused(at), "still within the span");
         }
@@ -5624,12 +4816,6 @@ mod tests {
         assert!(!queue.queued() && queue.next_deadline().is_none());
     }
 
-    /// READS OF THE RULE THAT READ NOTHING HOLD A RECORDED ASK FOR A BOUNDED SPAN:
-    /// each is read again while the span from the first lasts, a wait between them
-    /// restarting nothing; past the span the ask ends once [`UNREAD_READS`] have
-    /// failed, but not on fewer, so one failure met after an absence (no look runs
-    /// while no aterm window is focused) does not end an ask on a Mac already
-    /// recorded.
     #[test]
     fn reads_that_read_nothing_hold_a_recorded_launch_ask_for_a_bounded_span() {
         use crate::devtools_helper::RECHECK_EVERY;
@@ -5659,14 +4845,6 @@ mod tests {
         assert!(!queue.queued());
     }
 
-    /// THE OFFER JUDGES THE DISK AS THE WORKER DOES. A file at the change marker's
-    /// path that names no change — a link, a folder, an oversized or malformed
-    /// file — is no change: the records reader and the worker ignore it, so the
-    /// offer asks. A marker naming a gone child this lane does not follow is
-    /// refused, and asks the park for a records read at once, so the lane adopts
-    /// it and the next look settles; one this lane follows already is no change.
-    /// A lock file the offer cannot open or lock ends it with nothing written: no
-    /// yes could start the worker, which refuses without the lock.
     #[cfg(unix)]
     #[test]
     fn the_launch_offer_judges_the_disk_as_the_worker_does() {
@@ -5693,8 +4871,6 @@ mod tests {
             "another lane cannot ask before the claimed record is written"
         );
         assert!(!asked("MAC-CLAIM"), "the refused contender wrote nothing");
-        // The lock held is a peer's worker, which keeps it from its re-read through its
-        // child's exit: its change is followed at the next records read, at once.
         assert!(
             contender.records_due(now_secs()),
             "a held lock asks the park for a records read"
@@ -5715,7 +4891,6 @@ mod tests {
             Err(OfferEnd::Asked),
             "the durable claim is visible after the lock is released"
         );
-        /// What a stray puts at the marker's path.
         type Plant = fn(&Path);
         let strays: [(&str, &str, Plant); 4] = [
             ("a link", "MAC-A", |at| {
@@ -5744,9 +4919,7 @@ mod tests {
             }
         }
 
-        // A gone child nobody recorded: refused, and read again at once.
         let mut lane = askable();
-        // The read its first probe asked for, which seeds the drift watch.
         lane.settle_records(read_records(&config, |_| false));
         lane.poll(3);
         assert!(
@@ -5764,7 +4937,6 @@ mod tests {
         lane.settle_records(read_records(&config, |_| false));
         lane.poll(now_secs());
         assert!(lane.under_way(), "adopted: the next look settles");
-        // The same marker, followed by the lane that let it go: no change.
         let mut released = askable();
         released.released = Some(child(4242));
         assert!(
@@ -5773,7 +4945,6 @@ mod tests {
         );
         std::fs::remove_file(&marker_at).unwrap();
 
-        // A lock file that cannot be opened: nothing written, nothing asked.
         std::fs::remove_file(&lock_at).unwrap();
         std::os::unix::fs::symlink("/dev/null", &lock_at).unwrap();
         assert_eq!(
@@ -5785,29 +4956,8 @@ mod tests {
     }
 }
 
-// Tier-1: the real lane, worker and order against the derived model
-
-/// Tier-1 `debugger_access_conforms_to_the_model` (design §5.4): drives the production
-/// composition — [`DebuggerChangeLane`], the worker body [`run_devtools_job`] on its own thread
-/// with the real change lock and marker in a scratch config folder, and the real order
-/// `aterm_containment::consent::devtools_change_with_for_test` with a scripted `-status` re-read
-/// and a stand-in child — and projects it, direction-normalised, onto
-/// `aterm_models_gui::debugger_access_change_model()`. Each step's model guard must equal what
-/// the composition did, and a taken step must land on a successor the model admits.
-///
-/// `phase`, `obs` and `polling` come from the lane (phase 5 is a result it has not taken);
-/// `claim` from `native_settings::debugger_row_states`; `lock` from the real `flock` and a marker
-/// naming a live child; `asked` from the asked record on disk, through the real reader, for the
-/// rig's one Mac; the counters from what the stand-in environment saw, never the lane's own;
-/// `world` and `clobbered` are the environment's.
-///
-/// Three steps are compound: the owner's press-and-answer runs `Press`, `Consent`/`Decline` and,
-/// on a yes, `Recheck` and `Launch` up to the park reading the spawned child; the launch ask runs
-/// `Offer` and then the same answer (On only: aterm never asks by itself to turn it off); and a
-/// probe the lane refuses leaves the row's cached answer alone. A relaunch over the same config
-/// folder starts a new lane where the model can be, and is checked from there on.
+/// Tier-1 `debugger_access_conforms_to_the_model` (design §5.4): drives the production composition.
 #[cfg(test)]
-// Its harness runs where the change lock does (unix); see the tests below.
 #[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) mod conformance {
     use super::*;
@@ -5819,8 +4969,7 @@ pub(crate) mod conformance {
     use std::sync::atomic::{AtomicI64, AtomicU32, Ordering};
     use std::sync::mpsc;
 
-    /// Normalise a mode by the change: its precondition is 0, its target 1, an
-    /// unrecognised rule 2, and not read 3.
+    /// Normalise a mode by the change: its precondition is 0, its target 1, an unrecognised rule 2, and not read 3.
     pub(crate) fn norm(mode: DebuggerMode, change: DebuggerChange) -> i64 {
         match mode {
             m if m == change.precondition() => 0,
@@ -5830,8 +4979,6 @@ pub(crate) mod conformance {
         }
     }
 
-    /// The argv each direction must run, spelled here independently of the
-    /// containment crate's private builders: the second oracle for the order.
     fn change_argv(change: DebuggerChange) -> [&'static str; 2] {
         match change {
             DebuggerChange::On => ["/usr/sbin/DevToolsSecurity", "-enable"],
@@ -5847,9 +4994,6 @@ pub(crate) mod conformance {
         }
     }
 
-    /// The stand-in children alive on "this Mac", by pid: the lane's liveness
-    /// check, shared with the worker threads (a plain `fn`, as the shipping
-    /// `DevtoolsChild::is_running` is). Every harness uses its own pids.
     static ALIVE: Mutex<Option<HashSet<u32>>> = Mutex::new(None);
     static NEXT_PID: AtomicU32 = AtomicU32::new(3_000_000);
 
@@ -5881,26 +5025,19 @@ pub(crate) mod conformance {
         }
     }
 
-    /// What the stand-in environment saw a worker do.
     #[derive(Clone, Debug, PartialEq, Eq)]
     enum Event {
-        /// The order's `-status` re-read, normalised.
         Read(i64),
-        /// A change child started with this argv.
         Spawn(Vec<String>),
     }
 
-    /// The environment the worker threads share with the harness.
     struct Env {
         change: DebuggerChange,
-        /// The rule, normalised.
         world: AtomicI64,
         log: Mutex<Vec<Event>>,
-        /// 0 running, 1 blocked in its child, 2 ended.
         stage: AtomicI64,
     }
 
-    /// The harness's own accounting, from what it saw and what it gave.
     #[derive(Clone, Copy, Debug, Default)]
     struct Seen {
         clobbered: i64,
@@ -5910,10 +5047,7 @@ pub(crate) mod conformance {
         armed: i64,
         unarmed: i64,
         misadopted: i64,
-        /// A launch ask went past its gates while the asked record already
-        /// named this Mac.
         reasked: i64,
-        /// A launch ask went past its gates while a change was under way.
         overlapped: i64,
     }
 
@@ -5923,21 +5057,12 @@ pub(crate) mod conformance {
         cached: DebuggerProbe,
         lock: i64,
         inflight: i64,
-        /// A change marker on disk naming a dead child the lane does not
-        /// follow.
         stale: i64,
-        /// The asked record on disk names the rig's Mac (`read_asked`).
         asked: i64,
         seen: &'a Seen,
     }
 
     /// The projection (the anchors' `project`).
-    ///
-    /// The model's other actions are the environment's or the mutants' (the
-    /// press's on `Buggy = 1`, the launch ask's on `Buggy = 2`), waived here by
-    /// name; each mutant's negative control runs the
-    /// harness over a composition carrying that defect and requires it to fail
-    /// (`the_harness_fails_every_faulty_composition`).
     #[aterm_spec_anchor::spec_unmodeled(
         machine = "DebuggerAccessChange",
         action = "Drift",
@@ -6102,30 +5227,18 @@ pub(crate) mod conformance {
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub(crate) enum Fault {
         None,
-        /// An order that spawns on the render's reading, never re-reading.
         SkipRecheck,
-        /// A worker that takes no change lock.
         IgnorePeerLock,
-        /// A lane whose press guard lets a press through while in flight.
         PressWhileInFlight,
-        /// A lane that takes the child's exit as the change's target.
         ClaimFromExit,
-        /// A lane that stops asking the park to re-read while a child runs.
         DropPollInFlight,
-        /// A host that retries an unchanged result without asking.
         RetryAfterCancel,
-        /// A records reader that takes every marker's child for dead.
         AdoptLive,
-        /// A launch ask that never reads the asked record.
         OfferAgain,
-        /// A launch ask that never asks whether a change is under way.
         OfferWhileInFlight,
-        /// A launch ask that takes a yes no alert gave.
         OfferRunsUnasked,
     }
 
-    /// The worker thread the harness started, as `ConsentGestures::live`
-    /// would: its child's exit is the harness's to give.
     struct Worker {
         exit: mpsc::Sender<DevtoolsChangeRun>,
         handle: std::thread::JoinHandle<()>,
@@ -6133,8 +5246,7 @@ pub(crate) mod conformance {
         child: DevtoolsChild,
     }
 
-    /// The harness: the real lane, the environment, and the model state it
-    /// must keep agreeing with.
+    /// The harness: the real lane, the environment, and the model state it must keep agreeing with.
     pub(crate) struct Rig {
         model: Model,
         lane: DebuggerChangeLane,
@@ -6143,18 +5255,12 @@ pub(crate) mod conformance {
         dir: PathBuf,
         config: PathBuf,
         world: i64,
-        /// The row's cached probe answer (`ConsentState::debugger`).
         cached: DebuggerProbe,
         seen: Seen,
-        /// Events of the current worker already accounted.
         consumed: usize,
         worker: Option<Worker>,
-        /// A peer aterm's held lock and its live child.
         peer: Option<(ChangeLock, DevtoolsChild)>,
-        /// The last peer child that exited, whose change that peer has yet
-        /// to record.
         peer_gone: Option<DevtoolsChild>,
-        /// A predecessor's child, read from its marker at start.
         inherited: Option<DevtoolsChild>,
         state: State,
     }
@@ -6162,7 +5268,6 @@ pub(crate) mod conformance {
     impl Drop for Rig {
         fn drop(&mut self) {
             if let Some(worker) = self.worker.take() {
-                // Dropping the sender lets a blocked stand-in return.
                 drop(worker.exit);
                 let _ = worker.handle.join();
                 set_alive(worker.child.pid, false);
@@ -6173,14 +5278,12 @@ pub(crate) mod conformance {
             if let Some(child) = self.inherited.take() {
                 set_alive(child.pid, false);
             }
-            // A rig whose folder a relaunch took over leaves it to that one.
             if !self.dir.as_os_str().is_empty() {
                 let _ = std::fs::remove_dir_all(&self.dir);
             }
         }
     }
 
-    /// The Mac every rig runs on, as the asked record keys it.
     const RIG_HOST: &str = "00000000-0000-4000-8000-00000000d1b6";
 
     fn hang_detector(what: &str, done: impl Fn() -> bool) {
@@ -6231,8 +5334,7 @@ pub(crate) mod conformance {
             }
         }
 
-        /// A fresh lane: records read, nothing observed — the model's
-        /// initial state. The shared observed record holds the rule as it is.
+        /// A fresh lane: records read, nothing observed — the model's initial state.
         pub(crate) fn new(change: DebuggerChange, world: DebuggerMode, fault: Fault) -> Self {
             let mut rig = Self::bare(change, world, fault);
             rig.record_world();
@@ -6247,8 +5349,6 @@ pub(crate) mod conformance {
             rig
         }
 
-        /// A successor whose predecessor's child is still running: its marker
-        /// is on disk and read at start. Checked from there on.
         fn inherited(change: DebuggerChange, world: DebuggerMode) -> Self {
             let mut rig = Self::bare(change, world, Fault::None);
             let child = stand_in();
@@ -6281,13 +5381,6 @@ pub(crate) mod conformance {
             rig
         }
 
-        /// The next launch on this Mac over the same config folder, with
-        /// nothing running: a new lane reads the shared records afresh and has
-        /// read no probe yet, while the asked record, the observed record and
-        /// the change marker stay as the last process left them, and what
-        /// that process saw happen stays seen. The model has no process
-        /// boundary, so the new lane must start in a state the model reaches.
-        /// Checked from there on.
         fn relaunch(mut self) -> Self {
             assert!(
                 self.worker.is_none() && self.peer.is_none() && self.inherited.is_none(),
@@ -6300,7 +5393,6 @@ pub(crate) mod conformance {
                 lane,
                 change: self.change,
                 fault: self.fault,
-                // The folder moves to the new rig, which removes it.
                 dir: std::mem::take(&mut self.dir),
                 config: self.config.clone(),
                 world: self.world,
@@ -6331,8 +5423,6 @@ pub(crate) mod conformance {
             rig
         }
 
-        /// An earlier aterm's observed record of the rule as it is now, so the
-        /// drift watch judges the change's re-probe at once.
         fn record_world(&self) {
             let marker = ObservedMarker {
                 mode: denorm(self.world, self.change),
@@ -6348,7 +5438,6 @@ pub(crate) mod conformance {
             .unwrap();
         }
 
-        /// The observed record on disk, mode normalised, and its origin.
         fn recorded(&self) -> Option<(i64, Origin)> {
             read_debugger_marker(&self.config, OBSERVED_MARKER)
                 .and_then(|text| ObservedMarker::parse(&text))
@@ -6362,9 +5451,6 @@ pub(crate) mod conformance {
             let marker_live = read_debugger_marker(&self.config, CHANGE_MARKER)
                 .and_then(|text| ChangeMarker::parse(&text))
                 .is_some_and(|marker| alive(&marker.child));
-            // One try reads the fact: every holder here lets go by `LOCK_UN`, so a
-            // busy lock has a holder (the peer, the worker while its child is in
-            // flight, or a leaked lock, which fails the step).
             match try_change_lock(&self.config) {
                 LockTry::Busy => 1,
                 LockTry::Held(_) if marker_live => 1,
@@ -6373,7 +5459,6 @@ pub(crate) mod conformance {
             }
         }
 
-        /// Which branch of [`Self::lock_now`] answers, for a failing step.
         fn lock_detail(&self) -> String {
             let marker = read_debugger_marker(&self.config, CHANGE_MARKER)
                 .and_then(|text| ChangeMarker::parse(&text));
@@ -6404,8 +5489,6 @@ pub(crate) mod conformance {
             ours + peer + inherited
         }
 
-        /// The change marker on disk names a dead child the lane does not
-        /// follow.
         fn stale_now(&self) -> i64 {
             i64::from(
                 read_debugger_marker(&self.config, CHANGE_MARKER)
@@ -6416,7 +5499,6 @@ pub(crate) mod conformance {
             )
         }
 
-        /// The asked record on disk names this Mac, as the real reader judges it.
         fn asked_now(&self) -> i64 {
             i64::from(read_asked(&self.config, RIG_HOST))
         }
@@ -6448,7 +5530,6 @@ pub(crate) mod conformance {
             state
         }
 
-        /// Do what a lane step asks, as `App::apply_debugger_step` does.
         fn apply(&mut self, step: LaneStep) {
             if step.invalidate_probe {
                 self.cached = DebuggerProbe::pending();
@@ -6471,9 +5552,6 @@ pub(crate) mod conformance {
             }
         }
 
-        /// Fire the model action `action` against the composition's event,
-        /// whose return says whether it was taken: the guard must agree, and
-        /// a taken step must be one of the model's successors.
         fn step(&mut self, action: &str, event: impl FnOnce(&mut Self) -> bool) {
             let pre = self.now();
             assert_eq!(
@@ -6503,7 +5581,6 @@ pub(crate) mod conformance {
             self.check_invariants();
         }
 
-        /// The states `actions` reach from `pre`, each one enabled in turn.
         fn chain(&self, pre: &State, actions: &[&str]) -> Vec<State> {
             let mut states = vec![pre.clone()];
             for action in actions {
@@ -6517,14 +5594,11 @@ pub(crate) mod conformance {
             states
         }
 
-        /// A completed probe of the rule as it is: the lane takes it only
-        /// idle or once an exited child's result was read.
         fn probe(&mut self) {
             let read = scripted(denorm(self.world, self.change));
             self.step("Probe", |rig| rig.observe(read));
         }
 
-        /// A probe that failed (timed out).
         fn probe_fails(&mut self) {
             let read = DebuggerProbe {
                 mode: DebuggerMode::Unknown,
@@ -6545,7 +5619,6 @@ pub(crate) mod conformance {
             if self.fault == Fault::RetryAfterCancel
                 && matches!(outcome, Some(Outcome::NotChanged(_)))
             {
-                // The fault: the host starts the change again with no alert.
                 let job = self
                     .lane
                     .begin(self.change, OwnerAnswer::yes_for_test())
@@ -6558,9 +5631,6 @@ pub(crate) mod conformance {
             accepts
         }
 
-        /// Start the worker the way `ConsentGestures::live` does, over the
-        /// real body, lock and order, and wait until it blocks in its child or
-        /// ends.
         fn start_worker(&mut self, ticket: ChangeTicket) {
             assert!(self.worker.is_none(), "one worker at a time in the harness");
             let env = Arc::new(Env {
@@ -6581,7 +5651,6 @@ pub(crate) mod conformance {
             );
             let fault = self.fault;
             let shared = Arc::clone(&env);
-            // The worker inherits this thread's patience: this thread holds what it waits on.
             let patience = PATIENCE_FOR_TEST.with(std::cell::Cell::get);
             let handle = std::thread::Builder::new()
                 .name("rig-consent-devtools".into())
@@ -6634,7 +5703,6 @@ pub(crate) mod conformance {
             });
         }
 
-        /// Account what the current worker did since the last look.
         fn account(&mut self) {
             let Some(worker) = self.worker.as_ref() else {
                 return;
@@ -6670,7 +5738,6 @@ pub(crate) mod conformance {
             self.consumed = events.len();
             self.seen.armed = 0;
             if worker.env.stage.load(Ordering::SeqCst) == 2 {
-                // The worker ended: a yes it did not spend is spent now.
                 self.seen.fresh = 0;
                 if let Some(worker) = self.worker.take() {
                     worker.handle.join().expect("the worker ends");
@@ -6678,9 +5745,6 @@ pub(crate) mod conformance {
             }
         }
 
-        /// The owner presses and answers aterm's alert; the host drains the
-        /// request into `DebuggerChangeLane::begin` and, on a yes, starts the
-        /// worker; the park reads what it did.
         fn press(&mut self, answer: OwnerAnswer) {
             let pre = self.now();
             assert_eq!(
@@ -6725,7 +5789,6 @@ pub(crate) mod conformance {
                         .worker
                         .as_ref()
                         .is_some_and(|w| w.env.stage.load(Ordering::SeqCst) == 1);
-                    // The park reads the spawned child, or why none started.
                     let step = self.lane.poll(now_secs());
                     self.apply(step);
                     self.account();
@@ -6745,15 +5808,6 @@ pub(crate) mod conformance {
             self.check_invariants();
         }
 
-        /// The launch ask at its moment, as `App::offer_debugger_access_at_launch`
-        /// and `App::spend_debugger_offer_at_launch` run it, in one step: the real
-        /// `DebuggerChangeLane::offer_now` (the press refusal, the disk half that
-        /// writes this Mac into the asked record, then `offer`, which the App
-        /// calls at the next look) raises the alert (here, `answer`) and takes the
-        /// answer as a press's; on a yes the host starts the worker, and the
-        /// park reads what it did. `None` is a ticket given; otherwise why
-        /// there was none. The offer goes past its gates exactly when the
-        /// model's `Offer` is enabled.
         fn offer(&mut self, answer: OwnerAnswer) -> Option<OfferEnd> {
             assert_eq!(
                 self.change,
@@ -6769,14 +5823,11 @@ pub(crate) mod conformance {
             let answered_yes = matches!(answer, OwnerAnswer::Yes(_));
             let answer_label = format!("{answer:?}");
             let fault = self.fault;
-            // Whether the offer went past its gates, its record written, to
-            // the moment its alert is raised.
             let mut reached = false;
             let offered = match fault {
                 Fault::OfferWhileInFlight
                     if matches!(self.lane.flow.phase(), Phase::InFlight { .. }) =>
                 {
-                    // The fault: an ask that never looks for a change under way.
                     note_asked(&self.config, RIG_HOST, now_secs()).expect("the scratch record");
                     reached = true;
                     self.lane
@@ -6826,7 +5877,6 @@ pub(crate) mod conformance {
                         .worker
                         .as_ref()
                         .is_some_and(|w| w.env.stage.load(Ordering::SeqCst) == 1);
-                    // The park reads the spawned child, or why none started.
                     let step = self.lane.poll(now_secs());
                     self.apply(step);
                     self.account();
@@ -6855,10 +5905,6 @@ pub(crate) mod conformance {
             end
         }
 
-        /// The launch ask settled, as the App settles it (a change under way,
-        /// an alert the owner answered, the rule on, or on or turned off
-        /// before): the real `DebuggerChangeLane::forgo` writes this Mac into
-        /// the asked record, in whatever phase the lane is, and nothing else.
         fn forgo(&mut self) {
             self.step("Forgo", |rig| {
                 let before = rig.now();
@@ -6868,8 +5914,6 @@ pub(crate) mod conformance {
             });
         }
 
-        /// The child exits: applied, unchanged, or over a customised rule —
-        /// ours, or a predecessor's.
         fn exit(&mut self, action: &str) {
             self.step(action, |rig| {
                 match action {
@@ -6905,7 +5949,6 @@ pub(crate) mod conformance {
             });
         }
 
-        /// The park's re-read: only while the lane asks for it.
         fn notice(&mut self) {
             self.step("Notice", |rig| {
                 if !rig.needs_poll() {
@@ -6924,7 +5967,6 @@ pub(crate) mod conformance {
             });
         }
 
-        /// The environment moves the rule.
         fn environment(&mut self, action: &str, world: i64) {
             self.step(action, |rig| {
                 rig.world = world;
@@ -6935,10 +5977,6 @@ pub(crate) mod conformance {
             });
         }
 
-        /// A peer aterm's worker takes the lock, finds no live change named in
-        /// the marker, and starts its child, naming it there — as
-        /// `run_devtools_job` does. One try: the lock is free at once unless
-        /// a holder the rig knows has it.
         fn peer_launch(&mut self) {
             self.step("PeerLaunch", |rig| {
                 let LockTry::Held(lock) = try_change_lock(&rig.config) else {
@@ -6977,9 +6015,6 @@ pub(crate) mod conformance {
             });
         }
 
-        /// The peer records its change's re-probe and lets its marker go, as
-        /// its own lane does: through `settle_markers`, which removes the
-        /// marker only if it still names that peer's child.
         fn peer_settle(&mut self) {
             self.step("PeerSettle", |rig| {
                 let Some(child) = rig.peer_gone else {
@@ -6991,10 +6026,6 @@ pub(crate) mod conformance {
             });
         }
 
-        /// The records re-read mid-session, as the park runs it when a read is
-        /// due: `ask_records`, the reader body over the marker files, and the next
-        /// `poll`. `action` names the model step the scenario expects (`Adopt`,
-        /// `Follow`, `Discard`); a read that moves nothing is that step refused.
         fn reread(&mut self, action: &str) {
             self.step(action, |rig| {
                 let before = rig.now();
@@ -7017,27 +6048,24 @@ pub(crate) mod conformance {
         }
     }
 
-    /// The happy path in both directions, a decline, a cancelled dialog, a run the
-    /// moved rule stops, the named race, drift, a failed re-probe, a peer's change,
-    /// and a predecessor's.
     fn scenarios(fault: Fault) {
         for change in [DebuggerChange::On, DebuggerChange::Off] {
             let mut rig = Rig::new(change, change.precondition(), fault);
-            rig.press(OwnerAnswer::yes_for_test()); // refused: nothing observed yet
+            rig.press(OwnerAnswer::yes_for_test());
             rig.probe();
             rig.press(OwnerAnswer::yes_for_test());
-            rig.press(OwnerAnswer::yes_for_test()); // refused: the child is in flight
-            rig.probe(); // refused: the child is in flight
-            rig.notice(); // nothing to take yet
+            rig.press(OwnerAnswer::yes_for_test());
+            rig.probe();
+            rig.notice();
             rig.exit("ChildApplied");
-            rig.probe(); // refused: its result is unread
-            rig.press(OwnerAnswer::yes_for_test()); // refused: the result is not read yet
+            rig.probe();
+            rig.press(OwnerAnswer::yes_for_test());
             rig.notice();
             assert!(
                 rig.dir.join(CHANGE_MARKER).exists(),
                 "{change:?}: the marker outlives the taken result"
             );
-            rig.press(OwnerAnswer::yes_for_test()); // refused: not re-probed yet
+            rig.press(OwnerAnswer::yes_for_test());
             rig.probe();
             assert_eq!(rig.lane.flow.last(), Some(Outcome::Changed(change)));
             assert_eq!(rig.recorded(), Some((1, Origin::Aterm)), "{change:?}");
@@ -7047,8 +6075,6 @@ pub(crate) mod conformance {
             );
             assert_eq!(rig.state["claim"], 1, "{change:?}: the re-probe says it");
 
-            // Cancel in aterm's alert, nobody asked, then Cancel in macOS's
-            // dialog: nothing is retried; the next launch takes the next yes.
             let mut rig = Rig::new(change, change.precondition(), fault);
             rig.probe();
             rig.press(OwnerAnswer::No);
@@ -7061,23 +6087,16 @@ pub(crate) mod conformance {
             assert_eq!(rig.lane.flow.last(), Some(Outcome::NotChanged(change)));
             assert_eq!(rig.seen.launches, 1);
 
-            // Moved after the render, before the worker's re-read — to a shape
-            // Apple's tool does not recognise, or already to the target: the
-            // run launches nothing.
             for (moved, world) in [("Customize", 2), ("SetOutside", 1)] {
                 let mut rig = Rig::new(change, change.precondition(), fault);
                 rig.probe();
-                // The owner's press and yes; the rule moves while aterm's
-                // alert is up, so the worker's fresh read shows it.
                 rig.environment(moved, world);
                 rig.press(OwnerAnswer::yes_for_test());
                 assert_eq!(rig.seen.launches, 0, "{change:?} {moved}: nothing launched");
                 rig.probe();
-                rig.press(OwnerAnswer::yes_for_test()); // refused: not the precondition
+                rig.press(OwnerAnswer::yes_for_test());
             }
 
-            // The named residual race: customised while the child waits, and its
-            // write lands over it. Still conformant.
             let mut rig = Rig::new(change, change.precondition(), fault);
             rig.probe();
             rig.press(OwnerAnswer::yes_for_test());
@@ -7087,7 +6106,6 @@ pub(crate) mod conformance {
             rig.probe();
             assert_eq!(rig.state["clobbered"], 1);
 
-            // Drift after a change, a failed probe, and the button back.
             let mut rig = Rig::new(change, change.precondition(), fault);
             rig.probe();
             rig.press(OwnerAnswer::yes_for_test());
@@ -7106,8 +6124,6 @@ pub(crate) mod conformance {
             rig.notice();
             rig.probe();
 
-            // A peer aterm's change holds the lock: our worker reads nothing
-            // and spawns nothing; its exit frees the next change.
             let mut rig = Rig::new(change, change.precondition(), fault);
             rig.probe();
             rig.peer_launch();
@@ -7119,17 +6135,15 @@ pub(crate) mod conformance {
             );
             rig.peer_exit();
             rig.press(OwnerAnswer::yes_for_test());
-            rig.peer_launch(); // refused: our child holds the lock
+            rig.peer_launch();
             rig.exit("ChildApplied");
             rig.notice();
             rig.probe();
 
-            // A predecessor's child still running at start: presses are
-            // refused, and its exit is taken and re-probed like our own.
             let mut rig = Rig::inherited(change, change.precondition());
-            rig.press(OwnerAnswer::yes_for_test()); // refused: in flight
-            rig.peer_launch(); // refused: its marker names a live child
-            rig.notice(); // nothing to take yet
+            rig.press(OwnerAnswer::yes_for_test());
+            rig.peer_launch();
+            rig.notice();
             rig.exit("ChildUnchanged");
             rig.notice();
             assert!(
@@ -7147,17 +6161,12 @@ pub(crate) mod conformance {
                 "the predecessor's launch stays counted"
             );
 
-            // A records re-read mid-session: a peer's running child is followed as
-            // in flight; a peer's change whose child is gone, its marker on disk,
-            // is adopted as aterm's and re-probed; one the peer recorded leaves
-            // nothing; and a dead marker found while this lane's own change is
-            // under way is removed.
             let mut rig = Rig::new(change, change.precondition(), fault);
             rig.probe();
-            rig.reread("Adopt"); // refused: no marker
+            rig.reread("Adopt");
             rig.peer_launch();
             rig.reread("Follow");
-            rig.press(OwnerAnswer::yes_for_test()); // refused: in flight
+            rig.press(OwnerAnswer::yes_for_test());
             rig.peer_exit();
             rig.notice();
             rig.probe();
@@ -7172,8 +6181,8 @@ pub(crate) mod conformance {
                 rig.dir.join(CHANGE_MARKER).exists(),
                 "{change:?}: the adopted change's marker stays until its re-probe is recorded"
             );
-            rig.press(OwnerAnswer::yes_for_test()); // refused: its re-probe is owed
-            rig.reread("Adopt"); // refused: the lane follows it already
+            rig.press(OwnerAnswer::yes_for_test());
+            rig.reread("Adopt");
             assert!(
                 rig.dir.join(CHANGE_MARKER).exists(),
                 "a re-read of a change this lane follows leaves its marker for the re-probe"
@@ -7187,7 +6196,7 @@ pub(crate) mod conformance {
             rig.peer_launch();
             rig.peer_exit();
             rig.peer_settle();
-            rig.reread("Adopt"); // refused: the peer recorded it
+            rig.reread("Adopt");
             rig.press(OwnerAnswer::yes_for_test());
             rig.exit("ChildApplied");
             rig.notice();
@@ -7204,13 +6213,6 @@ pub(crate) mod conformance {
         launch_ask_scenarios(fault);
     }
 
-    /// The launch ask, On only: refused before the probe; a
-    /// yes that runs the change as a press's would, after which the record
-    /// refuses every later ask; a No, or no alert, that the record carries into
-    /// the next launch while the button stays the owner's; refused under a
-    /// peer's lock and over its dead marker; refused during our own child,
-    /// which settles it; settled first and never asked; and refused over a
-    /// predecessor's running child.
     fn launch_ask_scenarios(fault: Fault) {
         let on = DebuggerChange::On;
         let yes = OwnerAnswer::yes_for_test;
@@ -7243,7 +6245,7 @@ pub(crate) mod conformance {
             Some(OfferEnd::Asked),
             "asked once per Mac"
         );
-        rig.forgo(); // refused: the record names this Mac already
+        rig.forgo();
 
         let mut rig = Rig::new(on, DebuggerMode::Disabled, fault);
         rig.probe();
@@ -7313,23 +6315,16 @@ pub(crate) mod conformance {
         rig.forgo();
     }
 
-    // The change lock is a `flock` (`take_change_lock`): off unix it is
-    // unavailable by design, so the harness and its negative controls run
-    // where the lock does.
     #[cfg(unix)]
     #[test]
     fn debugger_access_conforms_to_the_model() {
-        // A lock this thread holds is never let go mid-read: `Busy` at once.
         let _patience = patience_for_test(Duration::ZERO);
         scenarios(Fault::None);
     }
 
-    /// Negative controls: the same harness over a composition carrying each defect
-    /// the model exists to catch must fail.
     #[cfg(unix)]
     #[test]
     fn the_harness_fails_every_faulty_composition() {
-        // A lock this thread holds is never let go mid-read: `Busy` at once.
         let _patience = patience_for_test(Duration::ZERO);
         for fault in [
             Fault::SkipRecheck,
@@ -7344,7 +6339,6 @@ pub(crate) mod conformance {
             Fault::OfferRunsUnasked,
         ] {
             let caught = std::panic::catch_unwind(|| match fault {
-                // Each needs the step that exercises it.
                 Fault::PressWhileInFlight => {
                     let mut rig = Rig::new(DebuggerChange::On, DebuggerMode::Disabled, fault);
                     rig.probe();
@@ -7359,7 +6353,6 @@ pub(crate) mod conformance {
                     rig.notice();
                     rig.probe();
                 }
-                // A No, then the next launch's ask over the record it wrote.
                 Fault::OfferAgain => {
                     let mut rig = Rig::new(DebuggerChange::On, DebuggerMode::Disabled, fault);
                     rig.probe();
@@ -7374,7 +6367,6 @@ pub(crate) mod conformance {
                     rig.press(OwnerAnswer::yes_for_test());
                     rig.offer(OwnerAnswer::No);
                 }
-                // The owner would say no; the composition never asks them.
                 Fault::OfferRunsUnasked => {
                     let mut rig = Rig::new(DebuggerChange::On, DebuggerMode::Disabled, fault);
                     rig.probe();
@@ -7382,8 +6374,6 @@ pub(crate) mod conformance {
                 }
                 _ => scenarios(fault),
             });
-            // A launch-ask fault is caught by the step that carries it, not by
-            // whatever else breaks after.
             let caught_by = match fault {
                 Fault::OfferAgain | Fault::OfferWhileInFlight => {
                     Some("Offer: the composition took what the model forbids")
@@ -7410,8 +6400,6 @@ pub(crate) mod conformance {
     }
 }
 
-/// `DebuggerAccessChange` actions no shipping function here performs, each waived where
-/// its Tier-1 (`conformance`) binds it.
 #[cfg(any(test, debug_assertions))]
 #[aterm_spec_anchor::spec_unmodeled(
     machine = "DebuggerAccessChange",

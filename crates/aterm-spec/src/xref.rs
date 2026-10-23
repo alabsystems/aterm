@@ -3,29 +3,6 @@
 // Author: Andrew Yates
 
 //! The compiler-collectable source↔spec cross-reference (TRUST_NATIVE_TLA, §2).
-//!
-//! `#[refines]` and `#[spec_unmodeled]` each emit a
-//! [`registry::submit!`](crate::registry::submit) of a record, so the full set of source↔spec
-//! bindings is collectable without scanning source text.
-//!
-//! * **Source → spec**: [`RefinementAnchor`] and [`Waiver`] records, collected by
-//!   [`refinements`] and [`waivers`].
-//! * **Spec → source**: the embedded [`Model`](crate::derive::Model) registry
-//!   ([`model_registry`]) and [`Model::anchors`](crate::derive::Model::anchors).
-//!
-//! [`check_closure`] enforces the bidirectional obligations of §2.2 over the registered
-//! `SpecModule`s, with coverage scoped to actively bound machines.
-//!
-//! The source half (the records, the registry, the entered-anchor record) lives in
-//! the std-only `aterm-spec-anchor`, which anchored libraries depend on without
-//! pulling in the models; it is re-exported here, so these paths name one registry.
-//!
-//! IMPORTANT — collection scope. The registry only sees `submit!`s from object code
-//! LINKED into the running binary. Anchors expand under `cfg(any(test,
-//! debug_assertions))`, so every dev and test build of an anchored crate carries them,
-//! and the full `spec_xref_closure` gate lives in `aterm-models`, whose test build
-//! links every anchored crate and every model; a gate in any individual library would
-//! see only that library's own anchors.
 
 pub use aterm_spec_anchor::xref::{
     RefinementAnchor, Waiver, disarm_entered_anchors, entered_anchor_count, entered_anchor_ids,
@@ -37,8 +14,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::derive::Model;
 
-/// What one conformance step entered: the action it claims to drive, and the anchor ids whose
-/// annotated fn ran inside that step's window.
+/// What one conformance step entered: the action it claims to drive, and the anchor ids whose annotated fn ran inside that step's window.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StepRecord {
     /// The machine action this step drives, spelled as the anchors spell it.
@@ -47,8 +23,7 @@ pub struct StepRecord {
     pub entered: BTreeSet<&'static str>,
 }
 
-/// A machine's per-step execution evidence, accumulated by its Tier-1 conformance (the only party
-/// that knows where one step ends and the next begins) and audited by the gate that ran it.
+/// A machine's per-step execution evidence, accumulated by its Tier-1 conformance (the only party that knows where one step ends and the next begins) and audited by the gate that ran it.
 #[derive(Debug, Clone)]
 pub struct StepEvidence {
     machine: &'static str,
@@ -66,18 +41,8 @@ impl StepEvidence {
     }
 
     /// Drive one step of the conformance inside its own evidence window.
-    ///
-    /// `drive` must be the shipping call for `action` and nothing else (no pre-state read,
-    /// projection or read-back): everything inside the window is evidence for `action`, so a
-    /// harness accessor inside it would let an anchor parked there discharge a shipping
-    /// obligation. Windows must not nest; the arm bit is re-read after `drive` returns.
-    ///
     /// # Panics
-    ///
-    /// If the window cannot be opened ([`reset_entered_anchors`]), the record is not observably
-    /// empty once it is ([`entered_anchor_count`]), or the window was closed while `drive` ran
-    /// ([`window_is_armed`]): each would let the audit pass on stale evidence.
-    // Skip: thread-local window bookkeeping around a caller-supplied closure. Verification tooling.
+    /// If the window cannot be opened ([`reset_entered_anchors`]), the record is not observably empty once it is ([`entered_anchor_count`]), or the window was closed while `drive` ran ([`window_is_armed`]): each would let the audit pass on stale evidence.
     #[cfg_attr(trust_verify, trust::skip)]
     pub fn step<T>(&mut self, action: &'static str, drive: impl FnOnce() -> T) -> T {
         assert!(
@@ -121,7 +86,6 @@ impl StepEvidence {
     }
 
     /// Cross the ledger with the machine's linked anchors.
-    // Skip: set algebra over the registry walk. Verification tooling.
     #[cfg_attr(trust_verify, trust::skip)]
     #[must_use]
     pub fn audit(&self) -> StepAudit {
@@ -129,98 +93,53 @@ impl StepEvidence {
     }
 }
 
-/// The execution-evidence verdict for one machine, crossing its linked anchors with a
-/// [`StepEvidence`] ledger. Every field is derived from the two, including the limits
-/// ([`Self::shared_site`], [`Self::interchangeable`], [`Self::entered_under`]).
+/// The execution-evidence verdict for one machine, crossing its linked anchors with a [`StepEvidence`] ledger.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StepAudit {
     /// The machine, spelled as the caller spelled it.
     pub machine: String,
     /// How many of the machine's anchors are linked into this binary (probed or not).
     pub anchors: usize,
-    /// The distinct actions those anchors cover. The gate asserts this set, not a count: an action
-    /// may have several anchor sites.
+    /// The distinct actions those anchors cover.
     pub actions: BTreeSet<&'static str>,
     /// How many step windows the conformance recorded.
     pub steps: usize,
-    /// Anchors the macro could not probe (`entry_id == ""`), by `rust_method`: a failure for a
-    /// machine claiming execution evidence.
+    /// Anchors the macro could not probe (`entry_id == ""`), by `rust_method`: a failure for a machine claiming execution evidence.
     pub uninstrumented: Vec<&'static str>,
-    /// `entry_id`s claimed by more than one anchor, which would let one fn's entry
-    /// discharge another's obligation.
+    /// `entry_id`s claimed by more than one anchor, which would let one fn's entry discharge another's obligation.
     pub ambiguous: Vec<&'static str>,
-    /// Anchored actions with no step in the ledger: the conformance never claimed to drive them,
-    /// so nothing was checked about their anchors.
+    /// Anchored actions with no step in the ledger: the conformance never claimed to drive them, so nothing was checked about their anchors.
     pub undriven: Vec<&'static str>,
-    /// Anchored actions that were driven and whose annotated function was entered in no step of
-    /// their own: the failure list (an anchor on a stub, on a fn the action's step never reaches,
-    /// or on an unrelated fn).
+    /// Anchored actions that were driven and whose annotated function was entered in no step of their own: the failure list (an anchor on a stub, on a fn the action's step never reaches, or on an unrelated fn).
     pub unwitnessed: Vec<&'static str>,
-    /// One entry per window that did not enter its own action's function, named by that action
-    /// (so an action driven three times can appear twice). [`Self::unwitnessed`] is an OR across
-    /// an action's windows; this is the AND.
+    /// One entry per window that did not enter its own action's function, named by that action (so an action driven three times can appear twice).
     pub blind_steps: Vec<&'static str>,
-    /// Step tags that match no anchored action of this machine — a typo in the
-    /// conformance, checking nothing.
+    /// Step tags that match no anchored action of this machine — a typo in the conformance, checking nothing.
     pub unanchored_steps: Vec<&'static str>,
     /// Annotated fn → the actions of this machine anchored on it.
     pub by_function: BTreeMap<&'static str, BTreeSet<&'static str>>,
-    /// Actions sharing their annotated fn with a sibling action, which entry alone cannot tell
-    /// apart. Read off the anchor table; [`Self::indiscriminate`] is the run-derived twin.
+    /// Actions sharing their annotated fn with a sibling action, which entry alone cannot tell apart.
     pub shared_site: BTreeSet<&'static str>,
     /// Action → the anchored functions every window driving it entered: what a window pins.
-    /// `witnessed` needs the action's own function in this set, and an anchor moved onto any other
-    /// member would be witnessed the same, so `1` pins the action to its function and `k` cannot
-    /// tell it from `k - 1` others.
-    ///
-    /// A lower bound, to be said wherever it is printed: only an anchored function runs a probe,
-    /// so an unanchored one the same window calls is invisible here and would also pass.
     pub interchangeable: BTreeMap<&'static str, BTreeSet<&'static str>>,
-    /// Anchored function of this machine → the actions whose windows entered it. A function with
-    /// more than one action is entered under all of them, the vacuous-discharge fact (true of
-    /// `Terminal::post_process` and `Terminal::note_output_custody`, entered on every batch).
+    /// Anchored function of this machine → the actions whose windows entered it.
     pub entered_under: BTreeMap<&'static str, BTreeSet<&'static str>>,
-    /// Actions one of whose anchored functions was entered by another action's window, so entry
-    /// says the function ran, not which action fired: the run-derived twin of
-    /// [`Self::shared_site`]. With [`Self::stray`] and [`Self::blind_steps`] empty the two are
-    /// equal.
+    /// Actions one of whose anchored functions was entered by another action's window, so entry says the function ran, not which action fired: the run-derived twin of [`Self::shared_site`].
     pub indiscriminate: BTreeSet<&'static str>,
-    /// Anchored function of this machine → the actions whose windows entered it that it is not
-    /// anchored for.
-    ///
-    /// The within-window detector: [`Self::unwitnessed`] asks whether a function ran when its own
-    /// action fired; this asks whether it ran when something else fired. A function that is the
-    /// seam for `{B, C}` has no business being entered by a window driving `D`, so an anchor moved
-    /// onto another function in the same window is caught exactly when that function's entry
-    /// pattern is wider than the actions it claims (`SelectionCustody::UniformScroll` parked on
-    /// `Terminal::note_output_custody` lands here, since that function also runs in the damage and
-    /// invalidation windows).
-    ///
-    /// It can fire on a structurally shared function (entered on every batch, in a machine that
-    /// drives a batch-shaped action it is not anchored for), whose entry is then no evidence for
-    /// its own actions. Anchor it for that action too, narrow the window, or move the anchor to a
-    /// specific seam.
+    /// Anchored function of this machine → the actions whose windows entered it that it is not anchored for.
     pub stray: BTreeMap<&'static str, BTreeSet<&'static str>>,
-    /// Per step window, in the order driven: the action it drives and the distinct anchored
-    /// functions it entered. A window with one pins its action to it; a window with `k` (a whole
-    /// `Terminal::process` batch, say) tells none of them apart. The same lower bound as
-    /// [`Self::interchangeable`].
+    /// Per step window, in the order driven: the action it drives and the distinct anchored functions it entered.
     pub window_reach: Vec<(&'static str, BTreeSet<&'static str>)>,
     /// Anchor sites of a multi-site action that no window of that action ever entered.
-    /// `witnessed` is an OR across sites, so a second site is never required to run; single-site
-    /// actions are excluded, since for them this is [`Self::unwitnessed`].
     pub dark_sites: Vec<&'static str>,
-    /// How many anchor sites belong to an action with more than one: the denominator of
-    /// [`Self::dark_sites`], so `0` dark sites over `0` reads as "no action has a second site
-    /// yet", not an all-clear.
+    /// How many anchor sites belong to an action with more than one: the denominator of [`Self::dark_sites`], so `0` dark sites over `0` reads as "no action has a second site yet", not an all-clear.
     pub multi_site_anchors: usize,
     /// Steps whose window entered an anchor of their own action.
     pub witnessed_steps: usize,
 }
 
 impl StepAudit {
-    /// Did every anchored action get driven and witnessed, with none unprobed,
-    /// ambiguous, or tagged by a step that names no action?
+    /// Did every anchored action get driven and witnessed, with none unprobed, ambiguous, or tagged by a step that names no action?
     #[must_use]
     pub fn is_complete(&self) -> bool {
         self.uninstrumented.is_empty()
@@ -232,8 +151,7 @@ impl StepAudit {
             && self.unanchored_steps.is_empty()
     }
 
-    /// The widest interchangeability set: `(action, k)` for the action whose windows
-    /// pin its anchor least — `k` already-anchored functions any of which would pass.
+    /// The widest interchangeability set: `(action, k)` for the action whose windows pin its anchor least — `k` already-anchored functions any of which would pass.
     #[must_use]
     pub fn widest_window(&self) -> (&'static str, usize) {
         self.interchangeable
@@ -243,10 +161,7 @@ impl StepAudit {
             .unwrap_or(("<no window>", 0))
     }
 
-    /// How many windows entered more than one anchored function — the windows inside
-    /// which this check distinguishes nothing — and the widest of them, spelled out:
-    /// the action it drives and every anchored function it entered. Derived, so no
-    /// caller has to name those functions in prose and be wrong about it later.
+    /// How many windows entered more than one anchored function — the windows inside which this check distinguishes nothing — and the widest of them, spelled out: the action it drives and every anchored function it entered.
     #[must_use]
     pub fn wide_windows(&self) -> (usize, &'static str, Vec<&'static str>) {
         let wide = self
@@ -265,13 +180,6 @@ impl StepAudit {
     }
 
     /// The evidence's arithmetic: what it pins and what it does not, in numbers.
-    ///
-    /// Every number is a fact about the run, not a quality score. `shared_site` and the
-    /// `indiscriminate` count go down when an anchor is moved somewhere wrong, since a wrong
-    /// function carries fewer of the machine's actions: an action taken off a four-action seam and
-    /// parked on a function only its own window enters passes [`Self::stray`], and the shared
-    /// figure falls.
-    // Skip: string formatting over the derived fields. Verification tooling.
     #[cfg_attr(trust_verify, trust::skip)]
     #[must_use]
     pub fn summary(&self) -> String {
@@ -349,15 +257,11 @@ impl StepAudit {
 }
 
 /// The function half of an entry id (`"<machine>::<action> @ <fn>"`). A window observes functions,
-/// not anchors (two anchors on one fn always fire together), so [`StepAudit::interchangeable`] and
-/// [`StepAudit::entered_under`] are keyed by this half.
 fn fn_of(entry_id: &'static str) -> &'static str {
     entry_id.rsplit_once(" @ ").map_or(entry_id, |(_, f)| f)
 }
 
 /// Cross `machine`'s linked anchors with a per-step ledger. `machine` is resolved with
-/// [`machine_matches`], so the caller may spell it the way the anchors do.
-// Skip: registry walk feeding the pure set algebra below. Verification tooling.
 #[cfg_attr(trust_verify, trust::skip)]
 fn audit_steps(machine: &str, steps: &[StepRecord]) -> StepAudit {
     let linked: Vec<&'static RefinementAnchor> = refinements()
@@ -367,11 +271,8 @@ fn audit_steps(machine: &str, steps: &[StepRecord]) -> StepAudit {
 }
 
 /// The pure half of [`audit_steps`]: set algebra over an explicit anchor list, so the
-/// derivations can be exercised on synthetic ledgers rather than only on whatever the
-/// test binary happened to link.
-// Skip: set algebra over std bodies the prover lacks. Verification tooling.
 #[cfg_attr(trust_verify, trust::skip)]
-#[allow(clippy::too_many_lines)] // one derivation per `StepAudit` field, in field order
+#[allow(clippy::too_many_lines)]
 fn audit_steps_of(
     machine: &str,
     linked: &[&'static RefinementAnchor],
@@ -407,7 +308,6 @@ fn audit_steps_of(
         .filter_map(|(id, n)| if n > 1 { Some(id) } else { None })
         .collect();
 
-    // Per action: was it driven at all, and did any of its own steps enter it?
     let mut undriven: Vec<&'static str> = Vec::new();
     let mut unwitnessed: Vec<&'static str> = Vec::new();
     for action in &actions {
@@ -445,22 +345,17 @@ fn audit_steps_of(
     };
     let witnessed_steps = steps.iter().filter(|s| witnessed_of(s)).count();
 
-    // The AND to `unwitnessed`'s OR. A mistyped tag is in `unanchored_steps`, not a blind
-    // window.
     let blind_steps: Vec<&'static str> = steps
         .iter()
         .filter(|s| actions.contains(&s.action) && !witnessed_of(s))
         .map(|s| s.action)
         .collect();
 
-    // What each window entered, as functions.
     let fns_of_step: Vec<BTreeSet<&'static str>> = steps
         .iter()
         .map(|s| s.entered.iter().copied().map(fn_of).collect())
         .collect();
 
-    // Per action, the functions every one of its windows entered: any member would have passed
-    // as the action's own.
     let mut interchangeable: BTreeMap<&'static str, BTreeSet<&'static str>> = BTreeMap::new();
     for action in &actions {
         let mut windows = steps
@@ -476,7 +371,6 @@ fn audit_steps_of(
         }
     }
 
-    // Per anchored function of this machine, the actions whose windows entered it.
     let mut entered_under: BTreeMap<&'static str, BTreeSet<&'static str>> = BTreeMap::new();
     for (s, fns) in steps.iter().zip(&fns_of_step) {
         if !actions.contains(&s.action) {
@@ -487,8 +381,6 @@ fn audit_steps_of(
         }
     }
 
-    // An action is indiscriminate when a function it is anchored on was entered by another
-    // action's window: that site alone could have discharged it.
     let indiscriminate: BTreeSet<&'static str> = actions
         .iter()
         .copied()
@@ -508,7 +400,6 @@ fn audit_steps_of(
         .map(|(s, f)| (s.action, f.clone()))
         .collect();
 
-    // Entered under an action this function is not anchored for (see `StepAudit::stray`).
     let stray: BTreeMap<&'static str, BTreeSet<&'static str>> = entered_under
         .iter()
         .filter_map(|(f, under)| {
@@ -518,7 +409,6 @@ fn audit_steps_of(
         })
         .collect();
 
-    // Sites of a multi-site action no window of that action entered, and the eligible count.
     let multi_site_anchors: usize = ids_of_action
         .values()
         .map(BTreeSet::len)
@@ -566,21 +456,18 @@ fn audit_steps_of(
     }
 }
 
-/// One registered model. `ty_model!` submits every model it writes and `#[model]` a hand-built
-/// one, so the registry is exactly the set of models linked into the binary.
+/// One registered model.
 #[derive(Debug, Clone, Copy)]
 pub struct RegisteredModel {
     /// Builds the model.
     pub build: fn() -> Model,
-    /// The configurations it declares beside the committed one (`scenario` in `ty_model!`): each
-    /// a set of constant overrides the real code also runs under, swept like the committed one.
+    /// The configurations it declares beside the committed one (`scenario` in `ty_model!`): each a set of constant overrides the real code also runs under, swept like the committed one.
     pub scenarios: &'static [&'static [(&'static str, i64)]],
     /// Where it was written (`file:line`).
     pub location: &'static str,
 }
 
-/// One registered liveness obligation, submitted by `#[liveness(model)]` with the model it is
-/// stated over.
+/// One registered liveness obligation, submitted by `#[liveness(model)]` with the model it is stated over.
 #[derive(Debug, Clone, Copy)]
 pub struct RegisteredLiveness {
     /// Builds the model the obligation holds of.
@@ -594,19 +481,13 @@ pub struct RegisteredLiveness {
 crate::registry::collect!(RegisteredModel);
 crate::registry::collect!(RegisteredLiveness);
 
-/// Every model linked into this binary, in name order. The non-vacuity sweep holds each design
-/// invariant to a catching mutant, `spec-check` re-checks each model under `ty`, and the closure
-/// resolves an anchor's `machine` against this set.
-// Skip: calls every registered model constructor. Spec tooling.
+/// Every model linked into this binary, in name order.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn model_registry() -> Vec<Model> {
     registered().into_values().map(|(m, _, _)| m).collect()
 }
 
-/// Every registered model in every configuration it declares (the committed one first, then each
-/// `scenario`), in [`model_registry`]'s order. The sweeps hold all of them: a law, an action or a
-/// mutant may matter only in a configuration the committed one does not reach.
-// Skip: same class as `model_registry`.
+/// Every registered model in every configuration it declares (the committed one first, then each `scenario`), in [`model_registry`]'s order.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn model_configurations() -> Vec<Vec<Model>> {
     registered()
@@ -620,9 +501,7 @@ pub fn model_configurations() -> Vec<Vec<Model>> {
         .collect()
 }
 
-/// Every liveness obligation linked into this binary, beside the registered model it is stated
-/// over, in (model, obligation) name order.
-// Skip: same class as `model_registry`.
+/// Every liveness obligation linked into this binary, beside the registered model it is stated over, in (model, obligation) name order.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn liveness_registry() -> Vec<(Model, crate::derive::Liveness)> {
     let models = registered();
@@ -645,15 +524,9 @@ type Registered = (
 );
 
 /// Every registered model by name: each one a `ty_model!` or `#[model]` registers, and each one a
-/// `#[liveness]` obligation is stated over, so no obligation's model escapes the sweeps.
-///
-/// A name is a model's identity (the machine an anchor names), so one name is
-/// one model: the same model registered twice is one entry.
-///
 /// # Panics
 ///
 /// When two different models share a name.
-// Skip: same class as `model_registry`.
 #[cfg_attr(trust_verify, trust::skip)]
 fn registered() -> BTreeMap<&'static str, Registered> {
     let mut by_name: BTreeMap<&'static str, Registered> = BTreeMap::new();
@@ -697,10 +570,7 @@ impl SpecModule {
         }
     }
 
-    /// The model's action names: what a refinement or waiver anchor resolves against
-    /// (obligation 1) and what coverage counts (obligation 3).
-    // An insert loop, not `collect`, so Trust L0 sees per-element growth.
-    // Skip: BTreeSet keyed build + iterator `next` (absent std bodies).
+    /// The model's action names: what a refinement or waiver anchor resolves against (obligation 1) and what coverage counts (obligation 3).
     #[cfg_attr(trust_verify, trust::skip)]
     pub fn action_names(&self) -> BTreeSet<String> {
         let SpecModule::Embedded(m) = self;
@@ -712,14 +582,10 @@ impl SpecModule {
     }
 }
 
-/// Whether an anchor's `machine` resolves to a `SpecModule` named `module_name`: anchors are
-/// lower_snake (`"terminal_modes"`), models CamelCase (`"TerminalModes"`), so the match is
-/// case-insensitive with `_` stripped.
+/// Whether an anchor's `machine` resolves to a `SpecModule` named `module_name`: anchors are lower_snake (`"terminal_modes"`), models CamelCase (`"TerminalModes"`), so the match is case-insensitive with `_` stripped.
 pub fn machine_matches(anchor_machine: &str, module_name: &str) -> bool {
-    // Skip: char-filter iterator `next` + String alloc (absent std bodies).
     #[cfg_attr(trust_verify, trust::skip)]
     fn norm(s: &str) -> String {
-        // A push loop, not `collect`, for Trust L0's allocation check.
         let mut out = String::new();
         for c in s.chars() {
             if c == '_' {
@@ -737,15 +603,12 @@ pub fn machine_matches(anchor_machine: &str, module_name: &str) -> bool {
 /// A single obligation failure (for a readable aggregate error).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClosureViolation {
-    /// Which §2.2 obligation was violated: 1, 3 or 4. Obligation 2 (the symbol resolves to a live
-    /// `DefId`) needs compiler-owned identities this gate does not have; [`StepEvidence`] is its
-    /// executable, weaker fragment (per-step function-entry evidence).
+    /// Which §2.2 obligation was violated: 1, 3 or 4.
     pub obligation: u8,
     pub message: String,
 }
 
-/// One module's coverage line for the report. Obligation 3 holds an active machine to full
-/// coverage; an inactive one's ratio is only reported.
+/// One module's coverage line for the report.
 #[derive(Debug, Clone)]
 pub struct MachineCoverage {
     pub machine: String,
@@ -761,15 +624,12 @@ impl MachineCoverage {
         if self.total_actions == 0 {
             return 1.0;
         }
-        // Saturating and `max(1)` only discharge Trust L0's overflow and divisor obligations;
-        // neither changes a reachable result.
         let covered = self.bound.len().saturating_add(self.waived.len());
         covered as f64 / self.total_actions.max(1) as f64
     }
 }
 
-/// The outcome of [`check_closure`]: the violations (empty == green) and the
-/// per-machine coverage ledger (for reporting).
+/// The outcome of [`check_closure`]: the violations (empty == green) and the per-machine coverage ledger (for reporting).
 pub struct ClosureReport {
     pub violations: Vec<ClosureViolation>,
     pub coverage: Vec<MachineCoverage>,
@@ -795,11 +655,6 @@ struct AnchorObligationSpec<'a> {
 }
 
 /// The Ob.4 ("machine exists") and Ob.1 ("action exists") arm for one anchor: push a
-/// [`ClosureViolation`] when `resolved` is `None`, else when `target` does not resolve in the
-/// module's action set. `site` is the anchor's rendered position (e.g.
-/// `"#[refines] at src/x.rs:3 (Foo::bar)"`), `authoring_hint` appends the refinement arm's
-/// "Either author the model…" tail to the Ob.4 message, `noun`/`known` fix the Ob.1 wording, and
-/// a `None` target (a waiver with no action) skips Ob.1.
 fn check_anchor_obligations(
     violations: &mut Vec<ClosureViolation>,
     resolved: Option<&ModuleActionIndex>,
@@ -845,24 +700,7 @@ fn check_anchor_obligations(
     }
 }
 
-/// Enforce the bidirectional obligations of TRUST_NATIVE_TLA §2.2 over `modules` and the
-/// collected refinements and waivers:
-///
-/// * **Ob.1, action exists**: every `refines` action (and every waiver action, when present)
-///   names a real definition in its module.
-/// * **Ob.3, coverage**: every action of an active machine (one with a refinement) is bound or
-///   waived, `ratio == 1.0`.
-/// * **Ob.4, machine exists**: every `machine` an anchor names resolves to a registered
-///   `SpecModule`.
-///
-/// Coverage is scoped to actively bound machines: many models are bound by Tier-1 conformance
-/// rather than per-method `#[refines]`, so the rest are only reported (`active == false`).
-///
-/// Ob.2 (the symbol resolves to a live `DefId`) is not enforced here. Its runnable fragment,
-/// [`StepEvidence`], is asserted by the gate that owns each conformance; this fn stays pure set
-/// algebra over the collected records, since callers with no conformance to run and fixtures with
-/// hand-built anchors use it, so a green ratio here is a claim about strings.
-// Skip: the closure gate's set algebra and formatting. Verification tooling.
+/// Enforce the bidirectional obligations of TRUST_NATIVE_TLA §2.2 over `modules` and the collected refinements and waivers:
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn check_closure(modules: &[SpecModule]) -> ClosureReport {
     let mut violations = Vec::new();
@@ -878,7 +716,6 @@ pub fn check_closure(modules: &[SpecModule]) -> ClosureReport {
             .find(|(name, _)| machine_matches(anchor_machine, name))
     };
 
-    // ---- Obligation 4 + 1 for refinements ----
     for r in refinements() {
         check_anchor_obligations(
             &mut violations,
@@ -894,10 +731,8 @@ pub fn check_closure(modules: &[SpecModule]) -> ClosureReport {
         );
     }
 
-    // ---- Obligation 4 + 1 for waivers that name a machine/action ----
     for w in waivers() {
         if w.machine.is_empty() {
-            // Bare `reason="…"` waiver (bypass-setter form): not tied to a machine,
             // nothing to resolve. It cannot discharge coverage either.
             continue;
         }
@@ -915,8 +750,6 @@ pub fn check_closure(modules: &[SpecModule]) -> ClosureReport {
         );
     }
 
-    // ---- Obligation 3: coverage over active machines, report over the rest ----
-    // Bind/waive sets keyed by the module's declared name (canonical).
     let mut bound: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     let mut waived: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
 
@@ -955,7 +788,6 @@ pub fn check_closure(modules: &[SpecModule]) -> ClosureReport {
             uncovered: uncovered.clone(),
             active,
         };
-        // Obligation 3 (scoped): an active machine must be fully bound-or-waived.
         if active && !uncovered.is_empty() {
             violations.push(ClosureViolation {
                 obligation: 3,
@@ -984,13 +816,7 @@ pub fn check_closure(modules: &[SpecModule]) -> ClosureReport {
 mod tests {
     use super::*;
 
-    // ── The per-step audit's derivations, on synthetic ledgers ──────────────
-    //
-    // The real ledgers come from a gate in another crate; the arithmetic it prints must be
-    // checkable without running it.
-
     /// A synthetic anchor. `entry_id` is spelled exactly as the `#[refines]` macro
-    /// spells it, because `fn_of` splits on that shape.
     fn synth(
         action: &'static str,
         method: &'static str,
@@ -1014,20 +840,14 @@ mod tests {
     }
 
     fn audit_of(anchors: &[RefinementAnchor], steps: &[StepRecord]) -> StepAudit {
-        // `audit_steps_of` takes `&'static` anchors because the registry yields them;
-        // the leak is a test fixture and bounded by the test.
         let linked: Vec<&'static RefinementAnchor> =
             anchors.iter().map(|a| &*Box::leak(Box::new(*a))).collect();
         audit_steps_of("Ring", &linked, steps)
     }
 
     /// The within-window move `stray` catches: an anchor moved onto a function whose entry
-    /// pattern is wider than the action it now claims.
     #[test]
     fn a_move_inside_one_window_is_caught_when_the_new_site_is_wider() {
-        // Caught: `Push` moves onto `chatty`, which the `Push` window does enter (so
-        // `witnessed` holds), but the `Pop` window enters it too and it is not anchored for
-        // `Pop`: its entry pattern is wider than the action it now claims.
         let moved = vec![
             synth("Push", "chatty", "Ring::Push @ chatty"),
             synth("Pop", "batch", "Ring::Pop @ batch"),
@@ -1093,16 +913,12 @@ mod tests {
     }
 
     /// A worker's window reaches its owner only by take and merge: nothing crosses threads
-    /// otherwise, a taken window is closed and empty, and a closed window neither hands its record
-    /// over nor takes a merge.
     #[test]
     fn a_workers_window_reaches_its_owner_only_by_take_and_merge() {
         assert!(reset_entered_anchors(), "the owner's window opens");
         let taken = std::thread::scope(|scope| {
             scope
                 .spawn(|| {
-                    // An earlier window on this thread, closed the way a step closes
-                    // one: its record stays readable and is no later work's.
                     assert!(reset_entered_anchors(), "an earlier window opens");
                     note_entered("Ring::Pop @ an earlier window");
                     disarm_entered_anchors();

@@ -224,7 +224,7 @@ struct Scan<'a> {
 impl Scan<'_> {
     /// Whether any count line has something to count ([`render`]'s
     /// `counts`): mail in `totals`, acts or stories, or shown marks.
-    fn counts_any(&self, totals: &crate::fold::Totals) -> bool {
+    const fn counts_any(&self, totals: &crate::fold::Totals) -> bool {
         self.acts + self.stories + self.shown > 0 || totals.mail_in > 0 || totals.mail_out > 0
     }
 }
@@ -242,7 +242,7 @@ impl Scan<'_> {
 /// generation, a topic, an advisory, the program's own report,
 /// a mail fetch and what the person was shown (6F-9: `shown`, one count
 /// line, [`Scan::shown`], shed with the others).
-fn mark_worth_a_line(k: Kind) -> bool {
+const fn mark_worth_a_line(k: Kind) -> bool {
     !matches!(
         k,
         Kind::Agent

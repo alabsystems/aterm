@@ -2,50 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 //! JOINING THE ALAB SECRETS VAULT AT FIRST LAUNCH (docs/DESIGN-secrets-2026-10-20.md §7).
-//!
-//! The owner, 2026-10-20: *"I download aterm on the internet on a new machine on my LAN,
-//! it tries to access the default credentials service URL on the LAN, it does that
-//! immediately and seamlessly, and then GitHub and publishing JUST WORK."* This is the
-//! window's half of it, in three steps:
-//!
-//! 1. **The probe lane** ([`spawn_probe_lane`], at config load, a windowed macOS instance
-//!    only): a Mac with no vault configured (`aterm_secrets::client::config` reads none),
-//!    or one whose join of the ALab vault never finished ([`plan`]), whose person has not
-//!    declined ([`DECLINED_RECORD`]) asks, on a background thread, whether the ALab vault
-//!    answers on this LAN (`client::probe_default`). An app's first LAN connection raises
-//!    macOS's Local Network consent and fails until the person allows it, so a failed
-//!    probe is tried again after [`retry_after`] — 15 s, doubling to five minutes — for the
-//!    life of the process while the vault's name resolves; a name that resolves to nothing
-//!    for [`UNRESOLVED_FOR`] (no such host on this LAN, or maybe a consent still
-//!    unanswered) and no ALab vault there (nothing served at its URL, or an answer that is
-//!    not the ALab vault under the key built into aterm, [`heard`]) both end the lane, and
-//!    the next launch asks again. A configured Mac's read also mends its subscriber: one
-//!    whose plist runs a copy of aterm that is gone or does not last (a disk image, an App
-//!    Translocation copy) is installed again from this one, as is one this window owes the
-//!    Mac ([`OWED_RECORD`]).
-//! 2. **The ask** ([`admit`], from the App's consent lanes): once the vault answered, a
-//!    sheet on the focused window at a quiet moment, behind the Full Disk Access, Developer
-//!    Tools and debugger-access launch steps (`secrets_sheet`): *Join*, *Not Now* (asked
-//!    again at the next launch: nothing is written) or *Don't Ask Again* (this Mac goes
-//!    into [`DECLINED_RECORD`]). A Mac that joined is never asked again, because it is
-//!    configured, and one configured from a terminal while the ask waited is not asked
-//!    either. A sheet nobody answers for [`SHEET_FOR`] is Not Now, and a `sudo` password
-//!    sheet that needs the same window takes it (the ask comes back after).
-//! 3. **The join** ([`JoinReach::run`], on a background thread): `client::join` of the
-//!    sheet's URL (the ALab default unless the person edited it) with the typed password,
-//!    the subscriber installed once the request is queued (or after the join, for a Mac
-//!    that was in already) when this aterm is a copy that lasts ([`lasting_program`]), and
-//!    the outcome told through the message surface: a band answer to the press
-//!    ([`joined_notice`], [`pending_notice`], [`failed_notice`]) and, where the person has
-//!    something left to do, a digest line ([`pending_entry`], [`failed_entry`],
-//!    [`unsynced_entry`], [`unfinished_entry`]). Names, counts, the join code and program
-//!    paths only, never a value; the typed password is wiped when the join returns.
-//!
-//! Headless code reaches neither WindowServer nor the LAN: the probe lane starts on a
-//! windowed instance only, the join and the sheet run behind [`JoinReach`] (inert on the
-//! test App), and everything else here is pure and tested without AppKit.
 
-// The live arms are macOS's; the pure half compiles everywhere so its tests do.
 #![cfg_attr(not(target_os = "macos"), allow(dead_code))]
 
 use std::path::{Path, PathBuf};
@@ -56,25 +13,15 @@ use aterm_messages::exceptions::{Entry, Family};
 use aterm_messages::need::{Fingerprint, NoticeKind, Reason, Then, Why};
 use aterm_messages::{Message, Severity, tags};
 use aterm_secrets::SecretBytes;
-// The vault's client and services are Unix's (`aterm secrets` refuses Windows by name).
 #[cfg(unix)]
 use aterm_secrets::client::Paths;
 
 use crate::{App, Wake};
 
-/// The once-per-Mac record beside `aterm.toml` of the Macs whose person chose *Don't Ask
-/// Again*: one `<host-uuid> <secs>` line per Mac, in the debugger-access launch ask's
-/// record form (`debugger_access::read_host_record`), because the config folder may sync
-/// between Macs. Written by that choice alone: *Not Now* writes nothing, and a Mac that
-/// joined is never asked again because it is configured.
+/// The once-per-Mac record beside `aterm.toml` of the Macs whose person chose *Don't Ask Again*: one `<host-uuid> <secs>` line per Mac, in the debugger-access launch ask's record form (`debugger_access::read_host_record`), because the config folder may sync between Macs.
 pub(crate) const DECLINED_RECORD: &str = "secrets-join-declined";
 
-/// The record beside `aterm.toml` of the Macs this window owes a subscriber: a join here
-/// asked for one and could not install it (this aterm ran from a disk image or an App
-/// Translocation copy, or launchd refused). The next launch from a copy that lasts installs
-/// it and forgets the line. Without it a Mac with no subscriber is left as it is: its
-/// person may have turned it off (`aterm secrets agent off`). Same form as
-/// [`DECLINED_RECORD`], read the other way: a record that cannot be read owes nothing.
+/// The record beside `aterm.toml` of the Macs this window owes a subscriber: a join here asked for one and could not install it (this aterm ran from a disk image or an App Translocation copy, or launchd refused).
 pub(crate) const OWED_RECORD: &str = "secrets-subscriber-owed";
 
 /// How long one probe waits for the vault to answer.
@@ -86,18 +33,10 @@ pub(crate) const RETRY_FIRST: Duration = Duration::from_secs(15);
 /// The probe lane's longest pause ([`retry_after`]).
 pub(crate) const RETRY_CAP: Duration = Duration::from_secs(5 * 60);
 
-/// How long the probe lane keeps asking while the vault's name resolves to nothing. That
-/// is a LAN with no ALab vault, or possibly one whose Local Network consent is still
-/// unanswered (Bonjour refuses a process the consent has not allowed, and the machines
-/// controller counts an unresolved name among what that refusal can cause; not measured
-/// for a `.local` lookup here, so the two are not told apart): an hour covers a person
-/// answering macOS's question, and spares every other network a lookup every five minutes
-/// for the life of the process. A name that resolves keeps the lane going.
+/// How long the probe lane keeps asking while the vault's name resolves to nothing.
 pub(crate) const UNRESOLVED_FOR: Duration = Duration::from_secs(60 * 60);
 
-/// How long a join waits for an admin Mac to approve this one once it has asked. With the
-/// join password an admin Mac's subscriber approves within seconds; past this the outcome
-/// is pending, and the subscriber finishes the join by itself.
+/// How long a join waits for an admin Mac to approve this one once it has asked.
 pub(crate) const JOIN_WAIT: Duration = Duration::from_secs(120);
 
 /// How often the join worker reads, after a pending outcome, whether this Mac is in.
@@ -106,25 +45,16 @@ pub(crate) const MEMBER_RECHECK: Duration = Duration::from_secs(30);
 /// How often the ask looks for its moment: the launch hand-overs' cadence.
 pub(crate) const LOOK_EVERY: Duration = crate::devtools_helper::RECHECK_EVERY;
 
-/// How long after the vault answered the ask waits behind the Full Disk Access and
-/// Developer Tools launch decisions. Both come within seconds of a launch; a decision that
-/// never comes must not keep the vault from being offered for good. A hand-over or panel
-/// that is actually up is waited out whatever the time ([`Wait::BehindPage`]).
+/// How long after the vault answered the ask waits behind the Full Disk Access and Developer Tools launch decisions.
 pub(crate) const LAUNCH_STEPS_FOR: Duration = Duration::from_secs(10 * 60);
 
-/// How long the sheet stays up unanswered: then it is Not Now. While it is up synthetic key
-/// posting is fenced off process-wide (`askpass::PROMPT_INPUT`), as for `sudo`'s sheet,
-/// whose deadline (`askpass::ASKPASS_DEADLINE`, macOS's only) this matches.
+/// How long the sheet stays up unanswered: then it is Not Now.
 pub(crate) const SHEET_FOR: Duration = Duration::from_secs(300);
 
-/// The development seam that shows the sheet on a Mac with no ALab vault in reach (`lab
-/// instance --window`): `found` makes the probe lane answer at once and the join answer
-/// pending with a made-up code, with no network, no files and no launchd job. A debug or
-/// `dev-seams` build reads it; a shipped build never does.
+/// The development seam that shows the sheet on a Mac with no ALab vault in reach (`lab instance --window`): `found` makes the probe lane answer at once and the join answer pending with a made-up code, with no network, no files and no launchd job.
 pub(crate) const LOOK_SEAM: &str = "ATERM_DEBUG_SECRETS_JOIN";
 
-/// How long the probe lane waits after its `failures`-th failure in a row: 15 s, 30 s,
-/// 60 s, 120 s, 240 s, then five minutes for as long as it keeps failing.
+/// How long the probe lane waits after its `failures`-th failure in a row: 15 s, 30 s, 60 s, 120 s, 240 s, then five minutes for as long as it keeps failing.
 pub(crate) fn retry_after(failures: u32) -> Duration {
     let doublings = failures.saturating_sub(1).min(8);
     RETRY_FIRST.saturating_mul(1 << doublings).min(RETRY_CAP)
@@ -138,17 +68,13 @@ pub(crate) fn vault_host() -> &'static str {
     &rest[..end]
 }
 
-/// Whether the sheet's `source` (empty: the default) is the ALab vault's URL, which a bare
-/// `aterm secrets join` joins.
+/// Whether the sheet's `source` (empty: the default) is the ALab vault's URL, which a bare `aterm secrets join` joins.
 pub(crate) fn is_alab_source(source: &str) -> bool {
     let source = source.trim();
     source.is_empty() || source == aterm_secrets::ALAB_DEFAULT_URL
 }
 
-// The events
-
-/// The ALab vault that answered the probe: the version it serves and its signer's
-/// fingerprint (public; for the log).
+/// The ALab vault that answered the probe: the version it serves and its signer's fingerprint (public; for the log).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Found {
     pub(crate) seq: u64,
@@ -172,9 +98,7 @@ const FIRST_BUTTON: isize = 1000;
 const THIRD_BUTTON: isize = 1002;
 
 impl Choice {
-    /// The answer an `NSAlert` response names: its first, second and third buttons are
-    /// Join, Not Now and Don't Ask Again. Anything else — the sheet ended by aterm, a
-    /// window that closed under it — is Not Now: no join, nothing written.
+    /// The answer an `NSAlert` response names: its first, second and third buttons are Join, Not Now and Don't Ask Again.
     pub(crate) const fn of_response(response: isize) -> Self {
         match response {
             FIRST_BUTTON => Self::Join,
@@ -195,9 +119,7 @@ impl Choice {
 /// Why this Mac's subscriber is not running, so its secrets do not follow the vault.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Unsynced {
-    /// This aterm runs from a copy that goes away (a disk image, an App Translocation copy,
-    /// a temporary or cache directory): a launchd job naming it would stop starting. Where
-    /// it runs.
+    /// This aterm runs from a copy that goes away (a disk image, an App Translocation copy, a temporary or cache directory): a launchd job naming it would stop starting.
     Fleeting(String),
     /// The install failed, or the subscriber is not there: what failed.
     Failed(String),
@@ -215,18 +137,15 @@ impl Unsynced {
     }
 }
 
-/// How a join ended. Counts, the code, the host name and program paths only: never a
-/// value.
+/// How a join ended.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum JoinEnd {
-    /// In, and synced: how many secrets this Mac holds; why the subscriber is not
-    /// running, if it is not.
+    /// In, and synced: how many secrets this Mac holds; why the subscriber is not running, if it is not.
     Joined {
         names: usize,
         subscriber: Option<Unsynced>,
     },
-    /// Asked; an admin Mac must approve `code` (this Mac asked as `host`); `with_password`
-    /// when a join password went with the request, so a mistyped one may be why it waits.
+    /// Asked; an admin Mac must approve `code` (this Mac asked as `host`); `with_password` when a join password went with the request, so a mistyped one may be why it waits.
     Pending {
         code: String,
         host: String,
@@ -242,7 +161,7 @@ pub(crate) enum JoinEnd {
 pub(crate) enum Subscriber {
     /// Installed (or installed now), running a copy of aterm that lasts.
     Running,
-    /// Not installed, and nothing owed: turned off, or never asked for. Left as it is.
+    /// Not installed, and nothing owed: turned off, or never asked for.
     Off,
     /// Owed or broken, and not mended: why.
     Missing(Unsynced),
@@ -259,15 +178,12 @@ pub(crate) struct Settled {
     pub(crate) unfinished: bool,
 }
 
-/// What the probe lane, the sheet and the join worker tell the window
-/// (`Wake::SecretsVault`).
+/// What the probe lane, the sheet and the join worker tell the window (`Wake::SecretsVault`).
 #[derive(Debug)]
 pub(crate) enum VaultWake {
-    /// The probe lane: the ALab vault answers on this LAN; `unfinished` when this Mac is
-    /// configured for it already, by a join that never finished.
+    /// The probe lane: the ALab vault answers on this LAN; `unfinished` when this Mac is configured for it already, by a join that never finished.
     Found { found: Found, unfinished: bool },
     /// The probe lane, on a Mac with a vault configured: what its read found and did.
-    /// Ends the digest lines that no longer hold, and raises the ones that do.
     Configured(Settled),
     /// The sheet was answered (its completion handler).
     Answered { id: u64, choice: Choice },
@@ -278,19 +194,14 @@ pub(crate) enum VaultWake {
 /// Where the lane's threads post: the window's queue.
 pub(crate) type Post = Arc<dyn Fn(VaultWake) + Send + Sync>;
 
-// The launch read
-
 /// The subscriber's launchd plist, as the launch read finds it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Plist {
     /// None there.
     Absent,
-    /// There, running a program that is a file at a place that lasts — or one the reader
-    /// cannot name (a plist in another shape than `aterm secrets` writes), which is left
-    /// as it is.
+    /// There, running a program that is a file at a place that lasts — or one the reader cannot name (a plist in another shape than `aterm secrets` writes), which is left as it is.
     Sound,
-    /// There, running a program that is gone or does not last (a disk image ejected, an
-    /// App Translocation copy, a temporary directory): launchd cannot start it.
+    /// There, running a program that is gone or does not last (a disk image ejected, an App Translocation copy, a temporary directory): launchd cannot start it.
     Stale(String),
 }
 
@@ -329,12 +240,7 @@ pub(crate) struct Plan {
     pub(crate) unfinished: bool,
 }
 
-/// THE LAUNCH READ'S PLAN (pure): the subscriber is installed again when its plist runs a
-/// program that is gone or does not last, and installed when this Mac is owed one and has
-/// none; a plist with no line owed for it is never touched (its person may have turned it
-/// off). A Mac that asked for nothing that will let it in — configured, not in, no
-/// subscriber to ask again and nothing owed (a join cut off between writing its source and
-/// installing the subscriber) — has an unfinished join.
+/// THE LAUNCH READ'S PLAN (pure): the subscriber is installed again when its plist runs a program that is gone or does not last, and installed when this Mac is owed one and has none; a plist with no line owed for it is never touched (its person may have turned it off).
 pub(crate) fn plan(setup: &Setup) -> Plan {
     let install = match setup.plist {
         Plist::Stale(_) => true,
@@ -348,15 +254,12 @@ pub(crate) fn plan(setup: &Setup) -> Plan {
     }
 }
 
-/// Whether the lane asks this configured Mac anyway: its join of the ALab vault never
-/// finished, so the sheet is the quickest way in (Join reruns it, password and all).
+/// Whether the lane asks this configured Mac anyway: its join of the ALab vault never finished, so the sheet is the quickest way in (Join reruns it, password and all).
 pub(crate) fn asks_again(setup: &Setup) -> bool {
     setup.alab && plan(setup).unfinished
 }
 
-/// The program a launchd plist that `aterm_secrets::service::plist_text` wrote runs: the
-/// first `<string>` of its `ProgramArguments` array, its XML entities read back. `None`
-/// for a plist in any other shape (edited by hand, converted to binary).
+/// The program a launchd plist that `aterm_secrets::service::plist_text` wrote runs: the first `<string>` of its `ProgramArguments` array, its XML entities read back.
 pub(crate) fn plist_program(text: &str) -> Option<String> {
     const KEY: &str = "<key>ProgramArguments</key>";
     let at = text.find(KEY)?;
@@ -369,7 +272,6 @@ pub(crate) fn plist_program(text: &str) -> Option<String> {
 }
 
 /// XML character data read back: the five predefined entities `plist_text` writes, and
-/// nothing else (`None`).
 fn xml_text(raw: &str) -> Option<String> {
     const ENTITIES: [(&str, char); 5] = [
         ("&amp;", '&'),
@@ -395,7 +297,6 @@ fn xml_text(raw: &str) -> Option<String> {
 pub(crate) fn subscriber_plist(plist: &Path) -> Plist {
     match std::fs::symlink_metadata(plist) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Plist::Absent,
-        // Something is there that cannot be read: left as it is.
         Err(_) => return Plist::Sound,
         Ok(_) => {}
     }
@@ -413,9 +314,7 @@ pub(crate) fn subscriber_plist(plist: &Path) -> Plist {
     }
 }
 
-/// The program a subscriber installed now runs, when it is a copy that lasts
-/// (`atpkg::stub::lasting`: not a disk image, an App Translocation copy, a temporary or a
-/// cache directory), which a launchd job may name; else where this aterm runs.
+/// The program a subscriber installed now runs, when it is a copy that lasts (`atpkg::stub::lasting`: not a disk image, an App Translocation copy, a temporary or a cache directory), which a launchd job may name; else where this aterm runs.
 pub(crate) fn lasting_program(program: PathBuf) -> Result<PathBuf, Unsynced> {
     if atpkg::stub::lasting(&program) {
         Ok(program)
@@ -425,8 +324,6 @@ pub(crate) fn lasting_program(program: PathBuf) -> Result<PathBuf, Unsynced> {
 }
 
 /// The program a subscriber installed now runs (`service::program_for_service`, which
-/// refuses a copy that does not last): where this aterm runs when that is why
-/// ([`lasting_program`]), else what failed.
 #[cfg(target_os = "macos")]
 fn subscriber_program() -> Result<PathBuf, Unsynced> {
     aterm_secrets::service::program_for_service().map_err(|error| {
@@ -438,8 +335,7 @@ fn subscriber_program() -> Result<PathBuf, Unsynced> {
     })
 }
 
-/// This Mac's vault setup under `paths`: `source.toml`, `state.toml` and the subscriber's
-/// plist, never the network; `owed` read by the caller ([`OWED_RECORD`]).
+/// This Mac's vault setup under `paths`: `source.toml`, `state.toml` and the subscriber's plist, never the network; `owed` read by the caller ([`OWED_RECORD`]).
 #[cfg(unix)]
 pub(crate) fn read_configured(paths: &Paths, owed: bool) -> Result<Configured, String> {
     use aterm_secrets::client::{self, Membership};
@@ -459,8 +355,7 @@ pub(crate) fn read_configured(paths: &Paths, owed: bool) -> Result<Configured, S
     }))
 }
 
-/// Whether this Mac (`host`) is in [`OWED_RECORD`] beside `config_path`. Fails toward not:
-/// an owed line starts a launchd write, so a record that cannot be read owes nothing.
+/// Whether this Mac (`host`) is in [`OWED_RECORD`] beside `config_path`.
 pub(crate) fn owed(config_path: Option<&Path>, host: Option<&str>) -> bool {
     match (config_path, host) {
         (Some(config), Some(host)) => {
@@ -470,8 +365,7 @@ pub(crate) fn owed(config_path: Option<&Path>, host: Option<&str>) -> bool {
     }
 }
 
-/// Write this Mac into [`OWED_RECORD`] (`still_owed`) or take it out. Logged, never
-/// fatal: the record only spares the person a step.
+/// Write this Mac into [`OWED_RECORD`] (`still_owed`) or take it out.
 pub(crate) fn note_owed(config_path: Option<&Path>, host: Option<&str>, still_owed: bool) {
     let (Some(config), Some(host)) = (config_path, host) else {
         return;
@@ -491,24 +385,14 @@ pub(crate) fn note_owed(config_path: Option<&Path>, host: Option<&str>, still_ow
     }
 }
 
-// The probe lane
-
-/// A probe that failed: what failed, and whether the vault's name resolves. A name that
-/// resolves is a host on this LAN that did not answer (Local Network consent, a server
-/// down) and is asked again for the life of the process; one that does not is asked for
-/// [`UNRESOLVED_FOR`]. An answer that is not the ALab vault is no miss ([`heard`]).
+/// A probe that failed: what failed, and whether the vault's name resolves.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Missed {
     pub(crate) why: String,
     pub(crate) resolved: bool,
 }
 
-/// One probe's answer (`client::probe_default`) as the lane reads it: the ALab vault found;
-/// no ALab vault there, either because nothing is served at its URL or because what is
-/// served there is not it (another vault, or something that is no vault server, on that
-/// name and port), which asking again every five minutes for the life of the process would
-/// not change; or a failure to reach it, a miss, for which alone `resolves` is asked (a
-/// lookup of its own).
+/// One probe's answer (`client::probe_default`) as the lane reads it: the ALab vault found; no ALab vault there, either because nothing is served at its URL or because what is served there is not it (another vault, or something that is no vault server, on that name and port), which asking again every five minutes for the life of the process would not change; or a failure to reach it, a miss, for which alone `resolves` is asked (a lookup of its own).
 #[cfg(unix)]
 pub(crate) fn heard(
     probed: aterm_secrets::Result<aterm_secrets::client::ProbeOutcome>,
@@ -535,15 +419,13 @@ pub(crate) fn heard(
     }
 }
 
-/// What the probe lane reads and does, injected so its schedule is tested without a LAN, a
-/// home, launchd or a clock.
+/// What the probe lane reads and does, injected so its schedule is tested without a LAN, a home, launchd or a clock.
 pub(crate) struct ProbeReach {
     /// This Mac's vault configuration, or why it cannot be read.
     pub(crate) configured: Box<dyn Fn() -> Result<Configured, String> + Send>,
     /// Whether this Mac is in [`DECLINED_RECORD`].
     pub(crate) declined: Box<dyn Fn() -> bool + Send>,
-    /// One probe of the ALab vault, bounded by the wait it is given: `Ok(None)` when no
-    /// ALab vault answers there, whatever else does ([`heard`]).
+    /// One probe of the ALab vault, bounded by the wait it is given: `Ok(None)` when no ALab vault answers there, whatever else does ([`heard`]).
     pub(crate) probe: Box<dyn Fn(Duration) -> Result<Option<Found>, Missed> + Send>,
     /// The pause between tries.
     pub(crate) sleep: Box<dyn Fn(Duration) + Send>,
@@ -564,18 +446,13 @@ pub(crate) enum LaneEnd {
     Declined,
     /// The ALab vault answered; the window asks at its moment.
     Found,
-    /// No ALab vault answers on this LAN: nothing is served at its URL, or what is served
-    /// there is not it.
+    /// No ALab vault answers on this LAN: nothing is served at its URL, or what is served there is not it.
     NoVault,
     /// The vault's name resolved to nothing for [`UNRESOLVED_FOR`].
     Unresolved,
 }
 
-/// THE PROBE LANE: read the configuration (and settle a configured Mac's subscriber,
-/// [`settle`]), then the declined record, then probe until the ALab vault answers or says
-/// it is not there, pausing [`retry_after`] between failures and re-reading the
-/// configuration after each pause. Runs for the life of the process while the probe fails
-/// with a name that resolves, and for [`UNRESOLVED_FOR`] of pauses while it does not.
+/// THE PROBE LANE: read the configuration (and settle a configured Mac's subscriber, [`settle`]), then the declined record, then probe until the ALab vault answers or says it is not there, pausing [`retry_after`] between failures and re-reading the configuration after each pause.
 pub(crate) fn run_probe_lane(reach: &ProbeReach, post: &dyn Fn(VaultWake)) -> LaneEnd {
     let unfinished = match (reach.configured)() {
         Err(why) => return LaneEnd::Unreadable(why),
@@ -610,8 +487,6 @@ pub(crate) fn run_probe_lane(reach: &ProbeReach, post: &dyn Fn(VaultWake)) -> La
                 } else {
                     unresolved_for = unresolved_for.saturating_add(pause);
                 }
-                // One line per distinct failure: a Local Network refusal repeats for as
-                // long as the person has not answered macOS's question.
                 if told.as_deref() != Some(missed.why.as_str()) {
                     aterm_log::info!(
                         "secrets vault: the ALab vault did not answer ({}); asking again every {}s at most",
@@ -636,8 +511,6 @@ pub(crate) fn run_probe_lane(reach: &ProbeReach, post: &dyn Fn(VaultWake)) -> La
 }
 
 /// A configured Mac's read, acted on ([`plan`]): the owed line forgotten once paid, the
-/// subscriber installed when the plan says so, and what holds posted. `true` when the lane
-/// goes on to ask ([`asks_again`]).
 fn settle(reach: &ProbeReach, setup: &Setup, post: &dyn Fn(VaultWake)) -> bool {
     let plan = plan(setup);
     if plan.paid {
@@ -666,8 +539,7 @@ fn settle(reach: &ProbeReach, setup: &Setup, post: &dyn Fn(VaultWake)) -> bool {
     asks_again(setup)
 }
 
-/// Whether this Mac (`host`, the kernel's host UUID) is in the declined record beside
-/// `config_path`. A Mac the kernel names no host for cannot be recorded, so it is asked.
+/// Whether this Mac (`host`, the kernel's host UUID) is in the declined record beside `config_path`.
 pub(crate) fn declined(config_path: &Path, host: Option<&str>) -> bool {
     host.is_some_and(|host| {
         crate::debugger_access::read_host_record(config_path, DECLINED_RECORD, host)
@@ -689,10 +561,7 @@ pub(crate) fn note_declined(
     crate::debugger_access::note_host_record(config_path, DECLINED_RECORD, host, now)
 }
 
-/// Start the probe lane: a windowed macOS instance, off the event loop, posting through
-/// `post` (which holds what it posts until the loop exists). `config_path` is
-/// `aterm.toml`'s, beside which [`DECLINED_RECORD`] and [`OWED_RECORD`] live. Never
-/// joined: a probe the resolver holds must not hold a launch.
+/// Start the probe lane: a windowed macOS instance, off the event loop, posting through `post` (which holds what it posts until the loop exists).
 pub(crate) fn spawn_probe_lane(headless: bool, config_path: Option<PathBuf>, post: Post) {
     if headless || !cfg!(target_os = "macos") {
         return;
@@ -746,7 +615,6 @@ fn live_probe_reach(config_path: Option<PathBuf>) -> ProbeReach {
 }
 
 /// Whether the ALab vault's name resolves to an address now (the resolver the probe's
-/// own request uses, `getaddrinfo`).
 #[cfg(target_os = "macos")]
 fn vault_resolves() -> bool {
     use std::net::ToSocketAddrs as _;
@@ -774,7 +642,6 @@ fn look_probe_reach() -> ProbeReach {
 }
 
 /// This Mac's vault configuration under the live home ([`read_configured`]), with this
-/// Mac's [`OWED_RECORD`] line beside `config_path`.
 #[cfg(target_os = "macos")]
 fn live_configured(config_path: Option<&Path>, host: Option<&str>) -> Result<Configured, String> {
     let paths = Paths::live().map_err(|error| error.to_string())?;
@@ -782,9 +649,6 @@ fn live_configured(config_path: Option<&Path>, host: Option<&str>) -> Result<Con
 }
 
 /// Whether a vault is configured under the live home now: `source.toml` alone, the one
-/// small file the ask reads on the event loop before it raises the sheet (a person may
-/// have joined from a terminal while it waited). A file that cannot be read counts as
-/// configured: nothing is asked over it.
 #[cfg(target_os = "macos")]
 fn live_configured_now() -> bool {
     !matches!(
@@ -793,10 +657,7 @@ fn live_configured_now() -> bool {
     )
 }
 
-// The join
-
-/// A join to run: the typed password (wiped when the job drops; `None` to be approved by
-/// code), where its end goes, and `aterm.toml`'s path ([`OWED_RECORD`] lives beside it).
+/// A join to run: the typed password (wiped when the job drops; `None` to be approved by code), where its end goes, and `aterm.toml`'s path ([`OWED_RECORD`] lives beside it).
 pub(crate) struct JoinJob {
     pub(crate) source: String,
     pub(crate) password: Option<SecretBytes>,
@@ -804,17 +665,14 @@ pub(crate) struct JoinJob {
     pub(crate) config: Option<PathBuf>,
 }
 
-/// How the sheet and the join reach the platform: the live arms on a windowed macOS
-/// instance, the inert ones everywhere else (the test App among them).
+/// How the sheet and the join reach the platform: the live arms on a windowed macOS instance, the inert ones everywhere else (the test App among them).
 #[derive(Clone, Copy)]
 pub(crate) struct JoinReach {
     /// Whether a sheet may be raised: a windowed macOS instance.
     pub(crate) sheet: bool,
-    /// Start `job` off the event loop; `false` when it could not start (its password is
-    /// wiped either way).
+    /// Start `job` off the event loop; `false` when it could not start (its password is wiped either way).
     pub(crate) run: fn(JoinJob) -> bool,
-    /// Whether a vault is configured now ([`live_configured_now`]), read just before the
-    /// sheet is raised on a Mac that had none.
+    /// Whether a vault is configured now ([`live_configured_now`]), read just before the sheet is raised on a Mac that had none.
     pub(crate) configured_now: fn() -> bool,
 }
 
@@ -875,9 +733,6 @@ const fn never() -> bool {
 }
 
 /// The live join, on a background thread: [`join_vault`] of the sheet's source, then — when
-/// it ends pending — a look at whether this Mac is in every [`MEMBER_RECHECK`], so the
-/// subscriber's finishing of it is told as a join. The password is wiped before the end
-/// is posted.
 #[cfg(target_os = "macos")]
 fn spawn_join(job: JoinJob) -> bool {
     crate::qos::spawn_lane_thread(
@@ -928,9 +783,7 @@ fn look_join(job: JoinJob) -> bool {
     true
 }
 
-/// One join, its reach injected: where the vault state lives, the source (empty: the ALab
-/// default, pinned by `ALAB_SIGNER`, so no fingerprint is confirmed), how long to wait for
-/// the approval, the typed password, and the subscriber's install.
+/// One join, its reach injected: where the vault state lives, the source (empty: the ALab default, pinned by `ALAB_SIGNER`, so no fingerprint is confirmed), how long to wait for the approval, the typed password, and the subscriber's install.
 #[cfg(unix)]
 pub(crate) struct JoinPlan<'a> {
     pub(crate) paths: &'a Paths,
@@ -940,11 +793,7 @@ pub(crate) struct JoinPlan<'a> {
     pub(crate) install: &'a dyn Fn() -> Result<(), Unsynced>,
 }
 
-/// `client::join`, not interactive, the subscriber installed once the request is queued —
-/// and after the join when that never ran (a Mac that was in already). Errors name what
-/// failed, never a value. A join that fails after it wrote its source (the request or the
-/// sync cut off) leaves an unfinished join, which the next launch reads ([`plan`]) and
-/// offers again.
+/// `client::join`, not interactive, the subscriber installed once the request is queued — and after the join when that never ran (a Mac that was in already).
 #[cfg(unix)]
 pub(crate) fn join_vault(plan: &JoinPlan<'_>) -> JoinEnd {
     use aterm_secrets::client::{self, JoinOptions, JoinOutcome};
@@ -994,9 +843,6 @@ pub(crate) fn join_vault(plan: &JoinPlan<'_>) -> JoinEnd {
 }
 
 /// The subscriber (`aterm secrets watch`), as `aterm secrets agent on` installs it: a
-/// launchd user agent running this aterm's bundle executable, when that is a copy that
-/// lasts ([`lasting_program`]). This Mac goes into [`OWED_RECORD`] when it is not
-/// installed, and out when it is.
 #[cfg(target_os = "macos")]
 fn install_subscriber(home: &Path, config_path: Option<&Path>) -> Result<(), Unsynced> {
     use aterm_secrets::service::{self, Job};
@@ -1021,8 +867,7 @@ fn install_subscriber(home: &Path, config_path: Option<&Path>) -> Result<(), Uns
     installed.map(|_| ())
 }
 
-/// Why a member's subscriber is not running, from its plist: `None` when it is sound;
-/// `running` names where a new one would run from, so a copy that does not last is said.
+/// Why a member's subscriber is not running, from its plist: `None` when it is sound; `running` names where a new one would run from, so a copy that does not last is said.
 pub(crate) fn subscriber_gap(
     plist: &Plist,
     running: impl FnOnce() -> Result<PathBuf, Unsynced>,
@@ -1041,8 +886,6 @@ pub(crate) fn subscriber_gap(
 }
 
 /// After a pending join: read every [`MEMBER_RECHECK`] whether this Mac is in, and post
-/// the join when it is, with what its subscriber's plist says. Ends when the
-/// configuration goes or cannot be read.
 #[cfg(target_os = "macos")]
 fn watch_membership(config_path: Option<&Path>, post: &dyn Fn(VaultWake)) {
     let host = aterm_containment::consent::host_uuid();
@@ -1063,13 +906,10 @@ fn watch_membership(config_path: Option<&Path>, post: &dyn Fn(VaultWake)) {
     }
 }
 
-// The ask
-
-/// What the ask is judged on at a look. Pure data, gathered by the App.
+/// What the ask is judged on at a look.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct AskFacts {
-    /// The Full Disk Access or Developer Tools launch decision is still to come (and
-    /// [`LAUNCH_STEPS_FOR`] has not passed since the vault answered).
+    /// The Full Disk Access or Developer Tools launch decision is still to come (and [`LAUNCH_STEPS_FOR`] has not passed since the vault answered).
     pub(crate) launch_steps: bool,
     /// The debugger-access launch ask is queued, or a debugger change is under way.
     pub(crate) debugger: bool,
@@ -1079,8 +919,7 @@ pub(crate) struct AskFacts {
     pub(crate) warmup: bool,
     /// A password sheet is up (`sudo`'s), or the focused window shows a sheet.
     pub(crate) other_sheet: bool,
-    /// The quiet moment (`App::devtools_moment_is_quiet`): an aterm window focused, the
-    /// owner present but hands off, this process settled.
+    /// The quiet moment (`App::devtools_moment_is_quiet`): an aterm window focused, the owner present but hands off, this process settled.
     pub(crate) quiet: bool,
     /// The owner declined a Security gesture recently.
     pub(crate) owner_quiet: bool,
@@ -1121,10 +960,7 @@ impl Wait {
     }
 }
 
-/// THE ASK'S ADMISSION. Pure, and the order is the contract: behind this process's
-/// launch steps (Full Disk Access, Developer Tools, then the debugger-access ask), with
-/// no page, panel, folder dialog or other sheet up, at the quiet moment, and not right
-/// after the owner declined a Security gesture.
+/// THE ASK'S ADMISSION.
 pub(crate) fn admit(facts: &AskFacts) -> Ask {
     let waits = [
         (facts.launch_steps, Wait::BehindLaunchSteps),
@@ -1141,15 +977,13 @@ pub(crate) fn admit(facts: &AskFacts) -> Ask {
         .map_or(Ask::Raise, |&(_, why)| Ask::Wait(why))
 }
 
-/// The App's lane: the vault that answered, the ask's next look, the sheet that is up and
-/// the join that runs. Fed only on a windowed macOS instance ([`JoinReach::sheet`]).
+/// The App's lane: the vault that answered, the ask's next look, the sheet that is up and the join that runs.
 #[derive(Default)]
 pub(crate) struct Lane {
     reach: Option<JoinReach>,
     /// The vault the probe lane found, and when.
     found: Option<(Found, Instant)>,
     /// The Mac the vault was found for is configured already (an unfinished join): the
-    /// look before the raise does not end the ask on its `source.toml`.
     unfinished: bool,
     /// When the next look is due; `None`: at the next park.
     next_look: Option<Instant>,
@@ -1204,9 +1038,7 @@ impl Lane {
         self.reach.unwrap_or(JoinReach::inert())
     }
 
-    /// The probe lane found the vault (for a Mac configured already by an unfinished join
-    /// when `unfinished`): the ask looks at the next park. Ignored where no sheet can be
-    /// raised, and once the ask is over.
+    /// The probe lane found the vault (for a Mac configured already by an unfinished join when `unfinished`): the ask looks at the next park.
     pub(crate) fn on_found(&mut self, found: Found, unfinished: bool, now: Instant) {
         if !self.reach().sheet || self.over {
             return;
@@ -1232,15 +1064,12 @@ impl Lane {
             .is_some_and(|(_, at)| now.saturating_duration_since(*at) < LAUNCH_STEPS_FOR)
     }
 
-    /// Whether the Mac is still one to ask, read just before the sheet goes up: one the
-    /// vault was found for unconfigured is not, once a vault is configured (a person
-    /// joined from a terminal while the ask waited).
+    /// Whether the Mac is still one to ask, read just before the sheet goes up: one the vault was found for unconfigured is not, once a vault is configured (a person joined from a terminal while the ask waited).
     pub(crate) fn still_asks(&self) -> bool {
         self.unfinished || !(self.reach().configured_now)()
     }
 
-    /// The look waits on `why`: look again after [`LOOK_EVERY`]. `true` when that is not
-    /// what the last look waited on (worth one line in the log).
+    /// The look waits on `why`: look again after [`LOOK_EVERY`].
     pub(crate) fn wait(&mut self, why: Wait, now: Instant) -> bool {
         self.next_look = Some(now + LOOK_EVERY);
         self.waiting.replace(why) != Some(why)
@@ -1281,8 +1110,7 @@ impl Lane {
         self.sheet.is_some()
     }
 
-    /// The sheet `id` was answered: `Some(choice)` for the sheet that is up, and the ask
-    /// is over for this process; `None` for a stale answer.
+    /// The sheet `id` was answered: `Some(choice)` for the sheet that is up, and the ask is over for this process; `None` for a stale answer.
     pub(crate) fn answered(&mut self, id: u64, choice: Choice) -> Option<Choice> {
         if self.sheet.map(|(up, _)| up) != Some(id) {
             return None;
@@ -1292,8 +1120,7 @@ impl Lane {
         Some(choice)
     }
 
-    /// The sheet went with no answer (its window closed, or `sudo`'s sheet needed it):
-    /// asked again at the next quiet moment.
+    /// The sheet went with no answer (its window closed, or `sudo`'s sheet needed it): asked again at the next quiet moment.
     pub(crate) fn withdrawn(&mut self) {
         self.sheet = None;
         self.next_look = None;
@@ -1320,8 +1147,6 @@ impl Lane {
         (self.reach().run)(job)
     }
 }
-
-// The words
 
 /// The band row's key: the join in flight, then the answer to the press, in place.
 pub(crate) const KEY_JOIN: &str = "secrets.join";
@@ -1356,9 +1181,7 @@ fn secrets_words(n: usize) -> String {
     }
 }
 
-/// The join in flight, from the press until its answer replaces it: the vault at the
-/// sheet's `source` (empty: the default). A URL is named as the CLI names one, never with
-/// its userinfo, query or fragment, where a credential could ride; a path is a vault file.
+/// The join in flight, from the press until its answer replaces it: the vault at the sheet's `source` (empty: the default).
 pub(crate) fn joining_row(source: &str) -> Message {
     let source = source.trim();
     let lower = source.to_ascii_lowercase();
@@ -1393,26 +1216,9 @@ pub(crate) fn joined_notice(names: usize, follows: bool) -> Message {
 }
 
 /// What fixes a mistyped join password on a Mac that waits with one: its proof matched
-/// nothing, so it waits for an approval by code with no sign of why, and only a join again
-/// sends another. A bare join asks for the ALab vault, so another vault's URL is added (as
-/// [`JOIN_AGAIN`] says), never shown here, since it may carry a query or a pin.
 const RETYPE: &str = "a mistyped join password is fixed by running aterm secrets join in a terminal, adding the vault's URL if not the ALab one (it asks for the password again)";
 
 /// What the digest line of a join that failed or never finished, or of a subscriber that
-/// could not be installed, asks: System State's Apply with its vault row
-/// ([`Setting::Secrets`], the one switch whose label names the vault) on and its Mac
-/// settings rows (the [`Setting::is_workstation`] ones) off. That Apply joins the vault in
-/// the tab's field (the vault this Mac is configured for, else the saved plan's) with the
-/// join password typed there, if any, and installs the subscriber. System State has one
-/// Apply, which runs every row switched on again, so a Mac settings row left on resets the
-/// Dock or signs an account out again; the other rows stay as they are, since an Apply
-/// without [`Setting::Permissions`] also ends aterm's permission asks. [`rows_named`] says
-/// which rows and why. No message intent opens that tab, so the step names its menu row
-/// too.
-///
-/// [`Setting::Secrets`]: aterm_types::macos_setup::Setting::Secrets
-/// [`Setting::Permissions`]: aterm_types::macos_setup::Setting::Permissions
-/// [`Setting::is_workstation`]: aterm_types::macos_setup::Setting::is_workstation
 fn sync_in_system_state() -> String {
     format!(
         "In {}, Apply with the vault row on and the Mac settings rows off",
@@ -1421,8 +1227,6 @@ fn sync_in_system_state() -> String {
 }
 
 /// The details line that says which rows [`sync_in_system_state`] means and why: the Mac
-/// settings rows by the first and last of their labels (they lead System State's list),
-/// which an Apply runs again, and the other rows left as they are.
 fn rows_named() -> String {
     use aterm_types::macos_setup::Setting;
     let mut mac = Setting::ALL
@@ -1437,15 +1241,13 @@ fn rows_named() -> String {
 }
 
 /// The same join from a terminal, beside [`sync_in_system_state`]: it names the vault's URL for
-/// any vault but the ALab default, the bare verb's.
 const JOIN_AGAIN: &str =
     "In a terminal, aterm secrets join does the same, adding the vault's URL if not the ALab one";
 
 /// The same subscriber install from a terminal, beside [`sync_in_system_state`].
 const AGENT_ON: &str = "In a terminal, aterm secrets agent on installs it too";
 
-/// The answer to Join: asked, and an admin Mac approves `code`; [`RETYPE`] when a join
-/// password went with the request.
+/// The answer to Join: asked, and an admin Mac approves `code`; [`RETYPE`] when a join password went with the request.
 pub(crate) fn pending_notice(code: &str, with_password: bool) -> Message {
     let message = Message::new(
         tags::PRIVACY,
@@ -1481,8 +1283,7 @@ pub(crate) fn failed_notice(why: &str) -> Message {
     .key(KEY_JOIN)
 }
 
-/// The digest line while an admin Mac has not approved this one; [`RETYPE`] when a join
-/// password went with the request.
+/// The digest line while an admin Mac has not approved this one; [`RETYPE`] when a join password went with the request.
 pub(crate) fn pending_entry(code: &str, host: &str, with_password: bool) -> Entry {
     let code = clean(code);
     let entry = Entry::new(
@@ -1527,8 +1328,7 @@ pub(crate) fn failed_entry(why: &str) -> Entry {
     .log_line("secrets join-failed")
 }
 
-/// The digest line for a Mac set up for a vault whose join never finished: it never asked,
-/// or nothing is left to finish it (aterm quit mid-join, a request the vault refused).
+/// The digest line for a Mac set up for a vault whose join never finished: it never asked, or nothing is left to finish it (aterm quit mid-join, a request the vault refused).
 pub(crate) fn unfinished_entry() -> Entry {
     Entry::new(
         Family::Privacy,
@@ -1547,10 +1347,7 @@ pub(crate) fn unfinished_entry() -> Entry {
     .log_line("secrets join-unfinished")
 }
 
-/// The digest line for a Mac that joined (or asked) but whose subscriber is not running,
-/// so its secrets do not follow the vault: the remedy follows the reason. A copy that goes
-/// away is moved, which System State cannot do (its own secrets vault row says the same);
-/// a failed install is System State's Apply again ([`sync_in_system_state`]).
+/// The digest line for a Mac that joined (or asked) but whose subscriber is not running, so its secrets do not follow the vault: the remedy follows the reason.
 pub(crate) fn unsynced_entry(why: &Unsynced) -> Entry {
     let (reason, step) = match why {
         Unsynced::Fleeting(_) => (
@@ -1581,8 +1378,6 @@ pub(crate) fn unsynced_entry(why: &Unsynced) -> Entry {
     .log_line("secrets not-synced")
 }
 
-// The App's side
-
 impl App {
     /// Where the join worker posts: the event loop's proxy (none on the test App).
     fn secrets_post(&self) -> Option<Post> {
@@ -1611,7 +1406,6 @@ impl App {
     }
 
     /// A configured Mac's launch read: the lines that no longer hold end, the ones that do
-    /// are raised.
     fn secrets_settled(&mut self, settled: &Settled) {
         if settled.member {
             self.clear_secrets_join_lines();
@@ -1630,9 +1424,7 @@ impl App {
         }
     }
 
-    /// Setup's Secrets stage read this Mac in its vault, synced, with its subscriber running
-    /// (System State's Apply, [`App::publish_system_state`]): every vault line ends, as at a
-    /// launch read that finds the same.
+    /// Setup's Secrets stage read this Mac in its vault, synced, with its subscriber running (System State's Apply, [`App::publish_system_state`]): every vault line ends, as at a launch read that finds the same.
     pub(crate) fn secrets_synced_by_setup(&mut self) {
         aterm_log::info!("secrets vault: setup synced this Mac, and its subscriber runs");
         self.secrets_settled(&Settled {
@@ -1649,10 +1441,7 @@ impl App {
         }
     }
 
-    /// THE ASK'S LOOK, from the hand-over lane's turn after the debugger-access launch
-    /// ask's: a sheet unanswered for [`SHEET_FOR`] goes as Not Now; then [`admit`] decides
-    /// on what this gathers; `quiet` is [`App::devtools_moment_is_quiet`] (a test's
-    /// stand-in). The input clock is read only once the vault answered and a look is due.
+    /// THE ASK'S LOOK, from the hand-over lane's turn after the debugger-access launch ask's: a sheet unanswered for [`SHEET_FOR`] goes as Not Now; then [`admit`] decides on what this gathers; `quiet` is [`App::devtools_moment_is_quiet`] (a test's stand-in).
     pub(crate) fn look_for_secrets_moment(
         &mut self,
         now: Instant,
@@ -1670,9 +1459,6 @@ impl App {
         let privacy = self.config.privacy_probe_gate().permits() && self.config.privacy_notice();
         let fda_decided = self.consent_launch.fda() != crate::consent_launch::FdaLaunch::Undecided;
         let mut devtools_decided = self.devtools_helper.reading().is_some();
-        // The debugger-access ask drives the Developer Tools launch reading where it
-        // reaches its own waits; one that dropped early (an aterm that is not hardened)
-        // leaves it to this look.
         if privacy && fda_decided && !devtools_decided && self.any_os_window_focused() {
             devtools_decided = self.devtools_launch_read_done();
         }
@@ -1726,8 +1512,6 @@ impl App {
     }
 
     /// Raise the sheet now, on a Mac that is still one to ask ([`Lane::still_asks`]); a
-    /// sheet that cannot be raised (no focused window, one with a sheet already) looks
-    /// again later.
     fn raise_secrets_ask(&mut self, now: Instant) {
         if !self.secrets_join.still_asks() {
             self.secrets_join.end();
@@ -1751,8 +1535,6 @@ impl App {
     }
 
     /// The sheet was answered: Join starts the join with the typed password (empty: to be
-    /// approved by code); Don't Ask Again writes this Mac into [`DECLINED_RECORD`], off
-    /// the event loop; Not Now writes nothing.
     fn answer_secrets_sheet(&mut self, id: u64, choice: Choice) {
         #[cfg(target_os = "macos")]
         let typed = self.take_secrets_sheet_with_source(id, choice == Choice::Join);
@@ -1762,7 +1544,6 @@ impl App {
         aterm_log::info!("secrets vault: the ask was answered: {}", choice.as_str());
         match choice {
             Choice::Join => {
-                // Off macOS the sheet has no fields: the default source, no password.
                 #[cfg(target_os = "macos")]
                 let (source, password) =
                     typed.unwrap_or_else(|| (aterm_secrets::ALAB_DEFAULT_URL.to_owned(), None));
@@ -1823,8 +1604,7 @@ impl App {
         }
     }
 
-    /// A join ended: the answer to the press on the band, in place of the row in flight,
-    /// and the digest lines that now hold or no longer do.
+    /// A join ended: the answer to the press on the band, in place of the row in flight, and the digest lines that now hold or no longer do.
     pub(crate) fn secrets_join_ended(&mut self, end: JoinEnd) {
         self.secrets_join.join_ended();
         let subscriber = match &end {
@@ -1870,7 +1650,6 @@ mod tests {
     use std::sync::Mutex;
 
     /// The probe lane's schedule: 15 s, doubling, capped at five minutes, for as long as
-    /// it keeps failing; never zero, so a lane never spins.
     #[test]
     fn the_backoff_doubles_from_fifteen_seconds_to_five_minutes() {
         let secs: Vec<u64> = (1..=9).map(|n| retry_after(n).as_secs()).collect();
@@ -1900,7 +1679,6 @@ mod tests {
     }
 
     /// A lane over scripted reads: `configured` answers in turn (the last repeats), and so
-    /// do `probes`; an install answers `install`.
     fn lane_with(
         configured: Vec<Result<Configured, String>>,
         declined: bool,
@@ -2024,9 +1802,6 @@ mod tests {
     }
 
     /// WHEN TO PROBE: only a Mac with no vault configured (or an unfinished join, below)
-    /// whose person has not declined. A configured Mac probes nothing and says what it read
-    /// (so the digest lines that no longer hold end); a configuration that cannot be read
-    /// asks nothing.
     #[test]
     fn only_an_unconfigured_mac_that_has_not_declined_probes() {
         let member = Ok(Configured::Some(setup()));
@@ -2066,9 +1841,6 @@ mod tests {
     }
 
     /// SOMETHING THAT IS NOT THE ALAB VAULT answering at its name and port (another vault,
-    /// a web page) is no ALab vault there: the lane ends at once, as for nothing served,
-    /// where a miss would have it ask every five minutes for the life of the process. Only a
-    /// failure to reach the server is a miss, and only a miss looks the name up.
     #[cfg(unix)]
     #[test]
     fn an_answer_that_is_not_the_alab_vault_ends_the_lane() {
@@ -2112,9 +1884,6 @@ mod tests {
     }
 
     /// LOCAL NETWORK CONSENT: the first probes fail until the person allows aterm, and the
-    /// lane keeps asking on the backoff's schedule, re-reading the configuration after each
-    /// pause, until the vault answers. A name that resolves is asked for past
-    /// [`UNRESOLVED_FOR`]: there is a host on this LAN.
     #[test]
     fn failures_are_retried_on_the_schedule_until_the_vault_answers() {
         let mut probes: Vec<_> = (0..7).map(|_| refused()).collect();
@@ -2134,9 +1903,6 @@ mod tests {
     }
 
     /// NOT THE ALAB LAN: a name that resolves to nothing — a network with no such host, or
-    /// maybe a Local Network consent still unanswered, which this cannot tell apart — is
-    /// asked for on the same schedule for [`UNRESOLVED_FOR`] of pauses, then the lane ends
-    /// (the next launch asks again). A failure whose name resolved starts that hour over.
     #[test]
     fn a_name_that_never_resolves_ends_the_lane_after_an_hour() {
         let (end, script) = lane(vec![NONE], false, vec![unresolved()]);
@@ -2147,13 +1913,11 @@ mod tests {
         assert_eq!(script.probes, script.pauses.len() + 1);
         assert!(script.posts.is_empty());
 
-        // An answer within the hour is still found.
         let mut probes: Vec<_> = (0..10).map(|_| unresolved()).collect();
         probes.push(Ok(Some(found())));
         let (end, _) = lane(vec![NONE], false, probes);
         assert_eq!(end, LaneEnd::Found);
 
-        // A name that resolved once restarts the hour.
         let mut probes: Vec<_> = (0..12).map(|_| unresolved()).collect();
         probes.push(refused());
         probes.push(unresolved());
@@ -2163,7 +1927,6 @@ mod tests {
     }
 
     /// A person who joins from a terminal while the lane waits ends it: nothing is asked,
-    /// and what the read found is said.
     #[test]
     fn a_join_from_a_terminal_meanwhile_ends_the_lane() {
         let joined = Ok(Configured::Some(Setup {
@@ -2182,9 +1945,6 @@ mod tests {
     }
 
     /// AN UNFINISHED JOIN (a join cut off after it wrote its source: aterm quit, the
-    /// request refused): the read says so, and a Mac set up for the ALab vault is asked
-    /// again — the vault is probed and the sheet offered — unless its person declined.
-    /// Another vault's unfinished Mac is told, not asked.
     #[test]
     fn an_unfinished_join_is_told_and_the_alab_vault_offered_again() {
         let unfinished = || Ok(Configured::Some(cut_off()));
@@ -2215,9 +1975,6 @@ mod tests {
     }
 
     /// THE SUBSCRIBER'S REPAIR at launch: a plist running a copy that is gone or does not
-    /// last is installed again from this aterm; a debt is installed and a paid one
-    /// forgotten; a Mac with no plist and nothing owed is left as it is (its person may
-    /// have turned the subscriber off). An install that fails says why.
     #[test]
     fn a_stale_or_owed_subscriber_is_installed_at_launch() {
         let stale = Ok(Configured::Some(Setup {
@@ -2263,8 +2020,6 @@ mod tests {
     }
 
     /// THE PLAN, case by case: only a stale plist, or an absent one that is owed, is
-    /// installed; only an owed line with a sound plist is paid; only a pending Mac with no
-    /// subscriber and nothing owed is unfinished; and only the ALab vault's is asked again.
     #[test]
     fn the_launch_plan_installs_only_what_is_broken_or_owed() {
         let stale = Plist::Stale("/gone".to_string());
@@ -2297,7 +2052,6 @@ mod tests {
     }
 
     /// The plist's program is read back exactly as `aterm secrets` writes it, entities
-    /// and all; a plist in another shape names nothing (and is left as it is).
     #[cfg(unix)]
     #[test]
     fn the_plists_program_is_read_back_as_service_writes_it() {
@@ -2324,8 +2078,6 @@ mod tests {
     }
 
     /// THE PLIST ON DISK: absent; sound when it runs a file at a lasting place; stale when
-    /// that file is gone or sits in a temporary directory (as a disk image or an App
-    /// Translocation copy does not last either).
     #[cfg(unix)]
     #[test]
     fn a_plist_is_judged_by_the_program_it_runs() {
@@ -2358,7 +2110,6 @@ mod tests {
     }
 
     /// THE COPY A SUBSCRIBER MAY NAME: one that lasts. A disk image and an App
-    /// Translocation copy go away; the installed bundle stays.
     #[test]
     fn only_a_lasting_copy_is_named_by_the_subscriber() {
         for fleeting in [
@@ -2375,7 +2126,6 @@ mod tests {
     }
 
     /// A member's subscriber, after a pending join: sound is none; absent says where this
-    /// aterm runs when that copy does not last, else that it is not installed.
     #[test]
     fn a_members_subscriber_gap_is_read_from_its_plist() {
         let never = || -> Result<PathBuf, Unsynced> { panic!("not asked") };
@@ -2398,8 +2148,6 @@ mod tests {
     }
 
     /// THE DECLINED RECORD: absent is not declined; Don't Ask Again names this Mac (and
-    /// only this Mac, on a synced config folder); a Mac the kernel names no host for is
-    /// asked, and its answer cannot be recorded.
     #[test]
     fn the_declined_record_names_this_mac_only() {
         let dir = aterm_tempfile::tempdir().expect("scratch");
@@ -2420,13 +2168,10 @@ mod tests {
             note_declined(&config, None, 1).map_err(|e| e.kind()),
             Err(std::io::ErrorKind::NotFound)
         );
-        // The debugger-access ask's record is its own file.
         assert!(!crate::debugger_access::read_asked(&config, "MAC-A"));
     }
 
     /// THE OWED RECORD: noted for this Mac only, forgotten once paid (the file goes with
-    /// its last Mac), and read the other way from the declined record: a record that
-    /// cannot be read owes nothing.
     #[test]
     fn the_owed_record_is_noted_forgotten_and_fails_toward_owing_nothing() {
         let dir = aterm_tempfile::tempdir().expect("scratch");
@@ -2481,8 +2226,6 @@ mod tests {
     }
 
     /// WHEN TO ASK: behind the launch steps, the debugger-access ask, a page, the folder
-    /// warm-up and another sheet, in that order; then at the quiet moment only, and not
-    /// right after a decline.
     #[test]
     fn the_ask_waits_for_every_launch_step_then_the_quiet_moment() {
         assert_eq!(admit(&quiet_facts()), Ask::Raise);
@@ -2500,7 +2243,6 @@ mod tests {
             set(&mut facts);
             assert_eq!(admit(&facts), Ask::Wait(why), "{why:?}");
         }
-        // The order is the contract: the earliest step names the wait.
         let mut all = quiet_facts();
         for (set, _) in cases {
             set(&mut all);
@@ -2520,8 +2262,6 @@ mod tests {
     }
 
     /// The lane: nothing is due until the vault answers; a wait looks again after
-    /// [`LOOK_EVERY`]; a sheet up or a join running holds every look; an answer ends the
-    /// ask for this process; a withdrawn sheet is asked again; a stale answer is ignored.
     #[test]
     fn the_lane_asks_once_per_process() {
         let t0 = Instant::now();
@@ -2557,7 +2297,6 @@ mod tests {
     }
 
     /// A SHEET NOBODY ANSWERS holds synthetic input fenced off, so it has a deadline: the
-    /// park wakes for it, and past it the sheet is the stale one an answer no longer finds.
     #[test]
     fn an_unanswered_sheet_expires() {
         let t0 = Instant::now();
@@ -2584,8 +2323,6 @@ mod tests {
     }
 
     /// A MAC CONFIGURED WHILE THE ASK WAITED (a join from a terminal) is not asked: the
-    /// look before the raise reads `source.toml`. One found with an unfinished join is
-    /// configured already, and asked.
     #[test]
     fn a_mac_configured_meanwhile_is_not_asked() {
         let t0 = Instant::now();
@@ -2606,7 +2343,6 @@ mod tests {
     }
 
     /// The launch steps hold the ask for [`LAUNCH_STEPS_FOR`] from the vault's answer at
-    /// most; an inert lane is never fed.
     #[test]
     fn the_launch_steps_hold_for_a_bounded_time_and_an_inert_lane_asks_nothing() {
         let t0 = Instant::now();
@@ -2642,7 +2378,6 @@ mod tests {
     }
 
     /// The sheet's buttons, by `NSAlert` response: anything but Join and Don't Ask Again
-    /// is Not Now, which writes nothing.
     #[test]
     fn the_sheet_answers_map_from_the_alert_response() {
         assert_eq!(Choice::of_response(1000), Choice::Join);
@@ -2662,9 +2397,6 @@ mod tests {
     }
 
     /// THE OUTCOME WORDS pass the message rules: the band rows are an answer to the press
-    /// (Info) or a failure (Warn), titles are glass titles; the digest lines are whole
-    /// entries (a reason that is not "waiting", one action); and nothing carries more
-    /// than a count, the code, the host and a program's path.
     #[test]
     fn the_outcome_words_pass_the_message_rules() {
         use crate::message_reporters::{Attention, attention};
@@ -2701,7 +2433,6 @@ mod tests {
             pending.contains("aterm secrets approve ABCD2345"),
             "{pending}"
         );
-        // A pending Mac whose proof matched nothing is told how to send another.
         let retype = "mistyped join password is fixed by running aterm secrets join";
         assert!(pending.contains(retype), "{pending}");
         let digest = format!(
@@ -2744,10 +2475,6 @@ mod tests {
     }
 
     /// A JOIN OF ANOTHER VAULT (the sheet's URL edited) is told as one: the pending answer
-    /// and digest line say how a mistyped join password is fixed only when one was typed,
-    /// adding the vault's URL if not the ALab one (never the URL itself, which may carry a
-    /// query or a pin), the row in flight names the vault asked as the CLI does (scheme, host
-    /// and path, never userinfo) or a vault file, and no outcome calls it the ALab vault.
     #[test]
     fn a_join_of_another_vault_is_told_by_its_own_url() {
         let url = "https://vault.example/v1/x?k=private-query#private-pin";
@@ -2785,7 +2512,6 @@ mod tests {
             "{shown}"
         );
         assert!(!shown.contains("private"), "{shown}");
-        // Userinfo (refused by the join, but typed) never shows; a vault at a path is a file.
         for typed in [
             "https://t0ken-private@vault.example/v1/x",
             "https://u5er-private:pa55-private@vault.example/v1/x",
@@ -2812,17 +2538,6 @@ mod tests {
     }
 
     /// THE DIGEST LINES SEND THE PERSON WHERE THE REMEDY IS, AND TO NOTHING MORE. A join
-    /// that failed or never finished, and a subscriber that could not be installed, are
-    /// System State's Apply (it joins the vault in its field with the password typed there,
-    /// and installs the subscriber), named by its menu row. That tab has one Apply, which
-    /// runs every row switched on again, so the step asks for the vault row on and the Mac
-    /// settings rows off (the Dock and the account sign-outs), whole within the step's cap.
-    /// It switches off nothing else: an Apply without the permissions row ends aterm's
-    /// permission asks (aterm-cli's setup tests run the selection the step asks for). The
-    /// details name the Mac settings rows by the labels their switches show, as the leading
-    /// run of the list, and say to leave the rest; the terminal command stays in the
-    /// details. An approval on an admin Mac and a copy of aterm that goes away are not
-    /// System State's to do, and keep their own steps.
     #[test]
     fn the_vault_lines_name_system_state_only_where_it_has_the_remedy() {
         use aterm_types::macos_setup::Setting;
@@ -2835,8 +2550,6 @@ mod tests {
             };
             (ask.then().words().to_string(), msg.detail[2..].to_vec())
         };
-        // "The vault row" is one switch, and "the Mac settings rows" lead the list, so the
-        // first and last of their labels name exactly them.
         let vault: Vec<_> = Setting::ALL
             .iter()
             .filter(|setting| setting.label().contains("vault"))
@@ -2903,9 +2616,6 @@ mod tests {
     }
 
     /// The App's side on the test App (no AppKit, no proxy): the outcomes post the answer
-    /// in place of the row and raise or end the digest lines; the inert lane is never fed,
-    /// and the launch read of a configured Mac ends the lines that no longer hold and
-    /// raises the ones that do.
     #[test]
     fn the_app_tells_each_outcome_and_ends_what_no_longer_holds() {
         let mut app = App::headless_for_test();
@@ -2933,8 +2643,6 @@ mod tests {
             .expect("the answer is on the band");
         assert_eq!(row.msg.title, "Could not join the secrets vault");
 
-        // The next launch: the join that failed after it wrote its source is unfinished,
-        // and its subscriber is off.
         app.on_secrets_vault(VaultWake::Configured(Settled {
             member: false,
             subscriber: Subscriber::Off,
@@ -2956,7 +2664,6 @@ mod tests {
             [entry_key(CAUSE_PENDING), entry_key(CAUSE_UNSYNCED)]
         );
 
-        // A launch from Applications installs what was owed.
         app.on_secrets_vault(VaultWake::Configured(Settled {
             member: true,
             subscriber: Subscriber::Running,
@@ -2987,12 +2694,6 @@ mod tests {
     }
 
     /// THE REMEDY'S APPLY ENDS THE LINES IT MENDS. A setup report (System State's status)
-    /// whose Secrets stage reads this Mac in and its subscriber running (`ok`, or `applied`
-    /// by a pass that joined) ends the failed, unfinished, pending and not-in-sync lines at
-    /// once, not at the next launch. A record of an earlier run (`applied`, no detail), a run
-    /// with a row still waiting, a later stage's read of the vault whose subscriber is not
-    /// running, and a Check's rows end nothing; a line raised while the same report still
-    /// stands stays, and the next run that syncs ends it again.
     #[test]
     fn a_setup_run_that_syncs_the_vault_ends_its_lines() {
         let mut app = App::headless_for_test();
@@ -3035,7 +2736,6 @@ mod tests {
         raise_all(&mut app);
         assert_eq!(open(&app), raised);
 
-        // The record's own row for a finished stage: `applied`, with no detail.
         let recorded = || crate::SetupStatusRow {
             name: "Secrets vault".into(),
             status: "applied".into(),
@@ -3075,16 +2775,12 @@ mod tests {
         app.publish_system_state(synced.clone());
         assert!(open(&app).is_empty(), "{:?}", open(&app));
 
-        // The same report again (each poll): a line raised since stands.
         raise_all(&mut app);
         app.publish_system_state(synced.clone());
         assert_eq!(open(&app), raised);
-        // The next run starts with no report, and its sync ends them again.
         app.publish_system_state(report(Vec::new()));
         app.publish_system_state(synced);
         assert!(open(&app).is_empty(), "{:?}", open(&app));
-        // A run whose vault item joined, synced and installed the subscriber reports its row
-        // `applied` (with why), beside the record's own row once the stage is done.
         raise_all(&mut app);
         app.publish_system_state(report(Vec::new()));
         app.publish_system_state(report(vec![recorded(), row("Secrets vault", "applied")]));
@@ -3121,7 +2817,6 @@ mod tests {
             .expect("the server starts");
             let url = format!("http://{}/v1/gui", running.addr);
             let admin = Paths::for_home(&root.path().join("admin"));
-            // One synthetic secret, made here: nothing reads the real `~/.secrets`.
             let import = admin.home.join(".secrets");
             std::fs::create_dir_all(&import).expect("admin secrets");
             let value = format!(
@@ -3171,12 +2866,6 @@ mod tests {
     }
 
     /// THE JOIN THE SHEET STARTS, against a real vault on loopback (a scratch home, a test
-    /// pin in the URL where the ALab default has `ALAB_SIGNER`, no launchd: the install is
-    /// a recorder): with the join password it asks and installs the subscriber once, when
-    /// the request is queued; once the admin's subscriber has let it in, a join again is
-    /// in, with the subscriber installed after the join. A join cut off after it wrote its
-    /// source — here the server gone when the password is asked — fails, and its next
-    /// launch reads it unfinished.
     #[cfg(unix)]
     #[test]
     fn the_join_runs_against_a_loopback_vault() {
@@ -3223,7 +2912,6 @@ mod tests {
             "the recorder wrote no plist"
         );
 
-        // The window asks under this Mac's own name (`client::default_host_name`).
         let approved = aterm_secrets::client::auto_approve(&vault.admin).expect("auto-approve");
         assert_eq!(approved.approved.len(), 1, "{:?}", approved.approved);
         let end = join(&machine, &typed);

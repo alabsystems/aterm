@@ -1,17 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The read side of the release channel, and the verbs built on it. `ship verify
-//! [vX.Y.Z]` replays the client's release-selection rule (the greatest canonical
-//! `vMAJOR.MINOR.PATCH` published release carrying the exact appcast name) against the
-//! channel with no cache and requires it to select the version, asserts the published
-//! manifest is byte-identical to the local artifact, and proves the DMG and zip digests,
-//! the evergreen pointer and the DMG URL; it prints PASS and the release URL, or the
-//! remediation. A cut runs the same proof inside `publish`; this is the re-run by hand.
-//!
-//! Also here, on the same scan: `ship status` (the ledger tail against the channel), the
-//! remote-derived fresh/recut decision ([`derive_cut_mode`]), `--abandon` and `ship yank`.
-//! Each reads the one release a cut publishes, on the channel (`publish::channel_slug`).
+//! The read side of the release channel, and the verbs built on it.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -24,40 +14,25 @@ use crate::ledger::{self, Error, Result};
 use crate::manifest_out;
 use crate::publish::{self, TagKind, gh_retry, step};
 
-// the canonical client scan, replayed against the live API
-
 /// One published (non-draft) release carrying a parseable manifest.
 #[derive(Debug, Clone)]
 pub struct Published {
-    /// Release ID carried by the listing row. Production binds this to the
-    /// complete `release` snapshot below before returning; pure fixtures may
-    /// carry only this field.
+    /// Release ID carried by the listing row.
     pub release_id: Option<u64>,
-    /// Exact immutable GitHub release-object snapshot. Production scans always carry it;
-    /// `None` is for pure fixtures and is never authority for a destructive yank.
+    /// Exact immutable GitHub release-object snapshot.
     pub release: Option<publish::ReleaseObjectIdentity>,
     pub tag: String,
     pub build: u64,
     pub version: String,
-    /// The exact asset the manifest was read from: `aterm-appcast.toml`, the one
-    /// name the client elects.
+    /// The exact asset the manifest was read from.
     pub asset: String,
-    /// Optional apply floor carried by this exact manifest. A release cut uses
-    /// the canonical client candidate's value as the channel floor to inherit.
+    /// Optional apply floor carried by this exact manifest.
     pub min_build: Option<u64>,
-    /// The manifest's exact downloaded bytes (strict UTF-8 — TOML is UTF-8 by
-    /// definition, and a lossy decode would break the byte-identity check).
+    /// The manifest's exact downloaded bytes (strict UTF-8 — TOML is UTF-8 by definition, and a lossy decode would break the byte-identity check).
     pub text: String,
 }
 
-/// The channel's head before a claim: [`scan_published`]'s client pick, held to the
-/// release GitHub's `latest` pointer names. A listing page can come back empty while the
-/// channel has releases (seen 2026-10-22, twice in three minutes after an engine source
-/// release appeared), and a head scan that reads no candidate carries no floor: the cut
-/// claimed with none, the late guard refused it, and its build number was burned. The
-/// pointer is a second, independent read, and it lags the listing
-/// ([`publish::POINTER_PROBE_ATTEMPTS`]), so a listing that reaches no candidate at or
-/// above the release the pointer names is torn, and refusing here claims nothing.
+/// The channel's head before a claim.
 pub fn scan_head_before_claim(slug: &str) -> Result<Vec<Published>> {
     let latest = latest_release_row(slug)?;
     let head = scan_published(slug, true)?;
@@ -69,7 +44,6 @@ pub fn scan_head_before_claim(slug: &str) -> Result<Vec<Published>> {
 }
 
 /// The [`RELEASE_ROW_JQ`] row of the release `releases/latest` names, or `None` when the
-/// channel has none (HTTP 404: a channel nothing was released on yet).
 fn latest_release_row(slug: &str) -> Result<Option<String>> {
     let endpoint = format!("repos/{slug}/releases/latest");
     let out = publish::gh_raw(&["api", &endpoint, "--jq", RELEASE_ROW_JQ])?;
@@ -86,9 +60,7 @@ fn latest_release_row(slug: &str) -> Result<Option<String>> {
     Ok(Some(out.stdout_utf8()))
 }
 
-/// [`scan_head_before_claim`]'s judgement, pure: `latest` is the pointer's row and `head`
-/// the tag of the listing's client pick. Only a pointer naming a published candidate
-/// carrying one appcast binds, and the pick must then be that release or a greater tag.
+/// [`scan_head_before_claim`]'s judgement, pure.
 pub(crate) fn head_reaches_latest(latest: Option<&str>, head: Option<&str>) -> Result<()> {
     let Some(latest) = latest else {
         return Ok(());
@@ -125,20 +97,7 @@ pub(crate) fn head_reaches_latest(latest: Option<&str>, head: Option<&str>) -> R
     )))
 }
 
-/// Scans the channel's release metadata (at most 10 pages of 100) before downloading any
-/// manifest. `stop_early` is the client's pick: only a published (non-draft,
-/// non-prerelease) release carrying `aterm-appcast.toml` is eligible, the greatest canonical
-/// `vMAJOR.MINOR.PATCH` tag wins whatever the REST row order (retired two-component tags
-/// are skipped), and only that manifest is fetched. (The client itself reads only the
-/// `releases/latest` pointer, which the cut owns.) `stop_early: false` is the
-/// operator/history view: every published release's appcast, the build set status and
-/// yank need.
-///
-/// Every row is bound to its immutable release ID, its exact tag and `draft == false`, and
-/// to the manifest's version/build/commit identity. A channel release's `target_commitish`
-/// is its default branch, so nothing binds it; the bytes' authenticity comes from the
-/// manifest digest, the pinned signature and codesign. Every `gh api` page is a fresh REST
-/// call (gh caches only with `--cache`).
+/// Scans the channel's release metadata (at most 10 pages of 100) before downloading any manifest.
 pub fn scan_published(slug: &str, stop_early: bool) -> Result<Vec<Published>> {
     let metadata = release_metadata_listing(slug)?;
     let mut identities = std::collections::BTreeMap::new();
@@ -146,9 +105,6 @@ pub fn scan_published(slug: &str, stop_early: bool) -> Result<Vec<Published>> {
         let release_id = release_id.ok_or_else(|| {
             Error::new("production release scan row has no immutable GitHub release ID")
         })?;
-        // Each end of the download bracket is one read of the release object: the
-        // release identity and the exact-name asset binding come from one JSON document,
-        // so the pair is never skewed in time.
         let before = publish::release_object_and_asset_identity(slug, release_id, asset)?;
         publish::validate_release_object_tag_state(
             before.release.as_ref(),
@@ -164,9 +120,6 @@ pub fn scan_published(slug: &str, stop_early: bool) -> Result<Vec<Published>> {
             )));
         }
         let before_asset = before_asset.ok_or_else(|| missing_release_asset(release_id, asset))?;
-        // The recheck runs after the transfer and before the asset identities are
-        // compared, so `after` is the snapshot the asset recheck saw and asset drift is
-        // reported before object drift.
         let mut after: Option<publish::ReleaseObjectIdentity> = None;
         let bytes = publish::download_release_asset_with_identity_and_recheck(
             slug,
@@ -187,11 +140,6 @@ pub fn scan_published(slug: &str, stop_early: bool) -> Result<Vec<Published>> {
         }
         Ok(bytes)
     })?;
-    // An exhaustive scan runs long, so every captured ID is re-read after the last download
-    // from one paginated listing ([`captured_identity_rows`]): concurrent channel mutation
-    // fails the scan rather than returning a torn view. Nothing between here and the
-    // comparison below touches the network. The stop-early replay fetches one manifest,
-    // which its own before/after pair already brackets.
     let live_identities = if stop_early {
         None
     } else {
@@ -208,8 +156,6 @@ pub fn scan_published(slug: &str, stop_early: bool) -> Result<Vec<Published>> {
                 "release ID {release_id} has no captured immutable identity"
             ))
         })?;
-        // A missing entry is a release deleted mid-scan; a differing entry is a
-        // release edited mid-scan. Both are the torn view this refuses to return.
         if let Some(live) = &live_identities
             && live.get(&release_id) != Some(captured)
         {
@@ -229,12 +175,6 @@ pub fn scan_published(slug: &str, stop_early: bool) -> Result<Vec<Published>> {
 }
 
 /// The channel's release metadata, one lossless line per release in arbitrary API order:
-/// ID, tag, draft flag, prerelease flag, exact appcast count. A count rather than `[0]`, so
-/// the Rust boundary rejects a duplicate appcast before any immutable-ID, bounded asset
-/// download runs.
-/// One release object as the five-field production row [`parse_release_metadata`] reads:
-/// the listing runs it over each release, [`latest_release_row`] over the one
-/// `releases/latest` returns.
 const RELEASE_ROW_JQ: &str = r#". as $r |
         ([$r.assets[]? | select(.name == "aterm-appcast.toml")] | length) as $exact_count |
         [($r.id | tostring), $r.tag_name, ($r.draft | tostring),
@@ -267,7 +207,6 @@ fn release_metadata_listing(slug: &str) -> Result<String> {
 }
 
 /// The refusal [`publish::release_asset_identity_for_release_id`] raises, verbatim: the
-/// scan reads the binding through the fused release-object/asset read instead.
 fn missing_release_asset(release_id: u64, name: &str) -> Error {
     Error::new(format!(
         "release ID {release_id} has 0 assets named {name:?}; expected exactly one"
@@ -275,9 +214,6 @@ fn missing_release_asset(release_id: u64, name: &str) -> Error {
 }
 
 /// The `wanted` release objects as the channel exposes them now, by immutable ID, from one
-/// paginated listing. `publish::release_identity_jq(true)` emits the exact-ID program's
-/// rows (tests/it/resume.rs pins it), so a row here compares against a captured snapshot
-/// on the same four fields.
 fn release_identity_listing(
     slug: &str,
     wanted: &std::collections::BTreeSet<u64>,
@@ -289,8 +225,6 @@ fn release_identity_listing(
         let path = format!("repos/{slug}/releases?per_page={PER_PAGE}&page={page}");
         let out = gh_retry(&["api", &path, "--jq", publish::release_identity_jq(true)])?;
         let text = out.stdout_utf8();
-        // Pagination follows what GitHub returned, never what survived the ID filter
-        // below: one page of uninteresting releases would otherwise end the walk early.
         let page_len = text.lines().count();
         let captured = captured_identity_rows(&text, wanted);
         let rows = publish::parse_release_object_identity_rows(&captured)?;
@@ -310,12 +244,6 @@ fn release_identity_listing(
 }
 
 /// The `wanted` releases' rows out of one page of the channel's identity listing, selected
-/// before the strict parser sees them: [`publish::parse_release_object_identity_rows`]
-/// fails closed on an empty tag or target, and a tagless draft made in the GitHub web UI
-/// (which [`scan_release_page`] skips at its `release.draft` guard) must not fail a
-/// read-only command. A captured ID still parses strictly, and a row whose ID does not
-/// parse is dropped, so its ID is absent from the live map and [`scan_published`] reports
-/// the scan as torn.
 fn captured_identity_rows(page: &str, wanted: &std::collections::BTreeSet<u64>) -> String {
     page.lines()
         .filter(|line| {
@@ -329,10 +257,6 @@ fn captured_identity_rows(page: &str, wanted: &std::collections::BTreeSet<u64>) 
 }
 
 /// The canonical version a candidate tag names: `"v0.2.0"` → `"0.2.0"`. The grammar is
-/// `aterm_update_core::tag::parse_release_tag`, shared with the client so the two rules
-/// cannot drift: canonical `vMAJOR.MINOR.PATCH` is a candidate, a retired two-component
-/// `vMAJOR.MINOR` is [`TagKind::Legacy`] (skipped, never an error), anything else fails
-/// closed.
 fn parse_canonical_tag(tag: &str) -> Result<String> {
     publish::canonical_channel_tag_version(tag)
 }
@@ -343,9 +267,6 @@ struct ReleaseMetadata<'a> {
     tag: &'a str,
     draft: bool,
     /// A prerelease is published but never the channel head: GitHub's `latest` cannot
-    /// name one and the deployed client skips it, so neither replay counts it. aterm's
-    /// source release is created as a prerelease and carries the cut's appcast between
-    /// that upload and the cut's head PATCH.
     prerelease: bool,
     exact_count: usize,
 }
@@ -365,11 +286,8 @@ fn parse_release_metadata(listing: &str) -> Result<Vec<ReleaseMetadata<'_>>> {
                 })
             };
             let (release_id, tag, draft, prerelease, exact_count) = match fields.as_slice() {
-                // Pure scan fixtures: no ID, no prerelease flag (a stable release).
                 [tag, draft, exact] => (None, *tag, *draft, "false", *exact),
-                // Pure scan fixtures with IDs, no prerelease flag.
                 [id, tag, draft, exact] => (Some(parse_id(id)?), *tag, *draft, "false", *exact),
-                // Production: `release_metadata_listing` always emits the five-field form.
                 [id, tag, draft, prerelease, exact] => {
                     (Some(parse_id(id)?), *tag, *draft, *prerelease, *exact)
                 }
@@ -440,10 +358,7 @@ fn fetch_authoritative(
     })
 }
 
-/// Scans a complete release-metadata listing through an injected appcast fetch: the seam
-/// behind [`scan_published`] that tests drive. The client path picks one canonical
-/// authority before fetching; the exhaustive path fetches every candidate, since `ship
-/// status` and `yank` need the complete published-build set.
+/// Scans a complete release-metadata listing through an injected appcast fetch.
 pub(crate) fn scan_release_page(
     listing: &str,
     stop_early: bool,
@@ -466,9 +381,6 @@ pub(crate) fn scan_release_page(
                     manifest_out::MANIFEST_ASSET
                 )));
             }
-            // Retired-scheme releases stay published but are never installed, so the replay
-            // skips them as the client does: a still-published v0.61 would otherwise
-            // out-order every current-scheme candidate.
             let TagKind::Candidate(tag_order) = publish::parse_release_tag(release.tag)? else {
                 continue;
             };
@@ -488,9 +400,6 @@ pub(crate) fn scan_release_page(
         let Some((release, _)) = selected else {
             return Ok((page_len, Vec::new()));
         };
-        // Every selected candidate was already proved three-component; this
-        // re-derives the canonical version string, pinning the tag's exact
-        // spelling to the version the manifest must carry.
         let version = parse_canonical_tag(release.tag)?;
         let published = fetch_authoritative(
             release.release_id,
@@ -519,8 +428,6 @@ pub(crate) fn scan_release_page(
             continue;
         }
         let asset = manifest_out::MANIFEST_ASSET.to_string();
-        // The operator/history scan warns on and skips malformed manifest bytes;
-        // transport failures stay terminal.
         let bytes = fetch_manifest(release.release_id, release.tag, &asset)?;
         let Ok(mtext) = String::from_utf8(bytes) else {
             eprintln!(
@@ -551,8 +458,7 @@ pub(crate) fn scan_release_page(
     Ok((page_len, out))
 }
 
-/// Highest build among an already exhaustive scan: status/ledger accounting only. A
-/// `stop_early` caller uses its canonical scan's sole candidate directly.
+/// Highest build among an already exhaustive scan.
 pub fn select_newest(scanned: &[Published]) -> Option<&Published> {
     let mut best: Option<&Published> = None;
     for p in scanned {
@@ -568,19 +474,15 @@ pub fn select_newest(scanned: &[Published]) -> Option<&Published> {
 pub enum ReleaseState {
     /// No release object under the tag.
     Absent,
-    /// Only a draft (or drafts) — invisible to every client.
+    /// Only a draft (or drafts).
     Draft,
-    /// A visible release that is not an app release a client installs from: the engine's
-    /// source prerelease `pub publish` creates before the cut (with or without some of
-    /// the cut's assets on it), or a full release carrying no appcast.
+    /// A visible release that is not an app release a client installs from.
     Unpublished,
-    /// The app release: published (not a draft, not a prerelease) and carrying exactly
-    /// one `aterm-appcast.toml`, what a cut makes of the release at its head PATCH.
+    /// The app release.
     Published,
 }
 
-/// Classify one tag from the channel's metadata listing ([`release_metadata_listing`]'s
-/// rows) — pure, so the table is a test.
+/// Classify one tag from the channel's metadata listing ([`release_metadata_listing`]'s rows).
 ///
 /// # Errors
 /// A malformed row, or two published app releases under one tag.
@@ -600,8 +502,6 @@ pub fn classify_release_state(listing: &str, tag: &str) -> Result<ReleaseState> 
                 "two published app releases carry the tag {tag}; channel authority is ambiguous"
             )));
         }
-        // The strongest reading wins: an app release, then a visible release, then a
-        // draft (drafts do not own their tag, so one can sit beside a visible release).
         let rank = |state: ReleaseState| match state {
             ReleaseState::Absent => 0,
             ReleaseState::Draft => 1,
@@ -620,21 +520,14 @@ pub fn release_state(slug: &str, tag: &str) -> Result<ReleaseState> {
     classify_release_state(&release_metadata_listing(slug)?, tag)
 }
 
-// remote-derived cut mode — pure; tests/it/resume.rs pins the table
-
-/// The three remote-derived facts [`derive_cut_mode`] reads, gathered by the caller
-/// (network) so the decision itself is pure and table-testable.
+/// The three remote-derived facts [`derive_cut_mode`] reads, gathered by the caller (network) so the decision itself is pure and table-testable.
 #[derive(Debug, Clone)]
 pub struct RemoteState {
-    /// The version this cut would publish: the `[workspace.package]` `MAJOR.MINOR.0`
-    /// version, e.g. "0.5.0". There is no second lineage: the ledger supplies build
-    /// numbers, not versions.
+    /// The version this cut would publish.
     pub current_version: String,
-    /// Does CHANGELOG.md already carry `## [current_version]`?
+    /// Does CHANGELOG.md already carry `## [current_version]`?.
     pub changelog_has_section: bool,
-    /// Is `v<current_version>` a published app release on the channel
-    /// ([`ReleaseState::Published`])? The engine's source prerelease is not, and neither
-    /// is a draft: each is exactly the wedge recut exists to finish.
+    /// Whether `v<current_version>` is a published app release on the channel ([`ReleaseState::Published`]).
     pub published: bool,
 }
 
@@ -643,19 +536,11 @@ pub struct RemoteState {
 pub enum CutMode {
     /// Normal: roll the changelog into `## [version]` and claim.
     Fresh { version: String },
-    /// The wedge signature (roll and claim landed on main, nothing published): skip the
-    /// roll, reuse the rolled section, claim a fresh n.
+    /// The wedge signature (roll and claim landed on main, nothing published).
     Recut { version: String },
 }
 
-/// Derives the cut mode from remote-visible state: a `## [<version>]` changelog section
-/// with no published `v<version>` is a recut, which lets any machine finish a wedged cut
-/// with no journal.
-///
-/// The version is [`RemoteState::current_version`] itself, not a bump: the version the
-/// published commit declares, which is what a real cut releases. So cutting again before
-/// publishing the next version lands on the already-published guard, whose message names
-/// the fix.
+/// Derives the cut mode from remote-visible state.
 pub fn derive_cut_mode(s: &RemoteState) -> Result<CutMode> {
     let pending = s.changelog_has_section && !s.published;
     let version = s.current_version.clone();
@@ -676,21 +561,15 @@ pub fn derive_cut_mode(s: &RemoteState) -> Result<CutMode> {
     Ok(CutMode::Fresh { version })
 }
 
-// post-publish verify
-
 /// What the published head's signature must verify under, and against what.
 pub struct PostPublishSignature<'a> {
-    /// A journaled cut knows whether its ratchet required a signature; without a
-    /// journal the requirement is read from the channel.
+    /// A journaled cut knows whether its ratchet required a signature.
     pub expected: Option<bool>,
     pub pubkey: Option<&'a str>,
     pub local_signature: Option<&'a Path>,
 }
 
-/// The full post-publish check of `version` on the channel `slug` — the check
-/// `ship verify` re-runs, and the proof a yank's successor must pass. `expect_build`
-/// is the build a caller knows it should find (a yank's successor); `None` verifies
-/// whatever is live.
+/// The full post-publish check of `version` on the channel `slug`.
 pub fn post_publish(
     repo: &Path,
     slug: &str,
@@ -727,7 +606,6 @@ pub fn post_publish(
         )));
     }
 
-    // Byte-identity with the local artifact (when it is this build's).
     let mut byte_note = "local manifest absent — byte-compare skipped".to_string();
     if let Some(local) = local_manifest
         && local.is_file()
@@ -756,8 +634,6 @@ pub fn post_publish(
         }
     }
 
-    // The head's exact detached signature, checked under the pinned public identity and,
-    // when a local artifact is given, byte-compared with it.
     let local_signature = match signature.local_signature {
         Some(path) if path.is_file() => Some(fs::read(path).map_err(|error| {
             Error::new(format!("read local signature {}: {error}", path.display()))
@@ -785,8 +661,6 @@ pub fn post_publish(
         "unsigned channel (no signing key journaled for this version)"
     };
 
-    // The dev tag names the manifest's claim commit — the one binding from the
-    // published bytes back to the source they were built from.
     let manifest = Manifest::parse(&best.text)
         .map_err(|e| Error::new(format!("published manifest re-parse: {e}")))?;
     let commit = manifest.commit.as_deref().ok_or_else(|| {
@@ -795,8 +669,6 @@ pub fn post_publish(
         ))
     })?;
     publish::assert_remote_annotated_tag_commit(&ledger::GitCli::new(repo), &tag, commit)?;
-    // The DMG and the zip — the containers every install downloads — by digest, over
-    // the exact release-ID transfer.
     let release_id = best.release_id.ok_or_else(|| {
         Error::new("selected production release has no immutable GitHub release ID")
     })?;
@@ -817,7 +689,6 @@ pub fn post_publish(
         }
         _ => "no zip container (pre-zip release; clients stage from the DMG)".to_string(),
     };
-    // Then the raw browser URL (tools/install.sh's path): HEAD → 200, anonymously.
     let url = manifest.url.clone().unwrap_or_else(|| {
         format!(
             "https://github.com/{slug}/releases/download/{tag}/{}",
@@ -832,10 +703,6 @@ pub fn post_publish(
         )));
     }
 
-    // The evergreen pointer: what a credential-less updater discovers by. The client HEADs
-    // `releases/latest/download/aterm-appcast.toml`, refuses the redirect, and fetches
-    // nothing unless the tag it names moved; a release the pointer does not name is
-    // invisible to every install. Read anonymously with the client's own strict parse.
     match publish::probe_evergreen_pointer(
         slug,
         manifest_out::MANIFEST_ASSET,
@@ -894,9 +761,7 @@ fn head_status(url: &str) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
-// the standalone commands: verify / status / yank / abandon
-
-/// `targo --unverified ship verify [vX.Y.Z]` — re-run the post-publish check anytime.
+/// `targo --unverified ship verify [vX.Y.Z]`.
 pub fn run_verify(repo: &Path, version: Option<String>) -> Result<()> {
     publish::assert_origin_repo_binding(&ledger::GitCli::new(repo), &origin_slug_of(repo)?)?;
     let slug = publish::workspace_channel_slug(repo)?;
@@ -905,7 +770,6 @@ pub fn run_verify(repo: &Path, version: Option<String>) -> Result<()> {
     let version = match version {
         Some(v) => v,
         None => {
-            // No argument: verify whatever the fleet would stage right now.
             let scanned = scan_published(&slug, true)?;
             let best = scanned.first().ok_or_else(|| {
                 Error::new(format!(
@@ -922,8 +786,6 @@ pub fn run_verify(repo: &Path, version: Option<String>) -> Result<()> {
     let matching = journal
         .as_ref()
         .filter(|journal| journal.version == version);
-    // The verification key: the release's own on a recovered cut, this machine's on every
-    // other (see `Journal::verify_pubkey`).
     let pubkey = matching.and_then(|journal| {
         journal
             .verify_pubkey
@@ -945,8 +807,6 @@ pub fn run_verify(repo: &Path, version: Option<String>) -> Result<()> {
 }
 
 /// `ship status`'s statement of what the next cut releases: the commit `pub publish`
-/// recorded and the version it declares, not this checkout's, which a cut does not build.
-/// Informational: an unreadable ledger or commit is said, never an error.
 fn next_cut_line(
     repo: &Path,
     published: Result<gates::PublishedSource>,
@@ -979,7 +839,6 @@ fn next_cut_line(
 }
 
 /// What a cut from this tree must be given to sign, read off the committed pins: the
-/// paper master (the roster) and the Apple Team ID (notarization).
 fn signing_requirement() -> &'static str {
     let roster = aterm_update_core::pins::roster_tier_armed();
     let notary = !aterm_update_core::pins::APPLE_TEAM_ID.is_empty();
@@ -988,8 +847,6 @@ fn signing_requirement() -> &'static str {
             "a cut needs --release-credentials <profile.toml>: a rostered machine key and a \
              notary credential"
         }
-        // With no flag, the machine key at ~/.aterm/machine.key signs
-        // (`sign::ReleaseCredentials::resolve`); only a notary credential needs the profile.
         (true, false) => {
             "a cut needs a rostered machine key (--release-credentials <profile.toml>, or \
              ~/.aterm/machine.key)"
@@ -1002,8 +859,7 @@ fn signing_requirement() -> &'static str {
     }
 }
 
-/// `targo --unverified ship status`: version, ledger tail, dangling claims (ledger vs the
-/// channel) and the latest published build.
+/// `targo --unverified ship status`.
 pub fn run_status(repo: &Path) -> Result<()> {
     let slug = publish::workspace_channel_slug(repo)?;
     let _cred = publish::ChannelCred::enter();
@@ -1022,8 +878,6 @@ pub fn run_status(repo: &Path) -> Result<()> {
     let ledger_text = fs::read_to_string(repo.join(ledger::LEDGER_FILE))
         .map_err(|e| Error::new(format!("read {}: {e}", ledger::LEDGER_FILE)))?;
     let records = ledger::parse(&ledger_text)?;
-    // The ledger tail is not shape-checked: pre-cut-over lines carry retired
-    // two-component versions and are real, append-only history.
     let tail = ledger::tail(&ledger_text)?;
     step(
         "app",
@@ -1040,9 +894,6 @@ pub fn run_status(repo: &Path) -> Result<()> {
         ),
     );
 
-    // An unfinished journal is the most actionable fact on the machine: say it before the
-    // network facts. Read by its header, whichever cutter wrote it: status never fails on
-    // a journal it does not interpret.
     let journal_path = repo.join("dist/cut-state.toml");
     if let Some(j) = publish::JournalHeader::read(&journal_path)? {
         if j.finished() {
@@ -1090,9 +941,6 @@ pub fn run_status(repo: &Path) -> Result<()> {
         ),
     }
 
-    // Dangling claims: ledger lines with no published release at that build, the normal
-    // residue of crashed cuts (gaps are expected). Derived from the channel, never a
-    // second ledger write.
     let live: Vec<u64> = scanned.iter().map(|p| p.build).collect();
     let dangling: Vec<String> = records
         .iter()
@@ -1152,16 +1000,11 @@ fn validate_published_identity(published: &Published) -> Result<Manifest> {
     Ok(manifest)
 }
 
-/// Pure successor-first yank decision. `false` means a new successor must be published;
-/// malformed or non-orderable identity is an error, never a reason to delete first. The
-/// caller separately replays signature and DMG verification.
+/// Pure successor-first yank decision.
 pub fn yank_successor_covers(bad: &Published, successor: &Published) -> Result<bool> {
     validate_published_identity(bad)?;
     validate_published_identity(successor)?;
     let required_floor = yank_required_floor(bad.build)?;
-    // Both ends must be current-scheme candidates: a retired two-component release is
-    // archive history no client selects, and being unorderable fails, never licenses a
-    // deletion.
     let (TagKind::Candidate(bad_order), TagKind::Candidate(successor_order)) = (
         publish::parse_release_tag(&bad.tag)?,
         publish::parse_release_tag(&successor.tag)?,
@@ -1217,7 +1060,6 @@ fn verification_pubkey_for(repo: &Path, version: &str) -> Result<Option<String>>
 }
 
 /// The channel floor a successor must carry before build `build` may be
-/// destroyed: yanking `u64::MAX` cannot be expressed and must fail, never wrap.
 fn yank_required_floor(build: u64) -> Result<u64> {
     build
         .checked_add(1)
@@ -1225,8 +1067,6 @@ fn yank_required_floor(build: u64) -> Result<u64> {
 }
 
 /// Shared skeleton of the yank convergence proofs: elect the channel head,
-/// test it with the caller's coverage predicate, then fully re-verify it with
-/// the post-publish replay before reporting it as the covering successor.
 fn verified_channel_successor(
     repo: &Path,
     slug: &str,
@@ -1256,7 +1096,6 @@ fn verified_channel_successor(
 }
 
 /// Re-proves the bad release inert before every cleanup mutation: a covering successor
-/// that passes the full post-publish replay ([`post_publish`]).
 fn prove_yank_successor(repo: &Path, slug: &str, bad: &Published) -> Result<Option<Published>> {
     verified_channel_successor(repo, slug, |successor| {
         yank_successor_covers(bad, successor)
@@ -1264,8 +1103,6 @@ fn prove_yank_successor(repo: &Path, slug: &str, bad: &Published) -> Result<Opti
 }
 
 /// The ratcheted successor once the bad build has left the published set: the channel head
-/// is newer than `build`, fully verified, and poisons it via `min_build`. The bad build's
-/// absence is the caller's to establish.
 fn prove_absent_yank_converged(repo: &Path, slug: &str, build: u64) -> Result<Option<Published>> {
     let required_floor = yank_required_floor(build)?;
     verified_channel_successor(repo, slug, |successor| {
@@ -1286,8 +1123,6 @@ fn published_commit(published: &Published) -> Result<String> {
 }
 
 /// A completed yank is not converged while a killed cleanup publisher still owns the
-/// global release refs: success then would leave a later cut wedged, so a response-lost
-/// final unlock goes to the ordinary explicit stopped-publisher recovery.
 fn ensure_yank_cleanup_session_absent(git: &ledger::GitCli, successor: &Published) -> Result<()> {
     let expected_owner = published_commit(successor)?;
     let owner = publish::release_lease_owner(git)?;
@@ -1343,8 +1178,6 @@ fn yank_cleanup_failure(error: Error, successor: &Published, owner: &str) -> Err
 }
 
 /// Re-read the exact bad manifest before the demotion: a build-number match is not
-/// identity, so tag, release, version and manifest bytes must all still match, and
-/// duplicates fail closed. `false` when the release is gone or already demoted.
 fn prove_yank_target_present(slug: &str, expected: &Published) -> Result<bool> {
     let expected_release = expected.release.as_ref().ok_or_else(|| {
         Error::new("yank target scan carries no immutable GitHub release object snapshot")
@@ -1360,8 +1193,6 @@ fn prove_yank_target_present(slug: &str, expected: &Published) -> Result<bool> {
         return Ok(false);
     }
     publish::validate_release_object_snapshot(exact.as_ref(), expected_release)?;
-    // The tag may be absent: yank deletes it first and keeps this release and manifest as
-    // its crash-recovery receipt.
     let scanned = scan_published(slug, false)?;
     let matches: Vec<&Published> = scanned
         .iter()
@@ -1395,11 +1226,6 @@ fn prove_yank_target_present(slug: &str, expected: &Published) -> Result<bool> {
 }
 
 /// Takes the yanked release out of the published set: demoted to a prerelease by its
-/// immutable ID, with the successor re-proved and the exact owner+process token re-asserted
-/// before every attempt. A demotion rather than a delete (publish/DECISIONS.md, *Publish
-/// once*): it is reversible, the release keeps its signed source attestation, and GitHub
-/// never lets `latest` return to a prerelease, while to every client and scan it is gone
-/// as a deleted release is. (`release_yank_successor_first_model`'s release-removal edge.)
 fn demote_yank_release_convergently(
     repo: &Path,
     slug: &str,
@@ -1438,26 +1264,12 @@ fn demote_yank_release_convergently(
     Ok(())
 }
 
-/// What `targo --unverified ship yank` must be told before it can publish anything: the
-/// successor cut's signing inputs and Linux declaration, and only those.
-///
-/// A yank's first act is a real, published cut ([`run_yank`]), held to every rule a cut
-/// is. With the paper master armed, `publish::channel_signature_policy` refuses pre-claim
-/// when no signing material resolves, and the only material that resolves without the flag,
-/// `~/.aterm/machine.key`, names no notary credential, which `sign::resolve_apple_tier`
-/// refuses with `pins::APPLE_TEAM_ID` pinned: so the profile must be nameable. The other
-/// cut flags are absent on purpose: `--dry-run` would leave no published successor to
-/// prove, `--resume` belongs to the journal (and [`run_yank`] refuses an unfinished
-/// journaled cut), and the floor is the yank's own (`yank_required_floor`).
+/// What `targo --unverified ship yank` must be told before it can publish anything.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct YankOptions {
-    /// The one credentials profile, forwarded verbatim to the successor cut. `None`
-    /// resolves as a bare `targo --unverified ship cut` does (this machine's provisioned
-    /// identity), so an unarmed or single-machine tree needs no flag.
+    /// The one credentials profile, forwarded verbatim to the successor cut.
     pub release_credentials: Option<PathBuf>,
-    /// The successor cut's Linux declaration, forwarded verbatim: the cut's
-    /// `--linux-artifacts DIRECTORY [--linux-target ARCH]... [--linux-worker
-    /// ARCH=HOST:REPO]...` or `--mac-only`. A yank must make one, as a cut must.
+    /// The successor cut's Linux declaration, forwarded verbatim.
     pub linux_artifacts: Option<PathBuf>,
     pub linux_targets: Vec<String>,
     pub linux_workers: Vec<String>,
@@ -1465,10 +1277,6 @@ pub struct YankOptions {
 }
 
 /// The successor cut a yank of a bad build must publish: the ratcheted floor
-/// plus the operator's signing inputs and Linux declaration, and nothing else.
-///
-/// Pure and split out of [`run_yank`] so a test pins every field: a dropped one (a
-/// `..Default::default()`) silently answers the armed tree's signing question with nothing.
 fn successor_cut_options(required_floor: u64, opts: &YankOptions) -> publish::CutOptions {
     publish::CutOptions {
         min_build: Some(required_floor),
@@ -1482,10 +1290,6 @@ fn successor_cut_options(required_floor: u64, opts: &YankOptions) -> publish::Cu
 }
 
 /// Yank's local gates, before anything remote: a clean checkout whose own cutter this is
-/// (`identity`: [`gates::current_own_cutter_gate`] in production), bound to the origin its
-/// Cargo.toml names. A cleanup-only resume mutates tags and releases without the fresh-cut
-/// ladder, so it needs these too. No branch rule: the successor builds the published
-/// commit in the cut tree, and the checkout never moves.
 fn yank_local_gates(
     git: &dyn ledger::GitRunner,
     slug: &str,
@@ -1496,14 +1300,7 @@ fn yank_local_gates(
     publish::assert_origin_repo_binding(git, slug)
 }
 
-/// `targo --unverified ship yank <build>`: first publish and prove a min_build-ratcheted
-/// successor under a fresh claim, then remove the now-inert bad build: its origin tag, then
-/// its channel release from the published set (a demotion to a prerelease). A crash at
-/// every cleanup edge leaves the successor authoritative; cleanup before the successor is
-/// structurally absent.
-///
-/// `opts` is the successor cut's signing input and nothing else; see [`YankOptions`] for
-/// why a yank has to carry one at all.
+/// `targo --unverified ship yank <build>`.
 pub fn run_yank(repo: &Path, build: u64, opts: &YankOptions) -> Result<()> {
     let slug = publish::workspace_channel_slug(repo)?;
     println!("aterm-release · yank build {build} ({slug})");
@@ -1514,7 +1311,6 @@ pub fn run_yank(repo: &Path, build: u64, opts: &YankOptions) -> Result<()> {
         &gates::current_own_cutter_gate,
     )?;
     let _cred = publish::ChannelCred::enter();
-    // Scan releases, not tags: a resumed yank may find the bad tag already deleted.
     let scanned = scan_published(&slug, false)?;
     let matching = scanned
         .iter()
@@ -1548,8 +1344,6 @@ pub fn run_yank(repo: &Path, build: u64, opts: &YankOptions) -> Result<()> {
     })?;
     let required_floor = yank_required_floor(build)?;
 
-    // An unfinished journaled cut must be finished or abandoned first; a completed journal
-    // is history `run_cut` clears.
     let journal_path = repo.join("dist/cut-state.toml");
     if let Some(j) = publish::JournalHeader::read(&journal_path)?
         && !j.finished()
@@ -1571,9 +1365,6 @@ pub fn run_yank(repo: &Path, build: u64, opts: &YankOptions) -> Result<()> {
                 "publishing successor FIRST with min_build = {required_floor}; bad release remains live until proof passes"
             ),
         );
-        // An ordinary cut held to every rule: nothing is pre-validated here (a copy of the
-        // rule would drift), so a missing answer earns the cut's own pre-claim refusal,
-        // which burns no ledger number and states the remedy.
         publish::run_cut(repo, &successor_cut_options(required_floor, opts))?;
     } else {
         step(
@@ -1586,9 +1377,6 @@ pub fn run_yank(repo: &Path, build: u64, opts: &YankOptions) -> Result<()> {
     })?;
     let cleanup_owner = published_commit(&successor)?;
 
-    // Cleanup is a release-channel mutation even though the bad build is already poisoned:
-    // claim the verified successor commit as the durable recovery identity, then add a
-    // per-process token so two simultaneous yank resumes can never both delete.
     let cleanup_lease = publish::acquire_release_lease(&git, &cleanup_owner)?;
     let cleanup_fence = publish::acquire_publisher_fence(&git, &cleanup_owner)
         .map_err(|error| yank_cleanup_failure(error, &successor, &cleanup_owner))?;
@@ -1611,20 +1399,12 @@ pub fn run_yank(repo: &Path, build: u64, opts: &YankOptions) -> Result<()> {
             .ok_or_else(|| {
                 Error::new("ratcheted successor proof disappeared before tag cleanup")
             })?;
-        // Keep the unique-session assertion immediately adjacent to each
-        // local/remote tag delete performed by the helper.
         publish::assert_publisher_session(&git, &cleanup_lease, &cleanup_fence)
     })
     .map_err(|error| yank_cleanup_failure(error, &successor, &cleanup_owner))?;
-    // Tag first: the published manifest stays the durable receipt a crashed cleanup
-    // rediscovers the build from, and the release stays visible (inert below the
-    // successor) until the final demotion.
     demote_yank_release_convergently(repo, &slug, &bad, &git, &cleanup_lease, &cleanup_fence)
         .map_err(|error| yank_cleanup_failure(error, &successor, &cleanup_owner))?;
 
-    // A successful REST response is not the final proof: replay the absent-target and
-    // verified-floor condition before releasing both coordination refs. Any ambiguity
-    // keeps the refs for explicit stopped-publisher recovery.
     prove_absent_yank_converged(repo, &slug, build)?
         .ok_or_else(|| Error::new("yank cleanup finished without a converged successor proof"))
         .map_err(|error| yank_cleanup_failure(error, &successor, &cleanup_owner))?;
@@ -1652,20 +1432,12 @@ pub fn run_yank(repo: &Path, build: u64, opts: &YankOptions) -> Result<()> {
     Ok(())
 }
 
-/// `targo --unverified ship release --abandon vX.Y.Z`: withdraw what this unfinished cut put
-/// on the channel ([`publish::withdraw_unpublished_release`]: its own draft deleted, or
-/// exactly its uploads taken back off the engine's source release, which stays), delete the
-/// tag the cut minted on origin, release the lease and the fence, and delete the local
-/// journal. The claim commit stays (the ledger is append-only); a later cut of the version
-/// recuts with a fresh number. Only the cutter built at the journal's claim commit runs it
-/// (`ship release` is that cutter, from the release's clone); any other refuses.
+/// `targo --unverified ship release --abandon vX.Y.Z`.
 pub fn run_abandon(repo: &Path, version: &str) -> Result<()> {
     let slug = publish::workspace_channel_slug(repo)?;
     let tag = format!("v{version}");
     println!("aterm-release · abandon {tag} ({slug})");
     let journal_path = repo.join("dist/cut-state.toml");
-    // The header first, as every entry point reads it: which cut this is, whether it is
-    // finished, and whose cutter withdraws it.
     let header = publish::JournalHeader::read(&journal_path)?.ok_or_else(|| {
         Error::new(format!(
             "there is no matching v{version} journal proving an owner; refusing destructive \
@@ -1687,8 +1459,6 @@ pub fn run_abandon(repo: &Path, version: &str) -> Result<()> {
     }
     let git = ledger::GitCli::new(repo);
     publish::assert_origin_repo_binding(&git, &origin_slug_of(repo)?)?;
-    // A withdrawal follows the rules its journal was written under, so only the claim's
-    // own cutter runs it, as for `--resume` and `recover`.
     gates::own_cutter_gate(&git, &header.commit, false)?;
     let journal = publish::Journal::load(&journal_path)?.ok_or_else(|| {
         Error::new(format!(
@@ -1699,8 +1469,6 @@ pub fn run_abandon(repo: &Path, version: &str) -> Result<()> {
     publish::ordinary_resume_claim_preflight(repo, &git, &journal)?;
     let _cred = publish::ChannelCred::enter();
 
-    // A published release is outside abandon's authority; checked before the lease is
-    // acquired, so the refusal leaves no new lock behind.
     if release_state(&slug, &tag)? == ReleaseState::Published {
         return Err(Error::new(format!(
             "{tag} is the channel's PUBLISHED app release — this cut's head PATCH landed, so \
@@ -1760,7 +1528,6 @@ pub fn run_abandon(repo: &Path, version: &str) -> Result<()> {
 }
 
 /// The origin "owner/repo" — `[workspace.package] repository`, where the ledger, the
-/// lease, the fence and the tags live.
 fn origin_slug_of(repo: &Path) -> Result<String> {
     let cargo_text = fs::read_to_string(repo.join("Cargo.toml"))
         .map_err(|e| Error::new(format!("read Cargo.toml: {e}")))?;
@@ -1776,12 +1543,9 @@ mod tests {
     use super::*;
 
     /// One page of `release_identity_jq(true)` output: id, tag, draft, target, tab-separated.
-    /// Release 9 is a draft created in the GitHub web UI without picking a tag.
     const PAGE_WITH_A_TAGLESS_DRAFT: &str = "9\t\ttrue\tmain\n12\tv0.3.0\tfalse\tabc123\n";
 
     /// A head scan below the release the latest pointer names is torn and refuses before
-    /// the claim; a channel with no pointer, or a pointer the client would not elect,
-    /// binds nothing.
     #[test]
     fn a_head_scan_below_the_latest_pointer_refuses_before_the_claim() {
         let latest = "420813912\tv0.112.0\tfalse\tfalse\t1\n";
@@ -1796,7 +1560,6 @@ mod tests {
     }
 
     /// Both replays skip a prerelease on the production five-field row; the same row
-    /// published is the client replay's head.
     #[test]
     fn a_prerelease_carrying_an_appcast_is_never_the_head() {
         let appcast = |version: &str, build: u64| -> Result<Vec<u8>> {
@@ -1835,7 +1598,6 @@ mod tests {
     /// The strict identity parse of the batched recheck sees only the captured rows.
     #[test]
     fn an_unrelated_tagless_draft_cannot_abort_the_batched_recheck() {
-        // The control: unfiltered, the page is fatal.
         assert!(publish::parse_release_object_identity_rows(PAGE_WITH_A_TAGLESS_DRAFT).is_err());
         let wanted = std::collections::BTreeSet::from([12]);
         let selected = captured_identity_rows(PAGE_WITH_A_TAGLESS_DRAFT, &wanted);
@@ -1858,7 +1620,6 @@ mod tests {
     }
 
     /// The captured ID is then absent from the live map, so [`scan_published`] reports the
-    /// scan as torn. An empty selection is no error.
     #[test]
     fn a_row_with_an_unreadable_id_is_dropped_not_parsed() {
         let page = "not-a-number\tv0.3.0\tfalse\tabc123\n";
@@ -1872,8 +1633,6 @@ mod tests {
     }
 
     /// With the paper master armed a cut refuses pre-claim unless told which profile signs,
-    /// so the yank's answer must reach its successor, which stays a plain real cut; the
-    /// yank's floor and Linux declaration reach it too.
     #[test]
     fn the_successor_cut_carries_the_operators_signing_inputs_and_stays_a_real_cut() {
         let cut = successor_cut_options(
@@ -1890,7 +1649,6 @@ mod tests {
         );
         assert!(!cut.dry_run && !cut.resume);
 
-        // A flagless yank asks for the plain real cut: an unarmed tree needs no flag.
         assert_eq!(
             successor_cut_options(7, &YankOptions::default()),
             publish::CutOptions {
@@ -1898,8 +1656,6 @@ mod tests {
                 ..Default::default()
             }
         );
-        // …and the yank's Linux declaration: a Mac-only yank's successor is
-        // Mac-only on purpose.
         let successor = successor_cut_options(
             7,
             &YankOptions {
@@ -1921,8 +1677,7 @@ mod tests {
 
 #[cfg(test)]
 mod yank_local_gate_tests {
-    //! Yank runs from any clean checkout whose own cutter it is: the successor cut builds
-    //! the published commit in the cut tree and never moves this checkout.
+    //! Yank runs from any clean checkout whose own cutter it is.
 
     use super::*;
 
@@ -1960,7 +1715,6 @@ mod yank_local_gate_tests {
         let root = scratch_repo("detached");
         let git = ledger::testing::Git::new(&root);
         ledger::git_ok(&git, &["checkout", "-q", "--detach", "HEAD~1"]).unwrap();
-        // The checkout really is off every branch.
         let branch = ledger::git_ok(&git, &["rev-parse", "--abbrev-ref", "HEAD"])
             .unwrap()
             .stdout_utf8();
@@ -1968,7 +1722,6 @@ mod yank_local_gate_tests {
         let ours = |_: &dyn ledger::GitRunner| -> Result<()> { Ok(()) };
         yank_local_gates(&git, "o/r", &ours).expect("no branch rule");
 
-        // Negative controls: the gates that remain still refuse.
         fs::write(root.join("stray"), "x").unwrap();
         assert!(yank_local_gates(&git, "o/r", &ours).is_err());
         fs::remove_file(root.join("stray")).unwrap();

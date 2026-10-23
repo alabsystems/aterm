@@ -1331,7 +1331,7 @@ impl View {
     /// on past them. No reply's cursor names an epoch the journal never
     /// numbered, so [`View::cursor`] needs no epoch of its own to tell one.
     #[must_use]
-    pub fn reply_cursor(&self) -> crate::Cursor {
+    pub const fn reply_cursor(&self) -> crate::Cursor {
         crate::Cursor::new(self.ep, self.head)
     }
 

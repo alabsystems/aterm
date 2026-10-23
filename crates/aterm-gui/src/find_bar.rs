@@ -1,72 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The Cmd-F FIND PANEL: a pinned chrome BAND painted over the terminal grid
-//! (directly below the tab strip, or in a split over the focused pane's top rows)
-//! while find mode is active (`WindowState.search`).
-//! Before this the find state was surfaced ONLY in the window title + the
-//! current-match selection highlight (the FIND-1 readiness finding), so
-//! pressing ⌘F looked like it did nothing — the search engine was wired, but
-//! INVISIBLE. Then it was one cramped row, which read as terminal output rather than
-//! as UI. It is now a [`FIND_BAR_ROWS`]-row panel:
-//!
-//! ```text
-//!                                                                  (pad, not on Windows)
-//!   Find: needle                          2/7      [Aa] [.*]       (field)
-//!   ⌘S next  ⌘R prev  ⌥⌘C case  ⌥⌘R regex  ⏎ accept  esc cancel     (hints)
-//! ```
-//!
-//! Its separator rule runs along the band's content-facing pixel EDGE: under the
-//! hints row the splice draws it as a one-pixel rail on the band's last pixel row
-//! ([`FindSeam::BottomRail`], the message band's rail), so it never crosses a
-//! descender; a cell too short to keep its words off a rail falls back to the face's
-//! underline ([`FindSeam::BottomUnderline`]).
-//!
-//! The field row holds an input well with a block caret, between [`MIN_FIELD`] and
-//! [`MAX_FIELD`] cells wide, scrolled to keep the caret in view, and sized by the window
-//! alone. The `[Aa]` / `[.*]` toggles are clickable through [`FindBarPaint`]; on a narrow
-//! window they are dropped before the status readout, which goes below 49 columns. A failed
-//! search tints the query.
-//!
-//! A count is painted bare only when it is an exact census of the present screen. Two
-//! qualifiers survive at every width (the ladder drops the `i/` position, never the mark):
-//!
-//! Windows sets the field row as a toolbar ([`FIND_TOOLBAR`]): the well with
-//! padded ` Aa ` / ` .* ` toggle buttons right after it, each on a resting
-//! control fill, and at the band's far end the count with clickable `↑` / `↓` /
-//! `✕` buttons (Shift+F3, F3, Esc), `✕` last, as the find bars of Windows
-//! Terminal and VS Code close. The well gives up width before the toggles do,
-//! so a split pane keeps them:
-//!
-//! ```text
-//!   Find: Merge▮______________  Aa   .*                  2/39  ↑  ↓  ✕
-//!   F3/Shift+F3 next/prev  Enter accept  Esc cancel
-//! ```
-//!
-//! (` Aa ` and ` .* ` are the two filled chips.)
-//!
-//! On Windows the bar's pixels are its Fluent face ([`fluent_bar`]), laid over
-//! these cells the way the tab strip and the pane headers lay theirs: the words
-//! in the system UI face, the query box and the toggles as inset, rounded
-//! controls, an on toggle in the accent. The cells keep every character for the
-//! text grid and stand in wherever no UI face is installed.
-//!
-//! * `+`: the total is a floor. Where there is room the bar names why: the depth cap
-//!   (`none in newest 100,000 lines`, `3/7+ (newest 100,000 lines)`; the limit is
-//!   `search_history_lines`), the match limit (`1/100000+ (match limit)`), a long line a
-//!   regex could not finish (`line cut short`) or a rewrap; otherwise `(partial history)`.
-//! * `…`: the terminal changed since the count was taken. The search is not re-run per PTY
-//!   batch (a full scan per burst on the UI thread), so the number can be wrong in either
-//!   direction until the next edit or ⌘S/⌘R. Spelled out as `(stale)`.
-//!
-//! While a width change's rewrap holds the history away, a zero-match is not a miss (the
-//! search reruns at the re-attach): no width says `no matches`, and the ladder runs from
-//! `none yet, history rewrapping` down to `rewrap`, in the label tone. Where the status zone
-//! is dropped, the band's `Rewrapping scrollback` row carries the wait.
-//!
-//! Pure and themed, so it unit-tests with no window. `App::splice_find_bar` (app_render.rs)
-//! overwrites grid rows with it: at the top normally, at the bottom when the current match
-//! would sit under the panel.
+//! The Cmd-F FIND PANEL.
 
 use std::ops::Range;
 use std::sync::Arc;
@@ -82,27 +17,17 @@ use crate::tray_raster;
 use crate::type_scale::{StepPx, TypeStep};
 use crate::widget::{DrawPrim, TextFace, TextWeight, rgba, text_prim};
 
-/// Rows the find panel occupies: a blank pad, the field row, the hints row (fewer on a
-/// terminal too short; see [`find_bar_paint`]).
-///
-/// Windows drops the pad: there the panel is the compact two-line find box a
-/// Windows Terminal or VS Code user knows, and the pad read as an empty row
-/// under the tab strip (the 2026-10-17 audit). Its rows are the degraded 2-row
-/// panel this builder always supported.
+/// Rows the find panel occupies: a blank pad, the field row, the hints row (fewer on a terminal too short; see [`find_bar_paint`]).
 pub(crate) const FIND_BAR_ROWS: usize = if cfg!(windows) { 2 } else { 3 };
 
 /// Where the panel's separator rule runs: the edge that faces the terminal content.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum FindSeam {
-    /// The panel floated to the BOTTOM (content above): an overline on its first
-    /// row, which the renderer draws on the row's top pixel row, the band's edge.
+    /// The panel floated to the BOTTOM (content above).
     Top,
-    /// The panel at the TOP (content below), its rule drawn by the splice as a
-    /// one-pixel rail on the band's last pixel row (a `ChromeRaster`, the message
-    /// band's seam), clear of every descender. The builder leaves the rows bare.
+    /// The panel at the TOP (content below), its rule drawn by the splice as a one-pixel rail on the band's last pixel row (a `ChromeRaster`, the message band's seam), clear of every descender.
     BottomRail,
-    /// The panel at the top on a cell too short to keep its words off a rail
-    /// (`aterm_render::band::seam_can_rail`): the face's underline on the last row.
+    /// The panel at the top on a cell too short to keep its words off a rail (`aterm_render::band::seam_can_rail`).
     BottomUnderline,
 }
 
@@ -119,7 +44,6 @@ const GAP: usize = 3;
 const PROMPT: &str = "Find: ";
 
 /// The input well never shrinks below this many cells: the right side is dropped first. Only
-/// a window narrower than `LEFT_PAD + PROMPT + MIN_FIELD + RIGHT_PAD` gets a shorter field.
 const MIN_FIELD: usize = 28;
 
 /// …and never grows past this: a wider trough reads as a hole, not a field.
@@ -129,7 +53,6 @@ const MAX_FIELD: usize = 48;
 const IND_W: usize = 9;
 
 /// Cells reserved for the status readout, from the window width only, so the well does not
-/// shift under the caret when the count changes.
 fn status_zone(cols: usize) -> usize {
     (cols / 6).clamp(6, 28)
 }
@@ -144,8 +67,7 @@ const SCROLL_RIGHT: char = '›';
 /// The find state the panel paints: a value copy, so the pure builder needs no `App`.
 pub(crate) struct FindBarView {
     pub query: String,
-    /// The caret as a byte offset into `query`, matching
-    /// [`crate::app_search::SearchState::cursor`].
+    /// The caret as a byte offset into `query`, matching [`crate::app_search::SearchState::cursor`].
     pub cursor: usize,
     /// 1-based position of the current match (meaningful only when `total > 0`).
     pub idx: usize,
@@ -154,27 +76,22 @@ pub(crate) struct FindBarView {
     pub is_regex: bool,
     /// The query was an invalid regex (regex mode only) — shown as `bad regex`.
     pub regex_error: bool,
-    /// The count is a floor (`+`): older history went unsearched, the match limit hit, a long
-    /// line was cut short, or a rewrap held the history away.
+    /// The count is a floor (`+`).
     pub truncated: bool,
-    /// How many of the newest lines the depth cap let the search read; `None` for the whole
-    /// buffer.
+    /// How many of the newest lines the depth cap let the search read; `None` for the whole buffer.
     pub searched_lines: Option<usize>,
     /// The list stopped at the match limit: `1/100000+ (match limit)`.
     pub match_capped: bool,
     /// A regex scan could not finish some line within its budget: `3/7+ (line cut short)`.
     pub cut_short: bool,
-    /// The terminal changed since `total` was counted (`…`); it can hold with
-    /// [`Self::truncated`] (`1/6+…`).
+    /// The terminal changed since `total` was counted (`…`); it can hold with [`Self::truncated`] (`1/6+…`).
     pub stale: bool,
-    /// The search ran while a rewrap held the history detached: a miss is `none yet` /
-    /// `rewrapping`, never `no matches`, and not tinted. Implies [`Self::truncated`].
+    /// The search ran while a rewrap held the history detached: a miss is `none yet` / `rewrapping`, never `no matches`, and not tinted.
     pub history_away: bool,
 }
 
 impl FindBarView {
     /// The caret as a character index into the query, clamped and floored onto a char
-    /// boundary so a cursor that raced ahead of the text cannot panic the painter.
     fn cursor_chars(&self) -> usize {
         let mut byte = self.cursor.min(self.query.len());
         while byte > 0 && !self.query.is_char_boundary(byte) {
@@ -184,82 +101,48 @@ impl FindBarView {
     }
 }
 
-/// The painted panel and the geometry the mouse and the splice need: the field row, the
-/// toggle spans, and the well a click maps back into a caret position.
+/// The painted panel and the geometry the mouse and the splice need.
 pub(crate) struct FindBarPaint {
     pub rows: Vec<Vec<RenderCell>>,
     /// Index within [`Self::rows`] of the row carrying the well + indicators.
     pub field_row: usize,
-    /// Cell-column spans of the clickable `Aa` (case) / `.*` (regex) indicators, or
-    /// `None` when the window was too narrow to draw them.
+    /// Cell-column spans of the clickable `Aa` (case) / `.*` (regex) indicators, or `None` when the window was too narrow to draw them.
     pub case_cols: Option<Range<usize>>,
     pub regex_cols: Option<Range<usize>>,
-    /// Cell-column spans of the `↑` (previous match), `↓` (next match) and `✕`
-    /// (close, as Esc) buttons ([`FIND_TOOLBAR`]), or `None` off Windows and when
-    /// the row was too narrow to draw them.
+    /// Cell-column spans of the `↑` (previous match), `↓` (next match) and `✕` (close, as Esc) buttons ([`FIND_TOOLBAR`]), or `None` off Windows and when the row was too narrow to draw them.
     pub prev_cols: Option<Range<usize>>,
     pub next_cols: Option<Range<usize>>,
     pub close_cols: Option<Range<usize>>,
     /// Columns of the input well on the field row.
     pub field_cols: Range<usize>,
-    /// Character index of the query shown in the well's first cell (the horizontal scroll):
-    /// character `i` landed at `field_cols.start + (i − field_scroll)`.
+    /// Character index of the query shown in the well's first cell (the horizontal scroll).
     pub field_scroll: usize,
-    /// The separator rule's tone, which the splice paints a [`FindSeam::BottomRail`]
-    /// in, so the rail and the cell-drawn seams cannot disagree.
+    /// The separator rule's tone, which the splice paints a [`FindSeam::BottomRail`] in, so the rail and the cell-drawn seams cannot disagree.
     pub seam: [u8; 3],
-    /// The accent line a focused Fluent text box closes on, which the splice lays
-    /// along the bottom of the well ([`WELL_ACCENT_LINE`]): the band's accent, or
-    /// `None` off Windows and under an OS-forced palette (whose well carries its
-    /// own border, [`BandColors::well_rule`]).
+    /// The accent line a focused Fluent text box closes on, which the splice lays along the bottom of the well ([`WELL_ACCENT_LINE`]).
     pub well_line: Option<[u8; 3]>,
-    /// Cell columns of the status readout on the field row (`2/7`, `no
-    /// matches`), or `None` when none was painted.
+    /// Cell columns of the status readout on the field row (`2/7`, `no matches`), or `None` when none was painted.
     pub status_cols: Option<Range<usize>>,
-    /// Index within [`Self::rows`] of the key-hint row, or `None` on a 1-row
-    /// panel.
+    /// Index within [`Self::rows`] of the key-hint row, or `None` on a 1-row panel.
     pub hint_row: Option<usize>,
 }
 
-/// Windows closes the query well on a 2 px accent line along its bottom edge, the
-/// focus line of a WinUI TextBox, so the field reads as the input it is (the
-/// 2026-10-17 audit: a square box with no stroke and no focus line). macOS and
-/// Linux keep the plain inset.
+/// On Windows, 2 px accent line along the bottom edge of the query well (`0` on macOS and Linux).
 pub(crate) const WELL_ACCENT_LINE: bool = cfg!(windows);
 
-/// Windows sets the field row as the find toolbar a Windows Terminal or VS Code
-/// user knows: the case and regex toggles as two padded `Aa` / `.*` buttons
-/// right after the well, a cell apart, each on the band's resting control fill
-/// ([`BandColors::chip_ground`], the message band's resting chip) so an OFF
-/// toggle still reads as a button, an ON one in the accent
-/// ([`toggle_on_colors`]); and at the row's far end, against the right
-/// margin, the count and clickable `↑` / `↓` / `✕` (previous, next, close)
-/// buttons, `✕` last. Packed into one cluster from the well, a full-width pane
-/// left the group floating at four-fifths of the band with the `✕` short of the
-/// end (the 2026-10-18 re-judge's `find-toolbar-floats-mid-band`). The well
-/// gives up width ([`TOOLBAR_MIN_FIELD`]) before the toggles do, so a split pane
-/// keeps them (at 55 columns the bracketed `[Aa] [.*]` were dropped for the
-/// count, the 2026-10-18 judge's `find-bar-still-cell-band`); the buttons go
-/// first, then the toggles, then the count. The caret wears the chrome accent
-/// the well's focus line does ([`caret_ink`]). macOS and Linux keep the
-/// bracketed toggles at the row's right edge and the cursor-coloured caret.
+/// Windows sets the field row as the find toolbar a Windows Terminal or VS Code user knows.
 pub(crate) const FIND_TOOLBAR: bool = cfg!(windows);
 
 /// The toolbar's well never shrinks below this many cells ([`FIND_TOOLBAR`]):
-/// about the width of Windows Terminal's search box, and what a 55-column split
-/// pane has left beside the toggles, the count and the buttons.
 const TOOLBAR_MIN_FIELD: usize = 15;
 
 /// …and never grows past this: a find box, not a second command line. A
-/// full-width pane's surplus is band between the toggles and the count.
 const TOOLBAR_MAX_FIELD: usize = 40;
 
 /// One toolbar toggle, ` Aa ` or ` .* `: its glyphs padded by a cell each side,
-/// so the resting fill and the ON fill are a chip, not a glyph-tight block.
 const TOGGLE_W: usize = 4;
 
 /// Both toolbar toggles and the band cell between them, so two resting chips
-/// read as two buttons, not one bar.
 const TOGGLES_W: usize = 2 * TOGGLE_W + 1;
 
 /// One toolbar button, ` ↑ `: a glyph padded to a three-cell click target.
@@ -269,7 +152,6 @@ const BUTTON_W: usize = 3;
 const TOOLBAR_BUTTONS: [char; 3] = ['\u{2191}', '\u{2193}', '\u{2715}'];
 
 /// One coloured run on the panel's right side; `bg` overrides the band background (a
-/// toggle's reversed state).
 struct Seg {
     text: String,
     fg: [u8; 3],
@@ -295,14 +177,10 @@ fn write_segs(row: &mut [RenderCell], cols: usize, mut col: usize, segs: &[Seg],
 }
 
 /// The status readout, widest form that fits `zone` cells first: bad regex, match position,
-/// or an honest no-match. `None` for an empty query or when even the shortest form won't
-/// fit. The caller drops the toggles before this.
 fn status_seg(v: &FindBarView, c: &BandColors, zone: usize) -> Option<Seg> {
     if v.query.is_empty() {
         return None;
     }
-    // Each ladder shortens the words first (`100,000` to `100k`, then the marks alone), then
-    // drops the `i/` position, never a mark.
     let facts = crate::app_search::CountFacts {
         truncated: v.truncated,
         stale: v.stale,
@@ -320,8 +198,6 @@ fn status_seg(v: &FindBarView, c: &BandColors, zone: usize) -> Option<Seg> {
             true,
         )
     } else if v.history_away && v.total == 0 {
-        // Not a miss while the history is away (module doc), so no `no matches` and no warn
-        // tone; no `…` either: a result that reruns itself is not stale.
         (
             vec![
                 crate::app_search::HISTORY_AWAY_NONE.to_string(),
@@ -345,7 +221,6 @@ fn status_seg(v: &FindBarView, c: &BandColors, zone: usize) -> Option<Seg> {
             forms.push(format!("no matches ({word}){stale_mark}"));
         }
         if let (Some(long), Some(short)) = (facts.depth(false), facts.depth(true)) {
-            // The depth cap stopped it: how far it searched outlives every other word.
             let short_count = short.trim_end_matches(" lines");
             forms.push(format!("none in {long}{stale_mark}"));
             forms.push(format!("none in {short}{stale_mark}"));
@@ -355,7 +230,6 @@ fn status_seg(v: &FindBarView, c: &BandColors, zone: usize) -> Option<Seg> {
         forms.push(format!("0 hits{mark}"));
         (forms, c.warn, false)
     } else {
-        // Hits: the cause where it fits, then the marks alone.
         use crate::app_search::parenthesized;
         let (i, n, plus) = (v.idx, v.total, facts.plus());
         (
@@ -376,7 +250,6 @@ fn status_seg(v: &FindBarView, c: &BandColors, zone: usize) -> Option<Seg> {
 }
 
 /// The `[Aa]` / `[.*]` toggles: bracketed so they read as controls, reversed when active, at
-/// a width that never changes as they flip.
 fn indicator_segs(v: &FindBarView, c: &BandColors) -> Vec<Seg> {
     let toggle = |text: &str, on: bool| {
         let mut s = seg(text, if on { c.bar_bg } else { c.label }, on);
@@ -384,10 +257,6 @@ fn indicator_segs(v: &FindBarView, c: &BandColors) -> Vec<Seg> {
         s
     };
     if FIND_TOOLBAR {
-        // Padded chips a cell apart ([`TOGGLES_W`]): OFF on the resting control
-        // fill ([`toggle_rest_fill`]) in the band's words, floored to AA there
-        // (Nord's words sit at 4.1:1 on its chip), ON in the accent with the
-        // on-accent ink ([`toggle_on_colors`]).
         let rest_fill = toggle_rest_fill(c);
         let rest_ink = chrome_band::ensure_contrast(c.value, rest_fill, TOGGLE_INK);
         let (on_fill, on_ink) = toggle_on_colors(c);
@@ -414,8 +283,6 @@ fn indicator_segs(v: &FindBarView, c: &BandColors) -> Vec<Seg> {
 }
 
 /// The toolbar's `↑` / `↓` / `✕` buttons ([`FIND_TOOLBAR`]), each padded to
-/// [`BUTTON_W`] cells, in the band's word ink: they are live controls, like the
-/// `Find:` prompt, where an inactive toggle is quiet.
 fn button_segs(c: &BandColors) -> Vec<Seg> {
     TOOLBAR_BUTTONS
         .iter()
@@ -424,11 +291,6 @@ fn button_segs(c: &BandColors) -> Vec<Seg> {
 }
 
 /// The well's caret ink: on Windows ([`FIND_TOOLBAR`]) the band's accent, the
-/// colour of the well's focus line ([`WELL_ACCENT_LINE`]), floored to AA in the
-/// well, so caret and focus line are one mark in the user's accent where the
-/// caret was the terminal cursor's green whatever the accent; elsewhere, and
-/// under an OS-forced palette (whose well carries a border, not a focus line),
-/// the band's own caret ink ([`BandColors::caret`]).
 fn caret_ink(c: &BandColors) -> [u8; 3] {
     if FIND_TOOLBAR && c.well_rule.is_none() {
         aterm_messages::ink::ensure_contrast(c.accent, c.field_bg, WELL_INK)
@@ -438,16 +300,6 @@ fn caret_ink(c: &BandColors) -> [u8; 3] {
 }
 
 /// The keymap taught on the hints row, widest variant that fits first.
-///
-/// `esc` is spelled out: U+238B (⎋) renders blank or as a reload arrow depending on the
-/// font. Per platform, because a hint naming keys the keyboard lacks is worse than none: off
-/// macOS the commands are Ctrl+S / Ctrl+R (the emacs arms in `on_key_search_mode`) and the
-/// toggles Alt+C / Alt+R (the VS Code chords; ⌥⌘ would be Win+Alt, and Win+Alt+R belongs to
-/// the Xbox Game Bar).
-///
-/// Windows teaches F3 / Shift+F3, the find-next reflex of every Windows app (the
-/// find field answers them, `App::search_repeat_action`; Ctrl+S / Ctrl+R still
-/// work), and spells Enter and Esc as the keys are labelled there.
 fn hint_text(cols: usize) -> &'static str {
     #[cfg(target_os = "macos")]
     const FULL: &str = "⌘S next  ⌘R prev  ⌥⌘C case  ⌥⌘R regex  ⏎ accept  esc cancel";
@@ -474,19 +326,7 @@ fn hint_text(cols: usize) -> &'static str {
     TINY
 }
 
-/// Build the find panel: `height` rows (normally [`FIND_BAR_ROWS`]; fewer drop the pad,
-/// then the hints), each exactly `cols` cells wide so the splice overwrites whole grid rows.
-/// Over-long text is truncated, never a panic.
-///
-/// `seam` places the thin separator rule on the edge that faces the terminal content
-/// ([`FindSeam`]): along the band's bottom edge when the panel sits at the TOP (content
-/// below — the normal placement), drawn by the splice as a rail
-/// ([`FindSeam::BottomRail`], the builder leaves the rows bare) or, on a cell too short
-/// for one, as an UNDERLINE under the LAST row; or an OVERLINE on the FIRST row when
-/// adaptive placement floats it to the BOTTOM (content above — see
-/// `App::splice_find_bar`, which flips placement so the current match is never hidden).
-/// A cell-drawn rule is applied AFTER the text, so it runs edge to edge instead of
-/// breaking into stubs wherever a glyph landed.
+/// Build the find panel.
 pub(crate) fn find_bar_paint(
     v: &FindBarView,
     cols: usize,
@@ -496,7 +336,6 @@ pub(crate) fn find_bar_paint(
 ) -> FindBarPaint {
     let c = chrome_band::band_colors(palette);
     let height = height.max(1);
-    // 3 rows: pad / field / hints. 2: field / hints. 1: field only.
     let field_row = usize::from(height >= 3);
     let hint_row = (height >= 2).then_some(height - 1);
     let mut rows: Vec<Vec<RenderCell>> = (0..height)
@@ -520,8 +359,6 @@ pub(crate) fn find_bar_paint(
         };
     }
 
-    // ---- field row: `Find: ` + the well, then the status/indicators (and, on
-    // Windows, the buttons).
     let well_start = (LEFT_PAD + PROMPT.chars().count()).min(cols);
     let layout = if FIND_TOOLBAR {
         toolbar_layout(v, &c, cols, well_start)
@@ -545,9 +382,6 @@ pub(crate) fn find_bar_paint(
         }
         scroll
     };
-    // `[Aa]` and `[.*]` (off Windows), or the toolbar's padded chips, are 4 cells
-    // each, separated by one: each whole chip is the click target, so a pointer
-    // aimed at a bracket or a chip's padding is not a dead pixel.
     let (case_cols, regex_cols) = match layout.indicators.as_ref() {
         Some((start, _)) => (
             Some(*start..start + TOGGLE_W),
@@ -555,7 +389,6 @@ pub(crate) fn find_bar_paint(
         ),
         None => (None, None),
     };
-    // The buttons abut too, each a glyph padded to `BUTTON_W` cells.
     let button = |i: usize| {
         layout
             .buttons
@@ -567,7 +400,6 @@ pub(crate) fn find_bar_paint(
         *start..start + segs.iter().map(|s| s.text.chars().count()).sum::<usize>()
     });
 
-    // ---- hints row: the keymap, dim, on its own line.
     if let Some(hint_row) = hint_row {
         let hint = hint_text(cols);
         write_str(
@@ -581,13 +413,6 @@ pub(crate) fn find_bar_paint(
         );
     }
 
-    // ---- seam last: one unbroken rule on the content-facing edge, over the text, in one
-    // explicit tone. Uncoloured, a rule falls back to each cell's ink, which on a degraded
-    // 1-2 row panel (seam row = field row) varies under the prompt, the query and the caret.
-    //
-    // A rail is the splice's to draw: a pixel row is not a cell attribute, and the
-    // underline it replaces ran through the hints' descenders five pixels above the
-    // band's real edge.
     match seam {
         FindSeam::Top => chrome_band::seal_band_top(&mut rows[0], c.seam),
         FindSeam::BottomUnderline => {
@@ -618,19 +443,7 @@ pub(crate) fn find_bar_paint(
     }
 }
 
-/// The CURRENT match's fill: the chrome accent, solid — the colour every other
-/// match's tint is stepped toward ([`aterm_messages::tokens::ChromeTokens::search_match`]
-/// seeds on it) — held [`CURRENT_RISE`]:1 off the background and [`CURRENT_STEP`]:1
-/// off `others`, that tint. The current match used to be the selection colour,
-/// which the tint is kept apart from by hue alone: 1.11:1 in the default dark theme
-/// (the 2026-10-17 audit), so on a screen of hits the one Enter accepts did not
-/// stand out. A step in LUMINANCE does, in every theme. The splice paints it as the
-/// live selection's colour while the bar is open, its text in
-/// [`current_match_ink`].
-///
-/// An accent that falls short walks toward the pole away from the background (the
-/// tint sits on the background's side of it, so both ratios grow along the walk)
-/// until it clears both floors; the pole itself always does.
+/// The CURRENT match's fill: the chrome accent, solid.
 pub(crate) fn current_match_fill(
     tokens: &aterm_messages::tokens::ChromeTokens,
     others: [u8; 3],
@@ -649,17 +462,7 @@ pub(crate) fn current_match_fill(
         .unwrap_or(away)
 }
 
-/// The CURRENT match's text ink on its `fill` ([`current_match_fill`]): the
-/// background the fill was walked away from — the side the fill stands off, as a
-/// block cursor's glyph inverts to the background — walked on toward its pole
-/// until it reads at [`CURRENT_INK`], or as far as a pole reaches where none
-/// does (always past AA: black or white clears 4.58:1 on any fill). The default
-/// theme's `#111318` stays itself on its bright green (13.5:1); Default Light's
-/// near-white goes to white on its dark green (5.1:1). The splice paints the
-/// selection's text in it. It used to be the renderer's automatic floor on each
-/// cell's own ink, which stops at the first tenth-step that clears AA: the
-/// default theme's `#d0d0d0` text landed on a washed-out `#535353` over the
-/// green (the 2026-10-18 judge).
+/// The CURRENT match's text ink on its `fill` ([`current_match_fill`]): the background the fill was walked away from.
 pub(crate) fn current_match_ink(
     tokens: &aterm_messages::tokens::ChromeTokens,
     fill: [u8; 3],
@@ -668,29 +471,18 @@ pub(crate) fn current_match_ink(
 }
 
 /// The contrast the current match's text reaches for on its fill: WCAG AAA (the
-/// best a pole reaches where none clears it, never under AA).
 const CURRENT_INK: f64 = 7.0;
 
 /// The least contrast the well's caret holds on the well: WCAG AA.
 const WELL_INK: f64 = 4.5;
 
 /// The least contrast an off toolbar toggle's glyphs hold on its resting fill
-/// ([`FIND_TOOLBAR`]): WCAG AA.
 const TOGGLE_INK: f64 = 4.5;
 
 /// The least contrast an off toolbar toggle's resting fill stands from the
-/// band ([`toggle_rest_fill`]).
 const TOGGLE_REST_STEP: f64 = 1.4;
 
 /// An ON toolbar toggle's fill and ink ([`FIND_TOOLBAR`]): the band's accent
-/// (held 3:1 off the band), its ink the band's on-accent floored to
-/// [`TOGGLE_INK`] on it, as Windows Terminal's search box checks a toggle
-/// (WinUI's `AccentFillColorDefaultBrush` under
-/// `TextOnAccentFillColorPrimaryBrush`). It was the band's words reversed,
-/// `#2B2D33` on light and `#D0D0D0` on dark, the accent kept for the focus
-/// line and the current match (the 2026-10-18 judge's
-/// `J4F-2-find-bar-not-fluent`). Under an OS-forced palette, `COLOR_HIGHLIGHT`
-/// and `COLOR_HIGHLIGHTTEXT`.
 fn toggle_on_colors(c: &BandColors) -> ([u8; 3], [u8; 3]) {
     (
         c.accent,
@@ -699,16 +491,6 @@ fn toggle_on_colors(c: &BandColors) -> ([u8; 3], [u8; 3]) {
 }
 
 /// An off toolbar toggle's resting fill ([`FIND_TOOLBAR`]): the message band's
-/// resting chip ([`BandColors::chip_ground`]), stepped on toward the band's
-/// words, in 32nds, where it stands less than [`TOGGLE_REST_STEP`]:1 from the
-/// band. The chip is a fixed mix toward the ink, which separates less on a
-/// light band: Default Light's `#cccdd0` on `#e2e3e5` was 1.24:1 where
-/// Default's is 1.56:1 (the 2026-10-18 judge's
-/// `light-find-chip-off-state-weak`). A fill, not a rim: Windows Terminal's
-/// search box rests its toggles on no fill and no stroke and gives the
-/// elevation border to the checked state, so a stroked off chip would borrow
-/// the on state's look. Under an OS-forced palette the chip is that palette's
-/// own window colour, untouched.
 fn toggle_rest_fill(c: &BandColors) -> [u8; 3] {
     use chrome_band::{contrast, ensure_contrast, mix3};
     if chrome_band::forced_chrome().is_some()
@@ -723,16 +505,12 @@ fn toggle_rest_fill(c: &BandColors) -> [u8; 3] {
 }
 
 /// The least contrast the current match's fill stands from the background: the
-/// non-text floor (WCAG 1.4.11) a mark you must find is held to.
 const CURRENT_RISE: f64 = 3.0;
 
 /// The least contrast the current match's fill stands from every other match's
-/// tint, so the two read as different marks without colour vision.
 const CURRENT_STEP: f64 = 2.0;
 
 /// The query's ink: the warn tone across a search that found nothing or a bad
-/// regex, else the band's words. A search that ran while the history was away
-/// found nothing YET — not a failure, so not the failure tint (ruling 237).
 fn query_ink(v: &FindBarView, c: &BandColors) -> [u8; 3] {
     if !v.query.is_empty() && (v.regex_error || (v.total == 0 && !v.history_away)) {
         c.warn
@@ -742,12 +520,6 @@ fn query_ink(v: &FindBarView, c: &BandColors) -> [u8; 3] {
 }
 
 /// Paint the input well: the visible slice of the query on the terminal's own background,
-/// with a reverse-video block caret at the edit position (no cell cost, no text shift).
-/// Returns the horizontal scroll (the character index in the well's first cell).
-///
-/// The view scrolls the minimum needed to keep the caret inside, preferring trailing text,
-/// like a native single-line field; `‹`/`›` mark an edge the query continues past. A failed
-/// search tints the query with the warn tone.
 fn paint_well(
     row: &mut [RenderCell],
     v: &FindBarView,
@@ -764,7 +536,6 @@ fn paint_well(
     let chars: Vec<char> = v.query.chars().collect();
     let cursor = v.cursor_chars().min(chars.len());
     let ink = query_ink(v, c);
-    // The caret can sit one past the last character, so the scrollable extent is `len + 1`.
     let max_start = (chars.len() + 1).saturating_sub(width);
     let scroll = cursor.saturating_sub(width - 1).min(max_start);
     let caret = caret_ink(c);
@@ -782,7 +553,6 @@ fn paint_well(
             break;
         }
     }
-    // An empty field says what it searches, dimmed, after the caret.
     if chars.is_empty() && width >= PLACEHOLDER.chars().count() + 2 {
         write_str(
             row,
@@ -794,7 +564,6 @@ fn paint_well(
             false,
         );
     }
-    // Clipped-edge markers, never over the caret.
     if scroll > 0 && cursor != scroll {
         row[field.start] = chrome_band::cell(SCROLL_LEFT, c.label, c.field_bg, false, false);
     }
@@ -802,8 +571,6 @@ fn paint_well(
     if last < chars.len() && cursor != last {
         row[field.end - 1] = chrome_band::cell(SCROLL_RIGHT, c.label, c.field_bg, false, false);
     }
-    // A border where the fill cannot carry the boundary (`well_rule`: every Windows
-    // High-Contrast scheme). Stamped last so it covers every cell written above.
     if let Some(rule) = c.well_rule {
         for cell in &mut row[field] {
             cell.underline = aterm_core::terminal::UnderlineStyle::Single;
@@ -814,7 +581,6 @@ fn paint_well(
 }
 
 /// Where the field row's pieces land: the single source of the row's geometry, so the click
-/// hit-test cannot drift from the paint. The well depends on `cols` alone ([`status_zone`]).
 struct FieldLayout {
     well: Range<usize>,
     /// `(start_col, segs)` of the `[Aa] [.*]` run, when it fits.
@@ -822,26 +588,14 @@ struct FieldLayout {
     /// `(start_col, segs)` of the status readout, when there is one and it fits.
     status: Option<(usize, Vec<Seg>)>,
     /// `(start_col, segs)` of the toolbar's `↑ ↓ ✕` buttons ([`FIND_TOOLBAR`]),
-    /// when they fit.
     buttons: Option<(usize, Vec<Seg>)>,
 }
 
 /// The Windows field row ([`FIND_TOOLBAR`]), a toolbar in two groups:
-/// `Find: [well] Aa .*` from the left, and `[status zone] ↑ ↓ ✕` against the
-/// right margin, the status right-aligned in its zone against the buttons so
-/// the count sits by the arrows that step it and `✕` ends the row. The well
-/// takes what the two groups leave, up to [`TOOLBAR_MAX_FIELD`]; the rest of a
-/// wide row is band between the groups. As in [`field_layout`] every column is
-/// a function of `cols` alone, never of the status text, so nothing moves under
-/// the caret while typing. Where the row runs short the buttons go first (F3,
-/// Shift+F3 and Esc do what they do, and the hint row teaches them), then the
-/// toggles; the count outranks both, and the well keeps [`TOOLBAR_MIN_FIELD`]
-/// cells.
 fn toolbar_layout(v: &FindBarView, c: &BandColors, cols: usize, well_start: usize) -> FieldLayout {
     let zone = status_zone(cols);
     let room = cols.saturating_sub(well_start + RIGHT_PAD);
     let buttons = TOOLBAR_BUTTONS.len() * BUTTON_W;
-    // Each rung: (with toggles, with buttons, the least cells right of the well).
     let rungs = [
         (true, true, 1 + TOGGLES_W + 1 + zone + 1 + buttons),
         (true, false, 1 + TOGGLES_W + 1 + zone),
@@ -868,7 +622,6 @@ fn toolbar_layout(v: &FindBarView, c: &BandColors, cols: usize, well_start: usiz
     if with_toggles {
         layout.indicators = Some((well_end + 1, indicator_segs(v, c)));
     }
-    // The right group, from the margin in: the buttons, then the status zone.
     let right_edge = well_start + room;
     let zone_end = if with_buttons {
         let start = right_edge - buttons;
@@ -887,8 +640,6 @@ fn toolbar_layout(v: &FindBarView, c: &BandColors, cols: usize, well_start: usiz
 fn field_layout(v: &FindBarView, c: &BandColors, cols: usize, well_start: usize) -> FieldLayout {
     let zone = status_zone(cols);
     let room = cols.saturating_sub(well_start + RIGHT_PAD);
-    // Widest reserve the window can afford while the well keeps MIN_FIELD cells; the
-    // indicators go before the status.
     let (reserve, with_indicators) = if room >= MIN_FIELD + GAP + zone + 1 + IND_W {
         (GAP + zone + 1 + IND_W, true)
     } else if room >= MIN_FIELD + GAP + zone {
@@ -916,8 +667,6 @@ fn field_layout(v: &FindBarView, c: &BandColors, cols: usize, well_start: usize)
     if with_indicators {
         layout.indicators = Some((indicator_start, indicator_segs(v, c)));
     }
-    // The status is right-aligned in the `zone` cells left of the indicators (or of the
-    // right margin when they were dropped).
     let status_right = if with_indicators {
         indicator_start.saturating_sub(1)
     } else {
@@ -934,10 +683,7 @@ fn field_layout(v: &FindBarView, c: &BandColors, cols: usize, well_start: usize)
     layout
 }
 
-// ---- The Fluent toolbar: the bar's pixels on Windows ----------------------------
-
-/// The window geometry the bar's pixel face is drawn at ([`fluent_bar`]): the
-/// cell box in device pixels and the window's scale (1 at 100 %).
+/// The window geometry the bar's pixel face is drawn at ([`fluent_bar`]).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct FluentGeom {
     pub cell_w: usize,
@@ -946,20 +692,15 @@ pub(crate) struct FluentGeom {
 }
 
 /// How far the query box and the toggle chips stand off the field row's top
-/// edge (the seam above the band) and off its foot, in epx. They sat flush on
-/// the row under the seam, square (the 2026-10-18 judge's
-/// `J4F-2-find-bar-not-fluent`: the chips spanned y25-47 under a y24 seam).
 const CONTROL_INSET_EPX: f32 = 3.0;
 
 /// The corner radius of the query box and the chips: WinUI's
-/// `ControlCornerRadius`.
 const CONTROL_RADIUS_EPX: f32 = 4.0;
 
 /// The space between `Find:` and the query box.
 const LABEL_GAP_EPX: f32 = 8.0;
 
 /// The query box's text inset, left and right; the `‹` / `›` edge marks sit
-/// in it.
 const BOX_PAD_EPX: f32 = 8.0;
 
 /// The query box's focus line: a focused WinUI TextBox's bottom border.
@@ -969,19 +710,15 @@ const FOCUS_LINE_EPX: f32 = 2.0;
 const CHIP_SIDE_EPX: f32 = 1.0;
 
 /// The space between two items of the hint row (`F3 next`, `Shift+F3 prev`),
-/// which the cells part with two blanks.
 const HINT_GAP_EPX: f32 = 14.0;
 
 /// The UI face's descender, in em (Segoe UI's is 0.21): the query's line is
-/// centred with its descenders, so a `g` stays off the box's focus line.
 const UI_DESCENT_EM: f32 = 0.21;
 
 /// The UI face's cap height, in em (Segoe UI's is 0.7): `↑` `↓` `✕` are
-/// centred on the count's capitals beside them.
 const UI_CAP_EM: f32 = 0.7;
 
 /// The scalar advance floor required by the Fluent well's bounded scans.
-/// A query whose actual font metrics cannot meet it keeps the cell bar.
 const MIN_ADVANCE_EM: f32 = 0.2;
 
 impl FluentGeom {
@@ -1004,13 +741,11 @@ impl FluentGeom {
     }
 
     /// The chrome's label base at this row and scale: the tab title's
-    /// ([`crate::tab_bar::chrome_label_base_px`]).
     fn base_px(self) -> f32 {
         crate::tab_bar::chrome_label_base_px(self.cell_h as f32, self.scale())
     }
 
     /// The field row's words (`Find:`, the query, the count, `Aa` / `.*`): the
-    /// tab title's size.
     fn body(self) -> StepPx {
         TypeStep::Body.px(self.base_px())
     }
@@ -1021,8 +756,6 @@ impl FluentGeom {
     }
 
     /// The controls' top and bottom (exclusive) on the field row, px from its
-    /// top: [`CONTROL_INSET_EPX`] off the seam and the foot, given up where the
-    /// row is too short for a line of the body size.
     fn control_y(self) -> (f32, f32) {
         let h = self.cell_h as f32;
         let line = (self.body().get() * 1.25).ceil();
@@ -1038,8 +771,7 @@ impl FluentGeom {
     }
 }
 
-/// The query box on the field row, px from the panel's left edge: from a gap
-/// past `Find:` to the well's last cell, its text inset [`BOX_PAD_EPX`].
+/// The query box on the field row, px from the panel's left edge.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct WellBox {
     pub x0: f32,
@@ -1048,10 +780,7 @@ pub(crate) struct WellBox {
     pub text_x1: f32,
 }
 
-/// The query box over the well's cells `field` (panel columns). It starts
-/// [`LABEL_GAP_EPX`] past the label as set in the UI face, never right of the
-/// well's first cell, so every cell of the well is inside it; the cells it
-/// takes from the prompt are still the box's to a click ([`well_click`]).
+/// The query box over the well's cells `field` (panel columns).
 pub(crate) fn well_box(field: &Range<usize>, g: FluentGeom) -> WellBox {
     let label = tray_raster::ui_text_width_for(TextFace::Ui, PROMPT.trim_end(), g.body().get());
     let cells = (g.x(field.start), g.x(field.end));
@@ -1088,10 +817,6 @@ fn reach(room: f32, px: f32) -> usize {
 }
 
 /// The query box's horizontal scroll: the first character it shows, the least
-/// that keeps the caret (before character `cursor`) inside `room` px, so the
-/// box shows as much of the query's head as it can, typing past its right edge
-/// scrolls the text under a caret that stays put, and Home brings the head
-/// back, as the cell well does ([`paint_well`]).
 fn well_scroll(chars: &[char], cursor: usize, room: f32, caret_w: f32, px: f32) -> usize {
     let cursor = cursor.min(chars.len());
     if room < caret_w {
@@ -1111,8 +836,6 @@ fn well_scroll(chars: &[char], cursor: usize, room: f32, caret_w: f32, px: f32) 
 }
 
 /// The character boundary nearest `x` px (from the text's left edge) in a
-/// query drawn from character `scroll`: where a click there puts the caret.
-/// Past the text it is the end.
 fn char_at(chars: &[char], scroll: usize, x: f32, room: f32, px: f32) -> usize {
     let scroll = scroll.min(chars.len());
     if x <= 0.0 {
@@ -1139,11 +862,7 @@ fn char_at(chars: &[char], scroll: usize, x: f32, room: f32, px: f32) -> usize {
     }
 }
 
-/// A click at `x` px from the panel's left edge on the field row, when the bar
-/// drew its pixel face for `query` ([`fluent_ready`]): the caret position it
-/// asks for, as a character index, or `None` off the query box. `field` is the
-/// well's cells (panel columns) and `scroll` the box's scroll as painted
-/// ([`FluentBar::scroll`]), the same inputs the paint measured with.
+/// A click at `x` px from the panel's left edge on the field row, when the bar drew its pixel face for `query` ([`fluent_ready`]).
 pub(crate) fn well_click(
     query: &str,
     scroll: usize,
@@ -1167,15 +886,7 @@ pub(crate) fn well_click(
     ))
 }
 
-/// Whether the bar draws its pixel face for `query`: on Windows
-/// ([`FIND_TOOLBAR`]), with a UI face installed that sets the bar's words and
-/// every character of the query (the strip band's own test,
-/// [`tray_raster::strip_band_run_coverable`]). A query no face draws, a colour
-/// emoji say, keeps the cell bar, which draws it through the terminal's cascade,
-/// rather than leave a hole in the box. The actual advances must also meet
-/// the bounded scan's floor at this geometry's size; a narrow or zero-advance
-/// scalar keeps the cell bar instead of truncating the query's visible range.
-/// Success carries the font epoch settled before that metric check.
+/// Whether the bar draws its pixel face for `query`.
 pub(crate) fn fluent_ready(query: &str, g: FluentGeom) -> Option<u64> {
     if !FIND_TOOLBAR
         || !tray_raster::strip_band_run_coverable(PROMPT)
@@ -1183,8 +894,6 @@ pub(crate) fn fluent_ready(query: &str, g: FluentGeom) -> Option<u64> {
     {
         return None;
     }
-    // Settle the same font epoch the raster key will keep before measuring
-    // the floor: this call may install a completed semantic fallback.
     let fonts = tray_raster::strip_band_font_epoch();
     let px = g.body().get();
     if !query.is_empty()
@@ -1197,8 +906,7 @@ pub(crate) fn fluent_ready(query: &str, g: FluentGeom) -> Option<u64> {
 
 /// The bar's pixel face for one frame ([`fluent_bar`]).
 pub(crate) struct FluentBar {
-    /// One raster per band row, each the panel's width and a cell tall: the
-    /// image the splice lays over that row's cells.
+    /// One raster per band row, each the panel's width and a cell tall: the image the splice lays over that row's cells.
     pub rows: Vec<Arc<ImageData>>,
     /// The query box's horizontal scroll: the first character it shows.
     pub scroll: usize,
@@ -1206,9 +914,7 @@ pub(crate) struct FluentBar {
     pub caret_x: f32,
 }
 
-/// What [`fluent_bar`] draws from: the painted cells (their spans and words),
-/// the view behind them, the band's colours, the window geometry, the seam,
-/// and the IME composition's characters in the query, if any.
+/// What [`fluent_bar`] draws from.
 pub(crate) struct FluentInput<'a> {
     pub view: &'a FindBarView,
     pub paint: &'a FindBarPaint,
@@ -1247,29 +953,7 @@ thread_local! {
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
-/// The find toolbar's Fluent face on Windows: one raster per band row, laid
-/// by the splice over the row's cells (the pane headers' mechanism, which keeps
-/// the cells' characters for the text grid). The label, the query, the count
-/// and the toggles' `Aa` / `.*` are set in the system UI face at the tab
-/// title's size, the hint row a step below, as a pane header is: they were the
-/// terminal face, where the strip, the headers and Settings use Segoe UI. The
-/// query box and the chips are WinUI controls, rounded [`CONTROL_RADIUS_EPX`]
-/// and inset [`CONTROL_INSET_EPX`] off the seam and the row's foot, one height;
-/// the box closes on its focus line and carries an I-beam caret in the
-/// accent; an on toggle is the accent with the on-accent ink
-/// ([`toggle_on_colors`]); `↑` `↓` `✕` are drawn strokes in the strip's close
-/// mark's weight.
-///
-/// The query is set in the UI face, as Windows Terminal's search box sets it (a
-/// XAML TextBox in the system face): the terminal face at the cell's size fills
-/// its row (Iosevka's ink spans 17 of the 23 rows at 100 %), so it cannot sit
-/// in a box inset off the seam, and it stood a third taller than the label
-/// beside it. The grid's hits keep the terminal face.
-///
-/// `None` off Windows, where no UI face is installed or one cannot draw the
-/// query ([`fluent_ready`]), and for an empty panel: the cells stand. Cached on
-/// everything the pixels depend on, the font epoch included, so an unchanged
-/// bar keeps its rasters' identity (the renderer's image cache keys on it).
+/// The find toolbar's Fluent face on Windows.
 pub(crate) fn fluent_bar(input: &FluentInput<'_>) -> Option<Arc<FluentBar>> {
     let p = input.paint;
     let cols = p.rows.first()?.len();
@@ -1327,7 +1011,6 @@ pub(crate) fn fluent_bar(input: &FluentInput<'_>) -> Option<Arc<FluentBar>> {
 }
 
 /// Rasterize the bar for [`fluent_bar`]; `key` carries the words it read off
-/// the cells.
 fn raster_bar(input: &FluentInput<'_>, key: &FluentKey) -> Option<FluentBar> {
     let (p, c, g) = (input.paint, &input.colors, input.geom);
     let cols = key.cols;
@@ -1347,9 +1030,6 @@ fn raster_bar(input: &FluentInput<'_>, key: &FluentKey) -> Option<FluentBar> {
         } else {
             Vec::new()
         };
-        // The rule on the edge that faces the content, a pixel row of the
-        // raster, which owns every pixel of the band (the cells give up their
-        // rules under it).
         let seam_y = match input.seam {
             FindSeam::Top => (row == 0).then_some(0.0),
             FindSeam::BottomRail | FindSeam::BottomUnderline => {
@@ -1376,7 +1056,6 @@ fn raster_bar(input: &FluentInput<'_>, key: &FluentKey) -> Option<FluentBar> {
 }
 
 /// One band row's raster: `prims` over the band's ground, the panel's width
-/// and a cell tall, drawn over the row's text (z 0).
 fn row_image(
     prims: &[DrawPrim],
     g: FluentGeom,
@@ -1406,7 +1085,6 @@ fn row_image(
 }
 
 /// The field row: `Find:`, the query box, the chips, the count and the
-/// buttons. Returns the box's scroll and caret x with the prims.
 fn field_prims(input: &FluentInput<'_>, key: &FluentKey) -> (usize, f32, Vec<DrawPrim>) {
     let (p, v, c, g) = (input.paint, input.view, &input.colors, input.geom);
     let body = g.body();
@@ -1418,8 +1096,6 @@ fn field_prims(input: &FluentInput<'_>, key: &FluentKey) -> (usize, f32, Vec<Dra
     } else {
         0.0
     };
-    // One baseline for the row's words, the query's: its line (descenders
-    // included) centred in the box above the focus line.
     let baseline = (tray_raster::row_baseline(y0, (y1 - y0 - focus).max(1.0), px)
         - px * UI_DESCENT_EM / 2.0)
         .round();
@@ -1436,7 +1112,6 @@ fn field_prims(input: &FluentInput<'_>, key: &FluentKey) -> (usize, f32, Vec<Dra
     };
     let mut prims = Vec::new();
     let well = well_box(&p.field_cols, g);
-    // `Find:`, the band's words, clear of the box.
     prims.push(DrawPrim::ClipPush {
         x: 0.0,
         y: 0.0,
@@ -1452,8 +1127,6 @@ fn field_prims(input: &FluentInput<'_>, key: &FluentKey) -> (usize, f32, Vec<Dra
     );
     prims.push(DrawPrim::ClipPop);
 
-    // The query box: the terminal's ground, rounded, its focus line along the
-    // foot inside the corners; under an OS-forced palette a border instead.
     let (scroll, caret_x) = if well.x1 > well.x0 {
         let (bx, bw, bh) = (well.x0, well.x1 - well.x0, y1 - y0);
         prims.push(DrawPrim::Panel {
@@ -1497,8 +1170,6 @@ fn field_prims(input: &FluentInput<'_>, key: &FluentKey) -> (usize, f32, Vec<Dra
         (0, well.x0)
     };
 
-    // The toggles: rounded chips, one height with the box; off on the resting
-    // fill, on in the accent.
     let chip_base = tray_raster::row_baseline(y0, y1 - y0, px).round();
     let rest_fill = toggle_rest_fill(c);
     let rest_ink = chrome_band::ensure_contrast(c.value, rest_fill, TOGGLE_INK);
@@ -1527,14 +1198,11 @@ fn field_prims(input: &FluentInput<'_>, key: &FluentKey) -> (usize, f32, Vec<Dra
         text(&mut prims, (xa + xb - w) / 2.0, chip_base, label, ink);
     }
 
-    // The count, right-aligned where its cells end, by the arrows.
     if let Some((span, words, ink)) = &key.status {
         let w = tray_raster::ui_text_width_for(TextFace::Ui, words, px);
         text(&mut prims, g.x(span.end) - w, baseline, words, *ink);
     }
 
-    // `↑` `↓` `✕`: round-capped strokes in the strip close mark's weight,
-    // centred on the line of words they end.
     let base = g.base_px();
     let stroke = (base / 9.0).max(1.0);
     let cy = (baseline - px * UI_CAP_EM / 2.0).round();
@@ -1561,7 +1229,6 @@ fn field_prims(input: &FluentInput<'_>, key: &FluentKey) -> (usize, f32, Vec<Dra
             line(&mut prims, (cx - r, cy - r), (cx + r, cy + r));
             line(&mut prims, (cx - r, cy + r), (cx + r, cy - r));
         } else {
-            // The shaft, and the head at its tip: up for `↑`, down for `↓`.
             let (a, b) = (base * 0.34, base * 0.24);
             let dir = if glyph == TOOLBAR_BUTTONS[0] {
                 -1.0
@@ -1578,9 +1245,6 @@ fn field_prims(input: &FluentInput<'_>, key: &FluentKey) -> (usize, f32, Vec<Dra
 }
 
 /// The query box's contents: the visible slice of the query (or the
-/// placeholder), the IME composition's underline, the I-beam caret in the
-/// accent, and `‹` / `›` where the query runs past an edge. `(top, bottom)` is
-/// the box above its focus line. Returns the scroll and the caret's x.
 fn well_text(
     prims: &mut Vec<DrawPrim>,
     input: &FluentInput<'_>,
@@ -1616,7 +1280,6 @@ fn well_text(
         h: (bottom - top).max(0.0),
     });
     if chars.is_empty() {
-        // The placeholder after the caret, where it fits whole.
         let x = well.text_x0 + caret_w + g.epx(3.0);
         if tray_raster::ui_text_width_for(TextFace::Ui, PLACEHOLDER, px) <= well.text_x1 - x {
             words(prims, x, PLACEHOLDER.to_string(), c.label);
@@ -1662,8 +1325,6 @@ fn well_text(
         radius: 0.0,
         fill: rgba(caret_ink(c), 255),
     });
-    // The edge marks, in the box's inset, so a clipped query never reads as
-    // the whole one.
     let mark = |prims: &mut Vec<DrawPrim>, ch: char, x0: f32, x1: f32| {
         let s = ch.to_string();
         let w = tray_raster::ui_text_width_for(TextFace::Ui, &s, px);
@@ -1679,8 +1340,6 @@ fn well_text(
 }
 
 /// The hint row: the keymap's items in the UI face a step below the field
-/// row's, in the band's label tone, a [`HINT_GAP_EPX`] apart; an item that
-/// would cross the right margin is left out whole.
 fn hint_prims(c: &BandColors, g: FluentGeom, cols: usize) -> Vec<DrawPrim> {
     let size = g.hint();
     let px = size.get();
@@ -1765,7 +1424,6 @@ mod tests {
     }
 
     /// The well's geometry depends on the window width only, never on the status text, so it
-    /// cannot move under the caret mid-edit.
     #[test]
     fn well_geometry_is_independent_of_the_status_text() {
         for cols in [60usize, 80, 100, 132, 200] {
@@ -1782,7 +1440,7 @@ mod tests {
                     truncated: true,
                     ..view("q")
                 },
-                view("zzz"), // no matches
+                view("zzz"),
                 FindBarView {
                     truncated: true,
                     ..view("zzz")
@@ -1833,7 +1491,6 @@ mod tests {
         assert_eq!(caret_start - field_start, 0, "caret on `a`");
         assert_eq!(caret_mid - field_start, 1, "caret on `b`");
         assert_eq!(caret_end - field_start, 3, "caret past the last character");
-        // Reverse video: the well's background becomes the ink.
         let c = chrome_band::band_colors(Theme::default());
         let p = paint(
             &FindBarView {
@@ -1897,9 +1554,6 @@ mod tests {
     }
 
     /// The clickable indicator spans line up EXACTLY with the painted `[Aa]` / `[.*]`
-    /// cells (brackets included — a click on the bracket is not a dead pixel), or on
-    /// Windows the padded ` Aa ` / ` .* ` chips, and the toolbar's buttons with their
-    /// padded `↑` / `↓` / `✕`.
     #[test]
     fn indicator_cols_match_painted_cells() {
         let cols = 90;
@@ -1934,10 +1588,6 @@ mod tests {
     }
 
     /// NARROW WINDOWS KEEP THE ANSWER. When the row cannot hold everything, the
-    /// ornament goes first: the toggles are dropped so the match/no-match readout
-    /// survives — a search that found nothing must never look like one that found
-    /// seven. (Windows' toolbar gives the well up first, so its toggles last to a
-    /// narrower row: [`the_toolbar_keeps_its_toggles_in_a_split_pane`].)
     #[test]
     fn the_status_outranks_the_toggles_when_space_runs_out() {
         let (narrow_cols, min_field) = if FIND_TOOLBAR {
@@ -1959,22 +1609,14 @@ mod tests {
             narrow.field_cols.len() >= min_field,
             "and so does the field"
         );
-        // Wider: both fit.
         let roomy = paint(&view("zzz"), 90);
         assert!(roomy.case_cols.is_some());
         assert!(all(&roomy).contains("no matches"));
-        // Narrower still: the field keeps whatever is left rather than vanishing.
         let tiny = paint(&view("q"), 24);
         assert!(!tiny.field_cols.is_empty());
     }
 
     /// A SPLIT PANE KEEPS THE TOGGLES on Windows ([`FIND_TOOLBAR`]): at the 55
-    /// columns half of a 111-column window gives a pane, the bracketed toggles were
-    /// dropped for the count (the 2026-10-18 judge). The toolbar's well gives up
-    /// width instead, so the toggles, the count and the `↑ ↓ ✕` buttons stand in
-    /// that order on disjoint spans, the two toggles a cell apart, and the count
-    /// sits by the arrows. NEGATIVE CONTROL: the right-edge layout macOS and Linux
-    /// keep drops the toggles at this width.
     #[test]
     fn the_toolbar_keeps_its_toggles_in_a_split_pane() {
         let v = FindBarView {
@@ -2024,7 +1666,6 @@ mod tests {
                 "{cols}: inside the right margin"
             );
         }
-        // A pane too narrow for the buttons keeps its toggles still.
         let p = paint(&v, 45);
         assert!(
             p.close_cols.is_none() && p.case_cols.is_some(),
@@ -2033,14 +1674,6 @@ mod tests {
     }
 
     /// THE TOOLBAR ENDS ON ITS CLOSE BUTTON at every width that draws one
-    /// ([`FIND_TOOLBAR`]): the count and `↑ ↓ ✕` stand against the right margin,
-    /// `✕` last, the count by the arrows, while the well and its toggles keep the
-    /// left; a wide pane's surplus is band between the two groups, and the well
-    /// stops at [`TOOLBAR_MAX_FIELD`]. Where the buttons have gone the count takes
-    /// the margin. NEGATIVE CONTROL: the 2026-10-18 build packed one cluster from
-    /// the well, so a full 111-column pane ended it at column 94 of 109, the `✕`
-    /// floating at four-fifths of the band (the re-judge's
-    /// `find-toolbar-floats-mid-band`); that layout fails the first assertion.
     #[test]
     fn the_toolbar_ends_on_its_close_button_at_every_width() {
         if !FIND_TOOLBAR {
@@ -2052,7 +1685,6 @@ mod tests {
             ..view("Merge")
         };
         let mut drew_buttons = 0;
-        // From the narrowest row that still paints the count.
         for cols in 34..=240usize {
             let p = paint(&v, cols);
             let row: String = p.rows[p.field_row].iter().map(|cell| cell.ch).collect();
@@ -2093,7 +1725,6 @@ mod tests {
             drew_buttons > 150,
             "the sweep must judge the buttons: {drew_buttons}"
         );
-        // A full-width pane leaves its surplus between the groups.
         let wide = paint(&v, 111);
         assert_eq!(wide.field_cols.len(), TOOLBAR_MAX_FIELD);
         let gap = wide.prev_cols.expect("buttons").start - wide.regex_cols.expect("toggles").end;
@@ -2101,14 +1732,6 @@ mod tests {
     }
 
     /// AN OFF TOGGLE IS STILL A BUTTON ([`FIND_TOOLBAR`]): its chip wears the
-    /// band's resting control fill ([`toggle_rest_fill`]), at least
-    /// [`TOGGLE_REST_STEP`]:1 off the band, with its glyphs in the band's words at
-    /// WCAG AA on it, in every built-in theme, light or dark; an ON toggle
-    /// wears the accent ([`toggle_on_colors`]). NEGATIVE CONTROLS: the 2026-10-18 build drew an off
-    /// toggle as bare label-ink glyphs on the band, no fill (the re-judge's
-    /// `find-toolbar-floats-mid-band`); and the message band's resting chip it
-    /// then wore stands 1.24:1 off Default Light's band (the judge's
-    /// `light-find-chip-off-state-weak`), where Default keeps it as is.
     #[test]
     fn an_off_toggle_rests_on_a_control_fill_in_every_builtin_theme() {
         use aterm_messages::ink::contrast;
@@ -2180,9 +1803,6 @@ mod tests {
     }
 
     /// THE CARET WEARS THE FOCUS LINE'S ACCENT on Windows ([`caret_ink`]): with an
-    /// authored blue accent the caret is that blue, floored to AA in the well, as the
-    /// well's focus line is the accent. NEGATIVE CONTROL: off Windows the caret stays
-    /// the band's cursor-coloured caret.
     #[test]
     fn the_caret_wears_the_accent_the_focus_line_does() {
         use aterm_messages::ink::contrast;
@@ -2240,8 +1860,6 @@ mod tests {
     }
 
     /// The seam rides the content-facing edge and runs edge to edge.
-    /// At the top it is the splice's rail by default: the builder then leaves every
-    /// cell bare, so no underline crosses the hints' descenders.
     #[test]
     fn seam_faces_the_content_and_is_unbroken() {
         use aterm_core::terminal::UnderlineStyle;
@@ -2302,7 +1920,6 @@ mod tests {
             chrome_band::band_colors(Theme::default()).seam,
             "the rail's tone is the band's seam"
         );
-        // One tone on the degraded panel too, where the seam row is the multi-ink field row.
         let band = chrome_band::band_colors(Theme::default());
         for height in [1_usize, 2] {
             let short = find_bar_paint(
@@ -2332,9 +1949,6 @@ mod tests {
     }
 
     /// THE CURRENT MATCH IS UNMISTAKABLE in every built-in theme: its fill stands
-    /// [`CURRENT_RISE`]:1 off the background and [`CURRENT_STEP`]:1 off the tint every
-    /// other match wears — a step in luminance. NEGATIVE CONTROL: the selection colour
-    /// it replaced sits under that step from the tint in the default theme (1.11:1).
     #[test]
     fn the_current_match_stands_apart_from_the_others_in_every_builtin_theme() {
         use crate::settings::u32_rgb;
@@ -2368,11 +1982,6 @@ mod tests {
     }
 
     /// THE CURRENT MATCH'S TEXT READS AT FULL STRENGTH: its ink is the background the
-    /// fill stands off, walked toward its pole for AAA, in every built-in theme: at
-    /// least AA always, AAA wherever a pole reaches it, the default theme's own
-    /// background on its green and white on Default Light's dark green. NEGATIVE
-    /// CONTROL: the renderer's automatic floor it replaced settles the default
-    /// theme's `#d0d0d0` text on a mid-grey under 6:1 over the bright green fill.
     #[test]
     fn the_current_match_text_wears_the_pole_its_fill_stands_off() {
         use crate::settings::u32_rgb;
@@ -2420,13 +2029,10 @@ mod tests {
     }
 
     /// Under every stock Windows High-Contrast scheme the well's fill matches the band, so an
-    /// unbroken border is stamped across the whole well instead.
     #[test]
     fn the_query_well_keeps_a_boundary_under_a_forced_palette() {
         use aterm_core::terminal::UnderlineStyle;
         let cols = 90;
-        // Off an OS palette the fill carries the edge and nothing is stamped; on
-        // Windows the splice closes the well on its accent focus line instead.
         let plain = paint(&view("abc"), cols);
         assert!(
             plain.rows[plain.field_row][plain.field_cols.clone()]
@@ -2456,7 +2062,6 @@ mod tests {
                             && cell.underline_color == c.well_rule),
                     "{name}: the well must carry an unbroken border, caret cell included"
                 );
-                // It stops at the well: the band around it is not a field.
                 assert_eq!(
                     p.rows[p.field_row][p.field_cols.start - 1].underline,
                     UnderlineStyle::None,
@@ -2468,8 +2073,6 @@ mod tests {
     }
 
     /// An ACTIVE toggle changes colour at the SAME width, so its state is visible
-    /// across the window and nothing reflows when it flips: reversed (ink and
-    /// ground swap) off Windows, the accent on Windows ([`toggle_on_colors`]).
     #[test]
     fn active_toggle_flips_at_a_fixed_width() {
         let cols = 90;
@@ -2490,8 +2093,6 @@ mod tests {
             off.case_cols, on.case_cols,
             "the toggle's geometry never changes with its state"
         );
-        // Windows' toolbar rests an inactive toggle on the control fill in the
-        // band's words (`an_off_toggle_rests_on_a_control_fill_in_every_builtin_theme`).
         let inactive = if FIND_TOOLBAR {
             (
                 chrome_band::ensure_contrast(c.value, toggle_rest_fill(&c), TOGGLE_INK),
@@ -2521,8 +2122,6 @@ mod tests {
     }
 
     /// While a rewrap holds the history away, a miss never reads `no matches` at any width
-    /// and the query keeps its ordinary ink; below the narrowest status zone the bar says
-    /// nothing.
     #[test]
     fn a_search_while_the_history_is_away_never_says_no_matches() {
         let c = chrome_band::band_colors(Theme::default());
@@ -2538,7 +2137,6 @@ mod tests {
             let ink = p.rows[p.field_row][p.field_cols.start].fg;
             (row, ink)
         };
-        // Every width: never the opposite of the truth.
         for cols in 40..=220 {
             for stale in [false, true] {
                 let (row, ink) = field_row(&away(stale), cols);
@@ -2549,11 +2147,9 @@ mod tests {
                 assert_ne!(ink, c.warn, "{cols}: the query is not a failure");
             }
         }
-        // The ordinary miss is still a miss, tinted as one.
         let (row, ink) = field_row(&view("needle"), 80);
         assert!(row.contains("no matches"), "{row}");
         assert_eq!(ink, c.warn);
-        // Hits on the screen while the rest is away: a floor.
         let (row, _) = field_row(
             &FindBarView {
                 idx: 1,
@@ -2566,10 +2162,8 @@ mod tests {
     }
 
     /// A count is painted bare only when it is an exact census: output since marks it `…`, a
-    /// floor `+`, both `+…`, and no width sheds a marker to fit.
     #[test]
     fn a_count_the_screen_has_moved_past_is_never_painted_bare() {
-        // The status row only: the hint row spells `Ctrl+S`, and a `+` there is not a qualifier.
         let status_row = |v: &FindBarView, cols: usize| {
             let p = paint(v, cols);
             text(&p.rows[p.field_row])
@@ -2592,8 +2186,6 @@ mod tests {
             stale: true,
             ..view("needle")
         };
-        // Wherever the exact form has room for a number, the qualified form keeps its mark
-        // (a window too narrow for any status paints none).
         let mut widths_checked = 0;
         for cols in [40usize, 50, 60, 72, 90, 140, 200] {
             if !status_row(&counted, cols).contains("1/6") {
@@ -2619,7 +2211,6 @@ mod tests {
         let painted = status_row(&both, 90);
         assert!(painted.contains("1/6+…"), "{painted}");
 
-        // The no-match form carries the same fact.
         let none = FindBarView {
             idx: 1,
             total: 0,
@@ -2631,7 +2222,6 @@ mod tests {
     }
 
     /// Every width × height (zero-width, degraded 1/2-row, overlong query) stays exactly
-    /// `cols` wide and never panics.
     #[test]
     fn narrow_short_and_overlong_never_panic() {
         for cols in [0usize, 1, 4, 8, 12, 20, 40, 200] {
@@ -2660,7 +2250,6 @@ mod tests {
                 }
             }
         }
-        // A degraded 1-row band keeps the field (the pad and hints go first).
         let one = find_bar_paint(&view("kept"), 90, 1, Theme::default(), FindSeam::Top);
         assert_eq!(one.field_row, 0);
         assert!(text(&one.rows[0]).contains("kept"));
@@ -2680,7 +2269,6 @@ mod tests {
         let (shown, caret) = well(&p);
         assert!(shown.starts_with("éßπ"), "{shown}");
         assert_eq!(caret - p.field_cols.start, 1, "the caret is on ß");
-        // Mid-codepoint cursor: floored to the boundary before it, never a panic.
         let p = paint(
             &FindBarView {
                 cursor: 1,
@@ -2693,11 +2281,6 @@ mod tests {
     }
 
     /// AN ON TOGGLE WEARS THE ACCENT ([`FIND_TOOLBAR`]), as Windows Terminal's
-    /// search box checks one: the band's accent under its on-accent ink at WCAG
-    /// AA, in every built-in theme, and under every stock High Contrast scheme
-    /// `COLOR_HIGHLIGHT` under `COLOR_HIGHLIGHTTEXT`. NEGATIVE CONTROL: the
-    /// 2026-10-18 build drew it as the band's words reversed, a `value` fill,
-    /// grey where the default themes' accent is green.
     #[test]
     fn an_on_toggle_wears_the_accent_with_its_on_accent_ink() {
         use aterm_messages::ink::contrast;
@@ -2735,10 +2318,7 @@ mod tests {
         }
     }
 
-    // ---- The Fluent face ([`fluent_bar`]) ----
-
     /// Install this host's UI faces on the test thread; `false` where it has
-    /// none (a fontless host has nothing to assert, as the strip band's tests).
     fn with_ui_faces() -> bool {
         tray_raster::prepare_ui_fonts_for_direct_view_test();
         tray_raster::strip_band_ui_ready()
@@ -2802,12 +2382,6 @@ mod tests {
     }
 
     /// THE WINDOWS BAR SETS ITS WORDS IN THE UI FACE ([`fluent_bar`]): `Find:`,
-    /// the count and the hint row are drawn at the UI face's own widths, the
-    /// field row at the tab title's size and the hints a step below, each band
-    /// row one raster the panel's width over its cells, as the strip and the
-    /// pane headers draw theirs. NEGATIVE CONTROL: the cells under them set
-    /// `Find:` across five 9 px terminal cells, and the hints one cell a
-    /// character, far wider than the face draws them.
     #[test]
     fn the_windows_bar_sets_its_words_in_the_ui_face() {
         if !FIND_TOOLBAR {
@@ -2843,8 +2417,6 @@ mod tests {
             label.start.abs_diff(X1.x(LEFT_PAD) as usize) <= 2,
             "{label:?}"
         );
-        // Ink sits inside the advance, short of it by the side bearings: a face
-        // whose ink runs past the UI face's advance is not the UI face.
         let face = measure("Find:", body);
         let inked = label.len() as f32;
         assert!(
@@ -2852,7 +2424,6 @@ mod tests {
             "{label:?}: inside the UI face's {face} px advance"
         );
         assert!(label.len() < 5 * 9 * 3 / 4, "CONTROL: under the cells' run");
-        // The count ends where its cells do, at the face's width.
         let status = p.status_cols.clone().expect("a count");
         assert_eq!(text(&p.rows[p.field_row][status.clone()]), "2/18");
         let count = ink_span(
@@ -2868,7 +2439,6 @@ mod tests {
         );
         let face = measure("2/18", body);
         assert!(count.len() as f32 <= face && count.len() as f32 >= face - 4.0);
-        // The hints, a step below, their items a gap apart, above the seam.
         let hints = &bar.rows[p.hint_row.expect("a hint row")];
         let small = X1.hint().get();
         assert!(small < body, "the hints a step below");
@@ -2893,11 +2463,6 @@ mod tests {
     }
 
     /// THE QUERY BOX AND THE TOGGLES ARE FLUENT CONTROLS ([`fluent_bar`]): at
-    /// 100 % and 200 % each stands [`CONTROL_INSET_EPX`] off the seam above the
-    /// band and as far off the field row's foot, one height, its corners rounded
-    /// [`CONTROL_RADIUS_EPX`]; the box closes on its accent focus line inside
-    /// its corners. NEGATIVE CONTROL: the cells under them fill the row edge to
-    /// edge (the judge's chip spanned y25-47 under a y24 seam, square).
     #[test]
     fn the_box_and_the_toggles_are_inset_rounded_controls() {
         if !FIND_TOOLBAR {
@@ -2965,8 +2530,6 @@ mod tests {
     }
 
     /// AN ON TOGGLE IS DRAWN IN THE ACCENT ([`fluent_bar`]): its chip is the
-    /// band's accent with its word in the on-accent ink, dark or light, where
-    /// an off chip keeps the resting fill. NEGATIVE CONTROL: the off chip.
     #[test]
     fn an_on_toggle_is_drawn_in_the_accent() {
         use aterm_messages::ink::contrast;
@@ -3017,11 +2580,6 @@ mod tests {
     }
 
     /// THE QUERY BOX SCROLLS AND HIT-TESTS IN THE FACE IT DRAWS ([`well_scroll`],
-    /// [`char_at`], [`well_click`]): the caret stands the query's measured width
-    /// in; a query past the box scrolls by the least that keeps the caret in;
-    /// a click lands on the nearest character boundary, anywhere in the box,
-    /// the prompt's cells it took included. NEGATIVE CONTROL: one character per
-    /// terminal cell, the cell well's mapping, puts the same click short.
     #[test]
     fn the_query_box_scrolls_and_hit_tests_in_its_own_face() {
         if !FIND_TOOLBAR {
@@ -3052,7 +2610,6 @@ mod tests {
             "past: the end"
         );
         assert_eq!(char_at(&chars, 0, -3.0, 400.0, px), 0);
-        // A long query, the caret at its end: the least scroll that keeps it in.
         let long: Vec<char> = "search the screen and the scrollback "
             .repeat(8)
             .chars()
@@ -3073,7 +2630,6 @@ mod tests {
             0,
             "Home: the head"
         );
-        // Clicks: the box is the box, its inset over the prompt's cells too.
         assert!(
             well.x0 < X1.x(p.field_cols.start),
             "it starts in the prompt's cells"
@@ -3093,8 +2649,6 @@ mod tests {
     }
 
     /// THE COMPOSITION IS UNDERLINED UNDER ITS OWN CHARACTERS IN THE BOX
-    /// ([`fluent_bar`]), in the band's words, and nowhere else. NEGATIVE CONTROL:
-    /// with no composition the box carries no underline.
     #[test]
     fn the_composition_is_underlined_under_its_own_characters() {
         if !FIND_TOOLBAR {
@@ -3129,9 +2683,6 @@ mod tests {
     }
 
     /// UNDER A FORCED PALETTE THE BOX KEEPS AN EDGE ([`fluent_bar`]): every stock
-    /// High Contrast scheme sets the field and the band one colour, so the box
-    /// carries a border in the window text and no accent focus line, and an on
-    /// toggle is `COLOR_HIGHLIGHT`.
     #[test]
     fn the_box_keeps_an_edge_under_a_forced_palette() {
         use aterm_messages::ink::contrast;
@@ -3177,7 +2728,6 @@ mod tests {
     }
 
     /// THE CELLS STAND where no UI face is installed, for a query no face draws
-    /// (a colour emoji), and off Windows ([`fluent_ready`]).
     #[test]
     fn the_cells_stand_without_a_face_for_the_query() {
         let bar = |query: &str| {

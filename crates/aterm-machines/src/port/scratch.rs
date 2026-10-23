@@ -292,6 +292,7 @@ mod tests {
         assert_eq!(std::fs::read(&dest).unwrap(), b"first");
         let live = Live {
             agent_exe: PathBuf::from("/unused-by-this-file-fixture"),
+            ..Live::new()
         };
         let source = dir.path().join("source");
         std::fs::write(&source, b"copied").unwrap();

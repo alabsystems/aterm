@@ -1,13 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The Muse Code lane's driver over scripted screens and a scripted kernel:
-//! a stand-in aterm instance on a real socket (every request recorded,
-//! nothing typed anywhere) whose screen is the shell after the Muse's exit,
-//! and the relaunched Muse Code once the relaunch line is typed; a kernel
-//! whose Muse has exited and whose relaunch appears under the shell when its
-//! line is; and the session's own lock and log on disk, as 1.4.10-R6427.1
-//! writes them. Screens are 1.4.10's (`aterm-phase` fixtures).
+//! Muse Code upgrade driver tests over scripted screens and kernel.
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -59,7 +53,6 @@ fn fixture_rows(text: &str) -> Vec<String> {
 }
 
 /// The relaunched Muse Code at rest on its replayed turn: 1.4.10's end of a
-/// turn, the cursor on its empty caret row.
 fn muse_idle() -> String {
     let rows = fixture_rows(aterm_phase::muse::fixtures::END_OF_TURN_1_4_10);
     let caret = rows
@@ -79,9 +72,6 @@ fn shell_after() -> String {
 }
 
 /// The shell integration's last two blocks: the command that ran the Muse
-/// (block 7) finished with `exit`, then the prompt entering — `word` false:
-/// the prompt not back yet; `later`: another command's block (9, a failure)
-/// the newest since.
 fn blocks(exit: i64, word: bool, later: bool) -> String {
     let entering = r#"{"id":8,"state":"entering","exit":null,"prompt":4,"cmd":4,"cmdcol":2,"out":null,"end":null,"cmdline":""}"#;
     if !word {
@@ -96,8 +86,6 @@ fn blocks(exit: i64, word: bool, later: bool) -> String {
 }
 
 /// The shell's blocks once the relaunch line ran in block 8 (the prompt
-/// block [`blocks`] names newest): `exit` `None` while its Muse runs, else
-/// that line's status and the prompt after it.
 fn line_blocks(exit: Option<i64>) -> String {
     let line = r#""cmdline":" ( cd -- '/w/proj' && XDG_DATA_HOME=/h exec '/p/agents/muse' 'resume' 's1' )""#;
     match exit {
@@ -111,8 +99,6 @@ fn line_blocks(exit: Option<i64>) -> String {
 }
 
 /// What the stand-in serves once the relaunch line is typed, which a test
-/// may change between attempts: `None` serves as before the line (the
-/// screen: 1.4.10 idle at the end of a turn).
 #[derive(Default)]
 struct After {
     /// The relaunched Muse's screen.
@@ -134,7 +120,6 @@ struct World {
 }
 
 /// A control socket at `<dir>/t.sock` standing in for the aterm instance of
-/// [`TAB`], and the requests it was asked, in order.
 fn instance(dir: &Path, w: World) -> (String, crate::harness::FakeInstanceLog) {
     crate::harness::fake_instance(&dir.join("t.sock"), TOKEN, move |line| {
         let verb = line
@@ -157,7 +142,6 @@ fn instance(dir: &Path, w: World) -> (String, crate::harness::FakeInstanceLog) {
                     w.after_exit.clone()
                 }
             ),
-            // A typed draft's colour, never the hint's.
             "cell" => "OK ❯ ccd3db 1e1e1e none".to_string(),
             "status" => served(&after.status, &w.status),
             "help" if line.contains("help key") => {
@@ -180,10 +164,6 @@ fn instance(dir: &Path, w: World) -> (String, crate::harness::FakeInstanceLog) {
 }
 
 /// The scripted kernel: [`TUI`] was [`SHELL`]'s foreground job and has
-/// exited; its relaunch [`NEW`] appears under the shell when its line is
-/// typed, holding the session's lock. `holder`: another live process holds
-/// that lock (a person's own `muse resume` elsewhere); `knobs`: how the
-/// relaunch goes otherwise.
 struct Script {
     exited: Arc<AtomicBool>,
     relaunched: Arc<AtomicBool>,
@@ -197,13 +177,11 @@ struct Script {
 }
 
 /// What a test varies about the relaunch, each `false`/`None` as the plain
-/// relaunch goes.
 #[derive(Clone, Debug, Default)]
 struct Knobs {
     /// The host's roster never shows [`NEW`] leading the tab.
     out_of_tab: bool,
     /// [`NEW`] is listed under the shell but gone at once (a resume Muse
-    /// refused, a crash at its start).
     new_dies: bool,
     /// No `muse` ever comes up under the shell.
     noappear: bool,
@@ -216,7 +194,6 @@ struct Knobs {
     /// Who holds the session's lock cannot be read.
     holders_unreadable: bool,
     /// Another live process ([`OTHER`]) holds the lock from this read of
-    /// it on (1 the first).
     holder_from_read: Option<usize>,
 }
 
@@ -335,8 +312,6 @@ impl MuseKernel for Script {
 }
 
 /// The session's log as 1.4.10 writes its lifecycle: its start (naming the
-/// workspace), then a clean end (`clean`), or none (`crash`), or nothing at
-/// all (`none`: no log).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Log {
     Clean,
@@ -358,8 +333,6 @@ fn log_text(log: Log) -> Option<String> {
 }
 
 /// One scripted rig: a data home with the session's lock and log, a managed
-/// store build and its twin, the state directory, the stand-in instance and
-/// the kernel.
 struct Rig {
     dir: ScratchDir,
     opts: Opts,
@@ -371,14 +344,11 @@ struct Rig {
     twin: PathBuf,
     after: Arc<Mutex<After>>,
     /// The harness's waits on the test's thread run on their own steps
-    /// ([`crate::harness::relaunch::virtual_waits`]): every stand-in here answers at once.
     _waits: crate::harness::relaunch::VirtualWaits,
 }
 
 impl Rig {
     /// `status`: the exit status the shell's block names; `word`, `later` as
-    /// [`blocks`]; `lock_names`: the lock still names the Muse's pid (a
-    /// clean `/exit` truncates it).
     fn new(name: &str, status: i64, word: bool, later: bool, log: Log, lock_names: bool) -> Rig {
         let dir = scratch(name);
         let base = std::fs::canonicalize(&*dir).expect("canonical scratch");
@@ -472,9 +442,6 @@ impl Rig {
     }
 
     /// The snapshot the host took of the Muse while it ran: launched by its
-    /// store path with the stub's `--base-url`, `--yolo` and a Session Name,
-    /// its session `session` (`None`: no witness), its workspace read off the
-    /// log, the block it ran in.
     fn snap(&self, session: Option<&str>) -> Snapshot {
         Snapshot {
             stored_login: false,
@@ -543,12 +510,6 @@ impl Drop for Rig {
 }
 
 /// A CRASH (SIGKILL, 137) IS RELAUNCHED ON ITS SESSION, IN ITS WORKSPACE, ON
-/// THE MANAGED TWIN: the line `cd`s to the session's workspace and types the
-/// twin `resume <uuid>` with the launch's `--base-url` carried, behind the
-/// data home the process ran under — never the store path argv[0] named, its
-/// `--yolo` or its Session Name — and once the relaunched Muse holds the
-/// session and reads idle, the continuation is typed and submitted
-/// (`continued`). The record is keyed `muse-<tab>`, its words Muse Code's.
 #[test]
 fn a_crashed_muse_is_relaunched_on_its_session_in_its_workspace() {
     let rig = Rig::new("crash", 137, true, false, Log::Crash, true);
@@ -607,10 +568,6 @@ fn a_crashed_muse_is_relaunched_on_its_session_in_its_workspace() {
 }
 
 /// The exit's word is the shell's: the finished block that ends where the
-/// entering prompt begins, its `exit` — of the block the Muse ran in where
-/// the snapshot named it. None while the prompt is not back, none for a
-/// block that ended elsewhere, none for an ERR. NEGATIVE CONTROL: another
-/// command's block newest since is read only where no block was named.
 #[test]
 fn the_muse_exit_is_read_off_its_command_block() {
     assert_eq!(
@@ -644,10 +601,6 @@ fn the_muse_exit_is_read_off_its_command_block() {
 }
 
 /// ITS OWN EXIT AND SOMEONE'S SIGINT OR SIGTERM ARE LEFT, and so is a start
-/// Muse REFUSED (1, 2): never retried as a crash (critic X4). SIGHUP is a
-/// crash (no clean end written). NEGATIVE CONTROL: a table that knows only
-/// its own exit and the signals someone sends would retry the refusal and
-/// leave the SIGHUP; nothing is typed for any left exit.
 #[test]
 fn an_own_exit_a_signal_and_a_refused_start_are_never_relaunched() {
     for (status, want) in [
@@ -691,9 +644,6 @@ fn an_own_exit_a_signal_and_a_refused_start_are_never_relaunched() {
 }
 
 /// NO SHELL WORD: the witnessed session's own log decides at the attempt —
-/// its clean end left, its start with no end relaunched — and with no
-/// witness, or no log either, nothing is relaunched. NEGATIVE CONTROL: the
-/// look alone reads no word (`Unread`).
 #[test]
 fn with_no_shell_word_the_sessions_log_decides() {
     for (log, witnessed, want) in [
@@ -715,9 +665,6 @@ fn with_no_shell_word_the_sessions_log_decides() {
 }
 
 /// A crash whose process held no proven session is relaunched by nothing
-/// (a fresh `muse` would start another session), and neither is one whose
-/// session's directory is gone. NEGATIVE CONTROL: the same crash with its
-/// witness is relaunched.
 #[test]
 fn no_witness_no_relaunch() {
     let rig = Rig::new("unwitnessed", 137, true, false, Log::Crash, true);
@@ -738,10 +685,6 @@ fn no_witness_no_relaunch() {
 }
 
 /// A TAB'S OWN MUSE CODE (`aterm -e muse`, `exec muse`: shell
-/// [`crate::harness::relaunch::NO_SHELL`]) that crashed is relaunched by
-/// nothing: no shell is left in its tab to type the line into, and its plan
-/// is refused for good, never waited on. NEGATIVE CONTROL: the same crash
-/// with a shell is relaunched.
 #[test]
 fn a_tabs_own_muse_is_relaunched_by_nothing() {
     use crate::harness::relaunch::NO_SHELL;
@@ -772,8 +715,6 @@ fn a_tabs_own_muse_is_relaunched_by_nothing() {
 }
 
 /// A SESSION ANOTHER LIVE PROCESS HOLDS opens Muse Code's picker, never a
-/// resume: the relaunch waits, nothing typed. NEGATIVE CONTROL: the holder
-/// gone, the same record is relaunched.
 #[test]
 fn a_held_session_is_never_typed_at() {
     let mut rig = Rig::new("held", 137, true, false, Log::Crash, true);
@@ -787,9 +728,6 @@ fn a_held_session_is_never_typed_at() {
 }
 
 /// A launch whose flags a relaunch cannot carry is refused with its word,
-/// nothing typed; a store build with no twin to type is relaunched by
-/// nothing. NEGATIVE CONTROL: a program run from no store is relaunched on
-/// itself.
 #[test]
 fn an_uncarryable_launch_and_a_missing_twin_are_refused() {
     let rig = Rig::new("worktree", 137, true, false, Log::Crash, true);
@@ -831,8 +769,6 @@ fn an_uncarryable_launch_and_a_missing_twin_are_refused() {
 }
 
 /// THE WITNESS: the one session-depth lock the process holds open whose body
-/// names its pid; a subagent's lock and a truncated one name nothing.
-/// NEGATIVE CONTROLS: a lock naming another pid, two locks naming it.
 #[test]
 fn the_witness_is_the_held_lock_naming_the_pid() {
     let rig = Rig::new("witness", 0, true, false, Log::Crash, true);
@@ -863,7 +799,6 @@ fn the_witness_is_the_held_lock_naming_the_pid() {
             rig.data.to_string_lossy().into_owned()
         )]
     );
-    // A subagent's lock beside it names the pid too: never the session's.
     let sub = rig
         .lock
         .parent()
@@ -878,17 +813,12 @@ fn the_witness_is_the_held_lock_naming_the_pid() {
     k.exited.store(false, Ordering::SeqCst);
     let again = snapshot(&rig.opts, TAB, TUI, "b".into(), SHELL, &args, &k).expect("snap");
     assert_eq!(again.session.as_deref(), Some(S1), "the subagent's is not");
-    // Truncated: no session proven.
     std::fs::write(&rig.lock, "").expect("truncate");
     let none = snapshot(&rig.opts, TAB, TUI, "b".into(), SHELL, &args, &k).expect("snap");
     assert_eq!(none.session, None);
-    // Another pid's.
     std::fs::write(&rig.lock, "pid=7\n").expect("other");
     let other = snapshot(&rig.opts, TAB, TUI, "b".into(), SHELL, &args, &k).expect("snap");
     assert_eq!(other.session, None);
-    // Naming the pid but not held open by it (the `pid=` a SIGTERM, SIGHUP
-    // or SIGKILL of an earlier process left): no session without the
-    // kernel's word too.
     std::fs::write(&rig.lock, format!("pid={TUI}\n")).expect("names it");
     let unheld = Script {
         files: vec![rig.lock.with_file_name("cron.db")],
@@ -899,9 +829,6 @@ fn the_witness_is_the_held_lock_naming_the_pid() {
     assert_eq!(stale.session, None, "a lock its process does not hold");
     let held = snapshot(&rig.opts, TAB, TUI, "b".into(), SHELL, &args, &k).expect("snap");
     assert_eq!(held.session.as_deref(), Some(S1), "the control: held");
-    // Two session-depth locks it holds, each naming it: neither is proven
-    // (exactly one names the session; the review of the rehome caught no test
-    // holding this).
     let second = rig
         .lock
         .parent()
@@ -924,7 +851,6 @@ fn the_witness_is_the_held_lock_naming_the_pid() {
         Some(S1),
         "the control: one names it"
     );
-    // `exec` is no TUI.
     let exec = atpkg::caller_shell::ProcArgs {
         argv: vec![
             rig.exe.to_string_lossy().into_owned(),
@@ -954,10 +880,6 @@ fn rig_kernel(rig: &Rig) -> Script {
 }
 
 /// THE FOLLOW: `/new` truncates the lock it leaves and writes the pid into
-/// the new session's, which the follow takes (no `lsof`), with that
-/// session's workspace; an unmoved lock costs one read. NEGATIVE CONTROL: a
-/// lock naming the pid written before the process started is an earlier
-/// process's, never followed.
 #[test]
 fn the_follow_moves_with_new() {
     let rig = Rig::new("follow", 0, true, false, Log::Crash, true);
@@ -978,7 +900,6 @@ fn the_follow_moves_with_new() {
         snap.muse().and_then(|r| r.lock.clone()),
         Some(fresh.join(mz::LOCK))
     );
-    // An earlier process's lock naming the same pid number.
     let mut early = rig.snap(Some(S1));
     if let AgentRun::Muse(run) = &mut early.run {
         run.started_ms = (now_s() + 3600) * 1000;
@@ -988,9 +909,6 @@ fn the_follow_moves_with_new() {
 }
 
 /// A RESTORED LAYOUT'S RELAUNCH (aterm's own end): no shell word is asked,
-/// the session is found again by its id wherever its date shard is, and the
-/// relaunch says aterm ended. NEGATIVE CONTROL: the same snapshot's own exit,
-/// clean, is left.
 #[test]
 fn aterm_ending_relaunches_the_restored_session() {
     let rig = Rig::new("host", 0, true, false, Log::Clean, false);
@@ -1012,9 +930,6 @@ fn aterm_ending_relaunches_the_restored_session() {
 }
 
 /// The records are the lane's: keyed `muse-<tab>`, read back by their tab,
-/// never a Claude Code conversation's key; a settled record of a tab proven
-/// gone, unwritten a week, is pruned. NEGATIVE CONTROLS: a live tab's, an
-/// in-flight one, and another lane's are kept.
 #[test]
 fn records_are_keyed_by_tab_and_pruned_once_gone() {
     assert_eq!(key(TAB), format!("muse-{TAB}"));
@@ -1039,8 +954,6 @@ fn records_are_keyed_by_tab_and_pruned_once_gone() {
             .expect("aged");
         path
     };
-    // Its data home and the homes its line carries round-trip; a record of
-    // another lane writes neither key.
     let homed = St {
         agent: Agent::Muse,
         tab: TAB.to_string(),
@@ -1078,8 +991,6 @@ fn records_are_keyed_by_tab_and_pruned_once_gone() {
 }
 
 /// A rig for the relaunch's own end: the crash relaunched (`hand_back` as
-/// the host types it), its waits short — every one here ends on its bound
-/// only where nothing is ever coming.
 fn relaunch_rig(name: &str, hand_back: bool, knobs: Knobs) -> Rig {
     let mut rig = Rig::new(name, 137, true, false, Log::Crash, true);
     rig.opts.hand_back = hand_back;
@@ -1088,7 +999,6 @@ fn relaunch_rig(name: &str, hand_back: bool, knobs: Knobs) -> Rig {
     rig.opts.timings.carry_settle = Duration::from_millis(400);
     rig.opts.timings.muse_up = Duration::from_millis(400);
     rig.opts.timings.muse_lock = Duration::from_millis(300);
-    // A relaunched Muse that never stays up leaves the shell's prompt.
     if knobs.new_dies || knobs.noappear {
         rig.after.lock().expect("after").screen = Some(shell_after());
     }
@@ -1127,14 +1037,6 @@ impl Rig {
 }
 
 /// A RESUME MUSE REFUSED IS NEVER TYPED AGAIN (critic X4, the review's
-/// first finding): the relaunched Muse came up under the shell and was gone
-/// before it led the tab — its line's own block then said `1` (`retained
-/// session not found`, `has no saved log`) — and the exit's next attempt,
-/// closing that record as gone before its continuation, reads that line's
-/// word: `refused:resume-refused`, the line typed once. So is a line the
-/// shell could not run (a `cd` that failed exits `1`, no program `127`).
-/// NEGATIVE CONTROL: the same relaunch whose line ended in a crash (`137`)
-/// is typed again.
 #[test]
 fn a_relaunch_muse_refused_is_never_typed_again() {
     for (exit, want, lines) in [
@@ -1142,8 +1044,6 @@ fn a_relaunch_muse_refused_is_never_typed_again() {
         (2, "refused:resume-refused", 1),
         (127, "refused:resume-refused", 1),
         (0, "ended:relaunch-ended", 1),
-        // Typed again; that relaunch too is gone at once, its own line
-        // (block 9) still running as this attempt looks.
         (137, "wait:resume", 2),
     ] {
         let rig = relaunch_rig(
@@ -1155,20 +1055,15 @@ fn a_relaunch_muse_refused_is_never_typed_again() {
             },
         );
         let snap = rig.snap(Some(S1));
-        // The relaunched Muse was listed, then gone before it led the tab;
-        // its line still runs as the first attempt looks.
         rig.line_ran(None);
         let first = rig.attempt(&snap, &ExitRecord::Crashed, ExitCause::Exit);
         assert_eq!(first.step, "wait:resume", "{exit}: {first:?}");
         assert_eq!(rig.lines(), 1);
         assert_eq!(rig.state().relaunched_pid, NEW, "found, on the record");
-        // Its line ended with `exit`; the exit is tried again.
         rig.line_ran(Some(exit));
         let again = rig.attempt(&snap, &ExitRecord::Crashed, ExitCause::Exit);
         assert_eq!(again.step, want, "{exit}: {again:?}");
         assert_eq!(rig.lines(), lines, "{exit}: {:#?}", rig.typed());
-        // A third try (the host's word for a refusal is final: Cannot)
-        // types nothing more either.
         if lines == 1 {
             let third = rig.attempt(&snap, &ExitRecord::Crashed, ExitCause::Exit);
             assert_eq!(third.step, want, "{exit}: {third:?}");
@@ -1186,19 +1081,12 @@ fn a_relaunch_muse_refused_is_never_typed_again() {
 }
 
 /// A RELAUNCH THAT NEVER COMES UP is decided by its line's own end AT ONCE
-/// — Muse refused it (`1`): `refused:resume-refused`, never waited out to
-/// the stale bound and typed again — and one whose line still runs past
-/// that bound with no Muse found relaunches nothing more
-/// (`refused:relaunch-unwitnessed`: a Muse it started may run there unseen,
-/// and a second line would open its picker). NEGATIVE CONTROL: a line that
-/// ended in a crash is closed as gone, and the next attempt types it again.
 #[test]
 fn a_relaunch_that_never_comes_up_is_never_typed_again_but_on_a_crash() {
     let knobs = Knobs {
         noappear: true,
         ..Knobs::default()
     };
-    // Refused at its start: decided by the first attempt itself.
     let rig = relaunch_rig("never-refused", true, knobs.clone());
     let snap = rig.snap(Some(S1));
     rig.line_ran(Some(1));
@@ -1211,7 +1099,6 @@ fn a_relaunch_that_never_comes_up_is_never_typed_again_but_on_a_crash() {
     let again = rig.attempt(&snap, &ExitRecord::Crashed, ExitCause::Exit);
     assert_eq!(again.step, "refused:resume-refused", "{again:?}");
     assert_eq!(rig.lines(), 1, "{:#?}", rig.typed());
-    // Its line still runs, nothing found, past the stale bound.
     let rig = relaunch_rig("never-stale", true, knobs.clone());
     let snap = rig.snap(Some(S1));
     rig.line_ran(None);
@@ -1225,7 +1112,6 @@ fn a_relaunch_that_never_comes_up_is_never_typed_again_but_on_a_crash() {
     let stale = rig.attempt(&snap, &ExitRecord::Crashed, ExitCause::Exit);
     assert_eq!(stale.step, "refused:relaunch-unwitnessed", "{stale:?}");
     assert_eq!(rig.lines(), 1, "{:#?}", rig.typed());
-    // NEGATIVE CONTROL: its line crashed.
     let rig = relaunch_rig("never-crashed", true, knobs);
     let snap = rig.snap(Some(S1));
     rig.line_ran(Some(137));
@@ -1240,10 +1126,6 @@ fn a_relaunch_that_never_comes_up_is_never_typed_again_but_on_a_crash() {
 }
 
 /// THE TYPING FENCE NAMES WHAT IT REFUSES, each arm on its own (the review of
-/// the rehome: Muse's reader draws no composer under a box, so the box case
-/// above was refused as a draft whatever the box arm said): a box `box`, a
-/// turn running or stopping `busy`, a draft `draft`. NEGATIVE CONTROL: the
-/// relaunched Muse at rest is fenced on its read.
 #[test]
 fn the_typing_fence_names_what_it_refuses() {
     use aterm_phase::muse::fixtures as fx;
@@ -1274,12 +1156,6 @@ fn the_typing_fence_names_what_it_refuses() {
 }
 
 /// NOTHING IS TYPED INTO A RELAUNCHED MUSE THAT IS NOT IDLE, EMPTY AND
-/// UNHELD: a turn running (1.4.10's status row), a draft in its composer, a
-/// box over it, its run still stopping (`interrupting run`), an idle read
-/// with no evidence, a person's hand within the grace, a process the
-/// host's roster does not show leading the tab, or one that does not hold
-/// the session's lock — each leaves the continuation untyped. NEGATIVE
-/// CONTROL: the plain relaunch types it (`continued`).
 #[test]
 fn no_continuation_into_a_busy_drafted_or_held_muse() {
     use aterm_phase::muse::fixtures as fx;
@@ -1291,7 +1167,6 @@ fn no_continuation_into_a_busy_drafted_or_held_muse() {
             .unwrap_or(rows.len().saturating_sub(1));
         screen_json(&rows, (caret, 2), 20)
     };
-    // An idle read with no evidence: the reply's next row unmeasured.
     let unknown = {
         let mut rows = fixture_rows(fx::END_OF_TURN_1_4_10);
         let reply = rows
@@ -1371,10 +1246,6 @@ fn no_continuation_into_a_busy_drafted_or_held_muse() {
 }
 
 /// ONLY OUR OWN RELAUNCH IS ADOPTED: a `muse` under the shell resuming
-/// another session, or one resuming this session that is no child of the
-/// shell the line was typed at, is never taken for the relaunch — nothing
-/// adopted, nothing typed into it. NEGATIVE CONTROL: the shell's child
-/// resuming the session is adopted.
 #[test]
 fn only_the_lines_own_muse_is_adopted() {
     let other_session = Knobs {
@@ -1410,10 +1281,6 @@ fn only_the_lines_own_muse_is_adopted() {
 }
 
 /// WHO HOLDS THE SESSION IS READ RIGHT BEFORE THE LINE TOO: a holder that
-/// appears after the relaunch's first look (a person's own `muse resume`
-/// elsewhere) leaves the line untyped, and so does a lock whose holders
-/// cannot be read (read as held, never as free). NEGATIVE CONTROL: free at
-/// both looks, the line is typed.
 #[test]
 fn the_sessions_holders_are_read_again_right_before_the_line() {
     for (name, knobs, want) in [
@@ -1450,10 +1317,6 @@ fn the_sessions_holders_are_read_again_right_before_the_line() {
 }
 
 /// THE EXPLICIT RESTART IS NOT CARRIED FOR A MUSE CODE (the review of the
-/// lane): what a SIGTERM does to one mid-turn — the stall's case — is
-/// unmeasured, so the act answers `restart unavailable` and the stall's
-/// remedy warns instead of ending it. NEGATIVE CONTROL: the very snapshot's
-/// crash is its lane's to relaunch.
 #[test]
 fn the_explicit_restart_is_not_carried_for_a_muse() {
     let rig = Rig::new("restart", 137, true, false, Log::Crash, true);
@@ -1467,12 +1330,6 @@ fn the_explicit_restart_is_not_carried_for_a_muse() {
 }
 
 /// Each agent's foreground process goes to its own lane's reader: agy to the
-/// agy lane's and an image itself named `gemini` to none ([`NO_LANE`]: Gemini
-/// CLI runs as `node`, read by its argv) — never to the Muse Code lane's, nor
-/// read as Claude Code. NEGATIVE CONTROLS: a Muse Code's store
-/// build and its twin go to its lane; a vendor Codex to none (the Codex
-/// screen lane's retirement: only an ALab image is codex-alab's); an unnamed
-/// program to Claude Code's records.
 #[test]
 fn each_image_goes_to_its_own_lanes_reader() {
     use crate::harness::relaunch::{SnapshotLane, snapshot_lane};
@@ -1493,18 +1350,6 @@ fn each_image_goes_to_its_own_lanes_reader() {
 }
 
 /// Tier-1 of `HarnessMuseExitWitness` (aterm-models-harness
-/// `harness_muse_exit_witness_model`): every look of the model — a crash
-/// (`137`), its own exit (`0`, its lock truncated), someone's signal
-/// (`143`), a refused start's status (`1`); witnessed or not; the shell's
-/// word drawn, not yet, or another command's block newest since — is
-/// replayed through the real `look_at_exit` and `exit_record` over a
-/// stand-in tab, and keeps what the model's does; every attempt goes through
-/// the real `after_exit`, the session's log on disk as the exit writes it,
-/// and relaunches exactly where the model's `Decide` does. Negative
-/// controls: where the `Buggy = 1` model looks at the exit as Claude Code's
-/// (`LookAsClaude`), reads a refusal as a crash (`RefusalAsCrash`), decides
-/// on the look alone (`DecideOnLook`) or relaunches with no witness
-/// (`DecideFresh`), the real code decides otherwise.
 #[test]
 fn tier1_the_real_muse_exit_read_conforms_to_the_model() {
     use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -1517,8 +1362,6 @@ fn tier1_the_real_muse_exit_read_conforms_to_the_model() {
             3 => 143,
             _ => 1,
         };
-        // The exit's log: a clean end for its own exit or someone's signal,
-        // its start with no end for a crash and a refused status.
         let log = if matches!(exit, 2 | 3) {
             Log::Clean
         } else {
@@ -1536,9 +1379,6 @@ fn tier1_the_real_muse_exit_read_conforms_to_the_model() {
     let mut attempted = BTreeSet::new();
     let mut queue = VecDeque::from([m.init_state()]);
     let (mut looks, mut attempts) = (0, 0);
-    // Each mutant's catches: every one must be caught somewhere, each on
-    // its own (the model's sweep checks the invariants against all of them
-    // together).
     let mut caught: BTreeMap<&str, usize> = BTreeMap::new();
     while let Some(st) = queue.pop_front() {
         if !seen.insert(st.clone()) {
@@ -1568,7 +1408,6 @@ fn tier1_the_real_muse_exit_read_conforms_to_the_model() {
                 |_| true,
             );
             assert_eq!(left, kept(after["kept"]), "the look at {st:?}");
-            // Negative controls: the Buggy looks at the same point.
             for mutant in ["LookAsClaude", "RefusalAsCrash"] {
                 let mut wrong = st.clone();
                 if buggy.fire(mutant, &mut wrong) && wrong["kept"] != after["kept"] {
@@ -1605,8 +1444,6 @@ fn tier1_the_real_muse_exit_read_conforms_to_the_model() {
             }
         }
     }
-    // Four exits, witnessed or not, each told, untold, and told with another
-    // command run since.
     assert_eq!(looks, 24, "{seen:?}");
     assert!(attempts > 0, "no attempt replayed");
     for mutant in [
@@ -1622,6 +1459,5 @@ fn tier1_the_real_muse_exit_read_conforms_to_the_model() {
     }
 }
 
-// The live upgrade's quiet flow, over the same stand-in tab and kernel shapes.
 #[path = "upgrade_muse_live_drive_tests.rs"]
 mod live_tests;

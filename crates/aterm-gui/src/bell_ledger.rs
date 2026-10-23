@@ -7,8 +7,11 @@
 //! sound plays and records the bell here: when, the program in front, and
 //! what the sound gates made of it ([`BellSound`]). `status` and the survey
 //! print it (`bells= bells_sounded= last_bell=`, [`BellRead::wire`]).
-//! BELs under 100 ms apart reach `on_bell` once: the engine coalesces them
-//! before its bell callback, so a count here is of bells, not BEL bytes.
+//! A BEL reaches `on_bell` at most once per 100 ms: the engine's throttle,
+//! ahead of its bell callback, drops a BEL under 100 ms after the last one
+//! that rang, so a burst is one bell and a sustained flood one every 100 ms
+//! or so (aterm-core's `bels_ring_at_most_once_per_hundred_ms`). A count
+//! here is of bells that rang, not BEL bytes.
 //!
 //! A FACT FOR LATER, NEVER AN ALERT: nothing here raises attention, posts a
 //! message or moves a need, and recording changes nothing the bell does —

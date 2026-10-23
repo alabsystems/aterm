@@ -207,7 +207,7 @@ impl ColorRepr {
     /// Whether the carry holds a pushed XTPUSHCOLORS stack, in either shape.
     #[inline]
     #[must_use]
-    pub fn has_stack(&self) -> bool {
+    pub const fn has_stack(&self) -> bool {
         !self.stack.is_empty() || !self.stack_overrides.is_empty()
     }
 

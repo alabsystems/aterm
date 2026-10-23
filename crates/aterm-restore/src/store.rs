@@ -1,42 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! What a writer and a reader reach a region through.
-//!
-//! The region is shared memory written by several threads of one process (the parse
-//! thread, the gather thread, the journal worker, the host's resize and config
-//! paths), each owning its own words, and read only after its writer is dead. So
-//! the store's methods take `&self`: the memory is shared, not owned, and each word
-//! has one writer by protocol (the plan's §2.2 table), not by borrow.
-//!
-//! Two kinds of access, as in the shared mapping:
-//!
-//! - plain byte copies ([`RegionStore::write`], [`RegionView::read`]) for record
-//!   bodies, ordered by nothing on their own;
-//! - word stores with release semantics and loads with acquire semantics
-//!   ([`RegionStore::store_u64_release`], [`RegionView::load_u64_acquire`]) for the
-//!   header words. A commit word stored with release after a copy makes the copy
-//!   visible to whoever loads the word with acquire.
-//!
-//! A process that dies loses no store it already made to its memory, so the only
-//! hazard a reader faces is a writer stopped between two of these calls: what
-//! [`CountdownStore`] reproduces, by executing the first `k` primitive stores and
-//! dropping the rest.
-//!
-//! A reader needs only [`RegionView`]: the recovery never writes, and a read-only
-//! mapping (which the kernel refuses to map writable) implements nothing more.
-//!
-//! A writer's region is wrapped twice in the window: in [`Touched`], which counts the
-//! pages its stores have made resident (what the region costs, which a memory shed
-//! weighs), and in [`Shared`], which lets the threads that write it share it and lets the
-//! shed put a fresh region in its place ([`Shared::swap_in`]).
+//! Shared-memory region traits ([`RegionView`], [`RegionView::read`],
+//! [`RegionView::load_u64_acquire`], [`RegionStore::write`], [`RegionStore::store_u64_release`])
+//! and wrappers ([`CountdownStore`], [`Touched`], [`Shared`], [`Shared::swap_in`]).
 
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use crate::layout::PAGE;
 
-/// Why an access was refused. Every access is bounds-checked; none panics.
+/// Why an access was refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StoreError {
     /// `[at, at + len)` is not inside the region.
@@ -80,36 +54,28 @@ pub trait RegionView {
     /// Copy `out.len()` bytes at `at` into `out`.
     ///
     /// # Errors
-    ///
     /// [`StoreError::OutOfBounds`] when the range is not inside the region.
     fn read(&self, at: usize, out: &mut [u8]) -> Result<(), StoreError>;
 
     /// Load the little-endian `u64` word at `at` (8-aligned) with acquire semantics.
     ///
     /// # Errors
-    ///
     /// [`StoreError::Misaligned`] or [`StoreError::OutOfBounds`].
     fn load_u64_acquire(&self, at: usize) -> Result<u64, StoreError>;
 }
 
-/// A region a writer can change. Each call is one primitive store, the granularity at
-/// which a writer can die.
+/// A region a writer can change.
 pub trait RegionStore: RegionView {
     /// Copy `bytes` to `at`, with no ordering of its own.
     ///
     /// # Errors
-    ///
     /// [`StoreError::OutOfBounds`], or [`StoreError::ReadOnly`] for a reader's mapping.
     fn write(&self, at: usize, bytes: &[u8]) -> Result<(), StoreError>;
 
-    /// Store the little-endian `u64` word at `at` (8-aligned) with release semantics:
-    /// every write and store this thread made before it is visible to a thread whose
-    /// acquire load sees it.
+    /// Store the little-endian `u64` word at `at` (8-aligned) with release semantics.
     ///
     /// # Errors
-    ///
-    /// [`StoreError::Misaligned`], [`StoreError::OutOfBounds`] or
-    /// [`StoreError::ReadOnly`].
+    /// [`StoreError::Misaligned`], [`StoreError::OutOfBounds`] or [`StoreError::ReadOnly`].
     fn store_u64_release(&self, at: usize, value: u64) -> Result<(), StoreError>;
 }
 
@@ -129,19 +95,7 @@ fn word_at(at: usize, region: usize) -> Result<(), StoreError> {
     span(at, 8, region).map(|_| ())
 }
 
-/// A region in this process's heap: the shared mapping's semantics without a mapping.
-///
-/// The bytes sit behind one mutex, so a copy is one `memcpy` and every access is
-/// ordered as the mapping's release stores and acquire loads are (the lock's release
-/// and acquire are at least that strong). A mutex rather than atomic words because the
-/// tail tap copies every PTY byte once: word-at-a-time atomic copies cost the parse
-/// thread a quarter of its throughput in the `crash-restore` perf lane, a memcpy well
-/// under the plan's 3% (writers of different words never wait long: the gather thread's
-/// one store per read is the only other writer while output flows).
-///
-/// The tests, the benches and a window without a keeper use it; the window's shared
-/// region implements the same traits over its mapping (`aterm_uds::shm::Region`, below),
-/// whose copies are a raw `memcpy` too.
+/// A region in this process's heap.
 #[derive(Debug)]
 pub struct VecStore {
     bytes: Mutex<Vec<u8>>,
@@ -159,13 +113,11 @@ impl VecStore {
     }
 
     /// The bytes, whatever a panicking holder left (every access is a whole copy or a
-    /// whole word, so there is no half-made state to refuse).
     fn lock_bytes(&self) -> MutexGuard<'_, Vec<u8>> {
         self.bytes.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// A copy of every byte, for a test that recovers from a snapshot while the writer
-    /// goes on.
+    /// A copy of every byte, for a test that recovers from a snapshot while the writer goes on.
     #[must_use]
     pub fn snapshot(&self) -> Self {
         Self {
@@ -224,22 +176,7 @@ impl RegionStore for VecStore {
     }
 }
 
-/// One region several threads write, each its own words (the plan's §2.2 table: the
-/// parse thread's tail and keyframes, the gather thread's `stream_gathered`, the host's
-/// resize, config and cell-size words): the store behind one lock, taken for each
-/// primitive store and released after it.
-///
-/// The window's mapping is `Send` and not `Sync` (`aterm_uds::shm`: a plain copy two
-/// threads race is undefined behaviour, so `&Region` cannot be shared), and this is the
-/// one way to share it, as [`VecStore`] shares its bytes: a lock around a `memcpy`
-/// measured at no cost to the parse thread's throughput where word-at-a-time atomic
-/// copies cost a quarter of it. Each call is still exactly one of the inner store's
-/// primitives, so a writer that dies between two calls leaves what the protocols
-/// promise, and a thread that dies holding the lock (a panic mid-copy) leaves a lock
-/// the next caller takes over, as `VecStore`'s does: every access is a whole copy or a
-/// whole word, so there is no half-made state to refuse.
-///
-/// Clones share the region; the last one drops it (for the mapping: unmaps it).
+/// One region several threads write, each its own words.
 #[derive(Debug)]
 pub struct Shared<S> {
     inner: std::sync::Arc<Mutex<S>>,
@@ -269,30 +206,15 @@ impl<S: RegionView> Shared<S> {
         self.inner.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Run `f` over the inner store under the lock (a test that snapshots a heap region
-    /// while its writer goes on; the window's read of how many pages its region touched).
+    /// Run `f` over the inner store under the lock.
     pub fn with<R>(&self, f: impl FnOnce(&S) -> R) -> R {
         f(&self.lock())
     }
 
-    /// Put `store` where the region every clone shares was, run `seed` on it in the same
-    /// hold of the lock, and hand back the region it replaced: what the window's memory
-    /// shed does to free a session's history ring (`aterm-gui`'s `crash_restore`), since
-    /// shared pages a region has touched stay resident for as long as the region lives
-    /// (`madvise` cannot give them back) and only a new region drops them.
-    ///
-    /// Every clone reaches the new region from its next primitive on, so a thread that
-    /// writes its own word through a clone (the gather thread's count) needs no new handle.
-    /// A primitive store lands wholly in one region or the other, never half in each. What
-    /// `seed` stores is in the new region before any other thread's next store is: the
-    /// gather thread's running count goes there in the hold of the swap, so a count stored
-    /// by a read the swap overtook can only be a larger one, never an older value written
-    /// over the newer.
+    /// Put `store` in place of the region every clone shares.
     ///
     /// # Errors
-    ///
-    /// `store` back, untouched, when its length is not the region's: every clone's bounds
-    /// checks were taken against that length.
+    /// Returns `store` untouched when its length differs.
     pub fn swap_in(&self, store: S, seed: impl FnOnce(&S)) -> Result<S, S> {
         if store.len() != self.len {
             return Err(store);
@@ -327,31 +249,7 @@ impl<S: RegionStore> RegionStore for Shared<S> {
     }
 }
 
-/// A writer's region that counts the pages it has written: what the region costs the
-/// window that maps it (the crash-restore plan's increment 6, `metrics
-/// journal_resident_bytes=` and `status journal_bytes=`).
-///
-/// WHY PAGES WRITTEN, AND NOT A MEASURE OF RESIDENCY. A region is anonymous shared memory:
-/// a page exists from the first store that reaches it until the region dies, and nothing
-/// short of its death gives it back (`madvise` cannot release shared pages, the plan's
-/// D3 M-R5). The writer never reads its region back (it keeps a mirror of every word it
-/// owns), so the pages it has written are exactly the pages it made resident, and they
-/// only grow. Counting them here, at the one funnel every store goes through, needs no
-/// system call, holds for every section (the keyframe slots, the tail, the history ring,
-/// increment 7's control slot) without knowing their protocols, and reads the same in a
-/// test over a heap region as in the window over the mapping. The page is the layout's
-/// ([`PAGE`], Apple silicon's 16 KiB): on a host whose page is smaller, a partly written
-/// page is counted whole, an over-count of less than one page per touched run, never an
-/// under-count.
-///
-/// The count is kept beside a process-wide `meter`, when one is given, which this region
-/// adds each new page to and takes all of them back from when it is dropped (unmapped):
-/// the window's total over every region it maps, which a control verb reads with no
-/// session's lock.
-///
-/// Each new page costs one atomic `fetch_or` and two adds; a page already counted costs one
-/// relaxed load, so the tail tap's every-slice copy (whose pages are counted after the
-/// ring's first lap) pays a load per page it spans and nothing else.
+/// A writer's region that counts the pages it has written.
 #[derive(Debug)]
 pub struct Touched<S> {
     inner: S,
@@ -364,7 +262,7 @@ pub struct Touched<S> {
 }
 
 impl<S: RegionView> Touched<S> {
-    /// Count the pages written to `inner` (none yet), adding each to `meter` too.
+    /// Count the pages written to `inner` (none yet), adding each to `meter`.
     #[must_use]
     pub fn new(inner: S, meter: Option<Arc<AtomicU64>>) -> Self {
         let words = inner.len().div_ceil(PAGE).div_ceil(64);
@@ -376,19 +274,13 @@ impl<S: RegionView> Touched<S> {
         }
     }
 
-    /// The bytes of every page written so far: what this region keeps resident.
+    /// The bytes of every page written so far.
     #[must_use]
     pub fn touched_bytes(&self) -> usize {
         self.pages.load(Ordering::Relaxed).saturating_mul(PAGE)
     }
 
-    /// The bytes of written pages intersecting `[at, at + len)`, clipped to the
-    /// region. A partly covered page counts whole. Clearing its bytes does not
-    /// clear its bit: only dropping this region releases that page's accounting.
-    ///
-    /// Work is bounded by this region's allocated bitmap, even when the requested
-    /// range overflows or extends beyond it. This reads the counter bitmap, never
-    /// the underlying mapping or an operating-system residency query.
+    /// The bytes of written pages intersecting `[at, at + len)`, clipped to the region.
     #[must_use]
     pub fn touched_bytes_in(&self, at: usize, len: usize) -> usize {
         let region_len = self.inner.len();
@@ -430,9 +322,7 @@ impl<S: RegionView> Touched<S> {
         })
     }
 
-    /// The byte ranges of the pages a store has reached, in address order, each clipped to
-    /// the region: what an erase zeroes ([`crate::writer::erase_region`]) without making
-    /// resident a page nothing wrote.
+    /// The byte ranges of the pages a store has reached, in address order.
     pub fn written_pages(&self) -> impl Iterator<Item = std::ops::Range<usize>> + '_ {
         let len = self.inner.len();
         (0..len.div_ceil(PAGE))
@@ -512,18 +402,6 @@ impl<S: RegionStore> RegionStore for Touched<S> {
 }
 
 /// The window's region: the shared mapping itself (`aterm_uds::shm`), read-write in the window
-/// that journals the session and read-only in the one that restores it.
-///
-/// The mapping's accessors are already this trait's, each bounds- and alignment-checked; this
-/// only names their refusals in the store's words. The words are atomic `u64`s with the release
-/// and acquire orderings the trait promises, and the copies are raw `memcpy`s that hand out no
-/// reference into the mapping (every `unsafe` stays in aterm-uds, so this crate keeps
-/// `forbid(unsafe_code)`). The mapping is `Send` but not `Sync`, because a plain copy two
-/// threads race is undefined behaviour: a writer several threads share goes behind one lock, as
-/// [`VecStore`]'s bytes do (atomic word copies measured at a quarter of the parse thread's
-/// throughput; the lock and a `memcpy` at none). A read-only mapping refuses every
-/// store as [`StoreError::ReadOnly`]: a restorer that tried one is a bug, never a write into the
-/// dead window's words, and the kernel would refuse the page anyway.
 #[cfg(unix)]
 impl RegionView for aterm_uds::shm::Region {
     fn len(&self) -> usize {
@@ -562,14 +440,7 @@ impl From<aterm_uds::shm::AccessError> for StoreError {
     }
 }
 
-/// A [`VecStore`] that executes only its first `budget` primitive stores (each
-/// [`RegionStore::write`] and each [`RegionStore::store_u64_release`] is one) and
-/// silently drops the rest: the writer carries on as if nothing happened, and the
-/// region is left exactly as a writer killed after its `budget`-th store leaves it.
-/// That is a death at instruction granularity, which the Tier-1 sweep runs at every
-/// `k` of every bounded schedule.
-///
-/// Test and debug builds only: the shipped binary never carries it.
+/// A [`VecStore`] that executes only its first `budget` primitive stores.
 #[cfg(any(test, debug_assertions))]
 #[derive(Debug)]
 pub struct CountdownStore {
@@ -580,8 +451,7 @@ pub struct CountdownStore {
 
 #[cfg(any(test, debug_assertions))]
 impl CountdownStore {
-    /// A zeroed region of `len` bytes that executes its first `budget` stores
-    /// (`None`: every store).
+    /// A zeroed region of `len` bytes that executes its first `budget` stores.
     #[must_use]
     pub fn new(len: usize, budget: Option<usize>) -> Self {
         Self {
@@ -597,7 +467,7 @@ impl CountdownStore {
         self.stores.load(Ordering::Relaxed)
     }
 
-    /// Whether a store has been dropped: the writer is dead.
+    /// Whether a store has been dropped.
     #[must_use]
     pub fn died(&self) -> bool {
         self.budget.is_some_and(|budget| self.stores() > budget)
@@ -655,7 +525,6 @@ mod tests {
     use super::*;
 
     /// Byte copies at every alignment land exactly, leave their neighbours alone, and
-    /// read back; words round-trip; every access outside the region is refused.
     #[test]
     fn the_heap_region_copies_and_bounds_like_the_mapping() {
         let store = VecStore::new(64);
@@ -702,8 +571,6 @@ mod tests {
     }
 
     /// A shared region takes a writer on one thread and another thread's word at the
-    /// same time, as the window's parse and gather threads write one session's region:
-    /// every store lands, and the session recovers from it as from an unshared one.
     #[test]
     fn a_shared_region_takes_two_threads_words() {
         use crate::layout::{Geometry, OFF_STREAM_GATHERED};
@@ -743,7 +610,6 @@ mod tests {
             .map(|i| format!("line {i}\r\n").into_bytes())
             .collect();
         let total: u64 = slices.iter().map(|s| s.len() as u64).sum();
-        // The gather thread: its count, ahead of what the parse thread processed.
         let gather = {
             let store = shared.clone();
             let counts: Vec<u64> = slices
@@ -782,8 +648,6 @@ mod tests {
     }
 
     /// A touched region counts each page once, at its first store, whatever wrote it and
-    /// however often; a refused store counts nothing; the meter carries every live region's
-    /// pages and takes a region's back when it is dropped.
     #[test]
     fn a_touched_region_counts_each_page_once_and_gives_them_back_when_dropped() {
         let meter = Arc::new(AtomicU64::new(0));
@@ -844,8 +708,6 @@ mod tests {
     }
 
     /// A replaced region takes every clone's next store, with what the seed stored already
-    /// in it; the region it replaced comes back as it was; a region of another length is
-    /// refused and the shared one left in place.
     #[test]
     fn a_replaced_region_takes_every_clone_s_next_store() {
         let shared = Shared::new(VecStore::new(64));

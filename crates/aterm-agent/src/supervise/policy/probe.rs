@@ -1,91 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE POLICY'S PROBE: the one door the approval policy looks at the machine
-//! by, at the level of what it concluded — never the raw bytes it read.
+//! Approval-policy probe boundary ([`PolicyProbe`], [`ApprovalCtx::probe`], [`LiveProbe`],
+//! [`doors`]) for [`super::approval::decide`].
 //!
-//! [`super::approval::decide`] is a pure function of the screen and its
-//! context, but for a handful of boxes it must ask the machine: where a Read's
-//! symbolic links lead and whether a folder on its way holds a name the box
-//! may not have drawn, where an `rm` operand's links lead, what configuration a
-//! git read would load and which `env` blocks Claude Code's settings carry,
-//! what the worker's shell starts with and which ask rules its own settings
-//! hold, where its Bash tool may stand, and which process is the worker at
-//! all. Each of those looks was made directly where the policy needed it
-//! (`std::fs::read_dir`, `canonicalize`, a `git config --list`, the worker's
-//! environment read through the kernel), so a harness tape recorded the
-//! decision's screen and its mark but not what the decision turned on.
-//!
-//! Now every such look is a method of [`PolicyProbe`], handed to the policy as
-//! [`ApprovalCtx::probe`] (and to the rm rule as `RmScope::probe`):
-//! * [`LiveProbe`] is the shipped look, its bodies the very code the policy
-//!   ran before (`probe_live.rs`, or the reader it calls where that reader is
-//!   shared with the window's host);
-//! * `TapedProbe` is a run recorded with `--tape`: it makes the same live
-//!   look and returns the same value, and hands the loop's door
-//!   (`Fx::exchange`) the request and the DERIVED answer as a round trip
-//!   at `probe.<name>` ([`doors`]), so the tape holds what the decision
-//!   turned on, in the order it turned on it;
-//! * `KeyedProbe` answers each look from a tape out of order, through
-//!   astream-effects' keyed index of the tape — built once per tape and shared
-//!   by every decision decided again on it — bounded at the point a recorded
-//!   decision was made (`aterm drive replay --why`, `--shadow`): what the
-//!   recorded loop had learned by then, never later, and never the machine.
-//!
-//! **Derived, not raw — the privacy line.** What crosses a probe is the
-//! answer, never what was read to reach it (the replay plan's §4.7 and §7):
-//! * a hidden twin's path or nothing, never a folder's listing;
-//! * a path's resolved components, never the links on the way;
-//! * the worker as a DIGEST and a pid ([`WorkerEnv::digest`], seeded per
-//!   tape), never its environment — which holds whatever the person's shell
-//!   exported, API keys and tokens among it;
-//! * a git view PROJECTED to the keys [`super::git_config`]'s `hazard` reads,
-//!   each value reduced to bare/true/false/set ([`GitView::project`]), never a
-//!   URL, a credential helper or an `http.<url>.extraheader`;
-//! * a verdict on Claude Code's settings, the shell's startup, the owner's
-//!   ask rules and the Bash tool's directories, never a settings file's or an
-//!   rc file's bytes;
-//! * a REFUSAL (an answer's `Err`, which a tape holds as it holds a value) in
-//!   the check's own words: paths, line numbers, and the NAMES it found — a
-//!   variable's, a config key's, an option's, an alias's, a function's —
-//!   never a line it read or a value: a `.zshenv` line is named by its number
-//!   and the word of the check's that it holds
-//!   ([`super::shell_startup::zshenv_hazard`]), a snapshot's option by its
-//!   name, a worker bound to another session without its variable's value, a
-//!   git that failed by its exit status rather than its stderr. The owner's
-//!   ask rules and its hooks' matchers cross as written: they ARE the rules
-//!   the decision quotes (never a hook's command, never an `env` value).
-//!
-//! The live bodies that see the environment and the files run INSIDE the
-//! probe's live call, below the door: a door reached there runs live and is
-//! taped nowhere (the replay plan's §4.4), and none is — they read the raw
-//! [`WorkerEnv`] directly, which no door wraps. So the variables reach no
-//! tape by construction, not by a filter that could miss one.
-//!
-//! **The answer IS the value.** The live probe returns the projected git view
-//! too, not the full one: the policy judges in every mode exactly what a tape
-//! can hold, and `hazard(v, r) == hazard(v.project(), r)` (a property test,
-//! with a projection that drops a key as its negative control) is what makes
-//! that no change at all.
-//!
-//! **No probe reads a variable by name, because nothing above one does.** The
-//! replay plan's §4.7 names a `worker_var`/`worker_flag` probe for the policy's
-//! reads of the worker's variables and argv, taped by access. Once every look
-//! that reads the environment is its own derived probe — the worker's binding
-//! to its session (`worker_proc`), git's view, the settings' `env` check, the
-//! shell's startup, the owner's asks, the Bash tool's directories, Codex's
-//! records — no decision-level code reads a variable at all: each read happens
-//! inside a live body and reaches the tape only as that probe's answer. A
-//! decision that comes to read one directly adds that probe then. Likewise the
-//! plan's `canonicalize` probe for where the worker may write is no probe of
-//! its own: that resolve is made only inside `git_view`'s live body
-//! ([`WorkerWrites::holds`]), and the tape holds what it decided.
-//!
-//! **Frozen below the door.** A replay answers each probe from the tape and
-//! never runs its live body, so what a probe concluded is replayed, not
-//! re-derived: a counterfactual policy that would read a key the recording's
-//! projection did not keep sees it absent — the [`PROJECTION`] version on each
-//! recorded view is how a later build tells.
+//! Records derived answers ([`WorkerEnv::digest`] over [`WorkerEnv`], [`GitView::project`] for
+//! [`super::git_config`] and [`WorkerWrites::holds`] at [`PROJECTION`], and
+//! [`super::shell_startup::zshenv_hazard`]) rather than raw environment or file bytes.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -105,28 +26,19 @@ use crate::supervise::tape::core::TapeValue;
 use crate::supervise::tape::doors;
 use crate::supervise::tape::header::Roots;
 
-/// How the approval policy looks at the machine ([module docs](self)): one
-/// method per look, each returning what the policy concluded from it.
+/// How the approval policy looks at the machine ([module docs](self)).
 pub trait PolicyProbe: Send + Sync + std::fmt::Debug {
-    /// A name in a folder on the way to the absolute path `comps` that differs
-    /// from the drawn one only by characters the box may not draw: its full
-    /// path, `None`, or `Err` for a folder that cannot be listed or is too big
-    /// to list in a decision (the Read rule's `hidden_twin`).
+    /// A name in a folder on the way to the absolute path `comps` that differs from the drawn one.
     ///
     /// # Errors
-    ///
     /// A folder on the way cannot be listed, or holds too many entries.
     fn hidden_twin(&self, comps: &[String]) -> Result<Option<String>, String> {
         self.hidden_twin_in(comps, None)
     }
 
-    /// [`Self::hidden_twin`] with `home` supplied so the live walk never lists
-    /// inside a root macOS guards with `kTCCServiceSystemPolicyAppData` or a
-    /// file-provider domain (`~/Library/Containers`, `~/Library/Group Containers`,
-    /// `~/Library/CloudStorage`, `~/Library/Mobile Documents`).
+    /// [`Self::hidden_twin`] with `home` supplied to avoid TCC-protected macOS folders.
     ///
     /// # Errors
-    ///
     /// A folder on the way cannot be listed, or holds too many entries.
     fn hidden_twin_in(
         &self,
@@ -135,35 +47,23 @@ pub trait PolicyProbe: Send + Sync + std::fmt::Debug {
     ) -> Result<Option<String>, String>;
 
     /// `comps` with every symbolic link resolved (the Read rule's resolver);
-    /// `None` for a dangling link or a refused look.
     fn real_components(&self, comps: &[String]) -> Option<Vec<String>>;
 
-    /// Where the absolute path `comps` leads on the disk as the kernel walks
-    /// it for `rm`, and whether a link on the way is not root's (the rm rule's
-    /// resolver).
+    /// Where the absolute path `comps` leads on the disk as the kernel walks it for `rm`.
     ///
     /// # Errors
-    ///
-    /// A link climbs out of a missing directory, the links do not end, or the
-    /// disk refuses the look.
+    /// A link climbs out of a missing directory, the links do not end.
     fn rm_physical(&self, comps: &[String]) -> Result<OnDisk, String>;
 
-    /// The worker: the process leading the foreground group `group` of
-    /// session `sid`, read through the kernel and bound to the session by the
-    /// `ATERM_PARENT_SESSION_ID` its shell was handed.
+    /// The worker: the process leading the foreground group `group` of session `sid`.
     ///
     /// # Errors
-    ///
     /// The process cannot be read, or names another session or none.
     fn worker_proc(&self, group: u32, sid: &str) -> Result<WorkerEnv, String>;
 
-    /// What a git command the worker runs in `dir` would load, PROJECTED to
-    /// what the policy reads of it ([`GitView::project`]); the git is the one
-    /// the worker's `PATH` finds, refused where `writes` says the worker could
-    /// have put one ([`WorkerWrites`]).
+    /// What a git command the worker runs in `dir` would load.
     ///
     /// # Errors
-    ///
     /// No git can be named, or its configuration cannot be read.
     fn git_view(
         &self,
@@ -172,53 +72,38 @@ pub trait PolicyProbe: Send + Sync + std::fmt::Debug {
         writes: &WorkerWrites<'_>,
     ) -> Result<GitView, String>;
 
-    /// Whether Claude Code's settings for an agent launched in `launch` give
-    /// its Bash tool a git-relevant variable the worker's process lacks
-    /// ([`WorkerEnv::git_settings_env`]).
+    /// Check Claude Code settings for `launch` for hazardous `env` variables.
     ///
     /// # Errors
-    ///
     /// Such a variable, or a settings file that cannot be read whole.
     fn settings_env(&self, worker: &WorkerEnv, launch: &Path) -> Result<(), String>;
 
-    /// What the worker's Bash tool's shell starts with
-    /// ([`super::shell_startup::read`]).
+    /// What the worker's Bash tool's shell starts with ([`super::shell_startup::read`]).
     ///
     /// # Errors
-    ///
     /// What fails every line, or why the startup could not be read.
     fn shell_startup(&self, worker: &WorkerEnv, launch: &Path) -> Result<ShellStartup, String>;
 
-    /// The ask rules and PreToolUse hooks of the agent's own Claude Code
-    /// settings ([`super::claude_settings::owner_asks`]).
+    /// The ask rules and PreToolUse hooks of the agent's own Claude Code settings.
     ///
     /// # Errors
-    ///
     /// Why they could not be read.
     fn owner_asks(&self, worker: &WorkerEnv, launch: &Path) -> Result<Vec<OwnerAsk>, String>;
 
     /// Where the worker's Bash tool may stand beyond `cwd`, from Claude
-    /// Code's transcripts under its directory
-    /// ([`crate::harness::footer::shell_cwds`]); empty where its directory
-    /// cannot be named.
     fn shell_cwds(&self, worker: &WorkerEnv, cwd: &Path) -> Vec<PathBuf>;
 }
 
-/// An absolute path as the disk resolves it for `rm`
-/// ([`PolicyProbe::rm_physical`]).
+/// An absolute path as the disk resolves it for `rm` ([`PolicyProbe::rm_physical`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OnDisk {
     /// Where it leads.
     pub comps: Vec<String>,
-    /// Whether a symbolic link on the way is not root's: the worker could
-    /// have made it, or re-pointed it.
+    /// Whether a symbolic link on the way was followed.
     pub foreign_link: bool,
 }
 
-/// Where the worker may write unapproved, so a `git` there would be the
-/// worker's to configure ([`PolicyProbe::git_view`]): the session cwd, every
-/// Bash tool directory and the scratch roots. Data, not a closure, so a probe's
-/// request can name it and its live body can judge by it.
+/// Where the worker may write unapproved, so a `git` there would be the worker's to configure.
 #[derive(Debug, Clone, Copy)]
 pub struct WorkerWrites<'a> {
     /// The session's working directory.
@@ -240,10 +125,7 @@ impl<'a> WorkerWrites<'a> {
         }
     }
 
-    /// Whether the worker may write under `dir`: compared as written and as
-    /// `resolved` leads it (the live probe's `canonicalize`), against the cwd
-    /// and every Bash tool directory (each also resolved) and the scratch
-    /// roots.
+    /// Whether the worker may write under `dir`.
     pub fn holds(&self, dir: &Path, resolved: &dyn Fn(&Path) -> PathBuf) -> bool {
         let forms = [dir.to_path_buf(), resolved(dir)];
         let bases: Vec<PathBuf> = std::iter::once(self.cwd)
@@ -258,29 +140,11 @@ impl<'a> WorkerWrites<'a> {
     }
 }
 
-/// The shipped probe: every look made on this machine, as the policy always
-/// made it (`probe_live.rs`).
-///
-/// Named by the shipped supervisor only here, in its live arm and in `Fx`
-/// (`Fx::policy_probe`, which hands it out only when nothing records): a
-/// decision handed one directly would look at the machine past the door a
-/// tape is kept at, so the `supervise-fx` source guard (`aterm-census`,
-/// phase 3) names it anywhere else — and, for the same reason, every call of
-/// a live body its arm makes (`shell_startup::read`,
-/// `WorkerEnv::raw_git_view`, …) from above the door. No `Default`: a
-/// probe typed in by inference would be one the guard cannot see.
+/// The shipped probe: every look made on this machine, as the policy always made it.
 #[derive(Debug, Clone, Copy)]
 pub struct LiveProbe;
 
-/// A run recorded to a harness tape: each look made live, its derived answer
-/// handed to the loop's door as a round trip at `probe.<name>`
-/// ([module docs](self)). The door returns the live value, so recording
-/// changes no decision.
-///
-/// The same probe over a REPLAYING door is [`ReplayProbe`]: each request is
-/// built exactly as the recording built it and checked against the recorded
-/// one, and the answer is the tape's — the door never makes its live call,
-/// and the probe's live arm there is [`NoLook`], which has no look to make.
+/// A run recorded to a harness tape.
 #[derive(Clone)]
 pub(crate) struct TapedProbe<P: PolicyProbe = LiveProbe> {
     fx: Fx,
@@ -289,8 +153,7 @@ pub(crate) struct TapedProbe<P: PolicyProbe = LiveProbe> {
     seed: u64,
 }
 
-/// A replay's probe ([`TapedProbe`] over a replaying door): every answer is
-/// the tape's.
+/// A replay's probe ([`TapedProbe`] over a replaying door).
 pub(crate) type ReplayProbe = TapedProbe<NoLook>;
 
 impl<P: PolicyProbe> std::fmt::Debug for TapedProbe<P> {
@@ -311,11 +174,9 @@ impl TapedProbe {
 }
 
 impl ReplayProbe {
-    /// A probe answering from the tape `fx` replays, the worker digested with
-    /// `seed` (the recording's).
+    /// A probe answering from the tape `fx` replays, the worker digested with `seed`.
     ///
     /// # Panics
-    ///
     /// `fx` does not replay: [`NoLook`] has no look to make.
     pub(crate) fn replaying(fx: Fx, seed: u64) -> Self {
         assert!(
@@ -330,10 +191,7 @@ impl ReplayProbe {
     }
 }
 
-/// A replay's live arm: no look at the machine at all. A replaying door never
-/// makes the live call it is handed, so none of these is reached; each says
-/// so if one ever were, rather than look at a machine the recorded run never
-/// stood on.
+/// A replay's live arm: no look at the machine at all.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct NoLook;
 
@@ -380,11 +238,6 @@ impl PolicyProbe for NoLook {
 }
 
 /// How a probe's REQUEST is written ([module docs](self)): each path as the
-/// run's roots write it (`path`), the worker by its digest under the tape's
-/// `seed`. One writer for the probe that records a request ([`TapedProbe`])
-/// and for the one that asks a tape for it again ([`KeyedProbe`]), so the two
-/// cannot spell one request two ways: a request asked otherwise than it was
-/// recorded finds nothing.
 struct Requests<'a> {
     path: &'a dyn Fn(&Path) -> Vec<u8>,
     seed: u64,
@@ -433,7 +286,6 @@ impl Requests<'_> {
     }
 
     /// A git view asked for: the worker, the directory, and where the worker
-    /// may write.
     fn git_view(&self, worker: &WorkerEnv, dir: &Path, writes: &WorkerWrites<'_>) -> Vec<u8> {
         let worker = self.worker(worker);
         let mut fields = vec![
@@ -507,8 +359,6 @@ impl<P: PolicyProbe> PolicyProbe for TapedProbe<P> {
         self.fx.exchange(
             doors::PROBE_WORKER_PROC,
             || self.request(|r| r.worker_proc(group, sid)),
-            // Digested where it crosses: every later request names the
-            // worker as this record does.
             || {
                 self.live
                     .worker_proc(group, sid)
@@ -563,42 +413,17 @@ impl<P: PolicyProbe> PolicyProbe for TapedProbe<P> {
     }
 }
 
-/// The tape's effects, by ordinal, and astream-effects' keyed index of their
-/// round trips ([`KeyedIndex`]): built once per tape and shared, behind an
-/// `Arc`, by the keyed probe of every decision decided again on it.
+/// The tape's effects, by ordinal, and astream-effects' keyed index of their round trips.
 pub(crate) type TapeIndex = KeyedIndex<Arc<[EffectRecord]>>;
 
-/// A probe that answers from a TAPE, asked out of order: what `aterm drive
-/// replay --why` and `--shadow` decide a recorded box again with, on any
-/// build. Each look is asked of the tape's round trips through
-/// astream-effects' keyed index ([`TapeIndex`]) by its door and its request,
-/// written as the recording wrote it ([`Requests`], under the tape's RECORDED
-/// roots and seed), and answered by the LATEST such round trip among the
-/// records the recorded loop had read when it decided — `seen`, the index's
-/// own bound, a count of records — never one from after: what the loop had
-/// learned by then, never what it learned later. Nothing is consumed and the
-/// machine is never looked at.
-///
-/// A look costs one lookup in the shared index. It once built a keyed VIEW of
-/// the whole tape at every look (a view borrows the records, and a probe must
-/// own what it reads): on a tape grown to 100,049 effects from the corpus's
-/// `c4-read`, two looks a box, a shadow took 2.59 s, quadratic in the tape
-/// (`benches/tape_shadow_cost.rs`, T12).
-///
-/// A look the tape does not hold before the point — a build that asks what
-/// the recording's build never asked, or asks it otherwise — is answered as
-/// a refused look ("not on the tape"), so the decision goes the cautious way
-/// it goes for any unreadable look, and the door and request are kept
-/// ([`Self::misses`]): what the re-decision NEEDED and did not have, said
-/// beside it, never a guess presented as the recorded world.
+/// A probe that answers from a tape, asked out of order.
 #[derive(Debug)]
 pub(crate) struct KeyedProbe {
     /// The tape's records, by ordinal, and their keyed index, shared.
     index: Arc<TapeIndex>,
     /// How many of them the recorded loop had read at the point.
     seen: usize,
-    /// The tape's roots as recorded: paths are asked as the recording wrote
-    /// them.
+    /// The tape's roots as recorded.
     roots: Roots,
     /// The tape's seed for a worker's digest ([`WorkerEnv::digest`]).
     seed: u64,
@@ -606,9 +431,7 @@ pub(crate) struct KeyedProbe {
 }
 
 impl KeyedProbe {
-    /// A probe standing where the recorded loop had read the first `seen` of
-    /// the records `index` holds (the tape's effects, by ordinal), its
-    /// requests written under `roots` and `seed` as the recording wrote them.
+    /// A probe standing where the recorded loop had read the first `seen` of the records `index`.
     pub(crate) fn at(index: Arc<TapeIndex>, seen: usize, roots: Roots, seed: u64) -> Self {
         Self {
             index,
@@ -619,21 +442,18 @@ impl KeyedProbe {
         }
     }
 
-    /// Every look asked that the tape did not answer before the point: its
-    /// door, and what it asked as the tape writes it.
+    /// Every look asked that the tape did not answer before the point.
     pub(crate) fn misses(&self) -> Vec<String> {
         self.misses.lock_or_recover().clone()
     }
 
     /// The answer to the request `write` writes at `door`, or `unrecorded`
-    /// with why.
     fn answer<A: TapeValue>(
         &self,
         door: &str,
         write: impl FnOnce(&Requests<'_>) -> Vec<u8>,
         unrecorded: impl FnOnce(String) -> A,
     ) -> A {
-        // Lossy as the recorder writes a path (`TapeCore::path`).
         let path = |p: &Path| {
             String::from_utf8_lossy(&self.roots.encode(p))
                 .into_owned()
@@ -725,17 +545,7 @@ impl PolicyProbe for KeyedProbe {
     }
 }
 
-// -- what a probe's answer is on a tape --------------------------------------
-//
-// Each answer is written as JSON (`aterm_json`, the workspace's one writer)
-// through a small mirror of its type, so the tape's text form reads as what
-// the policy concluded. A path is written as text (`to_string_lossy`: a byte
-// that is not UTF-8 is replaced, the documented loss of every path a tape
-// holds). A read of bytes this build did not write is a `CodecError`, never a
-// guess.
-
-/// A probe's answer, or why it has none, as a tape holds it: `{"ok":…}` or
-/// `{"err":"…"}` (the workspace's serde writes no `Result`).
+/// A probe's answer, or why it has none, as a tape holds it.
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum Answer<T> {
@@ -744,7 +554,6 @@ pub(crate) enum Answer<T> {
 }
 
 /// `value` as JSON bytes. The mirrors below hold strings, numbers, booleans and
-/// lists of them, which always serialize.
 fn json<T: Serialize>(value: &T) -> Vec<u8> {
     aterm_json::to_vec(value).unwrap_or_default()
 }
@@ -817,8 +626,6 @@ impl TapeValue for Result<OnDisk, String> {
 }
 
 /// The worker as a tape holds it: its digest (sixteen hex digits) and pid,
-/// never a variable. The digest is the one fixed where the worker crossed the
-/// probe ([`WorkerEnv::digested`], which [`TapedProbe`] always makes).
 impl TapeValue for Result<WorkerEnv, String> {
     fn to_tape(&self) -> Vec<u8> {
         answer(self, |w| (format!("{:016x}", w.digest(0)), w.pid()))
@@ -839,7 +646,7 @@ impl TapeValue for Result<WorkerEnv, String> {
 /// A projected git view as a tape holds it ([`GitView::project`]).
 #[derive(Serialize, Deserialize)]
 struct ViewWire {
-    /// [`PROJECTION`], the rule it was projected by.
+    /// [`PROJECTION`], the rule it was projected under.
     projection: u32,
     config: Vec<(String, String, Option<String>)>,
     index_hook: Option<String>,
@@ -851,7 +658,6 @@ struct ViewWire {
 
 impl ViewWire {
     /// `view` projected — again, whatever handed it here: a tape never holds
-    /// more of a view than the projection keeps.
     fn of(view: &GitView) -> Self {
         let v = view.project();
         Self {
@@ -899,9 +705,7 @@ impl TapeValue for Result<GitView, String> {
     }
 }
 
-/// A shell's startup as a tape holds it ([`ShellStartup::names`] and
-/// [`ShellStartup::may_run_zsh`]): the probe's answer and a decision's facts
-/// (`box_facts`) write it alike.
+/// A shell's startup as a tape holds it ([`ShellStartup::names`], [`ShellStartup::may_run_zsh`]).
 pub(crate) type ShellWire = (Vec<(String, String, bool)>, bool);
 
 impl TapeValue for Result<ShellStartup, String> {

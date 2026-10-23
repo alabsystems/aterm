@@ -1,22 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Console attention ownership at completed brain ticks. The host supplies
-//! input, selection, content identity and command events; this projection
-//! does not model sprite geometry, animation duration or input delivery.
+//! Console attention ownership and pet placement models at completed brain ticks.
 
 use aterm_spec::derive::*;
 
-/// Cursor-home placement at emitted frames. Ordinary text remains drawable;
-/// a moved caret carries the base home while finite local motion completes,
-/// and a wholly protected surface parks the resident. `Arrive` abstracts completion of the real follower, not one
-/// animation tick. `RepaintMove` is a program walking its HIDDEN cursor while
-/// it repaints — inside the repaint hold, or on a frame it has not finished:
-/// that cursor is its write position, so the home stays the last painted
-/// caret and nothing travels (`Buggy` chases it). Geometry and its pixel
-/// protection are bound separately by the real Terminal/PetBrain walk in
-/// `console_cursor_home.rs`; the unfinished-frame case by
-/// `pet_holds_through_a_torn_frame.rs`.
+/// Cursor-home placement model at emitted frames.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn console_cursor_home_model() -> Model {
@@ -63,7 +52,6 @@ pub fn console_cursor_home_model() -> Model {
             invariant OrdinaryTextKeepsBody: if protected == 0 { visible == 1 } else { visible == 0 };
             invariant BaseStaysAtCursor: if protected == 0 { home == 1 } else { home == 0 };
             invariant ArrivesAtCursor: if event == 4 { home == 1 && moving == 0 } else { home <= 1 };
-            // Dial 2 protects a caret still in flight.
             invariant ProtectionParks: if protected == 1 { visible == 0 && moving == 0 } else { protected == 0 };
             invariant RepaintHoldsHome: if event == 9 { moving == 0 } else { moving <= 1 };
             bound Bounded: visible <= 1 && home <= 1 && moving <= 1 && protected <= 1 && hidden <= 1 && event <= 9;
@@ -71,16 +59,7 @@ pub fn console_cursor_home_model() -> Model {
     }
 }
 
-/// One input sequence is consumed once, reading protects its surface, direct
-/// input revokes retained work, and expired or displaced results never replay.
-/// Actions include the stimulus and its next tick. `Expire`/`ReleaseSelection`
-/// advance beyond the real hold; `StaleComplete` reports a verdict already
-/// beyond the real TTL. Tier 1 drives those actual clocks, never edits state.
-///
-/// `Buggy=1` counts echoes as new input, skips input consumption/revocation,
-/// keeps work over selections and new surfaces, and replays expired results.
-/// The negative controls in `console_life_conformance.rs` are rejected by the
-/// same action relation that accepts shipping PetBrain observations.
+/// Console attention episode lifecycle model.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn console_life_episode_model() -> Model {
@@ -91,9 +70,7 @@ pub fn console_life_episode_model() -> Model {
             const MaxSurface = 2;
             var seq = 0;
             var consumed = 0;
-            // Environment count of actually admitted input events.
             var inputs = 0;
-            // 0 rest, 1 input, 2 reading, 3 retained content, 4 result.
             var attention = 0;
             var anchor = 0;
             var selected = 0;
@@ -110,8 +87,6 @@ pub fn console_life_episode_model() -> Model {
                 result = if Buggy == 1 { result } else { 0 };
                 event = 1;
             }
-            // Several native commits between frames coalesce to the newest
-            // subject, while the sequence still records every admitted event.
             action BatchInput when (seq <= MaxInputs - 2) {
                 seq = seq + 2;
                 inputs = inputs + 2;
@@ -176,16 +151,7 @@ pub fn console_life_episode_model() -> Model {
     }
 }
 
-/// Cadence custody when reading takes over an existing flight. The initial
-/// state is a real airborne legacy owner, not PetBrain::default. `Land`
-/// abstracts the tick that retires its final flight/landing work; the resident
-/// still owes one actual processing tick afterward. A clear existing body can
-/// then park, while a no-target decision must consume suppressed affection.
-///
-/// This model checks wake decisions and ownership, not flight duration,
-/// geometry, general perch travel or fairness of the host's future ticks.
-/// `Buggy=1` replays premature flight/landing parking, forgotten handoff, and
-/// perpetual no-target wake from a stale Land action or unconsumed touch.
+/// Cadence custody handoff model when reading takes over an airborne resident.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn console_resident_handoff_model() -> Model {
@@ -246,20 +212,7 @@ pub fn console_resident_handoff_model() -> Model {
     }
 }
 
-/// The resident's emitted Z-ORDER (`PetFrame::under_ink`), one action per
-/// frame. Ink under the DRAWN body sends it under the glyphs at once; coming
-/// back over waits for an unbroken clear run of `Z_DWELL`; a frame that
-/// draws nothing releases the hold. `dwelt` is the environment's clock, not
-/// a frame count: `ClearDwelt` is a clear frame at or past the dwell of a
-/// clear run already under way. Placement, the brain's own hide trick and
-/// the visibility hold are not modelled. Tier-1 in aterm-effects'
-/// `console_pet_z_order_hold.rs` walks a real PetBrain over a real Terminal
-/// through this relation and shows it rejects the shipped per-frame rule.
-///
-/// `Buggy=1` goes under one frame late (a symmetric hold), strobes on clear
-/// frames — sinking with no ink under the body, as the shipped caret-ring
-/// rule did, and surfacing on the next one — latches under past the dwell,
-/// and carries the hold across a frame that drew nothing.
+/// Emitted resident z-order model (`PetFrame::under_ink`).
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn console_pet_z_order_model() -> Model {
@@ -304,92 +257,7 @@ pub fn console_pet_z_order_model() -> Model {
     }
 }
 
-/// THE RESIDENT ACROSS A COORDINATE SEAM (2026-10-01): one seam, and the
-/// frame after it, for a pet that was on glass. Three seams, three laws.
-///
-/// * `Regrid` — the same terminal re-gridded (a resize, a font step, a DPI
-///   change, a divider drag, a zoom; `CompanionOwner::rebase_geometry`). Its
-///   cells are still that terminal's cells, so the body stays lit through the
-///   seam and the frame after it, and does not jump: `moved` is a drawn body
-///   more than a cell from where it stood.
-/// * `Replace` — another terminal, or the same terminal's other screen
-///   (`CompanionOwner::resight_owner`). The boundary itself is dark and owns
-///   no hit target (`CursorCompanionOwnerLifecycle`'s law); the frame after
-///   crossfades: the replacement is lit at its own station while the old body
-///   fades as a `ghost` where it was drawn ON GLASS (`ghost_moved` is a ghost
-///   anywhere else, measured in window pixels). `Shift` moves the focused
-///   pixel frame to another pane while the old one stays on glass exactly as
-///   drawn — a split-pane focus switch: the ghost is spent on its OWN glass,
-///   placed at its pane, cropped to it and beneath its ink, so the switch
-///   crossfades like any other replacement. `Lose` takes the old glass away
-///   before that frame — its cell metrics changed (a font step, a DPI
-///   change) or its pane left the glass (closed, zoomed away): no pixels of
-///   the old body are left to fade, so no ghost is spent and the replacement
-///   fades in alone. The new surface's world judges a ghost on its glass,
-///   and where that world cannot see the old body's cells at all (a tall
-///   screen whose caret is far from it) the ghost keeps the verdict its own
-///   surface gave it: still a crossfade. `Refuse` is the one guarantee that
-///   forbids a ghost on glass that is still there: the world it would fade
-///   in protects the cells under it (an image, a selection, an expanded
-///   row) or certifies nothing there — the new surface's on the same glass,
-///   or after a `Shift` the pane the focus left, at the boundary. No ghost
-///   is drawn there, and its presence is not lost (`dipped`): the arriver
-///   carries it, so the cat stands at its new station at the presence the
-///   user saw instead of vanishing to its ramp's floor.
-/// * `Blind` — the next observation is incoherent (a stale snapshot, a resize
-///   frame). The body on glass is held lit in place; `BlindLong` is a blind
-///   run past the visibility hold's bound, which fades it out.
-///
-/// `Return` is a second `Replace` inside a crossfade: to a surface a ghost of
-/// this cat is still fading on — a quick toggle between two panes, two tabs
-/// or two screens — or on to a third (a quick cycle across three panes,
-/// with ghosts still fading in the two the focus left). The boundary is
-/// dark, as every replacement's is; after it the seat the cat comes back to
-/// never `restarted`: ONE body there, in the look the user saw (its pose and
-/// facing), whose presence never falls below what the user saw — an arriver
-/// standing where its own ghost still fades adopts it and continues.
-/// `Spend` is the crossfade running out: no ghost leaves glass while its
-/// arriver is below full presence (`tail`) — each ghost's envelope runs on
-/// the arriver's ramp and reaches zero on the frame the arriver is full, in
-/// whichever pane it fades; a ghost cut at the second boundary leaves
-/// glass early too. `Handoff` puts the breed handoff's `leaver` on glass
-/// beside the body before the seam — the old coat running off or fading in
-/// place — and it is this cat too: carried across the boundary, stopped
-/// where it was drawn, it fades on the arriver's ramp like every ghost.
-///
-/// `hit` is the petting target, which is the drawn body's pixels: a seam
-/// withdraws it until a frame draws a body again.
-///
-/// `Buggy=1` is the shipped rule before 2026-10-01 — a regrid retired the
-/// body (dark at the seam and on the frame after), a replacement's next frame
-/// was dark with no crossfade (and a split-pane focus switch's stayed so
-/// until this fix: its ghost was dropped with the moved pixel frame), a
-/// blind frame was cut — plus the mutants a careless fix makes: a
-/// replacement carrying the old body and its hit target across the
-/// boundary, a ghost spent on glass that is gone, and a blind hold with no
-/// end. `PaneCut=1` alone is the rule shipped between the same-glass
-/// crossfade (4bf00833c) and the own-glass ghost: a replacement on the same
-/// glass crossfades, a `Shift` drops the ghost with the moved pixel frame and
-/// the frame after the switch has no cat. `Restart=1` is the rule shipped
-/// until the adoption: the returning surface's arriver restarted at the
-/// ramp's floor at its seat — beside its own ghost still fading there (a
-/// split pane: two cats, the presence the eye sees dipping before it
-/// recovers), or after that ghost was cut at the boundary (the same glass: a
-/// tab, a screen); an adopting arriver that changed pose in place (the rule
-/// until 2026-10-08) restarted the look the same way. `OwnClock=1` is the
-/// ghost life shipped until then: a ghost carried across the second
-/// boundary kept its old clock and left glass while the restarted arriver
-/// was still coming up — as a ghost on a pane the focus left two switches
-/// ago did, cut at the second boundary when the owner kept one own glass
-/// (until 2026-10-08). `Cull=1` is the refusal shipped until 2026-10-08: a
-/// ghost refused over protected cells took its presence with it, and the
-/// arriver stood alone at its ramp's floor. `LeaverCut=1` is the leaver
-/// shipped until 2026-10-08: the boundary dropped it, and it left glass in
-/// one frame while its arriver was still coming up. Tier-1 in
-/// aterm-effects'
-/// `pet_coordinate_seams.rs` drives the real
-/// `CompanionOwner` over a real `Terminal` through each seam and replays the
-/// shipped seams as the controls.
+/// Resident coordinate-seam transition model across a resize, scroll, or clear.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn pet_surface_seam_model() -> Model {
@@ -402,7 +270,6 @@ pub fn pet_surface_seam_model() -> Model {
             const Cull = 0;
             const LeaverCut = 0;
             var drawn = 0;
-            // 0 none, 1 regrid, 2 replace, 3 blind.
             var seam = 0;
             var shifted = 0;
             var lost = 0;

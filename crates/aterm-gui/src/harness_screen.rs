@@ -1,43 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The Settings ▸ Harness read projection (`docs/DESIGN-harness-autopilot-
-//! 2026-10-15.md` §4) — the harness analogue of [`crate::packages_screen`].
-//! ONE plain-data snapshot, [`HarnessState`], drives the native `/harness`
-//! route: the App builds it ([`App::harness_state`]) from what it already
-//! holds — the policy in force, every live supervisable agent session's
-//! Autopilot, the ledgers' last reading and the A/B book — and publishes it
-//! to every Settings view by revision fan-out (`App::publish_native_harness_
-//! state`, `AppEvent::HarnessChanged`). The page renders its
-//! [`HarnessProjection`], a pure function of the state, so what the screen
-//! shows and what `controls prefs` reads are one derivation.
-//!
-//! **Nothing polls.** The projection is published when the page opens, on a
-//! Refresh press, when a session's Autopilot is written, when the policy in
-//! force changes, when the ledgers' reading lands, and — while a view shows
-//! the page — on the host's notes, a session's claim moving, and an act of
-//! the harness's (design §9.2.1, "The page"): WHAT THE HARNESS DID is
-//! marked stale, and the ledgers are read again 3 s after the act and at
-//! most once per 10 s, on the act ticker's one deadline
-//! (`crate::harness_glass`); a page that leaves the screen owes nothing.
-//!
-//! **What the harness did** (§4 item 4) is folded from the ledgers it already
-//! writes by [`aterm_agent::harness::stats::stats_windows`], which is
-//! blocking file I/O: it runs on a one-shot background thread
-//! ([`App::start_harness_stats_refresh`]) and reads each ledger ONCE for two
-//! windows — today (since the local midnight, with each session's share) and
-//! the last 7 days (design §10.3.3, item 1) — and comes back as
-//! `Wake::HarnessStatsCollected`. It creates nothing.
-//!
-//! **With and without** (§4 item 5, the A/B) is measured in-process by the
-//! A/B book ([`crate::harness_ab`], §10.5.3 B): per session, its agent's
-//! time by published word — busy, at a box, asked, at its prompt — split by
-//! the Autopilot state it ran under ([`AbArm`]) and, under Cruise and Land
-//! at the prompt, by why ([`AbCause`]: landed, or the harness pausing),
-//! with each box's and question's hold in a histogram, per local day for
-//! seven days. This page feeds it (a moved word, a moved arm) and shows its
-//! week ([`ab_rows`]). No "time saved" figure is derived from it: nothing
-//! measures one (§6).
+//! The Settings ▸ Harness read projection (`docs/DESIGN-harness-autopilot- 2026-10-15.md` §4) — the harness analogue of [`crate::packages_screen`].
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -50,49 +14,27 @@ use crate::App;
 use crate::autopilot::{AutopilotView, HarnessPosture};
 use crate::claude_lights::{ChipFace, ChipGlass, LandAtGlass};
 
-/// The 7-day window's length.
 const WEEK_MS: i64 = 7 * 86_400_000;
-
-// The A/B book (`harness_ab`)
 
 pub(crate) use crate::harness_ab::{AbArm, AbBook, AbCause, AbPhase, AbWeek, ab_rows};
 
-// What the harness did
-
-/// One reading of the ledgers: today and the last 7 days, and when it was
-/// taken.
+/// One reading of the ledgers: today and the last 7 days, and when it was taken.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct HarnessStatsReport {
-    /// Since the local midnight (UTC's, where no offset could be read).
     pub(crate) today: HarnessStats,
-    /// Since 7 days before the reading.
     pub(crate) week: HarnessStats,
-    /// When the reading was taken, unix ms.
     pub(crate) collected_unix_ms: i64,
-    /// The local zone's offset east of UTC at that instant, in seconds, or
-    /// `None` where it could not be read (today is then UTC's day).
     pub(crate) offset_s: Option<i64>,
-    /// The A/B book's days of every OTHER aterm process on this state
-    /// directory (`<harness state>/ab/`, §10.5.3 C.3), summed by local day,
-    /// oldest first: what the page adds to the live book's week
-    /// ([`App::harness_ab`]). Empty where none was read.
     pub(crate) ab_others: Vec<crate::harness_ab::AbDay>,
-    /// Tabs read from sibling local `aterm` processes on this Mac.
     pub(crate) sibling_tabs: Vec<TabSpreadsheetRow>,
-    /// Managed LAN/remote computers read from `<config>/machines/`.
     pub(crate) remote_computers: Vec<TabComputer>,
-    /// Open tabs across managed LAN/remote computers read from `<config>/machines/state/`.
     pub(crate) remote_tabs: Vec<TabSpreadsheetRow>,
-    /// Each session's day line, formed by the reader beside its counts.
-    /// Projection lends these words without reading the local zone.
     day_lines: BTreeMap<String, String>,
-    /// Each kept decision's event clock, resolved by the reader.
     decision_clocks: BTreeMap<i64, String>,
 }
 
 impl HarnessStatsReport {
-    /// One immutable reading and its session-day text. The zone callback
-    /// belongs to the reader; no callback is retained in the report.
+    /// One immutable reading and its session-day text.
     pub(crate) fn new(
         today: HarnessStats,
         week: HarnessStats,
@@ -137,22 +79,6 @@ impl HarnessStatsReport {
 }
 
 /// The unix ms of the local midnight that starts the day `now_ms` falls in.
-/// `offset_at` is the zone's offset east of UTC in force at a unix second
-/// (`None`: unknown, and the day is UTC's). The DATE is now's, under now's
-/// offset; the midnight is that date's 00:00 under the offset in force AT
-/// midnight — on the day daylight saving starts or ends the two differ by
-/// the shift, and now's offset would start "today" that much off.
-///
-/// Midnight's offset is read at the instant now's offset puts midnight at,
-/// and an hour before it: where clocks fall back AT 01:00 local (to 00:00:
-/// Atlantic/Azores, America/Havana) the date's 00:00 comes twice, and the
-/// instant now's offset gives is the second, so the day would start an hour
-/// late. Each offset read is a candidate, kept only where the zone really
-/// is at it then (its instant reads 00:00 on that date); the earliest kept
-/// wins. None kept is a midnight the clocks skip (a spring forward AT
-/// 00:00): the day starts where the skip lands, the later read's instant.
-/// A shift of up to an hour is covered (a longer one at midnight would
-/// start the day late by the excess). Pure.
 #[must_use]
 pub(crate) fn local_midnight_ms(now_ms: i64, offset_at: impl Fn(i64) -> Option<i64>) -> i64 {
     const DAY_MS: i64 = 86_400_000;
@@ -161,10 +87,8 @@ pub(crate) fn local_midnight_ms(now_ms: i64, offset_at: impl Fn(i64) -> Option<i
     let Some(now_offset) = offset_at(now_ms.div_euclid(1000)) else {
         return now_ms - now_ms.rem_euclid(DAY_MS);
     };
-    // The offset at a unix second, now's where it cannot be read.
     let at = |unix_s: i64| offset_at(unix_s).unwrap_or(now_offset);
     let local = now_ms.saturating_add(ms(now_offset));
-    // The date's 00:00 on the local clock, as if the zone were UTC.
     let day = local - local.rem_euclid(DAY_MS);
     let guess_s = day.saturating_sub(ms(now_offset)).div_euclid(1000);
     let late = at(guess_s);
@@ -179,14 +103,7 @@ pub(crate) fn local_midnight_ms(now_ms: i64, offset_at: impl Fn(i64) -> Option<i
         .unwrap_or_else(|| day.saturating_sub(ms(late)))
 }
 
-/// READ THE LEDGERS (blocking file I/O: a worker's only), once: what the
-/// harness did since the local midnight (each session's share kept) and
-/// over the last 7 days, under aterm's
-/// state directory (`state_dir`, its `drive/` ledgers and journals) and the
-/// harness's own (`harness_state`, the live upgrade's ledger). `offset_at` is
-/// the zone's offset at a unix second ([`local_midnight_ms`]'s). Creates
-/// nothing; a missing file or directory is no rows. `Err` where either
-/// directory cannot be resolved here — there is nothing to read.
+/// READ THE LEDGERS (blocking file I/O: a worker's only), once: what the harness did since the local midnight (each session's share kept) and over the last 7 days, under aterm's state directory (`state_dir`, its `drive/` ledgers and journals) and the harness's own (`harness_state`, the live upgrade's ledger).
 pub(crate) fn collect_harness_stats(
     state_dir: Option<&Path>,
     harness_state: Option<&Path>,
@@ -197,7 +114,6 @@ pub(crate) fn collect_harness_stats(
         return Err("no state directory resolves here".to_string());
     };
     let offset_s = offset_at(now_ms.div_euclid(1000));
-    // ONE PASS over the ledgers folds both windows (§10.3.3, item 1).
     let (today, week) = aterm_agent::harness::stats::stats_windows(
         state_dir,
         harness_state,
@@ -209,16 +125,7 @@ pub(crate) fn collect_harness_stats(
     ))
 }
 
-/// THE STATS THREAD'S READING (blocking file I/O: a worker's only): the
-/// ledgers ([`collect_harness_stats`]) and the A/B book's exchange
-/// (§10.5.3 C.2–3, `harness_ab_store::exchange`) — this process's book
-/// (`ab`, the ring the App copied and its today; `None` where it was never
-/// fed) written whole as `own` under `harness_state/ab/`, then every other
-/// process's days read into [`HarnessStatsReport::ab_others`]. The book is
-/// written even where the ledgers cannot be read; nothing of it where no
-/// harness state resolves. The fleet last, as `fleet` asks it once the
-/// ledgers are read ([`FleetSlot::take`]), so a Tab Control page that came
-/// while they were read gets it in this reading.
+/// THE STATS THREAD'S READING (blocking file I/O: a worker's only): the ledgers ([`collect_harness_stats`]) and the A/B book's exchange (§10.5.3 C.2–3, `harness_ab_store::exchange`) — this process's book (`ab`, the ring the App copied and its today; `None` where it was never fed) written whole as `own` under `harness_state/ab/`, then every other process's days read into [`HarnessStatsReport::ab_others`].
 pub(crate) fn read_harness_stats(
     state_dir: Option<&Path>,
     harness_state: Option<&Path>,
@@ -243,14 +150,7 @@ pub(crate) fn read_harness_stats(
     })
 }
 
-/// WHAT A RUNNING READING SWEEPS OF THE FLEET, RAISED WHILE IT RUNS (the
-/// review of perf-1's fix): a reading begun for Settings ▸ Harness alone
-/// asks nothing of the fleet; a Tab Control page that comes while it reads
-/// the ledgers raises the ask ([`Self::raise`]) and the reading sweeps the
-/// fleet once they are read ([`Self::take`]), so that page's fleet lands
-/// with it — never a second reading of every ledger to fetch it. A raise
-/// after the take (the reading done with the ledgers) does not count, and
-/// the page then reads again at the landing.
+/// WHAT A RUNNING READING SWEEPS OF THE FLEET, RAISED WHILE IT RUNS (the review of perf-1's fix): a reading begun for Settings ▸ Harness alone asks nothing of the fleet; a Tab Control page that comes while it reads the ledgers raises the ask ([`Self::raise`]) and the reading sweeps the fleet once they are read ([`Self::take`]), so that page's fleet lands with it — never a second reading of every ledger to fetch it.
 #[derive(Debug, Default)]
 pub(crate) struct FleetSlot(std::sync::atomic::AtomicU8);
 
@@ -269,8 +169,7 @@ impl FleetSlot {
         u8::from(ask.fleet) * Self::FLEET + u8::from(ask.local_vitals) * Self::LOCAL_VITALS
     }
 
-    /// The reading, done with the ledgers: what it is asked now, closed to
-    /// every later raise.
+    /// The reading, done with the ledgers: what it is asked now, closed to every later raise.
     pub(crate) fn take(&self) -> FleetAsk {
         let bits = self
             .0
@@ -281,8 +180,7 @@ impl FleetSlot {
         }
     }
 
-    /// Ask the running reading for `ask` too: whether it will sweep it
-    /// (false where it was already taken).
+    /// Ask the running reading for `ask` too: whether it will sweep it (false where it was already taken).
     pub(crate) fn raise(&self, ask: FleetAsk) -> bool {
         self.0
             .fetch_or(Self::bits(ask), std::sync::atomic::Ordering::AcqRel)
@@ -291,47 +189,24 @@ impl FleetSlot {
     }
 }
 
-/// WHAT A READING ASKS OF THE FLEET ([`read_harness_stats`]): Settings ▸
-/// Harness shows none of it, so its readings never wait on it (the
-/// post-landing check's perf-1: every Harness reading slept 30 ms and spawned
-/// `/usr/sbin/sysctl` twice for this Mac's vitals, and dialled the sibling
-/// sockets and the LAN, for a page that never draws them).
+/// WHAT A READING ASKS OF THE FLEET ([`read_harness_stats`]): Settings ▸ Harness shows none of it, so its readings never wait on it (the post-landing check's perf-1: every Harness reading slept 30 ms and spawned `/usr/sbin/sysctl` twice for this Mac's vitals, and dialled the sibling sockets and the LAN, for a page that never draws them).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct FleetAsk {
-    /// The fleet (sibling aterm tabs, managed and LAN computers): only while
-    /// a Tab Control / Fleet Monitor page is shown, whose sweep it is.
     pub(crate) fleet: bool,
-    /// This Mac's vitals sampled on the reading's thread: only for a fleet
-    /// reading while `VitalsHost` has no snapshot for the page to show
-    /// instead (the page prefers its snapshot, [`App::tab_control_state`]).
     pub(crate) local_vitals: bool,
 }
 
-/// The ledgers' reading as the page has it: the last report, whether a
-/// reading is running, and why none could be taken.
+/// The ledgers' reading as the page has it: the last report, whether a reading is running, and why none could be taken.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct HarnessStatsSlot {
-    /// The newest reading (two windows, today's with a share per session),
-    /// shared: the state is cloned whole on every publish, and the reading
-    /// rides in it as a refcount (§10.3.3, item 4).
     pub(crate) report: Option<std::sync::Arc<HarnessStatsReport>>,
-    /// A reading is running ([`App::start_harness_stats_refresh`]).
     pub(crate) collecting: bool,
-    /// Why the last reading has nothing (no state directory, no thread).
     pub(crate) unavailable: Option<String>,
-    /// The harness acted while the page was on screen, after the newest
-    /// reading began or too soon before it to be read (design §9.2.1, "The
-    /// page"): the counts are older than the acts, and a re-read is owed or
-    /// running ([`HarnessScreen::reread_at`]).
     pub(crate) stale: bool,
 }
 
 impl HarnessStatsSlot {
-    /// Whether the newest reading's today is a day that has ended: it began
-    /// before the local midnight that starts `now_ms`'s day
-    /// ([`local_midnight_ms`], under `offset_at`). Past midnight STATUS's
-    /// today and each row's day are yesterday's, so the midnight turn owes a
-    /// reading (§10.3.3, item 10). No reading, no day to move. Pure.
+    /// Whether the newest reading's today is a day that has ended: it began before the local midnight that starts `now_ms`'s day ([`local_midnight_ms`], under `offset_at`).
     #[must_use]
     pub(crate) fn day_ended(&self, now_ms: i64, offset_at: impl Fn(i64) -> Option<i64>) -> bool {
         self.report
@@ -340,51 +215,22 @@ impl HarnessStatsSlot {
     }
 }
 
-// The App's own part
-
-/// What the App keeps for Settings ▸ Harness: the projection's revision, the
-/// A/B book and the ledgers' reading.
+/// What the App keeps for Settings ▸ Harness: the projection's revision, the A/B book and the ledgers' reading.
 #[derive(Debug, Default)]
 pub(crate) struct HarnessScreen {
-    /// The last published revision (bumped by every publish).
     pub(crate) revision: u64,
-    /// The A/B book ([`AbBook`]).
     pub(crate) ab: AbBook,
-    /// Shared capture/write order for this book, retained by its stats workers.
     pub(crate) ab_writes: std::sync::Arc<crate::harness_ab_store::AbWrites>,
-    /// The ledgers' reading.
     pub(crate) stats: HarnessStatsSlot,
-    /// The running reading's ticket: a completion for an older one is dropped.
     sequence: u64,
-    /// THE RE-READ ACTS OWE while the page is on screen (§9.2.1): when it is
-    /// due ([`Self::owe_reread`]) — folded into the harness's glass deadline
-    /// while the page is on screen (`App::harness_acts_deadline`). `None`:
-    /// none owed.
     reread_at: Option<Instant>,
-    /// The act that first owed [`Self::reread_at`]: later acts move the
-    /// re-read on, but never past [`crate::harness_glass::REREAD`] after
-    /// this one, so a steady run of acts cannot hold it off.
     owed_since: Option<Instant>,
-    /// When the newest reading began (the page's open, Refresh, a re-read).
     read_began: Option<Instant>,
-    /// The newest act told while the page was on screen: the time-based
-    /// freshness test requires a reading to begin
-    /// [`crate::harness_glass::DWELL`] after it ([`Self::covers_the_acts`]).
     last_act: Option<Instant>,
-    /// The counting seam on [`App::start_harness_stats_refresh_at`]: how
-    /// many readings were asked for (a headless test has no proxy, so none
-    /// begins).
     #[cfg(test)]
     pub(crate) readings_asked: u32,
-    /// What the running (or last) reading sweeps of the fleet ([`FleetAsk`]),
-    /// as the loop knows it: a reading that read none of it keeps the fleet
-    /// the last one read, and a Tab Control page shown while it ran raises
-    /// it ([`FleetSlot::raise`]) — or, raised too late, reads again when it
-    /// lands.
     reading: FleetAsk,
-    /// The running reading's [`FleetSlot`], which its thread takes.
     fleet_slot: std::sync::Arc<FleetSlot>,
-    /// The seam on what the newest reading asked was asked of the fleet.
     #[cfg(test)]
     pub(crate) last_fleet_ask: Option<FleetAsk>,
 }
@@ -396,8 +242,7 @@ impl HarnessScreen {
         self.reread_at
     }
 
-    /// Whether the Live Fleet Monitor tab (`/tabs` / `/monitor`) is due for its
-    /// next continuous 3-second fleet telemetry sweep at `now`.
+    /// Whether the Live Fleet Monitor tab (`/tabs` / `/monitor`) is due for its next continuous 3-second fleet telemetry sweep at `now`.
     #[must_use]
     pub(crate) fn fleet_sweep_due(&self, now: Instant) -> bool {
         !self.stats.collecting
@@ -406,19 +251,14 @@ impl HarnessScreen {
             })
     }
 
-    /// A reading of the ledgers began at `now`: the next re-read an act owes
-    /// waits [`crate::harness_glass::REREAD`] from here.
+    /// A reading of the ledgers began at `now`: the next re-read an act owes waits [`crate::harness_glass::REREAD`] from here.
     pub(crate) fn began_reading(&mut self, now: Instant) {
         self.stats.collecting = true;
         self.stats.unavailable = None;
         self.read_began = Some(now);
     }
 
-    /// AN ACT AT `now`, told while the page is on screen, whether or not
-    /// the chip's trail took it (a second box approved a second after the
-    /// first is a repeat on the chip, and a row the page counts): WHAT THE
-    /// HARNESS DID is stale and a re-read is owed ([`Self::owe_reread`]).
-    /// Whether the stale mark moved (the page then shows `Newer`).
+    /// AN ACT AT `now`, told while the page is on screen, whether or not the chip's trail took it (a second box approved a second after the first is a repeat on the chip, and a row the page counts): WHAT THE HARNESS DID is stale and a re-read is owed ([`Self::owe_reread`]).
     pub(crate) fn note_act(&mut self, now: Instant) -> bool {
         self.last_act = Some(self.last_act.map_or(now, |last| last.max(now)));
         let marked = !self.stats.stale;
@@ -427,12 +267,6 @@ impl HarnessScreen {
         marked
     }
 
-    /// Owe the re-read for an act at `act`: [`crate::harness_glass::DWELL`]
-    /// after it, allowing time for the turn's later journal rows such as a
-    /// question dialog's `CHOSE`, but never sooner than
-    /// [`crate::harness_glass::REREAD`] after the last reading began, and
-    /// never later than `REREAD` after the act that first owed it
-    /// ([`Self::owed_since`]) or that floor. Never moved sooner.
     fn owe_reread(&mut self, act: Instant) {
         use crate::harness_glass::{DWELL, REREAD};
         let since = *self.owed_since.get_or_insert(act);
@@ -441,19 +275,11 @@ impl HarnessScreen {
         self.reread_at = Some(self.reread_at.map_or(due, |at| at.max(due)));
     }
 
-    /// The owed re-read comes due: it is no longer owed (the reading it
-    /// starts, or the one already running, answers for the acts — and a
-    /// reading that lands not covering them owes another,
-    /// [`App::finish_harness_stats`]).
     fn take_reread(&mut self) {
         self.reread_at = None;
         self.owed_since = None;
     }
 
-    /// Whether the latest reading meets the time-based freshness threshold:
-    /// it began at least [`crate::harness_glass::DWELL`] after the newest act.
-    /// This does not acknowledge a worker's later journal writes; delayed rows
-    /// may need a later act or Refresh.
     fn covers_the_acts(&self) -> bool {
         match (self.read_began, self.last_act) {
             (_, None) => true,
@@ -462,9 +288,7 @@ impl HarnessScreen {
         }
     }
 
-    /// THE PAGE LEFT THE SCREEN: what the acts marked and owed goes — no
-    /// re-read for a page nobody reads, no `Newer` left standing for its
-    /// return, whose arrival reads the ledgers afresh.
+    /// THE PAGE LEFT THE SCREEN: what the acts marked and owed goes — no re-read for a page nobody reads, no `Newer` left standing for its return, whose arrival reads the ledgers afresh.
     pub(crate) fn forget_acts(&mut self) {
         self.take_reread();
         self.last_act = None;
@@ -473,14 +297,7 @@ impl HarnessScreen {
 }
 
 impl HarnessScreen {
-    /// Session `session`'s published agent word just moved (a sweep's
-    /// publish, an input stall's): the stretch it closes goes to the bucket in
-    /// force, and the new word's opens at the instant the word moved (its
-    /// `changed_ms`, so no clock is read for it). `arm` is the session's arm
-    /// now, and `glass` its glass's say on why it may sit at its prompt
-    /// (`App::harness_ab_glass`: landed, pausing). A session whose program
-    /// is no supervisable agent counts in no phase — a shell's idle hours
-    /// are no agent's wait.
+    /// Session `session`'s published agent word just moved (a sweep's publish, an input stall's): the stretch it closes goes to the bucket in force, and the new word's opens at the instant the word moved (its `changed_ms`, so no clock is read for it).
     pub(crate) fn note_phase(
         &mut self,
         session: u64,
@@ -488,9 +305,6 @@ impl HarnessScreen {
         arm: AbArm,
         glass: (bool, bool),
     ) {
-        // The timeline's guard ends before the word is read as a phase: the
-        // session's locks are taken meta, then timeline, never the reverse
-        // (`aterm-census --locks`).
         let (agent, word, at_ms) = {
             let tl = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
             let agent = tl.agent();
@@ -506,10 +320,7 @@ impl HarnessScreen {
         self.ab.observe(session, phase, cause, arm, at_ms);
     }
 
-    /// THE A/B BOOK'S CALENDAR, read where the book is first fed: one wall
-    /// read, with the ledger instant it pairs with ([`AbBook::set_calendar`]).
-    /// Nothing once it is read; a moved wall reads it again
-    /// (`App::harness_ab_wall_moved`).
+    /// THE A/B BOOK'S CALENDAR, read where the book is first fed: one wall read, with the ledger instant it pairs with ([`AbBook::set_calendar`]).
     pub(crate) fn ab_calendar(&mut self) {
         if !self.ab.has_calendar() {
             self.ab.set_calendar(crate::harness_ab::AbCalendar::read(
@@ -521,84 +332,34 @@ impl HarnessScreen {
     }
 }
 
-// The published state
-
 /// One live supervisable agent session as the page lists it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct HarnessSession {
-    /// Its process-local id: what a press names.
     pub(crate) local_id: u64,
-    /// Its session id (`ctx.self_id`): what its ledgers' rows carry, so its
-    /// row's day is read from the reading's share under it (§10.3.3, item 5).
     pub(crate) sid: String,
-    /// Its tab title (the person's title, else the live one).
     pub(crate) title: String,
-    /// Where it is (`in tab 2`, `in window 1, tab 2`, `in its tab`), its pane
-    /// named where its tab holds more than one agent session (`in tab 1,
-    /// left pane`: `App::session_place`, §10.3.3 item 9).
     pub(crate) place: String,
-    /// The agent's product name ([`aterm_phase::Program::product`]): `Claude
-    /// Code`, `Codex`, `Antigravity CLI`, `Muse Code`.
     pub(crate) program: &'static str,
-    /// Its own Autopilot word (`None`: the table's default decides).
     pub(crate) word: Option<Autopilot>,
-    /// Its effective Autopilot under its own posture (the window's, joined
-    /// with its agent's own switch: [`HarnessPosture::for_agent`]).
     pub(crate) view: AutopilotView,
-    /// The default a press of its Cruise, Land or Off is weighed against
-    /// ([`hands_back`]) while the harness can steer it — its own posture's
-    /// ([`HarnessPosture::default_mode`]); `None` where it can steer none
-    /// (no host, the master switch or its agent's own switch Off), and its
-    /// buttons are inert.
     pub(crate) default: Option<Autopilot>,
-    /// Whether this host's live claim is on it.
     pub(crate) supervised: bool,
-    /// The harness's glass on its Autopilot chip (`App::chip_glass`): the
-    /// act it just took, its task's face, its timer — what the row's state
-    /// line says (§9.3.4).
     pub(crate) glass: ChipGlass,
-    /// The stored Cruise timer, independent of a readable local face.
     pub(crate) armed_at_ms: Option<i64>,
-    /// Who set its own word, and when (§11.7.1;
-    /// [`crate::autopilot::SetByWords`]), read with the word: `None` where it
-    /// runs under the default. Its row says it on the line under it
-    /// (`its own setting, set 14:05 over aterm ctl`,
-    /// [`HarnessSessionRow::setting`]).
     pub(crate) set_by: Option<crate::autopilot::SetByWords>,
-    /// A harness's need standing on it, in the worker's own words: its
-    /// published need where that is a harness's ask
-    /// ([`crate::needs::Need::harness`], design §12.2.3). STATUS counts the
-    /// sessions it stands on (`· 2 need you`); its row's state line leads
-    /// with it.
     pub(crate) need: Option<crate::needs::HarnessAsk>,
-    /// WHY LAND STILL HOLDS (§12.3.3 item 4): the hold on its
-    /// glass, with its `since` stamped where it arrived, where this host's
-    /// live claim is on it and its chip wears `⤓ land` (`App::shown_hold`);
-    /// its row's state line says it ([`HarnessSessionRow::state_line`]).
     pub(crate) hold: Option<crate::harness_glass::HeldGlass>,
 }
 
 /// One `[harness]` key of the effective table.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct HarnessConfigRow {
-    /// The key (`approve`; an agent's table's `codex.enabled`).
     pub(crate) key: String,
-    /// Its value, as the reader takes it back (`safe`).
     pub(crate) value: String,
-    /// Whether it is the full-power default's value.
     pub(crate) is_default: bool,
 }
 
-/// The effective `[harness]` table: every key of
-/// [`aterm_agent::supervise::config::KEYS`], in its order, its value, and
-/// whether that is the full-power default's ([`SupervisorConfig::texts`]
-/// against [`SupervisorConfig::default`]'s, the comparison
-/// `SupervisorConfig::against_default` starts from) — with each agent's own
-/// table's switch right after the master switch, as the SUPERVISION card
-/// orders them ([`SupervisorConfig::agent_texts`]: `codex.enabled`), and,
-/// last, a safe rule a retired key took away, under that key
-/// ([`SupervisorConfig::withheld_texts`]: never a default). Every key the
-/// policy reads, so what STATUS names as written is on this card.
+/// The effective `[harness]` table: every key of [`aterm_agent::supervise::config::KEYS`], in its order, its value, and whether that is the full-power default's ([`SupervisorConfig::texts`] against [`SupervisorConfig::default`]'s, the comparison `SupervisorConfig::against_default` starts from) — with each agent's own table's switch right after the master switch, as the SUPERVISION card orders them ([`SupervisorConfig::agent_texts`]: `codex.enabled`), and, last, a safe rule a retired key took away, under that key ([`SupervisorConfig::withheld_texts`]: never a default).
 #[must_use]
 pub(crate) fn config_rows(cfg: &SupervisorConfig) -> Vec<HarnessConfigRow> {
     let full = SupervisorConfig::default();
@@ -635,128 +396,71 @@ pub(crate) fn config_rows(cfg: &SupervisorConfig) -> Vec<HarnessConfigRow> {
     rows
 }
 
-/// THE SETTINGS ▸ HARNESS SNAPSHOT: plain data, published whole on every
-/// change ([`App::harness_state`]); the page renders its
-/// [`Self::projection`].
+/// THE SETTINGS ▸ HARNESS SNAPSHOT: plain data, published whole on every change ([`App::harness_state`]); the page renders its [`Self::projection`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct HarnessState {
-    /// Whether the host published it (a fresh Settings controller holds
-    /// [`Self::unobserved`] until the first publish, and says it is reading).
     pub(crate) observed: bool,
-    /// The policy as Settings shows it (`app_config::HarnessPolicy::words`).
     pub(crate) words: String,
-    /// The window's harness posture.
     pub(crate) posture: HarnessPosture,
-    /// Every live supervisable agent session, in local-id order.
     pub(crate) sessions: Vec<HarnessSession>,
-    /// The ledgers' reading.
     pub(crate) stats: HarnessStatsSlot,
-    /// The A/B book's week at the publish ([`AbWeek`]).
     pub(crate) ab: AbWeek,
-    /// The effective `[harness]` table.
     pub(crate) config: Vec<HarnessConfigRow>,
-    /// `[harness] land_at` as a session's Timer arms it if chosen at the
-    /// publish ([`crate::autopilot_timers::offer_glass`]): its time, and its
-    /// weekday once today's has passed. `None` where it is not set.
     pub(crate) land_at_offer: Option<LandAtGlass>,
-    /// The AI CLIs sub-page's snapshot ([`crate::ai_screen::AiState`]):
-    /// published with its parent's, so the one fan-out serves both pages.
     pub(crate) ai: crate::ai_screen::AiState,
-    /// The Tab Control Panel sub-page's snapshot ([`TabControlState`]):
-    /// all accessible computers, `aterm` instances, and open tabs with live
-    /// AI CLI telemetry.
     pub(crate) tabs: TabControlState,
-    /// The live sessions today's decisions name that SESSIONS does not list
-    /// (an agent that has exited, its tab still open): DECIDED FOR YOU names
-    /// them and shows their tab ([`Self::decided_rows`]).
     pub(crate) decided_open: Vec<OpenSession>,
-    /// The publish's local day (days since 1970-01-01, local time), from its
-    /// one wall read: a state line's clock from another day names its
-    /// weekday against it (§10.2.3, item 3), so the projection stays pure.
     pub(crate) today: i64,
 }
 
 /// One accessible computer in Settings ▸ Harness ▸ Tab Control (`/tabs`).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct TabComputer {
-    /// Stable identifier: `"local"`, an enrolled host's UUID/name, or
-    /// `"lan/…"` for advertisement-only discovery without session observations.
     pub(crate) id: String,
-    /// Display name (`"MacBook-Pro (this Mac)"` or `"mini"`).
     pub(crate) name: String,
-    /// Network address (`"local"` or `"192.168.1.42"`).
     pub(crate) address: String,
-    /// OS version (`"macOS"` / `"macOS 15.4"`).
     pub(crate) os_version: String,
-    /// Reachability word (`"online"`, `"standby"`, `"offline"`).
     pub(crate) status: String,
-    /// Live system telemetry summary (`CPU`, `GPU`, `RAM`, `Disk`, `Uptime`, `RTT`, sparklines).
     pub(crate) vitals: String,
-    /// Number of observed active `aterm` instances; unused for `lan/…` hosts.
     pub(crate) instances: usize,
-    /// Total open tabs/sessions across all `aterm` instances on this computer.
     pub(crate) tabs: usize,
-    /// Number of tabs running an AI CLI (`Claude Code`, `Codex`, `Antigravity CLI`, `Muse Code`, `Gemini CLI`).
     pub(crate) ai_clis: usize,
-    /// Number of AI CLI tabs currently working or waiting on input.
     pub(crate) active_ai: usize,
 }
 
 /// One row in the Tab Control Panel's sessions & tabs spreadsheet.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct TabSpreadsheetRow {
-    /// Unique row key (`local/7`, `sibling/4120/1`, `remote/mini/500/2`).
     pub(crate) key: String,
-    /// Computer display name (`"this Mac"`, `"mini"`).
     pub(crate) computer: String,
-    /// `aterm` instance label (`"this aterm"`, `"aterm-4120"`).
     pub(crate) instance: String,
-    /// Tab / window place (`"Tab 1*"`, `"Window 1, tab 2"`).
     pub(crate) place: String,
-    /// Session ID (`"s-1"`).
     pub(crate) sid: String,
-    /// Resolved tab title.
     pub(crate) title: String,
-    /// Session state (`"Running"`, `"Idle"`).
     pub(crate) state: String,
-    /// Foreground program or AI CLI product name (`"Claude Code"`, `"Codex"`, `"zsh"`).
     pub(crate) program: String,
-    /// Whether this tab is running an AI CLI.
     pub(crate) is_ai_cli: bool,
-    /// Live AI CLI status (`"working: thinking (14s)"`, `"waiting on permission: Bash (5s)"`, `"idle at prompt"`, or `"-"` for non-AI tabs).
     pub(crate) ai_status: String,
-    /// Autopilot mode (`"cruise"`, `"land"`, `"off"`, `"-"`).
     pub(crate) autopilot: String,
-    /// Human activity (`"12s ago"`, `"5m ago"`, `"-"`).
     pub(crate) human: String,
-    /// Live per-tab CPU cores and memory footprint (`"0.42c · 318 MiB"`).
     pub(crate) vitals: String,
-    /// Process-local session ID if this tab belongs to THIS `aterm` instance (enables `Show tab`).
     pub(crate) show_local_id: Option<u64>,
 }
 
-/// Snapshot of all accessible computers, `aterm` instances, and tabs for
-/// Settings ▸ Harness ▸ Tab Control (`/tabs`).
+/// Snapshot of all accessible computers, `aterm` instances, and tabs for Settings ▸ Harness ▸ Tab Control (`/tabs`).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct TabControlState {
-    /// Accessible computers (`this Mac` first, followed by managed LAN Macs).
     pub(crate) computers: Vec<TabComputer>,
-    /// All open tabs across accessible computers and `aterm` instances.
     pub(crate) tabs: Vec<TabSpreadsheetRow>,
 }
 
 /// Pure projection rendered by Settings ▸ Harness ▸ Tab Control (`/tabs`).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct TabControlProjection {
-    /// Whether the host has published.
     pub(crate) observed: bool,
-    /// Whether a background refresh is running.
     pub(crate) collecting: bool,
-    /// Summary facts for the OVERVIEW card (`Computers`, `Sessions & tabs`, `AI CLIs`).
     pub(crate) summary_rows: Vec<(String, String)>,
-    /// Accessible computers table rows.
     pub(crate) computers: Vec<TabComputer>,
-    /// Sessions & tabs spreadsheet rows.
     pub(crate) tabs: Vec<TabSpreadsheetRow>,
 }
 
@@ -861,37 +565,21 @@ impl TabControlState {
     }
 }
 
-/// A live session a decision names that is no SESSIONS row
-/// ([`HarnessState::decided_open`]).
+/// A live session a decision names that is no SESSIONS row ([`HarnessState::decided_open`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct OpenSession {
-    /// Its session id, as its rows carry it.
     pub(crate) sid: String,
-    /// Its process-local id: what `Show tab` raises.
     pub(crate) local_id: u64,
-    /// Its name as the page gives one ([`App::harness_session_name`], else
-    /// `SessionHandle::display_title`: no spinner frame).
     pub(crate) title: String,
 }
 
-/// One row of DECIDED FOR YOU (§10.4.1): a choice the harness made in the
-/// person's name today, worded.
+/// One row of DECIDED FOR YOU (§10.4.1): a choice the harness made in the person's name today, worded.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct DecidedRow {
-    /// Its key's last part (`harness/decided/<id>`): its decision's id
-    /// ([`aterm_agent::harness::stats::Decision::id`]), the same at every
-    /// reading, so the row keeps its key (and the focus kept by it) while
-    /// newer rows arrive or a dialog told late sorts in among older ones; a
-    /// second decision with the same id takes `-2`.
     pub(crate) id: String,
-    /// When it was made, as the local clock (`18:25`).
     pub(crate) clock: String,
-    /// What was asked and what the harness did, in one sentence
-    /// ([`decision_sentence`]).
     pub(crate) sentence: String,
-    /// The session's local id while it is open: its `Show tab` raises it.
     pub(crate) show: Option<u64>,
-    /// The session's name, as the sentence and its `Show tab` say it.
     pub(crate) name: String,
 }
 
@@ -915,7 +603,7 @@ impl HarnessState {
         }
     }
 
-    /// What the page shows, derived once ([`HarnessProjection`]). Pure.
+    /// What the page shows, derived once ([`HarnessProjection`]).
     #[must_use]
     pub(crate) fn projection(&self) -> HarnessProjection {
         HarnessProjection {
@@ -943,8 +631,7 @@ impl HarnessState {
         }
     }
 
-    /// Today's decisions (DECIDED FOR YOU, §10.4), kept or not; none before
-    /// a reading.
+    /// Today's decisions (DECIDED FOR YOU, §10.4), kept or not; none before a reading.
     #[must_use]
     pub(crate) fn decided_total(&self) -> u64 {
         self.stats
@@ -954,13 +641,7 @@ impl HarnessState {
             .map_or(0, |decided| decided.total)
     }
 
-    /// DECIDED FOR YOU'S ROWS (§10.4.2, item 3), newest first: each of
-    /// today's kept decisions at its clock time, keyed by its decision's id,
-    /// in one sentence that names its session as SESSIONS does — its live
-    /// title, with its place where another row shares the title — else by
-    /// the name of the live session SESSIONS does not list
-    /// ([`Self::decided_open`]), else `A closed session`; `Show tab` only
-    /// while the session is open. Pure.
+    /// DECIDED FOR YOU'S ROWS (§10.4.2, item 3), newest first: each of today's kept decisions at its clock time, keyed by its decision's id, in one sentence that names its session as SESSIONS does — its live title, with its place where another row shares the title — else by the name of the live session SESSIONS does not list ([`Self::decided_open`]), else `A closed session`; `Show tab` only while the session is open.
     #[must_use]
     pub(crate) fn decided_rows(&self) -> Vec<DecidedRow> {
         let Some(report) = self.stats.report.as_deref() else {
@@ -1000,8 +681,6 @@ impl HarnessState {
         rows
     }
 
-    /// The name a decision of session `sid`'s gives it, and its local id
-    /// while it is open.
     fn decision_session(&self, sid: &str) -> (String, Option<u64>) {
         if let Some(session) = self.sessions.iter().find(|s| s.sid == sid) {
             return (self.row_name(session), Some(session.local_id));
@@ -1017,8 +696,6 @@ impl HarnessState {
         (name.to_string(), None)
     }
 
-    /// A SESSIONS row's name: its title, and its place too where another row
-    /// shares the title (`✳ Claude Code, tab 1, left pane`).
     fn row_name(&self, session: &HarnessSession) -> String {
         let shared = self
             .sessions
@@ -1035,10 +712,6 @@ impl HarnessState {
         }
     }
 
-    /// The STATUS card: the policy's words and, with any session open, how
-    /// many of them the harness supervises. With none open the SESSIONS card
-    /// under it says so, so this card does not say it again. The build's
-    /// version is About's to say.
     fn status_rows(&self) -> Vec<(String, String)> {
         if !self.observed {
             return vec![("Supervision".to_string(), "reading\u{2026}".to_string())];
@@ -1059,8 +732,6 @@ impl HarnessState {
                 format!("{open} open \u{b7} no harness: this aterm has no control socket")
             }
         };
-        // The listed sessions a harness's ask stands on (§12.2.1): its own
-        // need, never an approval, a question or another owner's ask.
         let need_you = self.sessions.iter().filter(|s| s.need.is_some()).count();
         if need_you > 0 {
             sessions.push_str(&format!(
@@ -1074,16 +745,7 @@ impl HarnessState {
         ]
     }
 
-    /// TODAY'S NUMBERS under STATUS's facts (§10.3.1): the first three
-    /// nonzero families (`37 approved today · 12 kept going · 4 answered`,
-    /// drawn in Hero type where it fits; landings lead where there are any,
-    /// `2 landed today · 31 approved · 4 kept going`, §12.4.1, by
-    /// [`Families`]' order), then the rest and the person's wait
-    /// (`2 resumed · 1 land prompt · waited on you 4m`, plain; empty where
-    /// there is none). Only nonzero counts: `nothing yet today` for an empty
-    /// day, `reading…` before the first reading. `None` before the host
-    /// publishes and where no reading could be taken (WHAT THE HARNESS DID
-    /// says why). The 7-day numbers stay in that card. Pure.
+    /// TODAY'S NUMBERS under STATUS's facts (§10.3.1): the first three nonzero families (`37 approved today · 12 kept going · 4 answered`, drawn in Hero type where it fits; landings lead where there are any, `2 landed today · 31 approved · 4 kept going`, §12.4.1, by [`Families`]' order), then the rest and the person's wait (`2 resumed · 1 land prompt · waited on you 4m`, plain; empty where there is none).
     #[must_use]
     pub(crate) fn today_lines(&self) -> Option<(String, String)> {
         if !self.observed {
@@ -1104,8 +766,6 @@ impl HarnessState {
                 duration_words(today.human_wait_ms)
             ));
         }
-        // DECIDED FOR YOU's count (§10.4.1): the card under SESSIONS lists
-        // them.
         match self.decided_total() {
             0 => {}
             1 => rest.push("1 choice made for you".to_string()),
@@ -1124,10 +784,6 @@ impl HarnessState {
         ))
     }
 
-    /// The SESSIONS card's rows. Each is named by its title, and where two
-    /// rows share a title, by its place too (`✳ Claude Code, tab 1, left
-    /// pane`): its buttons are spoken by that name, so no two of them read
-    /// alike (§10.3.1, the pane).
     fn session_rows(&self) -> Vec<HarnessSessionRow> {
         let days = self.stats.report.as_deref().map(|report| &report.day_lines);
         self.sessions
@@ -1142,8 +798,6 @@ impl HarnessState {
                         crate::autopilot::agent_switch_off(agent).to_string()
                     }
                     AutopilotView::Unhosted => "no harness here".to_string(),
-                    // Whose word it runs under is its own line, under the
-                    // row ([`HarnessSessionRow::setting`]).
                     view => format!(
                         "{} \u{b7} autopilot {}",
                         if session.supervised {
@@ -1154,9 +808,6 @@ impl HarnessState {
                         view.wire(),
                     ),
                 };
-                // Each word once: a title that already names the agent (its
-                // product name standing in for none, or the agent's own
-                // "✳ Claude Code") is not followed by it again.
                 let detail = if names_program(&session.title, session.program) {
                     format!("{tab} \u{b7} {how}")
                 } else {
@@ -1182,11 +833,7 @@ impl HarnessState {
             .collect()
     }
 
-    /// SESSIONS' `Every session` ROW (design §11.5.1): where SESSIONS lists
-    /// two sessions or more — whatever the switches say, so a switch pressed
-    /// in SUPERVISION, under it, never adds or takes away a row and moves
-    /// itself under the pointer — how they stand and what each press would
-    /// move, by the press's own rule ([`EveryPress::moves`]). Pure.
+    /// SESSIONS' `Every session` ROW (design §11.5.1): where SESSIONS lists two sessions or more — whatever the switches say, so a switch pressed in SUPERVISION, under it, never adds or takes away a row and moves itself under the pointer — how they stand and what each press would move, by the press's own rule ([`EveryPress::moves`]).
     #[must_use]
     pub(crate) fn every_row(&self) -> Option<EveryRow> {
         use crate::autopilot_timers::TimerChoice;
@@ -1202,8 +849,6 @@ impl HarnessState {
             .filter(|s| mode(s) == Some(Autopilot::Cruise));
         let first = self.sessions.first().map(|s| s.program);
         let follows = || steered().filter(|s| EveryPress::Follow.moves(s));
-        // Where it steers none, why, in the rows' own words for the view they
-        // share (`harness off in Settings`, an agent's switch by name).
         let views = self
             .sessions
             .first()
@@ -1222,10 +867,6 @@ impl HarnessState {
             }
             _ => "the harness steers none of them",
         };
-        // A session under Land by the face its chip wears (§12.4.3, item 3):
-        // `⤓ land` landing, `✓ landed`, or `⤓ quiet` (a person's own
-        // exchange) — the three faces Land's view folds to, so the parts sum
-        // to the sessions under Land, as the presses count them.
         let wears =
             |face: ChipFace| move |s: &&HarnessSession| ChipFace::of(s.view, &s.glass) == face;
         Some(EveryRow {
@@ -1257,10 +898,6 @@ impl HarnessState {
         })
     }
 
-    /// The WHAT THE HARNESS DID card's facts: each count today and over 7
-    /// days, the person's wait as hours and minutes, a window the ledgers'
-    /// cut may have shortened, when the reading was taken, and — where a
-    /// later reading failed — why the counts are that older reading's.
     fn did_rows(&self) -> Vec<(String, String)> {
         let row = |label: &str, value: String| (label.to_string(), value);
         let Some(report) = self.stats.report.as_deref() else {
@@ -1273,8 +910,6 @@ impl HarnessState {
             };
             return vec![row("Activity", words)];
         };
-        // A reading that failed after this one landed: the counts below are
-        // the older reading's, and the page says why the newer is missing.
         let failed = self
             .stats
             .unavailable
@@ -1297,10 +932,6 @@ impl HarnessState {
                 )
             };
             rows.push(row(APPROVED.label, both(today.approved, week.approved)));
-            // Of those, the presses full power made that no safe rule proved:
-            // the row under Approved, labelled as part of it, both windows,
-            // only where the week had one (the week holds today), so it is
-            // said once — in DECIDED FOR YOU's words.
             if week.unproven > 0 {
                 rows.push(row(
                     UNPROVEN_OF_APPROVED,
@@ -1315,10 +946,6 @@ impl HarnessState {
                 row(ANSWERED.label, both(today.answered, week.answered)),
                 row(KEPT_GOING.label, both(today.continued, week.continued)),
             ]);
-            // Of those, the done claims the harness checked (§12.4.1): the
-            // row under Kept going, labelled as part of it, made as the one
-            // under Approved is — both windows, only where the week had one.
-            // Read from the reading's acts by rule, so no count is added.
             let (checked_today, checked_week) =
                 (done_claims_checked(today), done_claims_checked(week));
             if checked_week > 0 {
@@ -1327,14 +954,10 @@ impl HarnessState {
                     format!("{DONE_CLAIM_CHECKED} {}", both(checked_today, checked_week)),
                 ));
             }
-            // Land's landings, over the prompts that led to them (§12.4.1):
-            // wherever the week had either, so a landing moves a count and
-            // never brings a row of its own between two readings.
             if week.landed > 0 || week.land_prompts > 0 {
                 rows.push(row(LANDED.label, both(today.landed, week.landed)));
             }
             rows.extend([
-                // Land's prompts typed, never the landings they led to.
                 row(
                     LAND_PROMPTS.label,
                     both(today.land_prompts, week.land_prompts),
@@ -1344,9 +967,6 @@ impl HarnessState {
                 row(UPGRADED.label, both(today.upgraded, week.upgraded)),
                 row(NEEDED_YOU.label, both(today.escalated, week.escalated)),
             ]);
-            // A worker's NEEDS YOU put on the person's screen while the work
-            // went on (never a stop, so never in "Needed you"): a row of its
-            // own, only where the week had one.
             if week.needs_told > 0 {
                 rows.push(row(
                     NEEDS_TOLD.label,
@@ -1388,17 +1008,13 @@ impl HarnessState {
     }
 }
 
-/// When a reading was taken, as a clock time — `at 14:05`, `at 14:05 UTC`
-/// where the zone could not be read. Absolute, never "3 min ago": nothing
-/// republishes the page while it stands open, so a relative time would go
-/// stale on the glass.
+/// When a reading was taken, as a clock time — `at 14:05`, `at 14:05 UTC` where the zone could not be read.
 #[must_use]
 pub(crate) fn read_at_words(collected_ms: i64, offset_s: Option<i64>) -> String {
     format!("at {}", clock_words(collected_ms, offset_s))
 }
 
-/// Unix ms `at_ms` as the local clock under `offset_s` (`14:05`; `14:05 UTC`
-/// where the zone could not be read).
+/// Unix ms `at_ms` as the local clock under `offset_s` (`14:05`; `14:05 UTC` where the zone could not be read).
 #[must_use]
 pub(crate) fn clock_words(at_ms: i64, offset_s: Option<i64>) -> String {
     let local_s = at_ms.div_euclid(1000).saturating_add(offset_s.unwrap_or(0));
@@ -1407,12 +1023,7 @@ pub(crate) fn clock_words(at_ms: i64, offset_s: Option<i64>) -> String {
     format!("{:02}:{:02}{zone}", of_day / 3600, (of_day % 3600) / 60)
 }
 
-/// A SESSIONS ROW'S SETTING LINE (design §11.7.1, §11.7.7): whose word
-/// `session` runs under — `its own setting, set 14:05 over aterm ctl` (who
-/// set it and when: clock times, never ages, the day named against
-/// `today`), `its own setting` where nothing is known of its setter, or
-/// `follows the default`. Every row says one, so a press that moves a word
-/// moves no row.
+/// A SESSIONS ROW'S SETTING LINE (design §11.7.1, §11.7.7): whose word `session` runs under — `its own setting, set 14:05 over aterm ctl` (who set it and when: clock times, never ages, the day named against `today`), `its own setting` where nothing is known of its setter, or `follows the default`.
 pub(crate) fn setting_line(session: &HarnessSession, today: i64) -> String {
     match (session.word, &session.set_by) {
         (Some(_), Some(set_by)) => format!("its own setting, {}", set_by.line(Some(today))),
@@ -1421,26 +1032,19 @@ pub(crate) fn setting_line(session: &HarnessSession, today: i64) -> String {
     }
 }
 
-/// STATUS's today line on a day the harness has not acted
-/// ([`HarnessState::today_lines`]): a note, no count.
+/// STATUS's today line on a day the harness has not acted ([`HarnessState::today_lines`]): a note, no count.
 pub(crate) const TODAY_NOTHING_YET: &str = "nothing yet today";
 
 /// STATUS's today line before the first reading: a note, no count.
 pub(crate) const TODAY_READING: &str = "reading\u{2026}";
 
-/// Whether STATUS's today `line` counts (`37 approved today · …`), as
-/// against one of its notes ([`TODAY_NOTHING_YET`], [`TODAY_READING`]):
-/// only a line of counts is drawn in Hero type (
-/// owner-eye-7).
+/// Whether STATUS's today `line` counts (`37 approved today · …`), as against one of its notes ([`TODAY_NOTHING_YET`], [`TODAY_READING`]): only a line of counts is drawn in Hero type ( owner-eye-7).
 #[must_use]
 pub(crate) fn today_counts(line: &str) -> bool {
     line != TODAY_NOTHING_YET && line != TODAY_READING
 }
 
-/// The families of acts a day says, in the order it says them: landed,
-/// approved, kept going, answered, resumed, land prompts, declined,
-/// relaunched, upgraded. Landings lead (§12.4.1): a day that landed work
-/// says so first, ahead of the acts that led to it.
+/// The families of acts a day says, in the order it says them: landed, approved, kept going, answered, resumed, land prompts, declined, relaunched, upgraded.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Families([u64; 9]);
 
@@ -1478,25 +1082,15 @@ impl Families {
     }
 }
 
-/// ONE NAME FOR EACH COUNT (owner-eye-6): the
-/// words a count is said in on Settings ▸ Harness — STATUS's today line,
-/// each SESSIONS row's day line, and its label in WHAT THE HARNESS DID — so
-/// a count is named one way on the whole page, and, where the chip lights
-/// the act, in the chip's own word (`↻ kept going`, `✓ approved`:
-/// [`aterm_agent::harness::acts::Act::word`]).
+/// ONE NAME FOR EACH COUNT (owner-eye-6): the words a count is said in on Settings ▸ Harness — STATUS's today line, each SESSIONS row's day line, and its label in WHAT THE HARNESS DID — so a count is named one way on the whole page, and, where the chip lights the act, in the chip's own word (`↻ kept going`, `✓ approved`: [`aterm_agent::harness::acts::Act::word`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct CountWords {
-    /// WHAT THE HARNESS DID's label (`Kept going`): the line's word for
-    /// more than one, its first letter upper case.
     pub(crate) label: &'static str,
-    /// A line's word after a count of one (`1 land prompt`).
     pub(crate) one: &'static str,
-    /// After any other count (`2 land prompts`).
     pub(crate) many: &'static str,
 }
 
 impl CountWords {
-    /// A count the chip lights as an act: its word, whatever the count.
     const fn act(label: &'static str, act: aterm_agent::harness::acts::Act) -> Self {
         Self {
             label,
@@ -1515,38 +1109,17 @@ impl CountWords {
 /// Boxes the harness approved.
 pub(crate) const APPROVED: CountWords =
     CountWords::act("Approved", aterm_agent::harness::acts::Act::Approved);
-/// THE PRESSES NO SAFE RULE PROVED (the ledger's `unproven:` approvals, the
-/// review of v3/polish-page's fixes): of the approved, those full
-/// power made where no safe rule proved the box. One wording wherever the
-/// page says them — DECIDED FOR YOU's sentence for one (`…; no safe rule
-/// proved it`) and WHAT THE HARNESS DID's row under Approved, labelled as a
-/// part of it ([`UNPROVEN_OF_APPROVED`]: `of those no safe rule proved 40
-/// today · 45 in 7 days`), so no one adds it to the approved. Never
-/// "unproven", the ledger's word.
+/// THE PRESSES NO SAFE RULE PROVED (the ledger's `unproven:` approvals, the review of v3/polish-page's fixes): of the approved, those full power made where no safe rule proved the box.
 pub(crate) const NO_SAFE_RULE_PROVED: &str = "no safe rule proved";
-/// WHAT THE HARNESS DID's label for [`NO_SAFE_RULE_PROVED`]'s row: a part of
-/// the Approved row over it.
+/// WHAT THE HARNESS DID's label for [`NO_SAFE_RULE_PROVED`]'s row: a part of the Approved row over it.
 pub(crate) const UNPROVEN_OF_APPROVED: &str = "of those";
 /// Turns the harness continued (`Counter::Continued`).
 pub(crate) const KEPT_GOING: CountWords =
     CountWords::act("Kept going", aterm_agent::harness::acts::Act::Continued);
-/// THE DONE CLAIMS THE HARNESS CHECKED (§12.4.1): of the turns it kept
-/// going, those that claimed done and were answered with Cruise's
-/// defend-and-find-more prompt. WHAT THE HARNESS DID's row under Kept going,
-/// labelled as a part of it ([`DONE_CHECKED_OF_KEPT_GOING`]: `of them  a
-/// done claim checked 4 today · 12 in 7 days`), so no one adds it to the
-/// turns kept going. The chip's trail keeps `↻ kept going` for them.
+/// THE DONE CLAIMS THE HARNESS CHECKED (§12.4.1): of the turns it kept going, those that claimed done and were answered with Cruise's defend-and-find-more prompt.
 pub(crate) const DONE_CLAIM_CHECKED: &str = "a done claim checked";
-/// WHAT THE HARNESS DID's label for [`DONE_CLAIM_CHECKED`]'s row: a part of
-/// the Kept going row over it. Not [`UNPROVEN_OF_APPROVED`]'s words: each
-/// fact of a card is keyed by its label.
+/// WHAT THE HARNESS DID's label for [`DONE_CLAIM_CHECKED`]'s row: a part of the Kept going row over it.
 pub(crate) const DONE_CHECKED_OF_KEPT_GOING: &str = "of them";
-/// The ledger's rules a done claim was checked under: Cruise's done check
-/// (`continue-done-check@v1`), and the two challenges older builds typed at
-/// a done report instead (`continue-open-items@v1`,
-/// `continue-uncommitted@v1`; retired with Autopilot Cruise, whose done check
-/// carries their words), which a 7-day window still reads. Each is one of
-/// the turns kept going (`acts::sort`).
 const DONE_CLAIM_RULES: [&str; 3] = {
     use aterm_agent::supervise::policy::turn_end::{
         RULE_DONE_CHECK, RULE_OPEN_ITEMS, RULE_UNCOMMITTED,
@@ -1554,8 +1127,6 @@ const DONE_CLAIM_RULES: [&str; 3] = {
     [RULE_DONE_CHECK, RULE_OPEN_ITEMS, RULE_UNCOMMITTED]
 };
 
-/// How many done claims the harness checked in `window`: its acts under
-/// [`DONE_CLAIM_RULES`], read from the reading's `by_rule`.
 fn done_claims_checked(window: &HarnessStats) -> u64 {
     DONE_CLAIM_RULES
         .iter()
@@ -1569,17 +1140,13 @@ pub(crate) const ANSWERED: CountWords =
 /// Work carried past a wall.
 pub(crate) const RESUMED: CountWords =
     CountWords::act("Resumed", aterm_agent::harness::acts::Act::Resumed);
-/// Land's instruction and its nudges typed: prompts, never landings (the
-/// chip's `⤓ landing` and `⤓ nudged` light the same rows).
+/// Land's instruction and its nudges typed: prompts, never landings (the chip's `⤓ landing` and `⤓ nudged` light the same rows).
 pub(crate) const LAND_PROMPTS: CountWords = CountWords {
     label: "Land prompts",
     one: "land prompt",
     many: "land prompts",
 };
-/// Land's landings: all of the work on the remote main branch, defended
-/// clean at a land act's yield, each counted once at its first note
-/// ([`HarnessStats::landed`], §12.4.3 item 2) — the word the chip's `✓
-/// landed` says.
+/// Land's landings: all of the work on the remote main branch, defended clean at a land act's yield, each counted once at its first note ([`HarnessStats::landed`], §12.4.3 item 2) — the word the chip's `✓ landed` says.
 pub(crate) const LANDED: CountWords = CountWords {
     label: "Landed",
     one: "landed",
@@ -1600,17 +1167,14 @@ pub(crate) const UPGRADED: CountWords = CountWords {
     one: "upgraded",
     many: "upgraded",
 };
-/// Times the harness stopped and asked the person (its escalations): a day
-/// line says how often (`needed you once`).
+/// Times the harness stopped and asked the person (its escalations): a day line says how often (`needed you once`).
 pub(crate) const NEEDED_YOU: CountWords = CountWords {
     label: "Needed you",
     one: "needed you",
     many: "needed you",
 };
 
-/// Times a worker's `NEEDS YOU:` line went on the person's screen as an
-/// `owner=needs` ask while the work went on (Autopilot Cruise / Land):
-/// never a stop, so never one of [`NEEDED_YOU`]'s.
+/// Times a worker's `NEEDS YOU:` line went on the person's screen as an `owner=needs` ask while the work went on (Autopilot Cruise / Land): never a stop, so never one of [`NEEDED_YOU`]'s.
 pub(crate) const NEEDS_TOLD: CountWords = CountWords {
     label: "Needs told",
     one: "need told",
@@ -1630,8 +1194,7 @@ pub(crate) const FAMILY_WORDS: [CountWords; 9] = [
     UPGRADED,
 ];
 
-/// The nonzero families, each in its words (`31 approved`, `1 kept going`,
-/// `1 land prompt`), in [`Families`]' order.
+/// The nonzero families, each in its words (`31 approved`, `1 kept going`, `1 land prompt`), in [`Families`]' order.
 #[must_use]
 pub(crate) fn families(counts: Families) -> Vec<String> {
     counts
@@ -1643,8 +1206,6 @@ pub(crate) fn families(counts: Families) -> Vec<String> {
         .collect()
 }
 
-/// A session's day line under the zone at its escalation, where it had
-/// one. Called by the reader, never by a frame or the page's projection.
 fn day_line_at(
     tally: &aterm_agent::harness::stats::Tally,
     offset_at: &dyn Fn(i64) -> Option<i64>,
@@ -1655,15 +1216,7 @@ fn day_line_at(
     day_line(tally, offset)
 }
 
-/// A SESSIONS ROW'S DAY (§10.3.1) from its share of today's reading:
-/// `today:`, then `needed you N times, <wait> at <the last escalation's
-/// clock>` where it needed the person, then `N needs told` where its worker's
-/// NEEDS YOU went on screen, then at most three nonzero counts, its landings
-/// first ([`Families`]' order, §12.4.1), then `partial` where its own
-/// ledgers' cut may have shortened the day — `today: needed you once, 1m at
-/// 18:29 · 31 approved · 1 kept going`, `today: 1 landed · 31 approved · 3
-/// land prompts`.
-/// `None` for a day with nothing to say. Pure.
+/// A SESSIONS ROW'S DAY (§10.3.1) from its share of today's reading: `today:`, then `needed you N times, <wait> at <the last escalation's clock>` where it needed the person, then `N needs told` where its worker's NEEDS YOU went on screen, then at most three nonzero counts, its landings first ([`Families`]' order, §12.4.1), then `partial` where its own ledgers' cut may have shortened the day — `today: needed you once, 1m at 18:29 · 31 approved · 1 kept going`, `today: 1 landed · 31 approved · 3 land prompts`.
 #[must_use]
 pub(crate) fn day_line(
     tally: &aterm_agent::harness::stats::Tally,
@@ -1695,8 +1248,6 @@ pub(crate) fn day_line(
     (!parts.is_empty()).then(|| format!("today: {}", parts.join(crate::native_ui::FACT_SEPARATOR)))
 }
 
-/// One key of the effective table as the card states it: the key, then its
-/// value (`(none)` for an empty one) and whether it is the default or yours.
 fn config_fact(row: &HarnessConfigRow) -> (String, String) {
     let value = if row.value.is_empty() {
         "(none)"
@@ -1707,8 +1258,7 @@ fn config_fact(row: &HarnessConfigRow) -> (String, String) {
     (row.key.to_string(), format!("{value} \u{b7} {whose}"))
 }
 
-/// `part` of `whole` as a whole percent, never rounded to a claim it is not:
-/// a share above nothing reads `<1%`, one short of all `>99%`.
+/// `part` of `whole` as a whole percent, never rounded to a claim it is not: a share above nothing reads `<1%`, one short of all `>99%`.
 #[must_use]
 pub(crate) fn share_words(part: u64, whole: u64) -> String {
     if whole == 0 {
@@ -1724,8 +1274,7 @@ pub(crate) fn share_words(part: u64, whole: u64) -> String {
     }
 }
 
-/// A duration as hours and minutes (`2h 5m`, `45m`, `3h`); under a minute
-/// but not nothing, `<1m`.
+/// A duration as hours and minutes (`2h 5m`, `45m`, `3h`); under a minute but not nothing, `<1m`.
 #[must_use]
 pub(crate) fn duration_words(ms: u64) -> String {
     let minutes = ms / 60_000;
@@ -1739,21 +1288,7 @@ pub(crate) fn duration_words(ms: u64) -> String {
     }
 }
 
-/// A DECISION IN ONE SENTENCE (§10.4.1), its session named `name`, the
-/// agent's words in quotes:
-///
-/// * a dialog: `<name> asked “<question>” → the harness chose <option>:
-///   <why>`;
-/// * a prose question: `<name> asked “<question>” → <the answer>` (`said`
-///   where the words are the agent's last row at the turn's end);
-/// * an unproven press: `<name>: pressed Yes on <command head> ×N under
-///   Approve permission boxes: All; no safe rule proved it` — or, where full
-///   power chose another of the box's options, `chose “<option>” on <command
-///   head>` — the switch that pressed it named, never "unsafe";
-/// * a refusal: `<name>: declined <command head>: <the reason it gave>`;
-/// * a limit reset kept: `<name>: kept its limit reset unspent: <why>`.
-///
-/// Pure.
+/// A DECISION IN ONE SENTENCE (§10.4.1), its session named `name`, the agent's words in quotes:
 #[must_use]
 pub(crate) fn decision_sentence(
     decision: &aterm_agent::harness::stats::Decision,
@@ -1824,8 +1359,6 @@ pub(crate) fn decision_sentence(
     }
 }
 
-/// A tab's place as a row leads with it: `in tab 2` → `Tab 2`, `in window 1,
-/// tab 2` → `Window 1, tab 2`, and a tab no window shows `Its tab`.
 fn place_words(place: &str) -> String {
     let bare = place.strip_prefix("in ").unwrap_or(place);
     let mut chars = bare.chars();
@@ -1838,100 +1371,45 @@ fn place_words(place: &str) -> String {
 /// What Settings ▸ Harness renders ([`HarnessState::projection`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct HarnessProjection {
-    /// Whether the host has published.
     pub(crate) observed: bool,
-    /// The STATUS card's facts.
     pub(crate) status_rows: Vec<(String, String)>,
-    /// Today's numbers under them ([`HarnessState::today_lines`]).
     pub(crate) today: Option<(String, String)>,
-    /// The SESSIONS card's rows (empty: no supervisable agent session).
     pub(crate) sessions: Vec<HarnessSessionRow>,
-    /// The `Every session` row after them ([`HarnessState::every_row`]):
-    /// `None` where SESSIONS lists fewer than two sessions.
     pub(crate) every: Option<EveryRow>,
-    /// A ledgers' reading is running (Refresh is busy).
     pub(crate) collecting: bool,
-    /// The WHAT THE HARNESS DID card's facts.
     pub(crate) did_rows: Vec<(String, String)>,
-    /// The EFFECT OF EACH AUTOPILOT card's facts.
     pub(crate) ab_rows: Vec<(String, String)>,
-    /// What that card opens with, where it leads ([`crate::harness_ab::ab_lead`]).
     pub(crate) ab_lead: Option<crate::harness_ab::AbLead>,
-    /// The SETTINGS IN ATERM.TOML card's facts: each key, and its value with
-    /// `default` or `yours` — the card's list with its disclosure open.
     pub(crate) config_rows: Vec<(String, String)>,
-    /// Of [`Self::config_rows`], the keys the person wrote: the card's list
-    /// with its disclosure closed (the rest are at their defaults).
     pub(crate) config_own: Vec<(String, String)>,
-    /// The Timer's `at` offer ([`HarnessState::land_at_offer`]).
     pub(crate) land_at_offer: Option<LandAtGlass>,
-    /// What Settings ▸ Harness ▸ AI CLIs renders
-    /// ([`crate::ai_screen::AiProjection`]).
     pub(crate) ai: crate::ai_screen::AiProjection,
-    /// What Settings ▸ Harness ▸ Tab Control renders ([`TabControlProjection`]).
     pub(crate) tabs: TabControlProjection,
-    /// DECIDED FOR YOU's rows, newest first ([`HarnessState::decided_rows`]):
-    /// empty on a day with no decision, and the card is not drawn.
     pub(crate) decided: Vec<DecidedRow>,
-    /// Today's decisions, kept or not ([`HarnessState::decided_total`]).
     pub(crate) decided_total: u64,
 }
 
 /// One SESSIONS row: what it is and its three-way control.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct HarnessSessionRow {
-    /// The session a press names.
     pub(crate) local_id: u64,
-    /// Its tab title.
     pub(crate) title: String,
-    /// What its buttons are spoken by: its title, and its place too where
-    /// another row shares the title (`✳ Claude Code, tab 1, left pane`).
     pub(crate) name: String,
-    /// Its tab (and pane, where its tab holds two agents), its agent, and how
-    /// the harness holds it.
     pub(crate) detail: String,
-    /// Its day under its state line ([`day_line`]): `None` where today's
-    /// reading holds nothing of it, or none has landed.
     pub(crate) day_line: Option<String>,
-    /// The mode it runs under — the selected button — or `None` where the
-    /// harness runs none (the master switch or its agent's switch off, no
-    /// host).
     pub(crate) mode: Option<Autopilot>,
-    /// Whether its Cruise, Land and Off act, and the default they are
-    /// weighed against: its session's [`HarnessSession::default`] — `Some`
-    /// only while the harness can steer this session. Where it carries
-    /// (Cruise or Land) the default's button hands the session back to it
-    /// ([`hands_back`], [`App::execute_native_harness`]); an Off default's
-    /// button pins Off like any other press.
     pub(crate) default: Option<Autopilot>,
-    /// Its effective Autopilot, the chip's view.
     pub(crate) view: AutopilotView,
-    /// The harness's glass on its chip, which its state line is formatted
-    /// from ([`Self::state_line`]).
     pub(crate) glass: ChipGlass,
-    /// The stored Cruise timer, independent of a readable local face.
     pub(crate) armed_at_ms: Option<i64>,
-    /// The publish's local day ([`HarnessState::today`]): a state line's
-    /// clock from another day names its weekday.
     pub(crate) today: i64,
-    /// Whose word it runs under, on the line under the row (design §11.7.1,
-    /// §11.7.7; [`setting_line`]): `its own setting, set 14:05 over aterm
-    /// ctl`, or `follows the default`. Every row has the line, so a press
-    /// that moves its word changes these words and no row's height.
     pub(crate) setting: String,
-    /// A harness's need standing on its session ([`HarnessSession::need`]):
-    /// its state line's head.
     pub(crate) need: Option<crate::needs::HarnessAsk>,
-    /// Land's hold on its session ([`HarnessSession::hold`]): its state
-    /// line's Land arm.
     pub(crate) hold: Option<crate::harness_glass::HeldGlass>,
 }
 
 impl HarnessSessionRow {
-    /// Where its session is — its detail's lead (`Tab 1, left pane`,
-    /// `Window 2, tab 1, right pane`): what tells two agents of one tab
-    /// apart, so the page lays the row out where it is drawn whole
-    /// (`native_settings::harness_page`'s `session_rows`).
+    /// Where its session is — its detail's lead (`Tab 1, left pane`, `Window 2, tab 1, right pane`): what tells two agents of one tab apart, so the page lays the row out where it is drawn whole (`native_settings::harness_page`'s `session_rows`).
     #[must_use]
     pub(crate) fn place(&self) -> &str {
         self.detail
@@ -1939,30 +1417,7 @@ impl HarnessSessionRow {
             .map_or(self.detail.as_str(), |(lead, _)| lead)
     }
 
-    /// The row's STATE LINE (§9.3.4, §10.2.3 item 2), led by a harness's need
-    /// where one stands (`needs you: … (+1 more); carrying on · `, §12.2.1),
-    /// formatted from its glass under its view as the chip's face reads it
-    /// ([`ChipFace::of`]):
-    /// `lands at 18:00` (`lands Sat 16:00` on another day), under Land
-    /// `landed 17:42` and `quiet: a person's own exchange`; else the
-    /// loop's pause after short turns (`pausing until 18:41 (3 short turns
-    /// in a row)`, §10.5.1); else the trail's newest act (`last: ✓ approved
-    /// 14:05`). Clock times only, never
-    /// an age (§9.0), each from another local day than the publish's
-    /// ([`Self::today`]) with its weekday (`landed Fri 18:11`, `last: ✓
-    /// approved Fri 17:58`, §10.2.3 item 3). `None` at rest — v1's row.
-    /// The SESSIONS card draws it under the row's head
-    /// (`native_settings_harness`'s `session_row`).
-    ///
-    /// UNDER `⤓ land`, WHERE A HOLD STANDS (§12.3.1): why Land
-    /// still holds, then the pause — `not landed yet: needs you: rotate the
-    /// deploy key; 2 unpushed commits; open work in its report: follow-up ·
-    /// landing since 14:02 · 3 nudges · pausing until 14:40 (3 short turns
-    /// in a row)`, or, once the instruction is typed and before its yield,
-    /// `landing since 14:02` and the pause
-    /// ([`crate::harness_glass::hold_words`]' line form). Where the hold
-    /// names the need it leads with, the need is not said twice. Before the
-    /// instruction, main's line.
+    /// The row's STATE LINE (§9.3.4, §10.2.3 item 2), led by a harness's need where one stands (`needs you: … (+1 more); carrying on · `, §12.2.1), formatted from its glass under its view as the chip's face reads it ([`ChipFace::of`]): `lands at 18:00` (`lands Sat 16:00` on another day), under Land `landed 17:42` and `quiet: a person's own exchange`; else the loop's pause after short turns (`pausing until 18:41 (3 short turns in a row)`, §10.5.1); else the trail's newest act (`last: ✓ approved 14:05`).
     #[must_use]
     pub(crate) fn state_line(&self) -> Option<String> {
         let glass = &self.glass;
@@ -1981,7 +1436,6 @@ impl HarnessSessionRow {
             ChipFace::CruiseUntil => glass.land_at.map(lands),
             ChipFace::Landed => Some(at("landed")),
             ChipFace::Theirs => Some("quiet: a person's own exchange".to_owned()),
-            // Why Land still holds, and the pause it waits out beside it.
             ChipFace::Land => hold
                 .and_then(|hold| {
                     crate::harness_glass::hold_words(
@@ -2005,7 +1459,6 @@ impl HarnessSessionRow {
             | ChipFace::AgentOff(_)
             | ChipFace::Unhosted => None,
         };
-        // A hold whose words name the need standing says it once.
         let need = self.need.as_ref().filter(|_| {
             !hold.is_some_and(|hold| {
                 hold.read() && hold.held.holds(aterm_agent::harness::acts::HoldLeg::Needs)
@@ -2023,8 +1476,6 @@ impl HarnessSessionRow {
                     )
                 })
             });
-        // A harness's need leads (§12.2.1), in the worker's words, whole:
-        // the line wraps, never cuts.
         match (need.map(need_head), rest) {
             (Some(need), Some(rest)) => {
                 Some(format!("{need}{}{rest}", crate::native_ui::FACT_SEPARATOR))
@@ -2034,23 +1485,15 @@ impl HarnessSessionRow {
     }
 }
 
-/// A state line's head where a harness's need stands (§12.2.1): `needs you:
-/// <the need> (+1 more); carrying on`. The chip's title says the same words,
-/// made title-safe (`harness_glass::need_title`).
+/// A state line's head where a harness's need stands (§12.2.1): `needs you: <the need> (+1 more); carrying on`.
 pub(crate) fn need_head(ask: &crate::needs::HarnessAsk) -> String {
     format!("needs you: {}{}; carrying on", ask.first, ask.more_words())
 }
 
-/// THE LANDING (§10.3.3, item 8): the host opens Settings ▸ Harness with this
-/// action ([`App::open_harness_settings`]), its value a [`HarnessFocus`]'s
-/// words, and the page's list lands on that row (drawn selected) or card.
+/// THE LANDING (§10.3.3, item 8): the host opens Settings ▸ Harness with this action ([`App::open_harness_settings`]), its value a [`HarnessFocus`]'s words, and the page's list lands on that row (drawn selected) or card.
 pub(crate) const HARNESS_LAND: &str = "harness/land";
 
-/// WHERE SETTINGS ▸ HARNESS LANDS as it opens
-/// (`docs/DESIGN-harness-autopilot-2026-10-15.md` §10.3.3, item 8): its top
-/// (View ▸ Coding Agent Harness…, the palette), a session's row (the
-/// Autopilot menu's `Harness settings…`), or SUPERVISION (an `⊘ off` chip:
-/// the switch that turned it off is there).
+/// WHERE SETTINGS ▸ HARNESS LANDS as it opens (`docs/DESIGN-harness-autopilot-2026-10-15.md` §10.3.3, item 8): its top (View ▸ Coding Agent Harness…, the palette), a session's row (the Autopilot menu's `Harness settings…`), or SUPERVISION (an `⊘ off` chip: the switch that turned it off is there).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum HarnessFocus {
     /// The page's top.
@@ -2063,8 +1506,7 @@ pub(crate) enum HarnessFocus {
 }
 
 impl HarnessFocus {
-    /// Its words on the page's landing action (`top`, `session/7`,
-    /// `supervision`).
+    /// Its words on the page's landing action (`top`, `session/7`, `supervision`).
     #[must_use]
     pub(crate) fn wire(self) -> String {
         match self {
@@ -2089,16 +1531,10 @@ impl HarnessFocus {
     }
 }
 
-/// Every action of a SESSIONS row starts with this: a press that writes a
-/// session's Autopilot word. The control surface keeps it Owner-only, as it
-/// keeps `meta set autopilot` (`control::argument_escalation`, and the front
-/// Settings surface on this page, `FrontControlSurface::HarnessSettings`):
-/// Off to Cruise puts the harness's hands back on a session its owner took
-/// them off (§2.1), which the Settings fine op does not reach.
+/// Every action of a SESSIONS row starts with this: a press that writes a session's Autopilot word.
 pub(crate) const SESSION_ACTION_PREFIX: &str = "harness/session/";
 
-/// A session's Autopilot button's action and key:
-/// `harness/session/<local_id>/autopilot/<word>`.
+/// A session's Autopilot button's action and key: `harness/session/<local_id>/autopilot/<word>`.
 #[must_use]
 pub(crate) fn autopilot_action(local_id: u64, mode: Autopilot) -> String {
     format!(
@@ -2107,8 +1543,7 @@ pub(crate) fn autopilot_action(local_id: u64, mode: Autopilot) -> String {
     )
 }
 
-/// [`autopilot_action`] read back: the session and the mode, or `None` for
-/// any other action.
+/// [`autopilot_action`] read back: the session and the mode, or `None` for any other action.
 #[must_use]
 pub(crate) fn parse_autopilot_action(action: &str) -> Option<(u64, Autopilot)> {
     let rest = action.strip_prefix(SESSION_ACTION_PREFIX)?;
@@ -2116,59 +1551,34 @@ pub(crate) fn parse_autopilot_action(action: &str) -> Option<(u64, Autopilot)> {
     Some((id.parse().ok()?, Autopilot::parse(word)?))
 }
 
-/// Whether a SESSIONS row's press of `pressed` under a default of `default`
-/// hands the session back to the default (its own word cleared) rather than
-/// writing `pressed` as its word ([`App::execute_native_harness`]): only a
-/// press of the default's own mode, and only where that default CARRIES the
-/// work (Cruise or Land). An Off press is always written — pinned, as the
-/// footer's chip pins it — so following a default of Off never leaves a
-/// session the owner turned off here open to a default moved up later
-/// (fail-closed). The page's button that hands back says so. Pure.
+/// Whether a SESSIONS row's press of `pressed` under a default of `default` hands the session back to the default (its own word cleared) rather than writing `pressed` as its word ([`App::execute_native_harness`]): only a press of the default's own mode, and only where that default CARRIES the work (Cruise or Land).
 #[must_use]
 pub(crate) fn hands_back(pressed: Autopilot, default: Autopilot) -> bool {
     pressed == default && AutopilotView::from_mode(default).carries()
 }
 
-/// THE PAGE'S ONE RULE FOR A MODE PRESS (design §11.5.3, item 3): the word a
-/// press of `pressed` writes under a default of `default` — `None`, the
-/// session's own word cleared, where the press hands the session back
-/// ([`hands_back`]), else `pressed`. A SESSIONS row's buttons
-/// ([`App::press_page_mode`]) and the `Every session` row
-/// ([`App::press_autopilot_every`]) both write it, so a bulk Land under a
-/// default of Land hands each session back as the row's Land does. The chip
-/// and the menu keep pinning. Pure.
+/// THE PAGE'S ONE RULE FOR A MODE PRESS (design §11.5.3, item 3): the word a press of `pressed` writes under a default of `default` — `None`, the session's own word cleared, where the press hands the session back ([`hands_back`]), else `pressed`.
 #[must_use]
 pub(crate) fn page_word(pressed: Autopilot, default: Autopilot) -> Option<Autopilot> {
     (!hands_back(pressed, default)).then_some(pressed)
 }
 
-/// The `Every session` row's id in its keys: `harness/session/all/…`, under
-/// [`SESSION_ACTION_PREFIX`] on purpose, so the prefix's one Owner fence
-/// covers them, fail-closed (design §11.5.2). No session's local id reads as
-/// it ([`parse_autopilot_action`] parses a number).
+/// The `Every session` row's id in its keys: `harness/session/all/…`, under [`SESSION_ACTION_PREFIX`] on purpose, so the prefix's one Owner fence covers them, fail-closed (design §11.5.2).
 pub(crate) const EVERY_ID: &str = "all";
 
-/// A PRESS ON SESSIONS' `Every session` ROW (design §11.5.1): one choice for
-/// every session the harness can steer, each moved by [`Self::moves`] and
-/// written as [`Self::write`] says.
+/// A PRESS ON SESSIONS' `Every session` ROW (design §11.5.1): one choice for every session the harness can steer, each moved by [`Self::moves`] and written as [`Self::write`] says.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum EveryPress {
-    /// Cruise or Land. There is no bulk Off: the master switch, `Supervise
-    /// coding agents`, is one, and writes no session's word.
+    /// Cruise or Land.
     Mode(Autopilot),
-    /// A timed Cruise, `1 hour`, `2 hours`, `4 hours` or `at 18:00`, resolved ONCE at
-    /// the press, so every session it arms lands at one instant. There is no
-    /// bulk cancel: Cruise drops every timer.
+    /// A timed Cruise, `1 hour`, `2 hours`, `4 hours` or `at 18:00`, resolved ONCE at the press, so every session it arms lands at one instant.
     Timer(crate::autopilot_timers::TimerChoice),
-    /// Follow the default: every session's own word cleared but a pinned
-    /// Off.
+    /// Follow the default: every session's own word cleared but a pinned Off.
     Follow,
 }
 
 impl EveryPress {
-    /// Every press the row draws, in its order: Cruise, Land, the Timer's
-    /// choices (`at` only with `[harness] land_at` set, the page's to say),
-    /// Follow the default.
+    /// Every press the row draws, in its order: Cruise, Land, the Timer's choices (`at` only with `[harness] land_at` set, the page's to say), Follow the default.
     #[cfg(test)]
     pub(crate) const ALL: [Self; 7] = {
         use crate::autopilot_timers::TimerChoice;
@@ -2183,15 +1593,7 @@ impl EveryPress {
         ]
     };
 
-    /// Whether this press moves `session` (design §11.5.1's table), a
-    /// session the harness can steer ([`HarnessSession::default`]) by the
-    /// mode it runs under: Land moves every Cruise, timed or not; Cruise
-    /// moves every Land and every timed Cruise (a hand write drops the
-    /// timer); a timer moves every Cruise; Follow moves every own word but
-    /// Off. So no press ever puts the harness's hands on a session whose
-    /// mode is Off, its own word's or the default's, and none moves a
-    /// session its agent's own switch or the master switch takes the
-    /// harness off. Pure.
+    /// Whether this press moves `session` (design §11.5.1's table), a session the harness can steer ([`HarnessSession::default`]) by the mode it runs under: Land moves every Cruise, timed or not; Cruise moves every Land and every timed Cruise (a hand write drops the timer); a timer moves every Cruise; Follow moves every own word but Off.
     #[must_use]
     pub(crate) fn moves(self, session: &HarnessSession) -> bool {
         use crate::autopilot_timers::TimerChoice;
@@ -2212,10 +1614,7 @@ impl EveryPress {
         }
     }
 
-    /// The pair this press writes on a session it moves, under the session's
-    /// `default`, `(word, land_at)`: a mode by the page's one rule
-    /// ([`page_word`]), with no timer; a timed Cruise at `at`, the instant
-    /// resolved once for the press; Follow, no word. Pure.
+    /// The pair this press writes on a session it moves, under the session's `default`, `(word, land_at)`: a mode by the page's one rule ([`page_word`]), with no timer; a timed Cruise at `at`, the instant resolved once for the press; Follow, no word.
     #[must_use]
     pub(crate) fn write(
         self,
@@ -2230,12 +1629,7 @@ impl EveryPress {
     }
 }
 
-/// An `Every session` button's action and key (design §11.5.2):
-/// `harness/session/all/autopilot/<cruise|land>`,
-/// `harness/session/all/land-in/<min>`, `harness/session/all/land-at` and
-/// `harness/session/all/follow`. A press the row never draws (Off, the
-/// cancel) is minted as its row's spelling would be, and read back as no
-/// press ([`parse_every_action`]).
+/// An `Every session` button's action and key (design §11.5.2): `harness/session/all/autopilot/<cruise|land>`, `harness/session/all/land-in/<min>`, `harness/session/all/land-at` and `harness/session/all/follow`.
 #[must_use]
 pub(crate) fn every_action(press: EveryPress) -> String {
     use crate::autopilot_timers::TimerChoice;
@@ -2249,10 +1643,7 @@ pub(crate) fn every_action(press: EveryPress) -> String {
     }
 }
 
-/// [`every_action`] read back: the press, or `None` for any other action —
-/// a session's own, an Off (no bulk Off), a cancel (no bulk cancel), a
-/// duration the page does not offer. [`parse_autopilot_action`] refuses
-/// `all` as an id, so these keys are read here.
+/// [`every_action`] read back: the press, or `None` for any other action — a session's own, an Off (no bulk Off), a cancel (no bulk cancel), a duration the page does not offer.
 #[must_use]
 pub(crate) fn parse_every_action(action: &str) -> Option<EveryPress> {
     use crate::autopilot_timers::TimerChoice;
@@ -2279,57 +1670,29 @@ pub(crate) fn parse_every_action(action: &str) -> Option<EveryPress> {
     }
 }
 
-/// SESSIONS' `Every session` ROW as the page draws it (design §11.5.1): how
-/// the sessions SESSIONS lists stand, and how many each press moves, read by
-/// [`EveryPress::moves`] — the rule the press itself runs
-/// ([`App::press_autopilot_every`]), so the row never counts what its press
-/// would not write. Built only where SESSIONS lists two sessions or more
-/// ([`HarnessState::every_row`]).
+/// SESSIONS' `Every session` ROW as the page draws it (design §11.5.1): how the sessions SESSIONS lists stand, and how many each press moves, read by [`EveryPress::moves`] — the rule the press itself runs ([`App::press_autopilot_every`]), so the row never counts what its press would not write.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct EveryRow {
-    /// How many sessions SESSIONS lists.
     pub(crate) sessions: usize,
-    /// Of them, how many the harness can steer now: the row's buttons act
-    /// only where one can.
     pub(crate) steered: usize,
-    /// Running under Cruise, timed or not.
     pub(crate) cruising: usize,
-    /// Of those, with a timer armed.
     pub(crate) timed: usize,
-    /// Running under Land, its task open or unknown: the chip's `⤓ land`.
     pub(crate) landing: usize,
-    /// Under Land and landed: the chip's `✓ landed` (§12.4.1). Never counted
-    /// `landing`, whose word says the work is still going.
     pub(crate) landed: usize,
-    /// Under Land through a person's own exchange: the chip's `⤓ quiet`.
     pub(crate) quiet: usize,
-    /// Under no carrying mode: Off by its own word or the default's, or
-    /// under a switch that takes the harness off it.
     pub(crate) off: usize,
-    /// Of the steered, Off by their own word: what Follow keeps.
     pub(crate) pinned_off: usize,
-    /// How many each press moves: Cruise, Land, a timer, Follow.
     pub(crate) cruise: usize,
     pub(crate) land: usize,
     pub(crate) timer: usize,
     pub(crate) follow: usize,
-    /// Of Cruise's, how many are under Land — landing, landed and quiet, by
-    /// their chips' faces, as the row says them — and how many timed: the
-    /// timed ones are the timers Land cancels, as it moves every Cruise.
     pub(crate) cruise_landing: usize,
     pub(crate) cruise_landed: usize,
     pub(crate) cruise_quiet: usize,
     pub(crate) cruise_timed: usize,
-    /// Of Follow's, how many have a timer it cancels, and how many it hands
-    /// to a default of Off (the window's one default, so none or all): the
-    /// harness lets go of them.
     pub(crate) follow_timed: usize,
     pub(crate) follow_to_off: usize,
-    /// Where it steers none of them, why: the rows' own words for the view
-    /// they share (`harness off in Settings`).
     pub(crate) why: &'static str,
-    /// The listed sessions' agent, by product, where they share one: the
-    /// words for its own switch off.
     pub(crate) product: Option<&'static str>,
 }
 
@@ -2342,9 +1705,6 @@ pub(crate) fn sessions_words(n: usize) -> String {
     }
 }
 
-/// Sessions under Land in the chip's words, its nonzero parts only: `1
-/// landing`, `2 landed`, `1 quiet` (§12.4.1: a landed session is never
-/// said to be landing).
 fn under_land(landing: usize, landed: usize, quiet: usize) -> Vec<String> {
     [(landing, "landing"), (landed, "landed"), (quiet, "quiet")]
         .into_iter()
@@ -2367,12 +1727,7 @@ impl EveryRow {
         }
     }
 
-    /// What is there now, beside the buttons: `6 sessions: 3 cruising, 1
-    /// landing, 1 landed, 1 off` (`3 cruising (2 timed)` where timers are
-    /// armed; a session under Land by its chip's face, `landing`, `landed`
-    /// or `quiet`, §12.4.1; a zero part is not said); where the harness
-    /// steers none of them, why, in the rows' own short words (`3 sessions
-    /// · harness off in Settings`), which fit where a row's detail fits.
+    /// What is there now, beside the buttons: `6 sessions: 3 cruising, 1 landing, 1 landed, 1 off` (`3 cruising (2 timed)` where timers are armed; a session under Land by its chip's face, `landing`, `landed` or `quiet`, §12.4.1; a zero part is not said); where the harness steers none of them, why, in the rows' own short words (`3 sessions · harness off in Settings`), which fit where a row's detail fits.
     #[must_use]
     pub(crate) fn line(&self) -> String {
         let all = sessions_words(self.sessions);
@@ -2394,7 +1749,6 @@ impl EveryRow {
         format!("{all}: {}", parts.join(", "))
     }
 
-    /// `; the 1 off stays off`, `; the 2 off stay off`, or nothing.
     fn offs_stay(&self, off: usize) -> String {
         match off {
             0 => String::new(),
@@ -2403,9 +1757,7 @@ impl EveryRow {
         }
     }
 
-    /// The timers a press cancels, for its words: Land's (every timed
-    /// Cruise it lands) and Follow's (every timed own Cruise it clears).
-    /// Cruise drops timers too, but its words count them as what it moves.
+    /// The timers a press cancels, for its words: Land's (every timed Cruise it lands) and Follow's (every timed own Cruise it clears).
     #[must_use]
     pub(crate) fn cancels(&self, press: EveryPress) -> usize {
         match press {
@@ -2415,9 +1767,7 @@ impl EveryRow {
         }
     }
 
-    /// What a button's spoken name adds after its count: the timers it
-    /// cancels (`, cancelling 2 timers`) and, for Follow under a default of
-    /// Off, `, the default is Off`.
+    /// What a button's spoken name adds after its count: the timers it cancels (`, cancelling 2 timers`) and, for Follow under a default of Off, `, the default is Off`.
     #[must_use]
     pub(crate) fn spoken_tail(&self, press: EveryPress) -> String {
         let mut tail = String::new();
@@ -2432,8 +1782,6 @@ impl EveryRow {
         tail
     }
 
-    /// The timers `press` cancels, in its words: Land's ` and cancel 2
-    /// timers`, Follow's `, 2 timers cancelled`; or nothing.
     fn cancelling(&self, press: EveryPress) -> String {
         let timers = match self.cancels(press) {
             0 => return String::new(),
@@ -2446,13 +1794,7 @@ impl EveryRow {
         }
     }
 
-    /// What a press does, for its button's description (design §11.5.1):
-    /// the count it moves, the timers it cancels and what stays — `Land 3
-    /// sessions and cancel 2 timers; the 1 off stays off`, `Cruise 4
-    /// sessions: 1 landing, 1 landed, 2 timed` (its sessions under Land told
-    /// apart as the row tells them, §12.4.1) — where Follow hands sessions
-    /// to a default of Off, that the harness lets go of them; or, where it
-    /// moves nothing, that it writes nothing.
+    /// What a press does, for its button's description (design §11.5.1): the count it moves, the timers it cancels and what stays — `Land 3 sessions and cancel 2 timers; the 1 off stays off`, `Cruise 4 sessions: 1 landing, 1 landed, 2 timed` (its sessions under Land told apart as the row tells them, §12.4.1) — where Follow hands sessions to a default of Off, that the harness lets go of them; or, where it moves nothing, that it writes nothing.
     #[must_use]
     pub(crate) fn description(&self, press: EveryPress) -> String {
         use crate::autopilot_timers::TimerChoice;
@@ -2496,9 +1838,6 @@ impl EveryRow {
                 if n == 0 {
                     format!("Every session follows [harness] autopilot already{kept}")
                 } else if self.follow_to_off > 0 {
-                    // Configuration only ever takes power away (§11.5.4): under
-                    // a default of Off (the window's one default), following
-                    // it lets go of them.
                     let them = if n == 1 { "it" } else { "them" };
                     format!(
                         "{} {follow} [harness] autopilot, which is Off: the harness lets go \
@@ -2519,11 +1858,6 @@ impl EveryRow {
     }
 }
 
-/// A session's name on Settings ▸ Harness: its tab's own name, `resolved`
-/// as the tab strip resolves it (the person's title, else the terminal's
-/// live one, else its folder: `app_tabs::resolved_terminal_title_rung`),
-/// else its program's name — never blank, since the row's controls are
-/// spoken by it ("Autopilot land for …") and a shell may set an empty title.
 fn session_title(resolved: Option<&str>, program: &str) -> String {
     resolved
         .map(str::trim)
@@ -2532,10 +1866,6 @@ fn session_title(resolved: Option<&str>, program: &str) -> String {
         .to_string()
 }
 
-/// Whether a session's `title` is its agent's product name (`program`) and
-/// nothing more, behind any status glyph the agent puts before it ("Claude
-/// Code", "✳ Claude Code", "⠋ Codex"): the row's detail then does not name
-/// the agent again. A title that only mentions it ("claude-docs") is not.
 fn names_program(title: &str, program: &str) -> bool {
     title
         .trim_start_matches(|c: char| !c.is_alphanumeric())
@@ -2543,16 +1873,8 @@ fn names_program(title: &str, program: &str) -> bool {
         .eq_ignore_ascii_case(program)
 }
 
-// The App
-
 impl App {
-    /// THE A/B BOOK'S WEEK (§10.5.3 B, C.4): today and the six days before,
-    /// the open stretches counted to now, with the other processes' days of
-    /// the last reading ([`HarnessStatsReport::ab_others`]) added, the
-    /// local clock and day the earliest began ([`AbWeek::since`], one zone
-    /// read: a publish's), and the publish's own clock, the instant the
-    /// numbers stop at ([`AbWeek::until`], §11.6.3 item 3: one wall read, so
-    /// a page republished past midnight says the new day's time).
+    /// THE A/B BOOK'S WEEK (§10.5.3 B, C.4): today and the six days before, the open stretches counted to now, with the other processes' days of the last reading ([`HarnessStatsReport::ab_others`]) added, the local clock and day the earliest began ([`AbWeek::since`], one zone read: a publish's), and the publish's own clock, the instant the numbers stop at ([`AbWeek::until`], §11.6.3 item 3: one wall read, so a page republished past midnight says the new day's time).
     #[must_use]
     pub(crate) fn harness_ab(&self) -> AbWeek {
         let others = self
@@ -2573,9 +1895,7 @@ impl App {
         week
     }
 
-    /// What session `local_id`'s glass says of why it may sit at its
-    /// prompt ([`AbCause::of`]): whether its task's face says `landed` and
-    /// whether the harness's pause stands. Read from the glass, no lock.
+    /// What session `local_id`'s glass says of why it may sit at its prompt ([`AbCause::of`]): whether its task's face says `landed` and whether the harness's pause stands.
     #[must_use]
     pub(crate) fn harness_ab_glass(&self, local_id: u64) -> (bool, bool) {
         use aterm_agent::harness::acts::TaskFace;
@@ -2587,11 +1907,7 @@ impl App {
             })
     }
 
-    /// THE WALL MOVED under the ledger clock (`Wake::WallMoved`, a window's
-    /// focus): the A/B book's calendar is read again where it was read at
-    /// all, so a sleep across a midnight starts the new day's stretches in
-    /// the new day ([`AbBook::set_calendar`]). Nothing before the book is
-    /// first fed.
+    /// THE WALL MOVED under the ledger clock (`Wake::WallMoved`, a window's focus): the A/B book's calendar is read again where it was read at all, so a sleep across a midnight starts the new day's stretches in the new day ([`AbBook::set_calendar`]).
     pub(crate) fn harness_ab_wall_moved(&mut self) {
         if self.harness_screen.ab.has_calendar() {
             self.harness_screen
@@ -2604,11 +1920,7 @@ impl App {
         }
     }
 
-    /// THE EXIT SEAM'S WRITE (§10.5.3 C.2): this process's A/B book, its
-    /// open stretches counted to now, written whole to its own file
-    /// (`harness_ab_store::write_own`) once the event loop has returned —
-    /// one small write, never on the frame path. Nothing where the book was
-    /// never fed or no harness state resolves; a failed write is logged.
+    /// THE EXIT SEAM'S WRITE (§10.5.3 C.2): this process's A/B book, its open stretches counted to now, written whole to its own file (`harness_ab_store::write_own`) once the event loop has returned — one small write, never on the frame path.
     pub(crate) fn write_harness_ab_at_exit(&self) {
         let Some(harness_state) = crate::harness_host::harness_state() else {
             return;
@@ -2633,20 +1945,13 @@ impl App {
         }
     }
 
-    /// Session `local_id`'s A/B arm now ([`AbArm::of`] its effective
-    /// Autopilot, this host's claim and anyone's). ONE read of its metadata
-    /// (a leaf lock) at ONE instant: the word, and the live claim whose
-    /// holder says both whether it is this host's and whether anyone's is
-    /// live — two reads could straddle a claim's lapse or another's take.
+    /// Session `local_id`'s A/B arm now ([`AbArm::of`] its effective Autopilot, this host's claim and anyone's).
     #[must_use]
     pub(crate) fn harness_ab_arm(&self, local_id: u64) -> AbArm {
         self.harness_ab_reading(local_id).0
     }
 
-    /// [`Self::harness_ab_arm`], and whether the session's MODE is Land —
-    /// its own word, else the table's default, whatever the posture or the
-    /// claim (`AbBook::follow_mode`, §11.6.3 item 4) — from the same one
-    /// read of its metadata. A session that is gone has no word.
+    /// [`Self::harness_ab_arm`], and whether the session's MODE is Land — its own word, else the table's default, whatever the posture or the claim (`AbBook::follow_mode`, §11.6.3 item 4) — from the same one read of its metadata.
     #[must_use]
     pub(crate) fn harness_ab_reading(&self, local_id: u64) -> (AbArm, bool) {
         let default = self.harness_policy.get().policy.autopilot;
@@ -2661,8 +1966,6 @@ impl App {
             );
         };
         let posture = self.session_harness_posture(local_id);
-        // The live claim's holder: `Some(true)` this host's, `Some(false)`
-        // another's, `None` nobody's.
         let (word, ours) = {
             let meta = session.ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
             let ours = meta
@@ -2680,8 +1983,7 @@ impl App {
         )
     }
 
-    /// Session `local_id`'s published word moved and no pool borrow is live
-    /// (an input stall's publish): [`HarnessScreen::note_phase`].
+    /// Session `local_id`'s published word moved and no pool borrow is live (an input stall's publish): [`HarnessScreen::note_phase`].
     pub(crate) fn note_harness_phase(&mut self, local_id: u64) {
         let arm = self.harness_ab_arm(local_id);
         let glass = self.harness_ab_glass(local_id);
@@ -2691,20 +1993,13 @@ impl App {
         self.harness_screen.note_phase(local_id, &ctx, arm, glass);
     }
 
-    /// Session `local_id`'s ARM or CAUSE may have moved (its Autopilot word
-    /// written, its claim taken or given back, its task's face or the
-    /// harness's pause told): the stretch so far goes to the arm and cause
-    /// that were in force, and the session counts under its arm and cause
-    /// now from here. Its mode is read for the time from Land to landed
-    /// (`AbBook::follow_mode`): every write of the word comes here.
+    /// Session `local_id`'s ARM or CAUSE may have moved (its Autopilot word written, its claim taken or given back, its task's face or the harness's pause told): the stretch so far goes to the arm and cause that were in force, and the session counts under its arm and cause now from here.
     pub(crate) fn note_harness_arm(&mut self, local_id: u64) {
         let (arm, lands) = self.harness_ab_reading(local_id);
         let glass = self.harness_ab_glass(local_id);
         let Some(session) = self.pool.get(local_id) else {
             return;
         };
-        // Read out under the timeline's guard and classified after it, as
-        // [`HarnessScreen::note_phase`] does (meta before timeline, always).
         let (agent, word) = {
             let tl = session
                 .ctx
@@ -2723,11 +2018,7 @@ impl App {
         book.observe(local_id, phase, cause, arm, now);
     }
 
-    /// Session `local_id`'s word was CARRIED onto it from before this process
-    /// (`App::graft_restored_user_meta`), its mode read as Land (`lands_before`)
-    /// or not just before: where the carried word moved the mode, the A/B
-    /// book takes it as read with no move (`AbBook::carry_mode`), so a
-    /// landing restored or handed over mid-work is counted with no span.
+    /// Session `local_id`'s word was CARRIED onto it from before this process (`App::graft_restored_user_meta`), its mode read as Land (`lands_before`) or not just before: where the carried word moved the mode, the A/B book takes it as read with no move (`AbBook::carry_mode`), so a landing restored or handed over mid-work is counted with no span.
     pub(crate) fn harness_mode_carried(&mut self, local_id: u64, lands_before: bool) {
         let lands = self.harness_ab_reading(local_id).1;
         if lands != lands_before {
@@ -2750,11 +2041,7 @@ impl App {
             .retire(local_id, crate::turn_ledger::now_ms());
     }
 
-    /// THE SNAPSHOT Settings ▸ Harness renders: the policy in force, every
-    /// live supervisable agent session, the ledgers' last
-    /// reading, the A/B book's week now and the effective table. Leaf locks only,
-    /// never nested (the registry's, then each session's timeline, then its
-    /// metadata).
+    /// THE SNAPSHOT Settings ▸ Harness renders: the policy in force, every live supervisable agent session, the ledgers' last reading, the A/B book's week now and the effective table.
     #[must_use]
     pub(crate) fn harness_state(&self) -> HarnessState {
         let posture = self.harness_posture();
@@ -2770,7 +2057,6 @@ impl App {
             stats: self.harness_screen.stats.clone(),
             ab: self.harness_ab(),
             config: config_rows(&policy.policy),
-            // One wall read per publish (an event), only with `land_at` set.
             land_at_offer: policy.policy.land_at.map(|at| {
                 crate::autopilot_timers::offer_glass(
                     at,
@@ -2780,19 +2066,13 @@ impl App {
             }),
             ai: self.ai_state(),
             tabs: self.tab_control_state(posture),
-            // One wall read per publish (an event): the day the state lines'
-            // clocks are read against.
             today: crate::harness_glass::local_day_at(
                 crate::autopilot_timers::wall_ms().div_euclid(1000),
             ),
         }
     }
 
-    /// Snapshot of all accessible computers, `aterm` instances, and open tabs
-    /// for Settings ▸ Harness ▸ Tab Control (`/tabs`). Reads this instance's
-    /// live tabs via leaf locks only and merges them with any sibling local
-    /// `aterm` instances and managed LAN Macs collected on the background
-    /// stats worker ([`HarnessStatsReport`]).
+    /// Snapshot of all accessible computers, `aterm` instances, and open tabs for Settings ▸ Harness ▸ Tab Control (`/tabs`).
     #[must_use]
     pub(crate) fn tab_control_state(&self, posture: HarnessPosture) -> TabControlState {
         let handles = self
@@ -3036,13 +2316,6 @@ impl App {
         TabControlState { computers, tabs }
     }
 
-    /// Every live session whose program is a supervisable agent
-    /// (`harness_host::agent_of`), with its Autopilot. Live is in this App's
-    /// pool, not only in the registry: a closed tab leaves the pool first
-    /// (`detach_session_view`, whose retirement republishes the page) and the
-    /// registry after (`retire_session_registration`), and a tab closed by
-    /// hand is never `Exited` there, so the registry alone would list it as a
-    /// ghost row until the next publish.
     fn harness_sessions(&self, posture: HarnessPosture) -> Vec<HarnessSession> {
         let handles = self
             .store
@@ -3056,8 +2329,6 @@ impl App {
             h.state != crate::session_store::SessionState::Exited
                 && self.pool.get(h.local_id).is_some()
         }) {
-            // The agent the host supervises or watches: a vendor `codex` is
-            // shown in its tab and is no row here.
             let program = crate::harness_host::admitted(&handle.ctx);
             let session_posture = posture.for_agent(program);
             let Some(program) = program.filter(|p| p.harness_table()).map(|p| p.product()) else {
@@ -3074,14 +2345,10 @@ impl App {
                     meta.autopilot_set_by,
                 )
             };
-            // Who set its own word (§11.7.1), composed with the meta guard
-            // released: an edge writer's tab is named by the one namer.
             let set_by = word.and_then(|_| {
                 crate::autopilot::SetByWords::of(set_by, true, |sid| self.autopilot_setter_tab(sid))
             });
             let resolved = self.harness_session_name(handle.local_id, person, &handle.title);
-            // A harness's need standing on it (§12.2.3), from its published
-            // verdict under the timeline's leaf lock, the meta guard released.
             let need = handle
                 .ctx
                 .timeline
@@ -3090,8 +2357,6 @@ impl App {
                 .need()
                 .harness_ask()
                 .cloned();
-            // Why Land still holds (§12.3.3 item 4), where this host's claim
-            // is on it and its chip wears `⤓ land` (`App::shown_hold`).
             let hold = self.shown_hold(handle.local_id).filter(|_| supervised);
             sessions.push(HarnessSession {
                 local_id: handle.local_id,
@@ -3114,9 +2379,6 @@ impl App {
         sessions
     }
 
-    /// The live sessions today's decisions name that `sessions` (SESSIONS'
-    /// rows) does not list ([`HarnessState::decided_open`]): one store read,
-    /// only where a decision names such a session. Leaf locks only.
     fn harness_decided_open(&self, sessions: &[HarnessSession]) -> Vec<OpenSession> {
         let Some(decided) = self
             .harness_screen
@@ -3166,18 +2428,7 @@ impl App {
             .collect()
     }
 
-    /// A SESSION'S NAME as Settings ▸ Harness and its Autopilot menu give it:
-    /// the person's name for its tab (`person`, the `title` its metadata
-    /// carries), else THE TAB'S NAME AS THE STRIP RESOLVES IT, from the
-    /// terminal it shows: the store's copy of the title (`stored`) is written
-    /// only as the front tab's window title is published, so it is stale for
-    /// a background tab, a pane the keyboard is not in, with Settings in
-    /// front, and on a headless aterm. A try-lock, never parked behind a PTY
-    /// reader (`App::tab_titles`); contended, `stored` stands in for the
-    /// terminal's rungs. The agent's own title loses its spinner frame: a
-    /// row and a menu are snapshots, and a frozen frame would stand there
-    /// until the next publish (`chrome_label::without_spinner_frame`); a
-    /// person's name for the tab is theirs, whole.
+    /// A SESSION'S NAME as Settings ▸ Harness and its Autopilot menu give it: the person's name for its tab (`person`, the `title` its metadata carries), else THE TAB'S NAME AS THE STRIP RESOLVES IT, from the terminal it shows: the store's copy of the title (`stored`) is written only as the front tab's window title is published, so it is stale for a background tab, a pane the keyboard is not in, with Settings in front, and on a headless aterm.
     pub(crate) fn harness_session_name(
         &self,
         local_id: u64,
@@ -3211,10 +2462,7 @@ impl App {
         })
     }
 
-    /// Whether native view `view` is a Settings view on the Harness route —
-    /// what the control surface's front-input fence asks of the front view
-    /// (`App::front_control_surface`), since its session buttons are
-    /// Owner-only ([`SESSION_ACTION_PREFIX`]).
+    /// Whether native view `view` is a Settings view on the Harness route — what the control surface's front-input fence asks of the front view (`App::front_control_surface`), since its session buttons are Owner-only ([`SESSION_ACTION_PREFIX`]).
     pub(crate) fn harness_page_in(&self, view: crate::tab_model::ViewId) -> bool {
         matches!(
             self.native_runtime.view_state(view),
@@ -3239,36 +2487,14 @@ impl App {
         })
     }
 
-    /// Something the page shows moved (a host note, a claim, a session's
-    /// end): republish while a view shows the page. Off the page nothing is
-    /// built — the route's arrival publishes afresh.
+    /// Something the page shows moved (a host note, a claim, a session's end): republish while a view shows the page.
     pub(crate) fn harness_screen_moved(&mut self) {
         if self.harness_page_shown() {
             self.publish_native_harness_state();
         }
     }
 
-    /// Perform a Settings ▸ Harness request (`AppEffect::Harness`): read the
-    /// ledgers again, or set a session's Autopilot through the one writer
-    /// ([`Self::set_session_autopilot`], which republishes). A session's word
-    /// is written only while the harness supervises that session — its own
-    /// posture ([`Self::session_harness_posture`]: the master switch and its
-    /// agent's own switch) — the page's buttons are inert otherwise, and a
-    /// stale press is refused here too.
-    ///
-    /// **A carrying default's button hands the session back to it**
-    /// ([`hands_back`]). Under a default of Cruise or Land, a press of that
-    /// mode clears the session's own word (`meta unset autopilot`'s write)
-    /// rather than pinning it, so the session follows the default again —
-    /// and where it had no word, nothing is written at all. Any other press
-    /// is written as the session's own word, Off ALWAYS: under a default of
-    /// Off the Off button pins Off as the footer's chip does, so a default
-    /// moved later (to Cruise, a deleted line) never puts the harness's hands
-    /// back on a session its owner took them off here. The row says which it
-    /// runs under ("its own setting" or "follows the default", the line under
-    /// it), and the button that
-    /// hands back says so; pinning a session to a carrying default's mode is
-    /// `meta set autopilot` and the chip's.
+    /// Perform a Settings ▸ Harness request (`AppEffect::Harness`): read the ledgers again, or set a session's Autopilot through the one writer ([`Self::set_session_autopilot`], which republishes).
     pub(crate) fn execute_native_harness(&mut self, request: crate::native_app::HarnessRequest) {
         match request {
             crate::native_app::HarnessRequest::Refresh => {
@@ -3283,15 +2509,11 @@ impl App {
             }
             crate::native_app::HarnessRequest::AiLook => self.ask_ai_look(),
             crate::native_app::HarnessRequest::AiFleetFetch => self.ask_ai_fetch(),
-            // A press with no window named (`app_native` names the Settings
-            // view's own): the tab opens in the front window.
             crate::native_app::HarnessRequest::AiSignIn { id } => {
                 if let Some(window) = self.frontmost_window {
                     self.ai_sign_in(window, id);
                 }
             }
-            // The row's session gone between the draw and the press: the
-            // republish below drops its row.
             crate::native_app::HarnessRequest::Show { session } => {
                 if !self.raise_session_pane(session) {
                     self.publish_native_harness_state();
@@ -3300,12 +2522,7 @@ impl App {
         }
     }
 
-    /// A SESSIONS ROW'S PRESS of `mode` on session `local_id`: the page's one
-    /// rule's word ([`page_word`]) written through the window's one writer
-    /// ([`Self::set_session_autopilot`], which publishes the page where it
-    /// moved), by the session's own posture — its agent's switch Off, or the
-    /// master switch, steers nothing there, whatever the window's. Whether
-    /// the pair moved.
+    /// A SESSIONS ROW'S PRESS of `mode` on session `local_id`: the page's one rule's word ([`page_word`]) written through the window's one writer ([`Self::set_session_autopilot`], which publishes the page where it moved), by the session's own posture — its agent's switch Off, or the master switch, steers nothing there, whatever the window's.
     pub(crate) fn press_page_mode(&mut self, local_id: u64, mode: Autopilot) -> bool {
         let Some(default) = self.session_harness_posture(local_id).default_mode() else {
             return false;
@@ -3317,17 +2534,7 @@ impl App {
         )
     }
 
-    /// A PRESS ON SESSIONS' `Every session` ROW (design §11.5.3): the live
-    /// sessions SESSIONS lists, read again at the press (a session opened or
-    /// closed since the draw is counted as it is now), each moved where
-    /// [`EveryPress::moves`] says — never one whose mode is Off, and none the
-    /// harness cannot steer — and written as [`EveryPress::write`] says, a
-    /// timer at ONE instant resolved here once
-    /// ([`Self::resolve_timer_choice`]), so every armed timer shares it and
-    /// the index folds one `autopilot_timer` deadline. All in one batch
-    /// ([`Self::write_autopilot_batch`]), which publishes the page once
-    /// however many it writes. A press that moves nothing writes nothing.
-    /// How many sessions' pairs moved.
+    /// A PRESS ON SESSIONS' `Every session` ROW (design §11.5.3): the live sessions SESSIONS lists, read again at the press (a session opened or closed since the draw is counted as it is now), each moved where [`EveryPress::moves`] says — never one whose mode is Off, and none the harness cannot steer — and written as [`EveryPress::write`] says, a timer at ONE instant resolved here once ([`Self::resolve_timer_choice`]), so every armed timer shares it and the index folds one `autopilot_timer` deadline.
     pub(crate) fn press_autopilot_every(&mut self, press: EveryPress) -> usize {
         let sessions = self.harness_sessions(self.harness_posture());
         let at = match press {
@@ -3350,15 +2557,7 @@ impl App {
         )
     }
 
-    /// AN ACT, TOLD WHILE THE PAGE MAY BE ON SCREEN (§9.2.1, "The page";
-    /// `crate::harness_glass::on_act_at`, at the act's receipt `now`, for
-    /// EVERY act, whether or not the chip's trail took it): with the page on
-    /// screen, WHAT THE HARNESS DID is marked stale and a re-read owed
-    /// ([`HarnessScreen::note_act`]: [`crate::harness_glass::DWELL`] after
-    /// the act, at most one per [`crate::harness_glass::REREAD`], on the
-    /// glass's one deadline), and the page republished where the mark or
-    /// the session's glass (`glass_moved`) moved. Off the page nothing is
-    /// kept: its route's arrival reads the ledgers afresh.
+    /// AN ACT, TOLD WHILE THE PAGE MAY BE ON SCREEN (§9.2.1, "The page"; `crate::harness_glass::on_act_at`, at the act's receipt `now`, for EVERY act, whether or not the chip's trail took it): with the page on screen, WHAT THE HARNESS DID is marked stale and a re-read owed ([`HarnessScreen::note_act`]: [`crate::harness_glass::DWELL`] after the act, at most one per [`crate::harness_glass::REREAD`], on the glass's one deadline), and the page republished where the mark or the session's glass (`glass_moved`) moved.
     pub(crate) fn note_harness_act_for_page(&mut self, now: Instant, glass_moved: bool) {
         if !self.harness_page_shown() {
             return;
@@ -3368,11 +2567,7 @@ impl App {
         }
     }
 
-    /// The re-read the page owes is due at `now`: started while the page is
-    /// on screen — where a reading is already running it answers instead,
-    /// and owes another if it lands not covering the acts
-    /// ([`Self::finish_harness_stats`]) — and forgotten where the page has
-    /// gone.
+    /// The re-read the page owes is due at `now`: started while the page is on screen — where a reading is already running it answers instead, and owes another if it lands not covering the acts ([`Self::finish_harness_stats`]) — and forgotten where the page has gone.
     pub(crate) fn reread_harness_stats(&mut self, now: Instant) {
         if !self.harness_page_shown() {
             self.harness_screen.forget_acts();
@@ -3383,19 +2578,12 @@ impl App {
         self.publish_native_harness_state();
     }
 
-    /// READ THE LEDGERS AGAIN, off the event loop: one named background
-    /// thread folds today and the last 7 days ([`collect_harness_stats`]),
-    /// writes this process's A/B book and reads the others'
-    /// ([`read_harness_stats`]), and posts `Wake::HarnessStatsCollected`. A
-    /// reading already running is not joined by another; a window without
-    /// an event loop (a test App) reads nothing.
+    /// READ THE LEDGERS AGAIN, off the event loop: one named background thread folds today and the last 7 days ([`collect_harness_stats`]), writes this process's A/B book and reads the others' ([`read_harness_stats`]), and posts `Wake::HarnessStatsCollected`.
     pub(crate) fn start_harness_stats_refresh(&mut self) {
         self.start_harness_stats_refresh_at(Instant::now());
     }
 
-    /// [`Self::start_harness_stats_refresh`], begun at `now`: the reading
-    /// meets the freshness threshold for acts told a dwell or more before it
-    /// ([`HarnessScreen::began_reading`]).
+    /// [`Self::start_harness_stats_refresh`], begun at `now`: the reading meets the freshness threshold for acts told a dwell or more before it ([`HarnessScreen::began_reading`]).
     pub(crate) fn start_harness_stats_refresh_at(&mut self, now: Instant) {
         #[cfg(test)]
         {
@@ -3403,8 +2591,6 @@ impl App {
                 self.harness_screen.readings_asked.saturating_add(1);
         }
         if self.harness_screen.stats.collecting {
-            // A Tab Control page come while the ledgers are read: the
-            // running reading sweeps its fleet too, where it is not past it.
             let ask = self.fleet_ask();
             if ask.fleet
                 && !self.harness_screen.reading.fleet
@@ -3416,8 +2602,6 @@ impl App {
         }
         let state_dir = aterm_types::dirs::state_dir();
         let harness_state = crate::harness_host::harness_state();
-        // The A/B book's ring, its open stretches counted to now, copied for
-        // the thread to write (§10.5.3 C.2): about 7 KB, at a reading.
         let ab = self
             .harness_screen
             .ab
@@ -3463,9 +2647,6 @@ impl App {
             "aterm-harness-stats",
             crate::qos::Role::Background,
             move || {
-                // Cosmetic to the terminal: it lands through the proxy when done.
-                // A reader that panicked still answers, so Refresh is never
-                // left busy for a reading that will not come.
                 let result = std::panic::catch_unwind(|| {
                     read_harness_stats(
                         state_dir.as_deref(),
@@ -3485,8 +2666,6 @@ impl App {
         match spawn {
             Ok(_) => self.harness_screen.began_reading(now),
             Err(error) => {
-                // The page says why there is no newer reading; it does not
-                // promise one (`Newer … reading again`).
                 self.harness_screen.stats.stale = false;
                 self.harness_screen.stats.unavailable =
                     Some(format!("the reader could not start: {error}"));
@@ -3494,8 +2673,7 @@ impl App {
         }
     }
 
-    /// The ledgers' reading `sequence` landed: kept when it is the running
-    /// one's, and published.
+    /// The ledgers' reading `sequence` landed: kept when it is the running one's, and published.
     pub(crate) fn finish_harness_stats(
         &mut self,
         sequence: u64,
@@ -3505,10 +2683,6 @@ impl App {
             return;
         }
         let shown = self.harness_page_shown();
-        // A reading that read no fleet landed while a Tab Control page is
-        // shown: that page came after the reading was done with the ledgers
-        // (its raise came too late, [`FleetSlot::raise`]), so it reads the
-        // fleet now.
         let fleet_owed =
             !self.harness_screen.reading.fleet && self.tabs_page_shown() && result.is_ok();
         let screen = &mut self.harness_screen;
@@ -3516,8 +2690,6 @@ impl App {
         screen.stats.collecting = false;
         match result {
             Ok(mut report) => {
-                // A reading that asked nothing of the fleet keeps the fleet
-                // the last one read: Tab Control shows its last sweep, never
                 // an empty fleet, until its next.
                 if !screen.reading.fleet
                     && let Some(last) = screen.stats.report.as_deref()
@@ -3528,10 +2700,6 @@ impl App {
                 }
                 screen.stats.report = Some(std::sync::Arc::from(report));
                 screen.stats.unavailable = None;
-                // Mark fresh only where the reading began a dwell after the
-                // newest act; else, with the page on screen, it reads again
-                // (a re-read that came due while this one ran was taken by
-                // it, so none may be owed now).
                 if covered {
                     screen.stats.stale = false;
                 } else if let Some(last) = screen.last_act.filter(|_| shown) {
@@ -3540,8 +2708,6 @@ impl App {
                 }
             }
             Err(why) => {
-                // The page says the newer reading failed, and why; it does
-                // not promise another.
                 screen.stats.unavailable = Some(why);
                 screen.stats.stale = false;
             }
@@ -3555,17 +2721,7 @@ impl App {
         self.publish_native_harness_state();
     }
 
-    /// AN UPDATE'S SUCCESSOR READS AT ITS COMMIT (the post-landing check's
-    /// behaviour-2, and its review): before the Commit
-    /// (`Wake::ActivateCommittedHandoff`) a reading's wake is dropped
-    /// (`drops_wake_before_commit`), so a restored Settings ▸ Harness read
-    /// nothing (`App::restore_native_leaf`) and drew this process's book
-    /// alone — `Ends: none yet` over the predecessor's landing — until a
-    /// Refresh. At the Commit a reading begun before it is let go (its wake
-    /// was dropped, or is held to run after the Commit's and then finds it
-    /// let go), so no later reading waits on it, and the page, where one is
-    /// shown, reads once. Tab Control's fleet sweep reads at its own next
-    /// wake (`App::service_vitals`). The Commit, and so this, is unix-only.
+    /// AN UPDATE'S SUCCESSOR READS AT ITS COMMIT (the post-landing check's behaviour-2, and its review): before the Commit (`Wake::ActivateCommittedHandoff`) a reading's wake is dropped (`drops_wake_before_commit`), so a restored Settings ▸ Harness read nothing (`App::restore_native_leaf`) and drew this process's book alone — `Ends: none yet` over the predecessor's landing — until a Refresh.
     #[cfg(unix)]
     pub(crate) fn settle_harness_reading_at_commit(&mut self) {
         self.harness_screen.stats.collecting = false;
@@ -3575,10 +2731,7 @@ impl App {
         }
     }
 
-    /// What a reading begun now asks of the fleet ([`FleetAsk`]): the fleet
-    /// only while a Tab Control / Fleet Monitor page is shown, and this Mac's
-    /// vitals on the reading's thread only where `VitalsHost` has no snapshot
-    /// for that page yet.
+    /// What a reading begun now asks of the fleet ([`FleetAsk`]): the fleet only while a Tab Control / Fleet Monitor page is shown, and this Mac's vitals on the reading's thread only where `VitalsHost` has no snapshot for that page yet.
     pub(crate) fn fleet_ask(&self) -> FleetAsk {
         let fleet = self.tabs_page_shown();
         FleetAsk {
@@ -3588,11 +2741,7 @@ impl App {
     }
 }
 
-/// Format live AI CLI status for a tab row (`"working: thinking (14s)"`,
-/// `"waiting on permission: Bash (5s)"`, `"idle at prompt · landed"`). Pure.
-/// `task` is the task's FACE as `status task=` prints it (`open`, `landed`,
-/// `theirs`; a sibling of an older build may print its own `done|spent`),
-/// never the worker's record: a landing reads `· landed` (§12.4.1).
+/// Format live AI CLI status for a tab row (`"working: thinking (14s)"`, `"waiting on permission: Bash (5s)"`, `"idle at prompt · landed"`).
 #[must_use]
 pub(crate) fn format_ai_cli_live_status(
     word: Option<&str>,
@@ -3663,7 +2812,7 @@ pub(crate) fn format_ai_cli_live_status(
     base
 }
 
-/// Format elapsed human input milliseconds (`"12s ago"`, `"5m ago"`, `"-"`). Pure.
+/// Format elapsed human input milliseconds (`"12s ago"`, `"5m ago"`, `"-"`).
 #[must_use]
 pub(crate) fn human_activity_words(human_ms: Option<u64>) -> String {
     match human_ms {
@@ -3673,7 +2822,6 @@ pub(crate) fn human_activity_words(human_ms: Option<u64>) -> String {
     }
 }
 
-/// Map a foreground binary or product name to its canonical AI CLI product name.
 fn ai_product_for_name(name: &str) -> Option<&'static str> {
     let lower = name.trim().to_ascii_lowercase();
     for prog in aterm_phase::Program::ALL {
@@ -3694,7 +2842,6 @@ fn ai_product_for_name(name: &str) -> Option<&'static str> {
     }
 }
 
-/// Real account home directory (independent of a scratch `$HOME` in `lab instance`).
 fn real_account_home() -> Option<std::path::PathBuf> {
     #[cfg(unix)]
     {
@@ -3721,7 +2868,6 @@ fn real_account_home() -> Option<std::path::PathBuf> {
     aterm_types::dirs::home_dir()
 }
 
-/// Replace the user's home directory prefix with `~`.
 fn shorten_home_dir(path: &str) -> String {
     let trimmed = path.trim();
     for home in [real_account_home(), aterm_types::dirs::home_dir()]
@@ -3742,7 +2888,6 @@ fn shorten_home_dir(path: &str) -> String {
     trimmed.to_string()
 }
 
-/// Extract a canonical short tag (`m14`, `spark-49f7`) from a host selector or Bonjour name.
 fn host_tag_key_gui(raw: &str) -> String {
     let base = raw.trim().trim_end_matches('.');
     let clean = base
@@ -3770,9 +2915,7 @@ fn host_tag_key_gui(raw: &str) -> String {
     clean.to_ascii_lowercase()
 }
 
-/// Normalize any discovered or local host name into a consistent canonical hyphenated
-/// identifier (`m1-MacBook-Air-M2-24GB-1TB`, `m14-MacBook-Air-M5-32GB-4TB-prime`, `spark-49f7`),
-/// honoring any custom override in `[names]` of `machines.toml`.
+/// Normalize any discovered or local host name into a consistent canonical hyphenated identifier (`m1-MacBook-Air-M2-24GB-1TB`, `m14-MacBook-Air-M5-32GB-4TB-prime`, `spark-49f7`), honoring any custom override in `[names]` of `machines.toml`.
 pub(crate) fn canonical_host_name_gui(
     raw: &str,
     custom_names: &std::collections::BTreeMap<String, String>,
@@ -3883,7 +3026,6 @@ pub(crate) fn canonical_host_name_gui(
     norm.join("-")
 }
 
-/// Read custom `[names]` mappings from `machines.toml` if present.
 fn load_custom_host_names() -> std::collections::BTreeMap<String, String> {
     let mut out = std::collections::BTreeMap::new();
     let mut candidates = Vec::new();
@@ -3912,7 +3054,6 @@ fn load_custom_host_names() -> std::collections::BTreeMap<String, String> {
     out
 }
 
-/// Cached raw local host name (`LocalHostName` on macOS, falling back to `gethostname`).
 fn raw_local_host_name_gui() -> String {
     static NAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     NAME.get_or_init(|| {
@@ -3947,7 +3088,6 @@ fn raw_local_host_name_gui() -> String {
     .clone()
 }
 
-/// Cached local computer name for the Tab Control Panel (no subprocess on the frame path).
 fn local_computer_label() -> String {
     let raw = raw_local_host_name_gui();
     if cfg!(test) || aterm_uds::test_binary::scratch_root().is_some() {
@@ -3957,9 +3097,6 @@ fn local_computer_label() -> String {
     }
 }
 
-/// Collect sibling local `aterm` tabs and managed remote computers/tabs on the
-/// background stats worker thread — where the reading asks for the fleet
-/// ([`FleetAsk`]); else none.
 fn collect_fleet_and_sibling_tabs(
     ask: FleetAsk,
 ) -> (
@@ -3982,8 +3119,7 @@ fn collect_fleet_and_sibling_tabs(
 
 #[cfg(test)]
 thread_local! {
-    /// The counting seam on [`collect_fleet_and_sibling_tabs`]: the fleet
-    /// sweeps this thread's readings began.
+    /// The counting seam on [`collect_fleet_and_sibling_tabs`]: the fleet sweeps this thread's readings began.
     pub(crate) static FLEET_SWEEPS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
@@ -3992,8 +3128,6 @@ fn collect_sibling_aterm_tabs() -> Vec<TabSpreadsheetRow> {
     sibling_aterm_tabs_in(sibling_socket_dirs())
 }
 
-/// The folders [`collect_sibling_aterm_tabs`] reads sibling sockets in: the
-/// control folder, and outside a test the person's other per-user ones.
 #[cfg(unix)]
 fn sibling_socket_dirs() -> Vec<std::path::PathBuf> {
     let mut dirs = Vec::new();
@@ -4022,8 +3156,6 @@ fn sibling_socket_dirs() -> Vec<std::path::PathBuf> {
     dirs
 }
 
-/// [`collect_sibling_aterm_tabs`] over the sibling sockets in `dirs`: a test
-/// names a folder of its own, short enough to bind in whatever `$TMPDIR` is.
 #[cfg(unix)]
 fn sibling_aterm_tabs_in(dirs: Vec<std::path::PathBuf>) -> Vec<TabSpreadsheetRow> {
     use std::io::{BufRead, BufReader, Write};
@@ -4116,7 +3248,6 @@ fn sibling_aterm_tabs_in(dirs: Vec<std::path::PathBuf>) -> Vec<TabSpreadsheetRow
                             cwd_opt = Some(shorten_home_dir(&decoded));
                         }
                     }
-                    // The tab's place, then its grid and its directory, as facts.
                     let facts = dims_opt
                         .map(|(c, r)| format!("{c}\u{d7}{r}"))
                         .into_iter()
@@ -4536,8 +3667,6 @@ fn format_uptime_gui(secs: u64) -> String {
     }
 }
 
-/// Push one `0..=100` sample into the rolling sparkline history ring for `host_key`
-/// and return its 8-level Unicode sparkline (`▁▂▃▄▅▆▇█`).
 fn push_sparkline_sample(host_key: &str, sample_pct: u8) -> String {
     use std::collections::{BTreeMap, VecDeque};
     use std::sync::{Mutex, OnceLock};
@@ -4561,7 +3690,6 @@ fn push_sparkline_sample(host_key: &str, sample_pct: u8) -> String {
         .collect()
 }
 
-/// Format live `this Mac` vitals from `VitalsHost`'s 1-second `Snapshot`.
 fn format_local_snapshot_vitals(snap: &aterm_vitals::model::Snapshot) -> String {
     let mut parts = Vec::new();
     if let Some(cpu) = &snap.cpu {
@@ -4618,8 +3746,6 @@ fn format_local_snapshot_vitals(snap: &aterm_vitals::model::Snapshot) -> String 
             pressure.to_string(),
             format!("wired {}", human_bytes_gui(mem.sample.wired)),
         ];
-        // A class this OS does not report (Windows' compression store) is
-        // left out, never a false `comp 0 B`.
         if let Some(c) = mem.sample.compressed {
             extra.push(format!("comp {}", human_bytes_gui(c)));
         }
@@ -4647,7 +3773,6 @@ fn format_local_snapshot_vitals(snap: &aterm_vitals::model::Snapshot) -> String 
     parts.join(" \u{b7} ")
 }
 
-/// Format `vitals` JSON object from an enrolled host's `state/<uuid>.json`.
 fn format_hello_vitals_json(host_id: &str, v: &aterm_json::Value) -> String {
     let cores = v.get("cpu_cores").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
     let cpu_pct = v
@@ -4740,8 +3865,6 @@ fn format_hello_vitals_json(host_id: &str, v: &aterm_json::Value) -> String {
     parts.join(" \u{b7} ")
 }
 
-/// Sample `this Mac`'s live kernel vitals directly via `aterm_sysprobe` on the background
-/// fleet worker thread (used immediately on first draw and merged with `VitalsHost`).
 #[cfg(target_os = "macos")]
 fn sample_local_vitals_fallback() -> String {
     let layout = aterm_sysprobe::cpu_layout();
@@ -4806,8 +3929,6 @@ fn sample_local_vitals_fallback() -> String {
             (Some(n), _) if !n.is_empty() => n.to_string(),
             _ => "GPU".to_string(),
         };
-        // A card asleep is known idle; one nobody can read says why, never
-        // a false 0 %.
         let gpct = g
             .device_pct
             .or((g.unread == Some(aterm_sysprobe::Why::Asleep)).then_some(0));
@@ -4823,8 +3944,6 @@ fn sample_local_vitals_fallback() -> String {
         }
     }
     if let Some(m) = aterm_sysprobe::memory_detail() {
-        // In use as the Deck counts it: Linux's shared memory is in use, and
-        // a class this OS does not report adds nothing.
         let used = m
             .app
             .saturating_add(m.shared.unwrap_or(0))
@@ -4836,7 +3955,6 @@ fn sample_local_vitals_fallback() -> String {
             Some(aterm_sysprobe::MemoryLevel::Normal) => "normal",
             Some(aterm_sysprobe::MemoryLevel::Warn) => "warn",
             Some(aterm_sysprobe::MemoryLevel::Critical) => "critical",
-            // Unread (Linux without PSI) is not "normal".
             None => "pressure unknown",
         };
         let mut extra = vec![
@@ -4937,8 +4055,6 @@ fn run_dns_sd_bounded(args: &[&str], wait_ms: u64, stop_substr: Option<&str>) ->
     };
     drop(cmd);
     let (finished, finish) = std::sync::mpsc::channel();
-    // One owner kills and reaps the child, even when the reader finishes early.
-    // No detached PID-only signal can outlive the child and hit a reused PID.
     let watcher = std::thread::spawn(move || {
         let _ = finish.recv_timeout(std::time::Duration::from_millis(wait_ms));
         let _ = child.kill();
@@ -5289,8 +4405,6 @@ fn discover_bonjour_lan_computers(
             "{local_hw} \u{b7} {local_os_str} \u{b7} {local_ssh_str} \u{b7} advertised services: {local_services}"
         ),
         status: "online (local)".to_string(),
-        // `VitalsHost`'s snapshot is what the page shows where it has one:
-        // no 30 ms sample and no `sysctl` spawns for words it would drop.
         vitals: if local_vitals {
             sample_local_vitals_fallback()
         } else {
@@ -5414,8 +4528,7 @@ fn natural_lan_sort_key(name: &str) -> (u8, u64, String) {
     (1, 0, trimmed.to_ascii_lowercase())
 }
 
-/// Unix milliseconds now (the wall clock: the ledgers' rows are stamped on
-/// it, and a task's face is stamped with it, `App::apply_harness_fact`).
+/// Unix milliseconds now (the wall clock: the ledgers' rows are stamped on it, and a task's face is stamped with it, `App::apply_harness_fact`).
 pub(crate) fn unix_ms_now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

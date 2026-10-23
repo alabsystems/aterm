@@ -1,12 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE GATE SWITCH (card engine §3.8-§3.9, §7 "A, the gate"): the card is
-//! decorated only where the current drawer's token, its reader, the frame's
-//! fence and the banner's build policy all admit it — on a real engine, a
-//! real frame through the capture route's splices and the real splice — and
-//! a card hidden by its identity or its fence shows again no sooner than the
-//! re-show bound allows.
+//! Tests for the Claude card decoration gate and re-show hold window.
 
 use super::*;
 
@@ -21,7 +16,6 @@ fn build(version: &str) -> atpkg::vendor_direct::Version {
 }
 
 /// The card probe's dev rows of `kind` on `session`'s timeline, oldest first
-/// (`SessionTimeline::note_card_frame`).
 fn dev_rows(app: &App, session: u64, kind: &str) -> Vec<String> {
     app.pool
         .get(session)
@@ -49,7 +43,6 @@ fn bare_reasons(app: &App, session: u64) -> Vec<String> {
 }
 
 /// A headless window 120 wide, its front session supervised, the dev card
-/// probe on: nothing on its screen and nothing in front yet.
 fn bare_window() -> (App, WindowId, u64, crate::harness_host::HostHandle) {
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
@@ -67,8 +60,6 @@ fn bytes(app: &App, session: u64, s: &str) {
 }
 
 /// Claude Code's launch card and prompt as it paints them INLINE (no clear),
-/// from the cursor down: a blank row, the card, a blank row, the composer
-/// between its rules and the mode row.
 fn inline_claude(version: &str) -> String {
     let screen = card_screen(24, 120, MODEL, version);
     let rule = "\u{2500}".repeat(120);
@@ -87,8 +78,6 @@ fn inline_claude(version: &str) -> String {
 }
 
 /// `rows` written at their own rows from the top with NO clear (cursor
-/// addressing and erase-line alone, the path row in [`GRAY`] as [`feed`]
-/// paints it): what a program that does not clear the screen leaves.
 fn paint_at(app: &App, session: u64, rows: &[String]) {
     let mut out = String::new();
     for (i, row) in rows.iter().enumerate() {
@@ -103,8 +92,6 @@ fn paint_at(app: &App, session: u64, rows: &[String]) {
 }
 
 /// A shell's `cat card.txt`: Claude Code's card and prompt printed by
-/// another program, the shell's next prompt under it, the cursor on the
-/// blank row below.
 fn cat_card(app: &App, session: u64) {
     bytes(app, session, "$ cat card.txt\r\n");
     bytes(app, session, &inline_claude(VERSION));
@@ -112,12 +99,6 @@ fn cat_card(app: &App, session: u64) {
 }
 
 /// THE GATE, AS A FUNCTION (§3.8): integer checks, cheapest first, each one
-/// failing closed — the token the frame's fence names, the reader, the
-/// fence (one span holding every card row on main; the alternate screen
-/// wholly the drawer's on alt) and the build policy (Exact: the banner names
-/// the image's build; Registry: its own row's; ProvenanceOnly: the fence
-/// alone; None: bare). Each refusal is shown against the admitted base case
-/// it differs from by one field.
 #[test]
 fn the_gate_checks_token_kind_fence_and_build_and_fails_closed() {
     let rows = card_screen(24, 120, MODEL, VERSION);
@@ -153,7 +134,6 @@ fn the_gate_checks_token_kind_fence_and_build_and_fails_closed() {
         Ok(()),
         "the drawer's own card"
     );
-    // The token.
     let no_token = CardGate { token: 0, ..gate };
     assert_eq!(admit(&no_token, &main(all), &read), Err(Bare::Token));
     let other = HolderView {
@@ -161,10 +141,8 @@ fn the_gate_checks_token_kind_fence_and_build_and_fails_closed() {
         ..all
     };
     assert_eq!(admit(&gate, &main(other), &read), Err(Bare::Token));
-    // The reader: an agy card under a Claude Code drawer.
     let agy = CardGate { kind: 4, ..gate };
     assert_eq!(admit(&agy, &main(all), &read), Err(Bare::Kind));
-    // The fence, main.
     let top = 100 + read.place.top as u64;
     let fence = |spans: &[(u64, u64)]| admit(&gate, &main(view(spans, false, false)), &read);
     assert_eq!(
@@ -197,7 +175,6 @@ fn the_gate_checks_token_kind_fence_and_build_and_fails_closed() {
         Err(Bare::Fence),
         "no row to name"
     );
-    // The fence, alt: the screen's freshness alone, whatever main holds.
     let alt = |holder| FenceFrame {
         holder,
         base_y: 100,
@@ -209,7 +186,6 @@ fn the_gate_checks_token_kind_fence_and_build_and_fails_closed() {
         Ok(()),
         "a fresh alternate screen is wholly the drawer's"
     );
-    // The build policy.
     let with = |policy| CardGate {
         build: policy,
         ..gate
@@ -245,14 +221,6 @@ fn the_gate_checks_token_kind_fence_and_build_and_fails_closed() {
 }
 
 /// THE POLICY TABLE (§3.8): the image's source × its program's banner
-/// build, as `aterm_phase` declares it beside each reader. Claude Code's
-/// managed-store, ALab-record and vendor-installer images hold the banner to
-/// their own build; an image of unknown build holds it to its own registry
-/// row, or keeps it bare with none; agy and Muse Code are judged by the
-/// fence alone whatever their source; a shell or a launcher has no gate. The
-/// timeline gives the gate only for its CURRENT image (`pgid ==
-/// program_pgid`) — CONTROL: the same image with another group in front has
-/// none.
 #[test]
 fn the_build_policy_is_the_images_source_by_its_banner_build() {
     use atpkg::image::{ImageBuild, ImageSource, ProgramTag};
@@ -305,7 +273,6 @@ fn the_build_policy_is_the_images_source_by_its_banner_build() {
         None,
         "a launcher draws no card"
     );
-    // The timeline's gate: the current image's only.
     let mut timeline = crate::session_timeline::SessionTimeline::default();
     let claude = claude_image(PGID, VERSION, 1);
     let token = claude.token.expect("a token");
@@ -329,14 +296,6 @@ fn the_build_policy_is_the_images_source_by_its_banner_build() {
 }
 
 /// THE FIRST FRAME (§3.8, §8): a Claude Code whose image is published and
-/// whose fence is cut is decorated on the first frame that shows its card,
-/// with no footer facts — no registry row is waited on — for ONE timeline
-/// lock a pane a frame; settled (held, its window out of focus: a focused
-/// card flows on), it costs no clock read and no allocation.
-/// The dev card probe (on here, as in every §8 run) takes one lock more a
-/// pane, to record the pass, and none with the probe off. CONTROL: the same
-/// image with another group in front (not current) draws nothing, for the
-/// same one lock.
 #[test]
 fn a_drawer_with_no_facts_is_decorated_on_its_first_frame() {
     let (mut app, wid, session, host) = bare_window();
@@ -370,8 +329,6 @@ fn a_drawer_with_no_facts_is_decorated_on_its_first_frame() {
     frame(&mut app, wid);
     set_now(Some(t0 + Duration::from_millis(EPISODE_MS + 1)));
     frame(&mut app, wid);
-    // Settled: held, its window out of focus (a focused card flows on,
-    // `settled_glass`).
     hold(&mut app, wid);
     for i in 0..6u64 {
         set_now(Some(t0 + Duration::from_millis(EPISODE_MS + 100 + i)));
@@ -393,7 +350,6 @@ fn a_drawer_with_no_facts_is_decorated_on_its_first_frame() {
     }
     app.session_factory.card_probe = true;
     assert!(decorated(&app, wid).is_some(), "still decorated");
-    // CONTROL: the image no longer current.
     app.pool
         .get(session)
         .unwrap()
@@ -413,12 +369,6 @@ fn a_drawer_with_no_facts_is_decorated_on_its_first_frame() {
 }
 
 /// THE GATE'S CONTROLS ON THE GLASS (§7 "A, the gate"): the very screen that
-/// decorates under its own drawer stays bare, for the reason the probe's
-/// `card-bare` row names, under each of: a 2.1.303 image (Exact), a fence
-/// that names another token, an agy card (rows kind 4) under Claude Code, a
-/// mark tainted by what lay under the cursor at its cut, and a card the
-/// drawer did not write (above its span). Each CONTROL decorates the same
-/// card once the one thing it differs by is the drawer's.
 #[test]
 fn the_gate_keeps_every_card_but_its_drawers_own_bare() {
     let screen = card_screen(24, 120, MODEL, VERSION);
@@ -436,7 +386,6 @@ fn the_gate_keeps_every_card_but_its_drawers_own_bare() {
         feed(app, session, &screen);
     });
     assert!(own.is_some(), "CONTROL: the drawer's own card decorates");
-    // A 2.1.303 image under a 2.1.283 banner.
     let (place, reasons) = run(&|app, session| {
         launch(app, session, "2.1.303", PGID, 1);
         feed(app, session, &screen);
@@ -445,7 +394,6 @@ fn the_gate_keeps_every_card_but_its_drawers_own_bare() {
         (place, reasons.last().map(String::as_str)),
         (None, Some("build"))
     );
-    // The frame's fence names another drawer.
     let (place, reasons) = run(&|app, session| {
         let token = launch(app, session, VERSION, PGID, 1);
         cut(app, session, Some(token ^ 1), CutKind::Exec, false);
@@ -455,7 +403,6 @@ fn the_gate_keeps_every_card_but_its_drawers_own_bare() {
         (place, reasons.last().map(String::as_str)),
         (None, Some("token"))
     );
-    // An agy card under Claude Code.
     let agy = agy_card_screen("1.4.0");
     let (place, reasons) = run(&|app, session| {
         launch(app, session, VERSION, PGID, 1);
@@ -465,8 +412,6 @@ fn the_gate_keeps_every_card_but_its_drawers_own_bare() {
         (place, reasons.last().map(String::as_str)),
         (None, Some("kind"))
     );
-    // Tainted: the card was on the screen BELOW the cursor at the cut, and
-    // nothing cleared it since.
     let tainted = |app: &App, session: u64| {
         paint_at(app, session, &screen);
         bytes(app, session, "\x1b[H");
@@ -478,14 +423,11 @@ fn the_gate_keeps_every_card_but_its_drawers_own_bare() {
         (place, reasons.last().map(String::as_str)),
         (None, Some("tainted"))
     );
-    // CONTROL: the lay that finds no ink admits it (the span from the
-    // cursor down holds the card).
     let (place, _) = with_knob(FenceKnob::NoLayTaint, || run(&tainted));
     assert!(
         place.is_some(),
         "CONTROL: untainted, the same card decorates"
     );
-    // Outside the span: printed by `cat` before the drawer took the front.
     let (place, reasons) = run(&|app, session| {
         cat_card(app, session);
         launch(app, session, VERSION, PGID, 1);
@@ -494,7 +436,6 @@ fn the_gate_keeps_every_card_but_its_drawers_own_bare() {
         (place, reasons.last().map(String::as_str)),
         (None, Some("fence"))
     );
-    // CONTROL: the same card printed after the cut is the drawer's.
     let (place, _) = run(&|app, session| {
         bytes(app, session, "$ claude\r\n");
         launch(app, session, VERSION, PGID, 1);
@@ -504,7 +445,6 @@ fn the_gate_keeps_every_card_but_its_drawers_own_bare() {
 }
 
 /// agy's launch card as its 1.4.0 fixtures draw it, under `version`, on a
-/// screen with nothing else: rows 4 to 8.
 fn agy_card_screen(version: &str) -> Vec<String> {
     let mut screen = vec![String::new(); 4];
     screen.extend([
@@ -521,7 +461,6 @@ fn agy_card_screen(version: &str) -> Vec<String> {
 }
 
 /// The image of an agy of build `version` leading group `pgid`: a store
-/// image — whose banner the gate does not hold to its build.
 fn agy_image(pgid: i32, version: &str) -> HolderImage {
     use atpkg::image::{ImageBuild, ImageSource, ProgramTag};
     HolderImage::of(
@@ -538,17 +477,6 @@ fn agy_image(pgid: i32, version: &str) -> HolderImage {
 }
 
 /// AGY IS JUDGED BY ITS FENCE ALONE (§3.8, ProvenanceOnly): an agy 1.4.2
-/// store image decorates the card it paints whatever build its banner
-/// prints (every 1.4.x fixture prints 1.4.0), and a predecessor's — or a
-/// quoted — agy card above its span stays bare, for the fence's reason only.
-/// CONTROL: the self-referential compare A4 deleted (the card's banner held
-/// to the build read off that same banner, with no fence) passes that card;
-/// the build policy here passes it too — the fence is what keeps it bare.
-/// The fence holds agy's card to its reader's full height
-/// (`agy::LAUNCH_CARD_ROWS`, the feet row under the four rows it places):
-/// a span that ends above the feet is no span of the card's.
-/// Mutation-checked: the fence's height taken from the placed rows alone
-/// admits the card without its feet.
 #[test]
 fn an_agy_card_is_judged_by_its_fence_alone() {
     let agy = agy_card_screen("1.4.0");
@@ -577,7 +505,6 @@ fn an_agy_card_is_judged_by_its_fence_alone() {
         frame(&mut app, wid);
         let place = decorated(&app, wid);
         let reasons = bare_reasons(&app, session);
-        // What the build policy alone says of the card on the glass.
         let read = app.windows[&wid]
             .claude_footer_texts
             .borrow()
@@ -627,7 +554,6 @@ fn an_agy_card_is_judged_by_its_fence_alone() {
         Ok(()),
         "CONTROL: the deleted self-compare passes it too"
     );
-    // The fence's height: the reader's, from the banner to the feet.
     assert_eq!(
         (read.place.rows, aterm_phase::agy::LAUNCH_CARD_ROWS),
         (4, 5),
@@ -660,11 +586,6 @@ fn an_agy_card_is_judged_by_its_fence_alone() {
 }
 
 /// A SAME-BUILD INLINE RELAUNCH (§7; `/exit`, then `claude` again): the old
-/// card, the same build's, is still on the glass above the new process's
-/// span; the new process is a new snapshot token, and until it paints its
-/// own card the old one stays bare (the fence) and arms nothing. Its own
-/// card is decorated and armed: a new episode. Mutation-checked: a span that
-/// starts at row 0 (`span.start = 0`) decorates the old card.
 #[test]
 fn a_same_build_inline_relaunch_keeps_the_old_card_bare() {
     let (mut app, wid, session, host) = bare_window();
@@ -675,7 +596,6 @@ fn a_same_build_inline_relaunch_keeps_the_old_card_bare() {
     bytes(&app, session, &inline_claude(VERSION));
     frame(&mut app, wid);
     let old = decorated(&app, wid).expect("the first card");
-    // `/exit`: the shell is back; `claude` again, the same build.
     bytes(&app, session, "\r\n");
     leave(&app, session, false);
     bytes(&app, session, "$ claude\r\n");
@@ -690,7 +610,6 @@ fn a_same_build_inline_relaunch_keeps_the_old_card_bare() {
     );
     let armed = || dev_rows(&app, session, "card-armed");
     assert_eq!(armed().len(), 1, "nothing armed for the old card");
-    // The new process paints its own card under it.
     bytes(&app, session, &inline_claude(VERSION));
     set_now(Some(t0 + Duration::from_secs(3)));
     frame(&mut app, wid);
@@ -707,20 +626,10 @@ fn a_same_build_inline_relaunch_keeps_the_old_card_bare() {
 }
 
 /// Claude Code 2.1.304's first inline frame, byte for byte as it wrote it in
-/// the lab at 144 columns (`CLAUDE_CODE_NO_FLICKER=0`, 2026-10-20): its
-/// card, the composer between its rules and the mode row, one write of 871
-/// characters, ending with the cursor moved back up into the composer.
 const CLAUDE_2_1_304_INLINE: &str =
     include_str!("../tests/fixtures/claude-card/claude-2.1.304-inline-first-frame-144col.out");
 
 /// THE SAME-BUILD INLINE RELAUNCH ON 2.1.304's OWN BYTES (§7: the fixture
-/// re-captured for 2.1.304): its first frame, `/exit` (the shell's prompt
-/// under its frame), and the same build again, its first frame drawn under
-/// the old one. Until then the old card stays bare (its rows are outside the
-/// new drawer's span); the new card is decorated on its first frame and
-/// armed: a new episode. Mutation-checked with
-/// [`a_same_build_inline_relaunch_keeps_the_old_card_bare`]: a span opened
-/// at row 0 (`open_span(mark, 0, grid)` in `lay`) decorates the old card.
 #[test]
 fn a_relaunch_of_2_1_304_keeps_its_old_card_bare_on_its_own_bytes() {
     const BUILD: &str = "2.1.304";
@@ -733,7 +642,6 @@ fn a_relaunch_of_2_1_304_keeps_its_old_card_bare_on_its_own_bytes() {
     bytes(&app, session, CLAUDE_2_1_304_INLINE);
     frame(&mut app, wid);
     let old = decorated(&app, wid).expect("2.1.304's own card, on its first frame");
-    // `/exit`: under the mode row, the shell's prompt; `claude` again.
     bytes(&app, session, "\x1b[3B\r\n");
     leave(&app, session, false);
     bytes(&app, session, "$ claude\r\n");
@@ -770,17 +678,11 @@ fn a_relaunch_of_2_1_304_keeps_its_old_card_bare_on_its_own_bytes() {
 }
 
 /// THE FULLSCREEN GAP (§7): Claude Code under `CLAUDE_CODE_NO_FLICKER=1`
-/// takes the alternate screen. Before it does, a card on the main screen
-/// outside its span stays bare; after its `1049h` (the alternate screen
-/// cleared) the card it paints there is decorated. CONTROL: a `47h` (the
-/// alternate screen NOT cleared) leaves the same card bare: nothing says the
-/// alternate screen is wholly the drawer's.
 #[test]
 fn the_alternate_screen_is_the_drawers_only_once_cleared() {
     let screen = card_screen(24, 120, MODEL, VERSION);
     let run = |enter: &str| {
         let (mut app, wid, session, host) = bare_window();
-        // A card on main from before the launch.
         cat_card(&app, session);
         launch(&app, session, VERSION, PGID, 1);
         frame(&mut app, wid);
@@ -802,8 +704,6 @@ fn the_alternate_screen_is_the_drawers_only_once_cleared() {
 }
 
 /// `claude` typed at the shell's prompt: Claude Code (group `pgid`,
-/// started at `start`) takes the front and paints its card and prompt
-/// inline, under the command line. The drawer's token.
 fn claude_inline(app: &App, session: u64, pgid: i32, start: u64) -> u64 {
     bytes(app, session, "$ claude\r\n");
     let token = launch(app, session, VERSION, pgid, start);
@@ -812,7 +712,6 @@ fn claude_inline(app: &App, session: u64, pgid: i32, start: u64) -> u64 {
 }
 
 /// Ctrl-Z: Claude Code leaves its cursor under its prompt and stops; the
-/// shell, in front, says so.
 fn suspend(app: &App, session: u64) {
     bytes(app, session, "\r\n");
     leave(app, session, true);
@@ -835,14 +734,6 @@ fn resume(app: &App, session: u64, token: u64) {
 }
 
 /// CTRL-Z, `clear`, `cat card`, `fg` (§7): the card the shell printed while
-/// Claude Code was stopped — the same build's, byte for byte, under the
-/// shell's command line — stays bare when Claude is back in front: the
-/// stopped drawer's sealed rows were rewritten. Nothing is armed again.
-/// CONTROLS: without the seal check the cat'd card is decorated (the seal
-/// is what refuses it), and still nothing arms (the same drawer, the same
-/// episode); and `fg` with nothing rewritten shows Claude's own card
-/// again, unarmed. (The seal judges a row by its content: a rewrite that
-/// leaves every sealed row exactly as the drawer left it is no rewrite.)
 #[test]
 fn a_card_catted_while_claude_was_stopped_stays_bare() {
     let run = |rewrite: bool, seal: bool| {
@@ -857,8 +748,6 @@ fn a_card_catted_while_claude_was_stopped_stays_bare() {
         frame(&mut app, wid);
         let stopped = decorated(&app, wid);
         if rewrite {
-            // `clear`, then `cat card.txt`: the card's own rows, from its
-            // banner.
             bytes(&app, session, "$ clear\r\n\x1b[H\x1b[2J$ cat card.txt\r\n");
             let card = inline_claude(VERSION);
             bytes(
@@ -904,14 +793,6 @@ fn a_card_catted_while_claude_was_stopped_stays_bare() {
 }
 
 /// CTRL-Z, `clear`, `cat card`, `fg` AS CLAUDE CODE 2.1.304 PLAYS IT (§8,
-/// live: on `SIGCONT` it repaints its card under the shell's `fg`, 2-3 ms
-/// after the cut). Until the repaint the cat'd card is the one on the pane
-/// and stays bare (its fence); the repaint is the drawer's own, drawn after
-/// its cut, and is decorated where it is drawn, under the cat'd card. The
-/// dev rows say the decorated card moved (`card-row`), and nothing is armed
-/// again: the same episode. Mutation-checked: arming every re-show of the
-/// same drawer's card (`entry.arm` when `!entry.was_shown`) arms twice; a
-/// `card-row` never recorded fails its row.
 #[test]
 fn a_card_claude_repaints_after_fg_is_decorated_under_the_catted_one() {
     let (mut app, wid, session, host) = bare_window();
@@ -952,7 +833,6 @@ fn a_card_claude_repaints_after_fg_is_decorated_under_the_catted_one() {
     };
     let fenced = dev_rows(&app, session, "card-bare");
     let catted = row_of(fenced.last().expect("the cat'd card's row"));
-    // Claude Code's repaint, at its cursor under `fg`.
     bytes(&app, session, &inline_claude(VERSION));
     set_now(Some(t0 + Duration::from_secs(3)));
     frame(&mut app, wid);
@@ -982,15 +862,10 @@ fn a_card_claude_repaints_after_fg_is_decorated_under_the_catted_one() {
 }
 
 /// A WIDTH RESIZE (§7): rows above Claude Code's span that unwrap at a wider
-/// width move its card up, and the fence's anchors move with them (the grid
-/// lends them to the reflow): the card stays decorated at its new place.
-/// CONTROL: a reflow that lends nothing leaves the anchors at their old rows
-/// and the card bare.
 #[test]
 fn a_width_resize_keeps_the_card_decorated() {
     let run = |lend: bool| {
         let (mut app, wid, session, host) = bare_window();
-        // Three shell lines that wrap at 120 columns, then the launch.
         for _ in 0..3 {
             bytes(&app, session, &format!("{}\r\n", "x".repeat(200)));
         }
@@ -1022,18 +897,11 @@ fn a_width_resize_keeps_the_card_decorated() {
 }
 
 /// THE RE-SHOW BOUND (§3.9): Claude Code stopped and brought back within
-/// [`RESHOW_MS`] of its card's show is not shown again until that bound —
-/// the card's own wake asks for the frame at that instant, with no input —
-/// then shown, unarmed. A viewport hide (scrolled back and down again) is
-/// exempt: shown at once. A NEW drawer's card is never held back, however
-/// soon. Mutation-checked: a hide that never bounds the re-show shows the
-/// card at once.
 #[test]
 fn the_reshow_bound_holds_a_flapping_card_and_shows_it_on_time() {
     let (mut app, wid, session, host) = bare_window();
     app.windows.get_mut(&wid).unwrap().band_on_screen_for_test = true;
     let ms = |t0: Instant, ms: u64| t0 + Duration::from_millis(ms);
-    // History to scroll back into, then Claude Code.
     for i in 0..40 {
         bytes(&app, session, &format!("line {i}\r\n"));
     }
@@ -1045,7 +913,6 @@ fn the_reshow_bound_holds_a_flapping_card_and_shows_it_on_time() {
         decorated(&app, wid).is_some(),
         "the first show is never held"
     );
-    // Ctrl-Z at 40 ms, `fg` at 80 ms: an identity hide, then a show.
     set_now(Some(ms(t0, 40)));
     suspend(&app, session);
     frame(&mut app, wid);
@@ -1077,7 +944,6 @@ fn the_reshow_bound_holds_a_flapping_card_and_shows_it_on_time() {
         "shown at the bound, no input"
     );
     assert_eq!(dev_rows(&app, session, "card-armed").len(), 1, "unarmed");
-    // A viewport hide: scrolled back and down again 20 ms later.
     let term = app.pool.get(session).unwrap().term.clone();
     crate::term_lock(&term).scroll_display(3);
     set_now(Some(ms(t0, RESHOW_MS + 20)));
@@ -1087,8 +953,6 @@ fn the_reshow_bound_holds_a_flapping_card_and_shows_it_on_time() {
     set_now(Some(ms(t0, RESHOW_MS + 40)));
     frame(&mut app, wid);
     assert!(decorated(&app, wid).is_some(), "a viewport hide is exempt");
-    // `/exit`, then `claude` again 20 ms later: a new drawer, whose first
-    // show is never held back.
     bytes(&app, session, "\r\n");
     leave(&app, session, false);
     set_now(Some(ms(t0, RESHOW_MS + 50)));
@@ -1103,13 +967,6 @@ fn the_reshow_bound_holds_a_flapping_card_and_shows_it_on_time() {
 }
 
 /// THE BOUND HOLDS A SUSTAINED FLAP (§3.9, photosensitivity): Claude Code
-/// stopped and resumed every 40 ms for over a second — a hide while a show
-/// is held back among them — on a frame every 20 ms. Every show of its card
-/// begins at least [`RESHOW_MS`] after the one before (at most
-/// `1000 / RESHOW_MS` a second, under WCAG 2.3.1's three; the const assert
-/// holds the constant to that), the card does show again (the bound defers,
-/// it does not hide), and nothing is armed again. Mutation-checked: a hide
-/// that never bounds the re-show starts a show every 80 ms here.
 #[test]
 fn the_reshow_bound_holds_a_sustained_flap() {
     let (mut app, wid, session, host) = bare_window();
@@ -1120,8 +977,6 @@ fn the_reshow_bound_holds_a_sustained_flap() {
     for step in 0..60u64 {
         let ms = step * 20;
         set_now(Some(t0 + Duration::from_millis(ms)));
-        // From 40 ms: stopped at 40, 120, 200, …; resumed at 80, 160, ….
-        // No bytes: the shell writes nothing over the card meanwhile.
         if ms >= 40 && ms % 40 == 0 {
             if ms % 80 == 40 {
                 leave(&app, session, true);
@@ -1157,8 +1012,6 @@ fn the_reshow_bound_holds_a_sustained_flap() {
 }
 
 /// `fg` with nothing written: the stopped Claude Code (`token`, group
-/// [`PGID`]) back in front, its image published again and the fence cut back
-/// to it.
 fn resume_quiet(app: &App, session: u64, token: u64) {
     {
         let entry = app.pool.get(session).expect("session");
@@ -1173,11 +1026,6 @@ fn resume_quiet(app: &App, session: u64, token: u64) {
 }
 
 /// THE DEV ROWS' JUDGE (§8): `card-decorated bare_frames=` counts the frames
-/// composed after the drawer's card was on the glass and before it was
-/// decorated. A fresh launch's card is decorated on its first frame
-/// (`bare_frames=0`), and its episode is armed once. CONTROL: a card the
-/// gate refuses for two frames (tainted at the cut) and then admits (the
-/// drawer clears and repaints) says `bare_frames=2`.
 #[test]
 fn the_dev_rows_count_the_frames_a_drawers_card_was_bare() {
     let screen = card_screen(24, 120, MODEL, VERSION);
@@ -1193,7 +1041,6 @@ fn the_dev_rows_count_the_frames_a_drawers_card_was_bare() {
     assert_eq!(dev_rows(&app, session, "card-armed").len(), 1);
     assert_eq!(bare_reasons(&app, session), vec!["no-card".to_string()]);
     host.shutdown_and_join();
-    // CONTROL.
     let (mut app, wid, session, host) = bare_window();
     paint_at(&app, session, &screen);
     bytes(&app, session, "\x1b[H");
@@ -1206,10 +1053,6 @@ fn the_dev_rows_count_the_frames_a_drawers_card_was_bare() {
     assert_eq!(rows.len(), 1, "{rows:?}");
     assert!(rows[0].contains("bare_frames=2"), "CONTROL: {rows:?}");
     host.shutdown_and_join();
-    // A PREDECESSOR'S CARD (an inline relaunch): refused above the drawer's
-    // own for two frames, it is no bare time of the drawer's card, and the
-    // `card-bare` row names its row. Mutation-checked: `BareFrames::of`
-    // counting a refused card at any row reports `bare_frames=2` here.
     let (mut app, wid, session, host) = bare_window();
     let t0 = Instant::now();
     set_now(Some(t0));
@@ -1255,12 +1098,6 @@ fn the_dev_rows_count_the_frames_a_drawers_card_was_bare() {
 }
 
 /// THE HOLDER AFTER A RESTORE (§3.8, `spawn::adopt_restored_holder`): the
-/// foreground leader is read from the kernel and its image published. A
-/// carried mark that is the holder's continues; a predecessor with no fence
-/// is seeded, for an Exact drawer, from its signed output start — the card
-/// it drew is admitted, the same-build card `cat` printed above it is not;
-/// a ProvenanceOnly drawer, or no group in front, is bare. CONTROL: the
-/// restored engine with no adoption admits nothing.
 #[cfg(unix)]
 #[test]
 fn a_restore_re_derives_the_holder_from_the_kernel() {
@@ -1278,8 +1115,6 @@ fn a_restore_re_derives_the_holder_from_the_kernel() {
         agy_image(pgid, "1.4.2")
     }
     let token = claude_image(PGID, VERSION, 1).token.expect("a token");
-    // A signed shell: `cat card.txt` prints a card, then `claude` paints its
-    // own. A card's three rows start a row under the cursor it starts at.
     let nonce = [7u8; 32];
     let id = aterm_core::terminal::ShellIntegrationNonce(nonce).to_hex();
     let banner_row = |t: &Terminal| {
@@ -1354,17 +1189,13 @@ fn a_restore_re_derives_the_holder_from_the_kernel() {
     assert!(view.admits_rows(lo, hi), "its own card: {view:?} {own}");
     let (lo, hi) = rows(catted);
     assert!(!view.admits_rows(lo, hi), "not the cat'd one: {view:?}");
-    // CONTROL: no adoption, nothing admitted.
     let unadopted = Terminal::from_checkpoint(&no_fence).holder_view();
     assert_eq!(unadopted.token, 0, "CONTROL: {unadopted:?}");
-    // A ProvenanceOnly drawer, and nobody in front: bare.
     let (adoption, view, _, _) = adopt(&no_fence, in_front, agy);
     assert_eq!((adoption, view.token), (HolderAdoption::Bare, 0));
     let (adoption, _, published, gate) = adopt(&no_fence, nobody, claude);
     assert_eq!((adoption, published), (HolderAdoption::Bare, None));
     assert_eq!(gate, None, "no current group grants no card gate");
-    // A carried mark of the holder's continues: its predecessor ran the
-    // fence, Claude Code in front and its card under its cut.
     let mut fenced = Terminal::new(24, 120);
     fenced.process(b"$ claude\r\n");
     fenced.note_holder_cut(HolderCut {
@@ -1382,8 +1213,6 @@ fn a_restore_re_derives_the_holder_from_the_kernel() {
         view.admits_rows(lo, hi),
         "the carried mark's card: {view:?}"
     );
-    // An already-open carried log takes the normal block-before-foreground
-    // step, while the gate is current on return here too.
     let term = std::sync::Mutex::new(Terminal::from_checkpoint(&no_fence));
     let timeline = std::sync::Mutex::new(crate::session_timeline::SessionTimeline::for_test());
     {
@@ -1405,8 +1234,6 @@ fn a_restore_re_derives_the_holder_from_the_kernel() {
 }
 
 /// The image of a Claude Code of UNKNOWN build (a Homebrew install, a
-/// development link) at `exe`, leading group `pgid`, started at `start`:
-/// the Registry rung, held to the build its own registry row reports.
 fn unknown_claude(pgid: i32, exe: &str, start: u64) -> HolderImage {
     use atpkg::image::{ImageBuild, ProgramTag};
     HolderImage::of(
@@ -1419,7 +1246,6 @@ fn unknown_claude(pgid: i32, exe: &str, start: u64) -> HolderImage {
 }
 
 /// The registry row of conversation `id` reporting `version`, pushed by the
-/// footer's resolver for group `pgid` (applied only while it is in front).
 fn registry_row(app: &App, session: u64, pgid: i32, id: &str, version: &str) {
     use aterm_agent::harness::footer::{FactsOwner, FooterFacts};
     let entry = app.pool.get(session).expect("session");
@@ -1451,7 +1277,6 @@ fn gate_of(app: &App, session: u64) -> Option<CardGate> {
 }
 
 /// Group `pgid` takes the front with `image`, as the reader publishes it on
-/// a group edge (`kind`), and the fence is cut to it.
 fn take_front(app: &App, session: u64, pgid: i32, image: HolderImage, kind: CutKind) -> u64 {
     let token = image.token.expect("a token");
     {
@@ -1469,8 +1294,6 @@ fn take_front(app: &App, session: u64, pgid: i32, image: HolderImage, kind: CutK
 }
 
 /// Ctrl-Z as the reader sees it: the shell's group and image in front, the
-/// stopped program's footer facts LEFT STANDING for its group (nothing
-/// drops them on a group edge), the fence cut to no drawer.
 fn shell_in_front(app: &App, session: u64) {
     use atpkg::image::{ImageBuild, ProgramTag};
     {
@@ -1492,14 +1315,6 @@ fn shell_in_front(app: &App, session: u64) {
 }
 
 /// THE REGISTRY RUNG ACROSS CTRL-Z AND `fg` (§3.8, §3.13): a Claude Code of
-/// unknown build is bare until its own registry row lands, then decorated;
-/// stopped with Ctrl-Z (its facts left standing for its group) and resumed,
-/// its image published again on `fg`'s group edge, it repaints its card —
-/// decorated again, held to the same row, unarmed. So too when another
-/// drawer with no facts of its own (an agy run while Claude Code was
-/// stopped) took the front in between. Mutation-checked: re-recording the
-/// stale owner at every publication of a drawer image refuses the image's
-/// own row after `fg` (`build`), for good.
 #[test]
 fn the_registry_rung_survives_ctrl_z_and_fg() {
     const BREW: &str = "/opt/homebrew/bin/claude";
@@ -1526,7 +1341,6 @@ fn the_registry_rung_survives_ctrl_z_and_fg() {
         set_now(Some(t0 + Duration::from_millis(50)));
         frame(&mut app, wid);
         assert!(decorated(&app, wid).is_some(), "its own row: decorated");
-        // Ctrl-Z.
         bytes(&app, session, "\r\n");
         shell_in_front(&app, session);
         bytes(&app, session, "zsh: suspended  claude\r\n");
@@ -1534,7 +1348,6 @@ fn the_registry_rung_survives_ctrl_z_and_fg() {
         frame(&mut app, wid);
         assert_eq!(decorated(&app, wid), None, "bare while stopped");
         if between {
-            // agy in the shell, its facts never pushed, and gone again.
             bytes(&app, session, "$ agy\r\n");
             take_front(
                 &app,
@@ -1546,7 +1359,6 @@ fn the_registry_rung_survives_ctrl_z_and_fg() {
             bytes(&app, session, "bye\r\n");
             shell_in_front(&app, session);
         }
-        // `fg`: the same image again, and Claude Code repaints its card.
         bytes(&app, session, "$ fg\r\n");
         take_front(
             &app,
@@ -1587,24 +1399,9 @@ fn the_registry_rung_survives_ctrl_z_and_fg() {
 }
 
 /// THE REGISTRY RUNG HOLDS AN IMAGE TO ITS OWN ROW ALONE (§3.8): an image of
-/// unknown build is never held to a row of another group's that the facts
-/// slot still keeps, nor to the row that stood for its own group when it
-/// was published (the image its `exec` replaced wrote that one); only its
-/// own row, from a new owner, decides its build. A row that came for the
-/// group before any image of it was published (the byte arm reads the
-/// group at its first byte, which a fullscreen Claude Code can write after
-/// its row) is the image's that arrives with the group — and stays that
-/// image's: the image an `exec` puts in its place, stopped and resumed,
-/// is not held to it. Mutation-checked: without the group check the other
-/// group's row is taken; without the stale owner the replaced image's row
-/// is; a row from before any image counted stale at a group edge keeps the
-/// arriving image bare; a row judged an image's own and not made its own
-/// is taken by its successor after `fg`.
 #[test]
 fn the_registry_rung_holds_an_image_to_its_own_row_alone() {
     let (mut app, wid, session, host) = bare_window();
-    // Another group's row, still in the facts slot when this one takes
-    // the front.
     take_front(
         &app,
         session,
@@ -1625,8 +1422,6 @@ fn the_registry_rung_holds_an_image_to_its_own_row_alone() {
         Some((first, GateBuild::None)),
         "another group's row is not this image's"
     );
-    // Its own row; then it execs a development build in place: the row
-    // that stood is the replaced image's.
     registry_row(&app, session, PGID, "sess-a", "2.1.282");
     assert_eq!(
         gate_of(&app, session).map(|g| g.build),
@@ -1649,7 +1444,6 @@ fn the_registry_rung_holds_an_image_to_its_own_row_alone() {
         "the replaced image's row is not the new image's"
     );
     assert_eq!(decorated(&app, wid), None, "bare until its own row");
-    // The new image's own row.
     registry_row(&app, session, PGID, "sess-b", VERSION);
     frame(&mut app, wid);
     assert_eq!(
@@ -1658,7 +1452,6 @@ fn the_registry_rung_holds_an_image_to_its_own_row_alone() {
     );
     assert!(decorated(&app, wid).is_some(), "its own row: decorated");
     host.shutdown_and_join();
-    // A row before any image of the group: the arriving image's own.
     let (mut app, wid, session, host) = bare_window();
     {
         let entry = app.pool.get(session).expect("session");
@@ -1681,7 +1474,6 @@ fn the_registry_rung_holds_an_image_to_its_own_row_alone() {
         "the row the group arrived with"
     );
     assert!(decorated(&app, wid).is_some(), "decorated");
-    // Its `exec` in place: that row is the replaced image's, after `fg` too.
     let next = take_front(
         &app,
         session,

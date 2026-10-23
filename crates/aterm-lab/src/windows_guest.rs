@@ -1,97 +1,53 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! What the Windows lane's VM holds and how a command runs in it, as data: the
-//! answer file that installs Windows 11 unattended, the script its first logon
-//! runs, the provisioning plan (Git for Windows, PowerShell 7, Visual Studio
-//! Build Tools, the Rust toolchain, WSL, the runner's desktop and its WSL
-//! distro) and the command lines and scripts a
-//! command runs under, over SSH or in the runner's desktop session. Each is a
-//! text this module renders and [`crate::windows`] hands to the guest (on the
-//! answer media, or over SSH), so all of it is tested here without a VM.
-//!
-//! Two places a command runs. Over SSH (the default) it is a child of sshd,
-//! in session 0, with no interactive window station, and with sshd's
-//! Redirection Guard: OpenSSH for Windows (9.5p2 here) enforces the process
-//! mitigation `ProcessRedirectionTrustPolicy`, which every process of the
-//! session inherits, and a process under it does not follow a junction a
-//! non-administrator made (measured in the guest, 2026-10-20). In the
-//! runner's desktop ([`desktop_runner`]) it is a child of Task Scheduler in the
-//! runner's interactive session, on `WinSta0`, under no such mitigation: as a
-//! person's console runs it.
-//!
-//! The guest is Windows 11 on arm64. x86_64 binaries are cross-built with
-//! MSVC's x64 tools and run under Prism, Windows' own x64 emulation.
+//! Unattended Windows 11 guest provisioning and SSH/[`desktop_runner`] command wrappers for
+//! [`crate::windows`].
 
 use std::fmt::Write as _;
 
+/// STOCK EXCEPTION: no Windows build of the Trust toolchain is published.
 /// STOCK EXCEPTION: no Windows build of the Trust toolchain is published (the
-/// atpkg `trust` releases carry the aarch64-apple-darwin asset alone), and
-/// Trust ships only its host's std, so the guest compiles with rustup's stock
-/// toolchain plus the x86_64 std: m6's, the Windows build lane's sanctioned
-/// exception (stock 1.97.1 msvc), so a result here is one m6 would see.
 pub const RUST: &str = "1.97.1";
 
-/// rustup-init for aarch64 Windows: its version and the digest
-/// static.rust-lang.org publishes beside it (`rustup-init.exe.sha256`).
-/// 1.29.1 (2026-09-01): the newest release when it was pinned (2026-10-20).
+/// Rustup-init for aarch64 Windows.
 pub const RUSTUP: (&str, &str) = (
     "1.29.1",
     "01aa49cf9574a8bd0ae52005d7de2590e8f27181ded6748236e702c92aef826d",
 );
 
-/// Git for Windows' native arm64 installer: its release tag, file and the
-/// digest GitHub publishes for the asset. v2.56.0.windows.2 (2026-10-05):
-/// the newest release when it was pinned (2026-10-20).
+/// Git for Windows' native arm64 installer.
 pub const GIT: (&str, &str, &str) = (
     "v2.56.0.windows.2",
     "Git-2.56.0.2-arm64.exe",
     "b9ced78ce371577dc966f50ae571909d6731e36d31065d35c8efa21544c58bf0",
 );
 
-/// PowerShell 7's arm64 installer: its version, file and the digest GitHub
-/// publishes for the asset. aterm-shell-integration's PowerShell tests run on
-/// `pwsh.exe` 7 and say they could not run on Windows PowerShell 5.1 alone.
-/// v7.6.7 (2026-10-13): the newest release when it was pinned (2026-10-20).
+/// PowerShell 7's arm64 installer.
 pub const PWSH: (&str, &str, &str) = (
     "7.6.7",
     "PowerShell-7.6.7-win-arm64.msi",
     "ddb2f3613a0ad27817b90601a0827f7347e81dfa5bce18d4be8009b8cb0e0a31",
 );
 
-/// WSL's arm64 package: its version, file and the digest GitHub publishes
-/// for the asset. 3.0.3 (2026-10-09): the newest release when it was pinned
-/// (2026-10-20). aterm-shell-integration's WSL launcher test runs through
-/// `wsl.exe` and could not run without a distro.
+/// WSL's arm64 package: its version, file and the digest GitHub publishes for the asset.
 pub const WSL: (&str, &str, &str) = (
     "3.0.3",
     "wsl.3.0.3.0.arm64.msi",
     "2937c7ce840bb35ec6e97f052189bdfff27f8c3463bfdd231df9a958212787a3",
 );
 
-/// The runner's WSL distro: its name, and Ubuntu 24.04.5's arm64 WSL image
-/// with the digest the release's `SHA256SUMS` gives (published 2026-09-08),
-/// imported as WSL 1, which needs no hypervisor in the guest.
+/// The runner's WSL distro.
 pub const WSL_DISTRO: (&str, &str, &str) = (
     "aterm-lane",
     "ubuntu-24.04.5-wsl-arm64.wsl",
     "74478b5024d9047397ba79d17c27f73caf85ada4988f88cffc2892d65e6a806b",
 );
 
-/// Where the runner's WSL distro lives, under the runner's own
-/// `%LOCALAPPDATA%`: outside [`LANE`], every file of which provisioning
-/// grants the runner again (`icacls /T`), because Microsoft's guidance is that
-/// Windows tools leave a WSL 1 distro's Linux files alone.
+/// Where the runner's WSL distro lives, under the runner's own `%LOCALAPPDATA%`.
 pub const WSL_DIR: &str = r"aterm-lane\wsl";
 
-/// virtio-win's display-only driver for the VM's virtio-gpu (QEMU's
-/// `virtio-gpu-pci`, PCI `VEN_1AF4&DEV_1050`): its directory on the virtio-win
-/// ISO ([`crate::windows::VIRTIO`]; `w11/ARM64` is a hard link to
-/// `2k25/ARM64`'s copy, DriverVer 07/22/2026 100.103.104.30200) and each file
-/// the guest installs with the SHA-256 it was read with (2026-10-21). With it
-/// Windows has a 1920x1200 monitor that offers display scaling (100-200 %):
-/// ramfb's 800x600 offers none, so no DPI change could be made on it. It
-/// draws nothing itself: aterm still renders on WARP and presents to it.
+/// Virtio-win's display-only driver for the VM's virtio-gpu.
 pub const VIOGPUDO_DIR: &str = "viogpudo/w11/ARM64";
 pub const VIOGPUDO_FILES: [(&str, &str); 3] = [
     (
@@ -108,36 +64,25 @@ pub const VIOGPUDO_FILES: [(&str, &str); 3] = [
     ),
 ];
 
-/// The service [`VIOGPUDO_FILES`]' INF installs for the device.
+/// The service [`VIOGPUDO_FILES`]' inf installs for the device.
 pub const VIOGPUDO_SERVICE: &str = "VioGpuDod";
 
 /// Where the host puts [`VIOGPUDO_FILES`] in the guest before provisioning.
 pub const VIOGPUDO_GUEST: &str = r"C:\lane\dl\viogpudo";
 
-/// The Windows capability that makes the inbox Japanese IME usable (without
-/// it Windows says "Japanese IME is not ready yet" and types Latin letters).
-/// Japanese fonts (`Language.Fonts.Jpan`) are not needed: aterm drew the
-/// IME's kanji, and the IME its candidates, before they were installed
-/// (measured 2026-10-21).
+/// The Windows capability that makes the inbox Japanese IME usable.
 pub const JA_CAPABILITY: &str = "Language.Basic~~~ja-JP~0.0.1.0";
 
-/// How long that capability's install may take: a hang detector, never a
-/// budget (it took 454 s from Windows Update on 2026-10-21).
+/// How long that capability's install may take.
 pub const CAPABILITY_WITHIN_SECS: u64 = 3600;
 
-/// The runner's input languages, in order: Win+Space moves from the first to
-/// the second, whose input method is Microsoft's Japanese IME.
+/// The runner's input languages, in order.
 pub const LANGUAGES: [&str; 2] = ["en-US", "ja-JP"];
 
-/// Visual Studio 2022's Build Tools bootstrapper. Microsoft publishes no
-/// digest for it (the link follows the channel), so the guest holds it to a
-/// valid Authenticode signature by Microsoft instead.
+/// Visual Studio 2022's Build Tools bootstrapper.
 pub const VS_BOOTSTRAPPER: &str = "https://aka.ms/vs/17/release/vs_BuildTools.exe";
 
-/// What the Build Tools install: MSVC for arm64 (the guest's own target) and
-/// for x64 (the cross target Prism runs), the Windows 11 SDK, and Clang, which
-/// ring's build script asks for by name to compile its C for aarch64 Windows
-/// ([`LLVM_BIN`]).
+/// What the Build Tools install.
 pub const VS_COMPONENTS: [&str; 5] = [
     "Microsoft.VisualStudio.Workload.VCTools",
     "Microsoft.VisualStudio.Component.VC.Tools.ARM64",
@@ -149,40 +94,29 @@ pub const VS_COMPONENTS: [&str; 5] = [
 /// Where the Build Tools go.
 pub const VS_PATH: &str = r"C:\BuildTools";
 
-/// The Build Tools' arm64-hosted Clang, first on an exec's `PATH` so ring's
-/// `clang` is found.
+/// The Build Tools' arm64-hosted Clang, first on an exec's `PATH` so ring's `clang` is found.
 pub const LLVM_BIN: &str = r"C:\BuildTools\VC\Tools\Llvm\ARM64\bin";
 
-/// The guest's administrator, which installs, provisions and shuts Windows
-/// down (OpenSSH reads its key from `administrators_authorized_keys`).
+/// The guest's administrator, which installs, provisions and shuts down Windows.
 pub const USER: &str = "aterm";
 
-/// The guest's standard user, which every `exec` and `smoke` runs as: a
-/// person's privileges (medium integrity, no `SeDebugPrivilege`), not the
-/// administrator's elevated network logon, which reads any process.
-/// The first logon makes it, with the lane's key in [`RUNNER_KEYS`];
-/// provisioning logs it on at every boot ([`desktop_step`]).
+/// The guest's standard user, which every `exec` and `smoke` runs as.
 pub const RUNNER: &str = "lane";
 
 /// The runner's authorized keys, which `sshd_config` names for it.
 pub const RUNNER_KEYS: &str = r"C:\ProgramData\ssh\lane_authorized_keys";
 
-/// Windows Terminal's package name: the runner gets it registered as a
-/// person's account has it.
+/// Windows Terminal's package name.
 pub const TERMINAL_PACKAGE: &str = "Microsoft.WindowsTerminal";
 
-/// Rust's homes (`RUSTUP_HOME`, `CARGO_HOME`), in the lane, which the runner
-/// may change: the administrator installs the toolchain, the runner builds.
+/// Rust's homes (`RUSTUP_HOME`, `CARGO_HOME`), in the lane, which the runner may change.
 pub const RUSTUP_HOME: &str = r"C:\lane\rustup";
 pub const CARGO_HOME: &str = r"C:\lane\cargo";
 
-/// The guest's lane directory, which Defender skips: the synced checkout
-/// ([`SRC`]), the build output ([`TARGET`]), downloads and the stamps.
+/// The guest's lane directory, which Defender skips.
 pub const LANE: &str = r"C:\lane";
 
-/// The checkout as the guest holds it: this Mac's working tree, copied in
-/// by [`crate::windows`]'s sync (no mount: QEMU on macOS serves no share
-/// Windows reads without a server this Mac does not run).
+/// The checkout as the guest holds it.
 pub const SRC: &str = r"C:\lane\src";
 
 /// The build output: `CARGO_TARGET_DIR` of every `exec`.
@@ -191,14 +125,13 @@ pub const TARGET: &str = r"C:\lane\target";
 /// Downloads the provisioning plan keeps (installers, rustup-init).
 pub const DOWNLOADS: &str = r"C:\lane\dl";
 
-/// Where a command run in the runner's desktop ([`desktop_runner`]) has its
-/// batch file, its controller and its output while it runs.
+/// Where a command run in the runner's desktop ([`desktop_runner`]) has its batch file.
 pub const TASKS: &str = r"C:\lane\task";
 
 /// Where the guest records the plan it was provisioned with.
 pub const STAMP: &str = r"C:\lane\provisioned";
 
-/// What the first-logon script writes when it finished; its log is beside it.
+/// What the first-logon script writes when it finished.
 pub const FIRST_LOGON_DONE: &str = r"C:\lane\first-logon.done";
 pub const FIRST_LOGON_LOG: &str = r"C:\lane\first-logon.log";
 
@@ -209,15 +142,13 @@ pub const FIRST_LOGON_FILE: &str = "aterm-lane.ps1";
 /// The edition the answer file installs from the multi-edition ISO.
 pub const EDITION: &str = "Windows 11 Pro";
 
-/// Microsoft's generic installation key for Windows 11 Pro: it selects the
-/// edition and installs, and never activates. The lane runs unactivated, as
-/// the owner allowed (2026-10-20, "YOU INSTALL EVERYTHING").
+/// Microsoft's generic installation key for Windows 11 Pro.
 pub const GENERIC_PRO_KEY: &str = "VK7JG-NPHTM-C97JM-9MPGT-3V66T";
 
 /// The guest's name on its network.
 pub const COMPUTER_NAME: &str = "ATERM-LANE";
 
-/// A CPU architecture the lane builds for.
+/// A CPU architecture the lane builds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Arch {
     /// The guest's own: built and run natively.
@@ -281,11 +212,7 @@ pub fn xml_escape(text: &str) -> String {
     out
 }
 
-/// The registry values Windows Setup reads (`HKLM\SYSTEM\Setup\LabConfig`) to
-/// skip the hardware checks a VM fails though it runs Windows 11: Secure Boot
-/// (the firmware enrolls no keys), the CPU list (Apple's cores are on none)
-/// and, for a firmware whose TPM Setup cannot read, the TPM (the VM has
-/// swtpm's TPM 2.0).
+/// Registry values Windows Setup reads (`HKLM\SYSTEM\Setup\LabConfig`) to skip hardware checks.
 pub const LAB_CONFIG: [&str; 4] = [
     "BypassTPMCheck",
     "BypassSecureBootCheck",
@@ -293,8 +220,7 @@ pub const LAB_CONFIG: [&str; 4] = [
     "BypassRAMCheck",
 ];
 
-/// The FirstLogonCommand: find the answer media by its script (its drive
-/// letter is whatever Windows gave it) and run the script.
+/// The FirstLogonCommand.
 #[must_use]
 pub fn first_logon_command() -> String {
     format!(
@@ -311,12 +237,7 @@ fn component(name: &str, body: &str) -> String {
     )
 }
 
-/// `autounattend.xml`: Windows 11 Pro installed on the whole first disk
-/// (EFI, MSR, NTFS), the licence terms accepted (the owner's consent,
-/// 2026-10-20), no online account, device encryption off (a disk snapshot
-/// must boot without a recovery key), one local administrator, [`USER`],
-/// with `password`, logged on once automatically, and that logon running the
-/// first-logon script ([`first_logon_script`]).
+/// `autounattend.xml`: Windows 11 Pro installed on the whole first disk (efi, msr, NTFS).
 #[must_use]
 pub fn autounattend(password: &str) -> String {
     let pw = xml_escape(password);
@@ -434,13 +355,7 @@ pub fn autounattend(password: &str) -> String {
     )
 }
 
-/// The script the first logon runs from the answer media (as [`USER`],
-/// elevated): the machine never sleeps; Defender skips [`LANE`]; long paths
-/// on; Windows Update installs nothing by itself (a reboot would end a run);
-/// the virtio-net driver (NetKVM, on the media) installed; then, once a
-/// network adapter is up, OpenSSH Server (Windows' own capability) with this
-/// lane's key as the only way in, port 22 allowed; [`FIRST_LOGON_DONE`] last.
-/// Its transcript is [`FIRST_LOGON_LOG`].
+/// The script the first logon runs from the answer media (as [`USER`], elevated).
 pub const FIRST_LOGON_SCRIPT: &str = r#"$ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 $media = Split-Path -Parent $PSCommandPath
@@ -519,10 +434,7 @@ pub fn ps_quote(text: &str) -> String {
     format!("'{}'", text.replace('\'', "''"))
 }
 
-/// One provisioning step: a PowerShell script run in the guest, as the
-/// administrator, or as the runner when `runner` is set; with `reboot`,
-/// Windows restarts after it and provisioning goes on once the runner's
-/// desktop session is up again.
+/// One provisioning step: a PowerShell script run in the guest, as the administrator.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Step {
     pub label: &'static str,
@@ -532,7 +444,6 @@ pub struct Step {
 }
 
 /// Every step's preamble: stop on a cmdlet's error, no progress records
-/// (PowerShell 5.1 writes them to a redirected stdout as CLIXML).
 const PREAMBLE: &str =
     "$ErrorActionPreference = 'Stop'\n$ProgressPreference = 'SilentlyContinue'\n";
 
@@ -558,8 +469,7 @@ fn digest(sha256: &str) -> String {
     )
 }
 
-/// The provisioning plan, in order. Every step is idempotent (it checks what
-/// it would install first), so an interrupted plan is simply run again.
+/// The provisioning plan, in order.
 #[must_use]
 pub fn provision_steps() -> Vec<Step> {
     let (git_tag, git_file, git_sha) = GIT;
@@ -683,10 +593,6 @@ pub fn provision_steps() -> Vec<Step> {
         cargo_home = ps_quote(CARGO_HOME),
         lane = ps_quote(LANE),
     );
-    // Windows Terminal is an inbox app every person's account has, registered
-    // at an interactive first logon, which the runner never has: aterm-pty's
-    // `auto` console host takes OpenConsole.exe from the package installed for
-    // the user that asks (`GetPackagesByPackageFamily`).
     let terminal = format!(
         "{PREAMBLE}if (-not (Get-AppxPackage -Name {name})) {{ \
          Add-AppxPackage -RegisterByFamilyName -MainPackage {family} }}\n\
@@ -745,10 +651,7 @@ pub fn provision_steps() -> Vec<Step> {
     ]
 }
 
-/// The Japanese IME made usable ([`JA_CAPABILITY`]). `Add-WindowsCapability`
-/// is refused over SSH even to the administrator ("Access is denied",
-/// 0x80070005, measured 2026-10-21), so it runs as a Task Scheduler task of
-/// SYSTEM's, waited for within [`CAPABILITY_WITHIN_SECS`] (a hang detector).
+/// The Japanese IME made usable ([`JA_CAPABILITY`]).
 #[must_use]
 pub fn japanese_step() -> Step {
     let log = format!("{TASKS}\\capability.log");
@@ -795,8 +698,7 @@ pub fn japanese_step() -> Step {
     }
 }
 
-/// The runner's input languages ([`LANGUAGES`]), set by the runner (they are
-/// its own), as a person adds Japanese in Settings.
+/// The runner's input languages ([`LANGUAGES`]), set by the runner (they are its own).
 #[must_use]
 pub fn languages_step() -> Step {
     let [first, rest @ ..] = LANGUAGES;
@@ -818,9 +720,7 @@ pub fn languages_step() -> Step {
     }
 }
 
-/// virtio-win's display driver ([`VIOGPUDO_FILES`], which the host copied to
-/// [`VIOGPUDO_GUEST`]) installed on the VM's virtio-gpu, each file held to
-/// its digest first; [`desktop_step`]'s restart follows.
+/// Virtio-win's display driver ([`VIOGPUDO_FILES`], which the host copied to [`VIOGPUDO_GUEST`]).
 #[must_use]
 pub fn display_step() -> Step {
     let files: Vec<String> = VIOGPUDO_FILES
@@ -852,11 +752,7 @@ pub fn display_step() -> Step {
     }
 }
 
-/// The runner's WSL distro ([`WSL_DISTRO`]), imported by the runner (a
-/// distro is its user's) as WSL 1 into [`WSL_DIR`] and made its default; a
-/// distro of that name somewhere else is unregistered and imported again.
-/// It comes after [`desktop_step`]'s restart, which WSL 1's Windows feature
-/// waits for.
+/// The runner's WSL distro ([`WSL_DISTRO`]).
 #[must_use]
 pub fn wsl_distro_step() -> Step {
     let (name, file, sha) = WSL_DISTRO;
@@ -895,11 +791,7 @@ pub fn wsl_distro_step() -> Step {
     }
 }
 
-/// The runner logged on at every boot, so a command can run in its
-/// interactive session ([`desktop_runner`]): Windows' automatic logon with a
-/// password made in the guest (it never leaves it; SSH takes the key alone),
-/// no first-logon animation; then a restart, so the snapshot holds the
-/// runner's first desktop logon done.
+/// The runner logged on at every boot, so a command can run in its interactive session.
 #[must_use]
 pub fn desktop_step() -> Step {
     let script = format!(
@@ -928,14 +820,11 @@ pub fn desktop_step() -> Step {
 }
 
 /// A PowerShell condition that holds when the runner has an active console
-/// session (`query user`, read through cmd.exe so its "No User exists" on
-/// stderr is no PowerShell error).
 fn desktop_condition() -> String {
     format!("((cmd /d /c 'query user 2>nul') -match '^\\s*>?{RUNNER}\\s.*\\sActive\\s')")
 }
 
-/// A PowerShell script that prints [`DESKTOP_UP`] when the runner's desktop
-/// session is up.
+/// A PowerShell script that prints [`DESKTOP_UP`] when the runner's desktop session is up.
 #[must_use]
 pub fn desktop_check() -> String {
     format!("if {} {{ '{DESKTOP_UP}' }}\n", desktop_condition())
@@ -944,8 +833,7 @@ pub fn desktop_check() -> String {
 /// What [`desktop_check`] prints when the runner's desktop session is up.
 pub const DESKTOP_UP: &str = "lane-desktop-up";
 
-/// The plan's fingerprint (FNV-1a over every step), which [`STAMP`] holds once
-/// it ran: a changed plan provisions again.
+/// The plan's fingerprint (fnv-1a over every step), which [`STAMP`] holds once it ran.
 #[must_use]
 pub fn fingerprint(steps: &[Step]) -> String {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
@@ -962,16 +850,14 @@ pub fn fingerprint(steps: &[Step]) -> String {
     format!("{h:016x}")
 }
 
-/// `script` as PowerShell's `-EncodedCommand` takes it: Base64 of its UTF-16LE.
+/// `script` as PowerShell's `-EncodedCommand` takes it.
 #[must_use]
 pub fn encoded(script: &str) -> String {
     let utf16: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
     aterm_codec::base64::encode(&utf16).unwrap_or_default()
 }
 
-/// The command line that runs `script` in Windows PowerShell 5.1 (what sshd's
-/// `cmd.exe /c` is handed): the script as `-EncodedCommand`, Base64 of its
-/// UTF-16LE, so nothing in it is ever quoted for cmd.exe.
+/// The command line that runs `script` in Windows PowerShell 5.1.
 #[must_use]
 pub fn powershell_command(script: &str) -> String {
     format!(
@@ -980,9 +866,7 @@ pub fn powershell_command(script: &str) -> String {
     )
 }
 
-/// The environment `cargo` gets for `arch`: the pinned stock toolchain, no
-/// incremental cache, the lane's target dir, and for x86_64
-/// `CARGO_BUILD_TARGET` (a cross triple on this arm64 guest).
+/// The environment `cargo` gets for `arch`.
 #[must_use]
 pub fn cargo_env(arch: Arch) -> Vec<(String, String)> {
     let mut env: Vec<(String, String)> = vec![
@@ -999,12 +883,7 @@ pub fn cargo_env(arch: Arch) -> Vec<(String, String)> {
     env
 }
 
-/// The cmd.exe line (sshd runs a command through `cmd.exe /c`) that runs
-/// `argv` in `dir` with `env` added and rustup's, Git's and Clang's ([`LLVM_BIN`]) directories first
-/// on `PATH`, its stderr merged into its stdout there (so cargo's lines and
-/// libtest's keep their order), ending with the command's exit status. A `%`
-/// in `argv` is still expanded by cmd.exe (by its batch-file rules in the
-/// runner's desktop, [`desktop_batch`]).
+/// The cmd.exe line (sshd runs a command through `cmd.exe /c`) that runs `argv` in `dir`.
 #[must_use]
 pub fn exec_command(dir: &str, env: &[(String, String)], argv: &[String]) -> String {
     let mut parts: Vec<String> = env
@@ -1020,14 +899,7 @@ pub fn exec_command(dir: &str, env: &[(String, String)], argv: &[String]) -> Str
     parts.join(" && ")
 }
 
-/// `arg` quoted for a Windows command line that cmd.exe reads first: bare
-/// when it holds no space, tab, quote or cmd.exe metacharacter, else in
-/// double quotes with the CommandLineToArgvW rules for backslashes before a
-/// quote. cmd.exe toggles its own quoting at every `"`, escaped for
-/// CommandLineToArgvW or not, so in a word that holds a `"` every quote and
-/// metacharacter is escaped for cmd with `^`: cmd then never quotes, acts on
-/// nothing in the word and leaves no quote open after it, and removes each
-/// `^` before the program reads its command line.
+/// `arg` quoted for a Windows command line that cmd.exe reads first.
 #[must_use]
 pub fn cmd_quote(arg: &str) -> String {
     let plain = !arg.is_empty()
@@ -1062,7 +934,6 @@ pub fn cmd_quote(arg: &str) -> String {
     if !arg.contains('"') {
         return out;
     }
-    // `a"&b` is `^"a\^"^&b^"`, which cmd hands on as `"a\"&b"`.
     let mut escaped = String::with_capacity(out.len() + 8);
     for c in out.chars() {
         if matches!(c, '"' | '&' | '|' | '<' | '>' | '^' | '(' | ')') {
@@ -1073,10 +944,7 @@ pub fn cmd_quote(arg: &str) -> String {
     escaped
 }
 
-/// The batch file a command runs from in the runner's desktop: `line`
-/// ([`exec_command`]) after UTF-8 output (`chcp 65001`), its exit status
-/// written to `TASKS\<name>.code` (a windowless run's task reports its
-/// console host's, not the command's) and returned, CRLF-ended.
+/// The batch file a command runs from in the runner's desktop.
 #[must_use]
 pub fn desktop_batch(line: &str, name: &str) -> String {
     format!(
@@ -1085,40 +953,22 @@ pub fn desktop_batch(line: &str, name: &str) -> String {
     )
 }
 
-/// How long the runner's desktop session may take to come up, and a task
-/// to start: hang detectors, never budgets (the session was up 0.7-13.6 s
-/// after SSH in three boots, 2026-10-20).
+/// How long the runner's desktop session may take to come up, and a task to start.
 pub const DESKTOP_WITHIN_SECS: u64 = 300;
 pub const TASK_START_WITHIN_SECS: u64 = 60;
 
 /// How a command runs in the runner's desktop ([`desktop_runner`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Desktop {
-    /// In a console window of its own (cmd.exe's), waited for: `exec
-    /// --desktop`, as a person's console runs it.
+    /// In a console window of its own (cmd.exe's), waited for.
     Console,
-    /// With no window (`conhost.exe --headless`), waited for: a probe of
-    /// the desktop that must not take the keyboard focus from the window it
-    /// looks at.
+    /// With no window (`conhost.exe --headless`), waited for.
     Hidden,
-    /// With no window, started and left running: a program the caller
-    /// drives, then ends with [`desktop_stop`].
+    /// With no window, started and left running.
     Started,
 }
 
-/// The PowerShell (run as the administrator, which may register a task for
-/// another user) that runs the batch file `TASKS\<name>.cmd`
-/// ([`desktop_batch`]) in the runner's desktop session: once that session is
-/// up ([`desktop_check`]), as a Task Scheduler task of the runner's with an
-/// interactive logon, so the command runs in that session, on `WinSta0`,
-/// outside sshd's processes and their Redirection Guard.
-///
-/// [`Desktop::Console`] and [`Desktop::Hidden`] write the task's output
-/// (`TASKS\<name>.log`, stderr merged) here as it grows, exit with the
-/// command's exit status (its `.code` file, else the task's result; 125 when
-/// the session or the task never came) and take the task and its files away.
-/// [`Desktop::Started`] exits 0 once the task runs (or ran), and leaves it.
-/// A command interrupted on this Mac goes on to its end in the guest.
+/// The PowerShell script (run as administrator) that runs a command in the runner's desktop.
 #[must_use]
 pub fn desktop_runner(name: &str, how: Desktop) -> String {
     let bat = format!("{TASKS}\\{name}.cmd");
@@ -1206,11 +1056,7 @@ pub fn desktop_runner(name: &str, how: Desktop) -> String {
     s
 }
 
-/// The PowerShell that ends a [`Desktop::Started`] task: stopped,
-/// unregistered, its files gone. Stopping ends the task's own processes, not
-/// a program one of them started on its own (`Start-Process`): two
-/// `aterm-gui` outlived their tasks so (2026-10-21), and the caller ends
-/// such a program by its pid.
+/// The PowerShell that ends a [`Desktop::Started`] task.
 #[must_use]
 pub fn desktop_stop(name: &str) -> String {
     format!(
@@ -1226,17 +1072,7 @@ pub fn desktop_stop(name: &str) -> String {
     )
 }
 
-/// The PowerShell, run as the administrator, that ends what an earlier lane
-/// run left running in the guest, then prints `ended <n>`: every process of
-/// the runner's in session 0, where only its SSH commands run (its desktop's
-/// are in its own session), with the processes each started. Windows' sshd
-/// ends none of a session's processes when its connection drops, so a command
-/// interrupted on this Mac that writes nothing more (a hung test, a sleep)
-/// runs on in a VM that `up` holds, with the build directory the next run's
-/// cargo needs (a desktop command runs on to its end by design:
-/// [`desktop_runner`]). Run only under the lane's lock, when no run's are there.
-/// Selection precedes `taskkill` by numeric PID, not a stable process handle;
-/// it does not close the process-exit/PID-reuse race.
+/// The PowerShell script (run as administrator) that shuts the guest down.
 #[must_use]
 pub fn end_leftovers() -> String {
     format!(
@@ -1278,7 +1114,6 @@ mod tests {
             xml.matches("<component ").count(),
             xml.matches("</component>").count()
         );
-        // The password is escaped in both places it appears, never raw.
         assert_eq!(xml.matches("p&lt;w&gt;&amp;&apos;&quot;").count(), 2);
         assert!(!xml.contains("p<w>"));
         assert!(xml.contains("<AcceptEula>true</AcceptEula>"));
@@ -1290,7 +1125,6 @@ mod tests {
                 "{key}"
             );
         }
-        // Every component is arm64's.
         assert_eq!(
             xml.matches("processorArchitecture=\"arm64\"").count(),
             xml.matches("<component ").count()
@@ -1302,15 +1136,12 @@ mod tests {
         let c = first_logon_command();
         assert!(c.contains("%d:\\aterm-lane.ps1"));
         assert!(c.contains("in (D E F"));
-        // The XML carries it escaped (nothing in it needs more than `&`-free text).
         assert!(autounattend("x").contains(&xml_escape(&c)));
         let script = first_logon_script();
         assert!(!script.contains("\r\r"));
         assert!(script.contains("OpenSSH.Server~~~~0.0.1.0"));
         assert!(script.contains("administrators_authorized_keys"));
         assert!(script.contains(FIRST_LOGON_DONE.rsplit('\\').next().unwrap_or("")));
-        // The runner the script makes is the one `exec` logs on as, with the
-        // key file sshd_config names for it.
         assert!(script.contains(&format!("$runner = '{RUNNER}'")));
         let keys = RUNNER_KEYS.rsplit('\\').next().unwrap_or("");
         assert!(script.contains(&format!("Join-Path $ssh '{keys}'")));
@@ -1333,18 +1164,12 @@ mod tests {
         assert_eq!(cmd_quote("C:\\dir\\"), "C:\\dir\\");
         assert_eq!(cmd_quote("C:\\a dir\\"), "\"C:\\a dir\\\\\"");
         assert_eq!(cmd_quote("a&b"), "\"a&b\"");
-        // cmd.exe's quoting toggles at every quote, so a word with a quote is
-        // escaped for cmd (`^`) throughout: `&` starts no second command.
         assert_eq!(cmd_quote("a\"&b"), "^\"a\\^\"^&b^\"");
         assert_eq!(cmd_quote("x \"y\" (z)|w"), "^\"x \\^\"y\\^\" ^(z^)^|w^\"");
         assert_eq!(cmd_quote("a\"|\"b"), "^\"a\\^\"^|\\^\"b^\"");
     }
 
     /// cmd.exe's reading of a quoted word: quote state toggled at every `"`,
-    /// `^` outside quotes escaping the next character; what is left is the
-    /// command line the program gets. A metacharacter cmd would act on, or a
-    /// quote left open after the word (which swallows what follows it, such
-    /// as `2>&1`), is reported instead.
     fn as_cmd_hands_on(word: &str) -> Result<String, char> {
         let mut out = String::new();
         let mut quoted = false;
@@ -1367,7 +1192,6 @@ mod tests {
     }
 
     /// CommandLineToArgvW's reading of one word (backslashes before a quote
-    /// halved, a quote after an odd run kept, quotes otherwise toggling).
     fn as_argv_reads(word: &str) -> String {
         let mut out = String::new();
         let mut backslashes = 0usize;
@@ -1409,9 +1233,6 @@ mod tests {
                 .unwrap_or_else(|c| panic!("{word:?}: cmd acts on {c:?} in {q}"));
             assert_eq!(as_argv_reads(&handed), word, "{q}");
         }
-        // NEGATIVE CONTROLS: the word quoted for CommandLineToArgvW alone
-        // (no `^`) leaves cmd an `&` to act on; escaping only what falls
-        // outside cmd's quotes leaves a quote open after the word.
         assert_eq!(as_cmd_hands_on("\"a\\\"&b\""), Err('&'));
         assert_eq!(as_cmd_hands_on("\"a\\\"^&b\""), Err('"'));
     }
@@ -1434,7 +1255,6 @@ mod tests {
         for c in VS_COMPONENTS {
             assert!(all.contains(c), "{c}");
         }
-        // The runner's Windows Terminal is registered by the runner itself.
         let terminal = steps
             .iter()
             .filter(|s| s.runner)
@@ -1457,9 +1277,6 @@ mod tests {
         restarted[0].reboot = !restarted[0].reboot;
         assert_ne!(fingerprint(&steps), fingerprint(&restarted));
         assert_eq!(fingerprint(&steps), fingerprint(&provision_steps()));
-        // The runner is logged on at boot by the one step that restarts
-        // Windows, so the snapshot holds that logon done; only the runner's
-        // WSL distro, which waits for that restart, comes after it.
         let at = steps
             .iter()
             .position(|s| s == &desktop_step())
@@ -1475,8 +1292,6 @@ mod tests {
                 .contains(&format!("DefaultUserName -Value '{RUNNER}'"))
         );
         assert!(all.contains(&ps_quote(TASKS)));
-        // WSL's package and Windows feature are the administrator's; the
-        // distro, pinned, is the runner's own, as WSL 1.
         assert!(all.contains(WSL.2) && all.contains(WSL_DISTRO.2));
         let feature = steps
             .iter()
@@ -1505,8 +1320,6 @@ mod tests {
         );
         let bat = desktop_batch(&line, "aterm-lane-1-2");
         assert!(bat.starts_with("@echo off\r\nchcp 65001 >nul\r\n"));
-        // The command's status is written down and returned: a windowless
-        // task's own result is its console host's.
         assert!(bat.contains(&format!("{line}\r\nset LANE_CODE=%ERRORLEVEL%\r\n")));
         assert!(bat.contains(&format!(
             ">\"{TASKS}\\aterm-lane-1-2.code\" echo %LANE_CODE%\r\n"
@@ -1516,17 +1329,13 @@ mod tests {
             let ps = desktop_runner("aterm-lane-1-2", how);
             assert!(ps.contains(&format!("$bat = '{TASKS}\\aterm-lane-1-2.cmd'")));
             assert!(ps.contains(&format!("$log = '{TASKS}\\aterm-lane-1-2.log'")));
-            // The runner's interactive logon, never the administrator's or a
-            // stored password's: the task runs in the runner's session.
             assert!(ps.contains(&format!(
                 "New-ScheduledTaskPrincipal -UserId '{RUNNER}' -LogonType Interactive -RunLevel Limited"
             )));
-            // It waits for the session within its hang detector.
             assert!(ps.contains(&format!("if {} {{ break }}", desktop_condition())));
             assert!(ps.contains(&format!("AddSeconds({DESKTOP_WITHIN_SECS})")));
             assert!(ps.contains(&format!("-gt {TASK_START_WITHIN_SECS}")));
             assert!(ps.trim_end().ends_with("exit $code"));
-            // A console of its own, or none.
             assert_eq!(
                 ps.contains("-Argument \"/d /c $bat > $log 2>&1\""),
                 how == Desktop::Console
@@ -1535,8 +1344,6 @@ mod tests {
                 ps.contains("'System32\\conhost.exe') -Argument \"--headless cmd.exe /d /c $bat > $log 2>&1\""),
                 how != Desktop::Console
             );
-            // A waited run always takes its task away; a started one leaves
-            // it for desktop_stop.
             let finally = ps.find("} finally {").unwrap_or(usize::MAX);
             let unregister = ps.find("Unregister-ScheduledTask");
             if how == Desktop::Started {
@@ -1553,14 +1360,11 @@ mod tests {
         let steps = provision_steps();
         let at = |s: &Step| steps.iter().position(|x| x == s).unwrap_or(usize::MAX);
         let desktop = at(&desktop_step());
-        // Each comes before the one restart, so the snapshot holds them done.
         for s in [japanese_step(), languages_step(), display_step()] {
             assert!(at(&s) < desktop, "{}", s.label);
         }
         let ja = japanese_step();
         assert!(!ja.runner && ja.script.contains(&ps_quote(JA_CAPABILITY)));
-        // Refused over SSH, it runs as a task, waited for within its hang
-        // detector.
         assert!(
             ja.script
                 .contains(&format!("AddSeconds({CAPABILITY_WITHIN_SECS})"))

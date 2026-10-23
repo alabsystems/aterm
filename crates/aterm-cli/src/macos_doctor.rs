@@ -15,11 +15,10 @@ pub use initial::{
     InitialSetupAdmission, InitialSetupAuthorization, InitialSetupObservation,
     InitialSetupObserved, InitialSetupRestart, InitialSetupSnapshot, InitialSetupSnapshotError,
     apply_initial_setup, apply_initial_setup_observed, authorize_initial_setup,
-    authorize_initial_setup_observed, automatic_plan, check_initial_setup,
-    check_initial_setup_observed, initial_setup_admission, initial_setup_finished,
-    initial_setup_observation, initial_setup_revision, initial_setup_snapshot,
-    initial_setup_status, restart_initial_setup, restart_initial_setup_observed,
-    validate_initial_setup_plan,
+    authorize_initial_setup_observed, check_initial_setup, check_initial_setup_observed,
+    initial_setup_admission, initial_setup_finished, initial_setup_observation,
+    initial_setup_revision, initial_setup_snapshot, initial_setup_status, restart_initial_setup,
+    restart_initial_setup_observed, validate_initial_setup_plan,
 };
 #[cfg(any(test, debug_assertions))]
 pub use initial::{initial_setup_observation_at, initial_setup_snapshot_at};
@@ -121,6 +120,22 @@ impl Report {
         }
         text.push_str(&format!("  backup: {}\n", self.backup.display()));
         text
+    }
+}
+
+/// Whether this process holds Full Disk Access, measured once per pass and without a
+/// prompt (`aterm_containment::probe_fda`: a child of this process opens the TCC database,
+/// closed unread). The probe is fenced to an `.app`, so a test binary or a bare build reads
+/// `None`, not measured, which counts as no grant: Notification Center's widgets then wait
+/// for it, and no `defaults` read or write of its container is made
+/// ([`aterm_machines::items::defaults::withheld`]). `aterm init` is handed this too.
+#[must_use]
+pub fn full_disk_access() -> Option<bool> {
+    use aterm_containment::{FdaState, ProbeGate};
+    match aterm_containment::probe_fda(ProbeGate::on()).state {
+        FdaState::Granted => Some(true),
+        FdaState::Denied => Some(false),
+        FdaState::Unknown => None,
     }
 }
 
@@ -512,12 +527,21 @@ fn automatic_retry_due(
 /// What a held item's row says once its automatic tries are spent ([`Host::hold`]).
 const HELD: &str = "aterm tried this by itself and it did not take, so it will not try again on its own; Apply in System State, or run aterm doctor --apply, to try again";
 
-/// What it says between its first automatic try and its last ([`SECOND_TRY_AFTER`]).
-const WAITING: &str = "aterm tried this by itself and it did not take; it tries once more on its own ten minutes later; Apply in System State, or run aterm doctor --apply, to try now";
+/// What it says between its first automatic try and its last ([`SECOND_TRY_AFTER`]): the
+/// second is setup's first try once that has passed or, for the follow-up of a setup that has
+/// finished ([`follow_up_at`]), aterm's first launch after it.
+const WAITING: &str = "aterm tried this by itself and it did not take; it tries once more on its own when ten minutes have passed, on setup's next try or at aterm's next launch; Apply in System State, or run aterm doctor --apply, to try now";
 
 /// What a setting says that an automatic pass of this run found as wanted, and that has
 /// changed since: the person's change, which setup leaves alone.
 const SETTLED: &str = "aterm set this once in this setup and it has changed since, so setup leaves it; Apply in System State, or run aterm doctor --apply, to set it again";
+
+/// What a setting says that an automatic pass of this run settled for the keys it reached,
+/// with a key it left for want of Full Disk Access ([`WITHHELD_RECORD`]: Notification
+/// Center's widget list) still owed, once the pass holds the grant and so reads that key too:
+/// aterm never wrote it, and nobody changed it since; it is the follow-up's
+/// ([`follow_up_at`]), whose row in the same report says how that went.
+const SETTLED_OWED: &str = "Notification Center's widget list is left to setup's own step for it, whose row says how that went; aterm set the rest once in this setup and leaves it as it is now; Apply in System State, or run aterm doctor --apply, to set it all now";
 
 /// How many times an automatic pass of one build makes a change that does not verify.
 const TRIES: u32 = 2;
@@ -541,7 +565,12 @@ const HELD_RECORD: &str = "automatic-held.json";
 /// build, the second [`SECOND_TRY_AFTER`] the first, and held in between and after. A
 /// retry on the worker's timer then makes no change it made before. A new run (System
 /// State's Apply, a restart of the plan) starts afresh; an explicit `doctor --apply`
-/// holds nothing.
+/// holds nothing. Once the pass holds Full Disk Access it reaches the keys an earlier pass
+/// left for want of it, which the follow-up owes ([`WITHHELD_RECORD`]): a settled item that
+/// owes one reads that key too, and is held as it is with [`SETTLED_OWED`], not [`SETTLED`];
+/// an item whose change to that key did not verify, made by an automatic pass or by the
+/// follow-up, is held by that record's tries as well, so one budget of tries covers that key
+/// whichever of them makes the try.
 fn automatic_pass(
     host: &mut dyn Host,
     root: &Path,
@@ -549,16 +578,113 @@ fn automatic_pass(
     now: std::time::SystemTime,
 ) -> Result<Report, String> {
     let revision = initial::revision_at(root)?;
-    let now = now
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |since| since.as_secs());
+    let now = epoch_secs(now);
     let mut record = Automatic::load(root, revision)?;
-    host.hold(&record.holds(build, now));
-    let pass = execute_pass(host, root, Action::Apply)?;
+    // Without the grant the pass reads only the keys a settled item reached, which aterm set
+    // ([`SETTLED`] is true of them), and none of the keys the follow-up's tries are spent on.
+    // An unreadable record is the follow-up's to report.
+    let owed = if host.full_disk_access() == Some(true) {
+        load_withheld(root).unwrap_or_default()
+    } else {
+        Withheld::default()
+    };
+    host.hold(&record.holds(build, now, &owed));
+    let pass = execute_pass(host, root, Action::Apply, build, now)?;
     if record.add(build, now, &pass) {
         record.save(root, revision)?;
     }
     Ok(pass.report)
+}
+
+/// `now` in seconds since the epoch, as the records keep a try's time.
+fn epoch_secs(now: std::time::SystemTime) -> u64 {
+    now.duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs())
+}
+
+/// The tries a record keeps ([`Failed`]) in its `entries`.
+fn load_tries(entries: &Value, bad: &dyn Fn() -> String) -> Result<Vec<Failed>, String> {
+    entries
+        .as_array()
+        .ok_or_else(bad)?
+        .iter()
+        .map(|entry| {
+            Ok(Failed {
+                item: entry["item"].as_str().ok_or_else(bad)?.to_owned(),
+                build: entry["build"].as_str().ok_or_else(bad)?.to_owned(),
+                tries: entry["tries"]
+                    .as_u64()
+                    .and_then(|tries| u32::try_from(tries).ok())
+                    .ok_or_else(bad)?,
+                at: entry["at"].as_u64().ok_or_else(bad)?,
+            })
+        })
+        .collect()
+}
+
+/// `failed`, as a record keeps it.
+fn tries_json(failed: &[Failed]) -> Vec<Value> {
+    failed
+        .iter()
+        .map(|f| json!({ "item": f.item, "build": f.build, "tries": f.tries, "at": f.at }))
+        .collect()
+}
+
+/// What `failed` holds back in a pass of `build` at `now`: an item it tried [`TRIES`] times
+/// ([`HELD`]), and one it tried less than [`SECOND_TRY_AFTER`] ago ([`WAITING`]).
+fn held_back(failed: &[Failed], build: &str, now: u64) -> Vec<(String, Hold)> {
+    failed
+        .iter()
+        .filter(|f| f.build == build)
+        .filter_map(|failed| {
+            let why = if failed.tries >= TRIES {
+                HELD
+            } else if now < failed.at.saturating_add(SECOND_TRY_AFTER.as_secs()) {
+                WAITING
+            } else {
+                return None;
+            };
+            Some((failed.item.clone(), Hold::Back(why.into())))
+        })
+        .collect()
+}
+
+/// Count a try of each of `items` by `build` at `now` in `failed`, and keep the tries of
+/// the [`HELD_BUILDS`] builds that tried last.
+fn count_tries(failed: &mut Vec<Failed>, build: &str, now: u64, items: &[String]) {
+    for item in items {
+        match failed
+            .iter_mut()
+            .find(|f| f.item == *item && f.build == build)
+        {
+            Some(failed) => {
+                failed.tries = failed.tries.saturating_add(1);
+                failed.at = now;
+            }
+            None => failed.push(Failed {
+                item: item.clone(),
+                build: build.to_owned(),
+                tries: 1,
+                at: now,
+            }),
+        }
+    }
+    // The builds that tried last keep their record.
+    let mut builds: Vec<(u64, &str)> = Vec::new();
+    for failed in failed.iter() {
+        match builds.iter_mut().find(|(_, build)| *build == failed.build) {
+            Some((at, _)) => *at = (*at).max(failed.at),
+            None => builds.push((failed.at, failed.build.as_str())),
+        }
+    }
+    if builds.len() > HELD_BUILDS {
+        builds.sort_by_key(|(at, _)| std::cmp::Reverse(*at));
+        let kept: Vec<String> = builds[..HELD_BUILDS]
+            .iter()
+            .map(|(_, build)| (*build).to_owned())
+            .collect();
+        failed.retain(|f| kept.contains(&f.build));
+    }
 }
 
 /// What one setup run's automatic passes did ([`HELD_RECORD`]).
@@ -604,56 +730,51 @@ impl Automatic {
             .iter()
             .map(|item| item.as_str().map(str::to_owned).ok_or_else(bad))
             .collect::<Result<_, _>>()?;
-        let failed = record["failed"]
-            .as_array()
-            .ok_or_else(bad)?
-            .iter()
-            .map(|entry| {
-                Ok(Failed {
-                    item: entry["item"].as_str().ok_or_else(bad)?.to_owned(),
-                    build: entry["build"].as_str().ok_or_else(bad)?.to_owned(),
-                    tries: entry["tries"]
-                        .as_u64()
-                        .and_then(|tries| u32::try_from(tries).ok())
-                        .ok_or_else(bad)?,
-                    at: entry["at"].as_u64().ok_or_else(bad)?,
-                })
-            })
-            .collect::<Result<_, String>>()?;
+        let failed = load_tries(&record["failed"], &bad)?;
         Ok(Self { settled, failed })
     }
 
     fn save(&self, root: &Path, revision: u64) -> Result<(), String> {
-        let failed: Vec<Value> = self
-            .failed
-            .iter()
-            .map(|f| json!({ "item": f.item, "build": f.build, "tries": f.tries, "at": f.at }))
-            .collect();
         write_json(
             &root.join(HELD_RECORD),
             &json!({
                 "profile": PROFILE, "revision": revision,
-                "settled": self.settled, "failed": failed,
+                "settled": self.settled, "failed": tries_json(&self.failed),
             }),
         )
     }
 
-    /// What a pass of `build` at `now` leaves alone, and how.
-    fn holds(&self, build: &str, now: u64) -> Vec<(String, Hold)> {
+    /// What a pass of `build` at `now` leaves alone, and how. `owed` is the follow-up's record
+    /// as a pass that reaches its keys reads it (empty for one that does not). A settled item
+    /// is left as it is, with [`SETTLED_OWED`] when `owed` names it, else [`SETTLED`]. Any
+    /// other item is held back by its tries in this record and, for one `owed` names, by
+    /// that record's too ([`held_back`]): HELD over WAITING, since the engine takes an id's
+    /// first hold.
+    fn holds(&self, build: &str, now: u64, owed: &Withheld) -> Vec<(String, Hold)> {
         let mut holds: Vec<(String, Hold)> = self
             .settled
             .iter()
-            .map(|item| (item.clone(), Hold::AsIs(SETTLED.into())))
+            .map(|item| {
+                let why = if owed.items.contains(item) {
+                    SETTLED_OWED
+                } else {
+                    SETTLED
+                };
+                (item.clone(), Hold::AsIs(why.into()))
+            })
             .collect();
-        for failed in self.failed.iter().filter(|f| f.build == build) {
-            let why = if failed.tries >= TRIES {
-                HELD
-            } else if now < failed.at.saturating_add(SECOND_TRY_AFTER.as_secs()) {
-                WAITING
-            } else {
-                continue;
-            };
-            holds.push((failed.item.clone(), Hold::Back(why.into())));
+        let owed_tries = held_back(&owed.failed, build, now)
+            .into_iter()
+            .filter(|(item, _)| owed.items.contains(item));
+        for (item, hold) in held_back(&self.failed, build, now)
+            .into_iter()
+            .chain(owed_tries)
+        {
+            match holds.iter_mut().find(|(held, _)| *held == item) {
+                None => holds.push((item, hold)),
+                Some((_, held @ Hold::Back(_))) if hold == Hold::Back(HELD.into()) => *held = hold,
+                Some(_) => {}
+            }
         }
         holds
     }
@@ -666,42 +787,9 @@ impl Automatic {
                 self.settled.push(item.clone());
             }
         }
-        for item in &pass.unverified {
-            match self
-                .failed
-                .iter_mut()
-                .find(|f| f.item == *item && f.build == build)
-            {
-                Some(failed) => {
-                    failed.tries = failed.tries.saturating_add(1);
-                    failed.at = now;
-                }
-                None => self.failed.push(Failed {
-                    item: item.clone(),
-                    build: build.to_owned(),
-                    tries: 1,
-                    at: now,
-                }),
-            }
-        }
+        count_tries(&mut self.failed, build, now, &pass.unverified);
         let settled = &self.settled;
         self.failed.retain(|f| !settled.contains(&f.item));
-        // The builds that tried last keep their record.
-        let mut builds: Vec<(u64, &str)> = Vec::new();
-        for failed in &self.failed {
-            match builds.iter_mut().find(|(_, build)| *build == failed.build) {
-                Some((at, _)) => *at = (*at).max(failed.at),
-                None => builds.push((failed.at, failed.build.as_str())),
-            }
-        }
-        if builds.len() > HELD_BUILDS {
-            builds.sort_by_key(|(at, _)| std::cmp::Reverse(*at));
-            let kept: Vec<String> = builds[..HELD_BUILDS]
-                .iter()
-                .map(|(_, build)| (*build).to_owned())
-                .collect();
-            self.failed.retain(|f| kept.contains(&f.build));
-        }
         (self.settled.len(), &self.failed) != (before.0, &before.1)
     }
 }
@@ -939,19 +1027,35 @@ trait Host {
     fn selection(&self) -> Selection {
         Selection::all().workstation()
     }
+    /// What the pass measured of this process's Full Disk Access, once
+    /// ([`aterm_machines::port::System::full_disk_access`]); `None` counts as no grant.
+    fn full_disk_access(&self) -> Option<bool>;
     /// Make later passes run the settings `selected` checks (its workstation part).
     fn select(&mut self, selected: Selection);
     fn read(&mut self, target: &Target) -> Result<Option<PValue>, String>;
     fn write(&mut self, target: &Target, value: Option<&PValue>) -> Result<(), String>;
-    fn preference_changes(&mut self) -> Result<Vec<Saved>, String>;
+    /// The before-images of what `group`'s pass (the selected preferences, or a follow-up's
+    /// [`WorkstationGroup::Withheld`] keys) would change, prepared for its apply.
+    fn preference_changes(&mut self, group: WorkstationGroup) -> Result<Vec<Saved>, String>;
     /// The items whose change the apply passes since the last call reached, in run order.
     fn attempts(&mut self) -> Vec<Attempt>;
     /// The items the apply passes since the last call left as wanted: already so, made
-    /// so, or not applicable here.
+    /// so, not applicable here, or held as they are ([`Host::hold`]); one that left a key
+    /// alone for want of Full Disk Access ([`Host::withheld`]) too, by what it did with the
+    /// keys it reached, so a later automatic pass of the run holds it as it is (it writes
+    /// none of its keys, which the person may have set since) and the follow-up
+    /// ([`follow_up_at`]) alone writes the key it left.
     fn settled(&mut self) -> Vec<String>;
+    /// The items the apply passes since the last call left keys alone in, in another app's
+    /// container, for want of Full Disk Access, held or not
+    /// ([`aterm_machines::init::WorkstationRun::withheld`]); the record adds only one that
+    /// ran ([`record_withheld`]).
+    fn withheld(&mut self) -> Vec<String>;
     /// Leave `items` alone in later passes, each as its [`Hold`] says: nothing of one is
     /// changed, backed up, relaunched or journaled.
     fn hold(&mut self, items: &[(String, Hold)]);
+    /// The items later passes leave alone ([`Host::hold`]), by id.
+    fn held(&self) -> Vec<String>;
     /// Record a change in the run's converge journal before it is made (design §3.3 of
     /// docs/DESIGN-init-system-2026-10-20.md). The caller says what a refusal means.
     fn journal(
@@ -992,17 +1096,21 @@ struct NativeHost {
     prepare: Prepare,
     selected: Selection,
     domains: BTreeMap<(String, bool), plist::Entries>,
-    prepared: Option<Workstation>,
+    /// The pass [`Host::preference_changes`] prepared, and its group.
+    prepared: Option<(WorkstationGroup, Workstation)>,
     attempts: Vec<Attempt>,
     settled: Vec<String>,
+    withheld: Vec<String>,
     held: Vec<(String, Hold)>,
 }
 
 impl NativeHost {
-    /// The profile on this Mac.
+    /// The profile on this Mac, with this process's Full Disk Access measured once for the
+    /// pass: its shared items read it from their context, its own reads and writes from
+    /// the port ([`withheld`]).
     fn new() -> Self {
         Self::over(
-            Box::new(aterm_machines::port::Live::new()),
+            Box::new(aterm_machines::port::Live::new().with_full_disk_access(full_disk_access())),
             Box::new(aterm_machines::init::prepare_workstation_selected),
         )
     }
@@ -1024,8 +1132,14 @@ impl NativeHost {
             prepared: None,
             attempts: Vec::new(),
             settled: Vec::new(),
+            withheld: Vec::new(),
             held: Vec::new(),
         }
+    }
+
+    /// Whether this pass reads `target` where macOS shows it ([`Saved::granted`]).
+    fn granted(&self, target: &Target) -> bool {
+        !contained(target) || self.sys.full_disk_access() == Some(true)
     }
 
     /// `group`'s pass, leaving alone what this host holds.
@@ -1036,6 +1150,13 @@ impl NativeHost {
     }
 
     fn entries(&mut self, domain: &str, host: bool) -> Result<&plist::Entries, String> {
+        // Never an export of another app's container without the grant: macOS would tell
+        // the person aterm tried to read another app's data, and print an empty domain.
+        if let Some(why) =
+            aterm_machines::items::defaults::withheld(domain, self.sys.full_disk_access())
+        {
+            return Err(why);
+        }
         let cache_key = (domain.to_owned(), host);
         if !self.domains.contains_key(&cache_key) {
             let mut export = Cmd::new(DEFAULTS);
@@ -1056,6 +1177,9 @@ impl Host for NativeHost {
     fn selection(&self) -> Selection {
         self.selected
     }
+    fn full_disk_access(&self) -> Option<bool> {
+        self.sys.full_disk_access()
+    }
     fn select(&mut self, selected: Selection) {
         self.selected = selected.workstation();
         self.prepared = None;
@@ -1066,8 +1190,14 @@ impl Host for NativeHost {
     fn settled(&mut self) -> Vec<String> {
         std::mem::take(&mut self.settled)
     }
+    fn withheld(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.withheld)
+    }
     fn hold(&mut self, items: &[(String, Hold)]) {
         self.held = items.to_vec();
+    }
+    fn held(&self) -> Vec<String> {
+        self.held.iter().map(|(item, _)| item.clone()).collect()
     }
     fn journal(
         &mut self,
@@ -1079,10 +1209,10 @@ impl Host for NativeHost {
         // The journal the shared items write through: one run, one record.
         self.sys.journal()?.before_change(id, from, to, revert)
     }
-    fn preference_changes(&mut self) -> Result<Vec<Saved>, String> {
+    fn preference_changes(&mut self, group: WorkstationGroup) -> Result<Vec<Saved>, String> {
         use aterm_machines::items::defaults::Scope;
         use aterm_machines::model::Read;
-        let mut prepared = self.prepare(WorkstationGroup::Preferences)?;
+        let mut prepared = self.prepare(group)?;
         let changes = prepared
             .preference_changes(self.sys.as_ref())?
             .into_iter()
@@ -1097,17 +1227,19 @@ impl Host for NativeHost {
                     Read::Value(v) => Some(v),
                     Read::Unusable(why) => return Err(why),
                 };
+                let target = Target {
+                    domain: target.domain,
+                    key: target.key,
+                    host: target.scope == Scope::Host,
+                };
                 Ok(Saved {
-                    target: Target {
-                        domain: target.domain,
-                        key: target.key,
-                        host: target.scope == Scope::Host,
-                    },
+                    granted: self.granted(&target),
+                    target,
                     value,
                 })
             })
             .collect::<Result<Vec<_>, String>>()?;
-        self.prepared = Some(prepared);
+        self.prepared = Some((group, prepared));
         Ok(changes)
     }
     fn read(&mut self, target: &Target) -> Result<Option<PValue>, String> {
@@ -1120,6 +1252,9 @@ impl Host for NativeHost {
     }
 
     fn write(&mut self, target: &Target, value: Option<&PValue>) -> Result<(), String> {
+        if let Some(why) = withheld(&*self, target) {
+            return Err(why);
+        }
         // A timed-out or failed client may already have changed cfprefsd's
         // value. Rollback must reread the machine, never the before-image cache.
         self.domains.remove(&(target.domain.clone(), target.host));
@@ -1151,12 +1286,9 @@ impl Host for NativeHost {
     fn workstation(&mut self, group: WorkstationGroup, apply: bool) -> Result<Vec<Row>, String> {
         use aterm_machines::model::{Mode, Outcome};
         let mode = if apply { Mode::Apply } else { Mode::Plan };
-        let prepared = if group == WorkstationGroup::Preferences
-            && let Some(prepared) = self.prepared.take()
-        {
-            prepared
-        } else {
-            self.prepare(group)?
+        let prepared = match self.prepared.take() {
+            Some((prepared_group, prepared)) if prepared_group == group => prepared,
+            _ => self.prepare(group)?,
         };
         self.domains.clear();
         let rows = if apply {
@@ -1176,12 +1308,14 @@ impl Host for NativeHost {
                                 Read::Value(value) => Some(value),
                                 Read::Unusable(why) => return Err(why),
                             };
+                            let target = Target {
+                                domain: target.domain,
+                                key: target.key,
+                                host: target.scope == Scope::Host,
+                            };
                             Ok(Saved {
-                                target: Target {
-                                    domain: target.domain,
-                                    key: target.key,
-                                    host: target.scope == Scope::Host,
-                                },
+                                granted: self.granted(&target),
+                                target,
                                 value,
                             })
                         })
@@ -1194,6 +1328,12 @@ impl Host for NativeHost {
                 })
                 .collect::<Result<Vec<_>, String>>()?;
             self.attempts.extend(attempts);
+            // A row that left a key alone for want of Full Disk Access is settled by what it
+            // did, so a later automatic pass holds the whole item as it is and writes none of
+            // its keys again; the key it left is the follow-up's ([`follow_up_at`]), which no
+            // hold of the run touches, through the record of what was withheld. A later pass
+            // with the grant reads that key too, and says it is the follow-up's
+            // ([`SETTLED_OWED`]).
             self.settled.extend(
                 result
                     .rows
@@ -1206,6 +1346,7 @@ impl Host for NativeHost {
                     })
                     .map(|row| row.id.clone()),
             );
+            self.withheld.extend(result.withheld);
             result.rows
         } else {
             prepared.run(self.sys.as_ref(), mode)?
@@ -1321,6 +1462,12 @@ fn journal_refused(refused: &[String]) -> Row {
 struct Saved {
     target: Target,
     value: Option<PValue>,
+    /// Whether the value was read where macOS shows it: always for an open domain; for a
+    /// key of another app's container ([`contained`]), only by a pass that held Full Disk
+    /// Access. Without it, macOS showed that pass an empty domain, so its absent value was
+    /// the denial, not the person's ([`unknown_original`]). A backup written before this
+    /// field reads it as held for a value and not for an absence.
+    granted: bool,
 }
 
 fn load_backup(path: &Path) -> Result<Vec<Saved>, String> {
@@ -1356,7 +1503,17 @@ fn load_backup(path: &Path) -> Result<Vec<Saved>, String> {
                         .as_bytes(),
                 )?)
             };
-            Ok(Saved { target, value })
+            // An earlier aterm wrote no grant: a value it read was there to read, and an
+            // absence in another app's container may have been macOS hiding it.
+            let granted = match entry.get("granted") {
+                None => !contained(&target) || value.is_some(),
+                Some(granted) => granted.as_bool().ok_or("backup grant is invalid")?,
+            };
+            Ok(Saved {
+                target,
+                value,
+                granted,
+            })
         })
         .collect()
 }
@@ -1367,7 +1524,7 @@ fn save_backup(path: &Path, keys: &[Saved]) -> Result<(), String> {
         .map(|s| {
             json!({
                 "domain": s.target.domain, "key": s.target.key, "host": s.target.host,
-                "xml": s.value.as_ref().map(plist::document),
+                "xml": s.value.as_ref().map(plist::document), "granted": s.granted,
             })
         })
         .collect();
@@ -1429,6 +1586,7 @@ fn append_workstation(
         WorkstationGroup::Preferences => "Workstation preferences",
         WorkstationGroup::InputActivation => "Active keyboard and trackpad settings",
         WorkstationGroup::All => "Workstation settings",
+        WorkstationGroup::Withheld => "Settings waiting for Full Disk Access",
     };
     match host.workstation(group, apply) {
         Ok(rows) if rows.is_empty() => report.rows.push(Row {
@@ -1445,8 +1603,16 @@ fn append_workstation(
     }
 }
 
+/// A pass a person asked for (`doctor --apply`, `--check`, `--restore`), as this build, now.
 fn execute(host: &mut dyn Host, root: &Path, action: Action) -> Result<Report, String> {
-    execute_pass(host, root, action).map(|pass| pass.report)
+    execute_pass(
+        host,
+        root,
+        action,
+        &aterm_types::version::build_id(),
+        epoch_secs(std::time::SystemTime::now()),
+    )
+    .map(|pass| pass.report)
 }
 
 /// A profile pass's report, the items whose change it reached without verifying, and
@@ -1467,7 +1633,15 @@ impl From<Report> for Pass {
     }
 }
 
-fn execute_pass(host: &mut dyn Host, root: &Path, action: Action) -> Result<Pass, String> {
+/// A profile pass of `build` at `now` (seconds since the epoch): what a change that did not
+/// verify spends its tries against ([`TRIES`]).
+fn execute_pass(
+    host: &mut dyn Host,
+    root: &Path,
+    action: Action,
+    build: &str,
+    now: u64,
+) -> Result<Pass, String> {
     let backup = root.join("original-preferences.json");
     let mut report = Report {
         action,
@@ -1502,7 +1676,12 @@ fn execute_pass(host: &mut dyn Host, root: &Path, action: Action) -> Result<Pass
         Vec::new()
     };
     if action == Action::Check {
-        if !previous_activation.is_empty() {
+        // A relaunch owed for a key this pass may not reach waits for the grant: it is
+        // not drift a person can apply away.
+        let (left, due): (Vec<&Target>, Vec<&Target>) = previous_activation
+            .iter()
+            .partition(|target| withheld(host, target).is_some());
+        if !due.is_empty() {
             report.rows.push(Row {
                 name: "Preference activation".into(),
                 status: "drift".into(),
@@ -1510,21 +1689,84 @@ fn execute_pass(host: &mut dyn Host, root: &Path, action: Action) -> Result<Pass
                     .into(),
             });
         }
+        if let Some(why) = left.first().and_then(|target| withheld(host, target)) {
+            report.rows.push(Row {
+                name: "Preference activation".into(),
+                status: "blocked".into(),
+                detail: format!(
+                    "a previous pass's relaunch for {} waits: {why}",
+                    left.iter()
+                        .map(|target| target.describe())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            });
+        }
         append_workstation(host, WorkstationGroup::All, false, &mut report);
         return Ok(report.into());
     }
+    let (mut unverified, mut settled) = apply_preferences(
+        host,
+        root,
+        &mut report,
+        WorkstationGroup::Preferences,
+        full_profile,
+        previous_activation,
+        (build, now),
+    )?;
+    // Account sign-out does not wait on an unrelated preference: a held Dock would
+    // otherwise keep the selected accounts signed in until a person acted on the Dock.
+    append_workstation(host, WorkstationGroup::Accounts, true, &mut report);
+    unverified.extend(
+        host.attempts()
+            .into_iter()
+            .filter(|attempt| !attempt.verified)
+            .map(|attempt| attempt.item),
+    );
+    settled.extend(host.settled());
+    if !report.needs_attention() {
+        write_json(
+            &root.join("first-run.json"),
+            &json!({ "profile": PROFILE, "state": "applied", "accounts_verified": true }),
+        )?;
+    }
+    Ok(Pass {
+        report,
+        unverified,
+        settled,
+    })
+}
+
+/// The preference part of an apply pass over `group`: the selected rows
+/// ([`WorkstationGroup::Preferences`], after which first-run.json reads pending until the
+/// pass ends well), or a follow-up's keys ([`WorkstationGroup::Withheld`], which writes no
+/// setup record but its own). It backs up, applies, rolls back what did not verify,
+/// relaunches, and records which items wait for Full Disk Access ([`WITHHELD_RECORD`]), a try
+/// of one whose change reached that key and did not verify spent by `turn` (the build, and
+/// the time in seconds since the epoch). The items whose change did not verify, and those
+/// left as wanted.
+fn apply_preferences(
+    host: &mut dyn Host,
+    root: &Path,
+    report: &mut Report,
+    group: WorkstationGroup,
+    full_profile: bool,
+    previous_activation: Vec<Target>,
+    turn: (&str, u64),
+) -> Result<(Vec<String>, Vec<String>), String> {
     let mut saved = load_backup(&report.backup)?;
-    let before = if WorkstationGroup::Preferences
-        .selected(host.selection())
-        .is_empty()
-    {
+    let before = if group.selected(host.selection()).is_empty() {
         Vec::new()
     } else {
-        host.preference_changes()?
+        host.preference_changes(group)?
     };
     for setting in &before {
-        if !saved.iter().any(|s| s.target == setting.target) {
-            saved.push(setting.clone());
+        match saved.iter_mut().find(|s| s.target == setting.target) {
+            None => saved.push(setting.clone()),
+            // An earlier aterm saved this while macOS hid the app's container from it: its
+            // absence was the denial, not the person's value. This read holds the grant.
+            Some(old) if !old.granted && setting.granted => *old = setting.clone(),
+            Some(_) => {}
         }
     }
     // The shared item set supplies exact typed before-images. The recovery
@@ -1536,21 +1778,32 @@ fn execute_pass(host: &mut dyn Host, root: &Path, action: Action) -> Result<Pass
     if !before.is_empty() {
         save_backup(&report.backup, &saved)?;
     }
-    // An explicit repair also supersedes an earlier completion/restoration.
-    // Failed account work must remain retryable until the shared pass verifies it.
-    write_json(
-        &root.join("first-run.json"),
-        &json!({ "profile": PROFILE, "state": "pending" }),
-    )?;
-    append_workstation(host, WorkstationGroup::Preferences, true, &mut report);
+    if group == WorkstationGroup::Preferences {
+        // An explicit repair also supersedes an earlier completion/restoration.
+        // Failed account work must remain retryable until the shared pass verifies it.
+        write_json(
+            &root.join("first-run.json"),
+            &json!({ "profile": PROFILE, "state": "pending" }),
+        )?;
+    }
+    append_workstation(host, group, true, report);
     // Each item settles alone. One whose change did not verify puts back only its own
     // keys; one that verified keeps its change, so the next pass finds it done instead
     // of making it again. A row that changed nothing (blocked, deferred, unreadable,
     // held) undoes nothing. Undoing every item for one failure made each retry re-apply
     // the rest and relaunch their consumers: the pass never settled.
     let attempts = host.attempts();
-    let mut settled = host.settled();
-    let mut unverified: Vec<String> = attempts
+    let settled = host.settled();
+    // An item this pass held ran nothing, its keys untouched: it reached no key as wanted
+    // and left none alone, so the record neither drops nor adds it (one recorded keeps its
+    // place). Else a pass without the grant that holds as it is an item a pass with the
+    // grant settled would record it, and the follow-up would write over the person's change
+    // since. One that ran and left a key alone again stays recorded.
+    let held = host.held();
+    let ran = |item: &&String| !held.contains(item);
+    let left_alone: Vec<String> = host.withheld().iter().filter(ran).cloned().collect();
+    let reached: Vec<String> = settled.iter().filter(ran).cloned().collect();
+    let unverified: Vec<String> = attempts
         .iter()
         .filter(|attempt| !attempt.verified)
         .map(|attempt| attempt.item.clone())
@@ -1592,7 +1845,14 @@ fn execute_pass(host: &mut dyn Host, root: &Path, action: Action) -> Result<Pass
         }
         let mut restored = Vec::new();
         let mut refused = Vec::new();
+        let mut left = Vec::new();
         for previous in rollback.iter().rev() {
+            if let Some(why) =
+                withheld(host, &previous.target).or_else(|| unknown_original(previous))
+            {
+                left.push(why);
+                continue;
+            }
             let wrote = match restore_one(
                 host,
                 &previous.target,
@@ -1625,6 +1885,13 @@ fn execute_pass(host: &mut dyn Host, root: &Path, action: Action) -> Result<Pass
                 ),
             });
         }
+        if !left.is_empty() {
+            report.rows.push(Row {
+                name: "Preference rollback".into(),
+                status: "blocked".into(),
+                detail: format!("left as this pass made it: {}", left.join("; ")),
+            });
+        }
         if !refused.is_empty() {
             report.rows.push(journal_refused(&refused));
         }
@@ -1637,30 +1904,338 @@ fn execute_pass(host: &mut dyn Host, root: &Path, action: Action) -> Result<Pass
             });
         }
     }
-    if refresh(host, &reload.iter().collect::<Vec<_>>(), &mut report) && full_profile {
-        clear_pending_refresh(root)?;
+    if refresh(host, &reload.iter().collect::<Vec<_>>(), report) && full_profile {
+        settle_pending_refresh(host, root)?;
     }
-    // Account sign-out does not wait on an unrelated preference: a held Dock would
-    // otherwise keep the selected accounts signed in until a person acted on the Dock.
-    append_workstation(host, WorkstationGroup::Accounts, true, &mut report);
-    unverified.extend(
-        host.attempts()
-            .into_iter()
-            .filter(|attempt| !attempt.verified)
-            .map(|attempt| attempt.item),
+    // After the rollback: a record that cannot be kept does not keep originals away.
+    if let Err(detail) = record_withheld(root, &left_alone, &reached, &unverified, turn) {
+        report.rows.push(Row {
+            name: "Settings waiting for Full Disk Access".into(),
+            status: "error".into(),
+            detail,
+        });
+    }
+    Ok((unverified, settled))
+}
+
+/// The record of the items an apply pass left keys alone in, in another app's container,
+/// for want of Full Disk Access (Notification Center's widget list): a pass that reaches
+/// them as wanted with the grant drops them, and [`follow_up_at`] reaches them alone once the
+/// grant is held. A change that reached those keys and did not verify keeps its item, and
+/// spends one of its tries ([`TRIES`] per build, [`SECOND_TRY_AFTER`] apart), whichever pass
+/// made it. The tries belong to the setup run that spent them, as [`HELD_RECORD`]'s do: a new
+/// run of the plan (System State's Apply, or its answer to the startup review) starts them
+/// afresh, and keeps what the record owes. A Restore drops it.
+const WITHHELD_RECORD: &str = "withheld-preferences.json";
+
+/// What [`WITHHELD_RECORD`] holds.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct Withheld {
+    /// The items that left keys alone, in run order.
+    items: Vec<String>,
+    /// The tries of a change that reached their keys and did not verify, per item and build.
+    failed: Vec<Failed>,
+}
+
+/// What [`WITHHELD_RECORD`] holds; nothing when there is no record, and no tries when another
+/// setup run spent them ([`initial::revision_at`]).
+fn load_withheld(root: &Path) -> Result<Withheld, String> {
+    let path = root.join(WITHHELD_RECORD);
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Withheld::default()),
+        Err(e) => return Err(format!("{}: {e}", path.display())),
+    };
+    let record: Value =
+        aterm_json::from_slice(&bytes).map_err(|e| format!("withheld preferences: {e}"))?;
+    if record["profile"].as_str() != Some(PROFILE) {
+        return Err("unrecognized withheld preferences profile".into());
+    }
+    let bad = || "withheld preferences are unreadable".to_owned();
+    let items = record["items"]
+        .as_array()
+        .ok_or_else(bad)?
+        .iter()
+        .map(|item| item.as_str().map(str::to_owned).ok_or_else(bad))
+        .collect::<Result<_, _>>()?;
+    let mut failed = load_tries(&record["failed"], &bad)?;
+    if record["revision"].as_u64() != initial::revision_at(root).ok() {
+        failed.clear();
+    }
+    Ok(Withheld { items, failed })
+}
+
+/// Save [`WITHHELD_RECORD`] as `record`, its tries the current setup run's, or remove it when
+/// it names no item.
+fn save_withheld(root: &Path, record: &Withheld) -> Result<(), String> {
+    if !record.items.is_empty() {
+        return write_json(
+            &root.join(WITHHELD_RECORD),
+            &json!({
+                "profile": PROFILE, "revision": initial::revision_at(root).ok(),
+                "items": record.items, "failed": tries_json(&record.failed),
+            }),
+        );
+    }
+    match std::fs::remove_file(root.join(WITHHELD_RECORD)) {
+        Ok(()) => durable_directory(root).map_err(|e| format!("{}: {e}", root.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("clear withheld preferences: {e}")),
+    }
+}
+
+/// Drop from [`WITHHELD_RECORD`] the items a pass reached as wanted (`reached`) and add those
+/// it ran and left keys alone in (`left_alone`): an item in both stays, and one the pass held
+/// is in neither, so it keeps whatever place the record gives it. Each recorded item whose
+/// change did not verify (`unverified`) and that reached its keys there (it left none alone)
+/// spends one of its tries, as `turn` (the build, and the time in seconds since the epoch).
+fn record_withheld(
+    root: &Path,
+    left_alone: &[String],
+    reached: &[String],
+    unverified: &[String],
+    turn: (&str, u64),
+) -> Result<(), String> {
+    if left_alone.is_empty() && reached.is_empty() && unverified.is_empty() {
+        return Ok(());
+    }
+    let before = load_withheld(root)?;
+    let mut record = before.clone();
+    record.items.retain(|item| !reached.contains(item));
+    for item in left_alone {
+        if !record.items.contains(item) {
+            record.items.push(item.clone());
+        }
+    }
+    let tried: Vec<String> = unverified
+        .iter()
+        .filter(|item| record.items.contains(item) && !left_alone.contains(item))
+        .cloned()
+        .collect();
+    let (build, now) = turn;
+    count_tries(&mut record.failed, build, now, &tried);
+    let items = &record.items;
+    record.failed.retain(|f| items.contains(&f.item));
+    if record == before {
+        return Ok(());
+    }
+    save_withheld(root, &record)
+}
+
+/// Reach, once this process holds Full Disk Access, what earlier apply passes left alone in
+/// another app's container for want of it ([`WITHHELD_RECORD`]: Notification Center's
+/// widget list): those keys alone ([`WorkstationGroup::Withheld`]), backed up first, its
+/// readers alone relaunched (never the Dock); no other key is read, so a person's change to
+/// them since stays theirs. It runs whether or not the Workstation stage is done: the setup
+/// run's automatic passes hold the item as it is once it settled for the keys it reached, so
+/// this is what reaches the key it left. Nothing runs without a record or without the grant,
+/// nor after the person cancelled or restored setup, nor for a row unchecked in a setup
+/// choice that still runs Mac settings (one that runs none, as the vault's remedy asks,
+/// withdraws nothing); it writes no setup record (no offer, countdown or question follows
+/// from it).
+/// A follow-up that reached its keys as wanted drops them from the record, so it runs once;
+/// one that could not (away from the console) is left for the next; one whose change did not
+/// verify is rolled back and stays, and is tried again as an automatic pass's change is,
+/// [`TRIES`] times per build (`build`, at `now`), the second once [`SECOND_TRY_AFTER`] has
+/// passed, held in between and after, writing and relaunching nothing for it then; an
+/// automatic pass with the grant spends and honours the same tries ([`automatic_pass`]).
+/// That second try is the first follow-up after it is due: setup's next worker pass while
+/// setup runs, or, once setup has finished, aterm's next launch
+/// ([`finish_withheld_preferences`]). The caller holds the profile lock. `None`: nothing
+/// ran.
+fn follow_up_at(
+    root: &Path,
+    host: &mut dyn Host,
+    build: &str,
+    now: std::time::SystemTime,
+) -> Result<Option<Report>, String> {
+    let record = load_withheld(root)?;
+    if record.items.is_empty() || initial::stopped(root)? {
+        return Ok(None);
+    }
+    if host.full_disk_access() != Some(true) {
+        return Ok(None);
+    }
+    // The current setup choice: a row the person unchecked since stays as it is. A choice
+    // with every Mac settings row off (the vault's remedy) runs none of them again, and is
+    // no answer about this one.
+    let chosen = authorized_selection(root)?;
+    let mut selected = Selection::none();
+    for item in &record.items {
+        if let Some(setting) = aterm_machines::init_preferences::setting_of(item)
+            && chosen
+                .is_none_or(|chosen| chosen.workstation().is_empty() || chosen.contains(setting))
+        {
+            selected.set(setting, true);
+        }
+    }
+    if selected.is_empty() {
+        // Nothing still chosen that this build knows names those items: nothing to follow up.
+        save_withheld(root, &Withheld::default())?;
+        return Ok(None);
+    }
+    let mut report = Report {
+        action: Action::Apply,
+        rows: Vec::new(),
+        manual_steps: Vec::new(),
+        backup: root.join("original-preferences.json"),
+    };
+    let now = epoch_secs(now);
+    let selection = host.selection();
+    host.select(selected);
+    // A follow-up is no automatic retry of the setup run's changes, and none of its holds
+    // applies; its record's tries hold an item whose change to its keys did not verify,
+    // whichever pass made it.
+    host.hold(&held_back(&record.failed, build, now));
+    let pass = apply_preferences(
+        host,
+        root,
+        &mut report,
+        WorkstationGroup::Withheld,
+        false,
+        Vec::new(),
+        (build, now),
     );
-    settled.extend(host.settled());
-    if !report.needs_attention() {
-        write_json(
-            &root.join("first-run.json"),
-            &json!({ "profile": PROFILE, "state": "applied", "accounts_verified": true }),
-        )?;
+    host.select(selection);
+    host.hold(&[]);
+    pass?;
+    Ok(Some(report))
+}
+
+/// Clear, once this aterm holds Full Disk Access, what earlier passes of the profile left
+/// alone in another app's container for want of it (Notification Center's widget list),
+/// silently ([`follow_up_at`]): what a window whose setup has finished calls at launch (a
+/// setup still running reaches it after each pass of its stages). It reads only aterm's
+/// record until there is one, and then measures the grant without a prompt. `reserve` takes
+/// the caller's in-process slot for profile work (System State's busy slot), held from
+/// before the profile lock until after it is released ([`follow_up_finished_at`]). `None`:
+/// nothing ran.
+pub fn finish_withheld_preferences<S>(
+    reserve: impl FnOnce() -> S,
+) -> Result<Option<Report>, String> {
+    if aterm_types::dirs::runs_under_private_state_root() {
+        return Ok(None);
     }
-    Ok(Pass {
-        report,
-        unverified,
-        settled,
+    follow_up_finished_at(
+        &state_root()?,
+        reserve,
+        || {
+            ensure_person_scope()?;
+            Ok(NativeHost::new())
+        },
+        &aterm_types::version::build_id(),
+        std::time::SystemTime::now(),
+    )
+}
+
+/// [`finish_withheld_preferences`] of `root`, over the host `host` makes, for `build` at
+/// `now`. With a record that names something to reach, a setup the person has not stopped,
+/// and the grant (measured before either is taken), it takes `reserve`'s slot, then the
+/// profile lock, and releases the lock before the slot: this process's System State, which
+/// serializes its operations on that slot, shows the follow-up busy and its setup worker
+/// waits for it, instead of failing on, or backing off from, a lock nobody they can see
+/// holds. Otherwise it takes neither, so a launch with nothing it could reach never shows
+/// busy; [`follow_up_at`] checks the stop and the grant again under the lock. Another pass
+/// holding the lock: nothing runs, and the next launch tries.
+fn follow_up_finished_at<S, H: Host>(
+    root: &Path,
+    reserve: impl FnOnce() -> S,
+    host: impl FnOnce() -> Result<H, String>,
+    build: &str,
+    now: std::time::SystemTime,
+) -> Result<Option<Report>, String> {
+    if load_withheld(root)?.items.is_empty() || initial::stopped(root)? {
+        return Ok(None);
+    }
+    let mut host = host()?;
+    if host.full_disk_access() != Some(true) {
+        return Ok(None);
+    }
+    let _slot = reserve();
+    let Some(_lock) = HeldLock::try_take(root)? else {
+        return Ok(None);
+    };
+    follow_up_at(root, &mut host, build, now)
+}
+
+/// [`follow_up_at`] for a caller that holds the profile lock: a running setup's worker,
+/// after its stages. It measures the grant only when a record names something to reach.
+fn follow_up_locked_at(root: &Path) -> Result<Option<Report>, String> {
+    if load_withheld(root)?.items.is_empty() {
+        return Ok(None);
+    }
+    follow_up_at(
+        root,
+        &mut NativeHost::new(),
+        &aterm_types::version::build_id(),
+        std::time::SystemTime::now(),
+    )
+}
+
+/// Why a saved before-image is not the original and is left as it is: a key of another
+/// app's container ([`contained`]) recorded as absent by a pass that held no Full Disk
+/// Access (an earlier aterm read it so while macOS hid the container from it), whose
+/// absence was the denial. Nothing is deleted or relaunched for it.
+fn unknown_original(saved: &Saved) -> Option<String> {
+    (contained(&saved.target) && !saved.granted && saved.value.is_none()).then(|| {
+        format!(
+            "{} was saved before aterm had Full Disk Access, while macOS hid it from aterm, \
+             so its original is unknown; it is left as it is",
+            saved.target.describe()
+        )
     })
+}
+
+/// Whether `target` is in another app's sandbox container
+/// ([`aterm_machines::items::defaults::CONTAINED`]).
+fn contained(target: &Target) -> bool {
+    aterm_machines::items::defaults::contained(&target.domain)
+}
+
+/// After a relaunch of what pending-refresh.json records: keep in it only what this pass
+/// left alone for want of Full Disk Access ([`withheld`]), for a pass with the grant to
+/// relaunch; remove it when nothing is left.
+fn settle_pending_refresh(host: &dyn Host, root: &Path) -> Result<(), String> {
+    let kept: Vec<Target> = pending_refresh(root)?
+        .into_iter()
+        .filter(|target| withheld(host, target).is_some())
+        .collect();
+    if kept.is_empty() {
+        clear_pending_refresh(root)
+    } else {
+        save_pending_refresh(root, &kept)
+    }
+}
+
+/// Why this pass leaves `target` alone: it is in another app's sandbox container and the
+/// pass holds no Full Disk Access ([`aterm_machines::items::defaults::withheld`]). A
+/// before-image of one is not read, put back or relaunched for, in a rollback or a Restore,
+/// and the backup keeps it for a Restore the person runs again with the grant (which puts it
+/// back unless it is an [`unknown_original`]; nothing reruns a Restore, so its row says so,
+/// [`restore_waits`]); a relaunch owed for one stays in pending-refresh.json for a pass with
+/// the grant ([`settle_pending_refresh`]).
+fn withheld(host: &dyn Host, target: &Target) -> Option<String> {
+    aterm_machines::items::defaults::withheld(&target.domain, host.full_disk_access())
+}
+
+/// What a Restore without Full Disk Access says of a key in another app's container it
+/// leaves as it is ([`withheld`]), whose before-image is the original (not an
+/// [`unknown_original`], which a Restore with the grant leaves too): setup is stopped and
+/// nothing runs a Restore again by itself, so the row names the step that puts it back,
+/// however this one ran: a Restore again from an app that holds the grant, which is the app
+/// macOS holds responsible (aterm for System State or a command in an aterm tab, the
+/// terminal app for one in another terminal, and over SSH `sshd-keygen-wrapper`, which
+/// Remote Login's switch grants).
+fn restore_waits(target: &Target) -> String {
+    format!(
+        "{} is in another app's container, which macOS opens only to a process whose app holds \
+         Full Disk Access; its original stays in the backup: run Restore again from an app that \
+         holds it: from aterm's System State on this Mac, or a command in an aterm tab, once \
+         aterm has Full Disk Access; aterm doctor --restore in another terminal once that \
+         terminal app has it; over SSH, once Remote Login's \"Allow full disk access for remote \
+         users\" is on (System Settings > General > Sharing)",
+        target.describe()
+    )
 }
 
 /// Put `target` back to `value`, journaled before the write. `Ok(false)`: it already
@@ -1767,9 +2342,16 @@ fn restore(host: &mut dyn Host, root: &Path, mut report: Report) -> Result<Repor
         &root.join("first-run.json"),
         &json!({ "profile": PROFILE, "state": "restored" }),
     )?;
+    // Nothing an earlier pass left alone for want of Full Disk Access is followed up after
+    // a Restore: setup is stopped, and the person's preferences are theirs.
+    save_withheld(root, &Withheld::default())?;
     let saved = load_backup(&report.backup)?;
     let mut activation = pending_refresh(root)?;
     for saved in &saved {
+        // Nothing is relaunched for a key this Restore does not put back.
+        if withheld(host, &saved.target).is_some() || unknown_original(saved).is_some() {
+            continue;
+        }
         if !activation.contains(&saved.target) {
             activation.push(saved.target.clone());
         }
@@ -1784,6 +2366,18 @@ fn restore(host: &mut dyn Host, root: &Path, mut report: Report) -> Result<Repor
     }
     let mut refused = Vec::new();
     for item in saved.iter().rev() {
+        // A before-image that is no original stays unknown whatever the grant: no Restore
+        // with it would put anything back, so the row names no step for one.
+        let why = unknown_original(item)
+            .or_else(|| withheld(host, &item.target).map(|_| restore_waits(&item.target)));
+        if let Some(why) = why {
+            report.rows.push(Row {
+                name: item.target.describe(),
+                status: "blocked".into(),
+                detail: why,
+            });
+            continue;
+        }
         match restore_one(host, &item.target, item.value.as_ref(), &mut refused) {
             Ok(_) => report.rows.push(Row {
                 name: item.target.describe(),
@@ -1801,7 +2395,7 @@ fn restore(host: &mut dyn Host, root: &Path, mut report: Report) -> Result<Repor
         report.rows.push(journal_refused(&refused));
     }
     if refresh(host, &activation.iter().collect::<Vec<_>>(), &mut report) {
-        clear_pending_refresh(root)?;
+        settle_pending_refresh(host, root)?;
     }
     report.rows.extend(host.restore_runtime(&saved));
     Ok(report)
@@ -1867,6 +2461,13 @@ fn clear_pending_refresh(root: &Path) -> Result<(), String> {
 /// consumer read what is saved (an original put back, or an earlier pass's change), so a
 /// journal that refuses its line does not stop it; the refusal is reported.
 fn refresh(host: &mut dyn Host, targets: &[&Target], report: &mut Report) -> bool {
+    // Nothing is relaunched for a key of another app's container without the grant: this
+    // pass neither read nor wrote it ([`withheld`]).
+    let targets: Vec<&Target> = targets
+        .iter()
+        .copied()
+        .filter(|target| withheld(&*host, target).is_none())
+        .collect();
     let mut refreshed = true;
     let mut refused = Vec::new();
     // The processes that read each target's domain: the table the shared items' own
@@ -1914,9 +2515,15 @@ mod tests {
     use super::*;
 
     /// A doctor host whose shared items are the [`wanted`] keys, one item each (its id is
-    /// the key's [`Target::describe`]), and whose account group is one sign-out row. It
-    /// holds what it is told to as the shared engine does ([`Hold`]); the engine's own
-    /// hold is pinned in aterm-machines, and [`NativeHost`]'s by the tests over [`Inert`].
+    /// the key's [`Target::describe`]), and whose account group is one sign-out row. When
+    /// it models Notification Center ([`Fake::notification_center`]), the widgets row is one
+    /// item of the Window Manager's key and Notification Center's widget list, as the shared
+    /// widgets item is (`init.widgets@alice`). Each row is its item's, by its id. It holds
+    /// what it is told to as the shared engine does ([`Hold`]; a row held as it is names the
+    /// keys it found changed, as the engine's does); the engine's own hold is pinned in
+    /// aterm-machines, and [`NativeHost`]'s by the tests over [`Inert`]. An item's own
+    /// relaunch of what reads its writes is an event (`relaunch <process>`), apart from the
+    /// doctor's (`restart <process>`).
     #[derive(Default)]
     struct Fake {
         selected: Option<Selection>,
@@ -1959,12 +2566,72 @@ mod tests {
         /// Each journal line's id, from, to and revert.
         lines: Vec<(String, String, String, Option<String>)>,
         runtime_changed: bool,
+        /// What the pass measured of its Full Disk Access; `None` counts as no grant.
+        full_disk_access: Option<bool>,
+        /// The widgets row also clears Notification Center's widget list ([`NC`]), a key
+        /// of another app's container, in one item with the Window Manager's key: without
+        /// the grant that key is left alone, the row says so and reads as its other key does,
+        /// and the item is withheld ([`Host::withheld`]).
+        notification_center: bool,
+        withheld: Vec<String>,
     }
 
     impl Fake {
-        /// The item a wanted key belongs to, as the fake's rows and attempts name it.
-        fn item(target: &Target) -> String {
-            target.describe()
+        /// The item a wanted key belongs to, as the fake's rows and attempts name it:
+        /// Notification Center's key is the shared widgets row's, and so is the Window
+        /// Manager's when it models Notification Center.
+        fn item(&self, target: &Target) -> String {
+            if contained(target)
+                || (self.notification_center && target.domain == "com.apple.WindowManager")
+            {
+                WIDGETS.into()
+            } else {
+                target.describe()
+            }
+        }
+
+        /// The items in run order, each with its keys and what each should hold.
+        fn items(&self) -> Vec<(String, Vec<(Target, PValue)>)> {
+            let mut items: Vec<(String, Vec<(Target, PValue)>)> = Vec::new();
+            for (target, value) in self.wants() {
+                let item = self.item(&target);
+                match items.iter_mut().find(|(id, _)| *id == item) {
+                    Some((_, keys)) => keys.push((target, value)),
+                    None => items.push((item, vec![(target, value)])),
+                }
+            }
+            items
+        }
+
+        /// The setting whose row writes `target`.
+        fn setting(target: &Target) -> Setting {
+            if target.domain == "com.apple.dock" {
+                Setting::Dock
+            } else {
+                Setting::Widgets
+            }
+        }
+
+        /// How many times an item's own activation relaunched `process`.
+        fn relaunches(&self, process: &str) -> usize {
+            let event = format!("relaunch {process}");
+            self.events.iter().filter(|e| **e == event).count()
+        }
+
+        /// The keys this host's items want: [`wanted`], and Notification Center's cleared
+        /// widget list when it models it.
+        fn wants(&self) -> Vec<(Target, PValue)> {
+            let mut keys = wanted();
+            if self.notification_center {
+                keys.push((nc_widgets(), cleared()));
+            }
+            keys
+        }
+
+        /// Whether this pass reaches `target`: one of another app's container only with
+        /// the grant, as the shared items do.
+        fn reaches(&self, target: &Target) -> bool {
+            !contained(target) || self.full_disk_access == Some(true)
         }
 
         /// Writes and relaunches, the changes a pass makes outside aterm's own records.
@@ -2054,6 +2721,148 @@ mod tests {
         }
     }
 
+    /// The doctor of a selected widgets row whose Notification Center key (a widget in its
+    /// list) waits for Full Disk Access, the row one item with the Window Manager's key, as
+    /// the shared widgets item is, for the stage tests in `initial`: [`Withholding::pass`] is
+    /// what one worker retry of the Workstation stage runs, a minute after the last, and
+    /// [`Withholding::follow_up`] what it runs after its stages.
+    pub(super) struct Withholding {
+        host: Fake,
+        now: std::time::SystemTime,
+        build: &'static str,
+    }
+
+    impl Withholding {
+        pub(super) fn widgets() -> Self {
+            Self {
+                host: Fake {
+                    notification_center: true,
+                    values: BTreeMap::from([(nc_widgets(), populated())]),
+                    ..Fake::default()
+                },
+                now: std::time::SystemTime::now(),
+                build: "1.0.0+gtest",
+            }
+        }
+
+        /// [`Withholding::widgets`] with the Dock selected too, its change never verifying (the
+        /// Dock wrote its own tiles back over it), so the Workstation stage stays pending.
+        pub(super) fn widgets_and_a_dock_that_never_verifies() -> Self {
+            let mut doctor = Self::widgets();
+            doctor.host.failing = vec![wanted()[0].0.clone()];
+            doctor
+        }
+
+        /// [`Withholding::widgets`] whose first change does not verify (the Window Manager
+        /// key's reader, the Dock, was not up again in time): that try is rolled back, and
+        /// the row tried again once its tries allow.
+        pub(super) fn widgets_whose_first_try_does_not_verify() -> Self {
+            let mut doctor = Self::widgets();
+            doctor.host.fail_once = true;
+            doctor
+        }
+
+        pub(super) fn pass(&mut self, root: &Path) -> Result<Option<Report>, String> {
+            self.now += std::time::Duration::from_secs(61);
+            apply_on_first_run_with(
+                root,
+                &Inert::default(),
+                &mut self.host,
+                self.build,
+                self.now,
+            )
+        }
+
+        pub(super) fn follow_up(&mut self, root: &Path) -> Result<Option<Report>, String> {
+            follow_up_at(root, &mut self.host, self.build, self.now)
+        }
+
+        /// `by` goes by.
+        fn wait(&mut self, by: std::time::Duration) {
+            self.now += by;
+        }
+
+        /// The time of the last pass, which its follow-up shares.
+        pub(super) fn now(&self) -> std::time::SystemTime {
+            self.now
+        }
+
+        /// macOS gives aterm Full Disk Access.
+        pub(super) fn grant(&mut self) {
+            self.host.full_disk_access = Some(true);
+        }
+
+        /// Notification Center never keeps a clear of its widget list (it is not up again
+        /// in time): each try reads back as it was, and is rolled back.
+        pub(super) fn notification_center_never_keeps(&mut self) {
+            self.host.failing.push(nc_widgets());
+        }
+
+        /// The person shows their desktop widgets again: the Window Manager's key reads as
+        /// they set it.
+        pub(super) fn show_desktop_widgets(&mut self) {
+            self.host
+                .values
+                .insert(wanted()[1].0.clone(), PValue::Bool(false));
+        }
+
+        /// Whether the desktop widgets show, as the person set them.
+        pub(super) fn desktop_widgets_shown(&self) -> bool {
+            self.host
+                .values
+                .get(&wanted()[1].0)
+                .is_some_and(|now| now.same(&PValue::Bool(false)))
+        }
+
+        /// Writes to the Window Manager's widget key so far.
+        pub(super) fn window_manager_writes(&self) -> usize {
+            self.host
+                .writes
+                .iter()
+                .filter(|target| **target == wanted()[1].0)
+                .count()
+        }
+
+        /// Relaunches of the Dock so far: the items' own and the doctor's.
+        pub(super) fn dock_relaunches(&self) -> usize {
+            self.host.relaunches("Dock")
+                + self.host.restarts.iter().filter(|p| *p == "Dock").count()
+        }
+
+        /// Relaunches of Notification Center so far: the items' own and the doctor's.
+        pub(super) fn notification_center_relaunches(&self) -> usize {
+            self.host.relaunches("NotificationCenter")
+                + self
+                    .host
+                    .restarts
+                    .iter()
+                    .filter(|p| *p == "NotificationCenter")
+                    .count()
+        }
+
+        /// What the record of withheld items names.
+        pub(super) fn withheld(root: &Path) -> Vec<String> {
+            load_withheld(root).unwrap().items
+        }
+
+        /// Writes to Notification Center's widget list so far.
+        pub(super) fn notification_center_writes(&self) -> usize {
+            self.host
+                .writes
+                .iter()
+                .filter(|target| contained(target))
+                .count()
+        }
+
+        /// Whether Notification Center's widget list holds no widget.
+        pub(super) fn notification_center_cleared(&self) -> bool {
+            self.host
+                .values
+                .get(&nc_widgets())
+                .is_some_and(|now| now.same(&cleared()))
+        }
+    }
+
     /// A [`System`] that runs nothing: each command is recorded and refused, every file
     /// operation is unsupported, and its journal keeps each line's id. A [`NativeHost`]
     /// over it never reaches this Mac's preferences, processes or journal.
@@ -2061,6 +2870,8 @@ mod tests {
     pub(super) struct Inert {
         calls: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
         lines: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        /// What it answers for this process's Full Disk Access; `None`, not measured.
+        full_disk_access: Option<bool>,
     }
 
     /// [`Inert`]'s journal.
@@ -2138,10 +2949,1288 @@ mod tests {
             fn now(&self) -> u64 {
                 0
             }
+            fn full_disk_access(&self) -> Option<bool> {
+                self.full_disk_access
+            }
             fn journal(&self) -> Result<Box<dyn aterm_converge::Journal + '_>, String> {
                 Ok(Box::new(super::InertJournal(std::sync::Arc::clone(
                     &self.lines,
                 ))))
+            }
+        }
+    }
+
+    /// Notification Center's widget list, which lives in its app container.
+    const NC: &str = "com.apple.notificationcenterui";
+
+    /// The shared widgets item's id: the Window Manager's widget keys and Notification
+    /// Center's widget list.
+    pub(super) const WIDGETS: &str = "init.widgets@alice";
+
+    /// Whether `call` reads, writes or relaunches Notification Center or its preferences.
+    fn touches_notification_center(call: &str) -> bool {
+        call.contains(NC) || call.contains("NotificationCenter")
+    }
+
+    /// A doctor host over an [`Inert`] system whose Full Disk Access is `full_disk_access`,
+    /// its shared preference items `items`, and the commands it was asked to run.
+    fn inert_host(
+        full_disk_access: Option<bool>,
+        items: fn() -> Vec<Box<dyn aterm_machines::items::Item>>,
+    ) -> (NativeHost, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        let inert = Inert {
+            full_disk_access,
+            ..Inert::default()
+        };
+        let calls = std::sync::Arc::clone(&inert.calls);
+        let host = NativeHost::over(
+            Box::new(inert),
+            Box::new(move |_, group, _| {
+                Ok(Workstation::of(if group == WorkstationGroup::Preferences {
+                    items()
+                } else {
+                    Vec::new()
+                }))
+            }),
+        );
+        (host, calls)
+    }
+
+    /// The doctor's own reads and writes of another app's container wait for the grant: no
+    /// `defaults` runs for it, and the refusal names Full Disk Access. Negative control:
+    /// with the grant the same read runs the export.
+    #[test]
+    fn the_doctors_host_neither_reads_nor_writes_a_container_without_the_grant() {
+        let widgets = Target {
+            domain: NC.into(),
+            key: "widgets".into(),
+            host: false,
+        };
+        for unknown in [None, Some(false)] {
+            let (mut host, calls) = inert_host(unknown, Vec::new);
+            let read = host.read(&widgets).unwrap_err();
+            let write = host.write(&widgets, None).unwrap_err();
+            assert!(read.contains("Full Disk Access"), "{read}");
+            assert!(write.contains("Full Disk Access"), "{write}");
+            assert!(calls.lock().unwrap().is_empty(), "{:?}", calls.lock());
+        }
+        let (mut host, calls) = inert_host(Some(true), Vec::new);
+        assert!(
+            host.read(&widgets).is_err(),
+            "the inert system runs nothing"
+        );
+        assert_eq!(
+            *calls.lock().unwrap(),
+            [format!("{DEFAULTS} export {NC} -")]
+        );
+    }
+
+    /// Restore puts back what the backup holds, except a key of another app's container
+    /// while the pass holds no Full Disk Access: that row is `blocked` and names the step that
+    /// puts it back, the grant and a Restore run again ([`restore_waits`]; nothing runs one by
+    /// itself), and nothing reads, writes or relaunches Notification Center, while the Window
+    /// Manager's key is still read for and the Dock still relaunched. The backup keeps the key
+    /// for that Restore. Negative control: with the grant the Restore reads Notification
+    /// Center's domain and relaunches it.
+    #[test]
+    fn restore_leaves_a_container_before_image_alone_without_the_grant() {
+        let saved = [
+            Saved {
+                target: Target {
+                    domain: NC.into(),
+                    key: "widgets".into(),
+                    host: false,
+                },
+                value: Some(PValue::Dict(vec![(
+                    "instances".into(),
+                    PValue::Array(vec![PValue::Data(vec![42])]),
+                )])),
+                granted: true,
+            },
+            Saved {
+                target: Target::new("com.apple.WindowManager", "StandardHideWidgets"),
+                value: Some(PValue::Bool(false)),
+                granted: true,
+            },
+        ];
+        for full_disk_access in [None, Some(false), Some(true)] {
+            let root = aterm_tempfile::tempdir().expect("scratch");
+            save_backup(&root.path().join("original-preferences.json"), &saved).unwrap();
+            let (mut host, calls) = inert_host(full_disk_access, Vec::new);
+            let report = execute(&mut host, root.path(), Action::Restore).expect("restore");
+            let calls = calls.lock().unwrap().clone();
+            assert!(
+                calls
+                    .iter()
+                    .any(|call| call.contains("export com.apple.WindowManager")),
+                "{calls:?}"
+            );
+            assert!(
+                calls.iter().any(|call| call.ends_with(" Dock")),
+                "{calls:?}"
+            );
+            let row = report
+                .rows
+                .iter()
+                .find(|row| row.name == format!("{NC} widgets"))
+                .unwrap();
+            if full_disk_access == Some(true) {
+                assert_eq!(row.status, "error", "the inert system runs nothing");
+                assert!(
+                    calls.contains(&format!("{DEFAULTS} export {NC} -")),
+                    "{calls:?}"
+                );
+                assert!(
+                    calls
+                        .iter()
+                        .any(|call| call.ends_with(" NotificationCenter")),
+                    "{calls:?}"
+                );
+            } else {
+                // Nothing runs a Restore again by itself: the row carries what names that step.
+                assert_eq!(
+                    (row.status.as_str(), row.detail.as_str()),
+                    ("blocked", restore_waits(&saved[0].target).as_str()),
+                    "{}",
+                    report.to_text()
+                );
+                assert!(
+                    !calls.iter().any(|call| touches_notification_center(call)),
+                    "{calls:?}"
+                );
+                assert_eq!(
+                    load_backup(&root.path().join("original-preferences.json"))
+                        .unwrap()
+                        .len(),
+                    2,
+                    "the backup keeps it"
+                );
+            }
+        }
+    }
+
+    /// The files of `root` a follow-up must leave as they are: every record but the backup
+    /// and the follow-up's own, so no offer, countdown or question can follow from it.
+    fn setup_records(root: &Path) -> BTreeMap<String, Vec<u8>> {
+        std::fs::read_dir(root)
+            .unwrap()
+            .map(Result::unwrap)
+            .filter(|entry| entry.file_type().unwrap().is_file())
+            .map(|entry| {
+                (
+                    entry.file_name().to_string_lossy().into_owned(),
+                    std::fs::read(entry.path()).unwrap(),
+                )
+            })
+            .filter(|(name, _)| {
+                !["original-preferences.json", WITHHELD_RECORD].contains(&name.as_str())
+            })
+            .collect()
+    }
+
+    /// A setup pass without Full Disk Access leaves Notification Center's widgets alone and
+    /// records the widgets row for the follow-up, settled for the keys it reached; nothing
+    /// touches Notification Center while the grant is missing, however often it is asked.
+    /// Once the grant is held, the follow-up clears it and relaunches Notification Center
+    /// once, reads no other key (a person's change since stays theirs), relaunches no Dock and
+    /// writes no setup record, then has nothing left to do. Negative control: a pass that
+    /// held the grant clears them itself and leaves nothing to follow up.
+    #[test]
+    fn notification_center_waits_for_the_grant_and_is_cleared_once_silently_when_it_arrives() {
+        let mut widgets = Selection::none();
+        widgets.set(Setting::Widgets, true);
+
+        let root = aterm_tempfile::tempdir().unwrap();
+        authorize_automatic_setup_at(root.path(), widgets).unwrap();
+        let mut doctor = Withholding::widgets();
+        let report = doctor
+            .pass(root.path())
+            .unwrap()
+            .expect("the setup pass runs");
+        assert!(!report.needs_attention(), "{}", report.to_text());
+        assert_eq!(doctor.notification_center_writes(), 0);
+        assert!(!doctor.notification_center_cleared());
+        assert_eq!(Withholding::withheld(root.path()), [WIDGETS]);
+        assert!(
+            Automatic::load(root.path(), initial::revision_at(root.path()).unwrap())
+                .unwrap()
+                .settled
+                .contains(&WIDGETS.to_owned()),
+            "settled for the keys it reached"
+        );
+        // The person turns the Window Manager's key back since.
+        doctor.show_desktop_widgets();
+        let docks = doctor.dock_relaunches();
+        for unknown in [None, Some(false), None] {
+            doctor.host.full_disk_access = unknown;
+            assert!(doctor.follow_up(root.path()).unwrap().is_none());
+        }
+        assert_eq!(doctor.notification_center_writes(), 0);
+        let records = setup_records(root.path());
+
+        doctor.grant();
+        let follow_up = doctor
+            .follow_up(root.path())
+            .unwrap()
+            .expect("the grant is held");
+        assert!(!follow_up.needs_attention(), "{}", follow_up.to_text());
+        assert!(doctor.notification_center_cleared());
+        assert_eq!(doctor.notification_center_writes(), 1);
+        assert_eq!(doctor.notification_center_relaunches(), 1);
+        assert_eq!(doctor.dock_relaunches(), docks);
+        assert!(
+            doctor.desktop_widgets_shown(),
+            "the person's change stays theirs"
+        );
+        assert_eq!(setup_records(root.path()), records);
+        assert!(Withholding::withheld(root.path()).is_empty());
+        let backup = load_backup(&root.path().join("original-preferences.json")).unwrap();
+        let saved = backup.iter().find(|s| s.target == nc_widgets()).unwrap();
+        assert!(saved.granted && saved.value.as_ref().is_some_and(|v| v.same(&populated())));
+        assert!(doctor.follow_up(root.path()).unwrap().is_none(), "once");
+        assert_eq!(doctor.notification_center_writes(), 1);
+
+        // Negative control: the grant held from the first pass.
+        let root = aterm_tempfile::tempdir().unwrap();
+        authorize_automatic_setup_at(root.path(), widgets).unwrap();
+        let mut doctor = Withholding::widgets();
+        doctor.grant();
+        doctor
+            .pass(root.path())
+            .unwrap()
+            .expect("the setup pass runs");
+        assert!(doctor.notification_center_cleared());
+        assert_eq!(doctor.notification_center_writes(), 1);
+        assert!(Withholding::withheld(root.path()).is_empty());
+        assert!(doctor.follow_up(root.path()).unwrap().is_none());
+    }
+
+    /// The follow-up record drops what a pass reached as wanted and adds what it left a key
+    /// alone in: an item it ran that left one alone again (the widgets row writing the Window
+    /// Manager's keys without the grant) stays, and the record goes once nothing waits. A
+    /// recorded item whose change reached its keys and did not verify stays and spends a try
+    /// of its build; one left alone in that pass spends none. Negative control: an item a pass
+    /// reached as wanted is dropped, with its tries.
+    #[test]
+    fn the_follow_up_record_keeps_an_item_that_ran_but_left_a_key_alone_again() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let ids = |names: &[&str]| -> Vec<String> {
+            names.iter().map(|name| (*name).to_owned()).collect()
+        };
+        let turn = (BUILD, 60);
+        record_withheld(root.path(), &ids(&["a", "b"]), &[], &[], turn).unwrap();
+        record_withheld(
+            root.path(),
+            &ids(&["a", "c"]),
+            &ids(&["a", "b"]),
+            &ids(&["a"]),
+            turn,
+        )
+        .unwrap();
+        let record = load_withheld(root.path()).unwrap();
+        assert_eq!(record.items, ["a", "c"]);
+        assert!(record.failed.is_empty(), "{record:?}");
+        record_withheld(root.path(), &[], &[], &ids(&["c", "d"]), turn).unwrap();
+        let record = load_withheld(root.path()).unwrap();
+        assert_eq!(record.items, ["a", "c"]);
+        assert_eq!(
+            held_back(&record.failed, BUILD, 61),
+            [("c".to_owned(), Hold::Back(WAITING.into()))]
+        );
+        record_withheld(root.path(), &[], &ids(&["a", "c"]), &[], turn).unwrap();
+        assert!(!root.path().join(WITHHELD_RECORD).exists());
+    }
+
+    /// A setup retry with the grant leaves the widgets row a pass without it settled as it
+    /// is (the Dock never verifies, so setup still retries): the retry writes neither the
+    /// Window Manager's key nor Notification Center's list, and the record still names the
+    /// row; the follow-up after it clears Notification Center once and drops the record.
+    /// Negative control: without the grant the follow-up reaches nothing.
+    #[test]
+    fn a_retry_with_the_grant_leaves_the_settled_row_and_the_follow_up_reaches_what_it_left() {
+        let mut selected = Selection::none();
+        selected.set(Setting::Widgets, true);
+        selected.set(Setting::Dock, true);
+        for granted in [false, true] {
+            let root = aterm_tempfile::tempdir().unwrap();
+            authorize_automatic_setup_at(root.path(), selected).unwrap();
+            let mut doctor = Withholding::widgets_and_a_dock_that_never_verifies();
+            doctor
+                .pass(root.path())
+                .unwrap()
+                .expect("the setup pass runs");
+            assert_eq!(doctor.notification_center_writes(), 0);
+            if granted {
+                doctor.grant();
+            }
+            doctor.pass(root.path()).unwrap().expect("the retry runs");
+            assert_eq!(doctor.notification_center_writes(), 0);
+            assert_eq!(doctor.window_manager_writes(), 1);
+            assert_eq!(Withholding::withheld(root.path()), [WIDGETS]);
+            assert_eq!(doctor.follow_up(root.path()).unwrap().is_some(), granted);
+            assert_eq!(doctor.notification_center_cleared(), granted);
+            assert_eq!(doctor.notification_center_writes(), usize::from(granted));
+            assert_eq!(doctor.window_manager_writes(), 1);
+            assert_eq!(Withholding::withheld(root.path()).is_empty(), granted);
+        }
+    }
+
+    /// A follow-up whose Notification Center relaunch does not settle is rolled back and keeps
+    /// the row in the record, held (nothing written, relaunched or journaled for it) until
+    /// [`SECOND_TRY_AFTER`] has passed; its second try fails too, and it is held for good in
+    /// that build, while a new build tries once more and, verifying, drops it. Negative
+    /// controls: counting an attempt that did not verify as reached drops the record after
+    /// the first failure; a follow-up that holds nothing tries on every call.
+    #[test]
+    fn a_follow_up_that_does_not_verify_stays_recorded_and_is_tried_twice_per_build() {
+        let mut widgets = Selection::none();
+        widgets.set(Setting::Widgets, true);
+        let root = aterm_tempfile::tempdir().unwrap();
+        authorize_automatic_setup_at(root.path(), widgets).unwrap();
+        let mut doctor = Withholding::widgets();
+        doctor
+            .pass(root.path())
+            .unwrap()
+            .expect("the setup pass runs");
+        assert_eq!(Withholding::withheld(root.path()), [WIDGETS]);
+        doctor.grant();
+        doctor.host.failing = vec![nc_widgets()];
+        let tried = |doctor: &mut Withholding, root: &Path| {
+            let report = doctor.follow_up(root).unwrap().expect("the follow-up runs");
+            assert!(report.needs_attention(), "{}", report.to_text());
+            assert!(!doctor.notification_center_cleared(), "rolled back");
+            assert_eq!(Withholding::withheld(root), [WIDGETS]);
+        };
+        let held = |doctor: &mut Withholding, root: &Path, why: &str| {
+            let events = doctor.host.events.len();
+            let report = doctor.follow_up(root).unwrap().expect("the follow-up runs");
+            let row = report.rows.iter().find(|row| row.name == WIDGETS).unwrap();
+            assert_eq!((row.status.as_str(), row.detail.as_str()), ("blocked", why));
+            assert!(
+                doctor.host.events[events..].is_empty(),
+                "nothing written, relaunched or journaled: {:?}",
+                &doctor.host.events[events..]
+            );
+            assert_eq!(Withholding::withheld(root), [WIDGETS]);
+        };
+        tried(&mut doctor, root.path());
+        assert_eq!(
+            doctor.notification_center_writes(),
+            2,
+            "the try and its rollback"
+        );
+        doctor.wait(std::time::Duration::from_secs(5 * 60));
+        held(&mut doctor, root.path(), WAITING);
+        doctor.wait(SECOND_TRY_AFTER);
+        tried(&mut doctor, root.path());
+        assert_eq!(doctor.notification_center_writes(), 4);
+        for _ in 0..3 {
+            doctor.wait(SECOND_TRY_AFTER);
+            held(&mut doctor, root.path(), HELD);
+        }
+        // A new build's try, which verifies.
+        doctor.build = "1.0.1+gtest";
+        doctor.host.failing.clear();
+        let report = doctor
+            .follow_up(root.path())
+            .unwrap()
+            .expect("the follow-up runs");
+        assert!(!report.needs_attention(), "{}", report.to_text());
+        assert!(doctor.notification_center_cleared());
+        assert!(Withholding::withheld(root.path()).is_empty());
+        assert!(doctor.follow_up(root.path()).unwrap().is_none());
+    }
+
+    /// A finished setup's follow-up at launch holds the caller's busy slot for as long as it
+    /// may hold the profile lock: it takes the slot only once the record names something to
+    /// reach, setup is not stopped and the grant is held, the grant measured with neither the
+    /// slot nor the lock held; it takes the slot before the lock, and releases it after the
+    /// lock, once the follow-up ran. Negative controls: a slot taken with nothing owed, after a
+    /// Cancel or without the grant is counted (and a Cancel's host is never built); a grant
+    /// measured under the slot or the lock is seen so; one taken after the lock finds the lock
+    /// held; one dropped at once, or before the lock is released, finds the follow-up not yet
+    /// run or the lock still held.
+    #[test]
+    fn a_finished_setups_follow_up_holds_the_busy_slot_while_it_may_hold_the_profile_lock() {
+        use std::cell::{Cell, RefCell};
+        /// The slot: at its release, whether the profile lock was free and the record empty.
+        struct Slot<'a> {
+            root: &'a Path,
+            released: &'a RefCell<Vec<(bool, bool)>>,
+        }
+        impl Drop for Slot<'_> {
+            fn drop(&mut self) {
+                let free = HeldLock::try_take(self.root).is_ok_and(|lock| lock.is_some());
+                let ran = load_withheld(self.root).is_ok_and(|record| record.items.is_empty());
+                self.released.borrow_mut().push((free, ran));
+            }
+        }
+        let mut widgets = Selection::none();
+        widgets.set(Setting::Widgets, true);
+        let root = aterm_tempfile::tempdir().unwrap();
+        authorize_automatic_setup_at(root.path(), widgets).unwrap();
+        let taken = RefCell::new(Vec::new());
+        let released = RefCell::new(Vec::new());
+        let reserve = || {
+            taken
+                .borrow_mut()
+                .push(HeldLock::try_take(root.path()).is_ok_and(|lock| lock.is_some()));
+            Slot {
+                root: root.path(),
+                released: &released,
+            }
+        };
+        let built = Cell::new(0);
+        // At each measure of the grant: how many slots were taken, and whether the lock was free.
+        let probed = RefCell::new(Vec::new());
+        let host = |full_disk_access| {
+            built.set(built.get() + 1);
+            probed.borrow_mut().push((
+                taken.borrow().len(),
+                HeldLock::try_take(root.path()).is_ok_and(|lock| lock.is_some()),
+            ));
+            Ok(Fake {
+                notification_center: true,
+                values: BTreeMap::from([(nc_widgets(), populated())]),
+                full_disk_access,
+                ..Fake::default()
+            })
+        };
+        let now = std::time::SystemTime::now();
+        assert!(
+            follow_up_finished_at(root.path(), reserve, || host(Some(true)), BUILD, now)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            (taken.borrow().len(), built.get()),
+            (0, 0),
+            "nothing owed: no slot, no grant measured"
+        );
+        record_withheld(root.path(), &[WIDGETS.to_owned()], &[], &[], (BUILD, 0)).unwrap();
+        for full_disk_access in [None, Some(false)] {
+            assert!(
+                follow_up_finished_at(root.path(), reserve, || host(full_disk_access), BUILD, now)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        assert_eq!(taken.borrow().len(), 0, "no grant: no slot");
+        let report = follow_up_finished_at(root.path(), reserve, || host(Some(true)), BUILD, now)
+            .unwrap()
+            .expect("the follow-up runs");
+        assert!(!report.needs_attention(), "{}", report.to_text());
+        assert_eq!(*taken.borrow(), [true], "the slot, before the lock");
+        assert_eq!(
+            *probed.borrow(),
+            [(0, true); 3],
+            "the grant measured before the slot and the lock"
+        );
+        assert_eq!(
+            *released.borrow(),
+            [(true, true)],
+            "the slot, after the follow-up and its lock"
+        );
+        // A cancelled setup's record is never followed up: no host, no slot.
+        record_withheld(root.path(), &[WIDGETS.to_owned()], &[], &[], (BUILD, 0)).unwrap();
+        cancel_automatic_setup_at(root.path()).unwrap();
+        let unbuilt = || -> Result<Fake, String> { panic!("a stopped setup measures nothing") };
+        assert!(
+            follow_up_finished_at(root.path(), reserve, unbuilt, BUILD, now)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(taken.borrow().len(), 1, "a stopped setup takes no slot");
+        assert_eq!(
+            Withholding::withheld(root.path()),
+            [WIDGETS],
+            "the record stays"
+        );
+        // A completed setup, which is when a launch calls it, is followed up.
+        let done = aterm_tempfile::tempdir().unwrap();
+        write_json(
+            &done.path().join("first-run.json"),
+            &json!({ "profile": PROFILE, "state": "applied", "accounts_verified": true }),
+        )
+        .unwrap();
+        assert!(first_run_complete(done.path()).unwrap());
+        record_withheld(done.path(), &[WIDGETS.to_owned()], &[], &[], (BUILD, 0)).unwrap();
+        let report = follow_up_finished_at(done.path(), || (), || host(Some(true)), BUILD, now)
+            .unwrap()
+            .expect("a completed setup's follow-up runs");
+        assert!(!report.needs_attention(), "{}", report.to_text());
+        assert!(Withholding::withheld(done.path()).is_empty());
+    }
+
+    /// Nothing is followed up once the person restored or cancelled setup (still running:
+    /// the Dock never verifies), or unchecked the widgets row in a later choice, even with
+    /// the grant; a Restore drops the record. Negative control: without any of them, the
+    /// same follow-up clears the widgets.
+    #[test]
+    fn nothing_is_followed_up_after_setup_was_restored_or_cancelled() {
+        let mut selected = Selection::none();
+        selected.set(Setting::Widgets, true);
+        selected.set(Setting::Dock, true);
+        let mut dock = Selection::none();
+        dock.set(Setting::Dock, true);
+        for stop in ["restore", "cancel", "unchecked", "none"] {
+            let root = aterm_tempfile::tempdir().unwrap();
+            authorize_automatic_setup_at(root.path(), selected).unwrap();
+            let mut doctor = Withholding::widgets();
+            doctor.host.failing = vec![wanted()[0].0.clone()];
+            doctor
+                .pass(root.path())
+                .unwrap()
+                .expect("the setup pass runs");
+            assert!(!first_run_complete(root.path()).unwrap());
+            match stop {
+                "restore" => {
+                    execute(&mut doctor.host, root.path(), Action::Restore).unwrap();
+                    assert!(Withholding::withheld(root.path()).is_empty());
+                }
+                "cancel" => cancel_automatic_setup_at(root.path()).unwrap(),
+                "unchecked" => save_automatic_plan(root.path(), dock).unwrap(),
+                _ => {}
+            }
+            doctor.grant();
+            let follow_up = doctor.follow_up(root.path()).unwrap();
+            assert_eq!(follow_up.is_some(), stop == "none", "{stop}");
+            assert_eq!(
+                doctor.notification_center_cleared(),
+                stop == "none",
+                "{stop}"
+            );
+        }
+    }
+
+    /// A before-image an earlier aterm saved of Notification Center's widget list without a
+    /// grant field reads as granted only when it holds a value: an absence it saved may be
+    /// macOS hiding the container. A Restore, with the grant or without, neither deletes such
+    /// a key nor relaunches Notification Center for it, and its row says its original is
+    /// unknown ([`unknown_original`]), never to grant the app and run Restore again
+    /// ([`restore_waits`]), which would put nothing back. Negative controls: an absence read
+    /// with the grant is the original, and the Restore reaches Notification Center; asking
+    /// for the grant before the record (the old order in `restore`) sends the person
+    /// without it to a Restore that cannot work.
+    #[test]
+    fn a_restore_never_deletes_what_a_read_without_the_grant_saved_as_absent() {
+        let backup_of = |widgets: Value| {
+            json!({ "profile": PROFILE, "keys": [
+                widgets,
+                { "domain": "com.apple.WindowManager", "key": "StandardHideWidgets",
+                  "host": false, "xml": plist::document(&PValue::Bool(false)) },
+            ] })
+        };
+        let legacy =
+            |xml: Value| json!({ "domain": NC, "key": "widgets", "host": false, "xml": xml });
+        let root = aterm_tempfile::tempdir().unwrap();
+        let backup = root.path().join("original-preferences.json");
+        write_json(
+            &backup,
+            &backup_of(legacy(json!(plist::document(&populated())))),
+        )
+        .unwrap();
+        assert!(
+            load_backup(&backup)
+                .unwrap()
+                .iter()
+                .all(|saved| saved.granted)
+        );
+        for (granted, full_disk_access) in [
+            (false, None),
+            (false, Some(false)),
+            (false, Some(true)),
+            (true, Some(true)),
+        ] {
+            let root = aterm_tempfile::tempdir().unwrap();
+            let backup = root.path().join("original-preferences.json");
+            let widgets = if granted {
+                json!({ "domain": NC, "key": "widgets", "host": false, "xml": null, "granted": true })
+            } else {
+                legacy(Value::Null)
+            };
+            write_json(&backup, &backup_of(widgets)).unwrap();
+            let saved = load_backup(&backup).unwrap();
+            assert_eq!(saved[0].granted, granted);
+            assert!(saved[1].granted);
+            let (mut host, calls) = inert_host(full_disk_access, Vec::new);
+            let report = execute(&mut host, root.path(), Action::Restore).expect("restore");
+            let calls = calls.lock().unwrap().clone();
+            assert!(
+                calls
+                    .iter()
+                    .any(|call| call.contains("export com.apple.WindowManager")),
+                "{calls:?}"
+            );
+            let row = report
+                .rows
+                .iter()
+                .find(|row| row.name == format!("{NC} widgets"))
+                .unwrap();
+            if granted {
+                assert_eq!(row.status, "error", "the inert system runs nothing");
+                assert!(
+                    calls.iter().any(|call| touches_notification_center(call)),
+                    "{calls:?}"
+                );
+            } else {
+                assert_eq!(
+                    (row.status.as_str(), Some(row.detail.clone())),
+                    ("blocked", unknown_original(&saved[0])),
+                    "{full_disk_access:?}"
+                );
+                assert!(
+                    !calls.iter().any(|call| touches_notification_center(call)),
+                    "{calls:?}"
+                );
+            }
+        }
+    }
+
+    /// The first read with the grant replaces a before-image saved without it, so a Restore
+    /// puts back the widgets the person had. Negative control: a before-image read with the
+    /// grant is the original, and no later read replaces it.
+    #[test]
+    fn the_first_read_with_the_grant_replaces_a_before_image_the_denial_wrote() {
+        let mut widgets = Selection::none();
+        widgets.set(Setting::Widgets, true);
+        let other = PValue::Dict(vec![("vers".into(), PValue::Int(2))]);
+        for (old, original) in [
+            (
+                Saved {
+                    target: nc_widgets(),
+                    value: None,
+                    granted: false,
+                },
+                populated(),
+            ),
+            (
+                Saved {
+                    target: nc_widgets(),
+                    value: Some(other.clone()),
+                    granted: true,
+                },
+                other.clone(),
+            ),
+        ] {
+            let root = aterm_tempfile::tempdir().unwrap();
+            let backup = root.path().join("original-preferences.json");
+            save_backup(&backup, &[old]).unwrap();
+            let mut host = Fake {
+                selected: Some(widgets),
+                notification_center: true,
+                full_disk_access: Some(true),
+                values: BTreeMap::from([(nc_widgets(), populated())]),
+                ..Fake::default()
+            };
+            let report = execute(&mut host, root.path(), Action::Apply).unwrap();
+            assert!(!report.needs_attention(), "{}", report.to_text());
+            assert!(
+                host.values
+                    .get(&nc_widgets())
+                    .is_some_and(|now| now.same(&cleared()))
+            );
+            let saved = load_backup(&backup).unwrap();
+            let nc = saved.iter().find(|s| s.target == nc_widgets()).unwrap();
+            assert!(nc.granted);
+            assert!(nc.value.as_ref().is_some_and(|v| v.same(&original)));
+            execute(&mut host, root.path(), Action::Restore).unwrap();
+            assert!(
+                host.values
+                    .get(&nc_widgets())
+                    .is_some_and(|now| now.same(&original))
+            );
+        }
+    }
+
+    /// A before-image of Notification Center's widget list read with the grant and found
+    /// absent is the original, and the backup says it was read with the grant: the next
+    /// apply with the grant keeps that absence (it does not take the list it reads now for
+    /// the original), and a Restore with the grant deletes the key, as `defaults delete`.
+    /// Negative control: a backup that does not keep the grant reads that absence as macOS
+    /// hiding the container, so the apply replaces it and the Restore puts the widgets back.
+    #[test]
+    fn a_granted_absence_is_kept_by_the_backup_and_restored_by_deleting_the_key() {
+        let mut widgets = Selection::none();
+        widgets.set(Setting::Widgets, true);
+        let root = aterm_tempfile::tempdir().unwrap();
+        let backup = root.path().join("original-preferences.json");
+        save_backup(
+            &backup,
+            &[Saved {
+                target: nc_widgets(),
+                value: None,
+                granted: true,
+            }],
+        )
+        .unwrap();
+        let mut host = Fake {
+            selected: Some(widgets),
+            notification_center: true,
+            full_disk_access: Some(true),
+            values: BTreeMap::from([(nc_widgets(), populated())]),
+            ..Fake::default()
+        };
+        let report = execute(&mut host, root.path(), Action::Apply).unwrap();
+        assert!(!report.needs_attention(), "{}", report.to_text());
+        let saved = load_backup(&backup).unwrap();
+        let nc = saved.iter().find(|s| s.target == nc_widgets()).unwrap();
+        assert!(
+            nc.granted && nc.value.is_none(),
+            "the recorded absence stays"
+        );
+        let report = execute(&mut host, root.path(), Action::Restore).unwrap();
+        let row = report
+            .rows
+            .iter()
+            .find(|row| row.name == nc_widgets().describe())
+            .unwrap();
+        assert_eq!(row.status, "restored", "{}", report.to_text());
+        assert!(!host.values.contains_key(&nc_widgets()), "deleted");
+    }
+
+    /// A relaunch of Notification Center an earlier pass owed (pending-refresh.json) waits
+    /// for the grant: a pass or a Restore without it does not relaunch it and keeps the
+    /// record, and a check says it waits rather than calling it drift. Negative control: the
+    /// first pass with the grant relaunches Notification Center and clears the record.
+    #[test]
+    fn a_notification_center_relaunch_owed_waits_for_the_grant_instead_of_being_dropped() {
+        let activation_rows = |report: &Report| -> Vec<String> {
+            report
+                .rows
+                .iter()
+                .filter(|row| row.name == "Preference activation")
+                .map(|row| row.status.clone())
+                .collect()
+        };
+        for unknown in [None, Some(false)] {
+            let root = aterm_tempfile::tempdir().unwrap();
+            save_pending_refresh(root.path(), &[nc_widgets()]).unwrap();
+            let mut host = Fake {
+                full_disk_access: unknown,
+                ..Fake::default()
+            };
+            let check = execute(&mut host, root.path(), Action::Check).unwrap();
+            assert_eq!(activation_rows(&check), ["blocked"], "{}", check.to_text());
+            execute(&mut host, root.path(), Action::Apply).unwrap();
+            execute(&mut host, root.path(), Action::Restore).unwrap();
+            assert!(
+                !host.restarts.iter().any(|p| p == "NotificationCenter"),
+                "{:?}",
+                host.restarts
+            );
+            assert_eq!(pending_refresh(root.path()).unwrap(), [nc_widgets()]);
+
+            host.full_disk_access = Some(true);
+            let check = execute(&mut host, root.path(), Action::Check).unwrap();
+            assert_eq!(activation_rows(&check), ["drift"], "{}", check.to_text());
+            execute(&mut host, root.path(), Action::Apply).unwrap();
+            assert_eq!(
+                host.restarts
+                    .iter()
+                    .filter(|p| *p == "NotificationCenter")
+                    .count(),
+                1,
+                "{:?}",
+                host.restarts
+            );
+            assert!(pending_refresh(root.path()).unwrap().is_empty());
+        }
+    }
+
+    /// A shared item that changes Notification Center's widget list and never verifies,
+    /// whose before-image the doctor's rollback would put back.
+    struct Contained;
+
+    impl aterm_machines::items::Item for Contained {
+        fn id(&self) -> String {
+            "init.test.contained".into()
+        }
+        fn family(&self) -> &'static str {
+            "test"
+        }
+        fn title(&self) -> String {
+            "init.test.contained".into()
+        }
+        fn probe(
+            &self,
+            _: &dyn System,
+            _: &aterm_machines::items::Ctx,
+        ) -> aterm_machines::model::Probe {
+            aterm_machines::model::Probe::Change {
+                from: "a".into(),
+                to: "b".into(),
+            }
+        }
+        fn apply(&self, _: &dyn System, _: &aterm_machines::items::Ctx) -> Result<(), String> {
+            Ok(())
+        }
+        fn preference_changes(
+            &self,
+            _: &dyn System,
+            _: &aterm_machines::items::Ctx,
+        ) -> Result<
+            Vec<(
+                aterm_machines::items::defaults::Target,
+                aterm_machines::model::Read<PValue>,
+            )>,
+            String,
+        > {
+            let alice = aterm_machines::model::User {
+                name: "alice".into(),
+                uid: 501,
+                gid: 20,
+                home: "/Users//alice".into(),
+                shell: "/bin/zsh".into(),
+                admin: false,
+            };
+            Ok(vec![(
+                aterm_machines::items::defaults::Target::user(NC, "widgets", &alice),
+                aterm_machines::model::Read::Absent,
+            )])
+        }
+    }
+
+    /// A shared item already as wanted that, when `.0`, left a key of another app's
+    /// container alone for want of Full Disk Access ([`aterm_machines::items::Item::withheld`]).
+    struct LeftAlone(bool);
+
+    impl aterm_machines::items::Item for LeftAlone {
+        fn id(&self) -> String {
+            "init.test.left-alone".into()
+        }
+        fn family(&self) -> &'static str {
+            "test"
+        }
+        fn title(&self) -> String {
+            "init.test.left-alone".into()
+        }
+        fn probe(
+            &self,
+            _: &dyn System,
+            _: &aterm_machines::items::Ctx,
+        ) -> aterm_machines::model::Probe {
+            aterm_machines::model::Probe::Ok { now: "b".into() }
+        }
+        fn apply(&self, _: &dyn System, _: &aterm_machines::items::Ctx) -> Result<(), String> {
+            Ok(())
+        }
+        fn withheld(&self) -> Option<String> {
+            self.0.then(|| "waits for Full Disk Access".into())
+        }
+    }
+
+    /// The doctor counts settled a row that left a key alone for want of Full Disk Access,
+    /// for the keys it reached, and records it for the follow-up. Negative control: the same
+    /// row with every key reached is settled and leaves nothing to follow up.
+    #[test]
+    fn a_row_that_left_a_key_alone_is_settled_and_recorded_for_the_follow_up() {
+        let item = "init.test.left-alone".to_owned();
+        for left_alone in [true, false] {
+            let root = aterm_tempfile::tempdir().expect("scratch");
+            let items: fn() -> Vec<Box<dyn aterm_machines::items::Item>> = if left_alone {
+                || vec![Box::new(LeftAlone(true))]
+            } else {
+                || vec![Box::new(LeftAlone(false))]
+            };
+            let (mut host, _) = inert_host(None, items);
+            let pass =
+                execute_pass(&mut host, root.path(), Action::Apply, BUILD, 0).expect("apply");
+            let row = pass
+                .report
+                .rows
+                .iter()
+                .find(|row| row.name == item)
+                .unwrap();
+            assert_eq!(row.status, "ok", "{}", pass.report.to_text());
+            assert!(pass.settled.contains(&item));
+            assert_eq!(
+                load_withheld(root.path()).unwrap().items.contains(&item),
+                left_alone
+            );
+        }
+    }
+
+    /// A widgets row as the shared item is one: the Window Manager's key and Notification
+    /// Center's list in one item, which without Full Disk Access reaches the Window
+    /// Manager's alone and says it left the other ([`aterm_machines::items::Item::withheld`]),
+    /// and with it reads and clears both; a follow-up's ([`WorkstationGroup::Withheld`])
+    /// reaches Notification Center's alone. Its clones share the keys (whether the desktop
+    /// widgets are hidden, whether Notification Center's list is cleared) and the grant, and
+    /// count the applies that hid the desktop widgets.
+    #[derive(Clone, Default)]
+    struct Bundled {
+        hidden: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        applies: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        granted: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        cleared: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        contained_only: bool,
+    }
+
+    impl Bundled {
+        /// Whether `flag` is set.
+        fn on(flag: &std::sync::atomic::AtomicBool) -> bool {
+            flag.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl aterm_machines::items::Item for Bundled {
+        fn id(&self) -> String {
+            WIDGETS.into()
+        }
+        fn family(&self) -> &'static str {
+            "widgets"
+        }
+        fn title(&self) -> String {
+            WIDGETS.into()
+        }
+        fn probe(
+            &self,
+            _: &dyn System,
+            _: &aterm_machines::items::Ctx,
+        ) -> aterm_machines::model::Probe {
+            use aterm_machines::model::Probe;
+            let mut from = Vec::new();
+            if !self.contained_only && !Self::on(&self.hidden) {
+                from.push("com.apple.WindowManager StandardHideWidgets".to_owned());
+            }
+            if Self::on(&self.granted) && !Self::on(&self.cleared) {
+                from.push(format!("{NC} widgets"));
+            }
+            if from.is_empty() {
+                Probe::Ok {
+                    now: "hidden".into(),
+                }
+            } else {
+                Probe::Change {
+                    from: from.join(", "),
+                    to: "hidden".into(),
+                }
+            }
+        }
+        fn apply(&self, _: &dyn System, _: &aterm_machines::items::Ctx) -> Result<(), String> {
+            if !self.contained_only {
+                self.applies
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                self.hidden.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            if Self::on(&self.granted) {
+                self.cleared
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            Ok(())
+        }
+        fn withheld(&self) -> Option<String> {
+            (!Self::on(&self.granted))
+                .then(|| "Notification Center's wait for Full Disk Access".into())
+        }
+    }
+
+    /// The worker's own entry over the doctor's own host ([`NativeHost`], on an [`Inert`]
+    /// system without Full Disk Access): a widgets row that left Notification Center alone is
+    /// settled for the Window Manager's key it hid, so while setup keeps retrying (the Dock
+    /// never verifies) no retry hides the desktop widgets again once the person shows them,
+    /// and its row says it is left as the person set it; the record still names the row for
+    /// the follow-up. Negative control: not counting a withheld row settled
+    /// (`NativeHost::workstation`) hides them again on every retry.
+    #[test]
+    fn a_withheld_row_is_left_as_the_person_set_it_by_every_later_automatic_pass() {
+        let root = aterm_tempfile::tempdir().expect("scratch");
+        let mut selected = Selection::none();
+        selected.set(Setting::Widgets, true);
+        selected.set(Setting::Dock, true);
+        authorize_automatic_setup_at(root.path(), selected).unwrap();
+        let widgets = Bundled::default();
+        let never = Scripted::new("init.test.never", &[false]);
+        let items = (widgets.clone(), never.clone());
+        let mut host = NativeHost::over(
+            Box::new(Inert::default()),
+            Box::new(move |_, group, _| {
+                Ok(Workstation::of(if group == WorkstationGroup::Preferences {
+                    vec![
+                        Box::new(items.0.clone()) as Box<dyn aterm_machines::items::Item>,
+                        Box::new(items.1.clone()),
+                    ]
+                } else {
+                    Vec::new()
+                }))
+            }),
+        );
+        let tick = |host: &mut NativeHost, minute: u64| -> Report {
+            apply_on_first_run_with(root.path(), &Inert::default(), host, BUILD, at(minute))
+                .expect("tick")
+                .expect("setup still runs")
+        };
+        tick(&mut host, 0);
+        assert_eq!(widgets.applies.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(load_withheld(root.path()).unwrap().items, [WIDGETS]);
+        // The person shows their desktop widgets again.
+        widgets
+            .hidden
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        for minute in 1..30 {
+            let report = tick(&mut host, minute);
+            let row = report.rows.iter().find(|row| row.name == WIDGETS).unwrap();
+            assert_eq!(row.status, "ok", "minute {minute}: {}", report.to_text());
+            assert!(row.detail.ends_with(SETTLED), "{}", row.detail);
+        }
+        assert_eq!(
+            widgets.applies.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the person's change stays theirs"
+        );
+        assert!(!widgets.hidden.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(
+            never.applies(),
+            2,
+            "the Dock's two tries, and setup still retries"
+        );
+        assert!(!first_run_complete(root.path()).unwrap());
+        assert_eq!(load_withheld(root.path()).unwrap().items, [WIDGETS]);
+    }
+
+    /// Over the doctor's own host, each tick's anew as the worker's is (its grant measured
+    /// again): the grant arrives after a pass without it settled the widgets row, while setup
+    /// keeps retrying (the Dock never verifies). The next pass holds the row as it is and
+    /// reads Notification Center's list too: the row is `ok` and says that list is the
+    /// follow-up's ([`SETTLED_OWED`]), not that aterm set it and it changed since, and the
+    /// record still names the row, since a pass that held it did not reach it as wanted;
+    /// nothing hides the desktop widgets again once the person shows them. The follow-up then
+    /// clears Notification Center alone and drops the record, and the row says [`SETTLED`],
+    /// true of the Window Manager's key the person changed. Negative controls: holding every
+    /// settled item with [`SETTLED`] (`Automatic::holds` ignoring what is owed) fails the
+    /// row's words; `NativeHost::held` naming nothing drops the record on the granted tick.
+    #[test]
+    fn the_grant_after_a_withheld_row_settled_leaves_it_owed_to_the_follow_up_and_says_so() {
+        let root = aterm_tempfile::tempdir().expect("scratch");
+        let mut selected = Selection::none();
+        selected.set(Setting::Widgets, true);
+        selected.set(Setting::Dock, true);
+        authorize_automatic_setup_at(root.path(), selected).unwrap();
+        let widgets = Bundled::default();
+        let never = Scripted::new("init.test.never", &[false]);
+        let host = |full_disk_access: Option<bool>| {
+            let items = (widgets.clone(), never.clone());
+            NativeHost::over(
+                Box::new(Inert {
+                    full_disk_access,
+                    ..Inert::default()
+                }),
+                Box::new(move |_, group, _| {
+                    Ok(Workstation::of(match group {
+                        WorkstationGroup::Preferences => vec![
+                            Box::new(items.0.clone()) as Box<dyn aterm_machines::items::Item>,
+                            Box::new(items.1.clone()),
+                        ],
+                        WorkstationGroup::Withheld => vec![Box::new(Bundled {
+                            contained_only: true,
+                            ..items.0.clone()
+                        })],
+                        _ => Vec::new(),
+                    }))
+                }),
+            )
+        };
+        let row = |full_disk_access: Option<bool>, minute: u64| -> (String, String) {
+            let report = apply_on_first_run_with(
+                root.path(),
+                &Inert::default(),
+                &mut host(full_disk_access),
+                BUILD,
+                at(minute),
+            )
+            .expect("tick")
+            .expect("setup still runs");
+            let row = report.rows.iter().find(|row| row.name == WIDGETS).unwrap();
+            (row.status.clone(), row.detail.clone())
+        };
+        let applies = || widgets.applies.load(std::sync::atomic::Ordering::SeqCst);
+        let window_manager = "com.apple.WindowManager StandardHideWidgets";
+        let notification_center = format!("{NC} widgets");
+
+        row(None, 0);
+        assert_eq!(applies(), 1);
+        assert_eq!(load_withheld(root.path()).unwrap().items, [WIDGETS]);
+        widgets
+            .granted
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            row(Some(true), 1),
+            (
+                "ok".into(),
+                format!("{notification_center}; left as it is: {SETTLED_OWED}")
+            )
+        );
+        assert_eq!(
+            load_withheld(root.path()).unwrap().items,
+            [WIDGETS],
+            "a held row is not reached: the follow-up still owes Notification Center"
+        );
+        // The person shows their desktop widgets again.
+        widgets
+            .hidden
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            row(Some(true), 2),
+            (
+                "ok".into(),
+                format!("{window_manager}, {notification_center}; left as it is: {SETTLED_OWED}")
+            )
+        );
+        assert_eq!(applies(), 1, "the person's change stays theirs");
+
+        let follow_up = follow_up_at(root.path(), &mut host(Some(true)), BUILD, at(3))
+            .unwrap()
+            .expect("the grant is held");
+        assert!(!follow_up.needs_attention(), "{}", follow_up.to_text());
+        assert!(Bundled::on(&widgets.cleared));
+        assert!(!Bundled::on(&widgets.hidden));
+        assert!(load_withheld(root.path()).unwrap().items.is_empty());
+        assert_eq!(
+            row(Some(true), 4),
+            (
+                "ok".into(),
+                format!("{window_manager}; left as it is: {SETTLED}")
+            )
+        );
+        assert_eq!(applies(), 1);
+        assert_eq!(
+            never.applies(),
+            1,
+            "the Dock's first try; its second is not due"
+        );
+    }
+
+    /// Over the doctor's own host, whose engine lists a row that leaves Notification Center
+    /// alone as withheld whether or not the pass holds it: once Notification Center's widget
+    /// list was cleared (by a pass with the grant, or by the follow-up) and the person added
+    /// a widget back, a pass without the grant (another build taking a turn, say, or a grant
+    /// read as not measured) holds the settled row as it is and does not record it again,
+    /// so the next follow-up with the grant has nothing to do and the person's widget stays,
+    /// as does the next pass's. Negative control: recording every withheld row, held or not,
+    /// has that follow-up clear the person's widget.
+    #[test]
+    fn a_pass_without_the_grant_never_records_again_a_row_it_held() {
+        let mut selected = Selection::none();
+        selected.set(Setting::Widgets, true);
+        selected.set(Setting::Dock, true);
+        for cleared_by in ["a pass with the grant", "the follow-up"] {
+            let root = aterm_tempfile::tempdir().expect("scratch");
+            authorize_automatic_setup_at(root.path(), selected).unwrap();
+            let widgets = Bundled::default();
+            let never = Scripted::new("init.test.never", &[false]);
+            let host = |full_disk_access: Option<bool>| {
+                widgets.granted.store(
+                    full_disk_access == Some(true),
+                    std::sync::atomic::Ordering::SeqCst,
+                );
+                let items = (widgets.clone(), never.clone());
+                NativeHost::over(
+                    Box::new(Inert {
+                        full_disk_access,
+                        ..Inert::default()
+                    }),
+                    Box::new(move |_, group, _| {
+                        Ok(Workstation::of(match group {
+                            WorkstationGroup::Preferences => vec![
+                                Box::new(items.0.clone()) as Box<dyn aterm_machines::items::Item>,
+                                Box::new(items.1.clone()),
+                            ],
+                            WorkstationGroup::Withheld => vec![Box::new(Bundled {
+                                contained_only: true,
+                                ..items.0.clone()
+                            })],
+                            _ => Vec::new(),
+                        }))
+                    }),
+                )
+            };
+            let tick = |full_disk_access: Option<bool>, build: &str, minute: u64| {
+                apply_on_first_run_with(
+                    root.path(),
+                    &Inert::default(),
+                    &mut host(full_disk_access),
+                    build,
+                    at(minute),
+                )
+                .expect("tick")
+                .expect("setup still runs")
+            };
+            if cleared_by == "the follow-up" {
+                tick(None, BUILD, 0);
+                assert_eq!(load_withheld(root.path()).unwrap().items, [WIDGETS]);
+                follow_up_at(root.path(), &mut host(Some(true)), BUILD, at(1))
+                    .unwrap()
+                    .expect("the grant is held");
+            } else {
+                tick(Some(true), BUILD, 0);
+            }
+            assert!(Bundled::on(&widgets.cleared), "{cleared_by}");
+            assert!(load_withheld(root.path()).unwrap().items.is_empty());
+            // The person adds a widget back.
+            widgets
+                .cleared
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+
+            let report = tick(None, "1.0.1+gtest", 2);
+            let row = report.rows.iter().find(|row| row.name == WIDGETS).unwrap();
+            assert_eq!(row.status, "ok", "{cleared_by}: {}", report.to_text());
+            assert!(
+                load_withheld(root.path()).unwrap().items.is_empty(),
+                "{cleared_by}: a held row is not recorded again"
+            );
+            assert!(
+                follow_up_at(root.path(), &mut host(Some(true)), BUILD, at(3))
+                    .unwrap()
+                    .is_none(),
+                "{cleared_by}"
+            );
+            tick(Some(true), BUILD, 4);
+            assert!(
+                !Bundled::on(&widgets.cleared),
+                "{cleared_by}: the person's widget stays theirs"
+            );
+            assert_eq!(widgets.applies.load(std::sync::atomic::Ordering::SeqCst), 1);
+        }
+    }
+
+    /// The rollback of a change that did not verify skips a before-image of another app's
+    /// container while the pass holds no Full Disk Access: a `blocked` rollback row names
+    /// the grant, and nothing reads, writes or relaunches Notification Center. Negative
+    /// control: with the grant the rollback reads Notification Center's domain.
+    #[test]
+    fn the_rollback_leaves_a_container_before_image_alone_without_the_grant() {
+        for full_disk_access in [None, Some(false), Some(true)] {
+            let root = aterm_tempfile::tempdir().expect("scratch");
+            let (mut host, calls) = inert_host(full_disk_access, || vec![Box::new(Contained)]);
+            let report = execute(&mut host, root.path(), Action::Apply).expect("apply");
+            let item = report
+                .rows
+                .iter()
+                .find(|row| row.name == "init.test.contained")
+                .unwrap();
+            assert_eq!(item.status, "error", "{}", report.to_text());
+            let calls = calls.lock().unwrap().clone();
+            if full_disk_access == Some(true) {
+                assert!(
+                    calls.contains(&format!("{DEFAULTS} export {NC} -")),
+                    "{calls:?}"
+                );
+            } else {
+                assert!(
+                    report
+                        .rows
+                        .iter()
+                        .any(|row| row.name == "Preference rollback"
+                            && row.status == "blocked"
+                            && row.detail.contains("Full Disk Access")),
+                    "{}",
+                    report.to_text()
+                );
+                assert!(
+                    !calls.iter().any(|call| touches_notification_center(call)),
+                    "{calls:?}"
+                );
             }
         }
     }
@@ -2305,6 +4394,30 @@ mod tests {
         );
     }
 
+    /// Notification Center's widget list, a key of another app's container.
+    pub(super) fn nc_widgets() -> Target {
+        Target::new(NC, "widgets")
+    }
+
+    /// A widget list with a widget in it.
+    fn populated() -> PValue {
+        PValue::Dict(vec![
+            ("vers".into(), PValue::Int(1)),
+            (
+                "instances".into(),
+                PValue::Array(vec![PValue::Data(vec![42])]),
+            ),
+        ])
+    }
+
+    /// A widget list with no widget.
+    fn cleared() -> PValue {
+        PValue::Dict(vec![
+            ("vers".into(), PValue::Int(1)),
+            ("instances".into(), PValue::Array(Vec::new())),
+        ])
+    }
+
     fn wanted() -> Vec<(Target, PValue)> {
         vec![
             (
@@ -2322,6 +4435,9 @@ mod tests {
         fn selection(&self) -> Selection {
             self.selected.unwrap_or_default()
         }
+        fn full_disk_access(&self) -> Option<bool> {
+            self.full_disk_access
+        }
         fn select(&mut self, selected: Selection) {
             self.selected = Some(selected.workstation());
         }
@@ -2331,8 +4447,14 @@ mod tests {
         fn settled(&mut self) -> Vec<String> {
             std::mem::take(&mut self.settled)
         }
+        fn withheld(&mut self) -> Vec<String> {
+            std::mem::take(&mut self.withheld)
+        }
         fn hold(&mut self, items: &[(String, Hold)]) {
             self.held = items.to_vec();
+        }
+        fn held(&self) -> Vec<String> {
+            self.held.iter().map(|(item, _)| item.clone()).collect()
         }
         fn journal(
             &mut self,
@@ -2364,25 +4486,24 @@ mod tests {
             );
             self.put(target, value)
         }
-        fn preference_changes(&mut self) -> Result<Vec<Saved>, String> {
+        fn preference_changes(&mut self, group: WorkstationGroup) -> Result<Vec<Saved>, String> {
             self.preference_passes += 1;
             self.attempts.clear();
             self.settled.clear();
-            Ok(wanted()
+            self.withheld.clear();
+            Ok(self
+                .wants()
                 .into_iter()
-                .filter(|(target, _)| {
-                    self.selection()
-                        .contains(if target.domain == "com.apple.dock" {
-                            Setting::Dock
-                        } else {
-                            Setting::Widgets
-                        })
-                })
+                // A follow-up reaches another app's container alone, and only with the grant.
+                .filter(|(target, _)| group != WorkstationGroup::Withheld || contained(target))
+                .filter(|(target, _)| self.reaches(target))
+                .filter(|(target, _)| self.selection().contains(Self::setting(target)))
                 // A held item changes nothing, so nothing of it is backed up.
-                .filter(|(target, _)| self.hold_of(&Self::item(target)).is_none())
+                .filter(|(target, _)| self.hold_of(&self.item(target)).is_none())
                 .filter(|(t, v)| !self.values.get(t).is_some_and(|now| now.same(v)))
                 .map(|(target, _)| Saved {
                     value: self.values.get(&target).cloned(),
+                    granted: self.reaches(&target),
                     target,
                 })
                 .collect())
@@ -2407,70 +4528,107 @@ mod tests {
                 "the process ends in its preference pass"
             );
             if group != WorkstationGroup::Accounts {
-                for (target, value) in wanted() {
-                    if !self
-                        .selection()
-                        .contains(if target.domain == "com.apple.dock" {
-                            Setting::Dock
-                        } else {
-                            Setting::Widgets
+                for (item, keys) in self.items() {
+                    // A follow-up reaches the keys in another app's container alone.
+                    let keys: Vec<(Target, PValue)> = keys
+                        .into_iter()
+                        .filter(|(target, _)| {
+                            self.selection().contains(Self::setting(target))
+                                && (group != WorkstationGroup::Withheld || contained(target))
                         })
-                    {
+                        .collect();
+                    if keys.is_empty() {
                         continue;
                     }
-                    let correct = self.values.get(&target).is_some_and(|now| now.same(&value));
-                    let mut status = if correct { "ok" } else { "drift" };
-                    let item = Self::item(&target);
-                    let mut detail = "injected shared item".to_owned();
-                    if apply && !correct {
+                    // A key it may not reach is left alone, and said so; the item is withheld,
+                    // whatever its row reads, and its row reads as its other keys do.
+                    let left_alone = keys.iter().any(|(target, _)| !self.reaches(target));
+                    if apply && left_alone {
+                        self.withheld.push(item.clone());
+                    }
+                    let unmet: Vec<(Target, PValue)> = keys
+                        .into_iter()
+                        .filter(|(target, value)| {
+                            self.reaches(target)
+                                && !self.values.get(target).is_some_and(|now| now.same(value))
+                        })
+                        .collect();
+                    let mut status = if unmet.is_empty() { "ok" } else { "drift" };
+                    let mut detail = if left_alone {
+                        "Notification Center's wait for Full Disk Access".to_owned()
+                    } else {
+                        "injected shared item".to_owned()
+                    };
+                    if apply && !unmet.is_empty() {
                         match self.hold_of(&item) {
                             // The shared engine's holds: nothing of it runs.
                             Some(Hold::Back(why)) => {
                                 status = "blocked";
                                 detail = why;
                             }
+                            // What it found changed, and why it leaves it, as the engine's.
                             Some(Hold::AsIs(why)) => {
                                 status = "ok";
-                                detail = why;
+                                let from: Vec<String> =
+                                    unmet.iter().map(|(target, _)| target.describe()).collect();
+                                detail = format!("{}; left as it is: {why}", from.join(", "));
                             }
-                            None if self.blocked.contains(&target) => status = "blocked",
+                            None if unmet
+                                .iter()
+                                .any(|(target, _)| self.blocked.contains(target)) =>
+                            {
+                                status = "blocked";
+                            }
                             None => {
-                                let before = self.values.get(&target).cloned();
                                 // The engine journals each item before its apply.
                                 self.events.push(format!("journal {item}"));
-                                self.put(&target, Some(&value))?;
-                                self.runtime_changed = true;
-                                let written_back = self.written_back.contains(&target);
-                                if written_back {
-                                    match &before {
-                                        Some(before) => {
-                                            self.values.insert(target.clone(), before.clone());
-                                        }
-                                        None => {
-                                            self.values.remove(&target);
+                                let mut failed = std::mem::take(&mut self.fail_once);
+                                let mut preferences = Vec::new();
+                                for (target, value) in &unmet {
+                                    let before = self.values.get(target).cloned();
+                                    self.put(target, Some(value))?;
+                                    if self.written_back.contains(target) {
+                                        failed = true;
+                                        match &before {
+                                            Some(before) => {
+                                                self.values.insert(target.clone(), before.clone());
+                                            }
+                                            None => {
+                                                self.values.remove(target);
+                                            }
                                         }
                                     }
+                                    failed |= self.failing.contains(target);
+                                    preferences.push(Saved {
+                                        target: target.clone(),
+                                        value: before,
+                                        granted: true,
+                                    });
                                 }
-                                let failed = std::mem::take(&mut self.fail_once)
-                                    || written_back
-                                    || self.failing.contains(&target);
+                                // Its own activation relaunches what reads its writes, once.
+                                for process in aterm_machines::init_activation::RELAUNCHED {
+                                    if unmet.iter().any(|(target, _)| {
+                                        aterm_machines::init_activation::readers(&target.domain)
+                                            .contains(&process)
+                                    }) {
+                                        self.events.push(format!("relaunch {process}"));
+                                    }
+                                }
+                                self.runtime_changed = true;
                                 status = if failed { "error" } else { "applied" };
                                 self.attempts.push(Attempt {
                                     item: item.clone(),
                                     verified: !failed,
-                                    preferences: vec![Saved {
-                                        target: target.clone(),
-                                        value: before,
-                                    }],
+                                    preferences,
                                 });
                             }
                         }
                     }
                     if apply && matches!(status, "ok" | "applied") {
-                        self.settled.push(item);
+                        self.settled.push(item.clone());
                     }
                     rows.push(Row {
-                        name: target.describe(),
+                        name: item,
                         status: status.into(),
                         detail,
                     });
@@ -3071,11 +5229,113 @@ mod tests {
         assert_eq!(builds.len(), HELD_BUILDS, "{builds:?}");
         assert!(!builds.contains(&build(1).as_str()), "{builds:?}");
         assert_eq!(
-            record.holds(&build(0), now),
+            record.holds(&build(0), now, &Withheld::default()),
             [("dock".to_owned(), Hold::Back(HELD.into()))],
             "{builds:?}"
         );
-        assert!(record.holds(&build(1), now).is_empty());
+        assert!(
+            record
+                .holds(&build(1), now, &Withheld::default())
+                .is_empty()
+        );
+    }
+
+    /// Only a settled item the follow-up still owes says that key is the follow-up's
+    /// ([`SETTLED_OWED`]); every other settled item keeps [`SETTLED`], even while something
+    /// is owed, and nothing is owed to a pass that does not read the follow-up's keys.
+    /// Negative control: choosing the words on whether anything is owed gives the Dock the
+    /// Notification Center wording.
+    #[test]
+    fn only_the_settled_item_the_follow_up_owes_is_held_with_its_words() {
+        let record = Automatic {
+            settled: vec!["dock".to_owned(), WIDGETS.to_owned()],
+            failed: Vec::new(),
+        };
+        let owed = Withheld {
+            items: vec![WIDGETS.to_owned()],
+            failed: Vec::new(),
+        };
+        assert_eq!(
+            record.holds(BUILD, 0, &owed),
+            [
+                ("dock".to_owned(), Hold::AsIs(SETTLED.into())),
+                (WIDGETS.to_owned(), Hold::AsIs(SETTLED_OWED.into())),
+            ]
+        );
+        assert_eq!(
+            record.holds(BUILD, 0, &Withheld::default()),
+            [
+                ("dock".to_owned(), Hold::AsIs(SETTLED.into())),
+                (WIDGETS.to_owned(), Hold::AsIs(SETTLED.into())),
+            ]
+        );
+    }
+
+    /// An automatic pass that reaches the follow-up's keys is held by that record's tries
+    /// too, for an item it owes: one either record holds waits, one only that record holds
+    /// included; spent tries in either outrank a wait in the other, whichever is read first;
+    /// an item neither holds runs; a settled item stays as it is whatever the follow-up's
+    /// tries; and tries of an item the record no longer names hold nothing. Negative
+    /// control: holding by this record's tries alone lets the pass make, minutes after the
+    /// follow-up's try, the one that is that key's second, before it is due.
+    #[test]
+    fn the_follow_ups_tries_hold_an_automatic_pass_that_reaches_its_keys() {
+        let tried = |item: &str, tries: u32, at: u64| Failed {
+            item: item.to_owned(),
+            build: BUILD.to_owned(),
+            tries,
+            at,
+        };
+        let back = |item: &str, why: &str| (item.to_owned(), Hold::Back(why.into()));
+        let now = SECOND_TRY_AFTER.as_secs() * 2;
+        let recent = now - 60;
+        let record = Automatic {
+            settled: vec!["settled".to_owned()],
+            failed: vec![
+                tried("waits here, spent there", 1, recent),
+                tried("spent here, waits there", TRIES, 0),
+                tried("due here, waits there", 1, 0),
+                tried("due here, owed nothing", 1, 0),
+            ],
+        };
+        let owed = Withheld {
+            items: [
+                "settled",
+                "waits here, spent there",
+                "spent here, waits there",
+                "due here, waits there",
+                "waits there",
+                "due here, owed nothing",
+            ]
+            .map(str::to_owned)
+            .to_vec(),
+            failed: vec![
+                tried("waits here, spent there", TRIES, 0),
+                tried("spent here, waits there", 1, recent),
+                tried("due here, waits there", 1, recent),
+                tried("waits there", 1, recent),
+                tried("settled", TRIES, recent),
+                tried("no longer named", 1, recent),
+            ],
+        };
+        assert_eq!(
+            record.holds(BUILD, now, &owed),
+            [
+                ("settled".to_owned(), Hold::AsIs(SETTLED_OWED.into())),
+                back("waits here, spent there", HELD),
+                back("spent here, waits there", HELD),
+                back("due here, waits there", WAITING),
+                back("waits there", WAITING),
+            ]
+        );
+        assert_eq!(
+            record.holds(BUILD, now, &Withheld::default()),
+            [
+                ("settled".to_owned(), Hold::AsIs(SETTLED.into())),
+                back("waits here, spent there", WAITING),
+                back("spent here, waits there", HELD),
+            ]
+        );
     }
 
     /// What an automatic pass found as wanted is left as it is afterwards: a setting it
@@ -3396,7 +5656,7 @@ mod tests {
                     .map(|(target, _)| target)
                     .find(|t| t.describe() == target)
                     .unwrap();
-                vec![Fake::item(&target), restore_id(&target)]
+                vec![host.item(&target), restore_id(&target)]
             } else if let Some(process) = event.strip_prefix("restart ") {
                 vec![format!("doctor.relaunch.{process}")]
             } else {

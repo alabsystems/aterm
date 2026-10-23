@@ -2,12 +2,6 @@
 // Copyright 2026 Andrew Yates
 
 //! Perceptual appearance system shared by every native tab app and chrome surface.
-//!
-//! The terminal theme is the source of identity, but native UI roles are not
-//! painted from raw cursor/selection bytes: they are rebuilt in OKLCH,
-//! gamut-mapped, and contrast-conditioned for the surface they sit on, so vivid
-//! schemes stay expressive without neon controls and quiet/light schemes keep
-//! their hierarchy.
 
 #[cfg(test)]
 use std::cell::Cell;
@@ -19,15 +13,12 @@ use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 
 use aterm_render::Theme;
 
-/// Accessibility inputs that affect role contrast. The host replaces the defaults when
-/// a platform appearance observer reports a change.
+/// Accessibility inputs that affect role contrast.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct AppearancePreferences {
     pub(crate) high_contrast: bool,
     pub(crate) reduced_transparency: bool,
-    /// System Settings ▸ Accessibility ▸ Display ▸ Differentiate without
-    /// colour: the stats bars give falling a shape as well as a colour
-    /// (`crate::stats_paint`).
+    /// System Settings ▸ Accessibility ▸ Display ▸ Differentiate without colour: the stats bars give falling a shape as well as a colour (`crate::stats_paint`).
     pub(crate) differentiate_without_color: bool,
     /// Native-app text scale, independent of terminal-cell zoom.
     pub(crate) text_scale: f32,
@@ -56,11 +47,6 @@ static ACCESSIBILITY_FLAGS: AtomicU8 = AtomicU8::new(0);
 static TEXT_SCALE_BITS: AtomicU32 = AtomicU32::new(1.0_f32.to_bits());
 
 /// A TEXT SCALE INJECTED IN PLACE OF THE OPERATING SYSTEM'S, for a development
-/// build: the `text-scale` control verb ([`cmd_text_scale`]) or the
-/// `$ATERM_TEXT_SCALE` launch seam set it, so a lab can see and audit the
-/// layouts larger text draws on a host whose own reading never moves (macOS
-/// reports 1.0). [`install_preferences`] lays it over every platform reading,
-/// so a re-sample keeps it until `text-scale os` clears it. `0`: none.
 #[cfg(not(test))]
 static INJECTED_TEXT_SCALE_BITS: AtomicU32 = AtomicU32::new(0);
 #[cfg(test)]
@@ -68,9 +54,7 @@ thread_local! {
     static TEST_INJECTED_TEXT_SCALE: Cell<Option<f32>> = const { Cell::new(None) };
 }
 
-/// Inject `scale` in place of the operating system's text scale, or clear the
-/// injection (`None`). The caller re-samples the preferences so it takes
-/// effect ([`install_preferences`]).
+/// Inject `scale` in place of the operating system's text scale, or clear the injection (`None`).
 pub(crate) fn inject_text_scale(scale: Option<f32>) {
     #[cfg(test)]
     TEST_INJECTED_TEXT_SCALE.with(|slot| slot.set(scale));
@@ -93,7 +77,6 @@ pub(crate) fn injected_text_scale() -> Option<f32> {
 }
 
 /// The text scale a `text-scale` request or the launch seam names: a number
-/// in `0.85..=2.0`, or `os` (`Some(None)`: clear the injection).
 fn parse_text_scale(word: &str) -> Option<Option<f32>> {
     if word.eq_ignore_ascii_case("os") {
         return Some(None);
@@ -103,7 +86,6 @@ fn parse_text_scale(word: &str) -> Option<Option<f32>> {
 }
 
 /// The `text-scale` verb's arguments: none (read), or one scale or `os`,
-/// which only a build with `injection` admits.
 fn text_scale_request(rest: &str, injection: bool) -> Result<Option<Option<f32>>, &'static str> {
     const USAGE: &str = "usage: text-scale [0.85..2.0|os]";
     let mut words = rest.split_whitespace();
@@ -118,9 +100,7 @@ fn text_scale_request(rest: &str, injection: bool) -> Result<Option<Option<f32>>
     Ok(set)
 }
 
-/// The `text-scale` control verb: answer the text scale native pages lay out
-/// at and where it comes from; a development build sets or clears an
-/// injected one first, through the main thread's re-sample.
+/// The `text-scale` control verb: answer the text scale native pages lay out at and where it comes from; a development build sets or clears an injected one first, through the main thread's re-sample.
 pub(crate) fn cmd_text_scale(
     proxy: &aterm_window::event_loop::EventLoopProxy<crate::Wake>,
     rest: &str,
@@ -152,8 +132,7 @@ pub(crate) fn text_scale_status_line() -> String {
     )
 }
 
-/// The `$ATERM_TEXT_SCALE` launch seam ([`aterm_types::dev_seam!`]): a
-/// development build's text scale from launch, before any window lays out.
+/// The `$ATERM_TEXT_SCALE` launch seam ([`aterm_types::dev_seam!`]): a development build's text scale from launch, before any window lays out.
 pub(crate) fn inject_launch_text_scale() {
     if let Some(Some(scale)) = aterm_types::dev_seam!("ATERM_TEXT_SCALE")
         .and_then(|value| value.to_str().and_then(parse_text_scale))
@@ -163,28 +142,15 @@ pub(crate) fn inject_launch_text_scale() {
 }
 
 /// Sticky flag: an OS-owned chrome input moved and no re-sample has settled the windows
-/// for it yet. Set by [`install_preferences`] and
-/// [`crate::chrome_band::install_forced_chrome`]; drained only by
-/// `App::resample_os_preferences`, through [`take_chrome_inputs_moved`].
-///
-/// A latch rather than the `install_*` return value, because that edge goes to whoever
-/// reads first: `AppRt::native_appearance_preferences` also runs at window attach, at
-/// startup and in the settings preview (on Windows it republishes the High-Contrast
-/// palette), and a move one of them consumed would leave existing windows painting the
-/// old OS palette.
 #[cfg(all(not(test), any(target_os = "macos", windows)))]
 static CHROME_INPUTS_MOVED: AtomicBool = AtomicBool::new(false);
 
-// Per worker thread under test, as with the snapshot below: libtest runs
-// independent Apps on a reused worker pool, so a process-global latch would let
-// one worker drain another's pending settle.
 #[cfg(test)]
 thread_local! {
     static TEST_CHROME_INPUTS_MOVED: Cell<bool> = const { Cell::new(false) };
 }
 
-/// Record that an OS-owned chrome input moved. Idempotent; see
-/// [`CHROME_INPUTS_MOVED`].
+/// Record that an OS-owned chrome input moved.
 #[cfg(any(target_os = "macos", windows, test))]
 pub(crate) fn note_chrome_inputs_moved() {
     #[cfg(test)]
@@ -193,9 +159,7 @@ pub(crate) fn note_chrome_inputs_moved() {
     CHROME_INPUTS_MOVED.store(true, Ordering::Release);
 }
 
-/// Consume the latch: `true` when an OS-owned chrome input has moved since the
-/// last re-sample settled the windows. The one caller is
-/// `App::resample_os_preferences`.
+/// Consume the latch: `true` when an OS-owned chrome input has moved since the last re-sample settled the windows.
 #[must_use]
 #[cfg(any(target_os = "macos", windows, test))]
 pub(crate) fn take_chrome_inputs_moved() -> bool {
@@ -210,8 +174,6 @@ pub(crate) fn take_chrome_inputs_moved() -> bool {
     }
 }
 
-// One process-wide snapshot in production; per worker thread under test, so one test
-// cannot change another's layout mid-compile/raster.
 #[cfg(test)]
 thread_local! {
     static TEST_APPEARANCE: Cell<AppearancePreferences> = const {
@@ -224,9 +186,7 @@ thread_local! {
     };
 }
 
-/// Install the platform-observed appearance snapshot. Returns `true` only when
-/// paint/layout inputs changed, so the host can skip redundant redraws; a `true` also
-/// arms [`CHROME_INPUTS_MOVED`].
+/// Install the platform-observed appearance snapshot.
 pub(crate) fn install_preferences(mut preferences: AppearancePreferences) -> bool {
     // A development build's injected scale stands over every reading.
     if let Some(scale) = injected_text_scale() {
@@ -250,7 +210,6 @@ pub(crate) fn install_preferences(mut preferences: AppearancePreferences) -> boo
             old_flags != flags || old_scale != preferences.text_scale.to_bits()
         }
     };
-    // Only the hosts that re-sample OS preferences read the latch.
     #[cfg(any(target_os = "macos", windows, test))]
     if moved {
         note_chrome_inputs_moved();
@@ -283,24 +242,17 @@ pub(crate) fn text_scale() -> f32 {
     current_preferences().text_scale
 }
 
-/// The operating system's accent colour, one shade per side of the light/dark
-/// split (Windows: Personalization ▸ Colours ▸ Accent colour). The chrome takes it
-/// as its accent wherever the theme and config author none
-/// (`aterm_messages::tokens::AccentSource::System`), so the Settings selection, the
-/// palette row, the strip's marks and the pane focus tick wear the user's Windows
-/// accent rather than the cursor's colour.
+/// The operating system's accent colour, one shade per side of the light/dark split (Windows: Personalization ▸ Colours ▸ Accent colour).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct SystemAccent {
-    /// The shade for marks and fills on a DARK surface (WinUI's
-    /// `SystemAccentColorLight2`).
+    /// The shade for marks and fills on a DARK surface (WinUI's `SystemAccentColorLight2`).
     pub(crate) on_dark: [u8; 3],
     /// The shade for a LIGHT surface (`SystemAccentColorDark1`).
     pub(crate) on_light: [u8; 3],
 }
 
 impl SystemAccent {
-    /// The shade for a surface whose background is `bg`
-    /// ([`aterm_messages::ink::bg_is_light`], the one dark/light classifier).
+    /// The shade for a surface whose background is `bg` ([`aterm_messages::ink::bg_is_light`], the one dark/light classifier).
     #[must_use]
     pub(crate) fn for_surface(self, bg: [u8; 3]) -> [u8; 3] {
         if aterm_messages::ink::bg_is_light(bg) {
@@ -335,16 +287,12 @@ const NO_SYSTEM_ACCENT: u64 = u64::MAX;
 static SYSTEM_ACCENT: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(NO_SYSTEM_ACCENT);
 
-// Per worker thread under test, like the appearance snapshot: none unless a test
-// installs one, so no test reads the machine's accent.
 #[cfg(test)]
 thread_local! {
     static TEST_SYSTEM_ACCENT: Cell<Option<SystemAccent>> = const { Cell::new(None) };
 }
 
-/// Install the OS accent the platform read (`None`: it gives none). `true` when it
-/// moved, which also arms [`CHROME_INPUTS_MOVED`] so the windows repaint their
-/// chrome in it (the strip's cached rows included).
+/// Install the OS accent the platform read (`None`: it gives none).
 #[cfg(any(windows, test))]
 pub(crate) fn install_system_accent(accent: Option<SystemAccent>) -> bool {
     let moved = {
@@ -397,8 +345,7 @@ impl AppearancePreferences {
     }
 }
 
-/// Complete semantic palette for a native surface. No application may invent a
-/// component colour outside this vocabulary.
+/// Complete semantic palette for a native surface.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct NativeRoles {
     pub(crate) surface: [u8; 3],
@@ -406,16 +353,11 @@ pub(crate) struct NativeRoles {
     pub(crate) text_secondary: [u8; 3],
     pub(crate) text_tertiary: [u8; 3],
     pub(crate) accent: [u8; 3],
-    /// The accent as text (a selected rail row's or segment's label, an accent heading,
-    /// a preview's caption): its hue held to the text floor (4.5:1, 7:1 in high contrast)
-    /// on every backdrop it is inked on. [`Self::accent`] keeps its own floor for fills,
-    /// rims and bars.
+    /// The accent as text (a selected rail row's or segment's label, an accent heading, a preview's caption): its hue held to the text floor (4.5:1, 7:1 in high contrast) on every backdrop it is inked on.
     pub(crate) accent_ink: [u8; 3],
     pub(crate) on_accent: [u8; 3],
     pub(crate) separator: [u8; 3],
-    /// A control's own boundary (a filter chip's rim): the separator held to
-    /// 3:1, the non-text contrast floor, against the cards and the page it sits
-    /// on. [`Self::separator`] stays a quiet hairline (1.5:1).
+    /// A control's own boundary (a filter chip's rim): the separator held to 3:1, the non-text contrast floor, against the cards and the page it sits on.
     pub(crate) control_edge: [u8; 3],
     pub(crate) control_track: [u8; 3],
     pub(crate) elevated: [u8; 3],
@@ -430,39 +372,23 @@ struct Oklch {
     h: f32,
 }
 
-/// Whether this chrome background is the dark side: [`crate::tab_bar::bg_is_light`], the
-/// predicate the tab strip's tones and the CSD variant use. A separate threshold would
-/// disagree in the mid-grey band and make `window_theme = light` a no-op there
-/// ([`crate::App::chrome_palette_theme`] would see "already light" while this pipeline
-/// built the dark side).
+/// Whether this chrome background is the dark side: [`crate::tab_bar::bg_is_light`], the predicate the tab strip's tones and the CSD variant use.
 pub(crate) fn surface_is_dark(bg: [u8; 3]) -> bool {
     !crate::tab_bar::bg_is_light(bg)
 }
 
-/// How far toward `accent` a selected navigation row's `elevated` fill is
-/// washed when the accent itself is the ink (label and icon); pressing the
-/// row deepens it to [`ACCENT_WASH_PRESSED`]. Owned here so
-/// [`accent_over_its_own_wash`] and the pixels `native_ui` produces agree.
+/// How far toward `accent` a selected navigation row's `elevated` fill is washed when the accent itself is the ink (label and icon); pressing the row deepens it to [`ACCENT_WASH_PRESSED`].
 pub(crate) const ACCENT_WASH_SELECTED: f32 = 0.13;
-/// The deepest accent wash that still carries accent ink (the pressed state of
-/// a selected navigation row). Deeper washes carry text_primary/secondary,
-/// already floored against `surface`.
+/// The deepest accent wash that still carries accent ink (the pressed state of a selected navigation row).
 pub(crate) const ACCENT_WASH_PRESSED: f32 = 0.16;
 /// The floor the accent holds as ink against the wash it is inked on. A rule
-/// or fill can be quieter than its surroundings; a label cannot.
 const ACCENT_INK_FLOOR: f32 = 3.0;
 /// How far a light theme's `elevated` (cards, the rail) rises above its
-/// `surface` (the page), in `OkLab` lightness: Fluent's light card step
-/// (#fbfbfb on #f3f3f3 is 0.025) and about what the dark side's mix rises.
 const LIGHT_ELEVATION_STEP: f32 = 0.035;
 /// The most of the way to white that step may take, so a near-white page
-/// still leaves its cards short of pure white (Fluent's step is 0.64 of it).
 const LIGHT_ELEVATION_TOWARD_WHITE: f32 = 0.6;
 
 /// A light theme's `elevated`: `surface` mixed toward white by
-/// [`LIGHT_ELEVATION_STEP`] of lightness, at most
-/// [`LIGHT_ELEVATION_TOWARD_WHITE`] of the way. A fixed share would lift a
-/// mid-grey page's cards far above the ink floored against the page.
 fn light_elevation(surface: [u8; 3]) -> [u8; 3] {
     let headroom = (1.0 - rgb_to_oklch(surface).l).max(0.0);
     let amount = (LIGHT_ELEVATION_STEP / headroom).min(LIGHT_ELEVATION_TOWARD_WHITE);
@@ -470,13 +396,9 @@ fn light_elevation(surface: [u8; 3]) -> [u8; 3] {
 }
 
 /// Whether a light theme's cards rise above the page ([`light_elevation`]), as
-/// Windows' own Settings lifts them (#fbfbfb on #f3f3f3). macOS and Linux keep
-/// their grouped fills a step darker than the window, their look until that
-/// lane is reviewed.
 const LIGHT_CARDS_RISE: bool = cfg!(windows);
 
 /// A light theme's `elevated` on this platform: [`light_elevation`] where
-/// [`LIGHT_CARDS_RISE`], else `surface` mixed a further step toward the ink.
 fn light_elevated(surface: [u8; 3], fg: [u8; 3]) -> [u8; 3] {
     if LIGHT_CARDS_RISE {
         light_elevation(surface)
@@ -485,10 +407,7 @@ fn light_elevated(surface: [u8; 3], fg: [u8; 3]) -> [u8; 3] {
     }
 }
 
-/// Straight sRGB channel lerp, the mix the native painter builds control fills
-/// with ([`crate::native_ui::mix_rgb`] delegates here), as distinct from the
-/// perceptual [`mix_oklab`] the role ramps use. The accent floor must measure
-/// the exact bytes the painter puts on screen.
+/// Straight sRGB channel lerp, the mix the native painter builds control fills with ([`crate::native_ui::mix_rgb`] delegates here), as distinct from the perceptual [`mix_oklab`] the role ramps use.
 pub(crate) fn mix_srgb(a: [u8; 3], b: [u8; 3], amount: f32) -> [u8; 3] {
     let amount = amount.clamp(0.0, 1.0);
     std::array::from_fn(|index| {
@@ -497,13 +416,6 @@ pub(crate) fn mix_srgb(a: [u8; 3], b: [u8; 3], amount: f32) -> [u8; 3] {
 }
 
 /// Hold the accent to [`ACCENT_INK_FLOOR`] against its own wash: the selected rail row is
-/// the one place the accent is body-sized ink on a backdrop built from the accent, so a
-/// floor against `surface` alone can leave it the least legible row.
-///
-/// A fixpoint: each pass re-mixes the wash from the current accent and nudges lightness
-/// only as far as that wash demands. The wash moves only [`ACCENT_WASH_PRESSED`] toward
-/// the accent, so the residual shrinks by about that factor per pass and the loop settles
-/// in two or three; the bound guarantees termination.
 fn accent_over_its_own_wash(accent: [u8; 3], elevated: [u8; 3]) -> [u8; 3] {
     let mut accent = accent;
     for _ in 0..8 {
@@ -522,8 +434,6 @@ const DANGER_HUE_DEGREES: f32 = 25.0;
 const SUCCESS_HUE_DEGREES: f32 = 145.0;
 
 /// A status hue as [`roles`] seeds it, before the ink floor: one shared
-/// semantic angle, at a lightness this chrome side chooses and a chroma the
-/// accessibility preferences choose.
 fn status_seed(dark: bool, high_contrast: bool, hue_degrees: f32) -> [u8; 3] {
     oklch_to_rgb(Oklch {
         l: if dark { 0.72 } else { 0.49 },
@@ -532,14 +442,7 @@ fn status_seed(dark: bool, high_contrast: bool, hue_degrees: f32) -> [u8; 3] {
     })
 }
 
-/// The `success` hue as decoration rather than ink: the seed [`roles`] conditions into
-/// [`NativeRoles::success`], without that role's 4.5:1 floor. Against a mid-tone surface
-/// the floor drives the role near-black, right for a label but a grey, not green, tint.
-/// Nothing painted with this is text or a UI mark.
-///
-/// `dark` is the chrome side the decoration lands on, which in the mid-tone band may
-/// differ from [`roles`]' answer for the window. Chroma follows the live accessibility
-/// preferences, as in [`default_roles`].
+/// The `success` hue as decoration rather than ink: the seed [`roles`] conditions into [`NativeRoles::success`], without that role's 4.5:1 floor.
 pub(crate) fn success_tint(dark: bool) -> [u8; 3] {
     status_seed(
         dark,
@@ -548,26 +451,12 @@ pub(crate) fn success_tint(dark: bool) -> [u8; 3] {
     )
 }
 
-/// Hold a surface at or above the openness (luminance) of `floor`, moving lightness only
-/// (the hue- and chroma-preserving nudge [`ensure_contrast`] makes for ink). Contrast
-/// against black is monotone in relative luminance, so this is a contrast target: the
-/// smallest lift that clears the floor, or `color` untouched when it already does.
-///
-/// A chromatic wash is not monotone in luminance: [`crate::native_ui::rainbow_banner_sky`]
-/// pours [`success_tint`] into the most open neutral and uses this so the banner cannot
-/// sink below its cards.
+/// Hold a surface at or above the openness (luminance) of `floor`, moving lightness only (the hue- and chroma-preserving nudge [`ensure_contrast`] makes for ink).
 pub(crate) fn at_least_as_open_as(color: [u8; 3], floor: [u8; 3]) -> [u8; 3] {
     ensure_contrast(color, [0, 0, 0], contrast_ratio(floor, [0, 0, 0]))
 }
 
-/// Build the native palette. Neutral roles preserve the theme's perceptual hue;
-/// chromatic roles keep the chrome accent's hue
-/// ([`aterm_messages::tokens::ChromeTokens::accent`]: the authored accent, the
-/// cursor, or the ANSI blue or cyan it borrows) but cap its chroma for large
-/// controls. A palette whose accent is Neutral (a monochrome theme, or one with
-/// no palette known) keeps the derived treatment: the selection's hue, else one
-/// opposite the background's. An authored `border_color` is the separator, and
-/// the theme's own ANSI red and green set the status hues.
+/// Build the native palette.
 pub(crate) fn roles(
     p: impl Into<crate::chrome_band::ChromePalette>,
     preferences: AppearancePreferences,
@@ -582,9 +471,6 @@ pub(crate) fn roles(
     let dark = surface_is_dark(bg);
 
     let surface = neutral_surface(bg, fg, if dark { 0.075 } else { 0.055 });
-    // A card sits above the page: toward the ink on a dark theme; on a light
-    // one toward white on Windows ([`light_elevated`]), where mixed toward the
-    // ink its cards sank 1.14:1 below the page.
     let elevated = if dark {
         neutral_surface(surface, fg, 0.075)
     } else {
@@ -606,8 +492,6 @@ pub(crate) fn roles(
         accent_seed = selection_seed;
     }
     if accent_seed.c < 0.035 {
-        // A neutral theme still gets identity, but the hue is derived from the
-        // selection/background relationship rather than a product-wide RGB token.
         let bg_hue = rgb_to_oklch(bg).h;
         accent_seed.h = (bg_hue + 0.61 * TAU).rem_euclid(TAU);
     }
@@ -617,13 +501,8 @@ pub(crate) fn roles(
     } else {
         accent_seed.l.clamp(0.42, 0.58)
     };
-    // Floored against both backdrops the accent meets: the surface it rules and
-    // fills on, and the selected-row wash it inks on.
     let accent = ensure_contrast(oklch_to_rgb(accent_seed), surface, ACCENT_INK_FLOOR);
     let accent = accent_over_its_own_wash(accent, elevated);
-    // The accent as text, floored on the page, a card and the deepest wash it is
-    // inked on: all three sit on one side of it, so meeting the floor on each meets
-    // it on every wash between them.
     let ink_target = if preferences.high_contrast { 7.0 } else { 4.5 };
     let accent_ink = [
         surface,
@@ -656,10 +535,6 @@ pub(crate) fn roles(
             ensure_contrast(edge, backdrop, 3.0)
         });
 
-    // Status hues take the theme's own ANSI red and green where they carry a
-    // colour, else a shared semantic angle; lightness, chroma and final
-    // contrast are conditioned by this theme.
-    // Held against the cards they mostly sit on as well as the page.
     #[allow(
         clippy::cast_possible_truncation,
         reason = "an OkLCh hue in degrees, [0, 360), fits f32"
@@ -710,9 +585,7 @@ pub(crate) fn roles(
 }
 
 impl NativeRoles {
-    /// The roles of a chrome palette (a bare [`Theme`] converts with nothing
-    /// authored and no palette known), under the live accessibility
-    /// preferences ([`default_roles`]).
+    /// The roles of a chrome palette (a bare [`Theme`] converts with nothing authored and no palette known), under the live accessibility preferences ([`default_roles`]).
     pub(crate) fn from_theme(p: impl Into<crate::chrome_band::ChromePalette>) -> Self {
         default_roles(p)
     }
@@ -722,34 +595,19 @@ pub(crate) fn default_roles(p: impl Into<crate::chrome_band::ChromePalette>) -> 
     roles(p, current_preferences())
 }
 
-/// The forced-chrome seed palette for config `window_theme = light`, modelled
-/// on libadwaita light (`window_bg_color #fafafa`, text `rgba(0,0,0,0.8)`).
-/// [`roles`] derives the full token set from these seeds through the same
-/// OKLCH mix and contrast conditioning every terminal theme goes through.
+/// The forced-chrome seed palette for config `window_theme = light`, modelled on libadwaita light (`window_bg_color #fafafa`, text `rgba(0,0,0,0.8)`).
 pub(crate) const FORCED_LIGHT_CHROME_BG: u32 = 0x00FA_FAFA;
 /// Dark text for the forced-light chrome (Adwaita's `#2e3436`).
 pub(crate) const FORCED_LIGHT_CHROME_FG: u32 = 0x002E_3436;
-/// The forced-chrome seed palette for config `window_theme = dark`
-/// (libadwaita dark: `window_bg_color #242424`, near-white text).
+/// The forced-chrome seed palette for config `window_theme = dark` (libadwaita dark: `window_bg_color #242424`, near-white text).
 pub(crate) const FORCED_DARK_CHROME_BG: u32 = 0x0024_2424;
 /// Near-white text for the forced-dark chrome.
 pub(crate) const FORCED_DARK_CHROME_FG: u32 = 0x00ED_EDED;
 
 /// The floor the carried terminal cursor (the accent seed) is held to against
-/// the forced chrome surface.
-///
-/// A floor on the input, not the shipped accent: [`roles`] applies
-/// [`ACCENT_INK_FLOOR`] itself, against both the surface and the row's own
-/// wash ([`accent_over_its_own_wash`]). This catches a degenerate seed, e.g. a
-/// dark theme's near-white cursor carried onto `#FAFAFA`, which would give
-/// [`roles`] no usable lightness and a hue that is mostly rounding noise.
 const FORCED_CHROME_ACCENT_FLOOR: f32 = ACCENT_INK_FLOOR;
 
-/// The [`Theme`] the chrome painters draw from when config `window_theme = light|dark`
-/// forces the side against the terminal theme's darkness
-/// ([`crate::App::chrome_palette_theme`]). Surfaces and text are the constants above; the
-/// cursor and selection (the accent seeds) are carried from the terminal theme, the cursor
-/// lightness-nudged so it stays visible on the forced surface.
+/// The [`Theme`] the chrome painters draw from when config `window_theme = light|dark` forces the side against the terminal theme's darkness ([`crate::App::chrome_palette_theme`]).
 pub(crate) fn forced_chrome_theme(terminal: Theme, dark: bool) -> Theme {
     let (bg, fg) = if dark {
         (FORCED_DARK_CHROME_BG, FORCED_DARK_CHROME_FG)
@@ -769,11 +627,7 @@ pub(crate) fn forced_chrome_theme(terminal: Theme, dark: bool) -> Theme {
     }
 }
 
-/// The chrome palette for a `window_theme` policy over a `terminal` theme: the pure
-/// core of `App::chrome_palette_theme`, testable on any host. `Auto` returns the
-/// terminal theme (the caption painter tracks the OS), as does a forced value matching
-/// its darkness; a forced value against it authors the forced-variant chrome so the
-/// band and native pages flip together with the OS caption.
+/// The chrome palette for a `window_theme` policy over a `terminal` theme: the pure core of `App::chrome_palette_theme`, testable on any host.
 pub(crate) fn resolve_chrome_palette(
     window_theme: crate::app_config::WindowTheme,
     terminal: Theme,
@@ -869,7 +723,6 @@ fn in_gamut(rgb: [f32; 3]) -> bool {
 }
 
 /// Convert with chroma-preserving gamut mapping. Lightness and hue remain stable;
-/// only chroma is reduced when the requested colour is outside sRGB.
 fn oklch_to_rgb(mut color: Oklch) -> [u8; 3] {
     color.l = color.l.clamp(0.0, 1.0);
     color.c = color.c.max(0.0);
@@ -909,7 +762,6 @@ fn mix_oklab(a: [u8; 3], b: [u8; 3], amount: f32) -> [u8; 3] {
 }
 
 /// Native neutral surfaces keep theme atmosphere but cannot inherit enough chroma
-/// to turn the entire application shell into a saturated color field.
 fn neutral_surface(a: [u8; 3], b: [u8; 3], amount: f32) -> [u8; 3] {
     let mixed = mix_oklab(a, b, amount);
     let source = rgb_to_oklch(a);
@@ -955,8 +807,7 @@ fn contrast_candidate(color: Oklch, bg: [u8; 3], target: f32, pole: f32) -> Opti
     Some(best)
 }
 
-/// `fg` as text on `bg`: its hue kept, its lightness moved until it reads at
-/// the text floor (4.5:1, 7:1 in high contrast).
+/// `fg` as text on `bg`: its hue kept, its lightness moved until it reads at the text floor (4.5:1, 7:1 in high contrast).
 pub(crate) fn ensure_text_contrast(fg: [u8; 3], bg: [u8; 3]) -> [u8; 3] {
     let target = if current_preferences().normalized().high_contrast {
         7.0
@@ -999,9 +850,6 @@ mod tests {
     use super::*;
 
     /// With the OS accent installed and none authored, every chrome surface takes
-    /// it as its accent, in the shade for its side: the Settings roles on a dark
-    /// theme carry Windows' blue, not the cursor's green. Installing it arms the
-    /// chrome latch so the windows repaint; uninstalling hands the cursor back.
     #[test]
     fn the_os_accent_leads_the_chrome_where_none_is_authored() {
         use aterm_messages::tokens::AccentSource;
@@ -1046,7 +894,6 @@ mod tests {
     }
 
     /// A preference move consumed by another caller (window attach, startup,
-    /// settings preview) still reaches the re-sample that settles the windows.
     #[test]
     fn a_consumed_preference_edge_still_reaches_the_resample() {
         let previous = current_preferences();
@@ -1058,13 +905,11 @@ mod tests {
             text_scale: 1.25,
             differentiate_without_color: previous.differentiate_without_color,
         };
-        // The attach reads first and takes the edge.
         assert!(install_preferences(moved), "off → on is a change");
         assert!(
             !install_preferences(moved),
             "the edge is gone: a second install reports no movement"
         );
-        // The re-sample runs later and must still be told to settle the windows.
         assert!(
             take_chrome_inputs_moved(),
             "the preference move was swallowed by the non-resample reader"
@@ -1079,8 +924,6 @@ mod tests {
     }
 
     /// Differentiate Without Color is a paint input of its own: turning it on
-    /// moves the chrome (the stats bars add shapes beside their hues) and
-    /// reads back; turning it off again moves it back.
     #[test]
     fn differentiate_without_color_is_a_paint_input() {
         let previous = current_preferences();
@@ -1140,7 +983,6 @@ mod tests {
     ];
 
     /// Every bundled scheme as its own chrome: the donor set the forced test
-    /// carries onto the authored surfaces.
     fn bundled_themes() -> Vec<(&'static str, Theme)> {
         aterm_types::scheme::builtin_names()
             .into_iter()
@@ -1156,8 +998,6 @@ mod tests {
     }
 
     /// The role contract, asserted on the pairs that actually meet on screen,
-    /// including accent ink on a selected row's accent wash over `elevated`
-    /// (not just accent against `surface`, which is the pair for a rule).
     fn assert_role_contract(what: &str, r: NativeRoles) {
         assert!(
             contrast_ratio(r.text_primary, r.surface) >= 4.5,
@@ -1190,8 +1030,6 @@ mod tests {
             contrast_ratio(r.on_accent, r.accent) >= 4.5,
             "{what}: ink on an accent fill"
         );
-        // The accent as small text (`accent_ink`): body-text contrast on every
-        // ground it is printed on, the pressed wash included.
         for (ground, rgb) in [
             ("surface", r.surface),
             ("elevated", r.elevated),
@@ -1230,8 +1068,6 @@ mod tests {
     }
 
     /// On Windows light themes' cards are lighter than their page, as dark
-    /// themes' are; macOS and Linux keep the step toward the ink, darker than
-    /// the page. Each platform's answer is the other's negative control.
     #[test]
     fn light_cards_rise_above_the_page_on_windows_only() {
         let mut light = 0;
@@ -1271,8 +1107,6 @@ mod tests {
         }
         for (name, theme) in bundled_themes() {
             assert_role_contract(name, default_roles(theme));
-            // …and over the full chrome palette, with a hostile authored accent
-            // and border (the background itself): the floors still hold.
             let scheme = aterm_types::scheme::builtin(name).expect("a built-in");
             let hostile = packed_rgb(theme.bg);
             for authored in [
@@ -1294,12 +1128,6 @@ mod tests {
     }
 
     /// THE NATIVE ACCENT IS THE TOKEN ACCENT: on every built-in whose chrome
-    /// accent has a colour (its cursor, or the ANSI blue or cyan a grey cursor
-    /// borrows), the Settings accent wears that hue (the chroma and lightness
-    /// clamps and the floors move lightness and chroma, not hue), and an
-    /// authored accent's hue likewise. NEGATIVE CONTROL: a monochrome theme
-    /// (grey cursor, grey selection, grey ANSI) has no accent to borrow, so its
-    /// roles are exactly the ones derived with no palette known.
     #[test]
     fn native_accent_is_the_token_accent() {
         use aterm_messages::tokens::{AccentSource, AuthoredChrome};
@@ -1364,7 +1192,6 @@ mod tests {
     }
 
     /// `Auto` passes the terminal theme through; a forced side against its darkness
-    /// re-authors the chrome; a forced side that already matches keeps it.
     #[test]
     fn resolve_chrome_palette_forces_the_whole_band_or_follows_the_system() {
         use crate::app_config::WindowTheme;
@@ -1381,7 +1208,6 @@ mod tests {
             selection: 0x00cc_cccc,
         };
 
-        // Auto follows the system on both bands: terminal theme, untouched.
         assert_eq!(
             resolve_chrome_palette(WindowTheme::Auto, dark_term),
             dark_term
@@ -1391,7 +1217,6 @@ mod tests {
             light_term
         );
 
-        // Forced light over a dark terminal authors a light chrome.
         let forced = resolve_chrome_palette(WindowTheme::Light, dark_term);
         assert_ne!(
             forced, dark_term,
@@ -1401,16 +1226,12 @@ mod tests {
             !crate::tab_bar::theme_is_dark(forced.bg),
             "forced light must yield a LIGHT chrome bg (matches the light caption)"
         );
-        // It is exactly the authored forced-light palette.
         assert_eq!(forced, forced_chrome_theme(dark_term, false));
 
-        // Forced dark over a light terminal authors a dark chrome.
         let forced_dark = resolve_chrome_palette(WindowTheme::Dark, light_term);
         assert!(crate::tab_bar::theme_is_dark(forced_dark.bg));
         assert_eq!(forced_dark, forced_chrome_theme(light_term, true));
 
-        // A forced value whose darkness already matches keeps the terminal
-        // theme (a dark terminal + forced dark).
         assert_eq!(
             resolve_chrome_palette(WindowTheme::Dark, dark_term),
             dark_term
@@ -1422,7 +1243,6 @@ mod tests {
     }
 
     /// The forced chrome palettes go through [`roles`] like every terminal theme, so they
-    /// hold the same contract for every carried accent.
     #[test]
     fn forced_chrome_themes_meet_the_roles_contract_for_any_carried_accent() {
         let donors = THEMES
@@ -1432,15 +1252,11 @@ mod tests {
         for (name, terminal) in donors {
             for dark in [false, true] {
                 let forced = forced_chrome_theme(terminal, dark);
-                // The authored side really is that side under the shared chrome
-                // classifier.
                 assert_eq!(surface_is_dark(packed_rgb(forced.bg)), dark);
                 assert!(
                     contrast_ratio(packed_rgb(forced.fg), packed_rgb(forced.bg)) >= 7.0,
                     "authored chrome text is comfortably readable on its own surface"
                 );
-                // The carried accent seed arrives as a real colour on the forced
-                // surface (the shipped accent is floored again by `roles`).
                 assert!(
                     contrast_ratio(packed_rgb(forced.cursor), packed_rgb(forced.bg))
                         >= FORCED_CHROME_ACCENT_FLOOR - 0.01
@@ -1451,7 +1267,6 @@ mod tests {
                 );
             }
         }
-        // The seed constants replace fg/bg; selection is carried verbatim.
         let light = forced_chrome_theme(THEMES[1], false);
         assert_eq!(light.bg, FORCED_LIGHT_CHROME_BG);
         assert_eq!(light.fg, FORCED_LIGHT_CHROME_FG);
@@ -1480,10 +1295,6 @@ mod tests {
     }
 
     /// A DEVELOPMENT BUILD'S INJECTED TEXT SCALE STANDS OVER THE OS'S
-    /// ([`super::inject_text_scale`]): a re-sample that installs the platform's
-    /// reading keeps it, `text-scale os` clears it, and the verb takes a scale
-    /// in 0.85..=2.0 or `os` and refuses the rest and any injection in a
-    /// build without the seam.
     #[test]
     fn an_injected_text_scale_survives_a_resample_until_cleared() {
         super::inject_text_scale(Some(2.0));

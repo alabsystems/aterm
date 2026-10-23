@@ -1,35 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The re-key channel, host side: how an adopted shell whose shell-integration nonce did
-//! not survive a seamless update gets a new one. A shell fixes its nonce at source time, so
-//! without it every mark (`detail=`, blocks, exit codes, prompt navigation) stays dropped
-//! for the tab's life.
-//!
-//! At spawn the host exports `ATERM_REKEY_PATH` = `<control dir>/rekey/<sid>` to every
-//! zsh/bash/fish it integrates; the script captures and scrubs it and checks it at every
-//! prompt (`__aterm_rekey_check`, one fork-free `[[ -f ]]`). The handoff record says whether
-//! a session has the channel (`SessionRecord::rekey`), since only a shell spawned with the
-//! path reads the file. A successor that adopts such a session degraded (no nonce or no
-//! screen carried) writes a fresh nonce there ([`deliver`]) and only then authorizes it on
-//! the engine (`spawn::hydrate_adopted_engine`); the key never appears in typed text,
-//! scrollback or history. `status integration=` reads `on` from the first mark signed with
-//! it (`Terminal::authorize_shell_integration_on_first_mark`), which a tab running a long
-//! program may reach hours later. There is no expiry, which would skip exactly the tabs
-//! that sit longest at a foreground program: a key not yet taken does not cross the next
-//! update, whose successor writes a fresh one. Under an overlap handoff the write waits for
-//! Commit ([`Deferred`]).
-//!
-//! A shell spawned before the channel has no hook and stays `degraded`. Nothing types a
-//! re-key line into it unprompted (its foreground is usually an agent, which would read the
-//! line as a prompt), but the live agent upgrade, which has ended the agent and is about to
-//! type its relaunch line, asks the window for a typed re-key ([`typed`]): a one-use file
-//! `<control dir>/rekey/<sid>.<n>` the relaunch line reads into the globals the old scripts
-//! sign with and removes (`aterm_shell_integration::typed_rekey`). A typed key whose line
-//! never ran is taken back ([`typed::settle`]). For a shell [`typed`]'s `behind` names, the
-//! file also carries this build's script folder and body pointer path, and the line sources
-//! this build's loader (`aterm_shell_integration::typed_rekey_with_loader`, see
-//! `shell_body`).
+//! The re-key channel, host side.
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -37,8 +9,6 @@ use std::path::{Path, PathBuf};
 use aterm_session::SessionId;
 
 /// The directory the re-key files live in: `<control dir>/rekey`, created
-/// `0700`. `None` when there is no private control dir; the channel is then not
-/// offered.
 fn dir() -> Option<PathBuf> {
     crate::control_auth::private_subdir("rekey")
 }
@@ -48,13 +18,7 @@ pub(crate) fn path_for(sid: &SessionId) -> Option<PathBuf> {
     crate::control_auth::sid_file_in(&dir()?, sid)
 }
 
-/// Write `key_hex` (a 64-hex nonce, or a body address) to `path` for the shell to take,
-/// whole: the line goes to a temp file beside it, `.<name>.<pid>.<n>.tmp` (no script reads
-/// a dot name), created exclusively, `0600`, without following a symlink, then renamed over
-/// `path`. The scripts read and remove the file before validating it, so a file written in
-/// place can be consumed empty by a prompt checking in between. `rename` replaces a
-/// leftover at `path` (a stale key, or a planted symlink: the link, not its target) in one
-/// step. A failed write leaves no temp file behind.
+/// Write `key_hex` (a 64-hex nonce, or a body address) to `path` for the shell to take, whole.
 pub(crate) fn deliver(path: &Path, key_hex: &str) -> std::io::Result<()> {
     static TEMP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let name = path
@@ -66,7 +30,6 @@ pub(crate) fn deliver(path: &Path, key_hex: &str) -> std::io::Result<()> {
         std::process::id(),
         TEMP.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
-    // A crashed writer of an earlier process with this pid may have left it.
     let _ = std::fs::remove_file(&temp);
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
@@ -85,10 +48,7 @@ pub(crate) fn deliver(path: &Path, key_hex: &str) -> std::io::Result<()> {
     written
 }
 
-/// Remove session `sid`'s re-key file, if a key is still waiting there (the
-/// session closed before its shell reached a prompt), and the one file a
-/// bash writes beside it, `<sid>.trap` (its fork-free read of the DEBUG trap
-/// its rc set, `aterm_shell_integration::DEBUG_TRAP_SUFFIX`). Best effort.
+/// Remove session `sid`'s pending re-key file and any companion `<sid>.trap` file (`aterm_shell_integration::DEBUG_TRAP_SUFFIX`).
 pub(crate) fn discard(sid: &SessionId) {
     if let Some(path) = path_for(sid) {
         let mut trap = path.clone().into_os_string();
@@ -98,21 +58,14 @@ pub(crate) fn discard(sid: &SessionId) {
     }
 }
 
-/// Re-key an adopted session whose marks are dropped, first half: mint a nonce and write
-/// it to `path`. The raw nonce comes back only when the file was written, for the caller to
-/// authorize on the engine (`spawn::hydrate_adopted_engine`), so a nonce the shell cannot
-/// receive is never authorized. File work: call with no engine lock held. An uncommitted
-/// adoption uses [`mint`] and [`Deferred`] instead.
+/// Re-key an adopted session whose marks are dropped, first half.
 #[cfg(any(unix, windows))]
 pub(crate) fn hand_over(path: &Path, id: u64) -> Option<[u8; 32]> {
     let (pending, raw) = mint(path, id);
     pending.deliver().then_some(raw)
 }
 
-/// A file an adopted shell will read at its next prompt, not written yet: a
-/// re-key for its channel, or the body pointer that moves it onto this build's
-/// integration (`shell_body`). Both wait for an overlap handoff's Commit
-/// ([`Deferred`]).
+/// A file an adopted shell will read at its next prompt, not written yet.
 pub(crate) struct Pending {
     path: PathBuf,
     /// A 64-hex key ([`What::Rekey`]) or a 16-hex folder address ([`What::Body`]).
@@ -130,7 +83,6 @@ enum What {
 
 impl std::fmt::Debug for Pending {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // The key never reaches a log or a panic message.
         f.debug_struct("Pending")
             .field("path", &self.path)
             .field("id", &self.id)
@@ -140,8 +92,7 @@ impl std::fmt::Debug for Pending {
 }
 
 impl Pending {
-    /// The body pointer naming `rev` (a script folder's address) for the shell
-    /// that reads `path` (`shell_body::pending`).
+    /// The body pointer naming `rev` (a script folder's address) for the shell that reads `path` (`shell_body::pending`).
     pub(crate) fn body(path: &Path, rev: &str, id: u64) -> Self {
         Self {
             path: path.to_path_buf(),
@@ -152,7 +103,6 @@ impl Pending {
     }
 
     /// Write the file for the shell to take ([`deliver`]), saying either way.
-    /// `true` when it was written.
     pub(crate) fn deliver(self) -> bool {
         let id = self.id;
         match (deliver(&self.path, &self.content), self.what) {
@@ -189,8 +139,7 @@ impl Pending {
     }
 }
 
-/// Mint a fresh nonce for the shell reading `path`: the re-key to write and the
-/// raw nonce to authorize on the engine.
+/// Mint a fresh nonce for the shell reading `path`.
 #[cfg(any(unix, windows))]
 pub(crate) fn mint(path: &Path, id: u64) -> (Pending, [u8; 32]) {
     let (raw, key_hex) = aterm_core::shell_integration::generate_nonce().into_parts();
@@ -203,13 +152,7 @@ pub(crate) fn mint(path: &Path, id: u64) -> (Pending, [u8; 32]) {
     (pending, raw)
 }
 
-/// The writes of an adoption not yet committed. A successor adopts its shells before the
-/// outgoing process commits, and an abandoned attempt hands every session back; a key file
-/// written meanwhile would move the shell onto a key only the abandoned candidate
-/// authorized (or overwrite the old process's waiting key). So under an overlap handoff the
-/// key is authorized on the engine at once and its write held here until Commit
-/// ([`Self::release`], from the commit waiter, after the reader gate opens). Body pointers
-/// (`shell_body`) wait here too.
+/// The writes of an adoption not yet committed.
 #[derive(Debug)]
 pub(crate) struct Deferred {
     /// `Some`: holding until Commit. `None`: released; a key handed over from
@@ -225,7 +168,7 @@ impl Deferred {
         }
     }
 
-    /// Hold `pending` for the Commit — or, once released, write it now.
+    /// Hold `pending` for the Commit.
     pub(crate) fn hold(&self, pending: Pending) {
         let mut held = self.held.lock().unwrap_or_else(|p| p.into_inner());
         match held.as_mut() {
@@ -237,8 +180,7 @@ impl Deferred {
         }
     }
 
-    /// Whether [`Self::release`] has run (the incoming handoff committed). A test's view: a
-    /// session's drop asks [`Self::withdraw`], which answers the same under one lock.
+    /// Whether [`Self::release`] has run (the incoming handoff committed).
     #[cfg(all(test, unix))]
     pub(crate) fn released(&self) -> bool {
         self.held
@@ -247,23 +189,18 @@ impl Deferred {
             .is_none()
     }
 
-    /// Session `sid` closed. Before Commit, drop only the writes held here for it and
-    /// answer `true`: the files at the sid's paths (`<control dir>/rekey/<sid>`,
-    /// `<control dir>/integration/<sid>`) are then the predecessor's, which resumes the
-    /// shell on a rollback. Once released, hold nothing and answer `false`: the session and
-    /// its files are this process's. One lock, so the answer cannot straddle the Commit.
+    /// Session `sid` closed.
     pub(crate) fn withdraw(&self, sid: &SessionId) -> bool {
         let mut held = self.held.lock().unwrap_or_else(|p| p.into_inner());
         let Some(queue) = held.as_mut() else {
             return false;
         };
-        // Both files are named by the sid itself (`control_auth::sid_file_in`).
         queue
             .retain(|pending| pending.path.file_name() != Some(std::ffi::OsStr::new(sid.as_str())));
         true
     }
 
-    /// The Commit: write every held file; later ones are written at once.
+    /// The Commit: write every held file.
     #[cfg(unix)]
     pub(crate) fn release(&self) {
         let queue = self
@@ -278,10 +215,7 @@ impl Deferred {
     }
 }
 
-// ─── The typed re-key ───
-
-/// Session `sid` closed: drop a typed re-key still waiting for it, with its file
-/// ([`typed::forget`]; the engine goes too, so nothing is left to take back).
+/// Session `sid` closed.
 pub(crate) fn forget_typed(sid: &SessionId) {
     #[cfg(unix)]
     typed::forget(sid);
@@ -289,19 +223,9 @@ pub(crate) fn forget_typed(sid: &SessionId) {
     let _ = sid;
 }
 
-/// The typed re-key, the window's half. The sweep asks (`@<sid> rekey shell=<pid>`,
-/// owner-only) only while `<pid>` leads the tab's foreground process group; the window
-/// writes a fresh key with [`deliver`]'s discipline to a one-use `<sid>.<n>` (never the
-/// channel's `<sid>`), authorizes it as untaken (`on` only from its first signed mark) and
-/// answers the path. A key no shell took must not stand where its file could hand it to
-/// someone else, so the file settles it: by the sweep's `rekey withdraw`, by the window
-/// `TTL` after issue, or when the session closes. A leftover file names a key no engine
-/// authorizes (the carry never takes an untaken key across an update). POSIX only, like
-/// the foreground proof.
+/// The typed re-key, the window's half.
 #[cfg(unix)]
 pub(crate) mod typed {
-    // Imported here, not at the top of the file: this half is POSIX only, and a
-    // Windows build would read them there as unused.
     use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
@@ -312,29 +236,23 @@ pub(crate) mod typed {
     use super::{Path, PathBuf, SessionId};
     use super::{deliver, dir};
 
-    /// How long a typed re-key's file waits for the line that reads it before
-    /// the window settles it ([`settle`]). The relaunch line is typed within
-    /// seconds or not at all (its fenced tries park at most half a minute), so
-    /// this only bounds a key whose sweep died between asking and typing.
+    /// How long a typed re-key's file waits for the line that reads it before the window settles it ([`settle`]).
     pub(crate) const TTL: Duration = Duration::from_secs(120);
 
-    /// Why a typed re-key was not issued: the verb's `ERR rekey <words>`.
+    /// Why a typed re-key was not issued.
     #[derive(Debug, PartialEq, Eq)]
     pub(crate) enum Refusal {
-        /// `integration=on`: the shell's marks already verify, and a re-key would
-        /// move a working shell off its key.
+        /// `integration=on`.
         Healthy,
-        /// `integration=off`: no nonce is required here, so there is nothing to heal.
+        /// `integration=off`.
         Off,
-        /// The re-key channel's own key waits in `<sid>` for this shell's next
-        /// prompt, and a typed one would race it.
+        /// The re-key channel's own key waits in `<sid>` for this shell's next prompt, and a typed one would race it.
         Pending,
         /// No private control dir to put the file in, or a sid that names none.
         NoDir,
-        /// The file could not be written; nothing was authorized.
+        /// The file could not be written.
         Write(std::io::ErrorKind),
-        /// No expiry could be started to settle it later, so it was taken back
-        /// at once.
+        /// No expiry could be started to settle it later, so it was taken back at once.
         NoExpiry(std::io::ErrorKind),
     }
 
@@ -361,16 +279,14 @@ pub(crate) mod typed {
         }
     }
 
-    /// How a typed re-key was settled ([`settle`]): the verb's `OK rekey <word>`.
+    /// How a typed re-key was settled ([`settle`]).
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub(crate) enum Settled {
         /// No typed re-key of this session was waiting.
         None,
-        /// Its file was gone: the shell read the key, which is kept (still `degraded`
-        /// until the first mark signed with it).
+        /// Its file was gone.
         Taken,
-        /// Its file was still there: removed, and the authorization the key
-        /// replaced restored.
+        /// Its file was still there.
         Withdrawn,
     }
 
@@ -386,17 +302,13 @@ pub(crate) mod typed {
     }
 
     /// One issued typed re-key: its file, and the key to settle it by (`None`
-    /// for an upgrade of a healthy shell, which authorized nothing).
     struct Issued {
         serial: u64,
         path: PathBuf,
         nonce: Option<[u8; 32]>,
     }
 
-    /// The typed upgrade: what a shell that is [`behind`] is handed beside its key, this
-    /// build's script folder and the session's body pointer path (lines 2 and 3 of the
-    /// one-use file), so the relaunch line (`aterm_shell_integration::typed_rekey_with_loader`)
-    /// sources this build's loader and the shell reads body pointers from then on.
+    /// The typed upgrade.
     #[derive(Clone, Debug)]
     pub(crate) struct Upgrade {
         /// This build's installed script folder (`ensure_script_set`).
@@ -408,48 +320,26 @@ pub(crate) mod typed {
     /// What an issue writes, decided from the engine under one lock.
     enum Plan {
         /// A degraded shell: a fresh key, authorized as one it has not taken (and the
-        /// upgrade's lines, when it is behind).
         Heal,
         /// A healthy shell that is behind: the key it already signs with, never moved, and
-        /// the upgrade's lines. An older sweep's key-only line reads the same key from the
-        /// first line, so it moves nothing either.
         UpgradeOnly([u8; 32]),
     }
 
     /// The typed re-keys issued and not yet settled, by session: at most one
-    /// each. A leaf lock, never held across an engine lock or a file operation.
     static ISSUED: Mutex<BTreeMap<String, Issued>> = Mutex::new(BTreeMap::new());
 
     /// This process's typed re-key numbers: each file's name is its own.
     static SERIAL: AtomicU64 = AtomicU64::new(1);
 
     /// One issue at a time. [`issue_in`] is a sequence (settle the previous key,
-    /// sweep, write, authorize, record); two interleaved issues of one tab each
-    /// settle nothing and the later record overwrites the earlier, leaving a
-    /// live key in an unsettled file. Held across the whole issue, before the
-    /// engine lock and [`ISSUED`]; nothing that holds either takes it. A settle
-    /// needs no turn: it takes its record out under [`ISSUED`] first, so a settle
-    /// and an issue interleave safely.
     static ISSUING: Mutex<()> = Mutex::new(());
 
     /// Whether the shell of `engine` is behind: the last revision it signed is not this
-    /// build's. A loader whose prompt hook runs signs its body before every prompt, so a
-    /// shell signing none runs a pre-loader integration or a loader whose hook never runs
-    /// (an older fish script under a prompt its config.fish defines, e.g.
-    /// `starship init fish | source`, loses the trampoline where it reads pointers and
-    /// signs); one signing an older build's took a typed upgrade once and no pointer since.
-    /// No pointer reaches either, but this build's loader sourced in place does. Read from
-    /// the engine, never the registry's loader flag, which says a loader was spawned, not
-    /// that it runs. A running loader at a prompt drawn before this build pointed it here
-    /// reads behind too, and the upgrade gives it at once the body its next prompt would
-    /// have taken.
     fn behind(engine: &Terminal) -> bool {
         engine.shell_integration_rev() != Some(crate::shell_body::own_rev())
     }
 
     /// What `term`'s shell may be issued, and whether the upgrade's lines go with it
-    /// (`upgrading` and the shell is [`behind`]): a heal when degraded, an upgrade-only file
-    /// when healthy and upgrading, else why not.
     fn plan(term: &Mutex<Terminal>, upgrading: bool) -> Result<(Plan, bool), Refusal> {
         let engine = crate::term_lock(term);
         let upgrading = upgrading && behind(&engine);
@@ -464,18 +354,12 @@ pub(crate) mod typed {
         }
     }
 
-    /// Issue a typed re-key for session `sid`, whose engine is `term`: the one-use file's
-    /// path, or why not. The caller has proven the tab's shell holds its terminal (the
-    /// verb's foreground check). The window settles it [`TTL`] from now unless the sweep
-    /// does first. `upgrade` builds the typed upgrade's lines (file work, no lock held) and
-    /// is called only for a shell that is [`behind`].
+    /// Issue a typed re-key for session `sid`, whose engine is `term`.
     pub(crate) fn issue(
         term: &Arc<Mutex<Terminal>>,
         sid: &SessionId,
         upgrade: impl FnOnce() -> Option<Upgrade>,
     ) -> Result<PathBuf, Refusal> {
-        // A healthy shell that runs this build's body, or an unintegrated tab, is
-        // refused before anything is touched.
         let (_, upgrading) = plan(term, true)?;
         let upgrade = upgrading.then(upgrade).flatten();
         let dir = dir().ok_or(Refusal::NoDir)?;
@@ -488,15 +372,13 @@ pub(crate) mod typed {
                 settle_issued(&engine, &session, Some(serial));
             });
         if let Err(e) = expiry {
-            // Nothing would take it back later, so it is taken back now.
             settle_issued(term, sid, Some(serial));
             return Err(Refusal::NoExpiry(e.kind()));
         }
         Ok(path)
     }
 
-    /// [`issue`] into `dir`, without the expiry and without an upgrade: the
-    /// file's path and the key's serial (the tests' and the conformance's form).
+    /// [`issue`] into `dir`, without the expiry and without an upgrade.
     #[cfg(test)]
     pub(crate) fn issue_in(
         dir: &Path,
@@ -506,9 +388,7 @@ pub(crate) mod typed {
         issue_upgrading_in(dir, term, sid, None)
     }
 
-    /// [`issue_in`] with the typed upgrade's lines for a shell that is [`behind`]: after a
-    /// fresh key for a degraded shell, after the key it already signs with for a healthy
-    /// one. A shell on this build's revision gets none (a degraded one, its key alone).
+    /// [`issue_in`] with the typed upgrade's lines for a shell that is [`behind`].
     pub(crate) fn issue_upgrading_in(
         dir: &Path,
         term: &Mutex<Terminal>,
@@ -517,8 +397,6 @@ pub(crate) mod typed {
     ) -> Result<(PathBuf, u64), Refusal> {
         let channel = crate::control_auth::sid_file_in(dir, sid).ok_or(Refusal::NoDir)?;
         let _one = ISSUING.lock().unwrap_or_else(|p| p.into_inner());
-        // An earlier typed re-key of this session is settled first, by its file,
-        // so the authorization a new one replaces is the one the shell really has.
         settle_issued(term, sid, None);
         let (planned, upgrading) = plan(term, upgrade.is_some())?;
         if channel.exists() {
@@ -546,8 +424,6 @@ pub(crate) mod typed {
             ),
             None => key_hex,
         };
-        // Written before it is authorized: a key the shell cannot receive is
-        // never authorized.
         deliver(&path, &content).map_err(|e| Refusal::Write(e.kind()))?;
         let refused = {
             let mut engine = crate::term_lock(term);
@@ -556,7 +432,6 @@ pub(crate) mod typed {
                     engine.authorize_shell_integration_rekey(nonce);
                     None
                 }
-                // The upgrade names the key in use: still the one in use.
                 (ShellIntegrationPosture::On, None, Some(kept))
                     if engine.shell_integration_nonce_in_use() == Some(kept) =>
                 {
@@ -566,8 +441,6 @@ pub(crate) mod typed {
             }
         };
         if let Some(no) = refused {
-            // A mark verified between the look and the write (healthy now), or
-            // the key an upgrade named moved: nothing is issued.
             let _ = std::fs::remove_file(&path);
             return Err(no);
         }
@@ -605,7 +478,6 @@ pub(crate) mod typed {
     }
 
     /// Remove `<sid>.<n>` files no live key names: left by a window that exited
-    /// before its expiry settled them. Never the channel's own `<sid>`.
     fn sweep_leftovers(dir: &Path, sid: &SessionId) {
         let prefix = format!("{}.", sid.as_str());
         let Ok(entries) = std::fs::read_dir(dir) else {
@@ -622,16 +494,12 @@ pub(crate) mod typed {
         }
     }
 
-    /// Settle the typed re-key waiting for session `sid` (the verb's `rekey
-    /// withdraw`) by its file: gone, the key is kept; still there, the file is
-    /// removed and the key taken back.
+    /// Settle the typed re-key waiting for session `sid` (the verb's `rekey withdraw`) by its file.
     pub(crate) fn settle(term: &Mutex<Terminal>, sid: &SessionId) -> Settled {
         settle_issued(term, sid, None)
     }
 
-    /// [`settle`] for the key numbered `serial` only (`None`: whichever is waiting), the
-    /// expiry's form, which must never settle a later key. An upgrade-only issue
-    /// authorized nothing, so only its file is settled.
+    /// [`settle`] for the key numbered `serial` only (`None`: whichever is waiting), the expiry's form, which must never settle a later key.
     pub(crate) fn settle_issued(
         term: &Mutex<Terminal>,
         sid: &SessionId,
@@ -647,7 +515,6 @@ pub(crate) mod typed {
         let Some(issued) = issued else {
             return Settled::None;
         };
-        // The file decides. Removed now: it was still waiting, so the line never ran.
         let unread = match std::fs::remove_file(&issued.path) {
             Ok(()) => true,
             Err(e) => e.kind() != std::io::ErrorKind::NotFound,
@@ -671,8 +538,7 @@ pub(crate) mod typed {
         }
     }
 
-    /// Session `sid` closed: its waiting typed re-key's file goes with it (the engine goes
-    /// too, so nothing is left to take back).
+    /// Session `sid` closed.
     pub(crate) fn forget(sid: &SessionId) {
         let issued = {
             let mut issued = ISSUED.lock().unwrap_or_else(|p| p.into_inner());
@@ -698,8 +564,6 @@ mod tests {
     }
 
     /// The key lands 0600 with its newline, replacing a stale key, and a planted
-    /// symlink at the path is replaced without writing through it. Neither a
-    /// delivery nor a failed one leaves its temp file in the directory.
     #[test]
     fn delivery_is_private_exclusive_and_never_through_a_symlink() {
         use std::os::unix::fs::PermissionsExt as _;
@@ -734,7 +598,6 @@ mod tests {
         );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "bb\n");
 
-        // A directory at the path refuses the rename: an error, and no temp.
         let occupied = dir.path().join("s-cd");
         std::fs::create_dir(&occupied).unwrap();
         std::fs::write(occupied.join("x"), "").unwrap();
@@ -743,8 +606,6 @@ mod tests {
     }
 
     /// A command cycle (prompt, command line, start) signed with `id`
-    /// (`";id=<hex>"`, or `""` for none); `status detail=` reads the running
-    /// command from it, so it shows whether marks reach the engine.
     fn cycle(id: &str) -> String {
         format!(
             "\x1b]133;A{id}\x07$ \x1b]633;E;claude --resume{id}\x07\x1b]133;B{id}\x07\
@@ -753,7 +614,6 @@ mod tests {
     }
 
     /// The carry of a parent that lost the shell's nonce: the requirement
-    /// crosses in `modes`, the nonce does not.
     fn carry_without_nonce() -> aterm_core::terminal::TerminalCheckpoint {
         let mut parent = Terminal::new(24, 80);
         parent.set_require_shell_integration_nonce(true);
@@ -771,9 +631,6 @@ mod tests {
     }
 
     /// A session with the channel, adopted with its nonce requirement and no nonce (or no
-    /// screen), gets a key in its file from `spawn::hydrate_adopted_engine`. Marks signed
-    /// with the old key or none stay dropped; the posture reads `degraded` until the first
-    /// mark signed with the new key, then `on`.
     #[test]
     fn the_adoption_rekeys_a_degraded_shell_that_has_the_channel() {
         let dir = scratch("rk-heal");
@@ -828,15 +685,12 @@ mod tests {
     }
 
     /// Under an overlap handoff the old key stays in the file through an abandoned
-    /// attempt, and the Commit writes the new one, which the engine (authorized at
-    /// adoption) verifies.
     #[test]
     fn an_uncommitted_adoption_holds_its_key_until_the_commit() {
         let dir = scratch("rk-deferred");
         let path = dir.path().join("s-ab");
         let old_key = "7".repeat(64);
         deliver(&path, &old_key).expect("the old process's own waiting key");
-        // Abandoned: the queue is dropped unreleased (the candidate exits).
         let term = std::sync::Mutex::new(Terminal::new(24, 80));
         let queue = Deferred::holding();
         crate::spawn::hydrate_adopted_engine(
@@ -851,7 +705,6 @@ mod tests {
         assert_eq!(key_in(&path), old_key, "held: the old key still waits");
         drop(queue);
         assert_eq!(key_in(&path), old_key, "abandoned: nothing was written");
-        // Committed: the release writes the key the engine already verifies.
         let term = std::sync::Mutex::new(Terminal::new(24, 80));
         let queue = Deferred::holding();
         crate::spawn::hydrate_adopted_engine(
@@ -875,16 +728,12 @@ mod tests {
             "authorized at adoption, taken after the Commit"
         );
         drop(engine);
-        // After the Commit a key is written at once.
         let later = dir.path().join("s-cd");
         queue.hold(mint(&later, 2).0);
         assert!(later.exists(), "released: written at once");
     }
 
     /// Negative controls: a shell without the channel gets no file and stays
-    /// `degraded`; a channel whose file cannot be written authorizes nothing and
-    /// stays `degraded`; a session whose nonce did cross is `on` with nothing
-    /// written.
     #[test]
     fn the_adoption_writes_no_key_where_none_is_wanted_or_deliverable() {
         let dir = scratch("rk-controls");
@@ -945,10 +794,7 @@ mod tests {
         );
     }
 
-    // ─── The typed re-key ───
-
     /// An adopted shell whose nonce did not cross the update, from a build with
-    /// no re-key channel: `integration=degraded`.
     fn lost_nonce_engine() -> Mutex<Terminal> {
         let mut t = Terminal::new(24, 80);
         t.restore_checkpoint(&carry_without_nonce());
@@ -965,8 +811,6 @@ mod tests {
     }
 
     /// A degraded tab gets a private one-use `<sid>.<n>` file beside the channel's `<sid>`,
-    /// holding a fresh key. It reads `degraded`, dropping unsigned, old-key and forged
-    /// marks, until the first cycle signed with the key lands (`integration=on`).
     #[test]
     fn a_typed_rekey_heals_a_degraded_tab_from_its_first_signed_mark() {
         use std::os::unix::fs::PermissionsExt as _;
@@ -1001,7 +845,6 @@ mod tests {
             ShellIntegrationPosture::On
         );
         drop(engine);
-        // The line removed the file; the window then finds it read.
         std::fs::remove_file(&path).unwrap();
         assert_eq!(
             typed::settle_issued(&term, &sid, None),
@@ -1010,8 +853,6 @@ mod tests {
     }
 
     /// A healthy tab is refused (a re-key would move a working shell off its
-    /// key), as are one with no integration and one whose channel key already
-    /// waits for its next prompt, each with nothing written.
     #[test]
     fn a_typed_rekey_is_refused_where_nothing_is_lost() {
         let dir = scratch("rk-typed-refused");
@@ -1051,14 +892,9 @@ mod tests {
     }
 
     /// A healthy shell that is behind (signing no revision, or an older build's) is issued
-    /// the key it already signs with plus this build's folder and pointer path; nothing on
-    /// the engine changes. A degraded one gets a fresh key with the same two lines. A
-    /// healthy shell on this build's revision, or with no upgrade to hand, is refused with
-    /// nothing written.
     #[test]
     fn a_shell_behind_this_build_is_issued_the_upgrade_healthy_or_not() {
         use aterm_core::shell_integration::hex_encode;
-        // Sids no other test here uses: the issued keys are one process-wide map.
         let dir = scratch("rk-typed-upgrade");
         let up = typed::Upgrade {
             folder: PathBuf::from("/c/shell-integration/0123456789abcdef"),
@@ -1160,19 +996,15 @@ mod tests {
     }
 
     /// A key whose line never ran is taken back with its file, so a mark signed with it is
-    /// dropped. The expiry settles only its own key, a second key supersedes an unread
-    /// first, and a closing session takes its file along; a read key is kept (`Taken`).
     #[test]
     fn a_typed_rekey_whose_line_never_ran_is_taken_back() {
         let dir = scratch("rk-typed-withdraw");
         let (term, sid) = (lost_nonce_engine(), sid(3));
         let (first, first_serial) = typed::issue_in(dir.path(), &term, &sid).expect("issued");
         let first_key = key_in(&first);
-        // A second key over the unread first: the first is taken back, its file gone.
         let (second, second_serial) = typed::issue_in(dir.path(), &term, &sid).expect("issued");
         assert!(!first.exists(), "the unread first key's file went with it");
         assert_ne!(key_in(&second), first_key);
-        // The first key's expiry does not settle the second.
         assert_eq!(
             typed::settle_issued(&term, &sid, Some(first_serial)),
             typed::Settled::None
@@ -1201,7 +1033,6 @@ mod tests {
         drop(engine);
         assert_eq!(typed::settle(&term, &sid), typed::Settled::None, "once");
 
-        // Negative control: read, so kept.
         let (read, _) = typed::issue_in(dir.path(), &term, &sid).expect("issued");
         let key = key_in(&read);
         std::fs::remove_file(&read).unwrap();
@@ -1214,7 +1045,6 @@ mod tests {
         );
         drop(engine);
 
-        // A session that closes takes its waiting file with it.
         let term = lost_nonce_engine();
         let (waiting, _) = typed::issue_in(dir.path(), &term, &sid).expect("issued");
         forget_typed(&sid);
@@ -1223,15 +1053,10 @@ mod tests {
     }
 
     /// Leftovers of a window that exited first are swept by the next typed
-    /// re-key of the same session (a stale `<sid>.<n>` file, and a symlink at
-    /// such a name, removed without writing its target); the channel's own file
-    /// and another session's are left alone.
     #[test]
     fn a_typed_rekey_sweeps_what_a_dead_window_left_and_nothing_else() {
         let dir = scratch("rk-typed-sweep");
         let (term, sid) = (lost_nonce_engine(), sid(4));
-        // Serials no issue of this process draws: the counter is process-wide,
-        // and a low serial could be a live key issued by a parallel test.
         let stale = dir
             .path()
             .join(format!("{}.{}", sid.as_str(), u64::MAX - 1));
@@ -1258,14 +1083,6 @@ mod tests {
     }
 
     /// Two issues of one tab at once leave nothing standing: both are issued
-    /// (the second settling the first), and once the waiting one is settled no
-    /// file holds a key the engine would verify.
-    ///
-    /// Fifty rounds: with `ISSUING` taken out of `issue_upgrading_in`, 48 to
-    /// 94% of rounds left a file (alone, and beside a whole run of this
-    /// binary; the first such round was round 0 to 5), so fifty rounds miss
-    /// that race less than once in 10^14. The 400 rounds this ran before spent
-    /// 10.5 s of a loaded binary run on 800 thread spawns (2026-10-20).
     #[test]
     fn two_issues_at_once_leave_no_key_in_a_file() {
         use std::sync::{Arc, Barrier};

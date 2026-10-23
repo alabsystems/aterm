@@ -1,45 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE PROVEN SELF-CLAIM (the codex-alab native harness contract, §1–§2): an
-//! agent ALab builds from source supervises ITSELF, and aterm watches beside
-//! it (aterm supervises no Codex: the Codex screen lane's retirement,
-//! 2026-10-16) — the claim counts only where the kernel proves it is the
-//! agent's own.
-//!
-//! A `meta set supervisor codex-alab@<pid>` is PROVEN when, and only when:
-//!
-//! * it arrived on a DIRECT local connection — one a pooled lane accepted on
-//!   the instance's own listener, never the bridge's inherited `socketpair`
-//!   (nor a `dial`'s takeover, a `@child` proxy or a network relay, whose
-//!   peer is a relay process, never the agent);
-//! * the kernel's peer pid of that connection, read right after the request
-//!   line ([`aterm_uds::fdpass::peer_pid`], Darwin's `LOCAL_PEERPID`: the
-//!   connection's last writer), EQUALS `<pid>`;
-//! * `<pid>` LEADS the session's foreground process group, read live from
-//!   the PTY master (`tcgetpgrp`), not from the sweep's last sighting;
-//! * `<pid>` RUNS AN ALAB BUILD: the kernel's image of the process
-//!   (`proc_pidpath`) lies in a Codex package whose root carries
-//!   `alab-build.json` ([`codex_alab::alab_bytes`]), so another program
-//!   that leads the group — a shell, a vendor `codex`, a tool a model ran in
-//!   the foreground — proves nothing, whatever pid it names;
-//! * the claim is connection-bound (no `ttl=`): the connection is
-//!   close-on-exec, so an `execve` into another image ends the claim with it;
-//! * and the kernel names its start ([`restart_stamp::kernel_start`]), which
-//!   the claim keeps as its identity (a reused pid is never the claim's).
-//!
-//! A descendant proves nothing while it runs another image: a model's tool
-//! process is a child of the TUI, its own pid is its peer pid, and its image
-//! is never an ALab build's (a tool that is codex-alab itself is the agent
-//! all the same). The holder's spelling proves nothing either: an unproven
-//! `codex-alab@…` claim is an ordinary foreign claim ([`Proven`] absent).
-//!
-//! What a proof buys (`session_timeline::claim_supervisor_as`): it REPLACES a
-//! live `aterm-harness@…` claim (the window host's own; its loop's connection
-//! is cut at once) and a proven claim whose process is gone; any other
-//! replacement stays `ERR busy`. A proven claim is renewed only by a proven
-//! request, and is cleared when its process leaves the foreground group or
-//! exits (`session_timeline::release_proven_if_gone`, from the status sweep).
+//! Kernel-proven `codex-alab@<pid>` self-claim verification and live session-record copies.
 
 use std::sync::{Mutex, PoisonError};
 
@@ -49,29 +11,23 @@ use aterm_agent::harness::{codex_alab, restart_stamp};
 /// The holder prefix a self-claim is made under: `codex-alab@<pid>`.
 pub(crate) const SELF_CLAIM_PREFIX: &str = "codex-alab@";
 
-/// A claim the kernel proved is its agent's own ([`prove`]): the agent's pid
-/// and its kernel start, the identity every later look checks it by.
+/// Kernel-proven self-claim identity (`pid` and kernel `start`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Proven {
-    /// The agent's pid: the connection's peer and the foreground group's
-    /// leader at the claim.
+    /// Agent pid (connection peer and foreground process group leader at the claim).
     pub(crate) pid: u32,
     /// Its kernel start, as [`restart_stamp::kernel_start`] spells it.
     pub(crate) start: String,
 }
 
 impl Proven {
-    /// Whether the very process the proof named still runs (its pid, alive,
-    /// with the same kernel start). A syscall on macOS and Windows (a `ps`
-    /// elsewhere): never asked under a lock.
+    /// Whether the proven process (`pid` and `start`) is still alive.
     pub(crate) fn alive(&self) -> bool {
         restart_stamp::alive_as(self.pid, &self.start)
     }
 }
 
-/// The pid a self-claim's holder names: `codex-alab@<pid>` in its one
-/// canonical spelling (no sign, no leading zero), above 1. `None` for any
-/// other holder.
+/// Parse canonical `<pid>` (> 1) from a `codex-alab@<pid>` holder string.
 #[must_use]
 pub(crate) fn holder_pid(holder: &str) -> Option<u32> {
     let digits = holder.strip_prefix(SELF_CLAIM_PREFIX)?;
@@ -82,21 +38,15 @@ pub(crate) fn holder_pid(holder: &str) -> Option<u32> {
 /// The proof's facts, as the server read them for one request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Facts {
-    /// The kernel's peer pid of the connection the request came on, read
-    /// right after the request line; `None` off a direct local connection or
-    /// where it cannot be read.
+    /// Kernel peer pid of the requesting local connection.
     pub(crate) peer: Option<u32>,
-    /// The session's foreground process group, read live from its PTY master
-    /// (`<= 0`: none, or unreadable).
+    /// Session foreground process group read live from its PTY master.
     pub(crate) foreground: i32,
-    /// Whether the named pid's image is an ALab build ([`runs_alab_build`]),
-    /// read only once the other facts hold.
+    /// Whether the named pid's executable image is an ALab build.
     pub(crate) alab_image: bool,
 }
 
-/// Whether `holder`'s claim is proven by `facts` (pure): it names a pid that
-/// is the connection's peer, leads the foreground group and runs an ALab
-/// build. The identity is read by [`prove`].
+/// Return the claimed pid if `facts` prove `holder`'s self-claim.
 #[must_use]
 pub(crate) fn proves(holder: &str, facts: Facts) -> Option<u32> {
     let pid = holder_pid(holder)?;
@@ -104,9 +54,7 @@ pub(crate) fn proves(holder: &str, facts: Facts) -> Option<u32> {
     (facts.peer == Some(pid) && leads && facts.alab_image).then_some(pid)
 }
 
-/// Whether process `pid`'s kernel image (`proc_pidpath`) is an ALab build of
-/// Codex ([`codex_alab::alab_bytes`]). `false` where the image cannot be
-/// read. A syscall and a few file reads: never under a lock.
+/// Whether process `pid`'s executable image is an ALab build of Codex.
 #[must_use]
 pub(crate) fn runs_alab_build(pid: u32) -> bool {
     i32::try_from(pid)
@@ -115,9 +63,7 @@ pub(crate) fn runs_alab_build(pid: u32) -> bool {
         .is_some_and(|exe| codex_alab::alab_bytes(&exe))
 }
 
-/// The proof of `holder`'s claim on `facts`, with the agent's kernel start
-/// ([`Proven`]); `None` when any fact fails — or the start cannot be read, so
-/// no later look could tell the process from a reused pid (fail closed).
+/// Prove `holder`'s claim on `facts` and capture its kernel start.
 #[must_use]
 pub(crate) fn prove(holder: &str, facts: Facts) -> Option<Proven> {
     let pid = proves(holder, facts)?;
@@ -125,16 +71,12 @@ pub(crate) fn prove(holder: &str, facts: Facts) -> Option<Proven> {
     Some(Proven { pid, start })
 }
 
-/// Whether `program`, the program in front as the status sweep publishes it
-/// (`status program=`, the `argv[0]` basename), is the one a proven self-claim
-/// speaks for: a Codex, by its own name or an ALab build's `codex-alab`. A wall
-/// read while anything else is in front (Claude Code, a shell, a name not yet
-/// resolved) is not the claimant's, so [`wall_answer`] is not asked of it.
+/// Whether foreground `program` (`status program=`) is a Codex build that a self-claim speaks for.
 #[must_use]
 pub(crate) fn fronts_claimant(program: Option<&str>) -> bool {
     use aterm_phase::Program;
     program.is_some_and(|program| {
-        // An exhaustive match, so a new agent decides here (the agent-gate guard).
+        // Exhaustive over Program.
         match aterm_phase::program_of(program) {
             Some(Program::Codex) => true,
             Some(
@@ -149,14 +91,7 @@ pub(crate) fn fronts_claimant(program: Option<&str>) -> bool {
     })
 }
 
-/// WHO ANSWERS a wall on a session under a PROVEN self-claim (the presence
-/// row and tab chip): the agent itself, when it is a usage wall (the session
-/// or the weekly window) and the `[harness]` policy it reads over `harness
-/// policy` is in `effective` and has `resume_limits` on. codex-alab knows the
-/// exact reset from its own rate-limit snapshot and waits it out, so the band
-/// reads it as aterm's own harness's wall reads (`note`, "resumes by
-/// itself"), never `limited`. Every other wall, or the policy off, is
-/// nobody's: the stop stands for a person (fail closed).
+/// Return `Some("self")` when a proven self-claim answers `wall` by itself under `policy`.
 #[must_use]
 pub(crate) fn wall_answer(
     kind: aterm_phase::WallKind,
@@ -180,29 +115,17 @@ pub(crate) fn wall_answer(
     }
 }
 
-// ATERM'S OWN COPY of codex-alab's session record (the contract, §4).
-
 /// The copy each session's proven claim was last read into, by tab
-/// ([`refresh`]): the record read ONLY while the claim's identity was live —
-/// at the proven claim and at each `meta-change` of the session — so the
-/// exit is decided and relaunched from what the agent itself left
-/// ([`aterm_agent::harness::self_claimed`]), never from the file as anyone
-/// rewrote it after the agent died. Kept past the claim's clear, for the
-/// exit's reader; replaced by the next identity's read.
 static COPIES: Mutex<Copies> = Mutex::new(Copies::new());
 
 /// The copies by tab (a `BTreeMap`, so the static needs no lazy init).
 type Copies = std::collections::BTreeMap<String, Copy>;
 
 /// The line the crash rule last typed in each tab ([`typed`]): what a
-/// codex-alab it started, read before its record's first write, relaunches
-/// on ([`self_claimed::inherited`]: only a process that runs exactly it).
 static TYPED: Mutex<std::collections::BTreeMap<String, self_claimed::Resume>> =
     Mutex::new(std::collections::BTreeMap::new());
 
-/// The crash rule types `resume` in tab `sid` (`harness_host`'s
-/// `self_claimed_exit`): a copy of the process it starts that finds no
-/// record yet inherits it.
+/// Record the `resume` command typed by the crash rule in tab `sid`.
 pub(crate) fn typed(sid: &str, resume: &self_claimed::Resume) {
     TYPED
         .lock()
@@ -219,11 +142,6 @@ fn typed_for(sid: &str) -> Option<self_claimed::Resume> {
 }
 
 /// Read the proven claim's record now, while its identity is live
-/// ([`self_claimed::read_copy`]: looked at before and after the read), and
-/// keep it as aterm's copy. A read that cannot be vouched for keeps the copy
-/// it had. Its revision is checked again before publication: a release or
-/// renewal during the off-lock read invalidates it. Returns whether the claim
-/// still stands. Never on the render or input path.
 fn refresh(ctx: &crate::SessionCtx, proven: &Proven, revision: u64) -> bool {
     let typed = typed_for(ctx.self_id.as_str());
     refresh_by(ctx, proven, revision, || {
@@ -263,9 +181,6 @@ fn refresh_by(
         let before = copies.insert(ctx.self_id.to_string(), copy);
         drop(copies);
         drop(meta);
-        // The line a layout's leaf carries moved: the host follows the
-        // session again, publishing it ([`crate::harness_host`]'s
-        // `with_self_claimed_line`).
         if before.and_then(|copy| copy.resume.ok()) != line {
             crate::harness_host::ring();
         }
@@ -274,7 +189,6 @@ fn refresh_by(
 }
 
 /// Tab `sid`'s live proven claim, read under its meta guard (a clone; the
-/// guard let go before anything is read from disk).
 fn standing(ctx: &crate::SessionCtx) -> Option<(Proven, u64)> {
     let meta = ctx.meta.lock().unwrap_or_else(PoisonError::into_inner);
     meta.live_claim(crate::metrics::now_us())
@@ -282,28 +196,21 @@ fn standing(ctx: &crate::SessionCtx) -> Option<(Proven, u64)> {
         .map(|proven| (proven, meta.supervisor_revision))
 }
 
-/// THE WATCH-ONLY WORKER'S IDLE POINT (the contract, §4): `ctx`'s live
-/// proven claim names the process `pid` started at `start`, and that
-/// process's own session record, read NOW while its identity is live, says it
-/// rests ([`self_claimed::read_idle`]: `status: "idle"`, `draftEmpty:
-/// true`). The meta guard is let go before the read. `false` with no proven
-/// claim, a claim of another process, and anything the read cannot vouch for.
+/// Whether `ctx`'s live proven claim matches `(pid, start)` and its live session record reports idle.
 pub(crate) fn idle_now(ctx: &crate::SessionCtx, pid: u32, start: &str) -> bool {
     standing(ctx).is_some_and(|(proven, _)| {
         proven.pid == pid && proven.start == start && self_claimed::read_idle(pid, start)
     })
 }
 
-/// A `meta-change` of the session: its proven claim's record is read again
-/// while the identity is live (§4, "at each meta-change").
+/// Re-read `ctx`'s proven claim session record on `meta-change` while its identity is live.
 pub(crate) fn meta_changed(ctx: &crate::SessionCtx) {
     if let Some((proven, revision)) = standing(ctx) {
         refresh(ctx, &proven, revision);
     }
 }
 
-/// The copy kept for tab `sid`, whatever identity it names (the exit's
-/// reader matches it to the agent it read the exit of).
+/// Return the kept session-record copy for tab `sid`.
 #[must_use]
 pub(crate) fn copy_of_tab(sid: &str) -> Option<Copy> {
     COPIES
@@ -313,10 +220,7 @@ pub(crate) fn copy_of_tab(sid: &str) -> Option<Copy> {
         .cloned()
 }
 
-/// What a codex-alab session's ROLLOUT TAP reads (`crate::codex_rollout_tap`):
-/// the proven agent's identity, its
-/// primary thread (its record's `sessionId`) and the `$CODEX_HOME` its
-/// record was read under.
+/// Rollout tap target for a proven `codex-alab` session.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct RolloutTarget {
     /// The live claim revision that admitted this copy.
@@ -330,15 +234,7 @@ pub(crate) struct RolloutTarget {
     pub(crate) home: std::path::PathBuf,
 }
 
-/// THE ROLLOUT TAP'S GATE, the claim's half (pure): a target only where a
-/// proven claim stands (`proven`) and aterm's copy of the record was read
-/// under that very identity, standing, naming a thread id as its
-/// `sessionId`. A vendor Codex proves no claim (its image is no ALab
-/// build's), so it names none, and neither does a copy kept past its claim
-/// for the exit's reader. The build's half is the tap's own
-/// (`aterm_agent::harness::codex_tap`: the build the rollout's
-/// `session_meta` names and the one the claimant's image runs now, both
-/// measured).
+/// Resolve the [`RolloutTarget`] when a proven claim and matching live record copy stand.
 #[must_use]
 pub(crate) fn target_of(
     proven: Option<&Proven>,
@@ -363,8 +259,7 @@ pub(crate) fn target_of(
     })
 }
 
-/// [`target_of`] for one current claim and its copy, under meta → copies.
-/// Neither lock crosses a file or process read.
+/// Read the [`RolloutTarget`] for `ctx` under `meta -> copies`.
 #[must_use]
 pub(crate) fn rollout_target(ctx: &crate::SessionCtx) -> Option<RolloutTarget> {
     let meta = ctx.meta.lock().unwrap_or_else(PoisonError::into_inner);
@@ -377,10 +272,7 @@ pub(crate) fn rollout_target(ctx: &crate::SessionCtx) -> Option<RolloutTarget> {
     )
 }
 
-/// Keeps the claim and its exact record copy current during one bounded
-/// timeline hold. The order is meta → copies → timeline; neither copy
-/// mutator takes the timeline while holding copies, and no timeline holder
-/// acquires either guard. No process or file read may run under this guard.
+/// Guard holding `meta` and `copies` locks across a bounded timeline hold.
 pub(crate) struct RolloutGuard<'a> {
     _meta: std::sync::MutexGuard<'a, crate::session_timeline::SessionMeta>,
     _copies: std::sync::MutexGuard<'static, Copies>,
@@ -404,11 +296,7 @@ pub(crate) fn hold_rollout<'a>(
     })
 }
 
-/// The copy of the process `pid` started at `start` is TAKEN by the reader
-/// of that process's exit: one exit, one decision — a later exit in the tab
-/// (another agent's, with no snapshot to tell them apart) never meets it.
-/// Named `take_copy` because a bare `take` merges in the lock-order census
-/// with `std::mem::take` and `journal::take`.
+/// Take and remove the kept record copy for `(pid, start)` in tab `sid`.
 pub(crate) fn take_copy(sid: &str, pid: u32, start: &str) {
     let mut copies = COPIES.lock().unwrap_or_else(PoisonError::into_inner);
     if copies
@@ -419,9 +307,7 @@ pub(crate) fn take_copy(sid: &str, pid: u32, start: &str) {
     }
 }
 
-/// Tab `sid`'s copy is dropped where its process has ended unread: an exit
-/// nobody decided from it (its worker was switched off, or was reading
-/// another program's exit) is never decided from it later.
+/// Drop tab `sid`'s kept record copy if its process has ended.
 pub(crate) fn discard_dead(sid: &str) {
     let dead = copy_of_tab(sid).filter(|copy| !restart_stamp::alive_as(copy.pid, &copy.start));
     if let Some(copy) = dead {
@@ -451,12 +337,7 @@ pub(crate) fn forget(sid: &str) {
         .remove(sid);
 }
 
-/// A proven claim was GRANTED on tab `sid` ([`crate::session_timeline::
-/// claim_supervisor_as`], replacing `replaced` where it did): the record is
-/// read while the identity is live, and — where the claim MOVED (`moved`: it
-/// was taken, gained its proof, or replaced another) — the window host is
-/// told at once ([`crate::harness_host::self_claimed`]). A renewal (the
-/// agent's per-act re-confirm) reads the record and tells nobody.
+/// Refresh the record copy when a proven claim is granted on `ctx` and notify the host if it moved.
 pub(crate) fn claimed(
     ctx: &crate::SessionCtx,
     proven: &Proven,
@@ -469,21 +350,7 @@ pub(crate) fn claimed(
     }
 }
 
-/// A proven claim on tab `sid` was CLEARED (released, lapsed, or its process
-/// gone from the front): its record is read once more while the identity is
-/// still live (an orderly end removes it first), and the window host is
-/// told whether the agent goes on without it (`true`: codex-alab went
-/// passive, and aterm's worker goes on watching beside the agent itself) or
-/// is gone.
-///
-/// A claim given back by an agent that GOES ON — its record standing with no
-/// word of an end ([`self_claimed::shows_end`]: passive, or an `execve` into
-/// its next build) — leaves no copy: nothing is read from it again while no
-/// proof stands, so its later exit is decided by nobody and nothing relaunches
-/// it (fail closed: no lane reads a Codex's end), never decided from a copy
-/// frozen at the release (a `/new` or a fork since, an orderly `/exit` it
-/// never saw). A next proven claim reads a fresh copy. A release that shows the end coming (the record removed, an
-/// exit word) keeps it, for the exit's reader.
+/// Refresh or clear the record copy when a proven claim is released on `ctx` and notify the host.
 pub(crate) fn released(ctx: &crate::SessionCtx, proven: &Proven, revision: u64) {
     let typed = typed_for(ctx.self_id.as_str());
     if let Some(alive) = released_by(
@@ -505,14 +372,11 @@ fn released_by(
     read: impl FnOnce() -> Option<Copy>,
 ) -> Option<bool> {
     let copy = alive().then(read).flatten();
-    // Death during read_copy invalidates that read. It is a crash with the
-    // previous copy retained, not a passive handback while still running.
     let alive = alive();
     finish_release(ctx, proven, revision, alive, copy).then_some(alive)
 }
 
 /// Commit the final live read only at the release that admitted it. The meta
-/// guard also excludes earlier refreshes until the keep/remove decision ends.
 fn finish_release(
     ctx: &crate::SessionCtx,
     proven: &Proven,
@@ -539,17 +403,12 @@ fn finish_release(
     {
         drop(copies);
         drop(meta);
-        // No line to carry any more: the host publishes the session again.
         crate::harness_host::ring();
     }
     true
 }
 
-/// A process for a test's proof to name, never the test process itself: a
-/// proven claim reads its process's codex-alab record live
-/// ([`self_claimed::read_copy`]: the exec-time `CODEX_HOME`, else
-/// `$HOME/.codex`), and a test process's own environment names the person's
-/// `~/.codex`.
+/// Stand-in child process helper for self-claim tests.
 #[cfg(test)]
 pub(crate) mod stand_in {
     use super::Proven;
@@ -558,9 +417,6 @@ pub(crate) mod stand_in {
     const STAND_IN_ENV: &str = "ATERM_SELF_CLAIM_TEST_STAND_IN";
 
     /// THE STAND-IN'S BODY: this test binary, which waits for its parent's
-    /// end of the pipe to close. Idle unless asked. Not `/bin/cat`: the
-    /// kernel shows nobody an Apple platform binary's environment, and a
-    /// proven claim reads its process's.
     #[test]
     fn a_stand_in_agent_when_asked() {
         use std::io::Read as _;
@@ -570,10 +426,7 @@ pub(crate) mod stand_in {
         let _ = std::io::stdin().read(&mut [0u8; 1]);
     }
 
-    /// The stand-in's pid: started once, with a scratch `HOME` and
-    /// `CODEX_HOME` under this binary's own root
-    /// (`aterm_types::dirs::test_root`). It reads a stdin only this binary
-    /// holds, so it ends when this binary does.
+    /// Pid of the shared stand-in child process started under a scratch `HOME`.
     pub(crate) fn pid() -> u32 {
         use aterm_uds::spawnfd::{Child, Stdio, command};
         static STAND_IN: std::sync::OnceLock<Child> = std::sync::OnceLock::new();
@@ -600,8 +453,7 @@ pub(crate) mod stand_in {
             .id()
     }
 
-    /// The proof of a process that runs: the stand-in, by its pid and kernel
-    /// start.
+    /// [`Proven`] identity of the running stand-in child process.
     pub(crate) fn running() -> Proven {
         let pid = pid();
         Proven {
@@ -642,13 +494,6 @@ mod tests {
     }
 
     /// THE ROLLOUT TAP'S CLAIM GATE: only a
-    /// proven claim's own copy, standing and naming a thread id, names a
-    /// rollout to tap — its thread, under the home the record was read
-    /// under. No claim standing (a vendor Codex: no proof), a copy of
-    /// another identity (a reused pid, an earlier process), a record gone or
-    /// never written, and a `sessionId` that is no thread id name none.
-    /// NEGATIVE CONTROL (scratch, `codex_tap` notes): drop the proven check
-    /// and the vendor case names a target.
     #[test]
     fn only_a_proven_claims_own_copy_names_a_rollout_target() {
         const THREAD: &str = "0199f2a4-6c1e-7a52-9d3b-2f6c8e1a4b77";
@@ -687,7 +532,6 @@ mod tests {
     }
 
     /// Only a usage wall, only with the policy in effect and `resume_limits`
-    /// on, is the self-claim's own to wait out; everything else stays a stop.
     #[test]
     fn a_self_claim_answers_only_a_usage_wall_under_resume_limits() {
         use aterm_agent::supervise::SupervisorConfig;
@@ -721,8 +565,6 @@ mod tests {
     }
 
     /// A self-claim speaks for a Codex in front, by either name it runs
-    /// under. NEGATIVE CONTROLS: another agent, a shell, a look-alike name and
-    /// a program not yet resolved are not the claimant.
     #[test]
     fn a_self_claim_speaks_only_for_a_codex_in_front() {
         for claimant in [
@@ -750,7 +592,6 @@ mod tests {
     #[test]
     fn a_holder_names_its_pid_in_one_spelling() {
         assert_eq!(holder_pid("codex-alab@4242"), Some(4242));
-        // Negative controls: another holder, a non-canonical or absent pid.
         for other in [
             "aterm-harness@4242",
             "codex-alab@",
@@ -773,7 +614,6 @@ mod tests {
             alab_image: true,
         };
         assert_eq!(proves("codex-alab@500", facts(Some(500), 500)), Some(500));
-        // Another program leading the group under that pid proves nothing.
         assert_eq!(
             proves(
                 "codex-alab@500",
@@ -784,8 +624,6 @@ mod tests {
             ),
             None
         );
-        // A descendant (its own peer pid), a peer that does not lead, a
-        // connection with no peer (the bridge, a relay), and another holder.
         assert_eq!(proves("codex-alab@500", facts(Some(501), 500)), None);
         assert_eq!(proves("codex-alab@500", facts(Some(500), 499)), None);
         assert_eq!(proves("codex-alab@500", facts(None, 500)), None);
@@ -845,8 +683,6 @@ mod tests {
         ));
         assert!(copy_of_tab(sid).is_some(), "the standing claim publishes");
 
-        // Handback finishes while an earlier disk read is in flight. Its
-        // result must not restore the frozen pre-handback record.
         assert!(!refresh_by(ctx, &proven, first.revision, || {
             assert!(release_supervisor(ctx, None, now, aterm_slog::Actor::Ctl));
             let revision = ctx.meta.lock().unwrap().supervisor_revision;
@@ -874,8 +710,6 @@ mod tests {
         )
         .expect("the same identity claims again");
         assert!(refresh_by(ctx, &proven, next.revision, || Some(standing())));
-        // An older release's final read cannot overwrite the next claim,
-        // even when that claim names the same pid and kernel start.
         assert!(!finish_release(
             ctx,
             &proven,
@@ -888,8 +722,6 @@ mod tests {
             self_claimed::Seen::Present(_)
         ));
 
-        // Positive control: the current release freezes an orderly end, for
-        // the exit reader, while still refusing the earlier claim's read.
         assert!(release_supervisor(ctx, None, now, aterm_slog::Actor::Ctl));
         let revision = ctx.meta.lock().unwrap().supervisor_revision;
         assert!(finish_release(
@@ -910,8 +742,6 @@ mod tests {
             self_claimed::Seen::Removed
         ));
 
-        // A live identity may die while its final read is off-lock. That
-        // read cannot vouch for a new copy; retain the old crash record.
         let next = claim_supervisor_as(
             ctx,
             holder,
@@ -944,9 +774,6 @@ mod tests {
             self_claimed::Seen::Present(_)
         ));
 
-        // THE KEPT COPY FOLDS ITS READS (AD-3): a read that finds nothing
-        // after one that found the record keeps a REMOVAL; a first read that
-        // finds nothing keeps NEVER — no orderly end it never saw.
         let next = claim_supervisor_as(
             ctx,
             holder,
@@ -970,21 +797,12 @@ mod tests {
     }
 
     /// THE WATCH-ONLY WORKER'S IDLE POINT, live ([`idle_now`]): a real
-    /// stand-in process (the kept signed `sleep`, its `CODEX_HOME` the
-    /// test's directory) holding the session's PROVEN claim, with a PLANTED
-    /// record saying `idle` and `draftEmpty: true`, is at its idle point; the
-    /// record saying `busy` is not. NEGATIVE CONTROLS: the claim's process
-    /// named under another pid or start, the claim released (no proof
-    /// stands), and the process gone (a dead identity) read no idle point.
     #[cfg(target_vendor = "apple")]
     #[test]
     fn the_idle_point_is_the_proven_processs_own_record_read_live() {
         use crate::session_timeline::{claim_supervisor_as, release_supervisor};
         let dir = aterm_tempfile::TempDir::new().expect("dir");
         let home = std::fs::canonicalize(dir.path()).expect("canonical");
-        // The kept stand-in, run in place: never a copy in `home`, which goes
-        // when the test ends, while macOS may still assess its first exec
-        // (`aterm_uds::deadline::stand_in`).
         let sleep = std::fs::canonicalize(aterm_uds::deadline::stand_in(std::path::Path::new(
             "/bin/sleep",
         )))
@@ -996,7 +814,6 @@ mod tests {
             .spawn()
             .expect("spawn sleep");
         let pid = child.id();
-        // Its exec has landed once its own argv reads back (a hang detector).
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
         while !atpkg::caller_shell::process_args(pid)
             .is_some_and(|a| a.argv.first() == Some(&sleep_s))
@@ -1075,12 +892,10 @@ mod tests {
             foreground: i32::try_from(me).expect("a pid"),
             alab_image: true,
         };
-        // This test binary is no ALab build: its image proves nothing.
         assert!(!runs_alab_build(me));
         let proven = prove(&holder, facts).expect("this process proves its own claim");
         assert_eq!(proven.pid, me);
         assert!(proven.alive(), "this process runs");
-        // Negative control: the same pid under another start is not it.
         let reused = Proven {
             start: "Thu Jan  1 00:00:00 1970".to_string(),
             ..proven

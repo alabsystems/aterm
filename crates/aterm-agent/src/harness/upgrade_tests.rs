@@ -17,7 +17,6 @@ fn rows(lines: &[&str]) -> Vec<String> {
 
 const ID: &str = "03396a15-856e-4f1b-8174-ae9a3e4b369f";
 
-/// The session file Claude Code 2.1.280 writes for a session.
 const SESSION_9162: &str = r#"{"pid":9162,"sessionId":"03396a15-856e-4f1b-8174-ae9a3e4b369f","cwd":"/Users/_owner/aterm","startedAt":1790194436213,"procStart":"Wed Sep 23 20:13:55 2026","version":"2.1.280","peerProtocol":1,"peerFeatures":["notify_idle","reply_across_default_dirs","artifact_yield"],"kind":"interactive","entrypoint":"cli","pidDomain":"darwin","messagingSocketPath":"/tmp/cc-socks/9162.sock","name":"aterm-83","nameSource":"derived","nameSince":1790194436213,"updatedAt":1790212772957,"status":"busy","statusUpdatedAt":1790212772957}"#;
 
 #[test]
@@ -67,21 +66,16 @@ fn cand(exe: &str, ver: &str, source: Source) -> Candidate {
 fn the_target_is_the_newest_build_never_sideways_and_managed_on_a_tie() {
     let managed_280 = cand("/pkg/agents/claude", "2.1.280", Source::Managed);
     let native_281 = cand("/n/versions/2.1.281", "2.1.281", Source::Native);
-    // Native 2.1.280 running, managed 2.1.280, and the native updater put
-    // 2.1.281 on disk -> the native 2.1.281.
     let t = choose_target(&v("2.1.280"), &[managed_280.clone(), native_281.clone()]);
     assert_eq!(t, Some(native_281.clone()));
-    // A tie at the newest version goes to the managed copy.
     let managed_281 = cand("/pkg/agents/claude", "2.1.281", Source::Managed);
     let t = choose_target(&v("2.1.280"), &[native_281.clone(), managed_281.clone()]);
     assert_eq!(t, Some(managed_281));
-    // Nothing newer: never moved sideways or down.
     assert_eq!(
         choose_target(&v("2.1.281"), &[managed_280.clone(), native_281]),
         None
     );
     assert_eq!(choose_target(&v("2.1.280"), &[managed_280]), None);
-    // The managed twin on an old build moves onto current.
     let t = choose_target(
         &v("2.1.278"),
         &[cand("/pkg/agents/claude", "2.1.280", Source::Managed)],
@@ -94,7 +88,6 @@ fn the_target_is_the_newest_build_never_sideways_and_managed_on_a_tie() {
 
 #[test]
 fn the_rewrite_carries_the_flags_and_resumes_the_conversation() {
-    // A bare --resume (the picker) becomes the id.
     let got = rewrite_argv(
         &argv(&["claude", "--dangerously-skip-permissions", "--resume"]),
         ID,
@@ -103,8 +96,6 @@ fn the_rewrite_carries_the_flags_and_resumes_the_conversation() {
         got,
         Ok(argv(&["--dangerously-skip-permissions", "--resume", ID]))
     );
-    // The resume family goes, with its values, whatever its spelling (the
-    // short and inline ones: `every_short_argv_resumes_with_exactly_the_values_claude_parsed`).
     for form in [
         argv(&["claude", "--continue", "--model", "opus"]),
         argv(&[
@@ -122,8 +113,6 @@ fn the_rewrite_carries_the_flags_and_resumes_the_conversation() {
             "{form:?}"
         );
     }
-    // A variadic flag keeps all its values; the first prompt (a positional) is
-    // dropped, never sent twice; `--` ends options.
     assert_eq!(
         rewrite_argv(
             &argv(&[
@@ -141,7 +130,6 @@ fn the_rewrite_carries_the_flags_and_resumes_the_conversation() {
         Ok(argv(&["--add-dir", "/a", "/b c", "--resume", ID])),
         "a launch --effort is dropped: the resumed session takes the user's default effort"
     );
-    // Fail closed.
     assert_eq!(
         rewrite_argv(&argv(&["claude", "--brand-new-flag", "x"]), ID),
         Err(ArgvRefusal::UnknownFlag("--brand-new-flag".to_string()))
@@ -162,10 +150,6 @@ fn the_rewrite_carries_the_flags_and_resumes_the_conversation() {
     }
 }
 
-/// What Claude's parser made of an argv: every option it met, in order, with the
-/// value it took (a list's values one event each, as Commander emits them), and
-/// the words it took as operands. An unknown option or a missing value ends
-/// Claude before any session exists.
 #[derive(Debug, Default)]
 struct Parsed {
     events: Vec<(String, Option<String>)>,
@@ -174,14 +158,7 @@ struct Parsed {
     missing: bool,
 }
 
-/// Claude's own parser, transcribed branch for branch: `parseOptions` of the
-/// Commander bundled in Claude Code 2.1.281. Its options are the [`FLAGS`]
-/// table: `One` and `Many` are required values, `Many` the variadic one,
-/// `Optional` an optional value, `None` a boolean. The positional-options stop
-/// is left out: it fires only on an operand naming a subcommand (`claude mcp
-/// …`), never a live session.
 fn claude_parses(args: &[String]) -> Parsed {
-    // `function r(o){return o.length>1&&o[0]==="-"}`
     let r = |o: &str| o.len() > 1 && o.starts_with('-');
     let mut p = Parsed::default();
     let mut s: std::collections::VecDeque<String> = args.iter().skip(1).cloned().collect();
@@ -204,7 +181,7 @@ fn claude_parses(args: &[String]) -> Parsed {
             match arity {
                 Arity::One | Arity::Many => {
                     let Some(v) = s.pop_front() else {
-                        p.missing = true; // optionMissingArgument
+                        p.missing = true;
                         return p;
                     };
                     p.events.push((o.clone(), Some(v)));
@@ -222,7 +199,6 @@ fn claude_parses(args: &[String]) -> Parsed {
             active = (arity == Arity::Many).then_some(o);
             continue;
         }
-        // `-abc`: a known `-a`, then the rest as its value or as more flags.
         if let Some(c) = o.strip_prefix('-').and_then(|t| t.chars().next())
             && c != '-'
             && o.len() > 1 + c.len_utf8()
@@ -237,7 +213,6 @@ fn claude_parses(args: &[String]) -> Parsed {
             }
             continue;
         }
-        // `--name=value`, for an option that takes a value.
         if let Some(h) = o.find('=')
             && h > 2
             && o.starts_with("--")
@@ -249,7 +224,7 @@ fn claude_parses(args: &[String]) -> Parsed {
             continue;
         }
         if r(&o) {
-            p.unknown = true; // unknownOption
+            p.unknown = true;
             return p;
         }
         p.operands.push(o);
@@ -257,7 +232,6 @@ fn claude_parses(args: &[String]) -> Parsed {
     p
 }
 
-/// The events of `fate` in a parse.
 fn of_fate(p: &Parsed, fate: Fate) -> Vec<(String, Option<String>)> {
     p.events
         .iter()
@@ -268,9 +242,6 @@ fn of_fate(p: &Parsed, fate: Fate) -> Vec<(String, Option<String>)> {
 
 #[test]
 fn every_short_argv_resumes_with_exactly_the_values_claude_parsed() {
-    // Every argv of up to four words over flags of each arity and fate, the
-    // dash-led values that decide consumption, an inline value, `--` and an
-    // unknown flag, each fed to the rewrite and to Claude's own parser.
     let words = [
         "--add-dir",
         "--debug",
@@ -302,7 +273,6 @@ fn every_short_argv_resumes_with_exactly_the_values_claude_parsed() {
         let meant = claude_parses(&a);
         let got = rewrite_argv(&a, ID);
         if meant.unknown {
-            // Claude never ran with this argv, and the rewrite fails closed.
             assert!(got.is_err(), "{a:?} -> {got:?}");
             continue;
         }
@@ -342,7 +312,6 @@ fn every_short_argv_resumes_with_exactly_the_values_claude_parsed() {
         );
         carried += 1;
     }
-    // Counted, never assumed: the space is walked and both answers occur.
     assert!(carried > 20_000 && refused > 10_000, "{carried} {refused}");
 }
 
@@ -380,12 +349,10 @@ fn the_relaunch_line_heals_a_frozen_shell_and_quotes_every_word() {
     )
     .unwrap();
     assert!(fish.starts_with(" source '/h/00-atpkg.fish'; '"), "{fish}");
-    // A healthy shell: no heal. A different launch directory: a subshell `cd`.
     let cd = relaunch_line(Dialect::Zsh, None, Some("/w/it's"), exe, &args).unwrap();
     assert!(cd.starts_with(" ( cd -- '/w/it'\\''s' && exec '"), "{cd}");
     assert!(cd.ends_with(&format!("'{ID}' )")), "{cd}");
     assert!(relaunch_line(Dialect::Fish, None, Some("/w"), exe, &args).is_err());
-    // Refused, never truncated or smuggled.
     assert!(relaunch_line(Dialect::Zsh, None, None, exe, &argv(&["--name", "a\nb"])).is_err());
     let long = "x".repeat(MAX_LINE);
     assert!(relaunch_line(Dialect::Zsh, None, None, exe, &[long]).is_err());
@@ -397,8 +364,6 @@ fn the_relaunch_line_heals_a_frozen_shell_and_quotes_every_word() {
 
 #[test]
 fn a_line_the_tty_could_cut_is_refused() {
-    // macOS keeps at most 1023 bytes of a line typed before the shell's line
-    // editor is back; `--resume <id>` ends the line, so any cut loses it.
     let exe = Path::new("/Users/_me/Library/Application Support/aterm/pkg/agents/claude");
     let hook = Path::new("/Users/_me/.aterm/shell.d/00-atpkg.zsh");
     let line = |tty: LineDiscipline, pad: &str| {
@@ -423,24 +388,13 @@ fn a_line_the_tty_could_cut_is_refused() {
             "{tty:?}: a {}-byte line would be cut by the tty",
             cut.as_ref().map_or(0, String::len)
         );
-        // The bound itself: exactly the kernel's max is written, one byte more
-        // is not.
         assert_eq!(at(tty, tty.max_line()).map(|l| l.len()), Ok(tty.max_line()));
         assert!(at(tty, tty.max_line() + 1).is_err(), "{tty:?}");
     }
-    // Each kernel keeps its own bound: Linux keeps 4095 bytes of a line, so a
-    // 2048-byte line is carried there.
     assert!(at(LineDiscipline::Linux, 2048).is_ok());
-    // macOS drops a 1024-byte line.
     assert!(at(LineDiscipline::Darwin, 1024).is_err());
 }
 
-/// The healed relaunch line: the shell takes its key from the file first, in
-/// its own dialect, then runs the relaunch line unchanged, still one line led
-/// by the space that keeps it out of history. The path is quoted like every
-/// other word; the key is not in the line. A path with a control character,
-/// or a healed line past the kernel's bound, is refused and the caller types
-/// the plain line.
 #[test]
 fn the_relaunch_line_takes_the_key_first_in_the_shells_own_dialect() {
     let exe = Path::new("/Users/_me/Library/Application Support/aterm/pkg/agents/claude");
@@ -449,8 +403,6 @@ fn the_relaunch_line_takes_the_key_first_in_the_shells_own_dialect() {
     let q = "'/Users/_me/Library/Application Support/aterm/rekey/s-0a.1'";
     let args = argv(&["--resume", ID]);
     let zsh = relaunch_line(Dialect::Zsh, Some(hook), Some("/w"), exe, &args).unwrap();
-    // The upgrading form where it fits: the shell's own text, the quoted path
-    // its only path.
     let form = |shell, q: &str| {
         aterm_shell_integration::typed_rekey_with_loader(shell, q).expect("scripted")
     };
@@ -482,7 +434,6 @@ fn the_relaunch_line_takes_the_key_first_in_the_shells_own_dialect() {
             &fish[1..]
         )
     );
-    // Quoted like any word: a quote in the path cannot end the word early.
     let odd = with_rekey(Dialect::Zsh, &bash, Path::new("/r/it's")).unwrap();
     assert!(odd.contains("<'/r/it'\\''s'; "), "{odd}");
     assert!(
@@ -490,7 +441,6 @@ fn the_relaunch_line_takes_the_key_first_in_the_shells_own_dialect() {
             .unwrap()
             .contains(r"command cat '/r/it\'s' 2>/dev/null"),
     );
-    // Refused: a control character, and a line the tty could cut.
     assert!(with_rekey(Dialect::Zsh, &zsh, Path::new("/r/a\nb")).is_err());
     let line_of = |tty: LineDiscipline, len: usize| {
         let padded = |pad: &str| {
@@ -514,8 +464,6 @@ fn the_relaunch_line_takes_the_key_first_in_the_shells_own_dialect() {
         + 1;
     assert!(key_only < take, "the key-only form is the shorter");
     for tty in [LineDiscipline::Darwin, LineDiscipline::Linux] {
-        // Exactly the bound, the upgrading heal included, is written in full;
-        // one byte more falls back to the key-only heal, which still fits.
         let room = line_of(tty, tty.max_line() - take);
         let full = with_rekey_on(tty, Dialect::Zsh, &room, key).unwrap();
         assert_eq!(full.len(), tty.max_line(), "{tty:?}");
@@ -527,7 +475,6 @@ fn the_relaunch_line_takes_the_key_first_in_the_shells_own_dialect() {
                 && fallback.ends_with(&over[1..]),
             "{tty:?}: past the upgrading form's bound, the key-only heal"
         );
-        // Exactly the key-only bound is written; one byte more is refused.
         let room = line_of(tty, tty.max_line() - key_only);
         assert_eq!(
             with_rekey_on(tty, Dialect::Zsh, &room, key).map(|l| l.len()),
@@ -542,7 +489,6 @@ fn the_relaunch_line_takes_the_key_first_in_the_shells_own_dialect() {
     }
 }
 
-/// The pids a held list names, in its order.
 fn named_pids(list: &str) -> Vec<u32> {
     list.split("pid ")
         .skip(1)
@@ -550,11 +496,6 @@ fn named_pids(list: &str) -> Vec<u32> {
         .collect()
 }
 
-/// The notice's list of what runs: each process by pid on one line a paste
-/// cannot split (no control characters), at most [`HELD_NAMED`] named and
-/// each command cut. Nothing when nothing runs. The notice stays one line
-/// with the clause before its closing sentence, the word the guarded Enter
-/// waits on.
 #[test]
 fn the_notice_lists_what_runs_under_the_agent_in_one_line() {
     assert_eq!(running_clause(&[]), "");
@@ -582,7 +523,6 @@ fn the_notice_lists_what_runs_under_the_agent_in_one_line() {
         clause.contains('…') && !clause.contains(&long),
         "each command is cut"
     );
-    // A process the table names but `ps` could not describe is still named.
     assert_eq!(named_pids(&running_clause(&[held(7, 0, "")])), [7]);
     let notice = with_running(
         &prepare_prompt(&v("2.1.278"), &v("2.1.283"), Source::Managed, "M"),
@@ -595,10 +535,6 @@ fn the_notice_lists_what_runs_under_the_agent_in_one_line() {
     );
 }
 
-/// The oldest process is named first, ties in the order given, so a
-/// long-running watch loop is never left among the counted ones past
-/// [`HELD_NAMED`]. Negative control: the process table's order names none of
-/// the watch.
 #[test]
 fn the_notice_names_the_oldest_processes_first() {
     let held = |pid: u32, age_s: u64| Held {
@@ -607,7 +543,6 @@ fn the_notice_names_the_oldest_processes_first() {
         age_s,
         command: String::new(),
     };
-    // Fourteen young shells the table lists first, the four-day watch last.
     let mut table: Vec<Held> = (0..14)
         .map(|i| held(60_000 + i, 60 + u64::from(i)))
         .collect();
@@ -615,26 +550,19 @@ fn the_notice_names_the_oldest_processes_first() {
     let named = named_pids(&held_list(&table));
     assert_eq!(named.len(), HELD_NAMED);
     assert_eq!(named[..3], [51_435, 60_013, 60_012]);
-    // Ties keep the order given.
     assert_eq!(
         named_pids(&held_list(&[held(3, 5), held(1, 5), held(2, 9)])),
         [2, 3, 1]
     );
-    // Negative control: the table's order leaves the watch unnamed.
     let old_named: Vec<u32> = table.iter().take(HELD_NAMED).map(|h| h.pid).collect();
     assert!(!old_named.contains(&51_435), "{old_named:?}");
 }
 
-/// A real closer command: 253 characters, 119 of them the one path in `D=`.
 const CLOSER: &str = "D=/Users//person/.claude/projects/-Users-person/\
     00000000-0000-4000-8000-000000000001/subagents/workflows/wf_examplerun-1; \
     tail -f -n +1 \"$D/journal.jsonl\" | /usr/bin/grep -m1 -F \
     '\"agentId\":\"a0000000000000001\",\"result\"' > /dev/null; echo \"closer finished\"";
 
-/// The notice keeps what makes a wait dead: a command over
-/// [`HELD_COMMAND_CHARS`] has the middle of each long path elided before the
-/// cut, so the `grep -m1` that bounds a `tail -f` survives. The cut stays the
-/// backstop.
 #[test]
 fn the_notice_keeps_a_pipeline_a_long_path_would_push_out() {
     let quoted = |command: &str| {
@@ -664,8 +592,6 @@ fn the_notice_keeps_a_pipeline_a_long_path_would_push_out() {
          '\"agentId\":\"a0000000000000001\",\"result\"' > /dev/null; echo \"closer finished\""
     );
 
-    // A long path passed as an argument is elided the same way, the words in
-    // a quote are not: there a path can be the pattern the wait turns on.
     let dir = "/Users//person/.claude/projects/-Users-person/00000000-0000-4000-8000-000000000001";
     let pattern = format!("{dir}/subagents/done");
     let argument = quoted(&format!(
@@ -677,8 +603,6 @@ fn the_notice_keeps_a_pipeline_a_long_path_would_push_out() {
         format!("tail -f -n +1 /Users/…/journal.jsonl | grep -m1 -F \"wrote {pattern} ok\"")
     );
 
-    // Negative controls: a command that fits is quoted whole, however long its
-    // paths. A URL is never a path, its query included.
     let fits = format!("tail -f {dir}/journal.jsonl");
     assert_eq!(quoted(&fits), fits);
     let url = "https://api.github.com/repos/people/aterm/actions/runs/123456789/jobs?filter=latest";
@@ -689,8 +613,6 @@ fn the_notice_keeps_a_pipeline_a_long_path_would_push_out() {
         fetch,
         format!("until curl -fsS -o /Users/…/jobs.json {url}; do sleep 30; done")
     );
-    // Only a rooted path is elided: a long relative one is quoted whole, as
-    // the agent wrote it. A redirection's path is elided after its operator.
     let relative =
         "crates/aterm-agent/src/harness/subagents/workflows/wf_examplerun-1/journal.jsonl";
     assert!(relative.chars().count() > HELD_PATH_CHARS);
@@ -705,9 +627,6 @@ fn the_notice_keeps_a_pipeline_a_long_path_would_push_out() {
         redirect.starts_with("tail -f 2>>/Users/…/log "),
         "{redirect}"
     );
-    // A word with a quote, a glob or an escape in it is not a path to elide,
-    // and a long path with nothing between its first name and its last is
-    // left as it is.
     for word in [
         format!("{dir}/*/journal.jsonl"),
         format!("{dir}/sub\\ dir/journal.jsonl"),
@@ -717,8 +636,6 @@ fn the_notice_keeps_a_pipeline_a_long_path_would_push_out() {
         let command = format!("{word} {}", "x".repeat(HELD_COMMAND_CHARS));
         assert!(quoted(&command).starts_with(&word), "{word}");
     }
-    // The fold is unchanged: a line or paragraph separator in the command is
-    // a space, never a break in the one-paste notice.
     let broken = quoted(&format!("{CLOSER}\u{2028}echo\u{2029}done"));
     assert!(
         !broken.contains(['\u{2028}', '\u{2029}']) && !broken.chars().any(char::is_control),
@@ -761,9 +678,6 @@ fn an_empty_composer_is_blank_or_a_placeholder_and_nothing_else() {
         !composer_is_empty(&suggestion, Some((1, 17)), true),
         "typed: the cursor moved"
     );
-    // The cursor can only prove typed text (on the caret row, off column 2), never
-    // placeholder: elsewhere the dim cell decides, since a grid displaced by a net-zero re-grid
-    // leaves the cursor a row below the composer.
     assert!(
         composer_is_empty(&suggestion, None, true),
         "no cursor: the dim cell decides"
@@ -804,7 +718,6 @@ fn an_empty_composer_is_blank_or_a_placeholder_and_nothing_else() {
         "─────────────────",
     ]);
     assert!(!composer_is_empty(&two_rows, Some((1, 2)), true));
-    // A live screen while the person types `we'd want`.
     let typing = rows(&["─────────────────", "❯ we'd want", "─────────────────"]);
     assert!(!composer_is_empty(&typing, Some((1, 11)), false));
     assert!(
@@ -846,18 +759,8 @@ fn idle_facts() -> Facts {
     }
 }
 
-/// One fact knocked off an otherwise-go reading, and the wait it must cause.
 type Knock = (fn(&mut Facts), &'static str);
 
-/// The quiet upgrade, the default ([`Facts::quiet`], [`quiet_step`]): at a genuinely idle
-/// point (Claude's own `idle`, nothing under the agent, no box, no draft, nobody at the tab,
-/// settled) a pending round restarts the session with nothing typed first (`Terminate`, never
-/// `Announce`) and needs no READY; anywhere else it waits with the gate's own word and never
-/// types a notice. A round an older aterm announced restarts at the same point, READY or not.
-/// The owner is told first: a move the waiting record has not stood a look for waits
-/// `notice-shown` ([`Facts::unnoticed`]). The knob (`upgrade_ask = true`, `quiet` false) is
-/// the ask-and-drain flow: `Announce` at the same idle point, `awaiting-ready` after it. A
-/// restart in flight, a finished move and a stopped round keep their own steps.
 #[test]
 fn a_quiet_upgrade_restarts_only_a_genuinely_idle_session_and_types_nothing() {
     let quiet = Facts {
@@ -895,7 +798,6 @@ fn a_quiet_upgrade_restarts_only_a_genuinely_idle_session_and_types_nothing() {
             assert_ne!(step, Step::Announce, "nothing is ever typed first");
         }
     }
-    // A restart in flight, a finished move and a stopped round keep their own steps.
     assert_eq!(
         next_step(&Phase::Exiting { at_s: 1 }, &quiet, false, 5),
         Step::Wait("in-flight")
@@ -908,7 +810,6 @@ fn a_quiet_upgrade_restarts_only_a_genuinely_idle_session_and_types_nothing() {
         next_step(&Phase::Failed("x".into()), &quiet, false, 5),
         Step::Wait("failed")
     );
-    // The knob: the ask-and-drain flow at the very same point.
     let ask = idle_facts();
     assert_eq!(next_step(&Phase::Pending, &ask, false, 200), Step::Announce);
     assert_eq!(
@@ -917,14 +818,6 @@ fn a_quiet_upgrade_restarts_only_a_genuinely_idle_session_and_types_nothing() {
     );
 }
 
-/// A round an older build announced still ends under the quiet upgrade ([`quiet_step`]): the
-/// agent was told to wind down, and the quiet flow asks it nothing again. Once the agent's
-/// own work (a break of it, a shell under it, a status its idle screen does not bear out) has
-/// held the restart a whole [`REASK_S`] past the notice or a READY, the round gives up at any
-/// ask, so the driver owes the agent its release; a READY a person's box held past
-/// [`DRAIN_S`] is void. Control: the ask flow gives up there only at its last ask. Negative
-/// controls: inside the window the restart's wait stands; a pending round is never given up
-/// on; a genuinely idle point restarts; a person at the tab or the settle never gives up.
 #[test]
 fn a_quiet_round_an_older_build_announced_still_ends_and_owes_its_release() {
     let brk = Facts {
@@ -938,13 +831,11 @@ fn a_quiet_round_an_older_build_announced_still_ends_and_owes_its_release() {
     };
     let first = Phase::Announced { at_s: 0, asks: 1 };
     let later = 10 * REASK_S;
-    // Control: the ask flow gives up at its last ask.
     let asking = Facts {
         quiet: false,
         ..brk.clone()
     };
     assert_eq!(next_step(&last, &asking, false, later), Step::GiveUp);
-    // The quiet flow gives up at any ask: it never asks again.
     for phase in [&last, &first] {
         assert_eq!(
             next_step(phase, &brk, false, later),
@@ -952,8 +843,6 @@ fn a_quiet_round_an_older_build_announced_still_ends_and_owes_its_release() {
             "{phase:?}"
         );
     }
-    // READY given, the agent's own shell under it at an idle point: given
-    // up on once the READY has stood the window, never waited on for good.
     let held = Facts {
         quiet: true,
         background: vec!["zsh".into()],
@@ -974,7 +863,6 @@ fn a_quiet_round_an_older_build_announced_still_ends_and_owes_its_release() {
         Step::Wait("background"),
         "a late READY gets its whole window"
     );
-    // A status its idle screen does not bear out holds it the same way.
     let stale = Facts {
         quiet: true,
         status: "shell".into(),
@@ -983,7 +871,6 @@ fn a_quiet_round_an_older_build_announced_still_ends_and_owes_its_release() {
         ..idle_facts()
     };
     assert_eq!(next_step(&first, &stale, false, later), Step::GiveUp);
-    // A person's box past the drain voids a READY, as under the ask flow.
     let boxed = Facts {
         quiet: true,
         approval_box: true,
@@ -996,7 +883,6 @@ fn a_quiet_round_an_older_build_announced_still_ends_and_owes_its_release() {
         Step::Wait("box"),
         "no READY: nothing to void, and a person's box is no work of the agent's"
     );
-    // Negative controls.
     assert_eq!(
         next_step(&first, &brk, false, REASK_S - 1),
         Step::Wait("background"),
@@ -1023,13 +909,6 @@ fn a_quiet_round_an_older_build_announced_still_ends_and_owes_its_release() {
     }
 }
 
-/// A status that only lags holds the quiet restart until the owner's word ([`quiet_step`]):
-/// Claude's own `shell`/`busy` left over an idle screen with nothing under the agent lets the
-/// ask flow's notice through, but the quiet flow types nothing, so it waits `status-stale`,
-/// at the Land rung too. The restart never kills on that status unasked; the owner's `--now`
-/// reads past the lag. Negative controls under `--now`: a status not yet shown to lag (one
-/// look short, too young), work under the agent, a box, and the ask flow (whose `--now`
-/// waives no status).
 #[test]
 fn a_quiet_round_is_not_held_for_ever_by_a_status_its_idle_screen_contradicts() {
     let stale = Facts {
@@ -1039,7 +918,6 @@ fn a_quiet_round_is_not_held_for_ever_by_a_status_its_idle_screen_contradicts() 
         idle_looks: IDLE_LOOKS,
         ..idle_facts()
     };
-    // Control: the ask flow's notice goes through the lag.
     let asking = Facts {
         quiet: false,
         ..stale.clone()
@@ -1053,7 +931,6 @@ fn a_quiet_round_is_not_held_for_ever_by_a_status_its_idle_screen_contradicts() 
             status: status.into(),
             ..stale.clone()
         };
-        // Unasked, never on the status alone — at the last rung too.
         let land = Facts {
             rung: Rung::Land,
             ..stale.clone()
@@ -1063,14 +940,12 @@ fn a_quiet_round_is_not_held_for_ever_by_a_status_its_idle_screen_contradicts() 
             Step::Wait("status-stale"),
             "{status}"
         );
-        // The owner's word moves it.
         assert_eq!(
             requested_step(&Request::Now, &Phase::Pending, &stale, false, 200, "9.9.9"),
             Step::Terminate,
             "{status}"
         );
     }
-    // Negative controls under the owner's word.
     let knocks: [Knock; 4] = [
         (|f| f.idle_looks = IDLE_LOOKS - 1, "status-stale"),
         (|f| f.status_age_s = QUIET_S - 1, "status-stale"),
@@ -1093,9 +968,6 @@ fn a_quiet_round_is_not_held_for_ever_by_a_status_its_idle_screen_contradicts() 
     );
 }
 
-/// Only a box (a visible one, or Claude's own `waiting` status) and a typed
-/// draft are a person's to clear. The agent's own work, aterm's hold and the
-/// settle window are not; each still shuts the gate.
 #[test]
 fn only_a_box_and_a_draft_are_a_persons_hold() {
     assert_eq!(person_hold(&idle_facts()), None);
@@ -1125,22 +997,17 @@ fn only_a_box_and_a_draft_are_a_persons_hold() {
     }
 }
 
-/// A hold stands only while it is sampled: a gap longer than [`HOLD_GAP_S`] (a system sleep, a
-/// driver restart) begins it again. Negative control: a box sampled once a minute for
-/// [`HOLD_S`] voids, and a gap of exactly [`HOLD_GAP_S`] carries it on.
 #[test]
 fn a_hold_stands_only_while_it_is_sampled() {
     let asked = Phase::Announced { at_s: 0, asks: 1 };
     let mut boxed = idle_facts();
     boxed.approval_box = true;
-    // The driver's sampling: `hold_since`, then `hold_s` from its start.
     let sample = |prior: (u64, u64), f: &Facts, now: u64| {
         let held = hold_since(prior, f, now);
         let mut f = f.clone();
         f.hold_s = if held.0 == 0 { 0 } else { now - held.0 };
         (held, next_step(&asked, &f, true, now))
     };
-    // Two sweeps two hours apart, past the drain's bound.
     let (held, _) = sample((0, 0), &boxed, DRAIN_S);
     let (held, step) = sample(held, &boxed, DRAIN_S + 7200);
     assert_eq!(held, (DRAIN_S + 7200, DRAIN_S + 7200), "begun again");
@@ -1149,7 +1016,6 @@ fn a_hold_stands_only_while_it_is_sampled() {
         Step::Wait("box"),
         "a box two samples caught is no hold"
     );
-    // Sampled once a minute: it stands, and past HOLD_S it voids.
     let mut held = (0, 0);
     let mut step = Step::Wait("x");
     for k in 0..=HOLD_S / 60 {
@@ -1157,7 +1023,6 @@ fn a_hold_stands_only_while_it_is_sampled() {
     }
     assert_eq!(held.0, DRAIN_S, "{held:?}");
     assert_eq!(step, Step::Void("box"));
-    // The gap's edge: exactly HOLD_GAP_S carries it on, one second more does not.
     assert_eq!(
         hold_since((500, 600), &boxed, 600 + HOLD_GAP_S),
         (500, 600 + HOLD_GAP_S)
@@ -1168,30 +1033,8 @@ fn a_hold_stands_only_while_it_is_sampled() {
     );
 }
 
-/// The drain model (`harness_upgrade_drain_bound_model`) folds the drain and
-/// re-ask clocks into one `Bound`, and the bind below samples only
-/// [`DRAIN_S`]; the equality is the model's assumption, pinned here.
 const _: () = assert!(DRAIN_S == REASK_S);
 
-/// Tier-1: on every state of the derived drain model
-/// (`harness_upgrade_drain_bound_model`), the real reducer takes the step the
-/// model's guards allow. The mapping:
-/// - A person is a box that has stood [`HOLD_S`]
-///   (`a_hold_stands_only_while_it_is_sampled`).
-/// - The agent's own work is a background shell.
-/// - A break is a step taken at one ([`Facts::background_point`], Claude's
-///   status `busy`).
-/// - A lagging status is Claude's own `busy` standing [`QUIET_S`] over a
-///   screen read idle [`IDLE_LOOKS`] looks in a row ([`status_lags`]).
-/// - The model's `waited` looks are the notice's age, and its `aged` looks
-///   are the READY answer's age ([`Facts::ready_s`]), each in `Bound`
-///   steps of [`DRAIN_S`] (== [`REASK_S`]).
-/// - Its `MaxAsks` notices are [`MAX_ASKS`], and a notice typed is `ReAsk`.
-///
-/// An answer is never older than its notice. Negative controls, each disagreeing with the
-/// reducer: `Buggy=1` (no void, a silent wait on the agent's work, the notice's clock for a
-/// READY), `LagEnds=1` (a restart on a lagging status) and `LagHolds=1` (a READY behind the
-/// lag waited on in silence).
 #[test]
 fn the_reducer_takes_the_step_the_drain_model_allows() {
     let model = aterm_models_harness::harness_upgrade_drain_bound_model();
@@ -1207,7 +1050,6 @@ fn the_reducer_takes_the_step_the_drain_model_allows() {
     for waited in 0..=bound {
         for asks in 1..=max_asks {
             for ready in [0, 1] {
-                // The answer's age matters only while there is one.
                 let ages = if ready == 1 { 0..=waited } else { 0..=0 };
                 for aged in ages {
                     for person in [0, 1] {
@@ -1290,17 +1132,12 @@ fn the_reducer_takes_the_step_the_drain_model_allows() {
             }
         }
     }
-    // Every step the reducer can take was driven: the bind is not vacuous.
     assert_eq!(steps.len(), 5, "{steps:?}");
     assert!(disagreements > 0, "the unbounded drain is caught");
     assert!(ends_caught > 0, "a restart on a lagging status is caught");
     assert!(holds_caught > 0, "a silent wait behind the lag is caught");
 }
 
-/// One presence fact: a session is attended when a person gave it input
-/// within `[harness] human_grace_s`, by the server's per-session stamp, never
-/// by where the tab sits or the machine's input clock. A host that sends no
-/// stamp proves no absence: attended.
 #[test]
 fn a_session_is_attended_by_its_own_person_stamp() {
     use crate::supervise::screen::HumanInput;
@@ -1323,11 +1160,6 @@ fn a_session_is_attended_by_its_own_person_stamp() {
     assert!(attended_by(HumanInput::Unknown, grace), "fails closed");
 }
 
-/// A person at the tab ([`Facts::attended`]): nothing the upgrade decides for
-/// itself is typed into it, and, READY or not, it is never signalled there,
-/// since the SIGTERM cannot be taken back. Only the owner's `--now` waives it
-/// ([`Facts::owner_now`]; what `--now` never waives:
-/// [`a_now_request_waives_settling_and_never_the_draft_or_the_ready_answer`]).
 #[test]
 fn an_attended_tab_is_neither_typed_into_nor_signalled_without_the_owners_now() {
     let attended = Facts {
@@ -1356,10 +1188,6 @@ fn an_attended_tab_is_neither_typed_into_nor_signalled_without_the_owners_now() 
     );
 }
 
-/// The READY answer must be the agent's last word: a READY row the agent has
-/// since answered past (a `keep going` it took, a person's message) is no
-/// consent to a restart. Negative controls: a subagent's row and a
-/// `<synthetic>` row after the answer supersede nothing.
 #[test]
 fn a_ready_answer_counts_only_while_it_is_the_agents_last_word() {
     let marker = "ATERM-UPGRADE-READY-0badf00d";
@@ -1378,28 +1206,20 @@ fn a_ready_answer_counts_only_while_it_is_the_agents_last_word() {
     ]
     .join("\n");
     assert!(!transcript_has_ready(&past, marker), "answered past");
-    // A tool call after the answer is work after it too.
     let tool = r#"{"type":"assistant","message":{"model":"claude-opus-5-5","content":[{"type":"tool_use","name":"Bash","input":{}}]}}"#;
     assert!(!transcript_has_ready(
         &[ready.clone(), tool.to_string()].join("\n"),
         marker
     ));
-    // Negative controls.
     let sidechain = said("Subagent: done.", r#","isSidechain":true"#);
     let synthetic = r#"{"type":"assistant","message":{"model":"<synthetic>","content":[{"type":"text","text":"No response requested."}]}}"#;
     assert!(transcript_has_ready(
         &[ready.clone(), sidechain, synthetic.to_string()].join("\n"),
         marker
     ));
-    // Answered again after the `keep going`: READY once more.
     assert!(transcript_has_ready(&[past, ready].join("\n"), marker));
 }
 
-/// A notice ends every READY before it: a main-chain user row that is an
-/// announcement (its content a string or text parts) ends an earlier READY,
-/// even when only a `<synthetic>` row follows. Negative controls: a user row
-/// that only mentions the head mid-sentence is no notice (a direction, which
-/// a notice ends), and a subagent's notice ends nothing.
 #[test]
 fn a_ready_before_the_latest_notice_is_no_answer_to_it() {
     let marker = "ATERM-UPGRADE-READY-0badf00d";
@@ -1451,11 +1271,6 @@ fn a_ready_before_the_latest_notice_is_no_answer_to_it() {
     ));
 }
 
-/// A direction after the READY ends it: a main-chain user row that directs the conversation (an
-/// Esc, a message met only by a `<synthetic>` row, a peer's message), whether or not the agent
-/// wrote since. Negative controls: rows Claude Code writes on its own (the limit's reset, a
-/// tool result, a task notification, a command's output), the harness's line and a subagent's
-/// prompt end nothing; a READY given again answers.
 #[test]
 fn a_direction_after_the_ready_ends_it() {
     let marker = "ATERM-UPGRADE-READY-0badf00d";
@@ -1485,8 +1300,6 @@ fn a_direction_after_the_ready_ends_it() {
         "a message the agent met only with a <synthetic> row"
     );
     assert!(!transcript_has_ready(&rows(&[&peer]), marker), "a peer's");
-    // Negative controls: the rows Claude Code writes itself, the harness's
-    // own line and a subagent's prompt end nothing.
     let release =
         aterm_json::to_string(&Value::from(release_prompt(Agent::Claude, false))).expect("json");
     for quiet in [
@@ -1508,14 +1321,9 @@ fn a_direction_after_the_ready_ends_it() {
             "{quiet}"
         );
     }
-    // Answered again after the direction: READY once more.
     assert!(transcript_has_ready(&rows(&[&esc, &ready]), marker));
 }
 
-/// A READY answer is a line that is the marker alone ([`is_ready_line`]):
-/// words that only quote a marker are no answer. Negative controls: the
-/// marker on its own line, in backticks or indented, is one; another marker,
-/// or one cut short, is not.
 #[test]
 fn a_ready_answer_is_the_marker_on_a_line_of_its_own() {
     let marker = ready_marker(ID, &v("2.1.282"), 3);
@@ -1529,18 +1337,12 @@ fn a_ready_answer_is_the_marker_on_a_line_of_its_own() {
     assert!(!is_ready_line(&marker[..marker.len() - 1], &marker));
 }
 
-// ---------------------------------------------------------------- the model
-
-/// An assistant row as Claude Code 2.1.282 writes one (`isSidechain`, `type`,
-/// `message.model`, the content blocks), naming `model`.
 fn said_by(model: &str) -> String {
     format!(
         r#"{{"parentUuid":"p","isSidechain":false,"type":"assistant","message":{{"model":"{model}","id":"msg_1","type":"message","role":"assistant","content":[{{"type":"text","text":"ok"}}]}},"version":"2.1.282"}}"#
     )
 }
 
-/// The rows a turn interleaves with its assistant rows: the person's prompt,
-/// a tool's result (a `user` row), an attachment and a system row.
 fn between() -> [String; 4] {
     [
         r#"{"type":"user","message":{"role":"user","content":"run the tests"}}"#.to_string(),
@@ -1550,8 +1352,6 @@ fn between() -> [String; 4] {
     ]
 }
 
-/// Claude Code's own assistant rows name the model `<synthetic>` (a limit
-/// notice, `No response requested.` after a restart).
 const SYNTHETIC: &str = r#"{"type":"assistant","isApiErrorMessage":false,"message":{"model":"<synthetic>","role":"assistant","content":[{"type":"text","text":"No response requested."}]}}"#;
 
 fn jsonl(rows: &[&str]) -> String {
@@ -1566,20 +1366,16 @@ fn the_model_is_the_last_assistant_turns_and_the_first_is_the_resumed_ones() {
         said_by("claude-fable-5-1"),
         said_by("claude-opus-5-5"),
     );
-    // Several turns on different models, the other rows interleaved.
     let tail = jsonl(&[&prompt, &a, &tool, &b, &attached, &prompt, &c, &system]);
     assert_eq!(transcript_model(&tail).as_deref(), Some("claude-opus-5-5"));
     assert_eq!(
         transcript_first_model(&tail, "2.1.282").as_deref(),
         Some("claude-opus-5")
     );
-    // No assistant turn at all.
     let quiet = jsonl(&[&prompt, &tool, &attached, &system]);
     assert_eq!(transcript_model(&quiet), None);
     assert_eq!(transcript_first_model(&quiet, "2.1.282"), None);
     assert_eq!(transcript_model(""), None);
-    // The tail's cut first line is skipped, not read: alone it is no turn, and
-    // before a whole one the whole one answers from both ends.
     let cut = &b[b.len() / 3..];
     assert!(cut.contains("claude-fable-5-1"), "the cut keeps the model");
     assert_eq!(transcript_model(&jsonl(&[cut, &prompt])), None);
@@ -1587,14 +1383,11 @@ fn the_model_is_the_last_assistant_turns_and_the_first_is_the_resumed_ones() {
         transcript_first_model(&jsonl(&[cut, &prompt, &c]), "2.1.282").as_deref(),
         Some("claude-opus-5-5")
     );
-    // A row half-written at the end (Claude appending) is not a turn yet.
     let half = &c[..c.len() / 2];
     assert_eq!(
         transcript_model(&format!("{a}\n{half}")).as_deref(),
         Some("claude-opus-5")
     );
-    // Claude's own rows name no model, and a row that names something no model
-    // id looks like is not taken either: a model is typed into the tab.
     let odd = said_by("claude opus\\u001b[2J");
     for filler in [SYNTHETIC, odd.as_str()] {
         assert_eq!(
@@ -1609,14 +1402,12 @@ fn the_model_is_the_last_assistant_turns_and_the_first_is_the_resumed_ones() {
         );
         assert_eq!(transcript_model(&jsonl(&[&prompt, filler])), None);
     }
-    // A subagent's turn is not the session's model.
     let sidechain =
         said_by("claude-haiku-5").replace(r#""isSidechain":false"#, r#""isSidechain":true"#);
     assert_eq!(
         transcript_model(&jsonl(&[&c, &sidechain])).as_deref(),
         Some("claude-opus-5-5")
     );
-    // The ids other providers and the long-context variant carry are ids.
     for id in [
         "claude-opus-5-5[1m]",
         "us.anthropic.claude-opus-5-5-v1:0",
@@ -1626,22 +1417,16 @@ fn the_model_is_the_last_assistant_turns_and_the_first_is_the_resumed_ones() {
     }
 }
 
-/// A cloud provider's model can be named by an ARN, longer than any first-party
-/// id: it is an id all the same, read and said, never "unconfirmed".
 #[test]
 fn a_provider_arn_is_a_model_id() {
     let arn = "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/\
                us.anthropic.claude-opus-5-5-20260901-v1:0";
     assert!(arn.len() > 64, "{}", arn.len());
     assert_eq!(transcript_model(&said_by(arn)).as_deref(), Some(arn));
-    // The bound still holds: an id is never an unbounded run of bytes.
     let endless = "a".repeat(4096);
     assert_eq!(transcript_model(&said_by(&endless)), None);
 }
 
-/// The kept `--model` is read by the rewrite's own parse: the last one wins,
-/// as in Claude's parser; `--model=<v>` is one; a `--model` that is another
-/// flag's value, or comes after `--`, is not one.
 #[test]
 fn the_launch_model_is_the_model_flag_the_rewrite_keeps() {
     let got = |w: &[&str]| launch_model(&argv(w));
@@ -1672,16 +1457,9 @@ fn the_launch_model_is_the_model_flag_the_rewrite_keeps() {
     );
     assert_eq!(got(&["claude", "--", "--model", "x"]), None);
     assert_eq!(got(&["claude", "--model"]), None, "no value");
-    // A launch the rewrite refuses relaunches nothing.
     assert_eq!(got(&["claude", "--print", "--model", "x"]), None);
 }
 
-/// The resumed conversation of a launch, by the same parse: `--resume <id>`,
-/// `-r <id>` and `--resume=<id>` name it (the last flag winning); a resume
-/// that names none the process keeps (`--continue`, `-c`, a bare `--resume`,
-/// or any resume with `--fork-session`) is `Some(None)`; a launch with no
-/// resume flag, or whose `--resume` is another flag's value or after `--`,
-/// resumed nothing.
 #[test]
 fn the_launch_resume_names_the_conversation_the_process_kept() {
     let got = |w: &[&str]| launch_resume(&argv(w));
@@ -1722,9 +1500,6 @@ fn the_launch_resume_names_the_conversation_the_process_kept() {
     assert_eq!(got(&["claude", "--", "--resume", "x"]), None);
 }
 
-/// The resumed model is the new process's: every transcript row carries the
-/// `version` that wrote it, so a row the old process wrote past the mark
-/// (alive past its SIGTERM for one more turn) is never taken as the answer.
 #[test]
 fn the_resumed_model_is_read_only_from_the_new_builds_rows() {
     let old = said_by("claude-opus-5").replace("2.1.282", "2.1.281");
@@ -1735,7 +1510,6 @@ fn the_resumed_model_is_read_only_from_the_new_builds_rows() {
         Some("claude-opus-5-5")
     );
     assert_eq!(transcript_first_model(&jsonl(&[&old]), "2.1.282"), None);
-    // A row that names no version is no build's.
     let unversioned = new.replace(r#","version":"2.1.282""#, "");
     assert_eq!(
         transcript_first_model(&jsonl(&[&unversioned]), "2.1.282"),
@@ -1743,13 +1517,8 @@ fn the_resumed_model_is_read_only_from_the_new_builds_rows() {
     );
 }
 
-// ---------------------------------------------------------------- the owner's word
-
 const TARGET: &str = "2.1.282";
 
-/// `--now` waives the settling window (and, the owner being the person at the tab, the
-/// attended-tab guard) and nothing else: a draft, a box, the busy footer, a non-idle status
-/// and a hold still wait, and a restart still needs the READY and an empty process tree.
 #[test]
 fn a_now_request_waives_settling_and_never_the_draft_or_the_ready_answer() {
     let mut settling = idle_facts();
@@ -1782,7 +1551,6 @@ fn a_now_request_waives_settling_and_never_the_draft_or_the_ready_answer() {
             Step::Wait(word)
         );
     }
-    // The owner's word is that person asking: an attended tab is moved too.
     let mut attended = settling.clone();
     attended.attended = true;
     assert_eq!(
@@ -1794,7 +1562,6 @@ fn a_now_request_waives_settling_and_never_the_draft_or_the_ready_answer() {
         step(&Request::Now, &Phase::Pending, &attended, false),
         Step::Announce
     );
-    // Announced, no READY: no restart.
     let asked = Phase::Announced { at_s: 90, asks: 1 };
     assert_eq!(
         step(&Request::Now, &asked, &settling, false),
@@ -1818,8 +1585,6 @@ fn a_now_request_waives_settling_and_never_the_draft_or_the_ready_answer() {
     );
 }
 
-/// A deferral holds a session until it runs out, and a skip holds only the
-/// version it names; neither ever holds a restart already in flight.
 #[test]
 fn a_deferral_holds_until_it_runs_out_and_a_skip_holds_only_its_version() {
     let f = idle_facts();
@@ -1876,13 +1641,6 @@ fn the_request_word_round_trips_and_an_unknown_word_asks_for_nothing() {
     }
 }
 
-/// The agent word round-trips, Claude's own name reads as Claude's, and a word
-/// this build does not know reads as no agent; an agent's program names it
-/// back, and a program that is no agent names none. agy, Muse Code and Gemini
-/// CLI read as themselves, by the program's own name (`agy`, `muse`,
-/// `gemini`), Gemini CLI relaunched on exit alone, Muse Code and agy also
-/// upgraded live (their quiet flows), their records keyed `muse-<tab>`,
-/// `agy-<tab>` and `gemini-<tab>`.
 #[test]
 fn the_agent_word_round_trips_and_an_unknown_word_is_no_agent() {
     use super::super::lanes::{Lanes, lanes};
@@ -1951,10 +1709,6 @@ fn the_agent_word_round_trips_and_an_unknown_word_is_no_agent() {
     );
 }
 
-/// EVERY AGENT ONCE, CLAUDE CODE LAST AMONG THE PASSES: [`Agent::ALL`] holds each variant at its
-/// own index (`agent as usize`, what a count per agent indexes by), Claude Code first, and
-/// [`Agent::others`] is every other agent in that order — the one fixed order the live
-/// upgrade's passes visit the lanes in before Claude Code's. Claude Code is never among them.
 #[test]
 fn every_agent_is_in_all_once_and_the_others_are_all_but_claude_code() {
     for (at, agent) in Agent::ALL.into_iter().enumerate() {
@@ -1970,11 +1724,6 @@ fn every_agent_is_in_all_once_and_the_others_are_all_but_claude_code() {
     );
 }
 
-/// A LANE PAST CLAUDE CODE'S KEYS ITS RECORDS `<word>-<tab>` ([`Agent::record_key`]), read
-/// back by the same prefix ([`Agent::record_tab`], [`Agent::keyed`]); Claude Code keys its
-/// own by conversation, so it has none, and no conversation id is any lane's key: each prefix
-/// holds a byte no id does ([`is_session_id`]: hex and dashes). NEGATIVE CONTROL: another
-/// lane's key, or a key with no tab past the prefix's word, is not Codex's tab.
 #[test]
 fn a_lanes_record_key_is_its_word_and_its_tab_and_no_conversation_is_one() {
     assert_eq!(
@@ -2022,11 +1771,6 @@ fn the_wait_word_names_claudes_status_only_for_not_idle() {
     assert_eq!(wait_word("not-idle", ""), "not-idle");
 }
 
-/// The machine parts of what the harness types (its words are prose, and
-/// unpinned): a notice, with or without a model to move to, opens with
-/// [`ANNOUNCE_HEAD`] and carries its READY marker and the model it asks for;
-/// a continuation never opens with the head (a transcript reader would take
-/// it for a notice) and names the models it knows, guessing none.
 #[test]
 fn the_notices_and_continuations_keep_their_machine_parts() {
     let (from, to) = (v("2.1.282"), v("2.1.283"));
@@ -2077,17 +1821,6 @@ fn the_notices_and_continuations_keep_their_machine_parts() {
     assert!(!bare.contains("claude-"), "no model guessed: {bare}");
 }
 
-/// Claude's own status is read against its screen and the work under it. Once the reader has
-/// read the screen authoritatively idle for [`IDLE_LOOKS`] looks with the status standing
-/// [`QUIET_S`]: with work under the agent the turn is over and the work is its own, so the
-/// notice goes as at a break and the restart waits `background`; with nothing under it the
-/// status is stale, and the notice and the release go. The restart still waits for Claude's
-/// own `idle`, since work inside the agent's process shows only in that status: its READY is
-/// asked again after [`REASK_S`], given up after [`MAX_ASKS`], and a gave-up upgrade's late
-/// READY is void past [`DRAIN_S`]. Neither a fresh restart nor `--now` goes past it. Negative
-/// controls: a live turn waits `not-idle`; one look short or a status younger than
-/// [`QUIET_S`] waits `status-stale`; `waiting`, a box, a draft, the busy footer and the
-/// settle still hold.
 #[test]
 fn claudes_status_is_read_against_its_idle_screen_and_the_work_under_it() {
     let own_work = Facts {
@@ -2127,7 +1860,6 @@ fn claudes_status_is_read_against_its_idle_screen_and_the_work_under_it() {
         next_step(&Phase::Pending, &busy, false, 1_000),
         Step::Announce
     );
-    // The stale status: nothing under the agent. One line goes; nothing ends.
     let stale = Facts {
         background: Vec::new(),
         ..busy.clone()
@@ -2159,8 +1891,6 @@ fn claudes_status_is_read_against_its_idle_screen_and_the_work_under_it() {
             Step::Wait("status-stale"),
             "{status}: nor a fresh restart"
         );
-        // The READY it holds: asked again past REASK_S, given up on after
-        // MAX_ASKS, and — given up — void past DRAIN_S, the agent released.
         let held = Facts {
             ready_s: REASK_S,
             ..stale.clone()
@@ -2181,13 +1911,11 @@ fn claudes_status_is_read_against_its_idle_screen_and_the_work_under_it() {
             Step::Void("status-stale")
         );
     }
-    // Negative control: Claude's own `idle` over the same screen restarts.
     let idle = Facts {
         status: "idle".to_string(),
         ..stale.clone()
     };
     assert_eq!(next_step(&asked, &idle, true, 10), Step::Terminate);
-    // Negative controls.
     let knocks: [Knock; 8] = [
         (|f| f.idle_looks = 0, "not-idle"),
         (|f| f.idle_looks = IDLE_LOOKS - 1, "status-stale"),
@@ -2209,16 +1937,9 @@ fn claudes_status_is_read_against_its_idle_screen_and_the_work_under_it() {
             );
         }
     }
-    // The wait that names it carries Claude's word beside it.
     assert_eq!(wait_word("status-stale", "busy"), "status-stale:busy");
 }
 
-/// The restart's gate waits at a break ([`Facts::background_point`]): the agent's own work
-/// runs there by definition (a shell under the agent, or a workflow in its process that
-/// [`Facts::background`] never names), and the drain never ends it. The gate says what
-/// [`next_step`]'s break arm says, `background` included for a phase the drivers carry instead
-/// of stepping. Negative controls: a shut gate says its own word first; off a break the same
-/// facts are the restart.
 #[test]
 fn the_restarts_gate_waits_at_a_break_whatever_else_lets_it_go() {
     for status in ["idle", "busy", "shell"] {
@@ -2260,30 +1981,18 @@ fn the_restarts_gate_waits_at_a_break_whatever_else_lets_it_go() {
     assert_eq!(gate_restart(&idle_facts(), true), Gate::Go);
 }
 
-/// A main-chain user row saying `text`, as Claude Code 2.1.283 writes a typed
-/// prompt; the harness's and a person's alike (`promptSource` and `origin`
-/// cannot tell them apart).
 fn prompt_row(text: &str) -> String {
     format!(
         r#"{{"type":"user","isSidechain":false,"promptSource":"typed","origin":{{"kind":"human"}},"message":{{"role":"user","content":"{text}"}}}}"#
     )
 }
 
-/// A main-chain assistant row.
 fn answer_row(model: &str) -> String {
     format!(
         r#"{{"type":"assistant","isSidechain":false,"message":{{"model":"{model}","role":"assistant","content":[{{"type":"text","text":"ok"}}]}}}}"#
     )
 }
 
-/// A conversation has a task from someone else's first prompt, never from the harness's own
-/// turns (the notice, READY, the carry-on and its answer). A person's or an orchestrator's
-/// prompt makes it tasked once recorded, answered or not, for good, even stopped with Esc. A
-/// command of theirs is a task once it starts a turn and while it has not said it started
-/// none (`/model`'s local output says so). Not prompts: a subagent's rows, Claude Code's
-/// expansions (`isMeta`), a tool's result, Esc's note. Negative controls: the same
-/// transcripts with a person's prompt read tasked; an unknown user row's shape reads as
-/// someone's.
 #[test]
 fn a_conversation_has_a_task_from_someone_elses_first_prompt() {
     let notice = prompt_row(
@@ -2299,8 +2008,6 @@ fn a_conversation_has_a_task_from_someone_elses_first_prompt() {
     let sub_answer = r#"{"type":"assistant","isSidechain":true,"message":{"model":"claude-haiku-4-5","content":[]}}"#.to_string();
     let model_cmd = prompt_row("<command-name>/model</command-name>");
     let model_out = prompt_row("<local-command-stdout>Set model to haiku</local-command-stdout>");
-    // Claude Code 2.1.283's own shape for a prompt command (`/init`): the
-    // command row, its expansion (`isMeta`), the turn.
     let init_cmd = prompt_row(
         "<command-message>init is analyzing your codebase…</command-message>\\n<command-name>/init</command-name>",
     );
@@ -2338,8 +2045,6 @@ fn a_conversation_has_a_task_from_someone_elses_first_prompt() {
     let tasked: [(&str, Vec<&String>); 11] = [
         ("a person's prompt, answered", vec![&person, &ready]),
         ("a person's prompt, not answered yet", vec![&person]),
-        // A first prompt stopped with Esc before any answer is still someone's
-        // ask.
         ("a person's prompt, stopped with Esc", vec![&person, &esc]),
         (
             "a first prompt after the notice, stopped with Esc",
@@ -2371,18 +2076,14 @@ fn a_conversation_has_a_task_from_someone_elses_first_prompt() {
     for (what, rows) in &tasked {
         assert!(transcript_tasked(&text(rows), &[]), "{what}");
     }
-    // An unknown shape reads as someone's, never as none.
     let odd = r#"{"type":"user","message":{"role":"user","content":{"weird":1}}}"#.to_string();
     assert!(transcript_tasked(&text(&[&odd]), &[]));
-    // Folded a line at a time, the answer is the same, and stays: a prompt
-    // for good at once, a command only while it has not said.
     let mut scan = TaskScan::default();
     assert!(!scan.line(&notice) && !scan.line(&ready));
     assert!(scan.line(&model_cmd) && !scan.settled());
     assert!(!scan.line(&model_out) && !scan.tasked());
     assert!(scan.line(&person) && scan.settled());
     assert!(scan.line(&notice) && scan.line(&model_out) && scan.tasked());
-    // Every turn the harness types carries the mark the scan reads.
     let (from, to) = (v("2.1.281"), v("2.1.283"));
     for typed in [
         prepare_prompt(&from, &to, Source::Managed, "M"),
@@ -2396,18 +2097,6 @@ fn a_conversation_has_a_task_from_someone_elses_first_prompt() {
     }
 }
 
-/// A LOCAL COMMAND'S OUTPUT IN A `system` ROW SAYS IT STARTED NO TURN, as its
-/// `user` row of the same text does (the live lab of 2026-10-17, `restore
-/// crash --clear` on Claude Code 2.1.302): there `/clear` is recorded as the
-/// caveat (`isMeta`), the command's `user` row, then a `system` row of
-/// subtype `local_command` whose top-level `content` is
-/// `<local-command-stdout></local-command-stdout>`. Read past, the command
-/// waited for a turn forever, the cleared conversation read tasked, and the
-/// relaunch typed `Continue where you left off … keep going` into a
-/// conversation nobody had asked anything. NEGATIVE CONTROLS: a person's
-/// prompt after it is a task; a `system` row of another subtype, or a
-/// `local_command` row that is no command's output, leaves a command
-/// waiting (a task meanwhile).
 #[test]
 fn a_local_commands_output_in_a_system_row_starts_no_task() {
     let caveat = r#"{"type":"user","isMeta":true,"isSidechain":false,"message":{"role":"user","content":"<local-command-caveat>The command below was run directly in Claude Code, not sent to you as a request.</local-command-caveat>"}}"#.to_string();
@@ -2415,8 +2104,6 @@ fn a_local_commands_output_in_a_system_row_starts_no_task() {
         "<command-name>/clear</command-name>\\n            <command-message>clear</command-message>\\n            <command-args></command-args>",
     );
     let output = r#"{"isSidechain":false,"type":"system","subtype":"local_command","content":"<local-command-stdout></local-command-stdout>","level":"info","isMeta":false,"commandRun":{"command":"clear","args":""},"userType":"external","entrypoint":"cli"}"#.to_string();
-    // Another subtype's row, though it names a local command (read past the
-    // line's quick filter): no command's output.
     let other = r#"{"isSidechain":false,"type":"system","subtype":"compact_boundary","content":"<local-command-stdout></local-command-stdout>","compactMetadata":{"trigger":"local_command"},"userType":"external"}"#.to_string();
     let not_output = r#"{"isSidechain":false,"type":"system","subtype":"local_command","content":"<command-name>/model</command-name>","userType":"external"}"#.to_string();
     let person = prompt_row("Staged harness test, please follow exactly.");
@@ -2450,15 +2137,8 @@ fn a_local_commands_output_in_a_system_row_starts_no_task() {
     assert!(!scan.line(&output) && !scan.tasked(), "its output: no turn");
 }
 
-/// The supervisor's own turns are no task either. `keep going` and `answer_text` carry no
-/// mark, but the loop's ledger records every text it types and when
-/// ([`TaskScan::supervisor_typed`]), and a row with the same words (however wrapped), recorded
-/// as they were typed, is the harness's; so is a command it typed (`/compact`). Negative
-/// controls: with no ledger the first unmarked turn is a task; a person's prompt that is not
-/// the loop's words is theirs; a person's command is still a command.
 #[test]
 fn the_supervisors_own_turns_by_its_ledger_are_no_task() {
-    // The owner's own continuation words (the default's carry the mark).
     let cfg = crate::supervise::SupervisorConfig {
         continue_text: "keep going".to_string(),
         ..crate::supervise::SupervisorConfig::default()
@@ -2475,7 +2155,6 @@ fn the_supervisors_own_turns_by_its_ledger_are_no_task() {
         rule: rule.to_string(),
     })
     .collect();
-    // Recorded as the loop typed it (its ledger's `ts` 1 000 ms).
     let typed = |text: &str| {
         prompt_row(text).replacen('{', r#"{"timestamp":"1970-01-01T00:00:01.000Z","#, 1)
     };
@@ -2504,12 +2183,6 @@ fn the_supervisors_own_turns_by_its_ledger_are_no_task() {
     assert!(transcript_tasked(&command, &ours), "a person's command");
 }
 
-/// THE HARNESS'S OWN MARKED ACTS ARE NO TASK, LEDGER OR NOT (Autopilot Cruise
-/// / Autopilot Land): Cruise's continuation (`CONTINUE_TEXT`, the default
-/// `continue_text`), its prompt at a done claim, and Land's instruction and
-/// nudge open with the harness's mark, so a conversation whose only turns
-/// are these reads taskless with no ledger at all. NEGATIVE CONTROL: the
-/// owner's own unmarked `keep going`, with no ledger, is someone's prompt.
 #[test]
 fn the_harnesss_marked_acts_are_no_task_ledger_or_not() {
     let json = |text: &str| {
@@ -2541,10 +2214,6 @@ fn the_harnesss_marked_acts_are_no_task_ledger_or_not() {
     assert!(transcript_tasked(&chain, &[]), "CONTROL: unmarked words");
 }
 
-// ---------------------------------------------------------------- a finished task, by its record
-
-/// A main-chain user row Claude Code asked itself, as 2.1.300 records it:
-/// `origin.kind` `kind`, `promptSource` `system`, `isMeta` as `meta`.
 fn asked_by_row(kind: &str, meta: bool, text: &str) -> String {
     format!(
         r#"{{"isSidechain":false,"type":"user","isMeta":{meta},"message":{{"role":"user","content":{}}},"origin":{{"kind":"{kind}"}},"promptSource":"system","version":"2.1.300"}}"#,
@@ -2552,7 +2221,6 @@ fn asked_by_row(kind: &str, meta: bool, text: &str) -> String {
     )
 }
 
-/// A background task's notification, as 2.1.300 records it.
 fn notification_row() -> String {
     asked_by_row(
         "task-notification",
@@ -2561,16 +2229,6 @@ fn notification_row() -> String {
     )
 }
 
-/// A CONVERSATION ONLY A PEER DIRECTED HAS A TASK (the done
-/// report's seventh item): Claude Code records a peer session's message
-/// `isMeta`, so [`TaskScan`] read it as no prompt, and a conversation whose
-/// only asks were a peer's read taskless to the upgrade, which restarted it
-/// afresh and left the conversation behind. Read by its origin's kind first,
-/// as [`FinishedScan`] reads it, it is someone's ask; so is a row of a kind
-/// this build does not know. NEGATIVE CONTROLS: Claude Code's own expansion
-/// (`isMeta`, a person's origin) and the harness's own lines are still no
-/// task, and a background task's notification is still read as one (in
-/// doubt the conversation is kept).
 #[test]
 fn a_conversation_only_a_peer_directed_has_a_task() {
     let peer = asked_by_row(
@@ -2618,26 +2276,12 @@ fn a_conversation_only_a_peer_directed_has_a_task() {
     );
 }
 
-/// A main-chain user row of the session's own (no origin), `extra` fields
-/// spliced in.
 fn bare_user_row(extra: &str, content: &str) -> String {
     format!(
         r#"{{"isSidechain":false,"type":"user"{extra},"message":{{"role":"user","content":{content}}}}}"#
     )
 }
 
-/// A RESTART'S CRUISE PROMPT LANDS NOTHING IN THE RECORD (Autopilot Cruise): a
-/// relaunch into a done report types its facts and the Cruise prompt
-/// (`checking`, `continued:check`), and the worker's done answer to it is a
-/// claim again, never a finish — the record's last words claim done
-/// ([`FinishedScan::said_done`]), so the next relaunch asks the prompt
-/// again: the plain prompt, the one that says to approve nothing
-/// irreversible, and an older build's check in a restart's carry-on, the
-/// clean defense included. Typed into a landed task, each opens it, as a
-/// Land changed to Cruise reopens it. NEGATIVE CONTROLS: Land's instruction
-/// answered by the clean defense lands the task; the plain carry-on, typed
-/// into a landed task, opens nothing; a person's prompt quoting Land's words
-/// is theirs, and the defense answering it lands nothing.
 #[test]
 fn a_restarts_cruise_prompt_lands_nothing_in_the_record() {
     use super::super::relaunch::{CAUSE_HOST, resumed_prompt};
@@ -2688,7 +2332,6 @@ fn a_restarts_cruise_prompt_lands_nothing_in_the_record() {
         reopened.push(typed_row(check));
         assert!(!finished(&reopened), "it opens a landed task: {check}");
     }
-    // NEGATIVE CONTROLS.
     let land = turn_end::land_text(None);
     assert!(finished(&answered(&land, DEFENSE)), "Land's instruction");
     let mut carried = landing_rows();
@@ -2701,23 +2344,6 @@ fn a_restarts_cruise_prompt_lands_nothing_in_the_record() {
     );
 }
 
-/// A WALL'S RETRY DELIVERS AGAIN THE LAND ACT THE WALL CUT, TO THE RECORD TOO
-/// (the merge review's M5-R1): the turn-end policy reads the answer to the
-/// retry of a wall that cut a land act's turn as that act's
-/// (`TurnEndState::cut_land`), and its clean defense lands the task. So the
-/// record reads it: Land's instruction (or a nudge) typed, Claude Code's 529
-/// row, the policy's retry by its ledger, then the clean defense lands the
-/// task — the act answered before the wall or not, across a second wall,
-/// closed or not. FAILS WITHOUT THE FIX: the retry read as the harness's own
-/// line took the act back, the defense a first done report (`finished`
-/// false, `said_done` true), and a new loop or a relaunch typed Land's
-/// instruction into a task the previous loop had landed. NEGATIVE CONTROLS:
-/// a person's prompt after the wall opens the task; the supervisor's
-/// `/compact`, a restart's marked carry-on, the retry with no ledger
-/// (someone's words) and a retry after the worker went on past the wall keep
-/// no act; a wall inside a plain continuation's turn keeps none either; the
-/// Cruise prompt cut and retried lands nothing (its answer is a claim); an
-/// idle report answering the retried LAND lands nothing.
 #[test]
 fn a_walls_retry_delivers_the_land_act_it_cut_again_to_the_record() {
     use super::super::relaunch::{CAUSE_HOST, resumed_prompt};
@@ -2806,7 +2432,6 @@ fn a_walls_retry_delivers_the_land_act_it_cut_again_to_the_record() {
     for (what, rows) in &finished {
         assert!(scan(rows, &ours).finished(), "{what}");
     }
-    // NEGATIVE CONTROLS.
     let carry_on = typed_row(&resumed_prompt("2.1.300", CAUSE_HOST));
     let compact = at(typed_row(
         "<command-name>/compact</command-name>\n<command-message>compact</command-message>\n<command-args></command-args>",
@@ -2871,18 +2496,6 @@ fn a_walls_retry_delivers_the_land_act_it_cut_again_to_the_record() {
     );
 }
 
-/// ONLY A WALL'S RETRY BY ITS LEDGER RULE DELIVERS AGAIN THE LAND ACT A WALL
-/// CUT (the done report's tenth item): the usage resume
-/// types `keep going` (`usage-resume@v1`), and so does the continue policy
-/// (`continue@v1`). The record read the next plain line the loop typed after
-/// a wall in an act's turn as the retry whatever rule typed it, so a reply
-/// to a plain `keep going` there was the act's answer, where the turn-end
-/// policy reads it as a first one (`TurnEndState::acted`: only
-/// `is_wall_retry` rules carry `cut_land`). Now the ledger row's rule
-/// decides: the clean defense under the usage resume's rule delivers Land's
-/// instruction again and lands the task; under `continue@v1` it does not,
-/// and the reply stays a done report. NEGATIVE CONTROL: the retry's own
-/// rule still lands it.
 #[test]
 fn only_a_walls_retry_by_its_ledger_rule_delivers_the_cut_land_act_again() {
     let at = |row: String| row.replacen('{', r#"{"timestamp":"1970-01-01T00:00:01.000Z","#, 1);
@@ -2928,18 +2541,6 @@ fn only_a_walls_retry_by_its_ledger_rule_delivers_the_cut_land_act_again() {
     );
 }
 
-/// THE VENDOR'S OWN CONTINUATION DELIVERS AGAIN THE LAND ACT A LIMIT CUT, TO
-/// THE RECORD TOO (the Land item): Land's instruction
-/// typed, the usage limit's row in its turn, and Claude Code's own
-/// continuation at the reset (`origin.kind` `auto-continuation`): the reply
-/// under it is the cut act's answer, as the turn-end policy reads it
-/// (`TurnEndState::observe`), and the clean defense lands the task. Read as a
-/// turn nobody asked, the act stood no more, the defense was a first done
-/// report, and a relaunch or the upgrade typed Land's instruction once more.
-/// NEGATIVE CONTROLS: with no act before the limit, the continuation's
-/// defense is a done report and nothing more; the Cruise prompt cut so lands
-/// nothing; a wake of a background task after the limit is no continuation
-/// of it.
 #[test]
 fn the_vendors_own_continuation_delivers_the_cut_land_act_again_to_the_record() {
     let wall = r#"{"isSidechain":false,"type":"assistant","message":{"model":"<synthetic>","content":[{"type":"text","text":"You've hit your limit · resets 3pm"}]},"isApiErrorMessage":true,"error":"rate_limit"}"#.to_string();
@@ -2991,18 +2592,6 @@ fn the_vendors_own_continuation_delivers_the_cut_land_act_again_to_the_record() 
     }
 }
 
-/// LAND'S ANSWER TO A QUESTION IS A LAND ACT TO THE RECORD ONCE THE LAND
-/// INSTRUCTION WAS TYPED (the Land item): the turn-end
-/// policy lands a clean defense answering its `land-answer@v1` once the
-/// instruction was typed (`TurnEndState::acted`: `landing`), and the record
-/// read that answer as the harness's own line, so the defense was a first
-/// done report and a relaunch or the upgrade typed Land's instruction once
-/// more. By the ledger row's rule, and the instruction read before it, the
-/// answer is Land's: the clean defense lands the task. NEGATIVE CONTROLS: no
-/// instruction before it (the policy lands nothing there either), a
-/// person's prompt between (their task), and the answer's words under
-/// another rule, are the harness's own line, the reply a done report; an
-/// idle report answering it lands nothing.
 #[test]
 fn lands_answer_after_the_instruction_is_a_land_act_to_the_record() {
     let at = |row: String| row.replacen('{', r#"{"timestamp":"1970-01-01T00:00:01.000Z","#, 1);
@@ -3078,17 +2667,11 @@ fn lands_answer_after_the_instruction_is_a_land_act_to_the_record() {
     assert!(!s.finished(), "CONTROL: an idle report answering it");
 }
 
-/// The worker's report ending with the retired token, which lands nothing
-/// now: only a land act's clean defense does.
 const FINISHED_REPORT: &str = "Landed the fix and verified it on main.\n\nATERM-TASK-DONE";
 
-/// A CLEAN DEFENSE (Autopilot Land): a `Nothing left:` line, no need and no
-/// open work beside it — what lands a task answering one of Land's acts.
 const DEFENSE: &str = "Landed the fix and verified it.\nNothing left: it is merged into the \
                        remote main branch.";
 
-/// A landing's rows: the task, the worker's report, Land's instruction and
-/// the clean defense answering it.
 fn landing_rows() -> Vec<String> {
     vec![
         typed_row("Fix the lexer and land it."),
@@ -3098,21 +2681,6 @@ fn landing_rows() -> Vec<String> {
     ]
 }
 
-/// A LANDED TASK STAYS LANDED UNTIL SOMEONE ASKS ([`FinishedScan`]): the
-/// clean defense answering Land's instruction lands it, and no turn nobody
-/// asked opens it again — Claude Code's own wakes (a background task's
-/// notification, its usage-limit continuation, an older build's
-/// notification by its words, a `/loop` wake), the harness's own turns,
-/// compaction summaries, a person's command that starts no turn — whatever
-/// their answers say. The Cruise prompt typed into a landed task opens it
-/// (a Land changed to Cruise), by every spelling of it, and its done answer
-/// lands nothing. NEGATIVE CONTROLS: a person's prompt opens it at once,
-/// before any answer; so does a peer session's message (recorded `isMeta`,
-/// `system`-sourced), a row of a kind the fold does not know, and a command
-/// that starts a turn; a later text of the same turn takes the landing back
-/// (a tool's result is no new turn); the retired token alone answering Land
-/// lands nothing, nor does the defense written by `<synthetic>`, an API
-/// error or a subagent.
 #[test]
 fn finished_holds_until_someone_asks() {
     let ask = typed_row("Fix the lexer and land it.");
@@ -3186,7 +2754,6 @@ fn finished_holds_until_someone_asks() {
     for (what, rows) in &stays {
         assert!(finished(rows), "{what}");
     }
-    // Folded a line at a time, the answer at each row.
     let mut scan = FinishedScan::default();
     for row in &base[..3] {
         assert!(!scan.line(row));
@@ -3195,8 +2762,6 @@ fn finished_holds_until_someone_asks() {
     assert!(scan.line(&notification_row()));
     assert!(scan.line(&reply("Done with the cleanup.")));
     assert!(!scan.line(&typed_row("Now add the flag.")));
-    // The Cruise prompt typed into a landed task opens it, by every
-    // spelling of it, and its done answer lands nothing.
     let rules = format!(
         "{} (standing rules: never force-push)",
         turn_end::DONE_CHECK
@@ -3212,7 +2777,6 @@ fn finished_holds_until_someone_asks() {
             assert!(!finished(&rows), "{check}: {said}");
         }
     }
-    // NEGATIVE CONTROLS.
     let peer = asked_by_row(
         "peer",
         true,
@@ -3271,19 +2835,10 @@ fn finished_holds_until_someone_asks() {
     for (what, rows) in &opened {
         assert!(!finished(rows), "{what}");
     }
-    // A compaction's summary is no turn: a later text of the turn it fell in
-    // still takes the landing back.
     assert!(!finished(&with(&[summary, reply("And the changelog.")])));
     assert!(!finished(std::slice::from_ref(&ask)), "asked, not answered");
 }
 
-/// LAND'S INSTRUCTION TYPED AGAIN AFTER A `/compact` IS A LAND ACT TO THE
-/// RECORD (done-3): where a full context cut a land act's
-/// turn, the record reads the act typed again as the compaction's
-/// continuation by its words, so its clean defense lands the task —
-/// whatever the compaction's summary kept. NEGATIVE CONTROL: `keep going`
-/// after the compaction delivers no act, and the defense answering it is a
-/// done report (the record never reads an act across the `/compact`).
 #[test]
 fn lands_instruction_typed_again_after_a_compaction_is_a_land_act_to_the_record() {
     let wall = r#"{"isSidechain":false,"type":"assistant","message":{"model":"<synthetic>","content":[{"type":"text","text":"Prompt is too long"}]},"isApiErrorMessage":true,"error":"invalid_request"}"#.to_string();
@@ -3314,19 +2869,6 @@ fn lands_instruction_typed_again_after_a_compaction_is_a_land_act_to_the_record(
     assert!(!going.finished() && going.said_done(), "{going:?}");
 }
 
-/// LAND'S ACTS AND THE CRUISE PROMPT ARE READ BY THEIR WORDS, WHOEVER TYPED
-/// THEM (done-2, the product's rule): a user row that opens
-/// with Land's instruction is a land act to the record whether or not the
-/// session's ledger names it, so the clean defense answering it lands the
-/// task; and a row that opens with the Cruise prompt is the prompt, so typed
-/// into a landed task it opens it. The alternative, the ledger alone, misses
-/// a real act wherever the ledger has no row of it — a hand `/resume` tab
-/// whose ledger `conversation_typed` does not join, a row past
-/// `TYPED_WITHIN_MS` or cut at `KEEP_ROWS` (here: no ledger at all). Its one
-/// other case, a person who types the words verbatim, gets what they ask.
-/// NEGATIVE CONTROL: a person's prompt that quotes them after words of their
-/// own is theirs, and the defense answering it is a first done report, never
-/// a landing.
 #[test]
 fn lands_acts_are_read_by_their_words_whoever_typed_them() {
     let ask = typed_row("Fix the lexer and land it.");
@@ -3359,16 +2901,11 @@ fn lands_acts_are_read_by_their_words_whoever_typed_them() {
         rows.push(typed_row(&check));
         assert!(!scan(&rows).finished(), "no ledger, opened: {check}");
     }
-    // NEGATIVE CONTROL: Land's words quoted after a person's own.
     let quoted = format!("Is this wording right? {}", turn_end::land_text(None));
     let s = scan(&[ask, report, typed_row(&quoted), model_row(DEFENSE)]);
     assert!(!s.finished() && s.said_done(), "{s:?}");
 }
 
-/// The open-items challenge as the last build that typed it worded it,
-/// naming `still open` (retired: no act types it now — the open work a done
-/// claim names is the done check's suffix), which conversation records still
-/// hold and [`FinishedScan`] still reads by [`turn_end::OPEN_ITEMS_HEAD`].
 fn old_challenge(irreversible: bool) -> String {
     let text = format!(
         "{} (still open): a done report ends nothing while any is left, a blocked item \
@@ -3385,19 +2922,6 @@ fn old_challenge(irreversible: bool) -> String {
     }
 }
 
-/// THE RETIRED CHALLENGES ARE CHECKS TO THE RECORD ([`Asked::Challenge`]):
-/// older builds typed an open-items challenge (and an uncommitted-work one)
-/// after a done report naming open work, which conversation records still
-/// hold. The record reads each, by its opening words in every wording it was
-/// typed in and whether or not the reversible clause rides it, as the
-/// Cruise prompt is read: typed into a landed task it opens it; unanswered,
-/// the report it followed stays the last words' done report, so a relaunch
-/// asks the Cruise prompt after it; and no answer to it lands the task —
-/// work going on, a done reply in words (a claim), the retired token, the
-/// clean defense itself. NEGATIVE CONTROLS: the loop's own `keep going`
-/// after a landing, by its ledger, takes nothing back; a person's prompt
-/// that quotes the challenge after words of their own is theirs, and a done
-/// reply in words to it is a first done report.
 #[test]
 fn the_retired_challenges_are_checks_to_the_record() {
     let open = model_row(
@@ -3441,14 +2965,10 @@ fn the_retired_challenges_are_checks_to_the_record() {
                    reply with ATERM-TASK-DONE on a line by itself only when every item left needs \
                    a person (a credential, a decision, physical access) or cannot be done on this \
                    host, each named with its blocker; a slow check is not a blocker.";
-    // The challenge as `69a8f68178` typed it (ordinary language, a blocked
-    // item exempt), until the owner's rule of 2026-10-19.
     let ordinary = "Your report still names open work (still open). Do each of those items you \
                     can still do yourself now, and verify it. Report whether the task is \
                     complete, the outcome, verification, and any remaining blockers in ordinary \
                     language.";
-    // The uncommitted-work challenge as the last build that typed it worded
-    // it, over a repository with one changed file.
     let uncommitted = format!(
         "{}: /Users//a/Developer/parser: 1 changed (src/lexer.rs). A done report ends nothing \
          while any is left. Commit and push it (merged to main where this repository lands \
@@ -3483,7 +3003,6 @@ fn the_retired_challenges_are_checks_to_the_record() {
         let s = scan(&[asked.clone(), words.clone()]);
         assert!(s.said_done(), "done in words is a claim: {asked}");
     }
-    // NEGATIVE CONTROLS.
     let mut kept = landing_rows();
     kept.extend([at(typed_row("keep going")), work.clone()]);
     assert!(
@@ -3498,8 +3017,6 @@ fn the_retired_challenges_are_checks_to_the_record() {
     );
 }
 
-/// The immediately preceding check wording is a transcript fixture only:
-/// current prompts ask agents for ordinary completion reports.
 const TOKEN_CHECK_FIXTURE: &str = "Before you stop: do every open item, skipped check, follow-up and \
      next step you can still do yourself now, and verify it (build, test, measure where numbers \
      were asked for, commit and land where this repository lands work). End your reply with \
@@ -3507,13 +3024,6 @@ const TOKEN_CHECK_FIXTURE: &str = "Before you stop: do every open item, skipped 
      a decision, physical access) or cannot be done on this host, each item named with its \
      blocker; a slow check is not a blocker. Otherwise continue.";
 
-/// OLD LAND INSTRUCTIONS STAY LAND ACTS: an older build's instruction or
-/// nudge can remain in an existing conversation after an upgrade (the
-/// token's wordings, the ordinary-language ones, every retired set), and
-/// the record reads each by its words as Land's act: the clean defense
-/// answering it lands the task. NEGATIVE CONTROL: an ordinary completion
-/// report answering it — which those builds took as the end — is a claim
-/// now, and lands nothing; so is the retired token.
 #[test]
 fn legacy_land_instructions_land_on_a_clean_defense() {
     let instruction = "[aterm harness] Autopilot is set to Land: wrap up this work cleanly. \
@@ -3553,18 +3063,6 @@ fn legacy_land_instructions_land_on_a_clean_defense() {
     }
 }
 
-/// ONLY A LAND ACT'S CLEAN DEFENSE LANDS THE TASK IN THE RECORD (FOREVER
-/// LAND): never the token, never a check's reply. The Cruise prompt and
-/// every check an older build typed (today's alone, with the reversible
-/// clause, and with the standing rules after that; the token's wordings and
-/// the `reply DONE` one before them, which records written then still hold)
-/// land nothing whatever their answer — the token on a line of its own,
-/// `DONE`, a done phrase, the clean defense itself. Land's instruction and
-/// its nudge, today's and the retired, land the task on the clean defense
-/// alone: a done phrase, the token or `DONE` answering them is a claim, and
-/// a defense that names a need, or open work, lands nothing. NEGATIVE
-/// CONTROLS: outside any act neither the token nor the defense lands
-/// anything; a near miss of a check's words is someone's prompt.
 #[test]
 fn only_a_land_acts_clean_defense_lands_the_task_in_the_record() {
     let ask = typed_row("Fix the lexer and land it.");
@@ -3625,31 +3123,20 @@ fn only_a_land_acts_clean_defense_lands_the_task_in_the_record() {
         assert!(!finished(&answered(act, &needs)), "a need: {act}");
         assert!(!finished(&answered(act, open_work)), "open work: {act}");
     }
-    // NEGATIVE CONTROLS: outside any act nothing lands.
     assert!(!finished(&[ask.clone(), model_row(claims[0])]));
     assert!(!finished(&[ask.clone(), model_row(DEFENSE)]));
-    // A near miss of a check's words is someone's prompt.
     let near = typed_row("If the task is finished, reply DONE.");
     let mut rows = landing_rows();
     rows.extend([near, model_row("DONE")]);
     assert!(!finished(&rows), "someone's prompt opens the landing");
 }
 
-/// A worker's waits on its own work in flight worded with a done phrase
-/// (the cross-lane review's F4).
 const WAITS_AT_THE_CHECK: [&str; 3] = [
     "Nothing more I can do until the release build finishes; its monitor will notify me.",
     "I'll stop here until CI reports back; the build is still running.",
     "Everything I can do is queued behind the build, which is still running.",
 ];
 
-/// A WAIT AT LAND'S YIELD LANDS NOTHING, AND ITS OWN WAKE KEEPS IT OPEN (the
-/// cross-lane review's F4): Land's instruction answered with a wait on the
-/// worker's own work in flight (`I'll stop here until CI reports back`) is
-/// no clean defense, so the wake that work causes — Claude Code's
-/// `<task-notification>`, nobody's prompt — ends on the worker's next step,
-/// an open task. NEGATIVE CONTROL: the clean defense at Land's yield stays
-/// landed through the same wake (a wake reopens nothing).
 #[test]
 fn a_wait_at_lands_yield_is_reopened_by_its_own_wake() {
     let finished = |rows: &[String]| transcript_finished(&rows.join("\n"), &[]);
@@ -3669,13 +3156,10 @@ fn a_wait_at_lands_yield_is_reopened_by_its_own_wake() {
     assert!(finished(&rows(DEFENSE)));
 }
 
-/// `row` written in the turn Claude Code numbers `id` (its `promptId`).
 fn in_turn(row: &str, id: &str) -> String {
     row.replacen('{', &format!(r#"{{"promptId":"{id}","#), 1)
 }
 
-/// A row Claude Code writes `isMeta` into a running turn: a Stop hook's
-/// feedback, `/goal`'s check-in.
 fn meta_row(text: &str) -> String {
     bare_user_row(
         r#","isMeta":true"#,
@@ -3683,16 +3167,6 @@ fn meta_row(text: &str) -> String {
     )
 }
 
-/// A TURN ITS OWN GOAL KEEPS GOING IS STILL THE LANDING'S TURN
-/// ([`FinishedScan`]): a Stop hook's feedback (`Stop hook feedback: … not
-/// met`) or `/goal`'s check-in is written `isMeta` under the running turn's
-/// `promptId` a second after the model's text (MEASURED 2026-10-15, 39 and
-/// 16 such rows on this machine), and the worker works on in that turn: its
-/// later text that is no clean defense takes the landing back. So too on a
-/// build that numbers no turn. NEGATIVE CONTROLS: the hook row alone takes
-/// nothing back, nor does it when the worker says the defense again; a row
-/// that asks nothing under a turn of its own (a `/loop`'s wake, a new
-/// `promptId`) begins a turn, and its answer leaves the landing standing.
 #[test]
 fn a_turn_its_own_goal_keeps_going_takes_the_landing_back() {
     let finished = |rows: &[String]| transcript_finished(&rows.join("\n"), &[]);
@@ -3724,13 +3198,11 @@ fn a_turn_its_own_goal_keeps_going_takes_the_landing_back() {
         assert!(!finished(&rows), "{what}, then more work");
         let rows = [landed(), vec![kept.clone(), tool.clone(), work.clone()]].concat();
         assert!(!finished(&rows), "{what}, a tool's result, then more work");
-        // NEGATIVE CONTROLS.
         let rows = [landed(), vec![kept.clone()]].concat();
         assert!(finished(&rows), "{what} alone");
         let rows = [landed(), vec![kept.clone(), defense.clone()]].concat();
         assert!(finished(&rows), "{what}, then the defense again");
     }
-    // A build that numbers no turn: the row goes on the turn too.
     let rows = [
         typed_row("Make the compiler build itself."),
         report.clone(),
@@ -3740,7 +3212,6 @@ fn a_turn_its_own_goal_keeps_going_takes_the_landing_back() {
         work.clone(),
     ];
     assert!(!finished(&rows), "no promptId");
-    // NEGATIVE CONTROL: a `/loop`'s wake is a turn of its own.
     let wake = in_turn(&meta_row("keep going: check the land log"), "p2");
     let rows = [
         landed(),
@@ -3748,11 +3219,6 @@ fn a_turn_its_own_goal_keeps_going_takes_the_landing_back() {
     ]
     .concat();
     assert!(finished(&rows), "a /loop wake under a new promptId");
-    // A `/loop`'s wake on a build that numbers no turn is a turn of its own
-    // by its `scheduledTaskId` (the 2.1.252 and 2.1.267
-    // bundles stamp it on the wake's user row): its answer leaves the
-    // landing standing. Read as part of the landing's turn, it took the
-    // landing back.
     let unnumbered_wake = bare_user_row(
         r#","isMeta":true,"promptSource":"system","scheduledTaskId":"t1""#,
         r#""keep going: check the land log""#,
@@ -3768,19 +3234,6 @@ fn a_turn_its_own_goal_keeps_going_takes_the_landing_back() {
     assert!(finished(&rows), "a /loop wake with no promptId");
 }
 
-/// A TURN CLAUDE CODE BEGINS WITH NO `promptId` IS STILL ONE OF ITS OWN (the
-/// review of 's done-5, KR-DONE-4): the scheduler's `onFire`
-/// passes no task, so the notice of a one-shot task missed while Claude Code
-/// was not running — what a relaunch's start meets — carries no
-/// `scheduledTaskId` (the 2.1.252 bundle: `if(l)l(e);else t(Pcr(e))`, and the
-/// REPL passes no `onMissed`; so too 2.1.302). On a build that numbers no
-/// turn it went on the landing's turn, and its answer took the landing back.
-/// Read by its fixed opening words it is a turn of its own, and so is a row
-/// whose `turnOrigin` names one with no `promptId` beside it (Claude Code's
-/// own rule, 2.1.302: `promptId || turnOrigin || !isMeta`). NEGATIVE
-/// CONTROLS: a Stop hook's feedback with neither still goes on the turn and
-/// takes the landing back, and so does the notice's text quoted inside other
-/// words.
 #[test]
 fn a_missed_tasks_notice_is_a_turn_of_its_own_on_a_build_that_numbers_none() {
     let finished = |rows: &[String]| transcript_finished(&rows.join("\n"), &[]);
@@ -3801,7 +3254,6 @@ fn a_missed_tasks_notice_is_a_turn_of_its_own_on_a_build_that_numbers_none() {
     );
     let rows = [landed(), vec![originated, answer.clone()]].concat();
     assert!(finished(&rows), "a turnOrigin with no promptId");
-    // NEGATIVE CONTROLS.
     let hook = meta_row(
         "Stop hook feedback:\n[The compiler builds itself]: The condition has not been \
          satisfied: stage 2 fails.",
@@ -3816,18 +3268,6 @@ fn a_missed_tasks_notice_is_a_turn_of_its_own_on_a_build_that_numbers_none() {
     assert!(!finished(&rows), "the notice's words quoted go on the turn");
 }
 
-/// A PERSON'S `!` SHELL COMMAND ASKS THE WORKER NOTHING, AND A PROMPT TYPED
-/// WHILE IT WORKS IS SOMEONE'S ([`FinishedScan`]): `<bash-input>…` and its
-/// `<bash-stdout>…` (as 2.1.294 records them) leave a landed task landed
-/// through the wakes after them; a prompt absorbed into a running turn,
-/// recorded only as a `queued_command` attachment (2.1.267 to 2.1.300),
-/// opens it at once, and the worker's defense after it lands nothing (no
-/// land act since); Land's instruction typed after it lands it again.
-/// NEGATIVE CONTROLS: a shell command a model turn follows is a turn of
-/// someone's; absorbed into a wake's turn, an attachment of a background
-/// task's notification, one of what the loop typed (its ledger), and a
-/// subagent's leave the landing standing; the same words with no ledger open
-/// it.
 #[test]
 fn a_shell_command_asks_nothing_and_a_prompt_typed_while_it_works_is_someones() {
     let finished = |rows: &[String], ours: &[Typed]| transcript_finished(&rows.join("\n"), ours);
@@ -3854,7 +3294,6 @@ fn a_shell_command_asks_nothing_and_a_prompt_typed_while_it_works_is_someones() 
     ]
     .concat();
     assert!(!finished(&answered, &[]), "a shell command a turn followed");
-    // A prompt absorbed into the running turn.
     let queued = |kind: &str, prompt: &str, chain: bool| {
         format!(
             r#"{{"isSidechain":{chain},"type":"attachment","attachment":{{"type":"queued_command","prompt":{},"commandMode":"prompt","origin":{{"kind":"{kind}"}}}},"timestamp":"1970-01-01T00:00:01.000Z","version":"2.1.300"}}"#,
@@ -3874,7 +3313,6 @@ fn a_shell_command_asks_nothing_and_a_prompt_typed_while_it_works_is_someones() 
     ]
     .concat();
     assert!(finished(&relanded, &[]), "absorbed, then landed again");
-    // NEGATIVE CONTROLS.
     let ours = [Typed {
         at_ms: 1_000,
         text: "keep going".to_string(),
@@ -3909,14 +3347,6 @@ fn a_shell_command_asks_nothing_and_a_prompt_typed_while_it_works_is_someones() 
     assert!(!finished(&rows, &[]), "the loop's words, no ledger");
 }
 
-/// THE RESUMED BUILD'S OWN WARNING ([`resumed_build_warned`], the quiet
-/// restart's one look): the row 2.1.300 wrote a second after the measured
-/// quiet restart of 2026-10-15 is read by its fields — a main-chain
-/// `system`/`informational` row at level `warning`, written by the resumed
-/// build within the look. NEGATIVE CONTROLS: the same row at level `notice`,
-/// of another subtype, written by the old build, before the relaunch or
-/// after the look, a subagent's, or asked of a record with no build named,
-/// is none.
 #[test]
 fn the_resumed_builds_warning_is_read_by_its_fields() {
     let at = |t: &str| models::parse_utc(t).expect("a time");
@@ -4015,15 +3445,6 @@ fn the_resumed_builds_warning_is_read_by_its_fields() {
     }
 }
 
-/// A conversation with no task is never announced to: it is restarted afresh
-/// ([`Step::Fresh`]) once idle the full [`QUIET_S`] (a first prompt may be on
-/// its way: an orchestrator's `await agent idle` returns at the first idle
-/// verdict), whether nothing was typed yet or an older aterm's notice stands
-/// unanswered, under either flow — and only once the owner's waiting record
-/// has stood a look (`notice-shown`). A person at the tab, a hold, a box, a
-/// draft, a busy agent and work under it still wait, and a break ends
-/// nothing. Negative controls: the same facts with a task are announced to;
-/// a taskless agent whose verdict moved under `QUIET_S` ago settles first.
 #[test]
 fn a_conversation_with_no_task_is_restarted_afresh_never_announced_to() {
     let now = 10_000;
@@ -4046,8 +3467,6 @@ fn a_conversation_with_no_task_is_restarted_afresh_never_announced_to() {
             "{phase:?}"
         );
     }
-    // Under the quiet upgrade too; and never before the owner is told
-    // ([`Facts::unnoticed`]).
     let quiet = Facts {
         quiet: true,
         ..settled.clone()
@@ -4065,7 +3484,6 @@ fn a_conversation_with_no_task_is_restarted_afresh_never_announced_to() {
             f.quiet
         );
     }
-    // Just launched, or just out of a turn: the settle first.
     for (status_age_s, quiet_s) in [(0, 0), (10, 10), (QUIET_S - 1, QUIET_S), (QUIET_S, 1)] {
         let f = Facts {
             status_age_s,
@@ -4092,14 +3510,12 @@ fn a_conversation_with_no_task_is_restarted_afresh_never_announced_to() {
         knock(&mut f);
         assert_eq!(next_step(&Phase::Pending, &f, false, now), Step::Wait(why));
     }
-    // A restart in flight or finished is its own: nothing afresh.
     for phase in [Phase::Exiting { at_s: now }, Phase::Done] {
         assert!(matches!(
             next_step(&phase, &settled, false, now),
             Step::Wait(_)
         ));
     }
-    // Negative control: with a task, the notice.
     let tasked = Facts {
         taskless: false,
         ..settled.clone()
@@ -4110,15 +3526,9 @@ fn a_conversation_with_no_task_is_restarted_afresh_never_announced_to() {
     );
 }
 
-// ------------------------------------------- a session parked at its usage limit
-
-/// The row Claude Code 2.1.280 parks a session at its usage limit under.
 const AUTO_CONTINUE: &str =
     "⚠ Usage limit reached · continuing automatically at 6am · esc to cancel";
 
-/// A Claude Code 2.1.280 screen: the last turn's words, then `live` (the
-/// rows Claude Code parks between them and the composer), the composer
-/// empty, the auto-mode footer.
 fn claude_screen(live: &[&str]) -> Vec<String> {
     let rule = "─".repeat(80);
     let mut r = rows(&["⏺ Both workflows are relaunched; waiting on them.", ""]);
@@ -4132,9 +3542,6 @@ fn claude_screen(live: &[&str]) -> Vec<String> {
     r
 }
 
-/// The limit fact is the supervisor's own reading: the auto-continue banner over an empty
-/// composer (idle to the gates), or over a break of background work, is `limited`. Negative
-/// controls: no banner, a banner made history by words under it, a copy in a tool's output.
 #[test]
 fn the_limit_fact_is_read_by_the_supervisors_own_recogniser() {
     let parked = claude_screen(&[AUTO_CONTINUE, ""]);
@@ -4161,9 +3568,6 @@ fn the_limit_fact_is_read_by_the_supervisors_own_recogniser() {
     assert!(!limited(&quoted), "a tool's output is not the wall");
 }
 
-/// The release is typed under the notice's own gate, never over a READY the
-/// restart will act on. Its line carries the harness's mark and is neither a
-/// notice nor a continuation to a transcript reader.
 #[test]
 fn the_release_is_typed_where_a_notice_could_be_and_never_over_a_ready() {
     assert_eq!(gate_release(&idle_facts(), false), Gate::Go);
@@ -4182,8 +3586,6 @@ fn the_release_is_typed_where_a_notice_could_be_and_never_over_a_ready() {
         edit(&mut f);
         assert_eq!(gate_release(&f, false), Gate::Wait(word), "{word}");
     }
-    // A break of the agent's own background work types it too, where a
-    // notice may go, since a break that never ends reaches no idle point.
     let at_break = Facts {
         status: "busy".to_string(),
         background_point: true,
@@ -4205,10 +3607,6 @@ fn the_release_is_typed_where_a_notice_could_be_and_never_over_a_ready() {
     assert!(!is_announcement(row.get("message").expect("message")));
 }
 
-// ------------------------------------------------ no stop is for good
-
-/// Every reason a round stops for: the give-up, the refusals, the stops of a
-/// restart, the orphan pass's expirations and the Codex lane's.
 const STOPS: [&str; 12] = [
     GAVE_UP,
     "not-a-shell-job",
@@ -4224,7 +3622,6 @@ const STOPS: [&str; 12] = [
     "shell-gone",
 ];
 
-/// A break of the agent's own background work: a shell of its own under it.
 fn break_with_work() -> Facts {
     Facts {
         status: "busy".to_string(),
@@ -4236,10 +3633,6 @@ fn break_with_work() -> Facts {
     }
 }
 
-/// No stop is for good: every reason a round stops for rests `RETRY_S` (`failed` at an idle
-/// point and at a break), then the reducer starts a new round (`Step::Rearm`) at an idle
-/// point, a break (it types and ends nothing), a usage limit, the login wall and a person's
-/// presence. Negative control: one second short of the rest, never.
 #[test]
 fn every_stopped_round_rests_then_rearms() {
     for why in STOPS {
@@ -4299,7 +3692,6 @@ fn every_stopped_round_rests_then_rearms() {
             assert!(!retry_due(&stopped, RETRY_S - 1, false), "{why}");
         }
     }
-    // Only a stopped round rests: nothing else is re-armed, however old.
     for phase in [
         Phase::Pending,
         Phase::Announced { at_s: 0, asks: 1 },
@@ -4311,10 +3703,6 @@ fn every_stopped_round_rests_then_rearms() {
     }
 }
 
-/// The owner's word holds a new round as it holds any ([`rearm_held`]): a
-/// stopped round the owner skipped (`--skip` of this target) stays skipped
-/// however long it rests; a deferral holds it until it runs out. Negative
-/// controls: a skip of another build, no word, and `--now` hold nothing.
 #[test]
 fn a_skip_stays_skipped_and_a_deferral_lets_a_stopped_round_go() {
     let rested = Facts {
@@ -4347,16 +3735,12 @@ fn a_skip_stays_skipped_and_a_deferral_lets_a_stopped_round_go() {
     }
 }
 
-// ------------------------------------ the notices queued behind a limit
-
-/// A READY marker as aterm 0.93.0 typed it.
 const QUEUED_MARKER: &str = "ATERM-UPGRADE-READY-6a57ff7a";
 
 fn json_text(text: &str) -> String {
     aterm_json::to_string(&Value::from(text)).expect("json")
 }
 
-/// A notice with `marker`, typed at `ts`.
 fn notice_row(ts: &str, marker: &str) -> String {
     let text = prepare_prompt(&v("2.1.280"), &v("2.1.283"), Source::Managed, marker);
     format!(
@@ -4365,15 +3749,12 @@ fn notice_row(ts: &str, marker: &str) -> String {
     )
 }
 
-/// Claude Code's own answer at the weekly limit (ids cut, every key the
-/// readers look at kept).
 fn limit_row(ts: &str) -> String {
     format!(
         r#"{{"parentUuid":"p","isSidechain":false,"type":"assistant","uuid":"u","timestamp":"{ts}","message":{{"diagnostics":null,"id":"m","container":null,"model":"<synthetic>","role":"assistant","stop_details":null,"stop_reason":"stop_sequence","stop_sequence":"","type":"message","usage":{{"input_tokens":0,"output_tokens":0}},"content":[{{"type":"text","text":"You've hit your weekly limit · resets Oct 3 at 10am (America/Los_Angeles)"}}],"context_management":null}},"requestId":"req_0","quotaLimits":{{"status":"rejected","resetsAt":1791046800,"unifiedRateLimitFallbackAvailable":false,"rateLimitType":"seven_day","overageStatus":"rejected","isUsingOverage":false}},"error":"rate_limit","isApiErrorMessage":true,"apiErrorStatus":429,"version":"2.1.280"}}"#
     )
 }
 
-/// A row of the session's own model saying `text` at `ts`.
 fn said_row(ts: &str, text: &str) -> String {
     format!(
         r#"{{"parentUuid":"p","isSidechain":false,"type":"assistant","timestamp":"{ts}","message":{{"model":"claude-opus-5-5","role":"assistant","content":[{{"type":"text","text":{}}}]}},"version":"2.1.280"}}"#,
@@ -4381,7 +3762,6 @@ fn said_row(ts: &str, text: &str) -> String {
     )
 }
 
-/// A person's message at `ts`.
 fn person_row(ts: &str, text: &str) -> String {
     format!(
         r#"{{"parentUuid":"p","isSidechain":false,"type":"user","message":{{"role":"user","content":{}}},"timestamp":"{ts}","version":"2.1.280"}}"#,
@@ -4389,13 +3769,6 @@ fn person_row(ts: &str, text: &str) -> String {
     )
 }
 
-/// A notice the limit answered is queued, never read as asked: Claude Code answers each
-/// notice typed at its limit with a `rate_limit` row, and when the session goes on all reach
-/// the agent at once. Its fate is `Queued` until the model writes a row of its own, then
-/// `Taken` at that row's time; a limit is no login wall. Negative controls: `Answered`,
-/// `Wall`, `Open`; a limit before the notice; an API error that is no limit, a warning and a
-/// subagent's limit are passed over; a limit row without the `error` key is read by the wall
-/// table's words.
 #[test]
 fn a_notice_the_limit_answered_is_queued_until_the_model_takes_it() {
     let m = QUEUED_MARKER;
@@ -4417,9 +3790,6 @@ fn a_notice_the_limit_answered_is_queued_until_the_model_takes_it() {
         Some(NoticeFate::Taken(Some(1_790_539_085))),
         "taken when the model first wrote after it"
     );
-    // How long it waits on its limit: the reset its row names; a row naming
-    // none, REASK_S from when it was written; a `/login` finished since, over
-    // (0), in both of Claude Code's shapes.
     assert_eq!(queued_until(&queued, m), Some(1_791_046_800));
     let unstamped = [
         notice.clone(),
@@ -4444,7 +3814,6 @@ fn a_notice_the_limit_answered_is_queued_until_the_model_takes_it() {
         );
     }
     assert_eq!(queued_until(&taken, m), None, "taken: no longer queued");
-    // Negative controls.
     let answered = [notice.clone(), said_row("2026-09-27T15:06:50Z", "Saved.")].join("\n");
     assert_eq!(notice_fate_of(&answered, m), Some(NoticeFate::Answered));
     assert_eq!(queued_until(&answered, m), None);
@@ -4493,14 +3862,6 @@ fn a_notice_the_limit_answered_is_queued_until_the_model_takes_it() {
     );
 }
 
-/// THE LIMIT'S RESET, FROM THE TRANSCRIPT ([`transcript_limit_until`]): while
-/// the session's last word is Claude Code's limit row, the instant it names
-/// (`quotaLimits.resetsAt`) is how long the session stands at its limit,
-/// which keeps even a first notice out once the banner has left the screen.
-/// A limit row naming no reset holds [`REASK_S`] from when it was written;
-/// one naming neither a reset nor a time says nothing. Which row stands is
-/// the scan [`transcript_standing_wall`] shares
-/// ([`the_standing_quota_wall_is_the_limit_row_that_stands_and_only_a_quota_rejection`]).
 #[test]
 fn the_limit_stands_until_the_reset_its_row_names() {
     let limit = limit_row("2026-09-27T15:04:28.344Z");
@@ -4520,12 +3881,6 @@ fn the_limit_stands_until_the_reset_its_row_names() {
     assert_eq!(transcript_limit_until(&untimed), None);
 }
 
-/// The copies of a queued notice, counted until the model takes one ([`REQUEUE_MAX`]): every
-/// upgrade notice typed since the model's last own row is one more untaken, whatever answered
-/// it (a limit, the login wall); a `/login` takes none; a model row restarts the count. The
-/// full queue's rest ([`Scan::rests_until`]) counts from the latest copy's limit row: its
-/// reset, or [`REASK_S`] after a row naming none, then [`RETRY_S`]. Negative controls: a
-/// notice not queued has none counted and no rest; a marker nothing carries, none.
 #[test]
 fn the_copies_of_a_queued_notice_are_counted_until_the_model_takes_one() {
     let m = QUEUED_MARKER;
@@ -4554,7 +3909,6 @@ fn the_copies_of_a_queued_notice_are_counted_until_the_model_takes_one() {
         1,
         "the model's row starts the count again"
     );
-    // Negative controls.
     let taken = rows(&[&copy(15, m), &copy(16, m), &took]);
     assert!(matches!(
         notice_fate_of(&taken, m),
@@ -4596,7 +3950,6 @@ fn the_copies_of_a_queued_notice_are_counted_until_the_model_takes_one() {
     );
     assert_eq!(queued_copies(&three, "ATERM-UPGRADE-READY-00000000"), 0);
 
-    // The rest of a full queue, from the latest copy's limit row.
     let scan = notice_scan(&three, m).expect("queued");
     assert_eq!(
         scan.rests_until(),
@@ -4615,8 +3968,6 @@ fn the_copies_of_a_queued_notice_are_counted_until_the_model_takes_one() {
     assert_eq!(notice_scan(&taken, m).and_then(|s| s.rests_until()), None);
     assert_eq!(notice_scan(&open, m).and_then(|s| s.rests_until()), None);
 
-    // A queue past its room rests longer for every copy unread: five
-    // copies, the named reset, then eight hours.
     let five = rows(&[
         &copy(13, m),
         &copy(14, m),
@@ -4631,18 +3982,9 @@ fn the_copies_of_a_queued_notice_are_counted_until_the_model_takes_one() {
     );
 }
 
-/// Activity delays, never disables, and no rung relaxes a floor. Each rung passes what the
-/// one before did not: from Settled a pause that only looks quiet (`still_s` over a
-/// repainting screen); from KeysOnly a person near the tab not typing within KEYS_GAP_S; at
-/// Land and under `--now` the first such pause, its settle waived. Negative controls at every
-/// rung, `--now` included: every floor (a hold, the limit, the login wall, a full queue, the
-/// agent's own turn, a daemon turn the screen does not show, a box, a draft, a recent
-/// keystroke) still waits.
 #[test]
 fn the_ladder_relaxes_the_settle_and_the_person_near_and_never_a_floor() {
     let at = |rung: Rung, f: Facts| Facts { rung, ..f };
-    // A repainting screen whose words stand still: the screen's quiet
-    // restarted, the reader's run of looks thirty seconds long.
     let repainting = Facts {
         quiet_s: 3,
         status_age_s: 3,
@@ -4660,7 +4002,6 @@ fn the_ladder_relaxes_the_settle_and_the_person_near_and_never_a_floor() {
             "{rung:?}"
         );
     }
-    // One look only (no run yet): only the last rung takes the first pause.
     let first_look = Facts {
         still_s: 0,
         ..repainting.clone()
@@ -4676,7 +4017,6 @@ fn the_ladder_relaxes_the_settle_and_the_person_near_and_never_a_floor() {
             "{rung:?}"
         );
     }
-    // A person near the tab (within human_grace_s), not typing.
     let near = Facts {
         attended: true,
         ..idle_facts()
@@ -4689,7 +4029,6 @@ fn the_ladder_relaxes_the_settle_and_the_person_near_and_never_a_floor() {
     ] {
         assert_eq!(gate_announce(&at(rung, near.clone())), gate, "{rung:?}");
     }
-    // Every floor, at every rung and under `--now`.
     let floors: [Knock; 10] = [
         (|f| f.held = true, "held"),
         (|f| f.typing = true, "attended"),
@@ -4725,10 +4064,6 @@ fn the_ladder_relaxes_the_settle_and_the_person_near_and_never_a_floor() {
     }
 }
 
-/// The last words' print (the repaint-proof settle): what a footer's clock, a
-/// goal's counter, a dim suggestion on the composer's row or a blank row
-/// under the words leaves as it was, and what new words or another process
-/// change. Negative control: a changed word above the composer is a new print.
 #[test]
 fn the_last_words_print_ignores_the_live_zone_and_follows_the_words() {
     let screen = |caret: &str, footer: &str| -> Vec<String> {
@@ -4775,7 +4110,6 @@ fn the_last_words_print_ignores_the_live_zone_and_follows_the_words() {
         base,
         "a blank row under the words"
     );
-    // Negative controls.
     let mut words = screen("» Ask Codex to do anything", "  gpt");
     words[1] = "• Fixed it; one test still fails.".to_string();
     assert_ne!(still_print(7, &words, 5), base, "new words");
@@ -4786,28 +4120,6 @@ fn the_last_words_print_ignores_the_live_zone_and_follows_the_words() {
     );
 }
 
-/// Tier-1 for `HarnessUpgradeWorkEnd` (aterm-spec
-/// `harness_upgrade_work_end_model`): at every reachable idle point of the
-/// model before the host's look (`screen == 0 && looked == 0`), the real
-/// reducer is asked what the model's round would be asked: announced with
-/// the model's asks (shifted so the model's `Cap` is `MAX_ASKS`), within its
-/// re-ask window or past it (`late`), or resting after a give-up well within
-/// its rest; an idle, settled, empty composer with nothing under the agent,
-/// Claude's status `idle` or, where the model's status lags, `shell` over an
-/// idle screen read so `IDLE_LOOKS` looks in a row; the end of the agent's
-/// work (`Facts::work_ended`) and the rest read by the driver's own clocks
-/// (`St::time_work`, `St::time_failed`) from the work the model saw since the
-/// notice, the notice (or the stop) past the work end's floor. It asks
-/// (`Announce`, or `Rearm` from a rest) exactly where `HostAsks` or
-/// `HostReasks` is enabled, gives up exactly where `HostGivesUp` is, waits
-/// `status-stale` exactly where `HostHolds` is, and says its quiet word
-/// (`awaiting-ready`, `failed`) exactly where `HostWaits` is. At every
-/// point before the look, a break of the work included (`screen == 1`: the
-/// work in the agent's own process, nothing under it), the driver reads the
-/// end of the work exactly at an idle point after work: never at a break,
-/// where the model's host takes no step. Negative controls: `Buggy`, an ask
-/// with no work seen (`Nag`) and the wait held past the window (`Hold`) each
-/// disagree with the real reducer at some reachable point.
 #[test]
 fn the_work_end_reducer_is_bound_to_its_model() {
     use aterm_models_harness::harness_upgrade_work_end_model;
@@ -4834,10 +4146,7 @@ fn the_work_end_reducer_is_bound_to_its_model() {
     let now = 1_790_645_000;
     let model = harness_upgrade_work_end_model();
     let cap = model.consts.iter().find(|c| c.0 == "Cap").unwrap().1;
-    // The model's asks onto the real count: its `Cap` is `MAX_ASKS`.
     let shift = i64::from(MAX_ASKS) - cap;
-    // The look at a model point: the round, and its facts as the driver reads
-    // them.
     let look = |s: &S| -> (Phase, Facts) {
         let since = if s["late"] == 1 {
             REASK_S + 60
@@ -4872,7 +4181,6 @@ fn the_work_end_reducer_is_bound_to_its_model() {
         st.time_work(&mut facts, now);
         (phase, facts)
     };
-    // The real reducer at a model point: which host action it takes.
     let real = |s: &S| -> &'static str {
         let (phase, facts) = look(s);
         match next_step(&phase, &facts, false, now) {
@@ -4942,7 +4250,6 @@ fn the_work_end_reducer_is_bound_to_its_model() {
             "the real reducer against the model at {s:?}"
         );
     }
-    // Negative controls: each dial disagrees with the real reducer somewhere.
     for dial in ["Buggy", "Nag", "Hold"] {
         let wrong = aterm_spec::interp::with_consts(&model, &[(dial, 1)]);
         let caught = reachable(&wrong)
@@ -4956,13 +4263,8 @@ fn the_work_end_reducer_is_bound_to_its_model() {
     }
 }
 
-// ---------------------------------------------------------------- a notice recorded as a paste
-
-/// A READY marker a notice asked for (Claude Code 2.1.284 → 2.1.285).
 const INCIDENT_MARKER: &str = "ATERM-UPGRADE-READY-d6476091";
 
-/// A main-chain user row saying `text`, typed (`origin` human: the upgrade's
-/// notice, the loop's `keep going` and a person's words alike).
 fn typed_row(text: &str) -> String {
     format!(
         r#"{{"isSidechain":false,"type":"user","message":{{"role":"user","content":{}}},"origin":{{"kind":"human"}},"promptSource":"typed","version":"2.1.284"}}"#,
@@ -4970,7 +4272,6 @@ fn typed_row(text: &str) -> String {
     )
 }
 
-/// A main-chain row of the agent's own model saying `text`.
 fn model_row(text: &str) -> String {
     format!(
         r#"{{"isSidechain":false,"type":"assistant","message":{{"model":"claude-opus-5-5","role":"assistant","content":[{{"type":"text","text":{}}}],"stop_reason":"end_turn"}},"version":"2.1.284"}}"#,
@@ -4978,19 +4279,14 @@ fn model_row(text: &str) -> String {
     )
 }
 
-/// `text` as Claude Code 2.1.284 records a paste of it.
 fn pasted(text: &str) -> String {
     format!("\n\n<pasted_content id=\"6dd8\">\n{text}\n</pasted_content id=\"6dd8\">\n")
 }
 
-/// The notice with `marker` as typed into the session.
 fn incident_notice(marker: &str) -> String {
     prepare_prompt(&v("2.1.284"), &v("2.1.285"), Source::Managed, marker)
 }
 
-/// A transcript up to the READY answer: the task, the notice (wrapped as a
-/// paste), the agent's "not yet", a background task's notification, and,
-/// with `ready`, the answer: several paragraphs, the marker its last line.
 fn incident_rows(ready: bool) -> Vec<String> {
     let mut rows = vec![
         typed_row("compile trust through trust-ir and trust-cg"),
@@ -5015,10 +4311,6 @@ fn incident_rows(ready: bool) -> Vec<String> {
     rows
 }
 
-/// A notice Claude Code recorded as a paste (`<pasted_content id="…">`, as the control socket
-/// types it) is still the notice, and a person's paste still a direction. Negative controls:
-/// the same rows typed plainly read the same; a READY on the last line of several paragraphs
-/// is heard.
 #[test]
 fn a_pasted_notice_is_the_notice_and_a_pasted_message_a_direction() {
     let earlier = ready_marker(ID, &v("2.1.285"), 1);
@@ -5027,8 +4319,6 @@ fn a_pasted_notice_is_the_notice_and_a_pasted_message_a_direction() {
         ("pasted", pasted as fn(&str) -> String),
         ("typed", str::to_string as fn(&str) -> String),
     ] {
-        // A READY to the earlier ask, then the next ask's notice: the latest
-        // notice ends every READY before it.
         let asked_again = [
             model_row(&format!("Done.\n\n{earlier}")),
             typed_row(&wrap(&incident_notice(&later))),
@@ -5038,12 +4328,10 @@ fn a_pasted_notice_is_the_notice_and_a_pasted_message_a_direction() {
             !transcript_has_ready(&asked_again, &earlier),
             "{how}: the notice after the answer ends it"
         );
-        // The harness's own notice is no task of anyone's.
         assert!(
             !transcript_tasked(&typed_row(&wrap(&incident_notice(&later))), &[]),
             "{how}: the notice is the harness's"
         );
-        // A person's message after the READY, taken up by the agent.
         let directed = [
             model_row(&format!("Saved.\n\n{earlier}")),
             typed_row(&wrap("Here is the log you asked for: ...")),
@@ -5059,10 +4347,6 @@ fn a_pasted_notice_is_the_notice_and_a_pasted_message_a_direction() {
     assert!(transcript_has_ready(&ready, INCIDENT_MARKER));
 }
 
-/// A READY through the transcript's folds: unheard before its row is appended, heard after,
-/// and superseded ([`ready_superseded`]) by the loop's `keep going` or anything the agent says
-/// after, until the next notice or a new READY. Negative control: a notice nobody answered is
-/// not a superseded answer.
 #[test]
 fn the_incidents_ready_is_heard_once_written_and_superseded_by_the_keep_going() {
     let markers = [INCIDENT_MARKER.to_string()];
@@ -5086,7 +4370,6 @@ fn the_incidents_ready_is_heard_once_written_and_superseded_by_the_keep_going() 
         "Two pieces of work are running in the background.",
     ));
     assert!(ready_superseded(&rows.join("\n"), &markers));
-    // The next ask: a notice of its own, not answered yet.
     let next = ready_marker(ID, &v("2.1.285"), 2);
     rows.push(typed_row(&pasted(&incident_notice(&next))));
     let both = [INCIDENT_MARKER.to_string(), next.clone()];
@@ -5096,11 +4379,6 @@ fn the_incidents_ready_is_heard_once_written_and_superseded_by_the_keep_going() 
     assert!(!ready_superseded(&rows.join("\n"), &both));
 }
 
-/// A READY on the screen whose transcript row is not yet written ([`Facts::ready_unrecorded`])
-/// holds the point (`ready-unrecorded`) for at most [`UNRECORDED_S`], and the row once written
-/// takes the restart's path. A gave-up round holds it too and is not re-armed over it; a
-/// break, a limit and a pending round keep their own steps. Negative control: without the
-/// screen's READY, `awaiting-ready`.
 #[test]
 fn a_ready_on_the_screen_holds_the_point_until_its_row_is_written() {
     let now = 1_790_714_134;
@@ -5127,7 +4405,6 @@ fn a_ready_on_the_screen_holds_the_point_until_its_row_is_written() {
         next_step(&announced, &shown, false, now),
         Step::Wait(READY_UNRECORDED)
     );
-    // The row written: the restart's settle, then the restart.
     assert_eq!(
         next_step(&announced, &turn_end, true, now),
         Step::Wait("settling")
@@ -5136,9 +4413,6 @@ fn a_ready_on_the_screen_holds_the_point_until_its_row_is_written() {
         next_step(&announced, &idle_facts(), true, now + 20),
         Step::Terminate
     );
-    // Held however many idle looks came before at other points, and still at
-    // the next look at the same words; bounded by how long they have stood.
-    // (The host looks again the settle's length after a wait.)
     let looked_before = Facts {
         idle_looks: 5,
         still_s: QUIET_S,
@@ -5172,7 +4446,6 @@ fn a_ready_on_the_screen_holds_the_point_until_its_row_is_written() {
         next_step(&announced, &limited, false, now),
         Step::Wait("limited")
     );
-    // A round that gave up and rested past its next round's due time.
     let gave_up = Phase::Failed(GAVE_UP.to_string());
     let rested = Facts {
         failed_s: RETRY_S + 60,
@@ -5198,8 +4471,6 @@ fn a_ready_on_the_screen_holds_the_point_until_its_row_is_written() {
         next_step(&Phase::Pending, &shown, false, now),
         Step::Wait(READY_UNRECORDED)
     );
-    // The quiet upgrade (the default) acts on no READY: its own restart gate
-    // holds the turn end (the settle), whatever the screen says.
     let quiet = Facts {
         quiet: true,
         ..shown.clone()
@@ -5210,10 +4481,6 @@ fn a_ready_on_the_screen_holds_the_point_until_its_row_is_written() {
     );
 }
 
-/// A READY the agent was moved on from ([`Facts::ready_superseded`]) is asked again at its
-/// next point, never waited on for the re-ask's window: at once when idle, `superseded` while
-/// the turn settles, a person, a box or a hold as their own wait, a give-up with asks spent,
-/// the notice at a break. Negative control: no READY given waits the window.
 #[test]
 fn a_superseded_ready_is_asked_again_at_the_next_point() {
     let now = 1_790_714_200;
@@ -5295,7 +4562,6 @@ fn a_superseded_ready_is_asked_again_at_the_next_point() {
         ..moved_on.clone()
     };
     assert_eq!(next_step(&announced, &at_break, false, now), Step::Announce);
-    // Negative control: the same break with no READY given waits its window.
     assert_eq!(
         next_step(
             &announced,
@@ -5311,8 +4577,6 @@ fn a_superseded_ready_is_asked_again_at_the_next_point() {
     assert_eq!(next_step(&announced, &moved_on, true, now), Step::Terminate);
 }
 
-/// Claude Code's answer at a quota limit as 2.1.286 writes it (ids cut, every key the readers
-/// use kept): limit `limit` (`quotaLimits.rateLimitType`), resetting at `resets`, saying `text`.
 fn quota_row(ts: &str, limit: &str, resets: u64, text: &str) -> String {
     format!(
         r#"{{"parentUuid":"p","isSidechain":false,"type":"assistant","uuid":"u","timestamp":"{ts}","message":{{"id":"m","model":"<synthetic>","role":"assistant","stop_reason":"stop_sequence","type":"message","usage":{{"input_tokens":0,"output_tokens":0}},"content":[{{"type":"text","text":{}}}]}},"requestId":"req_0","quotaLimits":{{"status":"rejected","resetsAt":{resets},"unifiedRateLimitFallbackAvailable":false,"rateLimitType":"{limit}","overageStatus":"rejected","overageDisabledReason":"org_level_disabled","isUsingOverage":false}},"error":"rate_limit","isApiErrorMessage":true,"apiErrorStatus":429,"version":"2.1.286"}}"#,
@@ -5320,12 +4584,6 @@ fn quota_row(ts: &str, limit: &str, resets: u64, text: &str) -> String {
     )
 }
 
-/// The quota wall a session stands at ([`transcript_standing_wall`]): the limit row that
-/// stands last (the row [`transcript_limit_until`] reads, so the controls ask both), read for
-/// when it was written, the reset it names and which limit it is, only when it is a quota
-/// rejection. Negative controls, each beside its rule: a subagent's row, a model row or a
-/// finished `/login` after the wall; an API rate limit and a spend or credit wall (limits,
-/// but no account's window); a status that is not `rejected`.
 #[test]
 fn the_standing_quota_wall_is_the_limit_row_that_stands_and_only_a_quota_rejection() {
     let at = 1_790_521_468;
@@ -5349,14 +4607,10 @@ fn the_standing_quota_wall_is_the_limit_row_that_stands_and_only_a_quota_rejecti
     );
     let answered = said_row("2026-09-27T14:00:00Z", "Working.");
 
-    // The three walls that rotate: the session window, the week, and a model's bucket, each
-    // by the vendor's own limit type.
     assert_eq!(
         transcript_standing_wall(&[answered.clone(), session.clone()].join("\n")),
         wall("five_hour", 1_790_532_000)
     );
-    // The week: the owner's row of 2026-09-27 (2.1.280), as it is — its
-    // credits off, with no reason named.
     assert_eq!(
         transcript_standing_wall(&limit_row(ts)),
         wall("seven_day", 1_791_046_800).map(|w| StandingWall {
@@ -5385,15 +4639,12 @@ fn the_standing_quota_wall_is_the_limit_row_that_stands_and_only_a_quota_rejecti
         );
     }
 
-    // Which row stands: Claude Code's other rows of its own are passed over.
     let no_response = r#"{"isSidechain":false,"type":"assistant","message":{"model":"<synthetic>","content":[{"type":"text","text":"No response requested."}]}}"#;
     assert_eq!(
         transcript_standing_wall(&[session.as_str(), no_response].join("\n")),
         wall("five_hour", 1_790_532_000),
         "passed over"
     );
-    // A subagent's sidechain row is not the session's: its wall is no wall
-    // of the session's, and its model row ends none.
     let side = |row: &str| row.replace(r#""isSidechain":false"#, r#""isSidechain":true"#);
     assert_eq!(
         transcript_standing_wall(&[answered.clone(), side(&session)].join("\n")),
@@ -5405,14 +4656,10 @@ fn the_standing_quota_wall_is_the_limit_row_that_stands_and_only_a_quota_rejecti
         wall("five_hour", 1_790_532_000),
         "a subagent that answered did not lift the session's wall"
     );
-    // A row of the session's own model after the wall ends it…
     assert_eq!(
         transcript_standing_wall(&[session.clone(), later.clone()].join("\n")),
         None
     );
-    // …not a person's prompt the model has not answered (the manual: a
-    // retry or a person's prompt the model answers moves the conversation
-    // past the row).
     let prompt = person_row("2026-09-27T19:50:00Z", "carry on with the parser");
     assert_eq!(
         transcript_standing_wall(&[session.clone(), prompt.clone()].join("\n")),
@@ -5424,7 +4671,6 @@ fn the_standing_quota_wall_is_the_limit_row_that_stands_and_only_a_quota_rejecti
         None,
         "the person's prompt the model answered"
     );
-    // …and so does a `/login` that finished; a wall hit after either stands.
     let login = person_row(
         "2026-09-27T19:57:47Z",
         "<local-command-stdout>Login successful</local-command-stdout>",
@@ -5440,8 +4686,6 @@ fn the_standing_quota_wall_is_the_limit_row_that_stands_and_only_a_quota_rejecti
     assert_eq!(transcript_standing_wall(&answered), None);
     assert_eq!(transcript_standing_wall(""), None);
 
-    // Only a quota rejection: an API rate limit (no `quotaLimits`) is a limit the upgrade
-    // waits behind but no account's window, also when it stands after a quota wall.
     let api = r#"{"isSidechain":false,"type":"assistant","timestamp":"2026-09-27T15:10:00Z","message":{"model":"<synthetic>","content":[{"type":"text","text":"API Error: Rate limit reached for requests"}]},"isApiErrorMessage":true}"#;
     assert!(transcript_limit_until(api).is_some(), "it is a limit row");
     assert_eq!(transcript_standing_wall(api), None);
@@ -5450,7 +4694,6 @@ fn the_standing_quota_wall_is_the_limit_row_that_stands_and_only_a_quota_rejecti
         None,
         "the row that stands last is the API's"
     );
-    // A spend or credit wall, by its text (the wall table's `Spend`)…
     for text in [
         "You've hit your usage credit limit · resets Oct 3 at 10am (America/Los_Angeles)",
         "You're out of extra usage · resets 7pm (America/Los_Angeles)",
@@ -5465,8 +4708,6 @@ fn the_standing_quota_wall_is_the_limit_row_that_stands_and_only_a_quota_rejecti
         );
         assert_eq!(transcript_standing_wall(&spend), None, "{text}");
     }
-    // …and by its limit type, whatever its text says: the vendor's
-    // usage-credit limit.
     let credit = quota_row(
         ts,
         "overage",
@@ -5475,8 +4716,6 @@ fn the_standing_quota_wall_is_the_limit_row_that_stands_and_only_a_quota_rejecti
     );
     assert!(!transcript_limit_spend(&credit), "its text is the week's");
     assert_eq!(transcript_standing_wall(&credit), None);
-    // A status that is not `rejected` — the vendor's `allowed_warning`, one
-    // a hair off, none at all — is no rejection.
     for status in [
         r#""status":"allowed_warning","#,
         r#""status":"allowed","#,
@@ -5497,17 +4736,12 @@ fn the_standing_quota_wall_is_the_limit_row_that_stands_and_only_a_quota_rejecti
     }
 }
 
-/// Where the row carries no `rateLimitType` (optional in the vendor's schema) the window is
-/// the one its text names (`usage::notice_window`), else none; the wall stands either way. A
-/// key of the wrong shape costs that key alone, a row naming no time is no observation, and
-/// only a short lowercase word becomes a window.
 #[test]
 fn a_standing_wall_with_no_limit_type_takes_it_from_its_text_and_hostile_rows_cost_one_key() {
     let at = 1_790_521_468;
     let ts = "2026-09-27T15:04:28.344Z";
     let typed = r#""rateLimitType":"seven_day","#;
     let week = limit_row(ts);
-    // The row says credits are off, and names no reason.
     let off = Some(CreditsWord::Off {
         reason: None,
         until: None,
@@ -5516,7 +4750,6 @@ fn a_standing_wall_with_no_limit_type_takes_it_from_its_text_and_hostile_rows_co
     let read = |row: &str| transcript_standing_wall(row);
     let window = |row: &str| read(row).expect("a wall").window;
 
-    // No limit type: the text's.
     let untyped = week.replace(typed, "");
     assert_eq!(
         read(&untyped),
@@ -5533,7 +4766,6 @@ fn a_standing_wall_with_no_limit_type_takes_it_from_its_text_and_hostile_rows_co
         session_text,
     );
     assert_eq!(window(&untyped_session).as_deref(), Some("five_hour"));
-    // A text that names neither window: the wall stands, its window unnamed.
     let untyped_bucket = untyped.replace("weekly limit", "Opus limit");
     assert_eq!(
         read(&untyped_bucket),
@@ -5544,12 +4776,9 @@ fn a_standing_wall_with_no_limit_type_takes_it_from_its_text_and_hostile_rows_co
             credits: off.clone(),
         })
     );
-    // Negative control: where the row carries a type the text is not asked: a bucket's row
-    // whose text names the week is the bucket's.
     let bucket = week.replace(typed, r#""rateLimitType":"seven_day_opus","#);
     assert_eq!(window(&bucket).as_deref(), Some("seven_day_opus"));
 
-    // A limit type that is not a word is read as absent: the text's again.
     let long = "a".repeat(LIMIT_TYPE_MAX + 1);
     for hostile in [
         r#""rateLimitType":7,"#.to_string(),
@@ -5567,12 +4796,10 @@ fn a_standing_wall_with_no_limit_type_takes_it_from_its_text_and_hostile_rows_co
         let row = week.replace(typed, &hostile);
         assert_eq!(window(&row).as_deref(), Some("seven_day"), "{hostile}");
     }
-    // Negative control: a word the vendor has not named yet, at the bound, is kept.
     let new = "b".repeat(LIMIT_TYPE_MAX);
     let row = week.replace(typed, &format!(r#""rateLimitType":"{new}","#));
     assert_eq!(window(&row), Some(new));
 
-    // A reset that is not a positive integer is no reset; the wall stands.
     let reset = r#""resetsAt":1791046800,"#;
     assert!(week.contains(reset));
     for hostile in [
@@ -5596,8 +4823,6 @@ fn a_standing_wall_with_no_limit_type_takes_it_from_its_text_and_hostile_rows_co
         );
     }
 
-    // A row that names no time is no observation: nobody could say which process wrote it.
-    // A zone offset is refused, never read as UTC.
     let stamp = r#""timestamp":"2026-09-27T15:04:28.344Z","#;
     assert!(week.contains(stamp));
     for hostile in [
@@ -5616,8 +4841,6 @@ fn a_standing_wall_with_no_limit_type_takes_it_from_its_text_and_hostile_rows_co
         );
     }
 
-    // `quotaLimits` of another shape is none; a line that is not JSON, or
-    // not a row, is skipped and the row before it still stands.
     let quota = week
         .find(r#""quotaLimits":{"#)
         .zip(week.find(r#""error":"rate_limit""#))
@@ -5654,8 +4877,6 @@ fn a_standing_wall_with_no_limit_type_takes_it_from_its_text_and_hostile_rows_co
     }
 }
 
-/// One row a local command wrote at `ts`: a `user` row whose content is the string
-/// `content`, in the shape measured for `/model` on 2.1.283 (`footer.rs`'s rows).
 fn local_command_row(ts: &str, content: &str) -> String {
     format!(
         r#"{{"parentUuid":"p","isSidechain":false,"promptId":"q","type":"user","message":{{"role":"user","content":{}}},"uuid":"u","timestamp":"{ts}","userType":"external","entrypoint":"cli","version":"2.1.287"}}"#,
@@ -5663,8 +4884,6 @@ fn local_command_row(ts: &str, content: &str) -> String {
     )
 }
 
-/// The same content as the `system` row some results are written as (measured on 2.1.278
-/// for a `/model` picker that changed nothing).
 fn local_command_system_row(ts: &str, content: &str) -> String {
     format!(
         r#"{{"parentUuid":"p","isSidechain":false,"type":"system","subtype":"local_command","content":{},"level":"info","timestamp":"{ts}","uuid":"u","isMeta":false,"version":"2.1.287"}}"#,
@@ -5672,37 +4891,18 @@ fn local_command_system_row(ts: &str, content: &str) -> String {
     )
 }
 
-/// A local command's own row content, as Claude Code writes it.
 fn command_content(name: &str) -> String {
     format!(
         "<command-name>/{name}</command-name>\n            <command-message>{name}</command-message>\n            <command-args></command-args>"
     )
 }
 
-/// A local command's output row content.
 fn stdout_content(text: &str) -> String {
     format!("<local-command-stdout>{text}</local-command-stdout>")
 }
 
-/// The line the usage-limit dialog ended with ([`transcript_reset_line`]): the last
-/// `<local-command-stdout>` row written at or after the claim's second directly under a
-/// `/rate-limit-options` command row, its text between the tags. A limit reset's outcome is
-/// read from it.
-///
-/// EVERY RESET ROW HERE IS COMPOSED 2026-10-02 (reworded 2026-10-19), never
-/// captured: the texts are the 2.1.304 bundle's
-/// (`docs/SPEC-claude-accounts-resets-2026-10-02.md`
-/// §0), laid on the two rows MEASURED for this dialog's wait row
-/// (`upgrade_stall_tests.rs`: the `/rate-limit-options` command row, then
-/// its output row) in the full row shape measured for `/model`; the values
-/// are invented. OPEN: replace with a captured transcript (SPEC §6).
-///
-/// Negative controls: a row older than the claim; a `/model` output after it; an output not
-/// directly under the dialog's command; a row with no time, a subagent's row, an error
-/// output, and a line quoted in a prompt, an answer or a tool result.
 #[test]
 fn the_dialogs_result_line_is_read_under_its_own_command_and_only_since_the_claim() {
-    // 2026-09-27T15:04:28Z, the second the attempt was claimed.
     let claimed = 1_790_521_468;
     let before = "2026-09-27T15:04:27.900Z";
     let same = "2026-09-27T15:04:28.344Z";
@@ -5718,18 +4918,14 @@ fn the_dialogs_result_line_is_read_under_its_own_command_and_only_since_the_clai
     let out = |ts: &str, text: &str| local_command_row(ts, &stdout_content(text));
     let read = |rows: &[String]| transcript_reset_line(&rows.join("\n"), claimed);
 
-    // The dialog's two rows, written when it ended.
     assert_eq!(
         read(&[dialog(after), out(after, spent)]).as_deref(),
         Some(spent)
     );
-    // In the claim's own second too: "at or after".
     assert_eq!(
         read(&[dialog(same), out(same, kept)]).as_deref(),
         Some(kept)
     );
-    // A whole tail around it: the wall's own row, the turn before, the
-    // caveat row a command is written under, and what follows.
     let tail = [
         said_row("2026-09-27T14:00:00Z", "Working."),
         limit_row("2026-09-27T15:00:00.000Z"),
@@ -5747,9 +4943,6 @@ fn the_dialogs_result_line_is_read_under_its_own_command_and_only_since_the_clai
         out(later, "Set model to `Opus 5.5`"),
     ];
     assert_eq!(read(&tail).as_deref(), Some(spent));
-    // The last such row since the claim: a claim outlives a dialog a person answered, and the
-    // first line would record a reset spent through the dialog's second opening as the wait
-    // row's failure.
     assert_eq!(
         read(&[
             dialog(after),
@@ -5760,7 +4953,6 @@ fn the_dialogs_result_line_is_read_under_its_own_command_and_only_since_the_clai
         .as_deref(),
         Some(spent)
     );
-    // Both row shapes, the command's and the output's.
     for system in [(true, true), (true, false), (false, true)] {
         let command = if system.0 {
             local_command_system_row(after, &command_content("rate-limit-options"))
@@ -5778,8 +4970,6 @@ fn the_dialogs_result_line_is_read_under_its_own_command_and_only_since_the_clai
             "{system:?}"
         );
     }
-    // The measured wait row carries no closing tag in the stall suite's
-    // copy: the text is the same without one.
     assert_eq!(
         read(&[
             dialog(after),
@@ -5789,29 +4979,20 @@ fn the_dialogs_result_line_is_read_under_its_own_command_and_only_since_the_clai
         Some(spent)
     );
 
-    // Negative control: a row older than the claim (an earlier dialog's) is not read…
     assert_eq!(read(&[dialog(before), out(before, spent)]), None);
-    // …and neither is a row that names no time.
     let untimed = out(after, spent).replace(&format!(r#""timestamp":"{after}","#), "");
     assert!(!untimed.contains("timestamp"));
     assert_eq!(read(&[dialog(after), untimed]), None);
 
-    // NEGATIVE CONTROL: A `/model` OUTPUT AFTER THE CLAIM is not read, a
-    // reset line under it included.
     assert_eq!(read(&[model(after), out(after, spent)]), None);
-    // Nor under `/model` typed after the dialog's command: the output is
-    // the last command's.
     assert_eq!(
         read(&[dialog(after), model(after), out(after, spent)]),
         None
     );
-    // An output ends what its command armed: a second one is nobody's.
     assert_eq!(
         read(&[dialog(before), out(before, waited), out(after, spent)]),
         None
     );
-    // No command row at all; the command typed with arguments, which is not
-    // the dialog the vendor opens; another command whose name it opens.
     assert_eq!(read(&[out(after, spent)]), None);
     let with_args = dialog(after).replace(
         "<command-args></command-args>",
@@ -5820,7 +5001,6 @@ fn the_dialogs_result_line_is_read_under_its_own_command_and_only_since_the_clai
     assert_eq!(read(&[with_args, out(after, spent)]), None);
     let longer = local_command_row(after, &command_content("rate-limit-options-2"));
     assert_eq!(read(&[longer, out(after, spent)]), None);
-    // An error output; a subagent's rows.
     let failed = local_command_row(
         after,
         &format!("<local-command-stderr>{spent}</local-command-stderr>"),
@@ -5829,7 +5009,6 @@ fn the_dialogs_result_line_is_read_under_its_own_command_and_only_since_the_clai
     let side = |row: String| row.replace(r#""isSidechain":false"#, r#""isSidechain":true"#);
     assert_eq!(read(&[dialog(after), side(out(after, spent))]), None);
     assert_eq!(read(&[side(dialog(after)), out(after, spent)]), None);
-    // The line quoted is not the line: in a person's prompt, an answer, a tool result.
     let quoted = stdout_content(spent);
     for row in [
         local_command_row(after, &format!("it printed {quoted}")),
@@ -5848,8 +5027,6 @@ fn the_dialogs_result_line_is_read_under_its_own_command_and_only_since_the_clai
     assert_eq!(read(&[]), None);
     assert_eq!(transcript_reset_line("not json\n{}\n", 0), None);
 
-    // The text is one bounded line, and a row that says nothing is the
-    // empty line: the dialog ended, and said nothing this reader keeps.
     let long = format!("{spent} {}", "x".repeat(4 * RESET_LINE_MAX));
     let cut = read(&[dialog(after), out(after, &long)]).expect("a line");
     assert!(
@@ -5863,13 +5040,6 @@ fn the_dialogs_result_line_is_read_under_its_own_command_and_only_since_the_clai
     assert_eq!(read(&[dialog(after), out(after, "")]).as_deref(), Some(""));
 }
 
-/// WHAT A LIMIT ROW SAYS OF THE ACCOUNT'S USAGE CREDITS (accounts v2 S5),
-/// kept with the wall it stands for ([`StandingWall::credits`]): `rejected`
-/// is off, with the vendor's reason and when they come back (`out_of_credits`
-/// and `overageResetsAt`, the bundle's; `org_level_disabled`, this machine's
-/// own rows), `allowed` and `allowed_warning` are on. NEGATIVE CONTROLS: a
-/// row with no `overageStatus`, or one the reader does not know, says nothing;
-/// a reason that is no word is no reason.
 #[test]
 fn a_limit_rows_word_on_usage_credits_is_read() {
     let ts = "2026-09-27T15:04:28.344Z";
@@ -5912,15 +5082,6 @@ fn a_limit_rows_word_on_usage_credits_is_read() {
     );
 }
 
-/// WHEN THE SESSION'S NEWEST ANSWER CAME (accounts v2 S5): what the usage
-/// notices on its screen were true at ([`transcript_last_answer`]) — the
-/// latest row of the model's own, a sidechain's included, or a limit's
-/// rejection, whatever follows it — of those that came by the second it is
-/// asked for: an answer written after it is none a screen read then can show.
-/// NEGATIVE CONTROLS: a person's prompt or a local command's output written
-/// after it is no answer (a notice drawn before stays as old as its answer),
-/// nor is a synthetic row that is no limit's; a tail with no answer has none,
-/// and neither has one whose answers all came later.
 #[test]
 fn the_newest_answer_is_the_last_response_row() {
     let at = |ts: &str| crate::harness::upgrade_models::parse_utc(ts).expect("a time");
@@ -5944,7 +5105,6 @@ fn the_newest_answer_is_the_last_response_row() {
         Some(at("2026-09-27T15:06:00.000Z"))
     );
     assert_eq!(tail(&[prompt, local, &synthetic]), None);
-    // By a second: the newest that had come.
     let by = |ts: &str| transcript_last_answer(&all, at(ts));
     assert_eq!(
         by("2026-09-27T15:05:59.000Z"),
@@ -5961,10 +5121,6 @@ fn the_newest_answer_is_the_last_response_row() {
     assert_eq!(by("2026-09-27T14:59:59.000Z"), None);
 }
 
-/// The rewrite drops only aterm's own `--settings` value (the usage tap, `tap::is_ours`), in
-/// both spellings, so a stale path or a switched-off tap leaves at the next relaunch and a
-/// resume line shown to a person never carries it; a person's own `--settings`, inline or a
-/// file, is carried verbatim. Negative control: a near miss of the tap is a person's, kept.
 #[cfg(unix)]
 #[test]
 fn the_rewrite_sheds_only_aterms_own_tap() {
@@ -5997,7 +5153,6 @@ fn the_rewrite_sheds_only_aterms_own_tap() {
         let inline = format!("--settings={theirs}");
         assert_eq!(resumed(&[&inline]), argv(&[&inline, "--resume", ID]));
     }
-    // The resume command a person is told carries none of it either.
     let told =
         super::super::resume::command(&argv(&["claude", "--settings", &ours]), ID).expect("a line");
     assert_eq!(told, format!("claude --resume {ID}"));
@@ -6007,27 +5162,6 @@ fn the_rewrite_sheds_only_aterms_own_tap() {
     );
 }
 
-/// THE TURN A CONVERSATION ENDS ON, BY THE PROMPT THAT OPENED IT TOO
-/// : [`LastTurn`] names the turn by its last row's key and
-/// by its prompt's, and a left exchange's row keyed by the prompt
-/// ([`LastTurn::key`]) is named by every reading of that turn however much
-/// of its reply the tail holds — the prompt alone, a tool's call and its
-/// result, the whole reply, an idle compaction's summary after it, a Stop
-/// hook's feedback under the turn's own `promptId` and the work after it.
-/// So too A COMMAND OF THE PERSON'S THAT NO ANSWER FOLLOWED (the review's
-/// KR-P5-CMD): `/config` as Claude Code 2.1.294 records it (its caveat, the
-/// command row and its output, under a fresh `promptId`:
-/// `claude-2.1.294-transcript-local-commands.jsonl`) and a `!` shell
-/// command (`<bash-input>`, `<bash-stdout>`) ask the model nothing, as
-/// [`FinishedScan`] reads them: the exchange is still the conversation's
-/// last turn, by its prompt and by its answer, and by the command's key
-/// too (what a loop that leaves a turn the moment it ends ledgers, the
-/// command's answer maybe not on the record yet: [`LastTurn::key`]).
-/// NEGATIVE CONTROLS, the prompt no longer named: a later prompt, a
-/// `/loop`'s wake (numbered anew) answered, a peer's message (`isMeta`, its
-/// origin no person's) answered, a prompt command (`/init`, its expansion)
-/// answered, a `!` command answered, a wake answered after a command; and a
-/// tail that holds no prompt names none (its key is the last row's).
 #[test]
 fn the_turn_a_conversation_ends_on_is_named_by_the_prompt_that_opened_it() {
     let prompt = r#"{"type":"user","uuid":"u-1","promptId":"p-1","isSidechain":false,"message":{"role":"user","content":"Hi"},"origin":{"kind":"human"}}"#;
@@ -6074,7 +5208,6 @@ fn the_turn_a_conversation_ends_on_is_named_by_the_prompt_that_opened_it() {
         assert_eq!(t.key().as_deref(), Some("prompt:u-1"), "{what}");
     }
     assert!(turn(&whole).names("answer:a-1"), "an earlier build's key");
-    // A command of the person's no answer followed.
     for (what, rows, command) in [
         (
             "/config, as 2.1.294 records it",
@@ -6123,7 +5256,6 @@ fn the_turn_a_conversation_ends_on_is_named_by_the_prompt_that_opened_it() {
         .names("prompt:c-1"),
         "every command since the answer"
     );
-    // A command the model answers opens its turn.
     for (what, rows, opened) in [
         (
             "a prompt command answered",
@@ -6147,7 +5279,6 @@ fn the_turn_a_conversation_ends_on_is_named_by_the_prompt_that_opened_it() {
         assert!(!t.names("prompt:c-1"), "{what}: {t:?}");
         assert_eq!(t.opened.as_deref(), opened, "{what}");
     }
-    // NEGATIVE CONTROLS.
     for (what, rows) in [
         ("a later prompt", vec![prompt, a1.as_str(), later]),
         (
@@ -6163,7 +5294,6 @@ fn the_turn_a_conversation_ends_on_is_named_by_the_prompt_that_opened_it() {
         assert!(!t.names("prompt:u-1"), "{what}: {t:?}");
         assert!(!t.names("answer:a-1"), "{what}: {t:?}");
     }
-    // The same no-promptId wakes FinishedScan recognizes also open their own exchange.
     for wake in [
         r#"{"type":"user","uuid":"w-2","isMeta":true,"scheduledTaskId":"t1","message":{"content":"check the build"}}"#,
         r#"{"type":"user","uuid":"w-3","isMeta":true,"turnOrigin":"scheduled","message":{"content":"check the build"}}"#,
@@ -6183,14 +5313,6 @@ fn the_turn_a_conversation_ends_on_is_named_by_the_prompt_that_opened_it() {
     assert_eq!(turn(&[]), LastTurn::default());
 }
 
-/// A PERSON'S EXCHANGE AT A WALL, ITS RETRY TYPED, NAMES THE RETRY'S TURN
-/// ([`crate::supervise::approvals::LEFT_RETRIED`]): the
-/// person's prompt met a 529, the loop typed the retry, and the retry's
-/// short answer ended (its `turn_duration`): the row names that turn, the
-/// work before the wall counted with the retry's. NEGATIVE CONTROLS: the
-/// retry's turn not ended yet (a crash mid-answer), its work and the work
-/// before the wall past the exchange's bound, a prompt of someone's after
-/// it, and a retry in other words.
 #[test]
 fn a_persons_exchange_retried_at_a_wall_names_the_retrys_turn() {
     use crate::supervise::approvals::{left_at_wall_key, left_retried_key};
@@ -6217,7 +5339,6 @@ fn a_persons_exchange_retried_at_a_wall_names_the_retrys_turn() {
         turn(&with(&[ended(20_000)])).names(&key),
         "the retry's short answer"
     );
-    // NEGATIVE CONTROLS.
     assert!(!turn(&base).names(&key), "not ended yet");
     assert!(
         !turn(&with(&[ended(9 * 60 * 1000)])).names(&key),
@@ -6233,16 +5354,6 @@ fn a_persons_exchange_retried_at_a_wall_names_the_retrys_turn() {
     );
 }
 
-/// AN OLDER BUILD'S NOTE OF A PERSON'S EXCHANGE LEFT NAMES THE TURN NO
-/// PROMPT OPENED SINCE (done-5,
-/// [`crate::supervise::approvals::LEFT_BEFORE`]): that build journals the
-/// exchange left at a time and names no turn; the conversation's last turn,
-/// opened by a prompt recorded at or before the note, is the one it left —
-/// and still is with a person's `/config` after it that nothing answered.
-/// NEGATIVE CONTROLS: a prompt recorded after the note, a prompt command
-/// answered after it (`/init`: its answer opens a turn at the command), a
-/// `/loop`'s wake answered (a turn no prompt opened), and a prompt row that
-/// names no time.
 #[test]
 fn an_older_builds_note_of_a_left_exchange_names_the_turn_no_prompt_opened_since() {
     use crate::supervise::approvals::left_before_key;
@@ -6279,7 +5390,6 @@ fn an_older_builds_note_of_a_left_exchange_names_the_turn_no_prompt_opened_since
         turn(&with(&[config])).names(&noted),
         "a /config after it, unanswered"
     );
-    // NEGATIVE CONTROLS.
     assert!(
         !turn(&exchange).names(&left_before_key(5_000)),
         "a prompt recorded after the note"
@@ -6298,15 +5408,6 @@ fn an_older_builds_note_of_a_left_exchange_names_the_turn_no_prompt_opened_since
     );
 }
 
-/// THE TURN A CONVERSATION ENDS ON, BY ITS KEY (the review's RR3-TE-2):
-/// its model's last answer (`answer:<uuid>`), or a prompt after it
-/// (`prompt:<uuid>`) — what a person's own exchange left to them is
-/// ledgered under and matched by. Read past what asks and answers nothing:
-/// a tool's result, Claude Code's expansions, a subagent's rows, an API
-/// error's synthetic row, a system row, a local command and its output, a
-/// `!` shell command (the review's KR-P5-CMD). NEGATIVE CONTROLS: a prompt after
-/// the answer names the prompt, a new answer names itself, and an answer
-/// with no `uuid`, or no row at all, names none.
 #[test]
 fn the_turn_a_conversation_ends_on_is_named_by_its_last_answer_or_prompt() {
     let user = |uuid: &str, content: &str| {
@@ -6372,7 +5473,6 @@ fn the_turn_a_conversation_ends_on_is_named_by_its_last_answer_or_prompt() {
     ] {
         assert_eq!(key(&past(&[row])).as_deref(), Some("answer:a-1"), "{what}");
     }
-    // NEGATIVE CONTROLS.
     assert_eq!(
         key(&past(&[user("u-4", r#""Now add the flag.""#)])).as_deref(),
         Some("prompt:u-4")
@@ -6392,16 +5492,9 @@ fn the_turn_a_conversation_ends_on_is_named_by_its_last_answer_or_prompt() {
     assert_eq!(key(&[]), None);
 }
 
-/// The lab's W1 on Claude Code 2.1.306 (a subscriber's session limit under
-/// Land, run sw4, 2026-10-21) as its transcript wrote it, cut where the loop
-/// read it: the limit row, then Claude Code's own continuation at the reset,
-/// its prompt the last row.
 const CONTINUED_LIMIT: &str =
     include_str!("../supervise/fixtures/claude-2.1.306-transcript-session-limit-continued.jsonl");
 
-/// The continuation's reply as 2.1.306 wrote it (12:49:18.335Z, under the
-/// continuation's prompt `67ad4c9a…`), built from the fixture's first reply
-/// row with the measured reply's words, ids and time.
 fn continued_reply(rows: &[&str]) -> String {
     rows.iter()
         .find(|r| r.contains(r#""uuid":"501239ab-c5da-4032-9991-787ec24f148f""#))
@@ -6421,23 +5514,6 @@ fn continued_reply(rows: &[&str]) -> String {
         .replace("2026-10-21T12:43:14.255Z", "2026-10-21T12:49:18.335Z")
 }
 
-/// CLAUDE CODE'S OWN CONTINUATION PAST A LIMIT ROW ENDS THE STANDING LIMIT
-/// (the lab's W1 on 2.1.306, and the review of its first fix): at the reset
-/// Claude Code wrote its continuation's prompt (`origin.kind`
-/// `auto-continuation`) after the limit row, drew the reply, and wrote the
-/// reply's row after that. The supervisor's read at that turn's end found the
-/// tail ending on the prompt, and the row, standing, was read as the wall:
-/// where the reply had scrolled the notice off the screen, nothing there
-/// said the limit ended. The vendor went on past the row:
-/// [`transcript_standing_limit`] reads none, on the tail the loop read and
-/// with the reply written. The row's other readers still read it (its reset, its quota
-/// wall: the account's and the upgrade's holds, which the reset that passed
-/// ends). NEGATIVE CONTROLS: the tail cut before the continuation (the row
-/// stands, named); a person's prompt, or a background task's wake, in its
-/// place (a prompt the limit may still answer: one that names the
-/// continuation and the assistant in its words too, which the scan reads);
-/// the continuation met by the limit again (the new row stands); a
-/// subagent's continuation.
 #[test]
 fn claudes_own_continuation_past_a_limit_row_ends_the_standing_limit() {
     const ROW: &str = "3e0efba4-585c-41b7-b108-155e8508be5d";
@@ -6461,7 +5537,6 @@ fn claudes_own_continuation_past_a_limit_row_ends_the_standing_limit() {
     assert_eq!(transcript_standing_limit(&whole), None, "the reply written");
     assert_eq!(transcript_limit_reset(read), Some(RESET));
     assert!(transcript_standing_wall(read).is_some());
-    // NEGATIVE CONTROLS. Before the continuation, the row stands.
     let before = cut(prompt);
     let standing = transcript_standing_limit(&before).expect("the limit row stands");
     assert_eq!(standing.row.as_deref(), Some(ROW));
@@ -6481,7 +5556,6 @@ fn claudes_own_continuation_past_a_limit_row_ends_the_standing_limit() {
             .as_deref(),
         Some(ROW)
     );
-    // …its words no continuation's though they name one: the row's origin says.
     let named = typed_row("is the auto-continuation of the assistant on? keep going");
     assert_eq!(
         then(&named).and_then(|l| l.row).as_deref(),
@@ -6498,7 +5572,6 @@ fn claudes_own_continuation_past_a_limit_row_ends_the_standing_limit() {
         Some(ROW),
         "a subagent's"
     );
-    // The continuation met by the limit again: its own row stands.
     let again = quota_row(
         "2026-10-21T12:49:15.300Z",
         "five_hour",

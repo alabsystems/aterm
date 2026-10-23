@@ -1,69 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `aterm drive replay FILE --why --at …`: WHY DID IT PRESS 2? — one decision
-//! on a harness tape, explained: the screen it judged, the box this build's
-//! reader finds on it, the facts it was decided on and the door each came
-//! from, the policy's RULE TRACE (every check consulted, the rule that
-//! decided), the act that followed and the server's reply, the journal line
-//! and the ledger row.
-//!
-//! `tape show --decisions` ([`super::show`]) already answers "what did it do,
-//! on what screen" from the tape alone; `--why` answers "why", which takes the
-//! POLICY: the decision made again, step by step. It is an option of the
-//! replay, not a verb of its own (`aterm drive` keeps classify, phase,
-//! answer, ledger, tape and replay), because a trace is what a replay of the
-//! tape computes. How depends on the kind:
-//!
-//! * **An approval or a question box** is decided again on ANY build, with no
-//!   loop run: the decision's mark carries the facts its context was built
-//!   from alone (`policy::box_facts`), the tape's header carries the owner's
-//!   policy and the supervisor's process inputs, and every look the decision
-//!   makes at the machine is answered from the tape by a keyed probe
-//!   (`policy::probe::KeyedProbe`: astream-effects' keyed index of the tape,
-//!   built once when the tape is opened and shared by every decision decided
-//!   again on it, bounded at the records the loop had read when it decided,
-//!   never one from after). A box taller than the pane whose head the loop
-//!   joined from the history (`run::box_head`) is joined again from the
-//!   replies the tape holds, by the loop's own readers of them, and decided
-//!   whole as the loop decided it. This build's policy runs with its trace kept
-//!   ([`super::super::policy::approval::decide_traced`]); the explanation is
-//!   labelled with the build that recorded the tape and the build that
-//!   explains it, says whether this build's policy decides as the recorded
-//!   loop did, and NAMES what the re-decision needed and did not have — a
-//!   fact the recording build did not write, a policy value this build
-//!   supplied where the header does not say the run's (`Header::supplied`),
-//!   a look the tape does not hold, a box head's join the tape cannot
-//!   rebuild — never a default presented as the recorded world. The
-//!   policy's decision is not the whole of the loop's: fences the loop puts
-//!   after it (a person count a key needs, the stepper's check, the
-//!   session's own word) may stand between, and a difference says so.
-//! * **A turn end** decides on the turn-end fold, a state built over hours of
-//!   the loop's reads, which only re-running the loop rebuilds. Its trace is
-//!   therefore computed in a STRICT REPLAY of the tape to the point
-//!   ([`super::replay::replay_traced`]), and only on the build that recorded
-//!   it; on another build the explanation carries the fold and reading the
-//!   recorder noted before the decision, and says why there is no trace.
-//!
-//! In no case is a trace computed or kept by a running loop: the shipped and
-//! recording loops decide with none (`policy::trace`), and a tape holds no
-//! trace — a trace is a function of what the tape does hold. PRIVACY: only
-//! the tape file is read (no socket, no session, no file the run named, no
-//! look at the machine but the local zone's offset, read for a point named
-//! by a local time alone), nothing is written, and what is printed is what
-//! the tape already holds — the worker by its digest, never a variable —
-//! said as aterm prints another party's text ([`super::show::shown`], or
-//! escaped for HTML).
-//!
-//! A point is named by `--at`: `seq=N` (the decision on the screen of
-//! sequence N), `door=N` (the decision in force at effect `#N`, as `tape cat`
-//! numbers them), `[YYYY-MM-DDT]HH:MM[:SS]` (the last decision at or before
-//! that local time — an instant, each decision's local time read by the
-//! offset its own instant had; with no day named, the one day of the tape's
-//! run the time falls within, one within it on more than one day or on
-//! none refused), or a journal line's text (the decision the line
-//! followed). The answer is a structured [`Why`], rendered as text,
-//! Markdown or HTML at the edge.
+//! `aterm drive replay FILE --why --at …`: explain one recorded decision on a harness tape.
 
 use std::sync::Arc;
 
@@ -92,23 +30,17 @@ pub enum At {
     Seq(u64),
     /// The decision in force at effect `#N`.
     Door(u64),
-    /// The last decision at or before this local time: `secs` into the local
-    /// day `day` (days since 1970-01-01), or with no day named, into the one
-    /// day of the tape's run that time falls on ([`why`]).
+    /// Last decision at or before `secs` into local `day` (or the tape's single matching day).
     Time { day: Option<i64>, secs: u32 },
-    /// The decision a journal line (or a printed line) with this text
-    /// followed.
+    /// Decision followed by a journal or printed line containing this text.
     Line(String),
 }
 
 impl At {
-    /// `--at`'s value read: `seq=N`, `door=N` (or `door=#N`),
-    /// `[YYYY-MM-DDT]HH:MM[:SS]` (or a space for the `T`), else a journal
-    /// line's text.
+    /// Parse `--at` (`seq=N`, `door=[#]N`, `[YYYY-MM-DDT]HH:MM[:SS]`, or journal text).
     ///
     /// # Errors
-    ///
-    /// A `seq=` or `door=` whose number does not read, an empty value.
+    /// Unparseable `seq=`/`door=` number or empty input.
     pub fn parse(text: &str) -> Result<Self, String> {
         if let Some(n) = text.strip_prefix("seq=") {
             return n
@@ -156,7 +88,6 @@ fn civil_day(text: &str) -> Option<i64> {
         return None;
     }
     let day = aterm_types::rfc3339::days_from_civil(y, m, d);
-    // A day the calendar has: it reads back as itself (no 2026-02-30).
     (aterm_types::rfc3339::civil_from_days(day) == (y, m, d)).then_some(day)
 }
 
@@ -185,8 +116,7 @@ pub struct Fact {
     pub name: &'static str,
     /// Its value as the decision had it.
     pub value: String,
-    /// The door it came through and the record it was read at (`ctl meta
-    /// #12`), or the loop's own memory.
+    /// Door and record ordinal it came through, or the loop's own memory.
     pub door: String,
 }
 
@@ -211,16 +141,13 @@ pub struct Why {
     pub recorded_by: Option<String>,
     /// The build explaining it (this one).
     pub explained_by: String,
-    /// The mark's door: `decide.approval`, `decide.question`,
-    /// `decide.turn_end`.
+    /// Mark door (`decide.approval`, `decide.question`, `decide.turn_end`).
     pub door: String,
     /// The mark's ordinal (`#N` in `tape cat`).
     pub mark: u64,
     /// When it was made, Unix milliseconds: the last wall reading before it.
     pub at_ms: Option<i64>,
-    /// That instant as the local clock read it (`YYYY-MM-DD HH:MM:SS`),
-    /// where the point was named by a local time — the one point the local
-    /// zone is read for.
+    /// Local clock timestamp (`YYYY-MM-DD HH:MM:SS`) when queried by local time.
     pub at_local: Option<String>,
     /// The judged screen's sequence.
     pub seq: u64,
@@ -232,24 +159,15 @@ pub struct Why {
     pub parsed: Option<BoxRead>,
     /// The facts the box was decided on, each with its door.
     pub facts: Vec<Fact>,
-    /// What the re-decision needed and did not have: a fact the recording
-    /// build did not write, a value this build supplied where the header
-    /// does not give the run's, a look the tape does not hold, a box head's
-    /// join the tape cannot rebuild.
+    /// Facts or looks missing from the tape that the re-decision needed.
     pub needs: Vec<String>,
     /// The rule the recorded decision names.
     pub recorded_rule: Option<String>,
     /// The recorded decision, as the loop rendered it.
     pub recorded_outcome: String,
-    /// This build's POLICY's decision on the same facts (an approval's or
-    /// a question's), as the loop renders one. A conservative result from a
-    /// missing look is diagnostic only; `agrees` then remains unknown.
+    /// Decision computed by this build's policy on the same facts.
     pub decided: Option<String>,
-    /// Whether this build's policy decides as the recorded loop did. `None`
-    /// when a missing probe prevents that comparison. Other differences can
-    /// come from this build's policy, facts it lacks (`needs`), or a fence
-    /// the loop puts after the policy (a person count a key needs, the
-    /// stepper's check, the session's word).
+    /// Whether this build's policy agrees with the recorded decision, or `None` if unknown.
     pub agrees: Option<bool>,
     /// The policy's rule trace, where one could be computed.
     pub trace: Option<Vec<TraceStep>>,
@@ -263,8 +181,7 @@ pub struct Why {
     pub journal: Option<String>,
     /// The first approval-ledger row the loop wrote after the decision.
     pub ledger: Option<String>,
-    /// The turn-end fold and reading the recorder noted before a turn end's
-    /// decision.
+    /// Turn-end fold and reading notes recorded before a turn-end decision.
     pub notes: Vec<String>,
 }
 
@@ -293,7 +210,6 @@ fn effects(tape: &Tape) -> (Vec<EffectRecord>, Vec<usize>) {
 }
 
 /// The wall time (Unix ms) at each item: the last `Clock` record or stamp at
-/// or before it.
 fn wall_times(tape: &Tape) -> Vec<Option<i64>> {
     let mut last = None;
     tape.items
@@ -313,10 +229,6 @@ fn wall_times(tape: &Tape) -> Vec<Option<i64>> {
 }
 
 /// The local clock, as [`why`]'s `offset_at` reads it: each instant's local
-/// time by its own offset, asked once per quarter hour of the tape (every
-/// zone's offset changes on one), so a tape recorded across a change of
-/// daylight saving reads each side as it was, and one recorded in another
-/// season reads by its own offsets, never today's.
 struct Zone<'a> {
     offset_at: &'a dyn Fn(i64) -> Option<i64>,
     read: std::collections::BTreeMap<i64, i64>,
@@ -331,7 +243,6 @@ impl<'a> Zone<'a> {
     }
 
     /// The Unix second `unix` on the local clock, in seconds since its
-    /// 1970-01-01 00:00.
     fn local(&mut self, unix: i64) -> Result<i64, String> {
         let quarter = unix.div_euclid(900);
         let offset = match self.read.get(&quarter) {
@@ -353,15 +264,6 @@ impl<'a> Zone<'a> {
 }
 
 /// The local instant (seconds since the local 1970-01-01 00:00) a point
-/// named by a local time stands for: `secs` into the local day `day`, or
-/// with no day named, into the one day of the tape's run — from its first
-/// wall reading to its last — that time falls within. A tape on one local
-/// day takes that day's (a time after its last decision is the last
-/// decision's, one before its first has none); one that crosses midnight
-/// takes the day on which the time is inside the run, and a time inside it
-/// on more than one day, or on none, is refused, asking for the day: an
-/// `HH:MM` is never compared as a time of day alone, which would take a
-/// decision after the time named on a tape that runs past midnight.
 fn local_target(
     walls: &[Option<i64>],
     day: Option<i64>,
@@ -381,7 +283,6 @@ fn local_target(
     if first_day == hi.div_euclid(86_400) {
         return Ok(first_day * 86_400 + secs);
     }
-    // The days d with lo <= d·86400 + secs <= hi.
     let from = (lo - secs + 86_399).div_euclid(86_400);
     let to = (hi - secs).div_euclid(86_400);
     if from == to {
@@ -416,18 +317,10 @@ fn utc_words(unix: i64) -> String {
     out
 }
 
-/// EXPLAIN the decision at `at` on the tape `bytes` ([module docs](self)).
-/// `offset_at` is the local zone's offset from UTC, in seconds, at a Unix
-/// second — the offset daylight saving gave THAT instant
-/// (`limit::local_offset_at`) — asked only for a point named by a local
-/// time, of the instants that point is compared with: every other point
-/// is found on the tape alone.
+/// Explain the decision at `at` on `bytes`, using `offset_at` for local-time queries.
 ///
 /// # Errors
-///
-/// A tape that does not read, a point with no decision at it, a local time
-/// the tape's run holds on more than one day (or on none) with no day
-/// named, a zone whose offset does not read.
+/// Unreadable tape, no matching decision, ambiguous/out-of-range local time, or unreadable zone offset.
 pub fn why(bytes: &[u8], at: &At, offset_at: &dyn Fn(i64) -> Option<i64>) -> Result<Why, String> {
     let tape = show::open(bytes, false)?;
     let book = Book::open(&tape);
@@ -473,7 +366,6 @@ pub fn why(bytes: &[u8], at: &At, offset_at: &dyn Fn(i64) -> Option<i64>) -> Res
     };
     let d =
         chosen.ok_or_else(|| format!("no decision on this tape at {}", shown(&at_words(at))))?;
-    // The zone is read for a point named by a local time alone.
     let at_local = match (at, book.walls[d.item]) {
         (At::Time { .. }, Some(ms)) => Some(local_words(zone.local(ms.div_euclid(1000))?)),
         _ => None,
@@ -481,15 +373,11 @@ pub fn why(bytes: &[u8], at: &At, offset_at: &dyn Fn(i64) -> Option<i64>) -> Res
     Ok(book.explain(d, at_local, bytes, None))
 }
 
-/// A tape opened to explain its decisions: each decision, its records by
-/// ordinal and the item each sits at, the wall time at each item, and its
-/// header as this build reads it ([`why`]; the shadow,
-/// [`super::shadow`], explains every box on it under a candidate policy).
+/// Opened tape state indexed for explaining decisions.
 pub(crate) struct Book<'t> {
     tape: &'t Tape,
     pub(crate) decisions: Vec<show::Decision>,
     /// Its effects by ordinal, and their keyed index: built once, here, and
-    /// shared by the keyed probe of every decision decided again on the tape.
     index: Arc<TapeIndex>,
     /// Each effect's item index, by ordinal (ascending).
     item_of: Vec<usize>,
@@ -503,10 +391,6 @@ impl<'t> Book<'t> {
     pub(crate) fn open(tape: &'t Tape) -> Self {
         let decisions = show::decisions(tape);
         let (records, item_of) = effects(tape);
-        // A header this build cannot read (another build's, which an
-        // incident read after an update often is) still leaves the screen,
-        // the act and the lines to explain: only the re-decision needs the
-        // policy it holds.
         let header = match tape.header.as_deref() {
             None => Err("the tape has no header: no policy to decide again with".to_string()),
             Some(text) => Header::decode(text).map_err(|e| {
@@ -540,10 +424,7 @@ impl<'t> Book<'t> {
         })
     }
 
-    /// The decision `d` explained ([`why`]), its local time `at_local` where
-    /// the point was named by one: an approval or a question decided again
-    /// under `policy` — the header's own with `None` — and a turn end traced
-    /// by a strict replay of the tape `bytes` to it (on the recording build).
+    /// Explain decision `d` under `policy` (or the header's policy when `None`).
     pub(crate) fn explain(
         &self,
         d: &show::Decision,
@@ -673,9 +554,6 @@ fn screen_of(item: &Item) -> Option<Screen> {
 }
 
 /// An approval's or a question's decision made again from its mark's facts
-/// ([module docs](self)), into `why`. `screen_record` is the ordinal of the
-/// round trip whose reply was the judged screen, `mark` the mark's own: the
-/// recorded loop had read the first `mark` records when it decided.
 fn box_trace(
     why: &mut Why,
     header: &Header,
@@ -691,10 +569,6 @@ fn box_trace(
         return;
     };
     let Some(facts) = facts else {
-        // The facts are written once the loop has read them; every box it
-        // hands over before (`approve = "none"`, another supervisor's
-        // session, a question's latch, a policy text the dialog did not
-        // take) says why in its recorded outcome, which is printed above.
         why.trace_note = Some(
             if why.recorded_outcome.starts_with("Escalate") {
                 "the mark carries no facts: the loop handed the box over before it read the facts \
@@ -722,11 +596,6 @@ fn box_trace(
         &screen.rows,
         Some(screen.cursor_col),
     );
-    // A box taller than the pane, its head read from the history above the
-    // screen (`run::box_head`): the loop's join rebuilt from the replies the
-    // tape holds, by the loop's own readers of them, and the box decided
-    // whole as the loop decided it — or on the cut, where the loop's join
-    // did not prove itself and the loop decided the cut.
     let head = head_of(records, screen_record, mark, screen, &cut);
     match &head {
         Head::Joined {
@@ -814,8 +683,6 @@ fn box_trace(
     };
     let decided = format!("{decision:?}");
     let missing_looks = probe.misses();
-    // A conservative answer to an untaped look is useful to explain why the
-    // policy held, but it is not evidence of what the candidate would decide.
     why.agrees = missing_looks
         .is_empty()
         .then_some(decided == why.recorded_outcome);
@@ -840,8 +707,6 @@ fn box_trace(
             why.explained_by,
         )
     } else {
-        // `--why` re-decides under the header's policy as `--shadow` does under
-        // a candidate's: say which, never "the candidate" for both.
         format!(
             "decided again by this build's policy ({}) on the facts the mark carries and {under}, \
              but it needs a look the tape does not hold before #{mark} (under needs): the \
@@ -852,9 +717,6 @@ fn box_trace(
 }
 
 /// What a header this build decoded does not give the run's own, each
-/// supplied by this build (`Header::supplied`: a key a build before it did
-/// not write, a policy value an inexact header's reader refused, the
-/// inexactness itself), as a need of a decision made again under it.
 fn supplied(header: &Header) -> impl Iterator<Item = String> + '_ {
     header
         .supplied
@@ -863,15 +725,12 @@ fn supplied(header: &Header) -> impl Iterator<Item = String> + '_ {
 }
 
 /// What the loop made of a box whose head is off the screen
-/// (`run::box_head`), as the tape's replies say ([`head_of`]).
 enum Head {
     /// No history searched: the box was decided on the screen's rows.
     NotRead,
     /// Searched, and the join did not prove itself: decided on the cut.
     Cut,
     /// Joined: the rows from the box's top rule to the screen's foot and
-    /// their reading, and the records the join came through (the search, the
-    /// first and last `line` read, the screen read again).
     Joined {
         rows: Vec<String>,
         reading: Box<aterm_phase::Reading>,
@@ -884,12 +743,6 @@ enum Head {
 }
 
 /// The loop's join of a box's head (`Session::box_from_history`) rebuilt
-/// from the control round trips strictly between the judged screen's record
-/// and the mark: the search for the box's top rule, a `line` read of each
-/// row it names, the screen read again by the request that read the judged
-/// one — each reply read by the loop's own reader of it
-/// (`run::head_rows`, `run::head_row`, `run::joined_box`), so the join is
-/// the loop's, never a second copy of its rule.
 fn head_of(
     records: &[EffectRecord],
     screen_record: u64,
@@ -923,7 +776,6 @@ fn head_of(
     let to = records
         .len()
         .min(usize::try_from(mark).unwrap_or(usize::MAX));
-    // The control round trips in between: ordinal, words, reply.
     let lane: Vec<(u64, Vec<String>, Option<CtlReply>)> = records
         .get(from..to)
         .unwrap_or_default()
@@ -1007,7 +859,6 @@ fn head_of(
 }
 
 /// A turn end's trace, from a strict replay of the tape to its mark on the
-/// build that recorded it ([module docs](self)), into `why`.
 fn turn_end_trace(why: &mut Why, bytes: &[u8], header: &Header) {
     if header.build != why.explained_by {
         why.trace_note = Some(format!(
@@ -1026,8 +877,6 @@ fn turn_end_trace(why: &mut Why, bytes: &[u8], header: &Header) {
     match replay_traced(bytes, &options) {
         Ok((_, Some(steps))) => {
             why.trace = Some(steps);
-            // A replay runs under what the header gives, and what this build
-            // supplied for what it does not (a policy it marked inexact).
             why.needs.extend(supplied(header));
             why.trace_note = Some(format!(
                 "decided again in a strict replay of the tape to #{}, on the fold the replay \
@@ -1052,7 +901,6 @@ fn turn_end_trace(why: &mut Why, bytes: &[u8], header: &Header) {
 }
 
 /// The latest record at or before `mark` that crossed `door` (a control
-/// request's first word naming the verb, for the control lane): its ordinal.
 fn last_at(records: &[EffectRecord], mark: u64, door: &str, verb: Option<&str>) -> Option<u64> {
     let upto = records
         .len()
@@ -1075,7 +923,6 @@ fn last_at(records: &[EffectRecord], mark: u64, door: &str, verb: Option<&str>) 
 }
 
 /// `facts`, each with the door it came through ([`Fact::door`]): the latest
-/// read of it among the first `mark` records, or the loop's own memory.
 fn facts_with_doors(
     facts: &BoxFacts,
     header: &Header,
@@ -1253,8 +1100,6 @@ fn facts_with_doors(
     out
 }
 
-// -- renderings ----------------------------------------------------------------
-
 /// `--format`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Format {
@@ -1308,7 +1153,6 @@ fn heading(why: &Why) -> String {
 }
 
 /// The verdict line: what was decided, by which rule, and whether this build
-/// agrees.
 fn verdict(why: &Why) -> String {
     let mut out = format!(
         "recorded: rule={} {}",

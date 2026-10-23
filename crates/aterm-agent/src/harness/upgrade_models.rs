@@ -1,25 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The model priority list: which model a relaunched session gets, what "available" means, and
-//! how the list grows when Claude Code recommends a newer model of a listed family.
-//!
-//! The list is data the harness maintains, `<state>/upgrade/models.json`: seeded with [`SEED`],
-//! editable by hand or through `aterm harness upgrade models set`, extended automatically
-//! ([`Priority::admit`]), every change carrying its provenance. Evidence is read from files
-//! Claude Code already keeps; no model call decides anything here. The move rule is
-//! [`model_due`]: same family first, then the list.
-//!
-//! A MODEL THE ACCOUNT BILLS TO USAGE CREDITS is no model the harness moves a session onto
-//! under `[harness] usage_credits = false`, the default (the owner, 2026-10-19: *"for continuing
-//! on credits, that's an optional additional feature that's off by default. use
-//! subscriptions."*): the profile's word on how the plan bills Fable
-//! ([`super::profile::FablePlan`]), the consents it stores and the families it bills to credits
-//! only ([`credits_billed`]) make it unavailable ([`availability`]), so neither step of the rule
-//! offers it; a relaunch onto it is refused ([`super::relaunch`]'s `refused:model-on-credits`).
-//! WHERE THE BILLING CANNOT BE READ — no profile, a plan or a date that did not read, two logins
-//! listed — Fable is taken for billed (fail closed: the review of 2026-10-19, P4,
-//! [`CREDITS_BILLED_UNREAD`]). A plan that reads as billing none is judged as before.
+//! The model priority list.
 
 use std::path::{Path, PathBuf};
 
@@ -38,7 +20,6 @@ fn base_id(id: &str) -> &str {
 }
 
 /// `claude-<family>-<major>[-<minor>][-<yyyymmdd>]` → family and version.
-/// A date suffix (six or more digits) is not part of the version.
 #[must_use]
 pub fn family_version(id: &str) -> Option<(String, (u32, u32))> {
     let base = base_id(id);
@@ -70,8 +51,7 @@ pub struct Change {
     pub id: String,
     /// Where it went: `above <id>`, `seed`, or `set`.
     pub placed: String,
-    /// What recommended it (`announcement:<id>`, `catalog:<build>`, `seed`,
-    /// `owner`).
+    /// What recommended it (`announcement:<id>`, `catalog:<build>`, `seed`, `owner`).
     pub source: String,
     /// Unix seconds.
     pub at: i64,
@@ -108,8 +88,7 @@ impl Priority {
         self.ids.iter().position(|x| x == base)
     }
 
-    /// Parse the file. `None` for anything malformed — the caller then acts
-    /// on nothing model-related rather than on a list it cannot read.
+    /// Parse the file.
     #[must_use]
     pub fn parse(text: &str) -> Option<Priority> {
         let v: Value = aterm_json::from_str(text).ok()?;
@@ -178,11 +157,7 @@ impl Priority {
         aterm_json::to_string(&Value::Object(root)).unwrap_or_default() + "\n"
     }
 
-    /// Admit a recommended id: the grammar holds, its family is already on
-    /// the list, it is strictly newer than that family's best member, and
-    /// `known` (the active build's own catalog) contains it. It is placed
-    /// directly above that family's best member. `None` when it is not
-    /// admitted; the change otherwise.
+    /// Admit a recommended id.
     pub fn admit(
         &mut self,
         id: &str,
@@ -195,7 +170,6 @@ impl Priority {
         if self.rank(base).is_some() || !known(base) {
             return None;
         }
-        // The family's best member = the highest-ranked id of that family.
         let (pos, best) = self
             .ids
             .iter()
@@ -206,8 +180,6 @@ impl Priority {
                     .map(|(_, v)| (i, v))
             })
             .min_by_key(|(i, _)| *i)?;
-        // Strictly newer than every listed member of the family, not only the
-        // best-ranked — a hand-ordered list must never be extended downward.
         let newest_listed = self
             .ids
             .iter()
@@ -244,7 +216,6 @@ pub fn load_or_seed(path: &Path, now: i64) -> Result<Priority, String> {
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             let p = Priority::seed(now);
-            // Ordered: a list that is lost is seeded again whenever it is absent.
             write_atomic_ordered(path, &p.render())
                 .map_err(|e| format!("{}: {e}", path.display()))?;
             Ok(p)
@@ -261,13 +232,10 @@ pub fn write_atomic(path: &Path, text: &str) -> std::io::Result<()> {
     write_atomic_mode(path, text, None)
 }
 
-/// [`write_atomic`], with the replacement's permission bits (unix) where `mode` names them, for a
-/// file its owner keeps as they made it; `None` is 0600. The bits are set on the temp file exactly
-/// (no umask) before the rename, so the file is never visible with other bits.
+/// [`write_atomic`], with the replacement's permission bits (unix) where `mode` names them, for a file its owner keeps as they made it.
 ///
 /// # Errors
-/// The directory could not be made or the write, the mode or the rename
-/// failed.
+/// The directory could not be made or the write, the mode or the rename failed.
 pub fn write_atomic_mode(path: &Path, text: &str, mode: Option<u32>) -> std::io::Result<()> {
     use std::io::Write as _;
     write_atomic_using(path, text, mode, Flush::Durable, |file, bytes| {
@@ -275,12 +243,7 @@ pub fn write_atomic_mode(path: &Path, text: &str, mode: Option<u32>) -> std::io:
     })
 }
 
-/// [`write_atomic`] with the stage finished by [`aterm_durable::ordered`] instead of a
-/// full flush: the bytes land before the rename that publishes them, so after a power
-/// loss `path` holds the old file or the whole new one, never a name over bytes that
-/// did not land. No write here syncs the directory after the rename, so what
-/// [`write_atomic`] promises beyond that order is only the new bytes, not their name.
-/// Each caller says which recovery tolerates the older copy.
+/// [`write_atomic`] with the stage finished by [`aterm_durable::ordered`] instead of a full flush.
 ///
 /// # Errors
 /// As [`write_atomic`].
@@ -291,8 +254,6 @@ pub fn write_atomic_ordered(path: &Path, text: &str) -> std::io::Result<()> {
     })
 }
 
-// The destination changes only after the owned stage is complete and synced. An error
-// before rename drops only the exclusively-created stage directory, never a guessed name.
 fn write_atomic_using(
     path: &Path,
     text: &str,
@@ -329,8 +290,6 @@ fn write_atomic_using(
     drop(file);
     std::fs::rename(&staged, path)
 }
-
-// Evidence
 
 /// One row of the served catalog (`~/.claude/cache/model-catalog/*-cc.json`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -369,23 +328,14 @@ pub struct Evidence {
     pub disabled_options: Vec<String>,
     /// Launch announcements.
     pub announcements: Vec<Announcement>,
-    /// The model families the account's profile bills to usage credits
-    /// ([`credits_billed`]), read only under `[harness] usage_credits =
-    /// false`: each is unavailable ([`availability`]). Empty — the key on, no
-    /// profile, or a plan billing none or not read — judges as before.
+    /// The model families the account's profile bills to usage credits ([`credits_billed`]), read only under `[harness] usage_credits = false`.
     pub credits_billed: Vec<String>,
 }
 
-/// The model families taken for billed to usage credits where the account's
-/// billing cannot be read ([`credits_billed`]): Fable, the family Claude Code
-/// bills per request with no dialog.
+/// The model families taken for billed to usage credits where the account's billing cannot be read ([`credits_billed`]).
 pub const CREDITS_BILLED_UNREAD: &[&str] = &["fable"];
 
-/// THE MODEL FAMILIES AN ACCOUNT BILLS TO USAGE CREDITS at `now` (unix
-/// seconds), by its profile ([`super::profile::Profile`]): Fable where its
-/// plan bills it ([`fable_billed`]); every family a stored consent bills with
-/// no dialog ([`super::profile::Profile::consented`]); every family billed to
-/// credits only ([`super::profile::Profile::credits_only`]).
+/// THE MODEL FAMILIES AN ACCOUNT BILLS TO USAGE CREDITS at `now` (unix seconds), by its profile ([`super::profile::Profile`]).
 #[must_use]
 pub fn credits_billed(profile: &super::profile::Profile, now: i64) -> Vec<String> {
     let mut billed: Vec<String> = Vec::new();
@@ -402,10 +352,7 @@ pub fn credits_billed(profile: &super::profile::Profile, now: i64) -> Vec<String
     billed
 }
 
-/// WHETHER THE PLAN BILLS FABLE TO USAGE CREDITS at `now`
-/// ([`super::profile::FablePlan`]): on credits only, past the date its Fable
-/// limits end — and, failing closed, where that date or the plan did not
-/// read. Included: no; a date still ahead: not yet.
+/// WHETHER THE PLAN BILLS FABLE TO USAGE CREDITS at `now` ([`super::profile::FablePlan`]).
 #[must_use]
 pub fn fable_billed(fable: &super::profile::FablePlan, now: i64) -> bool {
     use super::profile::FablePlan;
@@ -416,8 +363,7 @@ pub fn fable_billed(fable: &super::profile::FablePlan, now: i64) -> bool {
     }
 }
 
-/// Whether `model` — an id (`claude-fable-5-1[1m]`) or Claude Code's alias for
-/// a family (`fable`) — is of a family in `billed` ([`credits_billed`]).
+/// Whether `model` — an id (`claude-fable-5-1[1m]`) or Claude Code's alias for a family (`fable`).
 #[must_use]
 pub fn billed_to_credits(model: &str, billed: &[String]) -> bool {
     let base = base_id(model);
@@ -463,8 +409,7 @@ pub fn parse_served(text: &str) -> Option<Vec<ServedRow>> {
     )
 }
 
-/// Parse the model-related parts of `~/.claude.json`. Nothing else in that
-/// file is read or kept (it also holds account identity).
+/// Parse the model-related parts of `~/.claude.json`.
 #[must_use]
 pub fn parse_claude_json(text: &str) -> (Vec<String>, Vec<String>, Vec<Announcement>) {
     let Ok(v) = aterm_json::from_str::<Value>(text) else {
@@ -522,8 +467,7 @@ pub fn parse_claude_json(text: &str) -> (Vec<String>, Vec<String>, Vec<Announcem
     (denied, disabled, announcements)
 }
 
-/// Read every piece of evidence from a Claude config directory
-/// (`~/.claude`) and the `.claude.json` beside or inside it.
+/// Read every piece of evidence from a Claude config directory (`~/.claude`) and the `.claude.json` beside or inside it.
 #[must_use]
 pub fn read_evidence(config_dir: &Path, claude_json: &Path) -> Evidence {
     let served = std::fs::read_dir(config_dir.join("cache").join("model-catalog"))
@@ -534,7 +478,6 @@ pub fn read_evidence(config_dir: &Path, claude_json: &Path) -> Evidence {
                 .map(|e| e.path())
                 .filter(|p| p.to_string_lossy().ends_with("-cc.json"))
                 .collect();
-            // The newest cache wins when an account has several.
             files.sort_by_key(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok());
             files.last().and_then(|p| std::fs::read_to_string(p).ok())
         })
@@ -568,9 +511,7 @@ impl Availability {
     }
 }
 
-/// Is `id` usable for a session that will run Claude Code `cc_version`
-/// (the served catalog, the person's deny lists, the build's own catalog, a
-/// family billed to usage credits under the key off)?
+/// Is `id` usable for a session that will run Claude Code `cc_version` (the served catalog, the person's deny lists, the build's own catalog, a family billed to usage credits under the key off)?
 #[must_use]
 pub fn availability(
     id: &str,
@@ -633,8 +574,7 @@ pub fn target<'a>(
     (best, verdicts)
 }
 
-/// Claude Code's own recommendations, newest-first by source: every
-/// announcement's `requiresModel`, then the build's `latest_per_family`.
+/// Claude Code's own recommendations, newest-first by source.
 #[must_use]
 pub fn recommendations(
     ev: &Evidence,
@@ -656,7 +596,7 @@ pub fn recommendations(
     out
 }
 
-/// Apply every admissible recommendation to the list. Returns the changes.
+/// Apply every admissible recommendation to the list.
 pub fn ingest(
     list: &mut Priority,
     recs: &[(String, String)],
@@ -669,17 +609,10 @@ pub fn ingest(
         .collect()
 }
 
-// The live model and the model decision (asked by `upgrade_drive` at each
-// session's idle point, and by every restart for the model that rides it)
-
-/// Seconds a model a relaunch of this harness asked for (`--model`) is given
-/// to show in the transcript before the choice is recorded as failed for that
-/// conversation (never retried for it).
+/// Seconds a model a relaunch of this harness asked for (`--model`) is given to show in the transcript before the choice is recorded as failed for that conversation (never retried for it).
 pub const MODEL_SETTLE_S: u64 = 600;
 
-/// A `/model` result's display name (`Opus 5.5 (default)`, `Fable 5.1 (1M
-/// context)`) mapped back to an id through the build's baked catalog; a 1M
-/// display of a model without a native 1M window gets `[1m]`.
+/// A `/model` result's display name (`Opus 5.5 (default)`, `Fable 5.1 (1M context)`) mapped back to an id through the build's baked catalog.
 #[must_use]
 pub fn model_of_display(display: &str, baked: Option<&Baked>) -> Option<String> {
     let mut name = display.trim();
@@ -707,21 +640,18 @@ pub fn model_of_display(display: &str, baked: Option<&Baked>) -> Option<String> 
 pub struct LiveModel {
     /// The model id.
     pub id: String,
-    /// It comes from a `/model` result newer than the last answer (someone chose it), not from
-    /// the last answer itself.
+    /// It comes from a `/model` result newer than the last answer (someone chose it), not from the last answer itself.
     pub by_command: bool,
 }
 
 /// What one of Claude Code's model result rows says (its `<local-command-stdout>`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ModelResultKind {
-    /// `Set model to …`: the model was chosen (`/model`, the picker, a
-    /// typed `/model <name>`).
+    /// `Set model to …`: the model was chosen (`/model`, the picker, a typed `/model <name>`).
     Set,
     /// `Kept model as …`: a `/model` that changed nothing.
     Kept,
-    /// `<icon> Fast mode ON · model set to …`: `/fast on` moved the model to
-    /// one that runs fast.
+    /// `<icon> Fast mode ON · model set to …`: `/fast on` moved the model to one that runs fast.
     FastOn,
 }
 
@@ -729,19 +659,13 @@ pub(crate) enum ModelResultKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ModelResult {
     pub(crate) kind: ModelResultKind,
-    /// The model as Claude spelled it, quotes off (`Opus 5.5 (default)`);
-    /// `None` when the result is not quoted the way any build quotes it: a
-    /// model was set, and which one this build cannot tell.
+    /// The model as Claude spelled it, quotes off (`Opus 5.5 (default)`).
     pub(crate) display: Option<String>,
-    /// The effort level a ` with `<level>` effort` clause after it names, as
-    /// written: the top-effort mode by its own name
-    /// ([`aterm_primer::CLAUDE_TOP_EFFORT_KEY`]), not the `xhigh` it runs at.
+    /// The effort level a ` with `<level>` effort` clause after it names, as written.
     pub(crate) effort: Option<String>,
 }
 
 /// The display a result quotes right at `rest`'s start: in backticks (2.1.267
-/// on) or ANSI bold (2.1.201 to 2.1.222), with the rest after its closing
-/// quote. At most 80 chars are kept; a caller judges them.
 fn quoted_display(rest: &str) -> Option<(String, &str)> {
     let (display, after) = if let Some(quoted) = rest.strip_prefix('`') {
         let end = quoted.find('`')?;
@@ -762,8 +686,7 @@ fn effort_clause(after: &str) -> Option<String> {
         .then(|| level.chars().take(16).collect())
 }
 
-/// `text` without ANSI SGR sequences (`\x1b[1m`, `\x1b[38;2;255;106;0m`), stripped as Claude's
-/// result classifier strips them (`/\x1b\[[0-9;]*m/g`).
+/// `text` without ANSI SGR sequences (`\x1b[1m`, `\x1b[38;2;255;106;0m`), stripped as Claude's result classifier strips them (`/\x1b\[[0-9;]*m/g`).
 pub(crate) fn strip_sgr(text: &str) -> std::borrow::Cow<'_, str> {
     if !text.contains('\u{1b}') {
         return text.into();
@@ -786,17 +709,9 @@ pub(crate) fn strip_sgr(text: &str) -> std::borrow::Cow<'_, str> {
 }
 
 /// How far into a `/fast` result (SGR stripped, in UTF-16 code units, as JavaScript's `indexOf`
-/// counts) Claude's classifier takes the `Fast mode ON · model set to `` phrase (Claude Code
-/// 2.1.283): room for the icon and a space.
 const FAST_ON_LEAD: usize = 4;
 
-/// What a `type:user` row's content says about the model, when it is one of Claude Code's own
-/// model results: `<local-command-stdout>`, then the result phrase (anchors `model.set`,
-/// `model.kept`, `fast.on` + `fast.model_set`), the model quoted after it. The phrase anywhere
-/// else (an answer, a tool's output, a prompt, a notification) is text. `Current model: …` and a
-/// cloud session's switch reports say nothing this process chose and are not read. A `/fast`
-/// result is matched on the SGR-stripped text, as Claude's classifier does: Claude colours its
-/// `↯` icon.
+/// What a `type:user` row's content says about the model, when it is one of Claude Code's own model results.
 pub(crate) fn model_result_of(content: &str) -> Option<ModelResult> {
     let body = content
         .trim_start()
@@ -815,9 +730,6 @@ pub(crate) fn model_result_of(content: &str) -> Option<ModelResult> {
             });
         }
     }
-    // `/fast on`: the phrase at most [`FAST_ON_LEAD`] units into the stripped text, so a longer
-    // lead-in (`Kept Fast mode ON`, a sentence quoting it) is not this result. Without the
-    // `model set to` clause the model did not move: Claude appends it exactly when it moves one.
     let plain = strip_sgr(body);
     let phrase = format!(
         "{} \u{00B7} {}",
@@ -835,9 +747,6 @@ pub(crate) fn model_result_of(content: &str) -> Option<ModelResult> {
 }
 
 /// The model display a `/model` result row names: Claude's own `type:user`
-/// row whose content is a `Set model to` result ([`model_result_of`]), the
-/// choice [`live_model`] reads. A kept model or a fast switch is not a choice
-/// it counts (the footer reads those, `footer::tail_facts`).
 fn model_command_display(line: &str) -> Option<String> {
     if !line.contains(aterm_phase::anchor("model.set")) {
         return None;
@@ -852,10 +761,7 @@ fn model_command_display(line: &str) -> Option<String> {
         .and_then(|r| r.display)
 }
 
-/// The live model: the newest `/model` result ([`model_command_display`])
-/// when it is newer than the last main-chain answer, else the last answer's
-/// model. A `/model` display this build does not know yields `None`; unknown
-/// is never guessed. `<synthetic>` rows and subagents' rows are not answers.
+/// The live model: the newest `/model` result ([`model_command_display`]) when it is newer than the last main-chain answer, else the last answer's model.
 #[must_use]
 pub fn live_model(tail: &str, baked: Option<&Baked>) -> Option<LiveModel> {
     let mut answer: Option<(usize, String)> = None;
@@ -900,12 +806,7 @@ pub fn live_model(tail: &str, baked: Option<&Baked>) -> Option<LiveModel> {
     }
 }
 
-/// The hand-chosen model a relaunch carries in place of the launch's `--model` (`launch`), or
-/// `None` to keep the launch's flags: a command-line `--model` overrides the default `/model`
-/// saves, so keeping it would undo a later `/model`. Hand-chosen is a `/model` result newer than
-/// the last answer ([`LiveModel::by_command`], as its display maps, 1M window included) or, once
-/// answers follow it, the recorded choice ([`ModelRecord::human`]) while it runs; never the
-/// launch's own model, a launch alias read as the model `baked` names for it ([`launch_names`]).
+/// The hand-chosen model a relaunch carries in place of the launch's `--model` (`launch`), or `None` to keep the launch's flags.
 #[must_use]
 pub fn hand_chosen(
     live: Option<&LiveModel>,
@@ -923,11 +824,7 @@ pub fn hand_chosen(
         .then(|| human.to_string())
 }
 
-/// The model a launch's `--model` value names: a real id as it is; a family
-/// alias (`opus`, `opus[1m]`) as the build's catalog `baked` resolves it
-/// ([`Baked::latest`], the window kept); anything else (no catalog, an alias
-/// it does not know) as written, which no real id equals, so a pick is
-/// carried rather than guessed the alias's.
+/// The model a launch's `--model` value names: a real id as it is.
 #[must_use]
 pub fn launch_names(launch: &str, baked: Option<&Baked>) -> String {
     let (name, window) = launch
@@ -941,9 +838,7 @@ pub fn launch_names(launch: &str, baked: Option<&Baked>) -> String {
         .map_or_else(|| launch.to_string(), |id| format!("{id}{window}"))
 }
 
-/// [`hand_chosen`] off a transcript `tail`, for a process started at `started_s` with launch
-/// `--model` `launch` and recorded choice `human`: `None` while no answer and no `/model` is newer
-/// than the process (an older `/model` chose for a previous process).
+/// [`hand_chosen`] off a transcript `tail`, for a process started at `started_s` with launch `--model` `launch` and recorded choice `human`.
 #[must_use]
 pub fn hand_model(
     tail: &str,
@@ -959,8 +854,6 @@ pub fn hand_model(
 }
 
 /// The timestamp of the newest main-chain answer or `/model` result in
-/// `tail` ([`model_command_display`]): what says a process has run since it
-/// started.
 fn newest_row_at(tail: &str) -> Option<u64> {
     tail.lines()
         .filter(|l| l.contains("\"assistant\"") || model_command_display(l).is_some())
@@ -974,29 +867,13 @@ fn newest_row_at(tail: &str) -> Option<u64> {
         .max()
 }
 
-/// Seconds without an answer after which a conversation's prompt cache is
-/// cold: Claude's cache lifetime on these sessions (1 h). A model change
-/// prefers that moment, since a switch re-reads the whole history, which a
-/// warm cache would have spared. A preference, not a condition
-/// ([`model_moves_now`]).
+/// Seconds without an answer after which a conversation's prompt cache is cold: Claude's cache lifetime on these sessions (1 h).
 pub const CACHE_COLD_S: u64 = 3600;
 
-/// The longest a due model move waits for a cold cache, in seconds of being due. The wait is a
-/// preference, not a condition: a conversation in active use never goes an hour without an answer,
-/// so an unbounded wait would never land. Past it the move lands at the next stopping point (the
-/// READY handshake still gates it).
+/// The longest a due model move waits for a cold cache, in seconds of being due.
 pub const MODEL_WARM_MAX_S: u64 = CACHE_COLD_S;
 
-/// The model ladder: whether a due move is taken on this visit, and why, or
-/// `None` to wait. Monotone and bounded: every due move lands.
-///
-/// * `cache-cold`: no answer for [`CACHE_COLD_S`]; the switch re-reads a
-///   history that is cold anyway.
-/// * `build-restart`: the conversation is being restarted onto a newer build
-///   regardless; relaunching it on the old model would only schedule a second
-///   restart for the model later.
-/// * `warm-wait-over`: due for [`MODEL_WARM_MAX_S`] without either of the
-///   above; move at the next stopping point.
+/// The model ladder: whether a due move is taken on this visit, and why, or `None` to wait.
 #[must_use]
 pub fn model_moves_now(cold: bool, build_restart: bool, due_for_s: u64) -> Option<&'static str> {
     if cold {
@@ -1010,19 +887,15 @@ pub fn model_moves_now(cold: bool, build_restart: bool, due_for_s: u64) -> Optio
     }
 }
 
-/// Unix seconds of an RFC 3339 UTC stamp (`2026-09-24T04:18:02.796Z`, as transcripts carry), via
-/// [`aterm_types::rfc3339::parse_utc_fractional`]: a zone offset is refused rather than read as
-/// UTC; a stamp before the epoch is `None`.
+/// Unix seconds of an RFC 3339 UTC stamp (`2026-09-24T04:18:02.796Z`, as transcripts carry), via [`aterm_types::rfc3339::parse_utc_fractional`].
 #[must_use]
 pub fn parse_utc(s: &str) -> Option<u64> {
     u64::try_from(aterm_types::rfc3339::parse_utc_fractional(s)?).ok()
 }
 
-/// Unix seconds of the last main-chain answer in a transcript tail (`None`:
-/// no answer in the tail).
+/// Unix seconds of the last main-chain answer in a transcript tail (`None`: no answer in the tail).
 #[must_use]
 pub fn last_answer_at(tail: &str) -> Option<u64> {
-    // From the end: the newest answer is the first one met.
     tail.lines()
         .rev()
         .filter(|l| l.contains("\"assistant\""))
@@ -1038,8 +911,7 @@ pub fn last_answer_at(tail: &str) -> Option<u64> {
         })
 }
 
-/// Unix seconds of a `ps -o lstart=` stamp in UTC, C locale — the session
-/// file's `procStart` (`Thu Sep 24 23:21:50 2026`).
+/// Unix seconds of a `ps -o lstart=` stamp in UTC, C locale — the session file's `procStart` (`Thu Sep 24 23:21:50 2026`).
 #[must_use]
 pub fn parse_lstart(s: &str) -> Option<u64> {
     let w: Vec<&str> = s.split_whitespace().collect();
@@ -1055,10 +927,7 @@ pub fn parse_lstart(s: &str) -> Option<u64> {
     parse_utc(&format!("{year:04}-{m:02}-{day:02}T{hms}Z"))
 }
 
-/// [`live_model`] for a process started at `started_s` with the launch's own
-/// `--model` (`launch`): when neither the last answer nor the last `/model`
-/// is newer than the process, what runs is the launch flag (a resumed
-/// conversation's transcript still names the previous process's model).
+/// [`live_model`] for a process started at `started_s` with the launch's own `--model` (`launch`).
 #[must_use]
 pub fn live_model_at(
     tail: &str,
@@ -1066,8 +935,6 @@ pub fn live_model_at(
     launch: Option<&str>,
     started_s: Option<u64>,
 ) -> Option<LiveModel> {
-    // A real id (`claude-<family>-<n>…`), not an alias (`opus`), which only
-    // the build resolves.
     let real = |m: &&str| is_model_id(m) && family_version(base_id(m)).is_some();
     if let (Some(launch), Some(started)) = (launch.filter(real), started_s)
         && newest_row_at(tail).is_none_or(|t| t < started)
@@ -1080,22 +947,16 @@ pub fn live_model_at(
     live_model(tail, baked)
 }
 
-/// The person's own Claude settings that bear on the model
-/// (`~/.claude/settings.json`): the saved default and the allowlist.
+/// The person's own Claude settings that bear on the model (`~/.claude/settings.json`): the saved default and the allowlist.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct UserModelSettings {
-    /// `model`: the default new sessions start on (an id or a family alias),
-    /// a choice of the person's, which the list never moves across families
-    /// ([`model_due`]).
+    /// `model`: the default new sessions start on (an id or a family alias), a choice of the person's, which the list never moves across families ([`model_due`]).
     pub default: Option<String>,
     /// `availableModels`: when present, the only models a session may use.
     pub allowed: Option<Vec<String>>,
 }
 
-/// Read [`UserModelSettings`] out of a settings file's text, parsed as Claude
-/// Code parses a settings document (the settings chain's one parse,
-/// `claude_settings::parse`: an empty or blank text is `{}`, a leading
-/// byte-order mark is dropped); anything malformed reads as absent.
+/// Parse [`UserModelSettings`] from a settings file's text via `claude_settings::parse`.
 #[must_use]
 pub fn parse_user_settings(text: &str) -> UserModelSettings {
     crate::supervise::policy::claude_settings::parse(text)
@@ -1103,10 +964,7 @@ pub fn parse_user_settings(text: &str) -> UserModelSettings {
         .unwrap_or_default()
 }
 
-/// [`UserModelSettings`] out of one parsed settings document `v`, or out of the values the
-/// settings chain gives each key (`upgrade_drive`'s `agent_settings`). An `availableModels` that
-/// is present but not a list is an empty allowlist, as Claude Code enforces it, never every model
-/// allowed.
+/// [`UserModelSettings`] out of one parsed settings document `v`, or out of the values the settings chain gives each key (`upgrade_drive`'s `agent_settings`).
 #[must_use]
 pub fn model_settings_of(v: &Value) -> UserModelSettings {
     UserModelSettings {
@@ -1129,8 +987,7 @@ pub fn model_settings_of(v: &Value) -> UserModelSettings {
     }
 }
 
-/// The list's target, the rule's second step ([`model_due`]): the best-ranked entry of `list` that
-/// `offered` holds (the `[1m]` tag ignored), as the list spells it.
+/// The list's target, the rule's second step ([`model_due`]).
 #[must_use]
 pub fn list_target<'a>(list: &'a Priority, offered: &[String]) -> Option<&'a str> {
     list.ids.iter().map(String::as_str).find(|id| {
@@ -1139,8 +996,7 @@ pub fn list_target<'a>(list: &'a Priority, offered: &[String]) -> Option<&'a str
     })
 }
 
-/// Whether the person's `availableModels` (`None`: they set none) admits
-/// `id`, as itself or in its `[1m]` form.
+/// Whether the person's `availableModels` (`None`: they set none) admits `id`, as itself or in its `[1m]` form.
 pub(crate) fn allowed_by(allowed: Option<&[String]>, id: &str) -> bool {
     allowed.is_none_or(|ok| {
         ok.iter()
@@ -1148,11 +1004,7 @@ pub(crate) fn allowed_by(allowed: Option<&[String]>, id: &str) -> bool {
     })
 }
 
-/// Every model a restart on the build `cc_version` may ask for, the candidates both steps of the
-/// rule choose among ([`family_successor`], then [`list_target`]): the build's own
-/// `latest_per_family` (so a new model needs no aterm release), then every list entry, each
-/// available ([`availability`]) and allowed by the person's `availableModels`. Bare ids (no
-/// `[1m]`), each once, in that order.
+/// Every model a restart on the build `cc_version` may ask for, the candidates both steps of the rule choose among ([`family_successor`], then [`list_target`]).
 #[must_use]
 pub fn offered(
     list: &Priority,
@@ -1178,16 +1030,7 @@ pub fn offered(
     out
 }
 
-/// The same-family resolver: the newest of `offered` in `current`'s own family
-/// ([`family_version`]), when strictly newer than `current`, with the `[1m]` context tag appended
-/// when `one_m` (`claude-opus-5[1m]` -> `claude-opus-5-5[1m]`). `None`, and nothing moves, for
-/// everything else:
-///
-/// * another family: never Sonnet -> Opus, never Opus -> Fable or Haiku;
-/// * an older or equal version: never down or sideways (a dated id is its undated version:
-///   `claude-haiku-4-5-20251001` is Haiku 4.5);
-/// * a `current` outside the grammar (a family alias `opus`, a provider's id `us.anthropic.…`, an
-///   older id `claude-3-5-sonnet-…`, a model newer than this reader): never guessed at.
+/// The same-family resolver.
 #[must_use]
 pub fn family_successor(current: &str, one_m: bool, offered: &[String]) -> Option<String> {
     let (family, version) = family_version(current)?;
@@ -1207,32 +1050,24 @@ pub fn family_successor(current: &str, one_m: bool, offered: &[String]) -> Optio
     })
 }
 
-/// What the harness remembers about one conversation's model, beside the
-/// per-conversation upgrade state (`<state>/upgrade/models/<session>.json`).
+/// What the harness remembers about one conversation's model, beside the per-conversation upgrade state (`<state>/upgrade/models/<session>.json`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ModelRecord {
-    /// Models this harness already moved the conversation to: never re-applied
-    /// (a person who moves away from one has decided).
+    /// Models this harness already moved the conversation to: never re-applied (a person who moves away from one has decided).
     pub applied: Vec<String>,
-    /// The model the harness last asked for (a relaunch's `--model`), and
-    /// when.
+    /// The model the harness last asked for (a relaunch's `--model`), and when.
     pub set: String,
     /// Unix seconds.
     pub set_at: u64,
-    /// Models this harness asked for (a relaunch's `--model`) that did not
-    /// become what runs: never asked for again.
+    /// Models this harness asked for (a relaunch's `--model`) that did not become what runs: never asked for again.
     pub failed: Vec<String>,
-    /// The model a person last chose for this conversation with `/model` (the
-    /// harness never types `/model`), remembered past the answers that follow
-    /// it: the list never moves that choice across families.
+    /// The model a person last chose for this conversation with `/model` (the harness never types `/model`), remembered past the answers that follow it.
     pub human: String,
     /// The screen sequence last seen, and since when (the quiet gate).
     pub last_seq: u64,
     /// Unix seconds.
     pub seq_since_s: u64,
-    /// The model a move has been due to, and since when (Unix seconds): the
-    /// clock [`MODEL_WARM_MAX_S`] bounds. Reset whenever the due target
-    /// changes, cleared when nothing is due.
+    /// The model a move has been due to, and since when (Unix seconds): the clock [`MODEL_WARM_MAX_S`] bounds.
     pub due_to: String,
     /// Unix seconds.
     pub due_since: u64,
@@ -1274,8 +1109,6 @@ impl ModelRecord {
                 .to_string(),
             last_seq: num("last_seq"),
             seq_since_s: num("seq_since_s"),
-            // Absent from older records: nothing due, so the clock starts on
-            // the first due visit.
             due_to: v
                 .get("due_to")
                 .and_then(Value::as_str)
@@ -1312,43 +1145,13 @@ pub enum ModelVerdict {
         /// The live model.
         from: String,
         /// The newest model of its family on offer ([`family_successor`],
-        /// `[1m]` kept), or, with none newer, the list's target
-        /// ([`list_target`]).
         to: String,
     },
     /// Leave it, and why (one word for the report).
     Keep(&'static str),
 }
 
-/// The model rule: same family first, then the priority list. Both steps choose among `offered`
-/// ([`offered`]), and neither ever moves a conversation down.
-///
-/// 1. **Its own family.** The newest offered model of the live model's family, strictly newer
-///    ([`family_successor`]), its `[1m]` window kept. This applies whoever chose the model: aterm
-///    cannot tell a deliberate pin from one made before the newer model existed (`/model` saves
-///    its choice as the default for every new session). With a newer model of the family on
-///    offer, nothing crosses families.
-/// 2. **Then the list**, only when nothing newer of its family is on offer: the list's target
-///    ([`list_target`]) when it is of another family, ranks above the live model, and nobody
-///    chose the live model (a launch `--model` this harness did not put there, a `/model` now or
-///    remembered, or a saved default of its family).
-///
-/// Each `Keep` word:
-///
-/// * `no-model-available`: nothing is offered;
-/// * `model-alias`: the launch's `--model` is a family alias (`opus`, `sonnet[1m]`) or a
-///   provider's id, carried verbatim;
-/// * `model-unknown`: what the conversation runs could not be read;
-/// * `model-unreadable`: it runs an id outside the grammar;
-/// * `model-applied-before`: the harness already moved it to that model once (a person who moved
-///   back has decided);
-/// * `model-failed-before`: that model was asked for once and did not take;
-/// * `model-current`: nothing newer of its family, and the list's target is none or of its own
-///   family;
-/// * `model-off-list`: nothing newer of its family, and the live model is not on the list;
-/// * `model-ranks-higher`: nothing newer of its family, and the list's target does not rank above
-///   the live model;
-/// * `model-chosen-by-hand`: nothing newer of its family, and a person chose the live model.
+/// The model rule: same family first, then the priority list.
 #[must_use]
 pub fn model_due(
     list: &Priority,
@@ -1370,11 +1173,7 @@ pub fn model_due(
     let Some((family, _)) = family_version(&live.id) else {
         return ModelVerdict::Keep("model-unreadable");
     };
-    // Never twice, never after a failure — for either step's target.
     let spent_on = |to: &str| spent(record, to).map(ModelVerdict::Keep);
-    // 1. Same family first. The 1M window rides the move: the live id's tag,
-    // or (a transcript names the bare API id) the launch `--model`'s, when
-    // that is the same family and no `/model` has chosen since.
     let tagged = |m: &str| m.ends_with("[1m]");
     let one_m = tagged(&live.id)
         || (!live.by_command
@@ -1386,8 +1185,6 @@ pub fn model_due(
             to,
         });
     }
-    // 2. Then the priority list: across families, up the list, for a model
-    // nobody chose.
     let Some(target) = list_target(list, offered) else {
         return ModelVerdict::Keep("model-current");
     };
@@ -1413,7 +1210,6 @@ pub fn model_due(
 }
 
 /// Never twice, never after a failure: `model-applied-before` when this harness already moved the
-/// conversation to `to`, `model-failed-before` when it asked for `to` once and it did not take.
 fn spent(record: &ModelRecord, to: &str) -> Option<&'static str> {
     if record.applied.iter().any(|a| base_id(a) == base_id(to)) {
         Some("model-applied-before")
@@ -1425,9 +1221,6 @@ fn spent(record: &ModelRecord, to: &str) -> Option<&'static str> {
 }
 
 /// Whether a person chose `live` (of `family`), which the list never moves across families: a
-/// launch `--model` this harness did not put there, a `/model` (now, or remembered,
-/// [`ModelRecord::human`]), or a saved default of that family (an id, or an alias like `opus`). A
-/// model this harness asked for ([`ModelRecord::set`]) is never a person's.
 fn chosen_by_hand(
     live: &LiveModel,
     family: &str,
@@ -1447,22 +1240,7 @@ fn chosen_by_hand(
         || default_model.is_some_and(|d| family_of(d) == family)
 }
 
-/// The ride's guard: whether `carried`, the model a notice of the upgrade carried (an announced
-/// round's, or a gave-up one's on a late READY), may still ride its round's restart, judged over
-/// this read's settled record and what runs now (`live`). `None`: it rides; else the
-/// [`model_due`] word that bars it. The rule's move laws, re-taken:
-///
-/// * never twice, never after a failure (`model-applied-before`, `model-failed-before`,
-///   [`spent`]), whatever the transcript shows;
-/// * a person's choice moves only within its family: a launch alias not at all (`model-alias`),
-///   across families only a model nobody chose (`model-chosen-by-hand`, [`chosen_by_hand`]);
-/// * up the list only: within the family only onto a newer model (`model-current`), across
-///   families only off a listed model (`model-off-list`) ranked below `carried`
-///   (`model-ranks-higher`); a live id outside the grammar is never guessed (`model-unreadable`).
-///
-/// Not re-read: the model ladder (the READY answer warms the cache, and re-deciding then would
-/// drop the model half-way) and the offer (the carried model rides an offer that moved since). A
-/// live model this read could not see (`None`) bars nothing the record does not.
+/// Whether `carried`, the model a notice of the upgrade carried, may still ride its round's restart given `live`.
 #[must_use]
 pub fn ride_bar(
     carried: &str,
@@ -1478,7 +1256,6 @@ pub fn ride_bar(
     if launch_model.is_some_and(|m| family_version(m).is_none()) {
         return Some("model-alias");
     }
-    // What runs unread: nothing more bars it.
     let live = live?;
     let (Some((family, version)), Some((to_family, to_version))) =
         (family_version(&live.id), family_version(carried))
@@ -1498,34 +1275,19 @@ pub fn ride_bar(
         .then_some("model-chosen-by-hand")
 }
 
-/// What one visit's read of the live model did to a conversation's
-/// [`ModelRecord`] ([`ModelRecord::settle`]).
+/// What one visit's read of the live model did to a conversation's [`ModelRecord`] ([`ModelRecord::settle`]).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Settled {
-    /// The model this harness asked for runs: recorded applied (the caller
-    /// says `model-verified`).
+    /// The model this harness asked for runs: recorded applied (the caller says `model-verified`).
     pub verified: Option<String>,
-    /// The model this harness asked for is still not what runs
-    /// [`MODEL_SETTLE_S`] after it was asked for: recorded failed and the ask
-    /// cleared (the caller says `model-failed`).
+    /// The model this harness asked for is still not what runs [`MODEL_SETTLE_S`] after it was asked for.
     pub failed: Option<String>,
-    /// The record changed (either of the above, or a `/model` remembered):
-    /// the caller saves it.
+    /// The record changed (either of the above, or a `/model` remembered): the caller saves it.
     pub changed: bool,
 }
 
 impl ModelRecord {
-    /// The settle step, taken on every visit that reads what the conversation runs (`live`, `None`
-    /// when unreadable) at `now`, before [`model_due`]:
-    ///
-    /// * the harness's ask ([`ModelRecord::set`]) that now runs is recorded applied;
-    /// * one not running [`MODEL_SETTLE_S`] after the ask (an unreadable live model counts as not
-    ///   running), and never applied, is recorded failed and the ask cleared;
-    /// * an ask once applied stands: a conversation that later runs something else (a person's
-    ///   `/model`) is not a failed relaunch, and the ask's `--model` on the process is never read
-    ///   as a person's choice;
-    /// * a `/model` newer than the last answer is a person's (the harness never types one) and is
-    ///   remembered ([`ModelRecord::human`]), so later answers do not end its protection.
+    /// The settle step, taken on every visit that reads what the conversation runs (`live`, `None` when unreadable) at `now`, before [`model_due`].
     pub fn settle(&mut self, live: Option<&LiveModel>, now: u64) -> Settled {
         let mut out = Settled::default();
         let applied =
@@ -1557,15 +1319,7 @@ impl ModelRecord {
         out
     }
 
-    /// Step the due clock ([`ModelRecord::due_to`], [`ModelRecord::due_since`]) by `verdict` at
-    /// `now`. A `Due` restarts it when the target changes, it has no start, or its start is ahead
-    /// of `now` (the wall clock stepped back). A `Keep` clears it, so a move that comes back never
-    /// inherits a stale clock; `model-unknown` (a tail with no answer, which a long tool result can
-    /// cause for many visits) leaves it as it was, since clearing on every flicker could keep the
-    /// move from ever landing.
-    ///
-    /// Returns the seconds the current move has been due (0 when none is) and whether the record
-    /// changed.
+    /// Step the due clock ([`ModelRecord::due_to`], [`ModelRecord::due_since`]) by `verdict` at `now`.
     pub fn due_clock(&mut self, verdict: &ModelVerdict, now: u64) -> (u64, bool) {
         match verdict {
             ModelVerdict::Due { to, .. } => {
@@ -1590,9 +1344,7 @@ impl ModelRecord {
         }
     }
 
-    /// Record `model` as this conversation's ask at `now`, right before the relaunch line is
-    /// typed, so it is never asked twice (one not taken settles as failed,
-    /// [`ModelRecord::settle`]). Returns what it replaced, for [`ModelRecord::take_back`].
+    /// Record `model` as this conversation's ask at `now`, right before the relaunch line is typed, so it is never asked twice (one not taken settles as failed, [`ModelRecord::settle`]).
     pub fn asked(&mut self, model: &str, now: u64) -> Asked {
         Asked {
             model: model.to_string(),
@@ -1602,10 +1354,7 @@ impl ModelRecord {
         }
     }
 
-    /// Undo [`ModelRecord::asked`] when its relaunch line was not typed (a wait, a refusal): the
-    /// ask it replaced stands again. Kept, it would settle as failed [`MODEL_SETTLE_S`] later
-    /// though no relaunch asked it, barring the model for good ([`spent`], [`ride_bar`]). A no-op
-    /// once a later write replaced the ask.
+    /// Undo [`ModelRecord::asked`] when its relaunch line was not typed (a wait, a refusal): the ask it replaced stands again.
     pub fn take_back(&mut self, asked: Asked) {
         if self.set == asked.model && self.set_at == asked.at {
             self.set = asked.before;
@@ -1614,8 +1363,7 @@ impl ModelRecord {
     }
 }
 
-/// An ask [`ModelRecord::asked`] recorded, and the one it replaced: what
-/// [`ModelRecord::take_back`] undoes.
+/// An ask [`ModelRecord::asked`] recorded, and the one it replaced: what [`ModelRecord::take_back`] undoes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Asked {
     model: String,
@@ -1624,8 +1372,7 @@ pub struct Asked {
     before_at: u64,
 }
 
-/// What one visit reads a conversation's model against ([`model_read_step`]), for the build the
-/// session runs (the managed build, or the native one for a session that runs it).
+/// What one visit reads a conversation's model against ([`model_read_step`]), for the build the session runs (the managed build, or the native one for a session that runs it).
 #[derive(Debug, Clone, Copy)]
 pub struct ModelView<'a> {
     /// The priority list.
@@ -1642,9 +1389,7 @@ pub struct ModelView<'a> {
     pub started_s: Option<u64>,
     /// The wall clock, Unix seconds.
     pub now: u64,
-    /// The model a notice of the upgrade carried, which a restart of its round still asks for (an
-    /// announced round's, or a gave-up one's on a late READY: `upgrade_drive::St::carried_model`),
-    /// re-judged by [`ride_bar`]; `None` for every other read.
+    /// The model a notice of the upgrade carried, which a restart of its round still asks for (an announced round's, or a gave-up one's on a late READY: `upgrade_drive::St::carried_model`), re-judged by [`ride_bar`].
     pub carried: Option<&'a str>,
 }
 
@@ -1653,37 +1398,19 @@ pub struct ModelView<'a> {
 pub struct ModelReadStep {
     /// The model rule's verdict ([`model_due`]).
     pub verdict: ModelVerdict,
-    /// The conversation's prompt cache is cold (no answer for
-    /// [`CACHE_COLD_S`]).
+    /// The conversation's prompt cache is cold (no answer for [`CACHE_COLD_S`]).
     pub cold: bool,
-    /// Seconds the current due move has been due (0 when none is) — the clock
-    /// [`MODEL_WARM_MAX_S`] bounds ([`ModelRecord::due_clock`]).
+    /// Seconds the current due move has been due (0 when none is) — the clock [`MODEL_WARM_MAX_S`] bounds ([`ModelRecord::due_clock`]).
     pub due_for_s: u64,
-    /// What the settle step recorded ([`ModelRecord::settle`]): the caller
-    /// ledgers `model-verified` / `model-failed`.
+    /// What the settle step recorded ([`ModelRecord::settle`]): the caller ledgers `model-verified` / `model-failed`.
     pub settled: Settled,
-    /// The record changed (the settle step, or the clock): the caller saves
-    /// it.
+    /// The record changed (the settle step, or the clock): the caller saves it.
     pub changed: bool,
-    /// The [`ride_bar`] word why the carried model ([`ModelView::carried`]) no longer rides its
-    /// round's restart (the caller drops it and ledgers why); `None` when it rides or none was
-    /// carried.
+    /// The [`ride_bar`] word why the carried model ([`ModelView::carried`]) no longer rides its round's restart (the caller drops it and ledgers why).
     pub ride_barred: Option<&'static str>,
 }
 
-/// One visit's read of a conversation's model, over `record` (changed in place) and `view`:
-///
-/// * with nothing offered, no ask on the record and no carried model: `no-model-available`, the
-///   due clock cleared (a move that comes back must not inherit this one's start), the
-///   transcript not read;
-/// * else `tail` says what runs ([`live_model_at`]), [`ModelRecord::settle`] records what the
-///   harness asked for, [`model_due`] judges the settled record and [`ride_bar`] the carried
-///   model, the cache is cold after [`CACHE_COLD_S`] without an answer ([`last_answer_at`]), and
-///   [`ModelRecord::due_clock`] steps by the verdict.
-///
-/// A carried model reads the transcript even on an empty offer, so a `/model` typed since the
-/// notice is seen before a restart asks for it. This is `upgrade_drive::model_read_for` minus its
-/// I/O, so the derived model `HarnessModelSwitch` binds the read itself at Tier 1.
+/// One visit's read of a conversation's model, over `record` (changed in place) and `view`.
 pub fn model_read_step<S: AsRef<str>>(
     record: &mut ModelRecord,
     view: &ModelView<'_>,
@@ -1736,15 +1463,7 @@ pub fn model_read_step<S: AsRef<str>>(
     }
 }
 
-/// The model a restart of this conversation asks for (`--model` on its relaunch), or `None`:
-///
-/// * an announced model (the upgrade already told the agent it is moving to it) rides whatever
-///   the model ladder says now: the READY answer warms the cache again, and re-deciding then
-///   would drop the model half-way. A read that bars it ([`ride_bar`]) drops it from the
-///   upgrade's state first, so it never reaches here;
-/// * else a due move ([`model_due`]) when the ladder ([`model_moves_now`]) takes it now
-///   (`build_restart`: the restart happens regardless, for a newer build or another reason);
-/// * else none.
+/// The model a restart of this conversation asks for (`--model` on its relaunch), or `None`.
 #[must_use]
 pub fn model_to(
     announced: Option<&str>,
@@ -1766,20 +1485,13 @@ pub fn model_to(
     }
 }
 
-/// The launch's `--model` a relaunch keeps: `launch` (`upgrade::launch_model`) unless the record
-/// marks it failed ([`ModelRecord::failed`]), which no relaunch carries again. A `--model` the
-/// record never asked for (a person's own id, any alias) is kept. The record cannot tell a
-/// person's later relaunch with the same id from this harness's, so a failed model is dropped
-/// either way and the saved default runs.
+/// The launch's `--model` a relaunch keeps.
 #[must_use]
 pub fn launch_model_kept<'a>(launch: Option<&'a str>, record: &ModelRecord) -> Option<&'a str> {
     launch.filter(|m| !record.failed.iter().any(|f| base_id(f) == base_id(m)))
 }
 
-/// The model a relaunch line asks for (`relaunch::Launch::model`): `asks` when the site has one;
-/// else `Some("")` (drop `--model`, so the saved default runs) where the launch's `--model` is not
-/// kept ([`launch_model_kept`]); else `None`, the launch's flags verbatim. Every relaunch line is
-/// planned through it (`relaunch::plan`).
+/// The model a relaunch line asks for (`relaunch::Launch::model`): `asks` when the site has one.
 #[must_use]
 pub fn line_model<'a>(
     asks: Option<&'a str>,
@@ -1789,10 +1501,7 @@ pub fn line_model<'a>(
     asks.or_else(|| (launch.is_some() && launch_model_kept(launch, record).is_none()).then_some(""))
 }
 
-/// Why a relaunch moves from `before` (the model the conversation ran) to `to`, read back from the
-/// two ids: [`model_due`] crosses families only by the list's step, so the same family means the
-/// first step and another family the list's. `Unknown` when either id is outside the grammar or
-/// `before` is not known.
+/// Why a relaunch moves from `before` (the model the conversation ran) to `to`, read back from the two ids.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MoveWhy {
     /// The newest model of the conversation's own family.
@@ -1895,9 +1604,6 @@ mod tests {
 
     #[test]
     fn an_id_outside_the_grammar_or_the_list_is_never_admitted() {
-        // The writer's other refusals (older than the family's best, unknown
-        // to the build, already listed) are the Tier-1 bind's
-        // (`tests/conformance_upgrade_models/priority.rs`).
         let mut p = Priority::seed(0);
         assert_eq!(p.admit("claude-opus-6;ls", "x", &|_| true, 1), None);
         assert_eq!(p.admit("claude-mythos-5", "x", &|_| true, 1), None);
@@ -1920,19 +1626,15 @@ mod tests {
         let p = Priority::seed(0);
         let (best, _) = target(&p, "2.1.280", &ev, None);
         assert_eq!(best, Some("claude-opus-5-5"));
-        // An older Claude Code cannot take Opus 5.5 (min 2.1.280).
         let (best, verdicts) = target(&p, "2.1.278", &ev, None);
         assert_eq!(best, Some("claude-fable-5-1"));
         assert_eq!(
             verdicts[0].1,
             Availability::No("needs Claude Code 2.1.280".into())
         );
-        // Denied by the account.
         ev.denied = vec!["claude-opus-5-5".into(), "claude-fable-5-1".into()];
         assert_eq!(target(&p, "2.1.280", &ev, None).0, Some("claude-opus-5"));
         assert!(!availability("claude-opus-4-1", "2.1.280", &ev, None).ok());
-        // No served catalog: the build's own catalog is the evidence; with
-        // neither, nothing is available.
         let none = Evidence::default();
         assert_eq!(target(&p, "2.1.280", &none, None).0, None);
         let b = baked(&["claude-fable-5-1"], &[]);
@@ -1990,7 +1692,6 @@ mod tests {
             live_model(&tail, Some(&b)).map(|l| l.id),
             Some("claude-opus-5".into())
         );
-        // A /model after the last answer is what runs now, and it was chosen.
         let tail = [answer("claude-opus-5"), set_model("claude-fable-5-1")].join("\n");
         assert_eq!(
             live_model(&tail, Some(&b)),
@@ -1999,17 +1700,13 @@ mod tests {
                 by_command: true
             })
         );
-        // ...but an answer after it supersedes it.
         let tail = [set_model("claude-fable-5-1"), answer("claude-fable-5-1")].join("\n");
         assert!(!live_model(&tail, Some(&b)).expect("an answer").by_command);
-        // A display the build does not know is not guessed.
         let tail = [answer("claude-opus-5"), set_model("Mystery 9")].join("\n");
         assert_eq!(live_model(&tail, Some(&b)), None);
     }
 
     /// Only Claude's own result row is a `/model` choice: the phrase quoted in
-    /// an answer, a tool's output or a person's prompt is text, and the answer
-    /// that quotes it is still an answer.
     #[test]
     fn a_quoted_model_result_is_text_not_a_choice() {
         let b = baked(
@@ -2040,7 +1737,6 @@ mod tests {
                 "{text}"
             );
         }
-        // The older builds' ANSI-bold result is still a result.
         let bold = "{\"type\":\"user\",\"message\":{\"content\":\"<local-command-stdout>Set model to \\u001b[1mclaude-fable-5-1\\u001b[22m and saved as your default</local-command-stdout>\"}}";
         let tail = [answer("claude-opus-5"), bold.to_string()].join("\n");
         assert_eq!(
@@ -2066,13 +1762,10 @@ mod tests {
             "claude-opus-5",
         ]);
         let next = |current: &str, one_m: bool| family_successor(current, one_m, &offered);
-        // Opus 5 -> Opus 5.5.
         assert_eq!(
             next("claude-opus-5", false).as_deref(),
             Some("claude-opus-5-5")
         );
-        // The 1M window rides the move, whether the id carried it or the
-        // caller says so; a tag on an offered id is not what decides it.
         assert_eq!(
             next("claude-opus-5[1m]", true).as_deref(),
             Some("claude-opus-5-5[1m]")
@@ -2081,7 +1774,6 @@ mod tests {
             family_successor("claude-opus-5", false, &ids(&["claude-opus-5-5[1m]"])).as_deref(),
             Some("claude-opus-5-5")
         );
-        // An older major of the family moves too; a dated id is its version.
         assert_eq!(
             next("claude-opus-4-1", false).as_deref(),
             Some("claude-opus-5-5")
@@ -2090,7 +1782,6 @@ mod tests {
             next("claude-sonnet-4-20250514", false).as_deref(),
             Some("claude-sonnet-5-5")
         );
-        // The newest of the family, whatever order the candidates come in.
         assert_eq!(
             family_successor(
                 "claude-opus-5",
@@ -2100,7 +1791,6 @@ mod tests {
             .as_deref(),
             Some("claude-opus-5-6")
         );
-        // Never across families, whatever else is on offer.
         assert_eq!(
             family_successor("claude-sonnet-5", false, &ids(&["claude-opus-5-5"])),
             None
@@ -2113,7 +1803,6 @@ mod tests {
             ),
             None
         );
-        // Never down, never sideways.
         assert_eq!(next("claude-opus-5-5", false), None, "already the newest");
         assert_eq!(
             next("claude-opus-6", false),
@@ -2129,8 +1818,6 @@ mod tests {
             None,
             "the dated and undated ids are one version"
         );
-        // Never guessed: an alias, a provider's id, an id from before the
-        // grammar, a shape this reader does not know, another vendor's.
         for current in [
             "opus",
             "sonnet[1m]",
@@ -2146,9 +1833,6 @@ mod tests {
     }
 
     /// Where "newest of the family" comes from: the installed build's own
-    /// `latest_per_family` (so a family the list never named, Sonnet here,
-    /// still moves) and the list, each only when the build knows it and the
-    /// account may run it. Nothing the build does not know is offered.
     #[test]
     fn what_is_offered_is_what_the_installed_build_knows_and_the_person_allows() {
         let list = Priority::seed(0);
@@ -2183,7 +1867,6 @@ mod tests {
             Some("claude-sonnet-5-5"),
             "a family off the list moves by the build's own word"
         );
-        // A listed id the build does not know is not offered (never guessed).
         let hand = Priority {
             ids: ids(&["claude-opus-5-6", "claude-opus-5-5"]),
             history: vec![],
@@ -2191,7 +1874,6 @@ mod tests {
         assert!(
             !offered(&hand, "2.1.283", &none, Some(&b), None).contains(&"claude-opus-5-6".into())
         );
-        // Denied for the account, or outside the person's availableModels.
         let denied = Evidence {
             denied: ids(&["claude-opus-5-5"]),
             ..Evidence::default()
@@ -2204,12 +1886,10 @@ mod tests {
             offered(&list, "2.1.283", &none, Some(&b), Some(&only)),
             ["claude-opus-5-5"]
         );
-        // No catalog at all: nothing is offered.
         assert!(offered(&list, "2.1.283", &none, None, None).is_empty());
     }
 
     /// Step 1, same family first: whatever the list ranks, a newer model of
-    /// the conversation's own family on offer is the move.
     #[test]
     fn the_model_rule_moves_within_the_family_first() {
         let list = Priority::seed(0);
@@ -2238,14 +1918,10 @@ mod tests {
                 &none,
             )
         };
-        // No --model, the transcript on Opus 5, the build's newest Opus is
-        // Opus 5.5.
         assert_eq!(
             rule("claude-opus-5", false, None),
             due("claude-opus-5", "claude-opus-5-5")
         );
-        // An exact id the launch named moves the same way (a pin cannot be
-        // told from a stale one), and so does a /model and a saved default.
         assert_eq!(
             rule("claude-opus-5", false, Some("claude-opus-5")),
             due("claude-opus-5", "claude-opus-5-5")
@@ -2268,14 +1944,10 @@ mod tests {
                 "{default}"
             );
         }
-        // A family the list never named moves by the build's own newest.
         assert_eq!(
             rule("claude-sonnet-5", false, None),
             due("claude-sonnet-5", "claude-sonnet-5-5")
         );
-        // Negative control for the order: a hand list that ranks Fable 5.1
-        // above Opus 5.5 (the list's step alone would take Opus 5 to Fable). A
-        // newer Opus is on offer, so the move stays in the family.
         let fable_first = Priority {
             ids: ids(&["claude-fable-5-1", "claude-opus-5-5", "claude-opus-5"]),
             history: vec![],
@@ -2292,9 +1964,6 @@ mod tests {
             ),
             due("claude-opus-5", "claude-opus-5-5")
         );
-        // The 1M window: kept from the live id, or from the launch flag the
-        // transcript's bare API id stands for, but not from a launch of
-        // another family, nor once a /model chose since.
         assert_eq!(
             rule("claude-opus-5[1m]", true, None),
             due("claude-opus-5[1m]", "claude-opus-5-5[1m]")
@@ -2311,15 +1980,10 @@ mod tests {
             rule("claude-opus-5", true, Some("claude-opus-5[1m]")),
             due("claude-opus-5", "claude-opus-5-5")
         );
-        // Already the newest of its family, and the newest ranks first: no
-        // move, and never down or sideways.
         assert_eq!(
             rule("claude-opus-5-5[1m]", false, None),
             ModelVerdict::Keep("model-current")
         );
-        // An alias is kept: it already names the newest of its family, by the
-        // build's own table, and the relaunch carries it verbatim. So is any
-        // launch id this grammar does not read.
         for alias in ["opus", "sonnet[1m]", "us.anthropic.claude-opus-5-v1:0"] {
             assert_eq!(
                 rule("claude-opus-5", false, Some(alias)),
@@ -2327,7 +1991,6 @@ mod tests {
                 "{alias}"
             );
         }
-        // Unknown ids are untouched.
         assert_eq!(
             rule("us.anthropic.claude-opus-5-v1:0", false, None),
             ModelVerdict::Keep("model-unreadable")
@@ -2347,8 +2010,6 @@ mod tests {
             ),
             ModelVerdict::Keep("no-model-available")
         );
-        // Never twice, never after a failure — and a same-family move spent
-        // that way never falls through to the list's step (Fable here).
         let applied = ModelRecord {
             applied: ids(&["claude-opus-5-5"]),
             ..ModelRecord::default()
@@ -2382,8 +2043,6 @@ mod tests {
     }
 
     /// Step 2, then the priority list: only when nothing newer of its family
-    /// is on offer, a model nobody chose moves up the list across families,
-    /// and a deliberate choice never does.
     #[test]
     fn with_nothing_newer_in_its_family_the_list_moves_only_a_model_nobody_chose() {
         let list = Priority::seed(0);
@@ -2396,8 +2055,6 @@ mod tests {
             from: from.into(),
             to: to.into(),
         };
-        // Opus 5.5 not on offer (denied, say): nothing newer of Opus 5's
-        // family, and the list ranks Fable 5.1 above Opus 5.
         let no_opus55 = ids(&["claude-fable-5-1", "claude-opus-5"]);
         assert_eq!(
             model_due(
@@ -2410,17 +2067,12 @@ mod tests {
             ),
             due("claude-opus-5", "claude-fable-5-1")
         );
-        // A Fable 5.1 nobody chose, the newest Fable there is, moves up to the
-        // Opus 5.5 the list ranks above it.
         let offer = ids(&["claude-opus-5-5", "claude-fable-5-1", "claude-opus-5"]);
         let fable = |by_command: bool| live("claude-fable-5-1", by_command);
         assert_eq!(
             model_due(&list, Some(&fable(false)), &offer, None, None, &none),
             due("claude-fable-5-1", "claude-opus-5-5")
         );
-        // ...and so does one the harness itself put there (its own earlier
-        // `--model`, the record's `set`), and one whose saved default is of
-        // another family.
         let ours = ModelRecord {
             set: "claude-fable-5-1".into(),
             ..ModelRecord::default()
@@ -2443,10 +2095,6 @@ mod tests {
             ),
             due("claude-fable-5-1", "claude-opus-5-5")
         );
-        // A deliberate choice never moves across: a launch --model the harness
-        // did not put there, a /model now, a /model remembered past its
-        // answers, the saved default of the live model's family (an id or an
-        // alias), and a launch alias, kept as it is.
         let remembered = ModelRecord {
             human: "claude-fable-5-1".into(),
             ..ModelRecord::default()
@@ -2483,7 +2131,6 @@ mod tests {
             ),
             ModelVerdict::Keep("model-alias")
         );
-        // Never down. The live model ranks first: nothing above it.
         assert_eq!(
             model_due(
                 &list,
@@ -2495,8 +2142,6 @@ mod tests {
             ),
             ModelVerdict::Keep("model-ranks-higher")
         );
-        // A hand list that ranks an older model of the live model's own family
-        // first: that is a step down, never taken.
         let older_first = Priority {
             ids: ids(&["claude-opus-5", "claude-opus-5-5", "claude-fable-5-1"]),
             history: vec![],
@@ -2512,7 +2157,6 @@ mod tests {
             ),
             ModelVerdict::Keep("model-current")
         );
-        // A model the list does not name is left alone.
         assert_eq!(
             model_due(
                 &list,
@@ -2524,7 +2168,6 @@ mod tests {
             ),
             ModelVerdict::Keep("model-off-list")
         );
-        // Nothing of another family on offer: nothing moves.
         assert_eq!(
             model_due(
                 &list,
@@ -2536,7 +2179,6 @@ mod tests {
             ),
             ModelVerdict::Keep("model-current")
         );
-        // Never twice, never after a failure, for the list's target too.
         for record in [
             ModelRecord {
                 applied: ids(&["claude-opus-5-5"]),
@@ -2555,8 +2197,6 @@ mod tests {
     }
 
     /// Why, in the notices: a move within the family is the family's, a move
-    /// across it can only be the list's, and an id outside the grammar says
-    /// neither.
     #[test]
     fn the_reason_a_move_is_said_with_is_read_from_the_two_ids() {
         assert_eq!(
@@ -2595,7 +2235,6 @@ mod tests {
     }
 
     /// A record without the due clock parses with nothing due, so the first due visit starts the
-    /// clock instead of reading zero as due since 1970.
     #[test]
     fn a_record_without_the_due_clock_parses_as_nothing_due() {
         let old = r#"{"applied":[],"set":"","set_at":0,"failed":[],"human":"","last_seq":3,"seq_since_s":4}"#;
@@ -2610,7 +2249,6 @@ mod tests {
         assert_eq!(parse_utc("2026-09-24T04:18:02.796Z"), Some(1_790_223_482));
         assert_eq!(parse_utc("2026-13-01T00:00:00Z"), None);
         assert_eq!(parse_utc("garbage"), None);
-        // An offset is refused, never read as UTC.
         assert_eq!(parse_utc("2026-09-24T04:18:02+05:30"), None);
         assert_eq!(parse_utc("2026-09-24T04:18:02.796"), None);
         assert_eq!(parse_utc("2026-09-24T04:18:02Z"), Some(1_790_223_482));
@@ -2633,8 +2271,6 @@ mod tests {
     }
 
     /// A hand-chosen model replaces the launch's `--model`: a `/model` newer than the last answer
-    /// as its display maps (1M window included), or the recorded choice while it still runs. Not
-    /// when it is the launch's own, nobody chose it, or it no longer runs.
     #[test]
     fn a_model_chosen_by_hand_is_carried_only_where_it_is_not_the_launchs() {
         let live = |id: &str, by_command: bool| LiveModel {
@@ -2678,8 +2314,6 @@ mod tests {
     }
 
     /// Launched `--model opus`, a `/model` pick of what `opus` names is no hand choice (carrying it
-    /// would pin the full id). A pick the alias does not name is carried, and so is any pick when
-    /// no catalog resolves the alias.
     #[test]
     fn a_pick_of_what_the_launch_alias_names_is_no_hand_choice() {
         let live = |id: &str, by_command: bool| LiveModel {
@@ -2738,8 +2372,6 @@ mod tests {
     }
 
     /// A `/model` or recorded choice older than the process is not this process's hand choice (a
-    /// launch alias leaves [`live_model_at`] no flag to read instead). Controls: the same `/model`
-    /// after the start is carried; with no start known the newest `/model` stands.
     #[test]
     fn a_model_command_older_than_the_process_is_no_hand_choice() {
         let b = baked(
@@ -2794,18 +2426,15 @@ mod tests {
         assert_eq!(parse_lstart("garbage"), None);
         let old = r#"{"type":"assistant","isSidechain":false,"timestamp":"2026-09-24T03:08:57.061Z","message":{"model":"claude-opus-5-5"}}"#;
         let started = parse_utc("2026-09-24T23:00:00Z");
-        // Resumed with --model claude-opus-5 after the last answer: that runs.
         assert_eq!(
             live_model_at(old, None, Some("claude-opus-5"), started).map(|l| l.id),
             Some("claude-opus-5".into())
         );
-        // An answer from this process names what runs.
         let started_before = parse_utc("2026-09-24T01:00:00Z");
         assert_eq!(
             live_model_at(old, None, Some("claude-opus-5"), started_before).map(|l| l.id),
             Some("claude-opus-5-5".into())
         );
-        // An alias is not a model id: the transcript stands.
         assert_eq!(
             live_model_at(old, None, Some("opus"), started).map(|l| l.id),
             Some("claude-opus-5-5".into())
@@ -2813,7 +2442,6 @@ mod tests {
     }
 
     /// `settings.json` is parsed as Claude Code parses it: a leading byte-order mark is dropped, so
-    /// a marked file's allowlist and default count; an empty or blank file sets nothing.
     #[test]
     fn a_marked_settings_file_keeps_its_allowlist_and_default() {
         let u = parse_user_settings(
@@ -2854,13 +2482,6 @@ mod tests {
     }
 
     /// THE PLANS THAT BILL A MODEL TO USAGE CREDITS ([`credits_billed`]): Fable
-    /// on credits only, or past the date the plan's Fable limits end — and,
-    /// failing closed (the review of 2026-10-19, P4), where that date or the
-    /// plan did not read; a family a stored consent bills with no dialog, or
-    /// that `tengu_calm_seal` bills to credits only (P1) — by id or by alias
-    /// ([`billed_to_credits`]). NEGATIVE CONTROLS: a date still ahead and a
-    /// plan that includes Fable bill none; a consent the profile stores as
-    /// `false` bills none; another family is never billed.
     #[test]
     fn a_plan_bills_fable_to_usage_credits_only_where_its_profile_says() {
         use super::super::profile::{FablePlan, parse};
@@ -2877,7 +2498,6 @@ mod tests {
         for none in [FablePlan::LimitsEnd(Some(now + 1)), FablePlan::Included] {
             assert!(!fable_billed(&none, now), "{none:?}");
         }
-        // A Max plan whose flags include Fable, with consents stored.
         let profile = |extra: &str| {
             parse(
                 format!(
@@ -2930,8 +2550,6 @@ mod atomic_write_tests {
     }
 
     /// Each atomic write names its flush (aterm-durable's counting seam): the plain
-    /// one stays durable, the ordered one and the seeding of an absent list are only
-    /// ordered, and a list that is present is read, not written.
     #[test]
     fn the_atomic_writes_name_their_flush() {
         use aterm_durable::{Flush, seam::Recording};

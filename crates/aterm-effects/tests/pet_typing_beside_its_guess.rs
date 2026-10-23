@@ -2,29 +2,6 @@
 // Copyright 2026 Andrew Yates
 
 //! The pet types beside its guess.
-//!
-//! While the person types, the native host paints each letter before the program
-//! echoes it (predictive echo) and reserves the guessed cells from the pet: the
-//! caret's own cell, one cell left of the escort's seat. A body whose pose widens
-//! (waking, a landing squash) overhangs that cell by a sliver. Reserved as a
-//! PROTECTED surface, the guess made the pet's step-aside throw the body up onto a
-//! border rule, down under the composer or three columns ahead in one frame, and the
-//! echo a few milliseconds later turned the cell back into ink and the chase pulled
-//! it home: on every keystroke. That was the owner's "jumping and jittering" cat
-//! (2026-10-20, Claude Code generating while a long prompt was typed).
-//!
-//! The guess is the person's own ink, early, and is reserved as ink
-//! (`PetReserve::ink`). These laws replay Claude Code's recorded bytes through a real
-//! `Terminal` and the shipping `CompanionOwner`, presented every 8 ms (a 120 Hz
-//! display) under the native host's frame hold, with the guess the host's predictor
-//! reports (`pending_bounds`: each typed letter at the caret, until the echo moves
-//! the cursor past it). [`Reserve::Protected`] reserves the same cells as the host
-//! did before: the negative control.
-//!
-//! The same replay host measures the legs (the gait art drawn while typing,
-//! at 120 and 60 Hz and with a slow echo), the composer growing a line under a
-//! cat beside the host's footer chips (the chips reserved as the host reserves
-//! them), and the bound across the composer's wrap.
 
 use std::time::{Duration, Instant};
 
@@ -48,12 +25,10 @@ const CH: u16 = 28;
 /// The pet's top chase speed (`kitty_pet::MAX_SPEED`, columns per second).
 const MAX_SPEED: f32 = 26.0;
 /// The fastest the pet ever gallops (`kitty_pet::TOP_SPEED_MAX`, columns per
-/// second): the chase follows a live caret run's pace past [`MAX_SPEED`].
 const TOP_SPEED: f32 = 48.0;
 /// A gait's art drawn again this soon after the cat left it is a flicker.
 const FLICKER_MS: u64 = 350;
 /// An unconfirmed guess expires (`aterm_predict`'s `GLITCH_FLOOR_MS`, the
-/// window's floor on a local link).
 const GUESS_EXPIRY_MS: u64 = 250;
 
 struct Take {
@@ -64,12 +39,6 @@ struct Take {
 }
 
 /// Claude Code typing takes. The owner's case first: Claude Code 2.1.304 generating
-/// (its spinner repainting every ~100 ms) while a 220-character prompt is typed at
-/// ~9 keys/s and wraps at the right edge, then typing after the turn (40x120,
-/// recorded 2026-10-20 in the jailed real-Claude lab against its stub API, each key
-/// stamped when aterm had written it). Then a line typed at 12 cps (2.1.278,
-/// 40x120), a line typed across the composer's wrap (2.1.280, 40x120), and the
-/// owner's 175-key mid-line insert (60x146).
 const TAKES: [Take; 4] = [
     Take {
         name: "generating",
@@ -107,40 +76,20 @@ enum Reserve {
 }
 
 /// One replay's host: how it reserves the guess, its display, the program's
-/// echo latency, and whether aterm's footer chips sit on the composer's rule.
 #[derive(Clone, Copy, Debug)]
 struct Knobs {
     reserve: Reserve,
     /// The display's frame interval: 8 ms is 120 Hz, 16 ms 60 Hz.
     frame_ms: u64,
     /// The program's output arrives this much later than recorded (a slow
-    /// echo, a remote link).
     echo_ms: u64,
     /// The host's footer chips (`claude_footer`: model, folder, branch, cost)
-    /// spliced right-aligned into the composer's bottom rule and reserved as
-    /// protected chrome, as `pet_chrome` reserves them: the last
-    /// [`CHIPS_COLS`] cells before the rule's last.
     chips: bool,
     /// The harness on: its tint over the composer's top rule, the CLI's
-    /// lockup `    claude ` (the icon's sprite over its two blank cells, and
-    /// the name) written at its left and the lit switch ` alab harness ●
-    /// on ` at its right (`claude_footer::compose_top` repaints the rule's
-    /// whole run). `pet_chrome` reserves the lockup and the switch as
-    /// protected chrome and leaves the tinted strokes the rule they are
-    /// (`PetChrome::note_painted`). The composer's first line sits under
-    /// that rule, and a 1.7-row body standing on it reaches into it.
     brand: bool,
     /// The composer's upper rule reserved from end to end, as the host
-    /// reserved its tint until 2026-10-20 (`PetChrome::note_painted`): no
-    /// stand on the composer's first line, so the cat rests under the
-    /// composer while it is typed, beside the chips. Since the escort
-    /// passes under the host's chrome over its line
-    /// (`PetBrain::console_escorting`) it walks that line instead.
     rule_walled: bool,
     /// The composer's first line itself reserved from end to end: no stand
-    /// on it for the escort either, so the cat rests under the composer,
-    /// beside the chips, as `rule_walled` sent it until the escort passed
-    /// under the chrome over its line.
     line_walled: bool,
 }
 
@@ -158,13 +107,9 @@ impl Knobs {
 }
 
 /// The footer chips' width: `◆ Opus 5.5 xhigh ⌂ ~/aterm ⎇ main Σ $1.23` and
-/// their gaps, as the owner's footer writes them at 120 columns.
 const CHIPS_COLS: u16 = 57;
 
 /// The CLI's lockup on the composer's top rule, `    claude ` (a pad, the
-/// icon's two cells, a pad, the name, a pad), from the rule's third column,
-/// and its lit switch, ` alab harness ● on `, two columns short of the
-/// rule's end (`claude_footer::compose_top`, `switch_face`).
 const BRAND_MARK_COLS: u16 = 11;
 const BRAND_SWITCH_COLS: u16 = 19;
 
@@ -198,7 +143,6 @@ struct Host {
     vsync: Instant,
     hold: FrameHold,
     /// Pending guesses, oldest first: `(row, col, armed ms)` of each typed
-    /// letter.
     guesses: Vec<(u16, u16, u64)>,
     shots: Vec<Shot>,
     input: Option<(u64, RenderInput)>,
@@ -207,7 +151,6 @@ struct Host {
 impl Host {
     fn new(take: &Take, knobs: Knobs) -> Self {
         let mut term = Terminal::new(take.rows, take.cols);
-        // A presented host resolves its default background.
         term.process(b"\x1b]11;#000000\x07");
         let mut owner = CompanionOwner::default();
         owner.set_enabled_seed(true, 0x5EED);
@@ -277,8 +220,6 @@ impl Host {
     }
 
     /// Program output; a guess leaves when the echo moves the cursor past it
-    /// (a submit, which these keys do not carry, moves it to another row or back
-    /// to the line's start; its guesses expire).
     fn feed(&mut self, bytes: &[u8]) {
         let at = ClockReading {
             monotonic: self.now,
@@ -291,7 +232,6 @@ impl Host {
     }
 
     /// The composer's rules: the last two rows drawn mostly in U+2500 (at
-    /// least four fifths of the width), `(top, bottom)`.
     fn rules(&self, input: &RenderInput) -> Option<(usize, usize)> {
         let cols = usize::from(self.cols);
         let rules: Vec<usize> = input
@@ -351,8 +291,6 @@ impl Host {
                 overlays: &[],
                 ink: &typed,
             },
-            // The host until 2026-10-20 (a transient overlay, after main's
-            // ground plane): protected on the live plane.
             Reserve::Protected => PetReserve {
                 protected: &chips,
                 overlays: &typed,
@@ -419,7 +357,6 @@ impl Host {
     }
 
     /// Run the display's frame train up to `t0 + ms`: a present on every
-    /// vsync, whatever the program and the keyboard did between them.
     fn run_to(&mut self, ms: u64) {
         let t = self.t0 + Duration::from_millis(ms);
         while self.vsync <= t {
@@ -431,7 +368,6 @@ impl Host {
     }
 
     /// The whole take up to its exit chord, then a second of quiet. The
-    /// program's output is delayed by the knobs' echo latency.
     fn replay(take: &Take, knobs: Knobs) -> Self {
         let mut events: Vec<(u64, Rec)> = Vec::new();
         for (ms, ev) in recording(take.src, 1_000_000) {
@@ -447,7 +383,6 @@ impl Host {
     }
 
     /// [`Self::replay`] of a take's events, the program's output delayed by
-    /// the knobs' echo latency.
     fn replay_events(take: &Take, knobs: Knobs, recorded: Vec<(u64, Rec)>) -> Self {
         let mut h = Self::new(take, knobs);
         let mut events: Vec<(u64, Rec)> = recorded
@@ -473,17 +408,9 @@ impl Host {
 }
 
 /// A take written here rather than recorded: the events it replays
-/// ([`Host::replay_events`]).
 type SyntheticTake = fn() -> Vec<(u64, Rec)>;
 
 /// A Claude Code composer under a full transcript, typed across its wrap,
-/// written as the program writes it: the transcript's rows inked to the
-/// width, the composer between its rules, the footer under it, the caret
-/// painted. The hand types a key every 85 ms and the program echoes it 15 ms
-/// later; at the right edge the composer grows a line, its bottom rule and
-/// the footer pushed a row down. With the transcript full the only clear
-/// ground near the composer is under it: a cat whose stand the host's chrome
-/// refuses rests there.
 fn full_transcript_composer_take() -> Vec<(u64, Rec)> {
     const COLS: usize = 120;
     let mut ev = Vec::new();
@@ -508,8 +435,6 @@ fn full_transcript_composer_take() -> Vec<(u64, Rec)> {
         let b = ch.to_string().into_bytes();
         ev.push((t, Rec::In(b.clone())));
         let echo = if col > COLS {
-            // The wrap: the composer grows a line; the rule and the footer
-            // go a row down, and the line goes on under the first.
             row += 1;
             col = 3;
             format!(
@@ -528,13 +453,6 @@ fn full_transcript_composer_take() -> Vec<(u64, Rec)> {
 }
 
 /// Claude Code's composer as a windowed host shows it at every key (real
-/// Claude Code 2.1.305 at 120 x 40, 2026-10-20): the launch card's rows, the
-/// composer between its rules near the top of the pane, the footer under
-/// it, blank rows below; the cursor hidden and Claude's own block caret
-/// painted after the draft; every repaint one whole DEC 2026 frame, so no
-/// present catches a frame half written. The hand types a key every 85 ms
-/// and the program's frame lands 15 ms later; at the right edge the composer
-/// grows a line, its bottom rule and the footer pushed a row down.
 fn bracketed_composer_take() -> Vec<(u64, Rec)> {
     bracketed_composer_typing(
         "in fact, i would like for the model use sigma section to be hidden by default but can be enabled. i do not really need to know that info at all, and the footer stays",
@@ -543,7 +461,6 @@ fn bracketed_composer_take() -> Vec<(u64, Rec)> {
 }
 
 /// [`bracketed_composer_take`]'s composer with `text` typed into it, then
-/// `rest` milliseconds with no key.
 fn bracketed_composer_typing(text: &str, rest: u64) -> Vec<(u64, Rec)> {
     const COLS: usize = 120;
     let rule = "─".repeat(COLS);
@@ -607,29 +524,20 @@ struct Motion {
     /// Presents whose tick hid the body for want of a place to step to.
     yields: Vec<u64>,
     /// Presents whose tick carried the body down with the rows round it
-    /// (`content-ride`): `(ms, dx, dy, rows the bottom rule moved)`.
     rides: Vec<(u64, f32, f32, i64)>,
     /// One-present moves no locomotion makes: half a row or more, or
-    /// sideways faster than the fastest gallop ([`TOP_SPEED`]). A ride is not
-    /// one.
     jumps: Vec<(u64, f32, f32)>,
     /// The gait art going back to the cycle it left within [`FLICKER_MS`]:
-    /// `(ms, the gait it went back to, ms it was away)`.
     flickers: Vec<(u64, &'static str, u64)>,
     /// Every change of the gait art drawn.
     gait_changes: usize,
     /// Presents that draw a gait's art.
     gait_frames: usize,
     /// Runs of presents drawing the run's art while the body crawls (under
-    /// [`CREEP_SPEED`] since the present before): `(ms it began, ms it was on
-    /// glass)`.
     creeps: Vec<(u64, u64)>,
     /// Runs of presents holding a body that does not move in the run's
-    /// action: `(ms it began, ms it was on glass)`.
     stills: Vec<(u64, u64)>,
     /// Runs of presents drawing the stand's pose between two presents of a
-    /// leg's art (the walk's, the amble's or the run's): `(ms it began, ms
-    /// it was on glass)`.
     stands: Vec<(u64, u64)>,
 }
 
@@ -640,8 +548,6 @@ fn standing(frame: &PetFrame) -> bool {
 }
 
 /// One stride of the gallop at its top speed (`kitty_pet::STAND_MIN`,
-/// `RUN_STRIDE_CELLS / MAX_SPEED`), the quickest stride the legs take, in
-/// milliseconds: a stand between two legs shorter than it is a blink.
 const STRIDE_MS: f32 = 3.4 / MAX_SPEED * 1_000.0;
 
 /// The gait art a frame draws: the walk's, the amble's or the run's cycle.
@@ -655,15 +561,11 @@ fn gait(frame: &PetFrame) -> Option<&'static str> {
 /// Under this speed (cells/s) a body drawn in the run's art crawls.
 const CREEP_SPEED: f32 = 3.0;
 /// The longest a run's art may be drawn over a crawling body
-/// (`kitty_pet::RUN_ART_GRACE`): a dip between two keys that the next one
-/// picks up, never a slow-motion gallop.
 const CREEP_MAX_MS: u64 = 40;
 
 fn motion(shots: &[Shot], frame_ms: u64) -> Motion {
     let dt = frame_ms as f32 / 1_000.0;
     let mut m = Motion::default();
-    // The gait last drawn (a stop between keys draws none), and when each
-    // gait's art was last on glass.
     let mut drawn = None;
     let mut seen: std::collections::BTreeMap<&'static str, u64> = Default::default();
     for s in shots {
@@ -682,7 +584,6 @@ fn motion(shots: &[Shot], frame_ms: u64) -> Motion {
         seen.insert(g, s.ms);
         drawn = Some(g);
     }
-    // Episodes of presents, each as `(first, how long on glass)`.
     let episodes = |hit: &dyn Fn(&Shot, &Shot) -> bool| {
         let mut out = Vec::new();
         let mut from: Option<u64> = None;
@@ -698,13 +599,10 @@ fn motion(shots: &[Shot], frame_ms: u64) -> Motion {
         }
         if let (Some(f), Some(last)) = (from, shots.last()) {
             // Still active at the end: only the span through the final sample is
-            // observed. No later present establishes how long it stayed on glass.
             out.push((f, last.ms - f));
         }
         out
     };
-    // Stands between two legs: each run of stand presents with a leg's art
-    // on glass just before and just after it.
     let mut leg_before = false;
     let mut stand_from: Option<u64> = None;
     for s in shots {
@@ -743,8 +641,6 @@ fn motion(shots: &[Shot], frame_ms: u64) -> Motion {
             }
             _ => {}
         }
-        // An arc (a hop, a pounce, the wrap's bound) is paid for by the body
-        // in the air at its own rate; the ground has the chase's ceiling.
         let airborne = |f: &PetFrame| f.lift != 0.0 || f.action == PetAction::Leap;
         if prev.frame.alpha > 0
             && s.frame.alpha > 0
@@ -759,11 +655,6 @@ fn motion(shots: &[Shot], frame_ms: u64) -> Motion {
 }
 
 /// Every take typed with predictive echo on: the guess never moves the pet.
-/// No present steps the body aside, hides it, or moves it on the ground half a
-/// row or faster than it can run. Negative control: the same guesses reserved as
-/// protected step the body aside and jump it while typing (measured 2026-10-20:
-/// 7 step-asides and 6 jumps of 1.3 to 4.9 cells in one present over the four
-/// takes, 0 of each reserved as ink).
 #[test]
 fn a_guessed_letter_never_throws_the_pet_off_its_seat() {
     let runs: Vec<(usize, Reserve)> = [Reserve::Ink, Reserve::Protected]
@@ -810,35 +701,8 @@ fn a_guessed_letter_never_throws_the_pet_off_its_seat() {
 }
 
 /// The legs keep one gait while the person types, at 120 and at 60 Hz, with
-/// the echo as recorded and 150 ms late. The chase speed pulses with every key
-/// (a spring past the run's threshold, a collapse on arrival, a stall at a
-/// late key), and the gait used to follow each pulse: the drawn legs swapped
-/// between the amble's, the walk's and the run's art up to three times in
-/// 24 ms (measured 2026-10-20 over these four takes: 851 changes, 739 of them
-/// back to a gait left less than 350 ms before). Read through a held peak of
-/// the speed instead, the legs still went back to a gait at a late key, and a
-/// cat that landed from a sprint crept the cell after it in a gallop for
-/// 430 ms. The gait reads the speed averaged over `kitty_pet::GAIT_TAU`, is
-/// worn at least `GAIT_DWELL`, and picks afresh after a rest or a flight: no
-/// present goes back to a gait's art within 350 ms of last drawing it.
-///
-/// Inside the run the body slows into each stop and sets out from it again
-/// (the walk-on between keys coasting down when a key is late), and the
-/// run's distance-driven frames froze in a mid-gallop pose while it crawled:
-/// up to 128 ms of slow gallop per stop, and at the right margin 104 ms of a
-/// body standing still in the run's frame (a station pinned wall-side read as
-/// walking on). Under 3 cells/s the run's feet are planted
-/// (`kitty_pet::RUN_ART_MIN`) once the body has crawled
-/// `kitty_pet::RUN_ART_GRACE`, and the station pinned there is arrived at: no
-/// present draws the run's art over a crawling body for longer than
-/// [`CREEP_MAX_MS`] (and the present it runs out on), and none holds a still
-/// body in the run for more than one present. The gait itself is untouched:
-/// ended under a hand at a walking pace instead, the run came back over the
-/// walk's ceiling a few hundred milliseconds later at the next surge.
 #[test]
 fn the_legs_keep_one_gait_while_typing() {
-    // A stuck run at the end of a take must count too. Start from one ordinary
-    // host frame, then hold its running body through the last observed sample.
     let mut control = Host::new(&TAKES[0], Knobs::SHIPPED);
     control.present();
     let first = control.shots[0];
@@ -921,26 +785,11 @@ fn the_legs_keep_one_gait_while_typing() {
 }
 
 /// A STAND BETWEEN TWO LEGS LASTS A STRIDE: wherever the stand's pose is
-/// drawn between two presents of a leg's art, it is on glass at least one
-/// stride of the gallop ([`STRIDE_MS`], `kitty_pet::STAND_MIN`), over every
-/// take at 120 and 60 Hz, echo as recorded and 150 ms late. A run that all
-/// but stopped between two late keys planted its feet, or arrived and stood,
-/// and set out again a frame or a few later: measured 2026-10-21 over these
-/// takes, 10 to 12 such stands in each generating replay under a stride,
-/// from 8 to 128 ms (a walk stood one present; a run stood 40 to 72 ms with
-/// no arrival at all), the "standing blinks". The stand now holds the body
-/// where it stopped for a stride, then the leg sets out as before; the gait
-/// laws of [`the_legs_keep_one_gait_while_typing`] stand.
 #[test]
 fn a_stand_between_two_legs_lasts_a_stride() {
-    // The measure: a stand bounded by legs is counted, one bounded by
-    // anything else is not.
     let mut control = Host::new(&TAKES[0], Knobs::SHIPPED);
     control.present();
     let first = control.shots[0];
-    // Field writes, not `..first` in a closure: stock rustc 1.95 (the cross
-    // cells' compiler) breaks its MIR on that update syntax over these
-    // frames' array fields.
     let with = |pose| {
         let mut shot = first;
         shot.frame.pose = pose;
@@ -1000,19 +849,6 @@ fn a_stand_between_two_legs_lasts_a_stride() {
 }
 
 /// The composer grows a line under a cat that rests beside aterm's footer
-/// chips. Typing a long prompt in Claude Code with no stand on the
-/// composer's first line (`Knobs::line_walled`; the upper rule reserved
-/// whole did it until the escort passed under the chrome over its line), the
-/// cat rests under the composer, its head beside the chips' rule; at the
-/// wrap the composer grows a line, and the rule and the chips come down onto
-/// the cat's head. The console law stepped it aside: in one
-/// present, 28 px down and 19 px left at the owner's 15x28 cell (2026-10-20,
-/// review of `fix/kitty-jitter`, the generating take at every wrap). Now the
-/// body rides down with the rows round it, the rows they moved and not a
-/// column sideways: no present steps it aside or hides it, every ride moves it
-/// exactly the rows the composer's rule moved, and nothing else moves it on
-/// the ground faster than it can run. Negative control: the same take at 22
-/// rows, where the composer never grows under the cat, rides nothing.
 #[test]
 fn the_pet_rides_the_composer_down_when_its_chips_come_onto_it() {
     let rows: Vec<u16> = vec![40, 26, 22];
@@ -1062,17 +898,6 @@ fn the_pet_rides_the_composer_down_when_its_chips_come_onto_it() {
 }
 
 /// The cat walks the composer's line beside the caret, over aterm's footer
-/// chips. With the chips on the composer's lower rule (the owner's footer),
-/// the stand beside the caret on the composer's line has its paws on the
-/// rule's top edge over the chips. Judged with the clearance margin under
-/// its feet too, the stand was refused from the chips' first column on: the
-/// cat dropped under the composer at that column and waited there, fifty
-/// cells behind, while the line was typed to its end (2026-10-20: real
-/// Claude Code 2.1.305, windowed, a typed line's lag at its median 22 cells
-/// and 53 at its 90th percentile). Now, typed on to the wrap, the cat stays
-/// on the composer's line and beside the caret: at every present after the
-/// chips' first column, its feet on the caret's row and its body within
-/// [`STAND_REACH`] columns of the caret.
 #[test]
 fn the_pet_walks_the_composer_line_beside_its_caret_over_the_chips() {
     let knobs = Knobs {
@@ -1081,7 +906,6 @@ fn the_pet_walks_the_composer_line_beside_its_caret_over_the_chips() {
     };
     let h = Host::replay(&TAKES[0], knobs);
     let chips_from = h.cols - 1 - CHIPS_COLS;
-    // The composer's first line, from the chips' first column to the wrap.
     let line: Vec<&Shot> = h
         .shots
         .iter()
@@ -1111,43 +935,12 @@ fn the_pet_walks_the_composer_line_beside_its_caret_over_the_chips() {
 }
 
 /// The cat's width in tenths of a column at the owner's cell: the 1.7-row
-/// body at its aspect, `1.7 × 28 × 244 / 148 / 15` (`kitty_pet::art_cols`).
 const BODY_COLS_X10: u16 = 52;
 
 /// How far (columns) a cat walking beside the caret may be from it: the
-/// escort's lead past the caret (`kitty_pet::STATION_LEAD` and the keep-ahead,
-/// at most `LEAD_MAX`), its own width, and its lag behind a burst.
 const STAND_REACH: f32 = 12.0;
 
 /// A wrap typed through is one bound, whatever the host draws round the
-/// composer. At the composer's right edge the caret wraps to the next line
-/// and the person types on; the cat bounds the width of the composer to it.
-/// The bound was aimed once, at launch, and the hand typed some ten cells on
-/// through its second in the air: the cat came down nine cells behind the
-/// caret, and the jump it had latched at the wrap launched it again
-/// (2026-10-20, review of `fix/kitty-jitter`: about 3 s of leaping at every
-/// wrap). The landing now tracks the writing in the air, and the flight
-/// spends the latch it was launched for.
-///
-/// With aterm's chips on the composer's rule and its upper rule reserved
-/// whole (`Knobs::rule_walled`), the cat rests under the composer while its
-/// first line is typed, and the bound up to the new line passes over the
-/// chips: walled off by them (the box between the bodies cutting their
-/// corner) it went in two flights, down to a seat it could reach and then
-/// up, and kept off them in the air it glided with no rise. With the
-/// harness's lockup and switch on the upper rule (`Knobs::brand`), the cat
-/// walks the first line and waits short of the switch, and gathers for the
-/// bound there without a step aside. And in Claude Code as a window shows it,
-/// every frame one closed DEC 2026 bracket, the hidden caret it finished at
-/// was taken two presents late (`companion::HIDDEN_REST`, kept for moves no
-/// bracket closes): at the wrap the stale caret sent the cat hopping down
-/// to the new line's far end before it bounded back. And typed up to the
-/// margin, the cat hopped back over the caret onto the words just typed
-/// before the wrap's bound: two flights at every line end (2026-10-21, the
-/// owner's "jumping"; b884fc3b31's hop, outside the window this law watched
-/// until then). From the caret coming within a body of the margin to three
-/// seconds past each wrap, while the caret stays on the new line: one
-/// flight, and it comes down ahead of the caret.
 #[test]
 fn a_wrap_typed_through_is_one_bound() {
     let harness = Knobs {
@@ -1209,10 +1002,6 @@ fn a_wrap_typed_through_is_one_bound() {
         (name, h.cols, h.shots)
     });
     for (name, cols, shots) in &cases {
-        // Nothing on the ground is stepped aside: a coil gathering for the
-        // bound beside the harness's switch spread over the margin its stand
-        // kept, and the console law jumped it sideways (judged at its drawn
-        // size, not its own: 0.4 columns in one present).
         let m = motion(shots, 8);
         assert!(
             m.step_asides.is_empty() && m.yields.is_empty(),
@@ -1232,11 +1021,6 @@ fn a_wrap_typed_through_is_one_bound() {
             .collect();
         assert!(!wraps.is_empty(), "{name}: the take must wrap: {wraps:?}");
         for &at in &wraps {
-            // From the caret coming within a body of the margin on the line
-            // it wraps from (the stand ahead of it hangs off there, where the
-            // cat used to hop back over it before the wrap's bound) for three
-            // seconds past the wrap, while the caret stays on the line it
-            // wrapped to (a submit after it sends the cat elsewhere).
             let (start, line) = (shots[at].ms, shots[at].caret.0);
             let from_row = shots[at - 1].caret.0;
             let body = f32::from(BODY_COLS_X10) / 10.0;
@@ -1287,17 +1071,6 @@ fn a_wrap_typed_through_is_one_bound() {
 }
 
 /// A FLIGHT ACROSS THE HOST'S CHROME NEVER BLINKS OUT. With aterm's chips on
-/// the composer's lower rule and the harness's mark and switch on its upper
-/// one, the bound that follows Claude Code's caret along the composer at the
-/// take's start crosses the switch for longer than the visibility hold's
-/// dwell. Judged like a body that stays, it faded to nothing in mid-air and
-/// came back eight cells on: a teleport (2026-10-21, the owner's harness on).
-/// A body in the air is passing, as the placement law already held: from
-/// every launch of a body on glass to its landing, no present draws it at
-/// zero presence, over every take and host the wrap law replays.
-///
-/// NEGATIVE CONTROL (as run, the hold judging the body in the air): 23 blank
-/// presents in the take-start flight of the generating take with the harness.
 #[test]
 fn a_flight_across_the_hosts_chrome_never_blinks_out() {
     let harness = Knobs {
@@ -1367,20 +1140,6 @@ fn a_flight_across_the_hosts_chrome_never_blinks_out() {
 }
 
 /// THE CAT WALKS THE COMPOSER'S LINE BESIDE ITS CARET UNDER THE HARNESS
-/// SWITCH. With the harness on, aterm draws its switch on the composer's
-/// upper rule over the line's last forty cells, and reserves it as its
-/// chrome. The cat's 1.7-row body standing on the line reaches into that
-/// rule, and judged by the whole box every stand under the switch was
-/// refused: the cat waited on the line short of the switch, at col 79, for
-/// six seconds while the caret ran on to col 118, and caught up only at the
-/// wrap's bound (2026-10-21, the owner's own setup). The escort passes under
-/// the host's chrome over its line (the switch drawn over it, as text is):
-/// typed on past the switch's first column to the wrap, at every present
-/// the cat's feet are on the caret's row and its body within
-/// [`STAND_REACH`] columns of the caret.
-///
-/// NEGATIVE CONTROL (as run on the parent commit): presents 30 to 40
-/// columns behind the caret, the cat waiting at col 79.
 #[test]
 fn the_pet_walks_the_composer_line_beside_its_caret_under_the_harness_switch() {
     let knobs = Knobs {
@@ -1419,12 +1178,6 @@ fn the_pet_walks_the_composer_line_beside_its_caret_under_the_harness_switch() {
 }
 
 /// THE CAT NEVER PARKS ON THE HOST'S CHROME. Typed up under the harness
-/// switch, the cat walks the composer's line beside the caret, passing under
-/// the switch; the hand stops there and the cat comes to rest. It does not
-/// rest under the switch: it walks, on the line and with no flight, to the
-/// nearest stand clear of it, and its body covers no cell of the host's
-/// chrome once it is settled there. Negative control: stopped short of the
-/// switch, it rests beside the caret where it stood.
 #[test]
 fn the_pet_never_parks_under_the_hosts_chrome() {
     let knobs = Knobs {
@@ -1442,8 +1195,6 @@ fn the_pet_never_parks_under_the_hosts_chrome() {
     for (typed, under) in [(100usize, true), (60, false)] {
         let text: String = words.chars().take(typed).collect();
         let h = Host::replay_events(&window, knobs, bracketed_composer_typing(&text, 4_000));
-        // The last key's echo (`bracketed_composer_typing`: from 1 s, 85 ms
-        // a key, echoed 15 ms later).
         let last_key = 1_000 + 85 * (typed as u64 - 1) + 15;
         let rest: Vec<&Shot> = h.shots.iter().filter(|s| s.ms > last_key).collect();
         let flights = rest
@@ -1490,15 +1241,9 @@ fn the_pet_never_parks_under_the_hosts_chrome() {
 }
 
 /// The shortest time a pose may be on glass between two others
-/// (`kitty_pet::STILL_SECS`: two 60 Hz frames less half of one), in
-/// milliseconds: two presents at 60 Hz, four at 120 Hz. Under it, a pose is a
-/// flash.
 const POSE_MS: u64 = 25;
 
 /// Each pose run between two others as `(ms it began, before, pose, after, ms
-/// on glass)`, by the art's family: a leg's cycle (the walk's, the amble's,
-/// the run's) is one family, as are the flight's frames and the gather's.
-/// Only a run bounded on both sides is counted; a hidden body is skipped.
 fn pose_runs(shots: &[Shot]) -> Vec<(u64, String, String, String, u64)> {
     let family = |s: &Shot| {
         let id = aterm_effects::pet_glyphs_gen::PET_GLYPHS[s.frame.pose as usize].id;
@@ -1541,21 +1286,8 @@ fn pose_runs(shots: &[Shot]) -> Vec<(u64, String, String, String, u64)> {
 }
 
 /// NO POSE IS A ONE-FRAME FLASH: wherever the cat changes pose, the pose it
-/// takes is on glass at least [`POSE_MS`] before the next one, over every take
-/// at 120 and 60 Hz, echo as recorded and 150 ms late, with and without the
-/// harness's chrome; and a stand beside a leg lasts a stride ([`STRIDE_MS`]).
-/// Measured 2026-10-21 on these replays before the fix, 1 to 4 flashes in
-/// each: a wake's seat, a landing's seat or a play bow drawn one present
-/// before the leap; the notice's turned head squared after one frame when a
-/// wrap took the jump for its own flight; a fright that ended half a cell
-/// from its stand ran one frame of the gallop and stood; a face-on seat rows
-/// above the caret slid toward the caret's column and walked one frame back;
-/// a run's planted stand drawn two presents under the console's contact
-/// brace; a blink the caret's jump cut short.
 #[test]
 fn no_pose_is_a_one_frame_flash() {
-    // The measure: only a run bounded on both sides is counted, a leg's
-    // cycle is one pose.
     let mut control = Host::new(&TAKES[0], Knobs::SHIPPED);
     control.present();
     let first = control.shots[0];
@@ -1563,7 +1295,6 @@ fn no_pose_is_a_one_frame_flash() {
     let shots: Vec<Shot> = [PetSit, PetRun0, PetRun1, PetStand, PetSit, PetSit]
         .into_iter()
         .enumerate()
-        // Field writes, as in `a_stand_between_two_legs_lasts_a_stride`.
         .map(|(i, pose)| {
             let mut shot = first;
             shot.ms = i as u64 * 8;
@@ -1633,9 +1364,6 @@ fn no_pose_is_a_one_frame_flash() {
 }
 
 /// Each place the body on the ground turned back within 600 ms of setting out
-/// (half a cell or more each way), while the caret went one way only from
-/// 600 ms before to 300 ms after: `(ms it set out, from col, to col)`. A
-/// landing (its skid) and the air are not the ground's.
 fn turns_against_the_writing(shots: &[Shot]) -> Vec<(u64, f32, f32)> {
     let ground: Vec<&Shot> = shots
         .iter()
@@ -1680,19 +1408,6 @@ fn turns_against_the_writing(shots: &[Shot]) -> Vec<(u64, f32, f32)> {
 }
 
 /// THE PET NEVER TURNS BACK WHILE THE WRITING RUNS ONE WAY. Typed toward a
-/// cat a little ahead of its stand (resting past the harness's mark on the
-/// composer's upper rule, walking to that rest as the hand begins), the cat
-/// waits for the writing and sets out with it. Called back to the stand it
-/// ran toward the caret as the writing began and turned round a moment later
-/// to run with it, five cells back and round again, and with a late echo it
-/// set off at the key and turned when the echo moved the caret (2026-10-22,
-/// the owner's generating replay with the harness on). Over the generating
-/// take with and without aterm's chrome, at 120 and 60 Hz, the echo as
-/// recorded and 150 ms late.
-///
-/// NEGATIVE CONTROL (as run, the cat called back to its stand): with the
-/// harness, three turns at 60 Hz (13.8, 14.0 and 46.6 s), and one at the
-/// late echo's first key.
 #[test]
 fn the_pet_never_turns_back_while_the_writing_runs_one_way() {
     let harness = Knobs {
@@ -1741,21 +1456,6 @@ fn the_pet_never_turns_back_while_the_writing_runs_one_way() {
 }
 
 /// A FLIGHT THAT LANDS INTO WRITING TOUCHES DOWN. A bound that comes down
-/// while the hand types on (the hand began typing into the composer the cat
-/// was flying to, or typed on across the composer's wrap) lands on the run:
-/// a touch-down, and the chase takes the caret up again. Landed as a bound's
-/// heavy stop, the cat skidded back against the writing and sat out 400 ms of
-/// landing while the caret was typed on past it (2026-10-22, the owner's
-/// generating replay, the windowed composer and the long insert). Over every
-/// take and the
-/// synthetic composers, with and without the harness: a landing with three
-/// keys typed forward in the 600 ms before it lasts no longer than a
-/// touch-down (`kitty_pet::TOUCH_LAND_DUR`, 130 ms, and a frame) and never
-/// slides against the writing.
-///
-/// NEGATIVE CONTROL (as run, the landing chosen at launch): the generating
-/// take's bound across the composer's wrap held its landing 408 ms and slid
-/// 0.8 cells back against the writing.
 #[test]
 fn a_flight_that_lands_into_writing_touches_down() {
     let harness = Knobs {
@@ -1793,8 +1493,6 @@ fn a_flight_that_lands_into_writing_touches_down() {
             if !(prev.frame.action == PetAction::Leap && s.frame.action == PetAction::Land) {
                 continue;
             }
-            // Three keys typed forward along the caret's row, each within
-            // 600 ms of the last, the last within 600 ms of the landing.
             let mut keys = 0;
             let mut last = s.ms;
             for w in shots[..=i].windows(2).rev() {

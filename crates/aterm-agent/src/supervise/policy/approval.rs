@@ -1,82 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Approval policy: turn a parsed agent dialog into a guarded [`Decision`].
-//! [`decide`] is the entrypoint; [`decide_traced`] runs the same checks while
-//! recording why they answered or refused. The caller supplies the [`Reading`],
-//! screen rows and [`ApprovalCtx`]. The loop executes keys; this module only
-//! chooses a guarded action, amended refusal or escalation.
-//!
-//! The decision order is implemented in [`decide_box`]:
-//!
-//! * A program outside `Program::supervisable` is read but never answered.
-//!   Decisions require the agent reader's authoritative prompt phase.
-//! * Usage-limit dialogs use [`limit_reset`] when explicitly enabled, else
-//!   [`limit_wait`]. The grant pick ([`aterm_phase::reset_row`]: the one
-//!   reset on offer, of a kind the step takes, or the first kind of the
-//!   owner's `limit_reset_kinds` on offer, never a Fable reset) is not
-//!   spending authority: the loop asks the host before its first key and
-//!   fences the confirmation separately ([`super::reset`]); success is
-//!   recorded only for the claimed raw wall.
-//! * Usage-credits consent uses [`credits_consent`] and the default-off
-//!   `usage_credits` grant. Without it, [`credits_decline`] cancels only a
-//!   recognized consent; purchases and re-enabling account credits stay refused.
-//!   An enabled model consent may persist for that model and account.
-//! * [`autocompact_offer`] uses its own configured target. It is an explicit
-//!   standing-setting choice, independent of the permission level.
-//! * An owned login carry may choose the existing sign-in method
-//!   ([`super::login`]); a person's login or Console choice stays theirs.
-//! * Questions use [`super::question::answer_question`] and their own enable
-//!   switch/priority, independently of `approve`. Their cancel and checked
-//!   options are part of the structured question, not permission roles.
-//! * MCP server choices, owner ask rules/hooks and forced review are held
-//!   before the permission level. Unread/cut heads are held too, except the
-//!   narrowly guarded removal-breaker refusal in [`tall_box`].
-//!
-//! Ordinary permission levels then apply:
-//!
-//! * [`Approve::None`] escalates ordinary permission boxes; it does not turn
-//!   off the separately configured dialog policies above.
-//! * [`Approve::Safe`] uses [`decide_safe`]: Claude Code command reads
-//!   ([`bash`]), the rm breaker's too-many box over a proven read that names no
-//!   rm ([`breaker_read_only`]), bounded scratch removals ([`super::rm_breaker`]),
-//!   allowed non-secret reads ([`read_box`]) and cwd/trust-root grants
-//!   ([`trust_dialog`]).
-//!   Command ambiguity, shell startup and effective git configuration are
-//!   checked, not inferred from an apparently read-only command. An enabled
-//!   [`rm_breaker_warn`] can still approve a removal with an unproven warning.
-//! * [`Approve::All`] (the default) tries those rules first, then
-//!   [`full_power`]. It prefers a one-shot allow or a non-persistent refusal,
-//!   with explicit plan/model/consent rules. It still respects reader and
-//!   per-vendor capability limits ([`unmeasured_box`]); an unread or
-//!   unsupported dialog is not automatically safe merely because All is set.
-//!   The failed safe-rule reason accompanies an unproven approval in its ledger.
-//!
-//! Every decision then passes two final checks:
-//!
-//! * [`never_spends`] reserves limit-reset spending for [`RULE_LIMIT_RESET`].
-//!   Other answers inspect the actual option labels, including the selected
-//!   or checked options of structured questions. A reset confirmation permits
-//!   only its refusal outside the reset step, even if its yes is reworded.
-//! * [`kept_or_bought`] rejects ordinary picks that purchase or keep a standing
-//!   answer ([`buys`], [`kept_for_good`]); questions have their own equivalent
-//!   checks. Folder trust and the configured autocompact target are deliberate
-//!   standing choices, not permission grants inferred from an unknown label.
-//!
-//! An approval carries the judged row's [`row_guard`]. The surrounding
-//! `supervise::approval_loop` adds fresh-read, generation and person fences,
-//! and waits for the answered box to leave before pressing it again. A
-//! [`Decision::Decline`] instead carries feedback through
-//! [`decline_step`]; its refusal-input semantics are documented there.
-//!
-//! Filesystem, settings, shell and git checks use the supplied worker/probe
-//! context. A path observation does not constrain a worker's later file open.
-//! Dialog grammar and capture evidence live in `aterm-phase`; local
-//! `approval_tests.rs` exercises this policy, including the four recorded
-//! `fixtures/cap-decline-*.txt` states. Contracts map to those fixtures in
-//! `crates/aterm-agent/SPECS.md`. The private vendor lab is `aterm-lab`;
-//! source templates and composed fixtures do not imply a live capture.
-
+//! Pure supervisor tool-approval policy decider (`ApprovalState`, `ApprovalReading`, `ApprovalDecision`).
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -101,42 +26,13 @@ use crate::supervise::classify::{
     classify_command_with, classify_except_rm, glob_match, plain_zsh_line,
 };
 
-/// The read-only Bash rule's id (the classifier generation it trusts, and the
-/// zsh grammar it requires: v4 refuses arithmetic, an option or a keyword after
-/// `time`, and admits a plain `$NAME`, `${NAME}` and `$(…)` under zsh; v5
-/// opens no comment at a `#` right after an escaped blank or newline, which
-/// both shells read as a word's, MEASURED 2026-10-22: v4 took
-/// `echo a\ #; tee x` for a read; and v5 proves no reading whose words turn
-/// on a blank the screen cannot show, [`blanks_shown`]).
+/// Rule identifier for the read-only Bash classifier approval rule.
 pub const RULE_READ_ONLY: &str = "read-only@classify-v5";
-/// The rm circuit-breaker rule's id. v4 proves no reading whose words turn
-/// on a blank the screen cannot show ([`blanks_shown`]), and reads the rest
-/// of the line with [`RULE_READ_ONLY`]'s v5 classifier.
+/// The rm circuit-breaker rule's id.
 pub const RULE_RM_BREAKER: &str = "rm-breaker@v4";
-/// The rm circuit breaker's too-many box ([`RmBreakerKind::TooManySubstitutions`])
-/// over a command that names no rm, which every reading of proves a read by
-/// the read-only rule's own checks ([`breaker_read_only`]). Claude Code 2.1.307
-/// draws that box over any command with more than 64 command substitutions,
-/// rm or none, in a bypass session too (MEASURED,
-/// `docs/measured/claude-code-2.1.307-2026-10-21.md`). v2 also judges a matching
-/// transcript command, without removing any screen reading, and admits a
-/// plain `$NAME`, `${NAME}` and
-/// `$(…)` under zsh (`docs/measured/breaker-transcript-and-zsh-2026-10-22.md`).
-/// v3 (breaker-3's `8387171413`, never on `main`) took the transcript's
-/// command in place of the screen's readings; v4 keeps every screen reading
-/// as v2 does, and adds the transcript's command only where it draws as the
-/// box's rows and as the call's own row above the box (`⏺ Bash(…)` over
-/// `Waiting…`), with tabs (to stops of eight) and East Asian wide and
-/// fullwidth characters (two cells) drawn where v2 refused them (MEASURED
-/// on 2.1.308, the note's §H and §W). v4 also proves no reading whose words
-/// turn on a blank the screen cannot show ([`blanks_shown`]), and judges by
-/// [`RULE_READ_ONLY`]'s v5 classifier.
+/// The rm circuit breaker's too-many box ([`RmBreakerKind::TooManySubstitutions`]) over a command that names no rm.
 pub const RULE_BREAKER_READ_ONLY: &str = "breaker-read-only@v4";
-/// The rm circuit breaker the safe rules could not prove, approved with a
-/// warning under `approve = "safe"` ([`rm_breaker_warn`]): the one-shot allow
-/// pressed, the failed proof kept as `unproven` and said as one `WARN` line.
-/// `[harness] rm_breaker_ask = true` ([`ApprovalCtx::rm_breaker_warn`] off)
-/// hands it to a person.
+/// The rm circuit breaker the safe rules could not prove, approved with a warning under `approve = "safe"` ([`rm_breaker_warn`]).
 pub const RULE_RM_BREAKER_WARN: &str = "rm-breaker-warn@v1";
 /// The Read-outside-cwd rule's id.
 pub const RULE_READ_OUTSIDE_CWD: &str = "read-outside-cwd@v2";
@@ -146,107 +42,56 @@ pub const RULE_TRUST_DIALOG: &str = "trust-dialog@v1";
 pub const RULE_ALLOW_ONCE: &str = "allow-once@v1";
 /// Full power: the folder-trust dialog, any folder.
 pub const RULE_TRUST_ANY: &str = "trust-any@v1";
-/// Full power: plan mode's approval (or its entry), its yes that grants no
-/// standing mode ([`plan_pick`]).
+/// Full power.
 pub const RULE_PLAN: &str = "plan-approve@v2";
-/// Full power: a box whose every yes would buy something, answered with the
-/// option that waits.
+/// Full power.
 pub const RULE_NO_SPEND: &str = "no-spend@v1";
-/// Full power under `[harness] usage_credits`: a consent onto usage credits
-/// ([`credits_consent`]), its yes — kept for good per model and account where
-/// it names a model; the owner opted into that.
+/// Full power under `[harness] usage_credits`.
 pub const RULE_CREDITS_CONSENT: &str = "credits-consent@v1";
-/// Full power with `[harness] usage_credits` off, the default: a consent onto
-/// usage credits answered with Esc, the dialog's cancel, which saves nothing
-/// ([`credits_decline`]).
+/// Full power with `[harness] usage_credits` off, the default.
 pub const RULE_CREDITS_DECLINE: &str = "credits-decline@v1";
-/// Full power: a box with no yes it may take (a standing grant, a purchase)
-/// and nothing that waits, answered with the refusal that settles nothing.
+/// Full power.
 pub const RULE_DECLINE: &str = "decline@v1";
-/// Full power: Claude Code's model-refusal pause (`Session paused`) alone, its
-/// `Switch to <model>` while `[harness] model_fallback` is set
-/// ([`ApprovalCtx::model_fallback`], [`refusal_pause_switch`]).
+/// Full power.
 pub const RULE_MODEL_SWITCH: &str = "model-switch@v1";
-/// A box taller than the screen in a bypass session, declined with what its
-/// foot note flags ([`tall_box`]): it never approves.
+/// A box taller than the screen in a bypass session, declined with what its foot note flags ([`tall_box`]).
 pub const RULE_TALL_BOX: &str = "tall-box@v1";
-/// Full power: the model-switch confirmation's `Yes, switch to <m>` — the
-/// `/model` or `/effort` change the person typed ([`model_confirm`]).
+/// Full power.
 pub const RULE_MODEL_CONFIRM: &str = "model-confirm@v1";
-/// The usage-limit dialog's rule ([`limit_wait`]): its `Wait here, then
-/// continue automatically …` row, at every level, under
-/// [`ApprovalCtx::limit_wait`].
+/// The usage-limit dialog's rule ([`limit_wait`]).
 pub const RULE_LIMIT_WAIT: &str = "limit-wait@v1";
-/// Gemini CLI's usage-limit dialog ([`limit_retry`]): its `Keep trying`,
-/// once the reset it names (the end of the minute it names, in its zone) and
-/// the program's grace have passed, or, on one that names none, at the next
-/// rung of the loop's back-off ladder ([`ApprovalCtx::limit_retry`]), at
-/// every level, under [`ApprovalCtx::limit_wait`]. Before then the loop
-/// waits on the dialog (`approval_loop.rs`, `limit_retry_hold`): the
-/// analogue of Claude Code's wait row, whose program goes on by itself at
-/// the reset.
+/// Gemini CLI's usage-limit dialog ([`limit_retry`]).
 pub const RULE_LIMIT_RETRY: &str = "limit-retry@v1";
-/// The usage-limit dialog's grant row ([`limit_reset`]): the one reset on
-/// offer, of a kind the step takes, or the first kind of the owner's list on
-/// offer ([`ApprovalCtx::reset_kinds`]), `Use a <5-hour|weekly|full> reset
-/// (<n> left, until <day>)`, at every level, only under
-/// [`ApprovalCtx::limit_reset`]. The one
-/// rule that may choose an option that spends a reset ([`never_spends`]).
-/// The ledger's Enter on its confirmation names that kind's yes (`Yes, use
-/// my weekly reset`; an older build's `Yes, use my reset`).
+/// The usage-limit dialog's grant row ([`limit_reset`]).
 pub const RULE_LIMIT_RESET: &str = "limit-reset@v1";
-/// Claude Code's autocompact offer ([`autocompact_offer`]): `Autocompact at ‹
-/// <size> › tokens` at the size `[harness] autocompact_offer` names, at every
-/// level, under [`ApprovalCtx::autocompact_offer`].
+/// Claude Code's autocompact offer ([`autocompact_offer`]).
 pub const RULE_AUTOCOMPACT_OFFER: &str = "autocompact-offer@v1";
 
-/// A question dialog answered under the priority word `long-term`
-/// ([`QuestionPriority::LongTerm`]): the worker decides by
-/// [`super::question::LONG_TERM_TEXT`], typed into the free-text row.
+/// A question dialog answered under the priority word `long-term` ([`QuestionPriority::LongTerm`]).
 pub const RULE_ANSWER_LONG_TERM: &str = "answer-long-term@v1";
 /// The same under `short-term` ([`super::question::SHORT_TERM_TEXT`]).
 pub const RULE_ANSWER_SHORT_TERM: &str = "answer-short-term@v1";
-/// A prose question answered under `long-term` with its policy text instead of
-/// `[harness] answer_text` (the turn-end counterpart of
-/// [`RULE_ANSWER_LONG_TERM`]).
+/// A prose question answered under `long-term` with its policy text instead of `[harness] answer_text`.
 pub const RULE_PROSE_LONG_TERM: &str = "prose-long-term@v1";
 /// The same under `short-term`.
 pub const RULE_PROSE_SHORT_TERM: &str = "prose-short-term@v1";
 
-/// How a question is answered once [`ApprovalCtx::answer_questions`] says it is:
-/// `[harness] question_priority`, or a session's `questions` word (`aterm ctl
-/// @<sid> meta set questions …`) over it.
-///
-/// * [`Self::Recommended`] (default): a dialog's recommended option by Enter; a
-///   prose question with `[harness] answer_text`.
-/// * [`Self::LongTerm`] / [`Self::ShortTerm`]: the word's fixed policy text
-///   ([`Self::text`], a constant, never from config or screen) is written into a
-///   dialog's free-text row and Enter pressed, so the worker decides by that
-///   policy; a prose question gets the same text. A tab without a free-text row,
-///   or where the text would not fit, gets its recommended option and says so
-///   (`policy/question.rs`, `choose_text`), as does a dialog question with no
-///   recommendation that names a destructive act. A prose question naming an
-///   irreversible act gets `turn_end::REVERSIBLE_ANSWER` under every priority.
+/// How a question is answered once [`ApprovalCtx::answer_questions`] says it is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub enum QuestionPriority {
-    /// The recommended option(s).
     #[default]
     Recommended,
-    /// The worker decides for long-term correctness and total value.
     LongTerm,
-    /// The worker decides for the current deliverable, soonest.
     ShortTerm,
 }
 
 impl QuestionPriority {
     /// Every priority, in [`Self::WORDS`]' order.
     pub const ALL: [Self; 3] = [Self::Recommended, Self::LongTerm, Self::ShortTerm];
-    /// The words the config key and the session word spell them with, in
-    /// [`Self::ALL`]'s order (the Settings row lists them so).
+    /// The words the config key and the session word spell them with, in [`Self::ALL`]'s order.
     pub const WORDS: [&'static str; 3] = ["recommended", "long-term", "short-term"];
 
-    /// The priority `word` names (trimmed, ASCII case-folded), or `None` for
-    /// any other text (`ask` is a session's word for not answering).
+    /// The priority `word` names, or `None` for any other text.
     #[must_use]
     pub fn parse(word: &str) -> Option<Self> {
         let word = word.trim();
@@ -275,8 +120,7 @@ impl QuestionPriority {
         }
     }
 
-    /// The rule a prose question answered under it is ledgered as: `answer@v1`
-    /// under [`Self::Recommended`], else the word's own.
+    /// The rule a prose question answered under it is ledgered as.
     #[must_use]
     pub fn prose_rule_id(self) -> &'static str {
         match self {
@@ -286,8 +130,7 @@ impl QuestionPriority {
         }
     }
 
-    /// The fixed policy text written into a free-text row (and used for prose);
-    /// `None` for [`Self::Recommended`].
+    /// The fixed policy text written into a free-text row (and used for prose).
     #[must_use]
     pub fn text(self) -> Option<&'static str> {
         match self {
@@ -298,73 +141,42 @@ impl QuestionPriority {
     }
 }
 
-/// What every decline's text opens with ([`decline_text`]): Claude Code presents
-/// the text as the user's words, so it names who said them.
+/// What every decline's text opens with ([`decline_text`]).
 pub const DECLINE_PREFIX: &str = "aterm harness (not the user): ";
 
-/// The refusal a decline amends: the Bash box's `No`, whose input is
-/// opened by [`decline_step`].
+/// The refusal a decline amends.
 pub const REFUSAL_LABEL: &str = "No";
 
-/// Maximum characters of a reason or quoted command in a decline's text, which
-/// is typed and read back before Enter.
 const DECLINE_WHY_CHARS: usize = 160;
 
 /// How the approving option is chosen.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Choice {
-    /// Press this digit: a numbered box ([`Select::Digits`]).
     Digit(u8),
-    /// Move the focus `steps` options (down when positive), then press Enter
-    /// once a fresh read shows it on `label`: for unnumbered dialogs
-    /// ([`Select::ArrowsEnter`]) and the usage-limit wait row, never chosen by
-    /// digit ([`limit_wait`]). `steps` 0: already focused.
-    Focus { steps: i32, label: String },
-    /// A question dialog's answer ([`QuestionPriority::rule_id`]): every key
-    /// under the screen-generation fence, never a digit.
+    Focus {
+        steps: i32,
+        label: String,
+    },
     Answer(Answer),
-    /// Move the focus as [`Self::Focus`], then press `key` (not Enter) once a
-    /// fresh read shows it on `label`: the autocompact offer's `left` or
-    /// `right` toward the owner's size.
     FocusKey {
         steps: i32,
         label: String,
         key: &'static str,
     },
-    /// A question read by its answers' roles (Codex's, Muse Code's) answered
-    /// under a text priority: `text`'s fixed words written as the note of
-    /// `None of the above` — the focus moved there with arrows, Tab, the
-    /// text, Enter once a read shows it — one keystroke at a time, each
-    /// decided on a fresh read ([`super::question::note_step`]). Never a
-    /// digit, never Esc.
-    Note { text: QuestionPriority },
+    Note {
+        text: QuestionPriority,
+    },
 }
 
-/// How Claude Code's question dialog is answered ([`Choice::Answer`]; Codex's
-/// question takes a digit): move the focus, then Enter; under a text priority
-/// the policy text is first written into the free-text row ([`Self::Type`], a
-/// decision of its own). A digit is never sent: one landing late does harm
-/// (answers the next tab, cancels on the review tab, leaves a draft in the
-/// composer), while a late Enter lands harmlessly. The policy text holds no
-/// digit or newline. Read it through [`Self::enter_target`], [`Self::typed`]
-/// and [`Self::steps`], not by destructuring.
+/// How Claude Code's question dialog is answered ([`Choice::Answer`]; Codex's question takes a digit).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Answer {
-    /// Move the focus `steps` rows in the dialog's focus order (options,
-    /// free-text row, multi-select button, chat row; the review's two rows),
-    /// one key at a time, each seen landing, then Enter once a fresh read shows
-    /// the focus on `target`, guarded on the focused row. Usually 0.
     FocusEnter { steps: i32, target: AnswerTarget },
-    /// Move the focus `steps` rows onto the pristine free-text row, then write
-    /// the priority's fixed text ([`QuestionPriority::text`]); never Enter,
-    /// which is a later decision on a read showing exactly that text
-    /// ([`AnswerTarget::OwnText`]).
     Type { steps: i32, text: QuestionPriority },
 }
 
 impl Answer {
-    /// Where the answer's Enter goes; `None` for [`Self::Type`], which
-    /// presses none.
+    /// Where the answer's Enter goes.
     #[must_use]
     pub fn enter_target(&self) -> Option<AnswerTarget> {
         match self {
@@ -373,8 +185,7 @@ impl Answer {
         }
     }
 
-    /// The priority whose policy text the answer writes; `None` for
-    /// [`Self::FocusEnter`], which writes none.
+    /// The priority whose policy text the answer writes.
     #[must_use]
     pub fn typed(&self) -> Option<QuestionPriority> {
         match self {
@@ -392,67 +203,32 @@ impl Answer {
     }
 }
 
-/// Where a question answer's Enter goes ([`Answer::FocusEnter`]): never the
-/// free-text row except [`Self::OwnText`], never the chat row or the review's
-/// cancel.
+/// Where a question answer's Enter goes ([`Answer::FocusEnter`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AnswerTarget {
-    /// The model's own option `n` (single-select and preview: answers it;
-    /// multi-select: toggles its checkbox).
     Option(u8),
-    /// The multi-select button (`Next`, or `Submit` on the last question).
     Button,
-    /// The review tab's `1. Submit answers`.
     ReviewSubmit,
-    /// A single-select question's free-text row holding exactly this priority's
-    /// text, which the supervisor wrote ([`Answer::Type`]): Enter submits it.
-    /// Proving it is the supervisor's own is the loop's (`approval_loop.rs`). A
-    /// multi-select's text is never entered here (Enter unticks it); its button
-    /// is.
     OwnText(QuestionPriority),
 }
 
 /// What to do with one box.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Decision {
-    /// Choose `choice` under `guard`.
     Approve {
-        /// Which rule approved (a safe rule, one of full power's, a usage-limit
-        /// rule, or a question's: [`super::question::is_question_rule`]).
         rule_id: &'static str,
-        /// The option, and how it is chosen.
         choice: Choice,
-        /// The anchored `key if=` pattern of the judged row
-        /// ([`super::guard::row_guard`]).
         guard: String,
-        /// What was judged, as the ledger and the journal's `APPROVED` line
-        /// name it: the command or path (rm rule: ` => ` resolved targets;
-        /// trust backstop: warnings in parentheses; full power: the box's
-        /// subject and ` => ` the option chosen).
         subject: String,
-        /// Under full power, why the safe rules did not prove the box (the
-        /// breaker kind first, and `vendor default was No` where it applies):
-        /// the ledger's and journal's `unproven:`. `None` when proven.
         unproven: Option<String>,
     },
-    /// Refuse the box with feedback: `No` amended with `text`, never the
-    /// bare `No`. Built only by
-    /// [`decline`]; the loop carries it out one keystroke at a time via
-    /// [`decline_step`].
     Decline {
-        /// The rule that declined.
         rule_id: &'static str,
-        /// The refusal's index in the box's options ([`refusal_of`]).
         refusal: usize,
-        /// What the worker is told ([`decline_text`]).
         text: String,
-        /// What was judged: what the ledger row and the journal's `DECLINED`
-        /// line name.
         subject: String,
     },
-    /// Hand the box to a person, with the reason.
     Escalate {
-        /// Why no rule approved or declined it.
         reason: String,
     },
 }
@@ -477,20 +253,12 @@ impl Decision {
 /// A path a Read box may not be approved for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SecretRule {
-    /// This absolute directory (or file) and everything under it.
     Under(PathBuf),
-    /// Any path with a component of exactly this name (`.ssh` anywhere).
     Component(String),
-    /// Any path whose last component matches this glob (`*.pem`, `.env*`).
     Basename(String),
 }
 
-/// The default secrets list: key and credential stores, key and token file
-/// shapes (including aterm's `*.token`), shell histories, and under `home`
-/// all of `~/Library` and tool credential directories, `aterm secrets`' among
-/// them (`~/.secrets`, the files it writes, and `~/.config/aterm/secrets`, its
-/// machine key and vault cache: docs/DESIGN-secrets-2026-10-20.md §14.6).
-/// Checked on top of the allow-list ([`ApprovalCtx::read_roots`]).
+/// The default secrets list.
 pub fn default_secrets(home: Option<&Path>) -> Vec<SecretRule> {
     let mut out: Vec<SecretRule> = [
         ".ssh",
@@ -548,10 +316,7 @@ pub fn default_secrets(home: Option<&Path>) -> Vec<SecretRule> {
     out
 }
 
-/// Roots from config text (`[harness] trust_roots`): `~/` is `home`, a trailing
-/// `*` matches any suffix of the last component (`~/src/app*`), resolved
-/// lexically. A spec not absolute after `~`, holding `..`, or globbing
-/// elsewhere is dropped, never widened.
+/// Roots from config text (`[harness] trust_roots`).
 pub fn roots_from_config(specs: &[String], home: Option<&Path>) -> Vec<ScratchRoot> {
     let mut out = Vec::new();
     for spec in specs {
@@ -591,198 +356,47 @@ pub fn roots_from_config(specs: &[String], home: Option<&Path>) -> Vec<ScratchRo
 /// Everything [`decide`] knows besides the box.
 #[derive(Debug, Clone)]
 pub struct ApprovalCtx {
-    /// The session's working directory as the server reports it (`meta cwd=`,
-    /// OSC 7): where the agent was launched, not the Bash tool's cwd.
     pub cwd: PathBuf,
-    /// Whether [`Self::cwd`] was reported (`meta cwd=-` and an unread meta
-    /// are not): the trust dialog, the rm breaker and git reads need it.
     pub cwd_known: bool,
-    /// The user's home directory (`~` in a Read path; the rm deny table).
     pub home: Option<PathBuf>,
-    /// Whether the session runs in bypass mode, from its footer as last read
-    /// ([`footer_mode`]); the box covers the footer while up.
     pub bypass_mode: bool,
-    /// What may be answered (`[harness] approve`).
     pub approve: Approve,
-    /// Whether a question dialog is answered
-    /// ([`super::question::answer_question`], `[harness] answer_questions`),
-    /// regardless of [`Self::approve`].
     pub answer_questions: bool,
-    /// Whether full power may switch model on Claude Code's model-refusal pause
-    /// ([`RULE_MODEL_SWITCH`]): `[harness] model_fallback` set.
     pub model_fallback: bool,
-    /// Whether the usage-limit dialog's wait row is chosen ([`RULE_LIMIT_WAIT`],
-    /// `[harness] limit_wait`), regardless of [`Self::approve`].
     pub limit_wait: bool,
-    /// Whether the usage-limit dialog's grant row is chosen
-    /// ([`RULE_LIMIT_RESET`], `[harness] limit_reset`), regardless of
-    /// [`Self::approve`] and [`Self::limit_wait`]. Off unless the loop sets it;
-    /// off, the dialog is the wait row's.
     pub limit_reset: bool,
-    /// GEMINI CLI'S USAGE-LIMIT DIALOG IS DUE ITS `Keep trying`
-    /// ([`RULE_LIMIT_RETRY`], under [`Self::limit_wait`]): the reset its
-    /// `Access resets at <time>.` row names ([`aterm_phase::gemini::limit_reset`])
-    /// and the program's grace after it have passed, by the loop's clock, and
-    /// so has the loop's back-off from its last `Keep trying`; on a dialog
-    /// that names no reset, the rung of the back-off ladder it waits on (the
-    /// loop's `limit_retry_due`, `approval_loop.rs`). `false`: not yet, and
-    /// the dialog is waited on, never pressed for that.
     pub limit_retry: bool,
-    /// The kinds of reset [`Self::limit_reset`] may spend, the owner's first
-    /// first (`[harness] limit_reset_kinds`); empty, the dialog's one reset
-    /// on offer ([`aterm_phase::reset_row`]).
     pub reset_kinds: Vec<aterm_phase::ResetKind>,
-    /// Whether full power takes a consent that carries the session onto
-    /// usage credits ([`credits_consent`], `[harness] usage_credits`). Off,
-    /// the default: such a box is cancelled with Esc where it reads one
-    /// ([`credits_decline`]), else goes to a person. A consent that names no
-    /// credits is outside it.
     pub usage_credits: bool,
-    /// The size Claude Code's autocompact offer is answered with, in
-    /// kilo-tokens ([`RULE_AUTOCOMPACT_OFFER`], `[harness]
-    /// autocompact_offer`), regardless of [`Self::approve`]; `None`: the
-    /// offer is a person's.
     pub autocompact_offer: Option<u32>,
-    /// THE `/login` METHOD PICKER IS THE TURN-END POLICY'S CARRY: the loop
-    /// typed the `/login` it belongs to into a lost login
-    /// (`crate::supervise::policy::turn_end::TurnEndState::login_typed_at`).
-    /// `false`: a person's own `/login`, whose picker is theirs whatever
-    /// [`Self::login_method`] says.
     pub login_carry: bool,
-    /// THE `/login` METHOD PICKER OF THE LOOP'S OWN `/login`, ONCE THE LOGIN
-    /// CAME BACK IN ANOTHER TAB ([`super::login::PickerGate::Back`]): nothing
-    /// is left to sign in, so it is answered by nobody — a method chosen
-    /// would open a browser sign-in nobody needs — and the owner closes it.
     pub login_back: bool,
-    /// THE `/login` METHOD PICKER OF THE LOOP'S OWN `/login`, ONCE A RENEWAL
-    /// THE TAB FOLLOWS BY ITSELF REPLACED THE LOGIN IT SIGNS IN
-    /// ([`super::login::PickerGate::Renewed`]): answered by nobody — a method
-    /// chosen would open a browser sign-in that brings back the replaced
-    /// login — and the owner closes it.
     pub login_renewed: bool,
-    /// THE METHOD THIS SESSION'S LOGIN ALREADY IS (`crate::supervise::IdleHost::login_method`),
-    /// which the picker of the loop's own `/login` ([`Self::login_carry`]) is
-    /// answered with ([`super::login::pick_method`],
-    /// [`super::login::RULE_LOGIN_METHOD`]), regardless of [`Self::approve`]:
-    /// the picker is no permission. `None`: nothing says, and the picker is
-    /// the owner's.
     pub login_method: Option<aterm_phase::LoginMethod>,
-    /// Where a folder-trust dialog's folder may be trusted
-    /// ([`RULE_TRUST_DIALOG`]).
     pub trust_roots: Vec<ScratchRoot>,
-    /// The ONE folder this session's own starter trusted for it: the `cwd=`
-    /// an Owner's `spawn agent=claude` named (`meta`'s `trusted_cwd=`), where
-    /// a folder-trust dialog for exactly that folder is trusted as if under a
-    /// trust root — never a folder beneath it, and no other session's
-    /// ([`RULE_TRUST_DIALOG`]). `None` for every session no such spawn started.
     pub trusted_cwd: Option<PathBuf>,
-    /// THE AGENT A WORKER'S SPAWN STARTED ON THIS SESSION (`spawn
-    /// agent=<word>`, `meta`'s `worker=`), whose first prompt — its task — is
-    /// in its argv. A Gemini CLI worker's folder-trust dialog is never
-    /// pressed, by the safe rules or full power: its `Trust folder` relaunches
-    /// the CLI with that argv, and the task would be sent again
-    /// ([`gemini_worker_trust`]). `None` for every session no spawn started.
     pub worker_agent: Option<Program>,
-    /// Where a Read box may read ([`RULE_READ_OUTSIDE_CWD`]): the trust
-    /// roots and the system roots ([`Self::new`]).
     pub read_roots: Vec<ScratchRoot>,
-    /// Where an rm operand may point ([`RULE_RM_BREAKER`]). Empty withholds the
-    /// rule, and no rm is proven ([`RmScope::roots`]).
     pub scratch_roots: Vec<ScratchRoot>,
-    /// Under `approve = "safe"`, whether an unprovable `rm` breaker on a
-    /// possibly-empty variable is approved with a warning
-    /// ([`RULE_RM_BREAKER_WARN`], default `true`) or handed to a person
-    /// (`[harness] rm_breaker_ask = true`, or the retired `rm_breaker = false`).
     pub rm_breaker_warn: bool,
-    /// What a Read box may not be approved for, under an allowed root.
     pub secrets: Vec<SecretRule>,
-    /// The `python3 <script>` globs the classifier treats as reads (none by
-    /// default).
     pub python_allow: Vec<String>,
-    /// How a question dialog is answered when [`Self::answer_questions`] is on:
-    /// the session's `questions` word, else `[harness] question_priority`
-    /// (default [`QuestionPriority::Recommended`]).
     pub question_priority: QuestionPriority,
-    /// The priority whose text the loop wrote into this question's free-text row
-    /// and remembers writing; `None` when none
-    /// (or forgotten after a restart or handover). The same text with `None`
-    /// here is a person's.
     pub question_own: Option<QuestionPriority>,
-    /// The pane's width in cells (`text --json` `dims.cols`, else the widest
-    /// row); `0` makes [`decide`] use the widest row. Policy text is typed only
-    /// where its wrap fits (`policy/question.rs`, `text_fits`).
     pub screen_cols: u16,
-    /// The pane's height in rows (`text --json` `dims.rows`, else the grid row
-    /// past the last read), never the `tail=` count; `0` makes [`decide`] use
-    /// the count of `rows`.
     pub screen_rows: usize,
-    /// The loop already fell back to this tab's recommended option under a text
-    /// priority (`policy/question.rs`, `falls_back`) and latched it, so the fit
-    /// is not re-estimated.
     pub question_fell_back: bool,
-    /// The worker's environment ([`WorkerEnv`]) for reading git configuration
-    /// ([`super::git_config`]), or why it is unreadable (every git read then
-    /// escalates). Read by the loop only for a box that may run git
-    /// ([`worker_unread`]).
     pub worker: Result<WorkerEnv, String>,
-    /// Where the session's Bash tool may stand beyond [`Self::cwd`], from
-    /// Claude Code's transcripts ([`crate::harness::footer::shell_cwds`]); git
-    /// reads are checked there too. Empty until the loop reads it.
     pub shell_cwds: Vec<PathBuf>,
-    /// What the worker's Bash shell starts with beyond the modelled defaults
-    /// ([`super::shell_startup::read`]): aliases and functions failing lines
-    /// that name them, or the option, variable or file failing every line, or
-    /// why it is unreadable. Read by the loop only for a Bash box
-    /// ([`shell_unread`]).
     pub shell: Result<ShellStartup, String>,
-    /// The ask rules and PreToolUse hooks of the agent's own Claude Code
-    /// settings ([`super::claude_settings::owner_asks`]), or why they could
-    /// not be read: what holds a box Claude Code draws no ask reason on
-    /// ([`unvoiced_tools`], [`settings_ask`]). Read by the loop only for such
-    /// a box ([`asks_unread`]).
     pub owner_asks: Result<Vec<OwnerAsk>, String>,
-    /// How the policy looks at the machine while it decides
-    /// ([`super::probe`]): where a Read's symlinks lead and whether a folder
-    /// on its way holds a hidden twin of a name, where an `rm` operand's links
-    /// lead, the configuration a git read would load and the settings' `env`
-    /// blocks. [`super::probe::LiveProbe`] looks at the disk as [`decide`] always did; a run
-    /// recorded to a harness tape hands in a probe that tapes each derived
-    /// answer, so a decision that turned on the disk holds what it turned on.
     pub probe: Arc<dyn PolicyProbe>,
-    /// A transcript candidate for the box, without current-mount identity.
-    /// The transcript may lag a visible Bash box with an older Edit pending,
-    /// and screen rows do not close that gap. This never removes a possible
-    /// tool's owner hold ([`settings_ask`]).
     pub box_call: Option<String>,
-    /// The agent transcript's one pending Bash call, read twice a settle apart
-    /// ([`super::box_command::pending_bash`]), or why none was taken; `None`:
-    /// not read. Read by the loop only for the rm breaker's too-many box over
-    /// barred rows ([`super::box_command::may_prove`]) that the screen's
-    /// readings alone do not prove. [`breaker_read_only`] adds its command
-    /// only where it draws as the box's rows and its call's row exactly
-    /// ([`super::box_command::drawn_as`]); every screen reading is kept, since
-    /// neither matching rows nor elapsed time binds this call to this box.
     pub box_command: Option<Result<BoxCommand, String>>,
 }
 
 impl ApprovalCtx {
-    /// Defaults for a session in `cwd` owned by `uid`: the switches and trust
-    /// roots of [`SupervisorConfig::default`] (full power, questions answered,
-    /// the usage-limit wait chosen, no limit reset taken and no trust root).
-    /// Scratch roots: `/private/tmp/claude-<uid>/`, `tmpdir` (a root for literal
-    /// paths, when at least two levels deep and holding neither `cwd` nor
-    /// `home`), any `/tmp/<x>/` and `/private/tmp/<x>/`, and `<cwd>/target*`.
-    /// [`Self::set_trust_roots`] replaces the trust roots. Read roots: trust
-    /// roots plus `/usr`, `/etc`, `/private/etc`, `/opt/homebrew`.
-    /// [`default_secrets`], cwd known, not bypass, recommended answers, pane
-    /// size unknown.
-    ///
-    /// `probe` is how its decisions look at the machine, and it has no
-    /// default: the loop hands in its door's (`Fx::policy_probe`, which tapes
-    /// each derived answer when the run records), a test the live one. A
-    /// context that defaulted to [`super::probe::LiveProbe`] would decide past the door
-    /// whenever a caller forgot to replace it, and a tape would hold none of
-    /// what those decisions turned on.
+    /// Defaults for a session in `cwd` owned by `uid`.
     pub fn new(
         cwd: PathBuf,
         home: Option<PathBuf>,
@@ -851,12 +465,7 @@ impl ApprovalCtx {
         ctx
     }
 
-    /// The trust roots from `[harness] trust_roots` ([`roots_from_config`]), and
-    /// the Read roots rebuilt around them. A `claude-*` spec under
-    /// `/private/tmp` or `/tmp` names only this uid's `claude-<uid>`. With no
-    /// spec there is no trust root and the Read roots are the system's alone:
-    /// nothing about a session or the vendor makes a folder safe to trust, so
-    /// only a person names one.
+    /// The trust roots from `[harness] trust_roots` ([`roots_from_config`]), and the Read roots rebuilt around them.
     pub fn set_trust_roots(&mut self, specs: &[String], uid: u32) {
         let specs: Vec<String> = specs.iter().map(|s| own_claude_tmp(s, uid)).collect();
         self.trust_roots = roots_from_config(&specs, self.home.as_deref());
@@ -867,9 +476,6 @@ impl ApprovalCtx {
     }
 }
 
-/// [`ApprovalCtx::worker`] before the loop reads the environment: nothing, so a
-/// git read escalates; in this crate's unit tests a hermetic stand-in
-/// ([`WorkerEnv::hermetic`]).
 fn worker_unread() -> Result<WorkerEnv, String> {
     #[cfg(test)]
     {
@@ -881,8 +487,6 @@ fn worker_unread() -> Result<WorkerEnv, String> {
     }
 }
 
-/// [`ApprovalCtx::shell`] before the loop reads shell startup: nothing, so no
-/// Bash line is proven; in this crate's unit tests the modelled defaults.
 fn shell_unread() -> Result<ShellStartup, String> {
     #[cfg(test)]
     {
@@ -894,9 +498,6 @@ fn shell_unread() -> Result<ShellStartup, String> {
     }
 }
 
-/// [`ApprovalCtx::owner_asks`] before the loop reads the agent's settings:
-/// unknown, so a box an ask rule could have sent unread is held; in this
-/// crate's unit tests no rule.
 fn asks_unread() -> Result<Vec<OwnerAsk>, String> {
     #[cfg(test)]
     {
@@ -908,10 +509,6 @@ fn asks_unread() -> Result<Vec<OwnerAsk>, String> {
     }
 }
 
-/// `Ok` when the worker's Bash shell starts as the rm rule and classifier model
-/// it ([`ApprovalCtx::shell`], [`ShellStartup::admits`]); `Err` names what
-/// breaks that, or why it is unknown. A box running on another machine has
-/// startup this one cannot read.
 fn shell_models_hold(
     readings: &[String],
     runs_on: Option<&str>,
@@ -931,8 +528,6 @@ fn shell_models_hold(
     Ok(())
 }
 
-/// `spec`, with a `claude-*` glob under `/private/tmp` or `/tmp` narrowed to
-/// `uid`'s own `claude-<uid>` (Claude Code's per-user temp root).
 fn own_claude_tmp(spec: &str, uid: u32) -> String {
     let t = spec.trim().trim_end_matches('/');
     for base in ["/private/tmp", "/tmp"] {
@@ -943,10 +538,7 @@ fn own_claude_tmp(spec: &str, uid: u32) -> String {
     spec.to_string()
 }
 
-/// The permission mode the footer under the composer names, read from its
-/// pill (`harness::footer::pill_indicator`), or [`Mode::Manual`] for
-/// `? for shortcuts` and no pill; `None` when no footer is drawn (as while a
-/// box is up), so a caller keeps its last answer.
+/// The permission mode the footer under the composer names.
 pub fn footer_mode(rows: &[String]) -> Option<Mode> {
     let tail = rows.iter().rev().filter(|r| !r.trim().is_empty()).take(3);
     for r in tail {
@@ -960,24 +552,12 @@ pub fn footer_mode(rows: &[String]) -> Option<Mode> {
     None
 }
 
-/// Decide the box `reading` found on screen `rows` under
-/// [`ApprovalCtx::approve`]: the safe rules, then under [`Approve::All`] full
-/// power's answer to what they leave. `rows` are needed to guard the press on
-/// the judged row and cross-check the rows around the box. Whatever is
-/// decided spends no limit reset, but by the reset's own rule
-/// ([`never_spends`]).
+/// Decide the box `reading` found on screen `rows` under [`ApprovalCtx::approve`].
 pub fn decide(reading: &Reading, rows: &[String], ctx: &ApprovalCtx) -> Decision {
     decide_traced(reading, rows, ctx, &mut NoTrace)
 }
 
-/// [`decide`], each check it consults written to `trace` as it is consulted
-/// ([`super::trace`]): the gates that hand a box to a person, the level's
-/// rules, and the two checks every decision passes last ([`never_spends`],
-/// THE PRESS GATE), each named by the rule that decided where one did. The
-/// same function: `decide` is this one with no trace, so a trace tells of
-/// the very decision the loop makes. The loop uses `NoTrace`; its reader is
-/// `aterm drive replay --why` (`tape::explain`), which decides a recorded
-/// box again from its mark's facts with a trace kept.
+/// [`decide`], each check it consults written to `trace` as it is consulted ([`super::trace`]).
 pub fn decide_traced(
     reading: &Reading,
     rows: &[String],
@@ -1007,8 +587,6 @@ pub fn decide_traced(
     }
 }
 
-/// `d` as a trace states it: the act and what it was judged on, or the
-/// reason it went to a person.
 fn said(d: &Decision) -> String {
     match d {
         Decision::Approve {
@@ -1027,33 +605,16 @@ fn said(d: &Decision) -> String {
     }
 }
 
-/// `d`, decided at `check`, written to `trace` (named by its rule where it
-/// has one) and handed back.
 fn decided_at(trace: &mut dyn Trace, check: &'static str, d: Decision) -> Decision {
     note(trace, check, d.rule_id(), || Outcome::Decided(said(&d)));
     d
 }
 
-/// Whether `o`'s answer is kept for every later ask: its role
-/// ([`Role::Persist`]), its label ([`settles_later`], [`kept_answer`]) or the
-/// rows it is drawn on ([`Opt::kept`]: a run of its block's rows that takes
-/// in one of its own spells a kept answer whole, or, ending the block as a
-/// frame half drawn may, its first two words or more), so an option whose
-/// role the reader withheld (options read unsound, two cursors mid-move), or
-/// whose label a narrow pane's wrap left joined too far or not far enough,
-/// is still read so. The [`Opt::kept`] term is defence in depth: read sound,
-/// the reader already reads such an option [`Role::Persist`]. The press
-/// gate's test, the reset step's for a box it may Escape, and [`consents`]'s.
+/// Whether `o`'s answer is kept for every later ask.
 pub(crate) fn kept_for_good(o: &Opt) -> bool {
     o.role == Role::Persist || o.kept || settles_later(&o.label) || kept_answer(&o.label)
 }
 
-/// Why the option `decision` presses on `p`
-/// may not be pressed, whatever rule chose it — its answer is kept for every
-/// later ask ([`kept_for_good`]) or it buys something ([`buys`]). A
-/// question's options are the question rule's to judge
-/// ([`super::question`]), and the grant row is [`RULE_LIMIT_RESET`]'s,
-/// answered for by [`never_spends`].
 fn kept_or_bought(p: &PromptV2, decision: &Decision) -> Option<String> {
     let Decision::Approve {
         rule_id, choice, ..
@@ -1066,7 +627,6 @@ fn kept_or_bought(p: &PromptV2, decision: &Decision) -> Option<String> {
     }
     let o = match choice {
         Choice::Digit(n) => p.options.iter().find(|o| o.n == Some(*n)),
-        // Esc chooses no option: its label is only where the focus must be.
         Choice::FocusKey { key: "esc", .. } => None,
         Choice::Focus { label, .. } | Choice::FocusKey { label, .. } => {
             p.options.iter().find(|o| o.label == *label)
@@ -1086,20 +646,6 @@ fn kept_or_bought(p: &PromptV2, decision: &Decision) -> Option<String> {
     ))
 }
 
-/// NO RULE BUT THE RESET'S OWN CHOOSES AN OPTION THAT SPENDS A LIMIT RESET
-/// ([`spends`]), at any level: a check every decision of [`decide`] passes,
-/// whichever rule made it (THE PRESS GATE is the other). An approval whose chosen option — the
-/// one its digit numbers, or the one its focus is moved onto — spends a reset
-/// is handed to a person instead, unless the rule is [`RULE_LIMIT_RESET`]
-/// (decided only under [`ApprovalCtx::limit_reset`], for the grant row read
-/// by its exact template). The picks pass such an option over by themselves
-/// ([`buys`]); this holds for the ones that take an option by its role or its
-/// place. Structured question answers also check the chosen option, or the
-/// checked options submitted by a multi-select button, before any key is sent.
-///
-/// On a reset's confirmation ([`confirms_reset`]) only an option that refuses or
-/// waits is chosen, whatever its yes is labelled, since the server may reword that
-/// label; any other approval, a question's answer included, is handed to a person.
 fn never_spends(reading: &Reading, rows: &[String], decided: Decision) -> Decision {
     let Decision::Approve {
         rule_id, choice, ..
@@ -1156,12 +702,6 @@ fn never_spends(reading: &Reading, rows: &[String], decided: Decision) -> Decisi
     }
 }
 
-/// Whether the box `p`, read from `rows`, is a limit reset's confirmation by any
-/// part of it left on screen: its title, its yes, its no, a body row
-/// ([`aterm_phase::reset_confirm`] answers anything but
-/// [`aterm_phase::ConfirmRead::Not`]), the reading the loop's own step shares.
-/// The server may reword any text of that box and a short pane cuts its title,
-/// so its yes cannot be told by its label alone ([`spends`]).
 fn confirms_reset(p: &PromptV2, rows: &[String]) -> bool {
     !matches!(
         aterm_phase::reset_confirm(p, rows),
@@ -1169,15 +709,10 @@ fn confirms_reset(p: &PromptV2, rows: &[String]) -> bool {
     )
 }
 
-/// Whether choosing `opt` on a reset's confirmation keeps the reset: it refuses
-/// or waits, and buys nothing.
 fn keeps_reset(opt: &Opt) -> bool {
     (opt.role == Role::Deny || waits(opt)) && !buys(opt)
 }
 
-/// Whether `program` draws Claude Code's boxes and dialogs, the ones the safe
-/// rules, the owner's Claude Code settings and the dialog rules here were
-/// measured on. Any other program's box is escalated or handed over.
 fn draws_claude_boxes(program: Program) -> bool {
     match program {
         Program::Claude => true,
@@ -1185,10 +720,7 @@ fn draws_claude_boxes(program: Program) -> bool {
     }
 }
 
-/// Whether `program`'s usage-limit dialog is kept trying past the reset it
-/// names ([`limit_retry`], [`RULE_LIMIT_RETRY`]): Gemini CLI's, whose `Keep
-/// trying` sends the turn again. Claude Code's has its wait row, and no other
-/// program's is one the reader vouches for.
+/// Whether `program`'s usage-limit dialog is kept trying past the reset it names ([`limit_retry`], [`RULE_LIMIT_RETRY`]).
 #[must_use]
 pub fn keeps_trying_its_limit(program: Program) -> bool {
     match program {
@@ -1197,14 +729,6 @@ pub fn keeps_trying_its_limit(program: Program) -> bool {
     }
 }
 
-/// Why a usage-limit dialog no rule here answers goes to a person: Gemini
-/// CLI's (`Usage limit reached for <model>.` over `1. Keep trying` and `2.
-/// Stop`, measured on 0.46.0) where the reader does not vouch for the read
-/// (read whole, the dialog is [`limit_retry`]'s, a reset named or none) —
-/// `Keep trying` sends the turn again and `Stop` ends it — and names its own
-/// `/stats model`; any other program's is not one the reader vouches for.
-/// Short: an escalation's reason is cut after 120 cells, and the dialog's
-/// title is already its label.
 fn foreign_limit(program: Program) -> &'static str {
     match program {
         Program::Gemini => {
@@ -1217,17 +741,12 @@ fn foreign_limit(program: Program) -> &'static str {
     }
 }
 
-/// [`decide`], before its last checks ([`never_spends`], THE PRESS GATE),
-/// each check it consults written to `trace` ([`decide_traced`]).
 fn decide_box(
     reading: &Reading,
     rows: &[String],
     ctx: &ApprovalCtx,
     trace: &mut dyn Trace,
 ) -> Decision {
-    // A program the supervisor does not host
-    // (`aterm_phase::Program::supervisable`: the generic reader's, and
-    // Codex's, whose screen aterm reads no more) is read, never answered: every box of its is a person's,
     // whatever its reader names in it.
     if !reading.program.supervisable() {
         return decided_at(
@@ -1240,9 +759,6 @@ fn decide_box(
         );
     }
     note(trace, "supervisable", None, || Outcome::Passed);
-    // The usage-limit dialog is decided first by its own rules, before
-    // questions and levels, so full power never sees it: the grant row where
-    // the owner turned limit resets on, else the wait row.
     if let Some(prompt) = reading.prompt.as_ref()
         && prompt.kind == PromptKind::UsageLimit
     {
@@ -1256,8 +772,6 @@ fn decide_box(
         };
         return decided_at(trace, "usage-limit", decision);
     }
-    // Claude Code's autocompact offer is no permission either: answered by
-    // its own rule under its own key, before questions and levels.
     if let Some(prompt) = reading.prompt.as_ref()
         && prompt.kind == PromptKind::AutocompactOffer
     {
@@ -1271,12 +785,6 @@ fn decide_box(
         };
         return decided_at(trace, "autocompact-offer", decision);
     }
-    // Claude Code's `/login` dialog is no permission either: the method
-    // picker of the loop's own `/login` gets the method the session's login
-    // already is, else it is the owner's; a person's own `/login` is theirs
-    // whole; and Console's own menu (whose second option mints an API key)
-    // is always the owner's — before questions and levels, so full power
-    // never presses any option of it ([`super::login`]).
     if let Some(prompt) = reading.prompt.as_ref()
         && draws_claude_boxes(reading.program)
         && let Some(screen) = aterm_phase::login_screen(rows)
@@ -1303,8 +811,6 @@ fn decide_box(
         };
         return decided_at(trace, "login-method", decision);
     }
-    // A question is no permission: answered under its own
-    // key, before any level is consulted.
     if let Some(prompt) = reading.prompt.as_ref()
         && prompt.kind == PromptKind::Question
     {
@@ -1337,10 +843,6 @@ fn decide_box(
         };
         return decided_at(trace, "question", decision);
     }
-    // Claude Code's MCP server dialog is a person's at every level, before
-    // any is consulted: each of its answers, Esc's too, is saved for good.
-    // The one rule that holds it: no level's rules ([`decide_safe`],
-    // [`full_power`]) ever see it.
     if let Some(prompt) = reading.prompt.as_ref()
         && prompt.kind == PromptKind::McpServer
     {
@@ -1350,14 +852,6 @@ fn decide_box(
             Decision::escalate(mcp_server_held(prompt)),
         );
     }
-    // The user's own Claude Code configuration (an ask rule or hook) sends this
-    // box to a person: no level presses it — read off the box's reason where
-    // Claude Code draws one, else off the agent's own settings (a bare-tool
-    // ask rule for a file tool; for a box a Bash `sed -i` is drawn as, any
-    // Bash ask rule or Bash hook, retaining every possible tool even where
-    // the screen and transcript both suggest Edit),
-    // else, for an in-project Read, off the missing folder grant. Built-in
-    // safety checks stay the levels' to answer.
     if let Some(review) = reading.prompt.as_ref().and_then(|p| p.owner_review()) {
         return decided_at(
             trace,
@@ -1378,8 +872,6 @@ fn decide_box(
         return decided_at(trace, "forced-read", Decision::escalate(why));
     }
     note(trace, "forced-read", None, || Outcome::Passed);
-    // A box not read whole waits for its head, except the narrowly guarded
-    // tall-box removal refusal below.
     if let Some(why) = head_unread(reading) {
         let decision = match ctx.approve {
             Approve::All | Approve::Safe => tall_box(reading, rows, ctx, why),
@@ -1421,28 +913,7 @@ fn decide_box(
     }
 }
 
-/// Every Claude Code tool a box `p` may be a call of, where Claude Code draws
-/// no ask reason on a box of its kind (a file box): a bare-tool ask rule for any
-/// of them, read from the agent's own settings, is what sends the box to a
-/// person ([`settings_ask`]). Each bare rule holds only its own tool's calls
-/// (`Edit` holds no Write or NotebookEdit).
-///
-/// A box is no tool's name, so this lists every tool Claude Code draws it
-/// for, and a bare rule for ANY of them holds it (fail-closed: the box
-/// cannot say which drew it). From its file-box builder (2.1.295 and
-/// 2.1.299 bundles): `Create file`, `Write file` and `Overwrite file` are
-/// the Write tool's; `Edit notebook` NotebookEdit's; `Edit file` the Edit
-/// tool's AND the Bash tool's, which previews a `sed -i` as that box with no
-/// reason (`_simulatedSedEdit`: captured under `ask: ["Bash"]`,
-/// `claude-2.1.295-box-bash-sed-edit-ask-rule.txt`, row for row an Edit's);
-/// `Read file` every read-only file tool's (Read, Glob, Grep); and the IDE
-/// diff, which replaces the title of any file-writing box, any of those that
-/// write. Empty for every other kind: Claude Code draws the reason on a Bash,
-/// Fetch or Tool box ([`PromptV2::owner_review`]). A box this lists `Bash`
-/// for is one a Bash `sed -i` may be drawn as, which no reason on it can
-/// tell from a rule's or a hook's ask ([`settings_ask`], DECIDED
-/// 2026-10-15). Rows above the box and a transcript candidate do not bind
-/// the current mount to a tool, so every possible tool's hold survives.
+/// Every Claude Code tool a box `p` may be a call of, where Claude Code draws no ask reason on a box of its kind (a file box).
 #[must_use]
 pub fn unvoiced_tools(p: &PromptV2) -> &'static [&'static str] {
     let title = p.title.trim_start();
@@ -1456,9 +927,7 @@ pub fn unvoiced_tools(p: &PromptV2) -> &'static [&'static str] {
     }
 }
 
-/// Whether a transcript candidate could change the actual decision. Owner
-/// holds always retain [`unvoiced_tools`], so no candidate can lift one.
-/// The loop therefore does not read a candidate merely to bypass such a hold.
+/// Whether a transcript candidate could change the actual decision.
 #[must_use]
 pub fn proof_would_lift(reading: &Reading, rows: &[String], ctx: &ApprovalCtx) -> bool {
     let Some(p) = reading.prompt.as_ref() else {
@@ -1481,31 +950,6 @@ pub fn proof_would_lift(reading: &Reading, rows: &[String], ctx: &ApprovalCtx) -
             })
 }
 
-/// Why the owner's own Claude Code settings hold the box `reading` found (on
-/// `rows`), at every level, where Claude Code draws no reason to read it by
-/// ([`unvoiced_tools`]), from what the agent's settings chain carries
-/// ([`ApprovalCtx::owner_asks`]), or those settings unread, where no rule can
-/// be ruled out. A Codex box is not Claude Code's.
-///
-/// * A BARE-TOOL ask rule (`Write`, `Edit`, `Bash`, `Read`…, no specifier)
-///   for any tool Claude Code draws the box for: every call of the tool is
-///   the person's, so no matcher needs evaluating (DECIDED 2026-10-09).
-/// * For a box a Bash `sed -i` is drawn as (`Edit file`, the IDE diff: the
-///   box lists `Bash`), ANY Bash ask rule (`Bash(sed:*)`) and any PreToolUse
-///   hook whose matcher can match Bash
-///   ([`super::claude_settings::hook_may_match`]): Claude Code draws that box
-///   with no reason, so neither the rule's specifier nor the hook's answer
-///   can be read off it, and in auto mode the box is there only because one
-///   of them asked (DECIDED 2026-10-15, fail-closed toward the owner's rules;
-///   F1). The conservative over-hold remains: a transcript
-///   may retain an older Edit of the same file while the current Bash call
-///   is not written yet, and a queued Edit's childless row can stand over
-///   that Bash box while its Waiting row is off-screen. Neither observation
-///   establishes current-mount identity, even where the two agree.
-///
-/// Any other rule with a specifier (`Edit(src/**)`, `Read(~/.ssh/**)`) and
-/// a hook on another tool are Claude Code's to match and hold nothing here
-/// (`docs/measured/real-claude-lab-2026-10-15.md`, the 2026-10-06 ruling).
 fn settings_ask(reading: &Reading, _rows: &[String], ctx: &ApprovalCtx) -> Option<String> {
     let p = reading.prompt.as_ref()?;
     let tools = unvoiced_tools(p);
@@ -1551,21 +995,6 @@ fn settings_ask(reading: &Reading, _rows: &[String], ctx: &ApprovalCtx) -> Optio
     })
 }
 
-/// A Read box with no folder grant was sent by the owner's ask rule or hook.
-/// Claude Code offers `Yes, allow reading from <dir> during this session` on
-/// every Read box for a folder outside its working set (its directory and any
-/// `--add-dir`), in every mode, and asks about nothing inside it; so a box with
-/// no grant is for a path inside, put there by the owner. It draws no reason for
-/// a file tool, so [`PromptV2::owner_review`] cannot see it: held at every
-/// level. The tell reads no path and does not wait for the box to read whole
-/// (the renderer garbles the `No` row at some widths).
-///
-/// Misses: an owner's Read outside the working set carries the grant (held only
-/// under a bare `Read` rule, [`settings_ask`]); a Read on another machine is left
-/// to the proof that it is not local. False holds: names Claude Code distrusts
-/// ([`vendor_distrusts`]), a folder whose grant text would pass
-/// [`GRANT_TEXT_MAX`] (the vendor draws none), and a request from a plugin or
-/// remote agent. Root-level paths (`/foo`) draw no grant either and are left out.
 fn forced_read(reading: &Reading) -> Option<String> {
     let p = reading.prompt.as_ref()?;
     let root_level = p.path.as_deref().is_some_and(|path| {
@@ -1582,15 +1011,12 @@ fn forced_read(reading: &Reading) -> Option<String> {
     {
         return None;
     }
-    // The reason leads with the hold, so the status line's clip keeps it, and
-    // names the false hold the path itself shows.
     let path = p.path.as_deref().unwrap_or("?");
     if read_readings(path).any(vendor_distrusts) {
         return Some(format!(
             "a Read box with no folder grant (Claude Code asks about this name itself): {path}"
         ));
     }
-    // The grant's text is the folder, and its `/private` spelling where it has one.
     let folder = path.rsplit_once('/').map_or("", |(dir, _)| dir);
     let has_private = ["/tmp", "/var", "/etc", "/private"].iter().any(|top| {
         folder
@@ -1613,17 +1039,10 @@ fn forced_read(reading: &Reading) -> Option<String> {
     ))
 }
 
-/// The longest grant text Claude Code draws.
 const GRANT_TEXT_MAX: usize = 160;
 
-/// The longest folder whose grant text, doubled with its `/private` spelling
-/// (`<dir> and /private<dir>`), stays within [`GRANT_TEXT_MAX`].
 const GRANT_FOLDER_SURE: usize = (GRANT_TEXT_MAX - " and /private".len()) / 2;
 
-/// A Read path Claude Code asks about itself, as a name it distrusts on Windows:
-/// `~` and a digit anywhere (`x~1.txt`), a component ending in `.` or white
-/// space, a `...` component, or a path ending in a device name's extension
-/// (`paper.aux`).
 fn vendor_distrusts(path: &str) -> bool {
     let tilde_digit = path
         .as_bytes()
@@ -1645,27 +1064,12 @@ fn vendor_distrusts(path: &str) -> bool {
     tilde_digit || odd_component || device
 }
 
-/// What full power's ledger subject puts between a box and the option it
-/// chose, for every rule but a one-shot allow ([`RULE_ALLOW_ONCE`]) and the
-/// trust dialog's ([`RULE_TRUST_ANY`]), whose subject is the box alone: `<the
-/// box's command or title> => <the option's label>` (`… => No, keep
-/// default`, `… => Stop and wait for limit to reset`). Settings ▸ Harness's
-/// DECIDED FOR YOU reads it back (`crate::harness::stats`) to say which
-/// option was pressed, so the two cannot drift.
+/// What full power's ledger subject puts between a box and the option it chose.
 pub const SUBJECT_OPTION: &str = " => ";
 
-/// What an rm circuit breaker's warned box approved under `approve =
-/// "safe"` says in its ledger row's reason (after `unproven:` and the
-/// breaker's name): Settings ▸ Harness's DECIDED FOR YOU reads it back
-/// (`crate::harness::stats`) to name the switch that pressed it.
+/// Audit reason recorded when an `rm` circuit-breaker warning box is approved under `safe`.
 pub const WARNED_UNDER_SAFE: &str = "approved with this warning under approve = \"safe\"";
 
-/// Under `approve = "safe"`, the rm breaker the safe rules left (`safe`: their
-/// reason), approved with a warning ([`RULE_RM_BREAKER_WARN`]) only in the form
-/// the rm rule was written for: a vouched Claude Code Bash box whose note is one
-/// `rm` on a possibly-empty variable ([`RmBreakerKind::EmptyVariable`],
-/// [`resolvable_breaker`]) with one plain one-shot `Yes` and a `No`. Every other
-/// breaker kind, another machine's box, or other options keep the escalation.
 fn rm_breaker_warn(reading: &Reading, rows: &[String], safe: String) -> Decision {
     if !draws_claude_boxes(reading.program)
         || reading.phase != Phase::Prompt
@@ -1716,10 +1120,6 @@ fn rm_breaker_warn(reading: &Reading, rows: &[String], safe: String) -> Decision
     }
 }
 
-/// Why the box's title is not what the reader found, when it is not: a box
-/// taller than the pane, or a box of no kind whose first row is its own
-/// question (the walk up stopped inside its body). Such a box is not read
-/// whole, and nothing is pressed on it ([`decide`]).
 fn head_unread(reading: &Reading) -> Option<String> {
     let p = reading.prompt.as_ref()?;
     let why = if p.head_off_screen {
@@ -1735,34 +1135,15 @@ fn head_unread(reading: &Reading) -> Option<String> {
     ))
 }
 
-/// What a box not read whole waits for, at every level (under `approve =
-/// "none"` too, so it promises no answer).
 const UNREAD: &str = "nothing is pressed on a box not read whole: it is decided again once the \
                       pane shows it whole";
 
-/// What a declined box taller than the screen is told of itself.
 const TALL_WHY: &str =
     "it is taller than the screen, so the harness cannot read all of it to check it";
 
-/// How a declined tall box's flagged removal is to be rerun: its quoted
-/// invocation leans on variables the surrounding line binds, and Claude Code's
-/// Bash tool keeps no shell state between calls, so run alone it could expand
-/// to `rm -rf /`. Paths go in literally, and the rm rule then judges the short
-/// box whole.
 const TALL_RM_PATHS: &str = "its paths written as literal absolute paths (a command run on its \
                              own keeps none of this one's shell variables)";
 
-/// The answer, at every level that answers at all, to a box whose head is off
-/// the screen (`why`, [`head_unread`]): nothing is chosen among options read
-/// without their box. In a bypass session, a foot note flagging a removal
-/// ([`PromptV2::foot_note`]) on a `Yes`/`No` proceed box
-/// ([`yes_no_to_proceed`]), with the rm rule's roots present, is declined
-/// ([`decline`], [`RULE_TALL_BOX`]) — the plain `No` with a reason, which
-/// settles nothing and whatever the cut title — telling the worker to rerun
-/// the quoted part alone with literal paths ([`TALL_RM_PATHS`]), or, under a
-/// breaker the vendor drew because it could not rule an rm out
-/// ([`breaker_not_ruled_out`]), to split the line. Everything else is handed
-/// over with `why`.
 fn tall_box(reading: &Reading, rows: &[String], ctx: &ApprovalCtx, why: String) -> Decision {
     let handed_over = |not: Option<String>| {
         Decision::escalate(match not {
@@ -1793,9 +1174,6 @@ fn tall_box(reading: &Reading, rows: &[String], ctx: &ApprovalCtx, why: String) 
     if let Err(not) = yes_no_to_proceed(prompt, rows) {
         return handed_over(Some(not));
     }
-    // A breaker by which the vendor could not rule an rm out is drawn over a
-    // command that may name none: the line is to be split, not a removal
-    // pulled out of it.
     let fix = if rm_breaker_of(&note).is_some_and(|b| breaker_not_ruled_out(&b)) {
         format!(
             "Split it into shorter commands with fewer substitutions, run one at a time, any \
@@ -1815,9 +1193,6 @@ fn tall_box(reading: &Reading, rows: &[String], ctx: &ApprovalCtx, why: String) 
     decline(RULE_TALL_BOX, prompt, text, subject).unwrap_or_else(|not| handed_over(Some(not)))
 }
 
-/// `Ok` when a box's foot is a permission box's: `Do you want to proceed?`
-/// (anchor `prompt.proceed`) with exactly a one-shot allow then a refusal
-/// (the refusal's input may be open or filled by a decline).
 fn yes_no_to_proceed(prompt: &PromptV2, rows: &[String]) -> Result<(), String> {
     let proceed = anchor("prompt.proceed");
     if !prompt
@@ -1837,18 +1212,12 @@ fn yes_no_to_proceed(prompt: &PromptV2, rows: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-/// The invocation a removal note quotes between backticks (`… in \`rm -rf
-/// $S/$1\` (…)`), when it quotes exactly one.
 fn quoted_invocation(note: &str) -> Option<&str> {
     let (_, rest) = note.split_once('`')?;
     let (inv, after) = rest.split_once('`')?;
     (!inv.trim().is_empty() && !after.contains('`')).then_some(inv.trim())
 }
 
-/// The safe rules alone ([`Approve::Safe`]): the rule for the box's kind,
-/// or an escalation. They judge Claude Code's boxes, and of another
-/// harness's only its folder-trust dialog in the one folder a worker's
-/// starter trusted for it ([`spawned_trust`]).
 fn decide_safe(reading: &Reading, rows: &[String], ctx: &ApprovalCtx) -> Decision {
     if !draws_claude_boxes(reading.program) {
         if let Some(prompt) = reading.prompt.as_ref()
@@ -1881,8 +1250,7 @@ fn decide_safe(reading: &Reading, rows: &[String], ctx: &ApprovalCtx) -> Decisio
     }
 }
 
-/// Read `rows` with the reader for `program` ([`aterm_phase::read`]) and
-/// [`decide`] the box on them; `None` when that reader sees no box.
+/// Read `rows` with the reader for `program` ([`aterm_phase::read`]) and [`decide`] the box on them.
 pub fn decide_screen(
     program: Option<&str>,
     rows: &[String],
@@ -1893,8 +1261,6 @@ pub fn decide_screen(
     Some(decide(&reading, rows, ctx))
 }
 
-/// The screen row a box's content row is drawn on: the first row of the
-/// box's span whose text, a `│` bar and the indent stripped, is `text`.
 fn row_of(rows: &[String], prompt: &PromptV2, text: &str) -> Option<usize> {
     let (top, bottom) = prompt.span;
     (top + 1..bottom.min(rows.len())).find(|&k| {
@@ -1903,10 +1269,6 @@ fn row_of(rows: &[String], prompt: &PromptV2, text: &str) -> Option<usize> {
     })
 }
 
-/// The screen row of a file box's `path`: the bare path (2.1.282), a Read
-/// box's call (2.1.284 and later), `Read(<path>)`, or Muse Code's file box's
-/// `write path: <path>` (1.4.10). ONE row: a call that wraps names no row,
-/// and nothing is pressed under it.
 fn file_path_row(rows: &[String], prompt: &PromptV2, path: &str) -> Option<usize> {
     row_of(rows, prompt, path)
         .or_else(|| row_of(rows, prompt, &format!("{}{path})", anchor("box.read_call"))))
@@ -1919,9 +1281,6 @@ fn file_path_row(rows: &[String], prompt: &PromptV2, path: &str) -> Option<usize
         })
 }
 
-/// The one plain one-shot allow of a numbered box, what the safe rules press:
-/// exactly one numbered [`Role::Once`] with a [`Role::Deny`] beside it, never
-/// while an amend input is open ([`amend_input_open`]).
 fn once_choice(prompt: &PromptV2) -> Result<Choice, String> {
     if prompt.select != Select::Digits {
         return Err("an unnumbered box".to_string());
@@ -1954,19 +1313,11 @@ fn once_choice(prompt: &PromptV2) -> Result<Choice, String> {
         .ok_or_else(|| "the one-shot allow has no number".to_string())
 }
 
-/// Why no digit is pressed while [`amend_input_open`].
 const OPEN_INPUT: &str =
     "the focus is on an open `No, and …` input: a digit would be typed into it";
 
-/// Whether the focus is on the refusal's open amend input: a `No, …` label (the
-/// placeholder or typed text) over a footer reading `Esc to cancel` alone.
-/// Claude Code sends every key but the arrows to that input, so a digit would
-/// be typed into it. A fixed refusal label (the footerless Fetch and network
-/// boxes' `No, and tell Claude … (esc)`, Chrome's `Deny (esc)`) is no input.
 fn amend_input_open(prompt: &PromptV2) -> bool {
     let amended = format!("{REFUSAL_LABEL}, ");
-    // The keys of the box's own footer, less the vendor's note about background
-    // agents, which an agent's box keeps drawn while the input hides `Tab to amend`.
     let footer_alone = prompt
         .footer
         .as_deref()
@@ -1978,21 +1329,16 @@ fn amend_input_open(prompt: &PromptV2) -> bool {
             .any(|o| o.focused && o.role == Role::Deny && o.label.starts_with(&amended))
 }
 
-/// How many options the focus moves from option `from` to option `to`.
 fn focus_steps(from: usize, to: usize) -> i32 {
     i32::try_from(to).unwrap_or(0) - i32::try_from(from).unwrap_or(0)
 }
 
-/// `❯ 1. Yes` / `2. No`: a number, a dot, a space.
 fn is_option_row(t: &str) -> bool {
     let t = t.strip_prefix('❯').map_or(t, str::trim_start);
     let digits = t.chars().take_while(char::is_ascii_digit).count();
     (1..=2).contains(&digits) && t[digits..].starts_with(". ")
 }
 
-/// No option-shaped row above the box's question: options are the rows under
-/// `Do you want …`, and a `1. Yes` among command rows is command text or a
-/// forgery (a second line of defence behind aterm-phase).
 fn no_option_above_the_question(prompt: &PromptV2, rows: &[String]) -> Result<(), String> {
     let (top, bottom) = prompt.span;
     let bottom = bottom.min(rows.len());
@@ -2005,36 +1351,20 @@ fn no_option_above_the_question(prompt: &PromptV2, rows: &[String]) -> Result<()
     Ok(())
 }
 
-/// The box's content width in cells, from its top rule of `─` above the title;
-/// `None` when it has none.
 fn box_width(prompt: &PromptV2, rows: &[String]) -> Option<usize> {
     let rule = rows.get(prompt.span.0.checked_sub(1)?)?;
     let t = rule.trim();
     (!t.is_empty() && t.chars().all(|c| c == '─')).then(|| rule.trim_end().chars().count())
 }
 
-/// Whether a row's width in cells is its character count: printable ASCII only.
-/// The server's row text omits wide characters' continuation cells, and emoji
-/// width depends on the font, so any other row is never measured (no
-/// narrowing, every reading).
 fn cells_are_chars(row: &str) -> bool {
     row.bytes().all(|b| (0x20..0x7f).contains(&b))
 }
 
-/// How far inside the box's width a row plus the next row's first word must end
-/// before the row is taken as not wrapped: a quarter of the width, well inside
-/// any right edge the box can have.
 fn wrap_margin(width: usize) -> usize {
     (width / 4).max(8)
 }
 
-/// The readings of a Bash box's command to judge ([`PromptV2::readings`]),
-/// narrowed by geometry only for the rm breaker (`rm_breaker`) and only where
-/// the screen proves it. Without bars the command is one shell line, so a later
-/// row is its tail only if it is a wrap; a row ending with room to spare for the
-/// next word ([`wrap_margin`]) ends the command, and rows under it are judged
-/// as description. Barred boxes, boxes without a top rule, and non-ASCII rows
-/// ([`cells_are_chars`]) are judged under every reading.
 fn command_readings(prompt: &PromptV2, rows: &[String], rm_breaker: bool) -> (Vec<String>, String) {
     let all = prompt.readings();
     let n = prompt.command_rows.len();
@@ -2076,7 +1406,6 @@ fn command_readings(prompt: &PromptV2, rows: &[String], rm_breaker: bool) -> (Ve
 }
 
 fn bash(prompt: &PromptV2, rows: &[String], ctx: &ApprovalCtx) -> Decision {
-    // Every header form aterm-phase reads: an origin, `(unsandboxed)`,
     // `(runs on <m>)`. An unreadable suffix is no Bash header.
     if prompt.base_title().as_deref() != Some(anchor("box.bash")) {
         return Decision::escalate(format!(
@@ -2104,7 +1433,6 @@ fn bash(prompt: &PromptV2, rows: &[String], ctx: &ApprovalCtx) -> Decision {
     let (readings, subject) = command_readings(prompt, rows, rm_breaker);
     let guard = row_guard(&rows[first_row]);
     if rm_breaker {
-        // The scratch-root proof is this machine's, so an rm running on another
         // machine is not proven by it.
         if let Some(machine) = prompt.runs_on() {
             return Decision::escalate(format!(
@@ -2149,9 +1477,6 @@ fn bash(prompt: &PromptV2, rows: &[String], ctx: &ApprovalCtx) -> Decision {
                 ));
             }
         }
-        // After the line's own proof: a refused line is refused on where it
-        // points, and a proven one still needs the screen to show its blanks
-        // and the assumed shell startup.
         if let Err(why) = blanks_shown(&readings) {
             return Decision::escalate(format!("rm circuit breaker: {why}"));
         }
@@ -2202,10 +1527,6 @@ fn bash(prompt: &PromptV2, rows: &[String], ctx: &ApprovalCtx) -> Decision {
     }
 }
 
-/// `Ok` when no git read on any reading of a read-only line would load
-/// configuration that runs a program ([`super::git_config`]); `Err` names the
-/// key, hook, or why the check failed. A box on another machine cannot be
-/// checked.
 fn git_reads_clear(
     readings: &[String],
     runs_on: Option<&str>,
@@ -2233,10 +1554,6 @@ fn git_reads_clear(
             .worker
             .as_ref()
             .map_err(|why| format!("a git read whose environment is unknown: {why}"))?;
-        // Both looks at the machine go through the context's probe: the
-        // settings' `env` blocks, and the configuration each directory's git
-        // loads — projected to what `hazard` reads, so the view judged here is
-        // the very one a harness tape holds (`GitView::project`).
         ctx.probe.settings_env(worker, &ctx.cwd)?;
         let writes = WorkerWrites::of(ctx);
         for dir in &reads.dirs {
@@ -2252,7 +1569,6 @@ fn git_reads_clear(
     Ok(())
 }
 
-/// How a reason names a reading: by the join it has.
 fn reading_name(line: &str) -> &'static str {
     if line.contains('\n') {
         "newline reading"
@@ -2261,12 +1577,6 @@ fn reading_name(line: &str) -> &'static str {
     }
 }
 
-/// `Ok` unless the Bash tool may run the line under zsh
-/// ([`ShellStartup::may_run_zsh`]) and a reading of it is not plain
-/// ([`plain_zsh_line`]): under zsh the read-only rule proves only a line
-/// whose expansions zsh takes no further than bash (a plain `$NAME`,
-/// `${NAME}` or `$(…)`, MEASURED 2026-10-22), which the classifier judges. A
-/// startup not read is [`shell_models_hold`]'s refusal, made before this.
 fn plain_under_zsh(readings: &[String], ctx: &ApprovalCtx) -> Result<(), String> {
     if !ctx.shell.as_ref().is_ok_and(ShellStartup::may_run_zsh) {
         return Ok(());
@@ -2278,8 +1588,7 @@ fn plain_under_zsh(readings: &[String], ctx: &ApprovalCtx) -> Result<(), String>
     Ok(())
 }
 
-/// `Ok` when every reading of a Bash box's command ([`command_readings`])
-/// classifies read-only; `Err` names the reading and the reason.
+/// `Ok` when every reading of a Bash box's command ([`command_readings`]) classifies read-only.
 pub(crate) fn read_only_every_reading(
     readings: &[String],
     python_allow: &[String],
@@ -2300,36 +1609,12 @@ pub(crate) fn read_only_every_reading(
     Ok(())
 }
 
-/// THE READ-ONLY RULE'S VERDICT ON A BASH BOX'S COMMAND ALONE: `Ok` when
-/// every reading of it classifies read-only ([`read_only_every_reading`])
-/// and none turns on a blank the screen cannot show ([`blanks_shown`]),
-/// checked in that order, the first refusal returned. [`bash`]'s read-only
-/// rule needs this before its vendor-note, mode, startup, zsh and git checks
-/// (which read the box and the session, not the command), and the window's
-/// advisory word for a Bash box (`aterm-gui`'s `presence::prompt_detail`,
-/// `bash:read-only`) is this: the rule's verdict on the command alone, never
-/// read-only for a command this refuses. The word reads neither the box nor
-/// the session, so the rules still refuse some boxes it calls read-only (a
-/// vendor note, bypass, a breaker's options or a removal it names, the
-/// shell's startup, a line not plain under zsh, git configuration that runs
-/// a program).
-///
-/// # Errors
-///
-/// The first reading that is not read-only, else the first that holds a
-/// form the shell may read otherwise than drawn, named.
+/// THE READ-ONLY RULE'S VERDICT ON A BASH BOX'S COMMAND ALONE.
 pub fn readings_read_only(readings: &[String], python_allow: &[String]) -> Result<(), String> {
     read_only_every_reading(readings, python_allow)?;
     blanks_shown(readings)
 }
 
-/// `Ok` when no reading of a Bash box's rows ([`command_readings`]) holds a
-/// form in which the shell may read a blank the screen does not show
-/// ([`box_command::blanks_read_as_drawn`]: the screen draws a tab as the
-/// blanks to its stop and shows no blank at a row's end, so a command the
-/// shell reads otherwise draws as the same rows); `Err` names the reading and
-/// the form. Every rule that proves a Bash box from its rows needs this: a
-/// reading proves only the commands the shell reads as it.
 fn blanks_shown(readings: &[String]) -> Result<(), String> {
     readings.iter().try_for_each(|line| {
         box_command::blanks_read_as_drawn(line)
@@ -2337,44 +1622,11 @@ fn blanks_shown(readings: &[String]) -> Result<(), String> {
     })
 }
 
-/// Why no rule approves the nested breaker ([`RmBreakerKind::NestedUnanalyzed`]),
-/// read from 2.1.307's bundle and MEASURED: the vendor draws it only for a line
-/// whose parse put a shell keyword right after an assignment or a redirect
-/// (`X=1 if …`), when the `${ …; }` function substitutions in it overrun its
-/// budget of 16 or one does not parse. bash reads such a keyword as a program's
-/// name, and the classifier reads no `${ …; }` form, so no reading of such a
-/// line is ever proven a read.
 const NESTED_UNPROVEN: &str = "the vendor draws this only over a shell keyword right after an \
                                assignment or a redirect (bash runs a program by that name) with \
                                `${ …; }` function substitutions, neither of which aterm's \
                                classifier proves a read";
 
-/// [`RULE_BREAKER_READ_ONLY`]: a breaker by which the vendor could not rule a
-/// removal out ([`breaker_not_ruled_out`]), which 2.1.307 draws over commands
-/// that name no rm. It is approved only where aterm's own reading proves the
-/// whole command a read, by the checks [`bash`]'s read-only rule trusts and
-/// with nothing narrowed. Every reading of the box's command is judged
-/// ([`PromptV2::readings`]; a barred box's rows newline-joined too, since the
-/// screen cannot tell a wrap from a newline), and none may turn on a blank
-/// the screen cannot show ([`blanks_shown`]). A matching transcript call
-/// ([`ApprovalCtx::box_command`], drawn as the box's rows and its call's row:
-/// [`box_command::drawn_as`]) adds its reading, never removes one: an
-/// older call can remain pending while this box's call has not reached the
-/// file, even across the settle. Drawing alike is no current-box identity.
-/// A refusal also says why a transcript call was not taken. Each
-/// command judged classifies read-only, so every
-/// simple command in every substitution is a known read, no redirect writes,
-/// no word the line computes is a command's name and nothing evaluates text
-/// again (`eval`); the shell's startup is the modelled one, aliases and
-/// functions included ([`shell_models_hold`]); a line the Bash tool may run
-/// under zsh is plain ([`plain_under_zsh`]: no expansion zsh takes further
-/// than bash); its git
-/// reads load no configuration that runs a program ([`git_reads_clear`]). The
-/// command must name no `rm` or `rmdir` anywhere, in any letter case
-/// ([`names_a_removal`]), and the box must be the breaker's own `Yes`/`No`
-/// ([`yes_no_to_proceed`]). Only the too-many kind: the nested kind is
-/// [`NESTED_UNPROVEN`]. Every refusal escalates, its reason led by the
-/// breaker's label ([`rm_breaker_label`]).
 fn breaker_read_only(
     prompt: &PromptV2,
     rows: &[String],
@@ -2390,10 +1642,6 @@ fn breaker_read_only(
     if let Err(why) = yes_no_to_proceed(prompt, rows) {
         return refused(why);
     }
-    // A stable transcript can still name an older call. Keep every screen
-    // reading, even where that call draws exactly the same rows. The
-    // screen's readings are its text, whose blanks may not be the command's;
-    // the call's command is its own.
     let (mut readings, subject) = command_readings(prompt, rows, false);
     let unseen = blanks_shown(&readings);
     let (from_transcript, not_taken) = match &ctx.box_command {
@@ -2448,10 +1696,6 @@ fn breaker_read_only(
     }
 }
 
-/// Whether `line` names `rm` or `rmdir` as a word anywhere, in any letter case
-/// (the vendor's own test, `/\brm(?:dir)?\b/`, made case-blind: a
-/// case-insensitive file system runs `RM` as `rm`). A word here is a run of
-/// ASCII letters, digits and `_`.
 fn names_a_removal(line: &str) -> bool {
     let lower = line.to_ascii_lowercase();
     let bytes = lower.as_bytes();
@@ -2466,10 +1710,6 @@ fn names_a_removal(line: &str) -> bool {
     })
 }
 
-/// `Ok` when [`RULE_RM_BREAKER`]'s resolver may judge this breaker: an `rm` on a
-/// possibly-empty variable ([`RmBreakerKind::EmptyVariable`]) whose note is
-/// read whole (one note, one `Dangerous`, its advice's parentheses closed).
-/// `Err` names the kind and why not.
 fn resolvable_breaker(b: &RmBreaker) -> Result<(), String> {
     if b.command != RmCommand::Rm || !matches!(b.kind, RmBreakerKind::EmptyVariable { .. }) {
         return Err(format!(
@@ -2488,13 +1728,7 @@ fn resolvable_breaker(b: &RmBreaker) -> Result<(), String> {
     Ok(())
 }
 
-/// The vendor's rm/rmdir breaker as a reason names it, in the note's own words
-/// (`the rm circuit breaker (statically-unresolvable target)`). The words are
-/// aterm-phase's anchors. The two kinds by which the vendor could not rule an
-/// rm out ([`RmBreakerKind::TooManySubstitutions`],
-/// [`RmBreakerKind::NestedUnanalyzed`]) say so, and that the command need not
-/// name rm: 2.1.307 draws them over commands with none (MEASURED, `echo` and
-/// 65 `$(true)`).
+/// The vendor's rm/rmdir breaker as a reason names it, in the note's own words (`the rm circuit breaker (statically-unresolvable target)`).
 pub fn rm_breaker_label(b: &RmBreaker) -> String {
     let id = match b.kind {
         RmBreakerKind::EmptyVariable {
@@ -2530,9 +1764,6 @@ pub fn rm_breaker_label(b: &RmBreaker) -> String {
     format!("the {command} circuit breaker ({why})")
 }
 
-/// Whether this breaker is one by which the vendor could not rule a removal
-/// out (its analysis gave up), not one that found a removal: such a box is
-/// drawn whether or not the command names rm (2.1.307 on).
 fn breaker_not_ruled_out(b: &RmBreaker) -> bool {
     matches!(
         b.kind,
@@ -2540,10 +1771,6 @@ fn breaker_not_ruled_out(b: &RmBreaker) -> bool {
     )
 }
 
-/// A breaker box's escalation `reason` with its kind named once: unchanged if
-/// it already carries [`rm_breaker_label`]; the label in place of a leading
-/// "the/an rm circuit breaker" (rmdir alike); else the label and a colon in
-/// front.
 fn name_the_breaker(b: &RmBreaker, reason: String) -> String {
     let label = rm_breaker_label(b);
     if reason.contains(&label) {
@@ -2562,10 +1789,7 @@ fn name_the_breaker(b: &RmBreaker, reason: String) -> String {
     }
 }
 
-/// What a decline tells the worker ([`Decision::Decline`]): [`DECLINE_PREFIX`],
-/// that `what` was not run and why (cut at [`DECLINE_WHY_CHARS`]), and `fix`.
-/// One printable line: control characters, tabs (would close the input) and
-/// newlines (would submit) become spaces.
+/// What a decline tells the worker ([`Decision::Decline`]).
 #[must_use]
 pub fn decline_text(what: &str, why: &str, fix: &str) -> String {
     let why = clip(why.trim().trim_end_matches('.'), DECLINE_WHY_CHARS);
@@ -2581,14 +1805,7 @@ pub fn decline_text(what: &str, why: &str, fix: &str) -> String {
         .collect()
 }
 
-/// The decline's one constructor: `text` typed into the box's refusal
-/// ([`refusal_of`]) under `rule_id`, naming `subject`, or `Err` when the box
-/// offers no refusal to amend (the caller escalates). A box with a decline
-/// already under way is the same decline, so a stopped loop resumes it.
-///
-/// Claude Code's bare `No` aborts the worker's turn and asks the person what
-/// to do next. Nonempty amended feedback lets the worker continue in the same
-/// turn; a digit on `No`, or Enter on its empty input, is not that feedback.
+/// The decline's one constructor.
 pub fn decline(
     rule_id: &'static str,
     prompt: &PromptV2,
@@ -2604,25 +1821,19 @@ pub fn decline(
     })
 }
 
-/// `text` with all whitespace dropped, so wrapped rows read back as what was
-/// written (an option label here, a composer draft in `turn_end_loop.rs`).
+/// `text` with all whitespace dropped, so wrapped rows read back as what was written.
 pub(crate) fn squashed(text: &str) -> String {
     text.chars().filter(|c| !c.is_whitespace()).collect()
 }
 
-/// The refusal as drawn with its input open and empty: `No, and tell Claude
-/// what to do differently`.
 fn amend_open_label() -> String {
     format!("{REFUSAL_LABEL}, {}", anchor("prompt.amend_no"))
 }
 
-/// The refusal with `text` typed into its input: `No, <text>`.
 fn amended_label(text: &str) -> String {
     format!("{REFUSAL_LABEL}, {text}")
 }
 
-/// Whether the box's footer offers `Tab to amend` (Claude Code draws it
-/// while the focused option is an allow, or a refusal whose input is shut).
 fn offers_amend(prompt: &PromptV2) -> bool {
     let hint = anchor("prompt.amend");
     prompt
@@ -2631,10 +1842,6 @@ fn offers_amend(prompt: &PromptV2) -> bool {
         .is_some_and(|f| f.split(" · ").any(|h| h == hint))
 }
 
-/// The option a decline amends: the one [`Role::Deny`] plain `No`
-/// ([`REFUSAL_LABEL`]) on a footer offering `Tab to amend`, or during a decline
-/// the focused refusal whose input is open ([`amend_open_label`]) or holds
-/// `text` ([`amended_label`]).
 fn refusal_of(prompt: &PromptV2, text: &str) -> Result<usize, String> {
     let open = amend_open_label();
     let typed = squashed(&amended_label(text));
@@ -2665,30 +1872,16 @@ fn refusal_of(prompt: &PromptV2, text: &str) -> Result<usize, String> {
     Ok(k)
 }
 
-/// The next keystroke of a decline ([`decline_step`]) with the guard of the row
-/// showing the state it answers ([`super::guard::row_guard`]).
+/// The next keystroke of a decline with the guard of the row showing the state it answers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DeclineStep {
-    /// `down` (or `up`) toward the refusal, guarded on the focused row.
     Move { down: bool, guard: String },
-    /// `tab` on the focused `No`: its input opens.
     Amend { guard: String },
-    /// The text, typed into the open, empty input.
     Type { guard: String },
-    /// `enter` on the input that shows the text: the refusal, with it.
     Submit { guard: String },
 }
 
-/// A decline's next keystroke on a fresh read: focus elsewhere, move onto the
-/// refusal; on the shut `No` (footer offers `Tab to amend`), Tab; on the open
-/// empty input, the text; on the input showing exactly the text, Enter. `Err`
-/// for anything else, where no keystroke is sound.
-///
-/// Tab toggles the focused option's input; it is not an idempotent open.
-/// The loop must keep one key in flight and wait for the drawn state before
-/// the next step, or a second Tab can close the input underneath the text.
-/// The recorded `cap-decline-*.txt` states and their guarded transition test
-/// in `approval_tests.rs` retain the evidence for this sequence.
+/// A decline's next keystroke on a fresh read.
 pub fn decline_step(
     prompt: &PromptV2,
     rows: &[String],
@@ -2742,15 +1935,11 @@ pub fn decline_step(
 
 fn read_box(prompt: &PromptV2, rows: &[String], ctx: &ApprovalCtx) -> Decision {
     if !prompt.base_title().as_deref().is_some_and(is_read_title) {
-        // A Bash box's description row (`Read file /etc/hosts`) is not a
-        // Read header, and neither is a ` · ` suffix the grammar cannot read.
         return Decision::escalate(format!(
             "the box header is not a Read header: {}",
             prompt.title
         ));
     }
-    // The proof is local (symlinks on this machine, secrets under this
-    // `$HOME`), so a Read running on another machine is not proven.
     if let Some(machine) = prompt.runs_on() {
         return Decision::escalate(format!(
             "a Read on {machine}: its path is not on this machine"
@@ -2766,21 +1955,12 @@ fn read_box(prompt: &PromptV2, rows: &[String], ctx: &ApprovalCtx) -> Decision {
         Ok(c) => c,
         Err(why) => return Decision::escalate(why),
     };
-    // The box draws the path as text. A character it draws as another (newline,
-    // tab, escape: U+FFFD) or that this screen drops (a zero-width joiner) makes
-    // the name judged here one that is not there, so only plain ASCII is proven
-    // (the ` · ` of a view is the one exception).
     if !path
         .split(" · ")
         .all(|part| part.bytes().all(|b| (0x20..0x7f).contains(&b)))
     {
         return Decision::escalate(format!("a Read of a path outside plain ASCII: {path}"));
     }
-    // The view the model asked for rides inside the call (`Read(<path> · lines
-    // 1-5)`), and the screen cannot tell it from a name that ends like one: every
-    // path the text can mean is judged.
-    // Every reading's text first, then the disk: a reading that names a secret
-    // says so whatever a sibling reading's folders let this user look at.
     let mut lexical = Vec::new();
     for reading in read_readings(path) {
         match read_path_lexical(reading, ctx) {
@@ -2802,21 +1982,15 @@ fn read_box(prompt: &PromptV2, rows: &[String], ctx: &ApprovalCtx) -> Decision {
     }
 }
 
-/// Every path a Read call's text can mean: the whole of it, and each prefix cut
-/// at a ` · ` (Claude Code draws the view the model asked for after one).
 fn read_readings(call: &str) -> impl Iterator<Item = &str> {
     std::iter::once(call).chain(call.match_indices(" · ").map(|(at, _)| &call[..at]))
 }
 
-/// A Read box's base title ([`PromptV2::base_title`]): `Read file`, `Read
-/// files` or `Read file(s)`.
 fn is_read_title(base: &str) -> bool {
     base.strip_prefix(anchor("box.read"))
         .is_some_and(|rest| matches!(rest, "" | "s" | "(s)"))
 }
 
-/// `path` resolved to its absolute components: `~/…` against `home`, no
-/// glob, no `..`.
 fn resolve_abs(path: &str, home: Option<&Path>) -> Result<Vec<String>, String> {
     if path.contains(['*', '?', '[', '{']) {
         return Err(format!("a pattern: {path}"));
@@ -2824,7 +1998,6 @@ fn resolve_abs(path: &str, home: Option<&Path>) -> Result<Vec<String>, String> {
     let full = if let Some(rest) = path.strip_prefix("~/") {
         let home = home.ok_or_else(|| format!("{path} under ~ with no home to resolve it"))?;
         let home = home.to_string_lossy();
-        // A Windows home (`C:\Users\…`) is no `/` path these rules read.
         if !home.starts_with('/') {
             return Err(format!(
                 "{path} under a home that is not a `/` path ({home})"
@@ -2839,13 +2012,7 @@ fn resolve_abs(path: &str, home: Option<&Path>) -> Result<Vec<String>, String> {
     abs_components(&full).ok_or_else(|| format!("a path with `..`: {path}"))
 }
 
-/// A Read box's path, as text: absolute or `~/…`, one plain path (no glob, no
-/// `..`), under an [`ApprovalCtx::read_roots`] root and outside every
-/// [`SecretRule`]. Its components, for [`read_path_on_disk`].
 fn read_path_lexical(path: &str, ctx: &ApprovalCtx) -> Result<Vec<String>, String> {
-    // The components below drop an empty one (`a//b`, `a/./b`, a trailing `/`),
-    // so the path judged would not be the one drawn. Claude Code collapses those
-    // in a real path, so one on the box means the screen drew a name as nothing
     // (zero-width characters only): a person reads it.
     if path.contains("//") || path.contains("/./") || path.ends_with('/') {
         return Err(format!(
@@ -2857,14 +2024,7 @@ fn read_path_lexical(path: &str, ctx: &ApprovalCtx) -> Result<Vec<String>, Strin
     Ok(comps)
 }
 
-/// A Read box's path ([`read_path_lexical`]'s `comps`), on this machine: where
-/// its symlinks lead passes the same checks, and no name beside one on its way
-/// differs from it only by characters the box may not draw. Both looks at the
-/// disk go through the context's probe ([`ApprovalCtx::probe`]:
-/// [`PolicyProbe::real_components`], [`PolicyProbe::hidden_twin`]).
 fn read_path_on_disk(path: &str, comps: &[String], ctx: &ApprovalCtx) -> Result<(), String> {
-    // Apply the same root/secret checks to the symlink target observed now.
-    // The worker can change it before its later file open.
     let real = ctx
         .probe
         .real_components(comps)
@@ -2872,8 +2032,6 @@ fn read_path_on_disk(path: &str, comps: &[String], ctx: &ApprovalCtx) -> Result<
     if real != comps {
         read_comps_allowed(&real, &format!("{path} (-> /{})", real.join("/")), ctx)?;
     }
-    // The scan lists folders, so it runs for a path every cheaper test passed:
-    // one that is held lists nothing.
     if let Some(twin) = ctx.probe.hidden_twin_in(comps, ctx.home.as_deref())? {
         return Err(format!(
             "a Read of {path}: {twin:?} differs from it only by characters the box may not \
@@ -2884,8 +2042,6 @@ fn read_path_on_disk(path: &str, comps: &[String], ctx: &ApprovalCtx) -> Result<
     Ok(())
 }
 
-/// The root and secret checks of [`read_path_lexical`] on one spelling of
-/// the path (`shown` in the reason).
 fn read_comps_allowed(comps: &[String], shown: &str, ctx: &ApprovalCtx) -> Result<(), String> {
     let path = shown;
     if !ctx.read_roots.iter().any(|r| r.holds(comps)) {
@@ -2909,12 +2065,6 @@ fn read_comps_allowed(comps: &[String], shown: &str, ctx: &ApprovalCtx) -> Resul
     Ok(())
 }
 
-/// The folder-trust dialog ([`RULE_TRUST_DIALOG`]): its folder is the session's
-/// launch directory under a trust root (or the one folder the session's
-/// starter trusted for it, [`ApprovalCtx::trusted_cwd`]), its options exactly
-/// an exit and a trust (Claude Code's `No, exit` and `Yes, I trust this
-/// folder`), focus on one of them. The choice moves the focus to the trust
-/// option (or presses its digit if numbered).
 fn trust_dialog(prompt: &PromptV2, rows: &[String], ctx: &ApprovalCtx) -> Decision {
     let Some(path) = prompt.path.as_deref() else {
         return Decision::escalate("a folder-trust dialog with no folder");
@@ -2928,8 +2078,6 @@ fn trust_dialog(prompt: &PromptV2, rows: &[String], ctx: &ApprovalCtx) -> Decisi
             "a folder-trust dialog with the session's cwd unknown (meta cwd=-)",
         );
     }
-    // The dialog's path block loses a space its wrap fell on (aterm-phase),
-    // so the folder is compared with the session's own directory, exactly.
     let cwd = abs_components(&ctx.cwd.to_string_lossy());
     if cwd.as_deref() != Some(comps.as_slice()) {
         return Decision::escalate(format!(
@@ -2937,7 +2085,6 @@ fn trust_dialog(prompt: &PromptV2, rows: &[String], ctx: &ApprovalCtx) -> Decisi
             ctx.cwd.display()
         ));
     }
-    // The session's own starter's folder, exactly (`ApprovalCtx::trusted_cwd`).
     let spawned = ctx
         .trusted_cwd
         .as_deref()
@@ -3000,21 +2147,6 @@ fn trust_dialog(prompt: &PromptV2, rows: &[String], ctx: &ApprovalCtx) -> Decisi
     }
 }
 
-/// ANOTHER HARNESS'S FOLDER-TRUST DIALOG ON A WORKER ([`RULE_TRUST_DIALOG`],
-/// `spawn agent=agy|muse`): agy's (`Do you trust the contents of this
-/// project?`) and Muse Code's (`Do you trust this workspace?`), answered by
-/// the safe rules ONLY in the one folder the session's starter trusted for it
-/// ([`ApprovalCtx::trusted_cwd`], the spawn's `cwd=`), and only while the
-/// session stands there — never under a trust root, which was measured on
-/// Claude Code's dialog alone ([`trust_dialog`]). The folder is the one the
-/// dialog names, by its path, whose row guards the press. Its trust option
-/// alone is chosen; the other options must each exit or refuse. GEMINI CLI'S
-/// IS NEVER PRESSED HERE: its dialog names its folder by the last component
-/// alone (`Trust folder (<name>)`), which another folder of that name shares,
-/// and its `Trust folder` relaunches it with its argv — a worker's task —
-/// which would be sent again ([`gemini_worker_trust`]). Its worker's line
-/// trusts the spawn's folder by a trusted-folders file of its own
-/// (`harness::worker`), so in that folder it draws none.
 fn spawned_trust(
     program: Program,
     prompt: &PromptV2,
@@ -3117,13 +2249,6 @@ fn spawned_trust(
     }
 }
 
-/// A GEMINI CLI WORKER'S FOLDER-TRUST DIALOG, which nothing presses — not
-/// full power's [`RULE_TRUST_ANY`] either: on a session a spawn started
-/// Gemini CLI on ([`ApprovalCtx::worker_agent`]), the CLI's argv holds the
-/// worker's task as its first prompt, its `Trust folder` relaunches it with
-/// that argv (bundle 0.46.0: `relaunchApp` once the trust changes), and the
-/// prompt it submitted while the dialog stood would be sent a second time. A
-/// person answers it. `None` for any other box or session.
 fn gemini_worker_trust(program: Program, p: &PromptV2, ctx: &ApprovalCtx) -> Option<String> {
     (relaunches_at_trust(program)
         && p.kind == PromptKind::Trust
@@ -3135,10 +2260,6 @@ fn gemini_worker_trust(program: Program, p: &PromptV2, ctx: &ApprovalCtx) -> Opt
     })
 }
 
-/// Whether `program`'s `Trust folder` relaunches it with its argv — its
-/// first prompt with it (Gemini CLI 0.46.0's `relaunchApp` once the trust
-/// changes): a worker's task would be sent again ([`spawned_trust`],
-/// [`gemini_worker_trust`]).
 fn relaunches_at_trust(program: Program) -> bool {
     match program {
         Program::Gemini => true,
@@ -3146,13 +2267,8 @@ fn relaunches_at_trust(program: Program) -> bool {
     }
 }
 
-/// The most rows of one backstop warning's list [`backstop_warnings`]
-/// names; the rest are counted.
 const BACKSTOP_ROWS: usize = 10;
 
-/// The trust backstop's `⚠` warnings in `body`, each with its listed rows (tool
-/// permissions, directories, headersHelper), which the dialog's Yes makes apply
-/// without asking in later sessions.
 fn backstop_warnings(body: &[String]) -> Vec<String> {
     let leading_spaces = |r: &str| r.chars().take_while(|c| c.is_whitespace()).count();
     let mut out = Vec::new();
@@ -3183,16 +2299,6 @@ fn backstop_warnings(body: &[String]) -> Vec<String> {
     out
 }
 
-/// The words a purchase opens with ([`buys`]), lowercased, after a leading
-/// `yes, `: buying, adding funds, upgrading, spend limits, re-enabling usage
-/// credits (drawn only when the account holder turned them off), and switching
-/// onto usage credits (`Switch to usage credits`, which would otherwise read as
-/// a model switch, [`switches_model`]). A consent to continue with credits
-/// already on buys nothing ([`credits_consent`] is its own key's). Claude Code
-/// 2.1.304 adds two (READ in its bundle; neither captured on a screen): the
-/// spend-limit nudge's `Adjust monthly spend limit: $N`, whose Enter on a
-/// changed value raises the account's spend limit for good and carries the
-/// session on on credits, and the promotional buy screen's `Pay $X · Get $Y`.
 const PURCHASE: &[&str] = &[
     "re-enable",
     "turn on usage credits",
@@ -3211,14 +2317,8 @@ const PURCHASE: &[&str] = &[
     "set monthly spend limit",
 ];
 
-/// The words spending a limit reset opens with ([`spends`]), lowercased,
-/// after a leading `yes, `: wider than the vendor's own three labels, so a
-/// row whose tail or whose `now` the server rewords still reads as a spend.
 const RESET_SPEND: &[&str] = &["use my reset", "use your reset", "reset your session limit"];
 
-/// Whether `label`, past a leading `yes, `, opens with one of `words` as a
-/// whole word, case ignored — so a label naming a path (`billing/upgrade.rs`)
-/// opens with none.
 fn opens_with(label: &str, words: &[&str]) -> bool {
     let l = label.trim().to_lowercase();
     let l = l
@@ -3231,44 +2331,18 @@ fn opens_with(label: &str, words: &[&str]) -> bool {
     })
 }
 
-/// WHETHER CHOOSING AN OPTION LABELLED `label` SPENDS A LIMIT RESET — the ONE
-/// rule every pick and [`decide`]'s last check ask ([`buys`],
-/// [`never_spends`]): Claude Code 2.1.304's grant rows of every kind (`Use a
-/// weekly reset (…)`, the Fable one too) and its `Reset your session limit
-/// now` row on the usage-limit dialog, and each kind's `Yes, use my <kind>`
-/// on the confirmation a grant row opens, by the reader's own anchors
-/// ([`aterm_phase::spends_reset`]) and by their wide words
-/// ([`aterm_phase::uses_a_reset`]: `use` and a determiner, then a head that
-/// names a reset, so a kind the server adds or renames, however many words
-/// its name takes, still reads as a spend); and the
-/// 2.1.286–2.1.303 words the reader no longer reads (`Use your reset now
-/// (…)`, `Yes, use my reset`) by [`RESET_SPEND`], so an older build still
-/// running spends nothing either. READ in the 2.1.286, 2.1.287 and 2.1.304
-/// bundles; no such box has been captured on a screen.
-///
-/// A reset is a counted allowance with a deadline, and the weekly one claims
-/// with no confirmation at all. A confirmation whose title row is off the
-/// screen would fall to [`allow_once`], whose first plain yes is `Yes, use my
-/// weekly reset`; so such a box is pressed by no rule (it is not read whole,
-/// [`head_unread`]), a box that offers one gets the option that waits (`No,
-/// keep it`, [`RULE_NO_SPEND`]), and the grant row is chosen by
-/// [`RULE_LIMIT_RESET`] alone.
 fn spends(label: &str) -> bool {
     aterm_phase::spends_reset(label)
         || opens_with(label, RESET_SPEND)
         || aterm_phase::uses_a_reset(label)
 }
 
-/// Whether choosing `opt` would buy something: its label spends a limit
-/// reset ([`spends`]), or, past a leading `yes, `, opens with one of
-/// [`PURCHASE`]'s words as a whole word.
+/// Whether choosing `opt` would buy something.
 #[must_use]
 pub fn buys(opt: &Opt) -> bool {
     spends(&opt.label) || opens_with(&opt.label, PURCHASE)
 }
 
-/// Whether `opt` waits rather than goes on: `Stop and wait for limit to reset`,
-/// `No, keep my current model`, `Stay on …`.
 fn waits(opt: &Opt) -> bool {
     let l = opt.label.to_lowercase();
     ["stop and wait", "wait", "no, keep", "stay on", "stay "]
@@ -3276,8 +2350,6 @@ fn waits(opt: &Opt) -> bool {
         .any(|w| l.starts_with(w))
 }
 
-/// Full power's answer ([`Approve::All`]) to a box the safe rules left (`safe`:
-/// their reason, kept in an escalation and in `unproven`).
 fn full_power(reading: &Reading, rows: &[String], ctx: &ApprovalCtx, safe: String) -> Decision {
     if reading.phase != Phase::Prompt || !reading.phase_authoritative {
         return Decision::escalate(safe);
@@ -3297,15 +2369,12 @@ fn full_power(reading: &Reading, rows: &[String], ctx: &ApprovalCtx, safe: Strin
         return decision;
     }
     let pick = match p.kind {
-        // [`decide`] answers a question by its own rule first.
         PromptKind::Question => Err("a question is answered by its own rule".to_string()),
         PromptKind::PlanEnter | PromptKind::PlanExit => plan_pick(p),
         PromptKind::Trust => p
             .with_role(Role::Trust)
             .map(|o| (RULE_TRUST_ANY, o))
             .ok_or_else(|| "a folder-trust dialog with no trust option".to_string()),
-        // A held cross-session message: its one delivery, the one option
-        // that does not refuse (`Deliver this message to Claude`).
         PromptKind::HeldMessage => match p
             .options
             .iter()
@@ -3316,9 +2385,6 @@ fn full_power(reading: &Reading, rows: &[String], ctx: &ApprovalCtx, safe: Strin
             [o] if p.options.iter().any(|o| o.role == Role::Deny) => Ok((RULE_ALLOW_ONCE, *o)),
             _ => Err("a held message whose delivery is not its one other option".to_string()),
         },
-        // The read-outside dialog: its one-shot allow (`Yes, but ask again next
-        // time`), else the last `No` (`No, ask again next time`); each settles
-        // nothing.
         PromptKind::ReadOutsideSetting => match p.with_role(Role::Once) {
             Some(o) => Ok((RULE_ALLOW_ONCE, o)),
             None => p
@@ -3336,25 +2402,6 @@ fn full_power(reading: &Reading, rows: &[String], ctx: &ApprovalCtx, safe: Strin
     answer(p, rows, pick, safe)
 }
 
-/// Why full power leaves a box of `program` to a person where its picks for
-/// the kind would answer it: a program whose boxes were measured kind by kind.
-/// Gemini CLI's (0.46.0) are answered only as measured — its shell, write and
-/// edit boxes by their one [`Role::Once`] (`Allow once`), its folder-trust
-/// dialog by its [`Role::Trust`] (`Trust folder`) — so a box of another kind
-/// (an MCP tool's, a web fetch's: `Allow execution of [<tool>]?`), or one
-/// with no single one-shot allow, is never declined or allowed by the general
-/// picks. Muse Code's tool-action box (1.4.10, measured outside the lab's
-/// jail: `tool action: mcp__<server>__<tool>`, a [`PromptKind::Tool`] whose
-/// `Yes, proceed` the general picks would press) is an MCP tool's call, and
-/// goes to a person as Gemini CLI's MCP box does: the tool reaches past the
-/// shell, file and network boxes whose answers were measured. So does its
-/// network box of a command, a box of no kind (no `full URL:` row: a
-/// sandboxed `pip install`'s host, measured on 1.4.10, and the Unix-socket
-/// box, `Allow once` · `Reject`, measured outside the lab's jail): its reason
-/// says what the box is within the 120 cells a person's attention keeps of
-/// it, the command after (the attention's label names it too), where the
-/// general path's would say the box offers no refusal although its reader
-/// reads its Esc as one. `None` for every other program, and for those boxes.
 fn unmeasured_box(program: Program, p: &PromptV2) -> Option<String> {
     match program {
         Program::Gemini => {
@@ -3390,13 +2437,6 @@ fn unmeasured_box(program: Program, p: &PromptV2) -> Option<String> {
     }
 }
 
-/// Full power's answer to the model-switch confirmation
-/// ([`PromptKind::ModelSwitch`]): Claude Code asks before a person's `/model` or
-/// `/effort` change whether to pay an uncached re-read, so `Yes, switch to <m>`
-/// carries out what they asked ([`RULE_MODEL_CONFIRM`]). Pressed only when the
-/// subtitle (rows under the title to the first blank, joined) is exactly the
-/// cost warning (anchor `model_switch.cost`); a hook's confirmation (anchor
-/// `model_switch.hook`) or a reworded subtitle is handed over.
 fn model_confirm<'p>(p: &'p PromptV2, rows: &[String]) -> Result<(&'static str, &'p Opt), String> {
     let head_end = p
         .options
@@ -3442,9 +2482,6 @@ fn model_confirm<'p>(p: &'p PromptV2, rows: &[String]) -> Result<(&'static str, 
     }
 }
 
-/// The press full power makes of `pick` on `p`: its choice, the judged row's
-/// guard, the subject and `unproven` (`safe`: why the safe rules did not prove
-/// it).
 fn answer(
     p: &PromptV2,
     rows: &[String],
@@ -3468,9 +2505,6 @@ fn answer(
         Some(b) => name_the_breaker(&b, safe),
         None => safe,
     };
-    // An unnumbered box the vendor opened on its refusal (`No` listed first):
-    // pressed anyway and said so, read from option order since the press
-    // moves the focus.
     let default_no = p.select == Select::ArrowsEnter
         && p.options.first().is_some_and(|o| o.role == Role::Deny)
         && rule_id == RULE_ALLOW_ONCE;
@@ -3481,16 +2515,12 @@ fn answer(
     } else {
         unproven
     };
-    // A trust backstop's Yes makes the listed grants apply in later sessions,
-    // so the subject names every listed row.
     let what = match backstop_of(p, rows) {
         Some(warnings) => {
             format!("{what} (backstop: {warnings}; trusting makes these apply without asking)")
         }
         None => what.to_string(),
     };
-    // A one-shot allow names what it allowed (hashed as the command); other
-    // answers name the option chosen.
     let subject = if matches!(rule_id, RULE_ALLOW_ONCE | RULE_TRUST_ANY) {
         what
     } else {
@@ -3505,8 +2535,6 @@ fn answer(
     }
 }
 
-/// A trust dialog's backstop warnings, joined (`None` for other boxes): the
-/// option `No, continue without these permissions` beside the trust option.
 fn backstop_of(p: &PromptV2, rows: &[String]) -> Option<String> {
     let backstop = p.kind == PromptKind::Trust
         && p.options
@@ -3518,54 +2546,20 @@ fn backstop_of(p: &PromptV2, rows: &[String]) -> Option<String> {
     })
 }
 
-/// The words a limit's consent to go on opens with, lowercased (`Continue with
-/// …`, drawn while credits are on). Re-enabling credits is a purchase.
 const CONSENT: &[&str] = &["continue with"];
 
-/// Whether `opt` is a consent to go on ([`CONSENT`]): its label opens so, as
-/// a whole word ([`opens_with`]), and its answer is not kept for good
-/// ([`kept_for_good`], the press gate's test, its rows' term defence in
-/// depth). `Continue without …` is no
-/// consent but a refusal that goes on (aterm-phase's role table reads it
-/// [`Role::Deny`]): read by the bare prefix it was one, and full power
-/// pressed 2.1.301's `Continue without using this MCP server` under
-/// [`RULE_ALLOW_ONCE`], which disabled the server for good (measured
-/// 2026-10-16). Nor is the Chrome setup's `Continue with browser tools`
-/// (2.1.301 bundle, est()): it turns the browser tools on for every later
-/// session, so its panel is declined with `Continue without browser tools`
-/// (in the layout 2.1.302 draws, each option's description beside its
-/// label).
-/// Nor is a label Claude Code cut short ([`cut_short`]: `Continue with
-/// browser…`, the Chrome setup's in a narrow pane), whose cut end may keep
-/// it.
 fn consents(opt: &Opt) -> bool {
     opens_with(&opt.label, CONSENT) && !kept_for_good(opt) && !cut_short(&opt.label)
 }
 
-/// The words that name usage credits ([`credits_consent`]), lowercased:
-/// Claude Code's `usage credits`, and `extra usage`, its older name for them.
 const CREDITS: &[&str] = &["usage credit", "extra usage"];
 
-/// Whether the consent `opt` on `p` ([`consents`]) carries the session onto
-/// USAGE CREDITS: its label, the box's title, or the box's own rows
-/// (`p.span`, title to footer, wrapped rows joined) name them ([`CREDITS`]),
-/// case ignored. Claude Code 2.1.304's credit consents always do (READ in its
-/// bundle; no such box captured on a screen): the model consent dialog's
-/// title `<M> now uses usage credits`, or under `You've reached your Fable
-/// limit` its body `You've used your included Fable usage for this week.
-/// Continuing on <M> uses usage credits…` (`<M> runs on usage credits…`
-/// otherwise) over its `Continue with <M>`; the Usage credits dialog's
-/// `Continue with usage credits`. A consent that names none (a refill's
-/// `Continue with a refill`, the new-model offer's `Continue with <newer>`) is
-/// none: `[harness] usage_credits` leaves it as it was.
 fn credits_consent(p: &PromptV2, rows: &[String], opt: &Opt) -> bool {
     let names = |text: &str| {
         let text = text.to_lowercase();
         CREDITS.iter().any(|w| text.contains(w))
     };
     let end = p.span.1.saturating_add(1).min(rows.len());
-    // A box's bar (`│`) and rule glyphs are no words: dropped, so a wrap
-    // between `usage` and `credits` inside a framed box still reads whole.
     let frame = |w: &&str| w.chars().all(|c| ('\u{2500}'..='\u{257f}').contains(&c));
     let body = rows
         .get(p.span.0.min(end)..end)
@@ -3578,20 +2572,6 @@ fn credits_consent(p: &PromptV2, rows: &[String], opt: &Opt) -> bool {
     names(&opt.label) || names(&p.title) || names(&body)
 }
 
-/// THE CREDITS CONSENT CANCELLED (`[harness] usage_credits` off, the
-/// default; the owner, 2026-10-19): a consent onto usage credits on Claude
-/// Code's screen ([`consents`], [`credits_consent`]) is answered with Esc
-/// ([`RULE_CREDITS_DECLINE`]) where the box's own footer reads `Esc to
-/// cancel` (anchor `prompt.cancel`) and its title row is on the screen. Esc
-/// is the dialog's cancel and saves nothing (READ in the 2.1.304 bundle: the
-/// model consent dialog's ends `cancelled`, its consent unstored; the Usage
-/// credits dialog's closes it); none of its rows is pressed, since `Switch to
-/// <model> and continue` and `Not now` may save the person's default model.
-/// The key goes on a fresh read with the focus where it was judged
-/// ([`Choice::FocusKey`], 0 steps), so it chooses nothing; the press gate
-/// reads no option of it. Where no Esc is read, or no option is focused, the
-/// box is a person's ([`credits_held`]). `None`: no such consent, the key on,
-/// or another program's screen.
 fn credits_decline(
     program: Program,
     p: &PromptV2,
@@ -3631,11 +2611,6 @@ fn credits_decline(
     })
 }
 
-/// Why a consent onto usage credits is not taken with the key off, by its
-/// kind: a model's (`Continue with <M>`), which Claude Code keeps for good
-/// per model and account, or the Usage credits dialog's (`Continue with
-/// usage credits`), which saves nothing and carries the session onto the
-/// credits already on at the account.
 fn credits_held(o: &Opt) -> String {
     let what = if o.label.to_lowercase().contains("usage credit") {
         "would carry the session onto the credits already on at the account (it saves nothing)"
@@ -3649,14 +2624,6 @@ fn credits_held(o: &Opt) -> String {
     )
 }
 
-/// Why no rule answers Claude Code's MCP server dialog (aterm-phase's
-/// `McpServer`), at any level: every answer it offers, Esc's too, is saved
-/// for good in the project's `.claude/settings.local.json` — a standing
-/// grant or a standing refusal — and no rule gives one but the folder-trust
-/// dialog's and the owner's autocompact choice ([`trust_dialog`],
-/// [`autocompact_offer`]). Claude Code itself leaves it to a person in
-/// its own background sessions. What a person must know comes first, in the
-/// 120 cells the owner's badge keeps of a reason (`escalate::fit_reason`).
 fn mcp_server_held(p: &PromptV2) -> String {
     format!(
         "every answer, Esc too, is saved for good in .claude/settings.local.json (`claude mcp \
@@ -3666,20 +2633,6 @@ fn mcp_server_held(p: &PromptV2) -> String {
     )
 }
 
-/// A dialog of no kind aterm-phase names ([`PromptKind::Other`]), `rows` the
-/// screen it was read from. On Claude Code's screen a consent is accepted
-/// ([`consents`]: never an answer kept for good; on no other program's
-/// screen, [`draws_claude_boxes`]) — one onto usage credits
-/// ([`credits_consent`]) only under `[harness] usage_credits`
-/// ([`ApprovalCtx::usage_credits`], [`RULE_CREDITS_CONSENT`]), and with
-/// that off its box is cancelled before this ([`credits_decline`]) or a
-/// person's, none of its rows pressed (module header, the consent bullet); a
-/// box whose every yes buys gets the option that
-/// waits; the model-refusal pause gets its switch while `model_fallback` is set
-/// ([`refusal_pause_switch`], [`RULE_MODEL_SWITCH`]); any other setup or config
-/// dialog is declined with its refusal ([`RULE_DECLINE`]), since its yes
-/// settles something for good. No other `Switch to …` is chosen here. Else a
-/// person's.
 fn other_dialog<'p>(
     program: Program,
     p: &'p PromptV2,
@@ -3730,16 +2683,10 @@ fn other_dialog<'p>(
         })
 }
 
-/// Whether choosing `opt` switches the model: a `Switch to <model>` label with
-/// no purchase in it.
 fn switches_model(opt: &Opt) -> bool {
     opt.label.trim_start().starts_with("Switch to ") && !buys(opt)
 }
 
-/// Claude Code's model-refusal pause and nothing else: its switch when the box
-/// is program Claude, head read, titled `Session paused` (anchor
-/// `paused.title`), options exactly `Switch to <model>` and `Edit prompt and
-/// retry…` (anchor `paused.edit`).
 fn refusal_pause_switch(program: Program, p: &PromptV2) -> Option<&Opt> {
     if !draws_claude_boxes(program) || p.head_off_screen || p.title.trim() != anchor("paused.title")
     {
@@ -3756,8 +2703,6 @@ fn refusal_pause_switch(program: Program, p: &PromptV2) -> Option<&Opt> {
     }
 }
 
-/// The refusal pause's switch `o`, pressed while `model_fallback` is set
-/// ([`RULE_MODEL_SWITCH`]).
 fn fallback_switch<'p>(o: &'p Opt, ctx: &ApprovalCtx) -> Result<(&'static str, &'p Opt), String> {
     if ctx.model_fallback {
         Ok((RULE_MODEL_SWITCH, o))
@@ -3769,8 +2714,6 @@ fn fallback_switch<'p>(o: &'p Opt, ctx: &ApprovalCtx) -> Result<(&'static str, &
     }
 }
 
-/// Words of a plan yes that grants a standing mode or wipes the conversation,
-/// lowercased.
 const BROAD_PLAN: &[&str] = &[
     "auto mode",
     "accept edits",
@@ -3779,11 +2722,6 @@ const BROAD_PLAN: &[&str] = &[
     "clear context",
 ];
 
-/// Plan mode's box: the yes that grants no standing mode, a [`Role::Once`]
-/// (`Yes, implement this plan`) or else a yes naming none of [`BROAD_PLAN`]
-/// (`Yes, manually approve edits`, `Yes, enter plan mode`). Claude Code lists
-/// its broadest yes first, so the first yes is never assumed. Without one the
-/// plan is declined (`No, keep planning`) and the turn-end policy continues.
 fn plan_pick(p: &PromptV2) -> Result<(&'static str, &Opt), String> {
     let yes = |o: &&Opt| o.affirms() && !buys(o);
     let broad = |o: &Opt| {
@@ -3813,10 +2751,6 @@ fn plan_pick(p: &PromptV2) -> Result<(&'static str, &Opt), String> {
         })
 }
 
-/// A permission box's one-shot allow: its one [`Role::Once`]; else, on a sound
-/// parse that reads a role a press is chosen by, its first yes granting
-/// nothing standing ([`Role::standing`]); else, on a box that would buy, the
-/// option that waits; else its `No` ([`RULE_DECLINE`]).
 fn allow_once(p: &PromptV2) -> Result<(&'static str, &Opt), String> {
     let once: Vec<&Opt> = p.options.iter().filter(|o| o.role == Role::Once).collect();
     if let [o] = once.as_slice()
@@ -3824,9 +2758,6 @@ fn allow_once(p: &PromptV2) -> Result<(&'static str, &Opt), String> {
     {
         return Ok((RULE_ALLOW_ONCE, o));
     }
-    // Roles only on a sound parse (aterm-phase), and only the standing ones
-    // where an unnumbered option under another opens with no capital: there
-    // the labels are unproven, so no yes is taken by its label.
     let sound = p
         .options
         .iter()
@@ -3839,7 +2770,6 @@ fn allow_once(p: &PromptV2) -> Result<(&'static str, &Opt), String> {
     {
         return Ok((RULE_ALLOW_ONCE, o));
     }
-    // Waiting instead of buying is harmless whatever the parse.
     if p.options.iter().any(buys)
         && let Some(o) = p.options.iter().find(|o| waits(o) && !buys(o))
     {
@@ -3859,8 +2789,6 @@ fn allow_once(p: &PromptV2) -> Result<(&'static str, &Opt), String> {
         })
 }
 
-/// How `o` is chosen on `p`: its digit — never while the focus is on an
-/// open amend input ([`amend_input_open`]) — or the focus moved to it.
 fn choice_of(p: &PromptV2, o: &Opt) -> Result<Choice, String> {
     match p.select {
         Select::Digits if amend_input_open(p) => Err(OPEN_INPUT.to_string()),
@@ -3887,18 +2815,12 @@ fn choice_of(p: &PromptV2, o: &Opt) -> Result<Choice, String> {
     }
 }
 
-/// `│ text │` → `text`, trimmed.
 fn unbar(row: &str) -> Option<&str> {
     row.strip_prefix('│')
         .and_then(|t| t.strip_suffix('│'))
         .map(str::trim)
 }
 
-/// The row a full-power press is guarded on: a Bash or PowerShell box's first
-/// command row (bare, behind a prompt glyph like Codex's `$ `, or in a box
-/// drawn inside the box, as Gemini CLI's), a file box's path (the question
-/// for `Edit notebook`, the IDE diff and a box that names its file only in
-/// its title), the trust dialog's folder, else the box's first row.
 fn judged_row(p: &PromptV2, rows: &[String]) -> usize {
     let own = match p.kind {
         PromptKind::Bash | PromptKind::PowerShell => p.command_rows.first().and_then(|c| {
@@ -3912,8 +2834,6 @@ fn judged_row(p: &PromptV2, rows: &[String]) -> usize {
                             .is_some_and(|glyph| !glyph.is_empty() && glyph.trim_end() == "$")
                     })
                 })
-                // A command in a box drawn inside the box (Gemini CLI's
-                // `│ │ <command> │ │`).
                 .or_else(|| {
                     (top + 1..bottom.min(rows.len()))
                         .find(|&k| unbar(rows[k].trim()).and_then(unbar) == Some(c.as_str()))
@@ -3923,15 +2843,11 @@ fn judged_row(p: &PromptV2, rows: &[String]) -> usize {
             let t = rows[k].trim();
             t.starts_with('/') || t.starts_with('~')
         }),
-        // Muse Code's network box: its `full URL: <url>` row, where the URL
-        // fits on it (1.4.10); else its title, as a wrapped path's box is.
         PromptKind::NetworkRequest => row_of(
             rows,
             p,
             &format!("{}{}", anchor("muse.box.full_url"), p.command),
         ),
-        // A file box's path row — or, for `Edit notebook` and the IDE diff,
-        // whose file only the question names, the question row.
         _ => p
             .path
             .as_deref()
@@ -3941,20 +2857,6 @@ fn judged_row(p: &PromptV2, rows: &[String]) -> usize {
     own.unwrap_or(p.span.0)
 }
 
-/// The usage-limit options dialog's GRANT ROW ([`RULE_LIMIT_RESET`]), decided
-/// in front of the wait row: `Some` only where `[harness] limit_reset` is on
-/// ([`ApprovalCtx::limit_reset`]), the dialog's row taken is the ONE option
-/// that spends a reset, of a kind the step takes (5-hour, weekly, full; never
-/// a Fable row) — or, under the owner's `limit_reset_kinds`
-/// ([`ApprovalCtx::reset_kinds`]), the row of the first listed kind on offer
-/// — read by its whole template ([`aterm_phase::reset_row`]: never by its
-/// place; several on offer, with no list, are the owner's to choose), its title
-/// is the dialog's and on the screen, and an option has the focus. The row
-/// is then reached and confirmed as the wait row is — arrows, and Enter once
-/// a fresh read shows the focus on that very label and that label still the
-/// row the rule takes (`press_focused`), under the title row's guard, never
-/// a digit. `None` — the wait row's rule, exactly as with the key off — in
-/// every other case. What follows the row is the loop's.
 fn limit_reset(prompt: &PromptV2, rows: &[String], ctx: &ApprovalCtx) -> Option<Decision> {
     if !ctx.limit_reset {
         return None;
@@ -3978,13 +2880,6 @@ fn limit_reset(prompt: &PromptV2, rows: &[String], ctx: &ApprovalCtx) -> Option<
     })
 }
 
-/// The usage-limit options dialog ([`RULE_LIMIT_WAIT`]): its `Wait here, then
-/// continue automatically …` row ([`Role::AutoResume`]), by label, reached with
-/// arrows and confirmed with Enter once a fresh read shows the focus on it
-/// (`press_focused`), never a digit or Esc, guarded on the title row. It arms the
-/// vendor's own continue, which the vendor arms by itself only for a reset under
-/// 24 h away. Never `Stop and wait …`, which stops for good. A menu with no or
-/// several wait rows, no focus, or the rule off is a person's.
 fn limit_wait(prompt: &PromptV2, rows: &[String], ctx: &ApprovalCtx) -> Decision {
     if !ctx.limit_wait {
         return Decision::escalate("a usage-limit dialog (limit_wait is off)");
@@ -4024,8 +2919,6 @@ fn limit_wait(prompt: &PromptV2, rows: &[String], ctx: &ApprovalCtx) -> Decision
     let Some(at) = prompt.options.iter().position(|o| o.focused) else {
         return Decision::escalate("a usage-limit dialog with no focused option");
     };
-    // The row its title opens on, its line read across the rows a narrow
-    // pane wraps it onto (`What do you want to` over `do?` at 26 columns).
     let Some(title_row) = aterm_phase::prompt::title_row(prompt, rows) else {
         return Decision::escalate("the usage-limit dialog's title is not on the screen");
     };
@@ -4042,13 +2935,7 @@ fn limit_wait(prompt: &PromptV2, rows: &[String], ctx: &ApprovalCtx) -> Decision
     }
 }
 
-/// Why Gemini CLI's usage-limit dialog that names no reset (a key's per-day
-/// quota, [`limit_retry`]) is a person's to know of while its `Keep trying`
-/// goes on: the badge the loop raises for it (NEEDS YOU, never blocking) and
-/// the escalation of a decision made before its ladder's next try. `unplaced`:
-/// the reset the dialog drew, whose clock the loop cannot read — on the same
-/// ladder, said as what it is. One line, short of an attention's 120-cell
-/// reason.
+/// Format the escalation reason when Gemini CLI's usage-limit dialog names no reset time.
 #[must_use]
 pub(crate) fn limit_no_reset_reason(unplaced: Option<&str>) -> String {
     let retry = anchor("gemini.usage.retry");
@@ -4065,25 +2952,6 @@ pub(crate) fn limit_no_reset_reason(unplaced: Option<&str>) -> String {
     }
 }
 
-/// GEMINI CLI'S USAGE-LIMIT DIALOG ([`RULE_LIMIT_RETRY`]; aterm-phase's
-/// "THE USAGE-LIMIT DIALOG IS A BOX, NOT A WALL") over exactly `1. Keep
-/// trying` and `2. Stop`. Its `Keep trying` sends the turn's request again,
-/// so it is pressed only once the loop's clock says it is due
-/// ([`ApprovalCtx::limit_retry`]): past the reset a Google account's spent
-/// quota names (`Access resets at 5:06 AM PDT.`,
-/// [`aterm_phase::gemini::limit_reset`]: the end of the minute it names, in
-/// the zone it names, and the program's grace), or, on the dialog a key's
-/// per-day quota draws, which names none, at the next rung of the loop's
-/// back-off ladder, while the dialog stands as a person's to know of too
-/// (FOREVER: NEEDS YOU is loud, never blocking; `approval_loop.rs`,
-/// `limit_retry_hold`). The turn goes on where the quota stopped it, as
-/// Claude Code's own continuation does at its reset. Before the due the
-/// dialog is the loop's to wait on (it holds the point); a decision made
-/// there anyway says so and hands it over. Never `Stop` (it ends the turn on
-/// an error that no longer says it was the quota). The digit is guarded on
-/// the reset's own row — on a dialog that names none, its title's — so a
-/// dialog drawn again with another reset is judged again. A dialog with
-/// other options is a person's, and so is every one with `limit_wait` off.
 fn limit_retry(prompt: &PromptV2, rows: &[String], ctx: &ApprovalCtx) -> Decision {
     if !ctx.limit_wait {
         return Decision::escalate("a usage-limit dialog (limit_wait is off)");
@@ -4106,8 +2974,6 @@ fn limit_retry(prompt: &PromptV2, rows: &[String], ctx: &ApprovalCtx) -> Decisio
             None => limit_no_reset_reason(None),
         });
     }
-    // The row the digit is guarded on: the reset's, under the title (the
-    // span's first row), else the title's own.
     let (head, from, missing) = match &reset {
         Some(_) => (
             anchor("gemini.usage.resets"),
@@ -4158,28 +3024,6 @@ fn limit_retry(prompt: &PromptV2, rows: &[String], ctx: &ApprovalCtx) -> Decisio
     }
 }
 
-/// Claude Code's autocompact offer ([`RULE_AUTOCOMPACT_OFFER`];
-/// aterm-phase's "THE AUTOCOMPACT OFFER"): its accept row, read whole
-/// ([`aterm_phase::Offer`]), at [`ApprovalCtx::autocompact_offer`]'s size.
-/// One keystroke's worth of decision per fresh read, so every key meets the
-/// dialog as judged:
-///
-/// * the size is the target → [`Choice::Focus`] onto the accept row, whose
-///   Enter `press_focused` sends only once a fresh read shows the focus there
-///   (`steps` 0 when it is already);
-/// * the size is not → [`Choice::FocusKey`] with `right` (or `left`): the
-///   focus moved onto the accept row first, then ONE step of the stepper, and
-///   the dialog is decided again from the read after it — never an Enter on
-///   a size that is not the target. The loop bounds the stepper across
-///   reads (`approval_loop::StepperTrack`): the server's size list need not
-///   hold the target, and a key that turns back, does not move the size, or
-///   exceeds the longest list hands the offer to a person.
-///
-/// Never the keep row, never Esc (Claude Code counts it toward the offer's
-/// ask limit), never a printable key (the dialog counts one as a stray and
-/// disables itself). A dialog not read whole, a size or target off the
-/// ladder, or the key off is a person's. The arrows are guarded on the title
-/// row; the Enter or step on the focused row itself.
 fn autocompact_offer(prompt: &PromptV2, rows: &[String], ctx: &ApprovalCtx) -> Decision {
     let Some(target) = ctx.autocompact_offer else {
         return Decision::escalate("an autocompact offer (autocompact_offer is off)");
@@ -4201,8 +3045,6 @@ fn autocompact_offer(prompt: &PromptV2, rows: &[String], ctx: &ApprovalCtx) -> D
     };
     let steps = focus_steps(at, offer.accept);
     let label = prompt.options[offer.accept].label.clone();
-    // The target is a size of the ladder in kilo-tokens; the offer's size is
-    // the server's, in tokens as drawn (`350.5k`).
     let target_tokens = target.saturating_mul(1000);
     let (choice, subject) = if offer.tokens == target_tokens {
         (

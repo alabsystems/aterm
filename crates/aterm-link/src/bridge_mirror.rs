@@ -1,76 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE BUS MIRROR, BRIDGE HALF, its wiring (the pure
-//! parts are [`crate::mirror`]). A child of the bridge's module: it reads and
-//! moves the bridge's own state, through the bridge's own publish, collision,
-//! budget and urgent-service paths.
-//!
-//! OFF IS NOTHING. With `[fabric] log = "off"` [`Bridge::mirror`] is `None`:
-//! the `hello` carries no `log=`, no `log-take` or `log-landed` is ever sent,
-//! no `logpin`, `logkey` or `logfloor` is read or written (save the state
-//! dir's own reconciling of a pin a mirror left, by the first bridge after an
-//! unclean stop in an earlier boot, [`StateDir::reconcile_logpin`]: a dir no
-//! mirror ran in holds none), no `ev` body of the mirror's is published, and
-//! the loop's wait is what it was: judged before the round settles what the
-//! items before left owed ([`Bridge::mirror_then_round`]). So is a bridge
-//! whose endpoint did not acknowledge `log=turns`, and one whose mirror
-//! stopped.
-//!
-//! AUTO, THE DEFAULT (owner decision D4),
-//! FOLLOWS THE BROKER. Until an attach has judged the broker's `Hello`
-//! ([`Bridge::broker_retains`]) the `hello` says `log=auto`, which asks for
-//! nothing; an attach to a broker that retains this node's `ev` faces says
-//! the `hello` again with `log=turns`, and from its answer on the mirror runs
-//! as `turns` does ([`Bridge::mirror_attached`]). Over a broker that retains
-//! nothing it does not run: no take, no pin judged or written, and `link
-//! mirror unretained` (`fabric status mirror=unretained`).
-//!
-//! ON, it is ONE ROUND ITEM per pass of the loop, at the point
-//! where the round's queued work is done: a take of at most
-//! [`mirror::BATCH_MAX`] slots, pinned before a byte is sent, then sent
-//! pipelined at the pinned sequences; once every ack is in, a deduped answer
-//! is read back and compared (one whose record the read-back cannot
-//! see is sent again before it is called another writer's), the halts and
-//! mail queued meanwhile are served ([`Bridge::service_urgent`]), and one
-//! `log-landed` names each session's last cursor in each seq space. A
-//! `fenced` or `adopting` answer keeps the pin and waits
-//! [`super::DEADLINE_RETRY`] before landing again; nothing else waits in line
-//! for the mirror, and the mirror never waits in line for anything but its
-//! own acks: the round that reads them parks for nothing while the landing
-//! they concluded is owed ([`Bridge::park_wait`]). A take that could take
-//! nothing now (the bucket empty, or an empty answer saying `more=1`: a
-//! timeline busy at the take) waits [`BUSY_WAIT`], never a zero park that
-//! asks again at once. A collided slot holds its batch until its re-pin is
-//! on disk (no slot of it sent, none landed), and a re-pin that failed is
-//! tried again after [`super::DEADLINE_RETRY`]. A session's `ev` face is
-//! asked of the subject budget once, before its first slot is sent: once a
-//! slot of it is on the bus the face is in the index, which costs nothing
-//! more.
-//!
-//! A SESSION THE BUDGET REFUSES IS NOT LANDED: its cursor stays, its records
-//! wait in its ring (an evicted one becomes an exact cover), and a later take
-//! offers them again, after [`REFUSED_WAIT`] when nothing else of the batch
-//! landed. So its face, once room comes back, opens at the first `ms` the
-//! bus does not hold, never mid-stream past a hole nobody said.
-//!
-//! WHAT A REBOOT DOES NOT END IS ON THE MEDIA FIRST. The
-//! alias key is written durably to `logkey` before the first take that names
-//! it ([`Bridge::mirror_key_on_the_media`]), and `logfloor` is raised past a
-//! batch's bytes before any byte of it is sent ([`Bridge::mirror_floor_covers`]):
-//! a durable write once per [`mirror::FLOOR_LEASE_BYTES`] of bodies. Either
-//! write refused sends nothing, and is tried again after
-//! [`super::DEADLINE_RETRY`]. So a pin a power cut tore has its copies: the
-//! state dir sets it aside and writes a whole one from them in its place
-//! ([`StateDir::reconcile_logpin`]), and the hello resumes at the same key
-//! with the floor as the total. The copies hold only while no older build
-//! writes the pin, and none does: this build's pin is `v=2`, which an older
-//! build refuses ([`Pin`]). A recovered `v=1` is upgraded durably before
-//! copies or sends, without waiting for its batch to land. Every StateDir
-//! open reestablishes that fence before copying or sending, including a
-//! recovered v=2 left by a failed flush. A pin that does not read and that
-//! the copies cannot be shown to cover stops the mirror, and the stop says what a
-//! person does and what it costs ([`Bridge::mirror_hello_answered`]).
+//! THE BUS MIRROR, BRIDGE HALF, its wiring (the pure parts are [`crate::mirror`]).
 
 use std::collections::BTreeSet;
 use std::io;
@@ -85,15 +16,10 @@ use crate::mirror::{self, Bucket, LandedWord, LogMode, Pin, PinSlot};
 use crate::state::StateDir;
 use crate::subject;
 
-/// How long a batch none of whose slots could land (every session in it
-/// refused by the subject budget) waits before the next take offers them
-/// again: the budget is asked again then, never every round.
+/// How long a batch none of whose slots could land (every session in it refused by the subject budget) waits before the next take offers them again: the budget is asked again then, never every round.
 pub(super) const REFUSED_WAIT: Duration = Duration::from_secs(2);
 
-/// How long a take that could take nothing NOW waits before the next one
-/// asks: the rate bucket empty, or the endpoint's answer empty with `more=1`
-/// (a session's timeline lock was held at the take, which never waits on the
-/// UI's lock). Work is still owed, and it is not work the loop can do now.
+/// How long a take that could take nothing NOW waits before the next one asks: the rate bucket empty, or the endpoint's answer empty with `more=1` (a session's timeline lock was held at the take, which never waits on the UI's lock).
 pub(super) const BUSY_WAIT: Duration = Duration::from_millis(100);
 
 /// What became of one pinned slot.
@@ -117,27 +43,20 @@ pub(super) enum Outcome {
 
 impl Outcome {
     /// What came of the slot is final for the batch's landing. A collided
-    /// slot's is not: its record is not on the bus until its re-pin is sent,
-    /// and a batch landed past it would move the endpoint's cursor over a
-    /// hole nobody said.
     const fn concluded(self) -> bool {
         !matches!(self, Outcome::Owed | Outcome::Sending | Outcome::Collided)
     }
 }
 
-/// The mirror's state in a bridge whose `[fabric] log` is `"turns"` or
-/// `"auto"`.
+/// The mirror's state in a bridge whose `[fabric] log` is `"turns"` or `"auto"`.
 pub(super) struct MirrorRun {
     /// `Turns`, or `Auto` (on while the broker retains).
     mode: LogMode,
     /// The endpoint answered the hello's `log=turns`.
     acked: bool,
     /// The pin is not judged yet: the recovery an unclean stop owes, which
-    /// reconciles it, is not complete (sim item S7,
-    /// [`Bridge::mirror_hello_answered`]). Not engaged meanwhile.
     awaiting: bool,
     /// An `auto` mirror over a broker that retains nothing, said once a
-    /// change (`link mirror unretained`).
     unretained: bool,
     /// Why it stopped for this bridge's life, if it did.
     stopped: Option<String>,
@@ -148,17 +67,12 @@ pub(super) struct MirrorRun {
     /// The batch in flight and the node's total.
     pin: Pin,
     /// Per slot: whether THIS process sent it (a never-sent slot's deduped
-    /// answer is another writer's).
     sent: Vec<bool>,
     /// Per slot: the offset a deduped answer named whose record the read-back
-    /// could not see on the slot's face ([`Bridge::mirror_settle`]): the slot
-    /// is sent again, and a second dedup naming the same offset is another
-    /// writer's record.
     unread: Vec<Option<u64>>,
     /// Per slot: what came of it.
     outcome: Vec<Outcome>,
     /// The incarnation the `Sending` slots went out under: a reattach drops
-    /// their acks with the connection, and they are sent again.
     sent_inc: u64,
     /// A collision re-pins once the connection is back.
     repin: bool,
@@ -166,43 +80,28 @@ pub(super) struct MirrorRun {
     bucket: Bucket,
     clock: Instant,
     /// The alias key, in hex for the take (empty: none, every
-    /// edge `-`); the pin carries it ([`Pin::key`]).
     key: String,
     /// Whether `logkey` holds [`Pin::key`] on the media (or there is no key
-    /// to hold): no take names the key, and no slot is sent, before it does.
     key_durable: bool,
     /// What `logfloor` holds on the media, as this run knows it:
-    /// at or above every body byte the node sent.
     floor: u64,
     /// Whether `floor` covers the batch's bytes, so its slots may be sent.
     floored: bool,
     /// Sessions whose `ev` face the budget refused, said once.
     noticed: BTreeSet<String>,
     /// Recovery counts (§12 M6): slots republished from a pin this process
-    /// did not take, and how many of those the broker deduped.
     recovered: u64,
     recovered_deduped: u64,
     /// The most slots a take asks ([`mirror::BATCH_MAX`]; a test's one).
     batch: usize,
     /// The broker's `oldest=` for this node's `ev` faces as last read:
-    /// it only rises, so a window it counts under the budget is.
     oldest: u64,
     /// The window budget holds the take: said once to the endpoint (`link
-    /// mirror budget`) until the mirror goes on (`link mirror on`).
     waiting: bool,
 }
 
 impl MirrorRun {
-    /// The state a bridge starts with: `None` with the mirror off. THE ALIAS
-    /// KEY is, until the hello judges the state dir, the one the
-    /// pin holds, else a fresh one that `logkey` keeps from the first take on:
-    /// never derived from the node's caps, so a renewed cap or a changed grant
-    /// set aliases every edge as before. The hello takes `logkey`'s where it
-    /// holds one, and judges a pin that does not read
-    /// ([`Bridge::mirror_hello_answered`]); its key is not trusted meanwhile.
-    ///
-    /// `mint` draws a fresh key: [`mirror::mint_alias_key`] live, through the
-    /// bridge's door ([`crate::fx::Fx::alias_key`]).
+    /// The state a bridge starts with: `None` with the mirror off.
     pub(super) fn new(
         mode: LogMode,
         state: &StateDir,
@@ -278,8 +177,7 @@ impl MirrorRun {
         self.stopped.as_deref()
     }
 
-    /// Forget the batch as a buggy bridge would (a negative control's
-    /// broken call): the pin emptied with nothing landed.
+    /// Forget the batch as a buggy bridge would (a negative control's broken call): the pin emptied with nothing landed.
     #[cfg(test)]
     pub(super) fn drop_batch_for_tests(&mut self) {
         self.clear_batch();
@@ -315,8 +213,7 @@ impl MirrorRun {
         (&self.pin.win, self.oldest)
     }
 
-    /// A landed batch of `bytes` at `hi`, as a settle notes it (the budget's
-    /// tests).
+    /// A landed batch of `bytes` at `hi`, as a settle notes it (the budget's tests).
     #[cfg(test)]
     pub(super) fn note_window_for_tests(&mut self, hi: u64, bytes: u64) {
         self.pin.note_window(hi, bytes);
@@ -329,7 +226,6 @@ impl MirrorRun {
     }
 
     /// Milliseconds since this run began, at `now` (the bridge's door): the
-    /// rate bucket's clock.
     fn now_ms(&self, now: Instant) -> u64 {
         u64::try_from(now.saturating_duration_since(self.clock).as_millis()).unwrap_or(u64::MAX)
     }
@@ -339,7 +235,6 @@ impl MirrorRun {
     }
 
     /// A batch of `k` slots, none concluded: `sent` says which of them this
-    /// process (or the one whose pin it recovered) may already have sent.
     fn arm_batch(&mut self, k: usize, sent: bool) {
         self.sent = vec![sent; k];
         self.unread = vec![None; k];
@@ -364,12 +259,9 @@ impl MirrorRun {
 }
 
 /// Why the hello stopped the mirror on its pin, for what a person does
-/// ([`Bridge::mirror_pin_remedy`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PinRemedy {
     /// The pin does not read; which durable copies the dir holds, and
-    /// whether it begins as an older build's (`v=1`,
-    /// [`Pin::by_an_older_build`]), which the copies need not cover.
     Pin { key: bool, floor: bool, older: bool },
     /// `logkey` and the pin's `key=` name two keys.
     Disagree,
@@ -384,15 +276,11 @@ enum ReadBack {
     /// Another record at that offset on the face: another writer's.
     Other,
     /// No record at that offset on the face: retention may have taken the
-    /// record since the dedup answer (the broker drops its dedup entry with
-    /// it), or the record there is on a subject this face does not hold.
     Unread,
 }
 
 impl Bridge {
-    /// The `hello`'s token: ` log=turns` when the mirror is asked for,
-    /// ` log=auto` from an `auto` mirror before an attach found a broker that
-    /// retains, nothing off.
+    /// The `hello`'s token: ` log=turns` when the mirror is asked for, ` log=auto` from an `auto` mirror before an attach found a broker that retains, nothing off.
     pub(super) fn mirror_hello_token(&self) -> &'static str {
         match self.mirror.as_deref() {
             None => "",
@@ -402,7 +290,6 @@ impl Bridge {
     }
 
     /// Whether the `hello` asks for the mirror: `turns`, or `auto` over a
-    /// broker the last attach found retaining.
     fn mirror_asks(&self) -> bool {
         self.mirror
             .as_deref()
@@ -410,25 +297,11 @@ impl Bridge {
     }
 
     /// THE HELLO GATE: whether the last attach found the broker
-    /// retaining this node's `ev` faces ([`Bridge::broker_retains`]), which
-    /// is what an `auto` mirror runs on.
     fn mirror_retained(&self) -> bool {
         self.broker_retains == Some(true)
     }
 
     /// AFTER EVERY ATTACH, an `auto` mirror follows the broker's retention.
-    /// Over a broker that retains this
-    /// node's `ev` faces, a mirror the endpoint has not acknowledged is asked
-    /// for now (the `hello` again, `log=turns`, whose answer reads the pin and
-    /// says `link mirror on`), and one that waited out an unretaining broker
-    /// says `on` again. Over any other it does not run, said once a change:
-    /// a mirror the endpoint acknowledged is first withdrawn (the `hello`
-    /// again, `log=auto`), so the endpoint's recorded hello says what this
-    /// bridge asks for and its `fabric status` reads `bridge_log=auto`, then
-    /// `link mirror unretained` to an endpoint that reads it. Without the
-    /// withdrawal an endpoint that last recorded `log=turns` kept saying the
-    /// node mirrors (`bridge_log=turns mirror=unretained`), and kept its
-    /// sessions engaged for a take that never came.
     pub(super) fn mirror_attached(&mut self) {
         let Some(m) = self.mirror.as_deref() else {
             return;
@@ -461,8 +334,6 @@ impl Bridge {
         );
         if acked {
             // `mirror_asks` is false now, so this hello says `log=auto`, and
-            // its answer leaves the mirror unacknowledged until a retaining
-            // attach asks again.
             self.introduce();
         }
         if self.endpoint_lane >= LINK_MIRROR_WAIT_LANE {
@@ -470,33 +341,9 @@ impl Bridge {
         }
     }
 
-    /// The `hello`'s answer: the mirror runs only when the endpoint
-    /// acknowledged `log=turns` (a newer endpoint than this bridge's grammar
-    /// reads it past and answers nothing: the mirror stays off, said once).
-    /// On, the pin a predecessor left is read: a batch in it is recovered
-    /// before any new take.
-    ///
-    /// AND HELD TO ITS DURABLE COPIES: the key is
-    /// `logkey`'s where it holds one, and a pin whose `key=` names another
-    /// stops the mirror; a pin that is not there (never written, or one a
-    /// person moved aside) resumes at `logfloor`'s total, and where a copy is
-    /// on the media a whole pin is written from them at once, so an older
-    /// build that runs here next refuses it ([`Pin`]'s `v=2`) rather than
-    /// find none and mint a second key. A pin that does not read, and a copy
-    /// that does not, stop the mirror, kept as they are, and the stop says on
-    /// stderr exactly what a person does ([`Bridge::mirror_pin_remedy`]).
-    ///
-    /// NOT BEFORE THE PIN IS RECONCILED (sim item S7): where the recovery an
-    /// unclean stop in an earlier boot owes is not complete
-    /// ([`Bridge::recovery_owed`]: a write error stopped it), the pin is the
-    /// one a power cut left — torn, or a total below its floor — and judged
-    /// now it stopped the mirror for this bridge's life, or engaged it below
-    /// So the mirror waits, not engaged, and judges the pin once
-    /// the recovery completes ([`Bridge::mirror_after_recovery`]).
+    /// The `hello`'s answer: the mirror runs only when the endpoint acknowledged `log=turns` (a newer endpoint than this bridge's grammar reads it past and answers nothing: the mirror stays off, said once).
     pub(super) fn mirror_hello_answered(&mut self, header: &str) {
         let asked = self.mirror_asks();
-        // NEGATIVE CONTROL (`crate::sim`): the pin judged at the hello, the
-        // recovery complete or not, as before sim item S7.
         #[cfg(test)]
         let early = self
             .fx
@@ -507,8 +354,6 @@ impl Bridge {
         let Some(m) = self.mirror.as_deref_mut() else {
             return;
         };
-        // An `auto` hello asked for nothing: the attach that finds a
-        // retaining broker asks ([`Bridge::mirror_attached`]).
         if !asked {
             m.acked = false;
             return;
@@ -533,8 +378,7 @@ impl Bridge {
         self.mirror_judge_pin();
     }
 
-    /// THE RECOVERY COMPLETED ([`Bridge::recover`]): a mirror that waited for
-    /// it at the hello judges the pin now ([`Bridge::mirror_hello_answered`]).
+    /// THE RECOVERY COMPLETED ([`Bridge::recover`]): a mirror that waited for it at the hello judges the pin now ([`Bridge::mirror_hello_answered`]).
     pub(super) fn mirror_after_recovery(&mut self) {
         let Some(m) = self.mirror.as_deref_mut().filter(|m| m.awaiting) else {
             return;
@@ -544,8 +388,6 @@ impl Bridge {
     }
 
     /// JUDGE THE PIN an acknowledged mirror starts from, and its durable
-    /// copies ([`Bridge::mirror_hello_answered`]'s doc), and say whether the
-    /// mirror runs (`link mirror on`) or stopped for it (`reason=pin`).
     fn mirror_judge_pin(&mut self) {
         let Some(m) = self.mirror.as_deref_mut() else {
             return;
@@ -554,16 +396,12 @@ impl Bridge {
         let absent = matches!(pinned, Ok(None));
         let key_copy = self.state.logkey();
         let floor = self.state.logfloor();
-        // NEGATIVE CONTROL (`crate::sim`): the predecessor's batch not
-        // recovered, so its records are taken again at fresh sequences.
         #[cfg(test)]
         let pinned = if self.fx.mutant(crate::sim::world::Mutant::FreshMirrorTake) {
             Ok(None)
         } else {
             pinned
         };
-        // NEGATIVE CONTROLS (`crate::sim`): the key, or the total, read off
-        // the pin alone, as before their durable copies.
         #[cfg(test)]
         let key_copy = if self.fx.mutant(crate::sim::world::Mutant::KeyInThePinAlone) {
             Ok(None)
@@ -599,8 +437,6 @@ impl Bridge {
                     m.key_durable = true;
                 }
                 match pinned {
-                    // No pin: never mirrored here, or moved aside by a person.
-                    // The floor is at or above every byte sent.
                     Ok(None) => {
                         m.pin.total = m.floor;
                         if absent && (key_copy.is_some() || floor.is_some()) {
@@ -629,14 +465,8 @@ impl Bridge {
                                     "aterm-link: mirror: recovering a pinned batch of {k} slots"
                                 );
                             }
-                            // Not known to be unsent: each is a republish, and a
-                            // deduped answer is read back before it counts.
                             m.arm_batch(k, true);
                             m.recovered = k as u64;
-                            // The node's key: `logkey`'s, else the
-                            // one an older build kept in the pin (written to
-                            // `logkey` before the next take), else the one this
-                            // bridge minted.
                             pin.key = copy.or(pinned).or(m.pin.key);
                             m.pin = pin;
                             let key = m.pin.key;
@@ -655,7 +485,6 @@ impl Bridge {
             }
         }
         m.owed = true;
-        // The stop's reason carries what a person does, said once on stderr.
         if let Some(remedy) = remedy.map(|r| self.mirror_pin_remedy(r)) {
             if let Some(why) = self.mirror.as_deref_mut().and_then(|m| m.stopped.as_mut()) {
                 why.push_str("; kept as it is.");
@@ -673,11 +502,6 @@ impl Bridge {
     }
 
     /// WHAT A PERSON DOES about a mirror the pin or its copies stopped: one
-    /// sentence a reader can act on, naming the file, what each choice costs
-    /// — a second alias for every edge on the bus where a fresh key would be
-    /// minted, a total below what was mirrored where the copies
-    /// cannot say it — and claiming no cause it cannot show
-    /// (`mirror stopped: …` on stderr, which aterm keeps in its log).
     fn mirror_pin_remedy(&self, remedy: PinRemedy) -> String {
         let at = |name: &str| self.state.root().join(name).display().to_string();
         let pin = at(crate::state::LOGPIN);
@@ -786,10 +610,7 @@ impl Bridge {
         }
     }
 
-    /// Whether the mirror runs on this bridge: on, acknowledged by the
-    /// endpoint, its pin judged, not stopped, and, `auto`, over a broker that
-    /// retains it. A bridge whose mirror is not engaged runs the loop it ran
-    /// before the mirror ([`Bridge::mirror_then_round`]).
+    /// Whether the mirror runs on this bridge: on, acknowledged by the endpoint, its pin judged, not stopped, and, `auto`, over a broker that retains it.
     pub(super) fn mirror_engaged(&self) -> bool {
         self.mirror.as_deref().is_some_and(|m| {
             m.acked
@@ -799,9 +620,7 @@ impl Bridge {
         })
     }
 
-    /// TEST-ONLY: the node's total of mirrored bytes as an engaged mirror
-    /// holds it (`None`: off, not acknowledged, or stopped) — the simulation's oracle
-    /// (`crate::sim::world`).
+    /// TEST-ONLY: the node's total of mirrored bytes as an engaged mirror holds it (`None`: off, not acknowledged, or stopped) — the simulation's oracle (`crate::sim::world`).
     #[cfg(test)]
     pub(crate) fn mirror_engaged_total(&self) -> Option<u64> {
         if !self.mirror_engaged() {
@@ -810,9 +629,7 @@ impl Bridge {
         self.mirror.as_deref().map(|m| m.pin.total)
     }
 
-    /// When the loop owes the mirror a pass: `Some(now)` for work it can do
-    /// now (the loop's wait is then zero), the retry's instant
-    /// while a busy answer waits, `None` for nothing.
+    /// When the loop owes the mirror a pass: `Some(now)` for work it can do now (the loop's wait is then zero), the retry's instant while a busy answer waits, `None` for nothing.
     pub(super) fn mirror_due(&self, now: Instant) -> Option<Instant> {
         if !self.mirror_engaged() || self.conn.is_none() {
             return None;
@@ -821,9 +638,6 @@ impl Bridge {
         if !m.owed {
             return None;
         }
-        // Acks still owed are the round's to read, not a pass's: the round
-        // reads them and only then judges its park ([`Bridge::park_wait`]),
-        // so the landing they conclude waits for no other duty's deadline.
         if m.outcome.contains(&Outcome::Sending) && m.sent_inc == self.inc {
             return None;
         }
@@ -831,8 +645,6 @@ impl Bridge {
     }
 
     /// Stop the mirror for this bridge's life: said on stderr and to the
-    /// endpoint (`fabric status mirror=stopped:<reason>` or `capped`), the
-    /// pin kept for a later bridge.
     fn mirror_stop(&mut self, why: &str, report: &str) {
         let Some(m) = self.mirror.as_deref_mut() else {
             return;
@@ -848,13 +660,7 @@ impl Bridge {
         let _ = self.ctl_request(report);
     }
 
-    /// THE PASS: re-pin after a collision, take when nothing is pinned, send
-    /// what is owed, and settle a batch whose every slot concluded. A round
-    /// item ([`Bridge::in_round`]): its acks are read when the round runs out
-    /// of queued work, never in line here. A re-pin owed and not done (no
-    /// sequence, no pin on disk) holds the whole batch: nothing of it is sent
-    /// ([`Bridge::mirror_send`]) or landed ([`Outcome::concluded`]) until it
-    /// is, and it is tried again after [`DEADLINE_RETRY`].
+    /// THE PASS: re-pin after a collision, take when nothing is pinned, send what is owed, and settle a batch whose every slot concluded.
     pub(super) fn mirror_step(&mut self) {
         let now = self.fx.now();
         if self.mirror_due(now).is_none_or(|at| at > now) {
@@ -863,7 +669,6 @@ impl Bridge {
         let inc = self.inc;
         if let Some(m) = self.mirror.as_deref_mut() {
             m.retry_at = None;
-            // A reattach dropped the acks of what was in flight: send again.
             if m.sent_inc != inc {
                 for o in &mut m.outcome {
                     if *o == Outcome::Sending {
@@ -900,10 +705,6 @@ impl Bridge {
         }) else {
             return;
         };
-        // ON A RETAINING BROKER, THE WINDOW BUDGET:
-        // the broker gives the bulk stream up from its
-        // oldest end, so what this node may hold there is a share of the
-        // window, never a lifetime total. On any other broker, the total.
         if self.broker_retains == Some(true) {
             if !self.mirror_window_open() {
                 self.mirror_retry_in(DEADLINE_RETRY);
@@ -932,7 +733,6 @@ impl Bridge {
             self.mirror_retry_in(BUSY_WAIT);
             return;
         }
-        // The key on the media before a take names it.
         if !self.mirror_key_on_the_media() {
             return;
         }
@@ -976,11 +776,6 @@ impl Bridge {
                 return;
             }
         };
-        // NOTHING TAKEN: caught up (`more` unset), the take owes nothing until
-        // a wake; or the endpoint could copy nothing now and holds more (a
-        // timeline busy at the take is skipped, `more=1`), which is owed, and
-        // asked again after a short wait, never at once (the park
-        // is zero only for work the mirror can do now).
         if slots.is_empty() {
             if let Some(m) = self.mirror.as_deref_mut() {
                 m.owed = more;
@@ -990,10 +785,6 @@ impl Bridge {
             }
             return;
         }
-        // RESERVE, THEN PIN, THEN SEND: every sequence is on disk (its block's
-        // top) before it is used, and the pin before any byte of the batch.
-        // The posts' first-send guard (`unsent`) is theirs: each slot carries
-        // its own.
         let unsent = self.unsent.take();
         let mut pinned = Vec::with_capacity(slots.len());
         for s in slots {
@@ -1025,10 +816,6 @@ impl Bridge {
         m.recovered = 0;
         m.recovered_deduped = 0;
         m.owed = true;
-        // THE FLOOR BEFORE THE PIN: every pin this build writes
-        // has its floor, at or above its total and its batch, on the media
-        // first, so a power cut that tears it leaves what its set-aside needs
-        // (`StateDir::reconcile_logpin`). Refused, nothing is pinned or sent.
         if !self.mirror_floor_covers() {
             if let Some(m) = self.mirror.as_deref_mut() {
                 m.clear_batch();
@@ -1047,14 +834,6 @@ impl Bridge {
     }
 
     /// THE WINDOW BUDGET, on a
-    /// retaining broker: whether this node's landed bytes in the broker's
-    /// window are under [`mirror::NODE_WINDOW_BYTES`]. Judged first by the
-    /// `oldest=` last read, which only rises, so a window under the budget by
-    /// it is under it; only past it is `oldest=` asked again (a head query of
-    /// the node's `ev` faces, never refused), and the batches the cut passed
-    /// whole are forgotten. Past it still, the mirror waits, said once (`link
-    /// mirror budget` to an endpoint that reads it); under it again, `link
-    /// mirror on`, and the take goes on.
     fn mirror_window_open(&mut self) -> bool {
         let over = |m: &MirrorRun| m.pin.window_bytes(m.oldest) >= mirror::NODE_WINDOW_BYTES;
         if self.mirror.as_deref().is_some_and(over) {
@@ -1109,22 +888,11 @@ impl Bridge {
         }
     }
 
-    /// whether `logkey` holds the key this
-    /// mirror names, written durably now if it does not yet — before the first
-    /// take that names the key, and before any slot of a recovered batch an
-    /// older build's pin aliased with it is sent, so a power cut that tears or
-    /// rolls back the pin can never leave the bus holding aliases of a key the
-    /// next bridge does not know. No key (none could be minted: every edge
-    /// `-`) has nothing to keep. A write refused takes and sends nothing, and
-    /// is tried again after [`DEADLINE_RETRY`].
+    /// whether `logkey` holds the key this mirror names, written durably now if it does not yet — before the first take that names the key, and before any slot of a recovered batch an older build's pin aliased with it is sent, so a power cut that tears or rolls back the pin can never leave the bus holding aliases of a key the next bridge does not know.
     pub(super) fn mirror_key_on_the_media(&mut self) -> bool {
         let Some(m) = self.mirror.as_deref() else {
             return false;
         };
-        // Admission belongs to this StateDir open, not an on-disk header:
-        // even a recovered v=2 may be a renamed but unflushed first pin.
-        // Reestablish the fence before copies or sends, including when the
-        // key's copy already exists. Its old batch stays outstanding.
         if let Err(e) = self.state.ensure_logpin_durable(|| m.pin.render()) {
             eprintln!(
                 "aterm-link: mirror: the pin's version fence could not be made durable \
@@ -1137,8 +905,6 @@ impl Bridge {
             return true;
         }
         let key = m.pin.key;
-        // NEGATIVE CONTROL (`crate::sim`): no durable copy of the key, as
-        // before it; the key rides the pin alone.
         #[cfg(test)]
         let key = if self.fx.mutant(crate::sim::world::Mutant::KeyInThePinAlone) {
             None
@@ -1164,13 +930,7 @@ impl Bridge {
         }
     }
 
-    /// whether `logfloor` covers the batch —
-    /// the node's total plus every slot's body bytes — raised now, durably,
-    /// [`mirror::FLOOR_LEASE_BYTES`] past it if it does not, before any slot
-    /// is sent. So the floor is at or above every byte the node's mirror ever
-    /// sent, and a total a later bridge resumes at it, after a power cut tore
-    /// or rolled back the pin, is never below what was counted. A raise
-    /// refused sends nothing, and is tried again after [`DEADLINE_RETRY`].
+    /// whether `logfloor` covers the batch — the node's total plus every slot's body bytes — raised now, durably, [`mirror::FLOOR_LEASE_BYTES`] past it if it does not, before any slot is sent.
     pub(super) fn mirror_floor_covers(&mut self) -> bool {
         let Some(m) = self.mirror.as_deref() else {
             return false;
@@ -1180,12 +940,6 @@ impl Bridge {
         }
         let bytes: u64 = m.pin.slots.iter().map(|s| s.body.len() as u64).sum();
         let need = m.pin.total.saturating_add(bytes);
-        // ONLY A FLOOR THIS OPEN MADE DURABLE COVERS A BATCH (sim item S7): one
-        // read at the hello may be a killed predecessor's failed flush, one
-        // raised here may have failed after its rename; either is written
-        // again first ([`StateDir::raise_logfloor`]).
-        // NEGATIVE CONTROL (`crate::sim`): the floor that reads trusted, as
-        // before.
         #[cfg(test)]
         let admitted = self.state.logfloor_admitted()
             || self
@@ -1200,8 +954,6 @@ impl Bridge {
             return true;
         }
         let top = need.saturating_add(mirror::FLOOR_LEASE_BYTES);
-        // The first raise of this open is a start's cost (a restart's, a
-        // handoff successor's): said with its time, as the run record's is.
         let first = !self.state.logfloor_admitted();
         let began = self.fx.now();
         #[cfg(test)]
@@ -1241,23 +993,9 @@ impl Bridge {
         }
     }
 
-    /// Send every owed slot pipelined at its pinned sequence, the session's
-    /// `ev` face opened only through the subject budget's mirror reserve.
-    /// The budget is asked ONCE a face a pass, and never for a
-    /// face already in the index (a slot of it on the bus put it there,
-    /// [`Bridge::conclude_mirror`]): its round trip reads every ack owed
-    /// first, so asked per slot it serialized the batch one strict ack at a
-    /// time.
-    ///
-    /// A BATCH OWED ITS RE-PIN SENDS NOTHING (in order): the
-    /// collided session's later slots still hold their sequences from before
-    /// the collision. Sent there, one the broker never got would reach the
-    /// bus ahead of the collided slot, and once more at the fresh sequence
-    /// its re-pin gives it ([`Bridge::mirror_repin`]).
+    /// Send every owed slot pipelined at its pinned sequence, the session's `ev` face opened only through the subject budget's mirror reserve.
     pub(super) fn mirror_send(&mut self) {
         let k = self.mirror.as_deref().map_or(0, |m| m.pin.slots.len());
-        // The key and the floor on the media before any slot is sent:
-        // a recovered batch an older build pinned included.
         if k > 0 && !(self.mirror_key_on_the_media() && self.mirror_floor_covers()) {
             return;
         }
@@ -1327,16 +1065,7 @@ impl Bridge {
         }
     }
 
-    /// One slot's ack, read off the publisher connection by the round
-    /// ([`Bridge::settle_one`]): an append, a deduped answer to read back, a
-    /// first send's deduped answer (another writer's record: the collision
-    /// path, and the slot and every later one of its session re-pinned),
-    /// the budget's refusal, a refusal FOR GOOD (the mirror stops,
-    /// the same record would be refused again), or one that is
-    /// not — astream's `ERR_REFUSED` (a failed append or fsync, a broker
-    /// stopping) and a lapsed capability, which land once resent or renewed —
-    /// and a transport failure: sent again, a refusal after
-    /// [`super::DEADLINE_RETRY`].
+    /// One slot's ack, read off the publisher connection by the round ([`Bridge::settle_one`]): an append, a deduped answer to read back, a first send's deduped answer (another writer's record: the collision path, and the slot and every later one of its session re-pinned), the budget's refusal, a refusal FOR GOOD (the mirror stops, the same record would be refused again), or one that is not — astream's `ERR_REFUSED` (a failed append or fsync, a broker stopping) and a lapsed capability, which land once resent or renewed — and a transport failure: sent again, a refusal after [`super::DEADLINE_RETRY`].
     pub(super) fn conclude_mirror(
         &mut self,
         slot: usize,
@@ -1394,14 +1123,7 @@ impl Bridge {
         }
     }
 
-    /// After a collision, on the connection the reattach brought: the
-    /// collided slot and every later slot of its session at fresh sequences,
-    /// in order, never sent from this incarnation. `true` once
-    /// done: RESERVED, THEN PINNED, as a take is ([`Bridge::mirror_take`]). A
-    /// sequence that cannot be reserved or a pin that cannot be written
-    /// changes nothing: the re-pin stays owed, the collided slots hold the
-    /// landing ([`Outcome::concluded`]), and it is tried again after
-    /// [`DEADLINE_RETRY`].
+    /// After a collision, on the connection the reattach brought: the collided slot and every later slot of its session at fresh sequences, in order, never sent from this incarnation.
     pub(super) fn mirror_repin(&mut self) -> bool {
         if self.conn.is_none() {
             return false;
@@ -1466,26 +1188,11 @@ impl Bridge {
         true
     }
 
-    /// Every slot concluded: read back each deduped answer, then land. A
-    /// batch with a slot not concluded — owed, in flight, or collided and
-    /// owed its re-pin — lands nothing.
+    /// Every slot concluded: read back each deduped answer, then land.
     pub(super) fn mirror_settle(&mut self) {
         if self.mirror.as_deref().is_none_or(|m| !m.concluded()) {
             return;
         }
-        // THE CHECKED DEDUP, by the rule a post's pinned retry is
-        // checked by ([`Bridge::publish_reserved`]): these bytes at the
-        // answered offset on the slot's face are ours, and another record
-        // there is another writer's, the collision path. NO RECORD THERE IS
-        // NO EVIDENCE YET: retention may have taken it since the answer (a
-        // broker of astream's R4 then refuses the read `retained-from=`, which
-        // [`read_back_rows`] takes as no rows), or the record at that offset is
-        // on a subject this face does not hold.
-        // The slot is sent again at its pinned seq, and its answer tells them
-        // apart. astream drops a record's dedup entry with the record, so
-        // after retention the slot appends anew; a second dedup naming the
-        // same offset means the record there is held, and not on our face:
-        // another writer's.
         let checks: Vec<(usize, u64, String, String, u64)> = self
             .mirror
             .as_deref()
@@ -1511,7 +1218,6 @@ impl Bridge {
                 return;
             };
             let started = fx.now();
-            // Retention taking the record since the answer is no rows.
             let answer = read_back_rows(conn.fetch(off, &face, 1), off);
             let read = match self.observe(started, answer, Some("read")) {
                 Ok(rows) => match rows.iter().find(|(at, f, _)| *at == off && *f == face) {
@@ -1558,15 +1264,9 @@ impl Bridge {
                 }
             }
         }
-        // A slot to send again holds the batch's landing: the next pass sends
-        // it ([`Bridge::mirror_due`] is now) and settles the batch once more.
         if again {
             return;
         }
-        // A session the budget refused is not mirrored yet: said once on the
-        // node's own face, and NONE of its slots from the first refused one
-        // lands, so its cursor stays where the bus holds it and a later take
-        // offers the rest again (the module doc).
         let refused: Vec<String> = self
             .mirror
             .as_deref()
@@ -1605,8 +1305,6 @@ impl Bridge {
             })
             .unwrap_or_default();
         if pairs.is_empty() {
-            // Nothing of the batch may land: drop the pin, and wait before
-            // the take that offers the refused sessions' records again.
             let now = self.fx.now();
             if let Some(m) = self.mirror.as_deref_mut() {
                 m.clear_batch();
@@ -1620,7 +1318,6 @@ impl Bridge {
             }
             return;
         }
-        // A halt queued while the batch went out goes first.
         self.service_urgent();
         let reply = match self.ctl_request(&mirror::landed_line(&pairs)) {
             Ok(reply) => reply.header().to_string(),
@@ -1669,10 +1366,6 @@ impl Bridge {
             .map(|(s, _)| s.body.len() as u64)
             .sum();
         m.pin.total = m.pin.total.saturating_add(bytes);
-        // The window ledger, on a retaining broker: the batch's
-        // bytes at the highest offset it landed at, which the broker's cut
-        // must pass to give it up. Over any other broker nothing is given up,
-        // and the total alone counts.
         let retains = self.broker_retains == Some(true);
         let hi = m
             .outcome
@@ -1696,9 +1389,6 @@ impl Bridge {
     }
 
     /// A closed session's tail is all on the bus (`done`): its `ev` face
-    /// leaves the broker's last-value index and gives its subject back to
-    /// the node's budget (astream's `/a/retire`). Its records stay
-    /// in the log, fetchable.
     fn mirror_retire_face(&mut self, sid: &str) {
         let face = subject::session_face(&self.cfg.fleet, &self.node, sid, "ev");
         let producer = self.producer_id;
@@ -1715,14 +1405,11 @@ impl Bridge {
         }
     }
 
-    /// The bus log was replaced: the pinned batch names the old one. It is
-    /// dropped; the endpoint's cursors start over (`link log` answered
-    /// `forgot=1`), and its next takes regenerate what the old log held.
+    /// The bus log was replaced: the pinned batch names the old one.
     pub(super) fn mirror_forget_log(&mut self) {
         let Some(m) = self.mirror.as_deref_mut() else {
             return;
         };
-        // The window ledger and `oldest=` name the old log's offsets too.
         m.oldest = 0;
         if m.pin.slots.is_empty() && m.pin.win.is_empty() {
             return;

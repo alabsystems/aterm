@@ -1,50 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE CODEX-ALAB SESSION RECORD AND THE CRASH RULE (the codex-alab native
-//! harness contract, §4), for a session a PROVEN self-claim supervises
-//! (aterm-gui's `self_claim`): aterm's own Codex lane stands down for it, and
-//! the exit's one decider is the window host's watch-only worker, which
-//! relaunches a crash on the line codex-alab's own record names — once that
-//! line has been proven to be the live process's.
-//!
-//! * **The record.** codex-alab writes `$CODEX_HOME/alab/sessions/<pid>.json`
-//!   (schema v1, [`Record`]): its conversation (`sessionId`), its resume line
-//!   (`resumeArgv`), its environment (`env`, at most `CODEX_HOME`) and how it
-//!   last stood (`status`, `exit`). aterm reads it ONLY WHILE THE IDENTITY IS
-//!   LIVE — the pid running under the kernel start the proof named, before
-//!   and after the read ([`read_copy`]) — and keeps its own copy ([`Copy`]):
-//!   at the exit it reads nothing of the file, which anything running as the
-//!   user (a model's tool process among them) could have rewritten after the
-//!   agent died. aterm never writes into `CODEX_HOME`.
-//! * **The validation** ([`validate`], made against the live process at the
-//!   same read): `resumeArgv[0]` is the path the live process was exec'd from
-//!   (`KERN_PROCARGS2`'s exec path), its image (`proc_pidpath`), or atpkg's
-//!   managed twin (`<prefix>/agents/codex`, the launch path `PATH` resolves
-//!   inside aterm) while that twin execs an ALab build; the line ends
-//!   `resume <sessionId>`, `sessionId` a UUID; the elements between are,
-//!   in order and all of them, the root flags the live process ran with as
-//!   the Codex lane reads them ([`codex_alab::rewrite_argv`]: its prompt,
-//!   images, subcommand and session dropped, every flag kept with its value
-//!   — a flag that lane does not know relaunches nothing); `env` names
-//!   `CODEX_HOME` alone, equal to the live process's own; a `cwd` it names is
-//!   the live process's own, and the relaunch runs in the live process's
-//!   directory, never one the record chose. Anything else relaunches
-//!   nothing: a line read from a writable file is never typed into a shell
-//!   unless the agent itself ran it.
-//! * **The verdict** ([`verdict`]): an exit whose copy saw the record removed
-//!   — read standing once, then gone ([`fold`]) — is orderly (`/exit`,
-//!   `/quit`, archive, the tab's hangup) and is left alone; one whose copy
-//!   never saw a record (killed before codex-alab's first write) is a CRASH,
-//!   relaunched only on the line aterm's own crash rule typed for that very
-//!   process ([`inherited`]); one whose record stood with no exit word, or standing as
-//!   `upgrading` (an `execve` that failed), is a CRASH; one the agent wrote
-//!   down as `exit: "signal:<n>"` is a crash only where aterm sent that
-//!   signal itself (its explicit restart's stamp: the stall's remedy).
-//! * **The witness** ([`Witnesses`]): each `(pid, identity)` relaunched is
-//!   written to aterm's own ledger (`<state>/drive/self-claim-witnesses`), and
-//!   a witness found there is never relaunched again — a successor after a
-//!   seamless update, or a second reader, sees it.
+//! `codex-alab` self-claimed session record parser, live validator, and crash-relaunch rules.
 
 use std::path::{Path, PathBuf};
 
@@ -52,63 +9,47 @@ use aterm_json::Value;
 
 use super::codex_alab;
 
-/// The record's schema version this reader takes.
+/// Supported `codex-alab` session record schema version.
 pub const RECORD_VERSION: u64 = 1;
 
 /// Maximum serialized record size. Reads admit only regular files and never
-/// wait for a Unix FIFO's writer.
 const RECORD_MAX_BYTES: u64 = 2 * 1024 * 1024;
 
-/// The ledger file a handled witness is written to, under `<state>/drive/`.
+/// Ledger filename for handled crash witnesses under `<state>/drive/`.
 pub const WITNESS_FILE: &str = "self-claim-witnesses";
 
-/// What codex-alab's record says (schema v1), as far as the crash rule reads
-/// it. Unknown fields are ignored; a field of the wrong type is a refusal.
+/// Parsed `codex-alab` schema-v1 session record.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Record {
-    /// The process the record is of.
+    /// Process ID recorded by the agent.
     pub pid: u32,
-    /// The primary thread (`sessionId`), when the TUI had registered one.
+    /// Primary conversation UUID (`sessionId`), once registered.
     pub session_id: Option<String>,
-    /// The resume line (`resumeArgv`), `None` until the primary thread's
-    /// rollout was materialized.
+    /// Resume command line (`resumeArgv`), once the rollout is materialized.
     pub resume_argv: Option<Vec<String>>,
-    /// The launch environment the line needs (`env`), in the record's order.
+    /// Launch environment pairs (`env`) in record order.
     pub env: Vec<(String, String)>,
-    /// `busy|idle|waiting|upgrading|exited`, when named.
+    /// Agent status word (`busy|idle|waiting|upgrading|exited`).
     pub status: Option<String>,
-    /// How it ended, when it wrote that down (`signal:<n>`, …): `None` while
-    /// it ran.
+    /// Exit reason token (`signal:<n>`, etc.), or `None` while running.
     pub exit: Option<String>,
-    /// The directory it ran in.
+    /// Working directory recorded by the agent.
     pub cwd: Option<String>,
-    /// `draftEmpty`: whether the TUI's composer held no draft of a person's
-    /// when it wrote the record. It decides only the watch-only worker's
-    /// idle point ([`idle_point`]), never the crash rule: a value that is not
-    /// a boolean reads as unknown (`None`, never idle) rather than refusing
-    /// the record the exit is decided from.
+    /// Whether the TUI composer held no user draft (`draftEmpty`).
     pub draft_empty: Option<bool>,
-    /// `state`: what the TUI's frame reads (`working|idle|blocked|done|error`),
-    /// whatever the session still owes. It decides only the relaunch's first
-    /// frame ([`first_frame`]), never the crash rule or the idle point: a value
-    /// that is not a string reads as unknown (`None`), never refusing the
-    /// record.
+    /// TUI frame state (`working|idle|blocked|done|error`).
     pub frame: Option<String>,
-    /// The explicit pre-registration writer frame: all native identity and
-    /// frame fields are null, busy with an empty draft and no exit. Derived
-    /// from the parsed wire shape, never an extra field a writer may assert.
+    /// Whether the record is in its pre-registration initializing frame.
     pub initializing: bool,
 }
 
-/// Why a record or its line is refused (one word, said in the ledger and
-/// on the Messages record).
+/// Short refusal code returned when a record or resume line is rejected.
 pub type Refusal = &'static str;
 
-/// Parse one record (schema v1, [`Record`]).
+/// Parse a `codex-alab` schema-v1 [`Record`] from JSON `text`.
 ///
 /// # Errors
-/// `not-json`, `version` (another schema), `pid`, or the field whose type is
-/// wrong.
+/// Returns a [`Refusal`] code if `text` is not valid schema-v1 JSON.
 pub fn parse(text: &str) -> Result<Record, Refusal> {
     let v: Value = aterm_json::from_str(text).map_err(|_| "not-json")?;
     if v.get("v").and_then(Value::as_u64) != Some(RECORD_VERSION) {
@@ -164,11 +105,7 @@ pub fn parse(text: &str) -> Result<Record, Refusal> {
     })
 }
 
-/// THE WATCH-ONLY WORKER'S IDLE POINT (the contract, §4; the Codex screen
-/// lane's retirement): the agent itself says, in its own record, that it is
-/// at rest — `status: "idle"` with `draftEmpty: true` and no word of an end.
-/// Anything else is no idle point: `busy`, `waiting`, `upgrading`, `exited`,
-/// a draft in the composer, a draft not named, a status not named.
+/// Whether `record` reports the agent at a watch-only idle point.
 #[must_use]
 pub fn idle_point(record: &Record) -> bool {
     record.status.as_deref() == Some("idle")
@@ -177,7 +114,6 @@ pub fn idle_point(record: &Record) -> bool {
 }
 
 /// The live process `pid`'s `$CODEX_HOME` (canonical) and its own facts,
-/// from its exec record; `None` where that cannot be read.
 fn live_of(pid: u32) -> Option<(PathBuf, Live)> {
     let args = atpkg::caller_shell::process_args(pid)?;
     let live = Live {
@@ -192,49 +128,22 @@ fn live_of(pid: u32) -> Option<(PathBuf, Live)> {
     Some((home, live))
 }
 
-/// WHETHER THE PROCESS `pid` STARTED AT `start` IS AT ITS IDLE POINT NOW, by
-/// its own record read LIVE ([`idle_point`]): read only while that very
-/// process runs, looked at before the read and again after it, the record
-/// naming that pid. The watch-only worker beside a proven self-claim asks it
-/// at decision time — before the memory ceiling's restart (the stall's
-/// explicit restart reads no rest: a frozen TUI's record never rests) — in
-/// place of any screen reader. `false` (fail closed:
-/// wait) for a process gone or another identity of its pid, an exec record
-/// that cannot be read, a record removed, unreadable or of another pid, and
-/// any record that is not at rest.
+/// Whether live process `(pid, start)` is currently at its idle point according to its record.
 #[must_use]
 pub fn read_idle(pid: u32, start: &str) -> bool {
     read_live(pid, start, |record| idle_point(record).then_some(())).is_some()
 }
 
-/// What a relaunched codex-alab's own record says of its TUI's frame once
-/// it is up ([`first_frame`]): what ends aterm's relaunch hold
-/// (`codex_alab_drive`'s `hold_to_first_idle`).
+/// Initial TUI frame classification of a relaunched `codex-alab` process ([`first_frame`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FirstFrame {
-    /// At rest: its first idle — `state` `idle`, `done` or `error`, or the
-    /// record's own rest ([`idle_point`]).
+    /// Process has reached its first idle frame.
     Idle,
-    /// In a turn or a box (`working`, `blocked`): a turn under way that the
-    /// relaunch lease did not hold back — a person's, or a carry-on that went
-    /// before a later step took the hand again — so its first idle is behind
-    /// it, or not the next thing it reaches.
+    /// Process is actively working or blocked on an approval/question box.
     Turn,
 }
 
-/// A RELAUNCHED CODEX-ALAB'S FIRST FRAME (the contract §5, carry-on: aterm's
-/// relaunch lease is held "to the new process's first idle"): its own record
-/// names its TUI's frame — [`FirstFrame::Idle`] at rest, [`FirstFrame::Turn`]
-/// in a turn or a box — and no end. Not the idle point alone: a relaunch
-/// whose thread owes its carry-on keeps its record `busy` until that act goes
-/// (§4: `status:"idle"` only when no carry-on is owed), and the act waits for
-/// this very lease to be given back (§5, before every act: `hand=-` or its
-/// own), so a hold to the idle point would always run to its bound exactly
-/// when the carry-on is owed. Nor the frame at rest alone: codex-alab's own
-/// acts in a turn under way (a box it answers) wait for the same lease, so a
-/// hold to the rest that turn ends at would hold them to its bound too.
-/// `None` for no frame named (or one that is no word this reads) and a
-/// record that names its end.
+/// Classify the initial TUI frame of a relaunched `codex-alab` from `record`.
 #[must_use]
 pub fn first_frame(record: &Record) -> Option<FirstFrame> {
     if record.exit.is_some() {
@@ -248,19 +157,13 @@ pub fn first_frame(record: &Record) -> Option<FirstFrame> {
     }
 }
 
-/// THE FIRST FRAME OF THE PROCESS `pid` STARTED AT `start` ([`first_frame`]),
-/// by its own record read LIVE, as [`read_idle`] reads the idle point: `None`
-/// (fail closed: keep holding) for a process gone or another identity of its
-/// pid, an exec record that cannot be read, and a record missing, unreadable,
-/// of another pid or naming no frame.
+/// Read and classify the initial TUI frame of live process `(pid, start)`.
 #[must_use]
 pub fn read_first_frame(pid: u32, start: &str) -> Option<FirstFrame> {
     read_live(pid, start, first_frame)
 }
 
 /// `point` of the process `pid` started at `start`'s own record, read only
-/// while that very process runs (looked at before the read and again after
-/// it), the record naming that pid.
 fn read_live<T>(pid: u32, start: &str, point: fn(&Record) -> Option<T>) -> Option<T> {
     use super::restart_stamp::alive_as;
     if !alive_as(pid, start) {
@@ -274,10 +177,7 @@ fn read_live<T>(pid: u32, start: &str, point: fn(&Record) -> Option<T>) -> Optio
     at.filter(|_| alive_as(pid, start))
 }
 
-/// The pid of the codex-alab one `status` reply names as its PROVEN
-/// self-claim (`supervisor_proven=1` beside `supervisor=codex-alab@<pid>`,
-/// the holder percent-encoded as every `status` field is); `None` for any
-/// other claim, an unproven one, none, or a reply that is not `OK`.
+/// Extract the proven `codex-alab` PID from a `status` reply string.
 #[must_use]
 pub fn proven_pid(status: &str) -> Option<u32> {
     use crate::supervise::screen::status_field;
@@ -292,7 +192,7 @@ pub fn proven_pid(status: &str) -> Option<u32> {
         .ok()
 }
 
-/// Whether `id` is a UUID in its one textual form (8-4-4-4-12 hex digits).
+/// Whether `id` is a canonical 8-4-4-4-12 lowercase/uppercase hex UUID.
 #[must_use]
 pub fn is_uuid(id: &str) -> bool {
     let groups: Vec<&str> = id.split('-').collect();
@@ -303,47 +203,40 @@ pub fn is_uuid(id: &str) -> bool {
             .all(|(g, n)| g.len() == n && g.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
-/// The live process's own facts, read while it ran (the same read as the
-/// record's: [`read_copy`]).
+/// Live kernel facts for a running `codex-alab` process.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Live {
-    /// The path it was exec'd from (`KERN_PROCARGS2`): its launch path as
-    /// its shell resolved it.
+    /// Executable path from `KERN_PROCARGS2`.
     pub exec_path: String,
-    /// Its image (`proc_pidpath`), where readable.
+    /// Resolved executable image path from `proc_pidpath`.
     pub image: Option<PathBuf>,
-    /// Its argv, `argv[0]` first.
+    /// Process argument vector (`argv[0]` first).
     pub argv: Vec<String>,
-    /// Its `CODEX_HOME` at exec, where set.
+    /// `CODEX_HOME` environment variable at exec, if set.
     pub codex_home: Option<String>,
-    /// Its working directory, where readable.
+    /// Current working directory of the process.
     pub cwd: Option<PathBuf>,
-    /// atpkg's managed Codex twin (`<prefix>/agents/codex`), where it is
-    /// configured and execs an ALab build: the launch path a relaunch may
-    /// name, so it runs the CURRENT managed build.
+    /// Managed `atpkg` Codex twin path (`<prefix>/agents/codex`), if configured.
     pub twin: Option<PathBuf>,
 }
 
-/// A validated resume line ([`validate`]): what the relaunch types.
+/// Validated resume command and environment for relaunching a crashed session.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Resume {
-    /// The line, `argv[0]` the launch path.
+    /// Command vector with the launch path at `argv[0]`.
     pub argv: Vec<String>,
-    /// The conversation it resumes.
+    /// Conversation UUID to resume.
     pub session: String,
-    /// The `CODEX_HOME` it is relaunched under, when the launch had one.
+    /// `CODEX_HOME` directory for the relaunch, if non-default.
     pub codex_home: Option<String>,
-    /// The directory it ran in, when the record names one.
+    /// Working directory for the relaunch.
     pub cwd: Option<String>,
 }
 
-/// THE VALIDATION (module header): `record`'s line against the live
-/// process's own facts.
+/// Validate `record`'s resume command against `pid` and `live` process facts.
 ///
 /// # Errors
-/// The word that refused it: `no-resume-line`, `no-session`, `session-not-uuid`,
-/// `launch-path`, `no-resume`, `live-argv` (the live argv is not one the
-/// Codex lane reads), `foreign-argv`, `env`, `cwd`, `pid`.
+/// Returns the [`Refusal`] code explaining why the record cannot be relaunched.
 pub fn validate(record: &Record, pid: u32, live: &Live) -> Result<Resume, Refusal> {
     if record.pid != pid {
         return Err("pid");
@@ -367,7 +260,6 @@ pub fn validate(record: &Record, pid: u32, live: &Live) -> Result<Resume, Refusa
     {
         return Err("launch-path");
     }
-    // `resume <sessionId>` ends the line: nothing after it (no prompt).
     let at = argv
         .len()
         .checked_sub(2)
@@ -376,14 +268,10 @@ pub fn validate(record: &Record, pid: u32, live: &Live) -> Result<Resume, Refusa
     if argv[at] != "resume" || argv[at + 1] != session {
         return Err("no-resume");
     }
-    // The root flags between, exactly as the live process ran them: in
-    // order, every one with its value, its prompt and images dropped.
     let root = codex_alab::rewrite_argv(&live.argv, None).map_err(|_| "live-argv")?;
     if argv[1..at] != root[..] {
         return Err("foreign-argv");
     }
-    // The relaunch runs where the live process ran; a directory the record
-    // names is only checked against it (as spelled, or resolved).
     let same = |named: &str, running: &Path| {
         Path::new(named) == running || std::fs::canonicalize(named).is_ok_and(|c| c == running)
     };
@@ -400,50 +288,39 @@ pub fn validate(record: &Record, pid: u32, live: &Live) -> Result<Resume, Refusa
     Ok(Resume {
         argv: argv.clone(),
         session: session.to_string(),
-        // A record may omit its environment, but a per-command CODEX_HOME
-        // belongs to the live process, not necessarily its parent shell.
         codex_home: live.codex_home.clone(),
         cwd: cwd.filter(|c| Path::new(c).is_absolute() && !c.chars().any(char::is_control)),
     })
 }
 
-/// What one read of the record found while the identity was live.
+/// Outcome of reading a live process's session record.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Seen {
-    /// It stood, as parsed.
+    /// Record file existed and parsed.
     Present(Record),
-    /// It was read standing at an earlier read of this identity and is gone
-    /// now: codex-alab removed it (an orderly end). Only [`fold`] makes it.
+    /// Record file was previously present for this identity and has been removed.
     Removed,
-    /// No read of this identity has found it yet: codex-alab had not written
-    /// it (a process ended before its record writer's first write is no
-    /// orderly end: the end-to-end run of 2026-10-16, AD-3).
+    /// Record file has not yet been observed for this identity.
     Never,
-    /// It stood and could not be read as a record (the word why).
+    /// Record file existed but failed to parse.
     Unreadable(Refusal),
 }
 
-/// ATERM'S OWN COPY of what the record said, from the last read made while
-/// the identity was live ([`read_copy`]): the only thing the exit is decided
-/// and relaunched from.
+/// Host-side snapshot of a live process's session record ([`read_copy`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Copy {
-    /// The agent's pid and kernel start: the identity read under.
+    /// Process ID and kernel start timestamp.
     pub pid: u32,
     pub start: String,
-    /// The `$CODEX_HOME` the record was read under (canonical).
+    /// Canonical `CODEX_HOME` directory where the record was read.
     pub home: PathBuf,
-    /// What the read found.
+    /// Observed state of the record file.
     pub seen: Seen,
-    /// The record's line, validated against the live process at that read
-    /// ([`validate`]); `Err` names why it relaunches nothing. A record removed
-    /// or not readable is `Err("no-record")`; one never written yet, or its
-    /// explicit pre-registration initializer, uses the line [`inherited`]
-    /// from aterm's own relaunch, else `Err("no-record-yet")`.
+    /// Validated [`Resume`] or [`Refusal`] from the read.
     pub resume: Result<Resume, Refusal>,
 }
 
-/// Where codex-alab files its record: `<home>/alab/sessions/<pid>.json`.
+/// Path to `<home>/alab/sessions/<pid>.json`.
 #[must_use]
 pub fn record_path(home: &Path, pid: u32) -> PathBuf {
     home.join("alab")
@@ -452,7 +329,6 @@ pub fn record_path(home: &Path, pid: u32) -> PathBuf {
 }
 
 /// The `$CODEX_HOME` a process started with `codex_home`/`home` uses:
-/// `CODEX_HOME`, else `$HOME/.codex`; canonical where it exists.
 fn codex_home_of(codex_home: Option<&str>, home: Option<&str>) -> Option<PathBuf> {
     let dir = codex_home
         .map(PathBuf::from)
@@ -466,7 +342,6 @@ fn codex_home_of(codex_home: Option<&str>, home: Option<&str>) -> Option<PathBuf
 }
 
 /// atpkg's managed Codex twin, where one is configured and the build it execs
-/// is ALab's ([`codex_alab::alab_bytes`]).
 fn managed_alab_twin() -> Option<PathBuf> {
     let twin = atpkg::store::resolve_configured()?
         .agents_dir()
@@ -475,10 +350,7 @@ fn managed_alab_twin() -> Option<PathBuf> {
     codex_alab::alab_bytes(&exe).then_some(twin)
 }
 
-/// Make the copy from what was read: the record's text (`None`: no such
-/// file, never yet written as far as this read knows: [`fold`] tells a
-/// removal) and the live facts (pure). `typed`: the line aterm's own crash
-/// rule last typed in the tab ([`inherited`]).
+/// Build a [`Copy`] from raw record file text `raw` and `live` process facts.
 #[must_use]
 pub fn copy_of(
     pid: u32,
@@ -496,16 +368,10 @@ pub fn copy_of(
     copy_seen(pid, start, home, seen, live, typed)
 }
 
-/// THE LINE A NEVER-WRITTEN OR INITIAL RECORD INHERITS: `typed`, the line
-/// aterm's own crash rule typed in the tab, when the live process runs exactly it — its
-/// launch path, `resume <session>` of that line's conversation, its root
-/// flags, its `CODEX_HOME` ([`validate`] of that line as a record of `pid`):
-/// the relaunch that started this very process. Any other process (one a
-/// person started, another conversation) inherits nothing.
+/// Inherit the previously typed [`Resume`] when a relaunched process has not yet materialized its rollout.
 ///
 /// # Errors
-/// `no-record-yet` with no typed line; else the word [`validate`] refused it
-/// by, or `not-the-typed-line` when the live process resumes another thread.
+/// Returns `no-resume` if `typed` does not match `live`.
 pub fn inherited(typed: Option<&Resume>, pid: u32, live: &Live) -> Result<Resume, Refusal> {
     let typed = typed.ok_or("no-record-yet")?;
     if codex_alab::resumed_thread(&live.argv).as_deref() != Some(typed.session.as_str()) {
@@ -530,10 +396,7 @@ pub fn inherited(typed: Option<&Resume>, pid: u32, live: &Live) -> Result<Resume
     validate(&record, pid, live)
 }
 
-/// THE COPY KEPT ACROSS READS: `read` (this read's copy) over `before` (the
-/// copy kept until now). A record this read did not find that an earlier
-/// read of the SAME identity saw (standing, or unreadable but there) was
-/// REMOVED; one no read of it ever found stays [`Seen::Never`].
+/// Fold a new live `read` over the previously retained `before` copy.
 #[must_use]
 pub fn fold(before: Option<&Copy>, mut read: Copy) -> Copy {
     let seen_before = before.is_some_and(|b| {
@@ -543,10 +406,6 @@ pub fn fold(before: Option<&Copy>, mut read: Copy) -> Copy {
         read.seen = Seen::Removed;
         read.resume = Err("no-record");
     }
-    // Initializer authority belongs only before registration. A record that
-    // later goes blank cannot revive the launch's old conversation. Keep the
-    // refusal sticky through repeated initializers until a concrete record
-    // supplies its own validated line again.
     if matches!(&read.seen, Seen::Present(record) if record.initializing)
         && before.is_some_and(|b| {
             (b.pid, b.start.as_str()) == (read.pid, read.start.as_str())
@@ -570,9 +429,6 @@ fn copy_seen(
 ) -> Copy {
     let resume = match &seen {
         Seen::Present(record) if record.initializing => {
-            // The host already started this exact resume. The initializer
-            // contributes no new line; its pid and environment still have
-            // to agree with the live process, just as a materialized record's.
             inherited(typed, pid, live).and_then(|resume| {
                 let record = Record {
                     session_id: Some(resume.session),
@@ -609,13 +465,7 @@ fn read_record(path: &Path) -> Seen {
     }
 }
 
-/// THE LIVE READ (module header): the record of the process `pid` started at
-/// `start`, with the live process's own facts — read only while that very
-/// process runs, looked at before the read and again after it. `None` when it
-/// does not run (before or after), or its exec record cannot be read: nothing
-/// is kept from a read that cannot be vouched for. `typed`: the line aterm's
-/// crash rule last typed in the tab ([`inherited`]); [`fold`] it over the
-/// copy kept before.
+/// Read and validate the live session record for `(pid, start)` while verifying process identity.
 #[must_use]
 pub fn read_copy(pid: u32, start: &str, typed: Option<&Resume>) -> Option<Copy> {
     use super::restart_stamp::alive_as;
@@ -631,29 +481,25 @@ pub fn read_copy(pid: u32, start: &str, typed: Option<&Resume>) -> Option<Copy> 
     Some(copy_seen(pid, start, home, seen, &live, typed))
 }
 
-/// How an exit is decided from the copy ([`verdict`]).
+/// Exit classification derived from the last live [`Copy`] ([`verdict`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Verdict {
-    /// An orderly end the copy saw (its record removed, or an exit word that
-    /// is not aterm's signal): left alone.
+    /// Orderly exit that should not be relaunched.
     Orderly(Refusal),
-    /// A crash: relaunched, where its line validated.
+    /// Abnormal termination eligible for relaunch.
     Crash,
 }
 
-/// THE VERDICT (module header): `copy` the last live read's, `asked` whether
-/// aterm's own explicit restart ended the process (its stamp).
+/// Decide whether an exited process with last live `copy` crashed or ended orderly.
 #[must_use]
 pub fn verdict(copy: &Copy, asked: bool) -> Verdict {
     let record = match &copy.seen {
         Seen::Removed => return Verdict::Orderly("removed"),
-        // Ended before its record's first write: no word of an end at all.
         Seen::Never => return Verdict::Crash,
         Seen::Unreadable(why) => return Verdict::Orderly(why),
         Seen::Present(record) => record,
     };
     match record.exit.as_deref() {
-        // A signal it wrote down: a crash only where aterm sent it.
         Some(word) if word.starts_with("signal:") => {
             if asked {
                 Verdict::Crash
@@ -661,21 +507,14 @@ pub fn verdict(copy: &Copy, asked: bool) -> Verdict {
                 Verdict::Orderly("signal-not-aterms")
             }
         }
-        // An upgrade's `execve` that never landed leaves `upgrading` standing.
         _ if record.status.as_deref() == Some("upgrading") => Verdict::Crash,
         Some(_) => Verdict::Orderly("exited"),
         None if record.status.as_deref() == Some("exited") => Verdict::Orderly("exited"),
-        // The record stood with no word of an end: a panic, a SIGKILL, a
-        // power loss — or aterm's own restart, which a SIGTERM handler that
-        // never ran left unwritten.
         None => Verdict::Crash,
     }
 }
 
-/// Whether `copy` shows the agent's END coming: its record removed (an
-/// orderly end), or standing with an exit word or as `exited`. A record that
-/// stands with none (running, idle, or `upgrading` into its next image) is an
-/// agent that goes on.
+/// Whether `copy` indicates the agent is already shutting down or has exited.
 #[must_use]
 pub fn shows_end(copy: &Copy) -> bool {
     match &copy.seen {
@@ -687,14 +526,13 @@ pub fn shows_end(copy: &Copy) -> bool {
     }
 }
 
-/// ATERM'S LEDGER OF HANDLED WITNESSES (module header): one `<pid>
-/// <identity>` line per witness relaunched, under `<state>/drive/`.
+/// Persistent ledger of `(pid, start)` witnesses already relaunched.
 pub struct Witnesses {
     path: PathBuf,
 }
 
 impl Witnesses {
-    /// The ledger under the harness state root `state`.
+    /// Open the witnesses ledger under harness state root `state`.
     #[must_use]
     pub fn under(state: &Path) -> Self {
         Self {
@@ -709,18 +547,17 @@ impl Witnesses {
         )
     }
 
-    /// Whether the witness `(pid, start)` was handled already.
+    /// Whether witness `(pid, start)` has already been recorded.
     #[must_use]
     pub fn handled(&self, pid: u32, start: &str) -> bool {
         let want = Self::line(pid, start);
         std::fs::read_to_string(&self.path).is_ok_and(|text| text.lines().any(|l| l == want))
     }
 
-    /// Record the witness `(pid, start)` handled (appended; the directory
-    /// made 0700 where it is not there).
+    /// Append witness `(pid, start)` to the ledger file.
     ///
     /// # Errors
-    /// The filesystem's.
+    /// Returns an I/O error if creating the directory or appending fails.
     pub fn record(&self, pid: u32, start: &str) -> std::io::Result<()> {
         use std::io::Write as _;
         if let Some(dir) = self.path.parent() {

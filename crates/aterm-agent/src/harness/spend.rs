@@ -1,102 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE DOLLAR FIGURES of the account stats (`docs/DESIGN-account-stats-2026-10-15.md`
-//! §3.6): every message an account's agent was served, its tokens class by
-//! class, priced at the vendor's public LIST price — `≈$ (list)`, a
-//! normalization, never a bill — and, beside a window's reading, what a full
-//! window holds (`C ≥ $ ÷ used`) and what is left (`≈ C × (1 − used)`).
-//!
-//! * **The table** is [`PRICES_TOML`], a dated file of its own whose rows a
-//!   person read off the vendors' public pricing pages, each naming its page.
-//!   The caller loads it ([`PriceTable::from_toml`]) and hands it to every
-//!   function here: nothing in this module knows a price. A model id with no
-//!   row is UNPRICED — its tokens are counted and shown, never priced at a
-//!   guess (Claude Code prices an unknown model at a default rate; this does
-//!   not).
-//! * **The fold** ([`Spend::fold_claude_home`]) reads EVERY transcript under a
-//!   Claude Code home's `projects/` modified in the last [`HORIZON_S`],
-//!   subagent and workflow transcripts included (they carry nearly all the
-//!   dollars: the design's F15). Each message counts once in the HOME, by its
-//!   `message.id`: at the largest counts its rows carry within its file (a
-//!   streamed message repeats its id over rows whose output grows), and not
-//!   again when another transcript repeats it (a copy a fork or a resume
-//!   could write; none was seen — 0 of 15,717 ids over 8 days on the machine
-//!   this was built on, F15 — but a copy would double a home-wide sum). The
-//!   ids counted are kept, by the hour they were served, for the
-//!   [`HORIZON_S`]. Each message is priced on its own
-//!   ([`PriceTable::message_usd`]: a model priced by prompt length is decided
-//!   request by request) and placed in the [`BUCKET_S`]-wide bucket of its
-//!   time, back to [`HORIZON_S`]; older ones are dropped ([`Spend::expire`]),
-//!   never merged into wider ones. Fast mode, US-only inference, web search,
-//!   a non-standard tier and an advisor's iterations are priced at the base
-//!   rates (an advisor's own tokens not at all) and counted as `approx`
-//!   ([`Tally::approx`]), a message once, when ANY row of it says so: Claude
-//!   Code writes `server_tool_use` on most streamed messages only with the
-//!   final usage, and on 2.1.300 often `speed` too. Claude Code's own empty
-//!   usage, which it writes where the server named nothing, is standard.
-//! * **The spend** ([`Spend`]) holds the buckets and, per transcript, a
-//!   byte cursor — its identity, the offset folded to, its size and mtime
-//!   when read, the byte before the offset, and the newest message ids of a
-//!   file still being written — and the home's counted ids, so a second fold
-//!   of the same spend reads only the bytes appended since and an unchanged
-//!   file is not opened. It lives in the caller's memory: `accounts stats`
-//!   folds the home at each run and saves nothing (the spend file the design
-//!   names is the recorder's, A2). A spend priced by another table, or for
-//!   another home, is folded again from the transcripts.
-//! * **A transcript that changed other than by an append** (shrunk, replaced,
-//!   the byte before the offset changed) is folded again from its start: the
-//!   messages it already counted are known by their ids and not counted
-//!   again ([`FoldReport::refolded`]).
-//! * **Capacity** ([`figure`]): `C = $(window start, t_r] ÷ u(t_r)`, summed
-//!   from the window's own five-minute buckets: the numerator stops at the
-//!   reading (whole buckets only, so later spend never inflates it) and
-//!   starts at a reset used inside the window. `C` is a lower bound (`≥`):
-//!   spend no machine here sees only makes it low. `left = C × (1 − u_now)`
-//!   is an estimate (`≈`), `stale` when `u_now` is older than a tenth of its
-//!   window or a machine that used the account did not answer. Both are
-//!   `on-credits` when usage credits served any message in the window: no
-//!   share of the window's spend is split off by time. The error bar is the
-//!   reading's resolution — whole until a tenth is seen, a painted panel
-//!   floored; the spread of closed windows (the calibration) waits for the
-//!   series' `close` rows (A2), so every capacity is uncalibrated. Every
-//!   empty figure carries one closed word ([`Why`]).
-//!
-//! Nothing here is set against the vendor's own cost. Claude Code's process
-//! cost (the status line's `cost.total_cost_usd`) also counts model calls its
-//! transcripts leave out: the prompt-suggestion and compaction forks, which
-//! write no transcript, side queries such as the session title, and an
-//! advisor's iterations. The table is checked against the managed build's own
-//! catalog in the lab (`targo --unverified lab prices`), never at run time.
-//!
-//! **A Codex conversation** ([`fold_conversation`]): what `harness usage`
-//! shows from a Codex session's own tools, its turns summed by model from
-//! the Codex reader (`harness::codex_rollout::TurnReader`), each mapped into
-//! Anthropic's classes as [`codex_message`] says. Codex has no capacity
-//! figure (§3.6).
-//!
-//! This is a LEAF (§8.2): it depends on `usage`, `transcript` and the Codex
-//! reader (`harness::codex_rollout`, which imports nothing of it), and
-//! nothing that decides anything imports it. Its API is report functions; there is no "best" or
-//! "next" accessor.
-//!
-//! STATUS: unit-tested against composed transcripts in temp homes (never a
-//! real one). The usage keys read (`cache_creation.ephemeral_1h_input_tokens`,
-//! `speed`, `inference_geo`, `service_tier`, `server_tool_use`, `iterations`)
-//! were MEASURED by name on Claude Code 2.1.30x transcripts. Over 8 days on
-//! the machine this was built on, 26,531 of 41,794 assistant rows carried
-//! `iterations` and every entry was `type: "message"`: no advisor ran. Fast
-//! mode's and US-only inference's own words were not seen either, so any word
-//! but the standard ones counts as approximate. Claude Code's empty usage was
-//! READ in 2.1.301 (`speed:"standard"`, `service_tier:"standard"`,
-//! `inference_geo:""`, `iterations:[]`, no search) and MEASURED in the lab,
-//! on a stub's reply that named none (the design's §9, A5). The advisor's
-//! price was READ there too: each `iterations[]` entry of type
-//! `advisor_message`, priced at that entry's model and added on top of the
-//! message's own usage. A `fallback_message` entry (a server-side fallback
-//! served the message; seen in this machine's transcripts before the 8-day
-//! horizon) counts as approximate too, as any entry but a plain `message`
-//! does.
+//! THE DOLLAR FIGURES of the account stats (`docs/DESIGN-account-stats-2026-10-15.md` §3.6): every message an account's agent was served, its tokens class by class, priced at the vendor's public LIST price — `≈$ (list)`, a normalization, never a bill — and, beside a window's reading, what a full window holds (`C ≥ $ ÷ used`) and what is left (`≈ C × (1 − used)`).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::io::{self, Read as _, Seek as _, SeekFrom};
@@ -110,64 +15,46 @@ use super::usage::{
 };
 use crate::harness::codex_rollout::{Row, Turn, TurnReader};
 
-/// The shipped price table, `prices.toml` beside this file, for the caller
-/// to load ([`PriceTable::from_toml`]) and hand in.
+/// The shipped price table, `prices.toml` beside this file, for the caller to load ([`PriceTable::from_toml`]) and hand in.
 pub const PRICES_TOML: &str = include_str!("prices.toml");
 
 /// How far back spend is kept: a week's window and a day more.
 pub const HORIZON_S: i64 = 8 * 24 * 3600;
 
-/// The width of every bucket, back to the horizon: a window's capacity is
-/// summed from these, never from a wider sum that would hold spend from
-/// before its start or after its reading.
+/// The width of every bucket, back to the horizon: a window's capacity is summed from these, never from a wider sum that would hold spend from before its start or after its reading.
 pub const BUCKET_S: i64 = 5 * 60;
 
 /// The counted ids are kept by the hour their message was served.
 const HOUR_S: i64 = 3600;
 
-/// The most transcripts one spend follows; past it a new one is counted
-/// unread.
+/// The most transcripts one spend follows; past it a new one is counted unread.
 pub const MAX_FILES: usize = 16_384;
 
-/// The most directory entries one walk of `projects/` looks at; a walk cut
-/// short makes the fold incomplete.
+/// The most directory entries one walk of `projects/` looks at; a walk cut short makes the fold incomplete.
 pub const MAX_WALK_ENTRIES: usize = 262_144;
 
-/// How deep under `projects/` the walk goes (`<slug>/<session>/subagents/
-/// workflows/<run>/agent-*.jsonl` is five directories down).
+/// How deep under `projects/` the walk goes (`<slug>/<session>/subagents/ workflows/<run>/agent-*.jsonl` is five directories down).
 pub const MAX_DEPTH: usize = 8;
 
-/// The message ids kept for a transcript read to its end that is still being
-/// written: a message still streaming when a fold stops is raised, not
-/// counted again, by the next. A transcript not yet read to its end keeps up
-/// to [`SEEN_IDS_MAX`].
+/// The message ids kept for a transcript read to its end that is still being written: a message still streaming when a fold stops is raised, not counted again, by the next.
 pub const IDS_KEPT: usize = 16;
 
-/// A transcript unchanged this long keeps no message ids of its own (the
-/// home's counted ids still know them).
+/// A transcript unchanged this long keeps no message ids of its own (the home's counted ids still know them).
 pub const QUIET_S: i64 = 10 * 60;
 
-/// The most counted message ids the home keeps (16 bytes each); past it the oldest hours are forgotten first, and a later copy of
-/// one of their messages would count again. A busy home serves a few
-/// thousand messages a day.
+/// The most counted message ids the home keeps (16 bytes each); past it the oldest hours are forgotten first, and a later copy of one of their messages would count again.
 pub const MAX_SEEN: usize = 400_000;
 
 /// `unpriced` and `unattributed` suppress a capacity past this share.
 pub const SHARE_MAX: f64 = 0.01;
 
 /// At most every retained bucket of one message. A model change or aggregate
-/// overflow makes the whole message unpriced. Reaching this bound also retires
-/// its tracked price; it never drops provenance while keeping USD.
 const MAX_CONTRIBUTIONS: usize = (HORIZON_S / BUCKET_S) as usize + 1;
 
 /// How much one read call asks the kernel for.
 const READ_CHUNK: usize = 64 * 1024;
 
-// The price table — read from its file, handed in, never built in
-
-/// Dollars per million tokens in each token class. `input` and `output`
-/// always have a price; a cache class the vendor's page lists none for is
-/// `None`, and a request with tokens in it cannot be priced.
+/// Dollars per million tokens in each token class.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct Rates {
     /// Per million input tokens.
@@ -197,7 +84,6 @@ impl Rates {
     }
 
     /// Dollars for `t` at these rates, or `None` when a class with tokens has
-    /// no rate. Five-minute writes are `cache_write − cache_write_1h`.
     fn usd(&self, t: &TokenUsage) -> Option<f64> {
         let per = |tokens: u64, price: Option<f64>| match (tokens, price) {
             (0, _) => Some(0.0),
@@ -215,13 +101,10 @@ impl Rates {
     }
 }
 
-/// The price of one model: its rates, and the higher rates a request whose
-/// prompt ([`TokenUsage::prompt`]) passes a length pays, where the vendor
-/// prices by prompt length.
+/// The price of one model: its rates, and the higher rates a request whose prompt ([`TokenUsage::prompt`]) passes a length pays, where the vendor prices by prompt length.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct ModelPrice {
-    /// The rates of every request, or of those at or under [`Self::long`]'s
-    /// length.
+    /// The rates of every request, or of those at or under [`Self::long`]'s length.
     pub rates: Rates,
     /// A request whose prompt is over this many tokens pays these rates.
     pub long: Option<(u64, Rates)>,
@@ -242,10 +125,7 @@ impl ModelPrice {
 /// The most rows a price table may hold.
 pub const MAX_PRICE_ROWS: usize = 512;
 
-/// Prices by exact model id. Empty unless the caller fills it: no code knows
-/// what any model costs, and a model with no row prices as `None`. The
-/// shipped table is a file of its own ([`PRICES_TOML`]) the caller reads in
-/// ([`Self::from_toml`]) and hands to every fold and figure here.
+/// Prices by exact model id.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct PriceTable {
     rows: BTreeMap<String, ModelPrice>,
@@ -274,18 +154,8 @@ impl PriceTable {
         self
     }
 
-    /// A table from its file (`prices.toml`'s grammar, format 1): `as_of`, a
-    /// `YYYY-MM-DD` day; and under `[models."<id>"]` a row of dollars per
-    /// million tokens — `input` and `output` required, `cache_write`,
-    /// `cache_write_1h` and `cache_read` where the page prices them, `source`
-    /// and `id_from` naming the pages — with an optional `long` table
-    /// (`over`, then the same classes). STRICT: an unknown key, a missing
-    /// price or source, a negative or non-finite price, or more than
-    /// [`MAX_PRICE_ROWS`] rows refuses the whole table, so a typo cannot drop
-    /// a class and price it at nothing.
-    ///
+    /// A table from its file (`prices.toml`'s grammar, format 1): `as_of`, a `YYYY-MM-DD` day; and under `[models."<id>"]` a row of dollars per million tokens — `input` and `output` required, `cache_write`, `cache_write_1h` and `cache_read` where the page prices them, `source` and `id_from` naming the pages — with an optional `long` table (`over`, then the same classes).
     /// # Errors
-    ///
     /// What is wrong, and where.
     pub fn from_toml(text: &str) -> Result<Self, String> {
         use aterm_toml::Value as T;
@@ -391,10 +261,7 @@ impl PriceTable {
         self.rows.get(model)
     }
 
-    /// Dollars for ONE request of `model` with the counts `t`, at the rates
-    /// its prompt length picks; `None` when the model has no row, a class
-    /// with tokens has no rate, or the row holds a negative or non-finite
-    /// price. Never a guess.
+    /// Dollars for ONE request of `model` with the counts `t`, at the rates its prompt length picks; `None` when the model has no row, a class with tokens has no rate, or the row holds a negative or non-finite price.
     #[must_use]
     pub fn message_usd(&self, model: &str, t: &TokenUsage) -> Option<f64> {
         let p = self.get(model).filter(|p| p.is_valid())?;
@@ -446,39 +313,20 @@ fn is_day(text: &str) -> bool {
         })
 }
 
-// What is counted
-
-/// One served message as a fold yields it: when it was served, its model, its
-/// tokens, and whether the table cannot price it exactly.
+/// One served message as a fold yields it: when it was served, its model, its tokens, and whether the table cannot price it exactly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Message<'a> {
     /// Unix seconds it was served.
     pub at: i64,
     /// Its model id, exactly as the vendor wrote it.
     pub model: &'a str,
-    /// Its token counts in Anthropic's classes, where `input` is the
-    /// UNCACHED input only. A Codex turn's `input_tokens` include its
-    /// `cached_input_tokens`, so it maps as `input = input_tokens −
-    /// cached_input_tokens`, `cache_read = cached_input_tokens` and `output =
-    /// output_tokens` (reasoning tokens are already in it) — and a cache
-    /// write as a part too ([`codex_message`]). The prompt a `long` row is
-    /// decided on ([`TokenUsage::prompt`]) is then OpenAI's `input_tokens`;
-    /// `input = input_tokens` would price every cached token twice.
+    /// Its token counts in Anthropic's classes, where `input` is the UNCACHED input only.
     pub tokens: TokenUsage,
-    /// Priced at the base rates though the vendor's were higher or lower
-    /// ([`Tally::approx`]).
+    /// Priced at the base rates though the vendor's were higher or lower ([`Tally::approx`]).
     pub approx: bool,
 }
 
-/// A Codex turn as one [`Message`]: `input = input_tokens −
-/// cached_input_tokens − cache_write_input_tokens`, `cache_read =
-/// cached_input_tokens`, `cache_write = cache_write_input_tokens` (one
-/// lifetime: OpenAI lists one cache-write price) and `output =
-/// output_tokens`; filed under [`UNKNOWN_MODEL`] where no `turn_context`
-/// named a model. APPROXIMATE when its turn named a service tier (`fast`,
-/// `flex`), when it wrote to the cache (whether `input_tokens` holds the
-/// writes is UNKNOWN: none was ever seen), or when its parts exceed its
-/// input.
+/// A Codex turn as one [`Message`]: `input = input_tokens − cached_input_tokens − cache_write_input_tokens`, `cache_read = cached_input_tokens`, `cache_write = cache_write_input_tokens` (one lifetime: OpenAI lists one cache-write price) and `output = output_tokens`; filed under [`UNKNOWN_MODEL`] where no `turn_context` named a model.
 #[must_use]
 pub fn codex_message(turn: &Turn) -> Message<'_> {
     let t = &turn.tokens;
@@ -506,16 +354,13 @@ pub struct ModelTurns {
     pub turns: u64,
     /// List dollars of the turns the table priced.
     pub usd: f64,
-    /// Some turn of it could not be priced (no row for the model, or tokens
-    /// in a class its row has no rate for): `usd` is then not its whole.
+    /// Some turn of it could not be priced (no row for the model, or tokens in a class its row has no rate for): `usd` is then not its whole.
     pub unpriced: bool,
     /// Turns priced at the base rates ([`codex_message`]'s approximate).
     pub approx: u64,
 }
 
-/// Every served turn of one Codex conversation, by model, at list price:
-/// what `harness usage` shows from a Codex session's own tools. No horizon:
-/// a conversation's turns are summed whenever they were served.
+/// Every served turn of one Codex conversation, by model, at list price: what `harness usage` shows from a Codex session's own tools.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct ConversationSpend {
     /// By model id ([`UNKNOWN_MODEL`] where no `turn_context` named one).
@@ -534,8 +379,7 @@ pub struct ConversationSpend {
     pub repeats: u64,
     /// `token_count`s inside a fork's copied prefix.
     pub copied: u64,
-    /// Turns with no readable stamp: not counted (as the home's fold places
-    /// them in no window).
+    /// Turns with no readable stamp: not counted (as the home's fold places them in no window).
     pub untimed: u64,
     /// Lines that were not JSON, or a `token_count` that could not be read.
     pub unparsed: u64,
@@ -545,11 +389,7 @@ pub struct ConversationSpend {
     pub model: Option<String>,
 }
 
-/// Sum every served turn of the rollouts `files` (a conversation's, the
-/// named thread's own among them as `own`), each read once from its start,
-/// at most `cap` bytes in all, priced by `prices`. Two threads served the
-/// same counts are two turns: a fingerprint names a turn only within its
-/// rollout.
+/// Sum every served turn of the rollouts `files` (a conversation's, the named thread's own among them as `own`), each read once from its start, at most `cap` bytes in all, priced by `prices`.
 #[must_use]
 pub fn fold_conversation(
     files: &[PathBuf],
@@ -607,13 +447,9 @@ pub struct Tally {
     pub tokens: TokenUsage,
     /// List dollars of the messages the table priced.
     pub usd: f64,
-    /// The tokens of the messages it could not price: no row for the model,
-    /// or tokens in a class the row has no rate for.
+    /// The tokens of the messages it could not price: no row for the model, or tokens in a class the row has no rate for.
     pub unpriced: TokenUsage,
-    /// Messages priced at the base rates though fast mode, US-only inference,
-    /// web search, a tier other than the standard one or an advisor's
-    /// iterations changed what the vendor lists, each in the bucket of the
-    /// first row of it that said so.
+    /// Messages priced at the base rates though fast mode, US-only inference, web search, a tier other than the standard one or an advisor's iterations changed what the vendor lists, each in the bucket of the first row of it that said so.
     pub approx: u64,
 }
 
@@ -628,17 +464,6 @@ impl Tally {
 }
 
 /// Whether a row's usage asks for something the table does not price: any
-/// `speed` but `standard` (fast mode), any `inference_geo` but `global` or
-/// `not_available` (US-only inference lists at 1.1×), any `service_tier` but
-/// `standard`, a web search, or any `iterations` entry but a plain
-/// `message`: an advisor's (`advisor_message`, which Claude Code prices at
-/// the advisor's model on top of the message's own usage; its tokens are not
-/// in that usage, so the fold does not count them) or a server-side
-/// fallback's (`fallback_message`: the declined primary attempt and the
-/// fallback model's, two models in one message). Claude Code's own empty
-/// usage, written where the server named none (as the lab's stub and a
-/// gateway leave it), is standard: `speed:"standard"`,
-/// `service_tier:"standard"`, `inference_geo:""`, `iterations:[]`, no search.
 fn approx(usage: &Map) -> bool {
     let word = |key: &str| usage.get(key).and_then(Value::as_str);
     word("speed").is_some_and(|w| w != "standard")
@@ -660,12 +485,9 @@ fn approx(usage: &Map) -> bool {
 }
 
 /// The catalog family of a model id (`claude-fable-5-1` → `fable`), the one
-/// rule `upgrade_models` reads ids by.
 fn family_of(model: &str) -> Option<String> {
     super::upgrade_models::family_version(model).map(|(family, _)| family)
 }
-
-// The cursor of one transcript
 
 /// How far one transcript has been folded.
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -673,7 +495,6 @@ struct Cursor {
     /// The file folded (device, inode); `None` before its first read.
     identity: Option<(u64, u64)>,
     /// Bytes folded: every complete line, and a long line's bytes skipped. A
-    /// torn last line is read again next time.
     offset: u64,
     /// The byte at `offset - 1` when it was read.
     boundary: Option<u8>,
@@ -689,7 +510,6 @@ struct Cursor {
 }
 
 /// A message a transcript's cursor holds: what its later rows are folded
-/// against.
 #[derive(Debug, Clone, PartialEq)]
 struct Held {
     /// FNV-1a/64 of its `message.id`.
@@ -699,7 +519,6 @@ struct Held {
     /// A row of it was [`approx`], and the message was counted so.
     approx: bool,
     /// Sorted (bucket, actual aggregate model key) contributions. None means
-    /// tracking overflowed or the message changed model: it stays unpriced.
     contributions: Option<Vec<Contribution>>,
 }
 
@@ -714,7 +533,6 @@ struct Contribution {
 
 impl Held {
     /// Invalidate only this message's actual earlier contributions. Its tokens
-    /// and message count stay in their original buckets, as does unrelated spend.
     fn unprice(&mut self, buckets: &mut Buckets) {
         if let Some(parts) = self.contributions.as_mut() {
             for part in parts {
@@ -732,7 +550,6 @@ impl Held {
     }
 
     /// A later, fully priced tier can resolve previously unpriced classes.
-    /// The newly proved dollars are added at that later row, never backdated.
     fn price(&mut self, buckets: &mut Buckets) {
         if let Some(parts) = self.contributions.as_mut() {
             for part in parts {
@@ -748,7 +565,6 @@ impl Held {
     }
 
     /// A table may also price a longer request lower. Remove the difference
-    /// from its own latest credited buckets, never write a negative bucket.
     fn reduce_price(&mut self, buckets: &mut Buckets, mut amount: f64) {
         if let Some(parts) = self.contributions.as_mut() {
             for part in parts.iter_mut().rev() {
@@ -817,8 +633,6 @@ impl Held {
 
 impl Cursor {
     /// Start the file over from its first byte: it changed other than by an
-    /// append. The ids it holds stand: a message still streaming is raised by
-    /// its later rows.
     fn restart(&mut self) {
         *self = Self {
             ids: std::mem::take(&mut self.ids),
@@ -833,7 +647,6 @@ impl Cursor {
     }
 
     /// Whether the file `meta` describes is the one the last read left, read
-    /// to its end: nothing to read.
     fn unchanged(&self, meta: &std::fs::Metadata) -> bool {
         self.end
             && identity_of(meta).is_none_or(|id| self.identity == Some(id))
@@ -843,8 +656,6 @@ impl Cursor {
 }
 
 /// The identity `meta` carries, where the platform keeps one in a file's
-/// metadata (Unix); `None` elsewhere, where only an open file tells it
-/// ([`super::session_usage::open_identity`], read by [`advance`]).
 #[cfg(unix)]
 fn identity_of(meta: &std::fs::Metadata) -> Option<(u64, u64)> {
     use std::os::unix::fs::MetadataExt as _;
@@ -862,8 +673,6 @@ fn mtime_ns(meta: &std::fs::Metadata) -> i64 {
         .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
         .map_or(0, |d| i64::try_from(d.as_nanos()).unwrap_or(i64::MAX))
 }
-
-// The spend of one home
 
 /// How much one fold may do: bytes read, and a deadline.
 #[derive(Debug, Clone, Copy)]
@@ -896,34 +705,25 @@ pub struct FoldReport {
     pub files: usize,
     /// Bytes read from disk by this fold.
     pub read: u64,
-    /// Every followed transcript was read to the end it had (a torn last line
-    /// aside): the sums are not a mid-read prefix.
+    /// Every followed transcript was read to the end it had (a torn last line aside): the sums are not a mid-read prefix.
     pub caught_up: bool,
-    /// Files or directories which could not be inspected, and transcripts
-    /// past [`MAX_FILES`] or named by a path that is not UTF-8.
+    /// Files or directories which could not be inspected, and transcripts past [`MAX_FILES`] or named by a path that is not UTF-8.
     pub unread: usize,
-    /// Transcripts that changed other than by an append, folded again from
-    /// their start (what they had counted is not counted again).
+    /// Transcripts that changed other than by an append, folded again from their start (what they had counted is not counted again).
     pub refolded: usize,
-    /// The walk stopped at [`MAX_WALK_ENTRIES`], [`MAX_DEPTH`] or the
-    /// fold's deadline.
+    /// The walk stopped at [`MAX_WALK_ENTRIES`], [`MAX_DEPTH`] or the fold's deadline.
     pub walk_cut: bool,
     /// Messages counted by this fold.
     pub messages: u64,
-    /// Rows of a message already counted, folded away (or raised): a
-    /// streamed message's later rows, and a message another transcript
-    /// already counted. Codex: a `token_count` whose total did not grow, and
-    /// a turn the home already counted.
+    /// Rows of a message already counted, folded away (or raised): a streamed message's later rows, and a message another transcript already counted.
     pub duplicates: u64,
     /// Lines longer than [`MAX_LINE_BYTES`], skipped.
     pub rows_long: u64,
     /// Lines that were not JSON or not UTF-8.
     pub rows_unparsed: u64,
-    /// Assistant rows with usage but no readable `timestamp`: placed in no
-    /// window, so not counted.
+    /// Assistant rows with usage but no readable `timestamp`: placed in no window, so not counted.
     pub rows_untimed: u64,
-    /// Codex `token_count`s inside a fork's copied prefix: its parent's
-    /// turns, counted for nothing. 0 for Claude Code.
+    /// Codex `token_count`s inside a fork's copied prefix: its parent's turns, counted for nothing. 0 for Claude Code.
     pub copied: u64,
 }
 
@@ -938,9 +738,7 @@ impl FoldReport {
 /// A bucket's start (a multiple of [`BUCKET_S`]) → model → tally.
 type Buckets = BTreeMap<i64, BTreeMap<String, Tally>>;
 
-/// One Claude Code home's spend: its buckets, the cursors that say how far
-/// each of its transcripts was folded, and the ids of the messages it
-/// counted.
+/// One Claude Code home's spend: its buckets, the cursors that say how far each of its transcripts was folded, and the ids of the messages it counted.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Spend {
     /// The home folded (a path, written lossily).
@@ -951,8 +749,6 @@ pub struct Spend {
     files: BTreeMap<String, Cursor>,
     buckets: Buckets,
     /// Every message id counted in the horizon (FNV-1a/64 of `message.id`),
-    /// with the hour its message was served: a message one transcript
-    /// repeats from another counts once in the home.
     seen: HashMap<u64, i64>,
 }
 
@@ -975,8 +771,7 @@ impl Spend {
         &self.prices
     }
 
-    /// The buckets, oldest first: each one's start ([`BUCKET_S`] wide) and
-    /// each model's tally.
+    /// The buckets, oldest first: each one's start ([`BUCKET_S`] wide) and each model's tally.
     pub fn buckets(&self) -> impl Iterator<Item = (i64, &BTreeMap<String, Tally>)> {
         self.buckets.iter().map(|(k, v)| (*k, v))
     }
@@ -986,10 +781,7 @@ impl Spend {
         self.home == home.to_string_lossy() && self.prices == prices.as_of().unwrap_or_default()
     }
 
-    /// Fold what every transcript under the home's `projects/` appended since
-    /// the last fold, within `limits`, newest file first. `now` is the
-    /// caller's clock. A spend priced by another table is emptied first and
-    /// folded again from the transcripts.
+    /// Fold what every transcript under the home's `projects/` appended since the last fold, within `limits`, newest file first.
     pub fn fold_claude_home(
         &mut self,
         prices: &PriceTable,
@@ -1009,11 +801,6 @@ impl Spend {
             walk_cut: walk.cut,
             ..FoldReport::default()
         };
-        // A transcript gone, or past the horizon, keeps no cursor: what it
-        // counted stays in the buckets, and its ids in the home's, until they
-        // age out, and every row a file past the horizon holds is older than
-        // the horizon too. An incomplete walk cannot prove a file is gone:
-        // keep its streaming state so later growth is not mistaken for a copy.
         if !walk.cut && walk.unread == 0 {
             let there: BTreeSet<&str> = walk.files.iter().map(|f| f.rel.as_str()).collect();
             self.files.retain(|rel, _| there.contains(rel.as_str()));
@@ -1050,11 +837,7 @@ impl Spend {
         report
     }
 
-    /// Count one served message, priced by `prices`, in the bucket of its
-    /// time: the tests' seam, a spend composed with no transcript. A message
-    /// older than [`HORIZON_S`] is not counted; one stamped ahead of
-    /// `now` is placed now; a model that is no model id is filed (unpriced)
-    /// under [`UNKNOWN_MODEL`], as the transcript fold files it.
+    /// Count one served message, priced by `prices`, in the bucket of its time: the tests' seam, a spend composed with no transcript.
     #[cfg(test)]
     pub fn add_message(&mut self, message: &Message<'_>, prices: &PriceTable, now: i64) {
         if message.at < now.saturating_sub(HORIZON_S) || message.tokens.is_zero() {
@@ -1074,8 +857,7 @@ impl Spend {
         );
     }
 
-    /// Drop the buckets and counted ids past the horizon, and the oldest ids
-    /// past [`MAX_SEEN`]. No bucket is merged into a wider one.
+    /// Drop the buckets and counted ids past the horizon, and the oldest ids past [`MAX_SEEN`].
     pub fn expire(&mut self, now: i64) {
         let horizon = now.saturating_sub(HORIZON_S);
         for cursor in self.files.values_mut() {
@@ -1088,8 +870,6 @@ impl Spend {
         self.seen
             .retain(|_, hour| hour.saturating_add(HOUR_S) > horizon);
         if self.seen.len() > MAX_SEEN {
-            // The hour of the oldest id that would be kept goes too, so what
-            // stays is at most MAX_SEEN.
             let mut hours: Vec<i64> = self.seen.values().copied().collect();
             hours.sort_unstable();
             if let Some(&oldest_kept) = hours.get(hours.len() - MAX_SEEN) {
@@ -1100,8 +880,7 @@ impl Spend {
             .retain(|start, _| start.saturating_add(BUCKET_S) > horizon);
     }
 
-    /// The spend in `span`, of the models of `family` where one is named
-    /// (`fable` for the Fable bucket).
+    /// The spend in `span`, of the models of `family` where one is named (`fable` for the Fable bucket).
     #[must_use]
     pub fn sum(&self, span: Span, family: Option<&str>) -> Sum {
         let mut sum = Sum::default();
@@ -1135,7 +914,6 @@ impl Spend {
 }
 
 /// Where one fold's rows go: the table and clock they are priced and placed
-/// by, the buckets, the home's counted ids and the report.
 struct Sink<'a> {
     prices: &'a PriceTable,
     now: i64,
@@ -1157,7 +935,6 @@ impl Sink<'_> {
 }
 
 /// One message's tally (`messages` 1), or what a later row of it added (0),
-/// `approx` when it made the message approximate.
 fn tally(messages: u64, tokens: TokenUsage, usd: Option<f64>, approx: bool) -> Tally {
     Tally {
         messages,
@@ -1181,7 +958,6 @@ fn add(buckets: &mut Buckets, at: i64, model: &str, t: Tally) {
 }
 
 /// Add `t` under `model`, or under [`OTHER_MODEL`] once [`MAX_MODELS`] are
-/// held — where it is unpriced: the bucket no longer says which model it was.
 fn merge_model(into: &mut BTreeMap<String, Tally>, model: &str, t: &Tally) {
     if into.contains_key(model) || into.len() < MAX_MODELS {
         into.entry(model.to_owned()).or_default().absorb(t);
@@ -1196,20 +972,12 @@ fn merge_model(into: &mut BTreeMap<String, Tally>, model: &str, t: &Tally) {
 }
 
 /// Trim a file the fold read to its end, the only files it is called on: a
-/// quiet one keeps no message ids, one still being written the newest
-/// [`IDS_KEPT`]. A file not read to its end is not trimmed: a message it
-/// holds is raised by its rows not read yet, which with its id let go would
-/// fall to the home's counted ids as a copy.
 fn quiet(cursor: &mut Cursor, meta: &std::fs::Metadata, now: i64) {
     let quiet = cursor.end && mtime_ns(meta) / 1_000_000_000 <= now.saturating_sub(QUIET_S);
     cursor.let_go(if quiet { 0 } else { IDS_KEPT });
 }
 
 /// Read what one transcript appended since its cursor, within `left` bytes,
-/// and fold every line it completes. `Ok(true)` when it reached the end the
-/// file had; `Err` when it could not be read. A file that changed other than
-/// by an append (another file at the path, shorter than the offset, another
-/// byte before it) is read again from its start.
 fn advance(
     cursor: &mut Cursor,
     path: &Path,
@@ -1237,9 +1005,6 @@ fn advance(
         sink.report().refolded += 1;
     }
     cursor.identity = id;
-    // The budget is spent at line boundaries: a line begun is read to its
-    // newline (or past MAX_LINE_BYTES, skipped), so a budget smaller than a
-    // line still moves the fold on.
     let mut line: Vec<u8> = Vec::new();
     let mut pos = cursor.offset;
     let mut chunk = vec![0u8; READ_CHUNK];
@@ -1287,8 +1052,6 @@ fn advance(
             } else {
                 line.extend_from_slice(head);
                 if line.len() > MAX_LINE_BYTES {
-                    // Discarded as it streams, never held: the bytes are
-                    // folded past, and the rest up to its newline skipped.
                     let report = sink.report();
                     report.rows_long = report.rows_long.saturating_add(1);
                     line = Vec::new();
@@ -1299,8 +1062,6 @@ fn advance(
             }
             bytes = rest;
             if *left == 0 && line.is_empty() && !cursor.skipping {
-                // Out of budget at a line's end: what follows is read next
-                // time.
                 pos = cursor.offset;
                 break 'read;
             }
@@ -1313,8 +1074,6 @@ fn advance(
 }
 
 /// Fold one complete line: an assistant row with usage, served (not an API
-/// error), timed, inside the horizon, counted once in the home per
-/// `message.id`, at its largest counts within its file.
 fn fold_row(bytes: &[u8], cursor: &mut Cursor, sink: &mut Sink<'_>) {
     let report = &mut *sink.report;
     let Ok(line) = std::str::from_utf8(bytes) else {
@@ -1369,9 +1128,6 @@ fn fold_row(bytes: &[u8], cursor: &mut Cursor, sink: &mut Sink<'_>) {
     let held = id.and_then(|key| cursor.ids.iter_mut().rev().find(|held| held.key == key));
     if let Some(held) = held {
         report.duplicates = report.duplicates.saturating_add(1);
-        // A message is approximate when any row of it is, and counted so
-        // once: Claude Code writes `server_tool_use` on most streamed
-        // messages, and on 2.1.300 often `speed`, only with the final usage.
         let newly = approx && !held.approx;
         held.approx |= approx;
         let changed_model = held
@@ -1393,8 +1149,6 @@ fn fold_row(bytes: &[u8], cursor: &mut Cursor, sink: &mut Sink<'_>) {
             }
             return;
         }
-        // A streamed message's later row: count only what grew, priced as
-        // the whole message's price moved.
         let growth = grown.less(&held.tokens);
         let usd = match (
             sink.prices.message_usd(model, &grown),
@@ -1462,9 +1216,6 @@ struct Walk {
 }
 
 /// Every regular `*.jsonl` under `projects` (links not followed), at most
-/// [`MAX_DEPTH`] directories down and [`MAX_WALK_ENTRIES`] entries in all,
-/// modified at or after `since`, listed before the fold's deadline
-/// ([`Limits::until`]): a walk stopped by either is cut.
 fn walk(projects: &Path, since: i64, limits: &Limits) -> Walk {
     let mut out = Walk {
         files: Vec::new(),
@@ -1483,7 +1234,7 @@ fn walk(projects: &Path, since: i64, limits: &Limits) -> Walk {
     #[cfg(windows)]
     let linked = {
         use std::os::windows::fs::MetadataExt as _;
-        linked || root.file_attributes() & 0x400 != 0 // FILE_ATTRIBUTE_REPARSE_POINT
+        linked || root.file_attributes() & 0x400 != 0
     };
     if linked || !root.is_dir() {
         out.unread = 1;
@@ -1495,8 +1246,6 @@ fn walk(projects: &Path, since: i64, limits: &Limits) -> Walk {
         let entries = match std::fs::read_dir(&dir) {
             Ok(entries) => entries,
             Err(error) => {
-                // Only a genuinely absent projects root means an empty home.
-                // A vanished child, dangling link or failed read is incomplete.
                 let absent = depth == 0
                     && error.kind() == io::ErrorKind::NotFound
                     && matches!(std::fs::symlink_metadata(&dir), Err(missing)
@@ -1555,10 +1304,7 @@ fn walk(projects: &Path, since: i64, limits: &Limits) -> Walk {
     out
 }
 
-// Windows
-
-/// A span of time to sum: buckets that START in `[from, to)`, or, `whole`,
-/// that lie wholly inside it (so nothing after `to` is counted).
+/// A span of time to sum: buckets that START in `from, to)`, or, `whole`, that lie wholly inside it (so nothing after `to` is counted).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Span {
     /// Unix seconds, inclusive.
@@ -1596,8 +1342,6 @@ impl Sum {
             (u.input, t.input),
             (u.output, t.output),
             (u.cache_write, t.cache_write),
-            // A final streamed row can reveal an unpriced lifetime without
-            // increasing the total writes, leaving only this class unpriced.
             (u.cache_write_1h, t.cache_write_1h),
             (u.cache_read, t.cache_read),
         ]
@@ -1611,8 +1355,7 @@ impl Sum {
 pub enum ReadingKind {
     /// Rounded to the digit it carries (the tap, the usage cache).
     Rounded,
-    /// Floored to a whole percent (a painted `/usage` panel): the truth lies
-    /// in `[p, p + 1)`.
+    /// Floored to a whole percent (a painted `/usage` panel): the truth lies in `p, p + 1)`.
     Floored,
     /// A wall: exactly 100%, the best reading there is.
     Wall,
@@ -1631,8 +1374,6 @@ pub struct Reading {
 
 impl Reading {
     /// The fraction used and the half-width of what it may be, at the
-    /// resolution actually seen: whole percents until a tenth was
-    /// (`tenths_seen`).
     fn point(&self, tenths_seen: bool) -> (f64, f64) {
         let pct = f64::from(self.pct_x10) / 10.0;
         match self.kind {
@@ -1644,7 +1385,6 @@ impl Reading {
     }
 
     /// Too small a figure for a ratio: under 5 whole percents, or under 1%
-    /// once tenths are seen.
     fn low(&self, tenths_seen: bool) -> bool {
         match self.kind {
             ReadingKind::Wall => false,
@@ -1660,13 +1400,11 @@ impl Reading {
 pub enum Why {
     /// No reading in this window (or it has passed its reset).
     NoReading,
-    /// The reading is too small for a ratio, or no whole bucket of priced
-    /// spend comes before it.
+    /// The reading is too small for a ratio, or no whole bucket of priced spend comes before it.
     Low,
     /// The window is spent: nothing is left to estimate.
     AtLimit,
-    /// The newest reading is older than a tenth of its window, or a machine
-    /// that used the account in it did not answer.
+    /// The newest reading is older than a tenth of its window, or a machine that used the account in it did not answer.
     Stale,
     /// More than [`SHARE_MAX`] of a token class has no price.
     Unpriced,
@@ -1674,8 +1412,7 @@ pub enum Why {
     Unattributed,
     /// A process on an API key, Bedrock or Vertex used the home in it.
     ApiKeySeen,
-    /// Usage credits served a message in the window ([`Ask::on_credits`]):
-    /// part of its spend is not the plan's, and no bucket says which part.
+    /// Usage credits served a message in the window ([`Ask::on_credits`]): part of its spend is not the plan's, and no bucket says which part.
     OnCredits,
 }
 
@@ -1701,11 +1438,9 @@ impl Why {
 pub enum Attribution {
     /// Epoch rows say so.
     Seen,
-    /// No other account was seen on the home since the oldest open window
-    /// began, so they are taken as the current account's.
+    /// No other account was seen on the home since the oldest open window began, so they are taken as the current account's.
     Assumed,
-    /// A second account was seen in the window: this share of the spend
-    /// cannot be put on either.
+    /// A second account was seen in the window: this share of the spend cannot be put on either.
     Unattributed {
         /// A fraction of the window's spend.
         share: f64,
@@ -1740,8 +1475,7 @@ pub struct Machines {
 pub struct Ask<'a> {
     /// The window's length (5 h, a week).
     pub length_s: i64,
-    /// Its reset, from a current reading; `None` sums a rolling span ending
-    /// now, with no capacity.
+    /// Its reset, from a current reading; `None` sums a rolling span ending now, with no capacity.
     pub resets_at: Option<i64>,
     /// A reset used inside the window: the vendor refilled it there.
     pub epoch_at: Option<i64>,
@@ -1749,15 +1483,11 @@ pub struct Ask<'a> {
     pub family: Option<&'a str>,
     /// The reading `C` is taken at: the best one in the window.
     pub reading: Option<Reading>,
-    /// The newest reading (`u_now`); `reading` where `None` or from before
-    /// the window.
+    /// The newest reading (`u_now`); `reading` where `None` or from before the window.
     pub newest: Option<Reading>,
     /// A non-zero tenth was seen in this account's readings.
     pub tenths_seen: bool,
-    /// Usage credits served a message in the window: S5 read them `in use`,
-    /// a wall row said `isUsingOverage`, or a message was served after a
-    /// reading of 100%. Then `C` and `left` mean nothing ([`Why::OnCredits`]):
-    /// no share of the window's spend is split off by time.
+    /// Usage credits served a message in the window: S5 read them `in use`, a wall row said `isUsingOverage`, or a message was served after a reading of 100%.
     pub on_credits: bool,
     /// Whose the messages were.
     pub attribution: Attribution,
@@ -1776,8 +1506,7 @@ pub struct Capacity {
     pub usd: f64,
     /// The reading it was taken at.
     pub at: i64,
-    /// The error bar, ± percent: the reading's resolution. Uncalibrated:
-    /// the spread of closed windows waits for the series (A2).
+    /// The error bar, ± percent: the reading's resolution.
     pub pm_pct: f64,
 }
 
@@ -1807,10 +1536,7 @@ pub struct Figure {
     pub left: Result<Left, Why>,
 }
 
-/// One window's dollars: spent so far (from the window's start, or from a
-/// reset used inside it), and with a reading in it, its capacity, with its
-/// error bar, and what is left, with `u_now`'s age, or the word that says
-/// why each is empty.
+/// One window's dollars: spent so far (from the window's start, or from a reset used inside it), and with a reading in it, its capacity, with its error bar, and what is left, with `u_now`'s age, or the word that says why each is empty.
 #[must_use]
 pub fn figure(spend: &Spend, ask: &Ask<'_>) -> Figure {
     let (from, to, rolling) = match ask.resets_at {
@@ -1862,8 +1588,6 @@ fn capacity(spend: &Spend, ask: &Ask<'_>, from: i64) -> Result<Capacity, Why> {
     {
         return Err(Why::Unattributed);
     }
-    // A reading from before the window (or before a reset used in it) is of
-    // the spend the vendor has refilled.
     let reading = ask
         .reading
         .filter(|r| r.at >= from && ask.resets_at.is_some_and(|reset| r.at < reset))
@@ -1882,8 +1606,6 @@ fn capacity(spend: &Spend, ask: &Ask<'_>, from: i64) -> Result<Capacity, Why> {
     if spent.unpriced_over() {
         return Err(Why::Unpriced);
     }
-    // No whole bucket of priced spend before the reading (a window's first
-    // minutes): `$0 ÷ u` is no capacity.
     if spent.usd <= 0.0 {
         return Err(Why::Low);
     }
@@ -1896,8 +1618,6 @@ fn capacity(spend: &Spend, ask: &Ask<'_>, from: i64) -> Result<Capacity, Why> {
 }
 
 fn left(ask: &Ask<'_>, capacity: Capacity, from: i64) -> Result<Left, Why> {
-    // A newest reading from before the window (or before a reset used in it)
-    // is no `u_now` of it; the reading `C` was taken at stands in.
     let newest = ask
         .newest
         .filter(|n| n.at >= from && ask.resets_at.is_some_and(|reset| n.at < reset))

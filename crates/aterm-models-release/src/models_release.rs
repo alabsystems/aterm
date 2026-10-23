@@ -1,42 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
-//
-//! Release channel state-machine models. Every constructor is re-exported from
-//! this crate's root. (The in-app updater's `NativeUpdater` lives with the other
-//! native update models, in aterm-models-update.)
 
 use aterm_spec::derive::*;
 
 /// Durable one-shot authority for GitHub draft-create and asset-upload POSTs.
-///
-/// Each non-idempotent request is preceded by an atomically persisted intent. A crash may come
-/// before the POST or after a landed POST whose response was lost; either way a resumed process
-/// with an issued intent may not post again, only wait for and converge through the exact
-/// visible object. Asset upload starts only after the immutable draft object converges.
-///
-/// `Buggy=1` weakens the persist-before-POST guard and the one-shot bound (an unjournaled
-/// request, a duplicate retry after crash/resume). It also trusts a POST's own answer in the
-/// three places the shipping code refuses to: the draft converges, its assets are journaled
-/// against it, and an asset converges, each on a landed POST rather than the re-listed object.
-/// `bind_channel_release` binds (and journals) the release ID the POST answered first, but
-/// reports the draft converged (`Ok`, so the step is journaled done and the upload may begin)
-/// only after `release_object_by_id` re-reads that ID and `validate_channel_release_capability`
-/// accepts it; `upload_channel_asset` returns only after
-/// `release_asset_identity_for_release_id_optional` sees the asset, and a success with no
-/// visible asset is its own refusal. The mutants skip that re-read.
-///
-/// The upload intent is spent only on a POST that provably created nothing. A POST the process
-/// cannot classify (a success, a 5xx, a timeout, a reset) may have landed, so `IssueUploadPost`
-/// says it did and its intent stands. A POST curl never sent or the server answered with a 4xx
-/// (`IssueRefusedUploadPost`; `post_outcome`'s `NeverSent`/`Refused`) created nothing:
-/// `RetractUploadIntent` spends its intent and returns the one-shot budget, so the resume may
-/// post that asset once more instead of waiting forever for an object never stored. Only the
-/// process that saw the answer knows of the refusal, so a crash erases it
-/// (`upload_refusal_seen`) and the resume waits like any other. `Buggy=1` retracts on a POST it
-/// cannot classify (a landed object no intent names, which `--abandon` could not withdraw) and
-/// lets a resumed process retract on an answer it never saw. Tier-1
-/// (`durable_post_intent_model.rs`) binds the real `CutCtx::settle_upload_intent` to these
-/// decisions, curl outcome by curl outcome.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn release_durable_post_intent_model() -> Model {
@@ -214,21 +181,6 @@ pub fn release_durable_post_intent_model() -> Model {
 }
 
 /// Crash/restart and snapshot-CAS protocol for the machine-roster body/signature pair.
-///
-/// The pair is two independently renamed files, so the fixed redo directory is the durable
-/// commit point. `body`/`signature` share one small identity domain: `0` the exact predecessor
-/// ("absent" for first setup), `1` the exact transaction target, `2` an unrelated/newer value.
-/// A writer checks its snapshot under the shared lock, commits the complete redo record before
-/// either promotion, and recovery moves every predecessor/target mixture forward. Read-only
-/// acquisition reports a redo record without replaying it.
-///
-/// `Buggy=1` adds what this protocol prevents: retiring a body-only pair, overwriting unrelated
-/// bytes during replay, mutating from the check-only lane, promoting the body with no redo
-/// record (rolling back only on an error, so a process death leaves the new body beside the old
-/// signature), and a per-half CAS that promotes the body on its own premise before finding the
-/// signature stale. Tier-1 (`crates/atpkg-keys/tests/roster_redo_model.rs`) binds the real
-/// `lock_roster` / `lock_roster_read_only` / `commit_roster_pair` / `publish_roster_locked`
-/// filesystem operations to these decisions, and replays a torn pair written without redo.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn roster_pair_redo_model() -> Model {
@@ -242,7 +194,6 @@ pub fn roster_pair_redo_model() -> Model {
             var redo = 0;
             var writer_lock = 0;
             var snapshot_checked = 0;
-            // result: 0 in progress, 1 exact success, 2 refused.
             var result = 0;
             var writer_writes = 0;
             var readonly_checked = 0;
@@ -252,8 +203,6 @@ pub fn roster_pair_redo_model() -> Model {
             var foreign_overwritten = 0;
             var crashes = 0;
 
-            // Environment changes before lock acquisition are what the byte-for-byte
-            // snapshot comparison rejects.
             action AdvanceBodyBeforeCas when (
                 result == 0 && writer_lock == 0 && redo == 0 && body == 0
             ) {
@@ -284,8 +233,6 @@ pub fn roster_pair_redo_model() -> Model {
                 result = 2;
             }
 
-            // The public pair-publish call is one logical transition; the crash-cut actions
-            // below expose each durable intermediate state of it.
             action PublishExact when (
                 result == 0 && writer_lock == 1 && snapshot_checked == 1 &&
                 redo == 0 && body == 0 && signature == 0
@@ -405,8 +352,6 @@ pub fn roster_pair_redo_model() -> Model {
                 readonly_checked = 1;
                 readonly_writes = 2;
             }
-            // A publisher with no redo record: the body is renamed into place and the
-            // process dies before the signature.
             action BuggyPromoteBodyWithoutRedo when (
                 Buggy > 0 && result == 0 && writer_lock == 1 && snapshot_checked == 1 &&
                 redo == 0 && body == 0 && signature == 0 && crashes == 0
@@ -416,8 +361,6 @@ pub fn roster_pair_redo_model() -> Model {
                 crashes = 1;
                 writer_writes = 1;
             }
-            // A CAS checked per half at each rename: the body's premise holds, so the body
-            // is promoted, and only then is the signature found stale.
             action BuggyPromoteBeforeSignatureCas when (
                 Buggy > 0 && result == 0 && writer_lock == 1 && redo == 0 &&
                 snapshot_checked == 0 && body == 0 && signature == 2
@@ -461,30 +404,6 @@ pub fn roster_pair_redo_model() -> Model {
 }
 
 /// Release-channel floor carry-forward and late-race policy.
-///
-/// A cut resolves its manifest floor as the canonical maximum of the operator request and the
-/// newest live channel manifest, bounded by its claimed build, and freezes it in the resume
-/// journal. Before visibility the cutter holds a cross-machine release lease while it re-reads
-/// the live channel and publishes: a floor advanced past the frozen value aborts the cut, a
-/// covered floor permits publication with no post-check race. The exact-commit lease stays held
-/// after the head PATCH until what a stranger sees has been proved (`publish`'s last act: the
-/// client's own election, the evergreen pointer, the anonymous downloads); only the final
-/// journaled unlock releases it. The model covers the whole scan → freeze/crash/resume → lease →
-/// revalidate → publish → prove head → unlock lifecycle.
-///
-/// `Buggy=1` enables independent non-vacuity controls: `ResolveOperatorOnly` drops the observed
-/// channel input, `PublishUnchecked` skips late revalidation, `BypassLeaseAdvance` lets the
-/// channel change after a covered verdict despite lease ownership, and `UnlockBeforeHeadProof`
-/// drops the owner before the head is proved. Six more are the slips each remaining law refuses:
-/// `ResolveUncheckedCarryForward` validates only the operator's request against the claim, so a
-/// channel floor above the build is carried forward (`effective_min_build` validates the
-/// maximum); `ResumeFromOperatorRequest` rebuilds the resumed floor from the resume command's
-/// request instead of `journal.min_build`; `ConfirmCoveredWithoutLease` is the floor check
-/// without the owner check `publish_checked` pairs it with; `CompleteWithoutUnlock` journals
-/// completion over a refused CAS delete; `RejectAdvancedReleasingLease` drops the remote lease
-/// on the late guard's error path; and `AbandonIgnoringFailedCas` marks an abandon done whose
-/// CAS delete never landed. Tier-1 binds the resolver, journal, `PublishChecked`, exact-owner
-/// acquire/resume, and CAS unlock production seams.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn release_channel_floor_model() -> Model {
@@ -492,9 +411,6 @@ pub fn release_channel_floor_model() -> Model {
         ReleaseChannelFloor {
             const Buggy = 0;
             const MaxFloor = 4;
-            // phase: 0 Inputs, 1 Frozen, 2 Revalidated under lease,
-            // 3 Published (the head PATCH), 4 Aborted, 5 ResumePending,
-            // 6 Head proved, 7 Completed/Unlocked.
             var phase = 0;
             var operator_floor = 0;
             var observed_floor = 0;
@@ -511,7 +427,6 @@ pub fn release_channel_floor_model() -> Model {
             var advanced_rejected = 0;
             var abandon_done = 0;
 
-            // Input-spreading actions make every bounded resolver tuple reachable.
             action RaiseOperator when (
                 phase == 0 && operator_floor <= MaxFloor - 1
             ) {
@@ -563,20 +478,17 @@ pub fn release_channel_floor_model() -> Model {
             ) {
                 phase = 4;
             }
-            // A process crash loses the runtime copy but not the atomic journal.
             action CrashBeforeResume when (
                 phase == 1 && resumed == 0 && lease_owned == 0
             ) {
                 phase = 5;
                 frozen_floor = 0;
             }
-            // Resume reconstructs the runtime policy from real persisted state.
             action ResumeFrozen when (phase == 5) {
                 phase = 1;
                 frozen_floor = journal_floor;
                 resumed = 1;
             }
-            // Another publisher may raise the live floor before lease acquisition.
             action RaiseChannelFloor when (
                 phase == 1 && lease_owned == 0 && latest_floor <= MaxFloor - 1
             ) {
@@ -598,8 +510,6 @@ pub fn release_channel_floor_model() -> Model {
                 late_checked = 1;
                 advanced_rejected = 1;
             }
-            // A failed late guard leaves the persistent remote lease in place.
-            // Only an explicit abandon/CAS cleanup may release that authority.
             action AbandonRejected when (
                 phase == 4 && lease_owned == 1 && advanced_rejected == 1 &&
                 abandon_done == 0
@@ -630,8 +540,6 @@ pub fn release_channel_floor_model() -> Model {
                 lease_owned = 0;
                 unlock_bypassed = 1;
             }
-            // Control for a missing/non-shared lease: the channel moves after a covered
-            // verdict but before visibility.
             action BypassLeaseAdvance when (
                 Buggy == 1 && phase == 2 && lease_owned == 1 &&
                 latest_floor <= MaxFloor - 1
@@ -775,18 +683,6 @@ pub fn release_channel_floor_model() -> Model {
 }
 
 /// Canonical-prefix release journal and crash/resume ordering.
-///
-/// A current journal admits only a known, unique, gap-free prefix of the mutation pipeline under
-/// a canonical version and full claim identity. Resume starts at the first incomplete step and
-/// advances in order; a crash drops only the process-local attachment. Gapped membership must
-/// never let a later pre-marked remote mutation (visibility/archive/unlock above all) be
-/// skipped.
-///
-/// Four abstract steps stand for lock, previsibility preparation, visible-channel convergence,
-/// and final verify/unlock. `Buggy=1` admits a gapped/unknown/duplicate or bad-identity journal,
-/// can skip preparation after resume, and can complete the cut with its final verify/unlock step
-/// unjournaled: the cut reported done (its journal retired) over a failed last step, leaving
-/// nothing to resume the unlock from.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn release_journal_prefix_model() -> Model {
@@ -794,7 +690,6 @@ pub fn release_journal_prefix_model() -> Model {
         ReleaseJournalPrefix {
             const Buggy = 0;
             const MaxCursor = 4;
-            // phase: 0 persisted input, 1 admitted/resumable, 2 complete.
             var phase = 0;
             var done_lock = 0;
             var done_prepare = 0;
@@ -810,7 +705,6 @@ pub fn release_journal_prefix_model() -> Model {
             var corruption_bypassed = 0;
             var ordering_bypassed = 0;
 
-            // Input-spreading actions make every done-bit subset reachable.
             action InputLock when (phase == 0 && done_lock == 0) {
                 done_lock = 1;
             }
@@ -1020,32 +914,12 @@ pub fn release_journal_prefix_model() -> Model {
 }
 
 /// Unique per-process publisher fencing layered over the persistent claim lease.
-///
-/// The lease owner identifies a recoverable release journal, so two simultaneous resumes of the
-/// same commit share it; a separate annotated-tag token admits only one live mutation session.
-/// Lost-machine recovery has an explicit operator precondition that the old publisher was proved
-/// stopped, then rotates that token by exact CAS. The model keeps A's token data after `StopA`
-/// to prove a residual stale guard cannot later mutate, rotate, or delete B. It does not claim a
-/// Git ref rotation can cancel an external request already in flight: the stopped-process
-/// precondition closes that cross-system TOCTOU window. Ambiguous/malformed remote observations
-/// refuse authority. Final or ordinary cleanup deletes only an exact observed token, so a
-/// successor created after an uncertain response stays untouched.
-///
-/// `Buggy=1` exposes independent stale mutation, stale delete/rotation, stopped-proof reuse,
-/// lease-loss mutation and ambiguity bypass controls, plus the opposite failure:
-/// `RefuseWellFormedFence` refuses a coherent, unambiguous fence (a parser counting the
-/// annotated ref's own `^{}` peel row as an extra row, where `publisher_fence` requires exactly
-/// those two), wedging every resume behind a refusal no fault explains. Tier-1
-/// (`publisher_fence_model.rs`) drives the real annotated ref, create/rotation CAS, session
-/// assertion, stale exact-token cleanup, ordinary release, and atomic final owner+token delete
-/// against a bare Git remote.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn release_publisher_fence_model() -> Model {
     aterm_spec::ty_model! {
         ReleasePublisherFence {
             const Buggy = 0;
-            // Token 0=None, 1=session A, 2=session B. Both peel to claim owner 1.
             var remote_token = 0;
             var remote_fence_owner = 0;
             var local_a_token = 0;
@@ -1088,8 +962,6 @@ pub fn release_publisher_fence_model() -> Model {
                 remote_token = 1;
                 remote_fence_owner = 1;
                 local_a_token = 1;
-                // A stopped-process acknowledgement belongs to one publisher invocation:
-                // re-entering A after an ordinary release needs a fresh one before recovery.
                 old_process_stopped = 0;
             }
             action AcquireAReusingStoppedProof when (
@@ -1136,8 +1008,6 @@ pub fn release_publisher_fence_model() -> Model {
             ) {
                 old_process_stopped = 1;
             }
-            // After the external stopped-process proof, exact-CAS recovery installs B; A's
-            // residual token data is stale at once.
             action RotateAtoB when (
                 remote_token == 1 && local_a_token == 1 &&
                 local_b_token == 0 && lease_owner == 1 &&
@@ -1184,8 +1054,6 @@ pub fn release_publisher_fence_model() -> Model {
                 lease_owner = 0;
                 local_b_token = 0;
             }
-            // The delete landed but its response/journal mark was lost: A keeps a stale local
-            // guard while the remote slot is legitimately free.
             action DeleteALandsResponseLost when (
                 remote_token == 1 && local_a_token == 1 &&
                 ambiguous_remote == 0 && uncertain_delete == 0
@@ -1194,8 +1062,6 @@ pub fn release_publisher_fence_model() -> Model {
                 remote_fence_owner = 0;
                 uncertain_delete = 1;
             }
-            // The final atomic owner+fence delete landed but its response/journal mark was
-            // lost; a coherent foreign successor may then acquire both.
             action AtomicFinalDeleteAResponseLost when (
                 remote_token == 1 && remote_fence_owner == 1 &&
                 local_a_token == 1 && lease_owner == 1 &&
@@ -1356,33 +1222,6 @@ pub fn release_publisher_fence_model() -> Model {
 }
 
 /// Historical release recovery is not historical publication.
-///
-/// A stranded pre-activation owner converges in exactly two ways: delete an exact observed draft
-/// (or abandon when no POST was issued), or finish bookkeeping for an exact release already
-/// published. Unknown/issued intent plus an absent listing retains the owner, because a delayed
-/// draft may still appear. A signed historical release is verified with the retired public key;
-/// the explicit unsigned bootstrap stays unsigned. Neither branch rebuilds, uploads, tags, or
-/// flips the retired version.
-///
-/// A lost journal is answered in two ways, both modeled: a visible draft bound to the claim by
-/// its assets (`draft_bound`; the shipping `claim_bound_draft` is `channel::binds_to_version`:
-/// it carries nothing but assets this version publishes) is provably this claim's, so the
-/// remote's binding stands for issued intent (`LearnIssuedIntentFromClaimBinding`, knowledge 2);
-/// with nothing visible, the operator's `--no-draft-was-posted` stands for a no-POST journal
-/// (`AbandonOnOperatorNoPostAnswer`). A journal that proves a POST was issued is never
-/// overridable. With no journal a delete needs the draft bound to the claim
-/// (`draft_cleanup_decision`), and every delete goes through
-/// `delete_release_object_by_id_with_guard`, which re-validates the exact object snapshot right
-/// before the DELETE.
-///
-/// `Buggy=1` exposes seven independent prohibited controls: publishing during recovery,
-/// accepting the current key for a signed retired-epoch release, unlocking on unknown visibility
-/// without the operator's separate answer (folding it into `--old-publisher-stopped`), the
-/// operator's answer overriding a journal that proves a POST, deleting an unbound draft on a
-/// lost journal (the `claim_bound` conjunct dropped), deleting an issued but unbound draft (the
-/// capability check skipped), and releasing the owner before recovery finishes
-/// (`release_completed_publisher_session` run ahead of `delete_owned_release_tag`, so a failed
-/// tag delete returns with the lease free for a successor to find the half-cleaned tag).
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn release_historical_recovery_model() -> Model {
@@ -1391,20 +1230,14 @@ pub fn release_historical_recovery_model() -> Model {
             const Buggy = 0;
             const RetiredKey = 1;
             const CurrentKey = 2;
-            // phase: 0 stranded/unpublished, 1 observed already-published,
-            // 2 safely abandoned, 3 post-publish bookkeeping finished.
             var phase = 0;
             var owner_held = 1;
             var signature_required = 0;
             var selected_key = 0;
             var publication_mutation = 0;
             var wrong_key_bypassed = 0;
-            // 0 unknown/lost journal, 1 no POST (a current journal proves it),
-            // 2 durable create intent issued (a current journal, or the remote's
-            // claim binding of a visible draft).
             var create_knowledge = 0;
             var draft_observed = 0;
-            // The observed draft targets the recovery claim's commit.
             var draft_bound = 0;
             var draft_deleted = 0;
             var unsafe_absent_unlock = 0;
@@ -1426,7 +1259,6 @@ pub fn release_historical_recovery_model() -> Model {
                 draft_observed = 1;
                 draft_bound = 1;
             }
-            // Someone else's object under this tag: visible, but not this claim's.
             action ObserveUnboundDraft when (
                 phase == 0 && owner_held == 1 && draft_observed == 0
             ) {
@@ -1588,17 +1420,7 @@ pub fn release_historical_recovery_model() -> Model {
     }
 }
 
-/// Published-history identity separates GitHub's tag-creation hint from the immutable code
-/// binding.
-///
-/// A historical release may have captured a symbolic `target_commitish` (say `main`) and is
-/// still valid when its exact tag resolves to the manifest commit. A destructive mutation must
-/// re-read the complete captured release-object snapshot and the tag binding; target or tag
-/// drift refuses deletion. Current draft/claim paths keep their separate SHA-target capability
-/// invariant.
-///
-/// `Buggy=1` has both failures: rejecting valid symbolic history by equating the creation hint
-/// with the manifest commit, and deleting while ignoring target/tag drift.
+/// Published-history identity separates GitHub's tag-creation hint from the immutable code binding.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn release_published_identity_model() -> Model {
@@ -1717,27 +1539,6 @@ pub fn release_published_identity_model() -> Model {
 }
 
 /// Successor-first, crash-convergent yank cleanup.
-///
-/// The bad release stays discoverable until its exact tag has been removed by CAS. Every
-/// destructive edge requires a fully verified, strictly newer successor whose build is newer and
-/// whose minimum-build floor poisons the bad build. Before either destructive edge, cleanup
-/// acquires the verified successor commit as the persistent release lease plus a unique
-/// publisher fence. Tag-first ordering leaves the published bad manifest as a durable cleanup
-/// receipt: after a crash the process can rediscover its exact identity, explicitly recover the
-/// stopped publisher session, re-prove the successor, and finish the convergent release delete.
-/// Only after the tag is gone may the release disappear, and clean completion releases both
-/// session refs atomically.
-///
-/// "The release disappears" is a demotion of the bad channel release to a prerelease
-/// (`verify::run_yank`): it leaves the published set for every client and scan exactly as a
-/// deleted release would, and keeps its signed source attestation and stays reversible. The tag
-/// is the origin tag the cut pushed.
-///
-/// `Buggy=1` exposes delete-before-successor, weak-floor cleanup, wrong-identity cleanup,
-/// cleanup after lease/fence loss, premature session release, the release-first crash cut that
-/// strands a tag after destroying the only remotely discoverable receipt, and a convergence
-/// probe that reads only the tag (cleanup declared complete once the tag is gone while the bad
-/// release is still listed).
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn release_yank_successor_first_model() -> Model {
@@ -1759,8 +1560,6 @@ pub fn release_yank_successor_first_model() -> Model {
             var successor_floor = 0;
             var successor_signature_valid = 0;
             var successor_artifact_valid = 0;
-            // A process-local proof, lost on crash and after each mutation, so a fresh replay
-            // precedes the next cleanup edge.
             var successor_proof = 0;
             var cleanup_lease_owned = 0;
             var cleanup_fence_owned = 0;
@@ -1812,8 +1611,6 @@ pub fn release_yank_successor_first_model() -> Model {
             ) {
                 cleanup_lease_owned = 1;
                 cleanup_session_released = 0;
-                // Acquiring the cross-machine session is a remote boundary: destructive work
-                // must replay the successor afterwards.
                 successor_proof = 0;
             }
             action AcquireCleanupFence when (
@@ -1918,9 +1715,6 @@ pub fn release_yank_successor_first_model() -> Model {
             ) {
                 cleanup_publisher_stopped = 1;
             }
-            // The explicit stopped-publisher recovery command: it rotates/finishes the stale
-            // session and releases both refs; a new yank invocation must acquire a fresh
-            // lease+fence before deleting.
             action RecoverAndReleaseCleanupSession when (
                 cleanup_lease_owned == 1 && cleanup_fence_owned == 1 &&
                 cleanup_guard_attached == 0 && cleanup_publisher_stopped == 1
@@ -2104,39 +1898,7 @@ pub fn release_yank_successor_first_model() -> Model {
     }
 }
 
-/// The release claim, where it lands, and the reader that classifies the next cut: the
-/// writer/reader contract of `ledger::reserve` + `ledger::claim` + `changelog::claim_changelogs`
-/// (writers) and `publish::real_cut_version` over `verify::derive_cut_mode` (reader), in
-/// crates/aterm-release.
-///
-/// A real release builds the published commit P. The reservation (`ClaimRead`) fixes the build
-/// number n from the tail it reads and writes one release commit R = P + one ledger line + P's
-/// changelog rolled (P's code and nothing else), which the release then builds and measures, so
-/// the bytes carry n. The claim lands it: main takes R as a fast-forward when its tip is P, else
-/// as a merge onto the tip whose tree is the tip's plus the same line and the shipped notes. The
-/// push is the compare-and-swap on main's tip: a lost race re-reads the winner's tip and ledger
-/// and lands again with the same n while n is still above the tail (`ClaimRetry`), refuses with
-/// nothing claimed once the tail has reached n (`ClaimStale`: the bytes carry n, so the release
-/// reserves anew and rebuilds), and aborts as "cut elsewhere" when main now carries this
-/// version's section and the cut is not a recut. The next cut reads main's changelog section and
-/// the published state: section and unpublished is a recut of a claim whose cut died, section
-/// and published refuses, anything else is fresh.
-///
-/// Environment: peers push code (`PeerPush`), other versions' claims land ledger lines
-/// (`RivalClaim`), and another machine may claim this version while our claim is in flight
-/// (`ElsewhereClaim`, the one foreign section); each moves main's tip (`seq`). Build numbers are
-/// ordinals (the seed line is 1).
-///
-/// `Buggy = 1` turns on the defects this contract rules out, each caught by its own invariant:
-/// the release built from main's tip; the landing tree built from R (peers' code and other
-/// claims' ledger lines dropped from main); a retry that lands its reserved number after the
-/// tail reached it; and the reader taking the recut signal from the published commit's
-/// changelog, which never carries the section, so a claimed-unpublished version is classified
-/// fresh, then aborted as "cut elsewhere" on its own claim, and a published one is claimed again.
-///
-/// Tier-1: crates/aterm-release/tests/it/claim_landing_model.rs drives the real claim,
-/// claim_changelogs and real_cut_version against real git and checks every transition here,
-/// replaying the source-changelog reader and an R-tree landing as its negative controls.
+/// The release claim, where it lands, and the reader that classifies the next cut: the writer/reader contract of `ledger::reserve` + `ledger::claim` + `changelog::claim_changelogs` (writers) and `publish::real_cut_version` over `verify::derive_cut_mode` (reader), in crates/aterm-release.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn release_claim_landing_model() -> Model {
@@ -2146,19 +1908,15 @@ pub fn release_claim_landing_model() -> Model {
             const MaxPeers = 2;
             const MaxRivals = 1;
             const MaxSeq = 6;
-            // main, as the environment moves it
             var peers = 0;
             var rivals = 0;
             var foreign = 0;
             var seq = 0;
             var published = 0;
-            // main's tree, projected
             var main_code = 0;
             var main_lines = 1;
             var tail = 1;
             var section = 0;
-            // the cut: 0 idle, 1 classified, 2 claiming, 3 landed, 4 died unpublished,
-            // 5 refused (already published, or cut elsewhere)
             var phase = 0;
             var mode = 0;
             var allow = 0;
@@ -2192,9 +1950,6 @@ pub fn release_claim_landing_model() -> Model {
                 seq = seq + 1;
             }
 
-            // The reader. `section` is main's changelog. The Buggy reader takes it from the
-            // published commit's changelog, which never carries it: every cut is fresh to it,
-            // and a fresh cut claims without allowing the section.
             action ClassifyFresh when (
                 (phase == 0 || phase == 4) &&
                 ((section == 0 && published == 0) || Buggy == 1)
@@ -2218,8 +1973,6 @@ pub fn release_claim_landing_model() -> Model {
                 allow = 0;
             }
 
-            // The writer. The release commit carries P's code; the Buggy one is built from
-            // the tip it read.
             action ClaimRead when (phase == 1) {
                 phase = 2;
                 read_seq = seq;
@@ -2238,8 +1991,6 @@ pub fn release_claim_landing_model() -> Model {
             ) {
                 read_seq = seq;
             }
-            // The reservation is stale: the tail reached n while the release built and
-            // measured. Nothing was claimed; the release reserves again.
             action ClaimStale when (
                 phase == 2 && seq > read_seq && (section == 0 || allow == 1) && n <= tail
             ) {

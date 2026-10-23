@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `aterm fabric on|off|doctor`: turn the fabric on, turn it off, or diagnose warnings.
+//! `aterm fabric on|off|doctor`: provision, tear down, or diagnose the local fabric.
 //!
 //! ```text
 //! aterm fabric on  [--dry-run] [--fleet <F>] [--service launchd|systemd|none]
@@ -9,56 +9,10 @@
 //! aterm fabric doctor [--retire-ghosts [--yes]]
 //! ```
 //!
-//! Every step is idempotent; `--dry-run` prints every step and touches nothing.
-//!
-//! Before writing anything, `on` reads the root's [`Role`] from `[fabric] command`, the
-//! rendezvous file, and any installed broker job. Omitting `--fleet` keeps the recorded fleet
-//! (`local` on a fresh root); a differing `--fleet` or unreadable metadata is refused (exit 2).
-//!
-//! ## `on` steps
-//!
-//! 1. **Binary**: `aterm` on `$PATH`, else this executable (`ATERM_BIN` seam in dev builds),
-//!    verified to carry `link serve` and `link broker`. Every word of the bridge and broker
-//!    commands must be [`argv_safe`]; a non-plain aterm path (such as `aterm (dev).app`) is
-//!    invoked through `<root>/bin/<name>` ([`Paths::program`]) so `[fabric] command` stays a
-//!    single space-separated line.
-//! 2. **Root** (`~/.local/share/aterm-fabric`, 0700, or `$ATERM_FABRIC_HOME`) and `<root>/bin`
-//!    symlink when needed. The socket path `<root>/bus.sock` must fit `sun_path`
-//!    ([`SUN_PATH_MAX`]).
-//! 3. **Node id** (`<root>/link-state/node`): provisioned once and kept across `off`.
-//! 4. **Mint secret** (`<root>/mint.secret`, 32 random bytes, 0600): verified via
-//!    [`crate::transport::read_mint_secret`]; never overwritten or chmodded if invalid.
-//! 5. **Cap file** (`<root>/node.cap`): the 8 grants of [`node_grants`] minted for the state
-//!    dir's node id under step 4's secret, staged and renamed atomically.
-//! 6. **Broker**: supervised via launchd (`gui/<uid>/<label>`, `KeepAlive`), `systemd --user`
-//!    (`Restart=always`), or `--service none`, running `link broker <sock> <log> --secret-file
-//!    <root>/mint.secret`. The default root (`<login_home>/.local/share/aterm-fabric`) uses
-//!    [`LABEL`] and `~/Library/LaunchAgents/<label>.plist`; any other root appends
-//!    `.<cksum>` and keeps its plist inside `<root>`. `on` probes the broker and refuses to
-//!    start over an unmanaged broker on the same socket.
-//! 7. **`[fabric] command` in `aterm.toml`**: updated in place via [`set_fabric_command`] and
-//!    [`ConfigFile`] (saving `.bak`), always written as a command-line string with
-//!    `--accept-from <node>`, plus `receipts = true` when unset.
-//! 8. **Rendezvous file** (`<control-socket-dir>/fabric.toml`, 0600): records fleet, broker,
-//!    node, cap file, state dir, and bridge command for `aterm link ls` and `aterm fabric`.
-//! 9. **Running instances**: armed via `fabric attach <argv>` if not already supervised with
-//!    this command and program.
-//! 10. **Proof**: posts a self-addressed `note` with `--wait` and awaits inbox delivery within
-//!     5 s.
-//! 11. **Undo**: prints the `aterm fabric off` command scoped with the environment of this run.
-//! 12. **Status**: prints `aterm fabric` status.
-//!
-//! ## `off`
-//!
-//! Resolves the active root via [`Paths::resolve_for_off`], warns about any held sessions,
-//! stops and removes the broker job, removes `[fabric]` tables from `aterm.toml` and removes
-//! `fabric.toml`, while keeping `<root>/link-state/node`, `mint.secret`, `node.cap`, and
-//! `bus.log`.
-//!
-//! ## `doctor`
-//!
-//! Prints `aterm fabric` warnings with their remedies ([`fix_for`], using [`Role::again`]), or
-//! retires ghost presence rows under `--retire-ghosts`.
+//! `on` validates the existing [`Role`] and [`SUN_PATH_MAX`], resolves an [`argv_safe`] binary
+//! ([`Paths::program`]), provisions `<root>/mint.secret` ([`crate::transport::read_mint_secret`])
+//! and [`node_grants`], supervises the broker ([`LABEL`]), and updates `[fabric] command` via
+//! [`set_fabric_command`] and [`ConfigFile`].
 
 use aterm_uds::spawnfd::Stdio;
 use std::collections::{BTreeMap, BTreeSet};
@@ -77,22 +31,16 @@ pub const RENDEZVOUS_FILE: &str = "fabric.toml";
 /// The fleet `on` joins unless `--fleet` says otherwise.
 pub const DEFAULT_FLEET: &str = "local";
 
-/// The launchd label (and systemd unit name) of the broker under the default root. Any other
-/// root derives its own ([`Paths::label`]).
+/// The launchd label (and systemd unit name) of the broker under the default root.
 pub const LABEL: &str = "systems.alab.astream-broker";
 
-/// `sockaddr_un.sun_path` on macOS: 104 bytes, one of them the NUL.
+/// `sockaddr_un.sun_path` on macOS.
 pub const SUN_PATH_MAX: usize = 104;
 
-/// The mint secret's name in the fabric root, and beside the socket, where `aterm link broker`
-/// finds it when given no `--secret-file`: the root's secret guards the root's socket.
+/// The mint secret's name in the fabric root, and beside the socket.
 pub const MINT_SECRET: &str = "mint.secret";
 
-/// A mint secret is 32 bytes: astream's `SECRET_MIN`, the floor its one
-/// secret-file reader holds every secret to ([`astream_cap::capfile::SECRET_MIN`]),
-/// so the length `on` mints and the length the reader refuses below are one
-/// number. Shorter is refused by the one reader every minting and guarding verb
-/// uses ([`crate::transport::read_mint_secret`]).
+/// A mint secret is 32 bytes.
 pub use astream_cap::capfile::SECRET_MIN as SECRET_LEN;
 
 /// How long the proof may take: post, landing, delivery.
@@ -108,16 +56,12 @@ const ARM_DEADLINE: Duration = Duration::from_secs(5);
 const IO_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// Test-only development seam (compiled out of a release build): append one effect word per
-/// line (`Mint`, `Reject`, `Publish`, `Supervise`) to this file, for the capability-publication
-/// model's conformance run.
 const TRACE_ENV: &str = "ATERM_FABRIC_TRACE";
 
 /// Test-only fault injection (a development seam): refuse the `<n>`th grant's mint.
 const FAIL_MINT_ENV: &str = "ATERM_FABRIC_FAIL_MINT_AT";
 
 /// Test-only development seam: the fabric root in place of `~/.local/share/aterm-fabric`. Each
-/// test runs under its own, so the derived label and plist ([`Paths::label`]) keep it off the
-/// machine's real broker.
 const ROOT_SEAM: &str = "ATERM_FABRIC_HOME";
 
 /// [`ROOT_SEAM`], when a build that compiles seams has it set (and not empty).
@@ -127,19 +71,12 @@ fn root_seam() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-// options
-
 /// How the broker is kept alive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Service {
-    /// A `~/Library/LaunchAgents` job with `KeepAlive` (macOS), in launchd's
-    /// `gui/<uid>` domain: restarted while the user is logged in at the
-    /// console, stopped at logout. Started at the next login only when the
-    /// plist is in the login user's `~/Library/LaunchAgents`, never at boot.
+    /// A `~/Library/LaunchAgents` job with `KeepAlive` (macOS), in launchd's `gui/<uid>` domain.
     Launchd,
-    /// A `systemd --user` unit with `Restart=always` (Linux): restarted while
-    /// the user has a session; without `loginctl enable-linger`, stopped
-    /// shortly after the last one ends and started at the next login.
+    /// A `systemd --user` unit with `Restart=always` (Linux).
     Systemd,
     /// Nobody here: the broker is expected to be running already.
     None,
@@ -149,7 +86,6 @@ impl Service {
     /// Parse the `--service` word.
     ///
     /// # Errors
-    ///
     /// A word that is not one of the three.
     pub fn parse(word: &str) -> Result<Self, String> {
         match word {
@@ -193,10 +129,7 @@ pub struct OnOpts {
     pub service: Option<Service>,
     /// `--fleet`; `None` keeps the configured fleet, or [`DEFAULT_FLEET`] on a new root.
     pub fleet: Option<String>,
-    /// `--durability strict|ordered|relaxed`: what the broker's ack promises
-    /// ([`crate::durability`]), NAMED in the job's argv. `None` keeps the tier
-    /// the installed job names ([`kept_durability`]), else none: the build's
-    /// default.
+    /// `--durability strict|ordered|relaxed`.
     pub durability: Option<crate::durability::Durability>,
 }
 
@@ -209,21 +142,16 @@ pub struct OffOpts {
     pub service: Option<Service>,
 }
 
-// paths
-
-/// Where everything is, resolved once.
+/// Where everything is, resolved.
 #[derive(Debug, Clone)]
 pub struct Paths {
     /// `$HOME`.
     pub home: PathBuf,
-    /// The login user's home from the password database, where the default root (the one with
-    /// the plain [`LABEL`]) lives. `None` when it cannot be read, and then no root is default.
+    /// The login user's home from the password database.
     pub login_home: Option<PathBuf>,
     /// The fabric root.
     pub root: PathBuf,
-    /// The aterm binary the bridge and the broker run from. The commands
-    /// name it by [`Paths::program`]: itself when it is a plain word, else a
-    /// link to it in the root.
+    /// The aterm binary the bridge and the broker run.
     pub aterm: String,
     /// The fleet.
     pub fleet: String,
@@ -231,16 +159,12 @@ pub struct Paths {
     pub config: Option<PathBuf>,
     /// The rendezvous file, if the control-socket dir resolves.
     pub rendezvous: Option<PathBuf>,
-    /// The tier the broker's argv NAMES (`on --durability`, or the one the
-    /// installed job names); `None` names none, and the broker runs the
-    /// build's default ([`crate::durability::resolve`] says which).
+    /// The tier the broker's argv names (`on --durability`, or the one the installed job names).
     pub durability: Option<crate::durability::Durability>,
 }
 
 impl Paths {
-    /// The tier the broker this root runs acks under: the named one, else the
-    /// build's default for a guarded broker ([`crate::durability::default_for`]):
-    /// the job `on` writes always names its mint secret ([`Self::broker_argv`]).
+    /// The tier the broker this root runs acks.
     #[must_use]
     pub fn tier(&self) -> crate::durability::Durability {
         crate::durability::resolve(self.durability, true)
@@ -251,7 +175,6 @@ impl Paths {
     /// Resolve from the environment.
     ///
     /// # Errors
-    ///
     /// No `$HOME`, or no aterm binary anywhere.
     pub fn resolve(fleet: Option<&str>) -> Result<Self, String> {
         let home = std::env::var_os("HOME")
@@ -259,8 +182,6 @@ impl Paths {
             .map(PathBuf::from)
             .ok_or_else(|| "$HOME is not set".to_string())?;
         let root = root_seam().unwrap_or_else(|| default_root(&home));
-        // A development seam (`aterm_types::dev_seam!`): a shipped binary installs
-        // the `aterm` on PATH, else itself — no environment variable repoints it.
         let seam = aterm_types::dev_seam!("ATERM_BIN")
             .map(|b| b.to_string_lossy().into_owned())
             .filter(|b| !b.trim().is_empty());
@@ -296,15 +217,9 @@ impl Paths {
         })
     }
 
-    /// [`Paths::resolve`] for `off`: the root is the one the fabric is on —
-    /// the `--broker` the `[fabric] command` dials (a development build's
-    /// `ATERM_FABRIC_COMMAND` seam first, as `aterm fabric` reads it), else
-    /// the rendezvous file's — and only with none of them the environment's
-    /// (module doc, `off`). So `doctor` reads the role of the fabric its
-    /// report is about. Answers where the root came from beside the paths.
+    /// [`Paths::resolve`] for `off`.
     ///
     /// # Errors
-    ///
     /// As [`Paths::resolve`].
     pub fn resolve_for_off() -> Result<(Self, &'static str), String> {
         let mut p = Self::resolve(None)?;
@@ -336,16 +251,13 @@ impl Paths {
     }
 
     /// Whether this root is the default one, whose label is the plain [`LABEL`]: the login
-    /// user's `~/.local/share/aterm-fabric`, not `$HOME`'s (module doc, step 6).
     fn default_root(&self) -> bool {
         self.login_home
             .as_deref()
             .is_some_and(|login| self.root == default_root(login))
     }
 
-    /// The launchd label / systemd unit name: [`LABEL`] under the default root,
-    /// `LABEL.<cksum of the root>` under any other (module doc, step 6). A function of the root
-    /// alone: two roots never share a label.
+    /// The launchd label / systemd unit name.
     #[must_use]
     pub fn label(&self) -> String {
         if self.default_root() {
@@ -371,9 +283,7 @@ impl Paths {
     pub(crate) fn state(&self) -> PathBuf {
         self.root.join("link-state")
     }
-    /// The launchd job's plist: `~/Library/LaunchAgents/<label>.plist` under
-    /// the default root, `<root>/<label>.plist` under any other (module doc,
-    /// step 6).
+    /// The launchd job's plist.
     pub(crate) fn plist(&self) -> PathBuf {
         let name = format!("{}.plist", self.label());
         if self.default_root() {
@@ -391,16 +301,14 @@ impl Paths {
             .join(format!("{}.service", self.label()))
     }
 
-    /// Whether the binary is the `aterm-link` shim (a test build) rather than
-    /// the front door, which decides the spelling of every command written.
+    /// Whether the binary is the `aterm-link` shim (a test build) rather than the front door.
     pub(crate) fn is_link_shim(&self) -> bool {
         Path::new(&self.aterm)
             .file_name()
             .is_some_and(|n| n == "aterm-link")
     }
 
-    /// The program word every command `on` writes runs: the aterm path itself when
-    /// [`argv_safe`], else [`Paths::program_link`] (`<root>/bin/<name>`).
+    /// The program word every command `on` writes runs.
     #[must_use]
     pub fn program(&self) -> String {
         if argv_safe(&self.aterm).is_ok() {
@@ -419,7 +327,7 @@ impl Paths {
         self.root.join("bin").join(name)
     }
 
-    /// The bridge command aterm launches: `<program> [link] serve … --accept-from <node>`.
+    /// The bridge command aterm launches.
     pub(crate) fn bridge_command(&self, node: &str) -> Vec<String> {
         let mut argv = vec![self.program()];
         if !self.is_link_shim() {
@@ -446,7 +354,6 @@ impl Paths {
     }
 
     /// The broker argv: `<program> [link] broker <sock> <log> --secret-file <root>/mint.secret`
-    /// plus any explicit `--durability` ([`crate::durability::argv_words`]).
     fn broker_argv(&self) -> Vec<String> {
         let mut argv = vec![self.program()];
         if !self.is_link_shim() {
@@ -478,7 +385,6 @@ impl Paths {
     }
 
     /// [`Paths::broker_argv`] with every word single-quoted for `systemd --user` `ExecStart`
-    /// (safe because every word is [`argv_safe`]).
     fn broker_words(&self) -> String {
         self.broker_argv()
             .iter()
@@ -518,8 +424,7 @@ impl Paths {
         )
     }
 
-    /// Render the `systemd --user` unit (`StandardError=append:<root>/broker.err` so
-    /// [`supervisor_last_word`] can read the broker's exit reason).
+    /// Render the `systemd --user` unit.
     #[must_use]
     pub fn unit_text(&self) -> String {
         format!(
@@ -546,9 +451,7 @@ pub(crate) fn default_root(home: &Path) -> PathBuf {
     home.join(".local/share/aterm-fabric")
 }
 
-/// The fabric ROOT a bridge command (or a rendezvous file) points into: its
-/// broker socket's directory. `None` for a relative socket: a command whose
-/// files live elsewhere has no root this command may act on.
+/// The fabric ROOT a bridge command (or a rendezvous file) points.
 pub(crate) fn root_of(broker: &str) -> Option<PathBuf> {
     let root = Path::new(broker).parent()?.to_path_buf();
     root.is_absolute().then_some(root)
@@ -570,7 +473,6 @@ fn xml_unescape(s: &str) -> String {
 }
 
 /// `text` with the whitespace between tags dropped, so a plist reads the same whether it was
-/// written one line per key or with plistlib's tabs.
 fn collapse_between_tags(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut pending = String::new();
@@ -591,7 +493,6 @@ fn collapse_between_tags(text: &str) -> String {
 }
 
 /// The `<string>` values of a plist's `ProgramArguments` array, unescaped —
-/// `None` when the key or its array is not there.
 fn plist_program_arguments(flat: &str) -> Option<Vec<String>> {
     let at = flat.find("<key>ProgramArguments</key>")?;
     let rest = &flat[at..];
@@ -609,21 +510,16 @@ fn plist_program_arguments(flat: &str) -> Option<Vec<String>> {
 }
 
 /// What to read when launchd did not bring the socket up: `broker.err` when
-/// the job ran and wrote it, else launchd's own view of the job.
 fn launchd_failure_hint(root: &Path, label: &str, uid: &str) -> String {
     failure_hint(root, &format!("`launchctl print gui/{uid}/{label}`"))
 }
 
 /// What to read when systemd did not bring the socket up: `broker.err` when
-/// the unit ran and wrote it ([`Paths::unit_text`]'s `StandardError=`), else
-/// the journal — a unit written before that line, or a systemd older than
-/// 240, sends the broker's stderr there.
 fn systemd_failure_hint(root: &Path, label: &str) -> String {
     failure_hint(root, &format!("`journalctl --user -u {label}`"))
 }
 
 /// The supervisor's `broker.err` and its last word when there is one, else
-/// `otherwise` — the supervisor's own view of the job.
 fn failure_hint(root: &Path, otherwise: &str) -> String {
     let err = root.join("broker.err");
     match supervisor_last_word(root) {
@@ -635,8 +531,7 @@ fn failure_hint(root: &Path, otherwise: &str) -> String {
 /// Tail bytes read from `<root>/broker.err` by [`supervisor_last_word`].
 const LAST_WORD_TAIL: u64 = 4096;
 
-/// Last non-empty stderr line from `<root>/broker.err` as `written <age> ago: <line>`
-/// (control characters stripped), or `None` if missing or blank.
+/// Last non-empty stderr line from `<root>/broker.err` as `written <age> ago: <line>`.
 pub(crate) fn supervisor_last_word(root: &Path) -> Option<String> {
     use std::io::{Read, Seek, SeekFrom};
     let mut f = std::fs::File::open(root.join("broker.err")).ok()?;
@@ -674,7 +569,6 @@ fn unit_argv(text: &str) -> Option<Vec<String>> {
 }
 
 /// Extract the `exec` words from a supervisor `/bin/sh -c` script (`[rm -f <sock>;] exec <words…>`),
-/// where each word is single-quoted or plain; returns `None` for any other shell construct.
 fn sh_c_words(script: &str) -> Option<Vec<String>> {
     /// One shell token: a word, or the `;` that ends a command.
     enum Tok {
@@ -716,8 +610,6 @@ fn sh_c_words(script: &str) -> Option<Vec<String>> {
             }
             _ => return None,
         }
-        // A word ends at a separator, a `;`, or the end: `a'b'` is
-        // two runs of one shell word, a shape no writer of these jobs made.
         if matches!(toks.last(), Some(Tok::Word(_)))
             && chars
                 .peek()
@@ -759,17 +651,10 @@ fn supervised_argv(argv: Vec<String>) -> Option<Vec<String>> {
     }
 }
 
-// what this root is to its fleet
-
-/// What this root is to its fleet, read back from what `on` left: the fleet
-/// the configured `[fabric] command` names (else the rendezvous file's), with
-/// the root's installed broker job checked to be a broker command. `on` reads
-/// it before it writes anything — an `on` with no `--fleet` keeps that fleet,
-/// and a `--fleet` that differs is refused — and every remedy `doctor` prints
-/// re-runs `on` with it ([`fix_for`]).
+/// What this root is to its fleet, read back from what `on` left.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Role {
-    /// The configured fleet; absent only before one was recorded.
+    /// The configured fleet.
     pub fleet: Option<String>,
 }
 
@@ -778,14 +663,12 @@ pub struct Role {
 pub enum RoleError {
     /// The installed job runs a command that is not the broker.
     NotABroker,
-    /// The installed job's command line has a shape aterm never wrote:
-    /// `field` (`ProgramArguments`, `ExecStart`) of the file at `path`.
+    /// The installed job's command line has a shape aterm never wrote.
     UnreadableJob {
         path: std::path::PathBuf,
         field: &'static str,
     },
-    /// Anything else: unreadable or invalid configuration or rendezvous, or
-    /// a broker job missing a flag it needs.
+    /// Anything else: unreadable or invalid configuration or rendezvous.
     Invalid(String),
 }
 
@@ -811,11 +694,9 @@ impl From<String> for RoleError {
 }
 
 impl Role {
-    /// What the root `p` is to its fleet. Existing metadata that cannot be
-    /// read or understood is a refusal, never evidence of a fresh root.
+    /// What the root `p` is to its fleet.
     ///
     /// # Errors
-    ///
     /// Unreadable or invalid configuration, rendezvous, or installed job.
     pub fn of(p: &Paths) -> Result<Self, RoleError> {
         let rendezvous = p
@@ -840,8 +721,7 @@ impl Role {
         self.fleet.as_deref()
     }
 
-    /// The command that re-applies this root as it is — every remedy that
-    /// re-runs `on` is spelled with it: `on`, with the fleet the root records.
+    /// The command that re-applies this root as it.
     #[must_use]
     pub fn again(&self) -> String {
         format!("`aterm fabric on{}`", fleet_flag(self.fleet.as_deref()))
@@ -849,7 +729,6 @@ impl Role {
 }
 
 /// The fleet flag a repair must carry. The default remains the usual short
-/// spelling, while a named fleet never silently becomes `local`.
 fn fleet_flag(fleet: Option<&str>) -> String {
     fleet
         .filter(|f| *f != DEFAULT_FLEET)
@@ -872,7 +751,6 @@ fn role_text(path: &Path) -> Result<Option<String>, String> {
 }
 
 /// The fleet the configured bridge command names (else the rendezvous
-/// file's command), read off its raw flags. No cap is opened merely to read it.
 fn configured_fleet(
     config: Option<&Path>,
     rendezvous: Option<&Rendezvous>,
@@ -925,9 +803,6 @@ fn flag_value(flags: &[String], name: &str) -> Option<String> {
 }
 
 /// The broker job this root has installed — its supervisor and its argv, the
-/// plist's `ProgramArguments` or the unit's `ExecStart` words, the platform's
-/// own first — or `None` when neither file is there. A file that is there and
-/// does not parse is an error, never "no job".
 fn installed_job(p: &Paths) -> Result<Option<(Service, Vec<String>)>, RoleError> {
     let plist = role_text(&p.plist())?
         .map(|text| {
@@ -1041,9 +916,7 @@ fn is_executable(p: &Path) -> bool {
     std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
 }
 
-/// POSIX `cksum`'s CRC: the suffix of a non-default root's label
-/// ([`Paths::label`]), the number `printf '%s' "$ROOT" | cksum` prints, so a
-/// shell can name the job a custom root runs.
+/// POSIX `cksum`'s crc: the suffix of a non-default root's label ([`Paths::label`]).
 #[must_use]
 pub fn cksum(data: &[u8]) -> u32 {
     fn feed(crc: &mut u32, byte: u8) {
@@ -1084,7 +957,6 @@ pub fn node_grants(fleet: &str, node: &str) -> Vec<String> {
 }
 
 /// The grants of a person's capability ring (`h-` human or `a-` service) on `fleet`.
-/// Only `h-` principals receive the fleet halt grant (`rw,p=<person>:/f/<fleet>/fleet/<person>/>`).
 #[must_use]
 pub fn person_grants(fleet: &str, person: &str) -> Vec<String> {
     let mut ring = Vec::with_capacity(6);
@@ -1101,8 +973,7 @@ pub fn person_grants(fleet: &str, person: &str) -> Vec<String> {
     ring
 }
 
-/// Refuse a bridge or broker argv word containing whitespace, quotes, `\`, `%`, `$`, or control
-/// characters.
+/// Refuse a bridge or broker argv word containing whitespace, quotes, `\`, `%`, `$`.
 pub fn argv_safe(word: &str) -> Result<(), String> {
     let bad = word
         .chars()
@@ -1124,14 +995,12 @@ pub fn argv_safe(word: &str) -> Result<(), String> {
     Ok(())
 }
 
-// the rendezvous file
-
 /// What `fabric.toml` records.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Rendezvous {
     /// The fleet.
     pub fleet: String,
-    /// The broker the bridges dial: the root's socket, or a joined host's `<host>:<port>`.
+    /// The broker the bridges dial.
     pub broker: String,
     /// This machine's node id.
     pub node: String,
@@ -1167,13 +1036,10 @@ impl Rendezvous {
         )
     }
 
-    /// Parse one. `command` is read as `[fabric] command` is
-    /// ([`fabric::command_in_toml`]): a line, or an argv array.
+    /// Parse one. `command` is read as `[fabric] command` is ([`fabric::command_in_toml`]).
     ///
     /// # Errors
-    ///
-    /// Not TOML, a key missing or not a string, or a `command` that is
-    /// neither form.
+    /// Not TOML, a key missing or not a string, or a `command` that is neither form.
     pub fn parse(text: &str) -> Result<Self, String> {
         let table: aterm_toml::Table =
             aterm_toml::from_str(text).map_err(|e| format!("not valid TOML: {e}"))?;
@@ -1198,10 +1064,9 @@ impl Rendezvous {
         })
     }
 
-    /// The rendezvous file on this machine: `Ok(None)` when there is none.
+    /// The rendezvous file on this machine.
     ///
     /// # Errors
-    ///
     /// A file that exists and cannot be read or parsed, naming it.
     pub fn read() -> Result<Option<Self>, String> {
         let Some(path) = rendezvous_path() else {
@@ -1243,9 +1108,7 @@ fn toml_str(s: &str) -> String {
     out
 }
 
-/// `args` with `--fleet --broker --cap-file --state` filled from the rendezvous file
-/// ([`fill_defaults`]). No file, or an unreadable one (said on stderr), leaves `args` as given,
-/// and the parser's "required" refusal names the flags.
+/// `args` with `--fleet --broker --cap-file --state` filled from the rendezvous file.
 #[must_use]
 pub fn with_rendezvous_defaults(args: &[String]) -> Vec<String> {
     let r = match Rendezvous::read() {
@@ -1261,9 +1124,7 @@ pub fn with_rendezvous_defaults(args: &[String]) -> Vec<String> {
     fill_defaults(args, &r)
 }
 
-/// Prepend absent `--fleet` and `--broker` from `r`, plus `--cap-file` and `--state` only when
-/// `--broker` is also defaulted (never handing the local node's credential or state dir to an
-/// explicit `--broker`).
+/// Prepend absent `--fleet` and `--broker` from `r`.
 #[must_use]
 pub fn fill_defaults(args: &[String], r: &Rendezvous) -> Vec<String> {
     let has = |flag: &str| args.iter().any(|a| a == flag);
@@ -1284,21 +1145,13 @@ pub fn fill_defaults(args: &[String], r: &Rendezvous) -> Vec<String> {
     out
 }
 
-// aterm.toml's [fabric] table
-
 /// `repr` read as a TOML key path by the parser itself, so `fabric`,
-/// `"fabric"`, `'fabric'` and ` fabric . presence ` all name what the app
-/// reads; `None` when it is not a key.
 fn key_path(repr: &str) -> Option<Vec<String>> {
     let keys = aterm_toml::edit::Key::parse(repr.trim()).ok()?;
     Some(keys.iter().map(|k| k.get().to_string()).collect())
 }
 
 /// The table header on `line` — `[fabric]`, `[ "fabric" . presence ]`,
-/// `[[fabric.peers]]` — as its text (comment dropped) and key path; `None` for
-/// any other line. The header ends at the first close bracket whose text
-/// before it is a key and after it is nothing or a comment: a `]` or `#`
-/// inside a quoted segment leaves an unterminated string before it.
 fn table_header(line: &str) -> Option<(&str, Vec<String>)> {
     let t = line.trim_start();
     let (open, close) = if t.starts_with("[[") {
@@ -1318,15 +1171,12 @@ fn table_header(line: &str) -> Option<(&str, Vec<String>)> {
 }
 
 /// The key path a `key = value` line sets (`command`, `"command"`,
-/// `fabric.command`); `None` for any other line.
 fn line_key(line: &str) -> Option<Vec<String>> {
     line.match_indices('=')
         .find_map(|(at, _)| key_path(&line[..at]))
 }
 
 /// Every `fabric` table in `lines` — `[fabric]`, each `[fabric.<sub>]` and
-/// `[[fabric.<sub>]]`, in any spelling TOML allows — as `(header, path,
-/// start, end)`, in file order.
 fn fabric_table_spans<'a>(lines: &[&'a str]) -> Vec<(&'a str, Vec<String>, usize, usize)> {
     let mut out = Vec::new();
     for (i, l) in lines.iter().enumerate() {
@@ -1350,13 +1200,9 @@ fn is_command_line(line: &str) -> bool {
     line_key(line).is_some_and(|k| k == ["command"])
 }
 
-/// `edited` read back through the parser the app loads aterm.toml with, held to what the edit
-/// meant: `text`'s meaning with `fabric` applied. The line editors here know every spelling of
-/// a header and a key but not the rest of TOML (a header-shaped line in a multi-line string
-/// fools them), so nothing they produce is written unless it reads back as meant.
+/// `edited` read back through the parser the app loads aterm.toml with, held to what the edit meant
 ///
 /// # Errors
-///
 /// `text` or `edited` is not TOML, or `edited` means something else.
 fn reads_back(
     text: &str,
@@ -1365,7 +1211,6 @@ fn reads_back(
 ) -> Result<(), String> {
     let mut want: aterm_toml::Table =
         aterm_toml::from_str(text).map_err(|e| format!("not valid TOML: {e}"))?;
-    // The parse error is not named: its line is in text that never existed.
     let after: aterm_toml::Table = aterm_toml::from_str(edited)
         .map_err(|_| "the edited file would not be valid TOML".to_string())?;
     fabric(&mut want);
@@ -1377,11 +1222,6 @@ fn reads_back(
 }
 
 /// The line range `[at, end)` of the `command = …` value starting at `lines[at]`:
-/// one line, up to the closing `"""`/`'''` of a multi-line string, or up to
-/// the `]` that closes a multi-line ARRAY (the argv form, by hand) — read
-/// with its strings and comments skipped ([`array_end`]). An array whose end
-/// this cannot find runs to the table's end, and the read-back
-/// ([`reads_back`]) then refuses the edit rather than writing it.
 fn command_value_end(lines: &[&str], at: usize) -> usize {
     let line = lines[at];
     let value = line.split_once('=').map_or("", |(_, v)| v.trim_start());
@@ -1403,19 +1243,14 @@ fn command_value_end(lines: &[&str], at: usize) -> usize {
 }
 
 /// The index of the line holding the `]` that closes the array opening at
-/// byte `from` of `lines[at]`: brackets counted outside basic, literal and
-/// multi-line strings and `#` comments. `None` when the lines end first.
 fn array_end(lines: &[&str], at: usize, from: usize) -> Option<usize> {
     let mut depth = 0usize;
-    // The string being read, by its delimiter: `"`, `'`, `"""` or `'''`.
     let mut string: Option<&'static str> = None;
     for (n, line) in lines.iter().enumerate().skip(at) {
         let mut rest = if n == at { line.get(from..)? } else { *line };
         while let Some(c) = rest.chars().next() {
             if let Some(close) = string {
                 if c == '\\' && matches!(close, "\"" | "\"\"\"") {
-                    // A basic string's escape: the next character, whatever
-                    // it is, closes nothing.
                     let mut after = rest.chars();
                     after.next();
                     after.next();
@@ -1449,7 +1284,6 @@ fn array_end(lines: &[&str], at: usize, from: usize) -> Option<usize> {
             }
             rest = &rest[c.len_utf8()..];
         }
-        // A one-line string never runs past its line.
         if matches!(string, Some("\"" | "'")) {
             string = None;
         }
@@ -1457,9 +1291,7 @@ fn array_end(lines: &[&str], at: usize, from: usize) -> Option<usize> {
     None
 }
 
-/// Set `[fabric] command` in `text` to `cmd` (formatted via [`toml_command`]), replacing an
-/// existing `command` key in `[fabric]` or appending a new table, and adding `receipts = true`
-/// when `receipts` is absent. Returns `(edited, changed)` and verifies the edit via [`reads_back`].
+/// Set `[fabric] command` in `text` to `cmd` (formatted via [`toml_command`]).
 pub fn set_fabric_command(text: &str, cmd: &[String]) -> Result<(String, bool), String> {
     if !aterm_types::fabric_command::line_spells(cmd) {
         return Err(format!(
@@ -1469,8 +1301,6 @@ pub fn set_fabric_command(text: &str, cmd: &[String]) -> Result<(String, bool), 
             safe(&fabric::shown_argv(cmd), 512)
         ));
     }
-    // A file the app itself could not parse is not edited line by line into a
-    // file it still cannot parse: the refusal names the parse error instead.
     let receipts_missing = fabric::receipts_in_toml(text)?.is_none();
     if let Some(current) = fabric::command_in_toml(text)? {
         if current == cmd && !receipts_missing {
@@ -1478,7 +1308,6 @@ pub fn set_fabric_command(text: &str, cmd: &[String]) -> Result<(String, bool), 
         }
     }
     let lines: Vec<&str> = text.lines().collect();
-    // The line range `[start, end)` of the `[fabric]` table itself.
     let table = fabric_table_spans(&lines)
         .into_iter()
         .find_map(|(_, path, start, end)| (path == ["fabric"]).then_some((start, end)));
@@ -1550,8 +1379,6 @@ pub fn set_fabric_command(text: &str, cmd: &[String]) -> Result<(String, bool), 
 }
 
 /// Whether the top level spells `fabric` as `fabric.command = …` or
-/// `fabric = { … }`, in any key spelling — forms [`set_fabric_command`] does
-/// not edit.
 fn has_dotted_fabric(lines: &[&str]) -> bool {
     lines
         .iter()
@@ -1559,19 +1386,12 @@ fn has_dotted_fabric(lines: &[&str]) -> bool {
         .any(|l| line_key(l).is_some_and(|k| k.first().is_some_and(|k| k == "fabric")))
 }
 
-/// `text` with the `[fabric]` table and every `[fabric.<sub>]` table removed (a subtable left
-/// behind would re-create the `fabric` key), every other table kept, and the removed headers in
-/// file order (empty when there was none).
+/// `text` with the `[fabric]` table and every `[fabric.<sub>]` table removed.
 ///
 /// # Errors
-///
-/// A file that is not valid TOML (left alone, the error named: which lines are fabric's cannot
-/// be read in it, since a malformed `[keys` ends no table), a result that still defines
-/// `fabric` (a dotted key or an inline table, which this editor does not remove), or one that
-/// does not read back as `text` without it (`reads_back`).
+/// A file that is not valid TOML.
 pub fn remove_fabric_table(text: &str) -> Result<(String, Vec<String>), String> {
     let table: aterm_toml::Table = aterm_toml::from_str(text).map_err(|e| {
-        // The instruction before the error, whose snippet runs to several lines.
         format!(
             "not valid TOML, so aterm.toml is left as it was; fix it (or remove its [fabric] \
              table by hand) and run this again: {e}"
@@ -1619,14 +1439,11 @@ pub fn remove_fabric_table(text: &str) -> Result<(String, Vec<String>), String> 
     Ok((joined, removed))
 }
 
-// files, written the careful way
-
 pub(crate) use aterm_uds::atomic_file::{
     create_temp_beside, write as write_atomic, ConfigFile, LOCK_OPEN_FLAGS,
 };
 
-/// `n` random bytes through the one audited entropy helper (`aterm_uds::rand`); the `dev-read`
-/// guard refuses a hand-rolled device read.
+/// `n` random bytes through the one audited entropy helper (`aterm_uds::rand`).
 pub(crate) fn random_bytes(n: usize) -> io::Result<Vec<u8>> {
     let mut buf = vec![0u8; n];
     aterm_uds::rand::fill(&mut buf)?;
@@ -1640,15 +1457,13 @@ pub(crate) fn read_node(state: &Path) -> Option<String> {
     is_node_id(node).then(|| node.to_string())
 }
 
-/// Whether `node` is a NODE id: `n-` and a principal segment.
+/// Whether `node` is a node id.
 #[must_use]
 pub fn is_node_id(node: &str) -> bool {
     node.starts_with("n-") && crate::subject::is_principal(node)
 }
 
 /// Whether the cap file at `path` was minted for `node` under the current
-/// secret: every tag verifies, and at least one grant binds `node` as its
-/// principal. A recreated secret requires fresh caps even for the same node.
 fn cap_is_for(path: &Path, node: &str, secret: &[u8]) -> Result<usize, String> {
     let caps = crate::bridge::read_cap_file(&path.to_string_lossy()).map_err(|e| e.to_string())?;
     if !caps.iter().any(|c| {
@@ -1677,7 +1492,6 @@ fn cap_is_for(path: &Path, node: &str, secret: &[u8]) -> Result<usize, String> {
 }
 
 /// The test-only effect trace ([`TRACE_ENV`]). A failed write is ignored: the trace is evidence
-/// for a test, never a step of the command.
 fn trace(word: &str) {
     if let Some(path) = aterm_types::dev_seam!(TRACE_ENV) {
         if let Ok(mut f) = std::fs::OpenOptions::new()
@@ -1691,12 +1505,9 @@ fn trace(word: &str) {
 }
 
 /// Mint the eight grants into `<root>/node.cap` as one transaction (module doc, step 5).
-/// Answers the grant count.
 ///
 /// # Errors
-///
-/// A secret the reader refuses, a refused mint, or a staging/rename failure; in every case the
-/// previous cap file is untouched and the staging file is gone.
+/// A secret the reader refuses, a refused mint, or a staging/rename failure.
 fn mint_caps(p: &Paths, node: &str) -> Result<usize, String> {
     let secret_path = p.secret().to_string_lossy().into_owned();
     let key = crate::transport::read_mint_secret(&secret_path).map_err(|e| {
@@ -1746,8 +1557,6 @@ fn mint_caps(p: &Paths, node: &str) -> Result<usize, String> {
     result
 }
 
-// the report
-
 /// The step lines, printed as they happen.
 pub(crate) struct Out {
     pub(crate) dry_run: bool,
@@ -1770,13 +1579,12 @@ impl Out {
         let _ = out.flush();
     }
 
-    /// Nothing to do: it was already so.
+    /// Nothing to do: it was already.
     pub(crate) fn already(&self, name: &str, detail: &str) {
         self.line(name, "already", detail);
     }
 
-    /// Something was (or, dry, would be) done. An empty `did` prints `would`
-    /// rather than an empty detail.
+    /// Something was (or, dry, would be) done.
     pub(crate) fn done(&mut self, name: &str, would: &str, did: &str) {
         self.changed += 1;
         if self.dry_run {
@@ -1806,9 +1614,6 @@ impl Out {
 }
 
 /// Step 7 of `on`: `[fabric] command` in aterm.toml set to the argv `command`
-/// ([`set_fabric_command`]), written as the config service writes it
-/// ([`ConfigFile`]) with the previous file kept as a `.bak` — `already` when
-/// the file says it, and a dry run writes nothing. `false` stops the run.
 fn config_step(config: Option<&Path>, command: &[String], out: &mut Out) -> bool {
     let Some(config) = config else {
         out.fail(
@@ -1861,7 +1666,6 @@ fn config_step(config: Option<&Path>, command: &[String], out: &mut Out) -> bool
     if out.dry_run {
         return true;
     }
-    // The lock is let go when `replace` returns, before the line is printed.
     match file.lock().and_then(|edit| edit.replace(&new_text)) {
         Ok(bak) => {
             out.ok(
@@ -1882,10 +1686,8 @@ fn config_step(config: Option<&Path>, command: &[String], out: &mut Out) -> bool
 }
 
 /// Step 2 of `on`: ensure the fabric root and state directory are private (`0700`) via
-/// [`aterm_uds::private_file::ensure_private_dir`].
 fn root_step(p: &Paths, state: &Path, out: &mut Out) -> bool {
     use aterm_uds::private_file::{ensure_private_dir, judge_private_dir, PrivateDir};
-    // A refusal names the directory; an OS error (it carries a code) does not.
     let failed = |out: &mut Out, d: &Path, e: &io::Error| {
         if e.raw_os_error().is_some() {
             out.fail("root", &format!("{}: {e}", d.display()));
@@ -1893,8 +1695,6 @@ fn root_step(p: &Paths, state: &Path, out: &mut Out) -> bool {
             out.fail("root", &e.to_string());
         }
     };
-    // Both judged before either is changed, so a refusal of the second leaves the
-    // first as it was.
     let mut missing = Vec::new();
     let mut wide = Vec::new();
     for d in [p.root.as_path(), state] {
@@ -1939,20 +1739,12 @@ fn root_step(p: &Paths, state: &Path, out: &mut Out) -> bool {
 }
 
 /// Step 2's second half: when the aterm path is not a plain word, the link
-/// [`Paths::program`] names, `<root>/bin/<name>` → the aterm path, made or
-/// re-pointed (a new link renamed over the old one, so a running broker's
-/// restart never finds none) — `already` when it points there, nothing at all
-/// for a plain path. A file there that is NOT a link is never replaced: `on`
-/// did not make it. `false` stops the run.
 fn program_step(p: &Paths, out: &mut Out) -> bool {
     if p.program() == p.aterm {
         return true;
     }
     let link = p.program_link();
     let bin = link.parent().expect("the program link has a bin directory");
-    // Admit the directory BEFORE looking through it, including the `already`
-    // path: an existing bin link must not redirect chmod or program writes
-    // into a directory this step did not choose. `on` made the root first.
     let make_bin = match std::fs::symlink_metadata(bin) {
         Ok(m) if m.file_type().is_dir() => false,
         Ok(_) => {
@@ -1968,8 +1760,6 @@ fn program_step(p: &Paths, out: &mut Out) -> bool {
             return false;
         }
     };
-    // A link resolves a relative target from its own directory, so it names
-    // the aterm path as an absolute one.
     let target = std::path::absolute(&p.aterm).unwrap_or_else(|_| PathBuf::from(&p.aterm));
     let shown = format!(
         "{} → {}",
@@ -2011,8 +1801,6 @@ fn program_step(p: &Paths, out: &mut Out) -> bool {
     if out.dry_run {
         return true;
     }
-    // create_dir refuses an entry planted after a missing-directory read;
-    // create_dir_all would follow a newly planted bin symlink.
     let made = (if make_bin {
         std::fs::create_dir(bin)
     } else {
@@ -2043,7 +1831,6 @@ fn program_step(p: &Paths, out: &mut Out) -> bool {
 }
 
 /// Record `node` into `<state>/node` (a dry run writes nothing) — `on`'s
-/// minted id. `false` stops the run.
 fn record_node(state: &Path, node: &str, out: &mut Out) -> bool {
     if !out.dry_run {
         let write =
@@ -2057,7 +1844,6 @@ fn record_node(state: &Path, node: &str, out: &mut Out) -> bool {
 }
 
 /// Whether the binary carries `link` — `<aterm> link` prints the bridge's
-/// usage, which names `aterm-link`; the shim prints it with no argument.
 fn binary_has_link(p: &Paths) -> Result<(), String> {
     if !is_executable(Path::new(&p.aterm)) {
         return Err(format!(
@@ -2088,16 +1874,13 @@ fn binary_has_link(p: &Paths) -> Result<(), String> {
     }
 }
 
-/// Reach the broker for real, through the report's own probe; `procs` is the
-/// process table that names its pid.
+/// Reach the broker for real, through the report's own probe.
 pub(crate) fn probe(
     p: &Paths,
     node: &str,
     procs: impl FnOnce() -> Vec<fabric::Proc>,
 ) -> fabric::BrokerView {
     match fabric::bridge_config(&p.bridge_command(node)) {
-        // The process table only where there is a broker config to match it
-        // against: a `ps` spawn an unparsable command would throw away.
         Ok(cfg) => fabric::probe_broker(&cfg, &procs()).0,
         Err(e) => fabric::BrokerView {
             endpoint: p.sock(),
@@ -2108,8 +1891,6 @@ pub(crate) fn probe(
 }
 
 /// Wait for the socket file to appear, then for the broker behind it to answer.
-/// The process table (a `ps -A`) is read once, when it answers — not on every
-/// 100 ms retry.
 fn wait_for_broker(p: &Paths, node: &str) -> Result<fabric::BrokerView, String> {
     let started = Instant::now();
     loop {
@@ -2125,8 +1906,7 @@ fn wait_for_broker(p: &Paths, node: &str) -> Result<fabric::BrokerView, String> 
     }
 }
 
-/// This process's effective uid, as `id -u` prints it: the `gui/<uid>`
-/// launchd domain every job here is written to.
+/// This process's effective uid, as `id -u` prints it.
 #[cfg(unix)]
 pub(crate) fn uid() -> String {
     aterm_uds::peer::our_uid().to_string()
@@ -2138,7 +1918,7 @@ pub(crate) fn uid() -> String {
     "501".to_string()
 }
 
-/// `launchctl <args>`; `Ok(())` on exit 0.
+/// `launchctl <args>`.
 pub(crate) fn launchctl(args: &[&str]) -> Result<(), String> {
     let out = aterm_uds::spawnfd::command("launchctl")
         .args(args)
@@ -2157,7 +1937,7 @@ pub(crate) fn launchctl(args: &[&str]) -> Result<(), String> {
     }
 }
 
-/// `launchctl list`'s `PID  Status  Label` rows; empty when it cannot run.
+/// `launchctl list`'s `PID Status Label` rows.
 #[cfg(target_os = "macos")]
 pub(crate) fn launchctl_list() -> String {
     aterm_uds::spawnfd::command("launchctl")
@@ -2169,25 +1949,21 @@ pub(crate) fn launchctl_list() -> String {
         .unwrap_or_default()
 }
 
-/// What launchd's `gui/<uid>` domain — the one `on` bootstraps the broker
-/// into and `off` boots it out of — says of a job.
+/// What launchd's `gui/<uid>` domain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LaunchdJob {
     /// The domain holds no such job.
     Absent,
-    /// There is no `gui/<uid>` domain: this uid has no GUI login (an SSH
-    /// session alone opens none), so no job can run in it.
+    /// There is no `gui/<uid>` domain.
     NoGuiLogin,
     /// Loaded; `Some(pid)` while it runs.
     Loaded(Option<u32>),
 }
 
 /// `launchctl`'s exit status for "Could not find specified domain"
-/// (`launchctl error 112`): `print gui/<uid>/…` for a uid with no GUI login.
 const LAUNCHCTL_NO_DOMAIN: i32 = 112;
 
-/// Query `launchctl print gui/<uid>/<label>` (never `launchctl list`, which queries the caller's
-/// domain rather than `gui/<uid>`).
+/// Query `launchctl print gui/<uid>/<label>`.
 pub(crate) fn launchd_job(label: &str) -> LaunchdJob {
     let Ok(out) = aterm_uds::spawnfd::command("launchctl")
         .args(["print", &format!("gui/{}/{label}", uid())])
@@ -2213,7 +1989,6 @@ pub(crate) fn launchd_loaded(label: &str) -> bool {
 }
 
 /// The refusal for a uid launchd has no GUI domain for — before the plist
-/// is written, so a refused run leaves no unused broker job. Always `false`.
 fn refuse_no_gui_login(out: &mut Out) -> bool {
     let uid = uid();
     out.fail(
@@ -2229,8 +2004,6 @@ fn refuse_no_gui_login(out: &mut Out) -> bool {
 }
 
 /// Whether a `systemd --user` manager answers this login; the named refusal
-/// when none does (`su`, `sudo -u`, an SSH session without `pam_systemd`),
-/// which would otherwise surface as systemctl's own bus error.
 fn systemd_user_manager() -> Result<(), String> {
     systemctl(&["show-environment"]).map_err(|e| {
         format!(
@@ -2261,7 +2034,6 @@ pub(crate) fn systemctl(args: &[&str]) -> Result<(), String> {
 }
 
 /// The `MainPID` systemd runs `label` under, `None` when the unit is not
-/// running (systemd answers `0`) or systemctl cannot say.
 fn systemd_main_pid(label: &str) -> Option<u32> {
     let out = aterm_uds::spawnfd::command("systemctl")
         .args(["--user", "show", "-p", "MainPID", "--value", label])
@@ -2280,7 +2052,6 @@ fn systemd_main_pid(label: &str) -> Option<u32> {
 }
 
 /// Reason a responsive broker needs a restart (`None` if current): replaced binary, unguarded, or
-/// mismatched `--durability`.
 fn not_current(p: &Paths, view: &fabric::BrokerView) -> Option<&'static str> {
     use crate::durability::Durability;
     if view.replaced.is_some() {
@@ -2300,8 +2071,6 @@ fn not_current(p: &Paths, view: &fabric::BrokerView) -> Option<&'static str> {
 }
 
 /// The refusal for a broker the supervisor does not manage (a hand-run `aterm link broker`, or
-/// a job under another label): starting the job over it would put a second broker on the same
-/// socket and bus log. Always `false`.
 fn refuse_unmanaged(view: &fabric::BrokerView, sock: &str, out: &mut Out) -> bool {
     out.fail(
         "broker",
@@ -2316,7 +2085,6 @@ fn refuse_unmanaged(view: &fabric::BrokerView, sock: &str, out: &mut Out) -> boo
 }
 
 /// Step 6: the broker, supervised. `Ok(true)` when it answers. `named`:
-/// `on --durability` chose the tier, rather than keeping one.
 fn broker_step(p: &Paths, node: &str, service: Service, named: bool, out: &mut Out) -> bool {
     trace("Supervise");
     let sock = p.sock();
@@ -2324,11 +2092,6 @@ fn broker_step(p: &Paths, node: &str, service: Service, named: bool, out: &mut O
     match service {
         Service::None => {
             let view = probe(p, node, fabric::process_table);
-            // Under `--service none` the broker is the operator's, run by hand:
-            // no job says its tier, so a bare `on` keeps the one it runs, read
-            // off its process. Only a tier `--durability` names is one to
-            // restart it for — and every restart line below carries the tier
-            // kept.
             let kept;
             let p = match view.durability {
                 Some(running) if !named && running != p.tier() => {
@@ -2353,7 +2116,6 @@ fn broker_step(p: &Paths, node: &str, service: Service, named: bool, out: &mut O
                             .map_or_else(String::new, |pid| format!(", pid {pid}"))
                     ),
                 );
-                // Nothing here restarts it, so the line says how.
                 if let Some(why) = not_current(p, &view) {
                     out.warn(
                         "broker",
@@ -2382,8 +2144,6 @@ fn broker_step(p: &Paths, node: &str, service: Service, named: bool, out: &mut O
             let text = p.plist_text();
             let same = std::fs::read_to_string(&plist).is_ok_and(|old| p.plist_is_current(&old));
             let running = match launchd_job(&label) {
-                // No domain to bootstrap into: refused before anything is
-                // written, dry or not (the probe is read-only).
                 LaunchdJob::NoGuiLogin => return refuse_no_gui_login(out),
                 LaunchdJob::Loaded(pid) => pid,
                 LaunchdJob::Absent => None,
@@ -2401,7 +2161,6 @@ fn broker_step(p: &Paths, node: &str, service: Service, named: bool, out: &mut O
                 );
                 return true;
             }
-            // A broker launchd does not manage is never bootstrapped over.
             if running.is_none() && view.read_ok() {
                 return refuse_unmanaged(&view, &sock, out);
             }
@@ -2443,9 +2202,6 @@ fn broker_step(p: &Paths, node: &str, service: Service, named: bool, out: &mut O
             let domain = format!("gui/{}/{label}", uid());
             let _ = launchctl(&["bootout", &domain]);
             let plist_s = plist.to_string_lossy().into_owned();
-            // No legacy `load` fallback: it acts on the CALLER's domain, and
-            // exits 0 on anything but bad usage, so it would hide the
-            // bootstrap's own error behind a 5 s wait for a socket.
             if let Err(e) = launchctl(&["bootstrap", &format!("gui/{}", uid()), &plist_s]) {
                 out.fail("broker", &e);
                 return false;
@@ -2495,17 +2251,10 @@ fn broker_step(p: &Paths, node: &str, service: Service, named: bool, out: &mut O
                 );
                 return true;
             }
-            // No user manager to ask: refused before the unit is written, dry
-            // or not (the probe is read-only) — and BEFORE the unmanaged
-            // check, as the launchd arm asks for its domain first: with no
-            // manager `MainPID` cannot be read, so the unit's own broker
-            // answering would otherwise be called unmanaged.
             if let Err(e) = systemd_user_manager() {
                 out.fail("broker", &e);
                 return false;
             }
-            // The launchd arm's refusal: a broker the unit does not run is
-            // never restarted over (a second broker on its socket and log).
             if running.is_none() && view.read_ok() {
                 return refuse_unmanaged(&view, &sock, out);
             }
@@ -2541,8 +2290,6 @@ fn broker_step(p: &Paths, node: &str, service: Service, named: bool, out: &mut O
             if out.dry_run {
                 return true;
             }
-            // `enable` then `restart`, not `enable --now` (which would start the
-            // unit twice): restart starts a stopped unit too.
             let steps: [&[&str]; 3] = [
                 &["daemon-reload"],
                 &["enable", &label],
@@ -2581,28 +2328,22 @@ fn broker_step(p: &Paths, node: &str, service: Service, named: bool, out: &mut O
 }
 
 /// One running instance, as `on` sees it. It keeps no token: each connection
-/// to it reads the one beside its socket once connected ([`Ctl::open`]), so
-/// an update's successor at the same socket is asked with its own.
 struct Instance {
     pid: u32,
     sock: String,
     supervised: bool,
     state: String,
-    /// `fabric status`'s `reason=`: `state-locked` is a bridge standing by.
+    /// `fabric status`'s `reason=`.
     reason: String,
     /// The argv `fabric status` names ([`fabric::status_argv`]).
     command: Option<Vec<String>>,
 }
 
 /// What `on` says of an instance whose bridge stands by (`bridge::hold_state_dir`): armed, but
-/// not one the proof can post through.
 const STANDBY_NOTE: &str = "its bridge stands by: another instance's bridge holds this node's \
                             state dir, and this one carries no mail until that one exits";
 
 /// Every instance the rendezvous walk lists that answered `fabric status`, and
-/// how many listed instances are running: those, plus each live one that
-/// could not be asked (its line says why). `None` when the walk itself failed,
-/// so nobody can say none is running.
 fn instances(out: &mut Out) -> (Vec<Instance>, Option<usize>) {
     let listed = match aterm_ctl::local_instances() {
         Ok(l) => l,
@@ -2631,8 +2372,6 @@ fn instances(out: &mut Out) -> (Vec<Instance>, Option<usize>) {
 }
 
 /// Ask the instance `pid` listening on `sock` for its `fabric status`. `Err`
-/// is an instance that could not be asked: `Some` the line that says why, for
-/// a live one; `None` for a listing whose process is gone.
 fn ask_instance(pid: u32, sock: String) -> Result<Instance, Option<String>> {
     let (stream, token) = match aterm_ctl::connect_then_read_token(&sock) {
         Ok(connected) => connected,
@@ -2688,13 +2427,8 @@ fn ask_instance(pid: u32, sock: String) -> Result<Instance, Option<String>> {
 }
 
 /// Step 9: arm every running instance. Answers how many are running (`None`
-/// when they could not be listed), and the ones that carry this command
-/// (armed now or before), in the order they were listed.
 fn arm_instances(argv: &[String], out: &mut Out) -> (Option<usize>, Vec<Instance>) {
     let ours = fabric::serve_flags(argv);
-    // The program is compared with the flags ([`fabric::bridge_program`]): an
-    // instance armed with these flags and another program holds its bridge
-    // lane with a process `on` did not choose, and is named, not counted.
     let our_program = fabric::bridge_program(argv);
     let (found, running) = instances(out);
     if running == Some(0) {
@@ -2720,8 +2454,6 @@ fn arm_instances(argv: &[String], out: &mut Out) -> (Option<usize>, Vec<Instance
                     ),
                 );
             } else if flags_match && inst.reason == "state-locked" {
-                // A re-run finds the standby the first run armed: still not one the proof can
-                // post through (its `post --wait` answers `ERR fabric stalled`).
                 out.note(
                     "instance",
                     &format!("{pid} is armed with this command ({shown}); {STANDBY_NOTE}"),
@@ -2759,7 +2491,6 @@ fn arm_instances(argv: &[String], out: &mut Out) -> (Option<usize>, Vec<Instance
             &format!("armed {pid}"),
         );
         if out.dry_run {
-            // Listed as armed so the dry run's proof line names the session it would use.
             armed.push(inst);
             continue;
         }
@@ -2768,10 +2499,6 @@ fn arm_instances(argv: &[String], out: &mut Out) -> (Option<usize>, Vec<Instance
             continue;
         };
         let _ = ctl.get_ref().set_read_timeout(Some(IO_TIMEOUT));
-        // The plain join, as every earlier `on` sent it: every word is plain
-        // (step 1, [`argv_safe`]) — no whitespace and no `%` — so an instance
-        // of any build reads these words, whether it pct-decodes the attach
-        // line's words or not.
         let line = format!("fabric attach {}", argv.join(" "));
         match ctl.request(&line) {
             Ok(r) if r.ok() => {}
@@ -2787,7 +2514,6 @@ fn arm_instances(argv: &[String], out: &mut Out) -> (Option<usize>, Vec<Instance
                 continue;
             }
         }
-        // The bridge connects asynchronously; wait for the instance to say so.
         let started = Instant::now();
         let (state, reason) = loop {
             let header = ctl
@@ -2797,7 +2523,6 @@ fn arm_instances(argv: &[String], out: &mut Out) -> (Option<usize>, Vec<Instance
                 .unwrap_or_default();
             let state = kv(&header, "state").unwrap_or("-").to_string();
             let reason = kv(&header, "reason").unwrap_or("-").to_string();
-            // `state-locked` is final for as long as the holder runs.
             if state == "connected" || reason == "state-locked" || started.elapsed() > ARM_DEADLINE
             {
                 break (state, reason);
@@ -2816,8 +2541,6 @@ fn arm_instances(argv: &[String], out: &mut Out) -> (Option<usize>, Vec<Instance
             inst.state = state;
             armed.push(inst);
         } else if state == "stalled" && reason == "starting" {
-            // Attached, and the bridge has not reported its link (an older bridge reads
-            // `connected` only at its first delivered record): the proof is that record.
             out.note(
                 "instance",
                 &format!(
@@ -2830,8 +2553,6 @@ fn arm_instances(argv: &[String], out: &mut Out) -> (Option<usize>, Vec<Instance
             armed.push(inst);
         } else if state == "stalled" && reason == "state-locked" {
             // One state dir is one bridge (`bridge::hold_state_dir`), and another instance's
-            // holds this one: not a failed arm (this one takes the node over when that one
-            // exits), but not one the proof can post through.
             out.note("instance", &format!("{pid} armed; {STANDBY_NOTE}"));
         } else if state == "stalled" {
             out.fail(
@@ -2857,9 +2578,6 @@ fn arm_instances(argv: &[String], out: &mut Out) -> (Option<usize>, Vec<Instance
 }
 
 /// The proof line when nothing is armed to post through. Launching aterm is
-/// the fix only when the walk listed none running; otherwise (an instance that
-/// could not be asked, one armed with another command, a failed arm or
-/// bridge, a walk that failed) the lines above say why.
 fn proof_skipped(running: Option<usize>) -> &'static str {
     if running == Some(0) {
         "skipped: no aterm is running — launch one, then run this again"
@@ -2869,9 +2587,6 @@ fn proof_skipped(running: Option<usize>) -> &'static str {
 }
 
 /// Every `(instance pid, socket, sid, origin)` whose `status` says `hold=1`: the socket only
-/// when `--pid` does not reach it ([`aterm_ctl::pid_reaches`]), the origin read off the
-/// session's `timeline` ([`fabric::last_hold`]) when it is still there. An instance that cannot
-/// be asked is skipped: `off` names what it can see, and its `instances` line says what runs.
 fn held_sessions() -> Vec<(u32, Option<String>, String, Option<String>)> {
     let mut held = Vec::new();
     for (pid, sock) in aterm_ctl::local_instances().unwrap_or_default() {
@@ -2909,7 +2624,6 @@ fn sessions_of(inst: &Instance) -> Vec<String> {
 }
 
 /// The `s-` session ids the instance behind `ctl` lists, in its own order;
-/// none when it cannot be asked.
 fn session_sids(ctl: &mut Ctl) -> Vec<String> {
     ctl.request("sessions")
         .ok()
@@ -2925,8 +2639,6 @@ fn session_sids(ctl: &mut Ctl) -> Vec<String> {
 
 /// Step 10: the proof. `Ok(ms)` for a round trip that completed.
 fn prove(armed: &[Instance], out: &mut Out) -> Result<u64, String> {
-    // The caller's own session when an armed instance hosts it, else the first
-    // session of the first armed instance. No session is spawned.
     let own = std::env::var("ATERM_PARENT_SESSION_ID").ok();
     let mut choice: Option<(&Instance, String)> = None;
     for inst in armed {
@@ -2969,8 +2681,6 @@ fn prove(armed: &[Instance], out: &mut Out) -> Result<u64, String> {
             Err(format!("`{line}` answered {}", safe(r.header(), 256)))
         }
     };
-    // The newest row id before the post, so `await inbox` latches on the
-    // delivery and on nothing older.
     let before = ask(&mut ctl, &format!("@{sid} inbox 1 --peek --meta"))?;
     let since: u64 = before
         .rows()
@@ -3036,8 +2746,6 @@ fn prove(armed: &[Instance], out: &mut Out) -> Result<u64, String> {
     Ok(ms)
 }
 
-// on
-
 /// `aterm fabric on`.
 #[must_use]
 pub fn on(opts: &OnOpts) -> ExitCode {
@@ -3048,8 +2756,6 @@ pub fn on(opts: &OnOpts) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    // What this root already is, before anything is written ([`Role`]): the
-    // fleet it records is kept, and another is refused until `off`.
     let role = match Role::of(&p) {
         Ok(role) => role,
         Err(e) => {
@@ -3066,12 +2772,6 @@ pub fn on(opts: &OnOpts) -> ExitCode {
         }
         p.fleet = fleet.to_string();
     }
-    // The tier: `--durability`, else the one the installed job names, so a
-    // bare `on` that repairs a relaxed root restarts the broker it had, and a
-    // job that named strict keeps naming it. A job that names none runs the
-    // build's default. A host whose kernel names no boot runs relaxed too:
-    // astream moves the log's generation after every unclean stop there, the
-    // safe answer to not knowing ([`crate::durability`]).
     let (job_durability, durability_job) = match kept_durability(&p) {
         Ok(kept) => kept,
         Err(e) => {
@@ -3093,10 +2793,6 @@ pub fn on(opts: &OnOpts) -> ExitCode {
             ""
         }
     );
-    // A relaxed broker is said every run, with what its ack does not promise,
-    // and so is an ordered one, with what a power loss can take from it (and
-    // that astream serves it strict where the device cannot keep the order); a
-    // switch back to strict is said once, as the job it rewrites.
     let kept_from = match (opts.durability, &durability_job) {
         (None, Some(job)) => format!(", kept from {job}"),
         _ => String::new(),
@@ -3132,7 +2828,6 @@ pub fn on(opts: &OnOpts) -> ExitCode {
         _ => {}
     }
 
-    // The refusals that must come before anything is written.
     let sock = p.sock();
     if sock.len() >= SUN_PATH_MAX {
         out.fail(
@@ -3146,10 +2841,6 @@ pub fn on(opts: &OnOpts) -> ExitCode {
         return ExitCode::from(2);
     }
     let state = p.state();
-    // Every word the commands carry is plain: the root's paths, and the
-    // program — the aterm path itself, or the link to it in the root when the
-    // path is not plain ([`Paths::program`]), whose file name must then be.
-    // The fleet is a subject segment, checked when it was read.
     let checked = [
         sock.as_str(),
         &p.cap().to_string_lossy(),
@@ -3178,12 +2869,10 @@ pub fn on(opts: &OnOpts) -> ExitCode {
         }
     }
 
-    // 2. the root, and the program link in it when the aterm path needs one
     if !root_step(&p, &state, &mut out) || !program_step(&p, &mut out) {
         return ExitCode::from(2);
     }
 
-    // 3. the node id
     let node = match read_node(&state) {
         Some(n) => {
             out.already("node", &format!("{n} ({}/node)", state.display()));
@@ -3209,8 +2898,6 @@ pub fn on(opts: &OnOpts) -> ExitCode {
         }
     };
 
-    // 4. the mint secret — read through the one reader the broker and every
-    // mint use, so `already … (0600)` is a mode that was read, never assumed.
     let secret = p.secret();
     let secret_shown = secret.to_string_lossy().into_owned();
     match crate::transport::read_mint_secret(&secret_shown) {
@@ -3237,8 +2924,6 @@ pub fn on(opts: &OnOpts) -> ExitCode {
                 ),
                 &format!("minted {}", secret.display()),
             );
-            // Written by aterm-uds's private-file writer: the root is judged private
-            // (step 2's rule) again, as it stands, before a byte of the secret lands in it.
             if !opts.dry_run {
                 if let Err(e) = random_bytes(SECRET_LEN)
                     .and_then(|b| aterm_uds::private_file::write_private(&p.root, MINT_SECRET, &b))
@@ -3250,8 +2935,6 @@ pub fn on(opts: &OnOpts) -> ExitCode {
         }
     }
 
-    // 5. the cap file — this node's, under step 4's secret (a dry run that
-    // has yet to mint the secret re-mints any cap: it cannot be under it)
     let cap = p.cap();
     let cap_ok = if cap.exists() {
         crate::transport::read_mint_secret(&secret_shown)
@@ -3283,33 +2966,24 @@ pub fn on(opts: &OnOpts) -> ExitCode {
         }
     }
 
-    // 6. the broker. A dry run keeps going past one that does not answer —
-    // the point of a dry run is to see EVERY step — and exits 1 at the end.
     let broker_ok = broker_step(&p, &node, service, opts.durability.is_some(), &mut out);
     if !broker_ok && !opts.dry_run {
         return ExitCode::FAILURE;
     }
-    // 7–12: the config, the rendezvous file, the instances, the proof, the
-    // undo and the status.
     let argv = p.bridge_command(&node);
     finish(&p, &node, &argv, &mut out, opts.dry_run)
 }
 
 /// Steps 7–12 of `on`: write `[fabric] command` (atomically, with a `.bak`),
-/// write the rendezvous file, arm every running instance with `argv`, PROVE
-/// the round trip, print the undo scoped like this run, then the status. The
-/// exit code is this run's: the steps and the proof.
 fn finish(p: &Paths, node: &str, argv: &[String], out: &mut Out, dry_run: bool) -> ExitCode {
     let node = node.to_string();
     let state = p.state();
     let sock = p.sock();
     let cap = p.cap();
-    // 7. aterm.toml
     if !config_step(p.config.as_deref(), argv, out) {
         return ExitCode::FAILURE;
     }
 
-    // 8. the rendezvous file
     let rendezvous = Rendezvous {
         fleet: p.fleet.clone(),
         broker: sock.clone(),
@@ -3325,8 +2999,6 @@ fn finish(p: &Paths, node: &str, argv: &[String], out: &mut Out, dry_run: bool) 
         ),
         Some(path) => {
             let want = rendezvous.render();
-            // `already … (0600)` only for a mode that was read: the same bytes
-            // at a wider mode are written again, 0600.
             let private = {
                 use std::os::unix::fs::PermissionsExt;
                 std::fs::metadata(&path).is_ok_and(|m| m.permissions().mode() & 0o077 == 0)
@@ -3356,10 +3028,8 @@ fn finish(p: &Paths, node: &str, argv: &[String], out: &mut Out, dry_run: bool) 
         }
     }
 
-    // 9. the running instances
     let (running, armed) = arm_instances(argv, out);
 
-    // 10. the proof
     let (proof_failed, proof_ran) = if armed.is_empty() {
         out.note("proof", proof_skipped(running));
         (false, false)
@@ -3373,7 +3043,6 @@ fn finish(p: &Paths, node: &str, argv: &[String], out: &mut Out, dry_run: bool) 
         }
     };
 
-    // 11. the undo, scoped like this run was.
     if !dry_run {
         let program = if p.is_link_shim() {
             "aterm-link"
@@ -3431,8 +3100,6 @@ fn finish(p: &Paths, node: &str, argv: &[String], out: &mut Out, dry_run: bool) 
         );
     }
 
-    // 12. status. The exit code is this run's (the steps and the proof): the status's warnings
-    // are printed, but a session's unread mail does not fail an `on` that proved itself.
     println!();
     match fabric::gather() {
         Ok(report) => {
@@ -3454,7 +3121,6 @@ fn finish(p: &Paths, node: &str, argv: &[String], out: &mut Out, dry_run: bool) 
 }
 
 /// The verdict a successful run prints under a status that has warnings:
-/// they are the fabric's, not this run's failure. `None` with no warnings.
 fn done_despite(warnings: usize) -> Option<String> {
     match warnings {
         0 => None,
@@ -3465,12 +3131,7 @@ fn done_despite(warnings: usize) -> Option<String> {
     }
 }
 
-// off
-
 /// `off`'s config step: every `fabric` table removed from aterm.toml
-/// ([`remove_fabric_table`]), written as `on` writes it ([`ConfigFile`]) with
-/// the previous file kept as a `.bak` — `already` when there is none, and a
-/// dry run writes nothing.
 fn off_config_step(config: Option<&Path>, out: &mut Out) {
     let Some(config) = config else {
         out.note(
@@ -3484,7 +3145,6 @@ fn off_config_step(config: Option<&Path>, out: &mut Out) {
     };
     let file = match ConfigFile::open(config) {
         Ok(file) => file,
-        // A link that names no file: the app reads no command from it.
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
             out.already("config", &format!("{}: {e}", config.display()));
             return;
@@ -3560,17 +3220,12 @@ pub fn off(opts: &OffOpts) -> ExitCode {
             ""
         }
     );
-    // The held sessions, before anything stops (module doc, `off`).
     for (pid, sock, sid, origin) in held_sessions() {
         let shown = origin
             .as_deref()
             .map_or_else(|| "?".to_string(), |o| safe(o, 24));
         let slots = HoldSlots::of(origin.as_deref().unwrap_or(""));
         let lift = lift_hold(&sid, pid, sock.as_deref());
-        // One remedy per slot that stands, each lifting only its own: the
-        // person's Take Over, the fleet's halt, the owner's own hold. An
-        // origin the timeline no longer names reads as the fleet's, the one
-        // `off` cannot free for good.
         let mut remedies: Vec<String> = Vec::new();
         if slots.person {
             remedies.push(format!(
@@ -3614,7 +3269,6 @@ pub fn off(opts: &OffOpts) -> ExitCode {
                 );
                 if !opts.dry_run {
                     // By domain, with no legacy `unload` fallback: that acts
-                    // on the caller's domain and exits 0 whatever it did.
                     if loaded {
                         let domain = format!("gui/{}/{label}", uid());
                         if let Err(e) = launchctl(&["bootout", &domain]) {
@@ -3745,8 +3399,6 @@ pub fn off(opts: &OffOpts) -> ExitCode {
     }
 }
 
-// doctor
-
 /// Remedy for a broker/client protocol mismatch.
 fn protocol_remedy(again: &str) -> String {
     format!(
@@ -3781,9 +3433,6 @@ fn quoted_broker_fix(w: &str, again: &str) -> Option<String> {
         return None;
     }
     Some(if s(crate::cli::NEWER_LOG_REMEDY) {
-        // The broker's own line said a newer aterm wrote its log: never a
-        // repair — it would destroy records that release reads — and never a
-        // bare restart into the same refusal.
         format!(
             "the broker's log holds records in a format newer than this aterm reads: install \
              the aterm release that wrote them (or a later one), then {again} restarts the \
@@ -3791,21 +3440,13 @@ fn quoted_broker_fix(w: &str, again: &str) -> Option<String> {
         )
     } else if s(&format!(": {}", crate::broker_health::POISONED_EXIT_WORDS)) {
         // The broker left its poisoned log ([`crate::broker_health::poisoned_line`],
-        // whose opening words these are — they survive the quote's cut, which
-        // astream's reason at the line's end does not), and it is not back.
-        // Never a repair: the log is sound, only its open is spent.
         if s(crate::broker_health::UNSUPERVISED_WORDS) {
-            // No `aterm fabric on` job runs it: the line names the command
-            // that starts it again, which the quote may have cut.
             "the broker exited over a poisoned log, and no `aterm fabric on` job runs it: unless \
              something else restarts it, start it again with the command its line names (the \
              whole line is the last of broker.err); if it poisons again at once, the disk under \
              its log is failing flushes"
                 .to_string()
         } else {
-            // Its supervisor restarts it: launchd no sooner than ten seconds
-            // after its last start, systemd a second after the exit. One
-            // still down after that is one nothing restarted.
             format!(
                 "the broker exited over a poisoned log for its supervisor to reopen, and it is \
                  not back yet: launchd starts it again within ten seconds, systemd within one; \
@@ -3814,8 +3455,6 @@ fn quoted_broker_fix(w: &str, again: &str) -> Option<String> {
             )
         }
     } else if s(crate::cli::CORRUPT_LOG_REMEDY) {
-        // The broker's own line said its log has a corrupt record, and named
-        // the shipped repair with the log's path.
         format!(
             "the broker refuses its log for a corrupt record, and restarting it meets the same \
              refusal: run the `aterm link broker --repair <log>` the quoted line names — it \
@@ -3831,16 +3470,12 @@ fn quoted_broker_fix(w: &str, again: &str) -> Option<String> {
     })
 }
 
-/// The fix for one of `aterm fabric`'s warnings, matched on the words the
-/// warning is built from (`fabric::warnings`): every remedy that re-runs `on`
-/// is [`Role::again`], spelled with the fleet this root records.
+/// The fix for one of `aterm fabric`'s warnings, matched on the words the warning is built.
 #[must_use]
 pub fn fix_for(warning: &str, role: &Role) -> String {
     let w = warning;
     let s = |t: &str| w.contains(t);
     let again = role.again();
-    // The broker's own last word, wherever a warning quotes it: the broker's
-    // own warning, and a bridge's dial nothing answered on that broker.
     let quoted = quoted_broker_fix(w, &again);
     if s("speaks astream protocol") {
         protocol_remedy(&again)
@@ -3859,16 +3494,8 @@ pub fn fix_for(warning: &str, role: &Role) -> String {
         )
     } else if s(fabric::POISONED_WARNING) {
         // The broker itself says its log is poisoned (its `Hello`'s entry
-        // 0x04, [`crate::broker_health`]): nothing on this node is wrong and
-        // a re-minted cap cannot help, and `on` keeps a broker that answers
-        // its probe. The cure is the reopen, which a broker of this build
-        // makes itself by exiting; one still poisoned when this was read is
-        // inside those seconds, or predates the exit, or a hand-run one.
         POISONED_LOG_REMEDY.to_string()
     } else if s(fabric::FLUSH_FAILED_WARNING) {
-        // A count, not a verdict on what was lost: astream raises it before
-        // the disk work a poison waits on (`fabric::warnings`), so the fix
-        // names the disk and where to read whether the log was poisoned.
         "check the disk under the broker's log (Disk Utility's First Aid, or the system log's \
          I/O errors). A failed flush that put acked records at risk poisons the log, which a \
          broker of this build then exits to reopen: run `aterm fabric` again to see whether \
@@ -3885,28 +3512,17 @@ pub fn fix_for(warning: &str, role: &Role) -> String {
              ping` lands); if it does not, check the broker: {again}"
         )
     } else if s("broker link is down") {
-        // The warning carries the bridge's own `reason=`, so the one cause it
-        // names picks the one remedy.
         let reason = w
             .split("reason=")
             .nth(1)
             .and_then(|r| r.split([',', ' ', ')']).next())
             .unwrap_or("");
         let cause = match reason {
-            // Nothing listens — and when the broker's supervisor said why
-            // (`fabric::warnings` quotes its last word here, as on the
-            // broker's own warning), that line's remedy: a broker refusing its
-            // log meets the same refusal at every start.
             "no-socket" | "refused" => quoted.unwrap_or_else(|| {
                 format!("nothing listens at the broker's socket: {again} starts it")
             }),
             "no-ack" => format!("the broker accepts and never answers: {again} restarts it"),
             "expired" => renew_remedy(&again),
-            // The broker answers and its log takes no write until it is
-            // reopened ([`crate::broker_health`]): nothing on this node is
-            // wrong, and a re-minted cap cannot help. Nor does `on`: a
-            // poisoned broker still answers its probe (reads are served), so
-            // `on` keeps it — the remedy for one that stays is its process.
             "poisoned" => POISONED_LOG_REMEDY.to_string(),
             "attach" => format!(
                 "the broker refuses this node's cap: move <root>/node.cap aside and run {again}"
@@ -3923,7 +3539,6 @@ pub fn fix_for(warning: &str, role: &Role) -> String {
             "denied" => {
                 "the broker's socket refuses this user: check its owner and mode".to_string()
             }
-            // The bridge asked the broker before it reported: it answered.
             cut if cut.starts_with("cut-") => {
                 "the broker is up and ended one subscription (the face after `cut-`), as astream \
                  does to a reader that leaves its socket unread for the 30 s stream write bound: \
@@ -3978,11 +3593,6 @@ pub fn fix_for(warning: &str, role: &Role) -> String {
          it and publishes state=live"
             .to_string()
     } else if s("is HELD") {
-        // The warning names the hold's origin and reason when the timeline
-        // still has them, and that decides which remedy applies: one per slot
-        // that stands, each lifting only its own. `hold` acts only on the
-        // instance it reaches, so the command names that instance, as `off`
-        // does.
         let lift = lift_hold_in(w);
         let origin = w
             .split_whitespace()
@@ -4028,8 +3638,6 @@ pub fn fix_for(warning: &str, role: &Role) -> String {
          evicted records are still on the bus"
             .to_string()
     } else if s("passed its deadline") && s("@p passed") {
-        // A PERSON was asked (`post to=h-<name>`): no session holds it, so no
-        // `aterm ctl` reaches it.
         "a person was asked: `aterm fabric inbox --cap-file <their cap>` shows it, and `aterm \
          fabric post --cap-file <their cap> to=@<sid>@<node> kind=answer re=<off> <text>` \
          answers it (`aterm link notify --on ask:<person>` pages them next time)"
@@ -4087,32 +3695,21 @@ pub fn fix_for(warning: &str, role: &Role) -> String {
     }
 }
 
-/// What lifts a fleet halt, in the one sentence every surface that reports one
-/// uses: the person whose halt it is withdraws it, with the cap their halt was
-/// published under. The Owner's `hold <sid> off` is `ERR denied` for it, and
-/// `aterm fabric off` and a relaunch free a session only until the next `on`
-/// re-reads the row.
+/// What lifts a fleet halt, in the one sentence every surface that reports one uses.
 pub const FLEET_HALT_LIFT: &str = "the person who set it withdraws it: `aterm fabric halt \
      --cap-file <their cap> off` (a cap from `aterm fabric mint-for h-<name>`). `aterm fabric off` \
      and a relaunch free a session only until the next `fabric on` re-reads the halt row";
 
-/// What lifts the person's hold (`origin=person`, the window's Take Over):
-/// only their Hand Back at the window. No command reaches that slot — the
-/// wire refuses `origin=person`, and an Owner or bridge `hold off` lifts only
-/// its own slot (`OK hold=1`).
+/// What lifts the person's hold (`origin=person`, the window's Take Over).
 pub const PERSON_HOLD_LIFT: &str = "the person at the window took it over (Take Over): their \
      Hand Back there lifts it, and no command does";
 
-/// What lifts another Mac's hold (`origin=remote`, the step-in): that Mac's
-/// own `hold <sid> off` over the fleet, or the person here, whose Take Over
-/// takes it and whose Hand Back lifts it. An Owner or bridge `hold off` here
-/// lifts only its own slot (`OK hold=1`).
+/// What lifts another Mac's hold (`origin=remote`, the step-in).
 pub const REMOTE_HOLD_LIFT: &str = "another Mac holds it over the fleet: that Mac's `aterm ctl \
      --host <this Mac> hold <sid> off` lifts it, or the person here takes it with Take Over and \
      hands it back; no command here does";
 
 /// Which hold slots an `origin=` / `hold_origin=` list names (`person`,
-/// `remote`, `fleet`, `local`, comma-joined), each read as a whole word.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct HoldSlots {
     person: bool,
@@ -4134,8 +3731,6 @@ impl HoldSlots {
 }
 
 /// The command that lifts a local hold, for the HELD warning `warning` —
-/// `@<sid> (instance <pid>) is HELD …`, or `@<sid> (instance <pid>, --sock
-/// <sock>) is HELD …` for an instance only its socket reaches.
 fn lift_hold_in(warning: &str) -> String {
     let (sid, at) = warning
         .strip_prefix('@')
@@ -4149,8 +3744,6 @@ fn lift_hold_in(warning: &str) -> String {
 }
 
 /// What `on` says it does to one instance: the `fabric attach` it sends, spelled as a
-/// person would run it — by `--sock` when `--pid` does not reach the instance
-/// ([`aterm_ctl::pid_reaches`]), as `off` and doctor name it.
 fn arm_command(pid: u32, sock: &str, argv: &[String]) -> String {
     let reach = instance_flag(pid, (!aterm_ctl::pid_reaches(pid, sock)).then_some(sock));
     format!(
@@ -4160,9 +3753,6 @@ fn arm_command(pid: u32, sock: &str, argv: &[String]) -> String {
 }
 
 /// The argv of a `fabric attach` a person can paste: each word as the verb
-/// reads it (`aterm_codec::pct::encode_word`, a space spelled `%20`), and
-/// single-quoted where a shell would not read it as one word
-/// ([`fabric::shell_word`]). A plain argv is its plain join.
 fn attach_words(argv: &[String]) -> String {
     argv.iter()
         .map(|w| fabric::shell_word(&aterm_codec::pct::encode_word(w)))
@@ -4171,7 +3761,6 @@ fn attach_words(argv: &[String]) -> String {
 }
 
 /// `aterm ctl <instance> hold <sid> off`, the instance named by [`instance_flag`].
-/// A sid a command line cannot carry as it is stays a placeholder.
 fn lift_hold(sid: &str, pid: u32, sock: Option<&str>) -> String {
     let sid = if plain_arg(sid, b"") { sid } else { "<sid>" };
     format!("`aterm ctl {} hold {sid} off`", instance_flag(pid, sock))
@@ -4186,9 +3775,6 @@ fn plain_arg(t: &str, more: &[u8]) -> bool {
 }
 
 /// How `aterm ctl` names an instance: `--pid <pid>`, or `--sock <sock>` when only its
-/// socket reaches it (`sock` is `Some`). A socket path with a space is single-quoted;
-/// one that cannot be quoted (a quote, a backslash, a control character), or pid 0,
-/// stays a placeholder.
 fn instance_flag(pid: u32, sock: Option<&str>) -> String {
     match sock {
         Some(sock) if plain_arg(sock, b"/+~@%,:=") => format!("--sock {sock}"),
@@ -4206,10 +3792,6 @@ fn instance_flag(pid: u32, sock: Option<&str>) -> String {
 }
 
 /// `--retire-ghosts`: publish `exited` for every presence row this machine's nodes advertise live
-/// that no local instance hosts (dry by default; publishes on `y` or `--yes`).
-///
-/// Routes each node's rows through its running local bridge ([`publisher_for`]), or publishes
-/// directly under `StateDir::lock_bridge` when no bridge for that node is running here.
 fn retire_ghosts_action(yes: bool) -> ExitCode {
     let report = match fabric::gather() {
         Ok(r) => r,
@@ -4218,8 +3800,6 @@ fn retire_ghosts_action(yes: bool) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    // The gate `status` uses: an instance that did not answer is in the report with no
-    // sessions, so every live row on this node would read unhosted, its own included.
     let silent = fabric::unanswered(&report);
     if !silent.is_empty() {
         println!(
@@ -4252,9 +3832,6 @@ fn retire_ghosts_action(yes: bool) -> ExitCode {
     for (sid, node) in &ghosts {
         println!("  @{} on {}", safe(sid, 64), safe(node, 64));
     }
-    // Each node's rows go to that node's publisher: a running bridge of it owns
-    // the publish, so it is asked to do it. The listing is the whole value of
-    // a dry run and costs nothing either way.
     let mut by_node: BTreeMap<&str, Vec<(String, String)>> = BTreeMap::new();
     for (sid, node) in &ghosts {
         by_node
@@ -4312,20 +3889,15 @@ fn retire_ghosts_action(yes: bool) -> ExitCode {
 /// Who may publish `exited` over a row of `node` ([`publisher_for`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Publisher {
-    /// The running bridge of the instance at this pid, which answers as the
-    /// node.
+    /// The running bridge of the instance at this pid, which answers as the node.
     Bridge(u32),
-    /// This command: the node is its state dir's, and no bridge of it is up.
+    /// This command: the node is its state dir's, and no bridge of it.
     Itself,
-    /// Nothing here: no bridge of the node is up, and this command's state
-    /// dir is another node's.
+    /// Nothing here: no bridge of the node is up, and this command's state dir is another.
     Nobody,
 }
 
 /// The publisher of `node`'s retirements: a running bridge of THAT node
-/// ([`running_bridge`]), else this command when its state dir names the node
-/// (its lock still refuses one a bridge this report missed holds), else
-/// nobody — a node publishes as itself, and only its own cap grants its faces.
 fn publisher_for(report: &fabric::Report, node: &str) -> Publisher {
     match running_bridge(&report.instances, node) {
         Some(pid) => Publisher::Bridge(pid),
@@ -4345,7 +3917,6 @@ fn nobody_publishes(node: &str) -> String {
 }
 
 /// Ask the instance at `pid` to retire `node`'s ghost rows (`fabric retire <sid>…`) and poll the
-/// bus until every row is `exited`, refused, or [`RETIRE_WAIT`] elapses.
 fn retire_through_bridge(
     report: &fabric::Report,
     pid: u32,
@@ -4388,12 +3959,8 @@ fn retire_through_bridge(
     let mut done = 0;
     let deadline = std::time::Instant::now() + RETIRE_WAIT;
     let mut pending: Vec<&str> = sids.clone();
-    // The report's bus head predates the request, so a refusal at or after it
-    // answers this run and never an earlier one.
     let since = report.broker.head;
     let mut refused = BTreeMap::new();
-    // Whether the last poll read the bridge's refusals through to the head: only then does
-    // "not refused" rest on something read.
     let mut refusals_read = false;
     while !pending.is_empty() && std::time::Instant::now() < deadline {
         std::thread::sleep(std::time::Duration::from_millis(200));
@@ -4434,25 +4001,10 @@ fn retire_through_bridge(
 const RETIRE_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// The pid of a local instance whose bridge is up AND answers as `node`, if
-/// one is. Only its own node's: a bridge retires a row only on its own node's
-/// face, and drops another node's request unrefused
-/// (`Bridge::retire_on_request`). An instance whose node this report could not
-/// read is nobody's — the state dir's lock, which `fabric::publish_exited`
-/// takes, is what then refuses a CLI beside a bridge it missed.
 fn running_bridge(instances: &[fabric::InstanceView], node: &str) -> Option<u32> {
     instances
         .iter()
         .find(|i| {
-            // A bridge process is a bridge, whatever its link is doing.
-            // `bridge_pids` is the observed truth — a child that exists — and
-            // it settles the two cases the state words miss: a `stale` link
-            // (connected, owing an answer) and a bridge whose `fabric status`
-            // gave no state word. Either one still owns this node's publish
-            // sequence.
-            //
-            // Except one that stands by (`bridge::hold_state_dir`): it owns
-            // nothing until the holder exits, and a `fabric retire` asked of it
-            // is taken, never published, and waited out to "unretired".
             i.node.as_deref() == Some(node)
                 && i.reason.as_deref() != Some("state-locked")
                 && (!i.bridge_pids.is_empty()
@@ -4463,11 +4015,8 @@ fn running_bridge(instances: &[fabric::InstanceView], node: &str) -> Option<u32>
 }
 
 /// A y/N on a terminal stdin: anything but `y`/`yes`, or no terminal, is no, so an unattended
-/// run never retires a row.
 fn confirmed() -> bool {
     use std::io::{IsTerminal as _, Write as _};
-    // A terminal or nothing: a piped `y` is not consent, and an inherited idle pipe (cron, CI)
-    // would park `read_line` for ever. Without a terminal, `--yes` is the only yes.
     if !std::io::stdin().is_terminal() {
         println!("  stdin is not a terminal: taking that as NO (pass --yes to mean yes)");
         return false;
@@ -4487,8 +4036,6 @@ pub fn doctor(retire_ghosts: bool, yes: bool) -> ExitCode {
     if retire_ghosts {
         return retire_ghosts_action(yes);
     }
-    // What this host is to its fleet, read from the root the fabric is on —
-    // every remedy below is spelled for it.
     let role = match Paths::resolve_for_off()
         .and_then(|(p, _)| Role::of(&p).map_err(|e| e.to_string()))
     {
@@ -4502,7 +4049,6 @@ pub fn doctor(retire_ghosts: bool, yes: bool) -> ExitCode {
     };
     match fabric::gather() {
         Err(off) => {
-            // The state, then the remedy once, in the `fix:` shape every finding uses.
             println!("{}", off.state());
             println!(
                 "  fix: {} (`--dry-run` first shows every step)",
@@ -4526,9 +4072,6 @@ pub fn doctor(retire_ghosts: bool, yes: bool) -> ExitCode {
                 safe(&report.cfg.fleet, 64),
                 report.node.as_deref().unwrap_or("-")
             );
-            // A fact too: what an ack from this host's broker promises — the
-            // tier its process names ([`fabric::BrokerView::durability`]) as
-            // the broker itself says it serves it ([`fabric::BrokerView::served`]).
             if let Some(d) = report.broker.tier() {
                 println!(
                     "  durability: {} — {}",
@@ -4540,12 +4083,6 @@ pub fn doctor(retire_ghosts: bool, yes: bool) -> ExitCode {
                     )
                 );
             }
-            // And the log's health: the broker's own word in its `Hello`
-            // (entry 0x04 — poisoned or not, and its flushes), then what the
-            // log holds, from astream's snapshot beside it, said as the serving
-            // broker's own only when astream's reader says so
-            // ([`crate::broker_health`]). A poisoned log, and a failed flush,
-            // are warnings below as well, each with its fix.
             if let Some(row) = fabric::health_row(&report.broker) {
                 println!("  health: {row}");
             }
@@ -4576,15 +4113,6 @@ mod tests {
     }
 
     /// A bridge process is a bridge, whatever its link is doing. The
-    /// refusal exists because a running bridge owns this node's publish
-    /// sequence, and that is true of a bridge whose link went `stale` and of
-    /// one whose `fabric status` this report could not read. `bridge_pids` is
-    /// the observed truth — a child that exists — so it decides first.
-    ///
-    /// And it is only its own node's: a bridge retires a row only on its
-    /// own node's face (`Bridge::retire_on_request`), so another node's rows
-    /// are never sent to it. Negative control: the same instance asked for its
-    /// own node is its bridge.
     #[test]
     fn running_bridge_sees_a_stale_one_and_a_bare_pid() {
         let inst = |fabric: Option<&str>, supervised, pids: Vec<u32>| fabric::InstanceView {
@@ -4614,8 +4142,6 @@ mod tests {
             None
         );
         assert_eq!(running_bridge(&[], "n-a"), None);
-        // Another node's bridge is not this node's, however alive: a ghost
-        // node's rows are never sent to it.
         assert_eq!(
             running_bridge(&[inst(Some("connected"), Some(true), vec![99])], "n-ghost"),
             None,
@@ -4630,8 +4156,6 @@ mod tests {
             None,
             "a bridge whose node was not read is nobody's: the state dir's lock decides"
         );
-        // A bridge standing by for the state dir owns no sequence: the
-        // holder is asked, wherever the two sit in the listing.
         let standby = fabric::InstanceView {
             pid: 7,
             reason: Some("state-locked".to_string()),
@@ -4651,10 +4175,6 @@ mod tests {
     }
 
     /// A planted name is never written through. A file written into a
-    /// directory another user writes: a symlink planted at a guessable temp
-    /// name and its target are untouched, the file lands as a regular 0600
-    /// one, and no temp is left behind. A symlink at the path itself is
-    /// replaced by the rename — its target is never written either.
     #[test]
     fn write_atomic_never_writes_through_a_planted_name() {
         use std::os::unix::fs::PermissionsExt;
@@ -4700,7 +4220,6 @@ mod tests {
             ],
             "a temp was left behind"
         );
-        // A symlink at the path is replaced; its target is never written.
         let target = dir.join("elsewhere");
         std::fs::write(&target, "untouched\n").expect("target");
         let linked = shared.join("fabric.toml");
@@ -4741,9 +4260,6 @@ mod tests {
     }
 
     /// Step 2 judges the root and its state directory by aterm-uds's private-directory
-    /// rule. A dry run changes nothing; a missing state directory is made 0700; a root open
-    /// by its mode is narrowed; a second run reads `already`. A symlinked root is refused, and
-    /// nothing is made through it.
     #[test]
     fn the_root_step_makes_narrows_or_refuses_by_the_private_directory_rule() {
         use std::os::unix::fs::PermissionsExt as _;
@@ -4779,10 +4295,6 @@ mod tests {
     }
 
     /// On macOS a 0700 root carrying an `everyone allow read` entry is open to every user
-    /// though its mode says otherwise: step 2 refuses it, dry or not, and makes no state
-    /// directory in it; the mint secret's writer refuses that root as well. Once `chmod -N`
-    /// removes the entry, the same step passes and the secret is written 0600: the negative
-    /// control.
     #[cfg(target_os = "macos")]
     #[test]
     fn the_root_step_refuses_a_root_an_access_list_opens_to_others() {
@@ -4828,7 +4340,6 @@ mod tests {
     }
 
     /// Any root but the default derives its label from POSIX `cksum` of its path (the expected
-    /// value is what `printf '%s' <path> | cksum` prints).
     #[test]
     fn the_label_is_derived_from_the_root_with_posix_cksum() {
         assert_eq!(
@@ -4856,7 +4367,6 @@ mod tests {
     }
 
     /// The plain label is the login user's default root's alone; a redirected `$HOME` or an
-    /// unknown login home derives one.
     #[test]
     fn review_two_roots_never_share_a_label() {
         let paths = |home: &str, login: Option<&str>| Paths {
@@ -4877,14 +4387,10 @@ mod tests {
             redirected.label(),
             format!("{LABEL}.{}", cksum(b"/tmp/x/.local/share/aterm-fabric"))
         );
-        // The login home unknown: nothing is the default root.
         assert_ne!(paths("/Users//example", None).label(), LABEL);
     }
 
     /// THE LOGIN HOME AND THE UID ARE THE ONES `id` AND THE SHELL ANSWER, on
-    /// the live machine, though no child is run for them: [`login_home`] is
-    /// `~$(id -un)` as `sh` expands it with no `$HOME` to read, and [`uid`] is
-    /// `id -u`. A test-only oracle; `$HOME` decides neither.
     #[cfg(unix)]
     #[test]
     fn the_login_home_and_uid_are_what_id_and_the_shell_answer() {
@@ -4913,16 +4419,6 @@ mod tests {
     }
 
     /// The tier is in the job. A named tier rides after the secret, on both
-    /// wires — `--durability relaxed`, and `--durability strict` too, so a job
-    /// that chose strict keeps it under a build whose default differs — and a
-    /// job that names none carries nothing, and runs the build's default:
-    /// ordered for this guarded broker (served strict where astream cannot
-    /// keep the order). A bare job an earlier `on` wrote is still current,
-    /// and moves to that default when its broker next starts under this build.
-    /// A switch is "the job changed" and restarts the broker. The socket still follows
-    /// `broker`, which is how the process table finds it. A bare `on` keeps the
-    /// tier the installed job names (none, strict, ordered or relaxed), and
-    /// with no job it names none.
     #[test]
     fn the_tier_is_in_the_job_and_a_bare_on_keeps_it() {
         use crate::durability::Durability;
@@ -4946,9 +4442,6 @@ mod tests {
         assert_eq!(argv[argv.len() - 2..], ["--durability", "relaxed"]);
         assert!(!bare.broker_argv().iter().any(|w| w == "--durability"));
         assert_eq!(bare.broker_argv()[..], argv[..argv.len() - 2]);
-        // The build's default for the broker `on` writes, which always names
-        // its mint secret: ordered, on every platform (astream serves it
-        // strict where the device cannot keep the order, and says so).
         assert_eq!(
             bare.tier(),
             Durability::Ordered,
@@ -4976,8 +4469,6 @@ mod tests {
         assert_eq!(Durability::of_argv(&argv), Durability::Relaxed);
         assert!(unit_argv(&relaxed.unit_text()).is_some_and(|w| w == argv));
 
-        // Kept: no job names nothing, kept from nothing; each job names what
-        // it was written with, a bare one nothing.
         assert_eq!(kept_durability(&bare), Ok((None, None)));
         std::fs::create_dir_all(&bare.root).unwrap();
         for tier in [Durability::Relaxed, Durability::Ordered, Durability::Strict] {
@@ -4991,13 +4482,6 @@ mod tests {
     }
 
     /// A broker running another tier is not current: one whose process runs
-    /// another `--durability` than the tier `on` asks for — a switch either
-    /// way that the running broker never took — is named, so the supervisor
-    /// restarts it (or, under `--service none`, the warning says how). One
-    /// running the tier asked for, or whose process this host cannot read
-    /// (no tier: a remote broker, no `ps`), is current on that count; a bare
-    /// job asks for the build's default, which a named strict one is not on
-    /// macOS. A replaced build and an unguarded broker are named first.
     #[test]
     fn a_broker_running_another_tier_is_not_current() {
         use crate::durability::Durability;
@@ -5037,10 +4521,6 @@ mod tests {
             durability: None,
             ..p(strict)
         };
-        // A bare job asks for the build's default (ordered for this guarded
-        // broker): a broker running it is current, and one running the other
-        // is not — a named strict job an earlier `on` wrote is NOT what a bare
-        // one asks for.
         let default = crate::durability::default_for(true);
         assert_eq!(not_current(&bare, &view(Some(default))), None);
         if default != strict {
@@ -5062,9 +4542,6 @@ mod tests {
     }
 
     /// The plist runs the broker directly — the words, one `<string>` each,
-    /// no `/bin/sh -c` — and is valid XML for any path; it reads as current in
-    /// any layout, so `on` does not restart a healthy broker for its spelling;
-    /// a foreign argv is not current.
     #[test]
     fn the_plist_runs_the_broker_directly_and_reads_as_current_in_any_layout() {
         let p = Paths {
@@ -5092,7 +4569,6 @@ mod tests {
             ),
             "{text}"
         );
-        // The same job without `--secret-file` is not current.
         let unguarded = text.replace(
             "    <string>--secret-file</string>\n    \
              <string>/Users//example/.local/share/aterm-fabric/mint.secret</string>\n",
@@ -5112,7 +4588,6 @@ mod tests {
             plist_program_arguments(&text).as_deref(),
             Some(p.broker_argv().as_slice())
         );
-        // plistlib's layout (tabs, key and value on separate lines, keys sorted): current too.
         let plistlib = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plist version=\"1.0\">\n<dict>\n\
              \t<key>KeepAlive</key>\n\t<true/>\n\
              \t<key>Label</key>\n\t<string>systems.alab.astream-broker</string>\n\
@@ -5124,7 +4599,6 @@ mod tests {
              \t\t<string>/Users//example/.local/share/aterm-fabric/mint.secret</string>\n\t</array>\n\
              \t<key>RunAtLoad</key>\n\t<true/>\n</dict>\n</plist>\n";
         assert!(p.plist_is_current(plistlib));
-        // Another broker, another label, or no KeepAlive: not this job.
         assert!(!p.plist_is_current(&text.replace("bus.log", "other.log")));
         assert!(!p.plist_is_current(
             &text.replace("astream-broker</string>", "astream-broker.1</string>")
@@ -5134,7 +4608,6 @@ mod tests {
             "<key>KeepAlive</key><false/>"
         )));
         assert!(!p.plist_is_current("<plist/>"));
-        // A `&` or `<` in a path is escaped and reads back as itself.
         let odd = Paths {
             root: PathBuf::from("/tmp/a&b<c"),
             login_home: None,
@@ -5152,7 +4625,6 @@ mod tests {
             plist_program_arguments(&collapse_between_tags(&odd_text)).expect("argv")[3],
             "/tmp/a&b<c/bus.sock"
         );
-        // The shim spells the broker without `link`.
         let shim = Paths {
             aterm: "/x/target/debug/aterm-link".to_string(),
             ..p.clone()
@@ -5168,11 +4640,8 @@ mod tests {
                 "/Users//example/.local/share/aterm-fabric/mint.secret"
             ]
         );
-        // The unit runs the same guarded words and unlinks no socket first.
         let unit = p.unit_text();
         assert!(!unit.contains("rm -f"), "{unit}");
-        // Its stderr lands where the launchd job's does, the file whose last
-        // line `aterm fabric` and doctor quote.
         assert!(
             unit.contains(
                 "\nStandardError=append:/Users//example/.local/share/aterm-fabric/broker.err\n"
@@ -5230,7 +4699,6 @@ mod tests {
             PathBuf::from(format!("/tmp/atfo-x/root/{}.plist", redirected.label()))
         );
         assert!(!redirected.plist().starts_with("/Users//example/Library"));
-        // `$HOME`'s default root under another login home is not the default root.
         let foreign = Paths {
             home: PathBuf::from("/tmp/x"),
             ..p("/tmp/x/.local/share/aterm-fabric", Some("/Users//example"))
@@ -5238,8 +4706,6 @@ mod tests {
         assert!(foreign
             .plist()
             .starts_with("/tmp/x/.local/share/aterm-fabric/"));
-        // Even the default root's plist leaves the login user's LaunchAgents
-        // directory when HOME is redirected.
         let redirected_home = Paths {
             home: PathBuf::from("/tmp/x"),
             ..installed
@@ -5261,7 +4727,6 @@ mod tests {
                 && absent.contains("launchctl print gui/501/systems.alab.astream-broker.7"),
             "{absent}"
         );
-        // systemd's falls back to the journal, where an older unit wrote.
         let absent = systemd_failure_hint(&dir, "astream-broker-7");
         assert!(
             absent.contains("broker.err was not written")
@@ -5272,7 +4737,6 @@ mod tests {
         assert!(launchd_failure_hint(&dir, "l", "501").contains("was not written"));
         std::fs::write(dir.join("broker.err"), " \n\n").expect("blank");
         assert_eq!(supervisor_last_word(&dir), None, "whitespace is not a word");
-        // The last line of a file every start of the job appended to.
         std::fs::write(
             dir.join("broker.err"),
             "bind: address in use\naterm link broker: open bus.log: refused\n\n",
@@ -5321,8 +4785,6 @@ mod tests {
     }
 
     /// The edit replaces only the `command` key (single- or multi-line), adds `receipts = true`
-    /// once when absent, appends a table when there is none, and is a no-op when the file
-    /// already says it.
     #[test]
     fn the_config_edit_touches_only_the_command_key() {
         let line = "aterm link serve --fleet local --broker /b.sock";
@@ -5338,24 +4800,19 @@ mod tests {
         );
         assert_eq!(fabric::command_in_toml(&after), Ok(Some(cmd.clone())));
         assert_eq!(fabric::receipts_in_toml(&after), Ok(Some(true)));
-        // Idempotent.
         assert!(!set_fabric_command(&after, cmd).expect("ok").1);
-        // An operator's `receipts = false` stands: the same command over it is
-        // a no-op, and a changed command keeps it.
         let off = format!("[fabric]\ncommand = \"{line}\"\nreceipts = false\n");
         assert!(!set_fabric_command(&off, cmd).expect("ok").1);
         let (after, _) =
             set_fabric_command(&off, &words("aterm link serve --fleet x --broker /y")).expect("ok");
         assert_eq!(fabric::receipts_in_toml(&after), Ok(Some(false)));
         assert_eq!(after.matches("receipts").count(), 1);
-        // A multi-line command is replaced whole.
         let multi = "[fabric]\ncommand = \"\"\"aterm link serve --fleet x \\\n   --broker /y\"\"\"\nk = 1\n[z]\n";
         let (after, _) = set_fabric_command(multi, cmd).expect("ok");
         assert_eq!(
             after,
             format!("[fabric]\ncommand = \"{line}\"\nreceipts = true\nk = 1\n[z]\n")
         );
-        // No table: appended after a blank line, with the note.
         let (after, changed) = set_fabric_command("font_px = 1.0\n", cmd).expect("ok");
         assert!(changed);
         assert!(after.starts_with("font_px = 1.0\n\n[fabric]\n# Written by `aterm fabric on`"));
@@ -5363,16 +4820,12 @@ mod tests {
         assert_eq!(fabric::receipts_in_toml(&after), Ok(Some(true)));
         let (after, _) = set_fabric_command("", cmd).expect("ok");
         assert!(after.starts_with("[fabric]\n"));
-        // A file that is not TOML is refused, not edited.
         assert!(set_fabric_command("[fabric\ncommand = \"x\"\n", cmd).is_err());
-        // A dotted spelling is refused, not doubled.
         assert!(set_fabric_command("fabric.command = \"x\"\n", cmd).is_err());
         assert!(set_fabric_command("fabric = { command = \"x\" }\n", cmd).is_err());
-        // A dotted key inside another table is that table's business.
         let (after, _) = set_fabric_command("[other]\nfabric.command = \"x\"\n", cmd).expect("ok");
         assert!(after.contains("[other]\nfabric.command = \"x\"\n\n[fabric]\n"));
 
-        // Removal drops the table and nothing else.
         let (after, removed) = remove_fabric_table(before).expect("ok");
         assert_eq!(removed, ["[fabric]"]);
         assert_eq!(after, "font_px = 12.0\n\n[keys]\nx = 1\n");
@@ -5384,13 +4837,11 @@ mod tests {
         let (after, _) =
             remove_fabric_table("[fabric]\ncommand = \"x\"\n[keys]\nx = 1\n").expect("ok");
         assert_eq!(after, "[keys]\nx = 1\n");
-        // Every `[fabric.<sub>]` table too, wherever it sits, each header named in file order.
         let subs = "[fabric.presence]\nx = 1\n[a]\ny = 2\n[fabric] # on\ncommand = \"x\"\n[fabric.more]\nz = 3\n[keys]\nk = 1\n";
         let (after, removed) = remove_fabric_table(subs).expect("ok");
         assert_eq!(removed, ["[fabric.presence]", "[fabric]", "[fabric.more]"]);
         assert_eq!(after, "[a]\ny = 2\n[keys]\nk = 1\n");
         assert!(fabric::command_in_toml(&after).expect("valid").is_none());
-        // A subtable alone is a fabric table too; `[fabrics]` is not.
         assert_eq!(
             remove_fabric_table("[fabric.presence]\nx = 1\n"),
             Ok((String::new(), vec!["[fabric.presence]".to_string()]))
@@ -5399,8 +4850,6 @@ mod tests {
             .expect("ok")
             .1
             .is_empty());
-        // Not TOML: refused, since a malformed `[keys` ends no table and a removal would take
-        // the person's own lines.
         for broken in [
             "[fabric]\ncommand = \"x\"\n[keys\nbind = \"y\"\n[update]\nenabled = false\n",
             "[fabric]\ncommand = \"x\"\n[[keys]\nbind = \"y\"\n[update]\nenabled = false\n",
@@ -5410,8 +4859,6 @@ mod tests {
     }
 
     /// Every TOML spelling of the table and key (`[ fabric ]`, `["fabric"]`, a quoted
-    /// `"command"`) is edited in place, never doubled, and `off` removes it. What the editor
-    /// cannot place (a header-shaped line in a string, a dotted `fabric.command`) is refused.
     #[test]
     fn the_config_edit_reads_headers_and_keys_the_way_toml_does() {
         let cmd = &words("aterm link serve --fleet local --broker /b.sock");
@@ -5443,8 +4890,6 @@ mod tests {
     }
 
     /// aterm.toml is written through a final-file link (link kept, `.bak` beside the file it
-    /// names), under the service's write lock for the write alone, and never over bytes that
-    /// changed since the read.
     #[test]
     fn the_config_is_written_through_its_link_under_the_service_lock() {
         let dir = aterm_tempfile::tempdir().expect("scratch");
@@ -5475,7 +4920,6 @@ mod tests {
             aterm_uds::ownerlock::probe(&lock),
             aterm_uds::ownerlock::Owner::Live
         );
-        // A writer that ignores the lock lands between the read and the write.
         std::fs::write(&target, "font_px = 18.0\n").expect("the other writer");
         edit.replace("font_px = 9.0\n")
             .expect_err("changed under it");
@@ -5483,12 +4927,10 @@ mod tests {
             std::fs::read_to_string(&target).expect("target"),
             "font_px = 18.0\n"
         );
-        // Refused before the `.bak` too: the older one is kept.
         assert_eq!(
             std::fs::read_to_string(dotfiles.join("aterm.toml.bak")).expect("bak"),
             "font_px = 12.0\n"
         );
-        // `replace` let the lock go when it returned, refused or not.
         assert_eq!(
             aterm_uds::ownerlock::probe(&lock),
             aterm_uds::ownerlock::Owner::Dead
@@ -5502,7 +4944,6 @@ mod tests {
     }
 
     /// A no-op `on` or `off` through a link into a read-only directory (home-manager's
-    /// `/nix/store`) reads `already` and leaves nothing there, not even a lock.
     #[test]
     fn a_no_op_through_a_link_into_a_read_only_dir_reads_already() {
         use std::os::unix::fs::PermissionsExt;
@@ -5567,8 +5008,6 @@ mod tests {
             ..r.clone()
         };
         assert_eq!(Rendezvous::parse(&odd.render()), Ok(odd));
-        // A hand-written ARGV reads back whole — `on` never writes one, but
-        // the file is read in either spelling `[fabric] command` takes.
         let text = r.render().replace(
             "command = \"/x/aterm link serve --fleet local --broker /tmp/x/bus.sock\"",
             "command = [\"/a b/aterm\", \"link\", \"serve\"]",
@@ -5589,10 +5028,6 @@ mod tests {
     #[test]
     fn the_eight_grants_are_the_node_ring() {
         let g = node_grants("local", "n-a");
-        // The whole list, in order: SPECS.md's `node-and-person-grants` row
-        // says "exactly … in that order", so a grant added, dropped, widened
-        // or moved fails here — not only one at an index this happened to
-        // look at.
         assert_eq!(
             g,
             [
@@ -5606,8 +5041,6 @@ mod tests {
                 "rw,p=n-a:/f/local/term/n-a/*/screen",
             ]
         );
-        // Another fleet and node are spelled into every grant that names
-        // them, and into no other.
         let other = node_grants("lab", "n-b");
         assert_eq!(
             other,
@@ -5618,17 +5051,10 @@ mod tests {
         assert_eq!(g.len(), 8);
         assert_eq!(g.iter().filter(|x| x.contains("p=n-a:")).count(), 4);
         assert_eq!(g.iter().filter(|x| x.starts_with("ro:")).count(), 4);
-        // Six name the node: the four it writes as, and its inbox and drive-face reads.
         assert_eq!(g.iter().filter(|x| x.contains("n-a")).count(), 6);
     }
 
     /// Argv safety: a word every command `on` writes carries is plain — no
-    /// whitespace (the line is split on it, `ps` finds the broker by its
-    /// socket word), no quote of either kind or backslash (the systemd unit's
-    /// quoted `sh -c` script), no `%` or `$` (systemd expands them; an
-    /// attach line's `%` reads two ways) and no control character; a
-    /// non-ASCII letter is plain. Negative control: each refused word with its
-    /// one bad character taken out is accepted.
     #[test]
     fn a_word_no_supervisor_job_can_carry_is_refused() {
         for ok in [
@@ -5661,12 +5087,6 @@ mod tests {
     }
 
     /// An aterm path that is not plain runs through a link in the root: the
-    /// dev app's `…/aterm (dev).app/…`, and a path with a `'` (which would
-    /// close the systemd unit's quote early), are `<root>/bin/aterm` in the
-    /// bridge command, the broker argv, the plist and the unit — every word
-    /// plain, the unit's words read back — and the shim keeps its
-    /// name. Negative control: a plain path is its own program, the bytes
-    /// every earlier `on` wrote.
     #[test]
     fn an_aterm_path_that_is_not_plain_runs_through_a_link_in_the_root() {
         let p = |aterm: &str| Paths {
@@ -5711,16 +5131,12 @@ mod tests {
             "/Users//u/.local/share/aterm-fabric/bin/aterm-link"
         );
         assert_eq!(shim.bridge_command("n-a")[1], "serve");
-        // Negative control: a plain path is its own program.
         let plain = p("/Users//u/.local/bin/aterm");
         assert_eq!(plain.program(), "/Users//u/.local/bin/aterm");
         assert_eq!(plain.broker_argv()[0], "/Users//u/.local/bin/aterm");
     }
 
     /// `on`'s program step makes the link, says `already` when it points at
-    /// the aterm path, re-points one that points elsewhere, and never replaces
-    /// a file that is not a link; a plain path makes nothing. The link reads
-    /// the file it names.
     #[test]
     fn the_program_step_links_a_path_that_is_not_plain_and_replaces_no_file() {
         let scratch = aterm_tempfile::tempdir().expect("exclusive scratch");
@@ -5743,7 +5159,6 @@ mod tests {
         };
         std::fs::create_dir(&p.root).expect("the root step precedes the program step");
         let link = p.program_link();
-        // A dry run makes nothing.
         assert!(program_step(&p, &mut Out::new(true)));
         assert!(std::fs::symlink_metadata(&link).is_err());
         let mut out = Out::new(false);
@@ -5757,20 +5172,16 @@ mod tests {
         let mut again = Out::new(false);
         assert!(program_step(&p, &mut again));
         assert_eq!(again.changed, 0, "already");
-        // One pointing elsewhere is re-pointed.
         std::fs::remove_file(&link).expect("unlink");
         std::os::unix::fs::symlink("/elsewhere", &link).expect("a stale link");
         assert!(program_step(&p, &mut Out::new(false)));
         assert_eq!(std::fs::read_link(&link).expect("a link"), aterm);
-        // A FILE there is not `on`'s, and is left as it is.
         std::fs::remove_file(&link).expect("unlink");
         std::fs::write(&link, "mine").expect("a file");
         let mut refused = Out::new(false);
         assert!(!program_step(&p, &mut refused));
         assert!(refused.failed);
         assert_eq!(std::fs::read_to_string(&link).expect("kept"), "mine");
-        // An existing bin symlink is never an admission to its target, even
-        // when that target already has exactly the program link we wanted.
         std::fs::remove_file(&link).expect("unlink");
         let bin = link.parent().expect("bin");
         std::fs::remove_dir(bin).expect("empty physical bin");
@@ -5795,8 +5206,6 @@ mod tests {
         let matching_refused = !program_step(&p, &mut matching);
         let mut dry = Out::new(true);
         let dry_refused = !program_step(&p, &mut dry);
-        // The modifying path must also refuse: it cannot chmod this target,
-        // stage a link there or replace the different link already in it.
         std::fs::remove_file(&external_link).expect("replace owned external link");
         let other = std::path::Path::new("/not-the-selected-program");
         std::os::unix::fs::symlink(other, &external_link).expect("different external link");
@@ -5830,7 +5239,6 @@ mod tests {
         );
         std::fs::remove_file(bin).expect("remove our bin alias");
         std::fs::create_dir(bin).expect("restore physical bin");
-        // Negative control: a plain path makes nothing.
         let plain = Paths {
             aterm: "/usr/bin/true".to_string(),
             ..p
@@ -5848,13 +5256,6 @@ mod tests {
     }
 
     /// A spaced word is never written as an array: an argv the line cannot
-    /// spell is refused, the file untouched — an older aterm rejects a whole
-    /// aterm.toml holding an array — while the same argv with its program
-    /// linked to one plain word is written as the line every earlier `on`
-    /// wrote. A hand-written array — one element per line, a comment among
-    /// them — is replaced whole by the line, and an array of the same words
-    /// matches without a rewrite. Negative control: the line spelling of the
-    /// spaced argv reads back as another argv.
     #[test]
     fn a_spaced_word_is_never_written_as_an_array() {
         let dev = "/Users//u/Applications/aterm (dev).app/Contents/MacOS/aterm";
@@ -5891,14 +5292,11 @@ mod tests {
                 .join(", ")
         );
         assert!(!set_fabric_command(&same, &plain).expect("ok").1);
-        // An array this editor cannot see the end of is refused, not written.
         let open = "[fabric]\ncommand = [\"aterm\",\n";
         assert!(set_fabric_command(open, &plain).is_err());
     }
 
     /// Every warning has a fix, for a fresh root and a named fleet, and the
-    /// unknown one points at the manual. A remedy that re-runs `on` on a
-    /// named fleet's root names that fleet.
     #[test]
     fn every_warning_shape_has_a_fix() {
         let roles = [
@@ -5988,14 +5386,6 @@ mod tests {
     }
 
     /// A log the broker refuses is answered by its own remedy: the broker's
-    /// last line ([`crate::cli::log_refusal_remedy`]), quoted from broker.err,
-    /// picks the fix — the shipped repair for a corrupt record, and never a
-    /// repair for a log a newer aterm wrote, which a truncation would destroy.
-    /// A refusal with no remedy of aterm's own keeps the general "fix the
-    /// quoted cause first". A bridge's dial nothing answered on that broker
-    /// (`reason=no-socket|refused`) quotes the same line and gets the same
-    /// remedy, never "`on` starts it" into the refusal; with nothing quoted it
-    /// keeps that one.
     #[test]
     fn a_refused_log_gets_its_own_remedy_and_a_newer_one_never_a_repair() {
         use std::io::ErrorKind as K;
@@ -6040,8 +5430,6 @@ mod tests {
                 from(Some("open /r/bus.log: address in use")),
                 format!("{other}{reconnects}")
             );
-            // Negative control: nothing quoted, nothing listens — `on`
-            // starts it.
             let bare = from(None);
             assert!(
                 bare.starts_with("nothing listens at the broker's socket")
@@ -6057,13 +5445,6 @@ mod tests {
     }
 
     /// A poisoned log is the broker's, never this node's. A bridge's
-    /// `reason=poisoned` and a broker.err whose last line is the broker's exit
-    /// over a poisoned log ([`crate::broker_health::poisoned_line`], either
-    /// form) each get the poisoned remedy — the broker's own restart, never a
-    /// re-minted cap, a repair or "fix the quoted cause first", and never
-    /// `on`, which keeps a poisoned broker that still answers. Negative
-    /// controls: `reason=attach` keeps the refused-cap fix, and another quoted
-    /// line keeps "fix that first".
     #[test]
     fn a_poisoned_log_is_answered_by_the_brokers_restart() {
         let role = Role::default();
@@ -6089,9 +5470,6 @@ mod tests {
                     && !exited.contains("fix that first"),
                 "{exited}"
             );
-            // Supervised, the supervisor restarts it and `on` is the fallback;
-            // with no `aterm fabric on` job, `on` starts none: its own line's
-            // command does.
             if restart.is_some() {
                 assert!(
                     exited.contains("the command its line names")
@@ -6165,20 +5543,15 @@ mod tests {
             ),
             "arm 4242 (`aterm ctl --sock /tmp/at.x/a.sock fabric attach --node n1`)"
         );
-        // Pid 0 reaches nothing by `--pid`.
         assert_eq!(
             fix_for("@s-a (instance 0) is HELD (reason=x origin=local)"),
             "`aterm ctl --pid <pid> hold s-a off`"
         );
-        // A fleet hold's remedy is its halter's `halt off`, never the Owner's
-        // `hold off` (that is `ERR denied` for a fleet hold).
         let fleet = held("reason=stop origin=fleet");
         assert!(
             fleet.contains("aterm fabric halt") && !fleet.contains("hold s-a off"),
             "{fleet}"
         );
-        // Both slots: the fleet's remedy, and the owner's `hold off` for the
-        // local hold the fleet's lift leaves standing.
         let both = held("reason=stop origin=fleet,local");
         assert!(
             both.contains("aterm fabric halt") && both.contains("`aterm ctl --pid 1 hold s-a off`"),
@@ -6189,9 +5562,6 @@ mod tests {
             lost.contains("bridge reconnects") && lost.contains("hold s-a off"),
             "{lost}"
         );
-        // The person's slot (Take Over): its remedy is their Hand Back, and
-        // no command — never `hold off`, never `fabric halt`. Beside an
-        // owner's hold, both remedies, each its own slot's.
         let person = held("reason=taken-over origin=person");
         assert_eq!(person, PERSON_HOLD_LIFT);
         let beside = held("reason=taken-over origin=person,local");
@@ -6200,8 +5570,6 @@ mod tests {
                 && beside.contains("`aterm ctl --pid 1 hold s-a off`"),
             "{beside}"
         );
-        // Another Mac's slot (the step-in): that Mac's hand-back or the
-        // person's, never this Mac's `hold off`, which lifts nothing of it.
         let remote = held("reason=- origin=remote");
         assert_eq!(remote, REMOTE_HOLD_LIFT);
         assert!(!remote.contains("hold s-a off"), "{remote}");
@@ -6224,9 +5592,6 @@ mod tests {
                  reason={reason}, last ack 3s ago)"
             ))
         };
-        // A LAPSED cap is renewed, not re-minted for another secret: its own
-        // remedy, the same from the bridge's `reason=expired` as from the
-        // report's own probe ([`fabric::CAP_LAPSED`]).
         assert!(
             down("expired").contains("has lapsed") && down("expired") != down("attach"),
             "{}",
@@ -6238,15 +5603,10 @@ mod tests {
             "{}",
             fix_for(&format!("the broker at /x {}: x", fabric::CAP_LAPSED))
         );
-        // A broker in another astream protocol gets one remedy, the same from
-        // the bridge's `reason=` as from the report's own probe — a release:
-        // `on` restarts the broker.
         let skew = "the broker at /x speaks astream protocol 3 and this aterm speaks 2";
         let here = protocol_remedy("`aterm fabric on`");
         assert!(down("protocol").starts_with(&here), "{}", down("protocol"));
         assert_eq!(fix_for(skew), here);
-        // A full broker, a refused row and another protocol are not a refused
-        // cap: none is sent to move the cap aside.
         for reason in ["busy", "record", "protocol"] {
             assert!(
                 !down(reason).contains("node.cap aside") && down(reason) != down("other"),
@@ -6254,7 +5614,6 @@ mod tests {
                 down(reason)
             );
         }
-        // A cut is the broker answering: it is not sent to the broker.
         assert!(
             down("cut-say") != down("closed") && down("cut-inbox") == down("cut-say"),
             "{}",
@@ -6263,8 +5622,6 @@ mod tests {
     }
 
     /// What the installed job runs is read back word for word ([`Role::of`]
-    /// checks it names a broker): the plist's ProgramArguments and the unit's
-    /// ExecStart are the broker argv.
     #[test]
     fn the_installed_job_reads_back_as_the_broker_argv() {
         let p = Paths {
@@ -6289,8 +5646,6 @@ mod tests {
     }
 
     /// The rendezvous file round-trips through its own parser, and a key that
-    /// is not a string is refused. A bridge command's root is its socket's
-    /// directory, and a relative socket names none.
     #[test]
     fn the_rendezvous_file_round_trips_and_a_command_names_its_root() {
         let r = Rendezvous {
@@ -6334,8 +5689,6 @@ mod tests {
     }
 
     /// Each later connection to a listed instance reads its token once connected, so an instance
-    /// replaced after the listing (new token, then a new listener at the same socket) is asked
-    /// with its own.
     #[test]
     fn an_instance_replaced_after_the_listing_is_asked_with_its_own_token() {
         use std::io::{BufRead, BufReader, Write};
@@ -6346,7 +5699,6 @@ mod tests {
         let sock = dir.join("a.sock");
         let token_file = dir.join("a.sock.token");
         std::fs::write(&token_file, "deadbeef\n").expect("token");
-        // One connection: its first two lines, then `reply`.
         let serve = |listener: UnixListener, reply: &'static str| {
             std::thread::spawn(move || {
                 let (conn, _) = listener.accept().expect("accept");
@@ -6387,12 +5739,6 @@ mod tests {
     }
 
     /// The node's cap never leaves for a broker the caller named. A cap is
-    /// minted against one broker's secret; defaulting the rendezvous file's
-    /// `--cap-file` (and the `--state` holding the node identity it belongs
-    /// to) onto an explicit `--broker` would present this node's credential to
-    /// whatever the caller pointed at. So the pair comes with the broker while
-    /// `--fleet` (a name, not a secret) still defaults, and a cap or state the
-    /// caller spelled out is kept as given.
     #[test]
     fn an_explicit_broker_gets_no_rendezvous_cap_or_state() {
         for broker in ["/r/bus.sock", "127.0.0.1:7000"] {
@@ -6430,8 +5776,6 @@ mod tests {
     }
 
     /// A cap minted for this node under the root's own secret is recognised
-    /// (every tag verified); one for another node, one minted under another
-    /// secret, and a file that is not there, are not.
     #[test]
     fn a_cap_minted_under_the_roots_secret_is_recognised() {
         let dir = std::env::temp_dir().join(format!("atfo-minted-{}", std::process::id()));
@@ -6474,9 +5818,6 @@ mod tests {
     }
 
     /// The deleted script's shell job is read for its broker, and nothing
-    /// else is: fabric-enable.sh installed `/bin/sh -c "rm -f …; exec …"`;
-    /// [`sh_c_words`] reads that shape and the one [`Paths::unit_text`]
-    /// writes, and refuses every other script rather than guess at it.
     #[test]
     fn the_deleted_scripts_shell_job_is_read_for_its_broker_and_nothing_else_is() {
         let words = |w: &[&str]| Some(w.iter().map(ToString::to_string).collect::<Vec<_>>());
@@ -6534,8 +5875,6 @@ mod tests {
     }
 
     /// A root whose job the deleted script installed has a known role, and
-    /// its job is still not current — so `doctor` reports and `on` rewrites
-    /// it, instead of both refusing the host's own broker as an unknown role.
     #[test]
     fn role_of_a_root_with_the_scripts_plist_is_known_and_not_current() {
         let dir = aterm_tempfile::tempdir().expect("scratch");
@@ -6577,8 +5916,6 @@ mod tests {
         assert_eq!(Role::of(&p), Ok(Role { fleet: None }));
         assert!(!p.plist_is_current(&legacy), "`on` still rewrites it");
 
-        // Negative controls: a readable script that runs no broker, and one
-        // of a shape nothing aterm wrote, are still refused.
         install(&plist("exec /usr/bin/true"));
         assert_eq!(Role::of(&p), Err(RoleError::NotABroker));
         install(&plist(&format!(

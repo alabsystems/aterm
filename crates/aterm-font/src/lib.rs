@@ -7,82 +7,12 @@
 // cut down to the tables this crate reads and modified by the aterm project in
 // 2026. The sinks (`sink.rs`) and the crate layout are aterm's.
 
-// Registers the `trust` tool so `#[cfg_attr(trust_verify, trust::…)]`
-// attributes name it. A stable build ignores this.
 #![cfg_attr(trust_verify, feature(register_tool))]
 #![cfg_attr(trust_verify, register_tool(trust))]
 
-//! aterm's font reader, the sfnt half of the text-fonts carve (TF.3 and TF.5
-//! of docs/AUDIT-third-party-2026-10-15.md): every table aterm-render reads.
-//!
-//! - the sfnt table directory and TrueType/OpenType collections;
-//! - `head`, `hhea`, `maxp`, `hmtx`/`vmtx`, `vhea`, `VORG`, `post`, `OS/2`
-//!   and `name`;
-//! - `cmap` lookups and enumeration, formats 0, 2, 4, 6, 10, 12, 13 and 14;
-//! - outlines: `glyf`/`loca`, `gvar`, and CFF1 (CID-keyed included) and CFF2
-//!   charstrings;
-//! - variations: `fvar`, `avar`, the item variation store, `HVAR`, `VVAR`
-//!   and `MVAR` (the line metrics at an instance);
-//! - legacy `kern` (OpenType formats 0 and 2, AAT formats 0 to 3; an AAT
-//!   state machine is recognised, not run);
-//! - colour and bitmap glyphs: `COLR` v0 and v1 with `CPAL`, `sbix`, and
-//!   `CBLC`/`CBDT` (with `EBLC`/`EBDT` and Apple's `bloc`/`bdat`, which share
-//!   its layout);
-//! - `GSUB`: the script, feature and lookup lists with feature variations,
-//!   and every substitution subtable type; `GDEF`'s glyph classes and mark
-//!   sets; `GPOS`'s lists (not its positioning subtables).
-//!
-//! On a well-formed font every answer is ttf-parser 0.25.1's, bit for bit,
-//! as aterm's Linux build configures it: with `gvar-alloc`, so a glyph past
-//! 32 `gvar` tuples draws (macOS, Windows and wasm build ttf-parser without
-//! it, and such a glyph has no outline there). The table readers are carved
-//! from it, and `tests/reader_oracle.rs` holds this crate to the TF.1 reader
-//! corpus ttf-parser recorded, every query of it: outline point streams, COLR
-//! paint graphs, bitmap bytes, name records.
-//!
-//! What it adds is the never-panic guarantee upstream states but does not
-//! keep: arithmetic that could overflow on a malformed font is checked or
-//! widened, every index the font steers is tested first (by `get`, or by the
-//! length test before it), and an outline that cannot be read returns
-//! `None`. So a malformed font can answer differently where upstream panics,
-//! hangs or does unbounded work: a CFF2 `blend` on an empty stack is an error
-//! (upstream panics, release builds too), a `GSUB` extension of an extension
-//! is `None` (upstream never returns), `cmap` enumeration stops at U+10FFFF
-//! and after one call per code point the format can name (overlapping groups
-//! multiplied it upstream), an outline query stops after 65,536 steps
-//! (glyph entries, TrueType points and CFF operators, counted across a
-//! composite's or a charstring's whole recursion: nesting limits alone let a
-//! shared-child graph take upstream exponential time; the heaviest glyph of
-//! 809 macOS system and committed faces takes 5,598, measured 2026-10-16),
-//! and a `COLR` paint walk stops after 2^16 paint tables (likewise; the COLR
-//! v1 test fonts' glyphs visit at most 51). Where upstream's release build
-//! wraps instead of panicking (OS/2 win descent, the face heights, a `COLR`
-//! variation index past `u32::MAX`), this crate wraps too. A font is
-//! untrusted input (a user's font directory, a font a web page hands the
-//! wasm build), so `tests/never_panic.rs` mutates real faces and asks every
-//! query of every glyph.
-//!
-//! Outlines go to an [`OutlineSink`] in font units. [`ScaledSink`] maps them
-//! into a raster's pixel space, and [`PointSink`] receives the unscaled points
-//! (on- and off-curve, contour by contour) a grid-fitter works on.
-//!
-//! [`shape`] is the text shaper over this reader (TF.6), carved from rustybuzz
-//! 0.20.1: `GSUB` lookup types 1 to 8 with their flags and mark filtering,
-//! the default and caller features, automatic fractions, OpenType script
-//! selection and the Arabic joining forms. Where it answers differently from
-//! rustybuzz, by design, is listed in `src/shape/pipeline.rs`: no
-//! normalization, no mirroring (the bidi step's), positions by advance alone,
-//! and no AAT `morx`.
-//!
-//! `autohint` (the `hint` feature, and every build with debug assertions) is
-//! FreeType's automatic hinter as skrifa
-//! 0.46.2 ports it (TF.4): a face's glyphs grid-fitted at a size, instance
-//! and smooth target, answering skrifa's outlines bit for bit.
+//! aterm's font reader, the sfnt half of the text-fonts carve (TF.3 and TF.5 of docs/AUDIT-third-party-2026-10-15.md): every table aterm-render reads.
 
 #![forbid(unsafe_code)]
-// The derived readers (and their upstream unit tests) keep ttf-parser
-// 0.25.1's shape, so each file still diffs readably against its upstream
-// file; these lints flag only that shape. Code aterm writes meets them.
 #![allow(clippy::identity_op)]
 #![allow(clippy::too_many_arguments)]
 #![allow(clippy::collapsible_if)]
@@ -126,9 +56,6 @@ pub use work::{Spent, take_spent};
 
 pub mod opentype_layout {
     //! The [OpenType Layout](
-    //! https://docs.microsoft.com/en-us/typography/opentype/spec/chapter2#overview)
-    //! common tables: script, feature and lookup lists, coverage and class
-    //! definitions, (chained) context lookups and feature variations.
     pub use crate::ggg::*;
 }
 
@@ -147,8 +74,6 @@ impl FromData for GlyphId {
 }
 
 /// A TrueType font magic.
-///
-/// <https://docs.microsoft.com/en-us/typography/opentype/spec/otff#organization-of-an-opentype-font>
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Magic {
     TrueType,
@@ -171,9 +96,6 @@ impl FromData for Magic {
 }
 
 /// A variation coordinate in a normalized coordinate system.
-///
-/// Basically any number in a -1.0..1.0 range, where 0 is the default value,
-/// stored as F2DOT14.
 #[repr(transparent)]
 #[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
 pub struct NormalizedCoordinate(i16);
@@ -268,8 +190,6 @@ pub struct LineMetrics {
 }
 
 /// A rectangle.
-///
-/// Doesn't guarantee that `x_min` <= `x_max` and/or `y_min` <= `y_max`.
 #[repr(C)]
 #[allow(missing_docs)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -428,7 +348,6 @@ impl Transform {
     #[inline]
     #[must_use]
     pub const fn is_default(&self) -> bool {
-        // A direct float comparison is fine in our case.
         self.a == 1.0
             && self.b == 0.0
             && self.c == 0.0
@@ -477,8 +396,7 @@ impl RgbaColor {
         }
     }
 
-    /// Scales the alpha by `alpha` (0..=1); the cast saturates, and NaN
-    /// gives 0.
+    /// Scales the alpha by `alpha` (0..=1); the cast saturates, and NaN gives 0.
     #[inline]
     pub(crate) fn apply_alpha(&mut self, alpha: f32) {
         self.alpha = (((f32::from(self.alpha) / 255.0) * alpha) * 255.0) as u8;
@@ -492,65 +410,31 @@ pub enum RasterImageFormat {
     PNG,
 
     /// A monochrome bitmap.
-    ///
-    /// The most significant bit of the first byte corresponds to the top-left pixel, proceeding
-    /// through succeeding bits moving left to right. The data for each row is padded to a byte
-    /// boundary, so the next row begins with the most significant bit of a new byte. 1 corresponds
-    /// to black, and 0 to white.
     BitmapMono,
 
     /// A packed monochrome bitmap.
-    ///
-    /// The most significant bit of the first byte corresponds to the top-left pixel, proceeding
-    /// through succeeding bits moving left to right. Data is tightly packed with no padding. 1
-    /// corresponds to black, and 0 to white.
     BitmapMonoPacked,
 
     /// A grayscale bitmap with 2 bits per pixel.
-    ///
-    /// The most significant bits of the first byte corresponds to the top-left pixel, proceeding
-    /// through succeeding bits moving left to right. The data for each row is padded to a byte
-    /// boundary, so the next row begins with the most significant bit of a new byte.
     BitmapGray2,
 
     /// A packed grayscale bitmap with 2 bits per pixel.
-    ///
-    /// The most significant bits of the first byte corresponds to the top-left pixel, proceeding
-    /// through succeeding bits moving left to right. Data is tightly packed with no padding.
     BitmapGray2Packed,
 
     /// A grayscale bitmap with 4 bits per pixel.
-    ///
-    /// The most significant bits of the first byte corresponds to the top-left pixel, proceeding
-    /// through succeeding bits moving left to right. The data for each row is padded to a byte
-    /// boundary, so the next row begins with the most significant bit of a new byte.
     BitmapGray4,
 
     /// A packed grayscale bitmap with 4 bits per pixel.
-    ///
-    /// The most significant bits of the first byte corresponds to the top-left pixel, proceeding
-    /// through succeeding bits moving left to right. Data is tightly packed with no padding.
     BitmapGray4Packed,
 
     /// A grayscale bitmap with 8 bits per pixel.
-    ///
-    /// The first byte corresponds to the top-left pixel, proceeding through succeeding bytes
-    /// moving left to right.
     BitmapGray8,
 
     /// A color bitmap with 32 bits per pixel.
-    ///
-    /// The first group of four bytes corresponds to the top-left pixel, proceeding through
-    /// succeeding pixels moving left to right. Each byte corresponds to a color channel and the
-    /// channels within a pixel are in blue, green, red, alpha order. Color values are
-    /// pre-multiplied by the alpha. For example, the color "full-green with half translucency"
-    /// is encoded as `\x00\x80\x00\x80`, and not `\x00\xFF\x00\x80`.
     BitmapPremulBgra32,
 }
 
 /// A glyph's raster image.
-///
-/// Note, that glyph metrics are in pixels and not in font units.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct RasterGlyphImage<'a> {
     /// Horizontal offset.
@@ -560,13 +444,9 @@ pub struct RasterGlyphImage<'a> {
     pub y: i16,
 
     /// Image width.
-    ///
-    /// It doesn't guarantee that this value is the same as set in the `data`.
     pub width: u16,
 
     /// Image height.
-    ///
-    /// It doesn't guarantee that this value is the same as set in the `data`.
     pub height: u16,
 
     /// A pixels per em of the selected strike.
@@ -575,13 +455,11 @@ pub struct RasterGlyphImage<'a> {
     /// An image format.
     pub format: RasterImageFormat,
 
-    /// A raw image data. It's up to the caller to decode it.
+    /// A raw image data.
     pub data: &'a [u8],
 }
 
 /// Phantom points: the `gvar` deltas of a glyph's side bearings and advances.
-///
-/// Available only for variable fonts with the `gvar` table.
 #[derive(Clone, Copy, Debug)]
 pub struct PhantomPoints {
     /// Left side bearing point.
@@ -620,7 +498,6 @@ impl FromData for TableRecord {
 }
 
 /// The most variation axes a [`Face`] keeps coordinates for; a face with
-/// more is read at its default instance only.
 const MAX_VAR_COORDS: usize = 64;
 
 #[derive(Clone)]
@@ -657,8 +534,6 @@ impl VarCoords {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum FaceParsingError {
     /// An attempt to read out of bounds detected.
-    ///
-    /// Should occur only on malformed fonts.
     MalformedFont,
     /// Face data must start with `0x00010000`, `0x74727565`, `0x4F54544F` or `0x74746366`.
     UnknownMagic,
@@ -697,17 +572,13 @@ pub struct RawFace<'a> {
 }
 
 impl<'a> RawFace<'a> {
-    /// Reads the table directory of face `index` (0 for a single-face file;
-    /// [`fonts_in_collection`] gives a collection's count).
+    /// Reads the table directory of face `index` (0 for a single-face file; [`fonts_in_collection`] gives a collection's count).
     pub fn parse(data: &'a [u8], index: u32) -> Result<Self, FaceParsingError> {
-        // https://docs.microsoft.com/en-us/typography/opentype/spec/otff#organization-of-an-opentype-font
-
         let mut s = Stream::new(data);
 
-        // Read **font** magic.
         let magic = s.read::<Magic>().ok_or(FaceParsingError::UnknownMagic)?;
         if magic == Magic::FontCollection {
-            s.skip::<u32>(); // version
+            s.skip::<u32>();
             let number_of_faces = s.read::<u32>().ok_or(FaceParsingError::MalformedFont)?;
             let offsets = s
                 .read_array32::<Offset32>(number_of_faces)
@@ -716,8 +587,6 @@ impl<'a> RawFace<'a> {
             let face_offset = offsets
                 .get(index)
                 .ok_or(FaceParsingError::FaceIndexOutOfBounds)?;
-            // Face offset is from the start of the font data,
-            // so we have to adjust it to the current parser offset.
             let face_offset = face_offset
                 .to_usize()
                 .checked_sub(s.offset())
@@ -725,23 +594,19 @@ impl<'a> RawFace<'a> {
             s.advance_checked(face_offset)
                 .ok_or(FaceParsingError::MalformedFont)?;
 
-            // Read **face** magic.
-            // Each face in a font collection also starts with a magic.
             let magic = s.read::<Magic>().ok_or(FaceParsingError::UnknownMagic)?;
-            // And face in a font collection can't be another collection.
             if magic == Magic::FontCollection {
                 return Err(FaceParsingError::UnknownMagic);
             }
         } else {
             // When reading from a regular font (not a collection) disallow index to be non-zero
-            // Basically treat the font as a one-element collection
             if index != 0 {
                 return Err(FaceParsingError::FaceIndexOutOfBounds);
             }
         }
 
         let num_tables = s.read::<u16>().ok_or(FaceParsingError::MalformedFont)?;
-        s.advance(6); // searchRange (u16) + entrySelector (u16) + rangeShift (u16)
+        s.advance(6);
         let table_records = s
             .read_array16::<TableRecord>(num_tables)
             .ok_or(FaceParsingError::MalformedFont)?;
@@ -813,11 +678,10 @@ struct RawFaceTables<'a> {
     vvar: Option<&'a [u8]>,
 }
 
-/// The parsed tables of a [`Face`]. A malformed optional table is `None`.
+/// The parsed tables of a [`Face`].
 #[allow(missing_docs)]
 #[derive(Clone)]
 pub struct FaceTables<'a> {
-    // Mandatory tables.
     pub head: head::Table,
     pub hhea: hhea::Table,
     pub maxp: maxp::Table,
@@ -832,11 +696,9 @@ pub struct FaceTables<'a> {
     pub ebdt: Option<cbdt::Table<'a>>,
     pub gdef: Option<gdef::Table<'a>>,
     pub glyf: Option<glyf::Table<'a>>,
-    /// The `GPOS` layout lists (scripts, features, lookup headers); its
-    /// positioning subtables are not read.
+    /// The `GPOS` layout lists (scripts, features, lookup headers); its positioning subtables are not read.
     pub gpos: Option<opentype_layout::LayoutTable<'a>>,
-    /// The `GSUB` layout table: its lookups' subtables read as
-    /// [`gsub::SubstitutionSubtable`].
+    /// The `GSUB` layout table: its lookups' subtables read as [`gsub::SubstitutionSubtable`].
     pub gsub: Option<opentype_layout::LayoutTable<'a>>,
     pub hmtx: Option<hmtx::Table<'a>>,
     pub kern: Option<kern::Table<'a>>,
@@ -857,10 +719,7 @@ pub struct FaceTables<'a> {
     pub vvar: Option<vvar::Table<'a>>,
 }
 
-/// A font face: the tables of one face of a font file, and the variation
-/// instance its varied answers are read at.
-///
-/// `Face` borrows the font data and allocates nothing; parse one when needed.
+/// A font face: the tables of one face of a font file, and the variation instance its varied answers are read at.
 #[derive(Clone)]
 pub struct Face<'a> {
     raw_face: RawFace<'a>,
@@ -870,9 +729,6 @@ pub struct Face<'a> {
 
 impl<'a> Face<'a> {
     /// Parses face `index` of `data` (0 for a single-face file).
-    ///
-    /// Required tables: `head`, `hhea` and `maxp`. An optional table with
-    /// invalid data is skipped.
     pub fn parse(data: &'a [u8], index: u32) -> Result<Self, FaceParsingError> {
         let raw_face = RawFace::parse(data, index)?;
         let raw_tables = Self::collect_tables(raw_face);
@@ -1061,8 +917,6 @@ impl<'a> Face<'a> {
     }
 
     /// Checks that face is marked as *Monospaced* (`post.isFixedPitch`).
-    ///
-    /// Returns `false` when `post` table is not present.
     #[inline]
     #[must_use]
     pub fn is_monospaced(&self) -> bool {
@@ -1081,8 +935,6 @@ impl<'a> Face<'a> {
     }
 
     /// Returns face's italic angle.
-    ///
-    /// Returns `0.0` when `post` table is not present.
     #[inline]
     pub fn italic_angle(&self) -> f32 {
         self.tables
@@ -1110,8 +962,7 @@ impl<'a> Face<'a> {
         self.style() == Style::Italic || self.italic_angle() != 0.0
     }
 
-    /// Checks that face is marked as *Bold*: `OS/2` `fsSelection`, or the
-    /// `head` table's `macStyle` when the face has no `OS/2` table.
+    /// Checks that face is marked as *Bold*: `OS/2` `fsSelection`, or the `head` table's `macStyle` when the face has no `OS/2` table.
     #[inline]
     pub fn is_bold(&self) -> bool {
         self.tables
@@ -1120,15 +971,12 @@ impl<'a> Face<'a> {
     }
 
     /// Checks that face is marked as *Oblique*.
-    ///
-    /// Returns `false` when OS/2 table is not present or when its version is < 4.
     #[inline]
     pub fn is_oblique(&self) -> bool {
         self.style() == Style::Oblique
     }
 
-    /// Returns face style: `OS/2`'s, or Italic from the `head` table's
-    /// `macStyle` when the face has no `OS/2` table.
+    /// Returns face style: `OS/2`'s, or Italic from the `head` table's `macStyle` when the face has no `OS/2` table.
     #[inline]
     pub fn style(&self) -> Style {
         match self.tables.os2 {
@@ -1138,8 +986,7 @@ impl<'a> Face<'a> {
         }
     }
 
-    /// Returns face's weight: `OS/2`'s, or Bold from the `head` table's
-    /// `macStyle` when the face has no `OS/2` table (else `Weight::Normal`).
+    /// Returns face's weight: `OS/2`'s, or Bold from the `head` table's `macStyle` when the face has no `OS/2` table (else `Weight::Normal`).
     #[inline]
     pub fn weight(&self) -> Weight {
         match self.tables.os2 {
@@ -1150,19 +997,12 @@ impl<'a> Face<'a> {
     }
 
     /// Returns face's width.
-    ///
-    /// Returns `Width::Normal` when OS/2 table is not present or when value is invalid.
     #[inline]
     pub fn width(&self) -> Width {
         self.tables.os2.map(|os2| os2.width()).unwrap_or_default()
     }
 
-    // Read https://github.com/freetype/freetype/blob/49270c17011491227ec7bd3fb73ede4f674aa065/src/sfnt/sfobjs.c#L1279
-    // to learn more about the logic behind the following functions.
-
-    /// Returns a horizontal face ascender: OS/2's typographic ascender when
-    /// `USE_TYPO_METRICS` is set, else `hhea`'s (OS/2's when that is 0),
-    /// with the `MVAR` delta at the current instance.
+    /// Returns a horizontal face ascender: OS/2's typographic ascender when `USE_TYPO_METRICS` is set, else `hhea`'s (OS/2's when that is 0), with the `MVAR` delta at the current instance.
     #[inline]
     pub fn ascender(&self) -> i16 {
         if let Some(os_2) = self.tables.os2 {
@@ -1214,9 +1054,7 @@ impl<'a> Face<'a> {
         value
     }
 
-    /// Returns face's height: ascender minus descender. Wrapping, as
-    /// upstream's release build computes it, so a malformed pair cannot
-    /// overflow.
+    /// Returns face's height: ascender minus descender.
     #[inline]
     pub fn height(&self) -> i16 {
         self.ascender().wrapping_sub(self.descender())
@@ -1233,7 +1071,6 @@ impl<'a> Face<'a> {
         }
 
         let mut value = self.tables.hhea.line_gap;
-        // For line gap, we have to check that ascender or descender are 0, not line gap itself.
         if self.tables.hhea.ascender == 0 || self.tables.hhea.descender == 0 {
             if let Some(os_2) = self.tables.os2 {
                 if os_2.typographic_ascender() != 0 || os_2.typographic_descender() != 0 {
@@ -1249,8 +1086,6 @@ impl<'a> Face<'a> {
     }
 
     /// Returns OS/2's typographic ascender at the current instance.
-    ///
-    /// Returns `None` when OS/2 table is not present.
     #[inline]
     pub fn typographic_ascender(&self) -> Option<i16> {
         self.tables.os2.map(|table| {
@@ -1260,8 +1095,6 @@ impl<'a> Face<'a> {
     }
 
     /// Returns OS/2's typographic descender at the current instance.
-    ///
-    /// Returns `None` when OS/2 table is not present.
     #[inline]
     pub fn typographic_descender(&self) -> Option<i16> {
         self.tables.os2.map(|table| {
@@ -1271,8 +1104,6 @@ impl<'a> Face<'a> {
     }
 
     /// Returns OS/2's typographic line gap at the current instance.
-    ///
-    /// Returns `None` when OS/2 table is not present.
     #[inline]
     pub fn typographic_line_gap(&self) -> Option<i16> {
         self.tables.os2.map(|table| {
@@ -1318,8 +1149,6 @@ impl<'a> Face<'a> {
     }
 
     /// Returns face's x height at the current instance.
-    ///
-    /// Returns `None` when OS/2 table is not present or when its version is < 2.
     #[inline]
     pub fn x_height(&self) -> Option<i16> {
         self.tables
@@ -1329,8 +1158,6 @@ impl<'a> Face<'a> {
     }
 
     /// Returns face's capital height at the current instance.
-    ///
-    /// Returns `None` when OS/2 table is not present or when its version is < 2.
     #[inline]
     pub fn capital_height(&self) -> Option<i16> {
         self.tables
@@ -1340,8 +1167,6 @@ impl<'a> Face<'a> {
     }
 
     /// Returns face's underline metrics (`post`) at the current instance.
-    ///
-    /// Returns `None` when `post` table is not present.
     #[inline]
     pub fn underline_metrics(&self) -> Option<LineMetrics> {
         let mut metrics = self.tables.post?.underline_metrics;
@@ -1355,8 +1180,6 @@ impl<'a> Face<'a> {
     }
 
     /// Returns face's strikeout metrics (OS/2) at the current instance.
-    ///
-    /// Returns `None` when OS/2 table is not present.
     #[inline]
     pub fn strikeout_metrics(&self) -> Option<LineMetrics> {
         let mut metrics = self.tables.os2?.strikeout_metrics();
@@ -1370,8 +1193,6 @@ impl<'a> Face<'a> {
     }
 
     /// Returns face's subscript metrics (OS/2) at the current instance.
-    ///
-    /// Returns `None` when OS/2 table is not present.
     #[inline]
     pub fn subscript_metrics(&self) -> Option<ScriptMetrics> {
         let mut metrics = self.tables.os2?.subscript_metrics();
@@ -1387,8 +1208,6 @@ impl<'a> Face<'a> {
     }
 
     /// Returns face's superscript metrics (OS/2) at the current instance.
-    ///
-    /// Returns `None` when OS/2 table is not present.
     #[inline]
     pub fn superscript_metrics(&self) -> Option<ScriptMetrics> {
         let mut metrics = self.tables.os2?.superscript_metrics();
@@ -1404,8 +1223,6 @@ impl<'a> Face<'a> {
     }
 
     /// Returns face permissions.
-    ///
-    /// Returns `None` in case of a malformed value.
     #[inline]
     pub fn permissions(&self) -> Option<Permissions> {
         self.tables.os2?.permissions()
@@ -1445,17 +1262,14 @@ impl<'a> Face<'a> {
         self.tables.head.units_per_em
     }
 
-    /// Returns a total number of glyphs in the face. Never zero.
+    /// Returns a total number of glyphs in the face.
     #[inline]
     #[must_use]
     pub const fn number_of_glyphs(&self) -> u16 {
         self.tables.maxp.number_of_glyphs.get()
     }
 
-    /// Resolves a glyph ID for a code point through the face's Unicode
-    /// `cmap` subtables, in table order.
-    ///
-    /// Returns `None` instead of `0` when glyph is not found.
+    /// Resolves a glyph ID for a code point through the face's Unicode `cmap` subtables, in table order.
     #[inline]
     pub fn glyph_index(&self, code_point: char) -> Option<GlyphId> {
         for subtable in self.tables.cmap?.subtables {
@@ -1471,11 +1285,7 @@ impl<'a> Face<'a> {
         None
     }
 
-    /// Resolves a variation of a glyph ID from two code points through the
-    /// first format 14 subtable ([Unicode Variation Sequences](
-    /// https://docs.microsoft.com/en-us/typography/opentype/spec/cmap#format-14-unicode-variation-sequences)).
-    ///
-    /// Returns `None` instead of `0` when glyph is not found.
+    /// Resolves a variation of a glyph ID from two code points through the first format 14 subtable ([Unicode Variation Sequences]( https://docs.microsoft.com/en-us/typography/opentype/spec/cmap#format-14-unicode-variation-sequences)).
     #[inline]
     pub fn glyph_variation_index(&self, code_point: char, variation: char) -> Option<GlyphId> {
         for subtable in self.tables.cmap?.subtables {
@@ -1490,8 +1300,7 @@ impl<'a> Face<'a> {
         None
     }
 
-    /// Returns glyph's horizontal advance at the current instance: `hmtx`
-    /// plus the `HVAR` delta (else the `gvar` phantom point), rounded.
+    /// Returns glyph's horizontal advance at the current instance: `hmtx` plus the `HVAR` delta (else the `gvar` phantom point), rounded.
     #[inline]
     pub fn glyph_hor_advance(&self, glyph_id: GlyphId) -> Option<u16> {
         let mut advance = self.tables.hmtx?.advance(glyph_id)? as f32;
@@ -1511,8 +1320,7 @@ impl<'a> Face<'a> {
         u16::try_num_from(advance)
     }
 
-    /// Returns glyph's vertical advance at the current instance: `vmtx`
-    /// plus the `VVAR` delta (else the `gvar` phantom point), rounded.
+    /// Returns glyph's vertical advance at the current instance: `vmtx` plus the `VVAR` delta (else the `gvar` phantom point), rounded.
     #[inline]
     pub fn glyph_ver_advance(&self, glyph_id: GlyphId) -> Option<u16> {
         let mut advance = self.tables.vmtx?.advance(glyph_id)? as f32;
@@ -1565,9 +1373,7 @@ impl<'a> Face<'a> {
         i16::try_num_from(bearing)
     }
 
-    /// Returns glyph's vertical origin according to the
-    /// [Vertical Origin Table](https://docs.microsoft.com/en-us/typography/opentype/spec/vorg),
-    /// at the current instance.
+    /// Returns glyph's vertical origin according to the [Vertical Origin Table](https://docs.microsoft.com/en-us/typography/opentype/spec/vorg), at the current instance.
     #[inline]
     pub fn glyph_y_origin(&self, glyph_id: GlyphId) -> Option<i16> {
         let mut origin = self.tables.vorg.map(|vorg| vorg.glyph_y_origin(glyph_id))? as f32;
@@ -1584,16 +1390,7 @@ impl<'a> Face<'a> {
         i16::try_num_from(origin)
     }
 
-    /// Outlines a glyph at the current instance into `sink`, in font units,
-    /// and returns its tight bounding box.
-    ///
-    /// `gvar` (with `glyf`), then `glyf`, then `CFF `, then `CFF2`: the first
-    /// table the face has answers. `None` when the glyph has no outline or
-    /// its data is malformed; a malformed glyph may have sent part of its
-    /// outline to `sink` first, exactly as ttf-parser does.
-    /// A query also refuses after 65,536 cumulative glyph-entry, TrueType
-    /// point or CFF-instruction steps, shared across component/subroutine
-    /// calls: a small acyclic font program cannot expand without a bound.
+    /// Outlines a glyph at the current instance into `sink`, in font units, and returns its tight bounding box.
     #[inline]
     pub fn outline_glyph(&self, glyph_id: GlyphId, sink: &mut dyn OutlineSink) -> Option<Rect> {
         if let Some(ref gvar) = self.tables.gvar {
@@ -1615,11 +1412,7 @@ impl<'a> Face<'a> {
         None
     }
 
-    /// Outlines a glyph at the current instance into `sink` as points: the
-    /// on- and off-curve points of each contour as the font stores them
-    /// (`glyf`: TrueType's quadratic points, composite components
-    /// transformed; CFF: each segment's control and end points), and returns
-    /// the bounding box [`Face::outline_glyph`] would.
+    /// Outlines a glyph at the current instance into `sink` as points: the on- and off-curve points of each contour as the font stores them (`glyf`: TrueType's quadratic points, composite components transformed; CFF: each segment's control and end points), and returns the bounding box [`Face::outline_glyph`] would.
     #[inline]
     pub fn outline_glyph_points(
         &self,
@@ -1640,9 +1433,7 @@ impl<'a> Face<'a> {
         bbox
     }
 
-    /// Returns a tight glyph bounding box at the current instance, computed
-    /// from the outline (the `glyf` header boxes are ignored: they can be
-    /// malformed, and a variation moves them).
+    /// Returns a tight glyph bounding box at the current instance, computed from the outline (the `glyf` header boxes are ignored: they can be malformed, and a variation moves them).
     #[inline]
     pub fn glyph_bounding_box(&self, glyph_id: GlyphId) -> Option<Rect> {
         self.outline_glyph(glyph_id, &mut sink::NullSink)
@@ -1655,13 +1446,7 @@ impl<'a> Face<'a> {
         self.tables.head.global_bbox
     }
 
-    /// Returns a glyph's raster image: the strike closest to
-    /// `pixels_per_em` from below, else the next larger one (`u16::MAX`
-    /// picks the largest).
-    ///
-    /// Tables are read in the order `sbix`, `bloc` + `bdat`, `EBLC` +
-    /// `EBDT`, `CBLC` + `CBDT`; the first one the face has answers. The image
-    /// is returned encoded, unvalidated.
+    /// Returns a glyph's raster image: the strike closest to `pixels_per_em` from below, else the next larger one (`u16::MAX` picks the largest).
     #[inline]
     pub fn glyph_raster_image(
         &self,
@@ -1688,8 +1473,7 @@ impl<'a> Face<'a> {
         None
     }
 
-    /// Returns `true` if the glyph can be painted from the `COLR`+`CPAL`
-    /// tables.
+    /// Returns `true` if the glyph can be painted from the `COLR`+`CPAL` tables.
     #[inline]
     pub fn is_color_glyph(&self, glyph_id: GlyphId) -> bool {
         self.tables()
@@ -1704,12 +1488,7 @@ impl<'a> Face<'a> {
         Some(self.tables().colr?.palettes.palettes())
     }
 
-    /// Paints a color glyph from the `COLR` table at the current instance,
-    /// with `palette` (0 is the default) and `foreground_color` for the
-    /// foreground palette index.
-    ///
-    /// Returns `None` if the glyph has no `COLR` definition or if the glyph
-    /// definition is malformed.
+    /// Paints a color glyph from the `COLR` table at the current instance, with `palette` (0 is the default) and `foreground_color` for the foreground palette index.
     #[inline]
     pub fn paint_color_glyph(
         &self,
@@ -1729,11 +1508,7 @@ impl<'a> Face<'a> {
         self.tables.fvar.map(|fvar| fvar.axes).unwrap_or_default()
     }
 
-    /// Sets a variation axis coordinate, in user space: normalized by `fvar`,
-    /// then mapped by `avar`.
-    ///
-    /// Returns `None` when face is not variable, has more than 64 axes, or
-    /// doesn't have such axis.
+    /// Sets a variation axis coordinate, in user space: normalized by `fvar`, then mapped by `avar`.
     pub fn set_variation(&mut self, axis: Tag, value: f32) -> Option<()> {
         if !self.is_variable() {
             return None;
@@ -1758,10 +1533,7 @@ impl<'a> Face<'a> {
         Some(())
     }
 
-    /// Sets the normalized coordinates directly, in axis order: the
-    /// autohinter's CFF path, which normalizes in 16.16 as skrifa does
-    /// (`autohint/location.rs`). Coordinates past the face's axes are
-    /// ignored; axes past the coordinates sit at their default.
+    /// Sets the normalized coordinates directly, in axis order: the autohinter's CFF path, which normalizes in 16.16 as skrifa does (`autohint/location.rs`).
     #[cfg(any(feature = "hint", debug_assertions))]
     pub(crate) fn set_normalized_coordinates(
         &mut self,
@@ -1787,8 +1559,6 @@ impl<'a> Face<'a> {
     }
 
     /// Parses glyph's phantom points.
-    ///
-    /// Available only for variable fonts with the `gvar` table.
     #[inline]
     pub fn glyph_phantom_points(&self, glyph_id: GlyphId) -> Option<PhantomPoints> {
         let glyf = self.tables.glyf?;
@@ -1811,7 +1581,6 @@ impl<'a> Face<'a> {
     }
 
     /// Adds the `MVAR` delta for `tag` at the current instance, truncated
-    /// toward zero as upstream does; a sum outside i16 leaves `value` as is.
     #[inline]
     fn apply_metrics_variation_to(&self, tag: Tag, value: &mut i16) {
         if self.is_variable() {
@@ -1835,8 +1604,6 @@ impl core::fmt::Debug for Face<'_> {
 }
 
 /// Returns the number of fonts stored in a TrueType font collection.
-///
-/// Returns `None` if a provided data is not a TrueType font collection.
 #[inline]
 pub fn fonts_in_collection(data: &[u8]) -> Option<u32> {
     let mut s = Stream::new(data);
@@ -1844,6 +1611,6 @@ pub fn fonts_in_collection(data: &[u8]) -> Option<u32> {
         return None;
     }
 
-    s.skip::<u32>(); // version
+    s.skip::<u32>();
     s.read::<u32>()
 }

@@ -11,7 +11,6 @@ type RegistryHook = Box<dyn FnMut(&Path)>;
 
 thread_local! {
     /// Runs before each `sessions/<pid>.json` read on this thread
-    /// ([`session_of_pid`]), so a test can land a rewrite mid-read.
     static REGISTRY_READ: std::cell::RefCell<Option<RegistryHook>> =
         const { std::cell::RefCell::new(None) };
 }
@@ -36,8 +35,6 @@ pub(super) fn on_transcript_lookup() {
 }
 
 /// One footer read of `pid` as the window's resolver makes it
-/// ([`read_pid`]), over a per-process `tail` kept across reads and the
-/// tab's `fold`, with no launch facts or argv.
 #[cfg(unix)]
 fn folded(
     claude: &Path,
@@ -67,8 +64,6 @@ fn folded(
 }
 
 /// One footer read ([`folded`]) while the registry file is rewritten: the
-/// first read finds it whole, later ones cut mid-write; it is whole again
-/// afterwards. Returns the facts and the registry open count.
 #[cfg(unix)]
 fn read_torn_after_first(
     claude: &Path,
@@ -138,8 +133,6 @@ fn tail_cache_reuses_only_one_process_and_one_unchanged_file() {
     let read =
         |cache: &mut TailCache, started, since| cache.read(&path, 4242, started, since).unwrap();
 
-    // An old conversation row cannot become this process's model merely
-    // because the unchanged tail is served from memory on a later tick.
     assert_eq!(read(&mut cache, Some(start), start), TailFacts::default());
     assert_eq!(read(&mut cache, Some(start), start), TailFacts::default());
     assert_eq!(cache.reads, 1, "unchanged tail is read once");
@@ -160,8 +153,6 @@ fn tail_cache_reuses_only_one_process_and_one_unchanged_file() {
     let whole = format!("{old}{}\n", assistant_row("claude-opus-7", during));
     assert_eq!(whole.len(), old.len() + newer.len());
     let old_modified = std::fs::metadata(&path).unwrap().modified().unwrap();
-    // The rewrite is told apart by its ctime alone: let the coarse clock some
-    // filesystems stamp it with (a Linux jiffy) tick past the append's.
     std::thread::sleep(std::time::Duration::from_millis(20));
     std::fs::write(&path, &whole).unwrap();
     std::fs::OpenOptions::new()
@@ -205,8 +196,6 @@ fn tail_cache_reuses_only_one_process_and_one_unchanged_file() {
         "same-size, same-mtime replacement invalidates"
     );
 
-    // A process restart on the identical transcript path must move the
-    // floor even before the new process has written a row of its own.
     let new_start = crate::harness::upgrade_models::parse_utc("2026-09-27T14:00:00Z").unwrap();
     assert_eq!(
         read(&mut cache, Some(new_start), new_start),
@@ -248,9 +237,6 @@ fn tail_cache_reuses_only_one_process_and_one_unchanged_file() {
 }
 
 /// The path and the branch follow the Bash tool: the newest main-thread
-/// `cwd` since the process started, read from the same tail as the model
-/// (an append included). A predecessor's row and a subagent's do not move
-/// them; with no such row they are the launch directory's.
 #[cfg(unix)]
 #[test]
 fn the_path_and_branch_follow_the_bash_tools_directory() {
@@ -310,7 +296,6 @@ fn the_path_and_branch_follow_the_bash_tools_directory() {
     let first = read(&mut cache);
     assert_eq!(first.path, shown(&cwd), "a predecessor's cwd is not ours");
     assert_eq!(first.branch.as_deref(), Some("main"));
-    // The tail is served from the cache; the repository is read live.
     std::fs::write(cwd.join(".git/HEAD"), "ref: refs/heads/topic\n").unwrap();
     assert_eq!(read(&mut cache).branch.as_deref(), Some("topic"));
     assert_eq!(cache.reads, 1, "git re-read while the transcript is not");
@@ -388,7 +373,6 @@ fn a_registry_entry_must_name_the_pid_it_is_filed_under() {
 fn the_slug_matches_claude_codes_project_directories() {
     assert_eq!(project_slug(Path::new("/home/dev/proj")), "-home-dev-proj");
     assert_eq!(project_slug(Path::new("/tmp/a.b c")), "-tmp-a-b-c");
-    // A measured one (home prefix anonymized): a dot folds as a slash does.
     assert_eq!(
         project_slug(Path::new(
             "/home/me/repo/.claude/worktrees/kitty-motion-wave"
@@ -422,8 +406,6 @@ fn the_tail_takes_the_newest_main_thread_model_and_effort() {
 }
 
 /// A `/model` command whose result this build cannot read (or none at all)
-/// leaves model and effort unknown; the tag quoted anywhere but at the start
-/// of a person's row is text.
 #[test]
 fn an_unreadable_model_choice_voids_model_and_effort() {
     let answer = r#"{"type":"assistant","timestamp":"2026-09-24T04:13:30.000Z","effort":"xhigh","message":{"model":"claude-opus-5"}}"#;
@@ -444,14 +426,12 @@ fn an_unreadable_model_choice_voids_model_and_effort() {
         void,
         "a result this build does not read is no model"
     );
-    // Negative control: the same tail without the command row.
     assert_eq!(
         tail_facts(format!("{answer}\n").as_bytes(), start)
             .model
             .shown(),
         Some("Opus 5")
     );
-    // The tag quoted anywhere but at the start of a person's row is text.
     for quoted in [
         r#"{"type":"assistant","timestamp":"2026-09-24T04:13:31.000Z","message":{"model":"<synthetic>","content":"<command-name>/model</command-name>"}}"#,
         r#"{"type":"user","timestamp":"2026-09-24T04:13:31.000Z","message":{"content":[{"type":"tool_result","content":"<command-name>/model</command-name>"}]}}"#,
@@ -488,8 +468,6 @@ fn an_unstamped_row_is_not_attributed() {
 }
 
 /// Model results in every build's spelling show the vendor's name
-/// (`(default)`, `(1M context)` dropped); anything not plainly a name is
-/// no model.
 #[test]
 fn a_model_result_display_is_the_vendors_name() {
     let result = |text: &str| {
@@ -521,8 +499,6 @@ fn a_model_result_display_is_the_vendors_name() {
             "\u{21AF} Fast mode ON \u{00B7} model set to `Opus 5.5` \u{00B7} $30/$150 per Mtok",
             "Opus 5.5",
         ),
-        // The icon in the theme's fast-mode colour; the classifier strips
-        // the colour first.
         (FAST_ON_COLOURED, "Opus 5.5"),
     ] {
         assert_eq!(result(text).model.shown(), Some(model), "{text:?}");
@@ -534,7 +510,6 @@ fn a_model_result_display_is_the_vendors_name() {
         (with_effort.model.shown(), with_effort.effort.shown()),
         (Some("Opus 5.5"), Some("xhigh"))
     );
-    // Hostile or unreadable: never a model.
     for text in [
         "Set model to `Opus\u{7}5`",
         "Set model to `Opus\n5`",
@@ -544,7 +519,6 @@ fn a_model_result_display_is_the_vendors_name() {
     ] {
         assert_eq!(result(text).model, Said::Unread, "{text:?}");
     }
-    // Not a model result at all: says nothing about the model.
     for text in [
         "Cloud session couldn't switch to `Opus 5.5`",
         "Model switch to X was blocked by a PreModelSwitch hook",
@@ -552,7 +526,6 @@ fn a_model_result_display_is_the_vendors_name() {
         "Kept Fast mode ON \u{00B7} model set to `Opus 5.5`",
         "\u{1b}[38;2;255;106;0m\u{21AF}\u{1b}[39m Kept Fast mode ON \u{00B7} model set to `Opus 5.5`",
         "Fast mode ON",
-        // `/fast on` for a model that is already fast: no `model set to`.
         "\u{1b}[38;2;255;106;0m\u{21AF}\u{1b}[39m Fast mode ON \u{00B7} $30/$150 per Mtok",
         "Fast mode OFF",
     ] {
@@ -561,12 +534,9 @@ fn a_model_result_display_is_the_vendors_name() {
 }
 
 /// A `/fast on` that moved the model: coloured `↯` icon, the phrase and
-/// the new model.
 const FAST_ON_COLOURED: &str = "\u{1b}[38;2;255;106;0m\u{21AF}\u{1b}[39m Fast mode ON \u{00B7} model set to `Opus 5.5` \u{00B7} $30/$150 per Mtok";
 
 /// A `/model` picker that changed nothing (`type:system` rows with
-/// `Kept model as`) decides nothing. Negative control: the same command
-/// as a `type:user` choice row with no readable result voids both.
 #[test]
 fn a_kept_model_leaves_the_facts_as_they_were() {
     const ANSWER: &str = r#"{"parentUuid":"00000000-0000-4000-8000-000000000030","isSidechain":false,"type":"assistant","effort":"xhigh","message":{"model":"claude-fable-5-1","role":"assistant","content":[{"type":"text","text":"Done."}]},"uuid":"00000000-0000-4000-8000-000000000031","timestamp":"2026-09-22T17:05:50.000Z","userType":"external","entrypoint":"cli","cwd":"/Users//person/ty","sessionId":"00000000-0000-4000-8000-000000000004","version":"2.1.278"}"#;
@@ -583,7 +553,6 @@ fn a_kept_model_leaves_the_facts_as_they_were() {
         (kept.model.shown(), kept.effort.shown()),
         (Some("Fable 5.1"), Some("xhigh"))
     );
-    // Negative control: a choice row with no readable result under it.
     let choice = KEPT_COMMAND.replace(
         r#""type":"system","subtype":"local_command","content":"#,
         r#""type":"user","message":{"role":"user","content":"#,
@@ -598,7 +567,6 @@ fn a_kept_model_leaves_the_facts_as_they_were() {
 }
 
 /// A transcript row of an answer by `model`, stamped `at`, with its
-/// `effort` when the model has one.
 fn answer_at(model: &str, at: &str, effort: Option<&str>) -> String {
     let effort = effort.map_or(String::new(), |e| format!(r#","effort":"{e}""#));
     format!(r#"{{"type":"assistant","timestamp":"{at}"{effort},"message":{{"model":"{model}"}}}}"#)
@@ -628,10 +596,6 @@ fn body(rows: &[&str]) -> String {
 }
 
 /// [`chose_model_since`]: every `/model` command row is a choice whatever its
-/// result says (a kept or unreadable model still sets Claude's main-loop
-/// override), and so is a result that moved the model with no command row.
-/// Negative controls: a `Kept model` alone, an answer, another command, a
-/// `/model` before the floor and the tag quoted in a person's text pin nothing.
 #[test]
 fn a_model_command_row_pins_whatever_its_result_says() {
     let dir = aterm_tempfile::Builder::new()
@@ -678,8 +642,6 @@ fn a_model_command_row_pins_whatever_its_result_says() {
 }
 
 /// A model result without `with … effort` keeps the earlier effort only if
-/// it was read for the new model. Negative controls: a switch to that same
-/// model keeps it, and an explicit clause names it.
 #[test]
 fn a_switch_that_names_no_effort_keeps_it_only_for_the_same_model() {
     let start = crate::harness::upgrade_models::parse_utc("2026-09-28T15:00:00Z");
@@ -709,8 +671,6 @@ fn a_switch_that_names_no_effort_keeps_it_only_for_the_same_model() {
             effort.map_or(Said::Unread, |e| Said::Is(e.to_owned())),
         )
     };
-    // Opus 5.5 at xhigh, then Haiku 4.5 — which has
-    // no effort levels — and then a Haiku answer, which names none.
     let [c, r] = switch("2026-09-28T15:02:00.000Z", "Haiku 4.5");
     let haiku = answer_at(
         "claude-haiku-4-5-20251001",
@@ -723,22 +683,16 @@ fn a_switch_that_names_no_effort_keeps_it_only_for_the_same_model() {
         is("Haiku 4.5", None),
         "never Haiku 4.5 xhigh, after any number of Haiku answers"
     );
-    // Negative control: a switch to the model the effort was read for.
     let [c, r] = switch("2026-09-28T15:02:00.000Z", "Opus 5.5 (default)");
     assert_eq!(facts(&[&opus, &c, &r]), is("Opus 5.5", Some("xhigh")));
-    // Through two switches: Sonnet 5 ran between, so a switch back to
-    // Opus 5.5 does not bring Opus 5.5's xhigh back.
     let [c1, r1] = switch("2026-09-28T15:02:00.000Z", "Sonnet 5");
     let [c2, r2] = switch("2026-09-28T15:02:30.000Z", "Opus 5.5");
     assert_eq!(facts(&[&opus, &c1, &r1, &c2, &r2]), is("Opus 5.5", None));
-    // An `/effort` after the switch is the new model's own.
     let [e1, e2] = effort_high("2026-09-28T15:02:10.000Z");
     assert_eq!(
         facts(&[&opus, &c1, &r1, &e1, &e2]),
         is("Sonnet 5", Some("high"))
     );
-    // An `/effort` before the switch was set on the model then running:
-    // kept only when that is the model switched to.
     let [e1, e2] = effort_high("2026-09-28T15:01:30.000Z");
     assert_eq!(facts(&[&opus, &e1, &e2, &c1, &r1]), is("Sonnet 5", None));
     let [c, r] = switch("2026-09-28T15:02:00.000Z", "Opus 5.5");
@@ -746,15 +700,12 @@ fn a_switch_that_names_no_effort_keeps_it_only_for_the_same_model() {
         facts(&[&opus, &e1, &e2, &c, &r]),
         is("Opus 5.5", Some("high"))
     );
-    // A result that names the effort names it, whatever ran before.
     let clause = result_at(
         "2026-09-28T15:02:00.000Z",
         "Set model to `Sonnet 5` for this session only with `high` effort",
     );
     let c = command_at("model", "2026-09-28T15:02:00.000Z");
     assert_eq!(facts(&[&opus, &c, &clause]), is("Sonnet 5", Some("high")));
-    // With no older model named, the launch model decides
-    // (`facts_for_entry_at`).
     let [c, r] = switch("2026-09-28T15:02:00.000Z", "Sonnet 5");
     let alone = tail_facts(body(&[&c, &r]).as_bytes(), start);
     assert_eq!(
@@ -764,8 +715,6 @@ fn a_switch_that_names_no_effort_keeps_it_only_for_the_same_model() {
 }
 
 /// A command pairs only with the result directly under it: a `/fast` move
-/// does not settle an older unreadable `/model`, so the effort is unknown.
-/// Negative control: the move alone keeps the effort.
 #[test]
 fn a_command_pairs_only_with_the_result_directly_under_it() {
     let start = crate::harness::upgrade_models::parse_utc("2026-09-28T15:00:00Z");
@@ -778,30 +727,22 @@ fn a_command_pairs_only_with_the_result_directly_under_it() {
         let facts = tail_facts(body(rows).as_bytes(), start);
         (facts.model, facts.effort)
     };
-    // 3a: the unreadable choice alone voids both.
     assert_eq!(
         facts(&[&opus, &model_cmd, &unread]),
         (Said::Unread, Said::Unread)
     );
-    // 3b: a `/fast` move after it names the model,
-    // and the effort stays unknown.
     assert_eq!(
         facts(&[&opus, &model_cmd, &unread, &fast_cmd, &fast]),
         (Said::Is("Opus 5.5".into()), Said::Unread)
     );
-    // 3c: a `/model` command with no result under it, then the move: the
-    // move's result is its own command's, not the `/model` one's.
     assert_eq!(
         facts(&[&opus, &model_cmd, &fast_cmd, &fast]),
         (Said::Is("Opus 5.5".into()), Said::Unread)
     );
-    // Negative control: the move alone keeps the effort.
     assert_eq!(
         facts(&[&opus, &fast_cmd, &fast]),
         (Said::Is("Opus 5.5".into()), Said::Is("xhigh".into()))
     );
-    // …only when it was read for the model moved to; a `/fast` that moved
-    // nothing decides nothing, whatever its command row.
     let fable = answer_at("claude-fable-5-1", "2026-09-28T15:01:00.000Z", Some("high"));
     assert_eq!(
         facts(&[&fable, &fast_cmd, &fast]),
@@ -815,9 +756,6 @@ fn a_command_pairs_only_with_the_result_directly_under_it() {
 }
 
 /// [`scan`] reads back to the floor: a row stamped in the floor's own second is
-/// the process's, and the first row stamped before it ends the scan as a
-/// predecessor's, so no row above it is read whatever its stamp (the file is in
-/// append order), and the scan says it met the floor (the read's `resumed`).
 #[test]
 fn the_floor_second_is_the_processs_and_the_first_row_before_it_ends_the_scan() {
     let floor = crate::harness::upgrade_models::parse_utc("2026-09-28T15:00:00Z");
@@ -836,7 +774,6 @@ fn the_floor_second_is_the_processs_and_the_first_row_before_it_ends_the_scan() 
 }
 
 /// One Claude Code process on disk for the resolver's tests: registry
-/// file, transcripts, and the read clock (its start until [`Self::at`]).
 #[cfg(unix)]
 struct Proc {
     _root: aterm_tempfile::TempDir,
@@ -878,7 +815,6 @@ impl Proc {
     }
 
     /// The registry names `session` for the process — the same pid,
-    /// `procStart` and `startedAt` whatever the session.
     fn register(&self, session: &str) {
         std::fs::write(
             self.claude.join("sessions/4242.json"),
@@ -911,9 +847,6 @@ impl Proc {
 }
 
 /// Launched with `--model` Haiku 4.5 and switched to Sonnet 5 with no
-/// effort named: the footer shows no effort until one is named for Sonnet
-/// 5. Negative controls: launched on Sonnet 5 the effort stays open for the
-/// card, and an `/effort` read before the switch stands.
 #[cfg(unix)]
 #[test]
 fn a_switch_from_the_launch_model_names_no_effort_until_one_is_read() {
@@ -937,13 +870,9 @@ fn a_switch_from_the_launch_model_names_no_effort_until_one_is_read() {
         !facts.effort_open,
         "Haiku 4.5's launch card may not fill it"
     );
-    // With no flag, the card may speak for the launch model — only when it
-    // names the model switched to ([`a_launch_card_fills_only_open_facts`]).
     let open = proc.read(&LaunchFacts::default(), &mut TailCache::default());
     assert!(open.effort_open);
     assert_eq!(open.effort_for.as_deref(), Some("Sonnet 5"));
-    // Negative control: launched on Sonnet 5 the switch is to itself; an
-    // earlier `/effort` stands.
     let sonnet_flag = argv("claude-sonnet-5");
     let same = proc.read(&sonnet_flag, &mut TailCache::default());
     assert!(same.effort_open && same.effort.is_none());
@@ -969,11 +898,6 @@ fn a_switch_from_the_launch_model_names_no_effort_until_one_is_read() {
 }
 
 /// An in-REPL `/resume` into an older conversation restores its model
-/// unless the launch pinned it (an alias, an environment pin); unpinned, the
-/// effort stands only for that model. A resumed conversation whose newest
-/// answer names no plain model shows none; one with no answer restores
-/// nothing and pins nothing. The model-only walk (`Resume`, `Clear`, a
-/// choice, `--model`) is `tests/conformance_footer_model.rs`'s.
 #[cfg(unix)]
 #[test]
 fn a_resume_carries_the_model_only_where_the_process_pinned_it() {
@@ -982,7 +906,6 @@ fn a_resume_carries_the_model_only_where_the_process_pinned_it() {
     const R: &str = "00000000-0000-4000-8000-0000000000c1";
     let proc = Proc::new("resume", "2026-09-28T15:00:00Z");
     let opus = answer_at("claude-opus-5-5", "2026-09-28T15:01:00.000Z", Some("xhigh"));
-    // The resumed conversation's answer, written by an earlier process.
     let old = answer_at("claude-fable-5-1", "2026-09-27T10:00:00.000Z", Some("high"));
     let shown = |f: &FooterFacts| (f.model.clone(), f.effort.clone());
     let is = |m: &str, e: Option<&str>| (Some(m.to_owned()), e.map(str::to_owned));
@@ -995,8 +918,6 @@ fn a_resume_carries_the_model_only_where_the_process_pinned_it() {
         proc.register(R);
         (before, proc.read(launch, &mut cache), cache)
     };
-    // Unpinned: the resume restored Fable 5.1 — Opus 5.5's xhigh is not
-    // Fable 5.1's.
     let (before, after, _) = run(&[&opus], &LaunchFacts::default(), &[&old]);
     assert_eq!(shown(&before), is("Opus 5.5", Some("xhigh")));
     assert_eq!(
@@ -1005,18 +926,12 @@ fn a_resume_carries_the_model_only_where_the_process_pinned_it() {
         "never the pre-resume model"
     );
     assert!(!after.model_open && !after.effort_open);
-    // Unpinned, the same model: the effort was read for it, and stands.
     let fable = answer_at("claude-fable-5-1", "2026-09-28T15:01:00.000Z", Some("low"));
     let (_, after, _) = run(&[&fable], &LaunchFacts::default(), &[&old]);
     assert_eq!(shown(&after), is("Fable 5.1", Some("low")));
-    // A resumed conversation whose newest answer names no plain model:
-    // no model, never an older answer's.
     let odd = answer_at("claude opus", "2026-09-27T10:00:03.000Z", Some("high"));
     let (_, after, _) = run(&[&opus], &LaunchFacts::default(), &[&old, &odd]);
     assert_eq!(shown(&after), (None, None));
-    // A resumed conversation with no answer at all (a choice there, never
-    // answered): Claude restores nothing, the process keeps its model, and
-    // nothing is pinned; the next `/resume` restores B's.
     let chose_there = [
         command_at("model", "2026-09-27T10:00:00.000Z"),
         result_at(
@@ -1040,7 +955,6 @@ fn a_resume_carries_the_model_only_where_the_process_pinned_it() {
         Some("Sonnet 5"),
         "no answer, no restore, no pin"
     );
-    // Pinned by the launch without a real id: an alias, an environment pin.
     let argv = |args: &[&str]| args.iter().map(|a| (*a).to_owned()).collect::<Vec<_>>();
     for launch in [
         launch_facts(&argv(&["claude", "--model", "opus"])),
@@ -1055,11 +969,6 @@ fn a_resume_carries_the_model_only_where_the_process_pinned_it() {
 }
 
 /// A launch resume restores and pins from the start: the restored model is
-/// named at once, its effort open for its card alone; `--continue` pins as
-/// `--resume` does; an untied first sight shows nothing but keeps the pin.
-/// Negative controls: an environment pin restores nothing; a conversation
-/// with no answer pins nothing. `--resume` with and without `--model` is
-/// `tests/conformance_footer_model.rs`'s.
 #[cfg(unix)]
 #[test]
 fn a_launch_resume_pins_the_model_from_the_start() {
@@ -1086,14 +995,11 @@ fn a_launch_resume_pins_the_model_from_the_start() {
         "the effort open for Fable 5.1's card alone"
     );
     assert_eq!(first.effort_for, fable);
-    // `claude --continue`, then `/resume Y`: pinned.
     let continued = launch_facts(&argv(&["claude", "--continue"]));
     let mut cache = TailCache::default();
     assert_eq!(model(&proc.read(&continued, &mut cache)), fable);
     proc.register(Y);
     assert_eq!(model(&proc.read(&continued, &mut cache)), fable, "pinned");
-    // A first sight the launch does not name shows no model, yet the pin
-    // stands: `/resume Y` never shows Sonnet 5.
     for launch in [LaunchFacts::default(), resumed.clone()] {
         proc.register(Z);
         let mut cache = TailCache::default();
@@ -1101,7 +1007,6 @@ fn a_launch_resume_pins_the_model_from_the_start() {
         proc.register(Y);
         assert_eq!(model(&proc.read(&launch, &mut cache)), None, "{launch:?}");
     }
-    // Negative control: pinned by the environment, nothing is restored.
     let env = launch_facts_of(
         &argv(&["claude", "--resume", X]),
         &argv(&["ANTHROPIC_MODEL=claude-opus-5-5"]),
@@ -1111,8 +1016,6 @@ fn a_launch_resume_pins_the_model_from_the_start() {
     assert_eq!(model(&proc.read(&env, &mut cache)), None);
     proc.register(Y);
     assert_eq!(model(&proc.read(&env, &mut cache)), None);
-    // Negative control: no answer to restore, so the next `/resume`
-    // restores Y's.
     proc.write(X, &[prompt_old]);
     proc.register(X);
     let mut cache = TailCache::default();
@@ -1125,12 +1028,6 @@ fn a_launch_resume_pins_the_model_from_the_start() {
 }
 
 /// A `/resume` is told from a `/clear` by when the switch came: a
-/// conversation whose own first row predates the last sighting existed
-/// before the switch (even one another tab began after this process
-/// started), so its model is restored — its effort not the other tab's —
-/// and pinned; a resume back into the process's own session pins too.
-/// The floor-only judge, a choice's pin and an answered `/clear` are
-/// `tests/conformance_footer_model.rs`'s (`FloorOnly`, `ResumeLate`).
 #[cfg(unix)]
 #[test]
 fn a_resume_into_a_conversation_begun_since_the_start_pins_it() {
@@ -1149,7 +1046,6 @@ fn a_resume_into_a_conversation_begun_since_the_start_pins_it() {
     let model = |f: &FooterFacts| f.model.clone();
     let shown = |f: &FooterFacts| (f.model.clone(), f.effort.clone());
     let is = |m: &str, e: Option<&str>| (Some(m.to_owned()), e.map(str::to_owned));
-    // S (last seen at 15:25), `/resume D`, `/resume B`.
     proc.register(S);
     proc.write(S, &[&opus]);
     let mut cache = TailCache::default();
@@ -1172,8 +1068,6 @@ fn a_resume_into_a_conversation_begun_since_the_start_pins_it() {
         Some("Fable 5.1"),
         "the restore pinned it"
     );
-    // `/clear` into C, then `/resume S` — back into the session this
-    // process began: Claude restores S's Opus 5.5 and pins it.
     proc.register(S);
     proc.write(C, &[]);
     let mut cache = TailCache::default();
@@ -1196,9 +1090,6 @@ fn a_resume_into_a_conversation_begun_since_the_start_pins_it() {
 }
 
 /// A conversation whose file was born before the last sighting existed
-/// before the switch whatever its rows say, so it restores and pins.
-/// Negative control: born after that moment, a branch of copies is no
-/// resume.
 #[cfg(unix)]
 #[test]
 fn a_conversation_born_before_the_switch_is_resumed() {
@@ -1219,7 +1110,6 @@ fn a_conversation_born_before_the_switch_is_resumed() {
     proc.register(S);
     proc.write(S, &[&opus]);
     proc.write(B, &[&sonnet_old]);
-    // X is made now, by another tab.
     proc.write(X, &[&copied]);
     let launch = LaunchFacts::default();
     let run = |seen_in_s: u64| {
@@ -1250,9 +1140,6 @@ fn a_conversation_born_before_the_switch_is_resumed() {
 }
 
 /// A `/branch`'s copied `memory-mode` row (original stamp, no `forkedFrom`)
-/// is not the branch's own first row, so a fresh branch is not read as a
-/// `/resume`. Negative control: without `own_rows` the head's first stamp
-/// is the copied one.
 #[cfg(unix)]
 #[test]
 fn a_branchs_copied_memory_mode_row_is_not_its_own() {
@@ -1278,8 +1165,6 @@ fn a_branchs_copied_memory_mode_row_is_not_its_own() {
     let sonnet_old = answer_at("claude-sonnet-5", &stamp(now - 7 * 86_400), Some("high"));
     proc.write(S, &[&memory_mode(S, now - 1900), &opus]);
     proc.write(B, &[&sonnet_old]);
-    // The branch, begun after the process was last seen in S: the copy,
-    // then the memory-mode row as the vendor writes it.
     proc.write(F, &[&copied, &memory_mode(F, now - 1900)]);
     let path = |session: &str| proc.project.join(format!("{session}.jsonl"));
     let head =
@@ -1291,7 +1176,6 @@ fn a_branchs_copied_memory_mode_row_is_not_its_own() {
         "control: the head's first stamp is the copy's"
     );
 
-    // S seen, `/branch` to F, then `/resume B`.
     let launch = LaunchFacts::default();
     let mut cache = TailCache::default();
     proc.register(S);
@@ -1317,9 +1201,6 @@ fn a_branchs_copied_memory_mode_row_is_not_its_own() {
 }
 
 /// A resumed conversation's newest answer past [`MAX_LINE_BYTES`] makes the
-/// model unknown, never an older answer's, however windows cut the row.
-/// Negative controls: an oversized non-answer, and an oversized answer of
-/// the process's own since the floor, are passed over.
 #[cfg(unix)]
 #[test]
 fn an_oversized_newest_answer_is_never_passed_over() {
@@ -1328,8 +1209,6 @@ fn an_oversized_newest_answer_is_never_passed_over() {
     let proc = Proc::new("oversized", "2026-09-28T15:00:00Z");
     let opus = answer_at("claude-opus-5-5", "2026-09-28T15:01:00.000Z", Some("xhigh"));
     let sonnet_old = answer_at("claude-sonnet-5", "2026-09-26T10:00:00.000Z", Some("high"));
-    // Claude's own key order: `message` first, `type` and `timestamp`
-    // after it.
     let big_answer = |model: &str, at: &str, bytes: usize| {
         format!(
             r#"{{"parentUuid":"p","isSidechain":false,"message":{{"model":"{model}","role":"assistant","content":[{{"type":"tool_use","name":"Write","input":{{"content":"{}"}}}}]}},"type":"assistant","uuid":"u","timestamp":"{at}","effort":"high"}}"#,
@@ -1351,8 +1230,6 @@ fn an_oversized_newest_answer_is_never_passed_over() {
         proc.register(A);
         proc.read(&LaunchFacts::default(), &mut cache).model
     };
-    // 300 KB: past a row's limit, inside one read window; 1.2 MB:
-    // across three windows.
     for bytes in [300 * 1024, 1200 * 1024] {
         let big = big_answer("claude-fable-5-1", "2026-09-27T10:05:00.000Z", bytes);
         assert_eq!(after_resume(&[&sonnet_old, &big]), None, "R4 at {bytes}");
@@ -1362,7 +1239,6 @@ fn an_oversized_newest_answer_is_never_passed_over() {
             Some("Sonnet 5"),
             "a tool result at {bytes}"
         );
-        // Restored Sonnet 5 runs on: its own answer, since the floor.
         let own = big_answer("claude-sonnet-5", "2026-09-28T15:06:00.000Z", bytes);
         assert_eq!(
             after_resume(&[&sonnet_old, &own]).as_deref(),
@@ -1373,7 +1249,6 @@ fn an_oversized_newest_answer_is_never_passed_over() {
 }
 
 /// [`rows_back`] meets every row once, newest first, an oversized one in
-/// its place by its end, however windows fall across it.
 #[cfg(unix)]
 #[test]
 fn rows_back_meets_an_oversized_row_once_in_its_place() {
@@ -1418,8 +1293,6 @@ fn rows_back_meets_an_oversized_row_once_in_its_place() {
 }
 
 /// What pins the model at launch: any `--model` or an environment model pin;
-/// only a real id is shown. An empty or other variable pins nothing. A
-/// launch resume is recorded, not a pin ([`TailCache`] decides).
 #[test]
 fn a_launch_pins_the_model_by_flag_or_environment() {
     let argv = |args: &[&str]| args.iter().map(|a| (*a).to_owned()).collect::<Vec<_>>();
@@ -1478,8 +1351,6 @@ fn a_launch_pins_the_model_by_flag_or_environment() {
         of(&["claude", "--resume", "x", "--fork-session"], &[]).resume,
         Some(LaunchResume::Unnamed)
     );
-    // The model shown is the last `--model`, as Claude's parser takes it,
-    // in either spelling.
     assert_eq!(
         of(&["claude", "--model=claude-fable-5-1[1m]"], &[])
             .model
@@ -1503,8 +1374,6 @@ fn a_launch_pins_the_model_by_flag_or_environment() {
         .as_deref(),
         Some("Opus 5.5")
     );
-    // The Claude home the environment named, raw, for the resume line
-    // (`resume::home_env`): set and empty is named too; none, none.
     assert_eq!(
         of(&["claude"], &["CLAUDE_CONFIG_DIR=/w/.claude"])
             .config
@@ -1519,7 +1388,6 @@ fn a_launch_pins_the_model_by_flag_or_environment() {
 }
 
 /// `/effort` results name the effort at once (top-effort mode as `xhigh`);
-/// `auto`, an unknown level or an unreadable result make it unknown.
 #[test]
 fn an_effort_result_names_the_effort_at_once() {
     let start = crate::harness::upgrade_models::parse_utc("2026-09-24T04:13:26Z");
@@ -1576,7 +1444,6 @@ fn an_effort_result_names_the_effort_at_once() {
         Said::Unread,
         "an unreadable result is no effort"
     );
-    // Negative control: without the command, the answer's effort stands.
     assert_eq!(
         tail_facts(format!("{answer}\n").as_bytes(), start)
             .effort
@@ -1586,10 +1453,6 @@ fn an_effort_result_names_the_effort_at_once() {
 }
 
 /// The carry and backward read: a named model survives appends larger than
-/// the tail window, a choice in an append is read at once, and a fresh read
-/// looks back past a huge row for the model and the Bash tool's directory.
-/// Negative controls: the plain window misses the answer; a new floor or a
-/// shrunk file are read afresh.
 #[cfg(unix)]
 #[test]
 fn an_answer_past_the_tail_window_is_carried_for_the_same_process() {
@@ -1623,12 +1486,10 @@ fn an_answer_past_the_tail_window_is_carried_for_the_same_process() {
         "the answer is 600 KiB above the tail now: carried"
     );
     assert_eq!(cache.appends, 1, "read as an append");
-    // Control: the plain tail window does not see it.
     assert_eq!(
         read_tail_facts(&path, Some(start)).unwrap().model,
         Said::Unsaid
     );
-    // A read afresh looks back past the huge row.
     let fresh = TailCache::default()
         .read_since(&path, 4242, Some(start), start)
         .unwrap();
@@ -1645,9 +1506,7 @@ fn an_answer_past_the_tail_window_is_carried_for_the_same_process() {
         "every appended byte is scanned"
     );
     assert_eq!(cache.appends, 2);
-    // A new floor (an in-place exec after every row) is never carried.
     assert_eq!(read(&mut cache, start + 6 * 3600), TailFacts::default());
-    // A file rewritten shorter is read afresh.
     assert_eq!(read(&mut cache, start).model.shown(), Some("Fable 5.1"));
     std::fs::write(
         &path,
@@ -1663,7 +1522,6 @@ fn an_answer_past_the_tail_window_is_carried_for_the_same_process() {
 }
 
 /// The floor is the kernel's start, else the registry's `procStart` (the
-/// path where the kernel cannot be asked); with neither, no model.
 #[test]
 fn facts_floor_at_the_kernel_else_the_registry_start() {
     let root = std::env::temp_dir().join(format!("aterm-footer-floor-{}", std::process::id()));
@@ -1711,11 +1569,8 @@ fn facts_floor_at_the_kernel_else_the_registry_start() {
     assert_eq!(model(None), None, "the registry's start floors it");
     entry(None);
     assert_eq!(model(None), None, "no start known: no model");
-    // Negative control: a floor older than the answer reads it.
     entry(Some(start - 3 * 86_400));
     assert_eq!(model(None).as_deref(), Some("Opus 5"));
-    // An image exec'd in place (same pid, same kernel start) registers
-    // its own `startedAt`: the floor moves with it.
     let old_start = start - 3 * 86_400;
     std::fs::write(
         claude.join("sessions/4242.json"),
@@ -1732,8 +1587,6 @@ fn facts_floor_at_the_kernel_else_the_registry_start() {
         None,
         "the pre-exec image's answer does not speak for the new one"
     );
-    // The process's `--model` names the model while the transcript since
-    // the floor names none, and closes it to the launch card.
     let entry = session_of_pid(&claude, 4242, Some(old_start)).unwrap();
     let launch = launch_facts(&["claude".into(), "--model".into(), "claude-opus-5-5".into()]);
     let facts = facts_for_entry_at(
@@ -1755,7 +1608,6 @@ fn facts_floor_at_the_kernel_else_the_registry_start() {
         }),
         "the floor is the image's"
     );
-    // With no start known at all, the launch flag is still the process's own.
     let unfloored = SessionEntry {
         proc_start: None,
         started_at: None,
@@ -1775,9 +1627,6 @@ fn facts_floor_at_the_kernel_else_the_registry_start() {
 }
 
 /// `/clear` gives the same process a new session id and empty transcript;
-/// the model and effort chosen in the left session stand, never `--model`
-/// or the card. Negative control: a reader keeping nothing shows the flag's
-/// model. A new floor inherits nothing.
 #[test]
 fn a_clear_keeps_the_model_the_process_chose() {
     let root = std::env::temp_dir().join(format!("aterm-footer-clear-{}", std::process::id()));
@@ -1806,7 +1655,6 @@ fn a_clear_keeps_the_model_the_process_chose() {
         std::fs::write(project.join(format!("{session}.jsonl")), body).unwrap();
     };
     let launch = launch_facts(&["claude".into(), "--model".into(), "claude-opus-5-5".into()]);
-    // Each read at the wall-clock time it names.
     let read_at = |cache: &mut TailCache, at: &str| {
         let entry = session_of_pid(&claude, 4242, Some(start)).expect("the registry");
         let at = crate::harness::upgrade_models::parse_utc(at).unwrap();
@@ -1836,8 +1684,6 @@ fn a_clear_keeps_the_model_the_process_chose() {
         (facts.model.as_deref(), facts.effort.as_deref()),
         (Some("Fable 5.1"), None)
     );
-    // An unread `/effort`, then `/clear`: the left session is re-read at
-    // the switch, so the effort is not lost.
     transcript(A, &[CHOICE[0], CHOICE[1], EFFORT]);
     registry(B, start);
     let facts = read_at(&mut cache, "2026-09-28T15:04:30Z");
@@ -1851,21 +1697,17 @@ fn a_clear_keeps_the_model_the_process_chose() {
         "the card may not fill it"
     );
     assert_eq!(facts.owner.map(|o| o.session_id).as_deref(), Some(B));
-    // Negative control: nothing kept of the process: the launch flag.
     assert_eq!(
         read_at(&mut TailCache::default(), "2026-09-28T15:04:30Z")
             .model
             .as_deref(),
         Some("Opus 5.5")
     );
-    // A registry read that lands mid-write clears the tail, not the process.
     cache.clear();
     assert_eq!(
         read_at(&mut cache, "2026-09-28T15:05:00Z").model.as_deref(),
         Some("Fable 5.1")
     );
-    // An image exec'd in place registers a new `startedAt`: a new floor,
-    // a new process for the footer — its own `--model`, nothing carried.
     registry(C, start + 3600);
     let facts = read_at(&mut cache, "2026-09-28T16:05:00Z");
     assert_eq!(facts.model.as_deref(), Some("Opus 5.5"));
@@ -1906,9 +1748,6 @@ fn git_head_follows_a_worktree_file_and_climbs_to_the_top() {
     std::fs::create_dir_all(&wt).unwrap();
     std::fs::write(wt.join(".git"), format!("gitdir: {}\n", wt_git.display())).unwrap();
     assert_eq!(git_head(&wt), Some("feature".to_owned()));
-    // The root is where the climb found `.git`: the repository's top from
-    // a directory deep in it, a worktree's own (its `.git` file's), never
-    // the directory read from.
     assert_eq!(
         read_git_head(&main.join("crates/deep")),
         GitHeadRead::Found("main".into(), main.clone())
@@ -1922,7 +1761,6 @@ fn git_head_follows_a_worktree_file_and_climbs_to_the_top() {
 }
 
 /// A scratch `$HOME` whose repositories sit under `place` (a path below the
-/// home): `place/repo/.git/HEAD` names `branch`. Returns `(root, home, repo)`.
 fn repo_under(tag: &str, place: &str, branch: &str) -> (PathBuf, PathBuf, PathBuf) {
     let root = std::env::temp_dir().join(format!("aterm-footer-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
@@ -1938,10 +1776,6 @@ fn repo_under(tag: &str, place: &str, branch: &str) -> (PathBuf, PathBuf, PathBu
 }
 
 /// A repository inside a sync provider's folder or another app's container
-/// shows no branch rather than open a file whose system dialog would park the
-/// shared footer thread. The same layout in an ordinary (or per-folder
-/// protected) folder — including `Library/Caches/y` beside `Library/Containers`
-/// — is read.
 #[test]
 fn read_git_head_opens_nothing_under_a_file_provider_domain() {
     for place in [
@@ -1956,7 +1790,6 @@ fn read_git_head_opens_nothing_under_a_file_provider_domain() {
             GitHeadRead::Absent,
             "{place}"
         );
-        // a subdirectory of the repository climbs to the same `.git`
         std::fs::create_dir_all(repo.join("src")).unwrap();
         assert_eq!(
             read_git_head_in(Some(&home), &repo.join("src")),
@@ -1982,9 +1815,6 @@ fn read_git_head_opens_nothing_under_a_file_provider_domain() {
 }
 
 /// A worktree outside a provider domain or app container can point its
-/// `gitdir:` into one; the `HEAD` there is not opened either. A symlink into
-/// one is caught too. (An ordinary worktree file is followed:
-/// [`git_head_follows_a_worktree_file_and_climbs_to_the_top`].)
 #[cfg(unix)]
 #[test]
 fn a_worktree_pointing_into_a_provider_domain_is_absent() {
@@ -2006,7 +1836,6 @@ fn a_worktree_pointing_into_a_provider_domain_is_absent() {
             GitHeadRead::Absent,
             "{place}"
         );
-        // a symlink from an ordinary folder into the guarded root
         let link = home.join("src").join("link");
         std::os::unix::fs::symlink(&provider_repo, &link).unwrap();
         assert_eq!(
@@ -2019,9 +1848,6 @@ fn a_worktree_pointing_into_a_provider_domain_is_absent() {
 }
 
 /// A kernel refusal is its own answer, not "no repository": `EPERM` (what a
-/// macOS folder privacy consent returns) is denied, while `EACCES` (a
-/// directory stripped of its search bit) and a missing file stay `Absent`, so
-/// only a consent refusal raises the host's consent attention.
 #[cfg(unix)]
 #[test]
 fn only_an_eperm_refusal_reads_as_denied() {
@@ -2086,9 +1912,6 @@ fn the_path_shows_home_as_a_tilde() {
 }
 
 /// The account stands after the model: the process's two facts, then the
-/// directory's two, a limit wall still first and the tokens still last.
-/// Negative control: with no account there is no such mark, and the other
-/// five stand in that order.
 #[test]
 fn the_account_stands_after_the_model_and_before_the_path() {
     use crate::harness::session_usage::{ModelTokens, UsageFacts, Wall};
@@ -2136,14 +1959,12 @@ fn the_account_stands_after_the_model_and_before_the_path() {
         Segment::plain(ACCOUNT_MARK, "work-2"),
         "the label, whole"
     );
-    // With the model alone, and with nothing else at all.
     let bare = FooterFacts {
         model: Some("Opus 5.5".into()),
         account: Some("work-2".into()),
         ..FooterFacts::default()
     };
     assert_eq!(marks(&bare), [MODEL_MARK, ACCOUNT_MARK]);
-    // Negative control: no account, no mark; the other five stand.
     assert_eq!(
         marks(&plain),
         [WALL_MARK, MODEL_MARK, PATH_MARK, BRANCH_MARK, USAGE_MARK]
@@ -2151,10 +1972,6 @@ fn the_account_stands_after_the_model_and_before_the_path() {
 }
 
 /// End to end over a temp Claude directory: the fold reads the transcript
-/// this process's sessions file names, only what was appended, sums
-/// subagents and withholds tokens until caught up. Tokens are the
-/// conversation's (pre-start rows count); model and effort keep the process
-/// floor. A switch and a torn sessions file are the tests below.
 #[cfg(unix)]
 #[test]
 fn the_folded_facts_are_this_sessions_transcript() {
@@ -2201,7 +2018,6 @@ fn the_folded_facts_are_this_sessions_transcript() {
     .unwrap();
     let place = |_: Option<&str>, _: i64| None;
     let mut cache = FooterCache::default();
-    // The process's one transcript tail, as the window keeps it.
     let tail = std::cell::RefCell::new(TailCache::default());
     let read = |cache: &mut FooterCache| {
         folded(
@@ -2240,8 +2056,6 @@ fn the_folded_facts_are_this_sessions_transcript() {
     assert_eq!(facts.model.as_deref(), Some("Haiku 4.5"));
     assert_eq!(facts.usage.expect("usage").models.len(), 2);
 
-    // A subagent still behind names no tokens — a prefix of a session is
-    // not its usage — and the next reads carry on until caught up.
     let subs = project.join("abc-1").join("subagents");
     std::fs::create_dir_all(&subs).unwrap();
     let many: String = (0..40)
@@ -2275,9 +2089,6 @@ fn the_folded_facts_are_this_sessions_transcript() {
         Some(5 + 40),
         "the whole session once caught up"
     );
-    // THE TRAFFIC is every file's rows, graphed once caught up: 11:00 and
-    // 13:00 are 121 minutes, so two-minute buckets; each row's prompt is
-    // its input and cache reads.
     let traffic = short.traffic().expect("graphed once caught up");
     assert_eq!(traffic.width_s, 2 * crate::harness::usage::SERIES_BASE_S);
     assert_eq!(traffic.totals, (43 * 1_000, 2 + 40_000 + 5 + 40));
@@ -2287,15 +2098,12 @@ fn the_folded_facts_are_this_sessions_transcript() {
         .fold((0, 0), |(i, o), &(bi, bo)| (i + bi, o + bo));
     assert_eq!(graphed, traffic.totals, "every row was stamped");
     assert_eq!((traffic.unread, traffic.runtime_s), (0, None));
-    // Its generation holds while nothing moved, and moves with a row.
     let generation = short.traffic_generation();
     read(&mut short);
     assert_eq!(short.traffic_generation(), generation);
     append(&mine, &row("m3", "claude-haiku-4-5", 1, during));
     read(&mut short);
     assert_ne!(short.traffic_generation(), generation);
-    // The directories beside the facts: the session's cwd, outside any
-    // repository.
     assert_eq!(
         short.dirs(),
         Some(&FactDirs {
@@ -2308,9 +2116,6 @@ fn the_folded_facts_are_this_sessions_transcript() {
 }
 
 /// The fold is one conversation of one process: a `/clear` before its first
-/// prompt or a new process in the tab shows no previous Σ or wall (a torn
-/// read: [`a_torn_read_of_the_same_session_keeps_its_fold`],
-/// [`a_torn_read_of_another_processs_file_shows_nothing`]).
 #[cfg(unix)]
 #[test]
 fn a_new_conversation_or_process_never_shows_the_last_ones_usage() {
@@ -2319,10 +2124,7 @@ fn a_new_conversation_or_process_never_shows_the_last_ones_usage() {
     append_to(&transcript, &served_row("m0", two_pm - 600));
     let utc = |_: Option<&str>, _: i64| Some(0);
     let now = two_pm + 60;
-    // A kernel start the caller knows (the files carry no `procStart`).
     let started = Some(1_700_000_000);
-    // Each process's one transcript tail, as the window keeps them; the
-    // tab's one fold.
     let tails = std::cell::RefCell::new(std::collections::HashMap::<u32, TailCache>::new());
     let usage_of = |pid: u32, cache: &mut FooterCache| {
         folded(
@@ -2348,21 +2150,17 @@ fn a_new_conversation_or_process_never_shows_the_last_ones_usage() {
     let shown = usage_of(4242, &mut cache).expect("control");
     assert!(shown.wall.is_some() && !shown.models.is_empty(), "control");
 
-    // `/clear`: the same process names a session with no transcript yet.
     name(4242, "def-2");
     assert_eq!(usage_of(4242, &mut cache), None, "after /clear");
     name(4242, "abc-1");
     assert_eq!(usage_of(4242, &mut cache), Some(shown.clone()), "back");
 
-    // A new process in the same tab, its session not written yet.
     name(5555, "ghi-3");
     assert_eq!(usage_of(5555, &mut cache), None, "a new process");
     std::fs::remove_dir_all(root).unwrap();
 }
 
 /// `/resume` (or `/clear`) into another conversation reads model and Σ from
-/// it together: one footer read parses the sessions file once, so a rewrite
-/// landing mid-read cannot bring back the previous Σ and wall.
 #[cfg(unix)]
 #[test]
 fn a_resume_to_another_session_never_pairs_its_model_with_the_old_usage() {
@@ -2441,8 +2239,6 @@ fn a_resume_to_another_session_never_pairs_its_model_with_the_old_usage() {
 }
 
 /// A mid-write sessions file keeps the fold of the session last named,
-/// with or without a kernel start time; a torn only parse yields no facts
-/// and the next good read folds nothing again.
 #[cfg(unix)]
 #[test]
 fn a_torn_read_of_the_same_session_keeps_its_fold() {
@@ -2501,8 +2297,6 @@ fn a_torn_read_of_the_same_session_keeps_its_fold() {
 }
 
 /// A torn read of another process's sessions file (a new Claude Code in the
-/// tab) shows nothing of the old fold, nor does its next good read before
-/// its first prompt.
 #[cfg(unix)]
 #[test]
 fn a_torn_read_of_another_processs_file_shows_nothing() {
@@ -2555,7 +2349,6 @@ fn a_torn_read_of_another_processs_file_shows_nothing() {
 }
 
 /// One footer read ([`read_pid`]) looks its transcript up once
-/// ([`transcript_path`]), for both the slug's directory and a scanned one.
 #[cfg(unix)]
 #[test]
 fn one_footer_read_looks_its_transcript_up_once() {
@@ -2563,8 +2356,6 @@ fn one_footer_read_looks_its_transcript_up_once() {
     let (claude, transcript, two_pm) = walled_session(&root);
     append_to(&transcript, &served_row("m0", two_pm - 600));
     let utc = |_: Option<&str>, _: i64| Some(0);
-    // A kernel start the caller knows: the transcript's rows speak for
-    // the process, so the tail is read as well as the fold.
     let started = Some(1_700_000_000);
     let read = |claude: &Path| {
         TRANSCRIPT_LOOKUPS.with(|n| n.set(0));
@@ -2585,7 +2376,6 @@ fn one_footer_read_looks_its_transcript_up_once() {
     assert!(facts.usage.is_some(), "the fold read it");
     assert_eq!(lookups, 1, "one lookup, the slug's own directory");
 
-    // The slug misses: the scan of `projects/` finds the file, once.
     let projects = claude.join("projects");
     std::fs::rename(projects.join("-w-repo"), projects.join("-w-repo-moved")).unwrap();
     let (facts, lookups) = read(&claude);
@@ -2603,7 +2393,6 @@ fn one_footer_read_looks_its_transcript_up_once() {
 }
 
 /// A Claude directory where process 4242 runs `abc-1`, whose transcript has
-/// one session-limit notice at 14:00 UTC: the directory, transcript, 14:00.
 #[cfg(unix)]
 fn walled_session(root: &Path) -> (PathBuf, PathBuf, i64) {
     let claude = root.join("claude");
@@ -2638,7 +2427,6 @@ fn served_row(id: &str, at: i64) -> String {
 }
 
 /// The wall segment's text for process 4242 at `now` (UTC). No start is
-/// known, so no transcript row speaks for the process ([`floor_of`]).
 #[cfg(unix)]
 fn wall_at(claude: &Path, cache: &mut FooterCache, now: i64) -> Option<String> {
     let utc = |_: Option<&str>, _: i64| Some(0);
@@ -2666,7 +2454,6 @@ fn append_to(path: &Path, text: &str) {
 }
 
 /// The limit is the account's: a background agent served after the notice
-/// takes the wall down; one served before it does not.
 #[cfg(unix)]
 #[test]
 fn a_response_a_subagent_was_served_since_takes_the_wall_down() {
@@ -2692,7 +2479,6 @@ fn a_response_a_subagent_was_served_since_takes_the_wall_down() {
 }
 
 /// A fold still behind shows no wall it has not caught up to; a wall from a
-/// caught-up read is kept while a later read is behind.
 #[cfg(unix)]
 #[test]
 fn a_fold_still_behind_shows_no_wall_it_has_not_caught_up_to() {
@@ -2735,8 +2521,6 @@ fn a_fold_still_behind_shows_no_wall_it_has_not_caught_up_to() {
 }
 
 /// End to end: the wall is this session's notice, shown while its reset is
-/// ahead; an unplaceable reset shows nothing. (A response served since takes
-/// it down: [`a_fold_still_behind_shows_no_wall_it_has_not_caught_up_to`].)
 #[cfg(unix)]
 #[test]
 fn the_limit_wall_is_read_from_the_transcripts_row() {
@@ -2782,10 +2566,6 @@ fn the_limit_wall_is_read_from_the_transcripts_row() {
 }
 
 /// Every known pill opens a mode row whatever follows — a narrow pane's
-/// gaps, cut items and hints wrapped away included; a cycle hint cut
-/// mid-word, a parenthesis that is neither the hint nor its word-cut, a
-/// pill-less row, deeper-indented tool output and a glyph paired with
-/// another pill's indicator do not.
 #[test]
 fn is_mode_row_takes_known_pills_and_their_cuts_and_nothing_else() {
     for row in [
@@ -2796,26 +2576,18 @@ fn is_mode_row_takes_known_pills_and_their_cuts_and_nothing_else() {
         "  \u{23F8} manual mode on (shift+tab to cycle)",
         "  \u{23F5}\u{23F5} accept edits on (shift+tab to cycle)",
         "  \u{23F5}\u{23F5} don't ask on",
-        // 45 and 48 columns, `← for agents` behind the cut hint.
         "  \u{23F5}\u{23F5} bypass permissions on (shift+tab to  \u{00B7}",
         "  \u{23F5}\u{23F5} bypass permissions on (shift+tab to  \u{00B7} \u{2190}\u{2026}",
-        // 37: the hint wrapped away; the separator past the wide line's gap.
         "  \u{23F5}\u{23F5} bypass permissions on  \u{00B7} \u{2190} fo\u{2026}",
-        // 26: auto's second wrapped line is the wider one.
         "  \u{23F5}\u{23F5} auto mode on      \u{00B7}",
-        // 51: the whole hint, and a separator the row's edge cut.
         "  \u{23F5}\u{23F5} bypass permissions on (shift+tab to cycle) \u{00B7}",
-        // 50, 58 and 66, busy: live status cut short.
         "  \u{23F5}\u{23F5} auto mode on (shift+tab to cycle) \u{00B7} esc to\u{2026}",
         "  \u{23F5}\u{23F5} auto mode on (shift+tab to cycle) \u{00B7} esc to interru\u{2026}",
         "  \u{23F5}\u{23F5} auto mode on (shift+tab to cycle) \u{00B7} esc to interrupt \u{00B7} \u{2190} f\u{2026}",
-        // 31, busy, the separator in the truncating text itself.
         "  \u{23F5}\u{23F5} bypass permissions on \u{00B7}\u{2026}",
-        // Cut items after live status (`← 1 agent` cut to its arrow).
         "  \u{23F8} manual mode on \u{00B7} 1 shell \u{00B7} \u{2190}\u{2026}",
         "  \u{23F8} manual mode on \u{00B7} 1 shell \u{00B7} \u{2190} \u{2026}",
         "  \u{23F8} manual mode on \u{00B7} 1 shell \u{00B7} ?\u{2026}",
-        // A closed parenthesis that is no hint.
         "  \u{23F5}\u{23F5} bypass permissions on (beta)",
     ] {
         assert!(is_mode_row(row), "{row:?}");
@@ -2837,12 +2609,9 @@ fn is_mode_row_takes_known_pills_and_their_cuts_and_nothing_else() {
 }
 
 /// Narrow-pane mode rows (pill text wrapped by word at `columns - 4`, first
-/// line only), transcribed from the renderer's code: each is still found as
-/// the mode row.
 #[test]
 fn a_narrow_pane_cuts_the_hint_between_words_and_the_row_is_still_the_mode_row() {
     let cases: [(&str, &str); 5] = [
-        // 39 and 42 columns.
         (
             "  \u{23F5}\u{23F5} bypass permissions on (shift+tab",
             "mode.bypass",
@@ -2851,11 +2620,8 @@ fn a_narrow_pane_cuts_the_hint_between_words_and_the_row_is_still_the_mode_row()
             "  \u{23F5}\u{23F5} bypass permissions on (shift+tab to",
             "mode.bypass",
         ),
-        // 30 columns, as the grid holds it: padded to the pane's width.
         ("  \u{23F5}\u{23F5} auto mode on (shift+tab  ", "mode.auto"),
-        // 32 columns: an unexpected mode's pill, its hint cut.
         ("  \u{23F8} plan mode on (shift+tab to", "mode.plan"),
-        // 30 columns: the hint wrapped away whole, a blank left behind.
         ("  \u{23F5}\u{23F5} bypass permissions on ", "mode.bypass"),
     ];
     for (row, indicator) in cases {
@@ -2865,10 +2631,8 @@ fn a_narrow_pane_cuts_the_hint_between_words_and_the_row_is_still_the_mode_row()
 }
 
 /// `procStart` is `ps -o lstart=` in UTC; the guard compares it to the
-/// kernel's start time rendered the same way.
 #[test]
 fn a_reused_pid_is_refused_by_its_start_time() {
-    // 1790194435 = Wed Sep 23 2026 20:13:55 UTC.
     assert_eq!(lstart_utc(1_790_194_435), "Wed Sep 23 20:13:55 2026");
     assert_eq!(lstart_utc(0), "Thu Jan 1 00:00:00 1970");
     let text = r#"{"pid":9162,"sessionId":"03396a15-856e","cwd":"/w","procStart":"Thu Sep  3 20:13:55 2026"}"#;
@@ -2894,9 +2658,6 @@ fn a_reused_pid_is_refused_by_its_start_time() {
 }
 
 /// The one resolver (`upgrade_drive::claude_home_dir`), as Claude Code
-/// resolves `CLAUDE_CONFIG_DIR ?? join(homedir(), ".claude")`: an empty
-/// override is set (`??` keeps it) and names the directory the process runs
-/// in; a relative one is under it; neither is read without that directory.
 #[test]
 fn the_claude_dir_is_the_processs_own() {
     let (work, cfg, ana) = (abs("/work"), abs("/cfg/claude"), abs("/Users//ana"));
@@ -2943,7 +2704,6 @@ fn a_fifo_is_not_read() {
 }
 
 /// A pill glyph with an indicator this build does not know is the
-/// vendor's drift, and is told apart from rows that are no pill at all.
 #[test]
 fn a_renamed_pill_still_opens_with_a_pill_glyph() {
     let renamed = "  \u{23F5}\u{23F5} turbo mode on (shift+tab to cycle)";
@@ -2954,14 +2714,12 @@ fn a_renamed_pill_still_opens_with_a_pill_glyph() {
     assert!(!opens_with_pill_glyph(
         "    \u{23F5}\u{23F5} indented tool output"
     ));
-    // A narrow pane's cut of a known pill is geometry, not drift.
     assert!(is_cut_pill("  \u{23F5}\u{23F5} bypass permissi"));
     assert!(is_cut_pill("  \u{23F5}\u{23F5} bypass permissions o"));
     assert!(!is_cut_pill(renamed));
 }
 
 /// The rule's cells from screen text: `─` is a plain rule glyph, anything
-/// else is ink (the host also checks colour).
 fn coverable(row: &str, width: usize) -> Vec<bool> {
     let mut out: Vec<bool> = row.chars().map(|c| c == '\u{2500}').collect();
     out.resize(width, false);
@@ -2969,9 +2727,6 @@ fn coverable(row: &str, width: usize) -> Vec<bool> {
 }
 
 /// Every recorded Claude Code screen in `aterm-phase`'s fixtures with a
-/// composer has a writable bottom rule of plain glyphs with room for the
-/// footer at its width, and the mode row under it; a screen with a box up
-/// has none.
 #[test]
 fn every_recorded_screen_has_a_rule_the_footer_can_write() {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../aterm-phase/src/fixtures");
@@ -3012,7 +2767,6 @@ fn every_recorded_screen_has_a_rule_the_footer_can_write() {
 }
 
 /// The run is the widest of plain glyphs, rightmost of equals, bounded by
-/// ink; writes leave [`RULE_LEAD`] glyphs left and one right.
 #[test]
 fn the_rule_run_is_the_widest_plain_run() {
     let row = |s: &str| s.chars().map(|c| c == '-').collect::<Vec<_>>();
@@ -3029,8 +2783,6 @@ fn the_rule_run_is_the_widest_plain_run() {
 }
 
 /// The line [`set_facts`] made, read back from where its glyphs are drawn:
-/// a space for each pitch of room between two glyphs, at the line's own
-/// pitch (its cells over its pitches, `pitches`).
 fn read_set(set: &SetFacts, pitches: f32) -> String {
     let pitch = set.cells as f32 / pitches;
     let at = |g: &SetGlyph| {
@@ -3048,11 +2800,6 @@ fn read_set(set: &SetFacts, pitches: f32) -> String {
 }
 
 /// The facts are set as [`set_facts`] says: letters and words [`FACT_PITCH`]
-/// apart, every two facts [`GAP`] pitches apart, the line a whole number of
-/// cells (as loose as its glyphs need), its first and last glyphs half a pitch
-/// in from its ends, every glyph in a cell of its own, in order, within a
-/// nudge's reach. Control: one cell per character would take more cells than
-/// the line does.
 #[test]
 fn the_facts_are_set_as_a_line_of_type() {
     let step = 1.0 / f32::from(NUDGES_PER_CELL);
@@ -3100,8 +2847,6 @@ fn the_facts_are_set_as_a_line_of_type() {
         &facts,
         "\u{25C6} Opus 5.5 xhigh   \u{2302} ~/aterm   \u{2387} main",
     );
-    // A long path and branch, with few spaces among their glyphs: the line
-    // is as loose as one cell a glyph needs, the facts as far apart.
     let long = FooterFacts {
         path: Some("~/Developer/aterm-typo-20261014/crates/aterm-gui".into()),
         branch: Some("ui/footer-spacing-iosevka-20261014".into()),
@@ -3111,7 +2856,6 @@ fn the_facts_are_set_as_a_line_of_type() {
         &long,
         "\u{25C6} Opus 5.5 xhigh   \u{2302} ~/Developer/aterm-typo-20261014/crates/aterm-gui   \u{2387} ui/footer-spacing-iosevka-20261014",
     );
-    // Wide characters take two cells each, and stay in order.
     let wide = FooterFacts {
         branch: Some("\u{6F22}\u{5B57}".into()),
         ..facts.clone()
@@ -3121,7 +2865,6 @@ fn the_facts_are_set_as_a_line_of_type() {
         "\u{25C6} Opus 5.5 xhigh   \u{2302} ~/aterm   \u{2387} \u{6F22}\u{5B57}",
     );
     assert_eq!(set.glyphs.iter().filter(|g| g.cols == 2).count(), 2);
-    // A path no nudge reaches at FACT_PITCH: set looser, evenly.
     let deep = FooterFacts {
         path: Some(format!("~/{}", "deep/".repeat(30))),
         ..facts
@@ -3189,9 +2932,6 @@ fn native_footer_text_preserves_combining_and_joined_graphemes_when_set_and_elid
 }
 
 /// The order of giving way ([`fit_rule`]): a light's transient title first
-/// (whole, then short, then none), then the path is cut to `…/<dir>`, the
-/// branch goes, the path, the effort, then the chips; the model last. A light's
-/// reason outranks the branch and the path, never the model and effort.
 #[test]
 fn a_narrow_rule_gives_way_title_first_and_the_model_last() {
     let facts = narrow_rule_facts();
@@ -3216,10 +2956,6 @@ fn a_narrow_rule_gives_way_title_first_and_the_model_last() {
         ]
         .map(|v| v.into_iter().map(str::to_owned).collect::<Vec<_>>())
     );
-    // With `Σ` and a limit wall: `Σ` narrows to the working time and
-    // goes first; the wall outlasts every other fact, standing alone
-    // last; a rule too narrow even for it keeps the model, never an
-    // empty rule while one fits.
     let walled = narrow_rule_walled();
     let model = "\u{25C6} Opus 5.5 xhigh";
     let path = "\u{2302} ~/src/github.com/aterm";
@@ -3249,8 +2985,6 @@ fn a_narrow_rule_gives_way_title_first_and_the_model_last() {
         ]
         .map(|v| v.into_iter().map(str::to_owned).collect::<Vec<_>>())
     );
-    // With a light drawn and titled: the title gives way first, then the
-    // facts, then the chips; the model outlasts them all.
     let lights = Some(LightsWidth {
         chips: 13,
         title: 35,
@@ -3283,10 +3017,6 @@ fn a_narrow_rule_gives_way_title_first_and_the_model_last() {
             (0, TitleFit::None, false),
         ]
     );
-    // A title with leaner forms (Autopilot's, design §9.2.1) gives way
-    // through each of them, widest first, before its short form — and all of
-    // them before any fact; a form of width 0 is none and is skipped.
-    // NEGATIVE CONTROL: the same steps with no leaner form go whole → short.
     let leaner = lights.map(|l| LightsWidth {
         lean: [32, 29, 26, 23],
         ..l
@@ -3337,9 +3067,6 @@ fn a_narrow_rule_gives_way_title_first_and_the_model_last() {
             TitleFit::None
         ]
     );
-    // A face whose explanation is no longer than the menu's line has no form
-    // with both clicks (`claude_lights::lean_titles`): v1's words, then the
-    // click alone.
     assert_eq!(
         titles([0, 25, 0, 22]),
         [
@@ -3350,8 +3077,6 @@ fn a_narrow_rule_gives_way_title_first_and_the_model_last() {
             TitleFit::None
         ]
     );
-    // At 80 columns (room 76) a hovered light takes nothing from the
-    // typical facts: the title gives way instead.
     let owners = FooterFacts {
         path: Some("~/aterm".into()),
         ..facts.clone()
@@ -3359,9 +3084,6 @@ fn a_narrow_rule_gives_way_title_first_and_the_model_last() {
     let fit = fit_rule(&owners, rule_room(&(0..80)), lights);
     assert_eq!(fit.segments, segments(&owners), "{fit:?}");
     assert!(fit.chips && fit.title != TitleFit::Full, "{fit:?}");
-    // A reason: the whole title goes, then the path's head; the reason
-    // then takes branch and path room, never model or effort, else it
-    // goes and the facts return.
     let reason = lights.map(|l| LightsWidth {
         reason: true,
         title: 50,
@@ -3405,8 +3127,6 @@ fn a_narrow_rule_gives_way_title_first_and_the_model_last() {
             (Vec::new(), TitleFit::None, false),
         ]
     );
-    // At 80 columns typical facts give the reason the branch's and
-    // the path's room; a hovered title of the same width does not.
     let stop = Some(LightsWidth {
         chips: 22,
         title: 47,
@@ -3426,7 +3146,6 @@ fn a_narrow_rule_gives_way_title_first_and_the_model_last() {
         (fit.segments, fit.title),
         (segments(&owners), TitleFit::None)
     );
-    // Chips narrower than the model still draw where the model cannot.
     let dot = Some(LightsWidth {
         chips: 6,
         title: 0,
@@ -3436,7 +3155,6 @@ fn a_narrow_rule_gives_way_title_first_and_the_model_last() {
     });
     let fit = fit_rule(&facts, 9, dot);
     assert!(fit.chips && fit.segments.is_empty(), "{fit:?}");
-    // `chips_room` is exactly the room the chips have beside the model.
     for room in 0..120 {
         let chips = chips_room(&facts, room);
         for w in [chips, chips + 1] {
@@ -3471,7 +3189,6 @@ fn rung_texts(fit: &RuleFit) -> Vec<String> {
 }
 
 /// Every distinct run of facts a rule shows as it narrows a cell at a
-/// time, from the whole facts' width to nothing, with no lights.
 fn walk_down(facts: &FooterFacts) -> Vec<Vec<String>> {
     let full = segments_width(&segments(facts)) + 2;
     let mut seen: Vec<Vec<String>> = Vec::new();
@@ -3487,7 +3204,6 @@ fn walk_down(facts: &FooterFacts) -> Vec<Vec<String>> {
 }
 
 /// The facts `a_narrow_rule_gives_way_title_first_and_the_model_last`
-/// walks: 44 cells whole.
 fn narrow_rule_facts() -> FooterFacts {
     FooterFacts {
         model: Some("Opus 5.5".into()),
@@ -3535,9 +3251,6 @@ fn narrow_rule_tokens() -> FooterFacts {
 }
 
 /// The account costs only the tokens: at every width the wall, model, path and
-/// branch shown are those of the same facts with no account, and the label is
-/// whole or absent. Negative control: with no account every rung is the one
-/// `a_narrow_rule_gives_way_title_first_and_the_model_last` pins.
 #[test]
 fn the_account_costs_only_the_tokens() {
     let plain = narrow_rule_walled();
@@ -3547,7 +3260,6 @@ fn the_account_costs_only_the_tokens() {
     };
     let facts = named("work-2", &plain);
     let walk = walk_down(&facts);
-    // The first rung to lose a segment loses the tokens, and nothing else.
     let fewer = walk
         .iter()
         .find(|rung| rung.len() < walk[0].len())
@@ -3555,8 +3267,6 @@ fn the_account_costs_only_the_tokens() {
     assert_eq!(fewer.as_slice(), &walk[0][..5], "{fewer:?}");
     let bare = narrow_rule_facts();
 
-    // The law, at every width, for a short label, one of a runtime's
-    // width and one wider than the rule's whole room at 80 columns.
     let strip = |segments: &[Segment], marks: &[char]| -> Vec<Segment> {
         segments
             .iter()
@@ -3584,7 +3294,6 @@ fn the_account_costs_only_the_tokens() {
                     }
                     None => {
                         assert_eq!(fit, base, "{label} {room}");
-                        // Beside a model it would not have fitted.
                         if let Some(at) = kept.iter().position(|s| s.mark == MODEL_MARK) {
                             let mut with = kept.clone();
                             with.insert(at + 1, Segment::plain(ACCOUNT_MARK, label));
@@ -3601,9 +3310,6 @@ fn the_account_costs_only_the_tokens() {
         }
     }
 
-    // Negative control: the named walk is the unnamed one (pinned in
-    // `a_narrow_rule_gives_way_title_first_and_the_model_last`) with the
-    // account's rungs among it.
     let unnamed_of = |walk: &[Vec<String>]| -> Vec<Vec<String>> {
         walk.iter()
             .filter(|rung| !rung.iter().any(|s| s.starts_with(ACCOUNT_MARK)))
@@ -3611,9 +3317,6 @@ fn the_account_costs_only_the_tokens() {
             .collect()
     };
     let pinned = walk_down(&plain);
-    // Rounded to whole cells, an account rung and the next one without it can
-    // take the same width, and the earlier shows: the named walk without its
-    // account rungs is the pinned walk with at most such rungs missing.
     let mut rest = pinned[1..].iter();
     for rung in unnamed_of(&walk) {
         assert!(rest.any(|r| *r == rung), "{rung:?} out of order: {walk:?}");
@@ -3688,11 +3391,6 @@ fn subscription_chip_budget_keeps_account_and_weekly_beside_real_gui_faces() {
         for columns in [80, 100, 120] {
             let room = rule_room(&(0..columns));
             let budget = chips_room(&facts, room);
-            // The GUI's faces at rest: `∞` (1 cell) and `⤓ land` (6); then
-            // `∞ ⏸ plan` and its wider light faces (3, 8, 10 and 14 were
-            // measured while a `⚙` chip, since removed, stood beside them, so
-            // they cover wider rows). The last case exercises a block that
-            // consumes its whole advertised budget.
             for chips in [1, 3, 6, 8, 10, 14, budget] {
                 assert!(chips <= budget, "{columns}: {chips} > {budget}");
                 for reason in [false, true] {
@@ -3789,9 +3487,6 @@ fn subscription_control_glyph_outlasts_the_model_when_essentials_cannot_fit() {
 }
 
 /// A light's reason and a live upgrade's note, short, each take the account's
-/// room where the two do not fit together, never the limit wall's or the model
-/// and effort's. Negative controls: a hovered title of the same widths takes
-/// nothing, and with no account the reason and the note stand at those widths.
 #[test]
 fn a_reason_and_the_upgrade_note_take_the_accounts_room() {
     let plain = narrow_rule_walled();
@@ -3800,7 +3495,6 @@ fn a_reason_and_the_upgrade_note_take_the_accounts_room() {
         ..plain.clone()
     };
     let whole = segments(&facts);
-    // What a reason never takes the room of: the wall and the model.
     let top: Vec<Segment> = whole
         .iter()
         .filter(|s| s.mark == WALL_MARK || s.mark == MODEL_MARK)
@@ -3808,7 +3502,6 @@ fn a_reason_and_the_upgrade_note_take_the_accounts_room() {
         .collect();
     assert_eq!(top.len(), 2);
     let named = |fit: &RuleFit| fit.segments.iter().any(|s| s.mark == ACCOUNT_MARK);
-    // The fit with the account laid in after the model.
     let with_account = |fit: &RuleFit| {
         let mut fit = fit.clone();
         let at = fit.segments.iter().position(|s| s.mark == MODEL_MARK);
@@ -3824,7 +3517,6 @@ fn a_reason_and_the_upgrade_note_take_the_accounts_room() {
         short: 35,
         reason: true,
     });
-    // Rooms where the reason is shown: with the account, and without it.
     let (mut beside, mut instead): (Vec<usize>, Vec<usize>) = (Vec::new(), Vec::new());
     for room in (0..=240).rev() {
         let fit = fit_rule(&facts, room, reason);
@@ -3852,7 +3544,6 @@ fn a_reason_and_the_upgrade_note_take_the_accounts_room() {
         instead.iter().max() < beside.iter().max(),
         "a wide rule shows both: {instead:?} {beside:?}"
     );
-    // Negative control: a hovered title takes nothing from the facts.
     let hover = reason.map(|l| LightsWidth { reason: false, ..l });
     for room in 0..=240 {
         let fit = fit_rule(&facts, room, hover);
@@ -3861,14 +3552,11 @@ fn a_reason_and_the_upgrade_note_take_the_accounts_room() {
             "{room}: {fit:?}"
         );
     }
-    // Negative control: with no account, the reason stands at each room it
-    // took the account's at.
     for &room in &instead {
         let fit = fit_rule(&plain, room, reason);
         assert_ne!(fit.title, TitleFit::None, "{room}: {fit:?}");
     }
 
-    // The upgrade's note, the same way.
     let note = UpgradeWords {
         whole: "Claude Code 2.1.286 is ready \u{b7} waits while you use this tab".into(),
         short: "2.1.286 waits while you use this tab".into(),
@@ -3911,7 +3599,6 @@ fn a_reason_and_the_upgrade_note_take_the_accounts_room() {
         instead.iter().max() < beside.iter().max(),
         "a wide rule shows both: {instead:?} {beside:?}"
     );
-    // Negative control: with no account, the note stands at each of them.
     let unnamed = FooterFacts {
         upgrade: Some(note),
         ..plain
@@ -3927,8 +3614,6 @@ fn a_reason_and_the_upgrade_note_take_the_accounts_room() {
 }
 
 /// The launch card is read only under a live REPL. Negative controls: a
-/// relaunch before the new REPL is up (`Press Ctrl-C again to exit`), a
-/// half-drawn screen, and a box over the composer.
 #[test]
 fn the_launch_card_is_read_only_under_a_live_repl() {
     let fixture = |name: &str| -> Vec<String> {
@@ -3961,13 +3646,10 @@ fn the_launch_card_is_read_only_under_a_live_repl() {
     ] {
         assert_eq!(launch_card(&fixture(dead)), None, "{dead}");
     }
-    // The phase reader alone would take the predecessor's card there.
     assert!(
         aterm_phase::launch_card(&fixture("claude-2.1.283-inline-relaunch-before-repl.txt"))
             .is_some()
     );
-    // Default mode draws a pill too (`⏸ manual mode on`), so the card is
-    // read under it.
     let manual = fixture("claude-2.1.283-footer-manual.txt");
     assert_eq!(
         live_repl_row(&manual),
@@ -3978,15 +3660,12 @@ fn the_launch_card_is_read_only_under_a_live_repl() {
         launch_card(&manual).map(|c| c.model).as_deref(),
         Some("Opus 5.5")
     );
-    // The pill-less row also proves a live REPL: its hint slot at rest,
-    // with a draft, mid-turn.
     let bypass = fixture("claude-2.1.283-footer-bypass-idle.txt");
     let at = mode_row(&bypass).expect("the measured mode row");
     for (bare, live) in [
         ("  ? for shortcuts", true),
         ("  esc to clear", true),
         ("  esc to interrupt \u{00B7} \u{2190} for agents", true),
-        // Negative controls: the dead box, a completion list, shell mode.
         ("  Press Ctrl-C again to exit", false),
         ("  /clear          Clear conversation history", false),
         ("  ! for shell mode", false),
@@ -4004,15 +3683,6 @@ fn the_launch_card_is_read_only_under_a_live_repl() {
 }
 
 /// THE CONTEXT INDICATOR HAS GONE only from an empty slot (`context_gone`),
-/// on the rows 2.1.306 drew in the real-Claude lab (2026-10-21, 120 columns, a 100 000-token
-/// window compacting at 15%): once its effort notice has gone after `/compact` its mode row
-/// stands with nothing at its end, and an older build's footer rows with no indicator above
-/// the composer say the same. Not gone: the indicator at the mode row's end (at rest, beside a
-/// draft, through a turn) or above the composer; Claude Code's `◐ medium · /effort` in the
-/// slot; the `/` menu, the `@` menu and the shortcuts in the mode row's place; a box above the
-/// composer; no composer. CONTROLS: without the slot test the effort notice reads as gone;
-/// without the footer-row test the menus do; without the box read the box does; without the
-/// reading every shown indicator does.
 #[test]
 fn the_context_indicator_has_gone_only_from_an_empty_slot() {
     let rule = "─".repeat(120);
@@ -4121,7 +3791,6 @@ fn the_context_indicator_has_gone_only_from_an_empty_slot() {
 }
 
 /// A kept card fills only what nothing newer decided, and only from the
-/// running build's card.
 #[test]
 fn a_launch_card_fills_only_open_facts() {
     let card = aterm_phase::LaunchCard {
@@ -4164,8 +3833,6 @@ fn a_launch_card_fills_only_open_facts() {
     };
     assert_eq!(other_build.filled_from(Some(&card)), other_build);
     assert_eq!(open.filled_from(None), open);
-    // After an effort-less switch the card's effort counts only when the
-    // card names the model switched to.
     let switched = |to: &str| FooterFacts {
         model: Some(to.into()),
         model_open: false,
@@ -4189,7 +3856,6 @@ fn a_launch_card_fills_only_open_facts() {
 }
 
 /// Found under the composer's bottom rule only — a quoted copy of the row
-/// in the conversation above the frame is not the footer.
 #[test]
 fn the_mode_row_is_found_under_the_composer_and_nowhere_else() {
     let rule = "\u{2500}".repeat(40);
@@ -4220,7 +3886,6 @@ fn the_mode_row_is_found_under_the_composer_and_nowhere_else() {
 }
 
 /// The Bash tool's directory is the newest main-thread row's `cwd`;
-/// subagent rows, rows without one and relative values are passed over.
 #[test]
 fn the_last_cwd_is_the_newest_main_thread_rows() {
     let body = [
@@ -4243,8 +3908,6 @@ fn the_last_cwd_is_the_newest_main_thread_rows() {
 }
 
 /// [`shell_cwds`] reads only live sessions launched in the reported
-/// directory; other launches, dead pids and the launch directory add
-/// nothing.
 #[test]
 fn shell_cwds_reads_the_live_sessions_launched_in_the_directory() {
     let root = std::env::temp_dir().join(format!("aterm-footer-shell-{}", std::process::id()));
@@ -4274,17 +3937,12 @@ fn shell_cwds_reads_the_live_sessions_launched_in_the_directory() {
         .expect("transcript");
     };
     let me = std::process::id();
-    // Nothing registered yet: nothing learned.
     assert!(shell_cwds(&claude, &launch).is_empty());
-    // This process stands in for a live Claude Code whose Bash tool moved.
     session(me, "a-live", &launch, &launch.join("nested"));
     assert_eq!(shell_cwds(&claude, &launch), [launch.join("nested")]);
-    // Another launch directory is another session's business.
     assert!(shell_cwds(&claude, &root.join("elsewhere")).is_empty());
-    // Negative control: a pid no process holds is a leftover file.
     session(999_999_990, "b-dead", &launch, &root.join("dead"));
     assert_eq!(shell_cwds(&claude, &launch), [launch.join("nested")]);
-    // A Bash tool still in the launch directory adds nothing new.
     session(me, "a-live", &launch, &launch);
     assert!(shell_cwds(&claude, &launch).is_empty());
     let _ = std::fs::remove_dir_all(&root);
@@ -4297,9 +3955,6 @@ fn excerpt_row(kind: &str, at: &str, message: &str) -> String {
 }
 
 /// THE SURVEY'S EXCERPTS ride the tail read: a fresh read finds the prompt,
-/// the newest words and the call in flight; appends move them (the call's
-/// result ends it, a new prompt goes first) and are read as appends, not
-/// afresh.
 #[cfg(unix)]
 #[test]
 fn the_excerpts_ride_the_tail_read_and_its_appends() {
@@ -4365,7 +4020,6 @@ fn the_excerpts_ride_the_tail_read_and_its_appends() {
         .map(|p| p.text.clone())
         .collect();
     assert_eq!(prompts, ["now the client", "wire the survey"]);
-    // A failed read keeps no excerpts.
     std::fs::remove_file(&path).unwrap();
     assert!(cache.read_since(&path, 4242, Some(start), start).is_none());
     assert!(cache.excerpts().is_none());
@@ -4373,16 +4027,12 @@ fn the_excerpts_ride_the_tail_read_and_its_appends() {
 }
 
 /// A COLD READ STOPS AT ITS BOUND: a prompt more than [`MAX_BACK_BYTES`]
-/// above the end is not looked for, and the survey names none (`-`), while
-/// the newest words and the call in flight are still read. NEGATIVE CONTROL:
-/// the same prompt under less than the bound is found.
 #[cfg(unix)]
 #[test]
 fn a_cold_back_read_past_its_bound_names_no_prompt() {
     let root = cache_test_dir("excerpts-cold");
     let start = crate::harness::upgrade_models::parse_utc("2026-10-15T10:00:00Z").unwrap();
     let at = "2026-10-15T10:01:00Z";
-    // One tool result of about 100 KiB: a long run's filler.
     let filler = |n: usize| {
         excerpt_row(
             "user",
@@ -4432,14 +4082,6 @@ fn a_cold_back_read_past_its_bound_names_no_prompt() {
 }
 
 /// THE ACT'S LABEL NEVER TAKES A FACT'S ROOM (design §9.2.1, §9.2.5,
-/// §9.2.7): a transient title with no short form — the act ticker's `✓
-/// approved` beside the Autopilot chip — is drawn whole or not at all, at
-/// every room from wide to none, beside the facts exactly as the same room
-/// draws them with no title: it gives way before any of them. Over the
-/// owner's typical facts, whose rungs differ by less than the label, that is
-/// beside the whole facts, down to its own width and no narrower. NEGATIVE
-/// CONTROL: a hover's title of the same width, which has a short form, is
-/// drawn short beside the whole facts at a room the label is not drawn in.
 #[test]
 fn the_acts_label_is_drawn_whole_or_not_at_all_never_at_a_facts_cost() {
     let facts = FooterFacts {
@@ -4449,7 +4091,6 @@ fn the_acts_label_is_drawn_whole_or_not_at_all_never_at_a_facts_cost() {
         branch: Some("main".into()),
         ..FooterFacts::default()
     };
-    // `✓ approved` and its two-cell gap; the Autopilot chip, `∞`.
     let label = Some(LightsWidth {
         chips: 1,
         title: "\u{2713} approved".chars().count() + 2,
@@ -4467,7 +4108,6 @@ fn the_acts_label_is_drawn_whole_or_not_at_all_never_at_a_facts_cost() {
             assert_eq!(fit.segments, whole, "{room}: beside the whole facts");
             drawn.push(room);
         }
-        // The facts alone, in the same room, are what the label leaves.
         let bare = fit_rule(&facts, room, label.map(|l| LightsWidth { title: 0, ..l }));
         assert_eq!(fit.segments, bare.segments, "{room}: no fact gave way");
     }
@@ -4477,7 +4117,6 @@ fn the_acts_label_is_drawn_whole_or_not_at_all_never_at_a_facts_cost() {
         fit_rule(&facts, 90, label).width(label),
         "drawn down to its own width, and no narrower"
     );
-    // NEGATIVE CONTROL: a title with a short form is drawn short there.
     let hover = label.map(|l| LightsWidth { short: 5, ..l });
     let fit = fit_rule(&facts, least - 1, hover);
     assert_eq!(
@@ -4494,27 +4133,10 @@ fn the_acts_label_is_drawn_whole_or_not_at_all_never_at_a_facts_cost() {
 }
 
 /// The Together run's Claude Code working directory (2026-10-16): outside
-/// HOME, so the facts carry it whole, and a 120-column split pane cuts it to
-/// `…/proj-claude`.
 const SPLIT_PATH: &str = "/private/tmp/claude-502/-Users-person-aterm/\
     dd11ed0c-05cd-46e8-bf09-5b2786e48b6a/scratchpad/together/run-dir/proj-claude";
 
 /// A TITLE STANDS BESIDE THE FACTS AS THEY FIT WITHOUT IT (design §9.2.7;
-/// the Together run's D2): in a split pane whose long working directory is
-/// cut to `…/proj-claude`, ninety cells of the rule are free, and the act's
-/// label and the hovered Autopilot title are drawn there — the label whole,
-/// the title in the widest form that fits. At every room from a wide rule to
-/// none: the fit never passes the rule's ends; the facts and the chips are
-/// exactly what the same room draws with no title (a title never makes a
-/// fact give way); and the title is the widest of its forms that fits
-/// beside them, or none. Where nothing but the chips fits, or not even they,
-/// the rule drops the title cleanly: no short form of the label, nothing
-/// past the room.
-///
-/// NEGATIVE CONTROL (the fix mutated out, the title paired with the WHOLE
-/// facts only, as before): at 120 columns neither is drawn, and the walk
-/// meets no room where a title stands beside a fallen rung — the asserts
-/// marked RED fail.
 #[test]
 fn a_title_stands_beside_the_facts_as_they_fit_without_it() {
     let facts = FooterFacts {
@@ -4525,7 +4147,6 @@ fn a_title_stands_beside_the_facts_as_they_fit_without_it() {
         ..FooterFacts::default()
     };
     let whole = segments(&facts);
-    // `∞ ⏸ manual`: the Autopilot chip and Claude's mode light.
     let chips = "\u{221e} \u{23f8} manual".chars().count();
     let label = LightsWidth {
         chips,
@@ -4534,11 +4155,6 @@ fn a_title_stands_beside_the_facts_as_they_fit_without_it() {
         short: 0,
         reason: false,
     };
-    // Cruise's hovered title with no act taken (§9.2.1): the whole, v1's
-    // words (no trail to give up first), the phrase with both clicks, with
-    // the click alone, and the mode phrase. Its explanation is the one the
-    // window draws (aterm-gui's `autopilot::MODE_WORDS`, which this crate
-    // cannot read), so the widths are the real title's.
     let whole_title = "autopilot: cruise \u{2014} keeps going for ever, finding more to do \u{b7} \
                        click: land \u{b7} right-click: more";
     let v1 =
@@ -4605,16 +4221,11 @@ fn a_title_stands_beside_the_facts_as_they_fit_without_it() {
                 beside_a_fallen_rung = true;
             }
         }
-        // RED without the fix.
         assert!(
             beside_a_fallen_rung,
             "{lights:?}: a title stands beside a rung the room cut"
         );
     }
-    // The Together run's pane, 120 columns: the path cut, the label and the
-    // title drawn beside it — the hover's phrase with both clicks, since
-    // Cruise's sentence grew too long for v1's words there. RED without the
-    // fix.
     let room = rule_room(&(0..120));
     let cut = |fit: &RuleFit| {
         fit.segments
@@ -4631,8 +4242,6 @@ fn a_title_stands_beside_the_facts_as_they_fit_without_it() {
         cut(&hovered) && hovered.title == TitleFit::Lean(2),
         "the phrase and its clicks beside `…/proj-claude`: {hovered:?}"
     );
-    // Where the label does not fit beside what fits, it goes cleanly: the
-    // chips stand with the facts and no title. In no room, nothing at all.
     assert!(
         (0..=320).any(|room| {
             let fit = fit_rule(&facts, room, Some(label));
@@ -4651,11 +4260,6 @@ fn a_title_stands_beside_the_facts_as_they_fit_without_it() {
 }
 
 /// THE STEP TAP'S SIDE OF ONE REGISTRY READ (S1 as
-/// built): the lookup says whether the transcript's path is CERTAIN — the
-/// project's own file, or the one file a scan finds — and a read that found
-/// none tells an armed tap so, so the file Claude Code writes next is bound
-/// from its first byte. NEGATIVE CONTROLS: two scanned candidates are not
-/// certain; a tap that never saw the file absent binds it at its length.
 #[cfg(unix)]
 #[test]
 fn a_footer_read_tells_the_step_tap_what_it_found() {
@@ -4704,7 +4308,6 @@ fn a_footer_read_tells_the_step_tap_what_it_found() {
             .map(|s| s.ev)
             .collect::<Vec<_>>()
     };
-    // Armed while no file exists: the tap waits, then binds from byte 0.
     let mut waited = FooterCache::default();
     waited.set_floor(0, None);
     assert!(read(&mut waited).is_empty() && !waited.steps_bound());
@@ -4712,7 +4315,6 @@ fn a_footer_read_tells_the_step_tap_what_it_found() {
     let evs = read(&mut waited);
     assert_eq!(evs.first(), Some(&StepEvent::Bind { len: 0 }), "{evs:?}");
     assert!(waited.steps_bound());
-    // NEGATIVE CONTROL: armed over the file as it stands, its rows history.
     let len = std::fs::metadata(&transcript).unwrap().len();
     let mut over = FooterCache::default();
     over.set_floor(0, None);
@@ -4721,7 +4323,6 @@ fn a_footer_read_tells_the_step_tap_what_it_found() {
 }
 
 /// A screen of a composer (top rule, caret, bottom rule) over `rest`, and
-/// its bottom rule's row.
 fn under_rule(rest: &[&str]) -> (Vec<String>, usize) {
     let rule = "─".repeat(90);
     let mut rows = vec![
@@ -4745,14 +4346,6 @@ fn kinds(
 }
 
 /// The agents panel's one locator, on MEASURED screens of older builds —
-/// the live worker of 2026-09-12 (footer, blank, `main`, an agent), the
-/// wait_bg pair (a workflow straight under the footer, once under the
-/// transient `paste again to expand`), the /goal screen (a workflow, then
-/// the `⧉` artifact bar it stops at) — and on 2.1.304 shapes BUILT FROM ITS
-/// BUNDLE'S GRAMMAR (its main and agent rows are measured too:
-/// [`the_measured_2_1_304_panel_and_pill_are_found`]; these shapes are
-/// not): the selected row, a nested agent, `↓ N more`, the lone blank slot
-/// before a workflow.
 #[test]
 fn the_agents_panel_is_found_under_the_footer() {
     use aterm_phase::agents_panel::RowKind::{Agent, Main, More, Workflow};
@@ -4830,7 +4423,6 @@ fn the_agents_panel_is_found_under_the_footer() {
             (13, Workflow)
         ]
     );
-    // At most PANEL_ROWS_MAX rows.
     let many: Vec<String> = (0..20)
         .map(|n| format!("  ◯ worker-{n}  Working   {n}s · ↓ 1.0k tokens"))
         .collect();
@@ -4845,9 +4437,6 @@ fn the_agents_panel_is_found_under_the_footer() {
 }
 
 /// Negative controls: no footer row under the rule; a task row first (no
-/// `main`, no workflow); two blanks; a panel-shaped row ABOVE the frame
-/// (the transcript's `⏺ main` in `under_rule`) with nothing under the
-/// footer; a list under the rule longer than the footer's rows.
 #[test]
 fn the_agents_panel_is_read_nowhere_else() {
     let main = "  ⏺ main";
@@ -4872,7 +4461,6 @@ fn the_agents_panel_is_read_nowhere_else() {
         let (rows, bottom) = under_rule(&rest);
         assert_eq!(agents_panel_under(&rows, bottom), None, "{rest:#?}");
     }
-    // A footer row that wraps once is passed.
     let (rows, bottom) = under_rule(&[
         "  ⏵⏵ auto mode on · 3 shells · 2 monitors · ← for agents",
         "  ↓ to manage                                     /rc active",
@@ -4887,15 +4475,6 @@ fn the_agents_panel_is_read_nowhere_else() {
 }
 
 /// The panel under a MANUAL- or PLAN-MODE footer: their pill opens with
-/// `⏸`, the glyph of a paused workflow's bullet, so the footer row reads as
-/// a panel row too (`  ⏸ manual mode on · …` a paused workflow named
-/// `manual mode on · …`) — and the locator, which takes no panel row for
-/// the footer, found no panel in those modes (the owner's `YOLO off`). The
-/// footer slot is the footer's whatever the reader makes of it: a mode row,
-/// a cut pill, any row opening with a pill glyph. The measured rows are the
-/// 2.1.283 and 2.1.301 manual and plan footers (`aterm-phase` fixtures).
-/// NEGATIVE CONTROL: a panel's own row straight under the rule is still no
-/// footer, and a paused workflow's row that is no pill is read as one.
 #[test]
 fn the_panel_is_found_under_a_manual_or_plan_mode_footer() {
     let main = "  ⏺ main";
@@ -4951,10 +4530,6 @@ fn a_cut_pill_is_still_read_without_joining_it() {
 }
 
 /// The YOLO label's finder: Claude's bypass pill reads `YOLO on`, the
-/// manual-mode pill `YOLO off`, at the mode row's start (the measured 2.1.283
-/// rows, and the `14 shells` row the owner's screen showed); the run of left
-/// items packs left behind the label up to the first two blanks, and the
-/// glass→grid map sends each glass column of it to Claude's own cell.
 #[test]
 fn the_bypass_and_manual_pills_are_found_to_relabel() {
     let (rows, bottom) =
@@ -5003,7 +4578,6 @@ fn the_bypass_and_manual_pills_are_found_to_relabel() {
     let (rows, bottom) = under_rule(&["  ⏸ manual mode on · ? for shortcuts · ← for agents"]);
     let r = relabel_under(&rows, bottom).expect("the manual pill");
     assert_eq!((r.start, r.end, r.label, r.shift()), (2, 18, YOLO_OFF, 8));
-    // A pill alone on its row: no run, the blanks at the label's end.
     let (rows, bottom) = under_rule(&["  ⏵⏵ bypass permissions on"]);
     let r = relabel_under(&rows, bottom).unwrap();
     assert_eq!(r.run_end, r.end);
@@ -5011,9 +4585,6 @@ fn the_bypass_and_manual_pills_are_found_to_relabel() {
 }
 
 /// Negative controls: the other modes keep Claude's pill; a cut pill, a
-/// pill's words mid-row or run on into a word, a quoted pill above the
-/// frame over Claude's own auto row, a row under a blank, and agy's footer
-/// are never relabelled.
 #[test]
 fn no_other_pill_or_row_is_relabelled() {
     for footer in [
@@ -5035,11 +4606,6 @@ fn no_other_pill_or_row_is_relabelled() {
 }
 
 /// MEASURED on 2.1.304 (the lab, 2026-10-19): the panel under the footer at
-/// rest, and while it holds the keys — the footer row then a hint
-/// (`↑/↓ to select`, `Enter to view · x to stop`) the locator passes like
-/// any transient one — with the selected row's `❯` in column 0; and the
-/// bypass pill the glass relabels, its `(shift+tab to cycle)` packed
-/// behind the label.
 #[test]
 fn the_measured_2_1_304_panel_and_pill_are_found() {
     use aterm_phase::agents_panel::RowKind::{Agent, Main};
@@ -5087,7 +4653,6 @@ fn the_measured_2_1_304_panel_and_pill_are_found() {
 }
 
 /// A MEASURED 2.1.304 screen (`aterm-phase`'s fixtures), its header line
-/// left out.
 fn measured_2_1_304(name: &str) -> Vec<String> {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../aterm-phase/src/fixtures")
@@ -5101,15 +4666,6 @@ fn measured_2_1_304(name: &str) -> Vec<String> {
 }
 
 /// VIM INSERT'S INDICATOR BEFORE THE PILL (MEASURED on 2.1.304: `  -- INSERT
-/// -- ⏵⏵ auto mode on (shift+tab to cycle)`, the pill at column 15): the
-/// mode row is found under the composer, its pill names auto mode for the
-/// footer, the lights and the panel's locator alike, and the row says vim
-/// INSERT — on each of the three measured INSERT screens (at launch, after
-/// the NORMAL keys that ran as motions, and under Claude's refusal). The
-/// lead is the indicator and its one cell exactly. NEGATIVE CONTROLS: vim
-/// NORMAL's screen reads the same mode with no indicator; VISUAL's (drawn
-/// the same way, unmeasured), the indicator with no gap, and one after the
-/// pill are no INSERT lead, and only the first two keep the pill unread.
 #[test]
 fn the_pill_after_vim_inserts_indicator_is_read_as_its_mode() {
     for name in [
@@ -5153,18 +4709,11 @@ fn the_pill_after_vim_inserts_indicator_is_read_as_its_mode() {
         assert_eq!(pill_indicator(row).is_some(), pill, "{row:?}");
         assert_eq!(opens_with_pill_glyph(row), pill, "{row:?}");
     }
-    // A cut pill after the indicator is still a cut pill, and no other row.
     assert!(is_cut_pill("  -- INSERT -- \u{23F5}\u{23F5} bypass permi"));
     assert!(!is_cut_pill("  -- INSERT -- "));
 }
 
 /// THE YOLO LABEL AFTER VIM INSERT'S INDICATOR: the bypass pill at column 15
-/// reads `YOLO on`, the manual one `YOLO off`; the glass→grid map leaves the
-/// indicator's columns and the label's where they are, sends the packed run
-/// `shift` columns right to Claude's own cells and the blanks it left to the
-/// pill's first cell. NEGATIVE CONTROL: the measured INSERT screen's auto
-/// pill keeps Claude's words; the same row without the indicator is the
-/// column-2 relabel, as before.
 #[test]
 fn the_yolo_relabel_maps_the_pill_after_vim_inserts_indicator() {
     let row = "  -- INSERT -- \u{23F5}\u{23F5} bypass permissions on (shift+tab to cycle) \u{B7} \u{2190} for agents";
@@ -5210,7 +4759,6 @@ fn col_of_chars(row: &str, needle: &str) -> usize {
 }
 
 /// The top-effort key ([`CLAUDE_TOP_EFFORT_KEY`]) as the vendor writes it at
-/// the head of a sentence, built at run time: the key keeps one spelling.
 fn capital_key() -> String {
     let mut chars = CLAUDE_TOP_EFFORT_KEY.chars();
     let first = chars.next().expect("a key");
@@ -5218,7 +4766,6 @@ fn capital_key() -> String {
 }
 
 /// An answer, then an `/effort` command row, then (when `text`) its result:
-/// the transcript's newest rows, read since the process's start.
 fn effort_after_answer(text: Option<&str>) -> TailFacts {
     let start = crate::harness::upgrade_models::parse_utc("2026-10-19T10:00:00Z");
     let answer = answer_at("claude-opus-5-5", "2026-10-19T10:00:10.000Z", Some("high"));
@@ -5232,9 +4779,6 @@ fn effort_after_answer(text: Option<&str>) -> TailFacts {
 }
 
 /// `/effort <key> off` answers `<Key> off. Effort stays xhigh.` (the 2.1.304
-/// bundle's `D()`): the effort is the level that stays and the key is off.
-/// Negative control: with no result under the command the effort is unread,
-/// as before, and nothing is said of the key.
 #[test]
 fn a_top_effort_off_result_keeps_the_effort_and_names_the_key() {
     let key = capital_key();
@@ -5242,15 +4786,12 @@ fn a_top_effort_off_result_keeps_the_effort_and_names_the_key() {
     assert_eq!(facts.effort, Said::Is("xhigh".into()));
     assert_eq!(facts.top, Some(false));
     assert_eq!(facts.model.shown(), Some("Opus 5.5"), "the model stands");
-    // Negative control: the command alone.
     let bare = effort_after_answer(None);
     assert_eq!(bare.effort, Said::Unread);
     assert_eq!(bare.top, None);
 }
 
 /// `/effort <key> on` answers `<Key> on (this session only): … Effort stays
-/// xhigh.`: the effort stays and the key is on; a level that stays `auto`
-/// is unread, the key still on.
 #[test]
 fn a_top_effort_on_result_keeps_the_effort() {
     let key = capital_key();
@@ -5266,8 +4807,6 @@ fn a_top_effort_on_result_keeps_the_effort() {
     );
     let auto = on("auto");
     assert_eq!((auto.effort, auto.top), (Said::Unread, Some(true)));
-    // Negative control: the key in lower case reads the same (the vendor
-    // capitalises it), and another word in its place is no key.
     let lower = effort_after_answer(Some(&format!(
         "{CLAUDE_TOP_EFFORT_KEY} off. Effort stays max."
     )));
@@ -5280,10 +4819,6 @@ fn a_top_effort_on_result_keeps_the_effort() {
 }
 
 /// A level result ends with ` · <Key> off` where setting the level turned
-/// the key off, and `/effort`'s current-level line with ` · <Key> on` while
-/// it is on (the 2.1.304 bundle). Negative control: with no suffix the key
-/// is unsaid; a suffix naming something else, or the key run into a word,
-/// says nothing.
 #[test]
 fn a_level_result_suffix_names_the_key() {
     let key = capital_key();
@@ -5303,7 +4838,6 @@ fn a_level_result_suffix_names_the_key() {
     );
     let auto = effort_after_answer(Some(&format!("Effort level set to auto \u{b7} {key} off")));
     assert_eq!((auto.effort, auto.top), (Said::Unread, Some(false)));
-    // Negative controls.
     let plain = effort_after_answer(Some("Set effort level to low (this session only): Quick"));
     assert_eq!((plain.effort, plain.top), (Said::Is("low".into()), None));
     for tail in [
@@ -5319,9 +4853,6 @@ fn a_level_result_suffix_names_the_key() {
 }
 
 /// A refused key (`<Key> needs dynamic workflows enabled …`, `<Key> isn't
-/// available on <model>. …`) answers its `/effort` row and decides nothing:
-/// the older answer's effort stands. Negative control: a result this build
-/// does not read leaves the effort unread, as before.
 #[test]
 fn a_refused_key_answers_its_command_and_decides_nothing() {
     let key = capital_key();
@@ -5342,10 +4873,6 @@ fn a_refused_key_answers_its_command_and_decides_nothing() {
 }
 
 /// The key's state rides over newer rows that settle model and effort: an
-/// answer after `/effort <key> off` decides both, and the process still
-/// reads the key off (its carry and its own facts keep it). Negative
-/// control: another process reading the same file starts afresh, and the
-/// answer settles its scan before the key's row.
 #[cfg(unix)]
 #[test]
 fn the_key_state_rides_over_a_settled_newer_read() {
@@ -5372,7 +4899,6 @@ fn the_key_state_rides_over_a_settled_newer_read() {
     let facts = proc.read(&launch, &mut cache);
     assert_eq!(facts.effort.as_deref(), Some("xhigh"));
     assert_eq!(facts.top_effort, Some(false), "rides over the settled read");
-    // Negative control: another process (pid) with the same floor.
     let entry = session_of_pid(&proc.claude, 4242, Some(proc.start)).expect("registry");
     let other = facts_for_entry_at(
         &proc.claude,
@@ -5388,12 +4914,6 @@ fn the_key_state_rides_over_a_settled_newer_read() {
 }
 
 /// [`drawn_cells`] takes the cells under a fact's glyphs as drawn: two
-/// glyphs in cells 4 and 5 drawn three quarters of a cell right lie over
-/// 4.75..6.75, so cells 5 and 6 (middles 5.5 and 6.5), not 4 and 5; drawn
-/// three quarters left, 3.25..5.25, cells 3 and 4; a wide glyph's two cells
-/// move with it; a middle exactly on an ink's left edge is under it, one on
-/// its right edge is not. NEGATIVE CONTROL: with no nudge the run is the
-/// glyphs' own cells, and a span no glyph stands in takes none.
 #[test]
 fn drawn_cells_follow_the_glyphs_nudges() {
     let glyph = |cell: usize, cols: usize, nudge: i8| SetGlyph {
@@ -5424,17 +4944,12 @@ fn drawn_cells_follow_the_glyphs_nudges() {
     assert_eq!(drawn_cells(&wide, &span(4, 6)), 5..7);
     let half = set(vec![glyph(4, 1, 2 * quarter)]);
     assert_eq!(drawn_cells(&half, &span(4, 5)), 4..5, "4.5..5.5: cell 4");
-    // CONTROL: unmoved, the glyphs' own cells; an empty span, none.
     let still = set(vec![glyph(4, 1, 0), glyph(5, 1, 0)]);
     assert_eq!(drawn_cells(&still, &span(4, 6)), 4..6);
     assert_eq!(drawn_cells(&still, &span(8, 10)), 0..0);
 }
 
 /// [`fact_spans`] splits `◆ Opus 5.5 xhigh` by its glyphs: the mark and the
-/// model's glyphs are the model, the effort's five its own, then the path,
-/// the branch and the usage; the account is no fact. Negative controls: the
-/// model-alone rung has no effort span, an effort with no model is all
-/// effort, and a both-hidden stub has no split and restores both.
 #[test]
 fn fact_spans_split_model_and_effort_by_their_glyphs() {
     let facts = FooterFacts {
@@ -5478,11 +4993,9 @@ fn fact_spans_split_model_and_effort_by_their_glyphs() {
     assert_eq!(glyphs_in(span(FactKind::Model)), "\u{25C6}Opus5.5");
     assert_eq!(glyphs_in(span(FactKind::Branch)), "\u{2387}main");
     assert!(spans.iter().flatten().all(|s| s.restores.is_empty()));
-    // In reading order, none overlapping, inside the set line.
     let cells: Vec<(u16, u16)> = spans.iter().flatten().map(|s| s.cells).collect();
     assert!(cells.windows(2).all(|w| w[0].1 <= w[1].0), "{cells:?}");
     assert!(usize::from(cells.last().unwrap().1) <= set.cells);
-    // Negative controls.
     let alone = model_alone(&facts).expect("a model");
     let alone_spans = fact_spans(&set_facts(std::slice::from_ref(&alone)), &[alone]);
     assert_eq!(
@@ -5515,7 +5028,6 @@ fn fact_spans_split_model_and_effort_by_their_glyphs() {
         (segs[0].text.as_str(), segs[0].split),
         ("Opus 5.5 off xhigh off", Some("Opus 5.5 off ".len()))
     );
-    // Each stub shows its own fact again.
     let stubs = fact_spans(&set_facts(&segs), &segs);
     let (model, effort) = (stubs[0].expect("its model"), stubs[1].expect("its effort"));
     assert_eq!(
@@ -5531,13 +5043,6 @@ fn fact_spans_split_model_and_effort_by_their_glyphs() {
 }
 
 /// THE CONTEXT FACT (main's `◐ ctx`) is a clickable fact as the path and
-/// the branch are: [`fact_spans`] gives it its own span, after the branch
-/// and before the usage, over its mark and its words; hidden
-/// ([`FactMask::CONTEXT`]) it is its stub, `ctx 84% left off`, quiet but its
-/// mark, a span that restores it; and with a subscription shown it is the
-/// first fact the ladder gives up (`subscription_ladder`, the order main
-/// gave it). NEGATIVE CONTROL: with no context, no span is the context's
-/// and no rung differs by it.
 #[test]
 fn the_context_fact_is_a_span_its_stub_restores_and_it_goes_first() {
     let facts = FooterFacts {
@@ -5576,7 +5081,6 @@ fn the_context_fact_is_a_span_its_stub_restores_and_it_goes_first() {
         .collect();
     assert_eq!(glyphs, "\u{25D0}ctx84%left");
     assert!(context.restores.is_empty(), "shown, no stub");
-    // Hidden: its stub.
     let hidden = FooterFacts {
         off: FactMask::CONTEXT,
         ..facts.clone()
@@ -5597,7 +5101,6 @@ fn the_context_fact_is_a_span_its_stub_restores_and_it_goes_first() {
         .find(|s| s.kind == FactKind::Context)
         .expect("the stub's span");
     assert_eq!(stub.restores, FactMask::CONTEXT, "a stub that restores it");
-    // With a subscription shown, the context goes first.
     let subscribed = FooterFacts {
         subscription: Some(crate::harness::profile::SubscriptionDisplay {
             email: Some("person@example.com".into()),
@@ -5615,7 +5118,6 @@ fn the_context_fact_is_a_span_its_stub_restores_and_it_goes_first() {
         .collect();
     assert!(ladder[0].iter().any(|s| s.mark == CONTEXT_MARK));
     assert_eq!(ladder[1], without, "the context goes first");
-    // CONTROL: no context, no span and no rung for it.
     let none = FooterFacts {
         context: None,
         ..subscribed
@@ -5636,8 +5138,6 @@ fn the_context_fact_is_a_span_its_stub_restores_and_it_goes_first() {
 }
 
 /// `rooms 20..=200` of [`narrow_rule_walled`] with an account as the lights
-/// cases of `testdata/footer-fit-sweep.txt` see them, one line per run of
-/// rooms that fit alike.
 fn fit_sweep(facts: &FooterFacts) -> String {
     let lights = [
         None,
@@ -5683,14 +5183,6 @@ fn fit_sweep(facts: &FooterFacts) -> String {
 }
 
 /// A hidden fact reads its value and [`OFF_STUB`] after it, all its glyphs
-/// quiet (the window draws them in the rule's own gray) — the owner's ask
-/// (2026-10-19): "show greyed out text and say off", as the top rule's key
-/// does — and the stubs give way first:
-/// the whole facts with them, then without them, then as before. The model
-/// hidden gives no model-alone rung. Negative control: with nothing hidden
-/// every room from 20 to 200 fits exactly as the ladder did before hidden
-/// facts (`testdata/footer-fit-sweep.txt`), and the stubbed ladder is the
-/// bare one.
 #[test]
 fn a_hidden_fact_reads_off_in_rule_gray_and_gives_way_first() {
     let shown = |facts: &FooterFacts| -> Vec<String> {
@@ -5723,7 +5215,6 @@ fn a_hidden_fact_reads_off_in_rule_gray_and_gives_way_first() {
         shown(&hide(FactMask::PATH.union(FactMask::BRANCH)))[1..],
         ["\u{2302} ~/src/github.com/aterm off", "\u{2387} main off"]
     );
-    // The stub's glyphs are quiet, the values beside them are not.
     let quiet = |off: FactMask| -> (String, String) {
         let set = set_facts(&segments(&hide(off)));
         let pick = |q: bool| {
@@ -5756,15 +5247,12 @@ fn a_hidden_fact_reads_off_in_rule_gray_and_gives_way_first() {
             "Opus5.5xhigh~/src/github.com/aterm".into()
         )
     );
-    // A hidden fact the facts lack is no stub.
     let no_branch = FooterFacts {
         branch: None,
         off: FactMask::BRANCH,
         ..narrow_rule_facts()
     };
     assert!(!shown(&no_branch).iter().any(|s| s.contains(OFF_STUB)));
-    // The stubs give way first: the first narrower rung is the whole facts
-    // without them, the usage still whole.
     let tokens = FooterFacts {
         off: FactMask::PATH,
         ..narrow_rule_tokens()
@@ -5784,11 +5272,9 @@ fn a_hidden_fact_reads_off_in_rule_gray_and_gives_way_first() {
         "{walk:?}"
     );
     assert!(walk[2..].iter().flatten().all(|s| !s.contains(OFF_STUB)));
-    // With the model hidden, the narrowest rung keeps no model.
     let no_model = hide(FactMask::MODEL);
     assert_eq!(model_alone(&no_model), None);
     assert_eq!(walk_down(&no_model).last().map(Vec::len), Some(0));
-    // Negative control: nothing hidden, as before.
     let facts = FooterFacts {
         account: Some("work-2".into()),
         ..narrow_rule_walled()
@@ -5808,10 +5294,6 @@ fn a_hidden_fact_reads_off_in_rule_gray_and_gives_way_first() {
 }
 
 /// The launch fixtures' top rules with the stand-in `workspace` (as wide as
-/// the key) replaced by the key: the tag is found at the key's columns, at
-/// every width measured. Negative controls: the stand-in itself, the plain
-/// bottom rule, the key run into a path, and the key not at the rule's end
-/// are none.
 #[test]
 fn top_rule_tag_finds_the_key_alone() {
     let fixtures = [
@@ -5850,7 +5332,6 @@ fn top_rule_tag_finds_the_key_alone() {
             Some((at, at + CLAUDE_TOP_EFFORT_KEY.len())),
             "{row:?}"
         );
-        // Negative controls on the same row.
         let path = stand_in.replace(" workspace ", &format!(" /{CLAUDE_TOP_EFFORT_KEY} "));
         assert_eq!(top_rule_tag(&path), None, "{path:?}");
     }
@@ -5868,9 +5349,6 @@ fn top_rule_tag_finds_the_key_alone() {
 }
 
 /// [`top_effort_answer`] reads the newest `⎿` row above the top rule, its
-/// wrapped rows joined back. Negative controls: a `⎿` above a newer `❯` echo
-/// is not read, a newest `⎿` that is no key answer hides an older one, and
-/// one past eight rows is out of reach.
 #[test]
 fn top_effort_answer_reads_the_newest_answer_only() {
     let key = capital_key();
@@ -5901,7 +5379,6 @@ fn top_effort_answer_reads_the_newest_answer_only() {
         read(&screen(&[echo.clone(), on.clone()])),
         Some(TopAnswer::On)
     );
-    // Wrapped at a narrow pane: the anchor runs across the break.
     let wrapped = [
         echo.clone(),
         answer(&format!("{key} off. Effort")),
@@ -5920,7 +5397,6 @@ fn top_effort_answer_reads_the_newest_answer_only() {
         read(&screen(&[echo.clone(), unavailable])),
         Some(TopAnswer::Unavailable)
     );
-    // The newest of two.
     assert_eq!(
         read(&screen(&[
             echo.clone(),
@@ -5930,7 +5406,6 @@ fn top_effort_answer_reads_the_newest_answer_only() {
         ])),
         Some(TopAnswer::Off)
     );
-    // Negative controls.
     assert_eq!(
         read(&screen(&[off.clone(), echo.clone()])),
         None,
@@ -5948,9 +5423,6 @@ fn top_effort_answer_reads_the_newest_answer_only() {
 }
 
 /// A measured 2.1.304 screen (`aterm-phase`'s fixtures, the stand-in
-/// `workspace` as wide as the key) with the stand-in replaced by the key, its
-/// header line dropped; `cut` keeps only the rows above it and draws the
-/// composer under them, as a screen whose newest answer is that row's.
 fn measured(text: &str, cut: Option<usize>) -> Vec<String> {
     let key = capital_key();
     let mut rows: Vec<String> = text
@@ -5974,12 +5446,6 @@ fn measured(text: &str, cut: Option<usize>) -> Vec<String> {
 }
 
 /// THE MEASURED ANSWERS, AT EVERY WIDTH (2.1.304): each screen's newest
-/// answer to `/effort <key> on|off` is read — wrapped at 26, 34 and 80
-/// columns with a one-blank gutter, far above the composer in the
-/// fullscreen renderer's short transcript, and the two refusals, the
-/// unavailable one naming the model's ID at a narrow width too.
-/// NEGATIVE CONTROLS: the stand-in left in (no key's head) reads nothing,
-/// and so does a screen whose newest result is a `/model` answer.
 #[test]
 fn top_effort_reply_reads_every_measured_answer() {
     use aterm_phase::phase::composer_rules;
@@ -6041,23 +5507,18 @@ fn top_effort_reply_reads_every_measured_answer() {
         model: Some("claude-sonnet-4-5".into()),
     });
     assert_eq!(read(&measured(fx("unavailable"), None)), unavailable);
-    // The unavailable refusal as 34 and 80 columns wrapped it (its block
-    // ends at row 23 and row 27 of the files), read as the newest answer.
     for (name, cut) in [("on-34", 22), ("on-80", 26)] {
         let rows = measured(fx(name), Some(cut));
         assert_eq!(read(&rows), unavailable, "{name} cut at {cut}");
     }
-    // NEGATIVE CONTROLS.
     let stand_in: Vec<String> = fx("on-34").lines().skip(1).map(str::to_owned).collect();
     let (top, _) = composer_rules(&stand_in).expect("a composer");
     assert_eq!(top_effort_reply(&stand_in, top), None, "no key's head");
-    // The 26-column screen cut under its `/model default` answer.
     let model = measured(fx("on-26"), Some(26));
     assert_eq!(read(&model), None, "a /model answer");
 }
 
 /// No new anchor spells the key: each is a suffix the reader puts after the
-/// key's head ([`past_key`]), so `aterm_primer`'s const is its one spelling.
 #[test]
 fn no_anchor_spells_the_key() {
     for id in [
@@ -6080,12 +5541,6 @@ fn no_anchor_spells_the_key() {
 }
 
 /// THE EFFORT SPLIT AND A STUB'S GREY SURVIVE CLUSTERS AND MARKS: a
-/// segment's text set grapheme by grapheme ([`set_facts`]: an emoji cluster
-/// one glyph, a combining mark on its base, not a glyph of its own) still
-/// marks each glyph past [`Segment::split`] as the effort's and each of a
-/// hidden head's as quiet, by its byte in the text — so a click on the
-/// effort ([`fact_spans`]) lands there after a multi-byte head. CONTROL: the
-/// mark and the space after it are neither.
 #[test]
 fn the_effort_split_survives_clusters_and_marks() {
     for head in ["Opu\u{301}s 5.5 ", "\u{1F469}\u{200D}\u{1F4BB} 5.5 "] {

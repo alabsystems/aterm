@@ -2,34 +2,7 @@
 // Copyright 2026 Andrew Yates
 // Author: Andrew Yates
 
-//! A loopback GitHub for agh's tests: the api, uploads, web and CDN origins, each a plain
-//! HTTP listener on 127.0.0.1, with the faults a test asks for and a log of what it was sent.
-//!
-//! - **Wire.** HTTP/1.1, one request per connection (`Connection: close`). Every answer
-//!   carries `Content-Length` but a 304; a HEAD carries its GET's. Every api answer carries
-//!   `X-GitHub-Request-Id: FAKE:{n}` (n counts requests from 1) and the `x-ratelimit-*`
-//!   headers (5000 per token, 60 anonymous; an authenticated 304 and `/rate_limit` are free).
-//!   An api request the rate charges, made once its limit is used up, answers 403
-//!   `API rate limit exceeded.`, as GitHub's does.
-//! - **ETags.** A JSON GET's 200 carries `ETag: W/"{16 hex of sha256(body)}"`; a matching
-//!   `If-None-Match` answers 304.
-//! - **Visibility.** A private repository is a 404 to anyone it does not name; drafts are
-//!   listed only to a push login.
-//! - **Ids.** Owners count from 100, repositories from 1000, releases from 5000, assets
-//!   from 9000.
-//! - **Violations.** A credential at the web or CDN origin (the CDN then answers 400), a
-//!   missing or empty `User-Agent`, a missing or empty `X-GitHub-Api-Version` at the api or
-//!   uploads origin, an `X-GitHub-*` header at the web or CDN origin, `Content-Length` on a
-//!   GET or HEAD, and `per_page` over 100, each recorded as one line of `violations()`. At
-//!   the web and CDN origins a credential is `Authorization`, `Proxy-Authorization`,
-//!   `Cookie`, or any header whose value holds a token `add_token` registered, one line
-//!   each. A registered token in the request target is one at every origin (the CDN answers
-//!   it 400 too), and more than one credential header at the api or uploads origin is one,
-//!   answered 400. Every text, and `seen()`'s target, shows a registered token as `<token>`.
-//!   A request head the fake cannot parse (no target, a header line without `:`, a head cut
-//!   short or over 64 KiB, the request line included) is one too, logged in `seen()` and
-//!   answered 400. An `after` change that has gone stale by the time it is due (its release
-//!   deleted since) is skipped and recorded as one.
+//! Loopback HTTP fake for GitHub API, uploads, web, and CDN origins used by `agh` tests.
 
 #![forbid(unsafe_code)]
 #![deny(clippy::print_stdout, clippy::print_stderr)]
@@ -53,8 +26,7 @@ fn seeded_hex(domain: &[u8], seed: &str) -> String {
     aterm_codec::hex::encode_lower(&hasher.finalize())
 }
 
-/// A token for tests: `ghp_` and the first 36 lowercase hex digits of sha256(`agh-fake\0` ‖
-/// `seed`). No test spells a token-shaped literal.
+/// Generates a deterministic classic test token (`ghp_...`) from `seed`.
 #[must_use]
 pub fn token(seed: &str) -> String {
     let mut hex = seeded_hex(b"agh-fake\0", seed);
@@ -62,8 +34,7 @@ pub fn token(seed: &str) -> String {
     format!("ghp_{hex}")
 }
 
-/// A fine-grained token for tests: `github_pat_` and the 64 lowercase hex digits of
-/// sha256(`agh-fake/fine-grained\0` ‖ `seed`).
+/// Generates a deterministic fine-grained test token (`github_pat_...`) from `seed`.
 #[must_use]
 pub fn fine_grained_token(seed: &str) -> String {
     format!(
@@ -72,33 +43,33 @@ pub fn fine_grained_token(seed: &str) -> String {
     )
 }
 
-/// The four ports.
+/// Loopback ports bound by the four fake origins.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Ports {
-    /// The api origin.
+    /// API origin port.
     pub api: u16,
-    /// The uploads origin.
+    /// Uploads origin port.
     pub uploads: u16,
-    /// The web origin.
+    /// Web origin port.
     pub web: u16,
-    /// The CDN origin.
+    /// CDN origin port.
     pub cdn: u16,
 }
 
-/// Which origin a request reached.
+/// Origin reached by a recorded request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FakeOrigin {
-    /// The api origin.
+    /// API origin.
     Api,
-    /// The uploads origin.
+    /// Uploads origin.
     Uploads,
-    /// The web origin.
+    /// Web origin.
     Web,
-    /// The CDN origin.
+    /// CDN origin.
     Cdn,
 }
 
-/// The running fake. Dropping it stops the listeners.
+/// Running loopback GitHub fake whose listeners stop on drop.
 pub struct FakeGithub {
     state: Arc<Mutex<State>>,
     ports: Ports,
@@ -106,21 +77,21 @@ pub struct FakeGithub {
     accepts: Vec<JoinHandle<()>>,
 }
 
-/// A repository to add.
+/// Repository specification.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RepoSpec {
-    /// Whether it is private.
+    /// Whether the repository is private.
     pub private: bool,
-    /// Its default branch.
+    /// Default branch name.
     pub default_branch: String,
-    /// The logins with push.
+    /// Logins granted push access.
     pub push_logins: Vec<String>,
-    /// The logins with pull.
+    /// Logins granted pull access.
     pub pull_logins: Vec<String>,
 }
 
 impl RepoSpec {
-    /// Public, default branch `main`, nobody with push.
+    /// Public repository with default branch `main`.
     #[must_use]
     pub fn public() -> RepoSpec {
         RepoSpec {
@@ -131,7 +102,7 @@ impl RepoSpec {
         }
     }
 
-    /// As `public`, but private.
+    /// Private repository with default branch `main`.
     #[must_use]
     pub fn private() -> RepoSpec {
         RepoSpec {
@@ -140,14 +111,14 @@ impl RepoSpec {
         }
     }
 
-    /// The same repository with `login` holding push.
+    /// Grants push access to `login`.
     #[must_use]
     pub fn push(mut self, login: &str) -> RepoSpec {
         self.push_logins.push(login.to_string());
         self
     }
 
-    /// The same repository with `login` holding pull.
+    /// Grants pull access to `login`.
     #[must_use]
     pub fn pull(mut self, login: &str) -> RepoSpec {
         self.pull_logins.push(login.to_string());
@@ -155,31 +126,31 @@ impl RepoSpec {
     }
 }
 
-/// A release to add.
+/// Release specification.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReleaseSpec {
-    /// The tag.
+    /// Release tag.
     pub tag: String,
-    /// The title.
+    /// Release title.
     pub name: Option<String>,
-    /// Whether it is a draft.
+    /// Whether the release is a draft.
     pub draft: bool,
-    /// Whether it is a prerelease.
+    /// Whether the release is a prerelease.
     pub prerelease: bool,
-    /// Whether it is immutable.
+    /// Whether the release is immutable.
     pub immutable: bool,
-    /// The commitish.
+    /// Target commitish.
     pub target_commitish: String,
-    /// When it was made.
+    /// Creation timestamp.
     pub created_at: String,
-    /// When it was published.
+    /// Publication timestamp.
     pub published_at: Option<String>,
-    /// The notes.
+    /// Release notes body.
     pub body: Option<String>,
 }
 
 impl ReleaseSpec {
-    /// Published at `created_at`, target `main`, no name or body.
+    /// Published release at `created_at` targeting `main`.
     #[must_use]
     pub fn published(tag: &str, created_at: &str) -> ReleaseSpec {
         ReleaseSpec {
@@ -195,7 +166,7 @@ impl ReleaseSpec {
         }
     }
 
-    /// A draft (no `published_at`).
+    /// Draft release with no `published_at`.
     #[must_use]
     pub fn draft(tag: &str, created_at: &str) -> ReleaseSpec {
         ReleaseSpec {
@@ -205,7 +176,7 @@ impl ReleaseSpec {
         }
     }
 
-    /// The same release, a prerelease or not.
+    /// Sets the `prerelease` flag.
     #[must_use]
     pub fn prerelease(mut self, prerelease: bool) -> ReleaseSpec {
         self.prerelease = prerelease;
@@ -213,37 +184,36 @@ impl ReleaseSpec {
     }
 }
 
-/// What an asset's `digest` field says.
+/// Asset `digest` field behavior.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DigestSpec {
-    /// The bytes' true digest.
+    /// True SHA-256 digest of the asset bytes.
     True,
-    /// `null`, as assets before June 2025 have.
+    /// `null` digest.
     Null,
-    /// A digest of other bytes.
+    /// Mismatched SHA-256 digest.
     Wrong,
 }
 
-/// An asset to add.
+/// Release asset specification.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AssetSpec {
-    /// The file name.
+    /// Asset file name.
     pub name: String,
-    /// The bytes.
+    /// Asset payload bytes.
     pub bytes: Vec<u8>,
-    /// `uploaded`, `open`, `starter`, ….
+    /// Asset state (`uploaded`, `open`, `starter`, etc.).
     pub state: String,
-    /// What `digest` says.
+    /// Digest behavior.
     pub digest: DigestSpec,
-    /// The media type.
+    /// Content media type.
     pub content_type: String,
-    /// When it last changed.
+    /// Last-updated timestamp.
     pub updated_at: String,
 }
 
 impl AssetSpec {
-    /// `uploaded`, the true digest, `application/octet-stream`, updated
-    /// `2026-10-01T00:00:00Z`.
+    /// Uploaded `application/octet-stream` asset with its true digest.
     #[must_use]
     pub fn uploaded(name: &str, bytes: &[u8]) -> AssetSpec {
         AssetSpec {
@@ -257,56 +227,56 @@ impl AssetSpec {
     }
 }
 
-/// A commit to add, newest last; history is linear in the order added.
+/// Commit specification.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CommitSpec {
-    /// The sha.
+    /// Commit SHA.
     pub sha: String,
-    /// The message.
+    /// Commit message.
     pub message: String,
-    /// The author's GitHub login.
+    /// Author GitHub login.
     pub author_login: Option<String>,
-    /// The author's git name.
+    /// Author Git name.
     pub author_name: String,
-    /// The committer date.
+    /// Committer timestamp.
     pub date: String,
-    /// The paths it touches.
+    /// Paths modified by the commit.
     pub paths: Vec<String>,
 }
 
-/// What `compare/{base}...{head}` answers.
+/// Canned response for `compare/{base}...{head}`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CompareSpec {
-    /// A comparison.
+    /// Successful comparison result.
     Ok {
-        /// `ahead`, `behind`, `diverged` or `identical`.
+        /// Comparison status (`ahead`, `behind`, `diverged`, or `identical`).
         status: String,
-        /// Commits head has that base lacks.
+        /// Commits `head` is ahead of `base`.
         ahead_by: u64,
-        /// Commits base has that head lacks.
+        /// Commits `head` is behind `base`.
         behind_by: u64,
-        /// Every commit of the comparison.
+        /// Total commits in the comparison.
         total_commits: u64,
-        /// The merge base's sha.
+        /// Merge-base commit SHA.
         merge_base: String,
     },
-    /// 404 `No common ancestor between {base} and {head}.`
+    /// 404 `No common ancestor` response.
     NoCommonAncestor,
 }
 
-/// Which requests a fault or a change applies to.
+/// Request matcher for faults and state changes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Match {
-    /// The origin.
+    /// Target origin.
     pub origin: FakeOrigin,
-    /// The method, or any.
+    /// Optional HTTP method filter.
     pub method: Option<String>,
-    /// The path's prefix.
+    /// Request path prefix.
     pub path_prefix: String,
 }
 
 impl Match {
-    /// Api requests under `path_prefix`.
+    /// Matches API requests under `path_prefix`.
     #[must_use]
     pub fn api(path_prefix: &str) -> Match {
         Match {
@@ -316,7 +286,7 @@ impl Match {
         }
     }
 
-    /// Uploads requests under `path_prefix`.
+    /// Matches uploads requests under `path_prefix`.
     #[must_use]
     pub fn uploads(path_prefix: &str) -> Match {
         Match {
@@ -325,7 +295,7 @@ impl Match {
         }
     }
 
-    /// Web requests under `path_prefix`.
+    /// Matches web requests under `path_prefix`.
     #[must_use]
     pub fn web(path_prefix: &str) -> Match {
         Match {
@@ -334,7 +304,7 @@ impl Match {
         }
     }
 
-    /// Every CDN request.
+    /// Matches all CDN requests.
     #[must_use]
     pub fn cdn() -> Match {
         Match {
@@ -343,7 +313,7 @@ impl Match {
         }
     }
 
-    /// The same match, for `method` only.
+    /// Restricts this matcher to HTTP `method`.
     #[must_use]
     pub fn method(mut self, method: &str) -> Match {
         self.method = Some(method.to_string());
@@ -351,113 +321,103 @@ impl Match {
     }
 }
 
-/// A fault: what the fake does instead of answering.
+/// Injected fault action.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Fault {
-    /// This status, body and headers (plus the rate headers on the api origin). The body is
-    /// served as JSON unless `headers` names a `Content-Type`. A header named here replaces
-    /// the fake's own of that name (`x-ratelimit-*`, `X-GitHub-Request-Id`), except
-    /// `Content-Length` and `Connection`, which the fake always writes itself and drops here.
+    /// Responds with custom status, body, and headers.
     Status {
-        /// The status.
+        /// HTTP status code.
         status: u16,
-        /// The body.
+        /// Response body.
         body: String,
-        /// The headers.
+        /// Extra response headers.
         headers: Vec<(String, String)>,
     },
-    /// Read the request, then close without a byte of answer.
+    /// Closes the connection after reading the request without sending a response.
     Close,
-    /// Read the request, wait this long, then close. The fake waits on the client, not on a
-    /// clock, so the hang also ends as soon as the client hangs up.
+    /// Holds the connection open for up to the given duration before closing.
     Hang(std::time::Duration),
-    /// The full head with the true `Content-Length`, then only `at` bytes of the body.
+    /// Sends the full response header and truncates the body at `at` bytes.
     TruncateBody {
-        /// The bytes sent.
+        /// Number of body bytes sent.
         at: usize,
     },
-    /// 403, `retry-after`, and a message holding `secondary rate limit`.
+    /// Responds with 403 secondary rate limit and `retry-after`.
     SecondaryLimit {
-        /// The `retry-after` seconds.
+        /// `retry-after` header value in seconds.
         retry_after: u64,
     },
-    /// 403 with `x-ratelimit-remaining: 0` and `x-ratelimit-reset`, on whichever origin it
-    /// fires (the five `x-ratelimit-*` headers, the limit used up).
+    /// Responds with 403 primary rate limit exhausted (`x-ratelimit-remaining: 0`).
     PrimaryExhausted {
-        /// The reset, in Unix seconds.
+        /// `x-ratelimit-reset` Unix timestamp.
         reset: u64,
     },
-    /// This 3xx status and `Location`.
+    /// Responds with a 3xx redirect to `location`.
     RedirectTo {
-        /// The status.
+        /// Redirect HTTP status code.
         status: u16,
-        /// The `Location`.
+        /// `Location` header value.
         location: String,
     },
-    /// Answer normally, then delete the repository's newest release.
+    /// Answers normally and then deletes the repository's newest release.
     Torn,
-    /// On the CDN: answer 302 to the CDN again.
+    /// Redirects a CDN request to the CDN a second time (302).
     SecondHop,
 }
 
-/// A change to the fake's state.
+/// State mutation applied by the fake.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Change {
-    /// A draft becomes published (`published_at = created_at`).
+    /// Marks a draft release as published.
     Publish {
-        /// The release.
+        /// Target release ID.
         release_id: u64,
     },
-    /// As `add_asset`. An asset of that name already on the release is replaced in place: its
-    /// id is kept, and its bytes, size, digest, state and `updated_at` come from `spec`.
+    /// Adds or replaces an asset on a release.
     AddAsset {
-        /// The release.
+        /// Target release ID.
         release_id: u64,
-        /// The asset.
+        /// Asset specification.
         spec: AssetSpec,
     },
-    /// As `set_latest`.
+    /// Overrides the repository's `releases/latest` target.
     SetLatest {
-        /// The repository.
+        /// Repository `owner/name` slug.
         slug: String,
-        /// The release, or none.
+        /// Target release ID, or `None` for 404.
         release_id: Option<u64>,
     },
-    /// The release is deleted.
+    /// Deletes a release.
     DeleteRelease {
-        /// The release.
+        /// Target release ID.
         release_id: u64,
     },
-    /// The repository becomes private with no logins: a 404 to everyone.
+    /// Makes the repository private with no authorized logins.
     Hide {
-        /// The repository.
+        /// Repository `owner/name` slug.
         slug: String,
     },
 }
 
-/// One request as the fake received it. `headers` holds every header but the credential
-/// header (at the web and CDN origins, every header `violations()` counts as a credential),
-/// which is reduced to `had_authorization` and `as_login`.
+/// Recorded incoming request with credentials redacted.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Seen {
-    /// The origin it reached.
+    /// Origin that received the request.
     pub origin: FakeOrigin,
-    /// The method.
+    /// HTTP method.
     pub method: String,
-    /// The path and query, with every token `add_token` registered in it shown as `<token>`.
+    /// Request path and query with registered tokens redacted to `<token>`.
     pub path_and_query: String,
-    /// Every header but the credential (and, at the web and CDN origins, every header the
-    /// violations count as one: `Proxy-Authorization`, `Cookie`, a registered token's).
+    /// Request headers excluding credential headers.
     pub headers: Vec<(String, String)>,
-    /// Whether it carried a credential header (at the web and CDN origins, any credential,
-    /// a registered token in the target among them).
+    /// Whether the request carried an authorization credential.
     pub had_authorization: bool,
-    /// The login its token is, when the fake knows it.
+    /// Login associated with the request token, if known.
     pub as_login: Option<String>,
 }
 
 impl Seen {
-    /// The value of header `name`, ASCII case-insensitively.
+    /// Looks up header `name` ASCII case-insensitively.
     #[inline]
     #[must_use]
     pub fn header(&self, name: &str) -> Option<&str> {
@@ -465,8 +425,7 @@ impl Seen {
     }
 }
 
-/// The value of header `name` among `headers`, ASCII case-insensitively: the one lookup the
-/// answers, the requests, the server and the seen log share.
+/// Looks up `name` in `headers` ASCII case-insensitively.
 #[inline]
 pub(crate) fn header_in<'h>(headers: &'h [(String, String)], name: &str) -> Option<&'h str> {
     headers
@@ -476,11 +435,9 @@ pub(crate) fn header_in<'h>(headers: &'h [(String, String)], name: &str) -> Opti
 }
 
 impl FakeGithub {
-    /// Bind 127.0.0.1:0 four times and serve each listener on its own thread.
-    ///
+    /// Binds four loopback listeners and serves each on a background thread.
     /// # Panics
-    ///
-    /// When a loopback port cannot be bound: a test cannot run without one.
+    /// Panics if binding a loopback listener or spawning its thread fails.
     #[must_use]
     pub fn start() -> FakeGithub {
         let state = Arc::new(Mutex::new(State::new()));
@@ -494,7 +451,7 @@ impl FakeGithub {
         }
     }
 
-    /// The four ports.
+    /// Returns the bound loopback [`Ports`].
     #[inline]
     #[must_use]
     pub const fn ports(&self) -> Ports {
@@ -506,139 +463,103 @@ impl FakeGithub {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// A token the api and uploads origins accept, as `login` (an owner of type User).
+    /// Registers `token` for user `login` on the API and uploads origins.
     pub fn add_token(&self, token: &str, login: &str) {
         self.state().add_token(token, login);
     }
 
-    /// `owner/name`; the id. An owner that is some token's login is a User, any other an
-    /// Organization.
-    ///
+    /// Adds repository `slug` (`owner/name`) and returns its numeric ID.
     /// # Panics
-    ///
-    /// When `slug` holds no `/`.
+    /// Panics if `slug` is not `owner/name`.
     pub fn add_repo(&self, slug: &str, spec: RepoSpec) -> u64 {
         self.state().add_repo(slug, spec)
     }
 
-    /// From now on the old name answers 301 to `/repositories/{id}…`.
-    ///
+    /// Renames repository `old` to `new`, redirecting old paths with 301.
     /// # Panics
-    ///
-    /// When no repository is named `old`, or `new` holds no `/`.
+    /// Panics if `old` does not exist or `new` is not `owner/name`.
     pub fn rename_repo(&self, old: &str, new: &str) {
         self.state().rename_repo(old, new);
     }
 
-    /// Two releases may share a tag, as two drafts on GitHub can.
-    ///
+    /// Adds a release to repository `slug` and returns its numeric ID.
     /// # Panics
-    ///
-    /// When no repository is named `slug`.
+    /// Panics if repository `slug` does not exist.
     pub fn add_release(&self, slug: &str, spec: ReleaseSpec) -> u64 {
         self.state().add_release(slug, spec)
     }
 
-    /// The asset's id. A name the release already holds is replaced in place, keeping its id.
-    ///
+    /// Adds or replaces an asset on `release_id` and returns its numeric ID.
     /// # Panics
-    ///
-    /// When no release has `release_id`.
+    /// Panics if `release_id` does not exist.
     pub fn add_asset(&self, release_id: u64, spec: AssetSpec) -> u64 {
         self.state().add_asset(release_id, spec)
     }
 
-    /// The release `releases/latest` answers, or none (a 404). Until this is called it is
-    /// the newest published non-prerelease, as it is again once the set release is gone.
-    ///
+    /// Overrides which release `releases/latest` serves for `slug`.
     /// # Panics
-    ///
-    /// When no repository is named `slug`.
+    /// Panics if `slug` or `release_id` does not exist.
     pub fn set_latest(&self, slug: &str, release_id: Option<u64>) {
         self.state().set_latest(slug, release_id);
     }
 
-    /// A file at `path` under `reference` (a branch, a tag or a sha).
-    ///
+    /// Stores file `bytes` at `path` under `reference` in repository `slug`.
     /// # Panics
-    ///
-    /// When no repository is named `slug`.
+    /// Panics if repository `slug` does not exist.
     pub fn put_file(&self, slug: &str, reference: &str, path: &str, bytes: &[u8]) {
         self.state().put_file(slug, reference, path, bytes);
     }
 
-    /// Whether the tree answers `truncated`.
-    ///
+    /// Sets whether git tree responses for `slug` report `truncated: true`.
     /// # Panics
-    ///
-    /// When no repository is named `slug`.
+    /// Panics if repository `slug` does not exist.
     pub fn set_tree_truncated(&self, slug: &str, truncated: bool) {
         self.state().set_tree_truncated(slug, truncated);
     }
 
-    /// A commit, newest last.
-    ///
+    /// Appends a commit to repository `slug`.
     /// # Panics
-    ///
-    /// When no repository is named `slug`.
+    /// Panics if repository `slug` does not exist.
     pub fn add_commit(&self, slug: &str, spec: CommitSpec) {
         self.state().add_commit(slug, spec);
     }
 
-    /// A branch at `sha`.
-    ///
+    /// Points branch `name` in `slug` at `sha`.
     /// # Panics
-    ///
-    /// When no repository is named `slug`.
+    /// Panics if repository `slug` does not exist.
     pub fn set_branch(&self, slug: &str, name: &str, sha: &str) {
         self.state().set_branch(slug, name, sha);
     }
 
-    /// A tag at `sha`.
-    ///
+    /// Points tag `name` in `slug` at `sha`.
     /// # Panics
-    ///
-    /// When no repository is named `slug`.
+    /// Panics if repository `slug` does not exist.
     pub fn set_tag(&self, slug: &str, name: &str, sha: &str) {
         self.state().set_tag(slug, name, sha);
     }
 
-    /// What `compare/{base}...{head}` answers.
-    ///
+    /// Sets the canned response for `compare/{base}...{head}` in `slug`.
     /// # Panics
-    ///
-    /// When no repository is named `slug`.
+    /// Panics if repository `slug` does not exist.
     pub fn set_compare(&self, slug: &str, base: &str, head: &str, spec: CompareSpec) {
         self.state().set_compare(slug, base, head, spec);
     }
 
-    /// Apply `change` now.
-    ///
+    /// Applies `change` immediately.
     /// # Panics
-    ///
-    /// When the change names a release or repository the fake does not hold.
+    /// Panics if `change` references a missing repository or release.
     pub fn apply(&self, change: Change) {
         self.state().apply(change);
     }
 
-    /// Apply `change` once the `count`-th request matching `m` has been answered: the answer
-    /// is decided first, and the change is in place before its bytes are written, so the
-    /// client's next request sees it. A request a `Fault::Close` or `Fault::Hang` meets gets
-    /// no answer, so it does not count. A repository a `SetLatest` or `Hide` names is bound
-    /// now, so the change follows it through a later `rename_repo`. A change something has made
-    /// stale by the time it is due (its release deleted) is skipped and recorded in
-    /// `violations()`, and the answer is still written.
-    ///
+    /// Schedules `change` to run after the `count`-th request matching `m`.
     /// # Panics
-    ///
-    /// When the change names a release or repository the fake does not hold now.
+    /// Panics if `count == 0`.
     pub fn after(&self, m: Match, count: usize, change: Change) {
         self.state().after(m, count, change);
     }
 
-    /// The fault fires on the next matching request, once. A matching once-only fault fires
-    /// before any `fault_always` one, so it is never shadowed by an overlapping always fault;
-    /// of several matching once-only faults, the first added fires first.
+    /// Queues a one-shot `fault` for the next request matching `m`.
     pub fn fault(&self, m: Match, fault: Fault) {
         self.state().rules.push(Rule {
             m,
@@ -647,8 +568,7 @@ impl FakeGithub {
         });
     }
 
-    /// The fault fires on every matching request that no once-only fault (`fault`) takes; of
-    /// several matching always faults, the first added fires.
+    /// Installs a standing `fault` for all requests matching `m`.
     pub fn fault_always(&self, m: Match, fault: Fault) {
         self.state().rules.push(Rule {
             m,
@@ -657,29 +577,27 @@ impl FakeGithub {
         });
     }
 
-    /// Every request so far, in order.
+    /// Returns all recorded requests in arrival order.
     #[must_use]
     pub fn seen(&self) -> Vec<Seen> {
         self.state().seen.clone()
     }
 
-    /// Every breach of the wire rules so far, and every `after` change skipped as stale.
+    /// Returns all recorded protocol violations and stale `after` changes.
     #[must_use]
     pub fn violations(&self) -> Vec<String> {
         self.state().violations.clone()
     }
 
-    /// No violation so far.
-    ///
+    /// Asserts that no wire-rule violations have occurred.
     /// # Panics
-    ///
-    /// When there is one, naming every one.
+    /// Panics if any violation was recorded.
     pub fn assert_clean(&self) {
         let violations = self.violations();
         assert!(violations.is_empty(), "{violations:?}");
     }
 
-    /// Forget every request seen.
+    /// Clears the recorded request log.
     pub fn clear_seen(&self) {
         self.state().seen.clear();
     }
@@ -688,7 +606,6 @@ impl FakeGithub {
 impl Drop for FakeGithub {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
-        // An accept loop parked in its back-off sees the flag at once.
         for accept in &self.accepts {
             accept.thread().unpark();
         }

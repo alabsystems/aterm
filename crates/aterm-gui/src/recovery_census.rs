@@ -1,55 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The recovery census: at each windowed launch of the installed app, one row in the
-//! recovery ledger saying how the run before it ended
-//! (`aterm_update::recovery_ledger`, `docs/DESIGN-pty-keeper-2026-09-26.md` §7).
-//!
-//! It reads what is already there, off the main thread, after the crash scans:
-//!
-//! * the crash marker ([`crate::crash_signal::markers`]): one per run, named for its
-//!   pid and birth, removed by every clean exit. Non-empty: a fatal signal, whose
-//!   number the handler wrote and whose mtime is the moment of death. Empty and
-//!   dead: a kill. Gone: a clean exit.
-//! * the panic report (`crash-<pid>.log`, [`crate::logging`]), whose first line
-//!   dates it.
-//! * `aterm.log`, every line stamped with its time and writer's pid: the watchdog's
-//!   stall lines say whether the run's last word was an unended stall
-//!   ([`crate::watchdog`]), the pressure source's lines the level the OS last
-//!   reported ([`crate::memory_pressure`]), the final exit's line dates a quit, and
-//!   the run's last line bounds a kill.
-//! * the boot sentinel (`aterm_update::trial_launch_count`): whether the previous
-//!   build was still inside its boot trial.
-//!
-//! The crash scans (`logging::take_crash_evidence` / `take_kill_evidence`) rename
-//! their artifacts `.seen`, so the census reads both names. Every artifact is tied to
-//! its run by pid and by time (pids are recycled), so a report older than the run's
-//! birth is never that run's.
-//!
-//! Only launches whose crash marker is the daily driver's
-//! ([`crate::crash_signal::MarkerOwner::App`]) write: a cold windowed start of the
-//! installed app, and an update successor once its Commit lands. An update's cold
-//! lane exec's the new build in place, keeping the pid and birth; its row records the
-//! image it replaced as handed off, never the run before a second time. Test, dev,
-//! headless and translocated starts share the log directory and are SIGKILLed by
-//! harnesses routinely; they write nothing there (a development build under
-//! [`LEDGER_SEAM`] writes its cold start's row into the seam's own folder, for a live
-//! test to read). A LAB DESK ([`crate::crash_signal::Arming::Lab`]: a headless instance
-//! under the lab's desk seam, under a private state root) writes in its own log
-//! directory, which is that root's, and tells its node log, so `prev_end=` is real end
-//! to end; its markers are
-//! [`crate::crash_signal::MarkerOwner::Lab`]'s, news to its own root's scan alone
-//! ([`cold_census`]).
-//!
-//! Blind spots: a run whose marker was never created (no private log dir) reads as
-//! clean, as does a killed run whose consumed marker the crash scans pruned before an
-//! installed launch read it (they keep the newest `.seen` artifacts by mtime, and an
-//! empty marker's mtime is its run's birth); a run that filed a panic report on a
-//! background thread and then quit reads as a panic; a second instance still alive
-//! at the next launch is recorded as running and its own end is never classified.
-//! The pid-and-time tie excludes only an earlier owner of the pid: a process that
-//! reuses a dead run's pid before the next launch lends its `aterm.log` lines or
-//! panic report to the run.
+//! Launch recovery census: records previous-run end classification and restore metrics to `recovery-ledger.jsonl`.
 
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
@@ -73,7 +25,6 @@ const SHED_LINE_CRITICAL: &str = "memory pressure (critical)";
 const SHED_LINE_WARN: &str = "memory pressure (warn)";
 
 /// The most bytes of the logs one census reads: both rotation halves are about
-/// 4 MiB each (`logging::RotationBudget::ATERM_LOG`), with slack.
 const MAX_LOG_BYTES: u64 = 12 * 1024 * 1024;
 
 /// This launch, as its row records it.
@@ -81,8 +32,7 @@ const MAX_LOG_BYTES: u64 = 12 * 1024 * 1024;
 pub(crate) struct Me {
     pub(crate) pid: u32,
     pub(crate) started: u64,
-    /// The microseconds of the kernel's birth record within [`Self::started`]; `None`
-    /// when the birth came from the clock.
+    /// Microseconds within [`Self::started`] from the kernel's birth record.
     pub(crate) started_us: Option<u32>,
     pub(crate) build: u64,
     pub(crate) version: String,
@@ -102,8 +52,7 @@ impl Me {
     }
 }
 
-/// The kernel's birth record for a process: Unix seconds, and the microseconds within
-/// them.
+/// Kernel birth timestamp of a process (Unix seconds and microseconds).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Birth {
     pub(crate) seconds: u64,
@@ -144,12 +93,7 @@ fn now_secs() -> u64 {
     aterm_time::unix_secs().unwrap_or(0)
 }
 
-/// Record this launch in the ledger, on a thread of its own: the log scan reads up
-/// to [`MAX_LOG_BYTES`], and nothing on the launch path waits for it. Call after the
-/// crash scans, whose renames it reads. A no-op without a private log directory.
-/// `restores`: how this launch's keeper recovery brought its screens back, when it
-/// recovered any (the crash restore's rungs), recorded on the row. `keeper`: the launch's keeper
-/// link (`keeper=`), which the crash restore's soak reads (`aterm_update::restore_soak`).
+/// Spawn the background census thread to record this launch and previous-run classification.
 pub(crate) fn record(launch: LaunchKind, restores: Option<Restores>, keeper: KeeperAtLaunch) {
     record_into(
         Some(crate::session_log_node::node_log()),
@@ -160,32 +104,21 @@ pub(crate) fn record(launch: LaunchKind, restores: Option<Restores>, keeper: Kee
     );
 }
 
-/// The census's development seam ([`aterm_types::dev_seam!`]): a folder in which a launch
-/// that writes no row of its own (a dev or test build, a headless instance) writes the row
-/// its cold start would, with nothing else of the census's (the node log is not told). A
-/// live test reads it there: the boot's `keeper=` and the recovery's `restored=`, which
-/// `main_entry` hands the census and no unit test reaches.
+/// Environment variable naming a scratch folder for dev/headless census row output.
 pub(crate) const LEDGER_SEAM: &str = "ATERM_DEBUG_RECOVERY_LEDGER";
 
 /// Where a cold start's census row goes ([`cold_census`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ColdCensus {
-    /// The launch's own log directory, the node log told (`start prev_end=`): the
-    /// installed app's windowed start, and a lab desk's, whose log directory is its
-    /// private state root's.
+    /// Write to the launch's own log directory and amend the node log (`start prev_end=`).
     Own,
     /// The [`LEDGER_SEAM`]'s folder alone, the node log not told.
     Seam(PathBuf),
-    /// No row: a test, dev or plain headless start, whose log directory is the daily
-    /// driver's to read (it keeps `prev_end=-`), and an update candidate, which writes
-    /// at its Commit.
+    /// Write no census row.
     Off,
 }
 
-/// THE CENSUS GATE of a cold start armed as `arming`: [`ColdCensus::Own`] for the
-/// installed app ([`Arming::App`](crate::crash_signal::Arming::App)) and a lab desk
-/// ([`Arming::Lab`](crate::crash_signal::Arming::Lab)); else the
-/// development seam's folder when `seam` names one; else [`ColdCensus::Off`].
+/// Determine the [`ColdCensus`] destination for a cold start armed as `arming`.
 pub(crate) fn cold_census(
     arming: crate::crash_signal::Arming,
     seam: Option<&std::ffi::OsStr>,
@@ -216,7 +149,6 @@ pub(crate) fn record_cold(
 }
 
 /// [`record_cold`] with the node log and the log directory given: `census` says
-/// which ledger, if any, takes the row.
 fn record_cold_into(
     node: &'static crate::session_log_node::NodeLogHost,
     own_dir: impl FnOnce() -> Option<PathBuf> + Send + 'static,
@@ -235,9 +167,6 @@ fn record_cold_into(
 }
 
 /// [`record`], reading the ledger in the directory `dir` names (on the
-/// census thread) and telling `node`, when given, how the previous run ended:
-/// the node log's `start prev_end=`, amended as soon as the
-/// class is known, whether or not the row then appends.
 fn record_into(
     node: Option<&'static crate::session_log_node::NodeLogHost>,
     dir: impl FnOnce() -> Option<PathBuf> + Send + 'static,
@@ -249,7 +178,6 @@ fn record_into(
         "aterm-recovery-census",
         crate::qos::Role::Background,
         move || {
-            // Nobody waits on the census: it reads files and appends one line.
             let Some(dir) = dir() else {
                 return;
             };
@@ -293,10 +221,6 @@ pub(crate) fn census_row(
     let own_image = rows.last().filter(|row| is_me(row)).cloned();
     let last = rows.into_iter().rev().find(|row| !is_me(row));
     let prev = match (launch, own_image, last) {
-        // The newest row is this process's own: an update's cold lane exec'd a new
-        // image in place (same pid, same kernel birth). Its previous run is the image
-        // it replaced; the run before that is the old image's own row's, never
-        // counted twice.
         (LaunchKind::Cold, Some(own), _) => handoff_prev(dir, Some(&own), now, probe),
         (LaunchKind::Successor, _, last) => handoff_prev(dir, last.as_ref(), now, probe),
         (LaunchKind::Cold, None, Some(last)) => cold_prev(dir, &last, probe),
@@ -317,7 +241,6 @@ pub(crate) fn census_row(
 }
 
 /// The run that handed off to this launch: the parent of a successor at its Commit,
-/// or the image a cold-lane update exec replaced. It ends as this launch begins.
 fn handoff_prev(dir: &Path, last: Option<&Row>, now: u64, probe: &dyn Probe) -> PrevRun {
     let Some(last) = last else {
         return PrevRun {
@@ -345,8 +268,6 @@ fn handoff_prev(dir: &Path, last: Option<&Row>, now: u64, probe: &dyn Probe) -> 
 fn cold_prev(dir: &Path, last: &Row, probe: &dyn Probe) -> PrevRun {
     let facts = scan_logs(dir, last.pid, last.started);
     let evidence = find_evidence(dir, last.pid, last.started);
-    // Alive only as the very process the row names: a pid reused since is another
-    // (to the microsecond, where both sides carry it).
     let running = probe
         .birth(last.pid)
         .is_some_and(|birth| last.is_process(last.pid, birth.seconds, birth.micros));
@@ -394,7 +315,6 @@ fn first_row_prev(dir: &Path) -> PrevRun {
 }
 
 /// The end class and, when it can be told, the end time (with `true` when it is only
-/// a lower bound).
 fn classify(evidence: &Evidence, facts: &LogFacts) -> (EndClass, Option<(u64, bool)>) {
     if let Some(at) = evidence.panic_at {
         return (EndClass::Panic, at.map(|at| (at, false)));
@@ -409,9 +329,6 @@ fn classify(evidence: &Evidence, facts: &LogFacts) -> (EndClass, Option<(u64, bo
     if let Some(at) = facts.quit_at {
         return (EndClass::Clean, Some((at, false)));
     }
-    // A run always logs at its start (the watchdog arms), so a run with no marker
-    // and no line of its own left no evidence (its lines rotated away, or the log
-    // directory was cleared), and "clean" would be a guess.
     if facts.lines == 0 {
         return (EndClass::Unknown, None);
     }
@@ -452,7 +369,6 @@ fn panic_report_pid(name: &str) -> Option<u32> {
 }
 
 /// A marker's pid and birth second: `crash-marker-<pid>-<nanos>-<owner>.log`, or the
-/// legacy `crash-signal-<pid>-<nanos>.log`.
 fn marker_pid_birth(name: &str) -> Option<(u32, u64)> {
     let body = unconsumed(name).strip_suffix(".log")?;
     let rest = body
@@ -489,7 +405,6 @@ fn marker_signal(path: &Path) -> Option<u8> {
 }
 
 /// What `dir` holds for the run `pid` born at `birth` (artifacts older than the birth
-/// belong to an earlier owner of the pid, and are ignored).
 fn find_evidence(dir: &Path, pid: u32, birth: u64) -> Evidence {
     let mut evidence = Evidence::default();
     let Ok(entries) = std::fs::read_dir(dir) else {
@@ -498,7 +413,6 @@ fn find_evidence(dir: &Path, pid: u32, birth: u64) -> Evidence {
     for entry in entries.flatten() {
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
-        // `DirEntry::metadata` does not follow a symlink on unix.
         let Ok(meta) = entry.metadata() else { continue };
         if !meta.file_type().is_file() {
             continue;
@@ -512,7 +426,6 @@ fn find_evidence(dir: &Path, pid: u32, birth: u64) -> Evidence {
         let Some((marker_pid, marker_birth)) = marker_pid_birth(name) else {
             continue;
         };
-        // The marker is armed within a second or so of the process's birth.
         if marker_pid != pid || marker_birth + 2 < birth {
             continue;
         }
@@ -530,10 +443,6 @@ fn find_evidence(dir: &Path, pid: u32, birth: u64) -> Evidence {
 }
 
 /// For a ledger's first row: the pid and birth of the newest crash artifact a
-/// previous run left (the crash scans have just renamed it `.seen`). Never a marker
-/// its name says another kind of launch armed ([`crate::crash_signal::MarkerOwner::Other`]):
-/// a test, dev or headless start, or a candidate still under its parent's veto, is
-/// not the run before this one.
 fn newest_artifact_owner(dir: &Path) -> Option<(u32, u64)> {
     use crate::crash_signal::{MarkerOwner, markers};
     let mut newest: Option<(u64, u32, u64)> = None;
@@ -613,7 +522,6 @@ impl LogFacts {
         } else if body.contains(SHED_LINE_CRITICAL) {
             self.pressure = Some(Pressure::Critical);
         } else if body.contains(SHED_LINE_WARN) {
-            // A shed line only restates a level: it never lowers a critical report
             // the pressure source made just before it.
             if self.pressure != Some(Pressure::Critical) {
                 self.pressure = Some(Pressure::Warn);
@@ -625,9 +533,7 @@ impl LogFacts {
     }
 }
 
-/// Whether the census reads a stall as open at the end of a run whose `aterm.log`
-/// lines carry `bodies`, in order — the fold [`scan_logs`] applies to each line.
-/// The watchdog's tests pass it the lines its sampler thread logs.
+/// Fold `aterm.log` line `bodies` and return whether a stall remained open at the end.
 #[cfg(test)]
 pub(crate) fn stall_at_end<S: AsRef<str>>(bodies: &[S]) -> Tri {
     let mut facts = LogFacts::default();
@@ -666,7 +572,6 @@ fn scan_logs(dir: &Path, pid: u32, birth: u64) -> LogFacts {
                 Ok(_) => {}
             }
             let line = String::from_utf8_lossy(&raw);
-            // `<secs>.<ms> <pid> <LEVEL> <target>: <body>` (`logging::format_record`).
             let mut parts = line.splitn(3, ' ');
             let (Some(stamp), Some(line_pid), Some(rest)) =
                 (parts.next(), parts.next(), parts.next())
@@ -679,7 +584,6 @@ fn scan_logs(dir: &Path, pid: u32, birth: u64) -> LogFacts {
             let Some(secs) = stamp.split('.').next().and_then(|s| s.parse::<u64>().ok()) else {
                 continue;
             };
-            // An earlier owner of the same pid wrote lines before this run was born.
             if secs + 1 < birth {
                 continue;
             }
@@ -781,9 +685,6 @@ mod tests {
     }
 
     /// THE CENSUS PRODUCER of the node log:
-    /// the census thread tells the node log how the run before this launch
-    /// ended, read under the one-minute hang detector. A first launch (an
-    /// empty ledger) ended `none`; the row is appended after.
     #[test]
     fn the_census_thread_amends_the_node_logs_start() {
         let s = Scratch::new("node-log");
@@ -813,8 +714,6 @@ mod tests {
             amended.starts_with("2 amend n start prev_end=none by=aterm src=aterm conf=exact "),
             "{amended}"
         );
-        // The row follows, with the launch's keeper link: the scratch dir outlives the
-        // thread's write.
         let rows = aterm_spec::wait::until_within(
             aterm_spec::wait::MUST_HAPPEN,
             "the census's row",
@@ -824,10 +723,6 @@ mod tests {
     }
 
     /// A dead, empty marker of `owner` for the run the ledger names (pid 4242, born at
-    /// [`BORN`], whose lines say it started and never that it quit), swept by a launch
-    /// whose own marker is `scan`'s and, for a lab desk, consumed by its kill scan, as
-    /// the launch runs both before its census. Answers whether the marker was left for
-    /// the census, and the census's row.
     fn swept_then_counted(
         owner: crate::crash_signal::MarkerOwner,
         scan: crate::crash_signal::MarkerOwner,
@@ -866,13 +761,6 @@ mod tests {
     }
 
     /// THE LAB DESK'S CENSUS, in process
-    /// over an injected marker directory: a dead `lab` marker under a lab desk's sweep
-    /// is left for the census, and the run reads `killed`; the same marker under the
-    /// installed app's sweep, or a plain start's, is not news and goes, as a dead
-    /// `other` marker under a lab desk's sweep does (the control: a test's start does
-    /// not fool the census), and each of those runs reads `clean`, bounded by its last
-    /// line. NEGATIVE CONTROL (scratch revert): `MarkerOwner::is_news_to` reading a
-    /// `lab` marker as an `other` one sweeps it, and the lab case reads `clean`.
     #[test]
     fn a_lab_desks_census_reads_its_killed_run_and_no_other_start_fools_it() {
         use crate::crash_signal::MarkerOwner::{App, Lab, Other};
@@ -893,13 +781,6 @@ mod tests {
     }
 
     /// THE CENSUS GATE (6C-4): on for the installed app and for a lab desk, which read
-    /// and append their own log directory's ledger and tell the node log; off for a
-    /// plain headless start (its log directory is the daily driver's), whose node log
-    /// keeps `prev_end=-`; the seam's folder alone for a dev start under the ledger
-    /// seam. A lab desk's census amends its node log's start with the killed run its
-    /// kill scan consumed (a one-minute hang detector), and appends its row.
-    /// NEGATIVE CONTROL (scratch revert): the gate flipped, a lab desk `Off`, fails the
-    /// first assertion.
     #[test]
     fn the_census_gate_is_on_for_a_lab_desk_and_off_for_a_plain_headless_one() {
         use crate::crash_signal::{Arming, MarkerOwner, markers};
@@ -933,8 +814,6 @@ mod tests {
                 ep, clock,
             )))
         };
-        // The plain headless desk: no census at all (no thread to wait for), so
-        // its start stays `prev_end=-` and the ledger is untouched.
         let plain_node = started(8);
         let dir = s.0.path().to_path_buf();
         record_cold_into(
@@ -952,8 +831,6 @@ mod tests {
         );
         assert_eq!(read_rows(&ledger_path(s.0.path())).len(), 1);
 
-        // The lab desk: its kill scan consumes the marker, and its census tells the
-        // node log that the run before it was killed.
         assert!(
             crate::logging::consume_dead_markers(s.0.path(), 5000, None, MarkerOwner::Lab)
                 .is_some()
@@ -1020,7 +897,6 @@ mod tests {
     }
 
     /// No marker left and no quit line (an exit path of an older build, an update
-    /// parent's `_exit`): clean, bounded below by the run's last line.
     #[test]
     fn a_run_with_its_own_lines_and_no_marker_ended_clean_bounded_by_its_last_line() {
         let s = Scratch::new("clean-bound");
@@ -1122,13 +998,11 @@ mod tests {
             &NOBODY,
         );
         assert_eq!(row.prev.class, EndClass::Signal(11));
-        // The fixture was written now, so its mtime is now: the uptime is exact.
         assert_eq!(row.prev.uptime.map(|u| u.at_least), Some(false));
         assert_eq!(row.prev.stall, Tri::Unknown, "no log lines: not known");
     }
 
     /// A marker written before the banner lost its ` — crash marker written` tail
-    /// still names its signal.
     #[test]
     fn a_marker_in_the_older_banner_form_still_names_its_signal() {
         let s = Scratch::new("signal-old");
@@ -1183,8 +1057,6 @@ mod tests {
     fn another_runs_artifacts_and_lines_under_a_recycled_pid_are_not_this_runs() {
         let s = Scratch::new("recycled");
         with_previous(&s);
-        // An earlier owner of pid 4242: its marker is named with an older birth, and
-        // its lines predate this run's birth.
         s.file(&format!("{}.seen", marker(4242, BORN - 86_400)), "");
         s.log(&[(BORN - 86_000, 4242, "MAIN-THREAD STALL: an old one")]);
         let row = census_row(
@@ -1235,11 +1107,6 @@ mod tests {
     }
 
     /// THE ROW NAMES ITS PROCESS TO THE MICROSECOND. A launch records the kernel's
-    /// birth microseconds on its row, and the next launch finds the previous run still
-    /// alive only when the live process at that pid has that exact birth: a pid reused
-    /// within the same SECOND is another process, and the run before is classified by
-    /// its evidence instead of as `running`. Negative control: the same birth to the
-    /// microsecond is the run, alive.
     #[test]
     fn a_pid_reused_within_the_same_second_is_not_the_previous_run() {
         struct Exact(u32, Birth);
@@ -1314,9 +1181,6 @@ mod tests {
     }
 
     /// The first row's artifact is never one whose marker names another kind of launch
-    /// (`MarkerOwner::Other`: a test, dev or headless start, or a candidate its parent
-    /// could still reject): those share the log directory, and one's crash is not the
-    /// run before an installed launch.
     #[test]
     fn the_first_row_never_takes_a_marker_owned_by_another_kind_of_launch() {
         let s = Scratch::new("first-other");
@@ -1340,7 +1204,6 @@ mod tests {
             "a dev or test launch's crash is not the run before"
         );
         assert_eq!(row.prev.pid, None);
-        // The daily driver's own marker beside it is still read.
         s.file(&format!("{}.seen", marker(777, BORN)), "");
         let row = census_row(
             s.0.path(),
@@ -1378,14 +1241,10 @@ mod tests {
     }
 
     /// An update applied with no session open exec's the new image in place
-    /// (`ApplyLane::Cold`), keeping the pid and kernel birth: its previous run is the
-    /// image it replaced, handed off, never the run the old image's own row already
-    /// classified (which would count that end twice).
     #[test]
     fn a_cold_lane_update_exec_is_a_handoff_from_the_image_it_replaced() {
         let s = Scratch::new("self");
         with_previous(&s);
-        // The old image's row, written at its own cold start: it classified 4242.
         let old_image = Me {
             build: 1_790_300_000,
             version: "0.93.0".into(),
@@ -1404,8 +1263,6 @@ mod tests {
             (BORN + 5001, 5000, "watchdog armed"),
             (BORN + 9000, 5000, "update apply: cold lane"),
         ]);
-        // Same pid, same birth, the new build: the image the exec put in place. The
-        // process is alive — it is this one — and that is no "running" peer.
         let alive = Fake {
             alive: Some((5000, BORN + 5000)),
             trial: 0,
@@ -1417,7 +1274,6 @@ mod tests {
         assert_eq!(again.prev.version.as_deref(), Some("0.93.0"));
         assert_eq!(again.prev.uptime.map(|u| u.secs), Some(4002));
         assert_eq!(again.prev.stall, Tri::No);
-        // And the ledger then counts one end of 4242, not two.
         append_row(&ledger_path(s.0.path()), &again).expect("append");
         let rows = read_rows(&ledger_path(s.0.path()));
         assert_eq!(

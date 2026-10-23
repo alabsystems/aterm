@@ -278,8 +278,11 @@ impl Mug {
 
     /// The tick, and a wake from sleep: a passed deadline turns the mug off (saved), the
     /// tooltip's time left is brought up to date, and a replaced origin ends the app for
-    /// launchd to start the new build.
-    fn tick(&mut self, now: u64) -> Next {
+    /// launchd to start the new build. Not while the menu is open (`menu_open`): that stop
+    /// waits for the menu to close, and nothing is handled after it, so a deadline passing
+    /// meanwhile would keep the Mac awake until someone closed the menu. The first tick
+    /// after it closes looks.
+    fn tick(&mut self, now: u64, menu_open: bool) -> Next {
         let settled = self.mode.settled(now);
         if settled == self.mode {
             if !self.apply(now) {
@@ -288,7 +291,7 @@ impl Mug {
         } else if let stop @ Next::Stop(_) = self.set(settled, now) {
             return stop;
         }
-        if self.watch.as_mut().is_some_and(Watch::replaced) {
+        if !menu_open && self.watch.as_mut().is_some_and(Watch::replaced) {
             return self.restart_or_retire();
         }
         Next::Tick(next_tick_secs(self.mode, now))
@@ -460,7 +463,8 @@ aterm_objc::declare_class! {
         fn tick(&self, _arg: Id) {
             if MainThread::new().is_some() {
                 let now = now();
-                self.handle(|mug| mug.tick(now));
+                let menu_open = self.ivars().tracking.get();
+                self.handle(|mug| mug.tick(now, menu_open));
             }
         }
 
@@ -470,7 +474,8 @@ aterm_objc::declare_class! {
         fn workspace_did_wake(&self, _note: Id) {
             if MainThread::new().is_some() {
                 let now = now();
-                self.handle(|mug| mug.tick(now));
+                let menu_open = self.ivars().tracking.get();
+                self.handle(|mug| mug.tick(now, menu_open));
             }
         }
 
@@ -693,7 +698,8 @@ fn common_modes() -> Option<Obj> {
 /// perform on the main run loop's common modes, which `NSApplication` makes hold the menu's
 /// tracking mode: a tick runs while the menu is open too, so a deadline is kept then (a tick
 /// is safe there: no borrow is held across the pop-up, and a stop it decides still waits for
-/// the menu to close, [`schedule_stop`]). The perform retains `target` until it fires or is
+/// the menu to close, [`schedule_stop`]; an update restart is not decided then,
+/// [`Mug::tick`]). The perform retains `target` until it fires or is
 /// cancelled; should the modes not be made, it falls back to the default mode alone.
 fn arm_tick(target: Id, secs: u64) {
     autoreleasepool(|_| {
@@ -1166,7 +1172,7 @@ mod tests {
                     .starts_with("caffeine=off\nuntil=-\n")
             );
             mug.awake_begin = |_| panic!("a refused request does not retry without a new choice");
-            assert_eq!(mug.tick(NOW + TICK_SECS), Next::Tick(TICK_SECS));
+            assert_eq!(mug.tick(NOW + TICK_SECS, false), Next::Tick(TICK_SECS));
         }
         // The same refusal path covers a saved request at startup/reload.
         let dir = aterm_tempfile::tempdir().expect("tempdir");
@@ -1214,10 +1220,10 @@ mod tests {
         assert_eq!(saved(&mug), Some(hour));
         assert!(mug.awake.is_some());
         // A tick before the deadline changes nothing and lands just after it.
-        assert_eq!(mug.tick(NOW + HOUR - 30), Next::Tick(31));
+        assert_eq!(mug.tick(NOW + HOUR - 30, false), Next::Tick(31));
         assert_eq!(mug.mode, hour);
         // The tick past it: off, saved, the activity ended.
-        assert_eq!(mug.tick(NOW + HOUR + 1), Next::Tick(TICK_SECS));
+        assert_eq!(mug.tick(NOW + HOUR + 1, false), Next::Tick(TICK_SECS));
         assert_eq!(mug.mode, Mode::Off);
         assert_eq!(saved(&mug), Some(Mode::Off));
         assert!(mug.awake.is_none());
@@ -1251,7 +1257,7 @@ mod tests {
             mug.handled(|m| m.choose(MenuAction::Activate(Choice::Hours8), NOW + 1)),
             None
         );
-        assert_eq!(mug.handled(|m| m.tick(NOW + 2)), None);
+        assert_eq!(mug.handled(|m| m.tick(NOW + 2, false)), None);
         assert_eq!(mug.handled(|m| m.reload(NOW + 3)), None);
         assert_eq!(mug.mode, Mode::Off);
         assert!(mug.awake.is_none());
@@ -1263,12 +1269,12 @@ mod tests {
         mug.watch = Some(Watch::start(mug.origin.clone(), &mug.origin));
         std::fs::write(&mug.origin, b"build two").expect("exe");
         assert_eq!(
-            mug.handled(|m| m.tick(NOW)),
+            mug.handled(|m| m.tick(NOW, false)),
             Some(Next::Stop(Exit::Restart))
         );
         assert_eq!(mug.exit, Some(Exit::Restart));
         assert_eq!(mug.handled(|m| m.choose(MenuAction::Quit, NOW)), None);
-        assert_eq!(mug.handled(|m| m.tick(NOW + 1)), None);
+        assert_eq!(mug.handled(|m| m.tick(NOW + 1, false)), None);
         assert_eq!(mug.exit, Some(Exit::Restart));
         // But what the person does while that restart waits for the menu to close counts: a
         // choice is saved for the restarted mug to read, and a Quit ends the job instead.
@@ -1350,15 +1356,50 @@ mod tests {
         assert!(!checked(&mug), "the control");
     }
 
+    /// An update found while the menu is open waits for it to close; the ticks, and so the
+    /// deadline, do not.
+    #[test]
+    fn an_update_waits_for_the_menu_and_the_deadline_does_not() {
+        let dir = aterm_tempfile::tempdir().expect("tempdir");
+        let mut mug = scratch_mug(dir.path());
+        std::fs::write(&mug.origin, b"build 1").expect("exe");
+        mug.watch = Some(Watch::start(mug.origin.clone(), &mug.origin));
+        let hour = Mode::chosen(Choice::Hours1, NOW);
+        assert_eq!(
+            mug.handled(|m| m.set(hour, NOW)),
+            Some(Next::Tick(TICK_SECS))
+        );
+        assert!(mug.awake.is_some());
+        std::fs::write(&mug.origin, b"build two").expect("exe");
+        // The menu is open: no end is decided, so the tick that passes the deadline still
+        // comes and lets the Mac sleep.
+        assert_eq!(
+            mug.handled(|m| m.tick(NOW + 60, true)),
+            Some(Next::Tick(TICK_SECS))
+        );
+        assert_eq!(mug.exit, None);
+        assert_eq!(
+            mug.handled(|m| m.tick(NOW + HOUR, true)),
+            Some(Next::Tick(TICK_SECS))
+        );
+        assert!(mug.awake.is_none());
+        assert_eq!(mug.mode, Mode::Off);
+        // Closed: the next tick restarts onto the update.
+        assert_eq!(
+            mug.handled(|m| m.tick(NOW + HOUR + 60, false)),
+            Some(Next::Stop(Exit::Restart))
+        );
+    }
+
     #[test]
     fn a_replaced_origin_ends_the_app_for_a_restart() {
         let dir = aterm_tempfile::tempdir().expect("tempdir");
         let mut mug = scratch_mug(dir.path());
         std::fs::write(&mug.origin, b"build 1").expect("exe");
         mug.watch = Some(Watch::start(mug.origin.clone(), &mug.origin));
-        assert_eq!(mug.tick(NOW), Next::Tick(TICK_SECS));
+        assert_eq!(mug.tick(NOW, false), Next::Tick(TICK_SECS));
         std::fs::write(&mug.origin, b"build two").expect("exe");
-        assert_eq!(mug.tick(NOW + 60), Next::Stop(Exit::Restart));
+        assert_eq!(mug.tick(NOW + 60, false), Next::Stop(Exit::Restart));
         // Not knowing whether the new build serves restarts too.
         mug.origin_serves = |_| None;
         assert_eq!(mug.restart_or_retire(), Next::Stop(Exit::Restart));
@@ -1459,9 +1500,9 @@ mod tests {
         assert!(launchd::startup_enabled(&mug.paths, &mug.label));
         mug.watch = Some(Watch::start(mug.origin.clone(), &mug.origin));
         mug.origin_serves = |_| Some(false);
-        assert_eq!(mug.tick(NOW), Next::Tick(TICK_SECS));
+        assert_eq!(mug.tick(NOW, false), Next::Tick(TICK_SECS));
         std::fs::write(&mug.origin, b"an older build").expect("exe");
-        assert_eq!(mug.tick(NOW + 60), Next::Stop(Exit::Quit));
+        assert_eq!(mug.tick(NOW + 60, false), Next::Stop(Exit::Quit));
         assert!(!launchd::startup_enabled(&mug.paths, &mug.label));
     }
 

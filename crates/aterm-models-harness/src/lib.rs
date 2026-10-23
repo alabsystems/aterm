@@ -24,6 +24,7 @@ mod models_harness_host;
 mod models_harness_policy_writer;
 mod models_harness_progress;
 mod models_harness_state_collection;
+mod models_occupancy;
 mod models_program_queue;
 mod models_program_resolution;
 mod models_relaunch_prompt;
@@ -50,6 +51,7 @@ pub use models_harness_progress::*;
 pub use models_harness_state_collection::{
     harness_upgrade_state_collection_liveness, harness_upgrade_state_collection_model,
 };
+pub use models_occupancy::{occupancy_door_liveness, occupancy_door_model};
 pub use models_program_queue::{
     claude_footer_model_model, claude_footer_watch_model, program_resolver_queue_model,
 };

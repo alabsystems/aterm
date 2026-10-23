@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `aterm secrets`: the verb (docs/DESIGN-secrets-2026-10-20.md). Arguments are parsed
-//! before any probe, prompt or network call; nothing printed is ever a value except what
-//! `get` was asked for.
+//! `aterm secrets`.
 
 use std::ffi::OsString;
 use std::process::ExitCode;
@@ -186,7 +184,6 @@ struct Fill {
     /// `--no-with`: drop the anchor a re-set would otherwise keep.
     no_with: bool,
     /// `--fleet-reads-anchors`: every machine and admin runs an aterm that reads anchors, so
-    /// the vault's first anchored entry may be published.
     fleet_reads_anchors: bool,
 }
 
@@ -256,7 +253,6 @@ const SERVE_SWITCHES: &[&str] = &["--no-keep-awake", "--no-advertise"];
 const MAX_HOLD_SECS: u64 = 60;
 
 /// What `serve` was asked for, checked when the command line is parsed, so `server on`
-/// installs only a command line `serve` accepts.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ServeSettings {
     listen: std::net::SocketAddr,
@@ -308,11 +304,6 @@ fn serve_settings(f: &Flags) -> Result<ServeSettings, String> {
             "--advertise {name}: a host label of lowercase letters, digits and -"
         ));
     }
-    // On macOS the default vault's name, so a server set up with no flags answers the URL
-    // every new Mac joins, but only where it can: on every address at the default URL's port.
-    // A server hand-run on loopback or another port (a check, a test) claims no name. Two
-    // Macs advertising one name contend for it: one serving another vault names its own, or
-    // none.
     let answers_default_url = listen.ip().is_unspecified() && listen.port() == crate::DEFAULT_PORT;
     let advertise = match (advertise, f.has("--no-advertise")) {
         (Some(_), true) => return Err("--advertise and --no-advertise are both given".into()),
@@ -519,8 +510,6 @@ fn parse(words: &[String]) -> Result<Command, String> {
                 }
                 _ => {}
             }
-            // Never admitted under a generic name in its place: the machine was told this one.
-            // Nor one shaped like a join code, which names the machine whose key has it.
             if let Some(name) = &name
                 && (!crate::text::valid_machine_name(name) || crate::transport::valid_code(name))
             {
@@ -635,7 +624,6 @@ mod unix {
     const OPEN_VAULT: &str = "this vault is open: every machine that reaches its server and asks to join is let in within seconds, with no password and no code, and reads [everyone]'s entries, except a machine you let go (aterm secrets password set closes it)";
 
     /// What a vault at a path says where one served at a URL says whom its `[join]` lets in: a
-    /// path has no join queue, so nothing lets a machine in by itself there.
     const PATH_JOINS: &str = "a vault at a path has no join queue: a machine joins it only when an admin approves its key: aterm secrets approve <age1…> --name <host>";
 
     /// What a publish that let a machine go from an open vault says.
@@ -727,7 +715,6 @@ mod unix {
                     if !doc.remove_admin(&host).map_err(text_error)? {
                         return Err(Error::new(format!("{host} is not an admin")));
                     }
-                    // Every admin holds the vault key: the one removed must not keep signing.
                     let done = client::admin_rotate(&paths, &admin, &doc)?;
                     let code = published(&format!("removed {host} from the admins"), &done);
                     if let Some(held) = held {
@@ -773,8 +760,7 @@ mod unix {
         Error::new(error.to_string())
     }
 
-    /// The machines `words` name in `doc`, each by [`client::machine_named`]: a join code
-    /// reaches the machine whose key has it, never one named like it; a name passes as typed.
+    /// The machines `words` name in `doc`, each by [`client::machine_named`].
     pub(super) fn machines_named(
         doc: &text::Document,
         words: &[String],
@@ -798,9 +784,6 @@ mod unix {
     }
 
     /// Say what a publish did: the version, a key rotation (for the ALab vault, what the next
-    /// release must carry; for any vault, that its second key change leaves out the builds
-    /// before handoff chains), and this machine's own sync failing (the publish stands either
-    /// way). Exits 0: the change is out.
     fn published(what: &str, done: &Published) -> ExitCode {
         let rotated = if done.rotated {
             ", signed by a new vault key the old one endorsed"
@@ -840,11 +823,7 @@ mod unix {
         ExitCode::SUCCESS
     }
 
-    /// The change a rotation of the ALab vault asks of aterm's next release, exactly as the
-    /// two lines of crates/aterm-secrets/src/lib.rs read after it. The handoff chain lets a
-    /// build that pins the old key follow the vault, but every admin held that key, so until
-    /// a build pins the new one and retires the old, a new Mac also trusts what the admin
-    /// removed signs with its copy.
+    /// The change a rotation of the ALab vault asks of aterm's next release, exactly as the two lines of crates/aterm-secrets/src/lib.rs read after it.
     pub(super) fn release_note(release: &client::AlabRelease) -> String {
         let retired: Vec<String> = release
             .retired
@@ -859,8 +838,6 @@ mod unix {
     }
 
     /// What a vault's first version with two handoff pairs costs: an aterm built before
-    /// chains parses at most one pair, so it fails every sync of this vault (`expected
-    /// locker: or signature:`) and, serving it, refuses the version (400), until it updates.
     const LONG_CHAIN_NOTE: &str = "this version carries a second key handoff: an aterm built before handoff chains reads at most one, so every Mac running one fails each sync of this vault, and a server running one refuses it, until it is updated\n";
 
     fn yes(answer: Option<String>) -> bool {
@@ -905,8 +882,6 @@ mod unix {
     }
 
     /// The terminal while a password is typed: no echo, no line editing, and no signals, so
-    /// Ctrl-C arrives as a byte and the settings are put back before the process ends. The
-    /// settings `stty -g` saved are restored on drop.
     struct Quiet {
         tty: std::fs::File,
         saved: String,
@@ -937,8 +912,6 @@ mod unix {
     const HIDDEN_MAX: usize = 1024;
 
     /// One line typed at the terminal without echo. `None` with no terminal; Ctrl-C ends
-    /// the process (exit 130) once the terminal is put back; Ctrl-D on an empty line and
-    /// an empty line answer an empty value.
     fn ask_hidden(prompt: &str) -> Option<SecretBytes> {
         let mut tty = std::fs::OpenOptions::new()
             .read(true)
@@ -981,7 +954,6 @@ mod unix {
     }
 
     /// A password piped in for `--password-stdin` or `password set`: one line, blanks
-    /// around it dropped.
     fn piped_password(what: &str) -> crate::Result<SecretBytes> {
         if std::io::stdin().is_terminal() {
             return Err(Error::new(format!("{what} reads the password from a pipe")));
@@ -1020,15 +992,7 @@ mod unix {
         }
     }
 
-    /// How a Mac waiting to join the vault at `source` fixes a mistyped join password: the
-    /// join again, which asks for the password again and queues a request with the new proof.
-    /// Without it a Mac whose proof matched nothing just waits, told only what an admin runs.
-    /// `None` for a vault at a path, which has no join queue and so no password. The command
-    /// names what a bare join would not ask for: a vault other than the ALab default, and the
-    /// machine name `name` (`--name`), since the join again would otherwise ask for the ALab
-    /// vault, or ask under this Mac's default name. A password that came `piped` is piped
-    /// again: a join without a terminal that is not given it asks by code alone, a request
-    /// that replaces the one with the proof.
+    /// How a Mac waiting to join the vault at `source` fixes a mistyped join password.
     pub(super) fn retype(source: &Source, name: Option<&str>, piped: bool) -> Option<String> {
         let Source::Url(url) = source else {
             return None;
@@ -1058,8 +1022,7 @@ mod unix {
         })
     }
 
-    /// `join`'s last line for a Mac left waiting for an admin to approve `code`, with how a
-    /// mistyped join password is fixed ([`retype`]) when one went with the request.
+    /// `join`'s status line for a Mac awaiting approval of `code` (including [`retype`] hint when applicable).
     pub(super) fn waiting_line(host: &str, code: &str, retype: Option<&str>) -> String {
         let line = format!(
             "waiting for approval of {host} (code {code}): on an admin Mac run aterm secrets approve {code}"
@@ -1070,8 +1033,7 @@ mod unix {
         }
     }
 
-    /// `status`'s membership line for a Mac waiting for an admin to approve `code`, with
-    /// [`retype`] for a vault with a join queue.
+    /// `status`'s membership line for a Mac waiting for an admin to approve `code`, with [`retype`] for a vault with a join queue.
     pub(super) fn pending_membership(code: &str, retype: Option<&str>) -> String {
         let line = format!(
             "membership: waiting for approval (on an admin Mac: aterm secrets approve {code})"
@@ -1095,13 +1057,11 @@ mod unix {
         }
     }
 
-    /// This Mac's subscriber, where an admin's approver runs (§9): read and installed through
-    /// here, so a test plays it with an inert arm and never installs a launchd job or a
-    /// systemd unit.
+    /// This Mac's subscriber, where an admin's approver runs (§9).
     pub(super) struct Subscriber<'a> {
         /// Its state now ([`service::state`]).
         pub(super) state: &'a dyn Fn() -> crate::Result<service::State>,
-        /// Install and start it ([`install_subscriber`]): the line saying what was done.
+        /// Install and start it ([`install_subscriber`]).
         pub(super) install: &'a dyn Fn() -> crate::Result<String>,
     }
 
@@ -1110,13 +1070,13 @@ mod unix {
     pub(super) enum Approver {
         /// The subscriber was running already, so it was left be.
         Running,
-        /// The subscriber was installed now: the line saying so.
+        /// The subscriber was installed now.
         Installed(String),
-        /// `--no-agent`: nothing was installed.
+        /// `--no-agent`.
         Skipped,
-        /// The install failed: why.
+        /// The install failed.
         Failed(String),
-        /// The subscriber's state could not be read: why. Nothing was installed.
+        /// The subscriber's state could not be read.
         Unknown(String),
     }
 
@@ -1127,10 +1087,7 @@ mod unix {
         }
     }
 
-    /// Put this Mac's approver in: install the subscriber unless it runs already. One that is
-    /// installed with no process (a plist launchd never loaded, or a job that keeps ending)
-    /// runs no approver, so it is installed again, as `aterm init`'s row judges it. A state
-    /// that cannot be read installs nothing, since an install asks the same service manager.
+    /// Put this Mac's approver in.
     pub(super) fn put_in_approver(subscriber: &Subscriber<'_>) -> Approver {
         match (subscriber.state)() {
             Ok(service::State::Installed { pid: Some(_), .. }) => Approver::Running,
@@ -1142,10 +1099,7 @@ mod unix {
         }
     }
 
-    /// This Mac's approver for a command that needs one: put in where it does not run
-    /// ([`put_in_approver`]), or with `--no-agent` (`agent` false) only read, so a subscriber
-    /// already running (installed by an earlier join or command) is said to run, and nothing
-    /// is installed.
+    /// This Mac's approver for a command that needs one.
     pub(super) fn approver_here(agent: bool, subscriber: &Subscriber<'_>) -> Approver {
         if agent {
             put_in_approver(subscriber)
@@ -1159,10 +1113,7 @@ mod unix {
         }
     }
 
-    /// What `password` says of whom a vault whose `[join]` is `doc`'s lets in by itself: for
-    /// one with a join queue (`queued`, a URL's), that an open one lets in every machine that
-    /// asks (a password is the approver's line to say); for one at a path, which has none,
-    /// that a machine joins it only by an admin's approval of its key, whatever `[join]` says.
+    /// What `password` says of whom a vault whose `[join]` is `doc`'s lets in by itself.
     pub(super) fn lets_in_words(queued: bool, doc: &text::Document) -> Option<&'static str> {
         if !queued {
             return Approval::of(doc).map(|_| PATH_JOINS);
@@ -1186,9 +1137,7 @@ mod unix {
         )
     }
 
-    /// What a command that needs this Mac's approver says of it, for a vault that approves
-    /// by `approval`: the install line, nothing for one that ran already, else that none runs
-    /// here and that `aterm secrets agent on` starts one.
+    /// What a command that needs this Mac's approver says of it, for a vault that approves by `approval`.
     pub(super) fn approver_words(approver: &Approver, approval: Approval) -> Option<String> {
         let none = |why: &str| {
             format!(
@@ -1211,8 +1160,7 @@ mod unix {
         }
     }
 
-    /// `status`'s line for an admin of a vault that approves by `approval`: whether the
-    /// approver runs, by its subscriber's state (`subscriber`).
+    /// `status`'s line for an admin of a vault that approves by `approval`.
     pub(super) fn approver_line(
         approval: Approval,
         subscriber: &crate::Result<service::State>,
@@ -1237,11 +1185,7 @@ mod unix {
         }
     }
 
-    /// `status`'s line for this machine, `key` its `age1…` key and `code` its join code. A
-    /// plain text file is read under the name `source.toml` holds. A signed vault calls a
-    /// machine what its admission did, which is not the name it asked for when that was taken
-    /// (it got a free one, which never reaches the machine): that name is said as asked, and
-    /// the machine is named by its code, which `admins add` takes.
+    /// `status`'s line for this machine, `key` its `age1…` key and `code` its join code.
     pub(super) fn machine_line(config: Option<&client::Config>, key: &str, code: &str) -> String {
         let line = format!("machine: code {code}, key {key}");
         match config {
@@ -1287,8 +1231,6 @@ mod unix {
                     .machine
                     .as_ref()
                     .map_or("?", |(_, code)| code.as_str());
-                // How a mistyped join password is fixed, only when one went with the request.
-                // (A path has no join queue, so its default machine name is never looked up.)
                 let hint = status
                     .config
                     .as_ref()
@@ -1317,8 +1259,6 @@ mod unix {
         if status.config.is_some() {
             let state = (subscriber.state)();
             println!("subscriber: {}", service_words(&state));
-            // An admin of a vault that lets machines in by itself: they are let in only while
-            // an approver runs (on this Mac, or another admin's).
             if let Ok(Some(approval)) = client::approving_here(paths) {
                 println!("{}", approver_line(approval, &state));
             }
@@ -1354,7 +1294,6 @@ mod unix {
         password_stdin: bool,
     ) -> crate::Result<ExitCode> {
         let interactive = interactive();
-        // Read before any network call, so a pipe that holds nothing fails at once.
         let piped = if password_stdin {
             Some(piped_password("--password-stdin")?)
         } else {
@@ -1365,7 +1304,6 @@ mod unix {
                 "The vault is signed by {fingerprint}. Compare it with `aterm secrets status` on an admin Mac. Trust it? [y/N] "
             )))
         };
-        // Whether a join password went with the request: only then can it have been mistyped.
         let given = Cell::new(false);
         let from_pipe = piped.is_some();
         let password = || -> Option<SecretBytes> {
@@ -1380,8 +1318,6 @@ mod unix {
             given.set(password.is_some());
             password
         };
-        // The subscriber goes in as soon as the request is queued, so a Ctrl-C during the
-        // wait still leaves a machine that joins by itself once approved.
         let installed = Cell::new(false);
         let install_failed = Cell::new(false);
         let install = || {
@@ -1418,8 +1354,6 @@ mod unix {
             },
         )
         .inspect_err(|_| {
-            // Cut off after it saved the source (the server gone before the request was
-            // queued), the join leaves this Mac waiting with its request due at once: the
             // subscriber that makes it goes in now, as once a request is queued.
             if client::config(paths)
                 .ok()
@@ -1434,8 +1368,6 @@ mod unix {
                 println!("joined: seq {seq}, {} secrets in ~/.secrets", names.len());
             }
             JoinOutcome::Pending { code, host } => {
-                // The source the join saved, not what was typed: a URL without its `#<signer>`
-                // (this Mac holds that pin now), and the ALab default when nothing was typed.
                 let hint = if given.get() {
                     client::config(paths)
                         .ok()
@@ -1524,12 +1456,7 @@ mod unix {
         Ok(ExitCode::SUCCESS)
     }
 
-    /// `create`, then this Mac's subscriber put in as `join` puts it in (unless `agent` is
-    /// false, `--no-agent`): a new vault has a join password, and only an admin's subscriber
-    /// approves a machine that types it. A failed install is a warning, not a failure: the
-    /// vault is out, and `aterm secrets agent on` starts the approver later. So is a failure
-    /// of this Mac's own sync after the publish, said after the approver step, which still
-    /// runs: the subscriber it puts in syncs the vault.
+    /// `create`, then this Mac's subscriber put in as `join` puts it in (unless `agent` is false, `--no-agent`).
     pub(super) fn create(
         paths: &Paths,
         source: &str,
@@ -1549,8 +1476,6 @@ mod unix {
             "machines that join it must pin this key: add #{} to the URL, or confirm the fingerprint",
             created.signer
         );
-        // A vault at a path has no join queue: a machine joins it by key (`approve <age1…>
-        // --name`), so no approver has anything to do there.
         let mut syncs = false;
         if !matches!(
             client::config(paths)?.map(|config| config.source),
@@ -1596,9 +1521,7 @@ mod unix {
         }
     }
 
-    /// The store a `--store` names: a relative one is under the home directory, where a
-    /// systemd unit runs (a launchd job runs from `/`, a hand-run serve from anywhere), so
-    /// one line means one store however it is run.
+    /// The store a `--store` names.
     pub(super) fn store_dir(paths: &Paths, text: &str) -> PathBuf {
         let dir = expand(paths, text);
         if dir.is_absolute() {
@@ -1643,7 +1566,6 @@ mod unix {
                 "edit needs a terminal; use set/unset to change one entry",
             ));
         }
-        // Found first, so an editor that is not there leaves no draft behind.
         let editor = editor()?;
         edit_with(
             paths,
@@ -1658,16 +1580,13 @@ mod unix {
         )
     }
 
-    /// [`edit`] past its terminal check: `run` opens the draft in the editor (false when the
-    /// editor fails), and `ask` asks the person.
+    /// [`edit`] past its terminal check.
     pub(super) fn edit_with(
         paths: &Paths,
         run: &mut dyn FnMut(&Path) -> crate::Result<bool>,
         ask: &dyn Fn(&str) -> Option<String>,
     ) -> crate::Result<ExitCode> {
         let mut admin = client::admin_open(paths)?;
-        // The version the text began as: what another admin, or the approver, changed after
-        // it is brought into what the person saves ([`client::keep_admitted`]).
         let base = admin.doc.clone();
         let scratch = client::Scratch::new(paths)?;
         let file = scratch
@@ -1679,14 +1598,10 @@ mod unix {
             "draft: {} (kept unless edit ends with it published or unchanged, so an interrupted edit leaves it)",
             file.display()
         );
-        // The draft as the editor reopened it on a version that moved: quitting on it unchanged
-        // is no answer to the warning, so it publishes only when the person says so.
         let mut reopened: Option<SecretBytes> = None;
         loop {
             let ran = run(&file);
             if !matches!(ran, Ok(true)) {
-                // A draft that still holds the published text holds no work, so it goes;
-                // one that changed is kept.
                 let kept = scratch.discard(&file, original.as_slice()).is_err();
                 let why = match ran {
                     Err(error) => error.to_string(),
@@ -1745,10 +1660,6 @@ mod unix {
                 }
                 Err(error) => {
                     eprintln!("not published: {error}");
-                    // Another admin, or the approver, may have published meanwhile (the server
-                    // refuses a version that is not newer, and so does a path): the next try
-                    // goes on top of the newest version, and the person is told their text
-                    // replaces it, all but who that version let in or out and its [join] line.
                     match client::admin_open(paths) {
                         Ok(fresh) if fresh.seq() != admin.seq() => {
                             eprintln!(
@@ -1772,15 +1683,9 @@ mod unix {
     }
 
     /// Why the vault's first anchored entry waits for the fleet: no machine tells the vault
-    /// which aterm it runs, so the admin says it.
     const FIRST_ANCHOR: &str = "this is the vault's first anchored entry (if-absent=<anchor>), and an aterm older than anchors refuses every version that holds one: a machine on it applies nothing until it updates, and an admin on it cannot open the vault. Update every machine and admin first (there `aterm secrets --help` names --with)";
 
-    /// `doc` with entry `name` set for `audience` as `set` sets it, and the anchor the entry
-    /// got. Leaving a flag out never changes how an entry fills: an ` if-absent` entry set
-    /// again without `fill.if_absent` is refused (unsetting it first makes it a plain one),
-    /// and one set again with it but neither `--with` nor `--no-with` keeps the anchor it
-    /// has. The vault's first anchored entry is refused without `--fleet-reads-anchors`
-    /// ([`FIRST_ANCHOR`]).
+    /// `doc` with entry `name` set for `audience` as `set` sets it, and the anchor the entry got.
     pub(super) fn set_in(
         doc: &text::Document,
         audience: &Audience,
@@ -1816,10 +1721,7 @@ mod unix {
         Ok((next, anchor))
     }
 
-    /// A value piped in as one line of text (`echo token | …`) loses its line end: the LF and
-    /// a CR before it, when what is left is one line `name=value` spells (UTF-8 without CR, LF
-    /// or NUL). Anything else, a binary value above all, is kept byte for byte, as `--file`
-    /// keeps it.
+    /// A value piped in as one line of text (`echo token | …`) loses its line end.
     pub(super) fn trim_piped_line(bytes: &mut Vec<u8>) {
         let Some(body) = bytes.strip_suffix(b"\n") else {
             return;
@@ -1894,13 +1796,7 @@ mod unix {
         ))
     }
 
-    /// `password`. What leaves a vault with a join queue (a URL's) letting machines in by
-    /// itself (`open`, `set`, `new`) also puts this Mac's approver in where none runs
-    /// ([`put_in_approver`]), so the promise it prints holds: only an admin's subscriber lets
-    /// a machine in without a person. `--no-agent` (`agent` false) installs nothing, for an
-    /// admin whose subscriber was turned off on purpose, and says so where none runs. A vault
-    /// at a path has no queue: nothing is put in, and what it prints says a machine joins it
-    /// by key ([`lets_in_words`]).
+    /// Ensure [`put_in_approver`] is installed when configuring a vault with a join queue.
     pub(super) fn password(
         paths: &Paths,
         action: Password,
@@ -1949,9 +1845,6 @@ mod unix {
                     approver(&admin.doc);
                     return Ok(ExitCode::SUCCESS);
                 }
-                // Those already waiting are a person's to judge: one may be a machine let go
-                // while the vault was closed, its approved request still queued. Not let in
-                // here, each joins only by code (the publish names them).
                 let waiting = client::requests(paths, Some(&doc))?;
                 if interactive() {
                     admit_on_opening(
@@ -2035,12 +1928,7 @@ mod unix {
         }
     }
 
-    /// What `password open` at a terminal does with the requests `waiting` as it opens the
-    /// vault: names each machine once on `say`, and on one yes from `agree` lets in every one
-    /// but a key a `code-only` line names, or one asking under more than one name. The first
-    /// is a machine let go (or one held when the vault last opened): it is named, marked, and
-    /// joins only by its code. The second may be a stranger that read the key off the listing
-    /// and queued it under a name of its choosing: it joins only as the person names it.
+    /// What `password open` at a terminal does with the requests `waiting` as it opens the vault.
     pub(super) fn admit_on_opening(
         doc: &mut text::Document,
         waiting: Vec<client::Request>,
@@ -2050,7 +1938,6 @@ mod unix {
         let code_only = doc.code_only();
         let (mut offered, mut held, mut named) = (Vec::new(), Vec::new(), Vec::new());
         for request in &waiting {
-            // One host asked from two addresses is one machine.
             let listed = |list: &[&client::Request]| {
                 list.iter()
                     .any(|r| r.recipient == request.recipient && r.host == request.host)
@@ -2162,7 +2049,6 @@ mod unix {
             println!("no machines are asking to join");
             return Ok(ExitCode::SUCCESS);
         }
-        // Before any prompt: a code no machine asks with, or a key listed under two names.
         let mut chosen = from_queue(&pending, which, all)?;
         if all {
             if !interactive() {
@@ -2191,8 +2077,6 @@ mod unix {
                 return Ok(ExitCode::FAILURE);
             }
         }
-        // A key named here is not in the queue's pairs: `--name` goes with one key alone, and
-        // `add_machine` refuses a key twice rather than pick one of its names.
         for word in which.iter().filter(|word| word.starts_with("age1")) {
             crate::age::Recipient::parse(word)
                 .map_err(|_| Error::new(format!("{word} is not a valid age key")))?;
@@ -2221,11 +2105,7 @@ mod unix {
         ))
     }
 
-    /// What `host` could read in `doc`, said where it is let go (`revoke`, `admins remove`),
-    /// so a person rotates all of it: as an admin, every entry, since the admin locker holds
-    /// the whole text; else every entry of `[everyone]` and of each section naming it, an
-    /// `[everyone]` value its own section overrides too, since it opened both lockers. A host
-    /// section's entry is named with its header. `None` when it could read none.
+    /// What `host` could read in `doc`, said where it is let go (`revoke`, `admins remove`), so a person rotates all of it.
     pub(super) fn exposure(doc: &text::Document, host: &str) -> Option<String> {
         let admin = doc.admins().iter().any(|name| name == host);
         let held: Vec<String> = doc
@@ -2252,11 +2132,7 @@ mod unix {
         })
     }
 
-    /// The `(key, host)` pairs `approve` takes from the queue, one per key: the request each
-    /// code in `which` names (an `age1…` word is not a code), or with `all` every request. A
-    /// key listed under more than one host is refused: anyone on the LAN can read a key from
-    /// the listing and queue it beside its machine's own line under a name of its choosing,
-    /// so which name is the machine's is the person's call (`approve <age1…> --name`).
+    /// The `(key, host)` pairs `approve` takes from the queue, one per key.
     pub(super) fn from_queue(
         pending: &[client::Request],
         which: &[String],
@@ -2528,7 +2404,6 @@ mod tests {
     const PROFILE: &str = "~/.aterm/release-credentials.toml";
 
     /// A vault of one machine holding the release key and profile as if-absent entries, with
-    /// no anchor yet, as the live one does.
     #[cfg(unix)]
     fn unanchored_vault() -> crate::text::Document {
         let recipient = crate::age::Identity::generate()
@@ -2562,7 +2437,6 @@ mod tests {
             at: None,
             proof: None,
         };
-        // Only the machine let go is asking: it is named and marked, and nothing is asked.
         let mut said = Vec::new();
         unix::admit_on_opening(
             &mut doc,
@@ -2576,7 +2450,6 @@ mod tests {
                 .any(|line| line.contains("laptop") && line.contains("code only")),
             "{said:?}"
         );
-        // Beside one that may be let in, one yes lets in that one only.
         unix::admit_on_opening(
             &mut doc,
             vec![request(&gone, "laptop"), request(&asking, "m7")],
@@ -2591,8 +2464,6 @@ mod tests {
         );
         assert_eq!(doc.code_only(), [gone]);
 
-        // The queue lists a key once per address. One machine that asked from two is offered
-        // and let in once; a key listed under two names is left to the person, who names it.
         let (moved, doubled) = (key(), key());
         let mut asked = Vec::new();
         unix::admit_on_opening(
@@ -2649,7 +2520,6 @@ mod tests {
         .expect("anchored");
         assert_eq!(anchor.as_deref(), Some(KEY));
 
-        // Rotated with --if-absent alone, the profile keeps its anchor.
         let (doc, anchor) =
             unix::set_in(&doc, &everyone, PROFILE, b"w\n", &gaps(None, false)).expect("rotated");
         assert_eq!(anchor.as_deref(), Some(KEY));
@@ -2659,7 +2529,6 @@ mod tests {
             b"w\n"
         );
 
-        // Without --if-absent, an if-absent entry (anchored or not) is refused by name.
         let error =
             unix::set_in(&doc, &everyone, PROFILE, b"x\n", &Fill::default()).expect_err("refused");
         assert!(error.0.contains(&format!("if-absent={KEY}")), "{error}");
@@ -2667,7 +2536,6 @@ mod tests {
             unix::set_in(&doc, &everyone, KEY, b"x\n", &Fill::default()).expect_err("refused");
         assert!(error.0.contains("--if-absent"), "{error}");
 
-        // --no-with drops the anchor; an entry new to its audience has none to keep.
         let (dropped, anchor) =
             unix::set_in(&doc, &everyone, PROFILE, b"w\n", &gaps(None, true)).expect("dropped");
         assert_eq!(anchor, None);
@@ -2701,7 +2569,6 @@ mod tests {
         let (doc, _) = unix::set_in(&doc, &everyone, PROFILE, b"v\n", &with_key(true))
             .expect("the fleet reads anchors");
         assert!(doc.anchored());
-        // Once the vault holds one, an older aterm already refuses it: no need to say so again.
         let toml = Fill {
             if_absent: true,
             with: Some(KEY.to_string()),
@@ -2713,9 +2580,6 @@ mod tests {
     }
 
     /// Anyone on the LAN can read a waiting machine's key from the listing and queue it from
-    /// its own address under a name of its choosing, beside the machine's line. Such a key is
-    /// approved neither by its code nor by `--all`, whichever line sorts or was queued first:
-    /// the person names the machine. One name asked from two addresses is one machine.
     #[cfg(unix)]
     #[test]
     fn approve_takes_no_key_listed_under_two_names() {
@@ -2867,7 +2731,6 @@ mod tests {
     }
 
     /// A relative `--store` is under the home directory whether launchd (from `/`), systemd
-    /// (from the home directory) or a person in another directory runs the server.
     #[cfg(unix)]
     #[test]
     fn a_relative_store_is_under_the_home_directory() {
@@ -2882,8 +2745,6 @@ mod tests {
     }
 
     /// A server set up with no flags answers the default vault's URL: on macOS it advertises
-    /// that name unless told another, or none, and only on every address at the URL's port,
-    /// so a server hand-run on loopback or another port takes no Mac's name.
     #[test]
     fn serve_advertises_the_default_vaults_name_unless_told() {
         let advertised = |line: &str| {
@@ -2975,7 +2836,6 @@ mod tests {
     }
 
     /// `join`'s last line and `status`'s membership line for a waiting Mac say how a
-    /// mistyped join password is fixed, beside what an admin runs.
     #[cfg(unix)]
     #[test]
     fn a_waiting_machine_is_told_how_a_mistyped_join_password_is_fixed() {
@@ -2998,8 +2858,6 @@ mod tests {
             assert!(line.contains(&hint), "{line}");
         }
         assert!(!unix::waiting_line("m9", code, None).contains("mistyped"));
-        // A bare join asks for the ALab vault under this Mac's default name. Another
-        // vault needs its full configured URL; the hint never substitutes a redacted URL.
         let other = unix::retype(&Source::Url("http://h:1/v1/x".into()), Some("m9"), false)
             .expect("a URL has a join queue");
         assert!(
@@ -3017,14 +2875,11 @@ mod tests {
                 "{hint}"
             );
         }
-        // A password that came piped is piped again: without a terminal, a join not given it
-        // asks by code alone.
         let piped = unix::retype(&alab, None, true).expect("a URL has a join queue");
         assert!(
             piped.contains("piping it again to aterm secrets join --password-stdin"),
             "{piped}"
         );
-        // A vault at a path has no join queue, so no password to mistype.
         assert_eq!(
             unix::retype(&Source::Path("/v/x.vault".into()), None, false),
             None
@@ -3073,7 +2928,6 @@ mod tests {
         .expect_err("the editor did not start");
         assert!(error.0.contains("synthetic-editor"), "{error}");
         assert_eq!(edit_dirs(&admin), Vec::<std::path::PathBuf>::new());
-        // A draft the failed editor changed may be the only copy of new work: it stays.
         let error = unix::edit_with(
             &admin,
             &mut |file: &std::path::Path| {
@@ -3092,9 +2946,6 @@ mod tests {
     }
 
     /// An edit on a new vault at a path under `root`: the person adds `note` while another
-    /// admin lets `mb` in and sets `other`, so the save is refused; reopened, the person quits
-    /// without saving and answers `publish` when asked to publish the draft as it is. The
-    /// admin, the seq the edit began on, the exit code and the prompts asked.
     #[cfg(unix)]
     fn edit_reopened_unchanged(
         root: &std::path::Path,
@@ -3125,7 +2976,6 @@ mod tests {
                     .expect("set");
                     crate::client::admin_publish(&admin, &other, &doc).expect("publish");
                 }
-                // Reopened after the warning, the person quits without saving.
                 Ok(true)
             },
             &|prompt: &str| {
@@ -3150,8 +3000,6 @@ mod tests {
     fn a_draft_reopened_unchanged_on_a_vault_that_moved_publishes_only_when_the_person_says_so() {
         let everyone = crate::text::Audience::Everyone;
         let root = aterm_tempfile::tempdir().expect("tempdir");
-        // Quitting the reopened editor and pressing return publishes nothing: the draft is
-        // kept, and only the other admin's version is the vault's.
         let (admin, began, code, asked) = edit_reopened_unchanged(&root.path().join("a"), "");
         assert_eq!(code, ExitCode::FAILURE);
         assert!(asked.iter().any(|p| p.contains("as it is")), "{asked:?}");
@@ -3160,8 +3008,6 @@ mod tests {
         assert!(after.doc.entry(&everyone, "other").is_some());
         assert!(after.doc.entry(&everyone, "note").is_none());
         assert_eq!(edit_dirs(&admin).len(), 1, "the draft is kept");
-        // Told to, the same draft publishes over that version with no change to make up: its
-        // text replaces the version's entries, and the machine it let in is kept.
         let (admin, began, code, _) = edit_reopened_unchanged(&root.path().join("b"), "y");
         assert_eq!(code, ExitCode::SUCCESS);
         let after = crate::client::admin_open(&admin).expect("open");
@@ -3173,10 +3019,8 @@ mod tests {
     }
 
     /// A key approved with `--name` gets that name or none: a name that is not a machine name
-    /// is a usage error, never a generic `machine` in its place.
     #[test]
     fn a_key_is_never_approved_under_a_name_it_was_not_given() {
-        // A code-shaped name would be a code for `admins`, `revoke` and `set --for`.
         for refused in [
             "M9",
             "join",
@@ -3198,7 +3042,6 @@ mod tests {
     }
 
     /// A value piped to `set` loses its line end only when it is one line of text; a binary
-    /// value that happens to end in LF (or CR LF) keeps every byte, as `--file` keeps it.
     #[cfg(unix)]
     #[test]
     fn a_piped_value_loses_its_line_end_only_when_it_is_one_line_of_text() {
@@ -3224,9 +3067,6 @@ mod tests {
     }
 
     /// `revoke` and `admins remove` name everything the machine could read: an admin read the
-    /// whole text in the admin locker, every host section's entries too; any machine read
-    /// `[everyone]`'s locker beside its own sections', so an `[everyone]` value its section
-    /// overrides is named as well.
     #[cfg(unix)]
     #[test]
     fn letting_a_machine_go_names_everything_it_could_read() {
@@ -3275,9 +3115,6 @@ mod tests {
     }
 
     /// A JOIN CODE TYPED FOR A MACHINE (`revoke`, `set|unset --for`, as `admins`) reaches the
-    /// machine whose key has it, never one an older approver let in under that code as its
-    /// name; a name passes as typed, and a code no key has is refused, even when a machine is
-    /// so named.
     #[cfg(unix)]
     #[test]
     fn a_code_typed_for_a_machine_reaches_the_key_that_has_it() {
@@ -3294,8 +3131,6 @@ mod tests {
         );
         assert!(unix::machines_named(&doc, &["aaaa-bbbb-cccc-dddd".to_string()]).is_err());
 
-        // A machine an older approver let in under another's code as its name: the code is
-        // refused, naming both, since either may be meant.
         let mut both = doc.clone();
         let stranger = key();
         both.add_machine(&code, &stranger.to_bech32())
@@ -3306,8 +3141,6 @@ mod tests {
             error.0.contains("mb") && error.0.contains(&stranger.to_bech32()),
             "{error}"
         );
-        // Named with a code no key has, a machine is not reached by it (meant for a machine
-        // not yet in, it would reach a stranger): the refusal gives its own code, which is.
         let unkeyed = "aaaa-bbbb-cccc-dddd".to_string();
         let named = key();
         doc.add_machine(&unkeyed, &named.to_bech32())
@@ -3323,7 +3156,6 @@ mod tests {
     }
 
     /// `status` of a machine of a signed vault names it by its code: the name it asked for
-    /// may be another machine's in the vault. A plain text file is read under that name.
     #[cfg(unix)]
     #[test]
     fn status_names_a_machine_of_a_signed_vault_by_its_code() {
@@ -3350,7 +3182,6 @@ mod tests {
     }
 
     /// A subscriber played with an inert arm: `state` says its state and `install` stands in
-    /// for an install (each test counts them), never a launchd job or a systemd unit.
     #[cfg(unix)]
     fn played<'a>(
         state: &'a dyn Fn() -> crate::Result<crate::service::State>,
@@ -3368,8 +3199,6 @@ mod tests {
     }
 
     /// The approver goes in where it does not run: a subscriber that is not installed, or one
-    /// installed with no process, is installed; a running one is left be; a state that cannot
-    /// be read installs nothing (an install asks the same service manager).
     #[cfg(unix)]
     #[test]
     fn the_approver_is_put_in_only_where_it_does_not_run() {
@@ -3409,7 +3238,6 @@ mod tests {
             Approver::Unknown("played: launchctl hung".into())
         );
         assert_eq!(installs.get(), 3, "an unreadable state installs nothing");
-        // `--no-agent` installs nothing, but a subscriber already running still approves.
         assert_eq!(
             unix::approver_here(false, &played(&running, &install)),
             Approver::Running
@@ -3436,8 +3264,6 @@ mod tests {
     }
 
     /// Where no approver runs on this Mac, a command that needs one says so, and that `aterm
-    /// secrets agent on` starts one; one it installed shows its install line; one that ran
-    /// already says nothing.
     #[cfg(unix)]
     #[test]
     fn a_command_whose_approver_does_not_run_says_what_starts_one() {
@@ -3482,10 +3308,6 @@ mod tests {
     }
 
     /// A vault at a path has no join queue, so nothing lets a machine in there by itself:
-    /// where `password` would say an open vault lets in every machine that asks, or a join
-    /// password lets in whoever types it, it says a machine joins only by an admin's approval
-    /// of its key. A vault served at a URL says what an open one lets in, and leaves a
-    /// password to the approver's line; a closed one says nothing either way.
     #[cfg(unix)]
     #[test]
     fn a_vault_at_a_path_says_a_machine_joins_it_by_key() {
@@ -3516,10 +3338,6 @@ mod tests {
     }
 
     /// `create` puts this Mac's approver in, as `join` puts the subscriber in, so a machine
-    /// that types the new vault's join password is let in; `--no-agent` installs nothing, but
-    /// reads the subscriber, which, already running, approves for the new vault too; a failed
-    /// install leaves the vault made (exit 0) with a warning. A vault at a path has no join
-    /// queue, so nothing to approve: no subscriber is read or installed for one.
     #[cfg(unix)]
     #[test]
     fn create_puts_in_the_approver_unless_told_not_to() {
@@ -3560,6 +3378,7 @@ mod tests {
                 std::fs::create_dir_all(shared.parent().expect("parent")).expect("dir");
                 shared.to_str().expect("utf-8").to_string()
             } else {
+                //{}/v1/{dir}", server.addr)
                 format!("http://{}/v1/{dir}", server.addr)
             };
             let admin = crate::client::Paths::for_home(&root.path().join(dir).join("ma"));
@@ -3587,8 +3406,6 @@ mod tests {
     }
 
     /// A vault server that takes a vault's first version and then fails every read, as one that
-    /// goes away between `create`'s publish and its own sync: a GET before the PUT is 404, the
-    /// PUT 204, a GET after it 503. It answers until [`LostAfterThePut::end`].
     #[cfg(unix)]
     struct LostAfterThePut {
         url: String,
@@ -3615,7 +3432,6 @@ mod tests {
                     let Ok(mut stream) = stream else {
                         continue;
                     };
-                    // A hang detector, not a latency budget.
                     let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(60)));
                     let mut head = Vec::new();
                     let mut byte = [0u8; 1];
@@ -3670,9 +3486,6 @@ mod tests {
     }
 
     /// A create whose own sync fails once the vault is published (its server gone between the
-    /// two) is no failure: the vault is out and source.toml names it, and a create run again
-    /// would be refused ("already exists there"). The approver still goes in, and its
-    /// subscriber syncs the vault; client::create says why this Mac's copy is not synced.
     #[cfg(unix)]
     #[test]
     fn a_create_whose_own_sync_fails_still_puts_the_approver_in() {
@@ -3723,10 +3536,6 @@ mod tests {
     }
 
     /// What leaves a vault letting machines in by itself (`password open`, as `set` and `new`)
-    /// puts this Mac's approver in where none runs, so what it prints holds; closing it
-    /// (`off`) reads no subscriber. `status` says whether the approver runs only on an admin
-    /// of a vault that approves by itself, read off the version this Mac holds, and only for
-    /// a vault with a join queue (a URL's; a path has none, so nothing to approve).
     #[cfg(unix)]
     #[test]
     fn a_vault_that_lets_machines_in_gets_an_approver_and_status_says_whether_it_runs() {
@@ -3781,7 +3590,6 @@ mod tests {
         );
         password(Password::Open, &played(&running, &install));
         assert_eq!(installs.get(), 2, "a running approver is left be");
-        // `--no-agent`: an admin whose subscriber was turned off on purpose keeps it off.
         unix::password(&admin, Password::Open, false, &played(&absent, &install))
             .expect("published");
         assert_eq!(installs.get(), 2, "--no-agent installs nothing");
@@ -3790,8 +3598,6 @@ mod tests {
         password(Password::Off, &played(&unread, &install));
         assert_eq!(installs.get(), 2);
         server.stop();
-        // A machine that is no admin, or has no vault, has no approver to report; nor does
-        // an admin of a vault at a path, whatever its [join] says.
         let stranger = crate::client::Paths::for_home(&root.path().join("stranger"));
         assert_eq!(approving_here(&stranger), Ok(None));
         let at_a_path = admin_of_a_path_vault(&root.path().join("path"));

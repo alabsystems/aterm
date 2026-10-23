@@ -1,129 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE STEP FOLD: tool calls, turn ends and walls from Claude Code's
-//! transcript, for the session log, with no text kept (plan §2.2-§2.8; addendum A8-A11, A19, A20)
-//! .
-//!
-//! The footer's usage fold already reads every byte the main transcript
-//! appends ([`super::session_usage::TranscriptCursor`]); the cursor hands
-//! each completed main-chain line, with its end offset, to this fold too
-//! (the TAP), so no byte is read twice and no subagent file is tapped.
-//! [`StepFold`] is pure: no file, clock or thread. It turns rows into
-//! typed [`Step`]s the GUI's glue hands to `aterm_slog::TurnTracker::
-//! transcript` (one `TxEvent` per [`StepEvent`]), and keeps the main
-//! chain's end ([`End`]) for the wall judge ([`judge_wall`]).
-//!
-//! NO TEXT. A [`Step`] holds ids ([`StepId`], the log's id
-//! alphabet, at most 40 bytes), a tool's name ([`ToolName`], at most 64
-//! bytes), class words and numbers: no field could hold a prompt, a reply,
-//! a tool's input or result, or a notice. The rows are read by
-//! [`super::transcript`]'s `steps` projections, which keep no text
-//! (addendum A8): a row's content parts are projected only when its raw
-//! bytes hold a call's or a result's key (`"tool_use"`, `"tool_use_id"`,
-//! `"tool_result"`: a quote inside a JSON string is escaped, so these raw
-//! matches are keys), or a `\u` escape (the slow way, as
-//! `usage::cannot_be_assistant` reads it), and even then a plain-string
-//! content (a prompt), or a bare string among the parts, is read as null. A user row's shape (a bash command,
-//! a task notification, an interrupt, a local command) is read from at most
-//! 63 decoded bytes of its first text, by the marker prefixes shared with
-//! `upgrade.rs` ([`TASK_NOTIFICATION`] and its kin, addendum A10), and
-//! dropped. Claude Code's own notice (`isApiErrorMessage`) is read through
-//! `conversation()` as the harness reads it, classed, and dropped: only the
-//! class answers and the wall it is are kept (A9).
-//!
-//! THE END (A9, S7). [`End`] is the harness's `transcript_ends_on` made
-//! incremental, by the same rules (the sidechain skip, `turn_duration`
-//! closing, the `parentUuid: null` exception), its notice classed by the
-//! harness's own `confirms` and `transcript_wall` at the push. One rule is
-//! the fold's own: a `system` `local_command` row's content is not read, so
-//! while it is the newest entry the end is OPAQUE and the judge says
-//! [`Judge::Wait`] — never a confirmation, never a refutation. The
-//! agreement test holds the two to the same answers over every
-//! `supervise/fixtures` transcript and every corpus row.
-//!
-//! THE FLOOR AND THE SEED (S1, S23, A20). The fold binds a file at its
-//! first read, its identity's change and a cursor restart, and says so
-//! ([`StepEvent::Bind`]). What the file held then is history: rows ending
-//! at or below the SEED — the glue's watermark for that file
-//! ([`StepFold::set_floor`]), else on a restart what the fold already
-//! queued of it, else none when the registry named this very file's
-//! session while no file existed for it ([`StepFold::note_vacant`]: a file
-//! that did not exist held no history), else the file's length at the bind
-//! — and rows older than the floor (the process's start) are folded into
-//! the end and the turn's tokens, never queued. The vacancy is the absent
-//! session's: it is spent by the next read of any file, and a bind of
-//! another file (a `/resume` of an older conversation) seeds at its length.
-//! A [`StepEvent::Bind`] is never dropped from a full queue (the steps
-//! after it are the ones that go), so the log always learns which file the
-//! steps it is given came from.
-//!
-//! FAIL CLOSED (plan §2.8). A row of a kind the fold reads whose
-//! discriminant has the wrong shape — a `tool_use` part with no string
-//! `id`, a `tool_result` with no string `tool_use_id`, a `turn_duration`
-//! with no numeric `durationMs`, an unreadable `timestamp` on a row that
-//! would be queued — latches the fold off ([`StepEvent::Off`]) for the
-//! rest of the bound file: a bind of another file (a `/clear`, a
-//! `/resume`) reads it afresh, and a restart of the same file stays off
-//! and says nothing new. An unknown row is skipped, never an error.
-//!
-//! A TURN WITH NO PROMPT ROW (`upgrade.rs`'s `TaskScan`).
-//! A prompt command (`/init`, `/review`, a project's command) is a
-//! command row and its `isMeta` expansion, a `!` shell command a
-//! `<bash-input>` row (its `<bash-stdout>` output says nothing: 2.1.294 ran
-//! a model turn after one, `supervise/fixtures`), and a background task's
-//! wake a `<task-notification>` row: none is a prompt by its words, yet the
-//! model can run a turn for it. So is Claude Code's own `isMeta` row that
-//! begins a turn it numbers of its own, by `upgrade.rs`'s rule
-//! (`numbered_anew`, as its `FinishedScan` reads it): a `/loop`'s wake under
-//! a `promptId` other than the running turn's, or under none with a
-//! `turnOrigin` or a `scheduledTaskId`, and a missed one-shot task's
-//! notice; an `isMeta` row under the running turn's `promptId`, or under
-//! none (a Stop hook's feedback, `/goal`'s check-in), goes on that turn.
-//! Such a row waits; the next main-chain assistant row of a model's says a
-//! turn ran, and the waiting row's `promptId` (else its `uuid`) names it,
-//! dated at the waiting row (at the assistant row when the waiting row
-//! names no time), queued before the assistant row's steps. A local command
-//! (`/model`, `/config`) writes its output instead and names nothing; a
-//! wake that comes while a vendor turn runs joins it.
-//!
-//! A RUNNING TURN THE BIND DID NOT READ. A tap armed after the footer's
-//! first read binds at the file's length (`session_usage.rs`'s `bind_tap`)
-//! and reads no row before it, so the fold knows neither the running turn's
-//! `promptId` nor whether one runs. Until a row read since names the turn,
-//! or a turn end says none runs, a `promptId` is no evidence of a turn of
-//! its own: the row is read by its own words, as one under none is (a
-//! `/loop`'s `turnOrigin` or `scheduledTaskId`, the missed task's notice),
-//! and its `promptId` is the running turn's from then on. A Stop hook's
-//! feedback there goes on the running turn, never opening it again. And
-//! any model's row says a vendor turn runs, read or not, so a wake after
-//! it joins that turn.
-//!
-//! A FIRST PROMPT WRITTEN LATE (the opening hold). Claude Code writes a new
-//! conversation's first prompt row after the first rows of its turn —
-//! 2.1.294 after the session limit's notice and `turn_duration`, 2.1.300
-//! after the first call (`supervise/fixtures`) — dated before them, with
-//! no parent (`parentUuid: null`): the harness's exception, which makes it
-//! end nothing. The steps of a model's row that opens the bound file's
-//! conversation, read with no prompt or waiting row before it, are held;
-//! that prompt row, dated no later than the first held row, is queued
-//! before them and they follow, so its first turn has its calls. Any other
-//! user row, a bind, a latch and the second take after the hold began hand
-//! them on as they are. They wait in the queue itself, so the hold adds no
-//! allocation and the queue's bound covers them. A parentless prompt
-//! after rows of an earlier prompt's (a relaunch writing one again) is no
-//! turn of these rows': it starts none.
-//!
-//! MEASURED BUILDS. [`MEASURED_BUILDS`] names each
-//! build whose rows the lab read, one by one: a row of a build it names is
-//! [`StepState::On`]; a row of any other build — an older one, a newer one,
-//! or one naming none — is [`StepState::Partial`]: it adds facts and
-//! overrules nothing. A build is named exactly when its key-only reduction
-//! (`targo --unverified lab reduce`) is committed as
-//! `harness/testdata/steps/<build>.jsonl`
-//! (`a_build_is_exact_iff_its_reduction_is_committed`). It names 2.1.303
-//! alone (the lab's read of 2026-10-19, 5H-2b): every other build is
-//! partial.
+//! THE STEP FOLD: tool calls, turn ends and walls from Claude Code's transcript, for the session log, with no text kept (plan §2.2-§2.8; addendum A8-A11, A19, A20) .
 
 use std::collections::VecDeque;
 
@@ -135,28 +13,19 @@ use super::transcript;
 use super::usage::{Seen, SeenIds, TokenUsage};
 use crate::supervise::run::wall_confirm::{self, Class, Entry, Row, TranscriptEnd};
 
-/// The Claude Code builds whose transcript rows the lab read, each with its
-/// key-only reduction committed (`harness/testdata/steps/<build>.jsonl`):
-/// exact one by one, never "at or below" (which closed the old
-/// `MEASURED_THROUGH` that made every older build exact too). 2.1.303: the
-/// lab ran the managed build against its stub (5H-2b), and on a candidate
-/// naming it the limit's wall read `confirmed=1` and a Bash turn closed
-/// from the transcript `out=done`, as the screen read it.
+/// The Claude Code builds whose transcript rows the lab read, each with its key-only reduction committed (`harness/testdata/steps/<build>.jsonl`).
 pub const MEASURED_BUILDS: &[&str] = &["2.1.303"];
 
-/// The most steps the fold holds between two takes; past it the oldest is
-/// dropped and counted ([`StepBatch::overflow`]).
+/// The most steps the fold holds between two takes; past it the oldest is dropped and counted ([`StepBatch::overflow`]).
 pub const STEP_QUEUE: usize = 1024;
 
-/// The most message ids a vendor turn's token count dedupes; more are
-/// summed as they come (a stated bound: the turn's amend says nothing of it).
+/// The most message ids a vendor turn's token count dedupes.
 pub const TURN_IDS_MAX: usize = 64;
 
 /// How many decoded bytes of a user row's first text the shape test reads.
 const LEAD_BYTES: usize = 63;
 
-/// A background task's wake (`<task-notification>…`): Claude Code's own,
-/// no prompt (`upgrade::asked_by` reads it as nobody's).
+/// A background task's wake (`<task-notification>…`): Claude Code's own, no prompt (`upgrade::asked_by` reads it as nobody's).
 pub(crate) const TASK_NOTIFICATION: &str = "<task-notification>";
 /// A shell-mode command (`! cmd`), which asks the model nothing.
 pub(crate) const BASH_INPUT: &str = "<bash-input>";
@@ -168,7 +37,6 @@ pub(crate) const BASH_STDERR: &str = "<bash-stderr>";
 pub(crate) const INTERRUPTED: &str = "[Request interrupted by user";
 
 /// A LOCAL COMMAND's own rows, as `wall_confirm`'s `local_command` reads a
-/// user row's string content: no turn of the conversation's.
 const LOCAL_COMMAND: [&str; 4] = [
     "<command-name>",
     "<command-message>",
@@ -176,16 +44,10 @@ const LOCAL_COMMAND: [&str; 4] = [
     "<local-command-stderr>",
 ];
 
-/// A compaction's own command row: `/compact`, whole or before the words it
-/// was given (a local command's, as `wall_confirm`'s `local_command` reads
-/// it).
+/// A compaction's own command row.
 pub const COMPACT: &str = "/compact";
 
-/// THE WORDS A USER ROW OPENS WITH THAT THE SHAPE TEST READS (S3, A10): a
-/// background task's wake, a shell-mode command and its output, Esc's row,
-/// a local command's rows and the missed one-shot task's notice (with
-/// [`COMPACT`]). Nothing past them is read. `lab reduce` keeps exactly these
-/// of a user row's text, so a reduction folds as its source.
+/// THE WORDS A USER ROW OPENS WITH THAT THE SHAPE TEST READS (S3, A10).
 pub const USER_MARKERS: [&str; 10] = [
     TASK_NOTIFICATION,
     BASH_INPUT,
@@ -215,11 +77,7 @@ const KEY_PROMPT_ID: &str = anchor_text("transcript.promptId");
 const KEY_PARENT: &str = anchor_text("transcript.parentUuid");
 const KEY_LOCAL_COMMAND: &str = anchor_text("transcript.local_command");
 
-// Bounded values
-
-/// An id as the session log takes one (`aterm_slog::ShortId`'s rule): 1 to
-/// 40 bytes of `[A-Za-z0-9._:@-]`. A `promptId`, a row's `uuid`, a
-/// `tool_use_id`, a model id, a build.
+/// An id as the session log takes one (`aterm_slog::ShortId`'s rule): 1 to 40 bytes of `[A-Za-z0-9._:@-]`.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct StepId {
     bytes: [u8; StepId::MAX],
@@ -230,8 +88,7 @@ impl StepId {
     /// The longest id.
     pub const MAX: usize = 40;
 
-    /// `s` as an id, or `None` when it is empty, too long or holds a byte
-    /// outside the alphabet.
+    /// `s` as an id, or `None` when it is empty, too long or holds a byte outside the alphabet.
     #[must_use]
     pub fn new(s: &str) -> Option<StepId> {
         let raw = s.as_bytes();
@@ -264,8 +121,7 @@ impl std::fmt::Debug for StepId {
     }
 }
 
-/// A vendor tool's name (`Bash`, `mcp__<server>__<tool>`), bounded at the
-/// fold: at most 64 bytes, cut at a character, control characters removed.
+/// A vendor tool's name (`Bash`, `mcp__<server>__<tool>`), bounded at the fold.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ToolName {
     bytes: [u8; ToolName::MAX],
@@ -308,9 +164,7 @@ impl std::fmt::Debug for ToolName {
     }
 }
 
-/// The class of a vendor tool, by its NAME (addendum A11: never by the box
-/// the screen drew, which can draw a Bash `sed -i` as an Edit), and whether
-/// it starts a subagent: one of the log's `CLS_WORDS`.
+/// The class of a vendor tool, by its NAME (addendum A11: never by the box the screen drew, which can draw a Bash `sed -i` as an Edit), and whether it starts a subagent.
 #[must_use]
 pub fn tool_class(name: &str) -> (&'static str, bool) {
     match name {
@@ -327,12 +181,7 @@ pub fn tool_class(name: &str) -> (&'static str, bool) {
     }
 }
 
-// Steps
-
-/// Where a step was read: the file (its path's fingerprint and, where the
-/// platform has one, its identity), the offset (the end of the row's line,
-/// less one per later step of the same row, so each step of a row has its
-/// own offset inside the line), and the row's time (wall ms).
+/// Where a step was read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct StepPos {
     /// The path's fingerprint (FNV-1a/64 of its bytes).
@@ -345,8 +194,7 @@ pub struct StepPos {
     pub at_ms: u64,
 }
 
-/// A watermark the log holds for a file: rows ending at or below `off` were
-/// applied (the glue reads it from the log, `TxView::through`).
+/// A watermark the log holds for a file.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct StepMark {
     /// The path's fingerprint.
@@ -366,23 +214,15 @@ pub enum StepState {
     Partial,
 }
 
-/// One transcript fact. No field can hold text (S6).
+/// One transcript fact.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StepEvent {
     /// The fold bound a file: its first `len` bytes are history.
     Bind {
         /// The file's length at the bind; for the file the registry named
-        /// while it did not exist ([`StepFold::note_vacant`]), its seed
-        /// (none of it, but a watermark the log held).
         len: u64,
     },
-    /// A user row that starts a vendor turn (S3): never an interrupt, a
-    /// bash row, a compaction or local command's row, or a meta row that
-    /// begins no turn of its own. A prompt command's row and a wake (a
-    /// background task's, a `/loop`'s) start one only once a model's row
-    /// says the turn ran, dated at them; a first prompt written after its
-    /// turn's first rows is queued before them (module docs). Its
-    /// `promptId`, else its `uuid`.
+    /// A user row that starts a vendor turn (S3).
     Prompt {
         /// The vendor turn's id.
         vref: StepId,
@@ -412,22 +252,18 @@ pub enum StepEvent {
         /// Its `durationMs`.
         vdur_ms: u64,
         /// Input tokens over its rows (input, cache writes and reads), each
-        /// message counted once at its largest ([`TURN_IDS_MAX`]).
         tok_in: u64,
         /// Output tokens over its rows.
         tok_out: u64,
     },
-    /// The turn the row just ended ended on Claude Code's own notice of
-    /// this wall (the harness's `transcript_wall`).
+    /// The turn the row just ended ended on Claude Code's own notice of this wall (the harness's `transcript_wall`).
     EndWall {
         /// The notice's wall.
         kind: WallKind,
     },
     /// `system subtype=compact_boundary`.
     Compact,
-    /// A main-chain assistant row whose model or effort is not the last
-    /// one this fold said (the first after a bind included): never Claude
-    /// Code's own `<synthetic>` or notice rows.
+    /// A main-chain assistant row whose model or effort is not the last one this fold said (the first after a bind included).
     Model {
         /// `message.model`.
         model: StepId,
@@ -459,20 +295,15 @@ pub struct Step {
 pub struct StepBatch {
     /// The steps, oldest first.
     pub steps: Vec<Step>,
-    /// Steps dropped from a full queue (the oldest): the join is desynced
-    /// until the next prompt (`TxEvent::Overflow`).
+    /// Steps dropped from a full queue (the oldest): the join is desynced until the next prompt (`TxEvent::Overflow`).
     pub overflow: u64,
-    /// Rows past the seed the fold could not read (not UTF-8, not JSON,
-    /// longer than the line bound): `TxEvent::Lost`.
+    /// Rows past the seed the fold could not read (not UTF-8, not JSON, longer than the line bound): `TxEvent::Lost`.
     pub lost: u64,
     /// The main chain's end after the last row read.
     pub end: End,
 }
 
-// The end
-
-/// What the newest main-chain entry is (the harness's `Entry`, without its
-/// text, and the opaque local command).
+/// What the newest main-chain entry is (the harness's `Entry`, without its text, and the opaque local command).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum EndClass {
     /// Nothing of the conversation's yet.
@@ -525,17 +356,13 @@ fn bit(c: Class) -> u8 {
 }
 
 impl End {
-    /// The transcript has not caught up with the turn the screen ended: no
-    /// `turn_duration` closed it and its newest entry is no notice (the
-    /// harness's `TranscriptEnd::lagging`).
+    /// The transcript has not caught up with the turn the screen ended.
     #[must_use]
     pub fn lagging(&self) -> bool {
         !self.closed && self.last != EndClass::Notice
     }
 
-    /// The end confirms a screen wall of kind `screen`: its newest entry is
-    /// Claude Code's own notice of the same class (the harness's
-    /// `confirms`, which depends on the screen only through its class).
+    /// The end confirms a screen wall of kind `screen`.
     #[must_use]
     pub fn confirms(&self, screen: WallKind) -> bool {
         self.last == EndClass::Notice && self.classes & bit(wall_confirm::class(screen)) != 0
@@ -559,17 +386,11 @@ pub enum Judge {
     Confirm,
     /// The end is newer than the wall's turn and is no such notice.
     Refute,
-    /// Not now: the transcript lags, its end is opaque or older than the
-    /// turn, or the wall is one the transcript never writes.
+    /// Not now: the transcript lags, its end is opaque or older than the turn, or the wall is one the transcript never writes.
     Wait,
 }
 
-/// THE WALL JUDGE (plan §2.6): the harness's own rule, so the log and the
-/// harness never disagree on a wall. A screen wall of kind `screen`, under
-/// a turn that opened at `turn_opened_ms` (wall ms), is confirmed when the
-/// end confirms it; while the end lags, is opaque, or is older than the
-/// turn, the judge waits; a memory wall is never asked (no transcript
-/// row); anything else refutes it.
+/// THE WALL JUDGE (plan §2.6): the harness's own rule, so the log and the harness never disagree on a wall.
 #[must_use]
 pub fn judge_wall(screen: WallKind, end: &End, turn_opened_ms: u64) -> Judge {
     if screen == WallKind::Memory || end.last == EndClass::Opaque {
@@ -620,7 +441,6 @@ impl EndFold {
 }
 
 /// A notice row (`isApiErrorMessage`) read as the harness reads it, its
-/// classes and wall kept and its text dropped.
 fn notice_of(line: &str) -> (Option<WallKind>, u8) {
     notice_read(line).map_or((None, 0), |n| {
         let classes = CLASSES
@@ -632,19 +452,10 @@ fn notice_of(line: &str) -> (Option<WallKind>, u8) {
     })
 }
 
-/// WHAT THE HARNESS READS OF ONE NOTICE ROW: Claude Code's own notice (an
-/// `isApiErrorMessage` row), or a `system` `local_command` row whose output
-/// reads as a full context (a failed `/compact`), as the wall check reads
-/// it (`supervise/wall_confirm.rs`'s `row_of`): its words, the typed fields
-/// it carries, and what the harness makes of them — the wall it is once its
-/// turn is closed, the screen walls it confirms and the limit it names. A
-/// reader of the rows' closed words reads a notice through it
-/// (`aterm-lab reduce`'s readings, a reduction keeps
-/// the words this reads).
+/// WHAT THE HARNESS READS OF ONE NOTICE ROW.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NoticeRead {
-    /// Its words: every text part joined, or the command's output in its
-    /// tags.
+    /// Its words: every text part joined, or the command's output in its tags.
     pub text: String,
     /// Its `error` word.
     pub error: Option<String>,
@@ -652,30 +463,23 @@ pub struct NoticeRead {
     pub api_error: Option<String>,
     /// The status it answered (`apiErrorStatus`).
     pub status: Option<u16>,
-    /// Which of the account's limits it was written for
-    /// (`quotaLimits.rateLimitType`).
+    /// Which of the account's limits it was written for (`quotaLimits.rateLimitType`).
     pub limit: Option<String>,
     /// The wall it is once its turn is closed (`transcript_wall`).
     pub wall: Option<WallKind>,
-    /// Whether it confirms a screen wall of each class, in the order of a
-    /// usage limit, a full context, the lost login, an API error and the
-    /// memory wall (`confirms`, which reads the screen's class alone).
+    /// Whether it confirms a screen wall of each class, in the order of a usage limit, a full context, the lost login, an API error and the memory wall (`confirms`, which reads the screen's class alone).
     pub confirms: [bool; 5],
-    /// Which limit it names (`limit_named`: by its words, else by its
-    /// `rateLimitType`).
+    /// Which limit it names (`limit_named`: by its words, else by its `rateLimitType`).
     pub named: Option<WallKind>,
 }
 
-/// [`NoticeRead`] of one transcript line; `None` for a line that is no
-/// notice, and one that is no JSON.
+/// [`NoticeRead`] of one transcript line; `None` for a line that is no notice, and one that is no JSON.
 #[must_use]
 pub fn notice_read(line: &str) -> Option<NoticeRead> {
     let v = transcript::conversation(line).ok()?;
     let Some(Row::Entry(entry @ Entry::Notice { .. })) = wall_confirm::row_of(&v) else {
         return None;
     };
-    // Closed, so `transcript_wall` names the wall the notice is; the
-    // classes `confirms` answers do not look at `closed`.
     let end = TranscriptEnd {
         last: entry,
         closed: true,
@@ -708,13 +512,7 @@ pub fn notice_read(line: &str) -> Option<NoticeRead> {
     })
 }
 
-// Raw-byte reads
-
-/// Whether a row's content parts are needed: its raw bytes hold a call's or
-/// a result's key, or a `\u` escape that could spell one (A8). The keys
-/// that sit near a row's start are looked for first: a result row (the
-/// bulk of a transcript's bytes) answers before any scan of its whole line
-/// (plan §9 M1).
+/// Whether a row's content parts are needed.
 pub(super) fn wants_parts(line: &str) -> bool {
     [KEY_TOOL_USE_ID, KEY_TOOL_RESULT, KEY_TOOL_USE]
         .iter()
@@ -738,8 +536,6 @@ pub(super) fn quoted(line: &str, word: &str) -> bool {
 }
 
 /// The first decoded bytes of a user row's first text: its string content,
-/// or its content's first `text` part, with whether it was the string and
-/// whether it was read whole.
 struct Lead {
     bytes: [u8; LEAD_BYTES],
     len: usize,
@@ -757,7 +553,6 @@ impl Lead {
     }
 
     /// Whether this is a local command's own row (`wall_confirm`'s
-    /// `local_command`, on a string content only, as `user_entry` asks).
     fn local(&self) -> bool {
         if !self.string {
             return false;
@@ -774,7 +569,6 @@ impl Lead {
 }
 
 /// [`Lead`] of `line`, found after its `"message":` key; `None` where the
-/// content is neither a string nor holds a text part.
 fn lead(line: &str) -> Option<Lead> {
     let m = line.find("\"message\":")?;
     let rest = &line[m..];
@@ -821,8 +615,6 @@ fn lead(line: &str) -> Option<Lead> {
                 _ => break,
             },
             _ => {
-                // A run of plain bytes: copy what fits (cut at a character
-                // by `text`).
                 let n = b[i..]
                     .iter()
                     .position(|&x| x == b'"' || x == b'\\')
@@ -850,7 +642,6 @@ fn lead(line: &str) -> Option<Lead> {
 }
 
 /// A `\uXXXX` escape at the start of `b` (a surrogate pair as one), and how
-/// many bytes it spans.
 fn unicode_escape(b: &[u8]) -> Option<(char, usize)> {
     let hex = |s: &[u8]| -> Option<u32> {
         let t = std::str::from_utf8(s.get(2..6)?).ok()?;
@@ -873,7 +664,6 @@ fn unicode_escape(b: &[u8]) -> Option<(char, usize)> {
 }
 
 /// A row's `timestamp` as wall ms: whole seconds (`parse_utc_fractional`'s
-/// rule) and the first three digits of its fraction.
 fn stamp_ms(s: &str) -> Option<u64> {
     let secs = u64::try_from(aterm_types::rfc3339::parse_utc_fractional(s)?).ok()?;
     let ms = s
@@ -893,8 +683,7 @@ fn flag(obj: &Map, key: &str) -> bool {
     obj.get(key).and_then(Value::as_bool) == Some(true)
 }
 
-/// A count as a row writes it: a whole number, else a finite non-negative
-/// one cut to whole.
+/// A count as a row writes it: a whole number, else a finite non-negative one cut to whole.
 pub(super) fn number(v: Option<&Value>) -> Option<u64> {
     let v = v?;
     v.as_u64().or_else(|| {
@@ -903,8 +692,6 @@ pub(super) fn number(v: Option<&Value>) -> Option<u64> {
             .map(|f| f as u64)
     })
 }
-
-// The fold
 
 /// A vendor turn's tokens, by the usage fold's dedupe (A11).
 #[derive(Clone, Debug, Default)]
@@ -939,7 +726,6 @@ impl TurnTokens {
 }
 
 /// The session the registry named with no transcript, and the file a
-/// later read found for it ([`StepFold::note_vacant`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Vacancy {
     /// The session id's fingerprint.
@@ -949,7 +735,6 @@ struct Vacancy {
 }
 
 /// A row that asks the model a turn though its words are no prompt, read
-/// and waiting for the assistant row that says the turn ran (module docs).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Pending {
     /// Its `promptId`, else its `uuid` (none: counted lost if a turn ran).
@@ -975,7 +760,6 @@ enum Ask {
     /// A background task's wake: a turn waits for the model's row.
     Wake,
     /// A `!` shell command: the turn it may start waits, as a prompt
-    /// command's does.
     Command,
     /// A shell-mode command's output: nothing.
     Nothing,
@@ -994,13 +778,6 @@ fn fingerprint(id: &str) -> u64 {
 }
 
 /// THE OPENING HOLD: the steps of the bound file's first conversation rows,
-/// read before any prompt of theirs — the first turn's prompt row Claude
-/// Code writes after its turn's first rows (2.1.294 after the session
-/// limit's notice and `turn_duration`, 2.1.300 after the first call, each
-/// dated before them). They wait for that row, which is queued before them
-/// at `off`; any other user row, a bind, a latch and a second take
-/// ([`StepFold::take`]) hand them on as they are. The held steps are the
-/// queue's from `at` on, so a take hands on only those before them.
 #[derive(Clone, Debug)]
 struct Hold {
     /// Where the held steps start in the queue (those before are not held).
@@ -1025,9 +802,6 @@ pub struct StepFold {
     /// Rows ending at or below this are history.
     seed: u64,
     /// THE VACANCY: the session the registry named while no transcript
-    /// existed for it, and once a read found its file, that file's
-    /// fingerprint ([`Self::note_vacant`], [`Self::note_found`]): only that
-    /// file, bound next, is bound from its first byte.
     vacant: Option<Vacancy>,
     /// The highest offset queued.
     through: u64,
@@ -1038,16 +812,10 @@ pub struct StepFold {
     /// Latched off for the bound file ([`Self::latch`]).
     broken: bool,
     /// A vendor turn is running: a prompt or a model's row was read and no
-    /// turn end or interrupt since (`None`: not known, the bind's history
-    /// unread).
     in_turn: Option<bool>,
     /// A prompt command's row or a wake waiting for the assistant row that
-    /// says a turn ran (module docs).
     pending: Option<Pending>,
     /// The `promptId` of the last main-chain user row that named the
-    /// running turn ([`fingerprint`]; `upgrade.rs`'s `FinishedScan::turn`).
-    /// `None` with `in_turn` not `Some(false)`: the running turn is unread
-    /// (module docs), and a row's number says nothing of a turn of its own.
     vturn: Option<u64>,
     /// The opening hold ([`Hold`]).
     hold: Option<Hold>,
@@ -1057,9 +825,7 @@ pub struct StepFold {
 }
 
 impl StepFold {
-    /// A fold whose rows older than `floor_ms` (wall ms) are history, and
-    /// whose log holds the watermark `given` (the glue's read of
-    /// `TxView::through`; `None` for none).
+    /// A fold whose rows older than `floor_ms` (wall ms) are history, and whose log holds the watermark `given` (the glue's read of `TxView::through`; `None` for none).
     #[must_use]
     pub fn new(floor_ms: u64, given: Option<StepMark>) -> StepFold {
         StepFold {
@@ -1084,34 +850,23 @@ impl StepFold {
         }
     }
 
-    /// The floor and the log's watermark again (a later process, a fold the
-    /// glue re-read the log for): the floor only rises; the watermark seeds
-    /// the next bind of its file.
+    /// The floor and the log's watermark again (a later process, a fold the glue re-read the log for): the floor only rises.
     pub fn set_floor(&mut self, floor_ms: u64, given: Option<StepMark>) {
         self.floor_ms = self.floor_ms.max(floor_ms);
         self.given = given;
     }
 
-    /// Raise the floor to `floor_ms` (wall ms) when that is later: the
-    /// registry read named the process's start after the glue armed the fold.
+    /// Raise the floor to `floor_ms` (wall ms) when that is later.
     pub fn raise_floor(&mut self, floor_ms: u64) {
         self.floor_ms = self.floor_ms.max(floor_ms);
     }
 
-    /// The registry read named session `sid` (its id's fingerprint) and no
-    /// transcript for it: the file that session writes did not exist then,
-    /// so once a read finds it ([`Self::note_found`]) it is bound from its
-    /// first byte, its rows older than the floor still history (S1: a file
-    /// that did not exist held no history; the floor is the process's
-    /// start).
+    /// The registry read named session `sid` (its id's fingerprint) and no transcript for it.
     pub fn note_vacant(&mut self, sid: u64) {
         self.vacant = Some(Vacancy { sid, fp: None });
     }
 
-    /// The registry read named session `sid` and its transcript, the file
-    /// at fingerprint `fp`: the vacancy of that same session is that
-    /// file's, unless it is the file bound already; any other vacancy is
-    /// spent (another conversation's file held its history).
+    /// The registry read named session `sid` and its transcript, the file at fingerprint `fp`.
     pub fn note_found(&mut self, sid: u64, fp: u64) {
         let bound = self.bound.map(|(b, _)| b);
         self.vacant = self
@@ -1138,8 +893,7 @@ impl StepFold {
         self.broken
     }
 
-    /// Everything queued since the last take. Steps the opening hold has
-    /// held through one take already are handed on in this one ([`Hold`]).
+    /// Everything queued since the last take.
     pub fn take(&mut self) -> StepBatch {
         let upto = match self.hold.as_mut() {
             Some(h) if !h.taken => {
@@ -1160,24 +914,13 @@ impl StepFold {
         }
     }
 
-    /// The cursor's read of the file at `fp` (its identity `id`, `len`
-    /// bytes long) is about to fold lines; `restarted`: the cursor started
-    /// over from its first byte. The first read, another file and a restart
-    /// bind it (module docs): in-flight state is dropped, and the seed is the
-    /// log's watermark for this file where it holds one no longer than the
-    /// file, else what this fold already queued of it, else nothing when
-    /// this file is the one the registry named while it did not exist
-    /// ([`Self::note_vacant`], [`Self::note_found`]), else the file's
-    /// length. Every read spends the vacancy, a bind or not. A bind of
-    /// another file lifts the latch ([`Self::broken`]); a restart of a
-    /// latched file binds nothing new (the log keeps saying `off`).
+    /// The cursor's read of the file at `fp` (its identity `id`, `len` bytes long) is about to fold lines.
     pub fn read_at(&mut self, fp: u64, id: Option<(u64, u64)>, len: u64, restarted: bool) {
         let key = (fp, id);
         let vacant = self.vacant.take().is_some_and(|v| v.fp == Some(fp));
         if self.bound == Some(key) && !restarted {
             return;
         }
-        // What the hold kept is the old binding's: queued before the bind.
         self.release();
         let same = self.bound == Some(key);
         if !same {
@@ -1214,16 +957,14 @@ impl StepFold {
         );
     }
 
-    /// A line of the main transcript longer than the line bound, ending at
-    /// `end`: counted lost when it is past the seed.
+    /// A line of the main transcript longer than the line bound, ending at `end`: counted lost when it is past the seed.
     pub fn long_line(&mut self, end: u64) {
         if end > self.seed {
             self.lost = self.lost.saturating_add(1);
         }
     }
 
-    /// Fold one completed line of the main transcript, ending at offset
-    /// `end` (its newline's).
+    /// Fold one completed line of the main transcript, ending at offset `end` (its newline's).
     pub fn push(&mut self, line: &[u8], end: u64) {
         let Some((fp, id)) = self.bound else {
             return;
@@ -1271,19 +1012,15 @@ impl StepFold {
         let mut out: Vec<StepEvent> = Vec::new();
         let mut bad = false;
         let kind = obj.get("type").and_then(Value::as_str);
-        // A model's row that opens the conversation, no prompt or waiting
-        // row before it: its prompt may be written after it (the hold).
         let unasked = kind == Some("assistant")
             && self.end.end.last == EndClass::Nothing
             && self.pending.is_none()
             && self.in_turn != Some(true);
-        // The waiting row's turn ran: it is the turn's prompt, dated at it.
         let waited = match kind {
             Some("assistant") => self.ran(obj),
             _ => None,
         };
         let mut late = None;
-        // A row the log takes: past the seed, and no older than the floor.
         let live = fresh && at_ms.is_some_and(|t| t >= self.floor_ms);
         let row = match kind {
             Some("assistant") => self.assistant(t, obj, live, &mut out, &mut bad),
@@ -1331,8 +1068,6 @@ impl StepFold {
         let k = out.len() as u64;
         if kind == Some("user") {
             // THE HELD TURN'S PROMPT, written late: dated before its rows,
-            // it is queued before their steps; any other user row says no
-            // such prompt comes, and they go on as they are.
             if let Some(h) = self.hold.take()
                 && let (Some(vref), Some(when)) = (late, at_ms)
                 && when <= h.at_ms
@@ -1347,7 +1082,6 @@ impl StepFold {
                 let ev = StepEvent::Prompt { vref };
                 self.queue.insert(h.at, Step { pos, state, ev });
                 self.trim();
-                // Its turn runs on, unless a held turn end or Esc ended it.
                 self.in_turn = self.in_turn.or(Some(true));
             }
         }
@@ -1383,18 +1117,11 @@ impl StepFold {
     }
 
     /// End the opening hold: what it held goes on in the queue as it was
-    /// read.
     fn release(&mut self) {
         self.hold = None;
     }
 
     /// A main-chain assistant row of a model's (never Claude Code's own
-    /// `<synthetic>` notice) with a row waiting for it: the turn it asked
-    /// ran. Its tokens start over, and the waiting row's name and date are
-    /// handed back to be queued, if it was past the seed (module docs). A
-    /// wake while a vendor turn runs joins that turn: nothing. Any model's
-    /// row says a vendor turn runs from it on, read or not: a bind that read
-    /// no history learns it here, so a wake after it joins that turn.
     fn ran(&mut self, obj: &Map) -> Option<(StepId, Option<u64>)> {
         let model = obj
             .get("message")
@@ -1444,16 +1171,12 @@ impl StepFold {
     }
 
     /// Queue one step; a full queue drops its oldest step that is no
-    /// [`StepEvent::Bind`] or [`StepEvent::Off`] (those say which file the
-    /// rest came from and whether it is read at all, so the log never
-    /// loses them to a burst of rows), counting it in [`StepBatch::overflow`].
     fn enqueue_as(&mut self, pos: StepPos, state: StepState, ev: StepEvent) {
         self.queue.push_back(Step { pos, state, ev });
         self.trim();
     }
 
     /// Bound the queue to [`STEP_QUEUE`] as [`Self::enqueue_as`] says; the
-    /// opening hold's start moves with a step dropped before it.
     fn trim(&mut self) {
         while self.queue.len() > STEP_QUEUE {
             let pinned = |s: &Step| matches!(s.ev, StepEvent::Bind { .. } | StepEvent::Off { .. });
@@ -1469,7 +1192,6 @@ impl StepFold {
     }
 
     /// `live`: a row the log takes, past the seed and no older than the
-    /// floor (the model is said only on one).
     fn assistant(
         &mut self,
         line: &str,
@@ -1493,9 +1215,6 @@ impl StepFold {
         if flag(obj, KEY_API_ERROR) {
             return EndRow::Entry(EndClass::Notice, Some(notice_of(line)));
         }
-        // The model is said from the first row the log takes on: the
-        // history's (below the seed or the floor) is the run's to name,
-        // never this fold's, so a later row on the same model still says it.
         if let Some(model) = message
             .and_then(|m| m.get("model"))
             .and_then(Value::as_str)
@@ -1541,8 +1260,6 @@ impl StepFold {
     }
 
     /// A user row: its end entry, and the vendor turn's name when it is the
-    /// conversation's first prompt written after newer rows (the harness's
-    /// exception), for [`Self::push`] to hand to the opening hold.
     fn user(
         &mut self,
         line: &str,
@@ -1552,26 +1269,12 @@ impl StepFold {
         out: &mut Vec<StepEvent>,
         bad: &mut bool,
     ) -> (EndRow, Option<StepId>) {
-        // SOMEONE ELSE'S ASK by its origin alone (`upgrade::
-        // origin_is_someone`): a peer's message, which Claude Code records
-        // `isMeta`, or a kind this build does not know — a turn's prompt,
-        // though no entry of the end's (the harness skips meta rows).
         let someone = obj
             .get("origin")
             .and_then(|o| o.get("kind"))
             .and_then(Value::as_str)
             .is_some_and(|k| !matches!(k, "human" | "task-notification" | "auto-continuation"));
         let meta = flag(obj, KEY_META);
-        // A TURN CLAUDE CODE NUMBERED OF ITS OWN, by `upgrade.rs`'s rule
-        // (`numbered_anew`, as its `FinishedScan` reads every main-chain
-        // user row): a `promptId` other than the running turn's, or none on
-        // a row that names a `turnOrigin` or a `scheduledTaskId`, or is the
-        // notice of a missed one-shot task.
-        // THE RUNNING TURN UNREAD (module docs): while no row read since the
-        // bind named the running turn and no turn end says none runs, a
-        // number is no evidence of a turn of its own; the row is read by its
-        // own words, as one under none is, and its number is the running
-        // turn's from then on.
         let id = obj
             .get(KEY_PROMPT_ID)
             .and_then(Value::as_str)
@@ -1601,9 +1304,6 @@ impl StepFold {
                 self.prompt(obj, out);
             } else if anew {
                 // Claude Code's own row that begins a turn (a `/loop`'s
-                // wake, a missed task's notice) waits as a wake does; one
-                // under the running turn's `promptId`, or under none (a
-                // Stop hook's feedback, `/goal`'s check-in), goes on it.
                 self.pending = Some(waits(true));
             }
             return (EndRow::None, None);
@@ -1634,7 +1334,6 @@ impl StepFold {
         let lead = lead(line);
         if let Some(l) = lead.as_ref().filter(|l| l.local()) {
             // A command's row waits for the turn it may start (a prompt
-            // command's), its output says it started none (a local one's).
             if l.starts(LOCAL_COMMAND[0]) || l.starts(LOCAL_COMMAND[1]) {
                 self.pending = Some(waits(false));
             } else if l.starts(LOCAL_OUTPUT) {
@@ -1650,20 +1349,12 @@ impl StepFold {
         let ask = match lead {
             _ if someone => Ask::Prompt,
             Some(l) if l.starts(INTERRUPTED) => Ask::Interrupt,
-            // A background task's wake: the turn it may start waits.
             Some(l) if l.starts(TASK_NOTIFICATION) => Ask::Wake,
-            // A `!` shell command waits as a prompt command does (2.1.294
-            // ran a model turn after one); its output says nothing.
             Some(l) if l.starts(BASH_INPUT) => Ask::Command,
             Some(l) if [BASH_STDOUT, BASH_STDERR].iter().any(|m| l.starts(m)) => Ask::Nothing,
             _ if !asks => Ask::Wake,
             _ => Ask::Prompt,
         };
-        // The conversation's first prompt written after newer rows ends
-        // nothing (the harness's exception) and starts no turn here: when
-        // those rows are its own turn's (the first turn's prompt flushed
-        // late, as 2.1.294 and 2.1.300 write it), the opening hold gives
-        // them their prompt ([`Self::push`]).
         if opens && self.end.end.last != EndClass::Nothing {
             let late = (ask == Ask::Prompt).then(|| vref_of(obj)).flatten();
             return (EndRow::Entry(EndClass::Input, None), late);
@@ -1679,7 +1370,6 @@ impl StepFold {
     }
 
     /// A vendor turn's prompt: its tokens start over, and it is named by
-    /// its `promptId`, else its row's `uuid` (none: counted lost).
     fn prompt(&mut self, obj: &Map, out: &mut Vec<StepEvent>) {
         self.turn = TurnTokens::default();
         match vref_of(obj) {
@@ -1707,7 +1397,6 @@ impl StepFold {
             }
             Some(KEY_LOCAL_COMMAND) => {
                 // A local command's output in the newer shape: the command
-                // before it started no turn (`upgrade.rs`'s `TaskScan`).
                 if obj
                     .get("content")
                     .and_then(Value::as_str)
@@ -1722,11 +1411,7 @@ impl StepFold {
     }
 }
 
-/// The state of a row written by build `version` when the builds the lab
-/// measured are `measured` (S9, T8): exact only for a build named there; a
-/// row that names none, and any row of another build, older or newer, is
-/// partial. The Codex step fold reads its builds by the same rule
-/// (`super::codex_steps`).
+/// The state of a row written by build `version` when the builds the lab measured are `measured` (S9, T8).
 pub(super) fn state_for(measured: &[&str], version: Option<&str>) -> StepState {
     match version {
         Some(v) if measured.contains(&v) => StepState::On,

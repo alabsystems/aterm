@@ -1,39 +1,19 @@
 // Copyright 2026 Andrew Yates
-// Author: Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
 //! Character, line and column insertion, deletion and erase.
-//!
-//! - Character: ICH, DCH, ECH, within the cursor row.
-//! - Line: IL, DL, shifting rows within the scroll region.
-//! - Column: DECIC, DECDC, SL, SR, DECBI, DECFI, shifting columns within the
-//!   scroll region and horizontal margins.
 
 use super::{Grid, row_u16};
 use crate::row::LineSize;
 
 impl Grid {
-    // ---- Character-level operations (within a single row) ----
-
     /// Whether ICH/DCH shift the cursor row's cells only inside
-    /// `[cursor, right_bound)` (the bounded row ops) rather than through the
-    /// row's end: under a DECSLRM margin (`margined`), and wherever
-    /// `right_bound` stops short of the row, as on a DECDWL/DECDHL row, whose
-    /// line is its first half (`effective_cols_for_row`).
-    ///
-    /// The extras, the BCE ring and the orphan sweep move by `right_bound`, so
-    /// the cells must too, or DCH on a double-width row pulls a cell out from
-    /// under its mark. DCH brings blanks in at the line's visible edge and ICH
-    /// drops what it pushes past it, as DECDWL (which blanks the hidden half)
-    /// intends. A bounded shift recomputes `len` from the row's content.
     #[inline]
     const fn shift_is_bounded(&self, right_bound: u16, margined: bool) -> bool {
         margined || right_bound < self.storage.cols
     }
 
-    /// Insert `count` blank characters at the cursor (ICH), shifting the rest
-    /// right and discarding what passes the edge. Under DECLRMM margins the
-    /// shift stops at the right margin instead of the row edge.
+    /// Insert `count` blank characters at the cursor (ICH), shifting the rest right and discarding what passes the edge.
     #[inline]
     pub fn insert_chars(&mut self, count: u16) {
         self.storage.clear_pending_wrap();
@@ -41,9 +21,6 @@ impl Grid {
         let cursor_col = self.storage.cursor.col;
         let effective_cols = self.storage.effective_cols_for_row(cursor_row);
         let margins = self.storage.horizontal_margins();
-        // When horizontal margins are narrower than effective_cols, use margin
-        // boundary (right + 1) as the shift region. Per VT420, ICH respects
-        // horizontal margins when DECLRMM is active.
         let right_bound = (margins.right.saturating_add(1)).min(effective_cols);
         let fill = self.storage.cursor_template;
         let bounded = self.shift_is_bounded(right_bound, !margins.is_full(self.storage.cols));
@@ -59,27 +36,18 @@ impl Grid {
             self.storage
                 .extras
                 .shift_cols_right(cursor_row, cursor_col, count, right_bound);
-            // As in `insert_chars`.
             self.drop_unclaimed_extras(
                 cursor_row,
                 cursor_col.saturating_sub(1)..right_bound.saturating_add(1),
             );
-            // Fill BCE RGB in vacated cells at cursor position after shift, and
-            // in the wide halves the insert blanked.
             self.fill_bce_rgb_range(cursor_row, cursor_col, cursor_col + count);
             self.fill_bce_rgb_cols(cursor_row, blanked.unwrap_or_default());
-            // ICH shifts the row's tail right under any highlight, replacing
-            // content like EL, so record one row of selection damage (the
-            // cursor's). Not `damage_selection_scroll_region`: that also
-            // invalidates host coordinate caches, and ICH moves no row.
             self.damage_selection_visible_rows(cursor_row, cursor_row);
             self.storage.mark_content_row(cursor_row);
         }
     }
 
-    /// Delete `count` characters at the cursor (DCH), shifting the rest left and
-    /// filling the end with the BCE cursor template. Under DECLRMM margins the
-    /// shift stops at the right margin instead of the row edge.
+    /// Delete `count` characters at the cursor (DCH), shifting the rest left and filling the end with the BCE cursor template.
     #[inline]
     pub fn delete_chars(&mut self, count: u16) {
         self.storage.clear_pending_wrap();
@@ -102,27 +70,18 @@ impl Grid {
             self.storage
                 .extras
                 .shift_cols_left(cursor_row, cursor_col, count, right_bound);
-            // As in `delete_chars`.
             self.drop_unclaimed_extras(
                 cursor_row,
                 cursor_col.saturating_sub(1)..right_bound.saturating_add(1),
             );
-            // Fill BCE RGB in vacated cells at end of line after shift, and in the
-            // wide halves the delete blanked.
             self.fill_bce_rgb_range(cursor_row, right_bound - count, right_bound);
             self.fill_bce_rgb_cols(cursor_row, blanked.unwrap_or_default());
-            // DCH shifts the row's tail left under a live highlight; see
-            // `insert_chars` for the one-row damage.
             self.damage_selection_visible_rows(cursor_row, cursor_row);
             self.storage.mark_content_row(cursor_row);
         }
     }
 
     /// Margin-aware insert characters (DECLRMM).
-    ///
-    /// When `left_right_margin_mode` is true, shifts only within the
-    /// horizontal margins. Otherwise falls back to `insert_chars`.
-    /// Uses the BCE cursor template for fill.
     #[inline]
     pub fn insert_chars_margin(&mut self, count: u16, left_right_margin_mode: bool) {
         if !left_right_margin_mode {
@@ -134,8 +93,6 @@ impl Grid {
         let cursor_col = self.storage.cursor.col;
         let margins = self.storage.horizontal_margins();
         let effective_cols = self.storage.effective_cols_for_row(cursor_row);
-        // Only bound by margins when cursor is inside them. When cursor is
-        // outside the margin region, fall back to screen-edge bounding.
         let in_margins = cursor_col >= margins.left && cursor_col <= margins.right;
         let right_bound = if in_margins {
             margins.right.saturating_add(1).min(effective_cols)
@@ -156,25 +113,18 @@ impl Grid {
             self.storage
                 .extras
                 .shift_cols_right(cursor_row, cursor_col, count, right_bound);
-            // As in `insert_chars`.
             self.drop_unclaimed_extras(
                 cursor_row,
                 cursor_col.saturating_sub(1)..right_bound.saturating_add(1),
             );
             self.fill_bce_rgb_range(cursor_row, cursor_col, cursor_col + count);
             self.fill_bce_rgb_cols(cursor_row, blanked.unwrap_or_default());
-            // The margined ICH replaces content like the unmargined one; see
-            // `insert_chars`.
             self.damage_selection_visible_rows(cursor_row, cursor_row);
             self.storage.mark_content_row(cursor_row);
         }
     }
 
     /// Margin-aware delete characters (DECLRMM).
-    ///
-    /// When `left_right_margin_mode` is true, shifts only within the
-    /// horizontal margins. Otherwise falls back to `delete_chars`.
-    /// Uses the BCE cursor template for fill.
     #[inline]
     pub fn delete_chars_margin(&mut self, count: u16, left_right_margin_mode: bool) {
         if !left_right_margin_mode {
@@ -186,7 +136,6 @@ impl Grid {
         let cursor_col = self.storage.cursor.col;
         let margins = self.storage.horizontal_margins();
         let effective_cols = self.storage.effective_cols_for_row(cursor_row);
-        // Only bound by margins when cursor is inside them.
         let in_margins = cursor_col >= margins.left && cursor_col <= margins.right;
         let right_bound = if in_margins {
             margins.right.saturating_add(1).min(effective_cols)
@@ -207,27 +156,18 @@ impl Grid {
             self.storage
                 .extras
                 .shift_cols_left(cursor_row, cursor_col, count, right_bound);
-            // As in `delete_chars`.
             self.drop_unclaimed_extras(
                 cursor_row,
                 cursor_col.saturating_sub(1)..right_bound.saturating_add(1),
             );
             self.fill_bce_rgb_range(cursor_row, right_bound - count, right_bound);
             self.fill_bce_rgb_cols(cursor_row, blanked.unwrap_or_default());
-            // The margined DCH replaces content like the unmargined one; see
-            // `insert_chars`.
             self.damage_selection_visible_rows(cursor_row, cursor_row);
             self.storage.mark_content_row(cursor_row);
         }
     }
 
-    /// Erase `count` characters at the cursor in place (ECH), with the BCE
-    /// cursor template.
-    ///
-    /// ECH is not bounded by the DECLRMM margins: VT510 says "ECH works inside
-    /// or outside the scrolling margins", and xterm (`do_erase_char` ->
-    /// `ClearRight`, bounded by `MaxCols`), Ghostty and iTerm2 agree. See the
-    /// module note in `erase.rs`.
+    /// Erase `count` characters at the cursor in place (ECH), with the BCE cursor template.
     #[inline]
     pub fn erase_chars(&mut self, count: u16) {
         self.storage.clear_pending_wrap();
@@ -243,37 +183,21 @@ impl Grid {
             self.storage
                 .extras
                 .clear_range(cursor_row, cursor_col, cursor_col + count);
-            // The halves of a pair the erase bisected, outside its span.
             self.drop_unclaimed_extras(
                 cursor_row,
                 cursor_col.saturating_sub(1)..(cursor_col + count).saturating_add(1),
             );
             self.fill_bce_rgb_range(cursor_row, cursor_col, cursor_col + count);
             self.fill_bce_rgb_cols(cursor_row, blanked.unwrap_or_default());
-            // ECH blanks cells in place like EL, so it gets the same one-row
-            // selection damage; see `insert_chars`.
             self.damage_selection_visible_rows(cursor_row, cursor_row);
             self.storage.mark_content_row(cursor_row);
-            // An ECH running through the last column it can reach clears the
-            // row's right part as EL 0 does, so it breaks the wrap into the row
-            // below (`clear_wrap_into_next_row`). A shorter one leaves the row
-            // continuing: conhost paints a blank run inside a row as ECH then CUF
-            // and keeps writing that row, so a short ECH says nothing about the
-            // row's end.
             if cursor_col + count == right_bound {
                 self.clear_wrap_into_next_row(cursor_row);
             }
         }
     }
 
-    // ---- Line-level operations (within the scroll region) ----
-
-    /// Insert `count` blank lines at the cursor row (IL): lines below shift down
-    /// within the scroll region and those past the bottom margin are discarded.
-    /// Per VT510, no effect with the cursor outside the scroll region.
-    ///
-    /// REQUIRES: self.storage.scroll_region.top <= self.storage.scroll_region.bottom
-    /// REQUIRES: self.storage.scroll_region.bottom < self.storage.visible_rows
+    /// Insert `count` blank lines at the cursor row (IL).
     pub fn insert_lines(&mut self, count: usize) {
         if count == 0 {
             return;
@@ -282,43 +206,29 @@ impl Grid {
         let cursor_row = self.storage.cursor.row;
         let region = self.storage.scroll_region;
 
-        // Per VT510: IL has no effect if cursor is outside scroll region.
-        // Checked before moving the cursor column: a no-op IL must not move
-        // the cursor.
         if cursor_row < region.top || cursor_row > region.bottom {
             return;
         }
 
-        // The deferred wrap resets only once the insert happens: xterm's
-        // `InsertLine` (util.c) returns on the margin test before `ResetWrap`,
-        // so a rejected IL keeps the parked wrap.
         self.storage.clear_pending_wrap();
 
-        // Per ECMA-48 §8.3.67: IL moves the active position to the line home
-        // (column 0, or the left margin under DECLRMM; it is 0 without).
         self.storage.cursor.col = self.storage.horizontal_margins().left;
 
-        // Row index arithmetic requires display_offset == 0.
         self.reset_display_offset_with_damage();
 
         let start_row = usize::from(cursor_row);
-        let end_row = usize::from(region.bottom) + 1; // Bottom margin (inclusive) + 1
+        let end_row = usize::from(region.bottom) + 1;
 
-        // Shift rows down within the scroll region using pre-computed physical indices.
-        // display_offset == 0 is guaranteed by reset_display_offset_with_damage above.
         let shift_n = count.min(end_row - start_row);
         if end_row > start_row + shift_n {
             self.storage
                 .shift_visible_rows_down(start_row, end_row - 1, shift_n);
         }
 
-        // Batch shift CellExtras within [cursor_row, region.bottom]: O(E) regardless of count.
         self.storage
             .extras
             .shift_region_down_by(cursor_row, region.bottom, row_u16(shift_n));
 
-        // Clear the inserted rows with BCE fill, resetting line size to
-        // SingleWidth so DECDWL does not leak from recycled rows.
         let fill = self.storage.cursor_template;
         let clear_end = (start_row + count).min(end_row);
         for row in start_row..clear_end {
@@ -327,36 +237,24 @@ impl Grid {
                 r.erase_with(fill);
             }
         }
-        // Fill BCE RGB in vacated rows after shift.
         self.fill_bce_rgb_rows(cursor_row..row_u16(clear_end));
 
-        // IL is confined to the scroll region, which is the selection damage;
-        // selections outside it (including scrollback) survive.
-        //
-        // Recorded as a band: rows `cursor_row..=region.bottom` went down by the
-        // clamped count and the bottom rows left the band (like a region scroll
-        // down), so a host translating bands keeps its marks on their lines. A
-        // count past `i16` takes the poisoning path.
         match i16::try_from(shift_n) {
             Ok(delta) => {
                 self.damage_selection_scroll_region_as_band(cursor_row, region.bottom, delta);
             }
             Err(_) => {
                 self.damage_selection_scroll_region();
-                // The anchors take the move exactly, past `i16` too.
                 let delta = i64::try_from(shift_n).unwrap_or(i64::MAX);
                 self.anchors_band_move(cursor_row, region.bottom, delta);
             }
         }
 
-        // Mark only affected rows: cursor_row through region bottom.
         self.storage
             .mark_content_rows(cursor_row, region.bottom.saturating_add(1));
     }
 
-    /// Margin-aware insert lines (DECLRMM): with `left_right_margin_mode` and
-    /// margins narrower than the row, a rectangular shift within the scroll
-    /// region and the horizontal margins (VT420); otherwise `insert_lines`.
+    /// Margin-aware insert lines (DECLRMM).
     pub fn insert_lines_margined(&mut self, count: usize, left_right_margin_mode: bool) {
         if !left_right_margin_mode {
             self.insert_lines(count);
@@ -367,31 +265,22 @@ impl Grid {
             self.insert_lines(count);
             return;
         }
-        // Rectangular IL: shift cells within [left, right] down by `count` rows
-        // within [cursor_row, scroll_region.bottom].
         if count == 0 {
             return;
         }
 
         let cursor_row = self.storage.cursor.row;
         let region = self.storage.scroll_region;
-        // Per VT510: no effect with the cursor outside the scroll region.
         if cursor_row < region.top || cursor_row > region.bottom {
             return;
         }
 
-        // With DECLRMM active the scrolling region is the 2D rectangle
-        // [top..bottom] x [left..right]; IL is a no-op when the cursor column
-        // is outside the horizontal margins, mirroring DECIC/DECDC and xterm.
         let cursor_col = self.storage.cursor.col;
         if cursor_col < margins.left || cursor_col > margins.right {
             return;
         }
 
         self.storage.cursor.col = margins.left;
-        // Both margin tests come before xterm's `ResetWrap(screen)`, so an IL
-        // the cursor position rejects keeps the parked wrap (util.c
-        // `InsertLine`).
         self.storage.clear_pending_wrap();
         self.reset_display_offset_with_damage();
 
@@ -404,9 +293,6 @@ impl Grid {
         let width = right_usize + 1 - left_usize;
         let cols = self.storage.cols as usize;
 
-        // Copy cells downward within [left, right], bottom-to-top to avoid
-        // overwriting source data (as in scroll_region_down_margined), with one
-        // buffer reused across rows.
         let mut buf = vec![super::Cell::EMPTY; width];
         for dst_offset in (n..region_size).rev() {
             let dst_row = row_u16(top + dst_offset);
@@ -427,16 +313,11 @@ impl Grid {
                 if right_usize + 1 >= cols {
                     dst.set_end_marks(src_marks);
                 }
-                // Whole-row rect copy: no per-cell authoritative signal, so the
-                // fixup keeps the char == ' ' spacer heuristic (true).
                 dst.fixup_wide_boundary(left_usize, right_usize, cols, true);
-                // The span copy bypasses len maintenance: blank cells copied over
-                // the tail would leave len stale-high (phantom trailing spaces).
                 dst.recompute_len();
             }
         }
 
-        // Clear the top n rows within margins (the inserted blank lines) with BCE fill.
         let fill = self.storage.cursor_template;
         for clear_offset in 0..n {
             let clear_row = row_u16(top + clear_offset);
@@ -449,15 +330,11 @@ impl Grid {
                         *c = fill;
                     }
                 }
-                // As in `insert_lines_margined`.
                 r.fixup_wide_boundary(left_usize, right_usize, cols, true);
                 r.recompute_len();
             }
         }
 
-        // Shift extras down within the margin rectangle to match the cell
-        // shift, then clear the vacated top rows; shift_rect_down_by keeps
-        // hyperlinks, RGB colors, combining marks and underline colors.
         #[allow(
             clippy::cast_possible_truncation,
             reason = "n <= region_size <= visible_rows, fits u16"
@@ -469,7 +346,6 @@ impl Grid {
             margins.right,
             n as u16,
         );
-        // Fill BCE RGB in vacated top rect after shift.
         #[allow(
             clippy::cast_possible_truncation,
             reason = "n <= region_size <= visible_rows, fits u16"
@@ -479,8 +355,6 @@ impl Grid {
             margins.left..margins.right.saturating_add(1),
         );
 
-        // The halves of pairs the rectangle's edges bisected, blanked by
-        // `fixup_wide_boundary`, drop their extras.
         for row in cursor_row..=region.bottom {
             self.drop_unclaimed_extras(
                 row,
@@ -488,20 +362,13 @@ impl Grid {
             );
         }
 
-        // Confined to the scroll region: selections outside it survive.
         self.damage_selection_scroll_region();
-        // A rectangle moved across rows, which no anchor rule describes.
         self.lose_anchors();
         self.storage
             .mark_content_rows(cursor_row, region.bottom.saturating_add(1));
     }
 
-    /// Delete `count` lines at the cursor row (DL): lines below shift up within
-    /// the scroll region and blank lines enter at the bottom margin. Per VT510,
-    /// no effect with the cursor outside the scroll region.
-    ///
-    /// REQUIRES: self.storage.scroll_region.top <= self.storage.scroll_region.bottom
-    /// REQUIRES: self.storage.scroll_region.bottom < self.storage.visible_rows
+    /// Delete `count` lines at the cursor row (DL).
     pub fn delete_lines(&mut self, count: usize) {
         if count == 0 {
             return;
@@ -509,41 +376,29 @@ impl Grid {
         let cursor_row = self.storage.cursor.row;
         let region = self.storage.scroll_region;
 
-        // Per VT510: no effect with the cursor outside the scroll region, and a
-        // no-op DL must not move the cursor.
         if cursor_row < region.top || cursor_row > region.bottom {
             return;
         }
 
-        // As in `insert_lines`: xterm's `DeleteLine` (util.c) returns on the
-        // margin test before `ResetWrap(screen)`, so a rejected DL keeps the
-        // parked wrap.
         self.storage.clear_pending_wrap();
 
-        // Per ECMA-48 §8.3.32: DL moves the active position to the line home
-        // (column 0, or the left margin under DECLRMM; it is 0 without).
         self.storage.cursor.col = self.storage.horizontal_margins().left;
 
-        // Row index arithmetic requires display_offset == 0.
         self.reset_display_offset_with_damage();
 
         let start_row = usize::from(cursor_row);
-        let end_row = usize::from(region.bottom) + 1; // Bottom margin (inclusive) + 1
+        let end_row = usize::from(region.bottom) + 1;
 
-        // Shift rows up within the scroll region by pre-computed physical indices.
         let shift_n = count.min(end_row - start_row);
         if end_row > start_row + shift_n {
             self.storage
                 .shift_visible_rows_up(start_row, end_row - 1, shift_n);
         }
 
-        // Batch shift CellExtras within [cursor_row, region.bottom]: O(E) regardless of count.
         self.storage
             .extras
             .shift_region_up_by(cursor_row, region.bottom, row_u16(shift_n));
 
-        // Clear the bottom rows of the scroll region with BCE fill, resetting
-        // line size to SingleWidth so DECDWL does not leak from recycled rows.
         let fill = self.storage.cursor_template;
         let clear_start = end_row.saturating_sub(count).max(start_row);
         for row in clear_start..end_row {
@@ -552,11 +407,8 @@ impl Grid {
                 r.erase_with(fill);
             }
         }
-        // Fill BCE RGB in vacated bottom rows after shift.
         self.fill_bce_rgb_rows(row_u16(clear_start)..row_u16(end_row));
 
-        // Selection damage as a band, mirroring `insert_lines`: rows
-        // `cursor_row..=region.bottom` went up by the clamped count.
         match i16::try_from(shift_n) {
             Ok(rows) => {
                 self.damage_selection_scroll_region_as_band(cursor_row, region.bottom, -rows);
@@ -568,14 +420,11 @@ impl Grid {
             }
         }
 
-        // Mark only affected rows: cursor_row through region bottom.
         self.storage
             .mark_content_rows(cursor_row, region.bottom.saturating_add(1));
     }
 
-    /// Margin-aware delete lines (DECLRMM): with `left_right_margin_mode` and
-    /// margins narrower than the row, a rectangular shift within the scroll
-    /// region and the horizontal margins (VT420); otherwise `delete_lines`.
+    /// Margin-aware delete lines (DECLRMM).
     pub fn delete_lines_margined(&mut self, count: usize, left_right_margin_mode: bool) {
         if !left_right_margin_mode {
             self.delete_lines(count);
@@ -586,27 +435,22 @@ impl Grid {
             self.delete_lines(count);
             return;
         }
-        // Rectangular DL: shift cells within [left, right] up by `count` rows
-        // within [cursor_row, scroll_region.bottom].
         if count == 0 {
             return;
         }
 
         let cursor_row = self.storage.cursor.row;
         let region = self.storage.scroll_region;
-        // Per VT510: no effect with the cursor outside the scroll region.
         if cursor_row < region.top || cursor_row > region.bottom {
             return;
         }
 
-        // A no-op with the cursor column outside the margins, as for IL.
         let cursor_col = self.storage.cursor.col;
         if cursor_col < margins.left || cursor_col > margins.right {
             return;
         }
 
         self.storage.cursor.col = margins.left;
-        // As in `insert_lines_margined`: a rejected DL keeps the parked wrap.
         self.storage.clear_pending_wrap();
         self.reset_display_offset_with_damage();
 
@@ -619,9 +463,6 @@ impl Grid {
         let width = right_usize + 1 - left_usize;
         let cols = self.storage.cols as usize;
 
-        // Copy cells upward within [left, right], top-to-bottom to avoid
-        // overwriting source data (as in scroll_region_up_margined), with one
-        // buffer reused across rows.
         let mut buf = vec![super::Cell::EMPTY; width];
         for dst_offset in 0..(region_size - n) {
             let dst_row = row_u16(top + dst_offset);
@@ -642,14 +483,11 @@ impl Grid {
                 if right_usize + 1 >= cols {
                     dst.set_end_marks(src_marks);
                 }
-                // As in `insert_lines_margined`.
                 dst.fixup_wide_boundary(left_usize, right_usize, cols, true);
                 dst.recompute_len();
             }
         }
 
-        // Clear the bottom n rows within margins (vacated by the upward shift)
-        // with BCE fill.
         let fill = self.storage.cursor_template;
         for clear_offset in (region_size - n)..region_size {
             let clear_row = row_u16(top + clear_offset);
@@ -662,15 +500,11 @@ impl Grid {
                         *c = fill;
                     }
                 }
-                // As in `insert_lines_margined`.
                 r.fixup_wide_boundary(left_usize, right_usize, cols, true);
                 r.recompute_len();
             }
         }
 
-        // Shift extras up within the margin rectangle to match the cell shift;
-        // shift_rect_up_by keeps hyperlinks, RGB colors, combining marks and
-        // underline colors.
         #[allow(
             clippy::cast_possible_truncation,
             reason = "n <= region_size <= visible_rows, fits u16"
@@ -682,7 +516,6 @@ impl Grid {
             margins.right,
             n as u16,
         );
-        // Fill BCE RGB in vacated bottom rect after shift.
         #[allow(
             clippy::cast_possible_truncation,
             reason = "n <= region_size <= visible_rows, fits u16"
@@ -695,8 +528,6 @@ impl Grid {
             );
         }
 
-        // The halves of pairs the rectangle's edges bisected, blanked by
-        // `fixup_wide_boundary`, drop their extras.
         for row in cursor_row..=region.bottom {
             self.drop_unclaimed_extras(
                 row,
@@ -704,20 +535,13 @@ impl Grid {
             );
         }
 
-        // Confined to the scroll region: selections outside it survive.
         self.damage_selection_scroll_region();
-        // A rectangle moved across rows, which no anchor rule describes.
         self.lose_anchors();
         self.storage
             .mark_content_rows(cursor_row, region.bottom.saturating_add(1));
     }
 
-    // ---- Column-level operations (DECIC / DECDC, VT420+) ----
-
-    /// Insert `count` blank columns at the cursor column (DECIC, `CSI Pn ' }`):
-    /// in each row of the scroll region, cells in [cursor_col, right_margin]
-    /// shift right, content past the right margin is discarded, and BCE blanks
-    /// fill in. The cursor does not move.
+    /// Insert `count` blank columns at the cursor column (DECIC, `CSI Pn ' }`).
     pub fn insert_columns(&mut self, count: u16) {
         self.storage.clear_pending_wrap();
         if count == 0 {
@@ -729,9 +553,6 @@ impl Grid {
         let margins = self.storage.horizontal_margins();
         let effective_cols = self.storage.cols;
 
-        // Per VT420 / DEC STD 070: DECIC is ignored when the cursor is outside
-        // the scrolling margins — both the horizontal margins (column) and the
-        // vertical scroll region (row). Mirrors DECBI/DECFI and IL/DL.
         if cursor_col < margins.left || cursor_col > margins.right {
             return;
         }
@@ -751,9 +572,6 @@ impl Grid {
             let mut blanked = crate::row::BlankedHalves::default();
             if let Some(row) = self.row_mut(row_idx) {
                 blanked = row.insert_chars_bounded_fill(cursor_col, count, right_bound, fill);
-                // `insert_chars_bounded_fill` already fixed genuine boundary
-                // orphans, so skip the ambiguous spacer-clear (it could blank a
-                // protected space outside the region).
                 row.fixup_wide_boundary(
                     usize::from(margins.left),
                     usize::from(margins.right),
@@ -766,22 +584,18 @@ impl Grid {
                 .shift_cols_right(row_idx, cursor_col, count, right_bound);
             self.fill_bce_rgb_range(row_idx, cursor_col, cursor_col + count);
             self.fill_bce_rgb_cols(row_idx, blanked);
-            // The halves of pairs the shift or the edge fixup blanked.
             self.drop_unclaimed_extras(
                 row_idx,
                 margins.left.saturating_sub(1)..right_bound.saturating_add(1),
             );
         }
 
-        // Confined to the scroll region: selections outside it survive.
         self.damage_selection_scroll_region();
         self.storage
             .mark_content_rows(region.top, region.bottom.saturating_add(1));
     }
 
-    /// Delete `count` columns at the cursor column (DECDC, `CSI Pn ' ~`): in
-    /// each row of the scroll region, cells in [cursor_col, right_margin] shift
-    /// left and BCE blanks enter at the right margin. The cursor does not move.
+    /// Delete `count` columns at the cursor column (DECDC, `CSI Pn ' ~`).
     pub fn delete_columns(&mut self, count: u16) {
         self.storage.clear_pending_wrap();
         if count == 0 {
@@ -793,7 +607,6 @@ impl Grid {
         let margins = self.storage.horizontal_margins();
         let effective_cols = self.storage.cols;
 
-        // Ignored with the cursor outside the scrolling margins, as for DECIC.
         if cursor_col < margins.left || cursor_col > margins.right {
             return;
         }
@@ -813,7 +626,6 @@ impl Grid {
             let mut blanked = crate::row::BlankedHalves::default();
             if let Some(row) = self.row_mut(row_idx) {
                 blanked = row.delete_chars_bounded_fill(cursor_col, count, right_bound, fill);
-                // As in `insert_columns`.
                 row.fixup_wide_boundary(
                     usize::from(margins.left),
                     usize::from(margins.right),
@@ -826,24 +638,18 @@ impl Grid {
                 .shift_cols_left(row_idx, cursor_col, count, right_bound);
             self.fill_bce_rgb_range(row_idx, right_bound - count, right_bound);
             self.fill_bce_rgb_cols(row_idx, blanked);
-            // The halves of pairs the shift or the edge fixup blanked.
             self.drop_unclaimed_extras(
                 row_idx,
                 margins.left.saturating_sub(1)..right_bound.saturating_add(1),
             );
         }
 
-        // Confined to the scroll region: selections outside it survive.
         self.damage_selection_scroll_region();
         self.storage
             .mark_content_rows(region.top, region.bottom.saturating_add(1));
     }
 
-    /// SL — Scroll Left (CSI Ps SP @): scroll the content of the scroll region
-    /// left by `count` columns within the horizontal margins; blank columns
-    /// appear at the right margin. Anchored at the left margin, independent of
-    /// the cursor: the only difference from `delete_columns`. The BCE fill is
-    /// the caller's `cursor_template`.
+    /// SL — Scroll Left (CSI Ps SP @).
     pub fn scroll_left(&mut self, count: u16) {
         self.storage.clear_pending_wrap();
         if count == 0 {
@@ -863,8 +669,6 @@ impl Grid {
             let mut blanked = crate::row::BlankedHalves::default();
             if let Some(row) = self.row_mut(row_idx) {
                 blanked = row.delete_chars_bounded_fill(left, count, right_bound, fill);
-                // Genuine orphans were already fixed by the bounded shift, so skip
-                // the ambiguous spacer-clear (it could blank a protected space).
                 row.fixup_wide_boundary(
                     usize::from(margins.left),
                     usize::from(margins.right),
@@ -877,22 +681,17 @@ impl Grid {
                 .shift_cols_left(row_idx, left, count, right_bound);
             self.fill_bce_rgb_range(row_idx, right_bound - count, right_bound);
             self.fill_bce_rgb_cols(row_idx, blanked);
-            // The halves of pairs the shift or the edge fixup blanked.
             self.drop_unclaimed_extras(
                 row_idx,
                 margins.left.saturating_sub(1)..right_bound.saturating_add(1),
             );
         }
-        // Confined to the scroll region: selections outside it survive.
         self.damage_selection_scroll_region();
         self.storage
             .mark_content_rows(region.top, region.bottom.saturating_add(1));
     }
 
-    /// SR — Scroll Right (CSI Ps SP A): scroll the content of the scroll region
-    /// right by `count` columns within the horizontal margins; blank columns
-    /// appear at the left margin. Anchored at the left margin, the only
-    /// difference from `insert_columns`.
+    /// SR — Scroll Right (CSI Ps SP A).
     pub fn scroll_right(&mut self, count: u16) {
         self.storage.clear_pending_wrap();
         if count == 0 {
@@ -912,8 +711,6 @@ impl Grid {
             let mut blanked = crate::row::BlankedHalves::default();
             if let Some(row) = self.row_mut(row_idx) {
                 blanked = row.insert_chars_bounded_fill(left, count, right_bound, fill);
-                // Genuine orphans were already fixed by the bounded shift, so skip
-                // the ambiguous spacer-clear (it could blank a protected space).
                 row.fixup_wide_boundary(
                     usize::from(margins.left),
                     usize::from(margins.right),
@@ -926,28 +723,17 @@ impl Grid {
                 .shift_cols_right(row_idx, left, count, right_bound);
             self.fill_bce_rgb_range(row_idx, left, left + count);
             self.fill_bce_rgb_cols(row_idx, blanked);
-            // The halves of pairs the shift or the edge fixup blanked.
             self.drop_unclaimed_extras(
                 row_idx,
                 margins.left.saturating_sub(1)..right_bound.saturating_add(1),
             );
         }
-        // Confined to the scroll region: selections outside it survive.
         self.damage_selection_scroll_region();
         self.storage
             .mark_content_rows(region.top, region.bottom.saturating_add(1));
     }
 
-    // ---- Single-column scroll operations (DECBI / DECFI, VT420+) ----
-
-    /// DECBI — Back Index: scroll content right within margins.
-    ///
-    /// For each row in the scroll region, inserts 1 blank column at the left
-    /// margin, shifting content right within [left, right]. Content past the
-    /// right margin is discarded. The cursor position is not changed.
-    ///
-    /// Called when the cursor is at the left margin and DECBI (ESC 6) is
-    /// received. The caller handles the non-margin case (simple cursor left).
+    /// DECBI — Back Index.
     pub fn back_index(&mut self, left: u16, right: u16) {
         self.storage.clear_pending_wrap();
         let region = self.storage.scroll_region;
@@ -964,8 +750,6 @@ impl Grid {
             let mut blanked = crate::row::BlankedHalves::default();
             if let Some(row) = self.row_mut(row_idx) {
                 blanked = row.insert_chars_bounded_fill(left, 1, right_bound, fill);
-                // Genuine orphans were already fixed by the bounded shift, so skip
-                // the ambiguous spacer-clear (it could blank a protected space).
                 row.fixup_wide_boundary(
                     usize::from(left),
                     usize::from(right),
@@ -978,27 +762,18 @@ impl Grid {
                 .shift_cols_right(row_idx, left, 1, right_bound);
             self.fill_bce_rgb_range(row_idx, left, left + 1);
             self.fill_bce_rgb_cols(row_idx, blanked);
-            // The halves of pairs the shift or the edge fixup blanked.
             self.drop_unclaimed_extras(
                 row_idx,
                 left.saturating_sub(1)..right_bound.saturating_add(1),
             );
         }
 
-        // Confined to the scroll region: selections outside it survive.
         self.damage_selection_scroll_region();
         self.storage
             .mark_content_rows(region.top, region.bottom.saturating_add(1));
     }
 
-    /// DECFI — Forward Index: scroll content left within margins.
-    ///
-    /// For each row in the scroll region, deletes 1 column at the left margin,
-    /// shifting content left within [left, right]. A blank column is inserted
-    /// at the right margin. The cursor position is not changed.
-    ///
-    /// Called when the cursor is at the right margin and DECFI (ESC 9) is
-    /// received. The caller handles the non-margin case (simple cursor right).
+    /// DECFI — Forward Index.
     pub fn forward_index(&mut self, left: u16, right: u16) {
         self.storage.clear_pending_wrap();
         let region = self.storage.scroll_region;
@@ -1015,8 +790,6 @@ impl Grid {
             let mut blanked = crate::row::BlankedHalves::default();
             if let Some(row) = self.row_mut(row_idx) {
                 blanked = row.delete_chars_bounded_fill(left, 1, right_bound, fill);
-                // Genuine orphans were already fixed by the bounded shift, so skip
-                // the ambiguous spacer-clear (it could blank a protected space).
                 row.fixup_wide_boundary(
                     usize::from(left),
                     usize::from(right),
@@ -1029,14 +802,12 @@ impl Grid {
                 .shift_cols_left(row_idx, left, 1, right_bound);
             self.fill_bce_rgb_range(row_idx, right_bound - 1, right_bound);
             self.fill_bce_rgb_cols(row_idx, blanked);
-            // The halves of pairs the shift or the edge fixup blanked.
             self.drop_unclaimed_extras(
                 row_idx,
                 left.saturating_sub(1)..right_bound.saturating_add(1),
             );
         }
 
-        // Confined to the scroll region: selections outside it survive.
         self.damage_selection_scroll_region();
         self.storage
             .mark_content_rows(region.top, region.bottom.saturating_add(1));
@@ -1076,9 +847,6 @@ mod tests {
     }
 
     /// ICH shifts the rest of the cursor row right (dropping what passes the
-    /// edge), DCH shifts it left (blank-filling the end), ECH blanks in place;
-    /// each clamps its count to the row, leaves the other rows alone and
-    /// consumes the pending wrap.
     #[test]
     fn char_ops_edit_only_the_cursor_row() {
         use CharOp::*;
@@ -1122,9 +890,6 @@ mod tests {
     }
 
     /// IL inserts blank rows at the cursor row and DL deletes rows there,
-    /// shifting only the rest of the scroll region (rows past it are pushed
-    /// out or blank-filled), clamping the count to the region, and homing the
-    /// cursor column; a zero count or a cursor outside the region is a no-op.
     #[test]
     fn line_ops_shift_rows_within_the_region() {
         type Case<'a> = (
@@ -1229,8 +994,6 @@ mod tests {
 
     #[test]
     fn test_ech_through_the_last_column_breaks_the_wrap_as_el0_does() {
-        // Exactly to the end and past it (ECH clamps): the right part is
-        // cleared, as by EL 0, so row 0 no longer continues into row 1.
         for col in [0u16, 2, 4] {
             for count in [5 - col, 99] {
                 let mut grid = wrapped_pair();
@@ -1247,9 +1010,6 @@ mod tests {
 
     #[test]
     fn test_ech_short_of_the_last_column_keeps_the_wrap() {
-        // conhost's blank run inside a row (`CSI n X`, `CSI n C`, then the
-        // rest of the row): the row's last column keeps its text, so the row
-        // still continues into the next.
         for (col, count) in [(0u16, 3u16), (1, 1), (2, 2)] {
             let mut grid = wrapped_pair();
             grid.move_cursor_to(0, col);
@@ -1264,10 +1024,6 @@ mod tests {
 
     #[test]
     fn test_ech_under_margins_runs_to_the_row_end_and_breaks_the_wrap_as_el0_does() {
-        // DECLRMM margins do not bound ECH ("ECH works inside or outside the
-        // scrolling margins", VT510; see `tests/horizontal_margin_scope.rs`),
-        // so the last column ECH can reach is the row's own, where EL 0 stops
-        // too: an ECH through it clears the right part and breaks the link.
         let mut grid = wrapped_pair();
         grid.set_horizontal_margins(0, 3);
         grid.move_cursor_to(0, 1);
@@ -1279,8 +1035,6 @@ mod tests {
 
     #[test]
     fn test_ech_under_margins_short_of_the_row_end_keeps_the_wrap() {
-        // Reaching the right margin is not reaching the row end: the last
-        // column keeps its text, so the row still continues into the next.
         let mut grid = wrapped_pair();
         grid.set_horizontal_margins(0, 3);
         grid.move_cursor_to(0, 1);
@@ -1290,12 +1044,7 @@ mod tests {
         assert!(grid.row(1).unwrap().is_wrapped());
     }
 
-    // DECLRMM IL/DL horizontal containment
-
     /// IL and DL with DECLRMM active are no-ops when the cursor column is
-    /// outside the horizontal margins, even when the cursor row is inside the
-    /// vertical scroll region. They must not shift content nor move the cursor
-    /// column (it must not jump to `margins.left == 10`).
     #[test]
     fn test_il_and_dl_margined_cursor_col_outside_margins_are_noops() {
         type Op = fn(&mut Grid);
@@ -1310,11 +1059,8 @@ mod tests {
                 write_text(&mut grid, &format!("ROW{r}"));
             }
             grid.set_horizontal_margins(10, 50);
-            // Cursor row 2 is inside the (default full) vertical region, but
-            // col 70 is outside [10, 50].
             grid.move_cursor_to(2, 70);
             op(&mut grid);
-            // No content shift: rows still in original order.
             assert!(row_trimmed(&grid, 2).starts_with("ROW2"), "{name}");
             assert!(row_trimmed(&grid, 3).starts_with("ROW3"), "{name}");
             assert_eq!(
@@ -1327,7 +1073,6 @@ mod tests {
     }
 
     /// Inside both margins and region, margined IL still shifts (guard does not
-    /// over-fire).
     #[test]
     fn test_il_margined_cursor_inside_margins_still_shifts() {
         let mut grid = Grid::new(24, 80);
@@ -1336,22 +1081,16 @@ mod tests {
         grid.move_cursor_to(1, 20);
         write_text(&mut grid, "BBB");
         grid.set_horizontal_margins(10, 50);
-        grid.move_cursor_to(0, 30); // inside [10,50]
+        grid.move_cursor_to(0, 30);
         grid.insert_lines_margined(1, true);
-        // Row 0's margin cells moved down into row 1; cursor col moved to left margin.
         assert_eq!(grid.cursor_col(), 10);
         assert!(row_trimmed(&grid, 1).contains("AAA"));
     }
 
     /// Margined IL/DL and scroll_region_*_margined write cells via get_mut,
-    /// bypassing len maintenance; when the margined copy blanks a row's tail,
-    /// Row.len must still shrink, or row_text/search/scrollback emit phantom
-    /// trailing spaces.
     #[test]
     fn test_dl_margined_shrinks_len_when_blanks_cover_tail() {
         let mut grid = Grid::new(24, 80);
-        // Row 0: content only within the margins at the tail (cols 48-50), nothing
-        // beyond the right margin. Row 1 (the shift source) stays blank.
         grid.move_cursor_to(0, 48);
         write_text(&mut grid, "END");
         assert_eq!(
@@ -1361,11 +1100,9 @@ mod tests {
         );
 
         grid.set_horizontal_margins(10, 50);
-        grid.move_cursor_to(0, 20); // inside [10,50] → margined DL applies
+        grid.move_cursor_to(0, 20);
         grid.delete_lines_margined(1, true);
 
-        // Row 0 cols [10,50] were overwritten with row 1's blanks (the "END" tail is
-        // gone) and cols outside the margins were already blank → row 0 is empty.
         assert_eq!(
             grid.row_len(0),
             Some(0),
@@ -1373,13 +1110,7 @@ mod tests {
         );
     }
 
-    // DECIC/DECDC vertical-region containment
-
     /// DECIC and DECDC shift the rows of the vertical scroll region (rows
-    /// 0..=10) and are no-ops when the cursor row is outside it, even when the
-    /// cursor column is within the horizontal margins; inside it DECIC still
-    /// inserts (the guard does not over-fire). `ABCDE` stands on row 5, inside
-    /// the region, and on row 15, outside it.
     #[test]
     fn test_decic_and_decdc_act_only_inside_the_vertical_region() {
         type Op = fn(&mut Grid);
@@ -1396,7 +1127,6 @@ mod tests {
                 15,
                 ["ABCDE", "ABCDE"],
             ),
-            // Two blank columns inserted at col 2: "AB  CDE".
             (
                 "DECIC inside",
                 |g| g.insert_columns(2),

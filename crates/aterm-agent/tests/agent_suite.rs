@@ -22,6 +22,7 @@ mod conformance_account_key;
 mod conformance_disk_pass;
 mod conformance_footer_model;
 mod conformance_login_wall;
+mod conformance_occupancy;
 mod conformance_upgrade_models;
 mod conformance_usage_tap;
 mod supervise_conformance_account_rotation;

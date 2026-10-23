@@ -277,7 +277,7 @@ impl Terminal {
     /// is that site's observation that the offset changed or a live highlight
     /// died; only it has both sides of the change.
     #[inline]
-    pub(crate) fn note_custody_at(&mut self, transition: CustodyTransition, took: bool) {
+    pub(crate) const fn note_custody_at(&mut self, transition: CustodyTransition, took: bool) {
         self.last_custody = Some(transition);
         if transition.is_reader_gesture() {
             self.reader_gestures = self.reader_gestures.wrapping_add(1);
@@ -296,7 +296,7 @@ impl Terminal {
     /// [`Self::note_custody_at`] for the sites whose recording condition already
     /// decides the answer — see [`CustodyTransition::always_takes_custody`].
     #[inline]
-    pub fn note_custody(&mut self, transition: CustodyTransition) {
+    pub const fn note_custody(&mut self, transition: CustodyTransition) {
         self.note_custody_at(transition, transition.always_takes_custody());
     }
 
@@ -306,7 +306,7 @@ impl Terminal {
     /// and a press class that started disturbing still fails as the transition
     /// it is.
     #[inline]
-    pub fn note_custody_took(&mut self, transition: CustodyTransition) {
+    pub const fn note_custody_took(&mut self, transition: CustodyTransition) {
         self.last_custody_change = Some(transition);
     }
 
@@ -406,7 +406,7 @@ impl Terminal {
     /// site recorded rather than reading a stale tag.
     #[inline]
     #[cfg(any(test, debug_assertions))]
-    pub fn take_custody_transition(&mut self) -> Option<CustodyTransition> {
+    pub const fn take_custody_transition(&mut self) -> Option<CustodyTransition> {
         self.last_custody.take()
     }
 

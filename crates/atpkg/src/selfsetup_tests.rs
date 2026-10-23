@@ -1121,13 +1121,15 @@ fn an_uninstall_quits_the_caffeine_mug_and_removes_its_files() {
         "the rendezvous made for the cleanup stays: {out}"
     );
 
-    for kind in ["quit-fails", "unsupported", "busy"] {
+    // A direct bare `caffeine serve` can hold only the lock: no copied bundle, plist or saved
+    // Off state. A failed quit must still keep the executable needed to stop that mug.
+    for kind in ["quit-fails", "unsupported", "busy", "lock-only-quit-fails"] {
         let a = Account::new(kind);
         let support = a.home().join("Library/Application Support/aterm");
         let app = a.home().join("Applications/aterm.app");
         bundle(&app, None);
         let refuse = match kind {
-            "quit-fails" => "caffeine quit",
+            "quit-fails" | "lock-only-quit-fails" => "caffeine quit",
             "unsupported" => "help caffeine",
             _ => "never",
         };
@@ -1135,11 +1137,14 @@ fn an_uninstall_quits_the_caffeine_mug_and_removes_its_files() {
             &app.join("Contents/MacOS/aterm"),
             &format!("#!/bin/sh\n[ \"$*\" = '{refuse}' ] && exit 1\nexit 0\n"),
         );
-        write(&support.join("caffeine.state"), "mode=off\n");
-        write(&support.join("caffeine-code.noindex/keep"), "copy bytes");
+        let lock_only = kind == "lock-only-quit-fails";
+        if !lock_only {
+            write(&support.join("caffeine.state"), "mode=off\n");
+            write(&support.join("caffeine-code.noindex/keep"), "copy bytes");
+        }
         let lock = support.join("caffeine.lock");
         write(&lock, "");
-        let held = (kind == "busy").then(|| {
+        let held = (kind == "busy" || lock_only).then(|| {
             crate::lock::Flock::try_lock(std::fs::File::open(&lock).expect("open")).expect("hold")
         });
         let before = tree(&support);
@@ -1149,17 +1154,19 @@ fn an_uninstall_quits_the_caffeine_mug_and_removes_its_files() {
             "unconfirmed cleanup must report a partial result: {kind}: {out}{err}"
         );
         assert_eq!(tree(&support), before, "{kind}");
-        assert_eq!(
-            std::fs::read_to_string(support.join("caffeine.state")).expect("state"),
-            "mode=off\n"
-        );
-        assert_eq!(
-            std::fs::read_to_string(support.join("caffeine-code.noindex/keep")).expect("copy"),
-            "copy bytes"
-        );
+        if !lock_only {
+            assert_eq!(
+                std::fs::read_to_string(support.join("caffeine.state")).expect("state"),
+                "mode=off\n"
+            );
+            assert_eq!(
+                std::fs::read_to_string(support.join("caffeine-code.noindex/keep")).expect("copy"),
+                "copy bytes"
+            );
+        }
         assert_eq!(
             app.exists(),
-            kind == "quit-fails",
+            kind == "quit-fails" || lock_only,
             "only a failed step keeps its bundle: {kind}: {out}"
         );
         drop(held);

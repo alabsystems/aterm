@@ -1,21 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! **A10 — `notify`: the push to a human, and the failure it chooses.**
-//!
-//! The rung's claim is one sentence: `notify --on attention --exec <cmd>` runs
-//! the command exactly once per matching offset ACROSS A RESTART, and never more
-//! than the rate limit. Everything here is the real binary against a real broker
-//! on the fleet's loopback TCP wire, with a real `/bin/sh` child doing the notifying.
-//!
-//! ## No sleeps as synchronisation
-//!
-//! `--once` catches the bus up to its head and exits, so most of this file is
-//! run-assert-run with nothing to race. The one test that follows the bus live
-//! waits on the DURABLE JOURNAL — the file written after the command returns —
-//! and never on the command's own output, because the window between those two
-//! writes is precisely the in-doubt window another test crashes inside on
-//! purpose. Waiting on the wrong one of the two would be a coin flip.
+//! Integration tests for `aterm ctl notify` across restarts, rate limits, and broker ordering.
 
 #![cfg(unix)]
 #![allow(
@@ -64,7 +50,6 @@ impl Watch {
     }
 
     /// The `--exec` line every test uses unless it says otherwise: one line per
-    /// notification, carrying the three facts the assertions read.
     fn appender(&self) -> String {
         format!(
             "printf '%s dup=%s sup=%s\\n' \"$ATERM_NOTIFY_OFFSET\" \"$ATERM_NOTIFY_DUP\" \
@@ -159,7 +144,6 @@ impl Watch {
     }
 
     /// The persisted count of rate-dropped notifications the human has not been
-    /// told about yet.
     fn suppressed(&self) -> u64 {
         std::fs::read_to_string(self.state.join("notify/suppressed"))
             .ok()
@@ -178,8 +162,6 @@ impl Watch {
 }
 
 /// A follow-mode notifier that is killed when the test leaves, panic included.
-/// Started by `spawnfd`: it holds its stdio and nothing else of this process,
-/// not another test thread's pipe for as long as it follows.
 struct Follower(Option<aterm_uds::spawnfd::Child>);
 
 impl Follower {
@@ -211,7 +193,6 @@ fn raise_attention(fleet: &Fleet, who: &str, seq: u64, text: &str) -> u64 {
 }
 
 /// Publish one presence row for `who` carrying `fields` verbatim, and answer
-/// its offset. `seq` is the producer sequence, unique per row.
 fn presence_row(fleet: &Fleet, who: &str, seq: u64, fields: &str) -> u64 {
     let subject = format!("/f/{FLEET}/pub/n-alpha/{who}/presence");
     let body = format!("v=1 t={seq} {fields}");
@@ -231,12 +212,6 @@ fn offset_of(line: &str) -> u64 {
 }
 
 /// **THE RUNG.** One command per matching offset, and the second run of the
-/// notifier over the same records runs nothing at all.
-///
-/// The restart here is the real one: a whole process exit and a fresh
-/// `aterm link notify` against the same state dir, the same broker and the same
-/// records. Nothing is remembered in memory, and the broker's cursor is not what
-/// is being trusted — the journal in the state dir is.
 #[test]
 fn the_command_runs_exactly_once_per_matching_offset_across_a_restart() {
     let fleet = Fleet::boot("notify-once");
@@ -252,7 +227,6 @@ fn the_command_runs_exactly_once_per_matching_offset_across_a_restart() {
         run.stdout
     );
 
-    // THE RESTART. Same records, same state dir, nothing new on the bus.
     let again = w.once("attention", &[]);
     assert!(again.status.success(), "{}", again.stderr);
     assert_eq!(
@@ -266,10 +240,6 @@ fn the_command_runs_exactly_once_per_matching_offset_across_a_restart() {
         again.stdout
     );
 
-    // AND THE JOURNAL IS WHAT DOES IT, not the cursor. Take the cursor away —
-    // the file a lost disk, a copied state dir or a hand-edited `--since` can
-    // each produce — and re-scan the same records from zero. The verdicts are
-    // still there, so the command still does not run.
     std::fs::remove_file(w.state.join("notify/cur/attention")).expect("drop the cursor");
     let rescan = w.once("attention", &[]);
     assert!(rescan.status.success(), "{}", rescan.stderr);
@@ -284,7 +254,6 @@ fn the_command_runs_exactly_once_per_matching_offset_across_a_restart() {
         rescan.stdout
     );
 
-    // A NEW record is a new notification — the dedup is by offset, not a latch.
     let second = raise_attention(&fleet, "s-one", 2, "still needs a key");
     assert_ne!(second, first);
     let third = w.once("attention", &[]);
@@ -300,17 +269,6 @@ fn the_command_runs_exactly_once_per_matching_offset_across_a_restart() {
 }
 
 /// **A STANDING ATTENTION PAGES ONCE, HOWEVER OFTEN ITS ROW IS REWRITTEN**
-/// (r3-22).
-///
-/// Presence is a last-value face: the bridge writes a session's row again,
-/// standing `attention=` and all, on every attach — its first, each
-/// reconnect, the successor's after a seamless update — on each meta change,
-/// and in its `exited` row. Paged once per offset, one open escalation
-/// re-paged the human on every one of those and spent the budget a new
-/// escalation then found empty. Here the republishes page nobody and charge
-/// nothing — the negative control: offset dedup alone ran the command for
-/// each — another session's identical text pages, a clear and the same text
-/// again pages, and a fresh process remembers what stands.
 #[test]
 fn a_republished_standing_attention_pages_nobody_and_a_reraise_after_a_clear_does() {
     let fleet = Fleet::boot("notify-standing");
@@ -370,13 +328,6 @@ fn a_republished_standing_attention_pages_nobody_and_a_reraise_after_a_clear_doe
 }
 
 /// **The in-doubt window, entered on purpose.**
-///
-/// The journal says `firing` before the command is spawned and `fired` after it
-/// returns. A crash between the two leaves an entry nobody can resolve, and this
-/// rung resolves it by RUNNING THE COMMAND AGAIN — the duplicate is the failure
-/// it chooses, and the re-run says `dup=1` rather than pretending to be the
-/// first. The crash is real (`abort`, no destructors) and is timed from inside
-/// the process, because the window is microseconds wide.
 #[test]
 fn a_crash_between_the_exec_and_its_journal_entry_refires_and_says_dup() {
     let fleet = Fleet::boot("notify-doubt");
@@ -407,8 +358,6 @@ fn a_crash_between_the_exec_and_its_journal_entry_refires_and_says_dup() {
         w.journal()
     );
 
-    // The fault is one-shot (its marker is in the state dir), so the restart is
-    // an ordinary run against an entry it cannot resolve.
     let back = w.once("attention", &[]);
     assert!(back.status.success(), "{}", back.stderr);
     assert_eq!(
@@ -418,18 +367,12 @@ fn a_crash_between_the_exec_and_its_journal_entry_refires_and_says_dup() {
     );
     assert!(back.stdout.contains("dup=1"), "{}", back.stdout);
 
-    // And ONCE it is resolved it stays resolved: the third run does nothing.
     let settled = w.once("attention", &[]);
     assert!(settled.status.success(), "{}", settled.stderr);
     assert_eq!(w.fired().len(), 2, "a resolved offset never fires again");
 }
 
 /// **The rate limit drops nothing silently.**
-///
-/// Over budget, a matching record gets a durable `dropped` verdict, a line on
-/// stderr, and a bump of the persisted `suppressed` counter — which the next
-/// command that DOES run is told about in `$ATERM_NOTIFY_SUPPRESSED`. A human
-/// being rate-limited learns it from the notification itself.
 #[test]
 fn the_rate_limit_records_every_drop_and_tells_the_next_notification() {
     let fleet = Fleet::boot("notify-rate");
@@ -438,7 +381,6 @@ fn the_rate_limit_records_every_drop_and_tells_the_next_notification() {
         .map(|n| raise_attention(&fleet, "s-one", n, &format!("escalation {n}")))
         .collect();
 
-    // One per hour: the first fires, the other two are refused.
     let run = w.once("attention", &["--rate", "1/1h"]);
     assert!(run.status.success(), "{}", run.stderr);
     assert_eq!(w.fired(), vec![format!("{} dup=0 sup=0", offs[0])]);
@@ -463,10 +405,6 @@ fn the_rate_limit_records_every_drop_and_tells_the_next_notification() {
         );
     }
 
-    // A DROPPED OFFSET IS TERMINAL — it is not re-offered when the budget is
-    // raised, because a queue of deferred 3 a.m. pushes arriving later is its own
-    // kind of noise. What the human gets instead is the count, on the next real
-    // notification.
     let fourth = raise_attention(&fleet, "s-one", 4, "escalation 4");
     let after = w.once("attention", &["--rate", "3/1h"]);
     assert!(after.status.success(), "{}", after.stderr);
@@ -486,11 +424,6 @@ fn the_rate_limit_records_every_drop_and_tells_the_next_notification() {
 }
 
 /// **A record's body never becomes a command.**
-///
-/// `--exec` is the operator's own shell line; every fact about the record
-/// arrives in the environment, flattened to printable ASCII and capped. A
-/// stranger holding a cap can put any bytes in an `attention=`, and none of them
-/// can reach `/bin/sh` as syntax.
 #[test]
 fn an_attention_string_cannot_become_a_shell_word() {
     let fleet = Fleet::boot("notify-inject");
@@ -517,14 +450,6 @@ fn an_attention_string_cannot_become_a_shell_word() {
 }
 
 /// **Follow mode, a `SIGKILL`, and a restart.**
-///
-/// The daemon shape: one subscription per selector, live. It is killed with no
-/// warning while it is idle, and the restart neither re-runs what already fired
-/// nor misses what arrived while it was dead.
-///
-/// The wait before the kill is on the JOURNAL, not on the command's own output:
-/// the journal line is written after the command returns, so waiting on it puts
-/// the kill outside the in-doubt window rather than racing it.
 #[test]
 fn a_follow_mode_notifier_survives_a_kill_and_neither_repeats_nor_misses() {
     let fleet = Fleet::boot("notify-follow");
@@ -542,7 +467,6 @@ fn a_follow_mode_notifier_survives_a_kill_and_neither_repeats_nor_misses() {
 
     daemon.kill();
 
-    // Published while nothing was watching: the cursor is what catches it up.
     let second = raise_attention(&fleet, "s-one", 2, "two");
     let back = w.once("attention", &[]);
     assert!(back.status.success(), "{}", back.stderr);
@@ -560,9 +484,6 @@ fn a_follow_mode_notifier_survives_a_kill_and_neither_repeats_nor_misses() {
 }
 
 /// A follow-mode reader may have a deep, slow backlog while another selector
-/// has a fresh halt. Catching up all selectors serially before starting their
-/// subscriptions put the halt behind every attention command; each reader now
-/// pages independently and hands records to the one serial executor.
 #[test]
 fn a_slow_attention_catch_up_does_not_put_halt_behind_its_whole_backlog() {
     let fleet = Fleet::boot("notify-parallel-catchup");
@@ -587,8 +508,6 @@ fn a_slow_attention_catch_up_does_not_put_halt_behind_its_whole_backlog() {
         )
         .expect("publish halt")
         .0;
-    // The first attention is real work that gives both readers time to start.
-    // The wait is part of the operator command, not test synchronisation.
     let exec = format!(
         "if [ \"$ATERM_NOTIFY_OFFSET\" = \"{}\" ]; then sleep 1; fi; {}",
         attention[0],
@@ -609,7 +528,6 @@ fn a_slow_attention_catch_up_does_not_put_halt_behind_its_whole_backlog() {
 }
 
 /// `--since=head` is an initial cut, not a fresh cut on every restart. Follow
-/// mode persists that first head before subscribing, even when the log is idle.
 #[test]
 fn follow_since_head_keeps_its_initial_cut_across_an_idle_restart() {
     let fleet = Fleet::boot("notify-head-restart");
@@ -630,10 +548,6 @@ fn follow_since_head_keeps_its_initial_cut_across_an_idle_restart() {
 }
 
 /// Tier-1 for `NotifyFollowCheckpoint`: the reader can offer a page mark after
-/// handing its last record to the executor, while that record's command is
-/// still running. The durable cursor must stop before that record until its
-/// command and journal verdict complete. A premature page checkpoint would
-/// skip it after a crash.
 #[test]
 fn a_page_checkpoint_waits_for_the_last_notification_command() {
     let fleet = Fleet::boot("notify-page-checkpoint");
@@ -724,13 +638,6 @@ fn a_page_checkpoint_waits_for_the_last_notification_command() {
 }
 
 /// **Every selector is a real broker filter, read with the cap that holds
-/// it.** `ask:h-andrew` is an ask ADDRESSED TO h-andrew — the subject a
-/// session's `post to=h-andrew kind=ask` lands on — read with h-andrew's own
-/// ring (`mint-for h-andrew`); `halt` with node.cap's fleet grant. Both are
-/// matched by position at the broker and again by the reader, and both reach
-/// the same journal and the same budget. And the guarded broker is the
-/// negative control: node.cap alone grants no person's mail, and `notify`
-/// says so at once, naming the cap to mint, instead of retrying for ever.
 #[test]
 fn ask_and_halt_select_the_records_they_name_and_nothing_else() {
     let fleet = Fleet::boot("notify-sel");
@@ -743,9 +650,6 @@ fn ask_and_halt_select_the_records_they_name_and_nothing_else() {
             .expect("publish")
             .0
     };
-    // Three decoys and two hits: an ask FROM h-andrew, another kind to
-    // h-andrew, an ask to someone else, the ask to h-andrew, and a halt
-    // coming on.
     publish(
         1,
         &format!("/f/{FLEET}/in/n-a/s-b/h-andrew/ask"),
@@ -786,7 +690,6 @@ fn ask_and_halt_select_the_records_they_name_and_nothing_else() {
         "only the ask addressed to h-andrew and the halt coming ON"
     );
 
-    // node.cap alone: the ask selector reads a lane no grant covers.
     let node = Watch::new(
         &fleet,
         "sel-node",
@@ -804,15 +707,6 @@ fn ask_and_halt_select_the_records_they_name_and_nothing_else() {
 }
 
 /// **A COMMAND THAT DID NOT DELIVER DOES NOT CLEAR THE SUPPRESSED COUNT.**
-///
-/// The count exists so that a human being rate-limited learns it from the
-/// notification itself rather than from silence (the module header). A command
-/// that exits 127 (`curl` gone from `PATH`) or fails to spawn must keep the
-/// count, or the human is never told the dropped escalations existed.
-///
-/// `rc=0` is the only verdict that says the command was told. Everything else
-/// keeps the count for the next command that answers it — told twice, never
-/// untold, which is the direction every other choice in this file takes.
 #[test]
 fn a_command_that_did_not_deliver_does_not_clear_the_suppressed_count() {
     let fleet = Fleet::boot("notify-sup");
@@ -821,15 +715,11 @@ fn a_command_that_did_not_deliver_does_not_clear_the_suppressed_count() {
         .map(|n| raise_attention(&fleet, "s-one", n, &format!("escalation {n}")))
         .collect();
 
-    // One per hour: the first fires, two are refused and counted.
     let run = w.once("attention", &["--rate", "1/1h"]);
     assert!(run.status.success(), "{}", run.stderr);
     assert_eq!(w.fired(), vec![format!("{} dup=0 sup=0", offs[0])]);
     assert_eq!(w.suppressed(), 2, "two drops are on disk: {}", run.stdout);
 
-    // THE OPERATOR'S COMMAND IS GONE. `--exec` is run through `/bin/sh`, so a
-    // missing program is a shell exit of 127 rather than a failed spawn — the
-    // finding's own scenario, and the one that actually happens.
     let fourth = raise_attention(&fleet, "s-one", 4, "escalation 4");
     let broken = w.once_with(
         "attention",
@@ -856,8 +746,6 @@ fn a_command_that_did_not_deliver_does_not_clear_the_suppressed_count() {
         broken.stdout
     );
 
-    // AND THE NEXT COMMAND THAT DOES RUN IS TOLD, which is the whole point of
-    // keeping it.
     let fifth = raise_attention(&fleet, "s-one", 5, "escalation 5");
     let ok = w.once("attention", &["--rate", "9/1h"]);
     assert!(ok.status.success(), "{}", ok.stderr);
@@ -873,23 +761,6 @@ fn a_command_that_did_not_deliver_does_not_clear_the_suppressed_count() {
 }
 
 /// **ON A BROKER THAT SERVES ORDERED, A FOLLOWER PAGES AN ATTENTION ROW ONLY
-/// ONCE IT IS DURABLE** (`aterm_link::notify`'s module doc). The fleet's
-/// broker opens as aterm opens an ordered one, with aterm's table, but with
-/// NO HORIZON, so nothing moves its durable head but an escalated record or
-/// a flush asked for. An attention row (a presence record: not escalated) is
-/// read and HELD — the follower says so on stderr, and that line is the
-/// event this waits on — and nothing has paged when it is said; once the
-/// broker flushes in full (`flush_durable`), its durable mark reaches the
-/// subscription and the row pages, once.
-///
-/// NEGATIVE CONTROL, the notifier before the wait (the
-/// `ATERM_LINK_NOTIFY_PAGE_EARLY` dev seam): a second follower on the same
-/// broker pages its row with no flush at all — while the record is NOT on
-/// stable media, the page a power loss on the broker's host could leave
-/// pointing at nothing.
-///
-/// Where astream serves ordered strict (off Apple) every record is durable
-/// when visible: the test says so and stops.
 #[test]
 fn an_ordered_brokers_attention_pages_once_it_is_durable() {
     let mut opts = harness::broker_opts(aterm_link::durability::Durability::Ordered);
@@ -919,7 +790,6 @@ fn an_ordered_brokers_attention_pages_once_it_is_durable() {
     });
     assert_eq!(w.fired(), vec![format!("{held} dup=0 sup=0")]);
 
-    // NEGATIVE CONTROL: the wait turned off pages before any full flush.
     let early = Watch::attention(&fleet, "early");
     let _control = early.follow_env(
         "attention",

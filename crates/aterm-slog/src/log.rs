@@ -1,64 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! One session's log (design §2.3, §5.1): a ring bounded by BOTH a record
-//! count and an encoded size, evicting LEVEL-AWARE and counting every loss
-//! exactly, with the open/close discipline of §2.3 enforced by the API and
-//! the fold kept beside the ring.
-//!
-//! - **Eviction** ([`evict_class`], THE policy). A ring past its limits
-//!   evicts in one batch down to its low-water mark ([`low_water`]), oldest
-//!   first within each class, in this order: detail of closed structure
-//!   ([`EvictClass::ClosedDetail`]); the open records of closed runs and turns
-//!   (their close records carry the rollup); the close records of runs and
-//!   turns while those alone pass half the budget ([`closes_over_half`]);
-//!   current detail ([`EvictClass::OpenDetail`]); then the remaining closes.
-//!   The open records of open nodes and the session's own open and close
-//!   ([`EvictClass::Pinned`]) are never evicted, nor the record just
-//!   appended, nor a close whose subtree holds that record. Detail is
-//!   anchored by its nearest turn, and detail hanging from a run or the
-//!   session is current only while it is newer than the newest run or turn
-//!   that closed beneath that node: a verdict mark from three turns ago is
-//!   history, not the present.
-//!   While the host keeps timeline rows ([`Log::keep_rows`], `log_rows`),
-//!   the newest of them, up to a quarter of the ring ([`row_floor`]), go
-//!   only after every other record the batch may take.
-//! - **Losses** are counted where they happened: into the log's `lost`, and
-//!   into the rollup of the record's nearest open node (a closed node's
-//!   rollup is already written).
-//! - **Opening.** A child opens only under an open parent; with none, it
-//!   attaches to the nearest open ancestor and carries `orphan=1`. A parent
-//!   is never invented.
-//! - **Closing.** Closing a node first closes its open descendants,
-//!   innermost first, with `out=gone`. A node closes exactly once. A new
-//!   turn closes an unclosed turn under the same run with `out=superseded`.
-//!   Every close carries its node's rollup, and a turn's close restates its
-//!   open's `ledger=` (plan 5F-4a), so a close outliving its open still
-//!   names its exchange.
-//! - **Ids.** `r<n>`, `t<n>` and `p<n>` count per level and are never
-//!   reused while the session lives: a successor continues the
-//!   predecessor's counters ([`Log::after_handoff`], [`IdCounters`]).
-//! - **Owned keys.** The log writes `orphan=` on an open and `out=`,
-//!   `dur_ms=`, `dur=` and the rollup on a close; a caller's fields never
-//!   carry them ([`Close::dur_ms`] and [`Close::dur_wall`] give a duration
-//!   measured elsewhere, a block's stamps say).
-//! - **Readers** pull with a [`Cursor`], the `aterm_buffer` contract: seqs
-//!   are monotone and `since` is exclusive. A read that covers a record the
-//!   reader will never see gets a [`Gap`] with the exact count; level-aware
-//!   eviction takes records from the middle of the window, so the count may
-//!   be spread among the records returned, whose seqs show where (see
-//!   [`Log::read`]). Seqs this log never held (an update's overlap,
-//!   [`Log::skip_to`]) are no loss of its own: a read across them says
-//!   [`GapWhy::Handoff`].
-//! - **The fold** ([`Fold`]) is applied as each record is appended and lives
-//!   outside the ring, so eviction never changes the current state.
-//!
-//! An update that carries no records starts a fresh log with
-//! [`Log::after_handoff`], whose first record is `gap why=handoff`; its seqs
-//! go on past the predecessor's (the host carries the count with a reserve,
-//! §2.2), so no seq names two records of the session. A reader holding a
-//! cursor of the old epoch gets [`GapWhy::Reset`] and drops it, which needs
-//! the reader's epoch: see [`Log::read`].
+//! One session's log (design §2.3, §5.1): a ring bounded by BOTH a record count and an encoded size, evicting LEVEL-AWARE and counting every loss exactly, with the open/close discipline of §2.3 enforced by the API and the fold kept beside the ring.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
@@ -103,25 +46,12 @@ pub const MAX_BYTES: usize = 256 * 1024;
 /// The most nodes open at once; a deeper open is refused.
 pub const MAX_OPEN: usize = 64;
 /// How many closed nodes' parents the log remembers, to find a closed
-/// parent's nearest open ancestor.
 const CLOSED_PARENTS: usize = 64;
-/// How many update overlaps (seq ranges this log never held, [`Log::skip_to`])
-/// a log remembers. Past it the oldest is dropped and the log accounts only
-/// for seqs after it ([`Log::complete_from`]): a reader of an earlier epoch
-/// behind that point is reset, never told a wrong count.
+/// How many update overlaps (seq ranges this log never held, [`Log::skip_to`]) a log remembers.
 pub const MAX_HOLES: usize = 64;
-/// THE SEQ LIMIT: no log's seq passes it by much. A carried head
-/// ([`Log::from_carry`]) or a count a successor is told to continue from
-/// ([`Log::after_handoff`], [`CarryAdopt::next_seq`]) past it is a corrupt or
-/// foreign file, never a log's own (at a million records a second a session
-/// takes some 146,000 years to reach it), and is refused or read as none. So
-/// a host's reserve above every seq a log holds always fits the signed 64 bits
-/// a TOML manifest writes, and a ceiling drawn from it is always above the
-/// log's head.
+/// THE SEQ LIMIT: no log's seq passes it by much.
 pub const SEQ_LIMIT: u64 = 1 << 62;
 /// The longest parent chain the log walks (a run under a run under a run …
-/// is opened only under open nodes, so no chain is longer than the most nodes
-/// open at once).
 const MAX_DEPTH: usize = MAX_OPEN + 2;
 
 /// A ring's bounds: whichever is reached first evicts.
@@ -140,8 +70,7 @@ impl Limits {
         bytes: MAX_BYTES,
     };
 
-    /// Bounds of at least one record and one largest record's bytes (so the
-    /// record just appended is never the one evicted), or `None`.
+    /// Bounds of at least one record and one largest record's bytes (so the record just appended is never the one evicted), or `None`.
     #[must_use]
     pub const fn new(records: usize, bytes: usize) -> Option<Limits> {
         if records == 0 || bytes < MAX_RECORD_BYTES {
@@ -152,16 +81,13 @@ impl Limits {
     }
 }
 
-/// Whether a ring holding `records` records of `bytes` encoded bytes is past
-/// `limits`: when an append starts an eviction batch.
+/// Whether a ring holding `records` records of `bytes` encoded bytes is past `limits`: when an append starts an eviction batch.
 #[must_use]
 pub const fn over_limits(records: usize, bytes: usize, limits: Limits) -> bool {
     records > limits.records || bytes > limits.bytes
 }
 
-/// Where an eviction batch stops: an eighth under each bound (at least one
-/// record and one largest record's bytes), so a full ring classifies its
-/// records once per eighth of its budget, not on every append.
+/// Where an eviction batch stops: an eighth under each bound (at least one record and one largest record's bytes), so a full ring classifies its records once per eighth of its budget, not on every append.
 #[must_use]
 pub const fn low_water(l: Limits) -> Limits {
     let slack_records = if l.records / 8 > 1 { l.records / 8 } else { 1 };
@@ -176,41 +102,31 @@ pub const fn low_water(l: Limits) -> Limits {
     }
 }
 
-/// Whether the live close records of runs and turns (`count` of them,
-/// `bytes` encoded) alone pass half of `l`: only then is a close evicted
-/// before current detail (§5.1's third class).
+/// Whether the live close records of runs and turns (`count` of them, `bytes` encoded) alone pass half of `l`: only then is a close evicted before current detail (§5.1's third class).
 #[must_use]
 pub const fn closes_over_half(count: usize, bytes: usize, l: Limits) -> bool {
     count.saturating_mul(2) > l.records || bytes.saturating_mul(2) > l.bytes
 }
 
-/// A record's eviction class (§5.1), in the order a batch takes them:
-/// [`EvictClass::ClosedDetail`] first, [`EvictClass::Pinned`] never.
+/// A record's eviction class (§5.1), in the order a batch takes them: [`EvictClass::ClosedDetail`] first, [`EvictClass::Pinned`] never.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum EvictClass {
-    /// Detail of closed structure: marks, amends, gaps and step records under
-    /// a closed turn (or a closed run, or a node gone from the index), and
-    /// detail hanging from an open run or the session that is older than the
-    /// newest run or turn closed beneath it.
+    /// Detail of closed structure: marks, amends, gaps and step records under a closed turn (or a closed run, or a node gone from the index), and detail hanging from an open run or the session that is older than the newest run or turn closed beneath it.
     ClosedDetail,
     /// The open record of a closed run or turn: its close carries the rollup.
     ClosedOpen,
-    /// The close record of a run or turn (taken before current detail only
-    /// while the closes pass half the budget, [`closes_over_half`]).
+    /// The close record of a run or turn (taken before current detail only while the closes pass half the budget, [`closes_over_half`]).
     CloseRecord,
-    /// Current detail: under an open turn, or hanging from an open run or the
-    /// session and newer than every run or turn closed beneath it.
+    /// Current detail: under an open turn, or hanging from an open run or the session and newer than every run or turn closed beneath it.
     OpenDetail,
-    /// Never evicted: the open record of an open node, the session's own
-    /// open and close.
+    /// Never evicted: the open record of an open node, the session's own open and close.
     Pinned,
 }
 
 /// What [`evict_class`] needs to know of a node the log indexes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NodeView {
-    /// Its parent ([`Node::INSTANCE`]: not known, a closed node whose open
-    /// record and parent this log no longer holds).
+    /// Its parent ([`Node::INSTANCE`]: not known, a closed node whose open record and parent this log no longer holds).
     pub parent: Node,
     /// Whether it is open.
     pub open: bool,
@@ -218,12 +134,7 @@ pub struct NodeView {
     pub closed_below: u64,
 }
 
-/// THE EVICTION CLASS of `r` (§5.1), given the log's index of nodes (`node`:
-/// `None` for a node the log no longer indexes, which is closed). Detail is
-/// anchored at its nearest turn ancestor-or-self: an open one keeps it
-/// current. Detail with no turn above it is anchored at the run or session
-/// it hangs from, and is current only while that node is open and the
-/// record is newer than every run or turn closed beneath it.
+/// THE EVICTION CLASS of `r` (§5.1), given the log's index of nodes (`node`: `None` for a node the log no longer indexes, which is closed).
 #[must_use]
 pub fn evict_class(r: &Rec, node: impl Fn(Node) -> Option<NodeView>) -> EvictClass {
     if r.node == Node::SESSION && matches!(r.op, Op::Open | Op::Close) {
@@ -264,7 +175,7 @@ pub fn evict_class(r: &Rec, node: impl Fn(Node) -> Option<NodeView>) -> EvictCla
     EvictClass::ClosedDetail
 }
 
-/// Why an append was refused. A refused append changes nothing.
+/// Why an append was refused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Refused {
     /// The node is not open (a node closes exactly once).
@@ -285,10 +196,7 @@ pub enum Refused {
     SessionClosed,
     /// The session was already opened.
     AlreadyOpen,
-    /// A closed node the log no longer places: no record of its subtree is
-    /// live and its close is older than the last [`CLOSED_PARENTS`] closes,
-    /// so where it hung is not known, and an amend of it could be classed and
-    /// counted only by a guess ([`Log::amend`]).
+    /// A closed node the log no longer places: no record of its subtree is live and its close is older than the last [`CLOSED_PARENTS`] closes, so where it hung is not known, and an amend of it could be classed and counted only by a guess ([`Log::amend`]).
     Forgotten(Node),
 }
 
@@ -298,13 +206,12 @@ impl From<FieldError> for Refused {
     }
 }
 
-/// What opens a node. The level is the kind's ([`Kind::node_level`]).
+/// What opens a node.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Open {
     /// The node's kind.
     pub kind: Kind,
-    /// The parent asked for; `None` is the deepest open node that is a
-    /// natural parent of the kind's level.
+    /// The parent asked for; `None` is the deepest open node that is a natural parent of the kind's level.
     pub under: Option<Node>,
     /// Where the fact was observed.
     pub src: Src,
@@ -319,7 +226,7 @@ pub struct Open {
 impl Open {
     /// An open of `kind` with no parent named, no attribution, no fields.
     #[must_use]
-    pub fn new(kind: Kind, src: Src, conf: Conf) -> Open {
+    pub const fn new(kind: Kind, src: Src, conf: Conf) -> Open {
         Open {
             kind,
             under: None,
@@ -332,14 +239,14 @@ impl Open {
 
     /// Under `parent`.
     #[must_use]
-    pub fn under(mut self, parent: Node) -> Open {
+    pub const fn under(mut self, parent: Node) -> Open {
         self.under = Some(parent);
         self
     }
 
     /// Attributed to `by`.
     #[must_use]
-    pub fn by(mut self, by: Actor) -> Open {
+    pub const fn by(mut self, by: Actor) -> Open {
         self.by = by;
         self
     }
@@ -352,14 +259,12 @@ impl Open {
     }
 }
 
-/// A duration the host measured itself, in place of the log's own
-/// monotonic difference.
+/// A duration the host measured itself, in place of the log's own monotonic difference.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Dur {
     /// Measured on one process's monotonic clock (`dur_ms=`).
     Mono(u64),
-    /// Computed from wall stamps, such as a shell block's (`dur_ms= dur=wall`,
-    /// §3.5).
+    /// Computed from wall stamps, such as a shell block's (`dur_ms= dur=wall`, §3.5).
     Wall(u64),
 }
 
@@ -374,19 +279,16 @@ pub struct Close {
     pub conf: Conf,
     /// Attribution.
     pub by: Actor,
-    /// The duration, when the host measured it (a block the sweep saw only
-    /// complete has its own stamps); `None` is the log's monotonic
-    /// difference since the open.
+    /// The duration, when the host measured it (a block the sweep saw only complete has its own stamps); `None` is the log's monotonic difference since the open.
     pub dur: Option<Dur>,
     /// Fields beside the outcome, duration and rollup (`code=`, `blk=`).
-    /// The keys the log owns ([`Log::close`]) are refused here.
     pub f: Fields,
 }
 
 impl Close {
     /// A close with `out`, no attribution, no fields.
     #[must_use]
-    pub fn new(out: Out, src: Src, conf: Conf) -> Close {
+    pub const fn new(out: Out, src: Src, conf: Conf) -> Close {
         Close {
             out,
             src,
@@ -399,7 +301,7 @@ impl Close {
 
     /// Attributed to `by`.
     #[must_use]
-    pub fn by(mut self, by: Actor) -> Close {
+    pub const fn by(mut self, by: Actor) -> Close {
         self.by = by;
         self
     }
@@ -413,26 +315,20 @@ impl Close {
 
     /// With a duration measured on the host's monotonic clock.
     #[must_use]
-    pub fn dur_ms(mut self, ms: u64) -> Close {
+    pub const fn dur_ms(mut self, ms: u64) -> Close {
         self.dur = Some(Dur::Mono(ms));
         self
     }
 
-    /// With a duration computed from wall stamps (written `dur=wall`): a run
-    /// rebuilt from a shell block passes the block's end stamp as the close's
-    /// `at` and its start-to-end wall difference here.
+    /// With a duration computed from wall stamps (written `dur=wall`): a run rebuilt from a shell block passes the block's end stamp as the close's `at` and its start-to-end wall difference here.
     #[must_use]
-    pub fn dur_wall(mut self, ms: u64) -> Close {
+    pub const fn dur_wall(mut self, ms: u64) -> Close {
         self.dur = Some(Dur::Wall(ms));
         self
     }
 }
 
-/// Whether the log writes `key` itself on a record of `op`: `orphan=` on an
-/// open; the outcome, duration and rollup on a close; and `op_by=` (a turn
-/// close's restated opener) on none but the log's own
-/// close, so no caller writes it on any record. A caller's fields carrying
-/// one are refused, so a close always says what the log decided.
+/// Whether the log writes `key` itself on a record of `op`: `orphan=` on an open; the outcome, duration and rollup on a close; and `op_by=` (a turn close's restated opener) on none but the log's own close, so no caller writes it on any record.
 #[must_use]
 pub fn log_owned(op: Op, key: Key) -> bool {
     if key == Key::OpBy {
@@ -472,8 +368,7 @@ fn refuse_owned(op: Op, f: &Fields) -> Result<(), Refused> {
 pub struct Mark {
     /// The mark's kind.
     pub kind: Kind,
-    /// The node it attaches to; `None` (or a node not open) is the deepest
-    /// open node.
+    /// The node it attaches to; `None` (or a node not open) is the deepest open node.
     pub at: Option<Node>,
     /// Where observed.
     pub src: Src,
@@ -488,7 +383,7 @@ pub struct Mark {
 impl Mark {
     /// A mark of `kind` on the deepest open node.
     #[must_use]
-    pub fn new(kind: Kind, src: Src, conf: Conf) -> Mark {
+    pub const fn new(kind: Kind, src: Src, conf: Conf) -> Mark {
         Mark {
             kind,
             at: None,
@@ -501,14 +396,14 @@ impl Mark {
 
     /// On `node`.
     #[must_use]
-    pub fn at(mut self, node: Node) -> Mark {
+    pub const fn at(mut self, node: Node) -> Mark {
         self.at = Some(node);
         self
     }
 
     /// Attributed to `by`.
     #[must_use]
-    pub fn by(mut self, by: Actor) -> Mark {
+    pub const fn by(mut self, by: Actor) -> Mark {
         self.by = by;
         self
     }
@@ -539,7 +434,7 @@ pub struct Amend {
 impl Amend {
     /// An amend of a `kind` node with fields `f`, no attribution.
     #[must_use]
-    pub fn new(kind: Kind, src: Src, conf: Conf, f: Fields) -> Amend {
+    pub const fn new(kind: Kind, src: Src, conf: Conf, f: Fields) -> Amend {
         Amend {
             kind,
             src,
@@ -551,14 +446,13 @@ impl Amend {
 
     /// Attributed to `by`.
     #[must_use]
-    pub fn by(mut self, by: Actor) -> Amend {
+    pub const fn by(mut self, by: Actor) -> Amend {
         self.by = by;
         self
     }
 }
 
 /// How a close is written: the outcome, its provenance and a host-measured
-/// duration (the named node's only, never a cascaded descendant's).
 #[derive(Clone, Copy, Debug)]
 struct Ender {
     out: Out,
@@ -571,23 +465,17 @@ struct Ender {
 /// Why records were lost (`gap why=`), and why a reader's cursor broke.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum GapWhy {
-    /// A seamless update: one that carried nothing (its successor's first
-    /// record), or, for a reader, a read across the seqs a carried update's
-    /// outgoing process may have written after the carry was taken
-    /// ([`Log::skip_to`]): those records are not here and nobody counted
-    /// them, so the gap's `lost` is a lower bound.
+    /// A seamless update: one that carried nothing (its successor's first record), or, for a reader, a read across the seqs a carried update's outgoing process may have written after the carry was taken ([`Log::skip_to`]): those records are not here and nobody counted them, so the gap's `lost` is a lower bound.
     Handoff,
     /// The previous process died.
     Crash,
     /// Journal segments were pruned.
     Pruned,
-    /// A ring evicted them: the log's own, or the history a producer reads
-    /// (the terminal's block list) before the producer reached them.
+    /// A ring evicted them: the log's own, or the history a producer reads (the terminal's block list) before the producer reached them.
     Evicted,
     /// The cursor belongs to another epoch (or is ahead of the log).
     Reset,
-    /// A journal read stopped at its byte budget before it reached them
-    /// (design §5.3, phase 2B): they may be on disk, unread by this reply.
+    /// A journal read stopped at its byte budget before it reached them (design §5.3, phase 2B): they may be on disk, unread by this reply.
     Unread,
 }
 
@@ -605,8 +493,7 @@ impl GapWhy {
         }
     }
 
-    /// The why a `why=` word names, or `None` for a word this build does not
-    /// know.
+    /// The why a `why=` word names, or `None` for a word this build does not know.
     #[must_use]
     pub fn from_word(word: &str) -> Option<GapWhy> {
         [
@@ -623,12 +510,6 @@ impl GapWhy {
 }
 
 /// A reader's position: the epoch it read and the last seq it holds.
-/// `since` is exclusive: a read returns records after `seq`.
-///
-/// `ep` must be the epoch the reader was last told (a reply's `ep=`), never
-/// the log's own: an update that carries no records starts a new accounting
-/// epoch even though seqs continue beyond its predecessor. A verb that takes
-/// `since=` takes `ep=` beside it so that old cursors can be reset correctly.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Cursor {
     /// The epoch the seq belongs to.
@@ -645,21 +526,14 @@ impl Cursor {
     }
 }
 
-/// What a reader is told when the seqs a read covers hold records it will
-/// never see, or another process's (or holds another epoch's cursor).
+/// What a reader is told when the seqs a read covers hold records it will never see, or another process's (or holds another epoch's cursor).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Gap {
     /// Evicted, across an update's overlap, or the cursor was reset.
     pub why: GapWhy,
-    /// Exactly how many records of the covered seqs (the cursor's, exclusive,
-    /// to the read's `next`) this log held and the reader will never see: the
-    /// ones before `resync_to` and any evicted from between the records
-    /// returned (whose seqs show where). Across an update's overlap
-    /// ([`GapWhy::Handoff`]) a lower bound: the outgoing process's records
-    /// after its carry were never counted.
+    /// Exactly how many records of the covered seqs (the cursor's, exclusive, to the read's `next`) this log held and the reader will never see: the ones before `resync_to` and any evicted from between the records returned (whose seqs show where).
     pub lost: u64,
-    /// The seq to resume after: the records returned begin past it (the
-    /// first record's seq less one; the read's `next` when none is returned).
+    /// The seq to resume after: the records returned begin past it (the first record's seq less one; the read's `next` when none is returned).
     pub resync_to: u64,
 }
 
@@ -674,9 +548,7 @@ pub struct Read<'a> {
     pub next: Cursor,
 }
 
-/// A [`Read`] that hands out the ring's own shared records
-/// ([`Log::read_shared`]): a reader keeps one past the read with
-/// `Arc::clone`, a count bump, never a copy of its fields.
+/// A [`Read`] that hands out the ring's own shared records ([`Log::read_shared`]): a reader keeps one past the read with `Arc::clone`, a count bump, never a copy of its fields.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SharedRead<'a> {
     /// The gap the reader crossed, if any.
@@ -712,7 +584,6 @@ pub struct Rollup {
 
 impl Rollup {
     /// `tools=shell:9,edit:8`: classes by count, most first, within the
-    /// key's 64-byte cap.
     fn tools_word(&self) -> Option<String> {
         let mut by: Vec<(u32, &str)> = self
             .tools
@@ -737,7 +608,6 @@ impl Rollup {
     }
 
     /// The rollup's fields in the order a close carries them (zero
-    /// counters left out).
     fn fields(&self) -> Vec<(Key, Val)> {
         let mut v = Vec::new();
         for (key, n) in [
@@ -781,15 +651,11 @@ pub struct OpenEntry {
     pub orphan: bool,
     /// Its counters so far.
     pub roll: Rollup,
-    /// Whether it opened in another process (a seamless update carried it):
-    /// its `mono` is this process's clock clamped, so a close measures it on
-    /// the wall clock (`dur_ms= dur=wall`, §3.5).
+    /// Whether it opened in another process (a seamless update carried it): its `mono` is this process's clock clamped, so a close measures it on the wall clock (`dur_ms= dur=wall`, §3.5).
     pub wall_clock: bool,
 }
 
-/// The last node id issued per numbered level. A successor's log continues
-/// them ([`Log::after_handoff`]), so `t17` names one turn for as long as the
-/// session lives (§2.2), across an update that carries no records.
+/// The last node id issued per numbered level.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct IdCounters {
     /// The last `r<n>`.
@@ -807,39 +673,19 @@ impl IdCounters {
 }
 
 /// A live record and its encoded size. The record is shared with every
-/// reader that kept it ([`Log::read_shared`]); it never changes once
-/// appended.
 #[derive(Clone, Debug)]
 struct Entry {
     rec: Arc<Rec>,
     bytes: usize,
     /// The record's place in the bus class's dense count (phase 4, design
-    /// §5.5): `1..` for a bus-class record ([`Rec::is_bus_class`]), 0 for a
-    /// local one. Assigned at append whether or not anything mirrors, so a
-    /// mirror turned on later finds every record numbered; its only cost
-    /// with the mirror off is these 8 bytes a record ([`ENTRY_BYTES`]).
     ms: u64,
     /// THE RECORD'S PROCESS-CLOCK READING:
-    /// the `mono_ms` of the [`Stamp`] its append was given, so a view that
-    /// orders or ages records on this process's monotonic clock (the
-    /// timeline's `t_ms`) reads it off the record, never off the wall `t=`.
-    /// RAM ONLY: it is no field, so no tier encodes it, and neither the
-    /// journal nor the carry writes it. A record this process did not append
-    /// has none of its own: a carried one reads its wall time on this clock
-    /// ([`crate::turn::rebase`], clamped as a carried open node's is), and
-    /// one read back from a journal or a closed summary reads 0. Another 8
-    /// bytes a record ([`ENTRY_BYTES`]), which [`Log::footprint`] counts.
     mono: u64,
     /// THE ROWS IT STANDS FOR: its dense
-    /// row ids, when the host's rule flagged it as it was appended
-    /// (`log_rows`). RAM only, as `mono` is: another 8 bytes a record.
     row: rows::RowTag,
 }
 
 /// One node of the log's index: a node that is open, or whose subtree holds
-/// a live record (so every live record's parent chain can be walked, for the
-/// eviction class and for `log <node>`'s subtree, after the records that
-/// named its parents were evicted).
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct NodeInfo {
     /// Its parent ([`Node::INSTANCE`] when not known; the session is its own).
@@ -853,12 +699,7 @@ struct NodeInfo {
     open_bytes: usize,
 }
 
-/// THE JOURNAL'S WAKE (design §5.3): a host's dirty
-/// notifier, rung by every append and every eviction of a log it is installed
-/// in ([`Log::set_notify`]), so no producer path can write a record the host's
-/// journal writer is not woken for. The host's function sets its own flag and
-/// wakes its own writer; this crate only calls it (it spawns no thread). A
-/// log without one rings nothing.
+/// THE JOURNAL'S WAKE (design §5.3): a host's dirty notifier, rung by every append and every eviction of a log it is installed in ([`Log::set_notify`]), so no producer path can write a record the host's journal writer is not woken for.
 #[derive(Clone)]
 pub struct Notify(std::sync::Arc<dyn Fn() + Send + Sync>);
 
@@ -892,7 +733,6 @@ pub struct Log {
     ep: u32,
     limits: Limits,
     /// The byte budget evictions keep to (at most `limits.bytes`; lowered by
-    /// the host's instance-wide sweep, [`Log::set_byte_budget`]).
     budget_bytes: usize,
     ring: VecDeque<Entry>,
     bytes: usize,
@@ -908,9 +748,6 @@ pub struct Log {
     /// The first seq this log accounts for.
     first_seq: u64,
     /// Seq ranges (inclusive) this log never held, oldest first, each with
-    /// why a read across it says it was not held: an update's overlap
-    /// ([`GapWhy::Handoff`]), or, in a log a journal read built
-    /// ([`Log::from_journal`]), segments pruned or left unread.
     holes: VecDeque<(u64, u64, GapWhy)>,
     /// The last id issued per numbered level: run, turn, step.
     issued: [u32; 3],
@@ -924,16 +761,12 @@ pub struct Log {
     session_kind: Kind,
     session_roll: Rollup,
     /// Whether the session node opened in another process (its `mono` is
-    /// clamped; its close measures the wall clock).
     session_wall_clock: bool,
     /// The session's own open and close records' bytes (pinned).
     session_bytes: usize,
     /// An operation of several records is under way (a cascade of closes, a
-    /// supersede and its open): its batch runs once it is whole, so the
-    /// classes it reads are those of the structure the operation leaves.
     hold_batch: bool,
     /// Readers' fence while an update's carry stands ([`Log::fence_reads`]):
-    /// the seq they see up to, and the fold as it stood there.
     fence: Option<Box<(u64, Fold)>>,
     /// The live records' estimated heap ([`Log::footprint`]).
     heap: usize,
@@ -941,29 +774,18 @@ pub struct Log {
     /// The host's journal wake ([`Notify`]), if one is installed.
     notify: Option<Notify>,
     /// The newest seq the host's journal writer has taken
-    /// ([`Log::note_journaled`]), while one follows this log.
     journaled: Option<u64>,
     /// The bus class's count in this seq space (phase 4): the `ms` of the
-    /// newest bus-class record appended, evicted or not.
     ms_head: u64,
     /// [`Self::ms_head`] when the readers were fenced ([`Log::fence_reads`]):
-    /// what a take under the fence and its tail gap stop at.
     fence_ms: u64,
     /// THE MIRROR (phase 4, `mirror.rs`): where this log's bus-class records
-    /// stand on the bus. `None` until the first take, which a bridge makes
-    /// only while its mirror runs (`[fabric] log = "turns"`, or the default
-    /// `"auto"` over a broker that retains it): with the
-    /// mirror off nothing is ever held here, and the carry writes no byte of
-    /// it.
     mirror: Option<Box<mirror::Mirror>>,
     /// THE TIMELINE'S ROWS (`log_rows`): the host's row
-    /// rule, the dense row counter and where this log's own records begin.
     rows: rows::Rows,
 }
 
 /// One live record's estimated heap: its ring entry, the shared record's own
-/// allocation (the record and its two reference counts, [`Entry::rec`]), its
-/// fields' vector and the text and tokens they hold.
 fn entry_heap(rec: &Rec) -> usize {
     let strings: usize = rec.f.iter().map(|(_, v)| v.heap_len()).sum();
     let shared = std::mem::size_of::<Rec>() + 2 * std::mem::size_of::<usize>();
@@ -983,9 +805,7 @@ const fn level_slot(lvl: Lvl) -> Option<usize> {
     }
 }
 
-/// Whether a node of `parent` level is the natural parent of a `child`
-/// level node: a run under the session or a run, a turn under a run, a step
-/// under a turn or a step.
+/// Whether a node of `parent` level is the natural parent of a `child` level node: a run under the session or a run, a turn under a run, a step under a turn or a step.
 #[must_use]
 pub const fn natural_parent(parent: Lvl, child: Lvl) -> bool {
     match child {
@@ -1056,19 +876,7 @@ impl Log {
         }
     }
 
-    /// The successor's log after a seamless update that carried no records:
-    /// epoch `ep`, its first record `gap - gap why=handoff epoch=<ep>` at
-    /// seq `next_seq` (at least 1), its node ids continuing `ids`, the
-    /// predecessor's [`Log::id_counters`] (three integers the update carries
-    /// beside the timeline's id).
-    ///
-    /// `next_seq` continues the predecessor's seqs past its last plus the
-    /// overlap's reserve (the host carries that count, design §2.2), so no
-    /// seq is used twice under the session; 1 when nothing was carried (an
-    /// older producer), and read as 1 past [`SEQ_LIMIT`] (a count no log
-    /// reaches). The log accounts for no seq before it, and a reader
-    /// with a cursor of an earlier epoch is reset: what the predecessor held
-    /// past its cursor is gone, and nobody counted it.
+    /// The successor's log after a seamless update that carried no records: epoch `ep`, its first record `gap - gap why=handoff epoch=<ep>` at seq `next_seq` (at least 1), its node ids continuing `ids`, the predecessor's [`Log::id_counters`] (three integers the update carries beside the timeline's id).
     #[must_use]
     pub fn after_handoff(
         ep: u32,
@@ -1080,9 +888,7 @@ impl Log {
         Log::after_handoff_built(ep, limits, ids, next_seq, None, at)
     }
 
-    /// [`Log::after_handoff`], the gap naming the predecessor's build
-    /// (`gap why=handoff epoch=<ep> build=<n>`) when the
-    /// update said it.
+    /// [`Log::after_handoff`], the gap naming the predecessor's build (`gap why=handoff epoch=<ep> build=<n>`) when the update said it.
     #[must_use]
     pub fn after_handoff_built(
         ep: u32,
@@ -1094,7 +900,6 @@ impl Log {
     ) -> Log {
         let mut log = Log::with_limits(ep, limits);
         log.issued = ids.slots();
-        // A count past the limit is no count ([`SEQ_LIMIT`]): a new seq space.
         let next_seq = if next_seq > SEQ_LIMIT.saturating_add(1) {
             1
         } else {
@@ -1116,8 +921,6 @@ impl Log {
         }
     }
 
-    // ---- reading -----------------------------------------------------
-
     /// The epoch.
     #[must_use]
     pub const fn ep(&self) -> u32 {
@@ -1136,9 +939,7 @@ impl Log {
         self.last_seq
     }
 
-    /// The oldest live seq; `last_seq + 1` when the ring is empty. The open
-    /// path is never evicted, so records after it may be gone: see
-    /// [`Log::complete_from`].
+    /// The oldest live seq; `last_seq + 1` when the ring is empty.
     #[must_use]
     pub fn oldest_seq(&self) -> u64 {
         self.ring
@@ -1146,25 +947,19 @@ impl Log {
             .map_or(self.last_seq.saturating_add(1), |e| e.rec.seq)
     }
 
-    /// The seq from which the window is whole: every seq this log held from
-    /// it on is live, so a reader at `since=<complete_from - 1>` crosses no
-    /// loss of this log's (`log`'s `oldest=`). Never before
-    /// [`Log::first_seq`].
+    /// The seq from which the window is whole: every seq this log held from it on is live, so a reader at `since=<complete_from - 1>` crosses no loss of this log's (`log`'s `oldest=`).
     #[must_use]
     pub fn complete_from(&self) -> u64 {
         self.newest_lost.saturating_add(1).max(self.first_seq)
     }
 
-    /// The first seq this log accounts for: 1, or where an update that
-    /// carried no records started it, or past the oldest overlap it forgot
-    /// ([`MAX_HOLES`]).
+    /// The first seq this log accounts for: 1, or where an update that carried no records started it, or past the oldest overlap it forgot ([`MAX_HOLES`]).
     #[must_use]
     pub const fn first_seq(&self) -> u64 {
         self.first_seq
     }
 
-    /// The oldest epoch whose cursors count in this log's seqs: this log's
-    /// own, or the earliest a chain of carried updates continued.
+    /// The oldest epoch whose cursors count in this log's seqs: this log's own, or the earliest a chain of carried updates continued.
     #[must_use]
     pub const fn base_ep(&self) -> u32 {
         self.base_ep
@@ -1180,8 +975,7 @@ impl Log {
         self.holes.iter().copied()
     }
 
-    /// Install (or remove) the host's journal wake ([`Notify`]): from now on
-    /// every append, eviction, overlap and fence change of this log rings it.
+    /// Install (or remove) the host's journal wake ([`Notify`]): from now on every append, eviction, overlap and fence change of this log rings it.
     pub fn set_notify(&mut self, notify: Option<Notify>) {
         self.notify = notify;
     }
@@ -1192,12 +986,7 @@ impl Log {
         self.notify.as_ref()
     }
 
-    /// The host's journal writer has taken every record up to `seq` (phase
-    /// 2B): from now on an eviction batch takes the records it holds before
-    /// any it has not reached, each in the policy's order, so a burst between
-    /// two of its passes loses nothing it could still write while the ring
-    /// keeps its bounds. Only when nothing it holds is left to take does a
-    /// record it has not reached go (its next take says the loss).
+    /// The host's journal writer has taken every record up to `seq` (phase 2B): from now on an eviction batch takes the records it holds before any it has not reached, each in the policy's order, so a burst between two of its passes loses nothing it could still write while the ring keeps its bounds.
     pub fn note_journaled(&mut self, seq: u64) {
         self.journaled = Some(self.journaled.map_or(seq, |j| j.max(seq)));
     }
@@ -1221,10 +1010,7 @@ impl Log {
         self.lost
     }
 
-    /// The log's estimated heap, in bytes: its live records (their entries,
-    /// field vectors and text), its node index, open entries and overlaps,
-    /// and its fold. What a host's instance-wide cap charges (design §5.1:
-    /// the encoded bytes [`Log::bytes`] counts are a third or so of it).
+    /// The log's estimated heap, in bytes: its live records (their entries, field vectors and text), its node index, open entries and overlaps, and its fold.
     #[must_use]
     pub fn footprint(&self) -> usize {
         let node = std::mem::size_of::<(Node, NodeInfo)>() + 2 * std::mem::size_of::<usize>();
@@ -1258,9 +1044,7 @@ impl Log {
         }
     }
 
-    /// The encoded bytes of the records no eviction takes: the open records
-    /// of open nodes and the session's own open and close. A ring holds at
-    /// least these, whatever its budget.
+    /// The encoded bytes of the records no eviction takes: the open records of open nodes and the session's own open and close.
     #[must_use]
     pub fn pinned_bytes(&self) -> usize {
         self.nodes
@@ -1271,13 +1055,9 @@ impl Log {
             .saturating_add(self.session_bytes)
     }
 
-    /// Set the byte budget to `bytes` (clamped to one largest record's bytes
-    /// and to the session bound), evicting level-aware at once when the ring
-    /// is past it: the host's instance-wide cap (design §5.1) shares memory
-    /// out this way, never inside an append to another session's log.
+    /// Set the byte budget to `bytes` (clamped to one largest record's bytes and to the session bound), evicting level-aware at once when the ring is past it: the host's instance-wide cap (design §5.1) shares memory out this way, never inside an append to another session's log.
     pub fn set_byte_budget(&mut self, bytes: usize) {
         self.budget_bytes = bytes.clamp(MAX_RECORD_BYTES, self.limits.bytes);
-        // A lowered budget lowers the marks' share with it.
         let quota = self.enforce_mark_quota();
         if over_limits(self.ring.len(), self.bytes, self.effective_limits()) {
             self.evict_batch();
@@ -1287,16 +1067,7 @@ impl Log {
         }
     }
 
-    /// What a closed session keeps (a host's closed-session index, design
-    /// §6): a copy of this log evicted level-aware to `bytes` encoded, by
-    /// the policy an append past its budget runs, never below what no
-    /// eviction takes (the session's own open and close, and an open log's
-    /// open path). The copy's accounting stays exact: every record left out
-    /// counts in its `lost` and its rollups, and a cursor reads it as it
-    /// would have read this log (the same epoch, seqs and gaps). Its readers
-    /// see past any fence. `bytes` = 0 keeps only what is pinned: the
-    /// accounting, the node index and the fold, over the session's open and
-    /// close. Only a read is meant of it, never an append.
+    /// What a closed session keeps (a host's closed-session index, design §6): a copy of this log evicted level-aware to `bytes` encoded, by the policy an append past its budget runs, never below what no eviction takes (the session's own open and close, and an open log's open path).
     #[must_use]
     pub fn kept_within(&self, bytes: usize) -> Log {
         let mut kept = self.clone();
@@ -1304,8 +1075,6 @@ impl Log {
         kept.notify = None;
         kept.journaled = None;
         kept.hold_batch = false;
-        // Only an append asks a closed node's parent (`parent_for`); a read
-        // walks a live record's chain through the node index alone.
         kept.closed_parents = VecDeque::new();
         kept.budget_bytes = bytes.min(kept.limits.bytes);
         if over_limits(kept.ring.len(), kept.bytes, kept.effective_limits()) {
@@ -1315,10 +1084,7 @@ impl Log {
         kept
     }
 
-    /// The parent of `n`, as far as the log still knows it: an open node's,
-    /// an indexed node's (one whose subtree holds a live record), or a
-    /// recently closed node's. `None` for the session and for a node the log
-    /// no longer knows.
+    /// The parent of `n`, as far as the log still knows it: an open node's, an indexed node's (one whose subtree holds a live record), or a recently closed node's.
     #[must_use]
     pub fn parent_of(&self, n: Node) -> Option<Node> {
         if n == Node::SESSION {
@@ -1341,9 +1107,7 @@ impl Log {
             })
     }
 
-    /// The index's view of `n` (an open node, or one whose subtree holds a
-    /// live record): what [`evict_class`] reads. `None` for a node the log
-    /// no longer indexes, which is closed.
+    /// The index's view of `n` (an open node, or one whose subtree holds a live record): what [`evict_class`] reads.
     #[must_use]
     pub fn node_view(&self, n: Node) -> Option<NodeView> {
         self.view(n)
@@ -1355,8 +1119,7 @@ impl Log {
         evict_class(r, |n| self.view(n))
     }
 
-    /// How many seqs in `(lo, hi]` this log held: the seqs it accounts for
-    /// ([`Log::first_seq`] on), less the ones it never held (its holes).
+    /// How many seqs in `(lo, hi` this log held: the seqs it accounts for (`Log::first_seq` on), less the ones it never held (its holes).
     #[must_use]
     pub fn held_between(&self, lo: u64, hi: u64) -> u64 {
         let lo = lo.max(self.first_seq.saturating_sub(1));
@@ -1374,7 +1137,6 @@ impl Log {
     }
 
     /// How many live records have a seq in `(lo, hi]`, counting only the
-    /// seqs this log accounts for.
     fn live_between(&self, lo: u64, hi: u64) -> u64 {
         let lo = lo.max(self.first_seq.saturating_sub(1));
         if hi <= lo {
@@ -1386,7 +1148,6 @@ impl Log {
     }
 
     /// Why the oldest seq range this log never held that `(lo, hi]` meets
-    /// was not held, if it meets one.
     fn crosses_hole(&self, lo: u64, hi: u64) -> Option<GapWhy> {
         self.holes
             .iter()
@@ -1417,16 +1178,12 @@ impl Log {
         self.ring.iter().map(|e| &*e.rec)
     }
 
-    /// The live records, oldest first, each with its process-clock reading
-    /// (6F-1: the `mono_ms` of the stamp its append was given; a carried
-    /// record's wall time on this clock, a journaled or summarized one's 0).
+    /// The live records, oldest first, each with its process-clock reading (6F-1: the `mono_ms` of the stamp its append was given; a carried record's wall time on this clock, a journaled or summarized one's 0).
     pub fn window_mono(&self) -> impl DoubleEndedIterator<Item = (&Rec, u64)> + ExactSizeIterator {
         self.ring.iter().map(|e| (&*e.rec, e.mono))
     }
 
-    /// The process-clock reading of the live record at `seq` (as
-    /// [`Log::window_mono`] gives it), or `None` when no live record has
-    /// that seq.
+    /// The process-clock reading of the live record at `seq` (as [`Log::window_mono`] gives it), or `None` when no live record has that seq.
     #[must_use]
     pub fn mono_of(&self, seq: u64) -> Option<u64> {
         let i = self.ring.partition_point(|e| e.rec.seq < seq);
@@ -1495,33 +1252,7 @@ impl Log {
         }
     }
 
-    /// Records after `cursor`, at most `max` of them (§5.1's pull cursor),
-    /// and the gap the read crossed.
-    ///
-    /// The read covers the seqs from the cursor (exclusive) to its `next`:
-    /// the last record returned when `max` cut it, else the log's head; a
-    /// read of `max = 0` covers only the seqs up to the first live record (it
-    /// says the gap ahead, and moves past it). Its [`Gap`] says, exactly, how
-    /// many records of those seqs this log held and the reader will never see
-    /// (some may lie between the records returned: their seqs show where),
-    /// and whether the seqs cross an update's overlap ([`GapWhy::Handoff`],
-    /// whose count is then a lower bound). A read with nothing to say has no
-    /// gap. So a reader that keeps pulling from each `next` is told every
-    /// loss once.
-    ///
-    /// A cursor this log cannot place gets [`GapWhy::Reset`] and every live
-    /// record from the oldest, its count the losses of every seq the log
-    /// accounts for: one of an epoch after the log's, or before its
-    /// [`Log::base_ep`] (another seq space), or ahead of its head, or of an
-    /// earlier epoch and behind the seqs it still accounts for
-    /// ([`Log::first_seq`]).
-    ///
-    /// The host passes the READER's epoch in `cursor.ep` (the `ep=` the
-    /// reader was last told), never [`Log::ep`]: once a successor's seqs
-    /// pass an old `since=`, the epoch is the only thing that tells the old
-    /// cursor from a current one, so a `log`, `brief` or `subscribe` that
-    /// takes `since=` takes `ep=` with it. A reader that names no epoch is
-    /// one that has read nothing (`since=0`).
+    /// Records after `cursor`, at most `max` of them (§5.1's pull cursor), and the gap the read crossed.
     #[must_use]
     pub fn read(&self, cursor: Cursor, max: usize) -> Read<'_> {
         let (gap, range, next) = self.page(cursor, max);
@@ -1532,10 +1263,7 @@ impl Log {
         }
     }
 
-    /// [`Log::read`] handing out the ring's shared records: the same gap,
-    /// records and next cursor. A host that renders a reply after releasing
-    /// its lock on the log keeps the records it shows with `Arc::clone`,
-    /// so the copy taken under the lock is a count bump per record.
+    /// [`Log::read`] handing out the ring's shared records: the same gap, records and next cursor.
     #[must_use]
     pub fn read_shared(&self, cursor: Cursor, max: usize) -> SharedRead<'_> {
         let (gap, range, next) = self.page(cursor, max);
@@ -1547,11 +1275,7 @@ impl Log {
     }
 
     /// The page a read from `cursor` returns, as [`Log::read`] states it: the
-    /// gap it crossed, the ring positions of the live records it takes (at
-    /// most `max`), and where to read next. Both reads take their records
-    /// from it, so they agree by construction.
     fn page(&self, cursor: Cursor, max: usize) -> (Option<Gap>, std::ops::Range<usize>, Cursor) {
-        // A fenced log shows its readers nothing past the fence.
         let head = self.reader_last_seq();
         let reset = cursor.ep > self.ep
             || cursor.ep < self.base_ep
@@ -1564,7 +1288,6 @@ impl Log {
         let first = self.ring.get(range.start).filter(|_| !range.is_empty());
         let last = range.end.checked_sub(1).and_then(|i| self.ring.get(i));
         let next = match (max, last.filter(|_| !range.is_empty())) {
-            // A probe: the seqs up to the first live record.
             (0, _) => self
                 .ring
                 .get(start)
@@ -1592,15 +1315,7 @@ impl Log {
         (gap, range, Cursor::new(self.ep, next))
     }
 
-    // ---- writing -----------------------------------------------------
-
-    /// Continue at `next_seq`: the seqs from the head up to it are ones this
-    /// log never held (a carried update's overlap, in which the outgoing
-    /// process may have gone on writing after its carry was taken). A read
-    /// across them says [`GapWhy::Handoff`], and they count as no loss of
-    /// this log's. A `next_seq` at or below the head changes nothing. Past
-    /// [`MAX_HOLES`] such ranges the oldest is forgotten and the log
-    /// accounts only for seqs after it ([`Log::first_seq`]).
+    /// Continue at `next_seq`: the seqs from the head up to it are ones this log never held (a carried update's overlap, in which the outgoing process may have gone on writing after its carry was taken).
     pub fn skip_to(&mut self, next_seq: u64) {
         if next_seq <= self.last_seq.saturating_add(1) {
             return;
@@ -1617,12 +1332,8 @@ impl Log {
     }
 
     /// Open the session node (`open - spawn|adopt|restore`), once.
-    ///
     /// # Errors
-    ///
-    /// [`Refused::AlreadyOpen`], [`Refused::SessionClosed`],
-    /// [`Refused::KindDoesNotFit`] for a kind that is not a session's, or an
-    /// encoding refusal.
+    /// [`Refused::AlreadyOpen`], [`Refused::SessionClosed`], [`Refused::KindDoesNotFit`] for a kind that is not a session's, or an encoding refusal.
     pub fn open_session(
         &mut self,
         kind: Kind,
@@ -1661,18 +1372,9 @@ impl Log {
         Ok(self.push(rec, at.mono_ms))
     }
 
-    /// Open a run, turn or step (§2.3). Returns the new node.
-    ///
-    /// A step that carries `cont=<step>` continues that step (a wall that
-    /// outlived its turn reopens on the run): it is the same fact, so no
-    /// rollup counts it again.
-    ///
+    /// Open a run, turn or step (§2.3).
     /// # Errors
-    ///
-    /// [`Refused::KindDoesNotFit`] for a kind that is not a run's, turn's or
-    /// step's, [`Refused::TooManyOpen`], [`Refused::SessionClosed`], a field
-    /// the log owns ([`log_owned`]), or an encoding or field refusal. A
-    /// refused open changes nothing.
+    /// [`Refused::KindDoesNotFit`] for a kind that is not a run's, turn's or step's, [`Refused::TooManyOpen`], [`Refused::SessionClosed`], a field the log owns ([`log_owned`]), or an encoding or field refusal.
     pub fn open(&mut self, o: Open, at: Stamp) -> Result<Node, Refused> {
         if self.session_closed {
             return Err(Refused::SessionClosed);
@@ -1743,17 +1445,9 @@ impl Log {
         Ok(node)
     }
 
-    /// Close `node` (§2.3): its open descendants first, innermost first,
-    /// with `out=gone`, then the node with `c.out` and its rollup. Closing
-    /// the session closes everything. Returns the close record's seq.
-    ///
+    /// Close `node` (§2.3): its open descendants first, innermost first, with `out=gone`, then the node with `c.out` and its rollup.
     /// # Errors
-    ///
-    /// [`Refused::NotOpen`] for a node that is not open (it closes exactly
-    /// once), [`Refused::OutDoesNotFit`] for an outcome of another level, a
-    /// field of `c` the log owns ([`log_owned`]: the outcome, duration and
-    /// rollup are the log's to write), or an encoding or field refusal of
-    /// `c`'s own fields (checked before anything is written).
+    /// [`Refused::NotOpen`] for a node that is not open (it closes exactly once), [`Refused::OutDoesNotFit`] for an outcome of another level, a field of `c` the log owns ([`log_owned`]: the outcome, duration and rollup are the log's to write), or an encoding or field refusal of `c`'s own fields (checked before anything is written).
     pub fn close(&mut self, node: Node, c: Close, at: Stamp) -> Result<u64, Refused> {
         if !self.is_open(node) {
             return Err(Refused::NotOpen(node));
@@ -1767,8 +1461,6 @@ impl Log {
         } else {
             self.open_entry(node).map_or(Kind::Unknown, |e| e.kind)
         };
-        // The close's own fields must fit before anything is written: the
-        // rollup is added after, only as room allows.
         let mut probe = Fields::new();
         probe.set(Key::Out, Val::Word(c.out.word()))?;
         probe.set(Key::DurMs, Val::U(u64::MAX))?;
@@ -1801,21 +1493,15 @@ impl Log {
     }
 
     /// Close the session and everything open under it.
-    ///
     /// # Errors
-    ///
     /// As [`Log::close`] on [`Node::SESSION`].
     pub fn close_session(&mut self, c: Close, at: Stamp) -> Result<u64, Refused> {
         self.close(Node::SESSION, c, at)
     }
 
-    /// Attach a point fact (§2.1: to the deepest open node unless `m.at`
-    /// names an open one). Returns its seq.
-    ///
+    /// Attach a point fact (§2.1: to the deepest open node unless `m.at` names an open one).
     /// # Errors
-    ///
-    /// [`Refused::KindDoesNotFit`] for a kind that is no mark's,
-    /// [`Refused::SessionClosed`], or an encoding refusal.
+    /// [`Refused::KindDoesNotFit`] for a kind that is no mark's, [`Refused::SessionClosed`], or an encoding refusal.
     pub fn mark(&mut self, m: Mark, at: Stamp) -> Result<u64, Refused> {
         if self.session_closed {
             return Err(Refused::SessionClosed);
@@ -1849,23 +1535,9 @@ impl Log {
         Ok(seq)
     }
 
-    /// Refine an issued node (open or closed) with more reliable fields
-    /// (§2.3 "Amending"; the fold accepts them only at equal or higher
-    /// confidence, §3.7). Returns its seq.
-    ///
-    /// The amend hangs where its node did: an open node, a closed one the
-    /// index still holds (a record of its subtree is live), or one among the
-    /// last [`CLOSED_PARENTS`] closed, whose parent chain the log puts back
-    /// into its index. So its eviction class, the rollup a loss of it counts
-    /// into and the closes it shelters as the newest record are its node's
-    /// own, never a guess.
-    ///
+    /// Refine an issued node (open or closed) with more reliable fields (§2.3 "Amending"; the fold accepts them only at equal or higher confidence, §3.7).
     /// # Errors
-    ///
-    /// [`Refused::NotIssued`] for a node this log never issued,
-    /// [`Refused::Forgotten`] for a closed node it no longer places,
-    /// [`Refused::KindDoesNotFit`] for a kind of another level, or an
-    /// encoding refusal.
+    /// [`Refused::NotIssued`] for a node this log never issued, [`Refused::Forgotten`] for a closed node it no longer places, [`Refused::KindDoesNotFit`] for a kind of another level, or an encoding refusal.
     pub fn amend(&mut self, node: Node, a: Amend, at: Stamp) -> Result<u64, Refused> {
         if !self.issued(node) {
             return Err(Refused::NotIssued(node));
@@ -1893,18 +1565,14 @@ impl Log {
         Ok(self.push(rec, at.mono_ms))
     }
 
-    /// Record a loss (`gap - gap why=<why> lost=<n>`). Returns its seq.
+    /// Record a loss (`gap - gap why=<why> lost=<n>`).
     pub fn gap(&mut self, why: GapWhy, lost: u64, at: Stamp) -> u64 {
         self.gap_built(why, lost, None, at)
     }
 
-    /// [`Log::gap`], naming the build of the process the loss came across
-    /// from (`build=<n>`, a handoff's or a crash
-    /// adoption's predecessor) when `build` says it.
+    /// [`Log::gap`], naming the build of the process the loss came across from (`build=<n>`, a handoff's or a crash adoption's predecessor) when `build` says it.
     pub fn gap_built(&mut self, why: GapWhy, lost: u64, build: Option<u64>, at: Stamp) -> u64 {
         let mut f = Fields::new();
-        // Every value below is of its key's shape and the record is far
-        // under the byte bound, so none of these can be refused.
         let _ = f.set(Key::Why, Val::Word(why.word()));
         if lost > 0 {
             let _ = f.set(Key::Lost, Val::U(lost));
@@ -1932,20 +1600,12 @@ impl Log {
         )
     }
 
-    // ---- internals ---------------------------------------------------
-
     /// Whether a `lvl` node may hang from `parent` at all: a level above it,
-    /// or its own level where that is natural (a run under a run, §2.1; a
-    /// step under a step, §2.7).
     const fn may_hang_from(parent: Lvl, lvl: Lvl) -> bool {
         (parent as u8) < (lvl as u8) || natural_parent(parent, lvl)
     }
 
     /// The parent a new `lvl` node attaches to, and whether it is an orphan
-    /// (§2.3): the named parent when it is open (an orphan when it is not a
-    /// natural parent); else the nearest open ancestor of the named parent;
-    /// else the deepest open natural parent; else the deepest open node
-    /// above `lvl`; else the session.
     fn parent_for(&self, lvl: Lvl, under: Option<Node>) -> (Node, bool) {
         if let Some(p) = under {
             if self.is_open(p) && Log::may_hang_from(p.lvl, lvl) {
@@ -1970,9 +1630,6 @@ impl Log {
     }
 
     /// The parent of `n` as the open path and the last [`CLOSED_PARENTS`]
-    /// closes know it: what an append places a node by. Never the node
-    /// index's, which keeps a closed node only while a record of its subtree
-    /// is live, so a parent found there would depend on what was evicted.
     fn structural_parent(&self, n: Node) -> Option<Node> {
         self.open_entry(n).map(|e| e.parent).or_else(|| {
             self.closed_parents
@@ -1984,7 +1641,6 @@ impl Log {
     }
 
     /// The nearest open ancestor of `n` a `lvl` node may hang from, by
-    /// [`Log::structural_parent`]: the same whatever was evicted.
     fn nearest_open_ancestor(&self, n: Node, lvl: Lvl) -> Option<Node> {
         let mut at = self.structural_parent(n)?;
         for _ in 0..MAX_OPEN {
@@ -2037,9 +1693,6 @@ impl Log {
     }
 
     /// Close `node`'s open descendants innermost first with `out=gone`,
-    /// then `node` itself: the one path every close takes. Each record is
-    /// built to fit (the rollup is added only as room allows), so a
-    /// cascade is never refused half-way.
     fn close_cascade(&mut self, node: Node, end: Ender, f: Fields, at: Stamp) -> u64 {
         self.whole(|log| log.close_cascade_held(node, end, f, at))
     }
@@ -2112,10 +1765,7 @@ impl Log {
                 e.roll,
             )
         };
-        // A node carried from another process measures the wall clock.
         let dur = dur.or_else(|| wall_from.map(|t| Dur::Wall(at.wall_ms.saturating_sub(t))));
-        // Closed in the index before its close is appended: the batch that
-        // append may run classifies by it.
         self.index_close(node, self.last_seq.saturating_add(1));
         let mut f = Fields::new();
         let _ = f.set(Key::Out, Val::Word(out.word()));
@@ -2127,8 +1777,6 @@ impl Log {
         if matches!(dur, Some(Dur::Wall(_))) {
             let _ = f.set(Key::Dur, Val::Word("wall"));
         }
-        // `close` refused any key the log owns, so these never override the
-        // outcome or the duration above.
         for (k, v) in caller.iter() {
             let _ = f.set(*k, v.clone());
         }
@@ -2166,8 +1814,6 @@ impl Log {
                 break;
             }
         }
-        // The opener last, so the size guard drops it first: a close at the
-        // record cap, or with no field slot left, goes without it.
         if let Some(by) = opener {
             let mut grown = rec.f.clone();
             if grown.set(Key::OpBy, Val::Id(by)).is_ok() {
@@ -2194,13 +1840,6 @@ impl Log {
     }
 
     /// A TURN'S CLOSE RESTATES ITS `ledger=`: the
-    /// `ledger=` of turn `node`'s open record, which the ring still holds
-    /// (an open node's open is pinned, and its close is not appended yet),
-    /// unless the close's own fields `f` already name one. A reader holding
-    /// the close alone — its open evicted once the turn closed — still joins
-    /// the turn to the exchange that opened it (`drive ledger --source=log`),
-    /// with no clock. Nothing for another level, or a turn opened without
-    /// one. `by=` is not restated: the join reads it from its own rows.
     fn restated_ledger(&self, node: Node, f: &Fields) -> Option<u64> {
         if node.lvl != Lvl::Turn || f.get(Key::Ledger).is_some() {
             return None;
@@ -2213,15 +1852,6 @@ impl Log {
     }
 
     /// A TURN'S CLOSE RESTATES WHO OPENED IT:
-    /// the `by=` of turn `node`'s open record, which the ring still holds (as
-    /// [`Self::restated_ledger`] reads it), as the id `op_by=` takes, so a
-    /// `brief` holding the close alone still names the turn's author. Only
-    /// a turn's, and only an opener the record names (`-` restates
-    /// nothing). It is restated whoever closes the turn, so a reader never
-    /// takes the closer for the opener: a turn nobody opened (`by=-`) that
-    /// the transcript closes `by=vendor` names no `op_by=`, where one the
-    /// vendor opened would. HOST tier ([`Key::OpBy`]): an edge's raw sid
-    /// never reaches the bus by it.
     fn restated_opener(&self, node: Node) -> Option<ShortId> {
         if node.lvl != Lvl::Turn {
             return None;
@@ -2232,8 +1862,6 @@ impl Log {
             .rev()
             .find(|e| e.rec.node == node && e.rec.op == Op::Open)
             .map(|e| e.rec.by)?;
-        // `-` is how `Actor::Nobody` (and a sid named like an actor word)
-        // prints: no author to restate.
         match by.word() {
             "-" => None,
             word => ShortId::new(word),
@@ -2241,8 +1869,6 @@ impl Log {
     }
 
     /// Append a record that fits, appended at the process clock's `mono`:
-    /// assign its seq, apply it to the fold, index it, then evict a batch
-    /// when the ring is past its limits.
     fn push(&mut self, mut rec: Rec, mono: u64) -> u64 {
         self.last_seq = self.last_seq.saturating_add(1);
         rec.seq = self.last_seq;
@@ -2267,14 +1893,9 @@ impl Log {
             row,
         });
         self.bytes = self.bytes.saturating_add(bytes);
-        // A claim's append keeps the marks within their quarter of the ring
-        // (`log_quota`), before any batch: the batch then sees the ring the
-        // quota left.
         if claim {
             self.enforce_mark_quota();
         }
-        // A program mark keeps its node's program marks within their share
-        // (`log_quota`, T6): a flapping program spends its own.
         if let Some(node) = program {
             self.enforce_program_share(Some(node));
         }
@@ -2293,7 +1914,6 @@ impl Log {
     }
 
     /// Run `f`, an operation of several records, with its eviction batch held
-    /// until it is whole.
     fn whole<T>(&mut self, f: impl FnOnce(&mut Log) -> T) -> T {
         let held = std::mem::replace(&mut self.hold_batch, true);
         let out = f(self);
@@ -2314,7 +1934,6 @@ impl Log {
     }
 
     /// `n` and its ancestors in the index, nearest first (at most
-    /// [`MAX_DEPTH`]).
     fn chain(&self, n: Node) -> Vec<Node> {
         let mut out = Vec::new();
         let mut at = n;
@@ -2332,12 +1951,6 @@ impl Log {
     }
 
     /// Index a record about to enter the ring: an open adds its node (with
-    /// its parent, pinned bytes counted), and every record counts as live in
-    /// its node's subtree and each ancestor's. A record of a node the index
-    /// no longer holds (an amend of a closed node whose records were all
-    /// evicted, which [`Log::amend`] admits only for a node it places) puts
-    /// the node back with the chain of closed ancestors the index lost, by
-    /// [`Log::structural_parent`], up to one it holds.
     fn index_push(&mut self, rec: &Rec, bytes: usize) {
         if rec.op == Op::Open && rec.node != Node::SESSION {
             self.nodes.insert(
@@ -2384,7 +1997,6 @@ impl Log {
     }
 
     /// Count one live record more (or less) in `n`'s subtree and each
-    /// ancestor's, walking the index without allocating.
     fn bump_chain(&mut self, n: Node, more: bool) {
         let mut at = n;
         for _ in 0..MAX_DEPTH {
@@ -2404,9 +2016,6 @@ impl Log {
     }
 
     /// Mark `node` closed in the index at the close record `seq` (the close
-    /// of a run or turn is newer than all detail of each ancestor written so
-    /// far: [`EvictClass::ClosedDetail`]'s time rule), its open record no
-    /// longer pinned.
     fn index_close(&mut self, node: Node, seq: u64) {
         let structural = matches!(node.lvl, Lvl::Run | Lvl::Turn);
         let ancestors: Vec<Node> = self.chain(node).into_iter().skip(1).collect();
@@ -2425,7 +2034,6 @@ impl Log {
     }
 
     /// Drop `n` (and any ancestor left the same) from the index once it is
-    /// closed and nothing in its subtree is live.
     fn forget_if_spent(&mut self, n: Node) {
         let mut at = n;
         for _ in 0..MAX_DEPTH {
@@ -2448,8 +2056,6 @@ impl Log {
     }
 
     /// Count one lost record of `node` into the rollup of its nearest open
-    /// ancestor-or-self (the session's, at the root): a closed node's rollup
-    /// is already written.
     fn count_loss(&mut self, node: Node) {
         let mut at = node;
         for _ in 0..MAX_DEPTH {
@@ -2469,22 +2075,6 @@ impl Log {
     }
 
     /// THE EVICTION BATCH (§5.1): classify every live record but the newest
-    /// ([`evict_class`]) and take victims, oldest first within each class, in
-    /// policy order until the ring is at its low-water mark ([`low_water`]):
-    /// closed detail, the opens of closed runs and turns, closes while those
-    /// pass half the budget ([`closes_over_half`]), current detail, then the
-    /// remaining closes. Never a pinned record, never the newest, never a
-    /// close whose subtree holds the newest (a close outlives its detail).
-    /// Each victim is counted into the log's `lost` and its nearest open
-    /// node's rollup. One pass to classify and one to rebuild: a full ring of
-    /// 2048 records pays it once per eighth of its budget, and a ring that
-    /// holds only its open path (no victim to take) is at most the open path
-    /// plus one record long. While a journal writer follows the log
-    /// ([`Log::note_journaled`]), the policy runs over the records it has
-    /// taken before the ones it has not. THE ROW FLOOR:
-    /// while the host keeps rows ([`Log::keep_rows`]), the
-    /// newest of them, up to [`row_floor`], run the policy last, once every
-    /// other record it may take is taken.
     fn evict_batch(&mut self) {
         let n = self.ring.len();
         if n <= 1 {
@@ -2492,11 +2082,8 @@ impl Log {
         }
         let lim = self.effective_limits();
         let low = low_water(lim);
-        // The newest record's node and its ancestors: their closes stay.
         let newest = self.ring.back().map(|e| e.rec.node);
         let shelter: Vec<Node> = newest.map(|nd| self.chain(nd)).unwrap_or_default();
-        // While an update's carry stands, its records stay: a reader may be
-        // shown them, and the successor continues them.
         let frozen = self.read_fence().unwrap_or(0);
         let mut buckets: [Vec<usize>; 4] = Default::default();
         for (i, e) in self.ring.iter().enumerate().take(n - 1) {
@@ -2519,20 +2106,10 @@ impl Log {
         let entry_bytes: Vec<usize> = self.ring.iter().map(|e| e.bytes).collect();
         let seqs: Vec<u64> = self.ring.iter().map(|e| e.rec.seq).collect();
         let reached = |len: usize, bytes: usize| !over_limits(len, bytes, low);
-        // While a journal writer follows this log, the policy runs first over
-        // the records it has taken, then over the rest (`note_journaled`);
-        // without one, once over everything.
         let tiers: &[Option<u64>] = match self.journaled {
             Some(j) => &[Some(j), None],
             None => &[None],
         };
-        // THE ROW FLOOR (`log_rows`): the newest rows, a
-        // quarter of the ring at most, run the policy only once everything
-        // else it may take is taken, every unflagged closed detail first.
-        // WITHIN EACH JOURNAL TIER: the floor yields to the writer (2B), so a
-        // floor row it holds goes before a record it has not reached, and a
-        // burst between two of its passes still loses nothing it could
-        // write; the view tells such a row's id as a hole.
         let floor = self.row_floor_members();
         let floors: &[bool] = if floor.contains(&true) {
             &[false, true]
@@ -2546,7 +2123,6 @@ impl Log {
             let open = |i: usize, victim: &[bool]| {
                 !victim[i] && floor[i] == in_floor && tier.is_none_or(|j| seqs[i] <= j)
             };
-            // Closed detail, then the opens of closed structure.
             for slot in [0, 1] {
                 for &i in &buckets[slot] {
                     if reached(len, bytes) {
@@ -2559,7 +2135,6 @@ impl Log {
                     }
                 }
             }
-            // Closes, only while they alone pass half the budget.
             for &i in &buckets[2] {
                 if reached(len, bytes) || !closes_over_half(closes, close_bytes, lim) {
                     break;
@@ -2572,7 +2147,6 @@ impl Log {
                     close_bytes = close_bytes.saturating_sub(entry_bytes[i]);
                 }
             }
-            // Current detail, then whatever closes are left.
             for slot in [3, 2] {
                 for &i in &buckets[slot] {
                     if reached(len, bytes) {
@@ -2620,11 +2194,6 @@ impl Log {
 }
 
 /// Whether `rec` encodes within [`MAX_RECORD_BYTES`] whatever seq it is
-/// given (the check runs with the widest seq, so a record that fits here
-/// fits when it is appended), and, for a turn-class record the bus mirror
-/// carries (§5.5), whether its `v=2` body fits too at the widest header
-/// (`ep`, `seq` and `ms` at their maxima): every record the log accepts can
-/// be mirrored.
 fn fits(rec: &Rec) -> Result<(), Refused> {
     let mut probe = rec.clone();
     probe.seq = u64::MAX;

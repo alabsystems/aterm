@@ -1,15 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The Gemini CLI lane's driver over scripted screens and a scripted kernel:
-//! a stand-in aterm instance on a real socket (every request recorded,
-//! nothing typed anywhere) whose screen is the shell after the Gemini CLI's
-//! exit, and the relaunched Gemini CLI once the relaunch line is typed; a
-//! kernel whose Gemini CLI parent has exited and whose relaunch appears under
-//! the shell when its line is; and the project's session files on disk as
-//! 0.46.0 lays them out (`<home>/.gemini/tmp/<slug>/chats/session-*.jsonl`,
-//! the slug's `.project_root`). Screens are 0.46.0's (`aterm-phase`
-//! fixtures).
+//! Tests for the Gemini CLI upgrade driver over scripted screens, process tables, and session files.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -24,7 +16,6 @@ use crate::supervise::ScratchDir;
 const TAB: &str = "s-0123456789abcdef4a67";
 const TOKEN: &str = "0badf00d0badf00d";
 /// The session the crashed Gemini CLI ran; another (a `/clear`'s, an older
-/// session of the project).
 const S1: &str = "11edd4f1-7048-4ff7-8ff2-83cce0095a7c";
 const S2: &str = "88409a32-5b1e-4c2a-9d7f-0e1f2a3b4c5d";
 /// Pids no real process of this test has: the kernel is scripted.
@@ -67,7 +58,6 @@ fn screen_json(rows: &[String], cursor: (usize, usize), seq: u64) -> String {
 }
 
 /// A fixture as the stand-in serves it, its provenance line dropped, the
-/// cursor on its caret row (` > `, ` * `, ` ! `), column 3.
 fn at_caret(text: &str) -> String {
     let rows: Vec<String> = text.lines().skip(1).map(str::to_string).collect();
     let caret = rows
@@ -78,7 +68,6 @@ fn at_caret(text: &str) -> String {
 }
 
 /// The relaunched Gemini CLI at rest on its replayed turn: 0.46.0's end of a
-/// turn, the cursor in its empty composer.
 fn gemini_idle() -> String {
     at_caret(aterm_phase::gemini::fixtures::END_OF_TURN)
 }
@@ -93,9 +82,6 @@ fn shell_after() -> String {
 }
 
 /// The shell integration's last two blocks: the command that ran the Gemini
-/// CLI (block 7) finished with `exit`, then the prompt entering — `word`
-/// false: the prompt not back yet; `later`: another command's block (9) the
-/// newest since.
 fn blocks(exit: i64, word: bool, later: bool) -> String {
     let entering = r#"{"id":8,"state":"entering","exit":null,"prompt":4,"cmd":4,"cmdcol":2,"out":null,"end":null,"cmdline":""}"#;
     if !word {
@@ -110,7 +96,6 @@ fn blocks(exit: i64, word: bool, later: bool) -> String {
 }
 
 /// The shell's blocks once the relaunch line ran in block 8: `exit` `None`
-/// while its Gemini CLI runs, else that line's status and the prompt after.
 fn line_blocks(exit: Option<i64>) -> String {
     let line = r#""cmdline":" ( cd -- '/w/proj' && exec 'gemini' '--resume' 's1' )""#;
     match exit {
@@ -122,8 +107,6 @@ fn line_blocks(exit: Option<i64>) -> String {
         ),
     }
 }
-
-// ---------------------------------------------------------------- the files
 
 /// An ISO stamp of unix milliseconds `ms`, as the CLI writes one.
 fn iso(ms: u64) -> String {
@@ -144,7 +127,6 @@ fn header(session: &str, hash: &str, at: u64) -> String {
 }
 
 /// The `$set.messages` a launch writes after its header: the CLI's own
-/// `<session_context>`.
 fn context(at: u64, id: &str) -> String {
     format!(
         r#"{{"$set":{{"lastUpdated":"{}","messages":[{{"id":"{id}","timestamp":"{}","type":"user","content":[{{"text":"<session_context>\nThis is the Gemini CLI.\n</session_context>"}}]}}]}}}}"#,
@@ -154,7 +136,6 @@ fn context(at: u64, id: &str) -> String {
 }
 
 /// One turn: a person's message and the model's reply, each with its
-/// `$set.lastUpdated`.
 fn turn(at: u64, user: &str, reply: &str) -> String {
     format!(
         "{{\"id\":\"{user}\",\"timestamp\":\"{t}\",\"type\":\"user\",\"content\":[{{\"text\":\"remember DELTA-FOUR\"}}]}}\n\
@@ -166,41 +147,29 @@ fn turn(at: u64, user: &str, reply: &str) -> String {
 }
 
 /// What the project's session files say, each `false` as the plain crash
-/// goes: the crashed Gemini CLI was `gemini --resume S1`, its session's turn
-/// in an older file the resume bumped, its duplicate begun 900 ms after it
-/// started.
 #[derive(Clone, Copy, Debug, Default)]
 struct Files {
     /// A second header since its start (a `/clear` into [`S2`]).
     second: bool,
     /// Its resume would load an empty duplicate: the older file was not
-    /// bumped by this resume (two resumes with no turn between).
     dup: bool,
     /// The session took no turn in any file.
     no_turn: bool,
     /// No header since its start (its duplicate not written).
     no_header: bool,
     /// It was a bare `gemini`: [`S1`]'s turn-holding file holds nothing of
-    /// it (no resume's switch, no rewrite).
     bare: bool,
     /// Another launch of the project ([`S2`]) begun 30 s after its start,
-    /// a turn taken in it (with `no_header`: its own never written).
     late: bool,
     /// An older session ([`S2`]) of the project switched onto since its start
-    /// (an in-TUI `/resume`: a `$set.sessionId` appended to its file).
     switched: bool,
     /// [`S2`] resumed by `gemini --resume` before its start: its duplicate,
-    /// and that resume's switch onto it in its file.
     resumed: bool,
     /// An older session ([`S2`]) a start wrote its summary into since, after
-    /// whatever its file ended with.
     summary: bool,
 }
 
-// ---------------------------------------------------------------- the stand-in
-
 /// What the stand-in serves once the relaunch line is typed, which a test
-/// may change between attempts: `None` serves as before the line.
 #[derive(Default)]
 struct After {
     screen: Option<String>,
@@ -211,7 +180,6 @@ struct After {
 /// What the stand-in serves, and what it does as the relaunch line is typed.
 struct World {
     /// The shell's blocks after the exit ([`blocks`]), which a reset rig
-    /// ([`Rig::reset`]) serves anew.
     blocks2: Arc<Mutex<String>>,
     after_exit: String,
     after_relaunch: String,
@@ -220,7 +188,6 @@ struct World {
     relaunched_ms: Arc<AtomicU64>,
     after: Arc<Mutex<After>>,
     /// Where the relaunched process's resume writes its duplicate, and the
-    /// session it names (`None`: none written).
     chats: PathBuf,
     hash: String,
     new_session: Arc<Mutex<Option<String>>>,
@@ -234,9 +201,6 @@ fn turn_file() -> String {
 }
 
 /// A control socket at `<dir>/t.sock` standing in for the aterm instance of
-/// [`TAB`], and the requests it was asked, in order. The relaunch line's
-/// `turn` starts the relaunch: from then on the relaunched screen is served,
-/// and the resumed process's duplicate header lands in the chats directory.
 fn instance(dir: &Path, w: World) -> (String, crate::harness::FakeInstanceLog) {
     crate::harness::fake_instance(&dir.join("t.sock"), TOKEN, move |line| {
         let verb = line
@@ -285,9 +249,6 @@ fn instance(dir: &Path, w: World) -> (String, crate::harness::FakeInstanceLog) {
                             context(begun, "ctx-new")
                         );
                         std::fs::write(w.chats.join(name), text).expect("duplicate");
-                        // Its resume's rewrite of the turn-holding file
-                        // (resume 1 after a turn always makes one, measured):
-                        // its `lastUpdated` past the duplicate's.
                         let older = w.chats.join(turn_file());
                         if let Ok(was) = std::fs::read_to_string(&older)
                             .map_err(drop)
@@ -308,7 +269,6 @@ fn instance(dir: &Path, w: World) -> (String, crate::harness::FakeInstanceLog) {
 }
 
 /// What a test varies about the relaunch, each `false`/`None` as the plain
-/// relaunch goes.
 #[derive(Clone, Debug, Default)]
 struct Knobs {
     /// The host's roster never shows [`NEW`] leading the tab.
@@ -322,15 +282,12 @@ struct Knobs {
     /// [`NEW`]'s parent is another process than the shell.
     new_orphan: bool,
     /// The crashed parent's child [`CHILD`] lives on, orphaned, reading the
-    /// terminal for this many reads (`usize::MAX`: ever).
     orphan_reads: Option<usize>,
     /// Another live Gemini CLI of the project ([`OTHER`]) names [`S1`] in its
-    /// argv (a person resumed it in another tab).
     argv_holder: bool,
     /// The process table cannot be read.
     table_unreadable: bool,
     /// Another live Gemini CLI of the project started 50 ms after the
-    /// crashed one.
     together: bool,
     /// [`NEW`]'s number was taken by another process.
     new_reborn: bool,
@@ -339,8 +296,6 @@ struct Knobs {
 }
 
 /// The scripted kernel: [`TUI`] was [`SHELL`]'s foreground job and has
-/// exited; its relaunch [`NEW`] appears under the shell when its line is
-/// typed.
 struct Script {
     exited: Arc<AtomicBool>,
     relaunched: Arc<AtomicBool>,
@@ -504,7 +459,6 @@ impl Script {
 }
 
 /// One scripted rig: a Gemini home with the project's chats directory and its
-/// session files, the state directory, the stand-in instance and the kernel.
 struct Rig {
     dir: ScratchDir,
     opts: Opts,
@@ -519,13 +473,11 @@ struct Rig {
     new_session: Arc<Mutex<Option<String>>>,
     header_after: Arc<AtomicU64>,
     /// The harness's waits on the test's thread run on their own steps
-    /// ([`crate::harness::relaunch::virtual_waits`]): every stand-in here answers at once.
     _waits: crate::harness::relaunch::VirtualWaits,
 }
 
 impl Rig {
     /// `status`: the exit status the shell's block names; `word`, `later` as
-    /// [`blocks`]; `files`: what the project's session files say.
     fn new(name: &str, status: i64, word: bool, later: bool, files: Files) -> Rig {
         let dir = scratch(name);
         let base = std::fs::canonicalize(&*dir).expect("canonical scratch");
@@ -543,7 +495,6 @@ impl Rig {
             format!(r#"{{"projects":{{"{project}":"proj"}}}}"#),
         )
         .expect("registry");
-        // The crashed parent started a minute ago.
         let started_ms = now_ms() - 60_000;
         write_files(&chats, &hash, started_ms, files);
         let exited = Arc::new(AtomicBool::new(true));
@@ -612,14 +563,6 @@ impl Rig {
     }
 
     /// The rig [`Rig::new`] makes for `status`, `word`, `later` and `files`, on
-    /// this rig's scratch tree and stand-in: the project's session files
-    /// written afresh around a parent started a minute ago, the state and
-    /// home directories gone, the stand-in serving the exit's blocks and
-    /// nothing after the line, its log empty, and the kernel's parent
-    /// exited, nothing relaunched and no knob turned. A walk over many
-    /// worlds resets one rig per world instead of making and removing one:
-    /// the scratch tree and the stand-in's socket and thread were most of
-    /// its time.
     fn reset(&mut self, status: i64, word: bool, later: bool, files: Files) {
         for dir in [&self.opts.state, &self.opts.home, &self.chats] {
             match std::fs::remove_dir_all(dir) {
@@ -646,9 +589,6 @@ impl Rig {
     }
 
     /// The snapshot the host took of the Gemini CLI while it ran: launched
-    /// `gemini --model gemini-3.5-flash --resume S1 -i "carry on" "fix it"`,
-    /// its session `session` (`None`: no witness then), its project, its
-    /// child, the block it ran in.
     fn snap(&self, session: Option<&str>) -> Snapshot {
         Snapshot {
             stored_login: false,
@@ -693,11 +633,6 @@ impl Rig {
     }
 
     /// [`exit_record`] over the real look at this rig's exit. Nothing a look
-    /// asks moves the stand-in or the kernel, so the world stands still while
-    /// it is looked at: the second look is real and must read what the first
-    /// did, and every later one is the first's again. `exit_record`'s loop runs
-    /// whole over them (its waits and their count are `relaunch_tests`'), but
-    /// an undecided exit's 81 looks are two connects to the stand-in, not 81.
     fn look(&self, snap: &Snapshot) -> ExitRecord {
         let (mut first, mut looks) = (None, 0);
         exit_record(
@@ -764,10 +699,6 @@ impl Drop for Rig {
 }
 
 /// The project's session files as `files` says, around a parent started at
-/// `start` (unix ms): its session's older turn-holding file (begun an hour
-/// before, bumped by this resume 930 ms after its start unless `dup`, its
-/// switch onto it last; neither for a `bare` launch), its resume's duplicate
-/// (begun 900 ms after it started), and what else `files` adds.
 fn write_files(chats: &Path, hash: &str, start: u64, files: Files) {
     let write = |name: &str, text: String| {
         std::fs::write(chats.join(name), text).expect("session file");
@@ -781,9 +712,6 @@ fn write_files(chats: &Path, hash: &str, start: u64, files: Files) {
     }
     if !files.bare {
         if !files.dup {
-            // This resume's rewrite (a live turn's reply stored as a plain
-            // string made its fold differ), bumping `lastUpdated` past the
-            // duplicate's.
             older.push(format!(
                 r#"{{"$set":{{"lastUpdated":"{}"}}}}"#,
                 iso(start + 930)
@@ -856,13 +784,6 @@ fn write_files(chats: &Path, hash: &str, start: u64, files: Files) {
 }
 
 /// A CRASH IS RESUMED ON ITS SESSION, IN ITS PROJECT, THROUGH THE SHELL'S OWN
-/// `gemini`: its child killed (`1`) and its parent killed (`137`) alike. The
-/// line `cd`s to the project and types `gemini` (never the node, never a
-/// Cellar path) with the launch's `--model` carried and `--resume <uuid>` of
-/// the session the start-time rule named — never its `-i` prompt, its
-/// positional one, nor a second `--resume` — and once the relaunched process
-/// is up on that session and reads idle, the continuation is typed and
-/// submitted (`continued`). The record is keyed `gemini-<tab>`.
 #[test]
 fn a_crashed_gemini_cli_is_resumed_on_its_session_in_its_project() {
     for status in [1, 137] {
@@ -914,8 +835,6 @@ fn a_crashed_gemini_cli_is_resumed_on_its_session_in_its_project() {
 }
 
 /// The exit's word is the shell's: the finished block that ends where the
-/// entering prompt begins, its `exit` — of the block the parent ran in.
-/// NEGATIVE CONTROL: another command's block newest since is no word for it.
 #[test]
 fn the_gemini_exit_is_read_off_its_command_block() {
     assert_eq!(
@@ -929,11 +848,6 @@ fn the_gemini_exit_is_read_off_its_command_block() {
 }
 
 /// EVERY GRACEFUL WAY OUT (`0`; a cancel's `130`) IS LEFT, A REFUSED START
-/// (`41`, `42`, `52`) IS NEVER RETRIED, AND A STATUS THE TABLE NAMES NOTHING
-/// FOR (`143`: the parent ignores SIGTERM) RELAUNCHES NOTHING. NEGATIVE
-/// CONTROL: a table that reads the status alone (any nonzero a crash) would
-/// relaunch the refusals and the unwitnessed end; nothing is typed for any
-/// left exit.
 #[test]
 fn a_graceful_exit_a_refused_start_and_an_unwitnessed_end_are_never_relaunched() {
     let mut status_alone_differs = 0;
@@ -974,8 +888,6 @@ fn a_graceful_exit_a_refused_start_and_an_unwitnessed_end_are_never_relaunched()
 }
 
 /// A worker's launch as its spawn types it (`harness::worker`): its model,
-/// the session id of its own, its first prompt attached; its homes behind it
-/// with its trusted-folders file `trust`.
 fn worker_snap(rig: &Rig, id: &str, trust: &Path) -> Snapshot {
     let mut snap = rig.snap(Some(S1));
     snap.argv = vec![
@@ -997,8 +909,6 @@ fn worker_snap(rig: &Rig, id: &str, trust: &Path) -> Snapshot {
 }
 
 /// The project's one session file as a worker's first start writes it:
-/// [`S1`]'s header begun `begun_ms` after the parent started (negative: before
-/// it), its first turn after.
 fn worker_files(rig: &Rig, begun_ms: i64) {
     std::fs::remove_dir_all(&rig.chats).expect("chats");
     std::fs::create_dir_all(&rig.chats).expect("chats");
@@ -1018,22 +928,6 @@ fn worker_files(rig: &Rig, begun_ms: i64) {
 }
 
 /// A WORKER'S OWN RESTART IS FINISHED ON ITS SESSION, NOTHING TYPED: Gemini
-/// CLI's own restart (`/settings`, IDE trust, admin settings: exit `199`)
-/// runs its argv again, and the worker's `--session-id` — the id its first
-/// start wrote, which the start-time rule names for the process — is
-/// refused (`42`, relayed by the parent). The look owes it a relaunch as a
-/// crash is, kept as its own restart ([`ExitRecord::Restarted`]), and the attempt resumes that session
-/// by id: `gemini --model … --resume <id>`, never the `--session-id` nor the
-/// first prompt again, behind the worker's own trusted-folders file while it
-/// stands, and nothing typed after it (`done:resumed`, a quiet record).
-/// NEGATIVE CONTROLS: the same `42` from a worker whose id was written
-/// before it started (its first start refused: the rule names no session
-/// begun since), one whose session begun since is another than its
-/// `--session-id` (the rule refuses a witness its argv disagrees with), a
-/// worker's launch that also names a session to resume (`--resume`:
-/// `ug::restart_id` reads no restart of it, though the rule names its id),
-/// and the crash rig's plain `--resume` launch, are refused starts, nothing
-/// typed; a trusted-folders file gone with its worker is named to nothing.
 #[test]
 fn a_workers_own_restart_is_finished_on_its_session_with_nothing_typed() {
     let rig = Rig::new("restart", 42, true, false, Files::default());
@@ -1044,8 +938,6 @@ fn a_workers_own_restart_is_finished_on_its_session_with_nothing_typed() {
     let left = rig.look(&snap);
     assert_eq!(left, ExitRecord::Restarted);
     assert!(left.crashed(), "owed a relaunch as a crash is");
-    // The host reads it as the restart it is before whose exit it decides
-    // (`relaunch::restarted_itself`: a person's keys before it asked for it).
     assert!(look_at_exit(&rig.opts, &snap, &rig.kernel).restarted_itself);
     assert_eq!(crate::harness::relaunch::launch_ended(&snap, &left), None);
     let r = rig.attempt(&snap, &left, ExitCause::Exit);
@@ -1069,7 +961,6 @@ fn a_workers_own_restart_is_finished_on_its_session_with_nothing_typed() {
     assert!(st.quiet);
     assert_eq!(st.thread, S1);
 
-    // Its file gone with the worker: named to nothing.
     let rig = Rig::new("restart-untrusted", 42, true, false, Files::default());
     worker_files(&rig, 900);
     let snap = worker_snap(&rig, S1, &rig.dir.join("gone.trust.json"));
@@ -1114,9 +1005,6 @@ fn a_workers_own_restart_is_finished_on_its_session_with_nothing_typed() {
 }
 
 /// The project's one session file as a start that took no turn writes it:
-/// [`S1`]'s header and the CLI's own `<session_context>`, begun 900 ms after
-/// the parent started (the measured folder-trust restart's file:
-/// `upgrade_gemini_tests::TURNLESS_SESSION`).
 fn turnless_files(rig: &Rig) {
     std::fs::remove_dir_all(&rig.chats).expect("chats");
     std::fs::create_dir_all(&rig.chats).expect("chats");
@@ -1134,18 +1022,6 @@ fn turnless_files(rig: &Rig) {
 }
 
 /// A BARE LAUNCH'S OWN RESTART BEFORE ITS FIRST TURN IS RESUMED ON ITS
-/// SESSION, NOTHING TYPED AFTER IT (`upgrade_gemini_drive::resumes_turnless`;
-/// measured in the lab: Gemini CLI 0.46.0 writes its header at its UI's mount,
-/// before its folder-trust dialog is answered, so `Trust folder` restarts it
-/// onto its own `--session-id` with no turn in it — `42` — and `gemini
-/// --resume <id>` of that session comes up on it). The look owes it a relaunch
-/// as a crash is, and the attempt types `--resume <id>` alone (`done:resumed`,
-/// quiet), where before it was told `refused:no-turn` and the tab left at
-/// Gemini CLI's error. NEGATIVE CONTROLS: the same restart of a launch whose
-/// first prompt was never sent (`--prompt-interactive`: a resume would drop
-/// it), a crash (`1`) of a `--resume` launch whose session took no turn, and
-/// a bare worker launch's crash with no turn whose word is gone by the
-/// attempt, are told `refused:no-turn`, nothing typed.
 #[test]
 fn a_bare_restart_before_its_first_turn_is_resumed_on_its_session() {
     let bare = |rig: &Rig| {
@@ -1178,7 +1054,6 @@ fn a_bare_restart_before_its_first_turn_is_resumed_on_its_session() {
     );
     assert!(rig.state().quiet);
 
-    // NEGATIVE CONTROL: its first prompt never sent.
     let rig = Rig::new(
         "restart-turnless-prompted",
         42,
@@ -1195,7 +1070,6 @@ fn a_bare_restart_before_its_first_turn_is_resumed_on_its_session() {
     assert_eq!(r.step, "refused:no-turn", "{r:?}");
     assert!(rig.typed().is_empty(), "{:#?}", rig.typed());
 
-    // NEGATIVE CONTROL: a crash whose session took no turn.
     let rig = Rig::new(
         "crash-turnless",
         1,
@@ -1213,9 +1087,6 @@ fn a_bare_restart_before_its_first_turn_is_resumed_on_its_session() {
     assert_eq!(r.step, "refused:no-turn", "{r:?}");
     assert!(rig.typed().is_empty(), "{:#?}", rig.typed());
 
-    // NEGATIVE CONTROL: a bare worker launch's crash whose session took no
-    // turn, its word gone by the attempt (another command's block newest):
-    // the crash the look read stands, never its own restart on a guess.
     let rig = Rig::new("crash-turnless-bare", 1, true, false, Files::default());
     turnless_files(&rig);
     let snap = bare(&rig);
@@ -1228,18 +1099,6 @@ fn a_bare_restart_before_its_first_turn_is_resumed_on_its_session() {
 }
 
 /// WHAT THE LOOK READ AT A WORKER'S EXIT STANDS WHEN ITS WORD IS GONE BY THE
-/// ATTEMPT (`relaunch::ExitRecord::Restarted`):
-/// its own restart (`42`) read at the look is kept as one, and resumed
-/// quietly (`done:resumed`) with another command's block newest by the
-/// attempt; a worker's crash (`1`) read at the look is continued after its
-/// line however the shell draws by then — the lane of 3a4586a01e read every
-/// `--session-id` launch's crash whose word was gone as its own restart,
-/// and typed no continuation. NEGATIVE CONTROLS: the crash with its word
-/// standing and a `--resume` launch's crash with its word gone are
-/// continued; a crash's record over a restart whose word still stands is
-/// told apart by that word (`done:resumed`), and over one whose word is gone
-/// stays the crash it says (continued: nothing is read as a restart on a
-/// guess).
 #[test]
 fn what_the_look_read_at_an_exit_stands_when_its_word_is_gone() {
     for (name, status, worker, word_stays, record, want) in [
@@ -1296,15 +1155,6 @@ fn what_the_look_read_at_an_exit_stands_when_its_word_is_gone() {
 }
 
 /// A SESSION THE START-TIME RULE CANNOT NAME IS TOLD, NEVER TYPED
-/// (`refused:no-witness`, the host's `Cannot`): two headers since its start
-/// (a `/clear`), no header, an older session switched onto since (an in-TUI
-/// `/resume`: a `$set.sessionId` written since into its file, no stamped
-/// write after it) — the start's background summary written after that
-/// switch too — another Gemini CLI of the project started at the same
-/// moment, and a session its last idle point named that the rule no longer
-/// names. NEGATIVE CONTROLS: a summary a start wrote into an older file, the
-/// same after an old `gemini --resume`'s switch (its header beside it), and
-/// the plain crash, are resumed.
 #[test]
 fn a_session_the_rule_cannot_name_is_told_never_typed() {
     for (name, files, knobs, snapped, want) in [
@@ -1410,10 +1260,6 @@ fn a_session_the_rule_cannot_name_is_told_never_typed() {
 }
 
 /// A BARE `gemini` THAT DIED BEFORE ITS OWN HEADER, ANOTHER LAUNCH OF THE
-/// PROJECT BEGUN 30 s AFTER IT (a turn taken there, gone since): that
-/// launch's session is never resumed as its own — told, nothing typed
-/// (`refused:no-witness`). NEGATIVE CONTROL: the same bare launch with its
-/// own header is resumed.
 #[test]
 fn another_launchs_late_header_is_never_resumed_as_its_own() {
     for (name, files, want) in [
@@ -1441,13 +1287,6 @@ fn another_launchs_late_header_is_never_resumed_as_its_own() {
 }
 
 /// THE PRE-CHECK: A RESUME THAT WOULD LOAD A COPY MISSING TURNS IS TOLD,
-/// NEVER TYPED (`refused:history-unsafe`): after two resumes with no turn
-/// between, the newest of the session's files is an empty duplicate, which
-/// `--resume` would load under the same id. A session that took no turn is
-/// told there is nothing to resume (`refused:no-turn`), and either is told at
-/// the exit, before the attempt takes the tab: nothing is recorded of a
-/// relaunch. NEGATIVE CONTROL: the resume that bumped the turn-holding file
-/// loads every turn and is typed.
 #[test]
 fn a_resume_the_precheck_refuses_is_told_never_typed() {
     for (name, files, want) in [
@@ -1494,10 +1333,6 @@ fn a_resume_the_precheck_refuses_is_told_never_typed() {
 }
 
 /// THE PRE-CHECK IS READ AGAIN RIGHT BEFORE THE LINE: an attempt that waited
-/// (the session held by another tab) and finds, at its carried attempt, the
-/// session's newest file an empty duplicate (someone resumed it twice
-/// meanwhile) types nothing (`refused:history-unsafe`). NEGATIVE CONTROL: the
-/// same wait with the files unchanged is carried on and relaunched.
 #[test]
 fn the_precheck_is_read_again_right_before_the_line() {
     for (name, duplicate, want) in [
@@ -1529,11 +1364,6 @@ fn the_precheck_is_read_again_right_before_the_line() {
 }
 
 /// THE ORPHAN: a parent SIGKILLed leaves its child alive; nothing is typed
-/// while it still reads the terminal (its old group the foreground one), and
-/// the line is typed once it no longer does — the shell holds the terminal
-/// and the orphan's reads fail (measured: a line typed then reached the shell
-/// whole, the orphan gone at the next poll). NEGATIVE CONTROL: no orphan, no
-/// wait.
 #[test]
 fn nothing_is_typed_while_the_orphan_reads_the_terminal() {
     let mut rig = Rig::new("orphan-reads", 137, true, false, Files::default());
@@ -1557,9 +1387,6 @@ fn nothing_is_typed_while_the_orphan_reads_the_terminal() {
 }
 
 /// A SESSION ANOTHER LIVE GEMINI CLI RUNS is never resumed a second time:
-/// its argv naming it (a person resumed it in another tab), or a process
-/// table that cannot be read. NEGATIVE CONTROL: another Gemini CLI of the
-/// project on its own session holds nothing.
 #[test]
 fn a_held_session_is_never_typed_at() {
     for (name, knobs, want) in [
@@ -1577,7 +1404,6 @@ fn a_held_session_is_never_typed_at() {
                 table_unreadable: true,
                 ..Knobs::default()
             },
-            // The rule itself reads the table first: nobody can say.
             "refused:no-witness",
         ),
     ] {
@@ -1590,7 +1416,6 @@ fn a_held_session_is_never_typed_at() {
 }
 
 /// A launch whose flags a relaunch cannot carry (`--worktree`, a flag the
-/// table does not know) is refused with its word, nothing typed.
 #[test]
 fn an_uncarryable_launch_is_refused() {
     for extra in ["--worktree", "--approvalMode"] {
@@ -1605,12 +1430,6 @@ fn an_uncarryable_launch_is_refused() {
 }
 
 /// THE WITNESS OF A LIVE SNAPSHOT: the start-time rule over the project's
-/// session files names the one session begun since the parent started; the
-/// project is the process's working directory and its chats directory the
-/// slug whose `.project_root` names it; `GEMINI_CLI_HOME` moves the home;
-/// a home other than the user's is carried. NEGATIVE CONTROLS: a `/clear`
-/// since names none (and says why), a one-shot is no TUI, and a process that
-/// is no Gemini CLI is refused.
 #[test]
 fn the_snapshot_names_the_session_by_the_start_time_rule() {
     let rig = Rig::new("snapshot", 0, true, false, Files::default());
@@ -1646,7 +1465,6 @@ fn the_snapshot_names_the_session_by_the_start_time_rule() {
         vec![("HOME".to_string(), home.to_string_lossy().into_owned())],
         "a HOME other than the user's is carried"
     );
-    // GEMINI_CLI_HOME moves the home: no project there.
     let moved = args(
         rig.snap(None).argv,
         vec![format!("GEMINI_CLI_HOME={}", rig.dir.join("alt").display())],
@@ -1666,7 +1484,6 @@ fn the_snapshot_names_the_session_by_the_start_time_rule() {
         alt.gemini().and_then(|r| r.unwitnessed),
         Some(ug::NoWitness::NoChats)
     );
-    // A `/clear` since: none named, and why.
     let cleared = Rig::new(
         "snapshot-cleared",
         0,
@@ -1739,9 +1556,6 @@ fn the_snapshot_names_the_session_by_the_start_time_rule() {
 }
 
 /// THE PROJECT DIRECTORY: the slug `projects.json` maps the project to where
-/// its `.project_root` names it, else the one directory under `tmp/` whose
-/// marker does. NEGATIVE CONTROLS: a mapping whose marker names another
-/// project, and two directories claiming it, name none.
 #[test]
 fn the_project_directory_is_the_slug_whose_marker_names_it() {
     let rig = Rig::new("slug", 0, true, false, Files::default());
@@ -1774,9 +1588,6 @@ fn the_project_directory_is_the_slug_whose_marker_names_it() {
 }
 
 /// A RESTORED LAYOUT'S RELAUNCH (aterm's own end): no shell word is asked,
-/// the start-time rule is read again over the files as they are, and the
-/// continuation says aterm ended. NEGATIVE CONTROL: the same snapshot's own
-/// clean exit is left.
 #[test]
 fn aterm_ending_relaunches_the_restored_session() {
     let rig = Rig::new("host", 0, true, false, Files::default());
@@ -1798,9 +1609,6 @@ fn aterm_ending_relaunches_the_restored_session() {
 }
 
 /// THE EXPLICIT RESTART IS NEVER CARRIED FOR A GEMINI CLI: the act signals
-/// the tab's foreground job, its parent node, which ignores SIGTERM
-/// (measured), so the act would end it only by a SIGKILL that orphans its
-/// child. NEGATIVE CONTROL: a Claude Code snapshot's gate is its own rule.
 #[test]
 fn the_explicit_restart_is_never_carried_for_a_gemini_cli() {
     use crate::harness::relaunch::carries_restart;
@@ -1809,13 +1617,6 @@ fn the_explicit_restart_is_never_carried_for_a_gemini_cli() {
 }
 
 /// A TAB'S OWN GEMINI CLI (`aterm -e gemini`, `exec gemini`: shell
-/// [`crate::harness::relaunch::NO_SHELL`]) keeps its snapshot for its readers
-/// — the session the start-time rule names, read with no shell's dialect or
-/// block — and a crash of it is relaunched by nothing, as a tab's own agy,
-/// Muse Code or Claude Code is: no shell is left in its tab to type the line
-/// into, and its plan is refused for good (never waited on). NEGATIVE
-/// CONTROLS: at its shell, the snapshot reads the shell's dialect, and the
-/// same crash is relaunched.
 #[test]
 fn a_tabs_own_gemini_cli_is_relaunched_by_nothing() {
     use crate::harness::relaunch::NO_SHELL;
@@ -1869,11 +1670,6 @@ fn a_tabs_own_gemini_cli_is_relaunched_by_nothing() {
 }
 
 /// The records are the lane's: keyed `gemini-<tab>`, read back by their tab,
-/// never a Claude Code conversation's key, the chats directory, the carried
-/// homes and the child round-tripping, each written only when set; a settled
-/// record of a tab proven gone, unwritten a week, is pruned. NEGATIVE
-/// CONTROLS: a live tab's, an in-flight one, and another lane's record
-/// (which writes none of those keys) are kept.
 #[test]
 fn records_are_keyed_by_tab_and_pruned_once_gone() {
     assert_eq!(key(TAB), format!("gemini-{TAB}"));
@@ -1942,8 +1738,6 @@ fn records_are_keyed_by_tab_and_pruned_once_gone() {
 }
 
 /// A rig for the relaunch's own end: the crash relaunched (`hand_back` as
-/// the host types it), its waits short — every one here ends on its bound
-/// only where nothing is ever coming.
 fn relaunch_rig(name: &str, hand_back: bool, knobs: Knobs) -> Rig {
     let mut rig = Rig::new(name, 1, true, false, Files::default());
     rig.opts.hand_back = hand_back;
@@ -1960,13 +1754,6 @@ fn relaunch_rig(name: &str, hand_back: bool, knobs: Knobs) -> Rig {
 }
 
 /// A RESUME GEMINI CLI REFUSED IS NEVER TYPED AGAIN (critic X4): the
-/// relaunched process came up under the shell and was gone before it led the
-/// tab — its line's own block then said `42` (an unknown id, another
-/// project's session) — and the exit's next attempt reads that line's word:
-/// `refused:resume-refused`, the line typed once. So is a line the shell
-/// could not run (`127`) and one the CLI rejected before any TUI (`1`, an
-/// unknown flag; or a `cd` that failed). NEGATIVE CONTROL: the same relaunch
-/// whose own Gemini CLI crashed (`137`) is typed again.
 #[test]
 fn a_resume_gemini_refused_is_never_typed_again() {
     for (exit, want, lines) in [
@@ -2008,8 +1795,6 @@ fn a_resume_gemini_refused_is_never_typed_again() {
 }
 
 /// A RELAUNCH THAT NEVER COMES UP is decided by its line's own end AT ONCE,
-/// never waited out and typed again: Gemini CLI refused it (`42`), or the
-/// shell could not run it (`126`): `refused:resume-refused`.
 #[test]
 fn a_relaunch_that_never_comes_up_is_never_typed_again() {
     let knobs = Knobs {
@@ -2029,9 +1814,6 @@ fn a_relaunch_that_never_comes_up_is_never_typed_again() {
 }
 
 /// THE RELAUNCHED PROCESS THE RULE NAMES ANOTHER SESSION FOR is never
-/// carried on: nothing typed into it, the person told
-/// (`refused:started-other`). NEGATIVE CONTROL: one the rule names its session
-/// for is adopted, and carried on (`continued`) where the step types.
 #[test]
 fn a_relaunch_on_another_session_is_told_and_typed_nothing() {
     for hand_back in [true, false] {
@@ -2058,12 +1840,6 @@ fn a_relaunch_on_another_session_is_told_and_typed_nothing() {
 }
 
 /// A RELAUNCHED PROCESS NO FILE NAMES THE SESSION FOR is adopted on its
-/// line's word (`--resume <uuid>` brings back that id or refuses), but
-/// nothing is said into it: no continuation typed (`done:no-continue`), its
-/// record saying why. NEGATIVE CONTROLS: one whose duplicate header names the
-/// session is carried on (`continued`), and so is one whose header naming it
-/// was begun 5 s after it started (a loaded machine's: past the window, but
-/// the very session its line resumed).
 #[test]
 fn no_continuation_into_a_relaunch_no_file_names() {
     for (name, new_session, after, want) in [
@@ -2084,8 +1860,6 @@ fn no_continuation_into_a_relaunch_no_file_names() {
             rig.typed()
         );
         assert_eq!(rig.state().resumed_pid, NEW, "{name}: adopted");
-        // Its record says why nothing was typed; a carried-on one says the
-        // session resumed and nothing more.
         let outcome = rig.state().outcome;
         let unwitnessed = want == "done:no-continue";
         assert_eq!(
@@ -2100,10 +1874,6 @@ fn no_continuation_into_a_relaunch_no_file_names() {
 }
 
 /// THE TYPING FENCE NAMES WHAT IT REFUSES, each arm on its own: a box `box`,
-/// a turn running `busy`, the command menu (no evidence) `busy`, a draft
-/// `draft`, shell mode (what is typed there runs as a command)
-/// `shell-mode`. NEGATIVE CONTROLS: the relaunched Gemini CLI at rest is
-/// fenced on its read, and so is its YOLO composer (its caret `*`).
 #[test]
 fn the_typing_fence_names_what_it_refuses() {
     use aterm_phase::gemini::fixtures as fx;
@@ -2140,11 +1910,6 @@ fn the_typing_fence_names_what_it_refuses() {
 }
 
 /// NOTHING IS TYPED INTO A RELAUNCHED GEMINI CLI THAT IS NOT IDLE, EMPTY AND
-/// UNHELD: a turn running, a draft in its composer, a box over it, shell
-/// mode, a person's hand within the grace, a process the host's roster does
-/// not show leading the tab — each leaves the continuation untyped. NEGATIVE
-/// CONTROL: the plain relaunch types it (`continued`), under the caret it
-/// reads.
 #[test]
 fn no_continuation_into_a_busy_drafted_or_held_gemini_cli() {
     use aterm_phase::gemini::fixtures as fx;
@@ -2192,8 +1957,6 @@ fn no_continuation_into_a_busy_drafted_or_held_gemini_cli() {
     assert_eq!(r.step, "continued", "{r:?}");
     assert_eq!(control.continuations(), 1);
     let typed = control.typed();
-    // The crash note is past the paste fold: its guard is the chip's
-    // ([`a_continuation_past_the_paste_fold_is_guarded_on_its_chip`]).
     assert!(
         typed[1].contains("submit=guarded:^\\s>\\s"),
         "the guard one blank before the caret: {}",
@@ -2202,13 +1965,6 @@ fn no_continuation_into_a_busy_drafted_or_held_gemini_cli() {
 }
 
 /// THE RELAUNCH'S CONTINUATION IS GUARDED ON THE CHIP IT IS DRAWN AS: past
-/// Gemini CLI's paste fold (the crash note runs 538 characters on 0.46.0),
-/// the composer shows `[Pasted Text: <n> chars]` with the cursor past it
-/// ([`aterm_phase::gemini::fixtures::FOLDED_PASTE`], measured), so the
-/// `turn`'s guard is the chip's, and it matches that measured caret row.
-/// NEGATIVE CONTROL: the guard on the note's own last word — the one typed
-/// before — matches no row of the measured screen (the live `turn` left the
-/// note unsent there), and a note within the fold keeps its words' guard.
 #[test]
 fn a_continuation_past_the_paste_fold_is_guarded_on_its_chip() {
     use aterm_phase::gemini::{fixtures as fx, folded_paste};
@@ -2252,9 +2008,6 @@ fn a_continuation_past_the_paste_fold_is_guarded_on_its_chip() {
 }
 
 /// ONLY OUR OWN RELAUNCH IS ADOPTED: a Gemini CLI under the shell resuming
-/// another session, or one resuming this session that is no child of the
-/// shell the line was typed at, is never taken for the relaunch. NEGATIVE
-/// CONTROL: the shell's child resuming the session, any spelling, is adopted.
 #[test]
 fn only_the_lines_own_gemini_cli_is_adopted() {
     let other = Knobs {
@@ -2297,10 +2050,6 @@ fn only_the_lines_own_gemini_cli_is_adopted() {
 }
 
 /// Each process goes to its own lane's reader: a `node` running Gemini CLI's
-/// script (typed by name, or its bundle by path) to the Gemini CLI lane —
-/// never read as Claude Code. NEGATIVE CONTROLS: a Claude Code under `node`
-/// to Claude Code's records, an image itself named `gemini` (no such build
-/// measured) to none, agy to its own.
 #[test]
 fn each_process_goes_to_its_own_lanes_reader() {
     use crate::harness::relaunch::{SnapshotLane, snapshot_lane};
@@ -2339,10 +2088,6 @@ fn each_process_goes_to_its_own_lanes_reader() {
 }
 
 /// THE LINE A PERSON IS TOLD: Gemini CLI's own `gemini --resume <uuid>` in
-/// the project, for the session the rule named — else the one the argv names
-/// — and only where the pre-check says that resume loads every turn.
-/// NEGATIVE CONTROLS: an unsafe resume is told no line, and no session names
-/// none.
 #[test]
 fn the_told_line_is_safe_to_run() {
     let rig = Rig::new("told", 1, true, false, Files::default());
@@ -2370,49 +2115,13 @@ fn the_told_line_is_safe_to_run() {
 }
 
 /// Tier-1 of `HarnessGeminiExitWitness` (aterm-models-harness
-/// `harness_gemini_exit_witness_model`): every look of the model — its child
-/// killed (`1`), its parent killed (`137`), a graceful way out (`0`), a
-/// refused start (`42`), a status the table names nothing for (`143`), its
-/// own restart refused for its `--session-id` (`42` from a worker's launch,
-/// its first prompt attached or not); its own header alone since its start,
-/// a second one (a `/clear`), its own never written and another launch's
-/// begun 30 s after it (a bare `gemini`), or an in-TUI `/resume`'s switch
-/// with a start's summary written after it; its resume safe or loading an
-/// empty duplicate; its session holding a turn or none; the shell's word
-/// drawn, not yet, or another command's block newest since — is replayed
-/// through the real `look_at_exit` and `exit_record` over a stand-in tab and
-/// the session files on disk, and keeps what the model's does; every attempt
-/// goes through the real `after_exit`, relaunches exactly where the model's
-/// `Decide` does — a crash continued after its line, its own restart quiet
-/// (`done:resumed`) — and types nothing where it does not. Every exit is
-/// replayed on a worker's `--session-id` launch, prompted or not (whose `42`
-/// would be its own restart: an earlier version the
-/// binding gave its crashes a `--resume` launch alone), and the exits no own
-/// restart can be once more on a `--resume` launch. Negative controls:
-/// where the `Buggy = 1` model looks at the exit as Claude Code's
-/// (`LookAsClaude`), reads a refusal as a crash (`RefusalAsCrash`), its
-/// child's death as a refusal (`ChildDeathAsRefusal`) or its own restart as a
-/// refusal (`RestartAsRefusal`), trusts a non-unique witness
-/// (`NonUniqueTrusted`), a late header (`LateHeaderTrusted`) or a file whose
-/// switch a summary follows (`SwitchHiddenBySummary`), skips the pre-check
-/// (`PrecheckSkipped`), leaves its own bare restart that took no turn
-/// (`TurnlessRestartLeft`), resumes a session with no turn whatever ended it
-/// (`TurnlessResumed`), resumes a crash whose word is gone by the attempt as
-/// its own restart (`GoneWordReadAsRestart`), or continues after its own
-/// restart's line (`RestartContinued`), the real code decides otherwise —
-/// each caught on its own.
 #[test]
 #[allow(clippy::too_many_lines)]
 fn tier1_the_real_gemini_exit_read_conforms_to_the_model() {
     use std::collections::{BTreeMap, BTreeSet, VecDeque};
     let m = aterm_models_harness::harness_gemini_exit_witness_model();
     let buggy = aterm_spec::interp::with_buggy(&m, 1);
-    // One rig, reset to each world in turn ([`Rig::reset`]).
     let mut rig = Rig::new("tier1", 0, true, false, Files::default());
-    // A refused start (`exit` 3) is drawn as `42` on a `--resume` launch
-    // (an id it does not hold), and as `41` (no credential) on a worker's
-    // `--session-id` launch, whose `42` under a session the rule names is
-    // its own restart (`exit` 6) by the table itself.
     let draw = |rig: &mut Rig, st: &BTreeMap<&'static str, i64>, resumed: bool| {
         let (exit, rule) = (st["exit"], st["rule"]);
         let status = match exit {
@@ -2440,12 +2149,6 @@ fn tier1_the_real_gemini_exit_read_conforms_to_the_model() {
             },
         );
     };
-    // What the host snapped while it ran: a worker's `--session-id S1`
-    // launch (every worker's, `harness::worker`), its first prompt attached
-    // where the model's `prompt` says, named as the rule named it; with
-    // `resumed`, for an exit no own restart can be, `gemini --resume S1`
-    // (its prompt `-i …`, or none), named; a bare `gemini` whose own header
-    // was never written, named nothing.
     let snapped = |rig: &Rig, st: &BTreeMap<&'static str, i64>, resumed: bool| {
         let (rule, exit, prompt) = (st["rule"], st["exit"], st["prompt"] == 1);
         let mut snap = rig.snap((rule != 2).then_some(S1));
@@ -2491,8 +2194,6 @@ fn tier1_the_real_gemini_exit_read_conforms_to_the_model() {
                     queue.push_back(next);
                 }
             }
-            // The `--resume` launch's pass replays the exits no own restart
-            // can be, the session named.
             if st["exit"] == 0
                 || st["decided"] > 0
                 || (resumed && (st["exit"] == 6 || st["rule"] == 2))
@@ -2624,8 +2325,6 @@ fn tier1_the_real_gemini_exit_read_conforms_to_the_model() {
 }
 
 /// Whether the model state `st` is the first of its kind `what` (a look, an
-/// attempt) the bind replays: the real code sees only the exit, the files,
-/// the word and what the look kept.
 fn looked_once(
     done: &mut std::collections::BTreeSet<(&'static str, [i64; 9])>,
     st: &std::collections::BTreeMap<&'static str, i64>,

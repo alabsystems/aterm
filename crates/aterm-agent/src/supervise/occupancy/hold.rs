@@ -142,7 +142,27 @@ pub struct HoldClock {
 }
 
 impl HoldClock {
-    /// One event. `Some` when the hold opened, was declared or closed.
+    /// One event. `Some` when the hold opened, was declared or closed. `OccupancyDoor`'s
+    /// `IdleRead` is a background read of a new break with the hold open: it neither ends nor
+    /// restarts the hold. Its `HoldCloses` is a live turn's edge the harness did not type, or a
+    /// decided point that acts or finds no background work, and never the turn answering a
+    /// harness line or the point that ends that answer.
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "OccupancyDoor",
+            action = "IdleRead",
+            project = "conformance_occupancy::project"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "OccupancyDoor",
+            action = "HoldCloses",
+            project = "conformance_occupancy::project"
+        )
+    )]
     pub fn step(&mut self, event: HoldEvent) -> Option<HoldChange> {
         match event {
             HoldEvent::Background {
@@ -152,6 +172,9 @@ impl HoldClock {
             } => {
                 self.live = false;
                 if self.since_ms.is_some() {
+                    if super::fault::armed(super::fault::Fault::RestartOnIdle) {
+                        self.since_ms = Some(since_ms);
+                    }
                     self.seen_ms = self.seen_ms.max(now_ms);
                     return None;
                 }
@@ -196,7 +219,7 @@ impl HoldClock {
                 if std::mem::replace(&mut self.live, true) {
                     return None;
                 }
-                if ours {
+                if ours && !super::fault::armed(super::fault::Fault::CloseOnOurTurn) {
                     if self.answer == Answer::Owed {
                         self.answer = Answer::Running;
                     }
@@ -209,10 +232,13 @@ impl HoldClock {
                 self.live = false;
                 // The point that ends the answer to the harness's own line: neither ends the
                 // hold nor restarts it (F5).
-                if std::mem::take(&mut self.answer) != Answer::None {
+                if std::mem::take(&mut self.answer) != Answer::None
+                    && !super::fault::armed(super::fault::Fault::CloseAtTheAnswer)
+                {
                     return None;
                 }
-                if acts || !background {
+                if acts || !background || super::fault::armed(super::fault::Fault::CloseAtAnyPoint)
+                {
                     self.close(Close::Point)
                 } else {
                     None

@@ -2,38 +2,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! The apply-time re-verify anchor: [`tree_root`] (§4.2/§8).
-//!
-//! A bundle's compressed-asset `sha256` proves download integrity, but the extracted
-//! directory cannot be re-checked against it. So the signed per-build manifest also
-//! carries a `tree_root`: a SHA-256 over the sorted `(relpath \0 mode \0 content-sha256)`
-//! lines of every extracted file. Recomputing it over the staged tree under the store
-//! lock, immediately before the activation flip, closes the extract→activate TOCTOU
-//! window: a file swapped after extraction, or a partial extraction, changes the root and
-//! the apply fails.
-//!
-//! Symlinks (a `links` entry at `bin/<tool>`, or an in-root link inside a vendor archive or
-//! `.app` bundle) contribute one line each in the same framing, with the literal tag
-//! `symlink` in the mode slot and the SHA-256 of the link's raw target bytes in the digest
-//! slot ([`symlink_line`]). The tag is never an octal digit string, so a link and a file
-//! cannot collide; the target is digested so a `\0` or `\n` in it cannot break the
-//! framing; and the link's own permission bits are left out (`lstat` reports 0777 on
-//! Linux, 0755 on macOS). Roots signed before links were admitted are unchanged.
-//!
-//! The hash is content integrity, not the signature root (that stays `ring`, §8). It
-//! streams each file, so a multi-GB sysroot is never buffered whole. The byte format below
-//! is the contract the publish-side producer must reproduce.
-//!
-//! Two slots a platform can get wrong:
-//!
-//! * the separator is `/` by contract, but `Path::join` spells it `\` on Windows;
-//!   [`rel_line_bytes`] is the one place a relpath becomes line bytes, and it writes `/`
-//!   everywhere;
-//! * the mode is the permission bits the extractor was asked to apply (`0755`/`0644` after
-//!   `safe_mode`, `0755` for a raw binary). A filesystem that stores them hands the same
-//!   number back, and the client folds the read-back so one that stores something else
-//!   fails closed. A filesystem with no POSIX bits reads back `0`, so there the fold is the
-//!   declared mode ([`crate::platform::folded_mode`]), and the on-disk walk takes it from a
-//!   [`DeclaredModes`] record beside the build ([`tree_root_declared`]).
 
 use std::collections::BTreeMap;
 use std::io::{self, Read};
@@ -43,17 +11,10 @@ use aterm_digest::Sha256;
 
 use crate::manifest::DigestAlg;
 
-/// The permission bits a stage declared for each regular file it laid, keyed by the
-/// file's line bytes ([`rel_line_bytes`]): what the on-disk walk folds into the mode slot
-/// on a filesystem with no permission bits to read back. Where the filesystem has them the
-/// walk reads the inode and this map is not consulted.
+/// The permission bits a stage declared for each regular file it laid, keyed by the file's line bytes ([`rel_line_bytes`]): what the on-disk walk folds into the mode slot on a filesystem with no permission bits to read back.
 pub type DeclaredModes = BTreeMap<Vec<u8>, u32>;
 
-/// The line bytes of a path relative to the tree root: its raw OS bytes with the separator
-/// spelled `/`, the one producer of the relpath slot, shared by the on-disk walk and the
-/// extraction-time fold ([`crate::extract::rel_bytes_under`]). On Unix that is
-/// [`crate::platform::os_str_bytes`] unchanged; on Windows a `\` can never be part of a
-/// file name, so every `\` is a separator and becomes `/`.
+/// The line bytes of a path relative to the tree root: its raw OS bytes with the separator spelled `/`, the one producer of the relpath slot, shared by the on-disk walk and the extraction-time fold ([`crate::extract::rel_bytes_under`]).
 #[inline]
 #[must_use]
 pub(crate) fn rel_line_bytes(rel: &Path) -> Vec<u8> {
@@ -71,57 +32,22 @@ pub(crate) fn rel_line_bytes(rel: &Path) -> Vec<u8> {
 }
 
 /// Compute the [`tree_root`](self) over the directory at `root`.
-///
-/// For every **regular file** under `root` (recursively) an entry is formed:
-/// `<relpath-bytes> 0x00 <octal-perm-bits> 0x00 <lowercase-hex content sha256> 0x0A`,
-/// where `relpath` is relative to `root` (raw OS bytes, `/`-separated) and the perm bits
-/// are `mode & 0o7777`. The entries are **sorted by relpath bytes** (so the result is
-/// independent of directory-walk order) and concatenated, and the SHA-256 of that stream
-/// is returned as lowercase hex.
-///
-/// A **symlink** contributes a [`symlink_line`] (never followed, never descended). Any
-/// other entry type — device, fifo, socket — is **fail-closed**: the extractor never lays
-/// one down, so meeting one here means tampering or a bug, and this returns an error
-/// rather than silently skipping it.
-///
-/// The mode slot is the inode's stored bits; on a filesystem that stores none (Windows)
-/// this folds `0` for every file and matches no signed root, so callers with the stage's
-/// declared modes use [`tree_root_declared`].
 #[inline]
 pub fn tree_root(root: &Path) -> io::Result<String> {
     tree_root_declared(root, &DeclaredModes::new())
 }
 
-/// [`tree_root`], with the stage's [`DeclaredModes`] to fold on a filesystem that has no
-/// permission bits of its own.
-///
-/// Where the filesystem stores bits ([`crate::platform::HAS_POSIX_MODES`]) the walk reads
-/// them back and `modes` is never consulted, so on Unix this IS `tree_root`. Where it
-/// stores none, each regular file folds the mode `modes` declares for its line bytes, and
-/// a file the record does not name folds `0` — a file the stage did not lay is drift
-/// whatever its mode slot says, so the miss can only fail closed.
-///
+/// [`tree_root`], with the stage's [`DeclaredModes`] to fold on a filesystem that has no permission bits of its own.
 /// # Errors
-/// The walk's I/O errors, and the fail-closed refusal of a non-file, non-dir, non-link
-/// entry.
+/// The walk's I/O errors, and the fail-closed refusal of a non-file, non-dir, non-link entry.
 pub fn tree_root_declared(root: &Path, modes: &DeclaredModes) -> io::Result<String> {
     let mut entries: Vec<Vec<u8>> = Vec::new();
-    // One read buffer for the whole walk: a per-file 64 KiB local is zeroed per call (LLVM
-    // cannot elide it behind `Read::read`), a gigabyte-scale memset over a sysroot's tens
-    // of thousands of files. Heap `vec!`, not `Box::new([0u8; N])`, which builds the array
-    // on the stack first.
     let mut buf = vec![0u8; 64 * 1024];
     walk(root, root, modes, &mut entries, &mut buf)?;
     Ok(root_of_entry_lines(entries))
 }
 
-/// Fold a set of canonical entry lines ([`entry_line`]) into the tree root: sort,
-/// concatenate, SHA-256, lowercase hex.
-///
-/// Shared with the extraction-time accumulator in [`crate::extract`], so the two producers
-/// of this cross-version byte contract (signed manifests embed roots computed by earlier
-/// releases) have one formatter and one fold. Sorting whole lines equals sorting by
-/// relpath when relpaths are distinct, since a path byte is never `0x00`.
+/// Fold a set of canonical entry lines ([`entry_line`]) into the tree root: sort, concatenate, SHA-256, lowercase hex.
 pub(crate) fn root_of_entry_lines(mut entries: Vec<Vec<u8>>) -> String {
     entries.sort();
     let mut h = Sha256::new();
@@ -131,18 +57,13 @@ pub(crate) fn root_of_entry_lines(mut entries: Vec<Vec<u8>>) -> String {
     aterm_codec::hex::encode_lower(&h.finalize())
 }
 
-/// Build one canonical entry line: `<relpath-bytes> 0x00 <octal-perm-bits> 0x00
-/// <lowercase-hex content sha256> 0x0A` (see [`tree_root`]). `mode` is
-/// [`crate::platform::folded_mode`]'s answer, masked to `0o7777` by the caller: on Unix the
-/// bits read back (not the ones requested, so a filesystem that stores something else
-/// fails closed); on Windows the mode the extractor was asked to apply.
+/// Build one canonical entry line: `<relpath-bytes> 0x00 <octal-perm-bits> 0x00 <lowercase-hex content sha256> 0x0A` (see [`tree_root`]).
 #[inline]
 pub(crate) fn entry_line(rel_bytes: &[u8], mode: u32, content_sha_hex: &str) -> Vec<u8> {
     framed_line(rel_bytes, oct_mode(mode).as_bytes(), content_sha_hex)
 }
 
-/// The mode-slot tag of a symlink's entry line. Never a run of octal digits, so it cannot
-/// collide with any regular file's permission bits (see the module docs).
+/// The mode-slot tag of a symlink's entry line.
 pub(crate) const SYMLINK_TAG: &str = "symlink";
 
 /// Lowercase-hex SHA-256 of a symlink's raw target bytes — the digest slot of its line.
@@ -151,20 +72,14 @@ pub(crate) fn symlink_target_sha(target_bytes: &[u8]) -> String {
     sha256_bytes(target_bytes)
 }
 
-/// Build one canonical entry line for a symlink: `<relpath-bytes> 0x00 symlink 0x00
-/// <lowercase-hex sha256 of the raw target bytes> 0x0A`. `target_sha_hex` comes from
-/// [`symlink_target_sha`]; both producers of the digest (the on-disk walk and the
-/// extraction-time fold in [`crate::extract`]) go through this one function.
+/// Build one canonical entry line for a symlink: `<relpath-bytes> 0x00 symlink 0x00 <lowercase-hex sha256 of the raw target bytes> 0x0A`.
 #[inline]
 pub(crate) fn symlink_line(rel_bytes: &[u8], target_sha_hex: &str) -> Vec<u8> {
     framed_line(rel_bytes, SYMLINK_TAG.as_bytes(), target_sha_hex)
 }
 
 /// The one line framer: `<rel> 0x00 <mode-slot> 0x00 <digest> 0x0A`; the mode slot is the
-/// only thing a symlink line fills differently.
 fn framed_line(rel_bytes: &[u8], mode_slot: &[u8], digest_hex: &str) -> Vec<u8> {
-    // A saturating, capped capacity hint (for the allocation-budget recognizer); the `Vec`
-    // grows as needed.
     let cap = rel_bytes
         .len()
         .saturating_add(digest_hex.len())
@@ -184,8 +99,6 @@ fn framed_line(rel_bytes: &[u8], mode_slot: &[u8], digest_hex: &str) -> Vec<u8> 
 }
 
 /// Recursively collect one canonical entry line per regular file and symlink under `dir`,
-/// hashing each file through the caller's single reusable `buf`; `modes` is the
-/// declared-mode record [`tree_root_declared`] folds where the inode stores no bits.
 fn walk(
     root: &Path,
     dir: &Path,
@@ -194,13 +107,9 @@ fn walk(
     buf: &mut [u8],
 ) -> io::Result<()> {
     let mut children: Vec<_> = std::fs::read_dir(dir)?.collect::<Result<Vec<_>, _>>()?;
-    // Deterministic recursion order (the final sort over relpaths makes this belt-and-
-    // suspenders, but it keeps the walk itself reproducible).
     children.sort_by_key(std::fs::DirEntry::file_name);
     for child in children {
         let path = child.path();
-        // symlink_metadata: never follow a link. A link is checked first so a link to a
-        // directory is a line, never a descent.
         let meta = std::fs::symlink_metadata(&path)?;
         let ft = meta.file_type();
         if ft.is_symlink() {
@@ -209,8 +118,6 @@ fn walk(
             })?;
             let target = std::fs::read_link(&path)?;
             let rel_bytes = rel_line_bytes(rel);
-            // The target stays raw: it is digested, not framed, so a `\` in it is the
-            // target's own business.
             let target_bytes = crate::platform::os_str_bytes(target.as_os_str());
             out.push(symlink_line(&rel_bytes, &symlink_target_sha(target_bytes)));
         } else if ft.is_dir() {
@@ -220,8 +127,6 @@ fn walk(
                 io::Error::new(io::ErrorKind::InvalidData, "path escaped tree root")
             })?;
             let rel_bytes = rel_line_bytes(rel);
-            // The inode's bits where the filesystem stores them (Unix: what the stage
-            // `fchmod`ed, read back); the stage's declared mode where it stores none.
             let mode = if crate::platform::HAS_POSIX_MODES {
                 crate::platform::permission_mode(&meta) & 0o7777
             } else {
@@ -240,13 +145,7 @@ fn walk(
     Ok(())
 }
 
-/// The relpath slot ([`rel_line_bytes`]) of every line [`tree_root`] folds under `root`,
-/// sorted: each regular file and symlink, recursively, from the directory listings alone
-/// (no file opened, no link followed). Any other non-directory entry is listed too, so a
-/// name nobody folded is a mismatch, never a skip. A stage holds its fold's names against
-/// it ([`crate::extract::TreeAccumulator::require_spelled_back`]): a filesystem may store
-/// a name under other bytes.
-///
+/// The relpath slot ([`rel_line_bytes`]) of every line [`tree_root`] folds under `root`, sorted: each regular file and symlink, recursively, from the directory listings alone (no file opened, no link followed).
 /// # Errors
 /// The listing's I/O errors.
 pub(crate) fn line_names(root: &Path) -> io::Result<Vec<Vec<u8>>> {
@@ -261,7 +160,6 @@ fn collect_line_names(root: &Path, dir: &Path, out: &mut Vec<Vec<u8>>) -> io::Re
     for child in std::fs::read_dir(dir)? {
         let child = child?;
         let path = child.path();
-        // `DirEntry::file_type` does not follow a link.
         if child.file_type()?.is_dir() {
             collect_line_names(root, &path, out)?;
         } else {
@@ -274,16 +172,13 @@ fn collect_line_names(root: &Path, dir: &Path, out: &mut Vec<Vec<u8>>) -> io::Re
     Ok(())
 }
 
-/// Render the masked permission bits in octal: minimal digits, no leading zeros, so `0`
-/// renders as `"0"` and `0o644` as `"644"`. The declared-mode record beside a build
-/// (`store::write_declared_modes`) spells its numbers the same way.
+/// Render the masked permission bits in octal: minimal digits, no leading zeros, so `0` renders as `"0"` and `0o644` as `"644"`.
 #[inline]
 pub(crate) fn oct_mode(mode: u32) -> String {
     format!("{:o}", mode & 0o7777)
 }
 
-/// SHA-256 of bytes in memory → lowercase hex: [`sha256_file`]'s digest of a file
-/// holding exactly these bytes.
+/// SHA-256 of bytes in memory → lowercase hex: [`sha256_file`]'s digest of a file holding exactly these bytes.
 #[inline]
 #[must_use]
 pub fn sha256_bytes(bytes: &[u8]) -> String {
@@ -292,39 +187,26 @@ pub fn sha256_bytes(bytes: &[u8]) -> String {
     aterm_codec::hex::encode_lower(&h.finalize())
 }
 
-/// Streamed SHA-256 of a file's contents → lowercase hex (public producer helper: the
-/// publish pipeline computes a manifest's `sha256` with the *same* hash the client checks).
+/// Streamed SHA-256 of a file's contents → lowercase hex (public producer helper: the publish pipeline computes a manifest's `sha256` with the *same* hash the client checks).
 #[inline]
 pub fn sha256_file(path: &Path) -> io::Result<String> {
     file_sha256(path)
 }
 
 /// Streamed SHA-256 of a file's contents → lowercase hex; never buffers the whole file.
-/// Reused by the install path for the downloaded-asset check (§9). The tree walk calls
-/// [`file_sha256_with`] with one buffer instead.
 pub(crate) fn file_sha256(path: &Path) -> io::Result<String> {
     let mut buf = vec![0u8; 64 * 1024];
     file_sha256_with(path, &mut buf)
 }
 
 /// [`file_sha256`] against a caller-owned read buffer — the per-file body, with the
-/// buffer hoisted out of the hot per-file frame.
 fn file_sha256_with(path: &Path, buf: &mut [u8]) -> io::Result<String> {
     let mut h = BulkSha256::new();
     read_chunks(path, buf, |chunk| h.update(chunk))?;
     Ok(h.finalize_hex())
 }
 
-/// Streaming SHA-256 for bulk content: the downloaded archive's signed digest
-/// ([`file_sha256`], which `install::check_signed_digest` gates on) and the content slot of
-/// each extracted file's [`entry_line`] (the fold in [`crate::extract`] and the on-disk
-/// [`walk`]), so every byte an install lays passes through it twice.
-///
-/// The same FIPS 180-4 digest as `aterm_digest::Sha256` (signed digests and roots are
-/// cross-version contracts; the differential test below holds the two equal), on ring,
-/// which uses the CPU's SHA-256 instructions: a 1 GiB file hashes in 0.42 s against the
-/// scalar reference's 2.70 s on an M4 Max. Small inputs (the entry-line fold, symlink
-/// targets, manifests) stay on aterm_digest.
+/// Streaming SHA-256 for bulk content: the downloaded archive's signed digest ([`file_sha256`], which `install::check_signed_digest` gates on) and the content slot of each extracted file's [`entry_line`] (the fold in [`crate::extract`] and the on-disk [`walk`]), so every byte an install lays passes through it twice.
 pub(crate) struct BulkSha256(ring::digest::Context);
 
 impl BulkSha256 {
@@ -345,8 +227,7 @@ impl BulkSha256 {
     }
 }
 
-/// Streamed SHA-512 of a file's contents → lowercase hex: the payload digest of a vendor
-/// that signs only SHA-512 ([`DigestAlg::Sha512`]). Never buffers the whole file.
+/// Streamed SHA-512 of a file's contents → lowercase hex: the payload digest of a vendor that signs only SHA-512 ([`DigestAlg::Sha512`]).
 pub(crate) fn file_sha512(path: &Path) -> io::Result<String> {
     let mut h = ring::digest::Context::new(&ring::digest::SHA512);
     let mut buf = vec![0u8; 64 * 1024];
@@ -370,8 +251,6 @@ fn read_chunks(path: &Path, buf: &mut [u8], mut update: impl FnMut(&[u8])) -> io
         if n == 0 {
             return Ok(());
         }
-        // The `Read` contract guarantees `n <= buf.len()` (`File` keeps it); `min` keeps
-        // a nonconforming reader from panicking the slice.
         update(&buf[..n.min(buf.len())]);
     }
 }
@@ -393,7 +272,6 @@ mod tests {
         std::fs::write(p, content).unwrap();
     }
 
-    // A file longer than one read buffer streams to the one-shot digest.
     #[test]
     fn a_long_file_streams_to_the_one_shot_digest() {
         let d = tmp("vec");
@@ -417,10 +295,6 @@ mod tests {
     }
 
     /// [`BulkSha256`] gives the scalar reference's digest (archive digests and tree roots
-    /// are signed, cross-version contracts): FIPS 180-4's published vectors, then
-    /// pseudo-random messages split in two at each awkward boundary (empty, one byte, the
-    /// padding's 55/56, a block's 63/64/65, past a 64 KiB read buffer) and fed in runs of
-    /// awkward chunk sizes.
     #[test]
     fn bulk_sha256_is_the_reference_digest() {
         let bulk = |parts: &[&[u8]]| {
@@ -458,7 +332,6 @@ mod tests {
             assert_eq!(aterm_codec::hex::encode_lower(&Sha256::digest(msg)), want);
         }
 
-        // xorshift64 from a fixed seed: the same bytes on every run.
         let mut x = 0x9e37_79b9_7f4a_7c15_u64;
         let data: Vec<u8> = (0..(1 << 20) + 1)
             .map(|_| {
@@ -484,11 +357,6 @@ mod tests {
     }
 
     /// The cross-version byte contract pinned to a literal, computed independently from the
-    /// documented format (`sort(<relpath> 0x00 <octal mode> 0x00 <hex sha256> 0x0A)`,
-    /// concatenated, SHA-256): the recompute tests stay green if the primitive, framing or
-    /// sort changes, and signed manifests embed roots from earlier releases. On Unix the
-    /// plain walk reads the fixture's bits back; on Windows the declared-mode walk must give
-    /// the same number.
     #[test]
     fn tree_root_matches_the_pinned_cross_version_vector() {
         const GOLDEN: &str = "e44608970d54f90c4d54ad7852b174304b86395b89f59b3fcc04a11ae22e38e0";
@@ -519,7 +387,6 @@ mod tests {
     }
 
     /// The relpath slot is `/`-separated on every platform, though `Path::join` spells the
-    /// separator `\` on Windows.
     #[test]
     fn rel_line_bytes_spell_the_separator_as_a_slash() {
         let rel = Path::new("bin").join("sub").join("claude.exe");
@@ -531,8 +398,6 @@ mod tests {
     }
 
     /// A signed one-file row (`bin/claude.exe`, mode `0755`) folds to its signed root from
-    /// exactly that line, and the same content under a `\` separator and a `0` mode folds
-    /// to the different digest a client with those spellings produced.
     #[test]
     fn the_measured_windows_claude_row_folds_from_the_declared_line() {
         const CONTENT: &str = "0e4195524b73eb77efbdf3e2b36de5322a29f0ca575dfd2d9b4f946b1d425469";
@@ -547,8 +412,6 @@ mod tests {
             former_windows_fold,
             "3a446f3033188e9ec3bdaa0868f30863bc7508d3986290fc803316fa7dcd18b5"
         );
-        // The declared-mode walk over a stand-in file with that layout folds the declared
-        // line whatever the platform stores: `/`-spelled, the declared mode, never `0`.
         let d = tmp("claude-row");
         write(&d.join("bin/claude.exe"), b"stand-in");
         let mut modes = DeclaredModes::new();
@@ -568,7 +431,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
-    // Any change — content, mode, added/removed file — moves the root (TOCTOU detection).
     #[test]
     fn tree_root_changes_on_any_mutation() {
         let d = tmp("mut");
@@ -576,14 +438,12 @@ mod tests {
         write(&d.join("data"), b"x");
         let base = tree_root(&d).unwrap();
 
-        // Content change.
         write(&d.join("data"), b"y");
         let changed_content = tree_root(&d).unwrap();
         assert_ne!(base, changed_content, "content change must move the root");
-        write(&d.join("data"), b"x"); // restore
+        write(&d.join("data"), b"x");
         assert_eq!(tree_root(&d).unwrap(), base);
 
-        // Mode change — chmod fixture, Unix-only.
         #[cfg(unix)]
         {
             let exe = d.join("bin/ay");
@@ -593,8 +453,6 @@ mod tests {
             let restored = tree_root(&d).unwrap();
             assert_ne!(changed_mode, restored, "mode change must move the root");
         }
-        // A declared mode change moves the declared-mode walk where it folds (Windows); on
-        // Unix the record is not consulted and both roots are the read-back root.
         {
             let mut exec = DeclaredModes::new();
             exec.insert(b"bin/ay".to_vec(), 0o755);
@@ -616,7 +474,6 @@ mod tests {
             }
         }
 
-        // Added file.
         let before_add = tree_root(&d).unwrap();
         write(&d.join("extra"), b"new");
         assert_ne!(
@@ -628,8 +485,7 @@ mod tests {
     }
 
     /// A symlink is digested by its raw target bytes, never followed or skipped, and the
-    /// digest moves exactly when the target string moves; a dangling link is a good line.
-    #[cfg(unix)] // symlink fixture — Unix-only
+    #[cfg(unix)]
     #[test]
     fn a_symlink_is_digested_by_its_target_bytes_and_never_followed() {
         let d = tmp("link");
@@ -637,14 +493,11 @@ mod tests {
         std::os::unix::fs::symlink("real", d.join("link")).unwrap();
         let base = tree_root(&d).unwrap();
         assert_eq!(base, tree_root(&d).unwrap(), "deterministic");
-        // Not followed: the link's own line is a function of the target string, so a
-        // second link with the same target string is the same line at another path.
         std::os::unix::fs::symlink("real", d.join("link2")).unwrap();
         let with_twin = tree_root(&d).unwrap();
         assert_ne!(base, with_twin, "an added link must move the root");
         std::fs::remove_file(d.join("link2")).unwrap();
         assert_eq!(tree_root(&d).unwrap(), base);
-        // The target string moves the root, even when both strings resolve to nothing.
         std::fs::remove_file(d.join("link")).unwrap();
         std::os::unix::fs::symlink("nowhere", d.join("link")).unwrap();
         let dangling = tree_root(&d).unwrap();
@@ -652,8 +505,6 @@ mod tests {
         std::fs::remove_file(d.join("link")).unwrap();
         std::os::unix::fs::symlink("elsewhere", d.join("link")).unwrap();
         assert_ne!(dangling, tree_root(&d).unwrap());
-        // A link to a directory is a line, not a descent: the files behind it are hashed
-        // once, under their own paths.
         write(&d.join("sub/inner"), b"inner");
         std::fs::remove_file(d.join("link")).unwrap();
         std::os::unix::fs::symlink("sub", d.join("link")).unwrap();
@@ -665,8 +516,6 @@ mod tests {
     }
 
     /// The symlink line pinned to a literal computed independently from the documented
-    /// format, `sort(<relpath> 0x00 symlink 0x00 <hex sha256(target bytes)> 0x0A ...)`
-    /// concatenated and hashed, over `real` (content `x`, mode 0644) and `link -> real`.
     #[cfg(unix)]
     #[test]
     fn symlink_tree_root_matches_the_pinned_cross_version_vector() {
@@ -679,7 +528,6 @@ mod tests {
             "9b629b43d3775c6c84f676fd875ce601e5d9c3473b8e71b6470b12d48ee2d952",
             "the symlink line moved: every vendor manifest signed against it disagrees"
         );
-        // The line itself, spelled out, so the framing is pinned and not only the fold.
         assert_eq!(
             symlink_line(b"link", &symlink_target_sha(b"real")),
             b"link\0symlink\0aa33996d60e89311b4d1a920dae03c6d7fa3ae1956c52662e273aad4683e577f\n"

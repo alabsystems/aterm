@@ -2,65 +2,6 @@
 // Copyright 2026 Andrew Yates
 
 //! THE PUBLISHER CONNECTION, WITH THE ACKS IT HAS NOT READ YET.
-//!
-//! A blocking `Publish` costs one round trip and, on the broker's `Strict` log,
-//! one `fsync` of its own: the broker's group commit folds every write it finds
-//! queued into one flush, and a connection that waits for each ack before
-//! sending the next never has a second write queued. astream's client can keep
-//! many publishes in flight on one connection — `Client::send_publish` now,
-//! `Client::recv_publish_ack` later, in the SAME order, because the broker
-//! answers a connection's writes in the order it read them — and those share
-//! one group-commit flush.
-//!
-//! The price is a rule: every other request reads ITS reply as the next frame
-//! (`Fetch`, `Last`, `Commit`, `Will`, `Budget`, `Keepalive`, a blocking
-//! `Publish`), so it may be sent only once every pipelined ack ahead of it has
-//! been read. A request sent with an ack unread would take that ack for its own
-//! reply — a commit that answers some publish's offset, a `Fetch` that fails on
-//! a reply of the wrong kind and leaves the connection out of step.
-//!
-//! Two guards keep it. The FIRST is astream's client: it counts the acks it
-//! owes itself (`Client::owed_acks`) and refuses such a request, sending
-//! nothing, with its typed `AcksOwed` (`astream_broker::client::acks_owed`
-//! reads it back) — a refusal that leaves the connection in step, except for a
-//! subscribe, which consumes its client and so closes the connection. So a
-//! request sent past an ack fails at once and writes nothing, where it used to
-//! go out and read the ack as its reply
-//! (`a_request_behind_an_owed_ack_fails_loudly_and_sends_nothing`), and the
-//! bridge counts reaching it at all as its own bug: its verdict on every answer
-//! names it, and a build with debug assertions stops there
-//! (`bridge::sent_past_an_owed_ack`).
-//!
-//! The SECOND is [`Link`], the rule as a type, which carries what the client's
-//! bare count cannot. It owns the client and the queue of unread acks, each
-//! carrying what its sender wants done with the answer (`T`, and the riders
-//! hung on it after it was sent), and it hands the client out for a request
-//! that reads its own reply only while the queue is empty ([`Link::ready`]).
-//! There is no other way to reach the client mutably, so a request cannot be
-//! sent past an unread ack by a path that forgot to read it: it finds no
-//! connection and fails as an unreachable broker does, before the client's own
-//! refusal is ever reached. And the queue lives and dies with the connection —
-//! a dropped connection drops the acks owed on it, so they can never be read
-//! off the NEXT connection, which owes them nothing.
-//!
-//! THE GROUP COMMIT RIDES IT TOO, AND NOTHING HAS TO WAIT FOR AN ACK
-//! (aterm-0). astream answers a `Commit` through the same in-order ack stream
-//! as a publish (`Client::send_commit`), so the inbox group's commit is one
-//! more owed ack ([`Link::send_commit`]) rather than a request the loop parks
-//! on for a flush; and an owed ack can be read without waiting
-//! ([`Link::try_recv`], astream's frame-atomic `Client::try_recv_publish_ack`):
-//! the oldest answer if the broker has sent it, nothing if not, the
-//! connection in step either way. Where the bridge reads its acks — waiting
-//! only where a reply must be judged — is the bridge's (`Bridge::settle_owed`).
-//!
-//! WHAT IT DOES NOT PROMISE is that a refusal is sticky. The broker answers a
-//! connection's writes in order, but a write it refuses for a reason not known
-//! to be permanent — an append or `fsync` that failed — is refused with its
-//! BATCH, which the broker rolls back before it goes on to the next one. So
-//! with two publishes in flight the first can be refused and the second land
-//! (`a_refused_batch_lands_the_publish_sent_after_it`, on a real broker), and a
-//! caller whose records must land in its own order keeps one of them in flight
-//! at a time (`Bridge::settle_sender`, for a sender's posts).
 
 use std::collections::VecDeque;
 use std::io;
@@ -74,22 +15,17 @@ use crate::transport::Conn;
 pub(crate) struct Unacked<T> {
     /// The producer sequence it was sent under.
     pub seq: u64,
-    /// Whether this was the FIRST send of a sequence just reserved — the one
-    /// whose deduped answer is another writer's record, not a retry.
+    /// Whether this was the FIRST send of a sequence just reserved — the one whose deduped answer is another writer's record, not a retry.
     pub first: bool,
     /// When it was written to the connection.
     pub sent: Instant,
     /// What its sender wants done with the answer.
     pub tag: T,
-    /// A number hung on this ack AFTER it was sent ([`Link::ride`]), handed
-    /// back with its answer: the caller learns that what it was waiting on —
-    /// this publish and every one before it — has been answered on a
-    /// connection still in step.
+    /// A number hung on this ack AFTER it was sent ([`Link::ride`]), handed back with its answer: the caller learns that what it was waiting on — this publish and every one before it — has been answered on a connection still in step.
     pub rider: Option<u64>,
 }
 
-/// One owed publish and the broker's answer to it: `(offset, deduped)`, or the
-/// refusal or transport failure ([`Link::recv`]).
+/// One owed publish and the broker's answer to it: `(offset, deduped)`, or the refusal or transport failure ([`Link::recv`]).
 pub(crate) type Settled<T> = (Unacked<T>, io::Result<(u64, bool)>);
 
 /// The publisher connection and the acks owed on it, in send order.
@@ -97,8 +33,6 @@ pub(crate) struct Link<T> {
     client: Conn,
     unacked: VecDeque<Unacked<T>>,
     /// The most acks this connection has had unread at once: what a test reads
-    /// to know a burst went out without waiting on each answer. Kept by test
-    /// builds alone — nothing in the bridge reads it.
     #[cfg(test)]
     peak: usize,
 }
@@ -115,7 +49,6 @@ impl<T> From<Conn> for Link<T> {
 }
 
 /// Read-only access, for what asks the client nothing over the wire
-/// (`seen_log_identity`). Nothing here reaches it MUTABLY: see [`Link::ready`].
 impl<T> Deref for Link<T> {
     type Target = Conn;
     fn deref(&self) -> &Conn {
@@ -124,24 +57,13 @@ impl<T> Deref for Link<T> {
 }
 
 impl<T> Link<T> {
-    /// The client, for a request that reads its own reply — ONLY while no
-    /// pipelined ack is unread, so that reply is the next frame. `None`
-    /// otherwise: the caller reads the owed acks first ([`Link::recv`]).
+    /// The client, for a request that reads its own reply — ONLY while no pipelined ack is unread, so that reply is the next frame.
     pub fn ready(&mut self) -> Option<&mut Conn> {
         self.unacked.is_empty().then_some(&mut self.client)
     }
 
-    /// Write one publish WITHOUT waiting for its ack, and queue `tag` for the
-    /// answer. A publish that could not be written gives `tag` back with the
-    /// error: nothing is owed for it. A write that failed part-way latched the
-    /// client out of step (astream's `Client::send`), so every later request on
-    /// it fails too; one refused before a byte was written (a frame over the
-    /// cap) leaves it in step. `now` is when it was written, on the caller's
-    /// clock (the bridge's door, [`crate::fx::Fx::now`]): the ack's round trip
-    /// is measured from it.
-    ///
+    /// Write one publish WITHOUT waiting for its ack, and queue `tag` for the answer.
     /// # Errors
-    ///
     /// The send's, with the tag.
     #[allow(
         clippy::too_many_arguments,
@@ -172,20 +94,8 @@ impl<T> Link<T> {
         }
     }
 
-    /// Write a consumer group's COMMIT to `upto` WITHOUT waiting for its ack
-    /// (astream's `Client::send_commit`), and queue `tag` for the answer.
-    ///
-    /// The broker answers a commit as it answers a publish — in this
-    /// connection's order, with a `PublishAck` naming the commit record's
-    /// offset — so it is owed like one and read like one ([`Link::recv`],
-    /// [`Link::try_recv`]), and a request that reads its own reply is held
-    /// behind it ([`Link::ready`]). Its `seq` is 0 and it is never a `first`
-    /// send: a commit has no producer sequence, and its answer is never a
-    /// dedup. A commit that could not be written gives `tag` back, as
-    /// [`Link::send`] does.
-    ///
+    /// Write a consumer group's COMMIT to `upto` WITHOUT waiting for its ack (astream's `Client::send_commit`), and queue `tag` for the answer.
     /// # Errors
-    ///
     /// The send's, with the tag.
     pub fn send_commit(
         &mut self,
@@ -217,30 +127,14 @@ impl<T> Link<T> {
         }
     }
 
-    /// Read the OLDEST owed ack, answering it with the publish it belongs to —
-    /// `None` when nothing is owed. A refused publish is an `Err` carrying the
-    /// broker's refusal ([`astream_broker::BrokerRefusal`]) and leaves the
-    /// connection in step for the next ack; a transport failure leaves it out of
-    /// step, and every later `recv` fails at once.
+    /// Read the OLDEST owed ack, answering it with the publish it belongs to — `None` when nothing is owed.
     pub fn recv(&mut self) -> Option<Settled<T>> {
         let owed = self.unacked.pop_front()?;
         let answer = self.client.recv_publish_ack();
         Some((owed, answer))
     }
 
-    /// [`Link::recv`] WITHOUT WAITING: the oldest owed ack if the broker has
-    /// answered it already, and `None` when nothing is owed or its answer has
-    /// not arrived — astream's `Client::try_recv_publish_ack`, which keeps a
-    /// frame that only partly arrived for the next read (a try's or a blocking
-    /// one's), so a `None` leaves the connection in step owing what it owed.
-    /// A refusal or a transport failure is answered as [`Link::recv`] answers
-    /// it, with the publish it belongs to.
-    ///
-    /// What makes the read not wait is astream's: a live connection's socket
-    /// is put in non-blocking mode for the read and back after it. A stream
-    /// handed to `Client::from_stream` — the simulated bus's — reads as the
-    /// stream reads, which is how the simulation answers "not yet"
-    /// (`crate::fx::Fx::unwaited`).
+    /// [`Link::recv`] WITHOUT WAITING: the oldest owed ack if the broker has answered it already, and `None` when nothing is owed or its answer has not arrived — astream's `Client::try_recv_publish_ack`, which keeps a frame that only partly arrived for the next read (a try's or a blocking one's), so a `None` leaves the connection in step owing what it owed.
     pub fn try_recv(&mut self) -> Option<Settled<T>> {
         if self.unacked.is_empty() {
             return None;
@@ -264,15 +158,7 @@ impl<T> Link<T> {
         self.unacked.iter().map(|owed| &owed.tag)
     }
 
-    /// Hang `value` on the NEWEST owed ack whose tag `waits_on` names, to come
-    /// back with that ack's answer ([`Unacked::rider`]); a rider already there
-    /// keeps the larger of the two. Acks are read oldest first, so the rider
-    /// comes back only once every owed ack `waits_on` names up to it has been
-    /// answered too — and never, if the connection drops first, because the
-    /// queue drops with it.
-    ///
-    /// `false` when no owed ack is one `waits_on` names: nothing the caller
-    /// waits on is still unanswered, and nothing was hung.
+    /// Hang `value` on the NEWEST owed ack whose tag `waits_on` names, to come back with that ack's answer ([`Unacked::rider`]); a rider already there keeps the larger of the two.
     pub fn ride(&mut self, value: u64, waits_on: impl Fn(&T) -> bool) -> bool {
         let Some(owed) = self
             .unacked
@@ -300,15 +186,6 @@ impl<T> Link<T> {
 
 impl<T> Drop for Link<T> {
     /// A connection dropped with acks unread: what they answered is unknown.
-    /// Each record is on the broker or not, exactly as a blocking publish whose
-    /// connection failed mid-request would leave it, and each caller already
-    /// owns that outcome (a presence row is republished by the next attach, a
-    /// halt ack stays owed until one lands, an `ev` is a digest line, a post
-    /// stays queued under its pinned sequence and in flight, and its retry is
-    /// a dedup the broker answers with the record it holds). Said once,
-    /// on stderr, so the count is not lost with the queue. A rider hung on one
-    /// of them ([`Link::ride`]) is never handed back: what it waited on stays
-    /// unproven, which is the point of hanging it there.
     fn drop(&mut self) {
         if !self.unacked.is_empty() {
             eprintln!(
@@ -325,14 +202,12 @@ mod tests {
     use super::*;
 
     /// Serve a scratch broker and connect a [`Link`] to it, with a second plain
-    /// client for reading what landed.
     fn served() -> (
         aterm_tempfile::TempDir,
         astream_broker::BrokerHandle,
         Link<u32>,
         Conn,
     ) {
-        // Below the Unix sockaddr bound, whatever the runner's TMPDIR.
         let dir = aterm_tempfile::Builder::new()
             .prefix("al-p")
             .tempdir_in("/tmp")
@@ -352,18 +227,12 @@ mod tests {
     }
 
     /// **A BURST GOES OUT WHOLE, AND EACH ANSWER FINDS ITS OWN RECORD.** Ten
-    /// publishes are written before one ack is read; while any is owed the
-    /// client is not handed out for a request that reads its own reply; the
-    /// acks come back in send order, each naming its own sequence and its own
-    /// offset; and once they are read the connection serves a `Fetch` that
-    /// sees all ten. A refused publish in the middle (a subject the broker
-    /// refuses) is ITS answer alone — the one behind it still lands and is
-    /// still attributed to its own tag.
     #[test]
     fn a_burst_is_sent_before_any_ack_and_every_answer_is_its_own() {
         let (_dir, _server, mut link, mut reader) = served();
         for i in 0..10u32 {
             let subject = if i == 4 {
+                // empty-segment".to_string()
                 "/f/f//empty-segment".to_string()
             } else {
                 format!("/f/f/x/{i}")
@@ -423,20 +292,6 @@ mod tests {
     }
 
     /// **A REQUEST BEHIND AN OWED ACK FAILS LOUDLY, AND SENDS NOTHING** — the
-    /// FIRST guard (the module doc), astream's own, reached the one way nothing
-    /// in this crate can: past [`Link::ready`], straight to the client. A
-    /// `Fetch` and a `Commit` written behind a pipelined publish's unread ack
-    /// once read that ack as their own reply (a fetch that failed on a reply of
-    /// the wrong kind and latched the client, a commit that answered the
-    /// publish's offset); now each is refused with astream's typed `AcksOwed`,
-    /// naming the one ack owed, and NOTHING is written: the ack read next is
-    /// the publish's own, and the blocking
-    /// publish after it is answered in step, one offset on — a fetch that had
-    /// gone out would have left its rows on the stream for that publish to
-    /// read, and the client would have latched.
-    ///
-    /// Negative control: the same fetch with nothing owed is answered, rows
-    /// and all — the refusal was the owed ack's, never the request's.
     #[test]
     fn a_request_behind_an_owed_ack_fails_loudly_and_sends_nothing() {
         let (_dir, _server, mut link, _reader) = served();
@@ -444,7 +299,6 @@ mod tests {
             .map_err(|(e, _)| e)
             .expect("A written");
         assert!(link.ready().is_none(), "the second guard holds the client");
-        // Past the second guard, as only this module can reach.
         let fetched = link
             .client
             .fetch(0, "/f/f/owed/*", 64)
@@ -482,20 +336,6 @@ mod tests {
     }
 
     /// **A PIPELINED COMMIT IS OWED LIKE A PUBLISH, IN ORDER, AND A TRY WAITS
-    /// FOR NOTHING** — on a real broker. A commit of the group past record A is
-    /// sent without waiting, the writer is held before it answers that batch
-    /// (`pause_next_acks`, a rendezvous, never a race), and B is published
-    /// behind it: both are owed, the client is handed out for nothing, and a
-    /// try finds the commit's answer not yet there and leaves both owed. Once
-    /// the batch goes on, the acks come back in send order, each with its own
-    /// tag — the commit's offset between A's and B's — and the group the
-    /// commit moved hands a fresh subscriber B, never A.
-    ///
-    /// NEGATIVE CONTROLS: a group nobody committed hands over A first (the
-    /// group's read is what says the commit landed); and the BLOCKING commit,
-    /// sent behind an owed publish straight to the client, is refused with
-    /// astream's `AcksOwed` and sends nothing — only the pipelined verb can
-    /// ride behind an unread ack.
     #[test]
     fn a_pipelined_commit_is_owed_in_order_and_a_try_waits_for_nothing() {
         let dir = aterm_tempfile::Builder::new()
@@ -575,10 +415,6 @@ mod tests {
     }
 
     /// **A RIDER COMES BACK WITH THE ACK IT WAS HUNG ON, AND ONLY THEN.** It
-    /// hangs on the newest owed ack its predicate names — not on a newer one
-    /// it does not — keeps the larger of two values, comes back with that
-    /// ack's answer and with no other, and finds nothing to hang on while
-    /// only acks it does not name are owed.
     #[test]
     fn a_rider_comes_back_with_the_ack_it_was_hung_on() {
         let (_dir, _server, mut link, _reader) = served();
@@ -596,7 +432,6 @@ mod tests {
             .expect("written");
         };
         assert!(!link.ride(1, |_| true), "nothing owed: nothing to wait on");
-        // Even tags are the ones the rider waits on.
         send(&mut link, 2);
         send(&mut link, 4);
         send(&mut link, 5);
@@ -625,18 +460,6 @@ mod tests {
     }
 
     /// **A REFUSED BATCH LANDS THE PUBLISH SENT AFTER IT** — the hazard that
-    /// makes a caller whose records must land in its own order keep one of
-    /// them in flight at a time (`Bridge::settle_sender`), shown on a REAL
-    /// Strict broker rather than a scripted one. Every `fsync` fails (the
-    /// broker's own `inject_faults` seam), so A's batch is rolled back; the
-    /// writer is then held before it answers that batch (`pause_next_acks`,
-    /// armed before A is sent, the log lock released), the fault is lifted,
-    /// and only then is B sent — so B can only be in a LATER batch, and that
-    /// one commits. A is refused `ERR_REFUSED` — not known to be permanent, so
-    /// a sender retries it — B lands on a connection still in step, and A's
-    /// retry at its own sequence lands BEHIND B: the order the two were sent
-    /// in is not the order on the log. Every step is a rendezvous with the
-    /// writer, never a race; the claim is in offsets.
     #[test]
     fn a_refused_batch_lands_the_publish_sent_after_it() {
         let dir = aterm_tempfile::Builder::new()
@@ -644,8 +467,6 @@ mod tests {
             .tempdir_in("/tmp")
             .expect("a scratch dir");
         let socket = dir.path().join("b.sock");
-        // Strict, not `test_broker`'s tier: the fault fails a batch's `fsync`,
-        // which only Strict issues for every batch.
         let broker = astream_broker::Broker::open(dir.path().join("b.log")).expect("a broker");
         let _server = broker.serve(&socket).expect("serve");
         let (conn, _) = crate::transport::connect(
@@ -656,8 +477,6 @@ mod tests {
         let mut link: Link<char> = Link::from(conn);
         let (a, b) = ("/f/f/order/a", "/f/f/order/b");
 
-        // Every fsync fails until the fault is lifted; the writer is held
-        // after A's batch, with the log lock released, before it answers.
         broker.inject_faults(astream_broker::InjectedFaults {
             sync: true,
             truncate: false,

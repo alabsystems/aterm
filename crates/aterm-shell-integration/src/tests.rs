@@ -8,10 +8,7 @@ use std::fmt::Write as _;
 #[cfg(any(unix, windows))]
 use std::process::Command;
 
-/// The live tests' shells, as [`aterm_spec::host::test_shell`] finds them —
-/// `$ATERM_TEST_<SHELL>`, the usual install paths, then `$PATH`; the resolver
-/// atpkg's real-shell tests use too — each resolved once and kept as a
-/// `&'static str`.
+/// The live tests' shells, as [`aterm_spec::host::test_shell`] finds them.
 #[cfg(unix)]
 fn interned_test_shell(
     cell: &'static std::sync::OnceLock<Option<String>>,
@@ -23,33 +20,21 @@ fn interned_test_shell(
     .as_deref()
 }
 
-/// bash for the live tests: `$ATERM_TEST_BASH` overrides (a newer bash than
-/// macOS's /bin/bash 3.2), else /bin/bash, else `$PATH`, else the bare name.
+/// Bash for the live tests.
 #[cfg(unix)]
 fn bash_shell() -> &'static str {
     static BASH: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
     interned_test_shell(&BASH, "bash").unwrap_or("bash")
 }
 
-/// Absolute path to a `zsh` binary, or `None` where the host has none
-/// ([`interned_test_shell`]). Probing an absolute path rather than bare `"zsh"`
-/// keeps the spawn hermetic and avoids a misleading "No such file or directory"
-/// failure where zsh simply isn't present.
+/// Absolute path to a `zsh` binary, or `None` where the host has none ([`interned_test_shell`]).
 #[cfg(unix)]
 fn zsh_shell() -> Option<&'static str> {
     static ZSH: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
     interned_test_shell(&ZSH, "zsh")
 }
 
-/// A shell [`Command`] in its hermetic environment, with the private, EMPTY
-/// home directory that environment points at. Dereferences to the `Command`;
-/// the home goes when this does, so hold it until the shell has exited (a
-/// chained `shell_command(..).arg(..).output()` does). Tests that need their
-/// own populated home (the live shells) still set `HOME` themselves
-/// afterwards, which overrides this one.
-///
-/// The subdirectories are pre-created so fish never has to `mkdir` (and warn
-/// about) its config/data dirs on first run.
+/// A shell [`Command`] in its hermetic environment, with the private.
 #[cfg(unix)]
 struct ShellCommand {
     cmd: Command,
@@ -58,13 +43,12 @@ struct ShellCommand {
 
 #[cfg(unix)]
 impl ShellCommand {
-    /// The hermetic home every `HOME`/`XDG_*` of this command points into.
+    /// The hermetic home every `HOME`/`XDG_*` of this command points.
     fn home(&self) -> &std::path::Path {
         self.home.path()
     }
 
-    /// The home itself, for a [`LiveShell`] that outlives this command to hold
-    /// ([`LiveShell::holding`]).
+    /// The home itself, for a [`LiveShell`] that outlives this command to hold.
     fn into_home(self) -> aterm_tempfile::TempDir {
         self.home
     }
@@ -85,82 +69,22 @@ impl std::ops::DerefMut for ShellCommand {
     }
 }
 
-/// fish's marks that its man-page completions were made, under a home whose
-/// XDG dirs are [`aterm_spec::host::hermetic_env`]'s: fish 4 reads its cache
-/// dir's, fish 3 its data dir's ([`FISH3_COMPLETIONS_MADE`]). An interactive
-/// fish that finds its own missing starts fish_update_completions at its first
-/// prompt: a detached python that parses every man page on the host (~0.4 CPU-s
-/// and 200 files a second, measured with fish 4.9.3) and outlives the test. With
-/// fish 3's missing, one run of this crate's lib tests in the Linux lane
-/// (Ubuntu's fish 3.7.0) left 20 running, and ten runs of one fish test drove
-/// the guest's load to 87.
+/// Mark fish's man-page completions made in the dirs `cmd` names: fish 4 reads
+/// its mark under `XDG_CACHE_HOME`, fish 3 under `XDG_DATA_HOME`. A live fish
+/// without its mark starts, at its first prompt, a detached python that parses
+/// every man page and outlives the test
+/// (`no_live_fish_starts_its_completion_generator`).
 #[cfg(unix)]
-const FISH_COMPLETIONS_MADE: [&str; 2] =
-    [".cache/fish/generated_completions", FISH3_COMPLETIONS_MADE];
-
-/// fish 3's mark of [`FISH_COMPLETIONS_MADE`], in its data dir.
-#[cfg(unix)]
-const FISH3_COMPLETIONS_MADE: &str = ".local/share/fish/generated_completions";
+fn mark_fish_completions_made(cmd: &Command) {
+    for (key, dir) in cmd.get_envs() {
+        if let Some(dir) = dir.filter(|_| key == "XDG_CACHE_HOME" || key == "XDG_DATA_HOME") {
+            std::fs::create_dir_all(Path::new(dir).join("fish").join("generated_completions"))
+                .expect("mark fish's completions made");
+        }
+    }
+}
 
 /// Spawn a shell with a hermetic environment for integration tests.
-///
-/// # The developer's own dotfiles are NOT part of the fixture
-///
-/// Every live test in this file spawns an INTERACTIVE shell (`fish -i -c`,
-/// `zsh -i -c`, `bash --noprofile --norc -i -c`) and several of them assert on
-/// byte-exact stdout. Without a redirected `HOME` those shells read whatever
-/// the person running `cargo test` happens to have on disk, and anything those
-/// files print lands in the same stdout the assertions compare:
-///
-///   - fish `-i` sources `$XDG_CONFIG_HOME/fish/config.fish` (default
-///     `$HOME/.config/fish`), its `conf.d/`, and the *universal* variables in
-///     `fish_variables` — where a stray `ATERM_*` would survive every
-///     `env_remove` below, because it is restored INSIDE the child;
-///   - zsh `-i` (the live shells pass no `-f`) sources
-///     `$ZDOTDIR`/`$HOME`'s `.zshenv` and `.zshrc`;
-///   - `$XDG_DATA_DIRS/fish/vendor_conf.d` auto-loads vendor snippets — which
-///     is exactly how aterm installs its OWN fish integration, so a developer
-///     with aterm installed had the shipped script loaded (setting the
-///     "already loaded" guard to `1`) before the test's `source` ever ran;
-///   - and the integration scripts themselves read `$HOME`: all of them
-///     `source $HOME/.aterm/shell.d/*`, which bash executes even under
-///     `--noprofile --norc`.
-///
-/// So point `HOME` and the XDG base dirs at [`ShellCommand::home`] — an empty
-/// directory this command owns — through the hermetic environment every real
-/// shell a test runs gets (`aterm_spec::host::hermetic_env`: the XDG dirs where
-/// the spec defaults them under that home), and `ZDOTDIR` there too.
-/// `XDG_DATA_DIRS` is narrowed to the home's data dir, so no vendor `conf.d`
-/// (aterm's own included) is auto-loaded. A test that wants one of these back
-/// sets it AFTER calling this, which overrides.
-///
-/// Residual, deliberately not overridden: system-wide files (`/etc/zshenv`,
-/// `/etc/zsh/zshrc`, `/etc/fish/config.fish`). Those are not the developer's,
-/// and suppressing them for zsh would need `-f`, which the live shells avoid
-/// (they start through the real ZDOTDIR wrapper).
-///
-/// # The exported ATERM_* vars
-///
-/// A developer running these tests inside aterm has the shipped integration
-/// active in their own shell, which `export`s several vars the scripts read at
-/// *load* time. Those leak through `cargo test` into the shells spawned below:
-///   - `ATERM_SHELL_INTEGRATION_INSTALLED` trips the "already loaded" guard
-///     (`[[ -n "$..." ]] && return`), so the script returns before defining any
-///     function and every sourced-script test sees "command not found";
-///   - `ATERM_PROMPT_STYLE` / `ATERM_DISABLE_PROMPT_TITLES` alter prompt/title
-///     behavior; the `ATERM_PROMPT_*_COLOR` quintet feeds `set_color`, and an
-///     inherited empty one used to make fish print
-///     `set_color: Unknown color ""` into the asserted stream.
-///
-/// `ATERM_BANNER_B64` and `ATERM_SUITE_VERSION` used to be stripped here too.
-/// Both are gone from the scripts: the banner was a reader with no writer that
-/// base64-decoded an ambient value to stdout at load, and the suite version was
-/// an `export VAR="${VAR:-}"` self-passthrough nothing ever set or read.
-///
-/// Strip them all so each test sources the script fresh regardless of the
-/// developer's own active integration. Tests that need a specific var
-/// (e.g. ATERM_SHELL_NONCE) set it AFTER calling this, which overrides the
-/// removal.
 #[cfg(unix)]
 fn shell_command(shell: &str) -> ShellCommand {
     let mut cmd = Command::new(shell);
@@ -173,40 +97,18 @@ fn shell_command(shell: &str) -> ShellCommand {
         "ATERM_PROMPT_GIT_COLOR",
         "ATERM_PROMPT_ERROR_COLOR",
         "ATERM_PROMPT_SEP_COLOR",
-        // Injected into every spawned shell (lib.rs): an inherited nonce would test the
-        // live session's identity and hide the nonce scrub under test.
         "ATERM_SHELL_NONCE",
-        // The reroute seam's pair: an inherited `$ATERM_REROUTE_DIR` re-orders PATH, and
-        // `$__ATERM_REROUTE_PASSTHROUGH` (`aterm --no-reroute`) is the session's choice.
         "ATERM_REROUTE_DIR",
         "__ATERM_REROUTE_PASSTHROUGH",
-        // Exported by a live session's atpkg hook; every script moves it to the front of
-        // PATH, as it does the reroute dir.
         "ATPKG_AGENTS",
-        // The live re-assert's session gate: when set, every script probes
-        // ~/.aterm/shell.d at each prompt. The live tests set ATERM_CHILD=1 themselves.
         "ATERM_CHILD",
         "ATERM_SESSION_ID",
-        // The host channels: a live session's loader scrubs both, but an embedder's
-        // environment could carry a real session's.
         "ATERM_REKEY_PATH",
         "ATERM_INTEGRATION_POINTER",
-        // The developer's editor: fish's `funced` (and zsh's `edit-command-line`,
-        // bash's `fc`) take `$VISUAL` before `$EDITOR`, so a host's `VISUAL=emacs`
-        // beat the editor a test named, and on a host without that editor funced
-        // fell back to editing at the prompt and ate the test's next lines. A test
-        // that needs an editor names it in its own environment.
         "VISUAL",
         "EDITOR",
-        // The terminal the suite runs in: an aterm tab names its build here,
-        // and the body's AN OLDER SCRIPT'S `~/.aterm/bin` reads a build up to
-        // v0.105.0 as proof that an older script loaded the shell. A test that
-        // needs a terminal names one in its own environment.
         "TERM_PROGRAM",
         "TERM_PROGRAM_VERSION",
-        // The fast-prompt-editor default exported by both the spawn seam and
-        // the live body: strip it so tests can verify the script's own export
-        // and user-override preservation cleanly.
         "AGY_CLI_FAST_PROMPT_EDITOR",
     ] {
         cmd.env_remove(var);
@@ -216,20 +118,13 @@ fn shell_command(shell: &str) -> ShellCommand {
         .tempdir()
         .expect("create hermetic HOME for shell integration tests");
     let home = dir.path();
-    for sub in [".config/fish/conf.d", ".local/state"]
-        .into_iter()
-        .chain(FISH_COMPLETIONS_MADE)
-    {
+    for sub in [".config/fish/conf.d", ".local/state"] {
         std::fs::create_dir_all(home.join(sub))
             .expect("create hermetic HOME for shell integration tests");
     }
     for (key, value) in aterm_spec::host::hermetic_env(home) {
         cmd.env(key, value);
     }
-    // The start pointers the helper clears for every real shell
-    // (`aterm_spec::host::shell_command`): an inherited `$BASH_ENV`, which a
-    // non-interactive bash sources even under `--norc`, and `$ZDOTDIR`, which
-    // points into the scratch home instead.
     for key in aterm_spec::host::SHELL_START_POINTERS {
         cmd.env_remove(key);
     }
@@ -238,11 +133,6 @@ fn shell_command(shell: &str) -> ShellCommand {
     ShellCommand { cmd, home: dir }
 }
 
-/// A lane's shell starts as every real shell a test runs does
-/// (`aterm_spec::host::shell_command`): no inherited `$BASH_ENV`, and `ZDOTDIR`
-/// in its own scratch home. RED before: a developer's `BASH_ENV` was sourced by
-/// every `bash -c` of these lanes (`installed_scripts_run_the_code_of_their_source`
-/// failed on its output).
 #[cfg(unix)]
 #[test]
 fn a_lane_shell_inherits_no_start_pointer() {
@@ -256,8 +146,7 @@ fn a_lane_shell_inherits_no_start_pointer() {
     );
 }
 
-/// The hermetic home's data dir (`XDG_DATA_HOME`), which `XDG_DATA_DIRS` is
-/// narrowed to.
+/// The hermetic home's data dir (`XDG_DATA_HOME`), which `XDG_DATA_DIRS` is narrowed.
 #[cfg(unix)]
 fn hermetic_data(home: &std::path::Path) -> std::path::PathBuf {
     aterm_spec::host::hermetic_env(home)
@@ -267,7 +156,7 @@ fn hermetic_data(home: &std::path::Path) -> std::path::PathBuf {
         .expect("the hermetic env names XDG_DATA_HOME")
 }
 
-/// `(shell, args, script, quiet)` — see [`posix_lanes`].
+/// `(shell, args, script, quiet)`.
 #[cfg(unix)]
 type PosixLane = (
     &'static str,
@@ -276,14 +165,7 @@ type PosixLane = (
     &'static str,
 );
 
-/// The two POSIX lanes the script-level tests drive: bash, and zsh where it is
-/// installed (`shells` notes it where it is not) — `(shell, args, script, quiet)`,
-/// where `quiet` silences the hooks
-/// an interactive shell installs so only what the test calls reaches stdout.
-/// zsh's runs under a user's `setopt ksh_arrays` (subscripts from 0), as every
-/// zsh function runs with the user's options around it: a loop that read
-/// `${string[$i]}` from 1 dropped the first byte and read one past the last —
-/// in the OSC 7 encoder and in the 633;E one.
+/// The two POSIX lanes the script-level tests drive.
 #[cfg(unix)]
 fn posix_lanes(shells: &mut ShellLanes) -> Vec<PosixLane> {
     let mut lanes = vec![(
@@ -304,15 +186,7 @@ fn posix_lanes(shells: &mut ShellLanes) -> Vec<PosixLane> {
     lanes
 }
 
-/// The optional shells (zsh, fish) of a test that drives more than one, and the
-/// ones this host lacks. ONE RULE for every multi-lane test: each lane the host
-/// has runs, and then, when this drops at the test's end, a test that lacked a
-/// lane ends COULD NOT RUN naming it ([`aterm_spec::host::could_not_run_without`]).
-/// A bash defect still FAILS on a host without fish, and no test that names fish
-/// passes where fish never ran — before this, about a dozen tests dropped a
-/// missing lane with `if let Some(fish) = fish_shell()` and passed. The end is in
-/// `Drop`, so no test that asks here can forget it; a test already failing keeps
-/// its own message.
+/// The optional shells (zsh, fish) of a test that drives more than one.
 #[cfg(unix)]
 #[derive(Default)]
 struct ShellLanes {
@@ -373,16 +247,6 @@ fn create_special_cwd() -> (aterm_tempfile::TempDir, std::path::PathBuf) {
     (dir, cwd)
 }
 
-/// The reroute directory (`$ATERM_REROUTE_DIR`, set by aterm's spawn seam) and the
-/// agents directory (`$ATPKG_AGENTS`, exported by the atpkg shell.d hook) lead PATH in
-/// that order — MOVED there from wherever the inherited PATH listed them, each exactly
-/// once, the rest kept in order — and every script is inert for an unset variable or
-/// one naming nothing on disk (Windows lays no stubs). The measured failure
-/// (2026-09-10, m27): path_helper and a ~/.zshrc prepend left the agents dir at PATH
-/// position 14, so `codex` and `claude` ran foreign copies. `-c` has no first prompt,
-/// so this is the load-time assert (the live tests below hold the order at every
-/// prompt). bash and zsh (`-f`, no rc files) are checked byte-exactly; fish for
-/// position and count only, because its own startup may add entries.
 #[cfg(unix)]
 #[test]
 fn test_reroute_and_agents_dirs_lead_path_in_each_shell() {
@@ -413,8 +277,6 @@ fn test_reroute_and_agents_dirs_lead_path_in_each_shell() {
     }
     for (shell, args, script_name, print, exact) in lanes {
         let script = format!("{}/src/scripts/{script_name}", env!("CARGO_MANIFEST_DIR"));
-        // `pre` runs before the source. The value is the LAST `PATH=`'s, up to the
-        // first control byte.
         let run = |rr: Option<&str>, ag: Option<&str>, path: &str, pre: &str| {
             let mut cmd = shell_command(shell);
             cmd.args(args)
@@ -448,8 +310,6 @@ fn test_reroute_and_agents_dirs_lead_path_in_each_shell() {
             value
         };
         let both = (Some(reroute.as_str()), Some(agents.as_str()));
-        // Buried behind system entries, listed twice, the reroute dir after the agents
-        // dir: reroute first, agents second, each once, the rest in order.
         let got = run(
             both.0,
             both.1,
@@ -470,9 +330,7 @@ fn test_reroute_and_agents_dirs_lead_path_in_each_shell() {
         if exact {
             assert_eq!(got, format!("{reroute}:{agents}:/usr/bin:/bin"), "{shell}");
         }
-        // Already first: the same answer (a nested aterm stacks nothing).
         assert_eq!(run(both.0, both.1, &got, ""), got, "{shell}: idempotent");
-        // Unset, or naming nothing on disk: nothing is prepended.
         let missing = run(Some(stale_reroute), Some(stale_agents), "/usr/bin:/bin", "");
         assert!(
             !missing.contains("/nonexistent/"),
@@ -487,8 +345,6 @@ fn test_reroute_and_agents_dirs_lead_path_in_each_shell() {
             "/usr/bin:/bin",
             "{shell}: inert when unset"
         );
-        // A sole EMPTY entry ("here") beside the agents dir survives both moves. PATH
-        // is set INSIDE the shell so the harness still finds the shell binary.
         assert_eq!(
             run(
                 both.0,
@@ -502,17 +358,6 @@ fn test_reroute_and_agents_dirs_lead_path_in_each_shell() {
     }
 }
 
-/// `$HOME/.aterm/bin` is a folder nothing in aterm creates or manages (atpkg's
-/// managed `bin/` lives under its prefix and is APPENDED, `crates/atpkg/src/hooks.rs`;
-/// its command links go to `~/.local/bin`), so no integration puts it on PATH:
-/// an executable dropped there would otherwise shadow every command in every
-/// session. Live shells sourcing the real script with a populated
-/// `~/.aterm/bin` holding an `ls`; bash and zsh (`-f`) byte-exactly, fish for
-/// absence (its own startup may add entries). The PowerShell script is checked
-/// as text, as no pwsh runs on most unix lanes: it names the folder in no line
-/// of code (it takes an older script's entry off by that script's own
-/// `$__aterm_bin`); `a_pwsh_takes_an_older_scripts_aterm_bin_off_when_sourced_again`
-/// runs it where a pwsh is.
 #[cfg(unix)]
 #[test]
 fn test_an_unmanaged_aterm_bin_is_never_put_on_path() {
@@ -566,7 +411,6 @@ fn test_an_unmanaged_aterm_bin_is_never_put_on_path() {
             "{shell}: no PATH line; stdout={stdout:?} stderr={:?}",
             String::from_utf8_lossy(&out.stderr)
         );
-        // The last `PATH=` is the printf's (see the reroute and agents test above).
         let path: String = stdout
             .rsplit("PATH=")
             .next()
@@ -582,7 +426,6 @@ fn test_an_unmanaged_aterm_bin_is_never_put_on_path() {
             assert_eq!(path, "/usr/bin:/bin", "{shell}: PATH untouched");
         }
     }
-    // PowerShell, as text: no line of code (a comment may explain) names it.
     let named = scripts::POWERSHELL
         .lines()
         .filter(|line| !line.trim_start().starts_with('#'))
@@ -593,8 +436,7 @@ fn test_an_unmanaged_aterm_bin_is_never_put_on_path() {
     );
 }
 
-/// The 633;E encoding of `line`, byte for byte: backslash, semicolon and space
-/// spelled as escapes, every control byte as `\xNN`, every other byte as it is.
+/// The 633;E encoding of `line`, byte for byte.
 #[cfg(unix)]
 fn osc633_encode(line: &str) -> Vec<u8> {
     let mut encoded = Vec::with_capacity(line.len());
@@ -610,13 +452,6 @@ fn osc633_encode(line: &str) -> Vec<u8> {
     encoded
 }
 
-/// THE ENCODERS ANSWER IN `REPLY`, FORK-FREE, WITH THE BYTES THEY PRINTED: over
-/// spaces, `%`, Unicode, a newline, a tab, ESC/BEL, DEL, `;` and `\\`, the empty
-/// string and a path needing nothing, bash's and zsh's `__aterm_urlencode` and
-/// `__aterm_encode_cmd` leave in `REPLY` the percent- and 633;E-encodings
-/// spelled out above — zsh under a user's KSH_ARRAYS too. And a user's own
-/// `REPLY` survives the prompt's OSC 7 (and zsh's preexec), whose callers keep
-/// theirs local.
 #[cfg(unix)]
 #[test]
 fn test_encoders_answer_in_reply_and_keep_the_users() {
@@ -693,7 +528,6 @@ fn test_encoders_answer_in_reply_and_keep_the_users() {
             String::from_utf8_lossy(&output.stderr)
         );
         let mut got = output.stdout;
-        // An interactive bash may lead with its readline meta-mode probe.
         if let Some(start) = got.len().checked_sub(want.len() + b"KEPT=mine".len()) {
             got.drain(..start);
         }
@@ -707,12 +541,6 @@ fn test_encoders_answer_in_reply_and_keep_the_users() {
     }
 }
 
-/// FISH ENCODES A COMMAND LINE AS THE 633;E DECODER READS IT, whole strings at a
-/// time (LAG-9): over the bash/zsh corpus above and lines that need more than
-/// one pass — a control byte twice, two kinds of control, a blank line and a
-/// trailing newline, only controls, backslashes beside the bytes whose escapes
-/// write one — fish's `__aterm_encode_cmd`, captured as its callers capture it,
-/// gives exactly [`osc633_encode`]'s bytes.
 #[cfg(unix)]
 #[test]
 fn fish_encodes_a_command_line_as_the_633e_decoder_reads_it() {
@@ -759,8 +587,6 @@ fn fish_encodes_a_command_line_as_the_633e_decoder_reads_it() {
     );
 }
 
-/// OSC 7 from each POSIX lane's `__aterm_report_cwd`: a percent-encoded `file://`
-/// URI for a cwd holding a space, `@`, `[`, `]`, `!` and non-ASCII.
 #[cfg(unix)]
 #[test]
 fn test_report_cwd_emits_percent_encoded_osc_7() {
@@ -794,24 +620,16 @@ fn test_report_cwd_emits_percent_encoded_osc_7() {
     }
 }
 
-/// The nonce every lane's cwd report is signed with in the tests below.
+/// The nonce every lane's cwd report is signed with in the tests.
 #[cfg(unix)]
 const REPORT_NONCE: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
-/// The report a shell with the nonce `REPORT_NONCE` sends for `uri`: the URI
-/// signed as the property `633;P;AtermCwd=`, then the URI as OSC 7, which
-/// carries no nonce (an engine from before the property reads only the OSC 7,
-/// so the nonce never reaches a path it stores).
+/// The report a shell with the nonce `REPORT_NONCE` sends for `uri`.
 #[cfg(unix)]
 fn signed_report(uri: &str) -> String {
     format!("\u{1b}]633;P;AtermCwd={uri};id={REPORT_NONCE}\u{7}\u{1b}]7;{uri}\u{7}")
 }
 
-/// Each POSIX lane signs its own cwd report as it signs its marks
-/// (docs/DESIGN-cwd-reports-2026-10-19.md): with the nonce it captured, the URI
-/// goes first as the signed `AtermCwd` property, which the engine reads as the
-/// shell's own word (`aterm-core`'s `reported_cwd_tests`), then as the plain
-/// OSC 7. Without one, the OSC 7 alone (above).
 #[cfg(unix)]
 #[test]
 fn test_report_cwd_is_signed_with_the_captured_nonce() {
@@ -846,8 +664,6 @@ fn test_report_cwd_is_signed_with_the_captured_nonce() {
     }
 }
 
-/// fish's half of [`test_report_cwd_is_signed_with_the_captured_nonce`]: the
-/// report a `cd` sends is signed.
 #[cfg(unix)]
 #[test]
 fn test_fish_report_cwd_is_signed_with_the_captured_nonce() {
@@ -866,14 +682,6 @@ fn test_fish_report_cwd_is_signed_with_the_captured_nonce() {
     );
 }
 
-/// fish reports its cwd from the loader only for an UPGRADE IN PLACE (the
-/// script sourced again over a shell it already runs in): a fresh load leaves
-/// the report to its first prompt, which makes one before every 133;A, as zsh
-/// and bash report it only there. The report every fresh load used to make was
-/// that prompt's twin a few milliseconds early, about 0.8 M of a fresh fish's
-/// 163 M instructions to its prompt. `-c` draws no prompt, so the fresh load's
-/// output is the loader's own; the in-place one still says where the shell is
-/// (signed, then plain), before the command a typed upgrade goes on to run.
 #[cfg(unix)]
 #[test]
 fn test_fish_reports_its_cwd_at_load_only_for_an_upgrade_in_place() {
@@ -917,9 +725,6 @@ fn test_fish_reports_its_cwd_at_load_only_for_an_upgrade_in_place() {
     );
 }
 
-/// pwsh's half of [`test_report_cwd_is_signed_with_the_captured_nonce`]: the
-/// prompt's report is signed (its host is the machine's name, which a test
-/// cannot set).
 #[cfg(unix)]
 #[test]
 fn test_pwsh_report_cwd_is_signed_with_the_captured_nonce() {
@@ -964,12 +769,6 @@ fn test_pwsh_report_cwd_is_signed_with_the_captured_nonce() {
     assert!(stdout.contains(&signed_report(uri)), "{stdout:?}");
 }
 
-/// `Import-Module PSReadLine -Force` puts PSReadLine's own
-/// `PSConsoleHostReadLine` back over aterm's readline shim, the only source of
-/// pwsh's `C` and `E` (measured 2026-10-19 on pwsh 7.6.7 / PSReadLine 2.4.5:
-/// every later line went unmarked). The next prompt installs the shim again
-/// over the re-imported function, once, and leaves a wrapper other code put
-/// over the shim alone (wrapping one that calls the shim would loop).
 #[cfg(unix)]
 #[test]
 fn test_pwsh_prompt_installs_the_readline_shim_again_after_a_reimport() {
@@ -1001,8 +800,6 @@ fn test_pwsh_prompt_installs_the_readline_shim_again_after_a_reimport() {
         );
         stdout
     };
-    // What reads a line now, without reading one: PSReadLine's own function
-    // would wait on a console this test does not have.
     let report = "$f = $function:PSConsoleHostReadLine; \
          if ($f.Module) { [Console]::Write('in-place=' + $f.Module.Name + '|'); exit }; \
          [Console]::Write('wraps=' + $Global:__aterm_original_readline.Module.Name + '|'); \
@@ -1032,10 +829,6 @@ fn test_pwsh_prompt_installs_the_readline_shim_again_after_a_reimport() {
     );
 }
 
-/// Git Bash (MSYS2) and Cygwin report the Windows drive form over OSC 7, not `$PWD`'s POSIX
-/// view (`/c/Windows/Temp` names no Windows directory). A drive mount is rewritten by
-/// expansion alone; any other path asks `cygpath` once per directory. Driven by assigning
-/// `OSTYPE` and `PWD`, with `cygpath` a function that counts its calls.
 #[cfg(unix)]
 #[test]
 fn test_bash_on_msys_and_cygwin_reports_the_windows_drive_form() {
@@ -1081,8 +874,6 @@ fn test_bash_on_msys_and_cygwin_reports_the_windows_drive_form() {
     };
     let calls_made = || std::fs::read(&calls).map_or(0, |b| b.len());
 
-    // Git Bash: drive mounts need no cygpath; the rest resolve through it, once
-    // per directory (the repeated /usr/bin is served from the one-entry cache).
     let reported = run(
         "msys",
         &[
@@ -1107,24 +898,17 @@ fn test_bash_on_msys_and_cygwin_reports_the_windows_drive_form() {
     );
     assert_eq!(calls_made(), 2, "cygpath runs once per non-drive directory");
 
-    // Cygwin mounts drives under /cygdrive, so a bare /c is not a drive there.
     let _ = std::fs::remove_file(&calls);
     let reported = run("cygwin", &["/cygdrive/c/Users", "/c"]);
     assert_eq!(reported, ["/C%3A/Users", "/C%3A/Program%20Files/Git/c"]);
     assert_eq!(calls_made(), 2);
 
-    // Negative control: any other bash reports $PWD as it is and never asks.
     let _ = std::fs::remove_file(&calls);
     let reported = run("darwin24", &["/c/Windows/Temp"]);
     assert_eq!(reported, ["/c/Windows/Temp"]);
     assert_eq!(calls_made(), 0);
 }
 
-/// A PROMPT_COMMAND array (stock Ubuntu bash) runs each element as its own top-level command
-/// after `__aterm_prompt_command` returns, with the in-prompt flag already clear. The preexec
-/// skips every element, so a sibling integration's precmd (VTE's, starship's) is never
-/// captured as the user's command, and the real command after it still emits 633;E and
-/// 133;C.
 #[cfg(unix)]
 #[test]
 fn test_bash_preexec_skips_prompt_command_array_siblings() {
@@ -1132,13 +916,6 @@ fn test_bash_preexec_skips_prompt_command_array_siblings() {
         "{}/src/scripts/aterm_shell_integration.bash",
         env!("CARGO_MANIFEST_DIR")
     );
-    // One prompt cycle exactly as bash runs an array PROMPT_COMMAND: each element
-    // is a top-level DEBUG-trapped command, ours first, the siblings after ours
-    // returned, and on bash 5.1+ aterm's last element after them (an unarmed no-op
-    // before 5.1, where the wiring adds none). Two siblings, so the array is taken
-    // as one (an array with nothing at index 1 runs the scalar way — the next
-    // test). The marker rides an `__aterm_`-prefixed function so the guard skips
-    // it identically before and after the fix.
     let command = "\
 __fake_vte_precmd() { :; }\n\
 __fake_starship_precmd() { :; }\n\
@@ -1184,13 +961,6 @@ echo real-command\n";
     );
 }
 
-/// An array PROMPT_COMMAND with nothing at index 1 is taken the scalar way, read
-/// without a fork: ours takes element 0 and evals what it held, so the user's
-/// element runs once a prompt on every bash. Taken as an array (what the forked
-/// `declare -p` read made of it), ours went first and the user's after — which
-/// bash before 5.1, running element 0 alone, never ran. A bash runs element 0 of
-/// a one-element array on every version, so `eval "$PROMPT_COMMAND"` is the
-/// prompt here.
 #[cfg(unix)]
 #[test]
 fn test_bash_prompt_command_array_of_one_runs_its_element_once_a_prompt() {
@@ -1242,23 +1012,16 @@ fn test_detect_posix_shells() {
             r"C:\Program Files\PowerShell\7\pwsh.exe",
             ShellType::PowerShell,
         ),
-        // The bare aliases the PTY seam resolves, and the program paths they
-        // resolve to (Windows separators, split on every host).
         ("wsl", ShellType::Wsl),
         ("cmd", ShellType::Cmd),
         ("C:\\Windows\\System32\\wsl.exe", ShellType::Wsl),
         ("C:\\Windows\\System32\\CMD.EXE", ShellType::Cmd),
-        // Neighbours are not swept in: nu has no injection.
         ("nu.exe", ShellType::Unknown),
     ] {
         assert_eq!(ShellType::detect(path), shell, "{path:?}");
     }
 }
 
-/// A directory name may hold any byte but '/' and NUL, so a crafted one could
-/// embed ESC/BEL and smuggle a nested OSC (a clipboard write) out of the OSC 0
-/// cwd tab title the prompt hook emits. Driven through each POSIX prompt hook
-/// (and fish's prompt, where fish is installed) from inside such a directory.
 #[cfg(unix)]
 #[test]
 fn test_cwd_tab_title_strips_control_chars() {
@@ -1317,25 +1080,10 @@ fn test_cwd_tab_title_strips_control_chars() {
     }
 }
 
-/// A command line must not break out of the OSC 633;E that carries it, nor out of
-/// the OSC 0 title. `__aterm_encode_cmd` hex-escapes every reserved byte, and
-/// `__aterm_osc` must then copy the payload through byte-for-byte: zsh's `print`
-/// WITHOUT `-r` did not — it expanded escapes in its argument, re-materializing
-/// the raw ESC/BEL bytes the encoder exists to remove. Driven through the two
-/// emissions `preexec` performs, spelled identically for bash and zsh (both
-/// encoders answer in `REPLY`); fish's encoder (its writer is `printf '\e]%s\a'`)
-/// must produce the same payload.
 #[cfg(unix)]
 #[test]
 fn test_osc_frame_writer_preserves_payload_escapes() {
-    // Two independent break-out attempts: raw ESC/BEL bytes, which the encoder must
-    // hex-escape and the writer leave escaped; and the LITERAL text
-    // `\e]52;c;aGVsbG8=\a` — printable, so the title's `[[:cntrl:]]` strip has
-    // nothing to strip, and only a writer that expands escapes turns it into a
-    // real nested OSC 52 clipboard write.
     const CMDLINE: &str = "a\u{1b}b\u{7}c;d e\\f \\e]52;c;aGVsbG8=\\a";
-    // Every reserved byte the decoder's backslash escape, so the 633;E carries one
-    // BEL; the title strips the control bytes and keeps the literal `\e`/`\a` text.
     const PAYLOAD: &str = r"a\x1bb\x07c\x3bd\x20e\\f\x20\\e]52\x3bc\x3baGVsbG8=\\a";
     let expected = format!(
         "\u{1b}]633;E;{PAYLOAD}\u{7}\u{1b}]0;{}\u{7}",
@@ -1364,8 +1112,6 @@ fn test_osc_frame_writer_preserves_payload_escapes() {
             .env("ATERM_TEST_INPUT", CMDLINE)
             .output()
             .unwrap_or_else(|error| panic!("spawn {shell}: {error}"));
-        // `ends_with`: an interactive bash may prefix stdout with its readline
-        // meta-mode probe on some hosts.
         assert!(
             output.stdout.ends_with(expected.as_bytes()),
             "{shell}: OSC frames must carry the payload byte-for-byte;\n  expected suffix: \
@@ -1387,16 +1133,7 @@ fn test_prepare_unknown_returns_none() {
     );
 }
 
-// No env-mutating tests here: this binary runs tests on parallel threads that call
-// `prepare_into`, which reads the environment. They go in the `shell_suite` binary,
-// through `aterm_log::env::scoped_unset`.
-
-// ─── fish ──────────────────────────────────────────────────────────────
-
-/// Source the fish integration in an interactive fish, run `body`, and return
-/// its stdout. `extra_env` is applied AFTER [`shell_command`]'s hermetic scrub, so
-/// a test can put a variable back deliberately (including as an empty-but-SET
-/// value, which is the whole point of the loader-guard regression).
+/// Source the fish integration in an interactive fish, run `body`, and return its stdout.
 #[cfg(unix)]
 fn run_fish_integration(fish: &str, extra_env: &[(&str, &str)], body: &str) -> String {
     let script = format!(
@@ -1425,11 +1162,6 @@ fn run_fish_integration(fish: &str, extra_env: &[(&str, &str)], body: &str) -> S
     String::from_utf8_lossy(&output.stdout).into_owned()
 }
 
-/// The fish loader guard spelled `set -q` (definedness, not emptiness): with the
-/// guard SET BUT EMPTY — what aterm's spawn seam injects into every integrated
-/// session — the integration must still load, and scrub the nonce from the
-/// environment (#8015: every child process would inherit it). Under `set -q`
-/// a live fish tab had no marks, no blocks, and the nonce un-scrubbed.
 #[cfg(unix)]
 #[test]
 fn test_fish_integration_loads_under_an_empty_guard_override() {
@@ -1460,13 +1192,6 @@ fn test_fish_integration_loads_under_an_empty_guard_override() {
     );
 }
 
-/// Every OSC 133/633 mark survives an EMPTY nonce, and carries `;id=<hex>` when
-/// one is set. fish glues a command substitution to a string as a CARTESIAN
-/// PRODUCT, so the old `__aterm_osc "133;A"(__aterm_id_suffix)` spelling expanded
-/// to ZERO arguments whenever the suffix was empty — the pre-nonce fallback, and
-/// the manual `source`-from-config.fish install — and `printf '\e]%s\a'` emitted
-/// a bare empty OSC instead. Measured on fish 4.2.1 before the fix: 133;A/B/C/D
-/// and 633;E were ALL absent from the wire.
 #[cfg(unix)]
 #[test]
 fn test_fish_emits_all_133_marks_with_and_without_a_nonce() {
@@ -1503,14 +1228,6 @@ fn test_fish_emits_all_133_marks_with_and_without_a_nonce() {
     );
 }
 
-// `set -q` is definedness, and every ATERM_* read here wants EMPTINESS: the
-// misspelling survived the loader-guard fix in the prompt-style selector, the
-// tab-title guards and the prompt-colour defaults.
-
-/// An EMPTY `ATERM_PROMPT_STYLE` must fall through to the user's own prompt:
-/// under `set -q`, `__aterm_custom_prompt` ran with `style=""`, matched no case,
-/// and fish printed NOTHING between 133;A and 133;B. Both branches (and the cwd
-/// report) are stubbed, so the test needs none of fish's own `share/functions`.
 #[cfg(unix)]
 #[test]
 fn test_fish_empty_prompt_style_falls_through_to_the_user_prompt() {
@@ -1540,8 +1257,6 @@ fn test_fish_empty_prompt_style_falls_through_to_the_user_prompt() {
     }
 }
 
-/// An EMPTY `ATERM_DISABLE_PROMPT_TITLES` must NOT disable titles, as in bash and
-/// zsh; fish's `not set -q` read empty as "disabled" and dropped the OSC 0 title.
 #[cfg(unix)]
 #[test]
 fn test_fish_empty_disable_prompt_titles_still_emits_titles() {
@@ -1559,7 +1274,6 @@ fn test_fish_empty_disable_prompt_titles_still_emits_titles() {
         "an EMPTY ATERM_DISABLE_PROMPT_TITLES means 'not disabled' in bash and \
          zsh; fish must agree and still emit the OSC 0 title"
     );
-    // Negative control: the opt-out itself must keep working.
     assert_eq!(
         run_fish_integration(fish, &[("ATERM_DISABLE_PROMPT_TITLES", "1")], body),
         without_title,
@@ -1567,11 +1281,6 @@ fn test_fish_empty_disable_prompt_titles_still_emits_titles() {
     );
 }
 
-/// A command line's title is the line whole up to 256 characters, and a longer one its
-/// first 255 and `…`, in bash, zsh and fish (where installed): the cut at 64 characters
-/// before had no mark, so the tab took its cut-off end for the line's file (the
-/// 2026-10-18 judges' J4F-1-cut64-middle-cut-misleads). pwsh and Git Bash are driven
-/// live in `tests_windows_marks.rs`.
 #[cfg(unix)]
 #[test]
 fn test_a_long_command_title_ends_with_its_cut_mark() {
@@ -1622,11 +1331,6 @@ fn test_a_long_command_title_ends_with_its_cut_mark() {
     }
 }
 
-/// EMPTY `ATERM_PROMPT_*_COLOR` values fall back to the defaults bash and zsh get
-/// from `${ATERM_PROMPT_*_COLOR:-N}`; under `set -q` they reached `set_color ""`
-/// on every prompt. Each is a palette INDEX, which fish's `set_color` (names or
-/// hex only) rejected with no output, so the script formats the `38;5;N` SGR
-/// itself — asserted on the bytes. Only `prompt_pwd` is stubbed.
 #[cfg(unix)]
 #[test]
 fn test_fish_empty_prompt_colors_fall_back_to_defaults() {
@@ -1640,15 +1344,12 @@ fn test_fish_empty_prompt_colors_fall_back_to_defaults() {
         ("ATERM_PROMPT_ERROR_COLOR", ""),
         ("ATERM_PROMPT_SEP_COLOR", ""),
     ];
-    // `minimal` renders <path-color> pwd <reset> <prompt-color> $ <reset>;
-    // the defaults are path=4 and (last status 0) separator=8.
     assert_eq!(
         run_fish_integration(fish, &empty_colors, body),
         "\u{1b}[38;5;4m~/x\u{1b}[0m \u{1b}[38;5;8m$\u{1b}[0m ",
         "empty ATERM_PROMPT_*_COLOR values must fall back to the same defaults \
          bash and zsh get from `${{ATERM_PROMPT_*_COLOR:-N}}`"
     );
-    // Positive control: an explicitly set colour is still honoured.
     assert_eq!(
         run_fish_integration(
             fish,
@@ -1663,24 +1364,13 @@ fn test_fish_empty_prompt_colors_fall_back_to_defaults() {
     );
 }
 
-/// Absolute path to a `fish` binary, or `None` where the host has none
-/// ([`interned_test_shell`]).
+/// Absolute path to a `fish` binary, or `None` where the host has none ([`interned_test_shell`]).
 #[cfg(unix)]
 fn fish_shell() -> Option<&'static str> {
     static FISH: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
     interned_test_shell(&FISH, "fish")
 }
 
-// ─── ATERM_SHELL_NONCE must not leak into child processes ───────────────
-//
-// The nonce is a secret: a child that inherits it (env, ssh SendEnv, docker, tmux) could
-// forge nonced marks. Each script captures it into a shell-local at source time and unsets
-// the env var at once.
-
-/// The prompt hook appends `;id=<nonce>` to PS1, and a PS1 bash imported from its
-/// environment (or a user's rc exported) keeps the export attribute, so every child would
-/// read the nonce from `$PS1`. The hook drops the attribute at each prompt, undoing a
-/// later `export PS1` at the next one.
 #[cfg(unix)]
 #[test]
 fn test_bash_children_never_inherit_the_nonce_through_ps1() {
@@ -1689,7 +1379,6 @@ fn test_bash_children_never_inherit_the_nonce_through_ps1() {
         "{}/src/scripts/aterm_shell_integration.bash",
         env!("CARGO_MANIFEST_DIR")
     );
-    // Exit 96 if PS1 never got the nonce: then the env check proves nothing.
     let command = "\
 source \"$ATERM_TEST_SCRIPT\" >/dev/null 2>&1\n\
 __aterm_prompt_command >/dev/null 2>&1\n\
@@ -1727,10 +1416,6 @@ env >\"$HOME/child-env-2\"\n";
     }
 }
 
-/// zsh's half of #8015 (bash's rides the PS1 test above, fish's the loader-guard
-/// test): the nonce is captured into a shell-local and unset from the environment
-/// at source time, and the marks still sign with it; with no nonce at all the
-/// suffix is empty — an unsigned mark, for a host from before the nonce.
 #[cfg(unix)]
 #[test]
 fn test_zsh_unsets_shell_nonce_env_after_source() {
@@ -1761,11 +1446,6 @@ fn test_zsh_unsets_shell_nonce_env_after_source() {
     }
 }
 
-// ─── PowerShell / pwsh integration (Windows' default shells) ─────────────
-//
-// Functional tests spawn powershell.exe and are Windows-only (powershell.exe
-// ships with every supported Windows).
-
 #[test]
 fn test_prepare_powershell_dot_sources_script() {
     let dir = aterm_tempfile::tempdir().unwrap();
@@ -1778,8 +1458,6 @@ fn test_prepare_powershell_dot_sources_script() {
     let argv = result
         .argv_override
         .expect("powershell injection needs an argv override");
-    // `-ExecutionPolicy Bypass` must precede the interactive flags so the dot-source
-    // survives a stock `Restricted` machine (else it throws UnauthorizedAccess).
     assert_eq!(argv[1], "-ExecutionPolicy");
     assert_eq!(argv[2], "Bypass");
     assert_eq!(argv[3], "-NoExit");
@@ -1797,16 +1475,12 @@ fn test_prepare_powershell_dot_sources_script() {
 
 #[test]
 fn test_powershell_script_is_ascii() {
-    // Windows PowerShell 5.1 decodes BOM-less .ps1 source as ANSI, and we
-    // write the script without a BOM — so it must stay pure ASCII.
     assert!(
         scripts::POWERSHELL.is_ascii(),
         "aterm_shell_integration.ps1 must stay ASCII-only (written without a BOM)"
     );
 }
 
-/// Each run has its own hidden console, so the probe reads that console's code page and the
-/// switch cannot leak across runs. Outside aterm both encodings stay as a bare pwsh has them.
 #[cfg(windows)]
 #[test]
 fn test_powershell_speaks_utf8_only_inside_an_aterm_tab() {
@@ -1824,8 +1498,7 @@ fn test_powershell_speaks_utf8_only_inside_an_aterm_tab() {
     );
 }
 
-/// How a test pwsh runs: without the integration script, with it outside an
-/// aterm session, or with it in an aterm tab.
+/// How a test pwsh runs: without the integration script, with it outside an aterm session.
 #[cfg(windows)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Pwsh {
@@ -1851,11 +1524,7 @@ fn run_powershell(snippet: &str, nonce: Option<&str>, how: Pwsh) -> String {
     String::from_utf8_lossy(&output.stdout).into_owned()
 }
 
-/// One run of `exe` (`powershell.exe`, or a pwsh 7 path) in a hidden console of
-/// its own: `prelude` first (where a test plays the user's profile, which runs
-/// before the integration in a real tab; end it with `; `), then the
-/// integration script unless [`Pwsh::Bare`], then `snippet`. `env` overrides
-/// the ordinary scrub; the exclusive home/profile-state roots always go last.
+/// One run of `exe` (`powershell.exe`, or a pwsh 7 path) in a hidden console of its own.
 #[cfg(windows)]
 fn powershell_output(
     exe: &Path,
@@ -1892,9 +1561,6 @@ fn powershell_output_in(
         "{}/src/scripts/aterm_shell_integration.ps1",
         env!("CARGO_MANIFEST_DIR")
     );
-    // The prelude and snippet must avoid double quotes: powershell.exe's
-    // command-line quote handling would otherwise interact with Rust's arg
-    // quoting.
     let mut command = PowerShellWorld::home_guard().to_owned();
     command.push_str(prelude);
     if how != Pwsh::Bare {
@@ -1912,21 +1578,12 @@ fn powershell_output_in(
     .arg(&command)
     .env("ATERM_TEST_SCRIPT", &script)
     .creation_flags(CREATE_NO_WINDOW);
-    // Hermetic spawn: a developer running the tests inside aterm has these
-    // exported, which would trip the already-loaded guard, alter titles,
-    // decide whether the shell is in an aterm tab, or switch the readline key
-    // layer off.
     for var in [
         "ATERM_SHELL_INTEGRATION_INSTALLED",
         "ATERM_DISABLE_PROMPT_TITLES",
         "ATERM_DISABLE_READLINE_KEYS",
         "ATERM_CHILD",
         "ATERM_SESSION_ID",
-        // Each PowerShell builds its own module path when this is unset. A suite
-        // run from a pwsh 7 tab inherits pwsh's, and Windows PowerShell 5.1 then
-        // imported pwsh's PSReadLine 2.4.5 instead of its own 2.0.0 (measured
-        // 2026-10-16; pwsh rewrites it only for a powershell.exe it starts
-        // itself, not one under cmd and cargo).
         "PSModulePath",
     ] {
         cmd.env_remove(var);
@@ -1945,8 +1602,6 @@ fn powershell_output_in(
     for (key, value) in env {
         cmd.env(key, value);
     }
-    // Confinement is last, so a test's ordinary environment overrides cannot
-    // restore the runner's home or profile-state roots.
     cmd.envs(world.env()).current_dir(world.root.path());
     cmd.output()
         .unwrap_or_else(|error| panic!("spawn {exe:?} for integration test: {error}"))
@@ -1990,8 +1645,6 @@ fn test_powershell_prompt_emits_osc7_and_prompt_marks() {
         !out.contains("]133;D"),
         "first prompt (no command ran) must not emit OSC 133;D; got: {out:?}"
     );
-    // Bracketed paste and in-band size reports off before the prompt: PowerShell
-    // reads neither, and a program killed with them on must not leave them on.
     let modes = out
         .find("\u{1b}[?2004l\u{1b}[?2048l")
         .expect("prompt must turn off 2004 and 2048");
@@ -2033,12 +1686,6 @@ fn test_cache_dir_windows_uses_localappdata() {
     }
 }
 
-/// The scripts are staged in the per-user cache in every containment mode, and
-/// that lies outside every root a Containment shell may write
-/// (`aterm_containment::sbpl::WRITABLE_ROOTS`): a contained shell reads the
-/// scripts the next tab's shell sources and cannot rewrite them. Staging them in
-/// `/tmp` for Containment and Safety (#5575) let it. A test binary stages them
-/// under its own root instead, never in the person's cache.
 #[cfg(unix)]
 #[test]
 fn test_cache_dir_is_the_per_user_cache_outside_the_containment_write_roots() {
@@ -2056,7 +1703,6 @@ fn test_cache_dir_is_the_per_user_cache_outside_the_containment_write_roots() {
         let root = aterm_uds::test_binary::scratch_root().expect("this test binary's root");
         assert_eq!(cache_dir(), root.join("cache/aterm/shell-integration"));
     }
-    // Resolved as Seatbelt resolves it.
     let Ok(base) = std::fs::canonicalize(&base) else {
         aterm_spec::host::could_not_run(format!(
             "the cache base {} does not resolve here",
@@ -2080,16 +1726,6 @@ fn test_cache_dir_is_the_per_user_cache_outside_the_containment_write_roots() {
     }
 }
 
-// WSL and cmd.exe
-
-/// The WSL injection crosses into the distro through `WSLENV` (ours first, see
-/// below) and runs as `wsl --exec /bin/sh -c <program>` — `--exec` keeps argv
-/// byte-for-byte, where `wsl -- …` re-quotes every argument into a `bash -c`
-/// string. The program is driven here under this host's own `/bin/sh` with a
-/// stand-in login shell: it enters the handed-over cwd and drops the variable (a
-/// shell nested inside must not jump back), starts a bash login shell on the
-/// EXISTING bash wrapper rcfile, and any other login shell plainly — forcing bash
-/// on a zsh WSL user to gain marks would be a regression, not a feature.
 #[cfg(unix)]
 #[test]
 fn test_wsl_launcher_starts_bash_on_the_rcfile_and_any_other_shell_plainly() {
@@ -2135,11 +1771,6 @@ fn test_wsl_launcher_starts_bash_on_the_rcfile_and_any_other_shell_plainly() {
     }
 }
 
-/// `WSLENV` is the ONLY channel into the distro, so getting it wrong is silent:
-/// without `/p` the integration dir arrives as an untranslated `C:\…` no Linux
-/// shell can read, and without the nonce every mark is dropped. A user's own
-/// entries survive after ours; nesting (aterm inside aterm) neither grows
-/// duplicates nor keeps a stale flag spelling for one of our variables.
 #[test]
 fn test_merge_wslenv_is_append_safe_and_idempotent() {
     let ours = "ATERM_SHELL_INTEGRATION_DIR/p:ATERM_SHELL_NONCE:ATERM_WSL_CWD";
@@ -2158,30 +1789,17 @@ fn test_merge_wslenv_is_append_safe_and_idempotent() {
 
 #[test]
 fn test_wsl_cwd_env_only_crosses_a_posix_path() {
-    // The case that matters: a WSL tab reports `/home/you/proj` over OSC 7,
-    // Windows cannot use it as a working directory, so it rides the env.
     assert_eq!(
         wsl_cwd_env(ShellType::Wsl, Some("/home/you/proj")),
         Some((WSL_CWD_VAR.to_string(), "/home/you/proj".to_string()))
     );
-    // A Windows path is wsl.exe's own business (it inherits + translates it).
     assert_eq!(wsl_cwd_env(ShellType::Wsl, Some("C:\\Users\\x")), None);
-    // `//host/share` is the host-preserving UNC form, not a Linux path.
     assert_eq!(wsl_cwd_env(ShellType::Wsl, Some("//server/share")), None);
     assert_eq!(wsl_cwd_env(ShellType::Wsl, None), None);
-    // Never for another shell — bash on Windows gets a Windows cwd.
     assert_eq!(wsl_cwd_env(ShellType::Bash, Some("/home/you/proj")), None);
     assert_eq!(wsl_cwd_env(ShellType::Cmd, Some("/home/you/proj")), None);
 }
 
-/// cmd renders `%PROMPT%` on every input line and understands `$E`/`$P`; that is
-/// the whole integration surface it has. In order: the directory title (before
-/// the user's prompt, so a prompt that sets its own title is the later write and
-/// wins), 133;A, the cwd (AFTER 133;A: the engine files a 633 `P;Cwd` under the
-/// block in progress, so reported before it the block for `cd /d X` said it ran
-/// in `X`), cmd's own prompt, 133;B — every mark signed with the session nonce,
-/// which `augment_with_nonce` also hands the shell. No C/D: cmd has no hook for
-/// "a command started executing", and the phase machine needs A→B→C→D in order.
 #[test]
 fn test_prepare_cmd_wraps_the_prompt_with_marks_and_cwd() {
     let dir = aterm_tempfile::tempdir().unwrap();
@@ -2208,7 +1826,6 @@ fn test_prepare_cmd_wraps_the_prompt_with_marks_and_cwd() {
     };
     let order = [
         at("$e]0;$P$e\\"),
-        // Bracketed paste and in-band size reports off: cmd reads neither.
         at("$e[?2004l$e[?2048l"),
         at(&format!("$e]133;A;id={nonce}$e\\")),
         at(&format!("$e]633;P;Cwd=$P;id={nonce}$e\\")),
@@ -2222,10 +1839,6 @@ fn test_prepare_cmd_wraps_the_prompt_with_marks_and_cwd() {
     );
 }
 
-/// An inherited `%PROMPT%` is wrapped, not replaced: a user's own title is kept
-/// whole AFTER ours (the later write wins), an empty one is cmd's default, and one
-/// that already carries our marks (a nested aterm) is returned byte-identical —
-/// nesting neither double-wraps nor stacks a second title.
 #[test]
 fn test_cmd_prompt_wraps_an_inherited_prompt_once() {
     let own = "$e]0;build box$e\\$P$G";
@@ -2240,11 +1853,6 @@ fn test_cmd_prompt_wraps_an_inherited_prompt_once() {
     assert_eq!(cmd_prompt(Some(&outer)), outer);
 }
 
-/// A POSIX shell reads a script line by line and keeps a trailing CR as part of
-/// the last token, so one `\r` per line shreds the whole file. The scripts are
-/// `include_str!`d at build time, so a Windows build machine with Git's default
-/// `core.autocrlf=true` shipped exactly that — measured: 446 CRs in the installed
-/// `aterm_shell_integration.bash`, and sourcing it in WSL failed at line 16.
 #[test]
 fn test_posix_scripts_are_written_lf_only() {
     assert_eq!(lf_only("a\r\nb\r\n"), "a\nb\n");
@@ -2261,8 +1869,6 @@ fn test_posix_scripts_are_written_lf_only() {
     }
 }
 
-/// Live: cmd.exe renders the injected `%PROMPT%` as OSC 133 A/B around its prompt. cmd.exe
-/// ships with every Windows, so this never skips there.
 #[cfg(windows)]
 #[test]
 fn test_cmd_prompt_emits_real_osc_133_marks() {
@@ -2307,10 +1913,7 @@ fn test_cmd_prompt_emits_real_osc_133_marks() {
         text.contains("\x1b]633;P;Cwd="),
         "cmd must report its cwd; got {text:?}"
     );
-    // `$P` must have expanded to a real directory, not stayed literal.
     assert!(!text.contains("Cwd=$P"), "got {text:?}");
-    // The title is that same directory in an ESC-framed OSC 0, which conhost turns into the
-    // console title ConPTY hands aterm. Every cmd prompt carries it (no opt-out).
     let cwd = text
         .split_once("\x1b]633;P;Cwd=")
         .and_then(|(_, rest)| rest.split_once(";id="))
@@ -2322,9 +1925,6 @@ fn test_cmd_prompt_emits_real_osc_133_marks() {
     );
 }
 
-/// Functional proof on the real thing: the WSL launcher, run through the
-/// installed `wsl.exe`, lands OSC 133 marks with the session nonce. COULD NOT
-/// RUN when WSL is not installed — aterm must never DEPEND on it.
 #[cfg(windows)]
 #[test]
 fn test_wsl_launcher_emits_real_osc_133_marks() {
@@ -2353,7 +1953,6 @@ fn test_wsl_launcher_emits_real_osc_133_marks() {
     for (k, v) in &injection.env_add {
         cmd.env(k, v);
     }
-    // The cwd hand-off, exercised end to end.
     cmd.env(WSL_CWD_VAR, "/usr");
     let mut child = cmd
         .stdin(Stdio::piped())
@@ -2386,27 +1985,11 @@ fn test_wsl_launcher_emits_real_osc_133_marks() {
     );
 }
 
-// ─── fish: glued command substitutions, and prompt colours ──────────────────
-//
-// Two defects with one root, both fish-only, both invisible to bash and zsh.
-//
-// The palette rule: every `ATERM_PROMPT_*_COLOR` is a palette index (bash spells it
-// `\[\033[38;5;${hc}m\]`). fish's `set_color` takes names or hex only, so the fish prompt
-// writes the SGR escape itself.
-
-/// fish's OSC 7 stays a well-formed `file://` URI with the resolved host EMPTY:
-/// the pre-fix failure was a wrong NUMBER OF ARGUMENTS — the host glued to a
-/// substitution that printed nothing took the whole argument with it, and
-/// `__aterm_osc` printed a bare `ESC ] BEL`. `file:///path` is the
-/// empty-authority form RFC 8089 defines. (The named host is pinned by the
-/// prompt's re-assert below.)
 #[cfg(unix)]
 #[test]
 fn test_fish_osc7_is_well_formed_with_an_empty_host() {
     let fish = need_fish();
     let (_dir, cwd) = create_special_cwd();
-    // A bare `cd`: the report rides fish's `--on-variable PWD` handler and fires
-    // EXACTLY once (the source-time report is swallowed with the load).
     assert_eq!(
         run_fish_integration(
             fish,
@@ -2420,18 +2003,6 @@ fn test_fish_osc7_is_well_formed_with_an_empty_host() {
     );
 }
 
-/// Every prompt re-asserts the shell's own cwd before its 133;A, as zsh, bash
-/// and pwsh do. An OSC 7 need not be signed (a remote shell over ssh must be
-/// able to report a cwd), so a cwd a program reported — or a remote shell's,
-/// left when ssh exits — went into the next signed block and became the
-/// new-tab folder until the next `cd`, while the nonce gate dropped the same
-/// forgery sent as `633;P;Cwd`. The prompt is drawn without its event: fish's
-/// own `fish_prompt` handler re-sends OSC 7 from 4.3 on, and before that only
-/// on a `cd`. The shell's report is signed (the `AtermCwd` property, see
-/// [`test_fish_report_cwd_is_signed_with_the_captured_nonce`]), and the engine
-/// drops a report no one signed while the shell sits at its prompt
-/// (`aterm-core`'s `reported_cwd_tests`), so this report, the last before the
-/// mark, is the one that lands.
 #[cfg(unix)]
 #[test]
 fn test_fish_prompt_reasserts_its_own_cwd_before_the_prompt_start() {
@@ -2442,7 +2013,6 @@ fn test_fish_prompt_reasserts_its_own_cwd_before_the_prompt_start() {
         osc7_percent_encode(&cwd.to_string_lossy())
     );
     let forged = "\u{1b}]7;file://h/elsewhere\u{7}";
-    // A command's output names another folder; then the prompt.
     let stdout = run_fish_integration(
         fish,
         &[("HOST", "aterm.test"), ("ATERM_DISABLE_PROMPT_TITLES", "1")],
@@ -2468,17 +2038,10 @@ fn test_fish_prompt_reasserts_its_own_cwd_before_the_prompt_start() {
     );
 }
 
-/// The fallback prompt survives a host with no `hostname` command (a container image, say):
-/// it is built from captured locals, so a missing segment costs only its own text.
 #[cfg(unix)]
 #[test]
 fn test_fish_fallback_prompt_survives_a_missing_hostname() {
     let fish = need_fish();
-    // No ATERM_PROMPT_STYLE and no user prompt to wrap => the fallback arm.
-    //
-    // `$USER` is set INSIDE the body, not through the environment: fish
-    // populates its own `$USER` global from the passwd database at startup, so
-    // an exported one would be overwritten before the prompt ever renders.
     let body = "functions -e __aterm_original_fish_prompt; \
                 function prompt_pwd; printf '~/x'; end; \
                 function __aterm_report_cwd; end; \
@@ -2492,21 +2055,7 @@ fn test_fish_fallback_prompt_survives_a_missing_hostname() {
     );
 }
 
-// The multiplexer boundary (screen / tmux)
-//
-// aterm hosts ONE session per PTY; start `screen` or `tmux` in it and every pane
-// lives inside that SAME session. Measured with GNU screen 4.09.01 before any of
-// this existed: the whole screen run collapsed into ONE outer block, and a
-// flagless `aterm ctl status` typed IN a pane answered from the OUTER session —
-// success, wrong terminal. A pane is genuinely not an aterm session, so the
-// crossing is made VISIBLE: marked ($ATERM_MUX + the outer sid, which `aterm ctl`
-// refuses flagless self-drive on) and said once out loud. The guard is what makes
-// the detection trustworthy: aterm's spawn seam forces
-// `$ATERM_SHELL_INTEGRATION_INSTALLED` EMPTY for every session it starts, so a
-// NON-empty value means we did not come straight from aterm.
-
-/// Source a script under `shell` in a synthesized environment and report the
-/// boundary variables it left behind, plus whatever it said on stderr.
+/// Source a script under `shell` in a synthesized environment and report the boundary variables it.
 #[cfg(unix)]
 fn run_mux_probe(
     shell: &str,
@@ -2523,8 +2072,6 @@ fn run_mux_probe(
         .arg(report)
         .env("ATERM_TEST_SCRIPT", &script)
         .env("XDG_RUNTIME_DIR", runtime_dir)
-        // A pane's own environment is synthesized per case; start from a clean
-        // slate so the developer's real shell cannot decide the outcome.
         .env_remove("TMUX")
         .env_remove("STY")
         .env_remove("ATERM_MUX")
@@ -2543,16 +2090,6 @@ fn run_mux_probe(
     )
 }
 
-/// The boundary in each real shell: a pane shell (inherited guard) is MARKED with
-/// its multiplexer and the outer sid, and says so once per MULTIPLEXER (a stamp
-/// under `$XDG_RUNTIME_DIR` keyed by `$TMUX`/`$STY`), not once per pane; `$TMUX`
-/// names tmux though its default TERM is `screen-256color`. An aterm SESSION shell
-/// (guard empty) is not marked, CLEARS a marker inherited from the pane it was
-/// launched out of, and — the fallback for a host without the spawn seam — stamps
-/// the multiplexer it was born into as `$ATERM_MUX_BASE`, which `aterm ctl`
-/// compares a pane's own `$TMUX`/`$STY` against (a bash or zsh pane shell never
-/// sources the integration: `--rcfile` and `$ZDOTDIR` are one-shot mechanisms of
-/// whoever starts the shell, and a pane is started by the multiplexer).
 #[cfg(unix)]
 #[test]
 fn test_each_shell_marks_a_multiplexer_pane_and_clears_a_stale_marker() {
@@ -2561,8 +2098,6 @@ fn test_each_shell_marks_a_multiplexer_pane_and_clears_a_stale_marker() {
     const TMUX: (&str, &str) = ("TMUX", "/tmp/tmux-1000/default,9,0");
     const SCREEN: (&str, &str) = ("STY", "4242.pts-3.host");
     const OUTER: (&str, &str) = ("ATERM_PARENT_SESSION_ID", "s-outer");
-    // (environment, the report, the multiplexer announced on stderr, run in fish
-    // too — every case runs in bash and zsh).
     type Case = (
         &'static [(&'static str, &'static str)],
         &'static str,
@@ -2570,14 +2105,12 @@ fn test_each_shell_marks_a_multiplexer_pane_and_clears_a_stale_marker() {
         bool,
     );
     let cases: &[Case] = &[
-        // A GNU screen window inside an aterm session — the measured case.
         (
             &[PANE, OUTER, ("TERM", "screen.xterm-256color"), SCREEN],
             "mux=screen outer=s-outer base=UNSET",
             Some("screen"),
             true,
         ),
-        // Its second pane: quiet.
         (
             &[PANE, OUTER, ("TERM", "screen.xterm-256color"), SCREEN],
             "mux=screen outer=s-outer base=UNSET",
@@ -2590,7 +2123,6 @@ fn test_each_shell_marks_a_multiplexer_pane_and_clears_a_stale_marker() {
             Some("tmux"),
             true,
         ),
-        // ATERM_MUX_NOTICE=0 silences the line without disturbing the marks.
         (
             &[
                 PANE,
@@ -2603,7 +2135,6 @@ fn test_each_shell_marks_a_multiplexer_pane_and_clears_a_stale_marker() {
             None,
             false,
         ),
-        // A user's ATERM_MUX=0 turns the check off: kept, and nothing announced.
         (
             &[
                 PANE,
@@ -2616,23 +2147,18 @@ fn test_each_shell_marks_a_multiplexer_pane_and_clears_a_stale_marker() {
             None,
             false,
         ),
-        // No aterm session in scope: marked (so `aterm ctl mux` can say what it
-        // sees), no outer sid, nothing announced — there is no block model to lose.
         (
             &[PANE, ("TERM", "screen"), ("STY", "77.pts-1.h")],
             "mux=screen outer=UNSET base=UNSET",
             None,
             false,
         ),
-        // A plain nested shell inside a session: no multiplexer, nothing to mark.
         (
             &[PANE, OUTER, ("TERM", "xterm-256color")],
             "mux=UNSET outer=UNSET base=UNSET",
             None,
             false,
         ),
-        // An ordinary session shell, nothing nested yet: the base is stamped anyway,
-        // as the empty pair, which is what a later pane's own `$STY`/`$TMUX` differs from.
         (
             &[
                 SESSION,
@@ -2643,9 +2169,6 @@ fn test_each_shell_marks_a_multiplexer_pane_and_clears_a_stale_marker() {
             None,
             false,
         ),
-        // A session shell in a window LAUNCHED FROM a tmux pane: the inherited
-        // marker is cleared, and the base it stamps is its own, so the pane's
-        // `$TMUX` matches it and the window is not mistaken for a pane.
         (
             &[
                 SESSION,
@@ -2660,9 +2183,6 @@ fn test_each_shell_marks_a_multiplexer_pane_and_clears_a_stale_marker() {
             true,
         ),
     ];
-    // stdout is redirected, stderr is NOT: the notice IS the stderr of the source.
-    // Then the suite's usual teardown: where the guard is EMPTY the integration
-    // installs, and its preexec would stamp OSC marks into the asserted stdout.
     let mut shells = ShellLanes::default();
     let mut lanes = vec![(
         bash_shell(),
@@ -2704,7 +2224,6 @@ fn test_each_shell_marks_a_multiplexer_pane_and_clears_a_stale_marker() {
                 continue;
             }
             let (out, err) = run_mux_probe(shell, args, script_name, rt.path(), env, report);
-            // fish's report leaves the base out.
             let expected = if fish {
                 expected.split(" base=").next().unwrap_or(expected)
             } else {
@@ -2725,13 +2244,7 @@ fn test_each_shell_marks_a_multiplexer_pane_and_clears_a_stale_marker() {
     }
 }
 
-// Live: a tab that is already open picks up the managed dirs atpkg lays after its shell
-// started (a seamless update adopts the old shell), with no new tab.
-
-/// The atpkg hook in `crates/atpkg/src/hooks.rs`'s exact format: a golden of `hook_files()`
-/// for three fixture paths, pinned from atpkg's side
-/// (`crates/atpkg/tests/shell_integration_hook_pin.rs`). `aterm-shell-integration` cannot
-/// depend on `atpkg`.
+/// The atpkg hook in `crates/atpkg/src/hooks.rs`'s exact format.
 #[cfg(unix)]
 const ATPKG_HOOK_POSIX_GOLDEN: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -2753,13 +2266,7 @@ const ATPKG_HOOK_FIXTURE_REROUTE: &str = "/opt/aterm-si fixture/pkg/reroute";
 #[cfg(unix)]
 const REROUTE_DIR_MARKER: &str = ".atpkg-reroute-dir";
 
-/// One live, interactive shell driven over pipes: commands go in one line at a time, and
-/// the test waits for each command's output before changing the world and sending the
-/// next, so a directory laid between two commands is laid while the shell sits at an idle
-/// prompt. `-i` with a piped stdin still runs every hook this crate installs
-/// (precmd/PROMPT_COMMAND before every prompt, preexec/the DEBUG trap before every
-/// command); fish needs a real pty for its `fish_prompt`/`fish_preexec` events and is
-/// wrapped in `script` for that.
+/// One live, interactive shell driven over pipes.
 #[cfg(unix)]
 struct LiveShell {
     label: String,
@@ -2767,8 +2274,7 @@ struct LiveShell {
     stdin: std::process::ChildStdin,
     stdout: std::sync::Arc<Pumped>,
     stderr: std::sync::Arc<Pumped>,
-    /// The hermetic home the shell's environment points into, when the
-    /// [`ShellCommand`] that made it is gone ([`Self::holding`]).
+    /// The hermetic home the shell's environment points.
     home: Option<aterm_tempfile::TempDir>,
     /// An rc's background job, armed before any wait/assertion can unwind.
     job: Option<ShellJob>,
@@ -2813,9 +2319,7 @@ impl OwnedShellPid {
 
 #[cfg(unix)]
 impl ShellJob {
-    /// A private PID file alone is no signal authority: the still-current job
-    /// must descend from this exact live `script` child. Re-read every start
-    /// across its parent observation; never signal a process with unknown custody.
+    /// A private PID file alone is no signal authority.
     fn owned(&self) -> Result<OwnedShellPid, String> {
         let script = self.script.ok_or("script's start was unreadable")?;
         let text = std::fs::read_to_string(&self.pid_file).map_err(|e| e.to_string())?;
@@ -2850,10 +2354,6 @@ impl ShellJob {
     }
 }
 
-// `#[cfg(test)]` is redundant for the compiler (this file is `include!`d into lib.rs's
-// `#[cfg(test)] mod tests`), but the wasm-process census reads it: it walks each file
-// alone, so without the marker the `thread::spawn` below looks like a thread in the
-// shipped wasm closure (OB-12).
 #[cfg(test)]
 #[cfg(unix)]
 fn pump(mut reader: impl std::io::Read + Send + 'static) -> std::sync::Arc<Pumped> {
@@ -2882,7 +2382,6 @@ fn pump(mut reader: impl std::io::Read + Send + 'static) -> std::sync::Arc<Pumpe
             out.grew.notify_all();
         }
         out.ended.store(true, std::sync::atomic::Ordering::SeqCst);
-        // Under the lock: a waiter that read `ended` false is already waiting.
         let _held = out
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -2891,16 +2390,13 @@ fn pump(mut reader: impl std::io::Read + Send + 'static) -> std::sync::Arc<Pumpe
     sink
 }
 
-/// What a [`pump`] has read from one of a shell's pipes. `grew` is signalled at
-/// every read and at the pipe's end, so a wait for a marker wakes when its bytes
-/// arrive: a 15 ms poll here put up to a tick of idle time behind every marker a
-/// test waited for, six or more per shell (the warm-history tests start 120).
+/// What a [`pump`] has read from one of a shell's pipes.
 #[cfg(unix)]
 struct Pumped {
     bytes: std::sync::Mutex<Vec<u8>>,
     grew: std::sync::Condvar,
     ended: std::sync::atomic::AtomicBool,
-    /// Only a successful zero-byte read proves EOF; a stopped reader may have failed.
+    /// Only a successful zero-byte read proves EOF.
     eof: std::sync::atomic::AtomicBool,
 }
 
@@ -2921,28 +2417,16 @@ fn find_bytes(hay: &[u8], needle: &[u8]) -> Option<usize> {
 
 #[cfg(unix)]
 impl LiveShell {
-    /// A hang detector, never a latency budget: a marker the shell must print
-    /// and the exit it must take each end the wait the moment they happen.
+    /// A hang detector, never a latency budget.
     const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
-    /// The shell holds its three pipes and nothing else of this process
-    /// (`inherit_nothing`; the callers' `Command`s are std's, built with the
-    /// hermetic [`ShellCommand`]): a std child on a std without the SP-1 strip
-    /// keeps any descriptor another test thread had open unflagged at the
-    /// spawn, and a live shell would hold that pipe as long as its test runs.
-    ///
-    /// It starts with SIGINT and SIGQUIT at their defaults, as aterm-pty starts
-    /// a tab's shell. A test process launched by a non-interactive shell's `&`
-    /// inherits both ignored, std keeps an ignored disposition across exec, and
-    /// bash keeps a signal ignored at its entry ignored in every job: a ^C into
-    /// a command then ended nothing on a healthy tty (`133;D;0`, the
-    /// profile's failure of the bash tty test).
+    /// The shell holds its three pipes and nothing else of this process, and a
+    /// fish finds its completions made ([`mark_fish_completions_made`]).
     fn spawn(label: &str, cmd: &mut Command) -> Self {
         use aterm_uds::spawnfd::InheritNothing as _;
         use std::os::unix::process::CommandExt as _;
         cmd.inherit_nothing();
-        // SAFETY: between fork and exec, `signal` alone, which is
-        // async-signal-safe: no allocation, no lock.
+        // SAFETY: Between fork and exec, `signal` alone, which is async-signal-safe.
         unsafe {
             cmd.pre_exec(|| {
                 for sig in [libc::SIGINT, libc::SIGQUIT] {
@@ -2953,6 +2437,7 @@ impl LiveShell {
                 Ok(())
             });
         }
+        mark_fish_completions_made(cmd);
         cmd.stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
@@ -2974,16 +2459,13 @@ impl LiveShell {
         }
     }
 
-    /// Keep `home` — the [`ShellCommand`]'s, which this shell's environment
-    /// points into — for as long as this shell is held.
+    /// Keep `home` — the [`ShellCommand`]'s, which this shell's environment points.
     fn holding(mut self, home: aterm_tempfile::TempDir) -> Self {
         self.home = Some(home);
         self
     }
 
-    /// Retire a positively owned background job before the direct child, on
-    /// success or unwinding. Kernel PID checks cannot eliminate the final
-    /// read-to-signal race; no signal is sent on an unknown/mismatched read.
+    /// Retire a positively owned background job before the direct child, on success or unwinding.
     fn stop_owned_job(&mut self) -> Result<(), String> {
         use std::io::Write as _;
         let Some(mut job) = self.job.take() else {
@@ -2993,16 +2475,10 @@ impl LiveShell {
         let until = std::time::Instant::now() + Self::TIMEOUT;
         let result = (|| {
             let owned = job.owned()?;
-            // SAFETY: positive PID of this still-current child's descendant,
-            // with its kernel start checked immediately before this signal.
-            // No group/zero/negative PID or pathname-derived executable is signalled.
+            // SAFETY: Positive PID of this still-current child's descendant, with its kernel start.
             if !owned.current() || unsafe { libc::kill(owned.pid, libc::SIGKILL) } != 0 {
                 return Err("owned job could not be killed".to_owned());
             }
-            // A warm fish is blocked in its FIFO read. Let its event loop run
-            // and reap this job before closing the PTY: killing script first
-            // can leave the dead job waiting for its parent to reap it.
-            // These private pipes carry only the fixture's bounded protocol.
             job.release
                 .write_all(b"go\n")
                 .map_err(|e| format!("release the owned shell's hold: {e}"))?;
@@ -3082,9 +2558,7 @@ impl LiveShell {
             });
     }
 
-    /// Wait until `marker` appears in stdout at or after byte offset `from`;
-    /// returns the offset just past it. Panics with the whole transcript on
-    /// timeout or when the shell exits first.
+    /// Wait until `marker` appears in stdout at or after byte offset `from`.
     fn wait_for_after(&mut self, marker: &str, from: usize) -> usize {
         let pipe = std::sync::Arc::clone(&self.stdout);
         self.wait_on(&pipe, &format!("{marker:?}"), |out| {
@@ -3093,11 +2567,7 @@ impl LiveShell {
         })
     }
 
-    /// Wait until `found` finds what it looks for in what `pipe` has read so far,
-    /// woken by each read; `what` names it in a failure. Panics with the whole
-    /// transcript when the shell exits first or at [`Self::TIMEOUT`], a hang
-    /// detector. Between reads, the child's exit is looked at every 15 ms: a
-    /// shell can exit with its pipe still held open by a child of its own.
+    /// Wait until `found` finds what it looks for in what `pipe` has read so far.
     fn wait_on<T>(&mut self, pipe: &Pumped, what: &str, found: impl Fn(&[u8]) -> Option<T>) -> T {
         let started = std::time::Instant::now();
         let mut out = pipe
@@ -3131,10 +2601,7 @@ impl LiveShell {
         }
     }
 
-    /// Wait for the shell to exit and reap it; a hang detector. Woken by its
-    /// stdout's end (`script`'s, or a bare shell's, closes as it exits), the
-    /// exit is looked at every millisecond from then: the process is reapable
-    /// a moment after its last descriptor closes.
+    /// Wait for the shell to exit and reap it.
     fn wait_exit_status(&mut self, what: &str) -> std::process::ExitStatus {
         let started = std::time::Instant::now();
         let pipe = std::sync::Arc::clone(&self.stdout);
@@ -3162,9 +2629,7 @@ impl LiveShell {
         }
     }
 
-    /// The text after the last `key` before `end` (the OSC 633;E mark quotes the command
-    /// line, which carries `key` too, but the output comes after it), cut at the first
-    /// control byte.
+    /// The text after the last `key` before `end`.
     fn value_before(&self, key: &str, end: usize) -> String {
         let out = self
             .stdout
@@ -3189,10 +2654,7 @@ impl LiveShell {
     }
 }
 
-/// A shell its test lets go of, at its end or in a failed assertion's unwinding,
-/// is killed and reaped. A fish under `script` never sees its stdin close, so
-/// each failed live-fish test left a `script` and its fish running with no
-/// parent: 12 pairs after one fish 3.1.2 run of this crate (2026-10-18).
+/// A shell its test lets go of, at its end or in a failed assertion's unwinding.
 #[cfg(unix)]
 impl Drop for LiveShell {
     fn drop(&mut self) {
@@ -3201,8 +2663,6 @@ impl Drop for LiveShell {
             eprintln!("{}: {error}", self.label);
         }
         if owns_job {
-            // Its bounded cleanup already reaped the direct child, or kept
-            // every directory on an unconfirmed result. Do not enter a second,
             // unbounded wait during unwinding.
             return;
         }
@@ -3213,9 +2673,7 @@ impl Drop for LiveShell {
     }
 }
 
-/// A user's machine in a temp dir: a home whose rc prepends a foreign `claude` (as a
-/// ~/.zshrc prepending ~/.local/bin does), and a managed prefix that does not exist yet:
-/// atpkg lays it while the shell is already running.
+/// A user's machine in a temp dir.
 #[cfg(unix)]
 struct LiveFixture {
     _dir: aterm_tempfile::TempDir,
@@ -3240,7 +2698,6 @@ impl LiveFixture {
         let root = dir.path().to_path_buf();
         let home = root.join("home");
         let foreign = root.join("foreign");
-        // A prefix with a space, like the real one under "Application Support".
         let prefix = root.join("Application Support").join("pkg");
         std::fs::create_dir_all(&home).expect("home");
         std::fs::create_dir_all(&foreign).expect("foreign");
@@ -3273,16 +2730,14 @@ impl LiveFixture {
             )
     }
 
-    /// atpkg's pass, as the running shell sees it: agents/ + reroute/ (+ its
-    /// marker) + bin/ created, the twin laid, then the hook written temp+rename.
+    /// Atpkg's pass, as the running shell sees it.
     fn lay(&self, hook_ext: &str, golden: &str, twin_says: &str) {
         self.lay_dirs();
         self.lay_twin(twin_says);
         self.lay_hook(hook_ext, golden);
     }
 
-    /// The three managed dirs (agents/ empty, no twin yet) and the reroute marker:
-    /// what the spawn seam or the seed pass creates before any program is installed.
+    /// The three managed dirs (agents/ empty, no twin yet) and the reroute marker.
     fn lay_dirs(&self) {
         std::fs::create_dir_all(&self.agents).expect("agents");
         std::fs::create_dir_all(&self.reroute).expect("reroute");
@@ -3295,8 +2750,7 @@ impl LiveFixture {
         self.write_hook(ext, &self.hook_body(golden));
     }
 
-    /// The twin, atomically (`stand_in` lays it by temp + rename), the way atpkg
-    /// re-lays it on update.
+    /// The twin, atomically (`stand_in` lays it by temp + rename).
     fn lay_twin(&self, says: &str) {
         write_executable(
             &self.agents.join("claude"),
@@ -3304,8 +2758,7 @@ impl LiveFixture {
         );
     }
 
-    /// The seam's reroute dir with its marker and one stub in it (`aterm help
-    /// reroute`): what a session shell inherits before any agent program exists.
+    /// The seam's reroute dir with its marker and one stub in it (`aterm help reroute`).
     fn lay_reroute_stub(&self, name: &str, says: &str) {
         std::fs::create_dir_all(&self.reroute).expect("reroute");
         std::fs::write(self.reroute.join(REROUTE_DIR_MARKER), "").expect("marker");
@@ -3352,9 +2805,7 @@ impl LiveFixture {
     }
 }
 
-/// An interactive zsh through the crate's own ZDOTDIR wrapper, reading the
-/// fixture home's .zshrc — `rc_prelude` (a user's `setopt` lines, say) then the
-/// foreign prepend — exactly the real launch shape.
+/// An interactive zsh through the crate's own zdotdir wrapper, reading the fixture home's .zshrc.
 #[cfg(unix)]
 fn spawn_live_zsh(
     zsh: &str,
@@ -3374,9 +2825,6 @@ fn spawn_live_zsh(
         .expect("prepare")
         .expect("zsh injection");
     let mut cmd = shell_command(zsh);
-    // This fixture reads commands from a pipe: an inherited controlling TTY must not
-    // redirect ZLE's reads or engage job control (background runs would hang or exit on a
-    // TTY read error). `-i` keeps the real precmd/preexec hooks.
     cmd.args(["-i", "-o", "NO_ZLE", "-o", "NO_MONITOR"])
         .env("HOME", &fx.home)
         .env("PATH", "/usr/bin:/bin")
@@ -3384,8 +2832,6 @@ fn spawn_live_zsh(
     for (key, value) in env_add {
         cmd.env(key, value);
     }
-    // The wrapper restores ZDOTDIR to the test home, so the shell reads its .zshrc (the
-    // foreign prepend).
     cmd.env_remove("ATERM_UNSET_ZDOTDIR")
         .env("ATERM_ORIGINAL_ZDOTDIR", &fx.home);
     for (key, value) in extra {
@@ -3394,10 +2840,7 @@ fn spawn_live_zsh(
     LiveShell::spawn("zsh", &mut cmd).holding(cmd.into_home())
 }
 
-/// An interactive bash through the crate's own `--rcfile` wrapper (which sources
-/// /etc/profile, on macOS path_helper, then the home's .bashrc: `rc_prelude`, a user's
-/// `set -u` say, then the foreign prepend), inside a session; `extra` is applied last, so it
-/// can override PATH.
+/// An interactive bash through the crate's own `--rcfile` wrapper.
 #[cfg(unix)]
 fn spawn_live_bash(fx: &LiveFixture, rc_prelude: &str, extra: &[(&str, &str)]) -> LiveShell {
     std::fs::write(
@@ -3431,8 +2874,7 @@ fn spawn_live_bash(fx: &LiveFixture, rc_prelude: &str, extra: &[(&str, &str)]) -
     LiveShell::spawn("bash", &mut cmd).holding(cmd.into_home())
 }
 
-/// A home shaped like Ubuntu's `/etc/skel`: `~/.profile` reads `~/.bashrc`, and
-/// `~/.bash_logout` leaves a mark. Each startup file says when it runs.
+/// A home shaped like Ubuntu's `/etc/skel`.
 #[cfg(all(unix, not(target_os = "macos")))]
 fn skel_shaped_home(fx: &LiveFixture) {
     for (name, body) in [
@@ -3444,8 +2886,7 @@ fn skel_shaped_home(fx: &LiveFixture) {
     }
 }
 
-/// bash as aterm starts it with `shell_args` = `args` ([`merge_shell_args`]):
-/// the integration's argv and env, and the merge's.
+/// Bash as aterm starts it with `shell_args` = `args` ([`merge_shell_args`]).
 #[cfg(all(unix, not(target_os = "macos")))]
 fn spawn_bash_with_shell_args(fx: &LiveFixture, args: &[&str]) -> LiveShell {
     let mut injection = prepare_into(ShellType::Bash, &fx.base)
@@ -3473,13 +2914,6 @@ fn spawn_bash_with_shell_args(fx: &LiveFixture, args: &[&str]) -> LiveShell {
     LiveShell::spawn("bash", &mut cmd).holding(cmd.into_home())
 }
 
-/// Off macOS bash starts as every terminal there starts it — an interactive
-/// NON-login shell — and reads each startup file once: the loader reads
-/// `~/.bashrc` and not `~/.profile`, which on Ubuntu reads `~/.bashrc` again (the
-/// old login-style wrapper ran it twice, and `/etc/bash.bashrc` twice with it).
-/// With `shell_args = ["-l"]` it is a real login shell: `~/.profile` once, through
-/// it `~/.bashrc` once, `logout` works and `~/.bash_logout` runs. The integration
-/// loads in both.
 #[cfg(all(unix, not(target_os = "macos")))]
 #[test]
 fn bash_reads_each_startup_file_once_non_login_and_login() {
@@ -3518,9 +2952,6 @@ fn bash_reads_each_startup_file_once_non_login_and_login() {
         sh.transcript()
     );
 
-    // `--rcfile ~/.myrc`, as TOML spells it: bash tilde-expands the file it is
-    // handed, and so does the loader that reads it in its place (it read
-    // neither ~/.myrc nor ~/.bashrc).
     let fx = LiveFixture::new();
     skel_shaped_home(&fx);
     std::fs::write(fx.home.join(".myrc"), "echo RAN-MYRC\n").expect(".myrc");
@@ -3533,13 +2964,6 @@ fn bash_reads_each_startup_file_once_non_login_and_login() {
     sh.finish();
 }
 
-/// zsh/stat is loaded at the first stamp of a hook that exists, never for an
-/// absent one: a session shell with no hook to stamp loads nothing, at load or
-/// at a prompt — the first tab of a fresh machine, which opens before atpkg lays
-/// the hook — and the same shell loads it, and sources the hook, at the first
-/// prompt after one is laid. A zsh whose module will not load (a `zmodload`
-/// that refuses it stands in) sources that hook at the same prompt, through the
-/// `-f` fallback.
 #[cfg(unix)]
 #[test]
 fn test_zsh_loads_zstat_only_once_there_is_a_hook_to_stamp() {
@@ -3581,17 +3005,7 @@ print -rn -- \"[hook=${+builtins[zstat]} ran=${ATERM_TEST_HOOK_RAN:-0}]\"\n";
         );
     }
 }
-/// An interactive fish inside a session. fish's `fish_prompt`/`fish_preexec`
-/// events fire only from its interactive reader, which needs a real pty, so the
-/// shell runs under `script` (macOS and util-linux spellings). The integration
-/// arrives the way aterm delivers it — the vendor conf.d on XDG_DATA_DIRS — and
-/// the foreign prepend lives in the home's config.fish. TERM=dumb, like the
-/// other two lanes: under a terminal-class TERM fish 4.9.3 queries Primary
-/// Device Attributes and waits 10 s for the reply nobody here sends before its
-/// first prompt (measured 2026-09-16: 10.1 s to the prompt against 0.04 s under
-/// dumb) — three spawns spent 30 of the lane's 32 s idle and left the first
-/// `wait_for_after` half its budget. The OSC 133;A marker is the integration's
-/// own, not fish's terminal layer's, so it still arrives (pinned below).
+/// An interactive fish inside a session.
 #[cfg(unix)]
 fn spawn_live_fish(fish: &str, fx: &LiveFixture, extra: &[(&str, &str)]) -> LiveShell {
     let config = fx.home.join("config").join("fish");
@@ -3605,8 +3019,6 @@ fn spawn_live_fish(fish: &str, fx: &LiveFixture, extra: &[(&str, &str)]) -> Live
         .expect("prepare")
         .expect("fish injection");
     let mut cmd = pty_script(&[fish, "-i"]);
-    // The hermetic environment of `shell_command`, applied to `script` (fish
-    // inherits it), then the fixture's home and the conf.d injection.
     let hermetic = shell_command(fish);
     for (key, value) in hermetic.get_envs() {
         match value {
@@ -3625,8 +3037,6 @@ fn spawn_live_fish(fish: &str, fx: &LiveFixture, extra: &[(&str, &str)]) -> Live
         .env("ATERM_CHILD", "1");
     for (key, value) in env_add {
         if key == "XDG_DATA_DIRS" {
-            // Narrowed to the injection's own conf.d plus the hermetic data dir:
-            // `prepare_fish` folds in the test process's XDG_DATA_DIRS otherwise.
             cmd.env(
                 key,
                 format!(
@@ -3652,15 +3062,7 @@ const BASH_PRINT_PATH: &str = "printf 'LIVEPATH=%s\\n' \"$PATH\"; printf 'LIVERR
 #[cfg(unix)]
 const FISH_PRINT_PATH: &str = "printf 'LIVEPATH=%s\\n' (string join : -- $PATH); printf 'LIVERR=%s\\n' \"$ATERM_REROUTE_DIR\"; echo MARK(math 40 + 2)";
 
-/// `script(1)` running `argv` on a new pty, with the program `argv` names as its one
-/// child, so a signal a test sends the shell under test reaches it. macOS's `script`
-/// runs the argv itself. util-linux's runs `-c`'s line through `$SHELL -c`: /bin/sh
-/// here, never a bash that reads `~/.bashrc` on the way (Debian's does for a `-c` run
-/// over ssh, `SSH_CLIENT` set), which ran the rig's startup file before the shell under
-/// test began; and the line `exec`s the argv, because Ubuntu's dash forks a `-c` line's
-/// command and waits for it: `script`'s child was that `sh`, and the spare tests'
-/// SIGWINCH and SIGHUP went to it, never to the shell (the Linux lane's guest,
-/// 2026-10-21: `sh -c '…/bash' '--rcfile' … '-i'`, bash its child).
+/// `script(1)` running `argv` on a new pty, with the program `argv` names as its one child.
 #[cfg(unix)]
 fn pty_script(argv: &[&str]) -> Command {
     let mut cmd = Command::new("script");
@@ -3688,25 +3090,21 @@ fn script_can_allocate_a_pty() -> bool {
         || Command::new("script").arg("--version").output().is_ok()
 }
 
-/// [`zsh_shell`] for a test that needs a real zsh: COULD NOT RUN where the host
-/// has none, never a silent pass.
+/// [`zsh_shell`] for a test that needs a real zsh.
 #[cfg(unix)]
 fn need_zsh() -> &'static str {
     zsh_shell()
         .unwrap_or_else(|| aterm_spec::host::could_not_run(aterm_spec::host::tool("zsh").refusal()))
 }
 
-/// Absolute path to a PowerShell 7 `pwsh`, or `None` where the host has none
-/// ([`interned_test_shell`]).
+/// Absolute path to a PowerShell 7 `pwsh`, or `None` where the host has none.
 #[cfg(unix)]
 fn pwsh_shell() -> Option<&'static str> {
     static PWSH: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
     interned_test_shell(&PWSH, "pwsh")
 }
 
-/// [`pwsh_shell`] for a test that needs a real pwsh: COULD NOT RUN where the
-/// host has none, naming the route to a copy (`ATERM_TEST_PWSH` and where the official
-/// build comes from, `Tool::refusal`), never a silent pass.
+/// [`pwsh_shell`] for a test that needs a real pwsh.
 #[cfg(unix)]
 fn need_pwsh() -> &'static str {
     pwsh_shell().unwrap_or_else(|| {
@@ -3714,9 +3112,7 @@ fn need_pwsh() -> &'static str {
     })
 }
 
-/// [`fish_shell`] for a test that needs a real fish: COULD NOT RUN where the
-/// host has none, naming the route to a copy (`ATERM_TEST_FISH` and where the official
-/// build comes from, `Tool::refusal`), never a silent pass.
+/// [`fish_shell`] for a test that needs a real fish.
 #[cfg(unix)]
 fn need_fish() -> &'static str {
     fish_shell().unwrap_or_else(|| {
@@ -3724,14 +3120,10 @@ fn need_fish() -> &'static str {
     })
 }
 
-/// A `script(1)` that can allocate a pty, for a live-pty test: COULD NOT RUN
-/// where the host has none, never a silent pass.
+/// A `script(1)` that can allocate a pty, for a live-pty test.
 #[cfg(unix)]
 fn need_pty_script() {
     if !script_can_allocate_a_pty() {
-        // The remedy alone: the lanes start `script` from `$PATH`, not through the
-        // resolver, so no variable names another copy (and `ATERM_TEST_SCRIPT` is
-        // these tests' integration script).
         aterm_spec::host::could_not_run(format!(
             "no `script` that can allocate a pty on this host: {}",
             aterm_spec::host::tool("script").remedy()
@@ -3739,11 +3131,7 @@ fn need_pty_script() {
     }
 }
 
-/// A live `label` shell ("bash", "zsh" or "fish") inside a session, with no rc
-/// prelude, and the line that prints its PATH — or `None` where that shell is not
-/// installed, which `shells` notes. fish without the `script` that gives it a pty
-/// ends the test COULD NOT RUN here: fish is every caller's last lane, so the
-/// others have run.
+/// A live `label` shell ("bash", "zsh" or "fish") inside a session, with no rc prelude.
 #[cfg(unix)]
 fn spawn_live(
     label: &str,
@@ -3763,8 +3151,7 @@ fn spawn_live(
     }
 }
 
-/// Print PATH and `$ATERM_REROUTE_DIR` in the live shell, from `at` on: reroute,
-/// agents, …, bin last, each once, and the reroute dir derived beside agents/.
+/// Print PATH and `$ATERM_REROUTE_DIR` in the live shell, from `at`.
 #[cfg(unix)]
 fn assert_live_path(label: &str, sh: &mut LiveShell, fx: &LiveFixture, at: usize, print: &str) {
     sh.send(print);
@@ -3777,15 +3164,7 @@ fn assert_live_path(label: &str, sh: &mut LiveShell, fx: &LiveFixture, at: usize
     );
 }
 
-/// THE OWNER'S SCENARIO in one live bash or zsh (`label`, the hook's extension),
-/// started inside a session with no ATPKG_AGENTS, no ATERM_REROUTE_DIR, no hook
-/// and no agents dir, its rc putting a foreign `claude` first: `claude` → foreign;
-/// a whole idle prompt cycle with nothing laid; atpkg's pass lays the hook
-/// (hooks.rs's exact format), agents/ with a twin and reroute/ with its marker;
-/// `claude` → "managed 1" (preexec's pickup); the twin re-laid temp+rename →
-/// "managed 2"; the hook REWRITTEN under the live shell (a later pass) →
-/// re-sourced (zsh sees the new inode, bash compares the text — residual R1 of
-/// 2026-09-16, closed); then PATH and the derived reroute dir.
+/// The owner's scenario in one live bash or zsh (`label`, the hook's extension).
 #[cfg(unix)]
 fn posix_owner_scenario(label: &str, sh: &mut LiveShell, fx: &LiveFixture, print: &str) {
     sh.send("claude");
@@ -3811,10 +3190,6 @@ fn posix_owner_scenario(label: &str, sh: &mut LiveShell, fx: &LiveFixture, print
     assert_live_path(label, sh, fx, at, print);
 }
 
-/// The owner's scenario in zsh, through the crate's own ZDOTDIR wrapper; then the
-/// two negatives: outside a session (no ATERM_CHILD) nothing happens live, and an
-/// engaged __ATERM_REROUTE_PASSTHROUGH (the `aterm --no-reroute` marker) fronts
-/// agents/ but derives no reroute dir.
 #[cfg(unix)]
 #[test]
 fn test_zsh_already_running_session_shell_picks_up_the_managed_dirs_live() {
@@ -3826,7 +3201,6 @@ fn test_zsh_already_running_session_shell_picks_up_the_managed_dirs_live() {
     posix_owner_scenario("zsh", &mut sh, &fx, ZSH_PRINT_PATH);
     sh.finish();
 
-    // Outside a session: inert. The hook and dirs appear; `claude` stays foreign.
     let fx = LiveFixture::new();
     let mut sh = spawn(&fx, &[]);
     sh.send("claude");
@@ -3841,7 +3215,6 @@ fn test_zsh_already_running_session_shell_picks_up_the_managed_dirs_live() {
     );
     sh.finish();
 
-    // The `--no-reroute` marker engaged: agents/ is fronted, no reroute dir derived.
     let fx = LiveFixture::new();
     let mut sh = spawn(
         &fx,
@@ -3867,13 +3240,6 @@ fn test_zsh_already_running_session_shell_picks_up_the_managed_dirs_live() {
     sh.finish();
 }
 
-/// The owner's scenario in bash under a user's `set -u` (in .bashrc, so it
-/// governs the script's load AND every prompt). Before 2026-09-16 the prompt
-/// command aborted on the unbound `__aterm_pending_prompt_setup` at every prompt,
-/// leaving `__aterm_in_prompt_cmd=1` stuck and the DEBUG-trap preexec — the
-/// per-command re-assert — dead: the `claude` typed after the twins landed ran
-/// the FOREIGN copy. Pinned: the whole scenario holds, and stderr carries no
-/// "unbound variable".
 #[cfg(unix)]
 #[test]
 fn test_bash_live_pickup_holds_under_set_u() {
@@ -3888,14 +3254,6 @@ fn test_bash_live_pickup_holds_under_set_u() {
     sh.finish();
 }
 
-/// No hook at all — a fresh machine before any agent program is installed — and
-/// the seam's ATERM_REROUTE_DIR leading PATH with a `cargo` stub in it. The user
-/// prepends a dir holding its own `cargo` AT THE PROMPT (a `. ~/.cargo/env`, a
-/// tool installer): the very next `cargo` must still run the stub (preexec's
-/// re-front), and so must one typed a prompt cycle later. Review finding
-/// 2026-09-16: bash and fish returned from the hot path's step 1 whenever
-/// $ATPKG_AGENTS was unset, hook or no hook, so the prepend shadowed the stubs
-/// for the life of the shell — only zsh held.
 #[cfg(unix)]
 #[test]
 fn test_reroute_stubs_survive_a_prompt_time_prepend_with_no_hook() {
@@ -3951,16 +3309,6 @@ fn test_reroute_stubs_survive_a_prompt_time_prepend_with_no_hook() {
     }
 }
 
-/// The OTHER order the owner's gesture reaches: the hook and an EMPTY agents/
-/// exist when the shell starts — a fresh machine creates agents/ at launch and
-/// lays the twin only once the managed program is installed — so `claude` runs
-/// the foreign copy and the shell HASHES that path. The twin lands, with NO hook
-/// rewrite: `claude` must run it. Before the twin watch both shells kept the
-/// hashed foreign path for the life of the shell (measured: zsh 5.9 and bash
-/// 3.2.57). Also pinned: the steady state assigns nothing — a manual hash entry
-/// (`zzz`) survives two idle prompt cycles — and, for zsh, a user rc with
-/// `setopt ksh_arrays warn_create_global` neither truncates PATH nor prints a
-/// "created globally" line (the hot path runs under `emulate -L zsh`).
 #[cfg(unix)]
 #[test]
 fn test_twin_landing_in_an_agents_dir_already_leading_path_is_run_live() {
@@ -3999,7 +3347,6 @@ fn test_twin_landing_in_an_agents_dir_already_leading_path_is_run_live() {
         sh.send("echo IDLE-$((2+0))");
         let at = sh.wait_for_after("IDLE-2", at);
         let at = sh.wait_for_after("\x1b]133;A", at);
-        // The hash table survived two steady prompts: nothing was assigned or flushed.
         sh.send("zzz");
         let at = sh.wait_for_after("foreign", at);
         fx.lay_twin("managed 1");
@@ -4018,11 +3365,6 @@ fn test_twin_landing_in_an_agents_dir_already_leading_path_is_run_live() {
     }
 }
 
-/// The hook exists at spawn but names an agents/ atpkg has NOT created yet (a
-/// hook written on a machine with no agent program installed, or a wiped managed
-/// prefix): `claude` → foreign; agents/ + reroute/ + bin/ and the twin appear
-/// with NO hook rewrite; `claude` must run the twin. Before the re-probe,
-/// `$__aterm_managed_want` stayed empty and the hot path returned early forever.
 #[cfg(unix)]
 #[test]
 fn test_hook_naming_an_agents_dir_that_appears_later_is_fronted_live() {
@@ -4048,17 +3390,11 @@ fn test_hook_naming_an_agents_dir_that_appears_later_is_fronted_live() {
     }
 }
 
-/// The same three orders in fish, when installed: the tab-already-open scenario, with the
-/// hook rewritten under the live shell and re-sourced (fish reads the hook's text with
-/// `read -z` and compares); the hook and an empty agents/ at spawn with the twin landing
-/// later (fish keeps no command hash, so this is the order check plus PATH's own walk);
-/// and the hook first, the dirs later (the re-probe).
 #[cfg(unix)]
 #[test]
 fn test_fish_already_running_session_shell_picks_up_the_managed_dirs_live() {
     let fish = need_fish();
     need_pty_script();
-    // 1. The owner's scenario.
     let fx = LiveFixture::new();
     let mut sh = spawn_live_fish(fish, &fx, &[]);
     sh.send("claude");
@@ -4072,7 +3408,6 @@ fn test_fish_already_running_session_shell_picks_up_the_managed_dirs_live() {
     fx.lay_twin("managed 2");
     sh.send("claude");
     let at = sh.wait_for_after("managed 2", at);
-    // The hook rewritten under the live shell (a later pass): re-sourced.
     fx.write_hook(
         "fish",
         &format!(
@@ -4085,7 +3420,6 @@ fn test_fish_already_running_session_shell_picks_up_the_managed_dirs_live() {
     assert_live_path("fish", &mut sh, &fx, at, FISH_PRINT_PATH);
     sh.finish();
 
-    // 2. Hook + empty agents/ at spawn; the twin lands later, no hook rewrite.
     let fx = LiveFixture::new();
     fx.lay_dirs();
     fx.lay_hook("fish", ATPKG_HOOK_FISH_GOLDEN);
@@ -4104,7 +3438,6 @@ fn test_fish_already_running_session_shell_picks_up_the_managed_dirs_live() {
     assert_live_path("fish", &mut sh, &fx, at, FISH_PRINT_PATH);
     sh.finish();
 
-    // 3. The hook first, naming an agents/ that does not exist yet.
     let fx = LiveFixture::new();
     fx.lay_hook("fish", ATPKG_HOOK_FISH_GOLDEN);
     let mut sh = spawn_live_fish(fish, &fx, &[]);
@@ -4121,15 +3454,12 @@ fn test_fish_already_running_session_shell_picks_up_the_managed_dirs_live() {
     sh.finish();
 }
 
-// ─── The re-key channel ───
-
 #[cfg(unix)]
 const REKEY_OLD: &str = "1111111111111111111111111111111111111111111111111111111111111111";
 #[cfg(unix)]
 const REKEY_NEW: &str = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
 
-/// The line that prints the globals a mark is signed with, then a marker whose
-/// number is computed (so the echoed command line never matches it).
+/// The line that prints the globals a mark is signed with, then a marker whose number is computed.
 #[cfg(unix)]
 fn rekey_probe(label: &str, n: u32) -> (String, String) {
     let marker = format!("RK{}", 100 + n);
@@ -4145,10 +3475,7 @@ fn rekey_probe(label: &str, n: u32) -> (String, String) {
     (line, marker)
 }
 
-/// Hands a live shell `line` (a re-key's key, or a body's address) and its newline at
-/// `path`, renamed into place whole as the host writes both (aterm-gui's
-/// `shell_rekey::deliver`): written in place, a prompt's check could read the file before
-/// its bytes landed and consume an empty line.
+/// Hands a live shell `line` (a re-key's key, or a body's address) and its newline at `path`.
 #[cfg(unix)]
 fn deliver(path: &Path, line: &str) {
     let part = path.with_extension("part");
@@ -4156,11 +3483,6 @@ fn deliver(path: &Path, line: &str) {
     std::fs::rename(&part, path).unwrap();
 }
 
-/// Each live shell spawned with the re-key channel: the nonce it was spawned with
-/// and the path scrubbed from its environment; a malformed key is consumed and
-/// changes nothing; a key written while it idles is taken at its NEXT prompt —
-/// the globals change, the file is gone, and the marks after it carry
-/// `;id=<new>`.
 #[cfg(unix)]
 #[test]
 fn a_live_shell_takes_a_rekey_at_its_next_prompt() {
@@ -4226,18 +3548,6 @@ fn a_live_shell_takes_a_rekey_at_its_next_prompt() {
     }
 }
 
-/// bash's default prompt carries ONE 133;B however many prompts it has drawn:
-/// each prompt takes the previous mark off PS1 before it appends its own. The
-/// strip once matched nothing (its pattern's backslashes read as glob escapes),
-/// so PS1 gained a mark per prompt and every prompt re-sent them all; then, as a
-/// regex, nothing in a PS1 holding a byte the tab's UTF-8 locale cannot decode
-/// (a Latin-1 `É`, under the UTF-8 `LC_CTYPE` aterm's spawn seam forces). That
-/// PS1 starts with such a byte before a backslash, which bash 5's `%` empties.
-///
-/// The mark, signed, says it stands where the buffer starts
-/// (`;aterm_input=start`, which aterm-core's `input_region_start` asks for):
-/// it ends the prompt, before readline's line. And a PS1 an older body left
-/// its mark on, signed and without that word, sheds it for this body's.
 #[cfg(unix)]
 #[test]
 fn a_live_bash_prompt_carries_one_133b_however_many_prompts() {
@@ -4276,11 +3586,6 @@ fn a_live_bash_prompt_carries_one_133b_however_many_prompts() {
     }
 }
 
-// ─── The typed re-key ───
-
-/// The typed re-key exists only for a shell with a POSIX-or-fish integration
-/// script: typed into PowerShell, cmd, a WSL launcher or an unknown program,
-/// the line would be a syntax error at the user's prompt.
 #[test]
 fn the_typed_rekey_exists_only_for_scripted_shells() {
     for shell in [ShellType::Zsh, ShellType::Bash, ShellType::Fish] {
@@ -4296,8 +3601,7 @@ fn the_typed_rekey_exists_only_for_scripted_shells() {
     }
 }
 
-/// POSIX single quotes, `'\''` for a quote: the quoting the harness's relaunch
-/// line uses. Git Bash takes Windows paths with forward slashes.
+/// POSIX single quotes, `'\''` for a quote.
 #[cfg(any(unix, windows))]
 fn posix_quoted(path: &Path) -> String {
     let path = path.to_str().expect("UTF-8");
@@ -4306,14 +3610,6 @@ fn posix_quoted(path: &Path) -> String {
     format!("'{}'", path.replace('\'', r"'\''"))
 }
 
-/// A LIVE SHELL WITHOUT THE CHANNEL — spawned as every shell before 0.94 was,
-/// with its nonce and no `ATERM_REKEY_PATH` — never reads the key file at a
-/// prompt of its own, and takes the key from the typed line: the globals change
-/// at once, the file is gone, and the marks of the very next prompt carry the new
-/// id. The path has a space and a quote in it (the real control dir sits under
-/// "Application Support"). A second line naming a file that is not there — a key
-/// withdrawn before the line ran — changes nothing and prints no error, and the
-/// command after it still runs.
 #[cfg(unix)]
 #[test]
 fn a_live_shell_without_the_channel_takes_a_typed_rekey() {
@@ -4374,19 +3670,12 @@ fn a_live_shell_without_the_channel_takes_a_typed_rekey() {
             REKEY_NEW,
             "{label}: a missing file changes nothing"
         );
-        // (bash's line editor echoes the typed line to stderr, path and all; an
-        // error would name the missing file.)
         let err = sh.stderr_text().to_lowercase();
         assert!(!err.contains("no such file"), "{label}: quiet: {err}");
         sh.finish();
     }
 }
 
-// ─── The content-addressed script folder ───
-
-/// The address is what collection (`collect_old_script_sets`) and the loaders
-/// (`is_integration_rev`) recognise a script folder by: exactly 16 lowercase hex
-/// digits, and nothing else — not a scratch folder, not a near miss.
 #[test]
 fn the_script_set_has_one_sixteen_hex_address() {
     let address = script_set_address();
@@ -4401,14 +3690,6 @@ fn the_script_set_has_one_sixteen_hex_address() {
     }
 }
 
-/// THE MEASURED DEFECT: a foreign start rewrote the shared folder and every new
-/// tab of the running window sourced its scripts. Now a new window (a fresh memo)
-/// and the running one (a warm memo) both keep pointing their shells at THIS
-/// build's folder, whose bytes are this build's, whatever a foreign build wrote —
-/// an older aterm to the legacy flat files (left for the builds that read them),
-/// a build of this scheme to its own content folder. And a folder deleted mid-run
-/// (by a person, or by another build's collection) is installed again by the
-/// next spawn: the warm memo is checked against the disk, never trusted alone.
 #[test]
 fn a_foreign_build_cannot_change_what_this_builds_tabs_source() {
     let tmp = aterm_tempfile::tempdir().unwrap();
@@ -4451,11 +3732,6 @@ fn a_foreign_build_cannot_change_what_this_builds_tabs_source() {
     );
 }
 
-/// A content folder that exists but does not hold this set — a wrapper edited by
-/// hand, a file half-written by a writer that died — is replaced on the first
-/// `prepare` of a process, never trusted (every file of the set is checked, not
-/// just the script); no scratch folder survives; racing writers of the same set
-/// all land on one folder.
 #[test]
 fn a_damaged_content_folder_is_replaced_and_racing_writers_share_one() {
     let tmp = aterm_tempfile::tempdir().unwrap();
@@ -4492,9 +3768,6 @@ fn a_damaged_content_folder_is_replaced_and_racing_writers_share_one() {
     assert!(script_set_matches(&raced.join(script_set_address())));
 }
 
-/// No two writers share a scratch folder: suffixes drawn at once by many threads of one
-/// process (same clock tick, same pid) are all distinct, or the first rename would take a
-/// shared scratch folder from under the second.
 #[test]
 fn scratch_suffixes_drawn_at_once_never_collide() {
     let handles: Vec<_> = (0..8)
@@ -4511,11 +3784,6 @@ fn scratch_suffixes_drawn_at_once_never_collide() {
     assert_eq!(all.len(), drawn, "a scratch suffix was drawn twice");
 }
 
-/// Collection keeps this build's folder, the five newest others and everything
-/// younger than two weeks; it removes older folders beyond those and dead
-/// writers' scratch folders, and never touches the legacy flat files.
-/// Unix only: stamping a folder's mtime opens it with `File::open`, which
-/// Windows refuses for a directory without `FILE_FLAG_BACKUP_SEMANTICS`.
 #[cfg(unix)]
 #[test]
 fn old_script_folders_are_collected_and_young_or_newest_ones_kept() {
@@ -4523,8 +3791,6 @@ fn old_script_folders_are_collected_and_young_or_newest_ones_kept() {
     let root = tmp.path().join("si");
     install_script_set(&root).unwrap();
     std::fs::write(root.join("aterm_shell_integration.zsh"), "legacy").unwrap();
-    // Distinct mtimes, oldest first, stamped rather than waited for: a coarse
-    // filesystem clock would tie folders created back to back.
     let base = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
     let others: Vec<PathBuf> = (0..8u64)
         .map(|i| {
@@ -4539,11 +3805,9 @@ fn old_script_folders_are_collected_and_young_or_newest_ones_kept() {
     let scratch = root.join(".tmp-0000000000000000-1-1");
     std::fs::create_dir_all(&scratch).unwrap();
 
-    // Now: everything is young, nothing goes.
     collect_old_script_sets(&root, std::time::SystemTime::now());
     assert!(others.iter().all(|d| d.exists()) && scratch.exists());
 
-    // A month on: the three oldest others and the scratch folder go.
     let later = std::time::SystemTime::now() + std::time::Duration::from_secs(30 * 24 * 3600);
     collect_old_script_sets(&root, later);
     for (i, dir) in others.iter().enumerate() {

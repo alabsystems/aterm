@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The `privacy` report (design §5.1): the hop's facts, the probe slots and the
-//! process-wide facts joined once, and rendered as lines or as one JSON object.
-//!
-//! Grant scope and service coverage (spikes S1, S4) are not claimed
-//! (`SpikeEvidence::MEASURED` leaves both off): a completed grant establishes
-//! `fda_scope=this_process` and Apple's documented `app-data` coverage for that
-//! host, but not inherited-session or per-folder access, so `prompt_possible`
-//! stays `yes` and no folder is reported covered. S4 is measured; why its flag
-//! stays off is on `SpikeEvidence::fda_coverage_measured`.
+//! The `privacy` report (design §5.1): the hop's facts, the probe slots and the process-wide facts joined once, and rendered as lines or as one JSON object.
 
 use std::cell::Cell;
 use std::time::{Duration, Instant};
@@ -29,9 +21,6 @@ use crate::control::{Scope, cross_session_authorized};
 use crate::signing_identity::{SigningIdentity, install_posture_once, os_version};
 
 /// The TCC service classes a Full Disk Access grant is claimed (by Apple) to
-/// subsume. App-data follows the host's completed grant; others stay
-/// `unmeasured` while §7 S4's flag is off, except [`NEVER_COVERED`] (see
-/// [`covers_split`]).
 const SERVICES: &[&str] = &[
     "documents",
     "desktop",
@@ -40,8 +29,6 @@ const SERVICES: &[&str] = &[
     "removable-volumes",
     "app-data",
     "file-provider-domains",
-    // The promptable classes Full Disk Access does not subsume, each with its
-    // own System Settings pane. They are not folder rows.
     "media-library",
     "photos",
     "app-bundles",
@@ -49,14 +36,8 @@ const SERVICES: &[&str] = &[
 ];
 
 /// The service classes Full Disk Access does not reliably cover
-/// (`docs/DESIGN-macos-tcc-prompts-2026-08-30.md` §3.4). Always `uncovered`.
 const NEVER_COVERED: &[&str] = &[
     "file-provider-domains",
-    // Separate consent services that the FDA rule does not subsume: the grant
-    // does not reach them, so `uncovered`, not `unmeasured`. Contacts is
-    // measured: on 2026-10-16 (macOS 27.0.1) a program reading Contacts'
-    // container drew a kTCCServiceAddressBook check while the same sweep's
-    // Full Disk Access checks were granted.
     "media-library",
     "photos",
     "app-bundles",
@@ -64,17 +45,10 @@ const NEVER_COVERED: &[&str] = &[
 ];
 
 /// The two volume classes that appear on the `folder` row beside the three
-/// [`Folder`] variants. They have no `$HOME`-relative path, so they carry no
-/// resolved `PathBuf` and can only ever be `unknown` here.
 const VOLUME_ROWS: &[&str] = &["network-volumes", "removable-volumes"];
 
 /// A control caller can wait briefly for the asynchronous check it just
-/// requested: it parks on the pending slots' publications, so it wakes when
-/// one answers. GUI reads remain immediate, and a stuck OS call still reports
-/// Pending rather than holding a control worker indefinitely.
 const PRIVACY_READ_WAIT: Duration = Duration::from_millis(500);
-
-// The snapshot
 
 /// One live session's consent row.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -89,22 +63,18 @@ pub(crate) struct SessionRow {
     cwd: Option<String>,
 }
 
-/// Where the Full Disk Access question stands, for the `access_card` line of
-/// the report (`consent_card::report_state` and the record). Pure data.
+/// Where the Full Disk Access question stands, for the `access_card` line of the report (`consent_card::report_state` and the record).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct AccessCardReport {
     /// `quiet`, `asked`, `opened`, `granted` or `declined`.
     pub(crate) state: &'static str,
     /// The four unix-second facts the record holds.
     pub(crate) record: crate::consent_card::AccessRecord,
-    /// Need events counted in this process (dialogs macOS showed for a program
-    /// of this aterm, or refused reads).
+    /// Need events counted in this process (dialogs macOS showed for a program of this aterm, or refused reads).
     pub(crate) needs: u32,
 }
 
-/// What the card host holds for the `access_card` row, read on the event loop
-/// (`App::access_card_inputs`). The state is judged off it, against the
-/// verdict the report read ([`AccessCardReport::new`]).
+/// What the card host holds for the `access_card` row, read on the event loop (`App::access_card_inputs`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct AccessCardInputs {
     pub(crate) marker: Option<crate::consent_card::Marker>,
@@ -114,7 +84,6 @@ pub(crate) struct AccessCardInputs {
 
 impl AccessCardReport {
     /// The row for `inputs` under the Full Disk Access verdict `fda`, at
-    /// `now_secs` (unix seconds).
     fn new(inputs: AccessCardInputs, fda: FdaState, now_secs: u64) -> Self {
         Self {
             state: crate::consent_card::report_state(inputs.marker, &inputs.record, fda, now_secs),
@@ -162,32 +131,24 @@ impl AccessCardReport {
     }
 }
 
-/// The whole posture, assembled once and rendered two ways. Pure data: the
-/// renderers below are total functions of it, so the wire format is testable
-/// without an event loop, a window, or an OS.
+/// The whole posture, assembled once and rendered two ways.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PrivacySnapshot {
     platform: &'static str,
     os: Option<&'static str>,
     /// The process-wide identity, read once
-    /// ([`crate::signing_identity::signing_identity`]).
     identity: &'static SigningIdentity,
     /// The macOS install posture the first-open doctor classifies
-    /// (`aterm_update::which_copy::posture_from`), as a token. Other platforms
-    /// run a bare executable and report `not-a-bundle`.
     install: &'static str,
     /// The canonical path this process runs from, when it can be read.
     running: Option<String>,
     /// Whether macOS can still find the code this process's grants are keyed
-    /// to. `running=` is the exec-time path, which reads healthy even after the
-    /// bundle was renamed or deleted under the process (an in-place apply).
     anchor: aterm_containment::ImageAnchor,
     fda: FdaState,
     probe: ProbeLabel,
     probe_age_ms: Option<u128>,
     evidence: SpikeEvidence,
     /// [`covers_split`] of `fda` and `evidence`, computed once for the folder
-    /// row and both renderers.
     split: CoverageSplit,
     attribution_root: Attribution,
     sessions: Vec<SessionRow>,
@@ -197,12 +158,8 @@ pub(crate) struct PrivacySnapshot {
     warmup: &'static str,
     warmup_last_ms: Option<u128>,
     /// The debugger rule (`docs/DESIGN-macos-debugger-access-2026-09-29.md`
-    /// §4.1): an Authorization Services right, not a TCC grant, so it joins no
-    /// coverage bucket and never feeds `prompt_possible`.
     debugger: DebuggerRow,
     /// The Developer Tools list (debugger design §9.1): tccd's newest answer
-    /// for this bundle id, read from tccd's own log. TCC, but never a file
-    /// grant, so it joins no coverage bucket and never feeds `prompt_possible`.
     devtools: DevToolsRow,
     /// Per-service folder state, in `folder_names` order, and its source.
     folders: Vec<(&'static str, &'static str)>,
@@ -214,20 +171,14 @@ pub(crate) struct PrivacySnapshot {
     /// Where the Full Disk Access question stands (`access_card` row).
     access_card: AccessCardReport,
     /// Every bundle on disk claiming this process's `CFBundleIdentifier`
-    /// (`aterm_containment::consent`, "The claimant census") and the answer's
-    /// age. The only row about the TCC record rather than this process.
     claimants: Option<(Claimants, Duration)>,
     /// No census answer exists yet — `census=pending`, as opposed to `off`.
     census_pending: bool,
     /// Whether `/usr/bin/trash` is on this Mac: without it the Security panel
-    /// offers no move, and no row reads `trash=offered`.
     trash_tool: bool,
 }
 
-/// The `covers=` / `uncovered=` / `unmeasured=` split; "not measured" is not
-/// "measured as not covered". App-data uses Apple's documented FDA rule and the
-/// host's confirmed grant; other services stay unmeasured while §7 S4's flag is off.
-/// [`NEVER_COVERED`] stays separate regardless.
+/// The `covers=` / `uncovered=` / `unmeasured=` split; "not measured" is not "measured as not covered".
 pub(crate) fn covers_split(fda: FdaState, evidence: SpikeEvidence) -> CoverageSplit {
     let never = |s: &&&str| NEVER_COVERED.contains(s);
     let uncovered: Vec<&'static str> = SERVICES.iter().filter(never).copied().collect();
@@ -245,9 +196,6 @@ pub(crate) fn covers_split(fda: FdaState, evidence: SpikeEvidence) -> CoverageSp
             unmeasured: rest,
         }
     };
-    // Apple documents app-container access as an FDA-covered class (WWDC23,
-    // "What's new in privacy"). A completed grant is positive evidence for
-    // the observing host; it is not proof about adopted sessions or folders.
     split.covers.retain(|service| *service != "app-data");
     split.unmeasured.retain(|service| *service != "app-data");
     if app_data_covered(fda, observed_fda_scope(fda, evidence.fda_scope)) {
@@ -258,8 +206,7 @@ pub(crate) fn covers_split(fda: FdaState, evidence: SpikeEvidence) -> CoverageSp
     split
 }
 
-/// Successful access establishes the observing host's scope directly. It does
-/// not establish when a changed Settings grant reaches another process.
+/// Successful access establishes the observing host's scope directly.
 pub(crate) const fn observed_fda_scope(
     fda: FdaState,
     measured: consent::FdaScope,
@@ -279,8 +226,7 @@ const fn app_data_covered(fda: FdaState, scope: consent::FdaScope) -> bool {
         )
 }
 
-/// The three coverage buckets of [`covers_split`]. Shared with the Security
-/// panel, so the verb and the panel can never disagree about a service.
+/// The three coverage buckets of [`covers_split`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CoverageSplit {
     pub(crate) covers: Vec<&'static str>,
@@ -288,9 +234,7 @@ pub(crate) struct CoverageSplit {
     pub(crate) unmeasured: Vec<&'static str>,
 }
 
-/// The `observer fda=` value: `off` when deliberately not consulted,
-/// `unavailable` when permitted but unable to run, `ok` when a syscall
-/// answered.
+/// The `observer fda=` value: `off` when deliberately not consulted, `unavailable` when permitted but unable to run, `ok` when a syscall answered.
 pub(crate) fn observer_fda_value(probe: ProbeLabel) -> &'static str {
     match probe {
         ProbeLabel::RefusedDisabled => "off",
@@ -334,18 +278,15 @@ fn responsible_token(responsible: Responsible) -> String {
 }
 
 /// `-` for unset, pct-encoded otherwise. Free text on this wire is always
-/// encoded, so a cwd with a space can never split a field.
 fn opt(value: Option<&str>) -> String {
     value.map_or_else(|| "-".to_string(), pct_encode)
 }
 
 /// The closing prose row: what a `folder` value of `unknown` means, which a
-/// reader otherwise takes for a denial.
 const NOTE: &str =
     "unknown means not observed, not denied: reading a folder is what raises the prompt";
 
 /// The closing `note` off macOS, in [`NOTE`]'s place: there is no consent layer to
-/// prompt, so an EPERM is the file's own permission.
 const NOTE_NO_OS_CONSENT: &str = "this platform has no OS consent layer: nothing prompts, and an \
      Operation not permitted is an ordinary file permission";
 
@@ -358,27 +299,16 @@ const REMEDIATE: [&str; 4] = [
 ];
 
 /// `pending=` on the `debugger` row and `taskport=` on the `observer` row: the
-/// authd lane that would fill them (design §3.7, P2) does not exist, so `off`
-/// (not watching), never `no`. The fields it would fill read unset.
 const TASKPORT_WATCH: &str = "off";
 
 /// `remediate debugger=`: a PLACE where a human acts, never a command (commit
-/// d034733c6 removed `reset=` for handing in-session agents a command). It is
-/// the place the design names (§4.1): aterm's own Settings ▸ Security, whose
-/// debugger row carries the owner's "Allow debugger access…" press — confirmed
-/// in aterm's alert, after which macOS asks for an administrator in its own
-/// dialog (spike D2, measured); an agent can answer neither. An enable token here would be the hazard `reset=` was.
 const DEBUGGER_REMEDIATE: &str = "aterm-settings:security";
 
 /// `remediate devtools=`: a PLACE, never a command. The Developer Tools list
-/// changes only in System Settings, by a human (`+`, then the switch); aterm
-/// adds nothing to it, and no command a program could run does either.
 const DEVTOOLS_REMEDIATE: &str = "settings:Privacy_DevTools";
 
 impl PrivacySnapshot {
     /// The census rows: a summary, then one line per conflicting copy (at most
-    /// `MAX_CLAIMANT_ROWS`; the summary keeps true totals). A copy sharing the
-    /// running requirement cannot reset a grant, so it is counted, not listed.
     fn claimant_lines(&self) -> Vec<String> {
         let Some((census, age)) = &self.claimants else {
             let state = if self.census_pending {
@@ -397,8 +327,6 @@ impl PrivacySnapshot {
             yes_no(census.sole_claimant()),
             age.as_millis(),
         )];
-        // Each row says whether the panel's button takes the copy, and if not
-        // why, by the rule the button reads (`TrashOffer`).
         let listed = census.listed(self.trash_tool);
         for (claimant, offer) in &listed {
             out.push(format!(
@@ -418,8 +346,6 @@ impl PrivacySnapshot {
             ));
         }
         if !conflicting.is_empty() {
-            // The note names the Trash only beside a row that reads offered, and
-            // points at those rows rather than restating the rule.
             let n = conflicting.len();
             let (copies, them, marked) = if n == 1 {
                 ("1 other copy of aterm is".to_string(), "it", "it")
@@ -453,16 +379,11 @@ impl PrivacySnapshot {
     }
 
     /// Whether the snapshot's platform has an OS consent layer (TCC): macOS
-    /// alone. Keyed on the snapshot's own `platform`, so a macOS fixture reads
-    /// the same on any host. Off it, the report keeps its schema and row order
-    /// and says what is true: no prompt is possible, no folder is protected by
-    /// the OS, there is no Settings pane to send anyone to.
     fn os_consent(&self) -> bool {
         self.platform == "macos"
     }
 
     /// The `remediate` places, `None` where the platform has no consent layer
-    /// ([`Self::os_consent`]): a System Settings pane on Linux is no remedy.
     fn remediate(&self) -> [Option<&'static str>; 4] {
         REMEDIATE.map(|place| self.os_consent().then_some(place))
     }
@@ -486,8 +407,6 @@ impl PrivacySnapshot {
     }
 
     /// `prompt_possible` — the module's own rule, not a second copy of it, and
-    /// never where no consent layer exists to prompt (Linux read `yes` because
-    /// its Full Disk Access is always `unknown`).
     fn prompt_possible(&self) -> bool {
         self.os_consent()
             && ConsentPosture::join(PostureInputs {
@@ -507,9 +426,7 @@ impl PrivacySnapshot {
             .count()
     }
 
-    /// The line body. `OK <n>` counts these rows; every live session adds
-    /// exactly one, with no truncation, so `sessions_total=` equals the number
-    /// of `session` rows.
+    /// The line body.
     pub(crate) fn lines(&self) -> Vec<String> {
         let mut out = Vec::with_capacity(self.sessions.len() + 14);
         out.push("schema=1".to_string());
@@ -526,8 +443,6 @@ impl PrivacySnapshot {
                 .dev_build
                 .map_or_else(|| "-".to_string(), |d| d.to_string()),
         ));
-        // Where this process runs from: a grant is keyed to the bundle at a
-        // path, so a translocated or mounted-image posture cannot use one.
         out.push(format!(
             "install={} running={} anchor={}",
             self.install,
@@ -644,9 +559,6 @@ impl PrivacySnapshot {
         out.push(format!(
             "remediate fda={fda} files={files} debugger={debugger} devtools={devtools}"
         ));
-        // A grant that cannot be validated: `full_disk_access=` gates on the
-        // exec-time path, which a swap leaves pointing at a healthy bundle, so
-        // say it on its own row.
         if self.anchor.grant_unverifiable() {
             let gone = if self.anchor == aterm_containment::ImageAnchor::Deleted {
                 "deleted"
@@ -668,9 +580,6 @@ impl PrivacySnapshot {
 }
 
 /// Every name on the `folder` row: the consent module's own roster (the three
-/// `$HOME` folders it resolves, then `app-data` — every other app's own data,
-/// promptable and resettable exactly as a folder is), then the two volume
-/// classes that have no path.
 fn folder_names() -> Vec<&'static str> {
     let mut names: Vec<&'static str> = Folder::ALL.iter().map(|f| f.as_str()).collect();
     names.extend_from_slice(VOLUME_ROWS);
@@ -678,20 +587,6 @@ fn folder_names() -> Vec<&'static str> {
 }
 
 /// The per-service folder state, and the provenance token that qualifies it.
-///
-/// Pure; the only place the join exists. Two sources, in strict precedence:
-///
-/// 1. **What aterm observed.** A warm-up row the owner asked for outranks
-///    everything, including a held grant: an `EPERM` on Documents reads
-///    `denied` whatever the coverage rule claims.
-/// 2. **Measured coverage.** A service §7 S4 proved a held grant suppresses
-///    reads `covered-by-fda`, only while it is in `covers` for the current
-///    posture.
-///
-/// Everything else is `unknown`: reading a folder to learn whether it is
-/// readable is what raises the prompt (§3.4). The volume classes have no path
-/// or warm-up row, so they are always `unknown`. Unmeasured folders
-/// (Documents, Desktop, Downloads) stay `unknown` under a held grant.
 fn folder_state(
     name: &str,
     warmup: &[(Folder, crate::consent_warmup::WarmupRow)],
@@ -711,7 +606,6 @@ fn folder_state(
 }
 
 /// Which sources contributed a non-`unknown` folder state, in a fixed order;
-/// `none` when nothing did.
 fn folder_source(states: &[(&'static str, &'static str)]) -> String {
     let mut sources: Vec<&'static str> = Vec::new();
     if states
@@ -742,8 +636,7 @@ fn list_or_dash(items: &[&str]) -> String {
     }
 }
 
-/// The `--json` body: the same facts as one object, with `folders`,
-/// `sessions`, `observers` and `remediate` as sub-objects.
+/// The `--json` body: the same facts as one object, with `folders`, `sessions`, `observers` and `remediate` as sub-objects.
 pub(crate) fn cmd_privacy_json(snapshot: &PrivacySnapshot) -> String {
     use std::fmt::Write as _;
 
@@ -803,8 +696,6 @@ pub(crate) fn cmd_privacy_json(snapshot: &PrivacySnapshot) -> String {
         let _ = write!(body, ",{}", json_str_field(name, state));
     }
     let _ = write!(body, "}},");
-    // THE CENSUS, with the same keys in every state: counts are null until it
-    // answers, as the text form prints `-`.
     let _ = match &snapshot.claimants {
         None => write!(
             body,
@@ -896,8 +787,6 @@ pub(crate) fn cmd_privacy_json(snapshot: &PrivacySnapshot) -> String {
             .warmup_last_ms
             .map_or_else(|| "null".to_string(), |ms| ms.to_string()),
     );
-    // The debugger rule, with the same keys in every state: what was not
-    // observed is null, as the text form prints `-`.
     let _ = write!(
         body,
         "\"debugger\":{{{},{},{},{},{},\"probe_age_ms\":{},{},\"pending_right\":null,\
@@ -913,7 +802,6 @@ pub(crate) fn cmd_privacy_json(snapshot: &PrivacySnapshot) -> String {
             .map_or_else(|| "null".to_string(), |ms| ms.to_string()),
         json_str_field("pending", TASKPORT_WATCH),
     );
-    // The Developer Tools list, with the same keys in every state.
     let num = |value: Option<u64>| value.map_or_else(|| "null".to_string(), |n| n.to_string());
     let devtools = snapshot.devtools.probe;
     let _ = write!(
@@ -975,8 +863,6 @@ fn json_str_array(items: &[&str]) -> String {
     out
 }
 
-// The report
-
 /// Which shape of the posture the verb renders.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PrivacyForm {
@@ -994,13 +880,10 @@ struct SessionFacts {
     /// aterm's adoption record, before the master switch.
     observed: Attribution,
     /// The shell-integration cwd, unencoded. `None` when unreported or when
-    /// the terminal was contended.
     cwd: Option<String>,
 }
 
 /// What `privacy`'s one main-thread hop brings back ([`App::privacy_facts`]):
-/// the facts only `App` holds. The probe slots, every OS call, the wait and
-/// the rendering run on the control worker from them.
 #[derive(Debug)]
 pub(crate) struct PrivacyAppFacts {
     /// The instance's consent state; a clone shares the slots.
@@ -1014,10 +897,8 @@ pub(crate) struct PrivacyAppFacts {
     /// The configured warm-up mode's token.
     warmup: &'static str,
     /// The warm-up's rows, read without draining: a pass the Security panel
-    /// has not folded yet must not be consumed.
     warmup_rows: Vec<(Folder, crate::consent_warmup::WarmupRow)>,
     /// The warm-up's completion stamp (design §3.5), read without draining:
-    /// an unfolded pass is reported on the next read.
     warmup_last_ms: Option<u128>,
     /// The `observer log=` token.
     observer_log: &'static str,
@@ -1026,9 +907,6 @@ pub(crate) struct PrivacyAppFacts {
 
 impl PrivacyAppFacts {
     /// The responsibility SPI's answer for each session, in order, from one
-    /// call that resolves the SPI once. With `[privacy] report_attribution =
-    /// false` the SPI is not consulted: that removes a COLUMN, not a verdict,
-    /// and the observer row says `off` rather than pretending it answered.
     fn responsible_answers(&self) -> Vec<Result<i32, ResponsibleError>> {
         if !self.policy.report_attribution {
             return vec![Err(ResponsibleError::Unsupported); self.sessions.len()];
@@ -1038,16 +916,9 @@ impl PrivacyAppFacts {
     }
 
     /// The report, off the event loop: the SPI asked; the slots read and,
-    /// while one is pending, waited on for up to [`PRIVACY_READ_WAIT`]; then
-    /// everything joined.
     pub(crate) fn report(self, identity: &'static SigningIdentity) -> PrivacySnapshot {
-        // Asked about the hop's pids before the wait, while each still names
-        // its session: one that exits during the wait would answer ESRCH, and
-        // a recycled pid would name another process's responsible pid.
         let answers = self.responsible_answers();
         let consent = &self.consent;
-        // Taken before each read: whatever publishes after the read wakes the
-        // wait at once.
         let seen = Cell::new(consent.publication());
         let first = consent.report_slots(&self.policy, identity);
         let slots = finish_privacy_read(
@@ -1067,12 +938,6 @@ impl PrivacyAppFacts {
 
 impl PrivacySnapshot {
     /// Join the hop's facts with the slots and the SPI's answers (one per
-    /// session, in order). Besides its arguments it reads only process-wide
-    /// facts: the OS version, the install posture, the image anchor, the
-    /// containment mode and whether `/usr/bin/trash` exists.
-    ///
-    /// Nothing here raises a dialog or is inferred from anything else: in
-    /// particular no folder's state is ever derived from the grant.
     fn assemble(
         facts: PrivacyAppFacts,
         slots: SlotFacts,
@@ -1114,8 +979,6 @@ impl PrivacySnapshot {
             identity,
             install,
             running,
-            // Read fresh on every report: it changes under a running process.
-            // One `proc_pidpath`; no dialog.
             anchor: aterm_containment::image_anchor(),
             fda: probe.state,
             probe: probe.label,
@@ -1158,18 +1021,6 @@ impl PrivacySnapshot {
 
 impl App {
     /// `privacy`'s one main-thread hop (`Wake::ReadPrivacy`): the facts only
-    /// `App` holds ([`PrivacyAppFacts`]). No OS call and no wait: a pool walk,
-    /// the edge table per session, and a `try_lock` of each terminal for its
-    /// cwd. The probe slots, the responsibility SPI and the process-wide facts
-    /// are read on the control worker.
-    ///
-    /// `scope` decides WHICH sessions it reports: those `scope` may read with
-    /// the verb's own op. Owner-class scopes see every session; an edge sees
-    /// only the sessions it holds a read edge into, because each row (sid,
-    /// cwd, responsible pid) is a fact `status` shows one session at a time to
-    /// whoever may read it — and the whole set is the roster `sessions`,
-    /// `flows` and `subscribe sessions` withhold from an edge. The
-    /// instance-wide posture is the same for every scope.
     pub(crate) fn privacy_facts(&self, scope: Scope) -> PrivacyAppFacts {
         let mut ids: Vec<u64> = self.pool.iter().map(|s| s.id).collect();
         ids.sort_unstable();
@@ -1199,8 +1050,6 @@ impl App {
     }
 
     /// The report as `privacy` renders it from this App's state, with no
-    /// wait: the hop's facts, the SPI's answers and one read of the slots,
-    /// joined. Its rows (the JSON form is one) and whether a slot was pending.
     #[cfg(test)]
     pub(crate) fn privacy_report_for_test(
         &self,
@@ -1221,8 +1070,6 @@ impl App {
     }
 
     /// This instance's adoption record: `adopted` when it took over its
-    /// predecessor's shells across an in-place apply (even when its session 0
-    /// is a fresh bootstrap), `live` otherwise.
     fn instance_attribution(&self) -> Attribution {
         if self.handoff_successor {
             Attribution::Adopted
@@ -1232,8 +1079,6 @@ impl App {
     }
 
     /// The shell-integration cwd for one session, without ever waiting on the
-    /// terminal lock: a contended terminal reports nothing rather than
-    /// blocking the event loop under a poll.
     pub(crate) fn session_reported_cwd(&self, session: u64) -> Option<String> {
         use crate::cwd_native::ReportedCwd as _;
         let pooled = self.pool.get(session)?;
@@ -1244,11 +1089,6 @@ impl App {
 }
 
 /// The slot reads, given until ONE deadline, [`PRIVACY_READ_WAIT`] after the
-/// start, while one is pending. `wait` parks on the pending kinds'
-/// publications for the remaining budget and says whether one published;
-/// `reread` runs once per wait that saw one, never per tick. A wait that saw
-/// none returns the latest read: a stuck slot costs no reread, and Pending
-/// never extends the deadline.
 fn finish_privacy_read(
     mut latest: SlotFacts,
     mut reread: impl FnMut() -> SlotFacts,
@@ -1277,7 +1117,6 @@ mod privacy_read_tests {
     use crate::consent_state::ChangeKind;
 
     /// A report's slot reads with `probe` as the Full Disk Access answer and
-    /// every other slot answered (refused), so only that one can be pending.
     fn slots(probe: FdaProbe) -> SlotFacts {
         SlotFacts {
             fda: (probe, Duration::ZERO),
@@ -1316,8 +1155,6 @@ mod privacy_read_tests {
                 assert_eq!(pending.pending_kinds(), [ChangeKind::Fda]);
                 assert_eq!(remaining, PRIVACY_READ_WAIT);
                 state.complete_fda_for_test(ticket, denied, start);
-                // The completion published, so the real wait returns at once;
-                // the minute is a hang detector.
                 state.wait_for_change(
                     seen.get(),
                     &pending.pending_kinds(),
@@ -1331,9 +1168,6 @@ mod privacy_read_tests {
     }
 
     /// A slot that never publishes costs no reread: the one wait is given the
-    /// whole budget and the pending read is the answer. Publications that
-    /// leave it pending (a stale completion) cost one reread each, under the
-    /// same deadline: Pending never extends it.
     #[test]
     fn privacy_read_has_one_deadline_and_keeps_stuck_work_pending() {
         let start = Instant::now();
@@ -1390,8 +1224,6 @@ mod privacy_read_tests {
     }
 
     /// The report waits on exactly the slots that hold no answer: each slot's
-    /// pending reading names its kind, and a report with every slot answered
-    /// (the negative control) waits on nothing.
     #[test]
     fn a_report_waits_on_exactly_its_pending_slots() {
         let answered = slots(consent::classify_probe(consent::ProbeOutcome::Ok));
@@ -1524,7 +1356,6 @@ mod tests {
     use super::*;
     use crate::consent_state::{ChangeKind, ConsentProbes};
     /// The debugger row the fixture carries: design §4.1's example, the
-    /// installed release build on a Mac with developer mode off.
     const FIXTURE_DEBUGGER: DebuggerRow = DebuggerRow {
         probe: DebuggerProbe {
             mode: DebuggerMode::Disabled,
@@ -1536,8 +1367,6 @@ mod tests {
     };
 
     /// The Developer Tools row the fixture carries: the design's example, the
-    /// installed release build, not on the list, during a build that started
-    /// 233 new programs in the window.
     const FIXTURE_DEVTOOLS: DevToolsRow = DevToolsRow {
         probe: DevToolProbe {
             state: aterm_containment::DevToolState::Unlisted,
@@ -1558,7 +1387,6 @@ mod tests {
     };
 
     /// A snapshot with no OS in it, so the wire format is a total function of
-    /// data a test can name.
     fn snapshot(sessions: usize, fda: FdaState, evidence: SpikeEvidence) -> PrivacySnapshot {
         snapshot_with_warmup(sessions, fda, evidence, &[])
     }
@@ -1578,7 +1406,6 @@ mod tests {
     }
 
     /// The same snapshot, with warm-up rows, so a test can drive the folder row
-    /// through the states production reaches instead of asserting a constant.
     fn snapshot_with_warmup(
         sessions: usize,
         fda: FdaState,
@@ -1594,7 +1421,6 @@ mod tests {
         PrivacySnapshot {
             folders,
             folder_source,
-            // No census answer unless a test sets `claimants` itself.
             claimants: None,
             census_pending: false,
             trash_tool: true,
@@ -1643,10 +1469,6 @@ mod tests {
     }
 
     /// A headless-constructed `App` reaches `tccd` through nothing (design
-    /// §3.3 guardrail 2): every probe row names the INERT arm's label. The
-    /// live FDA arm from a test binary would answer `refused_out_of_bundle`,
-    /// the inert one `refused_disabled`; the responsibility SPI is `off`; and
-    /// no debugger or Developer Tools worker is dispatched.
     #[test]
     fn a_headless_app_wires_the_inert_consent_probe_arm() {
         let app = crate::App::headless_for_test();
@@ -1672,10 +1494,6 @@ mod tests {
     }
 
     /// An edge is shown only the sessions it may read — never the roster
-    /// `sessions` withholds from it. Owner sees every session; an edge holding
-    /// a read edge into one sibling sees that row alone, in both forms; a
-    /// write-only edge, or a token no table knows, sees none. The
-    /// instance-wide posture is answered to all of them.
     #[test]
     fn an_edge_sees_only_the_sessions_it_may_read() {
         use aterm_session::{EdgeToken, Op, SessionId};
@@ -1725,15 +1543,6 @@ mod tests {
     }
 
     /// Every live session contributes exactly one `session` row, with no cap,
-    /// and `sessions_total=` counts them; its free-text `cwd` takes the wire's
-    /// own pct encoder, which escapes the space that would split the field.
-    /// Off macOS there is no consent layer: the report keeps its schema and row
-    /// order (agents read rows by position) but says no prompt is possible,
-    /// names no OS-protected folder and no Settings pane, and closes with the
-    /// note that an EPERM is an ordinary permission. On Linux it read
-    /// `prompt_possible=yes`, `protected=~/Documents,…,~/Library/Mail,…` and
-    /// `remediate fda=settings:Privacy_AllFiles`. Negative control: the same
-    /// snapshot on macOS keeps every one of those.
     #[test]
     fn off_macos_the_report_claims_no_consent_layer_and_keeps_its_shape() {
         let mac = snapshot(1, FdaState::Unknown, SpikeEvidence::UNMEASURED);
@@ -1797,10 +1606,6 @@ mod tests {
     }
 
     /// The text body is the documented `k=v` contract: each row's keys, each
-    /// row once (one `session` row per live session), in any order. The
-    /// census summary names its unanswered states — `pending` and `off` are
-    /// different answers and neither is a count — and a lone install is
-    /// `sole=yes` with no copy row and no census note.
     #[test]
     fn the_line_body_is_the_documented_shape() {
         let keys = |line: &String| -> String {
@@ -1912,11 +1717,6 @@ mod tests {
     }
 
     /// The census rows when a grant is at risk: a Developer-ID install with
-    /// three ad-hoc copies. Every row says whether Settings ▸ Security's *Move
-    /// to Trash* takes it, and in both forms of the verb only the copy the move
-    /// itself takes (`Claimants::retirable`, whose rule `aterm-containment`
-    /// tests) reads as offered — and none without the tool. The running copy
-    /// is the reference, never a row.
     #[test]
     fn the_census_rows_offer_the_trash_only_for_what_the_move_takes() {
         let mut snap = snapshot(1, FdaState::Granted, SpikeEvidence::UNMEASURED);
@@ -1946,8 +1746,6 @@ mod tests {
         let moved: Vec<PathBuf> = census.retirable().iter().map(|c| c.path.clone()).collect();
         assert_eq!(moved, [PathBuf::from("/Applications/aterm.app.rollback")]);
         snap.claimants = Some((census, Duration::from_millis(1200)));
-        // The copies the verb reads as offered, in the text rows and in the
-        // JSON's conflicts, each of which must say one way or the other.
         let offered = |snap: &PrivacySnapshot| -> Vec<PathBuf> {
             let lines = snap.lines();
             assert!(
@@ -1991,7 +1789,6 @@ mod tests {
     }
 
     /// The JSON census object has the same keys in every state, and caps its
-    /// list like the text form does.
     #[test]
     fn the_json_census_parses_in_both_states_and_is_capped() {
         let keys = [
@@ -2049,13 +1846,8 @@ mod tests {
     }
 
     /// An unmeasured folder's state is never inferred from the grant: before an
-    /// observed access the only answer is `unknown`. Under a held grant only
-    /// services S4 proved covered read `covered-by-fda`; the four unmeasured
-    /// rows stay `unknown`.
     #[test]
     fn no_unmeasured_folder_state_is_ever_inferred_from_the_grant() {
-        // S4 could not isolate Documents/Desktop/Downloads, and never exercised
-        // the two volume classes.
         const STILL_UNMEASURED: &[&str] = &[
             "documents",
             "desktop",
@@ -2075,7 +1867,6 @@ mod tests {
                     "{name} has no measurement of its own: {folder}"
                 );
             }
-            // The measured exception, and only under a held grant.
             let expected = if fda == FdaState::Granted {
                 "app-data=covered-by-fda"
             } else {
@@ -2092,15 +1883,12 @@ mod tests {
     }
 
     /// An observation aterm made outranks the coverage rule, and a warm-up row
-    /// reaches the wire.
     #[test]
     fn an_observed_warmup_row_outranks_the_coverage_rule_and_reaches_the_wire() {
         use crate::consent_warmup::WarmupRow;
         let warmed = [
             (Folder::Documents, WarmupRow::Denied),
             (Folder::Desktop, WarmupRow::Allowed),
-            // An observed denial for a class the grant is measured to cover
-            // wins: the grant is a rule, this is a measurement.
             (Folder::AppData, WarmupRow::Denied),
         ];
         let lines =
@@ -2113,11 +1901,8 @@ mod tests {
         assert!(folder.contains("desktop=allowed"), "{folder}");
         assert!(folder.contains("app-data=denied"), "{folder}");
         assert!(folder.contains("downloads=unknown"), "{folder}");
-        // Provenance names the warm-up; `fda` is absent because the one service
-        // the rule would have covered was overridden by an observation.
         assert!(folder.ends_with(" source=warmup"), "{folder}");
 
-        // A row the worker has not answered yet is NOT a verdict.
         let asking = [(Folder::Documents, WarmupRow::Asking)];
         let lines =
             snapshot_with_warmup(1, FdaState::Denied, SpikeEvidence::UNMEASURED, &asking).lines();
@@ -2130,7 +1915,6 @@ mod tests {
     }
 
     /// A counting debugger arm for the slot tests: it answers like a Mac with
-    /// developer mode off and spawns nothing. Each test owns its own counter.
     fn fake_debugger(runs: &std::sync::atomic::AtomicUsize) -> DebuggerProbe {
         runs.fetch_add(1, Ordering::AcqRel);
         DebuggerProbe {
@@ -2141,7 +1925,6 @@ mod tests {
     }
 
     /// What the fake Developer Tools arm reports: tccd's newest answer was
-    /// `unlisted`, three new programs in the window, the newest at `at_ms`.
     fn fake_devtools(runs: &std::sync::atomic::AtomicUsize, at_ms: i64) -> DevToolProbe {
         runs.fetch_add(1, Ordering::AcqRel);
         DevToolProbe {
@@ -2159,10 +1942,6 @@ mod tests {
     }
 
     /// `privacy`'s main-thread hop makes no OS call: with every arm a
-    /// live-flagged counter and the gate open, [`App::privacy_facts`] runs
-    /// none of them. The positive control is what the control worker does
-    /// next with the facts: one read of the slots and the SPI runs or
-    /// dispatches every arm, so the silence before it is the hop's.
     #[test]
     fn the_privacy_facts_hop_makes_no_os_call() {
         use std::sync::atomic::AtomicUsize;
@@ -2233,7 +2012,6 @@ mod tests {
         assert_eq!(facts.sessions.len(), 1, "the hop read the pool");
         assert_eq!(counts(), [0; 7], "the hop made an OS call");
 
-        // The census asks about a bundle id, which a test binary has none of.
         let identity = SigningIdentity {
             bundle_id: Some("com.example.subject".to_string()),
             ..SigningIdentity::unknown().clone()
@@ -2262,12 +2040,6 @@ mod tests {
     }
 
     /// The report asks the responsibility SPI about the hop's pids before it
-    /// reads a slot, and so before it waits on one: a session that exits
-    /// during the wait (ESRCH) or whose pid is recycled is asked about while
-    /// its pid still names it. The SPI arm records how many slot reads had
-    /// happened when it was asked; the Developer Tools read's `subject` arm
-    /// counts them on the reading thread. The control is that the report did
-    /// read the slots, and joined the SPI's answer.
     #[test]
     fn the_report_asks_the_spi_before_it_reads_a_slot() {
         use std::sync::atomic::AtomicUsize;
@@ -2304,9 +2076,6 @@ mod tests {
     }
 
     /// The report asks the responsibility SPI once for all its sessions, with
-    /// their pids in session order, and joins each answer to its own session.
-    /// The control is `report_attribution = false`: the SPI is not asked, and
-    /// the observer row says `off`.
     #[test]
     fn the_report_asks_the_spi_once_for_every_session() {
         static ASKED: Mutex<Vec<Vec<i32>>> = Mutex::new(Vec::new());
@@ -2360,10 +2129,6 @@ mod tests {
     }
 
     /// A grant that cannot be validated gets its own note, keyed on the
-    /// anchor: `running=` and `full_disk_access=granted` can both read healthy
-    /// after a swap, and the probe's `granted` must not stand alone. The two
-    /// non-faults — a dev run outside a bundle, a path that could not be
-    /// read — never raise it.
     #[test]
     fn an_unvalidatable_identity_is_reported_and_does_not_hide_behind_a_granted_probe() {
         use aterm_containment::ImageAnchor;
@@ -2392,10 +2157,6 @@ mod tests {
     }
 
     /// `remediate` names only PLACES — Settings panes and aterm's Security
-    /// page — never a command: an enable token would hand an in-session agent
-    /// the debugger switch (design §4.1), and no command a program could run
-    /// adds aterm to the Developer Tools list. Free text rides one
-    /// pct-encoded field.
     #[test]
     fn the_remediate_row_names_only_places() {
         let lines = snapshot(1, FdaState::Denied, SpikeEvidence::UNMEASURED).lines();
@@ -2418,8 +2179,6 @@ mod tests {
     }
 
     /// The observer row's three answers: `off` is a probe not consulted,
-    /// `unavailable` one that could not answer, and `ok` one that ran —
-    /// whatever it answered, a denial or the SPI's "not yours" included.
     #[test]
     fn unavailable_is_distinct_from_off_and_from_a_negative_answer() {
         for (label, want) in [
@@ -2447,9 +2206,6 @@ mod tests {
     }
 
     /// Where the Full Disk Access question stands: `renew_at` is a week after
-    /// the ask (`-` unset), and the state token ranks the owner's *Not now*
-    /// over a grant and a grant over an ask, and lapses an ask to `quiet`
-    /// once its week is spent.
     #[test]
     fn the_access_card_row_reports_where_the_question_stands() {
         use crate::consent_card::{AccessRecord, Marker, RENEW_AFTER, report_state};
@@ -2491,9 +2247,6 @@ mod tests {
     }
 
     /// The `--json` form is one framed body line that parses, carries the
-    /// sub-objects the contract names, escapes rather than pct-encodes, and
-    /// keeps every key in every state: a row with nothing observed carries
-    /// `null` where the text form prints `-`.
     #[test]
     fn the_json_form_carries_the_documented_sub_objects() {
         let parse = |snap: &PrivacySnapshot| -> aterm_json::Value {

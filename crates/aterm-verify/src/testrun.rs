@@ -2,51 +2,6 @@
 // Copyright 2026 Andrew Yates
 
 //! Running test binaries concurrently.
-//!
-//! Cargo runs test binaries one at a time, even under `--no-fail-fast`, so a
-//! workspace's test binaries would otherwise be a serial walk. This module runs
-//! `--test-jobs` binaries at a time ([`DEFAULT_JOBS`]), each with the pinned
-//! `RUST_TEST_THREADS`, in cargo's order.
-//!
-//! THE RUN IS CPU-BOUND. Eight binaries with the machine's thread count each
-//! keep every core busy until the last one ends, so the run lasts about as long
-//! as the binaries' CPU time over the cores, whatever order they start in.
-//! Measured on the whole workspace (18 cores): starting the longest binary
-//! first stayed within the run-to-run spread of cargo's order, and starting
-//! them all longest first was slower (the heaviest at once cost more system
-//! time); a thread count per binary scaled to its last run's time was slower
-//! (the small binaries, left a few threads, ended the run); and 4, 6, 10, 12
-//! or 16 at a time were slower than 8. What shortens the run is less CPU in
-//! the heaviest binaries.
-//!
-//! Cargo starts each test binary in its package's root with its environment
-//! (`CARGO`, `CARGO_MANIFEST_DIR`, `CARGO_PKG_*`, dynamic-library search path,
-//! `cargo:rustc-env` values, `TRUST_TARGO_FRONTEND`). Rather than reconstructing
-//! that environment from compiler JSON, the stage runs `targo test --tests` with
-//! `--config target.'cfg(all())'.runner=[<this binary>, --record-test-binary, <dir>]`
-//! ahead of the subcommand so it keeps the build cache ([`recording_cmd`]).
-//! Cargo invokes [`record_main`] with each test binary's argv, cwd, and
-//! environment; [`record_main`] records them and exits 0, and this runner then
-//! executes the recorded invocations in parallel.
-//!
-//! The compile child (`--no-run`) uses `--message-format=json-render-diagnostics`:
-//! each `compiler-artifact` line names a test executable and its target kind and
-//! name, which with the recorded `CARGO_PKG_NAME` forms cargo's re-run spec
-//! (`-p atpkg --test atpkg_suite`, `-p aterm-gui --lib`) used by
-//! [`crate::findings::test_findings`]. The JSON lines are stripped from the
-//! ladder output.
-//!
-//! Each binary's output is captured and printed in cargo's order — its
-//! `Running` header ([`exec::Cmd::preamble`]), its output, and on failure
-//! cargo's `error: test failed, to rerun pass` line — so
-//! [`crate::libtest::failed_tests`] and [`crate::libtest::environment_refusals`]
-//! read it unchanged.
-//!
-//! If the recording pass fails or its records disagree with cargo's headers or
-//! the compile's artifact list, the stage falls back to a serial `targo test
-//! --tests` run. If a caller-configured cargo runner outranks this one so the
-//! recorder never ran, the pass already executed the tests serially and is
-//! judged directly.
 
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
@@ -56,25 +11,18 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use crate::exec::{self, Cmd, Run};
 use crate::ladder::Report;
 
-/// The flag cargo's runner config hands this binary: `aterm-verify
-/// --record-test-binary <dir> <test binary> <its args…>` ([`record_main`]).
+/// The flag cargo's runner config hands this binary.
 pub const RECORD_FLAG: &str = "--record-test-binary";
 
-/// How many test binaries run at once unless `--test-jobs` says otherwise: the
-/// measured best (the module doc).
+/// How many test binaries run at once unless `--test-jobs` says otherwise.
 pub const DEFAULT_JOBS: u32 = 8;
-
-// Every live suite uses its own pid-keyed scratch directory (private sockets,
-// state, and HOME), so binaries booting headless instances do not collide.
-
-// The record: what cargo would have started.
 
 const RECORD_MAGIC: &[u8] = b"aterm-verify test record 1\0";
 
 /// One test binary as cargo would have started it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Record {
-    /// The directory cargo starts it in: its package's root.
+    /// The directory cargo starts it in.
     pub cwd: PathBuf,
     /// The test binary and the arguments cargo hands it (libtest's `--skip`s).
     pub argv: Vec<OsString>,
@@ -105,7 +53,7 @@ fn os_of(b: &[u8]) -> OsString {
 }
 
 impl Record {
-    /// This process, as cargo started it: `argv` is the test binary's.
+    /// This process, as cargo started it.
     ///
     /// # Errors
     /// When the working directory cannot be read.
@@ -133,9 +81,7 @@ impl Record {
         self.argv.first().map_or(Path::new(""), Path::new)
     }
 
-    /// NUL-separated tokens after a magic line: `cwd`, then `arg` per argument,
-    /// then `env <key> <value>` per variable. Unix strings hold no NUL, so no
-    /// value can forge a token.
+    /// NUL-separated tokens after a magic line.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
         let mut out = RECORD_MAGIC.to_vec();
@@ -157,8 +103,7 @@ impl Record {
         out
     }
 
-    /// [`Record::encode`] read back; `None` for anything else, including a
-    /// file cut short.
+    /// [`Record::encode`] read back.
     #[must_use]
     pub fn decode(bytes: &[u8]) -> Option<Self> {
         let body = bytes.strip_prefix(RECORD_MAGIC)?;
@@ -185,12 +130,7 @@ impl Record {
     }
 }
 
-/// `aterm-verify --record-test-binary <dir> <test binary> <args…>`: write this
-/// process's invocation to the next free `<dir>/NNNNNN.rec` and exit 0, so
-/// cargo goes on to the next binary having run nothing. The file is created
-/// owner-only (it holds the environment) and never overwritten; cargo runs one
-/// binary at a time, and a name taken by another writer is skipped all the
-/// same. Returns the exit code.
+/// `aterm-verify --record-test-binary <dir> <test binary> <args…>`.
 #[must_use]
 pub fn record_main(args: &[OsString]) -> i32 {
     let [dir, argv @ ..] = args else {
@@ -257,9 +197,7 @@ pub fn read_records(dir: &Path) -> Result<Vec<Record>, String> {
         .collect()
 }
 
-/// The `--config` value that makes cargo run `gate --record-test-binary dir`
-/// in place of every test binary: TOML, an array, so no path is split on a
-/// space. `None` when a path is not UTF-8 and cannot be written into it.
+/// The `--config` value that makes cargo run `gate --record-test-binary dir` in place of every test binary.
 #[must_use]
 pub fn runner_config(gate: &Path, dir: &Path) -> Option<String> {
     let q = |s: &str| {
@@ -283,10 +221,7 @@ pub fn runner_config(gate: &Path, dir: &Path) -> Option<String> {
     ))
 }
 
-/// The serial `--tests` child with the recording runner prepended before the
-/// subcommand, beside the build-cache `--config` from
-/// [`crate::stages::main_targo`] (a `--config` after the subcommand would
-/// replace `--config` flags before it and drop the build cache).
+/// Build the serial `--tests` command with the recording runner prepended before the subcommand alongside [`crate::stages::main_targo`].
 #[must_use]
 pub fn recording_cmd(serial: &Cmd, config: &str) -> Cmd {
     let mut c = serial.clone();
@@ -295,10 +230,7 @@ pub fn recording_cmd(serial: &Cmd, config: &str) -> Cmd {
     c
 }
 
-// What the compile reported.
-
-/// A test executable the compile built, with cargo's target flag for it
-/// (`--lib`, `--bin <name>`, `--test <name>`, …).
+/// A test executable the compile built, with cargo's target flag for it (`--lib`, `--bin <name>`, `--test <name>`, …).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TestExe {
     pub exe: PathBuf,
@@ -321,13 +253,10 @@ fn target_flag(kinds: &[&str], name: &str) -> Option<String> {
     Some(format!("--{which} {name}"))
 }
 
-/// Take cargo's JSON messages out of a `--message-format=json-render-diagnostics`
-/// log, in place — what is left is what the ladder shows, as it did before the
-/// JSON was asked for — and return every test executable they report
-/// (`compiler-artifact` with `profile.test` and an `executable`).
+/// Take cargo's JSON messages out of a `--message-format=json-render-diagnostics` log, in place.
 ///
 /// # Errors
-/// A message that does not parse: the list would be short, so it is no list.
+/// A message that does not parse.
 pub fn take_test_executables(log: &mut String) -> Result<Vec<TestExe>, String> {
     let mut exes = Vec::new();
     let mut bad = None;
@@ -383,14 +312,12 @@ pub fn take_test_executables(log: &mut String) -> Result<Vec<TestExe>, String> {
     }
 }
 
-// The plan: records, cargo's headers and the compile's list, in agreement.
-
 /// One test binary the run will run.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Binary {
-    /// cargo's `     Running <target> (<path>)` line for it, verbatim.
+    /// cargo's ` Running <target> (<path>)` line for it, verbatim.
     pub header: String,
-    /// cargo's re-run spec: `-p <package> <flag>`.
+    /// cargo's re-run spec.
     pub spec: String,
     pub record: Record,
 }
@@ -409,12 +336,10 @@ fn announced(log: &str) -> Vec<(String, String)> {
         .collect()
 }
 
-/// Pair each record with the header cargo printed for it and the compile's
-/// flag for its executable.
+/// Pair each record with the header cargo printed for it and the compile's flag for its executable.
 ///
 /// # Errors
-/// Whatever does not add up, in a few words — the caller then runs the serial
-/// child instead.
+/// Whatever does not add up, in a few words.
 pub fn plan(records: Vec<Record>, log: &str, exes: &[TestExe]) -> Result<Vec<Binary>, String> {
     let headers = announced(log);
     if headers.len() != records.len() {
@@ -435,10 +360,6 @@ pub fn plan(records: Vec<Record>, log: &str, exes: &[TestExe]) -> Result<Vec<Bin
                     exe.display()
                 ));
             }
-            // BY FILE NAME, the unit's hash in it: with a build directory (the
-            // build cache plain targo shares) the compile reports each test
-            // executable where it was built, under the build dir, and cargo runs
-            // the copy it puts under the target dir.
             let flag = exes
                 .iter()
                 .find(|e| e.exe.file_name().is_some() && e.exe.file_name() == exe.file_name())
@@ -460,12 +381,7 @@ pub fn plan(records: Vec<Record>, log: &str, exes: &[TestExe]) -> Result<Vec<Bin
         .collect()
 }
 
-// Running them.
-
-/// Run every binary through [`pool`], `jobs` at a time. EVERY binary runs with
-/// the whole `threads`, as cargo's own run hands each one. `run_one(binary, its
-/// threads)` runs one; the answers come back in declared order whatever order
-/// they ran in.
+/// Run every binary through [`pool`], `jobs` at a time.
 pub fn run_all<F>(bins: &[Binary], jobs: usize, threads: u32, run_one: F) -> Vec<Run>
 where
     F: Fn(&Binary, u32) -> Run + Sync,
@@ -484,12 +400,7 @@ where
         .collect()
 }
 
-/// Run `run(i)` for each distinct index below `n` in `order`, `jobs` at a time
-/// (at least one). Indices are reserved in `order` as a slot frees; callback
-/// starts may interleave. Answers come back by index, with `None` for an index
-/// `order` does not hold. Nothing is retried; a
-/// `run` that panics is this call's panic once the others are done, as a
-/// scoped thread's is.
+/// Run `run(i)` for each distinct index below `n` in `order`, `jobs` at a time (at least one).
 pub fn pool<T, F>(n: usize, order: &[usize], jobs: usize, run: F) -> Vec<Option<T>>
 where
     T: Send,
@@ -515,8 +426,7 @@ where
         .collect()
 }
 
-/// The command that runs `b` as cargo would have, with `threads` test threads
-/// and its `Running` header at the head of its log.
+/// The command that runs `b` as cargo would have, with `threads` test threads and its `Running` header at the head of its log.
 #[must_use]
 pub fn binary_cmd(b: &Binary, threads: u32) -> Cmd {
     let mut env: Vec<(OsString, OsString)> = b
@@ -530,11 +440,7 @@ pub fn binary_cmd(b: &Binary, threads: u32) -> Cmd {
     Cmd::replayed(&b.record.argv, &b.record.cwd, env).preamble(format!("{}\n", b.header))
 }
 
-/// The one log cargo would have written for these runs, in declared order —
-/// each binary's own log (header first), and after a failed one cargo's
-/// `error: test failed, to rerun pass` line (with its `Caused by` when the
-/// binary did not exit with libtest's 101) — then cargo's closing list of the
-/// targets that failed. `ok` only when every binary passed.
+/// The one log cargo would have written for these runs, in declared order.
 #[must_use]
 pub fn combined(bins: &[Binary], runs: &[Run]) -> Run {
     let mut output = String::new();
@@ -595,9 +501,7 @@ pub fn summary(bins: &[Binary], jobs: usize, threads: u32) -> String {
     )
 }
 
-/// A binary the test run's ceiling left no time to start: a FAIL in cargo's
-/// shape (its header, then why), never a pass and never a skip; it says
-/// [`crate::findings::CEILING_KILL`].
+/// A binary the test run's ceiling left no time to start.
 #[must_use]
 pub fn not_started(b: &Binary, limit: std::time::Duration) -> Run {
     Run {
@@ -618,7 +522,6 @@ pub fn not_started(b: &Binary, limit: std::time::Duration) -> Run {
 }
 
 /// A line of a failed recording pass worth quoting: its first diagnostic, or
-/// its last line.
 fn first_error(log: &str) -> String {
     let line = log
         .lines()
@@ -629,17 +532,11 @@ fn first_error(log: &str) -> String {
 }
 
 /// Decide the test run's row exactly as the serial child's was decided. A test
-/// whose macOS service (`trustd`, the disk-image service) did not answer ends
-/// COULD NOT RUN itself (`aterm_uds::deadline::require_trust_service`), so its
-/// row says so through [`crate::libtest::environment_refusals`].
 fn decide(r: &mut Report, run: &Run, label: &str, env: &[(OsString, OsString)]) {
     r.decide_test_child(run, label, env);
 }
 
-/// THE TEST RUN (the test stage's second half, after its compile): record,
-/// plan, run, and decide one row labeled `label`, exactly as the serial
-/// `serial` child's row was decided — see the module doc for every path.
-/// `exes` is what the compile reported ([`take_test_executables`]).
+/// THE TEST RUN (the test stage's second half, after its compile).
 pub fn run_tests(
     ctx: &crate::Ctx,
     r: &mut Report,
@@ -647,10 +544,6 @@ pub fn run_tests(
     serial: &Cmd,
     exes: Result<Vec<TestExe>, String>,
 ) {
-    // A launcher can hand verify a small descriptor table. Concurrent
-    // fixtures and process-lifetime custody leases need room even after an
-    // earlier fixture ends. Raise before the recorder or any test child,
-    // including the serial fallback; low-limit tests constrain their own child.
     #[cfg(unix)]
     match aterm_uds::host::open_file_room(4096) {
         Ok(room) => {
@@ -692,25 +585,15 @@ pub fn run_tests(
     let records = read_records(&dir);
     std::fs::remove_dir_all(&dir).ok();
 
-    // RECORDS THAT CANNOT BE READ ARE NEVER "NO RECORDS": the pass behind them
-    // may have executed nothing — every binary replaced by a recorder that
-    // exited 0 — and judged as the serial run it was not, it would be an `ok`
-    // row with no test run. The serial child decides instead.
     if let Err(why) = &records {
         serially(r, &format!("the recording could not be read: {why}"));
         return;
     }
-    // The recorder ran if it recorded something, or if cargo reports it
-    // failing (`process didn't exit successfully: \`<gate> --record-test-binary
-    // …\``): a recorder that could not write is the run's failure, never the
-    // tree's, and the serial child below decides instead.
     let recorded = records.as_ref().is_ok_and(|v| !v.is_empty());
     let recorder_failed = pass
         .output
         .lines()
         .any(|l| l.contains("didn't exit successfully") && l.contains(RECORD_FLAG));
-    // A pass that announced binaries and printed no `test result:` ran none
-    // of them: it is never judged as the serial run.
     let ran_nothing = !announced(&pass.output).is_empty()
         && !pass.output.lines().any(|l| l.starts_with("test result: "));
     if !recorded && !recorder_failed && ran_nothing {
@@ -721,8 +604,6 @@ pub fn run_tests(
         return;
     }
     if !recorded && !recorder_failed {
-        // The recorder never ran: no test binary at all, or a runner the
-        // caller's cargo config names outranked this one and cargo ran every
         // binary itself — this pass WAS the serial run.
         if !announced(&pass.output).is_empty() {
             r.raw(
@@ -753,10 +634,6 @@ pub fn run_tests(
     };
     let jobs = ctx.test_jobs();
     let threads = ctx.test_threads();
-    // ONE CEILING FOR THE WHOLE RUN, as the serial child had: a binary is
-    // started with what is left of it, and one whose turn comes after it is
-    // spent is not started. A full ceiling per binary would leave the stage no
-    // bound at all — two hangs, two ceilings.
     let ceiling = ctx.exec_env().child_ceiling;
     let started = std::time::Instant::now();
     let runs = run_all(&bins, jobs, threads, |b, t| {
@@ -770,8 +647,6 @@ pub fn run_tests(
         }
         exec::run(&binary_cmd(b, t), env)
     });
-    // cargo's own lines from the pass (its warnings, `Finished`), without the
-    // headers the binaries' logs carry.
     let preface: String = pass
         .output
         .lines()
@@ -814,8 +689,6 @@ mod tests {
     }
 
     /// A RECORD IS THE PROCESS, BYTE FOR BYTE: every argument and variable
-    /// survives, spaces, `=` and newlines included, and anything that is not a
-    /// whole record is refused rather than read short.
     #[test]
     fn a_record_round_trips_and_a_torn_one_is_refused() {
         let r = Record {
@@ -840,8 +713,6 @@ mod tests {
     }
 
     /// THE RECORDER, THROUGH ITS OWN ENTRY POINT: each call takes the next
-    /// number, the file is the owner's alone, and what comes back is this
-    /// process — its directory and its environment — with the argv it was given.
     #[test]
     fn the_recorder_writes_the_next_owner_only_record() {
         let dir = crate::mktemp_dir("atv-rec").expect("mktemp");
@@ -916,8 +787,6 @@ mod tests {
     }
 
     /// THE COMPILE'S LIST, AND THE LOG WITHOUT IT: only test-mode executables
-    /// count, each with cargo's own flag, and every JSON line leaves the text
-    /// the ladder shows — the diagnostics and progress lines stay, in order.
     #[test]
     fn the_compile_names_its_test_executables_and_keeps_its_diagnostics() {
         let mut log = format!(
@@ -953,8 +822,6 @@ mod tests {
     }
 
     /// THE PLAN ADDS UP OR IT IS NOT A PLAN: every record meets the header cargo
-    /// printed for it and the compile's flag for its executable, the re-run spec
-    /// is cargo's.
     #[test]
     fn records_headers_and_the_compile_agree_or_the_plan_is_refused() {
         let log = "    Finished `test` profile\n\
@@ -981,8 +848,6 @@ mod tests {
             bins.iter().map(|b| b.spec.as_str()).collect::<Vec<_>>(),
             ["-p aterm-link --lib", "-p aterm-link --test bridge_e2e"]
         );
-        // Under a build directory the compile reports where it built each
-        // executable and cargo runs the target dir's copy: the same file name.
         let in_build_dir: Vec<TestExe> = exes
             .iter()
             .map(|e| TestExe {
@@ -1026,8 +891,6 @@ mod tests {
     }
 
     /// THE POOL: never more than `jobs` at once, every binary once and with the
-    /// whole thread count, as cargo's own run gives it, and the answers in
-    /// declared order whatever order they finished in.
     #[test]
     fn binaries_share_the_pool_and_answer_in_declared_order() {
         let bins: Vec<Binary> = (0..9)
@@ -1043,7 +906,6 @@ mod tests {
             let now = running.fetch_add(1, Ordering::SeqCst) + 1;
             peak.fetch_max(now, Ordering::SeqCst);
             assert_eq!(threads, 12, "every binary gets the whole count");
-            // The first binary finishes last.
             std::thread::sleep(std::time::Duration::from_millis(if b.spec.ends_with('0') {
                 60
             } else {
@@ -1072,8 +934,6 @@ mod tests {
     }
 
     /// A BINARY THE RUN'S CEILING LEFT NO TIME TO START is a FAIL in cargo's
-    /// shape — its header, the run's TIMEOUT words, cargo's re-run
-    /// line — one finding for the row, which says so.
     #[test]
     fn a_binary_the_ceiling_left_no_time_for_is_a_fail() {
         let b = Binary {
@@ -1104,9 +964,6 @@ mod tests {
     }
 
     /// THE COMBINED LOG IS CARGO'S, so every reader of cargo's reads it: the
-    /// failed tests come back with the re-run spec cargo would have printed, a
-    /// crash (no libtest 101) says how the process ended, and a binary whose
-    /// every failure is the machine's still reads as the machine's.
     #[test]
     fn the_combined_log_reads_as_cargos_to_every_reader_of_cargos() {
         let bins: Vec<Binary> = ["a", "b", "c"]

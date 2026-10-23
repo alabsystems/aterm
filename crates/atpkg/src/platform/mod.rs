@@ -1,25 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! OS-primitive abstraction: atpkg's platform-specific filesystem, activation, disk-query
-//! and process-exec edges behind one API, with a per-OS backend ([`unix`]/[`windows`]).
-//! The Windows analogues:
-//!
-//! * **Activation**: `store/<program>/current` and the sysroot/toolchain dir links are
-//!   directory junctions (`mklink /J`, no admin needed), made by [`atomic_symlink`].
-//! * **Bin shims**: a `bin/<tool>.cmd` batch wrapper ([`CMD_FORWARD_TAIL`] behind the
-//!   resume-proof frame [`CMD_FRAME_HEAD`]) instead of a `sh` exec stub;
-//!   [`install_tombstone_shim`] writes the failing (`exit /b 70`) variant and
-//!   [`resolve_shim`] parses a shim's target back.
-//! * **Private state**: rests on the per-user `%LOCALAPPDATA%` profile ACL:
-//!   [`harden_file`]/[`set_mode`] are no-ops, [`dir_meta_is_private`] is a best-effort
-//!   `true`, [`permission_mode`]/[`our_uid`] report a not-applicable sentinel.
-//! * **Disk**: [`volume_free_bytes`] calls `GetDiskFreeSpaceExW` instead of `statvfs`;
-//!   both fail open (`None` on any error).
-//! * **Exec**: [`exec_or_run`] is `spawn().wait()` + `process::exit` (no `execve`).
-//!
-//! `ensure_private_dir` and [`FileLock`] come from `aterm_update_core` on both
-//! platforms, so atpkg and the updater cannot drift.
+//! OS-primitive abstraction.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -41,8 +23,7 @@ pub enum Birth {
     At(u64),
     /// Nothing lives under the pid: no such process, or a zombie.
     Gone,
-    /// The kernel would not say — a sandbox denying process-info, another account's process,
-    /// a platform with no reader — which says nothing about the process either way.
+    /// The kernel would not say.
     Unreadable,
 }
 
@@ -57,20 +38,13 @@ impl Birth {
     }
 }
 
-/// The private-directory creator, [`aterm_update_core::ensure_private_dir`] on both
-/// platforms (Unix: `0700`, owned by our uid; Windows: `create_dir_all` under the
-/// per-user profile ACL, final component a real directory).
+/// The private-directory creator, [`aterm_update_core::ensure_private_dir`] on both platforms (Unix: `0700`, owned by our uid; Windows: `create_dir_all` under the per-user profile ACL, final component a real directory).
 pub use aterm_update_core::ensure_private_dir;
 
-/// The advisory exclusive file lock: [`aterm_update_core::FileLock`] on both
-/// platforms (Unix `flock(LOCK_EX)`, Windows `share_mode(0)` with bounded retry).
+/// The advisory exclusive file lock.
 pub use aterm_update_core::FileLock;
 
-/// Create `path` exclusively (`create_new`: an existing file is never opened and
-/// truncated), born `0600` on Unix. It is the temp of every atomic rewrite of a private or
-/// user-owned file, which holds the whole content before the real mode is applied, so a
-/// umask-default temp would expose a `0600` file's contents until that chmod. Windows has
-/// no mode to ask for; the per-user profile ACL covers it.
+/// Create `path` exclusively (`create_new`: an existing file is never opened and truncated), born `0600` on Unix.
 pub(crate) fn create_private_new(path: &Path) -> io::Result<std::fs::File> {
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
@@ -79,15 +53,7 @@ pub(crate) fn create_private_new(path: &Path) -> io::Result<std::fs::File> {
     options.open(path)
 }
 
-/// Create the one directory `dir` exclusively (an existing entry fails
-/// [`io::ErrorKind::AlreadyExists`], so the directory is provably this call's), born no
-/// wider than `mode` and then given exactly `mode`, whatever the umask.
-///
-/// The umask can only narrow `mkdir(2)`'s mode, so nobody else can reach into the
-/// directory before the `chmod`; the `chmod` then restores what a strict umask took (under
-/// `077` a store directory would be `0700`, which every other user of a system prefix must
-/// traverse). A plain `create_dir_all` is born `0777 & ~umask`, world-writable under umask
-/// `000`. Windows has no mode to ask for; the per-user profile ACL covers it.
+/// Create `dir` exclusively ([`io::ErrorKind::AlreadyExists`] if present), born no wider than `mode` and set to `mode` regardless of umask.
 pub(crate) fn make_dir_born(dir: &Path, mode: u32) -> io::Result<()> {
     #[cfg(unix)]
     {
@@ -102,11 +68,7 @@ pub(crate) fn make_dir_born(dir: &Path, mode: u32) -> io::Result<()> {
     }
 }
 
-/// [`make_dir_born`] for `dir` and every missing ancestor, top down: a component that is
-/// already a directory (followed through a link, as `create_dir_all` follows it) is left
-/// exactly as it is, and every component this call makes ends at exactly `mode`. The
-/// store's own directories on the way to a build or a download are made by this, never by
-/// the umask.
+/// [`make_dir_born`] for `dir` and every missing ancestor, top down.
 pub(crate) fn make_dirs_born(dir: &Path, mode: u32) -> io::Result<()> {
     if dir.is_dir() {
         return Ok(());
@@ -122,42 +84,22 @@ pub(crate) fn make_dirs_born(dir: &Path, mode: u32) -> io::Result<()> {
     }
 }
 
-/// Make one open file or directory durable: the barrier an atomic publish takes on its
-/// temp before the rename, and [`crate::store::sync_dir`] on the directory after it:
-/// [`aterm_durable::durable`], which on Apple targets is `fcntl(F_FULLFSYNC)`, a
-/// drive-cache flush. A write that needs only its order kept takes
-/// [`aterm_durable::ordered`] ([`crate::store::sync_dir_ordered`]); a staged TREE takes
-/// the lighter [`sync_file_contents`], for the reasons given there. In a test or debug
-/// build on Apple targets it is a plain `fsync(2)`, as every durable flush there.
+/// Make one open file or directory durable.
 pub(crate) fn sync_durable(f: &std::fs::File) -> io::Result<()> {
     aterm_durable::durable(f)
 }
 
 /// macOS's QoS launcher, the one the window wraps its package passes in. Absent
-/// elsewhere, where [`utility_clamped`] leaves a program bare.
 #[cfg(unix)]
 const TASKPOLICY: &str = "/usr/sbin/taskpolicy";
 
-/// The argv head that starts `program` at UTILITY QoS for a detached background pass:
-/// `taskpolicy -c utility <program>`, the clamp the window's lane gives the same passes
-/// (aterm-gui `qos::command(Role::Background, …)`). Bare, a session's pass — the
-/// six-hourly `aterm pkg update`, the daily `machine apply`, a head-watch pass, a warm —
-/// and everything it starts ran at the default band (`ps` pri 31), an equal of the
-/// program being typed into; behind the clamp it reads pri 20.
-///
-/// `taskpolicy` execs the program in place (`POSIX_SPAWN_SETEXEC`), so the pid a
-/// detaching shell reports and the process group it made stay the program's own.
-/// Wrapped only when both ends are real: `taskpolicy` exists and `program` is an absolute
-/// path to an executable file, so a missing program still fails as itself, not as
-/// `taskpolicy`'s exit 66. Never for a child that launches an aterm window: the clamp is
-/// inherited, and an aterm under UTILITY starves its own paint.
+/// The argv head that starts `program` at UTILITY QoS for a detached background pass.
 #[cfg(unix)]
 pub(crate) fn utility_clamped(program: &std::ffi::OsStr) -> Vec<std::ffi::OsString> {
     utility_clamped_with(program, Path::new(TASKPOLICY))
 }
 
 /// [`utility_clamped`] over an explicit launcher, so the decision is testable on every
-/// Unix against a stand-in.
 #[cfg(unix)]
 fn utility_clamped_with(program: &std::ffi::OsStr, taskpolicy: &Path) -> Vec<std::ffi::OsString> {
     let path = Path::new(program);
@@ -176,16 +118,7 @@ fn utility_clamped_with(program: &std::ffi::OsStr, taskpolicy: &Path) -> Vec<std
     }
 }
 
-/// Start `program args` DETACHED: stdio on `/dev/null`, its own process group, and NOT
-/// the caller's child. Used by `crates/aterm/src/main.rs` for the session's pass and by
-/// [`crate::warm`]. The session lane then runs `aterm_cli::session_main` in the same
-/// process, whose unix driver reaps the shell with `waitpid(-1)`: a finished pass left
-/// as ITS zombie could be reaped in the shell's place, and `aterm` would exit with the
-/// pass's status instead of the shell's (reliably on Linux, ~6% of exits on macOS). So
-/// on unix a `/bin/sh` middle process — the group leader — backgrounds the program and
-/// exits at once, and reaping it here re-parents the program to launchd/init. The
-/// program runs at utility QoS ([`utility_clamped`]), as the window's passes do. `env`
-/// is one variable set on it.
+/// Start `program args` DETACHED: stdio on `/dev/null`, its own process group, and NOT the caller's child.
 ///
 /// # Errors
 /// The middle shell could not be started, or did not exit 0.
@@ -197,11 +130,7 @@ pub fn spawn_detached(
     spawn_detached_at(program, args, env, true)
 }
 
-/// [`spawn_detached`] for the one pass a person waits on: a first run's (the store's first
-/// install of the ALab toolset still ahead, [`crate::adoption::first_install_ahead`]), whose
-/// stubs block until it lands. Started the same way, at the default band rather than behind
-/// [`utility_clamped`], as the window starts its own first run (aterm-gui
-/// `qos::atpkg_pass_command`): on a busy fresh Mac the clamp held it far behind.
+/// [`spawn_detached`] for the one pass a person waits on.
 ///
 /// # Errors
 /// As [`spawn_detached`].
@@ -248,10 +177,6 @@ fn spawn_detached_at(
     }
     #[cfg(not(unix))]
     {
-        // `spawnfd::command` decides its Windows console (`Console::Quiet`): from a
-        // console (the terminal session) the pass shares it, as a bare child did;
-        // from a process with none it gets a windowless console, where a bare child
-        // would open a visible one for its whole run. No QoS clamp exists here.
         let _ = clamped;
         let mut command = aterm_uds::spawnfd::command(program);
         if let Some((name, value)) = env {
@@ -267,11 +192,7 @@ fn spawn_detached_at(
     }
 }
 
-/// Install a `bin/` shim at `shim` (from [`crate::store::Layout::shim`], never a hand
-/// join) pointing at `tool`'s executable in a build's `bin/` directory. On Windows the
-/// shim `bin/<tool>.cmd` ([`crate::store::ToolName::shim_file`]) and its target
-/// `<build>/bin/<tool>.exe` ([`crate::store::ToolName::exe_file`]) are different names;
-/// taking a `ToolName` keeps them apart.
+/// Install a `bin/` shim at `shim` (from [`crate::store::Layout::shim`], never a hand join) pointing at `tool`'s executable in a build's `bin/` directory.
 #[cfg(test)]
 pub(crate) fn install_shim(
     build_bin_dir: &Path,
@@ -281,9 +202,7 @@ pub(crate) fn install_shim(
     install_shim_to(shim, &build_bin_dir.join(tool.exe_file()))
 }
 
-/// `install_shim` whose wrapper also exports `env` ([`crate::shim_env`]) before it execs
-/// the target: `export NAME='VALUE'` lines on Unix, `@set "NAME=VALUE"` lines on Windows.
-/// With an empty `env` the shim is byte-identical to `install_shim`'s.
+/// `install_shim` whose wrapper also exports `env` ([`crate::shim_env`]) before it execs the target.
 pub fn install_shim_env(
     build_bin_dir: &Path,
     tool: &crate::store::ToolName,
@@ -293,15 +212,12 @@ pub fn install_shim_env(
     install_shim_to_env(shim, &build_bin_dir.join(tool.exe_file()), env)
 }
 
-/// The `(shim path, target)` form of `install_shim`, for callers that already hold the
-/// target path: a shim with no exported environment.
+/// The `(shim path, target)` form of `install_shim`, for callers that already hold the target path.
 pub fn install_shim_to(shim: &Path, target: &Path) -> io::Result<()> {
     install_shim_to_env(shim, target, &crate::shim_env::ShimEnv::NONE)
 }
 
-/// The shim [`install_shim_env`] would lay, rendered but not written, for callers that
-/// render a whole pass before laying it ([`crate::lay::write_in_process`]) or compare it
-/// with what is on disk.
+/// The shim [`install_shim_env`] would lay, rendered but not written, for callers that render a whole pass before laying it ([`crate::lay::write_in_process`]) or compare it with what is on disk.
 pub fn shim_executable_env(
     build_bin_dir: &Path,
     tool: &crate::store::ToolName,
@@ -311,63 +227,20 @@ pub fn shim_executable_env(
     shim_executable_to_env(shim, &build_bin_dir.join(tool.exe_file()), env)
 }
 
-// Pure `.cmd` shim formatting/parsing, compiled under `cfg(any(windows, test))` so the
-// Unix tests cover the Windows format. The frame ([`CMD_FRAME_HEAD`], [`cmd_framed`])
-// compiles everywhere: `crate::stub` picks its `.cmd` renderer at runtime (`cfg!(windows)`).
-
-/// The tail of every `.cmd` forward line after the target's closing quote:
-/// `@"<target>" %* & @exit /b`. `cmd.exe` parses a line whole before running any of it, so
-/// the line that runs the program also ends the batch, and a shim re-laid while its
-/// program runs is never read again. A bare `exit /b` returns the program's ERRORLEVEL
-/// (what `cmd /c` exits with); `exit /b %errorlevel%` would expand at parse time, before
-/// the program ran. The renderer ([`cmd_shim_content_env`]) writes it and the reader
-/// ([`parse_cmd_shim_target`]) keys on it. Written to the documented `cmd` rules; no
-/// Windows host has run it.
+/// The tail of every `.cmd` forward line after the target's closing quote: `@"<target>" %* & @exit /b`.
 #[cfg(any(windows, test))]
 pub(crate) const CMD_FORWARD_TAIL: &str = " %* & @exit /b";
 
-/// The tail of a legacy `.cmd` shim's last line: `@"<target>" %*` alone. Never written;
-/// still read ([`parse_cmd_shim_target`]) so `which`, `doctor`, the sweeps and gc resolve
-/// such a shim until its next install, update, `repair` or `reconcile_agents` re-lays it in
-/// the framed shape, the one re-lay the frame's padding is sized for.
+/// The tail of a legacy `.cmd` shim's last line: `@"<target>" %*` alone.
 pub(crate) const CMD_LEGACY_FORWARD_TAIL: &str = " %*";
 
-/// The first line of every `.cmd` this crate writes (bin shim, alias, tombstone, `agents/`
-/// twin, and the pending stub `crate::stub` lays in the same slots ahead of an install):
-/// `@goto :main`, jumping over the padding ([`CMD_PADDING_LINE`] × [`CMD_PADDING_LINES`])
-/// and [`CMD_PADDING_EXIT`] to the [`CMD_MAIN_LABEL`] the body starts at.
-///
-/// `cmd.exe` runs a batch file by re-opening it and seeking to a remembered byte offset
-/// after every line. A legacy `.cmd` ends on `@"<target>" %*` with no exit on that line
-/// ([`CMD_LEGACY_FORWARD_TAIL`]); re-laid (temp + remove + rename, `windows.rs`'s
-/// `atomic_write`) while its program runs, it is resumed in the new file at the old file's
-/// end offset, mid-line: a fragment (`'xxx' is not recognized`, ERRORLEVEL 9009) or a
-/// second run of the program. The frame makes that offset harmless by construction: from
-/// the head's CRLF through the padding exit, every byte starts a line that is a label (all
-/// colons, which `cmd` skips), empty (a CRLF suffix), or exactly `@exit /b`, which returns
-/// the program's ERRORLEVEL. The padding is sized so the longest legacy file
-/// ([`CMD_LEGACY_FILE_BOUND_BYTES`]) ends inside it (asserted below and by the resume
-/// simulation in the tests). A framed file re-laid while it runs is never read again:
-/// every line that runs a program ends the batch on that line ([`CMD_FORWARD_TAIL`]).
-///
-/// The head's own bytes 1..10 are not inert (`goto :main` would run the body, `oto :main`
-/// is a 9009), but no resume lands there: `cmd` resumes only after a line end of the old
-/// file, only its first line end can fall inside the head, and the shortest first line
-/// any writer lays, the pending stub's `@echo off` + CRLF (11 bytes,
-/// `crate::stub::CMD_STUB_FIRST_LINE`), ends on the head's CRLF, which reads empty. No
-/// command line has only inert suffixes, so the head must sit where no old line can end.
-///
-/// The frame costs [`CMD_FRAME_BYTES`] (4110 bytes: 13 + 51 × 80 + 10 + 7) per `.cmd`, an
-/// order of magnitude under [`MAX_SHIM_BYTES`]. `cmd.exe`'s reading of it (the `goto`,
-/// label skipping, the offset resume) follows the documented `cmd` rules and is
-/// unverified on a Windows host.
+/// The first line of every `.cmd` this crate writes (bin shim, alias, tombstone, `agents/` twin, and the pending stub `crate::stub` lays in the same slots ahead of an install).
 pub(crate) const CMD_FRAME_HEAD: &str = "@goto :main\r\n";
 
 /// The label [`CMD_FRAME_HEAD`] jumps to: the line right ahead of the real body.
 const CMD_MAIN_LABEL: &str = "main";
 
 /// One line of the frame's padding: 78 colons and a CRLF, 80 bytes. A label to `cmd`
-/// from any byte of it (every suffix starts with `:` or is a CRLF suffix).
 const CMD_PADDING_LINE: &str =
     "::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::\r\n";
 
@@ -375,13 +248,9 @@ const CMD_PADDING_LINE: &str =
 const CMD_PADDING_LINES: usize = 51;
 
 /// The line that closes the padding: a resume landing exactly on it returns at once
-/// with the program's ERRORLEVEL; a fresh run never reaches it (the head jumped past).
 const CMD_PADDING_EXIT: &str = "@exit /b\r\n";
 
-/// The byte offset at which [`CMD_PADDING_EXIT`] starts: head + padding = 13 + 4080 =
-/// 4093. Every offset in `CMD_FRAME_HEAD.len() - 2 ..= CMD_PADDING_END_BYTES` of a
-/// framed file reads as an inert line, so a legacy file no longer than this is safe to
-/// re-lay over while it runs.
+/// The byte offset at which [`CMD_PADDING_EXIT`] starts: head + padding = 13 + 4080 = 4093.
 pub(crate) const CMD_PADDING_END_BYTES: usize =
     CMD_FRAME_HEAD.len() + CMD_PADDING_LINES * CMD_PADDING_LINE.len();
 
@@ -389,11 +258,7 @@ pub(crate) const CMD_PADDING_END_BYTES: usize =
 pub(crate) const CMD_FRAME_BYTES: usize =
     CMD_PADDING_END_BYTES + CMD_PADDING_EXIT.len() + 1 + CMD_MAIN_LABEL.len() + 2;
 
-/// The longest `.cmd` the legacy writer could have laid, from its own caps:
-/// [`crate::shim_env::MAX_SHIM_ENV`] `@set` lines of at most
-/// [`crate::shim_env::MAX_ENTRY_BYTES`] each, then the forward with a target of at most
-/// [`CMD_LEGACY_TARGET_BOUND_BYTES`]: 8 × 265 + 788 = 2908 bytes. A legacy twin was the
-/// plain shim under the twin's name, so the bound covers it too.
+/// The longest `.cmd` the legacy writer could have laid, from its own caps.
 pub(crate) const CMD_LEGACY_FILE_BOUND_BYTES: usize = crate::shim_env::MAX_SHIM_ENV
     * ("@set \"".len() + crate::shim_env::MAX_ENTRY_BYTES + "\"\r\n".len())
     + "@\"".len()
@@ -402,24 +267,16 @@ pub(crate) const CMD_LEGACY_FILE_BOUND_BYTES: usize = crate::shim_env::MAX_SHIM_
     + CMD_LEGACY_FORWARD_TAIL.len()
     + "\r\n".len();
 
-/// The longest target a legacy shim's forward could carry, in bytes: `MAX_PATH` (260
-/// UTF-16 units) at three UTF-8 bytes each. The old writer capped nothing, but `cmd.exe`'s
-/// command launch is not long-path aware (unverified), so a longer target never ran.
+/// The longest target a legacy shim's forward could carry, in bytes: `MAX_PATH` (260 UTF-16 units) at three UTF-8 bytes each.
 pub(crate) const CMD_LEGACY_TARGET_BOUND_BYTES: usize = 3 * 260;
 
-/// The shortest line the legacy writer could lay: `@set "A=b"` and its CRLF, 12 bytes
-/// (`shim_env::split_entry` wants a non-digit-led `[A-Z0-9_]+` name and `shim_env::admit`
-/// refuses an empty value; a forward line is at least 16). So an old file's line ends,
-/// the only offsets `cmd` resumes at, lie past every non-inert byte of [`CMD_FRAME_HEAD`].
+/// The shortest line the legacy writer could lay.
 pub(crate) const CMD_LEGACY_MIN_LINE_BYTES: usize = "@set \"A=b\"\r\n".len();
 
-// The frame is sized by construction, not by a test alone.
 const _: () = assert!(CMD_PADDING_END_BYTES >= CMD_LEGACY_FILE_BOUND_BYTES);
 const _: () = assert!(CMD_FRAME_HEAD.len() - 2 <= CMD_LEGACY_MIN_LINE_BYTES);
 
-/// `body` behind the resume-proof frame ([`CMD_FRAME_HEAD`]): `@goto :main`, the padding,
-/// `@exit /b`, `:main`, then `body` verbatim. The one place the frame is rendered; every
-/// `.cmd` renderer goes through it, the pending stub's (`crate::stub`) included.
+/// `body` behind the resume-proof frame ([`CMD_FRAME_HEAD`]): `@goto :main`, the padding, `@exit /b`, `:main`, then `body` verbatim.
 pub(crate) fn cmd_framed(body: &str) -> String {
     let mut s = String::with_capacity(CMD_FRAME_BYTES + body.len());
     s.push_str(CMD_FRAME_HEAD);
@@ -434,9 +291,7 @@ pub(crate) fn cmd_framed(body: &str) -> String {
     s
 }
 
-/// What `cmd.exe` reads when it resumes a batch file at byte `offset`: the bytes up to the
-/// next line feed (a CR before it dropped), or `None` at or past the end. A model of the
-/// documented `cmd` rules for the resume simulations here and in `crate::stub`'s tests.
+/// What `cmd.exe` reads when it resumes a batch file at byte `offset`.
 #[cfg(test)]
 pub(crate) fn cmd_resumed_line(file: &[u8], offset: usize) -> Option<String> {
     if offset >= file.len() {
@@ -448,9 +303,7 @@ pub(crate) fn cmd_resumed_line(file: &[u8], offset: usize) -> Option<String> {
     Some(String::from_utf8_lossy(line).into_owned())
 }
 
-/// Whether a resumed line does nothing and leaves the program's ERRORLEVEL alone: a
-/// label of nothing but colons (a suffix of a padding line), an empty line (a suffix of
-/// a CRLF), exactly `@exit /b`, or end-of-file.
+/// Whether a resumed line does nothing and leaves the program's ERRORLEVEL alone.
 #[cfg(test)]
 pub(crate) fn cmd_resumed_line_is_inert(line: Option<&str>) -> bool {
     match line {
@@ -459,32 +312,25 @@ pub(crate) fn cmd_resumed_line_is_inert(line: Option<&str>) -> bool {
     }
 }
 
-/// The frame alone ([`cmd_framed`] of nothing): what every `.cmd` this crate writes
-/// starts with, byte for byte, for the tests that pin a whole file.
+/// The frame alone ([`cmd_framed`] of nothing).
 #[cfg(test)]
 pub(crate) fn cmd_frame() -> String {
     cmd_framed("")
 }
 
-/// The body of a Windows bin shim: the frame, then `@"<target>" %* & @exit /b`
-/// ([`CMD_FORWARD_TAIL`]), CRLF-terminated. The no-environment form of
-/// [`cmd_shim_content_env`], for the tests.
+/// The body of a Windows bin shim: the frame, then `@"<target>" %* & @exit /b` ([`CMD_FORWARD_TAIL`]), CRLF-terminated.
 #[cfg(test)]
 pub(crate) fn cmd_shim_content(target: &Path) -> String {
     cmd_shim_content_env(target, &crate::shim_env::ShimEnv::NONE)
 }
 
-/// [`cmd_shim_content`] with the shim's exported environment ahead of the forward
-/// line: the frame, then one `@set "NAME=VALUE"` per entry (the quoted `set` form, so a
-/// value's trailing space or `&` is literal), then `@"<target>" %* & @exit /b`. The `@`
-/// keeps every line silent. An empty `env` is byte-identical to [`cmd_shim_content`].
+/// [`cmd_shim_content`] with the shim's exported environment ahead of the forward line.
 #[cfg(any(windows, test))]
 pub(crate) fn cmd_shim_content_env(target: &Path, env: &crate::shim_env::ShimEnv) -> String {
     cmd_framed(&cmd_shim_body_env(target, env))
 }
 
 /// The unframed shim body (the `@set` lines and the forward line) that
-/// [`cmd_shim_content_env`] frames and [`cmd_shim_content_twin`] lays behind a prelude.
 #[cfg(any(windows, test))]
 fn cmd_shim_body_env(target: &Path, env: &crate::shim_env::ShimEnv) -> String {
     let mut s = String::new();
@@ -503,9 +349,7 @@ fn cmd_shim_body_env(target: &Path, env: &crate::shim_env::ShimEnv) -> String {
     s
 }
 
-/// Whether every entry of `env` can sit inside `@set "NAME=VALUE"` without breaking out:
-/// no `"`, `%` or CR/LF/NUL. [`crate::shim_env::ShimEnv::admit`] already refuses these;
-/// like [`cmd_target_is_injection_safe`], this is defence in depth at the I/O site.
+/// Whether every entry of `env` can sit inside `@set "NAME=VALUE"` without breaking out: no `"`, `%` or CR/LF/NUL.
 #[cfg(any(windows, test))]
 pub(crate) fn cmd_env_is_injection_safe(env: &crate::shim_env::ShimEnv) -> bool {
     env.entries().iter().all(|(n, v)| {
@@ -515,9 +359,7 @@ pub(crate) fn cmd_env_is_injection_safe(env: &crate::shim_env::ShimEnv) -> bool 
     })
 }
 
-/// The environment a Windows shim written by [`cmd_shim_content_env`] exports: its
-/// `@set "NAME=VALUE"` lines, re-admitted through the rule (fail-closed: a hand-edited
-/// line that breaks it reads as NONE). A tombstone or a plain shim reads as NONE.
+/// The environment a Windows shim written by [`cmd_shim_content_env`] exports.
 #[cfg(any(windows, test))]
 pub(crate) fn parse_cmd_shim_env(content: &str) -> crate::shim_env::ShimEnv {
     let mut raw: Vec<String> = Vec::new();
@@ -532,11 +374,7 @@ pub(crate) fn parse_cmd_shim_env(content: &str) -> crate::shim_env::ShimEnv {
     crate::shim_env::ShimEnv::admit(&raw).unwrap_or_default()
 }
 
-/// Whether `target` can sit inside `@"<target>" %* & @exit /b` without breaking out: no
-/// `"` (closes the quote, and cannot be escaped there), no `%` (`%VAR%` expansion), no
-/// CR/LF/NUL (extra batch lines). A managed-store path never contains any; this is
-/// fail-closed defence in depth, so the I/O site refuses rather than emit an injectable
-/// `.cmd`.
+/// Whether `target` can sit inside `@"<target>" %* & @exit /b` without breaking out.
 #[cfg(any(windows, test))]
 pub(crate) fn cmd_target_is_injection_safe(target: &Path) -> bool {
     !target
@@ -545,10 +383,7 @@ pub(crate) fn cmd_target_is_injection_safe(target: &Path) -> bool {
         .any(|c| matches!(c, '"' | '%' | '\r' | '\n' | '\0'))
 }
 
-/// The body of a Windows **tombstone** shim: the frame ([`CMD_FRAME_HEAD`] — a tombstone
-/// replaces a shim that may be executing, like any re-lay), then `message` printed to
-/// stderr and exit 70 (`EX_SOFTWARE`), matching the Unix `sh` tombstone's contract.
-/// `message` is `cmd`-escaped so a crafted tool name cannot break out of the `echo`.
+/// The body of a Windows **tombstone** shim.
 #[cfg(any(windows, test))]
 pub(crate) fn cmd_tombstone_content(message: &str) -> String {
     let mut s = String::from("@echo ");
@@ -558,10 +393,6 @@ pub(crate) fn cmd_tombstone_content(message: &str) -> String {
 }
 
 /// Escape a string for safe embedding in a `cmd.exe` `echo` argument: the shell
-/// metacharacters `^ & < > | ( ) "` are `^`-escaped and `%` is doubled (batch
-/// variable-expansion). `^` is handled first so its own escape is not re-escaped.
-/// An em dash becomes `-`: cmd.exe reads the batch file in the console's OEM code
-/// page, where the UTF-8 em dash prints as mojibake.
 #[cfg(any(windows, test))]
 fn cmd_echo_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -579,14 +410,7 @@ fn cmd_echo_escape(s: &str) -> String {
     out
 }
 
-/// The forward target of a Windows bin shim (`@"<target>" %* & @exit /b`), or `None` for a
-/// tombstone (no quoted target) or unrecognized content.
-///
-/// Keyed on the forward line's exact shape — `@"`, the target, then [`CMD_FORWARD_TAIL`]
-/// (or a not-yet-re-laid legacy shim's [`CMD_LEGACY_FORWARD_TAIL`]) and nothing else — so it
-/// walks past a legacy twin's `@"<atpkg>" __landing … -- %* & @exit /b` hand-over. The
-/// frame's lines start with neither `@"` nor `@set "`, so this reader and
-/// [`parse_cmd_shim_env`] answer the same over framed and legacy files.
+/// The forward target of a Windows bin shim (`@"<target>" %* & @exit /b`), or `None` for a tombstone (no quoted target) or unrecognized content.
 #[cfg(any(windows, test))]
 pub(crate) fn parse_cmd_shim_target(content: &str) -> Option<PathBuf> {
     for line in content.lines() {
@@ -601,11 +425,7 @@ pub(crate) fn parse_cmd_shim_target(content: &str) -> Option<PathBuf> {
     None
 }
 
-/// `path` without a Windows verbatim prefix (`\\?\C:\…` → `C:\…`, `\\?\UNC\srv\sh` →
-/// `\\srv\sh`), so it can sit in a `.cmd` line: `std::fs::canonicalize` and
-/// [`crate::stub::co_located_atpkg_path`] answer verbatim paths on Windows, which
-/// `cmd.exe`'s built-ins and command launch do not reliably accept. Other paths pass
-/// through unchanged.
+/// `path` without a Windows verbatim prefix (`\\?\C:\…` → `C:\…`, `\\?\UNC\srv\sh` → `\\srv\sh`), so it can sit in a `.cmd` line.
 #[must_use]
 pub(crate) fn strip_verbatim_prefix(path: &Path) -> PathBuf {
     let s = path.to_string_lossy();
@@ -620,10 +440,7 @@ pub(crate) fn strip_verbatim_prefix(path: &Path) -> PathBuf {
     path.to_path_buf()
 }
 
-/// [`cmd_shim_content_env`] with `prelude` (an `agents/` twin's [`twin_prelude`], empty on
-/// Windows; empty for every `bin/` shim) ahead of the `@set` and forward lines, all behind
-/// the frame: the `.cmd` twin of [`sh_shim_content_twin`]. A prelude ends on a `:store`
-/// label, so its `goto store` lands on the exports the store forward needs.
+/// [`cmd_shim_content_env`] with `prelude` (an `agents/` twin's [`twin_prelude`], empty on Windows; empty for every `bin/` shim) ahead of the `@set` and forward lines, all behind the frame.
 #[cfg(any(windows, test))]
 pub(crate) fn cmd_shim_content_twin(
     target: &Path,
@@ -644,22 +461,7 @@ const CMD_LANDING_NOTE: &str = "@rem atpkg agents twin: while a newer build of t
 #[cfg(test)]
 const CMD_LANDING_LABEL: &str = "store";
 
-/// The legacy `.cmd` landing prelude an old Windows `agents\` twin carries ahead of its
-/// exports, rendered only so the tests can lay such a twin; the next pass re-lays it
-/// ([`crate::landing`]).
-///
-/// ```text
-/// @rem atpkg agents twin: while a newer build of this program is landing, atpkg __landing waits for it and then runs the new one (aterm help pkg).
-/// @if not exist "<marker>" goto store
-/// @if not exist "<atpkg>" goto store
-/// @"<atpkg>" __landing "<program>" "<prefix>" -- %* & @exit /b
-/// :store
-/// ```
-///
-/// Every reader still answers over it: the hand-over's closing quote is followed by
-/// ` __landing`, never [`CMD_FORWARD_TAIL`], so [`parse_cmd_shim_target`] walks past it,
-/// and it has no `@set` line. Empty when a path cannot be embedded ([`cmd_embedded_path`])
-/// or the program could break out of `"…"`.
+/// The legacy `.cmd` landing prelude an old Windows `agents\` twin carries ahead of its exports, rendered only so the tests can lay such a twin.
 #[cfg(test)]
 #[must_use]
 pub(crate) fn cmd_landing_prelude(
@@ -704,9 +506,6 @@ pub(crate) fn cmd_landing_prelude(
 }
 
 /// A path as the legacy `.cmd` landing prelude embedded it, or `None` when it could not:
-/// the verbatim prefix off ([`strip_verbatim_prefix`]), trailing `\` and `/` trimmed (a
-/// quoted operand ending in `\"` is an escaped quote to the launched exe's argv parser),
-/// then the injection guard ([`cmd_target_is_injection_safe`]).
 #[cfg(test)]
 fn cmd_embedded_path(path: &Path) -> Option<String> {
     let stripped = strip_verbatim_prefix(path);
@@ -723,22 +522,7 @@ fn cmd_embedded_path(path: &Path) -> Option<String> {
     Some(trimmed)
 }
 
-/// THE PRELUDE of an agent program's `agents/` twin and its `bin/` shim — what
-/// [`crate::activate::reconcile_agents`] renders into both: the self-update block
-/// ([`sh_selfupdate_prelude`]) then the `--yolo` block ([`sh_yolo_prelude`]) on
-/// Unix, and NOTHING on Windows — a `.cmd` block would test `"%~1"=="update"`,
-/// which expands the user's first argument onto a batch line, where an argument
-/// carrying a `"` can end the batch with the tool never run (the strand the Unix
-/// rule forbids), and a `--yolo` rewrite would have to take `%*` apart the same
-/// unsafe way; it waits for a Windows host that has measured `%~1` with `"`, `%`
-/// and `^` (`docs/DESIGN-vendor-self-update-2026-09-19.md`). A
-/// twin that still carries a legacy landing prelude compares unequal on the next pass
-/// and is re-laid once (temp + rename; a running `sh` keeps the old inode, a running
-/// `.cmd` ends its batch on the line that runs the program). `verbs` is the program's row
-/// ([`crate::selfupdate::verbs_of`]) and `yolo` its policy
-/// ([`crate::yolo::policy_of`]): each empty renders its block as nothing, and both
-/// empty is the plain shim under the twin's name. `atpkg` is the one
-/// [`crate::stub::Embedder`] settled on, or `None` to name none.
+/// THE PRELUDE of an agent program's `agents/` twin and its `bin/` shim.
 #[must_use]
 pub(crate) fn twin_prelude(
     program: &str,
@@ -756,69 +540,28 @@ pub(crate) fn twin_prelude(
 }
 
 /// The Unix `bin/` shim body: a `/bin/sh` stub that `exec`s the store binary.
-///
-/// Not a symlink: Trust's `targo` authenticates its frontend first, requiring
-/// `current_exe` to be a plain regular file that already equals its own `canonicalize()`,
-/// which a symlinked shim fails. Not a hardlink: `exec` replaces the process image, so
-/// `current_exe` is the real binary and its parent the real toolchain `bin/`, where targo
-/// finds its sysroot siblings; a hardlink would sit in `<prefix>/bin`. A shim at all,
-/// rather than the store's `bin/` on PATH, keeps the `exposes` allowlist meaningful
-/// (`shim_allowed` refuses names like `sudo`/`ssh`/`git`). `exec "<target>" "$@"` sets
-/// argv[0] to the target, so the stub is invisible to the tool.
-///
-/// The no-environment form of [`sh_shim_content_env`], for the tests.
 #[cfg(test)]
 pub(crate) fn sh_shim_content(target: &Path) -> String {
     sh_shim_content_env(target, &crate::shim_env::ShimEnv::NONE)
 }
 
 /// The note ahead of an env-carrying shim's `export` lines, so a human reading `bin/claude`
-/// sees where the variables come from (the program's policy).
 #[cfg(any(unix, test))]
 const SH_SHIM_ENV_NOTE: &str =
     "# shim_env is aterm's policy for this program: only this managed copy runs with it.\n";
 
-/// [`sh_shim_content`] with the shim's exported environment ([`crate::shim_env`]) ahead of
-/// the `exec`: the note, then one `export NAME='VALUE'` per entry, single-quoted by
-/// [`sh_quote_str`] so nothing in it is a word to `sh`. An empty `env` is byte-identical
-/// to [`sh_shim_content`]. The unrouted form of [`sh_shim_content_routed`], for the tests.
+/// [`sh_shim_content`] with the shim's exported environment ([`crate::shim_env`]) ahead of the `exec`.
 #[cfg(test)]
 pub(crate) fn sh_shim_content_env(target: &Path, env: &crate::shim_env::ShimEnv) -> String {
     sh_shim_content_routed(target, env, None)
 }
 
 /// The note ahead of the guard line of a shim routed through a [`crate::compat`] exec root,
-/// for a human reading `bin/tippy`.
 #[cfg(any(unix, test))]
 const SH_SHIM_ROUTE_NOTE: &str = "# atpkg exec root: this build ships bin/rustc as a separate copy of trustc, which its \
      tippy refuses; the same tools run from a clone of the build where rustc holds trustc's bytes (aterm pkg doctor).\n";
 
-/// [`sh_shim_content_env`] with an optional route: `None` is that shim byte for byte;
-/// `Some(R)` puts the note and one guard line ahead of the target `S`'s `exec`:
-///
-/// ```text
-/// [ ! -h 'R' ] && [ -f 'R' ] && [ -x 'R' ] && [ -f 'S' ] && [ ! -h 'M' ] && [ -f 'M' ] && exec 'R' "$@"
-/// exec 'S' "$@"
-/// ```
-///
-/// where `R` is `<root>/bin/<file>` and `M` the root's [`crate::compat::ROOT_MARKER`]
-/// (`<root>/.atpkg-root`).
-///
-/// Some Trust bundles (8571, 8589, 8590, 8595) ship `bin/rustc` as a separately signed copy
-/// of `bin/trustc`, and their tippy refuses to run unless the sibling `rustc` is the same
-/// file as, or byte-identical to, the selected `trustc`. The store is never modified, so
-/// [`crate::compat`] lays a copy-on-write clone of the build ([`crate::clone`]) where
-/// `rustc` holds `trustc`'s bytes, and the shim runs the tool from there.
-///
-/// The guard checks at every exec that the root stands and is whole: `R` is a regular,
-/// executable non-symlink; the store file `S` still exists (a reclaimed build never runs
-/// from a leftover root); and the marker `M`, written last before the `rename(2)` that
-/// commits the root, is a regular file. Any false falls through to the store `exec`. It
-/// proves no bytes; [`crate::compat::ensure_root`] does that when it lays the root.
-///
-/// Readers see no difference: the env note and exports stay ahead of the guard, so both
-/// `exec`s inherit them, and the guard line starts with `[`, so `parse_sh_shim_target`
-/// still answers `S` and `parse_sh_shim_env` reads the same exports.
+/// [`sh_shim_content_env`] with an optional route: `None` is that shim byte for byte.
 #[cfg(any(unix, test))]
 pub(crate) fn sh_shim_content_routed(
     target: &Path,
@@ -833,11 +576,7 @@ pub(crate) fn sh_shim_content_routed(
 const SH_LANDING_NOTE: &str = "# atpkg agents twin: while a newer build of this program is landing, `atpkg __landing` \
      waits for it and then runs the new one (aterm help pkg).\n";
 
-/// The legacy `sh` landing prelude an old Unix `agents/` twin carries after its
-/// self-update block, rendered only so the tests can lay such a twin; the next pass
-/// re-lays it ([`crate::landing`]). While the marker stands it hands over to
-/// `atpkg __landing <program> '<prefix>' -- "$@"`. No line is a literal `exec '` or an
-/// `export `, so the twin's target and env read as without it.
+/// The legacy `sh` landing prelude an old Unix `agents/` twin carries after its self-update block, rendered only so the tests can lay such a twin.
 #[cfg(all(test, unix))]
 #[must_use]
 pub(crate) fn sh_landing_prelude(
@@ -863,46 +602,10 @@ pub(crate) fn sh_landing_prelude(
 }
 
 /// The fixed tail of the self-update block's note line, after the program, its verbs and
-/// the verb name: it tells a human reading `agents/claude` what the `case` does.
 const SH_SELFUPDATE_NOTE: &str =
     "` — aterm updates this copy from its vendor and verifies every build here (aterm help pkg).\n";
 
-/// The self-update block of an agent program's `agents/` twin and its `bin/` shim
-/// ([`crate::selfupdate`]; outside an aterm session `bin/<program>` is the managed name),
-/// the whole of [`twin_prelude`] on Unix:
-///
-/// ```text
-/// # atpkg: `claude update|upgrade|install` is answered by `atpkg __selfupdate` — aterm updates this copy from its vendor and verifies every build here (aterm help pkg).
-/// case "$1" in
-///   update|upgrade|install)
-///     __atpkg='/Applications/aterm.app/Contents/MacOS/atpkg'
-///     if [ -x "$__atpkg" ] && [ "${__ATPKG_SELFUPDATE_PID-}" != "$$" ]; then __ATPKG_SELFUPDATE_PID=$$ exec "$__atpkg" __selfupdate 'claude' '/Users//u/Library/Application Support/aterm/pkg' -- "$@"; fi
-///     ;;
-/// esac
-/// ```
-///
-/// * Re-entry guard ([`crate::selfupdate::REENTRY_VAR`]): the verb's forward `exec`s
-///   `bin/<program>`, which carries this block, under the same pid; the block hands over
-///   only when the variable does not name its own `$$`, so the forward reaches the store
-///   build instead of handing over forever. An assignment prefix on `exec` is exported to
-///   the exec'd image and `$$` survives the `exec` (measured in sh, bash, zsh, dash, ksh).
-/// * `case "$1"` matches the first token exactly, never glob-expanded; the patterns are
-///   literal words validated by [`crate::selfupdate::is_shell_safe_verb`]; an unset `$1`
-///   matches nothing; `"$@"` passes verbatim. No user byte is parsed as shell, which is
-///   why classifying everything past `$1` lives in Rust.
-/// * When `$__atpkg` is not executable (the app relocated or gone) the arm falls through
-///   `;;` to the exports and the store `exec`, so the vendor's verb runs. Never
-///   `command -v atpkg`, which could exec an older `atpkg` into `unknown verb` with the
-///   tool never run. An empty `atpkg` ([`crate::stub::named`]) renders `__atpkg=''` and
-///   falls through the same way.
-/// * No line is a literal `exec '` (the one `exec` is `exec "$__atpkg"` on an `if` line),
-///   an `export ` line or a pending-stub marker, and every embedded string goes through
-///   [`sh_quote_str`], so `parse_sh_shim_target`, `resolve_shim`, `sweep_agents_dir`'s
-///   keep-predicate and `parse_sh_shim_env` are unaffected.
-/// * Fail-closed render: the empty string (the twin is the plain shim) when `verbs` is
-///   empty, when any verb fails the word rule (`esac` included: in that slot it is a parse
-///   error in sh, bash, dash, zsh and ksh, and the twin would never reach its `exec`), or
-///   when the program is not a [`crate::store::ToolName`] or fails the same rule.
+/// The self-update block of an agent program's `agents/` twin and its `bin/` shim ([`crate::selfupdate`]; outside an aterm session `bin/<program>` is the managed name), the whole of [`twin_prelude`] on Unix.
 #[must_use]
 pub(crate) fn sh_selfupdate_prelude(
     program: &str,
@@ -946,89 +649,7 @@ pub(crate) fn sh_selfupdate_prelude(
     s
 }
 
-/// THE `--yolo` BLOCK of an agent program's twin and `bin/` shim ([`crate::yolo`]),
-/// rendered after the self-update block in [`twin_prelude`]. For claude (no word
-/// lists) it reads:
-///
-/// ```text
-/// # atpkg: yolo by default — this name runs claude with every approval and sandbox off ('--dangerously-skip-permissions'); `--yolo` ahead of a literal `--` spells the same, a launch that types its own posture runs as typed, and the command as run is printed on stderr (aterm help pkg).
-/// __atpkg_yolo=0
-/// __atpkg_posture=0
-/// __atpkg_p0=0
-/// for __atpkg_a in "$@"; do
-///   case "$__atpkg_a" in
-///     --) break ;;
-///     --yolo) __atpkg_yolo=1 ;;
-///     '--dangerously-skip-permissions') __atpkg_p0=1; __atpkg_posture=1 ;;
-///     '--allow-dangerously-skip-permissions'|'--permission-mode'|'--permission-mode='*) __atpkg_posture=1 ;;
-///   esac
-/// done
-/// __atpkg_say=
-/// if [ "$__atpkg_yolo" = 1 ]; then
-///   __atpkg_say="aterm: --yolo: running 'claude'"
-///   __atpkg_stop=0
-///   __atpkg_n=$#
-///   while [ "$__atpkg_n" -gt 0 ]; do
-///     __atpkg_n=$((__atpkg_n - 1))
-///     if [ "$__atpkg_stop" = 0 ] && [ "$1" = "--yolo" ]; then
-///       shift
-///       if [ "$__atpkg_p0" = 0 ]; then __atpkg_p0=1; set -- "$@" '--dangerously-skip-permissions'; fi
-///     else
-///       if [ "$1" = "--" ]; then __atpkg_stop=1; fi
-///       set -- "$@" "$1"
-///       shift
-///     fi
-///   done
-/// elif [ "$__atpkg_posture" = 0 ]; then
-///   __atpkg_say="aterm: yolo (default): running 'claude'"
-///   set -- '--dangerously-skip-permissions' "$@"
-/// fi
-/// if [ -n "$__atpkg_say" ]; then
-///   printf '%s' "$__atpkg_say" 1>&2
-///   for __atpkg_a in "$@"; do
-///     printf " '" 1>&2
-///     __atpkg_rest=$__atpkg_a
-///     while case "$__atpkg_rest" in *"'"*) true ;; *) false ;; esac; do
-///       printf '%s' "${__atpkg_rest%%"'"*}" 1>&2
-///       printf '%s' "'\\''" 1>&2
-///       __atpkg_rest=${__atpkg_rest#*"'"}
-///     done
-///     printf '%s' "$__atpkg_rest" 1>&2
-///     printf "'" 1>&2
-///   done
-///   printf '\n' 1>&2
-/// fi
-/// ```
-///
-/// A row with word lists (muse) also tracks the first non-flag word: the
-/// default goes behind an `after` word and never on a `skip` word, and a
-/// `--yolo` typed ahead of an `after` word expands behind it (the pending
-/// rotation; [`crate::yolo::decide`] is the rule both lanes keep).
-///
-/// * PURE `/bin/sh`, no hand-over: every user word is only ever compared
-///   (`case`, `[ … = … ]`) or moved quoted (`set -- "$@" "$1"`), never parsed,
-///   so the default holds with no atpkg reachable and every run still reaches
-///   the twin's `exec`. A rotation consumes exactly the original `$#` words —
-///   each appended once at the tail, a `--yolo` as the flags not already
-///   present (a flag is never added twice: codex refuses its bypass repeated)
-///   — so order and empty words survive; a literal `--` freezes the rest.
-/// * THE ECHO is [`crate::yolo::echo_line`]/[`crate::yolo::default_echo_line`]'s
-///   twin: each word single-quoted, an embedded `'` split out as `'\''`
-///   (printed with `printf '%s'` — as a printf FORMAT `\'` collapses to `'`
-///   under bash, measured 2026-10-19), on stderr only, on a rewritten launch
-///   only.
-/// * No line is a literal `exec '` or `export `, so every reader of the twin's
-///   target and env answers as over a plain shim; every embedded word is
-///   rendered quoted and validated first.
-/// * FAIL-CLOSED RENDER: the EMPTY string when the flags or the markers are
-///   empty (a default that cannot tell a decided launch would upgrade the
-///   harness's own resume lines), when any flag, marker or word fails its word
-///   rule, or when the program is not a [`crate::store::ToolName`] or fails the
-///   verb word rule — the self-update block's rule, widened.
-///
-/// Measured against this shape in sh, bash, dash and zsh (2026-10-19),
-/// including arguments carrying quotes, `$`, backticks and spaces. Pure string
-/// building, pinned on every platform; [`twin_prelude`] renders it on Unix only.
+/// THE `--yolo` BLOCK of an agent program's twin and `bin/` shim ([`crate::yolo`]), rendered after the self-update block in [`twin_prelude`].
 #[must_use]
 pub(crate) fn sh_yolo_prelude(
     program: &str,
@@ -1055,9 +676,6 @@ pub(crate) fn sh_yolo_prelude(
     {
         return String::new();
     }
-    // The twin's self-update verbs ride along as skip words (`twin_prelude`
-    // passes them): an update shape is decided ahead of this block, and its
-    // help forward through `bin/` must not be defaulted on the way.
     let skip_all: Vec<&str> = skip
         .iter()
         .copied()
@@ -1069,8 +687,6 @@ pub(crate) fn sh_yolo_prelude(
         .collect::<Vec<_>>()
         .join(" ");
     let words = !after.is_empty() || !skip_all.is_empty();
-    // One `if` per flag not already present/emitted — the dedupe both the
-    // by-the-flag rotation and (via the posture scan) the default rely on.
     let fresh = |indent: &str| {
         let mut f = String::new();
         for (i, flag) in flags.iter().enumerate() {
@@ -1121,9 +737,6 @@ pub(crate) fn sh_yolo_prelude(
         s.push_str(&i.to_string());
         s.push_str("=1; __atpkg_posture=1 ;;\n");
     }
-    // The patterns `yolo::marker_matches` keeps, in `case` spelling: a `--word=`
-    // entry and a short flag are prefixes (their attached forms are the same
-    // flag to the vendor's parser), a long flag is itself or its `=value` form.
     let marker_pattern = |m: &str| {
         if m.ends_with('=') || (m.len() == 2 && m.starts_with('-') && !m.starts_with("--")) {
             let mut p = sh_quote_str(m);
@@ -1148,8 +761,6 @@ pub(crate) fn sh_yolo_prelude(
         s.push_str(") __atpkg_posture=1 ;;\n");
     }
     s.push_str("  esac\ndone\n");
-    // Discover the original argument position separately from the posture
-    // scan: a known value can itself spell a subcommand or posture word.
     let (values, switches) = crate::yolo::word_options(program);
     let standalone: Vec<&str> = std::iter::once(crate::yolo::WORD)
         .chain(flags.iter().copied())
@@ -1347,9 +958,7 @@ pub(crate) fn sh_yolo_prelude(
     s
 }
 
-/// [`sh_shim_content_routed`] with `prelude` (an agent program's [`twin_prelude`], else
-/// empty) right after the header comment, ahead of the exports, so a hand-over to
-/// `atpkg __selfupdate` inherits none of them.
+/// [`sh_shim_content_routed`] with `prelude` (an agent program's [`twin_prelude`], else empty) right after the header comment, ahead of the exports, so a hand-over to `atpkg __selfupdate` inherits none of them.
 #[cfg(any(unix, test))]
 pub(crate) fn sh_shim_content_twin(
     target: &Path,
@@ -1360,8 +969,7 @@ pub(crate) fn sh_shim_content_twin(
     sh_shim_body(target, env, route, None, prelude)
 }
 
-/// An admitted ALab primary runs through its stable exec entry. Keep the final physical
-/// target line for the package ownership readers; the guarded exec preserves argv0.
+/// An admitted ALab primary runs through its stable exec entry.
 #[cfg(unix)]
 pub(crate) fn sh_shim_content_managed(
     target: &Path,
@@ -1373,7 +981,6 @@ pub(crate) fn sh_shim_content_managed(
 }
 
 /// The one body every Unix shim renders through — see [`sh_shim_content_routed`] for
-/// the shape and [`sh_shim_content_twin`] for the prelude.
 #[cfg(any(unix, test))]
 fn sh_shim_body(
     target: &Path,
@@ -1396,8 +1003,6 @@ fn sh_shim_body(
         s.push_str(&sh_quote_str(value));
         s.push('\n');
     }
-    // The build-cache block is decided here, in the one body every writer and every
-    // "already right" check renders, so they cannot disagree.
     if cfg!(target_os = "macos")
         && let Some(block) = target
             .file_name()
@@ -1447,9 +1052,7 @@ fn sh_shim_body(
     s
 }
 
-/// The environment a Unix shim exports: its `export NAME='VALUE'` lines, unquoted and
-/// re-admitted through the rule (fail-closed: a hand-edited line that breaks it reads as
-/// NONE). A tombstone, a pending stub or a plain shim reads as NONE.
+/// The environment a Unix shim exports.
 #[cfg(any(unix, test))]
 pub(crate) fn parse_sh_shim_env(content: &str) -> crate::shim_env::ShimEnv {
     let mut raw: Vec<String> = Vec::new();
@@ -1472,16 +1075,13 @@ pub(crate) fn parse_sh_shim_env(content: &str) -> crate::shim_env::ShimEnv {
     crate::shim_env::ShimEnv::admit(&raw).unwrap_or_default()
 }
 
-/// Single-quote a path for the `sh` stub, escaping embedded quotes POSIX-style. A
-/// managed-store path never contains one; this is fail-closed defence in depth, the
-/// same posture the `.cmd` side takes.
+/// Single-quote a path for the `sh` stub, escaping embedded quotes POSIX-style.
 #[cfg(any(unix, test))]
 pub(crate) fn sh_shim_quote(target: &Path) -> String {
     sh_quote_str(&target.to_string_lossy())
 }
 
-/// [`sh_shim_quote`] over a string: the one quoting rule for a shim's target and exported
-/// values, the self-update block's operands, and the `ln -sfn` way back `crate::seam` prints.
+/// [`sh_shim_quote`] over a string.
 pub(crate) fn sh_quote_str(s: &str) -> String {
     let mut out = String::from("'");
     for c in s.chars() {
@@ -1495,8 +1095,7 @@ pub(crate) fn sh_quote_str(s: &str) -> String {
     out
 }
 
-/// The target a Unix shim execs (its first `exec '…' "$@"` line), which `active_builds`,
-/// `prune_stale_shims` and gc key on; a tombstone (no `exec`) parses as `None`.
+/// The target a Unix shim execs (its first `exec '…' "$@"` line), which `active_builds`, `prune_stale_shims` and gc key on.
 #[cfg(any(unix, test))]
 pub(crate) fn parse_sh_shim_target(content: &str) -> Option<PathBuf> {
     for line in content.lines() {
@@ -1513,16 +1112,14 @@ pub(crate) fn parse_sh_shim_target(content: &str) -> Option<PathBuf> {
 /// Bound for reading a shim of either dialect before parsing it.
 pub(crate) const MAX_SHIM_BYTES: usize = 64 * 1024;
 
-/// Read the Windows `.cmd` shim through the bounded, symlink-refusing metadata seam
-/// before parsing it. Compiled in Unix tests too.
+/// Read the Windows `.cmd` shim through the bounded, symlink-refusing metadata seam before parsing it.
 #[cfg(any(windows, test))]
 pub(crate) fn read_cmd_shim_target(path: &Path) -> Option<PathBuf> {
     let content = crate::metadata_io::read_bounded_regular_utf8(path, MAX_SHIM_BYTES).ok()?;
     parse_cmd_shim_target(&content)
 }
 
-/// The environment the Windows `.cmd` shim at `path` exports ([`parse_cmd_shim_env`]),
-/// read through the same bounded, symlink-refusing seam; NONE for anything unreadable.
+/// The environment the Windows `.cmd` shim at `path` exports ([`parse_cmd_shim_env`]), read through the same bounded, symlink-refusing seam.
 #[cfg(any(windows, test))]
 pub(crate) fn read_cmd_shim_env(path: &Path) -> crate::shim_env::ShimEnv {
     match crate::metadata_io::read_bounded_regular_utf8(path, MAX_SHIM_BYTES) {
@@ -1536,8 +1133,6 @@ mod tests {
     use super::*;
 
     /// The clamp's decision, against a stand-in launcher so it runs the same on every
-    /// Unix: an absolute executable program runs behind `taskpolicy -c utility`; a
-    /// relative, missing or non-executable one, or no launcher, leaves the program alone.
     #[cfg(unix)]
     #[test]
     fn only_an_absolute_executable_runs_behind_the_utility_clamp() {
@@ -1580,8 +1175,6 @@ mod tests {
     }
 
     /// The live contract: a program [`spawn_detached`] starts runs at utility (`ps` pri 20
-    /// or below), not the default band (31) the session lane's passes got bare; one
-    /// [`spawn_detached_waited`] starts (a first run's) runs at the default band.
     #[cfg(target_os = "macos")]
     #[test]
     fn a_detached_program_starts_at_utility_and_a_waited_one_at_the_default_band() {
@@ -1623,7 +1216,6 @@ mod tests {
     }
 
     /// Observed at creation, before any write or chmod: the temp is private from the
-    /// instant it exists, and an existing one is refused.
     #[cfg(unix)]
     #[test]
     fn a_private_temp_is_never_created_wider_than_0600() {
@@ -1646,7 +1238,6 @@ mod tests {
     #[test]
     fn cmd_shim_content_wraps_target_and_forwards_args() {
         let c = cmd_shim_content(Path::new("C:\\store\\ay\\18\\bin\\ay.exe"));
-        // The frame, then the forward line, which ends the batch on the same line.
         let mut want = cmd_frame();
         want.push_str("@\"C:\\store\\ay\\18\\bin\\ay.exe\" %* & @exit /b\r\n");
         assert_eq!(c, want);
@@ -1664,21 +1255,17 @@ mod tests {
         let c = cmd_tombstone_content("atpkg: ay was yanked/revoked — run `aterm pkg update`");
         assert!(c.contains("1>&2"), "notice goes to stderr: {c}");
         assert!(c.contains("exit /b 70"), "exits 70: {c}");
-        // cmd.exe reads the file in the console's OEM code page: the em dash goes.
         assert!(c.is_ascii(), "a .cmd tombstone is ASCII: {c}");
-        // A tombstone is not an installed shim: it has no forward target.
         assert_eq!(parse_cmd_shim_target(&c), None);
     }
 
     #[test]
     fn cmd_echo_escape_neutralizes_metacharacters() {
-        // A crafted tool name with cmd metacharacters must be inert inside echo.
         let esc = cmd_echo_escape("a&b|c>d<e^f%g\"h");
         assert_eq!(esc, "a^&b^|c^>d^<e^^f%%g^\"h");
     }
 
     /// The Windows wrapper with an environment, exact: the target and env round-trip, an
-    /// empty env is the plain shim byte for byte, and the injection guard passes it.
     #[test]
     fn cmd_shim_with_env_sets_then_forwards_and_round_trips() {
         let target = PathBuf::from("C:\\store\\claude\\2026082701\\bin\\claude.exe");
@@ -1705,12 +1292,10 @@ mod tests {
             parse_cmd_shim_env(&cmd_shim_content(&target)),
             crate::shim_env::ShimEnv::NONE
         );
-        // A tombstone carries no env either.
         assert_eq!(
             parse_cmd_shim_env(&cmd_tombstone_content("atpkg: x was yanked")),
             crate::shim_env::ShimEnv::NONE
         );
-        // A hand-edited `@set` the rule refuses reads as NONE, never as half an env.
         assert_eq!(
             parse_cmd_shim_env(
                 "@set \"DISABLE_AUTOUPDATER=1\"\r\n@set \"PATH=C:\\x\"\r\n@\"C:\\a.exe\" %* & @exit /b\r\n"
@@ -1719,7 +1304,6 @@ mod tests {
         );
         assert!(cmd_env_is_injection_safe(&env));
         assert!(cmd_env_is_injection_safe(&crate::shim_env::ShimEnv::NONE));
-        // The reader goes through the bounded seam: a real file round-trips.
         let root = crate::testdir::dir("atpkg-cmd-shim-env-");
         let path = root.join("claude.cmd");
         std::fs::write(&path, &c).unwrap();
@@ -1733,7 +1317,6 @@ mod tests {
     }
 
     /// On a real Windows host the backend writes, resolves and reads the env-carrying
-    /// `.cmd` through its I/O primitives — the same file the pure test above pins.
     #[cfg(windows)]
     #[test]
     fn windows_backend_lays_and_reads_an_env_shim() {
@@ -1749,7 +1332,6 @@ mod tests {
         );
         assert_eq!(resolve_shim(&shim), Some(target.clone()));
         assert_eq!(shim_env_of(&shim), env);
-        // Re-laid without an env: the plain shim, and nothing left of the exports.
         install_shim_to(&shim, &target).unwrap();
         assert_eq!(shim_env_of(&shim), crate::shim_env::ShimEnv::NONE);
         assert_eq!(resolve_shim(&shim), Some(target));
@@ -1757,7 +1339,6 @@ mod tests {
     }
 
     /// The target reader keys on the forward line's exact tail, current or legacy (` %*`),
-    /// and nothing else.
     #[test]
     fn parse_cmd_shim_target_keys_on_the_forward_tail_and_reads_the_legacy_one() {
         assert_eq!(parse_cmd_shim_target("not a shim\r\n"), None);
@@ -1789,12 +1370,8 @@ mod tests {
     }
 
     /// A legacy `.cmd` agents twin laid with the landing prelude (exact text, under a prefix
-    /// with a space and a `)`) still resolves to the store target and its own exports.
-    /// Rendered text only: no Windows host ran this.
     #[test]
     fn a_legacy_cmd_twin_with_the_landing_prelude_still_resolves_to_the_store() {
-        // Literal `\` paths, as `Layout` joins them on Windows (`Path::join` here would
-        // put in a `/`).
         let prefix = Path::new("C:\\Program Files (x86)\\aterm\\pkg");
         let marker = Path::new("C:\\Program Files (x86)\\aterm\\pkg\\landing\\claude");
         let atpkg = Path::new("C:\\Program Files (x86)\\aterm\\app\\atpkg.exe");
@@ -1813,12 +1390,8 @@ mod tests {
              \"C:\\Program Files (x86)\\aterm\\pkg\" -- %* & @exit /b\r\n\
              :store\r\n"
         );
-        // One stat on the embedded atpkg: a second would open a window where the file
-        // vanishes between them and the batch exits 0 with nothing run.
         assert_eq!(prelude.matches("atpkg.exe").count(), 2);
         let twin = cmd_shim_content_twin(target, &env, &prelude);
-        // The frame ahead of the prelude: a legacy twin, executing
-        // as it is re-laid, resumes inside the padding and returns, never in the prelude.
         let mut want = cmd_frame();
         want.push_str(&prelude);
         want.push_str("@set \"DISABLE_AUTOUPDATER=1\"\r\n");
@@ -1827,9 +1400,6 @@ mod tests {
              %* & @exit /b\r\n",
         );
         assert_eq!(twin, want);
-        // The cmd.exe rules the prelude is built to: no `( … )` block, every line silent
-        // (`@` or a label), CRLF, no `call`, no `where atpkg`, and every line that runs a
-        // program ends the batch on that line (never `%errorlevel%`, expanded at parse time).
         for line in twin.split("\r\n").filter(|l| !l.is_empty()) {
             assert!(
                 line.starts_with('@') || line.starts_with(':'),
@@ -1845,8 +1415,6 @@ mod tests {
                     "ends the batch on the line that runs the program: {line}"
                 );
             } else {
-                // The frame's padding exit is the one standalone exit line: a legacy
-                // resume lands before it, and a fresh run jumps past it.
                 assert!(
                     !line.contains("exit /b") || line == CMD_PADDING_EXIT.trim_end(),
                     "no exit line of its own past the frame's: {line}"
@@ -1867,11 +1435,7 @@ mod tests {
         );
         assert!(!twin.contains('\n') || twin.matches("\r\n").count() == twin.matches('\n').count());
         assert!(!twin.contains("where atpkg"));
-        // No `\"` anywhere: to the launched exe's argv parser it is an escaped quote,
-        // and the operand would fuse with what follows it.
         assert!(!twin.contains("\\\""), "{twin}");
-        // The target parser walks past the hand-over line to the real forward; the env
-        // parser reads the twin's own exports.
         assert_eq!(parse_cmd_shim_target(&twin), Some(target.to_path_buf()));
         assert_eq!(parse_cmd_shim_env(&twin), env);
         assert_eq!(
@@ -1886,8 +1450,6 @@ mod tests {
             None,
             "a quoted program with no forward tail is not the shim's forward"
         );
-        // The verbatim spelling `canonicalize` answers on Windows loses its prefix before
-        // any path is embedded in a `.cmd` (the pending stub's too).
         assert_eq!(
             strip_verbatim_prefix(Path::new("\\\\?\\UNC\\srv\\share\\aterm\\atpkg.exe")),
             PathBuf::from("\\\\srv\\share\\aterm\\atpkg.exe")
@@ -1900,16 +1462,13 @@ mod tests {
             strip_verbatim_prefix(Path::new("/usr/local/aterm/atpkg")),
             PathBuf::from("/usr/local/aterm/atpkg")
         );
-        // The prelude is ahead of the exports and the forward is the last line.
         assert!(twin.find("__landing").unwrap() < twin.find("@set ").unwrap());
         assert!(twin.trim_end().ends_with("\" %* & @exit /b"));
-        // The bin/ shim carries none of it; an empty prelude is the plain shim.
         assert!(!cmd_shim_content_env(target, &env).contains("__landing"));
         assert_eq!(
             cmd_shim_content_twin(target, &env, ""),
             cmd_shim_content_env(target, &env)
         );
-        // Through the bounded file reader, the same answers.
         let root = crate::testdir::dir("atpkg-cmd-twin-");
         let path = root.join("claude.cmd");
         std::fs::write(&path, &twin).unwrap();
@@ -1919,7 +1478,6 @@ mod tests {
     }
 
     /// The `.cmd` twin renders no prelude ([`twin_prelude`]'s Windows arm is empty): it is
-    /// the framed shim byte for byte, pinned from the Unix suite.
     #[test]
     fn the_cmd_twin_renders_no_prelude_and_is_the_plain_framed_shim() {
         let prefix = Path::new("C:\\Program Files (x86)\\aterm\\pkg");
@@ -1957,9 +1515,6 @@ mod tests {
     }
 
     /// Three legacy files (the plain twin, an env shim, and the longest the legacy caps
-    /// allow) re-laid to their framed successors while executing resume inertly at every
-    /// offset `0..=old_len`; laid bare (the control), the twin resumes into the prelude. A
-    /// simulation of `cmd`'s documented rules, not a run on Windows.
     #[test]
     fn a_legacy_cmd_re_laid_while_executing_resumes_into_the_frame_at_every_offset() {
         fn legacy(target: &Path, env: &crate::shim_env::ShimEnv) -> String {
@@ -2040,7 +1595,6 @@ mod tests {
                 "{what}: {} bytes",
                 old.len()
             );
-            // Where `cmd` can be in the old file: after each of its line ends.
             let ends: Vec<usize> = old
                 .iter()
                 .enumerate()
@@ -2048,7 +1602,6 @@ mod tests {
                 .map(|(i, _)| i + 1)
                 .collect();
             assert_eq!(ends.last().copied(), Some(old.len()), "{what}");
-            // No old line is shorter than the legacy writer's minimum.
             assert!(
                 ends.iter().all(|&e| e >= CMD_LEGACY_MIN_LINE_BYTES),
                 "{what}: {ends:?}"
@@ -2064,7 +1617,6 @@ mod tests {
                     continue;
                 }
                 if offset < CMD_FRAME_HEAD.len() - 2 {
-                    // The head's own bytes are not inert, and no old line ends there.
                     assert!(
                         !ends.contains(&offset),
                         "{what}: an old line ends at {offset}"
@@ -2077,22 +1629,17 @@ mod tests {
                     old.len()
                 );
             }
-            // The resume a running program's exit produces (the old file's end offset)
-            // reads a colon label: never the prelude, never a forward line.
             let at_eof = cmd_resumed_line(new, old.len()).unwrap();
             assert!(
                 !at_eof.is_empty() && at_eof.bytes().all(|b| b == b':'),
                 "{what}: {at_eof:?}"
             );
-            // Every old line end, the general resume set, reads inert.
             for end in &ends {
                 assert!(cmd_resumed_line_is_inert(
                     cmd_resumed_line(new, *end).as_deref()
                 ));
             }
         }
-        // The padding alone: every offset from the head's CRLF to the padding exit is
-        // inert, and the exit line begins exactly where the padding ends.
         let framed = cmd_shim_content(target);
         for offset in CMD_FRAME_HEAD.len() - 2..=CMD_PADDING_END_BYTES {
             let line = cmd_resumed_line(framed.as_bytes(), offset);
@@ -2115,7 +1662,6 @@ mod tests {
             Some("goto :main"),
             "why the head must sit where no old line can end"
         );
-        // The longest legacy file's end-of-file offset lies inside the padding: a label.
         let padding_end = framed.find("@exit /b").unwrap();
         assert!(cases[2].1.len() <= padding_end, "{}", cases[2].1.len());
         assert_eq!(
@@ -2123,8 +1669,6 @@ mod tests {
             Some(&":".repeat(78)[(cases[2].1.len() - CMD_FRAME_HEAD.len()) % 80..]),
             "the bound's own end-of-file offset, inside the padding"
         );
-        // Control: the same old twin over its successor laid bare (no frame) resumes
-        // inside the prelude.
         let mut bare = prelude.clone();
         bare.push_str(&cmd_shim_body_env(target, &none));
         let old_len = cases[0].1.len();
@@ -2133,20 +1677,17 @@ mod tests {
             !cmd_resumed_line_is_inert(Some(&line)),
             "laid bare, the resume lands in the prelude: {line:?}"
         );
-        // A framed file's program line ends the batch, so a re-lay over it is never read.
         assert!(framed.trim_end().ends_with(CMD_FORWARD_TAIL));
     }
 
     #[test]
     fn cmd_target_injection_guard_rejects_quote_percent_newline() {
-        // A managed store path is always safe.
         assert!(cmd_target_is_injection_safe(Path::new(
             "C:\\Users\\me\\AppData\\Local\\aterm\\pkg\\store\\ay\\18\\bin\\ay.exe"
         )));
         assert!(cmd_target_is_injection_safe(Path::new(
             "/managed/store/ay/18/bin/ay"
         )));
-        // Anything that would break out of `@"<target>" %*` is refused.
         assert!(!cmd_target_is_injection_safe(Path::new(
             "C:\\x\\\"&calc.exe\"\\ay.exe"
         )));
@@ -2207,7 +1748,6 @@ mod sh_shim_tests {
     }
 
     /// A tombstone has no `exec` line, so it resolves to nothing; `active_builds` and gc
-    /// depend on this.
     #[test]
     fn a_tombstone_is_not_an_installed_shim() {
         let notice = "#!/bin/sh\necho 'atpkg: ay was yanked' 1>&2\nexit 70\n";
@@ -2215,10 +1755,6 @@ mod sh_shim_tests {
     }
 
     /// THE WRAPPER WITH AN ENVIRONMENT (design S7): one
-    /// `export NAME='VALUE'` per entry, then the unchanged `exec` line. The target still
-    /// parses off the exec line (every sweep keyed on where a shim resolves is
-    /// unchanged), the env parses back off the exports, an empty env is the plain shim
-    /// byte for byte, and a quote in a value is POSIX-escaped both ways.
     #[test]
     fn the_sh_shim_with_env_exports_then_execs_and_round_trips() {
         let target = Path::new("/prefix/store/claude/2026082701/bin/claude");
@@ -2247,7 +1783,6 @@ mod sh_shim_tests {
             parse_sh_shim_env(&sh_shim_content(target)),
             crate::shim_env::ShimEnv::NONE
         );
-        // A tombstone and a hand-edited export the rule refuses both read as NONE.
         assert_eq!(
             parse_sh_shim_env("#!/bin/sh\necho 'atpkg: ay was yanked' 1>&2\nexit 70\n"),
             crate::shim_env::ShimEnv::NONE
@@ -2278,9 +1813,6 @@ mod sh_shim_tests {
         install_shim_to_env(&shim, &target, &env).unwrap();
         assert_eq!(resolve_shim(&shim).as_deref(), Some(target.as_path()));
         assert_eq!(shim_env_of(&shim), env);
-        // The ambient environment may already export DISABLE_AUTOUPDATER (an aterm-spawned
-        // Claude Code does): scrub it so the child sees only what the shim lays.
-        // Each shim was just laid: past the `ETXTBSY` a sibling test's fork can hold it in.
         let run_shim = || {
             aterm_spec::wait::past_text_busy(|| {
                 std::process::Command::new(&shim)
@@ -2293,7 +1825,6 @@ mod sh_shim_tests {
         let out = run_shim();
         assert!(out.status.success());
         assert_eq!(String::from_utf8_lossy(&out.stdout), "1|arg\n");
-        // The plain shim: no export, the program sees nothing, and nothing is read back.
         install_shim_to(&shim, &target).unwrap();
         assert_eq!(shim_env_of(&shim), crate::shim_env::ShimEnv::NONE);
         let out = run_shim();
@@ -2311,9 +1842,6 @@ mod sh_shim_tests {
     }
 
     /// THE ROUTED SHIM: the exports ahead of the guard (so both execs inherit them), and
-    /// the unchanged store `exec` line. `None` is
-    /// the plain shim byte for byte; the target and the env parse back off the routed form
-    /// exactly as off the plain one, because the guard line starts with `[`.
     #[test]
     fn the_routed_shim_is_exact_and_parses_as_the_plain_one() {
         let target = Path::new("/p/store/trust/8595/bin/tippy");
@@ -2341,7 +1869,6 @@ mod sh_shim_tests {
             sh_shim_content_routed(target, &env, None),
             sh_shim_content_env(target, &env)
         );
-        // Readers key on the first line starting `exec '`; the guard's `exec 'R'` is mid-line.
         assert_eq!(
             body.lines()
                 .filter(|l| l.trim_start().starts_with("exec '"))
@@ -2364,7 +1891,6 @@ mod sh_shim_tests {
             body.matches(r"'/it'\''s/store/trust/1/bin/targo'").count(),
             2
         );
-        // The marker is `compat::root_marker`'s host join of the root (`\` on Windows).
         let marker = if cfg!(windows) {
             r"'/it'\''s/compat/trust/1\.atpkg-root'"
         } else {
@@ -2376,9 +1902,6 @@ mod sh_shim_tests {
     }
 
     /// The guard under a real `/bin/sh` (and `/bin/dash` where present), with an empty
-    /// environment, quoted arguments and a prefix holding a space and a quote: the route runs
-    /// only while the marked root stands, else the store. A hard link looks like a clone to
-    /// the shell; catching it is `route_for_shim`'s and repair's job.
     #[cfg(unix)]
     #[test]
     fn the_guard_runs_the_root_only_when_the_marked_root_stands() {
@@ -2465,7 +1988,6 @@ mod sh_shim_tests {
                 );
             }
         }
-        // A missing root (not only a missing file in it) falls back the same way.
         std::fs::remove_dir_all(base.join("compat")).unwrap();
         for shell in &shells {
             assert_eq!(run(shell), ran(&store), "{shell}, no root");
@@ -2474,17 +1996,6 @@ mod sh_shim_tests {
     }
 
     /// THE SELF-UPDATE BLOCK ([`crate::selfupdate`]), for claude (three
-    /// verbs) and codex (one): the `case "$1"` on the row's verbs, the repeated
-    /// `__atpkg=` assignment, the variable `exec` with the program and the prefix quoted
-    /// and `"$@"` verbatim, `;;`, `esac`. Empty for an empty verb list, for a verb that
-    /// would break the `case` pattern, for a program with a quote in it and for a name the
-    /// tool-name gate refuses; a quote in the prefix or the atpkg path is POSIX-escaped in
-    /// every slot. On Unix [`twin_prelude`] IS this block, and the whole twin still reads
-    /// as a plain shim:
-    /// exactly one literal `exec '` line (the store target), no `export `, the target and
-    /// the env parse back, no pending-stub marker, the block ahead of the exports, and the
-    /// plain `bin/` render carries none of it (the agents reconcile lays an agent program's
-    /// `bin/` with the block, `crate::activate::reconcile_agents`).
     #[test]
     fn the_self_update_block_is_exact_is_the_whole_prelude_and_breaks_no_reader() {
         let prefix = Path::new("/Users//u/Library/Application Support/aterm/pkg");
@@ -2506,7 +2017,6 @@ mod sh_shim_tests {
             sh_selfupdate_prelude("codex", prefix, atpkg, crate::selfupdate::verbs_of("codex"));
         assert!(codex.contains("\n  update)\n"), "{codex}");
         assert!(codex.contains("__selfupdate 'codex' "), "{codex}");
-        // Fail-closed: no verbs, an unsafe verb, an unsafe program, a refused tool name.
         assert_eq!(sh_selfupdate_prelude("claude", prefix, atpkg, &[]), "");
         assert_eq!(
             sh_selfupdate_prelude("ay", prefix, atpkg, crate::selfupdate::verbs_of("ay")),
@@ -2526,8 +2036,6 @@ mod sh_shim_tests {
             sh_selfupdate_prelude("claude", prefix, atpkg, &["Update"]),
             ""
         );
-        // `esac` passes the regex but breaks the pattern (a parse error in sh, bash, dash,
-        // zsh and ksh), so it is refused in every slot.
         assert_eq!(
             sh_selfupdate_prelude("claude", prefix, atpkg, &["esac"]),
             ""
@@ -2543,7 +2051,6 @@ mod sh_shim_tests {
             "",
             "not a tool name"
         );
-        // A quote in the prefix and in the atpkg path is escaped in every slot.
         let quoted = sh_selfupdate_prelude(
             "claude",
             Path::new("/it's/pkg"),
@@ -2556,7 +2063,6 @@ mod sh_shim_tests {
             "{quoted}"
         );
         assert!(!quoted.contains("/it's/"), "{quoted}");
-        // The whole prelude is the block: no landing check, no marker, no `__landing`.
         let want = block.clone();
         let twin_pre = twin_prelude(
             "claude",
@@ -2583,7 +2089,6 @@ mod sh_shim_tests {
             "",
             "no verbs, no yolo policy: no prelude — the twin is the plain shim"
         );
-        // The full twin reads as a plain shim to every parser.
         let env = crate::shim_env::ShimEnv::admit(&["DISABLE_AUTOUPDATER=1".to_string()]).unwrap();
         let twin = sh_shim_content_twin(target, &env, None, &want);
         assert_eq!(
@@ -2613,11 +2118,6 @@ mod sh_shim_tests {
     }
 
     /// THE YOLO BLOCK EXECUTED: laid twins over a store build that prints its
-    /// argv. By default the flags are injected (behind muse's session words),
-    /// by the flag they replace `--yolo` without ever doubling, and a launch
-    /// that decided its own posture passes untouched and unprinted — the same
-    /// argv [`crate::yolo::decide`] returns and the same lines its echo
-    /// builders spell; stdout carries only the build's own words.
     #[cfg(unix)]
     #[test]
     fn the_yolo_block_expands_prints_and_reaches_the_exec() {
@@ -2666,7 +2166,6 @@ mod sh_shim_tests {
             )
         };
         let claude = lay("claude");
-        // By default: injected at the front, the default echo, stdout clean.
         assert_eq!(
             run(&claude, &["-p", "hello"]),
             (
@@ -2676,7 +2175,6 @@ mod sh_shim_tests {
                     .into()
             )
         );
-        // A decided posture, and the flag itself typed: as typed, silent.
         for args in [
             &["--permission-mode", "plan"][..],
             &["--permission-mode=auto"][..],
@@ -2690,8 +2188,6 @@ mod sh_shim_tests {
             run(&claude, &["--permission-mode", "plan"]).0,
             "<--permission-mode><plan>\n"
         );
-        // Attached and config spellings are the same decided posture in the
-        // generated shell as in `decide`: no injection and no echo.
         let codex = lay("codex");
         for args in [
             &["-sread-only", "exec", "x"][..],
@@ -2706,7 +2202,6 @@ mod sh_shim_tests {
                 "{args:?}: {stdout}"
             );
         }
-        // By the flag: in place, the flag's echo. A prompt with quote/$/backtick.
         let (stdout, stderr) = run(
             &claude,
             &["--model", "opus", "--yolo", "-p", "it's $x `y`", ""],
@@ -2726,7 +2221,6 @@ mod sh_shim_tests {
             stderr,
             format!("{}\n", crate::yolo::echo_line("claude", &expanded))
         );
-        // The separator freezes the rest; the default still lands in front.
         let (stdout, stderr) = run(&claude, &["--", "--yolo"]);
         assert_eq!(stdout, "<--dangerously-skip-permissions><--><--yolo>\n");
         assert_eq!(
@@ -2734,7 +2228,6 @@ mod sh_shim_tests {
             "aterm: yolo (default): running 'claude' '--dangerously-skip-permissions' \
              '--' '--yolo'\n"
         );
-        // muse: behind its session words, never on its tool words.
         let muse = lay("muse");
         let behind = "<exec><--disable-approval><--disable-sandbox><--trust-workspace>\
                       <--disable-request-user-input><x>\n";
@@ -2768,8 +2261,6 @@ mod sh_shim_tests {
                 )
             )
         );
-        // Leading option values cannot hide a resume/fork from the default,
-        // and an unknown arity cannot authorize guessing one.
         for args in [
             &["--model", "opus", "resume", "thread-id"][..],
             &["-m", "opus", "fork", "thread-id"][..],
@@ -2795,8 +2286,6 @@ mod sh_shim_tests {
             run(&codex, &["--model", "resume", "fix this"]).0,
             "<--dangerously-bypass-approvals-and-sandbox><--model><resume><fix this>\n"
         );
-        // The model's value spells the command too: insertion uses the
-        // original argument position, never the first equal string.
         for args in [
             &["--model", "exec", "exec", "x"][..],
             &["--yolo", "--model", "exec", "exec", "x"][..],
@@ -2820,7 +2309,6 @@ mod sh_shim_tests {
     }
 
     /// The yolo renderer's fail-closed rows, and its exact first line — the note a
-    /// person reading the twin sees.
     #[test]
     fn the_yolo_block_renders_fail_closed() {
         use crate::yolo::Policy;

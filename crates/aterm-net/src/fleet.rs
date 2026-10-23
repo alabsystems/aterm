@@ -1,20 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The fleet handshake (`docs/DESIGN-sessions-as-subagents-2026-10-15.md` §5):
-//! how one aterm proves to another, over TCP, that both hold the same fleet
-//! secret, before a single control byte moves and with no token on the wire.
+//! Mutual exporter-bound HMAC handshake over TLS 1.3 for fleet TCP connections.
 //!
-//! It is the only way one aterm reaches another over the network: one secret
-//! per fleet, one certificate in every aterm, and a proof each way. One secret
-//! is one read trust domain — every member can read every other's survey at
-//! the level that machine allows, and nothing more; nothing it admits is ever
-//! the Owner.
-//!
-//! **Keys.** The fleet secret `K` is 20 to 32 bytes
-//! ([`FleetSecret`](crate::fleet::FleetSecret); a join code carries 160 bits).
-//! Each role proves with its own key, derived from `K` with HKDF-SHA256
-//! (RFC 5869, no salt):
+//! **Keys.** From the 20–32 byte fleet secret `K` ([`FleetSecret`]), HKDF-SHA256 (RFC 5869,
+//! empty salt) derives three role keys:
 //!
 //! | key  | HKDF info               | proves                                     |
 //! |------|-------------------------|--------------------------------------------|
@@ -22,10 +12,9 @@
 //! | `Kc` | `aterm-fleet/v1 client` | a dialer's op (`survey`, `book`, `drive`)  |
 //! | `Kj` | `aterm-fleet/v1 join`   | a dialer's `join`, keyed apart from a read |
 //!
-//! **Wire.** TLS 1.3 only, ALPN [`ALPN`](crate::fleet::ALPN) (`atf/1`), no
-//! resumption and no 0-RTT. `E` is the connection's 32-byte RFC 5705 exporter
-//! under the label `EXPORTER-aterm-fleet-v1`, with no context. Then three
-//! lines, each ASCII, ending in LF, at most 128 bytes:
+//! **Wire.** TLS 1.3 only, ALPN [`ALPN_NODES`] (`atf/2`) or [`ALPN`] (`atf/1`), no resumption
+//! and no 0-RTT. `E` is the 32-byte RFC 5705 exporter under `EXPORTER-aterm-fleet-v1`.
+//! Three ASCII lines (at most 128 bytes each) authenticate both ends:
 //!
 //! ```text
 //! listener → dialer   <scope> SP hex(HMAC-SHA256(Ks, E ‖ scope)) LF    scope: facts | content
@@ -33,85 +22,20 @@
 //! listener → dialer   OK LF  |  NO SP proof LF  |  NO SP op LF  |  NO SP capacity LF
 //! ```
 //!
-//! A word is `[a-z0-9-]{1,32}`, a tag 64 lowercase hex digits. `E` has a fixed
-//! length, so `E ‖ word` is unambiguous. After `OK` the stream is the caller's:
-//! the listener hands it to its control server, the dialer speaks its op.
-//!
-//! **Nodes** ([`NodeIdentity`], [`NodeProof`]). The secret says a peer is OF
-//! the fleet, never WHICH machine of it: every member holds it. So each node
-//! holds an Ed25519 key of its own too (`fleet_member::NODE_KEY_FILE`), which
-//! the issuer's book binds to its node id at its first registration, and each
-//! end proves it holds the private half by signing `E`. A dialer offers ALPN
-//! [`ALPN_NODES`] (`atf/2`) before `atf/1`, a listener prefers it; under it
-//! two lines more, each at most 256 bytes, each sent only to a peer that has
-//! already proved the secret:
+//! **Nodes** ([`NodeIdentity`], [`NodeProof`]). Under [`ALPN_NODES`] (`atf/2`), each end also
+//! proves possession of its Ed25519 node key by signing its role label, a NUL byte, `E`, and
+//! its node id (or sends `node -` if unkeyed):
 //!
 //! ```text
 //! dialer → listener   (after its op line)  node SP <node id> SP hex(K) SP hex(Sig(E)) LF  |  node SP - LF
 //! listener → dialer   (after its OK)       node SP <node id> SP hex(K) SP hex(Sig(E)) LF  |  node SP - LF
 //! ```
 //!
-//! `Sig(E)` is the node key's Ed25519 signature over its end's label
-//! (`aterm-fleet/v2 node dialer` or `… listener`), a zero byte, `E` and the
-//! node id: each end's proof is its own, of its own node, on this channel
-//! alone. `node -` is an end that holds no node key (it has not joined since
-//! keys came). A signature that does not verify is refused (`NO node`); a
-//! valid one is a proof of POSSESSION, and which node it makes the peer is
-//! the book's word ([`NodeProof`]). Under `atf/1` — an older aterm on either
-//! end — no node is proved, and a reader whose book binds that peer a key
-//! does not read it as that peer (`fleet_member`).
-//!
-//! **Why this order.** The listener proves first, and the dialer checks that
-//! proof in constant time before it sends a byte: a dialer never hands its
-//! proof to a peer that has not shown it holds the secret, so an echo has
-//! nothing to send back. Each role has its own key, so the listener's tag
-//! reflected at it never passes as a dialer's, nor a dialer's as a listener's.
-//! Every tag covers `E`, which a man in the middle cannot carry across: it runs
-//! a separate TLS session on each leg, each with its own exporter, so a tag it
-//! relays from one leg fails on the other. And a tag names its word, so a proof
-//! of one op or scope is no proof of another.
-//!
-//! **The certificate is not a secret** ([`CERT_DER`](crate::fleet::CERT_DER)):
-//! every aterm carries it and its private key. TLS gives the channel its
-//! encryption, from the ephemeral key exchange (which a public signing key does
-//! not weaken), and an exporter bound to the handshake transcript;
-//! authentication is the exporter-bound HMAC. The dialer still pins that one
-//! certificate, so a listener that is not a fleet listener fails at once and
-//! by name, and still verifies the TLS 1.3 handshake signature.
-//!
-//! **The listener** ([`serve`]) accepts only from loopback, private and
-//! link-local addresses ([`is_fleet_source`]), holds at most a fixed number of
-//! connections at once — a connection that has proved nothing gives its slot
-//! up to a newcomer under the NET-1 rule, so idle sockets never lock a member
-//! out (on an IPv4 listener; on IPv6 a LAN is one address, [`serve`] says
-//! why) — gives each [`HANDSHAKE_WITHIN`] for TLS and both proofs on a
-//! thread of its own, and hands each proved stream to its owner for at most
-//! [`SERVED_WITHIN`]; clearing its flag cuts every connection it handed over.
-//! A dialer proving an op the listener does not serve is answered `NO op`, and
-//! one whose address already holds its share of proved connections
-//! ([`Listening::per_source`]; a drive's apart, [`drive_per_source`]) `NO
-//! capacity`: one member, which holds the secret every member holds, never
-//! fills the slots the others read through.
-//! A proved connection goes to its owner as a [`Served`], whose two ends
-//! are its only ones, and a connection that ends on its own — its control
-//! server's answer and hang-up, or a join's answer — frees its slot and share
-//! before its peer hears the end: a member that has read the end of a served
-//! connection can dial again at once. Whatever of an end waits on the peer
-//! comes before that, and nothing after it waits on either end, so a
-//! connection that no longer counts holds no thread or descriptor the peer
-//! can keep; a relayed one counts until its control server has answered the
-//! line it was serving, however the peer ended it. One the listener cuts (past its lifetime, or as it stops or
-//! rekeys) hears the cut first: its share goes with the cut, its slot as its
-//! end runs its course. A refused one hears its `NO <why>` before its slot is
-//! freed: a refusal is not undone by dialling again at once.
-//!
-//! **The key file** ([`KEY_FILE`], [`read_key_file`]): a machine's fleet
-//! secret is `<state>/fleet.key`, the secret in lowercase hex — 40 to 64
-//! digits, 20 to 32 bytes — on one line (a final LF optional, nothing else).
-//! It is a regular file with one link, owned by this user, mode 0600, directly
-//! in the state directory, which is this user's, mode 0700; neither is a
-//! symlink. Anything else is refused and never repaired: `aterm fleet
-//! init|join` writes it, and every reader of it reads it here.
+//! **Listener and key file.** [`serve`] accepts only [`is_fleet_source`] addresses, enforces
+//! [`HANDSHAKE_WITHIN`], [`SERVED_WITHIN`], total [`Listening::slots`], and per-source shares
+//! ([`per_source`], [`drive_per_source`]), and releases a connection's slot and share before
+//! signaling EOF to the peer ([`Served`]). [`read_key_file`] reads `<state>/fleet.key`
+//! ([`KEY_FILE`], mode `0600` in a `0700` directory, 40–64 lowercase hex digits).
 
 use std::fmt;
 use std::io::{self, Read, Write};
@@ -132,37 +56,20 @@ use crate::slots::{
 };
 use crate::tls::{self, EXPORTER_LEN, PinnedServerVerifier, TlsTransport};
 
-/// The ALPN protocol every fleet connection negotiates, or [`ALPN_NODES`]. A
-/// peer that negotiates neither is no fleet peer ([`FleetError::Alpn`]).
+/// Base ALPN protocol (`atf/1`) for fleet connections without node proofs.
 pub const ALPN: &[u8] = b"atf/1";
 
-/// The ALPN under which both ends prove their node as well as the secret
-/// (the module doc's **Nodes**): offered first by every dialer and preferred
-/// by every listener, so two aterms that know it speak it and one older end
-/// is spoken to under [`ALPN`], proving no node.
+/// Preferred ALPN protocol (`atf/2`) where both ends exchange Ed25519 node proofs.
 pub const ALPN_NODES: &[u8] = b"atf/2";
 
 /// The protocols a fleet end offers or serves, the preferred first.
 const PROTOCOLS: [&[u8]; 2] = [ALPN_NODES, ALPN];
 
 /// The fleet's RFC 5705 exporter label: every proof is taken over keying
-/// material exported under it alone, apart from an older aterm's network
-/// drive (`EXPORTER-aterm-net-capability-v1`), so no tag of one is ever a tag
-/// of the other.
 const EXPORTER_LABEL: &[u8] = b"EXPORTER-aterm-fleet-v1";
 
-/// The fleet's one certificate: DER, Ed25519, self-signed, `CN=aterm-fleet`,
-/// valid 2026-10-15 to 2126-10-16. Its fingerprint — the SHA-256 digest of
-/// these DER bytes, which a dialer pins — is
-/// `a1159e84212477a69a2e6ce663db7c6796d0456a6150446469e90f832f381926`; the
-/// certificate itself is signed with Ed25519, not with SHA-256.
-///
-/// **NOT A SECRET** — every aterm carries it, and its private key
-/// (`fleet_key.der`). Authentication is the exporter-bound HMAC, never this
-/// certificate: a man in the middle holds a different exporter on each leg. A
-/// dialer pins its fingerprint ([`client_config`]), so replacing it splits the
-/// fleet between the aterms that carry the old one and the new. Minted once,
-/// with OpenSSL 3.6:
+/// Shared self-signed Ed25519 DER certificate (`CN=aterm-fleet`) pinned by fleet dialers.
+/// Authentication comes from the exporter-bound HMAC, not certificate secrecy:
 ///
 /// ```text
 /// openssl genpkey -algorithm ed25519 -outform DER -out fleet_key.der
@@ -174,15 +81,12 @@ const EXPORTER_LABEL: &[u8] = b"EXPORTER-aterm-fleet-v1";
 pub const CERT_DER: &[u8] = include_bytes!("fleet_cert.der");
 
 /// [`CERT_DER`]'s private key, PKCS#8 DER. **NOT A SECRET**, for the same
-/// reason: every aterm carries it.
 const KEY_DER: &[u8] = include_bytes!("fleet_key.der");
 
 /// The name a dialer sends (SNI): the certificate's. Identity is the proof,
-/// never the name.
 const SERVER_NAME: &str = "aterm-fleet";
 
 /// The longest handshake line: the longest word, a space, a 64-digit tag and
-/// the LF fit with room to spare.
 const MAX_LINE: usize = 128;
 
 /// The longest word (a scope, an op, a verdict's reason).
@@ -192,27 +96,22 @@ const MAX_WORD: usize = 32;
 const TAG_LEN: usize = 32;
 
 /// The longest node line (the module doc's **Nodes**): `node`, a 32-digit
-/// node id, a 64-digit key and a 128-digit signature, spaces and the LF, with
-/// room to spare.
 const MAX_NODE_LINE: usize = 256;
 
 /// An Ed25519 signature's length.
 const SIG_LEN: usize = 64;
 
-/// What a fleet listener serves a dialer whose proof verified: the level its
-/// `[fleet] allow` names (design §3). The listener proves it, so the dialer
-/// learns it from a peer it has authenticated.
+/// Visibility scope proved and served by a fleet listener (`[fleet] allow`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FleetScope {
-    /// Facts only: the program, the agent's state, the task record, the model;
-    /// no text from a screen or a transcript.
+    /// Session metadata only (program, state, task, model), without screen or transcript text.
     Facts,
-    /// Facts and content: titles, cwd, prompts, the agent's newest words.
+    /// Metadata plus content (titles, cwd, prompts, and recent excerpts).
     Content,
 }
 
 impl FleetScope {
-    /// The scope's word on the wire.
+    /// Wire word for this scope (`"facts"` or `"content"`).
     #[inline]
     #[must_use]
     pub const fn word(self) -> &'static str {
@@ -222,7 +121,7 @@ impl FleetScope {
         }
     }
 
-    /// The scope a wire word names, if this aterm knows it.
+    /// Parse a wire word into a [`FleetScope`].
     #[inline]
     #[must_use]
     pub fn from_word(word: &str) -> Option<Self> {
@@ -232,47 +131,27 @@ impl FleetScope {
     }
 }
 
-/// `[fleet] allow = "drive"`: the level above content (the step-in,
-/// `docs/DESIGN-sessions-as-subagents-2026-10-15.md` §5.1). Its reads are
-/// [`FleetScope::Content`]'s, which is the scope the listener proves; it
-/// also serves [`FleetOp::Drive`], to the nodes `[fleet] drive_from` names
-/// alone. No scope on the wire: a level only this Mac's person sets.
+/// Config value `[fleet] allow = "drive"` enabling [`FleetOp::Drive`] alongside [`FleetScope::Content`].
 pub const DRIVE_LEVEL: &str = "drive";
 
-/// The most of a [`FleetOp::Survey`] reply a peer reads: the reader refuses
-/// more (`fleet_member::survey_all`), so a listener's survey answers its
-/// fleet within it, its least pressing sessions' excerpts cut first.
+/// Maximum byte length of a [`FleetOp::Survey`] reply.
 pub const REPLY_MAX: usize = 256 * 1024;
 
-/// What a dialer asks of a fleet listener.
+/// Operation requested and proved by a fleet dialer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FleetOp {
-    /// Read the listener's survey.
+    /// Read the listener's session survey.
     Survey,
-    /// Read the fleet's issuer's book of peers
-    /// (`crate::fleet_member::serve_book`), so a member's read reaches every
-    /// member, not only its issuer and the peers named on it by hand. Served
-    /// at every level — the book is facts: node ids, host names, addresses,
-    /// ports, versions — and proved with the client key, as a survey is. An
-    /// older listener answers it `NO op` ([`FleetError::UnknownOp`]), and the
-    /// member reads the peers it knows, as it did before.
+    /// Read the issuer's peer book.
     Book,
-    /// Register with the fleet's issuer (`aterm fleet join`). Proved with the
-    /// join key, so a read's proof is never a registration's.
+    /// Register with the fleet issuer (`aterm fleet join`), proved with the join key.
     Join,
-    /// Drive the listener's sessions: the step-in
-    /// (`docs/DESIGN-sessions-as-subagents-2026-10-15.md` §5.1). Proved with
-    /// the client key, as a read is; what makes it more than a read is the
-    /// listener's: it serves the op only where its person allows driving
-    /// (`[fleet] allow = "drive"`), and admits a connection only from a node
-    /// it binds a key to and names on its drive list
-    /// (`crate::fleet_member::proven_peer`). Elsewhere, and at an older
-    /// listener, it is `NO op` ([`FleetError::UnknownOp`]).
+    /// Drive sessions on a listener configured with `[fleet] allow = "drive"`.
     Drive,
 }
 
 impl FleetOp {
-    /// The op's word on the wire.
+    /// Wire word for this operation.
     #[inline]
     #[must_use]
     pub const fn word(self) -> &'static str {
@@ -284,7 +163,7 @@ impl FleetOp {
         }
     }
 
-    /// The op a wire word names, if this aterm knows it.
+    /// Parse a wire word into a [`FleetOp`].
     #[inline]
     #[must_use]
     pub fn from_word(word: &str) -> Option<Self> {
@@ -294,8 +173,7 @@ impl FleetOp {
     }
 }
 
-/// A fleet secret, held as the three role keys derived from it (the module
-/// doc's table). The secret itself is not kept, and no key is ever printed.
+/// Fleet secret expanded into its three HKDF-SHA256 role keys (`Ks`, `Kc`, `Kj`).
 #[derive(Clone)]
 pub struct FleetSecret {
     /// `Ks`: the listener's proof.
@@ -307,15 +185,12 @@ pub struct FleetSecret {
 }
 
 impl FleetSecret {
-    /// The shortest secret accepted: 160 bits, what a join code carries.
+    /// Minimum accepted secret length in bytes (160 bits).
     pub const MIN_LEN: usize = 20;
-    /// The longest secret accepted: 32 bytes, the length of the HKDF-SHA256
-    /// pseudorandom key every role key is expanded from, so a longer secret
-    /// would hold no more than that.
+    /// Maximum accepted secret length in bytes (256 bits).
     pub const MAX_LEN: usize = 32;
 
-    /// Derive the role keys from `secret`.
-    ///
+    /// Derive the three role keys from `secret` (`20..=32` bytes).
     /// # Errors
     /// [`SecretLength`] when `secret` is shorter than [`Self::MIN_LEN`] or
     /// longer than [`Self::MAX_LEN`].
@@ -360,8 +235,7 @@ impl fmt::Debug for FleetSecret {
     }
 }
 
-/// A fleet secret of a length [`FleetSecret::new`] refuses. Carries the
-/// length, never a byte.
+/// Error returned when a secret's byte length is outside `FleetSecret::MIN_LEN..=MAX_LEN`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SecretLength(pub usize);
 
@@ -379,31 +253,28 @@ impl fmt::Display for SecretLength {
 
 impl std::error::Error for SecretLength {}
 
-/// A node's public key: Ed25519, 32 bytes — what the issuer's book binds a
-/// node id to at its first registration (`fleet_member`), and what a peer
-/// proves it holds the private half of ([`NodeProof`]). Not a secret; never
-/// an identity by itself.
+/// A node's 32-byte Ed25519 public key.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct NodeKey([u8; NodeKey::LEN]);
 
 impl NodeKey {
-    /// A public key's length.
+    /// Public key byte length.
     pub const LEN: usize = 32;
 
-    /// The key's bytes.
+    /// Raw 32-byte public key.
     #[inline]
     #[must_use]
     pub const fn bytes(&self) -> &[u8; Self::LEN] {
         &self.0
     }
 
-    /// The key in its one spelling: 64 lowercase hex digits.
+    /// Encode as 64 lowercase hex digits.
     #[must_use]
     pub fn hex(&self) -> String {
         hex::encode_lower(&self.0)
     }
 
-    /// The key `word` spells: 64 lowercase hex digits, nothing else.
+    /// Parse from 64 lowercase hex digits.
     #[must_use]
     pub fn from_hex(word: &str) -> Option<Self> {
         if !hex::is_lower(word, 2 * Self::LEN) {
@@ -412,7 +283,7 @@ impl NodeKey {
         crate::hex_decode(word)?.try_into().ok().map(Self)
     }
 
-    /// Its first eight digits, as a row shows a key.
+    /// First 8 lowercase hex digits for compact display.
     #[must_use]
     pub fn short(&self) -> String {
         hex::encode_lower(&self.0[..4])
@@ -425,34 +296,23 @@ impl fmt::Debug for NodeKey {
     }
 }
 
-/// ONE DRIVE GRANT, as `[fleet] drive_from` holds it (the step-in,
-/// `docs/DESIGN-sessions-as-subagents-2026-10-15.md` §5.1): a node, and the
-/// key this machine's book bound it to when its person let it drive, spelt
-/// `<node id>:<key hex>`. A node id is a label anyone may name beside a key
-/// of their own ([`NodeProof`]), and a book's binding of it can change — a
-/// `peers rm` on the issuer, and a join again under that id with another
-/// key — so the grant holds the key the person approved: a Mac that comes
-/// back under another key drives nothing until its person here grants it
-/// again. It lives here, beside [`NodeKey`], and not in the Unix-only
-/// `fleet_member`: every platform reads its `[fleet]` table, even one that
-/// serves no fleet port.
+/// A `[fleet] drive_from` grant binding a node id to the [`NodeKey`] approved to drive this host.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DriveGrant {
-    /// The node id.
+    /// Granted 32-hex-digit node id.
     pub node: String,
-    /// The key it was bound to when the grant was made.
+    /// Public key bound to `node` when the grant was recorded.
     pub key: NodeKey,
 }
 
 impl DriveGrant {
-    /// Its one spelling: `<node id>:<key hex>`.
+    /// Format as `<node id>:<key hex>`.
     #[must_use]
     pub fn word(&self) -> String {
         format!("{}:{}", self.node, self.key.hex())
     }
 
-    /// The grant `word` spells, or `None`: a bare node id names no key, so
-    /// it grants nothing.
+    /// Parse `<node id>:<key hex>`, returning `None` if either half is missing or invalid.
     #[must_use]
     pub fn from_word(word: &str) -> Option<Self> {
         let (node, key) = word.trim().split_once(':')?;
@@ -466,8 +326,7 @@ impl DriveGrant {
         })
     }
 
-    /// The node a `drive_from` word names, granted or not (its text before
-    /// any `:`, in lowercase): what a `peers rm` of that node takes out.
+    /// Lowercase node id prefix (before `:`) of a `drive_from` entry.
     #[must_use]
     pub fn node_of(word: &str) -> String {
         let word = word.trim();
@@ -477,10 +336,7 @@ impl DriveGrant {
     }
 }
 
-/// THIS machine's node: its node id (`fleet_member::NODE_FILE`) and its
-/// Ed25519 key pair, from the seed `fleet_member::NODE_KEY_FILE` holds. The
-/// private half never leaves it: it only signs an end's node proof on a
-/// channel ([`client_handshake_as`], [`Listening::node`]).
+/// Local node id and Ed25519 key pair used to sign [`ALPN_NODES`] channel proofs.
 #[derive(Clone)]
 pub struct NodeIdentity {
     node: String,
@@ -489,9 +345,7 @@ pub struct NodeIdentity {
 }
 
 impl NodeIdentity {
-    /// The node `node` (32 lowercase hex digits) with the key pair `seed`
-    /// gives: `None` for a node id that is none, or a seed that is not 32
-    /// bytes.
+    /// Construct from a 32-lowercase-hex-digit `node` id and 32-byte Ed25519 `seed`.
     #[must_use]
     pub fn from_seed(node: &str, seed: &[u8]) -> Option<Self> {
         if !hex::is_lower(node, 32) {
@@ -506,14 +360,14 @@ impl NodeIdentity {
         })
     }
 
-    /// Its node id.
+    /// This machine's 32-hex-digit node id.
     #[inline]
     #[must_use]
     pub fn node(&self) -> &str {
         &self.node
     }
 
-    /// Its public key.
+    /// This machine's Ed25519 public key.
     #[inline]
     #[must_use]
     pub const fn key(&self) -> NodeKey {
@@ -536,22 +390,16 @@ impl fmt::Debug for NodeIdentity {
     }
 }
 
-/// What a peer PROVED of its node on one connection: the node id it named
-/// and the key it showed it holds the private half of, by a signature over
-/// this channel's exporter (the module doc's **Nodes**). That it holds the
-/// key is proved; that the key is that node's is the book's to say
-/// (`fleet_member::Keyring::proven`): anyone may mint a key and name any
-/// node id beside it.
+/// Verified possession proof of a peer's claimed `node` id and Ed25519 `key` on one connection.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NodeProof {
-    /// The node id it named.
+    /// Claimed 32-hex-digit node id.
     pub node: String,
-    /// The key it proved it holds.
+    /// Public key whose private half signed the connection's exporter.
     pub key: NodeKey,
 }
 
 /// Which end makes a node proof: each signs under its own label, so one
-/// end's proof is never the other's.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Signer {
     Dialer,
@@ -569,9 +417,6 @@ impl Signer {
 }
 
 /// What `end`'s node key signs on the channel whose exporter is `exporter`:
-/// its label, a zero byte, the exporter and the node id. The label holds no
-/// zero byte and the exporter and node id have fixed lengths, so no two
-/// messages are one.
 fn node_message(end: Signer, exporter: &[u8], node: &str) -> Vec<u8> {
     let mut message = end.label().to_vec();
     message.push(0);
@@ -581,7 +426,6 @@ fn node_message(end: Signer, exporter: &[u8], node: &str) -> Vec<u8> {
 }
 
 /// `end`'s node line on this channel: `me`'s proof, or `node -` for an end
-/// that holds no node key.
 fn node_line(me: Option<&NodeIdentity>, end: Signer, exporter: &[u8]) -> String {
     match me {
         Some(me) => format!(
@@ -595,8 +439,6 @@ fn node_line(me: Option<&NodeIdentity>, end: Signer, exporter: &[u8]) -> String 
 }
 
 /// Read `end`'s node line on this channel and check its signature: the
-/// proof, or `None` for `node -`.
-///
 /// # Errors
 /// [`FleetError::NodeProof`] for a signature that does not verify,
 /// [`FleetError::Malformed`] for a line that is no node line, or the read's
@@ -636,58 +478,36 @@ fn read_node_proof<S: Read>(
     }))
 }
 
-/// Why a fleet handshake did not end in an authenticated stream. Each variant
-/// says which end saw it; none carries a secret or a tag.
+/// Failure during a fleet TLS or HMAC/node handshake.
 #[derive(Debug)]
 pub enum FleetError {
-    /// The dialer found the listener's proof wrong: the listener holds another
-    /// fleet's secret, or a man in the middle runs this connection. The dialer
-    /// sent nothing.
+    /// Listener's proof did not verify under this fleet's secret; dialer sent nothing.
     ListenerWrongSecret,
-    /// The listener found the dialer's proof wrong: the dialer holds another
-    /// fleet's secret. The listener answered `NO proof`.
+    /// Dialer's proof did not verify under this fleet's secret (`NO proof`).
     DialerWrongSecret,
-    /// The listener's view of a dialer that hung up on its proof without a
-    /// byte: what an honest dialer of another fleet does
-    /// ([`ListenerWrongSecret`](Self::ListenerWrongSecret) on its side), and
-    /// any client that is not a fleet dialer.
+    /// Dialer closed before sending its proof.
     DialerHungUp,
-    /// The dialer's view of a listener that answered its proof `NO proof`.
+    /// Listener answered `NO proof`.
     Refused,
-    /// The dialer proved itself, and its address already held as many proved
-    /// connections as the listener serves one address at once
-    /// ([`Listening::per_source`]): `NO capacity`, seen from either end.
+    /// Source address already holds its share of proved connections (`NO capacity`).
     AddressBusy,
-    /// A peer presented a tag of this end's own role: the listener's own proof
-    /// sent back to it as a dialer's, or a "listener" proving with a dialer's
-    /// key. The role keys refuse it; it is named apart so a log says what
-    /// happened.
+    /// Peer presented a proof signed with this end's own role key.
     Reflection,
-    /// The listener does not serve the op the dialer proved: one end is an
-    /// older aterm (a `join` at an aterm from before members registered), or
-    /// the listener takes no such op.
+    /// Listener does not serve the requested operation (`NO op`).
     UnknownOp(String),
-    /// The listener proved a scope the dialer does not know: the dialer is an
-    /// older aterm.
+    /// Listener proved a scope word this version does not recognise.
     UnknownScope(String),
-    /// A node proof did not verify (the module doc's **Nodes**): the peer's
-    /// signature is not its key's over this channel — a broken or forged
-    /// aterm, since an honest one signs what it sends. The listener answers
-    /// `NO node`; the dialer's view of that answer is this too.
+    /// Peer's Ed25519 node signature failed verification (`NO node`).
     NodeProof,
-    /// The peer negotiated neither ALPN `atf/2` nor `atf/1`. On the dialer: a pre-fleet
-    /// aterm listener (its own `[net]` certificate and no ALPN), or not an
-    /// aterm — a caller says "pre-fleet aterm listener (update it)". On the
-    /// listener: a dialer that is no fleet client.
+    /// Peer negotiated neither `atf/2` nor `atf/1`.
     Alpn,
-    /// A handshake line the protocol does not allow.
+    /// Protocol line violated framing or syntax rules.
     Malformed(&'static str),
-    /// The TLS handshake failed for a reason other than ALPN.
+    /// TLS handshake failed for a reason other than ALPN.
     Tls(io::Error),
-    /// The handshake did not finish within its deadline.
+    /// Handshake exceeded its deadline.
     Timeout(Duration),
-    /// The connection failed: a read or write error, or the peer closing
-    /// mid-handshake.
+    /// Underlying socket I/O error or unexpected EOF.
     Io(io::Error),
 }
 
@@ -755,25 +575,18 @@ impl std::error::Error for FleetError {
     }
 }
 
-/// The listener's TLS configuration: [`CERT_DER`], TLS 1.3 only, ALPN
-/// [`ALPN_NODES`] preferred, else [`ALPN`], no session tickets, no session
-/// cache, no early data. Built once.
+/// Listener TLS 1.3 [`ServerConfig`] using [`CERT_DER`], [`ALPN_NODES`]/[`ALPN`], and no resumption or early data.
 #[must_use]
 pub fn server_config() -> Arc<ServerConfig> {
     static CONFIG: OnceLock<Arc<ServerConfig>> = OnceLock::new();
     Arc::clone(CONFIG.get_or_init(|| {
         tls::init_crypto();
         let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(KEY_DER));
-        // TLS 1.3 only: its exporter is bound to the whole handshake
-        // transcript, which a TLS 1.2 session without extended master secret
-        // (RFC 7627) is not.
         let mut cfg = ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
             .with_no_client_auth()
             .with_single_cert(vec![CertificateDer::from(CERT_DER)], key)
             .expect("the embedded fleet certificate and key are one Ed25519 pair");
         cfg.alpn_protocols = PROTOCOLS.iter().map(|alpn| alpn.to_vec()).collect();
-        // No resumption and no 0-RTT: every connection is a full handshake
-        // with a fresh key exchange, and no byte is accepted before it ends.
         cfg.send_tls13_tickets = 0;
         cfg.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
         cfg.max_early_data_size = 0;
@@ -781,10 +594,7 @@ pub fn server_config() -> Arc<ServerConfig> {
     }))
 }
 
-/// The dialer's TLS configuration: TLS 1.3 only, ALPN [`ALPN_NODES`] offered
-/// before [`ALPN`], exactly [`CERT_DER`] accepted (by its fingerprint) with
-/// the handshake signature still verified, no resumption, no early data.
-/// Built once.
+/// Dialer TLS 1.3 [`ClientConfig`] pinning [`CERT_DER`] and offering [`ALPN_NODES`] before [`ALPN`].
 #[must_use]
 pub fn client_config() -> Arc<ClientConfig> {
     static CONFIG: OnceLock<Arc<ClientConfig>> = OnceLock::new();
@@ -802,13 +612,7 @@ pub fn client_config() -> Arc<ClientConfig> {
     }))
 }
 
-/// Listener side: complete TLS on an accepted `tcp`, prove this machine holds
-/// `secret` and serves `scope`, then verify the dialer's proof and answer it —
-/// `OK` for an op in `serves`, `NO op` for any other — all within `within`, a
-/// wall-clock deadline a peer that dribbles bytes cannot stretch. Returns the
-/// authenticated transport, its socket deadlines cleared, and the op the
-/// dialer proved. This end proves no node ([`server_handshake_as`] does).
-///
+/// Listener handshake without local node identity (delegates to [`server_handshake_as`]).
 /// # Errors
 /// A [`FleetError`] naming what failed; the connection is then the caller's to
 /// drop, and nothing past the handshake was read from it.
@@ -823,22 +627,17 @@ pub fn server_handshake(
         .map(|accepted| (accepted.transport, accepted.op))
 }
 
-/// A listener's end of a proved connection ([`server_handshake_as`]).
+/// Listener result from [`server_handshake_as`].
 pub struct Accepted {
-    /// The authenticated transport, its socket deadlines cleared.
+    /// Authenticated TLS transport with socket deadlines cleared.
     pub transport: TlsTransport<ServerConnection>,
-    /// The op the dialer proved.
+    /// Operation proved by the dialer.
     pub op: FleetOp,
-    /// The node the dialer proved it holds the key of, when both ends speak
-    /// [`ALPN_NODES`] and it holds one.
+    /// Node proof presented by the dialer under [`ALPN_NODES`], if any.
     pub peer: Option<NodeProof>,
 }
 
-/// [`server_handshake`] proving this machine's node `me` too, under
-/// [`ALPN_NODES`] (the module doc's **Nodes**): the dialer's node proof is
-/// checked before `OK` (`NO node` for one that does not verify), and `me`'s
-/// is sent after it.
-///
+/// Complete the listener TLS and fleet handshake on `tcp` within `within`, proving `scope` and optional node `me`.
 /// # Errors
 /// As [`server_handshake`]; [`FleetError::NodeProof`] for a dialer's node
 /// proof that does not verify.
@@ -855,10 +654,6 @@ pub fn server_handshake_as(
 }
 
 /// [`server_handshake_as`] on a connection [`arm`] armed with `within`:
-/// [`serve`]'s accept loop arms it, so the connection's slot holds the
-/// watchdog's evictor from the moment it is taken. `admit` is asked, with the
-/// op, once the dialer's proof verified, before `OK`: `false` answers `NO
-/// capacity` ([`FleetError::AddressBusy`]).
 fn server_handshake_armed(
     tcp: TcpStream,
     watchdog: HandshakeWatchdog,
@@ -890,12 +685,7 @@ fn server_handshake_armed(
     })
 }
 
-/// Dialer side: complete TLS on a connected `tcp`, verify the listener's proof
-/// before sending anything, then prove `op` and read the listener's answer —
-/// all within `within`, as [`server_handshake`]. Returns the authenticated
-/// transport, its socket deadlines cleared, and the scope the listener proved.
-/// This end proves no node ([`client_handshake_as`] does).
-///
+/// Dialer handshake without local node identity (delegates to [`client_handshake_as`]).
 /// # Errors
 /// A [`FleetError`] naming what failed. On
 /// [`ListenerWrongSecret`](FleetError::ListenerWrongSecret),
@@ -911,21 +701,17 @@ pub fn client_handshake(
         .map(|dialed| (dialed.transport, dialed.scope))
 }
 
-/// A dialer's end of a proved connection ([`client_handshake_as`]).
+/// Dialer result from [`client_handshake_as`].
 pub struct Dialed {
-    /// The authenticated transport, its socket deadlines cleared.
+    /// Authenticated TLS transport with socket deadlines cleared.
     pub transport: TlsTransport<ClientConnection>,
-    /// The scope the listener proved.
+    /// Scope proved by the listener.
     pub scope: FleetScope,
-    /// The node the listener proved it holds the key of, when both ends
-    /// speak [`ALPN_NODES`] and it holds one.
+    /// Node proof presented by the listener under [`ALPN_NODES`], if any.
     pub peer: Option<NodeProof>,
 }
 
-/// [`client_handshake`] proving this machine's node `me` too, under
-/// [`ALPN_NODES`] (the module doc's **Nodes**): `me`'s node proof goes with
-/// the op's, and the listener's is read and checked after its `OK`.
-///
+/// Complete the dialer TLS and fleet handshake on `tcp` within `within`, verifying the listener before proving `op` and `me`.
 /// # Errors
 /// As [`client_handshake`]; [`FleetError::NodeProof`] for a listener's node
 /// proof that does not verify, or a listener that refused this end's.
@@ -952,72 +738,31 @@ pub fn client_handshake_as(
     })
 }
 
-/// How long an accepted fleet connection has for TLS and both proofs: the
-/// one deadline a fleet read gets per host (design §5), so a peer that dials
-/// and sends nothing holds a slot no longer than a reader waits for it.
+/// Wall-clock deadline (3 s) for TLS and both proofs on an accepted fleet connection.
 pub const HANDSHAKE_WITHIN: Duration = Duration::from_secs(3);
 
-/// How long [`serve`] serves a proved connection before it cuts it: ten times
-/// the whole read a fleet member makes of one host ([`HANDSHAKE_WITHIN`], its
-/// one wall-clock deadline), so no reader is cut, while a member that slept or
-/// fell off the network mid-read (no FIN, no RST ever arrives) or hung gives
-/// its slot back. A survey is one request on one connection.
+/// Maximum lifetime (30 s) [`serve`] allows a proved connection before cutting it.
 pub const SERVED_WITHIN: Duration = Duration::from_secs(30);
 
-/// The most connections a fleet listener should hold at once, handshaking or
-/// handed over ([`Listening::slots`]): a fleet of thirty reads a machine one
-/// connection per reader, each for well under a second. Its owner may hold
-/// fewer: aterm-gui takes the slots from the descriptor limit too, since each
-/// connection costs it several descriptors.
+/// Default maximum concurrent connections (handshaking or proved) on a fleet listener.
 pub const MAX_SLOTS: usize = 16;
 
-/// The most PROVED connections one address ([`serve`]'s: an IPv4 address or
-/// an IPv6 /64) holds at once on a listener of `slots` slots: a quarter of
-/// them, at least one ([`Listening::per_source`]). A proved connection's slot
-/// is never given up, and every member holds the one secret, so without a
-/// share one member's connections — renewed at each [`SERVED_WITHIN`] cut —
-/// would hold every slot and turn every other member away. A machine's own
-/// readers (`survey --fleet` in several sessions at once) open one each, for
-/// well under a second.
+/// Maximum concurrent proved read/join connections allowed from one source (`max(1, slots / 4)`).
 #[must_use]
 pub const fn per_source(slots: usize) -> usize {
     if slots < 4 { 1 } else { slots / 4 }
 }
 
-/// The most proved [`FleetOp::Drive`] connections one address holds at once
-/// on a listener of `slots` slots, counted apart from its reads' share
-/// ([`per_source`]): half the slots, at least one. A drive connection is held
-/// for as long as its request waits — an `await task` leg up to 20 s, a
-/// `turn` up to 22 s — where a read takes well under a second, so a Mac that
-/// runs two waits and a turn on another one at once is served, and its reads
-/// of that Mac's survey keep their own share. Only the nodes a person named
-/// are served past the handshake (the listener's owner refuses every other
-/// one at once), and the other half of the slots stays for every other
-/// address.
+/// Maximum concurrent proved [`FleetOp::Drive`] connections allowed from one source (`max(1, slots / 2)`).
 #[must_use]
 pub const fn drive_per_source(slots: usize) -> usize {
     if slots < 2 { 1 } else { slots / 2 }
 }
 
 /// How long a connection that has proved nothing keeps its slot against a
-/// newcomer from an address holding no more unproved connections than its own
-/// ([`serve`]'s rule 2, the slots' grace for the fleet's deadline). A fleet is
-/// a LAN: its round trips take milliseconds, and the slot is taken after the
-/// TCP handshake, so the stack has measured the path and a lost segment costs
-/// a retransmission timeout of a few hundred milliseconds, not the one-second
-/// initial one. TLS and both proofs, two
-/// round trips at the listener, fit in it with room for that; a third of
-/// [`HANDSHAKE_WITHIN`], which idle sockets would otherwise be renewed against.
 pub(crate) const PREAUTH_GRACE: Duration = Duration::from_secs(1);
 
-/// Whether a fleet listener serves a connection from `ip`: loopback, a private
-/// network (RFC 1918's three IPv4 blocks, IPv6 unique local `fc00::/7`) or
-/// link-local (`169.254.0.0/16`, `fe80::/10`) — the LAN a fleet is, never the
-/// internet past it. The IPv4 peer of a dual-stack listener
-/// (`::ffff:a.b.c.d`) is judged as that IPv4 address.
-///
-/// It is a fence, not an identity: a router forwarding the port from outside
-/// presents its own private address, and the proof is what admits a peer.
+/// Return `true` if `ip` (after canonicalising IPv4-mapped IPv6) is loopback, private, or link-local.
 #[must_use]
 pub fn is_fleet_source(ip: IpAddr) -> bool {
     match ip.to_canonical() {
@@ -1029,39 +774,36 @@ pub fn is_fleet_source(ip: IpAddr) -> bool {
     }
 }
 
-/// Why [`serve`] turned away a connection from outside [`is_fleet_source`].
+/// Refusal reason when a peer IP fails [`is_fleet_source`].
 pub const NOT_A_FLEET_SOURCE: &str = "not a loopback, private or link-local address";
 
-/// Why [`serve`] turned away a connection while every slot was held.
+/// Refusal reason when all listener slots are occupied by non-displaceable connections.
 pub const AT_CAPACITY: &str = "the fleet listener is at capacity";
 
-/// The key file's name in the state directory (the module doc).
+/// Filename of the fleet secret in the state directory.
 pub const KEY_FILE: &str = "fleet.key";
 
 /// The longest key file: the longest secret's 64 digits and a final LF.
 #[cfg(unix)]
 const KEY_FILE_MAX: usize = 2 * FleetSecret::MAX_LEN + 1;
 
-/// Why this machine's [`KEY_FILE`] gives no fleet secret. None carries a byte
-/// of the file.
+/// Error reading or validating [`KEY_FILE`].
 #[derive(Debug)]
 pub enum KeyFileError {
-    /// There is no key file (or no state directory): this machine is in no
-    /// fleet.
+    /// Key file or state directory does not exist.
     Missing,
-    /// The file or its directory is another user's, or another user could
-    /// reach it (a group or other mode bit, a second link to the file).
+    /// File or directory permissions, owner, or hard-link count are not private.
     NotPrivate(&'static str),
-    /// The file or its directory is a symbolic link.
+    /// File or directory is a symlink.
     Symlink,
-    /// The file holds no secret in the one spelling, or is no regular file.
+    /// File is not a regular file containing 40–64 lowercase hex digits.
     Malformed(&'static str),
-    /// The file could not be read.
+    /// Underlying I/O error.
     Io(io::Error),
 }
 
 impl KeyFileError {
-    /// The one word a status line says it with.
+    /// Short status token (`"no-key"`, `"key-mode"`, `"key-link"`, `"key-format"`, or `"key-unreadable"`).
     #[must_use]
     pub const fn word(&self) -> &'static str {
         match self {
@@ -1088,9 +830,7 @@ impl fmt::Display for KeyFileError {
 
 impl std::error::Error for KeyFileError {}
 
-/// The fleet secret a key file's bytes spell (the module doc): 40 to 64
-/// lowercase hex digits, a final LF optional, nothing else.
-///
+/// Parse a [`FleetSecret`] from 40–64 lowercase hex digits (with optional trailing LF).
 /// # Errors
 /// [`KeyFileError::Malformed`] for any other text.
 pub fn parse_key_file(text: &[u8]) -> Result<FleetSecret, KeyFileError> {
@@ -1114,12 +854,7 @@ pub fn parse_key_file(text: &[u8]) -> Result<FleetSecret, KeyFileError> {
     FleetSecret::new(&bytes).map_err(|_| KeyFileError::Malformed("not 20 to 32 bytes"))
 }
 
-/// This machine's fleet secret, read from [`KEY_FILE`] in `state_dir` under
-/// the module doc's rules: the directory and the file are this user's and
-/// nobody else's, neither is a symlink, and the file is one link to a regular
-/// file holding the secret in its one spelling. Read without following a
-/// link and without waiting on a FIFO.
-///
+/// Read and validate [`KEY_FILE`] from `state_dir`, enforcing private ownership and permissions.
 /// # Errors
 /// A [`KeyFileError`] naming the first rule the file or directory breaks.
 #[cfg(unix)]
@@ -1146,149 +881,88 @@ impl From<crate::fleet_member::PrivateFileError> for KeyFileError {
     }
 }
 
-/// What [`serve`] saw, for its owner's audit trail. Every connection event
-/// names the peer's address; none carries a secret or a tag.
+/// Audit event emitted by [`serve`].
 #[derive(Debug)]
 pub enum FleetEvent {
-    /// A dialer proved `op`: its stream is handed over now.
+    /// A dialer proved `op` and was handed over.
     Admitted {
-        /// The dialer's address.
+        /// Dialer socket address.
         peer: SocketAddr,
-        /// The op it proved.
+        /// Operation proved by the dialer.
         op: FleetOp,
     },
-    /// An admitted connection ended: `error` is `None` for an ordinary close.
+    /// An admitted connection finished (`error` is `None` on clean completion).
     Closed {
-        /// The dialer's address.
+        /// Dialer socket address.
         peer: SocketAddr,
-        /// Why the hand-over failed, when it did.
+        /// Hand-over error string, if any.
         error: Option<String>,
     },
-    /// A connection was turned away before anything was handed over.
+    /// Connection was rejected before hand-over.
     Refused {
-        /// The dialer's address.
+        /// Dialer socket address.
         peer: SocketAddr,
-        /// Why: [`NOT_A_FLEET_SOURCE`], [`AT_CAPACITY`], or the handshake's
-        /// [`FleetError`].
+        /// Refusal reason ([`NOT_A_FLEET_SOURCE`], [`AT_CAPACITY`], or [`FleetError`]).
         reason: String,
     },
-    /// The listener could not serve and stopped before its flag was cleared.
+    /// Listener stopped due to a fatal setup error before `running` was cleared.
     Stopped(String),
 }
 
-/// What one fleet listener serves ([`serve`]).
+/// Configuration for [`serve`].
 #[derive(Clone, Debug)]
 pub struct Listening {
-    /// The fleet's secret.
+    /// Fleet secret.
     pub secret: FleetSecret,
-    /// The level this listener proves and serves (`[fleet] allow`).
+    /// Scope proved and served by this listener.
     pub scope: FleetScope,
-    /// This machine's node, which the listener proves to every dialer that
-    /// speaks [`ALPN_NODES`]; `None` proves none (`node -`), and a reader
-    /// whose book binds this machine a key then reads it as no one.
+    /// Optional node identity proved under [`ALPN_NODES`].
     pub node: Option<NodeIdentity>,
-    /// The ops it serves; a dialer proving another is answered `NO op`.
+    /// Allowed operations (`NO op` is returned for others).
     pub serves: &'static [FleetOp],
-    /// The most connections in flight at once, handshaking or handed over.
+    /// Maximum total concurrent connections (handshaking or proved).
     pub slots: usize,
-    /// The most proved connections one address holds at once ([`per_source`]
-    /// of the slots): a dialer past it is answered `NO capacity`.
+    /// Maximum concurrent proved read/join connections per source ([`per_source`]).
     pub per_source: usize,
-    /// The longest a proved connection is served before it is cut
-    /// ([`SERVED_WITHIN`]).
+    /// Maximum duration a proved connection is served before being cut ([`SERVED_WITHIN`]).
     pub lifetime: Duration,
 }
 
 /// A served connection's hold on its listener ([`Served`]): its slot
-/// ([`Listening::slots`]) and its address's share of proved connections
-/// ([`Listening::per_source`]). Dropping it frees both.
 struct Release {
-    // Dropped in this order: the slot a newcomer's accept waits for first.
     _slot: crate::slots::SlotTenure,
     tenure: LiveTenure,
 }
 
-/// A proved connection as [`serve`] hands it over: its stream, and its hold
-/// on the listener — its slot ([`Listening::slots`]) and its address's share
-/// of proved connections ([`Listening::per_source`]).
-///
-/// It ends one of two ways, and each frees the hold BEFORE the peer hears
-/// the end, once nothing more of the connection waits on the peer:
-/// [`Served::relay_answers`] relays it to a local end that answers (a control
-/// server), [`Served::answer`] answers it here (a join). A peer that has read
-/// its connection's end can then dial again at once from the same address
-/// and be served, never answered `NO capacity` by its own connection still
-/// tearing down; no hand-over can keep the hold through the end. One dropped
-/// without either frees the hold as it drops, before its stream closes.
-///
-/// Nothing after the release waits on either end: a relay hangs its local
-/// end up first, and the peer is sent a `close_notify` only as far as the
-/// socket takes it at once, then the FIN (each a shutdown of each half on its
-/// own, [`aterm_uds::hangup::hang_up`], which wakes a thread writing to a
-/// peer that sent its FIN and reads nothing; a both-ways one would not, on
-/// Darwin). However the peer ends a relayed connection — its FIN, a reset, a
-/// record that does not decrypt — its local end hears an EOF after the line
-/// it is serving and the hold is kept until it has answered that line or
-/// hung up, so the control server's thread serving it counts too. So a
-/// connection whose hold is gone keeps no thread or descriptor on the peer's
-/// account or its local end's, and one member cannot fill the slots with
-/// teardowns: the slots bound the threads and descriptors in flight, and the
-/// share what one address holds of them.
-///
-/// A connection the listener cuts — past [`Listening::lifetime`], or as it
-/// stops or its key changes — hears the cut first: its share goes with the cut,
-/// its slot as its end runs its course (a join's at once, a relay's after at
-/// most the line its local end was serving), so the slots still bound the
-/// threads and descriptors in flight. A connection the handshake refuses never
-/// reaches a hand-over: it hears its `NO <why>` first and is freed as its
-/// thread ends — a wrong secret or op is refused again however soon it dials,
-/// and a peer past its share waits for one of its served connections to end,
-/// which frees the share first.
+/// Proved fleet connection handed to [`serve`]'s callback, releasing its slot and per-source
+/// share before signaling EOF to the peer via [`Served::relay_answers`] or [`Served::answer`].
 pub struct Served {
-    // Dropped first: a `Served` dropped through neither end frees its hold
-    // before its stream closes, so the peer hears that end after the release
-    // too, and the close that follows never blocks.
     release: Release,
     transport: TlsTransport<ServerConnection>,
     peer: Option<NodeProof>,
 }
 
 impl Served {
-    /// The address the peer dialled from.
+    /// Remote socket address of the peer.
     #[must_use]
     pub fn peer_addr(&self) -> Option<SocketAddr> {
         self.transport.tcp().peer_addr().ok()
     }
 
-    /// The node the peer proved it holds the key of on this connection, when
-    /// it proved one: possession, not yet identity — which node that makes
-    /// it is this machine's book's to say
-    /// (`fleet_member::proven_peer`, the one an authorization asks).
+    /// Node possession proof presented by the peer on this connection, if any.
     #[must_use]
     pub const fn peer_node(&self) -> Option<&NodeProof> {
         self.peer.as_ref()
     }
 
-    /// Relay the connection to `local`, an end that answers and then hangs up
-    /// (a control server): [`tls::relay_answers`], whose guard is this
-    /// connection's hold, freed after every answer byte and before the peer
-    /// hears the end.
-    ///
+    /// Relay the connection to `local` via [`tls::relay_answers`], releasing the listener hold before EOF.
     /// # Errors
     /// As [`tls::relay_answers`].
     pub fn relay_answers(self, local: aterm_uds::CtlStream) -> io::Result<()> {
         tls::relay_answers(self.transport, local, self.release)
     }
 
-    /// Answer the connection here: `write` reads the request and writes the
-    /// answer on the stream (set its read timeout first,
-    /// [`tls::Answering::set_read_timeout`]: nothing here waits on its own
-    /// clock), then the answer is flushed, the hold freed, and only then does
-    /// the peer hear the end ([`tls::answer`], whose guard is this
-    /// connection's hold). The stream `write` gets reads and writes and
-    /// cannot end the connection, so no answer can put its end on the wire
-    /// while the hold is held.
-    ///
+    /// Serve a direct response via `write` ([`tls::answer`]), flushing and releasing the listener hold before EOF.
     /// # Errors
     /// `write`'s own, or the flush's.
     pub fn answer<T>(
@@ -1299,56 +973,8 @@ impl Served {
     }
 }
 
-/// Serve a bound `listener` until `running` is cleared: each connection from
-/// an [`is_fleet_source`] address that gets a slot runs [`server_handshake`]
-/// within [`HANDSHAKE_WITHIN`] on a thread of its own, and a proved stream
-/// goes to `hand_over` on that thread as a [`Served`], which holds the slot
-/// and the share until it ends (freeing them before the peer hears the end)
-/// or the hand-over returns; the listener cuts it `lifetime` after the proof.
-/// Every refusal and every admitted connection's start and end go to
-/// `on_event`, a connection's last event only once its slot is free, so the
-/// owner's logging never holds a slot a newcomer waits for; no failure of a
-/// connection stops the listener.
-///
-/// **Who gets a slot when every slot is held**: the NET-1 rule (r13,
-/// 2026-10-10) of the listener's slots, with [`Listening::slots`] and its
-/// `PREAUTH_GRACE` (1 s). A connection that has proved nothing gives its slot
-/// up to a newcomer — at once to one from an address holding at least two
-/// fewer unproved connections than the most crowded address, and after
-/// `PREAUTH_GRACE` to one from an address no heavier than its own — so a LAN
-/// host that holds every slot with idle sockets, renewing each one as its
-/// deadline cuts it, never turns a member from another address away. A proved
-/// connection's slot is never taken (the watchdog's claim decides it once), so
-/// members still fill the listener: past that it refuses. **One address holds
-/// at most [`Listening::per_source`] proved connections**, and apart from
-/// them at most [`drive_per_source`] of the slots' proved drives, which wait
-/// as long as their request does: a dialer whose proof verifies past its
-/// op's share is answered `NO capacity` before `OK`, and its slot freed —
-/// every member holds the secret, so one of them cannot keep the others out
-/// by holding proved connections, renewed at each cut, and a Mac's waits on
-/// another never take its reads' share. (On IPv6 the share is the LAN's /64,
-/// below.)
-///
-/// **On IPv6 a LAN is one address.** An address is an IPv4 address or an IPv6
-/// /64, and every IPv6 host on one segment shares a /64 (`fe80::/64` for
-/// link-local, the LAN's SLAAC or ULA prefix otherwise): an IPv6 attacker and
-/// every IPv6 member there are one address, so rule 1 never separates them and
-/// a member is protected only by rule 2 — after the grace, and behind the
-/// accept backlog, where each connection refused at capacity holds the accept
-/// loop for up to the accept poll (200 ms), long enough for an attacker with
-/// many queued connections to push a member past its 3 s read deadline. A
-/// fleet listens on an IPv4 address (`[fleet] listen = "<IPv4>:<port>"`).
-///
-/// **A proved connection lives at most `lifetime`** from its proof: the
-/// accept loop cuts it then (both halves shut down), so a member that slept
-/// or vanished mid-read, which sends no FIN and no RST, or hung, gives its
-/// slot back.
-///
-/// The listener is put in non-blocking mode and its wait for a connection is
-/// bounded by the accept poll (200 ms), so clearing `running` is seen
-/// promptly, and so is an overdue connection. When `running` is cleared,
-/// every connection still open is cut before this returns: a listener told to
-/// stop serves no one, a stream already handed over included.
+/// Accept and authenticate fleet connections on `listener` until `running` is false,
+/// enforcing NET-1 pre-auth slot displacement, per-source shares, and connection lifetimes.
 pub fn serve<H, E>(
     listener: &TcpListener,
     listening: &Listening,
@@ -1374,7 +1000,6 @@ pub fn serve<H, E>(
             Ok(accepted) => accepted,
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                 // A readiness error backs off like an accept error below, so
-                // neither becomes a busy loop.
                 if wait_listener_readable(listener, ACCEPT_POLL).is_err()
                     && running.load(Ordering::Acquire)
                 {
@@ -1392,10 +1017,8 @@ pub fn serve<H, E>(
                 peer,
                 reason: NOT_A_FLEET_SOURCE.to_owned(),
             });
-            continue; // dropping `tcp` closes it
+            continue;
         }
-        // A free slot, or one a connection that has proved nothing gives up
-        // (the rule above); otherwise refuse rather than spawn unbounded work.
         let source = source_of(peer.ip());
         if !slots.make_room(source) {
             on_event(FleetEvent::Refused {
@@ -1404,8 +1027,6 @@ pub fn serve<H, E>(
             });
             continue;
         }
-        // Armed here, not on the connection's thread, so the slot holds the
-        // connection's evictor from the moment it is taken.
         let armed = tcp
             .try_clone()
             .map_err(FleetError::Io)
@@ -1439,8 +1060,6 @@ pub fn serve<H, E>(
         let spawned = std::thread::Builder::new()
             .name("aterm-fleet-conn".to_owned())
             .spawn(move || {
-                // It frees the connection's slot and share as this thread
-                // ends, however it ends, if the hand-over has not first.
                 let release = release;
                 let event = match server_handshake_armed(
                     tcp,
@@ -1476,10 +1095,6 @@ pub fn serve<H, E>(
                         }
                     }
                     Err(e) => {
-                        // Free first: a displaced connection's slot is what a
-                        // newcomer waits for (`Slots::make_room`, the accept
-                        // poll), and the owner's logging must never sit in
-                        // that wait.
                         drop(release);
                         FleetEvent::Refused {
                             peer,
@@ -1500,8 +1115,6 @@ pub fn serve<H, E>(
 }
 
 /// [`serve`]'s connections in flight, each by a clone of its socket, which is
-/// how the listener cuts one: when it is told to stop, and when a proved one
-/// outlives its lifetime. The slots ([`Slots`]) bound how many there are.
 #[derive(Default)]
 struct LiveConnections {
     fleet_live: Mutex<Vec<Live>>,
@@ -1516,7 +1129,6 @@ struct Live {
     /// When it proved itself, and its lifetime began.
     proved: Option<Instant>,
     /// Whether it proved a drive, counted against its address's drive share
-    /// ([`drive_per_source`]) rather than its reads' ([`per_source`]).
     drive: bool,
 }
 
@@ -1528,7 +1140,6 @@ impl LiveConnections {
     }
 
     /// Hold connection `id`'s `line`, from `source`, until the returned
-    /// tenure drops.
     fn hold(self: &Arc<Self>, id: u64, source: IpAddr, line: TcpStream) -> LiveTenure {
         self.lock().push(Live {
             id,
@@ -1544,10 +1155,6 @@ impl LiveConnections {
     }
 
     /// Cut every proved connection served `lifetime` or longer, both halves,
-    /// each on its own ([`aterm_uds::hangup::hang_up`]): a both-ways
-    /// `shutdown` of a peer that sent its FIN shuts nothing on Darwin, and
-    /// would leave its relay writing to a peer that reads nothing, its slot
-    /// held, once its share was gone with the cut.
     fn cut_overdue(&self, lifetime: Duration) {
         let now = Instant::now();
         self.lock().retain(|live| {
@@ -1562,7 +1169,6 @@ impl LiveConnections {
     }
 
     /// Shut every connection still held down, both halves, each on its own
-    /// (as [`Self::cut_overdue`] does).
     fn cut_all(&self) {
         for live in std::mem::take(&mut *self.lock()) {
             aterm_uds::hangup::hang_up(&live.line);
@@ -1578,10 +1184,6 @@ struct LiveTenure {
 
 impl LiveTenure {
     /// The connection proved itself — a drive where `drive`, else a read:
-    /// `true`, and its lifetime starts now, unless its address already holds
-    /// `most` proved connections of that kind — counted and marked under one
-    /// lock, so two proofs from one address at once never both pass the
-    /// share.
     fn proved(&self, drive: bool, most: usize) -> bool {
         let now = Instant::now();
         let mut held = self.live.lock();
@@ -1619,13 +1221,6 @@ impl Drop for LiveTenure {
 }
 
 /// Arm a handshake's deadline on `tcp`: per-syscall timeouts, which bound an
-/// idle peer, and the [`HandshakeWatchdog`], which force-closes
-/// the socket at `within` against one that dribbles
-/// ([`arm_unauthenticated`]).
-///
-/// The socket is put in blocking mode first: one accepted from a
-/// non-blocking listener ([`serve`]'s) inherits that mode on macOS and the
-/// BSDs, and a non-blocking read never waits for its timeout.
 fn arm(tcp: &TcpStream, within: Duration) -> Result<HandshakeWatchdog, FleetError> {
     if within.is_zero() {
         return Err(FleetError::Timeout(within));
@@ -1635,9 +1230,6 @@ fn arm(tcp: &TcpStream, within: Duration) -> Result<HandshakeWatchdog, FleetErro
 }
 
 /// Run `handshake` on `tcp` under the deadline `watchdog` was armed with
-/// (`within`, [`arm`]). Past it the result is [`FleetError::Timeout`],
-/// whatever error the force-close surfaced as; a connection whose slot
-/// [`serve`] gave a newer one is an [`FleetError::Io`] that says so.
 fn bounded<T>(
     tcp: TcpStream,
     watchdog: HandshakeWatchdog,
@@ -1678,9 +1270,6 @@ where
 }
 
 /// The listener's TLS handshake under `config`, which must name
-/// [`PROTOCOLS`]: the transport, and whether it speaks [`ALPN_NODES`]. A
-/// dialer that offers other protocols (rustls refuses it) or none (rustls
-/// lets it through, so this checks) is [`FleetError::Alpn`].
 fn accept_tls(
     tcp: TcpStream,
     config: Arc<ServerConfig>,
@@ -1710,7 +1299,6 @@ fn accept_tls(
 }
 
 /// Whether a connection that negotiated `alpn` speaks [`ALPN_NODES`]; `None`
-/// when it negotiated no fleet protocol.
 fn speaks_nodes(alpn: Option<&[u8]>) -> Option<bool> {
     match alpn {
         Some(ALPN_NODES) => Some(true),
@@ -1720,15 +1308,6 @@ fn speaks_nodes(alpn: Option<&[u8]>) -> Option<bool> {
 }
 
 /// The dialer's TLS handshake under `config`, which must name
-/// [`PROTOCOLS`]: the transport, and whether it speaks [`ALPN_NODES`].
-///
-/// A listener that negotiates no fleet protocol is [`FleetError::Alpn`]: one
-/// that serves other protocols refuses the handshake with an alert; one that
-/// serves none completes it without ALPN, which this checks; and a pre-fleet
-/// aterm listener — no ALPN and its own `[net]` certificate — fails the
-/// certificate pin first, so a certificate refusal from a listener that chose
-/// no fleet protocol is the same diagnosis. A listener that chose one and
-/// presents another certificate is a TLS failure, said as the pin mismatch.
 fn connect_tls(
     tcp: TcpStream,
     config: Arc<ClientConfig>,
@@ -1766,10 +1345,6 @@ fn connect_tls(
 }
 
 /// The listener's half on a channel whose exporter is `exporter`: prove
-/// `scope` first, then verify the dialer's proof and answer it, `NO op` for an
-/// op not in `serves`. Under [`ALPN_NODES`] (`nodes`) the dialer's node line
-/// is read and checked before the answer (`NO node`), and `me`'s goes after
-/// `OK`. Returns the op the dialer proved, and the node it proved.
 fn listener_proves<S: Read + Write>(
     stream: &mut S,
     exporter: &[u8],
@@ -1791,7 +1366,6 @@ fn listener_proves<S: Read + Write>(
         );
     };
     if !verifies(secret.dialer_key(word), exporter, word, &presented) {
-        // Diagnosis only: the role keys have already refused it.
         let reflected = verifies(&secret.server, exporter, word, &presented);
         return refuse(
             stream,
@@ -1803,8 +1377,6 @@ fn listener_proves<S: Read + Write>(
             },
         );
     }
-    // The dialer holds the secret: only now is its node read, and this
-    // machine's said.
     let peer = if nodes {
         match read_node_proof(stream, Signer::Dialer, exporter) {
             Ok(peer) => peer,
@@ -1831,7 +1403,6 @@ fn listener_proves<S: Read + Write>(
 }
 
 /// Answer the dialer `NO <why>` (best effort: it may be gone) and fail with
-/// `error`.
 fn refuse<S: Write, T>(stream: &mut S, why: &str, error: FleetError) -> Result<T, FleetError> {
     let _ = stream
         .write_all(format!("NO {why}\n").as_bytes())
@@ -1840,10 +1411,6 @@ fn refuse<S: Write, T>(stream: &mut S, why: &str, error: FleetError) -> Result<T
 }
 
 /// The dialer's half on a channel whose exporter is `exporter`: verify the
-/// listener's proof, and only then prove `op` and read the answer. Under
-/// [`ALPN_NODES`] (`nodes`) `me`'s node line goes with the op's, and the
-/// listener's is read and checked after its `OK`. Returns the scope the
-/// listener proved, and the node it proved.
 fn dialer_proves<S: Read + Write>(
     stream: &mut S,
     exporter: &[u8],
@@ -1862,7 +1429,6 @@ fn dialer_proves<S: Read + Write>(
         ));
     };
     if !verifies(&secret.server, exporter, word, &presented) {
-        // Diagnosis only: the role keys have already refused it.
         let reflected = verifies(&secret.client, exporter, word, &presented)
             || verifies(&secret.join, exporter, word, &presented);
         return Err(if reflected {
@@ -1874,7 +1440,6 @@ fn dialer_proves<S: Read + Write>(
     let Some(scope) = FleetScope::from_word(word) else {
         return Err(FleetError::UnknownScope(word.to_owned()));
     };
-    // The listener has proved itself: only now does this end send a byte.
     let word = op.word();
     let mut proof = proof_line(word, &tag(secret.dialer_key(word), exporter, word));
     if nodes {
@@ -1909,24 +1474,12 @@ fn dialer_proves<S: Read + Write>(
     Ok((scope, peer))
 }
 
-// THE KEYS AND TAGS ARE astream-digest's HMAC-SHA256 AND HKDF-SHA256, through
-// aterm-digest: `hkdf_extract` (RFC 5869 §2.2, an empty salt being its string of
-// 32 zeros) and `hkdf_expand_32` (§2.3, the first block alone, all a role key
-// takes) wipe the key blocks they key with, and `hmac_sha256_parts` MACs the
-// concatenation of its parts without joining them. This file kept a private
-// HKDF over the HMAC until astream-digest held the one construction (claim
-// `digest.hmac-one-construction`, with RFC 5869's vectors); the role keys and a
-// tag recorded through that private copy pin the move
-// (`the_role_keys_and_a_tag_are_the_answers_recorded_before_the_hkdf_moved`).
-
 /// The tag a role's `key` makes for `word` on the channel whose exporter is
-/// `exporter`.
 fn tag(key: &[u8; 32], exporter: &[u8], word: &str) -> [u8; TAG_LEN] {
     hmac_sha256_parts(key, &[exporter, word.as_bytes()])
 }
 
 /// Whether `presented` is `key`'s tag for `word` on this channel, compared in
-/// constant time.
 fn verifies(key: &[u8; 32], exporter: &[u8], word: &str, presented: &[u8]) -> bool {
     aterm_digest::ct_eq(&tag(key, exporter, word), presented)
 }
@@ -1940,7 +1493,6 @@ fn is_word(word: &str) -> bool {
 }
 
 /// Split a proof line, `<word> SP <64 lowercase hex digits>`, into its word
-/// and tag.
 fn parse_proof(line: &str) -> Option<(&str, Vec<u8>)> {
     let (word, tag_hex) = line.split_once(' ')?;
     if !is_word(word)
@@ -1975,8 +1527,6 @@ fn send<W: Write>(stream: &mut W, text: &str) -> Result<(), FleetError> {
 }
 
 /// Read one handshake line (its LF consumed, not returned), at most
-/// [`MAX_LINE`] bytes, a byte at a time so nothing past it is taken from the
-/// caller's stream. `Ok(None)`: the peer closed before a byte of it.
 fn read_line<R: Read>(stream: &mut R) -> Result<Option<String>, FleetError> {
     read_line_within(stream, MAX_LINE)
 }
@@ -2004,8 +1554,6 @@ fn read_line_within<R: Read>(stream: &mut R, max: usize) -> Result<Option<String
             }
             Ok(_) => line.push(byte[0]),
             Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-            // A peer gone without a TLS close_notify (or with a reset) before
-            // a byte of the line is the same hang-up as a clean close.
             Err(e)
                 if line.is_empty()
                     && matches!(
@@ -2034,7 +1582,6 @@ mod tests {
     use std::net::TcpListener;
 
     /// A one-minute hang detector on every handshake and every socket read
-    /// here — never a latency budget: a loopback handshake takes milliseconds.
     const HANG: Duration = Duration::from_secs(60);
 
     /// Every op this aterm knows: a listener that serves them all.
@@ -2054,7 +1601,6 @@ mod tests {
     }
 
     /// Run `listen` on a loopback connection's accepted end in a thread and
-    /// `dial` on its connected end here; both results.
     fn over_loopback<A: Send + 'static, B>(
         listen: impl FnOnce(TcpStream) -> A + Send + 'static,
         dial: impl FnOnce(TcpStream) -> B,
@@ -2087,16 +1633,6 @@ mod tests {
     }
 
     /// **THE ROLE KEYS AND A TAG ARE THE ANSWERS RECORDED BEFORE THE HKDF
-    /// MOVED.** The fleet's keys are a wire contract: every member derives the
-    /// same `Ks`, `Kc` and `Kj` from the one secret, so an aterm whose
-    /// derivation changed by a bit proves nothing to an older peer. These hex
-    /// strings were recorded through this file's own private HKDF
-    /// (`hkdf_extract`/`hkdf_expand_32` over aterm-digest's HMAC), just before
-    /// it gave way to astream-digest's, for RFC 5869 case 1's IKM as the
-    /// secret; RFC 5869's own vectors are astream-digest's to hold now.
-    ///
-    /// Negative control: one bit of the secret flipped moves every key and
-    /// the tag, so the agreement is the derivation's, not a constant's.
     #[test]
     fn the_role_keys_and_a_tag_are_the_answers_recorded_before_the_hkdf_moved() {
         let keys = FleetSecret::new(&[0x0b; 22]).unwrap();
@@ -2155,7 +1691,6 @@ mod tests {
                     let (mut t, op) =
                         server_handshake(tcp, &secret(7), scope, EVERY_OP, HANG).unwrap();
                     let alpn = t.stream().conn.alpn_protocol().map(<[u8]>::to_vec);
-                    // The stream is the caller's now: one request, one answer.
                     t.stream().get_ref().set_read_timeout(Some(HANG)).unwrap();
                     let mut request = [0u8; 5];
                     t.stream().read_exact(&mut request).unwrap();
@@ -2196,10 +1731,6 @@ mod tests {
     }
 
     /// EACH END PROVES ITS NODE under atf/2: the listener learns the node the
-    /// dialer holds the key of and the dialer the listener's, and an end that
-    /// holds no node key says so (`node -`), proving none. An older aterm on
-    /// either end speaks atf/1, where no node is proved and the handshake is
-    /// as it was.
     #[test]
     fn each_end_proves_its_node_under_atf2_and_neither_under_atf1() {
         let proof = |me: &NodeIdentity| NodeProof {
@@ -2233,8 +1764,6 @@ mod tests {
             assert_eq!(listened.unwrap(), want_heard);
             assert_eq!(dialed.unwrap(), want_dialed);
         }
-        // An older dialer (it offers atf/1 alone) at a listener that holds a
-        // node: proved as before, and neither end names a node.
         let (listened, dialed) = over_loopback(
             |tcp| {
                 server_handshake_as(
@@ -2261,7 +1790,6 @@ mod tests {
         );
         assert_eq!(listened.unwrap(), (FleetOp::Book, None));
         assert_eq!(dialed.unwrap(), (FleetScope::Facts, None));
-        // An older listener (it serves atf/1 alone): the same.
         let older = listener_tls(CERT_DER, KEY_DER, &[ALPN]);
         let (listened, dialed) = over_loopback(
             move |tcp| {
@@ -2292,11 +1820,6 @@ mod tests {
     }
 
     /// A NODE PROOF IS ITS END'S, ON ITS CHANNEL: a signature over another
-    /// channel's exporter, under another key than the one the line names, or
-    /// the other end's proof sent back is refused — the listener answers
-    /// `NO node` and hands nothing over, the dialer reads nothing past it —
-    /// and a node line that is no node line is malformed. Over a socket pair
-    /// with stand-in exporters, so each case is one scripted line.
     #[test]
     fn a_node_proof_proves_only_its_own_end_on_its_own_channel() {
         const E: &[u8] = &[0xa5; EXPORTER_LEN];
@@ -2304,8 +1827,6 @@ mod tests {
         let keys = secret(7);
         let me = node(3);
         let op_line = proof_line("survey", &tag(&keys.client, E, "survey"));
-        // A node line naming `named`'s node and key, signed by `signer` as
-        // `end` over `exporter`.
         let forged = |named: &NodeIdentity, signer: &NodeIdentity, end: Signer, exporter: &[u8]| {
             format!(
                 "node {} {} {}\n",
@@ -2315,7 +1836,6 @@ mod tests {
             )
         };
 
-        // The listener's side.
         let listener_hears = |line: String| {
             let (mut listener, mut dialer) = CtlStream::pair().unwrap();
             dialer.set_read_timeout(Some(HANG)).unwrap();
@@ -2347,11 +1867,8 @@ mod tests {
         assert!(matches!(heard, Ok((FleetOp::Survey, None))), "{heard:?}");
         assert_eq!(answer.as_deref(), Some("OK"));
         for refused in [
-            // Another connection's proof, replayed on this one.
             forged(&me, &me, Signer::Dialer, OTHER),
-            // The listener's proof sent back as the dialer's.
             forged(&me, &me, Signer::Listener, E),
-            // A key the line names, signed by another.
             forged(&me, &node(4), Signer::Dialer, E),
         ] {
             let (heard, answer) = listener_hears(refused.clone());
@@ -2370,8 +1887,6 @@ mod tests {
             assert_eq!(answer.as_deref(), Some("NO node"));
         }
 
-        // The dialer's side: the scripted listener's hello, then its OK and
-        // node line.
         let dialer_hears = |line: String| {
             let (mut dialer, mut listener) = CtlStream::pair().unwrap();
             listener.set_read_timeout(Some(HANG)).unwrap();
@@ -2425,8 +1940,6 @@ mod tests {
     }
 
     /// An honest dialer of another fleet checks the listener's proof and sends
-    /// nothing; a dialer that skips that check (a hostile or broken one) has
-    /// its own proof refused by the listener.
     #[test]
     fn a_wrong_secret_is_named_by_the_end_that_sees_it() {
         let (listened, dialed) = over_loopback(
@@ -2437,8 +1950,6 @@ mod tests {
             matches!(dialed, Some(FleetError::ListenerWrongSecret)),
             "{dialed:?}"
         );
-        // `DialerHungUp` is a close before a byte of the dialer's line: the
-        // honest dialer sent nothing.
         assert!(
             matches!(listened, Some(FleetError::DialerHungUp)),
             "{listened:?}"
@@ -2463,9 +1974,6 @@ mod tests {
     }
 
     /// THE NEGATIVE CONTROL. A dialer that holds no secret sends the listener
-    /// its own proof back — a genuine tag for this very channel, refused only
-    /// because the roles' keys differ. A "listener" that proves with a
-    /// dialer's key is refused the same way, and an echo gets nothing at all.
     #[test]
     fn a_reflected_proof_is_refused() {
         let (listened, (reflected, exporter, answer)) = over_loopback(
@@ -2487,8 +1995,6 @@ mod tests {
             "{listened:?}"
         );
         assert_eq!(answer.as_deref(), Some("NO proof"));
-        // The control: what came back is the listener's own valid proof on
-        // this channel. One key for both roles would have taken it.
         assert!(verifies(&secret(7).server, &exporter, "facts", &reflected));
         assert!(!verifies(&secret(7).client, &exporter, "facts", &reflected));
 
@@ -2508,9 +2014,6 @@ mod tests {
             "the dialer sent {sent:?} to an unproved listener"
         );
 
-        // An echo listener: the dialer waits for a proof that never comes,
-        // so there is nothing to echo. The deadline here is the outcome under
-        // test, not a budget: this handshake can only end by it.
         let within = Duration::from_millis(500);
         let (echoed, dialed) = over_loopback(
             |tcp| {
@@ -2532,16 +2035,12 @@ mod tests {
     }
 
     /// A tag names its word and its channel: a proof for one op, scope or
-    /// connection is no proof for another. Over a socket pair with stand-in
-    /// exporters, so each case is one scripted line.
     #[test]
     fn a_tag_proves_only_its_own_word_on_its_own_channel() {
         const E: &[u8] = &[0xa5; EXPORTER_LEN];
         const OTHER: &[u8] = &[0x5a; EXPORTER_LEN];
         let keys = secret(7);
 
-        // The listener's side: the scripted dialer's line, the listener's
-        // error and answer.
         let listener_hears = |line: String| {
             let (mut listener, mut dialer) = CtlStream::pair().unwrap();
             dialer.set_read_timeout(Some(HANG)).unwrap();
@@ -2581,22 +2080,14 @@ mod tests {
         assert!(matches!(heard, Ok(FleetOp::Drive)), "{heard:?}");
         assert_eq!(answer.as_deref(), Some("OK"));
         for refused in [
-            // A read's proof sent as a drive, and a drive's as a read: one
-            // key, but a tag names its word.
             proof(&keys.client, E, "survey", "drive"),
             proof(&keys.client, E, "drive", "survey"),
-            // A drive proved with the join key.
             proof(&keys.join, E, "drive", "drive"),
-            // A survey's proof sent as a join, and a join's as a survey.
             proof(&keys.client, E, "survey", "join"),
             proof(&keys.join, E, "join", "survey"),
-            // A survey's proof sent as a book read, and a book read's as a
-            // survey: one key, but a tag names its word.
             proof(&keys.client, E, "survey", "book"),
             proof(&keys.client, E, "book", "survey"),
-            // A join proved with the read key: the op has its own.
             proof(&keys.client, E, "join", "join"),
-            // A proof from another connection, replayed on this one.
             proof(&keys.client, OTHER, "survey", "survey"),
         ] {
             let (heard, answer) = listener_hears(refused.clone());
@@ -2606,7 +2097,6 @@ mod tests {
             );
             assert_eq!(answer.as_deref(), Some("NO proof"));
         }
-        // An op this aterm does not know, proved: told apart from a bad proof.
         let (heard, answer) = listener_hears(proof(&keys.client, E, "steer", "steer"));
         assert!(
             matches!(&heard, Err(FleetError::UnknownOp(op)) if op == "steer"),
@@ -2617,8 +2107,6 @@ mod tests {
         assert!(matches!(heard, Err(FleetError::Malformed(_))), "{heard:?}");
         assert_eq!(answer.as_deref(), Some("NO proof"));
 
-        // The dialer's side: the scripted listener's hello and answer, the
-        // dialer's verdict and what it sent.
         let dialer_hears = |hello: String, answer: &'static str| {
             let (mut dialer, mut listener) = CtlStream::pair().unwrap();
             listener.set_read_timeout(Some(HANG)).unwrap();
@@ -2646,8 +2134,6 @@ mod tests {
             )
         );
         for refused in [
-            // The listener's proof of content claimed as facts, and one from
-            // another connection.
             proof(&keys.server, E, "content", "facts"),
             proof(&keys.server, OTHER, "facts", "facts"),
         ] {
@@ -2661,7 +2147,6 @@ mod tests {
                 "the dialer sent its proof to an unproved listener"
             );
         }
-        // A proved listener's answers: each verdict by its own name.
         let hello = proof(&keys.server, E, "facts", "facts");
         let (heard, _) = dialer_hears(hello.clone(), "NO proof\n");
         assert!(matches!(heard, Err(FleetError::Refused)), "{heard:?}");
@@ -2681,7 +2166,6 @@ mod tests {
     }
 
     /// A listener TLS configuration for a test peer: `cert`/`key`, TLS 1.3,
-    /// offering `alpn`.
     fn listener_tls(cert: &[u8], key: &[u8], alpn: &[&[u8]]) -> Arc<ServerConfig> {
         tls::init_crypto();
         let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.to_vec()));
@@ -2694,7 +2178,6 @@ mod tests {
     }
 
     /// A dialer TLS configuration for a test peer: the fleet's pin, offering
-    /// `alpn`.
     fn dialer_tls(alpn: &[&[u8]]) -> Arc<ClientConfig> {
         let mut cfg = (*client_config()).clone();
         cfg.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
@@ -2702,7 +2185,6 @@ mod tests {
     }
 
     /// A peer's side of a TLS handshake under `conn`, then whatever it sends
-    /// until it closes; the result is not the point.
     fn raw_tls<C, S>(mut conn: C, mut tcp: TcpStream)
     where
         C: std::ops::DerefMut<Target = rustls::ConnectionCommon<S>>,
@@ -2718,9 +2200,6 @@ mod tests {
     }
 
     /// A peer that negotiates neither `atf/2` nor `atf/1` is named so, from
-    /// either end: a pre-fleet aterm listener (an older aterm's `[net]` drive:
-    /// its own certificate, no ALPN), a fleet-certified listener with no ALPN
-    /// or another one, and dialers offering none or another.
     #[test]
     fn a_peer_without_a_fleet_protocol_is_named_so_from_either_end() {
         const NET_CERT: &[u8] = include_bytes!("testdata/cert.der");
@@ -2754,8 +2233,6 @@ mod tests {
                 "{offered:?}: {listened:?}"
             );
         }
-        // The contrast: a listener that does choose atf/1 but presents
-        // another certificate fails the pin, said as the mismatch.
         let other = listener_tls(NET_CERT, NET_KEY, &[ALPN]);
         let ((), dialed) = over_loopback(
             move |tcp| raw_tls(ServerConnection::new(other).unwrap(), tcp),
@@ -2768,10 +2245,6 @@ mod tests {
     }
 
     /// A dialer that completes TLS and then sends nothing gets no slot past the
-    /// deadline: the listener's handshake ends as a timeout. The listener's
-    /// deadline is the one outcome under test: the dialer sends no proof
-    /// whether its TLS finished inside the short deadline or was cut by it,
-    /// and reads until the close.
     #[test]
     fn a_dialer_that_proves_nothing_in_time_is_timed_out() {
         let within = Duration::from_millis(500);
@@ -2790,11 +2263,6 @@ mod tests {
     }
 
     /// A proved op the listener does not serve is answered `NO op`, which the
-    /// dialer names as such; the listener hands nothing over. An older
-    /// listener — one that serves `survey` and `join`, from before members
-    /// read the issuer's book — answers a `book` so, and a listener whose
-    /// person allows no driving (it serves the reads and the join, never
-    /// `drive`) answers a `drive` so.
     #[test]
     fn an_op_the_listener_does_not_serve_is_answered_no_op() {
         const OLDER: &[FleetOp] = &[FleetOp::Survey, FleetOp::Join];
@@ -2820,9 +2288,6 @@ mod tests {
     }
 
     /// The fence: loopback, the private blocks and link-local are served,
-    /// judged through a dual-stack listener's IPv4-mapped form too; public,
-    /// shared (CGNAT), documentation, multicast and unspecified addresses are
-    /// not.
     #[test]
     fn only_loopback_private_and_link_local_sources_are_served() {
         for served in [
@@ -2871,7 +2336,6 @@ mod tests {
     }
 
     /// The key file's one spelling: 40 to 64 lowercase hex digits, a final LF
-    /// optional. The secret it spells is the one [`FleetSecret::new`] takes.
     #[test]
     fn a_key_file_is_lowercase_hex_on_one_line() {
         let secret = [0xa7_u8; 20];
@@ -2907,8 +2371,6 @@ mod tests {
     }
 
     /// The key file is read only when it and its directory are this user's
-    /// alone: a group or other bit on either, a second link, a symlink at
-    /// either, or no file at all is refused by its own word.
     #[cfg(unix)]
     #[test]
     fn a_key_file_is_read_only_when_private() {
@@ -2926,8 +2388,6 @@ mod tests {
 
         assert_eq!(word(&state), Some("no-key"));
         assert_eq!(word(&root.join("absent")), Some("no-key"));
-        // No key in a directory a launch left open to others is no key, not
-        // a privacy wall: the mode is judged where there is a secret to keep.
         mode(&state, 0o755);
         assert_eq!(word(&state), Some("no-key"));
         mode(&state, 0o700);
@@ -2951,7 +2411,6 @@ mod tests {
         std::fs::remove_file(&second).unwrap();
         assert_eq!(word(&state), None);
 
-        // A symlink in the file's place, and a state directory that is one.
         let real = root.join("real.key");
         std::fs::rename(&key, &real).unwrap();
         std::os::unix::fs::symlink(&real, &key).unwrap();
@@ -2963,7 +2422,6 @@ mod tests {
         assert_eq!(word(&linked), Some("key-link"));
         assert_eq!(word(&state), None);
 
-        // Not a regular file, and a file too long to be one secret.
         std::fs::remove_file(&key).unwrap();
         std::fs::create_dir(&key).unwrap();
         mode(&key, 0o700);
@@ -2977,10 +2435,6 @@ mod tests {
     }
 
     /// THE LISTENER END TO END on a loopback port: a proved stream is handed
-    /// over and served, a dialer past the last slot is turned away before any
-    /// TLS byte, and clearing the flag ends the loop and cuts the stream it
-    /// handed over. `serve` makes its listener non-blocking, which an accepted
-    /// socket inherits on macOS: the handshake proves it is put back.
     #[test]
     fn the_listener_hands_proved_streams_over_and_cuts_them_when_stopped() {
         use std::sync::mpsc;
@@ -3005,7 +2459,6 @@ mod tests {
                     &listener,
                     &listening,
                     &running,
-                    // An echo of one line, then of everything until the end.
                     |served, _op| served.answer(echo_all),
                     move |event| {
                         let _ = events.lock().unwrap().send(event);
@@ -3043,7 +2496,6 @@ mod tests {
         held.stream().read_exact(&mut echo).unwrap();
         assert_eq!(&echo, b"ping\n");
 
-        // The one slot is held: the next dialer is closed on before TLS.
         let tcp = TcpStream::connect(addr).unwrap();
         tcp.set_read_timeout(Some(HANG)).unwrap();
         assert!(client_handshake(tcp, &secret(7), FleetOp::Survey, HANG).is_err());
@@ -3053,7 +2505,6 @@ mod tests {
 
         running.store(false, Ordering::Release);
         serving.join().unwrap();
-        // Cut, not idle: the read ends at once, never by its hang detector.
         let mut rest = Vec::new();
         let ended = held.stream().read_to_end(&mut rest);
         assert!(
@@ -3068,24 +2519,6 @@ mod tests {
     }
 
     /// A PEER THAT HAS READ ITS CONNECTION'S END DIALS AGAIN AT ONCE, from the
-    /// same address, and is served — through each of a [`Served`]'s two
-    /// ends, the ones the aterm listener's hand-over takes: relayed to a local
-    /// end that answers ([`Served::relay_answers`], every op but `join`) and
-    /// answered here ([`Served::answer`], a `join`). Each frees the hold
-    /// before the peer hears the end. Each hand-over then holds its thread
-    /// until the test lets it go, so the first connection is still being torn
-    /// down — deterministically, no sleep — when the peer dials again: on a
-    /// listener of one slot (the slot is free) and on one of two slots with a
-    /// share of one (the share is free).
-    ///
-    /// NEGATIVE CONTROL: a relay that keeps the hold until the hand-over
-    /// returns — the order before 2026-10-16, which the live lane caught as a
-    /// flake — has the second dial turned away: at capacity, before TLS, with
-    /// one slot; `NO capacity` with a share of one. This holds the slot and
-    /// share semantics; the order inside each end (the guard gone before any
-    /// byte of the end is on the wire) is pinned by
-    /// `tls::tests::an_answering_relay_says_nothing_of_the_end_while_its_guard_is_held`
-    /// and `tls::tests::an_answer_says_nothing_of_the_end_while_its_guard_is_held`.
     #[test]
     fn a_peer_that_read_its_end_dials_again_at_once() {
         for (slots, per_source) in [(1, 1), (2, 1)] {
@@ -3118,20 +2551,15 @@ mod tests {
         /// [`Served::answer`] here.
         Answered,
         /// THE CONTROL: relayed with the hold kept until the hand-over
-        /// returns.
         Kept,
     }
 
     /// [`a_peer_that_read_its_end_dials_again_at_once`]'s run: a listener of
-    /// `slots` slots and a share of `per_source`, whose hand-over ends each
-    /// connection as `end` says; one dial asked and read to its end; then a
-    /// second dial at once, and what it was answered.
     fn redial(slots: usize, per_source: usize, end: End) -> Result<String, FleetError> {
         use std::sync::mpsc;
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let running = Arc::new(AtomicBool::new(true));
-        // Every hand-over waits here, its answer given, until the sender goes.
         let (go, gate) = mpsc::channel::<()>();
         let gate = Arc::new(Mutex::new(gate));
         let listening = Listening {
@@ -3151,9 +2579,6 @@ mod tests {
                     &listening,
                     &running,
                     move |served: Served, _op| {
-                        // One line asked, answered: here, or by a local end
-                        // that then hangs up, as a control server ends a
-                        // fleet connection.
                         let (answered, kept) = match end {
                             End::Answered => (
                                 served.answer(|stream| {
@@ -3216,15 +2641,12 @@ mod tests {
         };
         let mut first = dial().expect("the first dial is served");
         assert_eq!(ask(&mut first).expect("its answer"), "answered");
-        // Its end, read whole: a clean close_notify, never the hang detector.
         let mut rest = Vec::new();
         let end = first.stream().read_to_end(&mut rest);
         assert!(
             end.is_ok() && rest.is_empty(),
             "the first connection ends cleanly: {end:?} {rest:?}"
         );
-        // At once, from the same address, while the first connection's thread
-        // still holds on.
         let second = dial().and_then(|mut proved| ask(&mut proved).map_err(FleetError::Io));
         drop(go);
         running.store(false, Ordering::Release);
@@ -3233,21 +2655,6 @@ mod tests {
     }
 
     /// THE LISTENER'S CUT FREES THE SLOT OF A MEMBER THAT SENT ITS FIN AND
-    /// READS NOTHING. The member proves itself on a listener of one slot,
-    /// sends its FIN at once and never reads, and the control server's
-    /// stand-in answers without end, so the relay is left writing an answer
-    /// nobody takes. The listener cuts the connection at its lifetime: the
-    /// relay returns, its connection's slot comes back, and the next dial is
-    /// served.
-    ///
-    /// NEGATIVE CONTROL (by mutation, run 2026-10-16): with the cut a
-    /// both-ways `shutdown` — which Darwin refuses once the peer's FIN is in,
-    /// shutting nothing — the cut drops the connection's share and leaves its
-    /// relay blocked writing and its slot held for as long as the member
-    /// keeps the connection open: the relay's end is the hang detector's to
-    /// report, and a member could fill every slot so. Every wait here is the
-    /// hang detector, never a latency budget; the lifetime is the cut's
-    /// configuration, short so the cut comes soon.
     #[test]
     fn the_cut_frees_the_slot_of_a_peer_that_sent_its_fin_and_reads_nothing() {
         use std::sync::mpsc;
@@ -3272,8 +2679,6 @@ mod tests {
                     &listener,
                     &listening,
                     &running,
-                    // Relayed to a local end that answers without end and
-                    // never reads, until its writes fail.
                     |served: Served, _op| {
                         let (local, answering) = CtlStream::pair()?;
                         let answerer = std::thread::spawn(move || {
@@ -3302,9 +2707,7 @@ mod tests {
         let tcp = TcpStream::connect(addr).unwrap();
         let (silent, _) = client_handshake(tcp, &secret(7), FleetOp::Survey, HANG).unwrap();
         assert!(matches!(next("Admitted"), FleetEvent::Admitted { .. }));
-        // Its FIN, and never a read: the connection stays open on its side.
         silent.tcp().shutdown(std::net::Shutdown::Write).unwrap();
-        // The cut ends the relay, and its slot comes back.
         assert!(matches!(next("Closed"), FleetEvent::Closed { .. }));
         let tcp = TcpStream::connect(addr).unwrap();
         let again = client_handshake(tcp, &secret(7), FleetOp::Survey, HANG);
@@ -3331,7 +2734,6 @@ mod tests {
     }
 
     /// [`serve`] on its own thread, each proved stream an echo until its end;
-    /// stopped, and joined, when dropped.
     struct Serving {
         heard: Arc<Heard>,
         running: Arc<AtomicBool>,
@@ -3406,7 +2808,6 @@ mod tests {
     }
 
     /// A listener that serves `slots` connections at once, each for `lifetime`,
-    /// with no share of them kept from one address: the slots' rule alone.
     fn listening(slots: usize, lifetime: Duration) -> Listening {
         Listening {
             secret: secret(7),
@@ -3420,12 +2821,6 @@ mod tests {
     }
 
     /// NET-1 across addresses at the fleet port: a LAN host that holds every
-    /// slot with idle sockets — no TLS byte, each reconnected the moment the
-    /// listener closes it, no secret needed — never turns a member from
-    /// another address away. Rule 1 lets the member in on its FIRST dial, the
-    /// attack milliseconds old; refusing the newest connection turned it away
-    /// for as long as the sockets kept coming. A dual-stack listener sees
-    /// 127.0.0.1 and ::1 as two addresses.
     #[test]
     fn idle_sockets_from_one_address_never_turn_away_a_member_from_another() {
         use crate::slots::tests::{IdleSockets, dual_stack_listener, until_turned_away};
@@ -3460,11 +2855,6 @@ mod tests {
     }
 
     /// NET-1 at one address (rule 2): idle sockets from the member's own
-    /// address hold every slot, each reconnected the moment the listener
-    /// closes it, and the member is still admitted, within the hang detector,
-    /// by taking the slot of one that has gone `PREAUTH_GRACE` without proving
-    /// anything, which the listener says. Every peer here is 127.0.0.1; a
-    /// member from another address is the test above.
     #[test]
     fn idle_sockets_never_lock_a_member_of_their_own_address_out() {
         use crate::slots::tests::{IdleSockets, until_turned_away};
@@ -3476,7 +2866,6 @@ mod tests {
             client_handshake(tcp, &secret(7), FleetOp::Survey, HANG)
         };
 
-        // Control: with no attacker the member is admitted and served.
         let (mut control, _) = dial().expect("an unloaded listener admits");
         assert!(echoes(&mut control), "the control is served");
         drop(control);
@@ -3508,10 +2897,6 @@ mod tests {
     }
 
     /// Rule 2's address bound: a member from another address whose handshake
-    /// outlasts `PREAUTH_GRACE` — a lossy path, here a ClientHello sent
-    /// `PREAUTH_GRACE` + 500 ms after its connect, still inside
-    /// [`HANDSHAKE_WITHIN`] — is never cut for the idle sockets' own
-    /// reconnects, which may take only a slot of their own heavier address.
     #[test]
     fn a_slow_handshake_is_never_cut_for_a_heavier_address() {
         use crate::slots::tests::{IdleSockets, dual_stack_listener, until_turned_away};
@@ -3545,9 +2930,6 @@ mod tests {
     }
 
     /// The control for the rule: PROVED connections still fill the listener —
-    /// [`MAX_SLOTS`] members hold every slot, a newcomer is turned away at
-    /// capacity even once every member is older than `PREAUTH_GRACE`, and no
-    /// member is displaced to make room for it.
     #[test]
     fn proved_members_still_fill_the_listener_and_are_never_displaced() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -3561,8 +2943,6 @@ mod tests {
         let mut members: Vec<_> = (0..MAX_SLOTS)
             .map(|i| dial().unwrap_or_else(|e| panic!("member {i}: {e}")).0)
             .collect();
-        // Older than the grace an unproved connection gets, so the age rule
-        // would take a member's slot if a proved one were displaceable.
         std::thread::sleep(PREAUTH_GRACE + Duration::from_millis(500));
 
         assert!(
@@ -3577,12 +2957,6 @@ mod tests {
     }
 
     /// ONE MEMBER NEVER FILLS THE LISTENER: an address that holds its share of
-    /// proved connections ([`Listening::per_source`]) is answered `NO
-    /// capacity` on the next proof — which the dialer reads as
-    /// [`FleetError::AddressBusy`] — while a member from another address is
-    /// still admitted to a free slot; and once one of the first address's
-    /// connections ends, that address is admitted again. A dual-stack listener
-    /// sees 127.0.0.1 and ::1 as two addresses.
     #[test]
     fn one_address_holds_at_most_its_share_of_proved_connections() {
         use crate::slots::tests::dual_stack_listener;
@@ -3622,7 +2996,6 @@ mod tests {
         for (i, conn) in held.iter_mut().enumerate() {
             assert!(echoes(conn), "connection {i} is still served");
         }
-        // One ends: its address is admitted again once its slot is free.
         drop(held.pop());
         let started = Instant::now();
         while let Err(e) = dial(busy) {
@@ -3636,10 +3009,6 @@ mod tests {
     }
 
     /// A DRIVE HAS ITS OWN SHARE: an address that holds its reads' share
-    /// ([`per_source`]) is still admitted a drive, and its drives — held as
-    /// long as their request waits — are counted apart from its reads, up to
-    /// [`drive_per_source`]; past that a drive is answered `NO capacity`
-    /// (the NEGATIVE CONTROL), as a read past its own share is.
     #[test]
     fn a_drive_has_its_own_share_beside_the_reads() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -3679,11 +3048,6 @@ mod tests {
     }
 
     /// A proved connection is served for its lifetime and then cut, so a
-    /// member that went silent — asleep, off the network, or hung — gives its
-    /// slot back: the silent dialer's read ends by the cut, never by its hang
-    /// detector, and the one slot then serves the next member. The short
-    /// lifetime is the outcome under test; it starts at the proof, so it
-    /// never races a handshake.
     #[test]
     fn a_proved_connection_is_cut_at_its_lifetime() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -3710,8 +3074,6 @@ mod tests {
                 )),
             "the silent connection is cut: {rest:?}"
         );
-        // Its thread lets the slot go as the cut ends its hand-over, which the
-        // dialer's read does not wait for: dial until the slot is free.
         let started = std::time::Instant::now();
         while let Err(e) = dial() {
             assert!(

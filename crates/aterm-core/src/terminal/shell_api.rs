@@ -2,75 +2,53 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Shell integration API for [`Terminal`]: OSC 133 state and command marks, OSC 1337 marks,
-//! annotations and cell pixel size, and the program's progress (OSC 9;4) and state
-//! (OSC 7501) reports.
+//! Shell integration API for [`Terminal`]: OSC 133/1337/9;4/7501 state, marks, annotations, and cell metrics.
 
 use super::TaskbarProgress;
 use super::shell::{ANNOTATIONS_MAX, TERMINAL_MARKS_MAX};
 use super::{Annotation, BlockState, CommandMark, ShellState, Terminal, TerminalMark};
 
-/// Where the line editor of the shell in front starts its buffer, as its
-/// authenticated prompt vouches for it ([`Terminal::input_region_start`]).
+/// Where the foreground shell's line editor starts its buffer ([`Terminal::input_region_start`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct InputRegionStart {
     /// The visible row of the prompt's `B`, from `0`.
     pub row: u16,
     /// Its column: the cursor's when the shell sent it.
     pub col: u16,
-    /// Which prompt: the id of the block its `A` opened
-    /// ([`Terminal::prompt_in_front`]). Every prompt has its own, so a `B` the
-    /// engine keeps across a redraw is told from the next prompt's at the
-    /// same cell.
+    /// Block id opened by the prompt's `A` mark ([`Terminal::prompt_in_front`]).
     pub prompt: u64,
 }
 
 impl Terminal {
-    // ---- Shell integration (OSC 133) ----
-
-    /// The OSC 133 shell-integration state: `Ground` (waiting for a prompt),
-    /// `ReceivingPrompt` (after `A`), `EnteringCommand` (after `B`), `Executing` (after `C`).
+    /// Current OSC 133 shell-integration state.
     #[must_use]
     #[inline]
     pub const fn shell_state(&self) -> ShellState {
         self.shell.state
     }
 
-    /// All completed command marks: each a command's prompt, command and output ranges and
-    /// exit code.
+    /// All completed command marks (prompt, command, and output ranges with exit code).
     #[must_use]
     #[inline]
     pub fn command_marks(&self) -> &[CommandMark] {
         self.shell.command_marks.as_slices().0
     }
 
-    /// Monotonic count of completed commands (OSC 133;D). With
-    /// [`Self::last_completed_command`] it is an unambiguous "a command just finished" edge
-    /// (same-millisecond completions share an end time, never a seq). Survives `reset`.
+    /// Monotonic count of completed commands (OSC 133;D), surviving `reset`.
     #[must_use]
     #[inline]
     pub const fn completed_command_seq(&self) -> u64 {
         self.shell.completed_seq
     }
 
-    /// Monotonic count of commands the shell started (each OSC 133/633 C the
-    /// A→B→C→D gate accepted, whether or not a block held it). No clear takes
-    /// one back: RIS drops blocks (and the D a running command would send),
-    /// ED 3 and Cmd-K ([`Self::clear_scrollback`]) the blocks wholly in the
-    /// history they erase, never a counted C, so
-    /// the C's since a reading, less the blocks still held that reached C
-    /// since, are the commands whose blocks went unread. Survives `reset` and
-    /// a checkpoint round trip; a restore never sets it below the carried
-    /// blocks that reached C (a predecessor that did not count carries none).
+    /// Monotonic count of commands started by the shell (accepted OSC 133/633 `C` marks).
     #[must_use]
     #[inline]
     pub const fn started_command_seq(&self) -> u64 {
         self.shell.started_seq
     }
 
-    /// Which integration body the shell signs that it runs: the 16-hex address of its
-    /// script folder, from the last signed `633;P;AtermIntegration=` mark or carried across
-    /// a seamless update. `None` until one arrives (scripts without a loader send none).
+    /// 16-hex address of the integration script folder signed by the shell, if any.
     #[must_use]
     #[inline]
     pub fn shell_integration_rev(&self) -> Option<&str> {
@@ -80,17 +58,13 @@ impl Terminal {
             .and_then(|rev| std::str::from_utf8(rev).ok())
     }
 
-    /// The shell's START record (`docs/DESIGN-warm-spare-2026-10-16.md` §4),
-    /// once: the first signed `633;P;AtermStart=` with the rc folder and flags
-    /// that preceded it, or `None` before it and after the take. Only the first
-    /// record a shell signs is ever kept.
+    /// Take the shell's first signed `633;P;AtermStart=` record, if not yet taken.
     #[inline]
     pub const fn take_start_mark(&mut self) -> Option<super::StartMark> {
         self.shell.spare.mark.take()
     }
 
-    /// Whether a signed `633;P;AtermSpare=parked` arrived since the last take:
-    /// a spare shell waits at its parked hold, before any startup file.
+    /// Whether a signed `633;P;AtermSpare=parked` arrived since the last take.
     #[inline]
     pub const fn take_spare_parked(&mut self) -> bool {
         std::mem::replace(&mut self.shell.spare.parked, false)
@@ -103,57 +77,14 @@ impl Terminal {
         self.shell.spare.refused
     }
 
-    /// Whether the shell has signed a prompt start (an accepted OSC 133/633 `A`)
-    /// since this engine began: a released spare has left every hold by then.
+    /// Whether the shell has signed a prompt start (accepted OSC 133/633 `A`).
     #[must_use]
     #[inline]
     pub const fn shell_prompt_started(&self) -> bool {
         self.shell.next_block_id > 0
     }
 
-    /// Where the line editor of the shell in front starts the buffer it is
-    /// editing: the visible cell of the AUTHENTICATED OSC 133/633 `B` of its
-    /// prompt, and which prompt that is, or `None` whenever that cannot be
-    /// vouched for.
-    ///
-    /// A `B` mark is the shell saying "the command line starts here": the
-    /// prompt is drawn, the cursor stands where typed text goes. It is the one
-    /// far-end acknowledgement of the buffer's start a terminal gets, and the
-    /// predictor places Home, End, Ctrl-A, Ctrl-E and Delete only on a line it
-    /// started there, with the first key typed at that prompt
-    /// (`aterm_predict::KeySample::input_start`). So it is handed over only
-    /// when every one of these holds:
-    ///
-    /// - the capability-nonce gate is on and its nonce is in use, and the phase
-    ///   is the shell's last word (`phase_stale` clear): a mark then passed
-    ///   only with the shell's own `id=`, so no program's output (a `cat` of a
-    ///   log holding `133;B`, a remote shell over ssh) can name a buffer start;
-    ///   and in the window of a re-key the shell has not taken, or of a
-    ///   successor's first mark, the marks the shell signed meanwhile were
-    ///   dropped, so the `B` the engine still holds may be a prompt that is
-    ///   over;
-    /// - the `B` said it stands where the buffer STARTS (`aterm_input=start`,
-    ///   `ShellIntegrationState::input_start_attested`): zsh sends its `B`
-    ///   from zle-line-init, after zle drew the buffer, and a line pre-filled
-    ///   from its buffer stack (push-line, accept-and-hold, `print -z`) is
-    ///   drawn first, so a `B` there stands after that text (measured on zsh
-    ///   5.9: `P> echo hi` with the mark at column 10); aterm's zsh
-    ///   integration says so only over an empty buffer;
-    /// - the shell is between that `B` and its `C` (`EnteringCommand`), and no
-    ///   program a key binding started holds the foreground
-    ///   ([`Self::set_foreground_job`]): once a command runs, the prompt the
-    ///   mark belonged to is over, whatever the screen still shows;
-    /// - the main screen is up and the viewport is at the live bottom
-    ///   (`display_offset == 0`), so the visible row is the grid row the
-    ///   cursor and the predictor's coordinates name;
-    /// - the mark's absolute row (`OutputBlock::command_start_row`, kept in
-    ///   step with every row splice) is on screen, and its column inside it.
-    ///
-    /// The row is visible, from `0`; the column is the cursor's when the shell
-    /// sent the mark. Nothing moves the cell after: a prompt the shell redraws
-    /// in place (zsh's `reset-prompt` of an async segment, a resize) sends no
-    /// new `B`, which is why the predictor trusts it only for the FIRST key of
-    /// a prompt, over the buffer the mark found empty.
+    /// Visible cell and prompt id where the foreground shell's authenticated `B` mark starts its input buffer.
     #[must_use]
     #[inline]
     pub fn input_region_start(&self) -> Option<InputRegionStart> {
@@ -172,17 +103,7 @@ impl Terminal {
         (col < self.cols()).then_some(InputRegionStart { row, col, prompt })
     }
 
-    /// Which prompt's line editor reads the keys now, by the authenticated
-    /// shell's own marks: the id of the block its `A` opened, once its `B`
-    /// came and before its `C`, or `None`. The capability-nonce gate on, its
-    /// nonce in use and the phase the shell's last word, as for
-    /// [`Self::input_region_start`]; nothing about the screen.
-    ///
-    /// The predictor is told it with a line terminator
-    /// (`aterm_predict::Predictor::note_line_submit_at`): the next prompt's
-    /// first key may start a witnessed line only at ANOTHER prompt, so an
-    /// Enter the line editor kept for itself (accepting a completion menu's
-    /// pick) opens nothing at the prompt it was pressed at.
+    /// Block id of the authenticated prompt whose line editor currently reads keys, or `None`.
     #[must_use]
     #[inline]
     pub fn prompt_in_front(&self) -> Option<u64> {
@@ -197,8 +118,7 @@ impl Terminal {
         (block.state == BlockState::EnteringCommand).then_some(block.id)
     }
 
-    /// The most recent completed command mark (exit code recorded), whatever its status:
-    /// the "what just finished" probe, read per frame under the render lock.
+    /// Most recent completed command mark (exit code recorded), regardless of status.
     #[must_use]
     #[inline]
     pub fn last_completed_command(&self) -> Option<&CommandMark> {
@@ -209,10 +129,7 @@ impl Terminal {
             .find(|m| m.is_complete())
     }
 
-    // ---- Terminal extensions (OSC 1337, OSC 9;4, OSC 7501) ----
-
-    /// All terminal marks (OSC 1337 SetMark): navigation points an application or user set
-    /// explicitly, unlike OSC 133 command marks.
+    /// All explicitly set terminal marks (OSC 1337 SetMark).
     #[must_use]
     #[inline]
     pub fn terminal_marks(&self) -> &[TerminalMark] {
@@ -235,8 +152,7 @@ impl Terminal {
         id
     }
 
-    /// All annotations (OSC 1337 AddAnnotation): notes attached to regions of output,
-    /// visible or hidden.
+    /// All output region annotations (OSC 1337 AddAnnotation).
     #[must_use]
     #[inline]
     pub fn annotations(&self) -> &[Annotation] {
@@ -258,30 +174,11 @@ impl Terminal {
         id
     }
 
-    /// Set the cell pixel size `(width, height)` used to convert pixel/auto
-    /// inline-image dimensions (OSC 1337 `File=`) into a CELL footprint.
-    ///
-    /// The frontend reports its real font metrics here so an image requested in
-    /// pixels (`width=200px`) lands on the right number of cells. Cell-unit
-    /// requests (`width=10`) never consult this. A zero on either axis is clamped
-    /// to 1 at use to avoid a divide-by-zero. Defaults to a sane 8×16 so headless
-    /// tests are self-contained.
-    ///
-    /// Calling this is also what makes the metric reportable: it is the only
-    /// writer of the flag [`Self::host_cell_pixel_size`] reads, and the XTWINOPS
-    /// pixel reports (CSI 14 t / 16 t) answer from that and stay silent until a
-    /// host has spoken; a DEC 2048 in-band report says 0 pixels until then, and
-    /// a change of the measured box while 2048 is on queues a new one. A host
-    /// with real font metrics should call this as soon as they exist and again
-    /// whenever they change (font zoom, a DPI move).
+    /// Set the cell pixel size `(width, height)` used for inline-image footprint math and DEC 2048 reports.
     pub fn set_cell_pixel_size(&mut self, width: u16, height: u16) {
         let before = self.iterm2.host_cell_px();
         self.iterm2.cell_px = (width, height);
         self.iterm2.cell_px_from_host = true;
-        // DEC 2048: a new cell box at the same rows/cols (the first measurement, a
-        // font zoom, a move to a display of another scale) changes the text area's
-        // pixels, which `resize` alone would never report. Only a change: hosts set
-        // the box on every layout pass.
         let after = self.iterm2.host_cell_px();
         if self.modes.in_band_size_reports && after != before {
             super::state_accessors::push_in_band_size_report(
@@ -293,57 +190,28 @@ impl Terminal {
         }
     }
 
-    /// The cell pixel size for inline-image footprint math (OSC 1337): always usable, the
-    /// [`DEFAULT_CELL_PX`](super::grouped_state) 8×16 placeholder until a host reports. Use
-    /// [`Self::host_cell_pixel_size`] where the placeholder must not pass for a measurement.
+    /// Cell pixel size for inline-image footprint math (falling back to the 8×16 placeholder).
     #[must_use]
     #[inline]
     pub const fn cell_pixel_size(&self) -> (u16, u16) {
         self.iterm2.cell_px
     }
 
-    /// The cell pixel size a host actually reported, or `None` if none has (always for a
-    /// headless engine: only the frontend holding the rasterizer can measure a glyph). A
-    /// zero on either axis is unreported too. A wire query answers from this and stays
-    /// silent on `None` (`handler_window`'s XTWINOPS pixel reports).
+    /// Cell pixel size reported by the host, or `None` if unreported.
     #[must_use]
     #[inline]
     pub const fn host_cell_pixel_size(&self) -> Option<(u16, u16)> {
         self.iterm2.host_cell_px()
     }
 
-    /// The last taskbar progress state the program set (ConEmu OSC 9;4).
-    ///
-    /// # Example
-    /// ```
-    /// use aterm_core::terminal::Terminal;
-    /// use aterm_types::TaskbarProgress;
-    ///
-    /// let mut term = Terminal::new(24, 80);
-    /// term.process(b"\x1b]9;4;1;50\x07");  // Set 50% progress
-    /// assert_eq!(term.taskbar_progress(), Some(TaskbarProgress::Normal(50)));
-    /// ```
+    /// Last taskbar progress state set by the program (ConEmu OSC 9;4).
     #[must_use]
     #[inline]
     pub const fn taskbar_progress(&self) -> Option<TaskbarProgress> {
         self.taskbar_progress
     }
 
-    /// The program's own state report (OSC 7501, [`super::program_state`]): the report
-    /// standing, a sequence that moves with each report (a `clear` and a reset that
-    /// drops one included), and the count of turns the reports began. The program's
-    /// claim about itself, never evidence a typing decision rests on.
-    ///
-    /// # Example
-    /// ```
-    /// use aterm_core::terminal::Terminal;
-    /// use aterm_core::terminal::program_state::ProgramStateWord;
-    ///
-    /// let mut term = Terminal::new(24, 80);
-    /// term.process(b"\x1b]7501;state=working:app=codex\x1b\\");
-    /// let report = term.program_state();
-    /// assert_eq!(report.state.map(|s| s.state), Some(ProgramStateWord::Working));
-    /// ```
+    /// Program's own state report (OSC 7501, [`super::program_state`]).
     #[must_use]
     #[inline]
     pub const fn program_state(&self) -> super::program_state::ProgramStateReport {
@@ -356,12 +224,10 @@ mod tests {
     use crate::terminal::Terminal;
 
     /// `completed_command_seq` rises once per OSC 133;D, even for two completions in one
-    /// millisecond, and survives a reset.
     #[test]
     fn completed_command_seq_is_strictly_per_completion() {
         let mut term = Terminal::new(6, 40);
         assert_eq!(term.completed_command_seq(), 0);
-        // Two command cycles in one `process` burst: the same wall-clock millisecond.
         term.process(
             b"\x1b]133;A\x07$ a\x1b]133;B\x07\r\n\x1b]133;C\x07ok\r\n\x1b]133;D;0\x07\
               \x1b]133;A\x07$ b\x1b]133;B\x07\r\n\x1b]133;C\x07no\r\n\x1b]133;D;1\x07",
@@ -381,11 +247,6 @@ mod tests {
     }
 
     /// `started_command_seq` counts each C the A→B→C→D gate accepts, block or
-    /// no block, and nothing takes one back: RIS drops the blocks (and the
-    /// running command's D, which `completed_command_seq` then never counts),
-    /// ED 3 and Cmd-K the ones wholly in the history they erase (a running
-    /// `clear` keeps its own), and a checkpoint round trip carries it.
-    /// NEGATIVE CONTROL: a C out of order (no B before it) is not a start.
     #[test]
     fn started_command_seq_counts_every_accepted_c_and_no_clear_takes_one() {
         let prompt = b"\x1b]133;A\x07$ \x1b]133;B\x07";
@@ -393,11 +254,8 @@ mod tests {
         term.process(prompt);
         term.process(b"a\r\n\x1b]133;C\x07\x1b]133;D;0\x07");
         assert_eq!(term.started_command_seq(), 1);
-        // A C with no B before it is refused by the gate.
         term.process(b"\x1b]133;A\x07\x1b]133;C\x07");
         assert_eq!(term.started_command_seq(), 1, "out of order: no start");
-        // `reset`: its C counts; the RIS takes its block and the phase, so the
-        // gate refuses the shell's D.
         term.process(prompt);
         term.process(b"reset\r\n\x1b]133;C\x07\x1bc\x1b]133;D;0\x07");
         assert_eq!(term.started_command_seq(), 2);
@@ -406,7 +264,6 @@ mod tests {
             term.all_blocks().next().is_none(),
             "the RIS took the blocks"
         );
-        // `clear` (ED 3 from the running command) and Cmd-K.
         term.process(prompt);
         term.process(b"clear\r\n\x1b]133;C\x07\x1b[3J\x1b]133;D;0\x07");
         assert_eq!(term.started_command_seq(), 3);
@@ -441,7 +298,6 @@ mod tests {
     }
 
     /// The `B` aterm's integration sends where the buffer starts: signed, and
-    /// saying so (`aterm_input=start`).
     fn signed_b() -> Vec<u8> {
         signed("B;aterm_input=start")
     }
@@ -452,7 +308,6 @@ mod tests {
     }
 
     /// A 4×20 engine whose host authorized [`KEY`] and turned the nonce gate
-    /// on, at a signed prompt `$ ` on row 0 with nothing typed.
     fn at_signed_prompt() -> Terminal {
         let mut t = Terminal::new(4, 20);
         t.authorize_shell_integration(KEY);
@@ -464,12 +319,6 @@ mod tests {
     }
 
     /// `input_region_start` is the visible cell of the prompt's AUTHENTICATED
-    /// `B`, and that prompt's id: where the shell said its buffer starts,
-    /// whatever is typed after it, until the next prompt's own `B`, whose id
-    /// is another. NEGATIVE CONTROLS: the same marks unsigned under the gate
-    /// are dropped (no start), the gate off vouches for nothing however the
-    /// marks read, and a forged `A` and `B` printed mid-line (a program's
-    /// output, a `cat` of a log) move nothing.
     #[test]
     fn input_region_start_is_the_signed_prompt_s_b() {
         let mut t = at_signed_prompt();
@@ -510,12 +359,6 @@ mod tests {
     }
 
     /// A signed `B` that does not say it stands at the buffer's start names
-    /// none: zsh sends its `B` from zle-line-init after zle drew a line
-    /// pre-filled from its buffer stack (accept-and-hold: `P> echo hi` with
-    /// the mark at column 10, measured on zsh 5.9), and aterm's integration
-    /// says `aterm_input=start` only over an empty buffer. The prompt is still
-    /// the one in front (`prompt_in_front`). Control: the same prompt's `B`
-    /// saying so names its cell.
     #[test]
     fn a_b_that_does_not_say_it_starts_the_buffer_names_no_start() {
         let mut t = Terminal::new(4, 20);
@@ -534,7 +377,6 @@ mod tests {
         control.process(b"P> ");
         control.process(&signed_b());
         assert_eq!(cell(&control), Some((0, 3)), "control: an empty line's B");
-        // The next prompt's `A` takes the word back until its own `B` says so.
         control.process(b"\r\n");
         control.process(&signed("A"));
         control.process(b"P> pushed");
@@ -543,12 +385,6 @@ mod tests {
     }
 
     /// In the window of a re-key the shell has not taken, the marks it signs
-    /// with the new key before then were dropped: the phase, and the `B` the
-    /// engine holds, may belong to a prompt that is over. No start then: not
-    /// while the new key is not in use, and not while the phase is stale
-    /// after the first mark signed with it that is not an `A`. Each is a
-    /// negative control of its own conjunct; the new prompt's `A` and `B`
-    /// name a start again.
     #[test]
     fn input_region_start_is_none_while_the_phase_is_not_the_shell_s_last_word() {
         let mut t = at_signed_prompt();
@@ -556,8 +392,6 @@ mod tests {
         t.authorize_shell_integration_on_first_mark(NEW_KEY);
         assert_eq!(cell(&t), None, "the new key is not in use yet");
         assert_eq!(t.prompt_in_front(), None);
-        // The shell's first mark with the new key is no `A` (a property it
-        // signs before its prompt): the key is in use, the phase stale.
         t.process(&signed_with(NEW_KEY, "B;aterm_input=start"));
         assert_eq!(
             t.shell_integration_nonce_in_use(),
@@ -574,11 +408,6 @@ mod tests {
     }
 
     /// Once the prompt in front is not the one the `B` belongs to, or is not
-    /// where the grid's coordinates say, there is no input region: a command
-    /// started (`C`), a program a key binding started holds the foreground, the
-    /// alternate screen is up, the prompt's row scrolled off the top, or the
-    /// viewport is scrolled back into history. Each returns when it is undone,
-    /// where it can be.
     #[test]
     fn input_region_start_is_none_once_its_prompt_is_not_in_front() {
         let mut t = at_signed_prompt();
@@ -624,10 +453,6 @@ mod tests {
     }
 
     /// A predecessor's checkpoint carries no `started_seq` (the wire's
-    /// default reads 0): the restore starts the count at the carried blocks
-    /// that reached C, finished or running, and a carried count above them
-    /// (a clear took some) stands. NEGATIVE CONTROL: blocks at a prompt or
-    /// mid-input prove no C.
     #[test]
     fn a_restore_never_counts_fewer_starts_than_its_blocks_prove() {
         let prompt = b"\x1b]133;A\x07$ \x1b]133;B\x07";

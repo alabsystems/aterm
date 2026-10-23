@@ -1,50 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! SUMMARIZE IN A NEW TAB (`docs/DESIGN-owner-surfaces-2026-10-16.md` §4):
-//! prose about the alab costs one click. Agents ▸ Summarize the Fleet in a New
-//! Tab (Summarize This Mac where this Mac is in no fleet) starts ONE worker
-//! through the `spawn agent=claude` path, raised, with no role and `from=ctl`,
-//! whose task is [`FLEET_BRIEF`] (or [`MAC_BRIEF`]): read the survey once, say
-//! what needs the person, what each machine's managers and workers are doing
-//! and what finished. It runs under Autopilot Land, as every worker does
-//! ([`crate::task_launch::WORKER_AUTOPILOT`]): it changes nothing, so its
-//! clean `Nothing left:` defense (a read-only summary, nothing to land) is its
-//! landing, and its end. It starts in aterm's own folder for it
-//! ([`summary_folder`]), never where the focused pane was: Land lands only
-//! over a repository the probe finds nothing in, and the pane's repository is
-//! the person's own work, which the summary must not be told to land. Its
-//! result arrives where every `from=ctl` task's does (the menu bar's Done for
-//! you).
-//!
-//! The row is grey with the reason in its tool tip while a worker cannot
-//! start here ([`StartBlock`], the spawn's own checks plus a `claude` on the
-//! PATH a new tab starts from). Whether this Mac is in a fleet decides the
-//! brief and Read the Fleet's row ([`in_fleet`]): the fleet secret in the
-//! state directory, the one answer the fleet glance reads too. Whether this
-//! aterm's fabric is configured adds one sentence to either brief, right
-//! after its survey: read the fabric's log once ([`FABRIC_READ`]);
-//! without the fabric the briefs are
-//! [`FLEET_BRIEF`] and [`MAC_BRIEF`] byte for byte.
+//! SUMMARIZE IN A NEW TAB (`docs/DESIGN-owner-surfaces-2026-10-16.md` §4): prose about the alab costs one click.
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-/// The task Summarize the Fleet gives its worker. FACTS and one finishable
-/// task, never standing orders; SELF-CONTAINED: it names no filesystem path,
-/// because the worker's folder is aterm's own ([`summary_folder`]) and an
-/// installed aterm has no repo checkout. It asks for no token: under Land the worker's
-/// end is its landing, and a read-only summary has nothing to land.
+/// The task Summarize the Fleet gives its worker.
 pub(crate) const FLEET_BRIEF: &str = "Summarize this aterm fleet for the person reading this \
 tab. Run `aterm ctl survey --fleet` once. Write, in this order: first what needs the person \
 (the machine, the session, and why); then what each machine's managers and workers are doing; \
 then what finished. Change nothing and start nothing: this is a read-only summary, with nothing \
 to commit, push or land.";
 
-/// [`FLEET_BRIEF`] for a Mac in no fleet: the same summary of this Mac's
-/// sessions, from `aterm ctl survey`, then the local brief, `aterm ctl survey
-/// --brief`: each instance's node log and its sessions' briefs, read off the
-/// session log.
+/// [`FLEET_BRIEF`] for a Mac in no fleet.
 pub(crate) const MAC_BRIEF: &str = "Summarize this Mac's aterm sessions for the person reading \
 this tab. Run `aterm ctl survey` once, then `aterm ctl survey --brief` once, for what each \
 session's log says. Write, in this order: first what needs the person (the session, and why); \
@@ -56,20 +25,14 @@ land.";
 const FLEET_SURVEY: &str = "Run `aterm ctl survey --fleet` once.";
 
 /// [`MAC_BRIEF`]'s survey sentence (the survey, then the local brief), after
-/// which [`FABRIC_READ`] goes.
 const MAC_SURVEY: &str = "Run `aterm ctl survey` once, then `aterm ctl survey --brief` once, \
 for what each session's log says.";
 
-/// THE FABRIC'S SENTENCE: where
-/// this aterm's fabric is configured, either brief reads the fabric's log
-/// once too, right after its survey, for the sessions the fabric's other
-/// machines report from the bus alone.
+/// THE FABRIC'S SENTENCE.
 pub(crate) const FABRIC_READ: &str =
     "Then run `aterm fabric brief` once, for what the fabric's other machines report.";
 
-/// The brief a summary's worker is given: the fleet's or this Mac's, with
-/// [`FABRIC_READ`] after its survey where this aterm's fabric is configured,
-/// and byte for byte [`FLEET_BRIEF`] or [`MAC_BRIEF`] where it is not.
+/// The brief a summary's worker is given.
 pub(crate) fn summary_brief(fleet: bool, fabric: bool) -> String {
     let (brief, survey) = if fleet {
         (FLEET_BRIEF, FLEET_SURVEY)
@@ -83,9 +46,7 @@ pub(crate) fn summary_brief(fleet: bool, fabric: bool) -> String {
     }
 }
 
-/// The worker order Summarize spawns: the brief alone ([`summary_brief`]),
-/// no fact line naming a starter (no client waits on it; its task record's
-/// `from=` is `ctl`), under Autopilot Land, so its end is its landing.
+/// The worker order Summarize spawns.
 pub(crate) fn summary_order(fleet: bool, fabric: bool) -> crate::task_launch::TaskOrder {
     crate::task_launch::TaskOrder {
         task: summary_brief(fleet, fabric).into_bytes(),
@@ -101,23 +62,12 @@ pub(crate) fn summary_order(fleet: bool, fabric: bool) -> crate::task_launch::Ta
 /// The name of [`summary_folder`] under aterm's state root.
 const SUMMARY_FOLDER: &str = "summary";
 
-/// THE FOLDER A SUMMARY'S WORKER STARTS IN: `<state>/summary`, aterm's own,
-/// made on first use and private to this user (0o700 on unix). A summary
-/// changes nothing, so it has nothing to land: started where the focused pane
-/// was, Land's fourth condition — the repository probe, in the session's
-/// folder — read that pane's repository, the person's own work, and the
-/// summary's clean defense never landed; the worker was nudged without end to
-/// commit, merge and push someone else's work (the review of 2026-10-20). The
-/// probe reads nothing here ([`in_summary_folder_under`]). `None` where the state
-/// root resolves to nothing or the folder cannot be made private: the press
-/// then books nothing ([`NO_SUMMARY_FOLDER`], [`summary_spawn`]) rather than
-/// fall back to the focused pane's folder.
+/// THE FOLDER A SUMMARY'S WORKER STARTS IN.
 pub(crate) fn summary_folder() -> Option<std::path::PathBuf> {
     summary_folder_under(&aterm_types::dirs::state_dir()?)
 }
 
 /// [`summary_folder`] under the state root `state`: made if it is not there
-/// yet, then made owner-only; a folder whose mode cannot be set is no folder.
 fn summary_folder_under(state: &std::path::Path) -> Option<std::path::PathBuf> {
     let dir = state.join(SUMMARY_FOLDER);
     std::fs::create_dir_all(&dir).ok()?;
@@ -129,17 +79,11 @@ fn summary_folder_under(state: &std::path::Path) -> Option<std::path::PathBuf> {
     Some(dir)
 }
 
-/// Why Summarize books nothing where aterm has no folder of its own to start
-/// the worker in ([`summary_folder`]).
+/// Why Summarize books nothing where aterm has no folder of its own to start the worker in ([`summary_folder`]).
 pub(crate) const NO_SUMMARY_FOLDER: &str =
     "no folder of aterm's own to start the summary in (no state directory)";
 
-/// Whether `dir` is the summary folder under the state root `state`
-/// ([`summary_folder`]) or inside it, as given or resolved: no repository work
-/// there is anyone's to land (`harness_host`'s probe of a session's repository
-/// reads nothing for it). The caller reads the state root once: a test names
-/// its own, since the process's can be another test's for a while (a test
-/// scopes `ATERM_STATE_HOME` for its body, and that read does not wait for it).
+/// Whether `dir` is the summary folder under the state root `state` ([`summary_folder`]) or inside it, as given or resolved.
 pub(crate) fn in_summary_folder_under(dir: &std::path::Path, state: &std::path::Path) -> bool {
     let folder = state.join(SUMMARY_FOLDER);
     dir.starts_with(&folder)
@@ -149,8 +93,7 @@ pub(crate) fn in_summary_folder_under(dir: &std::path::Path, state: &std::path::
             .is_some_and(|canon| dir.starts_with(canon))
 }
 
-/// The booking a summary's worker is spawned with: in a new tab, raised, in
-/// `folder` ([`summary_folder`]), its admission the summary's single flight.
+/// The booking a summary's worker is spawned with.
 pub(crate) fn summary_booking(
     folder: &std::path::Path,
 ) -> crate::control::control_media::SpawnBooking {
@@ -163,12 +106,6 @@ pub(crate) fn summary_booking(
 }
 
 /// What Summarize books in `folder` ([`summary_folder`]): its order
-/// ([`summary_order`]: the fleet's brief or this Mac's, the fabric's
-/// sentence where `fabric` is configured), trusting that folder alone as a
-/// spawn's named folder is, and its booking ([`summary_booking`]). With no
-/// folder it books nothing and says why ([`NO_SUMMARY_FOLDER`]): the focused
-/// pane's folder is a person's repository, where Land would press the
-/// read-only summary to commit and push that person's work.
 fn summary_spawn(
     fleet: bool,
     fabric: bool,
@@ -190,9 +127,7 @@ fn summary_spawn(
     Ok((order, summary_booking(folder)))
 }
 
-/// Why Summarize cannot start a worker here, said in the row's tool tip:
-/// what the worker's spawn would refuse, or the missing `claude`
-/// ([`crate::App::summarize_start_block`]).
+/// Why Summarize cannot start a worker here, said in the row's tool tip.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum StartBlock {
     /// No `claude` on the PATH a new tab's shell starts from.
@@ -225,23 +160,13 @@ impl StartBlock {
     }
 }
 
-/// Why a second Summarize press books nothing while the first one's tab is
-/// still booking ([`crate::App::summarize_in_new_tab`]).
+/// Why a second Summarize press books nothing while the first one's tab is still booking ([`crate::App::summarize_in_new_tab`]).
 pub(crate) const SUMMARY_STARTING: &str = "a summary is already starting";
 
 /// How long one look for `claude` answers [`claude_on_path`]: the menu's
-/// live bits are published on the way to every wait, and an install or
-/// uninstall is noticed within this.
 const CLAUDE_LOOK_TTL: Duration = Duration::from_secs(2);
 
-/// Whether the agent CLI (`claude`) is launchable from a new tab: a file by
-/// that name on the PATH that tab's shell starts from — this process's PATH
-/// (launchd's four dirs, for a Finder or Dock launch) plus aterm's managed
-/// `agents/` and `bin/` and the places a foreign `claude` measurably lives
-/// ([`crate::spawn::fallback_child_path`]). A handful of stat calls, looked
-/// at again after [`CLAUDE_LOOK_TTL`], off the main thread ([`Look`]), so an
-/// install or uninstall mid-run is noticed; only the managed layout is
-/// resolved once.
+/// Whether the agent CLI (`claude`) is launchable from a new tab: a file by that name on the PATH that tab's shell starts from.
 pub(crate) fn claude_on_path() -> bool {
     #[cfg(test)]
     if let Some(answer) = CLAUDE_ON_PATH_FOR_TEST.get() {
@@ -256,15 +181,7 @@ pub(crate) fn claude_on_path() -> bool {
     )
 }
 
-/// A yes or no about the file system that the main thread asks on the way to
-/// every wait (the menu's live bits: [`claude_on_path`], [`in_fleet`]): the
-/// first answer is looked at where it is asked — the launch has just read the
-/// same home folder — and every look after it, once the last is older than
-/// its TTL, on a thread of its own, one at a time, the last answer standing
-/// meanwhile. Looked at again on the main thread, a home on a network volume
-/// that stopped answering held every window there until the server came back
-/// (measured in a macOS 27 guest, 2026-10-20: a `call_main` verb waited out
-/// its 30 s twice); now that thread waits alone.
+/// A yes or no about the file system that the main thread asks on the way to every wait (the menu's live bits: [`claude_on_path`], [`in_fleet`]).
 pub(crate) struct Look {
     state: Mutex<LookState>,
 }
@@ -287,9 +204,7 @@ impl Look {
         }
     }
 
-    /// The answer at `now`: the first look's, made here; after it the last
-    /// look's, with the next started off this thread (`name`) once that one is
-    /// older than `ttl` and none is out.
+    /// The answer at `now`: the first look's, made here.
     pub(crate) fn answer(
         &'static self,
         ttl: Duration,
@@ -315,7 +230,6 @@ impl Look {
                     };
                 });
             if spawned.is_err() {
-                // No thread to look on: the answer stands a TTL longer.
                 *state = LookState {
                     last: Some((answer, now)),
                     looking: false,
@@ -328,9 +242,7 @@ impl Look {
 
 #[cfg(test)]
 thread_local! {
-    /// TEST ARM of [`claude_on_path`]: `Some(answer)` stands in for the look
-    /// at this machine's PATH on this thread, so a test of Summarize's row
-    /// does not depend on what is installed where it runs.
+    /// TEST ARM of [`claude_on_path`].
     pub(crate) static CLAUDE_ON_PATH_FOR_TEST: std::cell::Cell<Option<bool>> =
         const { std::cell::Cell::new(None) };
 }
@@ -357,15 +269,9 @@ fn claude_on_path_now() -> bool {
 }
 
 /// How long one look at the fleet secret answers [`in_fleet`]: the menu's
-/// live bits are published on the way to every wait, and membership changes
-/// only at an `aterm fleet init|join|leave`.
 const FLEET_LOOK_TTL: Duration = Duration::from_secs(15);
 
-/// WHETHER THIS MAC IS IN A FLEET, for the Agents rows and Summarize's brief:
-/// the one answer the fleet glance's book reads too
-/// (`fleet_glance::holds_fleet_key`), looked at again once per
-/// [`FLEET_LOOK_TTL`], off the main thread ([`Look`]); no state directory is
-/// no fleet (the rows that need one grey).
+/// WHETHER THIS MAC IS IN A FLEET, for the Agents rows and Summarize's brief.
 pub(crate) fn in_fleet() -> bool {
     static LOOK: Look = Look::new();
     LOOK.answer(
@@ -380,9 +286,7 @@ pub(crate) fn in_fleet() -> bool {
 }
 
 impl crate::App {
-    /// Why Summarize cannot launch here, `None` when it can: the worker's
-    /// spawn would refuse ([`Self::worker_shell`], the spawn's own check), or
-    /// no `claude` is on the PATH a new tab starts from ([`claude_on_path`]).
+    /// Why Summarize cannot launch here, `None` when it can.
     pub(crate) fn summarize_start_block(&self) -> Option<StartBlock> {
         if let Err(block) = self.worker_shell(aterm_phase::Program::Claude) {
             return Some(StartBlock::Worker(block));
@@ -391,9 +295,6 @@ impl crate::App {
     }
 
     /// What a Summarize press books in `folder` ([`summary_spawn`]): the
-    /// fleet's brief where this Mac is in a fleet ([`in_fleet`]), this Mac's
-    /// otherwise, with the fabric's sentence where THIS aterm's fabric is
-    /// configured ([`Self::fabric_configured`]).
     fn summary_spawn_in(
         &self,
         folder: Option<&std::path::Path>,
@@ -407,26 +308,14 @@ impl crate::App {
         summary_spawn(in_fleet(), self.fabric_configured(), folder)
     }
 
-    /// AGENTS ▸ SUMMARIZE THE FLEET IN A NEW TAB: one worker (`spawn
-    /// agent=claude`, [`Self::book_spawn`]) in a new tab of the front window,
-    /// raised so the person who clicked sees it, no role, its task
-    /// [`summary_order`] (the fleet's brief in a fleet, this Mac's
-    /// otherwise; the fabric's sentence where this aterm's fabric is
-    /// configured, [`Self::fabric_configured`]), `from=ctl`. `Err` is the
-    /// spawn's refusal before anything is booked — what
-    /// [`Self::summarize_start_block`] greys the row for; a tab that did not
-    /// open is said when it settles.
+    /// AGENTS ▸ SUMMARIZE THE FLEET IN A NEW TAB.
     pub(crate) fn summarize_in_new_tab(&mut self) -> Result<(), String> {
         if let Some(block) = self.summarize_start_block() {
             return Err(block.hint());
         }
-        // SINGLE-FLIGHT: while one summary's tab is still booking, a second
-        // press (a double click, the palette after the menu) books nothing.
         if self.tab_spawns.summary_pending() {
             return Err(SUMMARY_STARTING.to_string());
         }
-        // In aterm's own folder, trusted as a spawn's named folder is; with
-        // none, nothing is booked.
         let (order, booking) = self.summary_spawn_in(summary_folder().as_deref())?;
         let plan = self.resolve_spawn(crate::control::SpawnAim::Front, Some(order))?;
         self.book_spawn(
@@ -434,9 +323,6 @@ impl crate::App {
             booking,
             Box::new(|app, spawned| {
                 match spawned {
-                    // No client waits on a reply: the worker's launcher
-                    // starts at once (`App::start_spawned`), as a wire
-                    // spawn's starts once its reply is taken.
                     Ok(spawned) => {
                         let _ = app.start_spawned(spawned);
                     }
@@ -457,9 +343,6 @@ mod tests {
     use crate::App;
 
     /// The two briefs are one finishable task each: the survey they read
-    /// (the fleet's with `--fleet`, this Mac's without), an ordinary report, no
-    /// standing order, no filesystem path, no role for the worker, and
-    /// nothing to land, under Land.
     #[test]
     fn the_briefs_read_the_survey_once_and_end() {
         for (fleet, fabric, survey) in [
@@ -484,12 +367,6 @@ mod tests {
     }
 
     /// THE FABRIC'S SENTENCE, ONLY WHERE THE FABRIC IS ON,
-    /// in all four arms: with no fabric each
-    /// brief is [`FLEET_BRIEF`] or [`MAC_BRIEF`] byte for byte and names no
-    /// fabric; with it, the same brief with exactly [`FABRIC_READ`] added,
-    /// right after its survey and before what it asks for. NEGATIVE
-    /// CONTROLS, run: the old order (no fabric arm) fails the fabric arms,
-    /// and the sentence on the no-fabric arm fails the byte-identical arm.
     #[test]
     fn the_briefs_read_the_fabric_only_where_it_is_on() {
         let task = |fleet: bool, fabric: bool| {
@@ -514,10 +391,6 @@ mod tests {
     }
 
     /// THIS MAC'S BRIEF READS THE SURVEY, THEN THE LOCAL BRIEF:
-    /// `aterm ctl survey` once, then `aterm ctl survey
-    /// --brief` once, and where the fabric is on its sentence follows both.
-    /// The fleet's brief is unchanged. NEGATIVE CONTROL, run: the old order
-    /// (the survey alone) fails it.
     #[test]
     fn this_macs_brief_reads_the_survey_then_the_local_brief() {
         for fabric in [false, true] {
@@ -536,11 +409,6 @@ mod tests {
     }
 
     /// A PRESS NAMES THE FABRIC WHERE THIS ATERM'S IS ON,
-    /// at the press: the order Summarize books
-    /// ([`App::summary_spawn_in`]) carries [`FABRIC_READ`] exactly where
-    /// [`App::fabric_configured`] says this aterm's fabric is configured.
-    /// NEGATIVE CONTROL, run: the press passing `false` for the fabric fails
-    /// it.
     #[test]
     fn a_press_names_the_fabric_where_this_aterms_fabric_is_on() {
         let root = aterm_tempfile::tempdir().expect("tempdir");
@@ -556,28 +424,15 @@ mod tests {
     }
 
     /// A SUMMARY STARTS IN ATERM'S OWN FOLDER ([`summary_folder`],
-    /// [`summary_booking`]), and the probe of a session's repository reads
-    /// nothing there (`harness_host::session_repo_work`), so its clean
-    /// defense lands under Land, a repository there or not. The review of
-    /// 2026-10-20 found the summary started in the focused pane's folder,
-    /// where the person's own dirty repository kept its landing off for
-    /// good. NEGATIVE CONTROL: the same dirty repository elsewhere is found
-    /// by the probe.
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn a_summary_starts_in_aterms_own_folder_where_no_repository_is_read() {
-        // A state root of the test's own, read once: the process's is another
-        // test's while that test scopes `ATERM_STATE_HOME`, and a read of it
-        // between the folder and the probe (a loaded run) found the folder no
-        // summary's and its repository work.
         let state = aterm_tempfile::tempdir().expect("state root");
         let folder = summary_folder_under(state.path()).expect("the summary folder");
         assert!(folder.is_dir() && in_summary_folder_under(&folder, state.path()));
         let booking = summary_booking(&folder);
         assert_eq!(booking.cwd.as_deref(), folder.to_str());
         assert!(booking.raise);
-        // A dirty repository made there, as a state root inside a checkout
-        // would put one: still nothing read.
         let git = |dir: &std::path::Path, args: &[&str]| {
             let out = aterm_uds::spawnfd::command("git")
                 .args([
@@ -614,7 +469,6 @@ mod tests {
             ),
             None
         );
-        // NEGATIVE CONTROLS.
         let elsewhere = aterm_tempfile::tempdir().expect("tmp");
         dirty(elsewhere.path());
         assert!(!in_summary_folder_under(elsewhere.path(), state.path()));
@@ -627,17 +481,12 @@ mod tests {
     }
 
     /// THE SUMMARY FOLDER IS PRIVATE ([`summary_folder_under`]): made under
-    /// the state root it is given, owner-only (0o700) on unix even where the
-    /// umask would leave it readable by others, and found again. NEGATIVE
-    /// CONTROL: a state root that cannot hold it (a file in its place) gives
-    /// no folder.
     #[test]
     fn the_summary_folder_is_private_to_its_owner() {
         let root = aterm_tempfile::tempdir().expect("tempdir");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
-            // Already there, readable by everyone: the mode is still set.
             let there = root.path().join(SUMMARY_FOLDER);
             std::fs::create_dir(&there).expect("pre-made");
             std::fs::set_permissions(&there, std::fs::Permissions::from_mode(0o755))
@@ -665,10 +514,6 @@ mod tests {
     }
 
     /// WITH NO FOLDER OF ITS OWN, SUMMARIZE REFUSES ([`summary_spawn`]) with
-    /// a plain reason instead of booking a tab where the focused pane was (a
-    /// person's repository, where Land would press the summary to commit and
-    /// push their work). NEGATIVE CONTROL: given its folder, it books there,
-    /// raised, trusting that folder alone.
     #[test]
     fn summarize_with_no_folder_of_its_own_refuses_in_plain_words() {
         let refused = summary_spawn(true, false, None).map(|_| ());
@@ -689,8 +534,6 @@ mod tests {
     }
 
     /// Summarize starts nothing where no worker can start: a headless test
-    /// App hosts no harness, so the row's block is the spawn's own, and the
-    /// press is refused with that reason before anything is booked.
     #[test]
     fn summarize_refuses_with_the_block_before_booking_anything() {
         let mut app = crate::App::headless_for_test();
@@ -700,10 +543,6 @@ mod tests {
     }
 
     /// An App whose worker spawn this test can steer: a window harness
-    /// hosted (as a control socket starts one) and on for a headless
-    /// instance, shell integration on, a zsh — what a worker's spawn needs
-    /// (`App::worker_shell`) — and `claude` on the PATH a new tab starts
-    /// from ([`CLAUDE_ON_PATH_FOR_TEST`]).
     fn workers_app() -> App {
         CLAUDE_ON_PATH_FOR_TEST.set(Some(true));
         let mut app = App::headless_for_test();
@@ -720,12 +559,6 @@ mod tests {
     }
 
     /// A SUMMARY WHOSE TAB DID NOT OPEN IS SAID ON THE BAND, not a stderr
-    /// line a Dock-launched aterm's nobody reads: past every check, a unit
-    /// test's App (no event loop) answers the booked spawn at once with an
-    /// error, and the press's own row says so; a second failure restates the
-    /// one row, and the single-flight reservation was released each time.
-    /// NEGATIVE CONTROL: a role is just a label — an `operator` role standing
-    /// elects nothing, so the summary still books and says it.
     #[test]
     fn a_summary_whose_tab_did_not_open_is_said_on_the_band() {
         let said = |app: &App| {
@@ -746,17 +579,9 @@ mod tests {
     }
 
     /// SUMMARIZE IS GREY FOR WHAT ITS SPAWN WOULD REFUSE: with no window
-    /// harness hosted (no control socket), the harness off, shell integration
-    /// off, a shell no worker's line is written for, or no `claude` to start,
-    /// the row's block names it, and a press is refused that way before
-    /// anything is created — no tab. The CONTROL, an instance a worker can
-    /// start in, has no block, and its press gets past the checks and books
-    /// the spawn (which a unit test's App, with no event loop, answers at
-    /// once: no tab, and the reservation released).
     #[test]
     fn summarize_is_grey_for_what_its_spawn_would_refuse() {
         use crate::control::control_media::WorkerBlock;
-        // What turns a worker off, and the block that names it.
         type Case = (fn(&mut App), fn(&StartBlock) -> bool);
         let blocked: [Case; 5] = [
             (
@@ -807,15 +632,6 @@ mod tests {
     }
 
     /// A FISH THAT SAID IT IS OLDER THAN 3.4 GREYS SUMMARIZE: the first look
-    /// at a fish starts its `--version` off the main thread and blocks
-    /// nothing, and once it has answered `3.3.1` the worker's check refuses it
-    /// (`WorkerBlock::OldFish`) before a worker is created, so the grey row's
-    /// tip says so instead of a launcher that stalls. NEGATIVE CONTROL: a
-    /// fish that answers `3.7.1` passes once it has answered. Each stand-in
-    /// runs once, unclocked, before the product meets it (macOS's first exec
-    /// of a fresh script can outlast the product's own `--version` wait), and
-    /// each must be remembered as the version it named, so a fish that timed
-    /// out fails either half.
     #[cfg(unix)]
     #[test]
     fn a_fish_known_older_than_3_4_greys_summarize() {
@@ -843,7 +659,6 @@ mod tests {
                 app.worker_shell(aterm_phase::Program::Claude).is_ok(),
                 "{version}: not known yet"
             );
-            // A hang detector, not a latency budget: the question must end.
             let asked = std::time::Instant::now();
             let answered = loop {
                 if let Some(answered) = crate::task_launch::fish_answered(&fish) {
@@ -870,12 +685,6 @@ mod tests {
     }
 
     /// THE MENU'S LIVE FILE BITS ARE LOOKED AT AGAIN OFF THE MAIN THREAD: the
-    /// first answer is looked at where it is asked; once it is older than its
-    /// TTL the next ask starts one look on a thread of its own and answers the
-    /// last at once, without waiting for it, and asks while it is out start no
-    /// other; once it has ended its answer stands. NEGATIVE CONTROL: looked at
-    /// again where it is asked, the stale ask waits for the look (here held
-    /// until the test lets it go) and answers it.
     #[test]
     fn a_stale_look_is_looked_at_again_off_the_asking_thread() {
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -888,8 +697,6 @@ mod tests {
             LOOKS.fetch_add(1, Ordering::SeqCst);
             let (open, bell) = &GATE;
             let open = open.lock().unwrap_or_else(PoisonError::into_inner);
-            // Held until the test lets it go, or for the minute that is this
-            // test's hang detector.
             let _ = bell
                 .wait_timeout_while(open, Duration::from_secs(60), |open| !*open)
                 .unwrap_or_else(PoisonError::into_inner);
@@ -904,7 +711,6 @@ mod tests {
         assert_eq!(LOOKS.load(Ordering::SeqCst), 1);
         assert!(!LOOK.answer(ttl, "aterm-test-look", look, t0 + Duration::from_secs(1)));
         assert_eq!(LOOKS.load(Ordering::SeqCst), 1, "fresh: no look");
-        // The next look is held, and finds the answer moved.
         *GATE.0.lock().unwrap_or_else(PoisonError::into_inner) = false;
         ANSWER.store(true, Ordering::SeqCst);
         let stale = t0 + ttl * 2;
@@ -922,7 +728,6 @@ mod tests {
         *GATE.0.lock().unwrap_or_else(PoisonError::into_inner) = true;
         GATE.1.notify_all();
         let began = Instant::now();
-        // Asked as of `t0`: the ended look's own stamp is later, so it is fresh.
         while !LOOK.answer(ttl, "aterm-test-look", look, t0) {
             assert!(
                 began.elapsed() < Duration::from_secs(60),

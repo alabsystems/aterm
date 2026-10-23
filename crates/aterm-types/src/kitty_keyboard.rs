@@ -92,7 +92,7 @@ impl KittyKeyboardFlags {
     /// - 2: Set specified bits, leave others unchanged (OR)
     /// - 3: Clear specified bits, leave others unchanged (AND NOT)
     #[inline]
-    pub fn apply(&mut self, bits: u8, mode: u8) {
+    pub const fn apply(&mut self, bits: u8, mode: u8) {
         let bits = bits & 0b1_1111; // Mask to valid flags
         match mode {
             // Mode 0 is set: the parser delivers an empty mode (`CSI = f ; u`) as 0, and an
@@ -233,7 +233,7 @@ impl KittyKeyboardState {
 
     /// Set flags directly (CSI = flags u or CSI = flags ; mode u).
     #[inline]
-    pub fn set_flags(&mut self, bits: u8, mode: u8) {
+    pub const fn set_flags(&mut self, bits: u8, mode: u8) {
         self.flags.apply(bits, mode);
     }
 
@@ -285,7 +285,7 @@ impl KittyKeyboardState {
 
     /// Pop `count` entries (CSI < n u), restoring the flags the deepest popped entry saved;
     /// popping more entries than the stack holds resets the flags to 0.
-    pub fn pop_flags_for_buffer(&mut self, count: u16, buffer: ScreenBuffer) {
+    pub const fn pop_flags_for_buffer(&mut self, count: u16, buffer: ScreenBuffer) {
         let (stack, sp) = if matches!(buffer, ScreenBuffer::Alternate) {
             (&mut self.alt_stack, &mut self.alt_sp)
         } else {

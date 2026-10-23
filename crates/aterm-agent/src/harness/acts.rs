@@ -1,74 +1,35 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! WHAT THE HARNESS JUST DID, AND HOW A LANDING ENDED, as the window shows
-//! them (`docs/DESIGN-harness-autopilot-2026-10-15.md` §9): the words both
-//! ends of the wire share.
-//!
-//! * [`Act`] — one act of the harness's that the Autopilot chip may light for
-//!   a moment (§9.2.1's seven), with its glyph, its word and its words for a
-//!   screen reader. Told by the loop's single ledger writer through
-//!   `IdleHost::act_taken` ([`crate::supervise::IdleHost::act_taken`]).
-//! * [`Counter`] — the counters of Settings ▸ Harness's WHAT THE HARNESS DID
-//!   ([`super::stats::HarnessStats`]) a ledger row adds to. An act and its
-//!   counter differ where the stats table already makes them differ: a
-//!   question dialog's key lights `Answered` and counts nothing (the
-//!   journal's `chose` counts the dialog, once).
-//! * [`TaskFace`] — the task's face (§9.4.2): open, landed or theirs, and
-//!   the word `status task=` prints for it. Told by the loop through
-//!   `IdleHost::task_face` ([`crate::supervise::IdleHost::task_face`]).
-//! * [`LandHeld`] — why Land still holds (§12.3): the legs that kept a
-//!   land act's yield from landing ([`HoldLeg`]), the open words as indices
-//!   ([`OpenWord`]), the repository's counts, the hold's `since` and its
-//!   nudges. Kept by the loop's policy
-//!   (`supervise::policy::turn_end::TurnEndState::land_held`).
-//! * [`self_claim_act`] — the session log's act word for an act a
-//!   self-supervising agent (codex-alab) tells, its own Autopilot Cruise /
-//!   Autopilot Land acts and its landing ([`RULE_LANDED`]) among them.
-//!
-//! * [`sort`] — THE ONE SORT of a ledger row (its rule, its outcome and the
-//!   command it typed) into the act it lights and the counter it adds to
-//!   (§9.2.3, item 1). The loop's ledger writer tells the window the act
-//!   (`Session::ledger_row`), and the page's fold counts the counter
-//!   ([`super::stats::fold_ledger_line`]): one function says both, so the
-//!   chip and the page never disagree about what an act is.
-//!
-//! Nothing here reads a ledger, a screen or a clock.
+//! Harness act and landing projections shared across the wire: [`Act`]
+//! ([`crate::supervise::IdleHost::act_taken`]), [`Counter`] ([`super::stats::HarnessStats`]),
+//! [`TaskFace`] ([`crate::supervise::IdleHost::task_face`]), [`LandHeld`] ([`HoldLeg`],
+//! [`OpenWord`]), [`self_claim_act`] ([`RULE_LANDED`]), and [`sort`]
+//! ([`super::stats::fold_ledger_line`]).
 
 use crate::supervise::approvals::Outcome;
 use crate::supervise::policy::approval::{
     QuestionPriority, RULE_PLAN, RULE_PROSE_LONG_TERM, RULE_PROSE_SHORT_TERM,
 };
 use crate::supervise::policy::question::{RULE_ANSWER_RECOMMENDED, is_question_rule};
-// A rule id is never reworded (a ledger an earlier build wrote reads the
-// same), so the sort is the policy's own consts.
 use crate::supervise::policy::turn_end::{
     RULE_ANSWER, RULE_API_BACK, RULE_API_CUTOFF, RULE_API_RETRY, RULE_COMPACT, RULE_CONTINUE,
     RULE_DONE_CHECK, RULE_HOST_TURN, RULE_LAND, RULE_LAND_ANSWER, RULE_LAND_NUDGE,
     RULE_LIMIT_RESUME, RULE_LOGIN_BACK, RULE_OPEN_ITEMS, RULE_SUGGESTION, RULE_UNCOMMITTED,
 };
 
-/// One act of the harness's, as the Autopilot chip names it for a moment
-/// (§9.2.1): the seven the page's own act families hold (approved, declined,
-/// answered, continued, resumed, landed — Land's instruction and its nudge
-/// apart). Nothing else lights the chip: not a `skipped`, `deferred`,
-/// `waiting` or `escalated` row, and not the `typed` rows the page counts
-/// only by rule (`/compact`, `/model`, a login, a consent).
+/// One act of the harness's, as the Autopilot chip names it for a moment.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Act {
     /// A box approved (`approved` under a box's rule).
     Approved,
     /// A box declined with a reason (`declined`).
     Declined,
-    /// A question answered: a dialog's keys (one label for the whole dialog)
-    /// or a prose answer typed (`answer@v1`, `prose-*@v1`, `land-answer@v1`).
+    /// A question answered: a dialog's keys (one label for the whole dialog) or a prose answer.
     Answered,
-    /// The work kept moving (`continue@v1`, `continue-suggestion@v1`,
-    /// `continue-done-check@v1`, `continue-open-items@v1`,
-    /// `continue-uncommitted@v1`).
+    /// The work kept moving.
     Continued,
-    /// Carried past a wall: a usage reset, an API error, a cut reply, a full
-    /// context's continuation (not its `/compact`).
+    /// Carried past a wall: a usage reset, an API error, a cut reply.
     Resumed,
     /// Land's instruction typed (`land@v1`).
     Landing,
@@ -77,7 +38,7 @@ pub enum Act {
 }
 
 impl Act {
-    /// Every act, in §9.2.1's order.
+    /// Every act, in display order.
     pub const ALL: [Act; 7] = [
         Act::Approved,
         Act::Declined,
@@ -88,8 +49,7 @@ impl Act {
         Act::Nudged,
     ];
 
-    /// The act's glyph, drawn before its word: `✓`, `✗`, `?`, `↻`, `⧗` (the
-    /// footer's own wall mark) and `⤓` for both of Land's.
+    /// The act's glyph, drawn before its word.
     #[must_use]
     pub const fn glyph(self) -> &'static str {
         match self {
@@ -116,10 +76,7 @@ impl Act {
         }
     }
 
-    /// The act in words a screen reader says, no glyph: letters and spaces
-    /// only, in §9.2.1's form (`Last: approved at 14:05.`) — the label's own
-    /// word, but for Land's instruction, whose `landing` would read as a
-    /// landing still to come at that time: `started landing`.
+    /// The act in words a screen reader says, no glyph.
     #[must_use]
     pub const fn spoken(self) -> &'static str {
         match self {
@@ -129,8 +86,7 @@ impl Act {
     }
 }
 
-/// A counter of WHAT THE HARNESS DID ([`super::stats::HarnessStats`]) one
-/// ledger row adds to; a row with none counts only by its rule.
+/// A counter of what the harness did ([`super::stats::HarnessStats`]) one ledger row adds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Counter {
     /// [`super::stats::HarnessStats::approved`].
@@ -143,42 +99,20 @@ pub enum Counter {
     Continued,
     /// [`super::stats::HarnessStats::resumed`].
     Resumed,
-    /// [`super::stats::HarnessStats::land_prompts`]: Land's instruction and
-    /// its nudges typed (`land@v1`, `land-nudge@v1`) — land PROMPTS, never
-    /// landings: the chip's `⤓ landing` and `⤓ nudged` light the same rows.
+    /// [`super::stats::HarnessStats::land_prompts`].
     LandPrompts,
 }
 
-/// What one ledger row is ([`sort`]): the act it lights on the Autopilot
-/// chip, and the counter of WHAT THE HARNESS DID it adds to. Apart, because
-/// they differ where the stats table already makes them differ: a question
-/// dialog's key lights [`Act::Answered`] and counts nothing.
+/// What one ledger row is ([`sort`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Sorted {
-    /// The act the chip lights for a moment; `None`: the row lights nothing.
+    /// The act the chip lights for a moment.
     pub act: Option<Act>,
-    /// The counter the page adds the row to; `None`: only
-    /// [`super::stats::HarnessStats::by_rule`].
+    /// The counter the page adds the row to.
     pub counter: Option<Counter>,
 }
 
-/// THE ONE SORT (`docs/DESIGN-harness-autopilot-2026-10-15.md` §9.2.3, item
-/// 1): what a ledger row under `rule_id` with `outcome`, typing `command`,
-/// lights and counts — the stats table's own rows
-/// ([`super::stats`]' module docs):
-///
-/// | Row | Act | Counter |
-/// |---|---|---|
-/// | `approved` under a box's rule | [`Act::Approved`] | [`Counter::Approved`] |
-/// | `approved` under a question dialog's rule (`answer-*@v1`, `land-answer@v1`): one key of the dialog | [`Act::Answered`] | none: the journal's `chose` counts the dialog, once |
-/// | `declined` | [`Act::Declined`] | [`Counter::Declined`] |
-/// | `typed` `continue@v1`, `policy-continue@v1`, `continue-suggestion@v1`, `continue-done-check@v1`, `continue-open-items@v1`, `continue-uncommitted@v1` | [`Act::Continued`] | [`Counter::Continued`] |
-/// | `typed` `answer@v1`, `prose-*@v1`, `land-answer@v1` | [`Act::Answered`] | [`Counter::Answered`] |
-/// | `typed` `land@v1` | [`Act::Landing`] | [`Counter::LandPrompts`] |
-/// | `typed` `land-nudge@v1` | [`Act::Nudged`] | [`Counter::LandPrompts`] |
-/// | `typed` `usage-resume@v1`, `api-retry@v1`, `api-back@v1`, `api-cutoff@v1`, and `context-compact@v1` typing anything but a slash command (the continuation) | [`Act::Resumed`] | [`Counter::Resumed`] |
-/// | `typed` under any other rule (`context-compact@v1`'s `/compact` among them) | none | none |
-/// | `skipped`, `deferred`, `waiting`, `escalated` | none | none |
+/// Sort a ledger row (`rule_id`, `outcome`, `command`) into its act and counter.
 #[must_use]
 pub fn sort(rule_id: &str, outcome: Outcome, command: &str) -> Sorted {
     let sorted = |act, counter| Sorted {
@@ -200,17 +134,11 @@ pub fn sort(rule_id: &str, outcome: Outcome, command: &str) -> Sorted {
 }
 
 /// Whether an `approved` row under `rule` is one key of a question dialog
-/// (its tab, a toggle, its submit) rather than a box's press. Land's answer
-/// is among them for the day Land answers dialogs: deferred (design §2.2),
-/// so today a dialog under Land is keyed under the question rules, and
-/// [`RULE_LAND_ANSWER`] is only ever typed in prose.
 fn is_dialog_key(rule: &str) -> bool {
     is_question_rule(rule) || rule == RULE_LAND_ANSWER
 }
 
 /// Whether a `typed` row under `rule` answers a question asked in prose:
-/// `answer_text` under any priority ([`QuestionPriority::prose_rule_id`]),
-/// or Land's answer.
 fn is_prose_answer(rule: &str) -> bool {
     rule == RULE_LAND_ANSWER
         || QuestionPriority::ALL
@@ -219,7 +147,6 @@ fn is_prose_answer(rule: &str) -> bool {
 }
 
 /// The act and counter of a `typed` row under `rule`, typing `command`;
-/// `None`: one the page counts only by its rule.
 fn typed_act(rule: &str, command: &str) -> Option<(Act, Counter)> {
     if matches!(
         rule,
@@ -248,23 +175,7 @@ fn typed_act(rule: &str, command: &str) -> Option<(Act, Counter)> {
     }
 }
 
-/// THE SESSION LOG'S `act` MARK for a ledger row:
-/// the request words `act word=<w> [rule=<id>]` that follow
-/// `mark -`, or `None` for a row that is no act of the log's. The word is
-/// the log's act vocabulary for what [`sort`] lit, sorted whatever host the
-/// loop has:
-///
-/// | Row | `word=` |
-/// |---|---|
-/// | [`Act::Approved`] | `approve` |
-/// | [`Act::Declined`] | `deny` |
-/// | [`Act::Answered`] | `answer` |
-/// | [`Act::Continued`], [`Act::Resumed`] | `continue` |
-/// | [`Act::Landing`], [`Act::Nudged`] | `dispatch` |
-/// | `escalated` (lights nothing) | `escalate` |
-///
-/// `rule=` is the row's rule id with `@` mapped to `.` (a mark's `rule=`
-/// holds no `@`), only the bytes a log id keeps, cut at 40; none for `-`.
+/// The session log's `act` mark for a ledger row.
 #[must_use]
 pub fn log_mark(rule_id: &str, outcome: Outcome, command: &str) -> Option<String> {
     let word = if outcome == Outcome::Escalated {
@@ -287,7 +198,6 @@ pub fn log_mark(rule_id: &str, outcome: Outcome, command: &str) -> Option<String
 }
 
 /// A rule id as a session log `rule=`: `@` mapped to `.` (a mark's `rule=`
-/// holds no `@`), only the bytes a log id keeps, cut at 40.
 fn log_rule(rule_id: &str) -> String {
     rule_id
         .chars()
@@ -297,42 +207,7 @@ fn log_rule(rule_id: &str) -> String {
         .collect()
 }
 
-/// The act words of a SELF-SUPERVISED agent's own acts:
-/// codex-alab, a proven self-claim's holder, tells each act it took
-/// with `meta set harness_act <act>`, the act being the rule id it acted
-/// under (`docs/measured/codex-alab-proof-2026-10-16.md`'s legs), and aterm
-/// writes it as the log's `act word=<w> rule=<act, @ written.>` beside the
-/// `harness-act` row — the word this table gives, as [`log_mark`] gives the
-/// loop's. codex-alab runs Autopilot Cruise / Land itself (the
-/// contract's §5 Cruise and Land rows, owner 2026-10-19), under the rule ids
-/// aterm's own loop types them by, so its acts get the words the loop's get
-/// ([`log_mark`]: Cruise's defend prompt is a `continue`, Land's instruction
-/// and nudge a `dispatch`, Land's answer an `answer`), and its landing — a
-/// clean defense at a land act's yield, recorded and never typed — a word of
-/// its own:
-///
-/// | `<act>` | `word=` |
-/// |---|---|
-/// | `approve-all@v1` | `approve` |
-/// | `answer-recommended@v1`, `land-answer@v1`, `answer@v1`, `prose-long-term@v1`, `prose-short-term@v1` | `answer` |
-/// | `continue@v1`, `policy-continue@v1`, `usage-resume@v1`, `continue-done-check@v1`, `api-retry@v1`, `api-cutoff@v1`, `context-compact@v1` | `continue` |
-/// | `upgrade@v1` | `relaunch` |
-/// | `harness-turn@v1`, `land@v1`, `land-nudge@v1` | `dispatch` |
-/// | `landed@v1` | `landed` ([`LANDED_WORD`]) |
-///
-/// Cruise's prose answers and the walls' acts (a server error's retry, a
-/// cut-off reply's, the compaction's continuation) are typed as aterm's own
-/// loop types them, so they get its typed rows' words ([`log_mark`]). The act
-/// carries no command, so `context-compact@v1` reads `continue` for
-/// codex-alab's compaction itself too, which it records under the same act as
-/// the continuation after it (aterm's own `/compact` row lights nothing).
-///
-/// Any other act (`finished@v1`, the retired token's end, which no build
-/// records now; `left-to-person@v1`, a point left to a person's own exchange,
-/// recorded and never typed, as aterm's own loop's `LEFT` row lights
-/// nothing; a word no proof showed) is `None`: its row stands alone,
-/// and no act mark is guessed for it. The rule is the act itself, so
-/// `rule=` never names a rule the holder did not.
+/// The act words of a self-supervised agent's own acts.
 #[must_use]
 pub fn self_claim_act(act: &str) -> Option<(&'static str, String)> {
     let word = match act {
@@ -352,48 +227,19 @@ pub fn self_claim_act(act: &str) -> Option<(&'static str, String)> {
     Some((word, log_rule(act)))
 }
 
-/// WHETHER A SELF-CLAIM'S ACT TYPES A TURN (Autopilot Land): the acts a
-/// proven self-claim's holder (codex-alab) records as it starts a turn of its
-/// own. Those are the act table's typed rows ([`typed_act`]: a continuation, a
-/// land act or nudge, a prose answer, a resume past a wall, the compaction
-/// and the continuation after it, all recorded with no command), a turn the
-/// session's host typed (`harness-turn@v1`), and the plan box's yes
-/// (`plan-approve@v2`), which submits `Implement the plan.` as a new turn.
-///
-/// Every other act begins no turn: an approval or a question box's answer
-/// inside a running turn (`approve-all@v1`, `answer-*@v1`), a report mailed
-/// (`mail-report@v1`), a lost login escalated (`auth-login@v1`), the landing,
-/// the point left to a person, the re-exec, and an act this table does not
-/// know. The window marks a landing by the turn its holder's last
-/// turn-typing act typed (`aterm-gui`'s `SessionTimeline::typed_turn`), so an
-/// act that begins none leaves that turn as it was: a report mailed at rest
-/// after the land turn ended is no turn still to come.
+/// Whether a self-claim's act types a turn (Autopilot Land).
 #[must_use]
 pub fn self_claim_types_turn(act: &str) -> bool {
     act == RULE_HOST_TURN || act == RULE_PLAN || typed_act(act, "").is_some()
 }
 
-/// The session log's act word for a self-claim's landing ([`RULE_LANDED`],
-/// [`self_claim_act`]): everything on the remote main branch, defended
-/// clean — no act of aterm's own loop, whose landing is its `DONE … rule=land@v1`
-/// journal row and the task face [`TaskFace::Landed`].
+/// The session log's act word for a self-claim's landing ([`RULE_LANDED`], [`self_claim_act`]).
 pub const LANDED_WORD: &str = "landed";
 
-/// The act word of the hosted lanes' relaunch and upgrade rows
-/// ([`relaunch_act`]).
+/// The act word of the hosted lanes' relaunch and upgrade rows ([`relaunch_act`]).
 pub const RELAUNCH_WORD: &str = "relaunch";
 
-/// THE HOSTED LANES' ACT MARK:
-/// the `rule=` of the log's `act word=relaunch` written beside one relaunch
-/// or upgrade row of the window's harness host (`relaunch`,
-/// `upgrade-at-break`, `carry-restart`, `restart:account`, …: the row's own
-/// name, as a log id), when the row's step MOVED the session
-/// ([`super::upgrade_drive::moved`]: it typed a turn into the agent or
-/// ended it). A row that waited, skipped, refused, failed or gave up moved
-/// nothing, and `None` claims no relaunch for it. The mark is the harness's
-/// signature on that pass: the turn the upgrade drive types still reads
-/// `by=ctl` (its transport stays the control socket, T25), and a log reader
-/// learns from this mark which pass was the harness's.
+/// The hosted lanes' act mark.
 #[must_use]
 pub fn relaunch_act(row: &str, step: &str) -> Option<String> {
     if !super::upgrade_drive::moved(step) {
@@ -405,46 +251,29 @@ pub fn relaunch_act(row: &str, step: &str) -> Option<String> {
 
 /// codex-alab's approval of an escalated box (the proof's `approval` leg).
 const RULE_APPROVE_ALL: &str = "approve-all@v1";
-/// codex-alab's re-exec onto a re-linked build (the proof's `upgrade` leg):
-/// the same conversation resumed by a new image, which carries a landing
-/// across, so it moves no task face.
+/// Codex-alab's re-exec onto a re-linked build (the proof's `upgrade` leg).
 pub const RULE_UPGRADE: &str = "upgrade@v1";
-/// codex-alab's bounded continuation of independent allowed work after a
-/// cybersecurity refusal. The rejected action stays excluded; this is new
-/// work continued, never a retry of the refused action.
+/// Codex-alab's bounded continuation of independent allowed work after a cybersecurity refusal.
 pub const RULE_POLICY_CONTINUE: &str = "policy-continue@v1";
-/// codex-alab's LANDING under its own Land (the contract's §5 Land row): a
-/// clean `Nothing left:` defense at a land act's yield over a repository its
-/// probe finds clean, after which it types nothing until someone else's turn.
-/// Recorded with `meta set harness_act`, never typed.
+/// Codex-alab's landing under its own Land (the contract's Land row).
 pub const RULE_LANDED: &str = "landed@v1";
 
 /// The longest `rule=` a session log id holds (`aterm_slog::ShortId::MAX`).
 const LOG_RULE_MAX: usize = 40;
 
-/// The task's face (§9.4.2), told by the loop as it moves. Autopilot Cruise /
-/// Autopilot Land: Cruise never rests, so its face is open; Land's is open
-/// until a clean defense lands the work.
-///
-/// | Face | Means | `task=` |
-/// |---|---|---|
-/// | [`TaskFace::Open`] | the work goes on, or a landing is under way | `open` |
-/// | [`TaskFace::Landed`] | everything is on the remote main branch, defended clean | `landed` |
-/// | [`TaskFace::Theirs`] | a person's own exchange | `theirs` |
+/// The task's face, told by the loop as it moves.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum TaskFace {
     /// Nothing ended: the work goes on, or a landing is under way.
     Open,
-    /// A clean defense at a land act's yield: the harness types nothing
-    /// more until someone else's turn.
+    /// A clean defense at a land act's yield.
     Landed,
-    /// A person's own exchange: the harness types nothing until someone
-    /// else's turn ends.
+    /// A person's own exchange.
     Theirs,
 }
 
 impl TaskFace {
-    /// Every face, in §9.4.1's order.
+    /// Every face, in display order.
     pub const ALL: [TaskFace; 3] = [TaskFace::Open, TaskFace::Landed, TaskFace::Theirs];
 
     /// The word `status` and `ls` print for it (`task=`).
@@ -458,47 +287,20 @@ impl TaskFace {
     }
 }
 
-/// WHY LAND STILL HOLDS (the Autopilot design's §12.3): the hold a Land
-/// episode stands at, as the loop keeps it
-/// (`supervise::policy::turn_end::TurnEndState::land_held`). `None` there
-/// until the episode's instruction is typed, and at a landing (and after
-/// it, until Land's next act begins the hold again), at a person's own
-/// exchange, outside Land, at Off and at the loop's end.
-///
-/// The legs are the yield's: set at a land act's yield that did not land,
-/// each leg the verdict's own reading evaluated in full (where the verdict
-/// stops at the first), kept through the act's own next turn, and dropped
-/// at someone else's turn (`read` false: its live read, or its end where no
-/// read saw it run), which may change every one of them. `since_ms` and
-/// `nudges` stay with the hold.
-///
-/// `Copy` and small, with no `Instant`, no `String` and no path: the open
-/// words are indices into the strict reading's own word tables
-/// ([`OpenWord`]), and the need's words are the standing set's, read beside
-/// the hold, so one set is never counted two ways.
+/// Why Land still holds.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct LandHeld {
-    /// When the land act that began the hold was ledgered, unix ms: the
-    /// episode's instruction (`land@v1`), or the first land act typed after
-    /// a landing (`supervise::policy::turn_end::HoldStart`); a loop that
-    /// follows seeds it from that row (`supervise::approvals::LandSeed::hold`).
-    /// `None` where no row says (an older ledger, an instruction a wall's
-    /// continuation typed).
+    /// When the land act that began the hold was ledgered, unix ms.
     pub since_ms: Option<i64>,
     /// The nudges (`land-nudge@v1`) typed since that act.
     pub nudges: u32,
-    /// A land act's yield was judged, and no other turn ran since: the
-    /// legs below are that yield's.
+    /// A land act's yield was judged, and no other turn ran.
     pub read: bool,
     /// What held the landing at that yield, a bit per [`HoldLeg`].
     pub legs: u8,
-    /// The first four words Land's strict reading found open
-    /// ([`HoldLeg::Open`]).
+    /// The first four words Land's strict reading found open ([`HoldLeg::Open`]).
     pub open: [Option<OpenWord>; 4],
-    /// The repository's work at that yield ([`HoldLeg::Repo`];
-    /// `crate::harness::repo_work::RepoWork`'s counts, saturated): tracked
-    /// paths changed, untracked paths, stash entries, commits no remote
-    /// holds, commits the remote's main lacks.
+    /// The repository's work at that yield.
     pub changed: u16,
     pub untracked: u16,
     pub stashes: u16,
@@ -524,13 +326,10 @@ impl LandHeld {
     }
 }
 
-/// ONE LEG OF A HOLD ([`LandHeld::legs`]), in the order the owner can act on
-/// them: a need said this turn, the repository's work, the open words Land's
-/// strict reading found, no defense yet, a reply too tall to read whole.
+/// One leg of a hold ([`LandHeld::legs`]), in the order the owner can act on them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum HoldLeg {
-    /// The reply named a need (`NEEDS YOU:`), in its last words or earlier
-    /// in the same turn.
+    /// The reply named a need (`NEEDS YOU:`), in its last words or earlier in the same turn.
     Needs,
     /// The session's repository holds work no remote main has.
     Repo,
@@ -552,8 +351,7 @@ impl HoldLeg {
         HoldLeg::Cut,
     ];
 
-    /// Its bit in [`LandHeld::legs`]: NEEDS 1, REPO 2, OPEN 4, DEFENSE 8,
-    /// CUT 16.
+    /// Its bit in [`LandHeld::legs`].
     #[must_use]
     pub const fn bit(self) -> u8 {
         match self {
@@ -565,8 +363,7 @@ impl HoldLeg {
         }
     }
 
-    /// Its word in `status land_held=` (the Autopilot design's §12.3.2,
-    /// which 3c prints).
+    /// Its word in `status land_held=`.
     #[must_use]
     pub const fn word(self) -> &'static str {
         match self {
@@ -579,16 +376,12 @@ impl HoldLeg {
     }
 }
 
-/// ONE WORD LAND'S STRICT READING FOUND OPEN, as an index into that
-/// reading's own word tables
-/// (`supervise::policy::turn_end::open_word_index`): two bytes and `Copy`,
-/// where the word itself would be sixteen. Its `Debug` is the word.
+/// One word Land's strict reading found open, as an index into its word tables.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct OpenWord(std::num::NonZeroU16);
 
 impl OpenWord {
-    /// The index of `word`, a spelling the strict reading names; `None`
-    /// for any other.
+    /// The index of `word`, a spelling the strict reading names.
     #[must_use]
     pub fn of(word: &str) -> Option<Self> {
         crate::supervise::policy::turn_end::open_word_index(word).map(Self)
@@ -613,9 +406,6 @@ mod tests {
     use super::*;
 
     /// Each act's glyph and word are its own pair (Land's two share the
-    /// glyph and differ in the word), and its spoken words carry no glyph:
-    /// the label's word, as §9.2.1 says it (`approved`), but Land's
-    /// instruction (`started landing`), and no two acts say the same.
     #[test]
     fn every_act_has_its_face_and_words_with_no_glyph() {
         let mut faces = std::collections::BTreeSet::new();
@@ -649,7 +439,6 @@ mod tests {
     };
 
     /// The counter each act's family adds to, were an act its own counter:
-    /// what [`sort`] gives everywhere but a dialog's key.
     fn family(act: Act) -> Counter {
         match act {
             Act::Approved => Counter::Approved,
@@ -662,15 +451,6 @@ mod tests {
     }
 
     /// THE SORT IS THE STATS TABLE'S: every rule each family counts lights
-    /// that family's act and adds to its counter; a question dialog's key
-    /// lights `Answered` and counts nothing; `context-compact@v1` typing
-    /// `/compact` is nothing, and typing anything else is `Resumed` for
-    /// both; the rules counted only by rule, and every `skipped`,
-    /// `deferred`, `waiting` and `escalated` row, are nothing.
-    ///
-    /// NEGATIVE CONTROL: an act taken as its own counter (`Act::of`'s first
-    /// draft, design §9.2.3) differs from the sort in exactly the dialog's
-    /// keys — the one place the two must part — and nowhere else.
     #[test]
     fn the_sort_is_the_stats_tables() {
         let lit = |act, counter| Sorted {
@@ -691,8 +471,6 @@ mod tests {
                 "{rule}"
             );
         }
-        // The usage-limit dialog's wait row is a box's press, as the page
-        // counts it.
         assert_eq!(
             sort(RULE_LIMIT_WAIT, approved, ""),
             lit(Act::Approved, Counter::Approved)
@@ -781,7 +559,6 @@ mod tests {
             RULE_MODEL_RESTORE,
             RULE_ACCOUNT,
             RULE_MEMORY_RESTART,
-            // An older loop's save-then-wait row (the Codex harness, retired).
             "model-wind-down@v1",
             RULE_HOST_TURN,
             RULE_USAGE_PROBE,
@@ -813,8 +590,6 @@ mod tests {
                 );
             }
         }
-        // NEGATIVE CONTROL: the act as its own counter parts from the sort
-        // at a dialog's keys alone.
         let mut parted = Vec::new();
         for outcome in Outcome::ALL {
             for rule in every_rule.into_iter().chain(keys) {
@@ -845,10 +620,6 @@ mod tests {
     }
 
     /// THE SESSION LOG'S `act` WORDS (addendum A17): each act's row maps to
-    /// the log's act vocabulary — Continued and Resumed both `continue`,
-    /// Land's two `dispatch` — an escalated row to `escalate`, and a row
-    /// that lights nothing to no mark. `rule=` maps `@` to `.`, keeps only
-    /// a log id's bytes, is cut at 40, and is left out for `-`.
     #[test]
     fn each_act_is_one_log_word() {
         use crate::supervise::policy::turn_end::RULE_LAND_NUDGE;
@@ -913,19 +684,6 @@ mod tests {
     }
 
     /// A SELF-SUPERVISED AGENT'S ACTS ARE THE LOG'S ACT WORDS (plan 5C-2):
-    /// every act codex-alab's proof shows (`docs/measured/
-    /// codex-alab-proof-2026-10-16.md`), and every act of its own FOREVER
-    /// CRUISE / Autopilot Land (the contract's §5 Cruise and Land rows), maps
-    /// to one word, `rule=` the act with `@` written `.`; the acts that are
-    /// no act of the log's (`finished@v1`, the retired token's end; a word
-    /// nobody measured; a near miss) map to none, and the table counts them.
-    /// Each word is one the session log's `word=` vocabulary holds, so the
-    /// mark is written (`aterm_slog::Fields::word`). NEGATIVE CONTROLS: a
-    /// Forever act's rule id spelled at another version, and the retired
-    /// rules (the open-items and uncommitted challenges no build types now),
-    /// map to none; a word outside the log's vocabulary is refused by it;
-    /// and a self-claim's act gets the word aterm's own loop's typed row
-    /// under the same rule gets ([`log_mark`]), landing aside.
     #[test]
     fn a_self_claims_acts_are_the_logs_act_words() {
         let cases = [
@@ -1004,13 +762,6 @@ mod tests {
     }
 
     /// A SELF-CLAIM'S ACT TYPES A TURN ONLY WHERE IT STARTS ONE (review of
-    /// codex-alab parity-4, R1): every act codex-alab records that begins a
-    /// turn of its own types one, and the acts that begin none (an approval
-    /// or a box's answer inside a turn, a report mailed, a login escalated,
-    /// the landing, the point left to a person, the re-exec, the retired
-    /// token, a near miss) type none. NEGATIVE CONTROL: the log's act words
-    /// cannot tell them apart — `approve-all@v1` and `harness-turn@v1` both
-    /// have a word, `plan-approve@v2` and `mail-report@v1` neither.
     #[test]
     fn a_self_claims_act_types_a_turn_only_where_it_starts_one() {
         let cases = [
@@ -1053,10 +804,6 @@ mod tests {
     }
 
     /// THE HOSTED LANES' ACT MARK (plan 5F-2, T25): a relaunch or upgrade
-    /// row whose step moved the session (typed a turn, or ended or relaunched
-    /// the agent) is one `act word=relaunch rule=<row>`; a row that moved
-    /// nothing is none. NEGATIVE CONTROL: the same row names with a wait, a
-    /// refusal or a failure claim no relaunch.
     #[test]
     fn a_hosted_relaunch_row_that_moved_the_session_is_a_relaunch_act() {
         let cases = [
@@ -1101,14 +848,6 @@ mod tests {
     }
 
     /// ONLY A STEP THAT BROUGHT A NEW AGENT UP STARTED ONE:
-    /// of the hosted rows' steps that moved the session,
-    /// the relaunch line typed, the relaunched process adopted and a fresh
-    /// start brought a new agent process up; a turn typed into the running
-    /// agent (a notice, a carry-on, a release, a restore line, the done
-    /// check) and a stop with no start yet did not, and a step that moved
-    /// nothing started nothing. Every started step moved the session.
-    /// NEGATIVE CONTROL (by scratch revert): `started` read as `moved`
-    /// starts an agent on every typed turn and stop.
     #[test]
     fn only_a_step_that_brought_a_new_agent_up_started_one() {
         use super::super::upgrade_drive::{moved, started};

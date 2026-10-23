@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Fleet membership's tests: the join code's checks, the book's files and
-//! rules, and a join and a reach over real loopback fleet listeners.
+//! Tests for fleet membership join codes, peer book persistence, and loopback join/reach flows.
 
 use super::*;
 use crate::fleet::{FleetEvent, Listening, read_key_file, serve};
@@ -84,8 +83,6 @@ fn join(chars: &[char], issuer: &str) -> String {
 }
 
 /// A code reads back as itself, from what a person might paste: another case,
-/// no group dashes, white space around, Crockford's look-alikes; and its
-/// issuer may be a name, an IPv4 or an IPv6 address.
 #[test]
 fn a_join_code_reads_back_as_itself() {
     let code = code();
@@ -133,16 +130,10 @@ fn a_join_code_reads_back_as_itself() {
 }
 
 /// A CODE IS FOUND WHEREVER IT SITS (what the survey's redaction replaces):
-/// whole as printed, its secret's groups without the `atf1-`, in capitals,
-/// with spaces for its dashes, without dashes at all, and its issuer taken
-/// with it, the words around it left out of the span. NEGATIVE CONTROLS: the
-/// same characters with one mistyped (no codeword), a run one character
-/// short, and an ordinary sentence of code characters hold none.
 #[test]
 fn a_join_code_is_found_wherever_it_sits() {
     let text = code().text();
     let body = &text[CODE_PREFIX.len()..text.find('@').unwrap()];
-    // The one span `t` holds, as text; `None` for none or several.
     let span = |t: &str| -> Option<String> {
         match code_spans(t).as_slice() {
             [one] => Some(t[one.clone()].to_owned()),
@@ -177,9 +168,6 @@ fn a_join_code_is_found_wherever_it_sits() {
 }
 
 /// THE CHECK CHARACTERS: every one-character typo at every place — each of
-/// the alphabet's other 31 characters — and every swap of two different
-/// neighbours is refused as a typo, so no mistyped code becomes a wrong
-/// secret written to disk.
 #[test]
 fn every_one_character_typo_and_neighbour_swap_is_refused() {
     let (chars, issuer) = split(&code().text());
@@ -216,7 +204,6 @@ fn every_one_character_typo_and_neighbour_swap_is_refused() {
 }
 
 /// A text that is not a whole code is refused by what is wrong with it, and
-/// no refusal quotes a character of it.
 #[test]
 fn a_code_that_is_not_whole_is_refused_by_what_is_wrong() {
     let text = code().text();
@@ -262,7 +249,6 @@ fn a_code_that_is_not_whole_is_refused_by_what_is_wrong() {
 }
 
 /// The key file `init` and `join` write is the one the listener reads, and
-/// the node id is minted once and kept.
 #[test]
 fn the_key_and_the_node_id_are_written_as_their_readers_read_them() {
     let state = State::new("key");
@@ -286,11 +272,6 @@ fn the_key_and_the_node_id_are_written_as_their_readers_read_them() {
 }
 
 /// THE NODE KEY is minted once, beside the node id, and kept: written 0600 as
-/// its seed's 64 hex digits and a newline, read back as the same key, never
-/// minted by a reader, and a broken file is refused rather than re-minted —
-/// a new key would be another node to the issuer that bound the old one. A
-/// held membership claim refuses a mint without changing either identity
-/// file, before and after a winner exists; releasing it permits the read.
 #[test]
 fn a_node_key_is_minted_once_and_read_back_as_itself() {
     let state = State::new("nodekey");
@@ -364,8 +345,6 @@ fn a_node_key_is_minted_once_and_read_back_as_itself() {
 }
 
 /// `ensure_private_dir` makes a missing state directory 0700, narrows one
-/// open to others and says what it was, and refuses a symlink; a writer
-/// refuses a directory that is not private rather than repair it.
 #[test]
 fn the_state_directory_is_made_private_and_a_symlink_refused() {
     let state = State::new("dir");
@@ -434,7 +413,6 @@ fn node_of(byte: u8) -> String {
 }
 
 /// The node `node` with a key from one repeated seed byte: another seed is
-/// another key for the same node id.
 fn identity(node: &str, seed: u8) -> NodeIdentity {
     NodeIdentity::from_seed(node, &[seed; 32]).unwrap()
 }
@@ -456,9 +434,6 @@ fn keyed(node: u8, key: NodeKey, ip: [u8; 4], port: u16) -> Peer {
 }
 
 /// A PEER'S KEY IS ON ITS LINE, after its node id, and reads back as
-/// itself; a line an older aterm wrote, with no `key=`, binds none. A key is
-/// a node id's, so one without a node id is refused, and so is one that is
-/// no key.
 #[test]
 fn a_peers_key_is_on_its_line_and_an_older_line_binds_none() {
     let peer = keyed(0xab, identity(&node_of(0xab), 1).key(), [10, 0, 0, 7], 7100);
@@ -493,8 +468,6 @@ fn a_peers_key_is_on_its_line_and_an_older_line_binds_none() {
         .replace("key=-", &format!("key={}", "ab".repeat(32)));
     assert_eq!(Peer::parse(&keyless_node), None, "a key with no node id");
 
-    // Where an unbound node's key may be bound from is on its line, after its
-    // key, and only there: a bound node's is dropped, as is one with no node.
     let moved = Peer {
         key_from: Some(IpAddr::from([10, 0, 0, 8])),
         ..joined(0xab, "m7.local", [10, 0, 0, 66], 7100)
@@ -523,8 +496,6 @@ fn a_peers_key_is_on_its_line_and_an_older_line_binds_none() {
 }
 
 /// A peer is one line and reads back as itself; a line that is not a peer
-/// (a hand edit gone wrong, a host that could carry a control character) is
-/// refused by its line number.
 #[test]
 fn a_peer_is_one_line_and_a_bad_line_is_refused() {
     for peer in [
@@ -561,8 +532,6 @@ fn a_peer_is_one_line_and_a_bad_line_is_refused() {
 }
 
 /// THE BOOK IS PRIVATE: read only when it and its directory are this user's
-/// alone — a group or other bit on either, a second link, a symlink at
-/// either is refused — and no file at all is an empty book.
 #[test]
 fn the_book_is_read_only_when_private() {
     let state = State::new("book");
@@ -613,8 +582,6 @@ fn the_book_is_read_only_when_private() {
 }
 
 /// The book is keyed by node id: a registration replaces its node's entry and
-/// a person's entry for the same place, a person's peer is added once, and a
-/// full book refuses a newcomer rather than evict a member.
 #[test]
 fn the_book_is_keyed_by_node_and_never_grows_past_its_cap() {
     let mut book = vec![manual("10.0.0.7", 7100), manual("lab-mini", 7100)];
@@ -631,7 +598,6 @@ fn the_book_is_keyed_by_node_and_never_grows_past_its_cap() {
     moved.version = Some("0.96.0".to_owned());
     assert_eq!(record(&mut book, moved.clone()), Ok(Recorded::Updated));
     assert_eq!(book.iter().filter(|p| p.node == moved.node).count(), 1);
-    // Bound to no key, it binds one only from where it was recorded.
     moved.key_from = Some(IpAddr::from([10, 0, 0, 7]));
     assert_eq!(book.iter().find(|p| p.node == moved.node), Some(&moved));
     assert_eq!(
@@ -662,14 +628,6 @@ fn the_book_is_keyed_by_node_and_never_grows_past_its_cap() {
 }
 
 /// ONE ADDRESS, A FEW MEMBERS, NONE EVICTED: a registration from an address
-/// and port the book holds for another node — on DHCP, an address that
-/// passed from a machine that moved — is an entry beside it, never in its
-/// place, and the machine that moved keeps its entry until it joins again
-/// from where it is now. Every node registered from an address counts
-/// toward its share, so an address that has registered its share is refused
-/// a node more: a made-up one, or a member's moved there by its node id,
-/// whose entry stays where it was. A member of that address re-joins, and
-/// another address still registers.
 #[test]
 fn one_address_registers_a_few_members_and_evicts_none() {
     let (moved, elsewhere) = (
@@ -732,11 +690,6 @@ fn one_address_registers_a_few_members_and_evicts_none() {
 }
 
 /// A REGISTRATION STANDS FOR A PERSON'S ENTRY AT ITS OWN PLACE ONLY: the
-/// address and port it registered from, never the host name it gives itself,
-/// which any holder of the secret writes as it likes. The issuer a member
-/// records stands for the person's entry of its name, `lab-mini` as
-/// `lab-mini.local`; a person's peer by that bare name is in the book
-/// already, while two dotted names are two machines.
 #[test]
 fn a_registration_never_takes_a_persons_entry_by_the_name_it_gives() {
     let (by_name, by_address) = (manual("lab-mini", 7100), manual("10.0.0.7", 7100));
@@ -777,12 +730,6 @@ fn a_registration_never_takes_a_persons_entry_by_the_name_it_gives() {
 }
 
 /// A NODE IS BOUND TO THE KEY IT FIRST REGISTERS WITH (trust on first use):
-/// a registration that proves that key brings its entry up to date from
-/// wherever it is; another key, or none, is refused, naming `aterm fleet
-/// peers rm <node>` on the issuer, and changes nothing — after which a new
-/// key binds. An entry an older aterm recorded with no key is bound at its
-/// next registration from the address it was recorded from, never from
-/// another, and one that proves no key brings it up to date as before.
 #[test]
 fn a_node_is_bound_to_its_first_key_and_another_is_refused() {
     let key = |seed: u8| identity(&node_of(0xab), seed).key();
@@ -848,10 +795,6 @@ fn a_node_is_bound_to_its_first_key_and_another_is_refused() {
         "and now held to it"
     );
 
-    // A registration that proves no key moves an older entry — an older
-    // member's new lease — and never where its key may be bound from: else a
-    // secret holder would move it to its own address keyless, then bind its
-    // own key there in a second registration.
     let at = |ip: [u8; 4]| Some(IpAddr::from(ip));
     let keyed_at = |ip: [u8; 4], seed: u8| Peer {
         key: Some(identity(&node_of(0xef), seed).key()),
@@ -867,7 +810,6 @@ fn a_node_is_bound_to_its_first_key_and_another_is_refused() {
         (book[0].addr, book[0].key_from),
         (at([10, 0, 0, 66]), at([10, 0, 0, 8]))
     );
-    // As the book's file holds it, between one registration and the next.
     let mut book: Vec<Peer> = book
         .iter()
         .map(|peer| Peer::parse(&peer.line()).unwrap())
@@ -896,8 +838,6 @@ fn a_node_is_bound_to_its_first_key_and_another_is_refused() {
         vec![joined(0xef, "lab-mini", [10, 0, 0, 8], 7100)],
         "back where it was recorded, which its address says"
     );
-    // NEGATIVE CONTROL: from the address it was recorded from, its key is
-    // bound, wherever a keyless move left the entry.
     assert_eq!(
         record(&mut book, keyed_at([10, 0, 0, 8], 7)),
         Ok(Recorded::Updated)
@@ -915,10 +855,6 @@ fn a_node_is_bound_to_its_first_key_and_another_is_refused() {
 }
 
 /// THE PROVEN NODE is the one a connection proved under the key this
-/// machine binds it to; a claim is never one — no proof, a node bound to no
-/// key, another key. The keys are the machine's own book's, then its copy
-/// of its issuer's book's, its own first; a book that cannot be read binds
-/// nothing, so every peer reads unproven, never proven.
 #[test]
 fn a_peer_is_proven_only_by_the_key_its_entry_binds() {
     let (a, b, i) = (
@@ -978,10 +914,6 @@ fn a_peer_is_proven_only_by_the_key_its_entry_binds() {
     mode(&state.dir().join(PEERS_FILE), 0o644);
     assert_eq!(Keyring::read(state.dir()), Keyring::default());
 
-    // A person's entry at a copy's place is read beside a copy that names a
-    // node, whose key binds it: whatever answers that entry as the copy's
-    // node is held to that key. NEGATIVE CONTROL: a copy that names no node
-    // at that place is the person's entry, read once.
     let n = identity(&node_of(0xc3), 6);
     let state = State::new("ringplace");
     let issuer = Peer {
@@ -1006,9 +938,6 @@ fn a_peer_is_proven_only_by_the_key_its_entry_binds() {
         Keyring::of(&read),
         "a read's targets keep the copy's key"
     );
-    // What names a node to grant, drive or survey it resolves among the
-    // peers a key binds first ([`bound_peers`]): a read's targets hold the
-    // person's entry and the copy, which both answer to the place's name.
     let bound = bound_peers(state.dir());
     assert_eq!(
         bound
@@ -1042,9 +971,6 @@ fn a_peer_is_proven_only_by_the_key_its_entry_binds() {
 }
 
 /// A KEY THE ISSUER NO LONGER PROVES IS TAKEN OUT ON THE MEMBER: the
-/// issuer's book never holds itself, so an answer that claims the issuer's
-/// node under another key names `peers rm` here and a join again; any other
-/// node's, `peers rm` on the issuer. Each within a survey row's room.
 #[test]
 fn an_impostor_of_the_issuer_names_the_remedy_here() {
     let (i, m) = (identity(&node_of(0x11), 3), identity(&node_of(0xa1), 1));
@@ -1078,11 +1004,6 @@ fn an_impostor_of_the_issuer_names_the_remedy_here() {
 }
 
 /// A DRIVE GRANT HOLDS THE KEY THE PERSON APPROVED: the driver is the node
-/// the book binds to the key it proved AND a grant names with that key. A
-/// node id the book has bound afresh to another key since — the issuer's
-/// `peers rm`, and a join again under that id — drives nothing, though the
-/// book now calls it proven (the NEGATIVE CONTROL beside the admitted
-/// driver); so does a node no grant names, and a bare node id grants no one.
 #[test]
 fn a_drive_grant_holds_the_key_it_was_made_for() {
     let (a, m) = (identity(&node_of(0xa1), 1), identity(&node_of(0xa1), 9));
@@ -1112,7 +1033,6 @@ fn a_drive_grant_holds_the_key_it_was_made_for() {
         approved.driver(Some(&proof(a.node(), a.key())), &[]),
         Err(Undriven::Unlisted(a.node().to_owned()))
     );
-    // Rebound: the book binds A's id to M's key now, and M proves it.
     let rebound = Keyring::of(&[keyed(0xa1, m.key(), [10, 0, 0, 9], 7100)]);
     assert_eq!(
         rebound.proven(Some(&proof(m.node(), m.key()))),
@@ -1139,17 +1059,6 @@ fn a_drive_grant_holds_the_key_it_was_made_for() {
 }
 
 /// A DRIVER AN OLD COPY ALONE BINDS IS CHECKED AGAINST THE ISSUER'S BOOK
-/// ([`proven_driver`]): on a member, a node only its copy of the issuer's
-/// book binds is admitted against that copy while it is under
-/// [`COPY_DRIVES_FOR`] old; past it the issuer's book is read again first,
-/// over a real loopback issuer that proves its key: a book that still binds
-/// the node admits it, and the issuer's `peers rm` of the node refuses it,
-/// the copy following. An issuer that cannot be reached, or one this Mac
-/// binds no key to, refuses it, saying why and what to do, and leaves the
-/// copy. FAILS WITHOUT THE FIX: the old copy admits the node the issuer
-/// took out. NEGATIVE CONTROLS: a young copy admits with no read, and the
-/// member's own issuer — bound by its own book, recorded at its join — is
-/// admitted however old the copy, with no read.
 #[test]
 fn a_driver_an_old_copy_alone_binds_is_checked_against_the_issuers_book() {
     let issuer_state = State::new("recheck-issuer");
@@ -1209,7 +1118,6 @@ fn a_driver_an_old_copy_alone_binds_is_checked_against_the_issuers_book() {
         "the issuer's book still binds it"
     );
 
-    // The issuer's `peers rm`.
     write_book(issuer_state.dir(), &[]);
     assert_eq!(
         driver_as_of(as_of(&n).as_ref(), (member.dir(), &grants), old(), fetched),
@@ -1223,8 +1131,6 @@ fn a_driver_an_old_copy_alone_binds_is_checked_against_the_issuers_book() {
         "and refuses by itself from then"
     );
 
-    // An old copy that still binds it, and no issuer answers: refused, and
-    // the copy is left as it was.
     write_issuer_book(member.dir(), i.node(), &[copy(entry.clone())]).unwrap();
     write_book(member.dir(), &[issuer_at(closed_port(), Some(i.key()))]);
     let refused = driver_as_of(as_of(&n).as_ref(), (member.dir(), &grants), old(), fetched);
@@ -1238,7 +1144,6 @@ fn a_driver_an_old_copy_alone_binds_is_checked_against_the_issuers_book() {
         "{said}"
     );
     assert_eq!(copied(), vec![copy(entry.clone())]);
-    // An issuer this Mac binds no key to answers with a claim: no book binds.
     write_book(member.dir(), &[issuer_at(issuing.port, None)]);
     let claimed = driver_as_of(as_of(&n).as_ref(), (member.dir(), &grants), old(), fetched);
     assert!(
@@ -1248,7 +1153,6 @@ fn a_driver_an_old_copy_alone_binds_is_checked_against_the_issuers_book() {
 }
 
 /// `rm` takes the one peer a node id, a host, a host's first label or an
-/// address names, and names every candidate when more than one answers.
 #[test]
 fn rm_takes_one_peer_or_names_the_candidates() {
     let a = joined(0xaa, "m7.local", [10, 0, 0, 7], 7100);
@@ -1277,9 +1181,6 @@ const EVERY_OP: &[FleetOp] = &[FleetOp::Survey, FleetOp::Book, FleetOp::Join];
 const OLDER_OPS: &[FleetOp] = &[FleetOp::Survey, FleetOp::Join];
 
 /// A loopback fleet listener with `secret`, its `join`s served by
-/// [`serve_join`] into `state` as `issuer`, its `book` reads by
-/// [`serve_book`] from `state`, and its surveys answered naming `issuer`'s
-/// node, each once its hook has run; stopped on drop.
 struct Issuing {
     port: u16,
     running: Arc<AtomicBool>,
@@ -1292,7 +1193,6 @@ impl Issuing {
     }
 
     /// [`Issuing::start`] serving only `serves`: [`OLDER_OPS`] is an older
-    /// aterm.
     fn serving(
         secret: FleetSecret,
         state: &Path,
@@ -1328,8 +1228,6 @@ impl Issuing {
     }
 
     /// [`Issuing::on`], each survey or book answered once `before` has run
-    /// with its op — with the answer `before` gives in place of its own,
-    /// when it gives one.
     fn hooked(
         listener: TcpListener,
         secret: FleetSecret,
@@ -1421,7 +1319,6 @@ impl Drop for Issuing {
 }
 
 /// Answer one `survey` request (any level) with a header naming `node` and no
-/// session.
 fn answer_survey<S: Read + Write>(stream: &mut S, node: &str) -> io::Result<()> {
     let mut byte = [0u8; 1];
     while stream.read(&mut byte)? == 1 && byte[0] != b'\n' {}
@@ -1450,14 +1347,11 @@ fn issue(state: &Path) {
 }
 
 /// Dial `port` on loopback for a join with `secret` — the dial and the
-/// proofs must succeed, so a refusal is the issuer's answer, never a failed
-/// dial — and send `reg`: the issuer's answer.
 fn join_over(port: u16, secret: &FleetSecret, reg: &Registration) -> Result<Joined, String> {
     join_as(port, (secret, None), reg).0
 }
 
 /// [`join_over`], proving the node `me`: the answer, and the node the issuer
-/// proved.
 fn join_as(
     port: u16,
     (secret, me): (&FleetSecret, Option<&NodeIdentity>),
@@ -1475,12 +1369,6 @@ fn join_as(
 }
 
 /// A JOIN REGISTERS: over a real fleet listener on loopback, a member that
-/// proves the secret for `join` is recorded in the issuer's book by node id,
-/// with the address it came from, and the answer names the issuer; joining
-/// again updates its one entry; the issuer's own node id is refused; a member
-/// of another fleet is refused before it sends a byte of its record; and a
-/// machine that holds no join code — a member, not the issuer — records no
-/// one.
 #[test]
 fn a_join_registers_the_member_with_the_issuer() {
     let state = State::new("join");
@@ -1561,7 +1449,6 @@ fn a_join_registers_the_member_with_the_issuer() {
 }
 
 /// One registration line in, the issuer's answer out: [`serve_join`]'s
-/// stream with no socket.
 struct Duplex {
     input: std::io::Cursor<Vec<u8>>,
     output: Vec<u8>,
@@ -1585,10 +1472,6 @@ impl std::io::Write for Duplex {
 }
 
 /// THE JOIN SAYS WHO IT RECORDED: [`serve_join`] answers the caller (its
-/// audit line, `fleet_listen`) with the peer as the book holds it — its node,
-/// the address the record came from, and the FLEET port the record names,
-/// never a connection's source port — first `New`, then `Updated` with the
-/// port it moved to; a refusal records and names no one.
 #[test]
 fn a_join_answers_with_the_member_as_the_book_records_it() {
     let state = State::new("joinsays");
@@ -1641,11 +1524,6 @@ fn a_join_answers_with_the_member_as_the_book_records_it() {
 }
 
 /// A REGISTRATION'S KEY IS THE ONE ITS CONNECTION PROVED: [`serve_join`]
-/// refuses a `key=` the dialer did not prove — no proof, a proof of another
-/// node, of another key — and records nothing; the key it proved is bound,
-/// and that node's registration without one is then refused. NEGATIVE
-/// CONTROL: an older aterm's registration, with no key, is recorded unbound,
-/// as before keys came.
 #[test]
 fn a_registration_binds_only_the_key_its_connection_proved() {
     let state = State::new("joinkey");
@@ -1718,12 +1596,6 @@ fn a_registration_binds_only_the_key_its_connection_proved() {
 }
 
 /// A KEYLESS MOVE NEVER MOVES WHERE A KEY IS BOUND FROM, through the
-/// issuer's own end and its book's file: an entry an older aterm recorded
-/// from 10.0.0.8 is moved by a registration from 10.0.0.66 that proves no
-/// key, as before keys came; a key proved from 10.0.0.66 is then refused,
-/// in the words of an entry recorded before keys came; and the real node's,
-/// from 10.0.0.8, is bound. NEGATIVE CONTROL: that last bind, after which
-/// the one from 10.0.0.66 is another key.
 #[test]
 fn a_keyless_move_never_moves_where_a_key_is_bound_from() {
     let state = State::new("keyfrom");
@@ -1783,10 +1655,6 @@ fn a_keyless_move_never_moves_where_a_key_is_bound_from() {
 }
 
 /// AN ISSUER THAT CANNOT NAME ITSELF RECORDS NO ONE: one whose host is no
-/// host — empty, as a host name that could not be read gives — answers the
-/// join `ERR`, and its book stays empty: the member refuses an answer that
-/// names no host, and a book that had recorded it would hold a member that
-/// was told it never joined.
 #[test]
 fn an_issuer_that_names_no_host_records_no_one() {
     let state = State::new("nameless");
@@ -1808,12 +1676,6 @@ fn an_issuer_that_names_no_host_records_no_one() {
 }
 
 /// A JOIN PROVES BOTH NODES: over a real fleet listener, the member's
-/// registration binds the key its connection proved, and the member is
-/// told the issuer's node by the issuer's proof; a machine that dials with
-/// the member's node id under another key — a secret holder taking its
-/// name — is refused, naming `aterm fleet peers rm <node>` on the issuer,
-/// and the member's entry stands; once removed there, the node joins
-/// afresh under its new key (a machine that lost its node key).
 #[test]
 fn a_join_binds_the_members_key_and_refuses_another_for_its_node() {
     let state = State::new("joinbind");
@@ -1868,12 +1730,6 @@ fn a_join_binds_the_members_key_and_refuses_another_for_its_node() {
 }
 
 /// A check (`read_whole` with `survey facts`, no issuer among the peers)
-/// answers every peer, in order, with what it serves or a reason a person can
-/// act on: a member, a closed port and a listener of another fleet, each
-/// within the hang detector; and a port that accepts and never speaks is its
-/// deadline's, however short. (A name nothing resolves is
-/// [`a_name_is_looked_up_as_itself_and_a_bare_one_as_dot_local`]'s, with no
-/// resolver of the network's asked.)
 #[test]
 fn a_check_gives_a_reason_per_peer() {
     let state = State::new("reach");
@@ -1932,8 +1788,6 @@ fn a_check_gives_a_reason_per_peer() {
         results[2]
     );
 
-    // Accepted by the kernel's backlog, never a byte answered: whatever the
-    // deadline, it is the deadline that ends the wait.
     let silent = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     let silent_port = silent.local_addr().unwrap().port();
     let results = check(&[at(silent_port)], Duration::from_millis(300));
@@ -1944,10 +1798,7 @@ fn a_check_gives_a_reason_per_peer() {
     drop(silent);
 }
 
-// the issuer's book, read by a member
-
 /// The member's entry for its issuer on loopback `port`, as `aterm fleet
-/// join` records it.
 fn issuer_entry(node: u8, port: u16) -> Peer {
     Peer {
         via: Via::Issuer,
@@ -1956,8 +1807,6 @@ fn issuer_entry(node: u8, port: u16) -> Peer {
 }
 
 /// Write `peers` as `state`'s book, as they are: a hand edit, so entries
-/// [`record`] would never write (an issuer's own `via=issuer`, a copy) can
-/// be in it.
 fn write_book(state: &Path, peers: &[Peer]) {
     write_private(state, PEERS_FILE, book_text(peers).as_bytes()).unwrap();
 }
@@ -1972,12 +1821,6 @@ fn closed_port() -> u16 {
 }
 
 /// THE ISSUER SERVES ITS BOOK: over a real fleet listener, a member's `book`
-/// read of the issuer is answered with its first-hand entries — the members
-/// that registered and the peers its person named, in order, never its own
-/// issuer's entry nor a copy — headed by the issuer's node; a machine that
-/// holds no join code answers `no-book`, naming its node; an issuer that
-/// cannot read its book answers `not-now`; and a head naming another node
-/// than the member's record of its issuer is refused.
 #[test]
 fn the_issuer_serves_its_book_and_any_other_machine_refuses() {
     let state = State::new("book");
@@ -2032,7 +1875,6 @@ fn the_issuer_serves_its_book_and_any_other_machine_refuses() {
         "{stranger:?}"
     );
 
-    // A book the issuer cannot read is no book this time, never none.
     write_private(state.dir(), PEERS_FILE, b"peer garbage\n").unwrap();
     let unshared = fetch_book(&target, (&secret(5), None), deadline());
     assert!(
@@ -2042,9 +1884,6 @@ fn the_issuer_serves_its_book_and_any_other_machine_refuses() {
 }
 
 /// AN OLDER ISSUER: a listener from before members read the book answers
-/// `book` `NO op`; its member reads its issuer and the peers it knows, as it
-/// did before the book, and its copy of the book goes (an answer replaces the
-/// copy whole), all in the one deadline.
 #[test]
 fn an_older_issuer_leaves_its_member_reading_what_it_knows() {
     let state = State::new("older");
@@ -2079,11 +1918,6 @@ fn an_older_issuer_leaves_its_member_reading_what_it_knows() {
 }
 
 /// AN OLDER ISSUER'S `NO op` ENDS THE DIAL THERE: it proved this fleet's
-/// secret, so it is this fleet's machine, and asking its name would only
-/// spend the read's one deadline. Here its name (`::1`) leads to a newer
-/// listener of the same node, which a dial going on to the name would read
-/// the book of. NEGATIVE CONTROL: that newer listener at the recorded address
-/// is read.
 #[test]
 fn an_older_issuers_no_op_ends_the_dial_there() {
     let state = State::new("no-op");
@@ -2117,10 +1951,6 @@ fn an_older_issuers_no_op_ends_the_dial_there() {
 }
 
 /// A MEMBER READS THE WHOLE FLEET: its book names only its issuer (and a
-/// stale copy of a member the issuer no longer holds), and its read reaches
-/// every member the issuer's book names — a registered member's survey, a
-/// peer the issuer's person named (closed, so its reason) — never its own
-/// registration there nor the stale copy.
 #[test]
 fn a_member_reads_every_member_its_issuers_book_names() {
     let issuer_state = State::new("whole-issuer");
@@ -2184,11 +2014,6 @@ fn a_member_reads_every_member_its_issuers_book_names() {
 }
 
 /// A BOOK'S KEYS ARE COPIED ONLY FROM THE ISSUER ITSELF: a book read of an
-/// issuer that proved the key its member binds it to is proven, and its
-/// copies keep the keys it binds; an issuer bound to no key (a member that
-/// joined before keys came) is a claim, and so is every key its book names,
-/// so its copies keep none; a machine that claims the issuer's node under
-/// another key gives no book at all.
 #[test]
 fn a_books_keys_are_copied_only_from_a_proven_issuer() {
     let state = State::new("bookkeys");
@@ -2240,12 +2065,6 @@ fn a_books_keys_are_copied_only_from_a_proven_issuer() {
 }
 
 /// THE COPY IS MERGED WHOLE: the old copy is replaced; this machine, the
-/// issuer itself, a node the member's own book holds, a place it holds for
-/// an entry that names no node, a repeat, and a second-hand entry are left
-/// out, while a member at the place of a person's entry is kept, node and
-/// all; an entry on the issuer's loopback is placed at the address the
-/// issuer answered from; a merge twice is the merge once; and the book never
-/// holds more than its cap, the member's own entries kept first.
 #[test]
 fn a_merge_replaces_the_copy_whole_dedupes_and_is_bounded() {
     let issuer_at = IpAddr::from([10, 0, 0, 7]);
@@ -2304,8 +2123,6 @@ fn a_merge_replaces_the_copy_whole_dedupes_and_is_bounded() {
     merge_book(&mut book, &fetched, Some(&node_of(0xaa)));
     assert_eq!(book, once, "a merge twice is the merge once");
 
-    // An issuer that answered on loopback is on this machine: its loopback
-    // entries stay where they are.
     let mut looped = vec![own_issuer.clone()];
     merge_book(
         &mut looped,
@@ -2320,8 +2137,6 @@ fn a_merge_replaces_the_copy_whole_dedupes_and_is_bounded() {
         "{looped:?}"
     );
 
-    // The cap: a book of more members than a book holds fills it, the
-    // member's own entries first and whole.
     let crowd = Book {
         peers: (0..PEERS_MAX + 10)
             .map(|n| Peer {
@@ -2350,12 +2165,6 @@ fn a_merge_replaces_the_copy_whole_dedupes_and_is_bounded() {
 }
 
 /// A COPY IS NEVER EDITED BY HAND: `rm` refuses a peer only the copy holds,
-/// and takes this machine's own entry where both answer; `record` refuses to
-/// write a copy; read beside the book, a person's entry for a copy's place
-/// stands for a copy that names no node, a node the book holds stands for
-/// its copy, a copy that names a node is read beside a person's entry at its
-/// place, and the two together never pass the cap, the book's own entries
-/// first and whole.
 #[test]
 fn a_copy_of_the_issuers_book_yields_to_the_machines_own_entries() {
     let own = vec![issuer_entry(0x11, 7100), manual("LAB-MINI", 7101)];
@@ -2413,14 +2222,6 @@ fn a_copy_of_the_issuers_book_yields_to_the_machines_own_entries() {
 }
 
 /// A MEMBER THAT NAMES ANOTHER'S PLACE TAKES NEITHER ITS COPY NOR ITS KEY: an
-/// entry's host and port are what its registrant said, so a member that
-/// joined again naming another member's host and port — ahead of it in the
-/// issuer's book, where a join again in place leaves it, or after it — is a
-/// copy beside that member's, never in its stead: the member's copy, the
-/// file that keeps it and the keys it binds still hold the member, proven
-/// by its own key. FAILS WITHOUT THE FIX: the entry first at the place drops
-/// the other's copy, and with it the key that binds its node. NEGATIVE
-/// CONTROL: an entry that names no node at that place is still left out.
 #[test]
 fn a_member_that_names_anothers_place_takes_neither_its_copy_nor_its_key() {
     let (y, z) = (identity(&node_of(0x5a), 1), identity(&node_of(0x5b), 2));
@@ -2478,11 +2279,6 @@ fn a_member_that_names_anothers_place_takes_neither_its_copy_nor_its_key() {
 }
 
 /// THE COPY HAS A FILE OF ITS OWN, BOUND TO ITS ISSUER: what a read of the
-/// book writes is read back only for the node it was read from — another
-/// issuer, a missing file, or a line that is no copy reads as no copy — and
-/// the book itself never holds one: a copy found there (an aterm built
-/// before the file) is passed over, and an edit of the book drops it, so the
-/// words an older aterm knows are the only ones its book holds.
 #[test]
 fn a_copy_is_read_only_beside_the_issuer_it_came_from() {
     let state = State::new("copy-file");
@@ -2532,12 +2328,6 @@ fn a_copy_is_read_only_beside_the_issuer_it_came_from() {
 }
 
 /// THE BOOK'S MEMBERS ARE ASKED WHILE THE ISSUER'S OWN SURVEY WAITS: the
-/// issuer answers its book at once and its survey only once the member that
-/// book names has been asked — an issuer whose control server is slow
-/// behind a listener that answers the book at once — and the read reaches
-/// both, the member never waiting on the issuer's survey. NEGATIVE CONTROL:
-/// hands for the members started only after the issuer's read leave the
-/// member undialled until that survey ends, and both reach the deadline.
 #[test]
 fn a_books_members_are_asked_while_the_issuers_own_survey_waits() {
     let (asked, gate) = std::sync::mpsc::channel::<()>();
@@ -2602,13 +2392,6 @@ fn a_books_members_are_asked_while_the_issuers_own_survey_waits() {
 }
 
 /// A MACHINE AT THE ISSUER'S OLD ADDRESS NEVER SPEAKS FOR THE ISSUER: the
-/// address the member recorded for its issuer now holds another member of
-/// the fleet — a newer one that answers `no-book` naming its own node, or an
-/// older one that answers `NO op` — while the issuer answers at its name.
-/// Neither refusal is the issuer's: the issuer's own survey finds it at its
-/// name, its book is read there, its member asked, and the member's copy
-/// stands. NEGATIVE CONTROL: a refusal taken as the issuer's whoever said
-/// it drops the copy and reads no book.
 #[test]
 fn a_machine_at_the_issuers_old_address_never_speaks_for_the_issuer() {
     for squatter_serves in [EVERY_OP, OLDER_OPS] {
@@ -2666,9 +2449,6 @@ fn a_machine_at_the_issuers_old_address_never_speaks_for_the_issuer() {
 }
 
 /// AN ISSUER THAT CANNOT SHARE ITS BOOK NOW (it cannot read it) answers
-/// `not-now`: the member keeps its copy and reads it, its issuer's own row
-/// answered, and the read says it is short of a fresh book. NEGATIVE
-/// CONTROL: `not-now` taken as `no-book` drops the copy.
 #[test]
 fn an_issuer_that_cannot_share_its_book_now_leaves_the_copy() {
     let state = State::new("not-now");
@@ -2692,9 +2472,6 @@ fn an_issuer_that_cannot_share_its_book_now_leaves_the_copy() {
 }
 
 /// A RE-KEYED MEMBER IS READ UNDER ITS NEW KEY the moment the issuer's book
-/// binds it: a copy of it held under the old key is skipped and queued again
-/// under the book's, and the book's keys replace the copy's. NEGATIVE
-/// CONTROL: a book that binds the key the copy holds changes nothing.
 #[test]
 fn a_book_that_rebinds_a_member_replaces_its_copy_and_key() {
     let i = identity(&node_of(0x11), 3);
@@ -2750,9 +2527,6 @@ fn a_book_that_rebinds_a_member_replaces_its_copy_and_key() {
 }
 
 /// THE WHOLE READ AFTER A RE-KEY: a member's copy holds node M under its old
-/// key, M's listener proves its new one, and the issuer's book binds the new
-/// one — M is read, proven, never named an impostor. NEGATIVE CONTROL: with
-/// the issuer's book still binding the old key, M is an impostor.
 #[test]
 fn a_member_rebound_on_the_issuer_is_read_under_its_new_key() {
     let (m_state, issuer_state) = (State::new("rekey-m"), State::new("rekey-i"));
@@ -2787,9 +2561,6 @@ fn a_member_rebound_on_the_issuer_is_read_under_its_new_key() {
                 key: Some(issuing_as.key()),
                 ..issuer_entry(0x11, issuing.port)
             },
-            // Named by its address, here and in the issuer's book: a key the
-            // dial there does not prove looks no `m7.local` up, which
-            // multicast DNS never answers before the read's deadline.
             copy(Peer {
                 host: "127.0.0.1".to_owned(),
                 ..keyed(0xd4, old.key(), [127, 0, 0, 1], m.port)
@@ -2827,15 +2598,6 @@ fn a_member_rebound_on_the_issuer_is_read_under_its_new_key() {
 }
 
 /// A NODE THE BOOK BINDS ANEW IS PROVEN BY EVERY ENTRY THAT REACHED IT: a
-/// member's copy holds only a place the issuer's person named by hand, where
-/// node M listens, and the book that comes names that place and M there,
-/// bound to the key M proves. The copy's dial, begun before the book's keys
-/// came, read M's answer as M's claim; judged again by the keys the read
-/// ends with, it is proven like the book's entry of M, so the survey never
-/// shows M twice, once `node unproven`. FAILS WITHOUT THE FIX: the copy's
-/// answer stays M's claim. NEGATIVE CONTROL: a book that binds M to another
-/// key proves neither — the copy's answer is never proven, and the book's
-/// entry of M is an impostor.
 #[test]
 fn a_node_the_book_binds_anew_is_proven_by_every_entry_that_reached_it() {
     let (m_state, issuer_state) = (State::new("anew-m"), State::new("anew-i"));
@@ -2914,16 +2676,6 @@ fn a_node_the_book_binds_anew_is_proven_by_every_entry_that_reached_it() {
 }
 
 /// AN ANSWER PROVEN BY A KEY THE BOOK NO LONGER BINDS IS NOT THAT NODE: a
-/// member's copy binds node N to its old key, and a place the member's
-/// person named holds the old key's holder, which proves N under it. The
-/// person's entry, dialled before the book's keys came, took that answer as
-/// N proven; the book that comes binds N to another key (the issuer re-bound
-/// it: `peers rm` and a join again), and judged again by the keys the read
-/// ends with that answer is N's impostor, as a dial begun after the book
-/// finds it — never N's proven block beside, or in place of, the real N's.
-/// A book that takes N out leaves it N's claim. FAILS WITHOUT THE FIX: the
-/// person's entry stays N, proven, in both. NEGATIVE CONTROL: a book that
-/// still binds N to the old key proves both entries.
 #[test]
 fn an_answer_proven_by_a_key_the_book_no_longer_binds_is_not_that_node() {
     let (m_state, issuer_state) = (State::new("unbound-m"), State::new("unbound-i"));
@@ -2938,7 +2690,6 @@ fn an_answer_proven_by_a_key_the_book_no_longer_binds_is_not_that_node() {
         old.clone(),
     );
     let issuing_as = identity(&issuer(0x11).node, 9);
-    // What the book binds N to, or none for a book that holds no N.
     let read = |bound: Option<NodeKey>| {
         let booked: Vec<Peer> = bound
             .map(|key| Peer {
@@ -3020,14 +2771,6 @@ fn an_answer_proven_by_a_key_the_book_no_longer_binds_is_not_that_node() {
 }
 
 /// A READ HOLDS ONE CONNECTION TO AN ADDRESS AT A TIME: a member's own entry
-/// at a Mac's place (no node, as a person names it) and the copy of the node
-/// that joined there are both read, and the Mac's listener serves one
-/// address a share of proved connections sized for one per reader. While
-/// one dial holds its connection there — its survey unanswered past the
-/// read's deadline — the other waits for it, never a second connection
-/// beside it: the listener never serves this read two surveys at once, and
-/// another reader keeps its share. FAILS WITHOUT THE FIX: both dials hold a
-/// connection there at once.
 #[test]
 fn a_read_holds_one_connection_to_an_address_at_a_time() {
     let (in_flight, most) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
@@ -3050,7 +2793,6 @@ fn a_read_holds_one_connection_to_an_address_at_a_time() {
                 if op == FleetOp::Survey {
                     let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
                     most.fetch_max(now, Ordering::SeqCst);
-                    // Unanswered until the read is over: its deadline cuts it.
                     let _ = held.lock().unwrap().recv_timeout(HANG);
                     in_flight.fetch_sub(1, Ordering::SeqCst);
                 }
@@ -3098,11 +2840,6 @@ fn a_read_holds_one_connection_to_an_address_at_a_time() {
 }
 
 /// PAST [`AT_ONCE`] DIALS A PEER HAS A DEADLINE OF ITS OWN: the issuer's
-/// seat is the first dial, so the first `AT_ONCE - 1` peers taken share the
-/// read's one deadline and every later one waited for a free place; a place
-/// skipped is no dial; and no call of `hands` starts more than `AT_ONCE`
-/// readers in all. NEGATIVE CONTROL: a take one dial early (`>=` for `>`)
-/// gives the last of the first `AT_ONCE` dials a deadline of its own.
 #[test]
 fn a_peer_past_the_first_at_once_dials_waits_for_a_place_of_its_own() {
     let peers: Vec<Peer> = (0..AT_ONCE + 5)
@@ -3130,10 +2867,6 @@ fn a_peer_past_the_first_at_once_dials_waits_for_a_place_of_its_own() {
 }
 
 /// A DARK ISSUER COSTS ITS MEMBER ONE DIAL: an issuer that accepts and never
-/// speaks holds its book's dial to the deadline, and its own row is that
-/// dial's reason (connected, no handshake) — never a second dial — while
-/// every other peer is asked meanwhile; the copy stands. The dark listener's
-/// queue holds the one connection.
 #[test]
 fn a_dark_issuer_costs_its_member_one_deadline() {
     const WITHIN: Duration = Duration::from_secs(2);
@@ -3182,8 +2915,6 @@ fn a_dark_issuer_costs_its_member_one_deadline() {
 }
 
 /// A loopback listener that takes every connection and closes it at once,
-/// counting them: what a dialer's handshake passes over for the name (an
-/// address that is no fleet listener now). Stopped on drop.
 struct Closing {
     taken: Arc<std::sync::atomic::AtomicUsize>,
     running: Arc<AtomicBool>,
@@ -3231,12 +2962,6 @@ impl Drop for Closing {
 }
 
 /// A MOVED ISSUER IS SURVEYED WHERE ITS BOOK ANSWERED: the address the
-/// member recorded is no fleet listener now (it takes the connection and
-/// closes it), and the issuer answers at its name. The book's dial passes
-/// over the recorded address once; the issuer's own survey is asked where the
-/// book came from, never at the recorded address again, and both answer.
-/// NEGATIVE CONTROL: the survey asked at the recorded address first dials it
-/// a second time.
 #[test]
 fn a_moved_issuer_is_surveyed_where_its_book_answered() {
     let (v6, v4, port) = twin_listeners();
@@ -3274,12 +2999,6 @@ fn a_moved_issuer_is_surveyed_where_its_book_answered() {
 }
 
 /// A MOVED ISSUER WHOSE BOOK FAILS IS SURVEYED WHERE IT PROVED ITSELF: the
-/// address the member recorded is no fleet listener now, and the issuer at
-/// its name proves `book` and then answers none (a head promising more
-/// entries than a book holds). Its own survey is asked where that dial was
-/// answered, never at the recorded address a second time in the one
-/// deadline; it answers, and the read is short of the book. NEGATIVE
-/// CONTROL: a failed reply read as no address dials the recorded one again.
 #[test]
 fn a_moved_issuer_whose_book_fails_is_surveyed_where_it_proved_itself() {
     let (v6, v4, port) = twin_listeners();
@@ -3321,12 +3040,6 @@ fn a_moved_issuer_whose_book_fails_is_surveyed_where_it_proved_itself() {
 }
 
 /// WHERE AND WHETHER THE ISSUER'S SURVEY FOLLOWS A BOOK THAT FAILED, with no
-/// clock: a dial that failed before proof, or a book the deadline cut short,
-/// is the issuer's answer too (never a second dial); one that proved itself
-/// and then failed, with time left, is surveyed at the address it proved
-/// itself at — a reply that failed, a listener at capacity — and one that
-/// never proved names no address. NEGATIVE CONTROL: a seat that does not
-/// read the deadline dials a book the deadline cut short again.
 #[test]
 fn a_failed_book_ends_the_issuers_seat_or_names_where_to_survey_it() {
     let at: SocketAddr = (Ipv4Addr::new(10, 0, 0, 7), 7300).into();
@@ -3355,15 +3068,6 @@ fn a_failed_book_ends_the_issuers_seat_or_names_where_to_survey_it() {
 }
 
 /// A BOOK THE DEADLINE CUT SHORT IS THE ISSUER'S ROW: the issuer proves
-/// `book` and sends none; the read's one deadline comes while the member
-/// waits for it, and the issuer's row is that reason (proved, no book) —
-/// never a second dial with no time left, read as no connection — while the
-/// copy stands. On a machine too loaded to finish the handshake in `WITHIN`
-/// the deadline comes at the handshake instead, the same one row: the test
-/// asks no latency of the loopback, and the rule's clock is pinned by
-/// `a_failed_book_ends_the_issuers_seat_or_names_where_to_survey_it`.
-/// NEGATIVE CONTROL: the issuer's survey dialled after the deadline reads as
-/// `Deadline(Stage::Connect)`.
 #[test]
 fn a_book_the_deadline_cut_short_is_the_issuers_row() {
     const WITHIN: Duration = Duration::from_secs(2);
@@ -3419,23 +3123,10 @@ fn a_book_the_deadline_cut_short_is_the_issuers_row() {
 }
 
 /// A MEMBER NEVER READS ITSELF THROUGH ITS ISSUER'S BOOK: the issuer's person
-/// named this machine's own place by hand (as the loopback fleet does for a
-/// member past four an address), so the copy names no node; dialled, it
-/// proves this machine's node under this machine's key, and it is left out
-/// of the read — the issuer and the other member read. NEGATIVE CONTROLS:
-/// only that proof leaves it out. A Mac there that names this machine's node
-/// without its key — that node id proved under a key of its own, or none
-/// proved and the node in its survey's header — is read as the claim it is,
-/// never left out as this machine (which would hide it from this machine's
-/// read); so is this machine's own answer to a read that proves no node key
-/// of its own; and without `own` the place is read as a peer.
 #[test]
 fn a_member_never_reads_itself_through_its_issuers_book() {
     let own = node_of(0xaa);
     let me = identity(&own, 1);
-    // The whole read, `proving` what answers at the place (its survey's
-    // header naming `own` whatever it proves): each row's entry, its node
-    // and whether that node is proven.
     let read = |proving: Option<NodeIdentity>, own: Option<&str>, me: Option<&NodeIdentity>| {
         let place_state = State::new("self-member");
         let place = match proving {
@@ -3512,16 +3203,12 @@ enum Answer {
     /// The Lines reply `OK <n>` and these lines.
     Lines(Vec<String>),
     /// Nothing: the stream is held, unanswered, until the peer goes — a
-    /// stopped aterm's control server.
     Never,
     /// More than a reply may be: `OK <n>` and line after line.
     Flood,
     /// One TLS record of a reply sent a byte at a time, slower than a
-    /// per-read timeout notices: only a wall-clock bound ends the read.
     Dribble,
     /// A one-line reply, held until `want` requests have come to the
-    /// listeners its clones serve (`arrived` counts them) or `released` is
-    /// set: only a reader that asks them all at once gets an answer from any.
     Together {
         arrived: Arc<AtomicUsize>,
         want: usize,
@@ -3548,13 +3235,9 @@ impl Answer {
 }
 
 /// How many bytes a [`Answer::Dribble`] peer sends, one per 80 ms: over five
-/// minutes, so only the reader's deadline ends its read inside the hang
-/// detector. It stops at the first byte the cut connection refuses.
 const DRIBBLE_BYTES: usize = 4_000;
 
 /// A loopback fleet listener serving `survey` at `scope`, which answers the
-/// request as its [`Answer`] says; told to stop on drop ([`Naming`]'s drop says
-/// why it is not joined).
 struct Answering {
     port: u16,
     running: Arc<AtomicBool>,
@@ -3565,7 +3248,6 @@ impl Answering {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let port = listener.local_addr().unwrap().port();
         let running = Arc::new(AtomicBool::new(true));
-        // Room for every peer a read asks at once, all from loopback.
         let listening = Listening {
             secret,
             scope,
@@ -3601,7 +3283,6 @@ impl Answering {
                                     stream.write_all(reply.as_bytes())?;
                                     stream.flush()
                                 }
-                                // Held until the reader goes: its close ends the read.
                                 Answer::Never => {
                                     let _ = stream.read(&mut byte);
                                     Ok(())
@@ -3613,8 +3294,6 @@ impl Answering {
                                         stream.write_all(line.as_bytes())?;
                                     }
                                 }
-                                // An application-data record claiming 16 KiB,
-                                // then its body a byte at a time.
                                 Answer::Dribble => {
                                     let mut sock = stream.sock();
                                     sock.write_all(&[0x17, 0x03, 0x03, 0x40, 0x00])?;
@@ -3630,8 +3309,6 @@ impl Answering {
                                     released,
                                 } => {
                                     arrived.fetch_add(1, Ordering::SeqCst);
-                                    // Held at most the hang detector, as the
-                                    // reader waits: past it the test has failed.
                                     let _ = aterm_spec::wait::within(
                                         HANG,
                                         Duration::from_millis(5),
@@ -3675,7 +3352,6 @@ fn on_loopback(port: u16) -> Target {
 }
 
 /// [`survey_all`] of `targets` on a thread of its own, waited for at most
-/// the [`HANG`] detector: its results.
 fn surveyed(targets: Vec<Target>, within: Duration) -> Vec<Result<Surveyed, Unreached>> {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
@@ -3691,16 +3367,6 @@ fn surveyed(targets: Vec<Target>, within: Duration) -> Vec<Result<Surveyed, Unre
 }
 
 /// THE FLEET READ: two members (one allowing facts, one content), a closed
-/// port, a member past the reply cap and one of another fleet — each one
-/// result, its survey or its reason, asked at the hang detector, since each
-/// must answer. Then a port that accepts and never speaks, a member whose
-/// control server never answers (a stopped aterm) and one that dribbles its
-/// answer: each ended by its one deadline, at the stage it reached — the
-/// silent port's the handshake, the others' the answer once their
-/// handshake came in time, which a loaded machine need not give them; so a
-/// proved stream's answer is asked once more under a deadline of its own,
-/// which ends it whatever the peer does. (That they are asked side by side
-/// is [`thirty_peers_are_asked_at_once`]'s.)
 #[test]
 fn survey_all_answers_each_peer_within_one_deadline() {
     const WITHIN: Duration = Duration::from_secs(2);
@@ -3762,7 +3428,6 @@ fn survey_all_answers_each_peer_within_one_deadline() {
 
     let stopped = Answering::start(secret(5), FleetScope::Facts, Answer::Never);
     let dribble = Answering::start(secret(5), FleetScope::Facts, Answer::Dribble);
-    // The kernel completes the connect; nothing ever reads or writes.
     let hang = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     let read = surveyed(
         vec![
@@ -3816,10 +3481,6 @@ fn survey_all_answers_each_peer_within_one_deadline() {
 }
 
 /// THIRTY PEERS ARE ASKED AT ONCE, by no clock: each of thirty listeners
-/// holds its answer until all thirty have asked, so only a read that asks
-/// them side by side gets thirty answers, and a walk in turn would get none
-/// before the hang detector. NEGATIVE CONTROL: the same peers asked one at a
-/// time are answered by none, each its own deadline's.
 #[test]
 fn thirty_peers_are_asked_at_once() {
     const PEERS: usize = 30;
@@ -3857,10 +3518,6 @@ fn thirty_peers_are_asked_at_once() {
 }
 
 /// A NAME IS LOOKED UP AS ITSELF, AND A BARE ONE AS `<name>.local` TOO, by
-/// a resolver of this test's, so no network's resolver is asked: a name
-/// nothing resolves is its own reason; a bare name only multicast DNS knows
-/// reaches the peer at its `.local` answer; a dotted one is asked as itself
-/// alone (the control: the same resolver gives it nothing).
 #[test]
 fn a_name_is_looked_up_as_itself_and_a_bare_one_as_dot_local() {
     let peer = Answering::start(
@@ -3910,7 +3567,6 @@ fn a_name_is_looked_up_as_itself_and_a_bare_one_as_dot_local() {
 }
 
 /// `at_once` asks at most its limit at a time — and that many — and answers
-/// in the items' order.
 #[test]
 fn at_once_holds_its_limit_and_its_order() {
     use std::sync::atomic::AtomicUsize;
@@ -3925,8 +3581,6 @@ fn at_once_holds_its_limit_and_its_order() {
         let now = inflight.fetch_add(1, Ordering::SeqCst) + 1;
         started.fetch_add(1, Ordering::SeqCst);
         most.fetch_max(now, Ordering::SeqCst);
-        // Each waits for a full house (or the last items), so a walk that
-        // ran more at once than its limit is seen to.
         let deadline = Instant::now() + HANG;
         while inflight.load(Ordering::SeqCst) < LIMIT
             && started.load(Ordering::SeqCst) < items.len()
@@ -3945,8 +3599,6 @@ fn at_once_holds_its_limit_and_its_order() {
 }
 
 /// A fleet listener on `listener` that answers every `survey` with a header
-/// naming `node` (or with the lines it is given, [`Naming::replying`]);
-/// told to stop on drop.
 struct Naming {
     running: Arc<AtomicBool>,
     /// How many surveys it was asked.
@@ -3959,7 +3611,6 @@ impl Naming {
     }
 
     /// [`Naming::on`], proving the node `me` when there is one — its header
-    /// still naming `node`, as an impostor's would.
     fn proving(
         listener: TcpListener,
         secret: FleetSecret,
@@ -3974,7 +3625,6 @@ impl Naming {
     }
 
     /// [`Naming::proving`], answering every `survey` with `lines` after its
-    /// `OK <n>` head, whatever they say.
     fn replying(
         listener: TcpListener,
         secret: FleetSecret,
@@ -4025,11 +3675,6 @@ impl Naming {
 }
 
 /// Told to stop, not joined: `serve` looks at `running` once per `ACCEPT_POLL`
-/// (200 ms) of an idle listener, and ends with its listener by then. Joined, each
-/// peer a test dropped cost that poll: 17 in
-/// [`a_proven_peer_is_read_only_as_the_node_it_proved`] (3.2 s alone, nearly all of
-/// it in these joins), seven in [`survey_all_answers_each_peer_within_one_deadline`].
-/// Nothing reads a peer after its drop, and every later peer binds a port of its own.
 impl Drop for Naming {
     fn drop(&mut self) {
         self.running.store(false, Ordering::Release);
@@ -4037,8 +3682,6 @@ impl Drop for Naming {
 }
 
 /// Two loopback listeners on one port: `[::1]` and `127.0.0.1`. Where there
-/// is no IPv6 loopback, or no port free on both, the test ends COULD NOT RUN
-/// (`aterm_spec::host::could_not_run`): never a pass that checked nothing.
 fn twin_listeners() -> (TcpListener, TcpListener, u16) {
     for _ in 0..16 {
         let Ok(v6) = TcpListener::bind((std::net::Ipv6Addr::LOCALHOST, 0)) else {
@@ -4053,12 +3696,6 @@ fn twin_listeners() -> (TcpListener, TcpListener, u16) {
 }
 
 /// A RECORDED ADDRESS THAT PASSED TO ANOTHER MACHINE gives way to the name:
-/// another fleet's listener there (the handshake fails) and another member
-/// there (its survey names another node) are each passed over for the name,
-/// which reaches the peer; with no other place to ask, the other member is
-/// reported, never read as this peer. An address past the LAN is never
-/// dialled. NEGATIVE CONTROL: a target that names no node takes the
-/// recorded address's answer.
 #[test]
 fn a_recorded_address_that_answers_as_another_gives_way_to_the_name() {
     let (node, other) = ("aa".repeat(16), "bb".repeat(16));
@@ -4070,7 +3707,6 @@ fn a_recorded_address_that_answers_as_another_gives_way_to_the_name() {
         key: None,
     };
 
-    // Another fleet's listener at the recorded address.
     let (v6, v4, port) = twin_listeners();
     let _peer = Naming::on(v6, secret(5), node.clone());
     let _stranger = Naming::on(v4, secret(6), other.clone());
@@ -4089,7 +3725,6 @@ fn a_recorded_address_that_answers_as_another_gives_way_to_the_name() {
     }
     drop((_peer, _stranger));
 
-    // Another member of this fleet at the recorded address.
     let (v6, v4, port) = twin_listeners();
     let _peer = Naming::on(v6, secret(5), node.clone());
     let _member = Naming::on(v4, secret(5), other.clone());
@@ -4097,13 +3732,10 @@ fn a_recorded_address_that_answers_as_another_gives_way_to_the_name() {
         &[
             target([127, 0, 0, 1], port, Some(&node)),
             target([127, 0, 0, 1], port, None),
-            // The name is the recorded address itself: nowhere else to ask.
             Target {
                 host: "127.0.0.1".to_owned(),
                 ..target([127, 0, 0, 1], port, Some(&node))
             },
-            // Past the LAN (TEST-NET-1, no machine's): never dialled, so
-            // the name answers.
             target([192, 0, 2, 1], port, Some(&node)),
         ],
         &Keyring::default(),
@@ -4148,15 +3780,6 @@ fn a_recorded_address_that_answers_as_another_gives_way_to_the_name() {
 }
 
 /// A PEER THAT CLAIMS A BOUND NODE WITHOUT ITS KEY IS NAMED, NEVER READ AS
-/// IT: at a target's recorded address, a secret holder that proves the
-/// target's node id under another key is an impostor, and one that proves
-/// no node where a key is bound is unproved — neither is asked its survey —
-/// and the name is asked, which reaches the real node, proven; with nowhere
-/// else to ask, each is reported as what it is. A peer a person named binds
-/// no key of its own and is still held to the key the book binds the node
-/// it claims, by its proof or by its header. NEGATIVE CONTROLS: the real
-/// node is read, proven; a node bound to no key (an older aterm's entry) is
-/// read as its claim, unproven.
 #[test]
 fn a_peer_that_claims_a_bound_node_without_its_key_is_named_and_never_read() {
     let real = identity(&node_of(0xaa), 1);
@@ -4180,7 +3803,6 @@ fn a_peer_that_claims_a_bound_node_without_its_key_is_named_and_never_read() {
         let reads = read(
             &[
                 entry("::1", port, Some(real.key())),
-                // The name is the recorded address itself: nowhere else.
                 entry("127.0.0.1", port, Some(real.key())),
             ],
             &Keyring::default(),
@@ -4272,12 +3894,6 @@ fn a_peer_that_claims_a_bound_node_without_its_key_is_named_and_never_read() {
 }
 
 /// THIS MACHINE, AT A PLACE NAMED BY HAND, IS PROVEN BY ITS OWN KEY: a
-/// person's `peers add` or `[[fleet.peers]]` of this machine names no node,
-/// no keyring binds this machine's own, and what answers there proves this
-/// machine's node under the key only it holds — this machine, never a claim
-/// (so the menu bar's glance leaves it out as this Mac). NEGATIVE CONTROL:
-/// this machine's node id under another key is the claim it was, and so is
-/// this machine's own answer to a read that proves no node key of its own.
 #[test]
 fn this_machine_named_by_hand_is_proven_by_its_own_key() {
     let me = identity(&node_of(0xaa), 1);
@@ -4319,15 +3935,6 @@ fn this_machine_named_by_hand_is_proven_by_its_own_key() {
 }
 
 /// A PROVEN PEER IS READ ONLY AS THE NODE IT PROVED: one whose survey's
-/// header names another node — this Mac's own, which would drop it from the
-/// menu bar's glance as this Mac and key its notices as this Mac's — is
-/// refused whole, naming both, however the claim is spelt for a reader to
-/// decode (a second header, a second `node=`, percent-encoded, in capitals),
-/// and whether or not the node it proved is bound here; at a recorded
-/// address, it gives way to the name. NEGATIVE CONTROLS: an honest proven
-/// peer's header (its node, `-` where it cannot read its node file, or no
-/// `node=`) is read, proven; a peer that proves no node is still read as its
-/// header's claim.
 #[test]
 fn a_proven_peer_is_read_only_as_the_node_it_proved() {
     let real = identity(&node_of(0xaa), 1);
@@ -4412,7 +4019,6 @@ fn a_proven_peer_is_read_only_as_the_node_it_proved() {
         "{said}"
     );
 
-    // A peer that proves no node: its header is its claim, as before.
     match read(None, vec![head(&format!("node={mine}"))], false) {
         Ok(surveyed) => assert_eq!(
             (surveyed.node.as_deref(), surveyed.proven),
@@ -4421,7 +4027,6 @@ fn a_proven_peer_is_read_only_as_the_node_it_proved() {
         Err(e) => panic!("a claim from a peer that proved no node was refused: {e}"),
     }
 
-    // At a recorded address, the name is asked, which reaches the real node.
     let (v6, v4, port) = twin_listeners();
     let _real = Naming::proving(v6, secret(5), node.clone(), Some(real.clone()));
     let _misnamed = Naming::proving(v4, secret(5), mine.clone(), Some(real.clone()));
@@ -4450,10 +4055,6 @@ fn a_proven_peer_is_read_only_as_the_node_it_proved() {
 }
 
 /// THE PROVEN NODE OF A SERVED CONNECTION ([`proven_peer`]) is the node the
-/// dialer proved under the key the listener's book binds it to — what a
-/// listener authorizes a node by. The node's own key proves it; the same
-/// node id under another key, a node bound to none, and no proof are each
-/// named, never that node.
 #[test]
 fn a_listener_names_only_the_node_its_book_binds_the_proved_key_to() {
     let state = State::new("proven");
@@ -4523,11 +4124,6 @@ fn a_listener_names_only_the_node_its_book_binds_the_proved_key_to() {
 }
 
 /// A DRIVE IS HELD TO THE NODE KEY THIS MACHINE BINDS ([`drive`]): a peer
-/// that proves the bound key is driven, its stream carrying the lines after
-/// the proof; one that proves a node bound to no key is never driven,
-/// though a read would take it as the peer's claim; one that proves the
-/// node under another key is an impostor; and a listener that serves no
-/// `drive` (its person allows none) says what its person runs.
 #[test]
 fn a_drive_reaches_only_the_node_this_machine_binds_a_key_to() {
     let host = identity(&node_of(0xd7), 4);
@@ -4635,14 +4231,6 @@ fn a_drive_reaches_only_the_node_this_machine_binds_a_key_to() {
 }
 
 /// WHO REFUSED A CONNECT is read off its kind, which the advice a survey,
-/// `peers` and `join` give follows: `EPERM` and `EACCES` are this process's
-/// own refusal (a sandbox, a firewall); `EHOSTUNREACH` is no route to the
-/// host (on a Mac, local-network privacy, or a host off the LAN);
-/// `ENETUNREACH` is no route to its network (this machine offline, or a VPN
-/// holding the route), which privacy never gives. Each is one kind alone. A
-/// name that did not resolve, an address past the LAN and this machine's
-/// own failure were never dialled. NEGATIVE CONTROLS: a refused port, and a
-/// handshake that failed, are dialled and none of the three.
 #[test]
 fn a_connect_failure_is_read_by_its_kind() {
     let at = SocketAddr::from(([192, 168, 1, 23], 7100));
@@ -4674,9 +4262,6 @@ fn a_connect_failure_is_read_by_its_kind() {
 }
 
 /// ON macOS AN ACCESS LIST IS PART OF PRIVACY: a key file whose ACL allows
-/// everyone to read it is refused like a 0644 one, however 0600 its mode
-/// bits are; a deny entry (what macOS puts on `~/Library`) is no refusal;
-/// and `chmod -N` makes it readable again. The same for the directory.
 #[cfg(target_os = "macos")]
 #[test]
 fn an_access_list_that_lets_others_in_is_not_private() {
@@ -4721,7 +4306,6 @@ fn an_access_list_that_lets_others_in_is_not_private() {
 }
 
 /// The actual resolver permit is held through unfinished work and unwind,
-/// independently of the caller's deadline. No DNS or thread is started here.
 #[test]
 fn resolver_work_keeps_its_process_budget_until_it_retires() {
     let in_flight = std::sync::atomic::AtomicUsize::new(0);

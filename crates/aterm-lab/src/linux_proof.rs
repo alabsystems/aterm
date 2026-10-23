@@ -1,35 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The Linux lane's proof (`linux proof`; `targo --unverified verify linux`
-//! runs it): on each architecture, the Linux tests of aterm-uds, aterm-pty and
-//! aterm-libc, and the libc oracle's conformance cell for that triple; the
-//! first-party windowing crates' and the winit fork's with displays up
-//! ([`WINDOWING`]); then a Linux aterm-gui under each display
-//! server (and once `--headless`, with no display), driven over its control
-//! socket: ready, a typed line whose echo must appear (the typed text never
-//! contains it), a resize the grid must take, on an X11 display a clipboard
-//! round trip through a second X client (xclip reads the echoed line aterm
-//! copied, then owns the clipboard with text aterm never held, which aterm
-//! pastes into a command that prints it changed), `status` with `render=ok`,
-//! the present percentiles, and one frame, kept on this Mac; then LW.4's
-//! recorded baseline replayed under every screen of the displays it runs
-//! ([`crate::linux_baseline`]), a row each.
-//!
-//! Each row is PASS, FAIL or NOT RUN with its wall time. The exit status is 1
-//! when a row failed, else 3 when a row could not run (or none ran), else 0:
-//! a partial lane never passes. The report, the frames and the guest's disk
-//! use go to `$LAB_STATE/linux/proof-<time>/`. The build output is removed
-//! from the guest at the end (`--keep-build` keeps it) and the VM stopped
-//! when this run booted it (`--keep-up` leaves it running).
-//!
-//! STOCK EXCEPTION: the guest's Rust is rustup's stock toolchain
-//! ([`crate::linux_guest::RUST`]); no Linux build of Trust exists. So the
-//! oracle row is the conformance crate's own tests (its generated const
-//! assertions and runtime checks against the registry libc), not the whole
-//! `aterm-libc-oracle` gate, whose rustdoc shape and symbol phases need
-//! Trust on a box native to the cell.
+//! The Linux lane's proof (`linux proof`; `targo --unverified verify linux` runs it).
 
+//! STOCK EXCEPTION: the guest's Rust is rustup's stock toolchain
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -66,8 +40,7 @@ pub struct Row {
     pub detail: String,
 }
 
-/// The run's exit status: 1 when a row failed, else 3 when a row did not run
-/// or there were none, else 0.
+/// The run's exit status: 1 when a row failed, else 3 when a row did not run or there were none, else 0.
 #[must_use]
 pub fn exit_code(rows: &[Row]) -> i32 {
     if rows.iter().any(|r| r.verdict == Verdict::Fail) {
@@ -86,36 +59,25 @@ pub struct ProofArgs {
     pub displays: Vec<Display>,
     pub keep_build: bool,
     pub keep_up: bool,
-    /// `gone`: only the rows that kill the display under aterm-gui
-    /// ([`crate::linux_gone`]), no tests, sessions or baseline.
+    /// `gone`: only the rows that kill the display under aterm-gui ([`crate::linux_gone`]), no tests, sessions or baseline.
     pub gone_only: bool,
-    /// `cpu`: only the CPU presenter rows (LW.6), no tests, GPU sessions,
-    /// display-gone rows or baseline.
+    /// `cpu`: only the CPU presenter rows (LW.6), no tests, GPU sessions, display-gone rows or baseline.
     pub cpu_only: bool,
-    /// `a11y`: only the accessibility runtime's rows
-    /// ([`crate::linux_a11y`]), no other tests, sessions, display-gone rows
-    /// or baseline.
+    /// `a11y`: only the accessibility runtime's rows ([`crate::linux_a11y`]), no other tests, sessions, display-gone rows or baseline.
     pub a11y_only: bool,
-    /// `deck`: only the stats Deck's layout rows
-    /// ([`crate::linux_baseline::deck_row`]), one per display family, no
-    /// tests, other sessions, display-gone rows or baseline.
+    /// `deck`: only the stats Deck's layout rows ([`crate::linux_baseline::deck_row`]), one per display family, no tests, other sessions, display-gone rows or baseline.
     pub deck_only: bool,
-    /// `edges`: only the untested edges' rows ([`crate::linux_edges`]), no
-    /// other tests, sessions, display-gone rows or baseline.
+    /// `edges`: only the untested edges' rows ([`crate::linux_edges`]), no other tests, sessions, display-gone rows or baseline.
     pub edges_only: bool,
     /// `edges --edge E`: the edge rows to run; every one when empty.
     pub edges: Vec<crate::linux_edges::Edge>,
-    /// `gone --wgpu-oracle`: aterm-gui built with aterm-gpu's `wgpu-oracle`,
-    /// so its windows attach on wgpu (Vulkan, lavapipe), the Linux renderer
-    /// before GW.4's GL arm, instead of the GL arm.
+    /// `gone --wgpu-oracle`.
     pub wgpu_oracle: bool,
-    /// `--weston-renderer pixman`: every weston the run starts draws with
-    /// its pixman renderer (the VM and kiosk case) instead of GL.
+    /// `--weston-renderer pixman`: every weston the run starts draws with its pixman renderer (the VM and kiosk case) instead of GL.
     pub weston_renderer: &'static str,
 }
 
-/// `proof [--arch A]... [--display D]... [--keep-build] [--keep-up]`: every
-/// arch and every proof display ([`Display::PROOF`]) when none is named.
+/// `proof [--arch A]... [--display D]... [--keep-build] [--keep-up]`.
 ///
 /// # Errors
 /// A usage error.
@@ -127,9 +89,7 @@ pub fn parse_proof(args: &[String]) -> Result<ProofArgs, Fail> {
     Ok(p)
 }
 
-/// `gone [--arch A]... [--display D]... [--wgpu-oracle] [--keep-build]
-/// [--keep-up]`: every arch, and the displays a proof kills
-/// ([`crate::linux_gone::GONE`]) when none is named.
+/// `gone [--arch A]... [--display D]... [--wgpu-oracle] [--keep-build] [--keep-up]`.
 ///
 /// # Errors
 /// A usage error.
@@ -142,8 +102,7 @@ pub fn parse_gone(args: &[String]) -> Result<ProofArgs, Fail> {
     Ok(p)
 }
 
-/// `cpu [--arch A]... [--display D]... [--keep-build] [--keep-up]`: every
-/// arch and every proof display ([`Display::PROOF`]) when none is named.
+/// `cpu [--arch A]... [--display D]... [--keep-build] [--keep-up]`.
 ///
 /// # Errors
 /// A usage error.
@@ -156,9 +115,7 @@ pub fn parse_cpu(args: &[String]) -> Result<ProofArgs, Fail> {
     Ok(p)
 }
 
-/// `deck [--arch A]... [--display D]... [--keep-build] [--keep-up]`: every
-/// arch and every proof display ([`Display::PROOF`]) when none is named,
-/// weston's family taking weston-x11 too, as the baseline's does.
+/// `deck [--arch A]... [--display D]... [--keep-build] [--keep-up]`.
 ///
 /// # Errors
 /// A usage error.
@@ -171,8 +128,7 @@ pub fn parse_deck(args: &[String]) -> Result<ProofArgs, Fail> {
     Ok(p)
 }
 
-/// `edges [--arch A]... [--edge E]... [--keep-build] [--keep-up]`: every
-/// arch and every edge row when none is named.
+/// `edges [--arch A]... [--edge E]... [--keep-build] [--keep-up]`: every arch and every edge row when none is named.
 ///
 /// # Errors
 /// A usage error.
@@ -182,8 +138,7 @@ pub fn parse_edges(args: &[String]) -> Result<ProofArgs, Fail> {
     Ok(p)
 }
 
-/// `a11y [--arch A]... [--keep-build] [--keep-up]`: every arch when none is
-/// named; its aterm-gui rows run under Xvfb.
+/// `a11y [--arch A]... [--keep-build] [--keep-up]`: every arch when none is named; its aterm-gui rows run under Xvfb.
 ///
 /// # Errors
 /// A usage error.
@@ -194,7 +149,6 @@ pub fn parse_a11y(args: &[String]) -> Result<ProofArgs, Fail> {
 }
 
 /// The words `proof`, `gone`, `cpu` and `a11y` share; `displays` stays empty
-/// when none is named.
 fn parse_args(args: &[String], verb: &str) -> Result<ProofArgs, Fail> {
     let mut p = ProofArgs {
         arches: Vec::new(),
@@ -254,8 +208,6 @@ fn parse_args(args: &[String], verb: &str) -> Result<ProofArgs, Fail> {
             "--keep-build" => p.keep_build = true,
             "--keep-up" => p.keep_up = true,
             "--wgpu-oracle" if verb == "gone" => p.wgpu_oracle = true,
-            // a11y starts no weston, and the edges' one weston row is pixman's
-            // whatever a run names: the switch would change nothing there.
             "--weston-renderer" if verb != "a11y" && verb != "edges" => {
                 p.weston_renderer = match it.next().map(String::as_str) {
                     Some("gl") => "gl",
@@ -281,9 +233,7 @@ fn parse_args(args: &[String], verb: &str) -> Result<ProofArgs, Fail> {
     Ok(p)
 }
 
-/// `row`, failed when `text` (its tests' uncaptured output) has a test
-/// saying it skipped (`SKIP: …`): the lane provides what every one of them
-/// needs, so a skip there is a test that did not run, not a pass.
+/// `row`, failed when `text` (its tests' uncaptured output) has a test saying it skipped (`SKIP: …`).
 #[must_use]
 pub fn no_skips(mut row: Row, text: &str) -> Row {
     let skips: Vec<&str> = text
@@ -307,22 +257,13 @@ pub fn no_skips(mut row: Row, text: &str) -> Row {
     row
 }
 
-/// The prefix of the line a test prints for what it cannot decide under a binary
-/// translator, the translator's name and the test's own words after it (aterm-uds's
-/// `spawnfd` tests: `NOT RUN under Rosetta: <test>: <why>`).
+/// The prefix of the line a test prints for what it cannot decide under a binary translator, the translator's name and the test's own words after it (aterm-uds's `spawnfd` tests: `NOT RUN under Rosetta: <test>: <why>`).
 pub const TRANSLATOR_NOT_RUN: &str = "NOT RUN under ";
 
-/// `row`, judged on what `text` (its tests' uncaptured output) says they could not
-/// decide under a binary translator ([`TRANSLATOR_NOT_RUN`]). The x86_64 cell runs
-/// under Rosetta, and what Rosetta cannot run is what this lane leaves to a real x86_64
-/// CPU, so there a Rosetta line keeps the row's verdict and is listed in its detail. A
-/// line in the native cell, or one naming any other translator, is a test that misread
-/// where it runs: the row fails.
+/// `row`, judged on what `text` (its tests' uncaptured output) says they could not decide under a binary translator ([`TRANSLATOR_NOT_RUN`]).
 #[must_use]
 pub fn translator_not_runs(mut row: Row, text: &str, arch: Arch) -> Row {
     let rosetta = format!("{TRANSLATOR_NOT_RUN}Rosetta:");
-    // From the marker on: a test run one at a time prints its own output after
-    // libtest's `test <name> ... `, on the same line.
     let lines: Vec<&str> = text
         .lines()
         .filter_map(|l| l.get(l.find(TRANSLATOR_NOT_RUN)?..).map(str::trim_end))
@@ -381,11 +322,7 @@ fn binary_of(running: &str) -> String {
         .to_string()
 }
 
-/// Read `cargo test --no-fail-fast`'s output, stderr merged in order. Per
-/// test binary (a `Running` line opens one) the LAST `test result:` line is
-/// the binary's own: the earlier ones are a staged child's output, which a
-/// failing test prints in its own section. A failure is counted once per
-/// binary and name for the same reason.
+/// Read `cargo test --no-fail-fast`'s output, stderr merged in order.
 #[must_use]
 pub fn tally(output: &str) -> Tally {
     fn close(t: &mut Tally, last: &mut Option<(u64, u64, u64)>) {
@@ -440,9 +377,7 @@ pub fn tally(output: &str) -> Tally {
     t
 }
 
-/// A test run's row: PASS on cargo's exit 0 when a test passed, NOT RUN when
-/// none did (a selection that matched nothing decided nothing), else FAIL
-/// naming what failed.
+/// A test run's row: PASS on cargo's exit 0 when a test passed, NOT RUN when none did (a selection that matched nothing decided nothing), else FAIL naming what failed.
 #[must_use]
 pub fn test_verdict(name: &str, out: &Out) -> Row {
     let t = tally(&out.text);
@@ -487,23 +422,10 @@ pub fn test_verdict(name: &str, out: &Out) -> Row {
     }
 }
 
-/// How the x86_64 cell's uds, pty and libc tests run: one at a time. Rosetta
-/// wedges a test process in which several tests spawn children at once: one
-/// Rosetta thread holds every other thread's lock in the translator and waits
-/// on a futex of its own, and the process makes no progress (measured
-/// 2026-10-17: 3 hangs past 90 s and 2 stalls of 60 s in about 350 parallel
-/// runs of aterm-uds's tests, none in 150 runs one at a time;
-/// `docs/measured/linux-rosetta-2026-10-17.md`). It also fails the first execs
-/// of a large binary it has not yet translated when several start at once:
-/// with the AOT cache emptied, atpkg's suite ran 75/84, 9 of its children
-/// dead on `rosetta error: Failed to map AOT header: 12`, and 84/84 one at a
-/// time (2026-10-20). The aarch64 cell runs them in parallel; every x86_64
-/// `exec` gets the same rule through its environment ([`guest::cargo_env`]).
+/// How the x86_64 cell's uds, pty and libc tests run: one at a time.
 pub const ROSETTA_ONE_AT_A_TIME: &str = "--test-threads=1";
 
-/// The uds, pty and libc row's hang detector: a run that has not ended by then
-/// is killed and the row fails, so a wedged test process ends the row rather
-/// than the lane. A cold build and the tests take about two minutes.
+/// The uds, pty and libc row's hang detector.
 pub const TEST_ROW_HANG_SECS: u32 = 1800;
 
 /// `timeout` for a guest command: TERM at `secs`, KILL ten seconds later.
@@ -512,30 +434,13 @@ pub fn hang_detector(secs: u32) -> Vec<String> {
     vec!["timeout".into(), "--kill-after=10".into(), secs.to_string()]
 }
 
-/// The packages whose Linux tests the proof runs. `libc` is aterm-libc, the
-/// lock's only `libc`; were the patch ever inert, a second one would make
-/// this spec ambiguous and the row FAIL with cargo's own message.
+/// The packages whose Linux tests the proof runs.
 pub const TESTED: [&str; 3] = ["aterm-uds", "aterm-pty", "libc"];
 
-/// The shell integration's suite (aterm-shell-integration's unit and
-/// integration tests), on real shells on a real pty: the guest's bash 5.2, zsh,
-/// apt's fish 3.7 (the fish floor lane, docs/DESIGN-init-system-2026-10-20.md
-/// §6.2) and pwsh, and GNU's bash 3.2 for the spare hold's SIGWINCH control
-/// (`linux_guest::BASH_3_2`). The lane provides every shell the suite names, so
-/// a test that ends COULD NOT RUN fails, as every failed test does, and fails
-/// the row: a fish failure no row ran once landed past every check (
-/// 2026-10-21).
+/// The shell integration's suite (aterm-shell-integration's unit and integration tests), on real shells on a real pty.
 pub const SHELLS: &str = "aterm-shell-integration";
 
-/// The first-party windowing crates (LW.6): the loader, the X11 client, the
-/// Wayland client and libxkbcommon's declarations, tested with an X server
-/// and two compositors up, so their live tests (`live_x11`, `live_wayland`,
-/// `live_xkb`) drive real servers, and `live_seat` drives Mutter with a
-/// RemoteDesktop seat ([`seat_env`]); and aterm-window, the absorbed winit
-/// (package `winit` until winit-core step 7), whose Linux module's unit
-/// tests (its poll loop, the Wayland backend's inbox and configure, the
-/// clipboard's claim order, the drop parser, the keymap) compile only here. A row of the rustix 0.38 facade's tests stood
-/// before this one until LW.7 deleted the facade.
+/// The first-party windowing crates (LW.6).
 pub const WINDOWING: [&str; 5] = [
     "aterm-dl",
     "aterm-x11",
@@ -544,10 +449,7 @@ pub const WINDOWING: [&str; 5] = [
     "aterm-window",
 ];
 
-/// What `aterm-wayland`'s `live_seat` test reads to reach Mutter with a seat:
-/// Mutter's socket, its pid (whose RemoteDesktop service `lane-bus seat`
-/// asks for a keyboard, a pointer and a touchscreen), `lane-bus` in `bin`,
-/// and the session bus that service is on.
+/// What `aterm-wayland`'s `live_seat` test reads to reach Mutter with a seat.
 #[must_use]
 pub fn seat_env(runtime: &str, mutter_pid: &str, bin: &str) -> Vec<(String, String)> {
     let (_, socket) = Display::Mutter.client_env(runtime);
@@ -563,7 +465,6 @@ pub fn seat_env(runtime: &str, mutter_pid: &str, bin: &str) -> Vec<(String, Stri
 }
 
 /// Whether Xvfb's display lists no MIT-SHM (`xdpyinfo -queryExtensions`),
-/// so a CPU row on it can only have taken the presenter's PutImage path.
 fn no_shm(up: &Up) -> Result<(), String> {
     let out = up.sh(&guest::with_env(
         &[Display::Xvfb.client_env(&up.runtime)],
@@ -638,19 +539,10 @@ pub fn renderer(journal: &str) -> Option<&str> {
         .find_map(|l| l.split_once("GPU rendering on ").map(|(_, r)| r.trim()))
 }
 
-/// What aterm-gui prints when a window's GPU surface did not attach although
-/// its device did (`crates/aterm-gui/src/app_window.rs`, the `Err` arm of the
-/// window attach's GPU surface): the window then draws on the CPU presenter
-/// (`…; falling back to the CPU renderer`), or is declined when another window
-/// already presents on the GPU.
+/// What aterm-gui prints when a window's GPU surface did not attach although its device did (`crates/aterm-gui/src/app_window.rs`, the `Err` arm of the window attach's GPU surface).
 pub const SURFACE_FAILED: &str = "GPU surface creation failed";
 
-/// A GPU row's check that it drew on the GPU, its frame taken: `backend`, the
-/// `backend=` of a `metrics` reply then, must be `gpu`, and the session's
-/// `journal` must not hold [`SURFACE_FAILED`]. The device line ([`renderer`])
-/// cannot tell: the device was built before the window's surface failed, so a
-/// session that fell back to the CPU still names it. `Ok` is the device the
-/// journal names, if it names one.
+/// A GPU row's check that it drew on the GPU, its frame taken.
 ///
 /// # Errors
 /// Why the row did not draw on the GPU.
@@ -673,34 +565,22 @@ pub fn drew_on_gpu<'a>(journal: &'a str, backend: Option<&str>) -> Result<Option
 /// The line the proof types, and the echo only running it prints.
 pub const TYPED: &str = "echo LANE-$((6*7))";
 pub const ECHO: &str = "LANE-42";
-/// What the CPU rows type at the prompt after their first photograph, not
-/// entered: a change to one row.
+/// What the CPU rows type at the prompt after their first photograph, not entered: a change to one row.
 pub const MORE: &str = "lane-damage";
 
-/// The clipboard round trip on an X11 display crosses the X server both
-/// ways, through a second client (xclip): xclip reads [`ECHO`] after aterm's
-/// `copy`, then owns CLIPBOARD with [`FOREIGN`], and aterm pastes it between
-/// `echo X-` and ` | tr A-Z a-z`. aterm never held [`FOREIGN`], so
-/// [`PASTED`] appears only when aterm's paste asked the X server and xclip
-/// answered; aterm's own stored copy would print `x-lane-42`.
+/// The clipboard round trip on an X11 display crosses the X server both ways, through a second client (xclip).
 pub const PASTE_BEFORE: &str = "echo X-";
 pub const PASTE_AFTER: &str = " | tr A-Z a-z";
 pub const FOREIGN: &str = "XCLIP-42";
 pub const PASTED: &str = "x-xclip-42";
 
-/// A control-socket reply as the proof reads it: trailing whitespace dropped,
-/// leading kept, so a `text` reply's blank first rows still count and
-/// [`echo_row`] names the row `select line` takes.
+/// A control-socket reply as the proof reads it.
 #[must_use]
 pub fn reply(text: &str) -> &str {
     text.trim_end()
 }
 
-/// Why a control verb's run was not taken: the verb, what it answered and
-/// how it ended ([`Out::status`]). An empty reply alone cannot tell a signal
-/// that ended the guest's `aterm-ctl` from one that ended this Mac's
-/// `limactl`; LWI-LAND's stats Deck row once failed so
-/// (`docs/measured/linux-x11-gone-2026-10-21.md`).
+/// Why a control verb's run was not taken: the verb, what it answered and how it ended ([`Out::status`]).
 #[must_use]
 pub(crate) fn refused(verb: &[&str], out: &Out) -> String {
     format!(
@@ -711,25 +591,19 @@ pub(crate) fn refused(verb: &[&str], out: &Out) -> String {
     )
 }
 
-/// The screen row (0-based, as `select line` takes it) that holds [`ECHO`]
-/// alone: the output of [`TYPED`], never the typed line.
+/// The screen row (0-based, as `select line` takes it) that holds [`ECHO`] alone: the output of [`TYPED`], never the typed line.
 #[must_use]
 pub fn echo_row(screen: &str) -> Option<usize> {
     screen.lines().position(|l| l.trim_end() == ECHO)
 }
 
-/// The scratch HOME's `.bashrc` (a login shell reads it through
-/// `.bash_profile`): a prompt that names no user, host or directory, so what
-/// the screen and the AT-SPI text show is the same from any account and VM.
+/// The scratch HOME's `.bashrc` (a login shell reads it through `.bash_profile`).
 pub const BASHRC: &str = "PS1='lane$ '\n";
 
-/// The prompt [`BASHRC`] sets, as a row of `text` shows it (trailing blanks
-/// trimmed).
+/// The prompt [`BASHRC`] sets, as a row of `text` shows it (trailing blanks trimmed).
 pub const PROMPT: &str = "lane$";
 
-/// One aterm-gui under `display` (or `--headless` with none), driven over its
-/// control socket in the guest. The baseline ([`crate::linux_baseline`])
-/// drives one the same way.
+/// One aterm-gui under `display` (or `--headless` with none), driven over its control socket in the guest.
 pub(crate) struct Gui<'a> {
     pub(crate) up: &'a Up,
     /// Where aterm-gui and aterm-ctl are, in the guest.
@@ -738,22 +612,13 @@ pub(crate) struct Gui<'a> {
     pub(crate) dir: String,
     /// `<arch>-<display>`, for the files kept on this Mac.
     pub(crate) name: String,
-    /// Draw on the CPU (`--cpu`): the first-party presenters (MIT-SHM on
-    /// X11, `wl_shm` on Wayland, LW.6) instead of the GPU's surface, with the
-    /// cursor still so a frame stays what was photographed.
+    /// Draw on the CPU (`--cpu`).
     pub(crate) cpu: bool,
-    /// The stats Deck on (`[sys] stats_bars`, aterm's default) rather than
-    /// held off. The lane holds it off ([`DECK_OFF`]), as it holds the
-    /// cursor still: the Deck redraws live figures every second, which races
-    /// every check that photographs a frame and holds it to what the server
-    /// shows. Only the Deck's own layout rows
-    /// ([`crate::linux_baseline::deck_row`]) turn it on, and they read its
-    /// layout, never its figures.
+    /// The stats Deck on (`[sys] stats_bars`, aterm's default) rather than held off.
     pub(crate) deck: bool,
 }
 
-/// The lane's session config holding the stats Deck off (`Gui::deck`):
-/// appended after [`crate::instance::CONFIG_OFF`]'s tables.
+/// The lane's session config holding the stats Deck off (`Gui::deck`): appended after [`crate::instance::CONFIG_OFF`]'s tables.
 pub(crate) const DECK_OFF: &str = "[sys]\nstats_bars = \"off\"\n";
 
 impl Gui<'_> {
@@ -765,8 +630,7 @@ impl Gui<'_> {
         self.up.sh(&self.ctl_argv(verb))
     }
 
-    /// The guest argv of one `aterm-ctl` verb against this aterm: the
-    /// verb's words last.
+    /// The guest argv of one `aterm-ctl` verb against this aterm: the verb's words last.
     pub(crate) fn ctl_argv(&self, verb: &[&str]) -> Vec<String> {
         let mut argv = vec![
             "env".to_string(),
@@ -782,8 +646,7 @@ impl Gui<'_> {
         argv
     }
 
-    /// What this one start of the unit logged: its invocation's lines only
-    /// (the unit's name is reused run after run).
+    /// What this one start of the unit logged: its invocation's lines only (the unit's name is reused run after run).
     pub(crate) fn journal(&self, invocation: &str) -> String {
         if invocation.is_empty() {
             return String::new();
@@ -800,13 +663,9 @@ impl Gui<'_> {
             .text
     }
 
-    /// Make the scratch world: HOME with a fixed prompt, the config with the
-    /// automatic lanes off, and a private runtime dir for the control socket.
+    /// Make the scratch world.
     pub(crate) fn prepare(&self) -> Result<(), String> {
         let d = &self.dir;
-        // A top-level key goes before CONFIG_OFF's tables. The cursor holds
-        // still (no blink, no trail and its resident cat), so the frame
-        // `image` photographs is the one the server keeps showing.
         let mut config = if self.cpu {
             format!(
                 "cursor_blink = false\ncursor_trail = false\n{}",
@@ -899,8 +758,7 @@ impl Gui<'_> {
         format!("{}aterm", guest::UNIT_PREFIX)
     }
 
-    /// Send `signal` (`SIGSTOP`, `SIGCONT`) to the unit's main process,
-    /// aterm-gui itself when it was started logged: whether systemd took it.
+    /// Send `signal` (`SIGSTOP`, `SIGCONT`) to the unit's main process, aterm-gui itself when it was started logged.
     pub(crate) fn signal(&self, signal: &str) -> bool {
         self.up
             .sh(&[
@@ -914,9 +772,7 @@ impl Gui<'_> {
             .ok()
     }
 
-    /// Start aterm-gui as a lane unit in the prepared world, with `extra`
-    /// added to its environment: the unit's invocation id, whose journal
-    /// lines are this start's alone.
+    /// Start aterm-gui as a lane unit in the prepared world, with `extra` added to its environment.
     ///
     /// # Errors
     /// `systemd-run` refused it.
@@ -928,9 +784,7 @@ impl Gui<'_> {
         self.start_with(display, extra, None)
     }
 
-    /// [`Gui::start`], with aterm-gui's stderr written to the guest file
-    /// `stderr` instead of the journal: whole once the unit has stopped,
-    /// where the journal takes it in when it will.
+    /// [`Gui::start`], with aterm-gui's stderr written to the guest file `stderr` instead of the journal.
     ///
     /// # Errors
     /// `systemd-run` refused it.
@@ -943,9 +797,7 @@ impl Gui<'_> {
         self.start_with(display, extra, Some(stderr))
     }
 
-    /// [`Gui::start_logged`] on a display that is not one of the lane's
-    /// [`Display`]s (Mutter's own Xwayland, whose number and authority file
-    /// Mutter picks): `client` is what aterm-gui is told to reach it by.
+    /// [`Gui::start_logged`] on a display that is not one of the lane's [`Display`]s (Mutter's own Xwayland, whose number and authority file Mutter picks).
     ///
     /// # Errors
     /// `systemd-run` refused it.
@@ -957,11 +809,7 @@ impl Gui<'_> {
         self.start_unit(Some(client), &[], Some(stderr), false)
     }
 
-    /// [`Gui::start_logged`] under `display`, with aterm-gui's exit status
-    /// (`$?`: 128 plus the signal when one killed it) written to the guest
-    /// file `status` once it ends, whole: its shell wrapper writes a
-    /// temporary and renames it. The unit's main process is that wrapper, so
-    /// the unit outlives aterm-gui by the write.
+    /// [`Gui::start_logged`] under `display`, with aterm-gui's exit status (`$?`: 128 plus the signal when one killed it) written to the guest file `status` once it ends, whole.
     ///
     /// # Errors
     /// `systemd-run` refused it.
@@ -992,8 +840,7 @@ impl Gui<'_> {
         self.start_unit(Some(client), extra, Some(stderr), false)
     }
 
-    /// [`Gui::start_watched`] on a display that is not one of the lane's
-    /// [`Display`]s: `client` is what aterm-gui is told to reach it by.
+    /// [`Gui::start_watched`] on a display that is not one of the lane's [`Display`]s: `client` is what aterm-gui is told to reach it by.
     ///
     /// # Errors
     /// `systemd-run` refused it.
@@ -1022,7 +869,6 @@ impl Gui<'_> {
     }
 
     /// `client`: what aterm-gui is told to reach its display by; `None` runs
-    /// it `--headless`.
     fn start_unit(
         &self,
         client: Option<&[(String, String)]>,
@@ -1103,9 +949,7 @@ impl Gui<'_> {
         ]);
     }
 
-    /// Copy the crash reports this instance wrote to this Mac, beside the
-    /// frames (the guest's `/tmp` is emptied at its next boot): a line naming
-    /// them, or nothing.
+    /// Copy the crash reports this instance wrote to this Mac, beside the frames (the guest's `/tmp` is emptied at its next boot).
     pub(crate) fn keep_crash_reports(&self, results: &Path) -> String {
         let found = self.up.sh(&[
             "find".into(),
@@ -1128,8 +972,7 @@ impl Gui<'_> {
         }
     }
 
-    /// Send `verb`; its reply when it exited 0 and `ok` accepts it, else
-    /// [`refused`].
+    /// Send `verb`; its reply when it exited 0 and `ok` accepts it, else [`refused`].
     pub(crate) fn expect(
         &self,
         verb: &[&str],
@@ -1145,8 +988,6 @@ impl Gui<'_> {
     }
 
     /// The CPU presenter's row (LW.6): typed, echoed, resized (new buffers),
-    /// `render=ok`, and the frame aterm presented (`image`), held to the
-    /// display server's own pixels ([`Gui::held_to_server`]).
     fn judge_cpu(&self, display: Display, results: &Path) -> Result<String, String> {
         if !self.up.sh(&guest::wait_socket(&self.sock(), 60)).ok() {
             return Err("the control socket never listened (60 s)".into());
@@ -1164,10 +1005,6 @@ impl Gui<'_> {
             return Err(format!("not on the CPU: {status}"));
         }
         let resized = self.held_to_server(display, results, "")?;
-        // One more line typed and not entered: a frame that changes the
-        // prompt's row alone, which the X11 presenter sends as damage-bounded
-        // ShmPutImages (its buffer's age is 1), so the server's pixels hold
-        // the damage path too.
         self.expect(&["send", MORE], &|r| r.starts_with("OK"))?;
         self.expect(&["await", "match", MORE, "timeout=60000"], &|r| {
             r.starts_with("OK match")
@@ -1179,14 +1016,7 @@ impl Gui<'_> {
         ))
     }
 
-    /// Photograph the presented frame (`image`, kept as
-    /// `<name><suffix>.png`) and hold it to the display server's own pixels:
-    /// the X window's (`lane-bus xgrab`) or weston's output
-    /// (`weston-screenshooter`, which needs weston's `--debug`: headless
-    /// weston's through [`linux::start_weston_capturing`], weston's x11
-    /// backend's always) or Mutter's primary monitor (`lane-bus cast`, a
-    /// ScreenCast frame, which needs the user's pipewire before Mutter). What
-    /// the row's detail says of it.
+    /// Photograph the presented frame (`image`, kept as `<name><suffix>.png`) and hold it to the display server's own pixels.
     pub(crate) fn held_to_server(
         &self,
         display: Display,
@@ -1196,12 +1026,7 @@ impl Gui<'_> {
         self.held_to_server_but(display, results, suffix, 0..0)
     }
 
-    /// [`Gui::held_to_server`], but for the frame's rows in `live`: the stats
-    /// Deck's, whose figures redraw every second, so the frame `image` took
-    /// and the pixels the server shows a moment later need not hold the same
-    /// ones. The bands around a frame smaller than its window are held whole
-    /// (a Deck row's band continues the frame's edge pixel, which is the
-    /// Deck's ground and its rule, not a figure).
+    /// [`Gui::held_to_server`], but for the frame's rows in `live`.
     pub(crate) fn held_to_server_but(
         &self,
         display: Display,
@@ -1242,10 +1067,6 @@ impl Gui<'_> {
                          presented frame exactly"
                     ));
                 }
-                // A window the window system sized (`xdotool windowsize`) is
-                // not whole cells: the frame sits at `dims`' offset in it with
-                // remainder bands around it, held as weston's output holds a
-                // maximized window's buffer.
                 let d = self.expect(&["dims"], &|r| r.starts_with("OK "))?;
                 let num = |k: &str| field(&d, k).and_then(|v| v.parse::<i64>().ok());
                 if (num("surface_w"), num("surface_h"))
@@ -1293,10 +1114,6 @@ impl Gui<'_> {
                         view.width, view.height, view.format
                     ));
                 }
-                // The buffer is the window's surface. A size the compositor
-                // chose (a maximized window's) is not whole cells, so the frame
-                // sits at `dims`' offset in it with remainder bands around it
-                // (aterm-render's `place_frame_bands`).
                 let (ox, oy) = if (view.width, view.height) == (w, h) {
                     (0, 0)
                 } else {
@@ -1351,12 +1168,9 @@ impl Gui<'_> {
                     .ok()
                     .and_then(|b| aterm_png::decode_rgba8(&b, 8192))
                     .ok_or_else(|| format!("{}: not a PNG this lab decodes", shot.display()))?;
-                // Mutter names no window's place, so the frame is found: the
-                // one place on the monitor that shows it whole and exactly.
                 let (fx, fy) = match frame_places(&output, &presented, live.clone()).as_slice() {
                     [one] => *one,
                     [] => {
-                        // Where Mutter centres a new window, for the record.
                         let centred = held_at(
                             &output,
                             &presented,
@@ -1390,9 +1204,6 @@ impl Gui<'_> {
                 );
                 let bands = match surface {
                     (Some(sw), Some(sh)) if (sw, sh) != (w, h) => {
-                        // A size the compositor chose (a maximized window's):
-                        // the surface sits `dims`' offset up and left of the
-                        // frame, and its bands continue the frame's edge.
                         let (ox, oy) = (num("offset_x").unwrap_or(0), num("offset_y").unwrap_or(0));
                         let view = WestonView {
                             x: fx as i64 - ox,
@@ -1422,8 +1233,6 @@ impl Gui<'_> {
     }
 
     /// The whole primary monitor of the lane's Mutter, as `lane-bus cast`
-    /// writes it (a ScreenCast frame read through PipeWire), copied out as
-    /// `<name><suffix>-monitor.png`.
     fn mutter_cast(&self, results: &Path, suffix: &str) -> Result<PathBuf, String> {
         let pid = unit_pid(self.up, &format!("{}mutter", guest::UNIT_PREFIX))
             .ok_or_else(|| "Mutter's unit has no main pid".to_string())?;
@@ -1456,7 +1265,6 @@ impl Gui<'_> {
     }
 
     /// The X window's pixels (`lane-bus xgrab` of the window aterm-gui's
-    /// unit owns), copied out as `<name><suffix>.ppm`.
     fn x_grab(&self, display: Display, results: &Path, suffix: &str) -> Result<PathBuf, String> {
         let x = vec![display.client_env(&self.up.runtime)];
         let pid = unit_pid(self.up, &Self::unit_name())
@@ -1507,8 +1315,6 @@ impl Gui<'_> {
     }
 
     /// aterm-gui's window in the scene graph of the weston that is `display`
-    /// (`weston-debug scene-graph`, which weston's `--debug` allows): where
-    /// weston shows it.
     fn weston_view(&self, display: Display) -> Result<WestonView, String> {
         let pid = unit_pid(self.up, &Self::unit_name())
             .ok_or_else(|| "aterm-gui's unit has no main pid".to_string())?;
@@ -1525,9 +1331,6 @@ impl Gui<'_> {
     }
 
     /// The whole output of the weston that is `display`, as
-    /// `weston-screenshooter` writes it (a PNG in its working directory,
-    /// through `weston_capture_v1`), copied out as
-    /// `<name><suffix>-output.png`.
     fn weston_shot(
         &self,
         display: Display,
@@ -1571,7 +1374,6 @@ impl Gui<'_> {
     }
 
     /// A GPU row's drive: its detail, and the `backend=` `metrics` names once
-    /// the frame is taken, which [`drew_on_gpu`] judges with the journal.
     fn judge(
         &self,
         display: Option<Display>,
@@ -1593,13 +1395,11 @@ impl Gui<'_> {
         let clipboard = match display {
             Some(d) if d.clipboard_scriptable() => {
                 let (_, x) = d.client_env(&self.up.runtime);
-                // The echoed line, selected by its row and copied: exactly its bytes.
                 let screen = self.expect(&["text"], &|r| echo_row(r).is_some())?;
                 let row = echo_row(&screen).unwrap_or_default().to_string();
                 self.expect(&["select", "line", &row], &|r| r.starts_with("OK"))?;
                 let copied = format!("OK {}", ECHO.len());
                 self.expect(&["copy"], &|r| r == copied)?;
-                // Out: another X client reads it, so aterm served the selection.
                 let read = self
                     .up
                     .sh(&guest::read_clipboard(&x, guest::Selection::Clipboard, 60));
@@ -1610,9 +1410,6 @@ impl Gui<'_> {
                         read.code
                     ));
                 }
-                // In: xclip takes CLIPBOARD with text aterm never held, and aterm
-                // pastes it between typed words; only that paste makes the lowered
-                // echo, which no typed text contains.
                 let owner = guest::clipboard_owner(&x, guest::Selection::Clipboard, FOREIGN);
                 let started = self.up.sh(&guest::run_unit(&owner, None));
                 if !started.ok() {
@@ -1654,8 +1451,6 @@ impl Gui<'_> {
                 self.up.lima.copy_out(guest_path, &to).ok()
             })
             .unwrap_or(false);
-        // After the frame: a headless session builds its device at its first
-        // pixel demand, the `image`.
         let summary = self.expect(&["metrics"], &|r| r.starts_with("OK "))?;
         let size = |r: &str| {
             let w: Vec<&str> = r.split_whitespace().collect();
@@ -1702,10 +1497,7 @@ pub(crate) fn parse_ppm(b: &[u8]) -> Option<(Vec<u8>, usize, usize)> {
     Some((rgb.to_vec(), w, h))
 }
 
-/// Whether `server` (RGB) shows exactly the RGB of `rgba` (`w` x `h`), but
-/// for the rows in `live` (the stats Deck's, whose figures move while the
-/// frame is read twice: `Gui::held_to_server_but`): the count and first
-/// place of the pixels that differ, when they do.
+/// Whether `server` (RGB) shows exactly the RGB of `rgba` (`w` x `h`), but for the rows in `live` (the stats Deck's, whose figures move while the frame is read twice: `Gui::held_to_server_but`).
 pub(crate) fn compare_rgb(
     rgba: &[u8],
     w: usize,
@@ -1747,8 +1539,7 @@ pub(crate) fn compare_rgb(
     }
 }
 
-/// A toplevel's view in weston's scene graph (`weston-debug scene-graph`):
-/// where the compositor shows it, and the buffer it shows.
+/// A toplevel's view in weston's scene graph (`weston-debug scene-graph`): where the compositor shows it, and the buffer it shows.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct WestonView {
     pub(crate) x: i64,
@@ -1759,8 +1550,7 @@ pub(crate) struct WestonView {
     pub(crate) format: String,
 }
 
-/// The `xdg_toplevel` view of process `pid` in a `weston-debug scene-graph`
-/// dump.
+/// The `xdg_toplevel` view of process `pid` in a `weston-debug scene-graph` dump.
 pub(crate) fn weston_view(dump: &str, pid: &str) -> Option<WestonView> {
     let owner = format!("role xdg_toplevel, PID {pid},");
     let mut lines = dump.lines().map(str::trim);
@@ -1801,12 +1591,7 @@ fn read_weston_view(dump: &Out, pid: &str) -> Result<WestonView, String> {
     })
 }
 
-/// Whether `screen` (RGBA, a display's whole output) shows `frame` (RGBA)
-/// exactly, by RGB, with the frame's top-left corner at `x`, `y` (where the
-/// compositor put the window): as much of it as the output holds, which a
-/// window reaching past the output's right or bottom edge cuts, and at least
-/// half of it; the frame's rows in `live` are not compared ([`compare_rgb`]).
-/// The part held to it.
+/// Whether `screen` (RGBA, a display's whole output) shows `frame` (RGBA) exactly, by RGB, with the frame's top-left corner at `x`, `y` (where the compositor put the window).
 pub(crate) fn held_at(
     screen: &(Vec<u8>, usize, usize),
     frame: &(Vec<u8>, usize, usize),
@@ -1844,10 +1629,7 @@ pub(crate) fn held_at(
         .map_err(|why| format!("at {x},{y}, {vw}x{vh} of the frame on the output: {why}"))
 }
 
-/// Where on `screen` (RGBA) the whole of `frame` (RGBA) shows exactly, by
-/// RGB, its rows in `live` aside: the top-left corners it shows at, at most
-/// two (a frame shown in two places is not placed). A frame larger than the
-/// screen, or with no row to hold, shows nowhere.
+/// Where on `screen` (RGBA) the whole of `frame` (RGBA) shows exactly, by RGB, its rows in `live` aside.
 pub(crate) fn frame_places(
     screen: &(Vec<u8>, usize, usize),
     frame: &(Vec<u8>, usize, usize),
@@ -1863,7 +1645,6 @@ pub(crate) fn frame_places(
         return Vec::new();
     };
     let middle = rows[rows.len() / 2];
-    // Three pixels first, so most places are passed over at once.
     let probes = [(0, top), (w - 1, bottom), (w / 2, middle)];
     let rgb = |buf: &[u8], stride: usize, x: usize, y: usize| {
         let at = (y * stride + x) * 4;
@@ -1898,12 +1679,7 @@ pub(crate) fn frame_places(
     found
 }
 
-/// Whether the bands of a window's buffer that a frame smaller than it
-/// leaves (`frame` at `offset` in the buffer weston shows as `view`) are on
-/// `screen` (RGBA, weston's whole output) as the CPU presenter fills them:
-/// each band pixel the frame's pixel nearest it, by RGB (a chrome row's band
-/// continues its edge, the rest is the terminal's background, which the
-/// frame's padding is). The band pixels held, the ones on the output.
+/// Whether the bands of a window's buffer that a frame smaller than it leaves (`frame` at `offset` in the buffer weston shows as `view`) are on `screen` (RGBA, weston's whole output) as the CPU presenter fills them.
 pub(crate) fn bands_held(
     screen: &(Vec<u8>, usize, usize),
     frame: &(Vec<u8>, usize, usize),
@@ -1963,8 +1739,7 @@ pub fn cmd_proof(args: &[String]) -> Res {
     run(&parse_proof(args)?, "proof")
 }
 
-/// `linux gone …`: the proof's display-gone rows alone
-/// ([`crate::linux_gone`]).
+/// `linux gone …`: the proof's display-gone rows alone ([`crate::linux_gone`]).
 ///
 /// # Errors
 /// A usage error, or the lane could not be brought up (NOT RUN).
@@ -1980,8 +1755,7 @@ pub fn cmd_cpu(args: &[String]) -> Res {
     run(&parse_cpu(args)?, "cpu")
 }
 
-/// `linux deck …`: the proof's stats Deck layout rows alone
-/// ([`crate::linux_baseline::deck_row`]).
+/// `linux deck …`: the proof's stats Deck layout rows alone ([`crate::linux_baseline::deck_row`]).
 ///
 /// # Errors
 /// A usage error, or the lane could not be brought up (NOT RUN).
@@ -1989,8 +1763,7 @@ pub fn cmd_deck(args: &[String]) -> Res {
     run(&parse_deck(args)?, "deck")
 }
 
-/// `linux edges …`: the proof's untested-edge rows alone
-/// ([`crate::linux_edges`]).
+/// `linux edges …`: the proof's untested-edge rows alone ([`crate::linux_edges`]).
 ///
 /// # Errors
 /// A usage error, or the lane could not be brought up (NOT RUN).
@@ -1998,8 +1771,7 @@ pub fn cmd_edges(args: &[String]) -> Res {
     run(&parse_edges(args)?, "edges")
 }
 
-/// `linux a11y …`: the proof's accessibility runtime rows alone
-/// ([`crate::linux_a11y`]).
+/// `linux a11y …`: the proof's accessibility runtime rows alone ([`crate::linux_a11y`]).
 ///
 /// # Errors
 /// A usage error, or the lane could not be brought up (NOT RUN).
@@ -2020,7 +1792,6 @@ fn run(ask: &ProofArgs, kind: &str) -> Res {
     let mut up = match linux::bring_up() {
         Ok(up) => up,
         Err(f) => {
-            // Nothing ran, so nothing is kept: an empty directory says nothing.
             let _ = std::fs::remove_dir(&results);
             return Err(f);
         }
@@ -2043,9 +1814,6 @@ fn run(ask: &ProofArgs, kind: &str) -> Res {
     let lane = up.lane_dir();
     let repo = linux::repo();
     let mut stopped = None;
-    // The baseline's replay (LW.4): every screen of a display this proof
-    // runs (weston's take weston-x11's too), against the recordings
-    // committed in `linux_baseline::DIR`.
     let baseline =
         if ask.gone_only || ask.cpu_only || ask.a11y_only || ask.deck_only || ask.edges_only {
             None
@@ -2079,7 +1847,6 @@ fn run(ask: &ProofArgs, kind: &str) -> Res {
         let env = guest::cargo_env(arch, &format!("{lane}/target"), false);
         let oracle_env = guest::cargo_env(arch, &format!("{lane}/libc-oracle-target"), false);
         let bin = arch.bin_dir(&format!("{lane}/target"));
-        // The accessibility runtime's rows (`a11y`'s, and a proof's).
         let a11y =
             (!ask.gone_only && !ask.cpu_only && !ask.deck_only).then(|| crate::linux_a11y::Cell {
                 up: &up,
@@ -2102,16 +1869,11 @@ fn run(ask: &ProofArgs, kind: &str) -> Res {
             argv.extend(extra.iter().map(|s| (*s).to_string()));
             guest::with_env(env, &argv)
         };
-        // The tests, a proof's alone: `gone` runs only its display-gone rows,
-        // `cpu` only its CPU rows, `a11y` and `deck` only their own.
         if !ask.gone_only && !ask.cpu_only && !ask.a11y_only && !ask.deck_only && !ask.edges_only {
             let mut tests = vec!["--no-fail-fast", "--tests"];
             for p in TESTED {
                 tests.extend(["-p", p]);
             }
-            // Uncaptured, so what a test could not decide under Rosetta is read;
-            // and under Rosetta one test at a time, which wedges a process whose
-            // tests spawn children at once ([`ROSETTA_ONE_AT_A_TIME`]).
             tests.extend(["--", "--nocapture"]);
             if arch == Arch::X86_64 {
                 tests.push(ROSETTA_ONE_AT_A_TIME);
@@ -2174,7 +1936,6 @@ fn run(ask: &ProofArgs, kind: &str) -> Res {
             let started = Instant::now();
             let name =
                 format!("{tag} tests: dl x11 wayland xkb window, live on Xvfb, weston and Mutter");
-            // `live_seat`'s second process: a RemoteDesktop seat for Mutter.
             let bus = up.lima.shell_streamed(
                 &up.home,
                 &cargo(
@@ -2186,8 +1947,6 @@ fn run(ask: &ProofArgs, kind: &str) -> Res {
                 "  | ",
             );
             let servers = if bus.ok() {
-                // `live_seat`'s finger is placed in a screencast stream, which
-                // Mutter makes through pipewire.
                 linux::start_pipewire(&up);
                 linux::start_display(&up, Display::Xvfb)
                     .and_then(|_| linux::start_display(&up, Display::Weston))
@@ -2219,8 +1978,6 @@ fn run(ask: &ProofArgs, kind: &str) -> Res {
                     for p in WINDOWING {
                         tests.extend(["-p", p]);
                     }
-                    // Uncaptured, so a test that found no display, library,
-                    // seat or compiler and said SKIP is seen to have.
                     tests.extend(["--", "--nocapture"]);
                     let out = up.lima.shell_streamed(
                         &up.home,
@@ -2242,8 +1999,6 @@ fn run(ask: &ProofArgs, kind: &str) -> Res {
             stopped = Some(s);
             break 'arches;
         }
-        // The renderer the rows' aterm-gui draws with, when it is not the
-        // shipped one.
         let oracle = if ask.wgpu_oracle {
             " (wgpu oracle)"
         } else {
@@ -2259,7 +2014,6 @@ fn run(ask: &ProofArgs, kind: &str) -> Res {
             "aterm-ctl",
             "--bin",
             "aterm-ctl",
-            // `lane-bus xgrab`: the X11 CPU rows read the server's pixels.
             "-p",
             "aterm-dbus",
             "--bin",
@@ -2295,7 +2049,6 @@ fn run(ask: &ProofArgs, kind: &str) -> Res {
                     .collect()
             };
         for display in sessions {
-            // A weston drawing with another renderer than GL says so.
             let where_ = display.map_or_else(
                 || "--headless".to_string(),
                 |d| match up.weston_renderer {
@@ -2355,14 +2108,12 @@ fn run(ask: &ProofArgs, kind: &str) -> Res {
                     break 'arches;
                 }
             }
-            // The same display on the CPU: the first-party presenters (LW.6).
             let Some(d) = display else {
                 continue;
             };
             let name = format!("{tag} aterm-gui --cpu {where_}");
             println!("\n=== {name} ===");
             let started = Instant::now();
-            // Weston with its capture protocol, so the row reads its pixels.
             let servers = if d == Display::Weston {
                 linux::start_weston_capturing(&up)
             } else {
@@ -2395,8 +2146,6 @@ fn run(ask: &ProofArgs, kind: &str) -> Res {
                 stopped = Some(s);
                 break 'arches;
             }
-            // And once on an X server without MIT-SHM: the presenter's
-            // PutImage path, judged as the SHM one is.
             if d != Display::Xvfb {
                 continue;
             }
@@ -2433,9 +2182,6 @@ fn run(ask: &ProofArgs, kind: &str) -> Res {
                 break 'arches;
             }
         }
-        // The display killed under a running aterm-gui (COMPOSITOR-GONE), and
-        // the person's quit as their control: Xvfb's and weston's in a proof,
-        // every display named to `gone`.
         let gone = ask.displays.iter().copied().filter(|d| {
             !ask.cpu_only
                 && !ask.a11y_only
@@ -2511,15 +2257,12 @@ fn run(ask: &ProofArgs, kind: &str) -> Res {
             stopped = Some(s);
             break 'arches;
         }
-        // The edges LW.5-LW.7 left untested: `edges`'s rows, and a proof's.
         if let Some(cell) = a11y.as_ref().filter(|_| !ask.a11y_only)
             && let Err(s) = crate::linux_edges::rows(cell, built, &ask.edges, &mut rows)
         {
             stopped = Some(s);
             break 'arches;
         }
-        // The stats Deck's layout rows, one per display family: the lane's
-        // other sessions hold the Deck off ([`DECK_OFF`]).
         let decks = guest::Screen::DECK
             .into_iter()
             .filter(|s| ask.displays.contains(&s.display.proof_display()))
@@ -2636,8 +2379,7 @@ fn run(ask: &ProofArgs, kind: &str) -> Res {
     Ok(code)
 }
 
-/// The report: one row per step with its verdict and wall time, the details
-/// under it, then the disk use and the total.
+/// The report: one row per step with its verdict and wall time, the details under it, then the disk use and the total.
 #[must_use]
 pub fn render(rows: &[Row], disk: &[String], total_secs: f64) -> String {
     render_as("LINUX LANE PROOF", rows, disk, total_secs)
@@ -2703,8 +2445,6 @@ mod tests {
     }
 
     /// A refused verb says how it ended, so the stats Deck's empty reply
-    /// would tell a guest-side signal (a silent exit 255) from this Mac's
-    /// `limactl` ended on one (no exit status).
     #[test]
     fn a_refused_verb_says_how_it_ended() {
         let out = |code: Option<i32>, text: &str| Out {
@@ -2771,7 +2511,6 @@ mod tests {
     }
 
     /// `gone` kills Xvfb and weston unless told otherwise, and only `gone`
-    /// builds the wgpu oracle.
     #[test]
     fn gone_runs_its_displays_and_alone_takes_the_oracle() {
         let s = |v: &[&str]| v.iter().map(|x| (*x).to_string()).collect::<Vec<_>>();
@@ -2793,7 +2532,6 @@ mod tests {
     }
 
     /// `a11y` runs its own rows on every arch unless named; its aterm-gui rows
-    /// are Xvfb's, so it takes no display.
     #[test]
     fn a11y_runs_its_rows_alone_on_every_arch_unless_named() {
         let s = |v: &[&str]| v.iter().map(|x| (*x).to_string()).collect::<Vec<_>>();
@@ -2818,8 +2556,6 @@ mod tests {
     }
 
     /// `--weston-renderer` is taken where it chooses a weston's renderer
-    /// (proof, gone, cpu, deck), and refused by `edges`, whose one weston row
-    /// is pixman's whatever a run names.
     #[test]
     fn the_weston_renderer_is_taken_where_it_starts_a_weston() {
         let s = |v: &[&str]| v.iter().map(|x| (*x).to_string()).collect::<Vec<_>>();
@@ -2837,7 +2573,6 @@ mod tests {
     }
 
     /// The shape of a `text` reply measured under Xvfb on 2026-10-16: only the
-    /// output row is the echo alone; the typed line carries the arithmetic.
     #[test]
     fn the_echo_row_is_the_output_never_the_typed_line() {
         let screen = "user@lima:/w$ echo LANE-$((6*7))\nLANE-42\nuser@lima:/w$ \n\n";
@@ -2850,12 +2585,10 @@ mod tests {
         assert!(!TYPED.contains(PASTED) && !PASTE_BEFORE.contains(PASTED));
         assert!(!PASTE_AFTER.contains(PASTED) && !FOREIGN.contains(PASTED));
         assert_ne!(ECHO.to_lowercase(), PASTED.trim_start_matches("x-"));
-        // Blank rows above the prompt keep their place in the reply.
         assert_eq!(echo_row(reply("\n\n$ echo x\nLANE-42\n$ \n\n")), Some(3));
     }
 
     /// The shape measured in the guest on 2026-10-16: a staged child's own
-    /// `test result:` and `FAILED` lines inside a failing test's section.
     const STAGED: &str = "\
      Running unittests src/lib.rs (lane/target/debug/deps/aterm_uds-04e96a6b8de7de57)
 
@@ -2967,8 +2700,6 @@ error: 1 target failed:
             drew_on_gpu(device, Some("gpu")),
             Ok(Some("llvmpipe (LLVM 20.1.2, 128 bits) (Gl)"))
         );
-        // The attach's fallback: the device line stands, `metrics` may not yet
-        // have been read, and the row still fails, naming the line.
         let fell_back = format!(
             "{device}aterm-gui: {SURFACE_FAILED}: gl: no libwayland-egl.so.1 on this machine; \
              falling back to the CPU renderer\n"
@@ -2977,7 +2708,6 @@ error: 1 target failed:
             let why = drew_on_gpu(&fell_back, backend).expect_err("a fallback fails the row");
             assert!(why.contains("no libwayland-egl.so.1"), "{why}");
         }
-        // No device at all, or one lost before the frame: only `metrics` says so.
         let no_device = "aterm-gui: GPU unavailable (no EGL display); using CPU renderer\n";
         let why = drew_on_gpu(no_device, Some("cpu")).expect_err("a CPU session fails the row");
         assert!(why.contains("backend=cpu"), "{why}");
@@ -3018,10 +2748,8 @@ error: 1 target failed:
         let ppm = b"P6\n2 1\n255\n\x01\x02\x03\x04\x05\x06";
         let server = parse_ppm(ppm).expect("a 2x1 PPM");
         assert_eq!(server, (vec![1, 2, 3, 4, 5, 6], 2, 1));
-        // Alpha is not compared: the presented frame is opaque RGBA.
         let frame = [1, 2, 3, 255, 4, 5, 6, 0];
         assert_eq!(compare_rgb(&frame, 2, 1, &server, 0..0), Ok(()));
-        // Negative controls: one channel of one pixel, and a size.
         let off = [1, 2, 3, 255, 4, 5, 7, 255];
         let why = compare_rgb(&off, 2, 1, &server, 0..0).unwrap_err();
         assert!(
@@ -3029,8 +2757,6 @@ error: 1 target failed:
             "{why}"
         );
         assert!(compare_rgb(&frame, 1, 2, &server, 0..0).is_err());
-        // A live row (the Deck's figures) is not compared; every other row
-        // still is.
         let two = (vec![1, 2, 3, 4, 5, 6], 1, 2);
         let moved = [9, 9, 9, 255, 4, 5, 6, 255];
         assert_eq!(compare_rgb(&moved, 1, 2, &two, 0..1), Ok(()));
@@ -3068,13 +2794,8 @@ error: 1 target failed:
         };
         let output = rgba(12, 10, |x, y| place(5, 3, (x, y)));
         assert_eq!(held_at(&output, &frame, 5, 3, 0..0), Ok((4, 5)));
-        // A window reaching past the output's bottom edge: what is on it.
         let past = rgba(12, 10, |x, y| place(5, 6, (x, y)));
         assert_eq!(held_at(&past, &frame, 5, 6, 0..0), Ok((4, 4)));
-        // Negative controls: one channel of one pixel; the frame one row low
-        // in its window, which the visible part alone would show whole one
-        // row down; elsewhere than the compositor says; mostly off the
-        // output; above it.
         let mut off = output.clone();
         off.0[((3 + 4) * 12 + 5 + 2) * 4] ^= 1;
         let why = held_at(&off, &frame, 5, 3, 0..0).unwrap_err();
@@ -3102,8 +2823,6 @@ error: 1 target failed:
     }
 
     /// The frame found where it shows whole; negative controls: one pixel
-    /// off (nowhere), a live row's pixel off (still there), shown twice (not
-    /// placed), larger than the screen.
     #[test]
     fn a_frame_is_found_where_it_shows_whole() {
         let pixel = |x: usize, y: usize| [u8::try_from(x).unwrap(), u8::try_from(y).unwrap(), 7];
@@ -3137,14 +2856,10 @@ error: 1 target failed:
     }
 
     /// A window's buffer wider and taller than its frame: the frame at its
-    /// offset, the bands around it each the frame's nearest pixel. Negative
-    /// controls: one band pixel off, and the same output read as if the frame
-    /// sat one pixel further left in the buffer.
     #[test]
     fn a_buffer_s_bands_continue_the_frame_s_edge() {
         let pixel = |x: usize, y: usize| [u8::try_from(x).unwrap(), u8::try_from(y).unwrap(), 7];
         let frame = rgba(4, 5, pixel);
-        // A 7x6 buffer at (3,2) on a 12x10 output, the frame at (2,0) in it.
         let view = WestonView {
             x: 3,
             y: 2,
@@ -3201,12 +2916,8 @@ Layer 5 (pos 0x50000000):
             format: "XRGB8888".into(),
         };
         assert_eq!(weston_view(dump, "1501"), Some(view.clone()));
-        // Negative controls: another process's, and a view that is not a
-        // toplevel (the panel's buffer is not taken for the window's).
         assert_eq!(weston_view(dump, "150"), None);
         assert_eq!(weston_view(dump, "1480"), None);
-        // The actual live-row boundary receives both captured text and the
-        // command's status. Ordinary complete evidence is admitted first.
         let observation = |code| Out {
             code,
             text: dump.to_string(),
@@ -3214,8 +2925,6 @@ Layer 5 (pos 0x50000000):
         };
         assert_eq!(read_weston_view(&observation(Some(0)), "1501"), Ok(view));
         assert!(read_weston_view(&observation(Some(0)), "150").is_err());
-        // A failed or never-completed observation can still contain a
-        // plausible view; its readable prefix cannot validate the row.
         let admitted: Vec<_> = [Some(1), None]
             .into_iter()
             .filter(|code| read_weston_view(&observation(*code), "1501").is_ok())
@@ -3244,7 +2953,6 @@ Layer 5 (pos 0x50000000):
             "{}",
             failed.detail
         );
-        // Negative control: no skip leaves the row as it was.
         let kept = no_skips(row(Verdict::Pass), "test live ... ok\n");
         assert_eq!(kept.verdict, Verdict::Pass);
         assert_eq!(kept.detail, "3 passed, 0 failed, 0 ignored");
@@ -3269,16 +2977,13 @@ Layer 5 (pos 0x50000000):
             "{}",
             listed.detail
         );
-        // The native cell runs under no translator: a test that says so fails it.
         let native = translator_not_runs(row(), text, Arch::Aarch64);
         assert_eq!(native.verdict, Verdict::Fail, "{}", native.detail);
-        // Nor does the x86_64 cell run under any translator but Rosetta.
         let other = "NOT RUN under a translator (x86_64 code on an aarch64 kernel): m::t: why\n";
         assert_eq!(
             translator_not_runs(row(), other, Arch::X86_64).verdict,
             Verdict::Fail
         );
-        // Negative control: no such line leaves the row as it was.
         assert_eq!(
             translator_not_runs(row(), "test a ... ok\n", Arch::X86_64),
             row()

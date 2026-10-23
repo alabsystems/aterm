@@ -589,6 +589,18 @@ pub trait System: Sync {
         None
     }
 
+    /// Whether this process holds Full Disk Access, as whoever runs the items measured it,
+    /// once and without a prompt, before the run (`aterm_containment::probe_fda`, which this
+    /// crate does not link): `Some(true)` granted, `Some(false)` refused, `None` not
+    /// measured, which every reader takes as no grant. A workstation pass carries it into
+    /// its context ([`crate::model::HostFacts::full_disk_access`]), which decides whether
+    /// it may touch another app's sandbox container ([`crate::items::defaults::withheld`]).
+    /// [`Live`] answers what its runner gave it ([`Live::with_full_disk_access`]); the test
+    /// arm what the test set; the default `None`.
+    fn full_disk_access(&self) -> Option<bool> {
+        None
+    }
+
     /// Open the converge journal for the account this system acts as.
     fn journal(&self) -> Result<Box<dyn aterm_converge::Journal + '_>, String> {
         Err("this system keeps no converge journal".into())
@@ -602,15 +614,27 @@ pub use crate::model::User;
 pub struct Live {
     /// The agent executable, which [`System::write_user_file`] re-runs as the user.
     pub agent_exe: PathBuf,
+    /// What [`System::full_disk_access`] answers: the runner's own measurement.
+    full_disk_access: Option<bool>,
 }
 
 impl Live {
-    /// The live port, with the running executable as the agent.
+    /// The live port, with the running executable as the agent, and Full Disk Access not
+    /// measured.
     #[must_use]
     pub fn new() -> Self {
         Self {
             agent_exe: std::env::current_exe().unwrap_or_else(|_| PathBuf::from("/nonexistent")),
+            full_disk_access: None,
         }
+    }
+
+    /// This port, answering `measured` for [`System::full_disk_access`]: what the runner
+    /// measured of this process, once, before the run (`aterm_containment::probe_fda`).
+    #[must_use]
+    pub const fn with_full_disk_access(mut self, measured: Option<bool>) -> Self {
+        self.full_disk_access = measured;
+        self
     }
 
     /// Build the real program and argv for `cmd`, wrapping with `sudo` and `launchctl` as needed.
@@ -1336,6 +1360,10 @@ impl System for Live {
         Ok(Box::new(Exclusive::within(file, limit, path)?))
     }
 
+    fn full_disk_access(&self) -> Option<bool> {
+        self.full_disk_access
+    }
+
     fn own_uuid(&self) -> Option<String> {
         let ran = self
             .run(&Cmd::new("/usr/sbin/ioreg").args(["-rd1", "-c", "IOPlatformExpertDevice"]))
@@ -1511,6 +1539,9 @@ mod fake {
         fed: Mutex<Vec<(String, Vec<u8>)>>,
         /// What [`System::has_tty`] answers: a person's terminal is there.
         pub tty: bool,
+        /// What [`System::full_disk_access`] answers: `None`, not measured, unless a test
+        /// grants it.
+        pub full_disk_access: Option<bool>,
     }
 
     #[derive(Clone)]
@@ -2149,6 +2180,10 @@ mod fake {
 
         fn has_tty(&self) -> bool {
             self.tty
+        }
+
+        fn full_disk_access(&self) -> Option<bool> {
+            self.full_disk_access
         }
 
         fn run_tty(&self, cmd: &Cmd) -> Result<Option<i32>, RunFailed> {

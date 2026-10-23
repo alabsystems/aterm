@@ -1,76 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The Claude Code footer: aterm's facts about a Claude Code session, written
-//! into the rule under Claude Code's input box, right-aligned the way Claude
-//! writes its own effort tag (`‹top effort›` below) into the rule above it:
-//!
-//! ```text
-//! ────────────────────────────────────────────── ‹top effort› ─
-//! ❯ fix the footer
-//! ───────────────── ◆ Opus 5.5 xhigh   ⌂ ~/aterm   ⎇ main ─
-//!   ⏵⏵ bypass permissions on (shift+tab to cycle) · esc to interrupt · ← for agents
-//! ```
-//!
-//! Model and effort under one mark, then the working directory (home as `~`),
-//! then the branch. Only cells that are plain rule glyphs are covered
-//! ([`rule_run`]), and Claude's own footer row under the rule is never touched.
-//! A pane too narrow for every fact gives them up in a fixed order, the model
-//! last ([`fit_rule`], `facts_ladder`).
-//!
-//! Claude Code's own rows cannot be switched off from outside (no setting or
-//! variable removes them, and a statusLine only adds a row), so the facts do not
-//! come from a statusLine; the usage tap ([`super::tap`]) is one only on a line
-//! aterm itself relaunches. They come from what Claude Code already keeps:
-//!
-//! * `<claude dir>/sessions/<pid>.json` maps the process to its session id and
-//!   launch directory, so a pane finds its own transcript when several sessions
-//!   share one directory ([`session_of_pid`]). The path and branch follow the
-//!   transcript's newest main-thread `cwd` since the process started, else the
-//!   launch directory.
-//! * The transcript carries the model and effort: every answer's
-//!   (`message.model`, `effort`) and the result Claude writes for its own
-//!   `/model`, `/effort` and `/fast` ([`tail_facts`]). The transcript is the
-//!   conversation's, shared by every process that resumed it, so only a row
-//!   written since this process started, and since it entered that session,
-//!   speaks for it; the model is the process's, carried across `/clear` and
-//!   `/resume` as [`TailCache`] describes.
-//! * The process's own `--model` ([`launch_facts`]), when the transcript since
-//!   its start names no model yet.
-//! * Claude Code's launch card on screen ([`launch_card`]), when nothing above
-//!   named them, kept for that process and session only ([`FactsOwner`]).
-//! * The branch, read live from `.git/HEAD` ([`git_head`]), so a checkout shows
-//!   at once.
-//! * The session's usage ([`super::session_usage`], via [`FooterCache::usage`]):
-//!   the conversation's tokens and working time (not floored at the process's
-//!   start, as model and effort are) as one merged total, last in the run
-//!   (`Σ 7h52m ↑395M ↓2.0M`; `[claude_footer] usage = false` hides it), and,
-//!   while one stands, the limit wall Claude Code wrote, first in the run
-//!   (`⧗ 5h ♻ 3pm`).
-//! * Laid in by the window, not read here: a live upgrade waiting on the person
-//!   at this composer ([`FooterFacts::upgrade`]), first in the run, and the
-//!   account the process runs on ([`FooterFacts::account`]), only where the
-//!   roster lists two or more.
-//!
-//! A fact the person hid by a click reads greyed, its value and `off`
-//! after it (`◆ Opus 5.5 off xhigh`, `⌂ ~/aterm off`: [`FooterFacts::off`],
-//! [`OFF_STUB`]), the first thing a narrow rule gives up; [`fact_spans`] says which cells of the set facts are which fact, for
-//! the window's click targets. The top rule's effort tag is read where Claude
-//! draws it ([`top_rule_tag`]), and its `/effort <key> on|off` answers from
-//! the transcript ([`TailFacts::top`]) and the screen ([`top_effort_answer`]).
-//!
-//! Nothing is written anywhere and the user's Claude settings are not touched.
-//! Vendor output is read as a third party's: an unrecognised rule is left as
-//! drawn, a moved file or result shape yields no fact, and facts are keyed to one
-//! process (pid and start time, [`parse_session_entry`]), so a relaunched build
-//! is read afresh.
-//!
-//! The mode row has `columns - 4` cells; Claude wraps the pill and its cycle hint
-//! by word and shows only the first line, so a narrow pane cuts the hint between
-//! words (never with `…`) or drops it, and cuts the pill itself when narrower
-//! still ([`is_cut_pill`]). aterm writes nothing on that row, but recognising it
-//! decides where the mode is read and whether a live REPL is up ([`is_mode_row`],
-//! [`live_repl_row`], [`cycle_hint_len`]).
+//! The Claude Code footer.
 
 use std::fs::{File, Metadata};
 use std::io::{Read, Seek, SeekFrom};
@@ -80,13 +11,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use aterm_json::Value;
 use aterm_primer::CLAUDE_TOP_EFFORT_KEY;
 
-/// How much of a transcript's end one read window takes; one turn with a large
-/// tool result can be hundreds of KiB. [`TailCache`] reads further back a
-/// window at a time; [`read_tail_facts`] reads this window alone.
+/// How much of a transcript's end one read window takes; one turn with a large tool result can be hundreds of KiB.
 pub const TAIL_BYTES: u64 = 512 * 1024;
 
 /// Longest transcript line [`tail_facts`] will parse. A row past this is a
-/// tool result, never a model or effort carrier worth a large parse.
 const MAX_LINE_BYTES: usize = 256 * 1024;
 
 /// Longest `sessions/<pid>.json` read: the file is a few hundred bytes.
@@ -99,53 +27,41 @@ const MAX_GIT_CLIMB: usize = 64;
 const MAX_GIT_FILE_BYTES: u64 = 4096;
 
 /// The mark before model + effort.
-pub const MODEL_MARK: char = '\u{25C6}'; // ◆
+pub const MODEL_MARK: char = '\u{25C6}';
 /// The mark before the working directory.
-pub const PATH_MARK: char = '\u{2302}'; // ⌂
+pub const PATH_MARK: char = '\u{2302}';
 /// The mark before the branch.
-pub const BRANCH_MARK: char = '\u{2387}'; // ⎇
+pub const BRANCH_MARK: char = '\u{2387}';
 /// The mark before the account the process runs on.
-pub const ACCOUNT_MARK: char = '\u{2386}'; // ⎆
+pub const ACCOUNT_MARK: char = '\u{2386}';
 /// The mark before the selected account's subscription plan.
-pub const PLAN_MARK: char = '\u{25c7}'; // ◇
+pub const PLAN_MARK: char = '\u{25c7}';
 /// The mark before the selected account's weekly quota.
-pub const WEEKLY_MARK: char = '\u{25f7}'; // ◷
+pub const WEEKLY_MARK: char = '\u{25f7}';
 /// The mark before a limit wall the session hit.
-pub const WALL_MARK: char = '\u{29D7}'; // ⧗
+pub const WALL_MARK: char = '\u{29D7}';
 /// The mark before the session's context window indicator.
-pub const CONTEXT_MARK: char = '\u{25D0}'; // ◐
+pub const CONTEXT_MARK: char = '\u{25D0}';
 /// The mark before the session's usage.
-pub const USAGE_MARK: char = '\u{03A3}'; // Σ
-/// The mark inside a limit wall that stands for "resets" (`⧗ 5h ♻ 3pm`). Not
-/// `Emoji_Presentation`, so it draws as one narrow text cell.
-pub const RESET_MARK: char = '\u{267B}'; // ♻
-/// The mark before a live upgrade that waits on the person at this composer
-/// ([`UpgradeNote`]): the band's mark for a build waiting to come in (`aterm
-/// vX is ready`).
-pub const UPGRADE_MARK: char = '\u{21E3}'; // ⇣
+pub const USAGE_MARK: char = '\u{03A3}';
+/// The mark inside a limit wall that stands for "resets" (`⧗ 5h ♻ 3pm`).
+pub const RESET_MARK: char = '\u{267B}';
+/// The mark before a live upgrade that waits on the person at this composer ([`UpgradeNote`]).
+pub const UPGRADE_MARK: char = '\u{21E3}';
 
-/// Most transcript bytes one [`FooterCache::usage`] folds, so a long session
-/// catches up over several reads without holding the resolver thread. Until
-/// caught up, the footer names no tokens.
+/// Most transcript bytes one [`FooterCache::usage`] folds, so a long session catches up over several reads without holding the resolver thread.
 pub const FOLD_BUDGET: u64 = 64 * 1024 * 1024;
 
-/// The pitch the facts are set at, in cells ([`set_facts`]). A fact glyph is
-/// drawn at seven tenths of its cell (`aterm_render::SCRIPT_SCALE`), so one per
-/// cell reads letter by letter; four fifths of a cell is the scaled face's own
-/// pitch plus a little air.
+/// The pitch the facts are set at, in cells ([`set_facts`]).
 pub const FACT_PITCH: f32 = 0.8;
 
-/// The space between two facts, in pitches: three, so a fact's words (one
-/// pitch apart) hold together and the facts read as four, not as one line.
+/// The space between two facts, in pitches.
 pub const GAP: f32 = 3.0;
 
-/// The steps a cell is divided into for a fact glyph's sideways move
-/// ([`SetGlyph::nudge`]): `aterm_core::terminal::Script::NUDGES_PER_CELL`,
-/// which the painter asserts is this.
+/// The steps a cell is divided into for a fact glyph's sideways move ([`SetGlyph::nudge`]).
 pub const NUDGES_PER_CELL: i8 = 16;
 
-/// Rule glyphs left at the left end of the run aterm writes into ([`rule_run`]),
-/// so the rule still reads as a rule however much it carries.
+/// Rule glyphs left at the left end of the run aterm writes into ([`rule_run`]), so the rule still reads as a rule however much it carries.
 pub const RULE_LEAD: usize = 3;
 
 /// Rule glyphs between the lights and the facts, when both are drawn.
@@ -158,21 +74,15 @@ pub struct SessionEntry {
     pub session_id: String,
     /// The directory the session runs in.
     pub cwd: PathBuf,
-    /// The running build's version, as Claude Code records it (`2.1.283`),
-    /// when the file carries one.
+    /// The running build's version, as Claude Code records it (`2.1.283`), when the file carries one.
     pub version: Option<String>,
-    /// The process's start (unix seconds), from the file's `procStart` — the
-    /// floor [`tail_facts`] takes where the kernel's own start cannot be read.
+    /// The process's start (unix seconds), from the file's `procStart`.
     pub proc_start: Option<u64>,
     /// When the running image registered (unix seconds, from `startedAt` ms).
-    /// An in-place `execve` keeps pid and kernel start time but writes a new
-    /// `startedAt`, so the floor moves with the image ([`floor_of`]).
     pub started_at: Option<u64>,
 }
 
 /// Whose facts these are: the transcript floor and session they were read for.
-/// A kept launch card ([`launch_card`]) belongs to one owner, so a new floor or
-/// session id drops it.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct FactsOwner {
     /// The floor (unix seconds) under the rows that speak for the process.
@@ -181,80 +91,46 @@ pub struct FactsOwner {
     pub session_id: String,
 }
 
-/// The facts the footer shows. Every one is optional: a fresh session has no
-/// transcript row yet, a directory may not be a repository, and the footer
-/// shows what it knows rather than a placeholder.
+/// The facts the footer shows.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub struct FooterFacts {
     /// The model's display name (`Opus 5.5`).
     pub model: Option<String>,
     /// The effort level (`xhigh`).
     pub effort: Option<String>,
-    /// Where the session's Bash tool stands, else its launch directory, home
-    /// shown as `~` (`~/aterm`).
+    /// Where the session's Bash tool stands, else its launch directory, home shown as `~` (`~/aterm`).
     pub path: Option<String>,
     /// The checked-out branch, or a short commit id when HEAD is detached.
     pub branch: Option<String>,
-    /// The working directory when the repository read failed with `EPERM`
-    /// (macOS folder privacy consent). Not shown; the host raises consent
-    /// attention ([`GitHeadRead::Denied`]).
+    /// The working directory when the repository read failed with `EPERM` (macOS folder privacy consent).
     pub repo_read_denied: Option<PathBuf>,
-    /// The Claude Code build this process runs (`2.1.283`). Not shown; names
-    /// the build in the drift log, and a launch card is taken only from this
-    /// build ([`FooterFacts::filled_from`]).
+    /// The Claude Code build this process runs (`2.1.283`).
     pub version: Option<String>,
-    /// The command resuming this process's own conversation (`claude --resume
-    /// <id>` with its launch flags, [`crate::harness::resume::of_entry`]), for
-    /// the frozen-program remedy; never `--continue`, which can pick a sibling
-    /// tab's conversation. [`facts_for_entry_at`] leaves it unset: it needs the
-    /// argv [`read_pid`]'s caller supplies.
+    /// The command resuming this process's own conversation (`claude --resume <id>` with its launch flags, [`crate::harness::resume::of_entry`]), for the frozen-program remedy.
     pub resume: Option<String>,
-    /// The session's usage ([`super::session_usage`]); only
-    /// [`FooterCache::usage`] fills it.
+    /// The session's usage ([`super::session_usage`]); only [`FooterCache::usage`] fills it.
     pub usage: Option<super::session_usage::UsageFacts>,
-    /// Nothing since the process started decided the model — no answer, no
-    /// model result, no `--model`: its launch card may name it.
+    /// Nothing since the process started decided the model — no answer, no model result, no `--model`: its launch card may name it.
     pub model_open: bool,
     /// Nothing since the process started decided the effort.
     pub effort_open: bool,
-    /// While [`Self::effort_open`]: the model a launch card must name for its
-    /// effort to count, set when a model switch named no effort.
+    /// While [`Self::effort_open`]: the model a launch card must name for its effort to count, set when a model switch named no effort.
     pub effort_for: Option<String>,
     /// Whose facts these are, when the registry named a session.
     pub owner: Option<FactsOwner>,
-    /// The live upgrade waiting on the person here, in the words the composer
-    /// now calls for ([`UpgradeNote::words`]). Laid in by the window from its
-    /// upgrade host's row for the tab, never read off Claude Code's files.
-    /// Shown first, and given up as a light's reason is ([`facts_ladder`]).
+    /// The live upgrade waiting on the person here, in the words the composer now calls for ([`UpgradeNote::words`]).
     pub upgrade: Option<UpgradeWords>,
-    /// The roster's label for the login this process runs under
-    /// ([`super::accounts::footer_label`]: only where two or more accounts
-    /// are listed). Never read off Claude Code's files: only the window's
-    /// resolver fills it, from the process's own exec environment. Shown
-    /// after the model, whole or not at all ([`facts_ladder`]).
+    /// The roster's label for the login this process runs under ([`super::accounts::footer_label`]: only where two or more accounts are listed).
     pub account: Option<String>,
-    /// What the newest statement since the process started says of the
-    /// top-effort key ([`CLAUDE_TOP_EFFORT_KEY`]): on or off for this session,
-    /// from its own `/effort <key> on|off` result or the ` · <Key> on|off` an
-    /// effort result ends with ([`TailFacts::top`]). Not shown in the bottom
-    /// rule; the top rule's mark takes it as evidence that the key exists for
-    /// this account. `None`: nothing said.
+    /// What the newest statement since the process started says of the top-effort key ([`CLAUDE_TOP_EFFORT_KEY`]).
     pub top_effort: Option<bool>,
-    /// The facts the person hid in this session by a click (hidden facts read
-    /// as a greyed `off`, [`fact_segments`]). Never read off Claude Code's
-    /// files: only the window lays it in, from its per-session state, as it
-    /// lays the usage switch in.
+    /// The facts the person hid in this session by a click (hidden facts read as a greyed `off`, [`fact_segments`]).
     pub off: FactMask,
-    /// Volatile email, subscription and weekly quota from the selected process's own
-    /// profile. Replaced on every read, including account changes and missing data.
+    /// Volatile email, subscription and weekly quota from the selected process's own profile.
     pub subscription: Option<super::profile::SubscriptionDisplay>,
-    /// The window that binds this process's model ([`super::profile::plan_usage_for`]),
-    /// from the same read as [`Self::subscription`]
-    /// ([`super::profile::subscription_and_plan_for`]) and replaced with it. Not shown in
-    /// the footer: the Stats Deck reads it.
+    /// The window that binds this process's model ([`super::profile::plan_usage_for`]), from the same read as [`Self::subscription`] ([`super::profile::subscription_and_plan_for`]) and replaced with it.
     pub plan: Option<super::profile::PlanUsage>,
     /// The context left, as read off the agent's own indicator on the glass (`ctx 84% left`).
-    /// `None` until one is read: no reading is no fact, never a placeholder.
     pub context: Option<String>,
 }
 
@@ -277,7 +153,6 @@ pub enum FactKind {
 
 impl FactKind {
     /// Its bit in a [`FactMask`]: none for [`FactKind::Usage`], which the
-    /// `[claude_footer] usage` switch alone hides.
     const fn bit(self) -> u8 {
         match self {
             Self::Model => 1,
@@ -289,8 +164,7 @@ impl FactKind {
         }
     }
 
-    /// The mark its segment leads with; none for the effort, which shares
-    /// the model's (`◆ Opus 5.5 xhigh`).
+    /// The mark its segment leads with; none for the effort, which shares the model's (`◆ Opus 5.5 xhigh`).
     #[must_use]
     pub const fn mark(self) -> Option<char> {
         match self {
@@ -304,8 +178,7 @@ impl FactKind {
     }
 }
 
-/// A set of hidden facts ([`FooterFacts::off`]): the model, the effort, the
-/// path, the branch and the context, each on its own.
+/// A set of hidden facts ([`FooterFacts::off`]): the model, the effort, the path, the branch and the context, each on its own.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct FactMask(u8);
 
@@ -327,8 +200,7 @@ impl FactMask {
         kind.bit() != 0 && self.0 & kind.bit() != 0
     }
 
-    /// The set with `kind` in it (`on`) or out of it; [`FactKind::Usage`]
-    /// changes nothing.
+    /// The set with `kind` in it (`on`) or out of it; [`FactKind::Usage`] changes nothing.
     #[must_use]
     pub const fn with(self, kind: FactKind, on: bool) -> Self {
         if on {
@@ -360,27 +232,17 @@ pub struct UpgradeWords {
     pub short: String,
 }
 
-/// What the footer says of a live upgrade that waits only on the person at
-/// this composer (`upgrade_status::Row::pause_note`): what holds it, never when
-/// it moves, since how long a person's hand holds it differs by rung. The
-/// window picks one of two wordings from its own read of the composer as it
-/// draws ([`Self::words`]), so the note follows the person from typing a prompt
-/// through the pause that leaves it unsent.
+/// What the footer says of a live upgrade that waits only on the person at this composer (`upgrade_status::Row::pause_note`).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct UpgradeNote {
     /// While the composer holds no draft: `… waits while you use this tab`.
-    /// `None` for a move the draft held at its look: the composer read empty
-    /// since, the draft was sent (the turn it started holds the move) or
-    /// cleared, and the next look says what holds it now.
     pub using: Option<UpgradeWords>,
-    /// While a draft stands in the composer: `… waits until your draft is
-    /// sent or cleared`.
+    /// While a draft stands in the composer: `… waits until your draft is sent or cleared`.
     pub draft: UpgradeWords,
 }
 
 impl UpgradeNote {
-    /// The words for a composer that holds a person's draft (`draft`) or
-    /// none, if any.
+    /// The words for a composer that holds a person's draft (`draft`) or none, if any.
     #[must_use]
     pub fn words(&self, draft: bool) -> Option<&UpgradeWords> {
         if draft {
@@ -394,47 +256,32 @@ impl UpgradeNote {
 /// What the process's own command line says ([`launch_facts`]).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub struct LaunchFacts {
-    /// The model `--model` names, only when it is a real id
-    /// (`claude-opus-5-5`); an alias resolves per account and build.
+    /// The model `--model` names, only when it is a real id (`claude-opus-5-5`); an alias resolves per account and build.
     pub model: Option<String>,
-    /// The model is pinned from launch: any `--model`, or an environment pin
-    /// (`ANTHROPIC_MODEL`, `ANTHROPIC_DEFAULT_<FAMILY>_MODEL`). Claude then
-    /// restores no conversation's model onto it. A restoring launch resume
-    /// also pins, which the transcript decides ([`TailCache`]).
+    /// The model is pinned from launch: any `--model`, or an environment pin (`ANTHROPIC_MODEL`, `ANTHROPIC_DEFAULT_<FAMILY>_MODEL`).
     pub pinned: bool,
-    /// The conversation the launch resumed (`--resume`, `--continue`), when
-    /// it resumed one ([`LaunchResume`]).
+    /// The conversation the launch resumed (`--resume`, `--continue`), when it resumed one ([`LaunchResume`]).
     pub resume: Option<LaunchResume>,
-    /// The `CLAUDE_CONFIG_DIR` the process's environment at exec named, raw
-    /// (set and empty is `Some("")`): the Claude home its resume line
-    /// carries ([`super::resume::home_env`]).
+    /// The `CLAUDE_CONFIG_DIR` the process's environment at exec named, raw (set and empty is `Some("")`).
     pub config: Option<String>,
 }
 
-/// The conversation a process's launch resumed
-/// ([`crate::harness::upgrade::launch_resume`]). Claude restores its model at
-/// launch unless [`LaunchFacts::pinned`].
+/// The conversation a process's launch resumed ([`crate::harness::upgrade::launch_resume`]).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum LaunchResume {
     /// `--resume <id>` / `-r <id>`: the process's first session is the
-    /// conversation it names.
     Session(String),
     /// A resume that names no conversation the process keeps: `--continue`,
-    /// `-c`, a bare `--resume` (Claude's picker), or any resume with
-    /// `--fork-session` (the conversation takes a new id).
     Unnamed,
 }
 
-/// What `argv` (argv[0] included) says about the model: the last `--model`
-/// Claude's parser takes ([`crate::harness::upgrade::launch_model`]), when a
-/// real id. Harness model moves relaunch with one (`relaunch::with_model`).
+/// What `argv` (argv[0] included) says about the model.
 #[must_use]
 pub fn launch_facts(argv: &[String]) -> LaunchFacts {
     launch_facts_of(argv, &[])
 }
 
-/// [`launch_facts`], and whether the process's environment at exec (`env`,
-/// `KEY=value` entries) pins its model ([`LaunchFacts::pinned`]).
+/// [`launch_facts`], and whether the process's environment at exec (`env`, `KEY=value` entries) pins its model ([`LaunchFacts::pinned`]).
 #[must_use]
 pub fn launch_facts_of(argv: &[String], env: &[String]) -> LaunchFacts {
     let flag = crate::harness::upgrade::launch_model(argv);
@@ -476,15 +323,9 @@ pub struct Segment {
     pub mark: char,
     /// The value after it.
     pub text: String,
-    /// Where the model-and-effort segment's effort starts in `text` (a byte
-    /// offset): its head is the model, its tail the effort ([`fact_spans`]).
-    /// `Some(0)` with no model known; `None` with no effort, and for every
-    /// other segment.
+    /// Where the model-and-effort segment's effort starts in `text` (a byte offset).
     pub split: Option<usize>,
-    /// Whether the head and the tail (`split`) are a hidden fact's stub —
-    /// its value greyed, [`OFF_STUB`] after it — rather than a value shown
-    /// ([`fact_segments`]). A model and effort hidden together are two
-    /// stubs either side of the split: `(true, true)`.
+    /// Whether the head and the tail (`split`) are a hidden fact's stub.
     pub quiet: (bool, bool),
 }
 
@@ -500,8 +341,6 @@ impl Segment {
     }
 
     /// Its mark and the part of its text a value shows, its stubs left
-    /// out: what a reason never takes the room of compares by this
-    /// ([`same_top`]).
     fn shown_part(&self) -> (char, &str) {
         let text = self.text.as_str();
         let shown = match (self.split, self.quiet) {
@@ -515,19 +354,10 @@ impl Segment {
     }
 }
 
-/// What a hidden fact says after its greyed value — `◆ Opus 5.5 off`, `⌂
-/// ~/aterm off`, `⎇ main off` — as the top rule's key says it after its
-/// greyed name.
+/// What a hidden fact says after its greyed value.
 pub const OFF_STUB: &str = "off";
 
-/// The Claude Code directory of one process, from its environment at exec
-/// (`config_dir`, its raw `CLAUDE_CONFIG_DIR`; `home`, its raw `HOME`) and the
-/// directory it runs in (`cwd`, asked only for a relative one), by the one
-/// resolver every reader asks (`upgrade_drive::claude_home_dir`, as Claude Code
-/// resolves `CLAUDE_CONFIG_DIR ?? join(homedir(), ".claude")`): a set one
-/// absolute as it is, relative (empty included) under `cwd` (`None` where that
-/// is not read), an unset one `$HOME/.claude` (`None` with no absolute `HOME`).
-/// Never aterm's own environment: aterm strips `CLAUDE_*` from its shells.
+/// The Claude Code directory of one process, resolved from `config_dir` (`CLAUDE_CONFIG_DIR`), `home` (`HOME`), and `cwd` (`upgrade_drive::claude_home_dir`).
 pub fn claude_dir_of(
     config_dir: Option<&str>,
     home: Option<&str>,
@@ -545,7 +375,6 @@ pub fn claude_dir_of(
 }
 
 /// Open `path` for reading, non-blocking, so a FIFO planted where a `HEAD`
-/// or a transcript should be cannot park the reader thread forever.
 fn open_nonblocking(path: &Path) -> std::io::Result<File> {
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
@@ -558,7 +387,6 @@ fn open_nonblocking(path: &Path) -> std::io::Result<File> {
 }
 
 /// `file` if it is a regular file, judged on the open handle (no
-/// check-then-open race).
 fn regular(file: File) -> Option<File> {
     file.metadata().ok()?.is_file().then_some(file)
 }
@@ -580,10 +408,7 @@ pub(crate) fn read_small(path: &Path, cap: u64) -> Option<String> {
     read_capped(open_regular(path)?, cap)
 }
 
-/// The registry entry for Claude Code process `pid`, or `None` when that pid
-/// is not a Claude Code session (or its file cannot be read). `started` is the
-/// kernel's start time of `pid` (unix seconds) where the caller could read it
-/// — see [`parse_session_entry`].
+/// The registry entry for Claude Code process `pid`, or `None` when that pid is not a Claude Code session (or its file cannot be read).
 pub fn session_of_pid(claude_dir: &Path, pid: u32, started: Option<u64>) -> Option<SessionEntry> {
     let path = claude_dir.join("sessions").join(format!("{pid}.json"));
     #[cfg(test)]
@@ -591,9 +416,7 @@ pub fn session_of_pid(claude_dir: &Path, pid: u32, started: Option<u64>) -> Opti
     parse_session_entry(&read_small(&path, MAX_SESSION_FILE_BYTES)?, pid, started)
 }
 
-/// [`session_of_pid`]'s parse, pure. The file must name the same `pid`, and,
-/// when both are known, its `procStart` must match the kernel start second,
-/// so a stale row from a reused pid is rejected.
+/// [`session_of_pid`]'s parse, pure.
 pub fn parse_session_entry(text: &str, pid: u32, started: Option<u64>) -> Option<SessionEntry> {
     let value: Value = aterm_json::from_str(text).ok()?;
     let obj = value.as_object()?;
@@ -628,8 +451,7 @@ pub fn parse_session_entry(text: &str, pid: u32, started: Option<u64>) -> Option
     })
 }
 
-/// Whether `s` has the shape of a Claude Code session id — the transcript's
-/// file stem, so letters, digits and `-` only.
+/// Whether `s` has the shape of a Claude Code session id — the transcript's file stem, so letters, digits and `-` only.
 #[must_use]
 pub fn is_session_id(s: &str) -> bool {
     !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
@@ -640,8 +462,7 @@ fn squash(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// A unix time as Claude Code records `procStart` — `ps -o lstart=` in UTC
-/// and the C locale — whitespace-squashed: `Wed Sep 23 20:13:55 2026`.
+/// A unix time as Claude Code records `procStart`.
 pub fn lstart_utc(secs: u64) -> String {
     const DAYS: [&str; 7] = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"];
     const MONTHS: [&str; 12] = [
@@ -660,8 +481,7 @@ pub fn lstart_utc(secs: u64) -> String {
     )
 }
 
-/// Claude Code's project directory name for `cwd`: every character that is
-/// not ASCII alphanumeric becomes `-` (`/Users//ana/aterm` → `-Users-ana-aterm`).
+/// Claude Code's project directory name for `cwd`.
 pub fn project_slug(cwd: &Path) -> String {
     cwd.to_string_lossy()
         .chars()
@@ -669,20 +489,12 @@ pub fn project_slug(cwd: &Path) -> String {
         .collect()
 }
 
-/// The transcript of `entry`: `<claude dir>/projects/<slug>/<id>.jsonl`, and
-/// when the slug guess misses (a vendor spelling change), a scan of the
-/// project directories for the id. `None` until the session writes one.
+/// The transcript of `entry`.
 pub fn transcript_path(claude_dir: &Path, entry: &SessionEntry) -> Option<PathBuf> {
     transcript_lookup(claude_dir, entry).map(|(path, _)| path)
 }
 
-/// [`transcript_path`] and whether it is CERTAIN (plan
-/// §2.1): the project's own `<claude dir>/projects/<slug>/<id>.jsonl`, or
-/// the one project directory holding the id ([`sole_transcript_path`]'s
-/// rule), in the same walk. The footer reads the same path either way; the
-/// session log takes an uncertain one's steps as partial (`conf=strong`, no
-/// confirmation, no retraction), so a file planted under another project's
-/// name can never confirm or retract a wall.
+/// [`transcript_path`] and whether it is CERTAIN (plan §2.1).
 pub fn transcript_lookup(claude_dir: &Path, entry: &SessionEntry) -> Option<(PathBuf, bool)> {
     #[cfg(test)]
     tests::on_transcript_lookup();
@@ -701,12 +513,7 @@ pub fn transcript_lookup(claude_dir: &Path, entry: &SessionEntry) -> Option<(Pat
     Some((first, found.next().is_none()))
 }
 
-/// [`transcript_path`] for a reader that must not guess between two: the
-/// project's own `<claude dir>/projects/<slug>/<id>.jsonl`, else the one
-/// project directory holding the id (two of them are none). The supervisor's
-/// wall confirmation reads through this (`supervise/wall_confirm.rs`), so a
-/// file planted under another project's name can neither stand in for the
-/// transcript nor be picked over it.
+/// [`transcript_path`] for a reader that must not guess between two.
 pub fn sole_transcript_path(claude_dir: &Path, entry: &SessionEntry) -> Option<PathBuf> {
     let projects = claude_dir.join("projects");
     let file = format!("{}.jsonl", entry.session_id);
@@ -723,72 +530,23 @@ pub fn sole_transcript_path(claude_dir: &Path, entry: &SessionEntry) -> Option<P
     found.next().is_none().then_some(one)
 }
 
-/// What the last [`TAIL_BYTES`] of the transcript at `path` say about the
-/// model and effort, counting only rows written no earlier than `since`
-/// ([`tail_facts`]).
+/// What the last [`TAIL_BYTES`] of the transcript at `path` say about the model and effort, counting only rows written no earlier than `since` ([`tail_facts`]).
 pub fn read_tail_facts(path: &Path, since: Option<u64>) -> Option<TailFacts> {
     Some(tail_facts(&read_tail(path)?, since))
 }
 
 /// The most bytes one refresh reads as an append to a transcript it has read
-/// before ([`TailCache`]'s carry); a larger append is read as a fresh tail.
 #[cfg(unix)]
 const MAX_APPEND_BYTES: u64 = 16 * 1024 * 1024;
 
 /// How many bytes before the carried end are checked unchanged before an
-/// append is read on top of what was read before.
 #[cfg(unix)]
 const GUARD_BYTES: u64 = 4096;
 
 /// How far back from its end a transcript is read afresh for a fact the
-/// newest rows do not decide ([`TailCache`]).
 const MAX_BACK_BYTES: u64 = 16 * 1024 * 1024;
 
-/// The resolver's per-session transcript memo, keyed by process and image
-/// start. The registry and repository are read on every refresh; only an
-/// unchanged transcript tail is reused.
-///
-/// A fresh read looks back a [`TAIL_BYTES`] window at a time while the newest
-/// rows decide nothing, up to [`MAX_BACK_BYTES`]. A grown transcript is read as
-/// an append (same file, process and floor, [`GUARD_BYTES`] before the old end
-/// unchanged, under [`MAX_APPEND_BYTES`]): only new whole rows are scanned and
-/// what they leave undecided is carried, so one huge row cannot blank a model
-/// named above it. Anything else is read afresh.
-///
-/// Model and effort are the process's, not the conversation's. `/clear` and
-/// in-REPL `/resume` give the process a new session id with the same
-/// `startedAt`, so the cache keeps what the process last decided and whether
-/// its model is pinned, and a silent new session inherits it
-/// ([`TailCache::for_process`]). On a switch the session left is read once more
-/// and searched for a model choice, which pins ([`chose_model_since`]).
-///
-/// A switch came after the process was last seen in the session it left. A
-/// conversation whose file or first main-chain row predates that moment is a
-/// `/resume` ([`existed_before`]), which restores its model unless the process
-/// pinned its own ([`conversation_model`]); `/branch` copies carry `forkedFrom`
-/// and restore nothing. Rows in a switched-into session speak for the process
-/// only from that moment ([`TailCache::session_floor`]); at first sight the
-/// process's floor stands in.
-///
-/// Pins, which no session switch undoes: [`LaunchFacts::pinned`], a choice in a
-/// left session, a switch into an older conversation holding an answer (a
-/// restore), and at first sight a first session that predates the floor and
-/// holds an answer. At first sight the restored model is named only when the
-/// launch resumed this session ([`LaunchFacts::resume`]).
-///
-/// Limits: two switches between reads look like one; another process's rows
-/// written between the last read and the switch are taken as this process's; a
-/// first sight (e.g. after an update handoff) knows nothing of earlier pins.
-/// Process facts survive [`TailCache::clear`]; another process or a new floor
-/// starts them afresh.
-///
-/// THE SURVEY'S EXCERPTS ride the same reads ([`super::excerpt`]): every
-/// window a fresh read takes is scanned for them too, and the walk back goes
-/// on while they are undecided — to the file's start or [`MAX_BACK_BYTES`],
-/// past which an undecided one is none — and an append scans only the rows
-/// it adds, over what the carry kept. They are the conversation's, so they
-/// are not floored; the facts' walk stops where it always did, and reads
-/// nothing for them past that. [`TailCache::excerpts`] answers the last read.
+/// The resolver's per-session transcript memo, keyed by process and image start.
 #[derive(Debug, Default)]
 pub struct TailCache {
     entry: Option<(TailKey, TailRead)>,
@@ -798,7 +556,6 @@ pub struct TailCache {
     /// The excerpts of the last read ([`TailCache::excerpts`]).
     excerpts: Option<super::excerpt::Excerpts>,
     /// The transcript's length as the last read found it
-    /// ([`TailCache::transcript_len`]).
     len: Option<u64>,
     #[cfg(test)]
     reads: usize,
@@ -807,9 +564,6 @@ pub struct TailCache {
 }
 
 /// One read of a transcript since the floor: what it decided, whether it met
-/// a row from before the floor (the conversation was resumed), where the
-/// Bash tool stands ([`last_cwd_since`]), and the survey's excerpts of the
-/// rows read, floor or no floor ([`super::excerpt::Scan`]).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct TailRead {
     facts: TailFacts,
@@ -819,7 +573,6 @@ struct TailRead {
 }
 
 /// What one Claude Code process last decided, whichever of its sessions said
-/// it ([`TailCache`]).
 #[derive(Debug)]
 struct ProcessFacts {
     pid: u32,
@@ -828,25 +581,15 @@ struct ProcessFacts {
     /// The session the process was last read in.
     session: String,
     /// The floor under `session`'s rows that speak for the process
-    /// ([`TailCache::session_floor`]): the process's own floor, or — for a
-    /// session it switched into — the moment it was last seen in the session
-    /// it left.
     session_floor: u64,
     /// When the process was last seen in `session` (unix seconds): the
-    /// wall-clock time of the newest read that found it there. A switch out
-    /// of `session` came after it.
     seen: u64,
     facts: TailFacts,
     /// The process's model is pinned by what this cache has read of it: a
-    /// choice in a session it left ([`chose_model_since`]), or a restore — a
-    /// switch into, or a first session that is, a resumed conversation with
-    /// an answer to restore ([`TailCache`]). The launch's own pin
-    /// ([`LaunchFacts::pinned`]) is not kept here: it comes with every read.
     pinned: bool,
 }
 
 /// What [`TailCache`] carries across appends (unix only: it needs the file's
-/// identity).
 #[cfg(unix)]
 #[derive(Debug)]
 struct Carry {
@@ -880,9 +623,6 @@ struct TailKey {
     since: u64,
     len: u64,
     modified: SystemTime,
-    // A same-length rewrite can preserve mtime, while a replacement can
-    // preserve both mtime and length. On Unix, ctime and inode cover them.
-    // Other targets keep reading rather than trusting an incomplete stamp.
     #[cfg(unix)]
     dev: u64,
     #[cfg(unix)]
@@ -903,8 +643,6 @@ impl TailKey {
     ) -> Option<Self> {
         #[cfg(unix)]
         use std::os::unix::fs::MetadataExt as _;
-        // Without a change-time and file identity the key cannot be trusted:
-        // cache on Unix only.
         #[cfg(not(unix))]
         {
             let _ = (path, pid, started, since, metadata);
@@ -940,8 +678,6 @@ impl TailCache {
     }
 
     /// Read the current tail, or reuse the previous parse only after opening
-    /// and identifying this exact regular file. A read that races a writer is
-    /// returned for this refresh but never remembered; the next one retries.
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -1016,10 +752,6 @@ impl TailCache {
     }
 
     /// The transcript read afresh, newest first, a [`TAIL_BYTES`] window at a
-    /// time, until both facts are decided, a row before the floor is met, the
-    /// file's start, or [`MAX_BACK_BYTES`] — so an answer above one huge row
-    /// (a pasted image, a large tool result) is still found, however the
-    /// reads fell between them. The carry is seeded from what it read.
     fn read_fresh(
         &mut self,
         file: &mut File,
@@ -1037,17 +769,10 @@ impl TailCache {
         let mut facts = TailFacts::default();
         let mut resumed = false;
         let mut cwd = None;
-        // The facts' walk is over (a row before the floor, or both decided):
-        // the excerpts' may go on, and reads nothing more for the facts.
         let mut facts_done = false;
         let mut excerpts = super::excerpt::Scan::default();
         let mut hi = len;
-        // The head of a row a window's start cut: completed by the next,
-        // older, window — dropped when it is already longer than any row
-        // this reads ([`MAX_LINE_BYTES`]), which the next window's cut tail
-        // then cannot parse either.
         let mut cut: Vec<u8> = Vec::new();
-        // Just past the newest whole row: where an append starts.
         let mut read_to: Option<u64> = None;
         let from_start = loop {
             let lo = hi.saturating_sub(TAIL_BYTES);
@@ -1071,8 +796,6 @@ impl TailCache {
                 let (older, floored) = scan(&rows, Some(since));
                 facts = facts.over(older);
                 resumed |= floored;
-                // The newest stamped row: a window of only oversized rows
-                // has none, so older windows are searched until one does.
                 if cwd.is_none() {
                     cwd = last_cwd_since(rows.iter().copied(), Some(since));
                 }
@@ -1123,8 +846,6 @@ impl TailCache {
     }
 
     /// The rows appended since the carried read, on top of what it carried —
-    /// or `None` when this is not that file of that process grown (read it
-    /// afresh).
     #[cfg(unix)]
     fn read_append(
         &mut self,
@@ -1163,12 +884,8 @@ impl TailCache {
         let rows: Vec<&str> = rows_of(&appended[..whole]).collect();
         let (newer, floored) = scan(&rows, Some(since));
         let cwd = last_cwd_since(rows.iter().copied(), Some(since));
-        // The conversation's excerpts, floor or no floor: the appended rows
-        // over the carried ones.
         let excerpts =
             super::excerpt::Scan::of(&rows).over(std::mem::take(&mut carry.facts.excerpts));
-        // A row stamped before the floor in the append puts every row above
-        // it — the carried ones too — before this process.
         let facts = if floored {
             TailRead {
                 facts: newer,
@@ -1208,8 +925,7 @@ impl TailCache {
         None
     }
 
-    /// Forget every transcript read: the next read is a fresh one. What the
-    /// process decided is kept; it is keyed by the process itself.
+    /// Forget every transcript read: the next read is a fresh one.
     pub fn clear(&mut self) {
         self.entry = None;
         self.excerpts = None;
@@ -1220,18 +936,13 @@ impl TailCache {
         }
     }
 
-    /// The survey's excerpts of the transcript the last read read
-    /// ([`super::excerpt`]); `None` when it read none (no registry entry, no
-    /// floor, no transcript yet, an unreadable file).
+    /// The survey's excerpts of the transcript the last read read ([`super::excerpt`]).
     #[must_use]
     pub fn excerpts(&self) -> Option<&super::excerpt::Excerpts> {
         self.excerpts.as_ref()
     }
 
-    /// How long the transcript the last read opened was, in bytes; `None`
-    /// when it opened none. It only grows while the conversation is written
-    /// to: what the window host's held deadline reads as the transcript
-    /// moving (aterm-gui's `harness_host::look_at_startups`).
+    /// How long the transcript the last read opened was, in bytes; `None` when it opened none.
     #[must_use]
     pub fn transcript_len(&self) -> Option<u64> {
         self.len
@@ -1245,8 +956,6 @@ impl TailCache {
     }
 
     /// The floor under `session`'s rows that speak for the process: its own
-    /// floor at first sight, or, in a session it switched into, the moment it
-    /// was last seen in the session it left (never below the floor).
     fn session_floor(&self, pid: u32, started: Option<u64>, floor: u64, session: &str) -> u64 {
         match self.process_of(pid, started, floor) {
             Some(p) if p.session == session => p.session_floor,
@@ -1256,12 +965,6 @@ impl TailCache {
     }
 
     /// `tail` (what `session` says since its [`Self::session_floor`]) over what
-    /// this process last decided in any session, by the rules of [`TailCache`]:
-    /// on a switch the session left is read again ([`Switch::left`]), and an
-    /// unpinned model takes the restored one ([`Switch::restored`]), the
-    /// process's effort standing only for that model. The result is remembered
-    /// as the process's decision, and [`Switch::now`] as when it was last seen
-    /// in `session`.
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -1294,12 +997,9 @@ impl TailCache {
                 let (left, chose_there) = (switch.left)(&before.session, before.session_floor);
                 let pinned = before.pinned || chose_there;
                 let process = left.over(before.facts);
-                // The switch came after the process was last seen in the
-                // session it left: `session_floor` is that moment.
                 let restored = (!pinned && !switch.launch_pinned)
                     .then(|| (switch.restored)(Some(session_floor)))
                     .flatten();
-                // The restore sets the override every later resume obeys.
                 let pinned = pinned || restored.is_some();
                 let process = match restored {
                     Some(model) => restored_facts(model).over(process),
@@ -1308,7 +1008,6 @@ impl TailCache {
                 (tail.over(process), pinned)
             }
             None => {
-                // A launch pin needs no reading: it comes with every read.
                 let restored = (!switch.launch_pinned)
                     .then(|| (switch.restored)(None))
                     .flatten();
@@ -1338,7 +1037,6 @@ impl TailCache {
 }
 
 /// The facts a restore leaves: the restored model, with the effort open for
-/// that model only ([`TailFacts::over`]), or unknown if the model is unreadable.
 fn restored_facts(model: Said) -> TailFacts {
     let effort_for = model.shown().map(str::to_owned);
     TailFacts {
@@ -1354,23 +1052,16 @@ fn restored_facts(model: Said) -> TailFacts {
 }
 
 /// How [`TailCache::for_process`] reads a session switch of one process, or
-/// its first sight of it.
 struct Switch<L, R> {
     /// When this read happened (unix seconds, the wall clock): from now on,
-    /// when the process was last seen in the current session.
     now: u64,
     /// The session left (its id), re-read since its session floor: what it
-    /// decided, and whether it holds a model choice ([`chose_model_since`]).
     left: L,
     /// The process's launch pins its model ([`LaunchFacts::pinned`]).
     launch_pinned: bool,
     /// The process's launch resumed the current session
-    /// ([`LaunchFacts::resume`]: it names this session, or names none).
     launch_resumed: bool,
     /// When the current session is a conversation that predates the process
-    /// taking it up, the model Claude restores from it; `None` for no session
-    /// or no answer. Given the switch moment ([`resumed_since`]), or `None` at
-    /// first sight, where the floor stands in ([`resumed_model`]).
     restored: R,
 }
 
@@ -1380,15 +1071,10 @@ enum Row<'a> {
     /// A whole row of at most [`MAX_LINE_BYTES`].
     Whole(&'a [u8]),
     /// A row longer than [`MAX_LINE_BYTES`], met once, by the part the read
-    /// holds: always its end (where Claude writes `type` and `timestamp`), and
-    /// its start too when one window held it whole.
     Oversized(&'a [u8]),
 }
 
 /// Every row of the transcript at `path`, newest first, a [`TAIL_BYTES`]
-/// window at a time, until `visit` breaks, the file's start, or
-/// [`MAX_BACK_BYTES`]. Oversized rows are met once as [`Row::Oversized`].
-/// `Some(true)` when the file's start was reached, `None` when unreadable.
 fn rows_back(
     path: &Path,
     mut visit: impl FnMut(Row<'_>) -> std::ops::ControlFlow<()>,
@@ -1397,8 +1083,6 @@ fn rows_back(
     let len = file.metadata().ok()?.len();
     let mut hi = len;
     let mut cut: Vec<u8> = Vec::new();
-    // The newest bytes of the next window continue an oversized row whose
-    // end was met already: the rest of it is not a row of its own.
     let mut inside = false;
     loop {
         let lo = hi.saturating_sub(TAIL_BYTES);
@@ -1411,8 +1095,6 @@ fn rows_back(
         };
         let mut rows = window[from..].rsplit(|&b| b == b'\n');
         if inside && (lo == 0 || first_nl.is_some()) {
-            // The oversized row starts in this window: its head is the
-            // newest segment here.
             rows.next();
             inside = false;
         }
@@ -1427,7 +1109,6 @@ fn rows_back(
             }
         }
         cut = if from > MAX_LINE_BYTES {
-            // The end of a row longer than any this reads, whose start is in
             // an older window: met now, in its place, and once.
             if !inside {
                 inside = true;
@@ -1447,16 +1128,11 @@ fn rows_back(
 }
 
 /// Whether the transcript at `path` holds, since `floor`, a model choice by
-/// the process: a `/model` command row or a `/fast` result that moved the
-/// model. Either pins the model across an in-REPL `/resume` ([`TailCache`]).
-/// Searched back to the first row before the floor, or [`MAX_BACK_BYTES`].
 fn chose_model_since(path: &Path, floor: u64) -> bool {
     use crate::harness::upgrade_models::{ModelResultKind, model_result_of};
     use std::ops::ControlFlow::{Break, Continue};
     let mut chose = false;
     rows_back(path, |row| {
-        // A command row and its result are short: an oversized row is
-        // neither.
         let Row::Whole(raw) = row else {
             return Continue(());
         };
@@ -1499,17 +1175,11 @@ fn chose_model_since(path: &Path, floor: u64) -> bool {
 }
 
 /// How much of a transcript's head [`head_stamp`] reads: its first rows
-/// are a few short ones (`mode`, `permission-mode`, the first system row).
 const HEAD_BYTES: u64 = 64 * 1024;
 
 /// The stamp of the first stamped row among the whole rows of the file's first
-/// [`HEAD_BYTES`]. With `own_rows`, only a main-chain message row (`user`,
-/// `assistant`, `system`) without `forkedFrom` counts: `/branch` copies keep
-/// their originals' stamps, and its copied `memory-mode` rows are not the
-/// file's own. `None` when there is no such stamp or the head is unreadable.
 fn head_stamp(file: &mut File, own_rows: bool) -> Option<u64> {
     let head = read_range(file, 0, HEAD_BYTES)?;
-    // A full read may end mid-row: only rows a newline closes count.
     let whole = if head.len() as u64 == HEAD_BYTES {
         head.iter()
             .rposition(|&b| b == b'\n')
@@ -1538,8 +1208,6 @@ fn head_stamp(file: &mut File, own_rows: bool) -> Option<u64> {
 }
 
 /// Whether the transcript at `path` began before `floor` ([`head_stamp`]): a
-/// conversation older than the process, which it resumed. `false` when
-/// unreadable.
 fn began_before(path: &Path, floor: u64) -> bool {
     open_regular(path)
         .and_then(|mut file| head_stamp(&mut file, false))
@@ -1547,10 +1215,6 @@ fn began_before(path: &Path, floor: u64) -> bool {
 }
 
 /// Whether the transcript at `path` existed before `moment` (the last sighting
-/// in the session switched out of): created before it, where the filesystem
-/// keeps a birth time, or its first own main-chain row ([`head_stamp`]) is
-/// older. `/clear` and `/branch` sessions are created by the switch, so an
-/// existing one was resumed. `false` when unreadable.
 fn existed_before(path: &Path, moment: u64) -> bool {
     let Some(mut file) = open_regular(path) else {
         return false;
@@ -1565,7 +1229,6 @@ fn existed_before(path: &Path, moment: u64) -> bool {
 }
 
 /// The top-level stamp at an oversized row's end: the last `"timestamp":"…"`
-/// in `part`. `None` when it names none.
 fn last_stamp(part: &[u8]) -> Option<u64> {
     const KEY: &[u8] = b"\"timestamp\":\"";
     let at = part.windows(KEY.len()).rposition(|w| w == KEY)? + KEY.len();
@@ -1577,8 +1240,6 @@ fn last_stamp(part: &[u8]) -> Option<u64> {
 }
 
 /// At first sight: when the transcript is a conversation resumed from before
-/// `floor` (`met_before`, or [`began_before`]), the model Claude restores
-/// ([`conversation_model`]); `None` otherwise or with no answer to restore.
 fn resumed_model(path: &Path, floor: u64, met_before: bool) -> Option<Said> {
     (met_before || began_before(path, floor))
         .then(|| conversation_model(path, floor))
@@ -1586,8 +1247,6 @@ fn resumed_model(path: &Path, floor: u64, met_before: bool) -> Option<Said> {
 }
 
 /// At a switch after `moment`: when the transcript existed before it
-/// ([`existed_before`]), the model Claude restored ([`conversation_model`]);
-/// `None` for a created session or no answer to restore.
 fn resumed_since(path: &Path, moment: u64) -> Option<Said> {
     existed_before(path, moment)
         .then(|| conversation_model(path, moment))
@@ -1595,11 +1254,6 @@ fn resumed_since(path: &Path, moment: u64) -> Option<Said> {
 }
 
 /// The model a resumed conversation last answered with before `before`, read as
-/// Claude reads it: the newest main-chain `assistant` row, not meta, whose
-/// model is not `<synthetic>`. [`Said::Unread`] when that model is not plainly
-/// an id, an answer has no stamp, an oversized row may be that answer, or the
-/// search ran out; never an older answer's model. `None` when there is no
-/// answer before `before` (Claude restores nothing).
 fn conversation_model(path: &Path, before: u64) -> Option<Said> {
     use std::ops::ControlFlow::{Break, Continue};
     let mut found = None;
@@ -1607,8 +1261,6 @@ fn conversation_model(path: &Path, before: u64) -> Option<Said> {
         let raw = match row {
             Row::Whole(raw) => raw,
             Row::Oversized(part) => {
-                // Bare `"assistant"` is JSON structure (`type` or `role`);
-                // inside a string the quotes would be escaped.
                 const ANSWER: &[u8] = b"\"assistant\"";
                 if !part.windows(ANSWER.len()).any(|w| w == ANSWER) {
                     return Continue(());
@@ -1648,8 +1300,6 @@ fn conversation_model(path: &Path, before: u64) -> Option<Said> {
             .and_then(Value::as_str)
             .and_then(crate::harness::upgrade_models::parse_utc);
         found = Some(match at {
-            // Written since `before`: the process's own, after it took the
-            // conversation up, or not certainly before the switch.
             Some(at) if at >= before => return Continue(()),
             Some(_) if is_word(model) => Said::Is(model_display(model)),
             _ => Said::Unread,
@@ -1663,45 +1313,32 @@ fn conversation_model(path: &Path, before: u64) -> Option<Said> {
     }
 }
 
-/// The directories beside one read's facts ([`FooterCache::dirs`]): what the
-/// window's folder and branch actions act on, never shown and never in the
-/// facts' own `Hash`/`Eq`.
+/// The directories beside one read's facts ([`FooterCache::dirs`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FactDirs {
-    /// Where the session's Bash tool stands, else its launch directory:
-    /// the directory the path fact shows, absolute.
+    /// Where the session's Bash tool stands, else its launch directory: the directory the path fact shows, absolute.
     pub cwd: PathBuf,
-    /// Its repository's root ([`GitHeadRead::Found`]), when it is in one the
-    /// branch read could read.
+    /// Its repository's root ([`GitHeadRead::Found`]), when it is in one the branch read could read.
     pub repo_root: Option<PathBuf>,
 }
 
-/// The resolver's per-session usage fold
-/// ([`super::session_usage::SessionUsage`]), so each read folds only what was
-/// appended. Dropping it releases the fold. The transcript tail lives in
-/// [`TailCache`], which the host keeps for the process's life.
+/// The resolver's per-session usage fold ([`super::session_usage::SessionUsage`]), so each read folds only what was appended.
 #[derive(Debug)]
 pub struct FooterCache {
     usage: Option<super::session_usage::SessionUsage>,
     /// The last refresh of `usage`, reused while none of its files moved.
     refreshed: Option<super::session_usage::Refresh>,
     /// The limit-wall inputs (limit-notice rows and served time) as of the
-    /// last read that caught up; a prefix may hold a notice already lifted.
     wall_basis: Option<WallBasis>,
     /// Transcript bytes one read folds at most ([`FOLD_BUDGET`]).
     budget: u64,
     /// The session log's step tap on the main transcript
-    /// ([`super::steps::StepFold`]): `None` until the glue arms it
-    /// ([`Self::set_floor`]); it outlives a moved path, which rebinds it.
     steps: Option<super::steps::StepFold>,
     /// Whether the last registry read's transcript path was certain
-    /// ([`transcript_lookup`]): an uncertain one's steps are partial.
     steps_certain: bool,
     /// The directories the last read that found the process stood in
-    /// ([`Self::dirs`]).
     dirs: Option<FactDirs>,
     /// How many folds this cache has dropped: a new fold's generations start
-    /// over, so [`Self::traffic_generation`] names the fold too.
     dropped: u64,
 }
 
@@ -1721,21 +1358,13 @@ impl Default for FooterCache {
 }
 
 /// The main transcript's newest limit-notice row per window, and the newest
-/// response served in any of the session's files
-/// ([`super::session_usage::wall_of`]'s two readings).
 type WallBasis = (
     std::collections::BTreeMap<String, super::usage::LimitNoticeRow>,
     Option<i64>,
 );
 
 impl FooterCache {
-    /// The usage of the conversation in `transcript` (the one the same registry
-    /// read named, [`read_pid`]), folded on from the last read unless no file
-    /// moved ([`super::session_usage::SessionUsage::moved`]). A new transcript
-    /// starts from nothing. Tokens are named only once every followed file is
-    /// read to its end, and the wall comes from the last caught-up read. A
-    /// session with no transcript yet shows nothing, never the previous one's.
-    /// The fold goes with the cache.
+    /// The usage of the conversation in `transcript` (the one the same registry read named, [`read_pid`]), folded on from the last read unless no file moved ([`super::session_usage::SessionUsage::moved`]).
     pub fn usage(
         &mut self,
         transcript: Option<PathBuf>,
@@ -1788,13 +1417,7 @@ impl FooterCache {
         UsageFacts::of(models, wall, Some(&refresh)).map(|facts| facts.with_runtime(busy_ms))
     }
 
-    /// ARM the step tap: rows of
-    /// the main transcript older than `floor_ms` (wall ms: the process's
-    /// start, `floor_of` × 1000) or at or below the log's watermark `given`
-    /// for their file are history, folded into the end and never queued.
-    /// The first call arms it, bound at once to a transcript this cache
-    /// already reads (seeded at its length now); a later call moves the
-    /// floor up and hands the watermark to the next bind.
+    /// ARM the step tap: rows of the main transcript older than `floor_ms` (wall ms: the process's start, `floor_of` × 1000) or at or below the log's watermark `given` for their file are history, folded into the end and never queued.
     pub fn set_floor(&mut self, floor_ms: u64, given: Option<super::steps::StepMark>) {
         match self.steps.as_mut() {
             Some(tap) => tap.set_floor(floor_ms, given),
@@ -1808,12 +1431,7 @@ impl FooterCache {
         }
     }
 
-    /// Everything the step tap queued since the last take, and the main
-    /// chain's end; an empty batch while it is not armed. A conversation's
-    /// first rows read before its prompt row wait one take at most for it
-    /// (the fold's opening hold, [`super::steps::StepFold::take`]). A transcript whose
-    /// path was not certain ([`transcript_lookup`]) gives partial steps
-    /// only: they add facts and overrule nothing.
+    /// Everything the step tap queued since the last take, and the main chain's end; an empty batch while it is not armed.
     pub fn take_steps(&mut self) -> super::steps::StepBatch {
         let mut batch = self
             .steps
@@ -1834,11 +1452,7 @@ impl FooterCache {
         self.steps.is_some()
     }
 
-    /// DISARM the step tap: what it queued and its binding go. The glue
-    /// does so when the log holds no run its steps could go to (none in
-    /// front, or a new run that bound no file), so the next
-    /// [`Self::set_floor`] arms a fresh one, bound at once — what the file
-    /// held then is history.
+    /// DISARM the step tap: what it queued and its binding go.
     pub fn disarm_steps(&mut self) {
         self.steps = None;
     }
@@ -1851,14 +1465,7 @@ impl FooterCache {
             .is_some_and(super::steps::StepFold::is_bound)
     }
 
-    /// What one registry read says of the tap ([`read_pid`]): the process's
-    /// start (`floor_ms`, wall ms: the floor only rises), the session it
-    /// named (`session`, its id) and the transcript the read found for it,
-    /// `Some((path, certain))` where it found one ([`transcript_lookup`]).
-    /// `None` tells the tap that session's file did not exist, so once a
-    /// read finds that file it is bound from its first byte; a file found
-    /// for any other session is bound at its length
-    /// ([`super::steps::StepFold::note_vacant`]).
+    /// What one registry read says of the tap ([`read_pid`]).
     pub fn note_entry(
         &mut self,
         floor_ms: Option<u64>,
@@ -1878,48 +1485,34 @@ impl FooterCache {
         self.steps_certain = found.is_some_and(|(_, certain)| certain);
     }
 
-    /// The directories the last read that found the process stood in
-    /// ([`read_pid`]): where the Bash tool stands (else the launch
-    /// directory), absolute, and its repository's root. `None` before such a
-    /// read.
+    /// The directories the last read that found the process stood in ([`read_pid`]).
     #[must_use]
     pub fn dirs(&self) -> Option<&FactDirs> {
         self.dirs.as_ref()
     }
 
-    /// The session's traffic over time
-    /// ([`super::session_usage::SessionUsage::traffic`]), only once the fold
-    /// has caught up: a half-folded session draws no graph.
+    /// The session's traffic over time ([`super::session_usage::SessionUsage::traffic`]), only once the fold has caught up.
     #[must_use]
     pub fn traffic(&self) -> Option<super::session_usage::TrafficView> {
         self.caught_up_usage()
             .map(super::session_usage::SessionUsage::traffic)
     }
 
-    /// The session's agents and workflow runs with what their files say of
-    /// their calls in flight (`session_usage::SessionUsage::flights`), under
-    /// [`Self::traffic`]'s rule: `None` until the fold has caught up, so a
-    /// table never shows a call a read behind has already seen answered.
+    /// The session's agents and workflow runs with what their files say of their calls in flight (`session_usage::SessionUsage::flights`), under [`Self::traffic`]'s rule.
     #[must_use]
     pub fn flights(&self) -> Option<super::flight::FlightTable> {
         self.caught_up_usage()
             .map(super::session_usage::SessionUsage::flights)
     }
 
-    /// What moves whenever [`Self::flights`] would (`None` until caught up):
-    /// which fold this cache holds, and its
-    /// [`super::session_usage::SessionUsage::flight_generation`].
+    /// What moves whenever [`Self::flights`] would (`None` until caught up).
     #[must_use]
     pub fn flight_generation(&self) -> Option<(u64, u64)> {
         self.caught_up_usage()
             .map(|usage| (self.dropped, usage.flight_generation()))
     }
 
-    /// What moves whenever [`Self::traffic`] would, under the same rule
-    /// (`None` until the fold has caught up): which fold this cache holds,
-    /// and its [`super::session_usage::SessionUsage::traffic_generation`]. A
-    /// reader that keeps what it built from [`Self::traffic`] rebuilds it
-    /// only when this moved.
+    /// What moves whenever [`Self::traffic`] would, under the same rule (`None` until the fold has caught up).
     #[must_use]
     pub fn traffic_generation(&self) -> Option<(u64, u64)> {
         self.caught_up_usage()
@@ -1949,8 +1542,6 @@ fn read_tail(path: &Path) -> Option<Vec<u8>> {
     let len = file.metadata().ok()?.len();
     let start = len.saturating_sub(TAIL_BYTES);
     let mut bytes = read_range(&mut file, start, len)?;
-    // A tail that starts mid-file starts mid-line: that first fragment is
-    // never a whole row.
     if start > 0 {
         let first = bytes
             .iter()
@@ -1967,7 +1558,6 @@ fn read_range(file: &mut File, from: u64, to: u64) -> Option<Vec<u8>> {
 }
 
 /// Bytes `from..to` of `file` (fewer if it shrank), then `then`, in one buffer
-/// sized for both.
 fn read_range_then(file: &mut File, from: u64, to: u64, then: &[u8]) -> Option<Vec<u8>> {
     file.seek(SeekFrom::Start(from)).ok()?;
     let want = to.saturating_sub(from);
@@ -1983,11 +1573,7 @@ fn read_range_then(file: &mut File, from: u64, to: u64, then: &[u8]) -> Option<V
 /// How many `sessions/<pid>.json` files [`shell_cwds`] reads at most.
 const MAX_SESSION_FILES: usize = 256;
 
-/// Where the Bash tool of each live Claude Code session launched in `launch`
-/// stands, per its transcript ([`last_cwd`]): the directory its next command
-/// starts in, which the shell's own cwd does not track. Every live session
-/// whose registry entry names that launch directory counts (a superset is
-/// what callers want). `launch` itself is left out; empty when unreadable.
+/// Where the Bash tool of each live Claude Code session launched in `launch` stands, per its transcript ([`last_cwd`]).
 pub fn shell_cwds(claude_dir: &Path, launch: &Path) -> Vec<PathBuf> {
     let Ok(dir) = std::fs::read_dir(claude_dir.join("sessions")) else {
         return Vec::new();
@@ -2022,16 +1608,12 @@ pub fn shell_cwds(claude_dir: &Path, launch: &Path) -> Vec<PathBuf> {
     out
 }
 
-/// The `cwd` of the newest main-thread row that carries one: Claude Code
-/// stamps rows with its working directory, which follows the Bash tool.
-/// Sidechain rows are skipped; a relative or empty value is not a directory.
+/// The `cwd` of the newest main-thread row that carries one.
 pub fn last_cwd(body: &[u8]) -> Option<PathBuf> {
     last_cwd_since(rows_of(body), None)
 }
 
 /// [`last_cwd`] of `rows` ([`rows_of`]) since `since` (unix seconds, the
-/// process's floor as [`scan`] takes it): a row stamped before it ends the
-/// search, and an unstamped row is skipped.
 fn last_cwd_since<'a>(
     rows: impl IntoIterator<Item = &'a str>,
     since: Option<u64>,
@@ -2070,16 +1652,13 @@ fn last_cwd_since<'a>(
     None
 }
 
-/// What the transcript since the process started says about one of the
-/// footer's facts.
+/// What the transcript since the process started says about one of the footer's facts.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub enum Said {
     /// Nothing since the start names it: the launch flag or the launch card
-    /// may ([`facts_for_entry_at`]).
     #[default]
     Unsaid,
     /// The newest statement is one this build cannot read (an unparsed `/model`
-    /// result, effort `auto`): unknown, and nothing older stands in.
     Unread,
     /// The newest statement names it, as the footer shows it.
     Is(String),
@@ -2103,37 +1682,23 @@ impl Said {
 /// What the end of a transcript says about the model and effort.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TailFacts {
-    /// The model: the newest of an answer's `message.model` and a model
-    /// result's name (`Opus 5.5`), as the footer shows it.
+    /// The model: the newest of an answer's `message.model` and a model result's name (`Opus 5.5`), as the footer shows it.
     pub model: Said,
-    /// The effort: the newest of an answer's `effort`, an `/effort` result and
-    /// a model result's `with … effort`; across a switch that named no effort,
-    /// only an effort read for the new model ([`Self::effort_for`]).
+    /// The effort: the newest of an answer's `effort`, an `/effort` result and a model result's `with … effort`.
     pub effort: Said,
     /// A model switch that named no effort while the effort was open, and the
-    /// model switched to. Claude runs each model at its own effort, so the
-    /// earlier effort stands only if the older rows' model is this one
-    /// ([`Self::over`]); `Some` when nothing older named a model, leaving it
-    /// to the launch flag or card ([`facts_for_entry_at`]).
     effort_for: Option<String>,
-    /// The top-effort key ([`CLAUDE_TOP_EFFORT_KEY`]) on or off, from the
-    /// newest statement of it: its own `/effort <key> on|off` result, or the
-    /// ` · <Key> on|off` an effort result ends with ([`effort_result`]). Not
-    /// part of [`Self::settled`]: a scan that settled model and effort first
-    /// leaves it to the rows read before (the carry, the process's facts).
+    /// The top-effort key ([`CLAUDE_TOP_EFFORT_KEY`]) on or off, from the newest statement of it.
     pub top: Option<bool>,
 }
 
 impl TailFacts {
     /// `self` (newer rows) over `older`: what the newer rows decided stands,
-    /// and a switch in them that named no effort takes the older effort only
-    /// when the older rows' model is the one it switched to.
     fn over(self, older: Self) -> Self {
         let (effort, effort_for) = match self.effort_for {
             None if self.effort.decided() => (self.effort, None),
             None => (older.effort, older.effort_for),
             Some(to) => match &older.model {
-                // Nothing older names the model before the switch: still open.
                 Said::Unsaid => (
                     if self.effort.decided() {
                         self.effort
@@ -2149,7 +1714,6 @@ impl TailFacts {
                         (older.effort, older.effort_for)
                     }
                 }
-                // Another model, or one this build cannot read, ran before.
                 Said::Is(_) | Said::Unread => (Said::Unread, None),
             },
         };
@@ -2172,7 +1736,6 @@ impl TailFacts {
     }
 
     /// A row naming the model in force (`said`), met newest first: sets the
-    /// model if nothing newer did, and settles a newer effort-less switch.
     fn meet_model(&mut self, said: Said) {
         if let Some(to) = self.effort_for.take()
             && said != Said::Is(to)
@@ -2194,23 +1757,18 @@ impl TailFacts {
 }
 
 /// The row Claude Code writes when a `/model` choice is made: a `type:user` row
-/// whose `message.content` starts with this tag; its result is the next such
-/// row ([`COMMAND_STDOUT`]). A picker that changed nothing writes `type:system`
-/// `local_command` rows (`Kept model as …`), from which [`scan`] reads nothing.
 const MODEL_COMMAND: &str = "<command-name>/model</command-name>";
 
 /// The row Claude Code writes for an `/effort` command, its result after it.
 const EFFORT_COMMAND: &str = "<command-name>/effort</command-name>";
 
 /// The tag every local command's row opens with (`/model`, `/effort`,
-/// `/fast`, …): a command's result is the row directly under it.
 const COMMAND_NAME: &str = "<command-name>";
 
 /// The tag a local command's result row opens with.
 const COMMAND_STDOUT: &str = "<local-command-stdout>";
 
-/// The effort levels the footer names, as `/effort` takes them; the top-effort
-/// mode ([`CLAUDE_TOP_EFFORT_KEY`]) shows as `xhigh`, the level it runs at.
+/// The effort levels the footer names, as `/effort` takes them.
 #[must_use]
 pub fn effort_level(word: &str) -> Option<&'static str> {
     match word {
@@ -2223,10 +1781,7 @@ pub fn effort_level(word: &str) -> Option<&'static str> {
     }
 }
 
-/// A model as a result or launch card spells it, as the footer shows it:
-/// `Opus 5.5 (default)` → `Opus 5.5` (also dropping ` (1M context)` and
-/// ` (recommended)`); an id goes through [`model_display`]. `None` for anything
-/// not plainly a name (at most 64 chars of letters, digits, spaces, `.-_()[]`).
+/// A model as a result or launch card spells it, as the footer shows it.
 #[must_use]
 pub fn footer_model_name(display: &str) -> Option<String> {
     let mut name = display.trim();
@@ -2256,15 +1811,10 @@ pub fn footer_model_name(display: &str) -> Option<String> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum EffortSaid {
     /// A level set or shown (`Set effort level to …`, `Current effort level:
-    /// …`, `Effort level set to auto`), and the top-effort key's state when
-    /// the result ends with ` · <Key> on|off`.
     Level { said: Said, top: Option<bool> },
     /// The key's own `/effort <key> on|off` result: on or off for this
-    /// session, and the level that stays.
     Top { on: bool, stays: Said },
     /// The key refused (`<Key> needs dynamic workflows enabled …`, `<Key>
-    /// isn't available on <model>. …`): it answers its command and decides
-    /// neither the effort nor the key.
     Refused,
 }
 
@@ -2289,20 +1839,15 @@ impl EffortSaid {
 }
 
 /// `text` past a head naming the top-effort key ([`CLAUDE_TOP_EFFORT_KEY`]),
-/// compared without case: the vendor writes it capitalised at the start of
-/// its sentences, and the key's one spelling stays the const's.
 fn past_key(text: &str) -> Option<&str> {
     let key = CLAUDE_TOP_EFFORT_KEY.as_bytes();
     text.as_bytes()
         .get(..key.len())
         .is_some_and(|head| head.eq_ignore_ascii_case(key))
-        // The key is ASCII, so the matched head ends on a char boundary.
         .then(|| &text[key.len()..])
 }
 
 /// The key's state an effort result ends with (`… · <Key> off`): the text
-/// after its last ` · ` (the clauses' join, typography aterm's own rows
-/// share, so no anchor) names the key, then ` on` or ` off` as a word.
 fn key_suffix(body: &str) -> Option<bool> {
     let (_, last) = body.rsplit_once(" \u{b7} ")?;
     let rest = past_key(last)?;
@@ -2320,7 +1865,6 @@ fn key_suffix(body: &str) -> Option<bool> {
 }
 
 /// The level a result's `word…` names ([`effort_level`]): `Is` it, else
-/// [`Said::Unread`] (`auto`, a level this build does not know).
 fn level_word(text: &str) -> Said {
     let word: String = text
         .chars()
@@ -2330,9 +1874,6 @@ fn level_word(text: &str) -> Said {
 }
 
 /// What an `/effort` result says ([`EffortSaid`]): a level ([`effort_level`];
-/// [`Said::Unread`] for `auto` or an unknown level) with the key's state where
-/// it ends with one; the key's own on or off and the level that stays; or the
-/// key refused. `None` when not an effort result.
 fn effort_result(content: &str) -> Option<EffortSaid> {
     use aterm_phase::anchor;
     let body = content
@@ -2377,7 +1918,6 @@ fn effort_result(content: &str) -> Option<EffortSaid> {
 }
 
 /// Which facts a local command's result row answered ([`fold_result`]), so
-/// [`scan`] can pair a command row with its own result.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct Answered {
     /// A readable model was named.
@@ -2387,12 +1927,6 @@ struct Answered {
 }
 
 /// A local command's result row folded into `facts`, newest first. A model
-/// result ([`crate::harness::upgrade_models::model_result_of`]) names the model
-/// ([`TailFacts::meet_model`]) and any `with … effort`; without that clause the
-/// earlier effort stands only for the same model. An `/effort` result names
-/// the effort and, where it says one, the top-effort key's state
-/// ([`EffortSaid`]); a refused key names neither. Returns what it answered, so
-/// [`scan`] can pair a `/model` or `/effort` command row with its own result.
 #[cfg_attr(
     any(test, debug_assertions),
     aterm_spec_anchor::refines(
@@ -2442,28 +1976,12 @@ fn fold_result(content: &str, facts: &mut TailFacts) -> Answered {
     }
 }
 
-/// [`read_tail_facts`]'s scan, pure: rows newest first, stopping once both facts
-/// are decided. Sidechain rows and `<synthetic>` models are skipped.
-///
-/// The model comes from an answer's `message.model` or a `/model`/`/fast`
-/// result ([`fold_result`]), so a choice shows at once. A `/model` command row
-/// whose next row is not a readable model result makes model and effort
-/// [`Said::Unread`]. A `/fast` result without `model set to` decides nothing.
-/// The effort comes from an answer's `effort`, an `/effort` result, or a model
-/// result's `with … effort`; a switch without it keeps the earlier effort only
-/// for the same model ([`TailFacts`]).
-///
-/// `since` is the process's start (unix seconds). The file is in append order,
-/// so the scan stops at the first row stamped before it: that row and all
-/// above belong to a predecessor. Unstamped rows are attributed to no one.
-/// `None` reads the tail as is; [`facts_for_entry_at`] does not show that.
+/// [`read_tail_facts`]'s scan, pure: rows newest first, stopping once both facts are decided.
 pub fn tail_facts(body: &[u8], since: Option<u64>) -> TailFacts {
     scan(&rows_of(body).collect::<Vec<_>>(), since).0
 }
 
 /// The rows of `body` a tail read scans, newest first: each whole row of at
-/// most [`MAX_LINE_BYTES`] that is UTF-8. A tail read collects them once for
-/// all its scans ([`scan`], [`last_cwd_since`], [`super::excerpt::Scan::of`]).
 fn rows_of(body: &[u8]) -> impl Iterator<Item = &str> {
     body.rsplit(|&b| b == b'\n')
         .filter(|raw| !raw.is_empty() && raw.len() <= MAX_LINE_BYTES)
@@ -2471,7 +1989,6 @@ fn rows_of(body: &[u8]) -> impl Iterator<Item = &str> {
 }
 
 /// [`tail_facts`] of `rows` ([`rows_of`]), and whether the scan stopped at a
-/// row before the floor.
 #[cfg_attr(
     any(test, debug_assertions),
     aterm_spec_anchor::refines(
@@ -2482,15 +1999,11 @@ fn rows_of(body: &[u8]) -> impl Iterator<Item = &str> {
 )]
 fn scan(rows: &[&str], since: Option<u64>) -> (TailFacts, bool) {
     let mut facts = TailFacts::default();
-    // What the command or result row met last — the one directly under the
-    // next command row up — answered: that command's own result.
     let mut under = Answered::default();
     for &line in rows {
         if facts.settled() {
             break;
         }
-        // Cheap prefilters: most rows carry neither fact, and a parse per row
-        // over half a MiB of tool output is the cost worth skipping.
         let command = line.contains(COMMAND_STDOUT) || line.contains(COMMAND_NAME);
         let model_open = !facts.model.decided() || facts.effort_for.is_some();
         let wants_model = model_open && (command || line.contains("\"assistant\""));
@@ -2498,8 +2011,6 @@ fn scan(rows: &[&str], since: Option<u64>) -> (TailFacts, bool) {
         if !wants_model && !wants_effort {
             continue;
         }
-        // Only a possible command or result row keeps its string content;
-        // others keep `type`, `isSidechain`, `timestamp`, `effort`, `message.model`.
         let value = if command {
             super::transcript::command(line)
         } else {
@@ -2541,8 +2052,6 @@ fn scan(rows: &[&str], since: Option<u64>) -> (TailFacts, bool) {
             if content.starts_with(COMMAND_NAME) {
                 let answered = std::mem::take(&mut under);
                 if content.starts_with(MODEL_COMMAND) && !answered.model {
-                    // No readable result under it: a choice this build
-                    // cannot read, which may have moved the effort too.
                     facts.meet_model(Said::Unread);
                     if !facts.effort.decided() {
                         facts.decide_effort(Said::Unread);
@@ -2551,8 +2060,6 @@ fn scan(rows: &[&str], since: Option<u64>) -> (TailFacts, bool) {
                     && !answered.effort
                     && !facts.effort.decided()
                 {
-                    // No effort result under it: an answer this build cannot
-                    // read. A refused key under it answered it and moved
                     // nothing, so the older effort stands.
                     facts.decide_effort(Said::Unread);
                 }
@@ -2580,7 +2087,6 @@ fn scan(rows: &[&str], since: Option<u64>) -> (TailFacts, bool) {
 }
 
 /// A value safe to paint as-is: short, and only letters, digits, `-`, `.`,
-/// `_`, `[`, `]`.
 fn is_word(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 64
@@ -2588,9 +2094,7 @@ fn is_word(s: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_' | '[' | ']'))
 }
 
-/// A model id's display name: `claude-opus-5-5` → `Opus 5.5`,
-/// `claude-haiku-4-5-20251001` → `Haiku 4.5` (trailing date dropped),
-/// `claude-opus-5-5[1m]` → `Opus 5.5`. Other shapes are shown unchanged.
+/// A model id's display name.
 pub fn model_display(id: &str) -> String {
     let base = id.split('[').next().unwrap_or(id);
     let Some(rest) = base.strip_prefix("claude-") else {
@@ -2619,9 +2123,7 @@ pub fn model_display(id: &str) -> String {
     name
 }
 
-/// The branch `cwd` is in, read from `.git` without running `git`. A worktree's
-/// `.git` file is followed; a detached HEAD shows seven hex digits. `None`
-/// outside a repository or when the read was refused.
+/// The branch `cwd` is in, read from `.git` without running `git`.
 pub fn git_head(cwd: &Path) -> Option<String> {
     match read_git_head(cwd) {
         GitHeadRead::Found(branch, _) => Some(branch),
@@ -2633,17 +2135,14 @@ pub fn git_head(cwd: &Path) -> Option<String> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GitHeadRead {
     /// The branch, and the repository's root: the directory the climb
-    /// found `.git` in (a worktree's own, where `.git` is its file).
     Found(String, PathBuf),
     /// Not inside a repository (or not one this bounded read can parse).
     Absent,
     /// A read failed with `EPERM` (macOS folder privacy consent); the host
-    /// raises consent attention rather than showing nothing.
     Denied,
 }
 
 /// `EPERM`, the kernel's answer to a read a privacy consent refuses (distinct
-/// from an ordinary `EACCES` permission bit).
 fn is_eperm(error: &std::io::Error) -> bool {
     #[cfg(unix)]
     {
@@ -2656,17 +2155,7 @@ fn is_eperm(error: &std::io::Error) -> bool {
     }
 }
 
-/// Whether `path` is inside a file-provider domain of `home` (iCloud Drive, a
-/// third-party sync provider) or another app's data (`~/Library/Containers`,
-/// `~/Library/Group Containers`): the classes whose open raises a system
-/// dialog with no timeout that parks the opening thread (here the
-/// footer-resolver thread every Claude session shares, and the supervisor's
-/// Claude settings reader) either even under Full Disk Access (file-provider
-/// domains, §3.4) or on every launch without it because an Allow is forgotten
-/// when the responsible process exits (App Data, §1.6a). The path is resolved
-/// first (`realpath` is not gated, docs/DESIGN-macos-tcc-prompts-2026-08-30.md
-/// §1.5), so a symlink out of an ordinary folder is caught; the predicate
-/// itself is lexical. No `home`: nothing to fence against.
+/// Whether `path` is inside a file-provider domain of `home` (iCloud Drive, a third-party sync provider) or another app's data (`~/Library/Containers`, `~/Library/Group Containers`).
 pub(crate) fn under_file_provider_domain(home: Option<&Path>, path: &Path) -> bool {
     let Some(home) = home else {
         return false;
@@ -2683,10 +2172,6 @@ pub fn read_git_head(cwd: &Path) -> GitHeadRead {
 }
 
 /// [`read_git_head`] against an explicit `home`, so a test needs no `$HOME`.
-///
-/// A `cwd` inside a file-provider domain is `Absent` before anything is opened:
-/// the session's own program raises the same dialog for that folder, but this
-/// thread must not be the one parked on it.
 fn read_git_head_in(home: Option<&Path>, cwd: &Path) -> GitHeadRead {
     if under_file_provider_domain(home, cwd) {
         return GitHeadRead::Absent;
@@ -2701,8 +2186,6 @@ fn read_git_head_in(home: Option<&Path>, cwd: &Path) -> GitHeadRead {
                 let Some(git_dir) = resolve_git_dir_of(&dot_git, &meta) else {
                     return GitHeadRead::Absent;
                 };
-                // A worktree's `gitdir:` file can point into a provider domain
-                // from outside one.
                 if under_file_provider_domain(home, &git_dir) {
                     return GitHeadRead::Absent;
                 }
@@ -2724,7 +2207,6 @@ fn read_git_head_in(home: Option<&Path>, cwd: &Path) -> GitHeadRead {
 }
 
 /// The `HEAD` file's text (bounded, regular files only, like [`read_small`]);
-/// `Err(())` when the open was refused with `EPERM`.
 fn read_head(path: &Path) -> Result<Option<String>, ()> {
     match open_nonblocking(path) {
         Ok(file) => Ok(regular(file).and_then(|file| read_capped(file, MAX_GIT_FILE_BYTES))),
@@ -2734,7 +2216,6 @@ fn read_head(path: &Path) -> Result<Option<String>, ()> {
 }
 
 /// The git directory `.git` names: itself when it is a directory, the
-/// `gitdir:` target when it is a worktree's file.
 fn resolve_git_dir_of(dot_git: &Path, meta: &std::fs::Metadata) -> Option<PathBuf> {
     if meta.is_dir() {
         return Some(dot_git.to_path_buf());
@@ -2761,15 +2242,12 @@ pub fn branch_of_head(head: &str) -> Option<String> {
 }
 
 /// A filesystem name fit for a chrome row: non-empty, at most 128 chars, no
-/// control characters.
 fn printable(name: &str) -> Option<String> {
     (!name.is_empty() && name.chars().count() <= 128 && !name.chars().any(char::is_control))
         .then(|| name.to_owned())
 }
 
-/// The floor under the transcript rows that speak for the process `entry`
-/// registers: the later of its start (the kernel's, else the registry's
-/// `procStart`) and its image's `startedAt`.
+/// The floor under the transcript rows that speak for the process `entry` registers.
 #[must_use]
 pub fn floor_of(started: Option<u64>, entry: &SessionEntry) -> Option<u64> {
     match (started.or(entry.proc_start), entry.started_at) {
@@ -2778,18 +2256,7 @@ pub fn floor_of(started: Option<u64>, entry: &SessionEntry) -> Option<u64> {
     }
 }
 
-/// Everything the footer shows for process `pid` given its registry `entry`
-/// ([`session_of_pid`]) and command-line facts (`launch`, [`launch_facts`]).
-/// File I/O: keep off the event loop. `read_at` is the wall clock no later than
-/// the registry read, recorded as when the process was last seen in the
-/// session ([`TailCache`]). With no start known ([`floor_of`]) the transcript
-/// is not used.
-///
-/// Order: what the transcript says since the process entered this session
-/// ([`tail_facts`]); else what the process decided in the session it left
-/// ([`TailCache`]); else its `--model`; else open ([`FooterFacts::model_open`],
-/// [`FooterFacts::effort_open`]) for the launch card to fill
-/// ([`FooterFacts::filled_from`]).
+/// Everything the footer shows for process `pid` given its registry `entry` ([`session_of_pid`]) and command-line facts (`launch`, [`launch_facts`]).
 pub fn facts_for_entry_at(
     claude_dir: &Path,
     pid: u32,
@@ -2799,7 +2266,6 @@ pub fn facts_for_entry_at(
     cache: &mut TailCache,
     read_at: SystemTime,
 ) -> FooterFacts {
-    // With no floor no transcript row speaks for the process: not looked up.
     let transcript = floor_of(started, entry).and_then(|_| transcript_path(claude_dir, entry));
     facts_for_entry_from(
         claude_dir,
@@ -2815,8 +2281,6 @@ pub fn facts_for_entry_at(
 }
 
 /// [`facts_for_entry_at`] over the caller's transcript lookup
-/// ([`transcript_path`]), shared with the usage fold so both read one file,
-/// and the directories beside the facts ([`FactDirs`]).
 #[allow(clippy::too_many_arguments)]
 #[cfg_attr(
     any(test, debug_assertions),
@@ -2837,11 +2301,7 @@ fn facts_for_entry_from(
     read_at: SystemTime,
 ) -> (FooterFacts, FactDirs) {
     let floor = floor_of(started, entry);
-    // With no floor the transcript stays out rather than risk a
-    // predecessor's model ([`facts_for_entry_at`]).
     let path = floor.and(transcript);
-    // The rows of the current session that speak for the process: since it
-    // entered that session.
     let since = floor.map(|floor| cache.session_floor(pid, started, floor, &entry.session_id));
     let read = match (since, path) {
         (Some(since), Some(path)) => cache
@@ -2853,8 +2313,6 @@ fn facts_for_entry_from(
         }
     };
     let met_before = read.resumed;
-    // Where the Bash tool stands, else the launch directory: the path and the
-    // branch both describe it.
     let dir = read.cwd.clone().unwrap_or_else(|| entry.cwd.clone());
     let tail = match floor {
         Some(floor) => cache.for_process(
@@ -2915,8 +2373,6 @@ fn facts_for_entry_from(
         (Said::Is(effort), None) => (Some(effort), false, None),
         (Said::Unread, _) => (None, false, None),
         (Said::Unsaid, None) => (None, true, None),
-        // An effort-less switch with no older model named: the launch model's
-        // `--model` decides, else the card may.
         (Said::Is(effort), Some(to)) => (
             (launch.model.as_deref() == Some(to.as_str())).then_some(effort),
             false,
@@ -2960,20 +2416,13 @@ fn facts_for_entry_from(
     )
 }
 
-/// Claude Code's launch card, read for the footer only under a live REPL
-/// ([`live_repl_row`]) and only when it is the newest card with no user
-/// message under it (`aterm_phase::launch_card`). `None` when the model row
-/// is not plainly a name.
+/// Claude Code's launch card, read for the footer only under a live REPL ([`live_repl_row`]) and only when it is the newest card with no user message under it (`aterm_phase::launch_card`).
 #[must_use]
 pub fn launch_card(rows: &[String]) -> Option<aterm_phase::LaunchCard> {
     launch_card_read(rows).map(|(_, read)| read.card)
 }
 
-/// [`launch_card`] with the reader that read it (Claude Code's, agy's or
-/// Muse Code's) and the rows it was read from
-/// ([`aterm_phase::LaunchCardRead`]): what the host holds to the rows the
-/// program in front drew before it keeps the card for its facts (the
-/// harness card's gate, card engine §3.8).
+/// [`launch_card`] with the reader that read it (Claude Code's, agy's or Muse Code's) and the rows it was read from ([`aterm_phase::LaunchCardRead`]).
 #[must_use]
 pub fn launch_card_read(
     rows: &[String],
@@ -3004,11 +2453,7 @@ pub fn launch_card_read(
 }
 
 impl FooterFacts {
-    /// These facts filled from `card` (the kept launch card) where still open:
-    /// the model while [`Self::model_open`], the effort while
-    /// [`Self::effort_open`] and, after an effort-less switch, only from a card
-    /// naming that model ([`Self::effort_for`]). Only a card of this build
-    /// (`version`) counts.
+    /// These facts filled from `card` (the kept launch card) where still open.
     #[must_use]
     pub fn filled_from(&self, card: Option<&aterm_phase::LaunchCard>) -> Self {
         let mut out = self.clone();
@@ -3028,10 +2473,7 @@ impl FooterFacts {
         out
     }
 
-    /// The model and the effort [`Self::filled_from`] shows, borrowed — these
-    /// facts' own, or the card's where it fills them — for a caller that
-    /// needs them without a copy of the facts (the footer's repaint key,
-    /// every frame).
+    /// The model and the effort [`Self::filled_from`] shows, borrowed.
     #[must_use]
     pub fn filled_model_effort<'a>(
         &'a self,
@@ -3057,8 +2499,7 @@ impl FooterFacts {
     }
 }
 
-/// `cwd` as the footer shows it: `~/…` under `home` (unless home is `/`),
-/// else whole. `None` for a path containing a control character.
+/// `cwd` as the footer shows it: `~/…` under `home` (unless home is `/`), else whole.
 #[must_use]
 pub fn home_path(cwd: &Path, home: Option<&Path>) -> Option<String> {
     let home = home.filter(|home| home.parent().is_some());
@@ -3070,9 +2511,7 @@ pub fn home_path(cwd: &Path, home: Option<&Path>) -> Option<String> {
     (!shown.is_empty() && !shown.chars().any(char::is_control)).then_some(shown)
 }
 
-/// `path` cut from the front to its last directory (`~/src/aterm` →
-/// `…/aterm`), for a pane too narrow for all of it. `None` when that is no
-/// shorter, or there is no directory to keep.
+/// `path` cut from the front to its last directory (`~/src/aterm` → `…/aterm`), for a pane too narrow for all of it.
 #[must_use]
 pub fn elide_path(path: &str) -> Option<String> {
     let (_, last) = path.trim_end_matches('/').rsplit_once('/')?;
@@ -3080,10 +2519,7 @@ pub fn elide_path(path: &str) -> Option<String> {
     (!last.is_empty() && short.chars().count() < path.chars().count()).then_some(short)
 }
 
-/// Timing for one footer read ([`read_pid`]): `read_at` (no later than the
-/// registry read), `now` (unix seconds, for the limit wall) and `offset_at`,
-/// a zone's UTC offset at an instant (`None`: local), injected because it
-/// reads system zone data ([`super::session_usage::wall_of`]).
+/// Timing for one footer read ([`read_pid`]).
 pub struct ReadClock<'a> {
     /// No later than the registry read.
     pub read_at: SystemTime,
@@ -3093,22 +2529,7 @@ pub struct ReadClock<'a> {
     pub offset_at: &'a dyn Fn(Option<&str>, i64) -> Option<i64>,
 }
 
-/// One footer read of live Claude Code process `pid`, as `aterm-gui`'s
-/// `claude_footer::resolve_into` makes it: its facts ([`facts_for_entry_at`]),
-/// the usage folded on in `fold` (at most [`FOLD_BUDGET`] bytes per call; the
-/// limit wall stands while its reset is ahead of `clock.now` and nothing was
-/// served since) and the resume line ([`super::resume::of_entry`], under the
-/// conversation's model record in the harness's state root `state`), with
-/// the Claude home the process ran under in front of it where that is not
-/// the shell's of a user whose home is `user_home`
-/// ([`super::resume::home_env`]: its `CLAUDE_CONFIG_DIR`, or the `HOME` that
-/// holds `claude_dir` LC-4 — the line every other surface
-/// tells for it). `launch` is asked once with the registry entry for its
-/// launch facts and argv.
-///
-/// One registry read feeds all of it, so model, usage and resume line always
-/// describe one conversation. A read landing mid-write yields no facts (the
-/// host keeps the last good ones) and keeps the fold.
+/// One footer read of live Claude Code process `pid`, as `aterm-gui`'s `claude_footer::resolve_into` makes it.
 #[allow(clippy::too_many_arguments)]
 pub fn read_pid(
     claude_dir: &Path,
@@ -3126,10 +2547,7 @@ pub fn read_pid(
         return None;
     };
     let (launch, argv) = launch(&entry);
-    // One lookup of the transcript for the facts and the fold alike.
     let found = transcript_lookup(claude_dir, &entry);
-    // The step tap's floor is this process's start (ms), and its steps are
-    // partial where the path is not certain.
     fold.note_entry(
         floor_of(started, &entry).map(|s| s.saturating_mul(1000)),
         &entry.session_id,
@@ -3159,25 +2577,18 @@ pub fn read_pid(
     Some(facts)
 }
 
-/// Where Claude Code's permission-mode row is: under the composer's bottom rule
-/// (`aterm_phase::phase::composer_bottom`), before the first blank row, the row
-/// opening with a mode pill ([`is_mode_row`]). Found by structure, never by the
-/// rebindable `(shift+tab to cycle)` hint. The lights read the mode from it
-/// (`harness::lights`) and the launch card is read only under one.
+/// Where Claude Code's permission-mode row is.
 pub fn mode_row(rows: &[String]) -> Option<usize> {
     mode_row_under(rows, aterm_phase::phase::composer_bottom(rows)?)
 }
 
-/// [`mode_row`] under the composer bottom rule the caller has found (row
-/// `bottom`), so a reader that has it does not look for it again.
+/// [`mode_row`] under the composer bottom rule the caller has found (row `bottom`), so a reader that has it does not look for it again.
 #[must_use]
 pub fn mode_row_under(rows: &[String], bottom: usize) -> Option<usize> {
     under_composer(rows, bottom).find(|&i| is_mode_row(&rows[i]))
 }
 
-/// The first row under the composer bottom rule `bottom` that opens with a
-/// pill glyph ([`opens_with_pill_glyph`]), whether or not this build knows
-/// the pill.
+/// The first row under the composer bottom rule `bottom` that opens with a pill glyph ([`opens_with_pill_glyph`]), whether or not this build knows the pill.
 #[must_use]
 pub fn pill_row_under(rows: &[String], bottom: usize) -> Option<usize> {
     under_composer(rows, bottom).find(|&i| opens_with_pill_glyph(&rows[i]))
@@ -3188,10 +2599,7 @@ fn under_composer(rows: &[String], bottom: usize) -> impl Iterator<Item = usize>
     (bottom + 1..rows.len()).take_while(|&i| !rows[i].trim().is_empty())
 }
 
-/// Where a live REPL's footer row is, under the composer's bottom rule: its mode
-/// row ([`mode_row`]), or where Claude draws no pill, the pill-less row
-/// ([`is_bare_footer_row`]). A box left on the main screen by a predecessor has
-/// `Press Ctrl-C again to exit` there instead.
+/// Where a live REPL's footer row is, under the composer's bottom rule.
 #[must_use]
 pub fn live_repl_row(rows: &[String]) -> Option<usize> {
     let bottom = aterm_phase::phase::composer_bottom(rows)?;
@@ -3199,22 +2607,7 @@ pub fn live_repl_row(rows: &[String]) -> Option<usize> {
         .or_else(|| under_composer(rows, bottom).find(|&i| is_bare_footer_row(&rows[i])))
 }
 
-/// Whether Claude Code's screen says its context indicator has GONE (as after `/compact`), for
-/// the context fact, which follows the indicator ([`FooterFacts::context`]): the composer
-/// frame stands, neither place [`aterm_phase::phase::context_left_shown`] reads holds it, and
-/// right under the bottom rule stands Claude Code's own footer row ([`is_mode_row`],
-/// [`is_bare_footer_row`]) with nothing against the rule's right edge, the slot 2.1.305 draws
-/// the indicator in. Measured on 2.1.306 in the real-Claude lab (2026-10-21, a 100 000-token
-/// window compacting at 15%): the slot reads `0% until auto-compact` at rest, beside a draft
-/// and through a turn; Claude Code's own `◐ medium · /effort` takes it for a while after the
-/// first keystroke and for 6-10 s after a compaction; the `/` and `@` menus and the `?`
-/// shortcuts stand in the mode row's place while open; once the notice has gone after
-/// `/compact`, the slot is empty (after `/clear` it read `100% until auto-compact`). So a slot
-/// that holds anything says nothing of the indicator, and neither does a box (over the
-/// composer, so no frame, or above it: the supervisor's watch reads a box the same way), the
-/// `/` or `@` menu or the shortcuts in the footer row's place (no footer row right under the
-/// rule), or a screen with no composer. The box is read last, and only on a screen that would
-/// otherwise say the indicator has gone.
+/// Whether Claude Code's screen says its context indicator has GONE (as after `/compact`), for the context fact, which follows the indicator ([`FooterFacts::context`]).
 #[must_use]
 pub fn context_gone(rows: &[String]) -> bool {
     let Some(bottom) = aterm_phase::phase::composer_bottom(rows) else {
@@ -3227,9 +2620,7 @@ pub fn context_gone(rows: &[String]) -> bool {
         && aterm_phase::prompt::parse_prompt_v2(rows).is_none()
 }
 
-/// Whether `row` is Claude Code's pill-less footer row: after a two-space
-/// indent, its left hint slot (`? for shortcuts`, `esc to clear`, `esc to
-/// interrupt`). Completion lists and pickers under the rule do not match.
+/// Whether `row` is Claude Code's pill-less footer row.
 #[must_use]
 pub fn is_bare_footer_row(row: &str) -> bool {
     row.strip_prefix("  ").is_some_and(|rest| {
@@ -3239,10 +2630,7 @@ pub fn is_bare_footer_row(row: &str) -> bool {
     })
 }
 
-/// Whether `row` is Claude Code's permission-mode row: it opens with a known
-/// pill ([`pill_indicator`]), and any `(<key> to cycle)` hint after it is
-/// closed or cut between words ([`cycle_hint_len`]). A hint cut mid-word, or
-/// the pill-less row, is not a mode row.
+/// Whether `row` is Claude Code's permission-mode row.
 #[must_use]
 pub fn is_mode_row(row: &str) -> bool {
     let Some(rest) = pill_lead(row) else {
@@ -3259,34 +2647,20 @@ pub fn is_mode_row(row: &str) -> bool {
 }
 
 /// VIM'S INSERT INDICATOR, the vendor's (anchor `vim.insert`): with the
-/// composer's vim editor mode in INSERT (`editorMode: "vim"`), Claude Code
-/// draws `-- INSERT --` dim at the mode row's head and its pill one cell
-/// after it — `  -- INSERT -- ⏵⏵ auto mode on (shift+tab to cycle)`, the
-/// indicator at column 2 and the pill at column 15, MEASURED on 2.1.304
-/// (`claude-2.1.304-top-vim-insert-120col.txt`). NORMAL draws nothing of its
-/// own. (The 2.1.304 bundle draws VISUAL's the same way; unmeasured, a row
-/// opening with it is read as no pill row at all, as before.)
 const VIM_INSERT: &str = aterm_phase::anchor_text("vim.insert");
 
 /// `row` past the lead its pill stands after: the two-space indent, and
-/// where Claude draws it, vim's INSERT indicator and its one-cell gap
-/// ([`vim_insert`]). `None` without the indent.
 fn pill_lead(row: &str) -> Option<&str> {
     let rest = row.strip_prefix("  ")?;
     Some(after_vim_insert(rest).unwrap_or(rest))
 }
 
 /// `rest` (a row past its indent) past vim's INSERT indicator and the cell
-/// after it, if it opens with them.
 fn after_vim_insert(rest: &str) -> Option<&str> {
     rest.strip_prefix(VIM_INSERT)?.strip_prefix(' ')
 }
 
-/// Whether `row` opens with vim's INSERT indicator before its pill
-/// (anchor `vim.insert`'s row: `  -- INSERT -- ⏵⏵ auto mode on …`): Claude
-/// Code's composer then takes keys through vim, and the facts' typing path
-/// (`aterm-gui`'s `claude_slash`) types nothing into it. The pill after it is
-/// read as on any mode row ([`pill_indicator`]).
+/// Whether `row` opens with vim's INSERT indicator before its pill (anchor `vim.insert`'s row: `  -- INSERT -- ⏵⏵ auto mode on …`).
 #[must_use]
 pub fn vim_insert(row: &str) -> bool {
     row.strip_prefix("  ")
@@ -3295,7 +2669,6 @@ pub fn vim_insert(row: &str) -> bool {
 }
 
 /// `rest` past the pill (`<glyph> <indicator> on`) it opens with, if it
-/// opens with that one.
 fn after_pill<'a>(rest: &'a str, pill: &Pill) -> Option<&'a str> {
     rest.strip_prefix(pill.glyph)?
         .strip_prefix(' ')?
@@ -3303,9 +2676,6 @@ fn after_pill<'a>(rest: &'a str, pill: &Pill) -> Option<&'a str> {
 }
 
 /// How many chars of `after` (the row past a pill) are the `(<key> to cycle)`
-/// hint: all of it, or the head a narrow pane leaves, cut only between words
-/// and ending at the row's end or the blanks before a separator. `0` when no
-/// hint follows.
 fn cycle_hint_len(after: &str) -> usize {
     let Some(hint) = after.strip_prefix(" (") else {
         return 0;
@@ -3331,8 +2701,7 @@ fn cycle_hint_len(after: &str) -> usize {
     }
 }
 
-/// One of the vendor's mode pills: its glyph and the anchor
-/// (`aterm_phase::anchor`) of the words after it.
+/// One of the vendor's mode pills: its glyph and the anchor (`aterm_phase::anchor`) of the words after it.
 pub(super) struct Pill {
     pub(super) glyph: &'static str,
     /// The anchor id (`mode.auto`): what [`pill_indicator`] answers.
@@ -3349,8 +2718,7 @@ const fn pill(glyph: &'static str, id: &'static str) -> Pill {
     }
 }
 
-/// The vendor's mode pills. `⏸` goes only with plan and manual mode, `⏵⏵`
-/// with the rest — the pairing the 2.1.282 mode table draws.
+/// The vendor's mode pills.
 pub(super) const PILLS: [Pill; 6] = [
     pill("\u{23F5}\u{23F5}", "mode.bypass"),
     pill("\u{23F5}\u{23F5}", "mode.auto"),
@@ -3360,9 +2728,7 @@ pub(super) const PILLS: [Pill; 6] = [
     pill("\u{23F8}", "mode.manual"),
 ];
 
-/// The anchor id (`mode.auto`) of the known pill `row` opens with, shared by
-/// the footer, the lights (`harness::lights`) and the supervisor's
-/// `footer_mode`.
+/// The anchor id (`mode.auto`) of the known pill `row` opens with, shared by the footer, the lights (`harness::lights`) and the supervisor's `footer_mode`.
 #[must_use]
 pub fn pill_indicator(row: &str) -> Option<&'static str> {
     let rest = pill_lead(row)?;
@@ -3372,17 +2738,13 @@ pub fn pill_indicator(row: &str) -> Option<&'static str> {
         .map(|pill| pill.id)
 }
 
-/// Whether `row` opens like a mode pill, whatever its indicator. With
-/// [`pill_indicator`] answering `None`, the vendor renamed or added a mode, and
-/// the host logs the drift.
+/// Whether `row` opens like a mode pill, whatever its indicator.
 #[must_use]
 pub fn opens_with_pill_glyph(row: &str) -> bool {
     pill_lead(row).is_some_and(|rest| PILLS.iter().any(|pill| rest.starts_with(pill.glyph)))
 }
 
-/// Whether `row` is a known pill cut short by a narrow pane
-/// (`⏵⏵ bypass permissi`): geometry, not drift. Allocation-free: the panel's
-/// locator ([`agents_panel_under`]) asks it on every frame the GUI paints.
+/// Whether `row` is a known pill cut short by a narrow pane (`⏵⏵ bypass permissi`): geometry, not drift.
 #[must_use]
 pub fn is_cut_pill(row: &str) -> bool {
     let Some(rest) = pill_lead(row) else {
@@ -3410,16 +2772,12 @@ fn prefix_of_parts(cut: &str, parts: &[&str]) -> bool {
     rest.is_empty()
 }
 
-/// What aterm draws over Claude's bypass pill (`⏵⏵ bypass permissions on`)
-/// on the glass (owner, 2026-10-19: "Replace '⏵⏵ bypass permissions on'
-/// with 'YOLO on' (or off)").
+/// What aterm draws over Claude's bypass pill (`⏵⏵ bypass permissions on`) on the glass (owner, 2026-10-19: "Replace '⏵⏵ bypass permissions on' with 'YOLO on' (or off)").
 pub const YOLO_ON: &str = "YOLO on";
-/// What it draws over the manual-mode pill (`⏸ manual mode on`), the mode
-/// that asks before each tool: YOLO's off.
+/// What it draws over the manual-mode pill (`⏸ manual mode on`), the mode that asks before each tool: YOLO's off.
 pub const YOLO_OFF: &str = "YOLO off";
 
-/// Claude's mode pill as [`relabel_under`] found it, in PANE COLUMNS of the
-/// GUI's pane text (one char per cell), for the glass to relabel.
+/// Claude's mode pill as [`relabel_under`] found it, in PANE COLUMNS of the GUI's pane text (one char per cell), for the glass to relabel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Relabel {
     /// The mode row.
@@ -3427,12 +2785,9 @@ pub struct Relabel {
     /// Claude's pill, its glyph to its `on`: `start..end`.
     pub start: usize,
     pub end: usize,
-    /// Where the pill's words start (after the glyph and its space): the
-    /// cell whose style the label takes.
+    /// Where the pill's words start (after the glyph and its space): the cell whose style the label takes.
     pub words: usize,
-    /// The end of the row's left items, from the pill's end to the first
-    /// two blanks (or the row's text end): the run the glass packs left
-    /// behind the label. Cells from here on stay where Claude drew them.
+    /// The end of the row's left items, from the pill's end to the first two blanks (or the row's text end).
     pub run_end: usize,
     /// [`YOLO_ON`] or [`YOLO_OFF`].
     pub label: &'static str,
@@ -3451,10 +2806,7 @@ impl Relabel {
         self.start + self.label.len()
     }
 
-    /// The grid column under glass column `col` of the relabelled row: the
-    /// label's cells over Claude's pill (whose cells answer no click), the
-    /// packed run `shift` columns right of where it shows, the blanks it
-    /// left at the run's end over the pill's first cell, the rest as drawn.
+    /// The grid column under glass column `col` of the relabelled row.
     #[must_use]
     pub fn grid_col(&self, col: usize) -> usize {
         let shift = self.shift();
@@ -3468,15 +2820,7 @@ impl Relabel {
     }
 }
 
-/// Claude Code's mode pill to relabel under the composer bottom rule
-/// `bottom`: the pill a mode row ([`is_mode_row`]) opens with, whole and at
-/// the row's start (column 2, or 15 after vim INSERT's indicator,
-/// [`vim_insert`]), when it is EXACTLY the bypass pill ([`YOLO_ON`]) or the
-/// manual-mode one ([`YOLO_OFF`]). `None` for every other mode (auto, plan,
-/// accept edits, don't ask: Claude's pill stays), a pill a narrow pane cut,
-/// a pill's words anywhere but the row's start, a row above the rule, and a
-/// screen that is not Claude's (agy and Muse Code draw no such pill; the
-/// host asks only on a Claude pane). Pure and allocation-free.
+/// Claude Code's mode pill to relabel under the composer bottom rule `bottom`.
 #[must_use]
 pub fn relabel_under(rows: &[String], bottom: usize) -> Option<Relabel> {
     let row = pill_row_under(rows, bottom)?;
@@ -3492,8 +2836,6 @@ pub fn relabel_under(rows: &[String], bottom: usize) -> Option<Relabel> {
             let after = after_pill(rest, pill)?;
             (after.is_empty() || after.starts_with(' ')).then_some((pill, label))
         })?;
-    // The pill's column: after the indent, and vim INSERT's indicator where
-    // Claude draws one (column 15, MEASURED).
     let start = text[..text.len() - rest.len()].chars().count();
     let words = start + pill.glyph.chars().count() + 1;
     let end = words + pill.text.chars().count();
@@ -3518,34 +2860,9 @@ pub fn relabel_under(rows: &[String], bottom: usize) -> Option<Relabel> {
 }
 
 /// How many rows of Claude's footer the panel's locator passes before the
-/// panel: the footer row and up to three more (a left slot a narrow pane
-/// wraps, a right-hand notice on its own row).
 const FOOTER_ROWS_MAX: usize = 4;
 
-/// Claude Code's agents panel under the composer bottom rule `bottom`, read
-/// in PANE CELLS (one char per cell, as the GUI's pane text holds them:
-/// [`aterm_phase::agents_panel::one_cell`]); [`agents_panel_under_with`]
-/// takes the width of text whose wide glyphs stand alone. The ONE locator of
-/// the panel: the reader (`aterm_phase::agents_panel`) reads its rows, this
-/// says which rows they are.
-///
-/// Under the rule: Claude's live footer row ([`is_mode_row`],
-/// [`is_bare_footer_row`], [`is_cut_pill`], an unknown pill
-/// ([`opens_with_pill_glyph`]), or a transient hint in its left slot —
-/// `paste again to expand` over a running workflow, MEASURED in
-/// `aterm-phase/src/fixtures/wait_bg2.out`, and `↑/↓ to select` or `Enter
-/// to view · x to stop` while the panel holds the keys, MEASURED on 2.1.304
-/// (`claude-2.1.304-agents-panel-*-selected.txt`)), up to three rows more
-/// of it, then at most one blank (2.1.304's container has `marginTop: 1`,
-/// measured; older builds drew the panel straight under the footer), then
-/// the panel: its
-/// first row the main row or a workflow (a task row is never first: 2.1.304
-/// draws `main` whenever it draws a task, and older builds drew workflows
-/// alone), then every row the reader reads, one blank slot passed when a
-/// workflow row follows it (the lone space 2.1.304 leaves where `↓ N more`
-/// would be), to the first row it does not (`⧉  <artifact> · canvas`, the
-/// screen's end). Never above the frame: the walk starts under `bottom`.
-/// `None` where no panel hangs there.
+/// Claude Code's agents panel under the composer bottom rule `bottom`, read in PANE CELLS (one char per cell, as the GUI's pane text holds them: [`aterm_phase::agents_panel::one_cell`]).
 #[must_use]
 pub fn agents_panel_under(
     rows: &[String],
@@ -3554,9 +2871,7 @@ pub fn agents_panel_under(
     agents_panel_under_with(rows, bottom, aterm_phase::agents_panel::one_cell)
 }
 
-/// [`agents_panel_under`], its spans counted in `width`'s columns
-/// (`aterm_grapheme::char_width` for a screen's text whose wide glyphs are
-/// one char each, such as `aterm ctl text`).
+/// [`agents_panel_under`], its spans counted in `width`'s columns (`aterm_grapheme::char_width` for a screen's text whose wide glyphs are one char each, such as `aterm ctl text`).
 #[must_use]
 pub fn agents_panel_under_with(
     rows: &[String],
@@ -3574,9 +2889,6 @@ pub fn agents_panel_under_with(
         || is_bare_footer_row(footer)
         || is_cut_pill(footer)
         || opens_with_pill_glyph(footer);
-    // The row in the footer's slot is a panel row only where it is no
-    // footer: manual and plan mode's pill opens with `⏸`, a paused
-    // workflow's bullet, so their footer reads as a panel row too.
     if footer.trim().is_empty() || (!known && read(first).is_some()) {
         return None;
     }
@@ -3615,14 +2927,7 @@ pub fn agents_panel_under_with(
     Some(panel)
 }
 
-/// The footer's marked values, in order: a live upgrade waiting on the person
-/// here ([`FooterFacts::upgrade`]), whole; a limit wall while it stands (a
-/// narrow row drops values from the back, and the wall says why nothing
-/// moves); model and effort under one mark; the account
-/// ([`FooterFacts::account`]); the working directory; the branch; and the
-/// session's tokens last, the first a narrow row gives up. A value the facts
-/// lack is left out, not shown as a placeholder; one the person hid
-/// ([`FooterFacts::off`]) reads greyed, [`OFF_STUB`] after it.
+/// The footer's marked values, in order: a live upgrade waiting on the person here ([`FooterFacts::upgrade`]), whole.
 pub fn segments(facts: &FooterFacts) -> Vec<Segment> {
     let mut out: Vec<Segment> = facts
         .upgrade
@@ -3640,11 +2945,6 @@ fn upgrade_segment(text: &str) -> Segment {
 }
 
 /// The model-and-effort segment under the mask ([`FooterFacts::off`]): `◆
-/// Opus 5.5 xhigh` split at the effort; a hidden model or effort is its
-/// stub — its value greyed, [`OFF_STUB`] after it (`◆ Opus 5.5 off xhigh`,
-/// `◆ Opus 5.5 xhigh off`, both `◆ Opus 5.5 off xhigh off`, each side of the
-/// split its own) — or with no `stubs` is left out (`◆ xhigh`, `◆ Opus 5.5`,
-/// nothing). A fact the facts lack is never a stub.
 fn model_effort_segment(facts: &FooterFacts, stubs: bool) -> Option<Segment> {
     let off = facts.off;
     let model = facts.model.as_deref();
@@ -3702,11 +3002,8 @@ fn model_effort_segment(facts: &FooterFacts, stubs: bool) -> Option<Segment> {
 }
 
 /// [`segments`] but the upgrade note: what Claude Code's own files say, a
-/// hidden fact as its stub (`stubs`) or left out.
 fn fact_segments(facts: &FooterFacts, stubs: bool) -> Vec<Segment> {
     let usage = facts.usage.as_ref();
-    // A hidden path, branch or context: its stub (its value greyed, `off`
-    // after it), or nothing.
     let hidable = |kind: FactKind, value: &Option<String>| -> Option<Segment> {
         let mark = kind.mark()?;
         let value = value.as_ref()?;
@@ -3741,9 +3038,16 @@ fn fact_segments(facts: &FooterFacts, stubs: bool) -> Vec<Segment> {
         plain(
             WEEKLY_MARK,
             facts.subscription.as_ref().map(|s| {
-                s.weekly
-                    .clone()
-                    .unwrap_or_else(|| "weekly unavailable".into())
+                s.weekly.clone().unwrap_or_else(|| {
+                    if usage
+                        .and_then(|u| u.wall.as_ref())
+                        .is_some_and(|w| w.label == "7d")
+                    {
+                        "weekly 0% left".into()
+                    } else {
+                        "weekly unavailable".into()
+                    }
+                })
             }),
         ),
         model_effort_segment(facts, stubs),
@@ -3770,7 +3074,6 @@ fn fact_segments(facts: &FooterFacts, stubs: bool) -> Vec<Segment> {
 }
 
 /// The model alone as a segment — the rung a narrow rule gives up last
-/// ([`facts_ladder`]). None while the model is hidden.
 fn model_alone(facts: &FooterFacts) -> Option<Segment> {
     facts
         .model
@@ -3779,8 +3082,7 @@ fn model_alone(facts: &FooterFacts) -> Option<Segment> {
         .map(|model| Segment::plain(MODEL_MARK, model.clone()))
 }
 
-/// The cells `text` takes on the glass: a wide char two, a combining mark
-/// or a control none (the painter leaves those out).
+/// The cells `text` takes on the glass: a wide char two, a combining mark or a control none (the painter leaves those out).
 #[must_use]
 pub fn text_width(text: &str) -> usize {
     aterm_grapheme::str_grid_columns(text)
@@ -3797,29 +3099,24 @@ pub fn segments_width(segments: &[Segment]) -> usize {
 pub struct SetGlyph {
     /// The character.
     pub ch: char,
-    /// Its cell in the set run (its lead cell: a wide char takes the next
-    /// one too).
+    /// Its cell in the set run (its lead cell: a wide char takes the next one too).
     pub cell: usize,
     /// The cells it takes: 1, or 2 for a wide char.
     pub cols: usize,
-    /// How far its glyph is drawn from the middle of its cells, in
-    /// [`NUDGES_PER_CELL`]ths of a cell (negative: left).
+    /// How far its glyph is drawn from the middle of its cells, in [`NUDGES_PER_CELL`]ths of a cell (negative: left).
     pub nudge: i8,
     /// A fact's mark (`◆`, `⌂`, ...) rather than a character of its value.
     pub mark: bool,
-    /// A character of the model-and-effort segment's effort, past its
-    /// [`Segment::split`] ([`fact_spans`]).
+    /// A character of the model-and-effort segment's effort, past its [`Segment::split`] ([`fact_spans`]).
     pub tail: bool,
-    /// A character of a hidden fact's greyed stub, its value and
-    /// [`OFF_STUB`] ([`Segment::quiet`]).
+    /// A character of a hidden fact's greyed stub, its value and [`OFF_STUB`] ([`Segment::quiet`]).
     pub quiet: bool,
 }
 
 /// The facts set as a line of small type ([`set_facts`]).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SetFacts {
-    /// The cells the line takes, a whole number: the rule meets it on a cell
-    /// boundary at either end.
+    /// The cells the line takes, a whole number: the rule meets it on a cell boundary at either end.
     pub cells: usize,
     /// Every glyph, in reading order, each in a cell of its own.
     pub glyphs: Vec<SetGlyph>,
@@ -3829,24 +3126,9 @@ pub struct SetFacts {
     pub combining: Vec<(usize, Box<[char]>)>,
 }
 
-/// Set the facts as a line of type: each fact a mark, a space and its value,
-/// its letters and words [`FACT_PITCH`] apart, the facts [`GAP`] pitches apart
-/// whatever their lengths, and the line exactly as long as that, so the rule
-/// runs on up to it.
-///
-/// One character still takes one cell, so each glyph stands in a cell of its
-/// own and is moved ([`SetGlyph::nudge`]) from that cell's middle to where the
-/// line puts it. A space takes no cell, so a tighter pitch shortens the line
-/// rather than leaving slack in the gaps. The length is rounded up to a whole
-/// cell by setting the line a hair looser; glyphs that need more cells than
-/// that are set as loose as they need, every letter alike, the gaps still
-/// [`GAP`] pitches. Glyphs take the cells nearest their places, in order, with
-/// the largest move as small as it can be. Where a move would pass the nudge's
-/// reach (a word of some eighty letters) the line is set a cell looser until
-/// none does; at one cell a pitch nothing moves.
+/// Set the facts as a line of type.
 #[must_use]
 pub fn set_facts(segments: &[Segment]) -> SetFacts {
-    // Each glyph's place on the line, in pitches from its start.
     let mut glyphs: Vec<SetGlyph> = Vec::new();
     let mut place: Vec<f32> = Vec::new();
     let mut clusters = Vec::new();
@@ -3857,9 +3139,6 @@ pub fn set_facts(segments: &[Segment]) -> SetFacts {
         if i > 0 {
             line += GAP;
         }
-        // Whether a char of the segment's text (at its byte `at`) is in the
-        // effort (past the split), and part of a hidden fact's stub; the
-        // mark and the space after it are neither.
         let quiet = |tail: bool| {
             if tail {
                 segment.quiet.1
@@ -3882,9 +3161,6 @@ pub fn set_facts(segments: &[Segment]) -> SetFacts {
             let mut base = None;
             for cluster in aterm_grapheme::split_graphemes(text) {
                 if cluster.is_emoji || cluster.text.contains('\u{20e3}') {
-                    // Color glyphs keep native size and ignore Sub nudges. A
-                    // mixed run must keep native pitch too, so adjacent text
-                    // (such as an email's @) cannot slide under the emoji.
                     native_pitch |= cluster.width == 2
                         && (cluster.codepoint_count > 1
                             || cluster
@@ -3912,8 +3188,6 @@ pub fn set_facts(segments: &[Segment]) -> SetFacts {
                     base = Some(index);
                     continue;
                 }
-                // Match the native grid: a non-emoji cluster may open several
-                // cells, while its marks attach to the preceding spacing base.
                 for (at, ch) in cluster
                     .text
                     .char_indices()
@@ -3965,16 +3239,10 @@ pub fn set_facts(segments: &[Segment]) -> SetFacts {
         return SetFacts::default();
     }
     let reach = f32::from(i8::MAX) / f32::from(NUDGES_PER_CELL);
-    // A line of at most a few hundred pitches; the hair under `ceil` keeps a
-    // whole product (`25 * 0.8`) from rounding up a cell.
     let pitch = if native_pitch { 1.0 } else { FACT_PITCH };
     let mut cells = ((line * pitch - 1e-3).ceil() as usize).max(ink);
     loop {
         let pitch = cells as f32 / line;
-        // The cells before each glyph's, and the cell it would lead from if
-        // it stood centred on its place: an isotonic fit of the difference
-        // (L-infinity, the midpoint of the running max and the running min
-        // from the end) keeps them in order with the largest move least.
         let mut before = Vec::with_capacity(glyphs.len());
         let mut used = 0usize;
         for g in &glyphs {
@@ -4038,22 +3306,16 @@ pub fn set_facts(segments: &[Segment]) -> SetFacts {
 pub struct FactSpan {
     /// Which fact.
     pub kind: FactKind,
-    /// Its cells in the set run ([`SetFacts::cells`]), `start..end`: its mark
-    /// (where the fact leads its segment) through its last glyph.
+    /// Its cells in the set run ([`SetFacts::cells`]), `start..end`: its mark (where the fact leads its segment) through its last glyph.
     pub cells: (u16, u16),
-    /// The hidden facts a click on it shows again: empty for a shown fact,
-    /// the stub's own fact for a stub.
+    /// The hidden facts a click on it shows again: empty for a shown fact, the stub's own fact for a stub.
     pub restores: FactMask,
 }
 
-/// Every fact of one rule's facts, in reading order ([`fact_spans`]): at most
-/// one span each for the model, the effort, the path, the branch, the context
-/// and the usage. Fixed, so a frame keeps them with no allocation.
+/// Every fact of one rule's facts, in reading order ([`fact_spans`]).
 pub type FactSpans = [Option<FactSpan>; 6];
 
 /// The fact a glyph of segment `segment` stands for (`tail`: past its split,
-/// the effort), and what a click on it shows again; `None` for the segments
-/// that are no fact (a limit wall, the account, the upgrade note).
 fn glyph_fact(segment: &Segment, tail: bool, quiet: bool) -> Option<(FactKind, FactMask)> {
     let kind = if tail {
         FactKind::Effort
@@ -4075,12 +3337,7 @@ fn glyph_fact(segment: &Segment, tail: bool, quiet: bool) -> Option<(FactKind, F
     Some((kind, restores))
 }
 
-/// Where each fact of `segments`, as [`set_facts`] set them (`set`), lies: a
-/// mark glyph starts the next segment; a glyph past the model-and-effort
-/// segment's split is the effort, any other its segment's fact (the model,
-/// the path, the branch, the context, the usage); a mark joins its first
-/// character's fact.
-/// A limit wall, the account and the upgrade note are no fact. Pure.
+/// Where each fact of `segments`, as [`set_facts`] set them (`set`), lies: a mark glyph starts the next segment.
 #[must_use]
 pub fn fact_spans(set: &SetFacts, segments: &[Segment]) -> FactSpans {
     let mut spans: FactSpans = [None; 6];
@@ -4088,7 +3345,6 @@ pub fn fact_spans(set: &SetFacts, segments: &[Segment]) -> FactSpans {
     let mut n = 0usize;
     let mut segment: Option<&Segment> = None;
     let mut next = 0usize;
-    // A mark's lead cell, until its first character names the fact.
     let mut mark_at: Option<usize> = None;
     let cell = |at: usize| u16::try_from(at).unwrap_or(u16::MAX);
     for glyph in &set.glyphs {
@@ -4106,7 +3362,6 @@ pub fn fact_spans(set: &SetFacts, segments: &[Segment]) -> FactSpans {
         let start = mark_at.take().unwrap_or(glyph.cell);
         let end = glyph.cell + glyph.cols;
         match n.checked_sub(1).and_then(|last| spans[last].as_mut()) {
-            // The same fact goes on (one segment's run of one fact).
             Some(span) if span.kind == kind && span.restores == restores && start == glyph.cell => {
                 span.cells.1 = cell(end);
             }
@@ -4124,16 +3379,40 @@ pub fn fact_spans(set: &SetFacts, segments: &[Segment]) -> FactSpans {
     spans
 }
 
-/// The cells of the set run ([`SetFacts::cells`]) an underline under `span`'s
-/// fact takes, so that it lies under the fact's glyphs where they are drawn
-/// rather than under the cells they stand in. Each glyph has a cell of its
-/// own but is drawn its nudge from it ([`SetGlyph::nudge`]): along a word set
-/// tighter than the grid the glyphs drift off their cells, a cell or two on a
-/// long path, and come back across the gaps, so the fact's own cells
-/// (`span.cells`, the click's target) are not where its ink is. The run is
-/// every cell whose middle lies between the left edge of the fact's first
-/// glyph as drawn and the right edge of its last; empty where no glyph
-/// stands in `span`. Pure.
+/// Where the subscription/account group (`⎆`, `◇`, `◷`) of `segments`, as
+/// [`set_facts`] set them (`set`), lies (`start..end` in [`SetFacts::cells`]).
+/// `None` when none of those segments is in `segments`. Pure.
+#[must_use]
+pub fn account_span(set: &SetFacts, segments: &[Segment]) -> Option<(u16, u16)> {
+    let mut segment: Option<&Segment> = None;
+    let mut next = 0usize;
+    let mut mark_at: Option<usize> = None;
+    let mut span: Option<(u16, u16)> = None;
+    let cell = |at: usize| u16::try_from(at).unwrap_or(u16::MAX);
+    for glyph in &set.glyphs {
+        if glyph.mark {
+            segment = segments.get(next);
+            next += 1;
+            mark_at = Some(glyph.cell);
+            continue;
+        }
+        let is_acct =
+            segment.is_some_and(|s| matches!(s.mark, ACCOUNT_MARK | PLAN_MARK | WEEKLY_MARK));
+        if !is_acct {
+            mark_at = None;
+            continue;
+        }
+        let start = mark_at.take().unwrap_or(glyph.cell);
+        let end = glyph.cell + glyph.cols;
+        span = Some(match span {
+            Some((s, _)) => (s, cell(end)),
+            None => (cell(start), cell(end)),
+        });
+    }
+    span
+}
+
+/// The cells of the set run ([`SetFacts::cells`]) an underline under `span`'s fact takes, so that it lies under the fact's glyphs where they are drawn rather than under the cells they stand in.
 #[must_use]
 pub fn drawn_cells(set: &SetFacts, span: &FactSpan) -> std::ops::Range<usize> {
     let n = isize::from(NUDGES_PER_CELL);
@@ -4147,7 +3426,6 @@ pub fn drawn_cells(set: &SetFacts, span: &FactSpan) -> std::ops::Range<usize> {
     let Some((left, right)) = edges else {
         return 0..0;
     };
-    // The first cell whose middle (`c * n + n / 2`) is at or past `edge`.
     let first = |edge: isize| {
         (edge - n / 2 + n - 1)
             .div_euclid(n)
@@ -4156,9 +3434,7 @@ pub fn drawn_cells(set: &SetFacts, span: &FactSpan) -> std::ops::Range<usize> {
     first(left)..first(right)
 }
 
-/// The run of the composer's bottom rule aterm may write into: the widest run
-/// of `coverable` cells (plain rule glyphs in the rule's colours), rightmost of
-/// equals. Other ink bounds the run. `None` when the row has no rule glyph.
+/// The run of the composer's bottom rule aterm may write into.
 #[must_use]
 pub fn rule_run(coverable: &[bool]) -> Option<std::ops::Range<usize>> {
     let mut best: Option<std::ops::Range<usize>> = None;
@@ -4179,44 +3455,27 @@ pub fn rule_run(coverable: &[bool]) -> Option<std::ops::Range<usize>> {
     best
 }
 
-/// The cells of `run` ([`rule_run`]) aterm's text may take: all but
-/// [`RULE_LEAD`] glyphs at the left and one glyph at the right.
+/// The cells of `run` ([`rule_run`]) aterm's text may take: all but [`RULE_LEAD`] glyphs at the left and one glyph at the right.
 #[must_use]
 pub fn rule_room(run: &std::ops::Range<usize>) -> usize {
     run.len().saturating_sub(RULE_LEAD + 1)
 }
 
-/// How many leaner forms a light's title may have between its whole and its
-/// short form ([`LightsWidth::lean`], [`TitleFit::Lean`]): Autopilot's
-/// without its trail, v1's words, its phrase with both clicks, and its phrase
-/// with the click alone (design `docs/DESIGN-harness-autopilot-2026-10-15.md`
-/// §9.2.1).
+/// How many leaner forms a light's title may have between its whole and its short form ([`LightsWidth::lean`], [`TitleFit::Lean`]).
 pub const LEAN_FORMS: usize = 4;
 
-/// The widths of the lights' block (`claude_lights`): chips, whole, leaner and
-/// short titles (each including its two-cell gap), and whether the title is a
-/// reason. A title with no short form (`short` 0: the act ticker's label, `✓
-/// approved`) is drawn whole or not at all, beside the facts as they fit
-/// without it ([`fit_rule`]).
+/// The widths of the lights' block (`claude_lights`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LightsWidth {
     /// The chips, one blank apart.
     pub chips: usize,
     /// `Light: what  `.
     pub title: usize,
-    /// The whole title with parts given up, widest first, each still more
-    /// than the short form (0: no such form): Autopilot's without its trail of
-    /// acts, then without its menu's line too — v1's words (design
-    /// `docs/DESIGN-harness-autopilot-2026-10-15.md` §9.2.1), so a rule where
-    /// v1's whole title fit still shows it — then without its explanation but
-    /// with both clicks, then with the click alone, so a rule too narrow to
-    /// explain a face still says what the chip does ([`LEAN_FORMS`]).
+    /// The whole title with parts given up, widest first, each still more than the short form (0: no such form).
     pub lean: [usize; LEAN_FORMS],
     /// `what  `.
     pub short: usize,
-    /// The title says why (a stopped mode return, a refusal, a switch note)
-    /// rather than what the pointer or selection shows; it outranks the branch
-    /// and the path ([`fit_rule`]).
+    /// The title says why (a stopped mode return, a refusal, a switch note) rather than what the pointer or selection shows.
     pub reason: bool,
 }
 
@@ -4253,8 +3512,6 @@ impl RuleFit {
 }
 
 /// The fewest cells a rule of `segments`, `title` and (with `chips`) the lights
-/// takes: ` <chips>  <title> `, [`RULE_SEP`] glyphs, ` <facts> `. Lights stand
-/// at the left end, facts at the right.
 fn rule_width(
     segments: &[Segment],
     title: TitleFit,
@@ -4282,22 +3539,6 @@ fn rule_width(
 }
 
 /// The facts as a narrow rule gives them up: a hidden fact's stub first
-/// ([`OFF_STUB`]: the whole facts with their stubs, then without them), then
-/// the usage (its total narrowed to its runtime alone, `Σ 7h52m`, then gone),
-/// then the path cut to `…/<dir>`, the branch, the path, the effort and the
-/// model, a limit wall standing alone last. The account
-/// ([`FooterFacts::account`]) stands whole beside whatever fits without it,
-/// or not at all (a clipped label would name another account): it takes only
-/// the tokens' room. A rule too narrow for the wall gives up the wall, not
-/// everything behind it: the same rungs follow without it, so a narrow pane
-/// keeps the model it showed before the limit (Claude's own screen carries
-/// the notice), and the model alone is the last rung ([`model_alone`]). Never
-/// empty: the whole facts are the first rung.
-///
-/// A live upgrade waiting on the person here ([`FooterFacts::upgrade`]) gives
-/// way as a light's reason does ([`fit_rule`]): whole beside the whole facts,
-/// then short, taking the tokens', account's, branch's and path's room (never
-/// the effort's, the model's or a wall's), then gone.
 fn facts_ladder(facts: &FooterFacts) -> Vec<Vec<Segment>> {
     let plain = plain_ladder(facts);
     let Some(note) = &facts.upgrade else {
@@ -4321,7 +3562,6 @@ fn facts_ladder(facts: &FooterFacts) -> Vec<Vec<Segment>> {
 }
 
 /// What a reason never takes the room of ([`fit_rule`]): a standing limit
-/// and subscription identity/quota, or model and effort without a subscription.
 fn top_of(rung: &[Segment]) -> impl Iterator<Item = &Segment> {
     let subscription = rung.iter().any(|s| s.mark == WEEKLY_MARK);
     rung.iter().filter(move |s| {
@@ -4332,7 +3572,6 @@ fn top_of(rung: &[Segment]) -> impl Iterator<Item = &Segment> {
 }
 
 /// Whether rungs `a` and `b` show the same [`top_of`], a hidden fact's stub
-/// aside ([`Segment::shown_part`]): a stub gives way before a reason does.
 fn same_top(a: &[Segment], b: &[Segment]) -> bool {
     let shown = |rung| {
         top_of(rung)
@@ -4343,8 +3582,6 @@ fn same_top(a: &[Segment], b: &[Segment]) -> bool {
 }
 
 /// [`facts_ladder`] of the facts alone, with no upgrade note: the whole facts
-/// with their stubs, then today's rungs of the facts without them
-/// ([`bare_ladder`]).
 fn plain_ladder(facts: &FooterFacts) -> Vec<Vec<Segment>> {
     let mut out = vec![fact_segments(facts, true)];
     for rung in bare_ladder(facts) {
@@ -4356,7 +3593,6 @@ fn plain_ladder(facts: &FooterFacts) -> Vec<Vec<Segment>> {
 }
 
 /// [`plain_ladder`] without a hidden fact's stub: a hidden fact is left out
-/// of every rung.
 fn bare_ladder(facts: &FooterFacts) -> Vec<Vec<Segment>> {
     if facts.subscription.is_some() {
         return subscription_ladder(facts);
@@ -4377,7 +3613,6 @@ fn bare_ladder(facts: &FooterFacts) -> Vec<Vec<Segment>> {
         .and_then(elide_path)
         .map(|text| Segment::plain(PATH_MARK, text));
     let model = model_alone(facts);
-    // The `Σ` segment narrows to the runtime alone before it goes.
     let runtime: Option<Vec<Segment>> = facts
         .usage
         .as_ref()
@@ -4392,8 +3627,6 @@ fn bare_ladder(facts: &FooterFacts) -> Vec<Vec<Segment>> {
                 .chain(std::iter::once(Segment::plain(USAGE_MARK, text)))
                 .collect()
         });
-    // Where the account does not fit, the rule with no account: the whole
-    // facts and their runtime form without it. None with no account.
     let mut unnamed: Vec<Vec<Segment>> = [Some(&whole), runtime.as_ref()]
         .into_iter()
         .flatten()
@@ -4443,7 +3676,6 @@ fn bare_ladder(facts: &FooterFacts) -> Vec<Vec<Segment>> {
             Some((model.as_ref(), None, None)),
         ];
         for (model, path, branch) in steps.into_iter().flatten() {
-            // Where the account does not fit beside the whole path, the
             // tokens come back without it. With no account this pushes nothing.
             if account.is_some() {
                 push(rung(true, model, path, branch));
@@ -4459,8 +3691,6 @@ fn bare_ladder(facts: &FooterFacts) -> Vec<Vec<Segment>> {
 }
 
 /// The explicit subscription display keeps identity and weekly quota after secondary
-/// workspace and usage details have given way. The native footer without this display
-/// keeps its established ladder above.
 fn subscription_ladder(facts: &FooterFacts) -> Vec<Vec<Segment>> {
     let mut rung = fact_segments(facts, false);
     let mut out = vec![rung.clone()];
@@ -4477,15 +3707,12 @@ fn subscription_ladder(facts: &FooterFacts) -> Vec<Vec<Segment>> {
             out.push(rung.clone());
         }
     }
-    // Keep both essentials on small panes, shortening the email before the quota.
     for limit in [24, 18, 12, 8] {
         let mut short = rung.clone();
         if shorten_subscription_account(&mut short, limit) && out.last() != Some(&short) {
             out.push(short);
         }
     }
-    // A standing limit is actionable. Keep it beside the controls even when
-    // identity and weekly quota no longer fit; only an overlong wall yields.
     if let Some(wall) = rung.iter().find(|s| s.mark == WALL_MARK).cloned() {
         out.push(vec![wall]);
         let mut without_wall = facts.clone();
@@ -4498,7 +3725,6 @@ fn subscription_ladder(facts: &FooterFacts) -> Vec<Vec<Segment>> {
 }
 
 /// Shorten by display columns, so an international account does not reserve
-/// twice the intended room when the control block is built.
 fn shorten_subscription_account(segments: &mut [Segment], limit: usize) -> bool {
     let Some(account) = segments.iter_mut().find(|s| s.mark == ACCOUNT_MARK) else {
         return false;
@@ -4515,7 +3741,6 @@ fn shorten_subscription_account(segments: &mut [Segment], limit: usize) -> bool 
 }
 
 /// The account/quota pair that controls must leave room for. A limit wall
-/// retains priority when a pane cannot hold it and the pair together.
 fn subscription_reservation(facts: &FooterFacts, room: usize) -> usize {
     let segments = fact_segments(facts, false);
     let wall = segments.iter().find(|s| s.mark == WALL_MARK).cloned();
@@ -4529,43 +3754,11 @@ fn subscription_reservation(facts: &FooterFacts, room: usize) -> usize {
         .into_iter()
         .filter(|segments| !segments.is_empty())
         .map(|segments| rule_width(segments, TitleFit::None, false, None))
-        // Leave at least one control glyph with its two surrounding blanks.
         .find(|width| width + RULE_SEP + 3 <= room)
         .unwrap_or(0)
 }
 
 /// What of the facts and lights fits `room` cells of the rule ([`rule_room`]).
-/// Order of giving way:
-///
-/// * a transient title (what the pointer, the keyboard selection or a toggle
-///   in flight shows) goes first, whole, then each of its leaner forms
-///   ([`LightsWidth::lean`]), then short, then gone, so the facts stay whole
-///   at 80 columns while a light is hovered; a transient title
-///   with NO short form — the act ticker's label beside the Autopilot chip
-///   (design `docs/DESIGN-harness-autopilot-2026-10-15.md` §9.2.1), whose
-///   lone glyph would read as a stray mark — is drawn whole or not at all.
-///   Either is laid beside the facts AS THEY FIT WITHOUT IT: never the cause
-///   of a fact giving way, but where the facts already fell for want of room
-///   (a split pane's long path cut to `…/<dir>`), the room they leave is the
-///   title's (design §9.2.7);
-/// * a light's reason ([`LightsWidth::reason`]: where a mode return stopped, a
-///   refusal) goes whole, then, short, takes the tokens', account's, branch's
-///   and path's room (never the effort's, the model's or a limit wall's); a
-///   reason too long even beside the model and effort goes, and the facts come
-///   back. With an explicit subscription display, identity and weekly quota
-///   replace model and effort in that protected set, so a reason can take the
-///   model's room while the account, weekly quota and limit wall stay visible;
-/// * a live upgrade's note ([`FooterFacts::upgrade`]) gives way the same way
-///   ([`facts_ladder`]), and yields to a light's reason where the two do not
-///   fit together;
-/// * then the facts give way ([`facts_ladder`]), then the chips, and the model
-///   goes last without a subscription display. A subscription reserves identity
-///   and weekly quota ahead of the model; controls and a standing limit remain
-///   available when a pane cannot hold all three.
-///
-/// Chips stand at the left end after [`RULE_LEAD`], the title right of them,
-/// facts right-aligned, so chips never move. Tries are measured in place and
-/// only the fitting one is copied out.
 #[must_use]
 pub fn fit_rule(facts: &FooterFacts, room: usize, lights: Option<LightsWidth>) -> RuleFit {
     let ladder = facts_ladder(facts);
@@ -4573,11 +3766,6 @@ pub fn fit_rule(facts: &FooterFacts, room: usize, lights: Option<LightsWidth>) -
     let chips = lights.is_some();
     let reason = lights.is_some_and(|l| l.reason);
     let whole = ladder[0].as_slice();
-    // The facts as they fit with no title: the rung a transient title is laid
-    // beside. A title never makes a fact give way, but the room the facts
-    // leave is its own however far they fell for want of room — a split
-    // pane's long working directory cut to `…/<dir>` leaves most of the rule
-    // free (design §9.2.7).
     let alone = ladder
         .iter()
         .map(Vec::as_slice)
@@ -4606,10 +3794,7 @@ pub fn fit_rule(facts: &FooterFacts, room: usize, lights: Option<LightsWidth>) -
     let bare = ladder
         .iter()
         .map(|rung| (rung.as_slice(), TitleFit::None, chips));
-    // Then the model without the chips, and chips narrower than the model
-    // still drawn where the model cannot be.
     let last = if facts.subscription.is_some() {
-        // The chip budget reserved the subscription essentials where possible.
         // If the pane is narrower still, keep its active controls before a model.
         [(&[][..], true), (model.as_slice(), false)]
     } else {
@@ -4631,10 +3816,7 @@ pub fn fit_rule(facts: &FooterFacts, room: usize, lights: Option<LightsWidth>) -
     }
 }
 
-/// The most cells the chips may take in a rule of `room` cells: what remains
-/// beside subscription identity and weekly quota, or the model alone without
-/// a subscription display. A standing limit retains priority. The lights' block
-/// is built to it and the keyboard selects only chips that fit.
+/// The most cells the chips may take in a rule of `room` cells.
 #[must_use]
 pub fn chips_room(facts: &FooterFacts, room: usize) -> usize {
     let reserved = if facts.subscription.is_some() {
@@ -4650,13 +3832,7 @@ pub fn chips_room(facts: &FooterFacts, room: usize) -> usize {
     room.saturating_sub(beside + 2)
 }
 
-/// Where Claude Code's top-effort tag ([`CLAUDE_TOP_EFFORT_KEY`]) stands in the
-/// composer's TOP rule `row` (`──── <key> ─`, right-aligned the way it writes
-/// its labels): the char columns `start..end` of the key as a whole token in
-/// the rule's trailing ` <labels> ─` zone, after its last run of two or more
-/// `─`, labels split on two spaces and words on one. `None` for a row that is
-/// no rule ([`aterm_phase::phase::is_rule`]), a rule with no labels, or labels
-/// that do not hold the key alone (a path ending in it is not it).
+/// Where Claude Code's top-effort tag ([`CLAUDE_TOP_EFFORT_KEY`]) stands in the composer's TOP rule `row` (`──── <key> ─`, right-aligned the way it writes its labels).
 #[must_use]
 pub fn top_rule_tag(row: &str) -> Option<(usize, usize)> {
     if !aterm_phase::phase::is_rule(row) {
@@ -4664,11 +3840,9 @@ pub fn top_rule_tag(row: &str) -> Option<(usize, usize)> {
     }
     let chars: Vec<char> = row.trim_end().chars().collect();
     let n = chars.len();
-    // ` <labels> ─`: the rule's last glyph alone after a blank.
     if n < 4 || chars[n - 1] != '\u{2500}' || chars[n - 2] != ' ' {
         return None;
     }
-    // Just past the last run of two or more `─` before it.
     let zone = (1..n - 2)
         .rev()
         .find(|&i| chars[i] == '\u{2500}' && chars[i - 1] == '\u{2500}')?
@@ -4692,8 +3866,7 @@ pub fn top_rule_tag(row: &str) -> Option<(usize, usize)> {
     None
 }
 
-/// What Claude Code answered an `/effort <key> on|off` with on the screen
-/// ([`top_effort_answer`]).
+/// What Claude Code answered an `/effort <key> on|off` with on the screen ([`top_effort_answer`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum TopAnswer {
     /// `<Key> on (this session only): …`.
@@ -4707,14 +3880,9 @@ pub enum TopAnswer {
 }
 
 /// How many rows an answer [`top_effort_answer`] reads may take: its `⎿`
-/// row and the rows it wraps onto (MEASURED on 2.1.304: the refusal wraps to
-/// six rows at 26 columns).
 const TOP_ANSWER_ROWS: usize = 8;
 
-/// What Claude Code answered an `/effort <key> on|off` with
-/// ([`top_effort_reply`]): the answer, and the model it names where it names
-/// one (`<Key> isn't available on claude-sonnet-4-5. …` names the model's ID,
-/// MEASURED on 2.1.304).
+/// What Claude Code answered an `/effort <key> on|off` with ([`top_effort_reply`]).
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct TopReply {
     pub answer: TopAnswer,
@@ -4722,37 +3890,21 @@ pub struct TopReply {
 }
 
 /// Claude Code's transient level hint, right-aligned above the composer's
-/// top rule a moment after an `/effort` (`◐ medium · /effort`, `◐ medium ·
-/// <key> · /effort`; MEASURED on 2.1.304): no answer's row.
 fn is_effort_hint(text: &str) -> bool {
     text.ends_with(aterm_phase::anchor("effort.hint_tail"))
 }
 
-/// The answer to an `/effort <key> on|off` that the screen `rows` show above
-/// the composer's top rule (row `top_rule`) — [`top_effort_reply`]'s answer.
-/// Pure.
+/// The answer to an `/effort <key> on|off` that the screen `rows` show above the composer's top rule (row `top_rule`).
 #[must_use]
 pub fn top_effort_answer(rows: &[String], top_rule: usize) -> Option<TopAnswer> {
     top_effort_reply(rows, top_rule).map(|reply| reply.answer)
 }
 
-/// The answer to an `/effort <key> on|off` that the screen `rows` show above
-/// the composer's top rule (row `top_rule`): the NEWEST `⎿` result block
-/// over the rule — past the blank rows the fullscreen renderer leaves between
-/// a short transcript and the composer and past the transient level hint
-/// ([`is_effort_hint`]) — its `⎿` row and the rows it wraps onto (at most
-/// [`TOP_ANSWER_ROWS`] in all) joined back with a blank, so an anchor a
-/// narrow pane broke across rows is read whole (MEASURED on 2.1.304: at 26
-/// and 34 columns ` on (this session only): ` and ` needs dynamic workflows
-/// enabled` break, the gutter after `⎿` one blank; at 80 columns `. Effort
-/// stays ` does). Reading stops at a `❯` row — a person's echo, under which
-/// an older answer is not this one's — a message, a status row or a blank
-/// row inside the block. Pure.
+/// The answer to an `/effort <key> on|off` that the screen `rows` show above the composer's top rule (row `top_rule`).
 #[must_use]
 pub fn top_effort_reply(rows: &[String], top_rule: usize) -> Option<TopReply> {
     use aterm_phase::anchor;
     let top_rule = top_rule.min(rows.len());
-    // Up from the rule over the blank rows and the level hint.
     let mut end = top_rule;
     while end > 0 {
         let text = rows[end - 1].trim();
@@ -4770,7 +3922,6 @@ pub fn top_effort_reply(rows: &[String], top_rule: usize) -> Option<TopReply> {
         text.starts_with('\u{23BF}').then_some(Some(i))
     })??;
     let head = rows[at].trim_start().strip_prefix('\u{23BF}')?;
-    // The answer's text, the rows it wraps onto joined back with a blank.
     let mut body = head.trim().to_owned();
     for more in &rows[at + 1..end] {
         body.push(' ');
@@ -4785,7 +3936,6 @@ pub fn top_effort_reply(rows: &[String], top_rule: usize) -> Option<TopReply> {
         TopAnswer::NeedsWorkflows
     } else {
         let named = rest.strip_prefix(anchor("effort.top_unavailable"))?;
-        // The model's ID, up to the sentence's end.
         let id = named.split_whitespace().next().unwrap_or("");
         let id = id.strip_suffix('.').unwrap_or(id);
         return Some(TopReply {
@@ -4799,11 +3949,7 @@ pub fn top_effort_reply(rows: &[String], top_rule: usize) -> Option<TopReply> {
     })
 }
 
-/// The environment actions of `ClaudeFooterModel`
-/// (`aterm_models_harness::claude_footer_model_model`): everything but `Read` is
-/// Claude Code's or a person's, and is waived here; `Read` is bound where the
-/// reader runs. The Tier-1 bind (`tests/conformance_footer_model.rs`) performs
-/// each on disk. Proof and test builds only.
+/// The environment actions of `ClaudeFooterModel` (`aterm_models_harness::claude_footer_model_model`).
 #[cfg(any(test, debug_assertions))]
 #[cfg_attr(
     any(test, debug_assertions),

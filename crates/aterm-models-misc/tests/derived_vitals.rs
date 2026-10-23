@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-use aterm_models_misc::{scope_balance_model, stuck_verdict_liveness, stuck_verdict_model};
+use aterm_models_misc::{
+    explain_honesty_model, scope_balance_model, stuck_verdict_liveness, stuck_verdict_model,
+};
 use aterm_spec::{interp, verify};
 
 /// THE STUCK VERDICT (`docs/DESIGN-system-awareness-2026-10-16.md` §17): it holds with no mutant
@@ -118,5 +120,68 @@ fn the_scope_balance_holds_and_each_law_has_its_own_mutant() {
     assert_eq!(
         (s["moved"], s["others"], s["tab"], s["rest"], s["residual"]),
         (1, 0, 2, 0, -1)
+    );
+}
+
+/// THE EXPLANATION'S HONESTY (`docs/DESIGN-resource-details-2026-10-20.md` §17): it holds with no
+/// mutant on, each `Buggy` value breaks exactly its own law, and the Deck's clause shows on the
+/// third 5 s tick its candidate holds (10 s) and goes on the seventh it fails (30 s). Tier-1
+/// against the real engine is `aterm-vitals`' `conformance_explain`.
+#[test]
+fn the_explanations_honesty_holds_and_each_law_has_its_own_mutant() {
+    let model = explain_honesty_model();
+    assert_eq!(
+        verify::sweep_faults(std::slice::from_ref(&model)),
+        Vec::<String>::new()
+    );
+    verify::prove_and_catch_scalar(&model, "explain honesty");
+
+    for (dial, law) in [
+        (1, "CauseOnlyWithEvidence"),
+        (2, "ClaimNeverVouches"),
+        (3, "StartIsEarliestBirth"),
+        (4, "ContextOnlyWhereItHolds"),
+        (5, "ContextOnlyWhereItHolds"),
+        (6, "CauseNeedsFloor"),
+        (7, "RoleNeedsBound"),
+        (8, "UnknownNeverZero"),
+        (9, "ClauseNeverFlickers"),
+    ] {
+        let broken = interp::violated_invariants(&interp::with_buggy(&model, dial));
+        assert_eq!(
+            broken.into_iter().collect::<Vec<_>>(),
+            [law],
+            "Buggy {dial}"
+        );
+    }
+
+    let mut s = model.init_state();
+    for (tick, clause) in [("Hold", 0), ("Hold", 0), ("Hold", 1)] {
+        assert!(model.fire(tick, &mut s), "{tick}");
+        assert_eq!(s["clause"], clause);
+        assert!(model.check_invariant("ClauseNeverFlickers", &s));
+    }
+    for k in 1..=7 {
+        assert!(model.fire("Fail", &mut s));
+        assert_eq!(s["clause"], i64::from(k < 7), "failing tick {k}");
+        assert!(model.check_invariant("ClauseNeverFlickers", &s));
+    }
+
+    // The init state is the 10:32 moment: Spotlight, after start-up; the
+    // caller's tab minor, its work under the floor.
+    let mut s = model.init_state();
+    for action in ["Detect", "Attach"] {
+        assert!(model.fire(action, &mut s), "{action}");
+    }
+    assert_eq!(
+        (
+            s["shown"],
+            s["tabshown"],
+            s["actstart"],
+            s["tabstart"],
+            s["role"],
+            s["start"]
+        ),
+        (1, 0, 1, 0, 1, 0)
     );
 }

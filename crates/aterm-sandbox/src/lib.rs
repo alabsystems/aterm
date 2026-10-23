@@ -1,24 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-// The anchor attributes are `macro_rules!` ones where Cargo resolved no proc macro
-// under them (crates/aterm-spec-anchor/anchor_rules.rs).
 #![cfg_attr(all(anchor_rules, any(test, debug_assertions)), feature(macro_attr))]
 
-//! Resource sandbox for spawned children.
-//!
-//! Confines the child `$SHELL` with POSIX `setrlimit` bounds, applied in the
-//! child after `fork` and before `exec` so the shell and everything it runs
-//! inherit them. [`Limits::apply`] requires a [`Cap<Sandbox>`] from `aterm-cap`,
-//! whose root mint is sealed behind its `launcher-mint` feature.
-//!
-//! Resource limits only: filesystem/network scoping is `aterm-containment`'s
-//! Seatbelt lane.
-//!
-//! The cap gate and [`Limits`] are shared; the actuator is per-platform.
-//! `src/unix.rs` is the `setrlimit` loop. On Windows [`Limits::apply`] is a
-//! cap-gated no-op and `Limits::apply_to_job` is the Job Object lane, which
-//! `aterm-pty`'s ConPTY seam calls on the suspended child's job.
+//! Resource sandbox for spawned children ([`Limits`], [`Limits::apply`], [`Cap<Sandbox>`]).
 
 use std::io;
 
@@ -31,13 +16,10 @@ mod imp;
 #[path = "windows.rs"]
 mod imp;
 
-/// The effect a capability authorizes here: installing a resource sandbox.
+/// The effect a capability authorizes here.
 pub enum Sandbox {}
 
-/// Resource limits to apply; `None` leaves a limit unchanged. On POSIX each
-/// value is installed as the soft limit, and as the hard limit too when
-/// [`Limits::binding`] is set (`set_limit` in the unix actuator). On Windows
-/// `apply` installs nothing; `Limits::apply_to_job` is the Windows lane.
+/// Resource limits to apply.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Limits {
     /// CPU seconds (`RLIMIT_CPU`).
@@ -48,70 +30,36 @@ pub struct Limits {
     pub file_size: Option<u64>,
     /// Max open file descriptors (`RLIMIT_NOFILE`).
     pub open_files: Option<u64>,
-    /// Max concurrently-active processes in the sandbox Job Object (Windows
-    /// `ActiveProcessLimit`): a fork-bomb bound on the child and its
-    /// descendants. Windows only; inert on POSIX, which has no per-job class.
+    /// Max concurrently-active processes in the sandbox Job Object (Windows `ActiveProcessLimit`).
     pub active_processes: Option<u32>,
-    /// Windows only: install Job Object UI restrictions (clipboard, desktop
-    /// switch, display / system parameters, global atoms, `ExitWindows`) so a
-    /// hostile child cannot act through the shared window station. `false`
-    /// (the daily-driver default) leaves UI access unrestricted.
+    /// Windows only: install Job Object UI restrictions.
     pub restrict_ui: bool,
-    /// POSIX: whether each value also becomes the hard limit, so the program
-    /// cannot raise it back (an unprivileged process can lower its hard limit
-    /// but never raise it). `false` keeps the inherited hard ceiling, so a soft
-    /// limit stays a guardrail the `$SHELL`'s rc can raise (`ulimit -n 65536`).
-    /// Windows ignores it: a Job Object limit binds the child already.
+    /// POSIX: whether each value also becomes the hard limit, so the program cannot raise it back.
     pub binding: bool,
 }
 
 impl Limits {
-    /// The Safety-mode set for an interactive shell: caps fds, address space
-    /// (not on macOS) and, on Windows, active processes and UI access; CPU and
-    /// file size stay unbounded (a shell legitimately runs long and writes large
-    /// files).
-    ///
-    /// On POSIX these are soft limits under the inherited hard ceiling: a
-    /// guardrail against a runaway program that the program or shell rc can
-    /// raise (`ulimit -n 10240` or `65536`) without `ulimit` errors at shell
-    /// startup. A per-process ceiling would not bound a program that forks
-    /// anyway (POSIX has no process cap here). The hostile mode's set is
-    /// [`Self::contained`]. On Windows the Job Object binds them.
+    /// The Safety-mode set for an interactive shell.
     #[must_use]
-    // #[inline] so the MIR crosses the crate boundary and callers' Trust gates
-    // (aterm-pty) verify this body instead of assuming an absent callee.
     #[inline]
     pub const fn shell_default() -> Self {
         Limits {
             cpu_seconds: None,
-            // macOS refuses (`EINVAL`) any `RLIMIT_AS` below the process's
-            // current mapped size (~415 GiB on arm64 before running user code),
-            // so a 16 GiB cap cannot be expressed there and a value large
-            // enough to be accepted bounds nothing real.
             address_space: if cfg!(target_os = "macos") {
                 None
             } else {
-                Some(16 * 1024 * 1024 * 1024) // 16 GiB
+                // 16 GiB
+                Some(16 * 1024 * 1024 * 1024)
             },
             file_size: None,
             open_files: Some(8192),
-            // Enough for a parallel build, low enough to stop a fork bomb.
             active_processes: Some(512),
-            // Hardened modes confine an untrusted shell: lock its window-station
-            // access.
             restrict_ui: true,
             binding: false,
         }
     }
 
-    /// The Containment-mode set: [`Self::shell_default`]'s values, installed
-    /// as hard limits too, so a hostile contained program cannot raise them
-    /// back with `ulimit -n`.
-    ///
-    /// What binds on POSIX is per process: there is no process cap here, so a
-    /// program that forks holds 8192 descriptors in each child, and a shell rc
-    /// that tries to raise the descriptor limit past 8192 is refused and keeps
-    /// 8192.
+    /// The Containment-mode set.
     #[must_use]
     #[inline]
     pub const fn contained() -> Self {
@@ -121,12 +69,7 @@ impl Limits {
         }
     }
 
-    /// The daily-driver limits (User mode): every limit `None`, so the shell
-    /// inherits the login shell's `rlimit`s unchanged. No `RLIMIT_AS` in
-    /// particular: it caps virtual address space, which CUDA/ML runtimes, the JVM,
-    /// Go and the sanitizers reserve far beyond resident use, so any finite cap
-    /// breaks real programs while bounding nothing. This mode confines through
-    /// the capability gate; [`Self::shell_default`] is the hardened opt-in.
+    /// The daily-driver limits (User mode).
     #[inline]
     #[must_use]
     pub const fn inherit() -> Self {
@@ -141,29 +84,10 @@ impl Limits {
         }
     }
 
-    /// Apply these limits to the current process. Call in the child, after
-    /// `fork`, before `exec`. Requires a `Trusted`+ [`Cap<Sandbox>`].
-    ///
-    /// The cap gate hard-fails; the `setrlimit` calls are best-effort: every
-    /// limit is attempted, so one the OS refuses (a 16 GiB `RLIMIT_AS` on macOS)
-    /// cannot keep the others from installing, and the first error is returned
-    /// after all were tried.
-    ///
-    /// An `Err` means confinement did not fully install and the caller must fail
-    /// closed: `aterm-pty`'s child `_exit(126)`s before `execve`.
+    /// Apply these limits to the current process.
     ///
     /// # Errors
-    /// `PermissionDenied` if the capability tier is too low; otherwise the first
-    /// `setrlimit` OS error encountered (after attempting every limit).
-    ///
-    /// SPEC: the `Apply` action of `aterm_models_core::sandbox_model` (`Sandbox`). Its `AllSupportedApplied` invariant (every
-    /// requested limit the OS supports is installed) is what the best-effort loop
-    /// guarantees. No Tier-1 binding: the loop runs post-fork and may not
-    /// allocate; `unsupported_limit_does_not_block_the_working_ones` reads the
-    /// limit back instead.
-    // PROJECTION: the L2 obligation needs only the projection name (Trust does
-    // not execute it) onto the model's `<<applied, done>>` in the host's
-    // configuration `<<Req, Sup>>`.
+    /// `PermissionDenied` if the capability tier is too low.
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -178,20 +102,10 @@ impl Limits {
         imp::apply_limits(self)
     }
 
-    /// Apply these limits to the Job Object of a still-suspended ConPTY child, so
-    /// the kernel enforces them on it and its descendants: the Windows analog of
-    /// [`Self::apply`] (Windows has no pre-exec `fork` seam). Requires a
-    /// `Trusted`+ [`Cap<Sandbox>`].
-    ///
-    /// Query-modify-write: `LimitFlags` already on the job (`KILL_ON_JOB_CLOSE`)
-    /// are kept. Memory, CPU time, the active-process cap and
-    /// [`Limits::restrict_ui`] are enforced; `open_files` / `file_size` have no
-    /// Job Object analog.
+    /// Apply these limits to the Job Object of a still-suspended ConPTY child.
     ///
     /// # Errors
-    /// `PermissionDenied` if the capability tier is too low; otherwise the first
-    /// Job Object OS error; the caller must fail closed (terminate the
-    /// never-resumed child).
+    /// `PermissionDenied` if the capability tier is too low.
     #[cfg(windows)]
     pub fn apply_to_job(
         &self,
@@ -215,8 +129,7 @@ impl Limits {
             && !self.restrict_ui
     }
 
-    /// Combine two [`Limits`] policies by taking the stricter (smaller) bound
-    /// for each resource and the boolean OR of `restrict_ui` and `binding`.
+    /// Combine two [`Limits`] policies by taking the stricter (smaller) bound for each resource.
     #[inline]
     #[must_use]
     pub const fn merge_stricter(self, other: Self) -> Self {
@@ -247,16 +160,7 @@ impl Limits {
         }
     }
 
-    /// Encode this [`Limits`] policy into a canonical 38-byte little-endian
-    /// wire frame:
-    /// - byte `0`: presence bitmask (`bit 0 = cpu_seconds`, `bit 1 = address_space`,
-    ///   `bit 2 = file_size`, `bit 3 = open_files`, `bit 4 = active_processes`)
-    /// - byte `1`: flags (`bit 0 = restrict_ui`, `bit 1 = binding`)
-    /// - bytes `2..10`: `cpu_seconds` (`0` when absent)
-    /// - bytes `10..18`: `address_space` (`0` when absent)
-    /// - bytes `18..26`: `file_size` (`0` when absent)
-    /// - bytes `26..34`: `open_files` (`0` when absent)
-    /// - bytes `34..38`: `active_processes` (`0` when absent)
+    /// Encode this [`Limits`] policy into a canonical 38-byte little-endian wire frame.
     #[inline]
     #[must_use]
     pub const fn encode_wire_le(&self) -> [u8; 38] {
@@ -309,9 +213,7 @@ impl Limits {
         ]
     }
 
-    /// Decode a canonical 38-byte little-endian [`Limits`] wire frame,
-    /// rejecting unknown mask/flag bits or non-zero payload fields when the
-    /// corresponding presence bit is clear.
+    /// Decode a canonical 38-byte little-endian [`Limits`] wire frame.
     #[inline]
     #[must_use]
     pub const fn decode_wire_le(wire: &[u8; 38]) -> Option<Self> {
@@ -389,12 +291,10 @@ mod tests {
     use imp::{RlimitResource, set_limit};
 
     /// `RLIMIT_*` is process-wide and the tests run concurrently in one process,
-    /// so tests that mutate NOFILE would see each other's read-backs.
     #[cfg(unix)]
     static NOFILE_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// Serialize a NOFILE-mutating test. Poison is ignored deliberately: one test
-    /// panicking must not cascade into unrelated failures in the others.
     #[cfg(unix)]
     fn nofile_guard() -> std::sync::MutexGuard<'static, ()> {
         NOFILE_TESTS.lock().unwrap_or_else(|e| e.into_inner())
@@ -407,7 +307,7 @@ mod tests {
             rlim_cur: 0,
             rlim_max: 0,
         };
-        // SAFETY: valid resource id + out-param.
+        // SAFETY: Valid resource id + out-param.
         let rc = unsafe { libc::getrlimit(resource, &mut lim) };
         assert_eq!(rc, 0, "getrlimit failed");
         lim
@@ -438,8 +338,6 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
     }
 
-    // Windows: `apply` is a capability-gated no-op — the fail-closed gate still
-    // denies a weak cap, and a Trusted cap succeeds without installing any limit.
     #[cfg(windows)]
     #[test]
     fn windows_apply_is_a_capgated_noop() {
@@ -476,14 +374,9 @@ mod tests {
     #[test]
     fn unsupported_limit_does_not_block_the_working_ones() {
         let _serialized = nofile_guard();
-        // A refused RLIMIT_AS must not keep NOFILE from installing.
         let auth = unsafe { Authority::root_authority() };
         let cap: Cap<Sandbox> = auth.grant(Tier::Trusted);
         let target = 256u64;
-        // macOS refuses any AS below the process's current mapped size, and a
-        // 64-bit Mach-O maps a 4 GiB `__PAGEZERO` before anything else, so 1 GiB
-        // is refused on every Mac (macOS accepts 64 TiB). Off macOS 64 TiB is
-        // accepted and harmless, where 1 GiB would cap this test process.
         let address_space: u64 = if cfg!(target_os = "macos") {
             1024 * 1024 * 1024
         } else {
@@ -511,8 +404,6 @@ mod tests {
 
     #[test]
     fn shell_default_omits_unsupported_address_space_on_macos() {
-        // macOS must not request RLIMIT_AS: 16 GiB is below what every process
-        // already maps, so it would EINVAL. Construction-only: no setrlimit.
         let d = Limits::shell_default();
         #[cfg(target_os = "macos")]
         assert_eq!(
@@ -534,9 +425,6 @@ mod tests {
     #[test]
     fn apply_preserves_the_hard_ceiling_so_a_shell_can_raise_its_soft_limit() {
         let _serialized = nofile_guard();
-        // A hard-limit clamp makes a `.zshrc` `ulimit -n 65536` abort shell
-        // startup with `value exceeds hard limit`: apply must leave the hard
-        // ceiling alone, and the soft limit must stay raisable up to it.
         let auth = unsafe { Authority::root_authority() };
         let cap: Cap<Sandbox> = auth.grant(Tier::Trusted);
 
@@ -560,7 +448,6 @@ mod tests {
             "apply must NOT lower the hard NOFILE ceiling (the `ulimit: value exceeds hard limit` regression)"
         );
 
-        // The shell rc raising its soft limit above the applied default.
         let raise = core::cmp::min(applied * 4, hard_before);
         set_limit(libc::RLIMIT_NOFILE, Some(raise), false)
             .expect("raising the soft limit must succeed");
@@ -571,31 +458,24 @@ mod tests {
     }
 
     /// Run `probe` in a forked child, as the spawn seam's child runs
-    /// [`Limits::apply`] after `fork` and before `exec`, and return its exit
-    /// code. A hard limit, once lowered, stays lowered for the process, so only
-    /// a child may lower one. `probe` must be async-signal-safe: rlimit
-    /// syscalls only.
     #[cfg(unix)]
     fn in_forked_child(probe: impl FnOnce() -> i32) -> i32 {
-        // SAFETY: the child runs only `probe` (getrlimit/setrlimit, no
-        // allocation) and `_exit`, all async-signal-safe after `fork`.
+        // SAFETY: The child runs only `probe` (getrlimit/setrlimit, no allocation) and `_exit`.
         let pid = unsafe { libc::fork() };
         assert!(pid >= 0, "fork failed: {}", io::Error::last_os_error());
         if pid == 0 {
             let code = probe();
-            // SAFETY: ends the child without running the parent's destructors.
+            // SAFETY: Ends the child without running the parent's destructors.
             unsafe { libc::_exit(code) };
         }
         let mut status = 0;
-        // SAFETY: reaping our own child into a valid out-param.
+        // SAFETY: Reaping our own child into a valid out-param.
         assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
         assert!(libc::WIFEXITED(status), "the probe child did not exit");
         libc::WEXITSTATUS(status)
     }
 
     /// A child that installed [`Limits::contained`] cannot raise its descriptor
-    /// limit back (`ulimit -n`), while one that installed [`Limits::shell_default`]
-    /// can.
     #[cfg(unix)]
     #[test]
     fn a_contained_limit_cannot_be_raised_back() {
@@ -623,7 +503,7 @@ mod tests {
                     rlim_cur: above,
                     rlim_max: above,
                 };
-                // SAFETY: a valid resource id and a fully initialized rlimit.
+                // SAFETY: A valid resource id and a fully initialized rlimit.
                 if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &lim) } == 0 {
                     RAISED
                 } else {
@@ -644,10 +524,6 @@ mod tests {
     }
 
     /// Each limit lands on its own resource, and one above the hard ceiling is clamped under
-    /// it rather than refused (a refusal fails the child closed: no shell where the host's
-    /// hard `RLIMIT_NOFILE` is below the Safety set's), a binding one too, whose hard limit
-    /// is the clamped value and never the asked one (raising a hard limit is refused). The
-    /// child lowers its own ceiling.
     #[cfg(unix)]
     #[test]
     fn each_limit_lands_on_its_resource_clamped_under_the_hard_ceiling() {
@@ -661,17 +537,15 @@ mod tests {
                         rlim_cur: 0,
                         rlim_max: 0,
                     };
-                    // SAFETY: a valid resource id and out-param.
+                    // SAFETY: A valid resource id and out-param.
                     unsafe { libc::getrlimit(resource, &mut lim) };
                     lim
                 };
-                // The soft limit starts below the ceiling, so reading the ceiling back
-                // means the asked limit landed (clamped), not that it was left alone.
                 let lowered = libc::rlimit {
                     rlim_cur: (CEILING / 2) as libc::rlim_t,
                     rlim_max: CEILING as libc::rlim_t,
                 };
-                // SAFETY: a valid resource id and a fully initialized rlimit.
+                // SAFETY: A valid resource id and a fully initialized rlimit.
                 if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &lowered) } != 0 {
                     return 1;
                 }

@@ -1,32 +1,8 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! `atpkg-publish pack-bundle <program> --sysroot <dir>`: a sysroot bundle (trust,
-//! trust-mc), made self-contained at pack time.
-//!
-//! Its attestation rests on order: every byte mutation precedes relocation, every gate
-//! runs over the final bytes, and the signed manifest describes exactly what was gated. The
-//! order is a typestate (each phase consumes the previous stage), so a pass out of order
-//! does not compile:
-//!
-//! ```text
-//! Admitted   compiler lineage (and --hello-sysroot's) admitted; dirty-tree gate
-//!  → Staged    sysroot copied (hard links kept); trust: closure frozen (super::closure)
-//!  → Mutated   dev-source links pruned (any other link refused); foreign target
-//!              sysroots pruned; fat Mach-O thinned; retired entrypoints stripped;
-//!              one compiler (bin/rustc a hard link to bin/trustc); symbols stripped and
-//!              re-signed once per hard-link group
-//!  → Relocated `crate::artifact::relocate::relocate_stage` (fail-closed audit; donor roots only)
-//!  → Gated     one-compiler gate; LINEAGE stamped; payload scan; arch gate over bin/;
-//!              every exposed bin present; per-bin smoke; hello-world; tippy over a
-//!              hello crate
-//!  → Packed    tar + zstd, disk_installed, manifest (kind = sysroot-bundle,
-//!              reloc = self-contained), signature, upload
-//! ```
-//!
-//! Every phase reads the sysroot through the physical path admission resolved and leased,
-//! never the request's spelling: a link like `~/.rustup/toolchains/trust` can be repointed
-//! mid-pack, and the bytes staged must be the build that was admitted.
+//! `atpkg-publish pack-bundle <program> --sysroot <dir>`: self-contained sysroot bundle pipeline
+//! (`Admitted -> Staged -> Mutated -> Relocated -> Gated -> Packed`).
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -53,10 +29,7 @@ impl BundlePacker for PackBundle {
     }
 }
 
-/// Stock-Rust entrypoints Trust's own surface gate forbids (`targo-trust`'s
-/// `FORBIDDEN_TRUST_PUBLIC_BIN_NAMES`): stripped from a staged `bin/`, and refused in an
-/// exposes list. `cargo`, `rustc` and `rustdoc` are required compatibility aliases and are
-/// not here.
+/// Stock-Rust entrypoints Trust's own surface gate forbids.
 pub const RETIRED_BINS: &[&str] = &[
     "cargo-trust",
     "tcargo",
@@ -81,15 +54,14 @@ pub const RETIRED_BINS: &[&str] = &[
 /// The `libexec/` counterpart of [`RETIRED_BINS`].
 pub const RETIRED_LIBEXEC: &[&str] = &["rust-analyzer-proc-macro-srv"];
 
-/// What a bundle's hello-world compiles with, and against.
+/// What a bundle's hello-world compiles.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HelloPlan {
     /// No hello, on purpose.
     Skip,
     /// The staged compiler against the staged sysroot (a working toolchain).
     Staged,
-    /// The packed `compiler` against the Trust sysroot it was built from (trust-mc,
-    /// whose own std is the panic=abort verification sysroot no hello links against).
+    /// The packed `compiler` against the Trust sysroot it was built with.
     Trust {
         /// The sysroot.
         sysroot: PathBuf,
@@ -101,9 +73,7 @@ pub enum HelloPlan {
 /// The hello plan a program's table row and the request's gate make.
 ///
 /// # Errors
-///
-/// A usage error for a Trust sysroot named for a bundle that proves its own std, a
-/// trust-mc pack that names none, or one that is not an absolute sysroot.
+/// A usage error for a Trust sysroot named for a bundle that proves its own std.
 pub fn hello_plan(def: &BundleDef, gate: &HelloGate) -> Result<HelloPlan> {
     match (def.hello, gate.sysroot.as_ref()) {
         (_, None) if !gate.enabled => Ok(HelloPlan::Skip),
@@ -131,14 +101,10 @@ pub fn hello_plan(def: &BundleDef, gate: &HelloGate) -> Result<HelloPlan> {
     }
 }
 
-/// The packaged version, derived from what is packed: the source checkout's
-/// `release/trust-version.toml` `trust_product_version`, else the staged trustc's `-vV`
-/// `trust:` line (never `release:`, the Rust compatibility number), else
-/// `trust-mc-driver --version`'s last word.
+/// The packaged version, derived from what is packed.
 ///
 /// # Errors
-///
-/// A refusal when nothing names one: a signed manifest is the wrong place to guess.
+/// A refusal when nothing names one.
 pub fn derive_version(tools: &dyn Tools, src_repo: &Path, sysroot: &Path) -> Result<String> {
     if let Ok(text) = std::fs::read_to_string(src_repo.join("release/trust-version.toml"))
         && let Some(v) = text.lines().find_map(|l| {
@@ -183,8 +149,7 @@ struct Bundle<'a> {
     tools: &'a dyn Tools,
     def: BundleDef,
     repo: &'static str,
-    /// The sysroot admitted and leased, resolved physically: every later phase reads
-    /// this, never `req.sysroot`.
+    /// The sysroot admitted and leased, resolved physically.
     sysroot: PathBuf,
     triple: Triple,
     build: u64,
@@ -197,8 +162,7 @@ struct Bundle<'a> {
     base: Option<Vec<u8>>,
     signer: Option<Signer>,
     _lease: toolchain::Held,
-    /// The hello sysroot's lease when it is a store build ([`toolchain::lease_required`]):
-    /// the hello runs its compiler, so a reclaim mid-pack would leave it proving nothing.
+    /// The hello sysroot's lease when it is a store build ([`toolchain::lease_required`]).
     _hello_lease: toolchain::Held,
 }
 
@@ -219,7 +183,7 @@ pub struct Relocated<'a> {
     b: Bundle<'a>,
     stage: aterm_tempfile::TempDir,
 }
-/// Phase 5: every gate passed over the final bytes; the scan's provenance in hand.
+/// Phase 5: every gate passed over the final bytes.
 pub struct Gated<'a> {
     b: Bundle<'a>,
     stage: aterm_tempfile::TempDir,
@@ -235,8 +199,6 @@ fn home_of(stage: &aterm_tempfile::TempDir) -> PathBuf {
 }
 
 /// The packed compiler a bundle names its triple and its hello by: the program's own
-/// (trust-mc's `bin/trust-mc-compiler`), else `bin/rustc`, else `bin/trustc` — the first
-/// that is there.
 fn packed_compiler(def: &BundleDef, root: &Path) -> Option<PathBuf> {
     let own = match def.hello {
         Hello::TrustSysroot { compiler } => Some(compiler),
@@ -248,12 +210,10 @@ fn packed_compiler(def: &BundleDef, root: &Path) -> Option<PathBuf> {
         .find(|p| atpkg::toolchain::is_executable_file(p))
 }
 
-/// Admit a bundle request: every decision that needs no copy.
+/// Admit a bundle request.
 ///
 /// # Errors
-///
-/// A usage error for a malformed request; a refusal for a compiler, a hello sysroot, a
-/// checkout or a key that does not pass.
+/// A usage error for a malformed request.
 pub fn admit<'a>(
     ctx: &'a Ctx,
     req: &'a BundleRequest,
@@ -272,7 +232,6 @@ pub fn admit<'a>(
             "--unsigned and --upload together make no sense — nothing unsigned may publish",
         ));
     }
-    // Resolved once: everything below reads this physical path.
     let sysroot = std::fs::canonicalize(&req.sysroot)
         .ok()
         .filter(|s| s.join("bin").is_dir())
@@ -283,8 +242,6 @@ pub fn admit<'a>(
             ))
         })?;
     let hello = match hello_plan(&def, &req.hello)? {
-        // Pinned physically for the same reason as the sysroot: what is admitted below is
-        // what the scan and the hello read.
         HelloPlan::Trust { sysroot, compiler } => HelloPlan::Trust {
             sysroot: std::fs::canonicalize(&sysroot)
                 .map_err(|e| Error::io(format!("resolve {}", sysroot.display()), &e))?,
@@ -314,8 +271,6 @@ pub fn admit<'a>(
     let switch = lineage_switch::read(ctx, &trust_repo)?;
     pack::say_switch(ctx, &trust_repo, &switch);
 
-    // The hello sysroot must be an admitted Trust toolchain and the very compiler the
-    // packed one was built from, or the hello proves nothing about it.
     let mut hello_compiler = None;
     if let HelloPlan::Trust {
         sysroot: hs,
@@ -422,11 +377,9 @@ pub fn admit<'a>(
     }))
 }
 
-/// Copy `src` into `dst`: directories made, symlinks copied as symlinks, regular files
-/// copied with their modes, and a hard-link group copied once and linked.
+/// Copy `src` into `dst`: directories made, symlinks copied as symlinks.
 ///
 /// # Errors
-///
 /// An I/O failure, or a special file.
 pub fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
     let mut seen: BTreeMap<(u64, u64), PathBuf> = BTreeMap::new();
@@ -544,16 +497,12 @@ fn walk(root: &Path) -> Result<Vec<(PathBuf, std::fs::FileType)>> {
 }
 
 impl<'a> Admitted<'a> {
-    /// Copy the sysroot into a stage of this pack's own (hard links kept, the sysroot
-    /// itself never written) and, for trust, freeze its rustc-dev + rust-src closure.
+    /// Copy the sysroot into a stage of this pack's own.
     ///
     /// # Errors
-    ///
     /// An I/O failure, or the closure's refusal.
     pub fn stage(self) -> Result<Staged<'a>> {
         let b = self.0;
-        // The tippy gate changes cwd to its hello crate. Resolve the stage's
-        // parent first so its executable, HOME and PATH still name this copy.
         let out = std::fs::canonicalize(&b.req.out)
             .map_err(|e| Error::io(format!("resolve {}", b.ctx.shown(&b.req.out)), &e))?;
         let stage = aterm_tempfile::Builder::new()
@@ -575,12 +524,9 @@ impl<'a> Admitted<'a> {
     }
 }
 
-/// Prune the dev-source links a sysroot carries (`lib/rustlib/{rustc-src,src}/…`, which
-/// would dangle on a user box) and refuse any other symlink: the signed tree is
-/// symlink-free by contract. Returns what was pruned.
+/// Prune the dev-source links a sysroot carries.
 ///
 /// # Errors
-///
 /// A refusal naming an unexpected link.
 pub fn prune_links(root: &Path) -> Result<Vec<String>> {
     let mut pruned = Vec::new();
@@ -606,12 +552,9 @@ pub fn prune_links(root: &Path) -> Result<Vec<String>> {
     Ok(pruned)
 }
 
-/// Prune every triple-shaped `lib/rustlib/<dir>` that is not `triple` or kept: a
-/// publisher's cross-target std is its state, not this asset's payload. Returns what was
-/// pruned.
+/// Prune every triple-shaped `lib/rustlib/<dir>` that is not `triple` or kept.
 ///
 /// # Errors
-///
 /// An I/O failure.
 pub fn prune_foreign_targets(root: &Path, triple: Triple, keep: &[String]) -> Result<Vec<String>> {
     let rustlib = root.join("lib/rustlib");
@@ -640,7 +583,6 @@ pub fn prune_foreign_targets(root: &Path, triple: Triple, keep: &[String]) -> Re
 /// A trust bundle carries a std for every target it keeps, not just a directory.
 ///
 /// # Errors
-///
 /// A refusal naming a kept target with no `libstd-*.rlib`.
 pub fn require_target_std(root: &Path) -> Result<()> {
     let rustlib = root.join("lib/rustlib");
@@ -665,13 +607,10 @@ pub fn require_target_std(root: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Thin every fat Mach-O to `triple`'s slice, written through its inode (a hard-linked
-/// member keeps its group). A fat file with no slice for the target is refused. Returns
-/// the files thinned.
+/// Thin every fat Mach-O to `triple`'s slice, written through its inode.
 ///
 /// # Errors
-///
-/// A refusal for a file with no such slice; the tool's failure.
+/// A refusal for a file with no such slice.
 pub fn thin_fat(tools: &dyn Tools, root: &Path, triple: Triple) -> Result<Vec<String>> {
     let mut thinned = Vec::new();
     if triple.os() != Os::Darwin {
@@ -710,12 +649,9 @@ pub fn thin_fat(tools: &dyn Tools, root: &Path, triple: Triple) -> Result<Vec<St
     Ok(thinned)
 }
 
-/// Strip the retired stock-Rust entrypoints Trust's surface gate forbids. A retired name
-/// in `exposes` is a contradiction, not a file to clean up: it would ship a shim whose
-/// target this very step deleted. Returns what was stripped.
+/// Strip the retired stock-Rust entrypoints Trust's surface gate forbids.
 ///
 /// # Errors
-///
 /// A refusal naming the exposed retired name.
 pub fn strip_retired(root: &Path, exposes: &[&str]) -> Result<Vec<String>> {
     if let Some(name) = exposes.iter().find(|e| RETIRED_BINS.contains(e)) {
@@ -757,13 +693,9 @@ pub enum OneCompiler {
     LinkedResigned,
 }
 
-/// Before any pass signs the tree, make `bin/rustc` a hard link to `bin/trustc` when the
-/// two are byte-identical or the same program under two code signatures. Tippy refuses a
-/// rustc that is not the selected trustc, and every later pass is hard-link aware, so the
-/// compiler is signed once.
+/// Deduplicate `bin/rustc` and `bin/trustc` into one inode before signing.
 ///
 /// # Errors
-///
 /// A refusal for two different programs.
 pub fn one_compiler(tools: &dyn Tools, root: &Path) -> Result<OneCompiler> {
     let (r, t) = (root.join("bin/rustc"), root.join("bin/trustc"));
@@ -795,12 +727,9 @@ pub fn one_compiler(tools: &dyn Tools, root: &Path) -> Result<OneCompiler> {
     Ok(how)
 }
 
-/// The one-compiler gate over the final bytes: when both ship, `bin/rustc` and
-/// `bin/trustc` are byte-identical regular files (a hard link or a copy; the client hashes
-/// them alike).
+/// The one-compiler gate over the final bytes.
 ///
 /// # Errors
-///
 /// A refusal for a link or two different files.
 pub fn compiler_gate(root: &Path) -> Result<OneCompiler> {
     let (r, t) = (root.join("bin/rustc"), root.join("bin/trustc"));
@@ -833,16 +762,10 @@ pub fn compiler_gate(root: &Path) -> Result<OneCompiler> {
     }
 }
 
-/// Strip debug stabs and local symbols off every staged Mach-O (`strip -x -S`, exported
-/// globals kept) and re-sign it ad hoc, once per hard-link group, re-linking the group's
-/// other names: a per-file strip would sever the group and ship the driver twice.
-/// rlib/rmeta/.a/.o stay untouched (compilation reads their symbols). Returns
-/// `(stripped, relinked)`.
+/// Strip debug stabs and local symbols off every staged Mach-O.
 ///
 /// # Errors
-///
-/// The first strip or re-sign failure: a Mach-O the tools cannot process is one this
-/// lane does not understand.
+/// The first strip or re-sign failure.
 pub fn strip_symbols(tools: &dyn Tools, root: &Path) -> Result<(usize, usize)> {
     let mut groups: BTreeMap<(u64, u64), Vec<PathBuf>> = BTreeMap::new();
     let mut solo = 0u64;
@@ -890,7 +813,6 @@ impl<'a> Staged<'a> {
     /// Every byte mutation, in order, before relocation and before any gate.
     ///
     /// # Errors
-    ///
     /// The first refusal.
     pub fn mutate(self) -> Result<Mutated<'a>> {
         let Staged { b, stage } = self;
@@ -927,11 +849,9 @@ impl<'a> Staged<'a> {
 }
 
 impl<'a> Mutated<'a> {
-    /// Pack-time relocation: libraries vendored only from declared donor roots, each
-    /// admitted as a Trust toolchain; any leftover machine-local reference is a refusal.
+    /// Pack-time relocation: libraries vendored only from declared donor roots.
     ///
     /// # Errors
-    ///
     /// A donor that is no Trust toolchain, or the relocator's refusal.
     pub fn relocate(self) -> Result<Relocated<'a>> {
         let Mutated { b, stage } = self;
@@ -955,11 +875,9 @@ impl<'a> Mutated<'a> {
     }
 }
 
-/// Every exposed bin is a file of the staged `bin/` — checked whether or not the smoke
-/// runs: a manifest is never signed shimming a tool its payload lacks.
+/// Every exposed bin is a file of the staged `bin/`.
 ///
 /// # Errors
-///
 /// A refusal naming every missing tool.
 pub fn require_exposed(root: &Path, exposes: &[&str]) -> Result<()> {
     let missing: Vec<&str> = exposes
@@ -977,13 +895,10 @@ pub fn require_exposed(root: &Path, exposes: &[&str]) -> Result<()> {
     }
 }
 
-/// Run one exposed bin under a hidden HOME with stdin closed: a loader error, or a bin
-/// that never executes on any probe, is a refusal; a usage error for an unknown flag is
-/// fine (it ran).
+/// Run one exposed bin under a hidden HOME with stdin closed.
 ///
 /// # Errors
-///
-/// A refusal naming the tool and why.
+/// A refusal naming the tool.
 pub fn smoke(tools: &dyn Tools, root: &Path, home: &Path, tool: &str) -> Result<()> {
     const LOADER: [&str; 7] = [
         "dyld",
@@ -1041,13 +956,9 @@ fn hidden(mut run: Run, root: &Path, home: &Path) -> Run {
     run
 }
 
-/// The hello-world gate: the packed compiler compiles and runs a hello against `sysroot`
-/// — strict first, then with verification off (a Trust compiler verifies by default and
-/// may refuse an unproven `hello.rs`: a policy refusal, not a broken toolchain). Returns
-/// the mode that proved it.
+/// The hello-world gate: the packed compiler compiles and runs a hello against `sysroot`.
 ///
 /// # Errors
-///
 /// A refusal when it compiles in neither mode, or the program prints the wrong thing.
 pub fn hello(
     tools: &dyn Tools,
@@ -1116,12 +1027,9 @@ pub fn hello(
     )))
 }
 
-/// The tippy gate: when the bundle ships `bin/tippy`, it lints a hello crate once as a
-/// user would (`tippy --offline`, hidden HOME, staged `bin/` first on PATH). The smoke
-/// cannot stand in: `tippy --version` exits 0 before tippy looks at its siblings.
+/// The tippy gate: when the bundle ships `bin/tippy`, it lints a hello crate once as a user.
 ///
 /// # Errors
-///
 /// A refusal quoting tippy's `setup error` (else its last line), the stage root removed.
 pub fn tippy_gate(tools: &dyn Tools, root: &Path, home: &Path) -> Result<bool> {
     let tippy = root.join("bin/tippy");
@@ -1169,7 +1077,6 @@ impl<'a> Relocated<'a> {
     /// Every gate, over the final bytes.
     ///
     /// # Errors
-    ///
     /// The first refusal.
     pub fn gate(self) -> Result<Gated<'a>> {
         let Relocated { b, stage } = self;
@@ -1177,8 +1084,6 @@ impl<'a> Relocated<'a> {
         let home = home_of(&stage);
         compiler_gate(&root)?;
         let probe = |p: &Path| tools::version(b.tools, p);
-        // LINEAGE is stamped inside the signed tree over the shipped digests, after the
-        // last byte-changing pass. An unproven source records nothing.
         if b.own_compiler && b.proven {
             super::lineage::stamp_with(&root, &b.sysroot.join("bin"), &probe).map_err(|r| {
                 Error::refused(format!(
@@ -1251,7 +1156,6 @@ impl Gated<'_> {
     /// Tar, sign and (maybe) upload what was gated.
     ///
     /// # Errors
-    ///
     /// The manifest's, the signature's or the upload's refusal.
     pub fn pack(self) -> Result<PackOutcome> {
         let Gated {
@@ -1260,8 +1164,6 @@ impl Gated<'_> {
             provenance,
         } = self;
         let program = &b.req.program;
-        // The same per-program lock as a plain pack: the asset, the manifest and the
-        // release tag are shared with every other publish of this program.
         let _lock = pack::pack_lock(b.ctx, program, pack::LOCK_WAIT)?;
         let asset_name = pkgdoc::asset_name(program, b.build, b.triple);
         let asset = b.req.out.join(&asset_name);
@@ -1322,11 +1224,10 @@ impl Gated<'_> {
     }
 }
 
-/// [`PackBundle`] over explicit tools — the seam the tests drive.
+/// [`PackBundle`] over explicit tools.
 ///
 /// # Errors
-///
-/// Any phase's refusal; nothing is signed or uploaded after one.
+/// Any phase's refusal.
 pub fn pack_bundle_with(
     ctx: &Ctx,
     request: &BundleRequest,
@@ -1343,8 +1244,7 @@ pub fn pack_bundle_with(
 /// `atpkg-publish pack-bundle …`.
 ///
 /// # Errors
-///
-/// A usage error for a malformed command line; the pack's refusals.
+/// A usage error for a malformed command line.
 pub fn run(ctx: &Ctx, args: &[String]) -> Result<()> {
     let mut ctx = ctx.clone();
     let request = parse_args(&mut ctx, args)?;
@@ -1374,12 +1274,9 @@ pub fn run(ctx: &Ctx, args: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// The command line as a [`BundleRequest`]; `--trust-repo` moves where `ctx` reads the
-/// receipt switch. The source checkout defaults to `~/<program>`; the output to its
-/// `dist/`.
+/// The command line as a [`BundleRequest`].
 ///
 /// # Errors
-///
 /// A usage error naming what is wrong.
 pub fn parse_args(ctx: &mut Ctx, args: &[String]) -> Result<BundleRequest> {
     let usage = || {

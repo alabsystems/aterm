@@ -5,101 +5,30 @@
 // modified by the aterm project in 2026 (see the repository NOTICE).
 
 //! Modified by the aterm project in 2026; see the repository NOTICE.
-//!
-//! # macOS / AppKit
-//!
-//! Winit has an OS requirement of macOS 10.11 or higher (same as Rust
-//! itself), and is regularly tested on macOS 10.14.
-//!
-//! ## Window initialization
-//!
-//! A lot of functionality expects the application to be ready before you
-//! start doing anything; this includes creating windows, fetching monitors,
-//! drawing, and so on, see issues [#2238], [#2051] and [#2087].
-//!
-//! If you encounter problems, you should try doing your initialization inside
-//! [`ApplicationHandler::resumed`].
-//!
-//! [#2238]: https://github.com/rust-windowing/winit/issues/2238
-//! [#2051]: https://github.com/rust-windowing/winit/issues/2051
-//! [#2087]: https://github.com/rust-windowing/winit/issues/2087
-//! [`ApplicationHandler::resumed`]: crate::application::ApplicationHandler::resumed
-//!
-//! ## Application termination
-//!
-//! This fork installs its own `NSApplicationDelegate` to deliver application lifecycle events.
-//! Keep that delegate in place. To decide whether AppKit may terminate the application,
-//! register a callback with [`set_application_should_terminate_handler`]. It runs on the main
-//! thread; returning `false` cancels termination. Only the first registration takes effect.
-//!
-//! ```no_run
-//! use aterm_window::platform::macos::set_application_should_terminate_handler;
-//!
-//! fn allow_termination() -> bool {
-//!     true
-//! }
-//!
-//! set_application_should_terminate_handler(allow_termination);
-//! ```
 
 use crate::event_loop::EventLoopBuilder;
 use crate::keyboard::ModifiersState;
 use crate::monitor::MonitorHandle;
 use crate::window::Window;
 
-/// Register a handler consulted before the application terminates via AppKit's
-/// `terminate:` — the Dock-icon "Quit", AppleScript `quit`, and logout/restart/shutdown,
-/// none of which pass through the application menu's Quit item (so an app that handles
-/// its own ⌘Q cannot otherwise confirm them). Return `true` to allow termination,
-/// `false` to cancel it (e.g. after a "really quit?" dialog). The handler runs on the
-/// main thread inside `applicationShouldTerminate:`, so it may show a modal. Only the
-/// first registration takes effect; without one, termination always proceeds — the
-/// default, so stock winit behavior is unchanged.
+/// Register a handler consulted on the main thread before AppKit terminates the application.
 #[inline]
 pub fn set_application_should_terminate_handler(handler: fn() -> bool) {
     crate::platform_impl::set_quit_confirm_hook(handler);
 }
 
-/// The printable ASCII character the Option chord on `key` types on the selected keyboard
-/// layout (with Shift when `shift`) when the layout has no key that types it without Option:
-/// German Option+L's `@`, Option+5's `[`, Option+7's `|` and Option+N's `~` (a dead key counts by
-/// the accent it puts down), French Option+('s `{`, British Option+3's `#`. `None` for every
-/// other chord, and for every chord on the U.S. layout, whose Option characters are not ASCII
-/// or are typed by a key of their own as well (Option+`'s accent is the ` key's). A terminal
-/// that sends Option chords as Meta (`WindowExtMacOS::set_option_as_alt`) types these instead:
-/// on such a layout Option is the only way to them.
-///
-/// LOCAL PATCH (aterm), 2026-10-20. Reads the layout with `UCKeyTranslate`
-/// (up to 257 lookups, only for an Option chord whose character is ASCII); on the main thread.
+/// Printable ASCII character produced only via an Option chord on `key` under the active keyboard layout.
 #[inline]
 pub fn option_only_character(key: crate::keyboard::PhysicalKey, shift: bool) -> Option<char> {
     crate::platform_impl::option_only_character(key, shift)
 }
 
-/// Additional methods on [`Window`] that are specific to MacOS.
-///
-/// LOCAL PATCH (aterm), 2026-10-15 (docs/AUDIT-third-party-2026-10-15.md, winit-core step 5): the
-/// methods aterm calls. Upstream's simple fullscreen, shadow, native tabbing, document-edited and
-/// borderless-game controls are cut, with `WindowAttributesExtMacOS` (whose titlebar, shadow,
-/// HiDPI, first-mouse, tabbing and option-as-alt settings now stand at the defaults aterm always
-/// ran with; option-as-alt is set after creation, [`WindowExtMacOS::set_option_as_alt`]),
-/// `ActiveEventLoopExtMacOS`, `EventLoopBuilderExtMacOS::with_default_menu` (winit's default
-/// menu, and with it the Services menu registration, is still always built) and
-/// `MonitorHandleExtMacOS::ns_screen`. Option-as-alt was cut in step 5 and restored on
-/// 2026-10-16 (aterm's Meta mode needs it).
+/// Additional methods on [`Window`] that are specific to macOS.
 pub trait WindowExtMacOS {
-    /// LOCAL PATCH (aterm): the modifier state winit last derived from an
-    /// event for this window — its own cache, written before the matching
-    /// `ModifiersChanged` is queued. For re-syncing after a contained
-    /// `NSException`; never a WindowServer-backed probe.
+    /// Modifier state last derived from an event for this window.
     fn cached_modifiers(&self) -> ModifiersState;
 
-    /// Make the Option keys `option_as_alt` names an Alt for this window's key events: AppKit
-    /// is handed the event with the characters the key types without Option
-    /// (`-charactersIgnoringModifiers`), so Option neither composes a glyph (Option+a, "å")
-    /// nor starts a dead key (Option+e), and the key event's text is the layout's character
-    /// at the Shift level. The Alt modifier is still reported. Not for a chord with Control
-    /// or Command, whose text AppKit already reads without Option.
+    /// Configure which Option keys are treated as Alt for this window's key events.
     fn set_option_as_alt(&self, option_as_alt: OptionAsAlt);
 
     /// What [`WindowExtMacOS::set_option_as_alt`] last set ([`OptionAsAlt::None`] until then).
@@ -124,8 +53,6 @@ impl WindowExtMacOS for Window {
 }
 
 /// Which Option keys a window treats as Alt ([`WindowExtMacOS::set_option_as_alt`]).
-///
-/// LOCAL PATCH (aterm), 2026-10-16: upstream's type, restored with the setter.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum OptionAsAlt {
     /// The left Option key is Alt; the right one composes.
@@ -139,14 +66,7 @@ pub enum OptionAsAlt {
     None,
 }
 
-// LOCAL PATCH (aterm), 2026-10-15 (docs/AUDIT-third-party-2026-10-15.md, winit-core step 6):
-// the window's content view through first-party `aterm_objc::HasNsView`, so the Metal presenter
-// (aterm-gpu) and aterm-gui's chrome reach it without `raw-window-handle`, whose `rwh_06`
-// feature is no longer a default. The opt-in `rwh_06` handle wraps this same view.
-//
-// SAFETY: the view is the `WinitView` installed as the window's content view at creation and
-// never replaced. The `NSWindow` retains it, and this `Window` retains the `NSWindow` until it
-// drops, so the view outlives `self`. Off the main thread the answer is nil.
+// SAFETY: the content view is installed at window creation and retained by `NSWindow` for the life of `self`.
 unsafe impl aterm_objc::HasNsView for Window {
     #[inline]
     fn ns_view(&self) -> aterm_objc::Id {
@@ -169,35 +89,10 @@ pub enum ActivationPolicy {
 }
 
 pub trait EventLoopBuilderExtMacOS {
-    /// Sets the activation policy for the application. If used, this will override
-    /// any relevant settings provided in the package manifest.
-    /// For instance, `with_activation_policy(ActivationPolicy::Regular)` will prevent
-    /// the application from running as an "agent", even if LSUIElement is set to true.
-    ///
-    /// If unused, the Winit will honor the package manifest.
-    ///
-    /// # Example
-    ///
-    /// Set the activation policy to "accessory".
-    ///
-    /// ```
-    /// use aterm_window::event_loop::EventLoop;
-    /// #[cfg(target_os = "macos")]
-    /// use aterm_window::platform::macos::{ActivationPolicy, EventLoopBuilderExtMacOS};
-    ///
-    /// let mut builder = EventLoop::builder();
-    /// #[cfg(target_os = "macos")]
-    /// builder.with_activation_policy(ActivationPolicy::Accessory);
-    /// # if false { // We can't test this part
-    /// let event_loop = builder.build();
-    /// # }
-    /// ```
+    /// Set the macOS activation policy for the application.
     fn with_activation_policy(&mut self, activation_policy: ActivationPolicy) -> &mut Self;
 
-    /// Used to prevent the application from automatically activating when launched if
-    /// another application is already active.
-    ///
-    /// The default behavior is to ignore other applications and activate when launched.
+    /// Configure whether the application activates automatically on launch when another app is active.
     fn with_activate_ignoring_other_apps(&mut self, ignore: bool) -> &mut Self;
 }
 

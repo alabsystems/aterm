@@ -7,6 +7,9 @@
 //! a window or the event loop, so a one-line edit in aterm-gui recompiles none
 //! of it. aterm-gui re-exports each module under its old name.
 
+#[cfg(test)]
+aterm_durable::plain_durable_flushes_in_tests!();
+
 /// Config-directory marker files: the exclusive, bounded, never-written-through
 /// read/write rules.
 pub mod config_marker;

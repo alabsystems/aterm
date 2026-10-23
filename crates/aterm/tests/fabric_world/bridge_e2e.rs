@@ -1,32 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! **A3 — the first cross-aterm message, end to end.**
-//!
-//! A headless `aterm` launches a REAL `aterm link serve` child over two
-//! inherited `socketpair` ends, and that child talks to an IN-PROCESS guarded
-//! `astream` broker. Nothing here is a mock: the endpoint is the shipped one,
-//! the bridge is the shipped binary, the broker enforces capabilities, and the
-//! `SIGKILL`s are real signals.
-//!
-//! Everything the rung asserts is a property of the whole path, so every test
-//! below boots the whole path.
-//!
-//! ## No sleeps as synchronisation
-//!
-//! Every wait is `until <observable state>` — a row on the broker's log, a field
-//! in a `status` reply, a file in the bridge's state dir — bounded by a generous
-//! deadline that is a HANG DETECTOR, not a performance assertion.
-//!
-//! ## Where a crash between two steps is tested
-//!
-//! Not here. What survives a `SIGKILL` between a post's `Publish` and its
-//! `outbox sent`, or between a burst's deliveries and its group commit, is
-//! `aterm-link`'s deterministic simulation's (`sim`): it kills the real
-//! bridge at every I/O step of every seed and replays a failing one exactly,
-//! where this world could only time two named steps from the inside. The
-//! `SIGKILL`s left here are real signals from outside, at moments a person
-//! could pick.
+//! End-to-end tests for cross-aterm `aterm link serve` messaging over an `astream` broker.
 
 #![cfg(unix)]
 
@@ -35,12 +10,6 @@ use crate::harness;
 use harness::{FLEET, World, kv, until};
 
 /// The first cross-aterm message: `post to=@s-B kind=ask --wait` answers `OK <id>
-/// off=<R>`, the record lands in B's inbox as `from=<A sid>@<node> trust=agent
-/// off=<R>`, B answers `re=R`, and A's drain shows it with `re-id=<the post id>`.
-///
-/// The bridge publishes under the node's bound cap (the broker checks the producer
-/// id against the principal), and the asker's offset is the broker's own: a
-/// correlation id nobody can forge.
 #[test]
 fn a_post_lands_in_a_peers_inbox_and_its_answer_comes_back() {
     let w = World::boot("ask", &[]);
@@ -64,8 +33,6 @@ fn a_post_lands_in_a_peers_inbox_and_its_answer_comes_back() {
         .and_then(|n| n.parse().ok())
         .unwrap_or_else(|| panic!("`--wait` must answer an offset: {}", reply.header()));
 
-    // B's inbox: `from=` is rendered from the delivered subject plus the
-    // node-attested `from=<sid>`, never from anything a sender wrote.
     let row = until("the ask to land in B's inbox", || {
         w.inbox(&b).into_iter().find(|r| r.contains("kind=ask"))
     });
@@ -74,8 +41,6 @@ fn a_post_lands_in_a_peers_inbox_and_its_answer_comes_back() {
     assert!(row.contains("trust=agent"), "{row}");
     assert!(row.contains("text=which%20branch"), "{row}");
 
-    // B answers, and A resolves the answer to its own post through the endpoint's
-    // post id ↔ offset table.
     let answer = w.verb(&format!(
         "@{b} post to=@{a} kind=answer re={ask_off} --wait=60000 fixtures on audit-2"
     ));
@@ -91,15 +56,12 @@ fn a_post_lands_in_a_peers_inbox_and_its_answer_comes_back() {
 }
 
 /// A `task` from an unlisted principal arrives `demoted=task`: delivered, but never as
-/// an instruction. A principal on `--accept-from` keeps its kind.
 #[test]
 fn a_task_from_an_unlisted_principal_arrives_demoted() {
     let w = World::boot("demote", &["a-orchestrator"]);
     w.wait_ready();
     let (a, _b) = w.two_sessions();
 
-    // The stranger is an agent: a human principal is accepted beside whatever
-    // `--accept-from` lists (§6.6 row 1, §8.4's `h-*`).
     let mut god = w.god();
     for (who, text) in [("a-stranger", "unlisted"), ("a-orchestrator", "listed")] {
         let subject = format!("/f/{FLEET}/in/{}/{a}/{who}/task", w.node);
@@ -137,13 +99,6 @@ fn a_task_from_an_unlisted_principal_arrives_demoted() {
 }
 
 /// Three shapes that never reach an inbox, each recorded instead:
-///
-/// * an eight-segment subject whose tail reads as a forged `<src>/<kind>`:
-///   `reason=malformed`, since the parse is by position from the left;
-/// * a `<sid>` this node does not host: `reason=not-hosted`;
-/// * a record on the node's own lane under its own id at an offset the bridge never
-///   acked: `reason=forged-self`, plus a `cap-compromised` ev, since only a co-holder
-///   of the node cap could have written it.
 #[test]
 fn a_forged_subject_never_reaches_an_inbox_and_is_recorded() {
     let w = World::boot("forge", &[]);
@@ -169,8 +124,6 @@ fn a_forged_subject_never_reaches_an_inbox_and_is_recorded() {
             .expect("publish the forgery");
         offs.push(off);
     }
-    // A sentinel that must be delivered, published last: waiting for it proves the
-    // three above were refused, not slow.
     let good = format!("/f/{FLEET}/in/{}/{a}/h-andrew/note", w.node);
     god.publish(9_100, 4, &good, b"v=1 t=1 text=sentinel")
         .expect("publish the sentinel");
@@ -188,17 +141,10 @@ fn a_forged_subject_never_reaches_an_inbox_and_is_recorded() {
         "exactly one of the four records may be delivered: {rows:#?}"
     );
 
-    // THE RECORDS ARE WAITED FOR, NOT READ ONCE. The bridge pipelines its
-    // `ev` publishes (`publish_ev_for` does not wait for the broker's ack)
-    // while the sentinel reaches the inbox over the endpoint, a different
-    // channel: the sentinel landing orders the DELIVERIES, not the `ev`s,
-    // so a read right after it could miss the newest one under load.
     let wanted = [
         format!("undeliverable off={} reason=malformed", offs[0]),
         format!("undeliverable off={} reason=not-hosted", offs[1]),
         format!("undeliverable off={} reason=forged-self", offs[2]),
-        // A forged record on our own lane is a COMPROMISE, not a delivery
-        // problem.
         format!("cap-compromised off={}", offs[2]),
     ];
     until("every refusal to be recorded", || {
@@ -208,7 +154,6 @@ fn a_forged_subject_never_reaches_an_inbox_and_is_recorded() {
             .all(|want| ev.iter().any(|e| e.starts_with(want.as_str())))
             .then_some(())
     });
-    // Nor did a refused record reach the inbox while its `ev` was awaited.
     assert_eq!(
         w.inbox(&a).len(),
         before + 1,
@@ -217,8 +162,6 @@ fn a_forged_subject_never_reaches_an_inbox_and_is_recorded() {
 }
 
 /// The fleet halt: a human's `halt state=on` holds every session the node hosts (a
-/// `send` answers `ERR halted`), and the node acks the halt at its offset with
-/// `state=held`, so `Last{…/node/ack}` with `re=<halt-offset>` counts who obeyed.
 #[test]
 fn a_fleet_halt_holds_every_session_and_is_acked_at_its_offset() {
     let w = World::boot("halt", &[]);
@@ -239,14 +182,8 @@ fn a_fleet_halt_holds_every_session_and_is_acked_at_its_offset() {
         w.verb(&format!("@{a} status")).header().contains("hold=1"),
         "status must report the standing hold"
     );
-    // Exempt verbs stay answerable: a halted agent can still ask why.
     assert!(w.verb(&format!("@{a} inbox --peek")).ok());
 
-    // One retained `ack` subject per node, naming the barrier in `re=`: a subject per
-    // halt offset would spend one of the producer's 4096 distinct subjects on every
-    // halt record, and past that bound the node could not publish its `live`
-    // presence row. A quorum fold over `Last{/f/<F>/pub/*/node/ack}` counts the
-    // members whose `re=` is this barrier.
     let ack = format!("/f/{FLEET}/pub/{}/node/ack", w.node);
     let counted = until("the node to ack the halt at its offset", || {
         w.row(&ack)
@@ -257,7 +194,6 @@ fn a_fleet_halt_holds_every_session_and_is_acked_at_its_offset() {
         "the node must count as HELD at the halt's own offset: {counted}"
     );
 
-    // And it lifts: each human lifts their own.
     god.publish(5_000, 2, &subject, b"v=1 t=1 state=off")
         .expect("lift the halt");
     until("the halt to lift", || {
@@ -269,12 +205,6 @@ fn a_fleet_halt_holds_every_session_and_is_acked_at_its_offset() {
 }
 
 /// A dead broker leaves the halt where it was, and posts queue.
-///
-/// A hold an outage lifted would let an agent dodge a halt by cutting a cable, and a
-/// dropped post would be one the sender was told `OK` for. The hold lives in the
-/// endpoint and only a `state=off` record lifts it. It is sampled during the outage,
-/// after [`World::stop_broker`] saw the bridge redialing: after the reconnect, the
-/// attach re-derives every standing halt from the bus and would hide a lift.
 #[test]
 fn a_dead_broker_keeps_the_hold_and_queues_the_posts_until_it_returns() {
     let mut w = World::boot("outage", &[]);
@@ -292,12 +222,9 @@ fn a_dead_broker_keeps_the_hold_and_queues_the_posts_until_it_returns() {
             .then_some(())
     });
 
-    // The broker goes away; its log stays, so the same records come back with it.
     drop(god);
     w.stop_broker();
 
-    // The hold stays with the bridge already redialing: nothing on the link-loss
-    // path may lift it.
     assert!(
         w.verb(&format!("@{a} status")).header().contains("hold=1"),
         "a broker outage lifted the halt — log:\n{}",
@@ -309,8 +236,6 @@ fn a_dead_broker_keeps_the_hold_and_queues_the_posts_until_it_returns() {
         "a halted session must stay halted while the broker is away: {}",
         refused.header()
     );
-    // `post` and `inbox` stay answerable (a halted agent can still send for help),
-    // and the post queues rather than failing.
     let queued = w.verb(&format!(
         "@{a} post to=@{b} kind=note queued while the bus was down"
     ));
@@ -329,7 +254,6 @@ fn a_dead_broker_keeps_the_hold_and_queues_the_posts_until_it_returns() {
         listing.rows()
     );
 
-    // The broker comes back on the same log and path, and the queued post lands.
     w.start_broker();
     until("the queued post to land after the reconnect", || {
         w.inbox(&b)
@@ -337,22 +261,15 @@ fn a_dead_broker_keeps_the_hold_and_queues_the_posts_until_it_returns() {
             .any(|r| r.contains("text=queued%20while"))
             .then_some(())
     });
-    // Still held: the attach re-derives the standing halt.
     assert!(w.verb(&format!("@{a} status")).header().contains("hold=1"));
 }
 
 /// No bus record moves a PTY byte: an `answer`, `task`, `control`, `note` and `ack`
-/// from every principal class, each carrying the `re=` and `gen=` a drive record
-/// would, leave the terminal untouched.
 #[test]
 fn no_bus_record_ever_reaches_a_pty() {
     let w = World::boot("pty", &["h-andrew", "s-1"]);
     w.wait_ready();
     let (a, _b) = w.two_sessions();
-    // The baseline is a SETTLED screen: the shell's first prompt is up. A shell that
-    // starts slowly would otherwise print it between the two reads and look like a
-    // record moving the terminal (seen on a loaded machine: `before` blank, `after`
-    // holding the prompt, 9.9 s in).
     until("the shell's first prompt", || {
         w.verb(&format!("@{a} text"))
             .rows()
@@ -377,9 +294,7 @@ fn no_bus_record_ever_reaches_a_pty() {
             records.push((6_200, seq, subject, body.as_bytes().to_vec()));
         }
     }
-    // Pipelined (`harness::publish_pipelined`): the same twenty, in order.
     harness::publish_pipelined(&mut w.god(), &records);
-    // Synchronise on the last one landing, then assert about the screen.
     until("every inbox record to be handled", || {
         (w.inbox(&a).len() >= 20).then_some(())
     });
@@ -392,33 +307,11 @@ fn no_bus_record_ever_reaches_a_pty() {
 }
 
 /// Every connection carries its own will: a broker restart fires the will of the
-/// connection it cut and the reconnect registers a new one, a `SIGKILL` of the
-/// bridge then fires exactly that one, and the relaunch publishes `live` above it.
-///
-/// A BROKER RESTART IS A PRESENCE EPOCH. A broker reopened on its log fires
-/// every will that log holds, so the node row reads `away inc=<n>` until the
-/// bridge's in-process reconnect — the presence bring-up every attach runs —
-/// takes `inc=<n+1>`, registers a will on the NEW connection and publishes
-/// `live`. A reconnect that skipped the bring-up leaves the row `away` while
-/// mail flows; one that skipped only the will leaves a later crash with no
-/// `away` at all, because the old will is fenced by the new incarnation's own
-/// records.
-///
-/// The will's sequence is the reserved TOP of its incarnation's space, so no
-/// ordinary publish can collide with it; the relaunch's `inc+1` is above that
-/// top, which is what suppresses a half-open connection's will structurally
-/// rather than by a reader fold. And it holds with the state dir WIPED, because
-/// the incarnation is `max(local, the bus's own last row) + 1` — the bus
-/// remembers what the disk forgot.
-///
-/// READ AS HISTORY, not with `Last`: `Last` keeps one record per subject, and
-/// the relaunch's `live` can overwrite an `away` before a poll of it looks.
 #[test]
 fn every_connection_carries_its_own_will_across_a_broker_restart_and_a_kill() {
     let mut w = World::boot("will", &[]);
     w.wait_ready();
     let presence = format!("/f/{FLEET}/pub/{}/node/presence", w.node);
-    // Every `(state, inc)` the node row has carried, oldest first.
     let history = |w: &World| -> Vec<(String, u64)> {
         let rows = w
             .read(|c| {
@@ -441,7 +334,6 @@ fn every_connection_carries_its_own_will_across_a_broker_restart_and_a_kill() {
             })
             .collect()
     };
-    // The first `live` above `inc` that comes after an `away inc=<inc>`.
     let live_after_gone = |w: &World, inc: u64| -> Option<u64> {
         let h = history(w);
         let gone = h.iter().position(|(s, i)| s == "away" && *i == inc)?;
@@ -458,9 +350,6 @@ fn every_connection_carries_its_own_will_across_a_broker_restart_and_a_kill() {
     });
     let pid = w.bridge_pid();
 
-    // THE BROKER RESTARTS. The cut connection's will fires (`away` at the first
-    // incarnation), and the reconnect — the same process, not a relaunch —
-    // outranks it with a higher one.
     w.stop_broker();
     w.start_broker();
     let second_inc = until("the reconnect to outrank the fired will", || {
@@ -472,16 +361,11 @@ fn every_connection_carries_its_own_will_across_a_broker_restart_and_a_kill() {
         "a broker restart is a reconnect, not a relaunch"
     );
 
-    // Wipe the state dir's incarnation and sequence, keeping the node id: the bus's
-    // last row still tells the relaunch where it had got to.
     let _ = std::fs::remove_file(w.state.join("inc"));
     let _ = std::fs::remove_file(w.state.join("inc-lease"));
     let _ = std::fs::remove_file(w.state.join("seq"));
     harness::kill(pid, 9);
 
-    // The will the reconnect registered fires at its incarnation; aterm relaunches
-    // the child, which reads the bus, takes a higher one and publishes `live` above
-    // the old reserved top.
     let back_inc = until(
         "the kill's will to fire and the relaunch to outrank it",
         || live_after_gone(&w, second_inc),
@@ -491,10 +375,6 @@ fn every_connection_carries_its_own_will_across_a_broker_restart_and_a_kill() {
         "the relaunch must take a HIGHER incarnation ({back_inc} !> {second_inc})"
     );
 
-    // AND THE SEQUENCE DID NOT REPEAT. Every publish of the new incarnation is
-    // above the old one's will, the top of its space in astream's layout
-    // (`astream_broker::will_seq`), so no record of it can collide with — and be
-    // deduped away by — a record of the old one.
     let seq: u64 = std::fs::read_to_string(w.state.join("seq"))
         .expect("the restart reserved a sequence")
         .trim()
@@ -528,30 +408,6 @@ fn bodies_under(w: &World, filter: &str) -> Vec<String> {
 }
 
 /// **A BRIDGE THROUGH AN UPDATE'S ORDERING: the predecessor's aterm goes while
-/// its bridge is mid-drain, and the successor's starts at once on the same
-/// state dir.**
-///
-/// That is the order the product allows. From the Commit to the `_exit` the
-/// predecessor answers no retirement (its Commit fence), so a bridge draining
-/// then is parked in a post's `outbox sent` when its lanes close, with the
-/// rest of the drain in hand; and the successor arms its bridge once its
-/// control socket binds, waiting for no predecessor's bridge. An update cannot
-/// run headless, so the instance is killed and relaunched without waiting for
-/// its bridge — the orphan sees what an update's sees, both lanes closing —
-/// and the bridge holds itself at that step
-/// (`ATERM_LINK_FAULT=park-retire-while-marked`, one shot) until the
-/// successor's bridge has started.
-///
-/// Asserted: the successor's bridge STANDS BY while the orphan lives (the
-/// state dir's lock), rather than attaching beside it; the orphan, released,
-/// publishes nothing more — the second post of its drain never reaches the bus
-/// — and exits; the successor carries the node at the next incarnation, and
-/// its own mail moves. Every wait is an `until`, a hang detector.
-///
-/// Negative controls: without the drain's lost-lane check the orphan
-/// publishes the second post after its aterm is gone, and the bus read below
-/// finds it; without the state dir's lock the successor's bridge attaches
-/// while the orphan is parked, and the rendezvous answers `Attached`.
 #[test]
 fn an_orphaned_bridge_mid_drain_neither_publishes_more_nor_shares_the_node() {
     #[derive(Debug, PartialEq, Eq)]
@@ -567,8 +423,6 @@ fn an_orphaned_bridge_mid_drain_neither_publishes_more_nor_shares_the_node() {
     w.wait_ready();
     let (a, b) = w.two_sessions();
 
-    // TWO POSTS IN ONE DRAIN: queued while the broker is away, so the drain
-    // the reattach runs peeks both.
     w.stop_broker();
     for text in ["orphanfirst", "orphansecond"] {
         let queued = w.verb(&format!("@{a} post to=@{b} kind=note {text}"));
@@ -584,9 +438,6 @@ fn an_orphaned_bridge_mid_drain_neither_publishes_more_nor_shares_the_node() {
         w.state.join("fault-fired").exists().then_some(())
     });
     let orphan = w.bridge_pid();
-    // The orphan's incarnation is its own node row's: the state dir's `inc`
-    // holds the top of the incarnation LEASE (`aterm-link`'s `state.rs`, "The
-    // incarnation lease"), not the incarnation the attach took.
     let node_face = format!("/f/{FLEET}/pub/{}/node/presence", w.node);
     let inc: u64 = until("the orphan's own live node row", || {
         let row = w.row(&node_face)?;
@@ -594,10 +445,6 @@ fn an_orphaned_bridge_mid_drain_neither_publishes_more_nor_shares_the_node() {
         mine.then(|| kv(&row, "inc")?.parse().ok()).flatten()
     });
 
-    // THE INSTANCE GOES — its bridge is not waited for — AND ITS SUCCESSOR
-    // COMES UP on the same state dir at once. (Should this test fail from here
-    // on, `World`'s drop kills the bridge the state dir's `pid` names, which
-    // is the orphan for as long as it holds the dir.)
     let mut gui = w.gui.take().expect("the instance");
     let _ = gui.kill();
     let _ = gui.wait();
@@ -621,8 +468,6 @@ fn an_orphaned_bridge_mid_drain_neither_publishes_more_nor_shares_the_node() {
         "the orphan exited before the successor's bridge started: no overlap was run"
     );
 
-    // RELEASED, the orphan finds its lanes gone at the retirement it was
-    // parked in, and goes.
     std::fs::remove_file(w.state.join("park-retire")).expect("release the orphan");
     until("the orphan to exit", || {
         (!harness::alive(orphan)).then_some(())
@@ -646,8 +491,6 @@ fn an_orphaned_bridge_mid_drain_neither_publishes_more_nor_shares_the_node() {
     );
     w.wait_ready();
 
-    // AND ITS MAIL MOVES: a session of the successor posts to itself and
-    // reads it back.
     let fresh = until("the successor's boot session", || {
         w.sessions().first().map(|(_, sid, _)| sid.clone())
     });
@@ -659,8 +502,6 @@ fn an_orphaned_bridge_mid_drain_neither_publishes_more_nor_shares_the_node() {
             .then_some(())
     });
 
-    // WHAT THE ORPHAN PUBLISHED: the post it was retiring, once — and nothing
-    // after its aterm went. It has exited, so nothing can add to this.
     let lane = bodies_under(&w, &format!("/f/{FLEET}/in/{}/{b}/>", w.node));
     let count = |text: &str| {
         lane.iter()

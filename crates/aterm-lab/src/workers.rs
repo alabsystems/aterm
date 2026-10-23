@@ -1,91 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `workers [tag] [--keep]`: THE proof that an aterm session runs others as
-//! WORKERS with the real Claude Code, and no tokens
-//! (`docs/DESIGN-sessions-as-subagents-2026-10-15.md` §8, the first bullet;
-//! measured in `docs/measured/workers-lab-2026-10-16.md`).
-//!
-//! A lab of its own (`workers-<pid>` unless a tag is given): the folder trust
-//! seeded, and in the scratch settings Bash allowed and `acceptEdits` the
-//! permission mode (2.1.301's default, auto mode, sends each Bash call to its
-//! classifier, which the stub cannot answer, and blocks it). Claude Code, the
-//! MANAGER, runs in the first tab and is given one prompt; the stub's script
-//! (`tool` mode, each conversation keyed on its first prompt: the
-//! [`crate::stub`] module) makes it
-//!
-//! 1. start three workers, each with one Bash `aterm ctl @self spawn
-//!    agent=claude - <<'EOF' … EOF` (the shim leads the manager's PATH: its
-//!    `aterm` is the aterm under test); one task carries quotes, backticks,
-//!    `$(…)`, `${…}` and backslashes, another blank and indented lines;
-//! 2. run `aterm ctl await task @w1,@w2,@w3 all since=0` (the sids its spawns
-//!    printed) as a Claude Code BACKGROUND Bash, and end its turn with text;
-//! 3. when Claude Code's `<task-notification>` of that command opens its next
-//!    turn, read each worker's `aterm ctl @<w> result` and end with a summary.
-//!
-//! Each WORKER is the real Claude Code that the server's `spawn agent=claude`
-//! typed into a new tab — the lab starts none — on the manager's Claude home
-//! (`CLAUDE_CONFIG_DIR` rides its line), whose settings point it at the stub.
-//! Its script runs one Bash (a file in the project) and ends its turn with its
-//! report. A worker is under Autopilot Land (a spawn's default), so its
-//! harness then types the LAND instruction, and the script answers it with a
-//! clean defense, a few lines starting `Nothing left:` (the project is no
-//! repository, so its probe finds nothing unlanded): Land's landing, which
-//! alone ends a worker's task. No token anywhere. Everything runs in the lab's jail. A worker's
-//! shell is the login shell the server spawned, which rebuilds its PATH and
-//! lists the shim LAST: an `aterm` a worker typed would be the first one on
-//! that PATH, not necessarily the aterm under test. The workers here type none.
-//!
-//! The checks, each printed `ok`/`FAIL` (exit 1 when one fails):
-//!
-//! * each worker's `task` is `state=done why=landed` with `result_bytes>0`;
-//! * each `result` prints its stubbed report, a blank line and its defense
-//!   BYTE FOR BYTE (the landing's result: the report before the land act,
-//!   then what the defense adds), and its header's `bytes=` is their length;
-//! * each worker's record moved from rev 1 to the rev it reads now through
-//!   `working` and `done` alone, every rev recorded on the session's own
-//!   `timeline` (rev 1 is the spawn's, before any watch could subscribe to the
-//!   session), and each move the instance pushed (`subscribe @* events`) is one
-//!   of them: no worker was ever `stalled`, and no event was dropped;
-//! * each worker's first user row (its transcript) is the task the manager
-//!   sent byte for byte, a blank line, and one line of fact naming the manager;
-//! * each worker ran its Bash (the file it wrote holds its token);
-//! * the manager's three spawns printed `OK <sid>` for the three workers the
-//!   instance created; its background await returned (the
-//!   `<task-notification>` row, `completed`, its output three `state=done`
-//!   rows, read only where Claude Code writes the manager's task output under
-//!   the temp root the lab gave it, a new 0700 folder in the run's scratch
-//!   (`CLAUDE_CODE_TMPDIR`), through no link and at most 64 KiB of it) and
-//!   opened the turn in which it read the three reports and ended with the
-//!   summary;
-//! * `survey` shows the four Claude Code sessions, each with what it was asked
-//!   and its last words, within the budget (24,000 characters, 110 a session
-//!   line), and `survey --json` the same records;
-//! * the egress witness saw no external endpoint, and saw the four Claude
-//!   Codes connect to the stub.
-//!
-//! With `--upgrade <newer-claude-bin>` on a lab that runs an older build
-//! (`LAB_CLAUDE`), the live upgrade of done workers follows: `twin` presents
-//! the newer build, the instance moves every session onto it, and each worker
-//! must come back `done:resumed` with its record and its result as they were.
-//!
-//! With `--early` the manager's prompt rides Claude Code's command line, so
-//! its first turn and the three spawns begin before the instance has read its
-//! screen and named its program: the race three runs met on 2026-10-18, when
-//! each worker's line carried plain `claude` and every worker stalled at its
-//! startup deadline. Each worker's line must then follow the manager's own
-//! Claude Code read off its terminal (`aterm.log`: `launch line typed …
-//! read from its terminal`). A failed run of either kind prints each
-//! worker's screen and keeps it in the logs (`workers-text.txt`).
-//!
-//! The timings it prints are read off one machine clock: the manager's `OK
-//! <sid>` rows and the workers' own rows (the first prompt, the final reply)
-//! in their transcripts, the task moves as the lab read their pushes, and the
-//! manager's wake row. NOT OBSERVED: a worker under another identity, a
-//! worker that asks a question or meets a wall, a manager on another
-//! instance, the folder-trust dialog (seeded here; `selftest` has the
-//! harness answer it), auto mode (its classifier asks the API, which the
-//! stub cannot answer).
+//! `workers [tag] [--keep]`.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -111,15 +27,12 @@ pub struct Worker {
     pub file: String,
     /// Its report: the final message of its first turn.
     pub report: String,
-    /// Its answer to the LAND instruction: a clean defense (`Nothing left:`),
-    /// Land's landing.
+    /// Its answer to the LAND instruction.
     pub defense: String,
 }
 
 impl Worker {
-    /// What its `result` prints after the landing: the report before the
-    /// land act, a blank line, then the defense (`harness::result`'s check
-    /// rule), and a newline.
+    /// What its `result` prints after the landing.
     #[must_use]
     pub fn result(&self) -> String {
         format!("{}\n\n{}\n", self.report, self.defense)
@@ -190,7 +103,7 @@ impl Plan {
         }
     }
 
-    /// The Bash a worker's spawn runs: the task on stdin, byte for byte.
+    /// The Bash a worker's spawn runs.
     #[must_use]
     pub fn spawn_command(w: &Worker) -> String {
         format!(
@@ -208,7 +121,7 @@ impl Plan {
         format!("aterm ctl await task {} all since=0", sel.join(","))
     }
 
-    /// The stub's `tool` script: the manager's steps, then each worker's.
+    /// The stub's `tool` script.
     #[must_use]
     pub fn script(&self) -> J {
         let bash = |when: &str, cmd: String, what: String, bg: bool| {
@@ -268,11 +181,11 @@ impl Plan {
 /// One row of a Claude Code transcript, as the proof reads it.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Row {
-    /// `user`, `assistant`, `system`, `attachment`, …
+    /// `user`, `assistant`, `system`, `attachment`, ….
     pub kind: String,
     /// Its stamp (unix ms).
     pub ts: Option<i64>,
-    /// Its message's text: the string, or its text blocks joined by newlines.
+    /// Its message's text.
     pub text: String,
     /// A tool use: its name and input.
     pub tool_use: Option<(String, J)>,
@@ -292,7 +205,6 @@ pub fn iso_ms(s: &str) -> Option<i64> {
     let mut t = hms.split(':').map(|p| p.parse::<i64>().ok());
     let (h, mi, sec) = (t.next()??, t.next()??, t.next()??);
     let ms: i64 = format!("{frac:0<3}").get(..3)?.parse().ok()?;
-    // days from the civil date (Howard Hinnant's algorithm)
     let y = if m <= 2 { y - 1 } else { y };
     let era = y.div_euclid(400);
     let yoe = y - era * 400;
@@ -303,9 +215,6 @@ pub fn iso_ms(s: &str) -> Option<i64> {
 }
 
 /// The rows of a transcript's text (a line that does not parse is skipped).
-/// Only a `user` or `assistant` row is the conversation's: another kind that
-/// carries a message (2.1.301's `api-request-blob`, a copy of what a request
-/// sent) keeps its text but gives no tool use or result.
 #[must_use]
 pub fn rows(text: &str) -> Vec<Row> {
     let blocks_text = |c: &J| crate::stub::text_of(Some(c));
@@ -350,7 +259,7 @@ pub fn rows(text: &str) -> Vec<Row> {
         .collect()
 }
 
-/// The first user row with words and no tool result: the prompt that opened a conversation.
+/// The first user row with words and no tool result.
 #[must_use]
 pub fn first_prompt(rows: &[Row]) -> Option<&Row> {
     rows.iter()
@@ -369,13 +278,13 @@ pub fn kv<'a>(line: &'a str, key: &str) -> Option<&'a str> {
 pub struct Pushed {
     /// `session-created <sid>`, with the wall time it was read.
     pub created: Vec<(String, f64)>,
-    /// `task …` moves: the session, the wall time, the payload (`rev= state= …`).
+    /// `task …` moves.
     pub tasks: Vec<(String, f64, String)>,
     /// `GAP` lines: events the timeline dropped before this watch saw them.
     pub gaps: Vec<String>,
 }
 
-/// [`Pushed`] of the stream's lines `(wall, line)`; a `sub <local> <sid>` ack names a local id's session.
+/// [`Pushed`] of the stream's lines `(wall, line)`.
 #[must_use]
 pub fn pushed(lines: &[(f64, String)]) -> Pushed {
     let mut sid_of: Vec<(String, String)> = Vec::new();
@@ -406,8 +315,7 @@ pub fn pushed(lines: &[(f64, String)]) -> Pushed {
     p
 }
 
-/// The task record's moves a session's `timeline` recorded, oldest first:
-/// each `task-change` row's rev and state.
+/// The task record's moves a session's `timeline` recorded, oldest first.
 #[must_use]
 pub fn task_moves(timeline: &str) -> Vec<(u64, String)> {
     timeline
@@ -420,9 +328,7 @@ pub fn task_moves(timeline: &str) -> Vec<(u64, String)> {
         .collect()
 }
 
-/// Whether `moves` are every move of a record that now reads `now_rev`, rev 1
-/// to it with none missing, and each one `working` or `done`. A move the
-/// timeline did not keep is a gap, and fails: what it moved to is unknown.
+/// Whether `moves` are every move of a record that now reads `now_rev`, rev 1 to it with none missing, and each one `working` or `done`.
 #[must_use]
 pub fn never_stalled(moves: &[(u64, String)], now_rev: Option<u64>) -> bool {
     let Some(now_rev) = now_rev else {
@@ -432,8 +338,7 @@ pub fn never_stalled(moves: &[(u64, String)], now_rev: Option<u64>) -> bool {
         && moves.iter().all(|(_, s)| s == "working" || s == "done")
 }
 
-/// One session's block of a `survey` text: its session line and the excerpt
-/// lines indented under it.
+/// One session's block of a `survey` text.
 #[must_use]
 pub fn survey_block(text: &str, sid: &str) -> String {
     let mut lines = text.lines().skip_while(|l| !l.starts_with(sid));
@@ -449,15 +354,10 @@ pub fn survey_block(text: &str, sid: &str) -> String {
     b
 }
 
-/// What a session was asked and last said, as [`survey_shown`] looks for it:
-/// its sid, a word of what it was asked, and the head and the end of what it
-/// last said.
+/// What a session was asked and last said, as [`survey_shown`] looks for it.
 pub type AskedSaid = (String, String, String, String);
 
-/// How many of `asked_said` a `survey` text shows as `claude` with both
-/// excerpts: its `asked:` holding the word, its `said:` the head of what it
-/// said or its end — a finished turn's `said:` cut by the read keeps its end
-/// (`…` first), where its report puts its result.
+/// How many of `asked_said` a `survey` text shows as `claude` with both excerpts.
 #[must_use]
 pub fn survey_shown(text: &str, asked_said: &[AskedSaid]) -> usize {
     asked_said
@@ -558,14 +458,10 @@ impl Checks {
     }
 }
 
-/// The file of the run (outside the jail's scratch, written by the lab) a failed run keeps each
-/// worker tab's screen in; `down` keeps it with the logs.
+/// The file of the run (outside the jail's scratch, written by the lab) a failed run keeps each worker tab's screen in.
 pub const WORKER_TEXTS: &str = "workers-text.txt";
 
 /// A FAILED RUN KEEPS WHAT EACH WORKER'S TAB SHOWS: its `status` line and its `text`, printed and
-/// in the run's [`WORKER_TEXTS`]. A worker that never started shows there what its shell made of
-/// its launch line, or that none was typed (2026-10-18: three such stalls were kept with nothing
-/// but the startup deadline's line).
 fn keep_worker_texts(run: &Run, door: &Door, sids: &[String]) {
     let mut all = String::new();
     for sid in sids {
@@ -615,7 +511,6 @@ fn transcript_of<'a>(all: &'a [(PathBuf, Vec<Row>)], token: &str) -> Option<&'a 
 }
 
 /// Whether the manager's transcript holds its summary: the last row its
-/// scripted turns write, which may land a moment after the screen draws it.
 fn summary_written(run: &Run, plan: &Plan) -> bool {
     transcript_of(&transcripts(run), &plan.mgr).is_some_and(|rows| {
         rows.iter()
@@ -669,7 +564,6 @@ enum Verdict {
 }
 
 /// The text a task notification holds between `<name>` and `</name>`
-/// (`task-id`, `output-file`, `status`).
 fn notification_field<'a>(text: &'a str, name: &str) -> Option<&'a str> {
     let (_, rest) = text.split_once(&format!("<{name}>"))?;
     rest.split_once(&format!("</{name}>"))
@@ -677,15 +571,6 @@ fn notification_field<'a>(text: &'a str, name: &str) -> Option<&'a str> {
 }
 
 /// Where Claude Code, run with `CLAUDE_CODE_TMPDIR=<tmp_root>`, writes the
-/// output of the background command `task_id` that the conversation of
-/// `transcript` (`<home>/projects/<project>/<session>.jsonl`) started:
-/// `<tmp_root>/claude-<uid>/<project>/<session>/tasks/<task_id>.output`. The
-/// lab gives the manager a `tmp_root` of its own in the run's scratch
-/// ([`run_workers`]) and reads the await's output there and nowhere else: a
-/// notification's `<output-file>` is text the jailed manager wrote, so it
-/// must name this path, which the lab builds from its own facts. `None` for a
-/// task id that is not one word of letters, digits, `_` and `-`, and for a
-/// project or session that is no folder name of its own (empty, `.`, `..`).
 fn task_output_path(tmp_root: &Path, transcript: &Path, task_id: &str) -> Option<PathBuf> {
     let word = !task_id.is_empty()
         && task_id.len() <= 64
@@ -713,12 +598,9 @@ fn task_output_path(tmp_root: &Path, transcript: &Path, task_id: &str) -> Option
 }
 
 /// The most of the await's output the lab reads: its three rows and the exit
-/// line Claude Code adds are well under one KiB.
 const AWAIT_OUTPUT_MAX: u64 = 64 * 1024;
 
 /// The text at `path` through the scratch reader (no link anywhere on its
-/// path, the lab user's regular file with one name), read only while it is
-/// at most `max` bytes; why it was not read otherwise.
 fn read_bounded(path: &Path, max: u64) -> Result<String, String> {
     let file = crate::sys::scratch_file(path)
         .map_err(|e| e.to_string())?
@@ -757,7 +639,6 @@ pub fn upgrade_of(ls: &str, sid: &str) -> String {
 }
 
 /// What a worker's record and result say, for the drill's before and after:
-/// the record's `rev= state= why= result_bytes=`, and the result as printed.
 fn held(door: &Door<'_>, sid: &str) -> Result<(String, String), Fail> {
     let at = format!("@{sid}");
     let task = door.out(&[at.as_str(), "task"]);
@@ -770,11 +651,6 @@ fn held(door: &Door<'_>, sid: &str) -> Result<(String, String), Fail> {
 }
 
 /// THE LIVE UPGRADE OF DONE WORKERS (`--upgrade <newer-claude-bin>`, on a lab
-/// that runs an older build: `LAB_CLAUDE`): `twin` presents `bin` as a newer
-/// managed Claude Code, the instance's live upgrade moves every session onto
-/// it, and each done worker must come back with its record and its result as
-/// they were (`docs/DESIGN-sessions-as-subagents-2026-10-15.md` §2.3: the
-/// result is a snapshot, never read again).
 fn upgrade_drill(
     run: &Run,
     door: &Door<'_>,
@@ -838,7 +714,6 @@ fn upgrade_drill(
 }
 
 /// One proof on the lab `tag`, which [`cmd_workers`] brought up; with
-/// `upgrade`, the live-upgrade drill after it ([`upgrade_drill`]).
 #[allow(clippy::too_many_lines)]
 fn run_workers(tag: &str, upgrade: Option<&str>, early: bool) -> Result<Verdict, Fail> {
     let could_not = |m: &str| Fail::exit(3, format!("workers: COULD NOT RUN: {m}"));
@@ -853,7 +728,6 @@ fn run_workers(tag: &str, upgrade: Option<&str>, early: bool) -> Result<Verdict,
         run.need_aterm()?.display()
     );
 
-    // ---- the scratch: Bash allowed, accept-edits mode, the script, the stub in `tool` mode
     crate::verbs::settings_merge(
         &run,
         &J::obj([(
@@ -870,17 +744,10 @@ fn run_workers(tag: &str, upgrade: Option<&str>, early: bool) -> Result<Verdict,
         .map_err(|e| could_not(&format!("the stub did not take mode tool: {e}")))?;
     let mut watch = Watch::start(&door).map_err(|e| could_not(&e))?;
 
-    // ---- the manager, and its one prompt. Its temp root is a new 0700 folder in the scratch, so the
-    // output of its background await lands inside the run's own files, where the lab reads it
-    // (`task_output_path`). The workers keep Claude Code's default, /private/tmp/claude-<uid>: aterm
-    // strips `CLAUDE*` from the shells it spawns, and nothing of theirs is read there
     let tmp_root = PathBuf::from(
         crate::sys::make_temp_dir(&format!("{}/tmp.XXXXXX", run.w.display()))
             .map_err(|e| could_not(&format!("cannot make the manager's temp dir: {e}")))?,
     );
-    // `--early`: the prompt rides Claude Code's argv, so its first turn (and the three spawns) can
-    // begin before the instance has read the manager's screen and named its program (the race
-    // three runs met on 2026-10-18): what a worker's line follows then is the starter's terminal
     let t_launch = now();
     crate::lab::launch_claude(
         &run,
@@ -930,7 +797,6 @@ fn run_workers(tag: &str, upgrade: Option<&str>, early: bool) -> Result<Verdict,
         stamp(t_prompt)
     );
 
-    // ---- three workers done (or one stalled or gone), then the manager's summary on its screen
     let n = plan.workers.len();
     let settled = |p: &Pushed| {
         let workers: Vec<&String> = p
@@ -953,8 +819,6 @@ fn run_workers(tag: &str, upgrade: Option<&str>, early: bool) -> Result<Verdict,
     let all_settled = wait_for(Duration::from_secs(240), || settled(&watch.pushed()))?;
     let summary_seen = all_settled && door.seen("LABSUM", 120)?;
     let t_end = now();
-    // the screen draws the summary a moment before the transcript holds it: wait for the row itself
-    // (a one-minute hang detector; it must land, and the check below says so if it did not)
     if summary_seen {
         wait_for(Duration::from_secs(60), || summary_written(&run, &plan))?;
     }
@@ -971,7 +835,6 @@ fn run_workers(tag: &str, upgrade: Option<&str>, early: bool) -> Result<Verdict,
         t_end - t_prompt
     );
 
-    // ---- the evidence
     let all = transcripts(&run);
     let mgr_at = transcript_at(&all, &plan.mgr);
     let mgr = mgr_at.map(|(_, r)| r.as_slice()).unwrap_or_default();
@@ -1021,7 +884,6 @@ fn run_workers(tag: &str, upgrade: Option<&str>, early: bool) -> Result<Verdict,
         };
         let at = format!("@{sid}");
         println!("  {label}        {sid}");
-        // the task record
         let task = door.out(&[at.as_str(), "task"]);
         let rb = kv(&task, "result_bytes")
             .and_then(|v| v.parse::<u64>().ok())
@@ -1033,9 +895,6 @@ fn run_workers(tag: &str, upgrade: Option<&str>, early: bool) -> Result<Verdict,
                 task.trim().chars().take(140).collect::<String>()
             ),
         );
-        // never stalled: every move of its record, rev 1 (the spawn's, before any watch could
-        // subscribe to the session) to the rev it reads now, from the session's own timeline; and
-        // every move the watch was pushed is one of them
         let moves: Vec<&(String, f64, String)> =
             p.tasks.iter().filter(|(s, _, _)| s == sid).collect();
         let rev_state = |pl: &str| {
@@ -1070,7 +929,6 @@ fn run_workers(tag: &str, upgrade: Option<&str>, early: bool) -> Result<Verdict,
         {
             done_at.push(*t);
         }
-        // the result, byte for byte
         let res = door.ctl(&[at.as_str(), "result"])?;
         let header = res.stderr.lines().find(|l| l.contains("OK ")).unwrap_or("");
         let want = w.result();
@@ -1090,7 +948,6 @@ fn run_workers(tag: &str, upgrade: Option<&str>, early: bool) -> Result<Verdict,
             kv(header, "bytes") == Some(bytes.to_string().as_str()),
             &format!("{label}: result header says bytes={bytes} ({header})"),
         );
-        // the first user row: the task as sent, a blank line, one line of fact naming the manager
         let wt = transcript_of(&all, &w.token).unwrap_or_default();
         let first = first_prompt(wt).map(|r| r.text.clone()).unwrap_or_default();
         let fact = first.strip_prefix(&format!("{}\n\n", w.task));
@@ -1105,14 +962,11 @@ fn run_workers(tag: &str, upgrade: Option<&str>, early: bool) -> Result<Verdict,
                 }
             ),
         );
-        // its Bash ran, in the project
-        // through no link: the project's physical path (`/tmp` is one), which the jail may not move
         let wrote = crate::util::scratch_text(&proj.join(&w.file));
         c.check(
             wrote.trim() == w.token,
             &format!("{label}: its Bash ran: {} holds its token", w.file),
         );
-        // timings: its spawn's `OK <sid>` row in the manager's transcript, then its own rows, then the push
         let spawn_ms = mgr
             .iter()
             .find(|r| {
@@ -1142,7 +996,6 @@ fn run_workers(tag: &str, upgrade: Option<&str>, early: bool) -> Result<Verdict,
         }
     }
 
-    // ---- the manager: the background await returned and opened the turn that read the results
     let bg = mgr.iter().position(|r| {
         r.tool_use.as_ref().is_some_and(|(name, input)| {
             name == "Bash"
@@ -1225,7 +1078,6 @@ fn run_workers(tag: &str, upgrade: Option<&str>, early: bool) -> Result<Verdict,
         ),
     );
 
-    // ---- the survey: four Claude Code sessions, what each was asked and last said, within the budget
     let mut all_sids = vec![mgr_sid.clone()];
     all_sids.extend(sids.iter().cloned());
     let head = |s: &str| {
@@ -1252,9 +1104,6 @@ fn run_workers(tag: &str, upgrade: Option<&str>, early: bool) -> Result<Verdict,
             asked_said.push((s.clone(), w.token.clone(), head(&w.report), end(&w.report)));
         }
     }
-    // the survey reads what the sessions publish (each Claude Code footer's own read of its
-    // transcript), a moment behind the transcript: read it until all four show what they were asked
-    // and last said (a one-minute hang detector), and say how long after the summary was drawn
     let mut survey = door.ctl(&["survey"])?;
     let survey_settled = wait_for(Duration::from_secs(60), || {
         if survey_shown(&survey.stdout, &asked_said) == all_sids.len() {
@@ -1313,7 +1162,6 @@ fn run_workers(tag: &str, upgrade: Option<&str>, early: bool) -> Result<Verdict,
     let json_ok = asked_said
         .iter()
         .filter(|(sid, asked, head, end)| {
-            // A finished turn's record keeps its end when the server cut it.
             let said = |s: &J| {
                 let said = field(s, "said");
                 said.contains(head.as_str()) || said.contains(end.as_str())
@@ -1334,7 +1182,6 @@ fn run_workers(tag: &str, upgrade: Option<&str>, early: bool) -> Result<Verdict,
         ),
     );
 
-    // ---- egress: nothing external, and the witness saw the four Claude Codes talk to the stub
     let egress = fs::read_to_string(run.run.join("egress.log")).unwrap_or_default();
     let external = egress.lines().filter(|l| l.contains("EXTERNAL")).count();
     let to_stub = format!("127.0.0.1:{}", run.port);
@@ -1342,7 +1189,6 @@ fn run_workers(tag: &str, upgrade: Option<&str>, early: bool) -> Result<Verdict,
         .unwrap_or_default()
         .lines()
         .filter(|l| {
-            // `<time> <cmd>[<pid>] <proto> <kind> <endpoint>` (the witness's line)
             let w: Vec<&str> = l.split_whitespace().collect();
             w.get(3) == Some(&"conn") && w.get(4) == Some(&to_stub.as_str())
         })
@@ -1359,7 +1205,6 @@ fn run_workers(tag: &str, upgrade: Option<&str>, early: bool) -> Result<Verdict,
         ),
     );
 
-    // ---- the run on one clock
     if let (Some(last), Some((_, wr))) = (done_at.iter().copied().reduce(f64::max), wake)
         && let Some(w_ts) = wr.ts
     {
@@ -1454,10 +1299,8 @@ pub fn cmd_workers(args: &[String]) -> Res {
         )));
     }
     stop::install();
-    // the folder trust seeded: the proof is the workers, not the dialog (the harness answers it, `selftest`)
     let mut u = UpOpts::from_env();
     u.trust = true;
-    // a lab of its own ends with this run, unless it is kept
     u.lifeline = !keep;
     if let Err(f) = crate::lab::up(&tag, &u) {
         if let Some(m) = &f.msg {
@@ -1522,7 +1365,6 @@ mod tests {
             ])
         };
         let said = |t: &str| J::obj([("role", J::s("assistant")), ("content", J::s(t))]);
-        // the manager: three spawns, each the task on stdin byte for byte
         let mut m = vec![user(&plan.prompt)];
         for (k, w) in plan.workers.iter().enumerate() {
             match tool_turn(req(&m).as_bytes(), &script) {
@@ -1538,7 +1380,6 @@ mod tests {
             m.push(used.clone());
             m.push(result(&format!("OK s-{k}{k}{k}a")));
         }
-        // the background wait names the sids the spawns printed, and the turn then ends with text
         match tool_turn(req(&m).as_bytes(), &script) {
             Some(ToolTurn::Call(_, input, 3)) => {
                 assert_eq!(
@@ -1555,7 +1396,6 @@ mod tests {
             tool_turn(req(&m).as_bytes(), &script),
             Some(ToolTurn::Say(plan.waiting.clone(), 4))
         );
-        // the wake opens the next turn: each result, then the summary
         m.push(said(&plan.waiting));
         m.push(user(
             "<task-notification><status>completed</status></task-notification>",
@@ -1575,8 +1415,6 @@ mod tests {
             tool_turn(req(&m).as_bytes(), &script),
             Some(ToolTurn::Say(plan.summary.clone(), 8))
         );
-        // a worker's conversation is its own: one Bash, its report, then its
-        // defense at the LAND instruction
         let w = &plan.workers[1];
         let task_row = user(&format!("{}\n\n(Started by `s-m` …)", w.task));
         assert!(matches!(
@@ -1598,16 +1436,12 @@ mod tests {
             ),
             Some(ToolTurn::Say(w.defense.clone(), 2))
         );
-        // Each defense lands the work under Land's own reading, and no
-        // report or result names the retired token. NEGATIVE CONTROL: a
-        // report alone is no landing.
         for w in &plan.workers {
             assert!(clean_defense(Some(&w.defense)), "{}", w.defense);
             assert!(!clean_defense(Some(&w.report)), "{}", w.report);
             assert!(!w.result().contains("ATERM-TASK-DONE"));
             assert_eq!(w.result(), format!("{}\n\n{}\n", w.report, w.defense));
         }
-        // no token is another's: a worker's task names no other conversation's key
         for w in &plan.workers {
             assert!(!w.task.contains(&plan.mgr));
             assert!(
@@ -1637,7 +1471,6 @@ mod tests {
         .join("\n");
         let r = rows(&text);
         assert_eq!(r.len(), 7);
-        // a request blob copies a message: it is no conversation row
         assert!(r[5].result.is_none() && r[5].kind == "api-request-blob");
         let p = first_prompt(&r).unwrap();
         assert_eq!(p.text, "LABW1-x: go\n\n(Started by `s-m`)");
@@ -1646,10 +1479,8 @@ mod tests {
             r[2].tool_use.as_ref().map(|(n, _)| n.as_str()),
             Some("Bash")
         );
-        // one tool result written twice is one spawn
         assert_eq!(spawned(&r), vec!["s-0f0a".to_string()]);
         assert_eq!(r[6].text, "done");
-        // a tool result is no prompt
         assert!(first_prompt(&r[3..4]).is_none());
     }
 
@@ -1681,7 +1512,6 @@ mod tests {
             )
         );
         assert_eq!(kv(&p.tasks[1].2, "why"), Some("landed"));
-        // a move of a session no ack named is kept, and named by its local id
         assert_eq!(p.tasks[2].0, "local:7");
         assert_eq!(p.gaps.len(), 1);
         assert_eq!(
@@ -1697,7 +1527,6 @@ mod tests {
                   0 1 s-w s-m alive t program=claude upgrade=pending/2.1.301/settling/5s task=done";
         assert_eq!(upgrade_of(ls, "s-m"), "done/2.1.301/-/40s");
         assert_eq!(upgrade_of(ls, "s-w"), "pending/2.1.301/settling/5s");
-        // the parent column names s-m too, and is not its row
         assert_eq!(upgrade_of("0 1 s-w s-m alive upgrade=-", "s-m"), "");
     }
 
@@ -1716,9 +1545,6 @@ mod tests {
     }
 
     /// The await's output is read only where Claude Code writes the task's
-    /// output for the manager's own conversation under the temp root the lab
-    /// gave it, a path the lab builds: never wherever the notification's text
-    /// points.
     #[test]
     fn the_await_output_is_read_where_the_managers_conversation_writes_it() {
         let root = Path::new("/s/runs/t/scratch/tmp.Ab12Cd");
@@ -1730,11 +1556,9 @@ mod tests {
                 "/s/runs/t/scratch/tmp.Ab12Cd/claude-{uid}/-private-tmp-at-Ab12-proj/5f0c/tasks/b1x2.output"
             )))
         );
-        // NEGATIVE CONTROL: a task id that would leave the tasks folder names nothing
         for id in ["", "../x", "a/b", "..", "b1 x"] {
             assert_eq!(task_output_path(root, transcript, id), None, "{id:?}");
         }
-        // ... nor does a transcript whose session or project is no folder of its own
         for t in [
             "/s/home/.claude/projects/p/...jsonl",
             "/s/home/.claude/projects/p/..jsonl",
@@ -1758,7 +1582,6 @@ mod tests {
             read_bounded(&f, 64).as_deref(),
             Ok("@s-1 rev=2 state=done\n")
         );
-        // NEGATIVE CONTROL: one byte past the bound is not read at all
         assert!(read_bounded(&f, 21).is_err());
         let link = d.join("link.output");
         std::os::unix::fs::symlink(&f, &link).unwrap();
@@ -1787,7 +1610,6 @@ mod tests {
             survey_shown(text, &[want("s-m", "LABMGR-x", "Summary: all")]),
             1
         );
-        // A finished turn's said cut keeping its end shows by its end.
         let cut = text.replace(
             "    said: Summary: all three",
             "    said: …and the end of it",
@@ -1796,8 +1618,6 @@ mod tests {
             survey_shown(&cut, &[want("s-m", "LABMGR-x", "Summary: all")]),
             1
         );
-        // NEGATIVE CONTROLS: no `said:` yet (the footer's read behind the transcript), another
-        // session's words, and a session that is no Claude Code
         assert_eq!(
             survey_shown(text, &[want("s-w", "LABW1-x", "Worker one")]),
             0
@@ -1822,8 +1642,6 @@ mod tests {
             vec![(1, "working".to_string()), (2, "done".to_string())]
         );
         assert!(never_stalled(&moves, Some(2)));
-        // NEGATIVE CONTROLS: a stall, a rev the timeline lost, a rev past the newest recorded,
-        // and no record read
         let stalled = [(1, "working".to_string()), (2, "stalled".to_string())];
         assert!(!never_stalled(&stalled, Some(2)));
         assert!(!never_stalled(&moves[1..], Some(2)), "rev 1 missing");

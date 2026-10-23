@@ -9,3 +9,4 @@
 //! file's tests with `targo --unverified test -p aterm-models-harness --test suite -- <file>::`.
 
 mod derived_supervise_tape;
+mod models_occupancy;

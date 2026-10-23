@@ -233,13 +233,13 @@ pub struct BusCopy {
 impl BusCopy {
     /// How many slots it holds.
     #[must_use]
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         self.items.len()
     }
 
     /// Whether it holds none.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.items.is_empty()
     }
 
@@ -445,7 +445,7 @@ impl Log {
     /// The `ms` head a reader is shown: [`Log::ms_head`], or, while the
     /// readers are fenced, the head at the fence.
     #[must_use]
-    pub fn reader_ms_head(&self) -> u64 {
+    pub const fn reader_ms_head(&self) -> u64 {
         if self.fence.is_some() {
             self.fence_ms
         } else {

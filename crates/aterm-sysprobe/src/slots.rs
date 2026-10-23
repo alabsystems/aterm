@@ -1,159 +1,79 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE MACHINE'S BUILD SLOTS, READ WITHOUT A LOCK: which of Trust's
-//! `build-slot` flock files a live build holds, which are free, and which a
-//! dead wrapper's orphaned build still occupies
-//! (`docs/DESIGN-harness-occupancy-2026-10-20.md` §4.2).
-//!
-//! `build-slot` (`$HOME/trust/scripts/build-slot`) admits a heavy build into one
-//! of a few slots: `slot-<i>` files in `~/.cache/build-slot` (or its
-//! `BUILD_SLOT_DIR`), each taken by `flock(LOCK_EX | LOCK_NB)` on a
-//! descriptor the wrapper keeps until its build exits. The winner truncates
-//! the file and writes one JSON record, `{"pid": …, "cmd": …, "cwd": …,
-//! "started": …}` (Python's `json.dumps`: the wrapper's pid and its
-//! `time.time()`), and never clears it. Its `status` verb takes and drops
-//! each free slot's lock, so a reader that did the same would make a racing
-//! acquirer skip a free slot.
-//!
-//! # What this reader never does
-//!
-//! It takes no lock of any kind (`flock`, `fcntl` `F_SETLK`, `O_EXLOCK`),
-//! never opens for writing or creates (`O_RDONLY | O_NOFOLLOW | O_NONBLOCK`,
-//! close on exec), never truncates or touches times, follows no symlinked
-//! slot and starts no process. `flock(2)` conflicts only between open file
-//! descriptions that hold a lock, and the reader's holds none, so no
-//! acquirer's `LOCK_EX | LOCK_NB` can fail because of it. It asks whether a
-//! lock is held with `fcntl(F_GETLK)`, a query that takes none and leaves
-//! none: Darwin keeps a vnode's `flock` locks and record locks in one list,
-//! so the query sees `build-slot`'s `flock` (`live::locked`).
-//!
-//! # A slot's sight, and its state over two reads
-//!
-//! Each read ([`observe`]) gives every `slot-<digits>` regular file a
-//! [`Sight`]: its record is empty, unreadable ([`Sight::Bad`]), held by the
-//! process it names (alive, born no later than the record's `started` plus
-//! [`BIRTH_SLACK_US`], and holding a descriptor to this very file: device and
-//! inode, from libproc's `PROC_PIDLISTFDS` and `PROC_PIDFDVNODEPATHINFO`), or
-//! not held. The lock query, asked after the record is read, has the last
-//! word on not held: a file whose lock someone holds is never empty or not
-//! held ([`Sight::Unproven`]: a winner between its `flock` and its record,
-//! however long it stalls there). A refused lock query proves no absence:
-//! an empty record or a missing holder stays unproven until the query says
-//! unlocked. A writer whose descriptors cannot be read has let go once
-//! nobody holds the lock. A [`SlotBook`] pairs two reads
-//! at least [`MIN_GAP_MS`] apart ([`SlotState`]): held is the same holder
-//! seen on both, free is no holder on both, unknown is a read that could not
-//! be judged, and pending is everything else: a first read, a single
-//! sighting, a change.
-//!
-//! # A dead wrapper's live build
-//!
-//! A wrapper killed mid-build frees its flock while its build (a session of
-//! its own) runs on under launchd. A free slot is counted occupied by such an
-//! orphan ([`SlotCounts::discounted`]) only when its record's wrapper is gone
-//! (dead, or its pid reused), it started within [`ORPHAN_HORIZON_US`], the
-//! machine's 5-minute load is more than the held slots and the orphans
-//! already counted explain, and a live witness is found: a process launchd
-//! adopted, leading its own session and group, of this user, born within
-//! [`WITNESS_WINDOW_US`] of the record's `started`, working in the record's
-//! `cwd` ([`adopted_in_window`] and the live check), and no witness already
-//! of another candidate in this read. The process table is read only when a
-//! candidate gets that far.
-//!
-//! # What enters aterm
-//!
-//! The record's pid and start; its `cwd` only to compare with a witness's
-//! working directory, never printed. Its `cmd` is checked to be a string and
-//! dropped.
-//!
-//! Bounded: at most [`MAX_ENTRIES`] directory entries are looked at,
-//! [`MAX_SLOTS`] slots kept, [`RECORD_CAP`] bytes read per record. macOS
-//! only; elsewhere every read is [`SlotsRead::Unread`]`(`[`Unread::Unsupported`]`)`.
-//! No timer and no thread: [`SlotReader`] re-reads when its caller asks, at
-//! most once per [`PERIOD`] while a wait names the slots, else once per
-//! [`IDLE_PERIOD`].
+//! Lock-free reader for Trust `build-slot` occupancy and orphaned builds.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-/// Where `build-slot` keeps its slots under a home directory.
+/// Relative path under `$HOME` where `build-slot` stores slot files.
 pub const SLOT_DIR: &str = ".cache/build-slot";
-/// A record longer than this is unreadable ([`Sight::Bad`]).
+/// Maximum byte length of a valid slot record (`16 KiB`).
 pub const RECORD_CAP: usize = 16 << 10;
-/// Two reads closer than this are not paired: the later one is not kept.
+/// Minimum gap in milliseconds between two paired slot observations.
 pub const MIN_GAP_MS: u64 = 1_000;
-/// [`SlotReader`] reads the slots again at most this often while a wait names
-/// them (`armed`, [`SlotReader::read`]).
+/// Polling period while a wait names build slots.
 pub const PERIOD: Duration = Duration::from_secs(5);
-/// …and at most this often otherwise: the occupancy board's look
-/// (`DESIGN-harness-occupancy-2026-10-20.md` §3.1, the cadence).
+/// Polling period when no wait names build slots.
 pub const IDLE_PERIOD: Duration = Duration::from_secs(60);
-/// The line a host logs when the first wait naming the slots arms its
-/// reader's [`PERIOD`] (the lab's sign that a wait is armed).
+/// Log line emitted when a slot wait arms [`PERIOD`].
 pub const ARMED_LINE: &str = "occupancy: build slots read every 5 s (a wait names them)";
-/// …and when the last one goes, back to [`IDLE_PERIOD`].
+/// Log line emitted when the last slot wait finishes and resets to [`IDLE_PERIOD`].
 pub const AT_REST_LINE: &str = "occupancy: build slots read once a minute (no wait names them)";
-/// An orphan is looked for only behind a record this young (12 hours).
+/// Maximum age in microseconds for considering an orphaned build record (12 hours).
 pub const ORPHAN_HORIZON_US: u64 = 12 * 3600 * 1_000_000;
-/// A witness was born within this long after its record's `started`.
+/// Maximum birth window in microseconds after `started` for matching an orphan witness.
 pub const WITNESS_WINDOW_US: u64 = 10_000_000;
-/// The record's `started` is a float of the wrapper's `time.time()`, read
-/// after its exec: a holder born up to this much later is still the writer.
+/// Clock slack in microseconds allowed between `started` and holder birth.
 pub const BIRTH_SLACK_US: u64 = 1_000;
-/// At most this many directory entries are looked at per read.
+/// Maximum directory entries inspected per read.
 pub const MAX_ENTRIES: usize = 1024;
-/// At most this many slots (the lowest indices) are kept per read.
+/// Maximum slots retained per read (lowest indices).
 pub const MAX_SLOTS: usize = 256;
 
-/// Why the slots were not read. A closed set: the host spells each with the
-/// word its readings refuse with.
+/// Reason why build slots could not be read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Unread {
-    /// A platform with no reader.
+    /// Platform has no slot reader.
     Unsupported,
-    /// A missing directory, or one with no slot in it.
+    /// Slot directory is missing or contains no slot files.
     NotSampled,
-    /// A directory, or every slot in it, refused to this user.
+    /// Slot directory or all slot files were unreadable by this user.
     Refused,
-    /// Every slot's record is unreadable: `build-slot` changed its record.
+    /// Every slot file held an unrecognized record format.
     UnreadFormat,
 }
 
-/// The slot directory under `home` ([`SLOT_DIR`]).
+/// Returns `<home>/.cache/build-slot`.
 #[must_use]
 pub fn default_dir(home: &Path) -> PathBuf {
     home.join(SLOT_DIR)
 }
 
-/// What a slot's record says: who wrote it and when.
+/// Parsed metadata from a `slot-<i>` record.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Record {
-    /// The wrapper's pid.
+    /// Wrapper process ID.
     pub pid: u32,
-    /// Its `started`, in microseconds since the epoch (rounded down).
+    /// Wrapper start time in microseconds since the Unix epoch.
     pub started_us: u64,
-    /// Its `cwd`, kept only to compare with a witness's working directory.
+    /// Wrapper working directory.
     pub cwd: Option<PathBuf>,
 }
 
-/// One slot file's contents, parsed.
+/// Outcome of parsing a slot file's bytes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RecordRead {
-    /// No bytes: a slot `status` created and nobody won, or a winner between
-    /// its truncate and its write.
+    /// Empty file.
     Empty,
-    /// Not a record this reader knows.
+    /// Unrecognized or malformed record.
     Bad,
-    /// A record.
+    /// Valid [`Record`].
     Rec(Record),
 }
 
 impl Record {
-    /// Parse a slot file's bytes: a JSON object whose `pid` is an integer in
-    /// `2..=i32::MAX` and whose `started` is a finite number at least 0;
-    /// `cmd` and `cwd`, when present, are strings; `"v"`, when present, is 1.
-    /// Other keys are allowed.
+    /// Parses a `build-slot` JSON record from `bytes`.
     #[must_use]
     pub fn parse(bytes: &[u8]) -> RecordRead {
         use aterm_json::Value;
@@ -182,8 +102,6 @@ impl Record {
         match (pid, started) {
             (Some(pid), Some(started)) if version_known && strings => RecordRead::Rec(Self {
                 pid,
-                // Saturating: a `started` past `u64` microseconds reads as the
-                // far future, never wraps.
                 started_us: (started * 1e6) as u64,
                 cwd: v.get("cwd").and_then(Value::as_str).map(PathBuf::from),
             }),
@@ -192,53 +110,42 @@ impl Record {
     }
 }
 
-/// A process that holds a slot.
+/// Process holding a build slot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Holder {
-    /// Its pid.
+    /// Process ID.
     pub pid: u32,
-    /// When it was born, microseconds since the epoch: with the pid, its
-    /// identity across reads.
+    /// Process birth time in microseconds since the Unix epoch.
     pub birth_us: u64,
 }
 
 impl Holder {
-    /// Whether the process at its pid now is still this holder: the
-    /// kernel's record of that pid names its birth. `false` where the pid is
-    /// gone, was taken by another process since, or this platform has no
-    /// reader of the record.
+    /// Returns `true` if `self.pid` is still running with `self.birth_us`.
     #[must_use]
     pub fn running(&self) -> bool {
         crate::kproc::record(self.pid).is_some_and(|p| birth_us(&p) == self.birth_us)
     }
 }
 
-/// One slot as one read saw it.
+/// Single-read observation of one slot file.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Sight {
-    /// An empty record.
+    /// Empty slot file.
     Empty,
-    /// Not a regular file, past [`RECORD_CAP`], or a record this reader does
-    /// not know.
+    /// Non-regular, oversized, or unparseable slot file.
     Bad,
-    /// Could not be judged this read: the file was replaced or refused while
-    /// it was read, the named process's descriptors could not be read while
-    /// the lock query gave no answer, or someone holds the file's lock whom
-    /// the record does not show holding it.
+    /// Slot state could not be proven on this read.
     Unproven,
-    /// A record whose writer does not hold the file now. `gone` carries the
-    /// record when the writer is dead or its pid reused (an orphan's
-    /// candidate); `None` when the writer lives and has let go.
+    /// Writer does not hold the file open.
     NotHeld {
-        /// The record of a gone writer.
+        /// Record of a writer that is dead or had its PID reused.
         gone: Option<Record>,
     },
-    /// The record's writer holds the file open.
+    /// Writer holds the slot file open.
     Sighted(Holder),
 }
 
 /// A missing holder is proven only by an unlocked file. A refused query
-/// keeps it unproven; positive descriptor evidence still stands.
 #[cfg(any(target_os = "macos", test))]
 fn lock_checked(sight: Sight, lock: Option<bool>) -> Sight {
     match (lock, sight) {
@@ -249,84 +156,82 @@ fn lock_checked(sight: Sight, lock: Option<bool>) -> Sight {
     }
 }
 
-/// One slot in one read.
+/// Observation of a single `slot-<i>` file.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SlotObs {
-    /// Its `<i>` in `slot-<i>`.
+    /// Slot index `i`.
     pub index: u32,
-    /// The file's device (as `u32`, the kernel's `dev_t` bits) and inode.
+    /// Slot file `(dev, ino)` identity.
     pub file: (u32, u64),
-    /// What the read saw.
+    /// Observed [`Sight`].
     pub sight: Sight,
 }
 
-/// One read of the slot directory.
+/// Single point-in-time read of a slot directory.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Observation {
-    /// When, on the caller's monotonic clock, in milliseconds.
+    /// Caller monotonic timestamp in milliseconds.
     pub mono_ms: u64,
-    /// When, in microseconds since the epoch.
+    /// Wall-clock timestamp in microseconds since the Unix epoch.
     pub now_us: u64,
-    /// Every slot, by index.
+    /// Observed slots ordered by index.
     pub slots: Vec<SlotObs>,
 }
 
-/// A slot's state over two reads.
+/// Slot state paired across two reads.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SlotState {
-    /// The same holder on both.
+    /// Held by the same process on both reads.
     Held(Holder),
-    /// No holder on both.
+    /// Unheld on both reads.
     Free,
-    /// Neither yet: a first read, a single sighting, a change.
+    /// Single sighting or transition awaiting confirmation.
     Pending,
-    /// This read could not judge it ([`Sight::Bad`], [`Sight::Unproven`]):
-    /// never free.
+    /// Unproven or malformed on the latest read.
     Unknown,
 }
 
-/// How many slots are in each state.
+/// Summary counts across all observed slots.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SlotCounts {
-    /// Slots present.
+    /// Total slots present.
     pub n: u16,
-    /// Held.
+    /// Held slots.
     pub held: u16,
-    /// Free (orphan-occupied ones included; see `discounted`).
+    /// Free slots (including `discounted`).
     pub free: u16,
-    /// Pending.
+    /// Pending slots.
     pub pending: u16,
-    /// Unknown.
+    /// Unknown slots.
     pub unknown: u16,
-    /// Free slots a dead wrapper's live build still occupies: usable is
-    /// `free - discounted`.
+    /// Free slots discounted due to orphaned builds under load.
     pub discounted: u16,
 }
 
-/// The slots as a reading proved them.
+/// Proven slot reading.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SlotsRead {
-    /// Not read, and why.
+    /// Slots could not be read.
     Unread(Unread),
-    /// Read.
+    /// Slots were read and judged.
     Read {
-        /// The counts.
+        /// Summary counts.
         counts: SlotCounts,
-        /// Every held slot's holder, by slot index.
+        /// Active slot holders ordered by slot index.
         holders: Vec<Holder>,
     },
 }
 
-/// The machine facts the orphan rule weighs.
+/// Machine load facts used when discounting orphaned builds.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Machine {
-    /// The 5-minute load average.
+    /// Five-minute load average.
     pub load5: Option<f64>,
-    /// Logical cores.
+    /// Logical CPU count.
     pub ncpu: Option<usize>,
 }
 
-/// The reads a judgement pairs: the last one kept, and what it judged.
+/// Paired slot observation state across reads.
 #[derive(Clone, Debug, Default)]
 pub struct SlotBook {
     prev: Option<Observation>,
@@ -334,11 +239,7 @@ pub struct SlotBook {
 }
 
 impl SlotBook {
-    /// Judge `obs` against the last read kept (see the module docs). A read
-    /// fewer than [`MIN_GAP_MS`] after the kept one is not kept, and the last
-    /// judgement stands. `witness` answers whether a gone writer's build
-    /// provably runs on; it is asked only of a free slot that passed the
-    /// other orphan rules.
+    /// Judges `obs` against the previously kept read, discounting orphaned builds via `witness`.
     pub fn judge(
         &mut self,
         obs: Observation,
@@ -416,9 +317,6 @@ fn judged(
 }
 
 /// How many of the free slots' gone writers' builds run on (module docs):
-/// the newest record first, each counted while the 5-minute load exceeds what
-/// the held slots and the orphans counted so far, this one included, explain
-/// (`load5 > (held + k) * ncpu / n`).
 fn discounted(
     mut candidates: Vec<&Record>,
     counts: SlotCounts,
@@ -448,11 +346,7 @@ fn discounted(
     found
 }
 
-/// Whether the process `p` could be `rec`'s orphaned build by its kernel
-/// record alone: launchd adopted it, it leads its own group, it is `uid`'s,
-/// it is no zombie, and it was born within [`WITNESS_WINDOW_US`] after
-/// `rec`'s `started` (less [`BIRTH_SLACK_US`] for the float). The live check
-/// adds that it leads its session and works in `rec`'s `cwd`.
+/// Returns `true` if `p` matches an orphaned build spawned by `rec` within `now_us`.
 #[must_use]
 pub fn adopted_in_window(p: &crate::kproc::Record, rec: &Record, uid: u32) -> bool {
     let birth = birth_us(p);
@@ -471,14 +365,9 @@ fn birth_us(p: &crate::kproc::Record) -> u64 {
         .saturating_add(u64::from(p.start_us))
 }
 
-/// Read the slot directory `dir` once, at `mono_ms` (the caller's monotonic
-/// clock) and `now_us` (the epoch). `Err` says why not:
-/// [`Unread::NotSampled`] for a missing directory or one with no slot,
-/// [`Unread::Refused`] when it or every slot is refused,
-/// [`Unread::Unsupported`] off macOS.
-///
+/// Reads all slots in `dir` at `(mono_ms, now_us)`.
 /// # Errors
-/// As above.
+/// Returns [`Unread`] if `dir` is unsupported, missing, refused, or unreadable.
 pub fn observe(dir: &Path, mono_ms: u64, now_us: u64) -> Result<Observation, Unread> {
     #[cfg(target_os = "macos")]
     {
@@ -500,9 +389,7 @@ fn slot_index(name: &str) -> Option<u32> {
         .flatten()
 }
 
-/// The slot reader a host keeps: one directory, its [`SlotBook`], and the
-/// last reading, handed back until [`PERIOD`] has passed while a wait names
-/// the slots, [`IDLE_PERIOD`] otherwise.
+/// Cached build-slot reader respecting [`PERIOD`] and [`IDLE_PERIOD`].
 #[derive(Debug)]
 pub struct SlotReader {
     dir: PathBuf,
@@ -512,7 +399,7 @@ pub struct SlotReader {
 }
 
 impl SlotReader {
-    /// A reader of the slots in `dir` ([`default_dir`]).
+    /// Creates a reader for `dir`.
     #[must_use]
     pub fn new(dir: PathBuf) -> Self {
         Self {
@@ -523,16 +410,13 @@ impl SlotReader {
         }
     }
 
-    /// The directory it reads.
+    /// Returns the slot directory path.
     #[must_use]
     pub fn dir(&self) -> &Path {
         &self.dir
     }
 
-    /// The slots at `now` (`now_us` since the epoch): the last reading while
-    /// it is younger than [`PERIOD`] (`armed`: a wait names the slots) or
-    /// [`IDLE_PERIOD`], else a fresh read judged against the last one. A
-    /// directory that cannot be read starts the pairing over.
+    /// Returns the current or cached [`SlotsRead`] at `(now, now_us)`.
     pub fn read(&mut self, now: Instant, now_us: u64, m: &Machine, armed: bool) -> SlotsRead {
         let period = if armed { PERIOD } else { IDLE_PERIOD };
         if let Some((at, read)) = &self.last
@@ -554,17 +438,14 @@ impl SlotReader {
         read
     }
 
-    /// When the reading [`Self::read`] hands back was read; `None` before the
-    /// first.
+    /// Returns when the cached reading was taken, if any.
     #[must_use]
     pub fn read_at(&self) -> Option<Instant> {
         self.last.as_ref().map(|(at, _)| *at)
     }
 }
 
-/// The live witness check (module docs): the process table read once, on the
-/// first question, and each candidate's session and working directory read
-/// from the kernel. Off macOS, never a witness.
+/// Returns a closure that checks whether a gone slot record has a live orphaned build witness.
 pub fn live_witness() -> impl FnMut(&Record) -> bool {
     #[cfg(target_os = "macos")]
     {
@@ -589,15 +470,13 @@ mod live {
     use crate::kproc;
 
     /// One slot's read: kept, vanished between the listing and the read, or
-    /// refused to this user.
     enum Got {
         Slot(SlotObs),
         Vanished,
         Refused,
     }
 
-    /// [`super::observe`], with `while_open` called on each slot file while
-    /// the reader's descriptor to it is open (the tests' acquirer seam).
+    /// Implements [`observe`] with a test hook invoked while each slot file is open.
     pub(super) fn observe_in(
         dir: &Path,
         mono_ms: u64,
@@ -646,7 +525,6 @@ mod live {
     }
 
     /// The file's identity as the kernel's vnode answer spells it: `vst_dev`
-    /// is a 32-bit `dev_t`, which std widens with its sign.
     fn identity(meta: &std::fs::Metadata) -> (u32, u64) {
         (meta.dev() as u32, meta.ino())
     }
@@ -663,9 +541,6 @@ mod live {
         if !meta.file_type().is_file() {
             return kept(file, Sight::Bad);
         }
-        // Read only: no create, no write, no lock; a symlink swapped in since
-        // the `lstat` fails (`ELOOP`) rather than being followed; a FIFO
-        // swapped in does not block the open.
         let opened = std::fs::OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
@@ -684,8 +559,6 @@ mod live {
         }
         let mut bytes = Vec::new();
         let read = (&mut f).take(RECORD_CAP as u64 + 1).read_to_end(&mut bytes);
-        // Asked after the record is read: a winner that took the lock since
-        // is seen holding it, whatever record the read saw.
         let lock = locked(&f);
         while_open(path);
         drop(f);
@@ -698,7 +571,6 @@ mod live {
         kept(
             file,
             match Record::parse(&bytes) {
-                // A winner between its truncate and its write.
                 RecordRead::Empty => lock_checked(Sight::Empty, lock),
                 RecordRead::Bad => Sight::Bad,
                 RecordRead::Rec(rec) => holder(rec, file, lock),
@@ -706,11 +578,7 @@ mod live {
         )
     }
 
-    /// Whether any process holds a lock on `f`'s file now: `fcntl(F_GETLK)`
-    /// for the whole file, a query that takes no lock and leaves none, and on
-    /// Darwin sees `flock` locks too (they share the vnode's one lock list),
-    /// whoever's they are. `None` when the kernel gives no answer (a file
-    /// system that keeps no local locks).
+    /// Queries `fcntl(F_GETLK)` on `f` without blocking.
     pub(super) fn locked(f: &std::fs::File) -> Option<bool> {
         use std::os::fd::AsRawFd as _;
         let mut query = libc::flock {
@@ -720,14 +588,12 @@ mod live {
             l_type: libc::F_WRLCK as libc::c_short,
             l_whence: libc::SEEK_SET as libc::c_short,
         };
-        // SAFETY: `f` is an open descriptor this function borrows, and
-        // `query` a `struct flock` `F_GETLK` reads and writes in place.
+        // SAFETY: `f` is an open borrowed descriptor and `query` is a valid `flock` struct.
         let rc = unsafe { libc::fcntl(f.as_raw_fd(), libc::F_GETLK, &raw mut query) };
         (rc != -1).then_some(query.l_type != libc::F_UNLCK as libc::c_short)
     }
 
-    /// Whether `rec`'s writer holds `file` now (module docs), the file's lock
-    /// as [`locked`] found it (`lock`) having the last word on not held.
+    /// Determines whether `rec`'s writer currently holds `file`.
     pub(super) fn holder(rec: Record, file: (u32, u64), lock: Option<bool>) -> Sight {
         lock_checked(by_descriptor(rec, file), lock)
     }
@@ -740,7 +606,6 @@ mod live {
         };
         let birth = birth_us(&p);
         if birth > rec.started_us.saturating_add(BIRTH_SLACK_US) {
-            // Born after the record was written: another process with the
             // writer's pid.
             return Sight::NotHeld { gone: Some(rec) };
         }
@@ -751,7 +616,6 @@ mod live {
             }),
             Some((_, false)) => Sight::NotHeld { gone: None },
             Some((_, true)) => Sight::Unproven,
-            // Refused: the writer may have exited since.
             None => match kproc::record(rec.pid).filter(alive) {
                 Some(q) if birth_us(&q) == birth => Sight::Unproven,
                 _ => Sight::NotHeld { gone: Some(rec) },
@@ -759,13 +623,11 @@ mod live {
         }
     }
 
-    /// [`super::live_witness`] on macOS. A process witnesses one candidate:
-    /// once it has, it is no witness of another, so one orphaned build never
-    /// discounts two slots.
+    /// macOS implementation of [`live_witness`].
     pub(super) fn witness() -> impl FnMut(&Record) -> bool {
         let mut table: Option<Option<Vec<kproc::Record>>> = None;
         let mut used: Vec<u32> = Vec::new();
-        // SAFETY: `geteuid` reads this process's effective uid.
+        // SAFETY: `geteuid` is always safe to call.
         let uid = unsafe { libc::geteuid() };
         move |rec: &Record| {
             let Some(cwd) = rec.cwd.as_deref() else {

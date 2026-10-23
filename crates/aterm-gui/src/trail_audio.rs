@@ -1,22 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Trail audio output: owns the platform audio queue and feeds it from the
-//! pure [`aterm_effects::trail_sound::TrailSynth`].
-//!
-//! The synth decides every sample; this module owns the output device, its
-//! callback thread and the power policy (the queue stops synchronously when
-//! the synth reports exact silence, so an idle terminal does no audio work).
-//!
-//! macOS backend: AudioToolbox's `AudioQueue` through hand-written C FFI (a
-//! system framework, so the `#[link]` adds no dependency). Three 512-frame
-//! float buffers (~10 ms each) are never pre-enqueued as silence: cold start
-//! and idle resume render every available buffer after the cue has entered the
-//! synth, so sound begins in the first buffer. The queue's thread drives the
-//! render callback; a dormant audio worker accepts nonblocking UI cues and
-//! owns all platform control calls.
-//!
-//! Other platforms: an inert stub with the same API.
+//! Trail audio output queue fed from [`aterm_effects::trail_sound::TrailSynth`] (AudioToolbox
+//! `AudioQueue` on macOS, inert stub elsewhere).
 
 use std::time::Duration;
 #[cfg(target_os = "macos")]
@@ -24,48 +10,35 @@ use std::time::Instant;
 
 use aterm_effects::trail_sound::{EventMeta, SoundEvent};
 
-/// Whether this build has a real platform audio output. Non-macOS
-/// [`TrailAudio`] implementations discard cues; Settings uses this to describe
-/// the saved toggle without claiming sound is playing.
+/// Whether this build has a real platform audio output.
 #[must_use]
 pub(crate) const fn output_available() -> bool {
     cfg!(target_os = "macos")
 }
 
 /// Output sample rate. 48 kHz is the native rate of every modern Mac output
-/// path; the hardware resampler handles the rest.
 #[cfg(target_os = "macos")]
 const SAMPLE_RATE: f64 = 48_000.0;
 
 /// Frames per queue buffer (~10.7 ms at 48 kHz), 3 buffers in flight. Start
-/// latency is bounded by one buffer; none is silent priming ahead of a cue.
 #[cfg(target_os = "macos")]
 const BUFFER_FRAMES: usize = 512;
 #[cfg(target_os = "macos")]
 const BUFFER_COUNT: usize = 3;
 
 /// Consecutive silent buffers before the queue pauses: 140 buffers is about
-/// 1.5 s of exact silence (the synth's beds are already at zero, so this cannot
-/// clip a tail). Longer than a pause between typed words, so the first key
-/// after a pause does not pay an `AudioQueueStart` its successors skip.
 #[cfg(target_os = "macos")]
 const PAUSE_AFTER_SILENT: u32 = 140;
 
 /// Housekeeping cadence while the AudioQueue runs: observes the exact-silence
-/// counter and pauses the device. Armed only while audio is live; disarms
-/// itself after a pause.
 #[cfg(target_os = "macos")]
 const HOUSEKEEPING_INTERVAL: Duration = Duration::from_millis(250);
 
 /// UI-side staleness threshold for the worker's platform-busy stamp. A
-/// control call that has not returned for this long is wedged (`audio=wedged`);
-/// a parked worker holds no stamp and is never wedged.
 #[cfg(target_os = "macos")]
 const WEDGE_AFTER_MS: u64 = 3_000;
 
 /// How long teardown waits for a live worker before detaching it: one
-/// housekeeping interval plus a healthy platform call, so an ordinary drop is
-/// effectively synchronous and a wedge never blocks the event loop.
 #[cfg(target_os = "macos")]
 const DETACH_DEADLINE: Duration = Duration::from_millis(600);
 
@@ -74,7 +47,6 @@ const DETACH_DEADLINE: Duration = Duration::from_millis(600);
 const DETACH_POLL: Duration = Duration::from_millis(5);
 
 /// What a [`TrailAudio`] drop did with its worker, recorded (test-only) on the
-/// dropping thread so teardown tests assert the join/detach decision itself.
 #[cfg(all(test, target_os = "macos"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum WorkerTeardown {
@@ -92,23 +64,18 @@ thread_local! {
     static LAST_TEARDOWN: std::cell::Cell<Option<WorkerTeardown>> =
         const { std::cell::Cell::new(None) };
     /// A longer [`DETACH_DEADLINE`] for drops on this thread, so a slow
-    /// scheduler cannot turn an expected join into a detach.
     static DETACH_DEADLINE_OVERRIDE: std::cell::Cell<Option<Duration>> =
         const { std::cell::Cell::new(None) };
     /// Whether the last drop on this thread had already closed the cue channel
-    /// when it began waiting for its worker — the wake a parked worker needs.
     static CLOSED_BEFORE_WAIT: std::cell::Cell<Option<bool>> =
         const { std::cell::Cell::new(None) };
 }
 
 /// Test-only: the workers (named as in [`PARKED_WORKERS`]) that exited because
-/// their idle `recv()` answered `Disconnected`. With [`CLOSED_BEFORE_WAIT`] it
-/// shows a healthy teardown is woken by the closing channel.
 #[cfg(all(test, target_os = "macos"))]
 static DISCONNECT_EXITS: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
 
 /// Record that the worker owning `state` left its idle `recv()` on
-/// `Disconnected` ([`DISCONNECT_EXITS`]).
 #[cfg(all(test, target_os = "macos"))]
 fn note_disconnect_exit(state: &std::sync::atomic::AtomicU8) {
     DISCONNECT_EXITS
@@ -118,7 +85,6 @@ fn note_disconnect_exit(state: &std::sync::atomic::AtomicU8) {
 }
 
 /// Whether the worker owning `state` left on `Disconnected`, consuming the
-/// record ([`DISCONNECT_EXITS`]).
 #[cfg(all(test, target_os = "macos"))]
 fn took_disconnect_exit(state: &std::sync::atomic::AtomicU8) -> bool {
     let key = std::ptr::from_ref(state) as usize;
@@ -133,8 +99,6 @@ fn took_disconnect_exit(state: &std::sync::atomic::AtomicU8) -> bool {
 }
 
 /// Test-only: the workers, named by the address of their state word, that are
-/// past their last `shutdown` check and committed to the idle `recv()`, so a
-/// teardown test can drop a worker that is really parked.
 #[cfg(all(test, target_os = "macos"))]
 static PARKED_WORKERS: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
 
@@ -185,40 +149,22 @@ fn detach_deadline() -> Duration {
 }
 
 /// Lifetime budget of worker revivals after wedge detection. Each revival
-/// abandons one blocked thread and its queue (a thread stuck in a platform
-/// call cannot be cancelled); the budget bounds that leak, and exhaustion
-/// seals ingress so the host reads inert.
 #[cfg(target_os = "macos")]
 const WEDGE_REVIVES: u8 = 3;
 
 /// How long a device open may run before it is judged a wedge: five times
-/// [`WEDGE_AFTER_MS`], because an open waits on hardware (a Bluetooth output
-/// negotiating, a device switch, coreaudiod restarting after wake).
 #[cfg(target_os = "macos")]
 const OPEN_WEDGE_AFTER_MS: u64 = WEDGE_AFTER_MS * 5;
 
 /// How long without a render callback counts as a stall: the queue is running
-/// and was armed by a successful start, yet `render_cb` has not run (a
-/// coreaudiod restart, a vanished device, a post-sleep invalidation).
-///
-/// One buffer period is 10.667 ms and the 3-buffer FIFO drains in 32 ms, so
-/// 750 ms is 70 buffer periods. The key path checks it on every push.
-///
-/// It cannot fire on a healthy parked queue: after the idle stop `running` is
-/// false and `worker_loop` blocks in `recv` without calling `on_tick`, and
-/// during the [`PAUSE_AFTER_SILENT`] window the queue keeps rendering silence.
-/// Polling `on_tick` while parked would break this.
 #[cfg(target_os = "macos")]
 const STALL_AFTER_MS: u64 = 750;
 
 /// Lifetime budget of device reopens. Budget exhaustion is the only terminal
-/// state; each transient AudioToolbox failure spends one reopen.
 #[cfg(target_os = "macos")]
 const REOPEN_BUDGET: u8 = 6;
 
 /// Wait before the n-th reopen attempt. The first is immediate (the likely
-/// fault is transient, and the next key should sound); the schedule then grows
-/// three- to fourfold, so an absent device costs about 44 s of attempts.
 #[cfg(target_os = "macos")]
 const REOPEN_BACKOFF: [Duration; REOPEN_BUDGET as usize] = [
     Duration::ZERO,
@@ -239,14 +185,10 @@ mod mac {
 
     use super::{BUFFER_COUNT, BUFFER_FRAMES, PAUSE_AFTER_SILENT, SAMPLE_RATE};
 
-    /// One queue block in seconds — 512 frames at 48 kHz = 10.667 ms — the
-    /// ceiling on a cue's pre-roll ([`EventMeta::block_lead_s`]).
+    /// One queue block in seconds.
     pub(super) const BLOCK_S: f32 = BUFFER_FRAMES as f32 / SAMPLE_RATE as f32;
 
-    /// Pre-roll: how far into the in-flight block a cue arrived, from the
-    /// block's admission stamp and the cue's instant. `0` while the queue is
-    /// not running (the first cue after idle primes fresh buffers) and before
-    /// any block is stamped; otherwise `now - start`, clamped to one block.
+    /// Pre-roll: how far into the in-flight block a cue arrived.
     pub(super) fn block_lead_s(running: bool, block_start_us: u64, now_us: u64) -> f32 {
         if !running || block_start_us == 0 {
             return 0.0;
@@ -254,18 +196,14 @@ mod mac {
         (now_us.saturating_sub(block_start_us) as f32 * 1e-6).min(BLOCK_S)
     }
 
-    /// Stall verdict: the queue is running, armed (a successful start stamped
-    /// `last_cb_us`), and no callback has arrived for
-    /// [`super::STALL_AFTER_MS`]. Both conditions are required, or the idle
-    /// window or a cold `MacOut` would read as a stall.
+    /// Stall verdict: the queue is running, armed (a successful start stamped `last_cb_us`).
     pub(super) fn callback_stalled(running: bool, last_cb_us: u64, now_us: u64) -> bool {
         running
             && last_cb_us != 0
             && now_us.saturating_sub(last_cb_us) >= super::STALL_AFTER_MS * 1_000
     }
 
-    /// What servicing the queue decided. There is no error variant: every
-    /// fault is a `Reopen`, and only the budget can make silence permanent.
+    /// What servicing the queue decided.
     #[derive(Clone, Copy, PartialEq, Eq, Debug)]
     pub(super) enum Service {
         Running,
@@ -273,19 +211,14 @@ mod mac {
         Reopen,
     }
 
-    /// What delivering a cue decided. `Reopen` means the cue was not consumed:
-    /// the worker reopens the device under the budget and re-pushes this cue,
-    /// so the key that discovered the fault is still heard.
+    /// What delivering a cue decided.
     #[derive(Clone, Copy, PartialEq, Eq, Debug)]
     pub(super) enum Delivery {
         Sounded,
         Reopen,
     }
 
-    /// Edge raised by [`running_listener`] whenever AudioToolbox reports that
-    /// `kAudioQueueProperty_IsRunning` changed; consumed by the worker in
-    /// [`DeviceHealth::needs_reopen`]. It carries no value: the worker reads
-    /// the property itself, inside its platform-busy stamp.
+    /// Edge raised by [`running_listener`] when AudioToolbox reports a change.
     pub(super) struct RunningEdge(AtomicBool);
 
     impl RunningEdge {
@@ -293,31 +226,18 @@ mod mac {
             Self(AtomicBool::new(false))
         }
 
-        /// The listener's whole body: one wait-free atomic store.
+        /// The listener's whole body.
         pub(super) fn raise(&self) {
             self.0.store(true, Ordering::Release);
         }
 
-        /// Consume a pending edge. The plain load first keeps the healthy
-        /// per-key path to one relaxed read.
+        /// Consume a pending edge.
         pub(super) fn take(&self) -> bool {
             self.0.load(Ordering::Relaxed) && self.0.swap(false, Ordering::AcqRel)
         }
     }
 
-    /// The `IsRunning` property listener; runs on an AudioToolbox thread.
-    ///
-    /// Takes no lock, never reads the property, never calls the control path
-    /// and never pushes a cue: the worker owns all platform control calls.
-    ///
-    /// `user` is the address of [`Shared::running_edge`] inside the queue's
-    /// `Arc<Shared>`. That allocation is kept alive by the raw refcount
-    /// [`AudioToolboxQueue::user`] owns, which [`OwnedQueue`]'s `Drop` releases
-    /// only after removing this listener and synchronously disposing the
-    /// queue (AudioToolbox does not promise removal waits out an in-flight
-    /// invocation). A queue whose worker stays stuck in a platform call is never
-    /// disposed, so its allocation leaks rather than being freed under a live
-    /// listener.
+    /// The `IsRunning` property listener.
     pub(super) extern "C" fn running_listener(
         user: *mut c_void,
         _q: AudioQueueRef,
@@ -326,40 +246,25 @@ mod mac {
         if id != PROP_IS_RUNNING || user.is_null() {
             return;
         }
-        // SAFETY: see the ownership argument above — `user` points at a
-        // `RunningEdge` that outlives every listener invocation.
+        // SAFETY: `user` points at a `RunningEdge` that outlives every listener call.
         let edge = unsafe { &*(user as *const RunningEdge) };
         edge.raise();
     }
 
-    /// What one read of `IsRunning` means, given what the worker already
-    /// knows about this start. Pure, so every cell is provable headless.
+    /// What one read of `IsRunning` means, given what the worker already knows about this start.
     #[derive(Clone, Copy, PartialEq, Eq, Debug)]
     pub(super) enum RunningProbe {
-        /// It reads running. Nothing to claim, and from now on a stop IS a
-        /// stop: the worker has seen this start actually take.
+        /// It reads running.
         Running,
-        /// Seen running since our start and now stopped, without the worker
-        /// stopping it: AudioToolbox stopped the queue under us.
+        /// Seen running since our start and now stopped, without the worker stopping it.
         StoppedUnderUs,
-        /// Reads stopped, but this start has not been seen running and no
-        /// callback has arrived: the running notification may land after
-        /// `AudioQueueStart` returns. Look again on the next push or tick.
+        /// Reads stopped, but this start has not been seen running and no callback has arrived.
         NotYetRunning,
-        /// No reading (the property call failed), or one that contradicts the
-        /// callbacks seen. Claim nothing; the callback watchdog still applies.
+        /// No reading (the property call failed), or one that contradicts the callbacks seen.
         Abstain,
     }
 
     /// The `IsRunning` verdict.
-    ///
-    /// `seen_running`: the worker has read `IsRunning != 0` since its last
-    /// start. `called_back`: a render callback has arrived since that start.
-    /// `property`: this read, `None` if the property call failed.
-    ///
-    /// `StoppedUnderUs` requires a witnessed 1 -> 0 within one start, since a
-    /// reading of 0 alone also describes a start still taking. A queue stopped
-    /// before it was ever read running falls to the callback watchdog.
     pub(super) fn running_probe(
         seen_running: bool,
         called_back: bool,
@@ -374,13 +279,9 @@ mod mac {
         }
     }
 
-    /// The worker's per-start knowledge of whether the device is alive, and
-    /// the one death verdict both service paths read: the callback's `faulted`
-    /// latch, the callback watchdog and the `IsRunning` listener all feed the
-    /// same `Reopen` on the same budgeted ladder.
+    /// The worker's per-start knowledge of whether the device is alive.
     pub(super) struct DeviceHealth {
-        /// `last_cb_us` exactly as the last start armed it; a later value is
-        /// a real callback.
+        /// `last_cb_us` exactly as the last start armed it.
         armed_cb_us: u64,
         /// The worker has read `IsRunning != 0` since the last start.
         seen_running: bool,
@@ -394,16 +295,13 @@ mod mac {
             }
         }
 
-        /// A start succeeded and armed the watchdog at `armed_cb_us`. What was
-        /// seen of the previous run says nothing about this one.
+        /// A start succeeded and armed the watchdog at `armed_cb_us`.
         pub(super) fn armed(&mut self, armed_cb_us: u64) {
             self.armed_cb_us = armed_cb_us;
             self.seen_running = false;
         }
 
-        /// Whether the device must be reopened. `read_is_running` is called at
-        /// most once, only when the listener raised an edge while the queue is
-        /// believed running; the healthy per-key path makes no platform call.
+        /// Whether the device must be reopened.
         pub(super) fn needs_reopen(
             &mut self,
             faulted: bool,
@@ -419,8 +317,6 @@ mod mac {
             if !edge.take() {
                 return false;
             }
-            // Not running by the worker's own account: the edge is our own
-            // stop (only the worker stops the queue). No platform call.
             if !running {
                 return false;
             }
@@ -461,7 +357,6 @@ mod mac {
     }
 
     /// `AudioQueueBuffer` header; `mAudioData` points at the sample storage
-    /// the queue allocated alongside it.
     #[repr(C)]
     struct AudioQueueBuffer {
         m_audio_data_bytes_capacity: u32,
@@ -483,8 +378,6 @@ mod mac {
     type AudioQueuePropertyListenerProc =
         extern "C" fn(*mut c_void, AudioQueueRef, AudioQueuePropertyID);
 
-    // AudioToolbox is a stock system framework, in the dyld shared cache of
-    // every macOS install — this adds bindings, not a dependency.
     #[link(name = "AudioToolbox", kind = "framework")]
     unsafe extern "C" {
         fn AudioQueueNewOutput(
@@ -523,9 +416,7 @@ mod mac {
         ) -> i32;
     }
 
-    /// `kAudioQueueProperty_IsRunning` ('aqrn'): read-only `UInt32`, nonzero
-    /// while the queue runs. Its notification may arrive some time after
-    /// start/stop, so it is an edge to go and read, never a value.
+    /// `kAudioQueueProperty_IsRunning` ('aqrn').
     pub(super) const PROP_IS_RUNNING: AudioQueuePropertyID = 0x6171_726E;
 
     /// `kAudioFormatLinearPCM` ('lpcm').
@@ -538,38 +429,19 @@ mod mac {
         synth: Mutex<TrailSynth>,
         /// Consecutive buffers of exact silence (reset by any audible one).
         silent: AtomicU32,
-        /// Whether the queue is currently started (vs stopped). Written by the
-        /// audio worker only; read for the idle-stop policy.
+        /// Whether the queue is currently started (vs stopped).
         running: AtomicBool,
-        /// Callback-side queue failure. The worker observes this and disposes
-        /// the device once; a broken callback must not spin or retry per cue.
+        /// Callback-side queue failure.
         faulted: AtomicBool,
-        /// Whether returned buffers may be rendered and re-enqueued. Even =
-        /// disabled, odd = one running generation. The worker disables before
-        /// synchronous stop/reset (AudioToolbox forbids enqueue during a flush);
-        /// bumping at every transition keeps an old-generation callback from
-        /// re-enqueueing a buffer after a later resume.
+        /// Whether returned buffers may be rendered and re-enqueued.
         recycle_epoch: AtomicU64,
-        /// Serializes the callback's final epoch check and enqueue with the
-        /// worker's disable transition.
+        /// Serializes the callback's final epoch check and enqueue with the worker's disable.
         recycle_gate: Mutex<()>,
-        /// When the callback began rendering the in-flight block, in
-        /// [`crate::metrics::now_us`] µs; stored under the synth lock just
-        /// before `render` (a cue pushed before it is in that block).
-        /// [`MacOut::push_meta`] reads it to give the synth the cue's pre-roll
-        /// ([`EventMeta::block_lead_s`]), turning the 0-10.7 ms render-grid
-        /// jitter into a constant. Also stamped by every prime
-        /// ([`QueueCycle::stamp_block_start`]), since primed buffers are the
-        /// in-flight blocks until the first callback. `0` until the first prime.
+        /// When the callback began rendering the in-flight block, in [`crate::metrics::now_us`] µs.
         block_start_us: AtomicU64,
-        /// When the callback last ran, in [`crate::metrics::now_us`] µs: the
-        /// stall watchdog's heartbeat. Stored first in [`render_cb`], before
-        /// the epoch check, so flush callbacks during our own stop count as
-        /// progress. `0` until a start arms it. Separate from
-        /// [`Self::block_start_us`], which primes also write.
+        /// When the callback last ran, in [`crate::metrics::now_us`] µs.
         last_cb_us: AtomicU64,
-        /// The `IsRunning` listener's edge. The listener's userdata is this
-        /// field's address, pinned by the queue's raw refcount.
+        /// The `IsRunning` listener's edge.
         running_edge: RunningEdge,
     }
 
@@ -589,8 +461,6 @@ mod mac {
         }
 
         /// The one death verdict, read from this queue's shared words; both
-        /// [`MacOut::push_meta`] and [`MacOut::on_tick`] call it. Worker
-        /// thread only: `read_is_running` is a platform call.
         fn device_needs_reopen(
             &self,
             health: &mut DeviceHealth,
@@ -609,12 +479,6 @@ mod mac {
     }
 
     /// THE ONE DOOR TO A QUEUE'S TEARDOWN, by construction:
-    /// `AudioQueueDispose` and `AudioQueueRemovePropertyListener` are declared
-    /// in this module and nowhere else, so nothing outside it can name them; a
-    /// queue `AudioQueueNewOutput` made is owned the instant [`own`] wraps it,
-    /// [`AudioToolboxQueue`]'s fields are this module's, and the owner hands
-    /// out only `&` access to its calls, so [`OwnedQueue`]'s `Drop` is the one
-    /// caller of `dispose` and of the listener's removal.
     mod queue_owner {
         use std::ffi::c_void;
         use std::sync::Arc;
@@ -625,7 +489,6 @@ mod mac {
             running_listener,
         };
 
-        // AudioToolbox, as the parent's block: the two teardown calls only.
         #[link(name = "AudioToolbox", kind = "framework")]
         unsafe extern "C" {
             fn AudioQueueDispose(in_aq: AudioQueueRef, in_immediate: u8) -> i32;
@@ -637,8 +500,7 @@ mod mac {
             ) -> i32;
         }
 
-        /// Own the queue `AudioQueueNewOutput` just made, with `user` the
-        /// `Arc::into_raw` of its `Shared` handed to its callbacks.
+        /// Own the queue `AudioQueueNewOutput` just made.
         pub(super) fn own(
             queue: AudioQueueRef,
             user: *const Shared,
@@ -646,34 +508,18 @@ mod mac {
             OwnedQueue::new(AudioToolboxQueue { queue, user })
         }
 
-        /// The platform calls that bracket a queue's life, as a seam so a headless
-        /// test can observe the teardown order (the listener's memory-safety
-        /// contract).
+        /// The platform calls that bracket a queue's life.
         pub(in crate::trail_audio) trait QueueOwnerCalls {
             /// Register the `IsRunning` listener. `false` when refused; the queue
-            /// still works, without that detector.
             fn add_running_listener(&mut self) -> bool;
             fn remove_running_listener(&mut self);
             /// `AudioQueueDispose(queue, immediate = true)` — synchronous.
             fn dispose(&mut self);
             /// Release the `Arc<Shared>` refcount handed to AudioToolbox as the
-            /// callbacks' userdata.
             fn release_user(&mut self);
         }
 
-        /// The one owner of a live audio queue, and the only place that disposes
-        /// one. Every path that ends a queue (teardown, reopen after a fault, the
-        /// late exit of an abandoned worker, `MacOut::new`'s allocation unwind)
-        /// runs this `Drop`, which:
-        ///
-        /// 1. removes the listener, if it was registered;
-        /// 2. disposes the queue synchronously, which also retires `render_cb`;
-        /// 3. only then releases the callbacks' userdata refcount.
-        ///
-        /// A listener firing after the `Shared` is released would be a
-        /// use-after-free. Constructed as soon as `AudioQueueNewOutput` succeeds.
-        /// `the_queue_owner_removes_the_listener_before_dispose_on_every_path`
-        /// pins the order through a recording double.
+        /// The one owner of a live audio queue, and the only place that disposes one.
         pub(in crate::trail_audio) struct OwnedQueue<P: QueueOwnerCalls> {
             calls: P,
             listening: bool,
@@ -687,8 +533,7 @@ mod mac {
                 }
             }
 
-            /// Register the `IsRunning` listener; remembered so teardown removes
-            /// exactly what was added.
+            /// Register the `IsRunning` listener.
             pub(in crate::trail_audio) fn listen(&mut self) -> bool {
                 self.listening = self.calls.add_running_listener();
                 self.listening
@@ -709,13 +554,10 @@ mod mac {
             }
         }
 
-        /// The real [`QueueOwnerCalls`]: one AudioToolbox queue plus the raw
-        /// `Arc<Shared>` refcount its callbacks were handed.
+        /// The real [`QueueOwnerCalls`].
         pub(super) struct AudioToolboxQueue {
             queue: AudioQueueRef,
-            /// `Arc::into_raw` of the queue's `Shared`: the `render_cb` userdata
-            /// and the refcount keeping [`Shared::running_edge`] alive. Released
-            /// only by [`OwnedQueue`]'s `Drop`.
+            /// `Arc::into_raw` of the queue's `Shared`.
             user: *const Shared,
         }
 
@@ -725,21 +567,16 @@ mod mac {
             }
 
             /// The listener's userdata (the edge field inside the pinned
-            /// allocation). Add and remove must pass the same value: a listener is
-            /// identified by (proc, userdata).
             fn edge_user(&self) -> *mut c_void {
-                // SAFETY: `user` is a live `Arc<Shared>` raw pointer until
-                // `release_user`, which runs last; taking a field's address does
-                // not create a reference.
+                // SAFETY: `user` is a live `Arc<Shared>` raw pointer until `release_user`.
                 unsafe { std::ptr::addr_of!((*self.user).running_edge) as *mut c_void }
             }
 
-            /// Read `kAudioQueueProperty_IsRunning`. Worker thread only.
+            /// Read `kAudioQueueProperty_IsRunning`.
             pub(super) fn read_is_running(&self) -> Option<bool> {
                 let mut value: u32 = 0;
                 let mut size = std::mem::size_of::<u32>() as u32;
-                // SAFETY: the queue is live (owned, not yet disposed); `value`
-                // and `size` outlive the call and `size` states the buffer.
+                // SAFETY: The queue is live (owned, not yet disposed).
                 let status = unsafe {
                     AudioQueueGetProperty(
                         self.queue,
@@ -754,8 +591,7 @@ mod mac {
 
         impl QueueOwnerCalls for AudioToolboxQueue {
             fn add_running_listener(&mut self) -> bool {
-                // SAFETY: the queue is live; the userdata's lifetime is argued
-                // at `running_listener`.
+                // SAFETY: The queue is live.
                 unsafe {
                     AudioQueueAddPropertyListener(
                         self.queue,
@@ -767,11 +603,7 @@ mod mac {
             }
 
             fn remove_running_listener(&mut self) {
-                // The status is ignored: the synchronous dispose that follows
-                // retires any listener still registered before the userdata's
-                // refcount is released.
-                // SAFETY: the queue is live (dispose has not run); proc and
-                // userdata are the exact pair that was added.
+                // SAFETY: The queue is live (dispose has not run).
                 unsafe {
                     AudioQueueRemovePropertyListener(
                         self.queue,
@@ -783,16 +615,14 @@ mod mac {
             }
 
             fn dispose(&mut self) {
-                // SAFETY: synchronous dispose (immediate = 1) stops the callback
-                // thread before `release_user` drops the refcount it was using.
+                // SAFETY: Synchronous dispose (immediate = 1) stops the callback thread.
                 unsafe {
                     AudioQueueDispose(self.queue, 1);
                 }
             }
 
             fn release_user(&mut self) {
-                // SAFETY: `user` came from `Arc::into_raw` in `MacOut::new` and
-                // is released exactly once, here, after the queue is gone.
+                // SAFETY: `user` came from `Arc::into_raw` in `MacOut::new` and is released once.
                 unsafe { drop(Arc::from_raw(self.user)) };
             }
         }
@@ -803,9 +633,6 @@ mod mac {
     pub(super) use queue_owner::QueueOwnerCalls;
 
     fn set_callback_recycling(shared: &Shared, enabled: bool) {
-        // Stop calls this before AudioQueueStop. Taking the same gate as the
-        // callback means every earlier enqueue has returned before the epoch
-        // becomes disabled, and no later enqueue can pass the check below.
         let _gate = shared
             .recycle_gate
             .lock()
@@ -818,17 +645,10 @@ mod mac {
         }
     }
 
-    /// Queue-control seam shared by the real AudioToolbox adapter and the
-    /// callback-free conformance fake. Buffer indices are available to the
-    /// implementation only before `enqueue_buffer`; after enqueue, the queue
-    /// owns scheduling access until `stop_immediate` returns synchronously.
+    /// Queue-control seam shared by the real AudioToolbox adapter and the test stand-in.
     pub(super) trait QueueCycle {
         fn buffer_count(&self) -> usize;
         /// Stamp the block admission boundary for the buffers about to be
-        /// primed — the same stamp the render callback takes before each
-        /// block, taken once here because the prime renders every buffer in
-        /// one breath. Called by [`prime_and_start`] before its first
-        /// `render_post_cue`, on every prime, cold and resume alike.
         fn stamp_block_start(&mut self);
         fn render_post_cue(&mut self, index: usize) -> bool;
         fn enqueue_buffer(&mut self, index: usize) -> bool;
@@ -839,16 +659,11 @@ mod mac {
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub(super) struct PrimeReport {
-        /// One-based queue position of the first buffer containing audible
-        /// post-cue samples. `None` is permitted for a deliberately inert cue.
+        /// One-based queue position of the first buffer containing audible post-cue samples.
         pub(super) first_audible_buffer: Option<usize>,
     }
 
-    /// Stamp the block start, fill every available buffer from the post-cue
-    /// synth state, enqueue it exactly once, then enable callback recycling
-    /// and start. This ordering is the latency contract: no pre-cue buffer
-    /// can sit ahead of buffer one, and no cue admitted after this prime can
-    /// measure its pre-roll against a block from before the park.
+    /// Stamp the block start, fill available buffers from the synth, and start the queue.
     pub(super) fn prime_and_start<Q: QueueCycle>(queue: &mut Q) -> Option<PrimeReport> {
         let count = queue.buffer_count();
         debug_assert!(count > 0);
@@ -873,17 +688,13 @@ mod mac {
         })
     }
 
-    /// Stop synchronously with callback recycling disabled. AudioQueueStop's
-    /// immediate path resets the queue and removes every scheduled buffer; only
-    /// after this returns may the worker render into the retained pointers.
+    /// Stop synchronously with callback recycling disabled.
     pub(super) fn stop_and_reclaim<Q: QueueCycle>(queue: &mut Q) -> bool {
         queue.set_callback_recycling(false);
         queue.stop_immediate()
     }
 
-    /// The queue render callback — runs on AudioToolbox's own thread. Locks
-    /// the synth briefly (its only other holder is the worker's cue push),
-    /// renders one buffer, re-enqueues it.
+    /// The queue render callback.
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -901,19 +712,13 @@ mod mac {
         )
     )]
     extern "C" fn render_cb(user: *mut c_void, q: AudioQueueRef, buf: *mut AudioQueueBuffer) {
-        // SAFETY: `user` is the `Arc<Shared>` raw pointer installed at queue
-        // creation and outlives the queue (disposed synchronously first).
+        // SAFETY: `user` is the `Arc<Shared>` raw pointer installed at queue creation.
         let shared = unsafe { &*(user as *const Shared) };
-        // Watchdog heartbeat, before the epoch check so the flush callbacks
-        // of our own stop count as progress. One relaxed store.
         shared
             .last_cb_us
             .store(crate::metrics::now_us(), Ordering::Relaxed);
-        // SAFETY: the queue hands us a buffer it allocated with capacity
-        // BUFFER_FRAMES × CHANNELS f32s; we fill exactly that.
+        // SAFETY: The queue hands us a buffer allocated with `BUFFER_FRAMES * CHANNELS` `f32`s.
         unsafe {
-            // Stop/reset may return scheduled buffers here. They stay
-            // available for the worker's next post-cue prime.
             let recycle_epoch = shared.recycle_epoch.load(Ordering::Acquire);
             if recycle_epoch & 1 == 0 {
                 return;
@@ -924,8 +729,6 @@ mod mac {
             );
             let quiet = {
                 let mut synth = shared.synth.lock().unwrap_or_else(PoisonError::into_inner);
-                // The block's admission boundary, stamped under the lock so a
-                // push never reads a start about to move. One relaxed store.
                 shared
                     .block_start_us
                     .store(crate::metrics::now_us(), Ordering::Relaxed);
@@ -940,9 +743,6 @@ mod mac {
                 shared.silent.store(0, Ordering::Relaxed);
             }
             (*buf).m_audio_data_byte_size = (BUFFER_FRAMES * CHANNELS * 4) as u32;
-            // The gate closes the check-to-enqueue race: stop/reset takes it
-            // before disabling recycling. A callback still rendering when
-            // recycling was disabled sees the new generation and retires.
             let _gate = shared
                 .recycle_gate
                 .lock()
@@ -957,32 +757,21 @@ mod mac {
     }
 
     pub(crate) struct MacOut {
-        /// The queue, its `IsRunning` listener and the callbacks' userdata
-        /// refcount, owned as one value whose `Drop` tears them down in order
-        /// ([`OwnedQueue`]).
+        /// The queue, its `IsRunning` listener and the callbacks' userdata refcount.
         owned: OwnedQueue<AudioToolboxQueue>,
         shared: Arc<Shared>,
-        /// All buffers are allocated for the queue's lifetime. Pointer values
-        /// remain stable, but the worker dereferences them only initially or
-        /// after synchronous immediate stop has removed scheduled ownership.
+        /// All buffers are allocated for the queue's lifetime.
         buffers: [*mut AudioQueueBuffer; BUFFER_COUNT],
         buffers_available: bool,
-        /// Per-start knowledge the `IsRunning` verdict needs. Worker-thread
-        /// only, like every field here.
+        /// Per-start knowledge the `IsRunning` verdict needs.
         health: DeviceHealth,
     }
 
-    // SAFETY: `queue` is only touched from the audio worker (start/stop/
-    // dispose); the callback thread reaches state exclusively through the
-    // `Shared` (Mutex + atomics). AudioQueue control calls are themselves
-    // thread-safe per AudioToolbox's documented contract.
+    // SAFETY: `queue` is only touched from the audio worker (start/stop/dispose).
     unsafe impl Send for MacOut {}
 
     impl MacOut {
-        /// Open the output queue and allocate, but do not enqueue, its
-        /// buffers; [`Self::start`] renders and enqueues them after the first
-        /// cue is applied. `None` on any AudioToolbox error (no audio device,
-        /// etc.): trail sound then stays off; never fatal.
+        /// Open the output queue and allocate, but do not enqueue, its buffers.
         #[cfg_attr(
             any(test, debug_assertions),
             aterm_spec_anchor::refines(
@@ -1006,8 +795,7 @@ mod mac {
             };
             let user = Arc::into_raw(Arc::clone(&shared)) as *mut c_void;
             let mut queue: AudioQueueRef = std::ptr::null_mut();
-            // SAFETY: fmt/queue outlive the call; null run loop selects
-            // AudioToolbox's internal callback thread.
+            // SAFETY: Fmt/queue outlive the call.
             let st = unsafe {
                 AudioQueueNewOutput(
                     &fmt,
@@ -1020,26 +808,17 @@ mod mac {
                 )
             };
             if st != 0 || queue.is_null() {
-                // SAFETY: reclaim the refcount handed to the (never-created)
-                // queue so it isn't leaked. No queue exists, so there is no
-                // listener and nothing to dispose.
+                // SAFETY: Reclaim the refcount handed to the uncreated queue so it is not leaked.
                 unsafe { drop(Arc::from_raw(user as *const Shared)) };
                 return None;
             }
-            // Owned from the instant it exists: every `return None` below
-            // drops `owned`, whose `Drop` removes the listener, disposes the
-            // queue and releases the refcount, in that order.
             let mut owned = queue_owner::own(queue, user as *const Shared);
-            // Registered before the buffers are allocated, so the unwind
-            // below has a listener to remove. A refusal is not fatal: the
-            // callback watchdog still applies.
             owned.listen();
             let bytes = (BUFFER_FRAMES * CHANNELS * 4) as u32;
             let mut buffers = [std::ptr::null_mut(); BUFFER_COUNT];
             for slot in &mut buffers {
                 let mut buf: *mut AudioQueueBuffer = std::ptr::null_mut();
-                // SAFETY: queue is live; on success the pointer stays allocated
-                // until queue disposal. It remains unscheduled/available here.
+                // SAFETY: Queue is live.
                 let st = unsafe { AudioQueueAllocateBuffer(queue, bytes, &mut buf) };
                 if st != 0 || buf.is_null() {
                     // `owned` drops here: listener, dispose, refcount.
@@ -1068,9 +847,6 @@ mod mac {
             if self.shared.faulted.load(Ordering::Acquire) || !self.buffers_available {
                 return false;
             }
-            // From here even a partial enqueue transfers scheduling ownership
-            // to the queue. Failure is terminal and disposal reclaims it; no
-            // retry may touch these pointers.
             self.buffers_available = false;
             let report = {
                 let mut cycle = MacQueueCycle {
@@ -1087,13 +863,8 @@ mod mac {
                 );
                 self.shared.running.store(true, Ordering::Relaxed);
                 self.shared.silent.store(0, Ordering::Relaxed);
-                // Arm the stall watchdog once per start transition, so the
-                // threshold measures "no callback since the queue began
-                // running"; after this only the callback writes it.
                 let armed_cb_us = crate::metrics::now_us();
                 self.shared.last_cb_us.store(armed_cb_us, Ordering::Relaxed);
-                // Forget the previous run: the `IsRunning` verdict needs a
-                // 1 -> 0 witnessed within this start.
                 self.health.armed(armed_cb_us);
                 true
             } else {
@@ -1102,10 +873,7 @@ mod mac {
             }
         }
 
-        /// Queue a cue: `Sounded` once output runs, else `Reopen`. The silence
-        /// reset happens while holding the same synth lock as the callback:
-        /// once the lock is released, `on_tick` can never observe the pre-cue
-        /// threshold and pause a newly queued first sound after idle.
+        /// Queue a cue: `Sounded` once output runs, else `Reopen`.
         #[cfg_attr(
             any(test, debug_assertions),
             aterm_spec_anchor::refines(
@@ -1116,8 +884,6 @@ mod mac {
         )]
         pub(crate) fn push_meta(&mut self, ev: SoundEvent, meta: EventMeta) -> Delivery {
             // The key path checks the death verdict too, since `on_tick` only
-            // runs when nobody is typing. The cue is not consumed: the worker
-            // reopens and re-pushes it.
             if self.device_needs_reopen() {
                 return Delivery::Reopen;
             }
@@ -1127,11 +893,6 @@ mod mac {
                     .synth
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner);
-                // Pre-roll ([`block_lead_s`]): how far into the in-flight block
-                // this cue arrived, measured under the lock the callback stamps
-                // under. Only while running: the first cue after idle primes
-                // fresh buffers (lead 0), and the prime re-stamps, so cues in
-                // the first block after a resume measure against the prime.
                 let block_lead_s = block_lead_s(
                     self.shared.running.load(Ordering::Relaxed),
                     self.shared.block_start_us.load(Ordering::Relaxed),
@@ -1148,7 +909,6 @@ mod mac {
             }
             if !self.shared.running.load(Ordering::Relaxed) && !self.start() {
                 // A failed lazy open. The cue is in the discarded synth, which
-                // was never heard, so re-pushing it plays it once.
                 return Delivery::Reopen;
             }
             if self.shared.running.load(Ordering::Acquire) {
@@ -1158,10 +918,7 @@ mod mac {
             }
         }
 
-        /// Housekeeping: pause a running queue after [`PAUSE_AFTER_SILENT`]
-        /// silent buffers. `Running` keeps the worker's housekeeping timeout
-        /// armed, `Paused` lets it park on a blocking receive, and `Reopen`
-        /// reports a dead device.
+        /// Housekeeping: pause a running queue after [`PAUSE_AFTER_SILENT`] silent buffers.
         #[cfg_attr(
             any(test, debug_assertions),
             aterm_spec_anchor::refines(
@@ -1180,7 +937,6 @@ mod mac {
         )]
         pub(crate) fn on_tick(&mut self) -> Service {
             // A faulted, stalled or stopped-under-us queue must reopen, not
-            // pause: the death verdict is asked first.
             if self.device_needs_reopen() {
                 return Service::Reopen;
             }
@@ -1214,8 +970,6 @@ mod mac {
         }
 
         /// The death verdict for this device (see
-        /// [`Shared::device_needs_reopen`]). The `IsRunning` read is a closure
-        /// so it runs only when the listener raised an edge while running.
         fn device_needs_reopen(&mut self) -> bool {
             let owned = &self.owned;
             self.shared
@@ -1228,8 +982,6 @@ mod mac {
     impl Drop for MacOut {
         fn drop(&mut self) {
             // Disable callback recycling first. `owned`'s `Drop` then removes
-            // the listener, disposes the queue synchronously and releases the
-            // callbacks' userdata refcount.
             set_callback_recycling(&self.shared, false);
         }
     }
@@ -1246,9 +998,6 @@ mod mac {
         }
 
         fn stamp_block_start(&mut self) {
-            // The worker is the only pusher and it is the thread priming, so
-            // no lock is needed for the stamp to be ordered before the
-            // renders below; the callback cannot run (recycling is off).
             self.shared
                 .block_start_us
                 .store(crate::metrics::now_us(), Ordering::Relaxed);
@@ -1257,9 +1006,7 @@ mod mac {
         fn render_post_cue(&mut self, index: usize) -> bool {
             let buf = self.buffers[index];
             debug_assert!(!buf.is_null());
-            // SAFETY: this adapter is constructed only while every retained
-            // pointer is AVAILABLE (initial allocation or after synchronous
-            // immediate stop), and capacity is fixed at allocation.
+            // SAFETY: This adapter is constructed only while every retained pointer is available.
             unsafe {
                 let out = std::slice::from_raw_parts_mut(
                     (*buf).m_audio_data as *mut f32,
@@ -1279,8 +1026,7 @@ mod mac {
         }
 
         fn enqueue_buffer(&mut self, index: usize) -> bool {
-            // SAFETY: the indexed pointer is still AVAILABLE and becomes
-            // scheduled/queue-owned exactly once on success.
+            // SAFETY: The indexed pointer is still available and becomes scheduled/queue-owned.
             unsafe {
                 AudioQueueEnqueueBuffer(self.queue, self.buffers[index], 0, std::ptr::null()) == 0
             }
@@ -1291,28 +1037,22 @@ mod mac {
         }
 
         fn start_queue(&mut self) -> bool {
-            // SAFETY: queue is live and all three buffers are scheduled.
+            // SAFETY: Queue is live and all three buffers are scheduled.
             unsafe { AudioQueueStart(self.queue, std::ptr::null()) == 0 }
         }
 
         fn stop_immediate(&mut self) -> bool {
-            // SAFETY: immediate=true is synchronous. On success AudioToolbox
-            // reset/removal has completed and all retained pointers are again
-            // available for the worker to fill.
+            // SAFETY: Immediate=true is synchronous.
             unsafe { AudioQueueStop(self.queue, 1) == 0 }
         }
     }
 }
 
 /// Bounded cue ingress. Eight cues can be emitted by one visual frame; 64 keeps
-/// several burst frames without making producer work depend on the callback. A
-/// full queue drops newest sound only — visual/input correctness always wins.
 #[cfg(target_os = "macos")]
 const COMMAND_CAPACITY: usize = 64;
 
 /// One queued cue: the gesture and its side-car (host input-clock stamp, glyph
-/// class, origin pan). The worker hands both to `TrailSynth::push_meta`;
-/// [`TrailAudio::push`] sends the identity side-car ([`EventMeta::default`]).
 #[derive(Clone, Copy, Debug)]
 #[cfg(target_os = "macos")]
 struct Cue {
@@ -1347,9 +1087,6 @@ fn cue_channel() -> (
 }
 
 /// Milliseconds on a process-monotonic clock, for the worker's platform-busy
-/// stamp. Zero means "not inside a platform call", so live stamps are floored
-/// to 1. The origin sits [`WEDGE_AFTER_MS`] + 1 in the past, so a stamp of `1`
-/// is already stale and a test can fabricate a wedge without sleeping.
 #[cfg(target_os = "macos")]
 fn monotonic_ms() -> u64 {
     use std::sync::OnceLock;
@@ -1361,18 +1098,10 @@ fn monotonic_ms() -> u64 {
 }
 
 /// Set on the busy stamp while the section it covers is a device open. The
-/// phase rides in the stamp word so the reader's verdict is one atomic load.
 #[cfg(target_os = "macos")]
 const BUSY_OPENING: u64 = 1 << 63;
 
 /// RAII stamp around every worker platform section (device open, cue apply,
-/// pause housekeeping). While held, the cell holds the section's entry
-/// instant; every exit path clears it. The UI reads it to tell a parked worker
-/// (0) from one stuck in a platform call (stale nonzero).
-///
-/// A device open ([`Self::mark_open`]) can legitimately take seconds, so it is
-/// judged at [`OPEN_WEDGE_AFTER_MS`] instead of [`WEDGE_AFTER_MS`]; misjudging
-/// it would make [`TrailAudio::revive_or_seal`] abandon a working thread.
 #[cfg(target_os = "macos")]
 struct PlatformBusy<'a>(&'a std::sync::atomic::AtomicU64);
 
@@ -1401,10 +1130,6 @@ impl Drop for PlatformBusy<'_> {
 }
 
 /// The wedge verdict: `Some(age_ms)` when the worker has been inside one
-/// platform call too long, `None` for a parked worker (stamp 0) or a call
-/// still young. A device open carries [`BUSY_OPENING`] and is judged at
-/// [`OPEN_WEDGE_AFTER_MS`], otherwise at [`WEDGE_AFTER_MS`]. Pure so the
-/// thresholds are tested on a fabricated clock.
 #[cfg(target_os = "macos")]
 fn busy_stale(mark: u64, now_ms: u64) -> Option<u64> {
     if mark == 0 {
@@ -1420,16 +1145,13 @@ fn busy_stale(mark: u64, now_ms: u64) -> Option<u64> {
 }
 
 /// The worker's shared control words, borrowed for the loop's lifetime: the
-/// shutdown request, the lifecycle state it reports and its platform-busy
-/// stamp.
 #[cfg(target_os = "macos")]
 #[derive(Clone, Copy)]
 struct WorkerFlags<'a> {
     shutdown: &'a std::sync::atomic::AtomicBool,
     state: &'a std::sync::atomic::AtomicU8,
     busy: &'a std::sync::atomic::AtomicU64,
-    /// Cues the worker consumed inside a reopen backoff window, counted
-    /// separately from ingress-full drops.
+    /// Cues the worker consumed inside a reopen backoff window.
     dropped_backoff: &'a std::sync::atomic::AtomicU64,
     /// Device reopens the worker has left, surfaced so `tone` can print it.
     reopens_left: &'a std::sync::atomic::AtomicU8,
@@ -1531,15 +1253,8 @@ fn worker_loop<Output, Open>(
     let mut output: Option<Output> = None;
     let mut retry = RetryState::new(backoff);
     reopens_left.store(retry.left(), Ordering::Release);
-    // One fault handler for every way the device can die (failed open, start
-    // or enqueue; faulted or stalled callback; stopped under us). It drops the
-    // whole `Output` and opens a fresh one; nothing retries `start()` on a
-    // `MacOut` whose buffers are already scheduled.
     macro_rules! reopen_or_die {
         ($now:expr) => {
-            // Dropping the old `Output` disposes the queue synchronously, and
-            // disposing an unresponsive device is slow, so it is stamped as an
-            // open and judged at [`OPEN_WEDGE_AFTER_MS`].
             match {
                 let _busy = PlatformBusy::mark_open(busy);
                 reopen_after_fault(&mut output, &mut retry, $now)
@@ -1589,8 +1304,6 @@ fn worker_loop<Output, Open>(
                 }
             }
         } else {
-            // Before the first cue and after an idle pause, sleep indefinitely:
-            // no timer, callback, run-loop wake, or polling CPU remains armed.
             #[cfg(test)]
             let _parked = ParkedMark::new(state);
             match rx.recv() {
@@ -1607,10 +1320,6 @@ fn worker_loop<Output, Open>(
             state.store(STATE_STOPPED, Ordering::Release);
             return;
         }
-        // Everything from here to the loop bottom may enter AudioToolbox.
-        // `open_device!` stamps a device open (judged at
-        // [`OPEN_WEDGE_AFTER_MS`]); `push_cue!` stamps the steady-state
-        // enqueue (judged at [`WEDGE_AFTER_MS`]).
         macro_rules! open_device {
             () => {{
                 let _busy = PlatformBusy::mark_open(busy);
@@ -1624,8 +1333,6 @@ fn worker_loop<Output, Open>(
             }};
         }
         let now = Instant::now();
-        // Reopens are cue-driven, not timer-driven, so an idle worker stays
-        // parked. A cue inside the wait window is dropped and counted.
         if output.is_none() && !retry.ready(now) {
             saturating_increment_u64(dropped_backoff);
             continue;
@@ -1633,16 +1340,10 @@ fn worker_loop<Output, Open>(
         if output.is_none() {
             output = open_device!();
             if output.is_none() {
-                // A failed device open spends one reopen; only budget
-                // exhaustion seals ingress.
                 reopen_or_die!(now);
                 saturating_increment_u64(dropped_backoff);
                 continue;
             }
-            // No `retry.delivered()` here: a successful open proves nothing
-            // about a device that plays (`AudioQueueStart` runs later, in
-            // `push_meta`), and resetting here would make the budget
-            // unspendable for a device that opens and never sounds.
         }
         let delivery = push_cue!(
             output
@@ -1651,16 +1352,11 @@ fn worker_loop<Output, Open>(
         );
         if delivery == mac::Delivery::Reopen {
             reopen_or_die!(now);
-            // Re-push the same cue into the fresh device so the key that
-            // discovered the fault is heard. If it fails too, that is another
-            // fault against the budget.
             if output.is_none() && retry.ready(Instant::now()) {
                 output = open_device!();
             }
             match push_cue!(output.as_mut().map(|out| out.push_meta(cue.ev, cue.meta))) {
                 Some(mac::Delivery::Sounded) => {
-                    // The device played; only that may reset the ladder (see
-                    // `RetryState::delivered`).
                     retry.delivered(Instant::now());
                     reopens_left.store(retry.left(), Ordering::Release);
                     state.store(STATE_RUNNING, Ordering::Release);
@@ -1671,7 +1367,6 @@ fn worker_loop<Output, Open>(
             }
             continue;
         }
-        // The device played; the only evidence that may reset the ladder.
         retry.delivered(Instant::now());
         reopens_left.store(retry.left(), Ordering::Release);
         state.store(STATE_RUNNING, Ordering::Release);
@@ -1683,9 +1378,7 @@ fn worker_loop<Output, Open>(
 struct RetryState<'a> {
     attempts: u8,
     earliest: Option<Instant>,
-    /// When the device first played after the last fault. `None` from each
-    /// fault until a delivery lands. The ladder resets only after the device
-    /// keeps playing for [`RetryState::healthy_for`] past this.
+    /// When the device first played after the last fault.
     played_since: Option<Instant>,
     backoff: &'a [Duration],
 }
@@ -1696,9 +1389,9 @@ struct RetryState<'a> {
 enum Reopen {
     /// Reopen on this cue.
     Now,
-    /// Inside the backoff window; wait for a later cue.
+    /// Inside the backoff window.
     Wait,
-    /// The budget is spent. This — and only this — is terminal.
+    /// The budget is spent.
     Exhausted,
 }
 
@@ -1714,8 +1407,6 @@ impl<'a> RetryState<'a> {
     }
 
     /// How long a device must play after its last fault before the ladder
-    /// resets: the schedule's longest step, so the compressed test schedule
-    /// scales with it.
     fn healthy_for(&self) -> Duration {
         self.backoff.iter().copied().max().unwrap_or_default()
     }
@@ -1731,16 +1422,6 @@ impl<'a> RetryState<'a> {
     }
 
     /// A cue sounded. The schedule resets only once the device has played for
-    /// [`Self::healthy_for`], measured from its first delivery after the last
-    /// fault, so the budget bounds consecutive failure.
-    ///
-    /// The delay makes two failure shapes reach exhaustion: a device that
-    /// opens but never starts, and one that plays one block then stalls. A
-    /// real transient is followed by minutes of playing and costs one reopen.
-    /// The window starts at the first delivery, not the fault, because the
-    /// backoff wait (whose last step equals `healthy_for`) plays nothing.
-    /// `plays-once-then-stalls` in the `TrailAudioReopenLadder` worker traces
-    /// pins it.
     fn delivered(&mut self, now: Instant) {
         if self.attempts == 0 {
             return;
@@ -1756,10 +1437,6 @@ impl<'a> RetryState<'a> {
 }
 
 /// The one fault handler: drops the whole output (its `Drop` disables callback
-/// recycling and disposes the queue synchronously) and arms the next attempt,
-/// or reports exhaustion. Not anchored to `trail_audio_lifecycle`'s
-/// `WorkerStartFails`: it does not latch `failed`; `worker_loop` does, and
-/// carries that anchor.
 #[cfg(target_os = "macos")]
 fn reopen_after_fault<Output>(
     output: &mut Option<Output>,
@@ -1773,8 +1450,6 @@ fn reopen_after_fault<Output>(
     let wait = retry.backoff[usize::from(retry.attempts)];
     retry.attempts = retry.attempts.saturating_add(1);
     retry.earliest = Some(now + wait);
-    // Whatever the device played before this fault is not evidence about
-    // the one the next cue opens.
     retry.played_since = None;
     if wait.is_zero() {
         Reopen::Now
@@ -1784,21 +1459,18 @@ fn reopen_after_fault<Output>(
 }
 
 /// Tier-1 conformance of the derived `TrailAudioReopenLadder` machine to the
-/// ladder above and to `worker_loop`'s call sites (a child module in its own
-/// file, so it can drive the private ladder).
 #[cfg(all(test, target_os = "macos"))]
 #[path = "trail_audio_reopen_conformance.rs"]
 mod reopen_conformance;
 
 /// Saturating `+1` on a `u64` counter: `u64::MAX` stays put rather than
-/// wrapping (the callback's `u32` silence counter takes the same step).
 #[cfg(target_os = "macos")]
 fn saturating_increment_u64(counter: &std::sync::atomic::AtomicU64) {
     use std::sync::atomic::Ordering;
     let _ = counter.try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1));
 }
 
-/// The device the worker drives: [`mac::MacOut`], or a test double.
+/// The device the worker drives.
 #[cfg(target_os = "macos")]
 #[cfg_attr(
     any(test, debug_assertions),
@@ -1844,47 +1516,38 @@ const STATE_FAILED: u8 = 3;
 #[cfg(target_os = "macos")]
 const STATE_STOPPED: u8 = 4;
 /// A fault was seen and the worker is inside its bounded reopen schedule.
-/// Discriminants are append-only.
 #[cfg(target_os = "macos")]
 const STATE_REOPENING: u8 = 5;
 
-/// The audio host's state as reported by status verbs. `live` means
-/// `AudioQueueStart` succeeded, not merely that an ingress channel exists.
+/// The audio host's state as reported by status verbs.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum HostState {
-    /// Ingress is sealed: headless/test form, non-macOS build, or a permanent
-    /// failure (including an exhausted revival budget). It can never sound.
+    /// Ingress is sealed: headless/test form, non-macOS build, or a permanent failure.
     Inert,
-    /// Ingress is open and no device has been opened yet; the queue opens
-    /// lazily on the first cue. Not a fault.
+    /// Ingress is open and no device has been opened.
     #[cfg(any(target_os = "macos", test))]
     Opening,
     /// `AudioQueueStart` returned OK and the callback is being served.
     Running,
-    /// The queue is open and started but parked at idle; the next cue resumes
-    /// it.
+    /// The queue is open and started but parked at idle.
     #[cfg(any(target_os = "macos", test))]
     Paused,
-    /// The worker spent its reopen budget and exited; the next push finds
-    /// ingress gone and seals it.
+    /// The worker spent its reopen budget and exited.
     #[cfg(any(target_os = "macos", test))]
     Failed,
-    /// A fault was seen and the worker is inside its bounded reopen schedule;
-    /// the next cue past the backoff window opens a fresh device.
+    /// A fault was seen and the worker is inside its bounded reopen schedule.
     #[cfg(any(target_os = "macos", test))]
     Reopening,
     /// The queue was stopped.
     #[cfg(any(target_os = "macos", test))]
     Stopped,
-    /// Ingress is open but the worker has been stuck inside one platform call
-    /// past [`WEDGE_AFTER_MS`], so cues are dropped. Outranks the state word.
+    /// Ingress is open but the worker has been stuck inside one platform call.
     #[cfg(any(target_os = "macos", test))]
     Wedged,
 }
 
 impl HostState {
-    /// Every variant, for the test that each has its own wire word (none falls
-    /// back to `live`).
+    /// Every variant, for the test that each has its own wire word (none falls back to `live`).
     #[cfg(test)]
     pub(crate) const ALL: [Self; 8] = [
         Self::Inert,
@@ -1897,8 +1560,7 @@ impl HostState {
         Self::Wedged,
     ];
 
-    /// The word `tone` and `trail status` print. `live` means
-    /// `AudioQueueStart` returned OK.
+    /// The word `tone` and `trail status` print.
     pub(crate) fn label(self) -> &'static str {
         match self {
             Self::Inert => "inert",
@@ -1939,11 +1601,7 @@ fn worker_main(rx: std::sync::mpsc::Receiver<Cue>, flags: WorkerFlags<'_>, seed:
     );
 }
 
-/// Cross-platform host face. On macOS the UI owns only a bounded `SyncSender`:
-/// `push` is a single `try_send` and never opens CoreAudio, waits on the
-/// synth mutex, allocates, sleeps or logs. A dormant worker owns the platform
-/// queue and blocks until the first cue; headless/test apps construct the
-/// inert form with no thread.
+/// Cross-platform host face.
 pub(crate) struct TrailAudio {
     #[cfg(target_os = "macos")]
     tx: Option<std::sync::mpsc::SyncSender<Cue>>,
@@ -1954,8 +1612,7 @@ pub(crate) struct TrailAudio {
     /// Cues dropped because ingress was full.
     #[cfg(target_os = "macos")]
     dropped_full: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    /// Cues pushed at a host whose ingress is gone, including the push that
-    /// discovers the disconnect.
+    /// Cues pushed at a host whose ingress is gone.
     #[cfg(target_os = "macos")]
     dropped_sealed: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// Cues the worker consumed while inside a reopen backoff window.
@@ -1964,31 +1621,24 @@ pub(crate) struct TrailAudio {
     /// Device reopens the worker has left ([`REOPEN_BUDGET`] at birth).
     #[cfg(target_os = "macos")]
     reopens_left: std::sync::Arc<std::sync::atomic::AtomicU8>,
-    /// Whether this host was born active. `TrailAudio::new(false)` (headless/
-    /// test) has no `tx` from birth and does not count sealed drops.
+    /// Whether this host was born active.
     #[cfg(target_os = "macos")]
     born_active: bool,
-    /// The worker's platform-busy stamp (see [`PlatformBusy`]): 0 while parked
-    /// or between calls, else the entry instant of the current call. Staleness
-    /// past [`WEDGE_AFTER_MS`] is what [`Self::wedged_for`] reports.
+    /// The worker's platform-busy stamp (see [`PlatformBusy`]).
     #[cfg(target_os = "macos")]
     busy: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    /// Remaining worker revivals ([`WEDGE_REVIVES`] at birth). Decremented by
-    /// each wedge-triggered revival; at zero the next wedge seals ingress.
+    /// Remaining worker revivals ([`WEDGE_REVIVES`] at birth).
     #[cfg(target_os = "macos")]
     revives_left: u8,
     #[cfg(target_os = "macos")]
     worker: Option<std::thread::JoinHandle<()>>,
-    /// Test-only cue tap: `Some` makes this host report itself live (so
-    /// `App::tone_infer_active` and `keystroke_click_audible` behave as on a
-    /// real Mac) and records every pushed [`SoundEvent`] instead of queueing
-    /// it, so tests assert what the render seams handed the audio host.
+    /// Test-only cue tap: `Some` makes this host report itself live.
     #[cfg(test)]
     capture: Option<Vec<(SoundEvent, EventMeta)>>,
 }
 
 impl TrailAudio {
-    /// `active=false` is the sealed headless/test path: no channel or worker.
+    /// `active=false` is the sealed headless/test path.
     pub(crate) fn new(active: bool) -> Self {
         #[cfg(target_os = "macos")]
         {
@@ -2023,10 +1673,6 @@ impl TrailAudio {
                 "aterm-trail-audio",
                 crate::qos::Role::Responsive,
                 move || {
-                    // This worker holds the synth mutex the real-time
-                    // callback takes, so it runs `Responsive` (the `qos.rs`
-                    // floor for a lock holder the UI contends) to avoid a
-                    // priority inversion, without outranking the UI thread.
                     worker_main(
                         rx,
                         WorkerFlags {
@@ -2059,8 +1705,7 @@ impl TrailAudio {
         }
     }
 
-    /// A test host that reports live and records every cue (the `capture`
-    /// field).
+    /// A test host that reports live and records every cue (the `capture` field).
     #[cfg(test)]
     pub(crate) fn capturing_for_test() -> Self {
         let mut host = Self::new(false);
@@ -2087,14 +1732,7 @@ impl TrailAudio {
     }
 
     /// Replace the audio host with a freshly resolved active/inert one.
-    /// Dropping the previous value closes ingress, wakes and joins the worker
-    /// (bounded: a wedged or overrunning worker is detached and self-
-    /// terminates) and lets the output dispose its queue. Used on the
-    /// serious-mode edge; no playing tail survives a healthy teardown.
     pub(crate) fn replace(&mut self, active: bool) {
-        // Nothing audible carries across (each event names its voice). The
-        // drop counters are lifetime totals and carry over, so `dropped=`
-        // never goes backwards across a revival.
         #[cfg(target_os = "macos")]
         {
             use std::sync::atomic::Ordering;
@@ -2114,17 +1752,12 @@ impl TrailAudio {
         }
     }
 
-    /// Queue one cue without blocking the input/present thread. A full channel
-    /// drops this cue; a disconnected one disables ingress. A wedged worker
-    /// spends one revival ([`Self::revive_or_seal`]), so a stuck device costs
-    /// seconds of silence, not the session.
+    /// Queue one cue without blocking the input/present thread.
     pub(crate) fn push(&mut self, ev: SoundEvent) {
         self.push_meta(ev, EventMeta::default());
     }
 
-    /// [`Self::push`] with the side-car (host input-clock stamp and glyph
-    /// class), stamped on both delivery paths (the keyed seam and the frame
-    /// drain). `push` is this with the identity side-car.
+    /// [`Self::push`] with the side-car (host input-clock stamp and glyph class).
     pub(crate) fn push_meta(&mut self, ev: SoundEvent, meta: EventMeta) {
         #[cfg(test)]
         if let Some(captured) = self.capture.as_mut() {
@@ -2139,7 +1772,6 @@ impl TrailAudio {
                 .map(|tx| enqueue_cue(tx, &self.dropped_full, Cue { ev, meta }));
             match disposition {
                 Some(EnqueueDisposition::Disconnected) => {
-                    // The cue that discovers the dead worker is a real loss.
                     saturating_increment_u64(&self.dropped_sealed);
                     self.tx = None;
                     self.state
@@ -2147,15 +1779,10 @@ impl TrailAudio {
                 }
                 None if self.born_active => {
                     // A push at an already-sealed host; counted only for a
-                    // host born active.
                     saturating_increment_u64(&self.dropped_sealed);
                 }
                 _ => {}
             }
-            // The wedge is judged on every push, so recovery is bounded by
-            // `WEDGE_AFTER_MS`, not FIFO depth. The stale-stamp gate keeps
-            // `revive_or_seal` (which spawns a thread) to at most once per
-            // `WEDGE_AFTER_MS`.
             if self.tx.is_some() && self.busy_stale_ms().is_some() {
                 self.revive_or_seal();
             }
@@ -2164,17 +1791,7 @@ impl TrailAudio {
         let _ = (ev, meta);
     }
 
-    /// Whether cues pushed here can ever reach a device: `false` for the
-    /// sealed headless/test form, platforms without an audio backend, and
-    /// after a permanent ingress failure. The tone-of-typing classifier gates
-    /// on this so it never runs where sound can only be silence.
-    ///
-    /// Channel liveness only: a wedged worker keeps it `true` (pair with
-    /// [`Self::wedged_for`] when reporting). The device opens lazily on the first
-    /// cue, so this must not mean "device started", or the first keystroke would
-    /// be refused; `keystroke_click_audible`'s `host` term is `HostState::Inert`
-    /// exactly when this is false. [`Self::host_state`] is the device state, for
-    /// status only.
+    /// Whether cues pushed here can ever reach a device.
     pub fn is_live(&self) -> bool {
         #[cfg(test)]
         if self.capture.is_some() {
@@ -2191,7 +1808,6 @@ impl TrailAudio {
     }
 
     /// `Some(elapsed)` when the worker's current platform call has outlived its
-    /// threshold ([`busy_stale`]); `None` when parked, between calls, or still young.
     #[cfg(target_os = "macos")]
     fn busy_stale_ms(&self) -> Option<u64> {
         busy_stale(
@@ -2200,9 +1816,7 @@ impl TrailAudio {
         )
     }
 
-    /// Wedged: ingress is open ([`Self::is_live`] is `true`) but the worker
-    /// has been stuck inside one platform call past its threshold, so every
-    /// new cue is dropped. `None` on the healthy, sealed and non-macOS forms.
+    /// Wedged: ingress is open ([`Self::is_live`] is `true`) but the worker has been stuck.
     pub(crate) fn wedged_for(&self) -> Option<Duration> {
         #[cfg(test)]
         if self.capture.is_some() {
@@ -2210,7 +1824,6 @@ impl TrailAudio {
         }
         #[cfg(target_os = "macos")]
         {
-            // A sealed host (no ingress) outranks wedged.
             self.tx
                 .as_ref()
                 .and_then(|_| self.busy_stale_ms())
@@ -2223,11 +1836,6 @@ impl TrailAudio {
     }
 
     /// The host's state for a status row.
-    ///
-    /// Precedence: sealed ingress is `Inert` and outranks everything; a wedge
-    /// outranks the state word (a running worker stuck in a call is wedged);
-    /// otherwise the state word answers. Honors the `#[cfg(test)]` capture
-    /// short-circuit like [`Self::is_live`] and [`Self::wedged_for`].
     pub(crate) fn host_state(&self) -> HostState {
         #[cfg(test)]
         if self.capture.is_some() {
@@ -2247,8 +1855,6 @@ impl TrailAudio {
                 STATE_FAILED => HostState::Failed,
                 STATE_REOPENING => HostState::Reopening,
                 STATE_STOPPED => HostState::Stopped,
-                // STATE_DORMANT, or any unknown word: ingress is open and no
-                // device is started. Never report an unknown state as running.
                 _ => HostState::Opening,
             }
         }
@@ -2258,8 +1864,7 @@ impl TrailAudio {
         }
     }
 
-    /// Device reopens the worker has left. `0` beside `audio=failed` is the
-    /// one honestly terminal reading.
+    /// Device reopens the worker has left.
     pub(crate) fn reopens_left(&self) -> u8 {
         #[cfg(target_os = "macos")]
         {
@@ -2271,8 +1876,7 @@ impl TrailAudio {
         }
     }
 
-    /// How many wedge revivals this host has spent; printed beside
-    /// `dropped=`, since a revival replaces the worker.
+    /// How many wedge revivals this host has spent.
     pub(crate) fn revives_spent(&self) -> u64 {
         #[cfg(target_os = "macos")]
         {
@@ -2284,9 +1888,7 @@ impl TrailAudio {
         }
     }
 
-    /// Saturating count of dropped cues: the sum of a full ingress FIFO, a
-    /// push at a host whose ingress is gone, and a cue the worker consumed
-    /// inside a reopen backoff window.
+    /// Saturating count of dropped cues.
     pub(crate) fn dropped_cues(&self) -> u64 {
         #[cfg(target_os = "macos")]
         {
@@ -2303,9 +1905,6 @@ impl TrailAudio {
     }
 
     /// A wedge was observed at the ingress. With budget remaining, abandon the
-    /// stuck worker (drop detaches it; it disposes its own queue if the call
-    /// ever returns) and stand up a fresh channel and worker. With the budget
-    /// exhausted, seal ingress so `is_live` is `false` and status reads inert.
     #[cfg(target_os = "macos")]
     fn revive_or_seal(&mut self) {
         if self.revives_left == 0 {
@@ -2322,7 +1921,6 @@ impl TrailAudio {
     #[cfg(test)]
     pub(crate) fn is_inert_for_test(&self) -> bool {
         // A capturing host accepts cues, so it is not inert; this stays the
-        // exact complement of `is_live`.
         if self.capture.is_some() {
             return false;
         }
@@ -2342,7 +1940,6 @@ impl TrailAudio {
     }
 
     /// An active host with no worker whose ingress is a real channel the test
-    /// holds; it exercises the enqueue path, not the capture tap.
     #[cfg(all(test, target_os = "macos"))]
     fn test_ingress() -> (Self, std::sync::mpsc::Receiver<Cue>) {
         let (tx, rx) = cue_channel();
@@ -2363,19 +1960,12 @@ impl Drop for TrailAudio {
             let Some(worker) = self.worker.take() else {
                 return;
             };
-            // A wedged worker cannot observe the shutdown flag, and joining it
-            // would block the event loop. Detach it: if its call ever returns
-            // it sees `shutdown`, exits, and its `MacOut` disposes the queue.
             if self.busy_stale_ms().is_some() {
                 #[cfg(test)]
                 LAST_TEARDOWN.with(|last| last.set(Some(WorkerTeardown::DetachedWedged)));
                 drop(worker);
                 return;
             }
-            // Healthy teardown stays effectively synchronous: a parked worker
-            // wakes from the closed channel, a running one returns within a
-            // housekeeping interval. Only a call slower than the deadline is
-            // detached.
             #[cfg(test)]
             CLOSED_BEFORE_WAIT.with(|closed| closed.set(Some(self.tx.is_none())));
             let deadline = std::time::Instant::now() + detach_deadline();
@@ -2402,9 +1992,7 @@ impl Drop for TrailAudio {
 pub(crate) mod trail_audio_conformance {
     use aterm_spec::interp::State;
 
-    /// Project the bounded lifecycle fields shared by the worker/device
-    /// actions. Mailbox/drop counters collapse to the model's Cap=2
-    /// abstraction; safety-observable UI violations remain exact zeros.
+    /// Project the bounded lifecycle fields shared by the worker/device actions.
     #[allow(
         clippy::too_many_arguments,
         reason = "named scalar projection mirrors the derived model variables exactly"
@@ -2500,11 +2088,9 @@ mod tests {
     };
 
     /// The state word reaches the status verb: a process that never opened a
-    /// device does not print `live`.
     #[test]
     fn a_dormant_host_is_not_live_on_the_wire() {
         let (mut audio, _rx) = TrailAudio::test_ingress();
-        // Ingress open, no device opened: `live` would be a lie.
         assert_eq!(audio.host_state(), HostState::Opening);
         assert_eq!(wire(audio.host_state()), "opening");
 
@@ -2519,20 +2105,16 @@ mod tests {
             assert_eq!(audio.host_state(), want, "state word {word}");
         }
 
-        // A wedge outranks the state word.
         audio.state.store(STATE_RUNNING, Ordering::Release);
         audio.busy.store(1, Ordering::Release);
         assert_eq!(audio.host_state(), HostState::Wedged);
 
-        // …and a sealed ingress outranks everything: there is nothing left to
-        // be running.
         audio.tx = None;
         assert_eq!(audio.host_state(), HostState::Inert);
         assert_eq!(wire(audio.host_state()), "inert");
     }
 
     /// The word a `HostState` reaches `tone` as, the same spelling the row
-    /// prints. Every state has its own word, with no fallback to `live`.
     fn wire(s: HostState) -> &'static str {
         s.label()
     }
@@ -2546,8 +2128,6 @@ mod tests {
             assert!(seen.insert(w), "{w} is spelled twice");
         }
         assert_eq!(seen.len(), HostState::ALL.len());
-        // `live` is reserved for the one state in which a platform call
-        // succeeded.
         assert_eq!(wire(HostState::Running), "live");
         for s in [HostState::Inert, HostState::Opening, HostState::Failed] {
             assert_ne!(wire(s), "live", "{s:?}");
@@ -2564,15 +2144,12 @@ mod tests {
             hue: 0.0,
             gain: 0.4,
             tone: aterm_effects::tone::Tone::Technical,
-            // Bed on in the queue tests: the idle-pause policy proofs cover the
-            // worst-case (bed-breathing) exhale window.
             bed: true,
             shifted: false,
         }
     }
 
     /// Wait for the worker thread to reach a state: a one-minute hang detector
-    /// polled every millisecond, so a correct run leaves as soon as it holds.
     fn wait_until(label: &str, pred: impl Fn() -> bool) {
         let seen = aterm_spec::wait::within(
             aterm_spec::wait::MUST_HAPPEN,
@@ -2590,8 +2167,6 @@ mod tests {
     }
 
     /// Deterministic AudioQueue seam with no callback thread. Every write
-    /// checks that synchronous stop returned the buffer to available; a
-    /// test-only retained-pause mutation records unsafe writes instead.
     struct CallbackFreeQueue {
         buffers: [FakeBuffer; super::BUFFER_COUNT],
         cue_audible: bool,
@@ -2611,7 +2186,6 @@ mod tests {
         /// Stamps taken by `prime_and_start` (one per prime is the law).
         block_stamps: usize,
         /// Set by a stamp, cleared by a stop: a `render_post_cue` that runs
-        /// while it is clear is a prime rendering against a stale stamp.
         stamped_since_stop: bool,
         renders_before_stamp: usize,
     }
@@ -2645,7 +2219,6 @@ mod tests {
         }
 
         /// What `MacOut::push_meta` would hand the synth for a cue at the
-        /// fake's current instant.
         fn lead_now_s(&self) -> f32 {
             block_lead_s(self.running, self.block_start_us, self.clock_us)
         }
@@ -2687,8 +2260,6 @@ mod tests {
                 self.stop_overlaps += 1;
             }
             self.running = false;
-            // Boolean gate mutant: no generation identity, so an old callback
-            // can alias the later run.
             self.recycling = false;
             self.enqueue_in_flight = false;
             self.stamped_since_stop = false;
@@ -2770,10 +2341,6 @@ mod tests {
     }
 
     /// Tier-1 binding for `TrailAudioStartLatency`: drive MacOut's generic
-    /// prime/stop helpers with a callback-free queue that checks buffer
-    /// ownership on every write. Cold start and resume both put audible
-    /// post-cue samples in queue position one; synchronous stop returns every
-    /// pointer, and the parked interval performs no operation.
     #[test]
     fn audio_queue_post_cue_prime_conforms_with_callback_free_fake() {
         use super::trail_audio_conformance::project_start_latency;
@@ -2860,9 +2427,6 @@ mod tests {
             assert!(model.check_invariant(invariant, &state), "{invariant}");
         }
 
-        // Negative control A: queueing three silent buffers before applying
-        // the cue puts the first audible buffer at position four, matching
-        // the Buggy model witness.
         let mut retained = CallbackFreeQueue::new();
         for index in 0..retained.buffer_count() {
             assert!(!retained.render_post_cue(index));
@@ -2881,10 +2445,6 @@ mod tests {
         assert_eq!(bad["audible_buffer"], retained.queued() as i64 + 1);
         assert!(!buggy.check_invariant("AudibleWithinOneBuffer", &bad));
 
-        // Negative control B: a boolean check lets stop begin between a
-        // callback's check and its enqueue. Pausing then retains queue
-        // ownership, so a refill writes a scheduled pointer. The fake and
-        // Buggy model record both violations.
         assert!(buggy.fire("StartCold", &mut bad));
         retained.callback_enqueue_begins();
         assert!(buggy.fire("CallbackEnqueueBegins", &mut bad));
@@ -2892,9 +2452,6 @@ mod tests {
         assert!(buggy.fire("StopIdle", &mut bad));
         assert_eq!(retained.stop_overlaps, 1);
         assert!(!buggy.check_invariant("StopNeverOverlapsEnqueue", &bad));
-        // With a callback mid-enqueue, `stop_and_reclaim` reports `false` and
-        // all three buffers stay queued. The mutant frees them anyway, which
-        // `BufferOwnershipConserved` rejects.
         let mut refused = CallbackFreeQueue::new();
         refused.apply_audible_cue();
         prime_and_start(&mut refused).expect("prime/start before the refused stop");
@@ -2920,20 +2477,13 @@ mod tests {
     }
 
     /// Cues in the first block after a resume prime measure their pre-roll
-    /// against the prime, not the last block rendered before the park. Driven
-    /// through `MacOut`'s generic helpers on the callback-free fake with a fake
-    /// clock. Negative control: a prime that does not stamp makes a cue 3 ms
-    /// after resume clamp to a full block.
     #[test]
     fn a_resume_prime_restamps_the_block_so_the_next_cues_pre_roll_is_its_true_offset() {
         const MS: u64 = 1_000;
         let mut queue = CallbackFreeQueue::new();
 
-        // Before any prime nothing is stamped and nothing is running: 0.
         assert_eq!(queue.lead_now_s(), 0.0);
 
-        // Cold start at t = 1 s. The first cue is pushed while the queue is
-        // not running (lead 0 by law), then primed.
         queue.apply_audible_cue();
         assert_eq!(
             queue.lead_now_s(),
@@ -2952,7 +2502,6 @@ mod tests {
             "4 ms into the primed block"
         );
 
-        // Steady state: the callback stamps each block as it begins.
         queue.clock_us += 500 * MS;
         queue.callback_renders_block();
         let last_callback_us = queue.clock_us;
@@ -2965,8 +2514,6 @@ mod tests {
             "a late callback clamps to one block"
         );
 
-        // Silence: the queue parks for five seconds. Parked, the law reads 0
-        // whatever the stamp says.
         assert!(stop_and_reclaim(&mut queue));
         queue.clock_us += 5_000 * MS;
         assert_eq!(
@@ -2979,8 +2526,6 @@ mod tests {
             "the parked stamp is seconds old"
         );
 
-        // Key 1 wakes the queue (lead 0), the prime runs, and key 2 arrives
-        // 3 ms later, inside the first block after the resume.
         queue.apply_audible_cue();
         let resume_us = queue.clock_us;
         prime_and_start(&mut queue).expect("resume prime/start");
@@ -2995,8 +2540,6 @@ mod tests {
             "key 2 measures 3 ms from the prime, got {key2}"
         );
 
-        // Negative control: without the prime's stamp, key 2 measures against
-        // the block before the park and clamps to the whole block.
         let retired = block_lead_s(true, last_callback_us, queue.clock_us);
         assert_eq!(
             retired, BLOCK_S,
@@ -3007,8 +2550,6 @@ mod tests {
             "the asymmetry this pin keeps out: {retired} vs {key2}"
         );
 
-        // And once the first callback lands, prime and callback stamps are
-        // one continuous clock.
         queue.clock_us += 8 * MS;
         queue.callback_renders_block();
         queue.clock_us += 2 * MS;
@@ -3024,12 +2565,10 @@ mod tests {
         fail_open: AtomicBool,
         fail_push: AtomicBool,
         /// While set, `push` spins in place — the deterministic stand-in for a
-        /// platform call that has stopped returning (the wedge).
         block_push: AtomicBool,
         /// The last cue's `at_ms`, so a test can prove the side-car arrived.
         last_at_ms: std::sync::atomic::AtomicU32,
         /// One-shot: the next `push_meta` reports `Reopen` without consuming
-        /// the cue, standing in for a stalled or faulted queue.
         stall_push_once: AtomicBool,
         /// One-shot: the next `on_tick` reports `Reopen`.
         stall_tick_once: AtomicBool,
@@ -3042,7 +2581,6 @@ mod tests {
 
     impl AudioWorkerOutput for FakeOutput {
         fn push_meta(&mut self, _ev: SoundEvent, meta: EventMeta) -> Delivery {
-            // The stamp lands before the count a test waits on.
             self.shared.last_at_ms.store(meta.at_ms, Ordering::Release);
             self.shared.pushes.fetch_add(1, Ordering::Release);
             while self.shared.block_push.load(Ordering::Acquire) {
@@ -3079,22 +2617,17 @@ mod tests {
     }
 
     /// What [`spawn_fake_worker`] hands back: cue ingress, the shutdown flag,
-    /// the state and busy cells, and the worker's join handle.
     type FakeWorkerHandles = (
         std::sync::mpsc::SyncSender<Cue>,
         Arc<AtomicBool>,
         Arc<AtomicU8>,
         Arc<std::sync::atomic::AtomicU64>,
         std::thread::JoinHandle<()>,
-        // `dropped_backoff`, `reopens_left` — the two counters the reopen
-        // lane reports through.
         Arc<std::sync::atomic::AtomicU64>,
         Arc<AtomicU8>,
     );
 
     /// The shipping `REOPEN_BACKOFF` compressed to milliseconds, so the retry
-    /// schedule is exercised at test speed; same length, so the budget under
-    /// test is the shipping budget.
     const FAKE_BACKOFF: [std::time::Duration; REOPEN_BUDGET as usize] = [
         std::time::Duration::ZERO,
         std::time::Duration::from_millis(1),
@@ -3155,8 +2688,6 @@ mod tests {
     }
 
     /// Tier-1: drive the shipping `TrailAudio::push` and check its
-    /// available/full decisions against the derived model's transitions.
-    /// Filling all 64 slots binds the abstraction to the production capacity.
     #[test]
     fn shipping_ingress_conforms_to_bounded_drop_newest_model() {
         use std::sync::atomic::Ordering;
@@ -3193,8 +2724,6 @@ mod tests {
         );
         assert_eq!(rx.try_iter().count(), COMMAND_CAPACITY);
 
-        // Negative control: a silent loss (full queue, no drop accounting) is
-        // not a healthy model transition.
         let silent_loss = project_ingress(2, 0, true);
         assert!(
             !model
@@ -3235,16 +2764,11 @@ mod tests {
         audio.push(cue());
         assert!(audio.tx.is_none());
         assert_eq!(audio.state(), STATE_FAILED);
-        // Permanently disabled: subsequent pushes cannot retry or block.
         audio.push(cue());
         assert!(audio.tx.is_none());
     }
 
     /// Tier-1 worker lifecycle with an injected deterministic device: the
-    /// shipping worker loop does no open/timer work before the first cue,
-    /// starts once, pauses onto a blocking receive, and resumes the same
-    /// backend on the next cue. Model transitions and a negative control bind
-    /// the observed states to the derived lifecycle.
     #[test]
     fn worker_lifecycle_conforms_and_parks_without_polling() {
         use super::trail_audio_conformance::project_worker;
@@ -3284,8 +2808,6 @@ mod tests {
         wait_until("idle pause", || {
             state.load(Ordering::Acquire) == STATE_PAUSED
         });
-        // The running worker ticked into the pause (it owned a housekeeping
-        // timeout); the paused one does not tick.
         let ticks_at_pause = shared.ticks.load(Ordering::Relaxed);
         let running_deadline = ticks_at_pause > 0;
         assert!(running_deadline, "the running worker services a deadline");
@@ -3309,9 +2831,6 @@ mod tests {
                 .successors("ParkIdle", &after_pause)
                 .contains(&after_pause)
         );
-        // Negative control at the projection: a pause that kept its
-        // housekeeping timeout is the model's `Buggy=1` PauseIdle, which
-        // `RunningOwnsOneDeadline` rejects.
         let polling_pause =
             project_worker(0, 0, false, false, 2, running_deadline, false, false, true);
         assert!(
@@ -3341,8 +2860,6 @@ mod tests {
     }
 
     /// A failed device open, start or enqueue is retried on the reopen ladder
-    /// instead of sealing ingress; budget exhaustion is still explicit,
-    /// terminal and observable.
     #[test]
     fn worker_device_failure_is_retried_with_backoff_then_terminal_at_budget() {
         let shared = Arc::new(FakeShared::default());
@@ -3350,8 +2867,6 @@ mod tests {
         let (tx, _shutdown, state, _busy, worker, dropped_backoff, reopens_left) =
             spawn_fake_worker(Arc::clone(&shared));
 
-        // One fault is not terminal: the worker reports reopening and ingress
-        // stays open.
         tx.send(cue().into()).unwrap();
         wait_until("first fault reopens", || {
             state.load(Ordering::Acquire) == STATE_REOPENING
@@ -3361,9 +2876,6 @@ mod tests {
             "ingress stays open while budget remains"
         );
 
-        // Every cue past a backoff window spends one more attempt. The
-        // compressed schedule totals 31 ms, so feeding cues steadily walks
-        // the budget to its end.
         let deadline = std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN;
         while state.load(Ordering::Acquire) != STATE_FAILED && std::time::Instant::now() < deadline
         {
@@ -3377,20 +2889,17 @@ mod tests {
         );
         worker.join().unwrap();
 
-        // The device was reopened, never more times than the budget allows.
         assert_eq!(
             shared.opens.load(Ordering::Relaxed),
             usize::from(REOPEN_BUDGET) + 1,
             "the first open plus exactly the budget's worth of REopens"
         );
         assert_eq!(shared.pushes.load(Ordering::Relaxed), 0);
-        // Exhaustion is terminal and observable.
         assert_eq!(reopens_left.load(Ordering::Acquire), 0);
         assert!(
             tx.send(cue().into()).is_err(),
             "an exhausted budget still seals ingress"
         );
-        // …and the cues lost while the device was down are counted.
         assert!(
             dropped_backoff.load(Ordering::Relaxed) > 0,
             "cues lost to a down device must be counted"
@@ -3398,21 +2907,17 @@ mod tests {
     }
 
     /// A key discovers a faulted or stalled queue on the push path (not only
-    /// on the idle tick), and that key is still heard.
     #[test]
     fn a_stalled_device_is_discovered_by_the_next_key_and_that_key_is_still_heard() {
         let shared = Arc::new(FakeShared::default());
         let (tx, shutdown, state, _busy, worker, _dropped_backoff, reopens_left) =
             spawn_fake_worker(Arc::clone(&shared));
 
-        // One healthy cue opens the device.
         tx.send(cue().into()).unwrap();
         wait_until("first open", || {
             shared.opens.load(Ordering::Relaxed) == 1 && shared.pushes.load(Ordering::Acquire) == 1
         });
 
-        // The next push reports a stall. The worker must reopen and re-push
-        // the same cue into the fresh device.
         shared.stall_push_once.store(true, Ordering::Release);
         tx.send(cue().into()).unwrap();
         wait_until("reopen after stall", || {
@@ -3421,17 +2926,12 @@ mod tests {
         wait_until("running again", || {
             state.load(Ordering::Acquire) == STATE_RUNNING
         });
-        // A successful reopen does not restore the budget on the spot; it
-        // returns only after the device has played for
-        // `RetryState::healthy_for` past its first delivery (16 ms here).
         assert_eq!(
             reopens_left.load(Ordering::Acquire),
             REOPEN_BUDGET - 1,
             "the reopen it just spent stays spent"
         );
 
-        // …and past that window, the next delivered cue hands it back: the
-        // bound is on consecutive failure, not on a lifetime of healthy use.
         std::thread::sleep(std::time::Duration::from_millis(40));
         let before = shared.pushes.load(Ordering::Acquire);
         tx.send(cue().into()).unwrap();
@@ -3448,7 +2948,6 @@ mod tests {
     }
 
     /// Negative control for the two above: a fake that never stalls reopens
-    /// zero times.
     #[test]
     fn a_healthy_device_is_never_reopened() {
         let shared = Arc::new(FakeShared::default());
@@ -3469,13 +2968,9 @@ mod tests {
     }
 
     /// The budget is spendable by a device that opens and never plays
-    /// (`AudioQueueNewOutput` succeeds, start or enqueue does not): the ladder
-    /// resets only on a delivery past a healthy window, so this reaches
-    /// `Reopen::Exhausted` instead of reopening per keystroke forever.
     #[test]
     fn a_device_that_opens_but_never_plays_spends_the_budget_and_stops() {
         let shared = Arc::new(FakeShared::default());
-        // The open succeeds; every push reports Reopen.
         shared.fail_push.store(true, Ordering::Relaxed);
         let (tx, _shutdown, state, _busy, worker, dropped_backoff, reopens_left) =
             spawn_fake_worker(Arc::clone(&shared));
@@ -3493,7 +2988,6 @@ mod tests {
         );
         worker.join().unwrap();
 
-        // Bounded by the budget, not by how long the person keeps typing.
         assert!(
             shared.opens.load(Ordering::Relaxed) <= usize::from(REOPEN_BUDGET) + 1,
             "opens must be bounded by the budget, got {}",
@@ -3508,16 +3002,10 @@ mod tests {
     }
 
     /// A slow device open is not a wedge. The worker holds the busy stamp
-    /// across `AudioQueueNewOutput` and its buffer allocations, which can take
-    /// seconds; the phase rides in the stamp and an open is judged at
-    /// [`OPEN_WEDGE_AFTER_MS`], so a slow open does not cost a revival. The
-    /// same stamp age is a wedge for a steady-state call and not for an open.
     #[test]
     fn a_slow_device_open_is_not_a_wedge() {
         use super::{BUSY_OPENING, OPEN_WEDGE_AFTER_MS, WEDGE_AFTER_MS, busy_stale};
 
-        // Exact on a fabricated clock: a stamp of `t0` read at
-        // `t0 + WEDGE_AFTER_MS` is the same age in both arms.
         let t0 = 1_000_000u64;
         assert!(busy_stale(0, t0 + 10 * OPEN_WEDGE_AFTER_MS).is_none());
         assert_eq!(
@@ -3540,9 +3028,6 @@ mod tests {
              window is a different price, not an exemption"
         );
 
-        // On the live host, a push while the worker is inside an open of
-        // wedge age must not abandon it. `WEDGE_AFTER_MS` back from now is
-        // stale for a steady-state call and short of the open threshold.
         let opening = monotonic_ms().saturating_sub(WEDGE_AFTER_MS).max(1) | BUSY_OPENING;
 
         let (audio, _rx) = TrailAudio::test_ingress();
@@ -3566,17 +3051,12 @@ mod tests {
     }
 
     /// The stall verdict against a fake clock: a stopped queue and a
-    /// never-armed one are not stalls.
     #[test]
     fn callback_stall_verdict_is_exact_on_a_fake_clock() {
         const MS: u64 = 1_000;
         let armed = 10 * MS;
-        // Not running: a parked queue is not calling back and must not be.
         assert!(!callback_stalled(false, armed, armed + 10_000 * MS));
-        // Never armed: a cold `MacOut` has not started, so it cannot have
-        // stopped calling back.
         assert!(!callback_stalled(true, 0, 10_000 * MS));
-        // One microsecond under the threshold, and exactly on it.
         assert!(!callback_stalled(
             true,
             armed,
@@ -3587,13 +3067,10 @@ mod tests {
             armed,
             armed + super::STALL_AFTER_MS * MS
         ));
-        // A clock that appears to run backwards saturates to zero elapsed,
-        // never to a spurious stall.
         assert!(!callback_stalled(true, 10_000 * MS, 1));
     }
 
     /// The reopen schedule is cue-driven and respects its window, so it never
-    /// busy-loops or wakes an idle worker.
     #[test]
     fn reopen_attempts_respect_their_backoff_window() {
         let mut output: Option<()> = Some(());
@@ -3604,8 +3081,6 @@ mod tests {
         let mut retry = super::RetryState::new(&backoff);
         let t0 = std::time::Instant::now();
 
-        // First fault: immediate, because the overwhelmingly likely cause is
-        // transient and an immediate reopen makes the next key sound.
         assert_eq!(
             super::reopen_after_fault(&mut output, &mut retry, t0),
             super::Reopen::Now
@@ -3614,7 +3089,6 @@ mod tests {
         assert!(retry.ready(t0));
         assert_eq!(retry.left(), 1);
 
-        // Second fault: inside its window a cue may not spend an attempt.
         output = Some(());
         assert_eq!(
             super::reopen_after_fault(&mut output, &mut retry, t0),
@@ -3624,7 +3098,6 @@ mod tests {
         assert!(retry.ready(t0 + std::time::Duration::from_millis(50)));
         assert_eq!(retry.left(), 0);
 
-        // And the budget is the only terminal state.
         assert_eq!(
             super::reopen_after_fault(&mut output, &mut retry, t0),
             super::Reopen::Exhausted
@@ -3632,7 +3105,6 @@ mod tests {
     }
 
     /// A host born inert (`new(false)`, ingress `None` from birth) counts no
-    /// drops.
     #[test]
     fn an_inert_host_counts_no_sealed_drops() {
         let mut audio = TrailAudio::new(false);
@@ -3668,7 +3140,6 @@ mod tests {
     }
 
     /// The busy stamp is nonzero and stable while the worker sits inside one
-    /// call, and zero once it parks.
     #[test]
     fn platform_busy_stamps_calls_and_clears_at_park() {
         let shared = Arc::new(FakeShared::default());
@@ -3706,7 +3177,6 @@ mod tests {
     }
 
     /// A full channel alone is a burst, not a wedge: with the busy stamp
-    /// young (or clear), the drop is accounted and nothing is revived.
     #[test]
     fn young_platform_call_is_not_a_wedge() {
         let (mut audio, rx) = TrailAudio::test_ingress();
@@ -3725,8 +3195,6 @@ mod tests {
     }
 
     /// Channel full and the worker stuck inside one platform call past the
-    /// threshold: one push reports the wedge and spends a revival (fresh
-    /// channel, fresh worker, old ingress dead).
     #[test]
     fn wedged_full_ingress_revives_within_budget() {
         let (mut audio, rx) = TrailAudio::test_ingress();
@@ -3734,8 +3202,6 @@ mod tests {
         for _ in 0..COMMAND_CAPACITY {
             audio.push(cue());
         }
-        // Stamp 1 = the clock's origin, which sits past the threshold by
-        // construction (see `monotonic_ms`) — a wedge, deterministically.
         audio.busy.store(1, std::sync::atomic::Ordering::Release);
         assert!(
             audio.wedged_for().is_some(),
@@ -3756,12 +3222,9 @@ mod tests {
             ),
             "the wedged channel is abandoned with its worker"
         );
-        // The fresh worker never receives a cue, so it parks without touching
-        // the device and this drop joins it synchronously.
     }
 
     /// An exhausted revival budget seals ingress: `is_live` goes false, so
-    /// every status verb reads inert instead of eternally-healthy silence.
     #[test]
     fn wedge_with_spent_budget_seals_ingress() {
         let (mut audio, _rx) = TrailAudio::test_ingress();
@@ -3778,15 +3241,9 @@ mod tests {
     }
 
     /// Dropping a wedged host never blocks the calling (event-loop) thread: the
-    /// stuck worker is detached, not joined. The drop's own decision is asserted
-    /// (`DetachedWedged` is recorded only by the branch that detaches without
-    /// waiting), and the drop runs on a helper whose one-minute answer deadline
-    /// turns a forever-join into a failure instead of a hung test.
     #[test]
     fn dropping_a_wedged_host_detaches_instead_of_freezing() {
         let (mut audio, _rx) = TrailAudio::test_ingress();
-        // Stand-in for a thread stuck in a platform call: parked until the
-        // keeper is dropped, which this test does only after the drop answers.
         let (keeper_tx, keeper_rx) = std::sync::mpsc::channel::<()>();
         audio.worker = Some(std::thread::spawn(move || {
             let _ = keeper_rx.recv();
@@ -3799,8 +3256,6 @@ mod tests {
             let _ = answer_tx.send(LAST_TEARDOWN.with(std::cell::Cell::get));
         });
         let teardown = answer_rx.recv_timeout(aterm_spec::wait::MUST_HAPPEN);
-        // Released only now, so a drop that joined the stand-in was parked on
-        // it for the whole deadline, and can finish once the verdict is in.
         drop(keeper_tx);
         dropper.join().expect("the drop does not panic");
         assert_eq!(
@@ -3811,13 +3266,6 @@ mod tests {
     }
 
     /// A parked shipping worker is woken by the closing channel and joined. The
-    /// deadline is stretched to a minute so scheduling delay cannot turn the
-    /// join into a detach (a drop that never wakes the worker still records
-    /// `DetachedAtDeadline`), and the mechanism is asserted too: the channel
-    /// closed before the drop began waiting, and the worker left through its
-    /// idle `recv()` answering `Disconnected`, the one wake that is immediate by
-    /// construction. The test first waits for the worker to park, since a worker
-    /// not yet at its loop top exits on `shutdown` alone.
     #[test]
     fn dropping_a_healthy_host_stays_synchronous() {
         let audio = TrailAudio::new(true);
@@ -3831,8 +3279,6 @@ mod tests {
         }
         LAST_TEARDOWN.with(|last| last.set(None));
         DETACH_DEADLINE_OVERRIDE.with(|stretch| stretch.set(Some(aterm_spec::wait::MUST_HAPPEN)));
-        // Held across the drop, so the state word's address — the worker's
-        // name in the census — cannot be reused before it is read.
         let state = std::sync::Arc::clone(&audio.state);
         CLOSED_BEFORE_WAIT.with(|closed| closed.set(None));
         drop(audio);
@@ -3854,7 +3300,6 @@ mod tests {
     }
 
     /// `push` is `push_meta` with the identity side-car, and a stamped cue
-    /// reaches the host with the stamp the seam gave it.
     #[test]
     fn a_plain_push_carries_the_identity_side_car_and_a_stamped_one_its_stamp() {
         let mut audio = TrailAudio::capturing_for_test();
@@ -3913,8 +3358,6 @@ mod tests {
         worker.join().unwrap();
     }
 
-    // ── The `kAudioQueueProperty_IsRunning` listener ──
-
     use std::ffi::c_void;
 
     use super::mac::{
@@ -3923,7 +3366,6 @@ mod tests {
     };
 
     /// Fire the real listener body at `edge`, exactly as AudioToolbox would:
-    /// the userdata is the edge's address and the id the one registered.
     fn fire(edge: &RunningEdge, id: u32) {
         running_listener(
             std::ptr::from_ref(edge).cast_mut().cast::<c_void>(),
@@ -3933,13 +3375,11 @@ mod tests {
     }
 
     /// A read that must never happen: the healthy key path makes no platform
-    /// call, and neither does an edge the worker can prove is its own stop.
     fn no_read() -> Option<bool> {
         panic!("IsRunning was read on a path that must make no platform call")
     }
 
     /// The listener's body is one store, and it answers only for the property
-    /// it was registered on: a stray id or null userdata does nothing.
     #[test]
     fn the_listener_raises_one_edge_for_its_own_property_only() {
         let edge = RunningEdge::new();
@@ -3957,7 +3397,6 @@ mod tests {
     }
 
     /// Every cell of the `IsRunning` verdict. The only claim it may make is a
-    /// witnessed 1 → 0 within one start.
     #[test]
     fn the_is_running_probe_claims_a_stop_only_after_seeing_the_run() {
         use RunningProbe::{Abstain, NotYetRunning, Running, StoppedUnderUs};
@@ -3977,18 +3416,14 @@ mod tests {
     }
 
     /// A queue AudioToolbox stops under us is seen on the next service call
-    /// (push or tick), before the callback watchdog.
     #[test]
     fn a_queue_stopped_under_us_is_seen_on_the_next_service_call() {
         let edge = RunningEdge::new();
         let mut health = DeviceHealth::new();
         let armed = 5_000;
         health.armed(armed);
-        // The start's own notification: it reads running.
         fire(&edge, PROP_IS_RUNNING);
         assert!(!health.needs_reopen(false, true, armed, armed, &edge, || Some(true)));
-        // AudioToolbox stops it. The clock has not moved — the watchdog
-        // could not have fired — and the verdict is already Reopen.
         fire(&edge, PROP_IS_RUNNING);
         assert!(
             health.needs_reopen(false, true, armed, armed, &edge, || Some(false)),
@@ -3997,34 +3432,27 @@ mod tests {
     }
 
     /// Negative control: a healthy running queue is never reopened by the
-    /// listener, and paths that must make no platform call make none.
     #[test]
     fn a_healthy_running_queue_is_never_reopened_by_the_listener() {
         let edge = RunningEdge::new();
         let mut health = DeviceHealth::new();
         let armed = 5_000;
         health.armed(armed);
-        // No edge: the healthy per-key path reads nothing.
         for _ in 0..100 {
             assert!(!health.needs_reopen(false, true, armed, armed, &edge, no_read));
         }
-        // Edges that read running — however many — are never a reopen.
         for i in 0..100 {
             fire(&edge, PROP_IS_RUNNING);
             assert!(!health.needs_reopen(false, true, armed + i, armed + i, &edge, || Some(true)));
         }
-        // An edge while the worker says stopped is the worker's own stop:
-        // consumed, no read, no reopen.
         fire(&edge, PROP_IS_RUNNING);
         assert!(!health.needs_reopen(false, false, armed, armed, &edge, no_read));
         assert!(!edge.take(), "our own stop's edge is consumed, not carried");
-        // A failed read claims nothing.
         fire(&edge, PROP_IS_RUNNING);
         assert!(!health.needs_reopen(false, true, armed, armed, &edge, || None));
     }
 
     /// A start still taking reads stopped too: the verdict re-raises the edge
-    /// and looks again instead of reopening, and a new start forgets the last.
     #[test]
     fn a_start_still_taking_is_looked_at_again_never_reopened() {
         let edge = RunningEdge::new();
@@ -4034,18 +3462,14 @@ mod tests {
         fire(&edge, PROP_IS_RUNNING);
         assert!(!health.needs_reopen(false, true, armed, armed, &edge, || Some(false)));
         assert!(edge.take(), "NotYetRunning re-raises the edge");
-        // …it reads running on the next look, and only then is a stop a stop.
         fire(&edge, PROP_IS_RUNNING);
         assert!(!health.needs_reopen(false, true, armed, armed, &edge, || Some(true)));
-        // A new start: what was seen of the previous run says nothing.
         health.armed(armed + 10);
         fire(&edge, PROP_IS_RUNNING);
         assert!(
             !health.needs_reopen(false, true, armed + 10, armed + 10, &edge, || Some(false)),
             "a fresh start's 0 is 'not yet', not 'stopped'"
         );
-        // Callbacks arrived since this start, yet it never read running: the
-        // listener abstains and the watchdog still applies.
         let _ = edge.take();
         fire(&edge, PROP_IS_RUNNING);
         assert!(!health.needs_reopen(false, true, armed + 20, armed + 20, &edge, || Some(false)));
@@ -4053,7 +3477,6 @@ mod tests {
     }
 
     /// The callback's `faulted` latch and the callback watchdog answer through
-    /// the same verdict, ahead of the listener and without a platform read.
     #[test]
     fn the_older_detectors_answer_through_the_same_verdict() {
         let edge = RunningEdge::new();
@@ -4067,7 +3490,6 @@ mod tests {
     }
 
     /// The teardown order observed through a test double: what the owner's
-    /// `Drop` does, in order.
     struct RecordingCalls {
         log: Arc<std::sync::Mutex<Vec<&'static str>>>,
         accept_listener: bool,
@@ -4110,11 +3532,8 @@ mod tests {
     }
 
     /// Listener removal before dispose, dispose before release, on every way a
-    /// queue ends.
     #[test]
     fn the_queue_owner_removes_the_listener_before_dispose_on_every_path() {
-        // Ordinary teardown (and the reopen after a fault, which drops the
-        // whole output): listener registered.
         let (calls, log) = RecordingCalls::new(true);
         let mut owned = OwnedQueue::new(calls);
         assert!(owned.listen());
@@ -4124,16 +3543,12 @@ mod tests {
             ["add", "remove", "dispose", "release"]
         );
 
-        // AudioToolbox refused the listener: nothing to remove, and nothing
-        // is removed that was never added.
         let (calls, log) = RecordingCalls::new(false);
         let mut owned = OwnedQueue::new(calls);
         assert!(!owned.listen());
         drop(owned);
         assert_eq!(*log.lock().unwrap(), ["add", "dispose", "release"]);
 
-        // `MacOut::new`'s buffer-allocation unwind: the owner exists, the
-        // listener is on, and an early `return None` is the whole unwind.
         fn open_then_fail(calls: RecordingCalls) -> Option<OwnedQueue<RecordingCalls>> {
             let mut owned = OwnedQueue::new(calls);
             owned.listen();
@@ -4152,9 +3567,6 @@ mod tests {
             "the allocation unwind removes the listener before disposing"
         );
 
-        // A queue whose worker is abandoned inside a platform call is never
-        // dropped: nothing is removed, disposed or released, so the listener
-        // keeps firing into a live (leaked) allocation.
         let (calls, log) = RecordingCalls::new(true);
         let mut owned = OwnedQueue::new(calls);
         owned.listen();
@@ -4163,8 +3575,6 @@ mod tests {
     }
 
     /// A device double for the worker-level proof: the real `DeviceHealth`
-    /// verdict and the real listener body, over a fake `IsRunning` property,
-    /// driven through the shipping `worker_loop` and its reopen ladder.
     #[derive(Default)]
     struct ListenerDevice {
         /// 0 reads stopped, 1 reads running, 2 the property call fails.
@@ -4175,7 +3585,6 @@ mod tests {
         ticks: AtomicUsize,
         drops: AtomicUsize,
         /// The edge of the current device — each open gets a fresh one, as
-        /// each real `MacOut` gets a fresh `Shared`.
         edge: std::sync::Mutex<Option<Arc<RunningEdge>>>,
     }
 
@@ -4197,8 +3606,6 @@ mod tests {
     impl ListenerOutput {
         fn needs_reopen(&mut self) -> bool {
             let dev = &self.dev;
-            // The clock never moves past the arm, so the watchdog cannot
-            // fire: whatever reopens here, the listener found.
             self.health
                 .needs_reopen(false, self.running, 1_000, 1_000, &self.edge, || {
                     dev.reads.fetch_add(1, Ordering::AcqRel);
@@ -4299,12 +3706,9 @@ mod tests {
     }
 
     /// The key path through the shipping ladder: a healthy queue whose
-    /// listener fires is not reopened; one stopped under us is reopened by
-    /// the next key, and that key is heard.
     #[test]
     fn the_next_key_after_a_stop_under_us_reopens_and_is_heard() {
         let dev = Arc::new(ListenerDevice::default());
-        // Housekeeping far beyond the test, so only pushes consume the edge.
         let (tx, shutdown, state, _busy, worker, _dropped, reopens_left) =
             spawn_listener_worker(Arc::clone(&dev), std::time::Duration::from_secs(60));
 
@@ -4313,13 +3717,11 @@ mod tests {
             dev.pushes.load(Ordering::Acquire) == 1
         });
 
-        // Negative control: the listener fires and the queue reads running.
         for n in 2..=4 {
             dev.stop_under_us(true);
             tx.send(cue().into()).unwrap();
             wait_until("healthy push", || dev.pushes.load(Ordering::Acquire) == n);
         }
-        // No edge: the healthy key reads nothing.
         tx.send(cue().into()).unwrap();
         wait_until("plain push", || dev.pushes.load(Ordering::Acquire) == 5);
         assert_eq!(dev.reads.load(Ordering::Acquire), 3, "one read per edge");
@@ -4327,7 +3729,6 @@ mod tests {
         assert_eq!(dev.drops.load(Ordering::Acquire), 0);
         assert_eq!(reopens_left.load(Ordering::Acquire), REOPEN_BUDGET);
 
-        // AudioToolbox stops it under us.
         dev.stop_under_us(false);
         tx.send(cue().into()).unwrap();
         wait_until("reopened and re-pushed", || {
@@ -4349,8 +3750,6 @@ mod tests {
     }
 
     /// The tick path: with nobody typing, a stop under us is seen by the next
-    /// housekeeping tick and the host reads `reopening`; ticks over a healthy
-    /// queue reopen nothing.
     #[test]
     fn the_next_tick_after_a_stop_under_us_reads_reopening() {
         let dev = Arc::new(ListenerDevice::default());
@@ -4360,7 +3759,6 @@ mod tests {
         tx.send(cue().into()).unwrap();
         wait_until("first push", || dev.pushes.load(Ordering::Acquire) == 1);
 
-        // Negative control on the tick path.
         dev.stop_under_us(true);
         wait_until("a tick read the edge", || {
             dev.reads.load(Ordering::Acquire) == 1
@@ -4380,7 +3778,6 @@ mod tests {
         assert_eq!(reopens_left.load(Ordering::Acquire), REOPEN_BUDGET - 1);
         assert_eq!(HostState::Reopening.label(), "reopening");
 
-        // Reopens are cue-driven: the next key opens a fresh device.
         tx.send(cue().into()).unwrap();
         wait_until("reopened on the next key", || {
             dev.opens.load(Ordering::Acquire) == 2 && dev.pushes.load(Ordering::Acquire) == 2

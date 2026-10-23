@@ -1,66 +1,11 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
-// Author: Andrew Yates
 
-//! Rust on this machine means the Trust toolchain: the stock Rust names, the Trust spelling
-//! of each, and the one reader that finds a stock Rust tool at command position in a shell
-//! command line.
-//!
-//! The rule: Rust means Trust everywhere, including in a repo whose `rust-toolchain.toml` pins
-//! a stock channel: `targo --unverified <cmd>` / `targo trust <cmd>` (never `cargo`, never
-//! `cargo +<channel>`), `targo tippy` (never clippy), `targo fmt` / `trustfmt` (never
-//! rustfmt), `trustc`, `trustdoc`. Three surfaces speak this vocabulary and must agree on every
-//! spelling: `atpkg::reroute` (the signpost printed when a stock name is typed),
-//! `aterm pkg lane` (`atpkg::lane`: this reader over one command line, the refusal a guard the
-//! owner wires says back; aterm installs nothing into an agent) and `aterm help rust` (which
-//! measures the toolchain a directory gets).
-//!
-//! # A Trust toolchain's own compatibility names
-//!
-//! The reader judges a command word by its name, except where a caller lets it look at the
-//! directory ([`verdict_in`]): a Trust toolchain's own `rustc` and `rustdoc` beside their
-//! twins are never a hit, and its `cargo` is refused with that directory's `targo`
-//! ([`COMPAT_TWINS`]). The same binaries chosen by a Trust rustup channel
-//! (`rustup run trust rustc`, `rustc +trust`) are read the same way, by text alone.
-//!
-//! Every spelling [`trust_spelling`] renders runs (a hint may only name a command that runs:
-//! docs/DESIGN-agent-toolchain-guidance-2026-09-08.md §2), so `cargo metadata` never renders a
-//! lane targo refuses.
-//!
-//! # A stock pin moves only rustup's proxies
-//!
-//! Under a `rust-toolchain.toml` pinning a stock channel, with rustup's proxies first on PATH,
-//! `targo` still runs the store's `trustc`, `tippy-driver`, `trustfmt` and `trustdoc` while
-//! the proxies `cargo`, `rustc` and `rustfmt` answer the pinned version: rustup proxies the
-//! names it ships, and `targo`, `tippy`, `trustfmt` and `trustdoc` are not among them. (An
-//! explicit `RUSTC` or `build.rustc` can move `targo` off trustc; `aterm help rust` measures
-//! that.)
-//!
-//! # Which lane a cargo verb takes
-//!
-//! | class | verbs | the Trust spelling |
-//! |---|---|---|
-//! | both lanes | `build` `check` `test` | `targo trust <verb> …` / `targo --unverified <verb> …` (a bare one is refused) |
-//! | unverified only | `run` `doc` `bench` `rustc` `rustdoc` `fix` `package` `install` `publish` | `targo --unverified <verb> …` (`targo trust <verb>` is not a verb) |
-//! | no lane | `clean` `metadata` `tree` `update` `fetch` `generate-lockfile` `locate-project` `pkgid` `vendor` `add` `remove` `new` `init` `version` `help` `search` `info` `config` `report` `verify-project` `read-manifest` `owner` `fmt` `tippy` | `targo <verb> …` (`--unverified` is refused: "valid only for a Targo compilation command") |
-//! | the linter | `clippy` | `targo tippy …` |
-//!
-//! A bare `build`, `check`, `test`, `package`, `install` or `publish` is refused ("refuses to
-//! create an implicitly unverified artifact"); a bare `run`, `doc`, `bench`, `rustc`,
-//! `rustdoc` or `fix` proceeds unverified with a warning. The spelling above is the one both
-//! accept. (`--help` answers before the lane check, so it proves nothing about a lane.)
-//! `targo clippy` runs the same `tippy-driver` as `targo tippy`, which is the name to type.
-//!
-//! A verb in none of those rows (`cargo nextest`, `cargo deny`, …) renders as `targo <verb> …`
-//! with a note that a cargo extension targo lacks has no Trust spelling: `targo nextest` and
-//! `targo deny` answer "no such command".
+//! Rust on this machine means the Trust toolchain.
 
 use std::path::{Path, PathBuf};
 
-/// The escape hatch an agent writes in front of a command that genuinely needs stock Rust:
-/// `ATERM_STOCK_REASON='<why>' cargo +1.97.1 …`, non-empty, in the same simple command, the
-/// reason then owed in the agent's reply. It is a word in the command text, read by
-/// [`check`]; nothing reads it from an environment, so exporting it earlier escapes nothing.
+/// The escape hatch an agent writes in front of a command that genuinely needs stock Rust.
 pub const STOCK_REASON: &str = "ATERM_STOCK_REASON";
 
 /// `build`, `check`, `test`: refused bare, and runnable in either lane.
@@ -99,9 +44,7 @@ pub const NO_LANE: &[&str] = &[
     "tippy",
 ];
 
-/// The stock names [`trust_spelling`] and [`check`] know, each with the Trust
-/// tool that replaces it. `cargo` and `rustc` carry lanes; the rest are one
-/// spelling.
+/// The stock names [`trust_spelling`] and [`check`] know, each with the Trust tool that replaces it.
 pub const STOCK_TOOLS: &[(&str, &str)] = &[
     ("cargo", "targo"),
     ("rustc", "trustc"),
@@ -113,14 +56,11 @@ pub const STOCK_TOOLS: &[(&str, &str)] = &[
     ("cargo-fmt", "targo fmt"),
 ];
 
-/// The note on the one spelling of a cargo verb in none of the verb classes, usually a cargo
-/// extension (`nextest`, `deny`): `targo nextest` and `targo deny` answer "no such command",
-/// so a surface rendering such a spelling must say it is conditional ([`is_unknown_verb`]).
+/// The note on the one spelling of a cargo verb in none of the verb classes, usually a cargo extension (`nextest`, `deny`).
 pub const UNKNOWN_VERB_NOTE: &str =
     "if targo has this verb; a cargo extension targo lacks has no Trust spelling";
 
-/// Whether `spellings` is the conditional one of a cargo verb targo is not known
-/// to have ([`UNKNOWN_VERB_NOTE`]).
+/// Whether `spellings` is the conditional one of a cargo verb targo is not known to have ([`UNKNOWN_VERB_NOTE`]).
 #[must_use]
 pub fn is_unknown_verb(spellings: &[Spelling]) -> bool {
     spellings.iter().any(|s| s.note == UNKNOWN_VERB_NOTE)
@@ -142,7 +82,7 @@ pub struct Spelling {
     pub note: &'static str,
 }
 
-/// Which lane(s) a cargo verb takes. See the module table.
+/// Which lane(s) a cargo verb takes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CargoVerb {
     /// `build`/`check`/`test`.
@@ -153,8 +93,7 @@ pub enum CargoVerb {
     NoLane,
     /// `clippy` — the linter is `targo tippy`.
     Clippy,
-    /// `trust` / `--unverified` in the verb position: the lane is already
-    /// named in cargo's own spelling (`cargo trust check`).
+    /// `trust` / `--unverified` in the verb position: the lane is already named in cargo's own spelling (`cargo trust check`).
     NamedLane,
     /// No verb at all: flags only (`cargo --version`) or nothing.
     FlagsOnly,
@@ -197,8 +136,7 @@ pub fn is_trust_channel(channel: &str) -> bool {
 /// Global cargo options that take their value as the next word.
 const CARGO_VALUE_FLAGS: &[&str] = &["--color", "--config", "-Z", "-C", "--explain"];
 
-/// The index of cargo's verb in `args` (no leading `+toolchain`): the first word
-/// that is not a global option or an option's value. `None` for flags only.
+/// The index of cargo's verb in `args` (no leading `+toolchain`): the first word that is not a global option or an option's value.
 #[must_use]
 pub fn cargo_verb_index(args: &[String]) -> Option<usize> {
     let mut i = 0;
@@ -238,11 +176,7 @@ fn command_line(tool: &str, words: &[String]) -> String {
     s
 }
 
-/// The Trust spelling of `<stock> <args>`, `args` exactly as the caller typed
-/// them (a leading `+<toolchain>` is dropped: no Trust tool takes a rustup
-/// directive). `None` when `stock` is not one of [`STOCK_TOOLS`].
-///
-/// Two-lane commands come VERIFIED first, the order every signpost prints.
+/// The Trust spelling of `<stock> <args>`, `args` exactly as the caller typed them (a leading `+<toolchain>` is dropped: no Trust tool takes a rustup directive).
 #[must_use]
 pub fn trust_spelling(stock: &str, args: &[String]) -> Option<Vec<Spelling>> {
     let args = if explicit_toolchain(args).is_some() {
@@ -291,8 +225,6 @@ fn cargo_spelling(args: &[String]) -> Vec<Spelling> {
             note: "takes no lane",
         }];
     };
-    // The verb first in the rendered command, then any global flag typed before
-    // it, then the rest: `targo trust` parses its own verb before anything else.
     let verb_first = |verb: &str| -> Vec<String> {
         let mut words = vec![verb.to_string()];
         words.extend_from_slice(&args[..at]);
@@ -343,8 +275,7 @@ fn cargo_spelling(args: &[String]) -> Vec<Spelling> {
     }
 }
 
-/// The spellings as indented lines, one per lane, the commands padded to one
-/// column: `  targo trust test -p x          VERIFIED   — emits a proof claim`.
+/// The spellings as indented lines, one per lane, the commands padded to one column.
 #[must_use]
 pub fn render_spellings(spellings: &[Spelling], indent: &str) -> String {
     let width = spellings.iter().map(|s| s.command.len()).max().unwrap_or(0) + 3;
@@ -354,7 +285,6 @@ pub fn render_spellings(spellings: &[Spelling], indent: &str) -> String {
         out.push_str(indent);
         out.push_str(&s.command);
         if s.label.is_empty() && label_width == 0 {
-            // One spelling with no lane: the command alone is the line.
             out.push('\n');
             continue;
         }
@@ -372,11 +302,7 @@ pub fn render_spellings(spellings: &[Spelling], indent: &str) -> String {
     out
 }
 
-// ── the pin ─────────────────────────────────────────────────────────────────
-
-/// The channel a toolchain file names: TOML `channel = "<name>"` (comments
-/// skipped), or the legacy one-line `rust-toolchain` form (the first non-empty,
-/// non-comment line, when it is a bare name).
+/// The channel a toolchain file names.
 #[must_use]
 pub fn channel_in(text: &str) -> Option<String> {
     let lines = text.lines().map(str::trim).filter(|l| !l.starts_with('#'));
@@ -411,14 +337,7 @@ pub fn channel_in(text: &str) -> Option<String> {
     bare.then(|| legacy.to_string())
 }
 
-/// The toolchain file rustup would read for `start`, and the channel it names:
-/// walking `start` and its parents, `rust-toolchain` before `rust-toolchain.toml`
-/// in one directory (rustup's own order when both exist). A file that names no
-/// channel ends the walk with `None`, as rustup stops at the first file.
-///
-/// Files only: a `rustup override set` directory override and
-/// `$RUSTUP_TOOLCHAIN` also move rustup's proxies, and a caller that must know
-/// asks rustup (`rustup show active-toolchain`).
+/// The toolchain file rustup would read for `start`, and the channel it names.
 #[must_use]
 pub fn find_pin(start: &Path) -> Option<(PathBuf, String)> {
     let mut dir = Some(start);
@@ -435,9 +354,7 @@ pub fn find_pin(start: &Path) -> Option<(PathBuf, String)> {
     None
 }
 
-/// Where a pinned channel was read: a toolchain file rustup would read
-/// ([`find_pin`]), or `$RUSTUP_TOOLCHAIN`, which rustup ranks above any file.
-/// A [`refusal`] names the one it has: the environment is not the directory.
+/// Where a pinned channel was read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PinSource {
     /// `$RUSTUP_TOOLCHAIN`.
@@ -446,35 +363,20 @@ pub enum PinSource {
     File(PathBuf),
 }
 
-// ── the reader: a stock tool at command position ───────────────────────────
-
 /// A stock Rust tool found at command position.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Hit {
-    /// The stock spelling as used — the tool, its `+<channel>` and its verb:
-    /// `cargo +1.97.1 test`, `rustfmt`, `rustup run 1.97.1 rustfmt`.
+    /// The stock spelling as used.
     pub used: String,
     /// The Trust spelling of the same command, the caller's arguments filled in.
     pub instead: Vec<Spelling>,
-    /// Set when the command word is a Trust toolchain's own compatibility
-    /// `cargo` by path — `<dir>/cargo` with `<dir>/targo` beside it
-    /// ([`COMPAT_TWINS`], asked through [`verdict_in`]): that directory as
-    /// written, trailing `/` included. [`Hit::used`] and every spelling then
-    /// carry it.
+    /// Set when the command word is a Trust toolchain's own compatibility `cargo` by path.
     pub toolchain_dir: Option<String>,
-    /// The rustup channel the command named — `cargo +1.97.1`, `rustup run trust
-    /// cargo` — which rustup ranks above `$RUSTUP_TOOLCHAIN` and any toolchain
-    /// file, so a [`refusal`] names no pin beside it.
+    /// The rustup channel the command named.
     pub channel: Option<String>,
-    /// Set when the command word is a Trust toolchain's compatibility `cargo`:
-    /// beside its `targo` ([`Hit::toolchain_dir`]) or chosen by a Trust rustup
-    /// channel ([`Hit::channel`]). Upstream cargo's surface, which names no lane —
-    /// never stock Rust.
+    /// Set when the command word is a Trust toolchain's compatibility `cargo`.
     pub compat: bool,
-    /// Set when the tool was found in text nested deeper than the reader follows
-    /// ([`MAX_DEPTH`]): its name appears there, and a guard refuses what it could
-    /// not read rather than guess. [`Hit::used`] is then the bare
-    /// name and [`Hit::instead`] the Trust tool with no arguments.
+    /// Set when the tool was found in text nested deeper than the reader follows ([`MAX_DEPTH`]).
     pub unread: bool,
 }
 
@@ -483,12 +385,9 @@ pub struct Hit {
 pub enum Verdict {
     /// No stock Rust tool at command position.
     Clean,
-    /// A stock Rust tool at command position, in a simple command that carries
-    /// no escape: the one to refuse.
+    /// A stock Rust tool at command position, in a simple command that carries no escape: the one to refuse.
     Stock(Hit),
-    /// Every stock Rust tool at command position sits in a simple command that
-    /// carries a non-empty [`STOCK_REASON`]: the first of them, and the reason
-    /// its author gave — what a guard lets through and journals.
+    /// Every stock Rust tool at command position sits in a simple command that carries a non-empty [`STOCK_REASON`].
     Escaped {
         /// The escaped stock command.
         hit: Hit,
@@ -498,8 +397,6 @@ pub enum Verdict {
 }
 
 /// Fold one more reading into `found`. A [`Verdict::Stock`] ends the search (the
-/// answer is a refusal whatever else the line holds); the first
-/// [`Verdict::Escaped`] is kept over [`Verdict::Clean`]. Answers whether to stop.
 fn fold(found: &mut Verdict, next: Verdict) -> bool {
     match next {
         Verdict::Stock(_) => {
@@ -514,34 +411,10 @@ fn fold(found: &mut Verdict, next: Verdict) -> bool {
     }
 }
 
-/// The deepest nesting ([`check`] recursing into `$(…)`, backticks, `bash -c`,
-/// `eval`) that is parsed. Deeper text is not parsed, and it is not waved
-/// through either: a stock tool's name anywhere in it is a hit ([`Hit::unread`]).
-/// A guard that fails open at its own cap is a way past it; the escape hatch
-/// exists for the command that genuinely needs one.
+/// The deepest nesting ([`check`] recursing into `$(…)`, backticks, `bash -c`, `eval`) that is parsed.
 pub const MAX_DEPTH: usize = 8;
 
-/// The first stock Rust tool at command position in `command` (a shell command line as an
-/// agent's Bash tool receives it) that no escape clears, or `None`. [`verdict`] is the same
-/// reading with the escaped ones reported too.
-///
-/// Text that is not a command is never a hit: a quoted argument (`grep "cargo clippy"`), a
-/// single-quoted string, a heredoc body with a quoted delimiter, a comment, a path argument
-/// (`ls ~/.cargo`, `ls ${DIR}/cargo`), a `case` pattern (`cargo) …`). A command is found
-/// where the shell runs one: after `;`, `&&`, `||`, `|`, `&`, a newline, `(`, `{`,
-/// `then`/`do`/`else`/`if`/`elif`/`while`/`until`, a case arm, the prefix words `time`,
-/// `env`, `nice`, `command`, `exec`, `nohup`, `setsid`, `unbuffer`, `caffeinate`, `sudo`,
-/// `doas`, `timeout`, `stdbuf`, `ionice`, `taskset`, `xargs`, `!` (their options skipped,
-/// value-taking ones with their value), a leading redirection; inside `$(…)`, backticks
-/// (also within double quotes and in an unquoted heredoc body), `bash|sh|zsh -c '…'`,
-/// `eval '…'` and `find -exec`; and as the tool `rustup run <toolchain> <tool>` runs.
-/// Assignments before a command are skipped, and `ATERM_STOCK_REASON=<non-empty>` among
-/// them (the escape hatch, [`STOCK_REASON`]; the last assignment wins, as in the shell)
-/// clears that one simple command.
-///
-/// One exception to "never a hit": text nested more than [`MAX_DEPTH`] levels deep is not
-/// parsed, so a stock tool's name anywhere in it is a hit ([`Hit::unread`]), refused rather
-/// than guessed at.
+/// The first stock Rust tool at command position in `command` (a shell command line as an agent's Bash tool receives it) that no escape clears, or `None`.
 #[must_use]
 pub fn check(command: &str) -> Option<Hit> {
     match verdict(command) {
@@ -550,21 +423,13 @@ pub fn check(command: &str) -> Option<Hit> {
     }
 }
 
-/// [`check`]'s reading, with an escaped stock command reported as [`Verdict::Escaped`] rather
-/// than dropped, so a guard that lets it through can say what ran and why. Text only: a
-/// path-form compatibility name (`build/<host>/stage2/bin/rustc`) is read by its name; a
-/// guard that can look at the directory reads with [`verdict_in`].
+/// [`check`]'s reading, with an escaped stock command reported as [`Verdict::Escaped`] rather than dropped, so a guard that lets it through can say what ran and why.
 #[must_use]
 pub fn verdict(command: &str) -> Verdict {
     verdict_in(command, &|_, _| false)
 }
 
-/// [`verdict`], with `beside(dir, name)` answering whether a file `name` sits in `dir`, the
-/// directory of a path-form command word as written, trailing `/` included
-/// (`build/aarch64-apple-darwin/stage2/bin/`). The reader asks it only about the Trust twin of
-/// a compatibility name ([`COMPAT_TWINS`]); [`file_beside`] answers from the filesystem.
-/// Beside its twin, `<dir>/rustc` and `<dir>/rustdoc` are never a hit; `<dir>/cargo` stays
-/// one, spelled with that directory's `targo`.
+/// [`verdict`], with `beside(dir, name)` answering whether a file `name` sits in `dir`, the directory of a path-form command word as written, trailing `/` included (`build/aarch64-apple-darwin/stage2/bin/`).
 #[must_use]
 pub fn verdict_in(command: &str, beside: &dyn Fn(&str, &str) -> bool) -> Verdict {
     check_at(command, 0, beside)
@@ -573,36 +438,19 @@ pub fn verdict_in(command: &str, beside: &dyn Fn(&str, &str) -> bool) -> Verdict
 /// The directory probe [`verdict_in`] threads through the reader.
 type Beside<'a> = &'a dyn Fn(&str, &str) -> bool;
 
-/// A Trust toolchain's compatibility names, each with the Trust name of the same tool, whose
-/// presence marks the directory as a Trust toolchain's `bin/`. `cargo`, `rustc` and `rustdoc`
-/// are the only compatibility names a Trust sysroot ships.
-///
-/// `rustc` and `rustdoc` are byte-identical to `trustc` and `trustdoc`, so beside their twin
-/// neither is a hit (`build/<host>/stage2/bin/rustc -vV` is how the trust repository reads the
-/// compiler under measurement). `cargo` is byte-identical to `targo` too, but run as `cargo`
-/// it is upstream cargo's surface: it refuses `--unverified` and builds naming no lane. So a
-/// path-form `cargo` stays a hit, its spellings rewritten to `<dir>/targo`, the toolchain the
-/// caller chose rather than the first `targo` on PATH.
+/// A Trust toolchain's compatibility names, each with the Trust name of the same tool, whose presence marks the directory as a Trust toolchain's `bin/`.
 pub const COMPAT_TWINS: &[(&str, &str)] = &[
     ("rustc", "trustc"),
     ("rustdoc", "trustdoc"),
     ("cargo", "targo"),
 ];
 
-/// Whether a file `name` sits in `dir`, a directory as a shell command line
-/// writes it ([`verdict_in`]'s probe). A leading `~/`, `$HOME/` or `${HOME}/` is
-/// `home`; a relative directory is under `cwd` (and, with no `cwd`, answers
-/// `false`). Any other expansion — `$VAR`, `~user`, a glob, a substitution — is
-/// text this reader cannot resolve, and answers `false`: a guard that exempted a
-/// path it could not read would be guessing. A `cd` earlier on the same line is
-/// not followed either.
+/// Whether a file `name` sits in `dir`, a directory as a shell command line writes it ([`verdict_in`]'s probe).
 #[must_use]
 pub fn file_beside(dir: &str, name: &str, cwd: Option<&Path>, home: Option<&Path>) -> bool {
     let from_home = ["~/", "$HOME/", "${HOME}/"]
         .iter()
         .find_map(|prefix| dir.strip_prefix(prefix));
-    // The shell expands `~` only at the start of a word (`~user/`); inside a
-    // path it is a literal character.
     let rest = from_home.unwrap_or(dir);
     if rest.starts_with('~') || rest.contains(['$', '`', '*', '?', '[']) {
         return false;
@@ -617,7 +465,6 @@ pub fn file_beside(dir: &str, name: &str, cwd: Option<&Path>, home: Option<&Path
 }
 
 /// The directory of a path-form command word, trailing `/` included
-/// (`build/x/bin/rustc` → `build/x/bin/`), or `None` for a bare name.
 fn dir_of(word: &str) -> Option<&str> {
     word.rfind('/').map(|at| &word[..=at])
 }
@@ -648,11 +495,6 @@ fn check_at(command: &str, depth: usize, beside: Beside<'_>) -> Verdict {
 }
 
 /// The verdict for text nested deeper than [`MAX_DEPTH`], which is not parsed: the
-/// first stock tool name in it — a run of the characters a name is made of, so
-/// `/x/cargo`, `"rustc"` and `$(cargo` all count — is a hit marked
-/// [`Hit::unread`], whether or not it stands at command position (text past the
-/// cap cannot say). An escape in front of an enclosing simple command clears it
-/// like any other hit found inside a `bash -c` script.
 fn unread(text: &str) -> Verdict {
     let Some(name) = text
         .split(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_'))
@@ -671,8 +513,6 @@ fn unread(text: &str) -> Verdict {
 }
 
 /// Remove heredoc bodies — text fed to a command on stdin, not commands. The
-/// operator line stays. A body under an unquoted delimiter is still expanded by
-/// the shell, so its `$(…)` and backtick substitutions are returned to be read.
 fn strip_heredocs(cmd: &str) -> (String, Vec<String>) {
     let lines: Vec<&str> = cmd.split('\n').collect();
     let mut out: Vec<&str> = Vec::with_capacity(lines.len());
@@ -707,8 +547,6 @@ fn strip_heredocs(cmd: &str) -> (String, Vec<String>) {
 }
 
 /// The heredoc operators on one line, outside quotes (quote state carried
-/// across lines in `quote`): `(terminator, <<- form, delimiter quoted)`. A
-/// here-string (`<<<`) is not a heredoc.
 fn heredoc_operators(line: &str, quote: &mut Option<char>) -> Vec<(String, bool, bool)> {
     let b: Vec<char> = line.chars().collect();
     let mut found = Vec::new();
@@ -761,9 +599,6 @@ fn heredoc_operators(line: &str, quote: &mut Option<char>) -> Vec<(String, bool,
             while b.get(j).is_some_and(|c| *c == ' ' || *c == '\t') {
                 j += 1;
             }
-            // The delimiter is the next shell word, quote removal applied: `EOF-1`,
-            // `END.txt` and `'my end'` end where they say. Any quoting (`'EOF'`, `"EOF"`,
-            // `\EOF`, `E"O"F`) makes the body literal.
             let (term, quoted, end) = heredoc_word(&b, j);
             if !term.is_empty() && (quoted || !term.starts_with(|c: char| c.is_ascii_digit())) {
                 found.push((term, dash, quoted));
@@ -777,9 +612,6 @@ fn heredoc_operators(line: &str, quote: &mut Option<char>) -> Vec<(String, bool,
 }
 
 /// The heredoc delimiter word starting at `b[j]`: `(delimiter, quoted, end)` —
-/// the word with its quotes and backslashes removed, whether any part of it was
-/// quoted, and the index just past it. It ends at unquoted whitespace or a shell
-/// metacharacter.
 fn heredoc_word(b: &[char], mut j: usize) -> (String, bool, usize) {
     let mut term = String::new();
     let mut quoted = false;
@@ -814,14 +646,6 @@ fn heredoc_word(b: &[char], mut j: usize) -> (String, bool, usize) {
 }
 
 /// Split into simple-command segments, quote-aware, the way the shell reads
-/// them; the text of every `$(…)` and backtick substitution (read even inside
-/// double quotes, where the shell runs them too) is returned separately.
-///
-/// A parameter expansion `${…}` and an arithmetic `$((…))` are part of a word,
-/// and `{`/`}` separate only where they are the shell's reserved words — alone,
-/// at command position — so `ls ${DIR}/cargo` and `xargs -I {} …` stay one
-/// command. A `case` pattern (`cargo)`, `(rustc|rustfmt)`) is not a command and
-/// is dropped; the commands of its arm are read like any others.
 fn split_commands(cmd: &str) -> (Vec<String>, Vec<String>) {
     let b: Vec<char> = cmd.chars().collect();
     let n = b.len();
@@ -829,7 +653,6 @@ fn split_commands(cmd: &str) -> (Vec<String>, Vec<String>) {
     let mut subs = Vec::new();
     let mut cur = String::new();
     let mut quote: Option<char> = None;
-    // Open `case … in … esac` constructs, and whether a pattern may start here.
     let mut case = CaseState::default();
     let mut i = 0;
     while i < n {
@@ -844,11 +667,9 @@ fn split_commands(cmd: &str) -> (Vec<String>, Vec<String>) {
                 i += 1;
                 continue;
             } else if c == '(' && cur.trim().is_empty() {
-                // The optional `(` before a pattern.
                 i += 1;
                 continue;
             } else if c == '|' {
-                // Alternation inside a pattern, not a pipe.
                 cur.push(c);
                 i += 1;
                 continue;
@@ -907,11 +728,9 @@ fn split_commands(cmd: &str) -> (Vec<String>, Vec<String>) {
             i += 1;
             continue;
         }
-        // `${…}` and `$((…))`: one word, whatever braces or parentheses it holds.
         if c == '$' && matches!(b.get(i + 1), Some('{' | '(')) {
             let open = b[i + 1];
             let end = matching_close(&b, i + 1, open, if open == '{' { '}' } else { ')' });
-            // A substitution inside it still runs: `${x:-$(cargo metadata)}`.
             let inner: String = b[(i + 2).min(end)..end.saturating_sub(1).max(i + 2)]
                 .iter()
                 .collect();
@@ -926,7 +745,6 @@ fn split_commands(cmd: &str) -> (Vec<String>, Vec<String>) {
             }
             continue;
         }
-        // `case WORD in`: a header, not a command; a pattern may start after it.
         if c.is_whitespace() && is_case_header(&cur) {
             cur.clear();
             case.open += 1;
@@ -934,7 +752,6 @@ fn split_commands(cmd: &str) -> (Vec<String>, Vec<String>) {
             i += 1;
             continue;
         }
-        // `;;`, `;&`, `;;&` end a case arm; the next pattern may start after it.
         if c == ';' && matches!(b.get(i + 1), Some(';' | '&')) {
             close_segment(&mut segs, &mut cur, &mut case);
             i += 2;
@@ -944,15 +761,11 @@ fn split_commands(cmd: &str) -> (Vec<String>, Vec<String>) {
             case.want_pattern = case.open > 0;
             continue;
         }
-        // `&` inside a redirection (`2>&1`, `>&2`, `<&3`, `&>out`) is not a command
-        // separator; splitting there would make `2>` the verb of `cargo --version 2>&1`.
         if c == '&' && (cur.ends_with('>') || cur.ends_with('<') || b.get(i + 1) == Some(&'>')) {
             cur.push(c);
             i += 1;
             continue;
         }
-        // `{` and `}` are reserved words only alone at command position; anywhere
-        // else (`{}`, `a{b,c}`, `x}`) they are part of a word.
         if (c == '{' || c == '}')
             && !(cur.trim().is_empty()
                 && b.get(i + 1)
@@ -1005,7 +818,6 @@ fn is_case_header(cur: &str) -> bool {
 }
 
 /// Whether the word `word` starts at `b[i]` and ends there too (a separator,
-/// whitespace or the end follows it).
 fn starts_word(b: &[char], i: usize, word: &str) -> bool {
     let w: Vec<char> = word.chars().collect();
     b.get(i..i + w.len()).is_some_and(|s| s == w.as_slice())
@@ -1014,8 +826,7 @@ fn starts_word(b: &[char], i: usize, word: &str) -> bool {
 }
 
 /// The index just past the `close` matching the `open` at `b[at]` (nesting
-/// counted), or the end of the text when it is unbalanced.
-fn matching_close(b: &[char], at: usize, open: char, close: char) -> usize {
+const fn matching_close(b: &[char], at: usize, open: char, close: char) -> usize {
     let mut depth = 0usize;
     let mut j = at;
     while j < b.len() {
@@ -1033,8 +844,6 @@ fn matching_close(b: &[char], at: usize, open: char, close: char) -> usize {
 }
 
 /// POSIX word splitting (quotes removed, backslashes resolved), as
-/// `shlex.split(posix=True)`. `None` for an unterminated quote: text the
-/// shell itself would refuse is not read as a command.
 fn words(segment: &str) -> Option<Vec<String>> {
     let mut out = Vec::new();
     let mut cur = String::new();
@@ -1112,12 +921,10 @@ fn is_assignment(word: &str) -> bool {
 }
 
 /// Prefix words that run the command after them. The value-taking options of
-/// each are listed so the command after them is found, not the option's value.
 fn wrapper_options(word: &str) -> Option<&'static [&'static str]> {
     Some(match word {
         "nohup" | "builtin" | "noglob" | "then" | "do" | "else" | "elif" | "if" | "while"
         | "until" | "!" | "setsid" | "unbuffer" => &[],
-        // GNU time's `-f FORMAT` and `-o FILE`; BSD time's flags take no value.
         "time" => &["-f", "-o", "--format", "--output"],
         "env" => &["-u", "-C", "-S", "--unset", "--chdir", "--split-string"],
         "nice" => &["-n", "--adjustment"],
@@ -1139,8 +946,6 @@ fn wrapper_options(word: &str) -> Option<&'static [&'static str]> {
             "--pgid",
             "--uid",
         ],
-        // `taskset [-a] [-c] <mask|list> <cmd>`: the mask is a positional word,
-        // skipped like `timeout`'s duration.
         "taskset" => &[],
         "xargs" => &[
             "-n", "-I", "-L", "-P", "-d", "-E", "-s", "-a", "-J", "-R", "-S",
@@ -1151,7 +956,6 @@ fn wrapper_options(word: &str) -> Option<&'static [&'static str]> {
 }
 
 /// Why a segment is (or is not) a stock Rust tool. An unterminated quote is
-/// text the shell itself would refuse, so it is not read as a command.
 fn offending(segment: &str, depth: usize, beside: Beside<'_>) -> Verdict {
     words(segment).map_or(Verdict::Clean, |words| {
         offending_words(&words, depth, beside)
@@ -1159,7 +963,6 @@ fn offending(segment: &str, depth: usize, beside: Beside<'_>) -> Verdict {
 }
 
 /// How many words a leading redirection occupies: `2>/dev/null` is one, `> out`
-/// is two (the operator, then its file). `None` for a word that is not one.
 fn redirection_words(word: &str) -> Option<usize> {
     let op = word.trim_start_matches(|c: char| c.is_ascii_digit());
     let op = op.strip_prefix('&').unwrap_or(op);
@@ -1173,8 +976,6 @@ fn redirection_words(word: &str) -> Option<usize> {
 
 fn offending_words(words: &[String], depth: usize, beside: Beside<'_>) -> Verdict {
     let mut i = 0;
-    // The escape word's value, as the shell would pass it: the last assignment of
-    // it in this simple command wins, and an empty value escapes nothing.
     let mut reason: Option<String> = None;
     while let Some(w) = words.get(i) {
         if let Some(skip) = redirection_words(w) {
@@ -1197,7 +998,6 @@ fn offending_words(words: &[String], depth: usize, beside: Beside<'_>) -> Verdic
         };
         let wrapper = basename(w);
         i += 1;
-        // `command -v cargo` / `command -V cargo` ask where cargo is; they run nothing.
         if wrapper == "command"
             && words
                 .get(i)
@@ -1215,15 +1015,10 @@ fn offending_words(words: &[String], depth: usize, beside: Beside<'_>) -> Verdic
             }
             i += if options.contains(&o.as_str()) { 2 } else { 1 };
         }
-        // `timeout [opts] DURATION cmd` and `taskset [opts] MASK cmd`: the
-        // positional word is not the command.
         if matches!(wrapper, "timeout" | "taskset") && words.get(i).is_some() {
             i += 1;
         }
-        // `nice -5 cmd` (the old spelling) was consumed as an option above.
     }
-    // The escape covers everything this one simple command runs, a `bash -c`
-    // script or a `find -exec` included, and nothing past it.
     match (tool_verdict(words, i, depth, beside), reason) {
         (Verdict::Stock(hit), Some(reason)) => Verdict::Escaped { hit, reason },
         (found, _) => found,
@@ -1231,7 +1026,6 @@ fn offending_words(words: &[String], depth: usize, beside: Beside<'_>) -> Verdic
 }
 
 /// The verdict for the command word at `words[i]` (every prefix word already
-/// skipped) and the arguments after it.
 fn tool_verdict(words: &[String], i: usize, depth: usize, beside: Beside<'_>) -> Verdict {
     let Some(head_word) = words.get(i) else {
         return Verdict::Clean;
@@ -1265,8 +1059,6 @@ fn tool_verdict(words: &[String], i: usize, depth: usize, beside: Beside<'_>) ->
             return Verdict::Clean;
         }
     }
-    // A redirection is the shell's, not the tool's: it is neither an argument
-    // nor a verb (`cargo --version 2>&1` has no verb `2>&1`).
     let mut plain_rest = Vec::with_capacity(rest.len());
     let mut j = 0;
     while let Some(w) = rest.get(j) {
@@ -1282,17 +1074,10 @@ fn tool_verdict(words: &[String], i: usize, depth: usize, beside: Beside<'_>) ->
     let Some(mut instead) = trust_spelling(head, rest) else {
         return Verdict::Clean;
     };
-    // The same binaries chosen by their rustup channel — `rustup run trust rustc`
-    // (the spelling `aterm help reroute` sanctions), `rustc +trust` — are that
-    // Trust toolchain's trustc and trustdoc: never a hit. Its `cargo` stays one,
-    // for the reason on [`COMPAT_TWINS`].
     let channel = run_channel.or_else(|| explicit_toolchain(rest));
     if is_trust_alias(head) && channel.is_some_and(is_trust_channel) {
         return Verdict::Clean;
     }
-    // A compatibility name by path, its Trust twin beside it: that toolchain's
-    // own binary ([`COMPAT_TWINS`]). `rustc` and `rustdoc` there are the Trust
-    // tools; `cargo` there is upstream cargo's surface, spelled with its `targo`.
     let toolchain_dir = dir_of(tool_word).filter(|dir| {
         COMPAT_TWINS
             .iter()
@@ -1341,15 +1126,11 @@ fn tool_verdict(words: &[String], i: usize, depth: usize, beside: Beside<'_>) ->
 }
 
 /// Whether `name` is a Trust toolchain's compatibility name for its own compiler
-/// or doc tool ([`COMPAT_TWINS`] without `cargo`): run from that toolchain — by
-/// path beside its twin, or by a Trust rustup channel — it is the Trust tool.
 fn is_trust_alias(name: &str) -> bool {
     name != "cargo" && COMPAT_TWINS.iter().any(|(compat, _)| *compat == name)
 }
 
 /// The command string of `sh -c '…'` (any flag cluster carrying `c`, e.g.
-/// `-lc`, `-ec`, or `-l -c`), or `None` when the shell runs a script file or
-/// reads stdin — text this reader never sees.
 fn shell_command_string(rest: &[String]) -> Option<&str> {
     let mut saw_c = false;
     let mut i = 0;
@@ -1366,7 +1147,6 @@ fn shell_command_string(rest: &[String]) -> Option<&str> {
             if w[1..].contains('c') {
                 saw_c = true;
             }
-            // `-o option` / `-O option` take the next word.
             i += if w[1..].ends_with('o') || w[1..].ends_with('O') {
                 2
             } else {
@@ -1406,16 +1186,10 @@ fn find_exec(rest: &[String], depth: usize, beside: Beside<'_>) -> Verdict {
     found
 }
 
-// ── the refusal: what a guard says back ─────────────────────────────────────
-
-/// The longest a rendered command may be in a [`refusal`]: an agent's command
-/// line can be kilobytes, and the refusal names the Trust spelling, not the
-/// whole payload.
+/// The longest a rendered command may be in a [`refusal`].
 pub const REFUSAL_COMMAND_CAP: usize = 240;
 
 /// `text` as one line of at most [`REFUSAL_COMMAND_CAP`] bytes: every control
-/// character (a newline inside a quoted argument, a tab) folded to a space, cut
-/// on a character boundary with `…` when it was longer.
 fn one_command_line(text: &str) -> String {
     let folded: String = text
         .chars()
@@ -1437,17 +1211,7 @@ fn one_command_line(text: &str) -> String {
     format!("{}…", &folded[..end])
 }
 
-/// What a guard says back to the agent whose command it refused: the stock
-/// spelling as used, the Trust spelling of the same command with the agent's own
-/// arguments (every lane targo accepts for it, [`trust_spelling`]), the fact
-/// that a stock pin moves only rustup's proxies, and
-/// the escape hatch. `pin` is the stock channel in force and where it was read
-/// (`$RUSTUP_TOOLCHAIN`, else [`find_pin`]): named, since that is what an agent reads
-/// as "this repository builds with stock" — unless the command names its own
-/// channel ([`Hit::channel`]), which outranks it, or is a compatibility cargo
-/// ([`Hit::compat`]).
-///
-/// Bounded: each command is one line of at most [`REFUSAL_COMMAND_CAP`] bytes.
+/// What a guard says back to the agent whose command it refused.
 #[must_use]
 pub fn refusal(hit: &Hit, pin: Option<(&PinSource, &str)>) -> String {
     let used = one_command_line(&hit.used);
@@ -1458,8 +1222,6 @@ pub fn refusal(hit: &Hit, pin: Option<(&PinSource, &str)>) -> String {
              so the tool stands where it can be read.\n"
         )
     } else if hit.toolchain_dir.is_some() {
-        // A Trust toolchain's own `cargo` by path ([`COMPAT_TWINS`]): not stock, but
-        // it names no lane. `used` carries the directory, and so does every spelling.
         format!(
             "`{used}` is a Trust toolchain's compatibility cargo: upstream cargo's surface, \
              which names no lane.\n"
@@ -1495,7 +1257,6 @@ pub fn refusal(hit: &Hit, pin: Option<(&PinSource, &str)>) -> String {
         });
     }
     if is_unknown_verb(&hit.instead) {
-        // A hint may only name a command that runs: say that this one may not.
         out.push_str(
             "targo may not have this verb (`targo nextest` and `targo deny` answer \"no such \
              command\"); if it does, the Trust spelling is:\n",

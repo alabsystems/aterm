@@ -3,14 +3,15 @@
 
 //! THE FLEET ACCOUNTS' UPKEEP OF A REAL INSTANCE, UNDER A NETWORK WITNESS.
 //!
-//! 0.112.0 and 0.113.0 had every window with a control socket fetch a
+//! 0.112.0 to 0.115.0 had every window with a control socket fetch a
 //! spreadsheet link built into the source with curl (then an rclone remote)
 //! about two seconds after its launch and again every ten minutes, on any
 //! machine with no `accounts.toml`: every new install and every test world.
-//! The upkeep now does anything only where this machine's person configured a
-//! fleet accounts source (`[fleet] accounts_source`, or the
-//! `fleet-accounts.toml` a sync from a named source leaves):
-//! `aterm_agent::harness::accounts_sync::upkeep_live`.
+//! The upkeep is now live only in an instance that runs as its account's own
+//! (`harness_host::accounts_upkeep_arm`), and there does anything only where
+//! this machine's person configured a fleet accounts source (`[fleet]
+//! accounts_source`, or the `fleet-accounts.toml` a sync handed its source
+//! leaves): `aterm_agent::harness::accounts_sync::upkeep_live`.
 //!
 //! THE WITNESS. The instance runs in a Seatbelt jail that kills a process at
 //! its first IP connection to anything but 127.0.0.1 and at its first name
@@ -20,14 +21,27 @@
 //! keeping what each process under the instance ran ([`Execs`]), so a curl or
 //! an rclone the instance starts is seen while it runs.
 //!
-//! A fresh world (`launch_isolation::prepare`'s, which names no source) says
-//! `accounts-upkeep=unconfigured` in its log on the real code path, and by
-//! then nothing under the instance ran curl or rclone, the instance is alive
-//! and no roster or fleet file was written (FAILS with any default source
-//! restored: the upkeep says it is configured, and runs curl). NEGATIVE
-//! CONTROL: the same world with `[fleet] accounts_source` naming a loopback
-//! recorder. The recorder is asked for that path by a curl the sampler sees
-//! (it holds its answer until then), and the roster it answers lands.
+//! THREE WORLDS, each `launch_isolation`'s (a scratch HOME, a private state
+//! root):
+//!
+//! 1. AS EVERY TEST INSTANCE IS, with `[fleet] accounts_source` naming a
+//!    loopback recorder all the same: the instance is not its account's own,
+//!    so its upkeep is the inert one by construction and says so
+//!    (`accounts-upkeep=inert`); once its activation wake is armed, nothing
+//!    asked the recorder and nothing under it ran curl or rclone (FAILS with
+//!    the live upkeep in every instance, as the first fix had it: the log says
+//!    `configured`, and the recorder is asked).
+//! 2. A FRESH HOME ON THE REAL CODE PATH: the live upkeep let in by the
+//!    development seam (`accounts_sync::UPKEEP_SEAM`) and no source
+//!    configured says `accounts-upkeep=unconfigured`, and by then nothing
+//!    under the instance ran curl or rclone, the instance is alive and no
+//!    roster or fleet file was written (FAILS with any default source
+//!    restored: the upkeep says it is configured, and runs curl).
+//! 3. NEGATIVE CONTROL of both: the seam and a configured loopback recorder.
+//!    The recorder is asked for that path by a curl the sampler sees (it
+//!    holds its answer until then, so the curl lives for the whole of its own
+//!    `--max-time` while the 1 ms sampler looks), and the roster it answers
+//!    lands.
 //!
 //! Every wait for something that must happen is a one-minute hang detector,
 //! never a latency budget; no check retries.
@@ -143,18 +157,27 @@ impl Drop for Execs {
     }
 }
 
-/// The instance's own log (`aterm.log` where its scratch home keeps logs).
+/// The private state root the seam's admission asks for (`ATERM_STATE_HOME`),
+/// under an instance's scratch root.
+const PRIVATE_STATE: &str = "state-aterm";
+
+/// The instance's own log (`aterm.log` where its scratch home keeps logs, or
+/// its private state root where it was given one).
 fn instance_log(inst: &Instance) -> String {
-    aterm_types::dirs::resolve_logs_dir(
-        None,
-        aterm_types::dirs::StatePlatform {
-            home: Some(inst.tmp.join("home")),
-            xdg_state_home: Some(inst.tmp.join("state")),
-            ..Default::default()
-        },
-    )
-    .and_then(|dir| std::fs::read_to_string(dir.join("aterm.log")).ok())
-    .unwrap_or_default()
+    [None, Some(inst.tmp.join(PRIVATE_STATE))]
+        .into_iter()
+        .filter_map(|root| {
+            aterm_types::dirs::resolve_logs_dir(
+                root,
+                aterm_types::dirs::StatePlatform {
+                    home: Some(inst.tmp.join("home")),
+                    xdg_state_home: Some(inst.tmp.join("state")),
+                    ..Default::default()
+                },
+            )
+        })
+        .filter_map(|dir| std::fs::read_to_string(dir.join("aterm.log")).ok())
+        .collect()
 }
 
 /// The last lines of the instance's own log, for a failure message.
@@ -196,9 +219,11 @@ fn alive(inst: &mut Instance) {
     );
 }
 
-/// Boot a jailed instance whose aterm.toml gets `extra` appended.
+/// Boot a jailed instance whose aterm.toml gets `extra` appended, with the
+/// live upkeep let in by its development seam where `live` says so (under the
+/// private state root the seam's admission asks for).
 #[track_caller]
-fn boot(prefix: &str, extra: String) -> Instance {
+fn boot(prefix: &str, extra: String, live: bool) -> Instance {
     headless_boot::boot_jailed(
         prefix,
         NETWORK_JAIL,
@@ -207,9 +232,34 @@ fn boot(prefix: &str, extra: String) -> Instance {
             let base = std::fs::read_to_string(&toml).expect("aterm.toml");
             std::fs::write(&toml, format!("{base}{extra}")).expect("aterm.toml");
             cmd.env("ATERM_LOG", "info");
+            if live {
+                cmd.env("ATERM_STATE_HOME", tmp.join(PRIVATE_STATE))
+                    .env(aterm_agent::harness::accounts_sync::UPKEEP_SEAM, "1");
+            }
         },
         |_| true,
     )
+}
+
+/// `[fleet] accounts_source` naming the loopback recorder on `port`.
+fn loopback_config(port: u16) -> String {
+    format!("[fleet]\naccounts_source = \"http://127.0.0.1:{port}/fleet.csv\"\nmachine = \"m1\"\n")
+}
+
+/// Wait, under the hang detector, for the instance's log to say its
+/// activation wake is armed: the upkeep's first kick is behind it.
+#[track_caller]
+fn wake_armed(inst: &mut Instance) {
+    let until_at = Instant::now() + MUST_HAPPEN;
+    while !instance_log(inst).contains("the activation wake is armed") {
+        alive(inst);
+        assert!(
+            Instant::now() < until_at,
+            "the activation wake was never armed; log tail:\n{}",
+            log_tail(inst)
+        );
+        std::thread::sleep(headless_boot::POLL_GAP);
+    }
 }
 
 /// A loopback source that answers one GET: what it was asked, sent on the
@@ -269,28 +319,44 @@ fn until(what: &str, mut ready: impl FnMut() -> bool) {
 }
 
 #[test]
-fn a_fresh_world_fetches_no_accounts_and_a_configured_one_fetches_its_own() {
+fn a_test_instance_and_a_fresh_home_fetch_no_accounts_and_a_configured_one_fetches_its_own() {
     let execs = Execs::watch();
-    let mut inst = boot("acct-upkeep-fresh", String::new());
+    let no_files = |inst: &Instance| {
+        let cfg = inst.tmp.join("cfg/aterm");
+        for file in ["accounts.toml", "fleet-accounts.toml"] {
+            assert!(!cfg.join(file).exists(), "{file} written");
+        }
+    };
+
+    // 1. As every test instance is: inert by construction, a source or not.
+    let (port, asked, _release) = loopback_source("email,computer,claude\nm1@example.test,m1,1\n");
+    let mut inst = boot("acct-upkeep-inert", loopback_config(port), false);
+    let word = upkeep_word(&mut inst);
+    assert!(word.contains("accounts-upkeep=inert"), "{word}");
+    wake_armed(&mut inst);
+    alive(&mut inst);
+    assert!(
+        asked.try_recv().is_err(),
+        "the inert instance asked its configured source"
+    );
+    let ran = execs.under(inst.child.id(), &FETCHERS);
+    assert!(ran.is_empty(), "the inert instance ran {ran:?}");
+    no_files(&inst);
+    drop(inst);
+
+    // 2. A fresh home, the live upkeep on the real code path.
+    let mut inst = boot("acct-upkeep-fresh", String::new(), true);
     let word = upkeep_word(&mut inst);
     assert!(word.contains("accounts-upkeep=unconfigured"), "{word}");
     alive(&mut inst);
     let ran = execs.under(inst.child.id(), &FETCHERS);
     assert!(ran.is_empty(), "the unconfigured instance ran {ran:?}");
-    let cfg = inst.tmp.join("cfg/aterm");
-    for file in ["accounts.toml", "fleet-accounts.toml"] {
-        assert!(!cfg.join(file).exists(), "{file} written with no source");
-    }
+    no_files(&inst);
     drop(inst);
 
-    // NEGATIVE CONTROL: a configured loopback source.
+    // 3. NEGATIVE CONTROL: the live upkeep and a configured loopback source.
     let (port, asked, release) = loopback_source("email,computer,claude\nm1@example.test,m1,1\n");
-    let mut inst = boot(
-        "acct-upkeep-conf",
-        format!(
-            "[fleet]\naccounts_source = \"http://127.0.0.1:{port}/fleet.csv\"\nmachine = \"m1\"\n"
-        ),
-    );
+    let mut inst = boot("acct-upkeep-conf", loopback_config(port), true);
     let line = asked.recv_timeout(MUST_HAPPEN).unwrap_or_else(|_| {
         panic!(
             "the configured source was not fetched within the hang detector; log tail:\n{}",

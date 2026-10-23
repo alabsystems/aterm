@@ -1,92 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE WAIT TALLY: where the bridge's one loop spends its time, counted where
-//! it spends it — a development seam the fabric bench's ping-pong arm reads
-//! (`crates/aterm/tests/fabric_bench/run/pingpong.rs`).
-//!
-//! WHY IT IS COUNTED IN HERE. The bridge is one thread. While it waits for a
-//! broker's answer, for aterm's answer on the verb lane, or for a state-dir
-//! write, it does nothing else. From outside, a bench sees only the round
-//! trip; how much of it is the loop, and which of its steps, is a fact only
-//! this process has. So the loop counts it.
-//!
-//! VERSION 2 (`wait-tally v=2`, B10) counts every kind of step the loop takes,
-//! not only its waits on the broker (`v=1`, which left 60-65% of an ordered
-//! round trip unattributed). Each [`Row`] is a [`Hist`]: a count, a total, the
-//! largest, and the count in each log2 band, because a sum cannot answer a
-//! tail question (was the one 50 ms round a state-dir replace or an ack?).
-//!
-//! - THE BROKER ([`Row::Request`], [`Row::Ack`], [`Row::Commit`]): every
-//!   request that reads its own reply — a `Fetch`, a `Last` page, the `Will`, a
-//!   `Budget`, a blocking `Publish` — from the moment it was written to the
-//!   moment its reply was read (`Bridge::observe`); every pipelined ack read,
-//!   waited for or not, around the read alone (`Bridge::settled`), and the
-//!   inbox group's commits among them again apart. (A `Last` walk the bridge
-//!   gives up on for running past its bound hands `observe` an error of its own
-//!   making: one more request, and no wait.)
-//! - THE VERB LANE ([`Row::LaneOutbox`] to [`Row::LaneOther`]): every round
-//!   trip to aterm, timed in `Bridge::ctl_request` and keyed by its verb head
-//!   ([`lane_row`]): the outbox peek, the roster read a drain makes (`sessions
-//!   bridge`), a post's retirement (`outbox sent`), a delivery (`deliver`),
-//!   and everything else.
-//! - THE STATE DIR ([`Row::DirReplace`] to [`Row::DirFlush`], by the kind of
-//!   write; [`Row::SetPostPin`] to [`Row::AppendSelfAcked`], by the call that
-//!   made it): counted by the [`crate::state::StateDir`] itself ([`Kept`]),
-//!   at its disk door, in a build with debug assertions (the bench's two
-//!   builds both have them; [`Tally::dir`] says whether a line's dir rows
-//!   were counted). The kind rows split the dir's time; the call rows say
-//!   whose it was, and overlap them.
-//! - THE PUSH LANES' WAKE ([`Row::WakeEvent`] to [`Row::QueuedRecord`]):
-//!   every item the push reader (aterm's `EVENT` lines) or a broker reader
-//!   queues in the [`crate::mailbox::Mailbox`] is stamped, and the time until
-//!   the loop takes it is counted — apart for an item that arrived while the
-//!   loop was parked on the mailbox (its wake: the scheduler's) and for one
-//!   that arrived while the loop was working (its wait behind that work).
-//! - A POST'S PATH ([`Row::PostPublish`], [`Row::DrainPosts`]): from taking a
-//!   `post` event to each fresh post's publish written on the broker socket,
-//!   and the posts each outbox peek listed.
-//! - THE LOOP ITSELF ([`Row::Park`], [`Row::TallyWrite`]): the time parked on
-//!   the mailbox, and this tally's own writes. With [`Tally::at_ns`], the
-//!   bridge's own clock at each write, two tallies say how long the loop ran,
-//!   how long it was parked, and what took the rest ([`Row::partitions`]): the
-//!   rows that partition the loop's time are disjoint. What they leave is
-//!   unaccounted wall time, including code between measured calls, scheduling
-//!   delays and instrumentation overhead. No CPU clock is sampled.
-//!
-//! Every clock read the seam makes is here (an `Instant` is read only while it
-//! is on), so the census guard that holds the bridge's files to their door
-//! (`aterm-census`'s `bridge-fx`) sees none in them.
-//!
-//! HOW IT LEAVES THE PROCESS. With [`SEAM`] set in a build that reads seams,
-//! the bridge opens `<state>/`[`FILE`] at its start and, at each idle moment —
-//! its loop found nothing queued and has read its posts' answers (waiting, as
-//! their senders wait) and the other acks that had arrived
-//! (`Bridge::settle_owed`), and again once its idle backstop has read the rest
-//! (`Bridge::park_and_take`) — when the tally has moved since the last write,
-//! writes the tally there ([`Recorder::idle`]): one positioned write of one
-//! line of constant length at offset 0 — no temp, no rename, no flush. The line
-//! carries a checksum of itself ([`Tally::parse`]), so a reader that raced a
-//! write reads a line that does not parse, never a count that is half old and
-//! half new.
-//!
-//! The line also names this process's pid, and the inbox group cursor the loop
-//! last committed — once the commit's ack was read: a reader waits for a tally
-//! that has committed past the message it just saw (the loop's idle write
-//! after that commit landed), and refuses a pair of tallies from two processes
-//! ([`Tally::since`]) — a relaunched bridge starts again from zero.
-//!
-//! WHAT IT COSTS THE LOOP IT MEASURES. The loop the arm measures is NOT the
-//! loop that runs without the seam: it is that loop plus this, and its own
-//! row says how much ([`Row::TallyWrite`]: rendering the rows that moved,
-//! hashing the line and one `pwrite`, at each idle moment something moved).
-//! Elsewhere it is two clock reads and a few additions per step counted, a
-//! lock per state-dir write and one per item taken, and a clock read per item
-//! queued. An item that arrives while the write runs waits for it.
-//!
-//! A RELEASED BINARY HAS NO TALLY. `dev_seam!` is `None` there, the recorder is
-//! off, and every note below is one branch on that; the state dir's counting
-//! is not compiled at all without debug assertions.
+//! Bridge loop wait tally ([`SEAM`], [`FILE`], [`Tally::parse`], [`Tally::since`],
+//! [`Tally::at_ns`], [`Recorder::idle`]) with per-[`Row`] log2 [`Hist`] buckets
+//! ([`Row::partitions`]): broker ([`Row::Request`], [`Row::Ack`], [`Row::Commit`]), verb lane
+//! ([`Row::LaneOutbox`], [`Row::LaneOther`], [`lane_row`]), [`crate::state::StateDir`]
+//! ([`Row::DirReplace`], [`Row::DirFlush`], [`Row::SetPostPin`], [`Row::AppendSelfAcked`],
+//! [`Kept`], [`Tally::dir`]), [`crate::mailbox::Mailbox`] wakes ([`Row::WakeEvent`],
+//! [`Row::QueuedRecord`]), posts ([`Row::PostPublish`], [`Row::DrainPosts`]), and loop park/write
+//! ([`Row::Park`], [`Row::TallyWrite`]).
 
 use std::io;
 use std::path::Path;
@@ -96,9 +18,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-/// The development seam that turns the tally on: any value, in a build that
-/// reads seams (a debug build, or `--features dev-seams`). Inherited by the
-/// bridge from the aterm that launches it (`aterm-gui`'s `fabric_launch.rs`).
+/// The development seam that turns the tally on.
 pub const SEAM: &str = "ATERM_LINK_WAIT_TALLY";
 
 /// The file in the bridge's state dir the tally is written to.
@@ -110,15 +30,12 @@ const HEAD: &str = "wait-tally v=2";
 /// The log2 bands each row counts in ([`Hist::buckets`]).
 pub const BUCKETS: usize = 18;
 
-/// What a row's values are.
+/// What a row's values measure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Unit {
-    /// Nanoseconds of `Instant`, the monotonic clock. Band 0 is under 1024 ns;
-    /// band `i` from 1 holds `[2^(i+9), 2^(i+10))` ns; the last, from 2^26 ns
-    /// (67.1 ms) up.
+    /// Nanoseconds of `Instant`, the monotonic clock.
     Ns,
-    /// A count. Band 0 is 0; band `i` from 1 holds `[2^(i-1), 2^i)`; the last,
-    /// from 65536 up.
+    /// A count. Band 0 is 0.
     Count,
 }
 
@@ -132,12 +49,12 @@ impl Unit {
     }
 }
 
-/// One thing the loop does, counted ([`Hist`]). The order is the line's.
+/// One thing the loop does, counted ([`Hist`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Row {
-    /// Requests that read their own reply: the write to the reply read.
+    /// Requests that read their own reply.
     Request,
-    /// Pipelined acks read, waited for or not: the read alone.
+    /// Pipelined acks read, waited for or not.
     Ack,
     /// Of both, the inbox group's commits (a pipelined ack each since aterm-0).
     Commit,
@@ -151,7 +68,7 @@ pub enum Row {
     LaneDeliver,
     /// Every other verb-lane round trip.
     LaneOther,
-    /// State-dir atomic replaces: temp written (and flushed, when asked), renamed.
+    /// State-dir atomic replaces.
     DirReplace,
     /// State-dir unlinks.
     DirUnlink,
@@ -159,25 +76,25 @@ pub enum Row {
     DirAppend,
     /// State-dir flushes of a file in place or of a directory.
     DirFlush,
-    /// `StateDir::set_post_pin`: a post's reservation (a replace).
+    /// `StateDir::set_post_pin`.
     SetPostPin,
-    /// `StateDir::set_in_flight`: a self-lane post's journal entry (a replace).
+    /// `StateDir::set_in_flight`.
     SetInFlight,
-    /// `StateDir::clear_in_flight`: its removal once it landed (an unlink).
+    /// `StateDir::clear_in_flight`.
     ClearInFlight,
-    /// `StateDir::clear_post_seq`: a retired post's reservation forgotten.
+    /// `StateDir::clear_post_seq`.
     ClearPostSeq,
-    /// `StateDir::append_self_acked`: a landed self-lane offset appended.
+    /// `StateDir::append_self_acked`.
     AppendSelfAcked,
-    /// aterm's events queued while the loop was parked: the wake to the take.
+    /// Aterm's events queued while the loop was parked.
     WakeEvent,
-    /// Broker records queued while the loop was parked: the wake to the take.
+    /// Broker records queued while the loop was parked.
     WakeRecord,
-    /// aterm's events queued while the loop worked: the wait to the take.
+    /// Aterm's events queued while the loop worked.
     QueuedEvent,
-    /// Broker records queued while the loop worked: the wait to the take.
+    /// Broker records queued while the loop worked.
     QueuedRecord,
-    /// A `post` event taken to each fresh post's publish written.
+    /// Time from taking a `post` event to writing each fresh post's publish.
     PostPublish,
     /// The posts each outbox peek listed (a count; 0 is an empty peek).
     DrainPosts,
@@ -187,7 +104,7 @@ pub enum Row {
     TallyWrite,
 }
 
-/// How many rows a line has.
+/// How many rows a line holds.
 pub const ROWS: usize = 25;
 
 impl Row {
@@ -258,7 +175,7 @@ impl Row {
         }
     }
 
-    /// What its values are.
+    /// What its values measure.
     #[must_use]
     pub fn unit(self) -> Unit {
         match self {
@@ -267,14 +184,7 @@ impl Row {
         }
     }
 
-    /// Whether the row is one of the disjoint spans that PARTITION the loop's
-    /// time: the loop is in at most one of them at a time, so with the
-    /// loop's wall time ([`Tally::at_ns`]) what they leave is unaccounted wall
-    /// time, including scheduling delays. The others overlap them: the
-    /// commits are acks or requests, a call row is a replace or an unlink,
-    /// a wake falls inside a park and a
-    /// queued item's wait inside the loop's work, and a post's path spans a
-    /// peek, its writes and its send.
+    /// Whether the row is one of the disjoint spans that partition the loop's time.
     #[must_use]
     pub fn partitions(self) -> bool {
         matches!(
@@ -295,7 +205,7 @@ impl Row {
         )
     }
 
-    /// The row the state dir keeps ([`Kept`]): its kinds and its calls.
+    /// The row the state dir keeps ([`Kept`]).
     #[must_use]
     pub fn kept_by_the_dir(self) -> bool {
         matches!(
@@ -313,8 +223,7 @@ impl Row {
     }
 }
 
-/// THE ROW A VERB-LANE REQUEST IS COUNTED IN, by its verb head. Pure
-/// (unit-tested).
+/// The row a verb-lane request is counted in, by its verb head.
 #[must_use]
 pub fn lane_row(line: &str) -> Row {
     if line.starts_with("outbox sent ") {
@@ -330,22 +239,18 @@ pub fn lane_row(line: &str) -> Row {
     }
 }
 
-/// One row's values since the process started: how many, their sum, the
-/// largest, and how many in each log2 band ([`Unit`]).
+/// One row's values since the process started.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Hist {
     pub count: u64,
     pub total: u64,
-    /// The largest value counted. In a difference ([`Hist::since`]): the
-    /// largest this process saw, when the window saw it, and 0 when the window
-    /// saw nothing larger than what came before it ([`Hist::top`] then bounds
-    /// the window's largest).
+    /// The largest value counted.
     pub max: u64,
     pub buckets: [u32; BUCKETS],
 }
 
 impl Hist {
-    /// The band `v` falls in. Pure (unit-tested).
+    /// The band `v` falls into.
     #[must_use]
     pub fn band(v: u64, unit: Unit) -> usize {
         let shifted = v >> unit.shift();
@@ -353,7 +258,7 @@ impl Hist {
         bits.min(BUCKETS - 1)
     }
 
-    /// The least value band `i` holds. Pure (unit-tested).
+    /// The least value band `i` holds.
     #[must_use]
     pub fn floor(i: usize, unit: Unit) -> u64 {
         if i == 0 {
@@ -382,8 +287,7 @@ impl Hist {
             .sum::<u64>()
     }
 
-    /// The floor and (for every band but the last) the bound of the highest
-    /// band holding a value: `None` for an empty row.
+    /// The floor and (for every band but the last) the bound of the highest band holding a value.
     #[must_use]
     pub fn top(&self, unit: Unit) -> Option<(u64, Option<u64>)> {
         let i = self.buckets.iter().rposition(|&n| n > 0)?;
@@ -391,12 +295,10 @@ impl Hist {
         Some((Hist::floor(i, unit), bound))
     }
 
-    /// What was counted between `earlier` and this. Pure (unit-tested).
+    /// What was counted between `earlier` and `self`.
     ///
     /// # Errors
-    ///
-    /// A count, a total or a band that went backwards: not the same row of
-    /// one process.
+    /// A count, a total or a band that went backwards.
     pub fn since(&self, earlier: &Hist) -> Result<Hist, String> {
         let back = |what: &str, then: u64, now: u64| {
             format!("its `{what}` went backwards, {then} to {now}")
@@ -428,20 +330,16 @@ impl Hist {
     }
 }
 
-/// The loop's time since this process started, and where its inbox group
-/// cursor stood at the write.
+/// The loop's time since this process started, and where its inbox group cursor stood at the write.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Tally {
-    /// The bridge process the counts are of.
+    /// The bridge process the counts belong to.
     pub pid: u32,
     /// The inbox group cursor this process last committed (0 before any).
     pub committed: u64,
-    /// The bridge's own monotonic clock at the write, in nanoseconds since its
-    /// recorder started: two tallies' difference is the loop's wall time
-    /// between them.
+    /// The bridge's own monotonic clock at the write, in nanoseconds since its recorder started.
     pub at_ns: u64,
-    /// Whether the state dir's rows were counted ([`Row::kept_by_the_dir`]):
-    /// only in a build with debug assertions.
+    /// Whether the state dir's rows were counted ([`Row::kept_by_the_dir`]).
     pub dir: bool,
     /// Each [`Row`], at its [`Row::index`].
     pub rows: [Hist; ROWS],
@@ -457,8 +355,6 @@ fn put_hex(out: &mut [u8], mut v: u64) {
 }
 
 /// The text of one row: ` <name>=<count>,<total>,<max>,<band>.<band>…`, every
-/// number fixed-width hex (16 digits, 8 for a band). Its length depends on
-/// the row's name alone.
 fn row_text(row: Row, h: &Hist) -> Vec<u8> {
     let mut out = vec![b'0'; row_len(row)];
     put_row(&mut out, row, h);
@@ -471,7 +367,6 @@ fn row_len(row: Row) -> usize {
 }
 
 /// [`row_text`] written into `out`, which is exactly [`row_len`] long: the
-/// in-place rewrite of one row's place in the line ([`Recorder::idle`]).
 fn put_row(out: &mut [u8], row: Row, h: &Hist) {
     let name = row.name().as_bytes();
     out[0] = b' ';
@@ -501,7 +396,6 @@ fn put_row(out: &mut [u8], row: Row, h: &Hist) {
 }
 
 /// The head: the format, the pid, the cursor, the clock and the dir flag,
-/// zero-padded decimal so its length is fixed.
 fn head_text(t: &Tally) -> String {
     format!(
         "{HEAD} pid={:010} committed={:020} at={:020} dir={}",
@@ -518,10 +412,6 @@ fn sum_text(body: &[u8]) -> String {
 }
 
 /// Every line's length ([`Tally::render`]): the head's ([`head_text`]: the
-/// format, ten digits of pid, twenty of cursor, twenty of clock, one of dir
-/// flag), each row's ([`row_len`]) and the checksum's ([`sum_text`]). Counted,
-/// not rendered, so the idle write's check of a line renders nothing it does
-/// not write.
 fn line_len() -> usize {
     let head = HEAD.len()
         + " pid=".len()
@@ -537,9 +427,6 @@ fn line_len() -> usize {
 }
 
 /// THE LINE'S CHECKSUM: aterm-hash's word-at-a-time Fx hash, not FNV-1a. It
-/// only has to tell a torn read from a whole line, and the loop pays for it
-/// at every idle write: over a line of about 6 KiB FNV-1a's byte-serial
-/// multiply chain was most of the write's cost ([`Row::TallyWrite`]).
 fn checksum(body: &[u8]) -> u64 {
     aterm_hash::fx_hash_bytes(body)
 }
@@ -568,9 +455,7 @@ impl Tally {
             .fold(0u64, |sum, r| sum.saturating_add(self.row(*r).total))
     }
 
-    /// The line [`Tally::parse`] reads, newline included. Every number is
-    /// fixed-width, so every line is the same length and a write at offset 0
-    /// replaces the last one whole. Pure (unit-tested).
+    /// The line [`Tally::parse`] reads, newline included.
     #[must_use]
     pub fn render(&self) -> String {
         let mut body = head_text(self).into_bytes();
@@ -582,13 +467,10 @@ impl Tally {
         String::from_utf8(body).unwrap_or_default()
     }
 
-    /// Read a line [`Tally::render`] wrote. Pure (unit-tested).
+    /// Read a line [`Tally::render`] wrote.
     ///
     /// # Errors
-    ///
-    /// A line that is not one: another format or version, a field missing, out
-    /// of order, not a number or not its width, or a checksum that does not
-    /// match — which is what a read that raced the write sees.
+    /// A line that is not one.
     pub fn parse(text: &str) -> Result<Tally, String> {
         let line = text
             .strip_suffix('\n')
@@ -688,15 +570,10 @@ impl Tally {
         })
     }
 
-    /// What the loop did between `earlier` and this tally: each row's
-    /// difference ([`Hist::since`]), the wall time between the two writes,
-    /// and this tally's cursor. Pure (unit-tested).
+    /// What the loop did between `earlier` and this tally.
     ///
     /// # Errors
-    ///
-    /// Two processes' tallies (a relaunched bridge counts from zero again), a
-    /// clock or a count that went backwards, or two lines that disagree on
-    /// whether the dir was counted.
+    /// Two processes' tallies (a relaunched bridge counts from zero again).
     pub fn since(&self, earlier: &Tally) -> Result<Tally, String> {
         if self.pid != earlier.pid {
             return Err(format!(
@@ -730,7 +607,6 @@ impl Tally {
     }
 
     /// Whether anything but the clock and the tally's own writes differs from
-    /// `other`: what makes an idle moment write.
     fn moved_from(&self, other: &Tally) -> bool {
         self.committed != other.committed
             || Row::ALL
@@ -744,8 +620,7 @@ fn nanos(d: Duration) -> u64 {
     u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)
 }
 
-/// When an item was queued for the loop, and whether the loop was parked on
-/// its mailbox then ([`crate::mailbox::Mailbox`]'s stamps).
+/// When an item was queued for the loop, and whether the loop was parked on its mailbox then.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Stamp {
     at: Instant,
@@ -753,7 +628,7 @@ pub(crate) struct Stamp {
 }
 
 impl Stamp {
-    /// Now, the loop parked or not.
+    /// Now, the loop parked.
     pub(crate) fn now(parked: bool) -> Self {
         Self {
             at: Instant::now(),
@@ -761,18 +636,13 @@ impl Stamp {
         }
     }
 
-    /// The item is taken now: its wait, and whether it was a wake (queued
-    /// while the loop was parked).
+    /// The item is taken now: its wait, and whether it was a wake.
     pub(crate) fn taken(self) -> (u64, bool) {
         (nanos(self.at.elapsed()), self.parked)
     }
 }
 
-/// ROWS ANOTHER PART OF THE BRIDGE KEEPS for the recorder, under a lock of its
-/// own, and the recorder copies at its idle write ([`Kept::copy_into`]): the
-/// state dir's ([`Row::kept_by_the_dir`]). Off until the recorder that will
-/// read it is on ([`Kept::turn_on`]); off, a timer reads no clock.
-/// Compiled only with debug assertions, as the state dir's counting is.
+/// Rows another part of the bridge keeps for the recorder, under a lock of its own.
 #[cfg(any(test, debug_assertions))]
 #[derive(Debug, Default)]
 pub(crate) struct Kept {
@@ -787,8 +657,7 @@ impl Kept {
         self.on.store(on, Ordering::Relaxed);
     }
 
-    /// A span of `row`, counted when the timer drops — on every way out of the
-    /// call that holds it.
+    /// A span of `row`, counted when the timer drops.
     pub(crate) fn timer(&self, row: Row) -> Timer<'_> {
         Timer {
             kept: self,
@@ -834,9 +703,9 @@ impl Drop for Timer<'_> {
 /// The bridge's side: counts while it is on, and writes at idle moments.
 #[derive(Debug)]
 pub(crate) struct Recorder {
-    /// The tally file, open for the life of the process; `None` is off.
+    /// The tally file, open for the life of the process.
     out: Option<std::fs::File>,
-    /// When the recorder started: [`Tally::at_ns`]'s zero.
+    /// When the recorder started.
     started: Instant,
     tally: Tally,
     /// What the file holds: the last tally written, and its line.
@@ -855,9 +724,7 @@ impl Default for Recorder {
 }
 
 impl Recorder {
-    /// On when [`SEAM`] is set in a build that reads seams, writing to
-    /// `<state>/`[`FILE`]; off otherwise, and off — said once, on stderr — when
-    /// the file cannot be opened.
+    /// On when [`SEAM`] is set in a build that reads seams, writing to `<state>/`[`FILE`].
     pub(crate) fn from_env(state_root: &Path) -> Self {
         if aterm_types::dev_seam!(SEAM).is_none() {
             return Self::default();
@@ -873,11 +740,8 @@ impl Recorder {
     }
 
     /// On, writing to a newly created private `path`.
-    /// An occupied name, including an old tally or a link, is left untouched;
-    /// the optional recorder stays off rather than adopting it.
     ///
     /// # Errors
-    ///
     /// The exclusive open's, including an already occupied name.
     pub(crate) fn at(path: &Path) -> io::Result<Self> {
         use std::os::unix::fs::OpenOptionsExt as _;
@@ -903,13 +767,12 @@ impl Recorder {
         self.out.is_some()
     }
 
-    /// When a counted span starts: `None` while off, so a released bridge
-    /// reads no clock for it.
+    /// When a counted span starts.
     pub(crate) fn starts(&self) -> Option<Instant> {
         self.on().then(Instant::now)
     }
 
-    /// The span [`Recorder::starts`] began has ended now: count it in `row`.
+    /// The span [`Recorder::starts`] began has ended now.
     pub(crate) fn note(&mut self, row: Row, started: Option<Instant>) {
         if let Some(started) = started {
             self.tally.rows[row.index()].add(nanos(started.elapsed()), row.unit());
@@ -930,16 +793,12 @@ impl Recorder {
         }
     }
 
-    /// When an ack read is about to start: `None` while off, so a released
-    /// bridge reads no clock for it.
+    /// When an ack read is about to start.
     pub(crate) fn ack_starts(&self) -> Option<Instant> {
         self.starts()
     }
 
-    /// The ack read that [`Recorder::ack_starts`] began has returned an ack —
-    /// the inbox group's commit's when `commit` (aterm-0's pipelined commit,
-    /// counted in [`Row::Commit`] as well, timed by the same read). A read
-    /// that did not wait (a try) is counted the same way, at what it cost.
+    /// The ack read that [`Recorder::ack_starts`] began has returned an ack.
     pub(crate) fn ack(&mut self, started: Option<Instant>, commit: bool) {
         if let Some(started) = started {
             let ns = nanos(started.elapsed());
@@ -950,18 +809,7 @@ impl Recorder {
         }
     }
 
-    /// An idle moment — the loop found nothing queued and has since read the
-    /// acks it owed, during which an item may have arrived — its inbox group
-    /// cursor at `committed`, and `outside` copying the rows the mailbox and
-    /// the state dir keep: write the tally if it moved since the last write
-    /// (the clock and this row aside). A write that fails is said on stderr
-    /// and turns the tally off, so a full disk costs one line rather than one
-    /// per round.
-    ///
-    /// ONLY THE ROWS THAT MOVED ARE RENDERED: the line is fixed-length and
-    /// each row has a fixed place in it, so the line last written is kept and
-    /// a changed row is written over its place, then the head and the
-    /// checksum.
+    /// An idle moment — the loop found nothing queued and has since read the acks it owed.
     pub(crate) fn idle(&mut self, committed: u64, outside: impl FnOnce(&mut Tally)) {
         use std::os::unix::fs::FileExt as _;
         if !self.on() {
@@ -1050,8 +898,6 @@ mod tests {
     }
 
     /// THE BANDS ARE LOG2, and the edges are where the unit says: under a
-    /// microsecond-ish 1024 ns is band 0, 1024 opens band 1, 2^26 ns (67.1 ms)
-    /// and anything past it is the last; a count's band 0 is 0 alone.
     #[test]
     fn a_value_falls_in_its_log2_band_and_each_band_starts_at_its_floor() {
         assert_eq!(Hist::band(0, Unit::Ns), 0);
@@ -1093,8 +939,6 @@ mod tests {
     }
 
     /// THE V=2 LINE READS BACK AS WRITTEN, AND EVERY LINE IS ONE LENGTH, so a
-    /// write at offset 0 always replaces the line whole: the smallest tally
-    /// and the largest render to the same width.
     #[test]
     fn a_tally_line_reads_back_as_written_and_every_line_is_one_length() {
         let t = sample();
@@ -1131,8 +975,6 @@ mod tests {
     }
 
     /// NEGATIVE CONTROL: a line whose checksum was corrupted is refused, and so
-    /// is every mix of two lines a read racing the write could see — never
-    /// read as a count that is half old and half new.
     #[test]
     fn a_line_that_raced_its_write_or_lost_its_checksum_is_refused_never_read_as_a_count() {
         let old = sample().render();
@@ -1148,9 +990,7 @@ mod tests {
                 assert!(Tally::parse(&torn).is_err(), "cut {cut}");
             }
         }
-        // The two whole lines parse.
         assert!(Tally::parse(&old).is_ok() && Tally::parse(&new).is_ok());
-        // A CORRUPTED CHECKSUM: one digit of it changed.
         let (body, sum) = old.trim_end().rsplit_once(" sum=").expect("a sum");
         let flipped: String = sum
             .chars()
@@ -1177,14 +1017,12 @@ mod tests {
         for bad in [
             "",
             "wait-tally v=2\n",
-            &old[..old.len() - 1],                            // unterminated
-            &old.replace("wait-tally v=2", "wait-tally v=1"), // another version
-            &old.replace(" sum=", " sum=0"),                  // a checksum that is not one
+            &old[..old.len() - 1],
+            &old.replace("wait-tally v=2", "wait-tally v=1"),
+            &old.replace(" sum=", " sum=0"),
         ] {
             assert!(Tally::parse(bad).is_err(), "{bad:?}");
         }
-        // A line with the right checksum over the wrong fields is still
-        // refused: a v=1 body, and a row a band short.
         for body in ["wait-tally v=2 pid=1 requests=1".to_string(), {
             let (body, _) = old.trim_end().rsplit_once(" sum=").expect("a sum");
             body.rsplit_once('.').expect("a band").0.to_string()
@@ -1218,8 +1056,6 @@ mod tests {
             "a new largest is the window's"
         );
         assert_eq!(d.row(Row::Request), &Hist::default(), "nothing new");
-        // A WINDOW WHOSE LARGEST IS BELOW AN EARLIER ONE: its max is not known
-        // (0), and its top band bounds it.
         let mut quieter = later;
         quieter.rows[Row::LaneDeliver.index()].add(130_000, Unit::Ns);
         let q = quieter.since(&later).expect("one process");
@@ -1241,8 +1077,6 @@ mod tests {
     }
 
     /// THE PARTITION: the rows the loop is in one at a time, and only those,
-    /// sum to its accounted time; a commit (an ack), a call row (a replace), a
-    /// wake (inside a park) and a post's path are left out of it.
     #[test]
     fn only_the_disjoint_rows_partition_the_loops_time() {
         let t = sample();
@@ -1276,7 +1110,6 @@ mod tests {
             ("sessions bridge", Row::LaneSessions),
             ("deliver s-b receipt=3 off=9", Row::LaneDeliver),
             ("deliver s-b fetched=9 err=refused", Row::LaneDeliver),
-            // NEGATIVE CONTROLS: near misses are other verbs.
             ("sessions status", Row::LaneOther),
             ("outboxes", Row::LaneOther),
             ("link mirror on", Row::LaneOther),
@@ -1288,7 +1121,6 @@ mod tests {
 
     #[test]
     fn an_off_recorder_counts_nothing_and_an_on_one_writes_only_what_moved() {
-        // OFF: nothing counted, no clock read, nothing written.
         let mut off = Recorder::default();
         off.request(Instant::now());
         let started = off.ack_starts();
@@ -1308,8 +1140,6 @@ mod tests {
         assert_eq!(read(), "", "nothing until the first idle moment");
         on.request(Instant::now());
         on.request(Instant::now());
-        // A publish's ack, then a pipelined commit's: both acks, one commit,
-        // and the commit's time is the time of the read that returned it.
         let started = on.ack_starts();
         assert!(started.is_some());
         on.ack(started, false);
@@ -1318,7 +1148,6 @@ mod tests {
         let started = on.starts();
         on.note(Row::LaneSent, started);
         on.count(Row::DrainPosts, 2);
-        // The rows another part keeps are copied in at the write.
         let kept = Kept::default();
         drop(kept.timer(Row::DirUnlink));
         kept.turn_on(true);
@@ -1354,14 +1183,9 @@ mod tests {
             "a write counts itself in the next line"
         );
 
-        // AN IDLE MOMENT WITH NOTHING MOVED WRITES NOTHING, though its own
-        // write and the clock moved: the file is overwritten from outside,
-        // and the next idle moment leaves it.
         std::fs::write(&path, "sentinel").expect("overwrite");
         on.idle(17, |t| kept.copy_into(t));
         assert_eq!(read(), "sentinel");
-        // NEGATIVE CONTROL: a moved cursor alone is a change, and is written
-        // whole over the outside bytes' place, rendered only where it moved.
         on.idle(18, |t| kept.copy_into(t));
         let again = Tally::parse(&read()).expect("rewritten whole");
         assert_eq!(again.committed, 18);
@@ -1378,7 +1202,6 @@ mod tests {
     }
 
     /// Occupied diagnostic names never authorize truncating their bytes or a
-    /// link target. Only the fresh file belongs to this recorder.
     #[cfg(unix)]
     #[test]
     fn a_wait_tally_never_truncates_an_occupied_name_or_its_link_target() {

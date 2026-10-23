@@ -1,25 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `verify cells`: each forge cell no fleet machine hosts (Windows, linux-arm,
-//! wasm32), or each `--cell` named, linted for its own triple with the
-//! `clippy.toml` bans that resolve or matter only there, and every workspace
-//! member in its graph type-checked with all its targets (wasm32 excepted).
-//! On an OS a fleet machine runs, and on Windows ([`judges_warnings`]), both
-//! passes are also red on any warning rustc itself raises
-//! ([`is_cell_warning`]): `dead_code`, `unused_imports` and the like turn on
-//! `cfg`, so the triple's own compile is the only one that sees them.
-//! The cells a fleet machine hosts are that machine's own `verify lint test`,
-//! and the cell whose triple is this machine's is never cross-checked here.
-//! A run that checks a Windows cell also runs both windows-sys oracles
-//! ([`WIN32_ORACLES`]), one row each.
-//!
-//! STOCK EXCEPTION: the Trust sysroot carries only the host std, so each cell
-//! compiles on a rustup toolchain carrying its triple's std (stable first),
-//! driven by path from a neutral cwd so neither this repo's Trust pin nor its
-//! Trust-only cargo config reaches it. A cell with no such toolchain skips and
-//! names the install.
+//! `verify cells`: cross-cell lint and type-check across Windows, linux-arm, and wasm32.
 
+//! STOCK EXCEPTION: the Trust sysroot carries only the host std, so each cell
 use aterm_uds::output::CommandOutput as _;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
@@ -38,9 +22,7 @@ use crate::stages::lane_jobs;
 /// The build-script shims a cell may apply.
 pub const POLICY: &str = "tools/cross-cell-gate.tsv";
 
-/// The triples some machine in this fleet runs natively. A hosted cell's
-/// verdict comes from its host's own build, so by default only the other
-/// cells are compiled here, alike on every machine.
+/// The triples some machine in this fleet runs natively.
 pub const FLEET_HOST_TRIPLES: [&str; 3] = [
     "aarch64-apple-darwin",
     "x86_64-apple-darwin",
@@ -48,11 +30,9 @@ pub const FLEET_HOST_TRIPLES: [&str; 3] = [
 ];
 
 /// The clippy config the browser cells lint with: std's clock panics on
-/// wasm32-unknown-unknown, which no host lint can see.
 const WASM_CLIPPY_CONF: &str = "crates/aterm-time/wasm32";
 
-/// The cells this check compiles by default: forge's own list, less the
-/// hosted triples.
+/// The cells this check compiles by default: forge's own list, less the hosted triples.
 #[must_use]
 pub fn foreign_cells() -> Vec<Cell> {
     aterm_forge::resolve::default_cells()
@@ -95,10 +75,7 @@ fn host_triple(ctx: &Ctx) -> Result<String, String> {
         .ok_or_else(|| format!("`{} -vV` named no host triple", trustc.display()))
 }
 
-/// One `cshim` row: a C-bearing build script replaced, for one triple, by
-/// cargo's own override on the command line. Faithful only where the script
-/// emits nothing a compiler reads, since a check never links; `name@version`
-/// pins the script that was read, so a bump leaves the row dead and red.
+/// One `cshim` row: a C-bearing build script replaced, for one triple, by cargo's own override on the command line.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Shim {
     pub package: String,
@@ -119,9 +96,7 @@ impl Shim {
     }
 }
 
-/// [`POLICY`], parsed: `cshim <name>@<version> <triple> <links> <why>`,
-/// TAB-separated, `#` and blank lines ignored. A row it cannot read is an
-/// error, never a skipped line.
+/// [`POLICY`], parsed: `cshim <name>@<version> <triple> <links> <why>`, TAB-separated, `#` and blank lines ignored.
 ///
 /// # Errors
 /// The first row that is not a well-formed `cshim` for one non-wasm triple.
@@ -158,10 +133,6 @@ pub fn parse_policy(text: &str) -> Result<Vec<Shim>, String> {
                 "{at}: a `cshim` row names one triple; what a script emits depends on it"
             ));
         }
-        // A bundled-C build script is known to emit `rustc-cfg` on wasm32 and
-        // hermit alone (zstd-sys emitted `feature="std"` there until it left
-        // the graph), so a shim there would type-check a different crate than
-        // the one shipped; the refusal stays for the next script like it.
         if triple.starts_with("wasm32") || triple.contains("hermit") {
             return Err(format!(
                 "{at}: no `cshim` on `{triple}`, where a bundled-C build script emits rustc-cfg"
@@ -184,19 +155,13 @@ pub enum CellOutcome {
     Checked(String),
     /// Nothing was compiled: why, and the install that clears it.
     Skipped { why: String, fix: String },
-    /// The tree did not hold for the cell: the first cause, and the lines
-    /// that say what went wrong.
+    /// The tree did not hold for the cell: the first cause, and the lines that say what went wrong.
     Failed { status: String, detail: Vec<String> },
-    /// The machine could not answer for the cell (no graph, no toolchain, a
-    /// child that never ran): what failed, and how.
+    /// The machine could not answer for the cell (no graph, no toolchain, a child that never ran): what failed, and how.
     CouldNotRun { status: String, detail: Vec<String> },
 }
 
-/// The `cells` check's stage: one row per selected cell, then the `cshim`
-/// rows nothing could use. A row naming a triple no forge cell has is dead;
-/// so is one naming a version its cell's graph does not carry, which fails
-/// that cell when it runs and, in an un-narrowed run, is read off the graph
-/// of each cell that did not run.
+/// The `cells` check's stage: one row per selected cell, then the `cshim` rows nothing could use.
 pub fn run(ctx: &Ctx, r: &mut Report) {
     let policy = match std::fs::read_to_string(ctx.root.join(POLICY))
         .map_err(|e| format!("cannot read {POLICY}: {e}"))
@@ -273,14 +238,8 @@ pub fn run(ctx: &Ctx, r: &mut Report) {
     audit_policy(ctx, r, &policy, &cells);
 }
 
-/// The windows-sys oracles, `aterm-win32-oracle`'s two verbs (WB.1, WB.2 and
-/// WB.3 of docs/AUDIT-third-party-2026-10-15.md), each with what it holds to
-/// the registry crates of its version: the declarations' types, layouts, values
-/// and signatures (and, for aterm-win32's hand-written COM and DXGI, each
-/// vtable slot), the DLL each import resolves from, and every planted mismatch
-/// caught. Each verb compiles both Windows triples, so a run that checks
+/// The windows-sys oracles, `aterm-win32-oracle`'s two verbs (WB.1, WB.2 and WB.3 of docs/AUDIT-third-party-2026-10-15.md), each with what it holds to the registry crates of its version. (STOCK EXCEPTION)
 /// either Windows cell runs each once. The same STOCK EXCEPTION as the cells:
-/// stock stable compiles Windows std, and no Windows program runs.
 pub const WIN32_ORACLES: [(&str, &str); 2] = [
     (
         "oracle",
@@ -298,12 +257,7 @@ pub fn runs_win32_oracles(cells: &[Cell]) -> bool {
     cells.iter().any(|c| c.triple.ends_with("-pc-windows-msvc"))
 }
 
-/// `targo --unverified run -q -p aterm-win32-oracle --target-dir
-/// <cells lane>/win32-oracle-bin -- <verb> --root <R>`, from `<R>`. The driver
-/// builds in the cells lane; the Windows builds it drives stay in the
-/// per-checkout directories the oracle defaults to, because the facades are
-/// path units a directory shared across checkouts could answer for. Both
-/// paths are absolute because the oracle's children run from other cwds.
+/// `targo --unverified run -q -p aterm-win32-oracle --target-dir <cells lane>/win32-oracle-bin -- <verb> --root <R>`, from `<R>`.
 ///
 /// # Errors
 /// The current-directory error from making a relative path absolute.
@@ -335,8 +289,7 @@ pub fn win32_oracle_cmd(ctx: &Ctx, verb: &str) -> std::io::Result<Cmd> {
     Ok(cmd)
 }
 
-/// The reason an oracle that decided nothing gives on its last
-/// `… could not run: <reason>` line.
+/// The reason an oracle that decided nothing gives on its last `… could not run: <reason>` line.
 #[must_use]
 pub fn win32_oracle_not_run_reason(output: &str) -> Option<String> {
     output
@@ -348,7 +301,6 @@ pub fn win32_oracle_not_run_reason(output: &str) -> Option<String> {
 }
 
 /// One row per [`WIN32_ORACLES`] verb. The oracle's exit is read as the libc
-/// oracle's: 0 passes, 1 is a finding, 3 or a signal decided nothing.
 fn win32_oracles(ctx: &Ctx, r: &mut Report, have_rustup: bool) {
     for (verb, holds) in WIN32_ORACLES {
         let label = format!("win32 {verb} ({holds}; x86_64 and aarch64 pc-windows-msvc)");
@@ -391,8 +343,6 @@ fn win32_oracles(ctx: &Ctx, r: &mut Report, have_rustup: bool) {
 }
 
 /// The `cshim` rows no cell of this run used: one naming a triple no forge
-/// cell has is dead; one whose cell did not run is held to that cell's graph
-/// unless `--cell` narrowed the run.
 fn audit_policy(ctx: &Ctx, r: &mut Report, policy: &[Shim], ran: &[Cell]) {
     let all = aterm_forge::resolve::default_cells();
     let mut graphs: BTreeMap<String, Result<(Graph, BTreeSet<PkgId>), String>> = BTreeMap::new();
@@ -424,7 +374,6 @@ fn audit_policy(ctx: &Ctx, r: &mut Report, policy: &[Shim], ran: &[Cell]) {
                 if dead_shim(shim, library, &BTreeSet::new()).is_none() {
                     continue;
                 }
-                // Not in the shipped graph: it may serve the test targets.
                 let names: BTreeSet<String> = g.nodes.iter().map(|p| p.name.clone()).collect();
                 let tests = members
                     .get_or_insert_with(|| member_names(ctx))
@@ -464,8 +413,7 @@ fn audit_policy(ctx: &Ctx, r: &mut Report, policy: &[Shim], ran: &[Cell]) {
     }
 }
 
-/// Whether `shim` is live in the lint's graph and in the test-target
-/// pass's: its package at its version is in each.
+/// Whether `shim` is live in the lint's graph and in the test-target pass's: its package at its version is in each.
 #[must_use]
 pub fn shim_lanes(shim: &Shim, library: &BTreeSet<PkgId>, tests: &BTreeSet<PkgId>) -> (bool, bool) {
     let live = |nodes: &BTreeSet<PkgId>| {
@@ -477,7 +425,6 @@ pub fn shim_lanes(shim: &Shim, library: &BTreeSet<PkgId>, tests: &BTreeSet<PkgId
 }
 
 /// `Some(why)` when `shim`'s version is in neither pass's graph, which a
-/// version bump does: its build script was never read.
 fn dead_shim(shim: &Shim, library: &BTreeSet<PkgId>, tests: &BTreeSet<PkgId>) -> Option<String> {
     let versions: BTreeSet<&str> = library
         .iter()
@@ -502,8 +449,7 @@ fn dead_shim(shim: &Shim, library: &BTreeSet<PkgId>, tests: &BTreeSet<PkgId>) ->
     })
 }
 
-/// What the all-targets pass compiles: the members it selects and excludes,
-/// and their target dependencies, dev-dependencies included.
+/// What the all-targets pass compiles: the members it selects and excludes, and their target dependencies, dev-dependencies included.
 #[derive(Debug, Default)]
 pub struct TestGraph {
     pub nodes: BTreeSet<PkgId>,
@@ -512,8 +458,6 @@ pub struct TestGraph {
 }
 
 /// The test-target pass's graph for `cell`: the selection
-/// [`test_selection`] makes from `members` and the cell's `normal` package
-/// names, resolved by `targo tree` for exactly that selection.
 fn test_graph(
     ctx: &Ctx,
     cell: &Cell,
@@ -550,8 +494,6 @@ fn test_graph(
 }
 
 /// `targo tree` over the workspace less `excluded`, for `triple`, with normal
-/// and dev edges and no proc-macro or build subtrees (host code a target
-/// override cannot help): the depth-prefixed forest, one root per member.
 fn test_tree(
     targo: &Path,
     path: &std::ffi::OsStr,
@@ -583,26 +525,12 @@ fn test_tree(
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-/// The packages of a depth-prefixed `targo tree` forest whose roots must be
-/// exactly `roots`. A proc-macro ROOT's whole tree is host code and adds
-/// nothing; a depth jump, a repeated root no proc macro explains or a root set
-/// that differs is an error, never a smaller graph.
-///
-/// A member a selected proc macro depends on is built twice, for the target and
-/// for the host, and cargo prints a root for EACH of its nodes, with nothing on
-/// the line to say which is which (aterm-macro-support and aterm-serde, since
-/// the workspace `serde` row made aterm-serde-derive a normal dependency of every
-/// cell: docs/AUDIT-third-party-2026-10-15.md SP.6). The host node is the one
-/// the proc macro's own tree prints, subtree and all (`--no-dedupe`), so a
-/// repeated root's copy whose node set equals one printed under a proc-macro
-/// root is that host copy and is dropped; the one copy left is the target's.
-/// Cargo may print the host copy first, so order cannot decide it.
+/// The packages of a depth-prefixed `targo tree` forest whose roots must be exactly `roots`.
 ///
 /// # Errors
 /// A line forge cannot read, or a forest that is not the one asked for.
 pub fn parse_test_forest(text: &str, roots: &BTreeSet<String>) -> Result<BTreeSet<PkgId>, String> {
     /// One depth-0 tree: whether its root is a proc macro, and every line from
-    /// the root down, as (depth, package).
     struct RootTree {
         proc_macro: bool,
         lines: Vec<(usize, PkgId)>,
@@ -630,7 +558,6 @@ pub fn parse_test_forest(text: &str, roots: &BTreeSet<String>) -> Result<BTreeSe
         tree.lines.push((line.depth, line.id));
         ancestors = line.depth + 1;
     }
-    // The node set of the subtree that starts at `lines[at]`.
     let subtree = |lines: &[(usize, PkgId)], at: usize| -> BTreeSet<PkgId> {
         let depth = lines[at].0;
         let mut nodes = BTreeSet::from([lines[at].1.clone()]);
@@ -642,7 +569,6 @@ pub fn parse_test_forest(text: &str, roots: &BTreeSet<String>) -> Result<BTreeSe
         }
         nodes
     };
-    // Every package a proc-macro root reaches, with the host subtree it has there.
     let mut host: BTreeMap<String, Vec<BTreeSet<PkgId>>> = BTreeMap::new();
     for tree in trees.iter().filter(|tree| tree.proc_macro) {
         for at in 1..tree.lines.len() {
@@ -699,8 +625,6 @@ pub fn parse_test_forest(text: &str, roots: &BTreeSet<String>) -> Result<BTreeSe
 }
 
 /// The cell's packages compiled for the host ([`host_side`]). A third-party
-/// proc macro has no path in the tree's output: forge finds its directory in
-/// the registry.
 fn host_side_of(ctx: &Ctx, graph: &Graph, paths: &BTreeMap<PkgId, PathBuf>) -> BTreeSet<PkgId> {
     host_side(graph, |id| {
         aterm_forge::loc::package_dir(&ctx.root, id, paths.get(id).map(PathBuf::as_path))
@@ -715,7 +639,6 @@ fn library_nodes(ctx: &Ctx, graph: &Graph, paths: &BTreeMap<PkgId, PathBuf>) -> 
 }
 
 /// One cell's graph from forge's own resolver, asking this run's targo, under
-/// the run's ceiling.
 fn graph_of(ctx: &Ctx, cell: &Cell) -> Result<(Graph, BTreeMap<PkgId, PathBuf>), String> {
     let (cargo, root, owned) = (ctx.forge_cargo(), ctx.root.clone(), cell.clone());
     crate::exec::bounded(ctx.child_ceiling, move || {
@@ -726,7 +649,6 @@ fn graph_of(ctx: &Ctx, cell: &Cell) -> Result<(Graph, BTreeMap<PkgId, PathBuf>),
 }
 
 /// One cell, end to end: its graph, its shims, its toolchain, the lint of
-/// its root package, and the all-targets pass over its workspace members.
 fn check_cell(
     ctx: &Ctx,
     rustup: &Path,
@@ -742,8 +664,6 @@ fn check_cell(
         status: status.to_string(),
         detail,
     };
-    // The graph from forge's own resolver, so the coverage denominator is the
-    // number forge reports.
     let (graph, paths) = match graph_of(ctx, cell) {
         Ok(g) => g,
         Err(e) => return could_not("UNRESOLVED", vec![e]),
@@ -760,18 +680,12 @@ fn check_cell(
         .filter(|id| in_repo(id))
         .map(|id| id.name.clone())
         .collect();
-    // A proc macro compiles for the host even in a cross build, so it is owed
-    // no artifact for the cell's triple.
     let proc_macros: BTreeSet<String> = graph
         .nodes
         .iter()
         .filter(|id| in_repo(id) && paths.get(*id).is_some_and(|d| is_proc_macro(d)))
         .map(|id| id.name.clone())
         .collect();
-    // Nor is a crate only proc macros reach (a facade under a third-party
-    // macro): it compiles for the host with them.
-    // A third-party proc macro has no path in the tree's output: forge finds
-    // its directory in the registry.
     let host = host_side_of(ctx, &graph, &paths);
     let host_deps: BTreeSet<String> = host
         .iter()
@@ -779,12 +693,8 @@ fn check_cell(
         .filter(|name| own.contains(name) && !proc_macros.contains(name))
         .collect();
     let not_owed: BTreeSet<String> = proc_macros.union(&host_deps).cloned().collect();
-    // What the lint compiles for the triple: the graph less its host side.
     let library: BTreeSet<PkgId> = graph.nodes.difference(&host).cloned().collect();
 
-    // The all-targets pass's own graph (every member it selects, with their
-    // dev-dependencies), resolved apart from forge's shipped one: a test-only
-    // oracle is never shipped. Not on wasm32, which has no such pass.
     let tests = if cell.triple.starts_with("wasm32") {
         None
     } else {
@@ -800,8 +710,6 @@ fn check_cell(
     };
     let test_nodes = tests.as_ref().map(|t| t.nodes.clone()).unwrap_or_default();
 
-    // Each pass applies only the rows live in its own graph; a row live in
-    // neither is dead.
     let (mut shim_args, mut shimmed) = (Vec::new(), Vec::new());
     let (mut test_shim_args, mut test_shimmed) = (Vec::new(), Vec::new());
     for shim in policy.iter().filter(|s| s.triple == cell.triple) {
@@ -904,10 +812,6 @@ fn check_cell(
         ));
     }
 
-    // Every target of every member in the graph: a `#[cfg(test)]` module is
-    // part of its crate's unit, so one unix-only name costs the crate's test
-    // binary on every other triple. Not on wasm32, which nothing tests and
-    // whose members' dev-dependencies do not build there (getrandom).
     if let (None, Some(tests)) = (&red.status, &tests) {
         let test_cargo = CellCargo {
             shim_args: &test_shim_args,
@@ -918,8 +822,6 @@ fn check_cell(
             Ok(read) => read,
             Err(outcome) => return outcome,
         };
-        // A test-only dependency's own artifact for the triple (never the
-        // member's test unit) is what shows its override took.
         let dependency_names: BTreeSet<String> =
             tests.nodes.iter().map(|id| id.name.clone()).collect();
         let dependencies = read_cargo_json(&run.output, &cell.triple, &dependency_names, false);
@@ -988,7 +890,6 @@ impl Red {
 }
 
 /// One compiler pass's diagnostics, shared by the lint and all-targets pass.
-/// Artifact coverage is checked by the caller against that pass's own graph.
 fn read_cargo_run(
     run: &exec::Run,
     triple: &str,
@@ -1066,7 +967,6 @@ fn read_cargo_run(
 }
 
 /// The two cargo runs one cell makes, sharing its toolchain, cwd, target
-/// dir and shims.
 struct CellCargo<'a> {
     ctx: &'a Ctx,
     triple: &'a str,
@@ -1078,10 +978,6 @@ struct CellCargo<'a> {
 
 impl CellCargo<'_> {
     /// `<toolchain cargo> <verb> --target <triple> …` with this cell's
-    /// environment: the toolchain's own `rustc`, its bin first on PATH (so
-    /// `cargo clippy` finds `cargo-clippy` beside it), its lib first on the
-    /// loader path ([`crate::rustup::Toolchain::loader_env`]), and the cells
-    /// lane's job cap, since the cells compile beside the run's other builds.
     fn base(&self, verb: &str) -> Cmd {
         let mut path = OsString::new();
         if let Some(bin) = self.toolchain.cargo.parent() {
@@ -1117,9 +1013,6 @@ impl CellCargo<'_> {
     }
 
     /// The lint of the cell's root package: of clippy, only the `clippy.toml`
-    /// bans (every other clippy lint is the host's), the browser cells with
-    /// their own clock-only config; rustc's own warnings are read from the
-    /// stream ([`is_cell_warning`]).
     fn lint(&self, cell: &Cell) -> Cmd {
         let mut cmd = self
             .base("clippy")
@@ -1141,9 +1034,7 @@ impl CellCargo<'_> {
     }
 }
 
-/// What a foreign cell's lint denies after `--`: the `clippy.toml` bans
-/// (and, off wasm, an `#[expect]` no ban fulfils); the browser config holds
-/// only the clock rows, so the workspace rows' expects go unfulfilled there.
+/// What a foreign cell's lint denies after `--`: the `clippy.toml` bans (and, off wasm, an `#[expect]` no ban fulfils).
 #[must_use]
 pub fn lint_flags(triple: &str) -> &'static [&'static str] {
     if triple.starts_with("wasm32") {
@@ -1170,7 +1061,6 @@ pub fn lint_flags(triple: &str) -> &'static [&'static str] {
 }
 
 /// The workspace member names, from `targo metadata --no-deps` (the NAME,
-/// which `--exclude` takes, is not always the directory).
 fn member_names(ctx: &Ctx) -> Result<BTreeSet<String>, String> {
     let out = aterm_uds::spawnfd::command(&ctx.tools.targo)
         .args([
@@ -1216,9 +1106,6 @@ pub fn parse_member_names(json: &str) -> Result<BTreeSet<String>, String> {
 }
 
 /// The members this cell's graph carries, and the ones `--exclude` drops.
-/// `--workspace --exclude`, never a partial `-p` list, which cargo resolves
-/// apart from the workspace; and never a `[patch.crates-io]` target excluded,
-/// which would drop its patch with it.
 #[must_use]
 pub fn test_selection(
     members: &BTreeSet<String>,
@@ -1234,9 +1121,7 @@ pub fn test_selection(
     (selected, excluded)
 }
 
-/// The packages the root manifest's `[patch.crates-io]` rows replace: a row's
-/// key, or its `package = "…"` when renamed (cargo's form for patching two
-/// version lines of one package).
+/// The packages the root manifest's `[patch.crates-io]` rows replace.
 ///
 /// # Errors
 /// The manifest could not be read ("could not look" is not "there are none").
@@ -1278,10 +1163,7 @@ pub fn renamed_package(spec: &str) -> Option<&str> {
     })
 }
 
-/// What cargo's JSON stream said: the graph packages that left an artifact
-/// for the triple (test units only when `tests_only`), every error
-/// diagnostic as `(package, rendered)`, and every warning
-/// [`is_cell_warning`] keeps, once each.
+/// What cargo's JSON stream said.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct CargoRead {
     pub checked: BTreeSet<String>,
@@ -1289,21 +1171,7 @@ pub struct CargoRead {
     pub warnings: Vec<(String, String)>,
 }
 
-/// Whether a cell's rustc warnings ([`is_cell_warning`]) are findings: when its
-/// OS is one a fleet machine runs ([`FLEET_HOST_TRIPLES`]). That machine's own
-/// `verify lint` holds the OS to `-D warnings`, but only on its own triple's
-/// `cfg`s; the cell holds the OS's other architectures to the same standard,
-/// and so every host that never compiles that OS (a Mac never compiles
-/// `target_os = "linux"`, a Linux box never `target_os = "macos"`). Of the
-/// OSes no fleet machine runs, Windows is held to it too
-/// ([`WARNINGS_JUDGED_OFF_FLEET`]); the browser has no such standard to carry
-/// yet: its cells judge errors, bans and stale expectations only.
-///
-/// The judge is the cell's rustup toolchain (stable first, unpinned), not the
-/// fleet's Trust rustc: a newer stable that adds a warn-by-default lint turns
-/// these cells red on code it flags, on every host that updates, before the
-/// Trust toolchain carries that lint, and `ship release` refuses until the
-/// code is fixed or [`is_cell_warning`] excuses the lint.
+/// Whether a cell's rustc warnings ([`is_cell_warning`]) are findings.
 #[must_use]
 pub fn judges_warnings(triple: &str) -> bool {
     let os = |t: &str| t.split_once('-').map(|(_, os)| os.to_string());
@@ -1316,22 +1184,10 @@ pub fn judges_warnings(triple: &str) -> bool {
             .any(|host| os(host).as_deref() == Some(own.as_str()))
 }
 
-/// The OSes (a triple past its architecture) no fleet machine runs whose cells
-/// still judge warnings ([`judges_warnings`]): Windows, whose warning pass is
-/// done (a76bd27015 and 3cf93be412 took its lib and test targets to none), so a
-/// warning there is red the day it is written, not the day a Windows box next
-/// builds it.
+/// The OSes (a triple past its architecture) no fleet machine runs whose cells still judge warnings ([`judges_warnings`]).
 pub const WARNINGS_JUDGED_OFF_FLEET: [&str; 1] = ["pc-windows-msvc"];
 
-/// Whether a warning's lint code makes a cell red: any lint rustc itself
-/// raises. Those are the ones that turn on `cfg` (`dead_code` and
-/// `unused_imports` above all, an item whose only callers are another OS's),
-/// so a host's `-D warnings` lint can never see another triple's, and the
-/// cell's compile is the one place they surface. A warning with no code (a
-/// count of the others) is no finding; clippy's lints are the host's, whose
-/// clippy is not the cell's version; so are the two that only say the cell's
-/// rustc does not know a lint name a newer one may (`unknown_lints`,
-/// `renamed_and_removed_lints`).
+/// Whether a warning's lint code makes a cell red: any lint rustc itself raises.
 #[must_use]
 pub fn is_cell_warning(code: Option<&str>) -> bool {
     code.is_some_and(|c| {
@@ -1365,8 +1221,6 @@ pub fn read_cargo_json(
                     .and_then(|p| p.get("test"))
                     .and_then(aterm_json::Value::as_bool)
                     .unwrap_or(false);
-                // Cross artifacts land under `<target>/<triple>/`; host units
-                // (build scripts, proc macros) under `<target>/debug/`.
                 let for_triple = value
                     .get("filenames")
                     .and_then(aterm_json::Value::as_array)
@@ -1397,8 +1251,6 @@ pub fn read_cargo_json(
                             .and_then(|m| m.get("code"))
                             .and_then(|c| c.get("code"))
                             .and_then(aterm_json::Value::as_str);
-                        // A unit and its test twin raise the same warning
-                        // on shared code: it is one finding.
                         let warning = (pkg, rendered());
                         if is_cell_warning(code) && !read.warnings.contains(&warning) {
                             read.warnings.push(warning);
@@ -1413,9 +1265,7 @@ pub fn read_cargo_json(
     read
 }
 
-/// The `error` lines cargo printed itself, at column zero (a failing build
-/// script's output is re-emitted indented; `could not compile` summarises
-/// diagnostics the JSON already carried).
+/// The `error` lines cargo printed itself, at column zero (a failing build script's output is re-emitted indented; `could not compile` summarises diagnostics the JSON already carried).
 #[must_use]
 pub fn cargo_level_errors(output: &str) -> Vec<String> {
     output
@@ -1425,9 +1275,7 @@ pub fn cargo_level_errors(output: &str) -> Vec<String> {
         .collect()
 }
 
-/// The package name inside a cargo `package_id`: `…#name@version`, or for a
-/// path package named as its directory `…/name#version`, or the older
-/// `name version (source)`.
+/// The package name inside a cargo `package_id`.
 #[must_use]
 pub fn package_id_name(id: &str) -> &str {
     let Some((url, frag)) = id.rsplit_once('#') else {
@@ -1444,9 +1292,6 @@ pub fn package_id_name(id: &str) -> &str {
 }
 
 /// Is `dir` inside `root`, both canonicalised (`/tmp` and `/private/tmp`
-/// name one place on macOS)?
-/// The summary's account of the in-repo crates the cell does not owe a
-/// triple artifact: its proc macros, and the crates only they reach.
 fn not_owed_note(proc_macros: &BTreeSet<String>, host_deps: &BTreeSet<String>) -> String {
     let mut kinds = Vec::new();
     if !proc_macros.is_empty() {
@@ -1465,11 +1310,7 @@ fn not_owed_note(proc_macros: &BTreeSet<String>, host_deps: &BTreeSet<String>) -
     format!(" ({} not owed: {})", kinds.join(" and "), names.join(", "))
 }
 
-/// The cell's packages cargo compiles for the HOST: every proc macro, and
-/// every package only proc macros reach. A proc macro's dependencies build
-/// with it, for the host, even in a cross build; a package some
-/// non-proc-macro path from the root also reaches compiles for the triple and
-/// stays owed.
+/// The cell's packages cargo compiles for the HOST: every proc macro, and every package only proc macros reach.
 pub fn host_side(graph: &Graph, is_proc_macro: impl Fn(&PkgId) -> bool) -> BTreeSet<PkgId> {
     let mut target = BTreeSet::from([graph.root.clone()]);
     let mut stack = vec![graph.root.clone()];
@@ -1546,7 +1387,6 @@ mod tests {
     }
 
     /// No `--cell` is the foreign cells; a name picks that cell, hosted or
-    /// not; an unknown name is refused.
     #[test]
     fn a_run_checks_the_foreign_cells_or_each_cell_named() {
         assert_eq!(selected(&[]).expect("default"), foreign_cells());
@@ -1603,7 +1443,6 @@ mod tests {
     }
 
     /// A test-only C oracle is live in the test-target pass alone; a stale
-    /// version or an unselected member's oracle is live in neither.
     #[test]
     fn a_test_only_c_oracle_is_shimmed_only_in_the_test_target_pass() {
         let normal = aterm_forge::resolve::parse_tree(
@@ -1643,9 +1482,6 @@ mod tests {
     }
 
     /// The test-target forest of a real (private, compiler-free) workspace
-    /// holds only the selected members, their dev-dependencies and their
-    /// target dependencies: no build-only or proc-macro subtree, no excluded
-    /// member's oracle.
     #[test]
     fn the_test_target_forest_has_only_selected_members_dev_and_target_dependencies() {
         let dir = aterm_tempfile::tempdir().expect("private resolver fixture");
@@ -1716,7 +1552,6 @@ mod tests {
         let (selected, excluded) = test_selection(&members, &normal, &BTreeSet::new());
         assert_eq!(selected, ["app", "decoder", "pm"]);
         assert_eq!(excluded, ["build-only", "ignored", "ignored-sys", "oracle"]);
-        // The targo that built this test, which resolves without compiling.
         let targo = PathBuf::from(env!("CARGO"));
         let path = std::env::var_os("PATH").unwrap_or_default();
         let forest = test_tree(&targo, &path, root, "x86_64-pc-windows-msvc", &excluded)
@@ -1728,18 +1563,12 @@ mod tests {
         let nodes = parse_test_forest(&forest, &roots).expect("the selected members' forest");
         let names: Vec<_> = nodes.iter().map(|id| id.name.as_str()).collect();
         assert_eq!(names, ["app", "decoder", "oracle"]);
-        // A truncated or overbroad forest must not authorize a shim.
         let one: BTreeSet<String> = ["app".to_string()].into_iter().collect();
         assert!(parse_test_forest("", &one).is_err());
         assert!(parse_test_forest("0other v1.0.0\n", &one).is_err());
     }
 
     /// A member a selected proc macro depends on is printed as two roots, its
-    /// target node and its host node (the SP.6 shape: aterm-serde-derive on
-    /// aterm-macro-support). The target copy is kept, and its target-only
-    /// dependency with it; the host copy, which the proc macro's tree prints
-    /// whole, is dropped, and its host-only dependency with it. A repeat no
-    /// proc macro explains stays refused.
     #[test]
     fn a_member_a_proc_macro_uses_is_read_as_its_target_copy() {
         let dir = aterm_tempfile::tempdir().expect("private resolver fixture");
@@ -1790,7 +1619,6 @@ mod tests {
              [[package]]\nname='win-only'\nversion='1.0.0'\n",
         )
         .expect("locked local dependency graph");
-        // The targo that built this test, which resolves without compiling.
         let targo = PathBuf::from(env!("CARGO"));
         let path = std::env::var_os("PATH").unwrap_or_default();
         let forest = test_tree(&targo, &path, root, "x86_64-pc-windows-msvc", &[])
@@ -1800,7 +1628,6 @@ mod tests {
         let found: Vec<_> = nodes.iter().map(|id| id.name.as_str()).collect();
         assert_eq!(found, ["app", "shared", "win-only"]);
 
-        // The same repeat with no proc macro to explain it is refused.
         let err = parse_test_forest(
             "0shared v1.0.0\n1win-only v1.0.0\n0shared v1.0.0\n1unix-only v1.0.0\n",
             &names(&["shared"]),
@@ -1827,7 +1654,6 @@ mod tests {
     }
 
     /// Only an artifact under the triple's own directory counts, a host unit
-    /// (a proc macro, a build script) never; test units only when asked.
     #[test]
     fn only_the_triples_own_artifacts_count() {
         let graph = names(&["a", "b", "c"]);
@@ -1856,10 +1682,6 @@ mod tests {
     }
 
     /// rustc's own warnings are the cell's: an item only another OS calls
-    /// (`dead_code`) or an import only it uses never warns on the host, so the
-    /// cell's compile is where it shows. Clippy's (its version is not the
-    /// host's), a count with no code, and a lint name this rustc predates are
-    /// not findings; a unit and its test twin warning alike are one.
     #[test]
     fn a_rustc_warning_is_a_cell_finding_and_a_clippy_one_is_the_hosts() {
         let graph = names(&["gui"]);
@@ -1900,8 +1722,6 @@ mod tests {
             ]
         );
         assert!(is_cell_warning(Some("unused_variables")));
-        // Linux and macOS are fleet OSes, every architecture of them; Windows
-        // is not, and is judged anyway; the browser is not judged.
         for (triple, judged) in [
             ("aarch64-unknown-linux-gnu", true),
             ("x86_64-unknown-linux-gnu", true),
@@ -1917,8 +1737,6 @@ mod tests {
         assert!(!is_cell_warning(Some("clippy::single_match")));
         assert!(!is_cell_warning(Some("renamed_and_removed_lints")));
         assert!(!is_cell_warning(None));
-        // On an OS a fleet machine runs, a run cargo calls a success is red on
-        // them, in either pass, and the detail carries the compiler's own text.
         for (tests, status) in [(false, "WARNING(2)"), (true, "TEST-TARGET-WARNING(2)")] {
             let run = exec::Run {
                 ok: true,
@@ -1933,8 +1751,6 @@ mod tests {
             assert_eq!(red.detail.len(), 2);
             assert!(red.detail[0].contains("launchctl_list"), "{:?}", red.detail);
         }
-        // Windows, which no fleet machine runs, is held to the same standard
-        // (WARNINGS_JUDGED_OFF_FLEET); the browser is held to errors only.
         let run = exec::Run {
             ok: true,
             output: out.clone(),
@@ -1954,7 +1770,6 @@ mod tests {
         read_cargo_run(&run, "wasm32-unknown-unknown", &graph, false, &mut red)
             .expect("the compiler ran");
         assert!(red.status.is_none(), "{:?}", red.detail);
-        // Negative control: the clippy-only stream leaves a cell green.
         let clippy_only = warning(
             r#"{"code":"clippy::duration_suboptimal_units","explanation":null}"#,
             "warning: constructing a `Duration` using a smaller unit",
@@ -1972,7 +1787,6 @@ mod tests {
     }
 
     /// Both passes can leave every owed artifact before cargo itself fails.
-    /// The artifacts establish coverage, never the compiler's final verdict.
     #[test]
     fn complete_cell_artifacts_do_not_make_a_failed_child_green() {
         let artifact = r#"{"reason":"compiler-artifact","package_id":"path+file:///r/app#app@1","profile":{"test":true},"filenames":["/t/x86_64-pc-windows-msvc/debug/app"]}"#;
@@ -2067,7 +1881,6 @@ mod tests {
     }
 
     /// The members the graph carries are selected; the rest are excluded,
-    /// except a patched one, whose exclusion would drop its patch.
     #[test]
     fn the_test_pass_selects_the_graph_and_never_excludes_a_patch() {
         let members = names(&["a", "b", "arrayvec", "z"]);
@@ -2078,7 +1891,6 @@ mod tests {
     }
 
     /// A crate only a proc macro reaches compiles for the host with it and is
-    /// not owed a target artifact; one a non-proc-macro path also reaches is.
     #[test]
     fn a_crate_only_proc_macros_reach_is_host_side() {
         let id = |n: &str| PkgId::new(n, "1.0.0");
@@ -2086,7 +1898,6 @@ mod tests {
             root: id("root"),
             ..Graph::default()
         };
-        // root -> lib -> pm -> only_pm, pm -> shared, root -> shared.
         for (from, to) in [
             ("root", "lib"),
             ("lib", "pm"),
@@ -2103,7 +1914,6 @@ mod tests {
             host.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
             ["only_pm", "pm"]
         );
-        // With no proc macro, everything compiles for the triple.
         assert!(super::host_side(&g, |_| false).is_empty());
     }
 
@@ -2132,7 +1942,6 @@ mod tests {
     }
 
     /// A cell's cargo builds in its own directory of the cells lane, capped at
-    /// the lane's jobs and never above the caller's own `CARGO_BUILD_JOBS`.
     #[test]
     fn a_cells_cargo_runs_in_the_cells_lane_under_its_job_cap() {
         let env_of = |caller: Option<&str>| {
@@ -2178,8 +1987,6 @@ mod tests {
     }
 
     /// Either Windows cell brings both windows-sys oracles, once each; a run
-    /// with no Windows cell runs neither. The driver builds in the cells
-    /// lane, and the oracle is told the checkout it holds.
     #[test]
     fn a_windows_cell_brings_both_windows_sys_oracles_built_in_the_cells_lane() {
         let all = aterm_forge::resolve::default_cells();
@@ -2236,7 +2043,6 @@ mod tests {
     }
 
     /// An oracle that decided nothing says why on its last `could not run`
-    /// line, which becomes the row's reason; a finding's output has none.
     #[test]
     fn a_win32_oracle_that_could_not_run_names_its_reason() {
         assert_eq!(

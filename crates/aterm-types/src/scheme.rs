@@ -1,19 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Named color schemes ("theme palettes") — the SINGLE source of truth for a
-//! terminal's colors, the way iTerm2 / Windows Terminal / Alacritty / Kitty do it.
-//!
-//! A [`ColorScheme`] bundles the foreground/background/cursor/selection chrome AND
-//! the full 16-entry ANSI palette. It projects to BOTH sinks the GUI drives:
-//!   * the renderer chrome — via [`ColorScheme::to_theme_parts`] (packed `u32`s the
-//!     GUI assembles into an `aterm_render::Theme`); and
-//!   * the engine indexed palette — via [`ColorScheme::to_color_palette`].
-//!
-//! It deliberately exposes ONLY [`Rgb`] / packed-`u32` primitives (never an
-//! `aterm_render::Theme`), so `aterm-types` stays at the bottom of the crate graph
-//! (`aterm-render -> aterm-core -> aterm-types`); the `Theme`/`TerminalConfig`
-//! projections live in `aterm-gui`, which already owns both.
+//! Named color schemes ("theme palettes") — the SINGLE source of truth for a terminal's colors, the way iTerm2 / Windows Terminal / Alacritty / Kitty do it.
 
 use crate::{ColorPalette, Rgb};
 
@@ -22,13 +10,10 @@ pub use crate::scheme_typography::{
     MAX_THEME_FONT_NAME_CHARS, THEME_SCHEMA_VERSION, ThemeTypography,
 };
 
-/// Maximum bytes admitted from one user theme definition. Shared by direct
-/// loaders and GUI catalog discovery so every entry point has the same bound.
+/// Maximum bytes admitted from one user theme definition.
 pub const MAX_USER_THEME_FILE_BYTES: usize = 256 * 1024;
 
-/// Whether a scheme is meant for a dark or light background. Drives the optional
-/// `dark:…,light:…` auto-split, which `aterm-gui` resolves against the window's
-/// appearance; carried here so a scheme is self-describing.
+/// Whether a scheme is meant for a dark or light background.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum Appearance {
@@ -40,9 +25,7 @@ pub enum Appearance {
 }
 
 impl Appearance {
-    /// The DEC color-scheme DSR parameter for this appearance (`1` = dark,
-    /// `2` = light), as reported via DSR `CSI ? 996 n` → `CSI ? 997 ; Ps n` and
-    /// the DEC mode 2031 push.
+    /// The DEC color-scheme DSR parameter for this appearance (`1` = dark, `2` = light), as reported via DSR `CSI ? 996 n` → `CSI ? 997 ; Ps n` and the DEC mode 2031 push.
     #[inline]
     #[must_use]
     pub const fn dsr_code(self) -> u8 {
@@ -53,9 +36,7 @@ impl Appearance {
     }
 }
 
-/// The renderer chrome of a scheme as packed `0x00RRGGBB` values — the exact shape
-/// `aterm_render::Theme` wants, but as plain `u32`s so this crate need not depend on
-/// the renderer (no crate cycle). The GUI builds the `Theme` from these.
+/// The renderer chrome of a scheme as packed `0x00RRGGBB` values — the exact shape `aterm_render::Theme` wants, but as plain `u32`s so this crate need not depend on the renderer (no crate cycle).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ThemeParts {
     /// Default foreground / window clear foreground.
@@ -82,37 +63,23 @@ pub struct ColorScheme {
     pub background: Rgb,
     /// Cursor color; `None` follows the foreground (matches the engine's fallback).
     pub cursor: Option<Rgb>,
-    /// Selection highlight bg; `None` derives one from this scheme's own
-    /// background and foreground ([`derived_selection`]), so a light theme
-    /// that leaves it out gets a light band and a dark one a dark band.
+    /// Selection highlight bg; `None` derives one from this scheme's own background and foreground ([`derived_selection`]), so a light theme that leaves it out gets a light band and a dark one a dark band.
     pub selection: Option<Rgb>,
-    /// Text colour inside the selection; `None` keeps each cell's own colour
-    /// (the renderer floors it against the selection). A theme file sets it
-    /// with `selection_foreground`; no built-in sets it.
+    /// Text colour inside the selection; `None` keeps each cell's own colour (the renderer floors it against the selection).
     #[cfg_attr(
         feature = "serde",
         serde(default, skip_serializing_if = "Option::is_none")
     )]
     pub selection_fg: Option<Rgb>,
-    /// The 16 ANSI slots: `[0..8)` normal (black, red, green, yellow, blue, magenta,
-    /// cyan, white), `[8..16)` their bright variants. THE authoritative ANSI table.
+    /// The 16 ANSI slots: `0..8)` normal (black, red, green, yellow, blue, magenta, cyan, white), `8..16)` their bright variants.
     pub ansi: [Rgb; 16],
-    /// The colours of aterm's own chrome the theme authors (`accent_color`,
-    /// `active_tab_color`, `border_color`, `search_match_color`); empty for
-    /// every built-in. Not projected by [`Self::to_theme_parts`]: the
-    /// renderer's grid never draws chrome; `aterm-gui` derives the chrome
-    /// tokens from these.
+    /// The colours of aterm's own chrome the theme authors (`accent_color`, `active_tab_color`, `border_color`, `search_match_color`); empty for every built-in.
     #[cfg_attr(
         feature = "serde",
         serde(default, skip_serializing_if = "ChromeColors::is_empty")
     )]
     pub chrome: ChromeColors,
-    /// Whether slots 16-255 derive from this scheme's own colours
-    /// ([`crate::scheme_palette256::generated_extended_palette`]) instead of
-    /// keeping xterm's cube and grey ramp. A theme file opts in with
-    /// `palette_generate = true`; of the built-ins only aterm's signature
-    /// themes do. `false` for Default, so an empty config keeps today's
-    /// colours.
+    /// Whether slots 16-255 derive from this scheme's own colours ([`crate::scheme_palette256::generated_extended_palette`]) instead of keeping xterm's cube and grey ramp.
     #[cfg_attr(
         feature = "serde",
         serde(default, skip_serializing_if = "core::ops::Not::not")
@@ -120,14 +87,11 @@ pub struct ColorScheme {
     pub palette_generate: bool,
 }
 
-/// The chrome colours a theme may author: each is optional and each is also
-/// an `aterm.toml` key spelled the same way, which beats the theme's. Every
-/// one is still held to its floor where it is drawn.
+/// The chrome colours a theme may author: each is optional and each is also an `aterm.toml` key spelled the same way, which beats the theme's.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ChromeColors {
-    /// `accent_color`: the active-tab rule, the message band's meter,
-    /// Settings' selected rows, the find highlight's hue.
+    /// `accent_color`: the active-tab rule, the message band's meter, Settings' selected rows, the find highlight's hue.
     #[cfg_attr(
         feature = "serde",
         serde(default, skip_serializing_if = "Option::is_none")
@@ -174,10 +138,9 @@ impl ChromeColors {
         }
     }
 
-    /// The slot a chrome key sets, to write; `None` for a key that is not a
-    /// chrome key.
+    /// The slot a chrome key sets, to write; `None` for a key that is not a chrome key.
     #[inline]
-    pub fn slot_mut(&mut self, key: ThemeKey) -> Option<&mut Option<Rgb>> {
+    pub const fn slot_mut(&mut self, key: ThemeKey) -> Option<&mut Option<Rgb>> {
         match key {
             ThemeKey::AccentColor => Some(&mut self.accent),
             ThemeKey::ActiveTabColor => Some(&mut self.active_tab),
@@ -189,23 +152,14 @@ impl ChromeColors {
 }
 
 /// Default's selection colour (`aterm_render::Theme::default().selection`,
-/// `#33415E`). A scheme that leaves `selection` as `None` does not get it:
-/// it gets [`derived_selection`], which follows its own background.
-///
-/// Selected coloured text keeps its own fg, so `#33415E` keeps mid-tone syntax
-/// colours (magenta, comment-gray, blue) readable (>~3:1) while still reading
-/// clearly as a selection against the `#111318` background.
 const SELECTION_DEFAULT: Rgb = Rgb::new(0x33, 0x41, 0x5E);
 
 impl Default for ColorScheme {
     /// Default color scheme: fg `#D0D0D0`, bg `#111318`, cursor
-    /// `#50FA7B`, selection `SELECTION_DEFAULT` (`#33415E`), and `ansi[i] == ColorPalette::default_color(i)`.
     fn default() -> Self {
         let mut ansi = [Rgb::new(0, 0, 0); 16];
         for (i, slot) in ansi.iter_mut().enumerate() {
             // `i` indexes a 16-entry array, so `i <= 15` and `& 0xF` is
-            // identity — the mask only proves the narrowing lossless to the
-            // Trust gate.
             *slot = ColorPalette::default_color((i & 0xF) as u8);
         }
         Self {
@@ -224,20 +178,12 @@ impl Default for ColorScheme {
 }
 
 impl ColorScheme {
-    /// Build the engine indexed palette from this scheme: each of the 16 ANSI slots
-    /// is applied via [`ColorPalette::set`]. Indices 16-255 stay the computed xterm
-    /// cube/ramp unless [`Self::palette_generate`] is set, when they are
-    /// [`crate::scheme_palette256::generated_extended_palette`] of the ANSI
-    /// slots, foreground and background.
-    /// (`set` elides a slot that equals `default_color(i)`, but that is
-    /// render-identical: `get(i)` then falls back to the same `default_color(i)`.)
+    /// Build the engine indexed palette from this scheme: each of the 16 ANSI slots is applied via [`ColorPalette::set`].
     #[must_use]
     pub fn to_color_palette(&self) -> ColorPalette {
         let mut p = ColorPalette::new();
         for (i, c) in self.ansi.iter().enumerate() {
             // `i` indexes the 16-entry `ansi` array, so `i <= 15` and `& 0xF`
-            // is identity — the mask only proves the narrowing lossless to the
-            // Trust gate.
             p.set((i & 0xF) as u8, *c);
         }
         if self.palette_generate {
@@ -253,8 +199,7 @@ impl ColorScheme {
         p
     }
 
-    /// Project the chrome to packed `0x00RRGGBB` [`ThemeParts`]. `cursor` falls back
-    /// to the foreground and `selection` to [`Self::selection_band`] when unset.
+    /// Project the chrome to packed `0x00RRGGBB` [`ThemeParts`].
     #[inline]
     #[must_use]
     pub const fn to_theme_parts(&self) -> ThemeParts {
@@ -273,8 +218,7 @@ impl ColorScheme {
         }
     }
 
-    /// The selection band this scheme paints: its own `selection`, else one
-    /// derived from its background and foreground ([`derived_selection`]).
+    /// The selection band this scheme paints: its own `selection`, else one derived from its background and foreground ([`derived_selection`]).
     #[inline]
     #[must_use]
     pub const fn selection_band(&self) -> Rgb {
@@ -285,24 +229,16 @@ impl ColorScheme {
     }
 }
 
-/// How far an unset selection band sits from the background toward the
-/// foreground, in percent: far enough to read as a band (about 1.5:1 on the
-/// background for a normal-contrast theme), near enough that text on it keeps
-/// most of its contrast.
+/// How far an unset selection band sits from the background toward the foreground, in percent: far enough to read as a band (about 1.5:1 on the background for a normal-contrast theme), near enough that text on it keeps most of its contrast.
 pub const DERIVED_SELECTION_PERCENT: u16 = 22;
 
-/// The selection band for a scheme that does not name one: `bg` moved
-/// [`DERIVED_SELECTION_PERCENT`] of the way toward `fg`, per sRGB channel,
-/// rounded. It sits on the background's side of the theme, so a light theme
-/// gets a light band, and it follows a background a config overrides.
+/// The selection band for a scheme that does not name one: `bg` moved [`DERIVED_SELECTION_PERCENT`] of the way toward `fg`, per sRGB channel, rounded.
 #[inline]
 #[must_use]
 pub const fn derived_selection(fg: Rgb, bg: Rgb) -> Rgb {
     const fn mix(b: u8, f: u8) -> u8 {
         let toward = DERIVED_SELECTION_PERCENT;
         let away = 100 - toward;
-        // At most 255 * 100 + 50, so it fits a u16, and the quotient is at
-        // most 255.
         let blended = ((b as u16) * away + (f as u16) * toward + 50) / 100;
         (blended & 0xFF) as u8
     }
@@ -310,8 +246,6 @@ pub const fn derived_selection(fg: Rgb, bg: Rgb) -> Rgb {
 }
 
 /// A compile-time built-in scheme: all-`Rgb` (const-constructible) so the registry
-/// lives in `.rodata` with no allocation. Materialized into a [`ColorScheme`] (which
-/// owns a `String` name) on lookup.
 struct Builtin {
     name: &'static str,
     appearance: Appearance,
@@ -320,8 +254,6 @@ struct Builtin {
     /// The same family's built-in for the other appearance, if aterm ships it.
     pair: Option<&'static str>,
     /// One of aterm's own signature themes, which `builtin_names` lists right
-    /// after Default and the `signature_themes_meet_their_bars` test holds to
-    /// the stricter signature laws.
     signature: bool,
     /// The project a port's palette comes from; `None` for aterm's own.
     source: Option<BuiltinSource>,
@@ -333,7 +265,7 @@ struct Builtin {
 }
 
 impl Builtin {
-    fn identity(&self) -> BuiltinTheme {
+    const fn identity(&self) -> BuiltinTheme {
         BuiltinTheme {
             name: self.name,
             appearance: self.appearance,
@@ -355,30 +287,17 @@ impl Builtin {
             selection_fg: None,
             ansi: self.ansi,
             chrome: ChromeColors::default(),
-            // aterm's own signature themes derive slots 16-255; a port keeps
-            // xterm's, which its upstream (and every 256-colour scheme
-            // written against it) assumes.
             palette_generate: self.signature,
         }
     }
 }
 
-// Shorthand for terse, readable palette tables below.
 const fn c(r: u8, g: u8, b: u8) -> Rgb {
     Rgb::new(r, g, b)
 }
 
 /// The bundled, well-known schemes (canonical values verified against
-/// github.com/mbadolato/iTerm2-Color-Schemes). `"Default"` is NOT here — it is
-/// served from [`ColorScheme::default`] so the historical look has one source.
 static BUILTINS: &[Builtin] = &[
-    // ── aterm's signature themes ──────────────────────────────────────────────
-    // Two light/dark pairs designed here in OkLCh rather than ported: the six
-    // chromatic hues at least 25° apart at one lightness per tier, their
-    // chroma in one band so no hue shouts, every chromatic slot at 4.5:1 on
-    // the background, body text at 7:1, color8 (comments, autosuggestions)
-    // between 3:1 and 4.5:1, a 1.5:1 selection band and a cursor in the
-    // theme's accent hue. `signature_themes_meet_their_bars` holds all of it.
     Builtin {
         name: "Aterm Night",
         appearance: Appearance::Dark,
@@ -499,13 +418,6 @@ static BUILTINS: &[Builtin] = &[
             c(0x33, 0x22, 0x19),
         ],
     },
-    // Palette values verified against github.com/mbadolato/iTerm2-Color-Schemes and
-    // each theme's own spec. NOTE: Nord and Catppuccin's canonical files list a
-    // near-WHITE selection (their selection-*foreground*); the built-ins carry no
-    // selection foreground (selected text keeps its own colour, which the renderer
-    // floors to 4.5:1 against the selection), so a near-white surface would wash
-    // selected text out. Those are replaced with each theme's proper dark
-    // selection surface (Nord nord3 #4c566a, Catppuccin Surface2 #585b70).
     Builtin {
         name: "Dracula",
         appearance: Appearance::Dark,
@@ -587,12 +499,7 @@ static BUILTINS: &[Builtin] = &[
         }),
         fg: c(0xc0, 0xca, 0xf5),
         bg: c(0x1a, 0x1b, 0x26),
-        // Accent blue, not the fg lavender — a fg-coloured full-cell block reads as a
-        // pale, heavy slab, heavier than the glyphs. The blue cursor
-        // reads as a cursor and stays distinct from text.
         cursor: c(0x7a, 0xa2, 0xf7),
-        // Upstream's visual-mode colour #33467c (the #283457 terminal port was
-        // 1.4:1 on the background).
         selection: c(0x33, 0x46, 0x7c),
         ansi: [
             c(0x15, 0x16, 0x1e),
@@ -603,9 +510,6 @@ static BUILTINS: &[Builtin] = &[
             c(0xbb, 0x9a, 0xf7),
             c(0x7d, 0xcf, 0xff),
             c(0xa9, 0xb1, 0xd6),
-            // bright-black / "dim" tier lifted #414868 -> #7a82a8: the stock comment
-            // grey was only ~2.8:1 on this very dark navy (below WCAG AA); now ~4.5:1
-            // so de-emphasised/secondary text stays legible while still clearly dimmer.
             c(0x7a, 0x82, 0xa8),
             c(0xff, 0x89, 0x9d),
             c(0x9f, 0xe0, 0x44),
@@ -666,7 +570,6 @@ static BUILTINS: &[Builtin] = &[
         cursor: c(0xeb, 0xdb, 0xb2),
         selection: c(0x66, 0x5c, 0x54),
         ansi: [
-            // Upstream black is bg0 itself (invisible text); Gruvbox bg1.
             c(0x3c, 0x38, 0x36),
             c(0xcc, 0x24, 0x1d),
             c(0x98, 0x97, 0x1a),
@@ -699,9 +602,6 @@ static BUILTINS: &[Builtin] = &[
         fg: c(0x83, 0x94, 0x96),
         bg: c(0x00, 0x2b, 0x36),
         cursor: c(0x83, 0x94, 0x96),
-        // Upstream selection is base02 #073642, 1.15:1 on base03 (and equal to
-        // color0); a base03-toward-base01 step at 1.5:1 that keeps base0 text
-        // above 3:1 on it.
         selection: c(0x1e, 0x49, 0x55),
         ansi: [
             c(0x07, 0x36, 0x42),
@@ -736,12 +636,8 @@ static BUILTINS: &[Builtin] = &[
         fg: c(0xab, 0xb2, 0xbf),
         bg: c(0x21, 0x25, 0x2b),
         cursor: c(0xab, 0xb2, 0xbf),
-        // One Dark's own editor selection #3e4451 (the terminal port's #323844
-        // was 1.3:1 on the background).
         selection: c(0x3e, 0x44, 0x51),
         ansi: [
-            // The port's black is the background itself, so `\e[30m` text was
-            // invisible; One Dark's cursor-line grey #2c313a stays a near-black.
             c(0x2c, 0x31, 0x3a),
             c(0xe0, 0x6c, 0x75),
             c(0x98, 0xc3, 0x79),
@@ -760,25 +656,6 @@ static BUILTINS: &[Builtin] = &[
             c(0xab, 0xb2, 0xbf),
         ],
     },
-    // ── Light schemes ─────────────────────────────────────────────────────────
-    // Light counterparts so the OS-appearance bridge (`aterm-gui` feeds the live
-    // `winit` light/dark theme into the engine) has a real light scheme to switch
-    // to. Same provenance as the dark set (github.com/mbadolato/iTerm2-Color-Schemes,
-    // ghostty format). NOTE: several upstream light files set `selection` to the dark
-    // *foreground* (they rely on a theme-supplied selection foreground, which aterm
-    // themes do not carry — selected text keeps its own colour and the renderer only
-    // floors it to 4.5:1). Those would render selected text dark-on-dark, readable
-    // only through that floor, so each is replaced with that theme's proper LIGHT
-    // selection surface — the mirror of the Nord/Catppuccin dark-selection fix above.
-    // The `light_builtins_are_light_and_selection_legible` test guards every substitution.
-    // aterm's own light look, the light half of Default: the same neutral
-    // grey ink and green cursor family. On a light ground the bright tier is
-    // the deeper one: brights 9-14 keep their own OkLCh hue and chroma one
-    // shared step (L -0.06) below their normals, so each is at least 0.05
-    // OkLab from its normal (ls shows both) and 6:1 or more on the
-    // background; color15 is a dark slate between color8 and the ink, 7.9:1.
-    // Default's pair: Settings' Follow system switch writes
-    // `dark:Default,light:Default Light`; an unset theme stays Default.
     Builtin {
         name: "Default Light",
         appearance: Appearance::Light,
@@ -820,13 +697,9 @@ static BUILTINS: &[Builtin] = &[
             url: "https://github.com/altercation/solarized",
             licence: "MIT",
         }),
-        // base01, Solarized's emphasised-content tone: upstream's base00
-        // #657b83 is 4.1:1 on base3, below the 4.5:1 body-text floor.
         fg: c(0x58, 0x6e, 0x75),
         bg: c(0xfd, 0xf6, 0xe3),
         cursor: c(0x58, 0x6e, 0x75),
-        // Upstream selection is base2 #eee8d5, 1.14:1 on base3 (a selection
-        // nobody can see); a base3-toward-base1 step at 1.5:1.
         selection: c(0xcf, 0xc9, 0xb7),
         ansi: [
             c(0x07, 0x36, 0x42),
@@ -844,7 +717,6 @@ static BUILTINS: &[Builtin] = &[
             c(0x83, 0x94, 0x96),
             c(0x6c, 0x71, 0xc4),
             c(0x93, 0xa1, 0xa1),
-            // Upstream bright white is base3, the background itself; base2.
             c(0xee, 0xe8, 0xd5),
         ],
     },
@@ -862,12 +734,8 @@ static BUILTINS: &[Builtin] = &[
         fg: c(0x3c, 0x38, 0x36),
         bg: c(0xfb, 0xf1, 0xc7),
         cursor: c(0x3c, 0x38, 0x36),
-        // Upstream selection is the dark fg #3c3836 (invisible as a bg highlight);
-        // replaced with Gruvbox light3 #bdae93 — the mirror of dark3 #665c54 used by
-        // Gruvbox Dark above.
         selection: c(0xbd, 0xae, 0x93),
         ansi: [
-            // Upstream black is bg0 itself (invisible text); Gruvbox light1.
             c(0xeb, 0xdb, 0xb2),
             c(0xcc, 0x24, 0x1d),
             c(0x98, 0x97, 0x1a),
@@ -899,12 +767,7 @@ static BUILTINS: &[Builtin] = &[
         }),
         fg: c(0x4c, 0x4f, 0x69),
         bg: c(0xef, 0xf1, 0xf5),
-        // Rosewater, deepened (upstream #dc8a78 is 2.3:1 on the background, a
-        // cursor that vanishes): upstream's own OkLCh hue and chroma at
-        // lightness 0.61, 3.5:1.
         cursor: c(0xb9, 0x6a, 0x59),
-        // Upstream selection is the Rosewater accent; replaced with Latte Surface2
-        // #acb0be — the mirror of the Mocha Surface2 #585b70 substitution above.
         selection: c(0xac, 0xb0, 0xbe),
         ansi: [
             c(0xbc, 0xc0, 0xcc),
@@ -938,9 +801,7 @@ static BUILTINS: &[Builtin] = &[
         }),
         fg: c(0x1f, 0x23, 0x28),
         bg: c(0xff, 0xff, 0xff),
-        cursor: c(0x09, 0x69, 0xda), // GitHub accent blue — upstream value, highly legible
-        // Upstream selection is the dark fg #1f2328 (invisible as a bg highlight);
-        // replaced with Primer blue-2 #80ccff (blue-1 #b6e3ff was 1.36:1 on white).
+        cursor: c(0x09, 0x69, 0xda),
         selection: c(0x80, 0xcc, 0xff),
         ansi: [
             c(0x24, 0x29, 0x2f),
@@ -963,8 +824,7 @@ static BUILTINS: &[Builtin] = &[
     },
 ];
 
-/// Look up a built-in scheme by name (case-insensitive). `"Default"` resolves to
-/// [`ColorScheme::default`]; every other name is searched in [`struct@BUILTINS`].
+/// Look up a built-in scheme by name (case-insensitive).
 #[must_use]
 pub fn builtin(name: &str) -> Option<ColorScheme> {
     if name.eq_ignore_ascii_case(DEFAULT_THEME.name) {
@@ -976,23 +836,17 @@ pub fn builtin(name: &str) -> Option<ColorScheme> {
         .map(Builtin::to_scheme)
 }
 
-/// All built-in scheme names (for `--list-themes` and config diagnostics), with
-/// `"Default"` first.
+/// All built-in scheme names (for `--list-themes` and config diagnostics), with `"Default"` first.
 #[must_use]
-// Skip: iterator/collect absent std bodies.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn builtin_names() -> Vec<&'static str> {
-    // `.min(64)` before the `+ 1` gives the Trust gate a literal upper bound on
-    // the reservation (BUILTINS has far fewer than 64 entries, so the clamp is
-    // never reached and the reserved capacity is unchanged in practice).
     let mut v = Vec::with_capacity(BUILTINS.len().min(64) + 1);
     v.push(DEFAULT_THEME.name);
     v.extend(BUILTINS.iter().map(|b| b.name));
     v
 }
 
-/// The identity half of a built-in theme: what listings, the picker and the
-/// split resolver need without materializing its colours.
+/// The identity half of a built-in theme: what listings, the picker and the split resolver need without materializing its colours.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BuiltinTheme {
     /// Canonical spelling (what `theme = "…"` and listings show).
@@ -1002,18 +856,14 @@ pub struct BuiltinTheme {
     /// One line for listings and the picker.
     pub description: &'static str,
     /// The same family's built-in for the other appearance, if aterm ships one.
-    /// Pairs are symmetric and always cross appearances.
     pub pair: Option<&'static str>,
     /// One of aterm's own signature themes (listed right after Default).
     pub signature: bool,
-    /// Where a ported palette comes from, for its licence notice; `None` for
-    /// the themes designed here.
+    /// Where a ported palette comes from, for its licence notice; `None` for the themes designed here.
     pub source: Option<BuiltinSource>,
 }
 
-/// The upstream project a built-in port's palette is taken from, and the
-/// licence it is used under. `aterm theme pack --licences` and the pack's
-/// ATTRIBUTION.md print one notice per project.
+/// The upstream project a built-in port's palette is taken from, and the licence it is used under.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BuiltinSource {
     /// `owner/repo` on GitHub.
@@ -1025,7 +875,6 @@ pub struct BuiltinSource {
 }
 
 /// `Default` lives in [`ColorScheme::default`], not [`struct@BUILTINS`]; this is
-/// its identity row.
 const DEFAULT_THEME: BuiltinTheme = BuiltinTheme {
     name: "Default",
     appearance: Appearance::Dark,
@@ -1049,67 +898,49 @@ pub fn builtin_theme(name: &str) -> Option<BuiltinTheme> {
 
 /// Every built-in theme's identity, `Default` first, in registry order.
 #[must_use]
-// Skip: iterator/collect absent std bodies.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn builtin_theme_list() -> Vec<BuiltinTheme> {
-    // `.min(64)` before the `+ 1` gives the Trust gate a literal upper bound on
-    // the reservation (see `builtin_names`).
     let mut v = Vec::with_capacity(BUILTINS.len().min(64) + 1);
     v.push(DEFAULT_THEME);
     v.extend(BUILTINS.iter().map(Builtin::identity));
     v
 }
 
-/// The built-in paired with `name` for the other appearance (canonical
-/// spelling), or `None` when `name` is not a built-in or has no pair.
+/// The built-in paired with `name` for the other appearance (canonical spelling), or `None` when `name` is not a built-in or has no pair.
 #[must_use]
 pub fn builtin_pair(name: &str) -> Option<&'static str> {
     builtin_theme(name)?.pair
 }
 
-/// All built-in schemes as `(name, description)` pairs, `"Default"` first — the
-/// data behind `aterm list-themes`. Reads [`builtin_theme_list`] so the set
-/// and its descriptions can't drift from the registry.
+/// All built-in schemes as `(name, description)` pairs, `"Default"` first — the data behind `aterm list-themes`.
 #[must_use]
 pub fn builtin_themes() -> Vec<(&'static str, &'static str)> {
     builtin_theme_list()
         .into_iter()
-        // `.take(64)` is identity — the list holds `BUILTINS.len() + 1`
-        // entries (about a dozen) — but it hands the `collect` a literal
-        // element bound so the Trust gate can prove the allocation bounded.
         .take(64)
         .map(|theme| (theme.name, theme.description))
         .collect()
 }
 
 /// Error from parsing a disk theme definition ([`parse_scheme_str`]).
-/// Stringly-typed line context so a bad user theme file produces an actionable
-/// diagnostic rather than a silent fallback.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ThemeError {
-    /// A line was syntactically malformed (no `=`, bad colour, unknown or
-    /// duplicate key, over-long text), or a required key was missing.
+    /// A line was syntactically malformed (no `=`, bad colour, unknown or duplicate key, over-long text), or a required key was missing.
     Parse {
-        /// 1-based line number of the offending line (`0` for a whole-file problem
-        /// such as a missing required key).
+        /// 1-based line number of the offending line (`0` for a whole-file problem such as a missing required key).
         line: usize,
         /// Short human-readable reason for the failure.
         reason: String,
-        /// The key the failure is about, canonically spelled (`foreground`,
-        /// `color3`), or as written for an unknown key; `None` for a line
-        /// with no key.
+        /// The key the failure is about, canonically spelled (`foreground`, `color3`), or as written for an unknown key; `None` for a line with no key.
         key: Option<String>,
-        /// The other terminal's theme format the file looks like, when it looks
-        /// like one ([`sniff_foreign_format`]); such a file is converted with
-        /// `aterm theme import`, never read natively.
+        /// The other terminal's theme format the file looks like, when it looks like one ([`sniff_foreign_format`]); such a file is converted with `aterm theme import`, never read natively.
         foreign_format: Option<ForeignFormat>,
     },
 }
 
 impl ThemeError {
     /// A [`ThemeError::Parse`] at `line` about `key` with no foreign-format
-    /// hint.
-    fn at(line: usize, key: Option<String>, reason: String) -> Self {
+    const fn at(line: usize, key: Option<String>, reason: String) -> Self {
         ThemeError::Parse {
             line,
             reason,
@@ -1121,10 +952,6 @@ impl ThemeError {
 
 impl core::fmt::Display for ThemeError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        // Trust gate: `write_str` instead of `write!` — runtime-argument
-        // `format_args!` cannot be lowered natively. Byte-identical: nested
-        // `{…}` always formats with default options, exactly like
-        // `to_string`/`debug_string`.
         match self {
             ThemeError::Parse {
                 line,
@@ -1149,9 +976,7 @@ impl core::fmt::Display for ThemeError {
 
 impl std::error::Error for ThemeError {}
 
-/// Another terminal's theme file format, recognised by its shape so a parse
-/// error can say what the file is and how to bring it in
-/// (`aterm theme import`). The native parser never reads these formats.
+/// Another terminal's theme file format, recognised by its shape so a parse error can say what the file is and how to bring it in (`aterm theme import`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ForeignFormat {
     /// kitty: whitespace-separated `key value` lines (`foreground #c0caf5`).
@@ -1169,7 +994,7 @@ pub enum ForeignFormat {
 impl ForeignFormat {
     /// The user-facing name of the format.
     #[must_use]
-    pub fn label(self) -> &'static str {
+    pub const fn label(self) -> &'static str {
         match self {
             ForeignFormat::Kitty => "kitty",
             ForeignFormat::Ghostty => "Ghostty",
@@ -1180,12 +1005,7 @@ impl ForeignFormat {
     }
 }
 
-/// Guess which other terminal's theme format `text` is written in, or `None`
-/// when it does not look like any of them. Pure and bounded by the text: it
-/// reads each line once and stops at the first decisive one. Container shapes
-/// (plist, JSON) are decided by the document's opening; line shapes (TOML,
-/// kitty, Ghostty) by the first line that only that format writes. aterm's own
-/// format (`key = value`, unquoted values, underscore keys) matches none.
+/// Guess which other terminal's theme format `text` is written in, or `None` when it does not look like any of them.
 #[must_use]
 pub fn sniff_foreign_format(text: &str) -> Option<ForeignFormat> {
     let head = text.trim_start_matches('\u{feff}').trim_start();
@@ -1208,7 +1028,6 @@ pub fn sniff_foreign_format(text: &str) -> Option<ForeignFormat> {
             if line.starts_with('[') && line.ends_with(']') {
                 return Some(ForeignFormat::Toml);
             }
-            // kitty: `key value` with an identifier key and a colour value.
             let mut tokens = line.split_whitespace();
             if let (Some(key), Some(value)) = (tokens.next(), tokens.next())
                 && !key.is_empty()
@@ -1221,11 +1040,9 @@ pub fn sniff_foreign_format(text: &str) -> Option<ForeignFormat> {
         };
         let key = key.trim();
         let value = value.trim();
-        // TOML: a quoted or array value (`foreground = "#c0caf5"`, `ansi = [ … ]`).
         if value.starts_with('"') || value.starts_with('\'') || value.starts_with('[') {
             return Some(ForeignFormat::Toml);
         }
-        // Ghostty: `palette = N=#hex`, or a hyphenated key (`cursor-color`).
         if (key.eq_ignore_ascii_case("palette") && value.contains('=')) || key.contains('-') {
             return Some(ForeignFormat::Ghostty);
         }
@@ -1233,13 +1050,7 @@ pub fn sniff_foreign_format(text: &str) -> Option<ForeignFormat> {
     None
 }
 
-/// Parse a theme colour: `#RRGGBB` (the `#` optional) or `#RGB` (the `#`
-/// required, so a bare word such as `bad` or `fed` stays an error rather than
-/// a colour), surrounding whitespace ignored. `#RGB` widens each digit to a
-/// byte (`#abc` is `#aabbcc`), as the OSC colour specs do. `None` on malformed input. The one
-/// hex-colour reader for theme files, so every reader of a theme colour
-/// accepts the same spellings.
-// Skip: radix parse absent std body; malformed input returns None.
+/// Parse a theme colour: `#RRGGBB` (the `#` optional) or `#RGB` (the `#` required, so a bare word such as `bad` or `fed` stays an error rather than a colour), surrounding whitespace ignored.
 #[cfg_attr(trust_verify, trust::skip)]
 #[must_use]
 pub fn parse_hex(s: &str) -> Option<Rgb> {
@@ -1249,9 +1060,6 @@ pub fn parse_hex(s: &str) -> Option<Rgb> {
     if !h.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
     }
-    // Every byte is an ASCII hex digit, so each total `get(..)` below is on a
-    // char boundary and in bounds for its length arm; it carries no
-    // slice-bounds obligation for the Trust gate.
     match h.len() {
         6 => Some(Rgb::new(
             u8::from_str_radix(h.get(0..2)?, 16).ok()?,
@@ -1259,7 +1067,6 @@ pub fn parse_hex(s: &str) -> Option<Rgb> {
             u8::from_str_radix(h.get(4..6)?, 16).ok()?,
         )),
         3 if hashed => {
-            // One digit `d` stands for the byte `dd`, i.e. `d * 17`.
             let nibble = |range: core::ops::Range<usize>| {
                 u8::from_str_radix(h.get(range)?, 16)
                     .ok()
@@ -1272,12 +1079,9 @@ pub fn parse_hex(s: &str) -> Option<Rgb> {
 }
 
 /// Longest `name`, `description` or `author` a theme file may carry, in chars.
-/// These are shown in the theme picker and listings; a bound keeps one file
-/// from flooding them.
 pub const MAX_THEME_TEXT_CHARS: usize = 256;
 
-/// A disk theme file as read by [`parse_theme_str`]: the colours plus the
-/// identity text that is not part of a [`ColorScheme`].
+/// A disk theme file as read by [`parse_theme_str`]: the colours plus the identity text that is not part of a [`ColorScheme`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedTheme {
     /// The colours, name and appearance.
@@ -1286,32 +1090,24 @@ pub struct ParsedTheme {
     pub description: Option<String>,
     /// The file's `author`, if any.
     pub author: Option<String>,
-    /// Whether the file set `appearance` itself. When it did not,
-    /// `scheme.appearance` is a `Dark` placeholder until admission
-    /// ([`ThemeMeta::admit`]) writes the measured one.
+    /// Whether the file set `appearance` itself.
     pub appearance_declared: bool,
-    /// The type settings the file names ([`ThemeTypography::NONE`] when it
-    /// names none). aterm.toml keys of the same name win over them.
+    /// The type settings the file names ([`ThemeTypography::NONE`] when it names none). aterm.toml keys of the same name win over them.
     pub typography: ThemeTypography,
-    /// The file's `bold_is_bright`: a colour rung under aterm.toml's key of
-    /// the same name.
+    /// The file's `bold_is_bright`: a colour rung under aterm.toml's key of the same name.
     pub bold_is_bright: Option<bool>,
     /// The file's `schema` line, if it has one.
     pub schema: Option<u16>,
-    /// Keys a newer-schema file sets that this aterm does not know: skipped,
-    /// at most [`MAX_SKIPPED_THEME_KEYS`] names of at most
-    /// [`MAX_SKIPPED_THEME_KEY_BYTES`] bytes each.
+    /// Keys a newer-schema file sets that this aterm does not know: skipped, at most [`MAX_SKIPPED_THEME_KEYS`] names of at most [`MAX_SKIPPED_THEME_KEY_BYTES`] bytes each.
     pub skipped_keys: Vec<String>,
     /// How many keys were skipped, in full.
     pub skipped_count: u16,
 }
 
 impl ParsedTheme {
-    /// A theme that carries colours and identity only: no typography, no
-    /// `bold_is_bright`, no `schema` line and nothing skipped. What a
-    /// built-in, an import and a colours-only writer describe.
+    /// A theme that carries colours and identity only: no typography, no `bold_is_bright`, no `schema` line and nothing skipped.
     #[must_use]
-    pub fn colours_only(
+    pub const fn colours_only(
         scheme: ColorScheme,
         appearance_declared: bool,
         description: Option<String>,
@@ -1340,38 +1136,23 @@ pub enum AppearanceSource {
     Measured,
 }
 
-/// Lowest foreground-on-background contrast a theme is admitted without a
-/// warning ([`ThemeWarning::LowTextContrast`]).
+/// Lowest foreground-on-background contrast a theme is admitted without a warning ([`ThemeWarning::LowTextContrast`]).
 pub const MIN_TEXT_CONTRAST: f64 = 3.0;
-/// Lowest selection-on-background contrast a theme is admitted without a
-/// warning ([`ThemeWarning::FaintSelection`]).
+/// Lowest selection-on-background contrast a theme is admitted without a warning ([`ThemeWarning::FaintSelection`]).
 pub const MIN_SELECTION_CONTRAST: f64 = 1.3;
-/// Lowest cursor-on-background contrast a theme is admitted without a warning
-/// ([`ThemeWarning::LowCursorContrast`]).
+/// Lowest cursor-on-background contrast a theme is admitted without a warning ([`ThemeWarning::LowCursorContrast`]).
 pub const MIN_CURSOR_CONTRAST: f64 = 3.0;
 
-/// Lowest authored `accent_color`-on-background contrast a theme is admitted
-/// without a warning ([`ThemeWarning::ChromeBelowFloor`]): the non-text floor
-/// every chrome surface raises the accent to where it is drawn
-/// (`aterm_messages::tokens::ACCENT_FLOOR` is this constant).
+/// Lowest authored `accent_color`-on-background contrast a theme is admitted without a warning ([`ThemeWarning::ChromeBelowFloor`]): the non-text floor every chrome surface raises the accent to where it is drawn (`aterm_messages::tokens::ACCENT_FLOOR` is this constant).
 pub const MIN_ACCENT_CONTRAST: f64 = 3.0;
-/// Lowest authored `border_color`-on-background contrast admitted without a
-/// warning: the seam floor (`aterm_messages::tokens::SEAM_FLOOR` is this constant).
+/// Lowest authored `border_color`-on-background contrast admitted without a warning: the seam floor (`aterm_messages::tokens::SEAM_FLOOR` is this constant).
 pub const MIN_BORDER_CONTRAST: f64 = 1.5;
-/// Lowest authored `search_match_color`-on-background contrast admitted
-/// without a warning: the match tint's rise
-/// (`aterm_messages::tokens::MATCH_RISE`).
+/// Lowest authored `search_match_color`-on-background contrast admitted without a warning: the match tint's rise (`aterm_messages::tokens::MATCH_RISE`).
 pub const MIN_SEARCH_MATCH_CONTRAST: f64 = 1.5;
-/// Least `OkLab` distance between an authored `search_match_color` and the
-/// selection band admitted without a warning
-/// ([`ThemeWarning::SearchMatchLikeSelection`]): the current match is the
-/// selection, so a tint that close makes every match look current
-/// (`aterm_messages::tokens::MATCH_DISTINCT_OKLAB`).
+/// Least `OkLab` distance between an authored `search_match_color` and the selection band admitted without a warning ([`ThemeWarning::SearchMatchLikeSelection`]): the current match is the selection, so a tint that close makes every match look current (`aterm_messages::tokens::MATCH_DISTINCT_OKLAB`).
 pub const MIN_SEARCH_MATCH_DISTANCE: f64 = 0.06;
 
-/// A problem a theme file is admitted with: it still loads, but the listing
-/// and picker say what will be hard to read. Ratios are WCAG contrast in
-/// hundredths (`250` is 2.50:1) so the type stays `Eq`.
+/// A problem a theme file is admitted with: it still loads, but the listing and picker say what will be hard to read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ThemeWarning {
     /// Foreground on background below [`MIN_TEXT_CONTRAST`].
@@ -1379,14 +1160,12 @@ pub enum ThemeWarning {
         /// The measured ratio, in hundredths.
         hundredths: u32,
     },
-    /// The selection band on background below [`MIN_SELECTION_CONTRAST`]: a
-    /// selection is hard to see.
+    /// The selection band on background below [`MIN_SELECTION_CONTRAST`]: a selection is hard to see.
     FaintSelection {
         /// The measured ratio, in hundredths.
         hundredths: u32,
     },
-    /// An ANSI slot is exactly the background, so text in that colour is
-    /// invisible.
+    /// An ANSI slot is exactly the background, so text in that colour is invisible.
     AnsiMatchesBackground {
         /// The slot, `0..16`.
         slot: u8,
@@ -1396,8 +1175,7 @@ pub enum ThemeWarning {
         /// The measured ratio, in hundredths.
         hundredths: u32,
     },
-    /// An authored chrome colour on the background below its floor. aterm
-    /// still draws it, raised to the floor on each surface.
+    /// An authored chrome colour on the background below its floor. aterm still draws it, raised to the floor on each surface.
     ChromeBelowFloor {
         /// The chrome key.
         key: ThemeKey,
@@ -1406,21 +1184,16 @@ pub enum ThemeWarning {
         /// The floor, in hundredths.
         floor_hundredths: u32,
     },
-    /// The authored `search_match_color` sits within
-    /// [`MIN_SEARCH_MATCH_DISTANCE`] of the selection band, so every match
-    /// looks like the current one.
+    /// The authored `search_match_color` sits within [`MIN_SEARCH_MATCH_DISTANCE`] of the selection band, so every match looks like the current one.
     SearchMatchLikeSelection,
-    /// The file declares one appearance and its background measures as the
-    /// other.
+    /// The file declares one appearance and its background measures as the other.
     AppearanceMismatch {
         /// What the file says.
         declared: Appearance,
         /// What its background measures as.
         measured: Appearance,
     },
-    /// The file was written for a newer theme schema and sets keys this
-    /// aterm does not know; they were skipped (the names are
-    /// [`ThemeMeta::skipped_keys`]).
+    /// The file was written for a newer theme schema and sets keys this aterm does not know; they were skipped (the names are [`ThemeMeta::skipped_keys`]).
     SkippedNewerKeys {
         /// The file's `schema`.
         schema: u16,
@@ -1493,12 +1266,10 @@ impl core::fmt::Display for ThemeWarning {
     }
 }
 
-/// The colour-identity half of a theme: what a listing, the picker
-/// and the split resolver show and pair by, separate from the colours.
+/// The colour-identity half of a theme: what a listing, the picker and the split resolver show and pair by, separate from the colours.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ThemeMeta {
-    /// What a person sees: a file's `name =`, else its id (the file stem,
-    /// which stays what config writes); a built-in's canonical name.
+    /// What a person sees: a file's `name =`, else its id (the file stem, which stays what config writes); a built-in's canonical name.
     pub display_name: String,
     /// One line for listings and the picker.
     pub description: Option<String>,
@@ -1512,14 +1283,12 @@ pub struct ThemeMeta {
     pub pair: Option<String>,
     /// Non-fatal admission problems, in a fixed order.
     pub warnings: Vec<ThemeWarning>,
-    /// The keys a newer-schema file sets that this aterm skipped (bounded as
-    /// [`ParsedTheme::skipped_keys`]); empty for a file read in full.
+    /// The keys a newer-schema file sets that this aterm skipped (bounded as [`ParsedTheme::skipped_keys`]); empty for a file read in full.
     pub skipped_keys: Vec<String>,
 }
 
 impl ThemeMeta {
-    /// A built-in's identity. Built-ins are curated, so they carry no
-    /// admission warnings.
+    /// A built-in's identity.
     #[must_use]
     pub fn of_builtin(theme: BuiltinTheme) -> Self {
         Self {
@@ -1535,10 +1304,6 @@ impl ThemeMeta {
     }
 
     /// Admit a parsed theme file whose id is `id` (its file stem).
-    /// `measured` is the appearance its background measures as, by the
-    /// caller's one dark/light classifier (this crate does no luminance
-    /// policy). A file that leaves `appearance` out takes `measured`, written
-    /// into the scheme too, instead of a silent `Dark`.
     #[must_use]
     pub fn admit(parsed: &mut ParsedTheme, id: &str, measured: Appearance) -> Self {
         let scheme = &mut parsed.scheme;
@@ -1574,10 +1339,7 @@ impl ThemeMeta {
     }
 }
 
-/// A whole admitted theme: its identity, its colours, its
-/// typography and its `bold_is_bright`. What the catalog holds for a theme
-/// file and what a theme switch applies; [`ColorScheme`] stays the colours
-/// alone.
+/// A whole admitted theme: its identity, its colours, its typography and its `bold_is_bright`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ThemePackage {
     /// Identity: name, appearance (declared or measured), pair, warnings.
@@ -1591,9 +1353,7 @@ pub struct ThemePackage {
 }
 
 impl ThemePackage {
-    /// Admit a parsed theme file whose id is `id`, as [`ThemeMeta::admit`]
-    /// does (`measured` is its background's appearance by the caller's
-    /// classifier).
+    /// Admit a parsed theme file whose id is `id`, as [`ThemeMeta::admit`] does (`measured` is its background's appearance by the caller's classifier).
     #[must_use]
     pub fn admit(mut parsed: ParsedTheme, id: &str, measured: Appearance) -> Self {
         let meta = ThemeMeta::admit(&mut parsed, id, measured);
@@ -1605,8 +1365,7 @@ impl ThemePackage {
         }
     }
 
-    /// The `Default` built-in as a package (what an unresolvable selection
-    /// draws).
+    /// The `Default` built-in as a package (what an unresolvable selection draws).
     #[must_use]
     pub fn default_theme() -> Self {
         Self {
@@ -1617,8 +1376,7 @@ impl ThemePackage {
         }
     }
 
-    /// A built-in theme as a package: built-ins carry no typography and no
-    /// `bold_is_bright`. `None` for a name that is not a built-in.
+    /// A built-in theme as a package: built-ins carry no typography and no `bold_is_bright`.
     #[must_use]
     pub fn of_builtin(theme: BuiltinTheme) -> Option<Self> {
         Some(Self {
@@ -1630,11 +1388,7 @@ impl ThemePackage {
     }
 }
 
-/// Every [`ThemeWarning`] `scheme` earns, in a fixed order: text, selection,
-/// ANSI slots (ascending), cursor, the authored chrome colours (accent,
-/// border, search match, then the search match's distance from the
-/// selection), appearance. The contrast warnings are exactly the
-/// [`contrast_report`] rows below their minimum.
+/// Every [`ThemeWarning`] `scheme` earns, in a fixed order: text, selection, ANSI slots (ascending), cursor, the authored chrome colours (accent, border, search match, then the search match's distance from the selection), appearance.
 #[must_use]
 pub fn admission_warnings(scheme: &ColorScheme, measured: Appearance) -> Vec<ThemeWarning> {
     let bg = scheme.background;
@@ -1693,8 +1447,7 @@ pub fn admission_warnings(scheme: &ColorScheme, measured: Appearance) -> Vec<The
     warnings
 }
 
-/// Two colours of a theme whose contrast [`contrast_report`] measures: the
-/// first is drawn on the second.
+/// Two colours of a theme whose contrast [`contrast_report`] measures: the first is drawn on the second.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ContrastPair {
     /// The foreground on the background.
@@ -1718,8 +1471,7 @@ pub enum ContrastPair {
 }
 
 impl ContrastPair {
-    /// The two colours as theme keys: `(drawn, on)`, an ANSI slot as
-    /// `color<N>`. The selection band is `selection` even when derived.
+    /// The two colours as theme keys: `(drawn, on)`, an ANSI slot as `color<N>`.
     #[must_use]
     pub fn keys(self) -> (String, &'static str) {
         let key = |key: ThemeKey| theme_key_spec(key).name.to_string();
@@ -1747,11 +1499,9 @@ pub struct ContrastRow {
     pub pair: ContrastPair,
     /// The WCAG contrast ratio, in hundredths (rounded down).
     pub hundredths: u32,
-    /// The admission bar, in hundredths, when a theme is warned below it
-    /// ([`admission_warnings`]); `None` for a pair measured for information.
+    /// The admission bar, in hundredths, when a theme is warned below it ([`admission_warnings`]); `None` for a pair measured for information.
     pub minimum: Option<u32>,
     /// Whether the ratio is below the bar, by the exact comparison admission
-    /// makes (`None` with no bar).
     below: Option<bool>,
 }
 
@@ -1767,14 +1517,7 @@ impl ContrastRow {
     }
 }
 
-/// Every contrast a theme's legibility rests on, in a fixed order: text on
-/// background, each ANSI slot on background, the selection band on
-/// background, text on the selection (and `selection_foreground` on it, when
-/// set), the cursor on background, then each authored chrome colour on the
-/// background (accent, border, search match). A pair has a minimum when admission
-/// warns below it: text and an explicit cursor at [`MIN_TEXT_CONTRAST`] and
-/// [`MIN_CURSOR_CONTRAST`], the band at [`MIN_SELECTION_CONTRAST`]. A cursor
-/// the theme leaves out follows the foreground, so it has no bar of its own.
+/// Every contrast a theme's legibility rests on, in a fixed order: text on background, each ANSI slot on background, the selection band on background, text on the selection (and `selection_foreground` on it, when set), the cursor on background, then each authored chrome colour on the background (accent, border, search match).
 #[must_use]
 pub fn contrast_report(scheme: &ColorScheme) -> Vec<ContrastRow> {
     let bg = scheme.background;
@@ -1849,10 +1592,6 @@ pub fn contrast_report(scheme: &ColorScheme) -> Vec<ContrastRow> {
 }
 
 /// The Euclidean `OkLab` distance between two colours (Björn Ottosson's
-/// `OkLab`): how far apart they look. `aterm_messages::palette::oklab_distance`
-/// is the chrome's copy; theme admission only compares it with
-/// [`MIN_SEARCH_MATCH_DISTANCE`], far from where the two could round apart.
-// Skip: f64 arithmetic with `powf`/`cbrt` — the float-interval lane.
 #[cfg_attr(trust_verify, trust::skip)]
 #[allow(
     clippy::excessive_precision,
@@ -1883,9 +1622,7 @@ fn oklab_distance(a: Rgb, b: Rgb) -> f64 {
     (p[0] - q[0]).hypot(p[1] - q[1]).hypot(p[2] - q[2])
 }
 
-/// A theme as the catalog holds it, under the id `theme = "<id>"` names: a
-/// built-in, or a themes-folder file that loaded. What `aterm theme export`
-/// writes and `aterm theme new --from` starts from.
+/// A theme as the catalog holds it, under the id `theme = "<id>"` names: a built-in, or a themes-folder file that loaded.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CatalogTheme {
     /// The id, canonically spelled (a built-in's name, a file's stem).
@@ -1915,9 +1652,7 @@ impl CatalogTheme {
     }
 }
 
-/// One key of the theme format, by what it sets. Every spelling of a key
-/// (`fg` and `foreground`, `palette3` and `color3`) is the same `ThemeKey`, so
-/// setting it twice under two spellings is still a duplicate.
+/// One key of the theme format, by what it sets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ThemeKey {
     /// `name`: the display name.
@@ -1983,9 +1718,7 @@ pub enum ThemeKey {
 }
 
 impl ThemeKey {
-    /// This key's row of [`THEME_KEYS`]. Exhaustive, so a new key cannot
-    /// compile without a row; the assertion under [`THEME_KEYS`] checks at
-    /// compile time that each row sits where this says.
+    /// This key's row of [`THEME_KEYS`].
     #[inline]
     #[must_use]
     pub const fn row(self) -> usize {
@@ -2029,21 +1762,17 @@ impl ThemeKey {
 pub enum ThemeValueType {
     /// A colour: `#RRGGBB` (the `#` optional) or `#RGB` ([`parse_hex`]).
     Colour,
-    /// One line of text: at most [`MAX_THEME_TEXT_CHARS`] chars and no control
-    /// characters; a ` #` or ` ;` in it starts an inline comment.
+    /// One line of text: at most [`MAX_THEME_TEXT_CHARS`] chars and no control characters; a ` #` or ` ;` in it starts an inline comment.
     Text,
     /// One of [`APPEARANCE_VALUES`], case-insensitive.
     Appearance,
-    /// One font family name, never a path or a font file
-    /// ([`crate::scheme_typography::parse_font_name`]).
+    /// One font family name, never a path or a font file ([`crate::scheme_typography::parse_font_name`]).
     FontName,
-    /// A comma-separated list of font family names, `1..=`
-    /// [`MAX_THEME_FONT_LIST`] entries, none empty.
+    /// A comma-separated list of font family names, `1..=` [`MAX_THEME_FONT_LIST`] entries, none empty.
     FontNameList,
     /// `true` or `false`, case-insensitive.
     Flag,
-    /// A decimal with at most three fraction digits, within `[min, max]`
-    /// (thousandths): `1.15` is 1150.
+    /// A decimal with at most three fraction digits, within `[min, max]` (thousandths): `1.15` is 1150.
     Milli {
         /// The least value, in thousandths.
         min: u16,
@@ -2057,8 +1786,7 @@ pub enum ThemeValueType {
         /// The greatest value.
         max: u16,
     },
-    /// OpenType feature specs (`tag`, `+tag`, `-tag`, `tag=N`) separated by
-    /// commas or spaces, `1..=`[`MAX_THEME_FEATURES`] of them.
+    /// OpenType feature specs (`tag`, `+tag`, `-tag`, `tag=N`) separated by commas or spaces, `1..=`[`MAX_THEME_FEATURES`] of them.
     FeatureList,
     /// The theme format version: a whole number from 1.
     SchemaVersion,
@@ -2084,19 +1812,16 @@ impl ThemeValueType {
     }
 }
 
-/// Which part of a theme a key belongs to: what `aterm theme schema` and the
-/// manual group the keys by.
+/// Which part of a theme a key belongs to: what `aterm theme schema` and the manual group the keys by.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ThemeKeyGroup {
     /// Who the theme is: its name, description, author and appearance.
     Identity,
-    /// The terminal's colours: foreground, background, cursor, selection and
-    /// the ANSI palette.
+    /// The terminal's colours: foreground, background, cursor, selection and the ANSI palette.
     Colour,
     /// The optional colours of aterm's own chrome.
     Chrome,
-    /// The optional type settings: font families, line height, ligatures,
-    /// features, weight and size scale. aterm.toml keys of the same name win.
+    /// The optional type settings: font families, line height, ligatures, features, weight and size scale. aterm.toml keys of the same name win.
     Typography,
 }
 
@@ -2120,14 +1845,12 @@ pub const APPEARANCE_VALUES: [&str; 2] = ["dark", "light"];
 /// How many ANSI slots a theme sets (`color0` through `color15`).
 pub const THEME_PALETTE_SLOTS: u8 = 16;
 
-/// One row of [`THEME_KEYS`]: everything the parser and `aterm theme schema`
-/// know about a key.
+/// One row of [`THEME_KEYS`]: everything the parser and `aterm theme schema` know about a key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ThemeKeySpec {
     /// What the key sets.
     pub key: ThemeKey,
-    /// The canonical spelling. For an indexed key it is the stem (`color`),
-    /// written with the slot number after it (`color3`).
+    /// The canonical spelling.
     pub name: &'static str,
     /// The other spellings the parser accepts (stems, for an indexed key).
     pub aliases: &'static [&'static str],
@@ -2135,13 +1858,11 @@ pub struct ThemeKeySpec {
     pub value: ThemeValueType,
     /// Whether a theme without this key is refused.
     pub required: bool,
-    /// For an indexed key, how many slots it has (`0..indexed`); `0` for a
-    /// plain key.
+    /// For an indexed key, how many slots it has (`0..indexed`); `0` for a plain key.
     pub indexed: u8,
     /// The part of the theme the key belongs to.
     pub group: ThemeKeyGroup,
-    /// The aterm.toml key that overrides this one when set (its spelling
-    /// there); `None` for an identity key, which aterm.toml cannot set.
+    /// The aterm.toml key that overrides this one when set (its spelling there); `None` for an identity key, which aterm.toml cannot set.
     pub config_key: Option<&'static str>,
     /// What leaving the key out means.
     pub when_omitted: &'static str,
@@ -2163,10 +1884,7 @@ impl ThemeKeySpec {
     }
 }
 
-/// THE table of theme keys: [`parse_theme_str`] reads keys by it, and
-/// `aterm theme schema` and the `aterm theme new` template are printed from
-/// it, so neither can describe a key the parser does not read the same way.
-/// The order is the order a theme file is written in.
+/// THE table of theme keys: [`parse_theme_str`] reads keys by it, and `aterm theme schema` and the `aterm theme new` template are printed from it, so neither can describe a key the parser does not read the same way.
 pub const THEME_KEYS: [ThemeKeySpec; 30] = [
     ThemeKeySpec {
         key: ThemeKey::Name,
@@ -2573,8 +2291,6 @@ pub const fn theme_key_spec(key: ThemeKey) -> &'static ThemeKeySpec {
     &THEME_KEYS[key.row()]
 }
 
-// Each row of the table is the one its key's `row()` names, so the rows are
-// distinct keys and `theme_key_spec` returns the key it was asked for.
 const _: () = {
     let mut i = 0;
     while i < THEME_KEYS.len() {
@@ -2586,9 +2302,7 @@ const _: () = {
     }
 };
 
-/// Read a key as written (any case, any spelling) by [`THEME_KEYS`]: its row's
-/// position in the table and, for an indexed key, the slot. `None` for a key
-/// the format does not have.
+/// Read a key as written (any case, any spelling) by [`THEME_KEYS`]: its row's position in the table and, for an indexed key, the slot.
 #[must_use]
 pub fn lookup_theme_key(written: &str) -> Option<(usize, Option<u8>)> {
     let key = written.trim().to_ascii_lowercase();
@@ -2599,7 +2313,6 @@ pub fn lookup_theme_key(written: &str) -> Option<(usize, Option<u8>)> {
         }
         spellings.find_map(|stem| {
             let slot = key.strip_prefix(stem)?;
-            // Digits only: `color+1` and `color 1` are not slot 1.
             if slot.is_empty() || !slot.bytes().all(|b| b.is_ascii_digit()) {
                 return None;
             }
@@ -2609,8 +2322,7 @@ pub fn lookup_theme_key(written: &str) -> Option<(usize, Option<u8>)> {
     })
 }
 
-/// The line each key of a parsed theme was set on, as [`parse_theme_located`]
-/// returns it, so a report about a key can point at its line.
+/// The line each key of a parsed theme was set on, as [`parse_theme_located`] returns it, so a report about a key can point at its line.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ThemeKeyLines {
     /// Per [`THEME_KEYS`] row (plain keys only).
@@ -2620,8 +2332,7 @@ pub struct ThemeKeyLines {
 }
 
 impl ThemeKeyLines {
-    /// The 1-based line `key` (slot `index`, for the palette) was set on, or
-    /// `None` when the file leaves it out.
+    /// The 1-based line `key` (slot `index`, for the palette) was set on, or `None` when the file leaves it out.
     #[inline]
     #[must_use]
     pub fn line(&self, key: ThemeKey, index: Option<u8>) -> Option<usize> {
@@ -2632,9 +2343,7 @@ impl ThemeKeyLines {
     }
 }
 
-/// Parse a minimal disk theme definition into a [`ColorScheme`]: exactly
-/// [`parse_theme_str`] without the identity text.
-///
+/// Parse a minimal disk theme definition into a [`ColorScheme`]: exactly [`parse_theme_str`] without the identity text.
 /// # Errors
 /// As [`parse_theme_str`].
 pub fn parse_scheme_str(text: &str) -> Result<ColorScheme, ThemeError> {
@@ -2642,67 +2351,18 @@ pub fn parse_scheme_str(text: &str) -> Result<ColorScheme, ThemeError> {
 }
 
 /// Parse a disk theme definition.
-///
-/// FORMAT — a deliberately tiny, dependency-free `key = value` line format (so this
-/// bottom-of-graph crate needs no TOML/serde at runtime). It is aterm's own
-/// format: Ghostty theme files (`palette = N=#…`, `cursor-color`), kitty's
-/// `key value` files, Alacritty's TOML, iTerm2 plists and Windows Terminal JSON
-/// are NOT accepted as-is. Parsing one fails, and the error names the format it
-/// looks like (the `foreign_format` of [`ThemeError::Parse`]) so the user can convert
-/// it with `aterm theme import`.
-///
-/// ```text
-/// # comments start with '#' (or ';'); blank lines ignored
-/// name        = My Theme        # optional display name
-/// description = Deep navy       # optional
-/// author      = Jane Doe        # optional
-/// appearance  = dark            # dark | light; omitted => measured from background
-/// foreground  = #c0caf5         # alias fg
-/// background  = #1a1b26         # alias bg
-/// cursor_color = #7aa2f7        # alias cursor; omitted => follows foreground
-/// selection_color = #283457     # alias selection; omitted => bg 22% toward fg
-/// selection_foreground = #c0caf5  # optional; omitted => selected text keeps its colour
-/// # the 16 ANSI slots, by 0-based index (0-7 normal, 8-15 bright):
-/// color0 = #15161e
-/// color1 = #f7768e
-/// # … through color15. Aliases: `palette0`/`ansi0` also accepted.
-/// ```
-///
-/// The keys, their spellings, types and which are required are
-/// [`THEME_KEYS`]; the parser reads keys by that table.
-///
-/// SEMANTICS: `foreground` and `background` are REQUIRED (a theme with no fg/bg is
-/// rejected). Any unspecified `colorN` defaults to that slot's
-/// [`ColorPalette::default_color`], so a partial palette is still well-formed.
-/// Colours are `#RRGGBB` or `#RGB` ([`parse_hex`]). `name`, `description` and
-/// `author` are at most [`MAX_THEME_TEXT_CHARS`] chars with no control
-/// characters. A leading UTF-8 byte-order mark is ignored. Keys are
-/// case-insensitive. An unknown key, a malformed colour or
-/// text, or a key set twice (under any of its spellings, e.g. `foreground` then
-/// `fg`, or `color1` then `palette1`) is a [`ThemeError::Parse`] with the 1-based
-/// line number.
-///
 /// # Errors
-/// Returns [`ThemeError::Parse`] for a malformed line, a bad colour value, an
-/// unknown or duplicate key, over-long text, or a missing required
-/// `foreground`/`background`.
-// Skip: the parse closures drive absent std iterator/parse bodies; every malformed input is rejected (fail-closed).
+/// Returns [`ThemeError::Parse`] for a malformed line, a bad colour value, an unknown or duplicate key, over-long text, or a missing required `foreground`/`background`.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn parse_theme_str(text: &str) -> Result<ParsedTheme, ThemeError> {
     parse_theme_located(text).map(|(parsed, _)| parsed)
 }
 
-/// [`parse_theme_str`], and the line each key was set on (for a report that
-/// points at a key, such as `aterm theme check`).
-///
+/// [`parse_theme_str`], and the line each key was set on (for a report that points at a key, such as `aterm theme check`).
 /// # Errors
 /// As [`parse_theme_str`].
-// Skip: the parse closures drive absent std iterator/parse bodies; every malformed input is rejected (fail-closed).
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn parse_theme_located(text: &str) -> Result<(ParsedTheme, ThemeKeyLines), ThemeError> {
-    // A UTF-8 byte-order mark (Windows editors write one) is no part of the
-    // first key; the importer strips it too, so the two readers agree. Line
-    // numbers are unchanged: the mark sits inside line 1.
     let body = text.strip_prefix('\u{feff}').unwrap_or(text);
     parse_theme_lines(body).map_err(|error| match error {
         ThemeError::Parse {
@@ -2717,8 +2377,6 @@ pub fn parse_theme_located(text: &str) -> Result<(ParsedTheme, ThemeKeyLines), T
 }
 
 /// The line parser behind [`parse_theme_located`], which adds the
-/// foreign-format hint to its error. Keys are read by [`THEME_KEYS`].
-// Skip: the parse closures drive absent std iterator/parse bodies; every malformed input is rejected (fail-closed).
 #[cfg_attr(trust_verify, trust::skip)]
 fn parse_theme_lines(text: &str) -> Result<(ParsedTheme, ThemeKeyLines), ThemeError> {
     let mut name = String::new();
@@ -2731,11 +2389,7 @@ fn parse_theme_lines(text: &str) -> Result<(ParsedTheme, ThemeKeyLines), ThemeEr
     let mut selection: Option<Rgb> = None;
     let mut selection_fg: Option<Rgb> = None;
     let mut chrome = ChromeColors::default();
-    // Start from the engine defaults so an omitted `colorN` is render-identical to
-    // an unthemed slot.
     let mut ansi = ColorScheme::default().ansi;
-    // The line each key was first set on, so a second setting (under any
-    // spelling) is caught and the error can point back at the first.
     let mut lines = ThemeKeyLines {
         plain: [None; THEME_KEYS.len()],
         palette: [None; THEME_PALETTE_SLOTS as usize],
@@ -2746,26 +2400,14 @@ fn parse_theme_lines(text: &str) -> Result<(ParsedTheme, ThemeKeyLines), ThemeEr
     let mut schema: Option<u16> = None;
     let mut skipped_keys: Vec<String> = Vec::new();
     let mut skipped_count: u16 = 0;
-    // Pass 0: a file written for a newer schema skips the keys this aterm
-    // does not know. The `schema` line itself is checked strictly by the
-    // main pass (malformed, zero or duplicated is an error there).
     let future = declared_schema(text).is_some_and(|n| n > THEME_SCHEMA_VERSION);
 
     for (idx, raw) in text.lines().enumerate() {
-        // Trust gate: `saturating_add(1)` is identical to `+ 1` here — `idx`
-        // counts `lines()` items, and a `&str` holds at most `isize::MAX`
-        // bytes, so `idx < usize::MAX` and the saturation branch never fires.
         let lineno = idx.saturating_add(1);
         let line = raw.trim();
         if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
             continue;
         }
-        // Strip an inline trailing comment (`key = #fff  # note`) — but NOT a '#'
-        // that begins a hex value. We split on the FIRST '=' to isolate the value,
-        // then trim a comment that starts with whitespace-' #'/';'.
-        // Trust gate (this fn): parse errors are concatenated instead of
-        // `format!` — runtime-argument `format_args!` cannot be lowered
-        // natively. `debug_string` is byte-identical to `{…:?}`.
         let Some((key, value)) = line.split_once('=') else {
             return Err(parse_error(lineno, None, "missing '=' in ", line));
         };
@@ -2783,8 +2425,6 @@ fn parse_theme_lines(text: &str) -> Result<(ParsedTheme, ThemeKeyLines), ThemeEr
             if future {
                 skipped_count = skipped_count.saturating_add(1);
                 if skipped_keys.len() < MAX_SKIPPED_THEME_KEYS {
-                    // Printable from here on: the key is untrusted text that
-                    // `theme check` and `theme import` print to a terminal.
                     skipped_keys.push(truncate_at_char(
                         &escape_controls(&key),
                         MAX_SKIPPED_THEME_KEY_BYTES,
@@ -2838,7 +2478,6 @@ fn parse_theme_lines(text: &str) -> Result<(ParsedTheme, ThemeKeyLines), ThemeEr
                     (ThemeKey::Palette, Some(slot)) => ansi[usize::from(slot)] = colour,
                     (key, _) => {
                         // The chrome keys; the table types no other key as a
-                        // colour.
                         if let Some(slot) = chrome.slot_mut(key) {
                             *slot = Some(colour);
                         }
@@ -2851,7 +2490,6 @@ fn parse_theme_lines(text: &str) -> Result<(ParsedTheme, ThemeKeyLines), ThemeEr
                     ThemeKey::Name => name = text,
                     ThemeKey::Description => description = Some(text),
                     ThemeKey::Author => author = Some(text),
-                    // The table types no other key as text.
                     _ => {}
                 }
             }
@@ -2867,7 +2505,6 @@ fn parse_theme_lines(text: &str) -> Result<(ParsedTheme, ThemeKeyLines), ThemeEr
                     }
                     ThemeKey::SymbolFont => typography.symbol_font = Some(name),
                     ThemeKey::EmojiFont => typography.emoji_font = Some(name),
-                    // The table types no other key as a font name.
                     _ => {}
                 }
             }
@@ -2886,7 +2523,6 @@ fn parse_theme_lines(text: &str) -> Result<(ParsedTheme, ThemeKeyLines), ThemeEr
                     ThemeKey::PaletteGenerate => palette_generate = flag,
                     ThemeKey::Ligatures => typography.ligatures = Some(flag),
                     ThemeKey::FontSyntheticStyle => typography.font_synthetic_style = Some(flag),
-                    // The table types no other key as a flag.
                     _ => {}
                 }
             }
@@ -2896,7 +2532,6 @@ fn parse_theme_lines(text: &str) -> Result<(ParsedTheme, ThemeKeyLines), ThemeEr
                 match spec.key {
                     ThemeKey::LineHeight => typography.line_height_milli = Some(milli),
                     ThemeKey::FontSizeScale => typography.font_size_scale_milli = Some(milli),
-                    // The table types no other key as a decimal.
                     _ => {}
                 }
             }
@@ -2938,7 +2573,6 @@ fn parse_theme_lines(text: &str) -> Result<(ParsedTheme, ThemeKeyLines), ThemeEr
         }
     }
 
-    // The table says which keys a theme cannot leave out.
     for (row, spec) in THEME_KEYS.iter().enumerate() {
         if spec.required && spec.indexed == 0 && lines.plain[row].is_none() {
             return Err(missing_key(spec.name));
@@ -2946,7 +2580,6 @@ fn parse_theme_lines(text: &str) -> Result<(ParsedTheme, ThemeKeyLines), ThemeEr
     }
     let (Some(foreground), Some(background)) = (foreground, background) else {
         // Unreachable while the table marks both required (the
-        // `theme_key_table_drives_the_parser` test); refused, not defaulted.
         return Err(missing_key(if foreground.is_none() {
             "foreground"
         } else {
@@ -2980,8 +2613,6 @@ fn parse_theme_lines(text: &str) -> Result<(ParsedTheme, ThemeKeyLines), ThemeEr
 }
 
 /// The value of the first `schema` line, read leniently (`None` when there
-/// is none or it does not parse): only whether a file is from a newer schema
-/// rides on it. The main pass reads the line strictly.
 fn declared_schema(text: &str) -> Option<u16> {
     text.lines().find_map(|raw| {
         let line = raw.trim();
@@ -2997,9 +2628,6 @@ fn declared_schema(text: &str) -> Option<u16> {
 }
 
 /// `text` cut to at most `max` bytes at a char boundary.
-/// `text` with every control character (C0, DEL, C1) written as its
-/// escape (`\u{1b}`), so untrusted text reaches a terminal as text, never as
-/// an escape sequence; anything else is kept as written.
 fn escape_controls(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for c in text.chars() {
@@ -3021,7 +2649,6 @@ fn truncate_at_char(text: &str, max: usize) -> String {
 }
 
 /// A [`ThemeError::Parse`] for a malformed value of `key`: the value
-/// reader's reason, prefixed with the key.
 fn value_error(line: usize, key: &str, reason: &str) -> ThemeError {
     let mut text = String::from("invalid value for ");
     text.push_str(&crate::trust_fmt::debug_string(key));
@@ -3039,7 +2666,6 @@ fn missing_key(name: &str) -> ThemeError {
 }
 
 /// A `name` / `description` / `author` value, refused when it is longer than
-/// [`MAX_THEME_TEXT_CHARS`] or carries a control character.
 fn bounded_text(line: usize, key: &str, value: &str) -> Result<String, ThemeError> {
     let mut reason = String::from("value for key ");
     reason.push_str(&crate::trust_fmt::debug_string(key));
@@ -3057,8 +2683,6 @@ fn bounded_text(line: usize, key: &str, value: &str) -> Result<String, ThemeErro
 }
 
 /// A [`ThemeError::Parse`] at `line` (about `key`, when there is one) whose
-/// reason is `prefix` then `detail` rendered as `{detail:?}` (via
-/// `debug_string`, see `parse_theme_lines`).
 fn parse_error(line: usize, key: Option<&str>, prefix: &str, detail: &str) -> ThemeError {
     let mut reason = String::from(prefix);
     reason.push_str(&crate::trust_fmt::debug_string(detail));
@@ -3066,18 +2690,10 @@ fn parse_error(line: usize, key: Option<&str>, prefix: &str, detail: &str) -> Th
 }
 
 /// Strip a trailing ` #…` / ` ;…` inline comment from a value, but never a leading
-/// `#` that is part of a hex colour. Only whitespace-preceded `#`/`;` (or one at the
-/// very start, which can't be a value) is treated as a comment.
 fn strip_inline_comment(value: &str) -> &str {
-    let mut prev_ws = true; // start is a boundary
+    let mut prev_ws = true;
     for (i, b) in value.bytes().enumerate() {
         if (b == b'#' || b == b';') && prev_ws {
-            // A whitespace-preceded `#`/`;` is a comment UNLESS it is the leading
-            // token (i.e. everything before it is blank) — that case is a hex value
-            // like ` #fff`, which must be kept. `i` is a byte offset from
-            // `bytes().enumerate()`, always <= len at an ASCII ('#'/';') boundary,
-            // so the total `get(..i)` yields `Some` — identical to `value[..i]`
-            // without a slice-bounds obligation.
             let prefix = value.get(..i).unwrap_or(value);
             if prefix.trim().is_empty() {
                 prev_ws = false;
@@ -3090,24 +2706,16 @@ fn strip_inline_comment(value: &str) -> &str {
     value
 }
 
-/// How many theme files the themes folder is read for: discovery opens and
-/// parses at most this many `.conf` files (the lowest names win), and a
-/// writer that adds many (`aterm theme install --all`) warns past it.
+/// How many theme files the themes folder is read for: discovery opens and parses at most this many `.conf` files (the lowest names win), and a writer that adds many (`aterm theme install --all`) warns past it.
 pub const MAX_USER_THEME_FILES: usize = 128;
 
-/// The user theme directory: `themes` inside the folder that holds
-/// `aterm.toml` ([`crate::dirs::aterm_config_dir`]), so it follows the same
-/// XDG / `%APPDATA%` / `HOME` rule as the config on every platform. `None` when
-/// no config directory can be resolved. Public so a packaging / `--list-themes`
-/// caller can tell users exactly where to drop theme packs.
+/// The user theme directory: `themes` inside the folder that holds `aterm.toml` ([`crate::dirs::aterm_config_dir`]), so it follows the same XDG / `%APPDATA%` / `HOME` rule as the config on every platform.
 #[must_use]
 pub fn user_theme_dir() -> Option<std::path::PathBuf> {
     crate::dirs::aterm_config_dir().map(|dir| dir.join("themes"))
 }
 
-/// Validate the literal grammar shared by direct loading and the GUI's bounded
-/// theme catalog. Theme names are file stems, never paths or OS-split syntax.
-/// Keeping this at the lowest layer makes every loader traversal-safe.
+/// Validate the literal grammar shared by direct loading and the GUI's bounded theme catalog.
 pub fn validate_user_theme_name(name: &str) -> Result<(), &'static str> {
     if name.is_empty() {
         return Err("theme name is empty");
@@ -3139,13 +2747,10 @@ pub fn validate_user_theme_name(name: &str) -> Result<(), &'static str> {
     Ok(())
 }
 
-/// One comma segment of a `theme` value, classified by the single rule every
-/// reader of the selector grammar shares ([`ThemeSelector::parse`] and
-/// [`validate_user_theme_name`]).
+/// One comma segment of a `theme` value, classified by the single rule every reader of the selector grammar shares ([`ThemeSelector::parse`] and [`validate_user_theme_name`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SelectorSegment<'a> {
-    /// `dark:<name>` / `light:<name>`: the key is case- and space-insensitive,
-    /// and the name is trimmed (it may be empty).
+    /// `dark:<name>` / `light:<name>`: the key is case- and space-insensitive, and the name is trimmed (it may be empty).
     Side(Appearance, &'a str),
     /// `<mode>:<name>` whose mode is not an appearance; the mode is trimmed.
     OtherMode(&'a str, &'a str),
@@ -3169,17 +2774,12 @@ pub fn classify_selector_segment(segment: &str) -> SelectorSegment<'_> {
     }
 }
 
-/// A parsed `theme` value: one name for every appearance, or a
-/// `dark:<name>,light:<name>` split. The one grammar the runtime resolver,
-/// config validation and the Settings disclosure all read, so they cannot
-/// disagree about what a value means.
+/// A parsed `theme` value: one name for every appearance, or a `dark:<name>,light:<name>` split.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ThemeSelector {
-    /// A plain name, trimmed, applied to both appearances. Empty only when the
-    /// whole value was blank (reported as [`SelectorIssue::EmptyName`]).
+    /// A plain name, trimmed, applied to both appearances.
     Single(String),
-    /// A split: any segment's key is `dark` or `light`. A side is `None` when
-    /// the value does not name it (or names it unusably).
+    /// A split: any segment's key is `dark` or `light`.
     Split {
         /// The name for a dark OS appearance.
         dark: Option<String>,
@@ -3188,14 +2788,12 @@ pub enum ThemeSelector {
     },
 }
 
-/// Why part of a `theme` value is not used as written. The runtime still draws
-/// what it can read ([`ThemeSelector::name_for`]); validation reports these.
+/// Why part of a `theme` value is not used as written.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SelectorIssue {
     /// A side appears more than once; the first one is used.
     DuplicateSide(Appearance),
-    /// A `<mode>:<name>` segment in a split whose mode is not dark or light
-    /// (lower-cased).
+    /// A `<mode>:<name>` segment in a split whose mode is not dark or light (lower-cased).
     UnknownMode(String),
     /// A side with no name (`dark:`), or a blank value (`None`).
     EmptyName(Option<Appearance>),
@@ -3236,10 +2834,7 @@ impl core::fmt::Display for SelectorIssue {
 }
 
 impl ThemeSelector {
-    /// Parse a `theme` value. A value is a split when any comma segment's key
-    /// is `dark` or `light`; otherwise the whole trimmed value is one name
-    /// (which may itself contain `:`). In a split the first usable segment for
-    /// each side wins, and every segment that is not used is one issue.
+    /// Parse a `theme` value.
     #[must_use]
     pub fn parse(raw: &str) -> (Self, Vec<SelectorIssue>) {
         let raw = raw.trim();
@@ -3286,11 +2881,7 @@ impl ThemeSelector {
         (Self::Split { dark, light }, issues)
     }
 
-    /// The name this selector draws for `appearance`: a plain name for both;
-    /// a split's own side; for a side the split leaves out, the named side's
-    /// built-in pair ([`builtin_pair`], so `dark:Gruvbox Dark` draws Gruvbox
-    /// Light on a light OS), else the named side itself. `None` means no name
-    /// at all (the built-in Default).
+    /// The name this selector draws for `appearance`: a plain name for both; a split's own side; for a side the split leaves out, the named side's built-in pair ([`builtin_pair`], so `dark:Gruvbox Dark` draws Gruvbox Light on a light OS), else the named side itself.
     #[must_use]
     pub fn name_for(&self, appearance: Appearance) -> Option<&str> {
         match self {
@@ -3309,8 +2900,7 @@ impl ThemeSelector {
         }
     }
 
-    /// The names the value writes, each with the appearance it is written for
-    /// (`None` for a plain name that serves both), in dark-then-light order.
+    /// The names the value writes, each with the appearance it is written for (`None` for a plain name that serves both), in dark-then-light order.
     #[must_use]
     pub fn named_sides(&self) -> Vec<(Option<Appearance>, &str)> {
         match self {
@@ -3324,25 +2914,17 @@ impl ThemeSelector {
     }
 }
 
-/// What an unset `theme` means, written as the selector it equals: Default
-/// on every appearance, as a value that names no theme at all (blank, or a
-/// split whose every segment is unusable) also draws. aterm follows the OS
-/// only when a `dark:…,light:…` pair is written (Settings' Follow system
-/// switch writes `dark:Default,light:Default Light` over an unset theme), so
-/// an update never turns an unconfigured terminal light.
+/// What an unset `theme` means, written as the selector it equals: Default on every appearance, as a value that names no theme at all (blank, or a split whose every segment is unusable) also draws. aterm follows the OS only when a `dark:…,light:…` pair is written (Settings' Follow system switch writes `dark:Default,light:Default Light` over an unset theme), so an update never turns an unconfigured terminal light.
 pub const UNSET_THEME: &str = "Default";
 
-/// What a selector draws for one appearance, as far as the built-ins can say
-/// ([`ThemeSelector::draw_builtin`]).
+/// What a selector draws for one appearance, as far as the built-ins can say ([`ThemeSelector::draw_builtin`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SelectorDraw {
-    /// No name at all: the unset default, [`UNSET_THEME`] on every
-    /// appearance.
+    /// No name at all: the unset default, [`UNSET_THEME`] on every appearance.
     Unset(ColorScheme),
     /// A built-in, canonically named.
     Builtin(ColorScheme),
-    /// A name the built-ins do not know: the caller's catalog (theme files
-    /// natively, registered themes on the web) resolves it.
+    /// A name the built-ins do not know: the caller's catalog (theme files natively, registered themes on the web) resolves it.
     Other(String),
 }
 
@@ -3355,11 +2937,7 @@ impl SelectorDraw {
 }
 
 impl ThemeSelector {
-    /// The built-in side of [`name_for`](Self::name_for): no name draws the
-    /// unset default, a built-in name (case-insensitive) draws that built-in,
-    /// and any other name is left to the caller's catalog. Built-ins win over
-    /// any catalog (a file named like a built-in is shadowed), so native and
-    /// web cannot disagree about what a selector draws.
+    /// The built-in side of [`name_for`](Self::name_for): no name draws the unset default, a built-in name (case-insensitive) draws that built-in, and any other name is left to the caller's catalog.
     #[must_use]
     pub fn draw_builtin(&self, appearance: Appearance) -> SelectorDraw {
         match self.name_for(appearance) {
@@ -3377,8 +2955,6 @@ mod tests {
     use super::*;
 
     /// Law: `draw_builtin` is `name_for` split three ways: no name draws the
-    /// unset default, a built-in (case-insensitive) draws it canonically (the
-    /// pair for an omitted side), anything else is `Other`.
     #[test]
     fn draw_builtin_follows_name_for() {
         let selectors = [
@@ -3418,9 +2994,6 @@ mod tests {
             builtin_named(draw("dark:Mine,light:Hearth", Appearance::Light)),
             "Hearth"
         );
-        // An unset value is Default on a light appearance too; only a written
-        // pair follows the OS (negative control: Default's pair draws Default
-        // Light there).
         assert!(
             matches!(draw("", Appearance::Light), SelectorDraw::Unset(s) if s.name == "Default")
         );
@@ -3428,7 +3001,6 @@ mod tests {
             builtin_named(draw("dark:Default,light:Default Light", Appearance::Light)),
             "Default Light"
         );
-        // Negative control: an unknown name is never a built-in.
         for a in [Appearance::Dark, Appearance::Light] {
             assert_eq!(draw("Mine", a), SelectorDraw::Other("Mine".into()));
         }
@@ -3439,7 +3011,6 @@ mod tests {
     }
 
     /// Law: a built-in pair is symmetric, crosses appearances and names a
-    /// built-in; the families aterm ships both halves of are linked.
     #[test]
     fn builtin_pairs_are_symmetric_and_cross_appearance() {
         for theme in builtin_theme_list() {
@@ -3469,8 +3040,6 @@ mod tests {
                 Some(Appearance::Dark)
             );
         }
-        // Lookup is case-insensitive and answers canonically; an unpaired or
-        // unknown name has none.
         assert_eq!(builtin_pair("gruvbox dark"), Some("Gruvbox Light"));
         assert_eq!(builtin_pair("Nord"), None);
         assert_eq!(builtin_pair("Studio Night"), None);
@@ -3483,7 +3052,6 @@ mod tests {
     }
 
     /// A file's `name =` is its display name and its stem stays the id; an
-    /// omitted `appearance` takes the measured one, a declared one is kept.
     #[test]
     fn admission_takes_display_name_and_measured_appearance() {
         let clean = "foreground = #202020\nbackground = #f8f8f8\n";
@@ -3540,7 +3108,6 @@ mod tests {
             chrome: ChromeColors::default(),
             palette_generate: false,
         };
-        // Negative control: the clean base earns nothing.
         assert_eq!(admission_warnings(&base, Appearance::Dark), vec![]);
         let kinds = |scheme: &ColorScheme| {
             admission_warnings(scheme, Appearance::Dark)
@@ -3582,12 +3149,9 @@ mod tests {
                 hundredths: 0
             })]
         );
-        // An unset cursor follows the foreground: no separate cursor warning.
         let mut s = base.clone();
         s.cursor = None;
         assert_eq!(kinds(&s), vec![]);
-        // Authored chrome at the background is below its floor; the warning
-        // names the key and the floor aterm raises it to.
         for (key, floor) in [
             (ThemeKey::AccentColor, 300),
             (ThemeKey::BorderColor, 150),
@@ -3611,7 +3175,6 @@ mod tests {
             admission_warnings(&s, Appearance::Dark),
             vec![ThemeWarning::SearchMatchLikeSelection]
         );
-        // Negative control: good chrome earns nothing.
         let mut s = base.clone();
         s.chrome = ChromeColors {
             accent: Some(Rgb::new(0x7a, 0xa2, 0xf7)),
@@ -3620,7 +3183,6 @@ mod tests {
             search_match: Some(Rgb::new(0x3d, 0x6f, 0x2f)),
         };
         assert_eq!(admission_warnings(&s, Appearance::Dark), vec![]);
-        // The ratio is carried in hundredths and printed as a ratio.
         let mut s = base;
         s.foreground = Rgb::new(0x30, 0x30, 0x30);
         let warning = admission_warnings(&s, Appearance::Dark)[0];
@@ -3678,7 +3240,6 @@ mod tests {
     }
 
     /// The selector grammar, as a table: what the runtime draws for each
-    /// appearance and which issue kinds validation reports.
     #[test]
     fn theme_selector_table() {
         use Appearance::{Dark, Light};
@@ -3708,8 +3269,6 @@ mod tests {
                 Some("Day"),
                 &[],
             ),
-            // One-sided: the omitted side draws the named side's built-in
-            // pair, else the named side itself.
             ("dark:Nord", Some("Nord"), Some("Nord"), &[]),
             ("light:Day", Some("Day"), Some("Day"), &[]),
             (
@@ -3737,7 +3296,6 @@ mod tests {
                 Some("Solarized Light"),
                 &[I::EmptyName(Some(Dark))],
             ),
-            // Duplicates: the first wins, the second is an issue.
             (
                 "dark:A,dark:B",
                 Some("A"),
@@ -3796,7 +3354,6 @@ mod tests {
                     .collect::<Vec<_>>(),
                 "{raw:?} issue kinds: {issues:?}"
             );
-            // Side-carrying kinds name the side they are about.
             for (issue, kind) in issues.iter().zip(kinds.iter()) {
                 match (issue, kind) {
                     (I::DuplicateSide(a), I::DuplicateSide(b))
@@ -3811,8 +3368,6 @@ mod tests {
     }
 
     /// Law: a value is a split exactly when some segment classifies as a side,
-    /// and a name the validator admits is always a plain single selector that
-    /// round-trips as itself (so a catalog id can be written back verbatim).
     #[test]
     fn admitted_names_parse_as_themselves() {
         for name in [
@@ -3828,8 +3383,6 @@ mod tests {
             assert!(issues.is_empty(), "{name:?}: {issues:?}");
             assert_eq!(selector, ThemeSelector::Single(name.to_string()));
         }
-        // Negative control: a name the validator refuses as split syntax
-        // does not parse as a single name.
         assert!(validate_user_theme_name("dark:Nord").is_err());
         assert!(matches!(
             ThemeSelector::parse("dark:Nord").0,
@@ -3838,7 +3391,6 @@ mod tests {
     }
 
     /// The Default scheme's ANSI slots equal `ColorPalette::default_color` (one
-    /// source) and its `to_color_palette()` resolves every index to the same RGB.
     #[test]
     fn default_scheme_matches_palette_defaults() {
         let s = ColorScheme::default();
@@ -3859,10 +3411,6 @@ mod tests {
     }
 
     /// Law: every built-in, Default included, is legible as shipped. Body
-    /// text clears 4.5:1, the selection band reads as a band (1.5:1 on the
-    /// background), the cursor clears 3:1, and no ANSI slot is the
-    /// background (text in it would be invisible, and outside Windows'
-    /// theme-pair floor nothing rescues it by default).
     #[test]
     fn builtins_are_legible() {
         for theme in builtin_theme_list() {
@@ -3878,7 +3426,6 @@ mod tests {
             for (slot, colour) in s.ansi.iter().enumerate() {
                 assert_ne!(*colour, bg, "{name}: color{slot} is the background");
             }
-            // The admission check a user file gets finds nothing either.
             assert_eq!(
                 admission_warnings(&s, s.appearance),
                 [],
@@ -3888,11 +3435,6 @@ mod tests {
     }
 
     /// Law: aterm's signature themes clear their bars (text 7:1, every
-    /// chromatic slot 4.5:1, hues 25 deg apart, distinct brights, color8
-    /// between 3:1 and 4.5:1, a visible color0, legible whites, a 1.5:1
-    /// band under 4.5:1 text, a chromatic accent cursor at 3:1, balanced
-    /// chroma), and each pairs with a signature theme of the other
-    /// appearance. Negative control: Default, which is not one, misses bars.
     #[test]
     fn signature_themes_meet_their_bars() {
         let signature: Vec<BuiltinTheme> = builtin_theme_list()
@@ -3939,9 +3481,6 @@ mod tests {
     }
 
     /// A theme file that leaves `selection` out gets a band on its own
-    /// background's side: a light theme a light band, a dark theme a dark
-    /// one. Negative control: the fixed dark default (`SELECTION_DEFAULT`) sits on
-    /// the light theme's text side.
     #[test]
     fn an_unset_selection_follows_the_theme() {
         let light = parse_scheme_str("foreground = #24292f\nbackground = #fafafa\n")
@@ -3949,7 +3488,6 @@ mod tests {
         assert_eq!(light.selection, None);
         let (fg, bg) = (light.foreground, light.background);
         let band = light.selection_band();
-        // On the background's side of the theme, and visible on it.
         assert!(band.contrast(bg) < band.contrast(fg), "{band:?}");
         assert!(band.contrast(bg) >= MIN_SELECTION_CONTRAST, "{band:?}");
         assert!(fg.contrast(band) >= 4.5, "{band:?}");
@@ -3978,7 +3516,6 @@ mod tests {
         let band = dark.selection_band();
         assert!(band.contrast(dark.background) < band.contrast(dark.foreground));
         assert!(band.contrast(dark.background) >= MIN_SELECTION_CONTRAST);
-        // A set selection wins.
         let set =
             parse_scheme_str("fg = #000000\nbg = #ffffff\nselection = #123456\n").expect("parses");
         assert_eq!(set.selection_band(), Rgb::new(0x12, 0x34, 0x56));
@@ -3989,7 +3526,6 @@ mod tests {
     fn derived_selection_is_the_rounded_blend() {
         let black = Rgb::new(0, 0, 0);
         let white = Rgb::new(255, 255, 255);
-        // 255 * 22 / 100 = 56.1 -> 56; 255 * 78 / 100 = 198.9 -> 199.
         assert_eq!(derived_selection(white, black), Rgb::new(56, 56, 56));
         assert_eq!(derived_selection(black, white), Rgb::new(199, 199, 199));
         let grey = Rgb::new(0x80, 0x80, 0x80);
@@ -3997,15 +3533,8 @@ mod tests {
     }
 
     /// Every built-in light scheme is actually light (`Appearance::Light` AND a
-    /// background brighter than its foreground), and on EVERY built-in — dark or
-    /// light — the default foreground stays legible OVER the selection surface
-    /// (contrast ≥ 3.0:1). The built-ins carry no selection foreground — selected text
-    /// keeps its own colour, which the renderer floors to 4.5:1 against the selection —
-    /// so a scheme whose `selection` collapses onto the text colour would lean on that
-    /// floor for every selected cell; this guards the light-theme dark-fg→light-surface substitutions.
     #[test]
     fn light_builtins_are_light_and_selection_legible() {
-        // A quick perceptual luma (0-255) so "light" means what the eye sees.
         let luma =
             |c: Rgb| 0.299 * f64::from(c.r) + 0.587 * f64::from(c.g) + 0.114 * f64::from(c.b);
         let mut saw_light = 0;
@@ -4018,8 +3547,6 @@ mod tests {
                     "{name}: a Light scheme must have a background brighter than its fg"
                 );
             }
-            // Selection legibility: the band the scheme paints must hold
-            // ≥ 3.0:1 against the default foreground.
             let sel = s.selection_band();
             let contrast = s.foreground.contrast(sel);
             assert!(
@@ -4034,7 +3561,6 @@ mod tests {
     }
 
     /// A full disk theme string parses into the expected `ColorScheme`: chrome,
-    /// appearance, name, and every ANSI slot (with both `colorN` and alias keys).
     #[test]
     fn parse_scheme_str_full_theme() {
         let src = "\
@@ -4069,19 +3595,16 @@ color15 = #c0caf5
         assert_eq!(s.background, Rgb::new(0x1a, 0x1b, 0x26));
         assert_eq!(s.cursor, Some(Rgb::new(0x7a, 0xa2, 0xf7)));
         assert_eq!(s.selection, Some(Rgb::new(0x28, 0x34, 0x57)));
-        // ANSI slots, including the two alias-keyed entries.
         assert_eq!(s.ansi[0], Rgb::new(0x15, 0x16, 0x1e));
         assert_eq!(s.ansi[1], Rgb::new(0xf7, 0x76, 0x8e));
-        assert_eq!(s.ansi[2], Rgb::new(0x9e, 0xce, 0x6a)); // palette2
-        assert_eq!(s.ansi[3], Rgb::new(0xe0, 0xaf, 0x68)); // ansi3
+        assert_eq!(s.ansi[2], Rgb::new(0x9e, 0xce, 0x6a));
+        assert_eq!(s.ansi[3], Rgb::new(0xe0, 0xaf, 0x68));
         assert_eq!(s.ansi[15], Rgb::new(0xc0, 0xca, 0xf5));
-        // It projects through the existing sinks exactly like a built-in.
         assert_eq!(s.to_theme_parts().bg, 0x001a_1b26);
         assert_eq!(s.to_color_palette().get(1), Rgb::new(0xf7, 0x76, 0x8e));
     }
 
     /// A minimal theme (only the required fg/bg) is well-formed: missing ANSI slots
-    /// fall back to the engine defaults, cursor/selection stay `None`.
     #[test]
     fn parse_scheme_str_minimal_defaults_unset_slots() {
         let s = parse_scheme_str("foreground = #ffffff\nbackground = #000000\n")
@@ -4090,7 +3613,6 @@ color15 = #c0caf5
         assert_eq!(s.background, Rgb::new(0, 0, 0));
         assert_eq!(s.cursor, None);
         assert_eq!(s.selection, None);
-        // Unspecified slots equal the engine defaults (render-identical to unthemed).
         for i in 0u8..16 {
             assert_eq!(
                 s.ansi[i as usize],
@@ -4098,17 +3620,12 @@ color15 = #c0caf5
                 "slot {i}"
             );
         }
-        // `fg`/`bg` short aliases also work.
         let s2 = parse_scheme_str("fg = #abcdef\nbg = #123456\n").unwrap();
         assert_eq!(s2.foreground, Rgb::new(0xab, 0xcd, 0xef));
         assert_eq!(s2.background, Rgb::new(0x12, 0x34, 0x56));
     }
 
     /// Malformed inputs surface a precise `ThemeError::Parse` (line + reason);
-    /// missing required keys are rejected.
-    /// Spec `scheme-palette-generate-key`: `palette_generate` reads `true` and
-    /// `false` in any case, and an omitted key is off. NEGATIVE: any other
-    /// value, and the key set twice, are errors at their line.
     #[test]
     fn palette_generate_key_parses() {
         let base = "foreground = #d0d0d0\nbackground = #101010\n";
@@ -4128,24 +3645,18 @@ color15 = #c0caf5
 
     #[test]
     fn parse_scheme_str_rejects_malformed() {
-        // No '=' on a content line.
         let e = parse_scheme_str("foreground = #fff000\nnonsense\n").unwrap_err();
         assert!(matches!(e, ThemeError::Parse { line: 2, .. }), "{e:?}");
-        // Bad colour.
         let e = parse_scheme_str("foreground = #zzzzzz\nbackground = #000000\n").unwrap_err();
         assert!(matches!(e, ThemeError::Parse { line: 1, .. }), "{e:?}");
-        // Unknown key.
         let e =
             parse_scheme_str("foreground = #fff000\nbackground=#000000\nwidth = 80\n").unwrap_err();
         assert!(matches!(e, ThemeError::Parse { line: 3, .. }), "{e:?}");
-        // Out-of-range index.
         let e = parse_scheme_str("foreground=#ffffff\nbackground=#000000\ncolor16=#111111\n")
             .unwrap_err();
         assert!(matches!(e, ThemeError::Parse { .. }), "{e:?}");
-        // Neither 3 nor 6 digits.
         let e = parse_scheme_str("fg=#ffff\n").unwrap_err();
         assert!(matches!(e, ThemeError::Parse { line: 1, .. }), "{e:?}");
-        // Duplicate colour index.
         let e = parse_scheme_str(
             "foreground=#ffffff\nbackground=#000000\ncolor1=#111111\ncolor1=#222222\n",
         )
@@ -4154,7 +3665,6 @@ color15 = #c0caf5
             matches!(&e, ThemeError::Parse { reason, .. } if reason.contains("duplicate")),
             "{e:?}"
         );
-        // Missing required background.
         let e = parse_scheme_str("foreground = #ffffff\n").unwrap_err();
         assert!(
             matches!(&e, ThemeError::Parse { reason, .. } if reason.contains("background")),
@@ -4163,8 +3673,6 @@ color15 = #c0caf5
     }
 
     /// A leading byte-order mark is not part of the first key, and line
-    /// numbers still count from the line it sits on. Negative control: a
-    /// mark anywhere but the very start is still an unknown key.
     #[test]
     fn parse_theme_ignores_a_leading_byte_order_mark() {
         let plain = "foreground = #ffffff\nbackground = #000000\n";
@@ -4178,8 +3686,6 @@ color15 = #c0caf5
     }
 
     /// The canonical key, then any alias of the same key, is a duplicate whose
-    /// error names the second line; every scalar key and every alias pair is
-    /// covered. Negative control: each key set once, in any spelling, parses.
     #[test]
     fn parse_theme_duplicate_keys_fold_aliases() {
         let e = parse_scheme_str("foreground = #ffffff\nfg = #000000\nbackground = #000000\n")
@@ -4189,8 +3695,6 @@ color15 = #c0caf5
                 if reason.contains("duplicate") && reason.contains("line 1")),
             "{e:?}"
         );
-        // Every spelling of every scalar key, paired with every spelling of the
-        // same key: always a duplicate on the second line.
         let groups: &[&[(&str, &str)]] = &[
             &[("name", "A")],
             &[("description", "A")],
@@ -4220,7 +3724,6 @@ color15 = #c0caf5
                 }
             }
         }
-        // Negative control: each key once, under its alternate spelling, parses.
         let once = "name = A\ndescription = B\nauthor = C\nappearance = light\nfg = #111111\n\
                     bg = #eeeeee\ncursor_color = #222222\nselection_color = #333333\n\
                     selection_foreground = #444444\npalette1 = #555555\nansi2 = #666666\n";
@@ -4234,7 +3737,6 @@ color15 = #c0caf5
     }
 
     /// The `aterm.toml` spellings are the same slots as the short ones: a file
-    /// written either way parses to the same scheme.
     #[test]
     fn parse_theme_dtp_spellings_equal_short_ones() {
         let base = "foreground = #c0caf5\nbackground = #1a1b26\n";
@@ -4251,7 +3753,6 @@ color15 = #c0caf5
         let with_fg = parse_scheme_str(&format!("{base}selection_foreground = #ffffff\n"))
             .expect("selection_foreground parses");
         assert_eq!(with_fg.selection_fg, Some(Rgb::new(0xff, 0xff, 0xff)));
-        // Built-ins and Default carry none.
         assert_eq!(ColorScheme::default().selection_fg, None);
         for name in builtin_names() {
             assert_eq!(builtin(name).unwrap().selection_fg, None, "{name}");
@@ -4259,7 +3760,6 @@ color15 = #c0caf5
     }
 
     /// `#RGB` widens each digit to a byte, for every digit, with or without
-    /// `#`; any other length is refused.
     #[test]
     fn parse_hex_short_form_widens_each_digit() {
         assert_eq!(parse_hex("#abc"), parse_hex("#aabbcc"));
@@ -4275,7 +3775,6 @@ color15 = #c0caf5
             assert!(parse_hex(&format!("#{short}")).is_some());
             assert_eq!(parse_hex(&long), parse_hex(&format!("#{long}")), "{d}");
         }
-        // The bare three-digit spelling is a word, not a colour.
         for bad in [
             "", "#", "#a", "#ab", "#abcd", "#abcde", "#abcdefa", "#ggg", "#é12", "bad", "fed",
             "abc",
@@ -4288,7 +3787,6 @@ color15 = #c0caf5
     }
 
     /// `name`, `description` and `author` are bounded and free of control
-    /// characters; at the bound they are kept verbatim.
     #[test]
     fn parse_theme_text_fields_are_bounded() {
         let base = "fg = #ffffff\nbg = #000000\n";
@@ -4320,8 +3818,6 @@ color15 = #c0caf5
     }
 
     /// Other terminals' theme files fail to parse and the error names their
-    /// format and `aterm theme import`; a native file's own error carries no
-    /// hint (negative control).
     #[test]
     fn parse_theme_foreign_formats_are_named() {
         let cases: &[(&str, ForeignFormat)] = &[
@@ -4363,7 +3859,6 @@ color15 = #c0caf5
             );
             assert!(e.to_string().contains("aterm theme import"), "{e}");
         }
-        // Negative control: native files, valid or not, are not foreign.
         for native in [
             "foreground = #c0caf5\nbackground = #1a1b26\nwidth = 80\n",
             "foreground = #zzzzzz\nbackground = #1a1b26\n",
@@ -4387,7 +3882,6 @@ color15 = #c0caf5
     }
 
     /// An unknown key stays fatal, including Ghostty's keys and the key names
-    /// of other terminals that aterm does not read natively.
     #[test]
     fn parse_theme_unknown_keys_stay_fatal() {
         let base = "foreground = #c0caf5\nbackground = #1a1b26\n";
@@ -4399,7 +3893,6 @@ color15 = #c0caf5
             "cursor_text_color",
             "palette",
             "color16",
-            // A theme sets a size only as `font_size_scale`, never in pixels.
             "font_px",
             "font_size",
         ] {
@@ -4412,8 +3905,6 @@ color15 = #c0caf5
     }
 
     /// No spelling (name or alias, stem or plain) belongs to two rows. (That
-    /// every key has its row is the compiler's: `ThemeKey::row` is exhaustive
-    /// and a const assertion checks the table's order.)
     #[test]
     fn no_theme_key_spelling_names_two_keys() {
         let mut spellings = std::collections::HashSet::new();
@@ -4425,7 +3916,6 @@ color15 = #c0caf5
     }
 
     /// The file a writer builds from the table's examples, every key spelled
-    /// canonically (every slot of an indexed key), with `skip` left out.
     fn file_from_examples(skip: Option<ThemeKey>, alias: bool) -> String {
         let mut text = String::new();
         for spec in THEME_KEYS.iter().filter(|spec| Some(spec.key) != skip) {
@@ -4452,9 +3942,6 @@ color15 = #c0caf5
     }
 
     /// The parser reads keys by the table: a file of the table's examples
-    /// parses, under canonical names and aliases alike; leaving out a key the
-    /// table marks required is refused with that key named, and leaving out
-    /// any other key is not. Every example is a value of its key's type.
     #[test]
     fn theme_key_table_drives_the_parser() {
         let canonical = parse_theme_str(&file_from_examples(None, false)).expect("examples parse");
@@ -4478,14 +3965,12 @@ color15 = #c0caf5
                 assert!(without.is_ok(), "{} is optional: {without:?}", spec.name);
             }
         }
-        // Negative control: a key outside the table is still refused.
         let mut extra = file_from_examples(None, false);
         extra.push_str("colour16 = #000000\n");
         assert!(matches!(
             parse_theme_str(&extra),
             Err(ThemeError::Parse { key: Some(ref k), .. }) if k == "colour16"
         ));
-        // Each chrome key parses into its own slot.
         let chrome = canonical.scheme.chrome;
         for (key, slot) in [
             (ThemeKey::AccentColor, chrome.accent),
@@ -4497,7 +3982,6 @@ color15 = #c0caf5
             assert_eq!(chrome.slot(key), Some(slot));
             assert_eq!(theme_key_spec(key).group, ThemeKeyGroup::Chrome);
         }
-        // All four round-trip through both writers.
         for written in [
             crate::scheme_import::to_native_conf(&canonical.scheme, true, None, None, &[]),
             crate::scheme_import::to_native_conf_commented(
@@ -4511,8 +3995,6 @@ color15 = #c0caf5
             let back = parse_theme_str(&written).expect("the writer's file parses");
             assert_eq!(back.scheme, canonical.scheme, "{written}");
         }
-        // Negative controls: a chrome key set twice is a duplicate naming the
-        // first line, and a near-miss spelling is an unknown key.
         let mut twice = file_from_examples(None, false);
         let first = twice
             .lines()
@@ -4540,7 +4022,6 @@ color15 = #c0caf5
     }
 
     /// `parse_theme_located` says the line each key was set on, under any
-    /// spelling, and `None` for a key the file leaves out.
     #[test]
     fn parse_theme_located_points_at_each_key() {
         let text = "# c\nfg = #ffffff\n\nbackground = #000000\npalette3 = #123\n";
@@ -4559,8 +4040,6 @@ color15 = #c0caf5
     }
 
     /// The admission contrast warnings are exactly the contrast rows below
-    /// their bar, over every built-in and a sweep of synthetic themes; the
-    /// sweep includes themes that earn each warning (the negative control).
     #[test]
     fn contrast_warnings_are_the_report_rows_below_their_bar() {
         let mut schemes: Vec<ColorScheme> =
@@ -4631,7 +4110,6 @@ color15 = #c0caf5
                 has(ContrastPair::SelectionTextOnSelection),
                 scheme.selection_fg.is_some()
             );
-            // A chrome row only for an authored key.
             assert_eq!(
                 has(ContrastPair::AccentOnBackground),
                 scheme.chrome.accent.is_some()
@@ -4649,8 +4127,6 @@ color15 = #c0caf5
     }
 
     /// A scheme with no chrome omits the `chrome` key when serialized,
-    /// and one with chrome round-trips. NEGATIVE
-    /// CONTROL: the authored scheme's text does carry the key.
     #[cfg(feature = "serde")]
     #[test]
     fn chrome_serializes_only_when_authored() {

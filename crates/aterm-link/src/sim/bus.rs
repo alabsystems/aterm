@@ -1,114 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE BUS DOOR'S SIMULATED ARM: an in-memory model of astream's broker,
-//! served over astream's OWN wire (`astream_broker::proto`'s frames, decoded
-//! and encoded by astream's own codec) to astream's OWN client, so the bridge
-//! reaches it through exactly the calls it makes on a real broker.
-//!
-//! ## What it serves
-//!
-//! The requests the bridge makes, with astream's semantics:
-//!
-//! * `Hello`: the log's identity, the tier served and the table's rule count,
-//!   the LINEAGE (empty until the log's first move), the request set;
-//! * `Publish`: deduped by `(producer, seq)`; a malformed subject, or one of
-//!   the broker's own four (`/a/commit`, `/a/will`, `/a/bind`, `/a/retire`),
-//!   refused; a subject new to the index refused past its producer's budget
-//!   (`ERR_SUBJECT_BOUND`: the subjects it is charged for and its wills'
-//!   reservations); and a pipelined publish's acks in order;
-//! * `/a/retire` (a publish, any sequence): the subject retire — moot for an
-//!   absent target, refused for one charged to another producer
-//!   (`charged: `) or one a will can still append to (`will: `), and for a
-//!   target that is malformed or the broker's own;
-//! * `Will`: refused for a subject a publish could not take, a second
-//!   producer on a connection that holds one, a sequence in the ack half,
-//!   and a new subject past the budget; otherwise a hidden registration
-//!   record, which RESERVES its subject against its producer's budget until a
-//!   record of its lands there. It fires when its connection ends, and at
-//!   every open each producer's latest will on the log fires again; deduped
-//!   like a publish, fenced by any later sequence of its producer below
-//!   [`astream_broker::ACK_SEQ_BASE`], and exempt from the budget;
-//! * `Last` (a page in subject order that resumes after its last row once it
-//!   reached its max), `Fetch` (a page from a scan of at most
-//!   `FETCH_SCAN_MAX` records, its `Mark` naming the oldest offset: 0, for a
-//!   log nothing compacts), `Commit` (a hidden record; a group resumes at
-//!   `upto + 1`, max-folded), `Subscribe` and `SubscribeGroup` (every
-//!   matching record from the start, in order, then live; a refused one ends
-//!   its connection), `IdleMarks`, `Keepalive`, `Budget`;
-//! * a name past `MAX_NAME_LEN` refused before anything reads it.
-//!
-//! Every `Mark` carries the durable head. No capability is checked: the
-//! simulated broker is an unguarded one, as a test's broker is.
-//!
-//! ## Held to astream's broker
-//!
-//! A DIFFERENTIAL TEST plays scripts on this model and on a real
-//! `astream_broker::Broker` opened as aterm opens its own, and compares the
-//! answers request by request (`super::conform_broker`, sim item B01): one
-//! script per verb and edge, and the door's journal of seeded worlds
-//! ([`Event`], [`State::journal`]) — what real bridges sent. Each pin bump of
-//! `vendor/astream` re-runs it. What it leaves out is listed there.
-//!
-//! ## What a restart may lose: astream's power-loss law, P2-P7
-//!
-//! Every request this model answers is ACKED when it is answered, and the
-//! durable head ([`State::durable`]) is what the tier has flushed in full:
-//! everything on Strict; on Ordered what the horizon's flush or an escalation
-//! covered; on Relaxed what an escalation covered. An ESCALATED record — the
-//! table aterm hands its broker (`crate::durability::escalation`) — is
-//! durable at its ack on every tier (P3e). A restart ([`Broker::stop`]) is one
-//! of:
-//!
-//! * [`Stop::Clean`]: nothing lost, nothing moved (P5);
-//! * [`Stop::Crash`] — a process crash in the same boot: nothing acked lost,
-//!   nothing moved (P6);
-//! * [`Stop::PowerLoss`]: on Strict nothing acked is lost and nothing moves;
-//!   on Ordered and Relaxed the log keeps a PREFIX (P2) of at least the
-//!   durable head (P3, P3e) — any suffix of unescalated acked records may go —
-//!   and the generation moves by one with lineage `(g + 1, kept)`, every older
-//!   step clamped to it (P4, P7). The cut is the seed's, drawn from exactly
-//!   the cuts [`State::allowed_cuts`] lists, and [`law_check`] holds every
-//!   restart to the law independently of how the cut was drawn.
-//!
-//! WHAT IT DOES NOT COVER. P1 (no refusal with a known floor) holds by
-//! construction: the model always opens. P2 is checked as a prefix no longer
-//! than the log, not at a batch boundary: the model has no batches. P8 (rot)
-//! is not modelled: no byte of this log is ever damaged, so neither its
-//! refusal nor its cut with a move is drawn. Nor is a move after a process
-//! crash: astream moves a weak tier's generation after an unclean stop of a
-//! log off the boot volume, whose page cache it cannot vouch for, and here a
-//! crash never moves. A will live at a stop fires at the next open (its
-//! producer's latest on the log), where astream's connection thread may fire
-//! it at the stop instead, racing the shutdown: one of the two outcomes the
-//! race allows. The table's principal rule (`h-`) escalates by the world's
-//! producer names ([`Broker::name_producer`]); astream applies it only to a
-//! producer a bound grant attached (`/a/bind`), which an unguarded broker
-//! never has.
-//!
-//! ## Held acks: the answer behind the record (aterm-0)
-//!
-//! A real broker's writer appends a batch, wakes its tails and writes the
-//! batch's acks, and a subscriber can read a record before its publisher
-//! reads the ack — or the other way round. With [`State::holds`] set, an ack
-//! is HELD at the seed's choice: the record is on the log and readable, and
-//! the answer waits ([`ConnState::held`]), with every answer behind it on that
-//! connection. A read that may wait gets it (the wait is the batch's flush);
-//! a read that must not wait — the bridge's try ([`crate::fx::Fx::unwaited`])
-//! — finds it not yet there; the world's [`Broker::answer_held`] sends it, as
-//! a flush landing between two of the bridge's passes. So the bridge's
-//! non-blocking loop meets every order of a delivery and its own post's ack,
-//! a reply and the commit before it, and the counts say it did
-//! ([`Broker::held_counts`]).
-//!
-//! ## Deterministic by construction
-//!
-//! A request is processed inside the client's own `write`, on the bridge's
-//! thread, and its reply queued for the client's next `read` — or held, at
-//! the seed's choice, until a read that waits or the world releases it; a
-//! subscription's deliveries are produced only when the scheduler's pump
-//! reads it ([`crate::sim::Core::pump`]). A connection a client drops or
-//! closes ends at that call, and its will fires then.
+//! THE BUS DOOR'S SIMULATED ARM.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::io::{self, Read};
@@ -159,11 +52,9 @@ pub(crate) struct Rec {
     /// `(producer id, producer seq)` for a deduped write.
     pub(crate) key: Option<(u64, u64)>,
     pub(crate) kind: Kind,
-    /// Whether the broker's own escalation table named it
-    /// ([`Escalation::escalates`]): it was acked only once flushed in full.
+    /// Whether the broker's own escalation table named it ([`Escalation::escalates`]): it was acked only once flushed in full.
     pub(crate) escalated: bool,
-    /// The principal of the producer that wrote it, as the world named it
-    /// ([`Broker::name_producer`]): what the oracle's principal rule reads.
+    /// The principal of the producer that wrote it, as the world named it ([`Broker::name_producer`]).
     pub(crate) principal: Option<String>,
 }
 
@@ -173,13 +64,7 @@ impl Rec {
     }
 }
 
-/// THE ESCALATION TABLE the model applies: aterm's, READ OFF the table
-/// `crate::durability::escalation` hands astream ([`Escalation::aterm`]), rule
-/// by rule, so a change to the shipped table is the change the simulated
-/// broker escalates — never a copy of it that a change leaves behind. The
-/// model reads a producer's principal from the world's own map
-/// ([`Broker::name_producer`]), as astream's crash simulation keeps its own
-/// oracle of what is escalated.
+/// THE ESCALATION TABLE the model applies.
 #[derive(Clone, Debug)]
 pub(crate) struct Escalation {
     pub(crate) subjects: Vec<Filter>,
@@ -188,15 +73,12 @@ pub(crate) struct Escalation {
 }
 
 impl Escalation {
-    /// aterm's table, the one it opens its broker with
-    /// (`crate::durability::escalation`).
+    /// aterm's table, the one it opens its broker with (`crate::durability::escalation`).
     pub(crate) fn aterm() -> Self {
         Self::of(&crate::durability::escalation())
     }
 
-    /// The model of `table`: each rule's filter parsed as astream parses it
-    /// at the open. A rule kind this model has no semantics for stops the
-    /// world rather than escalate nothing in its place.
+    /// The model of `table`: each rule's filter parsed as astream parses it at the open.
     pub(crate) fn of(table: &astream_broker::Escalation) -> Self {
         use astream_broker::Escalate;
         let f = |s: &str| Filter::new(s).expect("an escalation filter astream opens with");
@@ -241,7 +123,6 @@ impl Escalation {
                         self.principal_prefixes.iter().any(|pre| p.starts_with(pre))
                     })
             }
-            // Hidden records escape the principal rule (astream's own claim).
             Kind::WillReg(_) | Kind::Retire => false,
         }
     }
@@ -255,7 +136,6 @@ struct Will {
     subject: String,
     body: Vec<u8>,
     /// The offset of its registration record: the log holds the will only
-    /// while it holds this.
     reg_off: u64,
     /// The connection it was registered on, while that connection lives.
     conn: Option<u64>,
@@ -272,10 +152,6 @@ struct ConnState {
     inbound: Vec<u8>,
     out: VecDeque<u8>,
     /// Answers the broker has made and not yet SENT, oldest first: a write
-    /// whose batch is still in its flush ([`State::answer`]). Released whole
-    /// by a read that may wait (the wait is the flush) or by the world's
-    /// [`Broker::answer_held`]; a read that must not wait finds them not yet
-    /// there ([`crate::fx::Fx::unwaited`]).
     held: VecDeque<Held>,
     open: bool,
     /// `Some((cursor, filter))` once it is a subscription.
@@ -286,7 +162,6 @@ struct ConnState {
 #[derive(Debug)]
 struct Held {
     /// The record a `PublishAck` names: what the reorder count reads
-    /// ([`State::seen_before_ack`]).
     ack_of: Option<u64>,
     /// The framed answer.
     frame: Vec<u8>,
@@ -298,9 +173,7 @@ pub(crate) struct State {
     pub(crate) up: bool,
     pub(crate) tier: Tier,
     pub(crate) table: Escalation,
-    /// What the ORACLE escalates — aterm's table always, so a broker run
-    /// with a weaker table (a negative control) is caught losing a record
-    /// the law protects.
+    /// What the ORACLE escalates.
     pub(crate) oracle: Escalation,
     pub(crate) id: [u8; 16],
     pub(crate) generation: u64,
@@ -316,54 +189,30 @@ pub(crate) struct State {
     /// producer -> its highest sequence below the ack half.
     max_seq: BTreeMap<u64, u64>,
     /// producer -> the subjects its registered wills hold against its subject
-    /// budget until a record of its lands on them ([`State::reserve`]):
-    /// astream's `will_reserved`.
     reserved: BTreeMap<u64, std::collections::BTreeSet<String>>,
     wills: Vec<Will>,
     conns: BTreeMap<u64, ConnState>,
     next_conn: u64,
     /// Producer id -> principal, for the principal rule.
     principals: BTreeMap<u64, String>,
-    /// Refuse the next this-many publishes by a NODE producer, and group
-    /// commits, `ERR_REFUSED` (a batch rolled back), appending nothing.
+    /// Refuse the next this-many publishes by a NODE producer, and group commits, `ERR_REFUSED` (a batch rolled back), appending nothing.
     pub(crate) refuse_next: u32,
-    /// HELD ACKS (aterm-0): the seed's stream that decides which of a
-    /// connection's acks the broker answers late — its batch still in its
-    /// flush while the record is already readable — or `None` for a broker
-    /// that answers every write as it serves it ([`State::answer`]).
+    /// HELD ACKS (aterm-0): the seed's stream that decides which of a connection's acks the broker answers late.
     pub(crate) holds: Option<Rng>,
-    /// How many answers were held, how many reads that must not wait found
-    /// one not yet there, and how many records a subscription handed over
-    /// while their publish's ack was still held — the reorder the non-blocking
-    /// loop must survive: the bridge can take its own post's delivery before
-    /// its ack.
+    /// How many answers were held, how many reads that must not wait found one not yet there, and how many records a subscription handed over while their publish's ack was still held.
     pub(crate) held_total: u64,
     pub(crate) tries_not_yet: u64,
     pub(crate) seen_before_ack: u64,
-    /// NEGATIVE CONTROLS of the arm itself ([`law_check`]'s): lose below the
-    /// durable head; lose with no move.
+    /// NEGATIVE CONTROLS of the arm itself ([`law_check`]'s): lose below the durable head; lose with no move.
     pub(crate) mutant: ArmMutant,
     /// A SIBLING RACING AN ATTACH ([`Race`]), in the worlds that have one.
     pub(crate) race: Option<Race>,
-    /// THE DOOR'S JOURNAL ([`Event`]), in a world that keeps one: every
-    /// connection, served request, delivery, connection end, world write and
-    /// restart, in order.
+    /// THE DOOR'S JOURNAL ([`Event`]), in a world that keeps one.
     pub(crate) journal: Option<Vec<Event>>,
     notes: Vec<String>,
 }
 
-/// A SIBLING THAT RACES ONE OF THE NODE'S ATTACHES (
-/// `super::world::Opts::race`): a copy of the state dir, under the node's id
-/// and so its producer, whose bridge read the node face before this node's
-/// attach presented anything and takes the incarnation above it — one this
-/// node's state dir took for an attach the broker refused, which presented
-/// nothing. The broker refuses the node's [`Race::refuse_will`]-th will
-/// request, as a batch whose commit failed; inside a later one, while
-/// nothing of the refused incarnation is on the log, the sibling's node row
-/// and its session's row land at that incarnation's sequences, flushed, and
-/// it never dies. Inside the request, so the attach that sent it read the
-/// face before them: the interleaving a sibling acting between two of the
-/// scheduler's steps never reaches.
+/// A SIBLING THAT RACES ONE OF THE NODE'S ATTACHES ( `super::world::Opts::race`).
 #[derive(Debug, Default)]
 pub(crate) struct Race {
     /// Which of the node's will requests is refused, counting from 1.
@@ -377,12 +226,9 @@ pub(crate) struct Race {
     /// The sibling's node face and session face.
     pub(crate) node_face: String,
     pub(crate) session_face: String,
-    /// What the sibling's rows carry past the fields every row has, each
-    /// token led by its space.
+    /// What the sibling's rows carry past the fields every row has, each token led by its space.
     pub(crate) extra: String,
-    /// Instead of a previously refused incarnation, take the attach's current
-    /// incarnation after its Last read, before its will is registered. Its
-    /// first node publish then collides and its own will fires on disconnect.
+    /// Instead of a previously refused incarnation, take the attach's current incarnation after its Last read, before its will is registered.
     pub(crate) alias: bool,
     /// The actual colliding first node publish and sibling record offset.
     pub(crate) collision: Option<(u64, u64)>,
@@ -399,26 +245,18 @@ pub(crate) enum ArmMutant {
     LoseWithoutMove,
     /// A move whose lineage claims the whole old log (breaks P7).
     LineageAtHead,
-    /// A resent `(producer, seq)` is appended again under a fresh offset,
-    /// never deduped: the differential test's negative control
-    /// (`super::conform_broker`).
+    /// A resent `(producer, seq)` is appended again under a fresh offset, never deduped.
     FreshDedup,
-    /// A will fires whatever its producer published since: the differential
-    /// test's other negative control.
+    /// A will fires whatever its producer published since: the differential test's other negative control.
     NoWillFence,
-    /// Corrupt each published payload byte: the differential must compare bytes,
-    /// including distinct malformed UTF-8 sequences.
+    /// Corrupt each published payload byte: the differential must compare bytes, including distinct malformed UTF-8 sequences.
     AlterPayload,
 }
 
-/// One visible record as the oracle reads it: `(offset, subject, body,
-/// producer key)`.
+/// One visible record as the oracle reads it: `(offset, subject, body, producer key)`.
 pub(crate) type Visible = (u64, String, Vec<u8>, Option<(u64, u64)>);
 
-/// ONE THING THAT HAPPENED AT THE BROKER'S DOOR, as a world's broker that keeps
-/// a journal ([`State::journal`]) records it: what the differential test
-/// (`super::conform_broker`) replays against astream's own broker, so the
-/// requests it holds the model to are the ones a real bridge sent.
+/// ONE THING THAT HAPPENED AT THE BROKER'S DOOR, as a world's broker that keeps a journal ([`State::journal`]) records it.
 #[derive(Clone, Debug)]
 pub(crate) enum Event {
     /// A connection opened ([`dial_stream`]).
@@ -522,9 +360,7 @@ impl Broker {
         std::mem::take(&mut lock(&self.state).notes)
     }
 
-    /// A WORLD PRODUCER's write (a peer node, a person): appended as a
-    /// publish from no connection, deduped by its key. `None` while the
-    /// broker is down.
+    /// A WORLD PRODUCER's write (a peer node, a person): appended as a publish from no connection, deduped by its key.
     pub(crate) fn publish_as(
         &self,
         producer: u64,
@@ -550,16 +386,13 @@ impl Broker {
         lock(&self.state).holds = Some(rng);
     }
 
-    /// THE BROKER ANSWERS WHAT IT HELD: every held answer on every connection
-    /// is sent, as a batch's flush landing does; and with `and_stop`, none is
-    /// held from now on. How many were sent.
+    /// THE BROKER ANSWERS WHAT IT HELD: every held answer on every connection is sent, as a batch's flush landing does.
     pub(crate) fn answer_held(&self, and_stop: bool) -> usize {
         let mut s = lock(&self.state);
         if and_stop {
             s.holds = None;
         }
         let mut sent = 0;
-        // Only a connection still open: a dead one's answers died with it.
         for c in s.conns.values_mut().filter(|c| c.open) {
             sent += c.held.len();
             for h in c.held.drain(..) {
@@ -572,18 +405,13 @@ impl Broker {
         sent
     }
 
-    /// The held-ack counts ([`State::held_total`]): held, tries that found
-    /// one not yet there, records handed over before their ack.
+    /// The held-ack counts ([`State::held_total`]): held, tries that found one not yet there, records handed over before their ack.
     pub(crate) fn held_counts(&self) -> (u64, u64, u64) {
         let s = lock(&self.state);
         (s.held_total, s.tries_not_yet, s.seen_before_ack)
     }
 
-    /// THE RECORDS WHOSE ACKS THIS BROKER HOLDS for process `pid` on its open
-    /// connections ([`ConnState::held`]): `(offset, subject, body)`, what a
-    /// writer still waits to be told landed — the oracle's idle law reads it
-    /// when the process parks ([`crate::sim::Process::idle`]). A record a
-    /// restart cut is gone from the log and named no more.
+    /// THE RECORDS WHOSE ACKS THIS BROKER HOLDS for process `pid` on its open connections ([`ConnState::held`]).
     pub(crate) fn held_for(&self, pid: u64) -> Vec<(u64, String, Vec<u8>)> {
         let s = lock(&self.state);
         s.conns
@@ -607,9 +435,7 @@ impl Broker {
         }
     }
 
-    /// Whether a subscription's next read has something to answer: a frame
-    /// owed, or its end — a connection the broker no longer has (a restart
-    /// ended it) reads as its end, as a dead broker's socket does.
+    /// Whether a subscription's next read has something to answer: a frame owed, or its end.
     pub(crate) fn readable(&self, conn: u64) -> bool {
         let s = lock(&self.state);
         let Some(c) = s.conns.get(&conn) else {
@@ -638,9 +464,7 @@ impl Broker {
         }
     }
 
-    /// STOP THE BROKER (`stop`), choosing what the restart keeps with `rng`
-    /// among exactly the cuts the law allows ([`State::allowed_cuts`]). It
-    /// stays down until [`Broker::start`].
+    /// STOP THE BROKER (`stop`), choosing what the restart keeps with `rng` among exactly the cuts the law allows ([`State::allowed_cuts`]).
     pub(crate) fn stop(&self, stop: Stop, rng: &mut Rng) -> Restart {
         self.stop_choosing(stop, rng, |cuts, rng| {
             let pick = usize::try_from(rng.below(cuts.len() as u64)).unwrap_or(0);
@@ -648,10 +472,7 @@ impl Broker {
         })
     }
 
-    /// [`Broker::stop`], KEEPING THE WHOLE LOG whatever the law would allow it to
-    /// cut: a power loss after which every record survived, as a reboot after the
-    /// page cache reached the disk leaves it — what the differential test holds
-    /// to astream's reopen in a boot it cannot name.
+    /// [`Broker::stop`], KEEPING THE WHOLE LOG whatever the law would allow it to cut.
     pub(crate) fn stop_keeping_all(&self, stop: Stop) -> Restart {
         self.stop_choosing(stop, &mut Rng::new(0), |cuts, _| cuts.last().copied())
     }
@@ -668,11 +489,7 @@ impl Broker {
         let durable_before = s.durable;
         let generation_before = s.generation;
         let tier = s.tier;
-        // Every connection ends with the process; no will fires until the
-        // next open re-fires every will the log still holds.
         s.up = false;
-        // What it held unanswered dies with it: a write it took and never
-        // answered is one whose fate the writer must learn by its retry.
         for c in s.conns.values_mut() {
             c.open = false;
             c.held.clear();
@@ -688,8 +505,6 @@ impl Broker {
         let moves = stop == Stop::PowerLoss && s.tier != Tier::Strict;
         let moves = moves && !(s.mutant == ArmMutant::LoseWithoutMove);
         s.log.truncate(usize::try_from(kept).unwrap_or(usize::MAX));
-        // What the kept log says is what it says from now on: its group cursors,
-        // its index, its dedup — read off it now, not at the next open.
         s.rebuild();
         if moves {
             s.generation += 1;
@@ -728,11 +543,7 @@ impl Broker {
         }
     }
 
-    /// OPEN AGAIN: rebuild every index from the log that survived, call it
-    /// durable (the open's flush), and re-fire the wills it still holds as
-    /// astream's open does: each producer's LATEST registration on the log
-    /// (`BrokerLog::pending_wills`), in log order, whatever became of it — one
-    /// that fired dedups, one a later incarnation fenced appends nothing.
+    /// OPEN AGAIN: rebuild every index from the log that survived, call it durable (the open's flush), and re-fire the wills it still holds as astream's open does.
     pub(crate) fn start(&self) {
         let mut s = lock(&self.state);
         s.note_event(|| Event::Start);
@@ -748,8 +559,7 @@ impl Broker {
         s.notes.push(line);
     }
 
-    /// Where the inbox group `group` resumes: one past its committed offset,
-    /// or 0 with no commit on the log.
+    /// Where the inbox group `group` resumes: one past its committed offset, or 0 with no commit on the log.
     pub(crate) fn group_start(&self, group: &str) -> u64 {
         lock(&self.state)
             .groups
@@ -757,9 +567,7 @@ impl Broker {
             .map_or(0, |upto| upto + 1)
     }
 
-    /// Whether a will of `producer` at `seq` firing now would be FENCED — a
-    /// record of the producer at a higher sequence is on the log — as
-    /// [`State::fire`] judges one.
+    /// Whether a will of `producer` at `seq` firing now would be FENCED.
     pub(crate) fn fences(&self, producer: u64, seq: u64) -> bool {
         lock(&self.state)
             .max_seq
@@ -767,16 +575,12 @@ impl Broker {
             .is_some_and(|&high_water| astream_broker::proto::will_is_fenced(high_water, seq))
     }
 
-    /// The highest incarnation `producer` ever put anything on the log under,
-    /// in astream's layout — a record, hidden or not, or a will's
-    /// registration — or 0: what a power cut's next boot must take its
-    /// incarnations above, for the oracle.
+    /// The highest incarnation `producer` ever put anything on the log under, in astream's layout.
     pub(crate) fn max_incarnation(&self, producer: u64) -> u64 {
         lock(&self.state).max_incarnation(producer)
     }
 
-    /// The finite alias actually registered two wills at one incarnation,
-    /// collided on the first node publish, and fired only the loser's will.
+    /// The finite alias actually registered two wills at one incarnation, collided on the first node publish, and fired only the loser's will.
     pub(crate) fn alias_collision_completed(&self) -> bool {
         let s = lock(&self.state);
         let Some(race) = s
@@ -810,10 +614,7 @@ impl Broker {
 }
 
 impl State {
-    /// EXACTLY THE CUTS THE LAW ALLOWS a restart of this kind to keep: the
-    /// whole log, or — a power loss on Ordered or Relaxed — any prefix at or
-    /// above the durable head (every escalated record is below it: its full
-    /// flush raised it).
+    /// EXACTLY THE CUTS THE LAW ALLOWS a restart of this kind to keep: the whole log, or.
     pub(crate) fn allowed_cuts(&self, stop: Stop) -> Vec<u64> {
         let head = self.log.len() as u64;
         match (stop, self.tier) {
@@ -823,8 +624,6 @@ impl State {
     }
 
     /// Rebuild the dedup map, the index, the group cursors and the fence
-    /// from the log, as an open does; forget the firing of a will whose
-    /// firing record the log no longer holds.
     fn rebuild(&mut self) {
         self.dedup.clear();
         self.index.clear();
@@ -866,9 +665,6 @@ impl State {
             w.conn = None;
         }
         self.conns.retain(|_, c| c.open);
-        // THE RESERVATIONS an open rebuilds (`reserve_pending_will_subjects`):
-        // each producer's latest will on the log that nothing of its producer
-        // above it fenced or said, on a subject not in the index.
         self.reserved.clear();
         for i in self.latest_wills().into_values() {
             if !self.settled_above(i) {
@@ -880,7 +676,6 @@ impl State {
     }
 
     /// Hold `subject` against `producer`'s budget for its will, unless the
-    /// index holds it already (`reserve_will_subject`).
     fn reserve(&mut self, producer: u64, subject: String) {
         if !astream_broker::store::is_hidden_subject(&subject) && !self.index.contains_key(&subject)
         {
@@ -889,7 +684,6 @@ impl State {
     }
 
     /// Whether the log holds will `i`: its registration record is on it (a
-    /// power loss may have cut it, and a later record taken its offset).
     fn holds_will(&self, i: usize) -> bool {
         self.wills.get(i).is_some_and(|w| {
             usize::try_from(w.reg_off)
@@ -900,7 +694,6 @@ impl State {
     }
 
     /// Each producer's LATEST will on the log, by its registration
-    /// (`BrokerLog::latest_wills`): producer -> will.
     fn latest_wills(&self) -> BTreeMap<u64, usize> {
         let mut latest: BTreeMap<u64, usize> = BTreeMap::new();
         for i in (0..self.wills.len()).filter(|&i| self.holds_will(i)) {
@@ -916,7 +709,6 @@ impl State {
     }
 
     /// Whether a record of will `i`'s producer ABOVE its registration says
-    /// its key or outranks it (astream's `settled_above`).
     fn settled_above(&self, i: usize) -> bool {
         let w = &self.wills[i];
         self.log
@@ -936,8 +728,6 @@ impl State {
     }
 
     /// Whether will `w` could still append: no record of its producer
-    /// outranks it, and its own key is not on the log
-    /// (`will_can_still_append`).
     fn can_still_append(&self, w: &Will) -> bool {
         !self
             .max_seq
@@ -947,8 +737,6 @@ impl State {
     }
 
     /// Whether a will that can still append targets `subject`: one a live
-    /// connection holds, or a producer's latest on the log
-    /// (`will_targets_subject`) — what refuses a retire of it.
     fn will_targets(&self, subject: &str) -> bool {
         let latest = self.latest_wills();
         self.wills.iter().enumerate().any(|(i, w)| {
@@ -964,8 +752,6 @@ impl State {
     }
 
     /// Whether `producer`'s record on `subject` would open a subject past its
-    /// budget: the index entries charged to it and its wills' reservations
-    /// but this subject's (`subject_bound_exceeded`).
     fn past_the_budget(&self, producer: u64, subject: &str) -> bool {
         if self.index.contains_key(subject) {
             return false;
@@ -992,7 +778,6 @@ impl State {
                 .get(&rec.subject)
                 .map_or_else(|| rec.key.map_or(0, |k| k.0), |(_, c)| *c);
             self.index.insert(rec.subject.clone(), (off, charged));
-            // The subject landed: its producer's reservation of it is spent.
             if let Some((producer, _)) = rec.key {
                 if let Some(held) = self.reserved.get_mut(&producer) {
                     if held.remove(&rec.subject) && held.is_empty() {
@@ -1006,8 +791,6 @@ impl State {
         let head = self.log.len() as u64;
         match self.tier {
             Tier::Strict => self.durable = head,
-            // AN ESCALATED RECORD IS ACKED ONLY ONCE A FULL FLUSH COVERED IT,
-            // and a full flush covers everything before it too.
             Tier::Ordered | Tier::Relaxed if escalated => self.durable = head,
             _ => {}
         }
@@ -1039,10 +822,6 @@ impl State {
     }
 
     /// THE RACE ([`Race`]) at one of a NODE producer's will requests: the
-    /// one it refuses, and the later one inside which the sibling attaches at
-    /// the refused incarnation — while nothing of that incarnation is on the
-    /// log, so the sibling takes it as a bridge takes `max(local, Last) + 1`.
-    /// The refusal's answer, or `None` for a will to register as usual.
     fn race_at_will(&mut self, producer: u64, seq: u64) -> Option<Vec<Response>> {
         if !self
             .principal(producer)
@@ -1058,9 +837,6 @@ impl State {
             if let Some(n) = at {
                 if let Some(base) = astream_broker::incarnation_base(n) {
                     let refuse_next = std::mem::take(&mut self.refuse_next);
-                    // A distinct live connection takes the SAME will through
-                    // the normal broker handler. The race is taken out of
-                    // self during this call, so it cannot recurse into itself.
                     let sibling_conn = self.next_conn;
                     self.next_conn += 1;
                     self.conns.insert(
@@ -1122,8 +898,6 @@ impl State {
         {
             let base = astream_broker::incarnation_base(n);
             if let Some(base) = base.filter(|_| at > n && self.max_incarnation(producer) + 1 == n) {
-                // ANOTHER BRIDGE'S BATCH: the node's rolled-back batches are
-                // this bridge's, not the sibling's.
                 let refuse_next = std::mem::take(&mut self.refuse_next);
                 let rows = [
                     (
@@ -1154,13 +928,6 @@ impl State {
     }
 
     /// QUEUE `responses` ON `conn`'S STREAM, in order: sent at once, or HELD
-    /// (aterm-0) — an ack the broker answers late, its batch still in its
-    /// flush, while the record it names is already readable, as a real
-    /// broker's writer wakes its tails and writes its acks in no fixed order
-    /// — when this broker holds acks ([`State::holds`]) and the seed says so;
-    /// and always behind an answer already held, because a connection is
-    /// answered in the order it wrote. Only an ack starts a hold: every other
-    /// answer is a request's own reply, read by a read that waits.
     fn answer(&mut self, conn: u64, responses: &[Response]) {
         let State {
             conns,
@@ -1193,10 +960,6 @@ impl State {
     }
 
     /// One publish, as astream's `serve_publish` and the writer's
-    /// `stage_publish` take it: `/a/retire` is a retire ([`State::retire`]);
-    /// a malformed subject or one of the broker's own is refused; a resent
-    /// key dedups; a new subject past the producer's budget is refused; the
-    /// append.
     fn publish(
         &mut self,
         producer: u64,
@@ -1208,7 +971,6 @@ impl State {
     }
 
     /// [`State::publish`], held to the subject budget or not: a will's
-    /// firing is exempt (its registration was held to it, and reserved it).
     fn publish_bounded(
         &mut self,
         producer: u64,
@@ -1279,11 +1041,6 @@ impl State {
     }
 
     /// A SUBJECT RETIRE (`/a/retire`, its body the target), as astream's
-    /// `serve_publish` and `stage_retire` take one: a target that is not a
-    /// subject, or is the broker's own (`/a/...`), is refused; an absent one
-    /// is moot (the head, deduped); one charged to another producer is
-    /// refused `charged: `, one a will can still append to `will: `;
-    /// otherwise the index forgets it and a hidden record says so.
     fn retire(&mut self, producer: u64, body: &[u8]) -> Result<(u64, bool), Box<Response>> {
         use astream_broker::proto::{
             ERR_BAD_SUBJECT, ERR_RECORD_REFUSED, ERR_RETIRE_REFUSED, RETIRE_CHARGED_PREFIX,
@@ -1341,7 +1098,6 @@ impl State {
     }
 
     /// Will `i`'s connection ended: it fires, unless a later will on that
-    /// connection replaced it or it fired already.
     fn fire(&mut self, i: usize) {
         if self
             .wills
@@ -1353,9 +1109,6 @@ impl State {
     }
 
     /// FIRE will `i` (astream's `stage_will_fire`): FENCED — nothing appended —
-    /// when a record of its producer outranks it; otherwise an ordinary
-    /// publish under its key, so one already said dedups, exempt from the
-    /// subject budget.
     fn fire_will(&mut self, i: usize) {
         let Some(w) = self.wills.get(i).cloned() else {
             return;
@@ -1461,7 +1214,6 @@ impl State {
                     }),
                     rules: self.table.rules(),
                 }),
-                // Every open log has a lineage, empty until its first move.
                 lineage: astream_broker::Lineage::from_steps(&self.lineage),
                 requests: Some(astream_broker::REQUEST_RETIRE),
                 health: None,
@@ -1473,8 +1225,6 @@ impl State {
     /// Answer one request on `conn`: the frames it writes back.
     fn handle(&mut self, conn: u64, req: Request) -> Vec<Response> {
         let head = self.log.len() as u64;
-        // A NAME PAST astream's BOUND is refused before anything parses it
-        // (`oversized_name`).
         if let Some(msg) = oversized_name(&req) {
             return vec![Response::Error {
                 code: astream_broker::proto::ERR_RECORD_REFUSED,
@@ -1509,8 +1259,6 @@ impl State {
             } => self.register(conn, producer_id, producer_seq, subject, body),
             Request::Commit { group, upto } => {
                 // A BATCH ROLLED BACK refuses the group commit in it too: the
-                // bridge's commit rides the pipeline beside its publishes
-                // (aterm-0), and only a bridge's connection commits here.
                 if self.refuse_next > 0 {
                     self.refuse_next -= 1;
                     self.notes.push(format!(
@@ -1550,13 +1298,6 @@ impl State {
                         msg: format!("bad filter {filter:?}"),
                     }];
                 };
-                // astream's page (`last_matching`): at most `max` rows after
-                // `after`, in subject order; a page that reached its max
-                // resumes after its last row, whether or not more follow; a
-                // head query (`max` 0) is a page of none with nothing to
-                // resume. Its per-round scan bound is invisible below
-                // `LAST_RESUME_ROUNDS` x `LAST_SCAN_MAX` index entries
-                // (module doc).
                 let max = max.min(astream_broker::broker::LAST_PAGE_MAX) as usize;
                 let mut out = Vec::new();
                 let mut resume = String::new();
@@ -1598,11 +1339,6 @@ impl State {
                         msg: format!("bad filter {filter:?}"),
                     }];
                 };
-                // astream's page (`fetch_from`): at most `max` records, from a
-                // scan of at most `FETCH_SCAN_MAX` records — a sparse filter's
-                // page may end with none, its cursor moved on — and a `Mark`
-                // that names the oldest offset the filter reaches: 0, on a log
-                // nothing ever compacted.
                 let mut out = Vec::new();
                 let mut next = from_offset;
                 if max > 0 {
@@ -1653,12 +1389,6 @@ impl State {
     }
 
     /// REGISTER A WILL on `conn`, as astream's `serve_will` and the writer's
-    /// `stage_will_register` take one: a subject a publish could not take is
-    /// refused; so is a second producer's on a connection that holds one; so
-    /// is a sequence in the ack half, which no later record could fence; and
-    /// a subject new to the index past its producer's budget. Otherwise a
-    /// hidden record holds it, it replaces the connection's earlier will,
-    /// and its subject is reserved against the budget until it lands.
     fn register(
         &mut self,
         conn: u64,
@@ -1749,7 +1479,6 @@ impl State {
 }
 
 /// Why a publish (or a will) may not name `subject`, as astream's
-/// `publish_subject_error` says: not a subject, or one of the broker's own.
 fn subject_error(subject: &str) -> Option<Box<Response>> {
     if astream_wire::Subject::new(subject).is_err() {
         Some(refused(
@@ -1767,7 +1496,6 @@ fn subject_error(subject: &str) -> Option<Box<Response>> {
 }
 
 /// A name in `req` past astream's bound (`MAX_NAME_LEN`), as its
-/// `oversized_name` refuses one before anything parses it.
 fn oversized_name(req: &Request) -> Option<String> {
     let names: Vec<(&str, &str)> = match req {
         Request::Publish { subject, .. } | Request::Will { subject, .. } => {
@@ -1801,9 +1529,7 @@ fn put(out: &mut VecDeque<u8>, resp: &Response) {
     out.extend(bytes);
 }
 
-/// DIAL the world's broker for process `p`: a connection over a stream into
-/// the model, and its closer. Refused while the broker is down, as a socket
-/// nobody listens on is.
+/// DIAL the world's broker for process `p`: a connection over a stream into the model, and its closer.
 pub(crate) fn dial(p: &Arc<Process>) -> io::Result<(Conn, BusCloser)> {
     let stream = dial_stream(p)?;
     let conn = stream.conn;
@@ -1816,8 +1542,7 @@ pub(crate) fn dial(p: &Arc<Process>) -> io::Result<(Conn, BusCloser)> {
     ))
 }
 
-/// [`dial`]'s connection as the raw byte stream astream's client would wrap:
-/// what the differential test (`super::conform_broker`) writes frames to.
+/// [`dial`]'s connection as the raw byte stream astream's client would wrap.
 pub(crate) fn dial_stream(p: &Arc<Process>) -> io::Result<SimStream> {
     let conn = {
         let mut s = lock(&p.core.broker.state);
@@ -1870,7 +1595,6 @@ impl Read for SimStream {
             if let Some((cursor, filter)) = sub {
                 if let Some(off) = s.next_match(cursor, &filter) {
                     // THE REORDER aterm-0 must survive: a record handed to a
-                    // reader while its publisher's ack is still held.
                     if s.conns
                         .values()
                         .any(|c| c.held.iter().any(|h| h.ack_of == Some(off)))
@@ -1894,10 +1618,6 @@ impl Read for SimStream {
                 }
             }
         }
-        // AN ANSWER THE BROKER HOLDS (aterm-0, [`State::answer`]): a read that
-        // may wait waits for its batch's flush, and gets every held answer; a
-        // read that must not wait ([`crate::fx::Fx::unwaited`]) finds it not
-        // yet there.
         if out_empty && open && up {
             let trying = self.process.is_trying();
             let State {
@@ -1922,8 +1642,6 @@ impl Read for SimStream {
             if !open {
                 return Ok(0);
             }
-            // Nothing owed and nothing queued: a live socket would park here.
-            // Nothing in the simulation reads a quiet connection.
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
                 "simulated: nothing to read",
@@ -1964,11 +1682,6 @@ impl std::io::Write for SimStream {
                 ));
             }
             c.inbound.extend_from_slice(buf);
-            // THE STREAM IS FRAMED BY ASTREAM'S OWN CODEC (`Frame::decode`, the
-            // one `read_frame` judges a header by): magic, version, flags and
-            // the length cap checked as the broker checks them, so a header the
-            // broker would refuse ends this connection as it ends the broker's,
-            // and a change to the layout is astream's to make here too.
             let mut frames = Vec::new();
             let mut broken = false;
             loop {
@@ -1989,7 +1702,6 @@ impl std::io::Write for SimStream {
         };
         let (frames, broken) = frames;
         for payload in frames {
-            // A kill BEFORE the broker sees the request: written, never served.
             self.process.step("bus-before");
             let req = decode_request(&payload);
             {
@@ -2009,18 +1721,12 @@ impl std::io::Write for SimStream {
                     }],
                 };
                 s.answer(self.conn, &responses);
-                // A REFUSED SUBSCRIBE ENDS ITS CONNECTION, as astream's does
-                // once the refusal is written: the answer is still read, then
-                // the end; its will fires.
                 if subscribing && !responses.is_empty() {
                     s.end(self.conn);
                 }
             }
-            // A kill AFTER: served and answered, the answer never read.
             self.process.step("bus-after");
         }
-        // A FRAME THE BROKER CANNOT READ ends the connection, as the broker's
-        // session loop ends on `read_frame`'s error: its will fires.
         if broken {
             lock(&self.process.core.broker.state).end(self.conn);
         }
@@ -2062,10 +1768,7 @@ impl SimCloser {
     }
 }
 
-/// THE LAW CHECK of one restart: what the model kept against what astream's
-/// power-loss law allows (the module doc), judged from the records alone —
-/// which records were acked is all of them, which were escalated is the
-/// ORACLE's table. Each violation is named by the property it breaks.
+/// THE LAW CHECK of one restart.
 pub(crate) fn law_check(r: &Restart, oracle: &Escalation) -> Vec<String> {
     let mut bad = Vec::new();
     let head = r.before.len() as u64;

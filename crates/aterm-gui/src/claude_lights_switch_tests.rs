@@ -441,8 +441,8 @@ fn a_switch_turning_on_says_so_and_takes_no_click() {
     assert_eq!(switch(&app, wid).map(|b| b.face), Some(HarnessSwitch::On));
 }
 
-/// The switch marks (`● ○ ◐`) the frame draws as the chrome's icons on frame
-/// row `row` (`claude_footer::switch_icon`).
+/// The glass's marks (`● ○ ◐ ◌ ⊘ ⤓`) the frame draws as the chrome's icons
+/// on frame row `row` (`claude_card::WindowCards::paint_marks`).
 fn drawn_marks(app: &App, wid: WindowId, row: usize) -> Vec<ChromeIcon> {
     app.windows[&wid]
         .input_scratch
@@ -450,7 +450,7 @@ fn drawn_marks(app: &App, wid: WindowId, row: usize) -> Vec<ChromeIcon> {
         .iter()
         .filter(|raster| usize::from(raster.row) == row)
         .flat_map(|raster| raster.icons.iter().copied())
-        .filter(|i| BandIcon::switch_mark(i.icon.ch()).is_some())
+        .filter(|i| BandIcon::glass_mark(i.icon.ch()).is_some())
         .collect()
 }
 
@@ -520,15 +520,270 @@ fn the_switch_draws_its_mark_as_one_set_in_every_state() {
     crate::claude_card::strip(&mut ws.claude_card, &mut ws.input_scratch);
     assert_eq!(drawn_marks(&app, wid, row), [], "the strip takes it back");
     frame(&mut app, wid);
-    // NEGATIVE CONTROL: no agent, no switch, no mark anywhere.
+    // NEGATIVE CONTROL: no agent, no switch, no mark on any row but the
+    // bottom rule's, whose chip still says `⊘ off` (the chips' own mark,
+    // `the_chips_marks_are_drawn_as_the_switchs_are`).
     set_program(&app, session, None);
     frame(&mut app, wid);
     assert_eq!(switch(&app, wid), None, "control: no switch");
+    let rule = footer_row(&app, wid);
     let rows = app.windows[&wid].input_scratch.cells.len();
     assert!(
-        (0..rows).all(|r| drawn_marks(&app, wid, r).is_empty()),
+        (0..rows)
+            .filter(|&r| r != rule)
+            .all(|r| drawn_marks(&app, wid, r).is_empty()),
         "control: no switch draws no mark"
     );
+    assert!(
+        drawn_marks(&app, wid, rule)
+            .iter()
+            .all(|i| i.icon == BandIcon::SlashedRing),
+        "control: the rule's chip alone, {:?}",
+        row_text(&app, wid, rule)
+    );
+}
+
+/// THE CHIPS' MARKS ARE DRAWN AS THE SWITCH'S ARE (`BandIcon::glass_mark`, one
+/// map for the glass): on the composer's bottom rule the Autopilot chip's
+/// `○ off` is drawn as the switch's ring and Land's `⤓ land` as the drawn
+/// arrow (STIX Two Math's stood 7 × 13 at 1×, over the capitals and below the
+/// baseline), each once at the cell that keeps its character, however often
+/// the frame is painted or the same scratch spliced (a splice again
+/// allocating nothing), and the strip takes them back. NEGATIVE CONTROL: Cruise's `∞` and the facts' marks (`◆ ⌂ ⎇`, the
+/// face's or set small by their script) draw no icon on the rule.
+#[test]
+fn the_chips_marks_are_drawn_as_the_switchs_are() {
+    let (mut app, wid, session, _reader, _host) = claude_pane(120);
+    let rule = footer_row(&app, wid);
+    assert!(
+        row_text(&app, wid, rule).contains(WHOLE_FACTS),
+        "the facts are on the rule: {:?}",
+        row_text(&app, wid, rule)
+    );
+    assert_eq!(
+        drawn_marks(&app, wid, rule),
+        [],
+        "control: Cruise's ∞ and the facts"
+    );
+    let at = |app: &App, ch: char| {
+        let cells = &app.windows[&wid].input_scratch.cells[rule];
+        let col = cells.iter().position(|c| c.ch == ch);
+        u16::try_from(col.unwrap_or_else(|| panic!("the rule keeps {ch:?}"))).expect("a column")
+    };
+    for (mode, icon) in [
+        (Autopilot::Off, BandIcon::Ring),
+        (Autopilot::Land, BandIcon::ToBar),
+    ] {
+        assert!(app.set_session_autopilot(session, Some(mode), crate::autopilot::Surface::Chip));
+        frame(&mut app, wid);
+        let want = [ChromeIcon {
+            col: at(&app, icon.ch()),
+            icon,
+        }];
+        assert_eq!(
+            drawn_marks(&app, wid, rule),
+            want,
+            "{mode:?}: the chip's mark"
+        );
+        frame(&mut app, wid);
+        assert_eq!(
+            drawn_marks(&app, wid, rule),
+            want,
+            "{mode:?}: painted again"
+        );
+        let (plan, route) = app.active_visible_frame_layout(wid).expect("a layout");
+        for k in 0..3 {
+            let (_, allocations) = crate::work_counts::allocations_in(|| {
+                app.splice_claude_footer(wid, &plan, route);
+            });
+            assert_eq!(
+                drawn_marks(&app, wid, rule),
+                want,
+                "{mode:?}: spliced again"
+            );
+            assert!(
+                k == 0 || allocations == 0,
+                "{mode:?}: splice {k} allocated {allocations}"
+            );
+        }
+        let ws = app.windows.get_mut(&wid).expect("window");
+        crate::claude_card::strip(&mut ws.claude_card, &mut ws.input_scratch);
+        assert_eq!(
+            drawn_marks(&app, wid, rule),
+            [],
+            "{mode:?}: the strip takes it back"
+        );
+    }
+    assert!(app.set_session_autopilot(
+        session,
+        Some(Autopilot::Cruise),
+        crate::autopilot::Surface::Chip
+    ));
+    frame(&mut app, wid);
+    assert_eq!(drawn_marks(&app, wid, rule), [], "control: Cruise again");
+}
+
+/// ONE MAP, KEYED BY THE CHARACTER (`WindowCards::paint_marks`): of a write's
+/// cells, each full-size `● ○ ◐ ◌ ⊘ ⤓` is drawn at its own column, and the
+/// cell keeps its character. NEGATIVE CONTROLS: a small (`Script::Sub`) `◐`,
+/// as the context fact sets it, a wide glyph's continuation, and the marks
+/// the faces serve in the set's size (`∞ ✓ ⏸ ·`) draw nothing.
+#[test]
+fn the_glass_draws_its_marks_by_the_character_alone() {
+    let (mut app, wid, _session, _reader, _host) = claude_pane(120);
+    let rule = footer_row(&app, wid);
+    let ws = app.windows.get_mut(&wid).expect("window");
+    crate::claude_card::strip(&mut ws.claude_card, &mut ws.input_scratch);
+    let blank = aterm_core::terminal::RenderCell {
+        ch: ' ',
+        ..ws.input_scratch.cells[rule][0]
+    };
+    let cell = |ch: char| aterm_core::terminal::RenderCell { ch, ..blank };
+    let mut cells: Vec<_> =
+        "\u{25cf}\u{25cb}\u{25d0}\u{25cc}\u{2298}\u{2913}\u{221e}\u{2713}\u{23f8}\u{b7}x"
+            .chars()
+            .map(cell)
+            .collect();
+    cells.push(aterm_core::terminal::RenderCell {
+        script: aterm_core::terminal::Script::Sub { nudge: 0 },
+        ..cell('\u{25d0}')
+    });
+    cells.push(aterm_core::terminal::RenderCell {
+        wide: true,
+        ..cell('\u{25cb}')
+    });
+    ws.claude_card
+        .paint_marks(&mut ws.input_scratch, rule, 4, &cells);
+    let icon = |col: u16, icon| ChromeIcon { col, icon };
+    assert_eq!(
+        drawn_marks(&app, wid, rule),
+        [
+            icon(4, BandIcon::Disc),
+            icon(5, BandIcon::Ring),
+            icon(6, BandIcon::HalfDisc),
+            icon(7, BandIcon::DottedRing),
+            icon(8, BandIcon::SlashedRing),
+            icon(9, BandIcon::ToBar),
+        ]
+    );
+}
+
+/// A REFILLED FRAME'S MARKS ALLOCATE ONLY THEIR LISTS: the engine's fill of a
+/// frame drops every chrome raster, so the footer's pass on a refilled frame
+/// gives each marked row a raster again, whose ground and rail are the one
+/// shared empty row: the row's icon list is all it allocates (Cruise's switch
+/// `●`; Off's switch and chip `○`; Land's switch `●` and chip `⤓`), frame
+/// after frame, and a splice of the same frame again allocates nothing. Each
+/// row cost three before (two empty rows of its own and its list). CONTROL:
+/// the counter sees the pass: the one that composes a mode's rule anew counts
+/// more than its marks' lists.
+#[test]
+fn a_refilled_frames_marks_allocate_only_their_lists() {
+    let (mut app, wid, session, _reader, _host) = claude_pane(120);
+    let refill = |app: &mut App| {
+        app.capture_words(wid, Instant::now());
+        app.splice_tab_strip(wid);
+    };
+    for (mode, rows) in [
+        (Autopilot::Cruise, 1),
+        (Autopilot::Off, 2),
+        (Autopilot::Land, 2),
+    ] {
+        assert!(app.set_session_autopilot(session, Some(mode), crate::autopilot::Surface::Chip));
+        let (plan, route) = app.active_visible_frame_layout(wid).expect("a layout");
+        refill(&mut app);
+        let (_, composed) = crate::work_counts::allocations_in(|| {
+            app.splice_claude_footer(wid, &plan, route);
+        });
+        let marked = (0..app.windows[&wid].input_scratch.cells.len())
+            .filter(|&r| !drawn_marks(&app, wid, r).is_empty())
+            .count();
+        assert_eq!(marked, rows, "{mode:?}: the rows that draw a mark");
+        assert!(
+            composed > marked,
+            "{mode:?}: control, the composing pass allocated {composed}"
+        );
+        for i in 0..6 {
+            refill(&mut app);
+            let (_, allocations) = crate::work_counts::allocations_in(|| {
+                app.splice_claude_footer(wid, &plan, route);
+            });
+            assert_eq!(
+                allocations, marked,
+                "{mode:?}: refilled frame {i}, {marked} marked rows"
+            );
+        }
+        let (_, again) = crate::work_counts::allocations_in(|| {
+            app.splice_claude_footer(wid, &plan, route);
+        });
+        assert_eq!(again, 0, "{mode:?}: the same frame spliced again");
+    }
+}
+
+/// A MENU OVER THE TOP RULE KEEPS THE SWITCH'S MARK: the Autopilot menu,
+/// hung from its chip, covers the composer's top rule under its own columns
+/// only, and takes back the cells it covers, not the row: the switch's mark
+/// beside the card is still drawn as the chrome's `●` while the menu is up
+/// (on main the card's scrub retired the row's whole raster, and the cell
+/// fell back to the font's glyph), and as before once it closes. NEGATIVE
+/// CONTROL: no drawn icon is left on the card's own cells of that row.
+#[test]
+fn a_menu_over_the_top_rule_keeps_the_switch_mark_beside_it() {
+    let (mut app, wid, session, _reader, _host) = claude_pane(120);
+    let b = switch(&app, wid).expect("a switch");
+    let row = b.frame_row;
+    let col = b
+        .switch
+        .clone()
+        .find(|&c| app.windows[&wid].input_scratch.cells[row][c].ch == BandIcon::Disc.ch())
+        .expect("the switch's mark");
+    let mark = [ChromeIcon {
+        col: u16::try_from(col).expect("a frame column"),
+        icon: BandIcon::Disc,
+    }];
+    assert_eq!(
+        drawn_marks(&app, wid, row),
+        mark,
+        "the mark before the menu"
+    );
+    let chip = hit(&app, wid, Chip::Autopilot);
+    app.open_autopilot_menu(wid, session, chip, false);
+    frame(&mut app, wid);
+    app.splice_autopilot_menu(wid);
+    let rect = app
+        .autopilot_menu
+        .as_ref()
+        .and_then(|m| m.rect)
+        .expect("the menu is painted");
+    assert!(
+        rect.contains(row, rect.col) && !rect.contains(row, col),
+        "the card covers the top rule's row, not the mark: {rect:?}, row {row}, mark {col}"
+    );
+    let cells = &app.windows[&wid].input_scratch.cells[row];
+    assert_eq!(
+        cells[col].ch,
+        BandIcon::Disc.ch(),
+        "the cell keeps its mark"
+    );
+    assert_eq!(
+        drawn_marks(&app, wid, row),
+        mark,
+        "the mark beside the card is still drawn, once"
+    );
+    // CONTROL: nothing drawn is left over the card's cells of the row.
+    let over_card: Vec<ChromeIcon> = app.windows[&wid]
+        .input_scratch
+        .chrome_rasters
+        .iter()
+        .filter(|raster| usize::from(raster.row) == row)
+        .flat_map(|raster| raster.icons.iter().copied())
+        .filter(|i| rect.contains(row, usize::from(i.col)))
+        .collect();
+    assert_eq!(over_card, [], "control: no icon over the card");
+    assert!(app.close_autopilot_menu());
+    frame(&mut app, wid);
+    app.splice_autopilot_menu(wid);
+    assert_eq!(drawn_marks(&app, wid, row), mark, "the mark once it closes");
 }
 
 /// THE POINTER OVER `on` (hover): the button is drawn as what a press acts

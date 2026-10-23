@@ -2,43 +2,10 @@
 // Copyright 2026 Andrew Yates
 
 //! The one theme-install path, and the OS appearance that feeds it.
-//!
-//! [`App::install_resolved_colors`] is how every theme change lands: a config
-//! reload, a theme-catalog reload, an OS light/dark flip and a rejected-rebuild
-//! rollback all resolve the colours once ([`Config::resolved_colors`]) and
-//! install them with the same steps and the same invalidations. Callers differ
-//! only in the [`ThemeChange`] they name.
-//!
-//! What the engine REPORTS to programs (DEC private mode 2031 and DSR
-//! `CSI ? 996 n` → `CSI ? 997 ; Ps n`) is owned by the engine: the background
-//! on screen. The install hands it the baseline inside the projection
-//! (`TerminalConfig::color_scheme`, the configured palette's appearance,
-//! [`ResolvedColors::reported`]): `theme = "GitHub Light"` on a dark desktop
-//! reports light. The OS appearance only picks the side of a
-//! `dark:…,light:…` split. A program's own OSC 11 background outranks the
-//! baseline while it holds (`Terminal::color_scheme`). When mode 2031 is set
-//! and the reported scheme CHANGES, the same `apply_config` that lands the
-//! palette queues an unsolicited `CSI ? 997 ; Ps n`
-//! (`ConfigChange::ColorScheme`); it is drained in that critical section and
-//! sent by the route every UI-thread report takes (`app_input::write_ui_report`:
-//! queued behind earlier input, never a write that can park the event loop), so
-//! a program that re-queries OSC 10/11 on the push reads the new colours.
-//!
-//! The OS appearance comes from [`crate::os_appearance`], a source independent
-//! of any window's chrome: macOS observes the application's
-//! `effectiveAppearance` (a forced `window_theme` no longer masks a flip), Linux
-//! reads the XDG desktop portal or gsettings, and Windows keeps winit's window
-//! theme ([`theme_to_appearance`] maps it). It is read before the first session
-//! is built, and every later reading arrives as [`App::on_os_appearance`].
-//!
-//! [`Config::resolved_colors`]: crate::app_config::Config::resolved_colors
-//! [`ResolvedColors::reported`]: crate::resolved_colors::ResolvedColors::reported
 
 use crate::{App, WindowId};
 
-/// The `scheme_from=` word of a session's `status`: `theme` while the reported
-/// scheme is the theme's baseline, `program` while the session's program holds
-/// its own background (OSC 11), `-` when the engine could not be read.
+/// The `scheme_from=` word of a session's `status`.
 pub(crate) fn scheme_from_word(
     source: Option<aterm_core::terminal::ColorSchemeSource>,
 ) -> &'static str {
@@ -50,11 +17,7 @@ pub(crate) fn scheme_from_word(
     }
 }
 
-/// Map a winit window [`Theme`](aterm_window::window::Theme) onto the engine's
-/// [`Appearance`](aterm_types::Appearance).
-///
-/// `None` (winit cannot tell) maps to `Dark`, the engine's own default, so an unknown OS
-/// appearance pushes no change.
+/// Map a winit window [`Theme`](aterm_window::window::Theme) onto the engine's [`Appearance`](aterm_types::Appearance).
 #[must_use]
 pub(crate) fn theme_to_appearance(
     theme: Option<aterm_window::window::Theme>,
@@ -65,9 +28,7 @@ pub(crate) fn theme_to_appearance(
     }
 }
 
-/// Why the colours are being installed. Every caller takes the same path
-/// ([`App::install_resolved_colors`]); the reason only names the trigger in the
-/// log line.
+/// Why the colours are being installed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ThemeChange {
     /// `aterm.toml` changed.
@@ -78,27 +39,12 @@ pub(crate) enum ThemeChange {
     OsFlip,
     /// A rejected renderer rebuild restored the previous render config.
     Rollback,
-    /// The transient preview lane (`theme preview|revert`, its TTL): the
-    /// preview's candidate, or the configured theme once it ends.
+    /// The transient preview lane (`theme preview|revert`, its TTL): the preview's candidate, or the configured theme once it ends.
     Preview,
 }
 
 impl ThemeChange {
-    /// Whether this install keeps a preview held by `hold` standing, provided
-    /// the preview's selector still draws (a reload re-checks that,
-    /// [`App::settle_theme_preview`]).
-    ///
-    /// - An OS flip, a rollback and the preview lane itself keep every
-    ///   preview: its other side, its colours under the restored render
-    ///   config.
-    /// - A theme-catalog reload keeps every preview, so saving the file of a
-    ///   previewed theme redraws it, and a choice or a Keep in flight does not
-    ///   flash the old theme back before its write lands.
-    /// - A config reload ends every preview but a Settings trial nobody has
-    ///   kept: the trial is still what the page shows, so the reload resolves
-    ///   once with it instead of installing the config and then the trial
-    ///   again. The reload a Keep write causes ends that trial, as the reload
-    ///   a `theme commit` or a palette choice causes ends theirs.
+    /// Whether this install keeps a preview held by `hold` standing, provided the preview's selector still draws (a reload re-checks that, [`App::settle_theme_preview`]).
     pub(crate) fn keeps_preview(self, hold: crate::control_theme::PreviewHold) -> bool {
         match self {
             Self::OsFlip | Self::Rollback | Self::Preview | Self::CatalogReload => true,
@@ -108,9 +54,7 @@ impl ThemeChange {
         }
     }
 
-    /// One reason for two triggers folded into one install (a held colour
-    /// swap and the generation that releases it): a config reload dominates,
-    /// since it ends previews the others keep; otherwise the earlier one.
+    /// One reason for two triggers folded into one install (a held colour swap and the generation that releases it).
     pub(crate) fn merged(self, other: Option<Self>) -> Self {
         match other {
             None => self,
@@ -121,7 +65,6 @@ impl ThemeChange {
     }
 
     /// Whether this install reloads what a selector draws, so a kept preview
-    /// must be re-checked against the new config and catalog.
     const fn reloads(self) -> bool {
         matches!(self, Self::ConfigReload | Self::CatalogReload)
     }
@@ -130,26 +73,16 @@ impl ThemeChange {
 /// What one [`App::install_resolved_colors`] changed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ThemeInstall {
-    /// The engine projection (`TerminalConfig`) differed, so every session and
-    /// the factory got `apply_config`.
+    /// The engine projection (`TerminalConfig`) differed, so every session and the factory got `apply_config`.
     pub(crate) engine_changed: bool,
-    /// The renderer [`Theme`](aterm_render::Theme) differed, so it went
-    /// through [`App::apply_theme_live`].
+    /// The renderer [`Theme`](aterm_render::Theme) differed, so it went through [`App::apply_theme_live`].
     pub(crate) theme_changed: bool,
-    /// The authored chrome colours (`accent_color` and its kin, theme or
-    /// config) differed, so every chrome surface was invalidated to re-derive
-    /// its tokens.
+    /// The authored chrome colours (`accent_color` and its kin, theme or config) differed, so every chrome surface was invalidated to re-derive its tokens.
     pub(crate) chrome_changed: bool,
 }
 
 impl App {
-    /// The one theme-install path. Resolves the colours once for the live OS
-    /// appearance and the admitted catalog, then installs them with
-    /// [`Self::install_colors`].
-    ///
-    /// A standing preview ([`App::theme_preview`](crate::App)) stands in for
-    /// the configured `theme` unless `reason` ends it
-    /// ([`Self::settle_theme_preview`]).
+    /// The one theme-install path.
     pub(crate) fn install_resolved_colors(&mut self, reason: ThemeChange) -> ThemeInstall {
         self.settle_theme_preview(reason);
         let candidate = self.theme_preview.as_ref().map(|p| p.id.as_str());
@@ -161,33 +94,7 @@ impl App {
         self.install_colors(colors, reason)
     }
 
-    /// Install one resolution everywhere it is drawn or reported, in order:
-    ///
-    /// 1. the engine projection, onto every session and the session factory,
-    ///    skipped when it equals the installed one (an unrelated edit or an
-    ///    unused theme file costs no `apply_config`). It carries the scheme
-    ///    baseline ([`ResolvedColors::reported`](crate::resolved_colors::ResolvedColors)),
-    ///    so the colours and the baseline land in one `apply_config`. A session
-    ///    that draws a theme of its own ([`crate::session_theme`]) gets ITS
-    ///    projection instead, applied only when that moved, and one that just
-    ///    left its own theme is re-based on the instance's;
-    /// 2. in the SAME per-session critical section, the `CSI ? 997 ; Ps n`
-    ///    push that `apply_config` queued when the session's reported scheme
-    ///    moved (`ConfigChange::ColorScheme`) and its program set mode 2031.
-    ///    DSR 996 / mode 2031 describe the background on screen, not the OS: a
-    ///    session whose program holds its own background is not told about a
-    ///    theme change that leaves that background alone. The push is drained
-    ///    only after the palette is in, so a program that answers it with an
-    ///    OSC 10/11 query reads the new colours;
-    /// 3. the renderer theme, through [`Self::apply_theme_live`] when it
-    ///    changed, and the selected-text foreground knob;
-    /// 4. every colour-derived cache, invalidated here and nowhere else.
-    ///
-    /// `colors` must be resolved from `self.config`, `self.os_appearance` and
-    /// `self.config_assets.themes`; callers that already hold that resolution
-    /// pass it instead of resolving twice, after settling the preview for
-    /// `reason` ([`Self::settle_theme_preview`]), which runs here again and
-    /// then changes nothing.
+    /// Install one resolution everywhere it is drawn or reported, in order.
     pub(crate) fn install_colors(
         &mut self,
         colors: crate::resolved_colors::ResolvedColors,
@@ -197,14 +104,9 @@ impl App {
         let tc = std::sync::Arc::new(self.config.applied_terminal_config_from(&colors));
         let engine_changed = self.session_factory.terminal_config.as_ref() != Some(tc.as_ref());
         let reported = colors.reported;
-        // A warm spare's rc may have read the old colours (OSC 10/11): it goes.
         if engine_changed {
             self.spare_colors_changed();
         }
-        // Every session, in one plan made before any terminal lock: a session
-        // drawing the instance's theme gets `tc` when it moved, one drawing its
-        // own ([`crate::session_theme`]) gets that when IT moved. Each apply and
-        // its DEC 2031 push share the session's critical section.
         let own_applies = self.install_session_fanout(&tc, engine_changed);
         if engine_changed {
             self.session_factory.terminal_config = Some(std::sync::Arc::unwrap_or_clone(tc));
@@ -214,25 +116,13 @@ impl App {
         let theme = colors.theme();
         let theme_changed = theme != self.theme;
         let chrome_changed = colors.scheme.chrome != self.installed_colors.scheme.chrome;
-        // The tokens borrow the palette's hues (a grey-cursor theme's accent is
-        // its ANSI blue or cyan).
         let hues_changed = colors.scheme.ansi != self.installed_colors.scheme.ansi;
-        // A theme file's `selection_foreground` reaches the renderer knob too,
-        // not only the engine.
         let selection_fg = colors.selection_fg().map(crate::app_config::rgb_u32);
         let (id, side) = (colors.id.clone(), colors.side);
-        // Installed before the theme goes live, so every chrome surface the
-        // repaint derives reads this resolution's authored chrome.
         self.installed_colors = colors;
         if theme_changed {
             self.apply_theme_live(theme);
         } else if chrome_changed || hues_changed {
-            // Only the chrome or the palette moved (a grey-cursor theme's accent
-            // is its ANSI blue or cyan): the theme-keyed caches (the strip rows,
-            // the raster caches, the present gate) would keep the old tokens, so
-            // drop them and re-pin the native strip. The composed frame's
-            // retention compares its seam cell, so a new divider rebuilds it
-            // unasked.
             self.publish_theme_chrome();
             self.rain_dirty = true;
             self.introspect_gpu.invalidate_present();
@@ -243,8 +133,6 @@ impl App {
         }
 
         if engine_changed || theme_changed || own_applies > 0 {
-            // Sparkle and rain read the palette; a resident pet keeps its place
-            // but retires its contrast sample.
             self.sparkle_dirty = true;
             self.rain_dirty = true;
             for ws in self.windows.values_mut() {
@@ -253,7 +141,6 @@ impl App {
         }
         if (engine_changed || own_applies > 0) && !theme_changed {
             // Cells re-coloured under an unchanged chrome: each window's repaint
-            // key keeps an untouched presentation cheap.
             self.request_redraw_all_windows();
         }
         aterm_log::debug!(
@@ -266,10 +153,7 @@ impl App {
         }
     }
 
-    /// End the standing preview if `reason` does not keep it
-    /// ([`ThemeChange::keeps_preview`]), or if `reason` is a reload and the
-    /// preview's selector no longer draws under the config and catalog now
-    /// held (its file left, say). Idempotent; installs nothing.
+    /// End the standing preview unless [`ThemeChange::keeps_preview`] holds and its selector still resolves.
     pub(crate) fn settle_theme_preview(&mut self, reason: ThemeChange) {
         let Some(preview) = self.theme_preview.as_ref() else {
             return;
@@ -281,38 +165,8 @@ impl App {
         }
     }
 
-    /// Record the live OS `appearance` and install the colours it draws: the
-    /// OS-flip caller of [`Self::install_resolved_colors`].
-    ///
-    /// The appearance picks the side of a `dark:…,light:…` split `theme`; the
-    /// reported scheme follows the palette that side draws, so a plain theme
-    /// reports the same thing in light and dark mode. A NO-OP when the
-    /// appearance is unchanged. Re-resolves from the retained live
-    /// [`Config`](crate::Config) and the admitted theme catalog (no disk read),
-    /// and a changed chrome goes through the colour-only
-    /// [`Self::apply_theme_live`]: the backend is never rebuilt here. When the
-    /// new side's theme draws a different face, the face is prepared on the
-    /// font worker (`App::request_theme_typography_refresh`) and installed with
-    /// its colours by `rebuild_backend_with_prepared` through the config apply.
-    ///
-    /// Callers are [`Self::on_os_appearance`] (the platform observer and the
-    /// `appearance` control verb), window attach, and on Windows the window's
-    /// `ThemeChanged` event.
+    /// Record the live OS `appearance` and install the colours it draws: the OS-flip caller of [`Self::install_resolved_colors`].
     pub(crate) fn sync_app_theme_to_appearance(&mut self, appearance: aterm_types::Appearance) {
-        // Re-assert the resolved title-bar appearance after the OS flip. Under
-        // `window_theme = "auto"`, winit's own `WM_SETTINGCHANGE` handler has just re-themed the
-        // non-client area from the OS preference, overriding the caption the Windows arm
-        // resolves from the terminal background; it runs before this handler, so re-applying
-        // here is the last word.
-        //
-        // Above the dedupe below: `WM_SETTINGCHANGE` reaches every top-level window and winit
-        // emits `ThemeChanged` per HWND, so with two windows the second event arrives with the
-        // appearance already recorded, and an early return would leave that window on the OS
-        // caption. Not in the `theme_changed` branch either: a plain `theme` keeps its
-        // background across a flip, so `apply_theme_live` never runs, yet winit repainted the
-        // caption; when it does run, it re-publishes the new background afterwards. winit
-        // reports only the broadcasts that move the OS theme; the silent ones are caught on the
-        // frame path by `platform_win::verify_chrome_appearance`.
         #[cfg(windows)]
         {
             for wid in self.appearance_redraw_targets() {
@@ -327,21 +181,11 @@ impl App {
         }
         self.os_appearance = appearance;
 
-        // A side whose theme names a different face (split typography) is
-        // prepared on the font worker and lands with its colours through the
-        // config apply; the colour swap is held until then, so the old face
-        // never draws in the new colours. Otherwise, or when the worker cannot
-        // take the request, the colours install now.
         if self.request_theme_typography_refresh(ThemeChange::OsFlip) {
             return;
         }
-        // The OS appearance only picks the side of a split `theme`; what is
-        // reported to programs is the palette that side draws.
         let installed = self.install_resolved_colors(ThemeChange::OsFlip);
         if !installed.theme_changed {
-            // Chrome unchanged, but the `system_dark` repaint-key term and native
-            // app previews follow the OS: nudge every window; each repaint key
-            // keeps an untouched presentation cheap.
             for wid in self.appearance_redraw_targets() {
                 if let Some(w) = self.windows.get(&wid).and_then(|ws| ws.os_window.as_ref()) {
                     w.request_redraw();
@@ -350,15 +194,12 @@ impl App {
         }
     }
 
-    /// One reading from the OS appearance source ([`crate::Wake::OsAppearance`])
-    /// or the development `appearance dark|light` verb: the same install.
+    /// One reading from the OS appearance source ([`crate::Wake::OsAppearance`]) or the development `appearance dark|light` verb.
     pub(crate) fn on_os_appearance(&mut self, appearance: aterm_types::Appearance) {
         self.sync_app_theme_to_appearance(appearance);
     }
 
-    /// The `theme_side=` word: the side the OS appearance picked of a `theme`
-    /// that follows it (a `dark:…,light:…` pair that names a theme), and `-`
-    /// for a single theme or none (Default), which no appearance moves.
+    /// The `theme_side=` word.
     pub(crate) fn theme_side_word(&self) -> &'static str {
         use aterm_types::scheme::ThemeSelector;
         let (selector, _) = ThemeSelector::parse(self.config.theme.as_deref().unwrap_or(""));
@@ -371,15 +212,7 @@ impl App {
         }
     }
 
-    /// `os_appearance= theme_side= reported_scheme= [scheme_from=] bg_dark=`,
-    /// the appearance fields of a session's `status`: the OS reading and the
-    /// split side are the instance's; `reported` (what DSR 996 / mode 2031
-    /// answer), `scheme_from` ([`scheme_from_word`]: whether that is the
-    /// theme's baseline or the background the session's program set) and `bg`
-    /// (the engine's default background) are the session's own, read by the
-    /// caller under its terminal guard. `-` for a value the caller could not
-    /// read; `scheme_from: None` omits the field (the `appearance` verb, which
-    /// describes the theme, not a session).
+    /// `os_appearance= theme_side= reported_scheme= [scheme_from=] bg_dark=`, the appearance fields of a session's `status`.
     pub(crate) fn appearance_status_fields(
         &self,
         reported: Option<aterm_types::Appearance>,
@@ -402,11 +235,7 @@ impl App {
         )
     }
 
-    /// The `appearance` verb's line: the status fields for what the session
-    /// factory installs (every session agrees after an install), plus where
-    /// the reading came from, the theme drawn, and how many installs fanned
-    /// `apply_config` out to every session (launch built for the right side
-    /// when this stays 0 across window attach).
+    /// The `appearance` verb's line.
     pub(crate) fn appearance_status_line(&self) -> String {
         let fields = self.appearance_status_fields(
             Some(self.installed_colors.reported),
@@ -425,9 +254,7 @@ impl App {
         )
     }
 
-    /// The windows an OS appearance flip nudges when the rendered theme is unchanged: all of
-    /// them, since the `system_dark` repaint-key term moves on every window (native app
-    /// previews included). Split out so a headless test can pin the fan-out.
+    /// The windows an OS appearance flip nudges when the rendered theme is unchanged.
     pub(crate) fn appearance_redraw_targets(&self) -> Vec<WindowId> {
         self.windows.keys().copied().collect()
     }
@@ -454,7 +281,6 @@ mod tests {
             "negative control: the retired terminal-only projection cannot see this leaf"
         );
 
-        // A split theme, so the light OS draws (and reports) a light palette.
         app.config = aterm_toml::from_str(r#"theme = "dark:Dracula,light:GitHub Light""#)
             .expect("split theme");
         app.sync_app_theme_to_appearance(Appearance::Light);
@@ -471,12 +297,9 @@ mod tests {
     }
 
     /// With the rendered theme unchanged, a flip nudges every window, not just the front one.
-    /// Headless windows have no `os_window`, so the fan-out set is what is pinned.
     #[test]
     fn appearance_flip_nudges_every_window() {
         let mut app = crate::App::headless_for_test();
-        // A second mixed-tab window that is not frontmost (`install_window_state`
-        // repoints frontmost, so put the first window back in front).
         let wid = crate::WindowId(9);
         app.install_window_state(wid, crate::stub_session(99), 38, 132);
         app.frontmost_window = Some(crate::WindowId(0));
@@ -499,11 +322,6 @@ mod tests {
     }
 
     /// BROKEN-2 — an OS light/dark flip that moves the palette's appearance
-    /// updates the SESSION FACTORY's scheme baseline, so a tab/split spawned AFTER
-    /// the flip starts at it (its engine is built from the factory's
-    /// `terminal_config`, whose `color_scheme` it carries). A plain dark theme
-    /// keeps reporting dark on a light OS: the factory follows the palette, not
-    /// the OS.
     #[test]
     fn os_flip_updates_the_session_factory_appearance() {
         let mut app = crate::App::headless_for_test();
@@ -540,8 +358,7 @@ mod tests {
     }
 }
 
-/// The one install path: what DSR 996 / mode 2031 report, when the 997 push
-/// lands, what a theme change costs, and what the image-meta fingerprint sees.
+/// The one install path.
 #[cfg(test)]
 pub(crate) mod install_resolved_colors {
     use super::ThemeChange;
@@ -550,10 +367,6 @@ pub(crate) mod install_resolved_colors {
     use aterm_types::{Appearance, ColorScheme, Rgb};
 
     /// A CHROME-ONLY EDIT REPAINTS: re-resolving with only `accent_color`
-    /// changed leaves the renderer theme alone but reports the chrome change,
-    /// drops every window's strip-row cache, and the new accent is what the
-    /// header's tokens carry. NEGATIVE CONTROL: re-installing the identical
-    /// config reports no chrome change and leaves a seeded cache alone.
     #[test]
     fn a_chrome_only_edit_repaints() {
         let mut app = App::headless_for_test();
@@ -592,8 +405,7 @@ pub(crate) mod install_resolved_colors {
         assert_eq!(header.accent, [0xff, 0x00, 0xaa]);
     }
 
-    /// Apply `text` as `aterm.toml` through the real admission path (the
-    /// prepared generation a config watcher hands the App).
+    /// Apply `text` as `aterm.toml` through the real admission path (the prepared generation a config watcher hands the App).
     pub(crate) fn apply_config_text(app: &mut App, dir: &std::path::Path, text: &str) {
         let path = dir.join("aterm.toml");
         std::fs::write(&path, text).expect("write config");
@@ -643,8 +455,6 @@ pub(crate) mod install_resolved_colors {
     }
 
     /// A light theme on a dark OS reports light: the palette on screen, not the
-    /// desktop. Negative control: a dark theme on the same OS reports dark, and
-    /// a dark theme on a LIGHT OS still reports dark.
     #[test]
     fn a_light_theme_on_a_dark_os_reports_light() {
         let dir = scratch_dir("dsr");
@@ -670,8 +480,7 @@ pub(crate) mod install_resolved_colors {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Read whatever the program side of `fd` holds, without blocking; the push
-    /// is written inline on unix, so it is there or it was never sent.
+    /// Read whatever the program side of `fd` holds, without blocking.
     #[cfg(unix)]
     pub(crate) fn drain(fd: i32) -> Vec<u8> {
         let mut out = Vec::new();
@@ -687,10 +496,6 @@ pub(crate) mod install_resolved_colors {
     }
 
     /// A mode-2031 subscriber is pushed `?997;2n` when the config switches
-    /// Dracula → Solarized Light, and by the time the push reaches the PTY the
-    /// engine already answers OSC 11 with the new background (APPEAR-8: the
-    /// palette and the push land in one critical section, palette first). An
-    /// unrelated key change sends no push.
     #[cfg(unix)]
     #[test]
     fn a_theme_switch_pushes_997_after_the_new_palette_and_an_unrelated_edit_does_not() {
@@ -748,10 +553,6 @@ pub(crate) mod install_resolved_colors {
     }
 
     /// A program's own background outranks the theme in what its session
-    /// reports (DSR 996 / mode 2031 / `status`), and a theme switch that leaves
-    /// that background alone tells the program nothing. Its OSC 111 hands the
-    /// report back to the theme, with one push. Negative control: a session
-    /// with no override in the same app follows every theme switch.
     #[cfg(unix)]
     #[test]
     fn a_program_background_outranks_the_theme_until_it_resets() {
@@ -837,8 +638,6 @@ pub(crate) mod install_resolved_colors {
     }
 
     /// A theme file nothing draws changes no projection, so it costs no
-    /// `apply_config` fan-out. Negative control: changing the file the config
-    /// DOES draw fans out once.
     #[test]
     fn an_unused_theme_file_sends_no_apply_config() {
         let mut app = App::headless_for_test();
@@ -886,10 +685,6 @@ pub(crate) mod install_resolved_colors {
     }
 
     /// A change of the engine projection rings every session's screen
-    /// readers: a styled frame's colours resolve against it, so the hold that
-    /// installs it moves the frame, and a content subscription pushes the
-    /// reload on that ring. Negative control: an unused theme file changes no
-    /// projection and rings nobody.
     #[test]
     fn a_projection_change_rings_every_sessions_watchers() {
         let mut app = App::headless_for_test();
@@ -935,8 +730,6 @@ pub(crate) mod install_resolved_colors {
     }
 
     /// Two themes that differ only in an ANSI slot draw the same chrome but give
-    /// different image-meta fingerprints. Negative control: installing the same
-    /// theme again gives the same fingerprint.
     #[test]
     fn themes_that_differ_only_in_ansi_fingerprint_differently() {
         let mut app = App::headless_for_test();
@@ -969,7 +762,6 @@ pub(crate) mod install_resolved_colors {
     }
 
     /// A theme file's `selection_foreground` reaches the renderer knob, not only
-    /// the engine; the config key still wins over it.
     #[test]
     fn a_theme_files_selection_foreground_reaches_the_renderer() {
         let mut app = App::headless_for_test();
@@ -1004,8 +796,6 @@ pub(crate) mod install_resolved_colors {
 }
 
 /// The OS appearance as its own source (APPEAR-1/2/10/12): a forced window
-/// chrome does not mask a flip, launch builds for the side the OS shows, and
-/// `status` says which side is drawn and reported.
 #[cfg(test)]
 mod appearance_source {
     use crate::App;
@@ -1039,8 +829,6 @@ mod appearance_source {
     }
 
     /// APPEAR-2: `window_theme = "dark"` forces the chrome, yet a light OS
-    /// reading (the event the platform observer posts) draws and reports the
-    /// light side. Negative control: the dark reading draws Dracula again.
     #[test]
     fn a_forced_dark_chrome_still_follows_an_injected_light_flip() {
         let mut app = App::headless_for_test();
@@ -1073,11 +861,6 @@ mod appearance_source {
     }
 
     /// APPEAR-12: a launch built for the light reading (what `warm_config` and
-    /// `main_entry` build when the early read says light) needs nothing at
-    /// attach, which reads light again: session 0 already draws and reports
-    /// the light side, and no second `apply_config` fans out. Negative
-    /// control: the old cold start, built for dark, re-colours every session
-    /// once at attach.
     #[test]
     fn a_launch_built_for_light_needs_no_second_apply_config_at_attach() {
         let launch = |read: Appearance| {
@@ -1116,9 +899,6 @@ mod appearance_source {
     }
 
     /// APPEAR-10: `status` and the `appearance` line say which OS reading is
-    /// in effect, which side it picked, what the session reports and whether
-    /// its background is dark, and the four agree after a flip. A single
-    /// theme has no side (`-`) and keeps reporting its own palette.
     #[test]
     fn status_appearance_fields_agree_after_a_flip() {
         let mut app = App::headless_for_test();
@@ -1159,8 +939,6 @@ mod appearance_source {
         );
         assert_eq!(field(&record, "bg_dark"), Some("1"), "{record}");
 
-        // An unset theme is Default, one theme: on a light OS it has no side
-        // and reports dark.
         app.config = crate::app_config::Config::default();
         app.install_resolved_colors(super::ThemeChange::ConfigReload);
         let record = app.session_status_record(0).expect("status");
@@ -1170,13 +948,6 @@ mod appearance_source {
     }
 
     /// Linux `window_theme = "auto"`: the variant the window's chrome takes
-    /// (`chrome_theme_for_apprt`, X11's `_GTK_THEME_VARIANT` and the Wayland
-    /// header) follows an OS light/dark flip through the side of a split
-    /// `theme` it draws, and a single theme keeps its own side whatever the OS
-    /// shows: the title bar matches the terminal under it, the Windows caption's
-    /// rule (`platform_win::resolve_chrome_theme`) and what macOS's transparent
-    /// title bar shows. The window layer never gets `Auto` on Linux. Negative
-    /// control: the dark reading takes the chrome back to dark.
     #[cfg(target_os = "linux")]
     #[test]
     fn linux_auto_chrome_follows_the_os_through_the_theme_it_draws() {

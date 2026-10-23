@@ -1,9 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! One test per measured Gemini CLI screen (gemini-cli 0.46.0), each with
-//! its negative control.
-
 use super::fixtures::*;
 use super::*;
 use crate::prompt::fixtures::{provenance, rows, screen};
@@ -58,11 +55,6 @@ fn captures() -> Vec<(String, String)> {
 }
 
 /// A fresh session at its composer is idle as evidence: no message yet, the
-/// status row's `? for shortcuts`, and the composer EMPTY — its placeholder
-/// read as no text at all, since neither its cursor (column 3) nor its colour
-/// (grey, not dim) tells it from a draft. NEGATIVE CONTROLS: the busy
-/// screen's composer is the same placeholder, and busy; the placeholder's
-/// words TYPED (one blank after the caret, not three) are a draft.
 #[test]
 fn a_fresh_session_is_idle_at_its_composer_and_its_placeholder_is_no_draft() {
     let r = gemini(IDLE);
@@ -100,9 +92,6 @@ fn a_fresh_session_is_idle_at_its_composer_and_its_placeholder_is_no_draft() {
 }
 
 /// A typed draft is the composer's text, and the status row is BLANK while
-/// it is held: idle as evidence, the session still fresh. NEGATIVE CONTROL:
-/// a status row of words this grammar has not measured over the same draft
-/// says nothing.
 #[test]
 fn an_unsent_draft_is_the_composers() {
     let r = gemini(DRAFT);
@@ -122,8 +111,6 @@ fn an_unsent_draft_is_the_composers() {
 }
 
 /// A draft that wrapped: its rows under the caret row, at column 3, are
-/// lines of the draft. NEGATIVE CONTROL: a row at column 1 under the caret
-/// row is no row of the band, and leaves no composer read.
 #[test]
 fn a_wrapped_draft_is_every_row_of_the_band() {
     let rows = screen(DRAFT);
@@ -143,13 +130,6 @@ fn a_wrapped_draft_is_every_row_of_the_band() {
 }
 
 /// THE LAB'S HAZARD: every message a person sent is drawn in the composer's
-/// own band, so with a box up (the live zone gone) the last band on the
-/// screen is the message the box answers. It is never the composer: no rule
-/// stands over it. NEGATIVE CONTROLS: the box's screen has no composer, and
-/// neither has the transcript left when the box is cut away; the composer's
-/// band, with its rule, is read; a rule further up than the live zone's own
-/// rows under it reach (the mode row, and a narrow pane's summary) is no rule
-/// of the band's.
 #[test]
 fn a_sent_message_is_never_the_composer() {
     let boxed = screen(BOX_SHELL);
@@ -179,11 +159,6 @@ fn a_sent_message_is_never_the_composer() {
 }
 
 /// THE SPINNER ON THE STATUS ROW IS BUSY — thinking, streaming its reply,
-/// and through every retry of a 503 and a 500, which draw no row of their
-/// own (the CLI retries them for ever): no wall, no last words. NEGATIVE
-/// CONTROLS: the spinner row turned to words this grammar has not measured
-/// is no turn running and no evidence; `? for shortcuts` back in its place,
-/// or nothing (no hint drawn), is the turn's end, as evidence.
 #[test]
 fn the_spinner_is_busy_through_thinking_streaming_and_retries() {
     for text in [BUSY_THINKING, BUSY_STREAMING, RETRY_503, RETRY_500] {
@@ -213,10 +188,6 @@ fn the_spinner_is_busy_through_thinking_streaming_and_retries() {
 }
 
 /// A turn ends on its reply, with no row marking the end: the spinner gone
-/// and `? for shortcuts` back. Its last words are the reply's rows, the `✦`
-/// stripped — after a 503's and a 500's retries too. NEGATIVE CONTROLS: a
-/// reply whose last words ask is a question; a reply followed by a tool's
-/// row is no last words.
 #[test]
 fn a_turn_ends_on_its_reply() {
     let r = gemini(END_OF_TURN);
@@ -254,10 +225,6 @@ fn a_turn_ends_on_its_reply() {
 }
 
 /// Esc in a turn ends it on `ℹ Request cancelled.`: idle as evidence, and
-/// the PERSON's — the next message is theirs; no last words, no wall.
-/// NEGATIVE CONTROLS: a turn that ended by itself is not interrupted; nor is
-/// one whose cancel a newer message answered, nor a reply that says the
-/// words.
 #[test]
 fn an_interrupted_turn_is_the_persons() {
     let r = gemini(INTERRUPTED);
@@ -288,16 +255,6 @@ fn an_interrupted_turn_is_the_persons() {
 }
 
 /// A NARROW PANE (measured at 72 columns, a `GEMINI.md` loaded): the context
-/// summary stands on a row of its own under a blank, four rows between the
-/// rule and the band, and the status row never says `? for shortcuts` — so
-/// its rest is a blank status row over an empty composer: idle as evidence,
-/// and its turn's end too, with its wrapped reply; its draft is idle with
-/// its text, its spinner busy, and every screen is Gemini CLI's by its
-/// layout. The wide pane with the summary on the mode's row is read as
-/// before. NEGATIVE CONTROLS: a status row of words this grammar has not
-/// measured over an empty composer is no evidence, in either width; a band
-/// row between the rule and the band unmakes the composer; and a rule with
-/// five rows under it is none of its (four, a wrapped summary's, still is).
 #[test]
 fn a_narrow_pane_is_read_without_its_shortcuts_hint() {
     for (what, text) in [("narrow", NARROW_IDLE), ("wide", IDLE_CONTEXT)] {
@@ -383,11 +340,6 @@ fn a_narrow_pane_is_read_without_its_shortcuts_hint() {
 }
 
 /// A box the PERSON refused with Esc (`No, suggest changes (esc)`, measured
-/// under a supervised lab) ends the turn as Esc in a turn does: the tool's
-/// row marked `-` in its own small box, then `ℹ Request cancelled.` — idle as
-/// evidence, the person's, no last words and no wall, and no box up.
-/// NEGATIVE CONTROLS: the same screen with the cancel row gone is no
-/// person's stop; and the box it refused, read before the Esc, is a box.
 #[test]
 fn a_box_refused_with_esc_is_the_persons_stop() {
     let r = gemini(BOX_DENIED);
@@ -410,10 +362,6 @@ fn a_box_refused_with_esc_is_the_persons_stop() {
 }
 
 /// `/` opens the command menu under the composer's band: the composer is
-/// still the composer, its draft the `/`, and no box is up, but nothing is
-/// evidence — the menu stands where the footer did. NEGATIVE CONTROL: the
-/// menu's rows gone and the footer back under the band, the same draft is
-/// idle as evidence.
 #[test]
 fn the_command_menu_is_no_box_and_no_evidence() {
     let r = gemini(SLASH_MENU);
@@ -432,11 +380,6 @@ fn the_command_menu_is_no_box_and_no_evidence() {
 }
 
 /// Every box's span runs from its TITLE row to its last row, as every
-/// reader's does ([`PromptV2::span`]): the row a press or an answer is
-/// fenced on where no row of its own is named — the tool's row, the trust
-/// dialog's question, the question dialog's and the usage limit's title —
-/// never the round top border every box of that width shares. NEGATIVE
-/// CONTROL: that border stands above the span, outside it.
 #[test]
 fn every_box_span_opens_on_its_title_row() {
     for (fixture, title) in [
@@ -470,11 +413,6 @@ fn every_box_span_opens_on_its_title_row() {
 }
 
 /// The shell box for a command with a REDIRECTION draws a warning under its
-/// question (`Redirection detected. To auto-accept, press Shift+Tab`,
-/// captured under the lab): it is the same Bash prompt, its question the
-/// row over the warning, its options' roles the shell box's. NEGATIVE
-/// CONTROL: any other row in the warning's place leaves the box unnamed by
-/// its question (a kind this grammar does not read, `Other`).
 #[test]
 fn a_shell_box_with_a_redirection_warning_is_still_the_shell_box() {
     let rows = screen(BOX_SHELL_REDIRECTION);
@@ -495,7 +433,6 @@ fn a_shell_box_with_a_redirection_warning_is_still_the_shell_box() {
             .iter()
             .find(|r| r.starts_with("│ Redirection detected."))
             .expect("the warning")
-            // The same width, so the row stays inside the box.
             .replacen("Redirection detected.", "Something else noted.", 1),
     );
     let p = prompt(&other).expect("still a box");
@@ -503,12 +440,6 @@ fn a_shell_box_with_a_redirection_warning_is_still_the_shell_box() {
 }
 
 /// The shell tool's box: a Bash prompt for the command in the box drawn
-/// inside it, its three options by their roles — `Allow once` the one-shot,
-/// `Allow for this session` a standing grant ([`Role::Persist`]: every later
-/// command of the same root), `No, suggest changes (esc)` the refusal and the
-/// box's Esc — the first focused, chosen by digit. It replaces the live zone:
-/// no composer, no wall. NEGATIVE CONTROLS: a second cursor, or a gap in the
-/// numbering, and no option carries a role.
 #[test]
 fn the_shell_box_is_a_bash_prompt_with_its_roles() {
     let r = gemini(BOX_SHELL);
@@ -565,12 +496,6 @@ fn the_shell_box_is_a_bash_prompt_with_its_roles() {
 }
 
 /// The file boxes: `WriteFile` is a Write prompt and `Edit` an Edit prompt,
-/// each for the file its title names, both asking `Apply this change?` over
-/// four options — `Modify with external editor` [`Role::Other`], since it
-/// opens an editor, and `Allow for this session` [`Role::Persist`], since on
-/// a file box it switches the session to accepting every edit. NEGATIVE
-/// CONTROLS: Claude Code's and agy's readers see no box on either, and the
-/// same box asking another question is named by nothing.
 #[test]
 fn the_file_boxes_are_write_and_edit_prompts() {
     for (text, kind) in [(BOX_WRITE, PromptKind::Write), (BOX_EDIT, PromptKind::Edit)] {
@@ -609,12 +534,6 @@ fn the_file_boxes_are_write_and_edit_prompts() {
 }
 
 /// The ask-the-user tool's dialog: a Question prompt, its question the row
-/// under `Answer Questions`, the model's answers [`Role::Answer`] (their
-/// descriptions under them no options) and `Enter a custom value` (the
-/// person's own words) [`Role::Other`], chosen by digit, its key row's `Esc
-/// to cancel` leaving it unanswered. NEGATIVE CONTROLS: Claude Code's reader
-/// sees no question on it, and once answered the dialog's `✓ Ask User` box
-/// is transcript — no box, and the reply under it is the turn's last words.
 #[test]
 fn the_question_tool_is_a_question_with_answers() {
     let r = gemini(QUESTION);
@@ -652,12 +571,6 @@ fn the_question_tool_is_a_question_with_answers() {
 }
 
 /// THE PER-DAY QUOTA'S DIALOG IS A BOX, NOT A WALL (module header): a
-/// [`PromptKind::UsageLimit`] box in place of the composer, read as a
-/// prompt with no wall, and neither `Keep trying` nor `Stop` has a role any
-/// rule presses. Answered `Stop`, the turn ends on `✕ [API Error: An unknown
-/// error occurred.]`: an API error with no status, which the CLI does not
-/// retry. NEGATIVE CONTROL: its title reworded, the box is named by nothing,
-/// and its options still carry no role.
 #[test]
 fn the_usage_limit_dialog_is_a_box_with_nothing_to_press() {
     let r = gemini(LIMIT_DIALOG);
@@ -702,10 +615,6 @@ fn the_usage_limit_dialog_is_a_box_with_nothing_to_press() {
 }
 
 /// A Google account's spent quota draws the same dialog with its reset named
-/// under the title (`Access resets at 5:06 AM PDT.`): the same
-/// [`PromptKind::UsageLimit`] box, read as a prompt with no wall, its title
-/// the title row alone, and nothing on it to press. NEGATIVE CONTROL: the
-/// reset row moved over the title, the box is named by nothing.
 #[test]
 fn the_accounts_usage_limit_dialog_names_its_reset_and_is_the_same_box() {
     let r = gemini(LIMIT_DIALOG_ACCOUNT);
@@ -749,14 +658,6 @@ fn reset_of(clock: &str, zone: Option<&str>) -> LimitReset {
 }
 
 /// The reset the account's dialog names is its clock AND the zone it is
-/// drawn in (`5:06 AM` in `PDT` of `Access resets at 5:06 AM PDT.`), the
-/// CLI's no-break space read as a space; the supervisor waits for it before
-/// `Keep trying`. The zone is kept whatever it is (the CLI's process may run
-/// in a zone other than aterm's: `TZ`, an `ssh`), and a row that ends at the
-/// clock names none. NEGATIVE CONTROLS: the per-day quota's dialog names
-/// none; the same row moved under the options (no part of the dialog's
-/// message), or on a screen with no dialog, names none; a row whose words
-/// are no reset's is not read as one.
 #[test]
 fn the_accounts_usage_limit_dialog_names_its_reset_by_its_clock() {
     let rows = screen(LIMIT_DIALOG_ACCOUNT);
@@ -769,7 +670,6 @@ fn the_accounts_usage_limit_dialog_names_its_reset_by_its_clock() {
         .find(|r| r.starts_with("│ Access resets at"))
         .expect("the reset row")
         .clone();
-    // The row keeps its width, its right border where the box draws it.
     let respelled = |from: &str, to: &str| -> Vec<String> {
         assert!(row.contains(from), "{row:?}");
         let with = row.replacen(from, to, 1);
@@ -781,25 +681,17 @@ fn the_accounts_usage_limit_dialog_names_its_reset_by_its_clock() {
         limit_reset(&respelled("5:06 AM PDT", "5:06\u{202f}AM PDT")),
         Some(reset_of("5:06 AM", Some("PDT")))
     );
-    // The zones the measure drew in other `TZ`s (Europe/Paris, Asia/Kolkata,
-    // UTC), each kept as drawn with its offset.
     for (zone, offset) in [("GMT+2", 2 * 3600), ("GMT+5:30", 19_800), ("UTC", 0)] {
         let read = limit_reset(&respelled("5:06 AM PDT", &format!("5:06 AM {zone}")));
         assert_eq!(read, Some(reset_of("5:06 AM", Some(zone))), "{zone}");
         assert_eq!(read.and_then(|r| r.offset_s()), Some(offset), "{zone}");
     }
-    // A sentence that ends at the clock names no zone, and one no en-US
-    // short name spells names no offset.
     let bare = limit_reset(&respelled("5:06 AM PDT.", "11:30 PM.")).expect("the reset");
     assert_eq!(bare, reset_of("11:30 PM", None));
     assert_eq!(bare.offset_s(), None);
     let foreign = limit_reset(&respelled("5:06 AM PDT", "5:06 AM CEST")).expect("the reset");
     assert_eq!(foreign, reset_of("5:06 AM", Some("CEST")));
     assert_eq!(foreign.offset_s(), None);
-    // THE SENTENCE WRAPPED in a box narrower than it: its rest on the rows
-    // under it, read to its full stop — the zone, and the whole clock.
-    // NEGATIVE CONTROL: a row with no full stop over the next line's `/`
-    // command reads no further than itself.
     let at = rows.iter().position(|r| *r == row).expect("the row");
     let width = row.chars().count() - 1;
     let boxed = |text: &str| format!("{:<width$}│", format!("│ {text}"));
@@ -847,7 +739,6 @@ fn the_accounts_usage_limit_dialog_names_its_reset_by_its_clock() {
         reset_of("11:05 PM", None),
         "the next line is no rest of it"
     );
-    // NEGATIVE CONTROLS.
     assert_eq!(limit_reset(&screen(LIMIT_DIALOG)), None);
     assert_eq!(limit_reset(&screen(IDLE)), None);
     let at = rows.iter().position(|r| *r == row).expect("the row");
@@ -869,13 +760,6 @@ fn the_accounts_usage_limit_dialog_names_its_reset_by_its_clock() {
 }
 
 /// The zone a reset is drawn in reads as its offset, for every spelling the
-/// measure drew ([`zone_offset_s`]: `Intl.DateTimeFormat("en-US", …
-/// timeZoneName: "short")` over every IANA zone, January and July, as
-/// `node` printed them under `TZ=<zone>`: `5:06 AM PDT`, `9:36 AM GMT-2:30`,
-/// `1:51 AM GMT+13:45`, `3:06 AM HADT`, `12:06 PM GMT+0` for a `TZ` it does
-/// not know). NEGATIVE CONTROLS: names en-US never draws (another locale's
-/// `CEST`, `IST`, an IANA name, `BST`), and offsets no zone has or no
-/// `GMT±` form spells, read as none.
 #[test]
 fn the_dialogs_zone_names_read_as_their_offsets() {
     let h = |n: i32| n * 3600;
@@ -911,7 +795,6 @@ fn the_dialogs_zone_names_read_as_their_offsets() {
     ] {
         assert_eq!(zone_offset_s(zone), Some(offset), "{zone}");
     }
-    // NEGATIVE CONTROLS.
     for zone in [
         "CEST",
         "IST",
@@ -932,12 +815,6 @@ fn the_dialogs_zone_names_read_as_their_offsets() {
 }
 
 /// The folder-trust dialog of a first run is a box no typing answers: a
-/// Trust prompt, `Trust folder (<dir>)` the trust, `Trust parent folder
-/// (<parent>)` a wider standing grant, `Don't trust` the refusal, chosen by
-/// digit; its Esc quits the program and is drawn nowhere, so none is
-/// offered. NEGATIVE CONTROLS: Claude Code's reader, whose own trust dialog
-/// asks in other words, sees no box on it; with two cursors no option
-/// carries a role.
 #[test]
 fn the_trust_dialog_is_a_trust_prompt() {
     let r = gemini(TRUST);
@@ -973,12 +850,6 @@ fn the_trust_dialog_is_a_trust_prompt() {
 }
 
 /// AN API ERROR ROW IS THE TURN'S WALL: the 401 and the 400 Google answers
-/// a key that is no key are the login ([`WallKind::Auth`]), their JSON read
-/// across the rows it wrapped onto (mid-token); the message is the row and
-/// its wrap, joined. Idle as evidence, no last words. NEGATIVE CONTROLS: a
-/// reply under the error is a turn that went on; a 400 with another reason
-/// and a 503 are API errors, the 503 retryable; the error read while a turn
-/// runs is no wall.
 #[test]
 fn an_api_error_row_is_the_turns_wall() {
     for text in [ERROR_401, ERROR_400_KEY] {
@@ -1037,11 +908,6 @@ fn an_api_error_row_is_the_turns_wall() {
 }
 
 /// AN ERROR'S NOTICE WRAPS in a pane narrower than its line (measured at 72
-/// columns: `ℹ This request failed. …` over `  change "Error Verbosity" …`),
-/// and the error is the turn's wall all the same: the `Stop` a usage limit
-/// left, a non-retryable API error, idle as evidence. NEGATIVE CONTROLS: an
-/// indented row under a blank, with no notice over it, is no notice's, and
-/// a reply under the notice is a turn that went on.
 #[test]
 fn an_error_whose_notice_wrapped_is_still_the_wall() {
     let r = gemini(NARROW_LIMIT_STOPPED);
@@ -1073,10 +939,6 @@ fn an_error_whose_notice_wrapped_is_still_the_wall() {
 }
 
 /// `/quit`: the farewell box, the resume line inside it, and the shell's
-/// prompt under it. Gemini CLI has left: no composer, no box (the farewell
-/// offers nothing to choose, so even drawn last it is none), no evidence,
-/// and the screen names no program. NEGATIVE CONTROL: the shell's rows cut
-/// away, the farewell is the last thing drawn, and still no box.
 #[test]
 fn an_exited_gemini_is_read_as_nothing() {
     let r = gemini(EXIT);
@@ -1103,9 +965,6 @@ fn an_exited_gemini_is_read_as_nothing() {
 }
 
 /// A box whose head scrolled off the rows read is named by nothing (an Other
-/// prompt, its head off the screen), and its options take the approval
-/// boxes' roles where `Allow once` is among them. NEGATIVE CONTROL: with no
-/// `Allow once` among them, no option carries a role.
 #[test]
 fn a_box_whose_head_scrolled_off_is_named_by_its_one_shot_allow() {
     let rows = screen(BOX_SHELL);
@@ -1136,7 +995,6 @@ fn a_box_whose_head_scrolled_off_is_named_by_its_one_shot_allow() {
 }
 
 /// Claude Code's, Codex's, agy's and Muse Code's readers on Gemini CLI's
-/// screens: never a box, never a question.
 #[test]
 fn the_other_readers_see_no_box_and_no_question_on_gemini_screens() {
     for (name, text) in captures() {
@@ -1159,13 +1017,6 @@ fn the_other_readers_see_no_box_and_no_question_on_gemini_screens() {
 }
 
 /// A shell, a pager or a viewer showing Gemini CLI's screen is not Gemini
-/// CLI: the program's NAME wins. With no name, under `node` (the name its
-/// own process carries) or under `gemini`, EVERY screen it draws names it —
-/// its composer idle, holding a draft, busy, retrying and at a turn's end,
-/// its menu, each box, its question, its usage-limit and trust dialogs, its
-/// error rows — but the screen it left and a redraw caught half drawn
-/// ([`ERASE_HALF`], no screen it drew whole). NEGATIVE CONTROLS: a screen with its
-/// words and no frame names nothing; a shell's name wins over its screen.
 #[test]
 fn a_shell_quoting_gemini_is_not_gemini() {
     let r = screen(BOX_SHELL);
@@ -1210,10 +1061,6 @@ fn a_shell_quoting_gemini_is_not_gemini() {
 }
 
 /// Gemini CLI is named `gemini`, by its path and arguments too, and its busy
-/// row is the spinner on the status row: exactly one on each busy screen —
-/// in column 1, or in column 0 with the UI details hidden. NEGATIVE
-/// CONTROLS: the idle status row, a reply's row, a frame in column 2, the
-/// blank braille cell and a frame with no blank after it are no spinner row.
 #[test]
 fn gemini_is_named_and_busy_on_its_spinner_row() {
     assert_eq!(crate::reader::program_of("gemini"), Some(Program::Gemini));
@@ -1246,10 +1093,6 @@ fn gemini_is_named_and_busy_on_its_spinner_row() {
 }
 
 /// THE OTHER SNIFFS CLAIM NONE OF GEMINI CLI'S SCREENS, so the sniff's order
-/// is no part of naming them: Muse Code's, agy's, Claude Code's (its frame,
-/// and its box parser where it names its own kind) say no on every Gemini
-/// CLI capture. NEGATIVE CONTROL: each
-/// says yes on one capture of its own.
 #[test]
 fn no_other_sniff_claims_a_gemini_screen() {
     use crate::prompt::{PromptKind, parse_prompt_v2};
@@ -1278,7 +1121,6 @@ fn no_other_sniff_claims_a_gemini_screen() {
 }
 
 /// Only Gemini CLI draws its caret one column in: every other reader's guard
-/// anchors the caret at column 0 ([`ScreenReader::caret_column`]).
 #[test]
 fn only_gemini_clis_caret_is_one_column_in() {
     for p in Program::ALL {
@@ -1294,11 +1136,6 @@ fn only_gemini_clis_caret_is_one_column_in() {
 }
 
 /// THE SNIFF CLAIMS NO OTHER PROGRAM'S SCREEN: over every capture of Claude
-/// Code, agy and Muse Code under `src/fixtures/`, Gemini CLI's layout
-/// test says no, the screen is never identified as Gemini CLI's, and Gemini
-/// CLI's reader reads no box and no composer on it. The control: it says
-/// yes on Gemini CLI's own (but the one it left and the redraw caught half
-/// drawn, [`ERASE_HALF`]).
 #[test]
 fn the_gemini_sniff_claims_no_other_programs_screen() {
     let mut swept = 0;
@@ -1322,14 +1159,6 @@ fn the_gemini_sniff_claims_no_other_programs_screen() {
 }
 
 /// SHELL MODE (`!` typed into the empty composer, measured): Gemini CLI's
-/// screen, named by its layout, but no evidence and no composer — what is
-/// typed there runs as a shell command — and no caret anything is typed
-/// under; its command's run draws no box this reader reads. Left with Esc,
-/// the composer is back at rest as evidence, and the command's `$` band is
-/// the person's last message (the session no longer fresh). NEGATIVE
-/// CONTROLS: the same screen with its caret `>` and its placeholder the
-/// composer's is the composer at rest, as evidence; the left screen with the
-/// `$` band's caret changed is a session with no message yet.
 #[test]
 fn shell_mode_is_geminis_screen_but_no_composer_and_no_evidence() {
     for text in [SHELL_MODE, SHELL_MODE_DRAFT, SHELL_MODE_RAN] {
@@ -1372,11 +1201,6 @@ fn shell_mode_is_geminis_screen_but_no_composer_and_no_evidence() {
 }
 
 /// YOLO (ctrl+y, measured) draws the composer's caret `*`: the composer all
-/// the same — at rest, with a draft, busy under the spinner and at a turn's
-/// end, its tool run with no box — and a guard on typed text anchors to `*`
-/// there ([`caret_on`]). NEGATIVE CONTROLS: the default composer's caret is
-/// `>`, and a box screen's is `>` too; a `*` band with no rule over it (the
-/// transcript's) is no composer.
 #[test]
 fn yolo_is_a_composer_under_its_own_caret() {
     for (text, phase_, draft) in [
@@ -1416,16 +1240,6 @@ fn yolo_is_a_composer_under_its_own_caret() {
 }
 
 /// THE UI DETAILS HIDDEN (Tab twice, measured, `focusUiEnabled` in the CLI's
-/// state, so it stays across sessions): no rule, mode row or footer — the
-/// status row right over the band, the band the last thing drawn — and still
-/// the composer: at rest under `press tab twice for more` (or a blank row
-/// with the hint off), with a draft under a blank row, busy under the
-/// spinner in column 0, at a turn's end with its last words, under YOLO with
-/// `● YOLO` on the status row and the rule back, or the mode's row alone
-/// over a draft; its box is the shell box. NEGATIVE CONTROLS: a row drawn
-/// under the band (a menu, a list) unmakes it; a status row of words this
-/// grammar has not measured unmakes it; a band whose status row is a reply's
-/// row is the transcript's.
 #[test]
 fn the_composer_with_the_ui_details_hidden_is_read() {
     for (text, phase_, draft, caret) in [
@@ -1483,11 +1297,6 @@ fn the_composer_with_the_ui_details_hidden_is_read() {
 }
 
 /// `ui.showShortcutsHint = false` (measured at 144 columns): the status row
-/// is blank at rest in a wide pane too, and that is the composer's rest, as
-/// evidence — the session continued as any other; busy is the spinner, and
-/// the turn's end is the spinner gone with its last words. NEGATIVE CONTROL:
-/// the same rest with the spinner's words but no spinner glyph is no
-/// evidence.
 #[test]
 fn a_rest_with_the_shortcuts_hint_off_is_evidence() {
     let idle = gemini(HINT_OFF_IDLE);
@@ -1512,12 +1321,6 @@ fn a_rest_with_the_shortcuts_hint_off_is_evidence() {
 }
 
 /// SEVERAL QUESTIONS (measured, two): each tab is a question box whose
-/// question is the row under the tab row (the tab row its note), and its
-/// options carry NO role — such a dialog is a person's whole (module
-/// header); its review tab, with no numbered option, is a question box with
-/// none, its answers its notes, `Enter to submit · …` its key row; submitted,
-/// the turn ends on the tool's row. NEGATIVE CONTROLS: the one-question
-/// dialog keeps its answers' roles; the review's head reworded is no box.
 #[test]
 fn several_questions_are_read_tab_by_tab_and_left_to_a_person() {
     for (text, asks) in [
@@ -1570,14 +1373,6 @@ fn several_questions_are_read_tab_by_tab_and_left_to_a_person() {
 }
 
 /// THE MCP, FETCH AND SANDBOX-EXPANSION BOXES (measured: a local stdio MCP
-/// server, a `web_fetch` call, a shell call naming `additional_permissions`
-/// with no sandbox on): each a box of kind Other, named Gemini CLI's by its
-/// one `Allow once`, read whole — the MCP and fetch boxes' title the tool's
-/// row under `Action Required`, each question kept, the expansion's command
-/// and its `• …` rows — with `Allow once` the one-shot, every `… for this
-/// session` a standing grant and `No, suggest changes (esc)` the refusal.
-/// NEGATIVE CONTROLS: a session label in other words carries no role; the
-/// expansion's question reworded leaves no question read.
 #[test]
 fn the_mcp_fetch_and_expansion_boxes_are_read_whole() {
     let mcp = gemini(BOX_MCP).prompt.expect("the MCP box");
@@ -1644,14 +1439,6 @@ fn the_mcp_fetch_and_expansion_boxes_are_read_whole() {
 }
 
 /// IN A NARROW PANE, A 401 AND A 403 (measured at 72 columns): each error
-/// wraps over rows two columns in, its notice too, and is still the turn's
-/// wall — the 401 the login, the 403 `PERMISSION_DENIED` (`SERVICE_DISABLED`)
-/// an API error the CLI does not retry. A 404 for the turn's model draws the
-/// usage-limit dialog's sibling, `It seems like you don't have access to
-/// …`: a box of no kind named Gemini CLI's by that row, its message read
-/// whole, neither option pressed; answered `Stop`, an API error with no
-/// status. NEGATIVE CONTROL: the dialog's first row reworded names it no
-/// program's.
 #[test]
 fn narrow_errors_and_the_no_access_dialog() {
     let r401 = gemini(NARROW_ERROR_401);
@@ -1704,15 +1491,6 @@ fn narrow_errors_and_the_no_access_dialog() {
 }
 
 /// A BOX KEPT OVER THE COMPOSER (`ui.collapseDrawerDuringApproval = false`,
-/// measured): the shell box stays in the transcript over a composer still
-/// drawn and focused, its status row blank — with the composer empty, with
-/// a draft typed into it, with that draft queued under the box by an Enter,
-/// and with the UI details hidden too. Each is the PROMPT, as evidence, read
-/// whole (the shell box, its command and options), every option a person's
-/// (the composer has the keys: a digit is typed into it). NEGATIVE CONTROLS:
-/// the same screen with the box blanked out is the composer at rest; the box
-/// with no option under the cursor (a finished tool's box) is no prompt; the
-/// default layout's shell box keeps its roles.
 #[test]
 fn a_box_kept_over_the_composer_is_a_persons_prompt() {
     for text in [
@@ -1780,14 +1558,6 @@ fn a_box_kept_over_the_composer_is_a_persons_prompt() {
 }
 
 /// UNDER ITS OWN SANDBOX (measured outside the lab's jail: its seatbelt,
-/// `GEMINI_SANDBOX=sandbox-exec`, and its per-tool one,
-/// `security.toolSandboxing`, at 144 and 72 columns): the footer's sandbox
-/// column says `current process` or `all tools`, and a fresh session is
-/// still idle as evidence at its empty composer — `? for shortcuts` in a
-/// wide pane, a blank status row in a narrow one; a turn under the seatbelt
-/// is busy on its spinner and ends on its reply. NEGATIVE CONTROLS: the
-/// footer's words put on the status row are words this grammar has not
-/// measured, and say nothing; the busy screen is busy.
 #[test]
 fn a_session_under_its_sandbox_reads_as_without_it() {
     for (text, says) in [
@@ -1839,15 +1609,6 @@ fn a_session_under_its_sandbox_reads_as_without_it() {
 }
 
 /// A SHELL COMMAND THE SANDBOX DENIED, with nothing offered (measured: a
-/// write outside the project and a `curl` to a non-loopback address under
-/// its seatbelt; the same write once a sandbox expansion was allowed, which
-/// widens nothing the process's own profile denies; a `touch` with both
-/// sandboxes on, whose per-tool `sandbox-exec` cannot apply inside the
-/// other): the tool's row is `✓` — the command ran and exited non-zero, no
-/// tool error — with the denial in its box, and the turn ends on the
-/// model's reply: idle as evidence, its last words the reply, no wall, no
-/// person's stop, no box. NEGATIVE CONTROL: the reply's rows gone, the turn
-/// ends on the tool's box, which is Gemini CLI's own and no last words.
 #[test]
 fn a_command_its_sandbox_denied_ends_the_turn_on_the_reply() {
     for (text, denial) in [
@@ -1898,18 +1659,6 @@ fn a_command_its_sandbox_denied_ends_the_turn_on_the_reply() {
 }
 
 /// THE SANDBOX-EXPANSION BOX OFFERED WITH THE SANDBOX ON (measured: after
-/// the per-tool seatbelt denied a write outside the project, at 144, 100 and
-/// 72 columns, `• Write:` and `• Read:` the directory above the denied path;
-/// before a `curl` runs, `• Network: All Urls`; after the process's seatbelt
-/// denied the write, for the model's next call naming
-/// `additional_permissions`, under the denied call's finished row): each a
-/// box of kind Other named Gemini CLI's by its `Allow once`, read whole —
-/// the command in the box drawn inside it, the question, the `• …` rows as
-/// notes — `Allow once` the one-shot, `Allow for this session` a standing
-/// grant, `No, suggest changes (esc)` the refusal and its Esc, chosen by
-/// digit. NEGATIVE CONTROLS: the box blanked out, the denied call's
-/// finished box above it is no prompt; its question reworded, no question
-/// is read.
 #[test]
 fn the_expansion_box_after_a_denial_is_read_whole() {
     let write = "touch /Users//Shared/gemini-sandbox-probe.txt";
@@ -1988,16 +1737,6 @@ fn the_expansion_box_after_a_denial_is_read_whole() {
 }
 
 /// A SANDBOX EXPANSION REFUSED WITH ESC (measured). The box the model's own
-/// call raised, and the one a `curl` raised before it ran, end the turn as
-/// every refused box does — the call's row marked `-`, `ℹ Request
-/// cancelled.` — the person's stop. The box the per-tool seatbelt raised
-/// after a real denial does not: the call draws no row, and the CLI sends
-/// the expansion request back to the model as the call's error, so the turn
-/// goes on — a turn's end like any other, at 144, 100 and 72 columns. The
-/// reply's `sandbox_expansion` is the local fake's echo of that error, not
-/// what a model would say. NEGATIVE CONTROLS: the cancel row gone, the first
-/// are no person's stop; a cancel row under the second's reply would make it
-/// one.
 #[test]
 fn a_refused_expansion_is_the_persons_stop_or_the_models_turn() {
     for text in [SANDBOX_RETRY_REFUSED, SANDBOX_TOOLS_NETWORK_REFUSED] {
@@ -2047,12 +1786,6 @@ fn a_refused_expansion_is_the_persons_stop_or_the_models_turn() {
 }
 
 /// A REPLY TALLER THAN THE SCREEN IS NO WHOLE REPLY ([`said_whole`]): its
-/// `✦` head scrolled above the rows read, its last words are the rows in
-/// sight, and the need its head said is not in them — so a reader of a
-/// landing knows to read the rest (the recheck of d88a7bf289 found only
-/// Claude Code's cut read, and a tall report here land on its last rows).
-/// NEGATIVE CONTROL: the same reply with its head on the rows is whole, the
-/// need in its words.
 #[test]
 fn a_reply_whose_head_scrolled_away_is_no_whole_reply() {
     let rows = screen(END_OF_TURN);
@@ -2072,20 +1805,11 @@ fn a_reply_whose_head_scrolled_away_is_no_whole_reply() {
         "{tail}"
     );
     assert!(!said_whole(&cut) && !Program::Gemini.reader().said_whole(&cut));
-    // NEGATIVE CONTROL: the head on the rows.
     assert!(said_whole(&drawn) && Program::Gemini.reader().said_whole(&drawn));
     assert!(said_tail(&drawn).is_some_and(|t| t.starts_with("NEEDS YOU: the signing")));
 }
 
 /// A NEED SAID BEFORE A TOOL CALL IS THE TURN'S ([`turn_said_before`]): the
-/// `✦` reply above a tool's box, under the person's band, is read with the
-/// turn its last reply ends — a `NEEDS YOU:` there stands however the last
-/// reply says nothing is left (the recheck of ea564676a3 found the turn's
-/// earlier words read on Claude Code alone). The turn is whole with its
-/// band on the rows ([`turn_whole`]); with its band above them it is not,
-/// and the history read above them stops at the band's top
-/// ([`turn_history_stop`]). NEGATIVE CONTROL: the same turn with no reply
-/// before the call holds no other words.
 #[test]
 fn a_need_said_before_a_tool_call_is_read_with_the_turn() {
     let rows = screen(END_OF_TURN);
@@ -2124,8 +1848,6 @@ fn a_need_said_before_a_tool_call_is_read_with_the_turn() {
         Some("Nothing left: all of it is merged.")
     );
     assert!(turn_whole(&drawn) && reader.turn_whole(&drawn));
-    // The band above the rows: the turn is cut, and the read above stops at
-    // the band's top.
     let band = drawn
         .iter()
         .position(|r| r == " > think slowly")
@@ -2136,19 +1858,12 @@ fn a_need_said_before_a_tool_call_is_read_with_the_turn() {
     for row in &drawn[band..band + 4] {
         assert!(!turn_history_stop(row), "{row}");
     }
-    // NEGATIVE CONTROL: no reply before the call.
     let plain = turn(&[]);
     assert_eq!(turn_said_before(&plain), None);
     assert!(turn_whole(&plain) && said_tail(&plain).is_some());
 }
 
 /// THE MESSAGE THAT OPENED THE TURN IS READ OFF ITS BAND ([`turn_opened_by`]):
-/// the sent row's text past its ` > `, and the rows it wrapped onto three
-/// columns in, joined — what tells a successor whether its land act opened
-/// the turn whose defense stands (the review of b8/residuals found a
-/// defense said under a person's earlier message landed on Gemini CLI,
-/// nothing reading the band). NEGATIVE CONTROLS: the band above the rows,
-/// and Claude Code's reader, read none.
 #[test]
 fn the_message_that_opened_the_turn_is_read_off_its_band() {
     let rows = screen(END_OF_TURN);
@@ -2175,7 +1890,6 @@ fn the_message_that_opened_the_turn_is_read_off_its_band() {
             "[aterm harness] Autopilot is Land: land ALL of this work into the remote main branch"
         )
     );
-    // NEGATIVE CONTROLS.
     let cut = rows[band + 2..].to_vec();
     assert!(said_tail(&cut).is_some());
     assert_eq!(turn_opened_by(&cut), None);
@@ -2183,14 +1897,6 @@ fn the_message_that_opened_the_turn_is_read_off_its_band() {
 }
 
 /// THE FRAME A LAUNCH DRAWS BEFORE ITS BANNER (measured in the forever lab,
-/// P3 of `docs/measured/forever-lab-2026-10-20.md`): the composer, its
-/// footer and `? for shortcuts` with nothing above them — idle as evidence,
-/// no message, no reply, no opener, an empty composer, and NOT `fresh`: no
-/// banner row stands above the composer yet, so the screen alone cannot tell
-/// it from a conversation scrolled or cleared away (the supervisor reads the
-/// host's launch for that). NEGATIVE CONTROLS: the composer under its banner
-/// a moment later is fresh; a turn's end over the same composer opens on its
-/// message and ends on its reply.
 #[test]
 fn the_frame_before_the_banner_is_idle_with_no_turn_and_not_fresh() {
     let r = gemini(PRE_BANNER);
@@ -2206,7 +1912,6 @@ fn the_frame_before_the_banner_is_idle_with_no_turn_and_not_fresh() {
     assert_eq!(r.composer, Some((caret_at(&rows), vec![String::new()])));
     assert_eq!(turn_opened_by(&rows), None);
     assert!(!rows.iter().any(|row| is_banner_row(row)));
-    // NEGATIVE CONTROLS.
     assert!(gemini(IDLE).fresh, "the banner drawn");
     let ended = gemini(END_OF_TURN);
     assert!(!ended.fresh);
@@ -2215,25 +1920,9 @@ fn the_frame_before_the_banner_is_idle_with_no_turn_and_not_fresh() {
 }
 
 /// GEMINI CLI'S TOP LINE ([`top_rule`], the row aterm's glass marks the
-/// program on): the live zone's `─` rule over the approval mode, as wide as
-/// the composer's band, in every capture whose composer has one — at rest,
-/// with a draft, busy, at a turn's end, narrow, under YOLO, under its
-/// sandbox, with a box kept over the composer, and with the UI details
-/// hidden under a non-default mode, which brings the rule back (module
-/// header) — and none with the UI details hidden at the default mode, nor
-/// where a box replaced the live zone. Swept over every capture: a row it
-/// names is a plain `─` rule with the band of its width under it, at most
-/// [`UNDER_RULE_ROWS`] rows down, its caret under its `▄`. NEGATIVE
-/// CONTROLS: the band's `▄` row and a sent message's band are offered and
-/// refused — the band's top is no rule the sweep would pass, the band with
-/// its rule taken away names no top line (not its `▄`), the sent message's
-/// band in `busy-streaming` (no rule over it) names none once the live
-/// zone's rule is gone, and a full-width rule laid right over that sent band
-/// is never the top line while the composer's rule stands.
 #[test]
 fn gemini_top_rule_is_the_live_zone_rule() {
     /// The rule `top` names on `rows`, proven: a plain rule, the band of its
-    /// width under it within reach, the caret on the band's next row.
     fn proven(rows: &[String], top: usize) -> bool {
         plain_rule_width(&rows[top]).is_some_and(|w| {
             (top + 1..=(top + UNDER_RULE_ROWS + 1).min(rows.len() - 1)).any(|t| {
@@ -2297,8 +1986,6 @@ fn gemini_top_rule_is_the_live_zone_rule() {
         }
     }
 
-    // NEGATIVE CONTROLS. The band's `▄` row offered: no rule the sweep
-    // passes, and the band with its rule blanked names no top line at all.
     let rows = screen(IDLE);
     let band = caret_at(&rows) - 1;
     assert_eq!(
@@ -2309,7 +1996,6 @@ fn gemini_top_rule_is_the_live_zone_rule() {
     let mut unruled = rows.clone();
     unruled[top_rule(&rows).expect("the rule")] = String::new();
     assert_eq!(top_rule(&unruled), None, "the band alone");
-    // A sent message's band (`> think slowly`, no rule over it) offered.
     let rows = screen(BUSY_STREAMING);
     let live = top_rule(&rows).expect("the live zone's rule");
     let sent = rows
@@ -2327,10 +2013,6 @@ fn gemini_top_rule_is_the_live_zone_rule() {
 }
 
 /// THE ERROR A DIALOG'S `Stop` LEAVES ([`stopped_error`]): the usage-limit
-/// dialog's answered `2. Stop`, at 144 columns and wrapped at 72, and the
-/// no-access dialog's — `[API Error: An unknown error occurred.]`, no code,
-/// not retried. NEGATIVE CONTROLS: a 401 (Auth), the 400 of a key that is no
-/// key, a 403, and a retryable 5xx are no such error.
 #[test]
 fn the_error_a_dialogs_stop_leaves_is_read_as_such() {
     for f in [
@@ -2355,14 +2037,6 @@ fn the_error_a_dialogs_stop_leaves_is_read_as_such() {
 }
 
 /// A LONG PASTE IS DRAWN AS ITS CHIP ([`folded_paste`]): on the measured
-/// screen ([`FOLDED_PASTE`]) the composer holds `[Pasted Text: 538 chars]`
-/// alone, which is what `folded_paste` says for any 538-character text, and
-/// Gemini CLI's reader says the same ([`ScreenReader::folded_paste`]). The
-/// bounds are the bundle's: more than 500 UTF-16 code units (a character past
-/// the Basic Multilingual Plane counts two, and `\r\n` reads as one `\n`), or
-/// more than 5 lines (named by its lines). NEGATIVE CONTROLS: 500 units, 250
-/// emoji, 499 characters before a `\r\n` and 5 lines are drawn as typed
-/// (`None`), and no other program's reader folds a paste.
 #[test]
 fn a_long_paste_is_drawn_as_its_chip() {
     let rows = screen(FOLDED_PASTE);
@@ -2407,15 +2081,6 @@ fn a_long_paste_is_drawn_as_its_chip() {
 }
 
 /// GEMINI CLI'S TRUST NOTICES ARE CHROME UNDER A REPLY
-/// ([`trust_notices_above`]): on the screen of a worker aterm relaunched on
-/// its session after its own restart (measured), the defense `✦ Nothing
-/// left: …` stands above `⚠  Note: This folder is still trusted because …`
-/// and `ℹ This folder is untrusted, …` with its `/permissions` row; the
-/// turn's last words are the defense, whole, and the turn is the Land act's.
-/// The notices wrapped in a narrow pane are cut the same way, and a cancel
-/// above them still ends the turn. NEGATIVE CONTROLS: a notice of other words
-/// in the same place is what the turn ended on (no last words), and so is a
-/// trust notice's head with a row in column 0 under it.
 #[test]
 fn trust_notices_under_a_resumed_reply_are_chrome() {
     let rows = screen(LAB_RESUMED_TRUST_NOTICES);
@@ -2431,7 +2096,6 @@ fn trust_notices_under_a_resumed_reply_are_chrome() {
     let r = gemini(LAB_RESUMED_TRUST_NOTICES);
     assert_eq!(r.said_tail.as_deref(), Some(defense));
     assert_eq!(r.phase, Phase::Idle);
-    // Wrapped in a narrow pane: the rows each notice wrapped onto, two in.
     let untrusted = rows
         .iter()
         .position(|r| r.starts_with("ℹ This folder is untrusted"))
@@ -2445,7 +2109,6 @@ fn trust_notices_under_a_resumed_reply_are_chrome() {
         ],
     );
     assert_eq!(said_tail(&narrow).as_deref(), Some(defense));
-    // A cancel above the notices still ends the turn as a person's stop.
     let mut cancelled = rows.clone();
     let reply = rows
         .iter()
@@ -2457,25 +2120,18 @@ fn trust_notices_under_a_resumed_reply_are_chrome() {
     );
     cancelled.drain(cancelled.len() - 2..);
     assert!(interrupted(&cancelled));
-    // NEGATIVE CONTROL: a notice of other words where the trust notice was.
     let other = edited(
         &rows,
         "⚠  Note:",
         "⚠  Note: the loop detector stopped this turn.",
     );
     assert_eq!(said_tail(&other), None);
-    // NEGATIVE CONTROL: a row in column 0 under a trust notice's head.
     let mut broken = rows.clone();
     broken[untrusted + 1] = "Use the /permissions command to change the trust level.".to_string();
     assert_eq!(said_tail(&broken), None);
 }
 
 /// A RAW WRITE IS NO PASTE ([`folded_paste`]): 600 and 1600 characters of
-/// one line sent raw (the fenced write's `send`, no paste brackets) are drawn
-/// in the composer as the words typed, wrapped over its rows (measured), so the
-/// fenced write's comparison of the composer with its words holds past the
-/// fold's 500 units. NEGATIVE CONTROL: the same text written as one paste
-/// folds into a chip, as the harness's measured 538-character paste did.
 #[test]
 fn a_raw_send_longer_than_the_fold_is_drawn_as_words() {
     assert!(provenance(LAB_RAW_SEND_600).is_some_and(|p| p.contains("MEASURED")));
@@ -2488,16 +2144,12 @@ fn a_raw_send_longer_than_the_fold_is_drawn_as_words() {
     assert!(lines.len() >= 5, "{lines:?}");
     assert_eq!(squash(&lines.concat()), squash(&sent));
     assert!(lines.iter().all(|l| !l.contains("[Pasted Text")));
-    // NEGATIVE CONTROL: as one paste it folds.
     assert_eq!(
         folded_paste(&sent).as_deref(),
         Some("[Pasted Text: 600 chars]")
     );
     let (_, chip) = composer_draft(&screen(FOLDED_PASTE)).expect("the composer");
     assert!(chip[0].starts_with("[Pasted Text: 538 chars]"), "{chip:?}");
-    // 1600 characters (measured): words again, the composer's ten rows
-    // holding the text's end, its first rows scrolled inside the composer;
-    // as one paste it folds.
     assert!(provenance(LAB_RAW_SEND_1600).is_some_and(|p| p.contains("MEASURED")));
     let long: String = phrase.repeat(30).chars().take(1600).collect();
     let (_, lines) = composer_draft(&screen(LAB_RAW_SEND_1600)).expect("the composer");

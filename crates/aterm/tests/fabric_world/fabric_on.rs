@@ -1,16 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `aterm fabric on|off|doctor` end to end — the real `aterm fabric on`
-//! command line against a real broker, a real headless `aterm` and the real
-//! bridge it launches, every one of them in a scratch world of its own.
-//!
-//! Sealed off from the machine: its own `$HOME` (default root, LaunchAgents dir and config
-//! path land in scratch), `$XDG_CONFIG_HOME` and `$XDG_RUNTIME_DIR` (no live instance is
-//! dialed), `$ATERM_FABRIC_HOME` (the derived launchd label, `enable::Paths::label`, is
-//! never the live one), and `--service none` everywhere except the test that drives a fake
-//! `launchctl` on `$PATH`. Instances run the harness's fixture config, since a scratch
-//! HOME alone does not isolate macOS preferences.
+//! `aterm fabric on|off|doctor` end to end — the real `aterm fabric on` command line against a real broker, a real headless `aterm` and the real bridge it launches, every one of them in a scratch world of its own.
 #![allow(
     clippy::disallowed_types,
     reason = "test code: a stand-in child may inherit descriptors"
@@ -26,7 +17,6 @@ use aterm_link::ctl::Ctl;
 use aterm_link::fabric::kv;
 
 /// The scratch world, short and under `/tmp`: the broker's socket path has to fit
-/// `sun_path`, and a per-user `$TMPDIR` does not.
 struct Scratch {
     dir: PathBuf,
 }
@@ -85,7 +75,6 @@ impl Scratch {
     }
 
     /// `aterm link <verb> <args>` in the same environment (the read-side verbs,
-    /// whose flags the rendezvous file defaults).
     fn link(&self, args: &[&str]) -> (i32, String, String) {
         let mut cmd = Command::new(harness::aterm_to_launch());
         prepare_gui_environment(&mut cmd);
@@ -133,11 +122,6 @@ fn write_secret(s: &Scratch, bytes: &[u8], mode: u32) {
 }
 
 /// `aterm link broker <sock> <log> --secret-file <root>/mint.secret` — the
-/// GUARDED bus `on` deploys under launchd, started here instead; killed on
-/// drop. A root with no secret yet gets one first (32 bytes, 0600), which
-/// `on` then keeps: the broker cannot be guarded by a secret that does not
-/// exist. The root is made 0700 first, as `on` leaves it: a mint secret is read
-/// only from a directory nobody else can reach.
 struct Broker {
     child: Child,
 }
@@ -148,7 +132,6 @@ impl Broker {
     }
 
     /// [`Broker::spawn`] with `extra` words after the secret (a
-    /// `--durability`, as the manual's by-hand step 1 adds it).
     fn spawn_with(s: &Scratch, extra: &[&str]) -> Self {
         use aterm_uds::spawnfd::InheritNothing as _;
         chmod(&s.root(), 0o700);
@@ -156,8 +139,6 @@ impl Broker {
         if !secret.exists() {
             write_secret(s, &[0x6b; 32], 0o600);
         }
-        // std's `Command` for `harness::first_line_within`, stripped: the broker holds its
-        // stdio and nothing else of this process.
         let mut child = Command::new(harness::aterm_to_launch())
             .inherit_nothing()
             .args([
@@ -188,9 +169,6 @@ impl Drop for Broker {
 }
 
 /// The caps `on` minted, checked against the broker it deploys (the root's socket, guarded
-/// by the root's secret): every grant attaches and a `Last` walk under the ring answers,
-/// while a cap minted under another secret and a halt published with no cap are refused,
-/// which tells a guarded broker from one that checks nothing.
 fn deployed_broker_checks_the_minted_caps(s: &Scratch, node: &str) {
     let caps = aterm_link::bridge::read_cap_file(&s.path("root/node.cap")).expect("cap file");
     assert_eq!(caps.len(), 8);
@@ -243,7 +221,6 @@ impl Gui {
         prepare_gui_environment(&mut cmd);
         cmd.arg("--headless")
             .env("HOME", s.path("home"))
-            // The scratch's own, as every harness launch names it (`World`'s launch says why).
             .env("TMPDIR", &s.dir)
             .env("XDG_RUNTIME_DIR", s.path("run"))
             .env("XDG_CONFIG_HOME", s.path("cfg"))
@@ -289,8 +266,6 @@ impl Drop for Gui {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-        // The bridge sees its fds close a moment after the gui dies: kill it so no test
-        // leaves a `serve` behind.
         if let Some(pid) = std::fs::read_to_string(self.state.join("pid"))
             .ok()
             .and_then(|p| p.trim().parse::<i32>().ok())
@@ -301,7 +276,6 @@ impl Drop for Gui {
 }
 
 /// The step lines named `<name>` (e.g. `node already n-…`), from the STEPS block
-/// only: the status report that follows a real run has a `node` row of its own.
 fn step<'a>(out: &'a str, name: &str) -> Vec<&'a str> {
     let steps = out
         .find("\naterm fabric — fleet")
@@ -319,15 +293,6 @@ fn step<'a>(out: &'a str, name: &str) -> Vec<&'a str> {
 }
 
 /// **THE DEV APP'S PATH HOLDS A SPACE** (`~/Applications/aterm (dev).app/…`,
-/// what `targo --unverified ship dev-app` installs), and `on` used to refuse
-/// it at the argv step: `[fabric] command` is a whitespace-split line. Now
-/// `on` RUNS THAT PATH THROUGH A LINK in the fabric root, `<root>/bin/aterm`,
-/// so the command it writes is still the one plain line every aterm reads —
-/// never an argv array, which an older aterm sharing aterm.toml would reject
-/// the whole file for. The instance arms that line, the bridge runs through
-/// the link (its argv[0]), and the proof round-trips through the broker. A
-/// second `on` changes nothing. NEGATIVE CONTROL: the line spelling of the
-/// spaced path itself names a program that is not there.
 #[test]
 fn on_with_an_aterm_path_holding_a_space_runs_it_through_a_link() {
     let s = Scratch::new("sp");
@@ -392,7 +357,6 @@ fn on_with_an_aterm_path_holding_a_space_runs_it_through_a_link() {
     );
     let rendezvous = aterm_link::enable::Rendezvous::parse(&rendezvous_text).expect("parses");
     assert_eq!(rendezvous.command, want);
-    // The instance runs exactly that argv, and its bridge is up.
     let h = gui.verb("fabric status").header().to_string();
     assert_eq!(kv(&h, "state"), Some("connected"), "{h}");
     assert_eq!(
@@ -421,11 +385,9 @@ fn on_with_an_aterm_path_holding_a_space_runs_it_through_a_link() {
         "the proof's note was delivered: {:#?}",
         inbox.rows()
     );
-    // NEGATIVE CONTROL: the line spelling of the spaced path splits it.
     let split = aterm_types::fabric_command::split_line(&format!("{spaced} link serve"));
     assert_ne!(split[0], spaced);
     assert!(!std::path::Path::new(&split[0]).exists(), "{}", split[0]);
-    // A second `on` reads the same command and the same link.
     let mut again = s.fabric_cmd(&["on", "--service", "none"]);
     again.env("ATERM_BIN", &spaced);
     let (code, out, err) = run(&mut again);
@@ -441,11 +403,6 @@ fn on_with_an_aterm_path_holding_a_space_runs_it_through_a_link() {
 }
 
 /// End to end, twice. With no fabric command and no broker, the first `on` provisions the
-/// root, node id, secret and cap, then fails at the broker (`--service none` starts none),
-/// naming the guarded broker to run. With that broker up, `on` writes the config and the
-/// rendezvous file, arms the instance and proves the round trip; a second `on` changes
-/// nothing and says so; the read-side verbs then need no flags; `off` removes what changes
-/// behaviour and keeps the identity.
 #[test]
 fn on_provisions_arms_proves_and_a_second_on_changes_nothing() {
     let bin = harness::aterm();
@@ -459,7 +416,6 @@ fn on_provisions_arms_proves_and_a_second_on_changes_nothing() {
         status.header()
     );
 
-    // `on` with no broker: identity provisioned, the broker named.
     let (code, out, err) = s.fabric(&["on", "--service", "none"]);
     assert_eq!(code, 1, "stdout:\n{out}\nstderr:\n{err}");
     for (name, verdict) in [
@@ -498,7 +454,6 @@ fn on_provisions_arms_proves_and_a_second_on_changes_nothing() {
         "the broker is guarded by the secret `on` minted"
     );
 
-    // `on` with the broker up.
     let (code, out, err) = s.fabric(&["on", "--service", "none"]);
     assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
     assert!(err.is_empty(), "nothing on stderr: {err}");
@@ -526,8 +481,6 @@ fn on_provisions_arms_proves_and_a_second_on_changes_nothing() {
         step(&out, "broker").iter().all(|l| !l.contains("WARNING")),
         "a guarded broker is no warning:\n{out}"
     );
-    // The node id is in the state dir and the cap was minted for it with the root's secret,
-    // which the deployed broker verified when the bridge attached.
     let node = std::fs::read_to_string(s.root().join("link-state/node")).expect("node");
     let node = node.trim().to_string();
     assert!(node.starts_with("n-") && node.len() == 18, "{node}");
@@ -543,7 +496,6 @@ fn on_provisions_arms_proves_and_a_second_on_changes_nothing() {
     assert_eq!(mode_of(&s.root().join("node.cap")), 0o600);
     assert_eq!(mode_of(&s.root()), 0o700);
     deployed_broker_checks_the_minted_caps(&s, &node);
-    // The config carries the bridge command in the shim's spelling, with --accept-from.
     let config = std::fs::read_to_string(s.config()).expect("config");
     let command = aterm_link::fabric::command_in_toml(&config)
         .expect("valid TOML")
@@ -560,7 +512,6 @@ fn on_provisions_arms_proves_and_a_second_on_changes_nothing() {
     let baseline_backup = std::fs::read_to_string(s.dir.join("cfg/aterm/aterm.toml.bak"))
         .expect("the initial isolation config was backed up");
     assert_eq!(baseline_backup, harness::FIXTURE_GUI_CONFIG);
-    // The rendezvous file, 0600, beside the control socket.
     let r = std::fs::read_to_string(s.rendezvous()).expect("fabric.toml");
     assert_eq!(mode_of(&s.rendezvous()), 0o600);
     let r = aterm_link::enable::Rendezvous::parse(&r).expect("parses");
@@ -570,7 +521,6 @@ fn on_provisions_arms_proves_and_a_second_on_changes_nothing() {
     assert_eq!(r.cap_file, s.path("root/node.cap"));
     assert_eq!(r.state, s.path("root/link-state"));
     assert_eq!(r.command, command);
-    // The instance is armed with exactly that command, and connected.
     let status = gui.verb("fabric status");
     let h = status.header();
     assert_eq!(kv(h, "supervised"), Some("1"), "{h}");
@@ -580,8 +530,6 @@ fn on_provisions_arms_proves_and_a_second_on_changes_nothing() {
         Some(command.clone()),
         "{h}"
     );
-    // The proof's note is in the session's inbox, delivered THROUGH the broker
-    // (it carries a bus offset).
     let inbox = gui.verb(&format!("@{sid} inbox --peek"));
     let notes: Vec<&String> = inbox
         .rows()
@@ -591,7 +539,6 @@ fn on_provisions_arms_proves_and_a_second_on_changes_nothing() {
     assert_eq!(notes.len(), 1, "{:#?}", inbox.rows());
     assert!(kv(notes[0], "off").is_some_and(|o| o.parse::<u64>().is_ok()));
 
-    // The second `on`: idempotent, says so, proves again.
     let before = std::fs::read(s.config()).expect("config bytes");
     let rendezvous_before = std::fs::read(s.rendezvous()).expect("fabric.toml bytes");
     let (code, out2, err) = s.fabric(&["on", "--service", "none"]);
@@ -634,7 +581,6 @@ fn on_provisions_arms_proves_and_a_second_on_changes_nothing() {
         "the cap was re-minted"
     );
 
-    // The read-side verbs need no flags now.
     let (code, ls, err) = s.link(&["ls"]);
     assert_eq!(code, 0, "{ls}\n{err}");
     assert!(
@@ -646,10 +592,8 @@ fn on_provisions_arms_proves_and_a_second_on_changes_nothing() {
         ls.lines().any(|l| l.contains(&format!(" {sid} "))),
         "and the session's presence row:\n{ls}"
     );
-    // A flag on the command line still beats the rendezvous file.
     let (code, _, err) = s.link(&["ls", "--broker", "/tmp/atfo-nowhere.sock"]);
     assert_ne!(code, 0, "{err}");
-    // `aterm fabric` (status) without [fabric] reads the rendezvous file.
     std::fs::write(
         s.config(),
         format!("font_px = 12.0\n{}", harness::FIXTURE_GUI_CONFIG),
@@ -661,7 +605,6 @@ fn on_provisions_arms_proves_and_a_second_on_changes_nothing() {
         "exit {code}:\n{status}"
     );
 
-    // `off`, dry then real.
     let (code, out, err) = s.fabric(&["off", "--service", "none", "--dry-run"]);
     assert_eq!(code, 0, "{out}\n{err}");
     assert!(s.rendezvous().exists(), "a dry run removes nothing");
@@ -671,8 +614,6 @@ fn on_provisions_arms_proves_and_a_second_on_changes_nothing() {
     for kept in ["link-state/node", "mint.secret", "node.cap"] {
         assert!(s.root().join(kept).exists(), "off keeps {kept}");
     }
-    // `off` on a config with the table: the table goes, the rest stays, a .bak holds the
-    // previous file.
     std::fs::write(
         s.config(),
         format!(
@@ -692,9 +633,6 @@ fn on_provisions_arms_proves_and_a_second_on_changes_nothing() {
         )
     );
     assert!(s.dir.join("cfg/aterm/aterm.toml.bak").exists());
-    // `doctor` after `off`, with the instance still armed (a supervisor has no
-    // stop handle): the report reads that running bridge, and warns that the
-    // Fabric config and the rendezvous file are gone.
     let (code, doctor, _) = s.fabric(&["doctor"]);
     assert_eq!(code, 1, "{doctor}");
 
@@ -703,7 +641,6 @@ fn on_provisions_arms_proves_and_a_second_on_changes_nothing() {
 }
 
 /// `--dry-run` on a bare world with no broker prints every step as `would` and leaves no
-/// root, config or rendezvous file.
 #[test]
 fn dry_run_names_every_step_and_creates_nothing() {
     let s = Scratch::new("dry");
@@ -734,14 +671,6 @@ fn dry_run_names_every_step_and_creates_nothing() {
 }
 
 /// A rejected mint publishes nothing and supervises nothing; the effect trace runs through
-/// `fabric_capability_publication_model` with eight grants.
-///
-/// A refusal at grant 1, 3 and 8, over an absent cap, a stale one (another node id's) and a
-/// foreign one (this node's ring under another secret): the previous cap is byte-identical
-/// or still absent, no staging file is left, neither config nor rendezvous file is written,
-/// exit 1. A short or world-readable secret is refused before any mint and never replaced.
-/// The good case is eight `Mint`s, one `Publish`, then `Supervise`, and a cap already
-/// minted for this node is reused without a mint.
 #[test]
 fn a_rejected_mint_publishes_nothing_and_the_trace_satisfies_the_model() {
     let mut model = aterm_models_session::fabric_capability_publication_model();
@@ -758,8 +687,6 @@ fn a_rejected_mint_publishes_nothing_and_the_trace_satisfies_the_model() {
         )
         .expect("stale cap");
     };
-    // This node's whole ring minted under another secret (a secret moved aside, or a ring
-    // another host minted): the guarded broker would refuse every grant, so `on` re-mints.
     let foreign = |s: &Scratch, node: &str| {
         let lines: String = aterm_link::enable::node_grants("local", node)
             .iter()
@@ -802,7 +729,6 @@ fn a_rejected_mint_publishes_nothing_and_the_trace_satisfies_the_model() {
             .map(str::to_string)
             .collect()
     };
-    // Run the trace through the model, answering the final state.
     let check = |trace: &[String]| {
         let mut state = model.init_state();
         for event in trace {
@@ -860,9 +786,6 @@ fn a_rejected_mint_publishes_nothing_and_the_trace_satisfies_the_model() {
         }
     }
 
-    // A short secret, and a full-length one other users can read: each refused at the
-    // secret step, before the first mint, and never replaced or chmodded (a secret that sat
-    // readable may have been read).
     for (tag, bytes, mode) in [
         ("short", b"short\n".to_vec(), 0o600),
         ("wide", vec![9u8; 32], 0o644),
@@ -893,9 +816,6 @@ fn a_rejected_mint_publishes_nothing_and_the_trace_satisfies_the_model() {
         assert!(trace_of(&s).is_empty(), "{:?}", trace_of(&s));
     }
 
-    // The good case over an absent, a stale and a foreign cap: eight mints, one publish,
-    // then supervision; with a broker answering and no instance to arm, exit 0 and the
-    // proof skipped by name.
     for existing in ["absent", "stale", "foreign"] {
         let s = Scratch::new(&format!("mint-good-{existing}"));
         let node = node_of(&s);
@@ -908,8 +828,6 @@ fn a_rejected_mint_publishes_nothing_and_the_trace_satisfies_the_model() {
         }
         let secret_before = secret_bytes(&s);
         let broker = Broker::spawn(&s);
-        // Widened once the broker holds its secret (a restore, a `cp -r`): `on`
-        // narrows both before it reads the secret again.
         for d in [s.root(), s.root().join("link-state")] {
             chmod(&d, 0o755);
         }
@@ -939,12 +857,9 @@ fn a_rejected_mint_publishes_nothing_and_the_trace_satisfies_the_model() {
         assert!(!cap.contains("n-previous"), "the stale cap survived: {cap}");
         assert!(staging(&s).is_empty());
         assert_eq!(mode_of(&s.root().join("node.cap")), 0o600);
-        // A root another user could reach was made 0700.
         assert_eq!(mode_of(&s.root()), 0o700);
         assert_eq!(mode_of(&s.root().join("link-state")), 0o700);
-        // No aterm.toml before this run: no `.bak` is made.
         assert!(!s.dir.join("cfg/aterm/aterm.toml.bak").exists());
-        // A cap already minted for this node is reused: no mint at all.
         std::fs::remove_file(s.dir.join("effects.trace")).expect("reset");
         let cap_before = cap_bytes(&s);
         let (code, out, _) = run(s
@@ -962,31 +877,12 @@ fn a_rejected_mint_publishes_nothing_and_the_trace_satisfies_the_model() {
     }
 }
 /// **LAUNCHD IS ASKED THROUGH A DERIVED LABEL, THE PLIST IS THE SCRIPT'S, AND
-/// A BROKER LAUNCHD DOES NOT MANAGE IS NEVER BOOTSTRAPPED OVER.** A FAKE
-/// `launchctl` on `$PATH` that behaves like the real one where it matters:
-/// `bootstrap` starts the broker the plist names and `print gui/<uid>/<label>`
-/// shows it with its pid until `bootout` kills it, while the legacy `list`
-/// shows nothing — the CALLER's domain, as an SSH session's reads, so a run
-/// that still asked `list` would miss launchd's own job (and a domain that
-/// does not exist, no GUI login, is `print`'s exit 112). First: with a
-/// hand-run broker answering on the socket and no job by the label, `on
-/// --service launchd` names the unmanaged broker's pid and stops, rather than
-/// bootstrap a second broker on the same socket and log; with no GUI login it
-/// is refused by naming the domain, before a plist is written. Then the
-/// install proper: the label is
-/// derived from the root (never the live one), the plist lives INSIDE that
-/// root (not in `$HOME/Library/LaunchAgents`: the root is not the default
-/// one) and runs the broker directly, a second `on` reads `already` from
-/// launchd's own pid, and `off` boots the job out.
 #[test]
 fn launchd_is_asked_through_a_derived_label_and_the_plist_is_the_scripts() {
     let bin = harness::aterm();
     let s = Scratch::new("launchd");
     let calls = s.path("launchctl.calls");
     let pidfile = s.path("launchd.pid");
-    // Every path is read off `$0` (`<dir>/bin/launchctl`), so the body is the same on every
-    // run and `stand_in` hands back an inode the system has already assessed: a fresh
-    // script's first exec can stall for over a minute on a loaded Mac.
     aterm_tempfile::stand_in(
         &s.dir.join("bin/launchctl"),
         &format!(
@@ -1018,7 +914,6 @@ fn launchd_is_asked_through_a_derived_label_and_the_plist_is_the_scripts() {
     )
     .expect("fake launchctl");
     let path = format!("{}:/usr/bin:/bin", s.path("bin"));
-    // Whatever happens below, the broker the fake launchd started dies with the test.
     struct Reap(String);
     impl Drop for Reap {
         fn drop(&mut self) {
@@ -1042,7 +937,6 @@ fn launchd_is_asked_through_a_derived_label_and_the_plist_is_the_scripts() {
         .trim()
         .to_string();
 
-    // An unmanaged broker answers on the socket: refused, not bootstrapped over.
     let unmanaged = Broker::spawn(&s);
     let unmanaged_pid = unmanaged.child.id();
     let (code, out, err) = run(s
@@ -1070,7 +964,6 @@ fn launchd_is_asked_through_a_derived_label_and_the_plist_is_the_scripts() {
         "no plist is written for a job that is not started"
     );
     assert!(!s.config().exists(), "the run stopped before the config");
-    // The same run, dry: the step is named as a failure and nothing is touched.
     let (code, dry, _) = run(s
         .fabric_cmd(&["on", "--service", "launchd", "--dry-run"])
         .env("PATH", &path));
@@ -1080,10 +973,6 @@ fn launchd_is_asked_through_a_derived_label_and_the_plist_is_the_scripts() {
         "{dry}"
     );
     assert!(!plist.exists());
-    // The systemd arm refuses the same broker the same way: a fake `systemctl`
-    // that runs no such unit (`MainPID` 0) is asked only that (and whether a
-    // user manager answers), and no unit is written or (re)started over the
-    // broker that answers.
     aterm_tempfile::stand_in(
         &s.dir.join("bin/systemctl"),
         "#!/bin/sh\n\
@@ -1122,10 +1011,6 @@ fn launchd_is_asked_through_a_derived_label_and_the_plist_is_the_scripts() {
         asked_only(&asked),
         "systemd must not be asked to start anything over an unmanaged broker: {asked}"
     );
-    // With NO user manager (`su`, `sudo -u`): `MainPID` cannot be read, so a
-    // broker that answers may be the unit's own — the refusal names the
-    // missing manager, as launchd's names the missing domain, never
-    // "unmanaged".
     let no_manager = s.dir.join("no-manager");
     std::fs::write(&no_manager, "").expect("no-manager");
     let _ = std::fs::remove_file(&systemd_calls);
@@ -1153,9 +1038,6 @@ fn launchd_is_asked_through_a_derived_label_and_the_plist_is_the_scripts() {
     drop(unmanaged);
     let _ = std::fs::remove_file(&calls);
 
-    // ---- NO SYSTEMD USER MANAGER: a readable MainPID result alone is not
-    // enough. With no broker answering and show-environment refused, both
-    // real and dry runs stop before writing a unit or asking it to start.
     let no_manager = s.dir.join("no-manager");
     std::fs::write(&no_manager, "").expect("no-manager");
     for dry in [false, true] {
@@ -1191,9 +1073,6 @@ fn launchd_is_asked_through_a_derived_label_and_the_plist_is_the_scripts() {
     }
     std::fs::remove_file(&no_manager).expect("no-manager");
 
-    // ---- NO GUI LOGIN (an SSH session with nobody at the console): launchd
-    // has no gui/<uid> domain, so the run is refused by naming it, before a
-    // plist is written.
     let no_gui = s.dir.join("no-gui");
     std::fs::write(&no_gui, "").expect("no-gui");
     for dry in [false, true] {
@@ -1219,7 +1098,6 @@ fn launchd_is_asked_through_a_derived_label_and_the_plist_is_the_scripts() {
     std::fs::remove_file(&no_gui).expect("no-gui");
     let _ = std::fs::remove_file(&calls);
 
-    // The install: bootstrap starts the broker, and `on` reads its pid.
     let (code, out, err) = run(s
         .fabric_cmd(&["on", "--service", "launchd"])
         .env("PATH", &path));
@@ -1234,8 +1112,6 @@ fn launchd_is_asked_through_a_derived_label_and_the_plist_is_the_scripts() {
         text.contains(&format!("<key>Label</key><string>{label}</string>")),
         "{text}"
     );
-    // The broker's argv, one <string> each (no shell, no quoting), guarded by the root's
-    // secret.
     assert!(
         text.contains(&format!(
             "<string>{bin}</string>\n    <string>link</string>\n    <string>broker</string>\n    <string>{sock}</string>\n    \
@@ -1272,7 +1148,6 @@ fn launchd_is_asked_through_a_derived_label_and_the_plist_is_the_scripts() {
         "the pid printed is launchd's own, never 0:\n{out}"
     );
 
-    // A second `on`: the plist is `already`, and so is the job, by its pid.
     std::fs::remove_file(&calls).expect("reset");
     let (code, out, _) = run(s
         .fabric_cmd(&["on", "--service", "launchd"])
@@ -1294,7 +1169,6 @@ fn launchd_is_asked_through_a_derived_label_and_the_plist_is_the_scripts() {
         "a job that answers is left alone: {recorded}"
     );
 
-    // `off`: bootout and remove the plist; the broker is gone.
     std::fs::remove_file(&calls).expect("reset");
     let (code, out, _) = run(s
         .fabric_cmd(&["off", "--service", "launchd"])
@@ -1315,7 +1189,6 @@ fn launchd_is_asked_through_a_derived_label_and_the_plist_is_the_scripts() {
         "the fake launchd reaped the broker"
     );
     let pid: i32 = managed_pid.parse().expect("pid");
-    // A hang detector for the killed broker to go: it ends the moment it has.
     let gone_by = std::time::Instant::now() + std::time::Duration::from_secs(60);
     let gone = loop {
         if !harness::alive(pid) {
@@ -1330,7 +1203,6 @@ fn launchd_is_asked_through_a_derived_label_and_the_plist_is_the_scripts() {
 }
 
 /// **REFUSALS**: a flag `on` does not take (`--tcp`, the removed sealed wire's)
-/// and a bad `--service` are usage errors, refused BEFORE anything is written.
 #[test]
 fn a_usage_error_is_refused_before_anything_is_written() {
     let s = Scratch::new("usage");
@@ -1342,14 +1214,11 @@ fn a_usage_error_is_refused_before_anything_is_written() {
     );
     let (code, _, err) = s.fabric(&["on", "--service", "cron"]);
     assert_eq!(code, 2, "{err}");
-    // `doctor` on a world with no fabric: exit 2.
     let (code, out, _) = s.fabric(&["doctor"]);
     assert_eq!(code, 2, "{out}");
 }
 
 /// An unreadable or invalid role is not a new one-host fabric. Even without
-/// the login's rendezvous file, the refusing command must leave the previous
-/// node and its cap untouched and mint no secret of its own.
 #[test]
 fn role_identity_unreadable_state_never_writes() {
     let bin = harness::aterm();
@@ -1419,8 +1288,6 @@ fn role_identity_unreadable_state_never_writes() {
 }
 
 /// Repairing a missing cap must keep the fleet named by the existing bridge
-/// command. The broker is real: it checks the newly minted grants before the
-/// command and rendezvous are replaced. No GUI or session is needed.
 #[test]
 fn role_identity_reapplication_preserves_the_nondefault_fleet() {
     let s = Scratch::new("role-fleet");
@@ -1475,7 +1342,6 @@ fn role_identity_reapplication_preserves_the_nondefault_fleet() {
 }
 
 /// Naming a different fleet is a deliberate departure, so `off` must precede
-/// it. The old root's identity and configured command remain byte-identical.
 #[test]
 fn role_identity_conflicting_fleet_is_refused_before_writes() {
     let s = Scratch::new("role-conflict");
@@ -1511,10 +1377,6 @@ fn role_identity_conflicting_fleet_is_refused_before_writes() {
 }
 
 /// **A BARE `on` RE-APPLIES THE ROOT AS IT IS** — doctor's remedy for a
-/// broker that does not answer. The installed job is READ before anything is
-/// written: a Unix broker job is the control (the bare `on` runs the Unix
-/// broker), and a job that names no broker command is refused, exit 2, with
-/// nothing written — metadata `on` cannot read is never taken for a fresh root.
 #[test]
 fn a_bare_on_runs_the_unix_broker_and_refuses_a_job_it_cannot_read() {
     let bin = harness::aterm();
@@ -1541,7 +1403,6 @@ fn a_bare_on_runs_the_unix_broker_and_refuses_a_job_it_cannot_read() {
     };
     let secret = s.path("root/mint.secret");
     let log = s.path("root/bus.log");
-    // ---- the control: a Unix job, and the bare `on` runs the Unix broker
     job(&[
         bin,
         "link",
@@ -1558,7 +1419,6 @@ fn a_bare_on_runs_the_unix_broker_and_refuses_a_job_it_cannot_read() {
         step(&out, "broker").iter().any(|l| l.contains(&unix)) && !out.contains("--tcp"),
         "{out}"
     );
-    // ---- a job that names no broker command: refused, nothing written
     job(&[bin, "link", "serve", "--fleet", "local"]);
     let (code, out, err) = s.fabric(&["on", "--service", "none"]);
     assert_eq!(code, 2, "a job naming no broker ran `on`:\n{out}{err}");
@@ -1579,22 +1439,6 @@ fn a_bare_on_runs_the_unix_broker_and_refuses_a_job_it_cannot_read() {
 }
 
 /// **A BARE `on` KEEPS THE TIER; ONLY A NAMED ONE RESTARTS FOR IT.**
-///
-/// From the installed job (dry runs, no broker answering, so the broker step
-/// prints the argv to run): a job that runs `--durability relaxed` is kept —
-/// the argv carries it and the `durability` note names the job — and `on
-/// --durability strict` replaces it, saying it was relaxed, with `--durability
-/// strict` WRITTEN into the argv: a bare argv means the build's default, so a
-/// job that chose strict names it.
-///
-/// From a broker run by hand under `--service none` (no job — the manual's
-/// step 1): a bare `on` keeps the tier it runs, with no warning, whichever it
-/// is; `on --durability <the other>` warns that it runs the other tier and
-/// prints the restart line carrying the named one. That is the tier arm of
-/// `not_current`, end to end. Nothing here starts a broker through a job:
-/// launchd and systemd are out of this world (the fake launchctl's broker
-/// runs a fixed argv), and the job carrying the flag is the argv the dry runs
-/// print.
 #[test]
 fn a_bare_on_keeps_the_tier_and_only_a_named_one_restarts_for_it() {
     let bin = harness::aterm();
@@ -1671,7 +1515,6 @@ fn a_bare_on_keeps_the_tier_and_only_a_named_one_restarts_for_it() {
     );
     std::fs::remove_file(&plist).expect("plist");
 
-    // ---- a broker run by hand, no job
     let restart = |out: &str| -> Option<String> {
         step(out, "broker")
             .iter()
@@ -1679,8 +1522,6 @@ fn a_bare_on_keeps_the_tier_and_only_a_named_one_restarts_for_it() {
             .map(|l| (*l).to_string())
     };
     for (running, other) in [("relaxed", "strict"), ("strict", "relaxed")] {
-        // Named, both: a bare hand-run broker runs the build's default, which
-        // is ordered for a guarded broker (served strict off macOS).
         let broker = Broker::spawn_with(&s, &["--durability", running]);
         let (_, out, err) = s.fabric(&["on", "--service", "none"]);
         assert!(
@@ -1715,7 +1556,6 @@ fn a_bare_on_keeps_the_tier_and_only_a_named_one_restarts_for_it() {
 }
 
 /// Wait for `@<sid> status` to read `hold=<want>`. A hang detector (the
-/// latency is printed as a measurement, never bounded), so the harness's minute.
 fn until_hold(gui: &Gui, sid: &str, want: u8) -> std::time::Duration {
     let started = std::time::Instant::now();
     loop {
@@ -1733,12 +1573,6 @@ fn until_hold(gui: &Gui, sid: &str, want: u8) -> std::time::Duration {
 }
 
 /// **A PERSON HALTS THE FLEET AND WITHDRAWS IT, AND `off` NAMES EVERY SESSION
-/// THE FLEET HOLDS.** On the guarded broker `on` deploys, with the commands a
-/// person runs: `mint-for h-review`, `halt`, and `halt off`.
-/// The bridge holds the session; the Owner's `hold <sid> off` is denied;
-/// node.cap is no person's and cannot halt; `off` — dry and real — stops the
-/// one thing that could ever lift it, so it names the session and the command
-/// that lifts it, and lifts nothing; the person's `halt off` is what does.
 #[test]
 fn review_off_names_a_session_the_fleet_holds() {
     let s = Scratch::new("held");
@@ -1748,7 +1582,6 @@ fn review_off_names_a_session_the_fleet_holds() {
     let (code, out, err) = s.fabric(&["on", "--service", "none"]);
     assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
 
-    // THE PERSON'S CAP, minted on this host (it holds the mint secret).
     let cap = s.path("h-review.cap");
     let (code, out, err) = s.fabric(&["mint-for", "h-review", "--out", &cap]);
     assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
@@ -1757,13 +1590,9 @@ fn review_off_names_a_session_the_fleet_holds() {
         out.contains(&format!("aterm fabric halt --cap-file {cap} off")),
         "mint-for names the commands the person runs:\n{out}"
     );
-    // node.cap is the NODE's: it names no person, so it halts nothing.
     let (code, _, err) = s.fabric(&["halt", "--cap-file", &s.path("root/node.cap"), "nope"]);
     assert_eq!(code, 2, "{err}");
     assert!(err.contains("holds no person's grant"), "{err}");
-    // An `a-` service's cap is a person's but no human's: every bridge
-    // applies a human's halt row alone, so it is refused one, not told the
-    // fleet is held.
     let svc = s.path("a-svc.cap");
     let (code, out, err) = s.fabric(&["mint-for", "a-svc", "--out", &svc]);
     assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
@@ -1772,7 +1601,6 @@ fn review_off_names_a_session_the_fleet_holds() {
     assert_eq!(code, 2, "stdout:\n{out}\nstderr:\n{err}");
     assert!(!out.contains("halt is ON"), "{out}");
 
-    // A PERSON HALTS THE FLEET.
     let (code, out, err) = s.fabric(&["halt", "--cap-file", &cap, "review", "halt"]);
     assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
     assert!(out.contains("h-review's halt is ON at @"), "{out}");
@@ -1799,13 +1627,11 @@ fn review_off_names_a_session_the_fleet_holds() {
     };
     named_held(&["off", "--service", "none", "--dry-run"]);
 
-    // THE PERSON WITHDRAWS IT, and that is the lift.
     let (code, out, err) = s.fabric(&["halt", "--cap-file", &cap, "off"]);
     assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
     assert!(out.contains("h-review's halt is OFF at @"), "{out}");
     until_hold(&gui, &sid, 0);
 
-    // Halted again, `off` for real names it — and lifts nothing.
     let (code, out, err) = s.fabric(&["halt", "--cap-file", &cap, "review", "halt"]);
     assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
     until_hold(&gui, &sid, 1);
@@ -1817,11 +1643,6 @@ fn review_off_names_a_session_the_fleet_holds() {
 }
 
 /// **`(0600)` IS TRUE WHEN IT IS SAID.** `mint-for --out` over an IDENTICAL
-/// cap another user could read makes it 0600 before it says so, and stderr
-/// says it was readable and what voids a copy; over a DIFFERENT file it is
-/// refused, the file untouched; and a symlink at `--out` is refused, its
-/// target's bytes and mode untouched: a cap is never written — or chmodded —
-/// through one.
 #[test]
 fn mint_for_never_claims_0600_of_a_file_that_is_not() {
     let s = Scratch::new("mint-out");
@@ -1853,7 +1674,6 @@ fn mint_for_never_claims_0600_of_a_file_that_is_not() {
         "the remedy names what replaces the secret:\n{err}"
     );
 
-    // A DIFFERENT cap at --out (another person's): refused, untouched.
     let other = s.path("h-other.cap");
     let (code, out, err) = s.fabric(&["mint-for", "h-other", "--out", &other]);
     assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
@@ -1863,7 +1683,6 @@ fn mint_for_never_claims_0600_of_a_file_that_is_not() {
     assert!(err.contains("holds a different cap"), "{err}");
     assert_eq!(std::fs::read(&other).expect("h-other's cap"), theirs);
 
-    // A symlink at --out, to a file of the operator's.
     let victim = s.path("victim.txt");
     std::fs::write(&victim, "the operator's own file\n").expect("victim");
     chmod(Path::new(&victim), 0o644);
@@ -1880,11 +1699,6 @@ fn mint_for_never_claims_0600_of_a_file_that_is_not() {
 }
 
 /// **A PERSON READS AN ASK AND ANSWERS IT, AS A HUMAN.** An agent's `post
-/// to=h-review kind=ask` lands on the person's mail lane; `inbox` with the
-/// person's cap prints it with its answer spelled out and marks it read (a
-/// second `inbox` has nothing new); the `post … kind=answer re=<off>` it names
-/// reaches the asking session as an ANSWER from `h-review`, `trust=human` —
-/// the reply is from the principal the ask went to.
 #[test]
 fn a_person_reads_an_ask_and_answers_it_as_a_human() {
     let s = Scratch::new("person");
@@ -1958,9 +1772,6 @@ fn a_person_reads_an_ask_and_answers_it_as_a_human() {
 }
 
 /// `off` acts on the root the fabric is on. After `on` under root A, `off` under another
-/// `$ATERM_FABRIC_HOME` (or none) must not resolve root B and leave A's `KeepAlive` broker
-/// running: it follows the config's `--broker` to A and says so in its header, then the
-/// rendezvous file once the config is gone, then the environment once both are.
 #[test]
 fn review_off_acts_on_the_root_the_config_names() {
     let s = Scratch::new("offroot");
@@ -1975,7 +1786,6 @@ fn review_off_acts_on_the_root_the_config_names() {
         .trim()
         .to_string();
 
-    // Under B's environment, and under none: the config's root, A.
     for env in [Some(root_b.as_str()), None] {
         let mut cmd = s.fabric_cmd(&["off", "--service", "none", "--dry-run"]);
         match env {
@@ -1996,7 +1806,6 @@ fn review_off_acts_on_the_root_the_config_names() {
         );
         assert!(!out.contains(&root_b), "{env:?}: B is never named:\n{out}");
     }
-    // The config's table gone: the rendezvous file's root, still A.
     std::fs::write(s.config(), "font_px = 12.0\n").expect("drop the table");
     let (code, out, _) = run(s
         .fabric_cmd(&["off", "--service", "none", "--dry-run"])
@@ -2006,7 +1815,6 @@ fn review_off_acts_on_the_root_the_config_names() {
         out.lines().next().is_some_and(|l| l.contains(&root_a)) && !out.contains(&root_b),
         "the rendezvous file's root, A:\n{out}"
     );
-    // Both gone: the environment decides, and the header says so.
     std::fs::remove_file(s.rendezvous()).expect("drop the rendezvous file");
     let (code, out, _) = run(s
         .fabric_cmd(&["off", "--service", "none", "--dry-run"])

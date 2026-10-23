@@ -1,142 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1 trace conformance for `SelectionCustody`, the lifecycle of a text selection,
-//! bound to the shipping engine and GUI seams. The model is checked abstractly at Tier-0
-//! (`aterm-spec/tests/derived_ring_ty.rs`); here each step drives a real seam, projects
-//! the real `Terminal` onto the spec variables and asks
-//! [`aterm_spec::verify::validate_transition_tiered`] whether the derived `Next` admits
-//! it. The negative controls at the end show a corrupted `next` is rejected.
-//!
-//! `selection_custody_model()` is model-checked in the abstract at Tier-0
-//! (`aterm-models/tests/derived_ring_ty.rs`), which proves the DESIGN sound: a bare
-//! modifier destroys nothing, ordinary output destroys nothing, damage that missed
-//! the selected rows spares them, damage that hit them clears them, and losing the
-//! oldest line of a selection clamps the head instead of throwing the whole span
-//! away. None of that ties the model to the shipping engine. This closes that gap.
-//!
-//! * `App::begin_selection` → `drag_selection` → `finish_selection`: `SelectLow`,
-//!   `SelectOldest`, `SelectHigh`, and a press-release in one cell for `UserClear`.
-//! * `app_input::apply_press_custody`: `TypingPress` and `InertPress`.
-//! * `Terminal::process` → `post_process`: real VT batches for `UniformScroll`,
-//!   `RegionDamageLow`, `RegionDamageHigh` and `WholesaleInvalidate` (ED 3 and RIS).
-//! * `Terminal::set_scrollback_line_limit`: eviction with no delta, for `Evict`.
-//!
-//! Each step runs in a one-step `StepEvidence` window. `spec_xref_gate::spec_xref_closure`
-//! requires that every window entered its action's anchored function and that no
-//! anchored function was entered by a window driving an action it is not anchored for.
-//! The evidence is function entry, not branch entry: ten of the eleven actions share a
-//! function with a sibling, and only the transitions validated here tell those apart.
-//!
-//! Abstraction: model row `r` is absolute row `base + r`, `base` being the fixture's
-//! `Grid::oldest_absolute_row()`.
-//!
-//! WHAT AN ANCHOR PROVES, AND WHAT IT DOES NOT — the CURRENT state, which is not what
-//! this paragraph used to say. It used to say the gate "does NOT check that the
-//! attribute sits on a function which performs the action", so "the anchors here are
-//! documentation with a coverage gate attached". That was true and is no longer.
-//!
-//! Every step below now drives its shipping seam inside a ONE-STEP-WIDE execution
-//! evidence window (`aterm_spec::xref::StepEvidence`): the thread-local anchor-entry
-//! record is cleared, the seam is called, and what was entered is snapshotted before
-//! this module reads anything back. `spec_xref_gate`'s
-//! `selection_custody_steps_enter_their_own_seams` then asks TWO questions of the ledger, and the second
-//! is what makes the first worth anything.
-//!
-//! 1. ENTRY: every window driving action A must have entered A's annotated function.
-//!    An anchor parked on a stub fails; so does one moved onto a function some other
-//!    step calls — `Terminal::process` is entered by seven of this module's sixteen
-//!    steps (four damage batches, ED 3, RIS, the uniform scroll) and still fails
-//!    `Evict`, whose three steps call only `set_scrollback_line_limit`.
-//! 2. THE CONTRAPOSITIVE: an annotated function must NOT be entered by a window driving
-//!    an action it is not anchored for. Question 1 alone is weak inside a batch, because
-//!    a window is only as narrow as its seam: the uniform-scroll step enters
-//!    `Terminal::note_output_custody` as well as `Terminal::post_process`, so entry
-//!    alone would accept the anchor on either. `note_output_custody` also runs in the
-//!    damage and invalidation windows, so question 2 rejects it.
-//!
-//! THE SURVIVING LIMIT, stated in numbers because the adjective would overclaim. The
-//! evidence is FUNCTION-ENTRY, not branch-entry. Ten of the eleven actions here sit on
-//! a function that carries more than one of them — `App::finish_selection` carries four,
-//! `Terminal::post_process` four, `app_input::apply_press_custody` two — so one entry
-//! marks every anchor on that function and NOTHING here can tell those siblings apart:
-//! permuting the four labels on `post_process` changes no observable. `post_process` is
-//! entered on EVERY VT batch regardless of which damage or scroll occurred, which is
-//! precisely why the gate reports the actions its windows cover rather than reporting a
-//! function "entered in every window" — that older figure was an intersection across
-//! step families and could never be non-empty at all. The other survivor is an anchor
-//! moved onto a function whose entry pattern is exactly the action set it claims,
-//! including an unanchored one inside the same window, which carries no probe and so
-//! cannot even be counted. The gate derives all of that from the anchors and the ledger
-//! and prints it rather than claiming more; obligation 2 proper (`project` and
-//! `rust_method` resolving to live symbols) is still unresolved strings, and still
-//! Phase 3's `trust-ir` job.
-//!
-//! So THIS module remains the part that carries real weight. It drives real gestures
-//! and real `Terminal::process` batches, projects the engine before and after, and
-//! asserts the model admits the transition — plus negative controls asserting the model
-//! REFUSES the regression members. Deleting ED 3's own wholesale-damage call from the
-//! shipping grid (`Grid::discard_history_selection`, which since 2026-09-10 records the
-//! `SelectionDamage::All` that `force_selection_invalidation` used to record here —
-//! without the host-coordinate claim ED 3 was never entitled to) turns it red; that is
-//! the standard each case is held to.
-//!
-//! * `Terminal::post_process`'s `SelectionDamage::All` arm — for
-//!   `WholesaleInvalidate`, driven with real ED 3 (`\x1b[3J`) and RIS (`\x1bc`) bytes.
-//!
-//! THE ABSTRACTION FUNCTION. The model works in a four-row window; the engine works in
-//! absolute grid rows. Model row `r` IS absolute row `base + r`, where `base` is read
-//! from the real grid at fixture time (`Grid::oldest_absolute_row()`), and every
-//! projected quantity is an absolute-space read of the live `TextSelection`:
-//!
-//! * `alive` ← `TextSelection::has_selection()`
-//! * `sel_lo`/`sel_hi` ← the anchor rows lifted into absolute space the same way
-//!   `TextSelection::intersects_absolute_band` lifts them (`live_top_abs + row`),
-//!   minus `base`
-//! * `floor` ← `Grid::oldest_absolute_row() - base`
-//! * `truncated` ← `TextSelection::truncated()`
-//!
-//! Lifting into ABSOLUTE space is what makes `UniformScrollPreservesTheSelection`
-//! stateable at all: ordinary output moves `live_top_abs` up and the relative anchors
-//! down by the same amount, so the absolute interval is unchanged — which is precisely
-//! the law "the anchors ride the content".
-//!
-//! THE TWO HARNESS-CARRIED VARIABLES, stated plainly rather than hidden:
-//!
-//! * `band_lo`/`band_hi` are an INPUT to the step (the model's damage actions ASSIGN
-//!   them), so the harness names the visible rows it damages and reads their absolute
-//!   numbers back out of the real grid (`Grid::visible_to_absolute`). Nothing about the
-//!   OUTCOME is assumed: whether the selection survives is read off the real
-//!   `TextSelection` afterwards, and the disjoint/overlap pair of cases below is exactly
-//!   what would fail if the engine's recorded band were wider or narrower than named.
-//! * `last_event` and the `prev_*` shadows are trace bookkeeping — the same class as
-//!   `exited` in `window_routing_conformance`. The shadows are the harness's OWN
-//!   projection of the pre-state, so they are real observations; `last_event` is the
-//!   action tag.
-//!
-//! WHICH VARIABLES ARE REALLY OBSERVED, stated exactly, because "11 variables" reads
-//! stronger than what is actually checked.
-//!
-//! * `alive`, `floor`, `truncated` come from the real `Terminal` on EVERY transition —
-//!   `project_selection_custody` reads `text_selection()`, `scrollback_lines()` and the
-//!   clamp record. These carry the properties the design is about: whether a selection
-//!   survived, and whether a partial loss was recorded rather than silently swallowed.
-//! * `sel_lo`/`sel_hi` are real WHILE THE SELECTION LIVES. On a clearing transition a
-//!   cleared `TextSelection` has no interval left to read, so the harness carries the
-//!   last live one. The model's `sel_lo' = sel_lo` on those actions is therefore
-//!   satisfied BY CONSTRUCTION, not checked — and that is true of every clearing action
-//!   (`TypingPress`, `UserClear`, `WholesaleInvalidate`, and both damage-clears), not
-//!   just `Evict`. An earlier draft of this note said "one gap" and named only `Evict`,
-//!   which understated it.
-//! * `band_lo`/`band_hi` are the harness's own aim, re-derived through
-//!   `Grid::visible_to_absolute` — NOT read back from the engine's recorded
-//!   `SelectionDamage`. They check coordinate arithmetic, not the lattice. What
-//!   constrains the real band is indirect but genuine: the four disjoint/overlap cases
-//!   assert the resulting `alive`, and those come from the engine.
-//!
-//! `Evict` is the one action that re-floors `sel_lo` even on the arm where the selection
-//! dies, so its both-endpoints-evicted arm is driven for real and asserted directly
-//! rather than ty-validated. See `evict_destroys_a_selection_whose_whole_interval_fell_off`.
+//! Tier-1 trace conformance for `SelectionCustody` against [`aterm_spec::verify::validate_transition_tiered`].
 
 #![cfg(test)]
 
@@ -174,9 +39,7 @@ const EV_SCROLL: i64 = 5;
 const EV_EVICT: i64 = 6;
 const EV_WHOLESALE: i64 = 7;
 
-/// The observed half of the projection, `[alive, sel_lo, sel_hi, floor, truncated]`,
-/// read out of a real `Terminal` against the fixture's absolute-row `base`. Named by
-/// every `#[refines(project = …)]` on the `SelectionCustody` seams.
+/// Projects `[alive, sel_lo, sel_hi, floor, truncated]` from `term` relative to `base`.
 pub(crate) fn project_selection_custody(term: &Terminal, base: u64) -> [i64; 5] {
     let grid = term.grid();
     let base = i64::try_from(base).unwrap_or(i64::MAX);
@@ -200,17 +63,16 @@ pub(crate) fn project_selection_custody(term: &Terminal, base: u64) -> [i64; 5] 
 }
 
 /// One fixture's running abstract state: the observed projection plus the
-/// harness-carried variables (see the module doc).
 struct Custody {
-    /// Absolute row that model row 0 names.
+    /// Absolute row corresponding to model row 0.
     base: u64,
-    /// The last damage band the harness aimed, in model rows.
+    /// Last damage band in model rows.
     band: (i64, i64),
-    /// The last action tag.
+    /// Last action tag.
     last_event: i64,
-    /// `(prev_alive, prev_sel_lo, prev_sel_hi)` — the model's pre-state shadows.
+    /// Model pre-state shadows `(prev_alive, prev_sel_lo, prev_sel_hi)`.
     shadow: (i64, i64, i64),
-    /// The last live interval, which the model carries once `alive = 0`.
+    /// Last live selection interval.
     interval: (i64, i64),
 }
 
@@ -226,7 +88,6 @@ impl Custody {
     }
 
     /// The full 11-variable state. Refreshes the carried interval whenever the real
-    /// selection is alive, so a later clearing step carries the true last-live span.
     fn state(&mut self, term: &Terminal) -> [i64; 11] {
         let [alive, lo, hi, floor, truncated] = project_selection_custody(term, self.base);
         if alive == 1 {
@@ -249,8 +110,6 @@ impl Custody {
     }
 
     /// Record what the step just fired: the model writes the pre-state into the
-    /// `prev_*` shadows, stamps `last_event`, and (for the damage actions only)
-    /// assigns the band.
     fn fired(&mut self, prev: [i64; 11], tag: i64, band: Option<(i64, i64)>) {
         self.shadow = (prev[0], prev[1], prev[2]);
         self.last_event = tag;
@@ -277,17 +136,12 @@ fn validate_transition(action: &str, prev: [i64; 11], next: [i64; 11]) -> (bool,
 }
 
 /// `Terminal` fixture whose model row 0 is the oldest retained absolute row.
-/// Returns `(terminal, base)`; `rows` is the visible height, `history` the number of
-/// retained scrollback lines the fixture should end up holding.
 fn engine_fixture(rows: u16, history: usize) -> (Terminal, u64) {
     let mut term = Terminal::new(rows, 20);
     if history == 0 {
         term.set_scrollback_line_limit(Some(0));
         term.process(b"aaa\r\nbbb\r\nccc\r\nddd");
     } else {
-        // Fill the ring under a generous limit, pin the retained count exactly, then
-        // lift the limit so an ordinary scroll does not evict (`UniformScroll` is motion
-        // without eviction).
         term.set_scrollback_line_limit(Some(history + 8));
         for i in 0..(usize::from(rows) + history + 4) {
             term.process(format!("line{i}\r\n").as_bytes());
@@ -305,8 +159,6 @@ fn engine_fixture(rows: u16, history: usize) -> (Terminal, u64) {
 }
 
 /// Arm a completed selection over model rows `lo..=hi` of an engine fixture. Fixture
-/// construction, not a claimed transition: the gesture seam is driven in
-/// `gui_gesture_chain`.
 fn arm(term: &mut Terminal, base: u64, lo: i64, hi: i64) {
     let grid = term.grid();
     let live_top = i64::try_from(
@@ -324,7 +176,6 @@ fn arm(term: &mut Terminal, base: u64, lo: i64, hi: i64) {
 }
 
 /// Model rows of the damage band the harness is about to aim at visible rows
-/// `first..=last`, read back out of the real grid's own coordinate function.
 fn band_of(term: &Terminal, base: u64, first: u16, last: u16) -> (i64, i64) {
     let grid = term.grid();
     let base = i64::try_from(base).expect("base fits i64");
@@ -335,7 +186,6 @@ fn band_of(term: &Terminal, base: u64, first: u16, last: u16) -> (i64, i64) {
 }
 
 /// Drive one damage case: arm `sel_lo..=sel_hi`, damage visible rows `first..=last`
-/// with real EL batches, and validate the step against `action`.
 fn damage_case(
     action: &'static str,
     sel: (i64, i64),
@@ -355,15 +205,10 @@ fn damage_case(
     );
 
     let band = band_of(&term, base, rows.0, rows.1);
-    // EL (`\e[K`) records exactly the cursor's row on the selection-damage lattice,
-    // and adjacent bands merge — so this is a real, precisely-aimed band, not a hull.
     let mut batch = Vec::new();
     for row in rows.0..=rows.1 {
         batch.extend_from_slice(format!("\x1b[{};1H\x1b[K", row + 1).as_bytes());
     }
-    // The evidence window holds the batch only: the fixture build also entered the
-    // anchored `Terminal::process` and `set_scrollback_line_limit`, which this action
-    // must not be credited with.
     ev.step(action, || term.process(&batch));
 
     c.fired(prev, EV_DAMAGE, Some(band));
@@ -383,13 +228,9 @@ fn damage_case(
 }
 
 /// The GUI half: one real `App`, one real terminal, six validated transitions driven
-/// through the genuine gesture and press seams.
 fn gui_gesture_chain(validated: &mut usize, ev: &mut StepEvidence) {
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
-    // Keep the real clipboard untouched: copy-on-select and X11 PRIMARY are side
-    // effects, not custody. `finish_selection(wid, true)` (`suppress_copy_on_select`)
-    // skips both and still completes the selection.
     app.copy_on_select = false;
     let terminal = app
         .front_terminal(wid)
@@ -411,8 +252,6 @@ fn gui_gesture_chain(validated: &mut usize, ev: &mut StepEvidence) {
     };
     let mut c = Custody::new(base);
 
-    // Projection-drift guard: the untouched fixture must project to the model's `Init`
-    // before any transition is validated.
     let init = selection_custody_model().init_state();
     let model_init: [i64; 11] = VARS.map(|v| init[v]);
     assert_eq!(
@@ -422,7 +261,6 @@ fn gui_gesture_chain(validated: &mut usize, ev: &mut StepEvidence) {
     );
     assert_eq!(model_init, [0; 11], "sanity: Init is the all-zero state");
 
-    // The genuine left-drag: press in a cell, move to another, release.
     let drag = |app: &mut App, from: (u16, u16), to: (u16, u16)| {
         if let Some(ws) = app.windows.get_mut(&wid) {
             ws.last_mouse_cell = from;
@@ -432,7 +270,6 @@ fn gui_gesture_chain(validated: &mut usize, ev: &mut StepEvidence) {
         let _ = app.finish_selection(wid, true);
     };
 
-    // --- SelectLow: a two-row selection on the model's low pair.
     let prev = c.state(&term_lock(&terminal));
     ev.step("SelectLow", || drag(&mut app, (0, 0), (1, 5)));
     c.fired(prev, EV_GESTURE, None);
@@ -444,7 +281,6 @@ fn gui_gesture_chain(validated: &mut usize, ev: &mut StepEvidence) {
     );
     *validated += 1;
 
-    // --- InertPress: a bare modifier destroys nothing.
     let prev = next;
     let inert = ev.step("InertPress", || {
         apply_press_custody(&mut term_lock(&terminal), PressKind::Inert)
@@ -463,7 +299,6 @@ fn gui_gesture_chain(validated: &mut usize, ev: &mut StepEvidence) {
     );
     *validated += 1;
 
-    // --- TypingPress: a disturbing press clears the selection.
     let prev = next;
     let typing = ev.step("TypingPress", || {
         apply_press_custody(&mut term_lock(&terminal), PressKind::Typing)
@@ -478,7 +313,6 @@ fn gui_gesture_chain(validated: &mut usize, ev: &mut StepEvidence) {
     );
     *validated += 1;
 
-    // --- SelectHigh: the live-screen pair.
     let prev = next;
     ev.step("SelectHigh", || drag(&mut app, (2, 0), (3, 5)));
     c.fired(prev, EV_GESTURE, None);
@@ -490,7 +324,6 @@ fn gui_gesture_chain(validated: &mut usize, ev: &mut StepEvidence) {
     );
     *validated += 1;
 
-    // --- UserClear: press and release inside one cell is a deliberate deselect.
     let prev = next;
     if let Some(ws) = app.windows.get_mut(&wid) {
         ws.last_mouse_cell = (2, 0);
@@ -509,8 +342,6 @@ fn gui_gesture_chain(validated: &mut usize, ev: &mut StepEvidence) {
     );
     *validated += 1;
 
-    // --- SelectOldest: a one-row selection on the oldest retained row; without it
-    // the both-endpoints-evicted arm of `Evict` is unreachable.
     let prev = next;
     ev.step("SelectOldest", || drag(&mut app, (0, 0), (0, 5)));
     c.fired(prev, EV_GESTURE, None);
@@ -529,8 +360,6 @@ fn gui_gesture_chain(validated: &mut usize, ev: &mut StepEvidence) {
 }
 
 /// The both-endpoints-gone arm of `Evict`, asserted directly rather than ty-validated:
-/// `Evict` re-floors `sel_lo` even when it destroys the selection, so the model's
-/// post-state names a row the dead selection cannot be asked about.
 fn evict_destroys_a_selection_whose_whole_interval_fell_off(ev: &mut StepEvidence) {
     let (mut term, base) = engine_fixture(4, 2);
     arm(&mut term, base, 0, 0);
@@ -555,21 +384,13 @@ fn evict_destroys_a_selection_whose_whole_interval_fell_off(ev: &mut StepEvidenc
     );
 }
 
-/// The `SelectionCustody` Tier-1 body, run by `spec_xref_gate` with its execution
-/// evidence: the real engine and GUI seams are driven and checked, and each step must
-/// enter its own action's anchored function.
+/// Runs the Tier-1 `SelectionCustody` conformance suite and returns step evidence.
 pub(crate) fn run_conformance() -> StepEvidence {
     let mut validated = 0usize;
     let mut ev = StepEvidence::new("SelectionCustody");
 
-    // ---- The GUI half: six transitions through the real gesture/press seams. ----
     gui_gesture_chain(&mut validated, &mut ev);
 
-    // ---- The damage half: both sides of the lattice, both outcomes. ----
-    // Model rows are visible rows here (a zero-history fixture), and the band is read
-    // back out of `Grid::visible_to_absolute`.
-    //
-    // `DisjointDamagePreserves`: rows 0-1 rewritten, the selection sits on 2-3.
     damage_case(
         "RegionDamageLow",
         (2, 3),
@@ -578,7 +399,6 @@ pub(crate) fn run_conformance() -> StepEvidence {
         &mut validated,
         &mut ev,
     );
-    // `OverlapDamageClears`: the same band, the selection now sits on it.
     damage_case(
         "RegionDamageLow",
         (0, 1),
@@ -587,7 +407,6 @@ pub(crate) fn run_conformance() -> StepEvidence {
         &mut validated,
         &mut ev,
     );
-    // The inverse: a highlight must not survive over replaced text.
     damage_case(
         "RegionDamageHigh",
         (2, 3),
@@ -605,11 +424,6 @@ pub(crate) fn run_conformance() -> StepEvidence {
         &mut ev,
     );
 
-    // ---- WholesaleInvalidate: the coordinate space itself is gone. ----
-    //
-    // Driven with real bytes through `Terminal::process`, the only way the action
-    // reaches a user (`Terminal::clear_scrollback` is a host API no VT sequence
-    // reaches). ED 3 (`\x1b[3J`) is one of the model's three producers.
     {
         let (mut term, base) = engine_fixture(4, 0);
         arm(&mut term, base, 0, 1);
@@ -630,9 +444,6 @@ pub(crate) fn run_conformance() -> StepEvidence {
         validated += 1;
     }
 
-    // …and RIS, which takes a different route: ED 3 records `SelectionDamage::All` and
-    // lets the drain clear, while RIS clears in `Terminal::reset` and the drain finds
-    // nothing left, so each route needs its own case.
     {
         let (mut term, base) = engine_fixture(4, 0);
         arm(&mut term, base, 0, 1);
@@ -653,14 +464,11 @@ pub(crate) fn run_conformance() -> StepEvidence {
         validated += 1;
     }
 
-    // ---- UniformScroll then Evict, as one chain on one terminal. ----
     {
         let (mut term, base) = engine_fixture(4, 2);
         arm(&mut term, base, 0, 1);
         let mut c = Custody::new(base);
 
-        // Ordinary output while the user reads history: the anchors ride the content,
-        // so the absolute interval does not move and the floor does not rise.
         let prev = c.state(&term);
         ev.step("UniformScroll", || term.process(b"more\r\n"));
         c.fired(prev, EV_SCROLL, None);
@@ -677,8 +485,6 @@ pub(crate) fn run_conformance() -> StepEvidence {
         );
         validated += 1;
 
-        // Retention pressure now drops the oldest line under the selection's head:
-        // a partial loss, so the head clamps to the new floor and records it.
         let prev = next;
         let retained = term.grid().scrollback_lines();
         ev.step("Evict", || {
@@ -699,7 +505,6 @@ pub(crate) fn run_conformance() -> StepEvidence {
         validated += 1;
     }
 
-    // ---- Evict, the arm that must change nothing: no endpoint is below the floor. ----
     {
         let (mut term, base) = engine_fixture(4, 2);
         arm(&mut term, base, 2, 3);
@@ -724,63 +529,48 @@ pub(crate) fn run_conformance() -> StepEvidence {
         validated += 1;
     }
 
-    // ---- The third `Evict` arm, asserted directly. ----
     evict_destroys_a_selection_whose_whole_interval_fell_off(&mut ev);
 
-    // ---- Negative controls: each is a `Buggy = 1` regression member falsifying a
-    // named invariant; one admitted would make every check above vacuous. ----
     let live_low = [1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0];
     let live_high = [1, 2, 3, 0, 0, 0, 0, 0, 0, 0, 0];
 
     let rejected: &[(&str, [i64; 11], [i64; 11], &str)] = &[
-        // (a) A bare modifier destroys the selection (`InertPressPreservesTheSelection`).
         (
             "InertPress",
             live_low,
             [0, 0, 1, 0, 0, 0, 0, 1, 0, 1, EV_INERT],
             "a bare modifier expresses no intent and may destroy nothing",
         ),
-        // (b) Ordinary output takes a highlight (`UniformScrollPreservesTheSelection`).
         (
             "UniformScroll",
             live_low,
             [0, 0, 1, 0, 0, 0, 0, 1, 0, 1, EV_SCROLL],
             "ordinary output cannot take a selection",
         ),
-        // (c) Damage that missed clears anyway (`DisjointDamagePreserves`).
         (
             "RegionDamageLow",
             live_high,
             [0, 2, 3, 0, 1, 0, 0, 1, 2, 3, EV_DAMAGE],
             "damage confined to rows 0-1 may not clear a selection on rows 2-3",
         ),
-        // (d) Damage that hit leaves the highlight (`OverlapDamageClears`): a copy
-        // would then return text the user never selected.
         (
             "RegionDamageHigh",
             live_high,
             [1, 2, 3, 3, 3, 0, 0, 1, 2, 3, EV_DAMAGE],
             "a highlight left over replaced text is worse than a lost one",
         ),
-        // (e) Eviction reports the loss without acting on it: the floor rises and
-        // `truncated` is set, but the head still names the evicted row —
-        // `NoDanglingAnchors` / `TruncationImpliesAClampedHead`.
         (
             "Evict",
             live_low,
             [1, 0, 1, 0, 0, 1, 1, 1, 0, 1, EV_EVICT],
             "a truncation is only ever recorded against a CLAMPED head",
         ),
-        // (f) Eviction destroys a selection the user can still see half of —
-        // `PartialEvictionTruncates`.
         (
             "Evict",
             live_low,
             [0, 1, 1, 0, 0, 1, 0, 1, 0, 1, EV_EVICT],
             "losing the oldest line of a selection is not losing the selection",
         ),
-        // (g) A guard, not an invariant: `SelectLow` is disabled once the floor has
-        // risen (an evicted row is not on screen to select), so the guards bite too.
         (
             "SelectLow",
             [0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0],

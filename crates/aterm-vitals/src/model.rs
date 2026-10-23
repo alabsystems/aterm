@@ -1317,6 +1317,10 @@ pub struct Snapshot {
     pub events: Vec<crate::events::Event>,
     /// Most recent split-tick attribution facts ([`crate::explain`]).
     pub why: Option<Arc<crate::explain::WhyFacts>>,
+    /// Whether the coalition lane reads: the sample's word, or `Off` once a
+    /// read misread the layout. A reply with no [`Self::why`] says by it
+    /// whether the coalitions are still to come or never read.
+    pub coal_lane: crate::explain::CoalLane,
 }
 
 /// aterm's own process rows kept per snapshot, busiest first.
@@ -1656,7 +1660,8 @@ impl Vitals {
         self.seq
     }
 
-    /// Inject a fault into scope-balance attribution for negative-control testing.
+    /// Inject a fault into scope-balance attribution or the cause engine for
+    /// negative-control testing.
     #[cfg(any(test, debug_assertions))]
     #[must_use]
     pub fn with_fault(mut self, fault: crate::explain::Fault) -> Self {
@@ -1814,12 +1819,14 @@ impl Vitals {
             self_pid: s.self_pid,
             events: Vec::new(),
             why: None,
+            coal_lane: s.coal_lane,
         };
         let attribution = pass
             .attribution
             .as_ref()
             .map(|(m, o)| (m.as_slice(), o.as_slice()));
         snap.why = self.why.absorb(s, &snap, attribution);
+        snap.coal_lane = self.why.lane(s);
         snap.events = self.detector.detect(&snap);
         snap
     }

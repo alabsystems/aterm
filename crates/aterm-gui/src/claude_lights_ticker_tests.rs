@@ -1,13 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE ACT TICKER ON A REAL FRAME (`docs/DESIGN-harness-autopilot-2026-10-15.md`
-//! §9.2.5): a headless App with a harness host, Claude Code's bottom block
-//! on its engine, the footer spliced as the window splices it — the label
-//! lit by an act told as the host tells it, beside the whole facts or not at
-//! all, for its dwell; withheld by `[claude_footer] acts = false` and by
-//! serious mode; the trail in a hovered chip's title, built once per
-//! reading; and what each of these costs a frame.
+//! THE ACT TICKER ON A REAL FRAME (`docs/DESIGN-harness-autopilot-2026-10-15.md` §9.2.5): a headless App with a harness host, Claude Code's bottom block on its engine, the footer spliced as the window splices it — the label lit by an act told as the host tells it, beside the whole facts or not at all, for its dwell; withheld by `[claude_footer] acts = false` and by serious mode; the trail in a hovered chip's title, built once per reading; and what each of these costs a frame.
 
 use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
@@ -30,7 +24,6 @@ type Switch = (&'static str, fn(&mut App, bool));
 const CHIPS: &str = "\u{221e}";
 
 /// `app` hosted, its session drawing Claude Code in bypass under the
-/// owner's whole facts, `cols` wide, one frame painted.
 fn ticker_app(cols: u16) -> (App, WindowId, u64, (Hosted, UnixStream)) {
     let (mut app, wid, session, reader) = app();
     let hosted = host(&mut app);
@@ -56,8 +49,6 @@ fn arrival(t0: Instant, ms: u64) -> Arrival {
 }
 
 /// An act's arrival `ms` after `t0` on the wall clock as it reads now, in
-/// the zone's time — for a title built at the wall's now, whose trail
-/// leaves out an act older than a day — and the clock text it carries.
 fn arrival_now(t0: Instant, ms: u64) -> (Arrival, String) {
     let unix = i64::try_from(
         std::time::SystemTime::now()
@@ -88,15 +79,6 @@ fn reset_counts() {
 }
 
 /// AN ACT'S LABEL LIGHTS BESIDE THE WHOLE FACTS FOR ITS DWELL, THEN GOES
-/// (§9.2.1): told as the host tells it, `✓ approved` stands right of the
-/// chips in Cruise's ink, the chips and the facts where they were; frame
-/// after frame during the dwell it costs no clock read beyond the act's
-/// receipt and no composition beyond the label's own; at its end the rule is
-/// the rest rule again, the repaint key its rest value, nothing armed and
-/// the lights' key 0 — two compositions for the whole label.
-///
-/// NEGATIVE CONTROL: the key moved while it was lit (the label is drawn by
-/// the footer's own key, never by a timer of its own).
 #[test]
 fn an_acts_label_lights_beside_the_whole_facts_for_its_dwell_then_goes() {
     let (mut app, wid, session, _host) = ticker_app(120);
@@ -121,7 +103,6 @@ fn an_acts_label_lights_beside_the_whole_facts_for_its_dwell_then_goes() {
         assert_eq!(footer_fp(&app, wid), lit_key, "frame {i}");
     }
     let (row, col) = hit(&app, wid, Chip::Autopilot);
-    // `∞`, the title's two-cell gap, then the label.
     let check = cell_at(&app, wid, (row, col + 3));
     assert_eq!(check.ch, '\u{2713}');
     assert_eq!(
@@ -154,14 +135,6 @@ fn an_acts_label_lights_beside_the_whole_facts_for_its_dwell_then_goes() {
 }
 
 /// THE LABEL NEVER TAKES A FACT'S ROOM (§9.2.1): walked from a wide pane
-/// down to a narrow one with a label lit, over the owner's typical facts
-/// (whose rungs differ by less than the label), the rule draws it only
-/// beside the WHOLE facts — the label never cuts the path or drops the
-/// branch to make room — and the chips never move for it. At the width it
-/// first goes, the facts are still whole: it gave way first. Where the
-/// facts fell for want of room before any label, see
-/// [`a_split_panes_cut_path_leaves_the_label_and_the_hovered_title_room`].
-/// NEGATIVE CONTROL: it is drawn somewhere.
 #[test]
 fn the_acts_label_is_drawn_beside_the_whole_facts_or_not_at_all() {
     let t0 = Instant::now();
@@ -170,7 +143,6 @@ fn the_acts_label_is_drawn_beside_the_whole_facts_or_not_at_all() {
     let at_left = hit(&app, wid, Chip::Autopilot).1;
     let mut drawn = Vec::new();
     for cols in (40..=120).rev() {
-        // 120 is the pane's width already.
         assert_eq!(app.apply_term_resize(wid, 24, cols), cols != 120);
         draw_claude(&app, session, BYPASS);
         frame(&mut app, wid);
@@ -209,25 +181,10 @@ fn the_acts_label_is_drawn_beside_the_whole_facts_or_not_at_all() {
 }
 
 /// The Together run's Claude Code working directory (2026-10-16): outside
-/// HOME, so the footer carries it whole, and a 120-column pane cuts it.
 const SPLIT_PATH: &str = "/private/tmp/claude-502/-Users-person-aterm/\
     dd11ed0c-05cd-46e8-bf09-5b2786e48b6a/scratchpad/together/run-dir/proj-claude";
 
 /// A SPLIT PANE'S CUT PATH LEAVES THE LABEL AND THE HOVERED TITLE ROOM
-/// (§9.2.7; the Together run's D2, on glass): Claude Code's pane 120
-/// columns wide in a vertical split, its working directory too long for the
-/// rule, so the facts stand with the path cut to `…/proj-claude` and ninety
-/// cells of `─` free. An act lights `✓ approved` there, and hovering the
-/// Autopilot chip draws its title (a leaner form, `lean_titles`: the whole,
-/// with Cruise's sentence and the menu's line, does not fit), each beside
-/// the facts exactly as the rest rule draws them, the chips where they
-/// stood.
-///
-/// RED before the fix: the label and the title were paired with the WHOLE
-/// facts only, so neither was drawn and a hover only underlined the chip.
-/// NEGATIVE CONTROL: at 58 columns, the widest where the cut facts leave no
-/// room for it, the label is not drawn and leaves no lone glyph; the facts
-/// stand.
 #[test]
 fn a_split_panes_cut_path_leaves_the_label_and_the_hovered_title_room() {
     let t0 = Instant::now();
@@ -276,7 +233,6 @@ fn a_split_panes_cut_path_leaves_the_label_and_the_hovered_title_room() {
     );
     assert!(hovered.contains(facts), "no fact gave way: {hovered:?}");
     app.hover_claude_chip(wid, None);
-    // NEGATIVE CONTROL: where the cut facts leave it no room, no label.
     assert!(app.apply_term_resize(wid, 24, 58));
     draw_claude(&app, session, BYPASS);
     on_act_at(&mut app, session, Act::Declined, arrival(t0, 20_000));
@@ -294,11 +250,6 @@ fn a_split_panes_cut_path_leaves_the_label_and_the_hovered_title_room() {
 }
 
 /// `[claude_footer] acts = false` AND SERIOUS MODE WITHHOLD THE LABEL
-/// (§9.2.1) on the very next frame — the switch moves the footer's repaint
-/// key, as `usage` does — and keep the trail: the hovered title still
-/// lists the act. Back on, the label still lit shows again.
-///
-/// NEGATIVE CONTROL: each switch on, the label shows.
 #[test]
 fn acts_off_and_serious_mode_withhold_the_label_and_move_the_key() {
     let t0 = Instant::now();
@@ -337,14 +288,6 @@ fn acts_off_and_serious_mode_withhold_the_label_and_move_the_key() {
 }
 
 /// A HOVERED AUTOPILOT CHIP LISTS THE TRAIL, BUILT ONCE PER READING
-/// (§9.2.1): its whole title — which outranks the label — names the mode,
-/// says what it does, then `last:` and the acts with their clock times,
-/// then the click. The trail is formatted where the hover starts (one clock
-/// read) and again where an act arrives under it (its generation moves the
-/// key), never per frame; let go, nothing is read.
-///
-/// NEGATIVE CONTROL: before any act, the hovered title is v1's words and
-/// the menu's line, no trail.
 #[test]
 fn a_hovered_autopilot_chip_lists_the_trail_built_once_per_reading() {
     let t0 = Instant::now();
@@ -368,8 +311,6 @@ fn a_hovered_autopilot_chip_lists_the_trail_built_once_per_reading() {
     for _ in 0..5 {
         frame(&mut app, wid);
     }
-    // The act's clock time; a weekday before it only where the wall's date
-    // turned between the act and the hover.
     let titled = rule(&app, wid);
     assert!(
         titled.contains(&format!(
@@ -384,7 +325,6 @@ fn a_hovered_autopilot_chip_lists_the_trail_built_once_per_reading() {
         1,
         "the hover's start alone"
     );
-    // An act under the hover: the key moves, the trail is built again.
     let key = footer_fp(&app, wid);
     let (second, _) = arrival_now(t0, 60_000);
     on_act_at(&mut app, session, Act::Continued, second);
@@ -411,7 +351,6 @@ fn a_hovered_autopilot_chip_lists_the_trail_built_once_per_reading() {
         1,
         "rebuilt once"
     );
-    // Let go: nothing read, the cache gone.
     app.hover_claude_chip(wid, None);
     for _ in 0..3 {
         frame(&mut app, wid);
@@ -421,13 +360,6 @@ fn a_hovered_autopilot_chip_lists_the_trail_built_once_per_reading() {
 }
 
 /// A HOVERED CHIP NAMES ITS FACE CLOCK'S DAY WHERE IT IS NOT TODAY (§10.2.3,
-/// item 3) on a real frame: a session under Land with no trail whose work
-/// landed two days back reads, hovered, `landed <weekday> HH:MM` — the
-/// hover's start reads today's day for the face clock alone, since the title
-/// names one.
-///
-/// NEGATIVE CONTROL: a landing now reads its bare clock, no weekday — the
-/// day is named only where it differs.
 #[test]
 fn a_hovered_chip_names_its_face_clocks_day_where_it_is_not_today() {
     use crate::harness_glass::{Stamp, local_day_at};
@@ -473,8 +405,6 @@ fn a_hovered_chip_names_its_face_clocks_day_where_it_is_not_today() {
         old.contains(&format!("landed {wkd} {}", stamp.clock.as_str())),
         "two days back, the weekday: {old:?}"
     );
-    // NEGATIVE CONTROL: landed now, the bare clock (where the wall's date did
-    // not turn between the face and the hover).
     let now = wall_now();
     let stamp = Stamp::at(now).expect("the zone reads here");
     let fresh = hovered_after(now);
@@ -489,17 +419,6 @@ fn a_hovered_chip_names_its_face_clocks_day_where_it_is_not_today() {
 }
 
 /// A PAUSE TOLD UNDER A HOVER IS IN THE TITLE ON THE NEXT FRAME
-/// (`docs/DESIGN-harness-autopilot-2026-10-15.md` §10.5.7, 4a): a session
-/// with no trail and no face clock, its Autopilot chip hovered and its
-/// title drawn; the loop's pause told through the window's one door for
-/// harness facts asks the window reading that title for a frame, and that
-/// frame's title names the pause's end with its weekday — the pause is the
-/// title's only stamp, so the build reads today's date for it alone. The
-/// pause ends two days on, so a wall whose date turns during the test still
-/// names a later day. Told gone, the next frame's title drops it.
-///
-/// NEGATIVE CONTROL: with nobody reading the title, the same pause asks no
-/// window for a frame.
 #[test]
 fn a_pause_told_under_a_hover_is_in_the_title_on_the_next_frame() {
     use crate::harness_glass::Stamp;
@@ -537,7 +456,6 @@ fn a_pause_told_under_a_hover_is_in_the_title_on_the_next_frame() {
         until.clock.as_str()
     );
 
-    // NEGATIVE CONTROL: nobody reads the title; the pause asks no frame.
     asked();
     app.apply_harness_fact(&sid, crate::HarnessFact::Pause(Some(plan)));
     assert_eq!(asked(), 0, "no reader, no frame asked");
@@ -573,14 +491,6 @@ fn a_pause_told_under_a_hover_is_in_the_title_on_the_next_frame() {
 }
 
 /// THE CHIPS ARE BUTTONS A SCREEN READER CAN PRESS (§9.2.1): the tree's
-/// chips are the frame's — Autopilot (then the facts), over the cells the
-/// painter recorded, named in words (`Autopilot: cruise.`), the newest act
-/// its description (none once it is a day old, as the title leaves it out)
-/// — and a reader's click on Autopilot steps its word, as a click on its
-/// cells does.
-///
-/// NEGATIVE CONTROL: a click on a chip the glass does not show (a pane too
-/// narrow for it) does nothing.
 #[cfg(a11y_tree)]
 #[test]
 fn the_chips_are_buttons_a_screen_reader_can_press() {
@@ -594,9 +504,6 @@ fn the_chips_are_buttons_a_screen_reader_can_press() {
     on_act_at(&mut app, session, Act::Approved, now);
     frame(&mut app, wid);
     let chips = app.claude_chips_a11y(wid);
-    // Autopilot first, every other a fact the rule shows (the facts' own
-    // buttons are `claude_facts_gesture_tests`'), the top rule's harness
-    // switch or the title slot (the act's label).
     assert!(
         chips.len() > 1
             && chips[1..].iter().all(|c| c.chip.fact().is_some()
@@ -617,14 +524,11 @@ fn the_chips_are_buttons_a_screen_reader_can_press() {
         chips[0].description,
         Some(format!("Last: approved at {clock}."))
     );
-    // A day and a minute old, the act is told no more.
     let (mut old, _) = arrival_now(t0, 20_000);
     old.unix -= 86_460;
     on_act_at(&mut app, session, Act::Continued, old);
     frame(&mut app, wid);
     assert_eq!(app.claude_chips_a11y(wid)[0].description, None, "a day old");
-    // NEGATIVE CONTROL: a pane too narrow for any chip — a request for one
-    // the glass does not show is a no-op.
     assert!(app.apply_term_resize(wid, 24, 8));
     draw_claude(&app, session, BYPASS);
     frame(&mut app, wid);
@@ -654,14 +558,11 @@ fn a_reader_cannot_press_a_chip_under_painted_chrome() {
     use aterm_agent::supervise::Autopilot;
 
     let (mut app, wid, session, _host) = ticker_app(120);
-    // The ordinary reader path really changes the session's word first.
     app.press_claude_chip_for_reader(wid, session, HarnessChip::Autopilot);
     assert_eq!(
         autopilot(&app, session),
         (Some(Autopilot::Land), AutopilotView::Land)
     );
-    // A compact composer puts its footer under the portable paste banner.
-    // Paint the actual band; never fabricate the chrome ownership register.
     assert!(app.apply_term_resize(wid, 6, 120));
     let rule = "\u{2500}".repeat(120);
     feed(
@@ -697,7 +598,6 @@ fn a_reader_cannot_press_a_chip_under_painted_chrome() {
     let x = ox as f64 + (app.win_pad(wid) + col * cw + cw / 2) as f64;
     let y = oy as f64 + (app.win_pad_top(wid) + app.win_head(wid) + row * ch + ch / 2) as f64;
     assert_eq!(app.claude_chips_at(wid, x, y), None);
-    // A request saved from before the band must respect the same ownership.
     app.press_claude_chip_for_reader(wid, session, HarnessChip::Autopilot);
     assert_eq!(
         autopilot(&app, session),
@@ -706,18 +606,6 @@ fn a_reader_cannot_press_a_chip_under_painted_chrome() {
 }
 
 /// EVERYTHING ATERM DRAWS IN THE RULES IS IN THE TREE (review G1): the
-/// grid's text there is Claude's own `─`, so the permission-mode light, the
-/// top rule's harness switch and the title slot are nodes of their own.
-/// The light, drawn in plan mode, is a button over its cells named by its
-/// title and its mode, with what a click does as its description, and a
-/// reader's click on it presses Claude's own shift+tab. The switch is a
-/// switch over its own cells named by the words it paints and told on, and
-/// a reader's click on it turns the harness off, after which it is told off
-/// with its `on` button beside it. A hover on the light
-/// writes its title into the slot, which the tree publishes as its words.
-///
-/// NEGATIVE CONTROL: at rest in bypass, an expected mode, no light is drawn
-/// and none is published, and a reader's click on it types nothing.
 #[cfg(a11y_tree)]
 #[test]
 fn the_mode_light_the_switch_and_the_title_slot_are_in_the_tree() {
@@ -728,8 +616,6 @@ fn the_mode_light_the_switch_and_the_title_slot_are_in_the_tree() {
     use aterm_agent::supervise::Autopilot;
     let of = |chips: &[GridChip], chip| chips.iter().find(|c| c.chip == chip).cloned();
     let (mut app, wid, session, (_hosted, mut reader)) = ticker_app(120);
-    // Claude Code's session, its claim this window's host's: the harness's
-    // glass is worn, so the top rule wears the lit switch.
     {
         let ctx = app.pool.get(session).expect("session").ctx.clone();
         {
@@ -749,11 +635,9 @@ fn the_mode_light_the_switch_and_the_title_slot_are_in_the_tree() {
     draw_claude(&app, session, BYPASS);
     frame(&mut app, wid);
     let strip = usize::from(app.chrome_rows(wid));
-    // NEGATIVE CONTROL: bypass draws no light, so the tree has none.
     assert_eq!(of(&app.claude_chips_a11y(wid), HarnessChip::Mode), None);
     app.press_claude_chip_for_reader(wid, session, HarnessChip::Mode);
     assert!(pty(&mut reader, 0).is_empty(), "no light, nothing typed");
-    // The light, in plan mode.
     draw_claude(&app, session, PLAN);
     frame(&mut app, wid);
     let chips = app.claude_chips_a11y(wid);
@@ -769,7 +653,6 @@ fn the_mode_light_the_switch_and_the_title_slot_are_in_the_tree() {
             Mode::Bypass.word_on_glass(relabelled)
         ))
     );
-    // The harness switch, on the top rule: a switch told it is on.
     let switch = of(&chips, HarnessChip::Switch).unwrap_or_else(|| panic!("{chips:?}"));
     assert_eq!(switch.label, "alab harness on: Claude Code");
     assert_eq!(switch.toggled, Some(aterm_a11y::model::Toggled::True));
@@ -793,9 +676,7 @@ fn the_mode_light_the_switch_and_the_title_slot_are_in_the_tree() {
         row_text(&app, wid, drawn.frame_row)[..].contains("alab harness \u{25cf} on"),
         "the glass says what the node says"
     );
-    // No title at rest.
     assert_eq!(of(&chips, HarnessChip::Title), None, "{chips:?}");
-    // A hover on the light: its title in the slot, and in the tree.
     let (x, y) = px_of(&app, wid, (row, col));
     app.on_cursor_moved(wid, x, y);
     frame(&mut app, wid);
@@ -812,11 +693,8 @@ fn the_mode_light_the_switch_and_the_title_slot_are_in_the_tree() {
         title.label,
         rule(&app, wid)
     );
-    // A reader's click on the light presses Claude's own shift+tab.
     app.press_claude_chip_for_reader(wid, session, HarnessChip::Mode);
     assert_eq!(pty(&mut reader, SHIFT_TAB.len()), SHIFT_TAB);
-    // A reader's click on the switch turns the harness off: the switch is
-    // told off, and the `on` button stands beside it.
     app.press_claude_chip_for_reader(wid, session, HarnessChip::Switch);
     assert_eq!(
         autopilot(&app, session),
@@ -863,7 +741,6 @@ fn a_reader_chip_click_commits_an_open_in_grid_rename() {
         assert!(app.rename_field_edit(wid, SearchEdit::KillToStart));
         assert!(app.rename_field_edit(wid, SearchEdit::Insert(name.to_owned())));
     };
-    // Merely switching to Settings intentionally leaves the edit uncommitted.
     rename(&mut app, "left open");
     assert!(app.open_harness_settings(wid, crate::harness_screen::HarnessFocus::Top));
     let (_, _, settings, _) = app
@@ -874,9 +751,6 @@ fn a_reader_chip_click_commits_an_open_in_grid_rename() {
     assert_eq!(pinned(&app), None);
     app.switch_tab_in(wid, 0);
     frame(&mut app, wid);
-    // The master switch off: the reader's click on `⊘ off` turns it on and
-    // raises nothing (owner, 2026-10-20: "remove the harness settings button
-    // in the UX").
     app.harness_policy = crate::harness_policy_cell::HarnessPolicyCell::new(
         crate::app_config::HarnessPolicy::read("[harness]\nenabled = false\n"),
     );
@@ -894,20 +768,6 @@ fn a_reader_chip_click_commits_an_open_in_grid_rename() {
 }
 
 /// A HOVERED TITLE WITH A TRAIL GIVES ITS PARTS UP IN ORDER (§9.2.1)
-/// :
-/// walked from 240 columns down to 60 with
-/// one act taken, the hovered Autopilot title beside the whole facts is the
-/// WHOLE (the trail and the menu's line), then the whole WITHOUT ITS TRAIL
-/// (the menu still offered), then V1'S WORDS (the menu's line given up
-/// too), then the phrase WITH BOTH CLICKS (the explanation given up), then
-/// the phrase WITH THE CLICK, then the SHORT form, then none — in that
-/// order as the pane narrows, never back; the facts stay whole beside each.
-/// CONTROL: each of the seven forms is met.
-///
-/// RED before the menu wiring's fix: a pane with no room for the trail
-/// beside the facts showed `autopilot: cruise` alone, and the menu's line
-/// went with the trail; before owner-eye-1's, the clicks went with the
-/// explanation.
 #[test]
 fn a_hovered_title_gives_up_its_trail_then_its_menu_line_then_its_words() {
     let t0 = Instant::now();
@@ -916,7 +776,6 @@ fn a_hovered_title_gives_up_its_trail_then_its_menu_line_then_its_words() {
     on_act_at(&mut app, session, Act::Approved, act);
     let v1 = &crate::autopilot::AutopilotView::Cruise.title();
     let menu = format!("{v1} \u{b7} right-click: more");
-    // Cruise's sentence, from the one table (`autopilot::MODE_WORDS`).
     let cruise = crate::autopilot::mode_words(aterm_agent::supervise::Autopilot::Cruise).chip;
     let click = "autopilot: cruise \u{b7} click: land";
     let clicks = format!("{click} \u{b7} right-click: more");

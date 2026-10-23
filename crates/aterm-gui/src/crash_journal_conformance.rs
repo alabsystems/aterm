@@ -1,44 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1 conformance of the crash journal to
-//! `aterm_models_gui::crash_journal_claim_model` (`CrashJournalClaim`, PTY
-//! keeper P1).
-//!
-//! Every step the model can take from every state it can reach (a
-//! breadth-first cover, beside the ends a person meets) — which reaches every
-//! state the model can reach, as the test checks — is replayed on the SHIPPING
-//! owner and claim over a real directory: `JournalOwner::create`/`publish`
-//! (the writer thread's two calls) for `Write` and `Settle`,
-//! `JournalOwner::retire` for the quit's removal, `restore::write_quit_to` for
-//! the quit's own layout (stamped with its run), and `claim_at_boot` — with
-//! `classify_death` reading real crash markers in a real log dir — for every
-//! later launch. The test plays the process around them: it arms the run's
-//! crash marker at boot as the installed app arms it (`markers::arm`: locked
-//! for the run's life, named for the start the journal is named for too) and
-//! removes it on a clean end (what `atexit` and `clean_exit_now` do), releases
-//! the owner's locks without a word on a death (what the kernel does to a
-//! SIGKILLed process no forked child still shares a lock with: `Rig::end`),
-//! and leaves the journal behind on the update's hand-off.
-//! Every schedule is replayed twice: once as above, and once with a windowed
-//! launch that does NOT claim — an update's successor, a launch with
-//! `restore_session` off — reading every run's crash and kill evidence before
-//! each claim (`take_kill_evidence_in`/`take_crash_evidence_in`, which rename
-//! it `.seen`), so the claim's verdict must not depend on who read the
-//! evidence first. Every real step is projected onto the model
-//! and checked as a transition the committed model admits (interpreter, and
-//! `ty` wherever installed); every reached state satisfies every invariant; and
-//! wherever the model forbids a claim, the real claim is run anyway and must
-//! change nothing.
-//!
-//! Each schedule is replayed a second time in which, before each claim, a windowed launch that
-//! does not claim reads (and renames `.seen`) every run's evidence, so the verdict must not
-//! depend on who read it first. Every real step must be a transition the committed model admits
-//! (interpreter, and `ty` where installed), every reached state must satisfy every invariant,
-//! and where the model forbids a claim the real claim runs anyway and must change nothing.
-//!
-//! Negative control: the real steps disagree with `Buggy = 1`
-//! (`the_defects_reject_the_real_steps`).
+//! Tier-1 conformance of the crash journal to `aterm_models_gui::crash_journal_claim_model` (`CrashJournalClaim`, PTY keeper P1).
 
 use std::collections::BTreeMap;
 use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
@@ -52,27 +15,11 @@ use crate::crash_journal::tests::{layout, reaped_pid, scratch};
 use crate::crash_journal::{self, Evidence, JournalHeader, JournalId, JournalOwner, QuitLayout};
 use crate::crash_signal::{MarkerOwner, markers};
 
-/// Where replays run: a journal directory, a log dir, and the pids their runs
-/// are named for. A worker of [`the_real_journal_conforms_to_the_model`] keeps
-/// one desk for all its replays, emptied between them ([`Desk::clear`]).
-///
-/// WHY (test-run speed): a fresh desk per replay made and removed two
-/// directories in the system temp dir, the one every test binary of a run
-/// makes its own in, and reaped one process for its pid: 1,852 replays, 7,408
-/// directory makes and removes and 2,440 spawns of `/usr/bin/true` in one run.
-/// Beside three `F_FULLFSYNC` writers those directory calls took 2.9-6.2 ms
-/// each, 30.5 of the 210 thread-seconds the test spent in file system calls,
-/// and a spawn and its reap 2.1-2.8 ms. An emptied directory is what the
-/// shipping owner and claim see in a fresh one: they read names and the files
-/// under them, never the directory's own metadata, and `clear` checks it
-/// empty. A pid reaped earlier still names no process (the kernel hands a pid
-/// out again only once its pid counter has wrapped), and the journal tells
-/// runs apart by `(pid, start)`, whose start is the clock's at each replay.
+/// Where replays run.
 pub(crate) struct Desk {
     dir: aterm_tempfile::TempDir,
     logs: aterm_tempfile::TempDir,
     /// Pids of already-reaped processes, made as first needed: run `k` of a replay is named for
-    /// the `k`th, so no two runs of one replay share a pid.
     pids: Vec<u32>,
 }
 
@@ -128,7 +75,6 @@ pub(crate) struct Rig {
     /// The run's crash marker while it exists, and its lock while the run lives.
     marker: Option<(PathBuf, Option<OwnedFd>)>,
     /// Before every claim, a windowed launch that does not claim reads every
-    /// run's evidence first.
     consumed_first: bool,
     /// How many of those reads found evidence to consume.
     consumed: usize,
@@ -160,7 +106,6 @@ impl Rig {
 
     /// A replay on `desk`, empty as [`Desk::clear`] leaves it.
     fn on(mut desk: Desk, consumed_first: bool) -> Self {
-        // A pid no process has: the owner's liveness is its lock alone.
         let id = JournalId::now(desk.pid(0));
         Rig {
             desk,
@@ -189,7 +134,6 @@ impl Rig {
     }
 
     /// The replay is over: its owner and its marker's descriptor go, as when
-    /// a rig drops, and its desk comes back emptied for the next.
     fn finish(self) -> Desk {
         let Rig {
             desk,
@@ -215,14 +159,11 @@ impl Rig {
     }
 
     /// The run starts: its crash marker (empty, locked, the app's) is armed before its journal
-    /// and named for the same start (`JournalId::of_this_run`). `second`: the reopened journal
-    /// was a second chance (`Lane::begin_probation`'s flag).
     fn boot(&mut self, probation: bool, second: bool) {
         let armed = markers::arm(self.logs(), self.id.pid, self.id.nanos, MarkerOwner::App)
             .expect("marker armed");
         assert!(armed.locked, "the marker's owner lock is held");
-        // SAFETY: `arm` returns a descriptor it opened for this call and nobody
-        // else owns; the `OwnedFd` closes it exactly once.
+        // SAFETY: `arm` returns a descriptor it opened for this call and nobody else owns.
         let lock = unsafe { OwnedFd::from_raw_fd(armed.fd) };
         self.marker = Some((armed.path, Some(lock)));
         self.booted = true;
@@ -231,9 +172,6 @@ impl Rig {
     }
 
     /// The successor's commit (`release_committed_readers`, then `Lane::adopt_predecessor` at
-    /// its wake): a new run, its marker armed as `boot` arms one, takes the handed-off image
-    /// over onto its own journal by the real `JournalOwner::adopt`; only then do its readers run
-    /// on the live sessions.
     fn adopt(&mut self) {
         let parent = self.id;
         let mut id = JournalId::now(self.desk.pid(self.runs));
@@ -273,16 +211,13 @@ impl Rig {
     }
 
     /// The process ends; `clean` means through an exit path, which removes its crash marker.
-    /// Its locks go however it ends, by `LOCK_UN`: a close alone leaves the lock held by any
-    /// sibling test's child forked meanwhile, until that child's `exec`.
     fn end(&mut self, clean: bool) {
         if let Some((path, lock)) = self.marker.as_mut() {
             if clean {
                 std::fs::remove_file(&*path).expect("a live run's marker is under its name");
             }
             if let Some(lock) = lock.take() {
-                // SAFETY: `flock` on the descriptor the rig holds open until
-                // it drops right after; LOCK_UN never waits.
+                // SAFETY: `flock` on the descriptor the rig holds open until it drops right after.
                 #[expect(
                     clippy::disallowed_methods,
                     reason = "the release: LOCK_UN before the descriptor closes"
@@ -295,14 +230,12 @@ impl Rig {
         if clean {
             self.marker = None;
         }
-        // Its drop releases the lock at once, as the kernel does.
         drop(self.owner.take());
         self.live = false;
         self.clean = clean;
     }
 
     /// The quit's first step: the real `restore::write_quit_to`, stamped with
-    /// this run's journal id as the quit stamps it.
     fn write_quit_layout(&mut self) {
         crate::restore::write_quit_to(
             &self.dir().join(SESSION),
@@ -313,8 +246,6 @@ impl Rig {
     }
 
     /// The quit's `session.toml` as a later launch reads it before claiming (`main_entry` via
-    /// `restore::take` and `JournalId::parse_stem`), but read, not taken, so a forbidden claim
-    /// run anyway leaves it for the next.
     fn quit_layout(&self) -> QuitLayout {
         let path = self.dir().join(SESSION);
         let Ok(text) = std::fs::read_to_string(&path) else {
@@ -334,7 +265,6 @@ impl Rig {
     }
 
     /// A later launch's real claim. On the consumed pass, a windowed launch that does not claim
-    /// first reads (and renames) every run's evidence, as its boot does.
     fn claim(&mut self) {
         if self.consumed_first {
             let killed =
@@ -386,17 +316,12 @@ impl Rig {
                 self.end(true);
                 self.successor = true;
             }
-            // The successor ends before it took anything over: the parent left
-            // no image (the shipping waiter takes one over before any reader
-            // runs), so nothing of the journal is its to leave.
             "SuccessorDies" => self.successor = false,
             "Adopt" => self.adopt(),
             "Die" => {
                 self.end(false);
                 self.lost = self.written && !self.image().exists();
             }
-            // A fatal signal: the handler writes its banner into the run's
-            // own marker (`crash_signal`), then the process goes.
             "Crash" => {
                 if let Some((path, _)) = self.marker.as_ref() {
                     std::fs::write(path, b"aterm: fatal signal 11 (SIGSEGV)")
@@ -430,7 +355,6 @@ impl Rig {
         s.insert("image", i64::from(image));
         s.insert("image_probation", i64::from(self.image_probation));
         s.insert("image_second", i64::from(self.image_second));
-        // A real publish is one rename: no state has an empty name mid-write.
         s.insert("torn", 0);
         s.insert("written", i64::from(self.written));
         s.insert("claims", self.claims);
@@ -482,15 +406,6 @@ const ENDS: &[&[&str]] = &[
 ];
 
 /// EVERY STEP OF THE MODEL, EACH ONCE: breadth first from the initial
-/// state, every reachable state by the shortest schedule that reaches it,
-/// and that schedule extended by every action enabled there (`fire`d, the
-/// canonical successor), with every one of [`ENDS`] beside them. A schedule
-/// another one starts with is left out, the longer replaying its every step.
-///
-/// WHY (test-run speed): every schedule up to seven steps was 926 schedules
-/// (1,852 replays) whose prefixes walked the same transitions again and
-/// again, 36-70 s of a loaded suite; one schedule per (state, action) is
-/// every transition the model has, and still reaches every state.
 fn transition_cover(
     model: &aterm_spec::derive::Model,
     actions: &[&'static str],
@@ -521,10 +436,6 @@ fn transition_cover(
 }
 
 /// Replay `schedule` on the real owner and claim on `desk` (handed back emptied). With
-/// `consumed_first`, a launch that does not claim reads the evidence before every claim
-/// (`consumed` counts the reads that found some). After each step at which the model forbids a
-/// claim, the real claim runs anyway and must leave the projection unchanged (`refused` counts
-/// those).
 fn replay(
     desk: Desk,
     schedule: &[&'static str],
@@ -557,17 +468,6 @@ fn replay(
 }
 
 /// The shipping owner and claim refine `CrashJournalClaim` on every step the
-/// model can take from every state it reaches ([`transition_cover`]) — each
-/// schedule replayed twice, the second time with every claim's
-/// evidence read (and renamed `.seen`) first by a launch that does not claim —
-/// every state they reach satisfies every invariant, and between them they
-/// reach EVERY state the model can reach. Each step is admitted by the
-/// interpreter; each DISTINCT real transition is also validated once on both
-/// tiers.
-///
-/// Of the fourteen actions, `Write`, `Settle`, `Quit`, `WriteQuitLayout`, `Adopt` and `Claim`
-/// carry real `#[refines]` anchors; the other eight are the process around the journal, which
-/// this runner plays.
 #[test]
 fn the_real_journal_conforms_to_the_model() {
     let model = crash_journal_claim_model();
@@ -586,35 +486,6 @@ fn the_real_journal_conforms_to_the_model() {
         "the cover reaches the schedules it exists for: {}",
         all.len()
     );
-    // Each replay runs on a rig of its own (its worker's desk, emptied for it,
-    // and its own journal and markers), so the replays are independent: they
-    // run side by side (in turn they were 29.8 s of this test's 31.7 s on a
-    // 6-core host), each exactly once, every step checked where it was
-    // replayed, and the states they reach are gathered below.
-    //
-    // Each DISTINCT step is validated on both tiers by the worker that met it
-    // first, between its replays, and not after the last replay, for speed on
-    // a loaded machine: with the installed `ty` (0.13.0, no `--cases` co-process)
-    // the 129 of them are 262 `ty` spawns, and run one after another once
-    // every replay was done they were the last 5.4 s of a 63.3 s run beside
-    // eight spinners and three `F_FULLFSYNC` writers. Beside replays that wait
-    // on the file system they cost the wall nothing. With that and one
-    // `Desk` per worker this test took 43.9-49.1 s there instead of
-    // 53.4-56.6 s (13.7 CPU-s instead of 16.9), and 2.1-2.3 s alone instead
-    // of 3.8-3.9 s.
-    //
-    // FOUR AT MOST (test-run speed). A replay mostly waits on the
-    // shipping writers' syncs (`restore`'s `F_FULLFSYNC`, the journal's
-    // `fsync`), so the wall stops falling at about four threads (run alone on
-    // 14 cores: 23.6 s on one, 18.7 s on two, 15.6 s on four, 15.7 s on
-    // fourteen), and every thread past that only spins in the kernel: 14.4
-    // CPU-s on four against 51 on fourteen, three interleaved runs each. That
-    // kernel time also stalled every other test's file system calls: beside
-    // it, `config_watcher`'s entry-cap test (4,097 files) took 15.6 s and
-    // 8.1 s against fourteen, 2.1 s and 1.2 s against four. Those runs had
-    // `restore`'s sync as an `F_FULLFSYNC`; since `durable::sync_all`'s
-    // unit-test arm made it a plain `fsync` (2026-10-05), this test takes
-    // 4.1-7.3 s alone at load 20-22. The cap of four was not re-measured.
     let jobs: Vec<(&Vec<&'static str>, bool)> = all
         .iter()
         .flat_map(|schedule| [(schedule, false), (schedule, true)])
@@ -709,8 +580,6 @@ fn the_real_journal_conforms_to_the_model() {
 }
 
 /// Negative control: `Buggy = 1` disagrees with the real steps at a write (the real publish is
-/// one rename), at a claim blind to the quit layout's run, and at the claim of a running
-/// window's journal (its owner's lock is held), so a pass of the committed model is not vacuous.
 #[test]
 fn the_defects_reject_the_real_steps() {
     let buggy = interp::with_buggy(&crash_journal_claim_model(), 1);
@@ -733,7 +602,6 @@ fn the_defects_reject_the_real_steps() {
         "the claim blind to the quit layout's run disagrees with the real one (finding 48's \
          review: a quit cut short opens its desk once)"
     );
-    // The committed machine's path to a live journal, then the mutant's claim.
     let committed = crash_journal_claim_model();
     let mut state = committed.init_state();
     for action in ["BootFresh", "Write"] {

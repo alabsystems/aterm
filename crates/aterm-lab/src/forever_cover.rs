@@ -1,24 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE JUDGES OF `lab forever`'s COVERAGE CHAINS (`--mode cover`, `--mode
-//! cap`, `--mode wall`): what the measured pass left unobserved, each judged from the tab's
-//! own records ([`Seen`]: journal, ledger, `status`, `meta`, the task record,
-//! the stub's dumps) and what the run did to it ([`Cover`]), never the screen
-//! alone. Each passes beside the negative controls its tests fail
-//! (`forever_tests.rs`): a broken product's records fail it.
+//! Judges for `lab forever` coverage chains (`--mode cover`, `--mode cap`, `--mode wall`) from tab records ([`Seen`], [`Cover`]).
 
 use super::*;
 use aterm_agent::supervise::policy::approval::RULE_LIMIT_RETRY;
 
 /// How much earlier than the landing's journal line the manager's wait may
-/// have returned and still be the landing's answer (the record is marked
-/// done at the landing; the lab's clock reads the client's exit).
 const AWAIT_SLACK_MS: i64 = 2_000;
 
 /// One verdict of several judges' over the same records: FAIL where any
-/// failed, else UNOBSERVED where any went unobserved, else PASS — each one's
-/// words kept.
 fn compose(said: &str, parts: &[(&str, Verdict)]) -> Verdict {
     let all = parts
         .iter()
@@ -39,7 +30,6 @@ fn compose(said: &str, parts: &[(&str, Verdict)]) -> Verdict {
 }
 
 /// The first `EVENT idle` after `t0` and before `until` whose words hold
-/// `key`, else the words the first one read (for the report).
 fn read_holding<'a>(
     seen: &'a Seen,
     t0: i64,
@@ -60,8 +50,6 @@ fn read_holding<'a>(
 }
 
 /// The phase and words of a point's journal line, `EVENT <phase> seq=<n>
-/// <words>`: `idle`, or the phase the loop read it in (`question`: Claude
-/// Code's question at its yield is journaled so).
 fn event_words(line: &str) -> Option<(&str, &str)> {
     let rest = line.strip_prefix("EVENT ")?;
     let (phase, rest) = rest.split_once(' ')?;
@@ -70,9 +58,6 @@ fn event_words(line: &str) -> Option<(&str, &str)> {
 }
 
 /// A NEEDS YOU need raised on the tab: a `NEEDS` line, or the needs owner's
-/// `ask:needs` entry in `meta` — not `status needs=ask` alone, which the
-/// supervisor's own escalation raises too (CAP's: `attention_kinds=
-/// -:supervisor`, measured on Claude Code 2.1.304).
 fn need_raised(seen: &Seen) -> Option<String> {
     if let Some((_, l)) = seen.journal.iter().find(|(_, l)| l.starts_with("NEEDS ")) {
         return Some(format!("journal {}", crate::util::one_line(l, 100)));
@@ -84,7 +69,6 @@ fn need_raised(seen: &Seen) -> Option<String> {
 }
 
 /// A task record the run read where none was given (`OK task -` throughout
-/// is none).
 fn invented_record(seen: &Seen) -> Option<&str> {
     seen.task
         .iter()
@@ -102,13 +86,6 @@ fn said_before(said: &str, v: Verdict) -> Verdict {
 }
 
 /// THE ORCHESTRATOR'S TURN JUDGED AND ACTED ON (L13, CAP; F8 of the review
-/// of `b9/forever-gaps`, where any act after the turn passed): its reply's
-/// point read after the turn at `tt` (an `EVENT` whose words hold `key`),
-/// the back-off decided at THAT point (its `WAITING`, the same `seq=`), and
-/// the first act after the turn typed only after that `WAITING`, at its due.
-/// `Ok` with what it said and the act; `Err` with the verdict — FAIL for an
-/// act typed at no such point or before its due, and for persistence lost
-/// ([`lost_after`]); UNOBSERVED where the watch ended first.
 fn judged_resumption<'a>(
     seen: &'a Seen,
     tt: i64,
@@ -177,15 +154,7 @@ fn judged_resumption<'a>(
     }
 }
 
-/// L12: a question in prose at the land act's yield. Its yield READ (an
-/// `EVENT` line of the point holding the question: `idle`, or `question`
-/// where the loop read it as one), the act at that point
-/// `land-answer@v1` — never a nudge or a continuation, never a landing at the
-/// question — journaled and ledgered, its text Land's answer with no suffix
-/// (no open work, no repository, no needs carry-on: none stands), no need
-/// raised; then the clean defense at THE ANSWER'S yield lands the task (a
-/// land act's yield: `DONE … rule=land@v1`, nothing typed between), quiet
-/// after it as L5's ([`landing_quiet`]), no task record invented.
+/// Judges L12: a question in prose at the land act's yield.
 pub(super) fn judge_answer(seen: &Seen, t0: i64) -> Verdict {
     let Some(t1) = seen.acts(turn_end::RULE_LAND).first().map(|(t, _)| *t) else {
         return Verdict::Fail(format!("no land@v1 typed within {}", at(t0, seen.end_ms)));
@@ -313,23 +282,7 @@ pub(super) fn judge_answer(seen: &Seen, t0: i64) -> Verdict {
     landed_verdict(bad, format!("{said}; {quiet}"), seen, done.0, window)
 }
 
-/// L13: A PERSON'S OWN EXCHANGE — the first prompt typed as a person types
-/// it (its draft standing, then their Enter at [`Cover::person_ms`]),
-/// answered at once. Through the exchange (their Enter to the orchestrator's
-/// turn, [`Cover::turn_ms`]): `LEFT … rule=left-to-person@v1` journaled,
-/// `status task=theirs`, NOTHING TYPED (no journal act, no acting ledger row,
-/// no harness text in the stub's dumps of it: [`Cover::window_stub`]), no
-/// DONE, no need raised, for at least [`QUIET_UNDER_OFF_MS`] — past a 4 min
-/// first step; then the orchestrator's turn ended the exchange, judged and
-/// acted on ([`judged_resumption`]: its reply read, its back-off decided
-/// there, Land's act at that due). Judged only where a person's hand reached the session
-/// ([`Cover::person_stamp`] a stamp, not `-`): the lab's person types through
-/// the development seam `send|key as=person`, or (`forever --window`) through
-/// `hwkey`, the key press's own path ([`Cover::keyed`]), and a write that left
-/// no stamp is nobody's by the product's rule, so what the harness did after
-/// it says nothing of a person's exchange. Typed through `hwkey`, the stamp
-/// must be the keys' and theirs alone ([`keys_unaccounted`]): `status
-/// human_seq=` moved by exactly the keys posted, else UNOBSERVED.
+/// Judges L13: a person's own exchange and follow-up question under Land.
 pub(super) fn judge_theirs(seen: &Seen, t0: i64) -> Verdict {
     let Some(p) = seen.cover.person_ms else {
         return Verdict::Unobserved("the person's prompt was never typed".into());
@@ -471,12 +424,8 @@ pub(super) fn judge_theirs(seen: &Seen, t0: i64) -> Verdict {
 }
 
 /// Why `hwkey`'s keys do not account for the person's stamp, if they do
-/// not: `status human_seq=` (a person's gestures, which no control verb
-/// moves) went from its count before the first key to its count after the
-/// Enter by exactly the presses `hwkey` posted. Fewer: some key the real key
-/// path took was not counted as a person's. More: another hand (a person at
-/// the desk) reached the session too. Unread after: not known.
 #[must_use]
+/// Returns why `hwkey`'s keys do not account for the person's stamp, if they do not.
 pub fn keys_unaccounted(k: &Keyed) -> Option<String> {
     let Some(after) = k.seq_after else {
         return Some(format!(
@@ -502,6 +451,7 @@ pub fn keys_unaccounted(k: &Keyed) -> Option<String> {
 
 /// The line that says how `hwkey` typed the person's prompt.
 #[must_use]
+/// Formats how `hwkey` typed the person's prompt.
 pub fn keyed_line(k: &Keyed) -> String {
     format!(
         "typed through hwkey: {} key(s) posted to the window's event queue ({} to the key window of the active app), status human_seq= {} -> {}",
@@ -513,12 +463,7 @@ pub fn keyed_line(k: &Keyed) -> String {
     )
 }
 
-/// L14: P2 LIVE UNDER LAND — the work reply opening `Wrote the parser
-/// module …` READ at the first point judged (the `EVENT` of the first
-/// back-off's `seq=` holding it, before the land act: Muse Code's reader once
-/// took such a head for its own tool row and read no words), and L1, L3 and
-/// L5 on replies that each open `Wrote ` (the need and the defense read from
-/// them, the landing).
+/// Judges L14: P2 live under Land with a work reply before landing.
 pub(super) fn judge_wrote_land<'a>(
     seen: &'a Seen,
     land: Option<&(i64, String)>,
@@ -527,9 +472,6 @@ pub(super) fn judge_wrote_land<'a>(
     t0: i64,
 ) -> Verdict {
     let before = land.map_or(seen.end_ms, |(t, _)| *t);
-    // THE FIRST POINT JUDGED read the reply's words (F15 of the review of
-    // `b9/forever-gaps`): the point of the first back-off after the prompt,
-    // not any line that read them, which a point judged as no words passed.
     let judged = seen
         .journal
         .iter()
@@ -580,10 +522,7 @@ pub(super) fn judge_wrote_land<'a>(
     )
 }
 
-/// C3: P2 LIVE UNDER CRUISE — the done claim opening `Wrote the parser and
-/// pushed …` READ before the first act, that act the done check (a claim
-/// read as no words gets `continue@v1`), and C1 and C2 on it (the check's
-/// defense, opening `Wrote `, read and waited on).
+/// Judges C3: P2 live under Cruise with a done claim before continuation.
 pub(super) fn judge_wrote_cruise(seen: &Seen, done: Option<&(i64, String)>, t0: i64) -> Verdict {
     let first = seen.all_acts().first().copied();
     let before = first.map_or(seen.end_ms, |(t, _)| *t);
@@ -619,16 +558,7 @@ pub(super) fn judge_wrote_cruise(seen: &Seen, done: Option<&(i64, String)>, t0: 
     )
 }
 
-/// C4: THE OWNER'S CONTINUATION IN TWO PARAGRAPHS ([`OWNER_CONTINUE`], the
-/// lab's `continue_text`): the work reply's point types `continue@v1`, the
-/// owner's words in ONE line — the ledger's text and every text of the
-/// conversation's requests that carries them ([`Cover::owner_texts`]: what
-/// reached the agent) hold no line break and both paragraphs' words — and
-/// the point after it reads the agent's reply (the done claim), never the
-/// act's own rows: no read after the act holds the owner's words, no need is
-/// raised (the owner's `NEEDS YOU:` line read as the agent's), no `DONE` and
-/// no `task=landed` (Cruise). UNOBSERVED where no act came and the watch
-/// ended before the persistence verdict, or the dumps were not read.
+/// Judges C4: the owner's two-paragraph continuation ([`OWNER_CONTINUE`]) under Cruise.
 pub(super) fn judge_owner_continuation(
     seen: &Seen,
     done: Option<&(i64, String)>,
@@ -748,14 +678,7 @@ fn age(record: &str) -> Option<i64> {
     word(record, "since_ms").and_then(|v| v.parse().ok())
 }
 
-/// P5: a worker's record given before its agent started (`task mark working
-/// from=ctl`), its agent at its composer: read `working` at an age past its
-/// startup deadline and [`PAST_DEADLINE_MS`] more — never `stalled` (the
-/// deadline's `why=startup` included) nor another state before its `done`,
-/// every change of the record read ([`rev_gaps`]: a stall between two looks
-/// moves its rev by two),
-/// no `status needs=` but `-`, no "never started" in the record's or the
-/// supervisor's attention.
+/// Judges P5: a worker's task record given before its agent started.
 pub(super) fn judge_startup(seen: &Seen, t0: i64) -> Verdict {
     let state = |r: &str| word(r, "state").unwrap_or_default();
     let records: Vec<&(i64, String)> = seen
@@ -788,9 +711,6 @@ pub(super) fn judge_startup(seen: &Seen, t0: i64) -> Verdict {
             crate::util::one_line(r, 200)
         ));
     }
-    // every change of the record read (F13 of the review of
-    // `b9/forever-gaps`): a stall raised and lifted between two looks moves
-    // its rev by two, and shows nowhere else
     let gaps = rev_gaps(seen, t0);
     if !gaps.is_empty() {
         bad.push(format!(
@@ -865,8 +785,6 @@ pub(super) fn judge_startup(seen: &Seen, t0: i64) -> Verdict {
 }
 
 /// Where a worker of `program` takes its result from, as `result`'s header
-/// names it: Claude Code's transcript (`source=transcript`), every other
-/// harness's screen (`source=screen program=<program>`).
 fn result_source(program: &str) -> (&'static str, Option<&str>) {
     if program == Harness::Claude.name() {
         ("transcript", None)
@@ -875,17 +793,7 @@ fn result_source(program: &str) -> (&'static str, Option<&str>) {
     }
 }
 
-/// L15: a worker of the harness under test (`program`), given by `spawn
-/// agent=<program>` aimed at a manager tab running it ([`Cover::starter`]):
-/// the spawn named that agent ([`Cover::agent`]) and `meta worker=` names it
-/// ([`Cover::worker`]); its record `working from=<mgr>` at its first read,
-/// `autopilot=land` (a spawn's default) at the first `status` naming one
-/// (`-` until the agent runs), Land's landing as L7's (the record
-/// `done why=landed`, `TASK … done why=landed`, quiet after it as a managed
-/// worker's: [`judge_tasked`]); the manager's `await task @<w> since=0`
-/// RETURNED at the landing (not before it), exit 0, the worker's row
-/// `state=done`; and `result` its report, a blank line and its defense byte
-/// for byte, from the source its harness has ([`result_source`]).
+/// Judges L15: a spawned worker (`spawn agent=<program>`) carried to its landed task record.
 pub(super) fn judge_spawned(
     seen: &Seen,
     land: Option<&(i64, String)>,
@@ -931,10 +839,6 @@ pub(super) fn judge_spawned(
             first.map_or("not read", |(_, r)| r.as_str())
         ));
     }
-    // The spawn's default Autopilot, as `status` names it once the tab runs
-    // an agent the harness supervises: `autopilot=-` before that (a read
-    // racing the agent's start: Gemini CLI 0.46.0's, measured, is `node`
-    // until the status sweep publishes it), the first word after it `land`.
     let named = seen
         .status
         .iter()
@@ -1011,9 +915,7 @@ pub(super) fn judge_spawned(
     }
 }
 
-/// Whether CAP's tab has been watched to its verdict ([`finished`]): an act
-/// typed inside the hour after the first (the cap did not hold), or an act
-/// after the orchestrator's turn, a minute after it.
+/// Whether CAP's tab has been watched to its verdict ([`finished`]).
 pub(super) fn cap_watched(s: &Seen, now: i64) -> bool {
     let acts = s.all_acts();
     let Some((t1, _)) = acts.first().copied() else {
@@ -1027,17 +929,7 @@ pub(super) fn cap_watched(s: &Seen, now: i64) -> bool {
             .is_some_and(|tt| acts.iter().any(|(t, _)| *t > tt && now - *t >= 60_000))
 }
 
-/// CAP: `continue_per_hour = 1`. The first act (Land's instruction) is the
-/// hour's one; the next point is ESCALATED (journaled) with the attention
-/// naming the cap ([`cap_reason`]); NOTHING TYPED from the act to the
-/// orchestrator's turn past the hour's end (no journal act, no typed,
-/// approved or declined ledger row, no new harness text in the stub's dumps:
-/// [`Cover::window_stub`]): the escalated point is never decided again on a
-/// timer once the hour frees, no NEEDS YOU need raised ([`need_raised`]: the
-/// escalation's own `needs=ask` face is the cap's); and after the hour the policy
-/// acts again at a new point — the orchestrator's turn ([`Cover::turn_ms`],
-/// typed past the hour) judged and acted on ([`judged_resumption`]: its reply
-/// read, its back-off decided there, the act at that due), the act ledgered.
+/// Judges CAP (`continue_per_hour = 1`) escalation after the hourly continuation budget is spent.
 pub(super) fn judge_cap(seen: &Seen, t0: i64) -> Verdict {
     let acts = seen.all_acts();
     let Some(first) = acts.first().copied() else {
@@ -1148,9 +1040,7 @@ pub(super) fn judge_cap(seen: &Seen, t0: i64) -> Verdict {
     Verdict::Pass(format!("{said}; resumed: {went}"))
 }
 
-/// A journal point that reads the usage wall: an `EVENT limited` line (a
-/// wall on the screen at the turn's end), or an `EVENT prompt … kind=usage-limit`
-/// one (the program's usage-limit dialog, a box: Gemini CLI's).
+/// Whether `line` is a journal point that reads the usage wall.
 pub(super) fn wall_point(line: &str) -> bool {
     line.starts_with("EVENT limited ")
         || (line.starts_with("EVENT prompt ")
@@ -1158,20 +1048,12 @@ pub(super) fn wall_point(line: &str) -> bool {
 }
 
 /// The words of the loop's wait on Gemini CLI's usage-limit dialog that
-/// names no reset it can place: its `Keep trying` "is pressed on the
-/// back-off ladder" (`approval_loop.rs`'s `limit_retry_hold`).
 const LADDER_WORDS: &str = "on the back-off ladder";
 
 /// How far apart the ladder's badge and its wait are written: at the same
-/// read of the dialog.
 const LADDER_WITH_MS: i64 = 5_000;
 
 /// THE LADDER'S BADGE: an escalation `r` of Gemini CLI's usage-limit dialog
-/// that names no reset (a key's per-day quota), ledgered with the ladder's
-/// own wait ([`RULE_LIMIT_RETRY`] `waiting`, [`LADDER_WORDS`]) — FOREVER's
-/// NEEDS YOU, loud and never blocking: the loop goes on pressing its `Keep
-/// trying` on the entitlement ladder while a person is told. No stall of the
-/// wall; an escalation with no such wait beside it is one.
 fn ladder_badge(seen: &Seen, r: &Row) -> bool {
     seen.ledger.iter().any(|w| {
         w.rule == RULE_LIMIT_RETRY
@@ -1182,9 +1064,6 @@ fn ladder_badge(seen: &Seen, r: &Row) -> bool {
 }
 
 /// The ladder's waits on Gemini CLI's usage-limit dialog that names no
-/// reset, journaled after `t1` (the act that met it): each `WAITING …
-/// rule=limit-retry@v1 … on the back-off ladder` with its `until=` (unix
-/// ms) and its line, in order.
 fn ladder_waits(seen: &Seen, t1: i64) -> Vec<(i64, i64, &str)> {
     let rule = format!("rule={RULE_LIMIT_RETRY} ");
     seen.journal
@@ -1201,11 +1080,6 @@ fn ladder_waits(seen: &Seen, t1: i64) -> Vec<(i64, i64, &str)> {
 }
 
 /// The ladder's due standing when the lab lifted the wall at `lift`: the
-/// first `until=` of [`ladder_waits`] at or past it. The harness goes on
-/// there, past the lift, not at the lift: W1's deadline counts from the
-/// later of the two — the first rung's due where the lift comes before it
-/// (`--mode wall-day`), the climbed rung's where a try came in the wall
-/// (`--mode wall-climb`).
 fn ladder_due(seen: &Seen, t1: i64, lift: i64) -> Option<i64> {
     ladder_waits(seen, t1)
         .into_iter()
@@ -1214,12 +1088,9 @@ fn ladder_due(seen: &Seen, t1: i64, lift: i64) -> Option<i64> {
 }
 
 /// How far before the due its ladder wait named a `Keep trying` may come and
-/// still be at that due (the journal cuts `until=` to its second).
 const LADDER_DUE_SLACK_MS: i64 = 2_000;
 
 /// The due of the `Keep trying` pressed at `ts`: the `until=` of the last
-/// `WAITING … rule=limit-retry@v1` journaled after `t1` and before it (the
-/// dialog's wait on its named reset, or the ladder's), unix ms.
 fn press_due(seen: &Seen, t1: i64, ts: i64) -> Option<i64> {
     let rule = format!("rule={RULE_LIMIT_RETRY} ");
     seen.journal
@@ -1233,12 +1104,6 @@ fn press_due(seen: &Seen, t1: i64, ts: i64) -> Option<i64> {
 }
 
 /// A LADDER'S TRY: `r` is a `Keep trying` of Gemini CLI's usage-limit dialog
-/// that names no reset ([`RULE_LIMIT_RETRY`] `approved`), pressed at or past
-/// the due of the ladder's wait standing before it ([`ladder_waits`]) — a try
-/// on the entitlement ladder while the quota may stand, which the harness
-/// cannot know is spent until the dialog comes back: no act typed into the
-/// wall. One pressed before its due, or with no ladder wait before it, is
-/// one.
 fn ladder_try(seen: &Seen, r: &Row, t1: i64) -> bool {
     r.rule == RULE_LIMIT_RETRY
         && r.decision == "approved"
@@ -1249,13 +1114,6 @@ fn ladder_try(seen: &Seen, r: &Row, t1: i64) -> bool {
 }
 
 /// THE LADDER CLIMBED, NEEDS YOU STANDING: each of `tries` (the ladder's
-/// tries in the wall, [`ladder_try`]) answered by the dialog drawn again
-/// (the quota standing: a ladder wait saying `drawn again` after it), each
-/// pause from a try to the next due longer than the one before it (the
-/// first: from the dialog's first read to its first due), and the badge
-/// never cleared from the first try to `through` (the press that got
-/// through), every status read in that span saying `needs=ask` and one of
-/// them after the last try in the wall. `Err` names what was not so.
 fn ladder_climbed(
     seen: &Seen,
     t1: i64,
@@ -1308,9 +1166,6 @@ fn ladder_climbed(
             crate::util::one_line(l, 80)
         ));
     }
-    // The status reads from the first try to the press that got through
-    // (a read that changed nothing resolves to the value standing then:
-    // [`super::surfaces::observed`]): NEEDS YOU stood at every one.
     let reads = super::surfaces::observed(&seen.status, &seen.status_reads, first, through);
     if let Some((t, st)) = reads
         .iter()
@@ -1337,8 +1192,6 @@ fn ladder_climbed(
 }
 
 /// NEEDS YOU TAKEN DOWN by the ladder's try that got through at `through`: a
-/// `CLEARED` line, or a status read without `needs=ask`, after it and by the
-/// landing `done`.
 fn ladder_cleared(seen: &Seen, through: i64, done: i64) -> Option<i64> {
     let cleared = seen
         .journal
@@ -1355,37 +1208,9 @@ fn ladder_cleared(seen: &Seen, through: i64, done: i64) -> Option<i64> {
 }
 
 /// How long after the landing a status read may first say NEEDS YOU down
-/// ([`ladder_cleared`]): the lab reads status every few seconds.
 const LADDER_DOWN_AFTER_DONE_MS: i64 = 15_000;
 
-/// W1: A USAGE WALL UNDER LAND — the harness's own, drawn by the stub's
-/// `limit` ([`wall_claim`]) raised at the first point ([`Cover::wall`]): Muse
-/// Code's notice, agy's quota error, Claude Code's session limit (on its
-/// subscriber path), Gemini CLI's usage-limit dialog. Land's act MEETS it (typed
-/// after the raise, before the reset); the wall READ as one (a point after
-/// the act that reads it, [`wall_point`]: a point whose words say the usage
-/// limit, read otherwise, fails); NOTHING TYPED into it (no journal act, no
-/// acting ledger row from the act to the reset, no new harness text in the
-/// stub's dumps of it: [`Cover::window_stub`]), not handed to a person (no
-/// escalation of it: a stall — save THE LADDER'S BADGE, [`ladder_badge`]),
-/// no landing while it stands (no DONE, no `task=landed` before the lab
-/// lifts it, [`Cover::lifted_ms`]), no need raised. After the reset the
-/// harness GOES ON — its act typed and ledgered past the reset, or at Gemini
-/// CLI's usage-limit dialog, which takes no typing, its `Keep trying` pressed
-/// past the reset the dialog names ([`RULE_LIMIT_RETRY`] ledgered
-/// `approved`; one pressed in the wall is an act in it: FAIL), or, on the
-/// dialog a key's per-day quota draws, which names none (`--mode wall-day`),
-/// at its ladder's first due ([`ladder_due`]), which the deadline counts
-/// from where it is the later. Where the program went on by itself ([`Cover::went_on_ms`],
-/// Claude Code's own continuation at the reset, read in the stub's requests),
-/// nothing typed and its answer landing is the harness leaving it be, and an
-/// act of the loop's after it is typed ON TOP of it, a double continue
-/// (`r21amc15b`'s class): FAIL. The program's own retry landing it with no
-/// continuation read shows nothing of the harness: UNOBSERVED. The clean
-/// defense lands the task, quiet after as L5's ([`landing_quiet`]), no task
-/// record invented. Nothing going on, or no landing, within [`WALL_LOST_MS`]
-/// of the reset and `program`'s grace ([`wall_grace_ms`]) is persistence
-/// lost: FAIL.
+/// Judges W1: a usage wall ([`wall_claim`]) encountered and waited out under Land.
 pub(super) fn judge_wall(
     seen: &Seen,
     land: Option<&(i64, String)>,
@@ -1410,9 +1235,6 @@ pub(super) fn judge_wall(
         ));
     }
     let in_wall = |t: i64| t > t1 + AT_DONE_MS && t < reset;
-    // the stub answers again from the lift (F14 of the review of
-    // `b9/forever-gaps`): a landing from there is the program's or the
-    // harness's past the wall, no landing in it
     let lift = seen
         .cover
         .lifted_ms
@@ -1427,18 +1249,11 @@ pub(super) fn judge_wall(
             in_wall(r.ts) && r.acted() && r.decision != "escalated" && !ladder_try(seen, r, t1)
         })
         .collect();
-    // The ladder's tries in the wall (`--mode wall-climb`): Gemini CLI's
-    // dialog that names no reset, kept trying on its ladder while the quota
-    // stood ([`ladder_try`]) — no act typed into it, the climb.
     let tries: Vec<&Row> = seen
         .ledger
         .iter()
         .filter(|r| in_wall(r.ts) && ladder_try(seen, r, t1))
         .collect();
-    // The wall handed to a person while it stood: the loop's escalation of it
-    // (Gemini CLI's usage-limit dialog, which no rule presses) stalls the
-    // session until someone answers, whatever comes after — save the
-    // ladder's badge, raised while the loop goes on trying.
     let escalated = seen
         .ledger
         .iter()
@@ -1519,9 +1334,6 @@ pub(super) fn judge_wall(
             s.new_turns
         ));
     }
-    // The ladder's badge is the session's `needs=ask` while it stands: the
-    // loop's own word, no reply's need (a `NEEDS` line or a needs entry
-    // still is one).
     let ladder = seen
         .ledger
         .iter()
@@ -1571,13 +1383,8 @@ pub(super) fn judge_wall(
         .max(ladder_due(seen, t1, lift).unwrap_or(i64::MIN))
         + WALL_LOST_MS;
     let done = seen.first_after("DONE ", lift);
-    // The program's own continuation past the wall ([`Cover::went_on_ms`]:
-    // Claude Code goes on by itself at the reset).
     let went_on = seen.cover.went_on_ms;
     let first_act = acts.iter().copied().find(|(t, _)| *t >= reset);
-    // Gemini CLI's usage-limit dialog takes no typing: the harness goes on
-    // past it by pressing its `Keep trying` ([`RULE_LIMIT_RETRY`]), a key
-    // ledgered `approved` — the first after the reset, before any act.
     let press = seen
         .ledger
         .iter()
@@ -1602,9 +1409,6 @@ pub(super) fn judge_wall(
                     at(t0, r.ts)
                 ));
             }
-            // AT ITS DUE: the press comes at the `until=` the dialog's wait
-            // named — the reset as the dialog's zone places it, its minute
-            // and the grace — never before it.
             let due = press_due(seen, t1, r.ts);
             if let Some(d) = due.filter(|d| r.ts + LADDER_DUE_SLACK_MS < *d) {
                 return Verdict::Fail(format!(
@@ -1636,10 +1440,6 @@ pub(super) fn judge_wall(
                 ));
             }
             let rule = act_rule(la).unwrap_or("?");
-            // ON TOP OF THE PROGRAM'S OWN CONTINUATION: the program went on
-            // by itself, and the loop's act came after it — a double
-            // continue (`r21amc15b`'s class), into a conversation the
-            // vendor had already carried past the wall.
             if let Some(tv) = went_on.filter(|tv| tv < ta) {
                 return Verdict::Fail(format!(
                     "{said}; TYPED ON TOP of the program's own continuation: it went on at +{} ({} past the reset), and {rule} was typed at +{}, {} after it",
@@ -1661,9 +1461,6 @@ pub(super) fn judge_wall(
                 at(0, ta - reset)
             )
         }
-        // the harness's going on is the scenario: a landing nothing of its
-        // brought shows nothing of it (F14), unless the program's own
-        // continuation was read, which the harness rightly left be
         None if let Some((d, _)) = done => {
             if *d > lost_at {
                 return Verdict::Fail(format!(
@@ -1710,9 +1507,6 @@ pub(super) fn judge_wall(
             at(t0, seen.end_ms)
         ));
     };
-    // THE LADDER (Gemini CLI's dialog that names no reset): every try in
-    // the wall climbed it with NEEDS YOU standing, and the try that got
-    // through took NEEDS YOU down.
     let mut resumed = resumed;
     if ladder && let Some(r) = press {
         if !tries.is_empty() {
@@ -1749,12 +1543,7 @@ pub(super) fn judge_wall(
     )
 }
 
-/// W1 ON THE LADDER'S CLIMB (`--mode wall-climb`): W1's judge
-/// ([`judge_wall`]) over Gemini CLI's per-day dialog whose quota stood past
-/// the ladder's first rung, so a try came in the wall and was answered by the
-/// dialog drawn again ([`ladder_climbed`]). A pass with no try in the wall
-/// (the wall lifted before the first rung: `--mode wall-day`'s) shows nothing
-/// of the climb: UNOBSERVED.
+/// Judges W1 on the ladder's climb (`--mode wall-climb`) via [`judge_wall`].
 pub(super) fn judge_wall_climb(
     seen: &Seen,
     land: Option<&(i64, String)>,
@@ -1776,27 +1565,7 @@ pub(super) fn judge_wall_climb(
     }
 }
 
-/// W2: THE REMEMBERED WALL — W1's wall ([`judge_wall`]: Land's act meets it,
-/// it is read as one, nothing typed into it to its reset, gone on past it with
-/// a typed row, landed, quiet after), and its NOTICE LEFT THE SCREEN while the
-/// wait stood ([`Cover::hidden`]: the harness's own local command — Muse
-/// Code's `/rules`, agy's `/title` ([`hide_of`]) — printed until it scrolled
-/// the notice out of sight before the reset, after the land act). The loop
-/// READ a screen its reader found no wall on: a point journaled that is not
-/// the limit's, after the first command's Enter and before the reset (a
-/// reader may let the notice go before its last row scrolls away — Muse
-/// Code's does — so that point may come at a screen still drawing a row of
-/// it). And what went on past the reset was the
-/// loop's own act decided at a screen without the notice: typed after the
-/// hiding Enter, at the screen seq the lab read without it or later (the
-/// content seq only grows, and nothing draws the notice again), never at a
-/// screen from before the notice left. Any FAIL of W1's judge is W2's; a
-/// notice that never left, left at or after the reset, no wall-less point
-/// read, or a resume not typed from the hidden screen (none typed, the
-/// program's own retry; one typed at the notice's own screen) did not drive
-/// the remembered wall: UNOBSERVED, never a pass. The loop's waits read after the hide are
-/// named (an unread conversation's look, `limit-conversation-unread`, among
-/// them).
+/// Judges W2: a remembered usage wall ([`judge_wall`]) after the wall scrolls off screen.
 pub(super) fn judge_wall_hidden(
     seen: &Seen,
     land: Option<&(i64, String)>,
@@ -1815,7 +1584,6 @@ pub(super) fn judge_wall_hidden(
 }
 
 /// What W2's records say of the hidden notice (the words, each with its time),
-/// and whether they show the remembered wall driven ([`judge_wall_hidden`]).
 fn hidden_facts(
     seen: &Seen,
     land: Option<&(i64, String)>,
@@ -1839,17 +1607,6 @@ fn hidden_facts(
     let on_hidden = |t: i64, l: &str| {
         t > h.enter_ms && h.seq.is_none_or(|hs| seq_of(l).is_some_and(|s| s >= hs))
     };
-    // The point the loop reads once its reader finds no wall on the screen: a
-    // reader may stop reading the notice before the last of its rows has
-    // scrolled away (Muse Code's does; agy's reads none after the first
-    // command's `> /title` row, its last user row), so that point may come at
-    // a screen still drawing a row of it, after the first command and before
-    // the reset. After a dialog's option ([`Hidden::stopped`]: Gemini CLI's
-    // Stop) the screen draws the error that option leaves, a wall its reader
-    // reads (`EVENT limited … [API Error: An unknown error occurred.]`): a
-    // point there is one without the notice when it is no usage-limit point
-    // of the dialog and names none of the notice's words, read at the screen
-    // without it or after.
     let without_notice = |l: &str| {
         if h.stopped {
             l.starts_with("EVENT ")
@@ -1946,22 +1703,7 @@ fn hidden_facts(
     (said, Ok(()))
 }
 
-/// F18 LIVE: A PERSON'S PROMPT ANSWERED AT ONCE — typed as a person types it,
-/// mid-chain (`send|key as=person`: its Enter at [`Seen::asked_ms`]), while
-/// the loop waits out the done check's back-off, and answered at once
-/// ([`ASK_REPLY`]), so no read sees its turn run (no `turn-ran@v1` record
-/// between the Enter and the judgment). Only the submission tells the turn,
-/// and it is the person's own: `LEFT … rule=left-to-person@v1` journaled as
-/// the reply shows (within the take window), `status task=theirs`, and from
-/// the Enter to the watch's end NOTHING TYPED (no journal act, no acting
-/// ledger row, no harness text in the stub's dumps: [`Cover::window_stub`]),
-/// no back-off decided at a point of its own (the turn judged as one of the
-/// conversation), no DONE, no need raised, for at least
-/// [`QUIET_UNDER_OFF_MS`] after the LEFT. Judged only where a person's hand
-/// reached the session ([`Cover::ask_stamp`] a stamp); a read that saw the
-/// turn run makes it no instant turn (UNOBSERVED). Its negative control is
-/// P4P's prompt, typed through the control socket in the same run and judged
-/// a turn of the conversation ([`judge_instant_ask`]).
+/// Judges F18 live: a person's prompt answered immediately mid-chain.
 pub(super) fn judge_person_instant(seen: &Seen, t0: i64) -> Verdict {
     let Some(asked) = seen.asked_ms else {
         return Verdict::Unobserved(match seen.ask_refused_ms {
@@ -2147,26 +1889,12 @@ pub(super) fn judge_person_instant(seen: &Seen, t0: i64) -> Verdict {
 }
 
 /// Whether the lab's resize took ([`Cover::resized`]): `dims` after it
-/// answered the size asked (`OK <rows> <cols> …`).
 fn resize_took(how: &str) -> bool {
     let (cols, rows) = RESIZED;
     how.contains(&format!("dims OK {rows} {cols} "))
 }
 
-/// F1 AND F2 LIVE: A JUDGED TURN'S OPENER RE-WRAPPED INTO SIGHT, NOTHING
-/// SUBMITTED. `same-words`' first reply judged (its back-off decided), then
-/// its tab resized ([`Cover::resized`], [`RESIZED`], `dims` answering the
-/// size): its opener's long token ([`LONG_TOKEN`]) wraps at another width,
-/// and more of the conversation comes into sight. From the resize to the
-/// orchestrator's turn ([`Cover::turn_ms`]), at least 20 s: no point
-/// record (`point@v1`: nothing judged again), no act, every back-off
-/// journaled there the first point's own (its one short turn and its due),
-/// and THAT BACK-OFF TOLD AGAIN AT EVERY POINT READ THERE ([`same_backoff`]
-/// after each `EVENT idle`/`question`, before the next): the window ends
-/// long before its due, so a re-read that decided nothing — no due standing,
-/// nothing ever typed — is caught here or nowhere (the review of
-/// `b9/resid3`: Gemini CLI's re-wrapped frame read as a launch card, decided
-/// `Nothing`, and PASSed).
+/// Judges F1 and F2 live: a judged turn's opener re-wrapped into sight without submission.
 pub(super) fn judge_rewrap(seen: &Seen, t0: i64) -> Verdict {
     let Some((tr, how)) = seen.cover.resized.as_ref() else {
         return Verdict::Unobserved(
@@ -2217,24 +1945,16 @@ pub(super) fn judge_rewrap(seen: &Seen, t0: i64) -> Verdict {
 }
 
 /// What the harness did between a drive of the screen and the end of its
-/// watch ([`not_judged_again`]).
 struct AfterDrive {
     /// The readings journaled there (`EVENT …`).
     reads: usize,
     /// When each point was read there (`EVENT idle`/`question`).
     read_points: Vec<i64>,
     /// What says the judged point was judged again, or its back-off moved
-    /// or dropped.
     bad: Vec<String>,
 }
 
 /// F1'S LAW BETWEEN A DRIVE OF THE SCREEN AND THE END OF ITS WATCH (`(from,
-/// until)`, open at both ends), the first point's back-off `fl` decided
-/// before it: no point record (`point@v1`: nothing judged again), no act,
-/// every back-off journaled there the first point's own (its one short
-/// turn and its due), and THAT BACK-OFF TOLD AGAIN AT EVERY POINT READ THERE
-/// ([`same_backoff`] after each `EVENT idle`/`question`, before the next).
-/// `what` names the drive in what it says (`the resize`, `the scroll`).
 fn not_judged_again(
     seen: &Seen,
     t0: i64,
@@ -2268,8 +1988,6 @@ fn not_judged_again(
                 && (backoff_streak(l) != Some(1) || first_due.is_none() || !same_backoff(l, fl))
         })
         .collect();
-    // Every point read there, and whether the first point's back-off was
-    // told again at it (before the next point read, or the watch's end).
     let read_points: Vec<i64> = seen
         .journal
         .iter()
@@ -2330,24 +2048,7 @@ fn not_judged_again(
     }
 }
 
-/// F1 BY A SCROLL, LIVE: A JUDGED TURN'S OPENER SCROLLED INTO SIGHT FROM THE
-/// HISTORY, NOTHING SUBMITTED. `tall-scroll`'s first reply, taller than the
-/// screen ([`scroll_reply`]), judged (its back-off decided) with its opener
-/// above the screen; then the wheel turned up over its tab a row a notch
-/// until the opener was in sight ([`Cover::scrolled`]). From the FIRST notch
-/// to the end of the watch ([`SCROLL_WATCH_MS`]), F1's law
-/// ([`not_judged_again`]): nothing judged again, nothing typed, the first
-/// point's back-off told again at every point read — the reads during the
-/// notches included, among them the one of the screen the opener first came
-/// into sight on, inside the last notch's wait (judged from the last notch,
-/// a point judged again there went unchecked: the review of `b9/resid4-lab`,
-/// and `r4-f3`'s Gemini CLI turned 11 notches over some 3.6 s). A PASS wants
-/// a point read after the last notch, the opener in sight. UNOBSERVED where the
-/// opener was in sight before the wheel (no history to bring back), where
-/// the agent takes no wheel (the notches scrolled the tab's viewport, which
-/// the harness never reads: it reads the live screen, `text --json`; a turn
-/// judged again after them still FAILs), where the wheel never brought it
-/// into sight, and where the harness read no point on the scrolled screen.
+/// Judges F1 live by scroll: a judged turn's opener scrolled into sight from history without submission.
 pub(super) fn judge_scrolled(seen: &Seen, t0: i64) -> Verdict {
     let Some(sc) = seen.cover.scrolled.as_ref() else {
         return Verdict::Unobserved(
@@ -2372,8 +2073,6 @@ pub(super) fn judge_scrolled(seen: &Seen, t0: i64) -> Verdict {
         ));
     }
     if let Some(vp) = sc.viewport.as_deref() {
-        // the agent took no wheel: whatever the viewport shows, the harness
-        // reads the live screen; anything judged again after it still fails
         let again = seen
             .journal
             .iter()
@@ -2447,15 +2146,7 @@ fn last_rows(rows: &[String], n: usize) -> String {
         .join(" / ")
 }
 
-/// SAME WORDS, ANOTHER OPENER (F1 of the review; T1's submission count): the
-/// orchestrator's turn ([`Cover::turn_ms`], [`SAME_TURN`]) answered with the
-/// very words of the reply before it ([`WORK`]), while the first point's
-/// back-off stands. The new turn is judged as ITS OWN POINT: its reply read
-/// and its back-off decided there, acted on at that due
-/// ([`judged_resumption`]); and that back-off names one short turn more than
-/// the first point's, due after the first point's due — a turn taken for the
-/// one before it keeps that one's streak and due, and is acted on at the old
-/// due.
+/// Judges F1/T1: an orchestrator turn ([`Cover::turns`]) reusing the same opener words.
 pub(super) fn judge_same_words(seen: &Seen, t0: i64) -> Verdict {
     let Some(tt) = seen.cover.turn_ms else {
         return Verdict::Unobserved("the orchestrator's turn was never typed".into());
@@ -2518,19 +2209,7 @@ pub(super) fn judge_same_words(seen: &Seen, t0: i64) -> Verdict {
     }
 }
 
-/// F3 LIVE: A FIRST REPLY THAT ENDS ON A TOOL'S BOX. `tool-end`'s first
-/// prompt is answered with one read-only tool call ([`read_call`]), its
-/// result with no words ([`TOOL_AFTER`]), so the turn ends on the tool's row
-/// and no message of the agent's is drawn. Its agent ran the call (a request
-/// carried the result back: [`Cover::tool_results`], else UNOBSERVED); the
-/// first point after the launch JUDGED THAT TURN — a point record closing one
-/// short turn, its back-off decided before any act (a launch's frame taken
-/// for no turn decides none, and nothing is typed until persistence is
-/// lost: [`lost_after`]) — and Land's act typed at that due, its clean
-/// defense landing the task (`DONE` journaled within [`TOOL_END_LANDS_MS`]
-/// of the act; the stub answers it at once). No other judge reads the
-/// landing on this chain. The screen at the first point is reported
-/// ([`Cover::first_screen`]).
+/// Judges F3 live: a first reply ending on a read-only tool box.
 pub(super) fn judge_tool_end(seen: &Seen, land: Option<&(i64, String)>, t0: i64) -> Verdict {
     let results = seen.cover.tool_results.unwrap_or(0);
     let screen = seen.cover.first_screen.as_ref().map_or_else(
@@ -2645,22 +2324,9 @@ pub(super) fn judge_tool_end(seen: &Seen, land: Option<&(i64, String)>, t0: i64)
 }
 
 /// How long after `tool-end`'s land act its clean defense, answered at once
-/// by the stub, must have landed the task ([`judge_tool_end`]): the chain's
-/// watch runs 30 s past the act ([`finished`]).
 const TOOL_END_LANDS_MS: i64 = 25_000;
 
-/// THE BACK-OFF PAST ITS FOURTH STEP (`--mode ladder`): every reply short,
-/// under the development seam that scales the ladder by `scale`
-/// ([`LADDER_SCALE`]). The journal's steps ([`ladder_steps`]) name one, two,
-/// … [`LADDER_STEPS`] short turns in a row in order, each `until=` the
-/// shipped step scaled ([`ladder_step_ms`]: 2 min doubled to the 60 min cap,
-/// and the cap again) past its decision, within [`STEP_SLACK_MS`]; and AN
-/// ACT AFTER EACH STEP BEFORE THE NEXT — the next step that act's answer
-/// judged — typed at its due (no earlier: [`chain_faults`]; no more than
-/// [`PERSISTENCE_GRACE_MS`] later). A step with no act before the next is a
-/// point judged again with nothing typed (a redraw counted as a short turn),
-/// never a step the ladder climbed. A first step of the shipped 2 min is the
-/// seam not taken.
+/// Judges `--mode ladder`: short-turn back-off past its fourth step.
 pub(super) fn judge_ladder(seen: &Seen, scale: f64, t0: i64) -> Verdict {
     let steps = ladder_steps(seen, t0);
     let shipped_first = ladder_step_ms(1, 1.0);
@@ -2710,7 +2376,6 @@ pub(super) fn judge_ladder(seen: &Seen, scale: f64, t0: i64) -> Verdict {
                 at(0, ta - st.due)
             )),
             Some(_) => {}
-            // the next step decided with nothing typed since this one
             None if steps.get(i + 1).is_some() => bad.push(format!(
                 "NOTHING TYPED after step {n} (+{}, due +{}) before step {} at +{}: a point judged again, no act",
                 at(t0, st.at),
@@ -2725,8 +2390,6 @@ pub(super) fn judge_ladder(seen: &Seen, scale: f64, t0: i64) -> Verdict {
         return Verdict::Fail(format!("{said}: {}", bad.join("; ")));
     }
     if steps.len() < LADDER_STEPS as usize {
-        // nothing typed after the last act: the last step's due, or no
-        // step at all, judges persistence
         let since = acts.last().map_or(t0, |(t, _)| *t);
         return match lost_after(seen, since, t0) {
             Some(lost) => Verdict::Fail(format!("{said}: {lost}")),

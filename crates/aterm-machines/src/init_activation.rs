@@ -19,8 +19,32 @@ use std::time::{Duration, Instant};
 const RECORD: &[u8] = b"aterm init desktop activation pending v1\n";
 const DIRECTORY: &str = "Library/Application Support/aterm/init-activation";
 
+/// The marker of a write to another app's sandbox container
+/// ([`crate::items::defaults::CONTAINED`]: Notification Center's widget list), kept apart
+/// from its family's: only a pass that holds Full Disk Access reaches that container, so
+/// only such a pass begins, discharges or reports it, and a pass without the grant, which
+/// relaunches the family's other readers, cannot clear what Notification Center still owes.
+pub const CONTAINED_MARKER: &str = "notificationcenter";
+
+/// The marker of a write to the Window Manager's widget keys (on the desktop and in Stage
+/// Manager), whose relaunch is the Dock's.
+pub const WIDGETS_MARKER: &str = "desktopwidgets";
+
+/// The marker an older aterm (0.114.0 and before) wrote before every widgets write,
+/// Notification Center's widget list with the Window Manager's keys, and cleared once the
+/// Dock and Notification Center were relaunched. This one writes it no more: a pass that
+/// finds it pending carries what it owes to [`WIDGETS_MARKER`] and [`CONTAINED_MARKER`]
+/// before it writes, so the Dock relaunches for it and Notification Center does too, once,
+/// when a pass holds Full Disk Access.
+pub const LEGACY_WIDGETS_MARKER: &str = "widgets";
+
 fn path(user: &User, family: &str) -> Result<PathBuf, String> {
-    if !Path::new(&user.home).is_absolute() || !matches!(family, "dock" | "widgets" | "desktop") {
+    if !Path::new(&user.home).is_absolute()
+        || !matches!(
+            family,
+            "dock" | "desktop" | WIDGETS_MARKER | LEGACY_WIDGETS_MARKER | CONTAINED_MARKER
+        )
+    {
         return Err("invalid local initialization activation scope".into());
     }
     Ok(Path::new(&user.home)

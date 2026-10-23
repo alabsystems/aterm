@@ -1,78 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `Fx`: THE BRIDGE'S DOORS — the one place its loop reads a clock, parks on
-//! its mailbox, dials the broker, hands a subscription to a reader, talks on
-//! its verb lane and draws a random number, and the one place a deterministic
-//! simulation stands in for all of them (`crate::sim`, test builds).
-//!
-//! The pattern is `aterm-agent`'s `supervise::fx`: every value the loop
-//! uses for its operational clocks and backend dispatch crosses a door, so
-//! a world other than the live one can answer those operations. Constructor
-//! filesystem/metadata work and optional diagnostic I/O remain real. There
-//! the other world is a harness tape; here it is
-//! a seeded simulation of the whole fabric around one REAL bridge — a broker
-//! that may lose exactly what astream's power-loss law lets it lose, an aterm
-//! endpoint, a state dir on a device that can lose power, and a scheduler that
-//! kills the bridge at any of its I/O steps — so an interleaving bug is found
-//! by a seed and replayed by the same seed, instead of one end-to-end scenario
-//! at a time (the last three bridge fixes, 538cd43c45, b6e072f744 and
-//! 62a83beae9, were interleaving bugs).
-//!
-//! **What crosses a door.**
-//! * THE CLOCKS ([`Fx::now`], [`Fx::wall_ms`]): the monotonic clock every
-//!   deadline, back-off, round trip and duty runs on, and the wall clock a
-//!   body's `t=` and an ask's deadline are stamped with. Before this door they
-//!   were read in about seventy places across `bridge.rs` and `bridge_mirror.rs`.
-//! * THE PARK ([`Fx::take`]): the loop's one blocking wait for an input. Live,
-//!   it is [`Mailbox::take`]; simulated, nothing blocks — the virtual clock
-//!   moves by the wait and the scheduler decides what arrived. A park with no
-//!   input to take ([`Fx::sleep`], a dev seam's poll) moves the clock the same
-//!   way.
-//! * THE BUS ([`Fx::dial`], [`Fx::start_reader`]): every broker connection is
-//!   dialled here, and every subscription is handed here to whatever reads it.
-//!   Live, that is [`transport::connect`] and a reader thread per face;
-//!   simulated, an in-memory broker speaking astream's own wire
-//!   (`astream_broker::proto`) through astream's own client, and a pump the
-//!   scheduler drives. The closer that ends a connection from outside its
-//!   reader is the door's too ([`BusCloser`]), and so is a read of an owed
-//!   ack that must not wait ([`Fx::unwaited`]): live astream's own
-//!   non-blocking read, simulated a read that finds a held answer not yet
-//!   there.
-//! * THE VERB LANE ([`Fx::lane`]): every request to aterm already goes through
-//!   one funnel (`Bridge::ctl_request`); the door wraps it, so a simulated
-//!   kill can land on either side of a request the endpoint handled.
-//! * THE STATE DIR'S WRITES ([`Disk`]): every replace, append and unlink a
-//!   [`crate::state::StateDir`] makes. Live, the filesystem calls it always
-//!   made; simulated, the same calls on a scratch directory, journalled by a
-//!   device that knows what a power cut may keep of each (aterm-durable's
-//!   contract: a durable write survives, an atomic-only one may not).
-//! * THE ENTROPY ([`Fx::jitter`], [`Fx::alias_key`]): the reconnect
-//!   back-off's draw, the one random number the loop's own course depends on,
-//!   and the bus mirror's alias key, which its bodies carry.
-//!
-//! The clocks and the parks are held to their door by a census guard
-//! (`aterm-census`'s `bridge-fx`): a shipped `Instant::now`, `SystemTime::now`,
-//! `.elapsed()`, `now_ms()` (the wall clock as the bridge read it before the
-//! door: [`crate::now_ms`]), `unix_millis(`, `thread::sleep(` or
-//! `mailbox.take(` in `bridge.rs`, `bridge_mirror.rs` or `pipeline.rs` is a
-//! finding. A read under another name escapes it: the guard is lexical.
-//!
-//! **Live answers with the corresponding OS operation.** [`Fx::os`] uses:
-//! `Instant::now()`,
-//! [`crate::now_ms`], [`Mailbox::take`], [`transport::connect`], a reader
-//! thread ([`crate::bridge`]'s `spawn_reader`), the CSPRNG draw
-//! ([`transport::Backoff::failed`]'s). No lock, no allocation, no indirection a
-//! release build can see beyond one `match` on a two-armed enum whose second
-//! arm does not exist outside a test build.
-//!
-//! **Where the claim ends.** The door covers the bridge's LOOP: the run loop,
-//! every handler it calls, the bus mirror's half. It does not cover the
-//! presence view, an accelerator that dials and reads on a thread of its own
-//! ([`crate::presence_view`]): the simulation keeps it shut
-//! ([`Fx::presence_view`]), and the bridge then routes a bare address by its
-//! walk, as it does whenever the view is down. Nor does it cover the CLI verbs
-//! (`aterm fabric`, the doctor), which run once and read the real world.
+//! `Fx`: THE BRIDGE'S DOORS — the one place its loop reads a clock, parks on its mailbox, dials the broker, hands a subscription to a reader, talks on its verb lane and draws a random number, and the one place a deterministic simulation stands in for all of them (`crate::sim`, test builds).
 
 use std::io;
 use std::sync::Arc;
@@ -81,8 +10,7 @@ use std::time::{Duration, Instant};
 use crate::mailbox::{Item, Mailbox, Source};
 use crate::transport::{self, Closer, Conn};
 
-/// The bridge's doors. Cheap to clone (an `Arc` inside at most): the bridge
-/// holds one, and its state dir's [`Disk`] comes from it.
+/// The bridge's doors.
 #[derive(Clone, Debug)]
 pub(crate) struct Fx {
     world: World,
@@ -112,9 +40,7 @@ impl Fx {
         }
     }
 
-    /// Whether the simulated world switched `rule` off for this process: one
-    /// of the simulation's NEGATIVE CONTROLS (`crate::sim::world::Mutant`).
-    /// Never in the live world.
+    /// Whether the simulated world switched `rule` off for this process: one of the simulation's NEGATIVE CONTROLS (`crate::sim::world::Mutant`).
     #[cfg(test)]
     pub(crate) fn mutant(&self, rule: crate::sim::world::Mutant) -> bool {
         match &self.world {
@@ -132,8 +58,7 @@ impl Fx {
         }
     }
 
-    /// The wall clock in milliseconds since the Unix epoch: a body's `t=`, an
-    /// ask's absolute deadline ([`crate::now_ms`]).
+    /// The wall clock in milliseconds since the Unix epoch: a body's `t=`, an ask's absolute deadline ([`crate::now_ms`]).
     pub(crate) fn wall_ms(&self) -> u64 {
         match &self.world {
             World::Os => crate::now_ms(),
@@ -142,10 +67,7 @@ impl Fx {
         }
     }
 
-    /// THE PARK: take one input, waiting at most `wait` for it. Live, the
-    /// mailbox's own wait. Simulated, nothing blocks: what is queued is taken,
-    /// and with nothing queued the virtual clock moves by the wait (the
-    /// scheduler's inputs arrive between the loop's passes).
+    /// THE PARK: take one input, waiting at most `wait` for it.
     pub(crate) fn take(&self, mailbox: &Mailbox, wait: Duration) -> Option<Item> {
         match &self.world {
             World::Os => mailbox.take(wait),
@@ -160,12 +82,7 @@ impl Fx {
         }
     }
 
-    /// A PARK WITH NO INPUT TO TAKE: `wait` passes and nothing is read. Live,
-    /// `std::thread::sleep`. Simulated, the virtual clock moves by `wait`. The
-    /// one caller is a dev seam's poll ([`crate::bridge`]'s fault parks, which
-    /// a released build never arms and a simulated world never sets); it goes
-    /// through the door so no real sleep is left in the bridge's files
-    /// (`aterm-census`'s `bridge-fx`).
+    /// A PARK WITH NO INPUT TO TAKE: `wait` passes and nothing is read.
     pub(crate) fn sleep(&self, wait: Duration) {
         match &self.world {
             World::Os => std::thread::sleep(wait),
@@ -174,9 +91,7 @@ impl Fx {
         }
     }
 
-    /// The reconnect back-off's jitter draw ([`transport::Backoff::failed_with`]):
-    /// the OS CSPRNG live, the seed's stream simulated. `None` when it cannot
-    /// be read, and the back-off then waits its whole span.
+    /// The reconnect back-off's jitter draw ([`transport::Backoff::failed_with`]): the OS CSPRNG live, the seed's stream simulated.
     pub(crate) fn jitter(&self) -> Option<u64> {
         match &self.world {
             World::Os => transport::random_u64(),
@@ -185,8 +100,7 @@ impl Fx {
         }
     }
 
-    /// A fresh alias key for the bus mirror's edges ([`crate::mirror::mint_alias_key`]
-    /// live; the seed's draws simulated): the one draw the mirror makes.
+    /// A fresh alias key for the bus mirror's edges ([`crate::mirror::mint_alias_key`] live; the seed's draws simulated): the one draw the mirror makes.
     pub(crate) fn alias_key(&self) -> Option<[u8; 16]> {
         match &self.world {
             World::Os => crate::mirror::mint_alias_key(),
@@ -200,8 +114,7 @@ impl Fx {
         }
     }
 
-    /// ONE BROKER CONNECTION to `endpoint`, under `deadline`, and the closer
-    /// that ends it from another thread ([`transport::connect`] live).
+    /// ONE BROKER CONNECTION to `endpoint`, under `deadline`, and the closer that ends it from another thread ([`transport::connect`] live).
     pub(crate) fn dial(&self, endpoint: &str, deadline: Duration) -> io::Result<(Conn, BusCloser)> {
         match &self.world {
             World::Os => {
@@ -212,14 +125,7 @@ impl Fx {
         }
     }
 
-    /// A READ THAT MUST NOT WAIT, `op` being the read
-    /// ([`crate::pipeline::Link::try_recv`], aterm-0). Live it is `op`: astream's
-    /// client puts its own socket in non-blocking mode for the read and back
-    /// after it. Simulated, the bus is a stream astream cannot reach under
-    /// (`Client::from_stream`), so the process says it is TRYING for the length
-    /// of `op`, and the simulated broker answers "not yet" for an answer it is
-    /// still holding — a batch still in its flush (`crate::sim::bus`'s held
-    /// acks) — where a read that may wait releases it: the wait is the flush.
+    /// A READ THAT MUST NOT WAIT, `op` being the read ([`crate::pipeline::Link::try_recv`], aterm-0).
     pub(crate) fn unwaited<T>(&self, op: impl FnOnce() -> T) -> T {
         match &self.world {
             World::Os => op(),
@@ -228,10 +134,7 @@ impl Fx {
         }
     }
 
-    /// HAND AN OPEN SUBSCRIPTION TO ITS READER: live, a thread that pumps it
-    /// into the mailbox stamped with the face's generation (`spawn_reader`);
-    /// simulated, the scheduler's pump, which reads it when the seed says the
-    /// reader ran. `Err` only when a reader thread could not be spawned.
+    /// HAND AN OPEN SUBSCRIPTION TO ITS READER: live, a thread that pumps it into the mailbox stamped with the face's generation (`spawn_reader`); simulated, the scheduler's pump, which reads it when the seed says the reader ran.
     pub(crate) fn start_reader(
         &self,
         sub: astream_broker::AnySubscription,
@@ -251,10 +154,7 @@ impl Fx {
         }
     }
 
-    /// ONE REQUEST ON THE VERB LANE, `op` being the request itself. Live it is
-    /// `op`. Simulated, the scheduler may kill the process on either side of
-    /// it: before the line is written, or after the endpoint answered and
-    /// before the bridge read on.
+    /// ONE REQUEST ON THE VERB LANE, `op` being the request itself.
     pub(crate) fn lane<T>(&self, op: impl FnOnce() -> T) -> T {
         match &self.world {
             World::Os => op(),
@@ -268,10 +168,7 @@ impl Fx {
         }
     }
 
-    /// Whether the presence view may be opened: always live; never simulated,
-    /// where the view's own dial and reader thread are outside the doors and
-    /// the bridge routes by its walk instead (the module doc's "Where the claim
-    /// ends").
+    /// Whether the presence view may be opened: always live; never simulated, where the view's own dial and reader thread are outside the doors and the bridge routes by its walk instead (the module doc's "Where the claim ends").
     pub(crate) fn presence_view(&self) -> bool {
         match &self.world {
             World::Os => true,
@@ -290,9 +187,7 @@ impl Fx {
     }
 }
 
-/// What ends one broker connection from outside the thread that reads it, and
-/// bounds that thread's reads: astream's [`Closer`] live, the simulated
-/// broker's handle on its connection simulated.
+/// What ends one broker connection from outside the thread that reads it, and bounds that thread's reads: astream's [`Closer`] live, the simulated broker's handle on its connection simulated.
 #[derive(Debug)]
 pub(crate) enum BusCloser {
     /// A duplicate of the live socket ([`Closer`]).
@@ -312,11 +207,8 @@ impl BusCloser {
         }
     }
 
-    /// Bound (or, `None`, lift) how long a read on the connection parks
-    /// ([`Closer::set_read_timeout`]). A simulated read never parks.
-    ///
+    /// Bound (or, `None`, lift) how long a read on the connection parks ([`Closer::set_read_timeout`]).
     /// # Errors
-    ///
     /// The live `setsockopt`'s.
     pub(crate) fn set_read_timeout(&self, d: Option<Duration>) -> io::Result<()> {
         match self {
@@ -329,8 +221,7 @@ impl BusCloser {
         }
     }
 
-    /// The live closer inside, for a test that hands a live connection to code
-    /// that takes astream's own (the presence view's reader).
+    /// The live closer inside, for a test that hands a live connection to code that takes astream's own (the presence view's reader).
     #[cfg(test)]
     pub(crate) fn into_os(self) -> Closer {
         match self {
@@ -341,10 +232,6 @@ impl BusCloser {
 }
 
 /// THE STATE DIR'S DOOR: what a [`crate::state::StateDir`] writes through.
-/// Every replace, append and unlink the dir makes is announced here before
-/// and after it is made ([`Disk::before`], [`Disk::after`]); live that is
-/// nothing at all, simulated it is where a kill may land and what the device
-/// journals for its power cuts (`crate::sim::device`).
 #[derive(Clone, Debug, Default)]
 pub(crate) enum Disk {
     /// The filesystem, as the dir always wrote it.
@@ -355,8 +242,7 @@ pub(crate) enum Disk {
     Sim(Arc<crate::sim::Process>),
 }
 
-/// One write the state dir is about to make or has made, as the device
-/// journals it ([`Disk`]).
+/// One write the state dir is about to make or has made, as the device journals it ([`Disk`]).
 #[derive(Clone, Copy, Debug)]
 #[cfg_attr(
     not(test),
@@ -368,12 +254,6 @@ pub(crate) enum Disk {
 )]
 pub(crate) enum Write<'a> {
     /// `path` atomically replaced by `bytes` (temp + rename) under `mode`.
-    /// `flush` is how it was finished (`aterm_durable`'s two flushes): none;
-    /// [`aterm_durable::Flush::Ordered`], the temp's data flushed and ordered
-    /// ahead of every later write on its device before the rename, the rename
-    /// itself left to a later flush of its directory; or
-    /// [`aterm_durable::Flush::Durable`], the temp flushed before the rename
-    /// and the directory after it, on the media on return.
     Replace {
         path: &'a std::path::Path,
         bytes: &'a [u8],
@@ -387,20 +267,12 @@ pub(crate) enum Write<'a> {
     },
     /// `path` unlinked, never flushed.
     Remove { path: &'a std::path::Path },
-    /// The file at `path` flushed where it is, its bytes as they stand (a
-    /// clean stop's, `StateDir::end_run_clean`): on the media on return
-    /// ([`aterm_durable::Flush::Durable`]) or ahead of every later write on
-    /// its device ([`aterm_durable::Flush::Ordered`]). Its name is its
-    /// directory's flush's, not this one's.
+    /// The file at `path` flushed where it is, its bytes as they stand (a clean stop's, `StateDir::end_run_clean`): on the media on return ([`aterm_durable::Flush::Durable`]) or ahead of every later write on its device ([`aterm_durable::Flush::Ordered`]).
     Flush {
         path: &'a std::path::Path,
         flush: aterm_durable::Flush,
     },
-    /// The directory `path` flushed: every entry change in it (a rename, an
-    /// unlink) is on the media — on return ([`aterm_durable::Flush::Durable`],
-    /// with everything flushed before it on the device), or ahead of every
-    /// later write on the device ([`aterm_durable::Flush::Ordered`]) — and no
-    /// file's unflushed data with it.
+    /// The directory `path` flushed: every entry change in it (a rename, an unlink) is on the media — on return ([`aterm_durable::Flush::Durable`], with everything flushed before it on the device), or ahead of every later write on the device ([`aterm_durable::Flush::Ordered`]) — and no file's unflushed data with it.
     SyncDir {
         path: &'a std::path::Path,
         flush: aterm_durable::Flush,
@@ -408,16 +280,9 @@ pub(crate) enum Write<'a> {
 }
 
 impl Disk {
-    /// About to make `w`. Live, `Ok`. Simulated: a dead process's write is
-    /// refused (it made none), a kill may land here, before the write, and
-    /// the device may fail it with nothing made (`crate::sim::device`'s write
-    /// errors: `EIO` or `ENOSPC` on the write, the rename, the flush or the
-    /// unlink).
-    ///
+    /// About to make `w`.
     /// # Errors
-    ///
-    /// The simulated refusal of a write by a process that is gone, or a
-    /// simulated write error.
+    /// The simulated refusal of a write by a process that is gone, or a simulated write error.
     pub(crate) fn before(&self, w: Write<'_>) -> io::Result<()> {
         match self {
             Disk::Os => {
@@ -429,15 +294,8 @@ impl Disk {
         }
     }
 
-    /// `w` was made, and returned `Ok`. Live, `Ok`: nothing. Simulated, the
-    /// device journals it, and a kill may land here, after the write — or the
-    /// device says the write's LAST STEP failed after its effect was made
-    /// (`crate::sim::device`'s write errors: a durable replace whose rename
-    /// was made and whose directory flush failed, an append that wrote part
-    /// of its line), and the dir returns that error as the real call would.
-    ///
+    /// `w` was made, and returned `Ok`.
     /// # Errors
-    ///
     /// The simulated failure of a write's last step, after its effect.
     pub(crate) fn after(&self, w: Write<'_>) -> io::Result<()> {
         match self {

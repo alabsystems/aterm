@@ -1,106 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A TAPE'S HEADER ([`Header`]): what a supervisor loop was given before it
-//! ran, written once ahead of everything it then observed, and read back
-//! into the same [`SessionSetup`], [`SuperviseOpts`] and policy a replay
-//! builds its loop from ([`super::super::run::Session::from_setup`]).
-//!
-//! The text is one `atape <format>` line, then `key=value` lines in sections
-//! (`[roots]`, `[setup]`, `[env]`, `[opts]`, `[policy]`), the run's own
-//! facts (`tape`, `build`, `os`, `entry`) ahead of the first. A key alone on
-//! its line, with no `=`, is a value the run did not have (`ledger` with no
-//! ledger); `key=` is an empty one. Each value is one line: a backslash, a
-//! newline, a carriage return, a tab and every other control character are
-//! escaped (`\\`, `\n`, `\r`, `\t`, `\xHH`), and so is each byte of a path
-//! that is not UTF-8, so a value comes back byte for byte. A duration is
-//! exact to the nanosecond in the largest unit that holds it (`20s`,
-//! `250ms`, `max` for a budget that never runs out).
-//!
-//! THE POLICY is written as the owner's own keys
-//! ([`SupervisorConfig::policy_texts`]: every `[harness]` key's text, each
-//! agent's switch, each rule a retired key withholds, and a session's own
-//! word) and rebuilt through [`SupervisorConfig::set`] — the reader of the
-//! owner's file — never through a second encoding of the fields that could
-//! drift from it. `exact` says whether that rebuild gave back the very policy
-//! the run had, checked as the header was captured (a policy no file can
-//! spell, as a test builds one, says `false`). A header that says `true` is
-//! rebuilt strictly, a value the reader refuses there being damage; one that
-//! says `false` is rebuilt to its nearest — a value the reader refuses is
-//! read as the owner's file reads it — and the decode names each such value
-//! and the inexactness itself in [`Header::supplied`], so a replay says it
-//! ran a policy the run never had instead of refusing the tape whole over
-//! one such value. (A value the reader takes but reads differently — a
-//! trust root with a comma, split in two — was always read, under its mark.)
-//!
-//! THE ROOTS are the directories the run's own files live in — the
-//! ledger's, the journal's, the standing rules' and the state root — and
-//! the home directory, which names the values under it that a probe asks
-//! about ([`Roots`]; an older build's header may name a `notes` root too).
-//! Every path the loop opens is written under the most specific one,
-//! `@ledger/s-1.jsonl`, so a replay can move every root to a directory that
-//! does not exist ([`Header::decode_remapped`]) and the same paths still
-//! come out under them: whatever the replay would open that no record
-//! answers then fails. A file the run was given by a RELATIVE path
-//! (`--journal run.jsonl`) is one the loop opens from its own directory, so
-//! the header names it from there ([`Header::capture`]): the same file, by a
-//! path a root can hold — never written relative, where a replay started in
-//! the recording's directory would open the live one. A remapped decode
-//! refuses any opened file path that names no root, or leaves its root
-//! (`..`, an absolute rest): a hand-made or damaged header cannot point a
-//! replay back at the live ledger or journal. This is lexical relocation; a
-//! replay must still own its base and handle filesystem effects.
-//!
-//! THE APPROVAL POLICY'S HOME AND `$TMPDIR`
-//! ([`super::super::run::ApprovalEnv`]) are written as they are, and a remap
-//! leaves them so. The policy reads the screen with them: a box's `~/…`
-//! resolves against the home, the owner's `~/` trust roots and the secret
-//! rules are built under it, and `$TMPDIR` is a scratch root the rm rule may
-//! clear — each compared with the paths the screen draws, which name the
-//! recorded run's directories. Moved under a replay's base, a `~/proj` trust
-//! root would no longer hold the `/Users//a/proj/x` a Read box drew, and the
-//! replay would judge the box another way than the run did.
-//!
-//! The policy DOES look at the disk under them — where a Read's links lead,
-//! whether a folder on its way holds a hidden twin, where an `rm` operand
-//! leads — but only through its probe (`policy::probe`), and a replay's
-//! probe answers every look from the tape: it has no live look to make. Each
-//! look is asked by its path as the recorded run's roots write it
-//! (`@home/proj/x`: a replay writes a value under the recorded roots,
-//! `ReplayCore::path`), so it is asked as the run asked it. The `home` root
-//! is therefore a name for values, never a place a replay opens: remapped,
-//! it holds nothing.
-//!
-//! OLDER AND NEWER TAPES. Keys are added every week (a `[harness]` key, a
-//! supervisable agent, a setup knob), and a later build must still replay a
-//! run an earlier one recorded, while an earlier build must refuse a tape
-//! it cannot represent (a replay under a setup this build cannot spell would
-//! explain a run that never happened). So decoding is strict about what it
-//! cannot read and open about what it was not told:
-//! * a key this build does not have, one said twice, a value that does not
-//!   read, or a newer format is refused by name — an older build refusing a
-//!   newer tape;
-//! * a key this build has that the tape does not name is one the
-//!   recording's build did not have yet. A policy key or an agent's switch
-//!   keeps its full-power default, as an owner's file written before it is
-//!   read ([`SupervisorConfig::rebuild`]); a policy key retired since is read
-//!   as the owner's file reads it; a setup knob that arrived after the
-//!   format did takes this build's shipped value (`Reader::or_shipped`),
-//!   as every constant no key holds is this build's on a replay. Each is
-//!   named in [`Header::supplied`], so a replay says what this build chose
-//!   and the run never had;
-//! * every other key of the format is required: its absence is a damaged
-//!   header, and the `exact` line, always last, is what a torn one lacks.
-//!
-//! The format number therefore changes only with the text's grammar — a
-//! line an older reader would misread — never for a key added or retired;
-//! a setup field removed keeps its key taken (and dropped) by the reader.
-//!
-//! What a header never holds: the worker's environment (a stand-in for it is
-//! written as its kind, `env.worker=fixed`, and comes back as one that says
-//! it was never taped), the host behind [`SuperviseOpts::idle_host`] or the
-//! hand-over flag's value (each written as its presence), and the clock — a
-//! tape's records answer every read of it.
+//! A TAPE'S HEADER ([`Header`]).
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -110,18 +11,13 @@ use std::time::Duration;
 use super::super::config::{PolicyTexts, SupervisorConfig};
 use super::super::run::{SessionSetup, SuperviseOpts};
 
-/// The header's format, the `atape <n>` of its first line. A build refuses a
-/// tape whose format it does not read. It names the text's grammar, not its
-/// keys: a key added or retired is no new format ([module docs](self)).
+/// The header's format, the `atape <n>` of its first line.
 pub const FORMAT: u32 = 1;
 
 /// The first line's word.
 const MAGIC: &str = "atape";
 
-/// Which loop a tape recorded: the window's own hosted loop
-/// ([`super::super::run::Session::run_hosted`]), or the engine tests' `watch`
-/// or `supervise` seams — an older build's `aterm drive watch|supervise`,
-/// whose tapes still read.
+/// Which loop a tape recorded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Entry {
     Watch,
@@ -148,39 +44,23 @@ impl Entry {
 }
 
 /// The roots a header can name, in the order a tie between two that are the
-/// same directory goes to: the first named keeps it.
 const ROOT_IDS: [&str; 6] = ["ledger", "journal", "notes", "rules", "state", "home"];
 
-/// No roots: a path written as it is — a root's own directory, and the
-/// approval policy's home and `$TMPDIR`, values it reads the screen with,
-/// which a remap leaves as recorded; the policy looks at the disk under them
-/// only through its probe, which a replay answers from the tape
-/// ([module docs](self)).
+/// No roots: a path written as it is.
 pub(crate) const VERBATIM: Roots = Roots(Vec::new());
 
-/// THE RUN'S ROOTS: each directory its own files live in, by a fixed name
-/// ([`ROOT_IDS`]). A path under one is written `@<name>/<rest>` — under the
-/// most specific, so the ledger's `<state>/drive` wins over the state root
-/// that holds it — and any other as it is (one that itself starts with `@`
-/// with a second `@` before it). Only absolute directories are roots; two
-/// that are the same directory are one, under the first name.
+/// THE RUN'S ROOTS: each directory its own files live in, by a fixed name ([`ROOT_IDS`]).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Roots(Vec<(&'static str, PathBuf)>);
 
 impl Roots {
-    /// The roots of a run under this setup and these options: the
-    /// directories of its ledger, journal and standing rules,
-    /// then `state` (the state root the caller names: the process's own,
-    /// `aterm_types::dirs::state_dir`, for a live run) and the approval
-    /// policy's home.
+    /// The roots of a run under this setup and these options.
     #[must_use]
     pub fn capture(state: Option<&Path>, setup: &SessionSetup, opts: &SuperviseOpts) -> Self {
         let dir_of = |file: Option<&Path>| file.and_then(Path::parent).map(Path::to_path_buf);
         let found = [
             dir_of(setup.ledger_path().or(opts.ledger.as_deref())),
             dir_of(opts.journal.as_deref()),
-            // The notes file went with `aterm drive watch --notes`; its root's
-            // name stays taken, so an older header reads.
             None,
             dir_of(opts.policy.rules_file.as_deref()),
             state.map(Path::to_path_buf),
@@ -203,21 +83,7 @@ impl Roots {
         Self(dirs)
     }
 
-    /// The same roots moved under `base`, each to its RECORDED PATH beneath
-    /// it (`/st/drive` to `<base>/st/drive`): what a replay resolves the
-    /// header's paths against, so nothing it opens outside a record is the
-    /// recorded run's own file.
-    ///
-    /// WHY THE WHOLE PATH, NOT THE ROOT'S NAME: the loop reasons about where
-    /// its files sit — the ledger's directory is named `drive`, its parent is
-    /// the state root the earlier tabs' ledgers are found under
-    /// (`harness::upgrade_drive::lefts_beside_in`) — so a remap that renamed
-    /// the ledger's directory to `<base>/ledger` sent a replay down another
-    /// path than the recorded run took (the live test's first replay diverged
-    /// there). Under the recorded path every name and every nesting of one
-    /// root in another is kept, and the paths still encode as recorded.
-    /// Windows prefix kinds and values get separate namespaces below the
-    /// base, so distinct volumes or shares cannot alias after the move.
+    /// The same roots moved under `base`, each to its RECORDED PATH beneath it (`/st/drive` to `<base>/st/drive`).
     #[must_use]
     pub fn remapped(&self, base: &Path) -> Self {
         Self(
@@ -278,9 +144,7 @@ impl Roots {
     /// What [`Self::encode`] wrote, as a path under these roots.
     ///
     /// # Errors
-    ///
-    /// A root this header does not name, or (off unix) a path that is not
-    /// UTF-8.
+    /// A root this header does not name, or (off unix) a path that is not UTF-8.
     pub fn decode(&self, raw: &[u8]) -> Result<PathBuf, String> {
         if let Some(literal) = raw.strip_prefix(b"@@") {
             return path_of([b"@".as_slice(), literal].concat());
@@ -305,7 +169,6 @@ impl Roots {
     }
 
     /// A replay's file path must name one of its remapped roots. The ordinary
-    /// byte codec above deliberately accepts verbatim values; this boundary does not.
     fn decode_file(&self, raw: &[u8]) -> Result<PathBuf, String> {
         if !raw.starts_with(b"@") || raw.starts_with(b"@@") {
             return Err("a remapped file path must name a root".to_string());
@@ -326,8 +189,6 @@ impl Roots {
 }
 
 /// Prefix-free Windows namespaces, followed by the recorded normal path.
-/// Encoding each prefix field in bounded ASCII components avoids adopting a
-/// server/share/device name as a path component or losing its exact bytes.
 #[cfg(windows)]
 fn windows_root_namespace(dir: &Path) -> PathBuf {
     use std::path::{Component, Prefix};
@@ -364,13 +225,6 @@ fn windows_root_namespace(dir: &Path) -> PathBuf {
 }
 
 /// The path the loop opens for a file it was given as `path`: an absolute
-/// one as it is; a relative one (`--journal run.jsonl`, a `rules_file` of
-/// `standing.md`) from this process's directory, which every open of it
-/// resolves against and which the loop never changes — the same file, named
-/// so a root can hold it ([`Header::capture`]). Lexical, as the open is:
-/// nothing is looked up, so a file not yet made still has its name. One this
-/// process cannot name (its directory is gone) stays as given, a path under
-/// no root, which a remapped decode refuses.
 fn opened(path: &Path) -> PathBuf {
     if path.is_absolute() {
         return path.to_path_buf();
@@ -384,7 +238,6 @@ fn os_bytes(s: &std::ffi::OsStr) -> Vec<u8> {
 }
 
 /// Off unix a path is written as its text, a character it cannot spell
-/// replaced: the supervisor runs on unix hosts.
 #[cfg(not(unix))]
 fn os_bytes(s: &std::ffi::OsStr) -> Vec<u8> {
     s.to_string_lossy().into_owned().into_bytes()
@@ -460,7 +313,6 @@ pub(crate) fn unescape(text: &str) -> Result<Vec<u8>, String> {
 }
 
 /// A duration as a header writes it: exact, in the largest unit that holds
-/// it, and `max` for [`Duration::MAX`] (a budget that never runs out).
 fn duration_text(d: Duration) -> String {
     if d == Duration::MAX {
         return "max".to_string();
@@ -496,8 +348,7 @@ fn parse_duration(text: &str) -> Option<Duration> {
     Some(Duration::new(secs, nanos))
 }
 
-/// The header's text as it is written, section by section
-/// ([module docs](self)).
+/// The header's text as it is written, section by section ([module docs](self)).
 #[derive(Debug, Default)]
 pub(crate) struct Writer {
     out: String,
@@ -577,36 +428,20 @@ struct Line {
     taken: bool,
 }
 
-/// A header's lines, taken one key at a time from the section last named
-/// ([`Self::section`]); what is left untaken at the end is a key this build
-/// does not have ([`Self::finish`]).
+/// A header's lines, taken one key at a time from the section last named ([`Self::section`]).
 #[derive(Debug)]
 pub(crate) struct Reader {
     lines: Vec<Line>,
     /// Each line's place in [`Self::lines`], by its section and key: how a
-    /// key is found ([`Self::find`]) and a key said twice is caught.
-    ///
-    /// WHY AN INDEX: a header is read from tapes that come from elsewhere
-    /// (the corpus, an incident tape someone shared), whose header frame may
-    /// hold up to `frame::FRAME_RAW_MAX` bytes — millions of lines. Checked
-    /// against every earlier line, as each key once was, a damaged or hostile
-    /// header of half a million distinct keys cost ~10^11 comparisons before
-    /// its first unknown key was refused: `aterm drive replay`, the one verb
-    /// that decodes a header (`tape cat|show|stats` keep its text as it is),
-    /// hung instead of refusing it. Indexed, reading a header is linear in
-    /// its lines (times a logarithm), so a header is refused as fast as it
-    /// can be read.
     index: BTreeMap<String, BTreeMap<String, usize>>,
     section: String,
     remapped_io: bool,
     /// Each `[section] key` the header did not name that this build
-    /// supplied ([`Self::or_shipped`]).
     supplied: Vec<String>,
 }
 
 impl Reader {
     /// The lines after the `atape` line, each `[section]`, `key=value` or
-    /// `key`; a key said twice in one section is refused.
     fn parse(body: &str) -> Result<Self, String> {
         let mut lines: Vec<Line> = Vec::new();
         let mut index: BTreeMap<String, BTreeMap<String, usize>> = BTreeMap::new();
@@ -657,13 +492,7 @@ impl Reader {
         self.index.get(&self.section)?.get(key).copied()
     }
 
-    /// `key` read by `read` where the section names it. Where it does not,
-    /// the tape is from a build before the key — one that ran with the value
-    /// this field had no knob for — and `shipped`, this build's own value, is
-    /// what a replay runs with, as it does every constant no key holds; the
-    /// key is named in [`Header::supplied`]. Only a key that arrived after
-    /// the format did is read this way: every other is required
-    /// ([module docs](self)).
+    /// `key` read by `read` where the section names it.
     pub(crate) fn or_shipped<T>(
         &mut self,
         key: &str,
@@ -678,8 +507,7 @@ impl Reader {
         }
     }
 
-    /// A retired duration, if present: validate its old wire type and consume
-    /// it, without supplying a value or reviving a removed setup field.
+    /// A retired duration, if present.
     pub(crate) fn retired_duration(&mut self, key: &str) -> Result<(), String> {
         if self.find(key).is_some() {
             let _ = self.duration(key)?;
@@ -687,8 +515,7 @@ impl Reader {
         Ok(())
     }
 
-    /// A retired text (a value, an empty one or none), if present: validate
-    /// its old wire type and consume it, as [`Self::retired_duration`] does.
+    /// A retired text (a value, an empty one or none), if present.
     pub(crate) fn retired_text(&mut self, key: &str) -> Result<(), String> {
         if self.find(key).is_some() {
             let _ = self.opt_text(key)?;
@@ -696,8 +523,7 @@ impl Reader {
         Ok(())
     }
 
-    /// A retired switch or number, if present, read by its old type `T`, as
-    /// [`Self::retired_duration`] does.
+    /// A retired switch or number, if present, read by its old type `T`, as [`Self::retired_duration`] does.
     pub(crate) fn retired_parsed<T: std::str::FromStr>(&mut self, key: &str) -> Result<(), String> {
         if self.find(key).is_some() {
             let _ = self.parsed::<T>(key)?;
@@ -793,7 +619,6 @@ impl Reader {
     }
 
     /// Files the loop opens use the strict boundary only for a replay remap.
-    /// Approval environment values continue through `opt_path` above unchanged.
     fn io_path(&self, raw: &[u8], roots: &Roots) -> Result<PathBuf, String> {
         if self.remapped_io {
             roots.decode_file(raw)
@@ -819,7 +644,6 @@ impl Reader {
     }
 
     /// Every key of the section that starts `prefix` and is not yet taken,
-    /// taken, in order: `(rest of the key, value, line)`.
     fn prefixed(&mut self, prefix: &str) -> Vec<(String, Option<String>, usize)> {
         let section = &self.section;
         self.lines
@@ -863,48 +687,23 @@ pub struct Header {
     /// The OS and architecture it ran on.
     pub os: String,
     pub entry: Entry,
-    /// The roots its paths are written under — on a decode, the ones they
-    /// were resolved against (remapped ones, for [`Self::decode_remapped`]).
+    /// The roots its paths are written under.
     pub roots: Roots,
     pub setup: SessionSetup,
-    /// The options, [`SuperviseOpts::idle_host`] always `None`: whether the
-    /// run had one is [`Self::idle_host`].
+    /// The options, [`SuperviseOpts::idle_host`] always `None`: whether the run had one is [`Self::idle_host`].
     pub opts: SuperviseOpts,
     /// The run had a host behind [`SuperviseOpts::idle_host`].
     pub idle_host: bool,
-    /// THE HOST'S DOORS THE RECORDING BUILD HAD (`[opts] host_doors`, every
-    /// method of its `IdleHost`): a replay answers a door outside them that
-    /// has an answer for it (`TapeValue::absent`, the occupancy reading) as
-    /// that build's loop, which never asked there, would have been answered,
-    /// without taking a record, and diverges at a door inside them that the
-    /// tape does not hold — a newer build's tape that never asked never
-    /// replays a default silently (the occupancy red-team's F8). `None`: a
-    /// tape from before headers named them, which named none.
+    /// THE HOST'S DOORS THE RECORDING BUILD HAD (`[opts] host_doors`, every method of its `IdleHost`).
     pub host_doors: Option<Vec<String>>,
-    /// The policy's rebuild gave back the very policy the run had
-    /// ([module docs](self)).
+    /// The policy's rebuild gave back the very policy the run had ([module docs](self)).
     pub policy_exact: bool,
-    /// What this build supplied where the header did not give it the run's
-    /// own: for a tape from a build before a key ([module docs](self)), each
-    /// `[section] key` the header does not say, read at this build's value,
-    /// and each policy key retired since with the note its reading gave; for
-    /// a policy the header marked inexact, each value it said that the
-    /// owner's reader refused, with the note and the value read in its
-    /// place, and the inexactness itself (the replay runs the nearest
-    /// policy). Empty for a header this build captured from a policy its
-    /// texts give back; never written.
+    /// What this build supplied where the header did not give it the run's own.
     pub supplied: Vec<String>,
 }
 
 impl Header {
-    /// The header of a run about to start: the tape's id, which loop, the
-    /// state root ([`Roots::capture`]) and the run's setup and options, the
-    /// policy's rebuild checked once, here.
-    ///
-    /// Each file the loop opens — the ledger, the journal, the standing
-    /// rules — is held by the path it opens (`opened`): one given
-    /// relative is named from this process's directory, the one the loop
-    /// opens it from, so it has a root a replay moves.
+    /// The header of a run about to start.
     #[must_use]
     pub fn capture(
         tape: impl Into<String>,
@@ -965,7 +764,6 @@ impl Header {
             idle_host,
             host_doors,
             policy_exact,
-            // What a decode found missing: this build writes every key.
             supplied: _,
         } = self;
         let mut w = Writer::default();
@@ -996,13 +794,9 @@ impl Header {
         w.shown("context_warn", context_warn);
         w.opt_path("journal", journal.as_deref(), roots);
         w.opt_path("ledger", ledger.as_deref(), roots);
-        // The directory a done's result is written under: a value the
-        // result's round trip names (`doors::TASK_RESULT`), never opened by a
-        // replay.
         w.opt_path("tasks", tasks.as_deref(), roots);
         w.shown("yield_when_held", yield_when_held);
         w.shown("idle_host", idle_host);
-        // One space between each; none named (a tape from before) writes none.
         if let Some(doors) = host_doors {
             w.text("host_doors", &doors.join(" "));
         }
@@ -1014,7 +808,6 @@ impl Header {
         } = policy.policy_texts();
         for (key, value) in &keys {
             // The standing rules are a file the loop reads: under a root,
-            // as every path it opens.
             if key == RULES_FILE && !value.is_empty() {
                 w.path(key, Path::new(value), roots);
             } else {
@@ -1034,21 +827,15 @@ impl Header {
     /// A header's text, read back ([module docs](self)).
     ///
     /// # Errors
-    ///
-    /// Not a header, a format this build does not read, or a key missing,
-    /// unknown, said twice or unreadable — each named with its line.
+    /// Not a header, a format this build does not read, or a key missing, unknown, said twice or unreadable — each named with its line.
     pub fn decode(text: &str) -> Result<Self, String> {
         Self::decode_under(text, None)
     }
 
-    /// [`Self::decode`] with every root moved under `base`
-    /// ([`Roots::remapped`]): the header a replay builds its loop from.
+    /// [`Self::decode`] with every root moved under `base` ([`Roots::remapped`]): the header a replay builds its loop from.
     ///
     /// # Errors
-    ///
-    /// As [`Self::decode`], plus any opened file path that names no root or
-    /// escapes one lexically. Approval-environment values stay verbatim.
-    /// This does not check filesystem symlinks: the replay must own its base.
+    /// As [`Self::decode`], plus any opened file path that names no root or escapes one lexically.
     pub fn decode_remapped(text: &str, base: &Path) -> Result<Self, String> {
         Self::decode_under(text, Some(base))
     }
@@ -1097,9 +884,6 @@ impl Header {
         r.section("opts");
         let max = r.duration("max")?;
         let python_allow = r.texts("python_allow")?;
-        // Retired with `aterm drive watch --notes|--report|--mail`: an older
-        // build's header reads, its values dropped (a recording refused
-        // `--mail`, so no tape has the lane's keys on).
         r.retired_text("notes")?;
         r.retired_parsed::<bool>("report")?;
         r.retired_text("mail")?;
@@ -1109,11 +893,9 @@ impl Header {
         let context_warn = r.parsed("context_warn")?;
         let journal = r.opt_io_path("journal", &roots)?;
         let ledger = r.opt_io_path("ledger", &roots)?;
-        // Arrived after the format did: a tape from before wrote no result.
         let tasks = r.or_shipped("tasks", None, |r, key| r.opt_path(key, &roots))?;
         let yield_when_held = r.parsed("yield_when_held")?;
         let idle_host = r.parsed("idle_host")?;
-        // Arrived after the format did: a tape from before named no doors.
         let host_doors = r.or_shipped("host_doors", None, |r, key| {
             Ok(Some(
                 r.text(key)?
@@ -1123,15 +905,6 @@ impl Header {
             ))
         })?;
         r.section("policy");
-        // The verdict first: always written (`exact` last of all, what a torn
-        // header lacks); an older build's `session_questions` beside it, a
-        // switch no key sets any more, read and dropped. Then the withheld
-        // rules by their prefix, and every line left is one of the policy's
-        // texts — a `[harness]` key, or an agent's `<agent>.<key>` — in the
-        // order written: which keys there are is the recording build's, and
-        // the rebuild reads them as the owner's file is read, a key this build
-        // has and they lack at its default and one it lacks refused
-        // ([`SupervisorConfig::rebuild`]).
         r.retired_parsed::<bool>("session_questions")?;
         let policy_exact = r.parsed("exact")?;
         let mut withheld = Vec::new();
@@ -1146,8 +919,6 @@ impl Header {
         for (key, value, at) in r.prefixed("") {
             let raw = r.prefixed_value(&key, value.as_deref(), at)?;
             let value = if key == RULES_FILE && !raw.is_empty() {
-                // The standing rules are a file the loop reads: under a root,
-                // as every path it opens.
                 r.io_path(&raw, &roots)
                     .map_err(|e| r.bad(at, &key, &e))?
                     .to_str()
@@ -1163,14 +934,6 @@ impl Header {
             }
         }
         r.finish()?;
-        // A policy the header says rebuilds exactly is read strictly: a value
-        // the owner's reader refuses there is damage. One it marked inexact
-        // (`exact=false`, a policy no file spells, as a test builds one) is
-        // read to its nearest, each value the reader refused named
-        // ([`SupervisorConfig::rebuild_nearest`]). Read strictly, such a
-        // header was refused whole when one of its values was one `set`
-        // refuses (an `autocompact_offer` off the ladder); one whose values
-        // `set` only reads differently (a comma in a trust root) always read.
         let texts = PolicyTexts {
             keys,
             agents,
@@ -1193,7 +956,6 @@ impl Header {
         );
         if !policy_exact {
             // Said, so a replay's report never passes the rebuild off as the
-            // run's own policy (`Report::render` lists what was supplied).
             supplied.push(format!("[policy] {INEXACT}"));
         }
         Ok(Self {
@@ -1222,10 +984,7 @@ impl Header {
     }
 }
 
-/// The seed of the worker's digest on the tape whose id is `tape`
-/// (`WorkerEnv::digest`): an xxh64 of the id, so the same worker reads as
-/// another digest on another tape. The recorder, the header and a replay
-/// each seed with it, so a replay names the worker as the recording did.
+/// The seed of the worker's digest on the tape whose id is `tape` (`WorkerEnv::digest`).
 #[must_use]
 pub(crate) fn digest_seed(tape: &str) -> u64 {
     aterm_zstd::xxh64::xxh64(0, tape.as_bytes())
@@ -1238,7 +997,6 @@ const RULES_FILE: &str = "rules_file";
 const WITHHELD: &str = "withheld.";
 
 /// What [`Header::supplied`] says of a policy its header marked inexact
-/// (`exact=false`): the replay runs this build's nearest rebuild of it.
 const INEXACT: &str = "exact=false: the run's policy is one no owner's file spells; \
                        the replay runs the nearest policy its texts rebuild";
 

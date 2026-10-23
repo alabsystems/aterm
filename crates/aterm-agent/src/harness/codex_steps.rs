@@ -1,105 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE CODEX STEP FOLD: turns, tool calls, turn ends and the usage wall from
-//! a Codex rollout, for the session log, with no text kept.
-//! It folds into the Claude step fold's own types
-//! ([`Step`], [`StepEvent`], [`StepBatch`]), so the log takes a Codex
-//! rollout's steps as it takes a transcript's. One reader feeds it: 5G-3's
-//! rollout tap ([`super::codex_tap`]), which binds only a codex-alab
-//! session's own thread on a build [`CODEX_MEASURED_BUILDS`] names, and
-//! never a vendor Codex.
-//!
-//! WHAT IT READS is what the lab's Codex 0.163.0 rollouts show (the 5G lab
-//! run, 2026-10-19: a plain turn, a tool call, an approval, a question, Esc,
-//! a usage wall, a compaction and a subagent against the lab's stub),
-//! committed reduced as `testdata/steps/codex-0.163.0.jsonl` and its
-//! `-subagent` leg, and every key it reads is a literal of `aterm-phase`'s
-//! `ROLLOUT_KEYS`, spelled from there ([`anchor_text`]) so the drift canary
-//! that greps the store's Codex build for them guards this fold too:
-//! * A TURN OPENS AT ITS `turn_context`, the one turn-open key, once per
-//!   turn id (the opened ids are remembered, [`TURN_IDS_MAX`] of them): a
-//!   `turn_context` naming a turn already opened (Codex writes one again for
-//!   a running turn) opens nothing. `task_started` opens nothing: every turn
-//!   the lab ran wrote both, but a compaction turn's `turn_context` comes
-//!   after its compaction (measured), and the turn id and model are the
-//!   `turn_context`'s. The model and effort are said ([`StepEvent::Model`])
-//!   when they move, the build from the thread's own `session_meta` (the
-//!   writer's, where the reader knows it: [`CodexStepFold::set_writer`]).
-//! * A turn ENDS at the `task_complete` naming the open turn
-//!   ([`StepEvent::TurnEnd`], its `duration_ms`), on the usage wall when its
-//!   error's closed word is `usage_limit_exceeded` ([`StepEvent::EndWall`],
-//!   [`WallKind::UsageSession`]: Codex names no window), and is interrupted
-//!   at the `turn_aborted` naming it ([`StepEvent::Interrupt`]). A turn's
-//!   tokens are the `last_token_usage` of each `token_count` whose running
-//!   total grew since the last turn ended or was interrupted (a compaction
-//!   turn's count comes before its `turn_context`, measured), in OpenAI's
-//!   classes: input holds cached input, output holds reasoning.
-//! * A CALL is a `function_call` or `custom_tool_call` item
-//!   ([`StepEvent::ToolUse`]: its `call_id`, its bare `name`), its result the
-//!   item's `_output` ([`StepEvent::ToolResult`], never failed: the output's
-//!   text is not read). Its class is [`tool_class`]'s, from the calls the
-//!   lab's rollouts showed a class for.
-//! * A `compacted` row is a compaction ([`StepEvent::Compact`]).
-//!
-//! A COPY IS NO ONE'S TURN. A subagent's rollout opens with its own
-//! `session_meta` (naming `forked_from_id`), then a copy of its parent's
-//! rows — the parent's `session_meta`, its last turns' `turn_context`s,
-//! `task_complete`s and messages — in one burst, then its own
-//! `thread_settings_applied` naming its own thread (measured on the lab's
-//! subagent, committed). A legacy fork copies the same way, its parent's
-//! counts among them, and ends the copy with the same line (measured on
-//! 0.163.0, `super::codex_rollout`'s header); a paginated `/fork` writes the
-//! line in its `session_meta`'s millisecond. So, as the spend fold reads a
-//! fork ([`super::codex_rollout::TurnReader`]), the rows from a fork's
-//! `session_meta` up to its own `thread_settings_applied` — or, where none
-//! comes, each stamped within [`FORK_BURST_MS`] of the newest before it —
-//! step nothing; a copied count's total stands, so the fork's own count
-//! that repeats it is no turn's. A rollout whose first row is no
-//! `session_meta` is read the same way. Unlike the spend fold, a paginated
-//! fork is no exception: its copy holds no count, but it holds turns.
-//!
-//! THE SEED AND THE FLOOR. The fold is bound to a rollout ([`Self::bind`])
-//! and fed its lines from its FIRST byte, since a copy is known only from
-//! the first row. Rows ending at or below the bind's seed, and rows older
-//! than the floor, are history: folded into the copy, the open turn, the
-//! running total and the turn's tokens, never queued. History names no
-//! model: the first turn the log takes says its own, however many turns of
-//! history ran on it (a resumed thread's, read by the rollout tap).
-//!
-//! FAIL CLOSED. A `turn_context` with no turn id, or one that is no log id
-//! ([`StepId`]: at most 40 bytes of its alphabet), a `task_complete` or
-//! `turn_aborted` with no turn id, the open turn's `task_complete` with no
-//! `duration_ms`, a call or a result with no `call_id`, and a row that would
-//! step with no readable stamp latch the fold off for the bound rollout
-//! ([`StepEvent::Off`]) until the next bind. A call id that is no log id is
-//! counted lost; a row of a kind it does not read is skipped.
-//!
-//! NO TEXT. A step holds ids, a tool's bounded name, class words
-//! and numbers. A row is opened only when its raw bytes hold a key it reads
-//! (or a `\u` escape, which could spell one), and read through
-//! `super::transcript`'s `codex_steps` projection, which keeps only those
-//! keys: a call's arguments and input, a result's output, messages,
-//! instructions and a compaction's history are validated, never
-//! materialized (`tests/transcript_allocations.rs`).
-//!
-//! MEASURED BUILDS. [`CODEX_MEASURED_BUILDS`] names each codex-alab build
-//! whose rollouts the lab measured: 0.164.0-dev.12521 and 0.164.0-dev.12479
-//! (`lab codex-alab-proof` on the package built from its
-//! source and on the owner's managed one), and 0.164.0-dev.12672 (B5c, the
-//! forever-port package under the twelve-leg proof), each leg's rollout
-//! committed reduced as `codex-alab-<release>-<leg>.jsonl`.
-//! A row is [`StepState::On`] only on a build named there, read off the
-//! thread's own `session_meta` (or handed to [`CodexStepFold::bind_build`]
-//! by the tap that read it), and, where its reader knows the build writing
-//! the rollout now ([`CodexStepFold::set_writer`]: a resumed or re-exec'd
-//! thread never restates its `session_meta`), only while that one is named
-//! there too; else [`StepState::Partial`] (rule): the 5G lab
-//! run's 0.163.0 was a vendor Codex, which is never bound. An
-//! ALab build's version carries its commit as build metadata
-//! (`0.164.0-dev.12521+g3d3eb12d8`), whose `+` no log id holds, so the
-//! build is said (`ver=`) as its release, the version before the `+`
-//! ([`log_build`]); it is matched whole.
+//! THE CODEX STEP FOLD.
 
 use std::collections::VecDeque;
 use std::path::Path;
@@ -118,28 +20,14 @@ use super::steps::{
 };
 use super::transcript;
 
-/// The codex-alab builds whose rollouts the lab measured, each with its
-/// key-only reductions committed (`harness/testdata/steps/<stem>-<leg>.jsonl`,
-/// `aterm_phase::anchors::rollout_reduction_stem`'s stem): exact one by one
-/// (rule), the whole build string matched: 0.164.0-dev.12521,
-/// built from its source for the run, 0.164.0-dev.12479, the owner's
-/// managed codex-alab, read from its store, and 0.164.0-dev.12672, the
-/// forever-port build (codex-alab `089291d37`) the Autopilot Cruise / LAND
-/// proof runs (B5c). `lab codex-alab-proof`'s legs
-/// on each (a turn, a continued turn, an approved
-/// `exec_command`, a `request_user_input` answered, the usage wall waited
-/// out, a crash relaunched and a turn carried on), each step the fold makes
-/// exact against what the leg did and the rollout's own per-turn token
-/// record (`codex_steps_tests`).
+/// The codex-alab builds whose rollouts the lab measured and reduced (`harness/testdata/steps/<stem>-<leg>.jsonl`).
 pub const CODEX_MEASURED_BUILDS: &[&str] = &[
     "0.164.0-dev.12521+g3d3eb12d8",
     "0.164.0-dev.12479+g07a25d86a",
     "0.164.0-dev.12672+g089291d37",
 ];
 
-/// The build `build` as the log says it (`ver=`): the build when it is a
-/// log id ([`StepId`]), else its release, the version before a `+` (an ALab
-/// build's commit is build metadata), when that is one.
+/// The build `build` as the log says it (`ver=`).
 #[must_use]
 pub fn log_build(build: &str) -> Option<StepId> {
     StepId::new(build).or_else(|| {
@@ -181,8 +69,6 @@ const SPAWN_AGENT: &str = anchor_text("rollout.spawn_agent");
 const EXEC_COMMAND: &str = anchor_text("rollout.exec_command");
 
 /// The kinds of row past a copy the fold opens: any other is skipped by its
-/// raw bytes, unparsed (a quote inside a JSON string is escaped, so a
-/// quoted match is a key or a closed word).
 const OPENED: [&str; 9] = [
     TURN_CONTEXT,
     TASK_COMPLETE,
@@ -195,16 +81,7 @@ const OPENED: [&str; 9] = [
     COMPACTED,
 ];
 
-/// The class of a Codex call, by its namespace and NAME (addendum A11), and
-/// whether it starts a subagent: one of the log's `CLS_WORDS`. Only what a
-/// lab rollout showed is classed: `spawn_agent` in the `collaboration`
-/// namespace starts a subagent (0.163.0, the lab's subagent leg), and
-/// `exec_command` in no namespace runs a shell command, `shell` as Claude
-/// Code's `Bash` is (codex-alab 0.164.0-dev.12521 and 12479, the lab's
-/// approval leg: the command its model ran, approved). Every other call is
-/// `other`: 0.163.0's `exec` (`functions`) runs a script that may call any
-/// tool, so its name says no class, and `request_user_input` (in no
-/// namespace on codex-alab, in `functions` on 0.163.0) asks the person.
+/// The class of a Codex call, by its namespace and NAME (addendum A11), and whether it starts a subagent.
 #[must_use]
 pub fn tool_class(namespace: Option<&str>, name: &str) -> (&'static str, bool) {
     match (namespace, name) {
@@ -215,7 +92,6 @@ pub fn tool_class(namespace: Option<&str>, name: &str) -> (&'static str, bool) {
 }
 
 /// A copy that has read no stamp yet ([`Prefix::Copy`]): its burst starts
-/// at the first stamp read.
 const NO_STAMP: i64 = i64::MAX;
 
 /// An id as the fold compares it (never kept).
@@ -239,17 +115,12 @@ pub struct CodexStepFold {
     /// Where the fold stands against a copy.
     prefix: Prefix,
     /// While a fork's copy is read, its own thread's fingerprint: its own
-    /// `thread_settings_applied` ends the copy.
     thread: Option<u64>,
     /// The build its own `session_meta` names, as the log says it
-    /// ([`log_build`]).
     version: Option<StepId>,
     /// THE WRITER: the build of the process writing the rollout now, where
-    /// its reader knows it ([`Self::set_writer`]), its state and how the
-    /// log says it.
     writer: Option<(StepState, Option<StepId>)>,
     /// The state its rows are read at: [`StepState::On`] only on a build
-    /// [`CODEX_MEASURED_BUILDS`] names, matched whole.
     state: StepState,
     /// The largest running total read, a copy's included.
     top: u64,
@@ -295,19 +166,12 @@ impl CodexStepFold {
         }
     }
 
-    /// Bind the rollout at `fp` (its identity `id`): its lines are pushed
-    /// from its first byte on, and those ending at or below `seed` are
-    /// history (module docs). Everything read of another binding is dropped
-    /// but the queue, and the latch lifts.
+    /// Bind the rollout at `fp` (its identity `id`).
     pub fn bind(&mut self, fp: u64, id: Option<(u64, u64)>, seed: u64) {
         self.bind_build(fp, id, seed, None);
     }
 
-    /// [`Self::bind`] a rollout whose `session_meta` the binder read already
-    /// names `build` (the tap's gate, `super::codex_tap`): the bind is said
-    /// at that build's state, so a measured thread's source is never said
-    /// partial before its first row. The thread's own `session_meta` decides
-    /// the rows' state.
+    /// [`Self::bind`] a rollout whose `session_meta` the binder read already names `build` (the tap's gate, `super::codex_tap`).
     pub fn bind_build(&mut self, fp: u64, id: Option<(u64, u64)>, seed: u64, build: Option<&str>) {
         *self = CodexStepFold {
             queue: std::mem::take(&mut self.queue),
@@ -337,20 +201,12 @@ impl CodexStepFold {
         self.bound.is_some()
     }
 
-    /// Raise the floor to `floor_ms` (wall ms; it only rises): rows older
-    /// than it, read from now on, are history.
+    /// Raise the floor to `floor_ms` (wall ms; it only rises).
     pub fn raise_floor(&mut self, floor_ms: u64) {
         self.floor_ms = self.floor_ms.max(floor_ms);
     }
 
-    /// THE WRITER: `build` is what the process writing
-    /// the rollout runs now (the rollout tap reads it off the claimant's
-    /// image, `super::codex_alab::alab_build`). A thread's `session_meta`
-    /// names the build that STARTED it, and a thread resumed or re-exec'd
-    /// onto another build appends without restating it, so its rows are
-    /// [`StepState::On`] only while the writer's build, too, is one
-    /// [`CODEX_MEASURED_BUILDS`] names, and the build said (`ver=`) is the
-    /// writer's. A writer that moves says the model again on its next turn.
+    /// Record the `build` that the process writing the rollout runs now (`super::codex_alab::alab_build`).
     pub fn set_writer(&mut self, build: &str) {
         let writer = (
             state_for(CODEX_MEASURED_BUILDS, Some(build)),
@@ -362,10 +218,7 @@ impl CodexStepFold {
         self.writer = Some(writer);
     }
 
-    /// The reader stops reading the bound rollout at `end`, the end of the
-    /// last line it pushed (its writer runs a build nobody measured): the
-    /// source says `off` once ([`StepEvent::Off`]), and nothing more is
-    /// folded until the next bind.
+    /// The reader stops reading the bound rollout at `end`, the end of the last line it pushed (its writer runs a build nobody measured).
     pub fn stop(&mut self, end: u64) {
         if let Some((fp, id)) = self.bound
             && !self.broken
@@ -380,8 +233,7 @@ impl CodexStepFold {
         self.broken
     }
 
-    /// Everything queued since the last take. The end is the Claude fold's
-    /// and says nothing here: no Codex wall is judged by it.
+    /// Everything queued since the last take.
     pub fn take(&mut self) -> StepBatch {
         StepBatch {
             steps: self.queue.drain(..).collect(),
@@ -391,16 +243,14 @@ impl CodexStepFold {
         }
     }
 
-    /// A line the reader could not hand on, ending at `end`: longer than
-    /// the line bound, or not UTF-8. Counted lost past the seed.
+    /// A line the reader could not hand on, ending at `end`.
     pub fn lost_line(&mut self, end: u64) {
         if self.bound.is_some() && end > self.seed {
             self.lost = self.lost.saturating_add(1);
         }
     }
 
-    /// Fold one complete line of the bound rollout, ending at offset `end`
-    /// (past its newline).
+    /// Fold one complete line of the bound rollout, ending at offset `end` (past its newline).
     pub fn push(&mut self, line: &[u8], end: u64) {
         let Some((fp, id)) = self.bound else {
             return;
@@ -433,7 +283,6 @@ impl CodexStepFold {
             return;
         }
         let at_ms = stamp.and_then(|s| u64::try_from(s).ok());
-        // A row the log takes: past the seed, and no older than the floor.
         let live = fresh && at_ms.is_some_and(|t| t >= self.floor_ms);
         let mut out: Vec<StepEvent> = Vec::new();
         let bad = self.row(&v, fresh, live, &mut out);
@@ -456,9 +305,6 @@ impl CodexStepFold {
     }
 
     /// Where the row stands against a copy (module docs): `true` when it is
-    /// the thread's own and is read on, `false` when it steps nothing (a
-    /// copied row, the first row, the line that ends a copy). A copied
-    /// count's total stands.
     fn past_copy(&mut self, v: &Value, stamp: Option<i64>) -> bool {
         let kind = v.get("type").and_then(Value::as_str);
         let payload = v.get("payload");
@@ -479,8 +325,6 @@ impl CodexStepFold {
                         .filter(|t| is_thread_id(t))
                         .map(fingerprint);
                 }
-                // A fork's `session_meta`, or a first row naming no thread:
-                // the copy starts at its stamp, else at the first one read.
                 self.prefix = Prefix::Copy(stamp.unwrap_or(NO_STAMP));
             }
             Prefix::Copy(newest) => {
@@ -515,9 +359,6 @@ impl CodexStepFold {
     }
 
     /// The steps of one of the thread's own rows, into `out`; `true` when a
-    /// key it reads has the wrong shape (module docs). `fresh`: past the
-    /// seed; `live`: past the seed and no older than the floor, a row the
-    /// log takes.
     fn row(&mut self, v: &Value, fresh: bool, live: bool, out: &mut Vec<StepEvent>) -> bool {
         let kind = v.get("type").and_then(Value::as_str);
         let payload = v.get("payload");
@@ -539,9 +380,6 @@ impl CodexStepFold {
                     self.open = Some(f);
                     out.push(StepEvent::Prompt { vref });
                 }
-                // The model is said from the first row the log takes on:
-                // the history's (below the seed or the floor) is the run's
-                // to name, so a later turn on the same model still says it.
                 if let Some(model) = word(payload, KEY_MODEL)
                     .filter(|m| live && super::upgrade::is_model_id(m))
                     .and_then(StepId::new)
@@ -656,8 +494,6 @@ impl CodexStepFold {
     }
 
     /// The state of the rows now (rule): the thread's build's,
-    /// and never `On` while its writer runs a build nobody measured
-    /// ([`Self::set_writer`]).
     const fn state(&self) -> StepState {
         match self.writer {
             Some((StepState::Partial, _)) => StepState::Partial,
@@ -671,8 +507,6 @@ impl CodexStepFold {
     }
 
     /// Queue one step; a full queue drops its oldest step that is no
-    /// [`StepEvent::Bind`] or [`StepEvent::Off`], counting it in
-    /// [`StepBatch::overflow`] (the Claude fold's rule).
     fn enqueue_as(&mut self, pos: StepPos, state: StepState, ev: StepEvent) {
         self.queue.push_back(Step { pos, state, ev });
         while self.queue.len() > STEP_QUEUE {
@@ -684,11 +518,7 @@ impl CodexStepFold {
     }
 }
 
-/// Fold the rollout at `path` through `fold` from its first byte, at most
-/// `cap` bytes: each complete line pushed with its end, a line longer than
-/// the line bound or not UTF-8 counted lost, a torn last line left unread
-/// ([`super::codex_rollout`]'s `stream_lines`). `None` when the file cannot
-/// be opened.
+/// Fold the rollout at `path` through `fold` from its first byte, at most `cap` bytes.
 pub fn fold_rollout(path: &Path, fold: &mut CodexStepFold, cap: u64) -> Option<RolloutRead> {
     stream_lines_ends(path, cap, |_, end, line| {
         match line {

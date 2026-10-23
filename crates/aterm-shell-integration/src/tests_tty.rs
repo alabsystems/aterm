@@ -1,40 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-// ─── The tty settings a shell keeps after a raw-mode program dies ───
-//
-// `include!`d into lib.rs's `#[cfg(test)] mod tests` after tests_loader.rs, whose
-// helpers (`LiveShell`, `LiveFixture`, `shell_command`, `stdout_between`) it uses.
-//
-// A raw-mode program that dies without restoring the tty (an agent SIGKILLed while it held
-// the terminal, a `tty.setraw` script exiting on an error) must not leave the shell running
-// every later command under `-isig -iexten -icrnl -ixon -opost`, where Ctrl-C is a literal
-// ^C and Enter a bare CR that ends no line. bash restores the tty after a job that dies by
-// a signal but adopts it after one that exits, so an `exit 1` breaks it too. The scripts'
-// "tty settings" blocks say how they repair it.
-//
-// These tests drive REAL shells on a REAL pty (`script`, like the fish lanes),
-// started the way aterm starts a tab — the ZDOTDIR wrapper for zsh, the
-// `--rcfile` wrapper for bash — and measure the two symptoms the owner hit:
-// Ctrl-C sent into a `head -c 1` waiting for input must end it (the integration's own
-// `133;D;130`, the status its SIGINT gives it), and `read -r x` must end on a CR. The raw-mode program is `sh -c
-// 'stty raw -echo; …'` ending by SIGKILL, `exit 1` or `exit 0` — never by an
-// abort (no crash reports), and no python or node needed.
-//
-// NEGATIVE CONTROL, in the tests themselves: the same shells are also started
-// from a folder holding THIS build's scripts with only the fix's call sites cut
-// out (`unfixed_folder`), and there the same measurements must show the defect —
-// ISIG off, Ctrl-C not ending `head -c 1`, CR not ending `read`. A pass is
-// therefore never a property of the harness.
-
 /// The folder name the unfixed scripts are installed under: a folder address
-/// (16 lowercase hex) no build writes, so the zsh loader signs it as its revision
-/// and takes a body pointer to this build's folder like any older build's shell.
 #[cfg(unix)]
 const UNFIXED_REV: &str = "00000000000000aa";
 
 /// The call sites that arm the fix, per script. Cutting exactly these yields the unfixed
-/// script in everything that matters here.
 #[cfg(unix)]
 const ZSH_TTY_CALLS: [&str; 2] = [
     "    (( __aterm_tty_armed )) || __aterm_tty_arm\n",
@@ -52,15 +23,12 @@ enum RawEnd {
     Exit1,
     Exit0,
     /// `exit 0` after running 1.2 s: what a full-screen program killed from outside
-    /// reports under MSYS2.
     Exit0Late,
 }
 
 #[cfg(unix)]
 impl RawEnd {
     /// A child that puts the tty in raw mode, says so, and ends without
-    /// restoring it. The marker's number is computed, so the echoed command
-    /// line never matches it.
     fn line(self) -> &'static str {
         match self {
             Self::Sigkill => "sh -c 'stty raw -echo; echo RAW$((40+2)); kill -KILL $$'",
@@ -80,7 +48,6 @@ impl RawEnd {
 }
 
 /// The tty flags a raw mode clears, as `isig=on icrnl=off …`, read by a child
-/// `stty -a` (the tty as the next command sees it).
 #[cfg(unix)]
 const FLAGS_LINE: &str = "__s=\" $(command stty -a | tr '\\n' ' ') \"; for __f in isig icanon iexten icrnl opost ixon; do case \"$__s\" in *\" -$__f \"*) printf '%s=off ' \"$__f\";; *) printf '%s=on ' \"$__f\";; esac; done; echo FLAGS$((40+2))";
 
@@ -105,9 +72,6 @@ impl LiveShell {
     }
 
     /// Type `line` and Enter (a CR, as a terminal sends it) at the prompt
-    /// ([`Self::type_at_prompt`]), then wait for the command's
-    /// `133;D;<status>` and the next prompt's `133;A`. Returns the offset past
-    /// that prompt mark.
     fn run_line(&mut self, line: &str, status: &str) -> usize {
         let from = self.type_at_prompt(format!("{line}\r").as_bytes());
         let done = self.wait_for_after(&format!("\x1b]133;D;{status}"), from);
@@ -115,8 +79,6 @@ impl LiveShell {
     }
 
     /// Type `bytes` at the prompt the shell stands at, once its line editor
-    /// reads the tty ([`Self::wait_for_line_editor`]). Returns the offset they
-    /// were typed at.
     fn type_at_prompt(&mut self, bytes: &[u8]) -> usize {
         self.wait_for_line_editor();
         let from = self.len();
@@ -125,41 +87,11 @@ impl LiveShell {
     }
 
     /// Wait until the line editor reads the tty at the prompt the shell stands
-    /// at (the last `133;A` it wrote, which the caller has waited for), and
-    /// return the offset past its word for it.
-    ///
-    /// The prompt's `133;A` comes before the editor puts the tty in its raw,
-    /// no-echo mode, and a line typed in between is echoed by the kernel as
-    /// well as drawn by the editor, onto whatever the shell writes meanwhile:
-    /// bash runs the user's PROMPT_COMMAND after aterm's `133;A`, and under
-    /// XTRACE its `+__aterm_body_prompt_command> eval '…'` took the typed
-    /// line's echo on its own line (Linux lane, aarch64 guest, bash 5.2.21: 2
-    /// of 14 suite runs, 5 of 200 of that test run 8 at a time); in zsh, precmd
-    /// and zle's setup come after it too, and the echo lands ahead of the
-    /// prompt. Each editor writes two words only once it owns the tty:
-    ///
-    /// - `\e[?2004h`, bracketed paste on: readline (bash 5.1+) writes it in
-    ///   `rl_prep_terminal`, after setting the tty; zle after zle-line-init,
-    ///   which follows the refresh that sets zle's mode (`zrefresh` →
-    ///   `zsetterm`);
-    /// - aterm's `133;B`: readline draws it with the rest of PS1, after
-    ///   `rl_prep_terminal`, in every bash; zle-line-init writes zsh's.
-    ///
-    /// Whichever comes first: bash 3.2 (macOS's /bin/bash) writes no
-    /// `\e[?2004h`, and a zsh body from before the lead writes no `133;B` under
-    /// an rc that replaced zle-line-init.
+    /// at (its last `133;A`, with nothing typed still queued: [`Self::settle`]),
+    /// and return the offset past the editor's `\e[?2004h` or `133;B`.
     fn wait_for_line_editor(&mut self) -> usize {
-        const PROMPT: &[u8] = b"\x1b]133;A";
         const OWNS_THE_TTY: [&[u8]; 2] = [b"\x1b[?2004h", b"\x1b]133;B"];
-        let prompt = {
-            let out = self
-                .stdout
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            out.windows(PROMPT.len())
-                .rposition(|w| w == PROMPT)
-                .map_or(0, |at| at + PROMPT.len())
-        };
+        let prompt = self.last_prompt();
         let pipe = std::sync::Arc::clone(&self.stdout);
         self.wait_on(&pipe, "the line editor's \\e[?2004h or 133;B", |out| {
             let after = &out[prompt.min(out.len())..];
@@ -168,6 +100,19 @@ impl LiveShell {
                 .filter_map(|word| find_bytes(after, word).map(|at| prompt + at + word.len()))
                 .min()
         })
+    }
+
+    /// The offset past the last prompt's `133;A` the shell has written so far
+    /// (0 before its first).
+    fn last_prompt(&self) -> usize {
+        const PROMPT: &[u8] = b"\x1b]133;A";
+        let out = self
+            .stdout
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        out.windows(PROMPT.len())
+            .rposition(|w| w == PROMPT)
+            .map_or(0, |at| at + PROMPT.len())
     }
 
     /// The flags `FLAGS_LINE` printed, e.g. `isig=on icanon=on … ixon=off`.
@@ -188,31 +133,13 @@ impl LiveShell {
     }
 
     /// Ctrl-C into a `head -c 1` waiting for input: did it END the command?
-    /// Judged by the command's own status in the integration's
-    /// `133;D;<status>`, never by a clock: 130 is `head` killed by the SIGINT a
-    /// working ISIG makes of ^C, and a ^C the tty swallowed is a byte `head`
-    /// reads, ending with 0. Leaves the shell at a prompt either way, with the
-    /// line editor's buffer cleared.
     fn ctrl_c_interrupts(&mut self) -> bool {
         self.ctrl_c_status("") == "130"
     }
 
     /// Type `<runner>sh -c 'echo WAIT42; exec head -c 1 >/dev/null'`, send
-    /// Ctrl-C and a newline once the command runs, and return its status.
-    /// "Runs" is the command's OWN word: a foreground job owns the tty before it
-    /// execs (both shells' children call `tcsetpgrp` first), so a ^C after
-    /// `WAIT42` reaches `sh` or the `head` it became, never the shell. A fixed
-    /// pause after `133;C` stood in for that and under load sent the ^C while
-    /// zsh was still forking, where it interrupted nothing (`133;D;0` after `^C`).
-    ///
-    /// `head` ends on input alone, so no timer decides the outcome: a `sleep 4`
-    /// here ran out before a ^C sent under load reached it (`133;D;0` on a
-    /// healthy tty, seen at load 65), and the control waited out all 4 s. The
-    /// newline is for a tty whose ISIG is off but ICANON on, where `head` gets
-    /// the ^C byte only once a line ends. Where ISIG is on, the ^C's SIGINT is
-    /// posted before the newline is queued, so it kills `head` whatever it
-    /// reads; the newline is then an empty line at the prompt, which marks no
-    /// command.
+    /// Ctrl-C and a newline once the command runs, and return its status, the
+    /// shell settled at its last prompt ([`Self::settle`]).
     fn ctrl_c_status(&mut self, runner: &str) -> String {
         let from = self.type_at_prompt(
             format!("{runner}sh -c 'echo WAIT$((40+2)); exec head -c 1 >/dev/null'\r").as_bytes(),
@@ -220,13 +147,13 @@ impl LiveShell {
         let running = self.wait_for_after("WAIT42", from);
         self.send_bytes(b"\x03\n");
         let status = self.status_after(running);
-        // Ctrl-U: kill-whole-line in both line editors' default emacs bindings.
         self.send_bytes(b"\x15");
+        self.settle();
         status
     }
 
     /// The `<status>` of the first `133;D;<status>` after `from`, read once the
-    /// next prompt's `133;A` is in (so every digit is), with the shell at it.
+    /// next prompt's `133;A` is in (so every digit is).
     fn status_after(&mut self, from: usize) -> String {
         let done = self.wait_for_after("\x1b]133;D;", from);
         self.wait_for_after("\x1b]133;A", done);
@@ -234,10 +161,8 @@ impl LiveShell {
     }
 
     /// `read -r x` fed `hello` + CR: did the CR end the line? Judged by what
-    /// `read` got, not by a clock: an LF follows the CR, so the read ends either
-    /// way — with `hello` when ICRNL made the CR a line end (the LF is then an
-    /// empty line for the prompt, which marks no command), with `hello\r` when
-    /// the tty passed the CR through as a byte.
+    /// `read` got, not by a clock: `hello` when ICRNL made the CR a line end,
+    /// `hello\r` when the tty passed it through.
     fn cr_ends_read(&mut self) -> bool {
         let from = self.type_at_prompt(b"read -r x; echo \"GOT=[$x]\"\r");
         let started = self.wait_for_after("\x1b]133;C", from);
@@ -246,7 +171,24 @@ impl LiveShell {
         let end = self.wait_for_after("]", got);
         let done = self.wait_for_after("\x1b]133;D;", end);
         self.wait_for_after("\x1b]133;A", done);
+        self.settle();
         stdout_between(self, got, end - 1) == "hello"
+    }
+
+    /// Run a line of its own and wait for its word and the prompt after it, so
+    /// the shell stands at its last `133;A` with nothing typed still queued.
+    /// A probe whose input outlasts its command ends here: the newline after
+    /// the ^C or the CR is an empty line at a sane prompt, which the shell
+    /// answers with one more prompt after the probe's own, and a line typed at
+    /// the probe's prompt went into the cooked, echoing tty the shell read that
+    /// empty line in. Whether the newline is left over depends on the tty state
+    /// the probe measures, so no count of prompts says when it is read, but the
+    /// shell reads its tty in order. This line's own echo is harmless: its word
+    /// is computed.
+    fn settle(&mut self) {
+        let from = self.type_at_prompt(b"echo SETTLED$((40+2))\r");
+        let settled = self.wait_for_after("SETTLED42", from);
+        self.wait_for_after("\x1b]133;A", settled);
     }
 
     /// A raw-mode child ends as `end` says, and the shell returns to a prompt.
@@ -273,8 +215,6 @@ impl LiveShell {
 }
 
 /// Assert the tty is sane for the next command: the flags a raw mode clears are
-/// back on (IXON as `want_ixon` says — the user's own choice), Ctrl-C ends
-/// `head -c 1` and a CR ends `read`.
 #[cfg(unix)]
 fn assert_tty_usable(sh: &mut LiveShell, what: &str, want_ixon: bool) {
     let flags = sh.flags();
@@ -334,8 +274,53 @@ fn assert_tty_broken(sh: &mut LiveShell, what: &str) {
     );
 }
 
+/// The tty probes leave the shell settled at its last prompt
+/// ([`LiveShell::settle`]): a line typed right after one runs at the prompt
+/// `type_at_prompt` anchors at, with no prompt drawn between that anchor and
+/// the line's `133;C`.
+#[cfg(unix)]
+#[test]
+fn the_tty_probes_leave_the_shell_at_its_last_prompt() {
+    need_pty_script();
+    let zsh = need_zsh();
+    let fx = LiveFixture::new();
+    std::fs::write(fx.home.join(".zshrc"), "").expect(".zshrc");
+    std::fs::write(fx.home.join(".bashrc"), "").expect(".bashrc");
+    let ours = install_script_set(&fx.base).expect("install");
+    type Probe = fn(&mut LiveShell) -> bool;
+    let probes: [(&str, Probe); 2] = [
+        ("Ctrl-C into `head -c 1`", LiveShell::ctrl_c_interrupts),
+        ("a CR into `read`", LiveShell::cr_ends_read),
+    ];
+    for (shell, program) in [(ShellType::Bash, bash_shell()), (ShellType::Zsh, zsh)] {
+        let mut sh = spawn_pty_shell(shell, program, &fx, &ours, &[]);
+        for (probe, ends) in probes {
+            assert!(
+                ends(&mut sh),
+                "{}: {probe} on a sane tty\n{}",
+                sh.label,
+                sh.transcript()
+            );
+            let anchor = sh.last_prompt();
+            let from = sh.type_at_prompt(b"echo NEXT$((40+2))\r");
+            let next = sh.wait_for_after("NEXT42", from);
+            let ran = stdout_between(&sh, anchor, next);
+            let started = ran.rfind("\x1b]133;C").unwrap_or_else(|| {
+                panic!("{}: no 133;C before NEXT42\n{}", sh.label, sh.transcript())
+            });
+            assert!(
+                !ran[..started].contains("\x1b]133;A"),
+                "{}: after {probe}, the shell drew another prompt after the one the next line \
+                 was typed at\n{ran:?}",
+                sh.label
+            );
+            sh.wait_for_after("\x1b]133;A", next);
+        }
+        sh.finish();
+    }
+}
+
 /// This build's scripts with the fix's call sites cut out, as a folder the
-/// wrappers can start a shell from: `<root>/UNFIXED_REV`, beside this build's.
 #[cfg(unix)]
 fn unfixed_folder(root: &Path) -> PathBuf {
     let cut = |calls: &[&'static str]| -> Vec<(&'static str, &'static str)> {
@@ -356,9 +341,6 @@ fn unfixed_folder(root: &Path) -> PathBuf {
 type ScriptEdits<'a> = (&'a str, &'a str, &'a [(&'a str, &'a str)]);
 
 /// This build's scripts at `<root>/<rev>`, beside this build's folder, with each
-/// `(from, to)` edit made to its script (and so to the body written beside it).
-/// Every `from` must occur exactly once: a control that no longer differs from
-/// the build would pass for the wrong reason.
 #[cfg(unix)]
 fn folder_with_edits(root: &Path, rev: &str, edits: &[ScriptEdits<'_>]) -> PathBuf {
     let dir = root.join(rev);
@@ -386,9 +368,6 @@ fn folder_with_edits(root: &Path, rev: &str, edits: &[ScriptEdits<'_>]) -> PathB
 }
 
 /// An interactive `shell` on a real pty (`script`, macOS or util-linux
-/// spelling), started from the integration folder `dir` the way aterm starts a
-/// tab, in the fixture's home, with `extra` in its environment; returned at
-/// its first prompt's `133;A`.
 #[cfg(unix)]
 fn spawn_pty_shell(
     shell: ShellType,
@@ -422,8 +401,6 @@ fn spawn_pty_shell_unwaited(
     argv.push("-i".to_owned());
     let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
     let mut cmd = pty_script(&argv);
-    // The hermetic environment of `shell_command`, applied to `script` (the
-    // shell inherits it), then the fixture's home and the injection.
     let hermetic = shell_command(program);
     for (key, value) in hermetic.get_envs() {
         match value {
@@ -464,10 +441,6 @@ fn live_pty_zsh() -> &'static str {
 }
 
 /// A NEW integrated zsh: a raw-mode child dying by SIGKILL, `exit 1` or `exit 0`
-/// leaves the next command's tty sane — Ctrl-C ends `head -c 1`, a CR ends `read`
-/// — and the user's own `stty -ixon`, typed before, survives all three (the
-/// freeze puts back exactly what the shell had). The shell reports its tty
-/// frozen. The same scenario from the unfixed scripts is the negative control.
 #[cfg(unix)]
 #[test]
 fn an_integrated_zsh_keeps_its_tty_when_a_raw_program_dies() {
@@ -476,7 +449,6 @@ fn an_integrated_zsh_keeps_its_tty_when_a_raw_program_dies() {
     std::fs::write(fx.home.join(".zshrc"), "").expect(".zshrc");
     let ours = install_script_set(&fx.base).expect("install");
 
-    // The control: the unfixed scripts reproduce the defect.
     let unfixed = unfixed_folder(&fx.base);
     let mut sh = spawn_pty_shell(ShellType::Zsh, zsh, &fx, &unfixed, &[]);
     sh.kill_raw_child(RawEnd::Sigkill);
@@ -489,9 +461,6 @@ fn an_integrated_zsh_keeps_its_tty_when_a_raw_program_dies() {
         sh.kill_raw_child(end);
         assert_tty_usable(&mut sh, &format!("after a raw child's {end:?}"), true);
     }
-    // A deliberate `stty -ixon` goes through the thawing wrapper and sticks —
-    // from a function of the user's too, whose local `options` hides zsh's from
-    // the wrapper (which must neither fail on it nor write to it).
     sh.run_line("own() { local options=mine; stty -ixon; }; own", "0");
     sh.kill_raw_child(RawEnd::Sigkill);
     assert_tty_usable(&mut sh, "stty -ixon, then a SIGKILLed raw child", false);
@@ -502,12 +471,6 @@ fn an_integrated_zsh_keeps_its_tty_when_a_raw_program_dies() {
 }
 
 /// A NEW integrated zsh whose rc ran a raw-mode program that died: the shell
-/// adopted that tty before its first prompt, whose read of it runs in the
-/// background — and its first command still runs sane, repaired through the
-/// thaw at that command's preexec, so the tty it then keeps frozen is the
-/// repaired one (a raw child's `exit 0` after it leaves the next command sane).
-/// IXON stays as the raw mode left it: the repair never touches it. The same
-/// rc under the unfixed scripts is the negative control.
 #[cfg(unix)]
 #[test]
 fn an_integrated_zsh_whose_rc_broke_the_tty_runs_its_first_command_sane() {
@@ -533,40 +496,15 @@ fn an_integrated_zsh_whose_rc_broke_the_tty_runs_its_first_command_sane() {
 }
 
 /// The zsh line that has the line editor take a fresh shell's deferred tty
-/// read the moment it answers (and repair the tty its first prompt runs in);
-/// cut, the scripts are as they were before 2026-10-17 in everything that
-/// matters here: the read waits for the first command.
 #[cfg(unix)]
 const ZSH_FIRST_INTR_CALL: &str =
     "        zle -F $__aterm_tty_probe_fd __aterm_tty_probe_ready 2>/dev/null\n";
 
 /// The key typed right after a Ctrl-C at a zsh prompt. zsh 5.9's line editor
-/// looks for an interrupt only between keys (`zlecore`'s loop, then
-/// `getbyte`'s blocking `read`, zle_main.c): a SIGINT it takes after that look
-/// and before the read — the ^C landing while the editor is still busy, which
-/// load makes likely — ends the line only when one more byte arrives, and a
-/// ^C flushes the bytes typed ahead of it. Measured 2026-10-19 under 16
-/// parallel runs: a bare `zsh -i` (no aterm scripts) drew no prompt for 8 s,
-/// then took the interrupt at the next byte, 2 times in 640 and 0 in 640 with
-/// this key after the ^C; this test, beside its own copies and the suite, 15
-/// in 480, sampled in `getbyte`'s `read` with ISIG on. The kernel's flush for
-/// the ^C runs before the key is queued, so the key ends the dying line there,
-/// or leads the next line as a harmless space where the interrupt already
-/// took the line. A self-insert in both keymaps, so a ^C that is only a byte
-/// keeps the line.
 #[cfg(unix)]
 const ZLE_INTR_WAKE: &[u8] = b" ";
 
 /// A NEW integrated zsh whose rc left the tty raw (`stty raw -isig`): a
-/// Ctrl-C at its FIRST prompt — no command yet, so the deferred read is not
-/// taken at a preexec — drops the line it was typed on, as a working Ctrl-C
-/// does (`$?` 130), and the tty is repaired: in the emacs keymap and in viins.
-/// Once the read answers the line editor redraws the prompt on the repaired
-/// tty, which is what the test waits for before it types. The ^C waits for
-/// the typed line to be drawn and is followed by a space, as a user types on
-/// (both explained at the ^C). The same rc without the editor's watch on the
-/// read is the negative control: the ^C is a byte the editor beeps at, and
-/// the line survives into the next command.
 #[cfg(unix)]
 #[test]
 fn an_integrated_zsh_whose_rc_left_the_tty_raw_takes_ctrl_c_at_its_first_prompt() {
@@ -591,25 +529,12 @@ fn an_integrated_zsh_whose_rc_left_the_tty_raw_takes_ctrl_c_at_its_first_prompt(
             // The prompt drawn again, on the repaired tty.
             sh.wait_for_after("@@P@@", at);
         }
-        // The markers are computed, so the echoed lines never match them.
         let typed = sh.len();
         sh.send_bytes(b"echo LO$((7*7))");
-        // The ^C goes in once the editor has drawn the line to its end, so has
-        // read all of it and has nothing more to write. A ^C flushes the tty's
-        // output too, and `script` sets its pty master non-blocking and stops
-        // relaying for good when a read of it finds nothing (macOS shell_cmds
-        // script.c: `if (cc <= 0) break;`, then `finish()` waits for the
-        // shell): a ^C that lands with the editor's echo in flight empties the
-        // queue between `script`'s select and its read, and the shell then
-        // waits forever in `tcsetattr(TCSADRAIN)` for an output nobody drains
-        // (sampled 2026-10-19 with the space alone, 1 in 480 beside the suite:
-        // zsh in `hend` → `settyinfo`, `script` in `wait4`).
         let from = sh.wait_for_after("))", typed);
         sh.send_bytes(b"\x03");
         sh.send_bytes(ZLE_INTR_WAKE);
         if fixed {
-            // An interrupt flushes the tty's input: type on only at the next
-            // prompt. The control's ^C is a byte, and there is none.
             sh.wait_for_after("\x1b]133;A", from);
             sh.wait_for_line_editor();
         }
@@ -617,7 +542,6 @@ fn an_integrated_zsh_whose_rc_left_the_tty_raw_takes_ctrl_c_at_its_first_prompt(
         sh.send_bytes(b"echo KEPT$((40+2)) $?\r");
         let kept = sh.wait_for_after("KEPT42", from);
         let ran = cut_osc(&stdout_between(&sh, from, kept));
-        // What the command printed ahead of the marker, on the marker's line.
         let line = ran
             .strip_suffix("KEPT42")
             .and_then(|r| r.rsplit(['\n', '\r']).next())
@@ -648,9 +572,6 @@ fn an_integrated_zsh_whose_rc_left_the_tty_raw_takes_ctrl_c_at_its_first_prompt(
 }
 
 /// A user whose rc defines `stty` as a function (or `reset` as an alias) keeps zsh's
-/// adopting behaviour (a frozen tty would silently undo what their definition does): the
-/// tty is not frozen, and the repair still runs after a failed command, so a raw child's
-/// SIGKILL and `exit 1` leave the next command sane, `stty -ixon` included.
 #[cfg(unix)]
 #[test]
 fn an_integrated_zsh_with_its_own_stty_is_repaired_not_frozen() {
@@ -670,7 +591,6 @@ fn an_integrated_zsh_with_its_own_stty_is_repaired_not_frozen() {
     }
     sh.finish();
 
-    // An alias for one of the three names rules it out the same way.
     std::fs::write(fx.home.join(".zshrc"), "alias reset='command reset'\n").expect(".zshrc");
     let mut sh = spawn_pty_shell(ShellType::Zsh, zsh, &fx, &ours, &[]);
     assert!(
@@ -678,17 +598,11 @@ fn an_integrated_zsh_with_its_own_stty_is_repaired_not_frozen() {
         "zsh: a user's own `reset` alias rules the freeze out"
     );
     sh.kill_raw_child(RawEnd::Sigkill);
-    // The repair cannot tell a raw mode's IXON-off from the user's, so it leaves
-    // IXON as the dead program left it (off) — only the freeze puts it back.
     assert_tty_usable(&mut sh, "own reset alias, a SIGKILLed raw child", false);
     sh.finish();
 }
 
 /// A running zsh with a broken tty, from the unfixed scripts, gets the fix through the
-/// loader channel: a SIGKILLed raw child breaks it (the negative control); the host points
-/// it at this build's folder, and at its next prompt the new body repairs the tty it had
-/// adopted and freezes it, so the next command and the next raw child's death leave Ctrl-C
-/// and Enter working.
 #[cfg(unix)]
 #[test]
 fn a_running_zsh_with_a_broken_tty_is_repaired_by_the_body_the_loader_delivers() {
@@ -715,7 +629,6 @@ fn a_running_zsh_with_a_broken_tty_is_repaired_by_the_body_the_loader_delivers()
     sh.kill_raw_child(RawEnd::Sigkill);
     assert_tty_broken(&mut sh, "unfixed, after a SIGKILLed raw child");
 
-    // The host points the running shell at this build's body.
     deliver(&pointer, &ours_rev);
     let at = sh.run_line("true", "0");
     let signed = format!("633;P;{INTEGRATION_REV_KEY}={ours_rev}");
@@ -736,10 +649,6 @@ fn a_running_zsh_with_a_broken_tty_is_repaired_by_the_body_the_loader_delivers()
 }
 
 /// bash: after a raw child's `exit 1` (which bash adopts — it restores the tty
-/// only after a SIGNAL death), and after an `exit 0` from one that ran a second,
-/// the next command's tty is sane, and a SIGKILL stays fine; a deliberate `stty
-/// -ixon` survives. The unfixed scripts are the negative control, on the `exit 1`
-/// that breaks them.
 #[cfg(unix)]
 #[test]
 fn an_integrated_bash_repairs_its_tty_after_a_raw_program_fails() {
@@ -756,9 +665,6 @@ fn an_integrated_bash_repairs_its_tty_after_a_raw_program_fails() {
     sh.finish();
 
     let mut sh = spawn_pty_shell(ShellType::Bash, bash, &fx, &ours, &[]);
-    // bash's own restore after a signal death puts IXON back too; the repair
-    // after an `exit 1` cannot tell a raw mode's IXON-off from the user's and
-    // leaves it off (which bash then keeps, as the state it saved).
     for (end, ixon) in [
         (RawEnd::Sigkill, true),
         (RawEnd::Exit1, false),
@@ -775,11 +681,6 @@ fn an_integrated_bash_repairs_its_tty_after_a_raw_program_fails() {
 }
 
 /// Under `setopt err_return`, a failing wrapped command (`stty bogusflag`) must not return
-/// from `__aterm_tty_thaw_run` before its `ttyctl -f`, which would leave the shell thawed
-/// while `__aterm_tty_frozen` says 1 (switching the fallback repair off too). The wrapper
-/// opens with `emulate -L zsh` and re-freezes in an `always` block. The failing status
-/// still reaches the prompt (`133;D;1`), the tty reports frozen, and a raw child dying by
-/// `exit 1` and by `exit 0` (which no fallback repair catches) leaves the next command sane.
 #[cfg(unix)]
 #[test]
 fn an_integrated_zsh_with_err_return_stays_frozen_after_a_failing_stty() {
@@ -792,7 +693,6 @@ fn an_integrated_zsh_with_err_return_stays_frozen_after_a_failing_stty() {
         sh.zsh_frozen(),
         "zsh: err_return: the integrated shell freezes its tty"
     );
-    // A typo'd `stty` fails; its status is the wrapper's status.
     sh.run_line("stty bogusflag", "1");
     assert!(
         sh.zsh_frozen(),
@@ -811,14 +711,6 @@ fn an_integrated_zsh_with_err_return_stays_frozen_after_a_failing_stty() {
 }
 
 /// A thawed command INTERRUPTED by Ctrl-C: zsh
-/// abandons the rest of a function when its foreground child dies by SIGINT, so
-/// a `ttyctl -f` written after the command never ran — and Ctrl-C at `tset`'s
-/// "TERM = (unknown)?" question, or during `reset`'s pause, is the ordinary way
-/// that happens. The re-freeze is in an `always` block now, which runs on that
-/// path too. Driven through `__aterm_tty_thaw_run` with a `head -c 1` that ends
-/// only on the ^C, so the timing is the test's, not a terminal database's; the
-/// shell must report its tty frozen afterwards, and a raw child's `exit 0` must
-/// then leave the next command sane.
 #[cfg(unix)]
 #[test]
 fn an_integrated_zsh_refreezes_when_a_thawed_command_is_interrupted() {
@@ -849,16 +741,11 @@ fn an_integrated_zsh_refreezes_when_a_thawed_command_is_interrupted() {
     sh.finish();
 }
 
-// ─── 133;B whatever the rc does to zle-line-init ───
-
 /// The folder of a body from before the lead (`__aterm_line_init_lead`, which puts 133;B in
-/// front of whatever holds zle-line-init; 16 lowercase hex no build writes): what a rollback,
-/// or an older build adopting the shell, points it at.
 #[cfg(unix)]
 const BEFORE_LEAD_REV: &str = "00000000000000bb";
 
 /// That body's zle-line-init, defined last in this build's body: no per-prompt
-/// re-assertion, and the loader's widget marks every line it is reached on.
 #[cfg(unix)]
 const BEFORE_LEAD_ZSH: &str = "\
 __aterm_line_init_wire() { :; }
@@ -869,43 +756,6 @@ __aterm_zle_line_init() {
 ";
 
 /// Every prompt of an integrated zsh carries one 133;B whatever its ~/.zshrc does to
-/// zle-line-init after the loader wired it (the engine takes C only after a B, so a prompt
-/// without one keeps no block or exit code), and every widget the rc put there still runs
-/// once per line, through a body switch to the build before (a rollback) and back. The rc
-/// runs after the loader (zsh reads it from the ZDOTDIR .zshenv). The rcs:
-///
-/// - one that replaces zle-line-init (oh-my-zsh's `echoti smkx` widget), then wraps it
-///   again from a precmd hook at the first prompt (powerlevel10k over oh-my-zsh): the
-///   replacing widget still runs and reads in `$?` the status of the command before the
-///   line, as in bare zsh;
-/// - one that wraps it (powerlevel10k alone): the line is marked once and never loops;
-/// - one that wraps it again from a precmd hook whenever its wrapper lost the front: the
-///   wrapper runs once;
-/// - one that hooks it with add-zle-hook-widget, at load and from a precmd hook: the
-///   dispatcher stops at the first hook that fails, and the loader's widget is that first
-///   hook, so it succeeds (the build before's returns 1, so after a switch to it the user's
-///   hooks do not run); one 133;B however often the hook is added;
-/// - one that wraps it under a new name each time it lost the front (zsh-autosuggestions):
-///   each line runs one wrapper, not every wrapper so far;
-/// - one that reads the widget table to choose between wrapping and replacing (zsh-vi-mode
-///   at its first precmd, powerlevel10k while it expands its first prompt): the widget it
-///   replaces never runs, as in bare zsh;
-/// - one that registers through add-zle-hook-widget where the dispatcher leads and wraps
-///   otherwise, with a hook added from a later precmd: no dispatcher-wrapper loop;
-/// - one whose zle-line-init returns non-zero, which a user's ZERR trap sees once, from
-///   that widget;
-/// - one whose precmd hook fails with an error, after which zsh runs no due `sched` event
-///   until zle reads the line.
-///
-/// Every rc also sets PRINT_EXIT_VALUE (a failed command's status is reported once, below
-/// the command), WARN_NESTED_VAR and WARN_CREATE_GLOBAL (aterm's functions that run with
-/// the user's options give nothing to warn about), a ZERR trap (fires for the failed
-/// command, never inside aterm's precmd) and VERBOSE (aterm's own code never reaches the
-/// screen; each typed line is echoed once).
-///
-/// After a switch to the build before, a line is marked where that build's widget is
-/// reached, at most twice (the engine ignores a B outside a prompt). The build before is
-/// also the negative control: from its folder, the replacing rc's prompts carry no 133;B.
 #[cfg(unix)]
 #[test]
 fn an_integrated_zsh_marks_every_prompt_whatever_its_rc_does_to_zle_line_init() {
@@ -1029,13 +879,6 @@ fn an_integrated_zsh_marks_every_prompt_whatever_its_rc_does_to_zle_line_init() 
           add-zle-hook-widget line-init _rc_late\n\
         }\n\
         add-zsh-hook precmd _rc_late_wire\n";
-    // `n` prompts, each from its 133;A to the next one's: its line-init, then a
-    // command, whose status cycles through 3, 1 and 0 (each form of the event: a
-    // prompt after a 3 is checked in every phase), and whether zsh reports that
-    // status (`zsh: exit <status>`, PRINT_EXIT_VALUE). `run_line` types each
-    // line once zle owns the tty, so its only echo is VERBOSE's: typed at the
-    // bare 133;A, a loaded machine lets the tty echo it ahead of the prompt too
-    // (`\n(exit 3)\r\n` twice in one prompt).
     let lines = [("(exit 3)", "3"), ("false", "1"), ("true", "0")];
     let prompts = |sh: &mut LiveShell, at: &mut usize, n: usize| -> Vec<(String, usize, &str)> {
         (0..n)
@@ -1049,8 +892,6 @@ fn an_integrated_zsh_marks_every_prompt_whatever_its_rc_does_to_zle_line_init() 
             .collect()
     };
 
-    // The options and ZERR trap every rc runs under; the trap names the function the
-    // failed command ran in.
     let rc_file = |rc: &str| {
         std::fs::write(
             fx.home.join(".zshrc"),
@@ -1062,7 +903,6 @@ fn an_integrated_zsh_marks_every_prompt_whatever_its_rc_does_to_zle_line_init() 
         .expect(".zshrc");
     };
 
-    // The control: the build before marks no prompt of the replacing rc.
     rc_file(replaces);
     let mut sh = spawn_pty_shell(ShellType::Zsh, zsh, &fx, &before, &[]);
     let mut at = sh.wait_for_after("\x1b]133;A", 0);
@@ -1075,8 +915,6 @@ fn an_integrated_zsh_marks_every_prompt_whatever_its_rc_does_to_zle_line_init() 
     }
     sh.finish();
 
-    // The rc's own widgets and how often each runs in a line, as in bare zsh:
-    // from this build, and after a switch to the build before.
     for (what, rc, own, own_before) in [
         (
             "an rc that replaces zle-line-init",
@@ -1184,8 +1022,6 @@ fn an_integrated_zsh_marks_every_prompt_whatever_its_rc_does_to_zle_line_init() 
                         && !prompt.contains("recursion limit"),
                     "zsh, {what}, {phase}: no widget loop\n{prompt:?}"
                 );
-                // A widget that prints its `$?` (`OWN42?<status>;`) reads the
-                // status of the line before this prompt's.
                 let before = n.checked_sub(1).map(|b| prompts[b].2);
                 let want = lines.iter().find(|(l, _)| Some(*l) == before);
                 if let (true, Some((_, status))) = (prompt.contains("OWN42?"), want) {
@@ -1200,7 +1036,6 @@ fn an_integrated_zsh_marks_every_prompt_whatever_its_rc_does_to_zle_line_init() 
         let mut at = sh.wait_for_after("\x1b]133;A", 0);
         let fresh = prompts(&mut sh, &mut at, 3);
         check(&sh, "a new shell", &fresh, 1..=1, own);
-        // A body switch is taken at the prompt after the pointer is written.
         for (phase, rev, marks, own) in [
             (
                 "after a switch to the build before",
@@ -1225,11 +1060,6 @@ fn an_integrated_zsh_marks_every_prompt_whatever_its_rc_does_to_zle_line_init() 
 }
 
 /// A user's XTRACE traces the user's commands, not aterm's, and never the capability
-/// nonce (bare zsh traces nothing between two commands). XTRACE comes from `.zshenv` here,
-/// so the load runs under it too, and the rc replaces zle-line-init (oh-my-zsh's shape), so
-/// the scheduled event runs: its own line, which zsh prints before it runs, is all of
-/// aterm's that is left, `stty`'s wrapper included, as bare zsh traces only the line that
-/// ran it.
 #[cfg(unix)]
 #[test]
 fn an_integrated_zsh_under_xtrace_traces_the_users_commands_and_not_aterms() {
@@ -1266,9 +1096,6 @@ fn an_integrated_zsh_under_xtrace_traces_the_users_commands_and_not_aterms() {
         !text.contains(REKEY_OLD),
         "zsh: the capability nonce reached the trace\n{text}"
     );
-    // The event's own line names `__aterm_line_init_late` at the top level
-    // (`+zsh:<n>> …`); a line traced inside a function of aterm's carries its
-    // name as PS4's `%N` (`+__aterm_…:<n>> …`), that function's included.
     for line in text.lines().filter(|line| line.contains("__aterm")) {
         assert!(
             line.contains("__aterm_line_init_late") && !line.contains("+__aterm"),
@@ -1279,7 +1106,6 @@ fn an_integrated_zsh_under_xtrace_traces_the_users_commands_and_not_aterms() {
 }
 
 /// A shell's text with every OSC frame cut: what reads on the screen, where the
-/// marks carry the key by design.
 #[cfg(unix)]
 fn cut_osc(raw: &str) -> String {
     let mut text = String::new();
@@ -1295,10 +1121,6 @@ fn cut_osc(raw: &str) -> String {
 }
 
 /// bash's twin of the test above: a user's XTRACE traces the user's commands and their
-/// PROMPT_COMMAND, not aterm's, and never the capability nonce. XTRACE comes from
-/// `.bashrc`, so the load runs under it too, and PS4 names the function a line runs in:
-/// what is left of aterm's is bash's own trace of the two hooks' calls, at the top level,
-/// and the user's PROMPT_COMMAND, which aterm's prompt handler runs.
 #[cfg(unix)]
 #[test]
 fn an_integrated_bash_under_xtrace_traces_the_users_commands_and_not_aterms() {
@@ -1325,10 +1147,6 @@ fn an_integrated_bash_under_xtrace_traces_the_users_commands_and_not_aterms() {
         !text.contains(REKEY_OLD),
         "bash: the capability nonce reached the trace\n{text}"
     );
-    // (the function a traced line runs in, the line). Readline in bash 5.1+
-    // ends each accepted line with `\e[?2004l\r` (bracketed paste off), and
-    // the command's trace follows it on the same line: a line is what its
-    // last `\r` left on the screen.
     let traced: Vec<(&str, &str)> = text
         .lines()
         .filter_map(|line| line.rsplit('\r').next()?.strip_prefix('+'))
@@ -1345,8 +1163,6 @@ fn an_integrated_bash_under_xtrace_traces_the_users_commands_and_not_aterms() {
         let users = if frame.starts_with("__aterm") {
             matches!(*line, "eval 'echo pc$((40+2))'" | "echo pc42")
         } else {
-            // The hooks' own calls: the DEBUG trap's, PROMPT_COMMAND's and, on
-            // bash 5.3+, PS0's.
             !line.contains("__aterm")
                 || matches!(
                     line.split_whitespace().next(),
@@ -1362,21 +1178,12 @@ fn an_integrated_bash_under_xtrace_traces_the_users_commands_and_not_aterms() {
 }
 
 /// A user's ERR trap, `set -e` and `set -o functrace` meet the commands bare bash shows
-/// them. aterm's PROMPT_COMMAND runs no failing command of its own (a returned status, a
-/// `( exit <status> )`, a `hash -d` of a name not hashed, a reroute derivation that says
-/// no, a missing atpkg hook's open): each would fire the ERR trap again at the prompt, or
-/// close a `set -e` shell after a failure bash lets pass (`false && true`). Under
-/// functrace the DEBUG trap does not fire inside aterm's prompt functions (it would report
-/// one of their lines as the user's command and drop the typed command's 633;E); without
-/// functrace, a function wrapping the trap (starship's layering on bash < 4.4) still
-/// reports the commands typed after it. The user's PROMPT_COMMAND still reads `$?`.
 #[cfg(unix)]
 #[test]
 fn an_integrated_bash_keeps_the_users_err_trap_errexit_and_functrace_as_bare_bash_does() {
     need_pty_script();
     let fx = LiveFixture::new();
     let dir = install_script_set(&fx.base).expect("install");
-    // atpkg's dirs, its hook not yet written: a tab of a machine with atpkg.
     fx.lay_dirs();
     std::fs::write(
         fx.home.join(".bashrc"),
@@ -1412,11 +1219,9 @@ fn an_integrated_bash_keeps_the_users_err_trap_errexit_and_functrace_as_bare_bas
     sh.run_line("set -e", "0");
     sh.run_line("false && true", "1");
     sh.run_line("ls -d / >/dev/null", "0");
-    // atpkg writes its hook, as on every install and update.
     fx.lay_hook("bash", ATPKG_HOOK_POSIX_GOLDEN);
     sh.run_line("echo alive$((40+2))", "0");
     let from = sh.run_line("set -o functrace", "0");
-    // An empty line: a prompt with no command before it.
     sh.type_at_prompt(b"\r");
     sh.wait_for_after("\x1b]133;A", from);
     sh.run_line("f() { echo in-f; }; f", "0");
@@ -1437,7 +1242,6 @@ fn an_integrated_bash_keeps_the_users_err_trap_errexit_and_functrace_as_bare_bas
         stdout_between(&sh, from, sh.len())
     );
     sh.run_line("set +o functrace", "0");
-    // starship's layering when it finds a DEBUG trap (bash < 4.4), typed.
     let from = sh.run_line(
         r#"w() { local a=$1; eval -- "$T"; : "$a"; }; eval "T=($(trap -p DEBUG))"; T=("${T[2]}"); trap 'w "$_"' DEBUG"#,
         "0",
@@ -1455,17 +1259,6 @@ fn an_integrated_bash_keeps_the_users_err_trap_errexit_and_functrace_as_bare_bas
 }
 
 /// THE RC'S DEBUG TRAP (2026-10-17): a DEBUG trap the user's rc sets — two
-/// lines, a single quote inside — runs, chained, for a typed command, and
-/// aterm's own preexec still marks that command (`133;C`): with a re-key path,
-/// where the wrapper hands the trap over in `<re-key path>.trap` (which then
-/// holds it as `trap -p` prints it — no fork), and without one. NEGATIVE
-/// CONTROL: the same scripts with the wrapper's hand-over cut, where the
-/// integration's own `trap -p DEBUG` inside the `.` sees no trap: bash 3.2
-/// puts the rc's trap back over aterm's when the `.` returns (no mark), bash
-/// 4.4 and later keep aterm's and drop the rc's (no output) — never both. The
-/// line is one bash does not save (ignorespace), which only the DEBUG trap
-/// marks: bash 5.3's PS0 marks a saved line whatever the trap, so a saved line
-/// showed nothing of a chained trap that stopped marking.
 #[cfg(unix)]
 #[test]
 fn an_integrated_bash_chains_the_debug_trap_its_rc_set() {
@@ -1480,7 +1273,6 @@ fn an_integrated_bash_chains_the_debug_trap_its_rc_set() {
     .expect(".bashrc");
     let ours = install_script_set(&fx.base).expect("install");
     let unhanded = folder_with_edits(&fx.base, "00000000000000ac", &[]);
-    // The loader this platform starts bash on: `bash/bashrc` off macOS.
     let rcfile = unhanded.join("bash").join(BASH_LOADER_FILE);
     let wrapper = std::fs::read_to_string(&rcfile).expect("the control's loader");
     assert_eq!(
@@ -1544,14 +1336,6 @@ fn an_integrated_bash_chains_the_debug_trap_its_rc_set() {
 const BASH_HANDOVER_GUARD: &str = "if [ -z \"${ATERM_SHELL_INTEGRATION_INSTALLED:-}\" ]; then\n";
 
 /// A `.bashrc` that sources the integration itself (the line its header gives
-/// for a shell aterm did not start) keeps aterm's command marks in an aterm
-/// tab, with a re-key path and without: that load wired the DEBUG trap, and
-/// the wrapper's own load is then an upgrade in place that wires nothing, so
-/// the wrapper hands nothing over. NEGATIVE CONTROL: the hand-over unguarded,
-/// as 195c01197d wrote it, clears the trap the rc's load set, and the typed
-/// command goes unmarked. The line is one bash does not save (ignorespace),
-/// which only the DEBUG trap marks: bash 5.3's PS0 marks a saved line whatever
-/// the trap, so a saved line showed the control nothing there.
 #[cfg(unix)]
 #[test]
 fn an_integrated_bash_whose_rc_sources_the_integration_keeps_its_marks() {
@@ -1566,7 +1350,6 @@ fn an_integrated_bash_whose_rc_sources_the_integration_keeps_its_marks() {
     .expect(".bashrc");
     let ours = install_script_set(&fx.base).expect("install");
     let unguarded = folder_with_edits(&fx.base, "00000000000000ad", &[]);
-    // The loader this platform starts bash on: `bash/bashrc` off macOS.
     let rcfile = unguarded.join("bash").join(BASH_LOADER_FILE);
     let wrapper = std::fs::read_to_string(&rcfile).expect("the control's loader");
     assert_eq!(
@@ -1609,9 +1392,6 @@ fn an_integrated_bash_whose_rc_sources_the_integration_keeps_its_marks() {
 }
 
 /// The integration's read of the handed-over DEBUG trap (`read -d ''`, which
-/// answers 1 at the file's end) is no failed command to a `.bashrc`'s ERR trap
-/// or its `set -e`: the shell reaches its first prompt with nothing of the
-/// load reported, chains the rc's DEBUG trap and runs what is typed.
 #[cfg(unix)]
 #[test]
 fn an_integrated_bash_whose_rc_set_errexit_and_an_err_trap_loads_quietly() {
@@ -1653,11 +1433,6 @@ fn an_integrated_bash_whose_rc_set_errexit_and_an_err_trap_loads_quietly() {
 }
 
 /// The block's command and the tab title are the LINE as typed — a list, a
-/// pipeline, an alias — where they were its first simple command, alias-expanded
-/// (`true && sleep 3 | cat` showed `true` while it ran, `ll` was `ls -alF`). A
-/// line bash did not save (ignorespace) is reported as before, never as the
-/// previous line, and a user PROMPT_COMMAND that rewrites the history (`history
-/// -a; history -c; history -r`) does not make a saved line look unsaved.
 #[cfg(unix)]
 #[test]
 fn an_integrated_bash_reports_the_line_as_typed() {
@@ -1711,11 +1486,6 @@ fn an_integrated_bash_reports_the_line_as_typed() {
 }
 
 /// An ARRAY PROMPT_COMMAND (bash 5.1+ runs every element, aterm's first): the
-/// user's elements are no typed line, and the line typed after them is judged
-/// against the history as they left it. An element holding several commands
-/// (`__x=1; __y=2`) made a block at every prompt, an empty Enter's too, and a
-/// `history -a; history -c; history -r` element that read another tab's line
-/// made an ignorespace line typed next be reported, and titled, as that line.
 #[cfg(unix)]
 #[test]
 fn an_integrated_bash_with_an_array_prompt_command_reports_only_typed_lines() {
@@ -1742,7 +1512,6 @@ fn an_integrated_bash_with_an_array_prompt_command_reports_only_typed_lines() {
             .map(|rest| rest.split([';', '\x07']).next().unwrap_or("").to_owned())
             .collect()
     };
-    // Another tab's line, as its own `history -a` writes it.
     let other_tab_appends = || {
         use std::io::Write as _;
         std::fs::OpenOptions::new()
@@ -1786,9 +1555,6 @@ fn an_integrated_bash_with_an_array_prompt_command_reports_only_typed_lines() {
 }
 
 /// The user's `$_` reaches the user's code as in bare bash: `mkdir -p d && cd "$_"` enters
-/// d, and a command (and the user's PROMPT_COMMAND) reads the last argument of the one
-/// before it. The DEBUG trap's own command is the last one bash runs before each of the
-/// user's, so called bare it would leave `$_` reading `__aterm_preexec`.
 #[cfg(unix)]
 #[test]
 fn an_integrated_bash_keeps_the_users_last_argument() {
@@ -1821,25 +1587,10 @@ fn an_integrated_bash_keeps_the_users_last_argument() {
 }
 
 /// A compound command typed with its stdout redirected leaves the file holding
-/// its output and nothing else, and its block on the terminal. The DEBUG trap
-/// fires for the first simple command inside the compound once bash has applied
-/// the compound's redirections, so the preexec's 633;E (the line and the
-/// capability nonce), running title and 133;C went into the user's file ahead of
-/// its data, and the block never started on the terminal (measured on bash
-/// 5.2.21 in a real aterm: 419 bytes in `f` for `{ echo …; echo …; } > f`). The
-/// shapes: a group, `for`, `if`, `while` with a here-string, stdout and stderr
-/// both on the file (the marks then take /dev/tty: `script` gives the shell a
-/// controlling terminal), and stdout moved for the shell itself (`exec >f`),
-/// which put every mark of every prompt in the file. This build's script with
-/// the writer's terminal test cut is the negative control. On bash 5.3+ PS0
-/// starts a line bash saved before the compound's redirections apply, and the
-/// DEBUG trap starts only a line bash did not save (ignorespace): the control
-/// types those, and this build's script both.
 #[cfg(unix)]
 #[test]
 fn an_integrated_bash_keeps_its_marks_out_of_a_redirected_compound_command() {
     need_pty_script();
-    // (the line, the file it writes, what the file must hold)
     let compounds = [
         ("{ echo a; } > out-group", "out-group", "a\n"),
         (
@@ -1943,13 +1694,6 @@ fn an_integrated_bash_keeps_its_marks_out_of_a_redirected_compound_command() {
 }
 
 /// zsh's `133;B` says it stands where the buffer starts (`aterm_input=start`)
-/// only over an EMPTY buffer. zle draws a line pre-filled from its buffer stack
-/// before zle-line-init runs, and the mark comes from zle-line-init: after that
-/// text, where aterm-core must not take it for the buffer's start
-/// (`Terminal::input_region_start`). Here `print -z` pushes `echo pushed`, and
-/// the next prompt pops it: its signed `B` comes after the popped text and
-/// does not say so, while the prompt before it, over an empty buffer, does
-/// (the NEGATIVE CONTROL of the same shell).
 #[cfg(unix)]
 #[test]
 fn an_integrated_zsh_says_its_b_starts_the_buffer_only_over_an_empty_one() {
@@ -1965,7 +1709,6 @@ fn an_integrated_zsh_says_its_b_starts_the_buffer_only_over_an_empty_one() {
         &[("ATERM_SHELL_NONCE", REKEY_OLD), ("ATERM_CHILD", "1")],
     );
     let signed_b = format!("\x1b]133;B;id={REKEY_OLD}");
-    // The mark through its terminator, from the offset where it starts.
     let mark_at = |sh: &mut LiveShell, from: usize| -> String {
         let end = sh.wait_for_after(&signed_b, from);
         let close = sh.wait_for_after("\x07", end);
@@ -1992,7 +1735,6 @@ fn an_integrated_zsh_says_its_b_starts_the_buffer_only_over_an_empty_one() {
         matches!((text, mark), (Some(t), Some(m)) if t < m),
         "zsh: the popped line is drawn before the mark\n{drawn:?}"
     );
-    // Ctrl-U takes the popped line back before `exit`.
     sh.send_bytes(b"\x15");
     sh.finish();
 }

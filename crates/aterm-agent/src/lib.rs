@@ -27,6 +27,9 @@
     )
 )]
 
+#[cfg(test)]
+aterm_durable::plain_durable_flushes_in_tests!();
+
 /// The crate's durability flush ([`durable::sync_all`]).
 mod durable;
 

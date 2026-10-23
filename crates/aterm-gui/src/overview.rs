@@ -1,35 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE OVERVIEW (`docs/DESIGN-owner-surfaces-2026-10-16.md` §6, was the
-//! Connection Map): every session of this aterm on one card, grouped by window,
-//! each line saying what it needs of the person, else what it is doing, its
-//! task, and who drives it; then who manages whom, from the task records'
-//! `from=`. A keyboard selection model acts on it: ⏎ goes there, `t` takes the
-//! tab over or hands it back, `r` reads a done worker's result, ⌫ stops a
-//! worker behind an inline confirm that only a second ⌫ from the same hand
-//! resolves (⏎ always goes there), esc closes.
-//!
-//! ON THE FABRIC: where this
-//! aterm's fabric is on, a group after the windows lists each session on the
-//! fabric's other machines whose bus log says it needs the person
-//! ([`FabricChip`], composed by [`crate::overview_fabric`] from one bounded
-//! `aterm fabric brief --json` read): ◇ for a box or a question, ◆ for a
-//! failure, a wall or a session not responding, in the clause's own words,
-//! its node and how old its log is. An open need on a fresh read counts in
-//! the title at any age, as this aterm's own do; a chip from a read older
-//! than the fleet glance's `COUNT_FRESH` (the last good one, when the reads
-//! since failed), or of a session whose node is gone, is listed, said
-//! older, and never counted. A failed read says so on the group's header. It
-//! is read, never acted on (D1: a conclusion never acts on a session): ⏎,
-//! `t`, `r` and ⌫ on one do nothing, and the hint names its node.
-//!
-//! Pure like the palette and the picker: the App glue ([`crate::app_overview`])
-//! snapshots the words under the leaf locks every reader already takes (the
-//! published need verdict, the agent publication, the task record, the holds)
-//! and re-snapshots at paint time; this module owns only layout, selection and
-//! paint. It lives in the single modal [`crate::overlay::Overlay`] slot, so its
-//! keys are gated before the terminal.
+//! Overview card (`⌘⇧O` / `Ctrl+Shift+O`): session chips, fabric needs, and manager lines.
 
 #[cfg(test)]
 use aterm_render::Theme;
@@ -99,12 +71,9 @@ pub(crate) enum Driver {
     You,
     /// A manager here started its task (`worker of <label>`).
     WorkerOf(String),
-    /// A manager on no session of this aterm started it (`worker of <sid>
-    /// (not here)`).
+    /// A manager outside this aterm started it (`worker of <sid> (not here)`).
     WorkerOfElsewhere(String),
-    /// aterm's harness drives it, at this Autopilot in its chip's own
-    /// words (`driven by aterm (cruise)`, `(land, landed)`:
-    /// `crate::app_presence::driven_words`, which the tab's hover says too).
+    /// aterm's harness drives it under this Autopilot wording.
     Aterm(String),
 }
 
@@ -133,49 +102,32 @@ impl Driver {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct OverviewChip {
     pub(crate) sid: SessionId,
-    /// Registry local id: the raise, Take Over, Read Result and Stop Worker
-    /// act on it.
+    /// Registry local id.
     pub(crate) local_id: u64,
-    /// The tab label as the strip shows it (`App::tab_label_of_session`:
-    /// role, title pin, OSC title without its agent glyph, cwd, then the
-    /// tab's position).
+    /// Tab label as shown in the tab strip.
     pub(crate) label: String,
     pub(crate) mark: ChipMark,
     /// The need's word (`frozen`, `ask`, …), when one stands.
     pub(crate) need: Option<&'static str>,
-    /// The need's words, else what the session is doing and for how long
-    /// (`busy 3m`, `idle`, `shell`).
+    /// Need words, or what the session is doing and for how long.
     pub(crate) doing: String,
-    /// The task record's state word (`working`, `done`, `stalled`, …):
-    /// `controls overview`'s `task_state=`, as `ls` and `status` name it
-    /// (their `task=` is the Autopilot task's face).
+    /// Task record state word (`working`, `done`, `stalled`, …).
     pub(crate) task: Option<&'static str>,
     /// The task's words (`task working 12m`, `task done 4m · 2.1 KB`).
     pub(crate) task_words: Option<String>,
     /// Who drives it: one word, the person's hold first, so it is no count.
     pub(crate) driver: Option<Driver>,
-    /// WHY LAND STILL HOLDS (Autopilot v5 §12.3.1), where a land
-    /// act's yield did not land: the hold's words with no clock, as the menu
-    /// bar's landing worker's tip says them (`not landed yet: 2 unpushed
-    /// commits; open work in its report: follow-up · 3 nudges`,
-    /// `crate::harness_glass::hold_words`), painted on a line of its own
-    /// under the chip's ([`OverviewLine::Held`]), so the chip's own line
-    /// keeps its words (`driven by aterm (land) · typed by …`) and the card's
-    /// width cuts neither. `None` for every other chip.
+    /// Reason Land still holds, rendered on a line under the chip.
     pub(crate) held: Option<String>,
-    /// Who last typed into it over the socket and when, in words (S9:
-    /// `lab-sweep`, `4m ago`).
+    /// Who last typed into the session over the socket and when.
     pub(crate) typed: Option<(String, String)>,
-    /// Its task's `from=` names a manager (here or not): a worker, whoever
-    /// drives it now, so a worker the person took over still counts.
+    /// Whether the session's task `from=` names a manager.
     pub(crate) worker_of: bool,
-    /// The person's hold stands (`t` hands back rather than takes over, and
-    /// the key hint says so).
+    /// Whether the person's hold stands (`t` hands back).
     pub(crate) held_by_person: bool,
     /// Its task is done with a result to read (`r`).
     pub(crate) has_result: bool,
-    /// It runs a task a manager or `ctl` started and that is not over: ⌫
-    /// stops it.
+    /// Whether `⌫` can stop this session's running worker task.
     pub(crate) stoppable: bool,
 }
 
@@ -187,35 +139,26 @@ pub(crate) struct OverviewGroup {
     pub(crate) chips: Vec<OverviewChip>,
 }
 
-/// One session on another machine of this aterm's fabric whose log, read
-/// from the bus alone, says it needs the person: never one of
-/// this aterm's, never acted on.
+/// Remote fabric session whose bus log reports a person need.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct FabricChip {
     /// Its node id.
     pub(crate) node: String,
     /// Its face on the bus: the session's sid there.
     pub(crate) sid: String,
-    /// ◇ decide (a box, a question) or ◆ stuck (a failure, a wall, not
-    /// responding).
+    /// Leading mark (`◇` decide or `◆` stuck).
     pub(crate) mark: ChipMark,
     /// The need's word (`approval:bash`): `controls overview`'s `need=`.
     pub(crate) need: String,
     /// The need's words as the clause says them (`approval · bash`).
     pub(crate) words: String,
-    /// How old its log's newest record is, in seconds, as of the compose;
-    /// `None` when the brief could not say. Shown, never what decides
-    /// [`Self::older`]: a session waiting in a box writes nothing.
+    /// Age of its log's newest record in seconds as of the compose.
     pub(crate) age_s: Option<u64>,
-    /// Not known to stand now: its read is older than the fleet glance's
-    /// `COUNT_FRESH` (the reads since failed), or its node is gone (the
-    /// brief's `partial` says `node-gone`). Listed, never counted.
+    /// Whether its read is older than `COUNT_FRESH` or its node is gone.
     pub(crate) older: bool,
 }
 
-/// The fabric group as the card shows it: its chips, and the closed word
-/// for why the last read of the fabric's log failed (`None` after a good
-/// one), which the group's header and `controls overview` say.
+/// Fabric group chips and optional read-failure word.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct FabricGroup {
     /// The chips, in the brief's order.
@@ -240,8 +183,7 @@ pub(crate) struct Manages {
     pub(crate) workers: Vec<(SessionId, String)>,
 }
 
-/// One selectable element — a session chip or a manages line — in navigation
-/// order (every group's chips first, then the manages lines).
+/// Selectable element in navigation order.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum OverviewItem {
     Chip {
@@ -257,8 +199,7 @@ pub(crate) enum OverviewItem {
     },
 }
 
-/// What a key on the selection means — decided here so keyboard, pointer and
-/// a11y never diverge.
+/// Action resolved from a key or click on the current selection.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub(crate) enum OverviewAct {
     /// Nothing to act on.
@@ -269,8 +210,7 @@ pub(crate) enum OverviewAct {
     TakeOverOrHandBack(u64),
     /// Read this done worker's result.
     ReadResult(u64),
-    /// The Stop Worker confirm is now armed on the selection, this worker
-    /// (its local id): the App may refuse the arm and cancel it.
+    /// Stop Worker confirm armed on this worker's local id.
     Armed(u64),
     /// Stop this worker (the armed confirm resolved).
     StopWorker(u64),
@@ -286,7 +226,6 @@ enum OverviewLine {
         chip: usize,
     },
     /// Why Land still holds a chip ([`OverviewChip::held`]), under its
-    /// line: part of the chip's item (a click there is a click on it).
     Held {
         item: usize,
         group: usize,
@@ -313,14 +252,12 @@ struct OverviewLayout {
     body_rows: usize,
 }
 
-/// Transient state of the open Overview — the
-/// [`crate::overlay::Overlay::Overview`] payload.
+/// Transient state of the open Overview overlay.
 pub(crate) struct OverviewState {
     /// The hosting (frontmost-at-open) window.
     pub(crate) window: crate::WindowId,
     groups: Vec<OverviewGroup>,
     /// The fabric group's chips ([`FabricChip`]), empty where the fabric is
-    /// off or its log names no need.
     fabric: Vec<FabricChip>,
     /// Why the last read of the fabric's log failed ([`FabricGroup::failed`]).
     fabric_failed: Option<&'static str>,
@@ -332,15 +269,11 @@ pub(crate) struct OverviewState {
     /// The chip item whose Stop Worker confirm is armed.
     confirm: Option<usize>,
     /// The armed confirm is a CONTROL CLIENT'S (its ⌫ came through the `key`
-    /// verb): only a ⌫ from the same hand resolves it, so a script's ⌫ never
-    /// leaves a confirm the person's next key fires.
     confirm_by_controller: bool,
     /// Exact item index under the pointer (the palette's distinct rule).
     pointer_over: Option<usize>,
     pointer_armed: Option<usize>,
     /// How many sessions another aterm on this Mac holds, as the last sibling
-    /// scan counted them (the figure ❯'s This Mac line names): the title
-    /// says it beside this aterm's own.
     elsewhere: usize,
 }
 
@@ -375,8 +308,7 @@ impl OverviewState {
         }
     }
 
-    /// The sibling aterms' session count moved (the last sibling scan's):
-    /// reports whether the title changed.
+    /// Update the sibling aterm session count and return whether it changed.
     pub(crate) fn set_elsewhere(&mut self, elsewhere: usize) -> bool {
         std::mem::replace(&mut self.elsewhere, elsewhere) != elsewhere
     }
@@ -399,7 +331,6 @@ impl OverviewState {
     }
 
     /// The painted body lines: group headers and chips, then the manages
-    /// lines under their own header; an honest placeholder when empty.
     fn lines(&self) -> Vec<OverviewLine> {
         let mut out = Vec::new();
         let mut item = 0;
@@ -451,7 +382,6 @@ impl OverviewState {
     }
 
     /// A chip of THIS aterm's: what every act on the card acts on. A
-    /// fabric chip is none ([`Self::fabric_chip`]), so no act reaches one.
     fn chip(&self, item: OverviewItem) -> Option<&OverviewChip> {
         match item {
             OverviewItem::Chip { group, chip } => self.groups.get(group)?.chips.get(chip),
@@ -468,13 +398,11 @@ impl OverviewState {
     }
 
     /// Whether the card shows the fabric group: it lists a chip, or the last
-    /// read failed (its header alone then says so).
     fn fabric_shown(&self) -> bool {
         !self.fabric.is_empty() || self.fabric_failed.is_some()
     }
 
-    /// The selected fabric chip, when the selection is one: the hint names
-    /// its node.
+    /// Selected fabric chip, when the selection is on one.
     pub(crate) fn selected_fabric(&self) -> Option<&FabricChip> {
         self.fabric_chip(self.selected_item()?)
     }
@@ -490,9 +418,6 @@ impl OverviewState {
     }
 
     /// How many sessions the card lists, how many need the person, and how
-    /// many are workers. The needs count the fabric chips not said older
-    /// ([`FabricChip::older`]: a fresh read's open needs, at any age); the
-    /// sessions and workers are this aterm's.
     fn counts(&self) -> (usize, usize, usize) {
         let chips = self.groups.iter().flat_map(|g| g.chips.iter());
         let (mut sessions, mut needs, mut workers) = (0, 0, 0);
@@ -505,11 +430,7 @@ impl OverviewState {
         (sessions, needs, workers)
     }
 
-    /// The card's title: `This aterm — 14 sessions (+3 in another aterm) · 2
-    /// need you · 3 workers`. The card lists this instance's sessions only
-    /// (another aterm on the Mac is Read This Mac's), so its title names this
-    /// aterm, not the Mac, and counts the other aterms' sessions apart, as
-    /// ❯'s This Mac line does.
+    /// Format the Overview card's title line.
     pub(crate) fn title(&self) -> String {
         let (sessions, needs, workers) = self.counts();
         let plural = |n: usize, one: &str, many: &str| {
@@ -558,9 +479,6 @@ impl OverviewState {
         );
         let mut s = parts.join(" \u{00b7} ");
         if self.confirm == Some(item) {
-            // Worded for the person who reads the card: a confirm a control
-            // client armed is resolved by no key of theirs, so it is a fresh
-            // ask — two of their ⌫ stop it ([`Self::stop_pressed`]).
             s.push_str(if self.confirm_by_controller {
                 "  a script asks to stop it \u{00b7} \u{232b} twice stops it \u{00b7} esc keeps"
             } else {
@@ -571,10 +489,6 @@ impl OverviewState {
     }
 
     /// A fabric chip's display line (paint == a11y): `◇ approval · bash —
-    /// s-1e91 on n-7c2a · 4m` (no age where the brief could not say one),
-    /// and `older` where it is not known to stand ([`FabricChip::older`]).
-    /// What the card shows of a chip is exactly this: its exact age moves
-    /// nothing until these coarse words do ([`Self::set_fabric`]).
     fn fabric_text(chip: &FabricChip) -> String {
         let mut s = format!(
             "{} {} \u{2014} {} on {}",
@@ -593,8 +507,7 @@ impl OverviewState {
         s
     }
 
-    /// Whether `t` hands the selected tab back (the person holds it) rather
-    /// than takes it over: what the key hint names.
+    /// Whether `t` hands the selected tab back rather than taking it over.
     pub(crate) fn t_hands_back(&self) -> bool {
         self.selected_chip().is_some_and(|c| c.held_by_person)
     }
@@ -655,9 +568,7 @@ impl OverviewState {
         }
     }
 
-    /// Replace the snapshot (the words moved). Selection and the armed
-    /// confirm survive by identity, so a refresh never re-aims either at
-    /// whatever inherited the ordinal. Reports whether anything changed.
+    /// Replace the snapshot while preserving selection and confirm by identity.
     pub(crate) fn retarget(&mut self, groups: Vec<OverviewGroup>, manages: Vec<Manages>) -> bool {
         if self.groups == groups && self.manages == manages {
             return false;
@@ -669,12 +580,7 @@ impl OverviewState {
         true
     }
 
-    /// Replace the fabric group (a read of the fabric's log landed, or its
-    /// ages moved), selection and confirm surviving by identity as
-    /// [`Self::retarget`]'s do. Reports whether what the card SHOWS changed
-    /// ([`Self::fabric_text`] of each chip, and whether a read failed): an
-    /// age that moved a second, which every compose's does, is kept for
-    /// `controls overview` and repaints nothing until its coarse words move.
+    /// Replace the fabric group and report whether the displayed words changed.
     pub(crate) fn set_fabric(&mut self, group: FabricGroup) -> bool {
         let FabricGroup {
             chips: fabric,
@@ -708,7 +614,6 @@ impl OverviewState {
     }
 
     /// Apply `change` to the lists, then re-find the selection and the armed
-    /// confirm by identity.
     fn reshape(&mut self, change: impl FnOnce(&mut Self)) {
         let keep_selected = self.identity(self.selected);
         let keep_confirm = self.confirm.and_then(|idx| self.identity(idx));
@@ -732,7 +637,6 @@ impl OverviewState {
             .and_then(|id| find(self, id))
             .unwrap_or(0)
             .min(self.items().len().saturating_sub(1));
-        // A confirm survives only on a chip that can still be stopped.
         self.confirm = keep_confirm
             .as_ref()
             .and_then(|id| find(self, id))
@@ -777,10 +681,7 @@ impl OverviewState {
         self.clamp_scroll();
     }
 
-    /// Move the cursor to `session` (its local id), where an entrance opened
-    /// the card AT it: with `as_manager`, its manages line when it manages
-    /// workers here, else its chip. `false`, the cursor unmoved, when the
-    /// card lists neither.
+    /// Move the cursor to `session` (its manages line when `as_manager` and present, else its chip).
     pub(crate) fn select_session(&mut self, session: u64, as_manager: bool) -> bool {
         let items = self.items();
         let line = items.iter().position(|item| {
@@ -820,8 +721,6 @@ impl OverviewState {
             return;
         }
         if let Some(line) = self.line_of_item(self.selected) {
-            // The chip's held line (`OverviewLine::Held`) comes into view
-            // with it: its last line is what must fit.
             let last = match self.lines().get(line + 1) {
                 Some(OverviewLine::Held { item, .. }) if *item == self.selected => line + 1,
                 _ => line,
@@ -835,12 +734,7 @@ impl OverviewState {
         self.scroll = self.scroll.min(total.saturating_sub(body));
     }
 
-    /// ⏎ / click: go to a chip's session; on a manages line, to the manager.
-    /// NEVER A STOP, armed or not: ⏎ is the person's habitual key, so an
-    /// armed Stop Worker confirm is dropped and only a second ⌫ resolves one
-    /// ([`Self::stop_pressed`]). On a fabric chip, nothing: no session of
-    /// this aterm's is that one, and a conclusion read off the fabric never
-    /// acts on a session (D1).
+    /// Activate the selected chip or manages line (`⏎` or click).
     pub(crate) fn activate(&mut self) -> OverviewAct {
         self.confirm = None;
         match self.selected_item() {
@@ -872,11 +766,7 @@ impl OverviewState {
             .map_or(OverviewAct::None, |c| OverviewAct::ReadResult(c.local_id))
     }
 
-    /// ⌫: on a stoppable worker, arm the inline confirm, or (armed on it BY
-    /// THE SAME HAND) resolve to the stop. `controller` says whose ⌫ this is:
-    /// a confirm one hand armed is re-armed, never resolved, by the other's ⌫,
-    /// so neither can finish what the other started. Anything else does
-    /// nothing: ⌫ only ever stops a worker.
+    /// Handle `⌫` on a stoppable worker (arm confirm, or resolve when armed by the same hand).
     pub(crate) fn stop_pressed(&mut self, controller: bool) -> OverviewAct {
         let Some(chip) = self.selected_chip().filter(|c| c.stoppable) else {
             self.confirm = None;
@@ -892,10 +782,7 @@ impl OverviewState {
         OverviewAct::Armed(local)
     }
 
-    /// Select `session`'s chip and arm its Stop Worker confirm for this hand
-    /// (`controller`), as a first ⌫ on it would: the tab menu's Stop Worker…
-    /// where no sheet can ask. `false` (nothing armed) when the card lists no
-    /// stoppable chip of that session.
+    /// Select `session`'s chip and arm its Stop Worker confirm.
     pub(crate) fn arm_stop_on(&mut self, session: u64, controller: bool) -> bool {
         let Some(idx) = self
             .items()
@@ -914,8 +801,7 @@ impl OverviewState {
         self.confirm = None;
     }
 
-    /// esc: an armed confirm is cancelled (the card stays open); otherwise
-    /// the card closes. Returns `true` to close.
+    /// Cancel an armed confirm on `Esc`, or return `true` to close the card.
     pub(crate) fn escape(&mut self) -> bool {
         if self.confirm.is_some() {
             self.confirm = None;
@@ -923,8 +809,6 @@ impl OverviewState {
         }
         true
     }
-
-    // ---- Pointer arming (the palette press/release discipline) -------------
 
     /// Hover an item, dragging the selection with the pointer.
     pub(crate) fn pointer_hover(&mut self, idx: Option<usize>) -> bool {
@@ -944,8 +828,7 @@ impl OverviewState {
         changed
     }
 
-    /// Settle a left release: `(changed, activate)`; activation requires the
-    /// same item at press and release.
+    /// Settle a left pointer release into `(changed, activate)`.
     pub(crate) fn pointer_release(&mut self, idx: Option<usize>) -> (bool, bool) {
         let mut changed = self.pointer_hover(idx);
         let armed = self.pointer_armed.take();
@@ -956,8 +839,6 @@ impl OverviewState {
     pub(crate) fn pointer_over_item(&self) -> bool {
         self.pointer_over.is_some()
     }
-
-    // ---- Overlay-model surface --------------------------------------------
 
     /// The overlay height: chrome + the (capped) body band, never `0`.
     pub(crate) fn wanted_rows(&self) -> usize {
@@ -970,8 +851,7 @@ impl OverviewState {
         (self.scroll, total, total.min(MAX_BODY_LINES))
     }
 
-    /// Machine-readable lines for `controls overview`: the same rows the card
-    /// paints, as words, so screen == introspection.
+    /// Machine-readable lines for `controls overview`.
     pub(crate) fn controls_lines(&self) -> Vec<String> {
         let (sessions, needs, workers) = self.counts();
         let mut out = vec![format!(
@@ -1075,8 +955,6 @@ impl OverviewState {
                 chip.held_by_person.hash(&mut h);
             }
         }
-        // What the card shows of the fabric group, never a chip's exact age
-        // (`set_fabric`): a second's move repaints nothing.
         for chip in &self.fabric {
             Self::fabric_text(chip).hash(&mut h);
         }
@@ -1129,7 +1007,6 @@ impl OverviewState {
 }
 
 /// One pure geometry projection shared by paint and hit-testing — the
-/// palette's centred, width-capped, content-height card.
 fn overview_layout(state: &OverviewState, g: &SettingsGeom) -> OverviewLayout {
     let tray_w = (g.cols as f32 * g.cw).max(0.0);
     let tray_h = (g.panel_rows as f32 * g.ch).max(0.0);
@@ -1173,8 +1050,7 @@ fn overview_row_rect_in(
     ))
 }
 
-/// Item index under a card-local point — only painted chip and manages lines
-/// participate (headers and the placeholder carry no selection).
+/// Item index under a card-local point `(px, py)`.
 pub(crate) fn overview_item_hit(
     state: &OverviewState,
     g: &SettingsGeom,
@@ -1201,12 +1077,6 @@ pub(crate) fn overview_item_hit(
 }
 
 /// `s` as the card paints it in `room` px at `px`: whole where it fits, else
-/// cut on a whole char to end in `…`. Measured with the face's own advances
-/// ([`crate::settings::text_w`]), because the grid's cell is rounded to the
-/// device pixel and the chrome's monospace face is not: at 1x a 7 px cell
-/// carries a 7.5 px glyph, so a count of cells runs a long line past the
-/// ring. The run's mean advance puts the first cut within a char of the
-/// edge, so a line costs two or three measures, not one per char.
 fn fit_body(s: &str, room: f32, px: f32) -> String {
     let cells = crate::tab_menu::display_cells(s);
     let whole = crate::settings::text_w(s, px);
@@ -1228,8 +1098,7 @@ fn fit_body(s: &str, room: f32, px: f32) -> String {
     }
 }
 
-/// Paint the card: title and counts, the grouped band (cursor washed and
-/// ringed; the armed confirm ringed in the danger role), a key-hint footer.
+/// Paint the Overview card into a [`SettingsTray`].
 pub(crate) fn overview_tray(
     state: &OverviewState,
     g: &SettingsGeom,
@@ -1263,7 +1132,6 @@ pub(crate) fn overview_tray(
             OverviewLine::Chip { .. }
             | OverviewLine::Fabric { .. }
             | OverviewLine::Manages { .. } => (cw * 2.5, r.text_primary),
-            // Under the chip's words, past its mark: the chip's own line.
             OverviewLine::Held { .. } => (cw * 4.5, r.text_secondary),
             OverviewLine::Empty => (cw * 2.0, r.text_tertiary),
         };
@@ -1274,7 +1142,6 @@ pub(crate) fn overview_tray(
         {
             let (x, y, w, mut h) = overview_row_rect_in(&layout, g, slot)
                 .expect("painted overview slot has a row rectangle");
-            // A held chip's ring takes in its held line where it is painted.
             if slot + 1 < layout.body_rows
                 && matches!(
                     lines.get(state.scroll + slot + 1),
@@ -1306,8 +1173,6 @@ pub(crate) fn overview_tray(
                 color: rgba(ring, 0xCC),
             });
         }
-        // A line the card is too narrow for ends in `…` inside the ring's
-        // edge, never cut mid-word by the frame.
         text_at(
             &mut prims,
             card_x + indent,
@@ -1321,8 +1186,6 @@ pub(crate) fn overview_tray(
     let hint = match (state.confirm.is_some(), state.confirm_by_controller) {
         (true, false) => "\u{232b} again stop worker   \u{23ce} go   esc keep",
         (true, true) => "\u{232b}\u{232b} stop worker   \u{23ce} go   esc keep",
-        // A fabric chip's session is on another machine: nothing here acts
-        // on it, and the hint says where it is.
         (false, _) if state.selected_fabric().is_some() => {
             fabric_hint = fabric_hint_of(state.selected_fabric().map_or("", |c| &c.node));
             fabric_hint.as_str()
@@ -1344,8 +1207,7 @@ pub(crate) fn fabric_hint_of(node: &str) -> String {
     format!("\u{2191}\u{2193} move   on {node}, answered there   esc close")
 }
 
-/// The card's accessibility tree — the palette scheme verbatim: a ListBox of
-/// the items, epoch-guarded ids, focus follows the cursor.
+/// Build the Overview card's accessibility tree.
 #[cfg(a11y_tree)]
 pub(crate) fn overview_a11y(state: &OverviewState) -> aterm_a11y::model::TreeUpdate {
     use aterm_a11y::model::{Action, Node, Role};
@@ -1448,8 +1310,6 @@ mod tests {
     }
 
     /// The card's counts and words are the chips': sessions, needs, workers,
-    /// each chip's mark, need, task and driver, and the manages line naming
-    /// the manager and its workers. Introspection mirrors paint row for row.
     #[test]
     fn the_card_counts_needs_and_workers_and_lists_who_manages_whom() {
         let s = state();
@@ -1475,7 +1335,6 @@ mod tests {
                 .iter()
                 .any(|l| l.starts_with("overview manages manager=a local=1 workers=b,c"))
         );
-        // Paint: one text per header, chip and manages line, plus the title.
         let tray = overview_tray(&s, &geom(), Theme::default());
         let texts = tray
             .prims
@@ -1486,7 +1345,6 @@ mod tests {
     }
 
     /// WHO TYPED rides a chip's line after its driver, and `controls` names
-    /// the typist (S9). CONTROL: a chip nobody typed into says neither.
     #[test]
     fn a_chip_says_who_typed_after_its_driver() {
         let mut s = state();
@@ -1512,9 +1370,6 @@ mod tests {
     }
 
     /// AN ENTRANCE OPENS THE CARD AT A SESSION: a manager's lands on its
-    /// manages line, any other on the session's chip, and one the card does
-    /// not list moves nothing. NEGATIVE CONTROL: a session that manages
-    /// nobody, asked for as a manager, lands on its chip.
     #[test]
     fn select_session_lands_on_the_manages_line_or_the_chip() {
         let mut s = state();
@@ -1531,10 +1386,6 @@ mod tests {
     }
 
     /// The keys resolve to the acts the design names: ⏎ goes to the chip's
-    /// session or the manages line's manager, and never stops anything, armed
-    /// or not; `t` takes over (or hands back) the selected session; `r` reads
-    /// only a done worker's result; ⌫ arms and a second ⌫ stops only a
-    /// stoppable worker, moving away or esc cancels.
     #[test]
     fn the_keys_resolve_to_their_acts_and_stop_is_two_steps() {
         let mut s = state();
@@ -1542,26 +1393,21 @@ mod tests {
         assert_eq!(s.take_over_pressed(), OverviewAct::TakeOverOrHandBack(1));
         assert_eq!(s.read_result_pressed(), OverviewAct::None, "no result on a");
         assert_eq!(s.stop_pressed(false), OverviewAct::None, "a is no worker");
-        // b: a working worker — ⌫ arms, then stops.
         s.move_selection(1);
         assert_eq!(s.stop_pressed(false), OverviewAct::Armed(2));
         assert!(s.controls_lines()[0].contains("confirm=1 confirm_by=person"));
         assert_eq!(s.stop_pressed(false), OverviewAct::StopWorker(2));
-        // Armed again, ⏎ goes there and drops the confirm; moving away cancels.
         assert_eq!(s.stop_pressed(false), OverviewAct::Armed(2));
         assert_eq!(s.activate(), OverviewAct::Raise(2));
         assert!(s.controls_lines()[0].contains("confirm=-"));
         assert_eq!(s.stop_pressed(false), OverviewAct::Armed(2));
         s.move_selection(1);
         assert!(s.controls_lines()[0].contains("confirm=-"));
-        // c: done with a result — `r` reads it, ⌫ stops nothing.
         assert_eq!(s.read_result_pressed(), OverviewAct::ReadResult(3));
         assert_eq!(s.stop_pressed(false), OverviewAct::None);
-        // The manages line: ⏎ goes to the manager.
         s.move_selection(1);
         assert_eq!(s.activate(), OverviewAct::Raise(1));
         assert_eq!(s.take_over_pressed(), OverviewAct::None);
-        // esc cancels an armed confirm first, then closes.
         s.move_selection(-2);
         assert_eq!(s.stop_pressed(false), OverviewAct::Armed(2));
         assert!(!s.escape());
@@ -1569,10 +1415,6 @@ mod tests {
     }
 
     /// ONE HAND'S ⌫ NEVER RESOLVES THE OTHER'S CONFIRM: a control client's ⌫
-    /// arms a confirm the person's ⌫ only re-arms (as the person's), and the
-    /// person's own second ⌫ stops; the same both ways. CONTROL: one hand's
-    /// two ⌫ stop. The tab menu's arm selects the chip and arms it for its
-    /// hand; a session the card lists no stoppable chip of arms nothing.
     #[test]
     fn a_confirm_is_resolved_only_by_the_hand_that_armed_it() {
         let mut s = state();
@@ -1589,7 +1431,6 @@ mod tests {
         );
         assert_eq!(s.stop_pressed(true), OverviewAct::Armed(2), "re-armed");
         assert_eq!(s.stop_pressed(true), OverviewAct::StopWorker(2));
-        // The tab menu's arm, from another selection.
         s.move_selection(-1);
         assert!(s.arm_stop_on(2, false));
         assert!(
@@ -1604,11 +1445,6 @@ mod tests {
     }
 
     /// A WORKER THE PERSON HOLDS IS STILL A WORKER, AND `t` HANDS IT BACK.
-    /// The driver slot says `you have it` (one word), so the count reads the
-    /// task's `from=`, not the driver: taking a worker over leaves the
-    /// title's and `controls`' worker count where it was. The key hint names
-    /// what `t` does on the selection. CONTROL: on the unheld worker `t`
-    /// takes over.
     #[test]
     fn a_held_worker_still_counts_and_t_hands_it_back() {
         let mut s = state();
@@ -1628,13 +1464,11 @@ mod tests {
     }
 
     /// A refresh keeps the selection and the armed confirm by identity, and
-    /// drops the confirm once the chip can no longer be stopped.
     #[test]
     fn retarget_keeps_selection_identity_and_drops_a_dead_confirm() {
         let mut s = state();
         s.move_selection(1);
         assert_eq!(s.stop_pressed(false), OverviewAct::Armed(2));
-        // A new session listed first: b is found by its sid.
         let mut groups = state().groups;
         groups[0].chips.insert(0, chip("z", 9));
         assert!(s.retarget(groups.clone(), state().manages));
@@ -1645,25 +1479,12 @@ mod tests {
             !s.retarget(groups.clone(), state().manages),
             "same words: no change"
         );
-        // b's task ended: no confirm survives on it.
         groups[0].chips[2].stoppable = false;
         assert!(s.retarget(groups, state().manages));
         assert!(s.controls_lines()[0].contains("confirm=-"));
     }
 
     /// WHY LAND HOLDS IS A LINE OF ITS OWN UNDER ITS CHIP (Autopilot v5
-    /// §12.3.1): at the card's widest (760 px) a held
-    /// chip's own line keeps its words whole, `typed by` last, and the hold's
-    /// words are painted under it, past its mark, in the secondary ink; a
-    /// line too long for the card ends in `…` at its edge, never cut
-    /// mid-word by the frame. The held line is the chip's item: a click
-    /// there selects it, the selection ring takes it in, the band's rows
-    /// count it, a scroll brings it into view with its chip, and `controls`
-    /// says `held=1`. NEGATIVE CONTROLS (as run): the painter without its
-    /// `…` clip paints the held line whole past the card's edge; the clip
-    /// counted in grid cells runs the held line past the ring on a grid
-    /// whose cell is narrower than the face's glyph; the held line drawn as
-    /// a chip line (no `Held` arm in the hit test) is no click on the chip.
     #[test]
     fn a_held_chip_says_why_on_a_line_of_its_own_cut_with_an_ellipsis() {
         let held = "not landed yet: needs you; 3 changed files, 1 untracked file, 1 stash, 4 \
@@ -1689,7 +1510,6 @@ mod tests {
         let g = geom();
         let layout = overview_layout(&s, &g);
         assert_eq!(layout.card.2, MAX_CARD_WIDTH, "the card at its widest");
-        // Header, a, the held chip and its line, z.
         assert_eq!(s.lines().len(), 5);
         assert_eq!(s.wanted_rows(), CHROME_ROWS + 5);
         let texts = |s: &OverviewState| -> Vec<(f32, String)> {
@@ -1723,9 +1543,6 @@ mod tests {
             "cut with `…`: {}",
             under.1
         );
-        // Every line ends inside the ring, measured as the face draws it, on
-        // this grid and on one whose cell is narrower than the face's glyph
-        // (a 7 px cell at 1x carries a 7.5 px glyph).
         let px = TypeStep::Body.px(g.font_px).get();
         let narrow = SettingsGeom {
             cw: crate::settings::text_w("0", px) * 0.9,
@@ -1756,7 +1573,6 @@ mod tests {
                 );
             }
         }
-        // The held line is the chip's: a click there selects it.
         let (x, y, w, h) = overview_row_rect_in(&layout, &g, 3).expect("its slot");
         assert_eq!(overview_item_hit(&s, &g, x + w * 0.5, y + h * 0.5), Some(1));
         assert!(
@@ -1766,7 +1582,6 @@ mod tests {
             "{:?}",
             s.controls_lines()
         );
-        // Selected, its ring takes in both lines.
         s.select(1);
         let ring = overview_tray(&s, &g, Theme::default())
             .prims
@@ -1780,7 +1595,6 @@ mod tests {
     }
 
     /// Painter and hit-test share one row rectangle; the fingerprint moves
-    /// with the words.
     #[test]
     fn hit_test_paint_and_fingerprint_share_one_state() {
         let mut s = state();

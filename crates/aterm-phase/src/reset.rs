@@ -1,113 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Claude Code's LIMIT RESET — the grant rows of the usage-limit dialog and
-//! the one of them the step may take ([`reset_row`]), the confirmation it
-//! opens ([`reset_confirm`]), the two pending lines between them
-//! ([`reset_pending`]) and the one line the vendor answers with
-//! ([`reset_line`]) — as pure functions over a parsed box, a screen's rows or
-//! a line of text.
+//! Exact-match parsers for Claude Code usage-limit reset dialogs and outcomes.
 //!
-//! It is here for the supervisor's limit-reset step
-//! (`docs/SPEC-claude-accounts-resets-2026-10-02.md`, R2, R11, R14, R15): a
-//! reset is the owner's scarce purchase, so a row is matched by its exact
-//! template and never by its place, the confirmation must read exactly
-//! before anything is pressed on it, and only a spent line read whole says a
-//! reset was spent. Every reader here REFUSES what it does not read whole:
-//! `None`, [`ConfirmRead::Inexact`] and [`ResetLine::Other`] are the answers
-//! to anything reworded, and none of them spends a reset.
-//!
-//! ONE WORDING: Claude Code 2.1.304's, which every build since draws
-//! unchanged through 2.1.308, the store's build, and which the drift canaries
-//! grep (`crate::anchors`). 2.1.305 to 2.1.308 were read again on 2026-10-22,
-//! the reset program's bundle chunks diffed against 2.1.304's with the
-//! minifier's names set aside: the same texts, rows, confirmation and
-//! answers, and one change of the reset's code, 2.1.307's suffix helper for
-//! `Yn`'s strip (the drift canary takes either spelling), which draws the
-//! same names. The wording of 2.1.287 to 2.1.303 — `Use your reset now (…)`,
-//! `Use your reset?`, `Yes, use my reset`, one `Limits reset · …` for every
-//! grant, `Reset kept · …` — drawn by an older build still running, or by a
-//! flag payload that carries the old strings, reads as no grant row, a
-//! confirmation not read exactly and an `Other` line: refused, nothing spent.
-//!
-//! NOTHING HERE IS MEASURED. No wall with a reset on offer has been seen on a
-//! screen or in a transcript: every text below is READ in the 2.1.304
-//! bundle — `@` a byte offset into that build's binary, its JavaScript
-//! source — and every fixture ([`fixtures`]) is COMPOSED and says so on its
-//! first line. What is read, and where:
-//!
-//! * THE KINDS (`CLe` @244628502; [`ResetKind`]): a reset is of one kind —
-//!   `session`, `weekly`, `fable` or `full` — and every text of it names
-//!   that kind. `{kind}` (`X()` @244629154) is `5-hour reset`, `weekly
-//!   reset`, `Fable reset` or `full reset`; `{Kind}` the same with its first
-//!   letter upper-cased; `{kindResets}` (`ce()` @244629310) `no <noun>s`,
-//!   `1 <noun>` or `<n> <noun>s`, the noun `five-hour reset` for the session
-//!   kind (never `5-hour`) and `{kind}` for the others; `{done}` (`Mt()`
-//!   @244629627) `Session limit reset`, `Weekly limits reset`, `Fable reset
-//!   used · what Fable used is back in your weekly limit` and `Limits
-//!   reset`.
-//! * THE TEXTS (the table `Ug` @225876351): the row `Use a {kind} ({left}
-//!   left, until {date})`; the title `Use a {kind}?`; the body `Refills your
-//!   {limits} now · {returns} · your weekly reset day stays {week}`, whose
-//!   `{returns}` only the Fable kind has (`Ot()` @244629539: `returns what
-//!   Fable used to your weekly limit`), the others' segment dropped; the
-//!   detail `{kindResets} left · use by {deadline}`; `Yes, use my {kind}`;
-//!   `No, keep it`; the answers `{done} · your weekly reset day stays {week}
-//!   · {kindResets} left` and `{Kind} kept · run /limit-reset at a limit to
-//!   use it · use by {deadline}` (`… whenever you want to use it …` away from
-//!   a wall); the early lines `You still have {percent}% of your {limit} left
-//!   — use your {kind} anyway?` and `You haven't reached a limit yet — use
-//!   your {kind} anyway?`. The server's flag payload may replace any of them
-//!   (`mH()` @225878330): a replaced text is one these readers refuse.
-//! * THE GRAMMAR (`Kg` @225879482): `{left}` is a bare number. A ` · `
-//!   segment whose placeholder has no value is DROPPED; where all would drop,
-//!   a parenthetical holding one is removed — a grant with no end date draws
-//!   a bare `Use a 5-hour reset`.
-//! * THE DATES (`KC` @221890081 over `CT` @215952239, the formatter 2.1.287
-//!   drew with): `{date}` is the day alone (`Oct 5`; `Jan 2, 2027` in another
-//!   year); `{deadline}` and `{week}` are a day and an hour (`Oct 5 at 3pm`,
-//!   `Oct 5 at 3:30pm`), `en-US`, in the process's zone. A zone is named — `
-//!   (<zone>)` after EVERY value, inside the row's own parentheses too
-//!   (`until Oct 5 (UTC))`) — only under a host's zone override or on a
-//!   diskless host (`Rqn` @220364486): a plain local CLI names none, and these
-//!   readers refuse a value that names one. The ` at ` is the runtime's join,
-//!   MEASURED on a wall notice the same formatter drew (`resets Oct 1 at
-//!   9am`).
-//! * THE LIMITS (`Yn` @244635663): `session`, `weekly`, `Opus`, `Sonnet`,
-//!   each the name of a limit type ([`reset_limit_name`]), and `Fable` first
-//!   for a grant that gives Fable's usage back; one name reads `<name>
-//!   limit`, several `a, b and c limits`, none `limits`.
-//! * THE DIALOG'S ROWS (`so()` @257500437): the stop row, then ONE ROW PER
-//!   KIND ON OFFER (@257504167), each only where a grant of that kind refills
-//!   the walled limit (`TLe` @244631077), the wall's own kind first and the
-//!   rest in the kinds' order (`Xe` @244629033; a Fable row last at a weekly
-//!   wall, its label ending ` · frees up only what Fable used this week`) —
-//!   rows that may come after the dialog opens; ONLY where there is no grant
-//!   row, the weekly session reset's `Reset your session limit now`
-//!   (@257504453), which claims AT ONCE with no confirmation; then the wait
-//!   row.
-//! * THE ROW TAKEN (@257511049): the dialog redraws as its title over a dim
-//!   `Checking for a reset…` (`jVe` @244652675), then either ends with one
-//!   answer line or mounts that kind's confirmation in its place — never the
-//!   chooser `Which reset do you want to use?` (`Fnt` @257468497), which only
-//!   a typed `/limit-reset` with no kind named opens, and every option of
-//!   which spends.
-//! * THE CONFIRMATION (`_Ae` @257466054; its buttons `sr` @234846790): the
-//!   wall dialog's own Dialog component over a column of `[early line |
-//!   nothing, body, dim detail]`, then two UNNUMBERED options, yes then no,
-//!   the focus opening on yes. While it claims: its title over a dim
-//!   `Resetting your limits… this usually takes a few seconds` with no input
-//!   guide (@257467001). A choice or an Escape within 250 ms of its mount,
-//!   or of one it refused, is dropped (`Lr` @234609721; checked in its
-//!   handlers, @257466637).
-//! * THE ANSWER LINES (`tr` @244646499; the strings @244651833): the table
-//!   on [`reset_line`]. The spent line and the two lifted ones end ` · send a
-//!   message to continue` only where the vendor did not queue its own
-//!   continuation (`Wt` @244653814).
-//!
-//! NOT READ: how a row wraps; what the input guide says under the
-//! confirmation (the fixtures draw the Dialog's fallback, `Enter to confirm ·
-//! Esc to cancel`); what the server's flag payloads send.
+//! [`reset_row`], [`reset_confirm`], [`reset_pending`], and [`reset_line`] classify [`ResetKind`]
+//! and [`reset_limit_name`] strings (tested against [`fixtures`]), failing closed via
+//! [`ConfirmRead::Inexact`] and [`ResetLine::Other`] on any unrecognized wording.
 
 use crate::anchors::anchor;
 use crate::phase::{has_composer_frame, is_rule, leading_spaces};
@@ -121,18 +19,14 @@ const MONTHS: [&str; 12] = [
     "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
 ];
 
-/// A KIND OF RESET (2.1.304's `CLe`): which limits its grant refills, and
-/// the words every text of it is drawn with. The kind of a row is the kind
-/// of its confirmation and of its answer: the readers carry it, so the
-/// confirmation a row opens is held to that row's kind.
+/// A kind of reset (2.1.304's `CLe`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ResetKind {
     /// `session`: the five-hour limit's (`5-hour reset`).
     Session,
     /// `weekly`: a weekly limit's (`weekly reset`).
     Weekly,
-    /// `fable`: gives back what Fable used of the weekly limit (`Fable
-    /// reset`). Never taken ([`ResetKind::takeable`]).
+    /// `fable`: gives back what Fable used of the weekly limit (`Fable reset`).
     Fable,
     /// `full`: both limits' (`full reset`).
     Full,
@@ -147,8 +41,7 @@ impl ResetKind {
         ResetKind::Full,
     ];
 
-    /// The vendor's id of the kind (`CLe`; the dialog row's value is
-    /// `cedar-ember-<id>`): what a tape and a log name it by.
+    /// The vendor's id of the kind (`CLe`; the dialog row's value is `cedar-ember-<id>`).
     #[inline]
     #[must_use]
     pub const fn word(self) -> &'static str {
@@ -160,14 +53,13 @@ impl ResetKind {
         }
     }
 
-    /// [`Self::word`] read back; `None` for a word no kind has.
+    /// [`Self::word`] read back.
     #[must_use]
     pub fn of_word(word: &str) -> Option<ResetKind> {
         ResetKind::ALL.into_iter().find(|kind| kind.word() == word)
     }
 
-    /// `{kind}`, as the vendor draws it (`X()`): `5-hour reset`, `weekly
-    /// reset`, `Fable reset`, `full reset`.
+    /// `{kind}`, as the vendor draws it (`X()`).
     #[must_use]
     pub fn name(self) -> &'static str {
         anchor(match self {
@@ -178,9 +70,7 @@ impl ResetKind {
         })
     }
 
-    /// `{Kind}`: [`Self::name`] with its first letter upper-cased, as the
-    /// vendor does it (`charAt(0).toUpperCase()`): `5-hour reset`, `Weekly
-    /// reset`, `Fable reset`, `Full reset`.
+    /// `{Kind}`: [`Self::name`] with its first letter upper-cased.
     #[must_use]
     pub fn capital(self) -> String {
         let name = self.name();
@@ -191,7 +81,6 @@ impl ResetKind {
     }
 
     /// The noun `{kindResets}` counts (`ce()`): `five-hour reset` for the
-    /// session kind, [`Self::name`] for the others.
     fn noun(self) -> &'static str {
         match self {
             ResetKind::Session => anchor("reset.kind.session_count"),
@@ -199,8 +88,7 @@ impl ResetKind {
         }
     }
 
-    /// `{done}`, the head of the line that says a reset of this kind was
-    /// spent (`Mt()`).
+    /// `{done}`, the head of the line that says a reset of this kind was spent (`Mt()`).
     #[must_use]
     pub fn done(self) -> &'static str {
         anchor(match self {
@@ -211,23 +99,20 @@ impl ResetKind {
         })
     }
 
-    /// Whether the step may take a reset of this kind (the spec's R2): the
-    /// 5-hour, weekly and full ones, which refill the limit the vendor offers
-    /// them at. Never the Fable one, whose give-back is new in 2.1.304 and
-    /// postdates the owner's switch.
+    /// Whether the step may take a reset of this kind (the spec's R2).
     #[inline]
     #[must_use]
     pub const fn takeable(self) -> bool {
         !matches!(self, ResetKind::Fable)
     }
 
-    /// The confirmation's title: `Use a {kind}?`.
+    /// The confirmation's title.
     #[must_use]
     pub fn title(self) -> String {
         format!("{}?", self.row_head())
     }
 
-    /// The confirmation's yes: `Yes, use my {kind}`.
+    /// The confirmation's yes.
     #[must_use]
     pub fn yes(self) -> String {
         format!("{} {}", anchor("reset.yes"), self.name())
@@ -248,10 +133,7 @@ impl ResetKind {
         )
     }
 
-    /// `{kindResets}`, as `ce()` counts `n` of this kind: `no <noun>s`, `1
-    /// <noun>`, `<n> <noun>s` (`no weekly resets`, `1 five-hour reset`): what
-    /// a record that carries a count of one kind words it by, since 2.1.304
-    /// counts each kind apart.
+    /// `{kindResets}`, as `ce()` counts `n` of this kind.
     #[must_use]
     pub fn resets(self, n: u32) -> String {
         let noun = self.noun();
@@ -263,8 +145,6 @@ impl ResetKind {
     }
 
     /// `{kindResets}` read back: `no <noun>s` is none, `1 <noun>` one, `<n>
-    /// <noun>s` two or more — each only in its own spelling, and only with
-    /// this kind's noun.
     fn resets_of(self, text: &str) -> Option<u32> {
         let noun = self.noun();
         let plural = |rest: &str| rest.strip_suffix('s') == Some(noun);
@@ -282,60 +162,29 @@ impl ResetKind {
     }
 }
 
-/// The kind whose confirmation title `text` is (`Use a {kind}?`, the whole
-/// of it once trimmed), if it is one.
+/// The kind whose confirmation title `text` is (`Use a {kind}?`, the whole of it once trimmed).
 #[must_use]
 pub fn reset_title(text: &str) -> Option<ResetKind> {
     let text = crate::text::trim(text);
     ResetKind::ALL.into_iter().find(|kind| text == kind.title())
 }
 
-/// The grant row of a usage-limit dialog the step may take, as read
-/// ([`reset_row`]).
+/// The grant row of a usage-limit dialog the step may take, as read ([`reset_row`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResetRow {
     /// Its place among [`PromptV2::options`], from zero.
     pub index: usize,
-    /// Its label as drawn: what a press fences on.
+    /// Its label as drawn: what a press fences.
     pub label: String,
     /// The kind of reset it offers, never [`ResetKind::Fable`].
     pub kind: ResetKind,
     /// The resets of that kind left, one at least.
     pub left: u32,
-    /// The grant's last day as drawn (`Oct 5`, `Jan 2, 2027`): a day, never
-    /// a deadline — the hour is the confirmation's ([`ResetConfirm`]).
+    /// The grant's last day as drawn (`Oct 5`, `Jan 2, 2027`).
     pub day: String,
 }
 
-/// THE GRANT ROW THE STEP MAY TAKE in a usage-limit dialog (the spec's R2),
-/// under `order`, the kinds the owner lets the step spend, first preferred
-/// (`[harness] limit_reset_kinds`):
-///
-/// * `order` EMPTY, the default: the ONE option of the dialog that spends a
-///   reset, of a kind the step takes ([`ResetKind::takeable`]: 5-hour,
-///   weekly, full). A dialog that offers several — a Fable row among them —
-///   has none to take: which to spend is the owner's, and the owner has not
-///   said.
-/// * `order` SET: the row of the first kind in `order` the dialog offers,
-///   whatever else is on offer; a kind not in `order` is never taken, nor
-///   the Fable kind, listed or not.
-///
-/// The row is read whole: labelled exactly `Use a <kind> (<n> left, until
-/// <day>)`, `n` one at least, `<day>` a month and a day (and a year, in
-/// another one), with nothing else.
-///
-/// `None` with no such row; where the row so chosen does not read whole (the
-/// bare `Use a weekly reset` of a grant with no end date, a reworded one, `0
-/// left`, a day that names its zone) — never another kind in its place;
-/// where a kind is drawn twice; where a row spends a reset ([`uses_a_reset`],
-/// [`spends_reset`]) and opens as no kind's row ([`grant_kind`]: its head a
-/// word of its own), wherever it stands; and with the weekly session reset's
-/// row anywhere among the options: the vendor draws that one only where
-/// there is no grant row, and it claims at once, so a menu that shows it is
-/// refused whole. Never by its place: the row is found wherever it stands.
-///
-/// Only in a dialog read whole as [`PromptKind::UsageLimit`], its options numbered `1.`
-/// on in order with one cursor at most, as the vendor's Select draws them.
+/// The grant row the step may take in a usage-limit dialog (the spec's R2), under `order`.
 #[must_use]
 pub fn reset_row(prompt: &PromptV2, order: &[ResetKind]) -> Option<ResetRow> {
     if prompt.kind != PromptKind::UsageLimit || prompt.head_off_screen {
@@ -350,10 +199,6 @@ pub fn reset_row(prompt: &PromptV2, order: &[ResetKind]) -> Option<ResetRow> {
     if !numbered || cursors > 1 {
         return None;
     }
-    // Every option that spends a reset must open as a kind's row, each kind
-    // once: the weekly session reset's row, a kind a later build adds, one
-    // whose name only begins with a known one's and 2.1.287's `Use your
-    // reset now (…)` do not, and refuse the menu.
     let mut offers: Vec<(usize, ResetKind)> = Vec::new();
     for (index, opt) in prompt.options.iter().enumerate() {
         let kind = grant_kind(&opt.label);
@@ -389,14 +234,7 @@ pub fn reset_row(prompt: &PromptV2, order: &[ResetKind]) -> Option<ResetRow> {
     })
 }
 
-/// Whether choosing an option labelled `label` SPENDS a reset: a grant row
-/// of any kind in any spelling of its head (`Use a 5-hour reset`, bare or
-/// with its count, the Fable one among them), the weekly session reset's
-/// row, the confirmation's yes of any kind. By the label's opening words,
-/// ASCII case ignored, so a reworded tail still reads as a spend — the
-/// question a rule asks before it says yes to anything. Not a bare `Yes, use
-/// my …`: the 2.1.304 bundle's other dialogs open their yes so (`Yes, use my
-/// browser`).
+/// Whether choosing an option labelled `label` spends a reset.
 #[must_use]
 pub fn spends_reset(label: &str) -> bool {
     opens(label, anchor("reset.weekly_row"))
@@ -405,21 +243,7 @@ pub fn spends_reset(label: &str) -> bool {
             .any(|kind| opens(label, &kind.row_head()) || opens(label, &kind.yes()))
 }
 
-/// Whether `label`, past a leading `yes, `, reads `use` and a determiner
-/// (`a`, `an`, `my`, `your`), then a head whose words, up to its first `(`,
-/// `·` or `?` and each less the punctuation at its ends, include `reset` or
-/// `resets` as the thing used — any such word but one right after `and`,
-/// `or`, `then`, `but` or `to`, which is the verb of another clause (`Use a
-/// fresh session and reset nothing later`, `Use a new branch, then reset
-/// it`), case ignored: every row and yes of 2.1.304 (`Use a 5-hour reset
-/// (…)`, `Yes, use my full reset`), 2.1.287's (`Use your reset now (…)`,
-/// `Yes, use my reset`), and a kind no build has named yet, however many
-/// words its name takes (`Use a scheduled full weekly reset (…)`, `Use a
-/// 5-hour and weekly reset (…)`). Wide on purpose, as a spend is: the one
-/// reading it refuses is the verb, never a reset named after its modifiers.
-/// The words a rule asks about before it says yes to anything (approval.rs's
-/// `spends`), and the rows [`reset_row`] refuses a menu for where no kind's
-/// row opens them.
+/// Whether `label`, past a leading `yes, `.
 #[must_use]
 pub fn uses_a_reset(label: &str) -> bool {
     let l = label.trim().to_lowercase();
@@ -439,7 +263,6 @@ pub fn uses_a_reset(label: &str) -> bool {
         .unwrap_or_default()
         .split_whitespace()
         .map(|word| word.trim_matches(|c: char| !c.is_alphanumeric()));
-    // Each word beside the one before it (the determiner's, none, first).
     std::iter::once("")
         .chain(words.clone())
         .zip(words)
@@ -458,11 +281,6 @@ fn opens(label: &str, words: &str) -> bool {
 }
 
 /// The kind whose grant row `label` opens as, read whole or not: its row
-/// head (`Use a <kind>`, ASCII case ignored) as a word of its own — the
-/// label's end, or its ` (` or ` · ` next, as the vendor's `Kvt` draws a row
-/// (the bare head of a grant with no end date, the Fable row's suffix after
-/// its parentheses). A kind whose name only begins with a known one's (`Use
-/// a full reset plus (…)`) opens as none: a kind this build does not name.
 fn grant_kind(label: &str) -> Option<ResetKind> {
     let label = label.trim_start();
     ResetKind::ALL.into_iter().find(|kind| {
@@ -475,7 +293,6 @@ fn grant_kind(label: &str) -> Option<ResetKind> {
 }
 
 /// `Use a <kind> (<n> left, until <day>)` → `(n, day)`, the whole label and
-/// nothing else.
 fn grant_of(label: &str, kind: ResetKind) -> Option<(u32, &str)> {
     let inner = label
         .strip_prefix(kind.row_head().as_str())?
@@ -487,7 +304,6 @@ fn grant_of(label: &str, kind: ResetKind) -> Option<(u32, &str)> {
 }
 
 /// A number as the vendor's `String(n)` draws it: ASCII digits, no sign and
-/// no leading zero.
 fn number(text: &str) -> Option<u32> {
     let plain = !text.is_empty()
         && text.bytes().all(|b| b.is_ascii_digit())
@@ -505,12 +321,10 @@ fn take_number(text: &str, range: std::ops::RangeInclusive<u32>) -> Option<(u32,
 }
 
 /// `text` less the day it opens with — `Mon D`, or `Mon D, YYYY` — or `None`
-/// where it opens with none.
 fn take_day(text: &str) -> Option<&str> {
     let month = MONTHS.iter().find(|m| text.starts_with(**m))?;
     let rest = text[month.len()..].strip_prefix(' ')?;
     let (_, rest) = take_number(rest, 1..=31)?;
-    // A year is four digits; anything else after the comma is not the day's.
     Some(
         rest.strip_prefix(", ")
             .and_then(|year| take_number(year, 1000..=9999))
@@ -519,7 +333,6 @@ fn take_day(text: &str) -> Option<&str> {
 }
 
 /// The day and hour `text` opens with — `Mon D[, YYYY] at H[:MM](am|pm)` —
-/// and the rest, or `None` where it opens with none.
 fn take_when(text: &str) -> Option<(&str, &str)> {
     let rest = take_day(text)?.strip_prefix(" at ")?;
     let (_, rest) = take_number(rest, 1..=12)?;
@@ -541,8 +354,6 @@ fn take_when(text: &str) -> Option<(&str, &str)> {
 }
 
 /// The vendor's `{limits}` → its names: `<name> limit` is one, `a, b and c
-/// limits` several. `None` for the bare `limits` (a grant that names none)
-/// and for a name that is not one word.
 fn limits_of(text: &str) -> Option<Vec<String>> {
     let names: Vec<&str> = match text.strip_suffix(" limit") {
         Some(one) => vec![one],
@@ -557,17 +368,7 @@ fn limits_of(text: &str) -> Option<Vec<String>> {
         .then(|| names.iter().map(|n| (*n).to_string()).collect())
 }
 
-/// The name a walled window is drawn by in the confirmation's `{limits}`
-/// ([`ResetConfirm::limits`]), from the vendor's limit type on the wall's own
-/// row (`Yn` @244635663): the windows a grant can clear. `None` for any
-/// other type — a credit wall, a type this build does not know, a row that
-/// names none.
-///
-/// `seven_day_sonnet` is drawn `weekly` on some plans (READ): only its own
-/// name is answered here, so on such a plan the confirmation names another
-/// limit than the wall and is kept. `seven_day_overage_included` is drawn
-/// `Fable` only by a grant that gives Fable's usage back — a Fable reset,
-/// which the step never takes — and `weekly` by every other.
+/// The name a walled window is drawn by in the confirmation's `{limits}`.
 #[must_use]
 pub fn reset_limit_name(limit_type: &str) -> Option<&'static str> {
     match limit_type {
@@ -582,17 +383,15 @@ pub fn reset_limit_name(limit_type: &str) -> Option<&'static str> {
 /// The reset confirmation, read exactly ([`reset_confirm`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResetConfirm {
-    /// The row of its title, `Use a <kind>?`: what an Escape fences on.
+    /// The row of its title, `Use a <kind>?`.
     pub title_row: usize,
-    /// The row of `Yes, use my <kind>`: what the Enter fences on.
+    /// The row of `Yes, use my <kind>`.
     pub yes_row: usize,
     /// Whether the cursor is on that row (it opens there).
     pub yes_focused: bool,
-    /// The kind its title, its yes and its count name — one the step takes
-    /// ([`ResetKind::takeable`]).
+    /// The kind its title, its yes and its count name.
     pub kind: ResetKind,
-    /// The limits the body says it refills, as drawn: `session`, `weekly`,
-    /// `Opus`, `Sonnet`.
+    /// The limits the body says it refills, as drawn.
     pub limits: Vec<String>,
     /// The weekly reset day and hour the body says stays (`Oct 9 at 5am`).
     pub week: String,
@@ -600,53 +399,22 @@ pub struct ResetConfirm {
     pub left: u32,
     /// The day and hour the detail says to use it by (`Oct 5 at 3pm`).
     pub deadline: String,
-    /// The body and the detail as read: their rows, trimmed, joined with one
-    /// space.
+    /// The body and the detail as read.
     pub head: String,
 }
 
 /// What a box reads as, asked whether it is the reset confirmation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConfirmRead {
-    /// Not the confirmation: neither a title nor a yes of any kind's, nor —
-    /// on a box of unnumbered options — its no or a row of its body.
+    /// Not the confirmation: neither a title nor a yes.
     Not,
-    /// The confirmation by its title, its yes or what else is left of it,
-    /// but not read exactly — and the first thing that was not: `title`,
-    /// `options`, `kind`, `early`, `body`, `week`, `count`, `deadline`.
-    /// Nothing says yes to it.
+    /// The confirmation by its title, its yes or what else is left of it, but not read exactly.
     Inexact(&'static str),
     /// The confirmation, every part of it read.
     Exact(ResetConfirm),
 }
 
-/// The reset confirmation on `rows`, where `prompt` is the box read from
-/// them. [`ConfirmRead::Not`] unless the box's title is a kind's `Use a
-/// <kind>?`, one of its options opens with a kind's `Yes, use my <kind>`, or
-/// what is left of the confirmation says so where those two do not
-/// ([`keeps_a_reset`]): the server may replace any text of it, and a pane
-/// shorter than the box cuts its title off, so a box is told by ANY of its
-/// parts and entered only on ALL of them. [`ConfirmRead::Exact`] needs ALL
-/// of:
-///
-/// * the box's head is on the screen and its title row is the title `Use a
-///   <kind>?` — else `title`;
-/// * its options are exactly that kind's `Yes, use my <kind>` then `No, keep
-///   it`, unnumbered, the cursor on one of them — else `options`;
-/// * the kind is one the step takes ([`ResetKind::takeable`]) — else `kind`:
-///   a Fable confirmation is never read further;
-/// * the rows from under the title to the first option, trimmed, blank ones
-///   dropped, joined with one space, read `Refills your <limits> now · your
-///   weekly reset day stays <when> <count> left · use by <when>` and nothing
-///   else, `<when>` being `Mon D[, YYYY] at H[:MM](am|pm)`, `<limits>`
-///   `<name> limit` or `a, b and c limits`, and `<count>` the kind's own
-///   (`1 five-hour reset`, `2 weekly resets`). The vendor's early line of
-///   any kind anywhere in them (a reset used with budget left) is `early`; a
-///   head that is not `Refills your <limits> now`, or anything after the
-///   deadline, is `body`; a week segment missing or unread (a zone named
-///   after it among them) is `week`; a count that is not the kind's, or not
-///   one at least, is `count`; a deadline missing, with no hour or with a
-///   zone named after it is `deadline`.
+/// The reset confirmation on `rows`, where `prompt` is the box read from them.
 #[must_use]
 pub fn reset_confirm(prompt: &PromptV2, rows: &[String]) -> ConfirmRead {
     let titled_as = reset_title(&prompt.title);
@@ -710,18 +478,6 @@ pub fn reset_confirm(prompt: &PromptV2, rows: &[String]) -> ConfirmRead {
 }
 
 /// Whether a box with neither a confirmation's title nor its yes is the
-/// confirmation all the same, by what is left of it ([`reset_confirm`]): its
-/// options are UNNUMBERED, as the confirmation's are, and either one of them
-/// is its no — `No, keep it`, which one other box of the 2.1.304 bundle
-/// spells (a delete dialog's, over `Yes, delete it`, whose refusal is as
-/// safe an answer) — or a row above them carries a part of its body: the
-/// head `Refills your`, either join (`your weekly reset day stays`, `left ·
-/// use by`), or an early line's tail of any kind (`use your 5-hour reset
-/// anyway?`).
-///
-/// Unnumbered, because a permission box — numbered — shows a command or a
-/// diff, which may quote any of these words; the vendor's dialogs of
-/// unnumbered options draw its own text.
 fn keeps_a_reset(prompt: &PromptV2, rows: &[String]) -> bool {
     let Some(first) = prompt.options.first() else {
         return false;
@@ -753,8 +509,6 @@ fn keeps_a_reset(prompt: &PromptV2, rows: &[String]) -> bool {
 }
 
 /// The confirmation's body and detail, joined ([`reset_confirm`]), of a
-/// confirmation of `kind` → the limits, the week, the count and the
-/// deadline; or the first part that does not read.
 fn confirm_text(
     text: &str,
     kind: ResetKind,
@@ -765,12 +519,10 @@ fn confirm_text(
     {
         return Err("early");
     }
-    // The two joins, and the word each opens with: `now`, `left`.
     let stays = anchor("reset.confirm.stays");
     let use_by = anchor("reset.confirm.use_by");
     let now = stays.split(SEP).next().unwrap_or(stays);
     let left = use_by.split(SEP).next().unwrap_or(use_by);
-    // `Refills your <limits> now`, the word whole.
     let (limits, rest) = text
         .strip_prefix(anchor("reset.confirm.refills"))
         .and_then(|rest| rest.strip_prefix(' '))
@@ -778,22 +530,17 @@ fn confirm_text(
         .filter(|(_, rest)| rest.is_empty() || rest.starts_with(' '))
         .ok_or("body")?;
     let limits = limits_of(limits).ok_or("body")?;
-    // ` · your weekly reset day stays <when>`, and no zone after it: the
-    // vendor's formatter names one as ` (<zone>)` after the value, which is
-    // the week's, not the count's.
     let (week, rest) = rest
         .strip_prefix(&stays[now.len()..])
         .and_then(|rest| rest.strip_prefix(' '))
         .and_then(take_when)
         .filter(|(_, rest)| !rest.starts_with(" ("))
         .ok_or("week")?;
-    // ` <kindResets> left`, one reset at least.
     let (count, rest) = rest
         .strip_prefix(' ')
         .and_then(|rest| rest.split_once(&format!(" {left}")))
         .ok_or("count")?;
     let count = kind.resets_of(count).filter(|&n| n >= 1).ok_or("count")?;
-    // ` · use by <when>`, no zone after it, and nothing else.
     let (deadline, rest) = rest
         .strip_prefix(&use_by[left.len()..])
         .and_then(|rest| rest.strip_prefix(' '))
@@ -809,28 +556,13 @@ fn confirm_text(
 /// A line the vendor draws while a reset is being looked up or claimed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResetPending {
-    /// `Checking for a reset…` under the wall dialog's title: the offer is being read.
-    /// Escape closes the dialog and prints nothing.
+    /// `Checking for a reset…` under the wall dialog's title.
     Checking,
-    /// `Resetting your limits…` under a confirmation's title: the yes was
-    /// taken and the claim is in flight. The vendor takes no key there (READ).
+    /// `Resetting your limits…` under a confirmation's title.
     Resetting,
 }
 
-/// The pending line on `rows` and its row. `Some` only when all hold:
-///
-/// * no composer frame is on the rows (the dialog replaces the composer);
-/// * the LOWEST row that is a dialog title of the reset program — `What do
-///   you want to do?` or a kind's `Use a <kind>?`, alone on its row right
-///   under a full-width rule (`▔` or `─`) — has, as the first row under it, a
-///   row that opens with that title's pending line: `Checking for a reset`
-///   under the first, `Resetting your limits` under the second;
-/// * under that there is nothing but the line's own wrapped rows, blank
-///   rows, and at most one input guide as the last row — all at the title's
-///   column.
-///
-/// The usage-limit dialog itself, the confirmation, a quoted pending line and either
-/// line under the wrong title are none.
+/// The pending line on `rows` and its row.
 #[must_use]
 pub fn reset_pending(rows: &[String]) -> Option<(ResetPending, usize)> {
     let named = |row: &str| {
@@ -860,7 +592,6 @@ pub fn reset_pending(rows: &[String]) -> Option<(ResetPending, usize)> {
         under.pop();
     }
     let (&first, &last) = (under.first()?, under.last()?);
-    // The line and its wrap are one block of rows.
     let block = under.len() == last - first + 1;
     let text = under
         .iter()
@@ -871,7 +602,6 @@ pub fn reset_pending(rows: &[String]) -> Option<(ResetPending, usize)> {
 }
 
 /// A dialog's input guide: key hints joined by ` · `, one of them the cancel
-/// hint (`Enter to confirm · Esc to cancel`, `Esc to cancel`).
 fn is_guide(row: &str) -> bool {
     let t = crate::text::trim(row);
     t.split(SEP).all(|item| item.contains(" to "))
@@ -882,67 +612,25 @@ fn is_guide(row: &str) -> bool {
 /// What the vendor's answer to a reset says ([`reset_line`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResetLine {
-    /// A reset of `kind` was spent: its spent line opens with that kind's
-    /// `{done} · `. `left` is the count of that kind a `<kindResets> left`
-    /// segment draws, where one reads whole, else `None` (a reworded tail
-    /// still says the reset was spent); `asks` is whether it ends ` · send a
-    /// message to continue` (the vendor queued no continuation of its own).
+    /// A reset of `kind` was spent.
     Spent {
         kind: ResetKind,
         left: Option<u32>,
         asks: bool,
     },
-    /// `{Kind} used · you're still at your {limit} until {date} ·
-    /// {kindResets} left`: a reset of `kind` was SPENT and the walled limit
-    /// STILL STANDS — a give-back grant (the Fable kind's) at a weekly wall
-    /// the claim did not lift, which the vendor arms again. `left` as for
-    /// [`Self::Spent`]; it never asks (the vendor draws no ending on it, and
-    /// a message would meet the wall).
+    /// `{Kind} used · you're still at your {limit} until {date} · {kindResets} left`.
     Walled { kind: ResetKind, left: u32 },
-    /// `Your limit had already reset on its own · nothing was used`, or
-    /// `Your limits are clear`: the wall was gone and no reset was spent
-    /// (the second is drawn only where an earlier claim of the same grant
-    /// was unsettled, which may be what cleared it).
+    /// `Your limit had already reset on its own · nothing was used`, or `Your limits are clear`.
     Lifted { asks: bool },
     /// `<Kind> kept · …`: the confirmation was declined.
     Kept,
-    /// `Couldn't reset your limits with this login · run /login, then try
-    /// again`: the claim was refused for the login.
+    /// `Couldn't reset your limits with this login · run /login, then try again`.
     Login,
-    /// Anything else: every other answer, and any line this reader does not know, is a
-    /// failure of this attempt, though two answers say an earlier try at the same grant
-    /// went through (`Your earlier reset went through after all · …`, `That reset was
-    /// already used · …`).
+    /// Anything else: every other answer, and any line this reader does not know.
     Other,
 }
 
-/// One line of the vendor's text, as the answer to a reset made at a wall:
-///
-/// | the line | reads |
-/// |---|---|
-/// | `{done} · your weekly reset day stays {week} · {kindResets} left`, or with the week's segment dropped `{done} · {kindResets} left`, or reworded past `{done} · ` (the 5-hour kind's with its count or week): `Session limit reset · …`, `Weekly limits reset · …`, `Limits reset · …`, `Fable reset used · what Fable used is back in your weekly limit · …` | [`ResetLine::Spent`] of that `{done}`'s kind |
-/// | `{Kind} used · you're still at your {limit} until {date} · {kindResets} left` (a give-back grant at a weekly wall the claim did not lift) | [`ResetLine::Walled`] of that kind |
-/// | `Your limit had already reset on its own · nothing was used`; `Your limits are clear` | [`ResetLine::Lifted`] |
-/// | `{Kind} kept · run /limit-reset at a limit to use it · use by {deadline}` (and `… whenever you want to use it …`) | [`ResetLine::Kept`] |
-/// | `Couldn't reset your limits with this login · run /login, then try again` | [`ResetLine::Login`] |
-/// | every other answer (`That reset was already used · …`, `Couldn't confirm the reset went through · …`, `No reset to use · …`, `Reset used · {resets} left`, `Resets kept · …`, …), the weekly session reset's `Session limit reset · next reset available … · your weekly limit still applies` | [`ResetLine::Other`] |
-///
-/// A SPENT LINE IS READ BY ITS HEAD, its kind's `{done} · `: the vendor
-/// draws it only once a reset of that kind went through, and the server's
-/// flag payload may reword the rest of it on its own (`successLine`, apart
-/// from the confirmation's texts), so a line whose week or count is dropped
-/// or reworded is a reset spent all the same — read as a failure, the spent
-/// reset would clear no wall and the ledger would say `failed` of the owner's
-/// purchase. Its count is read where a segment of it is that kind's
-/// `<kindResets> left` whole, and is `None` otherwise. The 5-hour kind's head
-/// is not enough on its own: `Session limit reset · ` also opens the weekly
-/// session reset's answer (`… · next reset available … · your weekly limit
-/// still applies`), which is not this step's, so the 5-hour kind's line must
-/// also draw its count or its `your weekly reset day stays` segment. Nothing
-/// less than a head and its ` · ` is a spend (`Limits reset` alone, `Limits
-/// reset on …`, another case). `Lifted` is one of its two lines whole, less
-/// the ending. `Kept` is a kind's `{Kind} kept · ` head. A typographic
-/// apostrophe reads as the plain one.
+/// One line of the vendor's text, as the answer to a reset made at a wall.
 #[must_use]
 pub fn reset_line(text: &str) -> ResetLine {
     let text = crate::text::trim(text).replace('’', "'");
@@ -978,8 +666,6 @@ fn left_of(segment: &str, kind: ResetKind) -> Option<u32> {
 }
 
 /// `{done} · …` ([`reset_line`]): the kind, and the count of the first
-/// segment that is that kind's `<kindResets> left` whole. The 5-hour kind's
-/// line only with its count or its `your weekly reset day stays` segment.
 fn spent_line(text: &str) -> Option<(ResetKind, Option<u32>)> {
     let stays = anchor("reset.confirm.stays");
     let stays = stays.split(SEP).last().unwrap_or(stays);
@@ -994,7 +680,6 @@ fn spent_line(text: &str) -> Option<(ResetKind, Option<u32>)> {
 }
 
 /// `{Kind} used · you're still at your {limit} until {date} · {kindResets}
-/// left`, whole: the kind and the count.
 fn walled_line(text: &str) -> Option<(ResetKind, u32)> {
     ResetKind::ALL.into_iter().find_map(|kind| {
         let rest = text
@@ -1010,24 +695,14 @@ fn walled_line(text: &str) -> Option<(ResetKind, u32)> {
     })
 }
 
-/// The reset program's screens, as rows — EVERY ONE COMPOSED from the 2.1.304
-/// bundle's texts on the usage-limit dialog's hand-built frame
-/// ([`crate::prompt::fixtures::LIMIT_OPTIONS_PANEL`]), never captured; each
-/// file's first line says so, and names what it is. Read them with
-/// [`crate::prompt::fixtures::screen`]. Always compiled, as
-/// [`crate::prompt::fixtures`] is, so a dependent crate's tests reach them.
+/// The reset program's screens, as rows.
 #[doc(hidden)]
 pub mod fixtures {
-    /// The usage-limit dialog at a weekly limit with one kind on offer: the
-    /// grant row `Use a weekly reset (2 left, until Oct 5)` second.
+    /// The usage-limit dialog at a weekly limit with one kind on offer.
     pub const DIALOG_GRANT: &str = include_str!("fixtures/claude-2.1.304-reset-dialog-grant.txt");
-    /// The dialog at a five-hour limit with three kinds on offer, in the
-    /// vendor's order: `Use a 5-hour reset (2 left, until Oct 5)`, `Use a
-    /// weekly reset (1 left, until Oct 9)`, `Use a full reset (1 left, until
-    /// Oct 5)`.
+    /// The dialog at a five-hour limit with three kinds on offer, in the vendor's order.
     pub const DIALOG_KINDS: &str = include_str!("fixtures/claude-2.1.304-reset-dialog-kinds.txt");
-    /// The dialog at a Fable limit: `Use a Fable reset (1 left, until Oct 5)`
-    /// first, then `Use a weekly reset (1 left, until Oct 9)`.
+    /// The dialog at a Fable limit.
     pub const DIALOG_FABLE: &str = include_str!("fixtures/claude-2.1.304-reset-dialog-fable.txt");
     /// The dialog with the weekly session reset's row where the grant rows go.
     pub const DIALOG_WEEKLY: &str = include_str!("fixtures/claude-2.1.304-reset-dialog-weekly.txt");
@@ -1035,29 +710,23 @@ pub mod fixtures {
     pub const DIALOG_BARE: &str = include_str!("fixtures/claude-2.1.304-reset-dialog-bare.txt");
     /// The row taken: the dialog's title over `Checking for a reset…`.
     pub const CHECKING: &str = include_str!("fixtures/claude-2.1.304-reset-checking.txt");
-    /// The weekly reset's confirmation as it opens, the cursor on `Yes, use
-    /// my weekly reset`.
+    /// The weekly reset's confirmation as it opens, the cursor on `Yes, use my weekly reset`.
     pub const CONFIRM: &str = include_str!("fixtures/claude-2.1.304-reset-confirm.txt");
-    /// The 5-hour reset's confirmation as it opens: `Use a 5-hour reset?`
-    /// over `2 five-hour resets left · …`.
+    /// The 5-hour reset's confirmation as it opens.
     pub const CONFIRM_SESSION: &str =
         include_str!("fixtures/claude-2.1.304-reset-confirm-session.txt");
-    /// The full reset's confirmation as it opens: both limits, `1 full reset
-    /// left · …`.
+    /// The full reset's confirmation as it opens.
     pub const CONFIRM_FULL: &str = include_str!("fixtures/claude-2.1.304-reset-confirm-full.txt");
     /// The Fable reset's confirmation, its body's `returns …` segment drawn.
     pub const CONFIRM_FABLE: &str = include_str!("fixtures/claude-2.1.304-reset-confirm-fable.txt");
     /// The weekly reset's confirmation on a 60-column grid, its body wrapped.
     pub const CONFIRM_60: &str = include_str!("fixtures/claude-2.1.304-reset-confirm-60col.txt");
-    /// The weekly reset's confirmation of a reset used early: the early line
-    /// over the body.
+    /// The weekly reset's confirmation of a reset used early.
     pub const CONFIRM_EARLY: &str = include_str!("fixtures/claude-2.1.304-reset-confirm-early.txt");
-    /// The weekly reset's confirmation with the cursor moved onto `No, keep
-    /// it`.
+    /// The weekly reset's confirmation with the cursor moved onto `No, keep it`.
     pub const CONFIRM_FOCUS_NO: &str =
         include_str!("fixtures/claude-2.1.304-reset-confirm-focus-no.txt");
-    /// The weekly reset's yes taken: its title over `Resetting your limits…`,
-    /// no input guide.
+    /// The weekly reset's yes taken.
     pub const RESETTING: &str = include_str!("fixtures/claude-2.1.304-reset-resetting.txt");
 
     /// Every fixture of the reset program, with its name.
@@ -1110,24 +779,11 @@ mod tests {
     }
 
     /// The grant row of the dialog whose options are `labels` (the
-    /// fullscreen panel's frame, the cursor on the first).
     fn row_among(labels: &[&str]) -> Option<ResetRow> {
         reset_row(&boxed(&limit_options_panel(labels, 0, false)), &[])
     }
 
     /// MEASURED on 2.1.301 and 2.1.304 in the lab (crates/aterm-lab,
-    /// 2026-10-15 and 2026-10-19): the usage-limit dialog at a five-hour wall
-    /// with no reset on offer (2.1.301's at-wall reads of the usage body
-    /// failed, both reset programs flagged on; 2.1.304's stub account holds
-    /// none) has no grant row, and no option whose words spend one. The only
-    /// 2.1.304 screen measured: the inline renderer's frame, its box two
-    /// columns in, the session's rows above it. NEGATIVE CONTROL: that frame
-    /// with ONE row of a reset put in as its bundle draws it (after the stop
-    /// row, the rows after it renumbered) is read as that row, of its kind:
-    /// a full reset, a 5-hour reset, a weekly reset of another year. With
-    /// two rows put in — a 5-hour reset ahead of a full one, a weekly reset
-    /// behind a Fable row with its weekly-wall suffix — or a Fable row alone,
-    /// it has none to take: which of several to spend is the owner's.
     #[test]
     fn the_measured_dialog_with_no_reset_on_offer_has_no_grant_row() {
         use crate::prompt::fixtures::{
@@ -1147,8 +803,6 @@ mod tests {
             .iter()
             .position(|row| row.trim_start().starts_with("❯ 1. Stop and wait"))
             .expect("the stop row");
-        // The measured frame with `rows` drawn after its stop row, numbered on
-        // from 2, and the wait and upgrade rows renumbered after them.
         let offered = |rows: &[&str]| -> Vec<String> {
             let mut out = measured[..=stop].to_vec();
             out.extend(
@@ -1213,7 +867,6 @@ mod tests {
     }
 
     /// [`fixtures::CONFIRM`] with the rows between its title and its options
-    /// replaced by `body`, each at the dialog's column.
     fn confirm_with(body: &[&str]) -> Vec<String> {
         let base = screen(fixtures::CONFIRM);
         assert_eq!(
@@ -1228,7 +881,6 @@ mod tests {
     }
 
     /// [`fixtures::CONFIRM`] with its title, its body and its two options
-    /// replaced (the cursor on the first).
     fn confirm_of(title: &str, body: &[&str], yes: &str, no: &str) -> Vec<String> {
         let base = screen(fixtures::CONFIRM);
         let mut out = base[..3].to_vec();
@@ -1247,8 +899,6 @@ mod tests {
     }
 
     /// `rows`, a screen of the fullscreen renderer's panel, as the inline renderer draws
-    /// the same Dialog (measured on 2.1.295, [`LIMIT_OPTIONS_DIALOG`]): a `─` rule and the
-    /// box two columns in.
     fn inline(rows: &[String]) -> Vec<String> {
         rows.iter()
             .map(|row| {
@@ -1262,8 +912,6 @@ mod tests {
     }
 
     /// THE KINDS' WORDS, as the bundle's `X()`, `ce()` and `Mt()` draw them,
-    /// and each read back from its id. NEGATIVE CONTROL: a word no kind has
-    /// names none, and the five-hour kind's count is never `5-hour`.
     #[test]
     fn every_kind_is_drawn_by_its_own_words() {
         for (kind, word, name, capital, done, title, yes) in [
@@ -1356,8 +1004,6 @@ mod tests {
                 "{kind:?}: the record's words are the vendor's"
             );
         }
-        // A count is read only in its own spelling: the 2.1.287 noun, `0`
-        // for none, a singular of more or a plural of one, a padded number.
         for wrong in [
             "1 resets",
             "2 resets",
@@ -1372,7 +1018,6 @@ mod tests {
         ] {
             assert_eq!(ResetKind::Weekly.resets_of(wrong), None, "{wrong}");
         }
-        // The controls.
         assert_eq!(ResetKind::of_word("5-hour"), None);
         assert_eq!(ResetKind::Session.resets_of("2 5-hour resets"), None);
         assert_eq!(ResetKind::Weekly.resets_of("2 five-hour resets"), None);
@@ -1387,14 +1032,6 @@ mod tests {
     }
 
     /// THE GRANT ROW, by its exact label: the composed dialog gives its
-    /// place, its kind, its count and its day, and the label a press fences
-    /// on; found wherever it stands, in both frames, with a year in its day,
-    /// for each kind the step takes. NEGATIVE CONTROLS, each the same dialog
-    /// with one thing changed: the weekly session reset's row in the slot
-    /// (the row by its place would take it); a bare row; `0 left`; both
-    /// rows in one menu; a label that only opens with the row's words; a day
-    /// that names its zone; the 2.1.287 wording; the same options under
-    /// another title; options the vendor's Select would not draw.
     #[test]
     fn the_grant_row_is_read_by_its_exact_label_never_by_its_place() {
         let rows = screen(fixtures::DIALOG_GRANT);
@@ -1405,7 +1042,6 @@ mod tests {
         );
         let p = boxed(&rows);
         assert_eq!((p.kind, p.select), (PromptKind::UsageLimit, Select::Digits));
-        // The reader gives the row no role: nothing chooses it by one.
         assert_eq!(p.options[1].role, Role::Other);
         assert_eq!(
             reset_row(&p, &[]),
@@ -1417,7 +1053,6 @@ mod tests {
                 day: "Oct 5".to_string(),
             })
         );
-        // Wherever it stands, and whatever the focus is on.
         for (labels, index) in [
             (&[GRANT, STOP, WAIT, CREDITS][..], 0),
             (&[STOP, WAIT, GRANT, CREDITS], 2),
@@ -1434,7 +1069,6 @@ mod tests {
         assert_eq!(reset_row(&focused, &[]).map(|r| r.index), Some(1));
         let inline_frame = boxed(&limit_options_dialog(&[STOP, GRANT, WAIT, CREDITS], 0));
         assert_eq!(reset_row(&inline_frame, &[]).map(|r| r.left), Some(2));
-        // Each kind the step takes, a year, a count of one and of twelve.
         for (label, kind, left, day) in [
             (SESSION, ResetKind::Session, 2, "Oct 5"),
             (FULL, ResetKind::Full, 1, "Oct 5"),
@@ -1458,7 +1092,6 @@ mod tests {
             );
         }
 
-        // The controls.
         assert_eq!(
             reset_row(&boxed(&screen(fixtures::DIALOG_WEEKLY)), &[]),
             None
@@ -1507,7 +1140,6 @@ mod tests {
             "Use a weekly reset (2 left, until Oct 5 at 3pm)",
             "Use a weekly reset (2 left, until Oct 32)",
             "Use a weekly reset (2 left, until Oct 5, 27)",
-            // A zone named after the day (`CT`, under a host's zone override).
             "Use a weekly reset (2 left, until Oct 5 (UTC))",
             "Use a weekly reset (2 left, until Oct 5) and continue",
             "Use a weekly reset (2 left, until Oct 5) · frees up only what Fable used this week",
@@ -1521,13 +1153,10 @@ mod tests {
         ] {
             assert_eq!(row_among(&[STOP, label, WAIT, CREDITS]), None, "{label}");
         }
-        // The same rows under another title are not the usage-limit dialog.
         let mut retitled = rows.clone();
         retitled[3] = "   What would you like?".to_string();
         assert_ne!(boxed(&retitled).kind, PromptKind::UsageLimit);
         assert_eq!(reset_row(&boxed(&retitled), &[]), None);
-        // Options the Select would not draw: a number missing, two cursors,
-        // a head off the screen.
         for edit in [
             (|p: &mut PromptV2| p.options[0].n = None) as fn(&mut PromptV2),
             |p| p.options[2].n = Some(4),
@@ -1542,12 +1171,6 @@ mod tests {
     }
 
     /// ONLY THE ONE RESET ON OFFER (the spec's R2): a row of a kind the step
-    /// takes is taken where it is the one option of the dialog that spends a
-    /// reset — which of several to spend is the owner's choice — and a Fable
-    /// row never, even alone. NEGATIVE CONTROL: the same rows alone, each
-    /// where it stood, are taken (so it is the second offer that refuses
-    /// the menu); and a lone row of a kind this build does not name, one in
-    /// another case or one whose head runs on is refused as well.
     #[test]
     fn a_row_is_taken_only_as_the_one_reset_on_offer_and_never_a_fable_row() {
         const UNKNOWN: &str = "Use a scheduled full weekly reset (1 left, until Oct 7)";
@@ -1590,7 +1213,6 @@ mod tests {
             ],
         ] {
             assert_eq!(row_among(labels), None, "several on offer: {labels:?}");
-            // The control: each takeable row of the menu, alone, is taken.
             for (index, label) in labels.iter().enumerate() {
                 let alone: Vec<&str> = labels
                     .iter()
@@ -1609,11 +1231,6 @@ mod tests {
                 }
             }
         }
-        // Alone and still none to take: a Fable row, with its weekly-wall
-        // suffix and without; a kind this build does not name; 2.1.287's
-        // row; a kind whose name only begins with a known one's; a head run
-        // on into a longer word; a known head in another case; a kind joined
-        // to another.
         for label in [
             FABLE,
             FABLE_AT_WEEK,
@@ -1629,15 +1246,6 @@ mod tests {
     }
 
     /// THE OWNER'S ORDER (`[harness] limit_reset_kinds`, the spec's R2):
-    /// under a list, the row taken is the first listed kind's the dialog
-    /// offers, whatever else is on offer — the three kinds of
-    /// `DIALOG_KINDS`, a weekly reset beside a Fable one — and an unlisted
-    /// kind or a Fable row never. NEGATIVE CONTROLS: the same dialogs under
-    /// the empty list (the lone-offer rule) take nothing; the first listed
-    /// kind's row that does not read whole takes nothing, never the next
-    /// kind in its place; a kind drawn twice, a kind this build does not
-    /// name, 2.1.287's row and the weekly session reset's row refuse the
-    /// menu under any list; and a Fable kind in the list is never taken.
     #[test]
     fn under_the_owners_order_the_first_listed_kind_on_offer_is_taken() {
         use ResetKind::{Fable, Full, Session, Weekly};
@@ -1689,8 +1297,6 @@ mod tests {
             reset_row(&boxed(&limit_options_panel(labels, 0, false)), order)
                 .map(|row| (row.kind, row.label))
         };
-        // The first listed kind's row does not read whole: none, never the
-        // next kind's.
         for first in ["Use a full reset", "Use a full reset (0 left, until Oct 5)"] {
             assert_eq!(
                 among(&[STOP, first, GRANT, WAIT], &[Full, Weekly]),
@@ -1703,7 +1309,6 @@ mod tests {
                 "{first}: the first listed kind is the weekly one"
             );
         }
-        // Refused under any list.
         for labels in [
             &[STOP, GRANT, GRANT, WAIT][..],
             &[
@@ -1725,7 +1330,6 @@ mod tests {
                 assert_eq!(among(labels, order), None, "{labels:?} under {order:?}");
             }
         }
-        // A Fable row is never taken, listed or alone.
         assert_eq!(among(&[STOP, FABLE, WAIT], &[Fable, Full]), None);
         assert_eq!(
             among(&[STOP, FABLE, FULL, WAIT], &[Fable, Full]),
@@ -1734,12 +1338,6 @@ mod tests {
     }
 
     /// WHICH KIND A ROW OPENS AS: a kind's row head, ASCII case ignored,
-    /// that ends where the label does or at its ` (` or ` · ` — the head a
-    /// word of its own, as the vendor's `Kvt` draws it (a bare head where
-    /// the grant names no end date; the Fable row's suffix after its
-    /// parentheses). NEGATIVE CONTROL: a kind whose name only begins with a
-    /// known one's (`full reset plus`), a head run on into a longer word
-    /// (`resetting`), and every other row open as none.
     #[test]
     fn a_row_opens_as_a_kind_only_where_the_kinds_head_is_a_word_of_its_own() {
         for (label, kind) in [
@@ -1778,14 +1376,6 @@ mod tests {
     }
 
     /// WHAT SPENDS A RESET, by a label's opening words: a grant row of any
-    /// kind in any spelling of its head (the Fable one too), the weekly row,
-    /// the confirmation's yes of any kind. NEGATIVE CONTROL: every other row
-    /// of the two boxes, the plain yeses a permission box offers, the
-    /// bundle's other `Yes, use my …` and a row whose reset is another
-    /// clause's verb spend none; nor, to this reader, does the 2.1.287
-    /// wording (approval.rs's `spends` reads its words, through
-    /// [`uses_a_reset`], which reads the head of what a row uses and never a
-    /// reset that is another clause's verb).
     #[test]
     fn a_label_that_spends_a_reset_is_told_by_its_opening_words() {
         for label in [
@@ -1833,10 +1423,6 @@ mod tests {
         ] {
             assert!(!spends_reset(label), "{label}");
         }
-        // The wide reader reads the head of what a row uses: every build's
-        // row and yes, and a kind no build names, however its name is
-        // joined; never a reset past the head, or one that is another
-        // clause's verb (main's 28ef21b334).
         for label in [
             GRANT,
             SESSION,
@@ -1866,20 +1452,11 @@ mod tests {
     }
 
     /// THE CONFIRMATION, READ EXACTLY: the composed weekly box gives its two
-    /// fenced rows, its kind, the limit it refills, the week, the count and
-    /// the deadline; the same at 60 columns, its body wrapped onto a second
-    /// row; the same in the inline frame; with the cursor on `No, keep it` it
-    /// is still exact and says the yes is not focused; and the 5-hour and
-    /// full boxes, each by its own words (`5-hour` in the title, `five-hour`
-    /// in the count). NEGATIVE CONTROL: the wall dialog it replaces, and its
-    /// own pending state, are not it.
     #[test]
     fn the_confirmation_reads_exactly_plain_wrapped_and_with_the_focus_on_no() {
         let rows = screen(fixtures::CONFIRM);
         assert_eq!(rows, confirm_with(&[BODY, DETAIL]));
         let p = boxed(&rows);
-        // As the box parser reads it: no kind of its own, chosen by arrows
-        // and Enter, the yes with no role and the no a refusal.
         assert_eq!((p.kind, p.select), (PromptKind::Other, Select::ArrowsEnter));
         assert_eq!(
             p.options.iter().map(|o| o.role).collect::<Vec<_>>(),
@@ -1921,7 +1498,6 @@ mod tests {
                 ..exact.clone()
             })
         );
-        // Each other kind the step takes, as its fixture draws it.
         for (fixture, kind, limits, left) in [
             (
                 fixtures::CONFIRM_SESSION,
@@ -1958,8 +1534,6 @@ mod tests {
                 )
             );
         }
-        // The grammar's other spellings: several limits, one reset, a year,
-        // minutes.
         for (body, detail, limits, week, left, deadline) in [
             (
                 "Refills your session limit now · your weekly reset day stays Oct 9 at 5:30am",
@@ -2017,15 +1591,6 @@ mod tests {
     }
 
     /// EVERY LIMIT TYPE A GRANT CLEARS IS NAMED AS THE CONFIRMATION READS IT
-    /// BACK: the vendor's own `{limits}` for each type (`Yn` @244635663: the
-    /// five-hour type `session`, the week `weekly`, `Opus`, `Sonnet`, the
-    /// overage-included week `weekly` for a grant that does not give Fable's
-    /// usage back), drawn in the body, reads back as exactly the name
-    /// [`reset_limit_name`] answers — what a go's limits are matched against,
-    /// case and spelling alike — and the weekly types' name is the one the
-    /// composed confirmation reads. Any other type is no name. NEGATIVE
-    /// CONTROL: a name in another case (`Weekly`) reads back all the same,
-    /// so only the vendor's spelling tells it from theirs.
     #[test]
     fn every_limit_type_maps_to_a_name_the_confirmation_reads_back() {
         let ConfirmRead::Exact(composed) = confirm_read(&screen(fixtures::CONFIRM)) else {
@@ -2060,23 +1625,16 @@ mod tests {
             assert_eq!(reset_limit_name(limit_type), None, "{limit_type:?}");
         }
 
-        // The control.
         assert_eq!(read_back("Weekly limit"), ["Weekly"]);
         assert_ne!(read_back("Weekly limit"), read_back("weekly limit"));
     }
 
     /// ANYTHING ELSE IS INEXACT, and says the first thing that did not read
-    /// — one control for each word, each the exact confirmation with one
-    /// thing changed. Every one of them would be the confirmation of a reset
-    /// that must not be spent: an early use, another kind's, another offer,
-    /// a reworded box, the Fable reset's.
     #[test]
     fn a_confirmation_not_read_exactly_names_what_did_not_read() {
         const EARLY: &str =
             "You still have 40% of your weekly limit left — use your weekly reset anyway?";
         for (why, body) in [
-            // An early line above the body, in each of its spellings and of
-            // any kind, and wrapped.
             ("early", &[EARLY, BODY, DETAIL][..]),
             (
                 "early",
@@ -2103,9 +1661,6 @@ mod tests {
                     DETAIL,
                 ],
             ),
-            // The body's head reworded, a grant that names no limit, a name
-            // that is no word, a row that is not the box's, the Fable kind's
-            // segment in a weekly body.
             (
                 "body",
                 &[
@@ -2145,9 +1700,6 @@ mod tests {
             ("body", &[BODY, DETAIL, "This cannot be undone"]),
             ("body", &[DETAIL, BODY]),
             ("body", &[]),
-            // The week's segment dropped (the vendor drops a segment whose
-            // value it lacks), reworded, with no hour, with its zone named,
-            // or behind the Fable kind's `{returns}`.
             ("week", &["Refills your weekly limit now", DETAIL]),
             (
                 "week",
@@ -2199,8 +1751,6 @@ mod tests {
                     DETAIL,
                 ],
             ),
-            // `resets left` with no number, none left, the wrong plural,
-            // another kind's noun, the 2.1.287 count, no detail at all.
             ("count", &[BODY, "weekly resets left · use by Oct 5 at 3pm"]),
             (
                 "count",
@@ -2227,7 +1777,6 @@ mod tests {
             ("count", &[BODY, "… left · use by …"]),
             ("count", &[BODY, "use by Oct 5 at 3pm"]),
             ("count", &[BODY]),
-            // A deadline with no hour, dropped, reworded, with its zone named.
             ("deadline", &[BODY, "2 weekly resets left · use by Oct 5"]),
             ("deadline", &[BODY, "2 weekly resets left"]),
             (
@@ -2257,9 +1806,6 @@ mod tests {
             confirm_read(&screen(fixtures::CONFIRM_EARLY)),
             ConfirmRead::Inexact("early")
         );
-        // 2.1.287's whole confirmation — its title, its yes, its count —
-        // drawn by an older build: told by its `No, keep it` and its joins,
-        // and read no further than its title.
         assert_eq!(
             confirm_read(&confirm_of(
                 "Use your reset?",
@@ -2269,15 +1815,11 @@ mod tests {
             )),
             ConfirmRead::Inexact("title")
         );
-        // The Fable reset's confirmation, whole as the vendor draws it: of a
-        // kind the step never takes, never read further.
         assert_eq!(
             confirm_read(&screen(fixtures::CONFIRM_FABLE)),
             ConfirmRead::Inexact("kind")
         );
 
-        // The options: numbered, a third one, the two the other way round,
-        // either one reworded, another kind's yes under the title.
         let exact = screen(fixtures::CONFIRM);
         let options = |yes: &str, no: &str, more: &[&str]| {
             let mut rows = exact[..8].to_vec();
@@ -2316,7 +1858,6 @@ mod tests {
                 "{rows:#?}"
             );
         }
-        // Two cursors, or none: not what a Select draws.
         let p = boxed(&exact);
         for focused in [(true, true), (false, false)] {
             let mut edited = p.clone();
@@ -2327,8 +1868,6 @@ mod tests {
             );
         }
 
-        // The title reworded over the same yes, the 2.1.287 title, a head
-        // off the screen, rows that are not the ones the box was read from.
         for title in [
             "   Spend your reset?",
             "   Use your reset?",
@@ -2353,25 +1892,11 @@ mod tests {
     }
 
     /// A CONFIRMATION WITH NEITHER ITS TITLE NOR ITS YES IS STILL THE
-    /// CONFIRMATION, by any one part left of it: the server may reword every
-    /// text (READ: `mH()`), and a short pane cuts the title off. Its no, or
-    /// one row of its body — the head, either join, an early line of any
-    /// kind — on a box of unnumbered options reads [`ConfirmRead::Inexact`],
-    /// which nothing says yes to and an owed step Escapes; read as
-    /// [`ConfirmRead::Not`] it was any other box, and full power's catch-all
-    /// took its reworded yes. NEGATIVE CONTROLS: the same box with every part
-    /// reworded is some other box; a NUMBERED box (a permission box, whose
-    /// body is a command or a diff that may quote these words) is not the
-    /// confirmation by its body or by a `No, keep it` of its own; and the
-    /// usage-limit dialog is not.
     #[test]
     fn a_confirmation_is_told_by_any_part_left_of_it() {
         const QUESTION: &str = "Spend it now?";
         const PLAIN: &str = "This takes effect at once";
         let exact = screen(fixtures::CONFIRM);
-        // The exact confirmation with its title, body rows and options
-        // replaced; `cut` drops the rule and the title, as a pane shorter
-        // than the box does.
         let boxed_as = |title: &str, body: &[&str], yes: &str, no: &str, cut: bool| {
             let rows = confirm_of(title, body, yes, no);
             if cut { rows[5..].to_vec() } else { rows }
@@ -2420,7 +1945,6 @@ mod tests {
                     ConfirmRead::Inexact("title"),
                     "{what}, cut {cut}: {rows:#?}"
                 );
-                // With a plain `Yes`.
                 let rows = boxed_as(QUESTION, body, "Yes", no, cut);
                 assert_eq!(
                     confirm_read(&rows),
@@ -2428,19 +1952,15 @@ mod tests {
                     "{what}, cut {cut}, a plain yes"
                 );
             }
-            // A kind's yes under another title, cut or not.
             let rows = boxed_as(QUESTION, &[PLAIN], "Yes, use my 5-hour reset", "No", cut);
             assert_eq!(
                 confirm_read(&rows),
                 ConfirmRead::Inexact("title"),
                 "cut {cut}"
             );
-            // Negative control: no part of the confirmation left.
             let other = boxed_as(QUESTION, &[PLAIN], "Yes", "No", cut);
             assert_eq!(confirm_read(&other), ConfirmRead::Not, "cut {cut}");
         }
-        // Negative control: on numbered options (a permission box) neither the body's
-        // words nor a no of that spelling make a confirmation.
         let rows = boxed_as(QUESTION, &[BODY, DETAIL], "Yes", "No, keep it", false);
         let mut numbered = boxed(&rows);
         assert_eq!(
@@ -2466,13 +1986,6 @@ mod tests {
     }
 
     /// THE CHOOSER `Which reset do you want to use?` (READ, `Fnt`
-    /// @257468497: only a typed `/limit-reset` opens it, which the harness
-    /// never types): its unnumbered rows are each a kind's `Use a <kind> (…)`
-    /// or a disabled `<Kind> · <reason>`, with no keep row. It is no
-    /// usage-limit dialog, so no grant row of it is the step's, and no
-    /// confirmation: nothing here would say yes to it, and every row it
-    /// offers to choose spends. NEGATIVE CONTROL: one of its rows, the one
-    /// reset on offer in the usage-limit dialog, is a grant row.
     #[test]
     fn the_chooser_is_neither_the_dialog_nor_the_confirmation() {
         let base = screen(fixtures::CONFIRM);
@@ -2490,7 +2003,6 @@ mod tests {
         assert_eq!(reset_confirm(&p, &rows), ConfirmRead::Not);
         assert!(p.options[..2].iter().all(|o| spends_reset(&o.label)));
         assert_eq!(reset_pending(&rows), None);
-        // The control.
         assert_eq!(
             row_among(&[STOP, SESSION, WAIT]).map(|r| r.kind),
             Some(ResetKind::Session)
@@ -2498,14 +2010,6 @@ mod tests {
     }
 
     /// THE TWO PENDING LINES, each under its own title, with the row the
-    /// line is on: `Checking for a reset…` under the wall dialog's (its
-    /// input guide under it), `Resetting your limits…` under the
-    /// confirmation's of each kind (no guide) — in both frames, and with the
-    /// line wrapped. NEGATIVE CONTROLS: every other screen of the program
-    /// and the measured wall dialog; each line under the other's title; the
-    /// 2.1.287 title; no rule over the title; a composer under it; a row
-    /// under the line that is not the dialog's; the line quoted at an idle
-    /// composer.
     #[test]
     fn a_pending_line_is_read_under_its_own_title_and_nowhere_else() {
         let checking = screen(fixtures::CHECKING);
@@ -2539,8 +2043,6 @@ mod tests {
             reset_pending(&inline(&resetting)),
             Some((ResetPending::Resetting, 5))
         );
-        // The checking state with no guide, and the claiming line wrapped
-        // at 54 columns.
         assert_eq!(
             reset_pending(&checking[..6]),
             Some((ResetPending::Checking, 5))
@@ -2549,8 +2051,6 @@ mod tests {
         wrapped.push("   Resetting your limits… this usually takes a few".to_string());
         wrapped.push("   seconds".to_string());
         assert_eq!(reset_pending(&wrapped), Some((ResetPending::Resetting, 5)));
-        // The crate's reader says idle by default of a pending screen, no composer, no
-        // box: no evidence; only this reader names the state.
         for rows in [&checking, &resetting] {
             let reading = crate::read(Some("claude"), rows, None);
             assert_eq!(
@@ -2635,8 +2135,6 @@ mod tests {
                 "the composer under it"
             );
         }
-        // The composer's frame above the dialog, out of the column check's reach:
-        // refused for the frame alone.
         for base in [&checking, &resetting] {
             let rule = "─".repeat(60);
             let framed: Vec<String> = [rule.clone(), "❯ ".to_string(), rule]
@@ -2650,7 +2148,6 @@ mod tests {
                 "the same rows without it"
             );
         }
-        // The line said at an idle composer (a transcript that quotes it).
         let mut quoted = vec![
             "⏺ It printed this:".to_string(),
             "  What do you want to do?".to_string(),
@@ -2664,9 +2161,6 @@ mod tests {
     }
 
     /// The vendor's other answers at a wall, as its templates draw them (dates and counts
-    /// invented): the lines of a claim, then the row's own answers, then the rest of what the
-    /// answers' templates compose (2.1.308's are 2.1.304's), then the answers away from a
-    /// wall, which a person's own `/limit-reset` draws.
     const FAILURES: [&str; 43] = [
         "That reset was already used · nothing changed just now · 1 weekly reset left",
         "That reset was already used · nothing changed just now · 1 five-hour reset left · run \
@@ -2700,9 +2194,6 @@ mod tests {
         "Resets can't be used while you continue at lower priority · run /limit-reset after that \
          ends",
         "Resets kept · run /limit-reset when you want one · first expires Oct 5 at 3pm",
-        // Nothing to take at the wall, each reason the answer composes after
-        // its ` · this limit resets {when}` or ` · you're not at a usage
-        // limit right now`.
         "No reset to use · this limit resets Oct 9 at 5am",
         "Your Fable reset can't be used right now · no Fable usage this week to give back · this \
          limit resets Oct 9 at 5am",
@@ -2712,9 +2203,6 @@ mod tests {
          resets 3pm",
         "This reset isn't available any more · nothing was used · you're not at a usage limit \
          right now",
-        // The row's kind not on offer, by each reason it is not: the reason
-        // whole where it opens `can't be used`, after `can't be used right
-        // now · ` where it does not; then the kinds that are.
         "Your weekly reset can't be used while you're at your session limit · you can use a \
          5-hour reset",
         "Your full reset can't be used while you're at your Opus limit · you can use a weekly \
@@ -2732,7 +2220,6 @@ mod tests {
          can use a weekly reset",
         "Your weekly reset can't be used right now · try again in a minute · you can use a 5-hour \
          reset",
-        // Away from a wall.
         "You have a reset saved for when you reach a usage limit · run /limit-reset when you do · \
          1 reset left · use by Oct 5",
         "Your reset can't be used right now · it is paused · 2 resets left · use by Oct 5",
@@ -2753,9 +2240,6 @@ mod tests {
         "Weekly reset kept · run /limit-reset at a limit to use it · use by Oct 5 at 3pm";
     const LOGIN: &str = "Couldn't reset your limits with this login · run /login, then try again";
     /// The weekly session reset's answers (`yJ`, `Ir` @244662428): not this
-    /// step's, though the first opens as the 5-hour kind's spent line does;
-    /// the last three are `Ir`'s own (its unavailable, in-flight and login
-    /// answers, @~244664184).
     const JUNIPER: [&str; 7] = [
         "Session limit reset · next reset available Oct 9 at 5am · your weekly limit still applies",
         "Session limit reset · your weekly limit still applies",
@@ -2767,20 +2251,6 @@ mod tests {
     ];
 
     /// THE ANSWER LINE, one row for each line of the vendor's table: each
-    /// kind's spent line with its count and with the week's segment dropped,
-    /// the Fable kind's still-walled line, the two lifted lines, each kind's
-    /// kept lines, the login line, and every other answer a failure — `asks`
-    /// with the ending and without it. A SPENT LINE IS READ BY ITS KIND'S
-    /// HEAD (R16): its week or count dropped or reworded — as the server's
-    /// payload may replace the line — is a reset spent all the same, its
-    /// count `None` unless a segment is the kind's count whole; the 5-hour
-    /// kind's head only with its count or its week. NEGATIVE CONTROLS: a
-    /// spent head with no ` · ` after it or in another case, a head led by
-    /// other words, the 5-hour head with another kind's count, the weekly
-    /// session reset's own success lines (which share the 5-hour kind's
-    /// head), the Fable kind's words short of its head, a lifted line with
-    /// anything after it, the chooser's keep line, the wait row's line and
-    /// the 2.1.287 kept line are no spend.
     #[test]
     fn a_spent_line_is_read_by_its_kinds_head() {
         let asking = |line: &str| format!("{line}{ASKS}");
@@ -2810,7 +2280,6 @@ mod tests {
                 ResetKind::Fable,
                 1,
             ),
-            // The week's segment dropped (no weekly reset day known).
             (
                 "Session limit reset · 1 five-hour reset left",
                 ResetKind::Session,
@@ -2842,8 +2311,6 @@ mod tests {
                 "{line}"
             );
         }
-        // Reworded past the head: spent, the count read only where a segment
-        // is the kind's own count whole.
         for (line, kind, left) in [
             (
                 "Limits reset · send a message to continue",
@@ -2886,7 +2353,6 @@ mod tests {
                 ResetKind::Fable,
                 None,
             ),
-            // The 2.1.287 wording's count names no kind.
             (
                 "Limits reset · your weekly reset day stays Oct 9 at 5am · 1 reset left",
                 ResetKind::Full,
@@ -2901,8 +2367,6 @@ mod tests {
                 "{line}"
             );
         }
-        // Still at the wall after a give-back: spent, the wall standing, and
-        // never asking.
         let walled = "Fable reset used · you're still at your weekly limit until Oct 9 at 5am · no \
                       Fable resets left";
         assert_eq!(
@@ -2981,7 +2445,6 @@ mod tests {
             "weekly reset kept · run /limit-reset at a limit to use it",
             "Weekly reset kept, run /limit-reset at a limit to use it",
             "Couldn't reset your limits",
-            // The 2.1.287 kept line.
             "Reset kept · run /limit-reset at a limit to use it · use by Oct 5 at 3pm",
             "Claude Code will continue automatically at 6am. Keep this session open; it may \
              still pause for permission prompts. Press esc to cancel the wait.",
@@ -2993,17 +2456,6 @@ mod tests {
     }
 
     /// NO LINE OF THE RESET PROGRAM IS A WALL: the wall table places none of
-    /// the answers of any kind, the pending lines, the confirmation's rows,
-    /// the grant rows, the chooser's rows or the footer notices — an answer
-    /// printed after the wall must not read as a wall still standing (`Weekly
-    /// limits reset · …` opens with the words of a weekly limit and the verb
-    /// `reset`), or as a lost login (the login line names `/login` past its
-    /// first ` · `). Nor is any text of the weekly session reset, the program
-    /// whose row stands where the grant rows go: its answer says the session
-    /// limit is gone, and read as a session wall it would have a refilled
-    /// account waited out or moved from. NEGATIVE CONTROL: the notices these
-    /// lines sit beside are walls to the same classifier, a session limit's
-    /// and a weekly limit's own among them.
     #[test]
     fn no_line_of_the_reset_program_is_a_wall() {
         use crate::wall::{WallKind, classify_wall};
@@ -3055,20 +2507,11 @@ mod tests {
             "/limit-reset to use your weekly reset · 1 left · use by Oct 9",
             "/limit-reset · 2 five-hour, 1 Fable resets · first expires Oct 5",
             "Reset used · 1 reset left",
-            // The chooser (`Fnt` @257468497): its title; its disabled rows
-            // are `chooser` below.
             "Which reset do you want to use?",
-            // The weekly session reset (`yJ` @225880305): its row, its
-            // footer notice, its answers and its pending line.
             WEEKLY,
             "/limit-reset to reset your session limit now · uses weekly limit · 1/week",
             "Resetting your session limit… this usually takes a few seconds",
         ];
-        // The chooser's disabled rows (`Ht` @244631702): `{Kind} · {reason}`,
-        // every kind with every reason `zn` draws (@244632695; `ln` for a
-        // Fable reset at the weekly limit, the limit names `R1e`'s and
-        // `d0t`'s), and `doesn't refill your {limit}` with each name `Se`
-        // draws (@244634234) — a superset of the rows a build composes.
         let reasons = [
             "try again in a minute",
             "can't be used while you're at your session limit",

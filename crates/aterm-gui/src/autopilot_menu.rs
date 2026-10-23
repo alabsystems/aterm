@@ -1204,7 +1204,7 @@ impl App {
         let ws = self.windows.get_mut(&wid)?;
         let ground = crate::tab_menu::ground_cell(theme, ws.input_scratch.default_bg);
         let right = rect.col + rect.w;
-        for (r, row) in painted.into_iter().enumerate() {
+        for (r, row) in painted.iter().enumerate() {
             let frame_row = rect.row + r;
             let Some(cells) = ws.input_scratch.cells.get_mut(frame_row) else {
                 break;
@@ -1212,9 +1212,9 @@ impl App {
             if cells.len() < right {
                 cells.resize(right, ground);
             }
-            for (c, cell) in row.into_iter().enumerate() {
+            for (c, cell) in row.iter().enumerate() {
                 if let Some(slot) = cells.get_mut(rect.col + c) {
-                    *slot = cell;
+                    *slot = *cell;
                 }
             }
             let span = rect.col..right;
@@ -1235,6 +1235,17 @@ impl App {
             (cw, ch),
             (pad, grid_top),
         );
+        // The card's own marks (`BandIcon::glass_mark`: its `○ ● ⤓`, the fact
+        // menus' `◉ ◈ ⌂ ◐`), drawn as the glass draws its own and after the
+        // scrub, which takes every drawn icon on the card; recorded in the
+        // harness card's record, so every strip of it (the top of a frame, of
+        // a compose, of the footer's splice) takes them back and a closed card
+        // leaves none.
+        let on_frame = ws.input_scratch.cells.len().saturating_sub(rect.row);
+        for (r, row) in painted.iter().enumerate().take(on_frame) {
+            ws.claude_card
+                .paint_marks(&mut ws.input_scratch, rect.row + r, rect.col, row);
+        }
         ws.input_scratch.snapshot_seq = ws.input_scratch.snapshot_seq.wrapping_add(1);
         if let Some(menu) = self.autopilot_menu.as_mut() {
             menu.rect = Some(rect);

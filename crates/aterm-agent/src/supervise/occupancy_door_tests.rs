@@ -14,6 +14,7 @@ use std::sync::atomic::AtomicUsize;
 
 use super::*;
 use crate::supervise::config::Autopilot;
+use crate::supervise::occupancy::reading::LOOK_EVERY_MS;
 use crate::supervise::occupancy::rules::{RuleId, WOULD_RULE};
 use crate::supervise::occupancy::{OccupancyReading, SlotsSeen};
 use crate::supervise::policy::turn_end::Reach;
@@ -186,6 +187,10 @@ fn day_on(
 ) -> Day {
     let (dir, path) = ledger_at(tag);
     let mut m = Mock::new(Vec::new());
+    let has_board = board.taken_ms > 0;
+    let held_ago = board
+        .held_slot_last_ms
+        .map(|at| board.taken_ms.saturating_sub(at));
     let host = Board::reading(board);
     let (noted, asks) = {
         let as_host = hosted.then(|| Arc::clone(&host) as Arc<dyn IdleHost>);
@@ -201,6 +206,16 @@ fn day_on(
             if ahead > 0 {
                 skip(&clock, &mut at_ms, ahead);
             }
+            // These constant machine facts are sampled each virtual board look.
+            // The stopped-board controls below deliberately do not refresh them.
+            if has_board {
+                let looked_at = T0 + (at_ms - T0).div_euclid(LOOK_EVERY_MS) * LOOK_EVERY_MS;
+                let mut reading = host.reading.lock().expect("the board");
+                reading.taken_ms = looked_at;
+                reading.held_slot_last_ms = held_ago.map(|ago| looked_at.saturating_sub(ago));
+            }
+            // A real screen request installs this pair in Session::call.
+            s.clock_marks = Some((s.fx.mono(), at_ms));
             before(&mut s, seq);
             s.host_steps_in_background(&screen_at(seq, drawn(seq)), &mut since, cfg, review);
         }
@@ -383,6 +398,79 @@ fn the_board_is_asked_at_most_once_a_look() {
         [(NUDGE.to_string(), 30 * MIN)],
         "no room, no ask past"
     );
+
+    // Query a stopped board once while a guard holds the room line, then
+    // remove that guard 59 seconds later, still inside the query cache.
+    // The already sampled clock pair must age the owned reading too.
+    let cached_room = |tag: &str, age_ms, producer_stale, missing_clock, mark_ahead| {
+        let (dir, path) = ledger_at(tag);
+        let queried_at = T0 + 120 * MIN;
+        let host = Board::reading(OccupancyReading {
+            taken_ms: queried_at - age_ms,
+            stale: producer_stale,
+            held_slot_last_ms: Some(queried_at - age_ms - MIN),
+            ..room()
+        });
+        let mut m = Mock::new(Vec::new());
+        {
+            let (mut s, clock) = hold_session(
+                &mut m,
+                &path,
+                Some(Arc::clone(&host) as Arc<dyn IdleHost>),
+                Duration::ZERO,
+            );
+            let opts = hosted(30);
+            let mut heard = Heard::default();
+            let mut since = None;
+            let mut at_ms = T0;
+            for (seq, at) in [
+                (1, T0),
+                (2, T0 + 30 * MIN),
+                (3, queried_at),
+                (4, queried_at + 59_000),
+            ] {
+                let ahead = at - at_ms;
+                skip(&clock, &mut at_ms, ahead);
+                if seq < 4 {
+                    s.clock_marks = Some((s.fx.mono(), at_ms));
+                } else if missing_clock {
+                    s.clock_marks = None;
+                } else if mark_ahead {
+                    // A newer mark must not subtract time or panic.
+                    s.clock_marks = Some((s.fx.mono() + Duration::from_millis(1), at_ms + 1));
+                }
+                // Otherwise retain the query's pair, exercising extrapolation
+                // to the break's existing Instant without another clock effect.
+                s.driver = seq == 3;
+                s.host_steps_in_background(
+                    &screen_at(seq, break_screen()),
+                    &mut since,
+                    Some(&opts.policy),
+                    &mut heard,
+                );
+            }
+        }
+        assert_eq!(host.asks(), 1, "the second judgment reused the query");
+        let rows = would_rows(&path);
+        let _ = std::fs::remove_dir_all(&dir);
+        rows
+    };
+    for (tag, age_ms, producer_stale, missing_clock, mark_ahead, room_due) in [
+        ("aged-119-to-178", 119_000, false, false, false, false),
+        ("aged-fresh", 0, false, false, false, true),
+        ("aged-edge", 61_000, false, false, false, true),
+        ("aged-past-edge", 61_001, false, false, false, false),
+        ("aged-producer-stale", 0, true, false, false, false),
+        ("aged-missing-clock", 0, false, true, false, false),
+        ("aged-newer-clock", 61_000, false, false, true, false),
+    ] {
+        let rows = cached_room(tag, age_ms, producer_stale, missing_clock, mark_ahead);
+        let mut expected = vec![(NUDGE.to_string(), 30 * MIN)];
+        if room_due {
+            expected.push((ROOM.to_string(), 120 * MIN + 59_000));
+        }
+        assert_eq!(rows, expected, "{tag}");
+    }
 }
 
 /// EACH GUARD THE LOOP HOLDS HOLDS THE DUE LINE, said once, from the loop's own state (F1): a

@@ -1,21 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Settings at phone width and large text — the system pages first,
-//! then every page by the same rules: every word a page paints is
-//! whole in the box it is drawn in, and every control stays inside its card
-//! and is whole on some screen, from a 22-column window (178pt) up, at 1×,
-//! 1.5× and 2× text.
+//! Tests Settings layout and text fitting at narrow window widths (from 22 columns up) across
+//! 1×, 1.5×, and 2× text scales.
 
 use super::*;
 
-/// The window widths a 22-, 24-, 30-, 36- and 42-column terminal window gives
-/// Settings, and the heights of 24 and 36 rows.
+/// The window widths a 22-, 24-, 30-, 36- and 42-column terminal window gives Settings.
 pub(super) const NARROW_WIDTHS: [f32; 5] = [178.0, 192.0, 234.0, 276.0, 318.0];
 pub(super) const NARROW_HEIGHTS: [f32; 2] = [348.0, 516.0];
 
-/// The windows an 80×24, 102×29, 150×48, 167×36 and 220×60 terminal window
-/// gives Settings.
+/// The windows an 80×24, 102×29, 150×48, 167×36 and 220×60 terminal window gives Settings.
 pub(super) const WIDE_SIZES: [(f32, f32); 5] = [
     (584.0, 348.0),
     (744.0, 420.0),
@@ -24,8 +19,7 @@ pub(super) const WIDE_SIZES: [(f32, f32); 5] = [
     (1_606.0, 876.0),
 ];
 
-/// The first screen of `route` in a `width`×`height` window, from a fresh
-/// runtime.
+/// The first screen of `route` in a `width`×`height` window, from a fresh runtime.
 pub(super) fn first_screen_of(
     route: SettingsRoute,
     width: f32,
@@ -36,8 +30,7 @@ pub(super) fn first_screen_of(
     compile_settings_view(&runtime, instance, view, &view_cx_at(width, height))
 }
 
-/// Every screen of `route` in a `width`×`height` window, top to the last
-/// one its list scrolls to, from a fresh runtime `prepare` has set up.
+/// Every screen of `route` in a `width`×`height` window, top to the last one its list scrolls.
 pub(super) fn screens_of(
     prepare: impl FnOnce(&mut NativeRuntime, crate::native_app::ViewId),
     route: SettingsRoute,
@@ -64,9 +57,7 @@ pub(super) fn screens_of(
     screens
 }
 
-/// The painted words under any of `prefixes` that are not whole: elided or
-/// clipped by the painter (the fit audit's `overflow=true`), or cut by their
-/// author (an ellipsis in what it hands the painter).
+/// The painted words under any of `prefixes` that are not whole.
 pub(super) fn cut_words(compiled: &crate::native_ui::CompiledUi, prefixes: &[&str]) -> Vec<String> {
     compiled
         .paint_audit_lines()
@@ -83,8 +74,7 @@ pub(super) fn cut_words(compiled: &crate::native_ui::CompiledUi, prefixes: &[&st
         .collect()
 }
 
-/// The nodes under any of `prefixes` drawn past the box that holds them:
-/// wider than what their cards and the list let show.
+/// The nodes under any of `prefixes` drawn past the box that holds them.
 pub(super) fn spilled_nodes(
     compiled: &crate::native_ui::CompiledUi,
     prefixes: &[&str],
@@ -104,14 +94,6 @@ pub(super) fn spilled_nodes(
         .collect()
 }
 
-/// A CARD OF FACTS PAINTS EVERY NAME AND VALUE WHOLE AT PHONE WIDTH AND
-/// LARGE TEXT (the narrow sweep): About's build information and font
-/// credits at 22 to 42 columns, 1× and 2×, every screen — a name in its
-/// column, a value in its own, or each name over its value where the card
-/// cannot hold both side by side ([`FactColumns`]), nothing elided and
-/// nothing past the card. Before, the name column was a fixed 104pt (124.8pt
-/// at 2×, wider than a 22-column card's 110pt text) and the value column what
-/// it left: "Architec…", "Running…", and at 2× every value a lone "…".
 #[test]
 fn a_card_of_facts_paints_every_name_and_value_whole_at_phone_width() {
     at_each_text_scale(&[1.0, 2.0], "facts at phone width", |scale| {
@@ -133,12 +115,6 @@ fn a_card_of_facts_paints_every_name_and_value_whole_at_phone_width() {
     });
 }
 
-/// THE ONE RULE FOR A FACT'S WORDS: names over values only where the card
-/// cannot hold them side by side, measured. A wide card keeps each name
-/// beside its value, its name column as wide as the widest word of a name
-/// (up to two fifths of the card); a 2× phone-width card stacks; a value's
-/// words wrap at its pieces, a code value's characters with no hyphen to
-/// read as one of them, and a word wider than its box breaks with one.
 #[test]
 fn facts_sit_beside_their_names_until_a_word_cannot() {
     at_each_text_scale(&[2.0], "fact columns", |_| {
@@ -183,14 +159,6 @@ fn facts_sit_beside_their_names_until_a_word_cannot() {
     });
 }
 
-/// A STACKED SWITCH IS NEVER WIDER THAN ITS LINE (the narrow sweep):
-/// on the system pages that draw switch rows — Keyboard & Input, Security,
-/// Window, Software Update and Packages — at 22 and 24 columns, 1× and 2×,
-/// every switch, and the Reset its row keeps, is inside its card. A stacked
-/// row's switch was a fixed 104pt (145.6pt at 2×) whatever its line, which in
-/// a 116pt column ran past the card and cut its own On/Off word; Packages'
-/// switch rows kept their Reset beside the switch even where the line could
-/// not hold both.
 #[test]
 fn a_stacked_switch_is_never_wider_than_its_line() {
     at_each_text_scale(&[1.0, 2.0], "switches at phone width", |scale| {
@@ -225,8 +193,7 @@ fn a_stacked_switch_is_never_wider_than_its_line() {
     });
 }
 
-/// The setting names on `compiled` broken onto a next line whose first word
-/// would have fit the line before it, in that line's own box.
+/// The setting names on `compiled` broken onto a next line whose first word would have fit.
 pub(super) fn early_breaks(compiled: &crate::native_ui::CompiledUi) -> Vec<String> {
     let mut lines: BTreeMap<String, Vec<(usize, String, f32)>> = BTreeMap::new();
     for node in compiled.paint.iter().filter(|node| !node.peek) {
@@ -247,8 +214,6 @@ pub(super) fn early_breaks(compiled: &crate::native_ui::CompiledUi) -> Vec<Strin
         name.sort_by_key(|(index, _, _)| *index);
         for pair in name.windows(2) {
             let ((_, line, width), (_, next, _)) = (&pair[0], &pair[1]);
-            // A line a word broke inside, or one ending in a tag, is the
-            // word's or the tag's.
             if line.ends_with('-') || line.contains(FACT_SEPARATOR) {
                 continue;
             }
@@ -263,13 +228,6 @@ pub(super) fn early_breaks(compiled: &crate::native_ui::CompiledUi) -> Vec<Strin
     early
 }
 
-/// A WRAPPED NAME FILLS THE BOX IT IS DRAWN IN: each line of a setting
-/// row's name breaks only where its next word would not fit the line's own
-/// box ([`early_breaks`]), on Harness, AI CLIs and Software Update at 22 to
-/// 42 columns, 1× and 2×. Harness's and AI CLIs' cards laid their rows out
-/// at the page's padding and drew them, on a short window, inside a tighter
-/// one 20pt wider ("Supervise Muse" / "Code sessions" beside room for
-/// "Code"); Software Update measured its switches 6pt inside their card.
 #[test]
 fn a_wrapped_name_fills_the_box_it_is_drawn_in() {
     at_each_text_scale(&[1.0, 2.0], "names fill their boxes", |scale| {
@@ -294,14 +252,6 @@ fn a_wrapped_name_fills_the_box_it_is_drawn_in() {
     });
 }
 
-/// A NARROW SLIDER SETS ITS READOUT OVER ITS TRACK (the narrow
-/// sweep): a slider too narrow to keep its readout's room beside a track as
-/// wide, and tall enough for both, paints the readout flush right on a line
-/// of its own and the track under it across the whole control — at 2× text
-/// Window's "5000 ms" (95.5pt) was painted into a 57pt slot beside a 67pt
-/// track. Decided by the control's size, never the value: the track is the
-/// same length at both ends of the range. A wide slider keeps them side by
-/// side.
 #[test]
 fn a_narrow_slider_sets_its_readout_over_its_track() {
     at_each_text_scale(&[1.0, 2.0], "narrow slider", |scale| {
@@ -356,15 +306,6 @@ fn a_narrow_slider_sets_its_readout_over_its_track() {
     });
 }
 
-/// A SLIDER'S READOUT IS MEASURED IN THE FACE IT PAINTS IN, AND ENDS AT ITS
-/// EDGE (the audit): the cursor trail's "24 cells" and "0.6 cells"
-/// in the 126pt control a 22-column window gives a stacked slider at 2×
-/// text, and every readout beside a wide track, stand flush right — the
-/// painted text's right edge on the readout's end — and the fit audit
-/// passes them. Measured in the mono face with a floor of 0.62 em a
-/// character while painted in the UI face, "24 cells" was reported 109pt
-/// in a 104pt slot (overflow=true) while its glyphs took 73pt, and it stood
-/// flush left, 32pt short of the edge "260 ms" ends on.
 #[test]
 fn a_slider_readout_is_measured_in_its_face_and_ends_at_its_edge() {
     at_each_text_scale(&[1.0, 2.0], "slider readout", |scale| {
@@ -425,16 +366,6 @@ fn a_slider_readout_is_measured_in_its_face_and_ends_at_its_edge() {
     });
 }
 
-/// A RESET'S PLACE NEVER COSTS A NAME MORE THAN A LINE OF ITS OWN (the
-/// audit): on every page at 30, 38 and 42 columns, 1× and 2× text,
-/// a stacked row's name — beside the Reset (or the place it keeps) at its
-/// label line's end — takes at most one line more than the label line
-/// alone sets it on: where it would take more, Reset has a line of its own,
-/// or a switch row's Reset follows the switch, narrowed toward its least.
-/// At 38 columns and 2× text Reset's empty 108pt place left "Supervise
-/// Gemini CLI sessions" 124pt, a word to a line — four lines where the line
-/// alone holds it on two — and "Allow programs to read the window title and
-/// size" seven for three.
 #[test]
 fn a_reset_place_never_costs_a_name_more_than_a_line_of_its_own() {
     at_each_text_scale(&[1.0, 2.0], "reset seat", |scale| {
@@ -474,7 +405,6 @@ fn a_reset_place_never_costs_a_name_more_than_a_line_of_its_own() {
                             })
                             .collect();
                         let squeeze = |text: &str| text.split_whitespace().collect::<String>();
-                        // Rows whose label line paints the name alone.
                         if lines.is_empty() || squeeze(&lines.concat()) != squeeze(&name) {
                             continue;
                         }
@@ -504,12 +434,6 @@ fn a_reset_place_never_costs_a_name_more_than_a_line_of_its_own() {
     });
 }
 
-/// A STACKED CHOICE KEEPS ITS WORDS (the narrow sweep): a stacked
-/// row's choice button paints its whole choice where it fits, else the
-/// choice without its "(default)", else either with the arrow given up, else
-/// — a colour row — the colour alone, its chip; never cut. At 22 columns the
-/// Window page's "Automatic (default)" read "Auto…" beside room for
-/// "Automatic", and AI CLIs' "Claude (default)" read "Claude (…" at 2×.
 #[test]
 fn a_stacked_choice_keeps_its_words() {
     at_each_text_scale(&[1.0, 2.0], "stacked choices", |scale| {
@@ -548,13 +472,6 @@ fn a_stacked_choice_keeps_its_words() {
     });
 }
 
-/// A BUTTON KEEPS ITS WORDS IN A NARROW COLUMN (the narrow sweep):
-/// Harness's four actions and About's two at 22 to 42 columns, 1× and 2×,
-/// every screen — whole on one line where the box holds them, else a short
-/// form, else on as many lines as the box needs ([`button_words`]); never
-/// cut. Harness fitted its labels 20pt short of the room the button paints
-/// them in ("Tab Co…" in a box that held "Tab Control"), and About's hero
-/// had no form for a column narrower than "Copy Build" ("Cop…", "Ope…").
 #[test]
 fn a_button_keeps_its_words_in_a_narrow_column() {
     at_each_text_scale(&[1.0, 2.0], "buttons at phone width", |scale| {
@@ -598,10 +515,6 @@ fn a_button_keeps_its_words_in_a_narrow_column() {
     });
 }
 
-/// A TEXT BUTTON PAINTS ITS LABEL'S LINES, each whole, one under another in
-/// a button as tall as they need ([`native_ui::native_button_label_lines`],
-/// [`native_ui::native_button_height_for_lines`]); a word wider than the room
-/// has no whole-word lines.
 #[test]
 fn a_text_button_paints_its_labels_lines() {
     at_each_text_scale(&[2.0], "button lines", |_| {
@@ -611,9 +524,6 @@ fn a_text_button_paints_its_labels_lines() {
             .expect("each word fits");
         assert_eq!(lines, ["Open Project", "Site"]);
         assert!(crate::native_ui::native_button_label_lines("Information", 20.0).is_none());
-        // A label with no space has its words at its CJK characters, kinsoku
-        // kept, joined by nothing (before, one word wider than the room: no
-        // lines at all).
         let cjk_room = crate::native_ui::native_button_label_width("設定を") + 1.0;
         assert_eq!(
             crate::native_ui::native_button_label_lines("設定を開く。", cjk_room).as_deref(),
@@ -642,12 +552,6 @@ fn a_text_button_paints_its_labels_lines() {
     });
 }
 
-/// ABOUT'S WORDMARK IS WHOLE AT EVERY SIZE AND TEXT SCALE (item A2 of the
-/// narrow sweep): the hero's "aterm", in the Display step where its
-/// column holds it and scaled down to the column where it does not
-/// ([`native_ui::wordmark_typography`]) — from the 164pt window floor to a
-/// wide window, short and tall, at 1×, 1.5× and 2×. An 80 × 24 window
-/// (584 × 348) at 2× painted "ate…", a phone-width one "at…".
 #[test]
 fn about_s_wordmark_is_whole_at_every_size() {
     at_each_text_scale(&[1.0, 1.5, 2.0], "the wordmark", |scale| {
@@ -679,14 +583,6 @@ fn about_s_wordmark_is_whole_at_every_size() {
     });
 }
 
-/// A WARNING STAYS A WARNING AS IT GIVES UP ITS SIZE (item A4 of the
-/// narrow sweep): Software Update's failing verdict paints in the danger
-/// colour at its own step, at the Body step in bold where that does not fit
-/// ([`StyleRef::DangerCompact`]), and on as many lines as its column needs
-/// where not even that does — from a phone-width page to a desktop one, at
-/// 1×, 1.5× and 2×. The painter gave every heading but a quiet or accent one
-/// the body's ink, so the verdict was never red; and where it stepped down
-/// it took the plain style, keeping its words but not its warning.
 #[test]
 fn a_warning_headline_keeps_its_colour_at_every_size() {
     use crate::widget::DrawPrim;
@@ -742,14 +638,6 @@ fn a_warning_headline_keeps_its_colour_at_every_size() {
     });
 }
 
-/// SOFTWARE UPDATE KEEPS ITS WORDS (the narrow sweep): up to date,
-/// with an update ready and failing, at 22 to 42 columns and on a wide
-/// window, short and tall, 1× and 2× — the status card's caption, verdict,
-/// version and detail, the update action and the Messages link each whole in
-/// the column it is drawn in, nothing past its card. The caption, the verdict
-/// and the version were one line cut to the card ("SOFTWARE UPD…", "aterm
-/// 0.…"), the action was cut inside the card ("Upd…") and the Messages
-/// link's arrow cut its word ("Messa…").
 #[test]
 fn software_update_keeps_its_words() {
     let mut failing = update_status(false);
@@ -784,14 +672,6 @@ fn software_update_keeps_its_words() {
     });
 }
 
-/// THE COMPACT TOOLBAR KEEPS ITS WORDS (item A3 of the narrow sweep):
-/// at every compact width from the 164pt window floor and every text size,
-/// the back button, the title and Search each paint whole words — Search's
-/// field says "Search…" or "Search"; where the bar cannot hold even that
-/// beside the back button, Search is a button (a magnifying glass named
-/// Search Settings) that opens the field across the bar, the keyboard in it,
-/// whole, with Cancel after it, and Cancel brings the button back. A
-/// 24-column window at 2× painted "Se…".
 #[test]
 fn the_compact_toolbar_keeps_its_words() {
     at_each_text_scale(&[1.0, 1.5, 2.0], "the compact toolbar", |scale| {
@@ -807,7 +687,6 @@ fn the_compact_toolbar_keeps_its_words() {
                 "settings/page-heading/",
                 "settings/search",
             ];
-            // "Search…" is the field's whole placeholder, not a cut.
             let whole = |lines: Vec<String>| {
                 lines
                     .into_iter()
@@ -888,9 +767,6 @@ fn the_compact_toolbar_keeps_its_words() {
     });
 }
 
-/// A STACKED CLI ROW'S DETAIL IS WHOLE: on a compact page each CLI's state
-/// and fact wrap to the column — a path at its folders — never cut ("signed-
-/// ou…" at 2× text on a phone-width page).
 #[test]
 fn a_stacked_cli_row_keeps_its_whole_detail() {
     at_each_text_scale(&[1.0, 2.0], "stacked CLI detail", |scale| {
@@ -914,9 +790,7 @@ fn a_stacked_cli_row_keeps_its_whole_detail() {
     });
 }
 
-/// Text that ends in an ellipsis because it says something is under way
-/// ("Reading package status…"), not because it was cut: its painted line is
-/// the end of one of these.
+/// Text that ends in an ellipsis because it says something is under way.
 fn says_it_is_under_way(line: &str) -> bool {
     [
         "Reading package status\u{2026}",
@@ -936,10 +810,6 @@ fn says_it_is_under_way(line: &str) -> bool {
     })
 }
 
-/// A PAGE'S NAME IS WHOLE IN ITS COLUMN (the narrow sweep): every
-/// route's heading, at the window floor to 30 columns, 1× and 2× — in the
-/// title type where it fits, else Body-bold, else Body-bold on lines. A
-/// 22-column page painted "Keyboard…" and "Software U…" at 1×.
 #[test]
 fn a_page_name_is_whole_in_its_column() {
     at_each_text_scale(&[1.0, 2.0], "page names", |scale| {
@@ -957,15 +827,6 @@ fn a_page_name_is_whole_in_its_column() {
     });
 }
 
-/// THE PACKAGES PAGE KEEPS ITS WORDS (the narrow sweep): its
-/// status, verbs, captions, service line, programs and activity at 22 to 42
-/// columns and on a wide window, 1× and 2× — wrapped to the card's MEASURED
-/// column, never cut, nothing past a card — before its tool reports and with
-/// its tool live. Its lines were budgeted in average glyphs per width class
-/// (56 a compact line, for 6 words at 2×), its three verbs held at a fixed
-/// width whatever their words, its captions and its service line's columns
-/// fixed; and the hero's "Signed updates from …" was one fixed line, cut to
-/// "Signed updates fr…" at 22 columns once the tool was live.
 #[test]
 fn the_packages_page_keeps_its_words() {
     at_each_text_scale(&[1.0, 2.0], "Packages", |scale| {
@@ -999,10 +860,6 @@ fn the_packages_page_keeps_its_words() {
     });
 }
 
-/// MESSAGES' SMALL BUTTONS STAY ON THE PAGE (the narrow sweep): Copy
-/// All and Open Log Folder, at a phone width and 2× text, keep their words
-/// inside the column, on lines where it is narrower than one ("Open Log
-/// Folder" ran 87pt past it).
 #[test]
 fn messages_small_buttons_stay_on_the_page() {
     at_each_text_scale(&[1.0, 2.0], "Messages buttons", |scale| {
@@ -1020,23 +877,12 @@ fn messages_small_buttons_stay_on_the_page() {
     });
 }
 
-/// HARNESS KEEPS ITS WORDS WITH SESSIONS OPEN (the narrow sweep):
-/// the page with its sessions — and again with three under Land and a
-/// reading of landings — at 22 to 42 columns, short and tall, 1×
-/// and 2× — every row's title, detail, setting, state and day whole on as many
-/// lines as its column needs, every face of its buttons whole, nothing past
-/// its card; a row taller than one screen of its card listed a part at a time
-/// ([`super::scroll::row_parts`]). A short window at 2× crammed the
-/// buttons five to a line to keep the row on one screen ("Cru…", "…") and cut
-/// the words to the column ("Tab 2 · Cla…").
 #[test]
 fn harness_keeps_its_words_with_sessions_open() {
     at_each_text_scale(&[1.0, 2.0], "Harness sessions", |scale| {
         let mut parts = 0;
         for width in NARROW_WIDTHS {
             for height in NARROW_HEIGHTS {
-                // The page as published, and with landings counted (the Every row's `landed` and `quiet`, `Landed`, the
-                // done claims checked, today's lines led by landings).
                 for (fixture, state) in [
                     ("", super::harness::fixture()),
                     (" landings", super::harness::fixture_landings()),
@@ -1075,11 +921,6 @@ fn harness_keeps_its_words_with_sessions_open() {
     });
 }
 
-/// A ONE-LINE SESSIONS ROW KEEPS ITS WORDS (the sweep): on the
-/// windows an 80×24 to a 220×60 terminal gives, at 1× to 2× text, a session
-/// row whose words sit beside its five buttons wraps its title, detail and
-/// setting line to the words' column, whole, its buttons a control tall. A
-/// 167×36 window at 1.5× cut the detail at a joint, "Tab 2 · Claude Code ·…".
 #[test]
 fn a_one_line_session_row_keeps_its_words() {
     at_each_text_scale(&[1.0, 1.5, 2.0], "one-line sessions", |scale| {
@@ -1122,11 +963,6 @@ fn a_one_line_session_row_keeps_its_words() {
     });
 }
 
-/// A PAGE'S SUBTITLE IS WHOLE IN ITS COLUMN (the sweep): every route
-/// on the windows an 80×24 to a 220×60 terminal gives, 1× to 2× text, on as
-/// many lines as the form's measure needs. Harness's at 2× on a 220×60
-/// window painted "…what it did, and its settin…", 4pt over its 720pt
-/// column.
 #[test]
 fn a_page_subtitle_is_whole_in_its_column() {
     at_each_text_scale(&[1.0, 1.5, 2.0], "page subtitles", |scale| {
@@ -1144,13 +980,6 @@ fn a_page_subtitle_is_whole_in_its_column() {
     });
 }
 
-/// A ROW TOO NARROW FOR ITS NAME BESIDE ITS CONTROLS STACKS THEM UNDER IT,
-/// ON A WIDE PAGE TOO (the sweep; the rule a compact row keeps): at
-/// 1.5× and 2× text on the windows a 150×48 and a 220×60 terminal give, no
-/// setting row draws its name, control, segments or Reset past its row, and
-/// Harness's Question priority — three segments and Reset's place wider than
-/// the whole row at 2× — says its name whole over them. The name was given
-/// no room at all (and not painted), and Reset's place ran 52pt past the row.
 #[test]
 fn a_row_too_narrow_for_its_name_beside_its_controls_stacks_them() {
     let prefixes = [
@@ -1191,13 +1020,6 @@ fn a_row_too_narrow_for_its_name_beside_its_controls_stacks_them() {
     });
 }
 
-/// SEARCH'S RESULTS AND MODIFIED KEEP THEIR WORDS (the narrow sweep,
-/// what the narrow toolbar's Search opens): a search that finds pages and
-/// settings ("cursor"), one that finds nothing, and Modified with nothing
-/// changed, at 22 to 42 columns, short and tall, 1× to 2× — the count, every
-/// page result, the empty card and Reset All whole in the column, nothing past
-/// it. A 24-column window at 2× painted "2 pages · 19 s…" and "✦ C… →", and
-/// Modified "Nothin…", "Settings you c…" and a Reset All 12pt past the page.
 #[test]
 fn search_results_and_modified_keep_their_words() {
     let prefixes = [
@@ -1231,7 +1053,6 @@ fn search_results_and_modified_keep_their_words() {
                     each_screen(&mut runtime, instance, view, &cx, |screen, top| {
                         let cut = cut_words(screen, &prefixes)
                             .into_iter()
-                            // "Reset All…" asks before it acts: its words.
                             .filter(|line| !line.ends_with("painted=\"Reset All\u{2026}\""))
                             .collect::<Vec<_>>();
                         assert!(cut.is_empty(), "{context} screen {top}: {cut:#?}");
@@ -1255,17 +1076,6 @@ fn search_results_and_modified_keep_their_words() {
     });
 }
 
-/// AN EMPTY FIELD DROPS NO WORD WHERE ITS ROW CAN GROW (the
-/// audit): every empty text field on Appearance, Terminal and Cursor Styles
-/// (the comet's trail colours too) at 22 and 30 columns, 1×, 1.5× and 2×
-/// text, paints every word of its placeholder — less only the "(default)"
-/// the quiet tint says and the aside it ends in — on one line or on lines of
-/// the field, never "…" for words it leaves out — a colour field whose
-/// words are not whole beside its chip sets the chip on a line of its own
-/// under them, and still shows its colour. "Theme default" read "Theme…"
-/// (and at 2× in 22 columns the field showed its chip alone), "platform
-/// default" "platform…", "Pale blue (default)" "Pale…", and "Brighter pale
-/// blue (default)" "Brighter" / "pale…", the row free to grow.
 #[test]
 fn an_empty_field_drops_no_word_where_its_row_can_grow() {
     at_each_text_scale(&[1.0, 1.5, 2.0], "placeholder words", |scale| {
@@ -1312,8 +1122,6 @@ fn an_empty_field_drops_no_word_where_its_row_can_grow() {
                             route.label(),
                             node.key.as_str()
                         );
-                        // A colour field still shows its colour: beside its
-                        // words, or on a line of its own under them.
                         let themed = [
                             prefs::EDIT_FOREGROUND,
                             prefs::EDIT_BACKGROUND,
@@ -1353,14 +1161,6 @@ fn an_empty_field_drops_no_word_where_its_row_can_grow() {
     });
 }
 
-/// A FIELD'S VALUE IS WHOLE WHERE ITS ROW CAN GROW (the review):
-/// a value wider than its field — a shell named by a hyphenated word, a
-/// shell's path — paints every letter while the field is not being edited,
-/// on the lines it takes (a path the longest of its forms two lines hold,
-/// its program's name whole), the field as tall as they are; editing it
-/// leaves the row as tall. A value one line holds stays on one line. It
-/// was cut on one line: "nushell-nightly-build" read "nushel…" at 2× text
-/// in a 22-column window, the path's program "…e-zsh".
 #[test]
 fn a_fields_value_is_whole_where_its_row_can_grow() {
     let bare = |text: &str| {
@@ -1397,10 +1197,6 @@ fn a_fields_value_is_whole_where_its_row_can_grow() {
                     .map(|node| node.rect)
                     .expect("the field's rect");
                 if path {
-                    // Its program's name whole: the path whole, or its
-                    // folders given up for "…" only where two lines do not
-                    // hold it, the name's folder kept where they hold it
-                    // ([`path_placeholder_lines`]).
                     assert!(
                         bare(&shown).ends_with(&bare("/login-zsh"))
                             && (lines <= 2 || shown.starts_with('\u{2026}')),
@@ -1419,7 +1215,6 @@ fn a_fields_value_is_whole_where_its_row_can_grow() {
                     "{context}: the field holds its {lines} lines: {row:?}"
                 );
                 wrapped += usize::from(lines > 1);
-                // Editing it keeps the row's height.
                 let _ = lab.invoke(
                     "settings/set/shell",
                     Some(SemanticInput::TextPosition {
@@ -1451,11 +1246,6 @@ fn a_fields_value_is_whole_where_its_row_can_grow() {
     });
 }
 
-/// A FIELD'S CHIP ON A LINE OF ITS OWN TAKES NONE OF ITS WORDS' WIDTH
-/// ([`crate::native_ui::TextFieldSpec::swatch_line`]): the words have the
-/// field's whole text box, over the chip's line, and the chip is drawn at
-/// the field's end on that line, under them. NEGATIVE CONTROL: beside the
-/// words the chip takes its 30pt off their room.
 #[test]
 fn a_fields_chip_on_its_own_line_takes_none_of_its_words_width() {
     at_each_text_scale(&[2.0], "chip line", |_| {
@@ -1520,7 +1310,6 @@ fn a_fields_chip_on_its_own_line_takes_none_of_its_words_width() {
             "on the line under the words: {chip:?} in {height}"
         );
         assert!(chip.0 > 118.0 - 40.0, "at the field's end: {chip:?}");
-        // NEGATIVE CONTROL: beside the words, the chip takes its room.
         let beside = UiTree::new(UiNode::new("foreground", field(false)))
             .compile(rect)
             .expect("compiles");
@@ -1529,14 +1318,6 @@ fn a_fields_chip_on_its_own_line_takes_none_of_its_words_width() {
     });
 }
 
-/// A FIELD'S HINT STANDS AT THE END OF ITS TEXT BOX (the review):
-/// the "Unsaved" a colour field with a refused draft says at its end ends
-/// where the box its words have ends — at the field's end where the chip
-/// stands on a line of its own, a chip's width before it where the chip
-/// stands beside the words — so it never stands over them. The painter
-/// took a chip's width off the hint's line for any field with a chip, and
-/// the hint stood 30pt into the words of a field whose chip had a line of
-/// its own.
 #[test]
 fn a_fields_hint_stands_at_the_end_of_its_text_box() {
     at_each_text_scale(&[1.0, 2.0], "hint at the box's end", |scale| {
@@ -1603,13 +1384,6 @@ fn a_fields_hint_stands_at_the_end_of_its_text_box() {
     });
 }
 
-/// A NARROW FIELD GIVES UP ITS HINT, NEVER ITS WORDS (the review):
-/// at 2× text in a 22- or 24-column window a refused draft's field paints
-/// its value whole and no "Unsaved" beside it — the page's draft bar says
-/// the draft waits, and the field's description says it — where beside the
-/// hint its words would keep less than the hint takes; a field with room
-/// for both paints both. The hint left "abc" 8pt of its box, the value
-/// painted nowhere (audit overflow=true).
 #[test]
 fn a_narrow_field_gives_up_its_hint_never_its_words() {
     at_each_text_scale(&[2.0], "hint or words", |_| {
@@ -1641,15 +1415,6 @@ fn a_narrow_field_gives_up_its_hint_never_its_words() {
     });
 }
 
-/// THE FLEET FIELD'S WORDS KEEP IT A FIELD (the Linux lane): where
-/// Settings does not know aterm.toml's folder, the field says "ai-fleet.toml
-/// beside aterm.toml", which goes on five lines at 2× text in a 22-column
-/// window; once that was a field 229pt tall in a 222pt list, whole on no
-/// screen. Every word stands on the field's lines wherever a screen of the
-/// list holds them ([`field_lines_most`]) — capped at two or three lines,
-/// it read "ai-" / "fleet.toml" / "beside…" in a list with room for all —
-/// and the field is whole on some screen, at every narrow width, 24 and 36
-/// rows tall.
 #[test]
 fn the_fleet_fields_words_keep_it_a_field() {
     at_each_text_scale(&[1.0, 2.0], "fleet words", |scale| {
@@ -1658,8 +1423,6 @@ fn the_fleet_fields_words_keep_it_a_field() {
                 let context = format!("{scale}\u{d7} {width}x{height}");
                 let (mut runtime, instance, view) = every_page_runtime();
                 {
-                    // Where aterm.toml is is not known: the field says it in
-                    // words.
                     let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
                         unreachable!()
                     };
@@ -1699,14 +1462,6 @@ fn the_fleet_fields_words_keep_it_a_field() {
     });
 }
 
-/// THE MUSIC STATUS LINE SAYS WHY, WHOLE, IN THE ROOM IT HAS: whatever
-/// silences the voices, at every width from the narrow host's 126-pt column
-/// to a wide page and at 1x, 1.5x and 2x text, the painted status keeps its
-/// words whole and names its cause in the setting's own words (Reduce
-/// motion, System Reduce Motion, Heavy load, the cursor trail, Sound volume,
-/// the audio output); where the full sentence fits on two lines, the full
-/// sentence is what paints. One fixed "Some off" named neither the cause nor
-/// the voices, under a switch that read On.
 #[test]
 fn every_music_status_line_is_whole_and_names_its_cause() {
     at_each_text_scale(&[1.0, 1.5, 2.0], "music status", |scale| {
@@ -1762,13 +1517,6 @@ fn every_music_status_line_is_whole_and_names_its_cause() {
     });
 }
 
-/// PACKAGES' SERVICE LINE IS LAID OUT AT THE GAP IT WAS MEASURED WITH (the
-/// lab sweep): at every card text width from a phone's to a wide
-/// page's, 1× and 2× text, "Unavailable in this copy of aterm" beside or
-/// under "Background service" paints every line whole in its column. The row
-/// set its columns 12pt apart where [`FactColumns`] had measured them 10pt
-/// apart, so at 36 columns the value's first line was 2pt short of its words
-/// ("Unavailabl…").
 #[test]
 fn the_packages_service_line_paints_its_value_in_the_column_it_was_measured_for() {
     at_each_text_scale(&[1.0, 2.0], "service line", |scale| {
@@ -1789,18 +1537,6 @@ fn the_packages_service_line_paints_its_value_in_the_column_it_was_measured_for(
     });
 }
 
-/// MESSAGES KEEPS ITS WORDS WITH A LOG (the lab sweep, which a log
-/// in it made the page's real shape): the page with entries, collapsed and
-/// with one open, at 22 to 42 columns, short and tall, 1× to 2× — scrolled
-/// through every stop — every word whole and nothing past the page; what a
-/// screen's edge cuts (a tall open entry read a part at a time) whole on
-/// another screen; every control reachable whole. An entry's title is its
-/// row's one line (ruling 262: the row's name says it whole, its body says
-/// why), so it is the one text here an ellipsis may end. A 22-column window
-/// gave the title 24pt ("C…") under a time column wider than the row at 2×,
-/// cut the filter chips ("Proble…", "Tag:…") and the count ("40 messa…"),
-/// seated a filters card taller than the list, so Open Log Folder was on no
-/// screen, and cut an open entry's buttons by the list's edge on every one.
 #[test]
 fn messages_keeps_its_words_with_a_log() {
     let reach = [
@@ -1817,7 +1553,6 @@ fn messages_keeps_its_words_with_a_log() {
                     let (mut runtime, instance, view) = super::setup_with_messages();
                     let cx = view_cx_at(width, height);
                     if open {
-                        // Opened, then read from the list's top.
                         super::select_message(&mut runtime, instance, view, 40);
                         let _ = compile_settings_view(&runtime, instance, view, &cx);
                         runtime
@@ -1840,8 +1575,6 @@ fn messages_keeps_its_words_with_a_log() {
                             let cut = cut_words(screen, &["settings/messages/"])
                                 .into_iter()
                                 .filter(|line| {
-                                    // A head's title (ruling 262), said whole
-                                    // where its entry is open (below).
                                     let head_title = line
                                         .starts_with("paint-text key=\"settings/messages/row/")
                                         && (line.contains("/label\"")
@@ -1849,12 +1582,8 @@ fn messages_keeps_its_words_with_a_log() {
                                     head_cut |= head_title && line.contains("/row/40/");
                                     !head_title
                                 })
-                                // The technical details' honest count of the
-                                // lines the room leaves out (ruling 368; Copy
-                                // keeps them).
                                 .filter(|line| !line.contains(" more lines)\""))
                                 .filter(|line| {
-                                    // Cut by the room's edge: whole on another screen.
                                     let edge = line.contains("clip-truncated=true");
                                     if edge {
                                         edged.insert(key_of(line));
@@ -1889,7 +1618,6 @@ fn messages_keeps_its_words_with_a_log() {
                             }
                         },
                     );
-                    // An open entry whose head cut its title says it whole.
                     if open && head_cut {
                         let title = super::sample_messages()
                             .entries
@@ -1900,7 +1628,6 @@ fn messages_keeps_its_words_with_a_log() {
                         let said = name.values().cloned().collect::<Vec<_>>().join("\n");
                         assert_eq!(painted_words(&said), title, "{context}: the open title");
                     }
-                    // An open entry's buttons too, on a tall entry's part.
                     let entry = open.then(|| "settings/messages/row/40/copy".to_string());
                     for key in reach
                         .iter()
@@ -1922,12 +1649,6 @@ fn messages_keeps_its_words_with_a_log() {
     });
 }
 
-/// A ONE-LINE HEAD'S TITLE HAS TWO FIFTHS OF ITS ROW (ruling 262's own
-/// rule): at every row width from a phone's to a wide page's, 1× to 2×,
-/// either the title's column — the row less the lead and the chevron's end —
-/// is at least two fifths of the row, or the head stacks. The rule counted
-/// the chevron's end as the title's, so at 30 columns a title had a quarter
-/// of the row ("Claud…").
 #[test]
 fn a_one_line_head_leaves_its_title_two_fifths_of_the_row() {
     at_each_text_scale(&[1.0, 1.5, 2.0], "two fifths", |scale| {
@@ -1947,13 +1668,6 @@ fn a_one_line_head_leaves_its_title_two_fifths_of_the_row() {
     });
 }
 
-/// THE MANUAL PAGE'S BUTTONS KEEP THEIR WORDS: Open aterm.toml, Show in
-/// Finder and Copy path stand three to a row only where each label is whole
-/// in its third, measured; else one under another, each the card's width,
-/// its words on lines where even that is too narrow — from a phone-width
-/// window to a desktop one, at 1× and 2×. A guess from the text size (capped
-/// at 1.5×) set them in a row on a 150 × 48 window at 2× and painted "Open
-/// aterm.t…".
 #[test]
 fn the_manual_page_s_buttons_keep_their_words() {
     let buttons = [
@@ -1988,14 +1702,6 @@ fn the_manual_page_s_buttons_keep_their_words() {
     });
 }
 
-/// A PAGE SCROLLED DOWN KEEPS ITS CHROME ONLY WHILE ITS WINDOW AND ITS TEXT
-/// SIZE STAY: a text size changed under a scrolled list chooses the page's
-/// chrome again, as the page at that size chooses it, so a 1× subtitle and
-/// insets are never kept for a 2× page whose short window gives them to its
-/// list — every route, phone width to desktop. The kept chrome was keyed by
-/// the window alone: Manual at 22 × 24 kept its 1× lean chrome at 2×.
-/// CONTROL: some page here chooses a different chrome at 2× than at 1×, so
-/// the case is real.
 #[test]
 fn a_scrolled_page_chooses_its_chrome_again_when_the_text_size_changes() {
     let chrome_of = |runtime: &NativeRuntime, view: crate::native_app::ViewId| {
@@ -2030,14 +1736,12 @@ fn a_scrolled_page_chooses_its_chrome_again_when_the_text_size_changes() {
                 {
                     let context = format!("{route:?} {width}\u{d7}{height}");
                     let cx = view_cx_at(width, height);
-                    // At 2× from its first render, scrolled.
                     set_scale(2.0);
                     let (mut fresh, instance, view) = setup();
                     go_to_route(&mut fresh, instance, view, route);
                     scroll_to(&mut fresh, view, 2);
                     let _ = compile_settings_view(&fresh, instance, view, &cx);
                     let at_two = chrome_of(&fresh, view);
-                    // At 1×, scrolled; then the text made 2×.
                     set_scale(1.0);
                     let (mut runtime, instance, view) = setup();
                     go_to_route(&mut runtime, instance, view, route);
@@ -2058,14 +1762,6 @@ fn a_scrolled_page_chooses_its_chrome_again_when_the_text_size_changes() {
         .expect("the chrome is chosen again");
 }
 
-/// A PAGE'S FIRST FRAME IS ITS SECOND: every page opened, phone width to
-/// desktop, at 1× and 2× text, drawn again with nothing between, draws the
-/// same screen. The room a compact page lays its rows out for (whether a
-/// row stacks, how many lines a field's words take) was measured under the
-/// chrome the last render had left, the full chrome on a page's first
-/// render, not under the chrome the page then chose: AI CLIs at 22 columns
-/// at 2× text drew its fleet field a line taller on its second frame, and
-/// its list a stop longer.
 #[test]
 fn every_pages_first_frame_is_its_second() {
     at_each_text_scale(&[1.0, 2.0], "first frames", |scale| {
@@ -2095,10 +1791,7 @@ fn every_pages_first_frame_is_its_second() {
     });
 }
 
-/// Where two compiles of one screen first differ, both sides whole: the
-/// first painted node apart (or the one only one of them paints), else the
-/// first hit region, semantic node, focus stop, segment group or list
-/// picture apart, else the default action or the bounds.
+/// Where two compiles of one screen first differ, both sides whole.
 fn first_apart(was: &crate::native_ui::CompiledUi, now: &crate::native_ui::CompiledUi) -> String {
     fn apart<T: PartialEq + std::fmt::Debug>(what: &str, was: &[T], now: &[T]) -> Option<String> {
         (0..was.len().max(now.len())).find_map(|at| {
@@ -2135,12 +1828,6 @@ fn first_apart(was: &crate::native_ui::CompiledUi, now: &crate::native_ui::Compi
         .unwrap_or_else(|| "nothing apart".to_string())
 }
 
-/// THE RETIRED `auto_update` NOTE KEEPS ITS WORDS IN A NARROW COLUMN: on the
-/// Packages page under Keep ALab tools up to date, at 22 to 42 columns and
-/// on desktop widths, 1× and 2×, every line of atpkg's sentence is whole in
-/// the card's column and every word of it paints, its remedy included. Its
-/// lines were budgeted in characters per width class (56 on any compact
-/// page), so a phone-width card at 2× cut each to an ellipsis.
 #[test]
 fn the_retired_packages_note_keeps_its_words_in_a_narrow_column() {
     let note = atpkg::config::auto_update_note(false, Some(true));
@@ -2173,8 +1860,6 @@ fn the_retired_packages_note_keeps_its_words_in_a_narrow_column() {
             }
             assert!(!lines.is_empty(), "{context}: the note is drawn");
             let said = lines.into_values().collect::<Vec<_>>().join("\n");
-            // Each break joined as the note writes its halves: `auto_update`
-            // breaks before its `_` with no mark, an identifier's own joint.
             assert_eq!(
                 crate::native_ui::joined_as_named(&said, &note),
                 note,
@@ -2184,10 +1869,7 @@ fn the_retired_packages_note_keeps_its_words_in_a_narrow_column() {
     });
 }
 
-/// The Packages state of a copy of aterm with no package tool, its status
-/// read (what a development build in a lab shows): Packages says it cannot
-/// manage ALab tools, and Security's This Mac status why Universal Control
-/// cannot change.
+/// The Packages state of a copy of aterm with no package tool, its status read.
 fn packages_without_its_tool() -> PackagesState {
     let mut service = crate::packages_screen::PackagesService::new();
     assert!(service.note_tool(false));
@@ -2207,9 +1889,7 @@ fn packages_without_its_tool() -> PackagesState {
     service.state(false, true, false)
 }
 
-/// Every screen of `route` in a `width`×`height` window as Page Down turns
-/// them over from the list's top, from a fresh runtime `prepare` has set up,
-/// to the screen a turn no longer changes.
+/// Every screen of `route` in a `width`×`height` window as Page Down turns them.
 fn paged_screens_of(
     prepare: impl FnOnce(&mut NativeRuntime),
     route: SettingsRoute,
@@ -2226,8 +1906,6 @@ fn paged_screens_of(
             .dispatch(instance, view, AppEvent::ScrollPage(1))
             .unwrap();
         let screen = compile_settings_view(&runtime, instance, view, &cx);
-        // The same screen, every part of it: cheaper than comparing the
-        // audits it prints, which it decides.
         if screens.last() == Some(&screen) {
             return screens;
         }
@@ -2236,21 +1914,6 @@ fn paged_screens_of(
     panic!("{route:?} {width}\u{d7}{height}: Page Down never reaches the list's end");
 }
 
-/// EVERY CONTROL AND EVERY WORD OF A SYSTEM PAGE IS ON SOME SCREEN WHOLE:
-/// paging through Software Update, About, Messages, Packages, Security,
-/// Harness, AI CLIs, Keyboard & Input and Window from top to end with Page
-/// Down, at 22 to 42 columns short and tall and at 80 × 24 and 102 × 29, 1×
-/// and 2×, with and without a package tool (and Harness as it opens and with
-/// its sessions and landings counted), each control is drawn whole on
-/// at least one screen, and each
-/// block of wrapped words that starts with its own words paints all of them.
-/// The list scrolls by whole rows, and a row taller than what a screen leaves
-/// it under its card's caption was drawn from its top on every screen and its
-/// rest on none: Packages' status detail lost "Install aterm from
-/// alab.systems…", its consent card's rows their switches, Software Update's
-/// automatic-update switch, Security's switches whose names took six lines
-/// and the end of its This Mac status were on no screen
-/// ([`super::scroll::row_parts`]).
 #[test]
 fn every_control_and_word_of_a_system_page_is_on_some_screen() {
     let routes = [
@@ -2296,9 +1959,6 @@ fn every_control_and_word_of_a_system_page_is_on_some_screen() {
                                             3
                                         ));
                                     }
-                                    // Harness with its sessions and landings counted:
-                                    // the Every row's parts, Landed, the done
-                                    // claims checked, today's line led by landings.
                                     if toolless && route == SettingsRoute::Harness {
                                         assert!(runtime.replace_settings_harness(
                                             super::harness::fixture_landings(),
@@ -2314,9 +1974,6 @@ fn every_control_and_word_of_a_system_page_is_on_some_screen() {
                     {
                         for node in &screen.paint {
                             let key = node.key.as_str().to_string();
-                            // Drawn uncut and at full strength (a row
-                            // scrolled under a kept caption is a peek of its
-                            // card, its controls live and whole).
                             let whole = node.fade.is_none()
                                 && node.clip.height >= node.rect.height - 0.5
                                 && node.clip.width >= node.rect.width - 0.5;
@@ -2359,14 +2016,9 @@ fn every_control_and_word_of_a_system_page_is_on_some_screen() {
                             continue;
                         };
                         let said = painted.values().cloned().collect::<Vec<_>>();
-                        // A block cut honestly (an ellipsis), or painting a
-                        // shorter form of its name, says so on its own.
                         if said.iter().any(|line| line.ends_with('\u{2026}')) {
                             continue;
                         }
-                        // Each break joined as the label writes its
-                        // halves: an identifier breaks at its own joints
-                        // with no mark (`alab` / `.systems`).
                         let (want, have) = (
                             words(label),
                             words(&crate::native_ui::joined_as_named(&said.join("\n"), label)),
@@ -2374,10 +2026,6 @@ fn every_control_and_word_of_a_system_page_is_on_some_screen() {
                         if have.first() != want.first() {
                             continue;
                         }
-                        // A word's own hyphen may end a line, as copy
-                        // breaks there (`painted_words` joins a line ending
-                        // in a hyphen with the next, the hyphen dropped:
-                        // `follow-` and `up` read `followup`).
                         let missing = want
                             .iter()
                             .filter(|word| {
@@ -2395,15 +2043,7 @@ fn every_control_and_word_of_a_system_page_is_on_some_screen() {
     });
 }
 
-/// A Settings runtime holding what every page draws at its fullest: a key
-/// only aterm.toml holds (Modified's and Manual's own group), aterm.toml at a
-/// known path (the fleet document's default beside it), Harness with a
-/// session and Tab Control with this Mac, a LAN Mac and two tabs, their names
-/// as long as a real fleet's, Packages with its tool (its three verbs, its
-/// programs and its activity), and Security with the macOS host's posture
-/// the most of its buttons stand in (every folder denied, other copies to
-/// move to the Trash: the MACOS ACCESS block and the DEVELOPER TOOLS card
-/// over it, which a macOS host always draws and a headless one never does).
+/// A Settings runtime holding what every page draws at its fullest.
 fn every_page_runtime() -> (
     NativeRuntime,
     crate::native_app::AppInstanceId,
@@ -2412,9 +2052,7 @@ fn every_page_runtime() -> (
     every_page_runtime_over(EVERY_PAGE_SOURCES[0])
 }
 
-/// The aterm.toml sources the every-page sweep runs over: the default
-/// theme, and GitHub Light with a light window (the lab sweep's two), whose
-/// rows Modified, Appearance and Home then draw set.
+/// The aterm.toml sources the every-page sweep runs.
 const EVERY_PAGE_SOURCES: [&str; 2] = [
     "agents_auto_prime = false\n",
     "agents_auto_prime = false\ntheme = \"GitHub Light\"\nwindow_theme = \"light\"\n",
@@ -2508,8 +2146,7 @@ pub(super) fn every_page_runtime_over(
     (runtime, instance, view)
 }
 
-/// What a painted node says in words: a text's, a button's painted label, an
-/// empty field's placeholder.
+/// What a painted node says in words.
 fn painted_text(node: &crate::native_ui::PaintNode) -> Option<String> {
     match &node.content {
         UiContent::Text(text) => Some(text.text.clone()),
@@ -2535,9 +2172,7 @@ fn painted_text(node: &crate::native_ui::PaintNode) -> Option<String> {
     }
 }
 
-/// `painted` cut inside a word of `whole` (what the same node says where
-/// nothing cuts it): an ellipsis after part of a word, not after a whole one
-/// (a one-line head or a placeholder may end after whole words, "Theme…").
+/// `painted` cut inside a word of `whole` (what the same node says where nothing cuts it).
 fn cut_inside_a_word(painted: &str, whole: &str) -> bool {
     let line = painted.rsplit('\n').next().unwrap_or(painted);
     let Some(stem) = line.strip_suffix('\u{2026}') else {
@@ -2555,18 +2190,7 @@ fn cut_inside_a_word(painted: &str, whole: &str) -> bool {
     })
 }
 
-/// The places on `screen` where words wrapped onto lines break inside a
-/// word with no mark: a block's line (`<block>/line-<n>`, under the group
-/// that says the block whole, else what its lines say where nothing cuts
-/// them, `whole`) or a button's label line that ends where its next line
-/// goes on in the same word — "Messages" then "." alone, where a word wider
-/// than its box is broken with a hyphen ([`wrap_to_box`]). A line ending in
-/// a hyphen, a path broken at a folder's `/` (before it, or after it where
-/// its words are prose), a break inside an identifier (a path, a host, a
-/// version, a hash: [`aterm_grapheme::TokenKind::Identifier`], which never
-/// takes a mark, a hyphen would read as one of its characters) and East
-/// Asian text, which breaks between its characters, are not breaks inside a
-/// word.
+/// The places on `screen` where words wrapped onto lines break inside a word with no mark.
 fn broken_inside_a_word(
     screen: &crate::native_ui::CompiledUi,
     whole: &std::collections::HashMap<String, String>,
@@ -2575,8 +2199,6 @@ fn broken_inside_a_word(
     let mut blocks =
         std::collections::BTreeMap::<String, std::collections::BTreeMap<usize, String>>::new();
     let mut broken = Vec::new();
-    // Whether the line `before` ends where `after` goes on inside one of
-    // `whole`'s words.
     let inside = |before: &str, after: &str, whole: &str| {
         let before = before.trim_end();
         let after = after.trim_start();
@@ -2634,8 +2256,6 @@ fn broken_inside_a_word(
         }
     }
     for (block, lines) in &blocks {
-        // The block's words: what its group says, else its lines where
-        // nothing cuts them (a setting's note says itself only in them).
         let said = wholes
             .get(block.as_str())
             .filter(|label| !label.is_empty())
@@ -2658,8 +2278,7 @@ fn broken_inside_a_word(
     broken
 }
 
-/// What each node of `route` says where nothing cuts it: every screen of a
-/// 4000×2400 window, from a runtime `prepare` sets up.
+/// What each node of `route` says where nothing cuts it.
 fn whole_words_of(
     prepare: impl FnOnce() -> (
         NativeRuntime,
@@ -2687,8 +2306,7 @@ fn whole_words_of(
     whole
 }
 
-/// The nodes under `prefixes` on `screen` that cut a word inside itself
-/// ([`cut_inside_a_word`]) of what they say whole (`whole`), or overflow.
+/// The nodes under `prefixes` on `screen` that cut a word inside itself ([`cut_inside_a_word`]).
 fn words_cut(
     screen: &crate::native_ui::CompiledUi,
     whole: &std::collections::HashMap<String, String>,
@@ -2717,28 +2335,6 @@ fn words_cut(
     cut
 }
 
-/// EVERY PAGE KEEPS ITS WORDS AND ITS CONTROLS (the rules
-/// on every page — a label wraps to its box, a word wider than its box
-/// breaks with a hyphen, a button's words wrap, a tall row is listed a part
-/// at a time): every route, every screen, at 22 to 42 columns short and tall
-/// and the 80×24, 102×29 and 150×48 windows, 1×, 1.5× and 2× text, with a key
-/// only aterm.toml holds, aterm.toml at a known path and a fleet's sessions
-/// and computers, in the default theme and in GitHub Light with a light
-/// window ([`EVERY_PAGE_SOURCES`]), where Modified, Appearance and Home draw
-/// their theme rows set: at 22 to 30 columns there Modified's Color theme
-/// button and its Reset, its window theme's third segment and Appearance's
-/// theme Reset were whole on no screen, a row taller than any screen cut
-/// whole. On every screen nothing overflows, nothing is clipped and
-/// no two marks paint over each other ([`crate::native_ui::CompiledUi::fit_failures`]),
-/// and no word is cut inside itself; and every control is whole on some
-/// screen. Before, Cursor Styles cut every description ("Flames behind what
-/// you type and a red-hot…") and its captions, Home its cursor link and its
-/// cards' titles, Tab Control every computer and tab, Wallpaper its status
-/// and ran Choose Image… past its card, Text & Fonts its display-face
-/// switches, Modified's key only in aterm.toml drew its name in 4pt and its
-/// buttons past the card, and Themes' folder button ran out of the panel.
-/// Themes' own chooser list scrolls inside the page, and its rows are judged
-/// by its own sweep (`every_part_of_the_themes_page_is_whole_on_some_screen`).
 #[test]
 fn every_page_keeps_its_words_and_every_control_whole_on_some_screen() {
     let sizes: Vec<(f32, f32)> = NARROW_WIDTHS
@@ -2752,7 +2348,6 @@ fn every_page_keeps_its_words_and_every_control_whole_on_some_screen() {
             .flat_map(|route| EVERY_PAGE_SOURCES.map(|source| (route, source)))
             .collect();
         on_workers(&pages, "every page", |&(route, source)| {
-            // What each node says where nothing cuts it.
             let whole = whole_words_of(|| every_page_runtime_over(source), route);
             for &(width, height) in &sizes {
                 let context = format!(
@@ -2783,8 +2378,6 @@ fn every_page_keeps_its_words_and_every_control_whole_on_some_screen() {
                                     "{context} screen {top}: {key} paints {painted:?} of {whole:?}"
                                 );
                             }
-                            // A control only ever peeking past a screen's
-                            // edge is one no screen shows whole: it counts.
                             if matches!(
                                 node.content,
                                 UiContent::Button(_)
@@ -2807,9 +2400,6 @@ fn every_page_keeps_its_words_and_every_control_whole_on_some_screen() {
                     .map(|(key, _)| key.as_str())
                     .collect::<Vec<_>>();
                 assert!(unseen.is_empty(), "{context}: never whole: {unseen:?}");
-                // PREMISE: the fixture draws what a page draws at its fullest
-                // ([`every_page_runtime`]) — Packages' verbs, Security's
-                // MACOS ACCESS block and DEVELOPER TOOLS card.
                 let drawn: &[&str] = match route {
                     SettingsRoute::Packages => &[
                         "packages/check",
@@ -2832,17 +2422,6 @@ fn every_page_keeps_its_words_and_every_control_whole_on_some_screen() {
     });
 }
 
-/// THE MACOS ACCESS BLOCK AND THE DEVELOPER TOOLS CARD KEEP THEIR WORDS AT
-/// PHONE WIDTH, with the posture a macOS host always publishes (and a
-/// headless lab never does, so no sweep of one saw them): at 22 and 24
-/// columns, short and tall, 1.5× and 2× text, no screen of Security paints a
-/// word of either card cut or past its box, and every button of theirs is
-/// whole on some screen. The block's heading was one fixed line ("MACOS
-/// A…"), its buttons one fixed-height row whatever their words ("Open…",
-/// "Turn O…", "Ask fo…"), the card's floor a 306pt button in a 118pt card
-/// ([`button_line_set`], [`access_card_heading`], [`devtools_floor`]), and
-/// its facts broke a word wider than the card with no mark ("Download" /
-/// "s", [`copy_paragraph_lines`]).
 #[test]
 fn the_macos_access_block_keeps_its_words_at_phone_width() {
     let ours = |key: &str| key.contains("macos-access") || key.contains("developer-tools");
@@ -2896,15 +2475,6 @@ fn the_macos_access_block_keeps_its_words_at_phone_width() {
     });
 }
 
-/// A WORD OF COPY WIDER THAN ITS BOX BREAKS AS A LABEL'S DOES
-/// ([`copy_paragraph_lines`]): at its syllable, with a hyphen ("Mes-" /
-/// "sages."), every line inside the box. The copy walk breaks only at white
-/// space, and broke such a word wherever the box ended: a setting's note at
-/// 2× in a 22-column card painted "Messages" and then "." alone, and the
-/// label's rule then broke it "Messag-" / "es.".
-/// CONTROLS: copy whose every word fits wraps at its spaces, as the walk wraps
-/// it, with no hyphen; East Asian text breaks between its characters, with
-/// none.
 #[test]
 fn a_word_of_copy_wider_than_its_box_breaks_with_a_hyphen() {
     let px = 26.0;
@@ -2940,27 +2510,18 @@ fn a_word_of_copy_wider_than_its_box_breaks_with_a_hyphen() {
             .any(|pair| pair[0].ends_with("Mes-") && pair[1] == "sages."),
         "broken at its syllable: {lines:?}"
     );
-    // CONTROL: every word fits — the walk's lines.
     let wide = measure("Messages.") + 1.0;
     let walked: Vec<String> = crate::tray_raster::ui_text_wrap_ranges(text, px, wide)
         .into_iter()
         .map(|range| text[range].trim_end().to_string())
         .collect();
     assert_eq!(wrapped_copy_lines(text, px, wide), walked);
-    // CONTROL: East Asian text, no hyphen.
     let cjk = "設定ファイルを開いて保存します";
     let lines = wrapped_copy_lines(cjk, px, measure("設定ファイ"));
     assert!(lines.len() > 1, "{lines:?}");
     assert!(lines.iter().all(|line| !line.ends_with('-')), "{lines:?}");
 }
 
-/// NO LINE OF COPY OR OF A LABEL IS ONE LETTER ALONE where a syllable of the
-/// word after it fits beside it ([`copy_paragraph_lines`], [`wrap_to_box`]):
-/// the Security note at 2× text in a 22-column card, in every box "A
-/// program's" is too wide for and "A pro-" is not, reads "A pro-" /
-/// "gram's …", every line inside the box, the words all there. CONTROL: an
-/// identifier is never broken for it ("A aterm.toml" leaves "A" alone).
-/// NEGATIVE CONTROL: the copy walk painted "A" alone, then "program's".
 #[test]
 fn no_line_is_a_lone_letter_a_syllable_after_it_could_fill() {
     let px = 26.0;
@@ -2996,19 +2557,11 @@ fn no_line_is_a_lone_letter_a_syllable_after_it_could_fill() {
         }
         width += 2.0;
     }
-    // CONTROL: an identifier keeps its characters together.
     let code = "A aterm.toml key";
     let lines = wrap_to_box(code, measure("aterm.toml") + 1.0, &measure);
     assert_eq!(lines.first().map(String::as_str), Some("A"), "{lines:?}");
 }
 
-/// A SPACED SLASH ENDS ITS LINE, NEVER STARTS ONE (UAX #14 LB13,
-/// [`aterm_grapheme::never_starts_a_line`]): Tabs' computers heading and a
-/// window note, wrapped as a label ([`wrap_to_box`]) and as copy
-/// ([`wrapped_copy_lines`]) in every box from the widest word with its
-/// slash to the whole text, keep each " /" with the word before it, every
-/// word whole and in order. NEGATIVE CONTROL: the heading painted "(CPU /
-/// GPU" / "/ RAM /" at 2× text in a 22-column window.
 #[test]
 fn a_spaced_slash_never_starts_a_line() {
     let px = 26.0;
@@ -3040,16 +2593,6 @@ fn a_spaced_slash_never_starts_a_line() {
     }
 }
 
-/// A WORD WIDER THAN ITS BOX BREAKS AT A SYLLABLE, as a typesetter breaks
-/// it ([`wrap_to_box`], [`aterm_grapheme::break_inside`]): the words the
-/// 178pt window at 2× and 1.5× text broke, in a label's, a caption's and a
-/// button's type, at every box from as narrow as the word's widest syllable
-/// (and its hyphen) to as wide as the word — each line it breaks ends in a
-/// hyphen at one of the word's syllable breaks, no line paints past the
-/// box, the lines rejoined are the word, and a separator glued to a word
-/// ("COMPUTER ·") never leaves a lone letter. NEGATIVE CONTROL: broken
-/// wherever the box ended, Settings painted "Brightn-" / "ess", "AUTOMA-" /
-/// "TIC", "NOTIFICATI-" / "ONS", "Foregro-" / "und", "COMPUTE-" / "R ·".
 #[test]
 fn a_word_wider_than_its_box_breaks_at_a_syllable() {
     let words = [
@@ -3087,7 +2630,6 @@ fn a_word_wider_than_its_box_breaks_at_a_syllable() {
             for word in words {
                 let points = aterm_grapheme::hyphen_points(word);
                 assert!(!points.is_empty(), "premise: {word:?} has syllables");
-                // The widest run between two of its breaks, its hyphen on.
                 let narrowest = std::iter::once(0)
                     .chain(points.iter().copied())
                     .zip(points.iter().copied().chain(std::iter::once(word.len())))
@@ -3122,9 +2664,6 @@ fn a_word_wider_than_its_box_breaks_at_a_syllable() {
                     width += 3.0;
                 }
             }
-            // A separator glued to the word is no letter of it: the word's
-            // last syllables go with it, never a lone letter, in every box
-            // that holds a last syllable with its separator.
             let heading = "HARDWARE \u{b7} OS & COMPUTER \u{b7} STATUS";
             let least = measure("PUTER \u{b7}").max(measure("WARE \u{b7}")).ceil();
             for width in (0..8).map(|step| least + 6.0 * step as f32) {
@@ -3144,19 +2683,6 @@ fn a_word_wider_than_its_box_breaks_at_a_syllable() {
     });
 }
 
-/// AN IDENTIFIER NO LINE HOLDS BREAKS WITH NO MARK IN IT — a path, a host, a
-/// version, a hash or a file's name, which a hyphen would change
-/// ([`aterm_grapheme::break_inside`]): About's values at the 22- and
-/// 30-column value columns at 2× text, and Settings' file names, wrap so
-/// that their lines rejoined are the value, character for character, each
-/// line inside its column, and none ends in a hyphen; a host breaks before
-/// its dot, a version before its build, and a path before its own hyphen
-/// ("/aterm" / "-final"). CONTROL: a prose fact name still takes its hyphen at a
-/// syllable ("Archi-" / "tecture"). NEGATIVE CONTROL: broken as a word,
-/// About painted "0.11.0+g205-" / "65c325", "ec73ab1c-" / "007d90ca",
-/// "alab.syst-" / "ems" and "Applicatio-" / "ns/", and Modified "ATERM.T-" /
-/// "OML"; broken after a path's hyphen, "/aterm-" / "final" read as a word
-/// broken.
 #[test]
 fn an_identifier_no_line_holds_breaks_with_no_mark_in_it() {
     at_each_text_scale(&[2.0], "identifiers", |_| {
@@ -3187,8 +2713,6 @@ fn an_identifier_no_line_holds_breaks_with_no_mark_in_it() {
                             <= width + crate::native_ui::TEXT_FIT_SLACK,
                         "{context}: {line:?} is wider than its column"
                     );
-                    // A path's own hyphen starts its next line, never ends
-                    // one, where it reads as a hyphen the break put in.
                     assert!(
                         !line.ends_with('-'),
                         "{context}: {line:?} ends in a hyphen: {lines:?}"
@@ -3213,7 +2737,6 @@ fn an_identifier_no_line_holds_breaks_with_no_mark_in_it() {
             caps.iter().all(|line| !line.ends_with('-')) && caps.contains(&".TOML".to_string()),
             "{caps:?}"
         );
-        // CONTROL: a prose name still takes its hyphen, at a syllable.
         let name = wrap_to_box(
             "Architecture",
             fact_name_width("Architec"),
@@ -3223,21 +2746,9 @@ fn an_identifier_no_line_holds_breaks_with_no_mark_in_it() {
     });
 }
 
-/// A SHORT WORD IS NEVER BROKEN IN A CONTROL OR A TITLE that has room for
-/// it, in a 22-column window at 2× text: a colour row's Choose… paints
-/// "Choose" (its trailing "…" given up, [`button_words_in`]) where
-/// "Choose…" is wider than the button and "Choose" is not; a colour field
-/// whose words cannot be whole beside its chip sets the chip on a line of
-/// its own and keeps its words whole (`add_color_chooser`); and a stacked
-/// Messages head's title runs
-/// past its chevron, which stands on the head's first row
-/// ([`messages_stacked_width`]), so "Antigravity" is whole and the title is
-/// not cut. NEGATIVE CONTROL: Appearance painted "Choo-" / "se…" and "The-"
-/// / "me…", Messages "Antigrav-" / "ity CLI is" / "not…".
 #[test]
 fn a_short_word_is_never_broken_in_a_control_with_room_for_it() {
     at_each_text_scale(&[2.0], "short words", |_| {
-        // Choose…, on its own line in a 122pt column.
         let spec = ButtonSpec::new("Choose the foreground color").visual_label("Choose\u{2026}");
         let room = crate::native_ui::text_button_label_room(&spec, 122.0);
         assert!(
@@ -3249,7 +2760,6 @@ fn a_short_word_is_never_broken_in_a_control_with_room_for_it() {
             button_words_in(&spec, "Choose\u{2026}", &[], 122.0),
             ("Choose".to_string(), 1)
         );
-        // The colour fields, on every screen of Appearance.
         let (mut runtime, instance, view) = setup();
         go_to_route(&mut runtime, instance, view, SettingsRoute::Appearance);
         let mut fields = 0;
@@ -3290,7 +2800,6 @@ fn a_short_word_is_never_broken_in_a_control_with_room_for_it() {
             },
         );
         assert!(fields > 0, "premise: a colour field is drawn");
-        // A stacked Messages head, in a window as tall as the report's.
         let title = "Antigravity CLI is not installed";
         let (mut runtime, instance, view) = super::setup_with_messages();
         let mut messages = super::sample_messages();
@@ -3338,15 +2847,6 @@ fn a_short_word_is_never_broken_in_a_control_with_room_for_it() {
     });
 }
 
-/// A PATH IN A STATUS BREAKS BEFORE ITS FOLDERS' SLASHES, so no line of it
-/// ends in a separator ([`status_word_lines`], [`aterm_grapheme::line_breaks`]):
-/// the save failure of the Security page under a long lab path, at every
-/// width an 80- to 150-column window at 1× and 2× text gives the status bar,
-/// keeps the path's leading `/` with its first folder, starts each line the
-/// path goes on with a `/` of it, ends no line in a `/` or in a hyphen of
-/// the path, and keeps `lab-42` and `75d5bccd-9c38` whole. NEGATIVE
-/// CONTROL: broken after each `/` and `-`, line 1 ended "was not saved: /"
-/// and line 2 "lab-42/-Users-someone-aterm/75d5bccd-".
 #[test]
 fn a_path_in_a_status_breaks_before_its_folders_slashes() {
     let path = "/private/tmp/lab-42/-Users-someone-aterm/75d5bccd-9c38-431b-99e5-ef81935c6fbd/scratchpad/labs/fv-sk105-l80/cfg/aterm";
@@ -3354,8 +2854,6 @@ fn a_path_in_a_status_breaks_before_its_folders_slashes() {
         "Allow programs to read the clipboard was not saved: {path} isn't writable \u{b7} check its permissions"
     );
     at_each_text_scale(&[1.0, 2.0], "status path", |scale| {
-        // From the widest folder (no narrower line holds it whole) to a
-        // 150-column window's bar.
         let widest = path
             .split('/')
             .map(|folder| status_words_width(&format!("/{folder}")))
@@ -3389,13 +2887,6 @@ fn a_path_in_a_status_breaks_before_its_folders_slashes() {
     });
 }
 
-/// A CURSOR STYLE SAYS ITS WHOLE NAME AND DESCRIPTION (#71): at 80×24,
-/// 102×29 and 150×48 at 2× text and at 22 columns at 1×, every style row
-/// paints its name and its description whole, wrapped to the room beside the
-/// check mark ([`cursor_style_row`]) — or, where the row would be taller than
-/// a screen (22 columns at 2×), its description in a block of its own under
-/// it. They were cut to one line each: "Flames behind what you type and a
-/// red-hot e…", "Rainbow k… (default)".
 #[test]
 fn a_cursor_style_says_its_whole_name_and_description() {
     at_each_text_scale(&[1.0, 2.0], "cursor style words", |scale| {
@@ -3458,8 +2949,6 @@ fn a_cursor_style_says_its_whole_name_and_description() {
                         .join("\n"),
                 )
             };
-            // Every letter in order: a line a word broke at ends in a hyphen
-            // the break added, or in the word's own ("water-" / "drop").
             let letters = |text: &str| -> String {
                 text.chars()
                     .filter(|c| !c.is_whitespace() && *c != '-')
@@ -3482,20 +2971,12 @@ fn a_cursor_style_says_its_whole_name_and_description() {
     });
 }
 
-/// THE CURSOR LINK SAYS ITS WHOLE LABEL (#72): Home's "Cursor style:
-/// Rainbow kitty (default)" beside More styles… where its words are whole in
-/// two lines there, else over it, at 80×24 and 22 columns, 1× to 2×. At
-/// 80×24 at 2× it read "Cursor style: Rainbow k…". Its button's words stay
-/// whole too, its arrow given up before a word is broken ([`choice_words`]):
-/// at 22 columns and 2× it painted "More" / "styl-" / "es…" beside an arrow
-/// whose room held "styles…" whole.
 #[test]
 fn the_cursor_link_says_its_whole_label() {
     at_each_text_scale(&[1.0, 1.5, 2.0], "cursor link", |scale| {
         for (width, height) in [(584.0, 348.0), (178.0, 348.0), (744.0, 420.0)] {
             let context = format!("{scale}\u{d7} {width}\u{d7}{height}");
             let screens = screens_of(|_, _| {}, SettingsRoute::Home, width, height);
-            // Its lines, by key, across the screens that draw them whole.
             let mut lines = std::collections::BTreeMap::<String, String>::new();
             for screen in &screens {
                 for node in screen.paint.iter().filter(|node| !node.peek) {
@@ -3559,11 +3040,6 @@ fn the_cursor_link_says_its_whole_label() {
     });
 }
 
-/// WALLPAPER KEEPS ITS STATUS AND ITS BUTTONS (#73): "No wallpaper. Dim and
-/// text tint apply once you choose an image." wraps to its card, whole, at
-/// 80×24, 102×29 and 150×48 at 2× text (it was cut on all three); and Choose
-/// Image… and Remove go one under the other, each inside the card, where a
-/// line cannot hold both (they ran past it at 22 columns, 1.5× and 2×).
 #[test]
 fn wallpaper_keeps_its_status_and_its_buttons() {
     at_each_text_scale(&[1.0, 1.5, 2.0], "wallpaper", |scale| {
@@ -3584,13 +3060,6 @@ fn wallpaper_keeps_its_status_and_its_buttons() {
     });
 }
 
-/// TAB CONTROL KEEPS EVERY WORD OF ITS COMPUTERS AND TABS (#74): each
-/// computer's name, state and address, its vitals and its system, each
-/// tab's title and status, the session's line and the cards' headers wrap to
-/// their card at 22 columns to 150×48, 1× and 2× — the tree's branch running
-/// down beside a tab's lines — and its actions go to lines of their own. All
-/// of them were cut to one line ("m110-MacBook-P…", "Mac16,5 · Darwin 26
-/// ·…", "Coding Agent Har…").
 #[test]
 fn tab_control_keeps_every_word_of_its_computers_and_tabs() {
     at_each_text_scale(&[1.0, 2.0], "tab control", |scale| {
@@ -3619,19 +3088,6 @@ fn tab_control_keeps_every_word_of_its_computers_and_tabs() {
     });
 }
 
-/// A PATH FIELD KEEPS ITS FILE'S NAME (#75): the fleet document's field,
-/// unset, shows where aterm reads it — `ai-fleet.toml` beside aterm.toml, by
-/// its path — and fits that path as a CLI's path is fitted, whole components
-/// either side of an ellipsis ([`crate::native_ui::path_forms`]), its file's
-/// name always, the whole path its accessible value; it read
-/// "ai-fleet.toml…". Where no one line holds a form of it, its longest form
-/// two lines hold goes on lines of the field, else "…/" and its name
-/// ([`path_placeholder_lines`]) — so the field is whole on some screen
-/// whatever the config folder's path: every folder of a long one on lines
-/// made the field 691pt tall in a 268pt list at 2× in a 22-column window. A
-/// path a field holds that is wider than the field keeps whole components
-/// too ("/Users/…/dotfiles/ai-fleet.toml"), never a folder cut inside its
-/// name.
 #[test]
 fn a_path_field_keeps_its_file_name() {
     let long = "/Volumes/Work Disk/Shared Configuration/profiles/someone/settings/aterm";
@@ -3671,11 +3127,6 @@ fn a_path_field_keeps_its_file_name() {
                         };
                         seen = true;
                         whole |= node.clip.height >= node.rect.height - 0.5;
-                        // A form of the path ending in its file's name, whole
-                        // or on lines (a path breaks at its folders and its
-                        // own joints, never with a mark: its lines join with
-                        // nothing between), on two lines at most where a
-                        // form with a folder is shown.
                         let painted = painted_text(node).unwrap_or_default();
                         assert!(
                             painted.replace('\n', "").ends_with("ai-fleet.toml"),
@@ -3698,7 +3149,6 @@ fn a_path_field_keeps_its_file_name() {
             }
         }
     });
-    // A set path wider than its field.
     let path = "/Users//someone/Library/Application Support/dotfiles/ai-fleet.toml";
     let field = Control::new(
         TextFieldSpec {
@@ -3736,12 +3186,6 @@ fn a_path_field_keeps_its_file_name() {
     );
 }
 
-/// A PINNED SUMMARY NEVER STARVES THE LIST: Modified's count and Reset All
-/// at 22 columns at 2× text took 178pt of a 268pt page and left its rows an
-/// 86pt list, so the row of a key only aterm.toml holds was never whole and
-/// its Reset and its way to Manual were on no screen; the summary is the
-/// list's first stop there, and every control of the page is whole on some
-/// screen. CONTROL: at 80×24 the summary stays pinned.
 #[test]
 fn a_pinned_summary_never_starves_the_list() {
     at_each_text_scale(&[1.5, 2.0], "Modified summary", |scale| {
@@ -3800,14 +3244,6 @@ fn a_pinned_summary_never_starves_the_list() {
     });
 }
 
-/// A CHOICE KEEPS ITS WORDS ON LINES: a stacked choice too narrow for its
-/// words on one line, its arrow given up, sets them on as many lines as it
-/// needs and its row grows ([`choice_words`]) — Home's font "Automatic (SF
-/// Mono)" read "Auto…" and the theme "Def…" at 2× text in a 22-column
-/// window, Sound's "Follow th…" at 1.5×; and a colour row's Choose… on a
-/// line of its own wraps its word ("Choos…"), a control row's name over its
-/// slider wraps ("Brightn…"), a Text & Fonts display face's switch stands
-/// inside its card (145.6pt in 110) under its name.
 #[test]
 fn a_narrow_row_keeps_its_words_and_its_controls_in_its_card() {
     at_each_text_scale(&[1.5, 2.0], "narrow rows", |scale| {
@@ -3844,12 +3280,6 @@ fn a_narrow_row_keeps_its_words_and_its_controls_in_its_card() {
     });
 }
 
-/// A CARD'S CAPTION WRAPS ON EVERY PAGE: a group's caption ("ONLY IN
-/// ATERM.TOML", "DISPLAY FACES"), Cursor Styles' ("ADJUST RAINBOW KITTY",
-/// "COMPANIONS") and a Top card's title ("Colors & appearance") take the
-/// lines their card needs at 22 columns, 1× to 2× — they were cut ("ONLY IN
-/// ATE…", "ADJUST RAINBOW KI…", "Colors & appeara…") or, on a field page,
-/// not drawn at all.
 #[test]
 fn a_cards_caption_wraps_on_every_page() {
     at_each_text_scale(&[1.0, 1.5, 2.0], "captions", |scale| {
@@ -3887,12 +3317,6 @@ fn a_cards_caption_wraps_on_every_page() {
     });
 }
 
-/// THE THEMES PAGE KEEPS ITS WORDS AND ITS BUTTONS IN ITS PANEL (#78, #61):
-/// at 22 and 24 columns, 1× to 2×, a theme's name wraps in its row
-/// ("Catppuccin L…"), Follow system's name wraps beside its switch
-/// ("Follo…"), Import… and the folder's button go one under the other
-/// inside the panel (the folder's ran out of it), the strip's Customize
-/// wraps ("Custo…") and Community wraps beside its chevron ("Com…").
 #[test]
 fn the_themes_page_keeps_its_words_and_buttons_in_its_panel() {
     at_each_text_scale(&[1.0, 1.5, 2.0], "themes narrow", |scale| {
@@ -3923,19 +3347,8 @@ fn the_themes_page_keeps_its_words_and_buttons_in_its_panel() {
     });
 }
 
-/// FOLLOW SYSTEM'S NAME GOES OVER ITS SWITCH BEFORE IT BREAKS A WORD: at 2×
-/// text in a 22-column window (178x348) the 33pt the chooser's footer left
-/// beside the switch set "Follow system" a few letters a line ("F-", "ol-",
-/// "lo-", "w", "s-", ...), nine lines that made the footer 324pt, taller
-/// than the 188pt list, so neither its name nor its switch was on any
-/// screen whole. The name now takes the footer's width over the switch, its
-/// words whole, and the two are whole on a screen. CONTROL: at 1× the name
-/// keeps its place beside the switch, its words whole there.
 #[test]
 fn follow_systems_name_goes_over_its_switch_before_it_breaks_a_word() {
-    // The name's painted lines on the last screen that draws them, whether
-    // they sit over the switch (else beside it), and whether some screen
-    // draws the name and the switch whole.
     let footer = || {
         let (mut runtime, instance, view) = setup();
         replace_settings_source(&mut runtime, view, "theme = \"Default\"\n".to_string());
@@ -3995,17 +3408,8 @@ fn follow_systems_name_goes_over_its_switch_before_it_breaks_a_word() {
     });
 }
 
-/// A THEME NOT IN USE GIVES UP ITS EMPTY ✓ SLOT BEFORE ITS NAME BREAKS A
-/// WORD: at 2× text in a 22-column window the chooser's "Dracula" broke
-/// "Drac-" / "ula" beside the slot the ✓ of the theme in use stands in,
-/// which paints nothing on any other row; with the slot given up it is
-/// whole. CONTROL: the theme in use keeps its ✓ (and its name the lines it
-/// takes beside it).
 #[test]
 fn a_theme_not_in_use_gives_its_name_the_check_slot() {
-    // Dracula's row in the chooser filtered to it, at 2× in a 22-column
-    // window, on every screen: its name's painted lines and its ✓ slot's
-    // words, if it has one.
     let row = |source: &str| {
         let (mut runtime, instance, view) = setup();
         replace_settings_source(&mut runtime, view, source.to_string());
@@ -4054,18 +3458,11 @@ fn a_theme_not_in_use_gives_its_name_the_check_slot() {
         let (lines, check) = row("theme = \"Default\"\n");
         assert_eq!(lines, ["Dracula"], "the name whole");
         assert_eq!(check, None, "the empty slot is given up");
-        // CONTROL: Dracula in use.
         let (lines, check) = row("theme = \"Dracula\"\n");
         assert_eq!(check.as_deref(), Some("\u{2713}"), "{lines:?}");
     });
 }
 
-/// A WRAPPED LINE OF WORDS PAINTS NO BOX (#76): words wrapped onto lines
-/// are a plain group over lines that carry their style; the group took the
-/// lines' style, and a group in a card's style is painted as a card, so at
-/// 22 columns at 2× text Packages' "No package activity recorded yet." stood
-/// in an accent-ringed box of its own, its words against the ring — and in a
-/// box per piece where a screen took it a part at a time.
 #[test]
 fn a_wrapped_line_of_words_paints_no_box() {
     at_each_text_scale(&[2.0], "wrapped words box", |_| {
@@ -4073,7 +3470,6 @@ fn a_wrapped_line_of_words_paints_no_box() {
         for screen in screens_of(|_, _| {}, SettingsRoute::Packages, 178.0, 348.0) {
             for node in &screen.paint {
                 let key = node.key.as_str();
-                // The card itself, and its runs off the screen, are boxes.
                 if !key.starts_with("packages/activity/")
                     || key.ends_with("/above")
                     || key.ends_with("/below")
@@ -4099,12 +3495,6 @@ fn a_wrapped_line_of_words_paints_no_box() {
     });
 }
 
-/// HARNESS LISTS A TALL SESSION ROW BY THE ONE SPLITTER (#77): a SESSIONS
-/// row taller than its screen is listed a part at a time by the page's list
-/// ([`super::scroll::row_parts`]), the splitter every Settings list keeps —
-/// Harness kept one of its own from before it — and a landed row's parts
-/// read as the one accent card it wears, open where they meet
-/// ([`crate::native_ui::Joins`]); an open Timer's choices are one part.
 #[test]
 fn harness_lists_a_tall_session_row_by_the_one_splitter() {
     use crate::native_app::SemanticInput;
@@ -4146,19 +3536,7 @@ fn harness_lists_a_tall_session_row_by_the_one_splitter() {
     });
 }
 
-/// The wraps of Latin Settings copy as `tests/fixtures/latin-wraps.txt`
-/// records them: [`line_pieces`], [`wrap_to_box`] under a char measure at
-/// five box widths and `ui_text_wrap_ranges` at three, as they broke before
-/// CJK took the shared line breaks (taken from that code, 2026-10-21); the
-/// walk's lines re-taken once a space past the box ended its line, the word
-/// before it kept (a note wrapped a word early, #79), with no empty line
-/// after a text's trailing space; the pieces and the box's lines re-taken
-/// once a path broke before its slashes and an identifier nowhere else, and
-/// a piece wider than its box where a typesetter breaks it
-/// ([`aterm_grapheme::break_inside`]: "archi-" / "tec-" / "ture", not
-/// "archi-" / "tectu-" / "re"; "/aterm" / ".toml", not "aterm-" / ".tom-" /
-/// "l"); and once a path's own hyphen started the next line, never ended
-/// one ("/aterm-lab" / "-instance-runner", not "/aterm-lab-" / "instance-").
+/// The wraps of Latin Settings copy as `tests/fixtures/latin-wraps.txt` records them.
 fn latin_wraps() -> String {
     let corpus = [
         "Cursor blink",
@@ -4190,11 +3568,6 @@ fn latin_wraps() -> String {
     out
 }
 
-/// LATIN SETTINGS COPY WRAPS AS RECORDED: breaking between CJK characters
-/// (the shared line breaks, [`aterm_grapheme::line_breaks`]) moved no piece
-/// and no line of a Latin name, note or path, and neither does anything
-/// else unseen (the golden record: a change that moves a wrap re-takes it,
-/// and the diff shows every line it moved).
 #[test]
 fn latin_settings_copy_wraps_as_recorded() {
     let golden = include_str!("../tests/fixtures/latin-wraps.txt");
@@ -4209,21 +3582,11 @@ fn latin_settings_copy_wraps_as_recorded() {
     assert_eq!(golden.lines().count(), now.lines().count());
 }
 
-/// Characters a line may not start with ([`aterm_grapheme::line_breaks`]'
-/// kinsoku): the closers and small kana of the CJK samples below.
+/// Characters a line may not start with ([`aterm_grapheme::line_breaks`]' kinsoku).
 const NO_LINE_START: [char; 6] = [
     '\u{3002}', '\u{3001}', '\u{300d}', '\u{ff0c}', '\u{30fc}', '\u{30a1}',
 ];
 
-/// CJK SETTINGS COPY WRAPS BETWEEN ITS CHARACTERS, at every box a 22- to
-/// 42-column window gives a setting's name or a page's copy, 1× and 2×
-/// text: each line of a name ([`row_name_lines`]) and of copy
-/// ([`wrapped_copy_lines`]) fits its box and is as full as the box holds,
-/// no line starts with a closer or a small kana or ends with an opener, no
-/// hyphen is put inside a CJK word, and the lines rejoined are the text.
-/// NEGATIVE CONTROL: broken only at spaces (else grapheme by grapheme, with
-/// a hyphen in a name), a name read "設定ファイルを読み-" and copy started a
-/// line with "。".
 #[test]
 fn cjk_settings_copy_wraps_between_its_characters() {
     let samples = [
@@ -4240,8 +3603,6 @@ fn cjk_settings_copy_wraps_between_its_characters() {
                 let context = format!("{scale}\u{d7} {width}pt {text:?}");
                 let names = row_name_lines(text, width);
                 let copy = wrapped_copy_lines(text, px, width);
-                // A name's lines are measured as they paint; copy's by the
-                // advances its wrap sums, within half a point of that.
                 for (what, lines, slack) in [
                     ("name", &names, crate::native_ui::TEXT_FIT_SLACK),
                     ("copy", &copy, 0.5),
@@ -4275,8 +3636,6 @@ fn cjk_settings_copy_wraps_between_its_characters() {
                     }
                     assert_eq!(lines.concat(), text, "{context}: the {what} rejoined");
                 }
-                // A name's line is as full as its box holds: the next place
-                // the text may break would not fit it.
                 for pair in names.windows(2) {
                     let (line, next) = (&pair[0], &pair[1]);
                     let Some((_, piece)) = line_pieces(next).into_iter().next() else {
@@ -4292,11 +3651,6 @@ fn cjk_settings_copy_wraps_between_its_characters() {
     });
 }
 
-/// A CJK MESSAGE'S TITLE IS PAINTED ON THE MESSAGES PAGE at every window a
-/// 22- to 42-column terminal gives Settings, short and tall, 1× and 2×,
-/// scrolled through every stop: the head paints the title (whole, or ended
-/// with `…` where its row cuts it, ruling 262), never nothing, never a line
-/// starting with a closer, and each painted line inside its box.
 #[test]
 fn a_cjk_message_title_is_painted_at_every_narrow_width() {
     let title = "設定ファイルを読み込めませんでした。テーマ「ドラキュラ」は見つかりません";

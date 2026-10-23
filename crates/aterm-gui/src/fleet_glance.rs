@@ -1,36 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE FLEET GLANCE (`docs/DESIGN-owner-surfaces-2026-10-16.md` §3, S10):
-//! what the fleet's other Macs need of the owner, and what they are doing,
-//! for the menu-bar item's Fleet rows and its count.
-//!
-//! * **Read as a child, never in process.** The GUI keeps launchd's soft
-//!   descriptor limit and sizes its control-connection cap from it (§1); the
-//!   fleet client raises `RLIMIT_NOFILE` and dials every peer at once. So one
-//!   `aterm ctl survey --fleet --json --timeout 3` child at a time
-//!   ([`ChildRunner`], `bounded_child::run_bounded`), SIGKILLed at
-//!   [`READ_CAP`], on thread `aterm-fleet-glance`.
-//! * **Pure where it can be.** [`parse`] turns the child's JSON into a
-//!   [`FleetSnapshot`] — fleet peers only (this machine's instances and its
-//!   siblings come from the sibling scan), this machine dropped by its node,
-//!   a peer whose rows publish no `needs=` marked older and never counted, a
-//!   peer that proved no node key this Mac binds marked unproven, its word
-//!   about itself not taken and its needs never counted, told or driven —
-//!   and [`should_poll`] says when to read. Both are table-tested.
-//! * **When.** Every minute where this Mac is the fleet's issuer (its book has
-//!   peers that joined it) or `[fleet] watch = true`; otherwise when the menu
-//!   opens, if the last read is older than [`MENU_FRESH`].
-//! * **Bounded and single-flight.** The reader thread runs one read at a time;
-//!   kicks that arrive during a read are answered by it. A read that fails
-//!   keeps the last good snapshot (a failed read never moves the badge), and
-//!   a snapshot older than [`COUNT_FRESH`] is listed but not counted.
-//! * **Never headless, never off macOS** (`App::start_fleet_glance`).
-//!
-//! The reader writes the shared [`FleetSlot`] directly and then posts
-//! `Wake::FleetRead`; the Fleet submenu is composed from the slot at its own
-//! `menuNeedsUpdate:`, so a read that lands while the menu is open shows the
-//! next time the submenu opens.
+//! THE FLEET GLANCE (`docs/DESIGN-owner-surfaces-2026-10-16.md` §3, S10).
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
@@ -45,15 +16,11 @@ pub(crate) const POLL_EVERY: Duration = Duration::from_secs(60);
 pub(crate) const MENU_FRESH: Duration = Duration::from_secs(15);
 /// A fleet need counts on the badge only from a read this young.
 pub(crate) const COUNT_FRESH: Duration = Duration::from_secs(300);
-/// The most told fleet needs a seamless update carries
-/// (`SessionHandoff::fleet_told`): a bound on the manifest, past which a
-/// need is told again rather than the row kept.
+/// The most told fleet needs a seamless update carries (`SessionHandoff::fleet_told`).
 pub(crate) const FLEET_TOLD_MAX: usize = 512;
-/// One read's whole bound: the child's own deadline is 3 s a peer, so this
-/// is the kill, never a wait it is expected to reach.
+/// One read's whole bound: the child's own deadline is 3 s a peer, so this is the kill, never a wait it is expected to reach.
 pub(crate) const READ_CAP: Duration = Duration::from_secs(10);
 /// The most fleet peers one snapshot keeps (`aterm_net`'s book is bounded
-/// too); the rest are counted as not read.
 const MACS_MAX: usize = 256;
 
 /// One need on a fleet peer, from its facts row.
@@ -63,23 +30,17 @@ pub(crate) struct FleetNeed {
     pub(crate) sid: String,
     /// Its published need.
     pub(crate) word: NeedWord,
-    /// Who it is: the title a person gave it where the peer allows content,
-    /// else its role, else its program.
+    /// Who it is: the title a person gave it where the peer allows content, else its role, else its program.
     pub(crate) who: String,
     /// "worker of s-1e91": the task's `from=` where it names a sid.
     pub(crate) worker_of: Option<String>,
     /// How long ago the fact it stands on moved, as of the read.
     pub(crate) age_ms: Option<u64>,
-    /// The need's own words where the peer serves content ([`content_what`]):
-    /// an ask's text, a box's kind, a wall's kind and reset. `None` at facts,
-    /// whose rows carry no text: the word's own words then
-    /// (`status_item::need_words`).
+    /// The need's own words where the peer serves content ([`content_what`]): an ask's text, a box's kind, a wall's kind and reset.
     pub(crate) what: Option<String>,
 }
 
-/// One session on a fleet peer that this Mac holds over the fleet: its row's
-/// `held_from=` names this Mac's node (the step-in's remote hold, which this
-/// Mac's Take Over on <Mac> placed or its `aterm ctl --host … hold` did).
+/// One session on a fleet peer that this Mac holds over the fleet.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct FleetHeld {
     /// The session's sid there.
@@ -104,34 +65,19 @@ pub(crate) struct FleetManager {
 pub(crate) struct FleetMac {
     /// How its rows name it: its book name's first label ([`short_name`]).
     pub(crate) name: String,
-    /// What `aterm ctl survey --host` is given for it: the name the book
-    /// knows it by ([`dial_of`]).
+    /// What `aterm ctl survey --host` is given for it: the name the book knows it by ([`dial_of`]).
     pub(crate) dial: String,
-    /// Its node id (its header's `node=`), when it sent one and proved it
-    /// ([`Self::unproven`]'s is its claim, never kept): what its needs'
-    /// notices are keyed by ([`FleetMac::ident`]).
+    /// Its node id (its header's `node=`), when it sent one and proved it ([`Self::unproven`]'s is its claim, never kept).
     pub(crate) node: Option<String>,
-    /// Where Screen Sharing and ssh go: the peer's own `host=` (a proven
-    /// peer's only), else the host its book name names — only a name that is
-    /// a host ([`host_word`]).
+    /// Where Screen Sharing and ssh go: the peer's own `host=` (a proven peer's only), else the host its book name names.
     pub(crate) host: Option<String>,
     /// Its rows carry titles and words (`[fleet] allow = "content"`).
     pub(crate) content: bool,
-    /// It lets this Mac drive it (its header's `drive=1`, the step-in) — a
-    /// proven peer's word only: the dialler drives no node it binds no key
-    /// to.
+    /// It lets this Mac drive it (its header's `drive=1`, the step-in).
     pub(crate) drive: bool,
     /// Its rows publish no `needs=`: an older aterm, listed and never counted.
     pub(crate) older: bool,
-    /// It answered without proving a node key this Mac binds (the survey's
-    /// `"unproven":true`, `node unproven`: an entry an older aterm recorded,
-    /// a peer named by hand, an older aterm — or every Mac, the issuer too,
-    /// where this Mac's own book binds no key to its issuer,
-    /// [`BookFacts::unbound_issuer`]): which Mac it is, and what its rows
-    /// say, are its word alone. Listed under its own mark, never counted,
-    /// told or driven ([`Self::counts`]), its `node=` and `host=` not taken.
-    /// What proves it is that Mac joining again, or, where this Mac binds no
-    /// key to its issuer, this Mac joining again.
+    /// Answered without proving a node key this Mac binds (`"unproven":true`, [`BookFacts::unbound_issuer`]).
     pub(crate) unproven: bool,
     /// The sessions its reply holds rows for.
     pub(crate) sessions: usize,
@@ -139,40 +85,32 @@ pub(crate) struct FleetMac {
     pub(crate) agents: usize,
     /// Of them, the agents at work.
     pub(crate) working: usize,
-    /// Rows its reply cap left out (`sessions=` past every session row
-    /// sent, exited ones included: the header counts them too).
+    /// Rows its reply cap left out (`sessions=` past every session row sent, exited ones included: the header counts them too).
     pub(crate) left_out: usize,
     /// Its needs.
     pub(crate) needs: Vec<FleetNeed>,
-    /// Its sessions this Mac holds over the fleet, whatever their need: a
-    /// hold is never a need, and stands until this Mac hands it back.
+    /// Its sessions this Mac holds over the fleet, whatever their need: a hold is never a need, and stands until this Mac hands it back.
     pub(crate) held_here: Vec<FleetHeld>,
     /// Its managers.
     pub(crate) managers: Vec<FleetManager>,
-    /// When ITS rows were read (unix ms): the snapshot's read for a Mac that
-    /// answered it, an earlier one for a [`Self::carried`] Mac.
+    /// When ITS rows were read (unix ms): the snapshot's read for a Mac that answered it, an earlier one for a [`Self::carried`] Mac.
     pub(crate) read_at_ms: u64,
-    /// It did not answer this read: its rows are its last answer's, kept
-    /// while they still count ([`carry`]).
+    /// It did not answer this read: its rows are its last answer's, kept while they still count ([`carry`]).
     pub(crate) carried: bool,
 }
 
 impl FleetMac {
-    /// Who it is across reads: its node id, else the name the book knows it
-    /// by — never the address that answered, which DHCP moves.
+    /// Who it is across reads: its node id, else the name the book knows it by — never the address that answered, which DHCP moves.
     pub(crate) fn ident(&self) -> &str {
         self.node.as_deref().unwrap_or(&self.dial)
     }
 
-    /// Whether its needs are this Mac's to count and tell, and its sessions
-    /// its to hold and hand back: neither an older aterm's (it publishes no
-    /// needs) nor an [`Self::unproven`] one's (they are its word alone).
+    /// Whether its needs are this Mac's to count and tell, and its sessions its to hold and hand back.
     pub(crate) fn counts(&self) -> bool {
         !self.older && !self.unproven
     }
 
-    /// Whether its needs count on the badge at `now_ms`: its rows were read
-    /// no longer than [`COUNT_FRESH`] ago.
+    /// Whether its needs count on the badge at `now_ms`: its rows were read no longer than [`COUNT_FRESH`] ago.
     pub(crate) fn fresh(&self, now_ms: u64) -> bool {
         now_ms.saturating_sub(self.read_at_ms) <= millis(COUNT_FRESH)
     }
@@ -198,14 +136,12 @@ pub(crate) struct FleetSnapshot {
     pub(crate) macs: Vec<FleetMac>,
     /// The peers that did not, and why.
     pub(crate) unanswered: Vec<Unanswered>,
-    /// Every peer failed at once with no route: a Mac's local-network
-    /// privacy, until the person allows aterm.
+    /// Every peer failed at once with no route: a Mac's local-network privacy, until the person allows aterm.
     pub(crate) no_route: bool,
 }
 
 impl FleetSnapshot {
-    /// Whether the read itself is no older than [`COUNT_FRESH`] at `now_ms`
-    /// (each Mac's own rows: [`FleetMac::fresh`]).
+    /// Whether the read itself is no older than [`COUNT_FRESH`] at `now_ms` (each Mac's own rows: [`FleetMac::fresh`]).
     pub(crate) fn fresh(&self, now_ms: u64) -> bool {
         now_ms.saturating_sub(self.read_at_ms) <= millis(COUNT_FRESH)
     }
@@ -224,9 +160,7 @@ impl FleetSnapshot {
             .sum()
     }
 
-    /// The first instant after `now_ms` (unix ms) at which the read, or one
-    /// Mac's rows in it, stops counting: when the reader tells the App, so
-    /// the badge drops a need no read refreshed.
+    /// The first instant after `now_ms` (unix ms) at which the read, or one Mac's rows in it, stops counting.
     pub(crate) fn next_lapse(&self, now_ms: u64) -> Option<u64> {
         std::iter::once(self.read_at_ms)
             .chain(self.macs.iter().map(|m| m.read_at_ms))
@@ -236,13 +170,7 @@ impl FleetSnapshot {
     }
 }
 
-/// A READ CARRIES A SILENT MAC'S LAST ROWS while they still count: a peer
-/// `next` lists as not answering, that `previous` holds (answered, or
-/// carried itself) from rows no older than [`COUNT_FRESH`] at `now_ms`, is
-/// kept in `next`, [`FleetMac::carried`], with its own read time. So one
-/// missed 3 s deadline neither drops its needs from the badge nor, when it
-/// answers again, makes them new notices; past [`COUNT_FRESH`] it is only
-/// "not answering". It stays listed there too: it did not answer.
+/// A READ CARRIES A SILENT MAC'S LAST ROWS while they still count.
 pub(crate) fn carry(
     previous: Option<&FleetSnapshot>,
     mut next: FleetSnapshot,
@@ -277,9 +205,7 @@ fn millis(d: Duration) -> u64 {
     u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
 }
 
-/// `name` when it can stand in a `vnc://` URL or an `ssh` line: letters,
-/// digits, `.`, `-` and `_`, starting with a letter or digit. Anything else
-/// is no host, and the row offers no Screen Sharing or ssh for it.
+/// `name` when it can stand in a `vnc://` URL or an `ssh` line: letters, digits, `.`, `-` and `_`, starting with a letter or digit.
 pub(crate) fn host_word(name: &str) -> Option<String> {
     let ok = !name.is_empty()
         && name.len() <= 253
@@ -293,13 +219,7 @@ pub(crate) fn host_word(name: &str) -> Option<String> {
     ok.then(|| name.to_string())
 }
 
-/// THE NAME THE BOOK KNOWS A PEER BY, from its survey label: the part
-/// before ` at <address>`, which the fleet client adds where the address
-/// that answered is not the one the book names (`aterm_agent`'s
-/// `survey_fleet`). It is the book's own host (or `host:port`), so `aterm
-/// ctl survey --host` resolves it (`aterm_net::fleet_member::find`: a host,
-/// its first label, `host:port`) — the whole label, with its spaces, it never
-/// can.
+/// THE NAME THE BOOK KNOWS A PEER BY, from its survey label.
 pub(crate) fn dial_of(label: &str) -> &str {
     label.split_once(" at ").map_or(label, |(name, _)| name)
 }
@@ -315,8 +235,7 @@ fn host_part(dial: &str) -> &str {
     }
 }
 
-/// How a row names the peer the book knows as `dial`: its host's first
-/// label (`mac-17` for `mac-17.local`), an address whole.
+/// How a row names the peer the book knows as `dial`: its host's first label (`mac-17` for `mac-17.local`), an address whole.
 pub(crate) fn short_name(dial: &str) -> String {
     let host = host_part(dial);
     if host.parse::<std::net::IpAddr>().is_ok() {
@@ -329,10 +248,7 @@ pub(crate) fn short_name(dial: &str) -> String {
         .to_string()
 }
 
-/// The `aterm` argv of a fleet row's read: `ctl survey --host <dial>`, and
-/// `--sid <sid>` for one session. `None` for a dial that is no name the
-/// fleet client could be given (empty, or one an argv would read as a flag)
-/// and a sid that is no sid.
+/// The `aterm` argv of a fleet row's read: `ctl survey --host <dial>`, and `--sid <sid>` for one session.
 #[cfg_attr(
     all(not(target_os = "macos"), not(test)),
     expect(dead_code, reason = "the menu-bar status item is macOS's")
@@ -353,9 +269,7 @@ pub(crate) fn fleet_read_args(dial: &str, sid: Option<&str>) -> Option<Vec<Strin
     Some(args)
 }
 
-/// The argv after the program of a fleet need's Take Over (`on`) or Hand
-/// Back on the Mac the book knows as `dial` — `ctl --host <dial> hold <sid>
-/// on|off`, the step-in — or `None` where either word could be read as more.
+/// The argv after the program of a fleet need's Take Over (`on`) or Hand Back on the Mac the book knows as `dial`.
 #[cfg_attr(
     all(not(target_os = "macos"), not(test)),
     expect(dead_code, reason = "the menu-bar status item is macOS's")
@@ -390,9 +304,6 @@ fn field<'a>(object: &'a aterm_json::Map, key: &str) -> Option<&'a str> {
 }
 
 /// One fleet peer's answer, labelled `label`: its header and its session
-/// rows, read by the Mac whose node is `own_node`; `unproven` where it proved
-/// no node key this Mac binds, whose node, host and drive are then its claim
-/// and not taken ([`FleetMac::unproven`]).
 fn mac_of(
     label: &str,
     instance: &aterm_json::Map,
@@ -420,10 +331,6 @@ fn mac_of(
             )
     };
     let dial = dial_of(label);
-    // What a peer says of itself stands only where it proved which Mac it
-    // is: an unproven one's `node=` would key its notices and could pass for
-    // this Mac, its `host=` would send Screen Sharing and ssh wherever it
-    // names, and its `drive=1` would offer a Take Over the dialler refuses.
     let proven = |key: &str| (!unproven).then(|| field(instance, key)).flatten();
     let mut mac = FleetMac {
         name: short_name(dial),
@@ -439,9 +346,6 @@ fn mac_of(
         sessions: rows.len(),
         ..FleetMac::default()
     };
-    // `sessions=` counts every session the peer's store holds, exited ones
-    // too, and every one it holds a row for is sent: what the cap left out
-    // is the count past ALL the rows, not the live ones.
     let claimed = field(instance, "sessions").and_then(|n| n.parse::<usize>().ok());
     mac.left_out = claimed.map_or(0, |n| n.saturating_sub(sent.len()));
     for row in &rows {
@@ -471,11 +375,6 @@ fn mac_of(
         let Some(sid) = field(row, "sid") else {
             continue;
         };
-        // Named as a local row names its tab (`status_item::tab_name`): its
-        // role, then — where the peer serves content — the title its person
-        // gave and its OSC title without the spinner or idle glyph an agent
-        // leads it with (a spinner frame moves neither the row nor its
-        // notice), else its program.
         let content_field = |key: &str| content.then(|| field(row, key)).flatten();
         let who = crate::status_item::tab_name(
             field(row, "role"),
@@ -493,15 +392,6 @@ fn mac_of(
         let Some(need) = field(row, "needs").and_then(NeedWord::parse) else {
             continue;
         };
-        // A stall's age is its task's; a wall's or a box's the agent
-        // publication's. An ask's is neither: the row carries no age of the
-        // ask, and the agent's would date a fresh ask by an idle agent's
-        // hours, so it has none (it shows no age and sorts last). A frozen or
-        // stopped program dates by the agent publication only where it is an
-        // identified agent, whose verdict the stall sets
-        // (`wall:unresponsive`); a plain program's `agent_ms` is its
-        // session's age, which would date a minute-old freeze by hours and
-        // sort it ahead of older needs, so it has none.
         let age_key = match need {
             NeedWord::Stalled => Some("task_ms"),
             NeedWord::Ask => None,
@@ -525,16 +415,6 @@ fn mac_of(
 }
 
 /// A content peer's words for its row's need `word`, as a local row has
-/// them (§3: "titles and words appear only where that Mac's `[fleet]
-/// allow` is content"): an ask's own text — the row's attention excerpt is
-/// the entry the session is ranked by, the ask itself — a box's kind
-/// (`agent_detail`), a wall's kind and the reset it names. `None` for a
-/// stall (the row carries none of its words) or where the row says nothing.
-/// A harness's NEEDS YOU entry reads as a local row reads it, the need
-/// without aterm's frame then ` (+N more)` (`docs/DESIGN-harness-autopilot-2026-10-15.md`
-/// §12.2.9), so the menu's Needs you section reads one way. The row names
-/// no owner, so the entry is known by its form ([`crate::needs::need_words`]);
-/// any other text keeps its words.
 fn content_what(word: NeedWord, row: &aterm_json::Map) -> Option<String> {
     use crate::needs::{HarnessAsk, ROW_WHAT_MAX, fold_clip, need_words};
     match word {
@@ -559,18 +439,7 @@ fn content_what(word: NeedWord, row: &aterm_json::Map) -> Option<String> {
     }
 }
 
-/// THE FLEET READ, PARSED: the `aterm ctl survey --fleet --json` text
-/// `json` read at `now_ms`, `no_route` its stderr's verdict that every peer
-/// failed at once with no route. Entries that are not a fleet peer's (this
-/// machine's instances, its siblings) are dropped — the sibling scan reads
-/// those — and so is a peer that proved its `node=` is `own_node`, this
-/// machine answering through its own book. A proven answer's `node=` is the
-/// node its connection proved: the read refuses one whose header names
-/// another (`aterm_net::fleet_member::Unreached::Misnamed`), which comes
-/// here as a peer that did not answer, never as one dropped. An unproven
-/// peer's `node=` is its claim: it is listed ([`FleetMac::unproven`]). A row
-/// whose `held_from=` is `own_node` is a hold this machine placed
-/// ([`FleetMac::held_here`]). `Err` for text that is no survey.
+/// THE FLEET READ, PARSED.
 pub(crate) fn parse(
     json: &str,
     no_route: bool,
@@ -632,40 +501,25 @@ pub(crate) fn parse(
     Ok(snapshot)
 }
 
-/// What this Mac's fleet files say of it, read off the event loop
-/// ([`read_book`]).
+/// What this Mac's fleet files say of it, read off the event loop ([`read_book`]).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct BookFacts {
     /// It holds a fleet key: it is in a fleet.
     pub(crate) in_fleet: bool,
-    /// Its book has peers that joined it: it is the fleet's issuer, and its
-    /// read is the whole fleet.
+    /// Its book has peers that joined it: it is the fleet's issuer, and its read is the whole fleet.
     pub(crate) issuer: bool,
-    /// The issuer a member's book names, where it is all the book holds and
-    /// no copy of that issuer's book was read: this Mac knows only its
-    /// issuer.
+    /// The issuer a member's book names, where it is all the book holds and no copy of that issuer's book was read.
     pub(crate) issuer_label: Option<String>,
-    /// The issuer a member's book names with no key bound to it (it joined
-    /// before node keys came, or its issuer proved none then): no answer is
-    /// proven here, the issuer's and every copy of its book's
-    /// (`aterm_net::fleet_member::Book::proven`), until this Mac joins
-    /// again — the one act that proves any of them.
+    /// The issuer a member's book names with no key bound to it (it joined before node keys came, or its issuer proved none then).
     pub(crate) unbound_issuer: Option<String>,
 }
 
-/// WHETHER THIS MAC IS IN A FLEET, the one answer every surface reads (the
-/// fleet glance's book here, the Agents rows' and Summarize's
-/// `summarize::in_fleet`): its state directory `state` holds the fleet secret
-/// (`aterm_net::fleet::KEY_FILE`), which `aterm fleet init` and `join` write
-/// and `leave` removes — the membership `aterm ctl survey --fleet` reads. A
-/// key that is there but unreadable (a link, not private) is still a fleet:
-/// its read fails and says why, where "not in a fleet" would hide it.
+/// WHETHER THIS MAC IS IN A FLEET, the one answer every surface reads (the fleet glance's book here, the Agents rows' and Summarize's `summarize::in_fleet`).
 pub(crate) fn holds_fleet_key(state: &Path) -> bool {
     std::fs::symlink_metadata(state.join(aterm_net::fleet::KEY_FILE)).is_ok()
 }
 
-/// [`BookFacts`] of the state directory `state` (`fleet.key` and the book of
-/// peers); nothing for a Mac in no fleet or a book that cannot be read.
+/// [`BookFacts`] of the state directory `state` (`fleet.key` and the book of peers).
 pub(crate) fn read_book(state: &Path) -> BookFacts {
     let in_fleet = holds_fleet_key(state);
     if !in_fleet {
@@ -675,9 +529,6 @@ pub(crate) fn read_book(state: &Path) -> BookFacts {
 }
 
 /// [`read_book`] off unix, where there is no book to read
-/// (`aterm_net::fleet_member` is unix-only): a fleet key says only that it is
-/// in a fleet — and no reader starts off macOS anyway
-/// (`App::fleet_glance_may_start`).
 #[cfg(not(unix))]
 fn read_book_peers(_state: &Path, in_fleet: bool) -> BookFacts {
     BookFacts {
@@ -687,20 +538,12 @@ fn read_book_peers(_state: &Path, in_fleet: bool) -> BookFacts {
 }
 
 /// [`read_book`]'s book: whether it names peers that joined this Mac, or
-/// only its issuer — and then, since the issuer's book (S11) makes a
-/// member's read whole, whether the last read got that book
-/// ([`aterm_net::fleet_member::holds_issuer_book`]): a member holding it
-/// knows the whole fleet, one without it (its issuer an older aterm that
-/// shares none, or no read yet) only its issuer — and whether its issuer's
-/// entry binds a key ([`BookFacts::unbound_issuer`]).
 #[cfg(unix)]
 fn read_book_peers(state: &Path, in_fleet: bool) -> BookFacts {
     let book = aterm_net::fleet_member::read_peers(state).unwrap_or_default();
     let issuer = book
         .iter()
         .any(|p| p.via == aterm_net::fleet_member::Via::Joined);
-    // "Knows only its issuer" only where the book holds nothing else: a peer
-    // named by hand (`aterm fleet peers add`) is read too.
     let issuer_label = book
         .iter()
         .all(|p| p.via == aterm_net::fleet_member::Via::Issuer)
@@ -713,7 +556,6 @@ fn read_book_peers(state: &Path, in_fleet: bool) -> BookFacts {
                 .is_some_and(|node| aterm_net::fleet_member::holds_issuer_book(state, node))
         })
         .map(|first| first.host.clone());
-    // The issuer the keyring takes (`Keyring::of`: the first via=issuer).
     let unbound_issuer = book
         .iter()
         .find(|p| p.via == aterm_net::fleet_member::Via::Issuer)
@@ -727,9 +569,7 @@ fn read_book_peers(state: &Path, in_fleet: bool) -> BookFacts {
     }
 }
 
-/// WHEN TO READ THE FLEET: never in no fleet; at the menu's open when the
-/// last read (unix ms) is older than [`MENU_FRESH`] or there is none; on the
-/// minute where this Mac is the issuer or `watch` is on.
+/// WHEN TO READ THE FLEET: never in no fleet.
 pub(crate) fn should_poll(
     book: &BookFacts,
     watch: bool,
@@ -752,8 +592,7 @@ pub(crate) struct FleetSlot {
     pub(crate) generation: u16,
     /// The last good read.
     pub(crate) snapshot: Option<Arc<FleetSnapshot>>,
-    /// The read before it, and its generation: a click on a submenu painted
-    /// from it still resolves.
+    /// The read before it, and its generation: a click on a submenu painted from it still resolves.
     pub(crate) previous: Option<(u16, Arc<FleetSnapshot>)>,
     /// Why the last read failed, when it did (cleared by a good one).
     pub(crate) error: Option<String>,
@@ -781,11 +620,7 @@ impl FleetSlot {
             .map(|(_, s)| s)
     }
 
-    /// `chrome`'s `fleet=` word: `off` (in no fleet), `unread` (in one,
-    /// and not read yet: a member before its menu first opens), `reading`,
-    /// `failed` or `as_of:<unix ms>`. Where no glance runs (headless, or
-    /// before the status item installs) `chrome` says `off` too
-    /// (`App::status_item_line_of`): no fleet is read there.
+    /// `chrome`'s `fleet=` word.
     pub(crate) fn word(&self) -> String {
         if !self.book.in_fleet {
             "off".to_string()
@@ -860,20 +695,17 @@ pub(crate) struct ReaderSeams {
     pub(crate) book: Box<dyn Fn() -> BookFacts + Send>,
     /// `[fleet] watch`, current.
     pub(crate) watch: Arc<std::sync::atomic::AtomicBool>,
-    /// This machine's node id, to drop its own answer and to know the holds
-    /// its drives placed ([`FleetMac::held_here`]).
+    /// This machine's node id, to drop its own answer and to know the holds its drives placed ([`FleetMac::held_here`]).
     pub(crate) own_node: Option<String>,
     /// Now, unix ms.
     pub(crate) now_ms: Box<dyn Fn() -> u64 + Send>,
-    /// Told after every write to the slot (`Wake::FleetRead`); `false` when
-    /// nobody listens any more, which ends the thread.
+    /// Told after every write to the slot (`Wake::FleetRead`); `false` when nobody listens any more, which ends the thread.
     pub(crate) post: Box<dyn Fn() -> bool + Send>,
     /// How long the thread waits for a kick before it looks again.
     pub(crate) tick: Duration,
 }
 
-/// The fleet glance's handle: the slot and the kick channel. Dropping it
-/// ends the reader thread at its next look.
+/// The fleet glance's handle: the slot and the kick channel.
 pub(crate) struct FleetGlance {
     /// The shared slot.
     pub(crate) slot: Arc<Mutex<FleetSlot>>,
@@ -898,16 +730,13 @@ impl FleetGlance {
         self.watch.store(on, std::sync::atomic::Ordering::Release);
     }
 
-    /// The slot as it stands, copied out under its lock (poison recovered:
-    /// the slot is plain data, its snapshots shared, so a copy is cheap).
+    /// The slot as it stands, copied out under its lock (poison recovered: the slot is plain data, its snapshots shared, so a copy is cheap).
     pub(crate) fn copy(&self) -> FleetSlot {
         self.slot.lock().unwrap_or_else(|p| p.into_inner()).clone()
     }
 }
 
-/// START THE READER on thread `aterm-fleet-glance` with `runner` and
-/// `seams`, its watch switch starting at `watch`. `None` when the thread
-/// could not start.
+/// START THE READER on thread `aterm-fleet-glance` with `runner` and `seams`, its watch switch starting at `watch`.
 pub(crate) fn spawn(runner: Box<dyn FleetRunner>, seams: ReaderSeams) -> Option<FleetGlance> {
     let slot = Arc::new(Mutex::new(FleetSlot::default()));
     let (tx, rx) = std::sync::mpsc::channel();
@@ -928,14 +757,6 @@ pub(crate) fn spawn(runner: Box<dyn FleetRunner>, seams: ReaderSeams) -> Option<
 }
 
 /// The reader: look, read when [`should_poll`] (or a [`Kick::Now`]) says,
-/// write the slot ([`carry`]ing a silent Mac's last rows), tell the App,
-/// then wait for a kick, the tick, or the next instant the read or one Mac's
-/// rows in it stops counting ([`FleetSnapshot::next_lapse`]), whichever is
-/// first. The App is told at its first look (so the digest's answer is
-/// stated in no fleet too), at each read's start and end, when the book
-/// moves, and at each such lapse (so the badge drops a fleet need no read
-/// refreshed). Kicks that came during a read are answered by it. Ends when
-/// the handle is dropped or nobody listens.
 fn reader_loop(
     mut runner: Box<dyn FleetRunner>,
     seams: &ReaderSeams,
@@ -945,12 +766,7 @@ fn reader_loop(
     let lock = || slot.lock().unwrap_or_else(|p| p.into_inner());
     let mut kick: Option<Kick> = None;
     let mut first = true;
-    // The next instant the last read, or a Mac's rows in it, stops
-    // counting: news for the App when it passes.
     let mut lapse_at: Option<u64> = None;
-    // The clock when the App was last told: the next lapse is the first
-    // after it, so one that passes before the reader looks again (it was
-    // descheduled after its post, or the Mac slept) is still news.
     let mut told_ms: u64 = 0;
     loop {
         let book = (seams.book)();
@@ -968,8 +784,6 @@ fn reader_loop(
             moved
         };
         let lapsed = lapse_at.is_some_and(|at| now >= at);
-        // Taken whatever else is news: a first look that is also a moved book
-        // is told once, never again a tick after the next read.
         let first_look = std::mem::take(&mut first);
         if read || book_moved || lapsed || first_look {
             if !(seams.post)() {
@@ -1001,19 +815,13 @@ fn reader_loop(
                     Err(why) => slot.error = Some(why),
                 }
             }
-            // A read may have kept (or dropped) the copy of the issuer's
-            // book: the facts it reads are told with its answer.
             lock().book = (seams.book)();
-            // The kicks that came during the read: it answered them.
             while rx.try_recv().is_ok() {}
             if !(seams.post)() {
                 return;
             }
             told_ms = now;
         }
-        // Wake at the tick, or just past the next lapse after the App was
-        // last told (at once when the clock is already past it), whichever
-        // is first.
         let now = (seams.now_ms)();
         lapse_at = lock()
             .snapshot
@@ -1030,9 +838,7 @@ fn reader_loop(
     }
 }
 
-/// The herald's key for a fleet need: the peer ([`FleetMac::ident`]: its
-/// node, so an address DHCP moves is not a new need) and the session,
-/// hashed, with the top bit set, which no local session id reaches.
+/// The herald's key for a fleet need.
 pub(crate) fn herald_key(mac: &str, sid: &str) -> u64 {
     aterm_hash::fnv1a_64(format!("{mac}\u{1f}{sid}").as_bytes()) | (1 << 63)
 }
@@ -1043,14 +849,11 @@ pub(crate) fn is_herald_key(key: u64) -> bool {
 }
 
 /// A fleet need's transition key within its slot: its word's hash — a facts
-/// row carries no verdict rev, so one notice per (Mac, session, word).
 fn need_key(word: NeedWord) -> u64 {
     aterm_hash::fnv1a_64(word.word().as_bytes())
 }
 
-/// A fleet need as the herald reads it: keyed by its Mac's
-/// [`FleetMac::ident`] and its session ([`herald_key`]), one transition per
-/// word ([`need_key`]), its body "mac-17 · claude: stalled".
+/// A fleet need as the herald reads it.
 pub(crate) fn escalation(mac: &FleetMac, need: &FleetNeed) -> crate::status_item::Escalation {
     let what = need
         .what
@@ -1067,16 +870,13 @@ pub(crate) fn escalation(mac: &FleetMac, need: &FleetNeed) -> crate::status_item
     }
 }
 
-/// One told fleet need as the park writes it (`SessionHandoff::fleet_told`):
-/// its herald key in hex and its word. Unix only, as the park is.
+/// One told fleet need as the park writes it (`SessionHandoff::fleet_told`): its herald key in hex and its word.
 #[cfg(any(unix, test))]
 pub(crate) fn told_row(key: u64, word: NeedWord) -> String {
     format!("{key:016x}={}", word.word())
 }
 
-/// The told fleet needs a seamless update carried ([`told_row`]'s rows),
-/// by herald key; a row that does not read — no fleet key, no word this
-/// build knows — is dropped, and at most [`FLEET_TOLD_MAX`] are read.
+/// The told fleet needs a seamless update carried ([`told_row`]'s rows), by herald key; a row that does not read.
 pub(crate) fn parse_told(rows: &[String]) -> std::collections::HashMap<u64, NeedWord> {
     rows.iter()
         .filter_map(|row| {
@@ -1090,9 +890,7 @@ pub(crate) fn parse_told(rows: &[String]) -> std::collections::HashMap<u64, Need
         .collect()
 }
 
-/// THE FLEET'S DIGEST ENTRY (`fleet.unreadable.no-route`, the whole answer
-/// of the level `Family::FleetUnreadable`): every peer refused at once with
-/// no route, which on a Mac is local-network privacy.
+/// THE FLEET'S DIGEST ENTRY (`fleet.unreadable.no-route`, the whole answer of the level `Family::FleetUnreadable`).
 pub(crate) fn no_route_entry() -> aterm_messages::exceptions::Entry {
     use aterm_messages::exceptions::{Entry, Family};
     use aterm_messages::need::{Reason, Resurface, Then, Why};
@@ -1120,11 +918,7 @@ pub(crate) const LOCAL_NETWORK_PANE: &str =
     "x-apple.systempreferences:com.apple.preference.security?Privacy_LocalNetwork";
 
 impl crate::App {
-    /// START THE FLEET GLANCE with the status item (the first OS window's
-    /// attach): the real read ([`ChildRunner::fleet`]) and the real seams —
-    /// the book under the state directory, `[fleet] watch`, this machine's
-    /// node, the event loop's `Wake::FleetRead` — through
-    /// [`Self::start_fleet_glance_with`]'s gate.
+    /// START THE FLEET GLANCE with the status item (the first OS window's attach).
     pub(crate) fn start_fleet_glance(&mut self) {
         if !self.fleet_glance_may_start() {
             return;
@@ -1133,8 +927,6 @@ impl crate::App {
             return;
         };
         let state = aterm_types::dirs::state_dir();
-        // This machine's node id, by which its own answer through the book is
-        // dropped (unix only, as the book is).
         #[cfg(unix)]
         let own_node = state
             .as_deref()
@@ -1159,14 +951,11 @@ impl crate::App {
     }
 
     /// Whether a fleet glance may start here: never headless (no child, no
-    /// thread), never off macOS, never twice.
     fn fleet_glance_may_start(&self) -> bool {
         !self.headless && cfg!(target_os = "macos") && self.fleet_glance.is_none()
     }
 
-    /// Start the reader with `runner` and `seams` where
-    /// [`Self::fleet_glance_may_start`] allows, and hand its slot to the
-    /// status item for the Fleet submenu.
+    /// Start the reader with `runner` and `seams` where [`Self::fleet_glance_may_start`] allows, and hand its slot to the status item for the Fleet submenu.
     pub(crate) fn start_fleet_glance_with(
         &mut self,
         runner: Box<dyn FleetRunner>,
@@ -1194,10 +983,7 @@ impl crate::App {
         }
     }
 
-    /// The `Wake::FleetRead` arm: the fleet glance wrote its slot. The menu-bar
-    /// item is rebuilt, the digest's `FleetUnreadable` answer is stated again
-    /// (one entry while every peer refuses with no route, none otherwise),
-    /// and the fleet's needs are heralded.
+    /// The `Wake::FleetRead` arm: the fleet glance wrote its slot.
     pub(crate) fn on_fleet_read(&mut self) {
         self.mark_status_dirty();
         let no_route = self.fleet_glance.as_ref().is_some_and(|f| {
@@ -1216,22 +1002,7 @@ impl crate::App {
         self.herald_fleet();
     }
 
-    /// THE FLEET'S NOTICES: one per fleet need's transition, through the
-    /// herald's rate limits, from rows no older than [`COUNT_FRESH`] only —
-    /// an older or unproven peer's never ([`FleetMac::counts`]). Body
-    /// "mac-17 · claude: stalled", keyed by the Mac's [`FleetMac::ident`]
-    /// and the session. Never headless.
-    ///
-    /// ONLY A FRESH READ IN WHICH THE MAC ANSWERED CAN SAY A NEED IS GONE.
-    /// While the last read is stale (a member reads only when its menu
-    /// opens) nothing is known to stand or to have gone: nothing is posted
-    /// and nothing retired, so the same need read again is no new
-    /// transition. A Mac that did not answer keeps its needs' slots too (its
-    /// rows carried while they count, [`carry`]); a slot is retired only when
-    /// its Mac answered without that need, or left the fleet's read
-    /// altogether. A slot that cannot be told now owes nothing
-    /// ([`crate::status_item::Herald::forgo`]): the herald's timer would ask
-    /// again at once, and no read could pay it.
+    /// THE FLEET'S NOTICES: one per fleet need's transition, through the herald's rate limits, from rows no older than [`COUNT_FRESH`] only.
     pub(crate) fn herald_fleet(&mut self) {
         if self.headless {
             return;
@@ -1282,15 +1053,6 @@ impl crate::App {
         for key in quiet {
             self.presence.herald.forgo(key);
         }
-        // A SEAMLESS SUCCESSOR'S FIRST FRESH READ: the needs the outgoing
-        // herald had told, carried by its park (`SessionHandoff::
-        // fleet_told`), are noted as told (`Herald::adopt`) where this read
-        // still finds each — the same word on the same Mac's session — and
-        // post nothing: an update is no new need on another Mac, and one
-        // process reading on across the same gap would not have told them
-        // again. A need the carry does not name (one that arose during the
-        // update, one the outgoing process never told, another word) is
-        // told as ever.
         if let Some(told) = self.fleet_adopt.take() {
             let now_unix = i64::try_from(now_ms / 1000).unwrap_or(i64::MAX);
             for (esc, _, word) in &current {
@@ -1316,12 +1078,7 @@ impl crate::App {
         }
     }
 
-    /// THE FLEET NEEDS THIS HERALD HAS TOLD, as a seamless update's park
-    /// stamps them (`SessionHandoff::fleet_told`): every fleet need's slot
-    /// whose notice is shown and owed nothing ([`Herald::told`]), sorted,
-    /// at most [`FLEET_TOLD_MAX`].
-    ///
-    /// [`Herald::told`]: crate::status_item::Herald::told
+    /// THE FLEET NEEDS THIS HERALD HAS TOLD, as a seamless update's park stamps them (`SessionHandoff::fleet_told`).
     #[cfg(unix)]
     pub(crate) fn fleet_told_rows(&self) -> Vec<String> {
         let mut rows: Vec<String> = self
@@ -1341,11 +1098,7 @@ impl crate::App {
         rows
     }
 
-    /// A fleet row's act on the Mac the book knows as `dial`, shown as
-    /// `name` (and its session `sid`): read it (in full, or the one session)
-    /// into a document tab, Screen Sharing to its host, or its `ssh` line
-    /// onto the pasteboard. A Mac that named no host gets neither of the last
-    /// two.
+    /// A fleet row's act on the Mac the book knows as `dial`, shown as `name` (and its session `sid`).
     #[cfg(target_os = "macos")]
     pub(crate) fn fleet_act(
         &mut self,
@@ -1369,6 +1122,7 @@ impl crate::App {
             }
             StatusAction::PeerScreen(_) | StatusAction::MacScreen(_) => {
                 if let Some(host) = host.and_then(host_word) {
+                    // {host}"));
                     let _ = self.apprt.open_url(&format!("vnc://{host}"));
                 }
             }

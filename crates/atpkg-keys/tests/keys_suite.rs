@@ -11,6 +11,9 @@
 //! Run one file's tests with
 //! `targo --unverified test -p atpkg-keys --test keys_suite -- <file>::`.
 
+#[cfg(test)]
+aterm_durable::plain_durable_flushes_in_tests!();
+
 mod owner_to_client;
 mod paper_master_to_client;
 mod provision_cli;

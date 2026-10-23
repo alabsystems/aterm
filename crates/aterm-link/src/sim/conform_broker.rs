@@ -1,106 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE SIMULATED BROKER HELD TO ASTREAM'S OWN (sim item B01): a differential
-//! test of [`super::bus`]'s model against a real `astream_broker::Broker`.
-//!
-//! Every exactly-once claim the simulation makes — the seeded worlds' laws,
-//! `FabricExactlyOnce`'s conformance ([`super::conform`]) — rests on the model
-//! answering the bridge as astream does. This test plays one script on both,
-//! request by request, and compares what each answers. It runs on every pin
-//! bump of `vendor/astream`, so a change to astream's broker that the model
-//! does not follow is a red here, not a silent drift.
-//!
-//! ## The two arms
-//!
-//! * REAL: `Broker::open_opts` on a scratch directory, with the options aterm
-//!   opens its own broker with ([`crate::durability::Durability::options`]:
-//!   the tier, the Ordered horizon of 100 ms, the escalation table on the
-//!   weak tiers), a fixed boot (`Boot::Known`) and the boot volume
-//!   (`Volume::Boot`), so a same-boot unclean stop keeps the generation as it
-//!   does on a Mac. Unguarded, as the model is. Served on a scratch Unix
-//!   socket; each connection a `UnixStream` that writes astream's frames and
-//!   reads them back with astream's codec.
-//! * MODEL: `bus::Broker::new(tier, the same table)`, each connection a raw
-//!   [`bus::SimStream`] ([`bus::dial_stream`]) carrying the same frames. No
-//!   held acks, no refused batches, no race, no mutant.
-//!
-//! ## What is compared
-//!
-//! Each decoded answer, after one projection that names what it leaves out:
-//!
-//! * a `PublishAck`'s offset and `deduped`; a `Delivery` whole; a `Budget`
-//!   whole; a refusal's code and, where astream defines one, its prefix class
-//!   (`charged: `, `will: `, `log: `, `cut: `, `retained-from=`, `log
-//!   poisoned`), never the rest of its words;
-//! * a `Mark`'s `next`, `head`, `resume` and `oldest`; its `durable` exactly on
-//!   Strict, and on Ordered and Relaxed by the law instead ([`Law`]): monotone,
-//!   at most the head, at least one past every escalated record acked so far —
-//!   the horizon's flush runs on the real broker's own timer;
-//! * a `Hello`'s generation, lineage, served tier (requested, served, reason,
-//!   horizon, rule count), request set and retention block — never the nonce,
-//!   the log's id, or its health.
-//!
-//! A tail's `Mark`s (catch-up, idle, durable) are skipped: the model sends
-//! none ([`WHAT IT DOES NOT COVER`](self#what-it-does-not-cover)).
-//!
-//! ## The scripts
-//!
-//! Hand-written ones cover each verb the model serves and each edge astream
-//! defines for it ([`scripts`]): publish, a resend, pipelined publishes, the
-//! reserved and malformed subjects, the ack half; `/a/retire` of an absent
-//! subject, of one charged to this producer, to another, and while a will
-//! targets it; a will registered, refused (a second producer on one
-//! connection, a reserved or malformed subject, the ack half, past the
-//! subject budget), fired on a dropped connection, fenced by a later
-//! incarnation, not fenced by the ack half, replaced on its connection;
-//! commits max-folded and a group's resume across a restart; `Last` and
-//! `Fetch` paging, their bounds and head queries; `Budget` with a will's
-//! reservation; the subject budget itself; and the restarts — a clean close,
-//! an unclean stop in the same boot, and a reopen in a boot the open cannot
-//! name against the model's power loss that kept the whole log. Others are
-//! the DOOR'S JOURNAL of seeded worlds ([`bus::Event`], `world::Opts::journal`)
-//! on each tier: exactly the requests a real bridge sent, replayed.
-//!
-//! Every connection the arms hold is ended, in order, before a restart: the
-//! real broker's connection threads fire their wills then, and the model's do
-//! at their end. A will can only fire there, deterministically, so the
-//! script decides it.
-//!
-//! Waits are hang detectors of a minute, never budgets: a real will is
-//! waited for by the writer's settled count (`BrokerStats::wills_settled`,
-//! astream's own test idiom), a real tail's delivery by its reader thread.
-//!
-//! ## WHAT IT DOES NOT COVER
-//!
-//! * A GUARDED broker. Both arms are unguarded, so `Attach` is a `Mark` at the
-//!   head on both and no capability is checked; the escalation table's
-//!   principal rule (`h-`), which a real broker applies only to a producer a
-//!   bound grant attached (`/a/bind`), escalates by the model's own producer
-//!   names ([`bus::Broker::name_producer`]) in the worlds and is checked by
-//!   neither arm here; the refusals a capability draws (expired, poisoned
-//!   by a bind collision, unauthorized) are not drawn.
-//! * POWER-LOSS CUTS: what a restart may lose is the model's law check
-//!   ([`bus::law_check`], P2-P7), not this test; the only power loss here
-//!   keeps the whole log.
-//! * A WILL LIVE AT A RESTART. astream's connection threads race its shutdown:
-//!   each fires its will at the stop or leaves it to the next open, which
-//!   fires every producer's latest will. The model fires, at its open, every
-//!   producer's latest will whose registration the log holds — one of the
-//!   outcomes the race allows — and this test ends every connection first.
-//! * TIME: a tail's catch-up, idle and durable marks, the reader's liveness
-//!   bound they arm, a TCP keepalive's deadline, the Ordered horizon's own
-//!   timer (judged only by the durable law above).
-//! * SCAN BOUNDS PAST REACH: a `Last` cuts its scan of the index every
-//!   `LAST_SCAN_MAX` entries and resumes on the broker's side for up to
-//!   `LAST_RESUME_ROUNDS` rounds, which no client sees below
-//!   4,194,304 index entries in a filter's prefix; the model has neither.
-//! * Verbs the bridge never sends, which the model answers `not simulated`:
-//!   `ForkSubscribe`, `ProcessAndProduce`, `Replicate`, and the conditional
-//!   `Retire` (sim item B02 adds it).
-//! * Concurrency: one request at a time, one connection at a time; batches,
-//!   and the order a writer acks a batch against a tail's read of it, are the
-//!   held-ack worlds' (`bus`'s module doc).
+//! THE SIMULATED BROKER HELD TO ASTREAM'S OWN (sim item B01).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Write as _};
@@ -126,7 +27,6 @@ const HANG: Duration = aterm_spec::wait::MUST_HAPPEN;
 const BOOT: [u8; 16] = *b"aterm-sim-B01-bt";
 
 /// The connection a world producer's writes ride ([`Event::Publish`]): the
-/// journal's connections count from 1.
 const WORLD: u64 = 0;
 
 /// One step of a script, played on both arms.
@@ -134,26 +34,19 @@ const WORLD: u64 = 0;
 pub(crate) enum Step {
     /// Open connection `c`.
     Dial(u64),
-    /// Send one request on `c` and read its whole answer (none for a
-    /// subscribe: `c` is a tail from then on).
+    /// Send one request on `c` and read its whole answer (none for a subscribe: `c` is a tail from then on).
     Send(u64, Request),
     /// Send every request on `c` before reading any answer, then read each.
     Pipeline(u64, Vec<Request>),
     /// Read the next delivery of tail `c`.
     Deliver(u64),
-    /// The client drops `c`: its will fires.
+    /// The client drops `c`.
     End(u64),
-    /// Every connection ends, then the broker stops: `Clean` or `Crash` (an
-    /// unclean stop in the same boot). Down until [`Step::Start`].
+    /// Every connection ends, then the broker stops.
     Stop(Stop),
     /// The broker opens again.
     Start,
-    /// Every connection ends, the broker stops uncleanly, and it opens again
-    /// in a boot it cannot name, every record kept: astream's `Boot::Unknown`
-    /// reopen against the model's power loss that kept the whole log. A
-    /// script makes no [`Stop::Crash`] after one: astream moves a weak tier's
-    /// generation after every unclean stop in a boot it cannot name, and the
-    /// model's crash moves nothing.
+    /// Every connection ends, the broker stops uncleanly, and it opens again in a boot it cannot name, every record kept.
     Reboot,
 }
 
@@ -193,17 +86,13 @@ impl Law {
 
 /// The REAL arm: astream's broker on a scratch directory.
 struct Real {
-    // Dropped in this order: the connections, the broker (its clean close
-    // writes beside the log), then the directory.
     conns: BTreeMap<u64, RealConn>,
     up: Option<(astream_broker::Broker, astream_broker::BrokerHandle)>,
     durability: Durability,
     boot: Boot,
     /// Producers whose `/a/will` record the log holds: what an open fires,
-    /// one firing each.
     will_producers: BTreeSet<u64>,
     /// Wills queued to this broker's writer since its open: what
-    /// `wills_settled` must reach before the log is read again.
     queued: u64,
     dir: Scratch,
 }
@@ -257,14 +146,11 @@ impl RealConn {
 
 impl Drop for RealConn {
     fn drop(&mut self) {
-        // Shutdown affects the reader's clone too, including on an early mismatch.
         let _ = self.stream.shutdown(std::net::Shutdown::Both);
         let Some(reader) = self.reader.take() else {
             return;
         };
         let (complete, completion) = mpsc::channel();
-        // Observe the actual join without an unbounded join in this destructor.
-        // An unknown observer/reader retains the scratch directory above.
         let joining = std::thread::Builder::new().spawn(move || {
             let _ = complete.send(reader.join());
         });
@@ -325,9 +211,6 @@ impl Real {
             .expect("the real broker opens");
         let handle = broker.serve(self.sock()).expect("the real broker serves");
         self.up = Some((broker, handle));
-        // THE OPEN FIRES each producer's latest will: one firing queued per
-        // producer whose will the log holds, each settled before the log is
-        // read.
         self.queued = self.will_producers.len() as u64;
         self.settle();
     }
@@ -394,10 +277,6 @@ impl Real {
             "already a tail"
         );
         let mut reader = conn.stream.try_clone().expect("clone the tail");
-        // A tail reads unbounded: the channel's receive is the hang detector.
-        // A broker that already refused the subscribe and hung up leaves a
-        // socket macOS will set no option on (`EINVAL`); its reads return
-        // what was sent, then the end, whatever the bound.
         let _ = reader.set_read_timeout(None);
         let (tx, rx) = mpsc::channel();
         let worker = std::thread::spawn(move || loop {
@@ -525,7 +404,6 @@ impl Model {
     }
 
     /// The next frame of tail `c`, `Ok(None)` at its end, or what the model
-    /// said instead of either.
     fn deliver(&mut self, c: u64) -> Result<Option<Response>, String> {
         let stream = self.conns.get_mut(&c).expect("a model tail");
         match read_frame(stream) {
@@ -573,7 +451,6 @@ fn table(tier: Tier) -> Escalation {
 }
 
 /// Whether the record `req` writes is escalated on the real arm: its subject
-/// or group rules (an unguarded broker binds no principal).
 fn escalated(table: &Escalation, req: &Request) -> bool {
     match req {
         Request::Publish { subject, .. } => table.escalates(subject, &bus::Kind::Plain, None),
@@ -627,7 +504,6 @@ fn class(msg: &str) -> &'static str {
 }
 
 /// One answer as the comparison reads it ([module docs](self)), with a `Mark`'s
-/// durable head apart for the law.
 fn project(tier: Tier, resp: &Response) -> (String, Option<(Option<u64>, u64)>) {
     match resp {
         Response::PublishAck { offset, deduped } => {
@@ -797,8 +673,6 @@ fn answer(
 }
 
 /// THE DOOR'S JOURNAL of a world, as a script: each connection, request,
-/// delivery and end as it happened, a world producer's writes on a connection
-/// of their own, and the restarts.
 fn replay(journal: &[Event]) -> Vec<Step> {
     let mut steps = Vec::new();
     let mut world_dialled = false;
@@ -853,12 +727,12 @@ pub(crate) mod scripts {
     pub(crate) const NODE: &str = "/f/f/pub/n-sim/node/presence";
     pub(crate) const LANE: &str = "/f/f/in/n-sim/s-a/n-sim/say";
     pub(crate) const LANE_B: &str = "/f/f/in/n-sim/s-b/n-sim/say";
-    /// Escalated by aterm's table on the weak tiers: a halt, and a person's lane.
+    /// Escalated by aterm's table on the weak tiers.
     pub(crate) const HALT: &str = "/f/f/fleet/halt";
     pub(crate) const PERSON: &str = "/f/f/in/p/alice/n-sim/say";
     pub(crate) const INBOX: &str = "/f/f/in/n-sim/>";
     pub(crate) const GROUP: &str = "/f/f/cur/n-sim";
-    /// Escalated by aterm's table on the weak tiers: a person's read mark.
+    /// Escalated by aterm's table on the weak tiers.
     pub(crate) const PERSON_GROUP: &str = "/f/f/cur/p/alice";
 
     pub(crate) fn publish(producer: u64, seq: u64, subject: &str, body: &str) -> Request {
@@ -959,17 +833,13 @@ pub(crate) mod scripts {
         ]
     }
 
-    /// PUBLISH: a resend, pipelined publishes, the reserved and malformed
-    /// subjects, the ack half; `Fetch` and `Last` paging and head queries; the
-    /// wire-only verbs.
+    /// PUBLISH: a resend, pipelined publishes, the reserved and malformed subjects, the ack half.
     pub(crate) fn publishing() -> Vec<Step> {
         let mut s = vec![
             Step::Dial(1),
             Step::Send(1, Request::Hello),
             Step::Send(1, publish(P, seq(1, 1), PRES_A, "live")),
-            // A RESEND dedups to the first offset.
             Step::Send(1, publish(P, seq(1, 1), PRES_A, "live")),
-            // A different body under the same key dedups too.
             Step::Send(1, publish(P, seq(1, 1), PRES_A, "other")),
             Step::Pipeline(
                 1,
@@ -982,34 +852,26 @@ pub(crate) mod scripts {
                     publish(P, seq(1, 4), LANE, "m3"),
                 ],
             ),
-            // The broker's own subjects are refused by name; another `/a/` one
-            // is not one of them.
             Step::Send(1, publish(P, seq(1, 5), "/a/commit", "x")),
             Step::Send(1, publish(P, seq(1, 5), "/a/will", "x")),
             Step::Send(1, publish(P, seq(1, 5), "/a/bind", "x")),
             Step::Send(1, publish(P, seq(1, 5), "/a/custom", "x")),
-            // Malformed: no leading slash, a wildcard, an empty segment.
             Step::Send(1, publish(P, seq(1, 6), "no-slash", "x")),
             Step::Send(1, publish(P, seq(1, 6), "/f/f/*/x", "x")),
             Step::Send(1, publish(P, seq(1, 6), "/f//x", "x")),
-            // A name past astream's bound is refused before it is parsed.
             Step::Send(
                 1,
                 publish(P, seq(1, 6), &format!("/f/{}", "x".repeat(4100)), "x"),
             ),
             Step::Send(1, fetch(0, &format!("/f/{}", "x".repeat(4100)), 1)),
-            // The ack half: published, never a fence.
             Step::Send(1, publish(P, ACK_SEQ_BASE | 3, LANE, "ack")),
             Step::Send(1, publish(P, ACK_SEQ_BASE | 3, LANE, "ack")),
-            // FETCH: all, a page, the head query, from past the head, a bad filter.
             Step::Send(1, fetch(0, "/>", 100)),
             Step::Send(1, fetch(2, "/f/f/in/>", 1)),
             Step::Send(1, fetch(0, "/f/f/in/>", 0)),
             Step::Send(1, fetch(1000, "/>", 10)),
             Step::Send(1, fetch(0, "no-slash", 10)),
             Step::Send(1, fetch(0, "/f/f/pub/*/s-a/>", 100)),
-            // LAST: all, paged, a page that ends exactly at its max, an exact
-            // subject, the head query, a bad filter.
             Step::Send(1, last("/>", "", 100)),
             Step::Send(1, last("/f/f/>", "", 2)),
             Step::Send(1, last("/f/f/>", PRES_A, 2)),
@@ -1019,7 +881,6 @@ pub(crate) mod scripts {
             Step::Send(1, last("/>", "", 0)),
             Step::Send(1, last("bad", "", 10)),
             Step::Send(1, last("/f/f/pub/*/*/presence", "/a", 10)),
-            // THE WIRE-ONLY VERBS: a Mark at the head each.
             Step::Send(1, Request::Keepalive),
             Step::Send(1, Request::IdleMarks),
             Step::Send(
@@ -1040,16 +901,13 @@ pub(crate) mod scripts {
         s
     }
 
-    /// `/a/retire`: absent, charged to this producer, to another, at a seq
-    /// other than 0, a reserved or malformed target, and while a will targets
-    /// the subject; and the budget it gives back, across a restart.
+    /// `/a/retire`: absent, charged to this producer, to another, at a seq other than 0, a reserved or malformed target, and while a will targets the subject.
     pub(crate) fn retiring() -> Vec<Step> {
         let mut s = vec![
             Step::Dial(1),
             Step::Send(1, Request::Hello),
             Step::Send(1, publish(P, seq(1, 1), PRES_A, "live")),
             Step::Send(1, publish(Q, seq(1, 1), PRES_B, "live")),
-            // An update by P leaves PRES_B charged to Q.
             Step::Send(1, publish(P, seq(1, 2), PRES_B, "live")),
             Step::Send(1, budget(P)),
             Step::Send(1, budget(Q)),
@@ -1062,24 +920,19 @@ pub(crate) mod scripts {
             Step::Send(1, retire(P, "/a")),
             Step::Send(1, retire(P, "no-slash")),
             Step::Send(1, retire(P, "/f/f/*")),
-            // Any sequence names a retire, not only a client's 0.
             Step::Send(1, retire_at(Q, 9, PRES_B)),
             Step::Send(1, budget(P)),
             Step::Send(1, budget(Q)),
-            // RE-INTRODUCED by Q: charged to Q now.
             Step::Send(1, publish(Q, seq(1, 2), PRES_A, "back")),
             Step::Send(1, budget(P)),
             Step::Send(1, budget(Q)),
             Step::Send(1, retire(P, PRES_A)),
-            // A WILL TARGETS PRES_C: its retire is refused while the will can
-            // still append, and goes through once it fired.
             Step::Send(1, publish(P, seq(1, 3), PRES_C, "live")),
             Step::Dial(2),
             Step::Send(2, will(P, will_at(1), PRES_C, "gone")),
             Step::Send(1, retire(P, PRES_C)),
             Step::End(2),
             Step::Send(1, retire(P, PRES_C)),
-            // A will fenced by a later incarnation targets nothing.
             Step::Send(1, publish(P, seq(2, 1), LANE, "m")),
             Step::Dial(3),
             Step::Send(3, will(P, will_at(2), LANE, "gone")),
@@ -1099,10 +952,7 @@ pub(crate) mod scripts {
         s
     }
 
-    /// WILLS: registered with its subject reserved; refused for a second
-    /// producer on one connection, a reserved or malformed subject, the ack
-    /// half; fired on a dropped connection; fenced by a later incarnation;
-    /// not fenced by an ack; replaced on its connection; across a crash.
+    /// WILLS: registered with its subject reserved.
     pub(crate) fn wills() -> Vec<Step> {
         let mut s = vec![
             Step::Dial(1),
@@ -1115,29 +965,23 @@ pub(crate) mod scripts {
             Step::Send(1, will(P, will_at(1), "no-slash", "x")),
             Step::Send(1, will(P, ACK_SEQ_BASE | 1, NODE, "x")),
             Step::Send(1, budget(P)),
-            // NODE lands under P: the reservation is spent.
             Step::Send(1, publish(P, seq(1, 1), NODE, "live 1")),
             Step::Send(1, budget(P)),
             Step::End(1),
             Step::Dial(2),
             Step::Send(2, fetch(0, "/>", 100)),
-            // FENCED by a later incarnation's publish.
             Step::Send(2, will(P, will_at(2), NODE, "away 2")),
             Step::Dial(3),
             Step::Send(3, publish(P, seq(3, 1), NODE, "live 3")),
             Step::End(2),
             Step::Send(3, fetch(0, "/>", 100)),
-            // NOT FENCED by an ack, whatever its sequence.
             Step::Send(3, will(P, will_at(4), NODE, "away 4")),
             Step::Send(3, publish(P, ACK_SEQ_BASE | 77, LANE, "ack")),
             Step::End(3),
             Step::Dial(4),
             Step::Send(4, fetch(0, "/>", 100)),
-            // REPLACED on its connection: only the second fires.
             Step::Send(4, will(P, will_at(5), NODE, "first")),
             Step::Send(4, will(P, will_at(5), NODE, "second")),
-            // A will on a subject nothing indexed yet, by another producer,
-            // reserved until it fires.
             Step::Dial(5),
             Step::Send(5, will(Q, will_at(1), PRES_B, "q gone")),
             Step::Send(4, budget(Q)),
@@ -1145,13 +989,10 @@ pub(crate) mod scripts {
             Step::End(5),
             Step::Dial(6),
             Step::Send(6, budget(Q)),
-            // A WILL DEDUPED by its own key: said first, then nothing.
             Step::Send(6, will(P, will_at(6), NODE, "away 6")),
             Step::Dial(7),
             Step::Send(7, publish(P, will_at(6), NODE, "away 6")),
             Step::End(6),
-            // A REFUSED SUBSCRIBE ENDS ITS CONNECTION: the refusal is read,
-            // then the end, and the connection's will fires.
             Step::Dial(9),
             Step::Send(9, will(Q, will_at(3), PRES_B, "q again")),
             Step::Send(
@@ -1205,7 +1046,6 @@ pub(crate) mod scripts {
                     filter: INBOX.to_string(),
                 },
             ),
-            // From 2: m3 and m4 (the presence row is not the inbox's).
             Step::Deliver(2),
             Step::Deliver(2),
             Step::Send(1, publish(P, seq(1, 6), LANE, "m5")),
@@ -1239,8 +1079,6 @@ pub(crate) mod scripts {
                     filter: INBOX.to_string(),
                 },
             ),
-            // Resumes at 5, past the commit through 4 (the later one through 3
-            // folds below it): m5, at 9.
             Step::Deliver(5),
             Step::Stop(super::Stop::Crash),
             Step::Start,
@@ -1259,8 +1097,7 @@ pub(crate) mod scripts {
         s
     }
 
-    /// RESTARTS: a clean close, an unclean stop in the same boot, and a reopen
-    /// in a boot the open cannot name; the identity, lineage and log after each.
+    /// RESTARTS: a clean close, an unclean stop in the same boot, and a reopen in a boot the open cannot name.
     pub(crate) fn restarts() -> Vec<Step> {
         let mut s = vec![
             Step::Dial(1),
@@ -1297,8 +1134,7 @@ pub(crate) mod scripts {
     }
 }
 
-/// The scripts that need a long log: the subject budget and `Fetch`'s scan
-/// bound ([module docs](self#the-scripts)).
+/// The scripts that need a long log.
 pub(crate) mod long {
     use super::scripts::{budget, fetch, last, publish, retire, seq, will, will_at, NODE, P, Q};
     use super::{Request, Step};
@@ -1324,10 +1160,7 @@ pub(crate) mod long {
         steps
     }
 
-    /// THE SUBJECT BUDGET: a will's reservation counts against it; past it a
-    /// new subject is refused and an update is not; another producer may
-    /// introduce the subject; a will for a new subject is refused; the
-    /// reserved subject still lands; a retire gives a unit back.
+    /// THE SUBJECT BUDGET.
     pub(crate) fn budgets() -> Vec<Step> {
         let max = MAX_SUBJECTS_PER_PRODUCER as u64;
         let mut s = vec![
@@ -1362,8 +1195,7 @@ pub(crate) mod long {
         s
     }
 
-    /// `FETCH`'S SCAN BOUND: a sparse filter's page stops after
-    /// `FETCH_SCAN_MAX` records with nothing in it, and the cursor moves on.
+    /// `FETCH`'S SCAN BOUND.
     pub(crate) fn scan_bound() -> Vec<Step> {
         let n = FETCH_SCAN_MAX as u64 + 5;
         let lane = super::scripts::LANE;
@@ -1383,10 +1215,6 @@ pub(crate) mod long {
 }
 
 /// THE WORLDS whose journals are replayed: one per tier, and each with the
-/// mirror off and on ([`super::world::Opts::seed`]'s alternation), on one
-/// device that never loses power, a broker that answers every ack at once,
-/// and a disk that never fails: what a restart may lose and when an ack is
-/// read are the law check's and the held-ack worlds' (module docs).
 fn journalled(seed: u64, tier: Tier) -> super::world::Outcome {
     let opts = super::world::Opts {
         tier: Some(tier),
@@ -1401,7 +1229,6 @@ fn journalled(seed: u64, tier: Tier) -> super::world::Outcome {
 }
 
 /// **THE MODEL ANSWERS EVERY SCRIPT AS ASTREAM'S BROKER DOES**, on every
-/// tier: each verb the bridge sends and each edge astream defines for it.
 #[test]
 fn the_model_answers_every_script_as_astreams_broker_does() {
     let mut failed = Vec::new();
@@ -1427,8 +1254,6 @@ fn the_model_answers_every_script_as_astreams_broker_does() {
 }
 
 /// **THE MODEL HOLDS ASTREAM'S SUBJECT BUDGET AND FETCH SCAN BOUND**, on a
-/// log long enough to reach each (Relaxed: the bounds are the same on every
-/// tier, and a Strict flush per batch would only cost time).
 #[test]
 fn the_model_holds_astreams_subject_budget_and_fetch_scan_bound() {
     let mut failed = Vec::new();
@@ -1448,7 +1273,6 @@ fn the_model_holds_astreams_subject_budget_and_fetch_scan_bound() {
 }
 
 /// **WHAT REAL BRIDGES SENT, ASTREAM ANSWERS AS THE MODEL DID**: the door's
-/// journal of seeded worlds, replayed on both arms.
 #[test]
 fn what_real_bridges_sent_astream_answers_as_the_model_did() {
     let mut failed = Vec::new();
@@ -1486,9 +1310,6 @@ fn what_real_bridges_sent_astream_answers_as_the_model_did() {
 }
 
 /// **NEGATIVE CONTROL: A MODEL THAT FORGETS ITS DEDUP OR ITS WILL FENCE, OR
-/// CHANGES A BINARY PAYLOAD, IS CAUGHT** by the scripts that hold it
-/// ([`ArmMutant::FreshDedup`], [`ArmMutant::NoWillFence`],
-/// [`ArmMutant::AlterPayload`]), and by the journal of a world.
 #[test]
 fn a_model_that_forgets_its_dedup_or_its_will_fence_is_caught() {
     for (mutant, script, what) in [

@@ -2,21 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-// ─── The loader and the body ───
-//
-// `include!`d into lib.rs's `#[cfg(test)] mod tests` after tests.rs, whose
-// helpers (`LiveShell`, `LiveFixture`, `shell_command`, the re-key probes
-// and `deliver`) it uses.
-
 /// A folder address this suite's builds never write: the newer build the live tests point
-/// a running shell at.
 #[cfg(unix)]
 const NEWER_REV: &str = "0123456789abcdef";
 
 /// The script folder carries each body beside its loader, as the loader's own
-/// text under a header — so the body a running shell takes from a folder is the
-/// body a new shell of that build runs — and a body is part of what the
-/// folder's address names.
 #[test]
 fn the_script_set_carries_each_body_beside_its_loader() {
     let dir = aterm_tempfile::tempdir().unwrap();
@@ -46,8 +36,6 @@ fn the_script_set_carries_each_body_beside_its_loader() {
 }
 
 /// What a real `shell` reads `script` as: its canonical text, the script read as
-/// the body of one function (`functions` in zsh, `declare -f` in bash), which
-/// keeps every word and every string and drops every comment.
 #[cfg(unix)]
 fn canonical_text(shell: &str, script: &str) -> String {
     let dir = aterm_tempfile::tempdir().unwrap();
@@ -78,13 +66,6 @@ fn canonical_text(shell: &str, script: &str) -> String {
 }
 
 /// A script folder holds the zsh and bash loaders, and so their bodies, without
-/// their comment lines (`strip_comment_lines`): the shell reads every line it
-/// sources, and two thirds of these are comment. That is safe only while no
-/// comment line sits where the shell reads it as text, and the shells say so
-/// themselves: each reads its script with and without the comment lines to the
-/// same canonical text. The control is a `#` line inside a string that spans
-/// lines, which the same reading tells apart — so a script that ever puts one
-/// there fails here, before a folder ships it.
 #[cfg(unix)]
 #[test]
 fn installed_scripts_run_the_code_of_their_source() {
@@ -123,11 +104,6 @@ fn installed_scripts_run_the_code_of_their_source() {
 }
 
 /// A folder's zsh loader and body, compiled (`compile_zsh_scripts`), are what a
-/// zsh then sources: the wordcode beside each script, in place of its text. The
-/// control is the same folder before the compile, where the text runs. The text
-/// of the body is replaced by a probe, older than the wordcode, so which of the
-/// two ran shows; the loader's wordcode is checked to be there. A second
-/// compile keeps what the first made.
 #[cfg(unix)]
 #[test]
 fn a_compiled_zsh_set_is_sourced_from_its_wordcode() {
@@ -158,7 +134,6 @@ fn a_compiled_zsh_set_is_sourced_from_its_wordcode() {
             .set_modified(old)
             .unwrap();
     };
-    // Control: nothing compiled, so the text is what runs.
     let control = aterm_tempfile::tempdir().unwrap();
     ensure_scripts(control.path()).unwrap();
     let control_body = control.path().join(format!("{BODY_FILE_STEM}.zsh"));
@@ -183,8 +158,6 @@ fn a_compiled_zsh_set_is_sourced_from_its_wordcode() {
 }
 
 /// A real zsh sources the body alone without an error, from inside a function under
-/// `emulate -L zsh` (as the check sources it) and at top level, and the body defines what
-/// the loader's trampoline and wiring name.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_real_zsh_sources_the_body_alone_cleanly() {
@@ -222,8 +195,6 @@ fn a_real_zsh_sources_the_body_alone_cleanly() {
 }
 
 /// Sourcing the live body (in zsh, bash, and fish, as `__aterm_body_check` does
-/// on an adopted shell's next prompt) exports `AGY_CLI_FAST_PROMPT_EDITOR=true`
-/// to child processes when unset, while preserving an explicit user override.
 #[cfg(unix)]
 #[test]
 fn live_body_exports_agy_fast_prompt_editor_default_without_clobbering_override() {
@@ -291,8 +262,6 @@ fn live_body_exports_agy_fast_prompt_editor_default_without_clobbering_override(
 }
 
 /// The body of this build under a cache root, plus a newer build's folder whose body is
-/// this build's with one probe function spliced in: what a running shell finds under its
-/// root after an update.
 #[cfg(unix)]
 struct BodyFixture {
     fx: LiveFixture,
@@ -339,8 +308,6 @@ impl BodyFixture {
 }
 
 /// An interactive zsh started as a tab is, from the scripts in `dir` (the
-/// ZDOTDIR wrapper there sources the loader there), with an empty `.zshrc`.
-/// Its callers are the macOS-only zsh rows (macOS ships `/bin/zsh`).
 #[cfg(target_os = "macos")]
 fn spawn_live_zsh_from(
     zsh: &str,
@@ -367,7 +334,6 @@ fn spawn_live_zsh_from(
 }
 
 /// An interactive bash started as a tab is, on the `--rcfile` wrapper in `dir`
-/// (which sources the loader there), reading the fixture home's `.bashrc`.
 #[cfg(unix)]
 fn spawn_live_bash_from(fx: &LiveFixture, dir: &Path, extra: &[(&str, &str)]) -> LiveShell {
     let InjectionEnv {
@@ -392,18 +358,14 @@ fn spawn_live_bash_from(fx: &LiveFixture, dir: &Path, extra: &[(&str, &str)]) ->
 }
 
 /// The probe function the newer body carries (POSIX function syntax, so the same text
-/// serves zsh and bash).
 #[cfg(unix)]
 const BODY_PROBE_FN: &str = "__aterm_body_probe() { printf '%s\\n' PROBE-NEWER; }";
 
 /// [`BODY_PROBE_FN`] in fish. It reads `$__aterm_last_status` with `test`, as earlier bodies'
-/// custom prompts do, so it fails if this body leaves that a list (which stops an older body
-/// a shell is pointed back to with a `test` error).
 #[cfg(unix)]
 const BODY_PROBE_FN_FISH: &str = "function __aterm_body_probe; test $__aterm_last_status -ge 0; and printf '%s\\n' PROBE-NEWER; end";
 
 /// A command that prints `RAN<n>` in `label`'s own arithmetic, so the echoed
-/// command line never carries the marker.
 #[cfg(unix)]
 fn ran(label: &str, n: u32) -> String {
     if label == "fish" {
@@ -414,13 +376,9 @@ fn ran(label: &str, n: u32) -> String {
 }
 
 /// The line that prints the running body's revision, whether the newer body's
-/// probe exists, the prompt hooks and PATH, then a marker whose number is
-/// computed (so the echoed command line never matches it).
 #[cfg(unix)]
 fn body_probe(label: &str, n: u32) -> (String, String) {
     if label == "fish" {
-        // fish's hooks are its event handlers: a re-sourced body must not register one
-        // twice. Sorted, since fish lists an event's handlers in definition order.
         return (
             format!(
                 "printf 'REV=%s\\n' \"$__aterm_body_rev\"; functions -q __aterm_body_probe; \
@@ -458,8 +416,6 @@ fn stdout_between(sh: &LiveShell, from: usize, to: usize) -> String {
 }
 
 /// The prompt strings in `text` a shell signed with `key`, each from a signed
-/// 133;A to the signed 133;B after it — or None when its signed marks do not
-/// alternate A, B (a mark written twice, or one missing).
 #[cfg(unix)]
 fn signed_prompts(text: &str, key: &str) -> Option<Vec<String>> {
     let (a, b) = (format!("133;A;id={key}"), format!("133;B;id={key}"));
@@ -480,13 +436,6 @@ fn signed_prompts(text: &str, key: &str) -> Option<Vec<String>> {
 }
 
 /// Drive one live shell through the body pointer: spawned from this build's folder, it
-/// signs this build's revision; a malformed pointer and one naming a missing folder are
-/// consumed and change nothing; a pointer naming the newer folder, written while the shell
-/// idles, is taken at its next prompt (the newer body's probe exists, it signs the newer
-/// revision, the command that ran across the switch still gets its 133;D, and the marks
-/// keep flowing with the same key), while PATH and the prompt hooks stay as they were.
-/// `hooked` = spawned with the pointer path; the negative control, without it, never reads
-/// the file.
 #[cfg(unix)]
 fn live_body_pickup(label: &str, sh: &mut LiveShell, bf: &BodyFixture, hooked: bool) {
     let ours = bf.ours_rev();
@@ -508,7 +457,6 @@ fn live_body_pickup(label: &str, sh: &mut LiveShell, bf: &BodyFixture, hooked: b
         sh.transcript()
     );
 
-    // Malformed, and a folder that is not there: consumed, nothing changes.
     let mut at = at;
     for (n, bad) in [(2, "../../../etc/passwd"), (3, "fedcba9876543210")] {
         deliver(&bf.pointer, bad);
@@ -526,9 +474,6 @@ fn live_body_pickup(label: &str, sh: &mut LiveShell, bf: &BodyFixture, hooked: b
         let _ = std::fs::remove_file(&bf.pointer);
     }
 
-    // The newer build, pointed at while the shell idles: only once the last probe's prompt
-    // has emitted its 133;A (after that prompt's own body check), so that prompt cannot
-    // read the pointer before the command below runs.
     let at = sh.wait_for_after(&format!("133;A;id={REKEY_OLD}"), at);
     deliver(&bf.pointer, NEWER_REV);
     let from = at;
@@ -560,10 +505,6 @@ fn live_body_pickup(label: &str, sh: &mut LiveShell, bf: &BodyFixture, hooked: b
         path,
         "{label}: PATH unchanged"
     );
-    // The prompt that took the body: between the 133;C of the command that ran across the
-    // switch (from the old body) and the first revision the new body signs comes that
-    // command's 133;D (the body was re-sourced before the prompt handler ran, and the
-    // command's state survived it); then the prompt start.
     let switch = stdout_between(sh, from, at);
     let newer = format!("633;P;{INTEGRATION_REV_KEY}={NEWER_REV};id={REKEY_OLD}");
     let signed_at = switch
@@ -580,7 +521,6 @@ fn live_body_pickup(label: &str, sh: &mut LiveShell, bf: &BodyFixture, hooked: b
         switch[signed_at..].contains(&format!("133;A;id={REKEY_OLD}")),
         "{label}: then the prompt starts:\n{switch:?}"
     );
-    // And the marks keep flowing under the newer body.
     sh.send("true");
     let (line, marker) = body_probe(label, 5);
     sh.send(&line);
@@ -594,9 +534,6 @@ fn live_body_pickup(label: &str, sh: &mut LiveShell, bf: &BodyFixture, hooked: b
         assert!(after.contains(&mark), "{label}: {mark} after:\n{after:?}");
     }
     assert_eq!(sh.value_before("PROBE-", end), "NEWER", "{label}");
-    // The hooks are the ones it had, none twice. Read a prompt later: fish's body registers
-    // a one-shot fish_prompt handler (the first prompt's managed-PATH assert) that a
-    // re-sourced body registers again and the next prompt runs and erases.
     assert_eq!(
         sh.value_before("HOOKS=", end),
         hooks,
@@ -605,7 +542,6 @@ fn live_body_pickup(label: &str, sh: &mut LiveShell, bf: &BodyFixture, hooked: b
 }
 
 /// zsh ships with macOS (`/bin/zsh`), so there this is never skipped; elsewhere
-/// the zsh lane is not claimed.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_live_zsh_takes_a_newer_body_at_its_next_prompt() {
@@ -640,7 +576,6 @@ fn a_live_bash_takes_a_newer_body_at_its_next_prompt() {
 }
 
 /// The pre-loader scripts (fixtures): what a shell spawned before loaders existed runs,
-/// which no body pointer reaches.
 #[cfg(unix)]
 const PRELOADER_ZSH: &str = include_str!("fixtures/preloader-087a969af.zsh");
 #[cfg(unix)]
@@ -651,9 +586,6 @@ const PRELOADER_FISH: &str = include_str!("fixtures/preloader-087a969af.fish");
 const PRELOADER_PWSH: &str = include_str!("fixtures/preloader-087a969af.ps1");
 
 /// The scripts of 613305828c's parent (57daa3707e), the last that put
-/// `~/.aterm/bin` FIRST on PATH: LOADERS, as every build from 2026-09-26 to then
-/// wrote them, which take a newer body at a prompt and keep their own folder as
-/// `__aterm_si_dir`.
 #[cfg(unix)]
 const OLDER_LOADER_ZSH: &str = include_str!("fixtures/loader-57daa3707e.zsh");
 #[cfg(unix)]
@@ -662,9 +594,6 @@ const OLDER_LOADER_BASH: &str = include_str!("fixtures/loader-57daa3707e.bash");
 const OLDER_LOADER_FISH: &str = include_str!("fixtures/loader-57daa3707e.fish");
 
 /// The block those loaders put `~/.aterm/bin` first with, as zsh and bash spell
-/// it and as fish does. 613305828c's loaders are theirs without it, byte for
-/// byte in code: the first of the builds that put none there and set no mark
-/// (v0.106.0 among them).
 #[cfg(unix)]
 const OLDER_PREPEND_POSIX: &str = "if (( __aterm_fresh_load )) && [ -d \"$HOME/.aterm/bin\" ]; then
     export PATH=\"$HOME/.aterm/bin:$PATH\"
@@ -678,19 +607,12 @@ end
 ";
 
 /// The folder addresses the older loaders are laid at, beside this build's
-/// under one cache root: 57daa3707e's, which prepends, and 613305828c's, which
-/// does not.
 #[cfg(unix)]
 const PREPENDING_REV: &str = "57daa3707e000000";
 #[cfg(unix)]
 const UNPREPENDING_REV: &str = "613305828c000000";
 
 /// An older LOADER's folder under `fx`'s root, as its build laid it out: the
-/// zsh and bash loaders without their comment lines, fish's whole, fish's again
-/// in its vendor conf.d, and the wrappers (this build's, at the paths this build
-/// starts the shells from, as [`preloader_folder`] lays them). `prepends`: the
-/// 57daa3707e loaders; otherwise the same minus their prepend block
-/// (613305828c's).
 #[cfg(unix)]
 fn older_loader_folder(fx: &LiveFixture, prepends: bool) -> PathBuf {
     let dir = fx.base.join(if prepends {
@@ -735,7 +657,6 @@ fn older_loader_folder(fx: &LiveFixture, prepends: bool) -> PathBuf {
 }
 
 /// A folder holding the pre-loader scripts as a build of that time laid them out: the
-/// scripts and their wrappers, and no body.
 #[cfg(unix)]
 fn preloader_folder(fx: &LiveFixture) -> PathBuf {
     let old = fx.base.join("preloader");
@@ -744,8 +665,6 @@ fn preloader_folder(fx: &LiveFixture) -> PathBuf {
     std::fs::write(old.join("aterm_shell_integration.zsh"), PRELOADER_ZSH).unwrap();
     std::fs::write(old.join("aterm_shell_integration.bash"), PRELOADER_BASH).unwrap();
     std::fs::write(old.join("zdotdir/.zshenv"), ZSH_WRAPPER).unwrap();
-    // The wrapper a build of that day started bash on, at the path this build
-    // starts bash from (`bash/bashrc` off macOS).
     for loader in ["rcfile", BASH_LOADER_FILE] {
         std::fs::write(old.join("bash").join(loader), BASH_WRAPPER).unwrap();
     }
@@ -757,19 +676,14 @@ fn preloader_folder(fx: &LiveFixture) -> PathBuf {
 }
 
 /// The start the body's AN OLDER SCRIPT'S `~/.aterm/bin` block takes a shell's
-/// against: 2026-10-16 00:00 UTC, before which every script prepended. The
-/// shells below start ten seconds either side of it, so a cut moved further
-/// either way fails a case.
 #[cfg(unix)]
 const CUT: u64 = 1_792_108_800;
 
 /// The clock the stand-ins below read: 2026-10-20 00:00 UTC, four days after
-/// [`CUT`].
 #[cfg(unix)]
 const STAND_IN_NOW: u64 = CUT + 4 * 86_400;
 
 /// A shell's age as the stand-in `ps -o etime=` reports it: four days less ten
-/// seconds, so started ten seconds after [`CUT`] ...
 #[cfg(unix)]
 const STARTED_SINCE: &str = "3-23:59:50";
 
@@ -778,20 +692,12 @@ const STARTED_SINCE: &str = "3-23:59:50";
 const STARTED_BEFORE: &str = "4-00:00:10";
 
 /// Lay the fixture's bin before the shell starts. The actual loader's external
-/// readers receive captured timestamps: the clock [`STAND_IN_NOW`], a shell
-/// started since the cut ([`STARTED_SINCE`]), the folder born and changed 100 s
-/// before [`CUT`], so before every shell here. No filesystem creation-time
-/// convention or aging wait is used.
 #[cfg(unix)]
 fn lay_aterm_bin(fx: &LiveFixture) -> String {
     lay_aterm_bin_with_dates(fx, CUT - 100, CUT - 100, STARTED_SINCE)
 }
 
 /// Owned stand-ins for the timestamp readings the real cleanup `sh -c` asks:
-/// the folder's `birth` and `modified` (`stat`), the clock (`date`,
-/// [`STAND_IN_NOW`]) and the shell's `age` (`ps -o etime=`). Other invocations
-/// still use the system tools. The old loader puts this bin first, so the same
-/// actual PATH cleanup consumes these captured readings.
 #[cfg(unix)]
 fn lay_aterm_bin_with_dates(fx: &LiveFixture, birth: u64, modified: u64, age: &str) -> String {
     let bin = fx.home.join(".aterm").join("bin");
@@ -820,8 +726,6 @@ fn lay_aterm_bin_with_dates(fx: &LiveFixture, birth: u64, modified: u64, age: &s
 }
 
 /// `path` with its first entry equal to `entry` taken off and nothing else
-/// moved — what an older script's `~/.aterm/bin` leaves when it goes; `path`
-/// itself when no entry is. Entries are split on the platform's PATH separator.
 #[cfg(any(unix, windows))]
 fn without_first(path: &str, entry: &str) -> String {
     let sep = if cfg!(windows) { ";" } else { ":" };
@@ -833,20 +737,6 @@ fn without_first(path: &str, entry: &str) -> String {
 }
 
 /// A live shell from before loaders (spawned from the pre-loader script, with its nonce)
-/// takes the typed upgrade. Before the line it signs no revision (the negative control).
-/// The window's one-use file holds a fresh key (healing a degraded tab whose key the engine
-/// lost; a healthy tab's file hands back the key it already signs with), this build's
-/// folder and its body pointer. After the line (whose command still runs) the file is gone,
-/// the shell signs this build's revision with the file's key, its prompt hooks are the ones
-/// it had, and a body pointer written later is taken at its next prompt like any loader
-/// shell's. A second line naming a missing file changes nothing, prints nothing, and the
-/// command after it runs.
-///
-/// And THE OLD `~/.aterm/bin` goes: the pre-loader script put that folder (the
-/// caller lays it, [`lay_aterm_bin`]) FIRST on PATH, and the user has added a
-/// copy of their own at the end; the upgrade takes off exactly the first and
-/// moves nothing else (before it, both are there: the negative control), and the
-/// newer body taken later takes off nothing more.
 #[cfg(unix)]
 fn live_typed_upgrade(label: &str, shell: ShellType, sh: &mut LiveShell, bf: &BodyFixture) {
     let aterm_bin = bf.fx.home.join(".aterm").join("bin");
@@ -888,8 +778,6 @@ fn live_typed_upgrade(label: &str, shell: ShellType, sh: &mut LiveShell, bf: &Bo
     .unwrap();
     let typed = typed_rekey_with_loader(shell, &posix_quoted(&file)).expect("scripted");
     let sent = at;
-    // Under the user's `set -x` the trace names the path, never the key. (fish traces
-    // through `fish_trace`; not asserted.)
     let (trace, untrace) = if matches!(shell, ShellType::Zsh | ShellType::Bash) {
         ("set -x; ", "set +x; ")
     } else {
@@ -898,23 +786,16 @@ fn live_typed_upgrade(label: &str, shell: ShellType, sh: &mut LiveShell, bf: &Bo
     sh.send(&format!("{trace}{typed} {untrace}{}", ran(label, 201)));
     let at = sh.wait_for_after("RAN201", at);
     if !trace.is_empty() {
-        // The trace's own last line, `set +x`, ends it on stderr.
         let pipe = std::sync::Arc::clone(&sh.stderr);
         sh.wait_on(&pipe, "the trace's `set +x`", |err| {
             find_bytes(err, b"set +x").map(|_| ())
         });
-        // bash writes its prompt, and the signed 133;B in it, on stderr too.
         assert!(
             !cut_osc(&sh.stderr_text()).contains(REKEY_NEW),
             "{label}: the key in the trace\n{}",
             sh.stderr_text()
         );
     }
-    // Signed at the upgrade, before the command the line carries runs: that command is the
-    // relaunched agent, which can hold the terminal for hours, and until the next prompt the
-    // window would read `integration_rev=frozen`. And signed with the file's key: the key
-    // the shell held is the one a degraded tab's engine lost, so a mark signed with it is
-    // dropped.
     let signed = format!(
         "633;P;{INTEGRATION_REV_KEY}={};id={REKEY_NEW}",
         bf.ours_rev()
@@ -939,8 +820,6 @@ fn live_typed_upgrade(label: &str, shell: ShellType, sh: &mut LiveShell, bf: &Bo
         upgraded,
         "{label}: the old script's ~/.aterm/bin off, the user's copy and the rest where they were"
     );
-    // The hooks it had, and in fish the loader's prompt-event check and the
-    // body's prompt give-back (defined after the command) beside them.
     assert_eq!(
         sh.value_before("HOOKS=", at)
             .replace(",fish_prompt __aterm_fish_prompt_event", "")
@@ -963,7 +842,6 @@ fn live_typed_upgrade(label: &str, shell: ShellType, sh: &mut LiveShell, bf: &Bo
         assert!(after.contains(&mark), "{label}: {mark} after:\n{after:?}");
     }
 
-    // The pointer it was handed works like any loader shell's.
     deliver(&bf.pointer, NEWER_REV);
     sh.send("true");
     let (line, marker) = body_probe(label, 4);
@@ -981,7 +859,6 @@ fn live_typed_upgrade(label: &str, shell: ShellType, sh: &mut LiveShell, bf: &Bo
         "{label}: once per shell: the newer body keeps the user's copy"
     );
 
-    // A withdrawn file: nothing changes, quietly, and the command runs.
     let gone = bf.fx.home.join("withdrawn");
     let typed = typed_rekey_with_loader(shell, &posix_quoted(&gone)).expect("scripted");
     let from = at;
@@ -991,7 +868,6 @@ fn live_typed_upgrade(label: &str, shell: ShellType, sh: &mut LiveShell, bf: &Bo
     sh.send(&line);
     let at = sh.wait_for_after(&marker, at);
     assert_eq!(sh.value_before("REV=", at), NEWER_REV, "{label}: unchanged");
-    // stderr for zsh and bash; fish runs on a pty, where it is the screen.
     let err = format!("{}{}", sh.stderr_text(), stdout_between(sh, from, at)).to_lowercase();
     for noise in ["no such file", "does not exist", "while redirecting"] {
         assert!(!err.contains(noise), "{label}: quiet: {err}");
@@ -1017,7 +893,6 @@ fn a_live_zsh_from_before_loaders_is_upgraded_by_the_typed_line() {
 }
 
 /// Under the user's `set -u` too: every variable the typed line reads is
-/// `-`-guarded, so the line cannot abort before the command it carries.
 #[cfg(unix)]
 #[test]
 fn a_live_bash_from_before_loaders_is_upgraded_by_the_typed_line() {
@@ -1031,8 +906,6 @@ fn a_live_bash_from_before_loaders_is_upgraded_by_the_typed_line() {
 }
 
 /// The key-only text an older sweep types reads the first line of the three-line file and
-/// nothing else (the window writes a healthy shell's current key there, so that text never
-/// takes an empty line for a key).
 #[cfg(unix)]
 #[test]
 fn the_key_only_line_takes_the_first_line_of_a_three_line_file() {
@@ -1060,13 +933,6 @@ fn the_key_only_line_takes_the_first_line_of_a_three_line_file() {
 }
 
 /// A nested shell is never integrated by the typed line, at its first line or any later
-/// one. A shell started from an integrated tab (a `bash` typed there, a `nix develop`)
-/// inherits the exported guard, so its own load stopped at the guard; when an agent it
-/// launched is relaunched, the harness types the upgrade line into it with the file issued
-/// for the tab's own shell. Upgrading it would wire hooks, re-front its PATH and sign
-/// `integration_rev=current` for a tab whose own shell is still frozen. The loader's proof
-/// that a shell is its own is a hook function its integration defined, which no child
-/// shell inherits and no typed line defines.
 #[cfg(unix)]
 fn nested_shell_is_left_alone(label: &str, shell: ShellType, sh: &mut LiveShell, bf: &BodyFixture) {
     let (line, marker) = body_probe(label, 1);
@@ -1160,45 +1026,17 @@ fn a_nested_bash_is_not_integrated_by_the_typed_line() {
 }
 
 /// THE OLD `~/.aterm/bin` IN POWERSHELL. Its integration has no loader and no
-/// body: the guard ends a second load, and nothing reaches a running pwsh but
-/// the file dot-sourced into it again (a profile re-run after an update), which
-/// takes the entry off before the guard where the pwsh proves an older script
-/// put it there. `run(snippet, nested)` runs `snippet` in one pwsh, with
-/// `$env:ATERM_TEST_OLD` naming the pre-loader script and
-/// `$env:ATERM_TEST_NEW` this one, and returns its stdout; `nested` = the guard
-/// and a PATH led by a copy of the folder inherited. The folder is made inside
-/// the pwsh. Captured metadata places it before or after that process without aging waits.
-/// Four pwsh:
-///
-/// - THIS build's first load, the folder there: PATH as it was; a copy the
-///   user then puts first stays through the file sourced again (no older
-///   script ran here: the negative control of the proof).
-/// - The pre-loader script, the folder there before: it put the folder first;
-///   with a copy of the user's own at the end, the file sourced again takes
-///   exactly the first off, and a third load nothing more.
-/// - The pre-loader script with no folder at its load (it put nothing there),
-///   the folder made after the process started and the user's copy at the end:
-///   the file sourced again keeps it.
-/// - A NESTED pwsh — the guard and PATH inherited, no variable of an older
-///   script's — keeps PATH as it found it.
-///
-/// The five processes share nothing (each its own home), so they start side by
-/// side and are read in this order: one after another they were five pwsh
-/// startups end to end, the longest wait in the crate's binary.
 #[cfg(any(unix, windows))]
 fn pwsh_takes_an_older_scripts_aterm_bin_off(
     label: &str,
     run: impl Fn(&str, bool) -> String + Sync,
 ) {
     let sep = if cfg!(windows) { ";" } else { ":" };
-    // Captured metadata in the existing owned child, not filesystem birthtime
-    // setters: the actual loader still reads its normal Get-Item boundary.
     let dates = "$__t_start = [System.Diagnostics.Process]::GetCurrentProcess().StartTime.ToUniversalTime(); \
                  function Get-Item { param([string]$LiteralPath, [switch]$Force, [string]$ErrorAction) \
                  if ($LiteralPath -eq $__t_bin) { \
                  [PSCustomObject]@{ CreationTimeUtc = $__t_born; LastWriteTimeUtc = $__t_mtime } \
                  } else { Microsoft.PowerShell.Management\\Get-Item -LiteralPath $LiteralPath -Force:$Force -ErrorAction $ErrorAction } }; ";
-    // The `B=` and `P<n>=` lines a run printed, in order.
     let lines = |stdout: &str| -> (String, Vec<String>) {
         let mut bin = String::new();
         let mut paths = Vec::new();
@@ -1357,8 +1195,6 @@ fn a_pwsh_takes_an_older_scripts_aterm_bin_off_when_sourced_again() {
 }
 
 /// [`pwsh_takes_an_older_scripts_aterm_bin_off`] where the script runs most:
-/// Windows PowerShell 5.1 and pwsh 7, `;` between PATH entries, each in a
-/// private home.
 #[cfg(windows)]
 #[test]
 fn a_powershell_takes_an_older_scripts_aterm_bin_off_when_sourced_again() {
@@ -1400,7 +1236,6 @@ fn a_powershell_takes_an_older_scripts_aterm_bin_off_when_sourced_again() {
 }
 
 /// The line `label`'s user types to put `~/.aterm/bin` on PATH: `first`, ahead
-/// of everything, or last.
 #[cfg(unix)]
 fn users_aterm_bin(label: &str, first: bool) -> &'static str {
     match (label == "fish", first) {
@@ -1412,7 +1247,6 @@ fn users_aterm_bin(label: &str, first: bool) -> &'static str {
 }
 
 /// Probe `sh` ([`body_probe`] number `n`, after offset `at`): the offset past
-/// it, and the revision and PATH it printed.
 #[cfg(unix)]
 fn probe_rev_path(label: &str, sh: &mut LiveShell, n: u32, at: usize) -> (usize, String, String) {
     let (line, marker) = body_probe(label, n);
@@ -1426,8 +1260,6 @@ fn probe_rev_path(label: &str, sh: &mut LiveShell, n: u32, at: usize) -> (usize,
 }
 
 /// Run `line` to its end, point `sh` at `rev`, and probe the body it took (a
-/// line sent after the pointer is written, so the prompt before the probe runs
-/// the body check): the offset past the probe and the PATH it printed.
 #[cfg(unix)]
 fn line_then_body(
     label: &str,
@@ -1446,39 +1278,6 @@ fn line_then_body(
 }
 
 /// AN OLDER LOADER'S `~/.aterm/bin`, in a live `label` shell, through both ways
-/// this build reaches a running loader shell, from the real loaders that put
-/// it there (57daa3707e) and from the same minus that block (613305828c, the
-/// first build that put none there and set no mark, as every build since up
-/// to this one). `spawn(bf, folder, spawned_by)` starts the shell on
-/// `folder`'s scripts with the session's body pointer and `spawned_by` in its
-/// environment. The shells, each in its own fixture, side by side, each started
-/// since the cut the scripts take a shell's start against unless it says
-/// otherwise:
-///
-/// 1. The prepending loader, the folder there before the shell started: it put
-///    the folder first, and the user adds a copy at the end. This build's
-///    body, taken at a prompt, takes exactly the first off, and a newer body
-///    after it nothing more.
-/// 2. The same loader with no folder at its load (it put nothing there), the
-///    folder made after the shell started and the user's copy first: the body
-///    keeps it — in a shell started before the cut too, whose start proves
-///    the loader prepended but not that the folder was there.
-/// 3. 613305828c's loader, the folder there before, the shell spawned by a
-///    terminal naming itself aterm 0.105.0 (a dev build of the hour after
-///    613305828c): a copy the user puts first stays through the body, since
-///    the loader is there and answers (the review's v0.106.0 shell).
-/// 4. The prepending loader, then this build's LOADER sourced over it in place
-///    (a re-source; the typed upgrade's way): it notes the older loader before
-///    it writes over `__aterm_si_dir`, and its body takes exactly the first
-///    off.
-/// 5. The prepending loader whose folder is then collected, and 6. the
-///    prepending loader with 613305828c's sourced over it in place: neither
-///    shell names a loader that holds the prepend any more
-///    ([`UNNAMED_LOADER_CASES`]). Started before the cut, the start alone
-///    proves an older script loaded it; started since, the version aterm
-///    named to the shell does when it is v0.105.0 or older. Then the body
-///    takes exactly the first off; otherwise it keeps the entry (the limit
-///    `aterm help update` states).
 #[cfg(unix)]
 fn live_older_loaders_aterm_bin(
     label: &str,
@@ -1519,8 +1318,6 @@ fn live_older_loaders_aterm_bin(
             !before.contains(".aterm/bin"),
             "{label}: no folder, no entry: {before:?}"
         );
-        // The directory is created after the old loader ran. Its positive birth
-        // is newer than the shell, although its preserved mtime is much older.
         let bin = lay_aterm_bin_with_dates(&bf.fx, STAND_IN_NOW - 5, CUT - 100, age);
         let user = users_aterm_bin(label, true);
         let (_, path) = line_then_body(label, &mut sh, &bf, (user, &ours_rev(&bf), 2), at);
@@ -1535,8 +1332,6 @@ fn live_older_loaders_aterm_bin(
     let unprepending = || {
         let bf = BodyFixture::new();
         let bin = lay_aterm_bin(&bf.fx);
-        // Spawned by a dev build of the hour after 613305828c that still read
-        // 0.105.0: its loader is there, and it answers.
         let mut sh = spawn(&bf, &older_loader_folder(&bf.fx, false), SPAWNED_BY_0_105);
         let (at, rev, before) = probe_rev_path(label, &mut sh, 1, 0);
         assert_eq!(rev, UNPREPENDING_REV, "{label}: 613305828c's loader runs");
@@ -1667,9 +1462,6 @@ fn live_older_loaders_aterm_bin(
 }
 
 /// Run `cases`, each on a thread named for it, and wait for every one: shells
-/// that share nothing start side by side instead of end to end. The first
-/// case to panic (each prints its own message as it fails, under its thread's
-/// name) is raised again here once all have ended.
 #[cfg(unix)]
 fn side_by_side<'a>(cases: Vec<(String, Box<dyn FnOnce() + Send + 'a>)>) {
     std::thread::scope(|scope| {
@@ -1699,7 +1491,6 @@ fn side_by_side<'a>(cases: Vec<(String, Box<dyn FnOnce() + Send + 'a>)>) {
 type SpawnedBy = &'static [(&'static str, &'static str)];
 
 /// Spawned by aterm v0.105.0, the last release whose every script prepended
-/// ...
 #[cfg(unix)]
 const SPAWNED_BY_0_105: SpawnedBy = &[
     ("TERM_PROGRAM", "aterm"),
@@ -1721,9 +1512,6 @@ const SPAWNED_BY_ANOTHER: SpawnedBy = &[
 ];
 
 /// The shells whose loader is gone or unnamed ([`live_older_loaders_aterm_bin`]
-/// 5 and 6): `(age, what spawned it, collected, the entry goes)`. Before the
-/// cut the start proves the prepend whatever named it; since, only aterm at
-/// v0.105.0 or older does.
 #[cfg(unix)]
 const UNNAMED_LOADER_CASES: [(&str, SpawnedBy, bool, bool); 8] = [
     (STARTED_BEFORE, &[], true, true),
@@ -1766,11 +1554,7 @@ fn a_live_bash_takes_an_older_loaders_aterm_bin_off_and_only_that() {
     });
 }
 
-// ─── fish: the lanes above, in fish ───
-
 /// An interactive fish started as a tab is — its conf.d on XDG_DATA_DIRS from
-/// the folder `dir` — on a pty (`spawn_live_fish` says why), with `extra` in
-/// its environment; `dir` = `None` is a fish with no integration of its own.
 #[cfg(unix)]
 fn spawn_live_fish_from(
     fish: &str,
@@ -1822,7 +1606,6 @@ fn spawn_live_fish_from(
 }
 
 /// The fish lanes need fish and a pty. Like every other live fish test in this
-/// crate, a host without them runs none of them and says so: COULD NOT RUN.
 #[cfg(unix)]
 fn live_fish() -> &'static str {
     let fish = need_fish();
@@ -1900,10 +1683,7 @@ fn a_live_fish_takes_an_older_loaders_aterm_bin_off_and_only_that() {
     });
 }
 
-// ─── A body re-sourced keeps the user's key bindings ───
-
 /// The line that binds Ctrl+Right to a widget of the user's choosing, and the probe that
-/// prints what it is bound to now, in `label`'s own syntax.
 #[cfg(unix)]
 fn user_binding(label: &str, n: u32) -> (&'static str, String, String) {
     if label == "fish" {
@@ -1922,14 +1702,8 @@ fn user_binding(label: &str, n: u32) -> (&'static str, String, String) {
 }
 
 /// A newer body taken at a prompt leaves the user's key bindings alone. The integration
-/// binds a handful of keys (Alt/Ctrl+arrows, Home/End, Delete, Shift+Up/Down) so their
-/// sequences never leak as text, once, at the shell's first load, which zsh (`.zshenv`) and
-/// fish (vendor conf.d) run before the user's own rc, so a binding of the user's wins. The
-/// binding is the loader's, on a fresh load only: a re-sourced body would take those keys
-/// back from the user in every live tab.
 #[cfg(unix)]
 fn live_pickup_keeps_user_bindings(label: &str, sh: &mut LiveShell, bf: &BodyFixture) {
-    // The fresh load binds the key itself (the loader's once-per-shell call).
     let (bind, probe, marker) = user_binding(label, 0);
     sh.send(&probe);
     let at = sh.wait_for_after(&marker, 0);
@@ -2002,17 +1776,7 @@ fn a_live_fish_keeps_the_users_key_bindings_across_a_newer_body() {
     sh.finish();
 }
 
-// ─── An upgrade in place leaves the zle-line-init chain alone ───
-
 /// A live zsh with ZLE (on a pty, from the pre-loader script in `old`), whose `.zshrc` hooks
-/// `zle-line-init` as modern plugins do (`add-zle-hook-widget`, which keeps aterm's widget
-/// first among its hooks), takes the typed upgrade, and each next prompt emits one 133;B.
-///
-/// The upgrade must not re-wire `zle-line-init`: aliasing the plugin's dispatcher (which
-/// calls aterm's widget) to `__aterm_orig_zle_line_init` and installing aterm's own widget
-/// that calls the alias is a loop (recursion-limit errors and hundreds of marks per
-/// prompt). A widget names its function, so the existing chain reaches the new body's
-/// `__aterm_zle_line_init` untouched; the wiring is a fresh load's only.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_live_zsh_with_a_line_init_hook_is_upgraded_without_a_widget_loop() {
@@ -2070,7 +1834,6 @@ fn a_live_zsh_with_a_line_init_hook_is_upgraded_without_a_widget_loop() {
     sh.send("printf 'REV=%s\\n' \"$__aterm_body_rev\"; echo NX$((20 + 2))");
     let at = sh.wait_for_after("NX22", at);
     assert_eq!(sh.value_before("REV=", at), bf.ours_rev(), "upgraded");
-    // One whole prompt cycle after the upgrade: its line-init, then a command.
     sh.send("echo NX$((30 + 3))");
     let end = sh.wait_for_after("NX33", at);
     let cycle = stdout_between(&sh, at, end);
@@ -2088,14 +1851,6 @@ fn a_live_zsh_with_a_line_init_hook_is_upgraded_without_a_widget_loop() {
 }
 
 /// A live fish from before loaders whose config.fish defines its own prompt keeps it
-/// through the typed upgrade. fish reads the vendor conf.d (aterm's wrapper) before
-/// config.fish, so a prompt the user defines there replaces aterm's wrapper for the
-/// shell's life; the upgrade replaces only a prompt that is aterm's own. This prompt keeps
-/// a copy of the one it replaced, as conda's hook and a venv's activate.fish do (here the
-/// pre-loader wrapper, which writes its own marks): the prompt drawn after the upgrade
-/// carries one signed 133;A and one signed 133;B, and the copy reads the status the user's
-/// wrapper put back before calling it (`$status` and a `$pipestatus` of its own), not the
-/// command's.
 #[cfg(unix)]
 #[test]
 fn a_live_fish_keeps_the_users_own_prompt_through_the_typed_upgrade() {
@@ -2146,9 +1901,6 @@ fn a_live_fish_keeps_the_users_own_prompt_through_the_typed_upgrade() {
     sh.send("false");
     sh.send("echo DONE(math 600 + 1)");
     let end = sh.wait_for_after("DONE601", at);
-    // fish under TERM=dumb draws the prompt again, whole, as typed-ahead text
-    // arrives: every draw is the user's, between one signed 133;A and one 133;B,
-    // and the last, after `false`, reads what the wrapper put back.
     let drawn = signed_prompts(&stdout_between(&sh, at, end), REKEY_OLD);
     assert!(
         drawn.as_ref().is_some_and(|p| {
@@ -2164,11 +1916,6 @@ fn a_live_fish_keeps_the_users_own_prompt_through_the_typed_upgrade() {
 }
 
 /// A live fish whose config.fish defines its own prompt, piped to `source` as
-/// `starship init fish | source` does, takes a newer body at its next prompt and signs the
-/// revision it then runs. Such a prompt replaces the loader's trampoline, and with it the
-/// trampoline's body check, so the check rides the `fish_prompt` event, which fish emits
-/// before every prompt whoever draws it; the prompt drawn is still the user's, reading the
-/// previous command's status.
 #[cfg(unix)]
 #[test]
 fn a_live_fish_with_its_own_prompt_takes_a_newer_body() {
@@ -2223,14 +1970,7 @@ fn a_live_fish_with_its_own_prompt_takes_a_newer_body() {
     sh.finish();
 }
 
-// ─── The user's prompt: handed what fish hands it, and kept wrapped ───
-
 /// A live fish's prompt that the integration wraps (one in functions/, wrapped at load, as
-/// fish's own default prompt is) reads the previous command's `$status` and `$pipestatus`
-/// exactly as fish hands them to an unwrapped prompt, after `not` too (which inverts the
-/// status and leaves `$pipestatus`). And draws a Ctrl-C cancels, four in a row with no
-/// command between them (this prompt cancels itself, as a job killed by SIGINT cancels
-/// fish's whole evaluation), leave the next prompt the user's, and marked.
 #[cfg(unix)]
 #[test]
 fn a_live_fish_wrapped_prompt_reads_the_commands_status() {
@@ -2267,8 +2007,6 @@ fn a_live_fish_wrapped_prompt_reads_the_commands_status() {
             sh.transcript()
         );
     }
-    // The prompt after `set` is cancelled, and each Enter draws it again: three
-    // more cancelled, then the one the `echo` is typed at.
     sh.send("set -g MYCANCEL 1 2 3 4");
     for _ in 0..4 {
         sh.send("");
@@ -2292,9 +2030,6 @@ fn a_live_fish_wrapped_prompt_reads_the_commands_status() {
 }
 
 /// A live fish that draws aterm's own prompt (`ATERM_PROMPT_STYLE`) still gives the user's
-/// prompt back for a command, so `funcsave fish_prompt` writes the user's prompt, not the
-/// loader's trampoline (which a fish without aterm would answer with
-/// `Unknown command: __aterm_body_check` at every prompt).
 #[cfg(unix)]
 #[test]
 fn a_live_fish_with_a_prompt_style_gives_the_users_prompt_back() {
@@ -2342,20 +2077,6 @@ fn a_live_fish_with_a_prompt_style_gives_the_users_prompt_back() {
 }
 
 /// A live fish whose config.fish defines its own prompt keeps the prompt marks: every
-/// prompt, the first too, is a signed 133;A, the user's prompt (reading the previous
-/// command's status), a signed 133;B. fish reads the vendor conf.d before config.fish, so
-/// such a prompt (`starship init fish | source`) replaces the trampoline for the shell's
-/// life. Also pinned:
-/// - a prompt that keeps a copy of the trampoline and calls it only sometimes never reaches
-///   itself again through that copy, and the copy draws its marks once (the signed marks of
-///   every prompt string alternate A, B), also where fish words its stack trace (which
-///   tells the copy from the wrapper) in German;
-/// - a prompt written through `string` (fish-async-prompt's, tide's) is drawn on one line
-///   with its marks;
-/// - a command sees the user's own `fish_prompt`, the one config.fish defined, which
-///   `funced` edits in place;
-/// - the prompt is handed what fish hands it: fish 4.1's transient prompt draws it once
-///   more as a command starts, with `--final-rendering`.
 #[cfg(unix)]
 #[test]
 fn a_live_fish_with_its_own_prompt_keeps_its_prompt_marks() {
@@ -2377,7 +2098,6 @@ fn a_live_fish_with_its_own_prompt_keeps_its_prompt_marks() {
          else\n__my_prev_prompt\nend\nend\n",
     )
     .expect("config.fish");
-    // The editor `funced` runs below: it renames the prompt in the file it is given.
     let editor = fx.home.join("edit-prompt");
     aterm_tempfile::stand_in(
         &editor,
@@ -2415,8 +2135,6 @@ fn a_live_fish_with_its_own_prompt_keeps_its_prompt_marks() {
         at = sh.wait_for_after(&format!("PM{}", 701 + n), at);
         let text = stdout_between(&sh, from, at);
         let drawn = signed_prompts(&text, REKEY_OLD);
-        // The last prompt string is the one drawn after `cmd`; the first row's
-        // first is the shell's first prompt, drawn before any command started.
         let first_drawn = text.find(&a).is_some_and(|i| {
             text.find(&format!("133;C;id={REKEY_OLD}"))
                 .is_some_and(|c| i < c)
@@ -2432,8 +2150,6 @@ fn a_live_fish_with_its_own_prompt_keeps_its_prompt_marks() {
             sh.transcript()
         );
     }
-    // A command runs with the user's own prompt: what `funcsave fish_prompt`
-    // writes is theirs, never a trampoline every later shell would draw.
     sh.send(
         "functions fish_prompt | string match -q '*MINI*'; and echo SEEN=own; or echo SEEN=other; \
          echo FV=$FISH_VERSION; echo PM(math 800 + 1)",
@@ -2447,9 +2163,6 @@ fn a_live_fish_with_its_own_prompt_keeps_its_prompt_marks() {
     );
     let version = sh.value_before("FV=", at);
     let v: Vec<u32> = version.split('.').map(|n| n.parse().unwrap_or(0)).collect();
-    // ... the one config.fish defined, so `funced` edits config.fish in place, as in a
-    // fish without aterm (fish 4's funced writes functions/fish_prompt.fish for a prompt
-    // whose copy names another file). fish 3 drops the file from every copy: fish 4 only.
     let mut at = at;
     if v.first().copied() >= Some(4) {
         sh.send("funced -s fish_prompt; echo PM(math 850 + 1)");
@@ -2465,8 +2178,6 @@ fn a_live_fish_with_its_own_prompt_keeps_its_prompt_marks() {
             "fish {version} copies a function without its file (3.x): the funced row did not run"
         );
     }
-    // The transient prompt (fish 4.1): the prompt drawn last as `true` starts is
-    // the user's `--final-rendering` one.
     sh.send("set -g fish_transient_prompt 1; echo PM(math 900 + 1)");
     let at = sh.wait_for_after("PM901", at);
     if (v.first().copied(), v.get(1).copied()) >= (Some(4), Some(1)) {

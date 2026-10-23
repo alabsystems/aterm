@@ -619,7 +619,7 @@ impl CharacterSetState {
 
     /// Clear single shift after a character is printed.
     #[inline]
-    pub fn clear_single_shift(&mut self) {
+    pub const fn clear_single_shift(&mut self) {
         self.single_shift = SingleShift::None;
     }
 
@@ -720,7 +720,7 @@ impl CharacterSetState {
     /// Designate a character set to a G-set, clearing that G-set's 96-character override
     /// (94- and 96-character designations are mutually exclusive).
     #[inline]
-    pub fn designate(&mut self, g_set: u8, charset: CharacterSet) {
+    pub const fn designate(&mut self, g_set: u8, charset: CharacterSet) {
         match g_set {
             0 => self.g0 = charset,
             1 => {
@@ -741,7 +741,7 @@ impl CharacterSetState {
 
     /// Designate a 96-character set to G1-G3; G0 cannot hold one (ISO 2022).
     #[inline]
-    pub fn designate_96(&mut self, g_set: u8, charset: CharacterSet96) {
+    pub const fn designate_96(&mut self, g_set: u8, charset: CharacterSet96) {
         match g_set {
             0 => {} // G0 cannot hold 96-char sets
             1 => self.g1_96 = Some(charset),
@@ -753,7 +753,7 @@ impl CharacterSetState {
 
     /// Reset to default state.
     #[inline]
-    pub fn reset(&mut self) {
+    pub const fn reset(&mut self) {
         *self = Self::new();
     }
 }

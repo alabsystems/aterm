@@ -1,33 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! CODEX-ALAB, the I/O half ([`super::super::codex_alab`] is the pure half): what aterm
-//! does for a codex-alab beside its watch-only worker (the native harness contract
-//! `~/codex-alab/alab/CONTRACT.md`, §4). A codex-alab supervises itself: it continues,
-//! approves, answers and upgrades on its own (§5), so nothing here types into it, reads
-//! its screen or decides a move. What is left is aterm's from outside:
-//!
-//! 1. **The crash rule's relaunch** ([`self_claimed_after_exit`]): a proven self-claimed
-//!    codex-alab that crashed comes back on the line aterm's own copy of its session record
-//!    validated while it ran ([`super::super::self_claimed`]): the shell back at its marked
-//!    prompt leading the foreground group, no live writer lock on the thread's rollout, the
-//!    line typed once per witness, the new TUI found leading the tab, and the harness's hand
-//!    held to its first idle (its launch probe reads it there). No exit hint is read
-//!    off the screen (the copy named the thread) and no continuation is typed after it:
-//!    codex-alab's own carry-on continues a thread its crash relaunch resumed (§5).
-//! 2. **The relaunch left in flight** ([`carry_in_flight`]): an exit whose line waited, or
-//!    a relaunched TUI not yet found, carried on by the next step.
-//! 3. **The run, read while it runs** ([`snapshot`]): its home, its thread (the writer lock
-//!    it holds, else its launch's `resume <id>`), its block, for the relaunch's snapshot and
-//!    a restore layout's leaf.
-//! 4. **The prune** ([`prune`]) of the per-tab Codex records (`<state>/upgrade/codex-<tab>.json`)
-//!    nothing will visit again, Tier-1 bound to `HarnessUpgradeStateCollection`.
-//!
-//! [`sweep`] is the sweep's Codex pass: the prune, then each restart left in flight. A record
-//! the retired vendor Codex lane left in flight (no validated line, [`St::resume_argv`] empty)
-//! is closed, never carried: nothing moves a vendor Codex any more.
-//!
-//! Never a signal to a Codex process.
+//! CODEX-ALAB, the I/O half ([`super::super::codex_alab`] is the pure half).
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -44,13 +18,7 @@ use super::{
     said, save, squash, state_dir, table, type_relaunch_line_with, upgrade, wait_until,
 };
 
-// ---------------------------------------------------------------- the kernel
-
-/// The process facts the codex-alab path rests on, each read when asked: the
-/// Claude lane's [`Kernel`] plus a Codex process's argv, image, open files,
-/// working directory and lock holders, the shell's children and terminal, and
-/// the host's roster. A trait so a driver test can script a crashed codex-alab
-/// and the relaunch that appears on its line.
+/// The process facts the codex-alab path rests on, each read when asked.
 pub(super) trait AlabKernel: Kernel {
     /// Whether `pid` lives.
     fn alive(&self, pid: u32) -> bool;
@@ -61,7 +29,6 @@ pub(super) trait AlabKernel: Kernel {
     /// Every file `pid` holds open through a descriptor, `None` when unreadable.
     fn open_files(&self, pid: u32) -> Option<Vec<PathBuf>>;
     /// The conversation writer's kernel advisory lock, independently of other processes'
-    /// descriptor tables. Only `Dead` establishes that it is free.
     fn writer_owner(&self, file: &Path) -> aterm_uds::ownerlock::Owner;
     /// Whether `shell`'s group holds its terminal again (`pgid == tpgid`).
     fn shell_has_terminal(&self, shell: u32) -> bool;
@@ -70,19 +37,10 @@ pub(super) trait AlabKernel: Kernel {
     /// `pid`'s working directory.
     fn cwd(&self, pid: u32) -> Option<String>;
     /// Whether `pid` is still the foreground group of `tab` by the host's own
-    /// roster ([`process_in_tab`]): asked right before every typed act.
     fn in_tab(&self, c: &mut Client, pid: u32, tab: &str) -> bool;
     /// `pid`'s kernel start as the record reader spells it
-    /// ([`super::super::restart_stamp::kernel_start`]), `None` where it
-    /// cannot be read (off Apple a `ps` that failed: unknown, never an end):
-    /// the identity [`Self::first_frame`] reads under.
     fn birth(&self, pid: u32) -> Option<String>;
     /// THE RELAUNCHED CODEX-ALAB UP, as aterm reads it ([`hold_to_first_idle`]):
-    /// `tab`'s `status` names `pid` as its proven self-claim
-    /// ([`super::super::self_claimed::proven_pid`]), made only after its launch
-    /// probe read the tab, and that process, born `birth`, names its TUI's frame
-    /// in its own record read live ([`super::super::self_claimed::read_first_frame`]):
-    /// at rest (its first idle) or a turn under way. `None` until both stand.
     fn first_frame(
         &self,
         c: &mut Client,
@@ -152,17 +110,7 @@ impl AlabKernel for Live {
     }
 }
 
-// ---------------------------------------------------------------- the home and the thread
-
-/// The `$CODEX_HOME` a process started with `env` in the working directory
-/// `cwd` uses: `CODEX_HOME`, a relative one joined to `cwd` (Codex
-/// canonicalizes the variable against its own working directory as it
-/// starts, and the relaunch line carries it verbatim from that same
-/// directory), else `$HOME/.codex`, else `<home>/.codex`; canonical when it
-/// exists, matching `lsof`'s canonical paths. An empty `CODEX_HOME` is
-/// unset. `None`: a relative `CODEX_HOME` whose process's directory could
-/// not be read, which names no home aterm can place — never `$HOME/.codex`,
-/// which may hold another Codex's threads, locks and daemon.
+/// The `$CODEX_HOME` a process started with `env` in the working directory `cwd` uses.
 pub(super) fn home_of(
     env: &atpkg::caller_shell::ProcArgs,
     cwd: Option<&str>,
@@ -185,21 +133,17 @@ pub(super) fn canonical(p: &Path) -> PathBuf {
 }
 
 /// The Codex records' per-tab prefix ([`Agent::record_prefix`]), `codex-`:
-/// placed at compile time, which fails where Codex keys none.
 const PREFIX: &str = match Agent::Codex.record_prefix() {
     Some(prefix) => prefix,
     None => panic!("a Codex record is keyed by its tab"),
 };
 
-/// The state key of the Codex record in `tab` (`codex-<tab>`,
-/// [`Agent::record_key`]).
+/// The state key of the Codex record in `tab` (`codex-<tab>`, [`Agent::record_key`]).
 pub(super) fn key(tab: &str) -> String {
     format!("{PREFIX}{tab}")
 }
 
-/// The rollout of `thread` under `home`'s `sessions/<y>/<m>/<d>/`, when one
-/// exists; a thread without one has no user message, and `codex resume`
-/// refuses it.
+/// The rollout of `thread` under `home`'s `sessions/<y>/<m>/<d>/`, when one exists.
 pub(super) fn find_rollout(home: &Path, thread: &str) -> Option<PathBuf> {
     let dirs = |p: &Path| -> Vec<PathBuf> {
         std::fs::read_dir(p)
@@ -231,12 +175,7 @@ pub(super) fn find_rollout(home: &Path, thread: &str) -> Option<PathBuf> {
     None
 }
 
-/// The dialect of the shell `shell`, as its executable names it: the kernel's exec path, else
-/// its name in the process table `read_table` gives (read only then). `None` (unread, or a
-/// shell no relaunch line is written for: `sh`, tcsh, nushell…) is what a relaunch plan waits on
-/// for ever (`wait:shell-dialect`). The run's snapshots read it from the exec path alone,
-/// so the explicit restart is carried only where a plan would write its line
-/// ([`super::super::relaunch::carries_restart`]).
+/// The dialect of the shell `shell`, as its executable names it.
 pub(super) fn shell_dialect(
     shell: u32,
     k: &dyn AlabKernel,
@@ -256,13 +195,7 @@ pub(super) fn shell_dialect(
         .and_then(Dialect::from_exe_name)
 }
 
-// ---------------------------------------------------------------- the crash rule's relaunch
-
-/// THE LINE OF A PROVEN SELF-CLAIMED CODEX-ALAB ([`super::super::self_claimed`]): its own
-/// record's resume line as validated against the live process ([`St::resume_argv`]), typed on
-/// the program it names and under its captured `CODEX_HOME` ([`St::codex_home_env`]), with the
-/// `cd` and the integration heal the shell it finds needs — never a line this lane plans from
-/// its own flag table.
+/// THE LINE OF A PROVEN SELF-CLAIMED CODEX-ALAB ([`super::super::self_claimed`]).
 pub(super) fn self_claimed_plan(
     opts: &Opts,
     st: &St,
@@ -310,15 +243,7 @@ pub(super) fn self_claimed_plan(
     })
 }
 
-/// THE CRASH RULE'S RELAUNCH (the self-claim contract, §4; [`super::super::self_claimed`]): a
-/// proven self-claimed codex-alab that `snap` names crashed (the caller decided so from aterm's
-/// own copy of its record, after `relaunch::on_exit`), and `resume` is the line that copy
-/// validated while it ran. Relaunched once per witness — its `(pid, identity)` in aterm's own
-/// ledger ([`super::super::self_claimed::Witnesses`]) — through [`relaunch`]: the shell back at
-/// its marked prompt leading the foreground group, no live writer lock on the thread's rollout
-/// ([`type_relaunch_line_with`]'s `owner_clear`), the line typed, the new TUI found leading the
-/// tab, the hand held to its first idle ([`hold_to_first_idle`]), and nothing typed after it. A
-/// tab whose agent was its spawn command (no shell) is refused, said once by the caller.
+/// THE CRASH RULE'S RELAUNCH (the self-claim contract, §4; [`super::super::self_claimed`]).
 pub(super) fn self_claimed_after_exit(
     opts: &Opts,
     snap: &super::super::relaunch::Snapshot,
@@ -349,7 +274,6 @@ pub(super) fn self_claimed_after_exit(
         return said(r, "wait:not-exited");
     }
     let witnesses = super::super::self_claimed::Witnesses::under(&opts.state);
-    // A relaunch of this very exit already in flight is carried on, never typed twice.
     if let Some(mut st) = load(opts, &session).filter(St::in_flight) {
         if st.pid == snap.pid
             && st.resume_argv == resume.argv
@@ -369,8 +293,6 @@ pub(super) fn self_claimed_after_exit(
     if snap.shell == 0 || !k.alive(snap.shell) {
         return said(r, "refused:no-shell");
     }
-    // The rollout and writer lock belong to the captured canonical home;
-    // the raw optional environment is carried separately on the launch line.
     let home = run.home.clone();
     if find_rollout(&home, &resume.session).is_none() {
         return said(r, "refused:no-rollout");
@@ -388,7 +310,6 @@ pub(super) fn self_claimed_after_exit(
     let now = now_s();
     let mut st = St {
         agent: Agent::Codex,
-        // codex-alab holds its thread's writer lock itself: the relaunch waits for it to be free.
         thread: resume.session.clone(),
         codex_home: home.to_string_lossy().into_owned(),
         codex_home_env: resume.codex_home.clone(),
@@ -428,17 +349,13 @@ pub(super) fn self_claimed_after_exit(
     r
 }
 
-/// How long a TUI told to go (a typed `/exit`, or a crash still being reaped) may take to be
-/// gone before the relaunch waits for a later step (an embedded session shuts its runtime down
-/// first).
+/// How long a TUI told to go (a typed `/exit`, or a crash still being reaped) may take to be gone before the relaunch waits for a later step (an embedded session shuts its runtime down first).
 pub(super) const EXIT_WAIT: Duration = Duration::from_secs(30);
 
-/// How long a relaunched TUI may take to lead its tab's foreground group before the relaunch
-/// waits for a later step ([`await_held`]; the Codex lane's `adopt` waits as long).
+/// How long a relaunched TUI may take to lead its tab's foreground group before the relaunch waits for a later step ([`await_held`]; the Codex lane's `adopt` waits as long).
 pub(super) const ADOPT_WAIT: Duration = Duration::from_secs(30);
 
 /// The relaunch of a crashed codex-alab: once the TUI is gone and the shell has its prompt
-/// back, type its record's line ([`relaunch_held`]) under the harness's hand on the tab.
 fn relaunch(opts: &Opts, r: Report, st: &mut St, c: &mut Client, k: &dyn AlabKernel) -> Report {
     let mut hand = Hand::take_or_none(c, &st.tab);
     let r = relaunch_held(opts, r, st, c, &mut hand, k);
@@ -449,11 +366,6 @@ fn relaunch(opts: &Opts, r: Report, st: &mut St, c: &mut Client, k: &dyn AlabKer
 }
 
 /// [`relaunch`] with the harness's `hand` on the tab ([`Hand`]) through every wait, the typed
-/// line, and until the new TUI leads the tab and reaches its first idle ([`await_held`],
-/// [`hold_to_first_idle`]). The thread is the record's
-/// ([`St::thread`], the copy's validated `sessionId`): nothing is read off the screen, so an
-/// exit hint naming another thread is no word here. Its rollout must exist and its writer lock
-/// be free (codex-alab holds it itself), checked again right before the line.
 fn relaunch_held(
     opts: &Opts,
     r: Report,
@@ -468,8 +380,6 @@ fn relaunch_held(
         return said(r, "wait:exiting");
     }
     hand.keep(c);
-    // Gone: whatever stops this relaunch from here has no process left to vet it by, and is
-    // the tab's record (`upgrade_status::Row::exited_at`).
     if st.exited_at == 0 {
         st.exited_at = now_s();
     }
@@ -478,7 +388,6 @@ fn relaunch_held(
         return said(r, "wait:shell-prompt");
     }
     hand.keep(c);
-    // The shell draws its prompt after it takes the terminal back.
     pause(Duration::from_millis(600));
     let tab = st.tab.clone();
     let home = PathBuf::from(&st.codex_home);
@@ -491,10 +400,6 @@ fn relaunch_held(
             "the conversation's rollout is gone",
         );
     }
-    // Codex's WriterLockCoordinator holds File::try_lock for the writer's lifetime.
-    // Probe that same lock rather than inspecting every same-uid process: an unrelated
-    // protected descriptor can make the census unknown while this lock is readable/free.
-    // A held lock or an unreadable/missing/nonregular file still grants no admission.
     let lock = home
         .join("thread-writer-locks")
         .join(format!("{}.lock", st.thread));
@@ -508,8 +413,6 @@ fn relaunch_held(
         Err(NoPlan::Wait(why)) => return said(r, format!("wait:{why}")),
         Err(NoPlan::Refused { why, detail, .. }) => return fail(opts, r, st, &why, &detail),
     };
-    // Recorded before the line is typed: a step that dies after typing it leaves the next one
-    // the line to recognise its relaunch by.
     st.line.clone_from(&line);
     save(opts, &key(&tab), st);
     match type_relaunch_line_with(
@@ -519,23 +422,16 @@ fn relaunch_held(
         &tab,
         &line,
         Some(dialect),
-        // When its end was asked — known only for a restart that asked it
-        // (`relaunch::end_asked_at`): a person's keys before it went to Codex;
-        // and whether a hand held the line (`relaunch::hand_held_since`).
         PromptLook::of(st),
         || lock_free(k),
         |c, pid, tab| k.in_tab(c, pid, tab),
     ) {
         Ok(()) => st.prompt = None,
         Err(RelaunchLineError::Wait(why)) => {
-            // Kept on the record: the stale bound that ends the relaunch names what held its
-            // line ([`expired`]).
             st.note_wait(why, now_s());
             return said(r, format!("wait:{why}"));
         }
         Err(RelaunchLineError::Hand) => {
-            // A hand the line waits on: its clock stops while it stands, as
-            // Claude Code's does (`relaunch::exit_clock`).
             let now = now_s();
             st.saw_hand(now);
             st.note_wait("held", now);
@@ -549,8 +445,6 @@ fn relaunch_held(
         }
     }
     st.relaunched(now_s());
-    // The line landed, whether this is the exit's first attempt or a deferred carry. Record
-    // before waiting for the new process to appear.
     if !st.resume_start.is_empty()
         && let Err(e) = super::super::self_claimed::Witnesses::under(&opts.state)
             .record(st.pid, &st.resume_start)
@@ -567,7 +461,6 @@ fn relaunch_held(
 }
 
 /// After the relaunch line: find the new TUI ([`relaunched_by_us`]) under the harness's hand.
-/// A later step finding the relaunch in flight comes here too.
 fn await_new(opts: &Opts, r: Report, st: &mut St, c: &mut Client, k: &dyn AlabKernel) -> Report {
     let mut hand = Hand::take_or_none(c, &st.tab);
     let r = await_held(opts, r, st, c, &mut hand, k);
@@ -576,11 +469,6 @@ fn await_new(opts: &Opts, r: Report, st: &mut St, c: &mut Client, k: &dyn AlabKe
 }
 
 /// [`await_new`] with the harness's `hand` on the tab, kept through the wait; its caller gives
-/// it back. Done once the new TUI leads the tab by the host's own roster, the hand held on to
-/// its first idle ([`hold_to_first_idle`]): nothing is typed into it, no box is answered and no
-/// composer waited on, whoever asked (a window's worker under [`Opts::hand_back`] included,
-/// which adopts nothing). codex-alab's own carry-on continues the thread its crash relaunch
-/// resumed (the contract §5), once its launch probe saw this hand.
 fn await_held(
     opts: &Opts,
     mut r: Report,
@@ -639,7 +527,6 @@ fn await_held(
 /// How [`hold_to_first_idle`] ended, as the ledger's `done:resumed` row says it.
 const HELD_TO_FIRST_IDLE: &str = "the hand held to its first idle";
 /// The hold ended at a turn already under way
-/// ([`super::super::self_claimed::FirstFrame::Turn`]).
 const HELD_TO_A_TURN: &str = "the hand held until it was up, a turn already under way";
 /// The relaunched process ended, or its pid is another process's now.
 const HELD_TO_ITS_END: &str = "the hand given back: it ended before its first idle";
@@ -649,27 +536,6 @@ const HELD_TO_THE_BOUND: &str = "the hand given back at its bound, before its fi
 const HELD_TO_A_LAPSE: &str = "the hand lapsed to another driver before its first idle";
 
 /// THE HAND IS HELD TO THE RELAUNCHED PROCESS'S FIRST IDLE (the contract §5,
-/// carry-on): aterm's relaunch lease (`hand=lease:aterm-harness@<pid>`),
-/// taken before the line is typed, stands until the new codex-alab is up as
-/// aterm reads it ([`AlabKernel::first_frame`]: its proven self-claim, which
-/// codex-alab makes only after its launch probe read the tab, and its own
-/// record naming its TUI's frame — at rest, its first idle, or a turn already
-/// under way, whose own acts wait for this lease), the process gone, or
-/// [`super::super::Timings::alab_first_idle`] (the launch probe's window),
-/// whichever comes first; its caller then gives it back. codex-alab's launch
-/// probe (its client's FIRST `@self status`, read as the process starts) must
-/// see that lease to carry the resumed thread on: given back as soon as the
-/// new TUI led the tab (the carve, 3999d9adc6, in 0.106.0), the probe read
-/// `hand=-` 5 ms later and the resumed conversation waited at its prompt.
-/// Every relaunch of a codex-alab comes here (the crash rule's, a stall or
-/// memory remedy's, an asked restart's, a restore's, and each carried in
-/// flight: [`await_held`]); a later step that finds one already up ends at
-/// its first look. Nothing is typed meanwhile and no screen is read. A kernel
-/// start that cannot be read is unknown, never the process's end (off Apple
-/// it is a `ps`, which can fail once): only a process gone or another start
-/// of its pid ends the hold early. With no hand held (another driver's, or a
-/// server without hard leases) there is nothing to hold. Says how it ended,
-/// for the ledger.
 fn hold_to_first_idle(
     opts: &Opts,
     c: &mut Client,
@@ -723,9 +589,7 @@ pub(super) fn fail(opts: &Opts, r: Report, st: &mut St, why: &str, detail: &str)
     r
 }
 
-/// Whether `pid` (argv `argv`) is the relaunch this upgrade typed: a child of
-/// the line's shell, not the exited TUI, whose argv resumes the recorded thread
-/// (or nothing, for a plain relaunch).
+/// Whether `pid` (argv `argv`) is the relaunch this upgrade typed.
 pub(super) fn relaunched_by_us(pid: u32, argv: &[String], st: &St, k: &dyn AlabKernel) -> bool {
     pid != st.pid
         && matches!(st.phase, Phase::Relaunched { .. } | Phase::Exiting { .. })
@@ -738,24 +602,7 @@ pub(super) fn relaunched_by_us(pid: u32, argv: &[String], st: &St, k: &dyn AlabK
         }
 }
 
-/// The relaunched TUI `new` found ([`relaunched_by_us`]), by the wait after the relaunch line or
-/// by a visit (here, [`await_held`]; in the Codex lane, its `adopt` or `carry_on`): on the
-/// record ([`St::relaunched_pid`])
-/// whatever becomes of it, so once it is gone a Codex leaving the tab is that TUI, its exit its
-/// own (`relaunch::restarted`).
-///
-/// A relaunch that kept the TUI on its own program ([`SAME_PROGRAM`]: a crash's, while the
-/// owner's hold or the switch kept it off the managed build) hands its record to `new` as well:
-/// pid and kernel start, by which a later look keeps the record its own.
-/// The record carries what the relaunch kept of the upgrade's ([`St::kept_by_restart`]: the
-/// owner's hold, how long the TUI has been behind); left naming the crashed TUI, the first
-/// visit would mint a round with no word and its move clock at zero. A relaunch onto the
-/// managed build leaves the record as it was.
-///
-/// The relaunched TUI's kernel birth is read once, as it is first found
-/// ([`St::relaunched_start`]); a different later TUI has no witnessed
-/// connection to the typed line, and a re-read of the same pid never
-/// refreshes it into a reused pid's birth.
+/// The relaunched TUI `new` found ([`relaunched_by_us`]), by the wait after the relaunch line or by a visit (here, [`await_held`]; in the Codex lane, its `adopt` or `carry_on`).
 pub(super) fn found<K: Kernel + ?Sized>(st: &mut St, new: u32, k: &K) {
     if st.relaunched_pid == 0 {
         st.relaunched_start = k.process_start(new).map(|s| squash(&s)).unwrap_or_default();
@@ -769,10 +616,7 @@ pub(super) fn found<K: Kernel + ?Sized>(st: &mut St, new: u32, k: &K) {
     }
 }
 
-/// A codex-alab relaunch in flight (its line waited, or the relaunched TUI was not yet found)
-/// carried on from where it stopped: the relaunch primitive's continuation step for a Codex
-/// record ([`super::super::relaunch::resume`], by `upgrade_drive::codex_carry_in_flight`); one
-/// with no validated line is closed ([`carry_or_close`]).
+/// A codex-alab relaunch in flight (its line waited, or the relaunched TUI was not yet found) carried on from where it stopped.
 pub(in crate::harness) fn carry_in_flight(opts: &Opts, r: Report, st: St, session: &str) -> Report {
     carry_or_close(opts, r, st, session, &Live)
 }
@@ -796,8 +640,6 @@ pub(super) fn carry_in_flight_with(
     if opts.dry_run {
         return said(r, format!("would-resume:{}", st.phase.word()));
     }
-    // A hand the line waits on is waited out before the clock is read
-    // (`relaunch::hand_waits_out`): uncounted, its clock stopped.
     if hand_waits_out(opts, &mut st, session, |pid| k.alive(pid)) {
         return said(r, WAIT_HAND_LIFTS);
     }
@@ -820,10 +662,7 @@ pub(super) fn carry_in_flight_with(
     r
 }
 
-/// The sweep's Codex pass ([`super::sweep`]'s lanes): the records of closed tabs pruned
-/// ([`prune`], under the sweep lock, as the Claude lane's), then every Codex restart left in
-/// flight in a live tab within the pass's scope ([`in_flight_records`]). Nothing at a background
-/// break, where no restart is carried on.
+/// The sweep's Codex pass ([`super::sweep`]'s lanes).
 pub(super) fn sweep(opts: &Opts, live_tabs: Option<&[super::LiveTab]>) -> Vec<Report> {
     if live_tabs.is_some_and(<[super::LiveTab]>::is_empty) {
         return Vec::new();
@@ -842,12 +681,7 @@ pub(super) fn sweep(opts: &Opts, live_tabs: Option<&[super::LiveTab]>) -> Vec<Re
     in_flight_records(opts, live_tabs, &Live)
 }
 
-/// What the retired vendor Codex lane left on disk, swept once a week old (unwritten for
-/// [`super::STATE_KEEP_S`]), as the records are: each daemon's pin stamp
-/// (`<state>/upgrade/codex-daemons/<label>-pin.json`, the directory too once empty) and each
-/// tab's goal-pause record beside its loop's ledger (`<aterm state>/drive/<tab>.goal-hold.json`).
-/// Nothing writes either any more. Nothing under a `CODEX_HOME` is touched, and nothing in a
-/// dry run or a background break. Called under the sweep lock.
+/// What the retired vendor Codex lane left on disk, swept once a week old (unwritten for [`super::STATE_KEEP_S`]), as the records are.
 pub(super) fn prune_retired(opts: &Opts, now: u64) {
     if opts.dry_run || opts.background {
         return;
@@ -866,7 +700,6 @@ pub(super) fn prune_retired(opts: &Opts, now: u64) {
     };
     let pins = state_dir(opts).join("codex-daemons");
     sweep(&pins, &|name| name.ends_with("-pin.json"));
-    // Gone only once empty: a directory with anything else in it is not ours to judge.
     let _ = std::fs::remove_dir(&pins);
     if let Some(root) = opts.aterm_state.as_deref() {
         let drive = crate::supervise::approvals::ledger_under(root, Some("self"));
@@ -876,11 +709,7 @@ pub(super) fn prune_retired(opts: &Opts, now: u64) {
     }
 }
 
-/// Every Codex restart left in flight ([`St::in_flight`]) whose tab is live (or not known gone,
-/// for a hand-run pass) and within `opts.only_sid`: a codex-alab's crash relaunch carried on by
-/// its own path ([`carry_in_flight_with`]); a record with no validated line, which only the
-/// retired vendor Codex lane wrote, closed as `failed:codex-lane-retired` (a dry run says
-/// `would-fail:`) and never typed into.
+/// Every Codex restart left in flight ([`St::in_flight`]) whose tab is live (or not known gone, for a hand-run pass) and within `opts.only_sid`.
 pub(super) fn in_flight_records(
     opts: &Opts,
     live_tabs: Option<&[super::LiveTab]>,
@@ -922,8 +751,7 @@ pub(super) fn in_flight_records(
     out
 }
 
-/// One Codex record in flight: carried on when it holds a codex-alab's validated line, else
-/// closed as the retired vendor lane's ([`in_flight_records`]).
+/// One Codex record in flight.
 pub(super) fn carry_or_close(
     opts: &Opts,
     r: Report,
@@ -951,11 +779,7 @@ pub(super) fn carry_or_close(
 /// The stop of a Codex restart the retired vendor lane left in flight ([`carry_or_close`]).
 pub(super) const LANE_RETIRED: &str = "codex-lane-retired";
 
-/// [`super::expired`] for a Codex restart: the exit seen over [`STALE_S`] ago — or the last hand
-/// that held its line, whichever is later (`relaunch::exit_clock`) — and not relaunched, its
-/// shell gone, or relaunched and never come up.
-/// Its `stale-exit` line is Claude Code's, wait words and all
-/// (`relaunch::stale_exit_line`).
+/// [`super::expired`] for a Codex restart: the exit seen over [`STALE_S`] ago.
 pub(super) fn expired(st: &St, now: u64, k: &dyn AlabKernel) -> Option<(&'static str, String)> {
     match st.phase {
         Phase::Exiting { at_s }
@@ -978,14 +802,7 @@ pub(super) fn expired(st: &St, now: u64, k: &dyn AlabKernel) -> Option<(&'static
     }
 }
 
-// ---------------------------------------------------------------- the run, read while it runs
-
-/// A codex-alab's run, read while it runs ([`super::super::relaunch::snapshot`] vetted job, tab
-/// and terminal): its build and version, `$CODEX_HOME`, the thread (its writer lock's, else its
-/// launch's `resume <id>`, [`ca::resumed_thread`]) and its directory. The vendor daemon is never
-/// asked which thread it
-/// began: codex-alab's crash relaunch comes from its own record's line
-/// ([`super::super::relaunch::CodexRun::self_claimed`]), never from this read.
+/// A codex-alab's run, read while it runs ([`super::super::relaunch::snapshot`] vetted job, tab and terminal).
 pub(super) fn snapshot(
     opts: &Opts,
     tab: &str,
@@ -1028,14 +845,9 @@ pub(super) fn snapshot(
             home_env: args.env_var(ca::HOME_ENV).map(str::to_owned),
             self_claimed: None,
         }),
-        // From the kernel's exec path alone ([`shell_dialect`]): a shell no line is written for
-        // waits for ever at exit, so the explicit restart is not carried there
-        // ([`super::super::relaunch::carries_restart`]). None for a tab's own codex-alab
-        // ([`NO_SHELL`]): no shell holds it, and nothing relaunches it in its tab.
         dialect: (shell != NO_SHELL)
             .then(|| shell_dialect(shell, k, Vec::new))
             .flatten(),
-        // Claude Code's variables: a Codex has no such login or home, and no usage tap.
         login: None,
         home: None,
         claude_dir: None,
@@ -1044,16 +856,7 @@ pub(super) fn snapshot(
     })
 }
 
-// ---------------------------------------------------------------- the prune
-
-/// Remove Codex records nothing will visit again: a visit forgets a record only when a current
-/// Codex leads its tab, so closed tabs' records would stay forever. A record goes once its tab
-/// is proven [`TabLife::Gone`] (`life`), it is unwritten for [`super::STATE_KEEP_S`] and its
-/// upgrade is [`super::settled`]; never one in flight or not matching its name, and nothing in
-/// a dry run or a background break. Called under the sweep lock.
-///
-/// Tier-1 bound to `HarnessUpgradeStateCollection`
-/// (`aterm_models_harness::harness_upgrade_state_collection_model`) in this module's tests.
+/// Remove Codex records nothing will visit again.
 pub(super) fn prune(opts: &Opts, now: u64, life: impl Fn(&str) -> TabLife) {
     if opts.dry_run || opts.background {
         return;

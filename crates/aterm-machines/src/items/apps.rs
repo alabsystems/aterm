@@ -1,50 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Apps from pinned artifacts: a disk image, a zip or an installer package, each checked
-//! by SHA-256, Team ID and Gatekeeper before it is installed (design §8).
-//!
-//! The controller uploads each artifact into the agent's root cache, and the agent finds
-//! it there by its SHA-256 ([`Ctx::cached`]). Before an install the agent hashes the cached
-//! file again, then works under `/Library/Management/aterm/stage/<sha256>/`, never inside
-//! `/Applications`:
-//!
-//! * a **dmg-app** is attached read-only and unbrowsed at a random mount point inside the
-//!   stage, and the one `.app` at its root is copied out with `ditto`; the image is
-//!   detached on every path, a failed copy included;
-//! * a **zip-app** is expanded into the stage with `ditto -x -k`, and must hold one `.app`;
-//! * the staged bundle is given to root:wheel with no group or other write, then must pass
-//!   `codesign --verify --deep --strict` against the Developer ID requirement for the row's
-//!   Team ID, Gatekeeper's `spctl -a -t exec`, and carry the row's version. Only then is it
-//!   swapped into `/Applications` by two renames; the bundle it replaces is moved into the
-//!   stage and removed with it.
-//! * a **pkg** is copied into the stage under its URL's `.pkg` name (installer refuses any
-//!   other path) and hashed again; it must name the row's Team ID in `pkgutil
-//!   --check-signature` and pass `spctl -a -t install`; a pkg with no installer signature
-//!   (`unsigned = true`, gh's) is expanded with `pkgutil --expand-full`, refused if it
-//!   carries scripts (a component's top-level `Scripts/` or a product archive's
-//!   `<component>.pkg/Scripts/`) or a Distribution that allows external scripts, and
-//!   installed only when every Mach-O in it verifies against the Team ID. Other files its
-//!   payload lays down (a shell script, a launchd plist) are not code-signed and are not
-//!   checked: the hash pin is all that vouches for them. `installer -pkg … -target /` then
-//!   installs the staged copy.
-//!
-//! GATEKEEPER MAY BE OFF. On a Mac where assessments are disabled, `spctl -a` still exits
-//! 0 and says `override=security disabled` for anything, an ad hoc signature included
-//! (measured in the macOS 27 VM). That answer is a check that could not run, never a
-//! pass: the install still requires the Team ID check, and the row's `detail` says
-//! Gatekeeper did not vouch.
-//!
-//! AN APP WITH NO STAPLED TICKET (Emacs.app) is assessed as the app, not through its
-//! image: `spctl -a -t open --context context:primary-signature` rejects Emacs's unsigned
-//! image ("no usable signature") although a ticket is stapled to it, while `spctl -a -t
-//! exec` on the app accepts it as "Notarized Developer ID". With no ticket on the app that
-//! answer comes from Apple's notary service: a minute or more (93 s in the VM), and a
-//! host that cannot reach Apple cannot get it.
-//!
-//! The helpers here ([`verify_team`], [`assess`], [`with_image`], [`one_app_in`],
-//! [`swap_into`], [`vet_pkg`]) are the same checks `homebrew` and `aterm` install with,
-//! and the controller verifies the aterm release zip with.
+//! Installs pinned `.dmg`, `.zip`, and `.pkg` application artifacts verified by SHA-256, Team ID, and Gatekeeper.
 
 use super::{Ctx, Item};
 use crate::model::{Effect, Probe, Read, User};
@@ -54,94 +11,85 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
 
-/// Where apps are installed.
+/// Target directory where application bundles are installed.
 pub const APPLICATIONS: &str = "/Applications";
 
-/// Where every install stages, one directory per artifact SHA-256 (design §4.4).
+/// Staging root directory (`/Library/Management/aterm/stage`).
 pub const STAGE_ROOT: &str = "/Library/Management/aterm/stage";
 
 /// The bound on one `codesign --verify --deep` run: a hang detector, not a latency budget
-/// (Emacs.app, 180 MB of nested code, took 5.6 s in the VM).
 const VERIFY_BUDGET: Duration = Duration::from_secs(180);
 
 /// The bound on one `spctl -a`. Also a hang detector, and longer: an app with no stapled
-/// ticket is looked up with Apple's notary service, and in the VM `spctl -a -t exec` on
-/// Emacs.app took 93 s, and over 180 s on its first assessment there.
 const GATEKEEPER_BUDGET: Duration = Duration::from_secs(900);
 
 /// The bound on `ditto`, `hdiutil` and `pkgutil --expand-full` over one artifact.
 const STAGE_BUDGET: Duration = Duration::from_secs(900);
 
 /// The bound on `installer -pkg`. Homebrew.pkg took 3 s in the VM; a large vendor pkg can
-/// take minutes.
 const INSTALLER_BUDGET: Duration = Duration::from_secs(1800);
 
-/// What an artifact is.
+/// Artifact packaging kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Kind {
-    /// A disk image holding one `.app` at its root.
+    /// Disk image containing one `.app` at its root.
     DmgApp,
-    /// A zip holding one `.app` at its root.
+    /// Zip archive containing one `.app` at its root.
     ZipApp,
-    /// A flat installer package.
+    /// Flat installer package (`.pkg`).
     Pkg,
 }
 
-/// A pinned download.
+/// Pinned downloadable artifact.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Artifact {
-    /// An `https://` URL.
+    /// Artifact `https://` download URL.
     pub url: String,
-    /// The SHA-256 of the bytes at `url`, hex.
+    /// Expected hex SHA-256 digest of the artifact.
     pub sha256: String,
-    /// The Developer ID Team ID that must have signed the app (or, for a pkg, the
-    /// installer certificate; see `unsigned`).
+    /// Expected Developer ID Team ID for code or installer signing.
     #[serde(default)]
     pub team_id: Option<String>,
-    /// A pkg with no installer signature (gh's): installed on the hash alone, with the
-    /// Team ID checked on `binary` after install.
+    /// Whether the `.pkg` has no installer signature and is verified by hash and post-install binary Team ID.
     #[serde(default)]
     pub unsigned: bool,
 }
 
-/// One `[[app]]` row.
+/// Manifest `[[app]]` row.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Row {
-    /// A short name, the item id (`app.<name>`).
+    /// Short item name (`app.<name>`).
     pub name: String,
-    /// What the artifact is.
+    /// Artifact packaging kind.
     pub kind: Kind,
-    /// An `https://` URL.
+    /// Artifact `https://` download URL.
     pub url: String,
-    /// The SHA-256 of the bytes at `url`, hex.
+    /// Expected hex SHA-256 digest.
     pub sha256: String,
-    /// The Developer ID Team ID that must have signed the app (for a pkg, the installer
-    /// certificate, unless `unsigned`).
+    /// Expected Developer ID Team ID.
     #[serde(default)]
     pub team_id: Option<String>,
-    /// A pkg with no installer signature: installed on the hash alone, with `team_id`
-    /// checked on `binary` after install.
+    /// Whether the `.pkg` is unsigned at the installer envelope level.
     #[serde(default)]
     pub unsigned: bool,
-    /// The bundle that lands in `/Applications` (`Emacs.app`), for dmg-app and zip-app.
+    /// Bundle name in `/Applications` for `dmg-app` and `zip-app` rows.
     #[serde(default)]
     pub bundle: Option<String>,
-    /// For a pkg: the receipt id `pkgutil --pkg-info` knows it by.
+    /// Package receipt identifier for `pkgutil --pkg-info`.
     #[serde(default)]
     pub pkg_id: Option<String>,
-    /// For a pkg: an installed binary whose signature names `team_id`.
+    /// Installed binary path whose signature must match `team_id`.
     #[serde(default)]
     pub binary: Option<String>,
-    /// The version that counts as installed (`CFBundleShortVersionString`, or the pkg
-    /// receipt's version).
+    /// Expected installed version (`CFBundleShortVersionString` or package receipt version).
     pub version: String,
 }
 
 impl Row {
-    /// The row's download, as an [`Artifact`].
+    /// Extracts the downloadable [`Artifact`] descriptor for this row.
     #[must_use]
     pub fn artifact(&self) -> Artifact {
         Artifact {
@@ -153,13 +101,9 @@ impl Row {
     }
 }
 
-/// The items `rows` ask for.
-///
+/// Expands `[[app]]` manifest `rows` into executable [`Item`]s.
 /// # Errors
-/// One line naming the row that cannot be expanded: a missing Team ID, a dmg or zip row
-/// with no `bundle`, a pkg row with no `pkg_id` or with neither `bundle` nor `binary`, a
-/// malformed SHA-256 or URL, or a second row for a bundle or receipt another row already
-/// installs (the two would replace each other on every apply).
+/// Returns an error naming the invalid row if required fields or artifact constraints fail.
 pub fn expand(rows: &[Row], ctx: &Ctx) -> Result<Vec<Box<dyn Item>>, String> {
     let _ = ctx;
     let mut items: Vec<Box<dyn Item>> = Vec::new();
@@ -238,8 +182,6 @@ impl App {
                 {
                     return Err(format!("{at}: binary {binary:?} is not an absolute path"));
                 }
-                // Done is the installed bundle or binary verifying as the team's at the
-                // pinned version (design §8); a receipt alone says nothing about the code.
                 if row.bundle.is_none() && row.binary.is_none() {
                     return Err(format!(
                         "{at}: a pkg row names the bundle or the binary it installs, so the Team ID can be checked after the install"
@@ -275,7 +217,6 @@ impl App {
     }
 
     /// What is installed now, as one line, when it is not what the row wants; `Ok(None)`
-    /// when it is.
     fn differs(&self, sys: &dyn System) -> Result<Option<String>, String> {
         match self.row.kind {
             Kind::DmgApp | Kind::ZipApp => {
@@ -449,13 +390,12 @@ impl Item for App {
     }
 }
 
-/// Notes an apply leaves for the report's `detail`: what a check could not vouch for
-/// although the install went ahead (Gatekeeper off on this Mac).
+/// Collects non-fatal verification notes for the apply report.
 #[derive(Debug, Default)]
 pub(crate) struct Notes(Mutex<Vec<String>>);
 
 impl Notes {
-    /// Forget the last run's notes.
+    /// Clears recorded notes.
     pub(crate) fn clear(&self) {
         self.0
             .lock()
@@ -463,7 +403,7 @@ impl Notes {
             .clear();
     }
 
-    /// Add one.
+    /// Appends a note.
     pub(crate) fn push(&self, note: String) {
         self.0
             .lock()
@@ -471,7 +411,7 @@ impl Notes {
             .push(note);
     }
 
-    /// Every note, `; `-joined, or `None`.
+    /// Joins recorded notes with `; `, or returns `None` if empty.
     pub(crate) fn joined(&self) -> Option<String> {
         let notes = self
             .0
@@ -481,13 +421,13 @@ impl Notes {
     }
 }
 
-/// Refuse an artifact whose URL is not `https://` or whose SHA-256 or Team ID is not
-/// well formed. `at` names the row for the message.
-///
+/// Validates that `art` has an `https://` URL, hex SHA-256, and valid Team ID.
 /// # Errors
-/// One line.
+/// Returns an error naming `at` if any field is malformed.
 pub(crate) fn check_artifact(at: &str, art: &Artifact) -> Result<(), String> {
+    //") {
     if !art.url.starts_with("https://") {
+        //", art.url));
         return Err(format!("{at}: url {:?} is not https://", art.url));
     }
     if !is_sha256(&art.sha256) {
@@ -521,14 +461,13 @@ fn check_bundle_name(at: &str, bundle: &str) -> Result<(), String> {
     }
 }
 
-/// Whether `s` is a SHA-256 in hex.
+/// Returns `true` if `s` is a 64-character hex SHA-256 digest.
 #[must_use]
 pub fn is_sha256(s: &str) -> bool {
     s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
-/// Whether `s` is an Apple Team ID: ten capital letters and digits. Checked before it is
-/// spliced into a code requirement.
+/// Returns `true` if `s` is a 10-character alphanumeric Apple Team ID.
 #[must_use]
 pub fn is_team_id(s: &str) -> bool {
     s.len() == 10
@@ -536,7 +475,7 @@ pub fn is_team_id(s: &str) -> bool {
             .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
 }
 
-/// The why of a [`Probe::Blocked`] for an artifact the agent's cache lacks.
+/// Formats the [`Probe::Blocked`] reason for a missing cached artifact.
 pub(crate) fn not_cached(sha256: &str) -> String {
     format!(
         "artifact {} is not in the cache; the controller uploads it",
@@ -544,8 +483,7 @@ pub(crate) fn not_cached(sha256: &str) -> String {
     )
 }
 
-/// The local account `name`: one of the baseline's users, else any local account the
-/// agent's facts list.
+/// Resolves local user account `name` from baseline users or system facts.
 pub(crate) fn account(ctx: &Ctx, name: &str) -> Option<User> {
     ctx.users
         .iter()
@@ -554,9 +492,7 @@ pub(crate) fn account(ctx: &Ctx, name: &str) -> Option<User> {
         .cloned()
 }
 
-/// The Developer ID requirement for `team`, as install.sh spells it: an Apple-anchored
-/// chain through the Developer ID intermediate to a Developer ID Application leaf whose
-/// organizational unit is the Team ID.
+/// Builds the Apple-anchored Developer ID code requirement string for `team`.
 #[must_use]
 pub fn developer_id_requirement(team: &str) -> String {
     format!(
@@ -575,19 +511,18 @@ fn codesign_cmd(path: &Path, team: &str) -> Cmd {
         .budget(VERIFY_BUDGET)
 }
 
-/// What `codesign` said about one bundle or binary and a Team ID.
+/// Result of verifying a bundle or binary with `codesign` against a Team ID.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Signed {
-    /// Verifies, sealed and whole, as signed by the team.
+    /// Verified as sealed and signed by the expected team.
     Team,
-    /// Does not: signed by someone else (codesign's exit 3), unsigned, or modified.
+    /// Signed by another identity, unsigned, or modified.
     Other(String),
-    /// codesign did not answer.
+    /// `codesign` failed to produce a verdict.
     Unusable(String),
 }
 
-/// Whether `path` verifies as signed by Developer ID team `team`. Exit 3 is codesign's
-/// "failed to satisfy specified code requirement(s)": signed, by another team.
+/// Verifies `path` with `codesign` against Developer ID `team`.
 #[must_use]
 pub fn verify_team(sys: &dyn System, path: &Path, team: &str) -> Signed {
     if !is_team_id(team) {
@@ -597,8 +532,6 @@ pub fn verify_team(sys: &dyn System, path: &Path, team: &str) -> Signed {
         Ok(ran) => match ran.status {
             Some(0) => Signed::Team,
             Some(3) => Signed::Other(format!("signed, but not by Developer ID team {team}")),
-            // Exit 1 is also codesign's answer when it could not read `path` at all
-            // (`<path>: Permission denied`, measured): that is no verdict on its signer.
             Some(1) if unreadable(path, &ran.err()) => {
                 Signed::Unusable(format!("codesign {}: {}", path.display(), ran.describe()))
             }
@@ -610,7 +543,6 @@ pub fn verify_team(sys: &dyn System, path: &Path, team: &str) -> Signed {
 }
 
 /// Whether codesign's `stderr` says it could not open `path` itself: its first line is
-/// `<path>: <errno text>` for a permission refusal or a missing path.
 fn unreadable(path: &Path, stderr: &str) -> bool {
     let first = first_line(stderr);
     [
@@ -622,35 +554,34 @@ fn unreadable(path: &Path, stderr: &str) -> bool {
     .any(|why| first == format!("{}: {why}", path.display()))
 }
 
-/// Which Gatekeeper assessment.
+/// Gatekeeper assessment mode (`spctl -a`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Assess {
-    /// `spctl -a -t exec`: an app or a binary.
+    /// Assesses an executable or bundle (`spctl -a -t exec`).
     Exec,
-    /// `spctl -a -t install`: an installer package.
+    /// Assesses an installer package (`spctl -a -t install`).
     Install,
 }
 
-/// What `spctl -a` said.
+/// Verdict returned by `spctl -a`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Gatekeeper {
-    /// Assessed and accepted; the `source=` it named (`Notarized Developer ID`).
+    /// Assessed and accepted with the reported `source=`.
     Accepted(String),
-    /// Exited 0 on an override, not an assessment: `override=security disabled` where
-    /// Gatekeeper is off. The override and the source, for the report.
+    /// Exited 0 under an assessment override (such as Gatekeeper disabled).
     Overridden {
-        /// The `override=` value.
+        /// Reported `override=` value.
         how: String,
-        /// The `source=` value, when one was printed.
+        /// Reported `source=` value, if any.
         source: String,
     },
     /// Assessed and rejected (exit 3).
     Rejected(String),
-    /// spctl did not answer.
+    /// `spctl` did not produce a usable verdict.
     Unusable(String),
 }
 
-/// Gatekeeper's assessment of `path`. spctl writes its verdict to standard error.
+/// Runs Gatekeeper assessment (`spctl -a`) on `path`.
 #[must_use]
 pub fn assess(sys: &dyn System, path: &Path, kind: Assess) -> Gatekeeper {
     let t = match kind {
@@ -686,7 +617,6 @@ pub fn assess(sys: &dyn System, path: &Path, kind: Assess) -> Gatekeeper {
 }
 
 /// Require Gatekeeper's acceptance of `path`; an override is noted and passes, because
-/// the Team ID check the caller also requires still vouches for the bytes.
 fn require_gatekeeper(
     sys: &dyn System,
     path: &Path,
@@ -719,10 +649,6 @@ fn require_gatekeeper(
 }
 
 /// Why a Mac rejects a notarized Developer ID app, when it is the Mac's own setting:
-/// `spctl --status -v` prints `developer id disabled` where System Settings allows apps
-/// from the App Store only (VM, macOS 27.0, after `spctl --global-enable`: every Developer
-/// ID rule then reads disabled and syspolicyd logs `rejecting due to lack of matching
-/// active rule`). The setting is the owner's; nothing here changes it.
 fn app_store_only(sys: &dyn System) -> &'static str {
     match sys.run(&Cmd::new("/usr/sbin/spctl").args(["--status", "-v"])) {
         Ok(ran) if format!("{}\n{}", ran.out(), ran.err()).contains("developer id disabled") => {
@@ -733,9 +659,7 @@ fn app_store_only(sys: &dyn System) -> &'static str {
     }
 }
 
-/// A bundle's `Info.plist` key, read with PlistBuddy straight from the file. Not
-/// `defaults read <bundle>/Contents/Info`: cfprefsd caches a plist it read by path, so
-/// the read-back after a swap could answer the replaced bundle's version.
+/// Reads `key` from `<bundle>/Contents/Info.plist` via `PlistBuddy`.
 #[must_use]
 pub fn bundle_info(sys: &dyn System, bundle: &Path, key: &str) -> Read<String> {
     let plist = bundle.join("Contents/Info.plist");
@@ -761,7 +685,6 @@ pub fn bundle_info(sys: &dyn System, bundle: &Path, key: &str) -> Read<String> {
 }
 
 /// What the bundle at `target` is, when it is not `version` signed by `team`; `Ok(None)`
-/// when it is.
 fn installed_bundle(
     sys: &dyn System,
     target: &Path,
@@ -799,8 +722,7 @@ fn regex_literal(s: &str) -> String {
     out
 }
 
-/// Whether a process runs the executable of the bundle at `bundle` (`pgrep -f
-/// <bundle>/Contents/MacOS/`, which root sees for every user).
+/// Returns whether any process is running an executable inside `bundle`.
 #[must_use]
 pub fn running(sys: &dyn System, bundle: &Path) -> Read<bool> {
     let pattern = regex_literal(&format!("{}/Contents/MacOS/", bundle.display()));
@@ -812,10 +734,9 @@ pub fn running(sys: &dyn System, bundle: &Path) -> Read<bool> {
     }
 }
 
-/// The cached artifact `sha256`, hashed again before anything uses it.
-///
+/// Locates cached artifact `sha256` and re-verifies its SHA-256 digest.
 /// # Errors
-/// One line: not in the cache, unreadable, or it no longer hashes to its name.
+/// Returns an error if the artifact is missing, unreadable, or fails hash verification.
 pub(crate) fn cached_verified(
     sys: &dyn System,
     ctx: &Ctx,
@@ -835,9 +756,7 @@ pub(crate) fn cached_verified(
     }
 }
 
-/// Cleanup custody for one exclusively-created staging directory. Retaining an old
-/// bundle transfers this allocation out of automatic cleanup, including during unwind.
-/// A subsequent run allocates another directory and never adopts the retained one.
+/// Cleanup custody handle for an exclusively created staging directory.
 pub(crate) struct Stage<'s> {
     path: PathBuf,
     scratch: Option<crate::port::Scratch<'s>>,
@@ -881,12 +800,9 @@ impl Drop for Stage<'_> {
     }
 }
 
-/// A fresh, exclusively-created root-only stage for this attempt. A previous attempt's
-/// directory is never detached, adopted or removed; it may hold a displaced original.
-/// The agent root must already exist, so staging cannot recreate an uninstalled agent.
-///
+/// Creates a fresh root-only staging directory under [`STAGE_ROOT`].
 /// # Errors
-/// The parent cannot be admitted or the exclusive allocation fails.
+/// Returns an error if directory creation or ownership/mode verification fails.
 pub(crate) fn fresh_stage<'s>(sys: &'s dyn System) -> Result<Stage<'s>, String> {
     match sys.stat(Path::new(crate::AGENT_ROOT)) {
         Ok(st) if st.dir && !st.symlink => {}
@@ -914,11 +830,9 @@ pub(crate) fn fresh_stage<'s>(sys: &'s dyn System) -> Result<Stage<'s>, String> 
     Ok(Stage::new(scratch))
 }
 
-/// Finish an attempt. A displaced original still held after failed restoration is
-/// retained, not cleaned; other scratch is closed with any cleanup failure reported.
-///
+/// Cleans up `stage`, or retains it if a displaced original bundle is still held.
 /// # Errors
-/// The original install error, or an inconsistent retained-success state.
+/// Returns an error if retaining a displaced bundle or removing scratch fails.
 pub(crate) fn clear_stage(
     mut stage: Stage<'_>,
     done: Result<(), String>,
@@ -961,10 +875,9 @@ fn ditto_copy(sys: &dyn System, from: &Path, to: &Path) -> Result<(), String> {
     }
 }
 
-/// `ditto -x -k` of the zip `zip` into the directory `into`.
-///
+/// Extracts `zip` into `into` using `ditto -x -k`.
 /// # Errors
-/// One line.
+/// Returns an error if `ditto` fails.
 pub(crate) fn ditto_unzip(sys: &dyn System, zip: &Path, into: &Path) -> Result<(), String> {
     let ran = sys
         .run(
@@ -982,12 +895,9 @@ pub(crate) fn ditto_unzip(sys: &dyn System, zip: &Path, into: &Path) -> Result<(
     }
 }
 
-/// The name of the one `.app` directory at the root of `dir` (a mounted image, an
-/// expanded zip). Anything else there (the `Applications` link, `.background`, a README)
-/// is ignored; zero apps, several, or a link named `.app` is a refusal.
-///
+/// Returns the single `.app` directory name at the root of `dir`.
 /// # Errors
-/// One line.
+/// Returns an error if `dir` does not contain exactly one safe `.app` bundle.
 pub(crate) fn one_app_in(sys: &dyn System, dir: &Path) -> Result<String, String> {
     let names = sys
         .list_dir(dir)
@@ -1040,12 +950,9 @@ fn xml_text(s: &str) -> String {
         .replace("&amp;", "&")
 }
 
-/// Attach `image` read-only, unbrowsed, auto-opening nothing, at a random mount point
-/// inside `under`; run `work` on the mount point; detach on every path. A failed detach
-/// after good work is the result.
-///
+/// Attaches `image` read-only under `under`, runs `work` on the mount point, and detaches.
 /// # Errors
-/// One line: the attach, `work`, or the detach.
+/// Returns an error if attach, `work`, or detach fails.
 pub(crate) fn with_image<T>(
     sys: &dyn System,
     image: &Path,
@@ -1120,16 +1027,9 @@ fn detach(sys: &dyn System, point: &Path) -> Result<(), String> {
     }
 }
 
-/// Give the staged tree `path` to `uid:gid`, take group and other write away, and clear
-/// every set-user-ID and set-group-ID bit (a vendor bundle's own modes are whatever its
-/// build left; a bundle in `/Applications` that a user can write is a bundle a user can
-/// change; and root's `ditto` keeps an image's or a zip's owners and modes, so a file
-/// that arrives uid 0 with its set-user-ID bit set would stay a set-user-ID root program,
-/// which no app row asks for). Neither tool follows a link inside the tree (`-P`, their
-/// default with `-R`).
-///
+/// Sets ownership of `path` to `uid:gid`, strips group/other write, and clears setuid/setgid bits.
 /// # Errors
-/// One line.
+/// Returns an error if `chown` or `chmod` fails.
 pub(crate) fn give_to(sys: &dyn System, path: &Path, uid: u32, gid: u32) -> Result<(), String> {
     for cmd in [
         Cmd::new("/usr/sbin/chown")
@@ -1148,11 +1048,9 @@ pub(crate) fn give_to(sys: &dyn System, path: &Path, uid: u32, gid: u32) -> Resu
     Ok(())
 }
 
-/// Require the staged bundle `staged` to verify as `team`'s, pass Gatekeeper (an override
-/// is noted), and carry `version` when one is pinned.
-///
+/// Verifies that `staged` matches `team`, passes Gatekeeper, and reports `version`.
 /// # Errors
-/// One line naming the check that refused.
+/// Returns an error if signature, Gatekeeper, or version verification fails.
 pub(crate) fn vet_bundle(
     sys: &dyn System,
     staged: &Path,
@@ -1185,12 +1083,9 @@ pub(crate) fn vet_bundle(
     Ok(())
 }
 
-/// Swap the staged bundle `staged` into `target`: what is at `target` is renamed into
-/// `stage/old/`, then `staged` is renamed to `target`; if that second rename fails, the
-/// old bundle is put back. Both renames stay on the data volume, so neither copies.
-///
+/// Swaps `staged` into `target`, displacing any existing bundle into `stage/old/`.
 /// # Errors
-/// One line.
+/// Returns an error if moving the existing bundle or renaming `staged` into place fails.
 pub(crate) fn swap_into(
     sys: &dyn System,
     staged: &Path,
@@ -1206,7 +1101,6 @@ pub(crate) fn swap_into(
             let old_dir = stage.join("old");
             sys.create_dir_all(&old_dir, 0o700)
                 .map_err(|e| format!("{}: {e}", old_dir.display()))?;
-            // Arm before the first move: unwind after it must not clean the original.
             stage.retained.set(true);
             if let Err(e) = sys.rename(target, &aside) {
                 stage.retained.set(false);
@@ -1238,8 +1132,7 @@ pub(crate) fn swap_into(
     Ok(())
 }
 
-/// The version on `pkg_id`'s receipt (`pkgutil --pkg-info`); `Absent` on pkgutil's "No
-/// receipt for" answer.
+/// Reads the installed version from `pkg_id`'s receipt via `pkgutil --pkg-info`.
 #[must_use]
 pub fn receipt_version(sys: &dyn System, pkg_id: &str) -> Read<String> {
     let cmd = Cmd::new("/usr/sbin/pkgutil").arg("--pkg-info").arg(pkg_id);
@@ -1259,33 +1152,30 @@ pub fn receipt_version(sys: &dyn System, pkg_id: &str) -> Read<String> {
 }
 
 /// The start of the `Status:` line `pkgutil --check-signature` prints for a pkg signed
-/// through a Developer ID chain it trusts (Homebrew.pkg, VM).
 const DEVELOPER_ID_STATUS: &str =
     "signed by a developer certificate issued by Apple for distribution";
 
-/// What `pkgutil --check-signature` said about a pkg.
+/// Parsed `pkgutil --check-signature` verdict for a `.pkg`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PkgSignature {
-    /// Signed; pkgutil's trust verdict, the leaf certificate's name and the Team ID in its
-    /// parentheses, and whether pkgutil says the Apple notary service trusts it.
+    /// Signed package with trust status, leaf certificate, Team ID, and notarization state.
     Signed {
-        /// The `Status:` line: `signed by a developer certificate issued by Apple for
-        /// distribution` for a Developer ID chain pkgutil trusts.
+        /// Reported `Status:` line.
         status: String,
-        /// `Developer ID Installer: Patrick Linnane (927JGANW46)`.
+        /// Leaf certificate common name.
         leaf: String,
-        /// `927JGANW46`.
+        /// Extracted Team ID.
         team: String,
-        /// `Notarization: trusted by the Apple notary service`.
+        /// Whether notarization is trusted.
         notarized: bool,
     },
-    /// `Status: no signature`.
+    /// Package has no signature (`Status: no signature`).
     Unsigned,
-    /// pkgutil did not answer, or answered something else.
+    /// `pkgutil` output could not be parsed.
     Unusable(String),
 }
 
-/// Parse `pkgutil --check-signature`'s report.
+/// Parses `pkgutil --check-signature` exit status and stdout.
 #[must_use]
 pub fn parse_pkg_signature(status: Option<i32>, text: &str) -> PkgSignature {
     let line = |prefix: &str| {
@@ -1319,9 +1209,7 @@ pub fn parse_pkg_signature(status: Option<i32>, text: &str) -> PkgSignature {
     }
 }
 
-/// Whether `head` (a file's first bytes) starts a Mach-O: thin 32- or 64-bit in either
-/// byte order, or universal (`cafebabe` followed by an architecture count under 20, which
-/// is what tells it from a Java class file's version).
+/// Returns `true` if `head` starts with a thin or universal Mach-O magic number.
 #[must_use]
 pub fn is_macho(head: &[u8]) -> bool {
     let Some(magic) = head.get(..4) else {
@@ -1336,13 +1224,9 @@ pub fn is_macho(head: &[u8]) -> bool {
     }
 }
 
-/// Copy the cached pkg into `stage` under the file name its URL gives it (`installer`
-/// refuses a package path that does not end in `.pkg`: measured in the VM against the
-/// cache's `<sha256>` names), and check the copy's hash again: the bytes every later
-/// check and `installer` read are the root-only stage's.
-///
+/// Copies the cached `.pkg` into `stage` under its URL filename.
 /// # Errors
-/// One line.
+/// Returns an error if the URL filename is invalid or copying fails.
 pub(crate) fn stage_pkg(
     sys: &dyn System,
     cached: &Path,
@@ -1381,13 +1265,9 @@ pub(crate) fn stage_pkg(
     }
 }
 
-/// Check the pkg `pkg` against `art` before `installer` sees it: a signed pkg must name
-/// `art.team_id` as its Developer ID Installer leaf and pass `spctl -a -t install`; an
-/// unsigned one is expanded under `stage`, refused if it carries scripts, and passes
-/// only if every Mach-O in it verifies as `art.team_id`'s.
-///
+/// Vets staged package `pkg` against `art` before running `installer`.
 /// # Errors
-/// One line naming the check that refused.
+/// Returns an error if signature, Gatekeeper, or unsigned-package checks fail.
 pub(crate) fn vet_pkg(
     sys: &dyn System,
     pkg: &Path,
@@ -1421,9 +1301,6 @@ pub(crate) fn vet_pkg(
                     "the pkg is signed by {leaf}, not a Developer ID Installer of team {team}"
                 ));
             }
-            // The leaf's name is only text; the Status line is pkgutil's trust verdict
-            // on the chain (Homebrew.pkg: "signed by a developer certificate issued by
-            // Apple for distribution").
             if !status.starts_with(DEVELOPER_ID_STATUS) {
                 return Err(format!(
                     "pkgutil does not trust the pkg's signature as Developer ID (Status: {status})"
@@ -1445,7 +1322,6 @@ pub(crate) fn vet_pkg(
 }
 
 /// [`vet_pkg`] for a pkg with no installer signature: no scripts, a Distribution whose
-/// JavaScript cannot run programs, and at least one Mach-O, every one the team's.
 fn vet_unsigned_pkg(
     sys: &dyn System,
     pkg: &Path,
@@ -1491,8 +1367,6 @@ fn vet_unsigned_pkg(
             .components()
             .map(|c| c.as_os_str().to_string_lossy().into_owned())
             .collect();
-        // A component pkg expands its scripts to a top-level `Scripts/` (measured with
-        // pkgbuild + `pkgutil --expand-full`); a product archive to `<component>.pkg/Scripts/`.
         if parts.first().is_some_and(|p| p == "Scripts")
             || parts
                 .windows(2)
@@ -1536,10 +1410,7 @@ fn vet_unsigned_pkg(
     Ok(())
 }
 
-/// Whether a product archive's Distribution lets its JavaScript run programs
-/// (`system.run`): an `allow-external-scripts` option whose value is anything but
-/// `false` or `no`. gh's says `allow-external-scripts="false"`. A mention that is not a
-/// well-formed attribute counts as allowing, so a document this cannot read is refused.
+/// Returns `true` if a product archive `Distribution` XML permits external scripts (`system.run`).
 #[must_use]
 pub fn allows_external_scripts(distribution: &str) -> bool {
     const KEY: &str = "allow-external-scripts";
@@ -1568,10 +1439,9 @@ pub fn allows_external_scripts(distribution: &str) -> bool {
     false
 }
 
-/// `installer -pkg <pkg> -target /`.
-///
+/// Runs `installer -pkg <pkg> -target /`.
 /// # Errors
-/// One line: installer's own last words.
+/// Returns an error if `installer` fails.
 pub(crate) fn run_installer(sys: &dyn System, pkg: &Path) -> Result<(), String> {
     let cmd = Cmd::new("/usr/sbin/installer")
         .arg("-pkg")
@@ -1586,7 +1456,7 @@ pub(crate) fn run_installer(sys: &dyn System, pkg: &Path) -> Result<(), String> 
     }
 }
 
-/// `: <last line of standard output>` when the tool printed its reason there.
+/// Formats the last non-empty stdout line of `ran` as a `: <line>` suffix.
 pub(crate) fn last_words(ran: &Ran) -> String {
     ran.out()
         .lines()
@@ -1607,10 +1477,7 @@ pub(crate) mod tests {
     use crate::model::{HostFacts, Outcome};
     use crate::port::{Fake, Ran, Stat};
 
-    // ---- fixtures captured from the macOS 27.0 VM (26A428) and this Mac ----
-
-    /// `hdiutil attach -readonly -nobrowse -noautoopen -mountrandom <stage> -plist
-    /// Caffeine.dmg`, VM.
+    /// Sample `hdiutil attach -plist` output for `Caffeine.dmg`.
     pub(crate) const ATTACH_CAFFEINE: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -1653,13 +1520,13 @@ pub(crate) mod tests {
     const SPCTL_ADHOC_OFF: &str =
         "/private/tmp/swteam/adhoc/X.app: accepted\noverride=security disabled\n";
 
-    /// `spctl -a -vv -t exec` on KeepingYouAwake.app, this Mac (Gatekeeper on), stderr.
+    /// Sample `spctl -a -vv -t exec` output for `KeepingYouAwake.app` with Gatekeeper enabled.
     pub(crate) const SPCTL_KYA_ON: &str = "kya/KeepingYouAwake.app: accepted\nsource=Notarized Developer ID\norigin=Developer ID Application: Marcel Dierkes (5KESHV9W85)\n";
 
     /// `spctl -a -vv -t exec` on an ad hoc signed app, this Mac (Gatekeeper on): exit 3.
     const SPCTL_ADHOC_ON: &str = "/private/tmp/sw-adhoc/X.app: rejected\n";
 
-    /// `codesign --verify … -R=<wrong team>`, VM: exit 3, stderr.
+    /// Sample `codesign --verify` stderr on Team ID mismatch.
     pub(crate) const CODESIGN_WRONG_TEAM: &str =
         "test-requirement: code failed to satisfy specified code requirement(s)\n";
 
@@ -1667,7 +1534,7 @@ pub(crate) mod tests {
     const CODESIGN_UNSIGNED: &str =
         "./unsigned-ls: code object is not signed at all\nIn architecture: arm64e.x1\n";
 
-    /// `pkgutil --check-signature Homebrew-7.0.9.pkg`, VM: exit 0, stdout.
+    /// Sample `pkgutil --check-signature` stdout for `Homebrew-7.0.9.pkg`.
     pub(crate) const PKGUTIL_HOMEBREW: &str = r#"Package "Homebrew-7.0.9.pkg":
    Status: signed by a developer certificate issued by Apple for distribution
    Notarization: trusted by the Apple notary service
@@ -1697,7 +1564,7 @@ pub(crate) mod tests {
     const PKGUTIL_GH: &str =
         "Package \"gh_2.102.0_macOS_universal.pkg\":\n   Status: no signature\n";
 
-    /// `spctl -a -vv -t install Homebrew-7.0.9.pkg`, VM (Gatekeeper off), stderr.
+    /// Sample `spctl -a -vv -t install` stderr for `Homebrew-7.0.9.pkg` with Gatekeeper disabled.
     pub(crate) const SPCTL_HOMEBREW_OFF: &str = "Homebrew-7.0.9.pkg: accepted\nsource=Notarized Developer ID\noverride=security disabled\norigin=Developer ID Installer: Patrick Linnane (927JGANW46)\n";
 
     /// `installer -pkg gh_2.102.0_macOS_universal.pkg -target /`, VM: exit 0, stdout.
@@ -1711,8 +1578,6 @@ pub(crate) mod tests {
 
     /// `PlistBuddy -c 'Print :NoSuchKey' …/Info.plist`, VM: exit 1.
     const PLISTBUDDY_NO_KEY: &str = "Print: Entry, \":NoSuchKey\", Does Not Exist\n";
-
-    // ---- pins from docs/DESIGN-machines §8 research, hashed in dl-verify ----
 
     pub(crate) const CAFFEINE_SHA: &str =
         "1ad34c3299a0c866873c4feb432c3e11186375adb6f43c5f481ae9d46d06d723";
@@ -1765,14 +1630,14 @@ pub(crate) mod tests {
         }
     }
 
-    /// The next exclusive install allocation in this in-memory backend.
+    /// Returns the staging directory path for `sequence` in the fake backend.
     pub(crate) fn stage_path(sequence: u64) -> String {
         Fake::scratch_path(Some(Path::new(STAGE_ROOT)), "install", sequence)
             .to_string_lossy()
             .into_owned()
     }
 
-    /// A context whose cache holds `cached`, with the bytes of each seeded in `sys`.
+    /// Builds a test [`Ctx`] with `cached` artifacts seeded in `sys`.
     pub(crate) fn ctx_with(sys: &Fake, cached: &[(&str, &[u8])], disrupt: bool) -> Ctx {
         let mut facts = HostFacts {
             arch: "arm64".into(),
@@ -1799,7 +1664,7 @@ pub(crate) mod tests {
         }
     }
 
-    /// The SHA-256 of `bytes`, hex.
+    /// Returns the hex SHA-256 digest of `bytes`.
     pub(crate) fn sha_of(bytes: &[u8]) -> String {
         let mut h = aterm_digest::Sha256::new();
         h.update(bytes);
@@ -1895,7 +1760,6 @@ pub(crate) mod tests {
         assert!(
             matches!(verify_team(&sys, Path::new("/x"), "VEKTX9H2N7"), Signed::Other(w) if w.contains("not signed at all"))
         );
-        // No reply scripted: codesign did not run, which is no verdict at all.
         let sys = Fake::root();
         assert!(matches!(
             verify_team(&sys, Path::new("/x"), "VEKTX9H2N7"),
@@ -1949,8 +1813,6 @@ pub(crate) mod tests {
 
     #[test]
     fn a_rejection_on_an_app_store_only_mac_says_it_is_the_mac_s_setting() {
-        // VM, macOS 27.0, every Developer ID rule disabled: a notarized, stapled
-        // Caffeine.app is rejected with its source named.
         let rejected = "/s/Caffeine.app: rejected\nsource=Notarized Developer ID\norigin=Developer ID Application: Michael Jones (YD6LEYT6WZ)\n";
         let sys = Fake::root();
         sys.on(
@@ -1969,7 +1831,6 @@ pub(crate) mod tests {
         )
         .unwrap_err();
         assert!(why.contains("App Store only"), "{why}");
-        // Where Developer ID apps are allowed, a rejection is only spctl's own words.
         let sys = Fake::root();
         sys.on(
             "/usr/sbin/spctl -a -vv -t exec /s/Caffeine.app",
@@ -2254,7 +2115,6 @@ pub(crate) mod tests {
         let ctx = ctx_with(&sys, &[(&sha, bytes)], false);
         let row = one(&caffeine_row(&sha), &sys, &ctx, crate::model::Mode::Plan);
         assert_eq!(row.outcome, Outcome::Deferred, "{row:?}");
-        // With --now the same Mac plans the change.
         let ctx = ctx_with(&sys, &[(&sha, bytes)], true);
         let row = one(&caffeine_row(&sha), &sys, &ctx, crate::model::Mode::Plan);
         assert_eq!(row.outcome, Outcome::Planned);
@@ -2268,9 +2128,7 @@ pub(crate) mod tests {
         let sha = sha_of(bytes);
         let stage = stage_path(0);
         let ctx = ctx_with(&sys, &[(&sha, bytes)], true);
-        // Before: an older Caffeine, not running.
         installed_caffeine(&sys, "1.1.3");
-        // The read-back after the swap reads the new bundle's version.
         sys.on(
             &plistbuddy("/Applications/Caffeine.app", "CFBundleShortVersionString"),
             ok("1.1.4\n"),
@@ -2319,7 +2177,6 @@ pub(crate) mod tests {
                 .unwrap_or_else(|| panic!("{needle} not run: {calls:#?}"))
         };
         let last = |needle: &str| calls.iter().rposition(|c| c.starts_with(needle)).unwrap();
-        // The order that matters: copy out, detach, own, vet, then swap, then clean up.
         assert!(pos("/usr/bin/ditto") < pos("/usr/bin/hdiutil detach"));
         assert!(pos("/usr/bin/hdiutil detach") < pos("/usr/sbin/chown -R 0:0"));
         assert!(
@@ -2558,7 +2415,6 @@ pub(crate) mod tests {
                 .unwrap()
                 .contains("1 Mach-O file(s) verified as team VEKTX9H2N7")
         );
-        // Only the payload's binary was checked; the man page and Distribution are not code.
         assert_eq!(
             sys.calls()
                 .iter()
@@ -2615,8 +2471,6 @@ pub(crate) mod tests {
 
     #[test]
     fn a_component_pkg_s_top_level_scripts_are_refused_too() {
-        // `pkgbuild --scripts` + `pkgutil --expand-full`, measured: Bom, PackageInfo,
-        // Payload/…, Scripts/postinstall, with no `<name>.pkg/` level above them.
         let (sys, ctx, sha) = unsigned_pkg_listing(&|x| {
             format!(
                 "{x}/Bom\0{x}/PackageInfo\0{x}/Payload/usr/local/bin/gh\0{x}/Scripts/postinstall\0"
@@ -2630,7 +2484,6 @@ pub(crate) mod tests {
             Path::new(&gh),
             &[0xcf, 0xfa, 0xed, 0xfe, 0, 0, 0, 0],
         );
-        // The payload's one binary is the team's: only the script refuses this pkg.
         sys.on(&codesign_key(&gh, "VEKTX9H2N7"), ok(""));
         sys.on_write(
             &format!("/usr/sbin/pkgutil --expand-full {stage}/gh_2.102.0_macOS_universal.pkg {x}"),
@@ -2676,7 +2529,6 @@ pub(crate) mod tests {
 
     #[test]
     fn only_an_explicit_false_keeps_a_distribution_s_javascript_from_running_programs() {
-        // gh 2.102.0's own options line.
         assert!(!allows_external_scripts(
             r#"<options hostArchitectures="arm64,x86_64" customize="never" require-scripts="true" allow-external-scripts="false"/>"#
         ));
@@ -2755,7 +2607,6 @@ pub(crate) mod tests {
 
     #[test]
     fn a_path_codesign_cannot_read_is_no_verdict_on_its_signer() {
-        // codesign's own words for an unreadable file, this Mac: exit 1, like "unsigned".
         let sys = Fake::root();
         sys.on(
             &codesign_key("/x", "VEKTX9H2N7"),
@@ -2903,7 +2754,6 @@ pub(crate) mod tests {
         );
     }
     /// The actual swap -> cleanup sequence retains displaced original bytes on
-    /// failed restoration. Files and allocations are entirely the existing RAM Fake.
     #[test]
     fn a_failed_restore_keeps_the_old_bundle_out_of_stage_cleanup() {
         use std::sync::atomic::{AtomicU32, Ordering};
@@ -3055,8 +2905,6 @@ pub(crate) mod tests {
             b"original personal bytes"
         );
 
-        // The guard also preserves old bytes when an operation unwinds after the
-        // initial move and before a result can reach clear_stage.
         let sys = scenario(false, false, true);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let stage = fresh_stage(&sys).unwrap();
@@ -3113,8 +2961,6 @@ pub(crate) mod tests {
                 .any(|call| call.starts_with("/usr/bin/codesign"))
         );
 
-        // A valid-looking captured fragment is not proof there are no unseen Scripts
-        // or other payloads. Refusal comes before signer evidence can admit it.
         let mut refused = Vec::new();
         for why in [
             "stdout did not reach EOF",
@@ -3137,8 +2983,6 @@ pub(crate) mod tests {
                     .any(|call| call.starts_with("/usr/bin/codesign")),
             ));
         }
-        // Exact path bytes matter too: a lossy-decoded alias with a valid signature
-        // is evidence for a different path, not the invalid byte name in the record.
         let sys = Fake::root();
         sys.on(
             "/usr/sbin/pkgutil --expand-full /input.pkg /scratch/expanded",

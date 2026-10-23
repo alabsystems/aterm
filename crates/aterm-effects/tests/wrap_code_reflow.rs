@@ -1,42 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A word typed into Claude Code's composer just before an `[Image #1]` chip keeps its band
-//! while the box re-wraps it. `claude_wrap_band.rs` pins the soft-wrapped caret; this file pins
-//! the neighbouring shapes of the same insert.
-//!
-//! Claude Code (recorded in a headless aterm, 64×20, alt screen, DEC 2026 answered) writes each
-//! key as one home-addressed cell diff inside `?2026h ?25l … ?25h ?2026l`, no `CSI 2K`: the
-//! typed glyph plus every cell the insert shifted, `ESC[K` where a row got shorter, the caret
-//! last. Typed letters glue to the chip (`a[Image` is one word to Ink's wrap), so the word
-//! re-wraps between rows as it grows and back up when a Space splits it off. The synthetic
-//! composer below is modelled on that recording (64 columns, text columns 2..=61, continuation
-//! indent 2, the chip atomic under Left).
-//!
-//! * A: the key that pushes the word down is judged at once, not held as a cross-row footer
-//!   park, when the glass shows the key carried the text down
-//!   (`CursorGlow::key_pushed_text_down`).
-//! * B1/B2: the ribbon measures a re-wrapped word (`Ribbon::moved_word_len`) from the later of
-//!   the last typed Space and where the hand last arrived (`Ribbon::arrived`), so navigating
-//!   into program text or a pasted Space neither leaves the first letter dark nor relays cells
-//!   onto the blank indent.
-//! * B3: an arrival reaches back over the contiguous live typed cells left of it, bounded by
-//!   the typed Space, so a mid-word typo fix or scrub does not cut the measure.
-//! * B4: a token the box hard-breaks (wrap-ansi `hard`, modelled): the key filling the last
-//!   column is drawn there over the glyph it pushed and the caret alone wraps;
-//!   `CursorGlow::soft_wrapped_caret` accepts an origin the key's fresh glyph replaced, so
-//!   nothing lands on the indent.
-//! * C: a Space lets the word fit row 1 again: Ink writes it at row 1's end and the caret stays
-//!   before `[Image`, a same-row backward typed move. The seam reads the lift off the probes
-//!   (`CursorGlow::lifted_word`) and judges it at once; the ribbon relays the word's lit cells
-//!   under its glyphs (`Ribbon::lift_word`).
-//! * D: a soft-wrapped word comes down only with its text: the relay needs the word's columns
-//!   blank on its row (`CursorGlow::carried_word_left`), so a burst or paste after a one-letter
-//!   word leaves its light in place.
-//!
-//! Every take drives a real [`Terminal`] sampled as the host samples it (differences on
-//! [`Host`]) and [`CursorGlow`] ticked every 16 ms with the hints the app stamps per key; the
-//! census reads the plan's coverage per column of the two composer rows.
+//! A word typed into Claude Code's composer just before an `[Image #1]` chip keeps its band while the box re-wraps it.
 
 use aterm_core::render::GlowQuad;
 use aterm_core::terminal::Terminal;
@@ -68,11 +33,8 @@ const CHIP: &str = "[Image #1]";
 /// What the recorded takes type before the chip.
 const TYPED: &str = "already been runnignin ";
 /// Take 3's geometry: `have [Image` fits row 1, `have a[Image` does not, so the
-/// first key pushes the glued word down (A).
 const ROW1_EXACT: &str = "the aterm window had this prompt appear. you did have";
 /// One column more: `a` fits and `al[Image` wraps, so the second key moves the
-/// first letter down (B1, B2); the Space after `already` lets it fit row 1
-/// again (C).
 const ROW1_ONE_FITS: &str = "the aterm window had this prompt appear. you do have";
 /// Where the lifted `already` stands on row 1 in that geometry.
 const LIFTED: std::ops::RangeInclusive<usize> = 55..=61;
@@ -159,7 +121,6 @@ struct Shot {
 
 impl Shot {
     /// Live cells on the continuation row at or right of the caret, when the
-    /// caret is on it: light over text this insert has not written yet.
     fn live_ahead_on_row2(&self) -> Vec<usize> {
         if usize::from(self.caret.0) != ROW2 {
             return Vec::new();
@@ -173,13 +134,6 @@ impl Shot {
 }
 
 /// A real terminal and the glow engine, sampled in the host's order (`app_render.rs`: the
-/// caret row's probe and its two neighbours, the print anchor, every row the ribbon wants), a
-/// frame after every PTY read and on a 16 ms train. Not host-exact: the probe is always
-/// `ProbeTrust::Full`; there is no content-scroll sync, `drop_row_probe` or `note_pane_rows`; a
-/// frame is presented inside an open `?2026` bracket; the caret row's witness sample precedes
-/// the print anchor; an arrow stamps `note_motion` without `clear_typed`, a Backspace
-/// `note_backspace` rather than `note_backspace_erasing`. `claude_wrap_band.rs`'s harness is
-/// host-faithful.
 struct Host {
     term: Terminal,
     glow: CursorGlow,
@@ -250,7 +204,6 @@ impl Host {
     }
 
     /// The census of this frame: the caret, the two composer rows' text and
-    /// lit columns.
     fn shot(&mut self, label: &str) -> Shot {
         let mut text = [String::new(), String::new()];
         let mut lit = [Vec::new(), Vec::new()];
@@ -298,8 +251,6 @@ impl Host {
     }
 }
 
-// The real bytes.
-
 enum Rec {
     Out(Vec<u8>),
     In(Vec<u8>),
@@ -333,7 +284,6 @@ fn recording(src: &str) -> Vec<(u64, Rec)> {
 }
 
 /// The typed keys of the take whose program text contains `marker`, as
-/// `(key, ms of its echo)` — the echo is the next synchronized chunk.
 fn take_keys(rec: &[(u64, Rec)], marker: &str) -> Vec<(char, u64)> {
     let start = rec
         .iter()
@@ -345,7 +295,8 @@ fn take_keys(rec: &[(u64, Rec)], marker: &str) -> Vec<(char, u64)> {
     for (i, (ms, e)) in rec.iter().enumerate().skip(start + 1) {
         let Rec::In(b) = e else { continue };
         if b.len() > 3 {
-            break; // the next take's setup
+            // the next take's setup
+            break;
         }
         let [c] = b.as_slice() else { continue };
         if !(0x20..0x7f).contains(c) {
@@ -355,7 +306,8 @@ fn take_keys(rec: &[(u64, Rec)], marker: &str) -> Vec<(char, u64)> {
             .last()
             .is_some_and(|&(_, last)| ms.saturating_sub(last) > 5_000)
         {
-            break; // a later probe, not this take's typing
+            // a later probe, not this take's typing
+            break;
         }
         let echo = rec[i + 1..]
             .iter()
@@ -369,9 +321,6 @@ fn take_keys(rec: &[(u64, Rec)], marker: &str) -> Vec<(char, u64)> {
 }
 
 /// Replay the recording read by read with the hints the app stamps
-/// (`note_typed_expected` for a printable key, `note_motion` for an arrow or
-/// End, nothing for program text), censusing the composer rows on every frame
-/// inside `window` (ms).
 fn replay(window: (u64, u64)) -> Vec<Shot> {
     let mut h = Host::new();
     let mut shots = Vec::new();
@@ -420,24 +369,16 @@ fn at(shots: &[Shot], ms: u64) -> &Shot {
         .unwrap_or_else(|| panic!("a frame at {ms} ms"))
 }
 
-// The synthetic composer: Claude Code's box, modelled on the capture.
-
 /// How the composer breaks a word wider than its row.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Wrap {
     /// Never: the word overflows (as in every recorded take).
     Word,
     /// wrap-ansi's `hard: true`, which Ink passes: a word wider than a row is
-    /// broken at the row's end when moving it down would not save a row, so a
-    /// token begun at the row's first text column stays and overflows.
-    /// Modelled, not recorded.
     Hard,
 }
 
 /// Where each char of `text` sits `(text row, grid col)`, plus the caret's cell
-/// at the end. Ink's greedy wrap: a word that does not fit goes down whole and
-/// the Space before it is eaten at the end of the row it left; the chip's inner
-/// Space splits it like any other.
 fn layout(text: &[char], wrap: Wrap) -> Vec<(usize, usize)> {
     let mut pos = Vec::with_capacity(text.len() + 1);
     let (mut row, mut len) = (0usize, 0usize);
@@ -455,8 +396,6 @@ fn layout(text: &[char], wrap: Wrap) -> Vec<(usize, usize)> {
             .unwrap_or(text.len());
         let w = end - i;
         let down = if hard && w > TEXT_W {
-            // wrap-ansi's own count: the breaks the word needs starting on
-            // this row against starting on the next.
             let here = 1 + (w - (TEXT_W - len) - 1) / TEXT_W;
             let there = (w - 1) / TEXT_W;
             there < here
@@ -502,9 +441,6 @@ fn caret_cell(text: &[char], caret: usize, wrap: Wrap) -> (u16, u16) {
 }
 
 /// Claude Code's chunk for `old -> new`: per changed row the changed cell runs,
-/// the first addressed from home (`ESC[H CR ESC[nC ESC[mB`), the rest by
-/// `ESC[nG`, `EL` where a row got shorter; then the status park and the caret,
-/// inside the DEC 2026 bracket with the caret hidden.
 fn frame_bytes(old: &[Vec<char>; 2], new: &[Vec<char>; 2], caret: (u16, u16)) -> Vec<u8> {
     let mut s = String::from("\x1b[?2026h\x1b[?25l");
     for r in 0..2 {
@@ -558,7 +494,6 @@ struct Faults {
     /// `(ms, col)`: light on the continuation row's blank indent.
     indent: Vec<(u64, usize)>,
     /// `(ms, row, col)`: light on a row's blank tail one cell past its text (a
-    /// band head at a caret parked after the text is allowed).
     stranded: Vec<(u64, usize, usize)>,
 }
 
@@ -583,7 +518,6 @@ impl Faults {
 }
 
 /// The synthetic take: the box on a real terminal, the composer model
-/// driving it, a shot per frame.
 struct Cc {
     h: Host,
     text: Vec<char>,
@@ -606,7 +540,6 @@ struct Cc {
 
 impl Cc {
     /// The box painted with `text` as program output (a paste, a recall:
-    /// nothing typed), the caret at `caret`.
     fn new(text: &str, caret: usize) -> Self {
         Self::with_wrap(text, caret, Wrap::Word)
     }
@@ -686,7 +619,6 @@ impl Cc {
     }
 
     /// The hint the app stamps for a typed key (`app_input.rs`:
-    /// `note_typed_expected`), `gap_ms` after the last event.
     fn press(&mut self, ch: char, gap_ms: u64) {
         self.idle(gap_ms);
         self.label = format!("key {ch:?}");
@@ -697,7 +629,6 @@ impl Cc {
     }
 
     /// The pressed key's echo `echo_ms` later: the model takes the glyph at
-    /// the caret and the box is repainted.
     fn echo(&mut self, ch: char) {
         self.idle(self.echo_ms);
         self.text.insert(self.caret, ch);
@@ -733,7 +664,6 @@ impl Cc {
     }
 
     /// Program output outside the box model (a footer, an erase), one
-    /// synchronized chunk, one frame.
     fn program(&mut self, bytes: &str) {
         self.label = "program".into();
         self.h
@@ -769,7 +699,6 @@ impl Cc {
     }
 
     /// Walk the caret back with Left to just before the chip, pause, and
-    /// type `typed` at `gap_ms`; returns the first shot of the typing.
     fn insert_before_chip(&mut self, typed: &str, gap_ms: u64) -> usize {
         let chip: Vec<char> = CHIP.chars().collect();
         while !self.text[self.caret..].starts_with(&chip) {
@@ -793,7 +722,6 @@ impl Cc {
     }
 
     /// The two rows frame by frame, for the shots inside `ms` (a failure's
-    /// picture).
     fn dump(&self, ms: (u64, u64)) -> String {
         let mut out = String::new();
         for s in self.shots.iter().filter(|s| (ms.0..=ms.1).contains(&s.ms)) {
@@ -848,8 +776,6 @@ fn painted(row1: &str) -> Cc {
 }
 
 /// Row 1 typed by the hand up to its last word, with the Space after it and
-/// the chip arriving as program text (a paste): the last typed Space is the
-/// one before `have`.
 fn typed_but_the_last_space(row1: &str) -> Cc {
     let mut cc = Cc::new("", 0);
     cc.type_str(row1, 110);
@@ -858,9 +784,6 @@ fn typed_but_the_last_space(row1: &str) -> Cc {
 }
 
 /// A key pressed mid-line on row 1 (`x` before `prompt`) answered first by a
-/// program chunk that parks the caret one row down after writing `glyph` (a
-/// footer), erasing row 1 from the caret when `erase_tail`; the key's echo
-/// follows 60 ms later. Returns the take and the `x`'s column.
 fn footer_before_the_echo(glyph: char, erase_tail: bool) -> (Cc, usize) {
     let text = "the aterm window had this prompt appear";
     let at = text.find("prompt").expect("the word");
@@ -874,7 +797,6 @@ fn footer_before_the_echo(glyph: char, erase_tail: bool) -> (Cc, usize) {
     };
     cc.program(&format!("{erase}\x1b[{};30H{glyph}", ROW2 + 1));
     cc.idle(60);
-    // Claude Code repaints its box whole: the row as the model has it.
     cc.shown = [vec![' '; COLS], vec![' '; COLS]];
     cc.echo_ms = 0;
     cc.echo('x');
@@ -882,10 +804,7 @@ fn footer_before_the_echo(glyph: char, erase_tail: bool) -> (Cc, usize) {
     (cc, PREFIX + at)
 }
 
-// A: the key that pushes the word down is judged, not parked.
-
 /// `have [Image` fills row 1 and `a` sends `a[Image` to row 2: the fold `(16,56) → (17,3)`
-/// reaches the admission ring and every glyph typed on row 2 is lit from 20 ms after its echo.
 #[test]
 fn the_first_key_that_pushes_a_glued_word_down_is_judged_not_parked() {
     let mut cc = painted(ROW1_EXACT);
@@ -896,8 +815,6 @@ fn the_first_key_that_pushes_a_glued_word_down_is_judged_not_parked() {
             .any(|s| s.text[1].starts_with("  a[Image #1] in the")),
         "the take reached the measured fold"
     );
-    // Read before the rest of the insert can push the fold's row out of
-    // the admission ring.
     let judged = cc.h.judged((16, 56), (17, 3));
     let verdicts: Vec<_> =
         cc.h.glow
@@ -921,8 +838,6 @@ fn the_first_key_that_pushes_a_glued_word_down_is_judged_not_parked() {
 }
 
 /// The same fold with the first echo 300 ms late: the press's glyph witness lasts
-/// `IN_FLIGHT_PATIENCE_S`, so the fold is still judged, not held as a cross-row park whose
-/// custody would swallow later keys.
 #[test]
 fn a_delayed_first_key_still_carries_the_glued_word_down() {
     let mut cc = painted(ROW1_EXACT);
@@ -943,13 +858,6 @@ fn a_delayed_first_key_still_carries_the_glued_word_down() {
 }
 
 /// A key's footer keeps the park's custody: a program chunk that parks the
-/// caret one row down after a glyph, then the key's echo on row 1. The row
-/// below never lights and the key's own echo on row 1 is laid, whether the
-/// footer shows the key's own glyph with the input row untouched (the glyph
-/// witness alone must not refuse the park), erases the input row's tail under
-/// a glyph the key did not stamp (a ghost suggestion cleared, a status line),
-/// or erases it under the key's own glyph (the old tail must also follow the
-/// landing glyph to prove the word moved).
 #[test]
 fn a_footer_before_the_echo_keeps_the_parks_custody() {
     for (what, glyph, erase_tail) in [
@@ -975,12 +883,7 @@ fn a_footer_before_the_echo_keeps_the_parks_custody() {
     }
 }
 
-// B1, B2: the moved word is measured from where the hand's run began.
-
 /// B1: the reflowed word keeps its first glyph and the row it left keeps no
-/// scrap. `a` fits at row 1's end; `l` moves `al[Image` down. After `l`'s echo
-/// the `a` at (17, 2) is lit for its band's life, and the old `a` cell on row 1
-/// is dark after a retract fade.
 #[test]
 fn a_word_begun_at_a_navigated_caret_keeps_its_first_glyph_when_it_wraps_down() {
     let mut cc = painted(ROW1_ONE_FITS);
@@ -1020,8 +923,6 @@ fn a_word_begun_at_a_navigated_caret_keeps_its_first_glyph_when_it_wraps_down() 
 }
 
 /// B2: nothing is laid on the continuation row's blank indent. The Space after
-/// the last word came with the pasted chip, so the last typed Space is the one
-/// before `have`. No frame lights columns 0–1 of row 2.
 #[test]
 fn a_stale_typed_space_lays_nothing_on_the_continuation_indent() {
     let mut cc = typed_but_the_last_space(ROW1_ONE_FITS);
@@ -1042,8 +943,6 @@ fn a_stale_typed_space_lays_nothing_on_the_continuation_indent() {
     assert_eq!(first, 0, "{}", f.summary());
 }
 
-// B3: a move inside the hand's own lit word does not cut the measure.
-
 /// Program text the hand types after: row 1's columns 2..=41.
 const PROG: &str = "the aterm window had this prompt appear.";
 
@@ -1051,9 +950,6 @@ const PROG: &str = "the aterm window had this prompt appear.";
 type FrameCols = Vec<(u64, Vec<usize>)>;
 
 /// A re-wrap's census from the wrap key's echo at `wrap` ms. `dark`: frames
-/// 30..=400 ms after it where a column of the moved word (`word`) on row 2 is
-/// dark. `stranded`: frames from two retract fades after it to 1.5 s where row
-/// 1 is lit past its text.
 fn rewrap_faults(
     cc: &Cc,
     wrap: u64,
@@ -1081,8 +977,6 @@ fn rewrap_faults(
 }
 
 /// Type `word` after [`PROG`], let `edit` walk and finish it, then press `key`:
-/// the word no longer fits row 1 and moves whole to row 2, caret after `key`.
-/// Returns the take and the wrap key's echo.
 fn word_then_wrap(word: &str, edit: impl FnOnce(&mut Cc), key: char) -> (Cc, u64) {
     let mut cc = Cc::new(PROG, PROG.chars().count());
     cc.burst = cc.keys;
@@ -1121,11 +1015,6 @@ fn assert_rewrap_clean(cc: &Cc, wrap: u64, word: std::ops::RangeInclusive<usize>
 }
 
 /// B3: a typo fixed inside the word being typed does not cut its measure.
-/// ` crates/aterm-efects` fills row 1; Left ×4 walks back over the hand's own
-/// lit letters and the missing `f` is inserted, so `crates/aterm-effects` goes
-/// down whole, caret after the `f` at (17, 18). Every letter before the caret
-/// is lit from 30 ms after the wrap, and row 1's tail is dark two retract
-/// fades later.
 #[test]
 fn a_typo_fixed_inside_the_word_keeps_the_word_lit_when_it_wraps_down() {
     let (cc, wrap) = word_then_wrap(
@@ -1142,8 +1031,6 @@ fn a_typo_fixed_inside_the_word_keeps_the_word_lit_when_it_wraps_down() {
 }
 
 /// B3: a scrub over the word being typed does not cut its measure.
-/// ` crates/aterm-eff`, Left ×2, Right ×2, then `ect` and `s`: the word goes
-/// down whole, every letter lit on row 2, row 1's tail dark.
 #[test]
 fn a_scrub_over_the_word_keeps_the_word_lit_when_it_wraps_down() {
     let (cc, wrap) = word_then_wrap(
@@ -1160,13 +1047,7 @@ fn a_scrub_over_the_word_keeps_the_word_lit_when_it_wraps_down() {
     assert_rewrap_clean(&cc, wrap, 2..=21, "scrub");
 }
 
-// B4: a token the box hard-breaks moved nothing down.
-
 /// B4: the hand walks Left to the start of row 1 (an arrival at (16, 2)) and types one unbroken
-/// token glued to `hello`. The 60th key fills row 1's last text column and the box breaks the
-/// token ([`Wrap::Hard`]): the glyph is drawn at (16, 61) over the `h` it pushed, and the caret
-/// alone goes to (17, 2). Every typed glyph stays lit for its band's life and nothing lights
-/// the indent.
 #[test]
 fn a_token_the_box_hard_breaks_keeps_its_band_on_the_row_it_fills() {
     let mut cc = Cc::with_wrap("hello", 5, Wrap::Hard);
@@ -1204,13 +1085,7 @@ fn a_token_the_box_hard_breaks_keeps_its_band_on_the_row_it_fills() {
     );
 }
 
-// C: the lifted word goes up with its light.
-
 /// C: a Space that lets the word fit the row above again carries its band up.
-/// `already` typed on row 2 before the chip, then the Space: `already` is
-/// written at row 1's end and the caret stays before `[Image`. Next frame every
-/// glyph of the lifted word on row 1 is lit; from the Space on no live cell
-/// stands on row 2 at or right of the caret; the indent stays dark.
 #[test]
 fn a_space_that_lets_the_word_fit_the_row_above_carries_its_band_up() {
     let mut cc = painted(ROW1_ONE_FITS);
@@ -1249,16 +1124,10 @@ fn a_space_that_lets_the_word_fit_the_row_above_carries_its_band_up() {
     assert!(f.indent.is_empty(), "{}", f.summary());
 }
 
-// D: a soft-wrapped word comes down only when its text did.
-
 /// Program text to row 1's column 59; ` I` typed after it puts the `I` on
-/// row 1's last text column.
 const PROG_58: &str = "the aterm window had this prompt appear. you do have a lot";
 
 /// The soft-wrapped caret in the synthetic box: ` I` typed after [`PROG_58`],
-/// the `I` drawn at (16, 61) and the caret alone wrapped to (17, 2). Then
-/// `keys` pressed 4 ms apart and one chunk `echo` (after the box's own `?2026`
-/// bracket) answering them all. Returns the take and the chunk's ms.
 fn soft_wrap_then(keys: &str, echo: &str) -> (Cc, u64) {
     let mut cc = Cc::new(PROG_58, PROG_58.chars().count());
     cc.key(' ', 110);
@@ -1291,9 +1160,6 @@ fn soft_wrap_then(keys: &str, echo: &str) -> (Cc, u64) {
 }
 
 /// D: the key that reflows the soft-wrapped word carries its light down. `b`
-/// after the soft-wrapped `I` makes `Ib` one word: the `I` is erased from row
-/// 1's end and `Ib` written from the indent, caret (17, 4). The `I`'s light
-/// leaves row 1 and is relaid at (17, 2) (`Ribbon::settle_carry`).
 #[test]
 fn a_soft_wrapped_word_the_next_key_reflows_comes_down_with_its_light() {
     let echo = format!(
@@ -1326,10 +1192,6 @@ fn a_soft_wrapped_word_the_next_key_reflows_comes_down_with_its_light() {
 }
 
 /// D: a word that stayed on its row keeps its light there. The same
-/// soft-wrapped `I`, then a Space and `b` answered by one chunk (a burst or
-/// paste): `I` stays at row 1's end, the Space and `b` are written from the
-/// indent, and the caret hops (17, 2) → (17, 4). The `I`'s cell on row 1 stays
-/// live.
 #[test]
 fn a_soft_wrapped_word_that_stays_on_its_row_keeps_its_light_there() {
     let echo = format!(
@@ -1367,12 +1229,7 @@ fn a_soft_wrapped_word_that_stays_on_its_row_keeps_its_light_there() {
     );
 }
 
-// Claude Code's recorded bytes.
-
 /// Take 3 (`you did have`) and take 4 (one column more, `you do have`), replayed read by read
-/// with the app's hints. Take 3: every typed glyph lit (A). Take 4: (17, 2) lit after `l`'s echo
-/// and (16, 55) dark a retract fade later (B1), and the lifted `already` lit on row 1 after the
-/// Space (C).
 #[test]
 fn claude_codes_recorded_reflow_keeps_every_typed_glyph_lit_and_strands_nothing() {
     let rec = recording(REC);
@@ -1381,7 +1238,6 @@ fn claude_codes_recorded_reflow_keeps_every_typed_glyph_lit_and_strands_nothing(
     assert_eq!(exact.len(), TYPED.len(), "take 3's keys: {exact:?}");
     assert_eq!(one.len(), 13, "take 4's keys: {one:?}");
     let shots = replay((exact[0].1, one.last().expect("keys").1 + 1_000));
-    // Take 3: the typed text stands on row 2 at columns 2..=24.
     let end = at(&shots, exact.last().expect("keys").1 + 100);
     assert!(
         end.text[1].starts_with("  already been runnignin [Image #1] in the"),
@@ -1394,8 +1250,6 @@ fn claude_codes_recorded_reflow_keeps_every_typed_glyph_lit_and_strands_nothing(
         .map(|(i, _)| PREFIX + i)
         .collect();
     let dark: Vec<usize> = glyphs.iter().copied().filter(|&c| !end.lit[1][c]).collect();
-    // Take 4: `l` (the 2nd key) moved `a` down; the Space (the 8th) lifted
-    // `already` back up.
     let wrap = one[1].1;
     let s = at(&shots, wrap + 50);
     let late = at(&shots, wrap + (RETRACT_FADE_S * 1000.0) as u64 + 50);
@@ -1449,10 +1303,7 @@ fn claude_codes_recorded_reflow_keeps_every_typed_glyph_lit_and_strands_nothing(
     assert!(faults.is_empty(), "{}", faults.join("\n"));
 }
 
-// Controls.
-
 /// The same wrap with the typed Space exactly before the moved word: the letter
-/// is relaid, the indent stays dark, row 1 keeps no scrap past a retract fade.
 #[test]
 fn control_a_word_after_the_hands_own_space_is_relaid_exactly() {
     let mut cc = Cc::new("", 0);

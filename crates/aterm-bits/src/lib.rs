@@ -1,37 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! `aterm-bits` — minimal `Pod`/`Zeroable` traits and byte-casting helpers.
-//!
-//! Zero-external-dependency replacement for the subset of [`bytemuck`] used by
-//! aterm. Covers the GPU transmute paths in `aterm-gpu`:
-//!
-//! | bytemuck API                    | aterm-bits equivalent           |
-//! |---------------------------------|---------------------------------|
-//! | `bytemuck::Pod` (trait)         | [`Pod`]                         |
-//! | `bytemuck::Zeroable` (trait)    | [`Zeroable`]                    |
-//! | `bytemuck::cast_slice`          | [`cast_slice`]                  |
-//! | `bytemuck::try_cast_slice`      | [`try_cast_slice`]              |
-//! | `bytemuck::bytes_of`            | [`bytes_of`]                    |
-//!
-//! # Deriving
-//!
-//! Unlike bytemuck this crate ships no proc-macro derive. All `Pod`/`Zeroable`
-//! implementations are written manually as `unsafe impl` blocks at the call
-//! site. This keeps the crate surface tiny and the safety contract explicit.
-//!
-//! # Safety model
-//!
-//! Both [`Pod`] and [`Zeroable`] are `unsafe trait`s. The implementor
-//! guarantees:
-//!
-//! * `Zeroable`: the all-zero bit pattern is a valid value of the type.
-//! * `Pod`: every bit pattern of `size_of::<Self>()` bytes is a valid value,
-//!   the type is [`Copy`], contains no padding with uninitialized bytes, and
-//!   contains no references, pointers, or `!Send`/`!Sync` handles.
-//!
-//! Implementors are responsible for verifying these properties; this crate
-//! only provides the machinery to transmute once they hold.
+//! `aterm-bits`.
 
 #![warn(missing_docs)]
 #![warn(clippy::undocumented_unsafe_blocks)]
@@ -43,57 +13,30 @@ use core::slice;
 /// Types whose all-zero bit pattern is a valid value.
 ///
 /// # Safety
-///
-/// Implementors must guarantee that `[0u8; size_of::<Self>()]` interpreted
-/// as `Self` is a sound, fully-initialized value. Enums must cover the 0
-/// discriminant; structs must have every field implement `Zeroable`;
-/// references, `NonZero*`, and any type with niche optimizations that
-/// exclude 0 are not `Zeroable`.
+/// Implementors must guarantee that `[0u8; size_of::<Self>()]` interpreted as `Self` is a sound, fully-initialized value.
 pub unsafe trait Zeroable: Sized {
     /// Returns the all-zero bit pattern for this type.
     #[inline]
     #[must_use]
     fn zeroed() -> Self {
-        // SAFETY: by the `Zeroable` trait contract, the all-zero bit pattern
-        // is a valid value of `Self`.
+        // SAFETY: by the `Zeroable` trait contract, the all-zero bit pattern is a valid value of `Self`.
         unsafe { core::mem::zeroed() }
     }
 }
 
-/// Plain-old-data: types for which every bit pattern of
-/// `size_of::<Self>()` bytes is a valid value.
-///
-/// This enables sound transmutes between `&[Self]` and `&[u8]` (and vice
-/// versa) and lets us read values directly from raw memory / network / GPU
-/// buffers without going through a parser.
+/// Plain-old-data.
 ///
 /// # Safety
-///
-/// Implementors must satisfy *every* bullet:
-///
-/// 1. The type is `Copy`.
-/// 2. The type is `'static` — no lifetimes.
-/// 3. The type contains no references, raw pointers, function pointers,
-///    `NonZero*`, or any niche-optimized discriminants.
-/// 4. The type has a well-defined layout (`#[repr(C)]`, `#[repr(transparent)]`,
-///    or a primitive).
-/// 5. There are **no padding bytes** with indeterminate contents. If the
-///    struct has padding, the declared fields must cover every byte (use
-///    explicit `_padding: [u8; N]` fields).
-/// 6. Every field of the type is itself `Pod`.
+/// Implementors must satisfy *every* bullet.
 pub unsafe trait Pod: Zeroable + Copy + 'static {}
 
 macro_rules! impl_pod_zeroable_primitive {
     ($($t:ty),* $(,)?) => {
         $(
-            // SAFETY: `$t` is a built-in primitive integer/float. All bit
-            // patterns of the appropriate size are valid values of the type,
-            // and the all-zero bit pattern corresponds to the value `0` /
-            // `0.0` which is always valid.
+            // SAFETY: `$t` is a built-in primitive integer/float.
 
             unsafe impl Zeroable for $t {}
-            // SAFETY: see above — `$t` is `Copy + 'static`, has a canonical
-            // layout, and every bit pattern is a valid value.
+            // SAFETY: see above — `$t` is `Copy + 'static`, has a canonical layout, and every bit pattern is a valid value.
 
             unsafe impl Pod for $t {}
         )*
@@ -104,22 +47,17 @@ impl_pod_zeroable_primitive!(u8, u16, u32, u64, u128, usize);
 impl_pod_zeroable_primitive!(i8, i16, i32, i64, i128, isize);
 impl_pod_zeroable_primitive!(f32, f64);
 
-// SAFETY: `()` is a ZST; there are no bytes, so trivially every bit pattern
-// (i.e. the empty one) is valid and all-zero is sound.
+// SAFETY: `()` is a ZST.
 
 unsafe impl Zeroable for () {}
 // SAFETY: see above.
 
 unsafe impl Pod for () {}
 
-// Arrays of Pod are Pod (arrays of Zeroable are Zeroable) for all lengths.
-// SAFETY: `[T; N]` has layout `T` repeated `N` times with no extra padding
-// (stable guarantee). If every `T` byte pattern is valid, so is every
-// `[T; N]` byte pattern. Same argument for `Zeroable`.
+// SAFETY: `[T; N]` has layout `T` repeated `N` times with no extra padding (stable guarantee).
 
 unsafe impl<T: Zeroable, const N: usize> Zeroable for [T; N] {}
-// SAFETY: see above; additionally `[T; N]: Copy` when `T: Copy`, and `[T; N]`
-// is `'static` when `T: 'static`.
+// SAFETY: see above; additionally `[T; N]: Copy` when `T: Copy`, and `[T; N]` is `'static` when `T: 'static`.
 
 unsafe impl<T: Pod, const N: usize> Pod for [T; N] {}
 
@@ -152,14 +90,7 @@ impl core::fmt::Display for PodCastError {
 
 impl core::error::Error for PodCastError {}
 
-/// Panics with `"<op> failed: <message>"` where `<message>` is byte-identical
-/// to the [`PodCastError`] `Display` text (keep the literals in sync with
-/// `Display for PodCastError` above; `exact_panic_message_matches_display`
-/// in the test module guards this).
-///
-/// Each message is a single compile-time string literal (via `concat!`), so
-/// the panic path carries no runtime `fmt::Arguments` machinery — same panic,
-/// same text as `panic!("<op> failed: {err}")`.
+/// Panics with `"<op> failed: <message>"` matching the [`PodCastError`] `Display` text.
 macro_rules! panic_cast_failed {
     ($op:literal, $err:expr) => {
         match $err {
@@ -182,14 +113,7 @@ macro_rules! panic_cast_failed {
 /// Cast `&[A]` to `&[B]` where both are `Pod`.
 ///
 /// # Panics
-///
 /// * If `size_of::<B>() == 0` but `size_of::<A>() != 0` (or vice versa).
-/// * If the source byte length is not an integer multiple of
-///   `size_of::<B>()`.
-/// * If the source slice's starting address is not aligned to
-///   `align_of::<B>()`.
-///
-/// Use [`try_cast_slice`] to handle these cases as errors instead.
 #[inline]
 #[must_use]
 pub fn cast_slice<A: Pod, B: Pod>(src: &[A]) -> &[B] {
@@ -199,43 +123,27 @@ pub fn cast_slice<A: Pod, B: Pod>(src: &[A]) -> &[B] {
     }
 }
 
-/// Fallible [`cast_slice`] — returns [`PodCastError`] instead of panicking.
-///
-/// The size/alignment checks are written inline (rather than shared through
-/// a helper) so the Trust verifier sees each check as a path condition on
-/// the same function body as the `unsafe` slice construction it justifies —
-/// the modular checker cannot carry such facts across a call boundary.
+/// Fallible [`cast_slice`].
 #[inline]
 pub fn try_cast_slice<A: Pod, B: Pod>(src: &[A]) -> Result<&[B], PodCastError> {
     let a_size = size_of::<A>();
     let b_size = size_of::<B>();
     let byte_len = size_of_val(src);
 
-    // Handle the ZST corner cases cleanly — either both sides are ZST (OK,
-    // empty slice) or neither is, otherwise the cast is nonsensical.
     if a_size == 0 || b_size == 0 {
         if a_size == b_size {
-            // Empty slice of B. Use a fresh empty slice (dangling, aligned)
-            // rather than rebuilding one at `src`'s address: `src` need not
-            // be aligned for `B` here, and an empty slice's address is not
             // observable through the slice API.
             return Ok(&[]);
         }
         return Err(PodCastError::SizeMismatch);
     }
 
-    // Use `<[A]>::as_ptr().cast::<B>()` so the Trust verifier preserves pointer provenance.
     let ptr_a = src.as_ptr();
 
-    // Alignment check — source pointer must already be aligned for B,
-    // otherwise the cast produces an UB-adjacent misaligned reference.
-    // (`as usize` is a pure PtrToInt MIR cast the verifier models as an
-    // obligation-free address exposure; `.addr()` is an unlowerable call.)
     if !(ptr_a as usize).is_multiple_of(align_of::<B>()) {
         return Err(PodCastError::TargetAlignmentGreaterAndInputNotAligned);
     }
 
-    // Size check — every byte must be covered by an integer number of Bs.
     if !byte_len.is_multiple_of(b_size) {
         return Err(PodCastError::OutputSliceWouldHaveSlop);
     }
@@ -243,21 +151,10 @@ pub fn try_cast_slice<A: Pod, B: Pod>(src: &[A]) -> Result<&[B], PodCastError> {
     let out_len = byte_len / b_size;
     let ptr_b = ptr_a.cast::<B>();
     if (ptr_b as usize) == 0 {
-        // Unreachable: a pointer derived from a reference is never null. The
-        // guard hands the verifier the non-null fact it cannot carry across
-        // the pointer cast; behavior is unchanged. (Integer compare instead
         // of `is_null()`: the latter is an unlowerable call boundary.)
         return Ok(&[]);
     }
-    // SAFETY: the checks above (all on this path) verified:
-    //   * `ptr_b` is non-null and aligned to `align_of::<B>()`.
-    //   * `out_len * size_of::<B>() <= byte_len == size_of_val(src)` bytes of
-    //     initialized memory are reachable from `ptr_b` (it is `src`'s own
-    //     data pointer).
-    //   * Both `A` and `B` are `Pod`, so every bit pattern of
-    //     `size_of::<B>() * out_len` bytes is a valid `[B; out_len]`.
-    //   * The returned lifetime is tied to `&[A]`, so `B` cannot outlive it.
-    // Therefore `from_raw_parts` produces a sound `&[B]`.
+    // SAFETY: the checks above (all on this path) verified.
     Ok(unsafe { slice::from_raw_parts(ptr_b, out_len) })
 }
 
@@ -265,20 +162,12 @@ pub fn try_cast_slice<A: Pod, B: Pod>(src: &[A]) -> Result<&[B], PodCastError> {
 #[inline]
 #[must_use]
 pub fn bytes_of<T: Pod>(value: &T) -> &[u8] {
-    // Pure cast chain from the reference (no opaque `as_ptr` call) so the
-    // verifier can connect the pointer to `value`'s allocation.
     let ptr = core::ptr::from_ref(value).cast::<u8>();
     if ptr.is_null() {
-        // Unreachable: a pointer derived from a reference is never null. The
-        // guard hands the verifier the non-null fact it cannot carry across
         // the pointer cast; behavior is unchanged.
         return &[];
     }
-    // SAFETY: `ptr` is non-null (guarded above), trivially aligned for `u8`,
-    // and points at `value`, so exactly `size_of::<T>()` bytes are reachable;
-    // `T: Pod` guarantees those bytes are fully initialized (no padding)
-    // with a well-defined layout. The returned slice borrows from `value`,
-    // so its lifetime is bounded correctly.
+    // SAFETY: `ptr` is non-null (guarded above), trivially aligned for `u8`, and points at `value`, so exactly `size_of::<T>()` bytes are reachable.
     unsafe { slice::from_raw_parts(ptr, size_of::<T>()) }
 }
 
@@ -290,13 +179,7 @@ pub const POD_CAST_WIRE_BYTES: usize = 16;
 
 /// Pure `const fn` validation of a slice cast's size and alignment parameters.
 ///
-/// Returns `Ok(out_len)` when a source slice of `src_byte_len` bytes at
-/// address `src_addr` with element size `a_size` can be soundly cast to a
-/// slice of elements with size `b_size` and alignment `b_align` (a non-zero
-/// power of two).
-///
 /// # Errors
-///
 /// Returns [`PodCastError`] under the exact same conditions as [`try_cast_slice`].
 #[inline]
 pub const fn validate_pod_cast_params(
@@ -321,8 +204,7 @@ pub const fn validate_pod_cast_params(
     Ok(src_byte_len / b_size)
 }
 
-/// Encode a 16-byte POD layout wire descriptor (`"PODL"` + `elem_size`,
-/// `elem_align`, `elem_count` in little-endian `u32`).
+/// Encode a 16-byte POD layout wire descriptor (`"PODL"` + `elem_size`, `elem_align`, `elem_count` in little-endian `u32`).
 #[inline]
 #[must_use]
 pub const fn encode_pod_layout_wire(
@@ -350,10 +232,7 @@ pub const fn encode_pod_layout_wire(
     ]
 }
 
-/// Decode a 16-byte POD layout wire descriptor produced by
-/// [`encode_pod_layout_wire`].
-///
-/// Rejects descriptors whose alignment is zero or not a power of two.
+/// Decode a 16-byte POD layout wire descriptor produced by [`encode_pod_layout_wire`].
 #[inline]
 #[must_use]
 pub const fn decode_pod_layout_wire(bytes: &[u8]) -> Option<(u32, u32, u32)> {
@@ -416,8 +295,7 @@ pub const fn encode_pod_cast_wire(
     ]
 }
 
-/// Decode a 16-byte POD cast outcome wire descriptor produced by
-/// [`encode_pod_cast_wire`].
+/// Decode a 16-byte POD cast outcome wire descriptor produced by [`encode_pod_cast_wire`].
 #[inline]
 #[must_use]
 pub const fn decode_pod_cast_wire(bytes: &[u8]) -> Option<(u32, u32, u16, Option<PodCastError>)> {
@@ -502,7 +380,6 @@ mod tests {
     }
 
     /// The static literals in `panic_cast_failed!` must stay byte-identical
-    /// to `"<op> failed: "` + the `Display` text of the error variant.
     #[test]
     fn exact_panic_message_matches_display() {
         let slop = panic_message(|| {
@@ -528,8 +405,6 @@ mod tests {
 
         let align = panic_message(|| {
             let buf = [0u8; 8];
-            // Pick an offset that is guaranteed misaligned for u32 at
-            // whatever address `buf` landed on.
             let off = if (buf.as_ptr() as usize) % 4 == 3 {
                 2
             } else {

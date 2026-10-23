@@ -1,50 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Per-session user metadata and event timeline: two small stores on [`crate::SessionCtx`],
-//! shared by `Arc` between the `Session`, its registry
-//! [`crate::session_store::SessionHandle`] and each control connection.
-//!
-//! * [`SessionMeta`]: what a driver calls the session (`meta set <field> …`), not what its
-//!   program sets. The title outranks the OSC 0/2 title in tab labels; `role operator`
-//!   names the fleet operator; a non-empty `attention` badges the menu-bar status item;
-//!   `questions` tells the in-window supervisor how to answer Claude Code's question
-//!   dialog ([`QUESTIONS_POLICY_WORDS`]); `autopilot` (`cruise`, `land` or `off`) sets how
-//!   far the harness carries its work.
-//! * [`SessionTimeline`]: a bounded drop-oldest ring of [`TimelineEvent`]s plus the
-//!   server's published program and agent verdict ([`AgentPublication`]), built like
-//!   [`crate::turn_ledger::TurnLedger`] (same cap, monotonic-ms clock and clamp). Read by
-//!   the `timeline` verb and the `subscribe … events` digest.
-//!
-//! * [`SessionMeta`]: the user-settable identity a driver stamps on a session
-//!   over the control socket (`meta set title|description|icon|role|attention
-//!   …`): a display title that outranks the OSC 0/2 title in tab labels, a
-//!   free-text description, an icon token, a typed `role` (a label the
-//!   menus and the pill name the session by; it elects nothing), a typed `attention` escalation
-//!   (an ask ⇒ the menu-bar status item badges), and a typed `questions` policy word
-//!   for how the in-window supervisor answers Claude Code's question dialog
-//!   ([`QUESTIONS_POLICY_WORDS`], [`normalize_questions_value`]), and its
-//!   typed `autopilot` word for how far the harness carries its work
-//!   (`cruise`, `land` or `off`; [`normalize_autopilot_value`]). This is what
-//!   the operator calls the session, not what the running program sets.
-//! * [`SessionTimeline`]: a bounded, drop-oldest ring of lifecycle events
-//!   (`spawned`, `state-change`, `title-change`, `cwd-change`, `meta-change`,
-//!   `agent-change`, `status-change`, `human`, `harness-act`, `program-state`),
-//!   plus the server's published
-//!   program and agent verdict ([`AgentPublication`]), modeled on
-//!   [`crate::turn_ledger::TurnLedger`] (same cap, monotonic-ms clock and
-//!   clamp). Read by the `timeline` verb and scanned by the `subscribe …
-//!   events` digest for `EVENT <sid> meta …` pushes.
-//!
-//! ## Why `SessionCtx`, not `SessionHandle`
-//!
-//! A `SessionHandle` is a clone in the registry, cloned out per control request
-//! under the store lock; state in its fields would fork on every clone and force
-//! hot-path readers (the per-frame tab-label refill) through a `Store` read
-//! lock. `SessionCtx` holds one copy per session, reachable without the store
-//! lock from the pool session, the registry handle and the control thread. Both
-//! locks are leaves: taken briefly, never across a `Terminal` or `Store` lock.
-
+//! Session timeline, metadata, attention state, and lease claim tracking.
 use std::collections::VecDeque;
 use std::sync::Arc;
 
@@ -58,52 +15,30 @@ pub(crate) const META_TITLE_MAX: usize = 120;
 pub(crate) const META_DESCRIPTION_MAX: usize = 1024;
 /// Byte cap for `meta set icon` (after trim) — an emoji / short token.
 pub(crate) const META_ICON_MAX: usize = 64;
-/// Byte cap for `meta set role` (after trim). Every value is stored verbatim:
-/// a role is a label, and no value elects anything.
+/// Byte cap for `meta set role` (after trim).
 pub(crate) const META_ROLE_MAX: usize = 64;
 /// Byte cap for `meta set attention` (after trim): a one-line needs-human message.
 pub(crate) const META_ATTENTION_MAX: usize = 256;
 /// Byte cap for one keyed attention entry (`meta set attention owner=<k>`), after trim.
-/// Tighter than the bare field's: several owners share one badge.
 pub(crate) const META_ATTENTION_KEYED_MAX: usize =
     aterm_types::control_verbs::META_ATTENTION_KEYED_MAX;
-/// How many attention owners one session holds at once, the bare `-` owner
-/// included (its slot is always kept). A write from a new keyed owner past
-/// that is refused, never evicting another owner's escalation.
+/// How many attention owners one session holds at once, the bare `-` owner included (its slot is always kept).
 pub(crate) const ATTENTION_OWNERS_MAX: usize = 8;
 /// Byte cap for an attention owner key or a supervisor holder name.
 pub(crate) const META_OWNER_MAX: usize = 64;
 /// The owner a bare `meta set attention <text>` writes as.
 pub(crate) const BARE_ATTENTION_OWNER: &str = "-";
-/// Byte cap for `meta set questions` (the stored, normalized value). A storage
-/// bound only: the field is a closed set ([`QUESTIONS_POLICY_WORDS`]), so the
-/// grammar refuses first.
+/// Byte cap for `meta set questions` (the stored, normalized value).
 pub(crate) const META_QUESTIONS_MAX: usize = 16;
 
-/// The policy words `meta set questions` accepts: this session's word for how
-/// the in-window supervisor treats its questions (Claude Code's question
-/// dialog, and by the priority words a question asked in prose), overriding
-/// the global `[harness] answer_questions` and `[harness] question_priority`.
-/// Their meaning belongs to the supervisor (`aterm_agent::supervise`):
-/// - `ask` leaves the dialog to a person (escalated like any box); a prose
-///   question stays the global switch's;
-/// - `recommended` answers the dialog with its recommended option(s) and a
-///   prose question with `answer_text`;
-/// - `long-term` and `short-term` answer by the worker's own choice under that
-///   priority, from a fixed text the supervisor writes into the free-text row
-///   (`aterm_agent::supervise::QuestionPriority::WORDS`, which this list is
-///   built from).
-///
-/// Unset (`questions=-`), the global switch decides; a restore drops a word this build does
-/// not know.
+/// The policy words `meta set questions` accepts.
 pub(crate) const QUESTIONS_POLICY_WORDS: [&str;
     1 + aterm_agent::supervise::QuestionPriority::WORDS.len()] = {
     let w = aterm_agent::supervise::QuestionPriority::WORDS;
     ["ask", w[0], w[1], w[2]]
 };
 
-/// The one usage line every refusal of a `meta set questions` value prints
-/// (after the `ERR ` prefix), built from [`QUESTIONS_POLICY_WORDS`].
+/// The one usage line every refusal of a `meta set questions` value prints, built from [`QUESTIONS_POLICY_WORDS`].
 pub(crate) fn questions_usage() -> String {
     format!(
         "usage: meta set questions {}",
@@ -111,11 +46,7 @@ pub(crate) fn questions_usage() -> String {
     )
 }
 
-/// Normalize a `questions` value to its policy word, or `None` when it is not
-/// one: whitespace is trimmed and ASCII case folded (`Recommended` stores
-/// `recommended`), so every reader compares one spelling. Anything else is
-/// `None`, and the wire answers [`questions_usage`]. Pure: the control verb,
-/// the restore sanitizer and [`SessionMeta::set`]'s second gate all use it.
+/// Normalize a `questions` value to its policy word, or `None` when it is not one.
 #[must_use]
 pub(crate) fn normalize_questions_value(value: &str) -> Option<&'static str> {
     let value = value.trim();
@@ -124,38 +55,20 @@ pub(crate) fn normalize_questions_value(value: &str) -> Option<&'static str> {
         .find(|word| word.eq_ignore_ascii_case(value))
 }
 
-/// Byte cap for `meta set autopilot` (the stored word). A storage bound only, as
-/// [`META_QUESTIONS_MAX`] is: the closed set ([`normalize_autopilot_value`]) refuses first.
+/// Byte cap for `meta set autopilot` (the stored word).
 pub(crate) const META_AUTOPILOT_MAX: usize = 16;
 
-/// The one usage line every refusal of a `meta set autopilot` value prints
-/// (after the `ERR ` prefix, and after the reason where one is named:
-/// `ERR until= goes with cruise only: usage: …`). It spells the three stored
-/// words, in the order the chip cycles them, and the timed Cruise's
-/// `until=` (`docs/DESIGN-harness-autopilot-2026-10-15.md` §9.3.5: a local
-/// `HH:MM`, or `+<n>h`, `+<n>m`, `+<n>h<n>m` of elapsed time); the owner's
-/// own words for two of them (`forever`, `infinity`, `wrap-up`, `wrapup`,
-/// `wrap`) are admitted too and stored as the word they stand for
-/// ([`normalize_autopilot_value`]).
+/// Usage message returned when `meta set autopilot` receives an invalid value.
 pub(crate) const AUTOPILOT_USAGE: &str =
     "usage: meta set autopilot cruise [until=HH:MM|+DURATION]|land|off";
 
-/// Normalize an `autopilot` value to its stored word, or `None` when it names no mode: read
-/// by the supervisor's own reader ([`aterm_agent::supervise::Autopilot::parse`]: trimmed,
-/// any case, aliases included) and stored as that mode's word
-/// ([`aterm_agent::supervise::Autopilot::word`]), so a bare `meta` replies with exactly what
-/// the supervisor's loop reads back. The control verb, the restore sanitizer,
-/// [`SessionMeta::set`]'s second gate and the window's writer (`App::set_session_autopilot`)
-/// all use it.
+/// Normalize an `autopilot` value to its stored word, or `None` when it names no mode.
 #[must_use]
 pub(crate) fn normalize_autopilot_value(value: &str) -> Option<&'static str> {
     aterm_agent::supervise::Autopilot::parse(value).map(aterm_agent::supervise::Autopilot::word)
 }
 
-/// True for characters that must never reach chrome from user metadata: the engine's one table
-/// ([`aterm_messages::text::is_hidden_char`]), shared with the message band and the presence
-/// row. ZWJ/ZWNJ and the variation selectors pass, so emoji, joining scripts and ideographic
-/// variants survive.
+/// True for characters that must never reach chrome from user metadata.
 pub(crate) fn is_forbidden_metadata_char(ch: char) -> bool {
     aterm_messages::text::is_hidden_char(ch)
 }
@@ -165,10 +78,7 @@ pub(crate) fn metadata_has_forbidden_formatting(value: &str) -> bool {
     value.chars().any(is_forbidden_metadata_char)
 }
 
-/// Canonical single-line presentation sanitizer shared by restored metadata
-/// and every user-metadata chrome boundary. Unsafe controls are removed and
-/// the byte cap is applied only between grapheme clusters, so a combining mark
-/// or ZWJ emoji is never bisected.
+/// Canonical single-line presentation sanitizer shared by restored metadata and every user-metadata chrome boundary.
 #[must_use]
 pub(crate) fn sanitize_presentation_line(value: &str, max_bytes: usize) -> String {
     let filtered: String = value
@@ -192,19 +102,13 @@ pub(crate) fn sanitize_presentation_line(value: &str, max_bytes: usize) -> Strin
     sanitized
 }
 
-/// Sanitize one named user metadata field for presentation and persistence. Unknown
-/// fields and values that become empty are unset.
+/// Sanitize one named user metadata field for presentation and persistence.
 #[must_use]
 pub(crate) fn sanitize_metadata_value(field: &str, value: &str) -> Option<String> {
     let cap = SessionMeta::cap(field)?;
-    // `questions` is a closed set: a value from a restore manifest or an older
-    // caller is normalized or dropped, never cut to the cap (which could turn
-    // one word into another).
     if field == MetaField::Questions.wire_name() {
         return normalize_questions_value(value).map(str::to_owned);
     }
-    // So is `autopilot`: a word this build cannot read is dropped (the table's default
-    // then decides), never stored.
     if field == MetaField::Autopilot.wire_name() {
         return normalize_autopilot_value(value).map(str::to_owned);
     }
@@ -212,122 +116,40 @@ pub(crate) fn sanitize_metadata_value(field: &str, value: &str) -> Option<String
     (!value.is_empty()).then_some(value)
 }
 
-/// The bare-attention prefix the retired aterm-link Claude Code hooks wrote (`claude needs
-/// approval: <message>`). Nothing writes or clears it now (`aterm link hook` writes no
-/// meta), so a carried one would outlive the supervisor's own clear: it does not travel.
+/// The bare-attention prefix the retired aterm-link Claude Code hooks wrote (`claude needs approval: <message>`).
 pub(crate) const RETIRED_HOOK_BADGE: &str = "claude needs approval:";
 
-/// [`sanitize_metadata_value`] for an attention carried past this process (a
-/// handoff, a restore, the crash journal) or past its shell (a closed tab
-/// reopened on a fresh one): the retired hooks' badge ([`RETIRED_HOOK_BADGE`])
-/// does not travel. A live `meta set attention` is not filtered.
+/// Sanitize an attention value carried across seamless update handoff.
 #[must_use]
 pub(crate) fn carried_attention(value: &str) -> Option<String> {
     sanitize_metadata_value("attention", value)
         .filter(|value| !value.starts_with(RETIRED_HOOK_BADGE))
 }
 
-/// How many timeline events a session retains (drop-oldest past this), sized
-/// like the turn ledger: a long session stays readable, the ring never grows.
+/// How many timeline events a session retains (drop-oldest past this), sized like the turn ledger.
 pub(crate) const TIMELINE_CAP: usize = 512;
 
-/// Byte cap for one event's stored payload: a short `k=v` wire token string
-/// (values already pct-encoded); the clamp guards against a pathological
-/// title/cwd bloating the ring.
 const MAX_PAYLOAD: usize = 256;
 
-/// The user-settable per-session metadata (`meta set`/`meta unset`). All
-/// fields are `None` until a driver sets them; `user_title` (when set +
-/// non-empty) outranks the live OSC title in tab labels and stays until unset.
+/// The user-settable per-session metadata (`meta set`/`meta unset`).
 #[derive(Default, Clone, Debug)]
 pub(crate) struct SessionMeta {
-    /// Operator-chosen display title, the top rung of the tab-label chain.
     pub user_title: Option<String>,
-    /// Free-text purpose/notes for the session (agents leave context here).
     pub description: Option<String>,
-    /// Icon token (emoji or short name), shown in the pane header and session chrome.
     pub icon: Option<String>,
-    /// Typed role token: a label, the first rung the menus and the pill
-    /// name the session by. No value elects anything.
     pub role: Option<String>,
-    /// Typed needs-human escalation: non-empty ⇒ this session wants a human,
-    /// and the value is the one-line reason in the status-item menu. Only it
-    /// raises that row: a title starting `⚠` raises none.
-    ///
-    /// This is the effective value, the most recently set entry of
-    /// [`Self::attention_owners`], so every reader (status item, tab chrome,
-    /// `meta`, `sessions meta=1`, the `meta-change` event) sees one line.
-    /// Written only through [`Self::set`] and [`Self::set_attention_owned`],
-    /// which keep it in step with the map.
     pub attention: Option<String>,
-    /// Keyed attention (`meta set attention owner=<k> <text>`): one entry per
-    /// owner, bounded at [`ATTENTION_OWNERS_MAX`], so a supervisor and a human
-    /// (or two supervisors) raise and clear their own escalations independently.
-    /// The bare form is owner [`BARE_ATTENTION_OWNER`]. Not part of equality;
-    /// only the bare owner's entry is carried across a restore (see
-    /// [`Self::sanitized`]).
     pub(crate) attention_owners: AttentionOwners,
-    /// Who is supervising this session (`meta set supervisor <holder>`), shown
-    /// in `status`, `sessions` and `meta`. Not user identity: never restored,
-    /// not part of equality, not `meta=1`.
     pub(crate) supervisor: Option<SupervisorClaim>,
-    /// Bumped by every supervisor set or clear, renewals included: an off-lock record read or
-    /// kernel proof commits only while the revision it read still stands. Process-local;
-    /// never restored, not part of equality.
     pub(crate) supervisor_revision: u64,
-    /// Typed question policy: one of [`QUESTIONS_POLICY_WORDS`], stored lowercase (only ever a
-    /// word [`normalize_questions_value`] produced). Unset, the `[harness]` switches decide.
-    /// Like `role`: part of equality, counted by `sessions meta=1`, carried across a restore and
-    /// a handoff.
     pub questions: Option<String>,
-    /// The session's Autopilot word (`meta set autopilot cruise|land|off`;
-    /// `docs/DESIGN-harness-autopilot-2026-10-15.md` §2.1), only ever a word
-    /// [`normalize_autopilot_value`] produced. Unset, `[harness] autopilot` decides
-    /// ([`aterm_agent::supervise::SupervisorConfig::autopilot_for`]); `[harness] enabled =
-    /// false` overrides both. Read typed through [`Self::autopilot_word`]. Like `questions`:
-    /// part of equality, counted by `sessions meta=1`, carried across a restore and a handoff.
     pub autopilot: Option<String>,
-    /// AUTOPILOT'S TIMER (`docs/DESIGN-harness-autopilot-2026-10-15.md`
-    /// §9.3.6): the instant, unix ms, a timed Cruise lands — only ever beside
-    /// the word `cruise`, and written with it by one method. `meta`,
-    /// `status` and `ls` print it (`land_at=`, unix seconds, `-` while
-    /// unset). It is no [`MetaField`]: it rides the autopilot field. Written
-    /// only with the word, by [`Self::set_autopilot`]: every write of the
-    /// word by hand, the same word included, drops it. Part of equality,
-    /// like the word it goes with.
     pub(crate) land_at: Option<i64>,
-    /// WHO SET THE AUTOPILOT PAIR (`docs/DESIGN-harness-autopilot-2026-10-15.md`
-    /// §11.7.3, item 1): the writer of the last write that moved the word or
-    /// its timer — the session log's actor, the window surface pressed and
-    /// when ([`AutopilotSetBy`]) — stored with the pair under the same meta
-    /// guard ([`apply_autopilot`], the timer's fire and its cancel), so the
-    /// word and its setter never disagree. `None` before any such write, and
-    /// for a word carried from a leaf that names no setter (`meta`'s
-    /// `autopilot_by=restored`). Provenance like [`Self::driver_writes`], so
-    /// not part of equality; carried across a restore and a handoff with the
-    /// word it goes with, and dropped where the word is ([`Self::sanitized`]).
     pub(crate) autopilot_set_by: Option<AutopilotSetBy>,
-    /// How many writes of the Autopilot pair moved it in this process: one
-    /// more at every write that stores a setter here ([`apply_autopilot`],
-    /// the fire, the cancel), none at a restore's seed or graft, which carry
-    /// the setter of a write made in another process. The window's record of
-    /// a wire write (`App::on_meta_changed`) compares it with the last it
-    /// recorded, so a wake for another field — or one after a restore —
-    /// records nothing. Process-local: never restored, not part of equality.
     pub(crate) autopilot_revision: u64,
-    /// Provenance, not value: one bit per [`MetaField`] a driver wrote in this process (every
-    /// write [`apply_meta_value`] or [`write_attention_owned`] accepted, no-ops included); a
-    /// restore seed ([`Self::set`]) marks nothing. [`restore_carried_meta`] reads it so a carried
-    /// identity never overwrites a newer driver write. Not persisted, not part of equality;
-    /// written only by those two, read through [`Self::driver_wrote`].
     pub(crate) driver_writes: u8,
 }
 
-/// Equality is over the eight values (what a tab label, a `meta` reader and a
-/// restore capture see); `driver_writes` records how a value got there, and
-/// `autopilot_set_by` who wrote the Autopilot pair (§11.7.3, item 1: two
-/// sessions in the same mode are in the same mode, whoever set each).
-/// Destructured, so a new field forces a decision about which side it is on.
 impl PartialEq for SessionMeta {
     fn eq(&self, other: &Self) -> bool {
         let Self {
@@ -360,8 +182,7 @@ impl PartialEq for SessionMeta {
 impl Eq for SessionMeta {}
 
 impl SessionMeta {
-    /// Whether any field is set: the `sessions` listing's `meta=<1|0>` bit.
-    /// `questions` and `autopilot` count like every other user field.
+    /// Whether any field is set.
     #[must_use]
     pub(crate) fn any_set(&self) -> bool {
         self.user_title.is_some()
@@ -373,10 +194,7 @@ impl SessionMeta {
             || self.autopilot.is_some()
     }
 
-    /// The session's Autopilot word, typed ([`Self::autopilot`]): `None` while unset (the
-    /// table's default decides) or for a stored spelling this build cannot read. The stored
-    /// word is matched first, without allocating, since the footer reads it every frame
-    /// (`App::session_autopilot`); any other spelling goes through the supervisor's reader.
+    /// The session's Autopilot word, typed ([`Self::autopilot`]).
     #[must_use]
     pub(crate) fn autopilot_word(&self) -> Option<aterm_agent::supervise::Autopilot> {
         use aterm_agent::supervise::Autopilot;
@@ -387,15 +205,13 @@ impl SessionMeta {
             .or_else(|| Autopilot::parse(stored))
     }
 
-    /// Whether a driver wrote `field` on this process (see
-    /// [`Self::driver_writes`]).
+    /// Whether a driver wrote `field` on this process.
     #[must_use]
     pub(crate) const fn driver_wrote(&self, field: MetaField) -> bool {
         self.driver_writes & field.bit() != 0
     }
 
-    /// The named field's current value (`None` for an unknown field name —
-    /// callers validate names before writing; reading is total).
+    /// The named field's current value.
     #[must_use]
     pub fn get(&self, field: &str) -> Option<&str> {
         match field {
@@ -410,19 +226,14 @@ impl SessionMeta {
         }
     }
 
-    /// The named field after the canonical single-line presentation policy, which also covers
-    /// a value that bypassed the setter (a hand-edited restore manifest).
+    /// The named field after the canonical single-line presentation policy, which also covers a value that bypassed the setter.
     #[must_use]
     pub(crate) fn presentation_value(&self, field: &str) -> Option<String> {
         self.get(field)
             .and_then(|value| sanitize_metadata_value(field, value))
     }
 
-    /// [`Self::presentation_value`] without allocating, for the render path:
-    /// writes the canonical value into `out` and returns whether the field is
-    /// set (and non-empty after the policy). `out` is left untouched when the
-    /// answer is `false`, so the tab-strip refill's try-lock fallback can keep
-    /// a stale value in a resident slot.
+    /// [`Self::presentation_value`] without allocating, for the render path.
     pub(crate) fn presentation_value_into(&self, field: &str, out: &mut String) -> bool {
         let Some(cap) = Self::cap(field) else {
             return false;
@@ -430,9 +241,6 @@ impl SessionMeta {
         let Some(value) = self.get(field) else {
             return false;
         };
-        // Fixpoint of `sanitize_presentation_line`: nothing to filter or trim
-        // and within the cap. Every production writer sanitizes through `set`,
-        // so this is the steady-state path: one scan, no allocation.
         if value.len() <= cap
             && value.trim().len() == value.len()
             && !metadata_has_forbidden_formatting(value)
@@ -444,9 +252,6 @@ impl SessionMeta {
             out.push_str(value);
             return true;
         }
-        // Non-canonical (an older in-process caller, a hand-edited manifest):
-        // the full sanitizer, which is the bidi-override / invisible-character
-        // guard.
         match sanitize_metadata_value(field, value) {
             Some(sanitized) => {
                 out.clear();
@@ -457,13 +262,7 @@ impl SessionMeta {
         }
     }
 
-    /// A canonical bounded copy for restore/handoff persistence, values only
-    /// (driver provenance does not travel).
-    ///
-    /// Attention travels as the bare owner's entry only: one carried under the bare owner
-    /// could never be cleared by its real owner. Keyed entries cross a seamless update
-    /// separately ([`Self::handoff_attention_owners`]); after a restore their driver
-    /// re-asserts them. The retired hooks' badge does not travel ([`carried_attention`]).
+    /// A canonical bounded copy for restore/handoff persistence, values only.
     #[must_use]
     pub(crate) fn sanitized(&self) -> Self {
         let attention = if self.attention_owners.is_empty() {
@@ -473,8 +272,6 @@ impl SessionMeta {
         }
         .and_then(carried_attention);
         let (autopilot, land_at) = self.carried_autopilot();
-        // Its setter goes with the word, and where the word is dropped, so
-        // is it (§11.7.3, item 5: `carried_land_at`'s rule).
         let autopilot_set_by = self.autopilot_set_by.filter(|_| autopilot.is_some());
         Self {
             user_title: self.presentation_value("title"),
@@ -494,12 +291,7 @@ impl SessionMeta {
         }
     }
 
-    /// THE AUTOPILOT PAIR AS A RESTORE LAYOUT CARRIES IT: the word in its
-    /// presentation form, and the timer beside it — which travels with the
-    /// word it goes with, and only with `cruise` (§9.3.6, item 2). The one
-    /// projection [`Self::sanitized`] (every capture's) and the crash
-    /// journal's check of what its last image carries
-    /// (`App::journal_owner_words`) both read, so the two never disagree.
+    /// THE AUTOPILOT PAIR AS A RESTORE LAYOUT CARRIES IT.
     #[must_use]
     pub(crate) fn carried_autopilot(&self) -> (Option<String>, Option<i64>) {
         (
@@ -510,11 +302,7 @@ impl SessionMeta {
         )
     }
 
-    /// Set (or with `None`, clear) `owner`'s attention entry and re-project
-    /// [`Self::attention`]. `value` is stored as given (the caller validated it:
-    /// [`validated_attention_value`]). Returns whether the effective value
-    /// moved, or [`AttentionOwnersFull`] when `owner` is new and the map is at
-    /// [`ATTENTION_OWNERS_MAX`] (nothing changed).
+    /// Set (or with `None`, clear) `owner`'s attention entry and re-project [`Self::attention`].
     pub(crate) fn set_attention_owned(
         &mut self,
         owner: &str,
@@ -524,11 +312,7 @@ impl SessionMeta {
             .map(|moved| moved.effective)
     }
 
-    /// [`Self::set_attention_owned`] with the entry's kind (`meta set
-    /// attention owner=<k> kind=<ask|wait>`; `None`: the writer named none,
-    /// which the need classifier reads by its legacy rule). The bare owner's
-    /// entry is always an ask. Returns what moved ([`AttentionMove`]): the
-    /// effective value, and any entry at all, which the need reads.
+    /// Set an owned attention entry with an explicit attention kind.
     pub(crate) fn set_attention_kind(
         &mut self,
         owner: &str,
@@ -546,19 +330,13 @@ impl SessionMeta {
         })
     }
 
-    /// The bare field (`meta set|unset attention` with no `owner=`): the bare
-    /// owner's entry, `value` sanitized as every field is. The bare owner is
-    /// never refused for capacity.
+    /// The bare field (`meta set|unset attention` with no `owner=`).
     pub(crate) fn set_bare_attention(&mut self, value: Option<String>) -> AttentionMove {
         let value = value.and_then(|value| sanitize_metadata_value("attention", &value));
         self.set_attention_kind(BARE_ATTENTION_OWNER, value, None)
             .unwrap_or_default()
     }
 
-    /// A meta built as a struct literal (a restore seed, a test) carries its
-    /// attention in [`Self::attention`] with an empty map. Before the first
-    /// keyed write, that value becomes the bare owner's entry, so a keyed
-    /// write on top of it — and the clear after — cannot lose it.
     fn adopt_literal_attention(&mut self) {
         if self.attention_owners.is_empty()
             && let Some(value) = self.attention.clone()
@@ -569,15 +347,13 @@ impl SessionMeta {
         }
     }
 
-    /// The supervisor's holder name while its claim is live at `now_us`
-    /// ([`crate::metrics::now_us`]); a lapsed `ttl=` claim reads as none.
+    /// The supervisor's holder name while its claim is live at `now_us` ([`crate::metrics::now_us`]).
     #[must_use]
     pub(crate) fn live_supervisor(&self, now_us: u64) -> Option<&str> {
         self.live_claim(now_us).map(|claim| claim.holder.as_str())
     }
 
-    /// The live claim itself at `now_us` (a lapsed `ttl=` claim reads as
-    /// none): its holder, binding and proof.
+    /// The live claim itself at `now_us` (a lapsed `ttl=` claim reads as none).
     #[must_use]
     pub(crate) fn live_claim(&self, now_us: u64) -> Option<&SupervisorClaim> {
         self.supervisor
@@ -585,41 +361,26 @@ impl SessionMeta {
             .filter(|claim| claim.expires_us.is_none_or(|at| at > now_us))
     }
 
-    /// Replace the claim and bump [`Self::supervisor_revision`], invalidating reads admitted
-    /// under the old one. Returns the new revision.
     fn set_supervisor(&mut self, claim: Option<SupervisorClaim>) -> u64 {
         self.supervisor = claim;
         self.supervisor_revision = self.supervisor_revision.wrapping_add(1);
         self.supervisor_revision
     }
 
-    /// Whether the live claim at `now_us` is a proven self-claim ([`crate::self_claim`]):
-    /// `status` and `meta` print `supervisor_proven=<0|1>`.
+    /// Whether the live claim at `now_us` is a proven self-claim ([`crate::self_claim`]).
     #[must_use]
     pub(crate) fn supervisor_proven(&self, now_us: u64) -> bool {
         self.live_claim(now_us)
             .is_some_and(|claim| claim.proven.is_some())
     }
 
-    /// When the `ttl=` claim lapses ([`crate::metrics::now_us`]), live or not;
-    /// `None` without a claim or for a connection-bound one. The presence timer
-    /// wakes at it ([`lapse_supervisor`]).
+    /// When the `ttl=` claim lapses ([`crate::metrics::now_us`]), live or not.
     #[must_use]
     pub(crate) fn supervisor_expiry(&self) -> Option<u64> {
         self.supervisor.as_ref().and_then(|claim| claim.expires_us)
     }
 
-    /// The claim a seamless update carries at `now_us`, as `(row, claim_known)` for the
-    /// handoff record (`SessionRecord::supervisor` / `claim_known`):
-    ///
-    /// * no live claim, or one held by `own_holder` (this process's in-GUI host, whose
-    ///   successor takes the session at Commit): `(None, true)`, so the successor may
-    ///   supervise at once rather than park behind a dead process's claim;
-    /// * a live `ttl=` lease: `(Some("<holder> <remaining_ms>"), true)`, put back on the
-    ///   successor's session before it is registered, so its holder renews it there;
-    /// * a connection-bound claim: `(None, false)`: the connection ends with this process,
-    ///   and `false` gives the holder time to claim again ([`crate::harness_host`]'s
-    ///   adopted-claim grace).
+    /// The claim a seamless update carries at `now_us`, as `` for the handoff record.
     #[cfg(any(unix, test))]
     #[must_use]
     pub(crate) fn handoff_supervisor(
@@ -637,14 +398,10 @@ impl SessionMeta {
         if claim.holder == own_holder {
             return (None, true);
         }
-        // A proven self-claim is never carried: its proof is this instance's connection and
-        // process. Its holder claims again from the successor inside the adopted-claim
-        // grace, proven there.
         if claim.proven.is_some() {
             return (None, false);
         }
         match claim.expires_us {
-            // Rounded up to a whole ms, so a live lease never carries as 0.
             Some(at) => (
                 Some(format!(
                     "{} {}",
@@ -657,18 +414,7 @@ impl SessionMeta {
         }
     }
 
-    /// The keyed escalations a seamless update carries: every owner's attention
-    /// entry, `"<owner> [kind=<ask|wait>] <pct-text>"`, in write order (oldest
-    /// first, so the successor shows the same one), the bare owner's included,
-    /// but never [`crate::input_stall::SERVER_ATTENTION_OWNER`]'s, which the
-    /// successor's input watch derives again. An escalation is a request for a
-    /// person, so it must survive the update; and so must its kind: a wait read
-    /// with no kind is an ask to every reader but the window harness's own
-    /// (the need classifier's legacy rule), so a limit the harness or another
-    /// supervisor waits out would need the owner in the successor until its
-    /// writer said it again. A map built as a literal (its bare value in
-    /// [`Self::attention`] alone) carries nothing here; that value crosses in
-    /// the restore leaf.
+    /// The keyed escalations a seamless update carries.
     #[cfg(any(unix, test))]
     #[must_use]
     pub(crate) fn handoff_attention_owners(&self) -> Vec<String> {
@@ -678,8 +424,6 @@ impl SessionMeta {
             .filter(|(owner, _, _)| *owner != crate::input_stall::SERVER_ATTENTION_OWNER)
             .map(|(owner, text, kind)| {
                 let text = crate::control::pct_encode(text);
-                // The bare owner's entry is an ask by construction: its row
-                // stays the one every producer wrote.
                 match kind.filter(|_| owner != BARE_ATTENTION_OWNER) {
                     Some(kind) => format!("{owner} kind={} {text}", kind.word()),
                     None => format!("{owner} {text}"),
@@ -703,18 +447,13 @@ impl SessionMeta {
         }
     }
 
-    /// Set (or with `None`, unset) a named field. Returns `Some(changed)` for a
-    /// known field (`changed`: the stored value moved, so callers act only on a
-    /// real change), `None` for an unknown name.
+    /// Set (or with `None`, unset) a named field.
     pub(crate) fn set(&mut self, field: &str, value: Option<String>) -> Option<bool> {
         if field == "attention" {
-            // The bare field is the bare owner: existing callers (the wire's bare
-            // form, a restore seed) keep their meaning, and keyed entries are
             // untouched.
             return Some(self.set_bare_attention(value).effective);
         }
         if field == "autopilot" {
-            // The word alone is a hand write of it: its timer goes with it
             // (§9.3.6, item 1).
             return Some(self.set_autopilot(value, None));
         }
@@ -726,8 +465,6 @@ impl SessionMeta {
             "questions" => &mut self.questions,
             _ => return None,
         };
-        // User-facing callers reject unsafe/over-cap values visibly; this second
-        // gate makes older/internal callers store the same canonical form.
         let value = value.and_then(|value| sanitize_metadata_value(field, &value));
         let changed = *slot != value;
         *slot = value;
@@ -736,14 +473,7 @@ impl SessionMeta {
 }
 
 impl SessionMeta {
-    /// THE ONE WRITER OF THE AUTOPILOT PAIR (§9.3.6, item 1): store `word`
-    /// (`None`: unset; sanitized as [`Self::set`] sanitizes) and `land_at`
-    /// (unix ms) together. The timer is kept only beside the word `cruise`
-    /// — a `land_at` under any other word, or none, is dropped — so a timer
-    /// never outlives its Cruise. Whether EITHER half moved: a write of the
-    /// same word that drops a timer is a change, so its record, its wake and
-    /// the index follow it. The host's ring follows the word alone
-    /// ([`apply_autopilot`]).
+    /// THE ONE WRITER OF THE AUTOPILOT PAIR (§9.3.6, item 1).
     pub(crate) fn set_autopilot(&mut self, word: Option<String>, land_at: Option<i64>) -> bool {
         let word = word.and_then(|value| sanitize_metadata_value("autopilot", &value));
         let cruise = word.as_deref().and_then(normalize_autopilot_value)
@@ -755,27 +485,18 @@ impl SessionMeta {
         changed
     }
 
-    /// Store `set_by` as the Autopilot pair's setter
-    /// ([`Self::autopilot_set_by`]) and step [`Self::autopilot_revision`]:
-    /// a write here that moved the pair (§11.7.3, item 1). Called only beside
-    /// a [`Self::set_autopilot`] that returned `true`, under the same guard.
+    /// Store `set_by` as the Autopilot pair's setter ([`Self::autopilot_set_by`]) and step [`Self::autopilot_revision`].
     pub(crate) fn note_autopilot_set_by(&mut self, set_by: AutopilotSetBy) {
         self.autopilot_set_by = Some(set_by);
         self.autopilot_revision = self.autopilot_revision.wrapping_add(1);
     }
 }
 
-/// One owner's attention entry.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct AttentionEntry {
     owner: String,
     text: String,
-    /// What its writer said it is (`kind=`); the bare owner's is always
-    /// [`aterm_types::needs::AttentionKind::Ask`]. `None`: a keyed entry
-    /// written with no kind (an older writer, a carried row).
     kind: Option<aterm_types::needs::AttentionKind>,
-    /// Write order within this map: the highest is the most recent, and the
-    /// most recent entry is the effective one.
     stamp: u64,
 }
 
@@ -786,13 +507,7 @@ pub(crate) struct AttentionOwnersFull;
 /// What one attention write moved ([`SessionMeta::set_attention_kind`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct AttentionMove {
-    /// The effective (most recently written) value moved: what `attention=`
-    /// shows and `meta-change field=attention` records.
     pub(crate) effective: bool,
-    /// Some entry moved: one came or went, or its text or kind changed. The
-    /// need classifier reads every entry, so this alone moves a session's
-    /// need (an older ask cleared under a newer wait moves no effective
-    /// value).
     pub(crate) entry: bool,
 }
 
@@ -804,13 +519,7 @@ impl AttentionMove {
     }
 }
 
-/// The keyed attention map ([`SessionMeta::attention_owners`]): at most
-/// [`ATTENTION_OWNERS_MAX`] owners, one line each.
-///
-/// Readers see the most recently written entry: the texts are free form, so
-/// recency is the only order a human can predict, and a clear falls back to
-/// the next most recent, so one owner's clear never hides another's
-/// escalation. Re-setting an entry to its current text does not move it.
+/// The keyed attention map ([`SessionMeta::attention_owners`]).
 #[derive(Clone, Debug, Default)]
 pub(crate) struct AttentionOwners {
     entries: Vec<AttentionEntry>,
@@ -839,8 +548,7 @@ impl AttentionOwners {
             .map(|entry| entry.text.as_str())
     }
 
-    /// The most recently written entry's text — what [`SessionMeta::attention`]
-    /// projects.
+    /// The most recently written entry's text.
     #[must_use]
     pub(crate) fn effective(&self) -> Option<&str> {
         self.top().map(|entry| entry.text.as_str())
@@ -866,8 +574,7 @@ impl AttentionOwners {
             .map(|entry| entry.text.as_str())
     }
 
-    /// Every entry as the need classifier reads it (`App::need_facts`),
-    /// most recent first.
+    /// Every entry as the need classifier reads it, most recent first.
     #[must_use]
     pub(crate) fn kinded(&self) -> Vec<crate::needs::AttentionFact> {
         let mut entries: Vec<&AttentionEntry> = self.entries.iter().collect();
@@ -882,10 +589,7 @@ impl AttentionOwners {
             .collect()
     }
 
-    /// `meta`'s `attention_kinds=`: `<kind>:<owner>` per entry in write order,
-    /// oldest first, `,`-joined (`-` for a kind its writer did not name), or
-    /// `-` with no entry. An owner token holds no `,`, and the kind word no
-    /// `:`, so the first `:` splits each.
+    /// `meta`'s `attention_kinds=`.
     #[must_use]
     pub(crate) fn kinds_field(&self) -> String {
         let mut entries: Vec<&AttentionEntry> = self.entries.iter().collect();
@@ -909,9 +613,6 @@ impl AttentionOwners {
         }
     }
 
-    /// Every `(owner, text, kind)` in write order, oldest first: written again
-    /// into an empty map it gives the same effective entry. What a handoff
-    /// carries ([`SessionMeta::handoff_attention_owners`]).
     #[cfg(any(unix, test))]
     fn in_write_order(&self) -> Vec<(&str, &str, Option<aterm_types::needs::AttentionKind>)> {
         let mut entries: Vec<&AttentionEntry> = self.entries.iter().collect();
@@ -922,9 +623,6 @@ impl AttentionOwners {
             .collect()
     }
 
-    /// Store (`Some`) or clear (`None`) `owner`'s entry, of `kind` (the bare
-    /// owner's is always an ask). Returns whether any entry moved: one was
-    /// removed or added, or a standing one's text or kind changed.
     fn put(
         &mut self,
         owner: &str,
@@ -955,7 +653,6 @@ impl AttentionOwners {
                 Ok(kind_moved || text_moved)
             }
             (None, Some(text)) => {
-                // The bare owner always has its slot: it is the field every
                 // pre-keyed caller writes, and refusing it would break them.
                 if owner != BARE_ATTENTION_OWNER
                     && self
@@ -980,30 +677,16 @@ impl AttentionOwners {
     }
 }
 
-/// A live supervisor's claim on a session ([`SessionMeta::supervisor`]).
-///
-/// With `ttl=<ms>` it is a lease that lapses at `expires_us` unless the holder re-sets it (how
-/// a one-request-per-connection driver like `aterm ctl` keeps it). Without `ttl=` it is bound
-/// to the connection that set it (`conn`) and cleared when that connection stops serving
-/// requests (closes, or turns into a `subscribe` stream), so a dead supervisor stops showing.
+/// A live supervisor's claim on a session.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct SupervisorClaim {
-    /// The holder name the claim was made under.
     pub(crate) holder: String,
-    /// The control connection it is bound to, when it has no `ttl=`.
     pub(crate) conn: Option<u64>,
-    /// When a `ttl=` claim lapses ([`crate::metrics::now_us`]).
     pub(crate) expires_us: Option<u64>,
-    /// The proof, when the kernel proved the claim is its agent's own
-    /// ([`crate::self_claim::prove`]); never set from the holder's spelling. `None` for an
-    /// ordinary claim.
     pub(crate) proven: Option<crate::self_claim::Proven>,
 }
 
-/// Whether `token` is a well-formed attention owner key or supervisor holder name: one wire
-/// token of 1..=[`META_OWNER_MAX`] bytes from `[A-Za-z0-9._:@/-]`, so it prints verbatim and
-/// cannot be read as a field or an option. A lone `-` passes: it is the bare attention owner,
-/// and holder callers refuse it.
+/// Whether `token` is a well-formed attention owner key or supervisor holder name.
 #[must_use]
 pub(crate) fn valid_owner_token(token: &str) -> bool {
     !token.is_empty()
@@ -1013,26 +696,15 @@ pub(crate) fn valid_owner_token(token: &str) -> bool {
         })
 }
 
-/// The user-metadata fields as a closed type. Everything past the wire parse
-/// boundary carries this instead of a `&str` name, so the unknown-field case is
-/// unreachable and the `meta-change` record prints a `'static` token directly.
+/// The user-metadata fields as a closed type.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum MetaField {
-    /// `title` — the operator's display title, top rung of the label chain.
     Title,
-    /// `description` — free-text purpose/notes an agent leaves behind.
     Description,
-    /// `icon` — an emoji / short token for the strip.
     Icon,
-    /// `role` — typed role token (a label; no value is special).
     Role,
-    /// `attention` — typed needs-human escalation message (non-empty ⇒ badge).
     Attention,
-    /// `questions` — the typed question policy the in-window supervisor reads for this
-    /// session (a closed set, [`QUESTIONS_POLICY_WORDS`]).
     Questions,
-    /// `autopilot` — how far the harness carries the session's work (a closed set,
-    /// [`normalize_autopilot_value`]).
     Autopilot,
 }
 
@@ -1048,18 +720,15 @@ impl MetaField {
         Self::Autopilot,
     ];
 
-    /// The field list an unknown-field refusal names (`meta set|unset <field>`), in
-    /// [`Self::ALL`]'s order: one spelling for the wire and its tests.
+    /// The field list an unknown-field refusal names (`meta set|unset <field>`), in [`Self::ALL`]'s order.
     pub(crate) const NAMES: &'static str =
         "title|description|icon|role|attention|questions|autopilot";
 
-    /// This field's bit in [`SessionMeta::driver_writes`].
     const fn bit(self) -> u8 {
         1 << self as u8
     }
 
-    /// Parse a wire field token, or `None` for an unknown name: the one door from the
-    /// string vocabulary into the typed one.
+    /// Parse a wire field token, or `None` for an unknown name.
     #[must_use]
     pub(crate) fn parse(name: &str) -> Option<Self> {
         Some(match name {
@@ -1074,8 +743,7 @@ impl MetaField {
         })
     }
 
-    /// The stable token [`SessionMeta::set`]/[`SessionMeta::get`] key on and the
-    /// `meta-change` payload prints. A closed vocabulary, safe to print verbatim.
+    /// The stable token [`SessionMeta::set`]/[`SessionMeta::get`] key on and the `meta-change` payload prints.
     #[must_use]
     pub(crate) const fn wire_name(self) -> &'static str {
         match self {
@@ -1104,45 +772,24 @@ impl MetaField {
     }
 }
 
-/// What a metadata write intends. `Clear` is distinct from `Set("")`: both
-/// store `None`, but they record different timeline payloads (`value=-` is the
-/// cleared marker; `value=` is not), which `events` consumers distinguish.
+/// What a metadata write intends.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum MetaEdit<'a> {
-    /// Store this value, after the full validation ladder.
     Set(&'a str),
-    /// Unset the field — labels fall back down the chain.
     Clear,
 }
 
-/// Why a metadata write was refused. Every variant is user-visible: the control
-/// arm renders it as its `ERR` line, a GUI caller as an inline rejection. A
-/// value is never silently truncated or stripped.
+/// Why a metadata write was refused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum MetaWriteError {
-    /// The value was empty (or whitespace-only). `Set` cannot clear.
     Empty,
-    /// Control, bidi, or invisible formatting characters were present.
     ForbiddenFormatting,
-    /// Over the field's byte cap (which is carried so the caller can name it).
-    TooLong {
-        /// The exceeded [`MetaField::cap`].
-        cap: usize,
-    },
-    /// A `questions` value outside its closed set
-    /// ([`normalize_questions_value`]); the wire answers [`questions_usage`].
+    TooLong { cap: usize },
     NotAQuestionsPolicy,
-    /// An `autopilot` value that names no mode
-    /// ([`normalize_autopilot_value`]); the wire answers [`AUTOPILOT_USAGE`].
     NotAnAutopilot,
 }
 
-/// Pure validation: the `meta set` ladder minus the store (trim, empty
-/// rejection, forbidden-formatting rejection, byte cap, then canonicalization
-/// to the stored representation). No locks and no ctx.
-///
-/// `Ok(None)` comes only from [`MetaEdit::Clear`]: a `Set` that survives the
-/// ladder always has a canonical value.
+/// Pure validation.
 pub(crate) fn validated_meta_value(
     field: MetaField,
     edit: MetaEdit<'_>,
@@ -1154,8 +801,6 @@ pub(crate) fn validated_meta_value(
     if value.is_empty() {
         return Err(MetaWriteError::Empty);
     }
-    // The two typed-vocabulary fields: each one's closed set is the whole
-    // ladder, and it stores the normalized spelling, not the typed one.
     if field == MetaField::Questions {
         return normalize_questions_value(value)
             .map(|word| Some(word.to_string()))
@@ -1179,38 +824,7 @@ pub(crate) fn validated_meta_value(
     ))
 }
 
-/// Apply one validated metadata mutation and, on an actual change, record the
-/// `meta-change` timeline event (`field=<f> value=<pct|->`). Returns whether
-/// the stored value moved, the caller's gate for the wake and subscriber
-/// fan-out (see the `meta` dispatch arm and the GUI rename commit). For
-/// `attention` that is any entry moving ([`AttentionMove::any`]): clearing
-/// the bare entry under a newer keyed one moves no effective value, so no
-/// event, but it moves the need, which only the wake republishes.
-///
-/// The record is taken under the meta guard (the one sanctioned meta→timeline nesting,
-/// documented on `SessionCtx`), so racing `meta set`s cannot record events in the opposite
-/// order to their stores; [`restore_carried_meta`] nests in the same order and timeline is
-/// a leaf. Guards are released on return: a GUI caller refreshes tab chrome right after,
-/// re-taking `ctx.meta`, and `std::sync::Mutex` is not reentrant.
-///
-/// Atomicity: the timeline record happens while the meta guard is held (the
-/// one sanctioned meta→timeline nesting, documented on `SessionCtx`), so two
-/// racing `meta set`s on the control worker threads cannot record their events
-/// in the opposite order to their stores. Deadlock-free: the one other nested
-/// site ([`restore_carried_meta`]) takes them in the same order, and timeline
-/// is a leaf everywhere.
-///
-/// The record is taken under the meta guard (the one sanctioned meta→timeline nesting,
-/// documented on `SessionCtx`), so racing `meta set`s cannot record events in the opposite
-/// order to their stores; [`restore_carried_meta`] nests in the same order and timeline is
-/// a leaf. Guards are released on return: a GUI caller refreshes tab chrome right after,
-/// re-taking `ctx.meta`, and `std::sync::Mutex` is not reentrant.
-///
-/// An Autopilot word that moved rings the window's host ([`crate::harness_host::ring`],
-/// after the guards are released), whoever wrote it (the wire, or the window's chip and
-/// Settings, [`crate::autopilot`]): on the pass the ring brings, the host stops the
-/// session's worker for `off` and starts one for `cruise` or `land`. The footer repaint is
-/// the caller's, which knows the session's local id.
+/// Apply one validated metadata mutation and, on an actual change, record the `meta-change` timeline event (`field=<f> value=<pct|->`).
 pub(crate) fn apply_meta_value(
     ctx: &crate::SessionCtx,
     field: MetaField,
@@ -1218,7 +832,6 @@ pub(crate) fn apply_meta_value(
     by: aterm_slog::Actor,
 ) -> bool {
     if field == MetaField::Autopilot {
-        // The word written by hand: its timer, if any, goes with it.
         // A wire write (or an in-process one through it): no window surface.
         return apply_autopilot(ctx, value, None, by, None).moved;
     }
@@ -1246,31 +859,16 @@ pub(crate) fn apply_meta_value(
 /// What one write of the Autopilot pair did ([`apply_autopilot`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct AutopilotWrite {
-    /// Either half moved: the record, the wake, the footer and the timer's
-    /// index follow it.
     pub(crate) moved: bool,
-    /// The word moved: the window's host was rung.
     pub(crate) word_moved: bool,
-    /// The session's [`SessionMeta::autopilot_revision`] after the write:
-    /// the one this write stored where it `moved`.
     pub(crate) revision: u64,
 }
 
-/// WHO SET A SESSION'S AUTOPILOT PAIR, AND WHEN
-/// (`docs/DESIGN-harness-autopilot-2026-10-15.md` §11.7.3, item 1;
-/// [`SessionMeta::autopilot_set_by`]). Named `set_by`, never "hand": the
-/// timer's model keeps "hand" for a write with no timer.
+/// WHO SET A SESSION'S AUTOPILOT PAIR, AND WHEN.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct AutopilotSetBy {
-    /// The writer as the session log names it ([`aterm_slog::Actor`]):
-    /// `Human` for the window, `Ctl` an Owner client over `aterm ctl`,
-    /// `Harness` aterm's own harness, `Bridge` the fabric, `Aterm` the
-    /// timer's fire, a session's sid its edge connection.
     pub(crate) actor: aterm_slog::Actor,
-    /// The window surface pressed, for a window write; `None` for every
-    /// other writer.
     pub(crate) surface: Option<crate::autopilot::Surface>,
-    /// When, unix ms: the wall clock at the write.
     pub(crate) since_ms: i64,
 }
 
@@ -1288,10 +886,7 @@ impl AutopilotSetBy {
         }
     }
 
-    /// The setter's word, as `meta`'s `autopilot_by=` and the restore leaf
-    /// write it (§11.7.2): `human:chip`, `human:border`, `human:menu`,
-    /// `human:settings`, `human:every`; else the actor's own word (`ctl`,
-    /// `harness`, `bridge`, `aterm`, a session's sid, `-`).
+    /// The setter's word, as `meta`'s `autopilot_by=` and the restore leaf write it (§11.7.2).
     #[must_use]
     pub(crate) fn word(&self) -> String {
         match (self.actor, self.surface) {
@@ -1300,17 +895,13 @@ impl AutopilotSetBy {
         }
     }
 
-    /// As the restore leaf carries it (§11.7.3, item 5): `<setter> <unix
-    /// ms>`, the setter by [`Self::word`].
+    /// As the restore leaf carries it (§11.7.3, item 5).
     #[must_use]
     pub(crate) fn carried(&self) -> String {
         format!("{} {}", self.word(), self.since_ms)
     }
 
-    /// A leaf's `autopilot_by` read back ([`Self::carried`]'s form): `None`
-    /// where it does not parse — a hand-edited or unknown setter, a surface
-    /// this build does not know — so the word reads as restored with no
-    /// setter, never as one it was not.
+    /// A leaf's `autopilot_by` read back ([`Self::carried`]'s form).
     #[must_use]
     pub(crate) fn parse_carried(text: &str) -> Option<Self> {
         let (setter, since) = text.trim().split_once(' ')?;
@@ -1320,8 +911,6 @@ impl AutopilotSetBy {
                 aterm_slog::Actor::Human,
                 Some(crate::autopilot::Surface::from_word(surface)?),
             ),
-            // A known writer's word, or a minted sid (an edge writer,
-            // `session_log::sid_actor`'s rule); any other word is unknown.
             None => match aterm_slog::Actor::from_word(setter) {
                 aterm_slog::Actor::Sid(_) if !aterm_session::is_minted_sid(setter) => {
                     return None;
@@ -1338,24 +927,7 @@ impl AutopilotSetBy {
     }
 }
 
-/// Write session `ctx`'s AUTOPILOT PAIR (§9.3.6, item 1): its word (`None`:
-/// unset; a value [`validated_meta_value`] produced) and the instant a timed
-/// Cruise lands (`land_at`, unix ms; kept only beside `cruise`), as ONE step
-/// under the meta guard ([`SessionMeta::set_autopilot`]). The wire's `meta
-/// set|unset autopilot … [until=]` and the window's own writer
-/// (`App::set_session_autopilot_timed`) both come here. Marks the autopilot
-/// field driver-written — the pair rides its bit — and, when either half
-/// moved, records the `meta-change` (`field=autopilot value=<word|->`, with
-/// ` land_at=<unix s>` while a timer is armed) under the guard, as
-/// [`apply_meta_value`] does. A word that moved rings the window's host
-/// after the guards are released; a timer alone does not (the loop reads
-/// the word, never the timer).
-///
-/// WHO SET IT (§11.7.3, item 1): where the pair moved, `by` and the window
-/// `surface` pressed (`None` for a wire write) are stored as its setter
-/// ([`SessionMeta::autopilot_set_by`]) under the same guard, and the
-/// session's [`SessionMeta::autopilot_revision`] steps; a write that moves
-/// nothing (the same word again) stores neither.
+/// Write session `ctx`'s AUTOPILOT PAIR (§9.3.6, item 1).
 pub(crate) fn apply_autopilot(
     ctx: &crate::SessionCtx,
     word: Option<String>,
@@ -1387,33 +959,12 @@ pub(crate) fn apply_autopilot(
 /// What THE FIRE of a timed Cruise found (§9.3.6, item 5; [`fire_land_at`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Fired {
-    /// The stored pair was the timer's, and its instant had come: `land`
-    /// is stored, with no timer, at this [`SessionMeta::autopilot_revision`]
-    /// (its setter `aterm`, the timer's: §11.7.3, item 1).
     Landed { revision: u64 },
-    /// The stored pair is the timer's, but the wall clock is short of its
-    /// instant by this many ms (set back, or the monotonic deadline ran
-    /// early): nothing written; indexed again from the remainder.
     NotYet(i64),
-    /// The stored pair is no longer the timer's — the word is not `cruise`,
-    /// or the instant moved — so nothing is written; indexed again from what
-    /// is stored (`Some`), or not at all.
     Moved(Option<i64>),
 }
 
-/// THE FIRE IS A COMPARE-AND-SET (§9.3.6, item 5): under session `ctx`'s
-/// meta guard, write `land` (and drop the timer) only where the STORED pair
-/// is still `cruise` with `land_at == expected_ms` and the wall clock
-/// (`wall_ms`, read once by the caller) is at or past it. The App's index
-/// says only when to look: a hand write stored before this — `meta set
-/// autopilot off` over the wire whose wake the App has not applied yet, the
-/// same word again, a new arm — leaves a pair this does not match, so the
-/// hand always wins. A write here is this process's: it marks the
-/// autopilot `driver_writes` bit, so a later graft of a carried identity
-/// never reverts it, and records the `meta-change` under the guard as
-/// [`apply_meta_value`] does. The word moved, so the host is rung after the
-/// guard is released; the rest of the fan-out (the footer, the A/B arm, the
-/// page, the message) is the App's.
+/// THE FIRE IS A COMPARE-AND-SET (§9.3.6, item 5).
 pub(crate) fn fire_land_at(ctx: &crate::SessionCtx, expected_ms: i64, wall_ms: i64) -> Fired {
     use aterm_agent::supervise::Autopilot;
     let mut meta = ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
@@ -1427,7 +978,6 @@ pub(crate) fn fire_land_at(ctx: &crate::SessionCtx, expected_ms: i64, wall_ms: i
     }
     meta.driver_writes |= MetaField::Autopilot.bit();
     meta.set_autopilot(Some(Autopilot::Land.word().to_string()), None);
-    // The timer's write: aterm's, stored as its setter at the fire's wall.
     meta.note_autopilot_set_by(AutopilotSetBy {
         actor: aterm_slog::Actor::Aterm,
         surface: None,
@@ -1440,19 +990,7 @@ pub(crate) fn fire_land_at(ctx: &crate::SessionCtx, expected_ms: i64, wall_ms: i
     Fired::Landed { revision }
 }
 
-/// THE CANCEL IS A COMPARE-AND-SET TOO (§9.3.3, §9.3.4: "Cancel landing"
-/// is offered only while a timer is armed): under session `ctx`'s meta
-/// guard, drop the timer only where the STORED pair is still `cruise` with
-/// a `land_at` — the very instant `expected` names, where the row that asked
-/// named one — and keep the word as stored. Anything else (a hand write of
-/// `off` or `land` stored first, the timer's own fire, a new arm the row
-/// never showed) writes nothing, so a cancel offered by a page or a menu
-/// that has gone stale can never write `cruise` over a word the person or
-/// the timer wrote. A drop is a hand write of the pair: it marks the
-/// autopilot `driver_writes` bit and records the `meta-change` under the
-/// guard, as [`apply_autopilot`] does, with the person and the `surface`
-/// the cancel was pressed on as its setter; the word did not move, so the
-/// host is not rung. What it did.
+/// THE CANCEL IS A COMPARE-AND-SET TOO (§9.3.3, §9.3.4: "Cancel landing" is offered only while a timer is armed).
 pub(crate) fn cancel_land_at(
     ctx: &crate::SessionCtx,
     expected: Option<i64>,
@@ -1474,7 +1012,6 @@ pub(crate) fn cancel_land_at(
     let word = meta.autopilot.clone();
     let moved = meta.set_autopilot(word, None);
     if moved {
-        // A page's or a menu's cancel: the person's.
         meta.note_autopilot_set_by(AutopilotSetBy::now(aterm_slog::Actor::Human, Some(surface)));
         record_autopilot(ctx, &meta, aterm_slog::Actor::Human);
     }
@@ -1485,10 +1022,6 @@ pub(crate) fn cancel_land_at(
     }
 }
 
-/// The `meta-change` payload for the Autopilot pair as `meta` now stores it:
-/// [`meta_change_payload`]'s `field=autopilot value=<pct|->`, and
-/// ` land_at=<unix s>` after it while a timer is armed — so a write that
-/// only drops a timer reads as the change it is.
 fn autopilot_change_payload(meta: &SessionMeta) -> String {
     let mut payload = meta_change_payload(MetaField::Autopilot, meta.autopilot.as_deref());
     if let Some(ms) = meta.land_at {
@@ -1501,15 +1034,11 @@ fn autopilot_change_payload(meta: &SessionMeta) -> String {
 /// Why a keyed attention write was refused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AttentionWriteError {
-    /// The value failed the ordinary metadata ladder.
     Meta(MetaWriteError),
-    /// `owner` is new and [`ATTENTION_OWNERS_MAX`] owners already hold one.
     OwnersFull,
 }
 
-/// Pure validation for one owner's attention text: [`validated_meta_value`]'s
-/// ladder, with the keyed cap ([`META_ATTENTION_KEYED_MAX`]) for a keyed owner
-/// and the bare field's cap for the bare one.
+/// Pure validation for one owner's attention text.
 pub(crate) fn validated_attention_value(
     owner: &str,
     edit: MetaEdit<'_>,
@@ -1525,13 +1054,7 @@ pub(crate) fn validated_attention_value(
     }
 }
 
-/// `meta set|unset attention owner=<k> …`: validate, store `owner`'s entry and,
-/// when the effective value moved, record `meta-change field=attention` under
-/// the meta guard as [`apply_meta_value`] does. Marks the attention field
-/// driver-written. The supervisor's entry ([`crate::harness_host::ATTENTION_OWNER`])
-/// also moves a task record's rev ([`SessionTimeline::note_task_attention`]).
-/// Returns whether any entry (the need reads them all: [`AttentionMove`]) or
-/// the task record moved — what wakes the session's waiters and its need.
+/// `meta set|unset attention owner=<k> …`.
 pub(crate) fn write_attention_owned(
     ctx: &crate::SessionCtx,
     owner: &str,
@@ -1541,9 +1064,7 @@ pub(crate) fn write_attention_owned(
     write_attention_kind(ctx, owner, edit, None, by)
 }
 
-/// [`write_attention_owned`] with the entry's kind (`kind=`, `None` when the
-/// writer named none): a kind that moves alone is news too (the session's
-/// need moves).
+/// [`write_attention_owned`] with the entry's kind (`kind=`, `None` when the writer named none).
 pub(crate) fn write_attention_kind(
     ctx: &crate::SessionCtx,
     owner: &str,
@@ -1558,10 +1079,6 @@ pub(crate) fn write_attention_kind(
         .map_err(|AttentionOwnersFull| AttentionWriteError::OwnersFull)?;
     let changed = moved.effective;
     meta.driver_writes |= MetaField::Attention.bit();
-    // The supervisor's own entry, and a worker's NEEDS YOU entry, are also
-    // its task record's news (`task_record`): raised or cleared, a tasked
-    // session's rev moves, under this meta guard, so `await task` sees the
-    // edge the flag records (it stands while either entry does).
     let supervisor = crate::task_record::owner_moves_task(owner)
         .then(|| crate::task_record::supervisor_attention(&meta));
     let (mut task_moved, mut log_owed) = (false, false);
@@ -1579,25 +1096,13 @@ pub(crate) fn write_attention_kind(
         if let Some(raised) = supervisor {
             task_moved = timeline.note_task_attention(raised);
         }
-        // The log's `meta` and `task` marks owe its readers a wake: taken in
-        // this hold, sent by the caller after release.
         log_owed = timeline.slog_take_wake();
     }
     drop(meta);
     Ok(moved.any() || task_moved || log_owed)
 }
 
-/// THE SUPERVISOR'S ATTENTION ENTRY WRITTEN INSIDE A TASK MARK
-/// (`task_record::mark_session_task_with`): `value` (sanitized to one line
-/// within [`META_ATTENTION_KEYED_MAX`]; empty is a clear) stored as the
-/// [`crate::harness_host::ATTENTION_OWNER`]'s entry under the meta guard and
-/// the timeline lock the caller holds (meta → timeline, as
-/// [`write_attention_owned`] takes them), the field marked driver-written and
-/// `meta-change field=attention` recorded when the effective value moved —
-/// what the `meta set attention owner=supervisor` verb does, minus the task
-/// record's rev, which the caller's mark moves once with its state. Returns
-/// whether the supervisor's entry moved; a map already at
-/// [`ATTENTION_OWNERS_MAX`] owners refuses it (`false`, nothing written).
+/// THE SUPERVISOR'S ATTENTION ENTRY WRITTEN INSIDE A TASK MARK (`task_record::mark_session_task_with`).
 pub(crate) fn put_supervisor_attention(
     meta: &mut SessionMeta,
     timeline: &mut SessionTimeline,
@@ -1616,7 +1121,6 @@ pub(crate) fn put_supervisor_attention(
     meta.driver_writes |= MetaField::Attention.bit();
     if changed {
         let payload = meta_change_payload(MetaField::Attention, meta.attention.as_deref());
-        // The window host's own deadline wrote it, not a client: aterm's.
         let change = MetaChange::written_by(
             MetaField::Attention.wire_name(),
             meta.attention.as_deref(),
@@ -1627,12 +1131,7 @@ pub(crate) fn put_supervisor_attention(
     true
 }
 
-/// Store (`Some`) or clear (`None`) the server's own attention entry under `owner` (the
-/// input watch's [`crate::input_stall::SERVER_ATTENTION_OWNER`]), recording `meta-change
-/// field=attention` when the effective value moves, as [`write_attention_owned`] does. Marks
-/// no [`SessionMeta::driver_writes`]. The text quotes a program name, so it is held to the
-/// keyed cap and the presentation sanitizer. Returns whether the effective value moved; a
-/// full map refuses a new owner (the stall still reads on `status input=` and `agent=`).
+/// Store or clear the control server's own attention entry for a session.
 pub(crate) fn write_server_attention(
     ctx: &crate::SessionCtx,
     owner: &str,
@@ -1652,13 +1151,7 @@ pub(crate) fn write_server_attention(
     changed
 }
 
-/// [`claim_supervisor_as`] without a proof, for tests: claim the session for `holder`. `conn`
-/// binds a claim with no TTL to the setting connection ([`SupervisorClaim`]); `expires_us` is
-/// a TTL claim's lapse instant.
-///
-/// A live claim by another holder, or a proven one, is refused with its name (`Err`), like
-/// `lease acquire`; the same holder renews. Returns whether the shown holder moved; a move
-/// records `meta-change field=supervisor value=<holder>` under the meta guard.
+/// [`claim_supervisor_as`] without a proof, for tests.
 #[cfg(test)]
 pub(crate) fn claim_supervisor(
     ctx: &crate::SessionCtx,
@@ -1682,35 +1175,21 @@ pub(crate) fn claim_supervisor(
 /// What a granted claim did ([`claim_supervisor_as`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Claimed {
-    /// Whether what `status` and `meta` show moved: the holder, or whether it is proven.
     pub(crate) changed: bool,
-    /// The holder a proven self-claim replaced, if any: the window host's own loop (whose
-    /// connection is then cut at once) or a proven claim whose process is gone.
     pub(crate) replaced: Option<String>,
-    /// The granted request's revision, for its off-lock record read.
     pub(crate) revision: u64,
 }
 
 /// How a claim request meets the claim standing ([`claim_rule`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ClaimRule {
-    /// No live claim: taken.
     Take,
-    /// The same holder: renewed (binding, expiry and proof replaced).
     Renew,
-    /// A proven self-claim over the window host's claim, or over a proven
-    /// claim whose process is gone.
     Replace,
-    /// Refused: `ERR busy supervisor=<holder>`.
     Busy,
 }
 
-/// The claim rule (pure). `standing` is the live claim's holder and whether it is proven,
-/// `standing_gone` whether a proven standing claim's process is gone, `proven` whether this
-/// request was proven. A proven claim is renewed only by a proven request (an unproven one
-/// under the same name is a forgery and is refused); a proven request replaces the window
-/// host's claim (`aterm-harness@…`, never proven) and a proven claim whose process is gone;
-/// every other replacement is refused.
+/// The claim rule (pure).
 #[must_use]
 pub(crate) fn claim_rule(
     standing: Option<(&str, bool)>,
@@ -1739,14 +1218,7 @@ pub(crate) fn claim_rule(
     }
 }
 
-/// `meta set supervisor <holder> [ttl=<ms>]`: claim the session for `holder` with the
-/// request's proof, if any ([`crate::self_claim`]), under [`claim_rule`]. The standing proven
-/// claim's process is looked at before the meta guard is taken (a syscall, or `ps` off
-/// macOS: never under a leaf lock), and that look counts only while the claim under the
-/// guard is still the one looked at; a claim that moved in between counts its process as
-/// running (fail closed: busy, never a replacement). Every move, a proof gained or lost by
-/// a renewal included, records `meta-change field=supervisor value=<holder>` under the meta
-/// guard.
+/// `meta set supervisor <holder> [ttl=<ms>]`.
 pub(crate) fn claim_supervisor_as(
     ctx: &crate::SessionCtx,
     holder: &str,
@@ -1797,17 +1269,11 @@ pub(crate) fn claim_supervisor_as(
     if changed {
         record_supervisor(ctx, &meta, Some(holder), by);
     } else if renewed_identity_changed {
-        // The existing meta-change rule counts proof presence, not identity.
-        // A reused holder spelling under a different birth still owns none
-        // of the earlier proven process's pending faces.
         ctx.timeline
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .forget_holder_acts();
     }
-    // The card engine's `holder-claim` dev row (design §3.5, `claim_lead`):
-    // a claim taken or taken over, on the present ordinal and process clock
-    // the card's rows carry. Under the meta guard, as the row above.
     if crate::holder_image::DEV_ROWS && matches!(rule, ClaimRule::Take | ClaimRule::Replace) {
         ctx.timeline
             .lock()
@@ -1821,9 +1287,6 @@ pub(crate) fn claim_supervisor_as(
                 ),
             );
     }
-    // A replacement is answered only once the writes the replaced holder's
-    // fence admitted have landed (`FencedWrites`); every later one reads
-    // the new holder and is refused.
     let meta = if rule == ClaimRule::Replace {
         settle_fenced_writes(ctx, meta)
     } else {
@@ -1840,11 +1303,7 @@ pub(crate) fn claim_supervisor_as(
     })
 }
 
-/// The `if-supervisor=<holder>` fence, read under the meta lock: `None` while `holder` holds
-/// the session's live claim, else the refusal naming who holds it now, `ERR busy
-/// supervisor=<holder|->`, which a supervisor's loop reads as another holder's claim
-/// (`aterm_agent`'s `claim.rs`) and so watches instead. A write it admits is made under a
-/// [`FencedWrite`], never on this answer alone.
+/// The `if-supervisor=<holder>` fence, read under the meta lock.
 #[must_use]
 pub(crate) fn supervisor_fence(
     ctx: &crate::SessionCtx,
@@ -1865,30 +1324,20 @@ fn fence_refusal(meta: &SessionMeta, holder: &str, now_us: u64) -> Option<String
     }
 }
 
-/// The session's fenced writes in flight: every write an `if-supervisor=` fence admitted
-/// that has not finished ([`FencedWrite`]). A proven claim's replacement waits for them
-/// ([`claim_supervisor_as`]), so no keystroke the replaced holder was admitted to type lands
-/// after the replacement is answered, and every write admitted after it reads the new holder
-/// and is refused. The count is raised only under the meta guard that read the fence, and
-/// `settled` is waited on only with that guard held.
+/// The session's fenced writes in flight.
 #[derive(Debug, Default)]
 pub(crate) struct FencedWrites {
     inflight: std::sync::atomic::AtomicU32,
     settled: std::sync::Condvar,
 }
 
-/// One admitted fenced write, counted in [`FencedWrites`] from the fence's read until it
-/// drops. Taken around the write itself (a verb's whole write, or one phase of a `turn`,
-/// never a `turn`'s waits), and again on the main thread around a fenced
-/// [`crate::Wake::Input`] batch, which re-reads the fence there, so a hop that outlived its
-/// worker's deadline is checked when it is applied, not when it was posted.
+/// One admitted fenced write, counted in [`FencedWrites`] from the fence's read until it drops.
 pub(crate) struct FencedWrite<'a> {
     ctx: &'a crate::SessionCtx,
 }
 
 impl<'a> FencedWrite<'a> {
-    /// Admit one write under `holder`'s fence: counted, or the refusal
-    /// [`supervisor_fence`] gives.
+    /// Admit one write under `holder`'s fence.
     pub(crate) fn enter(
         ctx: &'a crate::SessionCtx,
         holder: &str,
@@ -1912,17 +1361,12 @@ impl Drop for FencedWrite<'_> {
         writes
             .inflight
             .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-        // Taken between the count and the notify, so a replacement that read
-        // a non-zero count under this guard is already waiting: no lost wake.
         let meta = self.ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
         writes.settled.notify_all();
         drop(meta);
     }
 }
 
-/// Wait, under the meta guard `meta`, until no fenced write admitted before
-/// it is still in flight. Each one ends within its own write's deadline (a
-/// main-thread hop's reply deadline, a background write's receipt wait).
 fn settle_fenced_writes<'g>(
     ctx: &crate::SessionCtx,
     meta: std::sync::MutexGuard<'g, SessionMeta>,
@@ -1936,11 +1380,7 @@ fn settle_fenced_writes<'g>(
         .unwrap_or_else(|p| p.into_inner())
 }
 
-/// Clear a proven claim whose process has exited or no longer leads the foreground group
-/// `foreground` (read by the status sweep as the group moved): recorded `meta-change
-/// field=supervisor value=-`, and the window host is told, as for any release. Any other
-/// claim, or a proven one whose process still leads, is left alone (`false`). The process
-/// is looked at outside the meta guard, and only the very claim looked at is cleared.
+/// Release a proven claim when its holder process has exited or left the foreground.
 pub(crate) fn release_proven_if_gone(
     ctx: &crate::SessionCtx,
     foreground: i32,
@@ -1956,16 +1396,12 @@ pub(crate) fn release_proven_if_gone(
     if i64::from(foreground) == i64::from(proven.pid) && proven.alive() {
         return false;
     }
-    // Its process left the foreground: aterm's.
     release_supervisor_if(ctx, now_us, aterm_slog::Actor::Aterm, |claim| {
         claim.proven.as_ref() == Some(&proven)
     })
 }
 
-/// Clear the session's supervisor claim: every claim when `conn` is `None`
-/// (`meta unset supervisor`), or only one bound to connection `conn`. Returns
-/// whether a live holder stopped being shown; that move records `meta-change
-/// field=supervisor value=-`.
+/// Clear the session's supervisor claim.
 pub(crate) fn release_supervisor(
     ctx: &crate::SessionCtx,
     conn: Option<u64>,
@@ -1977,10 +1413,7 @@ pub(crate) fn release_supervisor(
     })
 }
 
-/// `meta unset supervisor holder=<h>`: clear the claim only while `holder`
-/// holds it, so a supervisor giving back its own claim (after its connection
-/// was lost and another holder claimed the session) never clears the other's.
-/// Returns what [`release_supervisor`] returns.
+/// `meta unset supervisor holder=<h>`.
 pub(crate) fn release_supervisor_held_by(
     ctx: &crate::SessionCtx,
     holder: &str,
@@ -1990,8 +1423,6 @@ pub(crate) fn release_supervisor_held_by(
     release_supervisor_if(ctx, now_us, by, |claim| claim.holder == holder)
 }
 
-/// Clear the claim when `ours` says so, under the one meta guard that also
-/// read it (no gap for another claim between the test and the clear).
 fn release_supervisor_if(
     ctx: &crate::SessionCtx,
     now_us: u64,
@@ -2012,21 +1443,14 @@ fn release_supervisor_if(
         record_supervisor(ctx, &meta, None, by);
     }
     drop(meta);
-    // A proven claim's end is told to its copy and the window host
-    // (`self_claim::released`), outside every lock: it reads a process.
     if let Some(proven) = proven {
         crate::self_claim::released(ctx, &proven, revision);
     }
-    // The in-GUI host claims a session it found held by another supervisor
-    // once that claim goes (`harness_host`), so it is told of every release,
-    // shown or not (a lapsed TTL claim included).
     crate::harness_host::note_claim_released();
     was_live
 }
 
-/// Remove a `ttl=` claim lapsed at `now_us` and record `meta-change field=supervisor value=-`,
-/// as a release does: nothing writes when a supervisor dies, so the presence timer calls this
-/// at the expiry. A live claim, a connection-bound one or none is left alone (`false`).
+/// Remove a `ttl=` claim lapsed at `now_us` and record `meta-change field=supervisor value=-`, as a release does.
 pub(crate) fn lapse_supervisor(ctx: &crate::SessionCtx, now_us: u64) -> bool {
     let mut meta = ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
     if meta.supervisor_expiry().is_none_or(|at| at > now_us) {
@@ -2034,7 +1458,6 @@ pub(crate) fn lapse_supervisor(ctx: &crate::SessionCtx, now_us: u64) -> bool {
     }
     let proven = meta.supervisor.take().and_then(|claim| claim.proven);
     let revision = meta.set_supervisor(None);
-    // The lease's lapse: aterm's.
     record_supervisor(ctx, &meta, None, aterm_slog::Actor::Aterm);
     drop(meta);
     if let Some(proven) = proven {
@@ -2044,14 +1467,10 @@ pub(crate) fn lapse_supervisor(ctx: &crate::SessionCtx, now_us: u64) -> bool {
     true
 }
 
-/// The longest `ttl=` a `meta set supervisor` accepts (ms): the verb's own
-/// bound, and the most a carried lease is seeded with.
+/// The longest `ttl=` a `meta set supervisor` accepts (ms).
 pub(crate) const SUPERVISOR_TTL_MAX_MS: u64 = 600_000;
 
-/// A carried supervisor row (`SessionRecord::supervisor`, `"<holder>
-/// <remaining_ms>"`), read as the `meta set supervisor … ttl=` verb reads its
-/// arguments: the holder one owner token and never `-`, the lease at least a
-/// millisecond and cut to [`SUPERVISOR_TTL_MAX_MS`]. `None` for anything else.
+/// A carried supervisor row (`SessionRecord::supervisor`, `"<holder> <remaining_ms>"`).
 #[must_use]
 pub(crate) fn parse_carried_supervisor(row: &str) -> Option<(&str, u64)> {
     let (holder, ms) = row.split_once(' ')?;
@@ -2062,17 +1481,7 @@ pub(crate) fn parse_carried_supervisor(row: &str) -> Option<(&str, u64)> {
     Some((holder, ms.min(SUPERVISOR_TTL_MAX_MS)))
 }
 
-/// A carried attention row (`SessionRecord::attention_owners`, `"<owner>
-/// [kind=<ask|wait>] <pct-text>"`): the owner one owner token (the bare `-`
-/// included) and never the server's own; the kind, where the row names one
-/// (a producer before the kind names none, and the entry then reads by the
-/// need classifier's legacy rule); the text decoded and put through the
-/// chrome's presentation sanitizer at its owner's cap (the keyed cap, or the
-/// bare field's). The text is one space-free token (`pct_encode`), so a
-/// `kind=` token is told from it by the space after it. A kind outside the
-/// set, or one on the bare owner's row, is dropped and the entry kept: a
-/// fault in the kind never costs the escalation. `None` when nothing
-/// presentable is left.
+/// A carried attention row (`SessionRecord::attention_owners`, `"<owner> [kind=<ask|wait>] <pct-text>"`).
 #[must_use]
 pub(crate) fn parse_carried_attention(
     row: &str,
@@ -2099,23 +1508,7 @@ pub(crate) fn parse_carried_attention(
     (!text.is_empty()).then_some((owner, kind, text))
 }
 
-/// Put back the claim and escalations a seamless update carried onto an adopted session's
-/// fresh meta, before `App::register_session`, so no reader sees the session without them
-/// and no second supervisor can claim it in between.
-///
-/// * `supervisor` (a carried `ttl=` lease) becomes the same lease with its
-///   remaining time counted from `now_us`: its holder's next renewal renews it
-///   here, and the successor's own host is refused as in the parent. A row that
-///   does not parse ([`parse_carried_supervisor`]) seeds nothing; the
-///   successor's host still waits its grace (`SessionRecord::claim_grace`).
-/// * each `attention_owners` row is written again in order, of the kind it
-///   names, so the same entry is effective and a wait is still a wait; a row
-///   that does not parse ([`parse_carried_attention`]) is
-///   dropped, and past [`ATTENTION_OWNERS_MAX`] a new owner is refused as a
-///   live write would be.
-///
-/// A seed marks no [`SessionMeta::driver_writes`]; moves are recorded as ordinary
-/// `meta-change` events under the meta guard.
+/// Put back the claim and escalations a seamless update carried onto an adopted session's fresh meta.
 pub(crate) fn seed_carried_claims(
     meta: &std::sync::Mutex<SessionMeta>,
     timeline: &std::sync::Mutex<SessionTimeline>,
@@ -2142,11 +1535,9 @@ pub(crate) fn seed_carried_claims(
             holder: holder.to_string(),
             conn: None,
             expires_us: Some(now_us.saturating_add(ms.saturating_mul(1000))),
-            // A carried lease is never proven: no proof crosses an update.
             proven: None,
         }));
     }
-    // A seed is aterm's (no driver's write), and derives `escalated` too.
     let mut timeline = timeline.lock().unwrap_or_else(|p| p.into_inner());
     let by = aterm_slog::Actor::Aterm;
     if attention_moved {
@@ -2166,29 +1557,22 @@ pub(crate) fn seed_carried_claims(
     drop(meta);
 }
 
-/// The `meta-change` kind ([`SessionTimeline::record_meta_change`] alone
-/// writes it).
+/// The `meta-change` kind.
 pub(crate) const META_CHANGE: &str = "meta-change";
 
-/// The `human` kind: a person's burst, one row for each burst mark the
-/// session log writes ([`SessionTimeline::pay_burst_rows`] is its writer).
+/// The `human` kind.
 pub(crate) const HUMAN: &str = "human";
 
-/// The `title-change` kind ([`SessionTimeline::record_title`] is its
-/// production writer; a test's raw row is no writer's).
+/// The `title-change` kind.
 pub(crate) const TITLE_CHANGE: &str = "title-change";
 
-/// The `cwd-change` kind ([`SessionTimeline::record_cwd_change`] is its
-/// production writer; a test's raw row is no writer's).
+/// The `cwd-change` kind.
 pub(crate) const CWD_CHANGE: &str = "cwd-change";
 
 /// The supervisor key's wire name, as its `meta-change` names it.
 pub(crate) const SUPERVISOR_FIELD: &str = "supervisor";
 
-/// One `meta-change`'s typed facts as its writer knows them, for the session
-/// log's mark ([`SessionTimeline::record_meta_change`]): the key, the value
-/// it now stores (`None`: unset), who wrote it, and for the Autopilot pair
-/// its timer (`land_at`, unix ms), which its row prints too (phase 6, 6F-8).
+/// One `meta-change`'s typed facts as its writer knows them, for the session log's mark ([`SessionTimeline::record_meta_change`]).
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct MetaChange<'a> {
     pub(crate) field: &'static str,
@@ -2198,10 +1582,7 @@ pub(crate) struct MetaChange<'a> {
 }
 
 impl<'a> MetaChange<'a> {
-    /// `field` now storing `value`, written by `by`. Named for itself: the
-    /// lock-order census resolves a call by its name, and a bare `of` met
-    /// `session_store`'s `Drawn::of`, which takes the meta and timeline
-    /// locks this writer's callers already hold.
+    /// `field` now storing `value`, written by `by`.
     pub(crate) fn written_by(
         field: &'static str,
         value: Option<&'a str>,
@@ -2215,15 +1596,12 @@ impl<'a> MetaChange<'a> {
         }
     }
 
-    /// This change with the Autopilot pair's timer (`land_at`, unix ms), as
-    /// its row says it.
+    /// This change with the Autopilot pair's timer, as its row says it.
     pub(crate) fn with_land_at(self, land_at: Option<i64>) -> Self {
         MetaChange { land_at, ..self }
     }
 }
 
-/// [`SessionTimeline::record_meta_change`] on `ctx`'s timeline, the meta
-/// guard (`meta`) held: the one meta → timeline nesting.
 fn record_meta(
     ctx: &crate::SessionCtx,
     payload: String,
@@ -2236,8 +1614,6 @@ fn record_meta(
         .record_meta_change(payload, change, meta);
 }
 
-/// The Autopilot pair's `meta-change` as `meta` now stores it, by `by`: the
-/// word and its timer, each in the row and in its mark.
 fn record_autopilot(ctx: &crate::SessionCtx, meta: &SessionMeta, by: aterm_slog::Actor) {
     let change = MetaChange::written_by(
         MetaField::Autopilot.wire_name(),
@@ -2248,7 +1624,6 @@ fn record_autopilot(ctx: &crate::SessionCtx, meta: &SessionMeta, by: aterm_slog:
     record_meta(ctx, autopilot_change_payload(meta), change, meta);
 }
 
-/// The effective attention's `meta-change` as `meta` now stores it, by `by`.
 fn record_attention(ctx: &crate::SessionCtx, meta: &SessionMeta, by: aterm_slog::Actor) {
     let payload = meta_change_payload(MetaField::Attention, meta.attention.as_deref());
     let change = MetaChange::written_by(
@@ -2259,14 +1634,9 @@ fn record_attention(ctx: &crate::SessionCtx, meta: &SessionMeta, by: aterm_slog:
     record_meta(ctx, payload, change, meta);
 }
 
-/// THE LONGEST RE-EXEC GAP (µs, `SessionTimeline::self_reexec_since_us`):
-/// codex-alab's new image claims again within its launch (its launch probe,
-/// then its first frame: seconds); one that has not by then is not coming
-/// back as the same claim, and the watching loop's faces are the session's
-/// again.
+/// THE LONGEST RE-EXEC GAP (µs, `SessionTimeline::self_reexec_since_us`).
 pub(crate) const SELF_REEXEC_GAP_US: u64 = 60_000_000;
 
-/// The supervisor key's `meta-change` (`holder`, or `None` for none), by `by`.
 fn record_supervisor(
     ctx: &crate::SessionCtx,
     meta: &SessionMeta,
@@ -2275,50 +1645,22 @@ fn record_supervisor(
 ) {
     let change = MetaChange::written_by(SUPERVISOR_FIELD, holder, by);
     let mut timeline = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
-    // A logical claim change ends the former holder's pending faces and the
-    // turn its last act typed. A renewal of the same proven claim records no
-    // change here and keeps them.
     timeline.forget_holder_acts();
-    // A release right after the holder's `upgrade@v1` is its re-exec's.
     timeline.note_supervisor_moved(holder.is_some(), crate::metrics::now_us());
     timeline.record_meta_change(supervisor_change_payload(holder), change, meta);
 }
 
-/// The `meta-change` payload for the supervisor key: `field=supervisor
-/// value=<pct|->`, the attention record's shape.
 fn supervisor_change_payload(holder: Option<&str>) -> String {
     let value = holder.map_or_else(|| "-".to_string(), crate::control::pct_encode);
     format!("field=supervisor value={value}")
 }
 
-/// The `meta-change` record's payload for `field` now storing `value`:
-/// `field=<f> value=<pct|->`. One spelling for both recorders, so a restored
-/// field reads on the `events` digest exactly like a `meta set` one.
 fn meta_change_payload(field: MetaField, value: Option<&str>) -> String {
     let value = value.map_or_else(|| "-".to_string(), crate::control::pct_encode);
     format!("field={} value={value}", field.wire_name())
 }
 
-/// Put a carried identity (the seven user fields a restore leaf captured in the previous
-/// process) back onto a session already live here, which a reader may have seen bare and a
-/// driver may have written since:
-///
-/// * a field a driver wrote in this process ([`SessionMeta::driver_writes`]) keeps the
-///   driver's value, set or cleared;
-/// * every other field takes the carried value exactly (absent means unset), and each move
-///   records the ordinary `meta-change` under the meta guard, as a `meta set` would;
-/// * an Autopilot word that moves rings the window's host, as [`apply_meta_value`] does, so
-///   a session carried in `off` is left alone from the host's next pass.
-/// * The Autopilot word and its timer (`land_at`) are ONE step
-///   ([`SessionMeta::set_autopilot`]), under the autopilot field's bit: a
-///   driver's write of the word here set or cleared the timer with it, so
-///   it wins for both halves; else both take the carried pair. The App
-///   indexes the session's timer after this (`App::index_autopilot_timer`).
-/// * The pair's setter ([`SessionMeta::autopilot_set_by`]) follows the pair
-///   (§11.7.3, item 5): a driver's write here keeps its own setter, and
-///   otherwise the carried setter is stored, with no revision step.
-///
-/// Returns whether any stored value moved: the caller's gate for waking `events` watchers.
+/// Put a carried identity back onto a session already live here, which a reader may have seen bare and a driver may have written since.
 pub(crate) fn restore_carried_meta(ctx: &crate::SessionCtx, carried: &SessionMeta) -> bool {
     let mut meta = ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
     let mut moved = false;
@@ -2329,16 +1671,8 @@ pub(crate) fn restore_carried_meta(ctx: &crate::SessionCtx, carried: &SessionMet
         }
         let name = field.wire_name();
         if field == MetaField::Autopilot {
-            // The PAIR, as one step (§9.3.6, item 2): the word and its timer,
-            // both kept where a driver wrote the word here (its write set or
-            // cleared the timer with it).
             let before = meta.autopilot.clone();
             let pair_moved = meta.set_autopilot(carried.autopilot.clone(), carried.land_at);
-            // ITS SETTER GOES WITH IT (§11.7.3, item 5): the carried one,
-            // whether or not the pair moved, and none beside no word — as a
-            // driver's write here, its setter included, wins for all three.
-            // Provenance: no value moved, and no revision steps (the write it
-            // names was made in another process).
             meta.autopilot_set_by = carried
                 .autopilot_set_by
                 .filter(|_| meta.autopilot.is_some());
@@ -2347,7 +1681,6 @@ pub(crate) fn restore_carried_meta(ctx: &crate::SessionCtx, carried: &SessionMet
             }
             moved = true;
             autopilot_moved |= meta.autopilot != before;
-            // A restore is aterm's.
             record_autopilot(ctx, &meta, aterm_slog::Actor::Aterm);
             continue;
         }
@@ -2358,8 +1691,6 @@ pub(crate) fn restore_carried_meta(ctx: &crate::SessionCtx, carried: &SessionMet
             continue;
         }
         moved = true;
-        // The stored value, which `set`'s sanitizer may have narrowed from what the
-        // manifest spelled.
         let payload = meta_change_payload(field, meta.get(name));
         let change = MetaChange::written_by(name, meta.get(name), aterm_slog::Actor::Aterm);
         record_meta(ctx, payload, change, &meta);
@@ -2371,8 +1702,7 @@ pub(crate) fn restore_carried_meta(ctx: &crate::SessionCtx, carried: &SessionMet
     moved
 }
 
-/// Validate then apply: the entry point for non-wire callers. The wire handler
-/// splits the two only to render each refusal as its own `ERR` line.
+/// Validate then apply.
 pub(crate) fn write_session_meta(
     ctx: &crate::SessionCtx,
     field: MetaField,
@@ -2383,17 +1713,9 @@ pub(crate) fn write_session_meta(
     Ok(apply_meta_value(ctx, field, value, by))
 }
 
-/// What an adopted session's recorders say about the time before the seamless
-/// update that adopted it. The timeline, asciicast and temporal spine start
-/// empty in the successor, so each opens with this gap: the timeline's first
-/// row is `handoff carried=0 from_build=<n>`, the cast header carries
-/// `aterm_handoff` beside `aterm_truncated`/`aterm_dropped`, and `temporal
-/// status` appends ` carried=0 from_build=<n>` after `dropped_events=`.
-/// `from_build` is the manifest's `outgoing_build`; a producer that wrote none
-/// reads `-` (`null` in the cast's JSON).
+/// What an adopted session's recorders say about the time before the seamless update that adopted it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct HandoffGap {
-    /// The build number of the process that handed the session across.
     pub(crate) from_build: Option<u64>,
 }
 
@@ -2408,74 +1730,25 @@ impl HandoffGap {
     }
 }
 
-/// One recorded lifecycle event. `kind` is a closed vocabulary:
-/// - lifecycle kinds this module's recorders write (`spawned`, `state-change`,
-///   `title-change`, `cwd-change`, `meta-change`, `agent-change`,
-///   `task-change` ([`crate::task_record`]), `closing`, an adopted session's
-///   opening `handoff` row, [`HandoffGap`]) and the status sweep's
-///   `status-change` (`crate::session_status::STATUS_CHANGE`);
-/// - fabric kinds (`inbox`, `inbox-seen`, `post`, `fetch`, `post-landed`,
-///   `hold`, `topic`: `crate::fabric::FABRIC_EVENT_KINDS`, also their digest
-///   spelling);
-/// - `render`, the resize ledger's entry into and exit from `desync-risk`
-///   (`desync-risk run= displaced= net= at=` / `healed run= after_ms=`, pushed
-///   as `EVENT <local> render …`; [`crate::resize_ledger`]);
-/// - `in-doubt`, written by `crate::pty_idem` when an input verb with an `id=`
-///   key failed without saying whether its bytes reached the PTY. It has no
-///   wire form: it is one driver's unresolved write, and the fabric `EVENT`
-///   names are pinned.
-///
-/// `payload` is a short `k=v` string, free-text values pct-encoded at record time, printed
-/// verbatim by the `timeline` verb and the events digest (whose wire names are
-/// `crate::subscribe::timeline_wire_kind`'s).
-///
-/// The `timeline` verb lists every kind a live session recorded. The last two
-/// rows (`closing reason= by=`, when the close path said why, and
-/// `state-change state=closed`) are written as the store deregisters the
-/// session, when the sid stops resolving, so the verb cannot reach them. The
-/// `subscribe … events` digest pushes `meta-change` as `EVENT <local> meta …`,
-/// `agent-change` ([`SessionTimeline::publish_agent`]) as `EVENT <local> agent
-/// <word> rev=<n>`, `task-change` ([`SessionTimeline::mark_task`]) as `EVENT
-/// <local> task rev=<n> state=<s> …`, `status-change` as `EVENT <local> status
-/// …`, and `closing`
-/// as `EVENT <local> closing …` (the dying watch's final pass, before its
-/// `exited` frame); the final `state-change` has no wire form (`exited` is that
-/// fact). The instance's `exits` ledger keeps the reason and actor afterwards.
+/// One recorded lifecycle event.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct TimelineEvent {
-    /// Per-session monotonic id (1-based), the `since=<id>` resume key.
     pub id: u64,
-    /// Milliseconds since the process epoch ([`now_ms`]): monotonic, aligned
-    /// with the turn ledger's clock, not wall time.
     pub t_ms: u64,
-    /// The event kind token.
     pub kind: &'static str,
-    /// Pre-encoded `k=v` tail, clamped to [`MAX_PAYLOAD`] bytes. Shared, so
-    /// a reader copying events out of the timeline lock bumps a refcount
-    /// instead of copying the text.
     pub payload: Arc<str>,
 }
 
-/// The timeline kind of an act a self-supervising agent recorded
-/// ([`SessionTimeline::note_harness_act`]).
+/// The timeline kind of an act a self-supervising agent recorded.
 pub(crate) const HARNESS_ACT: &str = "harness-act";
 
-/// The timeline kind of a move of the program's own state report as the
-/// status sweep honoured it (OSC 7501, [`SessionTimeline::note_program_state`]).
+/// The timeline kind of a move of the program's own state report as the status sweep honoured it.
 pub(crate) const PROGRAM_STATE: &str = "program-state";
 
-/// How many [`PROGRAM_STATE`] rows the ring holds at once: half of
-/// [`TIMELINE_CAP`]. Past it a new row evicts the OLDEST `program-state` row,
-/// not the oldest row, so a program that flaps its report every sweep keeps
-/// its newest moves and, in a full ring, ages out at most this many of the
-/// session's other rows: the newest `TIMELINE_CAP - PROGRAM_STATE_ROWS_MAX`
-/// of them always stay. Below the share a new row is an ordinary one and a
-/// full ring drops its oldest row, whatever its kind. 256 rows are some sixty
-/// turns of `working`, `blocked`, `working`, `done`.
+/// How many [`PROGRAM_STATE`] rows the ring holds at once.
 pub(crate) const PROGRAM_STATE_ROWS_MAX: usize = TIMELINE_CAP / 2;
 
-/// Published foreground custody for an input decision, independent of
-/// ordinary phase or screen revisions.
+/// Published foreground custody for an input decision, independent of ordinary phase or screen revisions.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ForegroundStamp {
     generation: u64,
@@ -2484,271 +1757,78 @@ pub(crate) struct ForegroundStamp {
     agent: aterm_phase::Program,
 }
 
-/// A session's bounded event timeline, newest-last, drop-oldest at
-/// [`TIMELINE_CAP`], with per-session monotonic ids minted here.
+/// A session's bounded event timeline, newest-last, drop-oldest at [`TIMELINE_CAP`], with per-session monotonic ids minted here.
 #[derive(Default)]
 pub(crate) struct SessionTimeline {
     events: VecDeque<TimelineEvent>,
     next_id: u64,
-    /// What the server reads this session to be running, and its agent verdict
-    /// ([`AgentPublication`]). Kept beside the ring the events digest scans: the
-    /// status sweep writes it on the main thread, the program resolver thread
-    /// writes `program`, and `sessions`, `await agent` and the push loop read it
-    /// from the control threads.
     agent: AgentPublication,
-    /// Input custody, independent of busy/idle and ordinary verdict revisions.
-    /// Observed foreground, program, reader and image changes cannot revive
-    /// an older press by returning to the same published identity.
     foreground_generation: u64,
-    /// The Claude Code footer's facts (`aterm_agent::harness::footer`), with the foreground
-    /// group and kernel start they were read for. Host-side only: painted into the rule under
-    /// Claude Code's input box (`crate::claude_footer`). Written by the footer resolver thread.
     claude_footer: Option<(i32, Option<u64>, aterm_agent::harness::footer::FooterFacts)>,
-    /// Last Muse account named in this terminal. Its anonymous usage cards
-    /// cannot be attributed after a known account switch, even if a pane is
-    /// rebuilt or the foreground process changes: the old glass survives both.
     muse_card_account: Option<String>,
-    /// Sticky for the terminal's life, also set when old glass is adopted.
     muse_cards_need_account: bool,
-    /// Those facts' `version` as a build, parsed once when they were stored:
-    /// what the card's gate holds an image of unknown build to
-    /// ([`Self::card_gate`], every frame, with no parse).
     claude_footer_build: Option<atpkg::vendor_direct::Version>,
-    /// The drawer image in front (its token) when those facts were stored,
-    /// `None` when none of their group's was: whose row they are when an
-    /// image of that group is published again
-    /// ([`Self::offer_holder_image`]).
     claude_footer_image: Option<u64>,
-    /// The newest launch card the frame compose read for the process the footer facts are
-    /// (group, kernel start, owner). It names the starting model and effort until the
-    /// transcript or `--model` decides them (`FooterFacts::filled_from`). A frame with no card
-    /// keeps it: the card scrolls away long before the transcript decides.
     claude_card: Option<(
         i32,
         Option<u64>,
         aterm_agent::harness::footer::FactsOwner,
         aterm_phase::LaunchCard,
     )>,
-    /// The shell's PATH, measured from the environment of a foreground leader
-    /// whose parent is the session's shell (`session_status::program::
-    /// leader_facts`): a fact about the shell, so it outlives the job it was
-    /// read from. `None` until such a leader ran.
     path: Option<PathReading>,
-    /// `copy=` of the current foreground leader and the group it was read
-    /// for (`managed`/`foreign`, an agent only).
     leader_copy: Option<(i32, &'static str)>,
-    /// The live agent upgrade of the conversation in this tab, as the window's
-    /// upgrade host last reported it (`upgrade=`), or `None`.
     upgrade: Option<aterm_agent::harness::upgrade_drive::Row>,
-    /// That upgrade's note for the person here, read off the row when it was
-    /// handed over (`Row::pause_note`): what the Claude Code footer leads
-    /// with while the move waits only on them.
     upgrade_note: Option<aterm_agent::harness::footer::UpgradeNote>,
-    /// The resize ledger ([`crate::resize_ledger`]): every grid resize this session took and
-    /// whether the app drew over content one displaced. Kept beside the ring its `render`
-    /// transitions are recorded on.
     resizes: crate::resize_ledger::ResizeLedger,
-    /// The id a seamless update's manifest told its successor to count on
-    /// from ([`Self::handoff_id`]): this process may hand out ids up to it
-    /// without either process naming one event twice. `None` until a park
-    /// draws a manifest.
     #[cfg(any(unix, test))]
     handoff_ceiling: Option<u64>,
-    /// THE TASK RECORD ([`crate::task_record`]), `None` for a session with no
-    /// task. Here, beside the ring its `task-change` rows are recorded on and
-    /// the agent publication its replies join, for the reason `agent` is:
-    /// the one per-session leaf every reader (`task`, `status`, `sessions`,
-    /// `await task`, the `events` digest) reaches lock-disjointly.
     task: Option<crate::task_record::TaskRecord>,
-    /// WHAT A WORKER'S LAUNCHER DID WITH ITS LINE, and when
-    /// (`task_launch::note_launch`): typed, with what the input receipt said
-    /// and the program it runs, or never typed and why. `None` where no
-    /// launcher of this process got that far. The startup deadline's stall
-    /// says it in the log (`harness_host::startup_mark_with`).
     worker_launch: Option<(std::time::Instant, String)>,
-    /// THE SURVEY'S EXCERPTS of the Claude Code process in front
-    /// ([`crate::survey::ClaudeExcerpts`]) and the group they were read for:
-    /// written by the footer resolver from its own tail read with every
-    /// footer read (so a process that reuses the group has its own by the
-    /// next one), read by the `survey` verb, so a survey reads no transcript.
-    /// Never painted, so a new excerpt repaints nothing.
     claude_excerpts: Option<(i32, crate::survey::ClaudeExcerpts)>,
-    /// THE FOOTER'S SIDE of the Claude Code process in front
-    /// ([`crate::claude_footer::FactSide`]: its directories and traffic) and
-    /// the group it was read for, written by the footer resolver with every
-    /// footer read, read by the fact menus and the traffic card. Never
-    /// painted and never in the facts, so a new side repaints nothing.
     claude_side: Option<(i32, std::sync::Arc<crate::claude_footer::FactSide>)>,
-    /// When the footer resolver last read facts for the group in front, and
-    /// that group: each read folds the session's usage anew, whether or not
-    /// anything moved, so the Stats Deck takes its token rates between two
-    /// reads (`crate::vitals_host`). Kept apart from the facts, so a read
-    /// that moved nothing repaints nothing.
     claude_footer_read: Option<(i32, std::time::Instant)>,
-    /// What the agent's own screen counted at the status sweep's last read
-    /// of it ([`AgentGauges`]): the survey's `ctx_left_pct=` and `bg=`.
     gauges: AgentGauges,
-    /// When a move of the screen alone last woke the supervisor host
-    /// ([`Self::publish_agent`]): at most once per
-    /// `harness_host::STATUS_AFTER_SCREEN`.
     screen_rung_at: Option<std::time::Instant>,
-    /// The session log ([`crate::session_log`]): the hierarchical record of what this session
-    /// does (session › run › turn › step), kept under this leaf lock with the producers that
-    /// write it.
     slog: crate::session_log::SessionLog,
-    /// THE NEED VERDICT ([`crate::needs::Verdict`]): what the session needs of
-    /// its owner, what aterm waits out for it and whose hold stands, written
-    /// once per change on the main thread (`App::publish_need`) and read by
-    /// every surface — `status needs=`, the survey's `needs=`, the menu-bar
-    /// item and its notifications — so none of them classifies again. Here
-    /// for the reason `agent` is: the leaf every reader reaches.
     need: crate::needs::Verdict,
-    /// The last act an agent that supervises itself recorded on this session
-    /// (`meta set harness_act <act>`, [`Self::note_harness_act`]): `status
-    /// last_act=`. Kept beside the ring, which may age its `harness-act` row out.
     last_act: Option<String>,
-    /// Admitted self-claim acts not yet shown by the app thread, in commit
-    /// order. A SelfTask wake drains this queue, not its possibly late face.
-    /// One face per outstanding act, including an act whose lane has not
-    /// posted its wake yet. It is not aged out by the bounded timeline ring;
-    /// a logical claim change clears it, as the old holder's news.
     pending_self_tasks: VecDeque<aterm_agent::harness::acts::TaskFace>,
-    /// Whether the session's claim holder recorded `upgrade@v1` (its live
-    /// upgrade's re-exec onto its next build, [`Self::note_harness_act`])
-    /// since the claim last moved: the release that follows it is the
-    /// re-exec's ([`Self::note_supervisor_moved`]).
     upgrade_recorded: bool,
-    /// THE RE-EXEC'S GAP (Autopilot Land): when a claim was given back
-    /// right after its holder recorded `upgrade@v1` — codex-alab's live
-    /// upgrade, which re-execs the same process onto its next build, resumes
-    /// the same conversation and claims again — the time of that release
-    /// (µs, `metrics::now_us`). Until a claim is taken again, at most
-    /// [`SELF_REEXEC_GAP_US`] past it, the self-claim's face stands: the faces
-    /// the watching loop tells in the gap are not the session's
-    /// (`App::apply_harness_fact`), as `upgrade@v1` itself tells none. `None`
-    /// otherwise.
     self_reexec_since_us: Option<u64>,
-    /// What the latest landing a proven self-claim's holder recorded (or
-    /// point it left to a person) was recorded over ([`LandingMark`],
-    /// [`Self::mark_landing`]): `None` before one.
     landing_mark: Option<LandingMark>,
-    /// THE TURN THE HOLDER'S LAST TURN-STARTING ACT TYPED, while no turn has
-    /// been counted past it: the program's count of turns begun
-    /// ([`LandingMark::program_turns`]) as that act arrived with the
-    /// program's report at rest ([`Self::note_typed_act`]). An act that
-    /// starts no turn leaves it as it was. Its landing is
-    /// that act's turn's yield, so a landing recorded at this same count has
-    /// its own turn still unparsed, and its mark holds it
-    /// (`harness_task::landing_turns`). `None`: no such act since the last
-    /// landing or point left to a person, an act that came with the report
-    /// in a turn (its begin already counted), or a claim changed since.
     typed_turn: Option<u64>,
-    /// The task's face under Land, as this window's host last heard it from the session's
-    /// loop, and the wall time of the move (unix ms): `status` and `ls` print it (`task=`,
-    /// only while this window's host holds the live claim) and Settings ▸ Harness's state line
-    /// reads it. `None`: nobody has told it, or the loop that did has ended. Written only by
-    /// `App::apply_harness_fact`.
     task_face: Option<(aterm_agent::harness::acts::TaskFace, i64)>,
-    /// The session's watchers ([`crate::SessionCtx::watchers`]): every
-    /// [`Self::record`] rings them, so whatever reads this ring (the `events`
-    /// digest, a parked `await`, `mail` on an `inbox` row) is woken by the
-    /// write itself. A default timeline rings a list of its own that nobody
-    /// watches; a session's is wired by [`crate::session_watch::Observed`].
     watchers: Arc<crate::session_watch::Watchers>,
-    /// The face and its time as they stood when the host told "unknown"
-    /// (the loop ended: a restart, a panicked body, an Off), kept so the next
-    /// loop's start face, where it is the same (a landing seeded across the
-    /// restart), RESTATES it with its first time rather than moving it
-    /// ([`Self::set_task_face`]). Gone at the first face told after.
     task_face_held: Option<(aterm_agent::harness::acts::TaskFace, i64)>,
-    /// THE LOOP'S PAUSE AFTER SHORT TURNS, as this window's host last heard
-    /// it (`docs/DESIGN-harness-autopilot-2026-10-15.md` §10.5.3, item 4):
-    /// what `status` and `ls` print (`pause=`, only while this window's host
-    /// holds the live claim). `None`: none stands. Written only by
-    /// `App::apply_harness_fact`.
     pause: Option<crate::PausePlan>,
-    /// THE WORKER'S NEEDS YOU, WHOLE, as its loop told this window's host
-    /// (`docs/DESIGN-harness-autopilot-2026-10-15.md` §12.2.3 item 3):
-    /// the set told last and the outgoing set whose entry still stands
-    /// until the new one's request lands ([`crate::needs::ToldNeeds`]), each
-    /// with the needs owner's entry text it was told with. Written only by
-    /// the host's live hook (`harness_host::store_needs`), on the loop's
-    /// thread, before the entry's `meta set` (or `unset`) is sent; a set is
-    /// read only beside the entry it was told with
-    /// ([`crate::needs::NeedFacts::told_needs`]). No stamp: the menu row's
-    /// age is the entry's, and no surface reads a need's own.
     harness_needs: crate::needs::ToldNeeds,
-    /// WHY LAND STILL HOLDS, as the session's loop told this window's host
-    /// (`docs/DESIGN-harness-autopilot-2026-10-15.md` §12.3.3 item 3; `IdleHost::land_held`):
-    /// what `status land_held= land_nudges=
-    /// land_since=` print (only while this window's host holds the live
-    /// claim and the session runs under Land), and what the window's glass
-    /// copies (`harness_glass::on_land_held`). `None`: none stands. Written
-    /// only by the host's live hook (`harness_host::store_land_held`), on
-    /// the loop's thread, and cleared by `App::apply_harness_fact` beside a
-    /// proven self-claim and at a person's own exchange. `Copy`, no text.
     land_held: Option<aterm_agent::harness::acts::LandHeld>,
-    /// Which foreground group was in front when the status sweep first saw
-    /// the engine's current cwd report: `(Terminal::reported_cwd_seq, pgid)`
-    /// ([`Self::witness_cwd_report`]). A report stands only under the group it
-    /// was made under: an ssh's remote shell's OSC 7 says nothing once the
-    /// local shell is back in front (`App::resolve_citation`).
     cwd_witness: Option<(u64, i32)>,
-    /// THE HOLDER IMAGE (card engine §3.4, I1): the image the PTY reader last
-    /// published as the foreground holder's, before the hold of the slice
-    /// that starts at its cut ([`Self::offer_holder_image`]). Only card-relevant
-    /// edges publish, so between them it is the last image that entered or
-    /// left a card drawer.
     holder_image: Option<std::sync::Arc<crate::holder_image::HolderImage>>,
-    /// The token whose `card-seen` dev row was recorded
-    /// ([`Self::note_card_seen`]).
     card_seen: Option<u64>,
-    /// What the card passes did with this session's card, for the dev rows
-    /// ([`Self::note_card_frame`]).
     card_frames: CardFrameMemo,
-    /// What [`Self::take_registry_drift`] judges against and last said.
     registry_drift: RegistryDriftMemo,
 }
 
-/// [`SessionTimeline::note_card_frame`]'s memo (card engine §8's judge).
 #[derive(Default)]
 struct CardFrameMemo {
-    /// The drawer token whose `card-decorated` row was recorded.
     decorated: Option<u64>,
-    /// The banner row its card was last decorated at (`card-row`).
     decorated_row: Option<i64>,
-    /// The bare frames counted for the token in front since its card was
-    /// seen or read, before it was decorated.
     bare: BareFrames,
-    /// The last `card-bare` row's token, reason and row.
     said: Option<(u64, crate::claude_card::Bare, Option<i64>)>,
-    /// The window pass count of the last card pass that judged this
-    /// session's card (`card-seen after=`).
     composed: u64,
-    /// The `card-seen` row's token, banner row and `after=`: the passes
-    /// composed after it and before the same card's decoration showed it
-    /// bare, whatever the gate read (a predecessor's card above it, say).
     seen: Option<(u64, i64, u64)>,
 }
 
-/// The frames one drawer's card was shown bare, by where (§8's
-/// `bare_frames`): a refused card is counted at its banner's absolute row,
-/// so a predecessor's card refused above the drawer's own (an inline
-/// relaunch, a `cat`'d card) is not the drawer's card's bare time; a frame
-/// with the card seen but no card read on the pane counts for whichever
-/// card is decorated.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct BareFrames {
     token: u64,
-    /// The row of the card refused most recently, and its frames there.
     row: Option<i64>,
     at_row: u32,
-    /// Frames with the drawer's card seen but none read.
     unplaced: u32,
 }
 
 impl BareFrames {
-    /// One more bare frame of `token`'s, its refused card at `row`.
     fn count(&mut self, token: u64, row: Option<i64>) {
         if self.token != token {
             *self = Self {
@@ -2766,7 +1846,6 @@ impl BareFrames {
         }
     }
 
-    /// The frames `token`'s card decorated at `row` was shown bare first.
     fn of(&self, token: u64, row: i64) -> u32 {
         if self.token != token {
             return 0;
@@ -2780,94 +1859,50 @@ impl BareFrames {
     }
 }
 
-/// [`SessionTimeline::take_registry_drift`]'s memo (card engine §3.10).
 #[derive(Default)]
 struct RegistryDriftMemo {
-    /// A drawer image's token, and the owner of the facts that stood for its
-    /// group when it was published and are not its own: facts of that owner
-    /// are a row from before its `exec` (the image it replaced wrote it),
-    /// never judged against it, nor held to as its build
-    /// (`SessionTimeline::card_gate`). Which standing facts those are,
-    /// `SessionTimeline::offer_holder_image` says.
     stale: Option<(u64, Option<aterm_agent::harness::footer::FactsOwner>)>,
-    /// The image token and the reported build last said.
     said: Option<(u64, String)>,
 }
 
-/// A Claude Code process whose registry row reports a build its Store or
-/// Native drawer image does not name (card engine §3.10): a fact for later,
-/// never a gate input.
+/// A Claude Code process whose registry row reports a build its Store or Native drawer image does not name (card engine §3.10).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct RegistryDrift {
-    /// The group the image and the row are of.
     pub(crate) pgid: i32,
-    /// The build the image names: its store directory's, or its installer
-    /// version folder's.
     pub(crate) image: String,
-    /// Where the image runs from (Store or Native).
     pub(crate) source: atpkg::image::ImageSource,
-    /// The build the registry row reports (`FooterFacts::version`).
     pub(crate) reported: String,
 }
 
-/// What an identified agent's screen counts, read with its verdict by the
-/// status sweep (`session_status::AgentStep::gauges`) and published for the
-/// survey. `None` for what the screen did not show.
+/// What an identified agent's screen counts.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct AgentGauges {
-    /// The context left before auto-compact, in percent, where the agent
-    /// shows it (`aterm_phase::Reading::context_left`).
     pub(crate) ctx_pct: Option<u8>,
-    /// How many background shells it counts (`aterm_phase::shells_running`).
     pub(crate) shells: Option<u32>,
 }
 
-/// How many ids a seamless update leaves this process between the park's draw
-/// and its `_exit` ([`SessionTimeline::handoff_id`]). Events keep being
-/// recorded until Commit, so the successor counts on from above them;
-/// `timeline since=` filters by id, so the jump is invisible. A process that
-/// records more than this in one overlap refuses its Commit (a lossless retry)
-/// rather than hand an id out twice.
+/// How many ids a seamless update leaves this process between the park's draw and its `_exit` ([`SessionTimeline::handoff_id`]).
 #[cfg(any(unix, test))]
 pub(crate) const HANDOFF_ID_RESERVE: u64 = 1 << 16;
 
-/// One measurement of the shell's PATH ([`SessionTimeline::set_leader`]).
-///
-/// The evidence is a child's exec environment, not the shell's: a one-off
-/// `PATH=/usr/bin:/bin tool` reads frozen from a shell whose PATH is live. So a
-/// frozen reading is believed only once settled (a second job agrees, or the
-/// carried adoption mark does, [`path_columns`]) and never raises the mark. A
-/// live reading settles at once (putting aterm's own `agents/` first is no
-/// accident) and lowers the mark ([`SessionTimeline::take_path_lowered`]).
+/// One measurement of the shell's PATH.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct PathReading {
-    /// What the PATH does with `claude`/`codex`.
     pub(crate) verdict: crate::session_status::program::PathVerdict,
-    /// When it was read, on the ledger clock ([`now_ms`]).
     pub(crate) at_ms: u64,
-    /// The foreground group it was read from: a reading from another group with the
-    /// same verdict is another job agreeing.
     pgid: i32,
-    /// Whether another job's reading agreed with this verdict, with no other
-    /// verdict between them.
     agreed: bool,
-    /// Whether the registry's frozen mark has been lowered for this live
-    /// reading yet ([`SessionTimeline::take_path_lowered`]).
     reported: bool,
 }
 
 impl PathReading {
-    /// Whether the reading is the shell's, not one job's: live, or frozen
-    /// with a second job agreeing.
+    /// Whether the reading is the shell's, not one job's.
     pub(crate) fn settled(&self) -> bool {
         self.verdict.word() == "live" || self.agreed
     }
 }
 
-/// `(path=, path_evidence=)` from the registry's adoption `mark` and the last `reading`
-/// (`(word, age_ms, settled)`, [`SessionTimeline::path_reading`]). One job's unsettled frozen
-/// reading on an unmarked shell reads `live`, `unconfirmed:<age_ms>`: it may be a per-command
-/// `PATH=` override.
+/// Format `(path=, path_evidence=)` status columns from the adoption mark and live cwd.
 pub(crate) fn path_columns(
     mark: bool,
     reading: Option<(&'static str, u64, bool)>,
@@ -2880,174 +1915,50 @@ pub(crate) fn path_columns(
     }
 }
 
-/// The server-published identity and agent verdict of one session: `status`
-/// and every `sessions` row carry it as `program= agent= agent_detail=
-/// agent_rev= agent_since_ms=`, `subscribe … events` pushes `EVENT <local>
-/// agent <word> rev=<n>` on every move, and `await agent` parks on it.
+/// The server-published identity and agent verdict of one session.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct AgentPublication {
-    /// The argv[0] basename of the PTY's foreground process-group leader
-    /// (`claude`, `zsh`, `sleep`), or `None` while unresolved or unknowable.
     pub(crate) program: Option<String>,
-    /// The agent the last verdict's reader identified (by `program`'s name or, for a runtime
-    /// like `node`, by its screen), or `None`. The in-GUI supervisor host attaches by it
-    /// (`harness_host::agent_of`).
     pub(crate) reader: Option<aterm_phase::Program>,
-    /// The foreground process group `program` belongs to (`0` = none seen
-    /// yet). A resolution answered for an older group is dropped.
     pub(crate) program_pgid: i32,
-    /// `busy|prompt|question|wall:<kind>|idle|survey|unknown`, or `-` when the
-    /// session is not an identified agent. The effective word: the screen's
-    /// verdict ([`Self::screen_word`]), or `wall:unresponsive` while the program
-    /// has stopped reading its input ([`Self::input`]).
     pub(crate) word: &'static str,
-    /// The verdict's detail (`bash:not-read-only`, a limit's reset), wire-safe
-    /// (pct-encoded at the edge), or `None`.
     pub(crate) detail: Option<String>,
-    /// Bumps each time `word` or `detail` moves; `0` = never published.
     pub(crate) rev: u64,
-    /// How many times the verdict moved as the PROGRAM's: [`Self::rev`]'s
-    /// moves, less the screen reads within a re-grid's settle
-    /// ([`GridRead::settling`]) — a width change reflows the screen, the
-    /// read of the reflowed grid can parse it otherwise (a box's detail lost)
-    /// and the program's repaint parse it as before, with nothing of the
-    /// program's own moving — plus one at the first read past the settle
-    /// whose verdict is not the one that stood before the re-grid
-    /// ([`GridRead::before`]). An input stall's move always counts. A count
-    /// that only grows, like [`Self::text_moves`]: the held deadline's
-    /// verdict evidence (`harness_host::Progress::verdict`), where `rev` is
-    /// the wire's.
     pub(crate) verdict_moves: u64,
-    /// The approval box's command or path while `word` is `prompt`, folded to
-    /// one clipped line. Host-side only (menu-bar row and notification); the
-    /// wire never carries it. Moving it bumps no `rev`.
     pub(crate) subject: Option<String>,
-    /// When `word`/`detail` last moved, on the ledger clock ([`now_ms`]).
     pub(crate) changed_ms: u64,
-    /// The same moment on the clock that counts through sleep
-    /// (`aterm_uds::process::continuous_ms`), where this platform has one:
-    /// what the survey's `agent_ms=` is taken on ([`Self::age_ms`]).
     pub(crate) changed_continuous_ms: Option<u64>,
-    /// The screen the verdict stands on: the stamp of the last read of the live
-    /// zone (an unchanged re-read re-confirms the verdict and moves the stamp).
-    /// `None` until the first read.
     pub(crate) stamp: Option<AgentStamp>,
-    /// The screen's verdict as last published, kept apart from the effective
-    /// [`Self::word`] so a stall that ends hands the word back to it.
     pub(crate) screen_word: &'static str,
-    /// The screen verdict's detail, likewise.
     pub(crate) screen_detail: Option<String>,
-    /// The published input stall ([`crate::input_stall::InputStallFact`]): while
-    /// set on an identified agent the word is `wall:unresponsive` whatever the
-    /// screen says, since a frozen program's screen keeps its last verdict.
     pub(crate) input: Option<crate::input_stall::InputStallFact>,
-    /// How many times a read of the screen found its TEXT changed from the
-    /// read before ([`AgentStamp::fp`] moved; colours alone never move it):
-    /// a count that only grows, so a screen that changed and changed back
-    /// between two looks still reads as moved. A RE-GRID IS NO MOVE: a read
-    /// within [`REGRID_SETTLE`] of the first read that found the grid resized
-    /// ([`Self::grid`]) is not counted, since a resize changes every row's
-    /// text and the program's repaint after it changes it again with nothing
-    /// of the program's own moving — the presence row born or folded, a tab
-    /// brought to the front, the window dragged wider or taller, a pane
-    /// split, the font zoomed; the verdict a re-grid moves is settled the
-    /// same way ([`Self::verdict_moves`]). A grid that keeps moving less than
-    /// [`REGRID_SETTLE`] apart (an edge being dragged) withholds this text
-    /// evidence, and the verdict's, until it settles; input and the
-    /// transcript still count. The held deadline's screen evidence
-    /// (`harness_host::look_at_startups`).
     pub(crate) text_moves: u64,
-    /// The grid as the screen's reads found it ([`GridRead`]; `None` until
-    /// the sweep's first read names it): what keeps a re-grid out of
-    /// [`Self::text_moves`].
     pub(crate) grid: Option<GridRead>,
-    /// How many reads found the live zone moved under a verdict that stood while the agent was
-    /// not busy ([`SessionTimeline::publish_agent`]): an in-app `/clear` moves its
-    /// conversation and no verdict, only this. Host-side only, like [`Self::subject`]: the
-    /// supervisor host follows Claude Code's record of the agent when it moves
-    /// (`harness_host::FollowStamp::screen`). A busy agent's spinner never moves it.
     pub(crate) screen_moves: u64,
-    /// How many reads of the screen found the agent BUSY after a read that
-    /// did not ([`Self::screen_word`] moved into `busy`; a read within a
-    /// re-grid's settle is none, and an input stall, which moves only the
-    /// effective word, neither begins nor ends one): the turns the screen saw
-    /// begin, a count that only grows. A proven self-claim's landing reopens
-    /// at one past its mark ([`LandingMark::busy_entries`]). The screen is
-    /// read at sweeps, so a turn no read found busy is not counted; Codex's
-    /// screen is never read (`aterm_phase::CodexReader`), and its own report
-    /// counts its turns ([`LandingMark::program_turns`]).
     pub(crate) busy_entries: u64,
 }
 
-/// WHAT A PROVEN SELF-CLAIM'S LANDING WAS RECORDED OVER (Autopilot Land):
-/// the session's two counts of turns begun, as they stood when its holder's
-/// `meta set harness_act landed@v1` was served (the `meta` arm,
-/// `control::serve_meta`, which records the mark before it posts the
-/// landing's face). A point it left to a person (`left-to-person@v1`) is
-/// marked the same way and reopens the same way
-/// (`harness_task::holds_until_another_turn`). A turn begun after the landing that a count sees moves
-/// it past its mark, and the landing reopens
-/// (`App::reopen_self_claim_landing`) — however short the turn, whenever the
-/// status sweep reads it, and whatever the report standing then says. What
-/// each count cannot see is the reopen's to say.
+/// WHAT A PROVEN SELF-CLAIM'S LANDING WAS RECORDED OVER (Autopilot Land).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct LandingMark {
-    /// The program's own count (OSC 7501,
-    /// `aterm_core::terminal::program_state::ProgramStateReport::turns`),
-    /// read from the engine as the act arrived, before it was admitted: every
-    /// report the engine had parsed by then is the landing's or earlier, so a
-    /// sweep that had not yet read the landing turn's reports reads none of
-    /// them as after it, and a report parsed while the act was admitted (a
-    /// turn begun after the holder decided) stays past it. One parsed between
-    /// the holder's decision and the act's arrival is in it: the act's trip
-    /// from the holder is a window no read here closes. A landing whose act
-    /// outran its own turn's begin (no turn counted since the holder's last
-    /// act, which came at rest: [`SessionTimeline::typed_turn`]) is marked one
-    /// past the engine's count, so that begin, parsed after it, is no turn
-    /// after it (`harness_task::landing_turns`).
     pub(crate) program_turns: u64,
-    /// The screen's count ([`AgentPublication::busy_entries`]), read with the
-    /// program's.
     pub(crate) busy_entries: u64,
 }
 
-/// How long after the first read that finds a session's grid resized a text
-/// change is the re-grid's, not the program's ([`AgentPublication::text_moves`]):
-/// the program's repaint for the new size lands within the resize ledger's
-/// [`crate::resize_ledger::RISK_AFTER_MS`] (Claude Code's in 5-30 ms), and
-/// the sweep reads a moved screen within
-/// [`crate::session_status::AGENT_MIN_INTERVAL`] of it; two seconds holds
-/// both with room. What the program itself changes in that time is not
-/// counted, and its next change is; its verdict, if it is not the one that
-/// stood before the re-grid, counts once at the first read past the settle
-/// ([`AgentPublication::verdict_moves`]). Each new resize starts the settle
-/// again, so a grid that keeps moving less than this apart withholds the
-/// screen's evidence until it rests: the discount is per burst, not per
-/// resize.
+/// How long after the first read that finds a session's grid resized a text change is the re-grid's.
 pub(crate) const REGRID_SETTLE: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// THE GRID AT A READ OF THE SCREEN ([`SessionTimeline::note_grid`]): which
-/// resize the engine had last taken, and since when the reads have found it.
+/// THE GRID AT A READ OF THE SCREEN ([`SessionTimeline::note_grid`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct GridRead {
-    /// The engine's `(Terminal::resize_lifetime, Terminal::resize_ordinal)`
-    /// at the read: a new value is a resize (or a new engine) since the last.
     pub(crate) resize: (u64, u64),
-    /// The first read that found the grid at `resize` after another, or
-    /// `None` where the grid has not moved since the first read.
     pub(crate) since: Option<std::time::Instant>,
-    /// The read itself.
     pub(crate) at: std::time::Instant,
-    /// The effective verdict (word, detail) that stood when the first
-    /// re-grid of a burst was read, kept until the first read past the
-    /// settle compares it ([`AgentPublication::verdict_moves`]); `None`
-    /// outside a burst.
     pub(crate) before: Option<(&'static str, Option<String>)>,
 }
 
 impl GridRead {
-    /// Whether a text change at this read is the re-grid's: the read is
-    /// within [`REGRID_SETTLE`] of the first that found the grid resized.
+    /// Whether a text change at this read is the re-grid's.
     #[must_use]
     pub(crate) fn settling(&self) -> bool {
         self.since
@@ -3055,15 +1966,10 @@ impl GridRead {
     }
 }
 
-/// Which screen an agent verdict was read from: its generation and FNV-1a-64
-/// hash, as `status gen=`/`hash=` print them. A press decided from the verdict
-/// fences on these (`key if-gen=<agent_gen> if-fp=<agent_fp>`), never on a
-/// fresh `status gen=`, which can be up to one sweep newer than the verdict.
+/// Which screen an agent verdict was read from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct AgentStamp {
-    /// The screen generation of the read.
     pub(crate) generation: crate::control::ScreenGen,
-    /// FNV-1a-64 of the untrimmed visible screen at the read.
     pub(crate) fp: u64,
 }
 
@@ -3098,10 +2004,7 @@ impl AgentPublication {
         now_ms().saturating_sub(self.changed_ms)
     }
 
-    /// [`Self::since_ms`] counted THROUGH SLEEP, as the survey reports it: a
-    /// laptop that slept since the verdict moved reads the time that passed,
-    /// not only the time awake. The awake count where the platform has no
-    /// such clock.
+    /// [`Self::since_ms`] counted THROUGH SLEEP, as the survey reports it.
     pub(crate) fn age_ms(&self) -> u64 {
         match (
             self.changed_continuous_ms,
@@ -3112,10 +2015,6 @@ impl AgentPublication {
         }
     }
 
-    /// The effective word and detail: `wall:unresponsive` (detail `stopped`
-    /// for a stopped job) while an input stall is published on an identified
-    /// agent, the screen's verdict otherwise. A session that is no agent keeps
-    /// `-`: its stall is the server's attention entry, not an agent word.
     fn effective(&self) -> (&'static str, Option<String>) {
         match &self.input {
             Some(stall) if self.reader.is_some() => (
@@ -3126,9 +2025,7 @@ impl AgentPublication {
         }
     }
 
-    /// The seven wire fields, space-separated, in their fixed order: `program=`
-    /// `agent=` `agent_detail=` `agent_rev=` `agent_since_ms=` `agent_gen=`
-    /// `agent_fp=`. Free text is pct-encoded; unknown is `-`.
+    /// The seven wire fields, space-separated, in their fixed order.
     pub(crate) fn wire_fields(&self) -> String {
         let enc = |v: Option<&str>| v.map_or_else(|| "-".to_string(), crate::control::pct_encode);
         let (generation, fp) = self.stamp_fields();
@@ -3143,7 +2040,6 @@ impl AgentPublication {
         )
     }
 
-    /// `agent_gen`/`agent_fp` as wire text (`-` before the first read).
     fn stamp_fields(&self) -> (String, String) {
         self.stamp.map_or_else(
             || ("-".to_string(), "-".to_string()),
@@ -3152,10 +2048,7 @@ impl AgentPublication {
     }
 }
 
-/// How long a person's hands must be off a session before their next input opens a new burst
-/// (one `EVENT <local> human` push, one `human` row), which bounds those rows in the shared
-/// [`TIMELINE_CAP`] ring to 120 an hour. The supervisor's `[harness] human_grace_s` (120 s by
-/// default) is longer. Bursts are [`crate::human_input::HumanInputStamp`]'s.
+/// How long a person's hands must be off a session before their next input opens a new burst (one `EVENT <local> human` push, one `human` row).
 pub(crate) const HUMAN_BURST_GAP_MS: u64 = 30_000;
 
 impl SessionTimeline {
@@ -3167,24 +2060,12 @@ impl SessionTimeline {
         }
     }
 
-    /// The list this timeline rings: `SessionStore::register` checks it is the
-    /// context's.
+    /// The list this timeline rings.
     pub(crate) fn watchers(&self) -> &Arc<crate::session_watch::Watchers> {
         &self.watchers
     }
 
-    /// An act the session's proven self-claim's holder took (`meta set
-    /// harness_act <act>`, the native harness contract §5): the session
-    /// log's `act` mark by `by`, the connection's actor (plan 5C-2,
-    /// [`crate::session_log::SessionLog::self_claim_act`]), then, in the same
-    /// hold, its `harness-act` row (`act=<act> holder=<holder>`), and the act
-    /// kept for `status last_act=`. `act` and `holder` are owner tokens,
-    /// printed verbatim. THE ROW FOLLOWS ITS RECORD (phase 6, 6G-2, as U13
-    /// ruled the `cwd-change` and `title-change` rows): an act the mark
-    /// limiter refuses (its actor's burst spent) is no record, and no row, so
-    /// the timeline's view of the log is the ring's. The caller takes the
-    /// log's wake before it releases the lock. Returns the row's id, if one
-    /// was recorded.
+    /// An act the session's proven self-claim's holder took (`meta set harness_act <act>`, the native harness contract §5).
     pub(crate) fn note_harness_act(
         &mut self,
         act: &str,
@@ -3192,8 +2073,6 @@ impl SessionTimeline {
         by: aterm_slog::Actor,
     ) -> Option<u64> {
         self.last_act = Some(act.to_string());
-        // The holder's upgrade is its act, whatever the log's limiter
-        // keeps of it (as `last_act` is): the re-exec's gap reads it.
         if act == aterm_agent::harness::acts::RULE_UPGRADE {
             self.upgrade_recorded = true;
         }
@@ -3212,15 +2091,12 @@ impl SessionTimeline {
         self.pending_self_tasks.push_back(face);
     }
 
-    /// Take the finite batch committed before this read. Later acts keep
-    /// their own wakes; a continuous writer cannot grow this app turn.
+    /// Take the finite batch committed before this read.
     pub(crate) fn take_self_tasks(&mut self) -> VecDeque<aterm_agent::harness::acts::TaskFace> {
         std::mem::take(&mut self.pending_self_tasks)
     }
 
-    /// A proven self-claim's holder recorded its landing (or left a point to
-    /// a person) over `mark` (the session's counts as its act arrived,
-    /// [`LandingMark`]), replacing any mark before it.
+    /// A proven self-claim's holder recorded its landing over `mark`, replacing any mark before it.
     pub(crate) fn mark_landing(&mut self, mark: LandingMark) {
         self.landing_mark = Some(mark);
     }
@@ -3230,76 +2106,35 @@ impl SessionTimeline {
         self.landing_mark
     }
 
-    /// A proven self-claim's holder recorded an act that starts a turn (a
-    /// continuation, a land act, a prose answer, a resume past a wall:
-    /// `aterm_agent::harness::acts::self_claim_types_turn`) with the program's
-    /// report at rest and `turns` turns begun (`Some`), or with it in a turn
-    /// or unread (`None`): the turn that act typed is what a landing after it
-    /// is judged on ([`Self::typed_turn`]). An act that starts no turn (an
-    /// approval, a box's answer, a report mailed) is never noted here, so it
-    /// leaves the turn the last one typed as it was.
+    /// Record a turn-starting act typed by a proven self-claim holder.
     pub(crate) fn note_typed_act(&mut self, at_rest_turns: Option<u64>) {
         self.typed_turn = at_rest_turns;
     }
 
-    /// The count [`Self::note_typed_act`] kept, taken by the landing or the
-    /// point left to a person that follows it: one act, one landing.
+    /// The count [`Self::note_typed_act`] kept, taken by the landing or the point left to a person that follows it.
     pub(crate) fn take_typed_turn(&mut self) -> Option<u64> {
         self.typed_turn.take()
     }
 
-    /// THE CLAIM MOVED at `now_us` (taken, or given back: `taken`): a release
-    /// right after its holder's `upgrade@v1` opens the re-exec's gap
-    /// ([`Self::self_reexec_since_us`]); any claim taken closes it. Either
-    /// way the upgrade is spent.
+    /// THE CLAIM MOVED at `now_us` (taken, or given back: `taken`).
     pub(crate) fn note_supervisor_moved(&mut self, taken: bool, now_us: u64) {
         self.self_reexec_since_us = (!taken && self.upgrade_recorded).then_some(now_us);
         self.upgrade_recorded = false;
     }
 
-    /// Whether `now_us` falls in the re-exec's gap
-    /// ([`Self::self_reexec_since_us`]).
+    /// Whether `now_us` falls in the re-exec's gap.
     pub(crate) fn in_self_reexec(&self, now_us: u64) -> bool {
         self.self_reexec_since_us
             .is_some_and(|at| now_us.saturating_sub(at) < SELF_REEXEC_GAP_US)
     }
 
-    /// A logical claim change: the former holder's acts are no landing's
-    /// own turn for the next holder ([`Self::typed_turn`]).
+    /// A logical claim change.
     pub(crate) fn forget_holder_acts(&mut self) {
         self.pending_self_tasks.clear();
         self.typed_turn = None;
     }
 
-    /// A move of what the program in front says about itself, as the status
-    /// sweep's gate HONOURED it (OSC 7501, `crate::program_state::ProgramStateGate`:
-    /// only under a `codex`, only a report newer than the last foreground
-    /// move): one `program-state` row, `state=<idle|working|blocked|done|error>
-    /// kind=<permission|question|auth|->`, or `state=- kind=-` when the shown
-    /// report went away (a `clear`, a full reset, the program leaving the
-    /// front). Read with the rows' own `t=`, `timeline` is the program's turn
-    /// ledger: a turn starts at `working` (or `blocked`), ends at `done`,
-    /// `idle` or `error`, and a `blocked` row to the next row is a blocked span.
-    ///
-    /// IN THE SAME HOLD, THE SESSION LOG'S PROGRAM MARK (T24's reversal):
-    /// `mark <run|-> program state=
-    /// [ask=] [coalesced=] src=engine conf=claim`, through the run's
-    /// coalescing bucket (`SessionLog::observe_program`), written before the
-    /// row so the row's wake finds it. So `await log kind=program` and
-    /// `subscribe … log` see each move; the log's fold never reads it, `brief`
-    /// prints no line of it, and it stays on this host (no bus class).
-    ///
-    /// The row itself is still read by no decision: no agent verdict, act,
-    /// supervisor or alert reads it, the `events` digest does not carry it
-    /// (`crate::subscribe::timeline_wire_kind`) and the tab's hover tail
-    /// leaves it out (`crate::session_chrome::timeline_row_shown`).
-    ///
-    /// Bounded like every row: the gate moves at most once per status sweep,
-    /// the payload is two closed-set words under [`MAX_PAYLOAD`], and the ring
-    /// stays at [`TIMELINE_CAP`] with these rows held to
-    /// [`PROGRAM_STATE_ROWS_MAX`] of it; the log keeps its own rule (64 a
-    /// run, `aterm_slog::program_share`, and a flap past the bucket coalesced
-    /// to its latest state): `Diff::Retention`, not an exact pair.
+    /// A move of what the program in front says about itself.
     pub(crate) fn note_program_state(
         &mut self,
         shown: Option<aterm_core::terminal::program_state::ProgramState>,
@@ -3322,14 +2157,7 @@ impl SessionTimeline {
         self.record(PROGRAM_STATE, format!("state={state} kind={kind}"))
     }
 
-    /// Append one event, evicting the oldest past the cap, and wake the
-    /// session's watchers for a record ([`crate::session_watch::Watchers::ring_record`]:
-    /// an `events` subscription reads it at once). Returns its id.
-    ///
-    /// Never a [`META_CHANGE`]: that kind has ONE writer,
-    /// [`Self::record_meta_change`], so its session log mark and the
-    /// `escalated` need it derives cannot be skipped. Asked for
-    /// one, a debug build panics and a release build appends nothing.
+    /// Append one event, evicting the oldest past the cap, and wake the session's watchers for a record. Returns its id.
     pub(crate) fn record(&mut self, kind: &'static str, payload: String) -> u64 {
         debug_assert_ne!(kind, META_CHANGE, "a meta-change is record_meta_change's");
         if kind == META_CHANGE {
@@ -3338,13 +2166,7 @@ impl SessionTimeline {
         self.append(kind, payload)
     }
 
-    /// THE ONE `meta-change` WRITER,
-    /// under the meta → timeline hold its writer already
-    /// takes (`meta` is the store as the write left it): the timeline row,
-    /// the session log's `mark - meta field= value=` by its writer, and the
-    /// `escalated` need derived from the effective attention owner — raised
-    /// while it is the supervisor's, cleared once it is not, `by=aterm`
-    /// whoever wrote. Returns the row's id.
+    /// THE ONE `meta-change` WRITER, under the meta → timeline hold its writer already takes (`meta` is the store as the write left it).
     pub(crate) fn record_meta_change(
         &mut self,
         payload: String,
@@ -3359,32 +2181,18 @@ impl SessionTimeline {
         id
     }
 
-    /// A raw `meta-change` row for a test that pins the timeline's own
-    /// shapes (ids, the digest, the cap) and not a writer's.
+    /// A raw `meta-change` row for a test that pins the timeline's own shapes and not a writer's.
     #[cfg(test)]
     pub(crate) fn record_raw_meta_change(&mut self, payload: String) -> u64 {
         self.append(META_CHANGE, payload)
     }
 
-    /// Every row's one way in: the `human` rows the session log's burst
-    /// marks owe first ([`Self::pay_burst_rows`]), then this one.
     fn append(&mut self, kind: &'static str, payload: String) -> u64 {
         self.pay_burst_rows();
         self.push_row(kind, payload)
     }
 
-    /// THE `human` ROWS THE SESSION LOG'S BURST MARKS OWE (the
-    /// review of 6F-8): one row for each burst mark
-    /// [`crate::session_log::SessionLog::person_input`] wrote since the last
-    /// payment, recorded now. Paid before every row ([`Self::append`]) and
-    /// at the end of the key's own delivery
-    /// ([`crate::app_input::deliver_noted`]), so no row stands between a
-    /// burst's mark and its row: a key that a reconciling entry delivered
-    /// first (the timeline held when the key came) has its row where its
-    /// mark is, before that entry's own row, never after it. A writer whose
-    /// log entry reconciles the person writes its mark before its row
-    /// ([`Self::settle_agent_word`], the fabric's `record_fact`) for the
-    /// same reason.
+    /// THE `human` ROWS THE SESSION LOG'S BURST MARKS OWE (the review of 6F-8).
     pub(crate) fn pay_burst_rows(&mut self) {
         for _ in 0..self.slog.take_burst_rows() {
             let _ = self.push_row(HUMAN, String::new());
@@ -3406,15 +2214,7 @@ impl SessionTimeline {
         self.next_id
     }
 
-    /// THE `cwd-change` WRITER: record a `cwd-change` iff the session
-    /// log's `cwd` mark moved (the GUI observes cwd on every output wake, so
-    /// the dedup lives in the mark), its text the mark's. A `None`/empty cwd
-    /// (OSC 7 cleared) records `cwd=-`; a session's first read with none
-    /// records nothing. Since phase 6 the row follows its
-    /// record: the mark's dedup is its fingerprint, which a seamless update
-    /// carries, so a successor whose timeline starts empty does not restate
-    /// the directory it carried, and the row is the record's, row for
-    /// record, as the log's view prints it.
+    /// THE `cwd-change` WRITER.
     pub(crate) fn record_cwd_change(&mut self, cwd: Option<&str>) {
         let at = self.slog.now();
         let Some(held) = self.slog.observe_cwd(cwd, at) else {
@@ -3428,13 +2228,7 @@ impl SessionTimeline {
         self.record(CWD_CHANGE, payload);
     }
 
-    /// THE `title-change` WRITER (DESIGN
-    /// §8: "the C-tier title keeps the `title-change` rows"): the drift
-    /// flush's informative title ([`crate::tab_label::informative`]), on
-    /// every session, as the session log's content-tier `title` mark takes
-    /// it — when it moved past a spinner frame, its text the mark's, a
-    /// first read with no title nothing, and a successor's carried title
-    /// no move. Returns whether a row was recorded.
+    /// THE `title-change` WRITER (DESIGN §8: "the C-tier title keeps the `title-change` rows").
     pub(crate) fn record_title(&mut self, shown: &str) -> bool {
         let at = self.slog.now();
         let Some(held) = self.slog.observe_title(shown, at) else {
@@ -3452,10 +2246,7 @@ impl SessionTimeline {
         &self.resizes
     }
 
-    /// Book a resize path's journal copy ([`crate::resize_ledger::ResizeLedger::ingest`])
-    /// and record any verdict transition as a `render` event. Returns whether one
-    /// was recorded. A booked row wakes the session's watchers even with no
-    /// transition: `EVENT resize` is read off the ledger's rows.
+    /// Book a resize path's journal copy ([`crate::resize_ledger::ResizeLedger::ingest`]) and record any verdict transition as a `render` event.
     pub(crate) fn ingest_resizes(
         &mut self,
         copy: &crate::resize_ledger::JournalCopy,
@@ -3472,8 +2263,7 @@ impl SessionTimeline {
         recorded
     }
 
-    /// Evaluate the resize ledger against `probe` and record any verdict
-    /// transition as a `render` event. Returns whether one was recorded.
+    /// Evaluate the resize ledger against `probe` and record any verdict transition as a `render` event.
     pub(crate) fn evaluate_resizes(
         &mut self,
         probe: crate::resize_ledger::EngineProbe,
@@ -3490,21 +2280,18 @@ impl SessionTimeline {
         self.set_agent_reader(claude.then_some(aterm_phase::Program::Claude));
     }
 
-    /// Whether this session's program reads as the agent class (Claude Code)
-    /// now: the class the repaint nudge is limited to.
+    /// Whether this session's program reads as the agent class (Claude Code) now.
     pub(crate) fn resize_agent_class(&mut self) -> bool {
         self.note_resize_class();
         self.resizes.agent_class()
     }
 
-    /// The open epoch when the repaint nudge may act on it (`desync-risk`, the
-    /// agent class, untried).
+    /// The open epoch when the repaint nudge may act on it.
     pub(crate) fn resize_nudge_view(&self) -> Option<crate::resize_epoch::NudgeView> {
         self.resizes.nudge_view()
     }
 
-    /// Whether render epoch `id` is still the open one and at risk
-    /// ([`crate::resize_epoch::EpochBook::still_at_risk`]).
+    /// Whether render epoch `id` is still the open one and at risk.
     pub(crate) fn resize_epoch_at_risk(&self, id: u64) -> bool {
         self.resizes.still_at_risk(id)
     }
@@ -3514,14 +2301,12 @@ impl SessionTimeline {
         self.resizes.note_tried(id);
     }
 
-    /// The repaint nudge's attempt for epoch `id` was superseded by a real
-    /// resize ([`crate::resize_epoch::EpochBook::note_superseded`]).
+    /// The repaint nudge's attempt for epoch `id` was superseded by a real resize.
     pub(crate) fn note_resize_superseded(&mut self, id: u64) {
         self.resizes.note_superseded(id);
     }
 
-    /// A superseded attempt's epoch the judge found back at risk, once
-    /// ([`crate::resize_epoch::EpochBook::take_returned`]).
+    /// A superseded attempt's epoch the judge found back at risk, once.
     pub(crate) fn take_resize_returned(&mut self) -> Option<u64> {
         self.resizes.take_returned()
     }
@@ -3536,8 +2321,7 @@ impl SessionTimeline {
         self.resizes.defer_look(now_ms);
     }
 
-    /// `render= resizes= flaps=` for `status`, evaluated against `probe` (`None`:
-    /// the terminal lock was contended, and `render=-`).
+    /// `render= resizes= flaps=` for `status`, evaluated against `probe`.
     pub(crate) fn resize_status_fields(
         &mut self,
         probe: Option<crate::resize_ledger::EngineProbe>,
@@ -3549,9 +2333,6 @@ impl SessionTimeline {
         fields
     }
 
-    /// Tell the resize ledger whether this session's program is Claude Code, the
-    /// one class its epoch judge accuses (`crate::resize_epoch`): the presence
-    /// classifier's published reader.
     fn note_resize_class(&mut self) {
         self.resizes.set_agent(match self.agent.reader {
             Some(aterm_phase::Program::Claude) => true,
@@ -3566,15 +2347,11 @@ impl SessionTimeline {
         });
     }
 
-    /// Only entry into and exit from `desync-risk` reach the lifecycle ring:
-    /// a healthy flap records nothing, so at one a minute it cannot evict the
-    /// rows other watchers read.
+    /// Only entry into and exit from `desync-risk` reach the lifecycle ring.
     pub(crate) fn record_render(
         &mut self,
         transitions: &[crate::resize_ledger::Transition],
     ) -> bool {
-        // One `aterm.log` line per render epoch that reached `desync-risk` or
-        // `unjudged`: the field rate is then known whatever the repair does.
         for line in self.resizes.take_logs() {
             aterm_log::info!(
                 "{line} program={}",
@@ -3583,26 +2360,13 @@ impl SessionTimeline {
         }
         for transition in transitions {
             self.record("render", transition.payload());
-            // THE SESSION LOG's `render` mark, in the same hold (phase 3B).
             let at = self.slog.now();
             self.slog.observe_render(transition, at);
         }
         !transitions.is_empty()
     }
 
-    /// Events with `id > after` (all with `None`), oldest first. Seeks with `partition_point`
-    /// (ids are monotone), so the `events` digest's 250 ms tick costs O(log n + matched). A
-    /// watermark below [`Self::low_id`] yields everything; the digest reports that hole as
-    /// `GAP … events-dropped=`.
-    ///
-    /// A watermark ABOVE every id this timeline has handed out yields
-    /// everything as well: it is no id of this count, but another process's —
-    /// the window the PTY keeper recovered this shell from after a crash
-    /// (`keeper_link`, which carries no count, so the recovery starts at 1),
-    /// one seamless update's `HANDOFF_ID_RESERVE` above it. Filtered, a
-    /// driver tailing `timeline since=<last id>` read `OK 0` for some 65,540
-    /// events after the crash; read
-    /// from the recovery's first row, its `handoff` row, it reads on at once.
+    /// Events with `id > after` (all with `None`), oldest first.
     pub(crate) fn since(
         &self,
         after: Option<u64>,
@@ -3618,14 +2382,9 @@ impl SessionTimeline {
         self.events.range(start..)
     }
 
-    /// The id a seamless update's manifest carries (`SessionRecord::timeline_id`): the last id
-    /// handed out plus [`HANDOFF_ID_RESERVE`], since this process keeps recording after the
-    /// park draws the manifest. Remembered as this process's ceiling; clamped to what TOML can
-    /// write.
+    /// The id a seamless update's manifest carries (`SessionRecord::timeline_id`).
     #[cfg(any(unix, test))]
     pub(crate) fn handoff_id(&mut self) -> u64 {
-        // The view's ids too (6G-2): the session log's row count runs beside
-        // the ring's, and the successor continues both from the one number.
         let carried = self
             .next_id
             .max(self.slog.row_head())
@@ -3635,10 +2394,7 @@ impl SessionTimeline {
         carried
     }
 
-    /// Whether this process has handed out an id past the one the last manifest carried
-    /// ([`Self::handoff_id`]: a ring id, or a row id of the session log's view, 6G-2), or a
-    /// session-log id past its carry ([`Self::handoff_log_ids`]); the successor would hand it
-    /// out again, so the Commit stands down.
+    /// Return whether this process has allocated a session id past the handoff ceiling.
     #[cfg(any(unix, test))]
     pub(crate) fn past_handoff_ceiling(&self) -> bool {
         self.handoff_ceiling
@@ -3646,31 +2402,25 @@ impl SessionTimeline {
             || self.slog.past_handoff_ceiling()
     }
 
-    /// The session log's handoff carry (`SessionRecord::log_ids`): its epoch
-    /// and node-id counters plus their overlap reserve, remembered as this
-    /// process's ceiling ([`Self::past_handoff_ceiling`]).
+    /// The session log's handoff carry (`SessionRecord::log_ids`).
     #[cfg(any(unix, test))]
     pub(crate) fn handoff_log_ids(&mut self) -> String {
         self.slog.handoff_carry().row()
     }
 
-    /// The session log's seq count for the handoff (`SessionRecord::log_seq`):
-    /// its last seq plus its overlap reserve, remembered as this process's
-    /// ceiling ([`Self::past_handoff_ceiling`]).
+    /// The session log's seq count for the handoff (`SessionRecord::log_seq`).
     #[cfg(any(unix, test))]
     pub(crate) fn handoff_log_seq(&mut self) -> u64 {
         self.slog.handoff_seq()
     }
 
-    /// The adopted session's engine, hydrated: its next block id and C count,
-    /// which a carried block cursor must fit (`SessionLog::fit_engine`).
+    /// The adopted session's engine, hydrated.
     pub(crate) fn slog_fit_engine(&mut self, next_block: u64, started: u64) {
         let now = self.slog.now();
         self.slog.fit_engine(next_block, started, now);
     }
 
-    /// THE HANDOFF WORKER'S TAKE of the session log (phase 2A): its carry
-    /// snapshot and producers' lines, its readers fenced from now on.
+    /// THE HANDOFF WORKER'S TAKE of the session log (phase 2A).
     #[cfg(any(unix, test))]
     pub(crate) fn slog_carry_source(&mut self) -> crate::session_log::SlogCarrySource {
         self.slog.carry_source()
@@ -3681,9 +2431,7 @@ impl SessionTimeline {
         &self.slog
     }
 
-    /// A timeline whose session log is the test constructor's
-    /// ([`crate::session_log::SessionLog::for_test`]: `ep=1`, an allocator
-    /// of its own), for a unit test that reads epochs by hand.
+    /// A timeline whose session log is the test constructor's, for a unit test that reads epochs by hand.
     #[cfg(test)]
     pub(crate) fn for_test() -> SessionTimeline {
         SessionTimeline {
@@ -3697,24 +2445,18 @@ impl SessionTimeline {
         &mut self.slog
     }
 
-    /// When the session log's turn tracker wants its settle tick (monotonic
-    /// ms), if one is pending: what the event loop's [`crate::session_log::Wakes`]
-    /// holds for this session.
+    /// When the session log's turn tracker wants its settle tick (monotonic ms), if one is pending.
     pub(crate) fn slog_wake(&self) -> Option<u64> {
         self.slog.wake()
     }
 
-    /// The event loop's settle tick: a resting turn that has held closes.
-    /// Returns the next wake.
+    /// The event loop's settle tick.
     pub(crate) fn slog_tick(&mut self) -> Option<u64> {
         let at = self.slog.now();
         self.slog.tick(at)
     }
 
-    /// Whether the session log's readers were owed a wake
-    /// ([`crate::session_log::SessionLog::take_log_wake`]). An owed wake rings
-    /// the session's watchers here, under this lock, as [`Self::record`]
-    /// does: the caller wakes nobody itself.
+    /// Whether the session log's readers were owed a wake ([`crate::session_log::SessionLog::take_log_wake`]).
     pub(crate) fn slog_take_wake(&mut self) -> bool {
         let owed = self.slog.take_log_wake();
         if owed {
@@ -3723,24 +2465,19 @@ impl SessionTimeline {
         owed
     }
 
-    /// Count on from a seamless update: ids continue above the last one the old process handed
-    /// out, so a `timeline since=<id>` anchor taken before the update sees the `handoff` row
-    /// and everything after. Called before the first record; never lowers the count. The
-    /// session log's view counts on from the same number (6G-2): its rows' ids are the ring's.
+    /// Count on from a seamless update.
     pub(crate) fn continue_ids(&mut self, carried: u64) {
         let carried = carried.min(i64::MAX as u64);
         self.next_id = self.next_id.max(carried);
         self.slog.continue_rows(carried);
     }
 
-    /// The highest recorded event id, or `None` when empty — the events digest
-    /// seeds its watermark here so only post-subscription events push.
+    /// The highest recorded event id, or `None` when empty.
     pub(crate) fn high_id(&self) -> Option<u64> {
         self.events.back().map(|e| e.id)
     }
 
-    /// The lowest retained event id, or `None` when empty — what a watermark is
-    /// measured against to report a drop-oldest eviction as a `GAP`.
+    /// The lowest retained event id, or `None` when empty.
     pub(crate) fn low_id(&self) -> Option<u64> {
         self.events.front().map(|e| e.id)
     }
@@ -3757,7 +2494,6 @@ impl SessionTimeline {
     }
 
     /// The identity already published for input to this foreground group.
-    /// No kernel read: an unobserved process change is not vouched for here.
     pub(crate) fn foreground_stamp(&self) -> Option<ForegroundStamp> {
         let agent = crate::harness_host::identified_agent(&self.agent)?;
         (self.agent.program_pgid > 0 && self.foreground_generation < u64::MAX).then(|| {
@@ -3793,18 +2529,12 @@ impl SessionTimeline {
         self.worker_launch = Some((std::time::Instant::now(), words));
     }
 
-    /// What the worker's launcher did with its line, and when; `None` where
-    /// no launcher of this process got that far.
+    /// What the worker's launcher did with its line, and when.
     pub(crate) fn worker_launch(&self) -> Option<&(std::time::Instant, String)> {
         self.worker_launch.as_ref()
     }
 
-    /// Publish the session's need verdict ([`Self::need`]). Returns whether
-    /// it moved (any of its facts). THE SHOWN MARK,
-    /// in the same hold: keyed on what the verdict prints (the need's
-    /// word, its severity and the hold, [`crate::session_log::observed::ShownTuple`]),
-    /// never on `moved`, which counts the wait and the recheck instant too;
-    /// the caller takes the log's wake ([`Self::slog_take_wake`]).
+    /// Publish the session's need verdict ([`Self::need`]).
     pub(crate) fn set_need(&mut self, verdict: crate::needs::Verdict) -> bool {
         let moved = self.need != verdict;
         let at = self.slog.now();
@@ -3814,21 +2544,12 @@ impl SessionTimeline {
         moved
     }
 
-    /// The published need verdict ([`crate::needs`]); the default (no need,
-    /// no wait, no hold) until the first publish.
+    /// The published need verdict ([`crate::needs`]).
     pub(crate) fn need(&self) -> &crate::needs::Verdict {
         &self.need
     }
 
-    /// Apply `mark` to the task record ([`crate::task_record::TaskMark::apply`])
-    /// at `now`, the supervisor's attention as the caller read it under the
-    /// meta guard; a move records one `task-change` row (the `EVENT <local>
-    /// task …` push, [`crate::task_record::TaskRecord::event_payload`]) and,
-    /// in the same hold, the session log's `task` mark (plan 5C-3,
-    /// [`crate::session_log::SessionLog::observe_task`]), whose wake the
-    /// caller takes before it releases the lock.
-    /// Returns the record after the mark and whether it moved. The callers
-    /// are [`crate::task_record::mark_session_task`]; nothing else writes the record.
+    /// Apply `mark` to the task record ([`crate::task_record::TaskMark::apply`]) at `now`.
     pub(crate) fn mark_task(
         &mut self,
         mark: &crate::task_record::TaskMark,
@@ -3846,11 +2567,7 @@ impl SessionTimeline {
         (next, changed)
     }
 
-    /// The supervisor's attention entry was raised (`true`) or cleared: on a
-    /// session with a task record whose flag differs, flip it, bump the rev
-    /// and record the `task-change` row and the log's `task` mark, as
-    /// [`Self::mark_task`] does. Returns whether the record moved. A session
-    /// with no task keeps none.
+    /// The supervisor's attention entry was raised (`true`) or cleared.
     pub(crate) fn note_task_attention(&mut self, raised: bool) -> bool {
         let Some(task) = self.task.as_mut().filter(|task| task.attention != raised) else {
             return false;
@@ -3864,20 +2581,12 @@ impl SessionTimeline {
         true
     }
 
-    /// Seed the record a seamless update carried, before the adopted session
-    /// is registered ([`crate::task_record::seed_carried`]). No row: nothing
-    /// moved, the record only crossed.
+    /// Seed the record a seamless update carried, before the adopted session is registered ([`crate::task_record::seed_carried`]).
     pub(crate) fn seed_task(&mut self, record: crate::task_record::TaskRecord) {
         self.task = Some(record);
     }
 
-    /// Name the agent a worker's spawn started on its task record, and the
-    /// one folder its starter trusted for it
-    /// ([`crate::task_record::TaskRecord::agent`],
-    /// [`crate::task_record::TaskRecord::trusted_cwd`]): the spawn's own
-    /// write, on the main thread right after the record's first mark, where
-    /// no update's Commit comes between them. A session with no task keeps
-    /// none. Not news: the rev stays.
+    /// Name the agent a worker's spawn started on its task record.
     pub(crate) fn set_task_worker(
         &mut self,
         agent: aterm_phase::Program,
@@ -3897,9 +2606,7 @@ impl SessionTimeline {
             .map(crate::task_record::TaskRecord::carry_row)
     }
 
-    /// The published program for foreground group `pgid`, or `None` when the publication
-    /// names another group. Best effort for the PTY reader's `modes-restored` event: the sweep
-    /// may already have moved on to the group that reclaimed the terminal.
+    /// The published program for foreground group `pgid`, or `None` when the publication names another group.
     pub(crate) fn program_of(&self, pgid: i32) -> Option<&str> {
         if pgid > 0 && self.agent.program_pgid == pgid {
             self.agent.program.as_deref()
@@ -3908,11 +2615,7 @@ impl SessionTimeline {
         }
     }
 
-    /// Publish an agent verdict read from the screen `stamp` names. A move of `word` or
-    /// `detail` bumps `rev` and records one `agent-change` (`<word> rev=<n> gen=<g>
-    /// fp=<hex16>`); an unchanged verdict only moves the stamp. While an input stall is
-    /// published ([`Self::set_input`]) the effective word stays `wall:unresponsive`. Returns
-    /// whether the effective verdict moved.
+    /// Publish an agent verdict read from the screen `stamp` names.
     pub(crate) fn publish_agent(
         &mut self,
         word: &'static str,
@@ -3938,19 +2641,12 @@ impl SessionTimeline {
             // One wake after publication, even if both reader and phase moved.
             crate::harness_host::ring_phase();
         } else if self.note_screen_move(std::time::Instant::now()) {
+            // Only record screen movement when the phase word itself did not change.
             crate::harness_host::ring_phase();
         }
         changed
     }
 
-    /// The live zone moved under a verdict that stood. The status sweep publishes only when
-    /// the zone moved, and an in-app `/clear` moves it without moving the verdict while Claude
-    /// Code rewrites its record of the agent to name the new conversation. Counted
-    /// ([`AgentPublication::screen_moves`]) while an agent is published and not busy (a busy
-    /// one's spinner moves the zone at every read and changes no conversation). Returns
-    /// whether to wake the supervisor host to follow the record
-    /// (`harness_host::follow_entries`): at most once per `harness_host::STATUS_AFTER_SCREEN`,
-    /// since its own settle looks again after the last move.
     fn note_screen_move(&mut self, now: std::time::Instant) -> bool {
         if matches!(self.agent.word, "busy" | "-") {
             return false;
@@ -3965,8 +2661,7 @@ impl SessionTimeline {
         due
     }
 
-    /// Publish (`Some`) or clear (`None`) the input stall ([`AgentPublication::input`]) and
-    /// re-settle the effective word. Returns whether it moved, as [`Self::publish_agent`] does.
+    /// Publish (`Some`) or clear (`None`) the input stall ([`AgentPublication::input`]) and re-settle the effective word.
     pub(crate) fn set_input(&mut self, input: Option<crate::input_stall::InputStallFact>) -> bool {
         let old_word = self.agent.word;
         self.agent.input = input;
@@ -3977,11 +2672,6 @@ impl SessionTimeline {
         changed
     }
 
-    /// Make [`AgentPublication::word`]/`detail` the effective verdict; a move
-    /// bumps the rev and records one `agent-change`
-    /// (`<word> rev=<n> gen=<g> fp=<hex16>`), and counts in
-    /// [`AgentPublication::verdict_moves`] unless it is a `regrid`'s (a
-    /// screen read within a re-grid's settle). Returns whether it moved.
     fn settle_agent_word(&mut self, regrid: bool) -> bool {
         let (word, detail) = self.agent.effective();
         if self.agent.word == word && self.agent.detail == detail {
@@ -3997,12 +2687,6 @@ impl SessionTimeline {
         self.agent.changed_continuous_ms = aterm_uds::process::continuous_ms();
         let (generation, fp) = self.agent.stamp_fields();
         let payload = format!("{word} rev={} gen={generation} fp={fp}", self.agent.rev);
-        // The session log first: `mark agent word= rev= gen= fp=` and the
-        // turn tracker's transitions (a settle it arms is read back by the
-        // caller, `Self::slog_wake`). Its entry reconciles the person first,
-        // so a key it delivers is marked before the verdict,
-        // and that key's `human` row, owed, is paid by the row below before
-        // its own (the review of 6F-8: row for record, in order).
         let at = self.slog.now();
         let moved = crate::session_log::AgentMove {
             word,
@@ -4017,24 +2701,17 @@ impl SessionTimeline {
         true
     }
 
-    /// The live zone was read again and was unchanged: the published verdict
-    /// stands on this newer screen, so its stamp moves (no rev, no event).
+    /// The live zone was read again and was unchanged.
     pub(crate) fn note_agent_stamp(&mut self, stamp: AgentStamp) {
         let regrid = self.regrid_settling();
         self.note_text(stamp, regrid);
         self.settle_regrid(regrid, false);
     }
 
-    /// Whether this read of the screen is a re-grid's: within the settle of
-    /// the first read that found the grid resized ([`GridRead::settling`]).
     fn regrid_settling(&self) -> bool {
         self.agent.grid.as_ref().is_some_and(GridRead::settling)
     }
 
-    /// The first read past a re-grid's settle closes the burst: a verdict
-    /// unlike the one that stood before the re-grid ([`GridRead::before`])
-    /// is one move of the program's, unless this read's own move (`counted`)
-    /// already counted it ([`AgentPublication::verdict_moves`]).
     fn settle_regrid(&mut self, regrid: bool, counted: bool) {
         if regrid {
             return;
@@ -4049,9 +2726,6 @@ impl SessionTimeline {
         }
     }
 
-    /// The verdict stands on the screen `stamp` names: its stamp moves, and
-    /// [`AgentPublication::text_moves`] counts a text unlike the last read's
-    /// — unless this read is a re-grid's (`regrid`, [`GridRead::settling`]).
     fn note_text(&mut self, stamp: AgentStamp, regrid: bool) {
         if !regrid && self.agent.stamp.is_some_and(|last| last.fp != stamp.fp) {
             self.agent.text_moves = self.agent.text_moves.wrapping_add(1);
@@ -4059,17 +2733,7 @@ impl SessionTimeline {
         self.agent.stamp = Some(stamp);
     }
 
-    /// THE GRID AT THIS READ OF THE SCREEN, noted by the sweep before the
-    /// stamp the same read gives ([`Self::publish_agent`],
-    /// [`Self::note_agent_stamp`]): `resize` is the engine's
-    /// `(resize_lifetime, resize_ordinal)` under the same guard as the read,
-    /// `at` the sweep's instant. A `resize` unlike the last read's starts a
-    /// re-grid's settle ([`GridRead::since`]), which keeps the text the resize
-    /// and the program's repaint change out of
-    /// [`AgentPublication::text_moves`], and the verdict they move out of
-    /// [`AgentPublication::verdict_moves`]: the verdict that stood before the
-    /// burst's first re-grid is kept to compare at its end
-    /// ([`GridRead::before`]).
+    /// THE GRID AT THIS READ OF THE SCREEN.
     pub(crate) fn note_grid(&mut self, resize: (u64, u64), at: std::time::Instant) {
         let (since, before) = match self.agent.grid.take() {
             Some(last) if last.resize != resize => (
@@ -4088,9 +2752,7 @@ impl SessionTimeline {
         });
     }
 
-    /// The foreground process group moved to `pgid`: forget the program named
-    /// for the old one (it is no longer what runs) and return whether a
-    /// resolution is owed. The same group again owes nothing.
+    /// The foreground process group moved to `pgid`.
     pub(crate) fn note_foreground_group(&mut self, pgid: i32) -> bool {
         if self.agent.program_pgid == pgid {
             return false;
@@ -4100,30 +2762,15 @@ impl SessionTimeline {
         let had_reader = self.agent.reader.take().is_some();
         self.leader_copy = None;
         if self.agent.program.take().is_some() || had_reader {
-            // A runtime identified by its screen can have no named program;
             // its worker must still see the foreground group leave.
             crate::harness_host::ring();
         }
-        // The session log: the runs of the group that left close.
         let at = self.slog.now();
         self.slog.foreground_moved(pgid, at);
         true
     }
 
-    /// The status sweep saw the engine's cwd report `seq`
-    /// (`Terminal::reported_cwd_seq`) with group `pgid` in front: the first
-    /// sight of a report names the group it is held to, a later sight of the
-    /// same report changes nothing. No group (`pgid <= 0`) or a carried cwd
-    /// (`None`) witnesses nothing.
-    ///
-    /// The group is named only when it is SETTLED: in front at the sweep before
-    /// this one (the group this timeline last noted) and at `pgid`, the group
-    /// the sweep read under the same terminal hold as `seq`. The PTY names no
-    /// writer, so a report first seen after the front moved (an ssh that exited
-    /// between its remote shell's OSC 7 and this look, a sweep a contended lock
-    /// skipped) may be the group's that left: it is held to no group (`0`), and
-    /// stands under none ([`crate::path_link::report_stands`]), so neither its
-    /// host nor its directory is read until the next report.
+    /// The status sweep saw the engine's cwd report `seq` (`Terminal::reported_cwd_seq`) with group `pgid` in front.
     pub(crate) fn witness_cwd_report(&mut self, seq: Option<u64>, pgid: i32) {
         let Some(seq) = seq.filter(|_| pgid > 0) else {
             return;
@@ -4134,30 +2781,17 @@ impl SessionTimeline {
         }
     }
 
-    /// [`Self::witness_cwd_report`]'s record: the report and the group it was
-    /// first seen under.
+    /// [`Self::witness_cwd_report`]'s record.
     pub(crate) fn cwd_witness(&self) -> Option<(u64, i32)> {
         self.cwd_witness
     }
 
-    /// The session's own process group (its shell's pid), for the session
-    /// log: the shell in front is the session at its prompt, never a run.
+    /// The session's own process group (its shell's pid), for the session log.
     pub(crate) fn note_root_group(&mut self, pgid: i32) {
         self.slog.note_root(pgid);
     }
 
-    /// The status sweep's session-log step, in one order under one hold of this lock. First the
-    /// shell's `blocks` (read under the sweep's terminal guard): a command the shell reported
-    /// ended closes at its own D, and with it the program and agent runs under it (the D
-    /// proves they had ended), and the names the resolver gave since the last sweep
-    /// ([`Self::set_program`]) open under the command each ran in, which only the blocks tell.
-    /// Then a failure the person was looking at as it published (`seen`, the status observer's
-    /// `FailureMark`), once its run has closed, as `mark - seen`. Then the foreground group
-    /// `pgid` under the session's own group `root`, whose move closes only what the blocks left
-    /// open. The blocks are told `pgid` (read after them), so a command still running never
-    /// hangs under a run that move closes, and a name given before a command began is placed
-    /// by whether its group still holds the front. Returns the group that left when the group
-    /// moved (`pgid > 0` and new), for which [`Self::note_foreground_group`] owes a resolution.
+    /// The status sweep's session-log step, in one order under one hold of this lock.
     pub(crate) fn sweep_slog(
         &mut self,
         blocks: &crate::session_log::BlockRead,
@@ -4179,13 +2813,7 @@ impl SessionTimeline {
         self.note_foreground_group(pgid).then_some(previous)
     }
 
-    /// THE HOLDER IMAGE'S ONE WRITER: the PTY reader's parse stage offers the
-    /// image it read at a foreground edge (or the byte arm's re-read) before
-    /// the hold of the slice that starts there. Published when it or the image
-    /// it replaces is card-relevant and it is not that same image
-    /// (`holder_image::decide`); the dev rows `holder-edge` (stamped when the
-    /// image was read) and `holder-image` (stamped now) record each
-    /// publication.
+    /// THE HOLDER IMAGE'S ONE WRITER.
     pub(crate) fn offer_holder_image(
         &mut self,
         image: std::sync::Arc<crate::holder_image::HolderImage>,
@@ -4214,14 +2842,6 @@ impl SessionTimeline {
             let pgid = image.pgid;
             let drawer = image.drawer.is_some().then_some(image.token).flatten();
             self.holder_image = Some(image);
-            // The row standing for the drawer's group as its image is
-            // published is a row from before it — the image an `exec`
-            // replaced wrote it, or another image of the group came before —
-            // unless it came while this very image was in front (it was
-            // published before: `fg`, the group back in front), or before
-            // any image of the group was, and this is the group's arrival
-            // (a group edge: the byte arm's first read after the row).
-            // Facts judged its own are this image's from here on.
             if let Some(token) = drawer {
                 let standing = self
                     .claude_footer
@@ -4250,41 +2870,24 @@ impl SessionTimeline {
         self.holder_image.as_ref()
     }
 
-    /// The published holder image while it is CURRENT: its group is the one
-    /// in front (`program_pgid`, the currency rule of [`Self::set_program`]
-    /// and [`Self::claude_footer`]). A finished job's image left published
-    /// is no one's.
     fn current_holder_image(&self) -> Option<&crate::holder_image::HolderImage> {
         self.holder_image
             .as_deref()
             .filter(|image| image.pgid > 0 && image.pgid == self.agent.program_pgid)
     }
 
-    /// Whether the current holder image is a card drawer with a token: the
-    /// pane takes the card's path with no footer facts (card engine §3.8).
+    /// Whether the current holder image is a card drawer with a token.
     pub(crate) fn card_drawer_current(&self) -> bool {
         self.current_holder_image()
             .is_some_and(|image| image.drawer.is_some() && image.token.is_some())
     }
 
-    /// THE CARD'S GATE (card engine §3.8), read under the splice's one
-    /// timeline lock per pane: the current holder image's
-    /// [`crate::holder_image::CardGate`], or `None` where the image is no
-    /// drawer, has no token or is not current. An image of unknown build is
-    /// held to the build ITS registry row reports ([`Self::registry_build`]);
-    /// any other image never reads the registry. Integers only: no lock
-    /// beyond the caller's, no clock, no allocation.
+    /// THE CARD'S GATE (card engine §3.8), read under the splice's one timeline lock per pane.
     pub(crate) fn card_gate(&self) -> Option<crate::holder_image::CardGate> {
         let image = self.current_holder_image()?;
         image.gate(|| self.registry_build(image))
     }
 
-    /// The build `image`'s own registry row reports (`FooterFacts::version`,
-    /// pushed by the footer's resolver, parsed when it was stored): facts
-    /// for its group, with an owner, and not the owner whose facts stood
-    /// when the image was first published (a row from before its `exec`,
-    /// the replaced image's), whose version parses. `None` otherwise: the
-    /// card waits for the row.
     fn registry_build(
         &self,
         image: &crate::holder_image::HolderImage,
@@ -4305,14 +2908,7 @@ impl SessionTimeline {
         self.claude_footer_build
     }
 
-    /// The token of the published image of group `pgid` when it is a Claude
-    /// Code drawer from the managed store (a vendor build, or an ALab one
-    /// named by aterm's record) or the vendor's installer (card engine
-    /// §3.10): the image whose `exec` edge the status sweep asks the footer
-    /// for again, since an ask before it may have fallen in a `/bin/sh`
-    /// shim's window, where the Claude dir cannot be read. `None` for a
-    /// launcher, another program or an unknown image, and for an image whose
-    /// token could not be formed.
+    /// Return the published Claude launch-card image token for process group `pgid`.
     pub(crate) fn claude_drawer_token(&self, pgid: i32) -> Option<u64> {
         self.holder_image
             .as_deref()
@@ -4329,17 +2925,7 @@ impl SessionTimeline {
             .and_then(|image| image.token)
     }
 
-    /// THE DRIFT (card engine §3.10): the build the group's registry row
-    /// reports (`FooterFacts::version`) disagreeing with the build its Store
-    /// or Native Claude Code drawer image names — said ONCE per image and
-    /// reported build, and read by nothing that decides the card: the
-    /// caller raises an exception entry (`App::note_claude_build_drift`).
-    /// Judged only on facts with an owner other than the one standing when
-    /// the image was published (a row from before an `exec` in place is the
-    /// replaced image's), and only on a reported build that parses: an
-    /// unknown spelling is no evidence of another build. An ALab build's
-    /// image (`StoreRecord`) is not judged: its build is aterm's record, not
-    /// the vendor's spelling.
+    /// THE DRIFT (card engine §3.10).
     pub(crate) fn take_registry_drift(&mut self) -> Option<RegistryDrift> {
         let image = self.holder_image.as_deref()?;
         if !matches!(
@@ -4382,13 +2968,7 @@ impl SessionTimeline {
         Some(drift)
     }
 
-    /// The `card-seen` dev row, once per snapshot token: the current drawer's
-    /// family and known version were observed on screen, the banner at
-    /// absolute row `row`. This is not writer attribution and can match
-    /// stale same-build cells. `after=` is the last card pass's count that
-    /// judged this session's card, so a judge counts the passes composed
-    /// between the sight and the `card-decorated` row. Returns whether it
-    /// recorded (`rows_kind` 3 Claude, 4 agy, 1 Muse).
+    /// The `card-seen` dev row, once per snapshot token.
     pub(crate) fn note_card_seen(
         &mut self,
         token: u64,
@@ -4417,19 +2997,7 @@ impl SessionTimeline {
         true
     }
 
-    /// The dev rows of one card pass's outcome for this session's card
-    /// (`App::compose_claude_cards`, run only under the dev card probe;
-    /// `composed` is the window's pass count): `card-decorated token= row=
-    /// bare_frames=` the first frame a drawer's card is decorated, where
-    /// `bare_frames` counts the frames composed before it that showed the
-    /// drawer's card bare — read and refused by the gate at the row it is
-    /// decorated at, or with no card read once its card was seen on screen
-    /// (`card-seen`; [`BareFrames`]), and at least every pass composed after
-    /// that sight of the same row; `card-armed token= cause=` each episode
-    /// armed; `card-row token= row=` each time the same drawer's card is
-    /// decorated at another banner row (a repaint after `fg`, say); and
-    /// `card-bare reason= token= row=` each time the reason a card is bare,
-    /// or the row of the card left bare, changes (card engine §8).
+    /// Record dev diagnostic rows for one launch-card compose pass.
     pub(crate) fn note_card_frame(
         &mut self,
         outcome: crate::claude_card::CardOutcome,
@@ -4456,8 +3024,6 @@ impl SessionTimeline {
                 }
                 if self.card_frames.decorated != Some(token) {
                     self.card_frames.decorated = Some(token);
-                    // The frames counted bare, or every pass composed since
-                    // this card was seen on screen, whichever is more.
                     let late = match self.card_frames.seen {
                         Some((t, r, after)) if t == token && r == row => {
                             u32::try_from(composed.saturating_sub(after).saturating_sub(1))
@@ -4498,9 +3064,6 @@ impl SessionTimeline {
                         | Bare::Build
                         | Bare::Deferred
                 );
-                // A refusal counts where a card was read (its row): a fence
-                // of another holder's reads none, and counts only once the
-                // drawer's card was seen on screen, as no card read does.
                 if token != 0
                     && self.card_frames.decorated != Some(token)
                     && ((refused && row.is_some()) || self.card_seen == Some(token))
@@ -4524,8 +3087,7 @@ impl SessionTimeline {
         }
     }
 
-    /// The token of the current holder image when it is a drawer whose card
-    /// has not been seen yet: the parse stage's dev probe looks only then.
+    /// The token of the current holder image when it is a drawer whose card has not been seen yet.
     pub(crate) fn card_unseen(&self) -> Option<u64> {
         self.holder_image
             .as_ref()
@@ -4534,8 +3096,7 @@ impl SessionTimeline {
             .filter(|t| self.card_seen != Some(*t))
     }
 
-    /// The resolver's answer for `pgid`, applied only while that group is in front (a late
-    /// answer for a finished job is dropped). Returns whether the name changed.
+    /// The resolver's answer for `pgid`, applied only while that group is in front (a late answer for a finished job is dropped).
     pub(crate) fn set_program(&mut self, pgid: i32, program: Option<String>) -> bool {
         if self.agent.program_pgid == pgid && self.agent.program != program {
             self.advance_foreground_generation();
@@ -4554,11 +3115,7 @@ impl SessionTimeline {
                 );
             }
             self.agent.program = program;
-            // The in-GUI supervisor host attaches by program (`harness_host`).
             crate::harness_host::ring();
-            // The session log: the name waits for the sweep's next block read, which hangs
-            // its `prog` (or `agent`) run under the command it ran in; its tracker starts
-            // from the verdict published so far.
             let at = self.slog.now();
             self.slog.program_named(
                 pgid,
@@ -4572,9 +3129,7 @@ impl SessionTimeline {
         false
     }
 
-    /// The footer resolver's answer for `pgid` and the process's kernel start time (when
-    /// read), applied only while that group is in front. Returns whether the painted facts
-    /// moved.
+    /// The footer resolver's answer for `pgid` and the process's kernel start time (when read), applied only while that group is in front.
     pub(crate) fn set_claude_footer(
         &mut self,
         pgid: i32,
@@ -4618,8 +3173,6 @@ impl SessionTimeline {
                 .as_mut()
                 .and_then(|(_, _, facts)| facts.subscription.as_mut())
         {
-            // Publication itself enforces the boundary, including a frame
-            // that first discovers B while carrying A's anonymous quota.
             sub.weekly = None;
             sub.weekly_reset = None;
             if switched {
@@ -4629,10 +3182,6 @@ impl SessionTimeline {
         if self.claude_footer == next {
             return false;
         }
-        // A card belongs to one process and one owner: new facts for
-        // anything else drop it. A bootstrap reading (`s == None`, `owner.floor == None`)
-        // promotes in place when the resolver thread publishes the same process's
-        // kernel start time (`ns`) and floor.
         if let Some((p, s, owner, card)) = self.claude_card.clone() {
             if let Some((np, ns, facts)) = &next
                 && *np == p
@@ -4660,14 +3209,7 @@ impl SessionTimeline {
         true
     }
 
-    /// Keep the launch `card` the frame compose read for the process whose
-    /// facts are stored (only while they are this group's and theirs is
-    /// `owner`), replacing any kept before. Returns whether it changed what
-    /// is kept. The caller hands only a reading the harness card's gate
-    /// admitted — the current drawer's own card, by its fence and its
-    /// build, and its own status row (`claude_card::GateCheck::admits_reading`,
-    /// card engine §3.8) — so no predecessor's card, and no card quoted
-    /// under the drawer's, fills the footer.
+    /// Store the composed Claude launch card for the foreground process group.
     pub(crate) fn note_claude_card(
         &mut self,
         pgid: i32,
@@ -4685,7 +3227,6 @@ impl SessionTimeline {
             return false;
         }
         self.claude_card = next;
-        // THE SESSION LOG: the card's names amend the agent run (phase 3B).
         if let Some((.., card)) = self.claude_card.as_ref() {
             let at = self.slog.now();
             self.slog.observe_card(card, at);
@@ -4693,32 +3234,24 @@ impl SessionTimeline {
         true
     }
 
-    /// The process the stored footer facts were read for — its group and its
-    /// kernel start time — if any.
+    /// The process the stored footer facts were read for.
     pub(crate) fn claude_footer_identity(&self) -> Option<(i32, Option<u64>)> {
         self.claude_footer
             .as_ref()
             .map(|(pgid, started, _)| (*pgid, *started))
     }
 
-    /// A known switch or carried glass cannot attribute an anonymous Muse
-    /// card to the current login. Only an account-bearing card may fill its
-    /// own fields; a separate usage card supplies no account proof.
+    /// A known switch or carried glass cannot attribute an anonymous Muse card to the current login.
     pub(crate) fn muse_cards_need_account(&self) -> bool {
         self.muse_cards_need_account
     }
 
-    /// An adopted terminal may still show another account's cards, and its
-    /// predecessor need not have carried an account observation. Revoke the
-    /// bootstrap allowance without adding a version-dependent wire field.
+    /// An adopted terminal may still show another account's cards, and its predecessor need not have carried an account observation.
     pub(crate) fn note_carried_glass(&mut self) {
         self.muse_cards_need_account = true;
     }
 
-    /// Forget the footer facts; whether there were any. For when the status
-    /// sweep that keeps them current stops (`tab_status` off), so stale facts
-    /// are not painted over the next Claude Code in this tab. The survey's
-    /// excerpts go with them.
+    /// Forget the footer facts.
     pub(crate) fn clear_claude_footer(&mut self) -> bool {
         self.claude_card = None;
         self.claude_excerpts = None;
@@ -4729,25 +3262,21 @@ impl SessionTimeline {
         self.claude_footer.take().is_some()
     }
 
-    /// The footer resolver read `pgid`'s facts at `at` (a fresh read, its
-    /// usage folded anew), kept only while that group is in front.
+    /// The footer resolver read `pgid`'s facts at `at`, kept only while that group is in front.
     pub(crate) fn note_claude_footer_read(&mut self, pgid: i32, at: std::time::Instant) {
         if self.agent.program_pgid == pgid {
             self.claude_footer_read = Some((pgid, at));
         }
     }
 
-    /// When the facts [`Self::claude_footer`] gives were last read, while
-    /// they are the group in front's.
+    /// When the facts [`Self::claude_footer`] gives were last read, while they are the group in front's.
     pub(crate) fn claude_footer_read_at(&self) -> Option<std::time::Instant> {
         self.claude_footer_read
             .filter(|(pgid, _)| *pgid == self.agent.program_pgid)
             .map(|(_, at)| at)
     }
 
-    /// The footer resolver's excerpts for `pgid`, applied only while that
-    /// group is in front, as [`Self::set_claude_footer`] applies its facts;
-    /// `None` forgets them.
+    /// The footer resolver's excerpts for `pgid`, applied only while that group is in front, as [`Self::set_claude_footer`] applies its facts.
     pub(crate) fn set_claude_excerpts(
         &mut self,
         pgid: i32,
@@ -4759,8 +3288,7 @@ impl SessionTimeline {
         self.claude_excerpts = excerpts.map(|e| (pgid, e));
     }
 
-    /// The survey's excerpts for the CURRENT foreground group, or `None` when
-    /// the program in front is not the one they were read for.
+    /// The survey's excerpts for the CURRENT foreground group, or `None` when the program in front is not the one they were read for.
     pub(crate) fn claude_excerpts(&self) -> Option<&crate::survey::ClaudeExcerpts> {
         self.claude_excerpts
             .as_ref()
@@ -4768,9 +3296,7 @@ impl SessionTimeline {
             .map(|(_, excerpts)| excerpts)
     }
 
-    /// The footer resolver's side for `pgid`, applied only while that group
-    /// is in front, as [`Self::set_claude_excerpts`] applies its excerpts;
-    /// `None` forgets it.
+    /// The footer resolver's side for `pgid`, applied only while that group is in front, as [`Self::set_claude_excerpts`] applies its excerpts.
     pub(crate) fn set_claude_side(
         &mut self,
         pgid: i32,
@@ -4782,8 +3308,7 @@ impl SessionTimeline {
         self.claude_side = side.map(|side| (pgid, side));
     }
 
-    /// The footer's side for the CURRENT foreground group, or `None` when the
-    /// program in front is not the one it was read for.
+    /// The footer's side for the CURRENT foreground group, or `None` when the program in front is not the one it was read for.
     pub(crate) fn claude_side(&self) -> Option<&std::sync::Arc<crate::claude_footer::FactSide>> {
         self.claude_side
             .as_ref()
@@ -4805,8 +3330,7 @@ impl SessionTimeline {
         }
     }
 
-    /// The footer facts for the current foreground group, or `None` when the program in
-    /// front is not the one they were read for.
+    /// The footer facts for the current foreground group, or `None` when the program in front is not the one they were read for.
     pub(crate) fn claude_footer(&self) -> Option<&aterm_agent::harness::footer::FooterFacts> {
         self.claude_footer
             .as_ref()
@@ -4814,8 +3338,7 @@ impl SessionTimeline {
             .map(|(_, _, facts)| facts)
     }
 
-    /// The launch card kept for the process whose facts are in front — `None`
-    /// once they are another process's or another owner's.
+    /// The launch card kept for the process whose facts are in front.
     pub(crate) fn claude_card(&self) -> Option<&aterm_phase::LaunchCard> {
         let (pgid, started, facts) = self
             .claude_footer
@@ -4829,17 +3352,13 @@ impl SessionTimeline {
             .map(|(_, _, _, card)| card)
     }
 
-    /// What the footer shows for the group in front: its facts, filled from the
-    /// kept launch card where nothing newer decided them
-    /// (`FooterFacts::filled_from`). The survey publishes it (`survey.rs`).
+    /// What the footer shows for the group in front.
     pub(crate) fn claude_footer_shown(&self) -> Option<aterm_agent::harness::footer::FooterFacts> {
         self.claude_footer()
             .map(|facts| facts.filled_from(self.claude_card()))
     }
 
-    /// The leader read's copy and PATH answers for `pgid`
-    /// (`session_status::program::leader_facts`), applied only while that group is in front.
-    /// A PATH reading replaces the last one; [`PathReading`] says when it counts as agreed.
+    /// The leader read's copy and PATH answers for `pgid` (`session_status::program::leader_facts`), applied only while that group is in front.
     pub(crate) fn set_leader(
         &mut self,
         pgid: i32,
@@ -4862,8 +3381,7 @@ impl SessionTimeline {
         }
     }
 
-    /// `(path word, age in ms, settled)` of the last PATH measurement
-    /// ([`PathReading::settled`]), or `None`.
+    /// `` of the last PATH measurement, or `None`.
     pub(crate) fn path_reading(&self) -> Option<(&'static str, u64, bool)> {
         self.path.map(|p| {
             (
@@ -4874,16 +3392,13 @@ impl SessionTimeline {
         })
     }
 
-    /// Whether the shell's PATH is measured frozen and settled: two jobs in a row put a foreign
-    /// `claude`/`codex` first ([`PathReading`]).
+    /// Whether the shell's PATH is measured frozen and settled.
     pub(crate) fn path_settled_frozen(&self) -> bool {
         self.path
             .is_some_and(|p| p.settled() && p.verdict.word() == "frozen")
     }
 
-    /// `true` once for a live PATH reading, then `false` until a live reading follows a frozen
-    /// one; the status sweep lowers the registry's frozen mark on it. A frozen reading never
-    /// raises the mark.
+    /// `true` once for a live PATH reading, then `false` until a live reading follows a frozen one.
     pub(crate) fn take_path_lowered(&mut self) -> bool {
         let Some(p) = self
             .path
@@ -4920,8 +3435,7 @@ impl SessionTimeline {
         self.upgrade.as_ref()
     }
 
-    /// Replace the upgrade's note for the person here; whether it moved (the one change of the
-    /// row a frame must show).
+    /// Replace the upgrade's note for the person here.
     pub(crate) fn set_upgrade_note(
         &mut self,
         note: Option<aterm_agent::harness::footer::UpgradeNote>,
@@ -4933,19 +3447,12 @@ impl SessionTimeline {
         true
     }
 
-    /// The live upgrade's note for the person here, while the move waits
-    /// only on them (`Row::pause_note`), or `None`.
+    /// The live upgrade's note for the person here, while the move waits only on them, or `None`.
     pub(crate) fn upgrade_note(&self) -> Option<&aterm_agent::harness::footer::UpgradeNote> {
         self.upgrade_note.as_ref()
     }
 
-    /// Replace the task's face ([`Self::task_face()`]): `face` and the wall
-    /// time of its move (unix ms), or `None` for "unknown". Whether the face
-    /// moved — a move to the face already held keeps its first time, so a
-    /// face told again is no change. A face told after "unknown" that is the
-    /// one held before it (a landed session's next loop, which starts landed)
-    /// takes back that face's first time: `landed 17:42` stays 17:42 across a
-    /// restart.
+    /// Replace the task's face ([`Self::task_face()`]).
     pub(crate) fn set_task_face(
         &mut self,
         face: Option<aterm_agent::harness::acts::TaskFace>,
@@ -4965,19 +3472,12 @@ impl SessionTimeline {
         true
     }
 
-    /// The task's face as this window's host last heard it, and the wall
-    /// time (unix ms) it moved there; `None` while unknown.
+    /// The task's face as this window's host last heard it, and the wall time (unix ms) it moved there.
     pub(crate) fn task_face(&self) -> Option<(aterm_agent::harness::acts::TaskFace, i64)> {
         self.task_face
     }
 
-    /// A SEAMLESS UPDATE'S CARRIED END (`docs/DESIGN-harness-autopilot-
-    /// 2026-10-15.md` §11.2.3, item 8; `spawn::seed_adopted_end`): `face` and
-    /// the wall time (unix ms) it moved there in the outgoing process, HELD
-    /// as a face is held over "unknown" — where this timeline holds no face
-    /// and none is held (a successor's, before registration) — so the loop's
-    /// restated face takes that time back ([`Self::set_task_face`]'s rule),
-    /// and another face its own. Whether it was seeded.
+    /// A SEAMLESS UPDATE'S CARRIED END.
     pub(crate) fn seed_task_face_held(
         &mut self,
         face: aterm_agent::harness::acts::TaskFace,
@@ -4990,13 +3490,7 @@ impl SessionTimeline {
         true
     }
 
-    /// The wall time (unix ms) the task's face moved to `face`, where that is
-    /// the face this timeline holds — or held when its loop ended and no face
-    /// was told since ("unknown" between loop runs) — else `None`: the
-    /// instant a task's end standing on the glass was told at
-    /// (`harness_glass::EndGlass`), which the menu bar's Done for you row
-    /// ages from (`App::status_session_row`) and a seamless update's park
-    /// carries of a standing end (`App::end_carry_rows`).
+    /// The wall time (unix ms) the task's face moved to `face`, where that is the face this timeline holds.
     pub(crate) fn task_face_at(&self, face: aterm_agent::harness::acts::TaskFace) -> Option<i64> {
         self.task_face
             .or(self.task_face_held)
@@ -5009,18 +3503,12 @@ impl SessionTimeline {
         std::mem::replace(&mut self.pause, pause) != pause
     }
 
-    /// The loop's pause after short turns as this window's host last heard
-    /// it; `None` while none stands.
+    /// The loop's pause after short turns as this window's host last heard it.
     pub(crate) fn pause(&self) -> Option<crate::PausePlan> {
         self.pause
     }
 
-    /// The worker's NEEDS YOU set as its loop told it, `told` (`None`, the
-    /// take-down), with `standing`, the needs owner's entry as the server
-    /// holds it now ([`crate::needs::ToldNeeds::tell`]): whether what a
-    /// reader reads beside that entry moved, so the window must be woken.
-    /// The set is built and the entry copied before the caller takes this
-    /// lock, so the write under it is a few text comparisons and two swaps.
+    /// The worker's NEEDS YOU set as its loop told it.
     pub(crate) fn set_harness_needs(
         &mut self,
         told: Option<Arc<crate::needs::HarnessNeeds>>,
@@ -5029,17 +3517,12 @@ impl SessionTimeline {
         self.harness_needs.tell(told, standing)
     }
 
-    /// The worker's NEEDS YOU sets as its loop told this window's host,
-    /// whole, each with the entry's text it was told with — what
-    /// readers read, a set only beside its own entry
-    /// ([`crate::needs::NeedFacts::told_needs`]). Two `Arc`s.
+    /// The worker's NEEDS YOU sets as its loop told this window's host, whole, each with the entry's text it was told with.
     pub(crate) fn harness_needs(&self) -> crate::needs::ToldNeeds {
         self.harness_needs.clone()
     }
 
-    /// Replace Land's hold as the session's loop told it ([`Self::land_held()`]):
-    /// whether it moved. A `Copy` compare and a store, under this leaf lock
-    /// alone.
+    /// Replace Land's hold as the session's loop told it ([`Self::land_held()`]).
     pub(crate) fn set_land_held(
         &mut self,
         held: Option<aterm_agent::harness::acts::LandHeld>,
@@ -5047,15 +3530,12 @@ impl SessionTimeline {
         std::mem::replace(&mut self.land_held, held) != held
     }
 
-    /// Land's hold as the session's loop last told this window's host
-    /// (§12.3.3 item 3); `None` while none stands.
+    /// Land's hold as the session's loop last told this window's host (§12.3.3 item 3).
     pub(crate) fn land_held(&self) -> Option<aterm_agent::harness::acts::LandHeld> {
         self.land_held
     }
 
-    /// `(path word, "path_evidence= copy= upgrade=")` for `status` and roster rows, after
-    /// `supervisor=`. `mark` is the registry's frozen mark; `upgrade=` is judged as of `now_s`
-    /// (`Row::reread`).
+    /// `(path word, "path_evidence= copy= upgrade=")` for `status` and roster rows, after `supervisor=`.
     pub(crate) fn owner_columns(&self, mark: bool, now_s: u64) -> (&'static str, String) {
         let (path, evidence) = path_columns(mark, self.path_reading());
         let upgrade = self.upgrade.as_ref().map_or_else(
@@ -5076,9 +3556,7 @@ impl SessionTimeline {
     }
 }
 
-/// Clamp a payload to [`MAX_PAYLOAD`] bytes without bisecting a UTF-8 char or a `%XX`
-/// escape: payloads are pct-encoded and printed verbatim by the `timeline` verb and the
-/// `EVENT` push, so a strict decoder must never see a truncated escape.
+/// Clamp a payload to [`MAX_PAYLOAD`] bytes without bisecting a UTF-8 char or a `%XX` escape.
 pub(crate) fn clamp_payload(s: String) -> Arc<str> {
     if s.len() <= MAX_PAYLOAD {
         return s.into();
@@ -5093,8 +3571,6 @@ pub(crate) fn clamp_payload(s: String) -> Arc<str> {
             && bytes.get(i + 1).is_some_and(u8::is_ascii_hexdigit)
             && bytes.get(i + 2).is_some_and(u8::is_ascii_hexdigit)
     };
-    // A triple bisected by the cut has its `%` at end-1 (`…%|XX`) or end-2
-    // (`…%X|X`); a `%` at end-3 or earlier fits whole and needs no back-off.
     for back in 1..=2 {
         if end >= back && escape_starts_at(end - back) {
             end -= back;
@@ -5126,8 +3602,6 @@ mod tests {
             '\u{1bca0}',
             '\u{1d173}',
             '\u{e0001}',
-            // The engine's table also hides noncharacters and the interlinear
-            // annotation anchors.
             '\u{fdd0}',
             '\u{fffe}',
             '\u{1ffff}',
@@ -5141,8 +3615,6 @@ mod tests {
             );
         }
 
-        // ZWJ is presentation data, not a bidi/control primitive: keep the
-        // family cluster intact for icon metadata.
         let family = "👨‍👩‍👧‍👦";
         assert!(!metadata_has_forbidden_formatting(family));
         assert_eq!(
@@ -5160,8 +3632,6 @@ mod tests {
             );
         }
 
-        // `e + COMBINING ACUTE` is three bytes but one grapheme. Forty fit the
-        // 120-byte title cap exactly; the trailing grapheme is dropped whole.
         let cluster = "e\u{301}";
         let expected = cluster.repeat(META_TITLE_MAX / cluster.len());
         let over_cap = format!("{expected}z");
@@ -5179,8 +3649,6 @@ mod tests {
         );
         assert_eq!(meta.user_title.as_deref(), Some("safetitle"));
 
-        // A raw legacy/restore assignment is still sanitized at the chrome /
-        // persistence boundary even if it bypassed `set`.
         meta.description = Some("one\u{2029}two".to_string());
         meta.icon = Some("\u{2066}🚀\u{2069}".to_string());
         let canonical = meta.sanitized();
@@ -5196,8 +3664,6 @@ mod tests {
         }
         assert_eq!(tl.len(), TIMELINE_CAP, "capped");
         assert_eq!(tl.high_id(), Some(TIMELINE_CAP as u64 + 3));
-        // The three oldest were evicted; ids stay strictly increasing and
-        // `since` is a suffix keyed on them.
         let ids: Vec<u64> = tl.since(None).map(|e| e.id).collect();
         assert_eq!(ids[0], 4, "oldest three evicted");
         assert!(ids.windows(2).all(|w| w[1] == w[0] + 1), "monotonic ids");
@@ -5206,20 +3672,10 @@ mod tests {
             .map(|e| e.id)
             .collect();
         assert_eq!(tail, vec![TIMELINE_CAP as u64 + 2, TIMELINE_CAP as u64 + 3]);
-        // Timestamps never move backward (monotonic clock).
         let ts: Vec<u64> = tl.since(None).map(|e| e.t_ms).collect();
         assert!(ts.windows(2).all(|w| w[1] >= w[0]));
     }
 
-    /// A `program-state` row spells the shown report as two closed-set words
-    /// (`-` for none), and the rows hold at most [`PROGRAM_STATE_ROWS_MAX`] of
-    /// the ring: a program flapping its report a thousand times keeps its
-    /// newest moves, in order, and the session's other rows (its `spawned`
-    /// row here) stay. In a ring already FULL of other rows, the flood ages
-    /// out exactly the share of them and the newest rest stay. NEGATIVE
-    /// CONTROL: the same flood written as `program-state` rows with no share
-    /// (straight through `record`) evicts the `spawned` row and, in the full
-    /// ring, every other row, so the share is what kept them.
     #[test]
     fn program_state_rows_name_the_report_and_hold_at_most_their_share() {
         use aterm_core::terminal::program_state::{
@@ -5252,11 +3708,9 @@ mod tests {
             Some((spawned, "spawned")),
             "the session's own rows stay"
         );
-        // The newest moves are the ones kept, ids increasing.
         assert!(rows.windows(2).all(|w| w[1].id > w[0].id));
         assert_eq!(rows.last().map(|e| e.id), tl.high_id());
         let tail: Vec<&str> = rows[rows.len() - 3..].iter().map(|e| &*e.payload).collect();
-        // 997 % 3 == 1, 998 % 3 == 2, 999 % 3 == 0.
         assert_eq!(
             tail,
             [
@@ -5265,8 +3719,6 @@ mod tests {
                 "state=working kind=-"
             ]
         );
-        // A ring already full of the session's other rows: the flood ages out
-        // the share of them, oldest first, and the newest rest stay.
         let others = |tl: &SessionTimeline| -> Vec<u64> {
             tl.since(None)
                 .filter(|e| e.kind == "state-change")
@@ -5288,8 +3740,6 @@ mod tests {
             TIMELINE_CAP - PROGRAM_STATE_ROWS_MAX
         );
         assert_eq!(full.len(), TIMELINE_CAP);
-        // NEGATIVE CONTROL: the same rows with no share, straight through
-        // `record`, flood the spawned row out, and in a full ring every other row.
         let mut flood = SessionTimeline::default();
         flood.record("spawned", "pid=1".to_string());
         for _ in 0..1000 {
@@ -5312,10 +3762,6 @@ mod tests {
         );
     }
 
-    /// The `partition_point` seek agrees with a linear filter at every
-    /// watermark, including below the retained low-water (everything), at the
-    /// high (nothing), above it (everything: another count's anchor), and
-    /// either side of each retained id.
     #[test]
     fn since_seek_matches_the_linear_filter_for_every_watermark() {
         let mut tl = SessionTimeline::default();
@@ -5329,7 +3775,6 @@ mod tests {
             "the fixture must have evicted, or the below-low arm is vacuous"
         );
 
-        // An anchor above every id handed out is another count's: everything.
         let reference = |after: Option<u64>| -> Vec<u64> {
             tl.events
                 .iter()
@@ -5364,7 +3809,6 @@ mod tests {
             TIMELINE_CAP,
             "above every id handed out = all retained"
         );
-        // Still double-ended: the reverse walk the newest-few readers use.
         let newest: Vec<u64> = tl.since(None).rev().take(3).map(|e| e.id).collect();
         assert_eq!(newest, vec![high, high - 1, high - 2]);
     }
@@ -5398,9 +3842,6 @@ mod tests {
         assert!(e.payload.chars().all(|c| c == 'é'), "boundary-safe clamp");
     }
 
-    /// The clamp never bisects a `%XX` escape: slide the cut across all three
-    /// in-triple offsets (via a 0/1/2-byte ASCII prefix) and require every
-    /// stored `%` to head a complete, decodable triple.
     #[test]
     fn payload_clamp_never_bisects_a_pct_escape() {
         for pad in 0..3usize {
@@ -5431,16 +3872,12 @@ mod tests {
         assert_eq!(m.set("title", Some("build agent".into())), Some(true));
         assert_eq!(m.get("title"), Some("build agent"));
         assert!(m.any_set());
-        // Same value again: known field, not a change.
         assert_eq!(m.set("title", Some("build agent".into())), Some(false));
-        // Unset flips back; a second unset is a known-field no-change.
         assert_eq!(m.set("title", None), Some(true));
         assert_eq!(m.set("title", None), Some(false));
         assert!(!m.any_set());
-        // Unknown fields are rejected (None), not silently stored.
         assert_eq!(m.set("colour", Some("red".into())), None);
         assert_eq!(m.get("colour"), None);
-        // `role` and `attention` round-trip and flip `any_set`.
         assert_eq!(m.set("role", Some("reviewer".into())), Some(true));
         assert_eq!(m.get("role"), Some("reviewer"));
         assert!(m.any_set());
@@ -5454,8 +3891,6 @@ mod tests {
         assert!(!m.any_set());
     }
 
-    /// `upgrade=` reads the stored row against the awake clock now: it says `unwatched`
-    /// exactly when the machine is past its wake grace. Negative control: the row as stored.
     #[test]
     fn the_upgrade_column_reads_the_awake_clock_as_it_stands_now() {
         use aterm_agent::harness::upgrade::Phase;
@@ -5489,14 +3924,10 @@ mod tests {
     }
 }
 
-/// The typed metadata write API that `meta set`/`meta unset` and the GUI rename both take.
 #[cfg(test)]
 mod write_api_tests {
     use super::{MetaEdit, MetaField, MetaWriteError, apply_meta_value, validated_meta_value};
 
-    /// The validation ladder refuses rather than repairs: an empty `Set`, a
-    /// value with forbidden formatting and an over-cap value are refusals, and
-    /// a legal value comes back canonicalized. Only `Clear` reaches `Ok(None)`.
     #[test]
     fn the_ladder_refuses_rather_than_repairs() {
         use MetaField::{Icon, Title};
@@ -5528,8 +3959,6 @@ mod write_api_tests {
         assert_eq!(MetaField::parse("colour"), None);
     }
 
-    /// A clear records the cleared marker (`value=-`), distinguishing it in the
-    /// event stream from a `Set("")`, which would also store `None`.
     #[test]
     fn a_clear_records_the_cleared_marker_and_only_on_a_real_change() {
         let ctx = crate::stub_session(0).ctx.clone();
@@ -5571,10 +4000,6 @@ mod write_api_tests {
         );
     }
 
-    /// Every write the door accepts marks its field as the driver's (a no-op
-    /// re-set and a clear of an unset field included), a restore seed through
-    /// [`super::SessionMeta::set`] marks nothing, and the marks never enter
-    /// equality.
     #[test]
     fn every_accepted_write_marks_its_field_and_a_seed_marks_none() {
         use super::SessionMeta;
@@ -5614,9 +4039,6 @@ mod write_api_tests {
     }
 }
 
-/// Tests for the `questions` field: a closed set of four policy words,
-/// case-folded on the way in, refused whole otherwise, and carried like every
-/// other user field.
 #[cfg(test)]
 mod questions_field_tests {
     use super::{
@@ -5625,8 +4047,6 @@ mod questions_field_tests {
         validated_meta_value,
     };
 
-    /// Every spelling the contract admits, and the one it stores; the cap
-    /// holds the longest.
     #[test]
     fn the_policy_words_are_admitted_and_case_folded() {
         for word in QUESTIONS_POLICY_WORDS {
@@ -5645,9 +4065,6 @@ mod questions_field_tests {
         }
     }
 
-    /// Anything else is refused whole — never trimmed into a different value.
-    /// No controller form: a session principal is not a policy word, and a
-    /// priority word spelled otherwise (`long_term`, `long term`) is no word.
     #[test]
     fn anything_outside_the_words_is_refused() {
         for bad in [
@@ -5671,9 +4088,6 @@ mod questions_field_tests {
         }
     }
 
-    /// The write ladder: a legal word stores its normalized spelling; an
-    /// illegal one is the typed refusal the wire renders as its usage line;
-    /// an empty `Set` stays `Empty`; a `Clear` clears.
     #[test]
     fn the_write_ladder_normalizes_or_refuses() {
         use MetaField::Questions;
@@ -5701,9 +4115,6 @@ mod questions_field_tests {
         assert_eq!(Questions.cap(), META_QUESTIONS_MAX);
     }
 
-    /// The store's second gate: a value that bypassed the wire (a hand-edited
-    /// restore manifest) is normalized or dropped, `questions` counts toward
-    /// `any_set`, and it takes part in equality.
     #[test]
     fn the_store_normalizes_counts_and_compares_questions() {
         let mut m = SessionMeta::default();
@@ -5725,9 +4136,6 @@ mod questions_field_tests {
         assert_eq!(sanitize_metadata_value("questions", "@s-x"), None);
     }
 
-    /// Restore and handoff carry it: a sanitized copy keeps it, and the carried
-    /// identity puts it back on the live session as an ordinary `meta-change`,
-    /// for each of the four words.
     #[test]
     fn a_carried_identity_restores_the_policy() {
         for word in QUESTIONS_POLICY_WORDS {
@@ -5751,9 +4159,6 @@ mod questions_field_tests {
     }
 }
 
-/// The `autopilot` field: the supervisor's three words and their aliases store the mode's
-/// word, anything else is refused whole, and the word is counted, compared and carried like
-/// every other user field.
 #[cfg(test)]
 mod autopilot_field_tests {
     use super::{
@@ -5763,8 +4168,6 @@ mod autopilot_field_tests {
     };
     use aterm_agent::supervise::Autopilot;
 
-    /// Every mode's word is admitted as itself and fits the cap; aliases and any case store
-    /// the mode's word; the usage line spells the three words in the chip's order.
     #[test]
     fn the_modes_and_the_owners_words_store_the_modes_word() {
         for mode in Autopilot::ALL {
@@ -5783,8 +4186,6 @@ mod autopilot_field_tests {
         ] {
             assert_eq!(normalize_autopilot_value(typed), Some(stored), "{typed:?}");
         }
-        // The three words in the chip's cycle order, Cruise's `until=`
-        // (§9.3.5) beside it.
         let words: Vec<String> = Autopilot::ALL
             .iter()
             .map(|m| match m {
@@ -5798,8 +4199,6 @@ mod autopilot_field_tests {
         );
     }
 
-    /// NEGATIVE CONTROLS: a switch word other than `off`, a near miss and an
-    /// invisible character are no mode, and are refused whole.
     #[test]
     fn anything_that_names_no_mode_is_refused() {
         for bad in [
@@ -5818,9 +4217,6 @@ mod autopilot_field_tests {
         }
     }
 
-    /// The write ladder: a mode stores its word, anything else is the typed
-    /// refusal the wire renders as [`AUTOPILOT_USAGE`], an empty `Set` stays
-    /// `Empty`, and a `Clear` clears.
     #[test]
     fn the_write_ladder_normalizes_or_refuses() {
         use MetaField::Autopilot as Field;
@@ -5847,9 +4243,6 @@ mod autopilot_field_tests {
         assert!(MetaField::NAMES.ends_with("|questions|autopilot"));
     }
 
-    /// The store's second gate normalizes or drops a value that bypassed the
-    /// wire; the word counts toward `any_set`, takes part in equality and
-    /// reads back typed.
     #[test]
     fn the_store_normalizes_counts_compares_and_types_the_word() {
         let mut m = SessionMeta::default();
@@ -5871,8 +4264,6 @@ mod autopilot_field_tests {
             Some("off")
         );
         assert_eq!(sanitize_metadata_value("autopilot", "on"), None);
-        // Each stored word reads as its mode, and a spelling no writer here
-        // stores (set past both gates) still reads by the supervisor's reader.
         for mode in Autopilot::ALL {
             m.autopilot = Some(mode.word().into());
             assert_eq!(m.autopilot_word(), Some(mode));
@@ -5881,9 +4272,6 @@ mod autopilot_field_tests {
         assert_eq!(m.autopilot_word(), Some(Autopilot::Land));
     }
 
-    /// A write that moves the word records the ordinary `meta-change` and
-    /// rings the window's host; a write that moves nothing rings nothing
-    /// (the ring count is this thread's own).
     #[test]
     fn a_word_that_moves_is_recorded_and_rings_the_host() {
         let ctx = crate::stub_session(0).ctx.clone();
@@ -5923,9 +4311,6 @@ mod autopilot_field_tests {
         assert_eq!(events[0], "field=autopilot value=off");
     }
 
-    /// Restore and handoff carry it: a sanitized copy keeps it, and the carried
-    /// identity puts it back on the live session as an ordinary `meta-change`,
-    /// ringing the host, for each of the three words.
     #[test]
     fn a_carried_identity_restores_the_word() {
         for mode in Autopilot::ALL {
@@ -5942,18 +4327,7 @@ mod autopilot_field_tests {
     }
 }
 
-/// A WORKER AN OLDER BUILD STARTED KEEPS LAND (Autopilot Land): a session that
-/// holds a task record — it was started as a worker — and no Autopilot word
-/// of its own gets [`crate::task_launch::WORKER_AUTOPILOT`], the word every
-/// worker's spawn writes now, written as aterm's (never as a driver's: a
-/// carried identity grafted after it still puts its own word back). A build
-/// before that word was written left its workers on the table's default,
-/// and under Autopilot Cruise a worker on Cruise never publishes `done`: its
-/// manager's `await task` never woke after a seamless update (the review of
-/// 2026-10-20). Called where a carried record or identity lands on a session
-/// ([`crate::task_record::seed_carried`], the restore's identity seed and
-/// graft). A word the session has — carried, restored or written here — is
-/// kept, and an exited worker's task is over. Whether the word was written.
+/// A WORKER AN OLDER BUILD STARTED KEEPS LAND (Autopilot Land).
 pub(crate) fn keep_worker_autopilot(ctx: &crate::SessionCtx) -> bool {
     let tasked = ctx
         .timeline
@@ -5971,7 +4345,6 @@ pub(crate) fn keep_worker_autopilot(ctx: &crate::SessionCtx) -> bool {
     let word = crate::task_launch::WORKER_AUTOPILOT.word().to_string();
     let moved = meta.set_autopilot(Some(word), None);
     if moved {
-        // aterm's write, stored as its setter (§11.7.3, item 1).
         meta.note_autopilot_set_by(AutopilotSetBy::now(aterm_slog::Actor::Aterm, None));
         record_autopilot(ctx, &meta, aterm_slog::Actor::Aterm);
     }
@@ -5982,13 +4355,11 @@ pub(crate) fn keep_worker_autopilot(ctx: &crate::SessionCtx) -> bool {
     moved
 }
 
-/// Proofs for [`keep_worker_autopilot`].
 #[cfg(test)]
 mod worker_autopilot_tests {
     use super::{SessionMeta, keep_worker_autopilot, restore_carried_meta};
     use aterm_agent::supervise::Autopilot;
 
-    /// A carried worker's record on `ctx`, in `state`.
     fn carried(ctx: &crate::SessionCtx, state: &str) {
         let row = format!(
             "rev=3 state={state} from=s-0123456789abcdef0123 since=1789000000000 \
@@ -5998,11 +4369,6 @@ mod worker_autopilot_tests {
         assert!(ctx.timeline.lock().unwrap().task().is_some(), "{row}");
     }
 
-    /// A WORKER WITH NO WORD, ITS RECORD CARRIED, IS LAND: the record's seed
-    /// writes it, and a graft of a carried identity that names no word —
-    /// which clears the word — is followed by the same keep. NEGATIVE
-    /// CONTROLS: a carried word (Cruise) stands; a session with no task
-    /// record keeps the table's default; an exited worker gets nothing.
     #[test]
     fn a_worker_with_no_word_keeps_land() {
         let word = |ctx: &crate::SessionCtx| ctx.meta.lock().unwrap().autopilot_word();
@@ -6013,7 +4379,6 @@ mod worker_autopilot_tests {
         assert_eq!(word(&ctx), None, "the graft put the carried none back");
         assert!(keep_worker_autopilot(&ctx));
         assert_eq!(word(&ctx), Some(Autopilot::Land));
-        // NEGATIVE CONTROLS.
         let cruise = SessionMeta {
             autopilot: Some("cruise".into()),
             ..SessionMeta::default()
@@ -6030,7 +4395,6 @@ mod worker_autopilot_tests {
     }
 }
 
-/// [`super::restore_carried_meta`]: a carried identity put back on a session already live here.
 #[cfg(test)]
 mod carried_meta_tests {
     use super::{MetaField, SessionMeta, apply_meta_value, restore_carried_meta};
@@ -6045,15 +4409,10 @@ mod carried_meta_tests {
             .collect()
     }
 
-    /// A field a driver wrote here keeps the driver's value, set or cleared; every other field
-    /// takes the carried value, and each move is one `meta-change` naming the stored value.
     #[test]
     fn a_driver_write_outranks_the_carried_value_and_every_move_is_announced() {
         let ctx = crate::stub_session(0).ctx.clone();
-        // A value from an earlier restore — no driver wrote it here — that
-        // the carried identity does not name.
         let _ = ctx.meta.lock().unwrap().set("icon", Some("🧟".into()));
-        // What a driver wrote here before the carried identity arrived.
         assert!(apply_meta_value(
             &ctx,
             MetaField::Role,
@@ -6103,15 +4462,12 @@ mod carried_meta_tests {
             "exactly the fields that moved, each naming what it now stores"
         );
 
-        // Nothing left to move: silent, and says so.
         let watermark = ctx.timeline.lock().unwrap().high_id();
         assert!(!restore_carried_meta(&ctx, &carried));
         assert!(meta_events_after(&ctx, watermark).is_empty());
     }
 }
 
-/// [`apply_meta_value`] records under the meta guard, so racing `meta set`s never leave the
-/// event stream ending on a value other than the one stored.
 #[cfg(test)]
 mod meta_atomicity_tests {
     use super::{MetaField, apply_meta_value};
@@ -6182,9 +4538,6 @@ mod keyed_attention_tests {
         ctx.meta.lock().unwrap().attention.clone()
     }
 
-    /// Two owners raise and clear their own escalations independently: each
-    /// clear leaves the other's standing, readers see the most recently set
-    /// one, and only a move of what readers see is recorded as an event.
     #[test]
     fn two_owners_set_and_clear_independently() {
         let ctx = crate::stub_session(0).ctx.clone();
@@ -6195,13 +4548,11 @@ mod keyed_attention_tests {
         assert!(set("sup", "claude needs approval: rm -rf tmp"));
         assert!(set("human", "check the deploy"));
         assert_eq!(effective(&ctx).as_deref(), Some("check the deploy"));
-        // The earlier owner's entry is still there, underneath.
         assert_eq!(
             ctx.meta.lock().unwrap().attention_owners.get("sup"),
             Some("claude needs approval: rm -rf tmp")
         );
 
-        // Clearing the shown owner falls back to the other, not to nothing.
         assert!(
             write_attention_owned(&ctx, "human", MetaEdit::Clear, aterm_slog::Actor::Ctl).unwrap()
         );
@@ -6209,11 +4560,9 @@ mod keyed_attention_tests {
             effective(&ctx).as_deref(),
             Some("claude needs approval: rm -rf tmp")
         );
-        // Clearing an owner that holds nothing changes nothing.
         assert!(
             !write_attention_owned(&ctx, "human", MetaEdit::Clear, aterm_slog::Actor::Ctl).unwrap()
         );
-        // Re-setting the shown text is a no-op, not an event.
         assert!(!set("sup", "claude needs approval: rm -rf tmp"));
         assert!(
             write_attention_owned(&ctx, "sup", MetaEdit::Clear, aterm_slog::Actor::Ctl).unwrap()
@@ -6231,17 +4580,12 @@ mod keyed_attention_tests {
             ]
         );
 
-        // Clearing a non-shown owner moves nothing `attention=` shows, so it
-        // records nothing; but an entry went, which the need reads, so the
-        // write answers a move (what posts the wake that republishes it).
         set("a", "first");
         set("b", "second");
         let before = meta_events(&ctx).len();
         assert!(write_attention_owned(&ctx, "a", MetaEdit::Clear, aterm_slog::Actor::Ctl).unwrap());
         assert_eq!(effective(&ctx).as_deref(), Some("second"));
         assert_eq!(meta_events(&ctx).len(), before);
-        // …and so does the bare clear under a newer keyed entry (the wire's
-        // `meta unset attention`); clearing what is not there moves nothing.
         apply_meta_value(
             &ctx,
             MetaField::Attention,
@@ -6269,9 +4613,6 @@ mod keyed_attention_tests {
         );
     }
 
-    /// The bare form is owner `-`: `meta set attention` / `meta unset
-    /// attention` (the `apply_meta_value` path every pre-keyed caller takes)
-    /// set and clear only the bare entry, and a keyed escalation outlives it.
     #[test]
     fn the_bare_form_is_the_bare_owner_and_keeps_its_contract() {
         let ctx = crate::stub_session(0).ctx.clone();
@@ -6291,10 +4632,8 @@ mod keyed_attention_tests {
             Some("legacy badge")
         );
         write_attention_owned(&ctx, "sup", MetaEdit::Set("keyed"), aterm_slog::Actor::Ctl).unwrap();
-        // A bare clear leaves the keyed owner's escalation up.
         apply_meta_value(&ctx, MetaField::Attention, None, aterm_slog::Actor::Ctl);
         assert_eq!(effective(&ctx).as_deref(), Some("keyed"));
-        // With no keyed owner, the bare set and clear round-trip.
         write_attention_owned(&ctx, "sup", MetaEdit::Clear, aterm_slog::Actor::Ctl).unwrap();
         assert_eq!(effective(&ctx), None);
         assert!(apply_meta_value(
@@ -6312,9 +4651,6 @@ mod keyed_attention_tests {
         assert_eq!(effective(&ctx), None);
     }
 
-    /// Bounded: a ninth owner is refused without touching anyone, the bare
-    /// owner always has its slot, and a keyed text is capped at 200 bytes
-    /// while the bare field keeps its 256.
     #[test]
     fn the_map_is_bounded_and_the_keyed_text_capped() {
         let ctx = crate::stub_session(0).ctx.clone();
@@ -6327,7 +4663,6 @@ mod keyed_attention_tests {
             )
             .unwrap();
         }
-        // The bare owner is the eighth.
         assert!(apply_meta_value(
             &ctx,
             MetaField::Attention,
@@ -6344,12 +4679,10 @@ mod keyed_attention_tests {
             Err(AttentionWriteError::OwnersFull)
         );
         assert_eq!(effective(&ctx).as_deref(), Some("bare"), "nothing moved");
-        // An existing owner still updates at capacity.
         assert!(
             write_attention_owned(&ctx, "o0", MetaEdit::Set("updated"), aterm_slog::Actor::Ctl)
                 .unwrap()
         );
-        // …and a slot freed is a slot a new owner can take.
         write_attention_owned(&ctx, "o1", MetaEdit::Clear, aterm_slog::Actor::Ctl).unwrap();
         write_attention_owned(
             &ctx,
@@ -6375,9 +4708,6 @@ mod keyed_attention_tests {
         .expect("the bare owner keeps the bare field's 256-byte cap");
     }
 
-    /// A restore carries the bare owner's entry only; a meta seeded as a
-    /// struct literal adopts its value as the bare entry on the first keyed
-    /// write, so a keyed set-and-clear on top of it does not lose it.
     #[test]
     fn a_restore_carries_the_bare_entry_and_a_literal_seed_is_adopted() {
         let mut meta = SessionMeta::default();
@@ -6407,9 +4737,6 @@ mod keyed_attention_tests {
         assert_eq!(seeded.attention.as_deref(), Some("seeded"));
     }
 
-    /// The retired hooks' bare badge stays live where it stands but does not
-    /// travel, as the bare owner's entry, a literal seed, or under a keyed
-    /// entry. Negative control: a bare attention without the prefix travels.
     #[test]
     fn a_retired_hook_badge_does_not_travel() {
         let legacy = "claude needs approval: Claude needs your permission - permission_prompt";
@@ -6439,8 +4766,6 @@ mod keyed_attention_tests {
         );
     }
 
-    /// `meta unset supervisor holder=<h>` clears the claim only while `<h>` holds it.
-    /// Negative control: the holder's own release clears it.
     #[test]
     fn a_holder_conditional_release_never_clears_another_holders_claim() {
         let ctx = crate::stub_session(0).ctx.clone();
@@ -6498,7 +4823,6 @@ mod keyed_attention_tests {
             claim_supervisor(&ctx, "sup-a", Some(9), None, 100),
             Ok(false)
         );
-        // A release by a connection the claim is not bound to is a no-op.
         assert!(!release_supervisor(
             &ctx,
             Some(7),
@@ -6514,7 +4838,6 @@ mod keyed_attention_tests {
         ));
         assert_eq!(shown(100), None);
 
-        // A TTL claim is shown until it lapses, then another holder may claim.
         assert_eq!(
             claim_supervisor(&ctx, "sup-a", None, Some(500), 100),
             Ok(true)
@@ -6537,8 +4860,6 @@ mod keyed_attention_tests {
 
 #[cfg(test)]
 mod input_stall_tests {
-    //! The server's publication of an input stall: the effective agent word and
-    //! the server's own attention entry.
     use std::time::Instant;
 
     use aterm_session::input_backlog::InputWord;
@@ -6585,8 +4906,6 @@ mod input_stall_tests {
         tl.publish_agent(word, None, None, reader, stamp())
     }
 
-    /// A stall on a Claude Code session turns its word `wall:unresponsive` (one rev) and holds
-    /// it while the screen verdict moves underneath; the clear hands back the screen's word.
     #[test]
     fn a_stall_on_an_agent_is_wall_unresponsive_and_its_clear_hands_back_the_screen() {
         let mut tl = SessionTimeline::default();
@@ -6605,11 +4924,9 @@ mod input_stall_tests {
             tl.agent().wire_fields()
         );
 
-        // The screen moves under the frozen program: kept, not shown.
         assert!(!publish(&mut tl, "busy", true));
         assert_eq!((tl.agent().word, tl.agent().rev), ("wall:unresponsive", 2));
         assert_eq!(tl.agent().screen_word, "busy");
-        // Re-publishing the same stall moves nothing.
         assert!(!tl.set_input(Some(stall(false))));
         assert_eq!(tl.agent().rev, 2);
 
@@ -6625,8 +4942,6 @@ mod input_stall_tests {
         );
     }
 
-    /// A stopped job reads `agent_detail=stopped`; the move from a stall to a
-    /// stop is its own rev.
     #[test]
     fn a_stopped_job_is_wall_unresponsive_with_detail_stopped() {
         let mut tl = SessionTimeline::default();
@@ -6638,9 +4953,6 @@ mod input_stall_tests {
         assert_eq!(tl.agent().rev, 3);
     }
 
-    /// Negative control: a session that is no identified agent keeps `agent=-`
-    /// (its stall is the server's attention entry) and stays `-` when the stall
-    /// clears. The stall counts once the session is read as an agent.
     #[test]
     fn a_stall_on_no_agent_leaves_the_agent_word_alone() {
         let mut tl = SessionTimeline::default();
@@ -6651,15 +4963,12 @@ mod input_stall_tests {
             tl.agent().input.is_some(),
             "kept for when a reader names it"
         );
-        // The program is identified while the stall stands.
         assert!(publish(&mut tl, "prompt", true));
         assert_eq!(tl.agent().word, "wall:unresponsive");
         assert!(tl.set_input(None));
         assert_eq!(tl.agent().word, "prompt");
     }
 
-    /// The server's entry outranks an older supervisor badge while the stall stands, and its
-    /// clear uncovers the supervisor's entry. The server's write marks nothing driver-written.
     #[test]
     fn the_server_entry_outranks_the_supervisor_and_its_clear_uncovers_it() {
         let ctx = crate::stub_session(0).ctx.clone();
@@ -6683,7 +4992,6 @@ mod input_stall_tests {
         assert!(write_server_attention(&ctx, SERVER_ATTENTION_OWNER, None));
         assert_eq!(effective(), (None, None));
 
-        // The supervisor's badge first, the stall later.
         write_attention_owned(
             &ctx,
             "supervisor",
@@ -6700,7 +5008,6 @@ mod input_stall_tests {
             effective(),
             (Some(frozen.to_string()), Some("aterm".to_string()))
         );
-        // Re-writing the same line is no move.
         assert!(!write_server_attention(
             &ctx,
             SERVER_ATTENTION_OWNER,
@@ -6729,8 +5036,6 @@ mod input_stall_tests {
         );
     }
 
-    /// The stored line is held to the keyed cap and the presentation
-    /// sanitizer: it quotes a program name, which is whatever argv[0] said.
     #[test]
     fn the_server_entry_is_capped_and_sanitized() {
         let ctx = crate::stub_session(0).ctx.clone();
@@ -6743,7 +5048,6 @@ mod input_stall_tests {
         let shown = ctx.meta.lock().unwrap().attention.clone().expect("set");
         assert!(shown.len() <= META_ATTENTION_KEYED_MAX, "{}", shown.len());
         assert!(shown.starts_with("evilprog "), "{shown}");
-        // A line that sanitizes to nothing is a clear, never an empty badge.
         assert!(write_server_attention(
             &ctx,
             SERVER_ATTENTION_OWNER,
@@ -6755,8 +5059,6 @@ mod input_stall_tests {
 
 #[cfg(test)]
 mod screen_move_tests {
-    //! A move of the screen under a verdict that stands, counted for the supervisor host
-    //! while the agent is not busy.
     use std::time::{Duration, Instant};
 
     use super::{AgentStamp, SessionTimeline};
@@ -6775,11 +5077,6 @@ mod screen_move_tests {
         );
     }
 
-    /// A `/clear` at an idle composer moves no verdict, and its screen's move is counted
-    /// ([`super::AgentPublication::screen_moves`]); the host is woken for the first move and
-    /// then at most once per [`STATUS_AFTER_SCREEN`] ([`SessionTimeline::note_screen_move`]).
-    /// NEGATIVE CONTROLS: a busy agent's moving screen counts nothing and wakes nothing; a
-    /// verdict's own move is no screen move; no agent, no count.
     #[test]
     fn an_idle_screens_move_is_counted_and_wakes_the_host_once_per_settle() {
         let mut tl = SessionTimeline::default();
@@ -6806,7 +5103,6 @@ mod screen_move_tests {
             fresh.note_screen_move(t0 + STATUS_AFTER_SCREEN),
             "once per settle"
         );
-        // NEGATIVE CONTROLS.
         let mut busy = SessionTimeline::default();
         read(&mut busy, "busy", 1);
         assert!(!busy.note_screen_move(t0), "a busy agent's spinner");
@@ -6820,8 +5116,6 @@ mod screen_move_tests {
 
 #[cfg(test)]
 mod registry_drift_tests {
-    //! THE DRIFT (card engine §3.10): the build a Claude Code's registry row
-    //! reports, against the build its Store or Native drawer image names.
     use std::path::PathBuf;
     use std::sync::Arc;
 
@@ -6831,15 +5125,12 @@ mod registry_drift_tests {
     use super::{RegistryDrift, SessionTimeline};
     use crate::holder_image::{EdgeKind, HolderImage};
 
-    /// The store build id of `version`.
     fn build(version: &str) -> u64 {
         atpkg::vendor_direct::Version::parse(version)
             .expect("a vendor build")
             .build_id()
     }
 
-    /// Publish group `pgid`'s image: `claude` at `exe`, of `source`, naming
-    /// `version` (`None`: no build).
     fn image(
         tl: &mut SessionTimeline,
         pgid: i32,
@@ -6863,8 +5154,6 @@ mod registry_drift_tests {
         );
     }
 
-    /// The registry row of conversation `id` reporting `version`, read for
-    /// group `pgid`.
     fn row(tl: &mut SessionTimeline, pgid: i32, id: &str, version: &str) {
         tl.set_claude_footer(
             pgid,
@@ -6882,8 +5171,6 @@ mod registry_drift_tests {
 
     const STORE_304: &str = "/p/pkg/store/claude/1000002000001000304/bin/claude";
 
-    /// A row that reports another build than its Store drawer image names is
-    /// said once per reported build; one that agrees is not.
     #[test]
     fn a_row_that_disagrees_with_its_drawer_image_is_said_once() {
         let mut tl = SessionTimeline::default();
@@ -6925,10 +5212,6 @@ mod registry_drift_tests {
         );
     }
 
-    /// CONTROLS: the row that stood when the image was published (the
-    /// replaced image's, until the new one writes its own), a build spelled
-    /// in no form a vendor build parses from, and an image that is no Store
-    /// or Native Claude Code drawer are no drift.
     #[test]
     fn a_stale_row_an_unknown_spelling_or_no_drawer_is_no_drift() {
         let mut tl = SessionTimeline::default();
@@ -6959,11 +5242,6 @@ mod registry_drift_tests {
 
 #[cfg(all(test, any(debug_assertions, feature = "dev-seams")))]
 mod card_engine_dev_row_tests {
-    //! The card engine's dev rows a lead measurement reads (design §8):
-    //! `holder-named` when the sweep names a card program, `card-seen` once
-    //! per drawer token for its own family and known version, `holder-claim`
-    //! for a claim taken. Each with its negative control: another program, a
-    //! mismatched card or a seen token, and a renewal record nothing.
     use std::path::PathBuf;
     use std::sync::Arc;
 
@@ -7027,11 +5305,6 @@ mod card_engine_dev_row_tests {
         assert_eq!(tl.card_unseen(), None, "the probe stops looking");
     }
 
-    /// §8's `bare_frames`: a predecessor's card refused above the drawer's
-    /// own is not its bare time, but every pass composed after the drawer's
-    /// card was seen on screen at the row it is decorated at is, whatever the
-    /// gate read meanwhile. Mutation-checked: dropping the passes since the
-    /// sight (`.max(late)`) reports `bare_frames=0` for the second drawer.
     #[test]
     fn bare_frames_count_the_passes_since_the_drawers_card_was_seen() {
         use crate::claude_card::{Bare, CardOutcome};
@@ -7045,8 +5318,6 @@ mod card_engine_dev_row_tests {
         let image = claude_304(80);
         let token = image.token.expect("tracked");
         tl.offer_holder_image(Arc::new(image), EdgeKind::Group);
-        // A predecessor's card at row 0 refused for two passes; the drawer's
-        // own is decorated at row 9 with none of them counted.
         tl.note_card_frame(CardOutcome::Bare(token, Bare::Fence, Some(0)), 1);
         tl.note_card_frame(CardOutcome::Bare(token, Bare::Fence, Some(0)), 2);
         tl.note_card_frame(
@@ -7059,8 +5330,6 @@ mod card_engine_dev_row_tests {
         );
         let rows = decorated(&tl);
         assert!(rows[0].contains("bare_frames=0"), "{rows:?}");
-        // The next drawer: the old card refused at pass 4, the new card seen
-        // at row 20 after it, and two passes still read the old one.
         let image = claude_304(81);
         let next = image.token.expect("tracked");
         tl.offer_holder_image(Arc::new(image), EdgeKind::Group);

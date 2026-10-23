@@ -1,53 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Whether an account other than this one can write a file or directory: any other-write
-//! bit, or a group-write bit unless the group is this user's own private group and nothing
-//! past the mode widens it. The one judge for every reader that refuses what another account
-//! could have written: the updater's install-path walk (`aterm-update`'s `linux::ancestry`,
-//! held equal to the installer's embedded verifier, tools/install.sh `shared_write`, by
-//! `crates/aterm-update/tests/install_sh`) and the fleet document (`aterm-agent`'s
-//! `ai::config::load_fleet`).
-//!
-//! A group-write bit is another account's write unless the group can hold no account but
-//! this one ([`user_private_group`]): Ubuntu's `useradd` gives every user a group of their
-//! own (`USERGROUPS_ENAB`), and pam_umask's `usergroups` then sets their umask to `002`, so
-//! a file they write is `0664` (a `~/.local` made by pip, pipx or uv `0775`) without any
-//! other account being able to write it.
-//!
-//! The exemption holds only where the mode and this machine's account databases say who can
-//! write, so two facts take it back ([`others_can_write_as`]'s `widened`):
-//!
-//! - An extended access ACL, POSIX or NFSv4 ([`acl_carried`]). Its group bits are then the
-//!   ACL's mask, the most any named user or group entry grants, not the owning group's own
-//!   permission: `setfacl -m u:nobody:rw` on a `0644` file leaves it `0664`, and a
-//!   directory's default ACL hands the same to every file made in it. A mode without a
-//!   group-write bit stays safe with one, since the mask bounds every named entry.
-//! - A network or FUSE filesystem ([`remote_filesystem`]), or one whose type cannot be read.
-//!   There a server or daemon decides access, by its own ACLs or by groups defined off this
-//!   machine (another NFS client's `/etc/group`), which no local database shows.
-//!
-//! What the rule still cannot see:
-//!
-//! - a second group entry (another `/etc/group` line or a directory-service group) that
-//!   reuses the gid, whose members `initgroups` grants it though `getgrgid_r` returns only
-//!   the first;
-//! - an account with that primary gid that a source does not enumerate (SSSD with
-//!   `enumerate = false`), or drops by reporting itself unavailable mid-walk: glibc's
-//!   `getpwent_r` ends that walk with the same `ENOENT` as a complete one (a temporary
-//!   failure is told apart, and admits nothing);
-//! - membership granted outside those databases: a gshadow group password or administrator
-//!   (`newgrp`), pam_group, a setgid binary of the group, a rootless container whose gid 0
-//!   maps to the user's primary gid, or a stale nscd answer;
-//! - a remote filesystem the type list leaves out, or one under a stacking filesystem
-//!   (overlayfs reports its own type).
-//!
-//! The account databases, the ACL and the filesystem type are read on Linux alone.
-//! Everywhere else, macOS included, no group is private, so the answer is the plain mode
-//! test: a group-write bit is refused as it always was. (On macOS a user's primary group is
-//! `staff`, and Darwin's group records do not list the nested and GUID members its
-//! membership APIs resolve, so no member list there could show a group to be one
-//! account's.)
+//! Whether an account other than this one can write a file or directory: any other-write bit, or a group-write bit unless the group is this user's own private group and nothing past the mode widens it.
 
 use std::ffi::CStr;
 use std::os::unix::fs::MetadataExt as _;
@@ -66,30 +20,18 @@ pub struct Group {
     pub members: Vec<Vec<u8>>,
 }
 
-/// Whether an account other than this process's effective one can write the open `file`:
-/// [`others_can_write_as`] over its owner, group and mode, whether it carries an access ACL
-/// and the type of the filesystem it is on, all read from this one descriptor, with this
-/// system's account databases saying which group is this user's private one.
-///
+/// Whether an account other than this process's effective one can write the open `file`: [`others_can_write_as`] over its owner, group and mode, whether it carries an access ACL and the type of the filesystem it is on, all read from this one descriptor, with this system's account databases saying which group is this user's private one.
 /// # Errors
-///
 /// The `fstat` that reads its owner, group and mode failed.
-// Skip: bottoms out at the `geteuid`, `fgetxattr`, `fstatfs` and NSS FFI calls.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn others_can_write(file: &std::fs::File) -> std::io::Result<bool> {
     let md = file.metadata()?;
     Ok(judge(&md, acl::on_file(file), filesystem::of_file(file)))
 }
 
-/// [`others_can_write`] for what `path` itself names, a final symbolic link not followed
-/// (`lstat`, `lgetxattr`): the install-path walk judges each component as it stands. The
-/// filesystem type is read through the link (`statfs`), which changes no answer: a
-/// symbolic link's own mode is `0777`, never exempt.
-///
+/// [`others_can_write`] for what `path` itself names, a final symbolic link not followed (`lstat`, `lgetxattr`): the install-path walk judges each component as it stands.
 /// # Errors
-///
 /// The `lstat` of `path` failed.
-// Skip: bottoms out at the `geteuid`, `lgetxattr`, `statfs` and NSS FFI calls.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn others_can_write_at(path: &std::path::Path) -> std::io::Result<bool> {
     let md = std::fs::symlink_metadata(path)?;
@@ -97,8 +39,6 @@ pub fn others_can_write_at(path: &std::path::Path) -> std::io::Result<bool> {
 }
 
 /// [`others_can_write_as`] for this process's effective uid over what `md` says, widened by
-/// an access ACL (`acl`) or by a remote filesystem or one of no readable type (`magic`).
-// Skip: bottoms out at the `geteuid` and NSS FFI calls.
 #[cfg_attr(trust_verify, trust::skip)]
 fn judge(md: &std::fs::Metadata, acl: bool, magic: Option<u32>) -> bool {
     others_can_write_as(
@@ -111,13 +51,7 @@ fn judge(md: &std::fs::Metadata, acl: bool, magic: Option<u32>) -> bool {
     )
 }
 
-/// Whether an account other than `me` can write a file or directory `owner` owns on group
-/// `gid` with `mode`, `widened` saying whether something past the mode may let other
-/// accounts write it (an extended access ACL, whose mask its group bits would be, or a
-/// remote filesystem): any other-write bit, or a group-write bit unless the file is `me`'s,
-/// is not widened, and `private` says `gid` is `me`'s private group. `private` is asked only
-/// for such a file of `me`'s that is group- and not world-writable. The pure rule;
-/// [`others_can_write`] reads the facts.
+/// Whether an account other than `me` can write a file or directory `owner` owns on group `gid` with `mode`, `widened` saying whether something past the mode may let other accounts write it (an extended access ACL, whose mask its group bits would be, or a remote filesystem): any other-write bit, or a group-write bit unless the file is `me`'s, is not widened, and `private` says `gid` is `me`'s private group.
 #[must_use]
 pub fn others_can_write_as(
     me: u32,
@@ -131,27 +65,17 @@ pub fn others_can_write_as(
 }
 
 /// The POSIX access ACL's attribute: ext4, XFS, Btrfs and tmpfs keep it, and NFSv3 reads it
-/// through its ACL side protocol.
 const POSIX_ACL: &CStr = c"system.posix_acl_access";
 
 /// The extended-ACL attributes Linux exposes: [`POSIX_ACL`], and the NFSv4 ACL an NFSv4 mount
-/// reads from its server.
 const ACL_ATTRIBUTES: [&CStr; 2] = [POSIX_ACL, c"system.nfs4_acl"];
 
 /// `<errno.h>`'s `ENODATA` on Linux (the asm-generic value aarch64, x86_64, arm and riscv
-/// share): the file has no such attribute.
 const ENODATA: i32 = 61;
 /// `<errno.h>`'s `ENOTSUP` (`EOPNOTSUPP`) on Linux, as [`ENODATA`]: the filesystem keeps no
-/// such attribute.
 const ENOTSUP: i32 = 95;
 
-/// Whether a file carries an extended access ACL, by what `answer` says the length query of
-/// each ACL attribute returned: `None` it exists, `Some(errno)` it failed. The kernel stores
-/// no POSIX attribute for an ACL the mode bits already say in full, so one that exists names
-/// some other user or group; an NFSv4 server that keeps ACLs answers one for every file, so
-/// nothing there is exempt. Only "no such attribute" (`ENODATA`) and "this filesystem keeps
-/// none" (`ENOTSUP`) answer no; any other failure answers yes, which grants no exemption.
-/// The pure rule, in Linux's errnos; the `acl` probe asks the file.
+/// Whether a file carries an extended access ACL, by what `answer` says the length query of each ACL attribute returned: `None` it exists, `Some(errno)` it failed.
 #[must_use]
 pub fn acl_carried(mut answer: impl FnMut(&CStr) -> Option<i32>) -> bool {
     ACL_ATTRIBUTES
@@ -159,44 +83,32 @@ pub fn acl_carried(mut answer: impl FnMut(&CStr) -> Option<i32>) -> bool {
         .any(|name| !matches!(answer(name), Some(ENODATA | ENOTSUP)))
 }
 
-/// The `statfs` `f_type` of each network and FUSE filesystem the rule knows: NFS, SMB/CIFS
-/// (both of its magics), Ceph, AFS (kAFS and OpenAFS), 9P, Lustre, GPFS and FUSE (`fuseblk`
-/// and virtiofs included), from `<linux/magic.h>` and Lustre's and GPFS's own.
+/// The `statfs` `f_type` of each network and FUSE filesystem the rule knows: NFS, SMB/CIFS (both of its magics), Ceph, AFS (kAFS and OpenAFS), 9P, Lustre, GPFS and FUSE (`fuseblk` and virtiofs included), from `<linux/magic.h>` and Lustre's and GPFS's own.
 pub const REMOTE_FILESYSTEMS: [u32; 10] = [
-    0x6969,      // NFS_SUPER_MAGIC
-    0xFF53_4D42, // CIFS_SUPER_MAGIC
-    0xFE53_4D42, // SMB2_SUPER_MAGIC
-    0x00C3_6400, // CEPH_SUPER_MAGIC
-    0x6B41_4653, // AFS_FS_MAGIC (kAFS)
-    0x5346_414F, // AFS_SUPER_MAGIC (OpenAFS)
-    0x0102_1997, // V9FS_MAGIC
-    0x0BD0_0BD0, // LL_SUPER_MAGIC (Lustre)
-    0x4750_4653, // GPFS
-    0x6573_5546, // FUSE_SUPER_MAGIC
+    0x6969,
+    0xFF53_4D42,
+    0xFE53_4D42,
+    0x00C3_6400,
+    0x6B41_4653,
+    0x5346_414F,
+    0x0102_1997,
+    0x0BD0_0BD0,
+    0x4750_4653,
+    0x6573_5546,
 ];
 
-/// Whether a filesystem of type `magic` (`statfs`'s `f_type`) is a network or FUSE one
-/// ([`REMOTE_FILESYSTEMS`]), where a server or daemon decides who can write. The pure rule;
-/// the `filesystem` probe reads the type.
+/// Whether a filesystem of type `magic` (`statfs`'s `f_type`) is a network or FUSE one ([`REMOTE_FILESYSTEMS`]), where a server or daemon decides who can write.
 #[must_use]
 pub fn remote_filesystem(magic: u32) -> bool {
     REMOTE_FILESYSTEMS.contains(&magic)
 }
 
 /// Whether the filesystem whose type `magic` read is remote, an unreadable type (`None`)
-/// counting as one.
 fn remote(magic: Option<u32>) -> bool {
     magic.is_none_or(remote_filesystem)
 }
 
-/// Whether group `gid` can hold no account but `uid`. `account` is `uid`'s passwd entry,
-/// `group` the group's, each `None` when the system does not know it; `primaries` the uids
-/// of every passwd entry whose primary group is `gid`.
-///
-/// It is the user-private-group convention, checked rather than assumed: the group is
-/// `uid`'s primary group, it bears `uid`'s name (pam_umask's own `usergroups` test), it
-/// lists no member but `uid`, and no other account has it as its primary group. Root has
-/// no private group. The pure rule; [`is_user_private_group`] reads the facts.
+/// Whether group `gid` can hold no account but `uid`.
 #[must_use]
 pub fn user_private_group(
     uid: u32,
@@ -215,11 +127,8 @@ pub fn user_private_group(
         && primaries.iter().all(|&other| other == uid)
 }
 
-/// [`user_private_group`] for this process's effective uid, over the system's account
-/// databases (NSS: `getpwuid_r`, `getgrgid_r`, then the passwd enumeration, `getpwent_r`).
-/// Off Linux the databases are not read, so no group is private (the module header says why).
+/// [`user_private_group`] for this process's effective uid, over the system's account databases (NSS: `getpwuid_r`, `getgrgid_r`, then the passwd enumeration, `getpwent_r`).
 #[must_use]
-// Skip: bottoms out at the `geteuid` and NSS FFI calls.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn is_user_private_group(gid: u32) -> bool {
     private_group_by(
@@ -232,8 +141,6 @@ pub fn is_user_private_group(gid: u32) -> bool {
 }
 
 /// [`user_private_group`] over what `account`, `group` and `primaries` read for `uid` and
-/// `gid`. `primaries`, the enumeration, is asked last, only for a group every other fact
-/// admits, and its `None` (an enumeration that failed) admits nothing.
 fn private_group_by(
     uid: u32,
     gid: u32,
@@ -316,8 +223,6 @@ mod nss {
         /// `<pwd.h>`: rewind the passwd enumeration.
         fn setpwent();
         /// `<pwd.h>`: the next passwd entry, into the caller's record and buffer: 0, `ENOENT`
-        /// at the end, `ERANGE` when the buffer cannot hold it (the next call answers the
-        /// same entry), or another error. The stream is process-global ([`ENUMERATION`]).
         fn getpwent_r(
             pwd: *mut PasswdRecord,
             buf: *mut c_char,
@@ -331,9 +236,7 @@ mod nss {
     /// The largest record buffer a lookup grows to before it gives no answer.
     const RECORD_LIMIT: usize = 1 << 20;
 
-    /// `uid`'s passwd name and primary group, or `None` when the system has no such
-    /// account.
-    // Skip: bottoms out at the `getpwuid_r` FFI call.
+    /// `uid`'s passwd name and primary group, or `None` when the system has no such account.
     #[cfg_attr(trust_verify, trust::skip)]
     pub(super) fn account(uid: u32) -> Option<Account> {
         let mut size = 4096usize;
@@ -341,9 +244,7 @@ mod nss {
             let mut buf = vec![0 as c_char; size];
             let mut record = PasswdRecord::empty();
             let mut found: *mut PasswdRecord = std::ptr::null_mut();
-            // SAFETY: `record` and `found` are live out-parameters; `buf` is a live
-            // allocation of exactly `size` bytes that outlives the call and every pointer
-            // written into `record`, which is read only on success, before `buf` is dropped.
+            // SAFETY: `record` and `found` are live out-parameters; `buf` is a live allocation of exactly `size` bytes that outlives the call and every pointer written into `record`, which is read only on success, before `buf` is dropped.
             let ret =
                 unsafe { getpwuid_r(uid, &raw mut record, buf.as_mut_ptr(), size, &raw mut found) };
             match ret {
@@ -365,7 +266,6 @@ mod nss {
     }
 
     /// Group `gid`'s name and members, or `None` when the system has no such group.
-    // Skip: bottoms out at the `getgrgid_r` FFI call.
     #[cfg_attr(trust_verify, trust::skip)]
     pub(super) fn group(gid: u32) -> Option<Group> {
         let mut size = 4096usize;
@@ -378,8 +278,7 @@ mod nss {
                 gr_mem: std::ptr::null_mut(),
             };
             let mut found: *mut GroupRecord = std::ptr::null_mut();
-            // SAFETY: as in [`account`]: live out-parameters, and a `size`-byte buffer that
-            // outlives every pointer read out of `record` below.
+            // SAFETY: as in [`account`]: live out-parameters, and a `size`-byte buffer that outlives every pointer read out of `record` below.
             let ret =
                 unsafe { getgrgid_r(gid, &raw mut record, buf.as_mut_ptr(), size, &raw mut found) };
             match ret {
@@ -390,8 +289,7 @@ mod nss {
                         .to_vec();
                     let mut members = Vec::new();
                     let mut at = record.gr_mem;
-                    // SAFETY: on success `gr_mem` is null or a null-terminated array, inside
-                    // `buf`, of NUL-terminated strings inside `buf`.
+                    // SAFETY: on success `gr_mem` is null or a null-terminated array, inside `buf`, of NUL-terminated strings inside `buf`.
                     unsafe {
                         while !at.is_null() && !(*at).is_null() {
                             members.push(CStr::from_ptr(*at).to_bytes().to_vec());
@@ -420,10 +318,7 @@ mod nss {
         Failed,
     }
 
-    /// The uids of every entry whose primary group is `gid`, over an enumeration that `next`
-    /// steps with a record buffer of the size it is handed, or `None` when the walk fails:
-    /// any answer but an entry or the end, or an entry no buffer up to [`RECORD_LIMIT`]
-    /// holds. The pure walk; [`primary_members`] steps `getpwent_r`.
+    /// The uids of every entry whose primary group is `gid`, over an enumeration that `next` steps with a record buffer of the size it is handed, or `None` when the walk fails: any answer but an entry or the end, or an entry no buffer up to [`RECORD_LIMIT`] holds.
     pub(super) fn walk(gid: u32, mut next: impl FnMut(usize) -> Step) -> Option<Vec<u32>> {
         let mut size = 4096usize;
         let mut uids = Vec::new();
@@ -442,28 +337,22 @@ mod nss {
     }
 
     /// The passwd enumeration's one owner in this process: `setpwent`, `getpwent_r` and
-    /// `endpwent` walk one process-global stream.
     static ENUMERATION: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    /// The uids of every passwd entry whose primary group is `gid`, or `None` when the
-    /// enumeration fails ([`walk`]).
-    // Skip: bottoms out at the passwd enumeration's FFI calls.
+    /// The uids of every passwd entry whose primary group is `gid`, or `None` when the enumeration fails ([`walk`]).
     #[cfg_attr(trust_verify, trust::skip)]
     pub(super) fn primary_members(gid: u32) -> Option<Vec<u32>> {
         let _walk = ENUMERATION
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut buf: Vec<c_char> = Vec::new();
-        // SAFETY: the enumeration is serialized by `ENUMERATION`, and the stream is closed
-        // below, before the lock is released.
+        // SAFETY: the enumeration is serialized by `ENUMERATION`, and the stream is closed below, before the lock is released.
         unsafe { setpwent() };
         let uids = walk(gid, |size| {
             buf.resize(size, 0);
             let mut record = PasswdRecord::empty();
             let mut found: *mut PasswdRecord = std::ptr::null_mut();
-            // SAFETY: `record` and `found` are live out-parameters and `buf` a live
-            // allocation of exactly `size` bytes; only the record's integers are read, on
-            // success, before the next call reuses `buf`.
+            // SAFETY: `record` and `found` are live out-parameters and `buf` a live allocation of exactly `size` bytes; only the record's integers are read, on success, before the next call reuses `buf`.
             let ret =
                 unsafe { getpwent_r(&raw mut record, buf.as_mut_ptr(), size, &raw mut found) };
             match ret {
@@ -483,7 +372,6 @@ mod nss {
 }
 
 /// Whether a file carries an extended access ACL ([`super::acl_carried`]), asked of the file
-/// itself: the length of each ACL attribute.
 #[cfg(target_os = "linux")]
 mod acl {
     use std::ffi::{c_char, c_int, c_void};
@@ -503,7 +391,6 @@ mod acl {
     }
 
     /// What one attribute-length call that returned `ret` answered: `None` it succeeded,
-    /// else its errno.
     fn answered(ret: isize) -> Option<i32> {
         if ret >= 0 {
             None
@@ -513,18 +400,15 @@ mod acl {
     }
 
     /// Whether the open `file` carries an extended access ACL.
-    // Skip: bottoms out at the `fgetxattr` FFI call.
     #[cfg_attr(trust_verify, trust::skip)]
     pub(super) fn on_file(file: &std::fs::File) -> bool {
         super::acl_carried(|name| {
-            // SAFETY: a live descriptor and a NUL-terminated name; a null value with a zero
-            // size asks only the attribute's length, so nothing is written.
+            // SAFETY: a live descriptor and a NUL-terminated name; a null value with a zero size asks only the attribute's length, so nothing is written.
             answered(unsafe { fgetxattr(file.as_raw_fd(), name.as_ptr(), std::ptr::null_mut(), 0) })
         })
     }
 
     /// Whether what `path` itself names carries an extended access ACL.
-    // Skip: bottoms out at the `lgetxattr` FFI call.
     #[cfg_attr(trust_verify, trust::skip)]
     pub(super) fn at_path(path: &std::path::Path) -> bool {
         let Ok(path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
@@ -536,9 +420,7 @@ mod acl {
         })
     }
 
-    /// [`super::grant_group_class_by_acl`]. It writes the kernel's `posix_acl_xattr` form:
-    /// a version-2 header, then the entries in tag order, each a little-endian tag,
-    /// permission and id.
+    /// [`super::grant_group_class_by_acl`].
     #[cfg(any(test, debug_assertions))]
     pub(super) fn grant_group_class(path: &std::path::Path, uid: u32) -> std::io::Result<()> {
         use std::os::unix::fs::MetadataExt as _;
@@ -554,25 +436,22 @@ mod acl {
         }
         const UNDEFINED: u32 = u32::MAX;
         let mode = std::fs::metadata(path)?.mode();
-        // `checked_shr`, not `>>`: the closure is judged on its own, where a shift of 32
-        // would overflow; every call here shifts by 6, 3 or 0.
         let class =
             |shift: u32| u16::try_from(mode.checked_shr(shift).unwrap_or(0) & 0o7).unwrap_or(0);
         let mut blob = 2u32.to_le_bytes().to_vec();
         for (tag, perm, id) in [
-            (0x01u16, class(6), UNDEFINED), // ACL_USER_OBJ
-            (0x02, class(3), uid),          // ACL_USER
-            (0x04, class(3), UNDEFINED),    // ACL_GROUP_OBJ
-            (0x10, class(3), UNDEFINED),    // ACL_MASK
-            (0x20, class(0), UNDEFINED),    // ACL_OTHER
+            (0x01u16, class(6), UNDEFINED),
+            (0x02, class(3), uid),
+            (0x04, class(3), UNDEFINED),
+            (0x10, class(3), UNDEFINED),
+            (0x20, class(0), UNDEFINED),
         ] {
             blob.extend_from_slice(&tag.to_le_bytes());
             blob.extend_from_slice(&perm.to_le_bytes());
             blob.extend_from_slice(&id.to_le_bytes());
         }
         let path = std::ffi::CString::new(path.as_os_str().as_bytes())?;
-        // SAFETY: a NUL-terminated path and name, and a value of exactly `blob.len()`
-        // bytes, all live across the call, which only reads them.
+        // SAFETY: a NUL-terminated path and name, and a value of exactly `blob.len()` bytes, all live across the call, which only reads them.
         let ret = unsafe {
             setxattr(
                 path.as_ptr(),
@@ -598,8 +477,6 @@ mod filesystem {
     use std::os::unix::ffi::OsStrExt as _;
 
     /// `<sys/vfs.h>`'s `struct statfs` as glibc lays it out on x86_64 and aarch64, aterm's
-    /// Linux targets: `f_type`, a 64-bit `long`, first, then room for the fields after it,
-    /// which nothing here reads.
     #[repr(C)]
     struct Statfs {
         f_type: i64,
@@ -616,7 +493,6 @@ mod filesystem {
         }
 
         /// `f_type` after a call that returned `ret`: its low 32 bits, every magic number's
-        /// width, or `None` when the call failed.
         fn magic(&self, ret: c_int) -> Option<u32> {
             if ret == 0 {
                 u32::try_from(self.f_type & 0xFFFF_FFFF).ok()
@@ -634,18 +510,15 @@ mod filesystem {
     }
 
     /// The type of the filesystem the open `file` is on, or `None` when it cannot be read.
-    // Skip: bottoms out at the `fstatfs` FFI call.
     #[cfg_attr(trust_verify, trust::skip)]
     pub(super) fn of_file(file: &std::fs::File) -> Option<u32> {
         let mut buf = Statfs::empty();
-        // SAFETY: a live descriptor, and a live buffer larger than glibc's `struct statfs`,
-        // which the call only writes.
+        // SAFETY: a live descriptor, and a live buffer larger than glibc's `struct statfs`, which the call only writes.
         let ret = unsafe { fstatfs(file.as_raw_fd(), &raw mut buf) };
         buf.magic(ret)
     }
 
     /// The type of the filesystem `path` is on, or `None` when it cannot be read.
-    // Skip: bottoms out at the `statfs` FFI call.
     #[cfg_attr(trust_verify, trust::skip)]
     pub(super) fn at_path(path: &std::path::Path) -> Option<u32> {
         let path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
@@ -675,7 +548,6 @@ mod nss {
 }
 
 /// Off Linux the ACL is not read; it answers "may carry one", which grants no exemption
-/// (and none is asked for, since no group is private there).
 #[cfg(not(target_os = "linux"))]
 mod acl {
     pub(super) fn on_file(_file: &std::fs::File) -> bool {
@@ -688,7 +560,6 @@ mod acl {
 }
 
 /// Off Linux the filesystem type is not read; it answers "unknown", which grants no
-/// exemption.
 #[cfg(not(target_os = "linux"))]
 mod filesystem {
     pub(super) fn of_file(_file: &std::fs::File) -> Option<u32> {
@@ -700,28 +571,22 @@ mod filesystem {
     }
 }
 
-/// Test seam (Linux): gives account `uid` the permissions of `path`'s group class through
-/// a POSIX access ACL whose mask is those same bits, so the mode reads as before, as
-/// `setfacl -m u:<uid>:<group bits>` would.
-///
+/// Test seam (Linux): gives account `uid` the permissions of `path`'s group class through a POSIX access ACL whose mask is those same bits, so the mode reads as before, as `setfacl -m u:<uid>:<group bits>` would.
 /// # Errors
-///
 /// The `stat` or the `setxattr` failed (`ENOTSUP` on a filesystem that keeps no ACLs).
 #[cfg(all(target_os = "linux", any(test, debug_assertions)))]
 pub fn grant_group_class_by_acl(path: &std::path::Path, uid: u32) -> std::io::Result<()> {
     acl::grant_group_class(path, uid)
 }
 
-/// Test seam (Linux): the type of the filesystem `path` is on, as the judge reads it, or
-/// `None` when it cannot be read.
+/// Test seam (Linux): the type of the filesystem `path` is on, as the judge reads it, or `None` when it cannot be read.
 #[cfg(all(target_os = "linux", any(test, debug_assertions)))]
 #[must_use]
 pub fn filesystem_type_at(path: &std::path::Path) -> Option<u32> {
     filesystem::at_path(path)
 }
 
-/// Test seam (Linux): the passwd enumeration [`is_user_private_group`] reads, the uids whose
-/// primary group is `gid`, or `None` when it fails.
+/// Test seam (Linux): the passwd enumeration [`is_user_private_group`] reads, the uids whose primary group is `gid`, or `None` when it fails.
 #[cfg(all(target_os = "linux", any(test, debug_assertions)))]
 #[must_use]
 pub fn primary_members(gid: u32) -> Option<Vec<u32>> {
@@ -747,7 +612,6 @@ mod tests {
     }
 
     /// Ubuntu's own shape is admitted; each fact that lets another account into the group
-    /// refuses it, as does a fact the system cannot answer.
     #[test]
     fn only_a_group_no_other_account_can_hold_is_private() {
         let me = account("ann", 1000);
@@ -815,9 +679,6 @@ mod tests {
     }
 
     /// The reader the system's answer goes through: the enumeration of the accounts whose
-    /// primary group it is decides (another account there, or an enumeration that failed,
-    /// refuses a group every other fact admits), and it is asked only once the account and
-    /// the group admit the group.
     #[test]
     fn the_other_accounts_primary_groups_are_read_last_and_decide() {
         let me = || Some(account("ann", 1000));
@@ -855,10 +716,6 @@ mod tests {
     }
 
     /// Group-write is this user's own write only on this user's file in their private
-    /// group, with nothing past the mode widening it; world-write, another owner's file, any
-    /// other group, or a widening (an ACL, whose mask the group bits then are, or a remote
-    /// filesystem) lets another account in, and a mode without write bits for others never
-    /// asks about the group.
     #[test]
     fn only_a_private_groups_write_is_the_owners_own() {
         let private = |gid: u32| gid == 1000;
@@ -921,8 +778,6 @@ mod tests {
     }
 
     /// An access ACL is either attribute's: a file on NFSv4 (no POSIX attribute, an NFSv4
-    /// one) carries one as a POSIX-ACL'd file does; only "no such attribute" and "none kept
-    /// here" from both answer none, and any other failure of either answers one.
     #[test]
     fn an_access_acl_is_either_attributes() {
         const EIO: i32 = 5;
@@ -956,7 +811,6 @@ mod tests {
     }
 
     /// Every remote type takes the exemption back, as does a type that cannot be read; local
-    /// ones (ext4, tmpfs, Btrfs, XFS, overlayfs, procfs) keep it.
     #[test]
     fn a_remote_or_unknown_filesystem_widens_the_mode() {
         assert!(remote(None), "an unreadable type");
@@ -976,9 +830,6 @@ mod tests {
     }
 
     /// A path is judged as it stands, a final link not followed: a link reads as its own
-    /// `0777` (every Linux link's; Darwin's is set so here), never as the `0644` file it names.
-    /// The install-path walk refuses a link itself, so this is what a component swapped for a
-    /// link between the walk's `lstat` and this judgment reads as.
     #[test]
     fn a_link_is_judged_as_it_stands_not_through() {
         use std::os::unix::fs::PermissionsExt as _;
@@ -1005,9 +856,6 @@ mod tests {
     }
 
     /// The walk over the accounts: it keeps the uids whose primary group is the one asked,
-    /// grows the record buffer on `ERANGE` (the same entry asked again) up to the limit and
-    /// no further, and a failure at any step, though every entry before it admits the group,
-    /// is no answer rather than a short list.
     #[cfg(target_os = "linux")]
     #[test]
     fn a_failure_mid_walk_is_no_answer() {
@@ -1044,7 +892,6 @@ mod tests {
     }
 
     /// The enumeration on this machine reads the real accounts: root has gid 0, and this
-    /// user has their own primary group.
     #[cfg(target_os = "linux")]
     #[test]
     fn the_enumeration_reads_this_machines_accounts() {
@@ -1057,7 +904,6 @@ mod tests {
     }
 
     /// The filesystem type is read where it is: `/proc` is procfs, through its path and
-    /// through a descriptor alike, and a path that does not exist has no type.
     #[cfg(target_os = "linux")]
     #[test]
     fn the_filesystem_type_is_read() {
@@ -1075,12 +921,6 @@ mod tests {
     }
 
     /// On this machine's own filesystem: a file and a directory on this process's primary
-    /// group are judged as the pure rule says for what the system answers (its private
-    /// group or not, on a local filesystem or not), and as it says for a stand-in NFS or
-    /// unreadable filesystem type in place of the real one; an access ACL that gives another
-    /// account the group class's bits, leaving the mode as it was, is seen through the
-    /// descriptor and through the path, and refuses the group-write the private group would
-    /// have admitted; and the mask without a write bit still admits.
     #[cfg(target_os = "linux")]
     #[test]
     fn an_access_acl_takes_back_the_private_groups_exemption() {

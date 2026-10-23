@@ -20,10 +20,18 @@
 //!   read, and bounds older resumed limits within the session window.
 //! - **Usage credits (`Credits`)**: verifies `Now using usage credits` is not
 //!   treated as a spend wall (`NoWallOnCredits`).
+//! - **Usage tap (`Tapped`, accounts v2 S10a)**: verifies a wall whose notice is
+//!   cut before its reset (`· rese…`) waits on the back-off until the tap reads
+//!   (`TapReads`), then to the tap's reset and its grace through the real
+//!   `TapClock` and `timed`, and that the window rolling over (`TapRollsOver`)
+//!   leaves that reset standing; with no tap source the loop types on the
+//!   back-off (`TapResetIgnored`). Which reading counts is bound by
+//!   `supervise/tap_clock_tests.rs` and `tap_clock_loop_tests.rs`.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::{Duration, Instant};
 
+use aterm_agent::harness::tap::Window;
 use aterm_agent::supervise::SupervisorConfig;
 use aterm_agent::supervise::limit::{ResetSpec, place_reset, within_a_session_window};
 use aterm_agent::supervise::phase::Phase;
@@ -31,6 +39,7 @@ use aterm_agent::supervise::policy::turn_end::{
     FIRED_EARLY, RULE_CONTINUE, RULE_LIMIT_RESUME, TurnEndAction, TurnEndReading, TurnEndState,
     TurnEndTiming, decide_turn_end,
 };
+use aterm_agent::supervise::tap_clock::{TapClock, TapWindow, UsageWindow, timed};
 use aterm_models_harness::supervisor_usage_wall_model;
 use aterm_phase::prompt::fixtures::screen;
 use aterm_spec::derive::Model;
@@ -43,8 +52,14 @@ type State = BTreeMap<&'static str, i64>;
 fn walled_model() -> Model {
     aterm_spec::interp::with_consts(
         &supervisor_usage_wall_model(),
-        &[("Hidden", 0), ("OwnAct", 0), ("Credits", 0)],
+        &[("Hidden", 0), ("OwnAct", 0), ("Credits", 0), ("Tapped", 0)],
     )
+}
+
+/// [`walled_model`] with the usage tap timing a wall whose notice is cut
+/// (`Tapped = 1`).
+fn tapped_model() -> Model {
+    aterm_spec::interp::with_consts(&walled_model(), &[("Tapped", 1)])
 }
 
 /// The model with usage credits carrying a turn (`Credits = 1`) beside the
@@ -58,6 +73,7 @@ fn credits_model() -> Model {
             ("Credits", 1),
             ("Leaves", 0),
             ("Unread", 0),
+            ("Tapped", 0),
         ],
     )
 }
@@ -178,12 +194,15 @@ fn timing(m: &Model) -> TurnEndTiming {
 }
 
 /// The screen a state stands for: the wall (`bg`: the shell the tab counted
-/// kept, else the done row and the footer without it), the wall whose notice
-/// left the screen ([`left`]), or a worker at work.
+/// kept, else the done row and the footer without it), the same wall with its
+/// notice cut (`cut`, [`cut_walled`]), the wall whose notice left the screen
+/// ([`left`]), or a worker at work.
 #[derive(Clone, Copy)]
 enum Screen {
     Walled,
     WalledShell,
+    CutWalled,
+    CutWalledShell,
     Resumed,
     ResumedContinued,
     Cancelled,
@@ -193,9 +212,11 @@ enum Screen {
 }
 
 impl Screen {
-    const ALL: [Self; 8] = [
+    const ALL: [Self; 10] = [
         Self::Walled,
         Self::WalledShell,
+        Self::CutWalled,
+        Self::CutWalledShell,
         Self::Resumed,
         Self::ResumedContinued,
         Self::Cancelled,
@@ -206,6 +227,8 @@ impl Screen {
 
     fn of(st: &State) -> Self {
         match st["wall"] {
+            1 if st["cut"] == 1 && st["bg"] == 1 => Self::CutWalledShell,
+            1 if st["cut"] == 1 => Self::CutWalled,
             1 if st["bg"] == 1 => Self::WalledShell,
             1 => Self::Walled,
             6 if st["other"] == 1 => Self::Resumed,
@@ -221,6 +244,8 @@ impl Screen {
         match self {
             Self::Walled => walled(false),
             Self::WalledShell => walled(true),
+            Self::CutWalled => cut_walled(false),
+            Self::CutWalledShell => cut_walled(true),
             Self::Resumed => resumed(),
             Self::ResumedContinued => resumed_continued(),
             Self::Cancelled => cancelled(),
@@ -329,6 +354,15 @@ fn resumed_continued() -> Vec<String> {
     ))
 }
 
+/// THE MEASURED WALL WITH ITS NOTICE CUT before its reset (`· rese…`, as a
+/// narrow pane cuts a row): the weekly wall, no reset read.
+fn cut_walled(shell: bool) -> Vec<String> {
+    walled(shell)
+        .into_iter()
+        .map(|r| r.replace(" · resets 4pm (America/Los_Angeles)", " · rese…"))
+        .collect()
+}
+
 /// The measured wall, with the shell the tab counted (`shell`) or without.
 fn walled(shell: bool) -> Vec<String> {
     let mut rows = screen(WALL);
@@ -384,7 +418,7 @@ fn with_rows_before_the_done_row(mut rows: Vec<String>, extra: &[&str]) -> Vec<S
 fn reading(
     st: &State,
     worked: Option<Duration>,
-    reset: Instant,
+    reset: Option<Instant>,
     run: Run,
     real: &TurnEndState,
 ) -> TurnEndReading {
@@ -423,7 +457,7 @@ fn reading(
         };
         read.wall = Some(w);
     }
-    let reset_at = read.wall.is_some().then_some(reset);
+    let reset_at = read.wall.as_ref().and(reset);
     let mut t = turn_end_reading(Screen::of(st), &read, worked, reset_at);
     t.restartable = true;
     if run.masked && st["bg"] == 1 && st["wall"] == 1 {
@@ -478,15 +512,24 @@ struct Run {
     blind_to_left: bool,
     blind_to_a_persons_left: bool,
     uncapped: bool,
+    /// The loop with no usage tap source: no reading reaches the clock.
+    no_tap: bool,
 }
 
 #[derive(Clone)]
 struct Real {
     st: TurnEndState,
     now: Instant,
+    /// [`Self::now`] as unix seconds: the tap's and its clock's time.
+    unix: i64,
     appeared: Instant,
-    /// The wall's reset as the loop placed it.
-    reset: Instant,
+    /// The wall's reset as the loop placed it (`None`: none known, a cut
+    /// notice the tap has not timed).
+    reset: Option<Instant>,
+    /// The usage tap's clock at a cut wall, kept from its first read.
+    tap: Option<TapClock>,
+    /// When the cut wall appeared (unix seconds).
+    cut_at: i64,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -509,6 +552,11 @@ fn expected(m: &Model, st: &State) -> Verdict {
     }
     if st["held"] == 1 {
         return Verdict::Take;
+    }
+    // A cut wall the tap has not read yet: the back-off from the wall, which
+    // the tap's reading decides again before a tick (the loop's edge).
+    if st["cut"] == 1 && st["tap"] == 0 {
+        return Verdict::Wait(minutes(m, "Rung2"));
     }
     if m.action_enabled("Act", st) {
         return Verdict::Act;
@@ -576,7 +624,7 @@ fn mirror(
         // once: no turn ran, no busy read.
         "WallAppears" | "WallAppearsLate" | "WallMisplaced" => {
             real.appeared = now;
-            real.reset = on_the_print(now);
+            real.reset = Some(on_the_print(now));
             let worked = (before["held"] == 0).then_some(LONG);
             let r = reading(after, worked, real.reset, run, &real.st);
             real.st.observe(&r, now);
@@ -586,7 +634,7 @@ fn mirror(
         // no turn's work.
         "WallAppearsLeft" => {
             real.appeared = now;
-            real.reset = on_the_print(now);
+            real.reset = Some(on_the_print(now));
             let r = reading(after, None, real.reset, run, &real.st);
             real.st.observe(&r, now);
         }
@@ -602,7 +650,7 @@ fn mirror(
             end.said_tail = Some("Stage done.".to_string());
             real.st.observe(&end, now);
             real.appeared = now;
-            real.reset = on_the_print(now);
+            real.reset = Some(on_the_print(now));
             let r = reading(after, None, real.reset, run, &real.st);
             real.st.observe(&r, now);
         }
@@ -613,11 +661,11 @@ fn mirror(
             real.appeared = now;
             let placed = older_left_placed(run.uncapped);
             let off = Duration::from_secs(placed.unsigned_abs());
-            real.reset = if placed >= 0 {
+            real.reset = Some(if placed >= 0 {
                 now + off
             } else {
                 now.checked_sub(off).expect("an instant half an hour back")
-            };
+            });
             let r = reading(after, None, real.reset, run, &real.st);
             real.st.observe(&r, now);
         }
@@ -635,9 +683,10 @@ fn mirror(
         // placement, in the past.
         "WallFoundSitting" => {
             real.appeared = now;
-            real.reset = now
-                .checked_sub(misplaced_before_the_print())
-                .expect("an instant 11 h back");
+            real.reset = Some(
+                now.checked_sub(misplaced_before_the_print())
+                    .expect("an instant 11 h back"),
+            );
             let r = reading(after, None, real.reset, run, &real.st);
             real.st.observe(&r, now);
         }
@@ -653,6 +702,7 @@ fn mirror(
                 real.st.took();
             }
             real.now += MIN;
+            real.unix += 60;
             if before["held"] == 1 {
                 let r = reading(after, None, real.reset, run, &real.st);
                 real.st.observe(&r, real.now);
@@ -677,7 +727,7 @@ fn mirror(
             let worked = (!run.unseen || before["held"] == 1).then_some(SHORT);
             let answered = !run.blind_to_untaken && real.st.untaken_act().is_some();
             if worked.is_some() || answered {
-                real.reset = on_the_print(real.appeared);
+                real.reset = Some(on_the_print(real.appeared));
             }
             let r = reading(after, worked, real.reset, run, &real.st);
             real.st.observe(&r, now);
@@ -691,7 +741,7 @@ fn mirror(
         "MetInWindow" | "MetLeftUnread" => {
             let answered = !run.blind_to_untaken && real.st.untaken_act().is_some();
             if answered {
-                real.reset = on_the_print(real.appeared);
+                real.reset = Some(on_the_print(real.appeared));
             }
             let r = reading(after, None, real.reset, run, &real.st);
             real.st.observe(&r, now);
@@ -703,6 +753,58 @@ fn mirror(
             t.phase = Phase::Idle;
             t.said_tail = Some("Stage done.".to_string());
             real.st.observe(&t, now);
+            real.tap = None;
+        }
+        // A wall whose notice is cut, a turn having run into it: read with no
+        // reset, its tap clock started at this first read.
+        "WallAppearsCut" => {
+            real.appeared = now;
+            real.cut_at = real.unix;
+            real.tap = Some(TapClock::new(real.unix));
+            real.reset = None;
+            let r = reading(after, Some(LONG), None, run, &real.st);
+            real.st.observe(&r, now);
+        }
+        // The tap's run after the wall was read: the wall's window full, its
+        // reset `CutAt` ticks after the wall. Then its run at the reset: the
+        // window dropped. Each folded into the clock as the loop folds it, and
+        // the point read again with what `timed` makes of it.
+        "TapReads" | "TapRollsOver" => {
+            let r = reading(after, None, None, run, &real.st);
+            let kind = r.wall.expect("the cut wall");
+            let windows = UsageWindow::of_wall(kind, &r.wall_message);
+            assert_eq!(windows, [UsageWindow::SevenDay], "{r:#?}");
+            let reset = real.cut_at + 60 * cnst(m, "CutAt");
+            let answer = match action {
+                "TapReads" => Some(TapWindow {
+                    figure: Some(Window {
+                        pct: 100,
+                        resets_at: reset,
+                        pct_x10: Some(1000),
+                    }),
+                    read_at: real.unix,
+                }),
+                _ => Some(TapWindow {
+                    figure: None,
+                    read_at: real.unix,
+                }),
+            };
+            let clock = real.tap.as_mut().expect("the wall's clock");
+            if !run.no_tap {
+                let readings: Vec<_> = windows.iter().map(|w| (*w, answer)).collect();
+                clock.step(&readings, real.unix);
+            }
+            let unix0 = real.unix;
+            real.reset = timed(None, clock.says(windows)).at.map(|at| {
+                let off = Duration::from_secs(at.abs_diff(unix0));
+                if at >= unix0 {
+                    now + off
+                } else {
+                    now.checked_sub(off).expect("an instant minutes back")
+                }
+            });
+            let r = reading(after, None, real.reset, run, &real.st);
+            real.st.observe(&r, now);
         }
         // The notice leaves the screen: the left screen is a point, no work
         // since. Another conversation resumed there: its history is the
@@ -742,7 +844,8 @@ fn mirror(
         | "UnreadLeftDropped"
         | "UnreadAnswerReadAsTaken"
         | "OlderLeftPlacedTomorrow"
-        | "CreditsReadAsWall" => return false,
+        | "CreditsReadAsWall"
+        | "TapResetIgnored" => return false,
         other => panic!("an action this bind does not mirror: {other}"),
     }
     true
@@ -752,7 +855,9 @@ fn mirror(
 /// notice named exactly while the model's wall stands — shown, acted on, or
 /// left (`wall != 0`).
 fn waits_as_modelled(real: &Real, st: &State) -> bool {
-    real.st.waits_on_named_reset() == (st["wall"] != 0)
+    // A cut wall names its reset once the tap read it.
+    let named = st["wall"] != 0 && (st["cut"] == 0 || st["tap"] >= 1);
+    real.st.waits_on_named_reset() == named
 }
 
 /// What a walk saw: every state, the states the real side disagreed at (its
@@ -782,8 +887,11 @@ fn walk_until(m: &Model, strict: bool, run: Run, first_off: bool) -> Walked {
     let init = Real {
         st: TurnEndState::new(timing(m)),
         now: base,
+        unix: PRINT,
         appeared: base,
-        reset: base,
+        reset: Some(base),
+        tap: None,
+        cut_at: 0,
     };
     let mut seen: BTreeSet<State> = BTreeSet::new();
     let mut queue = VecDeque::from([(m.init_state(), init)]);
@@ -826,7 +934,9 @@ fn walk_until(m: &Model, strict: bool, run: Run, first_off: bool) -> Walked {
             let mut r = real.clone();
             if mirror(m, action.name, &st, &next, &mut r, &cfg, run) {
                 *fired.entry(action.name).or_default() += 1;
-                if r.reset.saturating_duration_since(r.now) > FIRED_EARLY {
+                if r.reset
+                    .is_some_and(|reset| reset.saturating_duration_since(r.now) > FIRED_EARLY)
+                {
                     *early.entry(action.name).or_default() += 1;
                 }
                 // Checked at the transition, not at the state: the walk
@@ -1118,4 +1228,76 @@ fn tier1_usage_credits_are_no_wall_where_the_model_says() {
         assert!(buggy.fire(a, &mut st), "{a} at {st:?}");
     }
     assert!(!buggy.check_invariant("NoWallOnCredits", &st), "{st:?}");
+}
+
+/// THE USAGE TAP TIMES A CUT WALL, WALKED (accounts v2 S10a): every reachable
+/// state of the model with the tap timing a wall whose notice is cut agrees
+/// with the real reader, the real tap clock and the real decider — the
+/// back-off until the tap reads, then the tap's reset and its grace, through
+/// the window's rollover at that reset.
+#[test]
+fn tier1_the_tap_times_a_cut_wall_exactly_where_the_model_acts() {
+    let m = tapped_model();
+    let walked = walk(&m, true, Run::default());
+    let states = &walked.states;
+    let cut = states.iter().filter(|st| st["cut"] == 1).count();
+    let read = states
+        .iter()
+        .filter(|st| st["cut"] == 1 && st["tap"] == 1)
+        .count();
+    let rolled = states.iter().filter(|st| st["tap"] == 2).count();
+    assert!(cut > 10 && read > 5 && rolled > 2, "{cut} {read} {rolled}");
+    for a in ["WallAppearsCut", "TapReads", "TapRollsOver", "Act", "Taken"] {
+        assert!(walked.fired.contains_key(a), "{a}: {:?}", walked.fired);
+    }
+}
+
+/// THE LOOP WITHOUT THE TAP SOURCE is not the model: at a wall whose notice is
+/// cut it waits on the policy's back-off and types there — before the reset
+/// the tap read — the model's `TapResetIgnored`, caught by `NoBlindAct`.
+/// Walked so, the real side disagrees at cut walls alone, among them the
+/// back-off's tick with the tap's reset read; the model with the tap
+/// switched off (`Tapped = 0`, no cut wall) agrees with the same loop
+/// everywhere — the control is the tap's alone.
+#[test]
+fn the_loop_without_the_tap_types_into_a_cut_wall_on_its_back_off() {
+    let m = tapped_model();
+    let run = Run {
+        no_tap: true,
+        ..Run::default()
+    };
+    let walked = walk(&m, false, run);
+    assert!(
+        !walked.off.is_empty(),
+        "the untapped loop agreed everywhere"
+    );
+    assert!(
+        walked.off.iter().all(|st| st["cut"] == 1 && st["tap"] >= 1),
+        "{:?}",
+        walked.off
+    );
+    let rung = cnst(&m, "Rung2");
+    assert!(
+        walked
+            .off
+            .iter()
+            .any(|st| st["clock"] == rung && st["clock"] < cnst(&m, "CutAt")),
+        "the back-off's act, before the reset: {:?}",
+        walked.off
+    );
+    let off = walk(&walled_model(), false, run).off;
+    assert!(off.is_empty(), "{off:?}");
+    // ... and the model's defect is that loop.
+    let buggy = aterm_spec::interp::with_buggy(&m, 1);
+    let mut st = buggy.init_state();
+    for a in [
+        "WallAppearsCut",
+        "TapReads",
+        "Tick",
+        "Tick",
+        "TapResetIgnored",
+    ] {
+        assert!(buggy.fire(a, &mut st), "{a} at {st:?}");
+    }
+    assert!(!buggy.check_invariant("NoBlindAct", &st), "{st:?}");
 }

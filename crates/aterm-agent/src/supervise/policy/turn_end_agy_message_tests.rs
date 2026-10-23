@@ -1,22 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-// WHAT AGY READS BACK OF A MESSAGE aterm types into it. agy draws a
-// message's blank line as a blank row with the rows under it two columns
-// in, as its reply's (MEASURED in the lab, 2026-10-21:
-// `aterm_phase::agy::fixtures::lab::WORKER_FIRST_PROMPT`), and its reader
-// takes the reply from the gap under the message's first row
-// (`aterm_phase::agy::said_tail`): whatever of a message follows a blank
-// line of it reads as agy's reply — its `Nothing left:` a defense, its
-// `NEEDS YOU:` a need. So does every row of a message whose first row is
-// above the rows read: a reply cut at the rows' top. These tests DRAW each
-// text the harness types the way agy draws a message ([`agy_turn`], a model:
-// held row for row to the measured screens it is built from, by
-// [`agys_drawing_is_held_to_its_measured_screens`]) and read it back
-// through agy's reader and the harness's own judges ([`needs::needs_you`],
-// [`needs::defense_line`], [`clean_defense`]). What the model draws beyond
-// those captures (other widths, a message's single line break) is the
-// model's, and is called drawn here, never measured.
 use aterm_phase::agy::fixtures::lab::{REPLY_WRAPPED_50, WORKER_FIRST_PROMPT};
 use aterm_phase::prompt::fixtures::screen;
 
@@ -27,7 +11,6 @@ const PROGRESS: &str = "Implemented the parser module and its unit tests in this
 const DEFENSE: &str = "Nothing left: the parser is committed and pushed to origin/main.";
 
 /// `line`'s words greedily on rows of at most `width` columns (a word wider
-/// than the row on rows of its own, cut at the edge).
 fn wrapped(line: &str, width: usize) -> Vec<String> {
     let mut rows = Vec::new();
     let mut row = String::new();
@@ -53,12 +36,6 @@ fn wrapped(line: &str, width: usize) -> Vec<String> {
 }
 
 /// One turn under its rule as agy 1.4.0 draws one at `cols` columns (held to
-/// the measured screens by [`agys_drawing_is_held_to_its_measured_screens`]):
-/// the message's rows — `> ` before its first, two columns in after, wrapped
-/// at `cols - 1`; a line of it starts a row of its own and a blank line of it
-/// is a blank row — then a blank row, the reply's paragraphs two columns in,
-/// wrapped two cells short of the edge, a blank row between them, and a blank
-/// row.
 fn agy_turn(cols: usize, message: &str, reply: &str) -> Vec<String> {
     let mut rows = Vec::new();
     for line in message.lines() {
@@ -87,7 +64,6 @@ fn agy_turn(cols: usize, message: &str, reply: &str) -> Vec<String> {
 }
 
 /// A measured screen's frame: its rows down to its first turn's rule, the
-/// turn rule, and its composer from the rule over the caret down.
 fn frame(text: &str) -> (Vec<String>, String, Vec<String>) {
     let rows = screen(text);
     let rule = rows
@@ -103,11 +79,6 @@ fn frame(text: &str) -> (Vec<String>, String, Vec<String>) {
 }
 
 /// agy's screen at `cols` after one turn: `message`, then `reply`, idle
-/// again — at 144 (the L15 worker's pane) and 50 (the narrow lab pane) in
-/// the measured screens' own frames, at any other width in the 144 one's
-/// with its rules drawn to that width (the turn's separator 60 columns or
-/// three short of the edge, as at 50; the composer's full width) and its
-/// footer's left side alone.
 fn agy_screen(cols: usize, message: &str, reply: &str) -> Vec<String> {
     let (head, rule, tail) = match cols {
         50 => frame(REPLY_WRAPPED_50),
@@ -137,7 +108,6 @@ fn agy_screen(cols: usize, message: &str, reply: &str) -> Vec<String> {
 }
 
 /// `text`'s words, one space between: a reply as wrapped rows join it, or
-/// read with no width.
 fn words(text: Option<&str>) -> Option<String> {
     text.map(|t| t.split_whitespace().collect::<Vec<_>>().join(" "))
 }
@@ -150,16 +120,6 @@ fn agy_reading(rows: &[String]) -> TurnEndReading {
 }
 
 /// THE DRAWING IS HELD TO AGY'S OWN: [`agy_turn`] redraws, row for row, both
-/// measured screens it is built from — the L15 worker's two turns at 144
-/// columns (a message whose blank line agy drew as a blank row, its later
-/// rows two columns in; then the Land act and its ack over five rows, and the
-/// landing) and the lab's 50-column reply of two paragraphs. Those pin the
-/// message's wrap at 144 columns, a blank line's row, and the reply's wrap at
-/// 50; the message's wrap at other widths and a single line break of it
-/// (`l15a2` saw one drawn as one message, no blank row, its rows unrecorded)
-/// are the model's. CONTROL, on the capture rather than the model: the
-/// measured screen's own rows hold the blank row and the fact two columns in
-/// under it.
 #[test]
 fn agys_drawing_is_held_to_its_measured_screens() {
     let rows = screen(WORKER_FIRST_PROMPT);
@@ -169,7 +129,6 @@ fn agys_drawing_is_held_to_its_measured_screens() {
         .position(|r| r.starts_with("> FOREVERLAB-WORKER"))
         .expect("the first prompt");
     let task = rows[user].trim_start_matches("> ").to_string();
-    // The spawn's fact line, as its rows hold it.
     let fact = rows[user + 2..user + 5]
         .iter()
         .map(|r| r.trim())
@@ -187,10 +146,6 @@ fn agys_drawing_is_held_to_its_measured_screens() {
         drawn
     };
     assert_eq!(drawn(&first), rows);
-    // CONTROL, ON THE CAPTURE ITSELF: the message's blank line is a blank row
-    // there, the fact's rows under it two columns in as the reply's are, and
-    // agy's reader reads them as its reply — what the model's blank-line
-    // branch draws is agy's own screen, not the model's choice.
     assert!(rows[user + 1].is_empty(), "{:?}", rows[user + 1]);
     assert!(
         rows[user + 2..user + 5]
@@ -211,25 +166,14 @@ const RULES: &str = "Run the full suite before you push.\n\nNever force-push; a 
                      is for credentials only.\n";
 
 /// A rules file of two paragraphs that never says the token: an owner's
-/// rules that do are the owner's words, which agy's reader reads as a
-/// reply's where a cut opens on them
-/// ([`an_acts_rows_cut_at_the_rows_top_name_no_need_and_land_nothing`]), and
-/// the policy drops as the act's own rows
-/// ([`a_cut_opening_on_the_acts_own_rows_names_no_need`]).
 const PLAIN_RULES: &str = "Run the full suite before you push.\n\nNever force-push.\n";
 
 /// The standing rules `text` as the loop types them: read by the loop's own
-/// reader of the rules file (`turn_end_loop::standing_rules_in`, which makes
-/// it one line).
 fn rules_line(text: &str) -> String {
     crate::supervise::run::standing_rules_in(text).expect("rules")
 }
 
 /// EVERY TEXT THE HARNESS TYPES INTO AN AGENT AS ITS MESSAGE, by name: Land's
-/// three acts and the nudge with each suffix it takes, Cruise's continuation,
-/// done check and answers (the owner's default words), the wall acts agy's
-/// screens raise, the login back, and the relaunch lanes' resumed prompts —
-/// each without and with the standing rules.
 fn every_act() -> Vec<(String, String)> {
     every_act_with(RULES)
 }
@@ -332,25 +276,11 @@ fn every_act_with(rules_text: &str) -> Vec<(String, String)> {
 }
 
 /// The text the act executor types for `text` (`turn_end_loop::one_turn`:
-/// one line, whatever line breaks the owner's words hold).
 fn typed(text: &str) -> String {
     crate::supervise::run::one_turn(text)
 }
 
 /// NO ACT THE HARNESS COMPOSES READS BACK AS AGY'S REPLY UNDER ITS WHOLE
-/// MESSAGE. Every text of [`every_act`] is one line as composed (its parts
-/// joined by spaces, the standing rules made one by the loop's own reader of
-/// them), so agy draws it as one message: under it, drawn at every width of
-/// [`WIDTHS`], agy's reader reads the reply alone, the harness raises no need
-/// from it and takes no landing from a plain report — though the Land act
-/// itself says `NEEDS YOU:` and `Nothing left:` mid-line — and the turn reads
-/// as opened by the act's own words (what Land's landing is held to). This
-/// guards the composers (a rules reader that kept the file's blank line
-/// breaks the `+rules` acts here); the executor's fold of an owner's text is
-/// `a_message_with_a_blank_line_…` and the loop's
-/// `an_owners_act_in_two_paragraphs_is_typed_as_one_line`. NEGATIVE CONTROL:
-/// the same acts over a clean defense are a landing, so the act's words
-/// spoil no real one.
 #[test]
 fn no_act_the_harness_types_reads_back_as_agys_reply() {
     let acts = every_act();
@@ -379,7 +309,6 @@ fn no_act_the_harness_types_reads_back_as_agys_reply() {
                 Some(crate::supervise::approvals::words_lead(&act)),
                 "{name} at {cols}"
             );
-            // CONTROL: a real landing under the act lands.
             let landed = agy_reading(&agy_screen(cols, &act, DEFENSE));
             assert_eq!(
                 words(landed.said_tail.as_deref()).as_deref(),
@@ -395,13 +324,6 @@ fn no_act_the_harness_types_reads_back_as_agys_reply() {
 }
 
 /// NO ACT'S OWN WORDS NAME A NEED, A DEFENSE OR A DONE, read whole and at
-/// every row agy may wrap them at — what any reader that cannot bound the
-/// message (agy's, a reply cut above the rows read) reads back of them. The
-/// review of b9/spawn-residuals (F1) found Land's act and its nudge read as
-/// the need `and land the rest. Once it is all on remote main, …`: the
-/// instruction `on a line starting NEEDS YOU:` was read as a head said
-/// (`needs::names_a_head` now names it, on its row or wrapped onto the next).
-/// NEGATIVE CONTROL: the same act with a real need after it names that need.
 #[test]
 fn no_acts_own_words_name_a_need_a_defense_or_a_done() {
     for (name, act) in every_act() {
@@ -418,7 +340,6 @@ fn no_acts_own_words_name_a_need_a_defense_or_a_done() {
             );
             assert!(!clean_defense(Some(&rows)), "{name} at {width}: {rows}");
         }
-        // CONTROL: a need said after the act's words is read.
         assert_eq!(
             needs::needs_you(&format!("{act}\nNEEDS YOU: the signing key")),
             ["the signing key"],
@@ -428,20 +349,6 @@ fn no_acts_own_words_name_a_need_a_defense_or_a_done() {
 }
 
 /// THE ROWS OF AN ACT CUT AT THE ROWS' TOP name no need, and the reply they
-/// read with lands nothing. agy's reader takes every row two columns in under
-/// the last rule it sees as the reply, and an act whose `> [aterm harness]`
-/// row is above the rows read (a loop's first point after an update, a
-/// relaunch, Off to Land; a tall reply) reads its later rows as agy's: so
-/// drawn at every width of [`WIDTHS`], under a plain report and a long one,
-/// with 1 up to all but one of its rows above the rows read, each reading is
-/// CUT ([`TurnEndReading::said_cut`]: nothing lands on it), or reads no
-/// words at all, and neither its
-/// last words nor its turn's other words name a need (the standing rules
-/// ones that never say the token, [`PLAIN_RULES`]). At the policy, the
-/// first point over such a reading puts up no need, owes no ack and lands
-/// nothing, the review's very screen (Land's act at 50 columns, its first 3
-/// rows gone, worked unknown). NEGATIVE CONTROL: the same screens uncut read
-/// the reply alone, whole.
 #[test]
 fn an_acts_rows_cut_at_the_rows_top_name_no_need_and_land_nothing() {
     let long = (0..24)
@@ -467,8 +374,6 @@ fn an_acts_rows_cut_at_the_rows_top_name_no_need_and_land_nothing() {
                     let cut = whole[at + drop..].to_vec();
                     let r = agy_reading(&cut);
                     let at_cut = format!("{name} at {cols}, {drop} rows above");
-                    // Cut, or no words at all (a row naming `Antigravity
-                    // CLI` reads as agy's banner, before any message).
                     assert!(r.said_cut || r.said_tail.is_none(), "{at_cut}: {cut:#?}");
                     let tail = r.said_tail.as_deref().unwrap_or("");
                     assert!(needs::needs_you(tail).is_empty(), "{at_cut}: {tail}");
@@ -483,7 +388,6 @@ fn an_acts_rows_cut_at_the_rows_top_name_no_need_and_land_nothing() {
             }
         }
     }
-    // The policy at a loop's first point, the review's screen.
     let land = typed(&land_text(None));
     let whole = agy_screen(50, &land, PROGRESS);
     let at = whole
@@ -506,32 +410,13 @@ fn an_acts_rows_cut_at_the_rows_top_name_no_need_and_land_nothing() {
 }
 
 /// An owner's rules that hold the NEEDS YOU token as a need is said: the
-/// owner's own words, which ride every act this policy types
-/// (`with_rules`), and name a need wherever they are read
-/// ([`a_cut_opening_on_the_acts_own_rows_names_no_need`]).
 const OWNER_NEED_RULES: &str =
     "Run the full suite before you push.\n\nNEEDS YOU: the release key, which only I hold.\n";
 
 /// The need [`OWNER_NEED_RULES`] names in an act's words read whole (the
-/// standing rules close a parenthesis there).
 const OWNER_NEED: &str = "the release key, which only I hold.)";
 
 /// A CUT OPENING ON THE ACT'S OWN ROWS NAMES NO NEED, whatever the owner's
-/// rules riding it say. agy's reader reads the later rows of a message whose
-/// first row is above the rows read as agy's reply (and a turn of several
-/// replies reads them as its earlier words), and the loop reads such a turn
-/// whole only at its first point and after a turn it saw run: at a point
-/// after a quick answer, or where the history could not be read, the
-/// owner's `NEEDS YOU:` in the act's rows stood as a need nobody said. The
-/// policy drops the rows of words read from the rows' top
-/// ([`TurnEndReading::opens_cut`]) that are, by their letters, the end of the
-/// act it typed last (`without_act_rows`). Drawn at every width of
-/// [`WIDTHS`], under a plain report and a long one, at every cut of the act's
-/// rows that reads the owner's need, the act typed and the point judged with
-/// the turn seen to run and not: no need stands. NEGATIVE CONTROLS: the same
-/// screen after another act (the continuation without the rules) raises the
-/// owner's need, which is what the drop takes away; and a need agy says in
-/// its reply under the act's rows stands alone.
 #[test]
 fn a_cut_opening_on_the_acts_own_rows_names_no_need() {
     let long = (0..24)
@@ -540,8 +425,6 @@ fn a_cut_opening_on_the_acts_own_rows_names_no_need() {
         .join(" ");
     let take = TurnEndTiming::default().take_within;
     let other = continuation_text(&cfg(), None);
-    // The needs standing after `act` was typed and the point `r` judged, the
-    // turn seen to run (`worked`) or not.
     let needs_after = |act: &str, r: &TurnEndReading, worked: Option<Duration>| {
         let mut st = TurnEndState::default();
         let t = t0();
@@ -582,7 +465,6 @@ fn a_cut_opening_on_the_acts_own_rows_names_no_need() {
                     .expect("the act's end");
                 for drop in 1..end - at {
                     let r = agy_reading(&whole[at + drop..]);
-                    // The words the policy folds needs from, as it joins them.
                     let tail = r.said_tail.as_deref().unwrap_or("");
                     let read = r
                         .turn_said
@@ -602,8 +484,6 @@ fn a_cut_opening_on_the_acts_own_rows_names_no_need() {
                             Vec::<String>::new(),
                             "{at_cut}, worked {worked:?}"
                         );
-                        // CONTROL: after another act, the owner's words stand
-                        // (as much of them as their rows hold).
                         assert_eq!(
                             needs_after(&other, &r, worked),
                             named,
@@ -613,8 +493,6 @@ fn a_cut_opening_on_the_acts_own_rows_names_no_need() {
                 }
             }
         }
-        // CONTROL: agy's own need in its reply under the act's rows stands,
-        // alone.
         let said = format!("{PROGRESS}\n\nNEEDS YOU: the signing key");
         let whole = agy_screen(80, &typed(&act), &said);
         let at = whole
@@ -635,8 +513,6 @@ fn a_cut_opening_on_the_acts_own_rows_names_no_need() {
         cuts > 100 && owners > 100,
         "{cuts} cuts, {owners} the owner's need"
     );
-    // CONTROL: words read whole drop nothing — agy saying the owner's very
-    // need line under the whole act is its own need (FAIL TOWARD A KEPT NEED).
     let act = continuation_text(&cfg(), Some(&rules_line(OWNER_NEED_RULES)));
     let r = agy_reading(&agy_screen(
         80,
@@ -654,16 +530,6 @@ fn a_cut_opening_on_the_acts_own_rows_names_no_need() {
 }
 
 /// A READER THAT BOUNDS ITS MESSAGES DROPS NOTHING FROM A CUT (the review of
-/// 3a4586a01e, T3): Claude Code's and Gemini CLI's words begin at the
-/// worker's own mark under the message (`⏺`, `✦`), never on the message's
-/// rows, so a cut there opens on the worker's words alone, and a first line
-/// of its own that repeats the owner's rule riding the act — `NEEDS YOU: the
-/// release key, which only I hold.`, by its letters the end of the act's
-/// words — is its own need: the reading opens no cut
-/// ([`TurnEndReading::opens_cut`]), and the need stands after the act, the
-/// turn seen to run or not, its message's row above the rows read. NEGATIVE
-/// CONTROL: the same words read on agy, which bounds no message, open on
-/// the act's rows (`a_cut_opening_on_the_acts_own_rows_names_no_need`).
 #[test]
 fn a_reader_that_bounds_its_messages_drops_nothing_from_a_cut() {
     let act = continuation_text(&cfg(), Some(&rules_line(OWNER_NEED_RULES)));
@@ -692,8 +558,6 @@ fn a_reader_that_bounds_its_messages_drops_nothing_from_a_cut() {
         }
         st.standing_needs().to_vec()
     };
-    // Gemini CLI's measured end of a turn, its message's band off the rows
-    // read and its reply the worker's own need line.
     let gemini: Vec<String> = screen(aterm_phase::gemini::fixtures::END_OF_TURN)
         .into_iter()
         .skip_while(|r| !r.starts_with('✦'))
@@ -705,7 +569,6 @@ fn a_reader_that_bounds_its_messages_drops_nothing_from_a_cut() {
             }
         })
         .collect();
-    // Claude Code's measured idle line, its `❯` row off the rows read.
     let claude: Vec<String> = {
         let rows = screen(include_str!(
             "../../../../aterm-phase/src/fixtures/claude-2.1.303-fast-answers-same-idle-line-measured.txt"
@@ -744,8 +607,6 @@ fn a_reader_that_bounds_its_messages_drops_nothing_from_a_cut() {
             );
         }
     }
-    // NEGATIVE CONTROL: the letters are the act's end, as the drop reads
-    // them, so only the reader's gate keeps the need.
     let letters = |t: &str| {
         t.chars()
             .filter(|c| c.is_alphanumeric())
@@ -755,28 +616,9 @@ fn a_reader_that_bounds_its_messages_drops_nothing_from_a_cut() {
 }
 
 /// The widths every act is drawn at: the narrow lab pane (50), the L15
-/// worker's (144), and a spread between and around them.
 const WIDTHS: [usize; 12] = [40, 50, 61, 72, 80, 89, 97, 100, 120, 133, 144, 160];
 
 /// A MESSAGE WITH A BLANK LINE READS AS AGY'S REPLY; THE HARNESS TYPES NONE.
-/// A person's message of two paragraphs, the second holding `Nothing left:
-/// x` and `NEEDS YOU: y`, drawn as agy draws a blank line (a blank row, the
-/// second paragraph two columns in), reads back as agy's reply: the need `y`
-/// and the defense `x`, though agy said neither, and the message as the
-/// reader takes it is the first paragraph alone — nothing in agy's TEXT
-/// tells them apart (`aterm_phase::agy`'s header). Its cells do: the loop
-/// takes the message's blank rows drawn in its caret row's style out of it
-/// before any reading (`Session::message_bounded_by_cells`, held on agy's
-/// measured screen and cells by `needs_loop_tests.rs`'s
-/// `a_persons_paragraphs_in_agy_are_never_its_need`). The same words as the act executor types an act
-/// (`turn_end_loop::one_turn`: one line, as no control request can carry a
-/// line break) are one message, and the reply under it reads alone: no
-/// need, no landing, the turn opened by the act's words. An owner's
-/// `continue_text` of two paragraphs, which unfolded would read its second
-/// paragraph back as agy's reply (drawn here), goes the same way: this test
-/// fails where the executor types it as written. NEGATIVE CONTROL: a real
-/// reply of two paragraphs under the one-line message is still read whole,
-/// its second paragraph's defense a landing.
 #[test]
 fn a_message_with_a_blank_line_reads_as_agys_reply_and_the_harness_types_none() {
     use crate::supervise::approvals::words_lead;
@@ -789,7 +631,6 @@ fn a_message_with_a_blank_line_reads_as_agys_reply_and_the_harness_types_none() 
     };
     let act = continuation_text(&owners, None);
     for cols in [144, 50] {
-        // As a person types it: the second paragraph read as agy's reply.
         let r = agy_reading(&agy_screen(cols, message, PROGRESS));
         let misread = r.said_tail.clone().expect("words");
         assert!(
@@ -804,8 +645,6 @@ fn a_message_with_a_blank_line_reads_as_agys_reply_and_the_harness_types_none() 
             "{cols}"
         );
 
-        // As the act executor types it: one line, one message, the reply
-        // alone.
         let sent = typed(message);
         assert_eq!(
             sent,
@@ -824,9 +663,6 @@ fn a_message_with_a_blank_line_reads_as_agys_reply_and_the_harness_types_none() 
         assert!(!clean_defense(r.said_tail.as_deref()), "{cols}");
         assert_eq!(r.opened_by, Some(words_lead(message)), "{cols}");
 
-        // The owner's continuation of two paragraphs: unfolded, its second
-        // paragraph is agy's reply; as the executor types it, the reply
-        // alone.
         let raw = agy_reading(&agy_screen(cols, &act, PROGRESS));
         assert!(
             raw.said_tail
@@ -843,7 +679,6 @@ fn a_message_with_a_blank_line_reads_as_agys_reply_and_the_harness_types_none() 
         );
         assert_eq!(r.opened_by, Some(words_lead(&act)), "{cols}");
 
-        // CONTROL: agy's own reply of two paragraphs is read whole.
         let reply = format!("{PROGRESS}\n\n{DEFENSE}");
         let r = agy_reading(&agy_screen(cols, &sent, &reply));
         let said = r.said_tail.expect("the reply");

@@ -1,65 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The sandbox profile: ONE profile (`runs/<tag>/jail.sb`) for everything a lab
-//! starts — the stub, the instance, its shells, the real Claude Code, Codex,
-//! Gemini CLI, agy or Muse Code, and what the lab starts in the jail outside
-//! that tree (`codex-run`, the agents' `--version`, the selftests' controls) —
-//! so every child inherits it.
-//! It is `(allow default)` plus denials, each with its reason in `jail.sb`, so
-//! the list of what it DOES is exact: loopback TCP and unix sockets in the
-//! lab's own socket directory only (not another private instance, the owner's
-//! live aterm or Claude sockets, ssh-agent, mDNSResponder: no name
-//! resolution); signals to its own processes only; no keychain daemon and no
-//! `/usr/bin/security` (a bare-name call lands on the tripwire); nothing
-//! opened on the desktop (Launch Services' open doors and `/usr/bin/open`; a
-//! bare-name `open` lands on the recorder); no preferences channels and no
-//! account-home or caller-home contents except the selected lab/build/tool
-//! paths; the extra data guards in [`crate::protected`]; no `TIOCSTI`; no
-//! write into another lab's `/tmp`
-//! directory, the xcrun shims' cache, the lab's state dir, its program and
-//! source, the aterm it runs or the checkout's builds; and writes nowhere in
-//! the owner's home nor in the run directory but its `scratch/`, whose own
-//! directories (and the project dir) may not be moved. The lab writes
-//! `env.sh`, `jail.sb` and the witness logs from OUTSIDE the jail, so no
-//! jailed process can plant a link in their way, and it reads and writes the
-//! scratch through no link ([`crate::sys::put`], [`crate::sys::scratch_read`]).
-//! Each profile also denies a Mach name of its own, the jail's MARK, by which
-//! every process in the jail is found ([`crate::procs::jail_members`]).
-//! Denials are logged by the kernel (`egress`, what the unified log keeps).
-//! `probe` proves each rule.
-//!
-//! What it does NOT do. It guards against accidents and bugs in what runs
-//! under it, with a stub in place of a model; it is no container, and a real
-//! model with a Bash tool would make anything inside it an adversary: never
-//! point a lab at a real API. Open to everything inside it:
-//!
-//! * writes outside the owner's home, the lab's state dir, its program and
-//!   source, the aterm under test and the run directory: `/tmp` (but every
-//!   lab's socket dir and the probes' scratch there; Muse Code's per-user
-//!   registry there, which none of `TMPDIR`, `TMP`, `TEMP`, `XDG_RUNTIME_DIR`
-//!   or `HOME` moves, is shared with the owner's own Muse Code, and `down`
-//!   takes back what this jail's made in it:
-//!   [`crate::runtime_dirs`]), `$TMPDIR` (all but the
-//!   xcrun cache and the temp dir itself, so any other per-user cache there
-//!   that a program trusts is open), `/Volumes`, `/opt/homebrew`, …; the lab's
-//!   own socket directory among them (its socket, token and `proj/` cannot be
-//!   removed or moved);
-//! * reads outside the two home fences and protected paths, and of the
-//!   explicitly selected lab/build/tool paths inside those homes;
-//! * loopback and this machine's own addresses, so every local service;
-//! * Mach and XPC services other than the keychain, preferences and desktop
-//!   names (the pasteboard, Apple Events, the rest
-//!   of Launch Services, …);
-//! * `/bin/ps`, which runs OUTSIDE the sandbox (it is setuid, which a sandbox
-//!   refuses to exec, and the harness is blind without it) and prints every
-//!   same-user process's command line, and with `eww` its environment;
-//! * other terminals' devices: the tree has no controlling terminal and
-//!   `TIOCSTI` is refused, but another terminal's `/dev/ttysNNN` (mode 0620) can
-//!   still be written to, or read from, which steals what a person types there;
-//! * the token's content: the socket and its token cannot be moved, but the
-//!   token can be overwritten in place (the lab's door then reads `ERR auth`);
-//! * any installed program (with no network), and no CPU, memory or disk limit.
+//! The sandbox profile: ONE profile (`runs/<tag>/jail.sb`) for everything a lab starts — the stub, the instance, its shells, the real Claude Code, Codex, Gemini CLI, agy or Muse Code, and what the lab starts in the jail outside that tree (`codex-run`, the agents' `--version`, the selftests' controls) — so every child inherits it.
 
 use std::path::Path;
 
@@ -74,10 +16,7 @@ const TEMPLATE: &str = include_str!("jail.sb");
 /// The same preference-channel denials in the regular lab and Codex rig.
 pub(crate) const PREFERENCES: &str = include_str!("preferences.sb");
 
-/// What a lab's profile names: its run and socket directories, the agents
-/// under test, whose data it guards, its mark, and what the lab trusts from
-/// OUTSIDE the jail (its state dir, its own program and source, the aterm its
-/// door runs, and the checkout's builds another lab's `up` may run).
+/// What a lab's profile names: its run and socket directories, the agents under test, whose data it guards, its mark, and what the lab trusts from OUTSIDE the jail (its state dir, its own program and source, the aterm its door runs, and the checkout's builds another lab's `up` may run).
 #[derive(Clone, Debug, Default)]
 pub struct Spec {
     /// The lab's run directory (`runs/<tag>`).
@@ -102,10 +41,7 @@ pub struct Spec {
     pub ccsocks: String,
     /// The lab's state dir (`runs/`, `logs/`, `captures/`).
     pub state: String,
-    /// The root under which every checkout's default state dir sits
-    /// ([`crate::paths::state_root`], empty: this user's): fenced, so no jail
-    /// reads another checkout's runs, logs or results; the lab's own state
-    /// dir is reopened ([`render`]).
+    /// The root under which every checkout's default state dir sits ([`crate::paths::state_root`], empty: this user's): fenced, so no jail reads another checkout's runs, logs or results; the lab's own state dir is reopened ([`render`]).
     pub states: String,
     /// The user's temp dir (empty: this user's, `DARWIN_USER_TEMP_DIR`).
     pub user_tmp: String,
@@ -120,15 +56,13 @@ pub struct Spec {
 }
 
 impl Spec {
-    /// The spec of a lab of this checkout: `lab_dirs`, `aterm` and
-    /// `repo_target` filled from this program's own facts.
+    /// The spec of a lab of this checkout: `lab_dirs`, `aterm` and `repo_target` filled from this program's own facts.
     #[must_use]
     pub fn for_lab(run: &str, claude: &str, codex: &str, sockdir: &str, mark: &str) -> Spec {
         Spec::for_lab_in(crate::paths::paths(), run, claude, codex, sockdir, mark)
     }
 
-    /// [`Spec::for_lab`] from the facts `p` (the seam a test hands a fake
-    /// account home: [`crate::paths::Paths::resolve_with`]).
+    /// [`Spec::for_lab`] from the facts `p` (the seam a test hands a fake account home: [`crate::paths::Paths::resolve_with`]).
     #[must_use]
     pub fn for_lab_in(
         p: &crate::paths::Paths,
@@ -187,8 +121,6 @@ pub fn valid_mark(mark: &str) -> bool {
 }
 
 /// `path` as a literal in the profile's regular expressions: each character
-/// the expression syntax gives a meaning is escaped (a path the profile can
-/// quote holds no quote and no backslash: [`profile_safe`]).
 fn regex_literal(path: &str) -> String {
     let mut out = String::with_capacity(path.len() + 8);
     for c in path.chars() {
@@ -207,8 +139,6 @@ fn parent(p: &str) -> String {
 }
 
 /// A selected non-store Codex package, never an arbitrary image's parent.
-/// Bind the standard layout's manifest to this exact physical entrypoint and
-/// refuse any root that would reopen a whole fenced home or its ancestors.
 fn codex_package_root(exe: &str, homes: &[&str]) -> Option<String> {
     use aterm_agent::harness::codex_alab::{PACKAGE_JSON, package_entrypoint};
     use std::io::Read as _;
@@ -219,7 +149,6 @@ fn codex_package_root(exe: &str, homes: &[&str]) -> Option<String> {
         return None;
     }
     let root = bin.parent()?;
-    // This admission precedes every read, including the manifest itself.
     if !root.is_absolute() || homes.iter().any(|h| Path::new(h).starts_with(root)) {
         return None;
     }
@@ -242,10 +171,8 @@ fn codex_package_root(exe: &str, homes: &[&str]) -> Option<String> {
 }
 
 /// Render the profile of `spec`.
-///
 /// # Errors
-/// A directory that does not exist, a path the profile cannot quote, a bad
-/// mark, or a run directory inside the owner's data.
+/// A directory that does not exist, a path the profile cannot quote, a bad mark, or a run directory inside the owner's data.
 #[allow(clippy::too_many_lines)]
 pub fn render(spec: &Spec) -> Result<String, String> {
     let real = |p: &str| {
@@ -291,10 +218,6 @@ pub fn render(spec: &Spec) -> Result<String, String> {
     let rel = physical(Path::new(&format!("{tg}/release")))
         .to_string_lossy()
         .into_owned();
-    // Every checkout's default state dir sits under one root outside the homes (`crate::paths::state_root`), so the
-    // homes' fence does not cover it: its own fence keeps one checkout's lab out of another's runs, logs, tapes and
-    // results. The root itself stays open (the tape store's walk to a run passes through it: its entries' names are
-    // all it shows) and this lab's own state dir is reopened with the rest of what the lab trusts.
     let states = if spec.states.is_empty() {
         crate::paths::state_root(crate::sys::getuid())
             .to_string_lossy()
@@ -334,11 +257,6 @@ pub fn render(spec: &Spec) -> Result<String, String> {
             "the lab's run directory may not sit inside the owner's data ({run})"
         ));
     }
-    // The harness's tape store (`aterm_agent::supervise::tape::store`) opens every directory from `/` down to the
-    // instance's state root (`<run>/scratch/state`), one no-follow open at a time, and keeps no tape when one is
-    // refused: the homes' read fence below refuses each of a run's ancestors inside a home. The fence stays whole
-    // (no directory of a home is reopened for the walk), so a run sits outside every home, as the default state dir
-    // does (`crate::paths::default_state`).
     if let Some(h) = homes.iter().find(|h| {
         let p = physical(Path::new(h));
         Path::new(&run).starts_with(h) || Path::new(&run).starts_with(&p)
@@ -366,8 +284,6 @@ pub fn render(spec: &Spec) -> Result<String, String> {
         .iter()
         .map(|(kind, path)| format!("(deny file-read* file-write* ({} \"{path}\"))", kind.word()))
         .collect();
-    // the probe's replica keeps its home and Claude sockets dir in /tmp too (their sockets need short paths): the rules
-    // under test decide them, as they decide the owner's, not the /tmp rule above (which would hide every replica write check)
     let tmp_replica: Vec<String> = homes
         .iter()
         .copied()
@@ -380,10 +296,6 @@ pub fn render(spec: &Spec) -> Result<String, String> {
             )
         })
         .collect();
-    // The agents under test stay readable when they live in aterm's package store (denied above as a whole): the
-    // build directory of each (Codex's holds its codex-package.json, resources and rg beside bin/), and the METADATA
-    // only of the directories above it up to aterm's own, so that an agent can resolve its own path (Codex
-    // canonicalizes it to find its package): a stat, no listing, no contents.
     let mut store: Vec<String> = Vec::new();
     for agent in [
         claude.as_str(),
@@ -408,8 +320,6 @@ pub fn render(spec: &Spec) -> Result<String, String> {
                 store.push(format!("(allow file-read-data (subpath \"{root}\"))"));
                 continue;
             }
-            // A selected native build outside the package store needs its own
-            // image, not the neighbouring source trees or the whole home.
             store.push(format!("(allow file-read-data (literal \"{agent}\"))"));
             continue;
         }
@@ -425,13 +335,6 @@ pub fn render(spec: &Spec) -> Result<String, String> {
             store.push(format!("(allow file-read-metadata (literal \"{path}\"))"));
         }
     }
-    // What the lab trusts from OUTSIDE the jail, wherever LAB_STATE, the checkout and LAB_ATERM sit: the state dir
-    // (runs/, whose env.sh it reads, logs/, captures/), its own program and source, the aterm its door runs (env.sh
-    // records it), and both builds a later `up` may pick when LAB_ATERM is left off: this checkout's target/ itself (no
-    // link may be put there) and all of its debug/ and release/, as written and physical. The jail reads all of it but
-    // target/ itself (`trusted_read`): nothing in the jail lists the checkout's build folder now that no lab's state
-    // sits under it (MEASURED 2026-10-22: `lab selftest` passed without it, the walk from / to the state root
-    // included, docs/measured/breaker-transcript-and-zsh-2026-10-22.md), so its entry names stay the owner's.
     let mut trusted = vec![format!("(subpath \"{st}\")")];
     trusted.extend(spec.lab_dirs.iter().map(|d| format!("(subpath \"{d}\")")));
     if !spec.aterm.is_empty() {
@@ -522,10 +425,7 @@ pub fn render(spec: &Spec) -> Result<String, String> {
     Ok(out)
 }
 
-/// Whether the profile applies HERE: profiles do not nest, and the lab never
-/// runs without its jail (a trivial profile applies inside another sandbox,
-/// the lab's own does not: the real one is tested).
-///
+/// Whether the profile applies HERE: profiles do not nest, and the lab never runs without its jail (a trivial profile applies inside another sandbox, the lab's own does not: the real one is tested).
 /// # Errors
 /// Why it does not apply, said for the person.
 pub fn check(profile: &std::path::Path) -> Result<(), String> {
@@ -550,7 +450,6 @@ mod tests {
     use super::*;
 
     /// A run, a socket dir, a state dir and a user temp dir under one scratch
-    /// tree, removed when it drops.
     struct Dirs {
         top: std::path::PathBuf,
         run: String,
@@ -622,7 +521,6 @@ mod tests {
             rules,
             protected_paths("/Users//o", "/private/tmp/cc-socks").len()
         );
-        // the keychain's, the desktop's, and the jail's own mark
         assert_eq!(
             p.lines()
                 .filter(|l| l.starts_with("(deny mach-lookup"))
@@ -664,9 +562,6 @@ mod tests {
         ] {
             assert!(trusted.contains(&want), "{want} in {trusted}");
         }
-        // The jail reads what the lab trusts, but no entry name of the
-        // checkout's target/ itself: its builds only. NEGATIVE CONTROL: the
-        // write rule above still names target/ itself.
         let read = p
             .lines()
             .find(|l| l.starts_with("(allow file-read-data (subpath ") && l.contains("/L/bin"))
@@ -708,7 +603,6 @@ mod tests {
         .unwrap();
         assert!(p.contains(&format!("(allow file-read* (subpath \"{st}/claude/1\"))")));
         assert!(p.contains(&format!("(allow file-read* (subpath \"{st}/codex/7\"))")));
-        // the metadata only, of each directory above a build, up to aterm's own
         for d in [
             format!("{st}/codex"),
             st.to_string(),
@@ -723,7 +617,6 @@ mod tests {
         assert!(!p.contains(
             "(allow file-read-metadata (literal \"/Users//o/Library/Application Support\"))"
         ));
-        // agy and Gemini CLI the same way: the store's build is readable, an agent outside the store adds no rule
         let mut s = spec(&d, "/x", "", "/Users//o");
         s.agy = format!("{st}/agy/1000001000004000000/bin/agy");
         s.gemini = "/opt/homebrew/Cellar/gemini-cli/0.46.0/libexec/bin/gemini".into();
@@ -737,7 +630,6 @@ mod tests {
         );
         s.agy = format!("{st}/agy/1/bin/a\"y");
         assert!(render(&s).is_err(), "a path the profile cannot quote");
-        // Muse Code the same way: the store's build is readable, a build outside the store adds no rule
         let mut s = spec(&d, "/x", "", "/Users//o");
         s.muse = format!("{st}/muse/2001004010006427002/bin/muse");
         let p = render(&s).unwrap();
@@ -757,11 +649,6 @@ mod tests {
     }
 
     /// THE OWNER'S MUSE CODE AND ANTIGRAVITY DATA ARE DENIED, READS AND ALL:
-    /// Muse Code 1.4.10 opened the account's `session-names.db` under
-    /// `~/Library/Application Support/Muse` with HOME and XDG pointed at the
-    /// scratch, and its sessions live in `~/.local/share/muse`. NEGATIVE
-    /// CONTROL: the store's re-allow for a Muse Code build, which the profile
-    /// does carry, reaches neither.
     #[test]
     #[expect(
         clippy::too_many_lines,
@@ -802,9 +689,6 @@ mod tests {
             );
         }
 
-        // Apply the actual profile to a child, with two distinct owned homes.
-        // Nothing in this fixture names the account's real home or asks a
-        // preferences service for anything: policy queries only.
         use crate::probe::{Op, WriteHow};
         let top = std::fs::canonicalize(&d.top).unwrap();
         let account = top.join("account");
@@ -871,7 +755,6 @@ mod tests {
             codex_package_root(dev_codex.to_str().unwrap(), &homes),
             Some(dev_package.display().to_string())
         );
-        // A stray manifest that names another image cannot enlarge the grant.
         std::fs::write(dev_package.join("bin/other"), "a different owned image").unwrap();
         std::fs::write(
             dev_package.join("codex-package.json"),
@@ -883,7 +766,6 @@ mod tests {
             None
         );
         std::fs::write(dev_package.join("codex-package.json"), manifest).unwrap();
-        // Even a valid layout whose image exists cannot select HOME or above.
         for root in [&account, &top] {
             std::fs::create_dir_all(root.join("bin")).unwrap();
             std::fs::write(root.join("bin/codex"), "owned image").unwrap();
@@ -905,9 +787,6 @@ mod tests {
             Op::PreferencePolicy("global".into(), "com.apple.TrustEvaluationAgent".into()),
             "yes",
         ));
-        // Each spelling gets independent entropy: Darwin may alias slash and
-        // nonslash names. All objects are exclusively ours, mode 0600, and the
-        // parent proves a read-only mapping reads the byte it just planted.
         let mut shared = Vec::new();
         for (prefix, wanted) in [
             ("apple.cfprefs.", "denied"),
@@ -928,8 +807,6 @@ mod tests {
         );
         s.caller_home = caller.display().to_string();
         s.muse = native.display().to_string();
-        // Retain the independent managed-store positive while Codex selects
-        // the non-store package. No fixture image is executed.
         s.agy = selected.display().to_string();
         s.lab_dirs = vec![source.display().to_string()];
         let operations = top.join("operations.txt");
@@ -939,8 +816,6 @@ mod tests {
             ("contained", render(&s).unwrap(), true, false),
             ("proof", crate::codex_rig::jail_policy(4242), true, true),
         ] {
-            // Exercise the proof's actual policy on decision queries and
-            // exclusively owned shared memory, never a preferences service.
             let checks: Vec<_> = checks
                 .iter()
                 .filter(|(op, _)| {
@@ -977,8 +852,6 @@ mod tests {
                         .map(|o| o.name().to_owned())
                         .collect::<Vec<_>>();
                     let kept = d.top.clone();
-                    // A deferred reaper is not EOF. Keep both descriptors and
-                    // names, and the owned fixture tree, for the pending child.
                     std::mem::forget(shared);
                     std::mem::forget(d);
                     panic!("{name}: {error}; retained {kept:?} and named shm {names:?}");
@@ -1013,7 +886,6 @@ mod tests {
     }
 
     /// The profile of a lab whose facts are `p`, on the test's run, socket,
-    /// state and temp dirs.
     fn profile_of(d: &Dirs, p: &crate::paths::Paths, claude: &str) -> Result<String, String> {
         let mut s = Spec::for_lab_in(
             p,
@@ -1032,9 +904,6 @@ mod tests {
     }
 
     /// The rules a profile makes of the owner's data in `home`, as the
-    /// protected list words them (`.ssh`, `.claude.json`, `.gemini`,
-    /// `.codex`, Muse Code's and Antigravity's data, a browser profile), and
-    /// its bans on reading and writing the rest of it.
     fn home_rules(home: &str) -> Vec<String> {
         let mut rules: Vec<String> = [
             ("subpath", ".ssh"),
@@ -1056,16 +925,6 @@ mod tests {
     }
 
     /// THE JAIL A LAB'S OWN FACTS MAKE GUARDS THE ACCOUNT'S HOME UNDER A
-    /// SCRATCH `HOME`: [`Spec::for_lab_in`] on facts resolved with a fake
-    /// account home (the account database's, through
-    /// [`crate::paths::Paths::resolve_with`]) and a scratch `HOME` (every agent
-    /// run's rule) renders every entry of the protected list in both, reads
-    /// and writes banned in both, each shared rule once; an agent in the
-    /// account's package store keeps its build; and a run directory inside the
-    /// account's data is refused. NEGATIVE CONTROL: facts that take `HOME` as
-    /// the account's home (the lab before the fence) name none of the
-    /// account's paths and let that run directory through; facts with no
-    /// account home are refused.
     #[test]
     fn the_jail_of_the_lab_s_facts_guards_the_account_home_and_a_scratch_home_both() {
         use crate::paths::Paths;
@@ -1092,7 +951,6 @@ mod tests {
             "each home's list, the shared Claude sockets rule once"
         );
         assert!(profile.contains(&format!("(allow file-read* (subpath \"{store}\"))")));
-        // a run directory in the account's data is refused under the scratch HOME too
         let inside = account.join(".config/run");
         std::fs::create_dir_all(inside.join("scratch")).unwrap();
         let mut in_data = Spec::for_lab_in(&p, &inside.to_string_lossy(), "/x", "", &d.sock, "");
@@ -1100,7 +958,6 @@ mod tests {
         in_data.user_tmp.clone_from(&d.ut);
         let err = render(&in_data).unwrap_err();
         assert!(err.contains("owner's data"), "{err}");
-        // NEGATIVE CONTROL: HOME taken as the account's home
         let env_only = Paths::resolve_with(Some(scratch.clone()), Some(scratch.clone().into()));
         let bare = profile_of(&d, &env_only, &format!("{store}/bin/claude")).unwrap();
         for rule in home_rules(&s) {
@@ -1122,21 +979,11 @@ mod tests {
             render(&bare_in).is_ok(),
             "its run in the account's data goes through"
         );
-        // no account home at all is refused, whatever HOME says
         let none = Paths::resolve_with(None, Some(scratch.into()));
         assert!(profile_of(&d, &none, "/x").is_err());
     }
 
     /// THE HARNESS'S TAPE STORE WALKS TO A RUN OUTSIDE EVERY HOME, AND THE
-    /// HOME FENCE STAYS WHOLE: the tape store opens every directory from `/`
-    /// down to `<run>/scratch/state` (no-follow, one at a time). Under the
-    /// profile, applied, with the run outside the home (where the default
-    /// state dir puts it), each of those opens goes through, while the home
-    /// itself, a directory and a file in it and a protected entry stay shut:
-    /// no rule reopens a directory of the home by its literal path. NEGATIVE
-    /// CONTROLS: the same profile without the home's fence opens the home (the
-    /// refusal is the fence's); a run inside the home is refused at render,
-    /// naming the home.
     #[test]
     fn the_tape_store_walks_to_a_run_outside_every_home_and_the_fence_stays_whole() {
         let d = dirs();
@@ -1208,7 +1055,6 @@ mod tests {
         let mut want = vec!["ok"; walk.len()];
         want.extend(["no"; 5]);
         assert_eq!(opens(&profile), want, "{walk:?} {shut:?}");
-        // NEGATIVE CONTROL: without the home's fence the home opens, so the refusal above is the fence's
         let fence = format!("(deny file-read-data (subpath \"{}\"))", home.display());
         let unfenced: String = profile
             .lines()
@@ -1217,7 +1063,6 @@ mod tests {
             .collect();
         assert_ne!(unfenced, profile, "the fence is in the profile");
         assert_eq!(opens(&unfenced)[walk.len()], "ok");
-        // NEGATIVE CONTROL: a run inside the home is refused, never walked to
         let inside = home.join("Developer/lab/runs/t");
         std::fs::create_dir_all(inside.join("scratch/state")).unwrap();
         s.run = inside.display().to_string();
@@ -1229,15 +1074,6 @@ mod tests {
     }
 
     /// ANOTHER CHECKOUT'S LAB STATE IS FENCED, AND THE WALK TO THIS LAB'S RUN
-    /// STAYS OPEN: every checkout's default state dir sits under one root
-    /// outside the homes (`/private/tmp/at.lab-<uid>`), which the homes'
-    /// fence does not cover. Under the profile, applied, the tape store's
-    /// walk from `/` through the root and this lab's state dir down to
-    /// `<run>/scratch/state` opens, while a sibling checkout's state dir, its
-    /// log and its run's `env.sh` stay shut; the rule is a regular
-    /// expression below the root, so no literal reopens anything. NEGATIVE
-    /// CONTROL: the same profile without the root's fence opens the sibling's
-    /// state dir, log and record (the refusal is the fence's).
     #[test]
     fn another_checkouts_lab_state_is_fenced_and_the_walk_to_this_run_stays_open() {
         let d = dirs();
@@ -1328,7 +1164,6 @@ mod tests {
         let mut want = vec!["ok"; walk.len()];
         want.extend(["no"; 3]);
         assert_eq!(opens(&profile), want, "{walk:?} {shut:?}");
-        // NEGATIVE CONTROL: without the root's fence the sibling's state opens
         let unfenced: String = profile
             .lines()
             .filter(|l| *l != fence)
@@ -1361,7 +1196,6 @@ mod tests {
         bad.mark = "lab.jail.t;(allow default)".into();
         assert!(render(&bad).unwrap_err().contains("bad mark"));
         assert!(!valid_mark("other.mark") && valid_mark("lab.jail.t.00ff"));
-        // a home whose `.config` holds the run directory
         let home = std::fs::canonicalize(&d.top).unwrap();
         let inside = home.join(".config/run");
         std::fs::create_dir_all(&inside).unwrap();

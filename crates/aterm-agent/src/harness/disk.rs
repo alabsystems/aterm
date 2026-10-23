@@ -1,192 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Disk watch and cleanup (design `docs/DESIGN-aterm-wrapper-2026-09-17.md`
-//! §5.5): the free-space figure, the reclaimable build caches, and the one
-//! apply path allowed to remove anything.
-//!
-//! [`report`] is a pure function of a [`Survey`] ([`scan`] measures one) and
-//! removes nothing. Removal goes only through [`plan`] + [`apply`]: with no
-//! class named, [`plan`] answers [`Plan::ReportOnly`]; the named class is the
-//! grant and cannot reach a row of another class. [`guard`] checks each path
-//! again before it is removed.
-//!
-//! # The automatic grant: below the floor, build caches only
-//!
-//! [`auto_plan`] is the one removal nobody names: below `disk.auto_free_gib`
-//! the host's tick reclaims the removable [`Class::CargoTargets`] rows, in
-//! this order:
-//!
-//! 1. every idle profile's `incremental/` (unwritten for `target_stale_days`;
-//!    [`target::reclaim`]);
-//! 2. build directories whose owner is gone ([`discover`]: an ended Claude
-//!    Code session's scratch build, a removed checkout's cells cache), whole,
-//!    longest unwritten first ([`Witness::OwnerGone`],
-//!    [`target::reclaim_whole`]);
-//! 3. the profiles inside the idle window, least recently used first
-//!    ([`Witness::LeastRecentlyUsed`], [`target::reclaim_lru`]).
-//!
-//! 1. every IDLE profile's `incremental/` (unwritten for `target_stale_days`)
-//!    in each witnessed build directory, through [`target::reclaim`] — all of
-//!    them: they are the least recently used there are;
-//! 2. then, free space measured again before each, the build directories
-//!    whose OWNER IS GONE, WHOLE, the longest unwritten first
-//!    ([`Witness::OwnerGone`], through [`target::reclaim_whole`];
-//!    `disk.dead_build_dirs`, on by default): an ended
-//!    Claude Code session's scratch build — no running Claude Code names the
-//!    session in its own registry, nothing of it written for
-//!    [`Config::quiet_s`] (`target_stale_days`, at least a day) ([`discover`]'s
-//!    owners). A signed
-//!    `CACHEDIR.TAG` (the specification's mark of regenerable contents), no
-//!    source at its root, every profile known, none locked and every one
-//!    unwritten for the quiet window; no running process using it or the
-//!    owner's folder ([`discover::unused`]); every lock of every profile held
-//!    for the delete and, under them, the owner checked again — the
-//!    directory inside its folder, the owner still gone
-//!    ([`discover::recheck`]). Nobody builds there again, so these go before
-//!    any live checkout's cache;
-//! 3. then, one PROFILE at a time and oldest LAST USED first, a profile
-//!    inside the window ([`Witness::LeastRecentlyUsed`], through
-//!    [`target::reclaim_lru`]) — free space MEASURED AGAIN before each, and
-//!    the pass stops as soon as it is back at the floor plus
-//!    [`PRESSURE_MARGIN_GIB`] ([`Config::pressure_target_bytes`]), or once
-//!    the bytes these rows released, as their unlinks counted them, cover
-//!    what free space was short of that at the first of them (a figure a
-//!    local snapshot keeps from rising must not cost every profile), or on
-//!    an unreadable figure ([`StopBy`]). A profile a build holds is never one
-//!    (cargo's locks, taken again for the delete), nor one on another volume
-//!    than the one measured.
-//!
-//! # Witnesses
-//!
-//! Every row carries a [`Witness`], a measured fact about the directory and not
-//! a rule about its name; a directory with none is a note, not a row. Of a
-//! [`Class::CargoTargets`] directory only a profile's `incremental/` goes,
-//! under all of that profile's cargo locks, never `deps/`, `build/` or
-//! `.fingerprint/`; only a gone owner's directory goes whole (step 2). A
-//! [`Class::ClaudeStaleVersions`] row is a vendor version directory that is not
-//! the live symlink's resolved target; when that does not resolve, every row of
-//! the class is blocked. [`Class::AtpkgGc`] and [`Class::ClaudePurge`] are
-//! reported and delegated ([`Delegate`]), never removed here.
-//!
-//! # What this module never does
-//!
-//! The owner's verb surveys the build directories NAMED on its line; named
-//! none, it SEARCHES for them, as the window's tick does below the floor
-//! ([`discover::discover`]): the agents' working directories and their
-//! worktrees, `$HOME`'s checkouts and their git worktrees two levels down
-//! (a `target -> target.noindex` link resolved), x.py's bootstrap build
-//! directories (never a sysroot, stage0 or `llvm`), the agents'
-//! `CARGO_TARGET_DIR` and Claude Code's temp root. What no
-//! row can free is the report's [`Report::hogs`]: the largest build
-//! directories left, each with what frees it (`$HOME/trust/build 94.0 GiB (x.py
-//! bootstrap; run scripts/slim_build.py)`), which the window's "Disk space is
-//! low" line names.
-//!
-//! # The tick and the journal
-//!
-//! A row with no witness is not a candidate; it is a note. The three classes
-//! the design names each have one, and each witness is a MEASURABLE fact
-//! about the directory rather than a rule about its name:
-//!
-//! * [`Class::CargoTargets`] — a build directory that carries a marker only
-//!   a build tool writes ([`CACHEDIR_SIGNATURE`] or `.rustc_info.json`),
-//!   holds no source at its root, whose cargo profiles are all known (found
-//!   at any depth by one bounded walk), and at least one of whose profiles is
-//!   IDLE — what a compile writes (`deps/`, `.fingerprint/`, `build/`,
-//!   `examples/`) unwritten for `target_stale_days` (default one day) —
-//!   holds a non-empty `incremental/`, and has no build holding its locks
-//!   ([`target::target_witness`]). What its removal takes is ONLY those idle
-//!   profiles' `incremental/`, each deleted while this process holds every
-//!   one of cargo's build locks of that profile ([`target::reclaim`]). Below
-//!   the floor a PROFILE inside the window is a row of its own
-//!   ([`Witness::LeastRecentlyUsed`]: the same fences, no build holding its
-//!   locks, its last use and its rank oldest first), taken the same way
-//!   ([`target::reclaim_lru`]). A build directory named inside another is
-//!   walked by both, and each of its profiles is decided ONCE, in both
-//!   passes, by the innermost named directory holding it (`speaker`): its
-//!   row, or its note keeping the profile — the outer directory's row
-//!   neither counts such a profile nor reclaims it. Never
-//!   the directory, `deps/`, `build/`, `.fingerprint/`, an uplifted binary,
-//!   or anything else — but for a gone owner's build directory below the
-//!   floor ([`Witness::OwnerGone`], step 2 above), which goes whole. The row
-//!   SAYS what it costs: a slower next build.
-//!   "Nothing is using it" is cargo's own answer, not a clock proxy: this
-//!   file once said the honest check "wants a lock acquisition this crate
-//!   will not write — `unsafe` is banned here". That was wrong: std's
-//!   `File::try_lock` takes cargo's `flock` with no `unsafe`, and the reclaim
-//!   holds every one of a profile's locks while it deletes.
-//! * [`Class::ClaudeStaleVersions`] — a vendor version that is not the live
-//!   one: not the live symlink's resolved target, or on Windows, where
-//!   `claude.exe` is a COPY, not the version it is a byte-for-byte copy of
-//!   ([`versions`]). The witness NAMES the live one, and if the launcher
-//!   names none strictly inside `versions/`, every row in the class becomes
-//!   unsafe: with nothing to compare against, "not the live one" is an
-//!   assumption, not a witness. A version Claude Code's lock or a running
-//!   process holds (on Windows, also one newer than the live one) is reported
-//!   and kept.
-//! * [`Class::AtpkgGc`] — a package build superseded by the live build of
-//!   the same program. Reported, never removed from here: `store/` is under
-//!   atpkg's single-writer lock and `aterm pkg gc` is its one gardener, so
-//!   the row carries [`Delegate::AtermPkgGc`] and [`apply`] refuses it.
-//!
-//! [`Class::ClaudePurge`] is surfaced the same way — a row naming
-//! `claude project purge --dry-run` — and is likewise delegated, because it
-//! reaches the vendor's own project history and §5.5 forbids this module from
-//! touching transcripts under any flag.
-//!
-//! # What this module will never do
-//!
-//! * Remove a transcript, or anything under [`Survey::transcripts_root`].
-//!   [`guard`] refuses such a path even when it is on the report — a second
-//!   fence behind the first, because this is the one mistake that is not
-//!   recoverable by rebuilding.
-//! * Remove a path that is not on the report for the class named. A path
-//!   arriving from anywhere else is [`Refusal::NotReported`], and the
-//!   refusal is journalled as a DENIAL ROW rather than dropped, so a refused
-//!   apply leaves the same kind of evidence a successful one does.
-//! * Remove `~/.cargo/git`, or any path the design's safelist does not name.
-//!   The safelist is the [`Class`] enum: a class that is not in it has no
-//!   spelling that reaches [`apply`].
-//!
-//! # The one timer in the design, and why it is here
-//!
-//! §5.5 keeps a tick, and §4.2 row 18 says why: a free-space figure has no
-//! event to hang on — nothing in aterm or the vendor announces "a gigabyte
-//! left". That tick belongs to the HOST that calls [`report`]; there is no
-//! sleep, no loop and no cadence in this file. The window's harness host
-//! (`aterm-gui` `harness_host.rs`) keeps it — a look every minute since the
-//! disk filled twice on 2026-10-16 (it was six hours) — and hands each pass to
-//! [`super::cli::disk_tick`] ([`Trigger::Tick`]).
-//!
-//! # Every removal is journalled before and after
-//!
-//! [`apply`] and [`apply_auto`] tell their caller each [`Step`] as it
-//! happens: the intent BEFORE a row's removal starts, its outcome (what went,
-//! the bytes actually released, what was skipped and why, and every delete
-//! error) after, and every refusal. The host writes each step to its journal
-//! as it comes, so a pass cut short leaves the intent on record.
-//!
-//! STATUS (docs/README.md honesty ratchet): unit-tested on faithful cargo
-//! layouts (locks in each profile, none at the root), including the idle
-//! profile whose `incremental/` alone goes, a profile a build holds locked
-//! (skipped), a symlinked path component (refused), the bytes an unlink
-//! released, the journal's intent row surviving a remover that panics, the
-//! outside-the-safelist path that is refused with a denial row, the
-//! report-only default, the automatic floor, and the pressure pass (every
-//! profile recent: the oldest unlocked one goes first, the pass stops once
-//! free space is back, a locked or just-built one is never taken, and a
-//! re-measure that never rises stops it once the counted bytes cover what
-//! was short). The re-measure is one `statfs`/`statvfs` on the mount point
-//! ([`volume_of`]), the watch's and the verb's alike. A
-//! drill on a scratch APFS volume saw each unlink there at once and the
-//! pass stop `by=measured`;
-//! with the caches made clones of a kept file it stopped `by=counted`. A
-//! local snapshot holding the blocks keeps the figure low the same way, and
-//! since an APFS clone's shared blocks are counted although the clone keeps
-//! them, the counted stop can end a pass early (the next tick looks again).
-//! `deps/`, `build/` and `.fingerprint/` are never reclaimed, by design
-//! ([`target`]'s docs). The `--diagnose` line of §5.5 has no host.
+//! Disk watch and cleanup (design `docs/DESIGN-aterm-wrapper-2026-09-17.md` §5.5).
 
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
@@ -196,80 +11,52 @@ use aterm_json::{Map, Value};
 use super::truncate_bytes;
 use super::usage::rfc3339_utc;
 
-// Constants
-
 /// `disk.warn_free_gib` (design §5.5).
 pub const DEFAULT_WARN_FREE_GIB: u64 = 40;
 
-/// `disk.target_stale_days` (design §5.5): a profile unwritten for this many
-/// days is idle, and `--apply cargo-targets` takes its `incremental/` at any
-/// free figure ([`Config::target_stale_days`]).
+/// `disk.target_stale_days` (design §5.5).
 pub const DEFAULT_TARGET_STALE_DAYS: i64 = 1;
 
-/// `disk.apply` (design §5.5): the owner's verb removes nothing until this is
-/// on. The automatic floor below is its own, narrower grant.
+/// `disk.apply` (design §5.5): the owner's verb removes nothing until this is on.
 pub const DEFAULT_APPLY: bool = false;
 
-/// `disk.auto_free_gib`: below this many free GiB the host's tick reclaims
-/// [`Class::CargoTargets`] rows by itself ([`auto_plan`]), since a full disk
-/// stalls workers. `0` turns it off.
+/// `disk.auto_free_gib`.
 pub const DEFAULT_AUTO_FREE_GIB: u64 = 10;
 
-/// How far above the floor the pressure pass reclaims before it stops: five
-/// GiB, so the next build's writes (one aterm workspace's cache is 12-43
-/// GiB) do not push the volume straight back under it before the next look.
-/// It was one GiB until the disk filled twice on 2026-10-16. A target, not a
-/// measurement.
+/// How far above the floor the pressure pass reclaims before it stops.
 pub const PRESSURE_MARGIN_GIB: u64 = 5;
 
-/// The automatic floor is at least this percent of the volume's size
-/// ([`Config::for_volume`]): ten GiB is one build from full on a 460 GiB
-/// disk where one workspace's build cache is 12-43 GiB.
+/// The automatic floor is at least this percent of the volume's size ([`Config::for_volume`]).
 pub const AUTO_FREE_PCT: u64 = 5;
 
-/// The warning threshold is at least this percent of the volume's size
-/// ([`Config::for_volume`]).
+/// The warning threshold is at least this percent of the volume's size ([`Config::for_volume`]).
 pub const WARN_FREE_PCT: u64 = 8;
 
-/// The most the volume's share ([`AUTO_FREE_PCT`]) raises the automatic
-/// floor to: on a 4 TB volume 5% is 200 GiB, and a floor there would take
-/// live checkouts' caches with 150 GiB free. A floor the owner WROTE is
-/// never raised at all ([`Written`]).
+/// The most the volume's share ([`AUTO_FREE_PCT`]) raises the automatic floor to.
 pub const AUTO_FREE_SHARE_MAX_GIB: u64 = 32;
 
 /// The most the volume's share ([`WARN_FREE_PCT`]) raises the warning to.
 pub const WARN_FREE_SHARE_MAX_GIB: u64 = 64;
 
-/// The most the volume's share ([`EMERGENCY_FREE_PCT`]) raises the
-/// emergency line to.
+/// The most the volume's share ([`EMERGENCY_FREE_PCT`]) raises the emergency line to.
 pub const EMERGENCY_FREE_SHARE_MAX_GIB: u64 = 8;
 
-/// An UNWRITTEN `warn_free_gib` is held to at most this percent of the
-/// volume ([`Config::on_volume`]): a fixed 40 GiB is a third of a 128 GB disk.
+/// An UNWRITTEN `warn_free_gib` is held to at most this percent of the volume ([`Config::on_volume`]).
 pub const SMALL_WARN_MAX_PCT: u64 = 20;
 
-/// An UNWRITTEN `auto_free_gib` is held to at most this percent of the
-/// volume ([`Config::on_volume`]).
+/// An UNWRITTEN `auto_free_gib` is held to at most this percent of the volume ([`Config::on_volume`]).
 pub const SMALL_FLOOR_MAX_PCT: u64 = 10;
 
-/// THE EMERGENCY: below the larger of this many GiB and
-/// [`EMERGENCY_FREE_PCT`] of the volume ([`Thresholds::emergency`]), or with
-/// fewer than [`EMERGENCY_FILES_FREE`] inodes, writes are about to fail with
-/// `ENOSPC`: the watch releases its reserve ([`reserve`]), passes at once,
-/// and an owner alert follows when nothing safe is left to free.
+/// THE EMERGENCY: below the larger of this many GiB and [`EMERGENCY_FREE_PCT`] of the volume ([`Thresholds::emergency`]), or with fewer than [`EMERGENCY_FILES_FREE`] inodes, writes are about to fail with `ENOSPC`.
 pub const EMERGENCY_FREE_GIB: u64 = 4;
 
 /// See [`EMERGENCY_FREE_GIB`].
 pub const EMERGENCY_FREE_PCT: u64 = 1;
 
-/// Fewer free inodes than this is an emergency whatever the bytes say: a
-/// volume out of inodes fails a write with `ENOSPC` too.
+/// Fewer free inodes than this is an emergency whatever the bytes say: a volume out of inodes fails a write with `ENOSPC` too.
 pub const EMERGENCY_FILES_FREE: u64 = 50_000;
 
-/// The `CACHEDIR.TAG` signature every cargo-compatible build tool writes into
-/// a target directory (the Cache Directory Tagging Specification's fixed
-/// line, which cargo emits verbatim): the marker that makes "a build tool
-/// laid this" a fact rather than a guess from the directory's name.
+/// The `CACHEDIR.TAG` signature every cargo-compatible build tool writes into a target directory (the Cache Directory Tagging Specification's fixed line, which cargo emits verbatim).
 pub const CACHEDIR_SIGNATURE: &str = "Signature: 8a477f597d28d172789f06886806bc55";
 
 /// The other marker a cargo target directory carries.
@@ -305,59 +92,37 @@ pub(crate) mod win;
 
 pub use target::{CARGO_LOCKS, INCREMENTAL, Judge, PRESSURE_MIN_IDLE_S, Profile, TargetDir};
 
-/// `disk.idle_build_dirs`: tier 3 is ON (design §8, stage 7), turned on once
-/// the live lane (`targo --unverified lab disk-lane`) passed with it on and
-/// what it would free here was measured report-only. `false` lists its rows
-/// report-only (`removable=false`).
+/// `disk.idle_build_dirs`.
 pub const DEFAULT_IDLE_BUILD_DIRS: bool = true;
 
 /// The most bytes of any quoted path or reason one ledger row may carry.
 pub const ROW_TEXT_CAP: usize = 512;
 
-/// The most rows one report carries per class: one report stays one screen
-/// of decisions, and every walk below stays bounded.
+/// The most rows one report carries per class: one report stays one screen of decisions, and every walk below stays bounded.
 pub const MAX_ROWS_PER_CLASS: usize = 64;
 
-/// The most directory entries one size walk visits before it stops and
-/// marks the figure partial.
+/// The most directory entries one size walk visits before it stops and marks the figure partial.
 pub const MAX_WALK_ENTRIES: usize = 200_000;
 
-/// The most build directories one survey measures: the named ones first,
-/// then what discovery found ([`discover::MAX_FOUND`]).
+/// The most build directories one survey measures: the named ones first, then what discovery found ([`discover::MAX_FOUND`]).
 pub const MAX_TARGETS: usize = discover::MAX_FOUND;
 
-/// The most entries of the report's list of the largest build directories it
-/// cannot reclaim ([`Report::hogs`]).
+/// The most entries of the report's list of the largest build directories it cannot reclaim ([`Report::hogs`]).
 pub const MAX_HOGS: usize = 5;
 
-/// `disk.dead_build_dirs`: below the floor, a build directory whose OWNER IS
-/// GONE goes WHOLE ([`Witness::OwnerGone`]) — a Claude Code session's scratch
-/// build once no running Claude Code names the session and nothing of it
-/// was written for the quiet window ([`Config::quiet_s`]) (measured: 45 GB of
-/// ended sessions' scratch builds on a volume at 3-6 GB free). `false`: such a directory is
-/// any other, its idle and least-recently-used `incremental/` only.
+/// `disk.dead_build_dirs`: below the floor, a build directory whose OWNER IS GONE goes WHOLE ([`Witness::OwnerGone`]).
 pub const DEFAULT_DEAD_BUILD_DIRS: bool = true;
 
-/// Bytes in a GiB.
 const GIB: u64 = 1024 * 1024 * 1024;
 
-/// Seconds in a day.
 const DAY_S: i64 = 86_400;
 
-// The safelist
-
-/// The safelist. A class not named here has no spelling that reaches
-/// [`apply`]: the list is a closed enum, not a configurable string set.
+/// The safelist.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Class {
-    /// Package builds superseded by the live one. Delegated to `aterm pkg gc`.
     AtpkgGc,
-    /// Vendor versions that are not the live one ([`versions`]).
     ClaudeStaleVersions,
-    /// Build directories whose idle cargo profiles' `incremental/` goes —
-    /// and below the floor, recent profiles', least recently used first.
     CargoTargets,
-    /// The vendor's own project purge. Delegated, and never run from here.
     ClaudePurge,
 }
 
@@ -381,19 +146,13 @@ impl Class {
         }
     }
 
-    /// Parse a class name. Unknown names answer `None`; no prefix matching or
-    /// case folding, since a typo resolving to a different class would be a
-    /// grant the owner did not give.
+    /// Parse a class name.
     #[must_use]
     pub fn parse(s: &str) -> Option<Class> {
         Class::ALL.iter().copied().find(|c| c.as_str() == s)
     }
 
     /// The command that owns removal for this class, when it is not us.
-    ///
-    /// `None`: this module removes the row itself. `Some`: the row is
-    /// reported and [`apply`] refuses it, naming the command (a tree under
-    /// another writer's lock).
     #[must_use]
     pub fn delegate(self) -> Option<Delegate> {
         match self {
@@ -404,14 +163,10 @@ impl Class {
     }
 }
 
-/// A command that owns a class's removal. Every variant is a tool with its
-/// own lock or its own data; none of them is invoked from this module.
+/// A command that owns a class's removal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Delegate {
-    /// `store/` is under atpkg's single-writer lock; its gardener is
-    /// `aterm pkg gc`, whose own witness is the live build.
     AtermPkgGc,
-    /// The vendor's project history. §5.5: never transcripts, under any flag.
     ClaudeProjectPurge,
 }
 
@@ -435,38 +190,24 @@ impl Delegate {
     }
 }
 
-// Knobs
-
 /// The `[disk]` knobs of design §5.5.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Config {
     /// Below this many free GiB the report warns.
     pub warn_free_gib: u64,
-    /// A cargo profile a compile wrote into (`deps/`, `.fingerprint/`,
-    /// `build/` or `examples/`) within this many days is not idle: its
-    /// `incremental/` is taken only below the automatic floor, least recently
-    /// used first ([`auto_plan`]). `0` makes every profile idle except one
-    /// written within [`PRESSURE_MIN_IDLE_S`].
+    /// A cargo profile a compile wrote into (`deps/`, `.fingerprint/`, `build/` or `examples/`) within this many days is not idle.
     pub target_stale_days: i64,
-    /// The durable `disk.apply` switch. `false` makes [`plan`] answer
-    /// [`Plan::Denied`] for every class, whatever the caller named.
+    /// The durable `disk.apply` switch.
     pub apply: bool,
-    /// Below this many free GiB the host's tick applies [`auto_plan`]; `0`
-    /// is off ([`DEFAULT_AUTO_FREE_GIB`]).
+    /// Below this many free GiB the host's tick applies [`auto_plan`]; `0` is off ([`DEFAULT_AUTO_FREE_GIB`]).
     pub auto_free_gib: u64,
-    /// Once the volume is low, may a build directory whose owner is gone go
-    /// whole ([`DEFAULT_DEAD_BUILD_DIRS`], tier 1)?
+    /// Once the volume is low, may a build directory whose owner is gone go whole ([`DEFAULT_DEAD_BUILD_DIRS`], tier 1)?
     pub dead_build_dirs: bool,
-    /// `disk.room_gib`: the room PINNED, read as written (`None`: the watch's
-    /// measured room, [`room`]). A line knob, not a removal knob: a value of
-    /// it aterm cannot read falls back to the measured room.
+    /// `disk.room_gib`: the room PINNED, read as written (`None`: the watch's measured room, [`room`]).
     pub room_gib: Option<u64>,
-    /// `disk.idle_build_dirs`: may tier 3 empty a live checkout's WHOLE idle
-    /// build directory ([`Witness::IdleWhole`], [`DEFAULT_IDLE_BUILD_DIRS`])?
-    /// Off, its rows are listed, report-only.
+    /// `disk.idle_build_dirs`.
     pub idle_build_dirs: bool,
-    /// `disk.idle_build_days`: tier 3's window ([`idle::DEFAULT_IDLE_BUILD_DAYS`]);
-    /// below one turns tier 3 off (`0` must not make every checkout idle).
+    /// `disk.idle_build_days`: tier 3's window ([`idle::DEFAULT_IDLE_BUILD_DAYS`]).
     pub idle_build_days: i64,
 }
 
@@ -485,9 +226,7 @@ impl Default for Config {
     }
 }
 
-/// Every `[disk]` key of `aterm.toml`, in the order the help lists them. The
-/// window's settings checker reads this list, so none of them reads there as
-/// "unknown".
+/// Every `[disk]` key of `aterm.toml`, in the order the help lists them.
 pub const KEYS: &[&str] = &[
     "apply",
     "warn_free_gib",
@@ -500,8 +239,7 @@ pub const KEYS: &[&str] = &[
 ];
 
 impl Config {
-    /// The shipped default of `[disk] <key>` as a settings help line shows it
-    /// (`None` for a key that is not in [`KEYS`]).
+    /// The shipped default of `[disk] <key>` as a settings help line shows it (`None` for a key that is not in [`KEYS`]).
     #[must_use]
     pub fn default_shown(key: &str) -> Option<String> {
         let d = Config::default();
@@ -520,11 +258,7 @@ impl Config {
         })
     }
 
-    /// How a negative `[disk] <key>` is read, for the settings checker to say
-    /// on the line: `auto_free_gib` reads it as `0`, off (never the default,
-    /// which would leave removal on for a person who wrote `-1` to stop it);
-    /// the other two fall back to their defaults, the safe side for a warning
-    /// threshold and for a stale window.
+    /// How a negative `[disk] <key>` is read, for the settings checker to say on the line.
     #[must_use]
     pub fn negative_reading(key: &str) -> Option<String> {
         let d = Config::default();
@@ -537,32 +271,25 @@ impl Config {
         })
     }
 
-    /// Whether tier 3 ([`Witness::IdleWhole`]) may remove: `disk.idle_build_dirs`
-    /// on and `disk.idle_build_days` at least one, the automatic removal on.
+    /// Whether tier 3 ([`Witness::IdleWhole`]) may remove.
     #[must_use]
     pub fn idle_whole_on(&self) -> bool {
         self.idle_build_dirs && self.idle_build_days >= 1 && self.auto_free_gib > 0
     }
 
-    /// Whether `free` bytes is below the automatic floor. An unknown figure
-    /// never is: nothing is removed on a number nobody read.
+    /// Whether `free` bytes is below the automatic floor.
     #[must_use]
     pub fn below_auto_floor(&self, free: Option<u64>) -> bool {
         self.auto_free_gib > 0 && free.is_some_and(|f| f < self.auto_free_gib.saturating_mul(GIB))
     }
 
-    /// Whether `free` bytes is below the warning: the volume is `low` (or
-    /// worse) and tiers 1 and 2 run ([`pass_plan`]). An unknown figure never
-    /// is.
+    /// Whether `free` bytes is below the warning: the volume is `low` (or worse) and tiers 1 and 2 run ([`pass_plan`]).
     #[must_use]
     pub fn below_warn(&self, free: Option<u64>) -> bool {
         free.is_some_and(|f| f < self.warn_free_gib.saturating_mul(GIB))
     }
 
-    /// The free bytes the idle tiers (2 and 3) reclaim up to ([`pass_plan`]):
-    /// the warning, and below the floor never less than where the recent tier
-    /// stops ([`Self::pressure_target_bytes`]), so no recent cache goes while
-    /// an idle one is left.
+    /// The free bytes the idle tiers (2 and 3) reclaim up to ([`pass_plan`]).
     #[must_use]
     pub fn idle_target_bytes(&self, short: bool) -> u64 {
         let warn = self.warn_free_gib.saturating_mul(GIB);
@@ -573,8 +300,7 @@ impl Config {
         }
     }
 
-    /// The free bytes the pressure pass reclaims up to before it stops: the
-    /// floor plus [`PRESSURE_MARGIN_GIB`].
+    /// The free bytes the pressure pass reclaims up to before it stops: the floor plus [`PRESSURE_MARGIN_GIB`].
     #[must_use]
     pub fn pressure_target_bytes(&self) -> u64 {
         self.auto_free_gib
@@ -582,38 +308,19 @@ impl Config {
             .saturating_mul(GIB)
     }
 
-    /// This config on a volume of `total` bytes with no knob written
-    /// ([`Self::on_volume`]).
+    /// This config on a volume of `total` bytes with no knob written ([`Self::on_volume`]).
     #[must_use]
     pub fn for_volume(self, total: Option<u64>) -> Config {
         self.on_volume(total, Written::default())
     }
 
-    /// This config on a volume of `total` bytes: a floor the owner did not
-    /// write raised to [`AUTO_FREE_PCT`] of it, at most
-    /// [`AUTO_FREE_SHARE_MAX_GIB`], and a warning not written to
-    /// [`WARN_FREE_PCT`], at most [`WARN_FREE_SHARE_MAX_GIB`] — each the
-    /// larger of the knob and the share. A value the owner WROTE is read as
-    /// written ([`Written`]); a floor of `0`, off, stays off. An unknown size
-    /// changes nothing.
-    ///
-    /// ON A SMALL VOLUME an UNWRITTEN fixed default is first held to a share
-    /// of it ([`SMALL_WARN_MAX_PCT`], [`SMALL_FLOOR_MAX_PCT`], never below one
-    /// GiB): the 40 GiB warning is 34 % of a 128 GB disk, which read `low` for
-    /// good (design `docs/DESIGN-disk-awareness-2026-10-17.md` §2.4). The hold
-    /// only lowers a line, so it only ever removes less.
+    /// This config on a volume of `total` bytes.
     #[must_use]
     pub fn on_volume(self, total: Option<u64>, written: Written) -> Config {
         self.on_volume_with(total, written, None)
     }
 
-    /// [`Self::on_volume`], the lines raised to this machine's ROOM (`room`
-    /// bytes, [`room`]; `disk.room_gib` pins it, read as written): an
-    /// UNWRITTEN warning at least twice the room, an unwritten floor at least
-    /// the room, each never below the line [`Self::on_volume`] gives (design
-    /// §2.4). With no room (none measured, no size) the lines are
-    /// [`Self::on_volume`]'s, so a lost history never removes more. A written
-    /// knob is read as written, and a floor of `0`, off, stays off.
+    /// [`Self::on_volume`], the lines raised to this machine's ROOM (`room` bytes, [`room`]; `disk.room_gib` pins it, read as written).
     #[must_use]
     pub fn on_volume_with(self, total: Option<u64>, written: Written, room: Option<u64>) -> Config {
         let base = self.on_volume_base(total, written);
@@ -639,15 +346,11 @@ impl Config {
         }
     }
 
-    /// [`Self::on_volume`]'s lines: the knob or the volume's share, the
-    /// small-volume hold first.
     fn on_volume_base(self, total: Option<u64>, written: Written) -> Config {
         let Some(total) = total else {
             return self;
         };
         let share = |pct: u64, max: u64| (total / 100).saturating_mul(pct).div_ceil(GIB).min(max);
-        // At most `pct` of the volume, in whole GiB rounded down, and never
-        // below one: a hold must not turn a floor that is on into `0`, off.
         let held = |knob: u64, pct: u64| knob.min((total.saturating_mul(pct) / 100 / GIB).max(1));
         Config {
             warn_free_gib: if written.warn_free_gib {
@@ -666,25 +369,19 @@ impl Config {
         }
     }
 
-    /// The thresholds in force on a volume of `total` bytes with no knob
-    /// written ([`Self::thresholds_on`]).
+    /// The thresholds in force on a volume of `total` bytes with no knob written ([`Self::thresholds_on`]).
     #[must_use]
     pub fn thresholds(self, total: Option<u64>) -> Thresholds {
         self.thresholds_on(total, Written::default())
     }
 
-    /// The thresholds in force on a volume of `total` bytes
-    /// ([`Self::on_volume`]), in bytes. The emergency line is the larger of
-    /// [`EMERGENCY_FREE_GIB`] and [`EMERGENCY_FREE_PCT`] of the volume (that
-    /// share at most [`EMERGENCY_FREE_SHARE_MAX_GIB`]), and never above a
-    /// floor that is on: below the emergency the pass must be able to run.
+    /// The thresholds in force on a volume of `total` bytes ([`Self::on_volume`]), in bytes.
     #[must_use]
     pub fn thresholds_on(self, total: Option<u64>, written: Written) -> Thresholds {
         self.thresholds_with(total, written, None)
     }
 
-    /// [`Self::thresholds_on`], the lines raised to the volume's room
-    /// ([`Self::on_volume_with`]).
+    /// [`Self::thresholds_on`], the lines raised to the volume's room ([`Self::on_volume_with`]).
     #[must_use]
     pub fn thresholds_with(
         self,
@@ -711,18 +408,14 @@ impl Config {
         }
     }
 
-    /// How long nothing of a gone owner may have been written before its build
-    /// directory goes whole: `target_stale_days`, at least one day (a window of
-    /// `0` makes every profile idle; it does not make a session ended).
+    /// How long nothing of a gone owner may have been written before its build directory goes whole.
     #[must_use]
     pub fn quiet_s(&self) -> i64 {
         self.target_stale_days.max(1).saturating_mul(DAY_S)
     }
 }
 
-/// Which of the volume-scaled `[disk]` knobs the owner WROTE in aterm.toml
-/// ([`Config::on_volume`]): a written one is read as written, never raised
-/// to the volume's share.
+/// Which of the volume-scaled `[disk]` knobs the owner WROTE in aterm.toml ([`Config::on_volume`]).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Written {
     /// `disk.auto_free_gib` is written.
@@ -731,8 +424,7 @@ pub struct Written {
     pub warn_free_gib: bool,
 }
 
-/// The free-space thresholds in force on one volume ([`Config::thresholds`]),
-/// in bytes.
+/// The free-space thresholds in force on one volume ([`Config::thresholds`]), in bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Thresholds {
     /// Below this the report warns.
@@ -750,16 +442,10 @@ pub struct Thresholds {
 /// Where a volume stands against its [`Thresholds`] ([`Thresholds::level`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Level {
-    /// Free bytes were not measured, and no measured inode emergency is known.
     Unknown,
-    /// At or above the warning threshold.
     Ok,
-    /// Below the warning threshold, at or above the floor.
     Low,
-    /// Below the automatic floor: the pass runs.
     Short,
-    /// Below the emergency line, or out of inodes: writes are failing or
-    /// about to.
     Emergency,
 }
 
@@ -778,10 +464,7 @@ impl Level {
 }
 
 impl Thresholds {
-    /// Where `free` bytes and `files_free` inodes stand. Without free bytes,
-    /// only a measured inode emergency is decisive; otherwise the level is
-    /// [`Level::Unknown`]. The floor at `0` (off) is never crossed, the
-    /// emergency always can be.
+    /// Where `free` bytes and `files_free` inodes stand.
     #[must_use]
     pub fn level(&self, free: Option<u64>, files_free: Option<u64>) -> Level {
         if free.is_some_and(|f| f < self.emergency)
@@ -798,10 +481,7 @@ impl Thresholds {
     }
 }
 
-// The survey — every fact the decision needs, injected
-
-/// One vendor version under `versions/`: a directory, or (every native
-/// install, and Windows') a single executable FILE.
+/// One vendor version under `versions/`: a directory, or (every native install, and Windows') a single executable FILE.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct VersionDir {
     /// Absolute path.
@@ -810,9 +490,7 @@ pub struct VersionDir {
     pub bytes: u64,
     /// `true` when the walk hit [`MAX_WALK_ENTRIES`] and stopped.
     pub bytes_partial: bool,
-    /// Why it is KEPT though it is not the live one ([`versions::kept`]): a
-    /// Claude Code lock holds it, a running process uses it, or (Windows) it
-    /// is newer than the live one. `None`: nothing holds it.
+    /// Why it is KEPT though it is not the live one ([`versions::kept`]).
     pub kept: Option<String>,
 }
 
@@ -831,13 +509,10 @@ pub struct StoreBuild {
     pub bytes_partial: bool,
 }
 
-/// What made the host re-measure: the owner's verb, or the window's harness
-/// host on its tick.
+/// What made the host re-measure: the owner's verb, or the window's harness host on its tick.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Trigger {
-    /// The owner typed the verb.
     OnDemand,
-    /// The host's tick.
     Tick,
 }
 
@@ -852,8 +527,7 @@ impl Trigger {
     }
 }
 
-/// Everything [`report`] reads. Built by [`scan`] on a real machine and by a
-/// literal in every test, so the decision core never touches a disk.
+/// Everything [`report`] reads.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Survey {
     /// Unix seconds.
@@ -862,57 +536,42 @@ pub struct Survey {
     pub trigger: Trigger,
     /// The volume the free figure is about.
     pub root: PathBuf,
-    /// Free bytes, or `None` when the query failed: the report then says
-    /// `free=unknown` and never warns on a number it does not have.
+    /// Free bytes, or `None` when the query failed: the report then says `free=unknown` and never warns on a number it does not have.
     pub free_bytes: Option<u64>,
-    /// The device of [`Self::root`], when it could be read: below the floor
-    /// only a build directory on it gets pressure rows (reclaiming one
-    /// anywhere else frees nothing here).
+    /// The device of [`Self::root`], when it could be read.
     pub volume_device: Option<u64>,
     /// Candidate build directories.
     pub targets: Vec<TargetDir>,
     /// Vendor version directories.
     pub versions: Vec<VersionDir>,
-    /// The live version, when the launcher named one ([`versions::live_of`]):
-    /// the entry the live symlink's resolved target lies in, or (Windows) the
-    /// one the launcher is a byte-for-byte copy of.
+    /// The live version, when the launcher named one ([`versions::live_of`]).
     pub live_version: Option<PathBuf>,
-    /// When [`Self::live_version`] was named BY CONTENT, the launcher that is
-    /// its copy (`~\.local\bin\claude.exe`); `None` when a link named it.
+    /// When [`Self::live_version`] was named BY CONTENT, the launcher that is its copy (`~\.local\bin\claude.exe`).
     pub live_copy: Option<PathBuf>,
-    /// Why no live version was named, when the launcher named none (`None`:
-    /// the live symlink did not resolve).
+    /// Why no live version was named, when the launcher named none (`None`: the live symlink did not resolve).
     pub live_unnamed: Option<String>,
     /// Builds in the package store.
     pub store: Vec<StoreBuild>,
     /// The live build of each program in the store.
     pub live_builds: BTreeMap<String, String>,
-    /// Where transcripts live. Nothing under this path is ever removable,
-    /// whatever else says otherwise.
+    /// Where transcripts live.
     pub transcripts_root: Option<PathBuf>,
     /// Is the vendor's `claude project purge` available to surface?
     pub purge_available: bool,
     /// `$HOME`, for the report's lines (`~/…`).
     pub home: Option<PathBuf>,
-    /// What the search for build directories could not finish
-    /// ([`discover::Discovered::notes`]).
+    /// What the search for build directories could not finish ([`discover::Discovered::notes`]).
     pub notes: Vec<String>,
-    /// The volume's ROOM, when one was read ([`room`]): what one round of
-    /// this machine's builds takes. The lines in force already read it
-    /// ([`Config::on_volume_with`]); this is the figure reported.
+    /// The volume's ROOM, when one was read ([`room`]): what one round of this machine's builds takes.
     pub room: Option<u64>,
-    /// The mount table read for this survey ([`aterm_sysprobe::volumes::table`]):
-    /// a whole removal needs it read whole and no mount point inside the
-    /// directory ([`whole_fences`]). `None`: not read, and nothing goes whole.
+    /// The mount table read for this survey ([`aterm_sysprobe::volumes::table`]).
     pub mounts: Option<aterm_sysprobe::volumes::Table>,
-    /// The free bytes an agent's wait needs and the pass adopted (a DEMAND,
-    /// `await sys free>=`): tiers 1-3 then run until free space is the need
-    /// plus the floor, at any measured level ([`pass_plan`]); never tier 4.
+    /// The free bytes an agent's wait needs and the pass adopted (a DEMAND, `await sys free>=`).
     pub demand: Option<u64>,
 }
 
 impl Survey {
-    /// An empty survey at `now`. Tests build from this.
+    /// An empty survey at `now`.
     #[must_use]
     pub fn new(now: i64) -> Survey {
         Survey {
@@ -939,121 +598,58 @@ impl Survey {
     }
 }
 
-// The witness
-
-/// Why a row is safe to remove. There is no `Witness::None`: a row with no
-/// witness is not a candidate.
+/// Why a row is safe to remove.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Witness {
-    /// A build directory a build tool laid, with idle cargo profiles whose
-    /// `incremental/` no build holds ([`target::target_witness`]).
     StaleBuildDir {
-        /// The marker found (`CACHEDIR.TAG` or `.rustc_info.json`).
         marker: String,
-        /// How many of its profiles are candidates.
         profiles: usize,
-        /// Days since the most recently used candidate's caches were written.
         idle_days: i64,
-        /// The threshold every candidate cleared.
         threshold_days: i64,
-        /// The build directories named inside it, each of which decides its
-        /// own profiles (the report's `speaker`): the row neither counts nor
-        /// reclaims a profile in one of them ([`target::reclaim_leaving`]).
         leaves: Vec<PathBuf>,
     },
-    /// Below the floor, one cargo profile inside the idle window, taken in
-    /// least-recently-used order until free space is back above the floor
-    /// (the module docs). The row's path is the profile's.
     LeastRecentlyUsed {
-        /// The build directory's marker.
         marker: String,
-        /// The build directory the profile is in (canonical).
         build_dir: PathBuf,
-        /// Its last use, as the survey read it (unix seconds).
         last_used: i64,
-        /// Seconds since then, at the survey.
         age_s: i64,
-        /// The idle window it is inside.
         threshold_days: i64,
-        /// The floor free space fell below, in GiB.
         floor_gib: u64,
-        /// The free GiB the pass stops at.
         until_gib: u64,
-        /// The device measured: the reclaim refuses the build directory on
-        /// any other.
         device: u64,
     },
-    /// Once the volume is low, a WHOLE build directory whose owner is gone (a
-    /// Claude Code session no running process names, a removed workspace's
-    /// build cache), every profile unwritten for the quiet window, none
-    /// locked, no mount point inside it and nothing of another user's in it
-    /// (the module docs; [`target::reclaim_whole`]). Tier 1: nobody builds
-    /// there again, so it goes first and takes all. The row's path is the
-    /// build directory's.
     OwnerGone {
-        /// Its marker: a signed `CACHEDIR.TAG`, the mark of a cache.
         marker: String,
-        /// Whose it was and why they are gone, as the survey read it.
         evidence: String,
-        /// What the removal checks again first ([`discover::still_gone`]).
         owner: discover::Owner,
-        /// The newest last use of its profiles (unix seconds).
         last_used: i64,
-        /// Seconds since then, at the survey.
         age_s: i64,
-        /// The quiet window, in seconds ([`Config::quiet_s`]).
         quiet_s: i64,
-        /// The floor free space fell below, in GiB.
         floor_gib: u64,
-        /// The free GiB the pass stops at.
         until_gib: u64,
-        /// The device measured.
         device: u64,
     },
-    /// Below the floor (or for a demand), a live checkout's WHOLE idle build
-    /// directory, its profiles EMPTIED under their locks and kept as empty
-    /// directories with their lock files (tier 3, [`idle`],
-    /// [`target::reclaim_profiles`]). The row's path is the build directory's.
     IdleWhole {
-        /// Its marker: a signed `CACHEDIR.TAG`.
         marker: String,
-        /// The checkout judged quiet (its working tree, git files, processes).
         checkout: PathBuf,
-        /// How many profiles it holds.
         profiles: usize,
-        /// The newest last use of its profiles (unix seconds).
         last_used: i64,
-        /// Seconds since then, at the survey.
         age_s: i64,
-        /// The idle window it cleared, in days (`disk.idle_build_days`).
         window_days: i64,
-        /// The device measured.
         device: u64,
     },
-    /// A vendor version directory the live symlink does not point at.
     NotLinkTarget {
-        /// The live symlink's resolved target, named so a reader can check.
         live: PathBuf,
     },
-    /// A vendor version the live launcher is not a COPY of (Windows:
-    /// `claude.exe` is the installer's byte-for-byte copy of the live one,
-    /// named by equal length and SHA-256: [`versions::copy_of`]).
     NotLauncherCopy {
-        /// The launcher compared.
         launcher: PathBuf,
-        /// The version it is a copy of, named so a reader can check.
         live: PathBuf,
     },
-    /// A package build superseded by the live build of the same program.
     Superseded {
-        /// The program.
         program: String,
-        /// The live build that supersedes this one.
         live: String,
     },
-    /// The vendor's own command reports it; this module only surfaces it.
     VendorReports {
-        /// The command that owns it.
         command: &'static str,
     },
 }
@@ -1140,24 +736,12 @@ impl Witness {
     }
 }
 
-/// THE TIERS of the automatic pass, cheapest to the owner first (design
-/// `docs/DESIGN-disk-awareness-2026-10-17.md` §4.1): each a kind of
-/// [`Class::CargoTargets`] row, admitted at a measured level and stopped at
-/// its own target ([`pass_plan`]).
+/// THE TIERS of the automatic pass, cheapest to the owner first (design `docs/DESIGN-disk-awareness-2026-10-17.md` §4.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Tier {
-    /// Ended owners' build directories, whole ([`Witness::OwnerGone`]):
-    /// nobody builds there again. From `low`; takes all.
     EndedOwners = 1,
-    /// Idle profiles' `incremental/` ([`Witness::StaleBuildDir`]). From
-    /// `low`, to the idle target.
     IdleIncremental = 2,
-    /// Whole idle build directories of live checkouts, their profiles
-    /// emptied. From `short`, or a demand.
     IdleWhole = 3,
-    /// Recent profiles' `incremental/`, least recently used first
-    /// ([`Witness::LeastRecentlyUsed`]). Only at a measured `short`, never
-    /// for a demand.
     RecentIncremental = 4,
 }
 
@@ -1169,15 +753,12 @@ impl Tier {
     }
 }
 
-// The report
-
 /// One reported target.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Row {
     /// The safelist class this row belongs to.
     pub class: Class,
-    /// The path, or — for a delegated row with no single path — the tree the
-    /// delegate owns.
+    /// The path, or — for a delegated row with no single path — the tree the delegate owns.
     pub path: PathBuf,
     /// Bytes this row would free, as far as the walk got.
     pub bytes: u64,
@@ -1185,16 +766,14 @@ pub struct Row {
     pub bytes_partial: bool,
     /// Why it is safe to remove.
     pub witness: Witness,
-    /// May [`apply`] remove it? A delegated class is `false`, and so is a row
-    /// whose own witness was undermined (an unresolvable live symlink).
+    /// May [`apply`] remove it? A delegated class is `false`, and so is a row whose own witness was undermined (an unresolvable live symlink).
     pub removable: bool,
     /// Why not, when `removable` is `false`.
     pub blocked: Option<String>,
 }
 
 impl Row {
-    /// The tier of the automatic pass that would take it ([`Tier`]); `None`
-    /// for a row of another class.
+    /// The tier of the automatic pass that would take it ([`Tier`]); `None` for a row of another class.
     #[must_use]
     pub fn tier(&self) -> Option<Tier> {
         if self.class != Class::CargoTargets {
@@ -1209,8 +788,7 @@ impl Row {
         }
     }
 
-    /// The text-report line, every path in it spelled as a person reads it
-    /// ([`shown`]).
+    /// The text-report line, every path in it spelled as a person reads it ([`shown`]).
     #[must_use]
     pub fn line(&self) -> String {
         let size = human_bytes(self.bytes);
@@ -1232,14 +810,7 @@ impl Row {
     }
 }
 
-/// `text` as a person reads it: on Windows every path in it spelled plain —
-/// `\\?\C:\x` reads `C:\x` and `\\?\UNC\srv\share\x` reads `\\srv\share\x`
-/// ([`aterm_sysprobe::paths::plain`]'s rule, applied to each path a line of
-/// prose names; any other verbatim spelling, a volume GUID path, stays).
-/// DISPLAY ONLY: a row's path, the journal's and `--json`'s keep the verbatim
-/// spelling, the one that opens past `MAX_PATH` (a tool reads those), and
-/// nothing parses this answer back into a path. Off Windows the text as it
-/// is: there a `\` is a character of a name.
+/// `text` as a person reads it: on Windows every path in it spelled plain.
 #[must_use]
 pub fn shown(text: &str) -> std::borrow::Cow<'_, str> {
     const VERBATIM: &str = r"\\?\";
@@ -1283,11 +854,9 @@ pub struct Report {
     pub warn: bool,
     /// The rows: class order, then the order the pass takes them, then path.
     pub rows: Vec<Row>,
-    /// Notes about rows the report did not make (an unresolvable live symlink,
-    /// a class with no roots). Data, not warnings.
+    /// Notes about rows the report did not make (an unresolvable live symlink, a class with no roots).
     pub notes: Vec<String>,
-    /// The largest build directories this report cannot reclaim, biggest
-    /// first, at most [`MAX_HOGS`], each with what frees it.
+    /// The largest build directories this report cannot reclaim, biggest first, at most [`MAX_HOGS`], each with what frees it.
     pub hogs: Vec<Hog>,
     /// `$HOME`, for the lines (`~/…`).
     pub home: Option<PathBuf>,
@@ -1299,14 +868,12 @@ pub struct Report {
     pub demand: Option<u64>,
 }
 
-/// One build directory — or an x.py checkout's whole `build/` — holding
-/// bytes no row of the report would free.
+/// One build directory — or an x.py checkout's whole `build/` — holding bytes no row of the report would free.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Hog {
     /// The directory.
     pub path: PathBuf,
-    /// The bytes it holds that no row frees: its size ([`target::total_bytes`])
-    /// less what its rows would release.
+    /// The bytes it holds that no row frees: its size ([`target::total_bytes`]) less what its rows would release.
     pub bytes: u64,
     /// `true` when a size walk stopped at its bound: the figure is a floor.
     pub bytes_partial: bool,
@@ -1315,17 +882,13 @@ pub struct Hog {
 }
 
 impl Hog {
-    /// The line a person reads: `$HOME/trust/build 94.0 GiB (x.py bootstrap; run
-    /// scripts/slim_build.py)`.
+    /// The line a person reads: `$HOME/trust/build 94.0 GiB (x.py bootstrap; run scripts/slim_build.py)`.
     #[must_use]
     pub fn line(&self, home: Option<&Path>) -> String {
         self.line_at(&display_home(&self.path, home))
     }
 
-    /// [`Self::line`] in at most `chars` characters, for a place that clips at
-    /// the end: what it is and why stay whole, and the path gives way first
-    /// (its middle written `…`, down to [`HOG_PATH_MIN`] characters); only
-    /// then is the line cut at its end.
+    /// [`Self::line`] in at most `chars` characters, for a place that clips at the end.
     #[must_use]
     pub fn line_within(&self, home: Option<&Path>, chars: usize) -> String {
         let full: Vec<char> = display_home(&self.path, home).chars().collect();
@@ -1351,8 +914,6 @@ impl Hog {
         line
     }
 
-    /// The line, the path written `at`, every path in why it is kept spelled
-    /// as a person reads it ([`shown`]).
     fn line_at(&self, at: &str) -> String {
         format!(
             "{at} {}{} ({})",
@@ -1363,13 +924,8 @@ impl Hog {
     }
 }
 
-/// The fewest characters of a hog's path [`Hog::line_within`] keeps.
 const HOG_PATH_MIN: usize = 24;
 
-/// `path` as a person reads it (on Windows [`aterm_sysprobe::paths::plain`]:
-/// a canonical `\\?\C:\x` reads `C:\x`), with `$HOME` written `~` — whichever
-/// of the two spellings either is in (`$HOME` from the environment is plain,
-/// a canonical path verbatim). DISPLAY ONLY.
 fn display_home(path: &Path, home: Option<&Path>) -> String {
     fn plain(p: &Path) -> std::borrow::Cow<'_, Path> {
         if cfg!(windows) {
@@ -1406,10 +962,7 @@ impl Report {
             .fold(0u64, |a, r| a.saturating_add(r.bytes))
     }
 
-    /// Bytes every removable row but a pressure row would free: what an
-    /// apply takes whole. The pressure rows are
-    /// [`Self::reclaimable_under_pressure`], since the pass takes only as
-    /// many of them as free space needs.
+    /// Bytes every removable row but a pressure row would free: what an apply takes whole.
     #[must_use]
     pub fn reclaimable_total(&self) -> u64 {
         self.rows
@@ -1418,10 +971,7 @@ impl Report {
             .fold(0u64, |a, r| a.saturating_add(r.bytes))
     }
 
-    /// Bytes tier 3 would free if it emptied every whole idle build directory
-    /// it lists, removable or not (report-only while `disk.idle_build_dirs` is
-    /// off): an upper bound, counted apart since those directories' idle
-    /// caches are tier 2's rows too.
+    /// Bytes tier 3 would free if it emptied every whole idle build directory it lists, removable or not (report-only while `disk.idle_build_dirs` is off).
     #[must_use]
     pub fn idle_whole_up_to(&self) -> u64 {
         self.rows
@@ -1430,10 +980,7 @@ impl Report {
             .fold(0u64, |a, r| a.saturating_add(r.bytes))
     }
 
-    /// Bytes the pressure rows would free if the pass took every one: an
-    /// upper bound, since it stops once free space is back at
-    /// [`Config::pressure_target_bytes`] (or the bytes it released cover what
-    /// it was short). `0` at or above the floor.
+    /// Bytes the pressure rows would free if the pass took every one.
     #[must_use]
     pub fn reclaimable_under_pressure(&self) -> u64 {
         self.rows
@@ -1543,7 +1090,6 @@ impl Report {
     }
 }
 
-/// One row as JSON, shared by the report and the ledger.
 fn row_value(r: &Row) -> Value {
     let mut o = Map::new();
     o.insert("class".to_owned(), Value::from(r.class.as_str().to_owned()));
@@ -1568,8 +1114,6 @@ fn row_value(r: &Row) -> Value {
     {
         o.insert("last_used".to_owned(), Value::from(rfc3339_utc(*last_used)));
     }
-    // Whose it was: the session and its folder — what the ledger needs to
-    // explain a whole removal.
     if let Witness::OwnerGone { owner, .. } = &r.witness {
         o.insert(
             "owner".to_owned(),
@@ -1585,26 +1129,17 @@ fn row_value(r: &Row) -> Value {
     Value::Object(o)
 }
 
-/// A path, bounded, for a row.
 fn path_text(p: &Path) -> String {
     truncate_bytes(&p.display().to_string(), ROW_TEXT_CAP).to_owned()
 }
 
-// The report, as a pure function
-
-/// Build the §5.5 report from `survey`. Pure: no clock, no filesystem, no
-/// environment.
+/// Build the §5.5 report from `survey`.
 #[must_use]
 pub fn report(survey: &Survey, config: Config) -> Report {
     let warn_free_bytes = config.warn_free_gib.saturating_mul(GIB);
     let mut rows: Vec<Row> = Vec::new();
     let mut notes: Vec<String> = Vec::new();
 
-    // -- atpkg-gc: superseded package builds, delegated -------------------
-    // Only what atpkg's retention would take ([`gc_retains`]): `aterm pkg gc`
-    // keeps the live build AND its rollback target, so a row naming the
-    // rollback would point at bytes the delegate never frees (measured
-    // 2026-10-17: eight rows of 3.6 GiB, and `aterm pkg gc` reclaimed nothing).
     let d = Delegate::AtermPkgGc;
     for b in survey.store.iter().take(MAX_ROWS_PER_CLASS) {
         let Some(live) = survey.live_builds.get(&b.program) else {
@@ -1631,11 +1166,8 @@ pub fn report(survey: &Survey, config: Config) -> Report {
         });
     }
 
-    // -- claude-stale-versions --------------------------------------------
     match &survey.live_version {
         Some(live) => {
-            // What proved it live: the link's target, or (Windows) the
-            // launcher's content.
             let witness = match &survey.live_copy {
                 Some(launcher) => Witness::NotLauncherCopy {
                     launcher: launcher.clone(),
@@ -1647,9 +1179,6 @@ pub fn report(survey: &Survey, config: Config) -> Report {
                 if &v.path == live {
                     continue;
                 }
-                // Not the live one, but something still holds it (a lock, a
-                // running process, an update not yet swapped in): reported,
-                // never removable.
                 rows.push(Row {
                     class: Class::ClaudeStaleVersions,
                     path: v.path.clone(),
@@ -1662,9 +1191,6 @@ pub fn report(survey: &Survey, config: Config) -> Report {
             }
         }
         None if !survey.versions.is_empty() => {
-            // The tie breaks safe: with no live version named, "not the live
-            // one" is an assumption, so every version directory is listed as
-            // blocked.
             let why = survey
                 .live_unnamed
                 .as_deref()
@@ -1689,22 +1215,15 @@ pub fn report(survey: &Survey, config: Config) -> Report {
         None => {}
     }
 
-    // -- cargo-targets -----------------------------------------------------
-    // One verdict per profile, the innermost build directory's (`speaker`);
-    // only directories clearing their fences had their profiles probed, so
-    // only they decide.
     let targets = &survey.targets[..survey.targets.len().min(MAX_TARGETS)];
     let deciding: Vec<&Path> = targets
         .iter()
         .filter(|t| t.fences().is_ok())
         .map(|t| t.path.as_path())
         .collect();
-    // Below the floor, a build directory whose owner is gone goes whole: its
-    // own row, and none of its profiles a row of another kind.
     let mut whole: Vec<&Path> = Vec::new();
     let mut next = 0;
     for t in targets {
-        // Its place among `deciding`, when it is one of them.
         let at = t.fences().is_ok().then(|| {
             next += 1;
             next - 1
@@ -1765,7 +1284,6 @@ pub fn report(survey: &Survey, config: Config) -> Report {
     idle_whole_rows(survey, config, &mut rows, &mut notes);
     notes.extend(survey.notes.iter().cloned());
 
-    // -- claude-purge: surfaced, delegated --------------------------------
     if survey.purge_available {
         let d = Delegate::ClaudeProjectPurge;
         rows.push(Row {
@@ -1784,7 +1302,6 @@ pub fn report(survey: &Survey, config: Config) -> Report {
         });
     }
 
-    // Class order, then the order the pass takes them in (`lru_rank`).
     rows.sort_by(|a, b| {
         a.class
             .cmp(&b.class)
@@ -1811,10 +1328,6 @@ pub fn report(survey: &Survey, config: Config) -> Report {
     }
 }
 
-/// Tier 3's rows ([`Witness::IdleWhole`]): each build directory the survey
-/// assessed whole and found idle ([`idle::assess`]), removable only while
-/// `disk.idle_build_dirs` is on (report-only before: what it would free here
-/// is measured first), and a note for each it keeps and why.
 fn idle_whole_rows(survey: &Survey, config: Config, rows: &mut Vec<Row>, notes: &mut Vec<String>) {
     for t in survey.targets.iter().take(MAX_TARGETS) {
         match &t.idle {
@@ -1859,14 +1372,6 @@ fn idle_whole_rows(survey: &Survey, config: Config, rows: &mut Vec<Row>, notes: 
     }
 }
 
-/// Does atpkg's retention keep `build` of `program`, whose live build is
-/// `live` ([`atpkg::gc::reclaimable`]'s rule: the live build, and the newest
-/// installed build below it, the one `aterm pkg rollback` lands on)? A build
-/// whose name is not a build number is kept: the store names every installed
-/// build by one, so such a tree is not one atpkg would collect either. The
-/// rule here may keep MORE than atpkg (it cannot read whether a rollback may
-/// land on that build, which atpkg reads from the channel), never less, so no
-/// row names bytes `aterm pkg gc` will not free.
 fn gc_retains(store: &[StoreBuild], program: &str, live: &str, build: &str) -> bool {
     if build == live {
         return true;
@@ -1883,10 +1388,6 @@ fn gc_retains(store: &[StoreBuild], program: &str, live: &str, build: &str) -> b
     rollback == Some(build)
 }
 
-/// Below the floor, with `disk.dead_build_dirs` on, whether `t` goes whole
-/// because its owner is gone: `None` when the question does not arise, `Err`
-/// with why not (it is then judged as any other), `Ok` with the witness.
-/// `leaves` are the build directories named inside it.
 fn whole_verdict(
     t: &TargetDir,
     survey: &Survey,
@@ -1896,8 +1397,6 @@ fn whole_verdict(
     let discover::Owned::Gone { evidence, owner } = &t.owned else {
         return None;
     };
-    // Tier 1 runs from `low` (or for a demand), and only while the automatic
-    // removal is on.
     let low = config.below_warn(survey.free_bytes) || survey.demand.is_some();
     if !config.dead_build_dirs || config.auto_free_gib == 0 || !low {
         return None;
@@ -1970,17 +1469,6 @@ fn whole_verdict(
     })())
 }
 
-/// THE FENCES EVERY WHOLE REMOVAL GAINS (design §4.5), read at the survey (the
-/// reclaim reads the mount table again under the locks): no mount point at or
-/// under the build directory, from a mount table read WHOLE (`mounts`; a Linux
-/// bind mount shares its source's `st_dev`, so the walk's device fence cannot
-/// see it, and a cut table proves nothing), and no entry of another user, from
-/// the `lstat`s the sizing walk made (one would fail to delete and leave a
-/// half-removed directory).
-///
-/// # Errors
-///
-/// Why the directory does not go whole.
 fn whole_fences(
     t: &TargetDir,
     mounts: Option<&aterm_sysprobe::volumes::Table>,
@@ -1992,12 +1480,7 @@ fn whole_fences(
     Ok(())
 }
 
-/// No mount point of `table` at or under `dir`, and `table` read whole
-/// ([`aterm_sysprobe::volumes::mounts_under`]).
-///
-/// # Errors
-///
-/// The table was not read whole, or a volume is mounted there.
+/// No mount point of `table` at or under `dir`, and `table` read whole ([`aterm_sysprobe::volumes::mounts_under`]).
 pub(crate) fn mounts_clear(
     dir: &Path,
     table: Option<&aterm_sysprobe::volumes::Table>,
@@ -2017,7 +1500,6 @@ pub(crate) fn mounts_clear(
     }
 }
 
-/// The build directory a [`Class::CargoTargets`] row frees bytes of.
 fn row_dir(r: &Row) -> Option<&Path> {
     match &r.witness {
         Witness::StaleBuildDir { .. } | Witness::OwnerGone { .. } | Witness::IdleWhole { .. } => {
@@ -2028,10 +1510,6 @@ fn row_dir(r: &Row) -> Option<&Path> {
     }
 }
 
-/// The largest build directories the report cannot reclaim ([`Report::hogs`]):
-/// each sized one not inside another and still `there`, less what its rows
-/// (and its nested ones') would free, x.py's grouped under their checkout's
-/// `build/`, biggest first, at most [`MAX_HOGS`].
 fn hogs(
     survey: &Survey,
     config: Config,
@@ -2084,11 +1562,7 @@ fn hogs(
     out
 }
 
-/// The largest build directories a pass left: [`Report::hogs`] given what
-/// [`apply_auto`] did (`done`). A refused row freed nothing and a row that
-/// released other than its size freed only what its unlinks released, so each
-/// is a hog again (a gone owner's saying why it stayed); a row the pass did not
-/// reach stays counted. A directory no longer `there` is no hog.
+/// The largest build directories a pass left: [`Report::hogs`] given what [`apply_auto`] did (`done`).
 #[must_use]
 pub fn hogs_left(
     survey: &Survey,
@@ -2096,7 +1570,6 @@ pub fn hogs_left(
     done: &Applied,
     there: &dyn Fn(&Path) -> bool,
 ) -> Vec<Hog> {
-    // Each row that did not go as planned: what it freed, and why.
     let mut short: Vec<(&Path, u64, String)> = done
         .denials
         .iter()
@@ -2113,9 +1586,6 @@ pub fn hogs_left(
             .iter()
             .filter(|(row, removed)| match &row.witness {
                 Witness::OwnerGone { .. } => !removed.units.contains(&row.path),
-                // A profile row is sized as its removal counts
-                // (`target::cache_bytes`, the blocks its unlinks release):
-                // released other than that, what it left differs too.
                 Witness::StaleBuildDir { .. }
                 | Witness::LeastRecentlyUsed { .. }
                 | Witness::IdleWhole { .. } => removed.bytes != row.bytes,
@@ -2142,7 +1612,6 @@ pub fn hogs_left(
                 return Some(r.clone());
             };
             if matches!(r.witness, Witness::OwnerGone { .. }) {
-                // `hog_of` reads it as the survey's own kept rows read.
                 notes.push(format!(
                     "cargo-targets: {} — its owner is gone, but it does not go whole: {why}",
                     r.path.display()
@@ -2157,8 +1626,6 @@ pub fn hogs_left(
     hogs(survey, rep.config, &rows, &notes, there)
 }
 
-/// Where a hog is listed (x.py's under its checkout's `build/`) and what it
-/// is, with what frees it.
 fn hog_of(t: &TargetDir, config: Config, survey: &Survey, notes: &[String]) -> (PathBuf, String) {
     use discover::{Origin, Owned};
     let gone_why = |what: &str| -> String {
@@ -2194,8 +1661,6 @@ fn hog_of(t: &TargetDir, config: Config, survey: &Survey, notes: &[String]) -> (
             t.path.clone(),
             gone_why("an ended Claude Code session's scratch build"),
         ),
-        // Kept is not live: the session may run, or may only not be ruled out
-        // (a process or registry not read whole, no transcript known).
         (Origin::ClaudeScratch { .. }, Owned::Live(why)) => {
             (t.path.clone(), format!("kept: {why}"))
         }
@@ -2229,18 +1694,10 @@ fn hog_of(t: &TargetDir, config: Config, survey: &Survey, notes: &[String]) -> (
     }
 }
 
-/// Is `r` a pressure row — a recent profile's, which only a volume below
-/// the floor gives up, least recently used first, and of which a pass takes
-/// only as many as free space needs ([`Witness::LeastRecentlyUsed`], tier 4)?
 fn is_pressure(r: &Row) -> bool {
     matches!(r.witness, Witness::LeastRecentlyUsed { .. })
 }
 
-/// Where a row sorts inside its class — the order the pass takes them in,
-/// cheapest to the owner first ([`Tier`]): a gone owner's whole build
-/// directory, the longest unwritten first (nothing builds there again); then
-/// the idle caches, the longest idle first; then the least recently used
-/// recent profiles, oldest first.
 fn lru_rank(r: &Row) -> (u8, i64) {
     let tier = r.tier().map_or(0, Tier::number);
     match r.witness {
@@ -2252,11 +1709,6 @@ fn lru_rank(r: &Row) -> (u8, i64) {
     }
 }
 
-/// Below the automatic floor, a row for each profile the pressure pass may
-/// take ([`TargetDir::pressure_candidates`]) in a build directory on the
-/// measured volume, oldest first, at most [`MAX_ROWS_PER_CLASS`], and a note
-/// for each recent one kept, each profile decided by [`speaker`]; at or above
-/// the floor, one note.
 fn pressure_rows(
     survey: &Survey,
     config: Config,
@@ -2289,8 +1741,6 @@ fn pressure_rows(
         return;
     }
     let until_gib = config.auto_free_gib.saturating_add(PRESSURE_MARGIN_GIB);
-    // The build directories that may give a pressure row: fenced, on the
-    // measured volume, their recent profiles probed.
     let mut eligible: Vec<(&TargetDir, String, u64)> = Vec::new();
     for t in survey.targets.iter().take(MAX_TARGETS) {
         let (Ok(marker), Some(device)) = (t.fences(), survey.volume_device) else {
@@ -2364,17 +1814,7 @@ fn pressure_rows(
     rows.extend(picks);
 }
 
-/// Is `path` at or under `dir`, where a miss must never be read as "not
-/// under" (S1, the one path rule): by [`aterm_sysprobe::paths::is_under`] —
-/// on Windows any case, a verbatim or a plain spelling — and where that
-/// cannot place the two (on Windows two roots, an 8.3 name), by FILE
-/// IDENTITY: `dir`'s file id met among `path`'s ancestors, each a link
-/// followed. `None`: neither could tell (an identity not read), which every
-/// caller reads as under. The key's "not under" stands, so both sides must
-/// be spelled alike (the canonical build directories and profiles
-/// [`speaker`] and [`decided_by`] compare); the transcripts fence, whose
-/// root is not canonical, is [`under_transcripts`]. Unix always answers by
-/// component, as before.
+/// Is `path` at or under `dir`, where a miss must never be read as "not under" (S1, the one path rule).
 pub(crate) fn placed_under(path: &Path, dir: &Path) -> Option<bool> {
     if let Some(placed) = aterm_sysprobe::paths::is_under(path, dir) {
         return Some(placed);
@@ -2388,20 +1828,6 @@ pub(crate) fn placed_under(path: &Path, dir: &Path) -> Option<bool> {
     Some(false)
 }
 
-/// Is `path` at or under the transcripts root `root`, for the removal
-/// fences ([`guard`], [`guard_row`])? By [`placed_under`]; and on Windows by
-/// FILE IDENTITY as well even where the key says "not under": the root comes
-/// as the home names it (`home.join(".claude").join("projects")`), never
-/// canonical, while a row's path is canonical, so a `~\.claude` that is a
-/// junction to another folder of the same drive would read beside every
-/// transcript (`\\?\C:\data\claude\projects\x` against
-/// `C:\Users\u\.claude\projects`). The root's identity met among `path`'s
-/// ancestors is under; one of them that cannot be read is `None` (under,
-/// to the fence). A root that is not there holds nothing, so only the key
-/// can place a path under it — never a refusal for a path the key cannot
-/// place against a root that does not exist (a hand-named directory on
-/// another drive while `~\.claude\projects` was never made). Unix compares
-/// by component, as before.
 fn under_transcripts(path: &Path, root: &Path) -> Option<bool> {
     #[cfg(windows)]
     {
@@ -2428,9 +1854,6 @@ fn under_transcripts(path: &Path, root: &Path) -> Option<bool> {
     }
 }
 
-/// Are `a` and `b` one path by the one path rule (on Windows the key of
-/// [`aterm_sysprobe::paths::windows_key`]; a path it cannot key is no
-/// other's)? By component elsewhere, as before.
 fn same_place(a: &Path, b: &Path) -> bool {
     if cfg!(windows) {
         let key = aterm_sysprobe::paths::windows_key;
@@ -2440,11 +1863,6 @@ fn same_place(a: &Path, b: &Path) -> bool {
     }
 }
 
-/// Which of `dirs` speaks for the profile at `profile`, in both passes: the
-/// innermost one holding it (the first of two equal ones). A build directory
-/// named inside another is surveyed twice, each survey probing the profile's
-/// locks, and a build starting in between could make them disagree; only the
-/// innermost survey decides.
 fn speaker(dirs: &[&Path], profile: &Path) -> Option<usize> {
     dirs.iter()
         .enumerate()
@@ -2453,10 +1871,6 @@ fn speaker(dirs: &[&Path], profile: &Path) -> Option<usize> {
         .map(|(i, _)| i)
 }
 
-/// `t` as the idle pass judges it: only the profiles it speaks for among
-/// `deciding` ([`speaker`]; `at` is its place there, `None` when it fails its
-/// fences), and the deciding directories named inside it, whose profiles its
-/// row leaves alone ([`target::reclaim_leaving`]).
 fn decided_by(t: &TargetDir, at: Option<usize>, deciding: &[&Path]) -> (TargetDir, Vec<PathBuf>) {
     let mut own = t.clone();
     let Some(at) = at else {
@@ -2472,8 +1886,6 @@ fn decided_by(t: &TargetDir, at: Option<usize>, deciding: &[&Path]) -> (TargetDi
     (own, leaves)
 }
 
-/// What a build directory leaves to the ones named inside it, as the clause
-/// its row or note ends with — nothing when it holds none.
 fn leaving(leaves: &[PathBuf]) -> String {
     match leaves {
         [] => String::new(),
@@ -2488,16 +1900,13 @@ fn leaving(leaves: &[PathBuf]) -> String {
     }
 }
 
-/// Whole days between `then` and `now`. A future mtime answers 0 ("brand
-/// new"), which never clears a threshold: the safe direction for a machine
-/// whose clock moved.
+/// Whole days between `then` and `now`.
 #[must_use]
 pub fn age_days(now: i64, then: i64) -> i64 {
     now.saturating_sub(then).max(0) / DAY_S
 }
 
-/// A byte count a person can read, deliberately coarse: the bounded walk has
-/// no byte precision.
+/// A byte count a person can read, deliberately coarse: the bounded walk has no byte precision.
 #[must_use]
 pub fn human_bytes(b: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
@@ -2514,29 +1923,17 @@ pub fn human_bytes(b: u64) -> String {
     }
 }
 
-// Apply — the plan, the guard, the denial
-
 /// Why an apply, or one path inside it, was refused.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Refusal {
-    /// No class was named. This is the default, not an error: report-only.
     NoClass,
-    /// `disk.apply` is off.
     ApplyOff(Class),
-    /// The class is owned by another command.
     Delegated(Class, Delegate),
-    /// The path is not on the report for this class.
     NotReported(PathBuf),
-    /// The path is on the report but its row is blocked.
     Blocked(PathBuf, String),
-    /// The path is, or is under, the transcripts root.
     Transcript(PathBuf),
-    /// The path is relative, or walks up through `..`.
     NotAnchored(PathBuf),
-    /// The removal itself failed.
     RemoveFailed(PathBuf, String),
-    /// Its intent row could not be journalled (no journal, a full disk), so
-    /// the removal did not start: nothing is removed without a record.
     Unjournalled(PathBuf),
 }
 
@@ -2624,7 +2021,7 @@ impl Refusal {
     }
 }
 
-/// One denial row. Every refusal above becomes one of these; none is dropped.
+/// One denial row.
 #[must_use]
 pub fn denial_row(now: i64, sid: &str, refusal: &Refusal) -> String {
     let mut o = Map::new();
@@ -2646,9 +2043,7 @@ pub fn denial_row(now: i64, sid: &str, refusal: &Refusal) -> String {
         .unwrap_or_else(|_| "{\"kind\":\"denial\",\"reason\":\"unserializable\"}".to_owned())
 }
 
-/// One intent row, written before a row's removal starts: a pass cut short
-/// (a quit, a panic, an update) leaves this on record even with no outcome
-/// row.
+/// One intent row, written before a row's removal starts.
 #[must_use]
 pub fn intent_row(now: i64, sid: &str, row: &Row) -> String {
     let mut o = Map::new();
@@ -2665,10 +2060,7 @@ pub fn intent_row(now: i64, sid: &str, row: &Row) -> String {
         .unwrap_or_else(|_| "{\"kind\":\"removing\",\"reason\":\"unserializable\"}".to_owned())
 }
 
-/// One removal row. The witness travels with it, and what it says was
-/// removed is the remover's answer (the bytes actually released, each unit
-/// that went, each skipped unit and every delete error), never the report's
-/// estimate.
+/// One removal row.
 #[must_use]
 pub fn removal_row(now: i64, sid: &str, row: &Row, removed: &Removed) -> String {
     let mut o = Map::new();
@@ -2752,24 +2144,15 @@ pub fn report_row(now: i64, sid: &str, rep: &Report) -> String {
         .unwrap_or_else(|_| "{\"kind\":\"report\",\"reason\":\"unserializable\"}".to_owned())
 }
 
-/// What an apply would do. Pure.
+/// What an apply would do.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Plan {
-    /// No class named: the default, and it removes nothing.
     ReportOnly(Refusal),
-    /// A class was named and refused.
     Denied(Refusal),
-    /// A class was named and these rows would go.
     Remove(Class, Vec<Row>),
 }
 
-/// Decide what `class` would do against `rep`. Pure: no filesystem.
-///
-/// `None` is [`Plan::ReportOnly`]: the design's "report-only by default" as
-/// the shape of the function. A tier-3 row ([`Witness::IdleWhole`]) is never
-/// the owner's verb's to take, whatever `disk.apply` says: emptying a live
-/// checkout's whole build directory is the window's pass's alone, below the
-/// floor or for an agent's demand (design §4.7). The verb reports those rows.
+/// Decide what `class` would do against `rep`.
 #[must_use]
 pub fn plan(rep: &Report, class: Option<Class>) -> Plan {
     let Some(class) = class else {
@@ -2790,15 +2173,7 @@ pub fn plan(rep: &Report, class: Option<Class>) -> Plan {
     Plan::Remove(class, rows)
 }
 
-/// The second fence: `path` may be removed under `class` only if all of these
-/// hold, else a [`Refusal`] for the caller to journal. It repeats [`plan`]'s
-/// work on purpose: a plan is a list the caller could edit, and what reaches
-/// the filesystem is a path, checked here.
-///
-/// # Errors
-///
-/// The path is relative or contains `..`; it is under the transcripts root;
-/// it is not a removable row of `class` on this report.
+/// The second fence: `path` may be removed under `class` only if all of these hold, else a [`Refusal`] for the caller to journal.
 pub fn guard(
     rep: &Report,
     survey_transcripts: Option<&Path>,
@@ -2829,13 +2204,7 @@ pub fn guard(
     Ok(())
 }
 
-/// [`guard`] for the very row `row`, not only its path: one build directory
-/// can be the path of two rows (tier 2's idle caches and tier 3's whole
-/// directory), and the row removed must be one the report holds as it is.
-///
-/// # Errors
-///
-/// As [`guard`]; and no row of the report is `row`.
+/// [`guard`] for the very row `row`, not only its path.
 pub fn guard_row(
     rep: &Report,
     survey_transcripts: Option<&Path>,
@@ -2859,7 +2228,6 @@ pub fn guard_row(
     Ok(())
 }
 
-/// The anchor and transcript fences of [`guard`].
 fn guard_path(survey_transcripts: Option<&Path>, path: &Path) -> Result<(), Refusal> {
     if !path.is_absolute()
         || path
@@ -2876,39 +2244,24 @@ fn guard_path(survey_transcripts: Option<&Path>, path: &Path) -> Result<(), Refu
     Ok(())
 }
 
-/// What one row's removal did — the remover's answer, never the report's
-/// estimate.
+/// What one row's removal did — the remover's answer, never the report's estimate.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Removed {
-    /// Bytes it released. For [`Class::CargoTargets`], the blocks each
-    /// unlinked file released when it was that file's last name
-    /// ([`target`]'s docs); for a [`Class::ClaudeStaleVersions`] row, its
-    /// reported size.
+    /// Bytes it released.
     pub bytes: u64,
-    /// What went, each a directory that is gone (a profile's `incremental/`,
-    /// or the row's own directory).
+    /// What went, each a directory that is gone (a profile's `incremental/`, or the row's own directory).
     pub units: Vec<PathBuf>,
-    /// What was left alone, and why (a profile a build holds, a lock that
-    /// could not be created).
+    /// What was left alone, and why (a profile a build holds, a lock that could not be created).
     pub skipped: Vec<(PathBuf, String)>,
-    /// Every delete error on the way, one line each, naming what stayed. A
-    /// failed delete is reported here and never counted in [`Self::bytes`].
+    /// Every delete error on the way, one line each, naming what stayed.
     pub trouble: Vec<String>,
 }
 
 /// Which of the pressure pass's stops fired ([`Stop`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StopBy {
-    /// Free space measured again is at [`Config::pressure_target_bytes`].
     Measured,
-    /// The bytes the pass's own removals released (as the unlinks counted
-    /// them) cover what free space was short of that target at its first
-    /// pressure row, though the figure has not risen to match: a local
-    /// snapshot, a clone sharing the blocks or a deferred free can keep an
-    /// unlink out of `statfs` for a while, and without this stop the
-    /// pass would take every row it has.
     Counted,
-    /// Free space could not be measured again.
     Unmeasured,
 }
 
@@ -2929,19 +2282,15 @@ impl StopBy {
 pub struct Stop {
     /// Which stop fired.
     pub by: StopBy,
-    /// Free bytes as measured before the row it stopped at; `None`: the
-    /// measurement failed, and nothing is removed on a number nobody read.
+    /// Free bytes as measured before the row it stopped at.
     pub free: Option<u64>,
     /// The free bytes the pass reclaims up to.
     pub target: u64,
-    /// What free space was short of `target` when it was measured before the
-    /// first pressure row (0 when the pass stopped there).
+    /// What free space was short of `target` when it was measured before the first pressure row (0 when the pass stopped there).
     pub short: u64,
-    /// The bytes the pressure rows it took released, as their unlinks
-    /// counted them.
+    /// The bytes the pressure rows it took released, as their unlinks counted them.
     pub released: u64,
-    /// The rows of its tier it did not take (each, in tier 4, a build cache
-    /// more recently used than every one it took).
+    /// The rows of its tier it did not take (each, in tier 4, a build cache more recently used than every one it took).
     pub left: usize,
     /// The tier it stopped ([`Tier::number`]); `None` for a row of no tier.
     pub tier: Option<u8>,
@@ -2984,26 +2333,16 @@ impl Stop {
     }
 }
 
-/// One step of an apply, told to the caller as it happens ([`apply`],
-/// [`apply_auto`]), so a journal written from it records a removal's intent
-/// before the removal starts.
+/// One step of an apply, told to the caller as it happens ([`apply`], [`apply_auto`]), so a journal written from it records a removal's intent before the removal starts.
 #[derive(Debug, Clone, Copy)]
 pub enum Step<'a> {
-    /// This row is about to be removed: it passed [`guard`].
     Removing(&'a Row),
-    /// This row's removal finished, and this is what it did.
     Removed(&'a Row, &'a Removed),
-    /// A refusal: of the whole apply, of one path, or a removal that failed.
     Denied(&'a Refusal),
-    /// The pressure pass stopped: enough is free again (or it could not
-    /// tell).
     Stopped(&'a Stop),
 }
 
-/// What [`apply`] and [`apply_auto`] tell each [`Step`] to. It answers whether
-/// the step is on record: a [`Step::Removing`] that is not stops that row's
-/// removal before it starts ([`Refusal::Unjournalled`]). Other answers are
-/// ignored.
+/// What [`apply`] and [`apply_auto`] tell each [`Step`] to.
 pub type Record<'a> = dyn FnMut(&Step<'_>) -> bool + 'a;
 
 /// The journal line of one [`Step`].
@@ -3017,9 +2356,7 @@ pub fn step_row(now: i64, sid: &str, step: &Step<'_>) -> String {
     }
 }
 
-/// One `reserve` row of the disk ledger: the reserve ([`reserve`]) was
-/// `released` (its `bytes` unlinked, so the rows after it can be written) or
-/// `written`, or `refused` (something not ours in its place).
+/// One `reserve` row of the disk ledger.
 #[must_use]
 pub fn reserve_row(now: i64, action: &str, bytes: Option<u64>, text: &str) -> String {
     let mut o = Map::new();
@@ -3036,9 +2373,7 @@ pub fn reserve_row(now: i64, action: &str, bytes: Option<u64>, text: &str) -> St
         .unwrap_or_else(|_| "{\"kind\":\"reserve\",\"reason\":\"unserializable\"}".to_owned())
 }
 
-/// Why the watch's sweep took a build directory of aterm's Rust build cache,
-/// in words, with the figures it was taken on (`atpkg::build_cache::Unused`):
-/// the `text` of its ledger rows ([`sweep_row`]).
+/// Why the watch's sweep took a build directory of aterm's Rust build cache, in words, with the figures it was taken on (`atpkg::build_cache::Unused`).
 #[must_use]
 pub fn sweep_words(why: atpkg::build_cache::Unused) -> String {
     use atpkg::build_cache::Unused;
@@ -3078,9 +2413,7 @@ pub fn sweep_words(why: atpkg::build_cache::Unused) -> String {
     }
 }
 
-/// Why the watch's sweep took a build directory, in the few words its line in
-/// the watch's account carries (the log, the freed entry, the resume): `its
-/// workspace is gone`, `unwritten 31d`.
+/// Why the watch's sweep took a build directory, in the few words its line in the watch's account carries (the log, the freed entry, the resume).
 #[must_use]
 pub fn sweep_reason(why: atpkg::build_cache::Unused) -> String {
     use atpkg::build_cache::Unused;
@@ -3100,9 +2433,6 @@ pub fn sweep_reason(why: atpkg::build_cache::Unused) -> String {
     }
 }
 
-/// A span of a sweep's figures a person can read: minutes under an hour,
-/// hours under two days (the sweep's day-long window reads `24h`, not `1d`),
-/// whole days after.
 fn sweep_span(d: std::time::Duration) -> String {
     let s = d.as_secs();
     if s < 3_600 {
@@ -3114,12 +2444,7 @@ fn sweep_span(d: std::time::Duration) -> String {
     }
 }
 
-/// One `build-cache-sweep` row of the disk ledger: a build directory of
-/// aterm's Rust build cache — or, for `Unused::Stale`, the stage holding what
-/// goes from one that stays — `bytes` in it, about to go whole under its locks
-/// (`action` `removing`, the write-ahead intent row) or gone (`removed`), and
-/// why ([`sweep_words`]; `atpkg::build_cache::reclaim_watched`, the watch's
-/// pass with no session supervised).
+/// One `build-cache-sweep` row of the disk ledger: a build directory of aterm's Rust build cache.
 #[must_use]
 pub fn sweep_row(
     now: i64,
@@ -3151,8 +2476,7 @@ pub fn sweep_row(
         .unwrap_or_else(|_| "{\"kind\":\"build-cache-sweep\"}".to_owned())
 }
 
-/// One `poke` row of the disk ledger: something saw the disk full and asked
-/// for a look now ([`poke`]), with the free figure measured on it.
+/// One `poke` row of the disk ledger.
 #[must_use]
 pub fn poke_row(now: i64, cause: &poke::Cause, free: Option<u64>, level: Level) -> String {
     let mut o = Map::new();
@@ -3178,8 +2502,7 @@ pub fn poke_row(now: i64, cause: &poke::Cause, free: Option<u64>, level: Level) 
         .unwrap_or_else(|_| "{\"kind\":\"poke\",\"reason\":\"unserializable\"}".to_owned())
 }
 
-/// One stop row: where the pressure pass stopped, on what free figure, and
-/// how many rows it left.
+/// One stop row: where the pressure pass stopped, on what free figure, and how many rows it left.
 #[must_use]
 pub fn stop_row(now: i64, sid: &str, stop: &Stop) -> String {
     let mut o = Map::new();
@@ -3216,32 +2539,22 @@ pub fn stop_row(now: i64, sid: &str, stop: &Stop) -> String {
 /// What an apply did.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Applied {
-    /// The rows that were (at least in part) removed, each with what its
-    /// removal did.
+    /// The rows that were (at least in part) removed, each with what its removal did.
     pub removed: Vec<(Row, Removed)>,
     /// Every refusal, in the order they happened.
     pub denials: Vec<Refusal>,
     /// Bytes the removals released, as each remover counted them.
     pub freed_bytes: u64,
-    /// Where the pass ended, when a stop ended it before its last row: the
-    /// last of [`Self::stops`].
+    /// Where the pass ended, when a stop ended it before its last row: the last of [`Self::stops`].
     pub stopped: Option<Stop>,
     /// Every tier's stop, in the order they fired.
     pub stops: Vec<Stop>,
-    /// The pass did not reach every row it may have: why (the search for
-    /// build directories stopped short). [`Self::ran_out`] reads it.
+    /// The pass did not reach every row it may have: why (the search for build directories stopped short).
     pub unfinished: Option<String>,
 }
 
 impl Applied {
-    /// Did the pass RUN OUT of what it may take: every row of every tier it
-    /// admitted tried, no tier stopped by a figure it could not read or by
-    /// the bytes it counted ([`StopBy::Unmeasured`], [`StopBy::Counted`] —
-    /// rows of that tier were left), and the search for build directories
-    /// finished ([`Self::unfinished`])? A tier stopped because free space
-    /// MEASURED at its target ran out of nothing, but it reached its target.
-    /// What an agent's demand reads as `why=spent` (`ERR unmet`) only when
-    /// this holds and free space is still below its need.
+    /// Did the pass RUN OUT of what it may take.
     #[must_use]
     pub fn ran_out(&self) -> bool {
         self.unfinished.is_none() && self.stops.iter().all(|s| s.by == StopBy::Measured)
@@ -3284,18 +2597,13 @@ pub struct Went {
     pub whole: usize,
     /// Gone owners' build directories that went only in part.
     pub in_part: usize,
-    /// Live checkouts' whole idle build directories whose profiles were
-    /// emptied (tier 3), in whole or in part.
+    /// Live checkouts' whole idle build directories whose profiles were emptied (tier 3), in whole or in part.
     pub idle_whole: usize,
     /// Every other unit that went.
     pub profiles: usize,
 }
 
-/// One row of a pass, with where its tier stops: `None` takes it whatever
-/// free space reads (a gone owner's build directory: nobody builds there
-/// again; the owner's verb's idle rows), `Some(bytes)` measures free space
-/// again before it and leaves it once free space is at that target
-/// ([`remove_rows`]).
+/// One row of a pass, with where its tier stops.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Planned {
     /// The row.
@@ -3304,23 +2612,7 @@ pub struct Planned {
     pub target: Option<u64>,
 }
 
-/// THE TIER PLANNER of the automatic pass (design §4.1). Pure. The
-/// removable [`Class::CargoTargets`] rows in the order they are taken —
-/// cheapest to the owner first ([`Tier`], [`lru_rank`]) — each with its
-/// tier's target, of the tiers the MEASURED level admits:
-///
-/// | tier | admitted | stops at |
-/// |---|---|---|
-/// | 1 ended owners | `low` or worse, or a demand | takes all |
-/// | 2 idle `incremental/` | `low` or worse, or a demand | the idle target ([`Config::idle_target_bytes`]), or the demand's |
-/// | 3 whole idle build directories | `short` or worse, or a demand | as tier 2 |
-/// | 4 recent `incremental/` | a measured `short` only — never a demand | the floor plus [`PRESSURE_MARGIN_GIB`] |
-///
-/// A demand ([`Report::demand`], need bytes) targets the need plus the floor,
-/// so the build leaves the volume above its floor and tier 4 never runs for
-/// it. Never a row of another class, whatever `disk.apply` says. `None` at
-/// `ok` with no demand, on an unknown free figure, or with the automatic
-/// removal off (`auto_free_gib = 0`).
+/// THE TIER PLANNER of the automatic pass (design §4.1).
 #[must_use]
 pub fn pass_plan(rep: &Report) -> Option<Vec<Planned>> {
     let c = rep.config;
@@ -3366,8 +2658,7 @@ pub fn pass_plan(rep: &Report) -> Option<Vec<Planned>> {
     )
 }
 
-/// The rows [`pass_plan`] would take, without their targets: what the
-/// automatic grant reaches. `None` where it reaches nothing.
+/// The rows [`pass_plan`] would take, without their targets: what the automatic grant reaches.
 #[must_use]
 pub fn auto_plan(rep: &Report) -> Option<Vec<Row>> {
     pass_plan(rep).map(|rows| rows.into_iter().map(|p| p.row).collect())
@@ -3376,14 +2667,10 @@ pub fn auto_plan(rep: &Report) -> Option<Vec<Row>> {
 /// A row's remover: what [`apply`] calls for each row that passed [`guard`].
 pub type Remove<'a> = dyn FnMut(&Row) -> std::io::Result<Removed> + 'a;
 
-/// Free space on the measured volume, measured again: what the pass reads
-/// before each row that has a target. `None` (a failed measurement) stops it.
+/// Free space on the measured volume, measured again: what the pass reads before each row that has a target.
 pub type Measure<'a> = dyn FnMut() -> Option<u64> + 'a;
 
-/// Carry out [`pass_plan`] against `rep` through `remove`, each path behind
-/// [`guard`] as [`apply`]'s are, each [`Step`] told to `record` as it
-/// happens, and free space re-read through `measure` before each row with a
-/// target: each tier stops at its own. `None` when the plan reaches nothing.
+/// Carry out [`pass_plan`] against `rep` through `remove`, each path behind [`guard`] as [`apply`]'s are, each [`Step`] told to `record` as it happens, and free space re-read through `measure` before each row with a target.
 pub fn apply_auto(
     rep: &Report,
     transcripts: Option<&Path>,
@@ -3405,19 +2692,7 @@ pub fn apply_auto(
     Some(done)
 }
 
-/// Carry out `class` against `rep`, removing through `remove` and telling
-/// `record` each [`Step`] as it happens. The owner's verb takes every
-/// removable row of the class named but tier 3's ([`plan`]): a gone owner's
-/// build directory and an idle cache whole, whatever free space reads (the
-/// grant is the class); a
-/// recent profile's row ([`Witness::LeastRecentlyUsed`], on a report taken
-/// below the floor) is preceded by a fresh `measure`, and those stop at
-/// [`Config::pressure_target_bytes`], as the tick's do.
-///
-/// `remove` is injected so this is testable without a disk ([`remover`] is
-/// the real one); [`guard`] runs before every call to it, and a guard refusal
-/// is recorded rather than returned, so one refused path does not abandon
-/// the rest of the grant.
+/// Carry out `class` against `rep`, removing through `remove` and telling `record` each [`Step`] as it happens.
 pub fn apply(
     rep: &Report,
     transcripts: Option<&Path>,
@@ -3435,7 +2710,6 @@ pub fn apply(
         }
         Plan::Remove(_, rows) => rows,
     };
-    // `class` is Some on this path: `plan` answered `Remove`.
     let Some(class) = class else {
         done.denials.push(Refusal::NoClass);
         return done;
@@ -3460,25 +2734,13 @@ pub fn apply(
     done
 }
 
-/// Where one tier of a pass stands ([`remove_rows`]).
 #[derive(Default)]
 struct TierRun {
-    /// What free space was short of the tier's target at its first measure.
     short: Option<u64>,
-    /// What its rows released, as counted.
     released: u64,
-    /// It stopped.
     stopped: bool,
 }
 
-/// Remove `rows` of `class`, each behind [`guard`], into `done`: the intent
-/// told before each removal (a removal whose intent is not on record does
-/// not start), its outcome after. Before each row with a target free space is
-/// measured again, and its TIER stops (a [`Stop`], told and kept) once free
-/// space is at that target, once the bytes the tier's rows released cover
-/// what it was short at the first of them ([`StopBy::Counted`]); a figure
-/// that cannot be read stops the whole pass ([`StopBy::Unmeasured`]). A row
-/// with no target is taken whatever free space reads.
 fn remove_rows(
     rep: &Report,
     transcripts: Option<&Path>,
@@ -3561,29 +2823,7 @@ fn remove_rows(
     }
 }
 
-/// The real remover. [`Class::CargoTargets`]: an idle row through
-/// [`target::reclaim_leaving`] (never a profile of a build directory named
-/// inside it), a pressure row through [`target::reclaim_lru`] on the device
-/// it was measured on, a gone owner's directory through [`discover::unused`]
-/// and then [`target::reclaim_whole`]. [`Class::ClaudeStaleVersions`]:
-/// [`remove_tree`]. A delegated class never reaches a remover ([`plan`]).
-///
-/// `sessions` reads this instance's sessions AS THEY STAND NOW (tier 3's
-/// clause 4a, [`idle::Sessions`]): the window's re-reads its tabs, the
-/// owner's verb answers its own working directory. Every OS: a tier-3 row
-/// is judged against it again before the reclaim opens anything and under
-/// each profile's locks — never only against the survey's copy, which is a
-/// look old by then — each working directory resolved as the survey
-/// resolves it ([`idle::SessionCwd::on`]: quietly, link by link, and only
-/// where the mount table places every step on a local, non-automounted
-/// volume — never a folder on a share or an automount, through a link onto
-/// one or spelled so the table cannot place it — so no read of it waits on
-/// a stalled server with cargo's locks held). One not resolved is compared
-/// as written on unix; on Windows it keeps every candidate of its volume,
-/// and all of them when it names none. Each reading is on a mount table
-/// read whole: before the reclaim, the one that reading judges by; under the
-/// locks, the very one the mount fence read there. A table not read whole
-/// refuses the removal.
+/// The real remover.
 pub fn remover(
     judge: Judge,
     sessions: impl Fn() -> idle::Sessions,
@@ -3597,15 +2837,7 @@ pub fn remover(
     )
 }
 
-/// [`remover`], a gone owner's build directory judged against the running
-/// processes `processes` reads ([`discover::Processes`]) and a session's
-/// against the running Claude Codes and the directories the processes were
-/// started with (`census`, [`discover::Census`]): the product's are every
-/// process of this uid, a test's the ones it names. A live checkout's whole
-/// idle build directory is judged against the sessions `sessions` reads at
-/// the removal ([`remover`]), each reading on a mount table `tables` reads
-/// (the product's [`aterm_sysprobe::volumes::table`]; a test's one it
-/// shapes).
+/// [`remover`], judging gone owners and sessions against `processes` ([`discover::Processes`]) and `census` ([`discover::Census`]).
 pub(crate) fn remover_among(
     judge: Judge,
     processes: impl Fn(&[PathBuf], &[u32]) -> std::io::Result<aterm_uds::holders::PathScan>,
@@ -3632,9 +2864,6 @@ pub(crate) fn remover_among(
             Witness::StaleBuildDir { leaves, .. } => {
                 target::reclaim_leaving(&row.path, &judge, leaves)
             }
-            // [`discover::unused`] is asked before the reclaim opens anything
-            // there ([`discover::recheck`] says why); the owner is checked
-            // again under every lock.
             Witness::OwnerGone {
                 owner,
                 last_used,
@@ -3656,23 +2885,6 @@ pub(crate) fn remover_among(
                     &mut || discover::recheck(owner, &row.path, judge.now, *quiet_s, &census),
                 )
             }
-            // TIER 3: clause 4 read again at the removal — no session of this
-            // instance in the checkout or the build directory and none whose
-            // working directory is unknown, as `sessions` reads them NOW; no
-            // process there; its git files and its working tree quiet —
-            // BEFORE anything there is opened; then each profile emptied
-            // under its locks, its directory and lock files kept, clause 3
-            // and the mount table read again under them, and the sessions,
-            // the processes and the git files once more, under each profile's
-            // locks, right before its delete ([`target::reclaim_profiles`]).
-            //
-            // Every reading of the sessions is on a table read whole (every
-            // OS): on one that is not, clause 4a resolves no working
-            // directory, and unix compares each as written — a `$PWD` in the
-            // checkout spelled through a link would read as elsewhere. So
-            // the table read before the locks refuses here when it is not
-            // whole, and under the locks the sessions and the git files are
-            // judged on the one table the mount fence read there.
             Witness::IdleWhole {
                 checkout,
                 last_used,
@@ -3699,9 +2911,6 @@ pub(crate) fn remover_among(
                 )
                 .map_err(no_longer)?;
                 discover::unused_under(&dirs, &processes).map_err(no_longer)?;
-                // The table the fence read under this profile's locks, taken
-                // by the check right after it (asked only once the fence
-                // passed): each profile's checks read a table of their own.
                 let locked: std::cell::Cell<Option<aterm_sysprobe::volumes::Table>> =
                     std::cell::Cell::new(None);
                 target::reclaim_profiles(
@@ -3744,17 +2953,10 @@ pub(crate) fn remover_among(
     }
 }
 
-// The resume — a session the full disk stopped is told once space is back
-
-/// The ledger's name for the resume typed into a session whose screen said
-/// the disk was full ([`resume_text`]), once space is back.
+/// The ledger's name for the resume typed into a session whose screen said the disk was full ([`resume_text`]), once space is back.
 pub const RULE_DISK_RESUME: &str = "disk-resume@v1";
 
-/// What is typed into a session whose Claude Code said `ENOSPC` (or
-/// `EDQUOT`) while the volume measured full, once a look measures it back:
-/// the harness's mark, what aterm freed (`freed` bytes; `top`, the largest
-/// of what went, at most two named), and the ask to retry what failed. It
-/// says no more than was measured.
+/// What is typed into a session whose Claude Code said `ENOSPC` (or `EDQUOT`) while the volume measured full, once a look measures it back.
 #[must_use]
 pub fn resume_text(code: &str, freed: u64, top: &[String]) -> String {
     let what = if freed == 0 {
@@ -3774,11 +2976,7 @@ pub fn resume_text(code: &str, freed: u64, top: &[String]) -> String {
     )
 }
 
-/// Type `text` into tab `sid` of the instance at `sock` as one fenced turn
-/// (`upgrade_drive::type_fenced`: under the hand, judged on a fresh read —
-/// a box, a draft, a person typing or an owner's hold refuses it). The
-/// step's word: `typed`, or `wait:<why>` to try again at the next idle
-/// point.
+/// Type `text` into tab `sid` of the instance at `sock` as one fenced turn (`upgrade_drive::type_fenced`: under the hand, judged on a fresh read — a box, a draft, a person typing or an owner's hold refuses it).
 #[must_use]
 pub fn type_resume(sock: &str, sid: &str, text: &str) -> String {
     let mut c = match crate::RelayClient::connect_local_beside(sock) {
@@ -3798,78 +2996,54 @@ pub fn type_resume(sock: &str, sid: &str, text: &str) -> String {
     }
 }
 
-// The scan — the one impure half
-
-/// Where to look. Every path is injected; this module reads no environment
-/// variable and derives no path from a name.
+/// Where to look.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Roots {
     /// The volume the free-space figure is about.
     pub volume: Option<PathBuf>,
     /// The vendor's `versions/` directory.
     pub versions_dir: Option<PathBuf>,
-    /// The live launcher: the `claude` symlink into `versions/` (macOS,
-    /// Linux), or `claude.exe`, the installer's COPY of the live version
-    /// (Windows) ([`versions::live_of`]).
+    /// The live launcher: the `claude` symlink into `versions/` (macOS, Linux), or `claude.exe`, the installer's COPY of the live version (Windows) ([`versions::live_of`]).
     pub live_link: Option<PathBuf>,
-    /// Claude Code's lock folder (`~/.local/state/claude/locks`): a version
-    /// with a `<version>.lock` there is held ([`versions::kept`]).
+    /// Claude Code's lock folder (`~/.local/state/claude/locks`): a version with a `<version>.lock` there is held ([`versions::kept`]).
     pub version_locks: Option<PathBuf>,
-    /// The digest cache under the harness state directory
-    /// ([`versions::HASH_FILE`]): a launcher copy is matched by content
-    /// without reading a quarter GiB twice on every survey.
+    /// The digest cache under the harness state directory ([`versions::HASH_FILE`]).
     pub version_hashes: Option<PathBuf>,
-    /// The package store's root (`<prefix>/store`), read only: every row it
-    /// produces is delegated to `aterm pkg gc`, so nothing here takes the
-    /// store lock or writes under it.
+    /// The package store's root (`<prefix>/store`), read only.
     pub store_dir: Option<PathBuf>,
     /// Candidate build directories, named by the caller.
     pub targets: Vec<PathBuf>,
-    /// Build directories discovery found ([`discover::discover`]), surveyed
-    /// after the named ones, each with how it was found.
+    /// Build directories discovery found ([`discover::discover`]), surveyed after the named ones, each with how it was found.
     pub found: Vec<discover::Found>,
     /// What discovery could not finish, carried into the report's notes.
     pub found_notes: Vec<String>,
     /// `$HOME`: how the report's lines abbreviate paths.
     pub home: Option<PathBuf>,
-    /// The Claude Code directories whose registries and transcripts say
-    /// whether a session ended ([`discover::Roots::claude_dirs`]).
+    /// The Claude Code directories whose registries and transcripts say whether a session ended ([`discover::Roots::claude_dirs`]).
     pub claude_dirs: Vec<PathBuf>,
     /// The running Claude Codes ([`discover::Roots::claudes`]).
     pub claudes: Vec<discover::RunningClaude>,
-    /// Why no session is called ended: a process that may be a Claude Code
-    /// could not be read ([`discover::Roots::claude_unread`]).
+    /// Why no session is called ended: a process that may be a Claude Code could not be read ([`discover::Roots::claude_unread`]).
     pub claude_unread: Option<String>,
     /// Where transcripts live.
     pub transcripts: Option<PathBuf>,
     /// The mount table, read for the whole-removal fences ([`Survey::mounts`]).
     pub mounts: Option<aterm_sysprobe::volumes::Table>,
-    /// What places a workspace nested in a removed checkout
-    /// ([`discover::placing_now`], [`discover::Owners::placed`]).
+    /// What places a workspace nested in a removed checkout ([`discover::placing_now`], [`discover::Owners::placed`]).
     pub placing: Option<discover::checkout::Placing>,
     /// The demand the pass adopted ([`Survey::demand`]).
     pub demand: Option<u64>,
-    /// Assess the found build directories for TIER 3 ([`idle::assess`]): the
-    /// owner's verb always (what tier 3 would free is shown), the window's
-    /// pass only when tier 3 may run.
+    /// Assess the found build directories for TIER 3 ([`idle::assess`]).
     pub idle_whole: bool,
-    /// The working directory of every session of this instance (tier 3's
-    /// clause 4a).
+    /// The working directory of every session of this instance (tier 3's clause 4a).
     pub session_cwds: Vec<PathBuf>,
-    /// Why the working directory of some session of this instance is not
-    /// known (on Windows a live tab that reported no absolute native one):
-    /// while it stands tier 3 takes nothing ([`idle::Context::cwd_unknown`]).
+    /// Why the working directory of some session of this instance is not known (on Windows a live tab that reported no absolute native one).
     pub session_cwd_unknown: Option<String>,
-    /// The folders whose links clause 5 reads (`~/.local/bin`,
-    /// `~/.cargo/bin`, `$ATPKG_BIN`, `~/.rustup/toolchains`).
+    /// The folders whose links clause 5 reads (`~/.local/bin`, `~/.cargo/bin`, `$ATPKG_BIN`, `~/.rustup/toolchains`).
     pub link_dirs: Vec<PathBuf>,
 }
 
-/// Measure one machine into a [`Survey`]: the one function here that
-/// touches a filesystem; everything else is a pure function of its result.
-///
-/// Free space is left to the caller (`free`), who measured it on the volume
-/// the lines are about; `None` fails open.
+/// Measure one machine into a [`Survey`]: the one function here that touches a filesystem.
 #[must_use]
 pub fn scan(
     roots: &Roots,
@@ -3888,8 +3062,7 @@ pub fn scan(
     )
 }
 
-/// [`scan`], tier 3's clause 4b read through `processes` ([`discover::Processes`]:
-/// the product's is every process of this uid, a test's the ones it names).
+/// [`scan`], tier 3's clause 4b read through `processes` ([`discover::Processes`]: the product's is every process of this uid, a test's the ones it names).
 #[must_use]
 pub fn scan_with(
     roots: &Roots,
@@ -3909,14 +3082,7 @@ pub fn scan_with(
         s.root = v.clone();
         s.volume_device = target::dev_of(v);
     }
-    // Once the volume is low (or a demand was adopted) every profile is sized
-    // and probed, recent ones too: a gone owner's build directory goes whole
-    // only with every lock free, and below the floor the recent tier may take
-    // any of them.
     let pressure = config.below_warn(free_bytes) || roots.demand.is_some();
-    // The vendor's versions, the live one and what holds the others
-    // ([`versions::read`]); the running processes are read through the same
-    // `processes` as tier 3's clause 4b.
     let read = versions::read(roots, processes);
     s.versions = read.entries;
     s.live_version = read.live;
@@ -3927,9 +3093,6 @@ pub fn scan_with(
     }
     s.home = roots.home.clone();
     s.notes = roots.found_notes.clone();
-    // One row per directory: a `target` link and the `target.noindex` it names,
-    // or two cwds differing by a linked component, are one directory once
-    // canonical.
     let named = roots
         .targets
         .iter()
@@ -3959,10 +3122,6 @@ pub fn scan_with(
             td.origin = origin;
             let (total, foreign) = target::total_bytes_owned(&td.path);
             td.total = Some(total);
-            // A sizing walk that stopped short read only part of it: before
-            // it can go whole (tier 1, or tier 3's assessment), the rest is
-            // read for another user's entry by a walk of its own
-            // ([`target::foreign_beyond`]); one that cannot finish keeps it.
             let whole = matches!(td.owned, discover::Owned::Gone { .. })
                 || (roots.idle_whole && idle::checkout_of(&td.origin, &td.path).is_some());
             td.foreign = foreign.or_else(|| {
@@ -3971,15 +3130,12 @@ pub fn scan_with(
                     .flatten()
             });
             s.targets.push(td);
-            // A directory sized: the pass is moving ([`beat`]).
             beat::beat();
         }
     }
     if roots.idle_whole {
         assess_idle_whole(&mut s, roots, config, now, processes);
     }
-    // While the census is refused, no session's scratch build is called ended:
-    // said once in the notes (each such hog line says it too, `hog_of`).
     if let Some(why) = &roots.claude_unread
         && s.targets
             .iter()
@@ -3992,10 +3148,6 @@ pub fn scan_with(
     s
 }
 
-/// Tier 3's assessment of every build directory `s` holds that it could take
-/// ([`idle::assess`], then one scan of the running processes for every
-/// candidate, [`idle::processes_clear`]): each one's verdict in
-/// [`TargetDir::idle`].
 fn assess_idle_whole(
     s: &mut Survey,
     roots: &Roots,
@@ -4049,13 +3201,6 @@ fn assess_idle_whole(
     }
 }
 
-/// Read `<prefix>/store` into [`Survey::store`] and [`Survey::live_builds`].
-///
-/// The layout is `<store>/<program>/<build>/` with a `current` symlink naming
-/// the live build (e.g. `store/ty/current -> …/store/ty/3007` beside `2984/`,
-/// `3007/` and their `.ready` files). A program whose `current` does not
-/// resolve contributes no live build, so none of its builds is superseded:
-/// `report` emits a note instead of rows.
 fn scan_store(store: &Path, s: &mut Survey) {
     for program_dir in read_children(store).into_iter().take(MAX_ROWS_PER_CLASS) {
         let Some(program) = program_dir.file_name().and_then(|n| n.to_str()) else {
@@ -4088,11 +3233,6 @@ fn scan_store(store: &Path, s: &mut Survey) {
     }
 }
 
-/// Which entry of `versions_dir` a resolved link target names: the ancestor
-/// of `resolved` (itself included) whose parent is `versions_dir`, both
-/// canonical. `None` unless `resolved` lies STRICTLY inside it — a target
-/// elsewhere (a copy of the launcher resolves to itself) names no version, and
-/// standing in for one it would make every real version read as not live.
 fn version_dir_of(resolved: &Path, versions_dir: Option<&Path>) -> Option<PathBuf> {
     let root = versions_dir?;
     resolved
@@ -4101,10 +3241,7 @@ fn version_dir_of(resolved: &Path, versions_dir: Option<&Path>) -> Option<PathBu
         .map(Path::to_path_buf)
 }
 
-/// One build directory's facts, or `None` when the path is not a directory:
-/// [`target::assess_under`] with the shipped walk bounds (under `pressure`,
-/// every profile sized and probed, not only the idle ones). The path it
-/// reports is canonical.
+/// One build directory's facts, or `None` when the path is not a directory.
 #[must_use]
 pub fn scan_target(
     path: &Path,
@@ -4121,9 +3258,6 @@ pub fn scan_target(
     )
 }
 
-/// Does this `CACHEDIR.TAG` carry the specification's signature? Read
-/// bounded (the signature is the first line); a file that is not a regular
-/// file answers `false`.
 fn cachedir_tag_signed(p: &Path) -> bool {
     let Ok(meta) = std::fs::symlink_metadata(p) else {
         return false;
@@ -4136,17 +3270,14 @@ fn cachedir_tag_signed(p: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// Unix-seconds mtime of `p`, or `None`.
 fn mtime_of(p: &Path) -> Option<i64> {
     let m = std::fs::symlink_metadata(p).ok()?.modified().ok()?;
     match m.duration_since(std::time::UNIX_EPOCH) {
         Ok(d) => i64::try_from(d.as_secs()).ok(),
-        // Before the epoch: 0, the honest floor for an old file.
         Err(_) => Some(0),
     }
 }
 
-/// The immediate children of `dir`, sorted, or empty.
 fn read_children(dir: &Path) -> Vec<PathBuf> {
     let Ok(rd) = std::fs::read_dir(dir) else {
         return Vec::new();
@@ -4160,16 +3291,11 @@ fn read_children(dir: &Path) -> Vec<PathBuf> {
 }
 
 /// Bytes under `dir`, and whether the walk was cut short.
-///
-/// Iterative, never follows a symlink, and stops at [`MAX_WALK_ENTRIES`].
 #[must_use]
 pub fn dir_bytes(dir: &Path) -> (u64, bool) {
     walk_bytes(dir, |_| true, std::fs::Metadata::len)
 }
 
-/// The bounded byte walk under [`dir_bytes`] and [`target::cache_bytes`]:
-/// iterative, never following a symlink, stopping at [`MAX_WALK_ENTRIES`]. It
-/// enters a directory only where `enter` says and sums `size` over the rest.
 fn walk_bytes(
     dir: &Path,
     enter: impl Fn(&std::fs::Metadata) -> bool,
@@ -4178,8 +3304,6 @@ fn walk_bytes(
     walk_bytes_until(dir, enter, size, None)
 }
 
-/// [`walk_bytes`], stopping too once `deadline` passes (read before each
-/// directory): the bytes summed so far, cut short.
 fn walk_bytes_until(
     dir: &Path,
     enter: impl Fn(&std::fs::Metadata) -> bool,
@@ -4189,8 +3313,6 @@ fn walk_bytes_until(
     let mut total: u64 = 0;
     let mut seen = 0usize;
     let mut stack = vec![dir.to_path_buf()];
-    // A folder that could not be read (another user's, say) leaves the
-    // figure a floor: said, never passed over as if it were empty.
     let mut unread = false;
     while let Some(d) = stack.pop() {
         if deadline.is_some_and(|at| std::time::Instant::now() >= at) {
@@ -4229,41 +3351,16 @@ fn walk_bytes_until(
 
 #[cfg(test)]
 thread_local! {
-    /// What [`volume_of`] read of its thread's error mode as it resolved
-    /// ([`aterm_sysprobe::errors_quiet`]): the test seam of its guard.
     static VOLUME_ERRORS_QUIET: std::cell::Cell<Option<bool>> =
         const { std::cell::Cell::new(None) };
 }
 
-/// The volume holding `path`, read now through the mount table `table`
-/// ([`aterm_sysprobe::volumes`]): one `statfs` (macOS) or `statvfs` (Linux)
-/// on the mount point, never a fork. The path's own spelling is placed first
-/// ([`aterm_sysprobe::volumes::mount_of`], which touches nothing; a Windows
-/// spelling with 8.3 short names spelled long before, which only a local
-/// volume is asked for): one on a remote or automounted mount is answered
-/// unread without a `stat`, since a stalled one answers by blocking.
-/// Otherwise its nearest existing ancestor is resolved (a link followed,
-/// `/tmp` to `/private/tmp`) and that one's mount read.
-///
-/// The resolve runs with the system's error boxes off
-/// ([`aterm_sysprobe::quiet_errors`]) on whatever thread asks — the control
-/// socket's `await sys` holds no guard of its own — so on Windows a path on
-/// an empty card reader or optical drive fails to resolve instead of putting
-/// "There is no disk in the drive" on the owner's desktop.
-///
-/// # Errors
-///
-/// [`aterm_sysprobe::volumes::Unread`]: the mount is remote or automounted,
-/// no mount holds the path or nothing of it exists, the read was refused, or
-/// this platform has no reader.
+/// The volume holding `path`, read now through the mount table `table` ([`aterm_sysprobe::volumes`]).
 pub fn volume_of(
     path: &Path,
     table: &aterm_sysprobe::volumes::Table,
 ) -> Result<aterm_sysprobe::volumes::Reading, aterm_sysprobe::volumes::Unread> {
     use aterm_sysprobe::volumes::{self, Unread};
-    // A Windows path spelled with 8.3 short names (a tab's or an agent's
-    // directory under a short `%TEMP%`) keys nowhere: spelled long first,
-    // asked of a local volume only ([`volumes::Table::long_spelling`]).
     let path = table.long_spelling(path);
     let spelled = volumes::mount_of(&path, table).ok_or(Unread::NoMount)?;
     if spelled.automounted || !spelled.local {
@@ -4279,10 +3376,7 @@ pub fn volume_of(
     volumes::read_path(&placed, table)
 }
 
-/// Free bytes on the volume holding `path` ([`volume_of`] through a fresh
-/// mount table), or `None` on any failure: a report that cannot read the disk
-/// says `free=unknown` and warns about nothing, and the pressure pass stops on
-/// a figure nobody read ([`StopBy::Unmeasured`]).
+/// Free bytes on the volume holding `path` ([`volume_of`] through a fresh mount table), or `None` on any failure.
 #[must_use]
 pub fn free_bytes(path: &Path) -> Option<u64> {
     volume_of(path, &aterm_sysprobe::volumes::table())
@@ -4291,34 +3385,6 @@ pub fn free_bytes(path: &Path) -> Option<u64> {
 }
 
 /// Remove one tree: [`remover`]'s primitive for [`Class::ClaudeStaleVersions`].
-/// A symlink is refused: removing through one would reach a tree no witness
-/// was taken of.
-///
-/// On Windows it removes as every reclaim removes, FAIL CLOSED
-/// ([`target::remove_entry`]): only on a local fixed disk (the volume fence
-/// every reclaim clears first: never a removable, optical or RAM drive, a
-/// share, or a volume of unknown kind), the entry's folder pinned from its
-/// volume's root (`aterm_dirfd::pin`, placeholders exposed, never through a
-/// link or any other reparse point), the entry found in that folder's
-/// listing by its exact name, and removed through that handle — each unlink
-/// held to the identity the listing gave it, a directory entered only once
-/// its opened identity is the listed one — so nothing is resolved by name
-/// after the check. Any failure to pin the folder refuses, naming it: a cloud
-/// sync root on the way (each file a delete there removes is removed from
-/// the cloud and every synced device), a junction or a folder a volume is
-/// mounted on (`LOOP`), a share, a denial, a thread whose placeholders
-/// could not be exposed — never a fall back to a delete by path, which
-/// follows a link in any component above the entry. An entry that is a
-/// link, or a reparse point that is no link, is refused too. The window and
-/// the verb call this inside their placeholder guard, but the refusal holds
-/// without it.
-///
-/// # Errors
-///
-/// The path is a symlink, the removal failed — and on Windows its folder
-/// is on no local fixed disk or could not be pinned (a cloud sync root, a
-/// link or another reparse point on the way), or the entry is a placeholder
-/// or gone.
 pub fn remove_tree(p: &Path) -> std::io::Result<()> {
     #[cfg(windows)]
     {

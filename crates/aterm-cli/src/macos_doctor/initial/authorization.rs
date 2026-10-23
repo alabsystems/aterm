@@ -10,6 +10,9 @@ use super::*;
 /// an already accepted choice. It contains no password and probes no OS settings.
 pub struct InitialSetupAuthorization {
     revision: u64,
+    /// The vault this Mac was in when the offer was loaded ([`Self::offer`]), which the run
+    /// it admits keeps; none known before an offer is.
+    vault: AdmittedVault,
     state: AuthorizationState,
 }
 
@@ -58,7 +61,11 @@ impl AuthorizationWrite {
 }
 
 impl AuthorizationCommit {
-    fn new(baseline: InitialSetupObservation, plan: &Plan) -> Result<Self, String> {
+    fn new(
+        baseline: InitialSetupObservation,
+        plan: &Plan,
+        vault: AdmittedVault,
+    ) -> Result<Self, String> {
         validate_plan(plan)?;
         let previous = baseline.records.plan.as_ref().map(|(plan, _)| plan);
         let prior = baseline.records.progress;
@@ -72,6 +79,7 @@ impl AuthorizationCommit {
         next.completed = plan.selection.is_empty();
         next.admitted = false;
         next.running = None;
+        next.admitted_vault = vault;
         let mut writes = vec![
             AuthorizationWrite::Plan(plan.clone()),
             AuthorizationWrite::Progress(next),
@@ -98,8 +106,9 @@ impl AuthorizationCommit {
 }
 
 impl InitialSetupAuthorization {
-    /// Observe existing setup records before loading or displaying an offer.
-    /// An unreadable or mismatched run cannot be assigned a guessed revision.
+    /// Observe existing setup records before loading or displaying an offer
+    /// ([`Self::offer`]). An unreadable or mismatched run cannot be assigned a guessed
+    /// revision.
     pub fn capture() -> Result<Self, String> {
         Self::capture_at(&state_root()?)
     }
@@ -110,8 +119,31 @@ impl InitialSetupAuthorization {
         let revision = plan_revision(baseline.records.progress, plan)?;
         Ok(Self {
             revision,
+            vault: AdmittedVault::Unknown,
             state: AuthorizationState::Bound(baseline),
         })
+    }
+
+    /// Load the offer: the saved first-launch plan in the vault this Mac is configured for
+    /// now ([`ConfiguredVault::present`]; with no saved plan every item is selected, and
+    /// with no configured vault the LAN default is used), reading only aterm's own
+    /// configuration and durable setup records. The run this ticket admits keeps that
+    /// vault, so one joined while the offer is shown stays, and a vault typed in the offer
+    /// while this Mac is in another moves it.
+    pub fn offer(&mut self) -> Result<Plan, String> {
+        self.offer_reading(&state_root()?, live_configured_vault)
+    }
+
+    /// [`Self::offer`] from `root`, `read` saying which vault this Mac is in now.
+    pub(super) fn offer_reading(
+        &mut self,
+        root: &Path,
+        read: impl FnOnce() -> Result<Option<ConfiguredVault>, String>,
+    ) -> Result<Plan, String> {
+        let configured = read();
+        let plan = offered_plan(saved_plan_record(root)?, configured.clone())?;
+        self.vault = AdmittedVault::of(configured);
+        Ok(plan)
     }
 
     /// The revision from the same coherent observation that bound this ticket.
@@ -182,7 +214,8 @@ impl InitialSetupAuthorization {
                 }
                 let owned = baseline.clone();
                 self.state = AuthorizationState::Ended;
-                self.state = AuthorizationState::Writing(AuthorizationCommit::new(owned, plan)?);
+                self.state =
+                    AuthorizationState::Writing(AuthorizationCommit::new(owned, plan, self.vault)?);
             }
             AuthorizationState::Writing(commit) => {
                 if current.publications() != commit.publications

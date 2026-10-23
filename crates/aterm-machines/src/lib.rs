@@ -23,6 +23,9 @@
 
 #![cfg(unix)]
 
+#[cfg(test)]
+aterm_durable::plain_durable_flushes_in_tests!();
+
 pub mod agent;
 pub mod askpass;
 pub mod baseline;

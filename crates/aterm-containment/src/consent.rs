@@ -2,118 +2,44 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! macOS privacy-consent (TCC) posture: observation only, never actuation
-//! (`docs/DESIGN-macos-tcc-prompts-2026-08-30.md` §3.3). It answers three questions and joins
-//! the answers into one posture a human or an agent can read:
+//! macOS privacy-consent (TCC) and debugger-access posture probes and classifiers.
 //!
-//! 1. does the responsible app hold **Full Disk Access** ([`FdaState`])?
-//! 2. which process is **responsible** for a given pid ([`responsible_pid`],
-//!    [`responsible_app`])?
-//! 3. is a session's file access **live** or **adopted** across an in-place apply
-//!    ([`Attribution`])?
-//!
-//! Beside them sits macOS **debugger access** (developer mode), which is not TCC but the
-//! Authorization Services right [`TASKPORT_DEBUG_RIGHT`]
-//! (`docs/DESIGN-macos-debugger-access-2026-09-29.md` §3.2): [`DebuggerMode`],
-//! [`DebuggerMember`] and [`SelfHardening`]. Only the owner's yes in aterm's own alert changes
-//! it, through [`run_devtools_change`]: their press in Settings ▸ Security, or the alert aterm
-//! raises once per Mac at first launch (design §3.4 step 0, O29). The Developer Tools list
-//! ([`DevToolState`] from tccd's log, [`DevToolListing`] from the system `TCC.db`, joined by
-//! [`devtool_grant`]) decides whether macOS checks each new program run in aterm before its
-//! first start; only a human changes it.
-//!
-//! The module never answers or requests a consent dialog, never writes a `TCC.db`, and never
-//! touches the write-side TCC SPI. Its one described mutation, the §3.7 denied-state repair
-//! ([`ResetPlan`], [`tccutil_reset_command`]), is a pure argv builder that names only the
-//! running bundle.
-//!
-//! Full Disk Access's reach over the per-folder prompts is unmeasured (design §7 S4). Learning
-//! a folder's state means attempting the access, which is the interruption to avoid, so every
-//! per-folder row is `unknown` by construction and [`FdaScope`] stays [`FdaScope::Unknown`];
-//! see [`SpikeEvidence`].
-//!
-//! ## OS wrappers
-//!
-//! Everything is pure over data except these thin wrappers, each beside a table-testable pure
-//! classifier:
-//!
-//! * [`probe_fda`]: one `open(…, O_RDONLY)` of the user's `TCC.db`, or of the system one where
-//!   macOS keeps no user store (macOS 27), closed unread, by a child of this process
-//!   (`aterm __tcc-open`); prompt-free, as `kTCCServiceSystemPolicyAllFiles` does not allow
-//!   prompting.
-//! * [`responsible_pid`], [`responsible_pids_detailed`], [`responsible_app`]: the
-//!   responsibility SPI (through `dlsym`, once per call), `proc_pidpath`, and at most one
-//!   bounded `Info.plist` read outside the protected roots.
-//! * [`tccutil_presence`]: one `stat` of `/usr/bin/tccutil`.
-//! * [`probe_debugger`]: at most one `DevToolsSecurity -status`, which raises no dialog.
-//! * [`debugger_membership`], [`self_hardening`], [`process_birth`]: directory and kernel
-//!   queries, no spawn.
-//! * [`probe_devtool`]: at most one `/usr/bin/log show`; [`probe_devtool_list`]: one `open` of
-//!   the system `TCC.db` (by a child, as for [`probe_fda`]), then `sqlite3 -readonly` on it as
-//!   an immutable URI, which takes no lock tccd's writes could meet (once; up to three times
-//!   while a read meets a write); both with a constant argv.
-//! * [`run_devtools_change`], the one actuator: a fresh `-status` read, then at most one
-//!   `DevToolsSecurity -enable` or `-disable`.
-//!
-//! The spawning probes share [`probe_fda`]'s gate and in-bundle fence.
-//!
-//! ## The in-bundle fence
-//!
-//! A platform probe a headless-constructible path can reach must be gated, because a unit
-//! test is a headless process: a test binary's first `WindowServer` touch can make `tccd`
-//! `readdir` a million-entry `target/debug/deps`, stalling `WindowServer` past its watchdog,
-//! which takes every GUI session down with it (the aterm-census guard `input-probe`). So
-//! [`probe_fda`] refuses, with no syscall, unless the running executable is inside a `.app`
-//! ([`path_is_in_app_bundle`]): a test binary gets [`ProbeLabel::RefusedOutOfBundle`], and
-//! `probe_refuses_out_of_bundle_without_touching_the_os` proves the syscall unreachable.
-//!
-//! ## Protected paths
-//!
-//! `aterm-gui` and `aterm-cli` may not write a protected-folder path literal as a syscall
-//! argument. [`protected_roots`] resolves them once, from [`crate::sbpl::PRIVATE_SUBDIRS`]
-//! (the list Containment denies), so the two tiers agree on which paths are sensitive.
+//! * TCC posture: Full Disk Access ([`FdaState`], [`FdaScope`], [`SpikeEvidence`], [`probe_fda`]),
+//!   process responsibility ([`responsible_pid`], [`responsible_pids_detailed`],
+//!   [`responsible_app`]), session [`Attribution`], and [`ResetPlan`] ([`tccutil_reset_command`],
+//!   [`tccutil_presence`]).
+//! * Debugger and Developer Tools posture ([`TASKPORT_DEBUG_RIGHT`]): [`DebuggerMode`]
+//!   ([`probe_debugger`], [`run_devtools_change`]), [`DebuggerMember`] ([`debugger_membership`]),
+//!   [`SelfHardening`] ([`self_hardening`], [`process_birth`]), and [`devtool_grant`]
+//!   ([`DevToolState`], [`DevToolListing`], [`probe_devtool`], [`probe_devtool_list`]).
+//! * [`path_is_in_app_bundle`] fences bundle-only probes ([`ProbeLabel::RefusedOutOfBundle`]),
+//!   and [`protected_roots`] derives sensitive paths from [`crate::sbpl::PRIVATE_SUBDIRS`].
 
 use std::path::{Component, Path, PathBuf};
 
-// errno values, pinned so classification stays pure on every platform
-
-/// `EPERM`. A TCC denial is `EPERM`, not `EACCES` (design §1.5). A literal so the classifiers
-/// stay pure off macOS; `errno_constants_match_the_platform` pins it to `libc::EPERM`.
+/// `EPERM`. A TCC denial is `EPERM`, not `EACCES` ().
 pub const ERRNO_EPERM: i32 = 1;
 
-/// `ESRCH` — "no such process". Distinguishes "the pid is gone" from "the pid
-/// is not ours" when the responsibility SPI returns `-1`.
+/// `ESRCH` — "no such process".
 #[cfg(any(target_os = "macos", test))]
 pub const ERRNO_ESRCH: i32 = 3;
 
-/// `ENOENT`. On a TCC-guarded path tccd decides before the lookup, so a denial is
-/// [`ERRNO_EPERM`] and never this; [`Folder::absent_means_allowed`] relies on that for the one
-/// item whose probe path may not exist.
+/// `ENOENT`. On a TCC-guarded path tccd decides before the lookup.
 pub const ERRNO_ENOENT: i32 = 2;
 
-/// The user's TCC store, relative to `$HOME`. Reaching it requires Full Disk
-/// Access; its contents are never read. macOS 27 keeps no user store (the directory is
-/// absent, so the open answers `ENOENT` with or without the grant), and the probe then opens
-/// [`SYSTEM_TCC_DB`], which answers `EPERM` without the grant (measured on macOS 27.0.1).
 #[cfg(any(target_os = "macos", test))]
 const TCC_DB_RELATIVE: &str = "Library/Application Support/com.apple.TCC/TCC.db";
 
-/// Hard cap on an `Info.plist` read; a larger plist reads as absent.
 const INFO_PLIST_MAX_BYTES: u64 = 256 * 1024;
 
-// Full Disk Access
-
 /// Whether the responsible app holds Full Disk Access (`kTCCServiceSystemPolicyAllFiles`).
-/// `Unknown` (an out-of-bundle caller, a disabled probe, an unexpected errno) is a real answer
-/// and is never rendered as "denied".
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum FdaState {
-    /// The `TCC.db` open succeeded — the grant is held by this identity.
+    /// The `TCC.db` open succeeded.
     Granted,
-    /// The open returned [`ERRNO_EPERM`] — the grant is not held.
+    /// The open returned [`ERRNO_EPERM`].
     Denied,
-    /// Not measured. The probe refused, was disabled, or the errno was one
-    /// this classification does not claim to understand.
+    /// Not measured.
     #[default]
     Unknown,
 }
@@ -130,10 +56,7 @@ impl FdaState {
     }
 }
 
-/// How far a Full Disk Access grant reaches: the running process, or only processes started
-/// later. Propagation is unmeasured for aterm's shape (design §7 S1); a successful access
-/// probe may establish [`FdaScope::ThisProcess`] for its own host, and says nothing about
-/// existing sessions or later launches.
+/// How far a Full Disk Access grant reaches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum FdaScope {
     /// The running process observes the grant.
@@ -157,8 +80,7 @@ impl FdaScope {
     }
 }
 
-/// The observation's progress or outcome, apart from [`FdaState`] so an unfinished observation
-/// is never mistaken for a denial.
+/// The observation's progress or outcome.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ProbeLabel {
     /// No current result: an asynchronous observer is waiting or refreshing.
@@ -173,7 +95,7 @@ pub enum ProbeLabel {
     RefusedOutOfBundle,
     /// Refused: the running executable could not be resolved.
     RefusedNoExe,
-    /// Refused: `[privacy] enabled` or `[privacy] check` is off.
+    /// Refused: `[privacy] enabled` or `[privacy] check`.
     RefusedDisabled,
     /// Refused: `$HOME` is unset.
     RefusedNoHome,
@@ -184,8 +106,7 @@ pub enum ProbeLabel {
 }
 
 impl ProbeLabel {
-    /// The `probe=` token. [`ProbeLabel::OpenErrno`] renders as `open_errno`;
-    /// callers that want the number read it from the variant.
+    /// The `probe=` token.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -202,8 +123,7 @@ impl ProbeLabel {
         }
     }
 
-    /// `true` for a refusal (an unsupported platform included): no probe syscall ran. `false`
-    /// is not completion: [`ProbeLabel::Pending`] may be queued or running on a worker.
+    /// `true` for a refusal (an unsupported platform included).
     #[must_use]
     pub const fn refused(self) -> bool {
         matches!(
@@ -218,7 +138,7 @@ impl ProbeLabel {
     }
 }
 
-/// One probe result: the state, and why.
+/// One probe result: the state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct FdaProbe {
     /// The classified state.
@@ -228,7 +148,7 @@ pub struct FdaProbe {
 }
 
 impl FdaProbe {
-    /// No current observation. This is neither a denial nor a refusal.
+    /// No current observation.
     #[must_use]
     pub const fn pending() -> Self {
         Self {
@@ -256,19 +176,17 @@ pub enum ProbeOutcome {
     Errno(i32),
 }
 
-/// The two `[privacy]` switches that gate the probe. Either off is
-/// [`ProbeLabel::RefusedDisabled`], which a report attributes to configuration, never to a
-/// denial.
+/// The two `[privacy]` switches that gate the probe.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ProbeGate {
-    /// `[privacy] enabled` — the master switch.
+    /// `[privacy] enabled`.
     pub enabled: bool,
-    /// `[privacy] check` — the silent, prompt-free probe.
+    /// `[privacy] check`.
     pub check: bool,
 }
 
 impl ProbeGate {
-    /// Both switches on — the shipped default.
+    /// Both switches.
     #[must_use]
     pub const fn on() -> Self {
         Self {
@@ -290,9 +208,7 @@ impl Default for ProbeGate {
     }
 }
 
-/// Classify one probe syscall: `Ok` is [`FdaState::Granted`], [`ERRNO_EPERM`] is
-/// [`FdaState::Denied`], any other errno [`FdaState::Unknown`]. Only `EPERM` is a TCC denial
-/// (design §1.5); reading another errno as one would manufacture a verdict.
+/// Classify one probe syscall.
 #[must_use]
 pub const fn classify_probe(outcome: ProbeOutcome) -> FdaProbe {
     match outcome {
@@ -311,19 +227,14 @@ pub const fn classify_probe(outcome: ProbeOutcome) -> FdaProbe {
     }
 }
 
-/// The answer on a platform that has no TCC: the whole implementation off
-/// macOS, and compiled into every test build so it is tested everywhere.
+/// The answer on a platform that has no TCC.
 #[cfg(any(test, not(target_os = "macos")))]
 #[must_use]
 pub const fn unsupported_probe() -> FdaProbe {
     FdaProbe::refused(ProbeLabel::UnsupportedPlatform)
 }
 
-/// The probe with the executable, the home directory and the syscall injected: the seam every
-/// guard is enforced at. `syscall` runs only after every refusal is ruled out: once with the
-/// user's `TCC.db`, and a second time with [`SYSTEM_TCC_DB`] only when the user store is
-/// absent (`ENOENT`, macOS 27), so a Mac that still keeps a user store is probed exactly as
-/// before.
+/// The probe with the executable, the home directory and the syscall injected.
 #[cfg(any(target_os = "macos", test))]
 pub fn probe_fda_with<F>(
     gate: ProbeGate,
@@ -340,8 +251,6 @@ where
     let Some(exe) = exe else {
         return FdaProbe::refused(ProbeLabel::RefusedNoExe);
     };
-    // The fence (design §3.3 guardrail 1). A binary outside a `.app` — a test
-    // binary under target/debug/deps above all — never reaches the syscall.
     if !path_is_in_app_bundle(exe) {
         return FdaProbe::refused(ProbeLabel::RefusedOutOfBundle);
     }
@@ -358,9 +267,7 @@ where
     }
 }
 
-/// Probe Full Disk Access for the running process: `probe_fda_with` over [`fence_exe`], `$HOME`
-/// and an `open(…, O_RDONLY)` of a `TCC.db`, closed unread, made by a child of this process
-/// ([`open_probe_in_child`]). Off macOS it is `unsupported_probe`.
+/// Probe Full Disk Access for the running process.
 #[must_use]
 pub fn probe_fda(gate: ProbeGate) -> FdaProbe {
     #[cfg(target_os = "macos")]
@@ -379,25 +286,12 @@ pub fn probe_fda(gate: ProbeGate) -> FdaProbe {
     }
 }
 
-/// The hidden verb `aterm __tcc-open <path>` ([`run_open_probe_verb`]): never advertised,
-/// answered at the front door before anything else runs.
+/// The hidden verb `aterm __tcc-open <path>` ([`run_open_probe_verb`]).
 pub const OPEN_PROBE_VERB: &str = "__tcc-open";
 
-/// How long [`open_probe_in_child`] waits for its child: a hang detector, never a budget.
 #[cfg(target_os = "macos")]
 const OPEN_PROBE_CEILING: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// THE PROBE'S OPEN, MADE BY A CHILD: `aterm __tcc-open <db>` from the bundle's own
-/// executable, which this process stays responsible for. Falls back to the open in this
-/// process when there is no executable or the child gives no answer.
-///
-/// Measured on macOS 26.6.2 and 27.0 (2026-10-17, design §2.2): a window an in-place update
-/// started is attributed to the outgoing process's image, which `.rollback` names and the
-/// update then deleted (it now keeps it there while that window runs). Deleted or moved,
-/// tccd fails that identity (`-67068`) for as long as the window runs and answers
-/// `Denied (Service Policy)` to the window's own opens, even with aterm switched on, and
-/// sandboxd keeps that answer for the window's tabs too. A child of the window is
-/// attributed to the window's own image, and the answer it gets is the one sandboxd keeps.
 #[cfg(target_os = "macos")]
 fn open_probe_in_child(exe: Option<&Path>, db: &Path) -> ProbeOutcome {
     open_probe_in_child_bounded(exe, db, OPEN_PROBE_CEILING)
@@ -432,7 +326,7 @@ fn open_probe_in_child_bounded(
     imp::open_probe(db)
 }
 
-/// The one line [`run_open_probe_verb`] prints for `outcome`: `ok`, or `errno <n>`.
+/// The one line [`run_open_probe_verb`] prints for `outcome`.
 #[must_use]
 pub fn open_probe_line(outcome: ProbeOutcome) -> String {
     match outcome {
@@ -441,7 +335,7 @@ pub fn open_probe_line(outcome: ProbeOutcome) -> String {
     }
 }
 
-/// Read back what [`open_probe_line`] printed. Anything else is no answer.
+/// Read back what [`open_probe_line`] printed.
 #[must_use]
 pub fn parse_open_probe_line(out: &str) -> Option<ProbeOutcome> {
     match out.trim_end_matches('\n').split_once(' ') {
@@ -451,9 +345,7 @@ pub fn parse_open_probe_line(out: &str) -> Option<ProbeOutcome> {
     }
 }
 
-/// [`OPEN_PROBE_VERB`]: open the one path named, close it unread, and print
-/// [`open_probe_line`]. Says one line on stderr and fails for anything but one operand, and
-/// off macOS.
+/// [`OPEN_PROBE_VERB`]: open the one path named, close it unread, and print [`open_probe_line`].
 #[must_use]
 pub fn run_open_probe_verb(args: &[std::ffi::OsString]) -> std::process::ExitCode {
     #[cfg(target_os = "macos")]
@@ -466,12 +358,7 @@ pub fn run_open_probe_verb(args: &[std::ffi::OsString]) -> std::process::ExitCod
     std::process::ExitCode::FAILURE
 }
 
-/// This Mac's hardware UUID (`gethostuuid(2)`), the key of what aterm verified on THIS
-/// Mac: a record that travelled in a synced or migrated config directory names another.
-/// Neither a TCC nor a `WindowServer` call. `None` off macOS, or when the kernel does not
-/// answer.
-/// Read once per process (the kernel's answer does not change), on whichever thread asks
-/// first: a worker, so [`host_uuid_if_warm`] serves the event loop with no syscall.
+/// This Mac's hardware UUID (`gethostuuid(2)`), the key of what aterm verified on this Mac.
 #[must_use]
 pub fn host_uuid() -> Option<String> {
     host_uuid_cell()
@@ -488,7 +375,7 @@ pub fn host_uuid() -> Option<String> {
         .clone()
 }
 
-/// [`host_uuid`] only if something has read it: never a syscall.
+/// [`host_uuid`] only if something has read it.
 #[must_use]
 pub fn host_uuid_if_warm() -> Option<&'static str> {
     host_uuid_cell().get().and_then(Option::as_deref)
@@ -499,7 +386,6 @@ fn host_uuid_cell() -> &'static std::sync::OnceLock<Option<String>> {
     &HOST_UUID
 }
 
-/// A `uuid_t` in its usual spelling (`8-4-4-4-12`, upper-case hex). Pure.
 #[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
 fn format_uuid(id: &[u8; 16]) -> String {
     use std::fmt::Write as _;
@@ -517,22 +403,15 @@ fn format_uuid(id: &[u8; 16]) -> String {
     )
 }
 
-// The in-bundle guard
-
-/// `true` when `exe` lies inside a `.app` bundle: a `.app` component followed by `Contents`,
-/// `MacOS` and at least one more. Lexical by design: it is the gate that decides whether the
-/// filesystem may be touched at all.
+/// `true` when `exe` lies inside a `.app` bundle.
 #[must_use]
 pub fn path_is_in_app_bundle(exe: &Path) -> bool {
     app_bundle_root(exe).is_some()
 }
 
-/// The `.app` directory `exe` lives inside, if any (`/Applications/aterm.app/Contents/MacOS/aterm`
-/// ⇒ `/Applications/aterm.app`); also the cache key's bundle half.
+/// The `.app` directory `exe` lives.
 #[must_use]
 pub fn app_bundle_root(exe: &Path) -> Option<PathBuf> {
-    // `Path::extension`, not a suffix test: a component that is exactly `.app` is a hidden
-    // file, not a bundle; no UTF-8 round trip; and macOS volumes are case-insensitive.
     bundle_root_where(exe, |dir| {
         Path::new(dir.as_os_str())
             .extension()
@@ -540,16 +419,7 @@ pub fn app_bundle_root(exe: &Path) -> Option<PathBuf> {
     })
 }
 
-/// The executable the in-bundle fence judges for the fenced probes: `current_exe()` when that
-/// is inside a `.app`, else the kernel's path for this image when that is, else
-/// `current_exe()`.
-///
-/// On macOS `current_exe()` is the `execve`-time string, so a program started through a
-/// symlink (the `~/.local/bin/aterm` that `tools/install.sh` lays) reads as outside the bundle
-/// although the bundle's code runs. The kernel's path (`proc_pidpath` on this pid: no protected
-/// read, no dialog) names the image macOS attributes. The exec path wins whenever it is
-/// bundled, so a window whose bundle an update renamed (`aterm.app.rollback`, [`ImageAnchor`])
-/// is judged by it, and a test binary under `target/` is outside a bundle by both paths.
+/// The executable the in-bundle fence judges for the fenced probes.
 #[must_use]
 pub fn fence_exe() -> Option<PathBuf> {
     fence_exe_from(std::env::current_exe().ok(), &self_image())
@@ -569,16 +439,6 @@ pub fn fence_exe_from(exec: Option<PathBuf>, image: &SelfImage) -> Option<PathBu
 
 /// Whether the bundle macOS keys this process's consent decisions to can still be found.
 ///
-/// A TCC grant is validated against the running code: once the running bundle is renamed or
-/// deleted, `tccd` cannot build a code object for it, and every consent decision for the
-/// process and its attributed descendants falls back to asking. The updater's apply renames:
-/// `RENAME_SWAP` moves the running bundle to `aterm.app.rollback`, where a window's boot-health
-/// confirmation keeps it while that window runs; the first launch after it, or the next
-/// update, deletes it.
-///
-/// Classified from the kernel's path (`proc_pidpath`: one syscall, no protected read, no
-/// dialog), never `current_exe()`, the frozen `execve`-time string:
-///
 /// ```text
 ///              current_exe()                 proc_pidpath
 /// before       …/A.app/Contents/MacOS/p      …/A.app/Contents/MacOS/p
@@ -587,15 +447,13 @@ pub fn fence_exe_from(exec: Option<PathBuf>, image: &SelfImage) -> Option<PathBu
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ImageAnchor {
-    /// The image sits in a `.app` bundle. Grants keyed to it can be validated.
+    /// The image sits in a `.app` bundle.
     Live,
-    /// The image sits in a bundle layout (`…/Contents/MacOS/…`) whose directory
-    /// is no longer named `<something>.app` — `aterm.app.rollback` after an apply.
+    /// The image sits in a bundle layout (`…/Contents/MacOS/…`) whose directory is no longer named.
     Displaced,
-    /// The image no longer has a path: its bundle was deleted while this runs.
+    /// The image no longer has a path.
     Deleted,
-    /// Not a bundle layout: a test binary, `targo run`, a dev build outside a
-    /// `.app`, or a host with no bundles. Not a fault, and never reported as one.
+    /// Not a bundle layout: a test binary, `targo run`, a dev build outside a `.app`.
     NotBundled,
     /// The kernel would not say (a sandbox denying process-info, say).
     Unknown,
@@ -614,9 +472,7 @@ impl ImageAnchor {
         }
     }
 
-    /// Whether this anchor means a held grant cannot be validated against the
-    /// running code. `NotBundled` (a dev run) and `Unknown` (a failed read) are
-    /// not faults.
+    /// Whether this anchor means a held grant cannot be validated against the running code.
     #[must_use]
     pub const fn grant_unverifiable(self) -> bool {
         matches!(self, Self::Displaced | Self::Deleted)
@@ -628,16 +484,12 @@ impl ImageAnchor {
 pub enum SelfImage {
     /// Its current path.
     At(PathBuf),
-    /// It has no path: `proc_pidpath` failed with `ENOENT`, which for this
-    /// process's own pid means the file was unlinked.
+    /// It has no path: `proc_pidpath` failed with `ENOENT`.
     NoPath,
-    /// The lookup failed for another reason — `EPERM` under a sandbox that
-    /// denies process-info, or a host with no such call. Says nothing about the
-    /// bundle.
+    /// The lookup failed for another reason.
     Unreadable,
 }
 
-/// [`SelfImage`] for this process.
 fn self_image() -> SelfImage {
     #[cfg(target_os = "macos")]
     {
@@ -658,9 +510,7 @@ pub fn image_anchor() -> ImageAnchor {
     classify_image_anchor(std::env::current_exe().ok().as_deref(), &self_image())
 }
 
-/// The classification, pure over the exec-time path and the kernel's answer. The kernel's path
-/// decides whenever there is one; the exec path only tells a deleted bundle from a binary that
-/// was never in one.
+/// The classification, pure over the exec-time path and the kernel's answer.
 #[must_use]
 pub fn classify_image_anchor(exec: Option<&Path>, image: &SelfImage) -> ImageAnchor {
     match image {
@@ -676,16 +526,11 @@ pub fn classify_image_anchor(exec: Option<&Path>, image: &SelfImage) -> ImageAnc
     }
 }
 
-/// The directory enclosing `<dir>/Contents/MacOS/<exe>`, whatever `<dir>` is
-/// named — `aterm.app` and `aterm.app.rollback` alike. [`app_bundle_root`] is the
-/// narrower question, "is that directory still named `.app`".
 #[must_use]
 fn bundle_layout_root(exe: &Path) -> Option<PathBuf> {
     bundle_root_where(exe, |dir| matches!(dir, Component::Normal(_)))
 }
 
-/// The innermost `<dir>` of a `<dir>/Contents/MacOS/<exe>` layout in `exe` —
-/// four components at least — whose `<dir>` passes `is_bundle_dir`.
 fn bundle_root_where(
     exe: &Path,
     is_bundle_dir: impl Fn(&Component<'_>) -> bool,
@@ -700,27 +545,21 @@ fn bundle_root_where(
     })
 }
 
-/// `true` when the path cannot be handed to a C API because it contains an
-/// interior NUL byte.
 #[must_use]
 #[cfg(any(target_os = "macos", test))]
 fn path_has_interior_nul(path: &Path) -> bool {
     path.as_os_str().as_encoded_bytes().contains(&0)
 }
 
-// Responsibility
-
-/// Why the responsibility SPI could not answer. It returns `-1` for every process the caller
-/// does not own (a euid mismatch, not privilege), so `errno` separates the cases; `-1` is never
-/// "self".
+/// Why the responsibility SPI could not answer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum ResponsibleError {
     /// The symbol is not present in this process image.
     SymbolUnavailable,
-    /// [`ERRNO_EPERM`] — the target is not ours.
+    /// [`ERRNO_EPERM`].
     NotOurs,
-    /// [`ERRNO_ESRCH`] — the target is gone.
+    /// [`ERRNO_ESRCH`].
     Gone,
     /// `-1` with some other errno.
     Errno(i32),
@@ -728,27 +567,22 @@ pub enum ResponsibleError {
     Unsupported,
 }
 
-/// The `responsible=` corroboration. This is the SPI's opinion, and it is only
-/// ever a corroboration: [`Attribution`] comes from aterm's own adoption
-/// record, never from here.
+/// The `responsible=` corroboration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum Responsible {
     /// The responsible pid is this process.
     SelfProcess,
-    /// The responsible pid is gone — the process that started this session has
-    /// exited.
+    /// The responsible pid is gone.
     Exited,
     /// The responsible pid is some other live process.
     Other(i32),
-    /// The SPI is absent, refused, or answered `-1` for a reason that does not
-    /// identify anything.
+    /// The SPI is absent, refused, or answered `-1` for a reason that does not identify anything.
     #[default]
     Unknown,
 }
 
 impl Responsible {
-    /// The `responsible=` token, or `None` for [`Responsible::Other`], whose
-    /// token is the decimal pid the caller renders.
+    /// The `responsible=` token, or `None` for [`Responsible::Other`].
     #[must_use]
     pub const fn token(self) -> Option<&'static str> {
         match self {
@@ -769,9 +603,7 @@ impl Responsible {
     }
 }
 
-/// Classify a responsibility answer against the asking process's own pid. Only
-/// [`ResponsibleError::Gone`] says something (the responsible process exited); every other
-/// error, and a non-positive pid, identifies nothing.
+/// Classify a responsibility answer against the asking process's own pid.
 #[must_use]
 pub const fn classify_responsible(
     self_pid: i32,
@@ -785,7 +617,7 @@ pub const fn classify_responsible(
     }
 }
 
-/// Map the SPI's `(return value, errno)` pair to a result. Pure.
+/// Map the SPI's `(return value, errno)` pair to a result.
 #[cfg(any(target_os = "macos", test))]
 pub const fn responsible_answer(ret: i32, errno: i32) -> Result<i32, ResponsibleError> {
     if ret >= 0 {
@@ -799,12 +631,6 @@ pub const fn responsible_answer(ret: i32, errno: i32) -> Result<i32, Responsible
 }
 
 /// The pid macOS holds responsible for `pid`, or `None`.
-///
-/// `responsibility_get_pid_responsible_for_pid` (in `libquarantine.dylib`, no SDK header) is
-/// resolved through `dlsym`, so a macOS that drops it degrades to `unknown` instead of failing
-/// to link. Unprivileged, and it reaches neither tccd nor `WindowServer`: one `__mac_syscall`
-/// into the kernel Quarantine policy. `-1`, the answer for any process the caller does not
-/// own, is `None`, never "self"; [`responsible_pid_detailed`] keeps the reason.
 #[must_use]
 pub fn responsible_pid(pid: i32) -> Option<i32> {
     responsible_pid_detailed(pid).ok()
@@ -812,14 +638,12 @@ pub fn responsible_pid(pid: i32) -> Option<i32> {
 
 /// [`responsible_pid`], keeping the reason a `-1` carries.
 pub fn responsible_pid_detailed(pid: i32) -> Result<i32, ResponsibleError> {
-    // One answer per pid asked about, so the fallback is never taken.
     responsible_pids_detailed(&[pid])
         .pop()
         .unwrap_or(Err(ResponsibleError::Unsupported))
 }
 
-/// [`responsible_pid_detailed`] for each of `pids`, in order: the SPI is resolved through
-/// `dlsym` once for the whole slice, then asked once per pid. An empty slice resolves nothing.
+/// [`responsible_pid_detailed`] for each of `pids`, in order.
 #[must_use]
 pub fn responsible_pids_detailed(pids: &[i32]) -> Vec<Result<i32, ResponsibleError>> {
     #[cfg(target_os = "macos")]
@@ -832,9 +656,6 @@ pub fn responsible_pids_detailed(pids: &[i32]) -> Vec<Result<i32, ResponsibleErr
     }
 }
 
-/// Ask `resolve`'s function about each pid, in order, resolving it at most once: only when
-/// there is a pid to ask about. No function means [`ResponsibleError::SymbolUnavailable`] for
-/// every pid.
 #[cfg(any(target_os = "macos", test))]
 fn ask_each<F>(
     pids: &[i32],
@@ -852,24 +673,18 @@ where
     }
 }
 
-/// The app macOS holds responsible for `pid`, resolved far enough to name it: the verdict is
-/// that app's (a probe from a shell under another terminal reports that terminal's Full Disk
-/// Access), so a report must name it.
+/// The app macOS holds responsible for `pid`, resolved far enough to name it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResponsibleApp {
     /// The responsible pid.
     pub pid: i32,
     /// Its executable path, from `proc_pidpath`.
     pub path: PathBuf,
-    /// Its display name: `CFBundleDisplayName`, else `CFBundleName`, else the
-    /// executable's basename.
+    /// Its display name: `CFBundleDisplayName`, else `CFBundleName`.
     pub display_name: String,
 }
 
-/// The `Info.plist` a display name may be read from, or `None` when there is none we may
-/// touch. A bundle under a protected root (`~/Documents/Something.app`) answers `None`:
-/// reading its plist would raise the consent dialog while describing consent. The test is
-/// lexical ([`is_under_protected_root`]).
+/// The `Info.plist` a display name may be read from, or `None` when there is none we may touch.
 #[must_use]
 pub fn readable_info_plist(exe: &Path, protected: &[PathBuf]) -> Option<PathBuf> {
     let root = app_bundle_root(exe)?;
@@ -880,18 +695,12 @@ pub fn readable_info_plist(exe: &Path, protected: &[PathBuf]) -> Option<PathBuf>
 }
 
 /// `true` when `path` is `root` or lives under it, for any root.
-///
-/// Lexical and component-wise, never canonicalizing or stat'ing, since it decides whether to
-/// touch the filesystem at all; so a protected directory reached through a symlink from
-/// outside is not caught.
 #[must_use]
 pub fn is_under_protected_root(path: &Path, protected: &[PathBuf]) -> bool {
     protected.iter().any(|root| path.starts_with(root))
 }
 
-/// The display name for an executable, given its bundle's `Info.plist` text only if
-/// [`readable_info_plist`] allowed the read: `CFBundleDisplayName`, else `CFBundleName`, else
-/// the basename. Only XML plists are understood; a binary plist reads as absent.
+/// The display name for an executable.
 #[must_use]
 #[cfg(any(target_os = "macos", test))]
 pub fn display_name(exe: &Path, info_plist_text: Option<&str>) -> String {
@@ -922,22 +731,16 @@ pub fn responsible_app(pid: i32) -> Option<ResponsibleApp> {
     }
 }
 
-// Designated-requirement class
-
-/// The class of a code-signing designated requirement, which `tccd` stores in the `csreq`
-/// column and re-validates the running code against. A Developer-ID DR names an `identifier`
-/// and pins a certificate, so its grant survives a rebuild; an ad-hoc DR is a bare `cdhash`,
-/// invalidated by any changed byte in the bundle.
+/// The class of a code-signing designated requirement.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum DrClass {
-    /// `identifier "…" and anchor apple generic … certificate leaf …` — no
-    /// cdhash. Survives rebuilds and in-place updates.
+    /// `identifier "…" and anchor apple generic … certificate leaf …`.
     Identity,
-    /// The requirement pins a `cdhash`. Every rebuild is a different identity.
+    /// The requirement pins a `cdhash`.
     Cdhash,
     /// The code object is not signed at all.
     Unsigned,
-    /// Not recognised. Never treated as stable.
+    /// Not recognised.
     #[default]
     Unknown,
 }
@@ -954,31 +757,14 @@ impl DrClass {
         }
     }
 
-    /// `grant_stable=` — whether a TCC grant keyed to this requirement
-    /// survives a rebuild. Only [`DrClass::Identity`] does; everything else,
-    /// including [`DrClass::Unknown`], is treated as unstable.
+    /// `grant_stable=`.
     #[must_use]
     pub const fn grant_stable(self) -> bool {
         matches!(self, Self::Identity)
     }
 }
 
-/// Classify a `codesign -d -r-` requirement string (pure: it does not shell out). The
-/// precedence fails toward "unstable":
-///
-/// 1. an unsigned marker anywhere ⇒ [`DrClass::Unsigned`];
-/// 2. a `cdhash` clause ⇒ [`DrClass::Cdhash`], **even alongside an
-///    identifier** — a requirement that pins a code-directory hash is
-///    invalidated by the next build whatever else it says;
-/// 3. an `identifier` clause plus a certificate/anchor clause ⇒
-///    [`DrClass::Identity`];
-/// 4. otherwise [`DrClass::Unknown`].
-///
-/// Rules 2 and 3 read only text outside quoted strings: an identifier, team or hash is data
-/// the bundle's author chose, so `identifier "com.cdhash.x"` on a Developer ID copy must not
-/// read as a cdhash pin (the class the Trash offers to move). `codesign` prints a plain
-/// alphanumeric value bare (`identifier mycdhash`), so rule 2 also requires the clause's
-/// shape: the word `cdhash` alone, then a hash constant (`H"…"`).
+/// Classify a `codesign -d -r-` requirement string (pure: it does not shell out).
 #[must_use]
 pub fn classify_dr(requirement: &str) -> DrClass {
     let text = requirement.trim();
@@ -1004,9 +790,6 @@ pub fn classify_dr(requirement: &str) -> DrClass {
     DrClass::Unknown
 }
 
-/// Whether lowercased `text`, its quoted strings emptied, holds a `cdhash`
-/// clause: the word on its own — not part of a bare value such as `mycdhash` —
-/// followed by a hash constant.
 fn has_cdhash_clause(text: &str) -> bool {
     text.match_indices("cdhash").any(|(at, word)| {
         let joined = |c: char| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-');
@@ -1015,10 +798,6 @@ fn has_cdhash_clause(text: &str) -> bool {
     })
 }
 
-/// `text` with the inside of every closed `"…"` string removed and its quotes
-/// kept, so `identifier "x"` still reads as an identifier clause. A string
-/// honours backslash escapes and does not cross a line; an unclosed quote is
-/// kept as written.
 fn without_quoted_strings(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for line in text.split_inclusive('\n') {
@@ -1043,20 +822,12 @@ fn without_quoted_strings(text: &str) -> String {
     out
 }
 
-// Code identity of a bundle on disk
-//
-// Shared by the claimant census below and `aterm_gui::signing_identity`'s
-// self-report, so the two cannot disagree about a bundle's requirement.
-
-/// A bounded read of a text plist. A non-file, a file over
-/// [`INFO_PLIST_MAX_BYTES`], or unreadable or non-UTF-8 text reads as absent.
+/// A bounded read of a text plist.
 #[must_use]
 pub fn read_plist_text(path: &Path) -> Option<String> {
     String::from_utf8(read_plist_bytes(path)?).ok()
 }
 
-/// A plist's bytes, or `None` for a non-file, a file over
-/// [`INFO_PLIST_MAX_BYTES`], or one that cannot be read.
 fn read_plist_bytes(path: &Path) -> Option<Vec<u8>> {
     let meta = std::fs::metadata(path).ok()?;
     if !meta.is_file() || meta.len() > INFO_PLIST_MAX_BYTES {
@@ -1065,10 +836,7 @@ fn read_plist_bytes(path: &Path) -> Option<Vec<u8>> {
     std::fs::read(path).ok()
 }
 
-/// The string immediately following one exact XML plist key, non-empty and
-/// trimmed. The value element must follow the key modulo whitespace, so a
-/// malformed or intervening key's string can never be mis-bound. Only XML
-/// plists are understood; a binary plist reads as absent.
+/// The string immediately following one exact XML plist key, non-empty and trimmed.
 #[must_use]
 pub fn plist_string<'a>(text: &'a str, key: &str) -> Option<&'a str> {
     let mut haystack = text;
@@ -1095,8 +863,7 @@ pub struct BundleIdentity {
     pub bundle_id: Option<String>,
     /// The `designated => …` clause.
     pub dr_text: String,
-    /// How that requirement is shaped — `Unsigned` when `codesign` says the
-    /// code is not signed at all, which leaves no clause to classify.
+    /// How that requirement is shaped.
     pub dr: DrClass,
     /// `developer-id` | `adhoc` | `unsigned` | `unknown`.
     pub signing: &'static str,
@@ -1104,13 +871,7 @@ pub struct BundleIdentity {
     pub team: Option<String>,
 }
 
-/// Read one bundle's identity: `Info.plist`, then `codesign`. `None` when that could raise the
-/// consent dialog (the bundle, its `Info.plist`, or anything `codesign` could open through it
-/// resolves under a protected root) and whenever the bundle cannot be vouched for
-/// (`bundle_reaches_protected` has the list: a stray link in `Contents`, anything but
-/// `Contents` and plain files at its top level, an `Info.plist` naming its main executable by
-/// anything but a plain file name). One such shape in the running bundle leaves its identity
-/// unread and the census off.
+/// Read one bundle's identity.
 #[must_use]
 pub fn bundle_identity(root: &Path, protected: &[PathBuf]) -> Option<BundleIdentity> {
     let plist = root.join("Contents").join("Info.plist");
@@ -1128,15 +889,11 @@ fn signed_identity(root: &Path, bundle_id: Option<String>) -> BundleIdentity {
     identity_from_report(codesign_report(root).as_deref(), bundle_id)
 }
 
-/// The identity a `codesign` report describes. Pure.
 fn identity_from_report(report: Option<&str>, bundle_id: Option<String>) -> BundleIdentity {
     let dr_text = report.and_then(designated_requirement).unwrap_or_default();
     let signing = report.map_or("unknown", classify_signing);
     BundleIdentity {
         bundle_id,
-        // Only the whole report can say "unsigned". A requirement clause that
-        // merely contains the phrase (a quoted identifier) is signed code whose
-        // class could not be read, never an unsigned copy the Trash may take.
         dr: match (signing, classify_dr(&dr_text)) {
             ("unsigned", _) => DrClass::Unsigned,
             (_, DrClass::Unsigned) => DrClass::Unknown,
@@ -1148,9 +905,6 @@ fn identity_from_report(report: Option<&str>, bundle_id: Option<String>) -> Bund
     }
 }
 
-/// `codesign -d -r- --verbose=2` over a bundle, stdout and stderr joined
-/// (`codesign -d` writes its report to stderr), within [`CODESIGN_CEILING`].
-/// `None` when it cannot run or does not finish.
 #[cfg(target_os = "macos")]
 fn codesign_report(root: &Path) -> Option<String> {
     let (_, out, err) = run_bounded(
@@ -1166,11 +920,6 @@ fn codesign_report(root: &Path) -> Option<String> {
     Some(format!("{out}\n{err}"))
 }
 
-/// Run one of Apple's tools with stdin closed, within `ceiling`: whether it succeeded, its
-/// stdout and its stderr. `None` for every outcome but [`ToolRun::Exited`], including a stream
-/// over [`TOOL_OUTPUT_MAX_BYTES`] or not UTF-8: a report read in part is not read. Gated
-/// native-only first, as the wasm census reads gates: its reader threads are never in the wasm
-/// module.
 #[cfg(not(target_arch = "wasm32"))]
 #[cfg(target_os = "macos")]
 fn run_bounded(
@@ -1179,7 +928,6 @@ fn run_bounded(
     ceiling: std::time::Duration,
 ) -> Option<(bool, String, String)> {
     match run_bounded_exit(program, args, ceiling, TOOL_OUTPUT_MAX_BYTES) {
-        // `ExitStatus::success` is exactly "exited with code 0" on unix.
         ToolRun::Exited {
             code,
             stdout,
@@ -1189,10 +937,6 @@ fn run_bounded(
     }
 }
 
-/// [`run_bounded`] with the outcome kept apart: the exit code, or which way the run failed.
-/// Stdout and stderr are each read on their own thread (so output beyond a pipe's buffer
-/// cannot wedge the tool), capped at `max_bytes` and required to be UTF-8; `ceiling` bounds the
-/// readers as well as the exit.
 #[cfg(not(target_arch = "wasm32"))]
 #[cfg(target_os = "macos")]
 fn run_bounded_exit(
@@ -1207,8 +951,6 @@ fn run_bounded_exit(
         pipe: impl std::io::Read + Send + 'static,
         max_bytes: u64,
     ) -> Option<std::thread::JoinHandle<Option<String>>> {
-        // `Builder::spawn`, not `thread::spawn`: a thread the OS refuses is no
-        // report, never a panic in the census or the Trash's worker.
         std::thread::Builder::new()
             .spawn(move || {
                 let mut bytes = Vec::new();
@@ -1253,8 +995,6 @@ fn run_bounded_exit(
                 let _ = child.wait();
                 return ToolRun::TimedOut;
             }
-            // The exit could not be read: no code to report, and no claim
-            // that the tool ran long.
             Err(_) => {
                 let _ = child.kill();
                 let _ = child.wait();
@@ -1262,11 +1002,6 @@ fn run_bounded_exit(
             }
         }
     };
-    // The ceiling bounds the readers too, not only the exit. A reader ends at
-    // EOF, which needs every copy of the pipe's write end closed, and a copy
-    // can outlive the tool (a background grandchild, or a child another thread
-    // spawned inside std's non-atomic `pipe()`-then-`FIOCLEX` on macOS). A
-    // reader left unjoined is detached and ends when the last copy closes.
     #[cfg(test)]
     let mut deadline = deadline;
     while !(out.is_finished() && err.is_finished()) {
@@ -1287,8 +1022,6 @@ fn run_bounded_exit(
     }
 }
 
-/// The most of one stream [`run_bounded`] reads: a bundle's reports are a few
-/// kilobytes.
 #[cfg(target_os = "macos")]
 const TOOL_OUTPUT_MAX_BYTES: u64 = 1024 * 1024;
 
@@ -1297,14 +1030,9 @@ fn codesign_report(_root: &Path) -> Option<String> {
     None
 }
 
-/// `codesign -d` on one bundle takes tens of milliseconds; a report that has
-/// not arrived in this long is not coming.
 #[cfg(target_os = "macos")]
 const CODESIGN_CEILING: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// The `designated => …` clause of a `codesign -d -r-` report. An ad-hoc signature's implicit
-/// requirement prints as a comment (`# designated => cdhash H"…"`); the `#` is stripped so it
-/// classifies as [`DrClass::Cdhash`] and two ad-hoc bundles never share the empty requirement.
 fn designated_requirement(report: &str) -> Option<String> {
     report.lines().find_map(|line| {
         let line = line.trim();
@@ -1315,8 +1043,6 @@ fn designated_requirement(report: &str) -> Option<String> {
     })
 }
 
-/// The Team ID, when the signature carries a real one. Apple prints
-/// `TeamIdentifier=not set` for an ad-hoc signature, which is not an id.
 fn team_identifier(report: &str) -> Option<String> {
     report.lines().find_map(|line| {
         let value = line.trim().strip_prefix("TeamIdentifier=")?.trim();
@@ -1324,12 +1050,7 @@ fn team_identifier(report: &str) -> Option<String> {
     })
 }
 
-/// How the code is signed, from the same report. Fails toward the weaker
-/// claim: anything unrecognised is `unknown`, never `developer-id`.
 fn classify_signing(report: &str) -> &'static str {
-    // `codesign -d` on unsigned code prints one line, `<path>: code object is not signed at
-    // all`. Matching that whole shape keeps a folder name containing the phrase from passing
-    // a signed copy off as unsigned, which the Trash would offer to move.
     let mut lines = report.lines().filter(|line| !line.trim().is_empty());
     if let (Some(only), None) = (lines.next(), lines.next())
         && only
@@ -1347,28 +1068,10 @@ fn classify_signing(report: &str) -> &'static str {
     "unknown"
 }
 
-// The claimant census
-//
-// macOS keeps one code requirement per bundle identifier. A copy that does not satisfy it is
-// not merely denied when it asks: `tccd` answers `DB Action:Update, UpdateVerifierData` and
-// replaces the stored requirement with the asker's, resetting the grant for every copy that
-// shares the identifier. That write escapes process scope, so no per-process self-report sees
-// it.
-//
-// The census reports what is on disk and whether those copies agree; it never reads `TCC.db`
-// (not a supported status API), so it says nothing about what `tccd` holds. It counts
-// bundles, not names: a copy is its directory's volume and file number, links followed
-// ([`Located`]), so a link in an app folder, a firmlink spelling and the bundle itself are one
-// claimant. A copy a link leads to is listed and never offered for the Trash, and nothing
-// moves the link: moving the bundle would strand the link, and moving the link would leave
-// the bundle, which is the code `tccd` sees.
-
-/// At most this many claimant lines on any surface. Every surface also carries
-/// the true totals, so truncation can never read as a smaller census.
+/// At most this many claimant lines on any surface.
 pub const MAX_CLAIMANT_ROWS: usize = 8;
 
-/// How much of the candidate space the census got to look at. "Nothing else
-/// claims this id" and "I could not finish looking" are different answers.
+/// How much of the candidate space the census got to look.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Enumeration {
     /// Every source was read and every candidate classified.
@@ -1395,8 +1098,7 @@ impl Enumeration {
 /// One bundle on disk that claims the identifier.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Claimant {
-    /// The bundle directory (`aterm.app`, `aterm.app.rollback`, …) — the
-    /// bundle itself, never a link to it ([`Located::path`]).
+    /// The bundle directory (`aterm.app`, `aterm.app.rollback`, …).
     pub path: PathBuf,
     /// How its designated requirement is shaped.
     pub dr: DrClass,
@@ -1406,46 +1108,33 @@ pub struct Claimant {
     pub signing: &'static str,
     /// The Team ID, when the signature carries a real one.
     pub team: Option<String>,
-    /// Whether this is the bundle the calling process runs from.
+    /// Whether this is the bundle the calling process runs.
     pub running: bool,
-    /// The links the census found that lead to this bundle (a hand-made
-    /// `/Applications/aterm-dev.app` naming a build elsewhere); a linked copy is never offered
-    /// for the Trash ([`TrashOffer::Linked`]).
+    /// The links the census found that lead to this bundle.
     pub links: Vec<PathBuf>,
 }
 
 impl Claimant {
-    /// Whether `tccd` would treat the two as different code. The comparison is
-    /// the designated requirement itself, which is what it stores. An
-    /// unreadable (empty) requirement conflicts: two unknowns are not one
-    /// identity.
     fn conflicts_with(&self, other: &Self) -> bool {
         let (mine, theirs) = (self.dr_text.trim(), other.dr_text.trim());
         mine.is_empty() || theirs.is_empty() || mine != theirs
     }
 }
 
-/// Whether the Security panel's *Move to Trash* takes one conflicting copy and, when not, the
-/// first condition it misses, in this order. [`Self::of`] is the one spelling of the rule: the
-/// move ([`Claimants::retirable`]) and every surface ([`Claimants::listed`]) read it, and a
-/// surface says why a copy stays by naming its variant.
+/// Whether the Security panel's *Move to Trash* takes one conflicting copy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrashOffer {
     /// The button takes it.
     Offered,
-    /// Signed with a certificate, as a release is — a Developer ID copy is
-    /// never moved, whatever its requirement says — or with a signature that
-    /// could not be read, so it is not known to be a build either.
+    /// Signed with a certificate, as a release.
     Signature,
-    /// Signed ad hoc, but its requirement does not read as its cdhash: one
-    /// someone chose, or one that could not be read.
+    /// Signed ad hoc, but its requirement does not read as its cdhash.
     Requirement,
     /// A link someone keeps leads to it ([`Claimant::links`]).
     Linked,
-    /// The copy running here does not keep its grant across updates, so the
-    /// conflicting copy may well be the real release.
+    /// The copy running here does not keep its grant across updates.
     RunningUnstable,
-    /// This Mac has no trash tool to move it with.
+    /// This Mac has no trash tool to move it.
     NoTool,
 }
 
@@ -1463,9 +1152,6 @@ impl TrashOffer {
         }
     }
 
-    /// The rule for one conflicting copy, the trash tool aside: signed ad hoc
-    /// to its cdhash or not signed at all, no link leading to it, beside a
-    /// running copy whose grant survives updates.
     fn of(copy: &Claimant, running_stable: bool) -> Self {
         match (copy.signing, copy.dr) {
             ("adhoc", DrClass::Cdhash) | ("unsigned", DrClass::Unsigned) => {}
@@ -1482,7 +1168,7 @@ impl TrashOffer {
     }
 }
 
-/// Every bundle found claiming one identifier, and how complete the look was.
+/// Every bundle found claiming one identifier, and how complete the look.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Claimants {
     /// Every claimant found, running copy first.
@@ -1492,9 +1178,7 @@ pub struct Claimants {
 }
 
 impl Claimants {
-    /// The claimants whose requirement differs from the running copy's — the
-    /// ones that can reset a grant. Empty when the running copy is unknown:
-    /// with no reference there is nothing to differ from.
+    /// The claimants whose requirement differs from the running.
     #[must_use]
     pub fn conflicting(&self) -> Vec<&Claimant> {
         let Some(running) = self.found.iter().find(|c| c.running) else {
@@ -1506,14 +1190,11 @@ impl Claimants {
             .collect()
     }
 
-    /// Whether the running copy keeps its grant across updates.
     fn running_stable(&self) -> bool {
         self.found.iter().any(|c| c.running && c.dr.grant_stable())
     }
 
-    /// Every conflicting copy the rule ([`TrashOffer`]) lets the move take, the trash tool
-    /// aside and listed or not: the worker's fresh check before each move
-    /// ([`retire_claimants`]).
+    /// Every conflicting copy the rule ([`TrashOffer`]) lets the move take.
     #[must_use]
     pub fn retirable(&self) -> Vec<&Claimant> {
         let stable = self.running_stable();
@@ -1523,10 +1204,7 @@ impl Claimants {
             .collect()
     }
 
-    /// The rows every surface lists (the first [`MAX_CLAIMANT_ROWS`] conflicting copies),
-    /// each with its [`TrashOffer`]; `trash_tool` is whether this Mac has the tool the move
-    /// needs. The panel and the `privacy` verb both read this, so none offers a copy the
-    /// button does not take.
+    /// The rows every surface lists (the first [`MAX_CLAIMANT_ROWS`] conflicting copies).
     #[must_use]
     pub fn listed(&self, trash_tool: bool) -> Vec<(&Claimant, TrashOffer)> {
         let stable = self.running_stable();
@@ -1543,8 +1221,7 @@ impl Claimants {
             .collect()
     }
 
-    /// The copies the Security panel offers to move to the Trash: the listed
-    /// ones that read [`TrashOffer::Offered`].
+    /// The copies the Security panel offers to move to the Trash.
     #[must_use]
     pub fn offered_for_trash(&self, trash_tool: bool) -> Vec<&Claimant> {
         self.listed(trash_tool)
@@ -1553,9 +1230,7 @@ impl Claimants {
             .collect()
     }
 
-    /// Whether the census may say nothing else claims the id: only after a
-    /// complete look. A partial look that found nothing has not established
-    /// absence.
+    /// Whether the census may say nothing else claims the id.
     #[must_use]
     pub fn sole_claimant(&self) -> bool {
         self.enumeration == Enumeration::Complete && self.found.iter().all(|c| c.running)
@@ -1573,20 +1248,18 @@ pub enum Listing {
     Unreadable,
 }
 
-/// What one candidate turned out to be.
+/// What one candidate turned out.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Candidate {
-    /// Not a bundle, gone, or another program's.
+    /// Not a bundle, gone, or another.
     NotOurs,
-    /// A bundle that could not be read: a hole in the census, not an absence.
+    /// A bundle that could not be read.
     Hole,
     /// A bundle claiming the identifier.
     Ours(BundleIdentity),
 }
 
-/// Which bundle one spelling of a candidate names. A bundle has one identity however it is
-/// spelled (a link, a firmlink such as `/System/Volumes/Data/Applications/x.app`, another
-/// letter case on a volume that ignores it), and the census compares identities, not spellings.
+/// Which bundle one spelling of a candidate names.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Located {
     /// The bundle directory's volume and file number, links followed.
@@ -1597,9 +1270,7 @@ pub struct Located {
     pub link: bool,
 }
 
-/// Locate one spelling ([`Located`]). `None` when it cannot be read, or when it is a link to a
-/// folder not named like a bundle: it then stays as spelled, for the candidate read to refuse.
-/// Metadata only, like the protected-root fence's own resolution.
+/// Locate one spelling ([`Located`]).
 #[cfg(unix)]
 #[must_use]
 pub fn locate_candidate(spelled: &Path) -> Option<Located> {
@@ -1625,7 +1296,7 @@ pub fn locate_candidate(spelled: &Path) -> Option<Located> {
     })
 }
 
-/// Off unix there is no file number to compare: every spelling stays its own.
+/// Off unix there is no file number to compare.
 #[cfg(not(unix))]
 #[must_use]
 pub fn locate_candidate(_spelled: &Path) -> Option<Located> {
@@ -1642,15 +1313,10 @@ pub fn list_root(dir: &Path) -> Listing {
     }
 }
 
-/// Classify one candidate for `bundle_id`. The `Info.plist` is read first, and
-/// `codesign` runs only for a bundle that claims the identifier.
+/// Classify one candidate for `bundle_id`.
 #[must_use]
 pub fn read_candidate(root: &Path, bundle_id: &str, protected: &[PathBuf]) -> Candidate {
     let plist = root.join("Contents").join("Info.plist");
-    // Check the fence before `metadata`: a candidate inside a non-existent or
-    // symlinked protected root is a hole without touching the path first, and
-    // a `Contents` link into a protected root is followed by every read below,
-    // `codesign` included.
     if !census_may_read(root, protected) || !census_may_read(&plist, protected) {
         return Candidate::Hole;
     }
@@ -1663,8 +1329,6 @@ pub fn read_candidate(root: &Path, bundle_id: &str, protected: &[PathBuf]) -> Ca
         Ok(meta) if !meta.is_file() => return Candidate::NotOurs,
         Ok(_) => {}
     }
-    // Read as `CFBundle` reads it, so a binary plist — every App Store app's —
-    // answers whose it is rather than leaving a hole in the census.
     let Some(info) = read_info_plist(&plist) else {
         return Candidate::Hole;
     };
@@ -1679,9 +1343,7 @@ pub fn read_candidate(root: &Path, bundle_id: &str, protected: &[PathBuf]) -> Ca
     }
 }
 
-/// Whether the bundle at `claimant.path` is still the copy the census
-/// classified: it still claims `bundle_id`, with the same identity
-/// ([`same_identity`]). Runs `codesign`, so it belongs on a worker.
+/// Whether the bundle at `claimant.path` is still the copy the census classified.
 #[must_use]
 pub fn still_claims(claimant: &Claimant, bundle_id: &str) -> bool {
     let home = std::env::var_os("HOME").map(PathBuf::from);
@@ -1691,9 +1353,6 @@ pub fn still_claims(claimant: &Claimant, bundle_id: &str) -> bool {
     )
 }
 
-/// Whether a fresh read describes the copy the census classified: the same requirement text,
-/// class and signing. An unsigned copy and a failed read both have no text, so the class and
-/// signing tell them apart, and a read with no class is never the same copy.
 fn same_identity(fresh: &BundleIdentity, claimant: &Claimant) -> bool {
     fresh.dr != DrClass::Unknown
         && fresh.dr == claimant.dr
@@ -1701,9 +1360,6 @@ fn same_identity(fresh: &BundleIdentity, claimant: &Claimant) -> bool {
         && fresh.dr_text == claimant.dr_text
 }
 
-/// [`list_root`], except that a folder under a protected root is never listed —
-/// an app run from `~/Desktop` must not list the Desktop — and is a hole in the
-/// look instead.
 fn list_unless_protected(dir: &Path, protected: &[PathBuf]) -> Listing {
     if census_may_read(dir, protected) {
         list_root(dir)
@@ -1712,38 +1368,13 @@ fn list_unless_protected(dir: &Path, protected: &[PathBuf]) -> Listing {
     }
 }
 
-/// The most entries [`bundle_reaches_protected`] walks, and how deep: a real
-/// bundle has a few dozen. A bundle larger or deeper is not vouched for.
 const BUNDLE_WALK_MAX_ENTRIES: usize = 4096;
 const BUNDLE_WALK_MAX_DEPTH: usize = 16;
 
-/// Whether the bundle at `root` cannot be vouched for before `codesign` reads it.
-///
-/// It reaches only what is physically inside the bundle, on its own volume (its top level,
-/// one listing, and its `Contents`, walked), so it never lists a place `codesign` would not
-/// open, and it refuses whatever could lead `codesign` elsewhere:
-///
-/// * a `Contents` under a protected root, as spelled or resolved, or resolving outside the
-///   bundle;
-/// * a bundle that resolves to a folder the census would not take for one
-///   ([`looks_like_bundle`]: `x.app -> ~`), that holds a protected root, or whose path holds a
-///   control character (`codesign` prints it raw);
-/// * at the top level, where `CFBundle` looks for a main executable it does not find in
-///   `Contents/MacOS`, anything but `Contents` and plain files;
-/// * in `Contents`, a link that does not resolve inside it (a real bundle's only links are its
-///   own aliases, `atpkg -> aterm`), a folder on another volume, or a platform `Info-*.plist`;
-/// * an `Info.plist` that names a main executable other than a plain file name, as Apple's own
-///   parser reads it ([`plist_names_plain_executables`]).
-///
-/// `true`, too, when it cannot finish (an unreadable folder, or past the bounds).
 fn bundle_reaches_protected(root: &Path, protected: &[PathBuf]) -> bool {
     bundle_reaches_protected_on(root, protected, device_of, BUNDLE_WALK_MAX_ENTRIES)
 }
 
-/// [`bundle_reaches_protected`] with each folder's volume read by `device` ([`device_of`])
-/// and the entry bound given: a test can stand a scratch folder in for a mounted volume
-/// (mounting a disk image and reading inside it can raise macOS's removable-volume dialog),
-/// and reach past the bound without laying thousands of files.
 fn bundle_reaches_protected_on(
     root: &Path,
     protected: &[PathBuf],
@@ -1757,8 +1388,6 @@ fn bundle_reaches_protected_on(
     let Ok(bundle) = std::fs::canonicalize(root) else {
         return true;
     };
-    // `codesign`'s report prints the executable's path raw, a field a line: a
-    // control character in it could forge a line the signing readers trust.
     let spelled_plainly = |path: &Path| !path.to_string_lossy().chars().any(char::is_control);
     if !spelled_plainly(root) || !spelled_plainly(&bundle) {
         return true;
@@ -1781,7 +1410,6 @@ fn bundle_reaches_protected_on(
         return true;
     }
     let mut seen = 0usize;
-    // The top level: only `Contents` and plain files.
     let Ok(top) = std::fs::read_dir(&bundle) else {
         return true;
     };
@@ -1817,8 +1445,6 @@ fn bundle_reaches_protected_on(
             let Ok(kind) = entry.file_type() else {
                 return true;
             };
-            // `CFBundle` reads a platform plist (`Info-macos.plist`) before `Info.plist`,
-            // matching either name in any case; only `Info.plist` itself may stand.
             if depth == 0 {
                 let name = entry.file_name();
                 let lower = name.to_string_lossy().to_ascii_lowercase();
@@ -1843,9 +1469,6 @@ fn bundle_reaches_protected_on(
             }
         }
     }
-    // `codesign` also opens the main executable the plist names: an absolute
-    // `CFBundleExecutable`, or one that climbs with `..`, leaves `Contents` as surely as a
-    // link does. A missing plist names none.
     let plist = inside.join("Info.plist");
     match std::fs::symlink_metadata(&plist) {
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
@@ -1854,11 +1477,6 @@ fn bundle_reaches_protected_on(
     }
 }
 
-/// What `CFBundle` reads from a bundle's `Info.plist`: its identifier (the
-/// `CFBundleIdentifier-macos` variant where there is one, which `CFBundle` applies over the
-/// plain key whatever its value; `-macosx`, `-ios` and `~mac` are not applied) and, on macOS,
-/// whether every key containing `executable` (`CFBundleExecutable`, its `-macos` variant,
-/// `NSExecutable`, …) names a plain file ([`plain_file_name`]).
 #[derive(Debug, PartialEq, Eq)]
 struct InfoPlist {
     bundle_id: Option<String>,
@@ -1866,9 +1484,6 @@ struct InfoPlist {
     plain_executables: bool,
 }
 
-/// Whether `name` is a plain file name: one path component, no control character (which would
-/// forge a line in `codesign`'s report). So the executable `codesign` opens is in
-/// `Contents/MacOS`, or else a plain file at the bundle's top level.
 #[cfg(any(target_os = "macos", test))]
 fn plain_file_name(name: &str) -> bool {
     let mut parts = Path::new(name).components();
@@ -1878,11 +1493,6 @@ fn plain_file_name(name: &str) -> bool {
     ) && !name.chars().any(char::is_control)
 }
 
-/// A bundle's `Info.plist` as `CFBundle` reads it, parsed in process by the same CoreFoundation
-/// reader (`CFPropertyListCreateWithData`): binary plists, every encoding, entity and spelling
-/// it accepts, and nothing it does not. `None` (a hole, since `CFBundle` might read it) when
-/// the file cannot be read or is over [`INFO_PLIST_MAX_BYTES`]; a file CoreFoundation cannot
-/// parse gives `CFBundle` no identifier and no executable, so it reads as naming nothing.
 #[cfg(target_os = "macos")]
 fn read_info_plist(plist: &Path) -> Option<InfoPlist> {
     let bytes = read_plist_bytes(plist)?;
@@ -1892,8 +1502,6 @@ fn read_info_plist(plist: &Path) -> Option<InfoPlist> {
     }))
 }
 
-/// Off macOS there is no `CFBundle` (and no `codesign`): a text plist's
-/// identifier, read as it is, and no executable to vouch for.
 #[cfg(not(target_os = "macos"))]
 fn read_info_plist(plist: &Path) -> Option<InfoPlist> {
     let text = read_plist_text(plist)?;
@@ -1902,46 +1510,33 @@ fn read_info_plist(plist: &Path) -> Option<InfoPlist> {
     })
 }
 
-/// Whether `plist`, read as `CFBundle` reads it ([`read_info_plist`]), names
-/// only plain executables. A plist that cannot be read is not vouched for.
 #[cfg(target_os = "macos")]
 fn plist_names_plain_executables(plist: &Path) -> bool {
     read_info_plist(plist).is_some_and(|info| info.plain_executables)
 }
 
-/// Off macOS nothing runs `codesign`, so nothing follows the name.
 #[cfg(not(target_os = "macos"))]
 fn plist_names_plain_executables(_plist: &Path) -> bool {
     true
 }
 
-/// The volume `path` (followed) lives on, as its device number.
 #[cfg(unix)]
 fn device_of(path: &Path) -> Option<u64> {
     use std::os::unix::fs::MetadataExt as _;
     std::fs::metadata(path).ok().map(|meta| meta.dev())
 }
 
-/// Off unix there is no device number to compare, and no TCC to ask.
 #[cfg(not(unix))]
 fn device_of(path: &Path) -> Option<u64> {
     std::fs::metadata(path).ok().map(|_| 0)
 }
 
-/// Whether the census may look inside `path`: not under a protected root as
-/// spelled, nor once resolved — a link from `/Applications` into `~/Documents`
-/// must not be followed into it. `canonicalize` is metadata-only and raises no
-/// dialog; listing or reading under a protected root would.
 fn census_may_read(path: &Path, protected: &[PathBuf]) -> bool {
     !is_under_protected_root(path, protected)
         && !std::fs::canonicalize(path)
             .is_ok_and(|resolved| is_under_protected_root(&resolved, protected))
 }
 
-/// The directories the census lists, with whether each must be readable: the running bundle's
-/// parent (required: this process runs from there, and the updater's `rollback_path` puts the
-/// displaced bundle beside the live one), then the conventional app folders (a missing one is
-/// empty). `LaunchServices` supplies every other registered copy.
 fn claimant_search_roots(running: Option<&Path>, home: Option<&Path>) -> Vec<(PathBuf, bool)> {
     let mut roots: Vec<(PathBuf, bool)> = Vec::new();
     if let Some(parent) = running.and_then(Path::parent) {
@@ -1959,9 +1554,6 @@ fn claimant_search_roots(running: Option<&Path>, home: Option<&Path>) -> Vec<(Pa
     roots
 }
 
-/// Whether a directory entry is named like a bundle: `foo.app`, or
-/// `foo.app.<suffix>` — `aterm.app.rollback` is a complete bundle carrying the
-/// install's identifier. Hidden names are skipped.
 fn looks_like_bundle(path: &Path) -> bool {
     let Some(name) = path
         .file_name()
@@ -1979,35 +1571,23 @@ fn looks_like_bundle(path: &Path) -> bool {
                 .is_some_and(|(head, tail)| !head.is_empty() && !tail.is_empty()))
 }
 
-/// What makes two candidates one bundle: the file they locate to, or, for a
-/// spelling that could not be located, the spelling itself.
 #[derive(PartialEq, Eq)]
 enum SameBundle {
     File((u64, u64)),
     Spelled(PathBuf),
 }
 
-/// One bundle the census reached, however many times.
 struct Reached {
     same: SameBundle,
-    /// The path it is read and reported by.
+    /// The path it is read and reported.
     path: PathBuf,
-    /// Whether `path` is only where a link resolves: the bundle's own name,
-    /// once a source spells it, replaces it.
+    /// Whether `path` is only where a link resolves.
     resolved: bool,
     /// The links that lead to it.
     links: Vec<PathBuf>,
 }
 
-/// The census, pure over its sources: `running` is the bundle this process runs from, `roots`
-/// the directories to list (with whether each is required), `registered` the copies
-/// `LaunchServices` knows (`None` when it could not be asked), and `list`, `locate` and `read`
-/// the filesystem reads, injected so a table test needs no filesystem and no `codesign`.
-///
-/// Candidates are told apart by the bundle each locates to ([`Located`]), never by spelling:
-/// a link to the running copy is the running copy, and a link to another build is that build,
-/// reported under the bundle's own name (the first a source spells it by, else where the link
-/// resolves) with the link in [`Claimant::links`].
+/// The census, pure over its sources.
 #[must_use]
 pub fn classify_claimants(
     running: Option<&Path>,
@@ -2101,8 +1681,7 @@ pub fn classify_claimants(
     Claimants { found, enumeration }
 }
 
-/// The census for one identifier, against this machine. Runs `codesign` per claiming bundle,
-/// so it belongs on a worker, never on a draw path.
+/// The census for one identifier, against this machine.
 #[must_use]
 pub fn claimants_for(bundle_id: &str) -> Claimants {
     let running = running_bundle();
@@ -2119,13 +1698,6 @@ pub fn claimants_for(bundle_id: &str) -> Claimants {
     )
 }
 
-/// The roots [`claimants_for`] and [`still_claims`] refuse to list or read
-/// inside: [`protected_roots_in`] with default overrides PLUS
-/// [`app_data_roots`] (`~/Library/Containers` and `~/Library/Group Containers`),
-/// for both `home` as spelled and `canonicalize(home)` when they differ (e.g. a
-/// symlinked `$HOME` or `/var/…` vs `/private/var/…`), so a copy `LaunchServices`
-/// registered inside another app's container is a hole rather than an `Info.plist`
-/// read or `codesign` run that raises the App Data dialog.
 #[must_use]
 fn census_fence(home: Option<&Path>) -> Vec<PathBuf> {
     let mut roots = protected_roots_in(home, &[]);
@@ -2147,8 +1719,7 @@ fn census_fence(home: Option<&Path>) -> Vec<PathBuf> {
     roots
 }
 
-/// The `kTCCServiceSystemPolicyAppData` parent roots under `home`
-/// ([`crate::sbpl::APP_DATA_ROOTS`]), resolved as absolute paths.
+/// The `kTCCServiceSystemPolicyAppData` parent roots under `home`.
 #[must_use]
 pub fn app_data_roots(home: &Path) -> Vec<PathBuf> {
     crate::sbpl::APP_DATA_ROOTS
@@ -2157,8 +1728,6 @@ pub fn app_data_roots(home: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-/// [`claimants_for`] with its sources given: the real listing and candidate
-/// reads, each behind the protected-root fence.
 fn census_in(
     bundle_id: &str,
     running: Option<&Path>,
@@ -2176,9 +1745,6 @@ fn census_in(
     )
 }
 
-/// The bundle this process runs from, by the kernel's path: after an update's swap, the
-/// `aterm.app.rollback` actually executing, not the new bundle that took the name. The exec
-/// path is the fallback only when the kernel will not say.
 fn running_bundle() -> Option<PathBuf> {
     running_bundle_from(self_image(), || {
         std::env::current_exe()
@@ -2187,8 +1753,6 @@ fn running_bundle() -> Option<PathBuf> {
     })
 }
 
-/// [`running_bundle`], pure over the kernel's answer and the resolved exec path, which is
-/// read only when the kernel will not say.
 fn running_bundle_from(
     image: SelfImage,
     exec: impl FnOnce() -> Option<PathBuf>,
@@ -2200,8 +1764,6 @@ fn running_bundle_from(
     }
 }
 
-/// Every bundle `LaunchServices` has registered for `bundle_id` — every copy
-/// that has launched, wherever it sits. `None` when it cannot be asked.
 fn registered_bundles(bundle_id: &str) -> Option<Vec<PathBuf>> {
     #[cfg(target_os = "macos")]
     {
@@ -2214,10 +1776,6 @@ fn registered_bundles(bundle_id: &str) -> Option<Vec<PathBuf>> {
     }
 }
 
-/// Whether `path` sits in a Trash (`~/.Trash`, a volume's `.Trashes`).
-/// `LaunchServices` keeps a copy's registration after it is moved there, the
-/// Finder will not open an item in the Trash, and moving a copy there is how
-/// the Security panel retires one — so the census does not count it.
 fn in_trash(path: &Path) -> bool {
     path.components().any(|c| {
         matches!(c, std::path::Component::Normal(name) if name == ".Trash" || name == ".Trashes")
@@ -2229,9 +1787,7 @@ fn in_trash(path: &Path) -> bool {
 pub enum Retired {
     /// Moved to the Trash.
     Moved,
-    /// Left in place: a fresh check no longer offers it — it moved, it was
-    /// re-signed, its signature could not be read, or the copy running here
-    /// changed.
+    /// Left in place: a fresh check no longer offers it.
     NotOffered,
     /// Left in place: a process runs from it, or that could not be ruled out.
     InUse,
@@ -2239,10 +1795,7 @@ pub enum Retired {
     Failed(String),
 }
 
-/// Move to the Trash each copy in `plan` (the copies the owner was shown) that a fresh census
-/// still offers ([`Claimants::retirable`]), that is still the same bundle right before the move
-/// (`unchanged`, see [`still_claims`]), and that no process runs from. Nothing outside `plan`
-/// is touched. The checks are injected so a table test drives every arm.
+/// Move to the Trash each copy in `plan` (the copies the owner was shown) that a fresh census.
 pub fn retire_claimants(
     plan: &[PathBuf],
     fresh: &Claimants,
@@ -2266,22 +1819,14 @@ pub fn retire_claimants(
         .collect()
 }
 
-// Protected roots
-
 /// The protected roots, resolved once, as absolute paths.
-///
-/// With `overrides` empty, [`crate::sbpl::PRIVATE_SUBDIRS`] joined onto `$HOME`: the list
-/// Containment denies, so the two tiers agree. An override is taken verbatim when absolute
-/// and expanded when it is `~` or starts `~/`; anything else is skipped (`--validate-config`
-/// warns). Empty when `$HOME` is unset and no absolute override was given: callers treat "no
-/// roots" as "cannot answer", never as "nothing is protected".
 #[must_use]
 pub fn protected_roots(overrides: &[String]) -> Vec<PathBuf> {
     let home = std::env::var_os("HOME").map(PathBuf::from);
     protected_roots_in(home.as_deref(), overrides)
 }
 
-/// [`protected_roots`], with `$HOME` injected. Pure.
+/// [`protected_roots`], with `$HOME` injected.
 #[must_use]
 pub fn protected_roots_in(home: Option<&Path>, overrides: &[String]) -> Vec<PathBuf> {
     if overrides.is_empty() {
@@ -2319,13 +1864,7 @@ pub fn protected_roots_in(home: Option<&Path>, overrides: &[String]) -> Vec<Path
     roots
 }
 
-/// The paths under `$HOME`, beyond [`crate::sbpl::PRIVATE_SUBDIRS`], whose `stat` can raise
-/// a macOS privacy prompt: other apps' data (`kTCCServiceSystemPolicyAppData`), the File
-/// Provider and iCloud Drive stores, and the Trash. The sandbox does not read these (it keeps
-/// `PRIVATE_SUBDIRS` unchanged); a reader that `stat`s paths it did not write takes them
-/// through [`tcc_prompting_roots`]. The census guard `protected-folder` (aterm-census
-/// `guards/rules.rs`) keeps its own needles for the literal shapes it refuses in shipped code
-/// (`Library/Containers`, `Library/CloudStorage`, `/Volumes`); it does not read this const.
+/// The paths under `$HOME`, beyond [`crate::sbpl::PRIVATE_SUBDIRS`].
 pub const TCC_PROMPTING_SUBPATHS: &[&str] = &[
     "Library/Containers",
     "Library/Group Containers",
@@ -2334,19 +1873,10 @@ pub const TCC_PROMPTING_SUBPATHS: &[&str] = &[
     ".Trash",
 ];
 
-/// The machine-wide paths whose `stat` can raise a privacy prompt or mount a volume:
-/// removable and network volumes (`kTCCServiceSystemPolicyRemovableVolumes`,
-/// `…NetworkVolumes`), the automounted home and network maps.
+/// The machine-wide paths whose `stat` can raise a privacy prompt or mount a volume.
 pub const TCC_PROMPTING_ABSOLUTE: &[&str] = &["/Volumes", "/System/Volumes/Data/home", "/Network"];
 
-/// Every path whose `stat` can put a privacy dialog on the owner's screen (design
-/// `docs/DESIGN-system-awareness-2026-10-16.md` §3.4 row 10, §10.5 rule 7), absolute, for a
-/// reader that touches paths it did not create (the disk walker, a job's output-file read).
-///
-/// It is [`protected_roots_in`]'s default set ALWAYS (an override adds to it here, never
-/// removes: a prompt is macOS's behaviour, not a setting), plus `overrides`, plus
-/// [`TCC_PROMPTING_SUBPATHS`] under `home` and [`TCC_PROMPTING_ABSOLUTE`]. Other users'
-/// homes are a rule, not a list ([`other_homes_root`]). Pure.
+/// Every path whose `stat` can put a privacy dialog on the owner's screen, absolute.
 #[must_use]
 pub fn tcc_prompting_roots(home: &Path, overrides: &[String]) -> Vec<PathBuf> {
     let mut roots = protected_roots_in(Some(home), &[]);
@@ -2360,9 +1890,7 @@ pub fn tcc_prompting_roots(home: &Path, overrides: &[String]) -> Vec<PathBuf> {
     roots
 }
 
-/// The folder that holds every user's home (`/Users` for `/Users//a`): every path under it
-/// that is not under `home` is another user's, and reading it can prompt. `None` when `home`
-/// sits directly under `/` or is not absolute. Pure.
+/// The folder that holds every user's home (`/Users` for `/Users//a`).
 #[must_use]
 pub fn other_homes_root(home: &Path) -> Option<PathBuf> {
     if !home.is_absolute() {
@@ -2373,11 +1901,7 @@ pub fn other_homes_root(home: &Path) -> Option<PathBuf> {
         .map(Path::to_path_buf)
 }
 
-// Folders
-
-/// One promptable per-folder service, named the way `[privacy] warmup_folders`
-/// names it. The path literals live only here; `aterm-gui` and `aterm-cli`
-/// receive resolved [`PathBuf`]s.
+/// One promptable per-folder service, named the way `[privacy] warmup_folders` names it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Folder {
     /// `~/Documents` — `kTCCServiceSystemPolicyDocumentsFolder`.
@@ -2386,14 +1910,7 @@ pub enum Folder {
     Desktop,
     /// `~/Downloads` — `kTCCServiceSystemPolicyDownloadsFolder`.
     Downloads,
-    /// Another application's data (`kTCCServiceSystemPolicyAppData`, "would like to access
-    /// data from other apps"). Not the human's folder, hence last in [`ALL`](Self::ALL) with
-    /// its own [`label`](Self::label); promptable, resettable and warm-up-able like the
-    /// folders.
-    ///
-    /// Its probe path is one fixed first-party container ([`path`](Self::path)), named rather
-    /// than discovered, since listing to choose one would itself be a guarded access. It may
-    /// not exist, hence [`absent_means_allowed`](Self::absent_means_allowed).
+    /// Another application's data.
     AppData,
 }
 
@@ -2406,11 +1923,7 @@ impl Folder {
         Self::AppData,
     ];
 
-    /// What the warm-up asks for when `[privacy] warmup_folders` is absent: the three folders,
-    /// not [`AppData`](Self::AppData), whose Allow is forgotten when the responsible instance
-    /// ends (`docs/DESIGN-macos-tcc-prompts-2026-08-30.md` §1.6a), so the dialog could never be
-    /// made to stick. An explicit list may still name it, and [`ALL`](Self::ALL) carries it for
-    /// the reset and the report rows.
+    /// What the warm-up asks for when `[privacy] warmup_folders` is absent.
     pub const WARMUP_DEFAULT: &'static [Self] = &[Self::Documents, Self::Desktop, Self::Downloads];
 
     /// The configuration / report name (`documents`).
@@ -2424,8 +1937,7 @@ impl Folder {
         }
     }
 
-    /// The `tccutil` service name (`SystemPolicyDocumentsFolder`) — the
-    /// `kTCCService` prefix is not part of `tccutil`'s argument.
+    /// The `tccutil` service name (`SystemPolicyDocumentsFolder`).
     #[must_use]
     pub const fn tcc_service(self) -> &'static str {
         match self {
@@ -2436,16 +1948,13 @@ impl Folder {
         }
     }
 
-    /// Parse a configuration name. Case-insensitive; unknown names are `None`
-    /// so `--validate-config` can warn rather than silently dropping one.
+    /// Parse a configuration name.
     #[must_use]
     pub fn parse(name: &str) -> Option<Self> {
         match name.trim().to_ascii_lowercase().as_str() {
             "documents" => Some(Self::Documents),
             "desktop" => Some(Self::Desktop),
             "downloads" => Some(Self::Downloads),
-            // Three spellings for the one two-word name: a hand-written config need not guess
-            // the separator.
             "app-data" | "app_data" | "appdata" => Some(Self::AppData),
             _ => None,
         }
@@ -2464,8 +1973,7 @@ impl Folder {
         }
     }
 
-    /// The display name, so every surface spells it alike and none derives a sentence from
-    /// the config token.
+    /// The display name, so every surface spells it alike and none derives a sentence.
     #[must_use]
     pub const fn label(self) -> &'static str {
         match self {
@@ -2476,8 +1984,7 @@ impl Folder {
         }
     }
 
-    /// The noun a sentence about this item uses: "this folder" for the three,
-    /// "this data" for the fourth. Denial copy is per-item for that reason.
+    /// The noun a sentence about this item uses.
     #[must_use]
     pub const fn noun(self) -> &'static str {
         match self {
@@ -2487,11 +1994,6 @@ impl Folder {
     }
 
     /// Whether a missing probe path is a permission answer rather than a failure.
-    ///
-    /// macOS creates the three folders at account setup, so their absence is a broken home
-    /// and [`ERRNO_ENOENT`] there means "could not be read". The app-data container exists
-    /// only once its app has run; there `ENOENT` proves the access was permitted, since a TCC
-    /// refusal answers [`ERRNO_EPERM`] before the lookup can report a missing name.
     #[must_use]
     pub const fn absent_means_allowed(self) -> bool {
         match self {
@@ -2501,14 +2003,9 @@ impl Folder {
     }
 }
 
-/// The bundle whose container stands for every other app's data. Notes ships with macOS and
-/// is not removable, so the name resolves on any account; TCC keys the grant to the service,
-/// so one container answers for all apps, and whether it exists does not matter
-/// ([`Folder::absent_means_allowed`]).
 const APP_DATA_PROBE_BUNDLE: &str = "com.apple.Notes";
 
-/// Resolve configured folder names to `(folder, absolute path)` pairs, in order, skipping
-/// unknown names: the warm-up worker's paths, as data, so it holds no path literal.
+/// Resolve configured folder names to `(folder, absolute path)` pairs, in order.
 #[must_use]
 pub fn folder_paths_in(home: Option<&Path>, names: &[String]) -> Vec<(Folder, PathBuf)> {
     let Some(home) = home else {
@@ -2528,19 +2025,12 @@ pub fn folder_paths(names: &[String]) -> Vec<(Folder, PathBuf)> {
     folder_paths_in(home.as_deref(), names)
 }
 
-/// The one bundle id a `tccutil reset` may name: the running bundle's own,
-/// read from its `Info.plist` and trimmed. Minted only by
-/// [`ResetSubject::read`] from a bundle root, never from a string, so no
-/// literal — the release channel's id typed into a dev build, a config
-/// value, another app's name — can become a reset's subject: a dev channel
-/// resets only its own rows, by construction (design §3.1, HYG-3).
+/// The one bundle id a `tccutil reset` may name.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ResetSubject(String);
 
 impl ResetSubject {
-    /// Read the subject from the bundle at `root` ([`bundle_id_of`]), or
-    /// `None` when it names no usable identifier
-    /// ([`bundle_id_is_usable`]).
+    /// Read the subject from the bundle at `root` ([`bundle_id_of`]).
     #[must_use]
     pub fn read(root: &Path, protected: &[PathBuf]) -> Option<Self> {
         Self::from_usable(&bundle_id_of(root, protected)?)
@@ -2550,16 +2040,14 @@ impl ResetSubject {
         bundle_id_is_usable(bundle_id).then(|| Self(bundle_id.trim().to_owned()))
     }
 
-    /// The subject every invocation names — the running bundle's id, trimmed.
+    /// The subject every invocation names.
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
     }
 }
 
-/// Build the `tccutil reset <service> <bundle id>` argv for one folder; it never runs it.
-/// The subject comes from the running bundle ([`ResetSubject`]), so a dev channel resets
-/// only its own rows.
+/// Build the `tccutil reset <service> <bundle id>` argv for one folder.
 #[must_use]
 pub fn tccutil_reset_command(subject: &ResetSubject, folder: Folder) -> Vec<String> {
     vec![
@@ -2570,48 +2058,33 @@ pub fn tccutil_reset_command(subject: &ResetSubject, folder: Folder) -> Vec<Stri
     ]
 }
 
-// Denied-state repair (design §3.7), pure.
-//
-// A persisted "Don't Allow" and a stale-`csreq` silent failure look the same from outside:
-// `EPERM`, no dialog, and macOS never asks again. The only unprivileged repair is `tccutil
-// reset`, which removes this app's row for one service so macOS can ask again; it grants
-// nothing and cannot help Full Disk Access. This module only builds argv and folds recorded
-// results. The spawn lives in the Settings panel behind an owner gesture, fenced off every
-// control verb, so a program in a session cannot re-arm a prompt the human already answered.
-// Nothing here may imply what a later grant covers (§7 S4 is unmeasured).
-
-/// The `tccutil` binary, absolute: a destructive mutation of the human's privacy state is never
-/// resolved through `PATH`.
+/// The `tccutil` binary, absolute.
 #[cfg(any(unix, test))]
 pub const TCCUTIL_PATH: &str = "/usr/bin/tccutil";
 
-/// Whether [`TCCUTIL_PATH`] can be run at all; §3.7 shows no repair button otherwise. A
-/// property of the file, never rendered as a privacy verdict.
+/// Whether [`TCCUTIL_PATH`] can be run at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum TccutilPresence {
     /// A file at [`TCCUTIL_PATH`] carrying an execute bit.
     Executable,
-    /// Nothing usable at [`TCCUTIL_PATH`] — absent, or not a file.
+    /// Nothing usable at [`TCCUTIL_PATH`].
     Missing,
     /// Present, but with no execute bit.
     NotExecutable,
-    /// Not determined: the path could not be examined, or this is not a unix
-    /// where an execute bit exists. Never treated as runnable.
+    /// Not determined: the path could not be examined.
     #[default]
     Unknown,
 }
 
 impl TccutilPresence {
-    /// Whether an invocation may be attempted. Only [`Self::Executable`] —
-    /// [`Self::Unknown`] fails toward "do not offer a destructive button".
+    /// Whether an invocation may be attempted.
     #[must_use]
     pub const fn can_run(self) -> bool {
         matches!(self, Self::Executable)
     }
 }
 
-/// Classify a stat of [`TCCUTIL_PATH`] (the caller does the stat). A path that exists but is
-/// not a regular file is [`TccutilPresence::Missing`].
+/// Classify a stat of [`TCCUTIL_PATH`] (the caller does the stat).
 #[must_use]
 #[cfg(any(unix, test))]
 pub const fn classify_tccutil(is_file: bool, executable: bool) -> TccutilPresence {
@@ -2622,16 +2095,13 @@ pub const fn classify_tccutil(is_file: bool, executable: bool) -> TccutilPresenc
     }
 }
 
-/// One `stat` of [`TCCUTIL_PATH`]: no spawn, no `tccd`, no `WindowServer`, nothing under a
-/// protected root, so safe from a headless process. A failure other than "no such file" is
-/// [`TccutilPresence::Unknown`], not a claim that the tool is absent.
+/// One `stat` of [`TCCUTIL_PATH`].
 #[cfg(unix)]
 #[must_use]
 pub fn tccutil_presence() -> TccutilPresence {
     tccutil_presence_at(Path::new(TCCUTIL_PATH))
 }
 
-/// [`tccutil_presence`] over `path`, so a test can stat a file of its own.
 #[cfg(unix)]
 fn tccutil_presence_at(path: &Path) -> TccutilPresence {
     use std::os::unix::fs::PermissionsExt as _;
@@ -2643,20 +2113,14 @@ fn tccutil_presence_at(path: &Path) -> TccutilPresence {
     }
 }
 
-/// Off unix there is no execute bit to read, so the answer is
-/// [`TccutilPresence::Unknown`] and the button is never offered.
+/// Off unix there is no execute bit to read.
 #[cfg(not(unix))]
 #[must_use]
 pub fn tccutil_presence() -> TccutilPresence {
     TccutilPresence::Unknown
 }
 
-/// Whether a string may be used as the `tccutil` subject. Every clause is a safety property:
-///
-/// * non-blank: `tccutil reset <service>` with no subject is the every-app form;
-/// * no interior whitespace and no control characters: a plist bundle id like that was not
-///   read correctly;
-/// * no leading `-`, which would be taken for a flag.
+/// Whether a string may be used as the `tccutil` subject.
 #[must_use]
 pub fn bundle_id_is_usable(bundle_id: &str) -> bool {
     let id = bundle_id.trim();
@@ -2666,23 +2130,16 @@ pub fn bundle_id_is_usable(bundle_id: &str) -> bool {
         && !id.chars().any(char::is_control)
 }
 
-/// What the Settings panel should do about the *Ask again* repair. A pure
-/// decision — the panel owns the prose; this crate owns the choice.
+/// What the Settings panel should do about the *Ask again* repair.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ResetOffer {
-    /// Show the button. It re-arms macOS's question for the folders in the
-    /// plan; it makes no claim about what a grant that follows will cover.
+    /// Show the button.
     Offer,
-    /// Show no button; say a rebuild, not the owner, invalidated the grant, and point at the
-    /// dev-identity fix (§3.1): this identity does not survive a build, so a reset could not
-    /// hold. Worded from the [`DrClass`].
+    /// Show no button; say a rebuild, not the owner, invalidated the grant.
     ExplainRebuild,
-    /// Show nothing: [`TCCUTIL_PATH`] cannot be run here (missing, not
-    /// executable, or not determinable).
+    /// Show nothing: [`TCCUTIL_PATH`] cannot be run here.
     HideNoTool,
-    /// Show nothing: the running bundle id is unknown, so no argv can be built
-    /// from the running bundle, and there is no literal fallback (a dev channel
-    /// must never reset the release's rows).
+    /// Show nothing: the running bundle id is unknown.
     HideNoBundleId,
 }
 
@@ -2694,25 +2151,18 @@ impl ResetOffer {
     }
 }
 
-/// Everything [`reset_offer`] reads. All observed: a classified designated
-/// requirement, a stat, and the running bundle's own id.
+/// Everything [`reset_offer`] reads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct ResetOfferInputs<'a> {
-    /// The designated-requirement class of the running code object
-    /// ([`classify_dr`]).
+    /// The designated-requirement class of the running code object ([`classify_dr`]).
     pub dr: DrClass,
     /// Whether [`TCCUTIL_PATH`] can be run ([`tccutil_presence`]).
     pub tccutil: TccutilPresence,
-    /// The running bundle's reset subject; `None` when it could not be
-    /// read. Never a literal, never the release's id on a dev build.
+    /// The running bundle's reset subject.
     pub bundle_id: Option<&'a ResetSubject>,
 }
 
-/// Decide whether the denied-state repair may be offered. Pure. An identity that does not
-/// survive a build ([`DrClass::Cdhash`], §3.7; [`DrClass::Unsigned`], §3.1) explains the
-/// rebuild instead, ahead of the tool and subject checks. [`DrClass::Unknown`] does not
-/// suppress the offer: no unstable identity was observed, and the panel promises nothing about
-/// a later grant's durability.
+/// Decide whether the denied-state repair may be offered.
 #[must_use]
 pub fn reset_offer(inputs: ResetOfferInputs<'_>) -> ResetOffer {
     match inputs.dr {
@@ -2730,8 +2180,7 @@ pub fn reset_offer(inputs: ResetOfferInputs<'_>) -> ResetOffer {
     }
 }
 
-/// One owner-initiated *Ask again*: one `tccutil reset` per folder, every argv built from the
-/// same running bundle id. Building a plan runs nothing, and it carries each folder once.
+/// One owner-initiated *Ask again*.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ResetPlan {
     subject: ResetSubject,
@@ -2739,9 +2188,7 @@ pub struct ResetPlan {
 }
 
 impl ResetPlan {
-    /// Build a plan, or `None` for no folder. Duplicate folders are dropped,
-    /// keeping first-seen order. The subject is usable by construction
-    /// ([`ResetSubject::read`]).
+    /// Build a plan, or `None` for no folder.
     #[must_use]
     pub fn new(subject: &ResetSubject, folders: &[Folder]) -> Option<Self> {
         let mut wanted: Vec<Folder> = Vec::with_capacity(folders.len());
@@ -2759,8 +2206,7 @@ impl ResetPlan {
         })
     }
 
-    /// Build a plan only when [`reset_offer`] says the repair may be offered: the panel's
-    /// entry point, making "the button is hidden" and "no argv exists" one fact.
+    /// Build a plan only when [`reset_offer`] says the repair may be offered.
     #[must_use]
     pub fn for_offer(inputs: ResetOfferInputs<'_>, folders: &[Folder]) -> Option<Self> {
         if !reset_offer(inputs).shows_button() {
@@ -2769,21 +2215,19 @@ impl ResetPlan {
         Self::new(inputs.bundle_id?, folders)
     }
 
-    /// The subject every invocation names — the running bundle's id, trimmed.
+    /// The subject every invocation names.
     #[must_use]
     pub fn bundle_id(&self) -> &str {
         self.subject.as_str()
     }
 
-    /// The folders, in plan order, each appearing once.
+    /// The folders, in plan order, each appearing.
     #[must_use]
     pub fn folders(&self) -> &[Folder] {
         &self.folders
     }
 
-    /// The argv for each folder, in plan order. Pure — it builds commands; it
-    /// never runs one, and each is a separate, non-atomic invocation whose
-    /// result is recorded on its own ([`ResetAttempt`]).
+    /// The argv for each folder, in plan order.
     #[must_use]
     pub fn commands(&self) -> Vec<(Folder, Vec<String>)> {
         self.folders
@@ -2798,16 +2242,12 @@ impl ResetPlan {
 pub enum ResetStatus {
     /// Exited 0: this folder's row is gone, so macOS can ask about it again.
     Reset,
-    /// Ran and exited nonzero — this folder's row is unchanged. `code` is the
-    /// exit status the panel names in the one line this folder gets; `None`
-    /// when the process was killed by a signal and there is no code.
+    /// Ran and exited nonzero.
     Declined {
         /// The process exit status, or `None` for a signal death.
         code: Option<i32>,
     },
-    /// Not run: [`TCCUTIL_PATH`] is missing or not executable. Distinct from
-    /// [`ResetStatus::Declined`] — nothing was asked, so nothing was declined,
-    /// and the panel must not say macOS refused anything.
+    /// Not run: [`TCCUTIL_PATH`] is missing or not executable.
     ToolAbsent,
 }
 
@@ -2818,8 +2258,7 @@ impl ResetStatus {
         matches!(self, Self::Reset)
     }
 
-    /// Classify a finished invocation from `ExitStatus::code()`: `Some(0)` is
-    /// the only success, and `None` (a signal) is a decline with no code.
+    /// Classify a finished invocation from `ExitStatus::code()`.
     #[must_use]
     pub const fn from_exit_status(code: Option<i32>) -> Self {
         match code {
@@ -2829,13 +2268,12 @@ impl ResetStatus {
     }
 }
 
-/// One folder's independently recorded result. The gesture runs one process per folder and is
-/// not atomic, so there is no single status until every attempt is recorded.
+/// One folder's independently recorded result.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ResetAttempt {
     /// The folder this invocation named.
     pub folder: Folder,
-    /// What that invocation did.
+    /// What that invocation.
     pub status: ResetStatus,
 }
 
@@ -2852,8 +2290,7 @@ impl ResetAttempt {
         Self::new(folder, ResetStatus::from_exit_status(code))
     }
 
-    /// Record an invocation that could not be made because the tool is not
-    /// there.
+    /// Record an invocation that could not be made because the tool is not there.
     #[must_use]
     pub const fn tool_absent(folder: Folder) -> Self {
         Self::new(folder, ResetStatus::ToolAbsent)
@@ -2866,27 +2303,22 @@ impl ResetAttempt {
     }
 }
 
-/// The folded result of one *Ask again* gesture. [`Self::AllReset`] and [`Self::Partial`] stay
-/// apart: §3.7 forbids claiming every folder reset because one did.
+/// The folded result of one *Ask again* gesture.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ResetOutcome {
     /// Every invocation exited 0.
     AllReset,
-    /// At least one folder reset and at least one did not. Reported as a
-    /// partial success, naming the folders that failed and no others.
+    /// At least one folder reset and at least one.
     Partial,
-    /// At least one invocation ran and no folder reset. No row changed.
+    /// At least one invocation ran and no folder reset.
     NoneReset,
-    /// Nothing ran at all: [`TCCUTIL_PATH`] is missing or not executable. §3.7:
-    /// the button is not shown in the first place.
+    /// Nothing ran at all: [`TCCUTIL_PATH`] is missing or not executable.
     ToolAbsent,
-    /// There was nothing to attempt. Not a success, and never rendered as one.
+    /// There was nothing to attempt.
     NotAttempted,
 }
 
-/// Fold one gesture's per-invocation results into one outcome, once, with no retry. Every
-/// attempt [`ResetStatus::ToolAbsent`] is [`ResetOutcome::ToolAbsent`]: absence is the
-/// machine's property, not a folder's.
+/// Fold one gesture's per-invocation results into one outcome, once, with no retry.
 #[must_use]
 pub fn reset_outcome(attempts: &[ResetAttempt]) -> ResetOutcome {
     if attempts.is_empty() {
@@ -2908,8 +2340,7 @@ pub fn reset_outcome(attempts: &[ResetAttempt]) -> ResetOutcome {
     ResetOutcome::NoneReset
 }
 
-/// The folders whose rows actually changed — exactly the set the warm-up is
-/// offered for afterwards, and no other (§3.7).
+/// The folders whose rows actually changed.
 #[must_use]
 pub fn folders_reset(attempts: &[ResetAttempt]) -> Vec<Folder> {
     attempts
@@ -2919,9 +2350,7 @@ pub fn folders_reset(attempts: &[ResetAttempt]) -> Vec<Folder> {
         .collect()
 }
 
-/// The folders macOS declined, each with the exit status to name in its one
-/// line. A [`ResetStatus::ToolAbsent`] attempt is not here: nothing was asked,
-/// so nothing declined.
+/// The folders macOS declined, each with the exit status to name in its one line.
 #[must_use]
 pub fn folders_declined(attempts: &[ResetAttempt]) -> Vec<(Folder, Option<i32>)> {
     attempts
@@ -2933,78 +2362,43 @@ pub fn folders_declined(attempts: &[ResetAttempt]) -> Vec<(Folder, Option<i32>)>
         .collect()
 }
 
-// Debugger access (developer mode): observation
-//
-// `docs/DESIGN-macos-debugger-access-2026-09-29.md` §3.2. The "Developer Tools Access needs to
-// take control of another process" dialog is not TCC: it is the Authorization Services right
-// [`TASKPORT_DEBUG_RIGHT`], keyed to the user and the Mac, never to aterm's code identity.
-// Apple's one sanctioned switch for it is `DevToolsSecurity`; this section only asks it
-// `-status`, a compare that exits before `AuthorizationCreate`, so it raises no dialog (§1.3).
-// The owner's change is the next section's [`run_devtools_change`], the only spawner of
-// [`devtools_enable_command`] and [`devtools_disable_command`]; every argv carries its flag,
-// since a bare invocation means `-enable`. [`DEBUGGER_ACCESS_REVERT`] is copy, never spawned.
-//
-// Three facts, each a thin wrapper beside a pure classifier: the rule's mode, the account's
-// membership (`mbr_check_membership` resolves nested groups, so every admin is a `_developer`
-// member) and aterm's own hardening (`csops`). None reaches `tccd` or `WindowServer`.
-
-/// Apple's switch for the debugger right, absolute: a tool that edits the
-/// authorization database may not be resolved through `PATH`. Private, like
-/// every argv built from it: outside this module the tool is reached only
-/// through [`probe_debugger`] and [`run_devtools_change`].
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 const DEVTOOLSSECURITY_PATH: &str = "/usr/sbin/DevToolsSecurity";
 
-/// The one right `DevToolsSecurity` reads and writes (§1.3). The plain
-/// `system.privilege.taskport` right — third-party debuggers' "Take Control"
-/// dialog — is a different rule, and developer mode does not change it.
+/// The one right `DevToolsSecurity` reads and writes ().
 pub const TASKPORT_DEBUG_RIGHT: &str = "system.privilege.taskport.debug";
 
-/// The one-line undo every surface that mentions developer mode prints (the
-/// `UNIVERSAL_CONTROL_REVERT` convention, `crates/atpkg/src/machine.rs`). Copy only, never
-/// spawned: the owner's *Turn Off Debugger Access…* gesture runs the same argv through
-/// `devtools_disable_command` and [`run_devtools_change`].
+/// The one-line undo every surface that mentions developer mode prints.
 pub const DEBUGGER_ACCESS_REVERT: &str = "/usr/sbin/DevToolsSecurity -disable";
 
-/// `-status` answers in about 10 ms; an answer that has not arrived in this long is not coming.
 #[cfg(target_os = "macos")]
 const DEVTOOLS_STATUS_CEILING: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// The directory group `is-admin` names — the first rule developer mode tries.
+/// The directory group `is-admin` names.
 pub const ADMIN_GROUP: &str = "admin";
 
-/// The directory group `is-developer` names — the second rule.
+/// The directory group `is-developer` names.
 pub const DEVELOPER_GROUP: &str = "_developer";
 
-/// `CS_OPS_STATUS` — `csops`' "read the status flags" operation
-/// (xnu `bsd/sys/codesign.h`). Pinned so [`classify_cs_status`] stays pure on
-/// every platform.
+/// `CS_OPS_STATUS`.
 pub const CS_OPS_STATUS: u32 = 0;
 
-/// `CS_GET_TASK_ALLOW` — the image carries `get-task-allow`, so any debugger
-/// may take its task port without a password (SDK
-/// `Kernel.framework/Headers/kern/cs_blobs.h`).
+/// `CS_GET_TASK_ALLOW`.
 pub const CS_GET_TASK_ALLOW: u32 = 0x0000_0004;
 
-/// `CS_RUNTIME` — the hardened runtime, what `codesign` prints as
-/// `0x10000(runtime)` (same header).
+/// `CS_RUNTIME` — the hardened runtime, what `codesign` prints as `0x10000(runtime)` (same header).
 pub const CS_RUNTIME: u32 = 0x0001_0000;
 
-/// What `DevToolsSecurity -status` says about the rule. The `mode=` token.
-///
-/// `unrecognized` is Apple's tool not recognising the definition (an administrator's rule, a
-/// changed OS default, a partial write; no copy names a cause, since nothing measured supports
-/// one); `unknown` is aterm having no answer at all.
+/// What `DevToolsSecurity -status` says about the rule.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum DebuggerMode {
-    /// `Developer mode is currently enabled.`
+    /// `Developer mode is currently enabled.`.
     Enabled,
-    /// `Developer mode is currently disabled.`
+    /// `Developer mode is currently disabled.`.
     Disabled,
-    /// `Developer mode rights are currently in an unknown state.`
+    /// `Developer mode rights are currently in an unknown state.`.
     Unrecognized,
-    /// Not observed: refused, not run, or an answer this classifier does not
-    /// claim to understand. Never rendered as `disabled`.
+    /// Not observed: refused, not run, or an answer this classifier does not claim to understand.
     #[default]
     Unknown,
 }
@@ -3022,21 +2416,16 @@ impl DebuggerMode {
     }
 }
 
-/// Which developer-mode rule this account would match. The `member=` token.
-///
-/// Rules are tried in order and the first match wins (§1.4), so the answer
-/// names the first group that holds: an admin is also a `_developer` member
-/// (nested through admin's GUID) and reads [`Self::Admin`].
+/// Which developer-mode rule this account would match.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum DebuggerMember {
     /// In [`ADMIN_GROUP`]: `is-admin`, which needs no authentication.
     Admin,
-    /// Not an admin, but in [`DEVELOPER_GROUP`]: `is-developer`.
+    /// Not an admin, but in [`DEVELOPER_GROUP`].
     Developer,
-    /// In neither. Developer mode would still prompt this account
-    /// (`authenticate-developer`).
+    /// In neither.
     NotMember,
-    /// Not determined. Never rendered as `no`.
+    /// Not determined.
     #[default]
     Unknown,
 }
@@ -3054,11 +2443,7 @@ impl DebuggerMember {
     }
 }
 
-/// Whether the running aterm is protected from a same-user debugger: the
-/// hardened runtime without `get-task-allow`. The `self_hardened=` token.
-///
-/// The notarized release reads [`Self::Hardened`]; `ship dev-app` and
-/// `target/release` builds read [`Self::NotHardened`] (§1.1).
+/// Whether the running aterm is protected from a same-user debugger.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum SelfHardening {
     /// [`CS_RUNTIME`] set and [`CS_GET_TASK_ALLOW`] clear.
@@ -3082,15 +2467,12 @@ impl SelfHardening {
     }
 }
 
-/// The debugger probe's progress or outcome. The `probe=` token. Kept apart
-/// from [`DebuggerMode`] so an unfinished or refused observation can never be
-/// read as a completed one.
+/// The debugger probe's progress or outcome.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DebuggerProbeLabel {
     /// No current result: an asynchronous observer is waiting or refreshing.
     Pending,
-    /// `-status` exited and said something this classifier recognises —
-    /// including `unrecognized`, which is a recognised answer about the rule.
+    /// `-status` exited and said something this classifier recognises.
     StatusOk,
     /// `-status` ran, but its answer is not one this classifier recognises.
     StatusUnrecognized,
@@ -3102,10 +2484,9 @@ pub enum DebuggerProbeLabel {
     TimedOut,
     /// Its output was over the cap or not UTF-8, or its exit could not be read.
     OutputUnreadable,
-    /// Refused: `[privacy] enabled` or `[privacy] check` is off.
+    /// Refused: `[privacy] enabled` or `[privacy] check`.
     RefusedDisabled,
-    /// Refused: the running executable is not inside a `.app` bundle (the same fence as
-    /// [`probe_fda_with`]).
+    /// Refused: the running executable is not inside a `.app` bundle.
     RefusedOutOfBundle,
     /// Refused: the running executable could not be resolved.
     RefusedNoExe,
@@ -3132,9 +2513,7 @@ impl DebuggerProbeLabel {
         }
     }
 
-    /// `true` for a deliberate refusal to consult the tool, including an
-    /// unsupported platform. These labels guarantee nothing was spawned.
-    /// [`Self::Pending`] is not a refusal.
+    /// `true` for a deliberate refusal to consult the tool, including an unsupported platform.
     #[must_use]
     pub const fn refused(self) -> bool {
         matches!(
@@ -3147,10 +2526,7 @@ impl DebuggerProbeLabel {
     }
 }
 
-/// One debugger probe: the rule's mode, the account's membership, and why.
-///
-/// It carries no timestamp: the slot that dispatches the probe stamps its own
-/// completion, as the claimant census's does, so this crate reads no clock.
+/// One debugger probe: the rule's mode, the account's membership.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct DebuggerProbe {
     /// What `-status` said, classified.
@@ -3162,14 +2538,13 @@ pub struct DebuggerProbe {
 }
 
 impl DebuggerProbe {
-    /// No current observation. Neither an answer nor a refusal.
+    /// No current observation.
     #[must_use]
     pub const fn pending() -> Self {
         Self::refused(DebuggerProbeLabel::Pending)
     }
 
-    /// Nothing learned: both facts [`DebuggerMode::Unknown`] /
-    /// [`DebuggerMember::Unknown`], with the given reason.
+    /// Nothing learned: both facts [`DebuggerMode::Unknown`] / [`DebuggerMember::Unknown`].
     #[must_use]
     pub const fn refused(label: DebuggerProbeLabel) -> Self {
         Self {
@@ -3180,50 +2555,38 @@ impl DebuggerProbe {
     }
 }
 
-/// The answer on a platform with no `DevToolsSecurity`: the whole probe off
-/// macOS, and compiled into every test build so it is tested everywhere.
+/// The answer on a platform with no `DevToolsSecurity`.
 #[cfg(any(test, not(target_os = "macos")))]
 #[must_use]
 pub const fn unsupported_debugger_probe() -> DebuggerProbe {
     DebuggerProbe::refused(DebuggerProbeLabel::UnsupportedPlatform)
 }
 
-/// The `-status` argv (runs nothing), always with its flag, since a bare `DevToolsSecurity`
-/// means `-enable` (§1.3). The only argv the observation path builds.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 const fn devtools_status_command() -> [&'static str; 2] {
     [DEVTOOLSSECURITY_PATH, "-status"]
 }
 
-/// The `-enable` argv (runs nothing), spelled with its flag so no flagless argv exists. Only
-/// [`run_devtools_change`] spawns it, for [`DebuggerChange::On`], after the owner's yes in
-/// aterm's alert, to their press or to the once-per-Mac launch ask (design §3.4).
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 const fn devtools_enable_command() -> [&'static str; 2] {
     [DEVTOOLSSECURITY_PATH, "-enable"]
 }
 
-/// The `-disable` argv (runs nothing). Only [`run_devtools_change`] spawns it, for
-/// [`DebuggerChange::Off`]; [`DEBUGGER_ACCESS_REVERT`] is the same line as copy.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 const fn devtools_disable_command() -> [&'static str; 2] {
     [DEVTOOLSSECURITY_PATH, "-disable"]
 }
 
-/// Which way the owner's gesture changes the debugger rule (design §3.4). The
-/// press carries its intent — two action ids, never one toggle — so a render
-/// and a press that disagree about the state can never flip its meaning.
+/// Which way the owner's gesture changes the debugger rule ().
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DebuggerChange {
-    /// *Allow debugger access…*: `DevToolsSecurity -enable`.
+    /// *Allow debugger access…*.
     On,
-    /// *Turn off debugger access…*: `DevToolsSecurity -disable`.
+    /// *Turn off debugger access…*.
     Off,
 }
 
 impl DebuggerChange {
-    /// The argv this change runs (runs nothing). Private: only the order
-    /// ([`devtools_change_with`]) takes it, after its re-read.
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     const fn command(self) -> [&'static str; 2] {
         match self {
@@ -3232,10 +2595,7 @@ impl DebuggerChange {
         }
     }
 
-    /// The mode a fresh `-status` read must show for the change to run: `On`
-    /// only over [`DebuggerMode::Disabled`], `Off` only over
-    /// [`DebuggerMode::Enabled`]. Never [`DebuggerMode::Unrecognized`]: `-enable`
-    /// would overwrite a definition Apple's tool does not recognise (§1.3).
+    /// The mode a fresh `-status` read must show for the change to run.
     #[must_use]
     pub const fn precondition(self) -> DebuggerMode {
         match self {
@@ -3244,8 +2604,7 @@ impl DebuggerChange {
         }
     }
 
-    /// The mode the change sets, when it lands. Only a later probe says whether
-    /// it did: an exit code never does.
+    /// The mode the change sets, when it lands.
     #[must_use]
     pub const fn target(self) -> DebuggerMode {
         match self {
@@ -3263,7 +2622,7 @@ impl DebuggerChange {
         }
     }
 
-    /// Read a direction token back ([`Self::as_str`]); anything else is `None`.
+    /// Read a direction token back ([`Self::as_str`]).
     #[must_use]
     pub fn from_token(token: &str) -> Option<Self> {
         match token {
@@ -3290,27 +2649,14 @@ pub enum ToolRun {
     Absent,
     /// It could not be started, or its output could not be collected.
     SpawnFailed,
-    /// It outlasted the ceiling and was killed, or it exited but a holder of
-    /// its output pipes kept them open past the ceiling (the readers are left
-    /// detached, and nothing is killed).
+    /// It outlasted the ceiling and was killed.
     TimedOut,
-    /// A stream was over the cap or not UTF-8, or the exit could not be read:
-    /// an answer read in part is not read.
+    /// A stream was over the cap or not UTF-8, or the exit could not be read.
     Unreadable,
 }
 
-/// The adverbs `DevToolsSecurity` fills its `%s%s` with: its only such strings are
-/// `currently`, `already` and `now`, and the slot may be empty. `now` still claims the mode,
-/// so it reads like `currently`.
 const DEVTOOLS_ADVERBS: [&str; 4] = ["", "currently", "already", "now"];
 
-/// One line of `DevToolsSecurity` output, as a mode. Pure.
-///
-/// The disabled line is captured from a live run (§1.1); the enabled and unknown-state lines
-/// come from the binary's format strings (`Developer mode is%s%s enabled.`, `Developer mode
-/// rights are%s%s in an unknown state.`), the adverb slot from [`DEVTOOLS_ADVERBS`].
-/// Surrounding whitespace is ignored; anything else, a negation or a new adverb included, is
-/// `None`.
 fn devtools_status_line(line: &str) -> Option<DebuggerMode> {
     let line = line.trim();
     let adverb_ok = |middle: &str| DEVTOOLS_ADVERBS.contains(&middle.trim());
@@ -3330,14 +2676,7 @@ fn devtools_status_line(line: &str) -> Option<DebuggerMode> {
     None
 }
 
-/// Classify one `DevToolsSecurity -status` run, reading lines from both streams. Pure.
-///
-/// * `enabled` / `disabled` need exit code 0 (the measured run's); with another code they
-///   read [`DebuggerMode::Unknown`].
-/// * `rights are … in an unknown state` is [`DebuggerMode::Unrecognized`] whatever the code:
-///   that path's exit status is unmeasured, and the line is the tool's whole claim.
-/// * No recognised line, or lines that disagree, is [`DebuggerMode::Unknown`] with
-///   [`DebuggerProbeLabel::StatusUnrecognized`], never `Disabled`.
+/// Classify one `DevToolsSecurity -status` run, reading lines from both streams.
 #[must_use]
 pub fn classify_devtools_status(run: &ToolRun) -> (DebuggerMode, DebuggerProbeLabel) {
     let (code, stdout, stderr) = match run {
@@ -3376,9 +2715,7 @@ pub fn classify_devtools_status(run: &ToolRun) -> (DebuggerMode, DebuggerProbeLa
     }
 }
 
-/// Fold the two directory answers (`None`: the directory could not answer) in rule order:
-/// `developer` is not consulted once `admin` is `Some(true)`, and an unanswered `admin` is
-/// [`DebuggerMember::Unknown`], since every admin is also a `_developer` member.
+/// Fold the two directory answers (`None`: the directory could not answer) in rule order.
 #[must_use]
 pub const fn classify_membership(admin: Option<bool>, developer: Option<bool>) -> DebuggerMember {
     match (admin, developer) {
@@ -3389,11 +2726,7 @@ pub const fn classify_membership(admin: Option<bool>, developer: Option<bool>) -
     }
 }
 
-/// The running user's developer-mode membership: [`ADMIN_GROUP`], then [`DEVELOPER_GROUP`]
-/// only when that is "no". Gids come from `getgrnam_r`, and each check is
-/// `mbr_check_membership`, which asks `opendirectoryd` and so resolves nested groups
-/// (`getgroups` would not). No spawn, no `tccd`, no dialog. Off macOS it is
-/// [`DebuggerMember::Unknown`].
+/// The running user's developer-mode membership.
 #[must_use]
 pub fn debugger_membership() -> DebuggerMember {
     #[cfg(target_os = "macos")]
@@ -3411,8 +2744,7 @@ pub fn debugger_membership() -> DebuggerMember {
     }
 }
 
-/// Classify the running image's code-signing status flags: `None` is `Unknown`,
-/// [`CS_RUNTIME`] without [`CS_GET_TASK_ALLOW`] is `Hardened`, anything else `NotHardened`.
+/// Classify the running image's code-signing status flags.
 #[must_use]
 pub const fn classify_cs_status(flags: Option<u32>) -> SelfHardening {
     match flags {
@@ -3424,10 +2756,7 @@ pub const fn classify_cs_status(flags: Option<u32>) -> SelfHardening {
     }
 }
 
-/// Whether the running aterm is hardened against a same-user debugger: one
-/// `csops(getpid(), CS_OPS_STATUS)`, no spawn and no dialog. Not cached (this crate keeps
-/// lazy-init statics off paths a GUI main thread can reach); the bits are fixed at exec, so a
-/// caller reads it once. Off macOS it is [`SelfHardening::Unknown`].
+/// Whether the running aterm is hardened against a same-user debugger.
 #[must_use]
 pub fn self_hardening() -> SelfHardening {
     #[cfg(target_os = "macos")]
@@ -3440,9 +2769,7 @@ pub fn self_hardening() -> SelfHardening {
     }
 }
 
-/// The debugger probe with the executable, the spawn and the membership query injected. Each
-/// refusal calls neither closure (there is no `$HOME` refusal: `DevToolsSecurity` reads none);
-/// otherwise `spawn` runs once with `devtools_status_command`, and `membership` once.
+/// The debugger probe with the executable, the spawn and the membership query injected.
 #[cfg(any(target_os = "macos", test))]
 pub fn probe_debugger_with<S, M>(
     gate: ProbeGate,
@@ -3460,7 +2787,6 @@ where
     let Some(exe) = exe else {
         return DebuggerProbe::refused(DebuggerProbeLabel::RefusedNoExe);
     };
-    // The fence shared with the Full Disk Access probe.
     if !path_is_in_app_bundle(exe) {
         return DebuggerProbe::refused(DebuggerProbeLabel::RefusedOutOfBundle);
     }
@@ -3472,10 +2798,7 @@ where
     }
 }
 
-/// Probe the debugger rule for the running process: at most one `DevToolsSecurity -status`,
-/// within a 2 s ceiling, plus the membership query. Refuses, spawning nothing, when the gate
-/// is off or the running executable is not inside a `.app`. Off macOS it is
-/// [`unsupported_debugger_probe`].
+/// Probe the debugger rule for the running process.
 #[must_use]
 pub fn probe_debugger(gate: ProbeGate) -> DebuggerProbe {
     #[cfg(target_os = "macos")]
@@ -3507,83 +2830,38 @@ pub fn probe_debugger(gate: ProbeGate) -> DebuggerProbe {
     }
 }
 
-// Developer Tools list (kTCCServiceDeveloperTool): observation
-//
-// `docs/DESIGN-macos-debugger-access-2026-09-29.md` §9.1. Privacy & Security ▸ Developer Tools
-// is a TCC service with no dialog: only a human adds an app, in System Settings. On the first
-// run of each new program under aterm, syspolicyd asks tccd whether the responsible app is on
-// the list, and tccd logs its answer for that app's identity (`Sub:{<bundle id>}`); an
-// identity with no row answers `Auth Right: Unknown (None)`. [`probe_devtool`] reads those
-// answers back with one bounded `/usr/bin/log show` whose argv is a constant
-// ([`DEVTOOL_LOG_ARGS`]); the subject is matched in Rust and never reaches an argv. No TCC.db
-// is opened, so Full Disk Access plays no part, and the answer is tccd's effective decision
-// for aterm's bundle id, not a mirror of the System Settings switch.
-//
-// Any program chooses the text tccd logs about it: `binary_path=` carries its path verbatim.
-// In the `compact` style a path holding a newline and a forged record prints as two records,
-// and a path near `PATH_MAX` is cut with `<…>`, leaving tccd's answer as `<decode: missing
-// data>`. So [`classify_devtool_log`] reads the `ndjson` style, whose framing JSON-escapes the
-// message, accepts only records from tccd's own image with tccd's own format string, and
-// recognises an answer only in tccd's own suffix, ending the message. Anything else makes the
-// whole probe `unknown` ([`DevToolProbeLabel::FormatUnrecognized`]): a planted path, or a
-// name that is not aterm's bundle id, can force `unknown`, never `allowed`.
-//
-// A program carrying aterm's exact bundle id is the same `Sub:{…}`, and its answers count as
-// aterm's (design §9.1, O10): a copy that does not meet the code requirement the list holds
-// for aterm can make the row read `unlisted` or `denied` while aterm is allowed, or `allowed`
-// if that copy is the one listed. Requiring `responsible_path=` inside the running bundle
-// could reject aterm's own answers across an in-place apply, which renames the bundle under
-// the running process.
-
-/// The unified log's tool, absolute: a bare `log` is a zsh builtin that shadows it, exits 0
-/// and prints nothing. The one spelling: the GUI's consent observer re-exports it.
+/// The unified log's tool, absolute.
 pub const LOG_TOOL: &str = "/usr/bin/log";
 
-/// The directory whose readability decides whether this account can read the
-/// unified log at all: `root:admin drwxr-x---` on macOS, so a standard account
-/// gets `EACCES`. Ordinary Unix permissions, no TCC service, no dialog.
+/// The directory whose readability decides whether this account can read the unified log at all.
 pub const DIAGNOSTICS_DIR: &str = "/var/db/diagnostics";
 
-/// Whether this account can read the unified log's backing store: the
-/// admin-group test on [`DIAGNOSTICS_DIR`], one `opendir`.
+/// Whether this account can read the unified log's backing store.
 #[cfg(target_os = "macos")]
 #[must_use]
 pub fn log_store_readable() -> bool {
     std::fs::read_dir(DIAGNOSTICS_DIR).is_ok()
 }
 
-/// How far back [`probe_devtool`] reads tccd's answers, in seconds. Must match
-/// the `--last` argument of [`DEVTOOL_LOG_ARGS`] (a test pins the two).
+/// How far back [`probe_devtool`] reads tccd's answers, in seconds.
 pub const DEVTOOL_WINDOW_S: u64 = 600;
 
-/// Where a person adds aterm to the Developer Tools list, in words. The one
-/// spelling: the window's *Open Developer Tools…* route says it beside the pane
-/// it opens, and `aterm doctor`'s `devtools:` row prints it as the fix.
+/// Where a person adds aterm to the Developer Tools list, in words.
 pub const DEVTOOLS_SETTINGS_WORDS: &str =
     "System Settings \u{25b8} Privacy & Security \u{25b8} Developer Tools";
 
-/// The Developer Tools list through the modern Settings extension, at its registered
-/// `Privacy_DevTools` anchor (debugger design §9.1 O14): the window's first try. Opening it
-/// only navigates; nothing in aterm adds itself to the list. The scheme is
-/// `x-apple.systempreferences`, with a dot.
+/// The Developer Tools list through the modern Settings extension.
 pub const DEVTOOLS_SETTINGS_URL: &str =
     "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_DevTools";
 
-/// The same pane through its legacy pane id, which System Settings maps to the extension: the
-/// window's second try, and what `aterm doctor`'s `open` prints and runs. Opening it only
-/// navigates.
+/// The same pane through its legacy pane id, which System Settings maps to the extension.
 pub const DEVTOOLS_SETTINGS_URL_LEGACY: &str =
     "x-apple.systempreferences:com.apple.preference.security?Privacy_DevTools";
 
-/// The constant predicate: tccd's Developer Tools answers, for every subject.
-/// The subject is never interpolated here; [`classify_devtool_log`] matches it.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 const DEVTOOL_PREDICATE: &str = "process == \"tccd\" AND eventMessage BEGINSWITH \"Handling access \
                                  request to kTCCServiceDeveloperTool, from Sub:{\"";
 
-/// The one argv the probe runs after [`LOG_TOOL`]. `--info` because tccd logs these at Info
-/// level; `ndjson` because its framing escapes the newline a program can put in its own path;
-/// UTC so a timestamp converts without a time-zone lookup.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 const DEVTOOL_LOG_ARGS: [&str; 10] = [
     "show",
@@ -3598,31 +2876,20 @@ const DEVTOOL_LOG_ARGS: [&str; 10] = [
     DEVTOOL_PREDICATE,
 ];
 
-/// A 10-minute read takes about 0.9 s, about 2.6 s at load 190; an answer that has not arrived
-/// in this long is not coming.
 #[cfg(target_os = "macos")]
 const DEVTOOL_CEILING: std::time::Duration = std::time::Duration::from_secs(8);
 
-/// The most of one stream the probe reads. An `ndjson` answer is about 1.3 kB and syspolicyd's
-/// first-run checks run serially at about 180 ms each, so a 10-minute window holds about 3,300
-/// answers (4.2 MB). Output over the cap is `output_unreadable`, never a partial count.
 #[cfg(target_os = "macos")]
 const DEVTOOL_OUTPUT_MAX_BYTES: u64 = 8 * 1024 * 1024;
 
-/// tccd's image, the only process whose records are read.
 const TCCD_IMAGE_PATH: &str = "/System/Library/PrivateFrameworks/TCC.framework/Support/tccd";
 
-/// tccd's format string for an access request: three public arguments, the
-/// service, the subject and responsible process, and the result.
 const TCCD_ACCESS_FORMAT: &str =
     "Handling access request to %{public}@, from %{public}@, %{public}@";
 
-/// The start of every message the predicate selects, up to the subject.
 const DEVTOOL_MESSAGE_PREFIX: &str =
     "Handling access request to kTCCServiceDeveloperTool, from Sub:{";
 
-/// tccd's reason words, from its own strings (`strings tccd`). An answer whose reason is not
-/// one of these is not recognised.
 const TCCD_REASONS: [&str; 12] = [
     "None",
     "System Set",
@@ -3638,21 +2905,18 @@ const TCCD_REASONS: [&str; 12] = [
     "User Consent",
 ];
 
-/// tccd's `DB Action:` words, from the same strings.
 const TCCD_DB_ACTIONS: [&str; 3] = ["None", "Update", "Retry"];
 
-/// What tccd's newest Developer Tools answer for aterm's identity said. The
-/// `devtools state=` token.
+/// What tccd's newest Developer Tools answer for aterm's identity said.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum DevToolState {
     /// `Auth Right: Allowed (<reason>)`.
     Allowed,
-    /// `Auth Right: Denied (<reason>)`, for any reason in tccd's table. Which listed state that
-    /// is (switched off, or refused by policy) is unmeasured.
+    /// `Auth Right: Denied (<reason>)`, for any reason in tccd's table.
     Denied,
-    /// `Auth Right: Unknown (None)`: tccd's answer while aterm is not on the list.
+    /// `Auth Right: Unknown (None)`.
     Unlisted,
-    /// No answer could be read. Never rendered as `unlisted`.
+    /// No answer could be read.
     #[default]
     Unknown,
 }
@@ -3670,21 +2934,18 @@ impl DevToolState {
     }
 }
 
-/// The Developer Tools probe's progress or outcome. The `probe=` token.
+/// The Developer Tools probe's progress or outcome.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DevToolProbeLabel {
     /// No current result: an asynchronous observer is waiting or refreshing.
     Pending,
-    /// tccd's log was read whole and held at least one answer for the subject.
+    /// Tccd's log was read whole and held at least one answer for the subject.
     Observed,
-    /// tccd's log was read whole and held no answer for the subject in the
-    /// window: no new program started under aterm, so macOS gave none.
+    /// Tccd's log was read whole and held no answer for the subject in the window.
     NoRecentRequest,
-    /// The log store could not be read: [`DIAGNOSTICS_DIR`] is not readable by
-    /// this account (not an administrator). Decided before any spawn.
+    /// The log store could not be read.
     LogUnavailable,
-    /// `log` ran on an account that can read the store, and exited non-zero or
-    /// by a signal.
+    /// `log` ran on an account that can read the store, and exited non-zero or by a signal.
     LogFailed,
     /// The log answered in a shape this classifier does not recognise.
     FormatUnrecognized,
@@ -3694,12 +2955,11 @@ pub enum DevToolProbeLabel {
     SpawnFailed,
     /// Its output was over the cap or not UTF-8, or its exit could not be read.
     OutputUnreadable,
-    /// Refused: `[privacy] enabled` or `[privacy] check` is off.
+    /// Refused: `[privacy] enabled` or `[privacy] check`.
     RefusedDisabled,
     /// Refused: `[privacy] observer = false`, which stops aterm reading tccd's log.
     RefusedObserverOff,
-    /// Refused: the running executable is not inside a `.app` bundle (the same fence as
-    /// [`probe_fda_with`]).
+    /// Refused: the running executable is not inside a `.app` bundle.
     RefusedOutOfBundle,
     /// Refused: the running executable could not be resolved.
     RefusedNoExe,
@@ -3732,9 +2992,7 @@ impl DevToolProbeLabel {
         }
     }
 
-    /// `true` for a deliberate refusal to read the log, including an
-    /// unsupported platform. These labels guarantee nothing was spawned.
-    /// [`Self::Pending`] is not a refusal.
+    /// `true` for a deliberate refusal to read the log, including an unsupported platform.
     #[must_use]
     pub const fn refused(self) -> bool {
         matches!(
@@ -3749,29 +3007,23 @@ impl DevToolProbeLabel {
     }
 }
 
-/// One Developer Tools probe: tccd's newest answer for the subject, how many
-/// answers the window held, and why.
-///
-/// It carries no reading of the clock: `answered_at_ms` is tccd's own
-/// timestamp, and the slot that dispatches the probe stamps its completion.
+/// One Developer Tools probe.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct DevToolProbe {
     /// The newest answer, classified.
     pub state: DevToolState,
     /// The observation's progress, refusal, or completed outcome.
     pub label: DevToolProbeLabel,
-    /// Answers for the subject in the window. `None` unless the log was read
-    /// whole (`observed` or `no_recent_request`).
+    /// Answers for the subject in the window.
     pub requests: Option<u32>,
-    /// Of those, how many were not `Allowed`: new programs macOS checked
-    /// before letting them start.
+    /// Of those, how many were not `Allowed`.
     pub not_allowed: Option<u32>,
     /// The newest answer's UTC time, in unix milliseconds.
     pub answered_at_ms: Option<i64>,
 }
 
 impl DevToolProbe {
-    /// No current observation. Neither an answer nor a refusal.
+    /// No current observation.
     #[must_use]
     pub const fn pending() -> Self {
         Self::refused(DevToolProbeLabel::Pending)
@@ -3790,18 +3042,14 @@ impl DevToolProbe {
     }
 }
 
-/// The answer on a platform with no such list: the whole probe off macOS, and
-/// compiled into every test build so it is tested everywhere.
+/// The answer on a platform with no such list.
 #[cfg(any(test, not(target_os = "macos")))]
 #[must_use]
 pub const fn unsupported_devtool_probe() -> DevToolProbe {
     DevToolProbe::refused(DevToolProbeLabel::UnsupportedPlatform)
 }
 
-/// Whether `subject` may be matched against tccd's `Sub:{…}`: a usable bundle
-/// id ([`bundle_id_is_usable`]) made only of the characters Apple allows in
-/// one (ASCII letters, digits, `.` and `-`), so it can contain neither `}` nor
-/// anything else that ends tccd's field.
+/// Whether `subject` may be matched against tccd's `Sub:{…}`.
 #[must_use]
 pub fn devtool_subject_is_usable(subject: &str) -> bool {
     bundle_id_is_usable(subject)
@@ -3810,21 +3058,6 @@ pub fn devtool_subject_is_usable(subject: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-')
 }
 
-/// One record's answer for `subject`, from tccd's message. Pure.
-///
-/// `Ok(None)` is another subject's answer. `Err(())` is a message this does not recognise: a
-/// subject line must hold exactly one `}Resp:{` (tccd writes one, right after the subject) and
-/// exactly one `ReqResult(`, preceded by `}, ` and followed by `Auth Right: <value> (<reason>),
-/// promptType: <n>,DB Action:<word>[, UpdateVerifierData])` to the end of the message, both
-/// words from tccd's tables, and no truncation marker anywhere. Only `Unknown (None)` reads as
-/// `unlisted`; any other `Unknown`, and `Limited`, are not recognised.
-///
-/// The `}Resp:{` count keeps another app's answer from reading as aterm's: an app may name
-/// itself `<subject>}Resp:{x` (a bundle id, or a codesign identifier, which `codesign -i`
-/// accepts), so its `Sub:{…}` starts with the subject and tccd's own `}Resp:{` makes two. A
-/// name that closes the Sub early with no `}Resp:{` of its own (`<subject>}x`) passes the
-/// count; the `Resp:{` that must follow the first `}` refuses it. A program whose id is the
-/// subject is not told apart (see the section note).
 fn devtool_answer(message: &str, subject: &str) -> Result<Option<DevToolState>, ()> {
     let rest = message.strip_prefix(DEVTOOL_MESSAGE_PREFIX).ok_or(())?;
     let (sub, after) = rest.split_once('}').ok_or(())?;
@@ -3834,7 +3067,6 @@ fn devtool_answer(message: &str, subject: &str) -> Result<Option<DevToolState>, 
     if !after.starts_with("Resp:{") {
         return Err(());
     }
-    // A record the log cut short: what is left can end in a planted answer.
     if message.contains("<decode:") || message.contains("<\u{2026}>") {
         return Err(());
     }
@@ -3868,9 +3100,6 @@ fn devtool_answer(message: &str, subject: &str) -> Result<Option<DevToolState>, 
     Ok(Some(state))
 }
 
-/// Days from 1970-01-01 to the civil date `(y, m, d)` in the proleptic
-/// Gregorian calendar (H. Hinnant's `days_from_civil`). Pure; the caller has
-/// range-checked the fields.
 const fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     let y = if m <= 2 { y - 1 } else { y };
     let era = (if y >= 0 { y } else { y - 399 }) / 400;
@@ -3881,7 +3110,6 @@ const fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     era * 146_097 + doe - 719_468
 }
 
-/// The number of days in month `m` of year `y`.
 const fn days_in_month(y: i64, m: i64) -> i64 {
     match m {
         2 if (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 => 29,
@@ -3891,16 +3119,13 @@ const fn days_in_month(y: i64, m: i64) -> i64 {
     }
 }
 
-/// A fixed-width run of ASCII digits as a number, or `None`.
 fn digits(text: &str, width: usize) -> Option<i64> {
     (text.len() == width && text.bytes().all(|b| b.is_ascii_digit()))
         .then(|| text.parse().ok())
         .flatten()
 }
 
-/// `log`'s `ndjson` timestamp (`2026-10-07 13:58:21.820241+0000`) as unix
-/// milliseconds, UTC. Pure: the offset is applied by arithmetic, so no
-/// time-zone database is read. Anything out of range is `None`.
+/// `log`'s `ndjson` timestamp as unix milliseconds, UTC.
 #[must_use]
 pub fn devtool_timestamp_ms(text: &str) -> Option<i64> {
     let (date, time) = text.split_once(' ')?;
@@ -3951,24 +3176,14 @@ pub fn devtool_timestamp_ms(text: &str) -> Option<i64> {
     Some(utc_s * 1_000 + millis)
 }
 
-/// How old an answer stamped `answered_at_ms` is at `now_ms`, both unix
-/// milliseconds. Pure; a stamp in the future is age 0.
+/// How old an answer stamped `answered_at_ms` is at `now_ms`, both unix milliseconds.
 #[must_use]
 pub const fn devtool_answer_age_ms(answered_at_ms: i64, now_ms: i64) -> u64 {
     let age = now_ms.saturating_sub(answered_at_ms);
     if age < 0 { 0 } else { age.unsigned_abs() }
 }
 
-/// Classify one `log show` run for `subject`. Pure.
-///
-/// * A non-zero exit or a signal is [`DevToolProbeLabel::LogFailed`], never
-///   [`DevToolProbeLabel::LogUnavailable`] (the store check decides that, before the spawn).
-/// * Every line must be a record tccd wrote (`tccd_record`) or the closing
-///   `{"count":<n>,"finished":1}`, last and counting the records; a record for `subject` must
-///   pass [`devtool_answer`]. Anything else is [`DevToolProbeLabel::FormatUnrecognized`] for
-///   the whole probe.
-/// * The newest of the subject's answers decides; `requests` and `not_allowed` count them
-///   all. None in the window is [`DevToolProbeLabel::NoRecentRequest`] with zero counts.
+/// Classify one `log show` run for `subject`.
 #[must_use]
 pub fn classify_devtool_log(run: &ToolRun, subject: &str) -> DevToolProbe {
     let stdout = match run {
@@ -3989,7 +3204,6 @@ pub fn classify_devtool_log(run: &ToolRun, subject: &str) -> DevToolProbe {
     let mut finished = false;
     let mut requests: u32 = 0;
     let mut not_allowed: u32 = 0;
-    // (timestamp, the answer); a later line wins a tie.
     let mut newest: Option<(i64, DevToolState)> = None;
     for line in stdout.lines() {
         if finished {
@@ -4044,8 +3258,6 @@ pub fn classify_devtool_log(run: &ToolRun, subject: &str) -> DevToolProbe {
     }
 }
 
-/// `log show --style ndjson`'s closing object, `{"count":<n>,"finished":1}`:
-/// the record count it reports, or `None` when `fields` is not exactly that.
 fn devtool_trailer(fields: &[(String, json::Value)]) -> Option<u64> {
     if fields.len() != 2 || json::uint(fields, "finished")? != 1 {
         return None;
@@ -4053,9 +3265,6 @@ fn devtool_trailer(fields: &[(String, json::Value)]) -> Option<u64> {
     json::uint(fields, "count")
 }
 
-/// A record tccd itself wrote with its access format, as `(message,
-/// timestamp)`, or `None`. The image paths are the kernel's account of who
-/// logged, so a process that merely calls itself `tccd` is not read.
 fn tccd_record(fields: &[(String, json::Value)]) -> Option<(&str, &str)> {
     let is = |key: &str, want: &str| json::str(fields, key) == Some(want);
     let from_tccd = is("eventType", "logEvent")
@@ -4074,10 +3283,7 @@ fn tccd_record(fields: &[(String, json::Value)]) -> Option<(&str, &str)> {
     ))
 }
 
-/// The Developer Tools probe with the executable, the log store's readability and the spawn
-/// injected. Each refusal calls neither closure; an unreadable store is
-/// [`DevToolProbeLabel::LogUnavailable`] without a spawn; otherwise `spawn` runs once, with
-/// [`LOG_TOOL`] and [`DEVTOOL_LOG_ARGS`].
+/// The Developer Tools probe with the executable.
 #[cfg(any(target_os = "macos", test))]
 pub fn probe_devtool_with<R, S>(
     gate: ProbeGate,
@@ -4096,7 +3302,6 @@ where
     let Some(exe) = exe else {
         return DevToolProbe::refused(DevToolProbeLabel::RefusedNoExe);
     };
-    // The fence shared with the Full Disk Access probe.
     if !path_is_in_app_bundle(exe) {
         return DevToolProbe::refused(DevToolProbeLabel::RefusedOutOfBundle);
     }
@@ -4109,10 +3314,7 @@ where
     classify_devtool_log(&spawn(LOG_TOOL, &DEVTOOL_LOG_ARGS), subject)
 }
 
-/// Read tccd's Developer Tools answers for `subject`, the running bundle's identifier: at most
-/// one `/usr/bin/log show`, within an 8 s ceiling and an 8 MiB output cap. Refuses, spawning
-/// nothing, when the gate is off, the running executable is not inside a `.app`, or `subject`
-/// is unusable. Off macOS it is [`unsupported_devtool_probe`].
+/// Read tccd's Developer Tools answers for `subject`, the running bundle's identifier.
 #[must_use]
 pub fn probe_devtool(gate: ProbeGate, subject: &str) -> DevToolProbe {
     #[cfg(target_os = "macos")]
@@ -4136,52 +3338,17 @@ pub fn probe_devtool(gate: ProbeGate, subject: &str) -> DevToolProbe {
     }
 }
 
-// Developer Tools list: the switch, read from the system TCC.db
-//
-// tccd's log ([`probe_devtool`]) answers only after a new program starts, only within its
-// 10-minute window and only to an administrator, so a quiet machine or a standard account
-// reads `unknown` there (debugger design §9.1, O18). The switch the owner flips is a row of the
-// system TCC.db ([`SYSTEM_TCC_DB`]): service `kTCCServiceDeveloperTool`, the app's bundle id
-// as `client` (`client_type` 0), `auth_value` 2 for on and 0 for off, and `last_modified` in
-// unix seconds.
-//
-// [`probe_devtool_list`] reads it without a prompt, without writing and WITH NO LOCK: one
-// `open(…, O_RDONLY)` first, the call [`probe_fda`] makes (`EPERM` without Full Disk Access,
-// which cannot prompt), then a bounded `/usr/bin/sqlite3` with a constant argv
-// ([`devtool_db_args`]): read-only, no `~/.sqliterc`, safe mode, no symbolic link, and every
-// client hex-encoded so no app's name can forge a row. The subject is matched in Rust, never
-// put into an argv. sqlite3 opens the database through [`aterm_uds::foreign_db::read`], as an
-// immutable URI, never by its path: tccd writes it in rollback-journal mode with no busy
-// timeout, so a reader's `SHARED` lock that tccd's `COMMIT` meets fails that `COMMIT` and
-// loses the write (measured: a loop of the old `sqlite3 -readonly <path>` read cost a writer
-// shaped as tccd 323 of 5 000 writes). An answer read while the file changed, or beside a
-// journal with a write in it, is read again, up to [`DEVTOOL_DB_READS`] times.
-//
-// The row is the switch, not tccd's decision: it holds the code requirement of the copy that
-// was added, and a copy that does not meet it is not answered as the switch says. So
-// [`devtool_grant`] lets tccd's answer decide when it is newer than the row's last change, and
-// the switch otherwise.
-
-/// The system TCC database: the switches of Privacy & Security's lists that
-/// belong to the Mac rather than to one account, Developer Tools among them.
-/// Root-owned; a process can open it only while its responsible app holds Full
-/// Disk Access.
+/// The system TCC database.
 pub const SYSTEM_TCC_DB: &str = "/Library/Application Support/com.apple.TCC/TCC.db";
 
-/// The reader, named absolutely: Apple's own `sqlite3`, a platform binary
-/// (macOS does not check it before it starts).
+/// The reader, named absolutely.
 pub const SQLITE_TOOL: &str = "/usr/bin/sqlite3";
 
-/// The constant query: every Developer Tools row, its client hex-encoded.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 const DEVTOOL_DB_QUERY: &str = "SELECT hex(client), client_type, auth_value, last_modified \
                                 FROM access WHERE service = 'kTCCServiceDeveloperTool' \
                                 ORDER BY rowid;";
 
-/// The options the list probe passes [`SQLITE_TOOL`] before the database. `-init /dev/null`
-/// because the shell otherwise reads `~/.sqliterc`, which could change the output mode or run
-/// commands; `-safe` refuses every command that touches another file; `-bail` exits non-zero
-/// on the first error; one `|`-separated line per row, no header.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 const DEVTOOL_DB_OPTIONS: [&str; 11] = [
     "-init",
@@ -4197,8 +3364,6 @@ const DEVTOOL_DB_OPTIONS: [&str; 11] = [
     "|",
 ];
 
-/// The one argv the list probe runs after [`SQLITE_TOOL`] to read `target`:
-/// [`DEVTOOL_DB_OPTIONS`], the database, [`DEVTOOL_DB_QUERY`].
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn devtool_db_args(target: &str) -> Vec<&str> {
     DEVTOOL_DB_OPTIONS
@@ -4208,22 +3373,19 @@ fn devtool_db_args(target: &str) -> Vec<&str> {
         .collect()
 }
 
-/// The read takes about 10 ms and waits on no lock (an immutable open takes none), so the
-/// ceiling bounds only a wedged process.
 #[cfg(target_os = "macos")]
 const DEVTOOL_DB_CEILING: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// What the Developer Tools list holds for the subject. The `list=` token.
+/// What the Developer Tools list holds for the subject.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum DevToolListing {
-    /// A row with `auth_value` 2: listed, switched on.
+    /// A row with `auth_value` 2.
     On,
-    /// A row with `auth_value` 0: listed, switched off.
+    /// A row with `auth_value` 0.
     Off,
     /// The list was read whole and holds no row for the subject.
     Absent,
-    /// Not read, or read in a shape this classifier does not recognise. Never
-    /// rendered as `absent`.
+    /// Not read, or read in a shape this classifier does not recognise.
     #[default]
     Unknown,
 }
@@ -4241,20 +3403,18 @@ impl DevToolListing {
     }
 }
 
-/// The list probe's progress or outcome. The `list_probe=` token.
+/// The list probe's progress or outcome.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DevToolListLabel {
     /// No current result: an asynchronous reader is waiting or refreshing.
     Pending,
     /// The database was read whole.
     Read,
-    /// `open` answered `EPERM`: the responsible app does not hold Full Disk
-    /// Access, so macOS keeps the database closed to it. Nothing was spawned.
+    /// `open` answered `EPERM`.
     NoFullDiskAccess,
-    /// `open` failed with another errno. Nothing was spawned.
+    /// `open` failed with another errno.
     OpenFailed,
-    /// `sqlite3` exited non-zero or by a signal (a schema it does not know, a
-    /// lock, a damaged file).
+    /// `sqlite3` exited non-zero or by a signal.
     ToolFailed,
     /// `sqlite3` answered in a shape this classifier does not recognise.
     FormatUnrecognized,
@@ -4264,13 +3424,11 @@ pub enum DevToolListLabel {
     SpawnFailed,
     /// Its output was over the cap or not UTF-8, or its exit could not be read.
     OutputUnreadable,
-    /// Refused: `[privacy] enabled` or `[privacy] check` is off.
+    /// Refused: `[privacy] enabled` or `[privacy] check`.
     RefusedDisabled,
-    /// Refused: `[privacy] observer = false`, under which the window reads neither half of the
-    /// Developer Tools row.
+    /// Refused: `[privacy] observer = false`.
     RefusedObserverOff,
-    /// Refused: the running executable is not inside a `.app` bundle (the fence
-    /// [`probe_fda_with`] keeps).
+    /// Refused: the running executable is not inside a `.app` bundle.
     RefusedOutOfBundle,
     /// Refused: the running executable could not be resolved.
     RefusedNoExe,
@@ -4303,8 +3461,7 @@ impl DevToolListLabel {
         }
     }
 
-    /// `true` for a deliberate refusal, including an unsupported platform:
-    /// nothing was opened and nothing spawned. [`Self::Pending`] is not one.
+    /// `true` for a deliberate refusal, including an unsupported platform.
     #[must_use]
     pub const fn refused(self) -> bool {
         matches!(
@@ -4324,15 +3481,11 @@ impl DevToolListLabel {
 pub struct DevToolList {
     /// The subject's row, classified.
     pub listing: DevToolListing,
-    /// Why it reads so.
+    /// Why it reads.
     pub label: DevToolListLabel,
-    /// The row's `last_modified`, unix seconds: when the switch last changed.
-    /// `None` without a row.
+    /// The row's `last_modified`, unix seconds.
     pub modified_at_s: Option<i64>,
-    /// How many apps the list holds, the subject's row included. `None` unless
-    /// it was read whole. `Some(0)` is a Mac whose Settings shows no
-    /// Developer Tools pane yet (`spctl developer-mode enable-terminal` adds
-    /// Terminal to the list, and the pane appears with it).
+    /// How many apps the list holds, the subject's row included.
     pub rows: Option<u32>,
 }
 
@@ -4355,19 +3508,13 @@ impl DevToolList {
     }
 }
 
-/// The list's answer on a platform with no such list: the whole probe off
-/// macOS, and compiled into every test build so it is tested everywhere.
+/// The list's answer on a platform with no such list.
 #[cfg(any(test, not(target_os = "macos")))]
 #[must_use]
 pub const fn unsupported_devtool_list() -> DevToolList {
     DevToolList::refused(DevToolListLabel::UnsupportedPlatform)
 }
 
-/// One `sqlite3` row, `HEX(client)|client_type|auth_value|last_modified`, as
-/// `(client, client_type, auth_value, last_modified)`. `None` for any other
-/// shape: four fields, an even run of upper-case hex digits (sqlite's `hex()`),
-/// and three decimal integers. A client that is not UTF-8 decodes lossily; it
-/// cannot equal a subject made of ASCII ([`devtool_subject_is_usable`]).
 fn devtool_db_row(line: &str) -> Option<(String, u32, u32, i64)> {
     let mut fields = line.split('|');
     let (hex, kind, auth, modified) = (
@@ -4402,14 +3549,7 @@ fn devtool_db_row(line: &str) -> Option<(String, u32, u32, i64)> {
     ))
 }
 
-/// Classify one `sqlite3` run for `subject`. Pure.
-///
-/// * A run that did not exit with code 0 maps to its failure label.
-/// * Every line must be a row [`devtool_db_row`] reads; anything else is
-///   [`DevToolListLabel::FormatUnrecognized`] for the whole read.
-/// * The subject's row is the one whose client is exactly `subject` with
-///   `client_type` 0 (a bundle id). None is [`DevToolListing::Absent`]; more
-///   than one, or an `auth_value` other than 2 or 0, is not recognised.
+/// Classify one `sqlite3` run for `subject`.
 #[must_use]
 pub fn classify_devtool_db(run: &ToolRun, subject: &str) -> DevToolList {
     let stdout = match run {
@@ -4461,23 +3601,13 @@ pub fn classify_devtool_db(run: &ToolRun, subject: &str) -> DevToolList {
     }
 }
 
-/// How many times the list probe reads the database while each read meets a write (the file
-/// changed during it, or a journal with a write in it stood beside it), [`DEVTOOL_DB_PAUSE`]
-/// apart: a write passes in milliseconds.
 #[cfg(any(target_os = "macos", test))]
 const DEVTOOL_DB_READS: usize = 3;
 
-/// The pause between two of [`DEVTOOL_DB_READS`].
 #[cfg(any(target_os = "macos", test))]
 const DEVTOOL_DB_PAUSE: std::time::Duration = std::time::Duration::from_millis(10);
 
-/// The list probe with the executable, the database (production: [`SYSTEM_TCC_DB`]), the
-/// `open` and the spawn injected. Each refusal calls neither closure; then `open_db` runs once
-/// on `db` (`EPERM` is [`DevToolListLabel::NoFullDiskAccess`], another errno
-/// [`DevToolListLabel::OpenFailed`], each without a spawn), and only then `spawn` with
-/// [`SQLITE_TOOL`] and [`devtool_db_args`] of the target [`aterm_uds::foreign_db::read`]
-/// names: once, or up to [`DEVTOOL_DB_READS`] times while each read meets a write (then
-/// [`DevToolListLabel::ToolFailed`]).
+/// The list probe with the executable, the database (production: [`SYSTEM_TCC_DB`]).
 #[cfg(any(target_os = "macos", test))]
 pub fn probe_devtool_list_with<O, S>(
     gate: ProbeGate,
@@ -4512,9 +3642,6 @@ where
     }
 }
 
-/// The list probe's read of `db` once its open passed: `spawn` runs sqlite3 on the target
-/// [`aterm_uds::foreign_db::read`] names, which takes no lock on the live file, read again
-/// while a read meets a write.
 #[cfg(any(target_os = "macos", test))]
 fn read_devtool_db<S>(db: &Path, subject: &str, mut spawn: S) -> DevToolList
 where
@@ -4537,12 +3664,7 @@ where
     DevToolList::refused(DevToolListLabel::ToolFailed)
 }
 
-/// Read the Developer Tools list's row for `subject`, the running bundle's identifier: one
-/// `open` of [`SYSTEM_TCC_DB`] by a child ([`open_probe_in_child`]) and a `/usr/bin/sqlite3`
-/// that takes no lock on it ([`read_devtool_db`]), each within a 5 s ceiling and a
-/// 1 MiB output cap. Refuses, opening and spawning nothing, when the gate is off, the running
-/// executable is not inside a `.app`, or `subject` is unusable. Off macOS it is
-/// [`unsupported_devtool_list`].
+/// Read the Developer Tools list's row for `subject`, the running bundle's identifier.
 #[must_use]
 pub fn probe_devtool_list(gate: ProbeGate, subject: &str) -> DevToolList {
     #[cfg(target_os = "macos")]
@@ -4567,17 +3689,14 @@ pub fn probe_devtool_list(gate: ProbeGate, subject: &str) -> DevToolList {
     }
 }
 
-/// Whether the app is on the Developer Tools list, all evidence joined. The
-/// `grant=` token.
+/// Whether the app is on the Developer Tools list, all evidence joined.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum DevToolGrant {
-    /// Listed and switched on, or tccd allowed it, with nothing newer saying
-    /// otherwise: macOS should not hold the programs it starts for its
-    /// first-run check.
+    /// Listed and switched on, or tccd allowed it, with nothing newer saying otherwise.
     Granted,
     /// Not listed, switched off, or tccd's newer answer did not allow it.
     NotGranted,
-    /// Neither the list nor tccd's log could be read. Never reported as fine.
+    /// Neither the list nor tccd's log could be read.
     #[default]
     Unknown,
 }
@@ -4594,15 +3713,7 @@ impl DevToolGrant {
     }
 }
 
-/// Join the list's row and tccd's newest answer into one verdict. Pure.
-///
-/// * The row is the switch now, so an absent row decides `not_granted` whatever an older
-///   answer said (the owner may just have removed aterm).
-/// * A row that is on or off decides unless tccd answered after the row last
-///   changed: then tccd's answer, its effective decision for this identity,
-///   decides (a copy the row's requirement does not match, or a policy).
-/// * Without a read row, tccd's observed answer decides; without either,
-///   `unknown`.
+/// Join the list's row and tccd's newest answer into one verdict.
 #[must_use]
 pub fn devtool_grant(list: &DevToolList, log: &DevToolProbe) -> DevToolGrant {
     let tccd = match (log.label, log.state) {
@@ -4621,7 +3732,6 @@ pub fn devtool_grant(list: &DevToolList, log: &DevToolProbe) -> DevToolGrant {
         }
         _ => None,
     };
-    // An absent row has no time of change: it is the switch as of this read.
     if switch.is_some() && list.listing == DevToolListing::Absent {
         return DevToolGrant::NotGranted;
     }
@@ -4639,9 +3749,7 @@ pub fn devtool_grant(list: &DevToolList, log: &DevToolProbe) -> DevToolGrant {
     }
 }
 
-/// `CFBundleIdentifier` of the bundle at `root`, read as `CFBundle` reads it,
-/// or `None`: the bundle or its `Info.plist` lies under a protected root (as
-/// spelled or once resolved), or names no identifier. No `codesign`.
+/// `CFBundleIdentifier` of the bundle at `root`, read as `CFBundle` reads it, or `None`.
 #[must_use]
 pub fn bundle_id_of(root: &Path, protected: &[PathBuf]) -> Option<String> {
     let plist = root.join("Contents").join("Info.plist");
@@ -4651,15 +3759,8 @@ pub fn bundle_id_of(root: &Path, protected: &[PathBuf]) -> Option<String> {
     read_info_plist(&plist).and_then(|info| info.bundle_id)
 }
 
-/// A strict reader for one line of `log show --style ndjson`: one JSON value
-/// per line (RFC 8259), objects kept as ordered `(key, value)` pairs. It
-/// rejects what a strict parser rejects (raw control characters in a string, a
-/// lone surrogate, a trailing byte) and, beyond that, a duplicate key at the
-/// top level and nesting deeper than 16 levels.
 mod json {
-    /// One JSON value, as far as the probe reads it: numbers keep their text,
-    /// so nothing is rounded, and an array, a boolean and `null` are checked
-    /// for shape and then not kept.
+    /// One JSON value, as far as the probe reads it.
     #[derive(Debug)]
     pub(super) enum Value {
         Number(String),
@@ -4668,11 +3769,9 @@ mod json {
         Other,
     }
 
-    /// The deepest nesting read; `log`'s records nest three levels.
     const MAX_DEPTH: usize = 16;
 
-    /// The fields of a line that is exactly one JSON object with no repeated
-    /// key, else `None`.
+    /// The fields of a line that is exactly one JSON object with no repeated key, else `None`.
     pub(super) fn object_line(line: &str) -> Option<Vec<(String, Value)>> {
         let mut reader = Reader {
             bytes: line.as_bytes(),
@@ -4702,8 +3801,7 @@ mod json {
         }
     }
 
-    /// The field `key` as a non-negative integer written without a fraction,
-    /// an exponent or a leading zero, if present.
+    /// The field `key` as a non-negative integer written without a fraction.
     pub(super) fn uint(fields: &[(String, Value)], key: &str) -> Option<u64> {
         match fields.iter().find(|(k, _)| k == key)? {
             (_, Value::Number(text))
@@ -4816,8 +3914,6 @@ mod json {
                     }
                     self.at += 1;
                 }
-                // The input is a `&str` and the run stops only at ASCII, so it
-                // is whole UTF-8.
                 out.push_str(std::str::from_utf8(self.bytes.get(start..self.at)?).ok()?);
                 match self.peek()? {
                     b'"' => {
@@ -4855,7 +3951,6 @@ mod json {
                         };
                         out.push(ch);
                     }
-                    // A raw control character: not JSON.
                     _ => return None,
                 }
             }
@@ -4896,34 +3991,13 @@ mod json {
     }
 }
 
-// Debugger access: the owner's change
-//
-// Design §3.4 step 3. [`run_devtools_change`] is the one place a
-// `DevToolsSecurity -enable`/`-disable` process is constructed, and it runs only what the
-// owner confirmed in aterm's own alert: the GUI's live gesture arm calls it on a detached
-// worker; headless instances and every test wire an inert arm. It re-reads `-status` first
-// and spawns only over the change's precondition, so a rule changed since the page rendered
-// (an administrator's, an MDM's) is left alone. It runs the change unprivileged (no `sudo`, no
-// `osascript`, no authorization of its own), so macOS raises its own administrator dialog
-// (spike D2, measured: one, naming SamplingTools), which aterm never sees or answers. It
-// waits for the child with no deadline (that dialog has shown no timeout) and never kills it.
-// Only a later probe says what the rule is: the exit code is evidence for a log line, never a
-// claim (`DebuggerAccessChange`'s `ClaimIsObserved`).
-
-/// The most of each stream a change keeps: `DevToolsSecurity` prints one line,
-/// and a head is for a log line, never parsed into a verdict.
+/// The most of each stream a change keeps.
 pub const DEVTOOLS_CHANGE_HEAD_BYTES: usize = 4 * 1024;
 
-/// How long the readers of an exited change's pipes are waited for, in 10 ms polls (2 s): a
-/// pipe some stranger inherited can outlive the tool (see [`run_bounded_exit`]), and a head is
-/// not worth a wedged worker. Readers still running then are left detached, their head
-/// reported empty.
 #[cfg(all(any(target_os = "macos", all(test, unix)), not(target_arch = "wasm32")))]
 const CHANGE_READER_GRACE_POLLS: u32 = 200;
 
-/// The kernel's birth record of a process: its start time
-/// (`proc_pidinfo(PROC_PIDTBSDINFO)`'s `pbi_start_tvsec`/`pbi_start_tvusec`).
-/// A pid plus its birth names one process; a pid alone may be reused.
+/// The kernel's birth record of a process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ProcessBirth {
     /// Seconds since the epoch.
@@ -4932,10 +4006,7 @@ pub struct ProcessBirth {
     pub microseconds: u64,
 }
 
-/// The birth record of the process at `pid` right now, or `None` when the
-/// kernel gives none (no such process, not ours to read, a record about some
-/// other pid). One `proc_pidinfo` — no spawn, no `tccd`, no `WindowServer`.
-/// `None` proves nothing either way. Off macOS it is always `None`.
+/// The birth record of the process at `pid` right now, or `None` when the kernel gives none.
 #[must_use]
 pub fn process_birth(pid: u32) -> Option<ProcessBirth> {
     #[cfg(target_os = "macos")]
@@ -4949,9 +4020,7 @@ pub fn process_birth(pid: u32) -> Option<ProcessBirth> {
     }
 }
 
-/// The `DevToolsSecurity` change child, as the `privacy-debugger-change`
-/// marker records it (design §3.4 step 3.3): its pid and its birth, read right
-/// after the spawn.
+/// The `DevToolsSecurity` change child, as the `privacy-debugger-change` marker records it (.3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct DevtoolsChild {
     /// The child's pid.
@@ -4961,11 +4030,7 @@ pub struct DevtoolsChild {
 }
 
 impl DevtoolsChild {
-    /// Whether the recorded child is still the process at its pid: its birth
-    /// was read at spawn and reads the same now. A child whose birth could not
-    /// be read at spawn is never proven running, so a marker naming one is
-    /// stale (design §3.4 step 6). A child that exited but is not yet reaped
-    /// still reads as running; the worker waiting on it reaps it.
+    /// Whether the recorded child is still the process at its pid.
     #[must_use]
     pub fn is_running(&self) -> bool {
         self.birth.is_some() && process_birth(self.pid) == self.birth
@@ -4975,17 +4040,12 @@ impl DevtoolsChild {
 /// How one [`run_devtools_change`] ended.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum DevtoolsChangeRun {
-    /// The fresh `-status` read did not show the change's precondition
-    /// ([`DebuggerChange::precondition`]), or was refused: nothing was spawned. `observed` is
-    /// that read, for the caller's cache.
+    /// The fresh `-status` read did not show the change's precondition.
     NotDue {
         /// The re-read that stopped it.
         observed: DebuggerProbe,
     },
-    /// The child ran and exited. `code` is `None` when a signal ended it; each
-    /// head is at most [`DEVTOOLS_CHANGE_HEAD_BYTES`] of its stream, read
-    /// lossily (empty when its reader could not start or did not finish in
-    /// time). What the rule is now, only a probe says.
+    /// The child ran and exited.
     Exited {
         /// The exit code, or `None` for a signal.
         code: Option<i32>,
@@ -4994,31 +4054,24 @@ pub enum DevtoolsChangeRun {
         /// The head of its stderr.
         stderr_head: String,
     },
-    /// There is no program at the path: nothing ran.
+    /// There is no program at the path.
     Absent,
-    /// It could not be started: nothing ran.
+    /// It could not be started.
     SpawnFailed,
-    /// It was started, but its exit could not be read. It was not killed.
+    /// It was started, but its exit could not be read.
     WaitFailed,
     /// Not macOS: there is no `DevToolsSecurity` here, and nothing ran.
     Unsupported,
 }
 
 impl DevtoolsChangeRun {
-    /// Whether a change child was started (so macOS may have shown its
-    /// dialog, and the rule may have changed).
+    /// Whether a change child was started.
     #[must_use]
     pub const fn spawned(&self) -> bool {
         matches!(self, Self::Exited { .. } | Self::WaitFailed)
     }
 }
 
-/// The change's order with the re-read and the spawn injected, which [`run_devtools_change`]
-/// runs with the live arms. `recheck` runs once; `spawn` at most once, with `change`'s own
-/// argv, and only when the re-read shows the change's precondition (design §3.4 step 3.1). A
-/// refused re-read is [`DebuggerMode::Unknown`], no precondition, so a closed gate or a binary
-/// outside a `.app` spawns nothing here either. Private: a shipped caller outside this module
-/// has only [`run_devtools_change`], which always re-reads first.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn devtools_change_with<R, S>(change: DebuggerChange, recheck: R, spawn: S) -> DevtoolsChangeRun
 where
@@ -5032,9 +4085,7 @@ where
     spawn(&change.command())
 }
 
-/// `devtools_change_with` for aterm-gui's Tier-1 bind, which drives the real
-/// order with a scripted read and a stand-in child. Only a debug build compiles
-/// it, never the shipped (release) one.
+/// `devtools_change_with` for aterm-gui's Tier-1 bind.
 #[cfg(debug_assertions)]
 #[doc(hidden)]
 pub fn devtools_change_with_for_test<R, S>(
@@ -5049,21 +4100,12 @@ where
     devtools_change_with(change, recheck, spawn)
 }
 
-/// Run `argv` to its exit with stdin `/dev/null`, keeping at most
-/// [`DEVTOOLS_CHANGE_HEAD_BYTES`] of each output stream, and waiting with no deadline: the
-/// child is never killed. `on_spawn` runs once with the child's pid, after the spawn and before
-/// the wait, where the caller writes its marker. Only [`run_devtools_change`] calls it outside
-/// tests, which drive it with `/bin/sh` stand-ins.
 #[cfg(all(any(target_os = "macos", all(test, unix)), not(target_arch = "wasm32")))]
 fn run_to_exit_keeping_heads<F: FnOnce(u32)>(argv: &[&str], on_spawn: F) -> DevtoolsChangeRun {
     use aterm_uds::spawnfd::Stdio;
-    /// Read `pipe` to its end, keeping its head. Reading on past the head (and
-    /// discarding) keeps a chatty child from blocking on a full pipe.
     fn keep_head(
         pipe: impl std::io::Read + Send + 'static,
     ) -> Option<std::thread::JoinHandle<Vec<u8>>> {
-        // `Builder::spawn`: a thread the OS refuses is an empty head, never a
-        // panic in the worker. The refused closure drops the pipe with it.
         std::thread::Builder::new()
             .spawn(move || {
                 let mut pipe = pipe;
@@ -5103,8 +4145,6 @@ fn run_to_exit_keeping_heads<F: FnOnce(u32)>(argv: &[&str], on_spawn: F) -> Devt
     on_spawn(child.id());
     let out = child.stdout.take().and_then(keep_head);
     let err = child.stderr.take().and_then(keep_head);
-    // No deadline and never a kill: macOS's administrator dialog has shown no timeout (the
-    // taskport dialog it resembles sat for 12 hours). `wait` retries EINTR itself.
     let Ok(status) = child.wait() else {
         return DevtoolsChangeRun::WaitFailed;
     };
@@ -5142,22 +4182,7 @@ fn run_to_exit_keeping_heads<F: FnOnce(u32)>(argv: &[&str], on_spawn: F) -> Devt
     }
 }
 
-/// Change the debugger rule the owner's way: the one place a `DevToolsSecurity` change process
-/// is constructed (design §3.4 step 3), since the argv builders are private to this module. It
-/// re-reads `-status` through [`probe_debugger`] (so a closed gate or a test binary spawns
-/// nothing) and returns [`DevtoolsChangeRun::NotDue`] unless that shows
-/// [`DebuggerChange::precondition`]; otherwise it spawns the change unprivileged, calls
-/// `on_spawn` with the child's pid and birth before the wait (for the `privacy-debugger-change`
-/// marker a successor reads), and waits with no deadline.
-///
-/// It blocks while macOS's dialog is up (hours, if nobody answers), so it runs only on a
-/// detached worker. The child is its own process: an aterm that exits or hands off mid-dialog
-/// leaves it running. Off macOS it is [`DevtoolsChangeRun::Unsupported`] and `on_spawn` never
-/// runs.
-///
-/// `pub` only for aterm-gui: the aterm-census guard `devtools-door` keeps it to its one caller,
-/// `debugger_access::spawn_devtools_worker`, the live arm that runs a change only for the
-/// owner's yes in aterm's alert (their press, or the once-per-Mac launch ask).
+/// Change the debugger rule the owner's way.
 pub fn run_devtools_change<F: FnOnce(DevtoolsChild)>(
     change: DebuggerChange,
     gate: ProbeGate,
@@ -5185,19 +4210,14 @@ pub fn run_devtools_change<F: FnOnce(DevtoolsChild)>(
     }
 }
 
-// Attribution and the posture join
-
-/// Whether a session's file access is attributed to the live aterm process or to one that has
-/// exited: aterm's own adoption record, which [`Responsible`] only corroborates and never
-/// overrides.
+/// Whether a session's file access is attributed to the live aterm process or to one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum Attribution {
     /// Spawned by the process that is running now.
     Live,
-    /// Adopted across an in-place apply: this session outlived the process
-    /// that started it.
+    /// Adopted across an in-place apply.
     Adopted,
-    /// No adoption record. Not a claim in either direction.
+    /// No adoption record.
     #[default]
     Unknown,
 }
@@ -5217,13 +4237,11 @@ impl Attribution {
 /// A session's file-consent verdict.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum FsConsent {
-    /// Full Disk Access is held, the session is live, and the service was
-    /// measured to be covered. Requires evidence on all three counts.
+    /// Full Disk Access is held, the session is live, and the service was measured to be covered.
     Covered,
-    /// aterm itself observed an `EPERM(1)` for this session.
+    /// Aterm itself observed an `EPERM(1)` for this session.
     Denied,
-    /// Everything else — including every case where a claim would be an
-    /// inference rather than an observation.
+    /// Everything else.
     #[default]
     Unknown,
 }
@@ -5240,10 +4258,7 @@ impl FsConsent {
     }
 }
 
-/// Which blocking measurements from design §7 (and the debugger design's §7) have been made.
-/// [`Self::MEASURED`] is what production passes; [`Self::UNMEASURED`] is every field
-/// `false`/`Unknown`. Flipping one in `MEASURED` is the only way a stronger claim can appear
-/// in a report, so an over-claim is a visible code change.
+/// Which blocking measurements from (and the debugger design's ) have been made.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[allow(
     clippy::struct_excessive_bools,
@@ -5251,60 +4266,28 @@ impl FsConsent {
               they are not the states of one machine"
 )]
 pub struct SpikeEvidence {
-    /// §7 S4 — how much a held Full Disk Access grant actually suppresses.
-    /// Until this is `true`, no folder is ever reported `covered`. S4 is measured (the three
-    /// folders and both volume classes covered on macOS 26.6.2 and 27.0), but the flag stays
-    /// `false`: it also turns `prompt_possible` to `no` under a held grant, and the services
-    /// the grant does not reach still prompt then (design §1.6b), so the flip waits on
-    /// `prompt_possible` naming only the covered classes.
+    /// S4 — how much a held Full Disk Access grant actually suppresses.
     pub fda_coverage_measured: bool,
-    /// §7 S2: what an adopted-across-a-handoff session's attribution and access do. Until
-    /// `true`, an adopted session reports `unknown`, never `denied`. S2 is measured (adopted
-    /// sessions follow aterm's grant, design §2.2), but the flag stays `false`: it only lets an
-    /// observed `EPERM` read `denied`, and no production site observes one yet.
+    /// S2: what an adopted-across-a-handoff session's attribution and access.
     pub handoff_attribution_measured: bool,
-    /// §7 S1 — how far a grant reaches. Stays [`FdaScope::Unknown`].
+    /// S1 — how far a grant reaches.
     pub fda_scope: FdaScope,
-    /// Debugger design §7 D2 — what `DevToolsSecurity -enable` does from
-    /// aterm's gesture, the app name macOS's dialog shows included. Measured
-    /// (with D4's `-disable`) on the Developer-ID 0.106.0 in VMs of macOS
-    /// 26.6.2 and 27.0, from the gesture and from a tab: one `SecurityAgent`
-    /// dialog naming `SamplingTools`, so copy says macOS "asks", not "should ask".
+    /// Debugger D2 — what `DevToolsSecurity -enable` does from aterm's gesture.
     pub devtools_enable_measured: bool,
-    /// Debugger design §7 D5 — whether developer mode silences lldb's attach.
-    /// Measured in VMs of macOS 26.6.2 and 27.0 with the Command Line Tools
-    /// lldb, from an aterm tab in a fresh login session: no dialog, and authd
-    /// satisfied the right through `is-admin` with no `builtin:authenticate`.
-    /// Until this is `true`, copy says the switch "should stop" the dialog,
-    /// never that it "stops" it.
+    /// Debugger D5 — whether developer mode silences lldb's attach.
     pub devtools_silences_lldb: bool,
-    /// Debugger design §7 D6 — the shape of a cancelled taskport
-    /// authorization in authd's log. Measured in VMs of macOS 26.6.2 and 27.0:
-    /// `Evaluate cancelled or failed -60006 (engine N)` and `Failed to
-    /// authorize right 'system.privilege.taskport.debug' … (-60006) (engine N)`.
-    /// Until this is `true`, an unrecognised close reads `unknown`, never `failed`.
+    /// Debugger D6 — the shape of a cancelled taskport authorization in authd's log.
     pub taskport_cancel_shape_measured: bool,
-    /// Debugger design §7 D12 — whether `sample`, `leaks` and their kin stay
-    /// silent with developer mode off. Measured in VMs of macOS 26.6.2 and
-    /// 27.0 for `sample`, `leaks`, `vmmap`, `heap` and `atos`: taskgated
-    /// allowed each a read port by entitlement and authd evaluated nothing.
-    /// Until this is `true`, help says they "should not" raise the dialog,
-    /// never that they "do not".
+    /// Debugger D12 — whether `sample`, `leaks` and their kin stay silent with developer mode.
     pub perf_tools_never_prompt: bool,
-    /// Debugger design §7 D13: tccd's Developer Tools answer for a listed identity, switched
-    /// on and off. Until `true`, `denied` reads "not allowed", never "listed, switched off".
-    /// [`DevToolState::Denied`] does not carry tccd's reason, so the flip must add it, or a
-    /// policy denial would read "switched off".
+    /// Debugger D13: tccd's Developer Tools answer for a listed identity, switched.
     pub devtool_answer_shapes_measured: bool,
-    /// Debugger design §7 D14: whether being on the Developer Tools list skips
-    /// macOS's first-run check of a new program run in aterm. Until this is
-    /// `true`, copy says the list "should" stop that check, never that it does.
+    /// Debugger D14: whether being on the Developer Tools list skips macOS's first-run check.
     pub devtool_skips_first_run_check: bool,
 }
 
 impl SpikeEvidence {
-    /// What has been measured, and what every production caller passes. A
-    /// flag set here names its spike's write-up in the design doc.
+    /// What has been measured, and what every production caller passes.
     pub const MEASURED: Self = Self {
         devtools_enable_measured: true,
         devtools_silences_lldb: true,
@@ -5333,25 +4316,22 @@ impl Default for SpikeEvidence {
     }
 }
 
-/// Everything the posture join reads. All of it is observed, none of it is
-/// inferred.
+/// Everything the posture join reads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct PostureInputs {
-    /// aterm's own adoption record for this session.
+    /// Aterm's own adoption record for this session.
     pub adoption: Attribution,
     /// The instance's Full Disk Access state.
     pub fda: FdaState,
-    /// The responsibility SPI's corroboration. Informational: it never changes
-    /// [`ConsentPosture::attribution`].
+    /// The responsibility SPI's corroboration.
     pub responsible: Responsible,
-    /// `true` only when aterm itself took an `EPERM(1)` on a path under a
-    /// protected root for this session. Never set from a guess.
+    /// `true` only when aterm itself took an `EPERM(1)` on a path under a protected root.
     pub observed_eperm: bool,
     /// Which spikes have landed.
     pub evidence: SpikeEvidence,
 }
 
-/// The joined posture for one session. Pure product of [`PostureInputs`].
+/// The joined posture for one session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ConsentPosture {
     /// Copied verbatim from the adoption record.
@@ -5362,22 +4342,14 @@ pub struct ConsentPosture {
     pub responsible: Responsible,
     /// The instance Full Disk Access state, carried through unchanged.
     pub fda: FdaState,
-    /// How far the grant reaches. [`FdaScope::Unknown`] until §7 S1.
+    /// How far the grant reaches.
     pub fda_scope: FdaScope,
     /// `true` when a macOS consent dialog remains possible for this session.
     pub prompt_possible: bool,
 }
 
 impl ConsentPosture {
-    /// Join the observations. Pure, total, and table-tested.
-    ///
-    /// * `attribution` is the adoption record, verbatim; the SPI never overrides it (it answers
-    ///   `-1` for any process the caller does not own).
-    /// * `fs_consent` is `Denied` only on an observed `EPERM`, `Covered` only when the grant is
-    ///   held, the session is live and §7 S4 measured the coverage, else `Unknown`. An adopted
-    ///   session stays `Unknown` while `handoff_attribution_measured` is false (design §3.9
-    ///   pt 2).
-    /// * `prompt_possible` is `false` only when the grant is held and its coverage measured.
+    /// Join the observations.
     #[must_use]
     pub const fn join(inputs: PostureInputs) -> Self {
         let attribution = inputs.adoption;
@@ -5411,8 +4383,6 @@ impl ConsentPosture {
     }
 }
 
-// macOS implementation — the only code here that touches the OS
-
 #[cfg(target_os = "macos")]
 mod imp {
     use super::{
@@ -5423,8 +4393,6 @@ mod imp {
     use std::os::unix::ffi::OsStrExt;
     use std::path::{Path, PathBuf};
 
-    // `proc_pidpath` is in `libproc`, which is part of `libSystem`; it links
-    // directly. Only the responsibility SPI needs `dlsym`.
     unsafe extern "C" {
         fn proc_pidpath(
             pid: libc::c_int,
@@ -5433,60 +4401,38 @@ mod imp {
         ) -> libc::c_int;
     }
 
-    /// `PROC_PIDPATHINFO_MAXSIZE` — `4 * MAXPATHLEN`.
     const PROC_PIDPATHINFO_MAXSIZE: usize = 4 * 1024;
 
-    // `gethostuuid(2)`, the Mac's hardware UUID (IOPlatformUUID), from libSystem. Not in
-    // `crates/aterm-libc` for the reason the debugger facts below are not.
     unsafe extern "C" {
-        /// `int gethostuuid(uuid_t id, const struct timespec *wait)`
         fn gethostuuid(id: *mut u8, wait: *const libc::timespec) -> libc::c_int;
     }
 
-    /// This Mac's hardware UUID, upper-case and hyphenated; `None` when the kernel does
-    /// not answer within a second.
+    /// This Mac's hardware UUID, upper-case and hyphenated.
     pub(super) fn host_uuid() -> Option<String> {
         let mut id = [0u8; 16];
         let wait = libc::timespec {
             tv_sec: 1,
             tv_nsec: 0,
         };
-        // SAFETY: `id` is the 16 bytes of a `uuid_t` and outlives the call; `wait` is a
-        // valid `timespec` read during the call only.
+        // SAFETY: `id` is the 16 bytes of a `uuid_t` and outlives the call.
         let rc = unsafe { gethostuuid(id.as_mut_ptr(), &raw const wait) };
         (rc == 0).then(|| super::format_uuid(&id))
     }
 
-    // The debugger-access facts (design §3.2). Declared here rather than in
-    // `crates/aterm-libc`, whose cells are generated from the crates.io `libc`
-    // and held to it by `libc-oracle` item for item: upstream declares neither
-    // `csops` nor the `mbr_*` family, and binds `getgrnam_r` through a
-    // `group` struct that cell does not carry. All four are libSystem exports
-    // (`csops` in `libsystem_kernel`, the rest in `libsystem_info`), and none
-    // takes a `$`-suffixed link name on either Darwin arch.
     unsafe extern "C" {
-        /// `int csops(pid_t, unsigned int ops, void *useraddr, size_t usersize)`
-        /// — xnu `bsd/sys/codesign.h`; no SDK header declares it.
         fn csops(
             pid: libc::pid_t,
             ops: u32,
             useraddr: *mut libc::c_void,
             usersize: libc::size_t,
         ) -> libc::c_int;
-        /// `<membership.h>`: `int mbr_uid_to_uuid(uid_t, uuid_t)`.
         fn mbr_uid_to_uuid(uid: libc::uid_t, uu: *mut u8) -> libc::c_int;
-        /// `<membership.h>`: `int mbr_gid_to_uuid(gid_t, uuid_t)`.
         fn mbr_gid_to_uuid(gid: libc::gid_t, uu: *mut u8) -> libc::c_int;
-        /// `<membership.h>`: `int mbr_check_membership(const uuid_t user,
-        /// const uuid_t group, int *ismember)` — asks the directory, so nested
-        /// groups resolve.
         fn mbr_check_membership(
             user: *const u8,
             group: *const u8,
             ismember: *mut libc::c_int,
         ) -> libc::c_int;
-        /// `<grp.h>`: the reentrant `getgrnam`. The plain one returns a
-        /// static buffer another thread's lookup can overwrite.
         fn getgrnam_r(
             name: *const libc::c_char,
             grp: *mut Group,
@@ -5496,7 +4442,6 @@ mod imp {
         ) -> libc::c_int;
     }
 
-    /// `<grp.h>`'s `struct group`, the same on both Darwin arches.
     #[repr(C)]
     #[allow(clippy::struct_field_names, reason = "`<grp.h>`'s own field names")]
     struct Group {
@@ -5506,17 +4451,14 @@ mod imp {
         gr_mem: *mut *mut libc::c_char,
     }
 
-    /// `uuid_t` — `unsigned char[16]`.
     type Uuid = [u8; 16];
 
-    /// The running image's code-signing status flags, or `None` when `csops`
-    /// refuses. A syscall about our own process: no spawn, no dialog.
+    /// The running image's code-signing status flags, or `None` when `csops` refuses.
     pub(super) fn own_cs_status() -> Option<u32> {
         let mut flags: u32 = 0;
         // SAFETY: `getpid` has no preconditions.
         let me = unsafe { libc::getpid() };
-        // SAFETY: `flags` is a live, aligned `u32`, and the size passed is its
-        // exact size; `CS_OPS_STATUS` writes exactly one `uint32_t`.
+        // SAFETY: `flags` is a live, aligned `u32`, and the size passed is its exact size.
         let ret = unsafe {
             csops(
                 me,
@@ -5528,8 +4470,7 @@ mod imp {
         (ret == 0).then_some(flags)
     }
 
-    /// The birth record of the process at `pid`, from `proc_pidinfo(PROC_PIDTBSDINFO)`. `None`
-    /// for pid 0 or 1, a pid the kernel will not describe, a short record, or another pid's.
+    /// The birth record of the process at `pid`, from `proc_pidinfo(PROC_PIDTBSDINFO)`.
     pub(super) fn process_birth(pid: u32) -> Option<super::ProcessBirth> {
         let pid = libc::pid_t::try_from(pid).ok()?;
         if pid <= 1 {
@@ -5537,9 +4478,7 @@ mod imp {
         }
         let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::uninit();
         let size = i32::try_from(std::mem::size_of::<libc::proc_bsdinfo>()).ok()?;
-        // SAFETY: `info` points at `size` writable bytes of exactly the
-        // structure PROC_PIDTBSDINFO fills; libproc returns the number of bytes
-        // it wrote.
+        // SAFETY: `info` points at `size` writable bytes of exactly the structure PROC_PIDTBSDINFO.
         let read = unsafe {
             libc::proc_pidinfo(
                 pid,
@@ -5554,7 +4493,6 @@ mod imp {
         }
         // SAFETY: the exact-size success above initialized the whole record.
         let info = unsafe { info.assume_init() };
-        // A record about some other pid would name the wrong process.
         if u32::try_from(pid).ok()? != info.pbi_pid {
             return None;
         }
@@ -5564,8 +4502,7 @@ mod imp {
         })
     }
 
-    /// Whether the running user is a member of the directory group `name`,
-    /// nested membership included; `None` when any step cannot answer.
+    /// Whether the running user is a member of the directory group `name`.
     pub(super) fn in_group(name: &str) -> Option<bool> {
         let gid = group_gid(name)?;
         let mut user: Uuid = [0; 16];
@@ -5581,19 +4518,14 @@ mod imp {
             return None;
         }
         let mut is_member: libc::c_int = 0;
-        // SAFETY: both are live 16-byte `uuid_t`s, and `is_member` is a live
-        // `int` the call writes once.
+        // SAFETY: both are live 16-byte `uuid_t`s.
         let ret =
             unsafe { mbr_check_membership(user.as_ptr(), group.as_ptr(), &raw mut is_member) };
         (ret == 0).then_some(is_member != 0)
     }
 
-    /// The gid of the directory group `name`, through `getgrnam_r`: no gid is
-    /// written in this crate. `None` for no such group, or any failure.
     fn group_gid(name: &str) -> Option<libc::gid_t> {
         let name = CString::new(name).ok()?;
-        // A group record with a long member list can outgrow a first guess;
-        // `ERANGE` doubles the buffer up to a bound, past which it is no answer.
         let mut size = 4096usize;
         while size <= 1 << 20 {
             let mut buf = vec![0 as libc::c_char; size];
@@ -5604,10 +4536,7 @@ mod imp {
                 gr_mem: std::ptr::null_mut(),
             };
             let mut found: *mut Group = std::ptr::null_mut();
-            // SAFETY: `name` is NUL-terminated; `record` and `found` are live
-            // out-parameters; `buf` is a live allocation of exactly `size`
-            // bytes that outlives the call and every pointer written into
-            // `record` (only `gr_gid`, a plain integer, is read below).
+            // SAFETY: `name` is NUL-terminated.
             let ret = unsafe {
                 getgrnam_r(
                     name.as_ptr(),
@@ -5626,14 +4555,12 @@ mod imp {
         None
     }
 
-    /// No SDK header declares this; it lives in `/usr/lib/system/libquarantine.dylib`.
     type ResponsibilityGetPid = unsafe extern "C" fn(libc::c_int) -> libc::c_int;
 
     const RESPONSIBILITY_SYMBOL: &[u8] = b"responsibility_get_pid_responsible_for_pid\0";
 
     type CfRef = *const libc::c_void;
 
-    /// `kCFStringEncodingUTF8`.
     const UTF8: u32 = 0x0800_0100;
 
     #[link(name = "CoreFoundation", kind = "framework")]
@@ -5677,7 +4604,6 @@ mod imp {
     pub(super) fn open_probe(db: &Path) -> ProbeOutcome {
         match probe_descriptor(db) {
             Ok(fd) => {
-                // Closed at once; the contents are never read.
                 drop(fd);
                 ProbeOutcome::Ok
             }
@@ -5685,40 +4611,29 @@ mod imp {
         }
     }
 
-    /// The probe's `open`, close-on-exec from creation (`O_CLOEXEC` is atomic
-    /// in `open(2)`), so a child another thread spawns before the close cannot
-    /// inherit a handle on `TCC.db`.
+    /// The probe's `open`, close-on-exec from creation (`O_CLOEXEC` is atomic in `open(2)`).
     pub(super) fn probe_descriptor(db: &Path) -> Result<std::os::fd::OwnedFd, i32> {
         use std::os::fd::FromRawFd as _;
         let Ok(path) = CString::new(db.as_os_str().as_bytes()) else {
-            // Unreachable: the caller already rejected interior NULs. Report
             // an errno rather than panicking in a probe.
             return Err(libc::EINVAL);
         };
-        // SAFETY: `path` is a valid NUL-terminated C string that outlives the
-        // call; `O_RDONLY | O_CLOEXEC` takes no third argument.
+        // SAFETY: `path` is a valid NUL-terminated C string that outlives the call.
         let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
         if fd < 0 {
             return Err(errno());
         }
-        // SAFETY: `fd` is a descriptor this call just created, owned by nothing
-        // else; the `OwnedFd` closes it exactly once.
+        // SAFETY: `fd` is a descriptor this call just created, owned by nothing else.
         Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) })
     }
 
-    /// `errno` for the immediately preceding call.
     fn errno() -> i32 {
         // SAFETY: `__error()` returns a valid pointer to this thread's errno.
         unsafe { *libc::__error() }
     }
 
-    /// Resolve the responsibility SPI, or `None`. Once per [`super::responsible_pids_detailed`]
-    /// call, which asks it about every pid in its slice (a `privacy` report asks about all its
-    /// sessions in one call). Not cached in a `static`: this crate keeps lazy-init statics off
-    /// paths a GUI main thread can reach.
     fn responsibility_symbol() -> Option<ResponsibilityGetPid> {
-        // SAFETY: `RESPONSIBILITY_SYMBOL` is NUL-terminated; `RTLD_DEFAULT` is
-        // the documented pseudo-handle for a global search.
+        // SAFETY: `RESPONSIBILITY_SYMBOL` is NUL-terminated.
         let sym = unsafe {
             libc::dlsym(
                 libc::RTLD_DEFAULT,
@@ -5728,25 +4643,19 @@ mod imp {
         if sym.is_null() {
             return None;
         }
-        // SAFETY: dyld resolved this name to the libquarantine function whose
-        // C prototype is `pid_t f(pid_t)`, which is exactly
-        // `ResponsibilityGetPid`.
+        // SAFETY: dyld resolved this name to the libquarantine function whose C prototype.
         Some(unsafe { std::mem::transmute::<*mut libc::c_void, ResponsibilityGetPid>(sym) })
     }
 
-    /// The responsibility SPI resolved, as a question about one pid at a time, or `None` when
-    /// the symbol is absent.
+    /// The responsibility SPI resolved, as a question about one pid at a time.
     pub(super) fn responsibility_spi() -> Option<impl FnMut(i32) -> Result<i32, ResponsibleError>> {
         let func = responsibility_symbol()?;
         Some(move |pid: i32| {
-            // `-1` is overloaded, so errno is the only way to tell "not ours"
-            // from "gone"; clear it first so a stale value cannot be read back.
             // SAFETY: `__error()` returns a valid pointer to this thread's errno.
             unsafe {
                 *libc::__error() = 0;
             }
-            // SAFETY: `func` has the signature dyld resolved it to, and the argument is a
-            // plain `pid_t`.
+            // SAFETY: `func` has the signature dyld resolved it.
             let ret = unsafe { func(pid) };
             responsible_answer(ret, errno())
         })
@@ -5767,8 +4676,7 @@ mod imp {
         })
     }
 
-    /// [`SelfImage`] from `proc_pidpath` on our own pid. `ENOENT` is the unlink
-    /// signal; any other failure is [`SelfImage::Unreadable`].
+    /// [`SelfImage`] from `proc_pidpath` on our own pid.
     pub(super) fn self_image() -> SelfImage {
         let Ok(me) = i32::try_from(std::process::id()) else {
             return SelfImage::Unreadable;
@@ -5780,16 +4688,13 @@ mod imp {
         }
     }
 
-    /// `proc_pidpath` for one pid, or the errno it failed with.
     fn pid_path(pid: i32) -> Result<PathBuf, i32> {
         let mut buf = vec![0u8; PROC_PIDPATHINFO_MAXSIZE];
-        // SAFETY: `__error()` returns a valid pointer to this thread's errno;
-        // cleared so a stale value cannot be read back as this call's.
+        // SAFETY: `__error()` returns a valid pointer to this thread's errno.
         unsafe {
             *libc::__error() = 0;
         }
-        // SAFETY: `buf` is a live allocation of exactly the length passed, and
-        // `proc_pidpath` writes at most that many bytes.
+        // SAFETY: `buf` is a live allocation of exactly the length passed.
         let written = unsafe {
             proc_pidpath(
                 pid,
@@ -5803,10 +4708,7 @@ mod imp {
         }
     }
 
-    /// Every bundle `LaunchServices` has registered for `bundle_id`
-    /// (`LSCopyApplicationURLsForBundleIdentifier`: no protected path, no dialog, no
-    /// `WindowServer`). `kLSApplicationNotFoundErr` is an empty answer, any other failure
-    /// `None`. Registrations outlive their bundles, so each path is a candidate, not a fact.
+    /// Every bundle `LaunchServices` has registered for `bundle_id`.
     pub(super) fn registered_bundles(bundle_id: &str) -> Option<Vec<PathBuf>> {
         #[link(name = "CoreServices", kind = "framework")]
         unsafe extern "C" {
@@ -5814,8 +4716,7 @@ mod imp {
         }
         const APPLICATION_NOT_FOUND: isize = -10814;
         let len = isize::try_from(bundle_id.len()).ok()?;
-        // SAFETY: `bundle_id` is a live UTF-8 buffer of exactly `len` bytes; a
-        // null allocator is the documented default.
+        // SAFETY: `bundle_id` is a live UTF-8 buffer of exactly `len` bytes.
         let id =
             unsafe { CFStringCreateWithBytes(std::ptr::null(), bundle_id.as_ptr(), len, UTF8, 0) };
         if id.is_null() {
@@ -5824,7 +4725,7 @@ mod imp {
         let mut error: CfRef = std::ptr::null();
         // SAFETY: `id` is a valid CFString we own; `error` is a valid out slot.
         let urls = unsafe { LSCopyApplicationURLsForBundleIdentifier(id, &raw mut error) };
-        // SAFETY: `id` was created above and is released exactly once.
+        // SAFETY: `id` was created above and is released exactly.
         unsafe { CFRelease(id) };
         if urls.is_null() {
             if error.is_null() {
@@ -5832,15 +4733,14 @@ mod imp {
             }
             // SAFETY: a non-null `error` is a CFError we own (Copy rule).
             let code = unsafe { CFErrorGetCode(error) };
-            // SAFETY: released exactly once.
+            // SAFETY: released exactly.
             unsafe { CFRelease(error) };
             return (code == APPLICATION_NOT_FOUND).then(Vec::new);
         }
         let mut out = Vec::new();
         let mut buf = vec![0u8; 4096];
         let max = isize::try_from(buf.len()).unwrap_or(isize::MAX);
-        // SAFETY: `urls` is a valid CFArray of CFURLs we own; every index is in
-        // range; `buf` holds `max` bytes and the call NUL-terminates within it.
+        // SAFETY: `urls` is a valid CFArray of CFURLs we own.
         unsafe {
             for index in 0..CFArrayGetCount(urls) {
                 let url = CFArrayGetValueAtIndex(urls, index);
@@ -5855,20 +4755,11 @@ mod imp {
         Some(out)
     }
 
-    /// `bytes` (a bundle's `Info.plist`) parsed by `CFBundle`'s reader,
-    /// `CFPropertyListCreateWithData`: XML, binary or old-style text, never JSON. `None` when
-    /// that reader refuses it; a non-dictionary plist names nothing. Only the identifier and one
-    /// verdict are kept, and no string is converted past [`KEY_MAX_UNITS`] or
-    /// [`VALUE_MAX_UNITS`] (a binary plist can point thousands of keys at one large string). A
-    /// string that does not come back whole (an embedded NUL) is unread, so it never equals a
-    /// name it is not.
+    /// `bytes` (a bundle's `Info.plist`) parsed by `CFBundle`'s reader.
     pub(super) fn parse_info_plist(bytes: &[u8]) -> Option<super::InfoPlist> {
         const IMMUTABLE: usize = 0;
-        // A CFString of at most `max` UTF-16 units as Rust text, whole or not
-        // at all; the length is checked before anything is allocated.
         let text = |value: CfRef, max: isize| -> Option<String> {
-            // SAFETY: `value` is a live CF object owned by the dictionary the
-            // caller holds; its type is checked before any string call.
+            // SAFETY: `value` is a live CF object owned by the dictionary the caller holds.
             unsafe {
                 if value.is_null() || CFGetTypeID(value) != CFStringGetTypeID() {
                     return None;
@@ -5890,14 +4781,12 @@ mod imp {
             }
         };
         let len = isize::try_from(bytes.len()).ok()?;
-        // SAFETY: `bytes` is a live buffer of exactly `len` bytes, copied by
-        // `CFDataCreate`; a null allocator is the documented default.
+        // SAFETY: `bytes` is a live buffer of exactly `len` bytes, copied by `CFDataCreate`.
         let data = unsafe { CFDataCreate(std::ptr::null(), bytes.as_ptr(), len) };
         if data.is_null() {
             return None;
         }
-        // SAFETY: `data` is a valid CFData we own; null format and error slots
-        // are documented as allowed.
+        // SAFETY: `data` is a valid CFData we own.
         let plist = unsafe {
             CFPropertyListCreateWithData(
                 std::ptr::null(),
@@ -5907,21 +4796,15 @@ mod imp {
                 std::ptr::null_mut(),
             )
         };
-        // SAFETY: `data` was created above and is released exactly once.
+        // SAFETY: `data` was created above and is released exactly.
         unsafe { CFRelease(data) };
         if plist.is_null() {
             return None;
         }
-        // The `-macos` key, when present, is the identifier `CFBundle` reports, even a value it
-        // cannot use (a number, a string with a NUL), which leaves no usable identifier rather
-        // than falling back to the plain key.
         let mut plain_id = None;
         let mut macos_id: Option<Option<String>> = None;
         let mut plain_executables = true;
-        // SAFETY: `plist` is a valid property list we own (Create rule); the
-        // dictionary calls run only once its type is checked, the key and
-        // value buffers hold exactly `count` slots, and `plist` is released
-        // exactly once, after the last read of anything it owns.
+        // SAFETY: `plist` is a valid property list we own (Create rule).
         unsafe {
             if CFGetTypeID(plist) == CFDictionaryGetTypeID() {
                 let count = usize::try_from(CFDictionaryGetCount(plist)).unwrap_or(0);
@@ -5953,23 +4836,19 @@ mod imp {
         })
     }
 
-    /// The longest key [`parse_info_plist`] reads: `CFBundle`'s own keys, the
-    /// platform variants among them, are a few dozen units.
     const KEY_MAX_UNITS: isize = 128;
-    /// The longest value it reads: a bundle identifier, or a file name (at most
-    /// 255 bytes on APFS).
     const VALUE_MAX_UNITS: isize = 1024;
 }
 
-/// Explicit mounted-volume acceptance for the census boundary. The same bundle
-/// must be refused while a volume is mounted inside it and admitted after detach.
-/// Run the `dmg_acceptance` bench with `--profile test`; macOS may request consent.
+/// Explicit mounted-volume acceptance for the census boundary.
 ///
 /// # Errors
+///
 /// Returns the setup failure when a disk image cannot be created or attached.
 ///
 /// # Panics
-/// If detaching fails or the mounted/detached policy judgments are incorrect.
+///
+/// Panics if detaching fails or the mounted/detached policy judgments are incorrect.
 #[cfg(all(debug_assertions, target_os = "macos"))]
 pub fn a_real_volume_mounted_in_the_bundle_is_not_crossed(dir: &Path) -> std::io::Result<()> {
     struct Detach {
@@ -6021,7 +4900,6 @@ pub fn a_real_volume_mounted_in_the_bundle_is_not_crossed(dir: &Path) -> std::io
         "HFS+".as_ref(),
         image.as_os_str(),
     ])?;
-    // Arm before attach: a failed attach can still have mounted the image.
     let mut attached = Detach {
         point: mount.clone(),
         attached: true,
@@ -6051,8 +4929,6 @@ pub fn a_real_volume_mounted_in_the_bundle_is_not_crossed(dir: &Path) -> std::io
 mod tests {
     use super::*;
 
-    /// An act for one poll of [`run_bounded_exit`]'s wait for its readers, given that
-    /// wait's deadline.
     #[cfg(target_os = "macos")]
     type ReadersAct = Box<dyn FnOnce(&mut std::time::Instant)>;
 
@@ -6062,8 +4938,6 @@ mod tests {
             const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
     }
 
-    /// One poll of [`run_bounded_exit`]'s wait for readers that outlive the tool: run the
-    /// next act this thread armed, once, on the wait's `deadline`.
     #[cfg(target_os = "macos")]
     pub(super) fn readers_pending(deadline: &mut std::time::Instant) {
         if let Some(act) = READERS_PENDING.with(|acts| acts.borrow_mut().pop_front()) {
@@ -6071,9 +4945,6 @@ mod tests {
         }
     }
 
-    /// An act for one of [`run_to_exit_keeping_heads`]'s reader grace polls: the poll's
-    /// number, and what runs there, given the poll counter (an act may spend the rest of
-    /// the grace) and whether both readers are done.
     #[cfg(unix)]
     type GracePollAct = (u32, Box<dyn FnOnce(&mut u32, &dyn Fn() -> bool)>);
 
@@ -6083,8 +4954,6 @@ mod tests {
             const { std::cell::RefCell::new(None) };
     }
 
-    /// [`run_to_exit_keeping_heads`]'s grace poll number `*poll`: run the act this thread
-    /// armed for that poll, once.
     #[cfg(unix)]
     pub(super) fn reader_grace_poll(poll: &mut u32, readers_done: &dyn Fn() -> bool) {
         let act = GRACE_POLL.with(|slot| {
@@ -6100,21 +4969,13 @@ mod tests {
         }
     }
 
-    /// A stand-in that prints `early` and exits, leaving a grandchild that holds its stdout
-    /// and stderr and prints `late` once the FIFO `$1` ([`fifo_gate`]) is released, then the
-    /// line that released it: nothing for a test's own [`release_gate`],
-    /// [`HANG_DETECTOR_RELEASE`] for [`gate_hang_detector`]'s, so a run the detector let go
-    /// never reads as the run its test expects.
     #[cfg(target_os = "macos")]
     const GATED_GRANDCHILD: &str =
         "exec 3<>\"$1\"; (read line <&3; printf 'late%s' \"$line\") & printf early";
 
-    /// What [`gate_hang_detector`] writes to the gate, and so what a grandchild it let go
-    /// prints after `late`.
     #[cfg(target_os = "macos")]
     const HANG_DETECTOR_RELEASE: &str = "+released-by-the-hang-detector";
 
-    /// A FIFO at `dir/gate` for [`GATED_GRANDCHILD`] to wait on.
     #[cfg(target_os = "macos")]
     fn fifo_gate(dir: &Path) -> PathBuf {
         let gate = dir.join("gate");
@@ -6124,14 +4985,11 @@ mod tests {
         gate
     }
 
-    /// Let the grandchild waiting on `gate` go. Non-blocking, so a gate nobody holds open
-    /// any more is a refusal, never a hang.
     #[cfg(target_os = "macos")]
     fn release_gate(gate: &Path) -> std::io::Result<()> {
         release_gate_saying(gate, "")
     }
 
-    /// [`release_gate`], the grandchild printing `said` after `late`.
     #[cfg(target_os = "macos")]
     fn release_gate_saying(gate: &Path, said: &str) -> std::io::Result<()> {
         use std::io::Write as _;
@@ -6143,11 +5001,6 @@ mod tests {
             .and_then(|mut gate| gate.write_all(format!("{said}\n").as_bytes()))
     }
 
-    /// The [`HANG_DETECTOR`] of a run [`fifo_gate`] holds: the gate is released if the test
-    /// still runs then, so a wait that never gives the grandchild up ends and fails its
-    /// assertions instead of hanging: what the grandchild then prints carries
-    /// [`HANG_DETECTOR_RELEASE`], which no expected run does. Dropping what this returns
-    /// stands it down.
     #[cfg(target_os = "macos")]
     fn gate_hang_detector(gate: &Path) -> std::sync::mpsc::Sender<()> {
         let (stand_down, detector) = std::sync::mpsc::channel::<()>();
@@ -6166,12 +5019,6 @@ mod tests {
         PathBuf::from(s)
     }
 
-    // -- the fence -----------------------------------------------------------
-
-    /// The fence is lexical, as one table: `app_bundle_root` (the innermost
-    /// `.app` around the executable; `path_is_in_app_bundle` is its `is_some`)
-    /// and `bundle_layout_root` (the same layout under any name, the updater's
-    /// `.app.rollback` included).
     #[test]
     fn the_bundle_root_is_lexical() {
         let (app, dev, inner) = (
@@ -6183,13 +5030,11 @@ mod tests {
             ("/A/x.app/Contents/MacOS/x", Some(app), Some(app)),
             ("/A/x (dev).app/Contents/MacOS/x", Some(dev), Some(dev)),
             ("/A/x.app/Contents/MacOS/helpers/x", Some(app), Some(app)),
-            // Nested bundles: the innermost enclosing one wins.
             (
                 "/A/O.app/Contents/MacOS/I.app/Contents/MacOS/x",
                 Some(inner),
                 Some(inner),
             ),
-            // Lexical: a relative path with a bundle's shape resolves.
             (
                 "sub/x.app/Contents/MacOS/x",
                 Some("sub/x.app"),
@@ -6209,7 +5054,6 @@ mod tests {
             ("/A/x.app/Contents/MacOS", None, None),
             ("/A/x.app/Contents/Resources/x", None, None),
             ("/A/x.app/Other/MacOS/x", None, None),
-            // macOS volumes ignore case, and so does the extension test.
             (
                 "/A/X.APP/Contents/MacOS/x",
                 Some("/A/X.APP"),
@@ -6224,12 +5068,9 @@ mod tests {
         }
     }
 
-    // The claimant census
-
     const DEV_ID: &str = "designated => identifier \"x\" and anchor apple generic and \
                           certificate leaf[subject.OU] = A66A9P66Z7";
 
-    /// The table's paths are not on disk: each spelling is its own bundle.
     fn as_spelled(_: &Path) -> Option<Located> {
         None
     }
@@ -6248,7 +5089,6 @@ mod tests {
         })
     }
 
-    /// Over recorded `codesign -d -r- --verbose=2` output.
     #[test]
     fn the_signing_readers_fail_toward_the_weaker_claim() {
         let devid = "Executable=/Applications/aterm.app/Contents/MacOS/aterm\n\
@@ -6261,7 +5101,6 @@ mod tests {
             DrClass::Identity
         );
 
-        // codesign prints an ad-hoc requirement commented; it still reads, as cdhash.
         let adhoc = "Signature=adhoc\n\
                      TeamIdentifier=not set\n\
                      # designated => cdhash H\"4249c4f5\"\n";
@@ -6276,8 +5115,6 @@ mod tests {
         assert_eq!(designated_requirement(unsigned), None);
         assert_eq!(classify_signing("something else entirely\n"), "unknown");
         assert_eq!(team_identifier("TeamIdentifier=\n"), None, "an empty id");
-        // Unsigned is the whole one-line report, never the phrase among other lines or a line
-        // that only mentions it; ad hoc is the line itself, never a path that spells it.
         for (report, signing) in [
             (
                 "/x: code object is not signed at all\nIdentifier=x\n",
@@ -6293,8 +5130,6 @@ mod tests {
         }
     }
 
-    /// XML only, exact key (a key it is a prefix of does not bind), and a key whose value is
-    /// not the next element binds nothing.
     #[test]
     fn the_plist_reader_is_exact_and_xml_only() {
         let xml = "<plist><dict>\
@@ -6316,7 +5151,6 @@ mod tests {
             Some("v"),
             "whitespace around the key, before its string and inside it"
         );
-        // Only a regular file within the bound is read.
         #[cfg(unix)]
         assert_eq!(read_plist_bytes(Path::new("/dev/null")), None, "a device");
         let tmp = aterm_tempfile::tempdir().expect("tempdir");
@@ -6332,7 +5166,6 @@ mod tests {
         );
     }
 
-    /// Two unknowns are not one identity: an unreadable requirement conflicts.
     #[test]
     fn an_unreadable_requirement_conflicts_rather_than_matching() {
         let mk = |dr: &str| Claimant {
@@ -6346,11 +5179,8 @@ mod tests {
         };
         assert!(!mk(DEV_ID).conflicts_with(&mk(DEV_ID)));
         assert!(mk("").conflicts_with(&mk("")));
-        // Compared trimmed: whitespace is not identity, and a blank requirement is unread.
         assert!(!mk(DEV_ID).conflicts_with(&mk(&format!(" {DEV_ID}\n"))));
         assert!(mk(" ").conflicts_with(&mk(" ")));
-        // The Trash's fresh read is the census's copy only when class, signing and text all
-        // match, and never when it has no class.
         let fresh = |dr, signing, dr_text: &str| BundleIdentity {
             bundle_id: Some("x".to_string()),
             dr_text: dr_text.to_string(),
@@ -6378,9 +5208,6 @@ mod tests {
         }
     }
 
-    /// A Developer-ID install, its `.rollback` and a backup (both ad hoc), an unreadable copy,
-    /// another program and a LaunchServices-only copy: five claimants, four conflicting, the
-    /// two ad-hoc ones retirable.
     #[test]
     fn the_census_finds_every_claimant_including_rollback_and_registered_copies() {
         let apps = PathBuf::from("/Apps");
@@ -6399,7 +5226,6 @@ mod tests {
                     apps.join("x-unread.app"),
                     apps.join("Other.app"),
                     apps.join("notes.txt"),
-                    // Not named like a bundle: never read, whatever it would say.
                     apps.join("x-plain"),
                 ])
             } else {
@@ -6459,7 +5285,6 @@ mod tests {
         assert!(!c.sole_claimant());
     }
 
-    /// Only a complete look may claim absence: each hole downgrades the verdict.
     #[test]
     fn every_hole_downgrades_the_census_and_a_complete_lone_install_is_sole() {
         let apps = PathBuf::from("/Apps");
@@ -6551,10 +5376,6 @@ mod tests {
         );
     }
 
-    /// A bundle is one claimant however it is spelled: the links that reach it are kept once
-    /// each, it is reported under the first of its own names a source spells (a firmlink
-    /// spelling later changes nothing), and the running copy is known by the bundle, not by
-    /// the spelling it was launched through.
     #[test]
     fn a_bundle_is_reported_once_under_its_own_name() {
         let (link, own, resolved) = (p("/Links/x.app"), p("/Apps/x.app"), p("/real/x.app"));
@@ -6588,11 +5409,6 @@ mod tests {
         assert!(copy.running);
     }
 
-    /// Beside a Developer-ID running copy, every copy that differs conflicts,
-    /// but the Trash takes only a build: an ad-hoc copy, or an unsigned one
-    /// (its class read off `codesign`'s whole report). A Developer ID copy whose
-    /// requirement pins a cdhash, and a copy whose signature could not be read,
-    /// are listed and left alone.
     #[test]
     fn only_an_ad_hoc_or_unsigned_copy_is_retirable() {
         let running = PathBuf::from("/A/x.app");
@@ -6640,7 +5456,6 @@ mod tests {
         assert_eq!(c.conflicting().len(), 4);
         let retirable: Vec<&Path> = c.retirable().iter().map(|c| c.path.as_path()).collect();
         assert_eq!(retirable, vec![adhoc.as_path(), unsigned.as_path()]);
-        // Every surface lists the same rule; without the trash tool an offered copy says so.
         use TrashOffer::{Linked, NoTool, Offered, Requirement, RunningUnstable, Signature};
         let offers = |trash_tool| -> Vec<TrashOffer> {
             c.listed(trash_tool)
@@ -6648,11 +5463,9 @@ mod tests {
                 .map(|(_, offer)| offer)
                 .collect()
         };
-        // adhoc, pinned, unread, unsigned.
         assert_eq!(offers(true), [Offered, Signature, Signature, Offered]);
         assert_eq!(offers(false), [NoTool, Signature, Signature, NoTool]);
 
-        // The rule for one copy, as a table: (signing, class, links, running copy stable).
         let none: &[&str] = &[];
         for (signing, dr, links, stable, want) in [
             ("adhoc", DrClass::Cdhash, none, true, Offered),
@@ -6688,9 +5501,6 @@ mod tests {
             );
         }
 
-        // The running copy is the one reference: it never conflicts with itself, even unread;
-        // a copy with its requirement does not conflict; with no running copy nothing does;
-        // and only its own requirement says whether its grant survives updates.
         let claimant = |name: &str, dr_text: &str, running: bool| Claimant {
             path: PathBuf::from("/A").join(name),
             dr: classify_dr(dr_text),
@@ -6741,7 +5551,6 @@ mod tests {
         );
     }
 
-    /// Every other copy stays with its reason, and nothing outside the plan is touched.
     #[test]
     fn only_a_shown_still_offered_idle_copy_is_moved_to_the_trash() {
         let dir = PathBuf::from("/A");
@@ -6825,9 +5634,6 @@ mod tests {
         );
     }
 
-    /// Whether through a link to the bundle, a `Contents` link, a plist link, or any link out
-    /// of the bundle. Every path here is resolved, so the resolved arm refuses; the spelled arm
-    /// is `the_spelled_protected_arm_refuses_on_its_own`.
     #[cfg(unix)]
     #[test]
     fn the_census_does_not_look_inside_a_protected_root() {
@@ -6845,7 +5651,6 @@ mod tests {
         std::fs::create_dir_all(&apps).unwrap();
         let protected = vec![documents.clone()];
 
-        // As spelled: the path is under the root with no link involved.
         assert!(!census_may_read(&hidden, &protected));
         assert_eq!(
             list_unless_protected(&documents, &protected),
@@ -6857,7 +5662,6 @@ mod tests {
             Listing::Entries(_)
         ));
 
-        // Resolved: the bundle is a link into the root.
         let link = apps.join("x.app");
         std::os::unix::fs::symlink(&hidden, &link).unwrap();
         assert!(is_under_protected_root(&hidden, &protected));
@@ -6868,7 +5672,6 @@ mod tests {
         assert!(!census_may_read(&link, &protected), "but once resolved");
         assert_eq!(read_candidate(&link, "x", &protected), Candidate::Hole);
 
-        // A real bundle directory whose `Contents` is a link into the root.
         let shell = apps.join("y.app");
         std::fs::create_dir_all(&shell).unwrap();
         std::os::unix::fs::symlink(hidden.join("Contents"), shell.join("Contents")).unwrap();
@@ -6879,7 +5682,6 @@ mod tests {
         assert_eq!(read_candidate(&shell, "x", &protected), Candidate::Hole);
         assert_eq!(bundle_identity(&shell, &protected), None);
 
-        // A real bundle whose executable is a link into the root.
         let exe_link = apps.join("z.app");
         std::fs::create_dir_all(exe_link.join("Contents/MacOS")).unwrap();
         std::fs::write(
@@ -6897,7 +5699,6 @@ mod tests {
         );
         assert_eq!(bundle_identity(&exe_link, &protected), None);
 
-        // A `_CodeSignature` file linking into the root: whatever `codesign` could open counts.
         let sig_link = apps.join("s.app");
         std::fs::create_dir_all(sig_link.join("Contents/_CodeSignature")).unwrap();
         std::fs::write(
@@ -6916,8 +5717,6 @@ mod tests {
             "the control: the same bundle without the link is vouched for"
         );
 
-        // A `Contents` linking out of the bundle, to a harmless folder: only the rule that
-        // `Contents` stays inside refuses it.
         let away = dir.join("away");
         std::fs::create_dir_all(&away).unwrap();
         std::fs::write(
@@ -6931,7 +5730,6 @@ mod tests {
         assert!(bundle_reaches_protected(&w, &protected));
         assert_eq!(read_candidate(&w, "x", &protected), Candidate::Hole);
         assert_eq!(bundle_identity(&w, &protected), None);
-        // A plist linking into the root is never read (it would have answered NotOurs).
         let other = apps.join("o.app");
         std::fs::create_dir_all(other.join("Contents")).unwrap();
         std::fs::write(
@@ -6946,28 +5744,22 @@ mod tests {
         .unwrap();
         assert_eq!(read_candidate(&other, "x", &protected), Candidate::Hole);
         assert_eq!(bundle_id_of(&other, &protected), None);
-        // A `Contents` linking into the root, with no plist to stop the read earlier.
         let bare = apps.join("b.app");
         std::fs::create_dir_all(&bare).unwrap();
         std::fs::create_dir_all(documents.join("no-plist")).unwrap();
         std::os::unix::fs::symlink(documents.join("no-plist"), bare.join("Contents")).unwrap();
         assert!(bundle_reaches_protected(&bare, &protected));
         assert_eq!(bundle_identity(&bare, &protected), None);
-        // A bundle linking into the root, with no plist there to refuse it by.
         let into = apps.join("n.app");
         std::os::unix::fs::symlink(documents.join("no-plist"), &into).unwrap();
         assert_eq!(read_candidate(&into, "x", &protected), Candidate::Hole);
-        // A bundle linking into the root whose `Contents` links back out: its plist resolves
-        // outside, but the bundle does not.
         let q = documents.join("q.app");
         std::fs::create_dir_all(&q).unwrap();
         std::os::unix::fs::symlink(&away, q.join("Contents")).unwrap();
         let q_link = apps.join("q.app");
         std::os::unix::fs::symlink(&q, &q_link).unwrap();
         assert_eq!(bundle_id_of(&q_link, &protected), None);
-        // The walk refuses a bundle under the root on its own, before listing anything.
         assert!(bundle_reaches_protected(&hidden, &protected));
-        // A link inside the bundle (its own alias, even a loop) is fine and never followed.
         let cyc = apps.join("c.app");
         std::fs::create_dir_all(cyc.join("Contents/MacOS")).unwrap();
         std::fs::write(cyc.join("Contents/MacOS/aterm"), b"").unwrap();
@@ -6978,7 +5770,6 @@ mod tests {
             bundle_identity(&cyc, &protected).is_some(),
             "the control: vouched for, so read"
         );
-        // A protected root that is the plist's own path, spelled through a link to the folder.
         let alias = dir.join("apps-alias");
         std::os::unix::fs::symlink(&apps, &alias).unwrap();
         let spelled = alias.join("c.app");
@@ -6989,7 +5780,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Each refusal has a control differing in that one respect, which is vouched for.
     #[cfg(unix)]
     #[test]
     fn the_walk_stays_inside_the_bundles_own_contents() {
@@ -7010,7 +5800,6 @@ mod tests {
             std::fs::write(at.join("Contents/MacOS/x"), b"").unwrap();
         };
 
-        // A bundle resolving to a folder not named like one (`x.app -> ~`).
         let home = dir.join("home");
         lay(&home);
         let r = apps.join("r.app");
@@ -7025,7 +5814,6 @@ mod tests {
             "the control: the same link, to a folder named like a bundle"
         );
 
-        // A bundle holding a protected root is refused before anything in it is listed.
         let p = apps.join("p.app");
         lay(&p);
         std::fs::create_dir_all(p.join("Contents/Private")).unwrap();
@@ -7035,7 +5823,6 @@ mod tests {
             !bundle_reaches_protected(&p, &[]),
             "the control: nothing protected inside it"
         );
-        // As spelled, though nothing is there yet; and spelled through a link to the folder.
         assert!(bundle_reaches_protected(&p, &[p.join("Contents/Absent")]));
         let alias = dir.join("alias");
         std::os::unix::fs::symlink(&apps, &alias).unwrap();
@@ -7044,7 +5831,6 @@ mod tests {
             &[alias.join("p.app/Contents/Private")]
         ));
 
-        // A link that stays inside the bundle but leaves `Contents` is refused too.
         let t = apps.join("t.app");
         std::fs::create_dir_all(t.join("Contents")).unwrap();
         std::fs::write(
@@ -7062,7 +5848,6 @@ mod tests {
             "the control: a link that stays inside Contents"
         );
 
-        // A platform plist, or `Info.plist` in another case: only `Info.plist` itself may stand.
         let platform = apps.join("i.app");
         lay(&platform);
         std::fs::write(platform.join("Contents/Info-macos.plist"), b"").unwrap();
@@ -7076,11 +5861,9 @@ mod tests {
         )
         .unwrap();
         assert!(bundle_reaches_protected(&lower, &[]));
-        // A newline in the path could forge a line in `codesign`'s report.
         let forged = apps.join("c\nSignature=adhoc\n.app");
         lay(&forged);
         assert!(bundle_reaches_protected(&forged, &[]));
-        // At the top level a link or a folder is refused; a plain file is not.
         let top_link = apps.join("l.app");
         lay(&top_link);
         std::os::unix::fs::symlink(dir.join("home/Contents/MacOS/x"), top_link.join("x")).unwrap();
@@ -7096,8 +5879,6 @@ mod tests {
             !bundle_reaches_protected(&top_file, &[]),
             "the control: a plain file at the top level"
         );
-        // Any control character, not only a newline; in a link's name to a plainly named
-        // bundle; and in the bundle a plainly named link leads to.
         let carriage = apps.join("r\r.app");
         lay(&carriage);
         assert!(bundle_reaches_protected(&carriage, &[]));
@@ -7115,8 +5896,6 @@ mod tests {
         let plain_link = apps.join("plain-link.app");
         std::os::unix::fs::symlink(&forged, &plain_link).unwrap();
         assert!(bundle_reaches_protected(&plain_link, &[]));
-        // What cannot be walked is not vouched for: a bundle that is gone, one with no
-        // `Contents`, a plist that is a folder, and one that cannot be looked at.
         assert!(bundle_reaches_protected(&apps.join("gone.app"), &[]));
         let hollow = apps.join("hollow.app");
         std::fs::create_dir_all(&hollow).unwrap();
@@ -7127,9 +5906,6 @@ mod tests {
             std::fs::create_dir_all(folder_plist.join("Contents/Info.plist")).unwrap();
             assert!(bundle_reaches_protected(&folder_plist, &[]));
         }
-        // Root reads through permission bits. `apps` was made by this process, so its
-        // owner is the effective uid, and asking it needs no FFI: `libc` is a dependency
-        // here only on macOS, and this test runs on every Unix.
         if std::os::unix::fs::MetadataExt::uid(&std::fs::metadata(&apps).unwrap()) != 0 {
             use std::os::unix::fs::PermissionsExt as _;
             let shut = apps.join("shut.app");
@@ -7146,8 +5922,6 @@ mod tests {
                 refused,
                 "a listable Contents whose plist cannot be looked at"
             );
-            // Nor one whose top level cannot be listed, or with a folder inside that cannot be;
-            // opened again, each is vouched for.
             for (name, shut, bits) in [
                 ("sealed.app", ".", 0o100),
                 ("closed.app", "Contents/Resources", 0o000),
@@ -7166,9 +5940,6 @@ mod tests {
                 assert!(!bundle_reaches_protected(&app, &[]), "the control: {name}");
             }
         }
-        // Only at the top of `Contents` is a platform plist read, and only one named `Info…`:
-        // deeper, or by another name (`version.plist`), a plist is data, and so is an `Info…`
-        // file that is no plist.
         let nested = apps.join("nested.app");
         lay(&nested);
         std::fs::create_dir_all(nested.join("Contents/Resources")).unwrap();
@@ -7176,7 +5947,6 @@ mod tests {
         std::fs::write(nested.join("Contents/version.plist"), b"").unwrap();
         std::fs::write(nested.join("Contents/Info.txt"), b"").unwrap();
         assert!(!bundle_reaches_protected(&nested, &[]));
-        // Sixteen folders deep is walked; seventeen is past the bound.
         let deep = apps.join("deep.app");
         lay(&deep);
         let sixteen = (0..16).fold(deep.join("Contents"), |at, _| at.join("d"));
@@ -7184,8 +5954,6 @@ mod tests {
         assert!(!bundle_reaches_protected(&deep, &[]));
         std::fs::create_dir_all(sixteen.join("d")).unwrap();
         assert!(bundle_reaches_protected(&deep, &[]));
-        // The entry bound, made small: three entries are walked, and a fourth is past it at
-        // the top level and in `Contents` alike.
         let wide = apps.join("wide.app");
         std::fs::create_dir_all(wide.join("Contents")).unwrap();
         let full = apps.join("full.app");
@@ -7203,10 +5971,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The main executable is named, not linked, so a name that is a path is refused. The plist
-    /// is parsed by `CFBundle`'s reader: every spelling it accepts (an entity, CDATA, a spaced
-    /// tag, another encoding, old text, binary) reads as `codesign` reads it; an unparseable
-    /// plist names nothing, and a key in a comment is no key.
     #[cfg(target_os = "macos")]
     #[test]
     fn the_walk_reads_the_plist_as_codesign_does() {
@@ -7229,8 +5993,6 @@ mod tests {
         };
         let exe = |value: &str| format!("<key>CFBundleExecutable</key><string>{value}</string>");
         let abs = "<string>/Users//u/Documents/z</string>";
-        // Every name `plain_file_name` refuses is refused here; one stands for
-        // its table.
         assert!(refused("e1.app", &dict(&exe("/Users//u/Documents/z"))));
         assert!(refused(
             "e6.app",
@@ -7263,14 +6025,11 @@ mod tests {
             "e15.app",
             &dict(&format!("<key>NSExecutable</key>{abs}"))
         ));
-        // Past the length bound a name is not read, so not vouched for.
         assert!(refused("e18.app", &dict(&exe(&"a".repeat(2000)))));
-        // An over-long key is none `CFBundle` reads: its value is not judged.
         assert!(!refused(
             "e19.app",
             &dict(&format!("<key>{}Executable</key>{abs}", "x".repeat(200)))
         ));
-        // UTF-7 spells the key with no `<key` bytes, declared plainly or behind a UTF-8 decoy.
         let utf7 = "+ADw-key+AD4-CFBundleExecutable+ADw-/key+AD4-\
                     +ADw-string+AD4-/Users//u/Documents/z+ADw-/string+AD4-";
         for (app, declaration) in [
@@ -7289,8 +6048,6 @@ mod tests {
             "n.app",
             "{ CFBundleIdentifier = x; CFBundleExecutable = \"/Users//u/Documents/z\"; }"
         ));
-        // An unparseable plist (markup in a key, a `<string>` key, JSON) names no executable,
-        // so it is not refused for its name.
         for (app, plist) in [
             (
                 "e14.app",
@@ -7307,7 +6064,6 @@ mod tests {
         ] {
             assert!(!refused(app, &plist), "{app}");
         }
-        // The controls: a plain name, a key inside a comment, a plain name declared UTF-8.
         assert!(!refused("e10.app", &dict(&exe("x"))), "a plain name");
         assert!(
             !refused(
@@ -7340,7 +6096,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// One plain path component with no control character.
     #[test]
     fn only_plain_file_names_are_plain() {
         assert!(plain_file_name("aterm"));
@@ -7356,7 +6111,6 @@ mod tests {
         }
     }
 
-    /// Another program's binary plist is not ours (never a hole); one naming ours is ours.
     #[cfg(target_os = "macos")]
     #[test]
     fn a_binary_info_plist_answers_whose_bundle_it_is() {
@@ -7395,7 +6149,6 @@ mod tests {
             read_candidate(&ours, "x", &[]),
             Candidate::Ours(BundleIdentity { bundle_id: Some(ref id), .. }) if id == "x"
         ));
-        // `CFBundleIdentifier-macos` overrides the plain key, in both directions.
         let variant = |app: &str, plain: &str, macos: &str| {
             let at = dir.join(app);
             std::fs::create_dir_all(at.join("Contents/MacOS")).unwrap();
@@ -7417,7 +6170,6 @@ mod tests {
             read_candidate(&variant("v2.app", "x", "other"), "x", &[]),
             Candidate::NotOurs
         );
-        // An unusable `-macos` value still overrides the plain key: no identifier, not ours.
         let unusable = dir.join("v3.app");
         std::fs::create_dir_all(unusable.join("Contents/MacOS")).unwrap();
         std::fs::write(
@@ -7427,7 +6179,6 @@ mod tests {
         )
         .unwrap();
         assert_eq!(read_candidate(&unusable, "x", &[]), Candidate::NotOurs);
-        // A JSON `Info.plist` names no identifier to `CFBundle`.
         let json = dir.join("j.app");
         std::fs::create_dir_all(json.join("Contents/MacOS")).unwrap();
         std::fs::write(
@@ -7436,10 +6187,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(read_candidate(&json, "x", &[]), Candidate::NotOurs);
-        // `x`, a NUL and more is not `x`: a string not read whole is unread.
         let nul = binary("n.app", "x");
-        // `bplist00`, one dictionary: CFBundleIdentifier = "x\0junk" (an ASCII
-        // string object holding a NUL), then its offset table and trailer.
         let mut bplist = b"bplist00\xd1\x01\x02\x5f\x10\x12CFBundleIdentifier\x56x\0junk".to_vec();
         bplist.extend_from_slice(&[8, 11, 32, 0, 0, 0, 0, 0, 0, 1, 1]);
         bplist.extend_from_slice(&3u64.to_be_bytes());
@@ -7450,18 +6198,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A wait for something that must happen is a hang detector, never a latency
-    /// budget (AGENTS.md).
     #[cfg(target_os = "macos")]
     const HANG_DETECTOR: std::time::Duration = std::time::Duration::from_secs(60);
 
-    /// A grandchild holding the tool's stdout and stderr keeps both readers short of EOF; the
-    /// run gives up at its ceiling. The tool gets the [`HANG_DETECTOR`] to exit, and the
-    /// readers' first wait spends the ceiling (moves it to now), so the run must answer
-    /// `TimedOut` at the next poll, with the grandchild still holding the pipes. A wait that
-    /// ignored its ceiling reaches the second act, which lets the grandchild go, and reads
-    /// the run whole; a run that never waits on its readers is let go by the gate's hang
-    /// detector ([`gate_hang_detector`]) and reads the run whole too.
     #[cfg(target_os = "macos")]
     #[test]
     fn a_pipe_held_open_past_the_tool_cannot_outlast_the_ceiling() {
@@ -7486,15 +6225,12 @@ mod tests {
             TOOL_OUTPUT_MAX_BYTES,
         );
         let unrun = READERS_PENDING.with(|acts| acts.borrow_mut().drain(..).count());
-        // Let the grandchild the run gave up on go; refused once it is gone.
         let held = release_gate(&gate);
         assert_eq!(run, ToolRun::TimedOut);
         assert_eq!(unrun, 1, "the wait ended at the poll past its ceiling");
         assert!(held.is_ok(), "the grandchild held the pipes: {held:?}");
     }
 
-    /// The FDA probe's descriptor is close-on-exec from its open, so a child
-    /// spawned by another thread cannot carry a handle on `TCC.db` past exec.
     #[cfg(target_os = "macos")]
     #[test]
     fn the_fda_probe_descriptor_is_close_on_exec_from_its_open() {
@@ -7520,8 +6256,6 @@ mod tests {
         );
     }
 
-    /// What `aterm __tcc-open` prints reads back as the outcome it printed, and nothing else
-    /// reads as an answer.
     #[test]
     fn the_open_probe_child_line_reads_back_as_its_outcome() {
         for outcome in [
@@ -7564,8 +6298,6 @@ mod tests {
         }
     }
 
-    /// A child that cannot answer (no executable, one that does not exist, one that fails)
-    /// leaves the open to this process, so the probe still reads.
     #[cfg(target_os = "macos")]
     #[test]
     fn a_child_that_cannot_answer_leaves_the_open_to_this_process() {
@@ -7576,8 +6308,6 @@ mod tests {
         for exe in [None, Some(missing), Some(Path::new("/usr/bin/false"))] {
             assert_eq!(open_probe_in_child(exe, &path), ProbeOutcome::Ok, "{exe:?}");
         }
-        // A child's answer is taken only when it exits cleanly: the same line from a child
-        // that fails leaves the open to this process.
         let stand_in = |name: &str, code: u8| {
             use std::os::unix::fs::PermissionsExt as _;
             let exe = scratch.path().join(name);
@@ -7591,9 +6321,6 @@ mod tests {
             ProbeOutcome::Errno(13)
         );
         assert_eq!(open_probe_in_child(Some(&fails), &path), ProbeOutcome::Ok);
-        // A child that times out (tccd/syspolicyd unresponsive) must NOT fall back to opening
-        // the database inside the parent process, which would wedge the parent's thread in
-        // uninterruptible kernel open(2).
         let hangs = {
             use std::os::unix::fs::PermissionsExt as _;
             let exe = scratch.path().join("hangs");
@@ -7618,10 +6345,6 @@ mod tests {
         );
     }
 
-    /// A folder inside the bundle on another volume is refused unlisted: a scratch folder
-    /// stands in for a mounted volume, its device read as another's. The control is the
-    /// same bundle with every folder on the bundle's own volume. The same walk over a real
-    /// disk image mounted there runs in the explicit `dmg_acceptance` bench.
     #[cfg(unix)]
     #[test]
     fn the_walk_does_not_cross_into_another_volume() {
@@ -7657,7 +6380,6 @@ mod tests {
             ),
             "the control: every folder on the bundle's volume"
         );
-        // A bundle whose own volume cannot be read is refused, not walked.
         assert!(bundle_reaches_protected_on(
             &bundle,
             &[],
@@ -7666,8 +6388,6 @@ mod tests {
         ));
     }
 
-    /// A path under a protected root that does not exist yet (nothing to resolve) is refused as
-    /// spelled, and so is its listing.
     #[test]
     fn the_spelled_protected_arm_refuses_on_its_own() {
         let root = PathBuf::from("/nonexistent-aterm-census/Documents");
@@ -7689,8 +6409,6 @@ mod tests {
         );
     }
 
-    /// Only codesign's whole one-line "not signed" report is unsigned: the phrase
-    /// inside a path on a signed copy's report is not.
     #[test]
     fn unsigned_is_the_whole_report_not_a_phrase_in_it() {
         let planted = "Executable=/A/x: code object is not signed at all/x\n\
@@ -7701,7 +6419,6 @@ mod tests {
             identity_from_report(Some(planted), None).dr,
             DrClass::Unsigned
         );
-        // The phrase inside a signed copy's requirement clause is not unsigned.
         let quoted = "Identifier=x\nTeamIdentifier=T\n\
                       designated => identifier \"code object is not signed at all\" and \
                       anchor apple generic and certificate leaf[subject.OU] = \"T\"\n";
@@ -7712,8 +6429,6 @@ mod tests {
         );
     }
 
-    /// A required folder under a protected root is a hole, where a plain listing would call the
-    /// look complete.
     #[test]
     fn the_census_lists_through_the_protected_fence() {
         let dir = std::env::temp_dir()
@@ -7736,11 +6451,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The census fence includes `~/Library/Containers` and
-    /// `~/Library/Group Containers` (`app_data_roots`), so a bundle registered by
-    /// `LaunchServices` inside another app's container — or a symlink in
-    /// `/Applications` that resolves into one — is a hole, never read or handed
-    /// to `codesign`.
     #[test]
     fn the_census_never_reads_a_copy_inside_another_apps_container() {
         let scratch = aterm_tempfile::tempdir().expect("owned census scratch");
@@ -7774,8 +6484,6 @@ mod tests {
             Candidate::Hole,
             "a bundle under ~/Library/Group Containers must not be read"
         );
-        // Even when the container path does not exist on disk, the lexical arm of
-        // `census_may_read` refuses before `metadata` or `read_info_plist`.
         let absent_container = home.join("Library/Containers/com.apple.Notes/Data/aterm.app");
         assert_eq!(
             read_candidate(&absent_container, "dev.aterm", &protected),
@@ -7791,9 +6499,6 @@ mod tests {
                 Candidate::Hole,
                 "a symlink in ~/Applications resolving into ~/Library/Containers must not be read"
             );
-            // A symlinked `$HOME` (where `locate_candidate` canonicalizes the
-            // bundle to `real_home/...` while `home` is the symlink path) must
-            // fence both spellings.
             let link_home = scratch.path().canonicalize().unwrap().join("home-link");
             std::os::unix::fs::symlink(&home, &link_home).unwrap();
             let linked_fence = census_fence(Some(&link_home));
@@ -7803,7 +6508,6 @@ mod tests {
                 "canonical container path must be fenced even when HOME is a symlink"
             );
         }
-        // Control: a bundle in `~/Applications` is outside the fence and is read.
         assert!(
             matches!(
                 read_candidate(&normal_app, "dev.aterm", &protected),
@@ -7811,7 +6515,6 @@ mod tests {
             ),
             "control bundle in ~/Applications must still be read"
         );
-        // And `Folder::AppData.path` sits under `app_data_roots(home)[0]`.
         assert!(
             Folder::AppData
                 .path(&home)
@@ -7820,8 +6523,6 @@ mod tests {
         );
     }
 
-    /// The Trash is offered only among the rows the owner can see: a retirable
-    /// copy past the first MAX_CLAIMANT_ROWS conflicting ones is never offered.
     #[test]
     fn only_listed_copies_are_offered_for_the_trash() {
         let dir = PathBuf::from("/A");
@@ -7882,8 +6583,6 @@ mod tests {
         }
     }
 
-    /// The running bundle's parent is listed first and required; the
-    /// conventional folders follow, optional and de-duplicated.
     #[test]
     fn the_search_roots_start_where_this_process_runs_from() {
         let home = PathBuf::from("/Users//a");
@@ -7908,8 +6607,6 @@ mod tests {
         );
     }
 
-    /// Ours, another program's, no Info.plist, a plain `.app.zip` file and a missing path; a
-    /// bundle under a protected root is a hole.
     #[test]
     fn the_candidate_reader_tells_ours_from_not_a_bundle_from_a_hole() {
         let tmp = aterm_tempfile::tempdir().expect("tempdir");
@@ -7964,9 +6661,6 @@ mod tests {
             Listing::Unreadable,
             "a file is not a missing folder"
         );
-        // A plist that cannot be looked at (`Contents` is a file) or read (over the bound) is
-        // a hole; one that is a folder names nothing; an identifier in another case is another
-        // program's.
         let at = |name: &str| tmp.path().join(name);
         std::fs::create_dir_all(at("flat.app")).unwrap();
         std::fs::write(at("flat.app/Contents"), b"").unwrap();
@@ -7985,7 +6679,6 @@ mod tests {
         ] {
             assert_eq!(read_candidate(&at(name), "x", &[]), want, "{name}");
         }
-        // A link is located at its bundle only when it leads to a folder named like one.
         #[cfg(unix)]
         {
             std::fs::create_dir_all(at("plain-folder")).unwrap();
@@ -7996,9 +6689,6 @@ mod tests {
         }
     }
 
-    /// The exec path when bundled (a window an update renamed is judged as before), else the
-    /// kernel's image path when bundled (a launch through `~/.local/bin/aterm`), else the exec
-    /// path.
     #[test]
     fn the_fence_judges_the_bundled_image_behind_a_launch_symlink() {
         let exec = PathBuf::from("/Applications/aterm.app/Contents/MacOS/aterm");
@@ -8022,8 +6712,6 @@ mod tests {
             Some(exec.clone()),
             "both bundled: the exec path still wins"
         );
-        // The census's running copy is the kernel's: after the swap, the `.rollback` that
-        // runs; the exec path is read only when the kernel will not say.
         let never = || -> Option<PathBuf> { panic!("the kernel answered") };
         let (app, rollback) = (
             p("/Applications/aterm.app"),
@@ -8051,8 +6739,6 @@ mod tests {
         assert_eq!(fence_exe_from(None, &SelfImage::Unreadable), None);
     }
 
-    /// The image anchor as a table: every arm, classified from the kernel's
-    /// path, with the exec path consulted only once the image has none.
     #[test]
     fn the_image_anchor_names_every_way_the_code_can_go_missing() {
         let exec = Path::new("/Applications/aterm.app/Contents/MacOS/aterm");
@@ -8064,13 +6750,10 @@ mod tests {
             classify_image_anchor(Some(exec), &at(exec)),
             ImageAnchor::Live
         );
-        // The updater's swap: the frozen exec path still names a `.app`, the
-        // kernel's path does not.
         assert_eq!(
             classify_image_anchor(Some(exec), &at(rolled)),
             ImageAnchor::Displaced
         );
-        // Another valid `.app` (a retargeted launch symlink) is still live.
         let other = Path::new("/Applications/aterm-new.app/Contents/MacOS/aterm");
         assert_eq!(
             classify_image_anchor(Some(exec), &at(other)),
@@ -8081,7 +6764,6 @@ mod tests {
             ImageAnchor::NotBundled
         );
 
-        // No path left: deleted only if this was ever a bundled image.
         assert_eq!(
             classify_image_anchor(Some(exec), &SelfImage::NoPath),
             ImageAnchor::Deleted
@@ -8094,7 +6776,6 @@ mod tests {
             classify_image_anchor(None, &SelfImage::NoPath),
             ImageAnchor::Unknown
         );
-        // A failed lookup (EPERM under a sandbox) says nothing about the bundle.
         assert_eq!(
             classify_image_anchor(Some(exec), &SelfImage::Unreadable),
             ImageAnchor::Unknown
@@ -8111,7 +6792,6 @@ mod tests {
         }
     }
 
-    /// The injected syscall panics, so a guard moved below the syscall fails loudly.
     #[test]
     fn probe_refuses_out_of_bundle_without_touching_the_os() {
         let deps = p("/Users//a/aterm/target/debug/deps/aterm_containment-abc123");
@@ -8165,7 +6845,6 @@ mod tests {
             ProbeLabel::RefusedBadPath,
             "a home no C API can take"
         );
-        // Every refusal is Unknown — never Denied.
         for gate in [off, no_check] {
             assert_eq!(
                 probe_fda_with(gate, Some(&bundled), Some(&home), boom).state,
@@ -8174,7 +6853,6 @@ mod tests {
         }
     }
 
-    /// A `uuid_t` reads as `gethostuuid`'s callers and `ioreg` spell it.
     #[test]
     fn a_host_uuid_is_spelled_8_4_4_4_12() {
         let id = [
@@ -8184,7 +6862,6 @@ mod tests {
         assert_eq!(format_uuid(&id), "12345678-9ABC-DEF0-0123-456789ABCDEF");
     }
 
-    /// macOS 26 and earlier keep a user store: it answers, and nothing else is opened.
     #[test]
     fn probe_opens_only_the_user_store_when_it_answers() {
         let bundled = p("/Applications/aterm.app/Contents/MacOS/aterm");
@@ -8205,8 +6882,6 @@ mod tests {
         }
     }
 
-    /// macOS 27 keeps no user store, so its absence must not end the probe at `unknown`: the
-    /// system store answers, `EPERM` without the grant (measured on macOS 27.0.1).
     #[test]
     fn probe_falls_back_to_the_system_store_when_the_user_store_is_absent() {
         let bundled = p("/Applications/aterm.app/Contents/MacOS/aterm");
@@ -8248,7 +6923,6 @@ mod tests {
                 FdaState::Denied,
                 ProbeLabel::OpenEperm,
             ),
-            // EACCES is not a TCC denial.
             (
                 ProbeOutcome::Errno(13),
                 FdaState::Unknown,
@@ -8262,11 +6936,6 @@ mod tests {
         }
     }
 
-    // -- responsibility ------------------------------------------------------
-
-    /// One resolution per slice, however many pids it asks about, and each pid's answer in
-    /// its place. The negative control is an absent symbol: every pid reads
-    /// `SymbolUnavailable` and nothing is asked. An empty slice resolves nothing.
     #[test]
     fn responsible_pids_detailed_resolves_once() {
         let resolutions = std::cell::Cell::new(0_usize);
@@ -8343,12 +7012,9 @@ mod tests {
         );
         assert_eq!(classify_responsible(me, Ok(me)), Responsible::SelfProcess);
         assert_eq!(classify_responsible(me, Ok(4402)), Responsible::Other(4402));
-        // A zero or negative "success" identifies nothing.
         assert_eq!(classify_responsible(me, Ok(0)), Responsible::Unknown);
         assert_eq!(classify_responsible(me, Ok(-1)), Responsible::Unknown);
     }
-
-    // -- responsible_app's Info.plist guard ----------------------------------
 
     #[test]
     fn info_plist_under_a_protected_root_is_refused_and_falls_back_to_the_basename() {
@@ -8359,19 +7025,16 @@ mod tests {
             "PRIVATE_SUBDIRS must supply ~/Documents"
         );
 
-        // An app inside ~/Documents: reading its Info.plist would raise the dialog.
         let evil = p("/Users//a/Documents/Sketchy.app/Contents/MacOS/Sketchy");
         assert_eq!(readable_info_plist(&evil, &protected), None);
         assert_eq!(display_name(&evil, None), "Sketchy");
 
-        // An app outside every protected root is fine to read.
         let ok = p("/Applications/iTerm.app/Contents/MacOS/iTerm2");
         assert_eq!(
             readable_info_plist(&ok, &protected),
             Some(p("/Applications/iTerm.app/Contents/Info.plist"))
         );
 
-        // A non-bundle executable has no Info.plist to read at all.
         assert_eq!(readable_info_plist(Path::new("/bin/zsh"), &protected), None);
         assert_eq!(display_name(Path::new("/bin/zsh"), None), "zsh");
     }
@@ -8391,15 +7054,11 @@ mod tests {
         let neither = "<plist><dict><key>CFBundleIdentifier</key><string>com.aterm.aterm</string></dict></plist>";
         assert_eq!(display_name(&exe, Some(neither)), "aterm");
 
-        // An empty value is not a name.
         let empty = "<plist><dict><key>CFBundleDisplayName</key><string></string></dict></plist>";
         assert_eq!(display_name(&exe, Some(empty)), "aterm");
-        // A key whose value is not a string is not mis-bound: the lookup falls through.
         let wrong = "<plist><dict><key>CFBundleDisplayName</key><true/><key>CFBundleName</key><string>ok</string></dict></plist>";
         assert_eq!(display_name(&exe, Some(wrong)), "ok");
     }
-
-    // -- designated requirement ---------------------------------------------
 
     #[test]
     fn dr_classification_is_a_table() {
@@ -8420,7 +7079,6 @@ mod tests {
                 DrClass::Cdhash,
             ),
             ("cdhash H\"abc\" or cdhash H\"def\"", DrClass::Cdhash),
-            // A cdhash pin invalidates the next build whatever else it says.
             (
                 "identifier \"com.aterm.aterm\" and cdhash H\"abc\"",
                 DrClass::Cdhash,
@@ -8429,19 +7087,16 @@ mod tests {
             ("", DrClass::Unknown),
             ("anchor apple", DrClass::Unknown),
             ("identifier \"com.aterm.aterm\"", DrClass::Unknown),
-            // A Developer ID copy named for a cdhash is still stable.
             (
                 "identifier \"com.cdhash.x\" and anchor apple generic and \
                  certificate leaf[subject.OU] = \"CDHASH\"",
                 DrClass::Identity,
             ),
-            // A quoted string is the author's data: a clause's shape inside one is neither rule.
             (
                 "identifier \"x cdhash H\" and anchor apple generic",
                 DrClass::Identity,
             ),
             ("identifier \"anchor apple\"", DrClass::Unknown),
-            // `cdhash` inside a bare word is not the clause (the word alone, then a hash).
             (
                 "designated => identifier mycdhash and anchor apple generic and \
                  certificate leaf[subject.OU] = A66A9P66Z7",
@@ -8449,20 +7104,16 @@ mod tests {
             ),
             ("identifier cdhash", DrClass::Unknown),
             ("(cdhash H\"abc\")", DrClass::Cdhash),
-            // An escaped quote does not close the string, so the anchor clause is inside it.
             (
                 "identifier \"a\\\" and anchor apple generic\"",
                 DrClass::Unknown,
             ),
-            // A string does not cross a line: an earlier stray quote cannot swallow the clause.
             (
                 "Executable=/A/we\"ird\ndesignated => cdhash H\"aa\"",
                 DrClass::Cdhash,
             ),
-            // Either phrasing of an unsigned report.
             ("x: not signed at all", DrClass::Unsigned),
             ("code object is not signed", DrClass::Unsigned),
-            // An identifier clause written without a space; each anchor spelling alone.
             (
                 "identifier\"x\" and anchor apple generic",
                 DrClass::Identity,
@@ -8475,14 +7126,12 @@ mod tests {
                 "identifier \"x\" and certificate 1[subject.OU] = \"T\"",
                 DrClass::Identity,
             ),
-            // `cdhash` ending a bare word joined by a letter or punctuation is no clause.
             ("identifier xcdhash H\"ab\"", DrClass::Unknown),
             ("identifier my_cdhash H\"ab\"", DrClass::Unknown),
         ];
         for (input, want) in cases {
             assert_eq!(classify_dr(input), want, "classifying {input:?}");
         }
-        // Only an identity requirement keeps a grant across builds.
         for (class, stable) in [
             (DrClass::Identity, true),
             (DrClass::Cdhash, false),
@@ -8493,10 +7142,6 @@ mod tests {
         }
     }
 
-    // -- protected roots -----------------------------------------------------
-
-    /// Containment and consent cannot disagree: with no override the consent
-    /// roots are the sandbox's private subdirectories, in its order.
     #[test]
     fn empty_overrides_resolve_to_private_subdirs() {
         let home = p("/Users//a");
@@ -8513,8 +7158,6 @@ mod tests {
     #[test]
     fn overrides_replace_the_default_and_are_expanded() {
         let home = p("/Users//a");
-        // An absolute override in this platform's spelling: `/Volumes` names no
-        // drive, so Windows reads it as relative and refuses it.
         let volumes = if cfg!(windows) {
             "C:/Volumes"
         } else {
@@ -8525,7 +7168,6 @@ mod tests {
             String::from(volumes),
             String::from("~"),
             String::from("  ~/Library/CloudStorage  "),
-            // Neither absolute nor ~-prefixed: refused rather than guessed at.
             String::from("relative/path"),
             String::new(),
         ];
@@ -8539,14 +7181,10 @@ mod tests {
                 p("/Users//a/Library/CloudStorage"),
             ]
         );
-        // With no home there is no default, and a `~` override is dropped.
         assert!(protected_roots_in(None, &[]).is_empty());
         assert_eq!(protected_roots_in(None, &overrides), vec![p(volumes)]);
     }
 
-    /// The prompting set is the sandbox's private set plus what it omits, and an override
-    /// widens it but never narrows it: dropping `~/Documents` from `[privacy]` does not stop
-    /// macOS from prompting on it.
     #[test]
     fn tcc_prompting_roots_hold_the_private_set_and_what_it_omits() {
         let home = p("/Users//a");
@@ -8589,7 +7227,6 @@ mod tests {
             Path::new("/Users//a/Documents/x/y.app"),
             &roots
         ));
-        // A sibling whose name merely starts with the root's name is not under it.
         assert!(!is_under_protected_root(
             Path::new("/Users//a/DocumentsOld/x"),
             &roots
@@ -8597,8 +7234,6 @@ mod tests {
         assert!(!is_under_protected_root(Path::new("/Users//a"), &roots));
         assert!(!is_under_protected_root(Path::new("/Applications"), &[]));
     }
-
-    // -- folders -------------------------------------------------------------
 
     #[test]
     fn folder_names_services_and_paths() {
@@ -8633,13 +7268,10 @@ mod tests {
             assert_eq!(folder.as_str(), name);
             assert_eq!(folder.tcc_service(), service);
             assert_eq!(folder.path(&home), p(path));
-            // Only the app-data container may be missing because it never existed.
             assert_eq!(folder.absent_means_allowed(), folder == Folder::AppData);
             assert_eq!(Folder::parse(name), Some(folder));
             assert_eq!(Folder::parse(&name.to_uppercase()), Some(folder));
         }
-        // The app-data item answers to the spellings a hand-written config
-        // might use, and to nothing else.
         for spelling in ["app_data", "appdata", " App_Data "] {
             assert_eq!(
                 Folder::parse(spelling),
@@ -8670,8 +7302,6 @@ mod tests {
         assert!(folder_paths_in(None, &names).is_empty());
     }
 
-    // -- denied-state repair (§3.7) ------------------------------------------
-
     #[test]
     fn tccutil_presence_is_a_table_and_only_executable_may_run() {
         let (run, notx, gone) = (
@@ -8683,7 +7313,6 @@ mod tests {
             (true, true, run, true),
             (true, false, notx, false),
             (false, false, gone, false),
-            // Anything but a regular file at the path is no tool there.
             (false, true, gone, false),
         ];
         for (is_file, executable, want, can_run) in cases {
@@ -8691,7 +7320,6 @@ mod tests {
             assert_eq!(got, want, "is_file={is_file} executable={executable}");
             assert_eq!(got.can_run(), can_run);
         }
-        // The default fails toward "do not offer a destructive button".
         assert_eq!(TccutilPresence::default(), TccutilPresence::Unknown);
         assert!(!TccutilPresence::Unknown.can_run());
     }
@@ -8708,8 +7336,6 @@ mod tests {
 
     #[test]
     fn the_reset_command_can_never_take_the_every_app_form() {
-        // Four arguments, always, the subject last: never the every-app form.
-        // An unusable id mints no subject at all, so no argv can name it.
         for bad in ["", "   ", "-not-a-flag"] {
             assert!(ResetSubject::from_usable(bad).is_none(), "{bad:?}");
         }
@@ -8724,8 +7350,6 @@ mod tests {
         }
     }
 
-    /// The subject is read from a bundle's `Info.plist`, trimmed once; a
-    /// plist naming no usable identifier mints none.
     #[test]
     fn a_reset_subject_is_read_from_a_bundles_plist() {
         let scratch = aterm_tempfile::tempdir().expect("subject scratch");
@@ -8744,9 +7368,6 @@ mod tests {
         assert_eq!(ResetSubject::read(&root, &[]), None);
     }
 
-    /// A plan is one command per distinct folder, in plan order — no retry and
-    /// no loop: a folder listed twice is still one command — every one naming
-    /// the same trimmed subject. No folder is no plan.
     #[test]
     fn a_plan_is_one_command_per_distinct_folder_from_one_subject() {
         let subject = ResetSubject::from_usable(" a.b.c ").expect("usable");
@@ -8802,30 +7423,20 @@ mod tests {
         let subject = ResetSubject::from_usable("a.b.c").expect("usable");
         let id = Some(&subject);
         let cases = [
-            // A stable identity, a runnable tool and a known subject: offer.
             (DrClass::Identity, run, id, ResetOffer::Offer),
-            // Not observed unstable: still offered, promising nothing about a later grant.
             (DrClass::Unknown, run, id, ResetOffer::Offer),
-            // §3.7's named case: the grant died with the last build.
             (DrClass::Cdhash, run, id, ResetOffer::ExplainRebuild),
-            // §3.1 says the same of an ad-hoc bundle in its own words.
             (DrClass::Unsigned, run, id, ResetOffer::ExplainRebuild),
-            // The rebuild explanation outranks the tool and subject checks.
             (DrClass::Cdhash, gone, id, ResetOffer::ExplainRebuild),
             (DrClass::Cdhash, run, None, ResetOffer::ExplainRebuild),
-            // No runnable tool, no button at all.
             (DrClass::Identity, gone, id, ResetOffer::HideNoTool),
             (DrClass::Identity, notx, id, ResetOffer::HideNoTool),
             (DrClass::Identity, unk, id, ResetOffer::HideNoTool),
-            // No subject, no button — and never a fallback literal. An
-            // unusable id mints no subject (`ResetSubject::read`), so it
-            // arrives here as the same `None`.
             (DrClass::Identity, run, None, ResetOffer::HideNoBundleId),
         ];
         for (dr, tool, bundle, want) in cases {
             let got = reset_offer(offer_inputs(dr, tool, bundle));
             assert_eq!(got, want, "dr={dr:?} tool={tool:?} bundle={bundle:?}");
-            // "The button is hidden" and "no argv exists" are the same fact.
             let offered = want == ResetOffer::Offer;
             assert_eq!(got.shows_button(), offered);
             assert_eq!(
@@ -8834,7 +7445,6 @@ mod tests {
                 "dr={dr:?} tool={tool:?} bundle={bundle:?}"
             );
         }
-        // The all-unknown default never offers a destructive action.
         assert_eq!(
             reset_offer(ResetOfferInputs::default()),
             ResetOffer::HideNoTool
@@ -8848,7 +7458,6 @@ mod tests {
             ResetStatus::from_exit_status(Some(64)),
             ResetStatus::Declined { code: Some(64) }
         );
-        // Killed by a signal: a decline with no code, never a success.
         assert_eq!(
             ResetStatus::from_exit_status(None),
             ResetStatus::Declined { code: None }
@@ -8861,7 +7470,6 @@ mod tests {
         let bad = |f: Folder, c: i32| ResetAttempt::from_exit_status(f, Some(c));
         let gone = ResetAttempt::tool_absent;
         let cases: [(&[ResetAttempt], ResetOutcome); 7] = [
-            // all ok
             (
                 &[
                     ok(Folder::Documents),
@@ -8870,7 +7478,6 @@ mod tests {
                 ],
                 ResetOutcome::AllReset,
             ),
-            // one nonzero
             (
                 &[
                     ok(Folder::Documents),
@@ -8879,7 +7486,6 @@ mod tests {
                 ],
                 ResetOutcome::Partial,
             ),
-            // all nonzero
             (
                 &[
                     bad(Folder::Documents, 1),
@@ -8888,7 +7494,6 @@ mod tests {
                 ],
                 ResetOutcome::NoneReset,
             ),
-            // tccutil absent — a property of the machine, not of a folder
             (
                 &[
                     gone(Folder::Documents),
@@ -8897,17 +7502,14 @@ mod tests {
                 ],
                 ResetOutcome::ToolAbsent,
             ),
-            // the tool vanished after one folder had already been reset
             (
                 &[ok(Folder::Documents), gone(Folder::Desktop)],
                 ResetOutcome::Partial,
             ),
-            // nothing ran, and not because the tool is missing
             (
                 &[bad(Folder::Documents, 1), gone(Folder::Desktop)],
                 ResetOutcome::NoneReset,
             ),
-            // nothing to do is not a success
             (&[], ResetOutcome::NotAttempted),
         ];
         for (attempts, want) in cases {
@@ -8915,9 +7517,6 @@ mod tests {
         }
     }
 
-    /// The warm-up follows only what actually reset; each folder macOS
-    /// declined is named with its status; an absent tool asked nothing, so
-    /// nothing was declined.
     #[test]
     fn only_a_reset_folder_is_warmed_and_only_an_asked_one_declined() {
         let attempts = [
@@ -8933,8 +7532,6 @@ mod tests {
         );
     }
 
-    // -- the posture join ----------------------------------------------------
-
     fn inputs(adoption: Attribution, fda: FdaState) -> PostureInputs {
         PostureInputs {
             adoption,
@@ -8945,8 +7542,6 @@ mod tests {
 
     #[test]
     fn posture_join_is_a_table_under_todays_evidence() {
-        // Coverage is measured in neither the zero state nor what production
-        // passes: never `covered`, and a prompt is always possible.
         let cases = [
             (Attribution::Live, FdaState::Granted),
             (Attribution::Live, FdaState::Denied),
@@ -8982,13 +7577,11 @@ mod tests {
 
     #[test]
     fn an_observed_eperm_is_the_only_route_to_denied() {
-        // The observation alone decides; the FDA state does not matter.
         for fda in [FdaState::Granted, FdaState::Denied, FdaState::Unknown] {
             let mut i = inputs(Attribution::Live, fda);
             i.observed_eperm = true;
             assert_eq!(ConsentPosture::join(i).fs_consent, FsConsent::Denied);
         }
-        // And a denied FDA state alone is not a session denial.
         assert_eq!(
             ConsentPosture::join(inputs(Attribution::Live, FdaState::Denied)).fs_consent,
             FsConsent::Unknown
@@ -9007,7 +7600,6 @@ mod tests {
             "design §3.9 pt3: adopted reports unknown, never denied, until S2"
         );
 
-        // With S2 measured, the observation is reportable.
         i.evidence.handoff_attribution_measured = true;
         assert_eq!(ConsentPosture::join(i).fs_consent, FsConsent::Denied);
     }
@@ -9030,7 +7622,6 @@ mod tests {
             "carried from the evidence"
         );
 
-        // Drop any one of the three legs and it is Unknown again.
         let mut not_live = i;
         not_live.adoption = Attribution::Unknown;
         assert_eq!(
@@ -9056,7 +7647,6 @@ mod tests {
 
     #[test]
     fn attribution_comes_from_the_adoption_record_not_the_spi() {
-        // The SPI can say anything, including nothing at all; the record wins.
         for corroboration in [
             Responsible::Unknown,
             Responsible::SelfProcess,
@@ -9080,11 +7670,6 @@ mod tests {
         }
     }
 
-    // -- the wire ------------------------------------------------------------
-
-    /// The wire tokens, pinned: they are the `privacy` row's and `aterm
-    /// doctor`'s schema, read by agents. A `refused` label means no syscall or
-    /// spawn ran; and every default is the not-observed answer, never a verdict.
     #[test]
     fn the_wire_tokens_are_the_documented_spellings() {
         let tokens = [
@@ -9222,14 +7807,8 @@ mod tests {
         assert_eq!(unobserved, [true; 9], "a default that is a verdict");
     }
 
-    // Debugger access (developer mode)
-
-    /// Each argv carries its flag (`-enable` spelled out) on an absolute path.
     #[test]
     fn the_change_builders_always_carry_their_flags() {
-        // Rooted: never a bare name resolved through PATH. `has_root`, not
-        // `is_absolute`: the macOS tool's path names no drive, so Windows calls it
-        // root-relative; on unix the two are the same test.
         assert!(
             Path::new(DEVTOOLSSECURITY_PATH).has_root(),
             "never resolved through PATH"
@@ -9240,10 +7819,7 @@ mod tests {
         );
         let disable = DebuggerChange::Off.command();
         assert_eq!(disable, [DEVTOOLSSECURITY_PATH, "-disable"]);
-        // The revert line a human reads is the argv `Off` runs.
         assert_eq!(DEBUGGER_ACCESS_REVERT, disable.join(" "));
-        // `-enable` runs only over a rule read as disabled, `-disable` only
-        // over one read as enabled: never over one Apple's tool cannot read.
         assert_eq!(DebuggerChange::On.precondition(), DebuggerMode::Disabled);
         assert_eq!(DebuggerChange::Off.precondition(), DebuggerMode::Enabled);
         assert_eq!(DebuggerChange::On.target(), DebuggerMode::Enabled);
@@ -9262,7 +7838,6 @@ mod tests {
         }
     }
 
-    /// Over its precondition it spawns exactly its own argv. Nothing here starts a process.
     #[test]
     fn a_change_spawns_only_over_a_fresh_read_of_its_precondition() {
         let never_spawn = |argv: &[&str]| -> DevtoolsChangeRun {
@@ -9285,8 +7860,6 @@ mod tests {
                     "{change:?} over {mode:?}"
                 );
             }
-            // A refused re-read (a closed gate, a binary outside a `.app`)
-            // is no precondition either.
             for label in [
                 DebuggerProbeLabel::RefusedDisabled,
                 DebuggerProbeLabel::RefusedOutOfBundle,
@@ -9318,8 +7891,6 @@ mod tests {
         }
     }
 
-    /// Against a `/bin/sh` stand-in: the exit code, a 4 KiB head of each stream, stdin closed,
-    /// and `on_spawn` told the live pid before the wait.
     #[cfg(unix)]
     #[test]
     fn the_change_runner_keeps_the_exit_and_a_head_of_each_stream() {
@@ -9328,8 +7899,6 @@ mod tests {
             &[
                 "/bin/sh",
                 "-c",
-                // Reads stdin (it must be /dev/null: `wc -c` says 0), writes
-                // 10 000 bytes to stdout and a line to stderr, exits 3.
                 "printf 'in=%s\\n' \"$(wc -c | tr -d ' ')\"; \
                  i=0; while [ $i -lt 100 ]; do printf '%0100d' 0; i=$((i+1)); done; \
                  echo nope >&2; exit 3",
@@ -9355,12 +7924,6 @@ mod tests {
         assert_eq!(stderr_head, "nope\n");
     }
 
-    /// A reader still running when the change exits is waited for past the first grace poll:
-    /// what a grandchild holding the change's stdout writes after the exit is in the head.
-    /// The grandchild waits on a gate the second poll releases, and that poll holds the loop
-    /// until both readers are done (a hang detector, not a budget), so no clock decides it.
-    /// A run that joins its readers without the grace wait is let go by the gate's hang
-    /// detector ([`gate_hang_detector`]), and its head says so.
     #[cfg(target_os = "macos")]
     #[test]
     fn a_change_reader_that_lags_the_exit_still_reaches_the_head() {
@@ -9392,7 +7955,6 @@ mod tests {
             ],
             |_| {},
         );
-        // Let a grandchild the grace gave up on go too; once it is gone this is refused.
         let _ = release_gate(&gate);
         assert_eq!(
             run,
@@ -9404,13 +7966,6 @@ mod tests {
         );
     }
 
-    /// A reader still running when the grace runs out is left detached, its head empty:
-    /// the grandchild holds both pipes past the grace, and the first poll spends the rest of
-    /// it (the count moves to the last poll), so no clock decides it. The grandchild is let
-    /// go only once the run has returned, and still held the gate then. A wait that ignored
-    /// the grace's end would hold the run until the gate's hang detector let the grandchild
-    /// go, and read a head saying so; one that ran a poll past the last (a `<=`, a longer
-    /// grace) takes the act the first poll arms for the poll after the last.
     #[cfg(target_os = "macos")]
     #[test]
     fn a_change_reader_still_running_past_the_grace_leaves_an_empty_head() {
@@ -9438,7 +7993,6 @@ mod tests {
             |_| {},
         );
         let armed = GRACE_POLL.with(|slot| slot.borrow_mut().take().map(|(at, _)| at));
-        // Let the grandchild the grace gave up on go; refused once it is gone.
         let held = release_gate(&gate);
         assert_eq!(
             armed,
@@ -9460,7 +8014,6 @@ mod tests {
         );
     }
 
-    /// A missing program is `Absent` and never calls `on_spawn`.
     #[cfg(unix)]
     #[test]
     fn the_change_runner_names_a_missing_program() {
@@ -9489,7 +8042,6 @@ mod tests {
         );
     }
 
-    /// A record with no birth is never proven running; a mismatched birth is another process.
     #[test]
     fn a_recorded_child_runs_only_while_its_birth_matches() {
         let me = std::process::id();
@@ -9507,7 +8059,6 @@ mod tests {
             "no birth matches no birth: a pid the kernel will not describe is not running"
         );
         let Some(birth) = process_birth(me) else {
-            // Off macOS there is no birth record: nothing is ever proven.
             assert!(!cfg!(target_os = "macos"), "our own pid has a birth record");
             return;
         };
@@ -9541,9 +8092,6 @@ mod tests {
         }
     }
 
-    /// The `disabled` line is captured live; the `enabled` and unknown-state lines come from the
-    /// binary's format strings, so each adverb it carries (`currently`, `already`, `now`, or
-    /// none) matches, and nothing else.
     #[test]
     fn the_status_classifier_reads_only_what_the_tool_says() {
         use DebuggerMode as M;
@@ -9551,12 +8099,10 @@ mod tests {
         let ok = L::StatusOk;
         let no = (M::Unknown, L::StatusUnrecognized);
         let cases: &[(ToolRun, (DebuggerMode, DebuggerProbeLabel))] = &[
-            // Captured live (§1.1): rc 0.
             (
                 exited(Some(0), "Developer mode is currently disabled.\n", ""),
                 (M::Disabled, ok),
             ),
-            // Derived by symmetry from the same format string.
             (
                 exited(Some(0), "Developer mode is currently enabled.\n", ""),
                 (M::Enabled, ok),
@@ -9569,7 +8115,6 @@ mod tests {
                 exited(Some(0), "Developer mode is enabled.", ""),
                 (M::Enabled, ok),
             ),
-            // `now`, the third adverb the binary carries (after a write).
             (
                 exited(Some(0), "Developer mode is now enabled.\n", ""),
                 (M::Enabled, ok),
@@ -9578,12 +8123,10 @@ mod tests {
                 exited(Some(0), "  Developer mode is currently disabled.\r\n", ""),
                 (M::Disabled, ok),
             ),
-            // Which stream carries the line is not part of the contract.
             (
                 exited(Some(0), "", "Developer mode is currently disabled.\n"),
                 (M::Disabled, ok),
             ),
-            // `-verbose`-style preamble lines are ignored.
             (
                 exited(
                     Some(0),
@@ -9593,7 +8136,6 @@ mod tests {
                 ),
                 (M::Enabled, ok),
             ),
-            // The unknown state is a recognised answer, whatever the code.
             (
                 exited(
                     Some(0),
@@ -9610,7 +8152,6 @@ mod tests {
                 ),
                 (M::Unrecognized, ok),
             ),
-            // enabled/disabled with a code nobody measured: no claim.
             (
                 exited(Some(1), "Developer mode is currently disabled.\n", ""),
                 no,
@@ -9619,7 +8160,6 @@ mod tests {
                 exited(None, "Developer mode is currently enabled.\n", ""),
                 no,
             ),
-            // Nothing recognisable is never `disabled`.
             (exited(Some(0), "", ""), no),
             (
                 exited(
@@ -9654,7 +8194,6 @@ mod tests {
                 exited(Some(0), "Developer mode is currently disenabled.\n", ""),
                 no,
             ),
-            // Two answers that disagree are no answer.
             (
                 exited(
                     Some(0),
@@ -9663,7 +8202,6 @@ mod tests {
                 ),
                 no,
             ),
-            // A run that did not exit keeps its failure.
             (ToolRun::Absent, (M::Unknown, L::ToolAbsent)),
             (ToolRun::SpawnFailed, (M::Unknown, L::SpawnFailed)),
             (ToolRun::TimedOut, (M::Unknown, L::TimedOut)),
@@ -9672,7 +8210,6 @@ mod tests {
         for (run, want) in cases {
             assert_eq!(classify_devtools_status(run), *want, "{run:?}");
         }
-        // The same line repeated is one answer, not a conflict.
         assert_eq!(
             classify_devtools_status(&exited(
                 Some(0),
@@ -9683,8 +8220,6 @@ mod tests {
         );
     }
 
-    /// Membership folds in rule order: `admin` first, and an unanswered
-    /// `admin` is unknown, because every admin is also a `_developer`.
     #[test]
     fn membership_names_the_first_rule_that_matches() {
         use DebuggerMember as D;
@@ -9708,9 +8243,6 @@ mod tests {
         }
     }
 
-    /// Hardened means the runtime flag without `get-task-allow`. The flags are
-    /// what `codesign -dv` prints: the notarized release reads
-    /// `flags=0x10000(runtime)` (§1.1), Homebrew's tools `0x2(adhoc)`.
     #[test]
     fn hardening_is_the_runtime_without_get_task_allow() {
         use SelfHardening as H;
@@ -9731,7 +8263,6 @@ mod tests {
         assert_eq!(CS_OPS_STATUS, 0);
     }
 
-    /// Both injected closures panic if called.
     #[test]
     fn the_debugger_probe_refuses_without_spawning() {
         let bundled = p("/Applications/aterm.app/Contents/MacOS/aterm");
@@ -9770,9 +8301,6 @@ mod tests {
         );
     }
 
-    /// Past the refusals the probe spawns exactly the `-status` argv, once, and
-    /// reads membership once; a failed run still reports the membership it
-    /// read, and never a mode.
     #[test]
     fn the_debugger_probe_spawns_only_the_status_argv() {
         let bundled = p("/Applications/aterm.app/Contents/MacOS/aterm");
@@ -9812,24 +8340,14 @@ mod tests {
         assert_eq!(got.label, DebuggerProbeLabel::TimedOut);
     }
 
-    // -- the Developer Tools list (kTCCServiceDeveloperTool) ----------------
-
-    /// One record as `/usr/bin/log show --info --style ndjson --timezone UTC` prints it, for a
-    /// `/bin/sh` started in an aterm tab; only `bootUUID` is zeroed.
     const CAPTURED_RECORD: &str = r#"{"timezoneName":"","messageType":"Info","eventType":"logEvent","source":null,"formatString":"Handling access request to %{public}@, from %{public}@, %{public}@","userID":0,"activityIdentifier":223003332,"subsystem":"com.apple.TCC","category":"access","threadID":173778168,"senderImageUUID":"5379B300-7E73-30E5-B53F-7E8A12954AB5","backtrace":{"frames":[{"imageOffset":74432,"imageUUID":"5379B300-7E73-30E5-B53F-7E8A12954AB5"}]},"bootUUID":"00000000-0000-0000-0000-000000000000","processImagePath":"\/System\/Library\/PrivateFrameworks\/TCC.framework\/Support\/tccd","senderImagePath":"\/System\/Library\/PrivateFrameworks\/TCC.framework\/Support\/tccd","timestamp":"2026-10-07 13:58:21.820241+0000","machTimestamp":66148736620656,"eventMessage":"Handling access request to kTCCServiceDeveloperTool, from Sub:{com.aterm.aterm}Resp:{TCCDProcess: identifier=com.aterm.aterm, pid=56408, auid=501, euid=501, responsible_path=\/Applications\/aterm.app\/Contents\/MacOS\/aterm, binary_path=\/bin\/sh}, ReqResult(Auth Right: Unknown (None), promptType: 1,DB Action:None, UpdateVerifierData)","processImageUUID":"5379B300-7E73-30E5-B53F-7E8A12954AB5","traceID":2660156748005636,"processID":588,"senderProgramCounter":74432,"parentActivityIdentifier":0}"#;
 
-    /// The captured record's timestamp, in unix milliseconds.
     const CAPTURED_AT_MS: i64 = 1_791_381_501_820;
 
     const ATERM: &str = "com.aterm.aterm";
 
-    /// Another app's identity, starting with [`ATERM`] and the field tccd writes after the
-    /// subject; `codesign -i` accepts it. Whether tccd prints it unescaped is unmeasured, so
-    /// the classifier assumes it does.
     const FORGED_SUB: &str = "com.aterm.aterm}Resp:{x";
 
-    /// A string as `log`'s `ndjson` writes it: `"` `\` `/` and control
-    /// characters escaped.
     fn ndjson_escape(text: &str) -> String {
         let mut out = String::new();
         for ch in text.chars() {
@@ -9845,9 +8363,6 @@ mod tests {
         out
     }
 
-    /// tccd's message for `subject`, with `binary` as the new program's path
-    /// and `answer` in tccd's `Auth Right:` slot: the captured shape, with
-    /// only those three filled in.
     fn tccd_message(subject: &str, binary: &str, answer: &str) -> String {
         format!(
             "Handling access request to kTCCServiceDeveloperTool, from Sub:{{{subject}}}Resp:\
@@ -9858,7 +8373,6 @@ mod tests {
         )
     }
 
-    /// The captured record with its timestamp and message replaced.
     fn record(timestamp: &str, message: &str) -> String {
         let (head, rest) = CAPTURED_RECORD
             .split_once("\"timestamp\":\"")
@@ -9872,7 +8386,6 @@ mod tests {
         )
     }
 
-    /// The record for `answer` at second `s` past 13:58:00 on 2026-10-07.
     fn answer_at(s: u32, subject: &str, answer: &str) -> String {
         record(
             &format!("2026-10-07 13:58:{s:02}.000000+0000"),
@@ -9880,7 +8393,6 @@ mod tests {
         )
     }
 
-    /// A whole `log show` stdout: the lines, then `log`'s closing count.
     fn log_of(records: &[String]) -> ToolRun {
         let mut out = String::new();
         for line in records {
@@ -9910,9 +8422,6 @@ mod tests {
         DevToolProbe::refused(DevToolProbeLabel::FormatUnrecognized)
     }
 
-    /// The `Unknown (None)` record is captured live; `Allowed` and `Denied` are built from
-    /// tccd's own strings. Every shape the table does not name, and every place a program's path
-    /// could plant an answer, reads `format_unrecognized` for the whole probe.
     #[test]
     fn the_devtool_classifier_reads_only_what_tccd_says() {
         use DevToolProbeLabel as L;
@@ -9937,22 +8446,17 @@ mod tests {
             "\"processImagePath\":\"\\/private\\/tmp\\/x\\/tccd\"",
         );
         let other_user = allowed(30).replace("\"userID\":0,", "\"userID\":501,");
-        // One `tccd_record` field off at a time: each row fails without its
-        // own check.
         let other_field = |from: &str, to: &str| {
             let line = allowed(30);
             assert!(line.contains(from), "{from}");
             line.replace(from, to)
         };
-        // Only an answer for the subject has its timestamp read, so this one
-        // is refused by the record check alone.
         let untimed = {
             let line = answer_at(21, "com.apple.Terminal", "Allowed (User Set)");
             let stamp = "\"timestamp\":\"2026-10-07 13:58:21.000000+0000\",";
             assert!(line.contains(stamp), "{line}");
             line.replace(stamp, "")
         };
-        // The same for the parts of tccd's own answer.
         let other_answer = |from: &str, to: &str| {
             let message = tccd_message(ATERM, "/private/tmp/x", "Allowed (User Set)");
             assert_eq!(message.matches(from).count(), 1, "{from}");
@@ -9962,13 +8466,11 @@ mod tests {
             )
         };
         let cases: Vec<(&str, ToolRun, DevToolProbe)> = vec![
-            // Captured live.
             (
                 "the captured record",
                 log_of(&[CAPTURED_RECORD.to_string()]),
                 devtool(S::Unlisted, L::Observed, Some((1, 1)), Some(CAPTURED_AT_MS)),
             ),
-            // Built from tccd's strings.
             (
                 "allowed",
                 log_of(&[answer_at(21, ATERM, "Allowed (System Set)")]),
@@ -9989,8 +8491,6 @@ mod tests {
                 log_of(&[answer_at(21, "com.aterm.aterm.dev", "Allowed (User Set)")]),
                 devtool(S::Unknown, L::NoRecentRequest, Some((0, 0)), None),
             ),
-            // The subject match is exact: a name equal to aterm's up to case or
-            // surrounding space is another app, and its answer is never aterm's.
             (
                 "a bundle id that differs only in case is another app",
                 log_of(&[
@@ -10012,7 +8512,6 @@ mod tests {
                 log_of(&[]),
                 devtool(S::Unknown, L::NoRecentRequest, Some((0, 0)), None),
             ),
-            // The newest answer decides; the counts cover the window.
             (
                 "allowed, then unlisted",
                 log_of(&[allowed(10), unlisted(20)]),
@@ -10038,7 +8537,6 @@ mod tests {
                 log_of(&[planted("/private/tmp/x/a\nb")]),
                 devtool(S::Unlisted, L::Observed, Some((1, 1)), at(30)),
             ),
-            // Shapes tccd's table does not hold.
             (
                 "limited",
                 log_of(&[answer_at(21, ATERM, "Limited (System Set)")]),
@@ -10131,7 +8629,6 @@ mod tests {
                 )]),
                 unrecognized(),
             ),
-            // A program's own path planting an answer.
             (
                 "a path that plants an answer",
                 log_of(&[planted(
@@ -10161,8 +8658,6 @@ mod tests {
                 unrecognized(),
             ),
             (
-                // A long path is cut with `<…>` and tccd's answer becomes `<decode: missing
-                // data>`, so the only answer left is the planted one.
                 "a record the log cut short",
                 log_of(&[record(
                     "2026-10-07 13:58:21.000000+0000",
@@ -10177,9 +8672,6 @@ mod tests {
                 )]),
                 unrecognized(),
             ),
-            // Another app named aterm's subject plus tccd's next field: only the second
-            // `}Resp:{` tells its answer from aterm's. Read as aterm's or skipped as another
-            // app's, each row answers wrong.
             (
                 "its unlisted after aterm's real allowed",
                 log_of(&[allowed(10), answer_at(21, FORGED_SUB, "Unknown (None)")]),
@@ -10193,8 +8685,6 @@ mod tests {
                 ]),
                 unrecognized(),
             ),
-            // An app's codesign identifier need not repeat its `Sub:{…}`, so
-            // its line can hold exactly two `}Resp:{`, not three.
             (
                 "its allowed, with an identifier that is not its Sub",
                 log_of(&[
@@ -10207,8 +8697,6 @@ mod tests {
                 ]),
                 unrecognized(),
             ),
-            // A name that closes the Sub early with no `}Resp:{` of its own: only the `Resp:{`
-            // that must follow the first `}` refuses it.
             (
                 "its allowed, under a name that closes the Sub early",
                 log_of(&[
@@ -10217,8 +8705,6 @@ mod tests {
                 ]),
                 unrecognized(),
             ),
-            // The longest proper prefix of tccd's own field: only the whole
-            // `Resp:{` refuses it, not `Resp:` or `Resp`.
             (
                 "its allowed, under a name that ends in most of tccd's field",
                 log_of(&[
@@ -10239,7 +8725,6 @@ mod tests {
                 ),
                 unrecognized(),
             ),
-            // Records tccd did not write.
             (
                 "a record tccd did not write, left out of the count",
                 exited(
@@ -10295,9 +8780,6 @@ mod tests {
                 unrecognized(),
             ),
             (
-                // Deleting the presence check leaves an empty message, which
-                // the prefix check refuses: this row pins the reading, not
-                // that one check.
                 "a record with no message",
                 log_of(&[other_field("\"eventMessage\":", "\"message\":")]),
                 unrecognized(),
@@ -10335,7 +8817,6 @@ mod tests {
                 )]),
                 unrecognized(),
             ),
-            // The framing.
             ("empty output", exited(Some(0), "", ""), unrecognized()),
             (
                 "no closing count",
@@ -10381,8 +8862,6 @@ mod tests {
                 ),
                 unrecognized(),
             ),
-            // How the run ended. A run follows the store check, so a failure never reads as
-            // the account's (`log_unavailable`).
             (
                 "a non-zero exit",
                 exited(Some(64), "", "log: Could not open the data store"),
@@ -10417,15 +8896,12 @@ mod tests {
         for (name, run, want) in &cases {
             assert_eq!(classify_devtool_log(run, ATERM), *want, "{name}");
         }
-        // The other direction of the exact match.
         assert_eq!(
             classify_devtool_log(&log_of(&[unlisted(10)]), "com.aterm.aterm.dev").label,
             L::NoRecentRequest
         );
     }
 
-    /// Whatever a program names itself, tccd's own `Unknown (None)` after it never reads
-    /// `allowed`: each planted path reads the true answer or makes the whole probe `unknown`.
     #[test]
     fn no_planted_path_reads_allowed() {
         let allowed = "Allowed (User Set)";
@@ -10463,7 +8939,6 @@ mod tests {
                 "{path:?}: {got:?}"
             );
         }
-        // The negative control: the same reader does read a real `Allowed`.
         let real = record(
             "2026-10-07 13:58:30.000000+0000",
             &tccd_message(ATERM, "/private/tmp/x/plain", allowed),
@@ -10474,8 +8949,6 @@ mod tests {
         );
     }
 
-    /// `log`'s `ndjson` timestamps convert to unix milliseconds by arithmetic
-    /// alone, and an answer's age is never negative.
     #[test]
     fn the_devtool_answer_age_is_utc_arithmetic() {
         let cases: &[(&str, Option<i64>)] = &[
@@ -10511,8 +8984,6 @@ mod tests {
         for (text, want) in cases {
             assert_eq!(devtool_timestamp_ms(text), *want, "{text:?}");
         }
-        // The last day a month accepts is the eve of the next month's first: no month is cut
-        // short and none runs into the next, leap or not.
         let midnight = |y: i64, m: i64, d: i64| {
             devtool_timestamp_ms(&format!("{y}-{m:02}-{d:02} 00:00:00+0000"))
         };
@@ -10544,8 +9015,6 @@ mod tests {
         );
     }
 
-    /// The reader `ndjson` lines go through: strict JSON, one object per line,
-    /// no repeated key.
     #[test]
     fn the_ndjson_reader_is_strict() {
         let fields = json::object_line(
@@ -10557,7 +9026,6 @@ mod tests {
         assert_eq!(json::uint(&fields, "m"), Some(12));
         assert_eq!(json::uint(&fields, "a"), None, "a string is not a number");
         assert_eq!(json::str(&fields, "missing"), None);
-        // `\u` escapes, the backslash spelled as a char so nothing on the way reads them.
         let u = |hex: &str| format!("{}u{hex}", '\u{5c}');
         let escaped = format!("{{\"a\":\"{}{}{}\"}}", u("00e9"), u("d83d"), u("de00"));
         let escaped = json::object_line(&escaped).expect("escapes");
@@ -10594,20 +9062,16 @@ mod tests {
         assert!(json::object_line(&deep).is_none(), "nesting is bounded");
         let shallow = format!("{{\"a\":{}1{}}}", "[".repeat(3), "]".repeat(3));
         assert!(json::object_line(&shallow).is_some());
-        // The bound exactly: a value nested sixteen deep is read, seventeen is not.
         let nested =
             |arrays: usize| format!("{{\"a\":{}1{}}}", "[".repeat(arrays), "]".repeat(arrays));
         assert!(json::object_line(&nested(15)).is_some());
         assert!(json::object_line(&nested(16)).is_none());
-        // `uint` reads only a plain non-negative integer.
         for (text, want) in [("7", Some(7)), ("-7", None), ("7.0", None), ("7e0", None)] {
             let fields = json::object_line(&format!("{{\"n\":{text}}}")).expect("a number");
             assert_eq!(json::uint(&fields, "n"), want, "{text}");
         }
     }
 
-    /// Every refusal spawns nothing: the injected spawn panics if it is ever
-    /// called, and so does the store check for every refusal ahead of it.
     #[test]
     fn the_devtool_probe_refuses_without_spawning() {
         let bundled = p("/Applications/aterm.app/Contents/MacOS/aterm");
@@ -10673,8 +9137,6 @@ mod tests {
             DevToolProbe::refused(DevToolProbeLabel::LogUnavailable),
             "not an administrator: the store is not readable"
         );
-        // Past the store check a failed run is `log`'s failure, never the
-        // account's.
         assert_eq!(
             probe_devtool_with(
                 ProbeGate::on(),
@@ -10689,8 +9151,6 @@ mod tests {
         assert!(devtool_subject_is_usable("com.aterm.aterm.dev"));
     }
 
-    /// Past the refusals the probe runs exactly `LOG_TOOL` with the constant
-    /// argv, once, and the subject is in no argument: it is matched in Rust.
     #[test]
     fn the_devtool_probe_spawns_only_the_log_argv() {
         let bundled = p("/Applications/aterm.app/Contents/MacOS/aterm");
@@ -10728,7 +9188,6 @@ mod tests {
                 .all(|a| !a.contains(subject) && !a.contains("example")),
             "the subject never reaches an argv: {args:?}"
         );
-        // The window the argv reads is the window the row reports.
         let last = args
             .iter()
             .position(|a| a == "--last")
@@ -10737,9 +9196,6 @@ mod tests {
         assert!(args.contains(&"ndjson".to_string()), "the escaped framing");
     }
 
-    // -- the Developer Tools list's row in the system TCC.db ----------------
-
-    /// `sqlite3`'s line for one row: the client as sqlite's `hex()` spells it.
     fn db_row(client: &str, kind: u32, auth: u32, modified: i64) -> String {
         let hex: String = client.bytes().map(|b| format!("{b:02X}")).collect();
         format!("{hex}|{kind}|{auth}|{modified}")
@@ -10766,12 +9222,9 @@ mod tests {
         }
     }
 
-    /// Captured rows from before and after aterm was added and switched on (Terminal listed
-    /// off, then both on), then a table.
     #[test]
     fn the_list_classifier_reads_only_the_subjects_bundle_row() {
         let unrecognized = DevToolList::refused(DevToolListLabel::FormatUnrecognized);
-        // The captured lines, verbatim.
         let before = "636F6D2E6170706C652E5465726D696E616C|0|0|1781819370\n";
         let after = "636F6D2E6170706C652E5465726D696E616C|0|2|1792020639\n\
                      636F6D2E617465726D2E617465726D|0|2|1792020637\n";
@@ -10847,8 +9300,6 @@ mod tests {
         ] {
             assert_eq!(classify_devtool_db(&db_of(&rows), ATERM), want, "{name}");
         }
-        // Any line that is not a row spoils the whole read: a planted line
-        // can force `unknown`, never `on`.
         let ours = db_row(ATERM, 0, 2, 1);
         for bad in [
             "com.aterm.aterm|0|2|1",
@@ -10863,7 +9314,6 @@ mod tests {
             "636F6D2E617465726D2E617465726D|0|99999999999999999999|1",
             "Error: in prepare, no such table: access",
             "",
-            // Malformed rows for another client (`a.b`), which a lax read would only count.
             "612e62|0|2|1",
             "612E62|0|2|1|x",
             "612E62|+0|2|1",
@@ -10895,8 +9345,6 @@ mod tests {
         }
     }
 
-    /// Every refusal opens and spawns nothing; `EPERM` on the open is the
-    /// responsible app's missing Full Disk Access and spawns nothing either.
     #[test]
     fn the_list_probe_refuses_without_opening_or_spawning() {
         let bundled = p("/Applications/aterm.app/Contents/MacOS/aterm");
@@ -10961,10 +9409,6 @@ mod tests {
         }
     }
 
-    /// Past the refusals the probe opens the database once, then runs exactly
-    /// `SQLITE_TOOL` with the constant argv on the database as an immutable URI
-    /// (no lock on it): read-only, no rc file, safe mode, and the subject in no
-    /// argument.
     #[test]
     fn the_list_probe_opens_once_and_spawns_only_the_sqlite_argv() {
         let bundled = p("/Applications/aterm.app/Contents/MacOS/aterm");
@@ -11027,9 +9471,6 @@ mod tests {
         );
     }
 
-    /// A read that meets a write (the file changed under it) is read again, up to
-    /// `DEVTOOL_DB_READS` times, then `ToolFailed`; a read that meets none is
-    /// kept. NEGATIVE CONTROL: one write only, and the second read answers.
     #[test]
     fn a_list_read_that_meets_a_write_is_read_again() {
         let dir = aterm_tempfile::tempdir().expect("tempdir");
@@ -11066,15 +9507,6 @@ mod tests {
         assert_eq!(runs, 2);
     }
 
-    /// THE LIST READ NEVER LOCKS OUT tccd. tccd writes the system TCC.db in
-    /// rollback-journal mode with no busy timeout (`BEGIN`, `UPDATE`, `COMMIT`):
-    /// a reader's lock its `COMMIT` meets fails that `COMMIT` at once, and the
-    /// write is lost (`docs/measured/real-claude-lab-2026-10-15.md`, 2026-10-20).
-    /// A scratch database shaped as TCC.db is read by the probe while the witness
-    /// watches its lock bytes: a reader caught holding one is frozen while a
-    /// writer shaped as tccd commits. The probe holds none, answers the row, and
-    /// the write lands. RED before the fix: the caught `sqlite3 -readonly` cost the
-    /// writer its `COMMIT` (`database is locked`).
     #[cfg(all(target_os = "macos", debug_assertions))]
     #[test]
     fn the_list_read_never_locks_out_a_writer_with_no_busy_timeout() {
@@ -11090,7 +9522,6 @@ mod tests {
                 .output()
                 .expect("sqlite3 runs")
         };
-        // A table scan long enough for the witness to see a reader's lock.
         let made = sqlite(
             "CREATE TABLE access (service TEXT NOT NULL, client TEXT NOT NULL, \
              client_type INTEGER NOT NULL, auth_value INTEGER NOT NULL, csreq BLOB, \
@@ -11143,9 +9574,6 @@ mod tests {
         assert_eq!(String::from_utf8_lossy(&after.stdout), "2|8\n");
     }
 
-    /// The join, as a table: the switch decides unless tccd answered after it
-    /// last changed; an absent row is the switch now; `unknown` only when
-    /// neither source was read.
     #[test]
     fn the_grant_joins_the_switch_and_tccds_answer() {
         use DevToolGrant::{Granted, NotGranted, Unknown};
@@ -11245,8 +9673,6 @@ mod tests {
                 DevToolProbe::pending(),
                 Unknown,
             ),
-            // Only a read row is the switch, and only an observed answer is tccd's; an absent
-            // row decides whatever its stamp.
             (
                 "a row not read, whatever its listing",
                 DevToolList {
@@ -11301,9 +9727,6 @@ mod tests {
         assert_eq!(bundle_id_of(&dir.path().join("missing.app"), &[]), None);
     }
 
-    /// `/bin/sh` stands in for the tool: an exit code (a signal's is `None`), a missing program,
-    /// a run past its ceiling and output read in part stay distinct. A run that must finish
-    /// gets a minute (a hang detector, not a budget).
     #[cfg(target_os = "macos")]
     #[test]
     fn a_bounded_run_keeps_its_outcome_apart() {
@@ -11323,15 +9746,12 @@ mod tests {
                 stderr: "err".to_string(),
             }
         );
-        // SIGKILL, never a core-dump signal (AGENTS.md).
         assert!(matches!(
             sh("kill -KILL $$", 60_000),
             ToolRun::Exited { code: None, .. }
         ));
         assert_eq!(sh("sleep 5", 200), ToolRun::TimedOut);
         assert_eq!(sh("printf '\\377'", 60_000), ToolRun::Unreadable);
-        // A stream one byte over the cap is read in part, so it is no report;
-        // at the cap it is whole.
         assert_eq!(
             sh(
                 &format!("head -c {} /dev/zero", TOOL_OUTPUT_MAX_BYTES + 1),
@@ -11353,8 +9773,6 @@ mod tests {
             ),
             other => panic!("a report at the cap: {other:?}"),
         }
-        // The cap is the caller's: the same stream reads whole under the
-        // Developer Tools read's larger one.
         let over = TOOL_OUTPUT_MAX_BYTES + 1;
         let script = format!("head -c {over} /dev/zero");
         match run_bounded_exit(
@@ -11381,7 +9799,6 @@ mod tests {
             ),
             ToolRun::Absent
         );
-        // `run_bounded` is the same run with the outcome folded.
         assert_eq!(
             run_bounded(
                 "/bin/sh",
@@ -11391,10 +9808,6 @@ mod tests {
             Some((false, String::new(), String::new()))
         );
 
-        // A copy of the pipes that outlives the tool (a background grandchild here) is
-        // waited for, up to the ceiling: what it writes after the tool exited is in the
-        // report. It holds the pipes until the readers' wait lets it go through a FIFO it
-        // opened before the tool exited, so that wait starts with the readers running.
         let dir = aterm_tempfile::tempdir().expect("tempdir");
         let gate = fifo_gate(dir.path());
         let _detector = gate_hang_detector(&gate);
@@ -11414,7 +9827,6 @@ mod tests {
             HANG_DETECTOR,
             TOOL_OUTPUT_MAX_BYTES,
         );
-        // Let a grandchild the wait gave up on go too; once it is gone this is refused.
         let _ = release_gate(&gate);
         assert_eq!(
             run,
@@ -11426,14 +9838,12 @@ mod tests {
         );
     }
 
-    /// A test binary is linker-signed ad hoc with no hardened runtime, so it reads `no`.
     #[cfg(target_os = "macos")]
     #[test]
     fn a_test_binary_is_not_hardened() {
         assert_eq!(self_hardening(), SelfHardening::NotHardened);
     }
 
-    /// Total from a test binary; a group that does not exist is no answer, not "not a member".
     #[cfg(target_os = "macos")]
     #[test]
     fn the_membership_query_is_total() {
@@ -11454,7 +9864,6 @@ mod tests {
         }
     }
 
-    /// `LaunchServices`' "no such application" is an empty answer; any other failure is none.
     #[cfg(target_os = "macos")]
     #[test]
     fn an_unregistered_id_is_an_empty_answer_and_a_malformed_one_none() {
@@ -11465,10 +9874,6 @@ mod tests {
         assert_eq!(imp::registered_bundles(""), None);
     }
 
-    // -- macOS-only ----------------------------------------------------------
-
-    /// The pinned errno literals must match the platform, or every
-    /// classification silently answers the wrong thing.
     #[cfg(target_os = "macos")]
     #[test]
     fn errno_constants_match_the_platform() {
@@ -11476,10 +9881,6 @@ mod tests {
         assert_eq!(ERRNO_ESRCH, libc::ESRCH);
     }
 
-    /// This test binary lives under `target/debug/deps`, so every real entry
-    /// point refuses, end to end through the functions production calls: the
-    /// 2026-08-17 fence. Nothing is opened or spawned — no `TCC.db`, no
-    /// `DevToolsSecurity`, no `log`, no `sqlite3` — and nothing is learned.
     #[cfg(target_os = "macos")]
     #[test]
     fn the_real_probes_refuse_from_a_test_binary() {
@@ -11502,7 +9903,6 @@ mod tests {
         );
     }
 
-    /// `/usr/bin/tccutil` ships with macOS; one `stat`, safe from this test binary.
     #[cfg(target_os = "macos")]
     #[test]
     fn the_real_tccutil_presence_reads_the_mode_of_a_real_file() {
@@ -11513,13 +9913,11 @@ mod tests {
             "/usr/bin/tccutil is part of macOS; {got:?} means the mode read is wrong"
         );
         assert!(got.can_run());
-        // The same `stat`, of files of the test's own.
         use std::os::unix::fs::PermissionsExt as _;
         let scratch = aterm_tempfile::tempdir().expect("tempdir");
         let plain = scratch.path().join("tccutil");
         std::fs::write(&plain, b"").unwrap();
         std::fs::set_permissions(&plain, std::fs::Permissions::from_mode(0o644)).unwrap();
-        // Any execute bit counts, not only the owner's.
         let group_x = scratch.path().join("group-x");
         std::fs::write(&group_x, b"").unwrap();
         std::fs::set_permissions(&group_x, std::fs::Permissions::from_mode(0o610)).unwrap();

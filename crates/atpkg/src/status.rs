@@ -1,20 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The operator-readable status record (`<prefix>/status.toml`): the resolved index
-//! source, the last aggregate outcome, the pass stamps and a per-program state line, so an
-//! operator can see whether updates arrive and why the last apply did not happen. Status
-//! is diagnostics, never load-bearing, and durable:
-//!
-//! * written through for what a pass must not lose, coalesced for what it stamps: while a
-//!   verb holds the store lock ([`hold`]) a change to a row, the seams or any other field
-//!   is on disk at once, while the outcome sentence and the clocks land once, at its end;
-//! * written by temp + fsync + rename + a directory sync, so a power loss leaves the old
-//!   record or the new one;
-//! * keys this build does not know ride [`Status::extra`] through every rewrite;
-//! * a corrupt record (unparsable, not UTF-8, over its bounds, not a regular file) is kept
-//!   as `status.toml.corrupt-<unix>` and replaced in one rename by one rebuilt from the
-//!   store ([`seed_for_rewrite`]); one unreadable for another reason is left alone.
+//! The operator-readable status record (`<prefix>/status.toml`).
 
 use std::collections::BTreeMap;
 use std::io;
@@ -26,18 +13,12 @@ use serde::{Deserialize, Serialize};
 use crate::Layout;
 
 /// Maximum serialized size of the operator-readable status record.
-///
-/// A normal record is a few KiB. Two MiB leaves room for a large managed fleet
-/// while making Settings/doctor/verify parsing and allocation strictly finite.
 pub const MAX_STATUS_BYTES: usize = 2 * 1024 * 1024;
 
 /// Maximum number of per-program rows admitted from one status snapshot.
 pub const MAX_STATUS_PROGRAMS: usize = 2048;
 
-/// The clause an update pass that did not reach the signed index appends to its `outcome`
-/// (`<outcome> (index from cache — <why>)`), naming the cause (a rate limit, a 5xx, a
-/// captive portal). One spelling for the writer (`cli`'s `record_index_freshness`) and the
-/// window's pass report, which reads it to say the pass ran on a stale index.
+/// The clause an update pass that did not reach the signed index appends to its `outcome` (`<outcome> (index from cache — <why>)`), naming the cause (a rate limit, a 5xx, a captive portal).
 pub const INDEX_FROM_CACHE_CLAUSE: &str = "(index from cache \u{2014} ";
 
 /// One program's last-known state, for `status.toml`.
@@ -45,53 +26,35 @@ pub const INDEX_FROM_CACHE_CLAUSE: &str = "(index from cache \u{2014} ";
 pub struct ProgramStatus {
     /// The currently-active build, if any.
     pub installed_build: Option<u64>,
-    /// The program's state line. For a program the index names, one of the canonical
-    /// spellings of [`crate::state`] (`managed <build> — pinned by index <N>`, `system:
-    /// <path> — not managed by aterm`, `unavailable on <target>: <hint>`, …), the words the
-    /// pass log, `doctor` and `which` print. Faults keep prefixed free text (`"error: …"`,
-    /// `"tombstoned: yanked@N"`, `"deferred: …"`, `"rejected: …"`), which `doctor` matches
-    /// by prefix.
+    /// The program's state line.
     pub state: String,
-    /// The signed `tree_root` (§8) of the active build, from the release-key-verified
-    /// manifest at install/update time. `atpkg verify` compares the store tree's recomputed
-    /// root to this value, never to a self-generated hash. Empty: no signed root recorded,
-    /// so verify reports "cannot attest" (fail-closed).
+    /// The signed `tree_root` (§8) of the active build, from the release-key-verified manifest at install/update time.
     #[serde(default)]
     pub tree_root: String,
 }
 
-/// The most refused names one program's entry keeps ([`RefusedShims::names`]); the rest
-/// are counted.
+/// The most refused names one program's entry keeps ([`RefusedShims::names`]); the rest are counted.
 pub const MAX_REFUSED_RECORDED: usize = 16;
 
-/// The longest refused name an entry keeps, in characters; a longer one is cut, ending in
-/// `…`. A signed `exposes` has no length bound of its own, and the record has one.
+/// The longest refused name an entry keeps, in characters; a longer one is cut, ending in `…`.
 pub const MAX_REFUSED_NAME_CHARS: usize = 64;
 
-/// The most builds one program's list keeps an entry for ([`Status::refused_shims`]): the
-/// newest, as the store keeps them. A program's live build and the one a pass stages beside
-/// it each keep their own, so a flip that is held or aborted leaves the live build's said.
+/// The most builds one program's list keeps an entry for ([`Status::refused_shims`]): the newest, as the store keeps them.
 pub const MAX_REFUSED_BUILDS: usize = 8;
 
-/// One build's exposed names that were refused a shim ([`crate::store::shim_allowed`]: a
-/// shell, another command a shim must never intercept, or no tool name at all), in the
-/// order its manifest lists them (design S13).
+/// One build's exposed names that were refused a shim ([`crate::store::shim_allowed`]: a shell, another command a shim must never intercept, or no tool name at all), in the order its manifest lists them (design S13).
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RefusedShims {
-    /// The build whose manifest named them. The entry speaks for that build only: a reader
-    /// takes the entry of the build `store/<program>/current` names ([`Status::refused_for`]),
-    /// and the next record drops it once that build is gone from the store.
+    /// The build whose manifest named them.
     pub build: u64,
-    /// The names, at most [`MAX_REFUSED_RECORDED`], each at most
-    /// [`MAX_REFUSED_NAME_CHARS`] characters.
+    /// The names, at most [`MAX_REFUSED_RECORDED`], each at most [`MAX_REFUSED_NAME_CHARS`] characters.
     pub names: Vec<String>,
     /// How many names were refused; more than `names` holds when the list was cut.
     pub count: u64,
 }
 
 impl RefusedShims {
-    /// The entry for `build` whose landing refused `refused`, or `None` when it refused
-    /// nothing.
+    /// The entry for `build` whose landing refused `refused`, or `None` when it refused nothing.
     #[must_use]
     pub fn of(build: u64, refused: &[String]) -> Option<Self> {
         if refused.is_empty() {
@@ -117,15 +80,7 @@ impl RefusedShims {
     }
 }
 
-/// Record that `program`'s `build` was refused a shim for each of `refused` (none: that
-/// build's entry goes), beside the entries of the program's other builds, in the same write
-/// dropping every entry whose build is no longer in the store. Called on the pass's own
-/// thread where a landing admits a signed `exposes` ([`crate::store::split_exposed`]): the
-/// index lane's singleton landing and a group member's stage. The vendor lane never records,
-/// because its `exposes` is the compiled table, every name of which a shim may carry (the
-/// table's own test), and its landings run on rider threads that write no status. A landing
-/// that changes nothing writes nothing, so a pass whose programs expose only tool names keeps
-/// its one write. Best-effort, like every status write.
+/// Record that `program`'s `build` was refused a shim for `refused`, pruning entries for builds no longer in the store.
 ///
 /// # Errors
 /// [`read_checked`]'s diagnostic for an unreadable record, or the write's.
@@ -184,90 +139,50 @@ pub struct Status {
     pub enabled: bool,
     /// The resolved index source, `owner/repo`.
     pub index_source: String,
-    /// The last aggregate decision (`"up to date"`, `"staged …"`, `"idle: no token"`,
-    /// `"rejected unsigned index at build N"`, …).
+    /// The last aggregate decision (`"up to date"`, `"staged …"`, `"idle: no token"`, `"rejected unsigned index at build N"`, …).
     pub outcome: String,
-    /// The rustup toolchain seams atpkg owns, as `rustup:<name>` ([`crate::seam`]): written
-    /// when an attach succeeds, dropped by a detach and `uninstall --all`, walked by every
-    /// re-assertion; empty in older records. Two more spellings ride beside them, never
-    /// read as seams: `refused:rustup:<name>: <why>` (the last re-assertion's refusal) and
-    /// `replaced:rustup:<name>: <target>` (the stale link one replaced, the way back:
-    /// [`crate::seam::replaced_from`]), spelled `replacing:…` from just before the swap
-    /// until the entry names the view.
+    /// The rustup toolchain seams atpkg owns, as `rustup:<name>` ([`crate::seam`]).
     #[serde(default)]
     pub seams: Vec<String>,
-    /// RFC3339 UTC time of the last full update pass that reached the signed index (one the
-    /// channel served this pass, not the §14 cache's) and ran to its end. Stamped only by
-    /// [`stamp_success`], at the pass's end (the derived model `AtpkgPassStamps` states the
-    /// contract). Empty: no pass has reached the index here, which `aterm pkg doctor`
-    /// reports.
+    /// RFC3339 UTC time of the last full update pass that reached the signed index (one the channel served this pass, not the §14 cache's) and ran to its end.
     #[serde(default)]
     pub last_success_at: String,
-    /// The `index_build` the last pass resolved, and when it last changed: the publisher's
-    /// own pulse, which `doctor`'s "publishing looks frozen" reads.
+    /// The `index_build` the last pass resolved, and when it last changed.
     #[serde(default)]
     pub last_index_build: u64,
     /// See [`Self::last_index_build`].
     #[serde(default)]
     pub index_build_changed_at: String,
-    /// How the last full `update` pass ended
-    /// ([`aterm_update_core::pkg_check::PassOutcome`]): `ok` (it reached the signed index,
-    /// or had nothing to check), `offline` or `failed` (including a pass the §14 cache
-    /// served after a refusal). Stamped only at the pass's end; the schedulers read this,
-    /// not `updated_at`, which moves on every write.
+    /// How the last full `update` pass ended ([`aterm_update_core::pkg_check::PassOutcome`]).
     #[serde(default)]
     pub last_pass: String,
-    /// RFC3339 UTC time that pass ended. See [`Self::last_pass`].
+    /// RFC3339 UTC time that pass ended.
     #[serde(default)]
     pub last_pass_at: String,
-    /// The highest index this full pass was asked to check or resolved, when it attempted a
-    /// signed index resolve; zero is unknown. Written with `last_pass` and `last_pass_at`, so
-    /// a scheduler can tell a newer publication from another lane's attempt at the same
-    /// index, even one that failed before resolving the listing.
+    /// The highest index this full pass was asked to check or resolved, when it attempted a signed index resolve; zero is unknown.
     #[serde(default)]
     pub last_pass_attempted_index_build: u64,
     /// The exact pass-end stamp that owns `last_pass_attempted_index_build`.
-    /// A previous atpkg binary preserves unknown fields while rewriting the
-    /// known pass end; comparing this stamp avoids borrowing its old target.
     #[serde(default)]
     pub last_pass_attempted_at: String,
-    /// How many full passes have recorded their end on this store, bumped only by the
-    /// pass-end stamp, so a queued pass can tell exactly whether one ended since it was
-    /// queued (`last_pass_at` is whole seconds). Zero in older records; an older binary
-    /// carries it through unmoved.
+    /// How many full passes have recorded their end on this store, bumped only by the pass-end stamp, so a queued pass can tell exactly whether one ended since it was queued (`last_pass_at` is whole seconds).
     #[serde(default)]
     pub pass_seq: u64,
-    /// The [`Self::pass_seq`] of the last full pass that ended `failed` for one reason
-    /// only: its index came from the §14 cache (the listing was refused, yet some host
-    /// answered, so not offline) while no member failed. Such a pass exits 1 with nothing on
-    /// stderr; its cause is only [`INDEX_FROM_CACHE_CLAUSE`] in [`Self::outcome`]. Any value
-    /// but the current `pass_seq` means the last pass was not that (an older binary that
-    /// bumps `pass_seq` without knowing this key leaves it stale, which reads as "not that",
-    /// the safe side).
-    ///
-    /// A `--wait-lock` child that stands down behind such a pass exits as that pass would
-    /// have ([`crate::cli`]'s stand-down), and the outcome text alone cannot say whether the
-    /// holder also failed a member. [`stale_index_only_end`] reads it.
+    /// The [`Self::pass_seq`] of the last full pass that ended `failed` for one reason only.
     #[serde(default)]
     pub stale_index_only_pass_seq: u64,
     /// Per-program states, keyed by program name.
     #[serde(default)]
     pub programs: BTreeMap<String, ProgramStatus>,
-    /// Per program, one entry for each of its builds (at most [`MAX_REFUSED_BUILDS`], by
-    /// build) whose signed `exposes` holds names that were refused a shim ([`RefusedShims`]),
-    /// written where a landing admits that list ([`record_refused_shims`]). A program none
-    /// were refused for has no entry, so a record without one is written as before.
+    /// Per-program builds (up to [`MAX_REFUSED_BUILDS`]) whose signed `exposes` held refused shim names ([`RefusedShims`], [`record_refused_shims`]).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub refused_shims: BTreeMap<String, Vec<RefusedShims>>,
-    /// Every top-level key this build does not know, carried verbatim through each rewrite,
-    /// so builds sharing a store never erase each other's fields.
+    /// Every top-level key this build does not know, carried verbatim through each rewrite, so builds sharing a store never erase each other's fields.
     #[serde(flatten)]
     pub extra: BTreeMap<String, aterm_toml::Value>,
 }
 
-/// Stamp the index build the pass resolved: `last_index_build` and `index_build_changed_at`
-/// move when `index_build` differs from the recorded one (`None`, no index in hand, changes
-/// neither); `updated_at` always moves. Seeded through [`seed_for_rewrite`].
+/// Stamp the index build the pass resolved.
 ///
 /// # Errors
 /// [`read_checked`]'s diagnostic for an unreadable record, or the write's.
@@ -283,19 +198,14 @@ pub fn stamp_index_build(layout: &Layout, now: &str, index_build: Option<u64>) -
     write(layout, &status)
 }
 
-/// Whether no index update pass has ever completed here: `status.toml` absent, unreadable,
-/// or with an empty [`Status::last_success_at`] (a record a failed resolve wrote is not a
-/// check that ran). Test-only.
+/// Whether no index update pass has ever completed here.
 #[cfg(test)]
 #[must_use]
 pub(crate) fn never_checked(layout: &Layout) -> bool {
     read(layout).is_none_or(|s| s.last_success_at.trim().is_empty())
 }
 
-/// Stamp a full pass that reached the signed index and ran to its end: `last_success_at`
-/// and `updated_at`, creating a minimal record when none exists. The one event that makes
-/// "packages can be updated on this machine" true; a member that failed inside such a pass
-/// is recorded in its own row. Seeded through [`seed_for_rewrite`].
+/// Stamp a full pass that reached the signed index and ran to its end.
 ///
 /// # Errors
 /// [`read_checked`]'s diagnostic for an unreadable record, or the write's.
@@ -306,12 +216,7 @@ pub fn stamp_success(layout: &Layout, now: &str) -> io::Result<()> {
     write(layout, &status)
 }
 
-/// Stamp how a full `update` pass ended: `last_pass` (the outcome's word), `last_pass_at`
-/// and `updated_at`. A pass that did not reach the signed index records `failed` or
-/// `offline` and stamps no success, so the walk's interval and "never checked" count from
-/// the last pass that did. This function and its `_with_index`/`_recorded` forms are the
-/// one writer of those keys, called once at the pass's end (`cli`'s recorded pass); the
-/// schedulers read them through [`aterm_update_core::pkg_check::Stamps`].
+/// Stamp how a full `update` pass ended: `last_pass` (the outcome's word), `last_pass_at` and `updated_at`.
 ///
 /// # Errors
 /// [`read_checked`]'s diagnostic for an unreadable record, or the write's.
@@ -323,8 +228,7 @@ pub fn stamp_pass_end(
     stamp_pass_end_with_index(layout, now, outcome, 0)
 }
 
-/// [`stamp_pass_end`] with this pass's target or resolved index, in the same write as the
-/// outcome and end time. An unknown target (0) clears the previous pass's witness.
+/// [`stamp_pass_end`] with this pass's target or resolved index, in the same write as the outcome and end time.
 ///
 /// # Errors
 /// [`read_checked`]'s diagnostic for an unreadable record, or the write's.
@@ -337,9 +241,7 @@ pub fn stamp_pass_end_with_index(
     stamp_pass_end_recorded(layout, now, outcome, attempted_index_build, false)
 }
 
-/// [`stamp_pass_end_with_index`], also recording whether this pass failed only because its
-/// index came from the cache (`stale_index_only`, [`Status::stale_index_only_pass_seq`]),
-/// in the same write as the end it describes.
+/// [`stamp_pass_end_with_index`], also recording `stale_index_only` ([`Status::stale_index_only_pass_seq`]).
 ///
 /// # Errors
 /// [`read_checked`]'s diagnostic for an unreadable record, or the write's.
@@ -352,9 +254,6 @@ pub fn stamp_pass_end_recorded(
 ) -> io::Result<()> {
     let mut status = seed_for_rewrite(layout)?;
     status.last_pass = outcome.word().to_string();
-    // Older binaries write whole-second `last_pass_at` and keep unknown fields in `extra`;
-    // the `.000000000` suffix marks this writer (a format marker, not subsecond precision),
-    // so an old pass ending in the same second cannot inherit this target.
     let witness_at = (attempted_index_build > 0)
         .then(|| now.strip_suffix('Z'))
         .flatten()
@@ -374,9 +273,7 @@ pub fn stamp_pass_end_recorded(
     write(layout, &status)
 }
 
-/// Whether `status`'s last recorded full pass ended `failed` only because its index came
-/// from the cache ([`Status::stale_index_only_pass_seq`] naming the current
-/// [`Status::pass_seq`]). Pure.
+/// Whether `status`'s last recorded full pass ended `failed` only because its index came from the cache ([`Status::stale_index_only_pass_seq`] naming the current [`Status::pass_seq`]).
 #[inline]
 #[must_use]
 pub fn stale_index_only_end(status: &Status) -> bool {
@@ -385,11 +282,7 @@ pub fn stale_index_only_end(status: &Status) -> bool {
         && status.last_pass == aterm_update_core::pkg_check::PassOutcome::Failed.word()
 }
 
-/// The machine-wide stamps every lane schedules a full pass on (the window's gate and walk,
-/// the session lane, a window's launch), read now: `status.toml`'s, with the index build
-/// raised to the one verified here ([`crate::index_probe::verified_floor`], so an index a
-/// sibling landed counts) and whether a pass is installing now
-/// ([`crate::progress::pass_running`]).
+/// The machine-wide stamps every lane schedules a full pass on (the window's gate and walk, the session lane, a window's launch), read now.
 #[must_use]
 pub fn pass_stamps(layout: &Layout, now_unix: i64) -> aterm_update_core::pkg_check::Stamps {
     let stamps = aterm_update_core::pkg_check::Stamps::read(&layout.status());
@@ -402,8 +295,7 @@ pub fn pass_stamps(layout: &Layout, now_unix: i64) -> aterm_update_core::pkg_che
     }
 }
 
-/// How many full passes have recorded their end on this store ([`Status::pass_seq`]);
-/// zero with no readable record.
+/// How many full passes have recorded their end on this store ([`Status::pass_seq`]); zero with no readable record.
 #[must_use]
 pub fn pass_seq(layout: &Layout) -> u64 {
     read(layout).map_or(0, |status| status.pass_seq)
@@ -429,17 +321,9 @@ impl Status {
     }
 }
 
-/// Write `status` to `layout.status()`, durably ([`write_durably`]) — except while a
-/// mutating verb holds the store lock ([`hold`]) and `status` differs from what is on disk
-/// only in its stamps ([`only_stamps_differ`]): that lands in the held record, written
-/// once when the hold ends. Best-effort: a failure is returned but is never fatal to an
-/// apply (status is diagnostics). The bounds are checked here either way, so a held write
-/// refuses what the final write would.
+/// Write `status` to `layout.status()`, durably ([`write_durably`]).
 pub fn write(layout: &Layout, status: &Status) -> io::Result<()> {
     let text = render(status)?;
-    // The record as it stood, for the package log's transitions: the held record while a
-    // verb holds the lock, else the file. Every row writer comes through here, so this is
-    // the one place a transition is seen; an unreadable record is no baseline.
     let before = crate::packages_log::records(layout)
         .then(|| read_checked(layout).ok())
         .flatten();
@@ -458,9 +342,6 @@ pub fn write(layout: &Layout, status: &Status) -> io::Result<()> {
 }
 
 /// Whether `a` and `b` differ only in what a pass stamps as it goes (the outcome sentence
-/// and the clocks), which is all a hold coalesces: a lost stamp is re-stamped by the next
-/// pass, while a lost row (an activated build and its signed root, a seam, a tombstone)
-/// lets the next pass record a new build under an old root, which `verify` calls drift.
 fn only_stamps_differ(a: &Status, b: &Status) -> bool {
     let unstamped = |s: &Status| Status {
         updated_at: String::new(),
@@ -480,8 +361,6 @@ fn only_stamps_differ(a: &Status, b: &Status) -> bool {
 }
 
 /// Refuse a record with more per-program rows than [`MAX_STATUS_PROGRAMS`], in either map
-/// keyed by program, or a program with more refused-name entries than
-/// [`MAX_REFUSED_BUILDS`]: the bound every read and every write holds.
 fn bounded_rows(status: &Status) -> io::Result<()> {
     for (what, rows) in [
         ("programs", status.programs.len()),
@@ -527,9 +406,6 @@ fn render(status: &Status) -> io::Result<String> {
 }
 
 /// Put `text` at `layout.status()` so a power loss leaves the old record or this one: a
-/// temp beside it, `fsync`, `rename(2)`, then a directory sync. The temp is removed on
-/// every failure arm: nothing sweeps `status.toml.tmp-<pid>`, so a full disk would strand
-/// one per pass.
 fn write_durably(layout: &Layout, text: &str) -> io::Result<()> {
     let dest = layout.status();
     let tmp = dest.with_file_name(format!("status.toml.tmp-{}", std::process::id()));
@@ -551,8 +427,7 @@ fn write_durably(layout: &Layout, text: &str) -> io::Result<()> {
     Ok(())
 }
 
-/// How many times each store's record reached the disk in this test process — the
-/// instrument behind "one write per pass".
+/// How many times each store's record reached the disk in this test process — the instrument behind "one write per pass".
 #[cfg(test)]
 pub(crate) mod counted {
     use super::{Layout, PathBuf};
@@ -581,12 +456,7 @@ pub(crate) mod counted {
     }
 }
 
-/// Read + parse `status.toml` with explicit admission/parse diagnostics — the held record
-/// while this process holds one for `layout` ([`hold`]).
-///
-/// Missing is a normal `Ok(None)`. Existing paths must be bounded regular
-/// non-link files containing valid UTF-8 TOML and no more than
-/// [`MAX_STATUS_PROGRAMS`] rows.
+/// Read + parse `status.toml` with explicit admission/parse diagnostics.
 pub fn read_checked(layout: &Layout) -> io::Result<Option<Status>> {
     if let Some(held) = held::load(layout) {
         return held;
@@ -613,22 +483,16 @@ fn read_disk(layout: &Layout) -> io::Result<Option<Status>> {
 }
 
 /// Compatibility projection: absent or malformed diagnostics yield `None`.
-/// Interactive surfaces which can show an error should use [`read_checked`].
 #[inline]
 #[must_use]
 pub fn read(layout: &Layout) -> Option<Status> {
     read_checked(layout).ok().flatten()
 }
 
-/// Seed a writer that rebuilds the whole record: the record on disk, a minimal schema-1 one
-/// when the store has none, or, when the record is corrupt, one rebuilt from the store with
-/// the corrupt bytes kept aside ([`heal`]). Refusing a corrupt record would block every
-/// later stamp, so it is healed.
+/// Seed a writer that rebuilds the whole record.
 ///
 /// # Errors
-/// The record cannot be read for a reason that is not corruption (a permission, an I/O
-/// error, a descriptor limit; it is left as it is), or it is corrupt and could not be kept
-/// aside.
+/// The record cannot be read for a reason that is not corruption (a permission, an I/O error, a descriptor limit; it is left as it is), or it is corrupt and could not be kept aside.
 pub fn seed_for_rewrite(layout: &Layout) -> io::Result<Status> {
     match read_checked(layout) {
         Ok(Some(status)) => Ok(status),
@@ -641,19 +505,12 @@ pub fn seed_for_rewrite(layout: &Layout) -> io::Result<Status> {
 }
 
 /// Whether the read error `why` means the record itself is bad, rather than that this read
-/// failed: bytes that do not parse, are not UTF-8 or exceed the bounds (`InvalidData`), or
-/// a path that is not a regular file. Anything else (`EACCES`, `EIO`, `EMFILE`, …) may pass
-/// by the next read, and a healthy record must never be moved aside for it.
 fn is_corrupt(layout: &Layout, why: &io::Error) -> bool {
     why.kind() == io::ErrorKind::InvalidData
         || std::fs::symlink_metadata(layout.status()).is_ok_and(|m| !m.file_type().is_file())
 }
 
 /// Replace a corrupt record with [`rebuilt_from_store`]'s, keeping the corrupt one beside
-/// it as `status.toml.corrupt-<unix>`, said once as a notice. A regular file's bytes are
-/// linked (or copied) aside and the rebuilt record renamed over it, so a kill in between
-/// leaves the old bytes or the new record, never no record. `Err` (nothing replaced) when
-/// `why` is not corruption ([`is_corrupt`]) or the bytes could not be kept.
 fn heal(layout: &Layout, why: io::Error) -> io::Result<Status> {
     if !is_corrupt(layout, &why) {
         return Err(why);
@@ -678,7 +535,6 @@ fn heal(layout: &Layout, why: io::Error) -> io::Result<Status> {
 }
 
 /// `status.toml.corrupt-<unix>`, or `…-<unix>-<pid>` when a record was already kept aside
-/// in the same second.
 fn corrupt_path(layout: &Layout, unix: u64) -> PathBuf {
     let first = layout.prefix.join(format!("status.toml.corrupt-{unix}"));
     if std::fs::symlink_metadata(&first).is_err() {
@@ -689,10 +545,7 @@ fn corrupt_path(layout: &Layout, unix: u64) -> PathBuf {
         .join(format!("status.toml.corrupt-{unix}-{}", std::process::id()))
 }
 
-/// The record the store describes when the written one is lost: a row per active program
-/// ([`store_row`]), and the rustup seams that point into this prefix. What the store
-/// cannot say — the signed roots, the stamps — the next pass records again
-/// (`cli::recover_missing_roots` re-derives the roots).
+/// The record the store describes when the written one is lost.
 #[must_use]
 pub fn rebuilt_from_store(layout: &Layout) -> Status {
     let programs = crate::active_builds(layout)
@@ -710,9 +563,7 @@ pub fn rebuilt_from_store(layout: &Layout) -> Status {
     }
 }
 
-/// The row the store itself can vouch for, for `program` active at `build`: a vendor build
-/// by its recorded version, an index build as `active` (a word every reader accepts; the
-/// next pass rewrites it to its pin), and no signed root (the store holds no signature).
+/// The row the store itself can vouch for, for `program` active at `build`.
 #[must_use]
 pub fn store_row(layout: &Layout, program: &str, build: u64) -> ProgramStatus {
     let vendor = crate::vendor_direct::spec(program).and_then(|spec| {
@@ -726,12 +577,7 @@ pub fn store_row(layout: &Layout, program: &str, build: u64) -> ProgramStatus {
     }
 }
 
-/// `status` as a shell whose `PATH` is `path_var` sees it: a managed row of an active
-/// program one of whose tools a foreign executable out-ranks on that `PATH` reads `managed
-/// <build> — SHADOWED by <path>`. Shadowing is per-shell, so passes do not record it;
-/// `doctor`, `which` and the Settings page compute it when they read. An agent program
-/// whose `agents/` twin is current (every aterm tab puts `agents/` first) and a dev-linked
-/// program are never shadowed, and a row already recorded as SHADOWED is left as written.
+/// `status` as a shell whose `PATH` is `path_var` sees it.
 #[must_use]
 pub fn with_shadows(
     layout: &Layout,
@@ -765,12 +611,7 @@ pub fn with_shadows(
     status
 }
 
-/// Hold `layout`'s stamps in memory until the returned guard drops, and write them once
-/// then, so a mutating verb writes `status.toml` once however often it moves the outcome
-/// and the clocks. Every other change is written through at once ([`write`]): atpkg has no
-/// signal handler, so a pass killed by Ctrl-C, a logout or SIGKILL must already have its
-/// rows on disk. Nests. The CLI takes it right after the store lock, so the record is on
-/// disk before the lock is released.
+/// Hold `layout`'s stamps in memory until the returned guard drops, and write them once then, so a mutating verb writes `status.toml` once however often it moves the outcome and the clocks.
 #[must_use]
 pub fn hold(layout: &Layout) -> HeldRecord {
     held::begin(layout);
@@ -799,7 +640,6 @@ mod held {
     use super::{Layout, PathBuf, Status, io};
 
     /// One held store: `record` is the record as it stands and `disk` as the file holds
-    /// it — each `None` until first read or written (`Some(None)`: the store has none).
     struct Held {
         prefix: PathBuf,
         depth: u32,
@@ -848,7 +688,6 @@ mod held {
     }
 
     /// The held record, loaded from disk on first use; `None` when `layout` is not held.
-    /// An unreadable file is not cached: the writer that heals it settles what replaces it.
     pub(super) fn load(layout: &Layout) -> Option<io::Result<Option<Status>>> {
         with(layout, |h| {
             if let Some(record) = &h.record {
@@ -861,9 +700,7 @@ mod held {
         })
     }
 
-    /// Take `status` into the held record: `Some(true)` when it must reach the disk now —
-    /// it differs from the file in more than its stamps, or the file is not known — and
-    /// `Some(false)` when it may wait for the end; `None` when `layout` is not held.
+    /// Take `status` into the held record: `Some(true)` when it must reach the disk now.
     pub(super) fn store(layout: &Layout, status: &Status) -> Option<bool> {
         with(layout, |h| {
             let through = match &h.disk {
@@ -897,7 +734,6 @@ mod tests {
     }
 
     /// A pass that reached the index stamps its success and ends `ok`; one that did not ends
-    /// `failed` and keeps the success; the build fields move only on a different build.
     #[test]
     fn the_pass_end_stamps_say_what_the_pass_did() {
         use aterm_update_core::pkg_check::{PassOutcome, Stamps};
@@ -914,7 +750,6 @@ mod tests {
         assert_eq!(s.last_index_build, 32);
         assert_eq!(s.index_build_changed_at, "2026-09-15T10:00:00Z");
         assert!(!Stamps::read(&layout.status()).last_failed());
-        // A pass that did not reach the index: it ends `failed`, the success stays.
         stamp_pass_end(&layout, "2026-09-16T10:00:00Z", PassOutcome::Failed).unwrap();
         stamp_index_build(&layout, "2026-09-16T10:00:00Z", Some(32)).unwrap();
         let s = read(&layout).unwrap();
@@ -924,7 +759,6 @@ mod tests {
         assert_eq!(s.index_build_changed_at, "2026-09-15T10:00:00Z");
         assert_eq!(s.updated_at, "2026-09-16T10:00:00Z");
         assert!(Stamps::read(&layout.status()).last_failed());
-        // A pass that reached it on a newer build: `ok` again, both build fields move.
         stamp_success(&layout, "2026-09-17T10:00:00Z").unwrap();
         stamp_pass_end(&layout, "2026-09-17T10:00:00Z", PassOutcome::Ok).unwrap();
         stamp_index_build(&layout, "2026-09-17T10:00:00Z", Some(33)).unwrap();
@@ -937,7 +771,6 @@ mod tests {
         );
         assert_eq!(s.last_index_build, 33);
         assert_eq!(s.index_build_changed_at, "2026-09-17T10:00:00Z");
-        // No index in hand: the build fields are untouched.
         stamp_index_build(&layout, "2026-09-18T10:00:00Z", None).unwrap();
         let s = read(&layout).unwrap();
         assert_eq!(s.last_index_build, 33);
@@ -961,8 +794,6 @@ mod tests {
         assert!(!stamps.completed_older_index_pass(45));
         assert!(stamps.completed_older_index_pass(46));
 
-        // An older binary rewrites `last_pass_at` and carries the new fields through
-        // `extra`: an old pass ending in the same second must not inherit this target.
         let mut old_writer = status;
         old_writer.last_pass = "failed".to_string();
         old_writer.last_pass_at = "2026-09-24T12:01:00Z".to_string();
@@ -983,7 +814,6 @@ mod tests {
     }
 
     /// A failed write reclaims its `status.toml.tmp-<pid>`, which nothing else sweeps.
-    /// Staged with a `status.toml` that is a directory, so the rename is what refuses.
     #[cfg(unix)]
     #[test]
     fn failed_write_reclaims_its_temp() {
@@ -997,8 +827,6 @@ mod tests {
             },
         )
         .expect_err("a rename onto a directory cannot succeed");
-        // EISDIR (21 on every unix this ships to): the bytes reached the temp and the rename
-        // refused, not an earlier step.
         assert_eq!(
             error.raw_os_error(),
             Some(21),
@@ -1031,8 +859,6 @@ mod tests {
     }
 
     /// A rewriting writer heals an unreadable record (garbage, truncated, empty) by keeping
-    /// the bytes aside and rebuilding from the store, and its stamp lands; an absent record
-    /// seeds a fresh one and keeps nothing aside.
     #[test]
     fn rewriting_writers_heal_an_unreadable_record() {
         let l = layout("unreadable");
@@ -1077,11 +903,8 @@ mod tests {
                 std::fs::remove_file(l.prefix.join(name)).unwrap();
             }
         }
-        // A record rebuilt from the store names what the store holds.
         stamp_index_build(&l, "2026-09-16T00:00:00Z", Some(7)).unwrap();
         assert_eq!(read(&l).unwrap().last_index_build, 7);
-        // Healed in place even inside a hold: the rebuilt record is on disk as soon as the
-        // corrupt one is kept aside, never "no record" for the length of a pass.
         std::fs::write(l.status(), "garbage {{{").unwrap();
         {
             let _held = hold(&l);
@@ -1094,7 +917,6 @@ mod tests {
     }
 
     /// A read that failed (a permission, an I/O error) is not corruption: the healthy record
-    /// is left where it is, never moved aside or replaced.
     #[cfg(unix)]
     #[test]
     fn a_record_that_could_not_be_read_is_left_alone() {
@@ -1161,7 +983,6 @@ mod tests {
     }
 
     /// While a store is held the stamps land in memory, where readers in this process see
-    /// them; the file is written once when the hold ends, and not at all if nothing changed.
     #[cfg(unix)]
     #[test]
     fn a_held_record_is_written_once_when_the_hold_ends() {
@@ -1207,7 +1028,6 @@ mod tests {
     }
 
     /// A row change is written through even while held: a pass killed after activating a
-    /// build must leave its row and signed root on disk. Only the stamps after it wait.
     #[cfg(unix)]
     #[test]
     fn a_held_row_change_reaches_the_disk_at_once() {
@@ -1238,7 +1058,6 @@ mod tests {
             ino,
             "a stamp after it waits"
         );
-        // The kill: the guard never drops. What the disk holds is the row, not the stamp.
         std::mem::forget(held);
         let on_disk = read_disk(&l).unwrap().unwrap();
         assert_eq!(on_disk.programs["ay"].installed_build, Some(19));
@@ -1262,8 +1081,6 @@ mod tests {
         assert_eq!(write_error.kind(), io::ErrorKind::InvalidData);
         assert!(write_error.to_string().contains("limit is"));
 
-        // Bypass the writer to prove a hostile otherwise-valid on-disk record
-        // is rejected by the independent read-side count gate too.
         std::fs::write(l.status(), status.to_toml().unwrap()).unwrap();
         let read_error = read_checked(&l).unwrap_err();
         assert_eq!(read_error.kind(), io::ErrorKind::InvalidData);
@@ -1272,8 +1089,6 @@ mod tests {
     }
 
     /// The `seams` record round-trips beside the program rows (aterm-toml orders values
-    /// before sub-tables, so the array never lands inside the last `[programs.*]` table),
-    /// and a record without the field parses as no seams.
     #[test]
     fn seams_round_trip_and_default_empty() {
         let l = layout("seams");
@@ -1319,7 +1134,6 @@ mod tests {
             "seams must precede the program tables:\n{text}"
         );
 
-        // A record without the `seams` key.
         let legacy = "schema = 1\nupdated_at = \"2026-08-01T00:00:00Z\"\nenabled = true\n\
              index_source = \"o/r\"\noutcome = \"up to date\"\n\n[programs.trust]\n\
              installed_build = 6808\nstate = \"managed 6808 — pinned by index 9\"\n\
@@ -1332,8 +1146,6 @@ mod tests {
     }
 
     /// The refused names a landing records (design S13): kept per build, beside the
-    /// program's other builds, bounded, dropped with the build, and never a write for a
-    /// landing that refused nothing, so a record without them is the bytes it was.
     #[test]
     fn refused_shims_are_recorded_per_build_bounded_and_dropped_with_the_build() {
         let l = layout("refused-shims");
@@ -1342,7 +1154,6 @@ mod tests {
         std::fs::create_dir_all(l.build_dir("ay", 19)).unwrap();
         std::fs::create_dir_all(l.build_dir("ny", 4)).unwrap();
 
-        // The control first: nothing refused, no record, nothing written.
         record_refused_shims(&l, "ay", 18, &[]).unwrap();
         assert!(
             !l.status().exists(),
@@ -1355,8 +1166,6 @@ mod tests {
             .chain((0..MAX_REFUSED_RECORDED + 3).map(|i| format!("a/{i}")))
             .collect();
         record_refused_shims(&l, "ny", 4, &many).unwrap();
-        // ay's next build is staged beside the live one: each build keeps its own entry, so
-        // a flip that never happens leaves build 18's said.
         record_refused_shims(&l, "ay", 19, &names(&["zsh"])).unwrap();
         let back = read_checked(&l).unwrap().expect("recorded");
         assert_eq!(
@@ -1378,7 +1187,6 @@ mod tests {
         assert_eq!(ny.names[0].chars().count(), MAX_REFUSED_NAME_CHARS);
         assert!(ny.names[0].ends_with('\u{2026}') && long.starts_with(&ny.names[0][..60]));
 
-        // The same landing again changes nothing, and so writes nothing.
         #[cfg(unix)]
         {
             let writes = counted::writes(&l);
@@ -1390,7 +1198,6 @@ mod tests {
             );
         }
 
-        // A program keeps at most MAX_REFUSED_BUILDS entries, the newest.
         for build in 20..20 + u64::try_from(MAX_REFUSED_BUILDS).unwrap() {
             std::fs::create_dir_all(l.build_dir("ay", build)).unwrap();
             record_refused_shims(&l, "ay", build, &names(&["fish"])).unwrap();
@@ -1402,8 +1209,6 @@ mod tests {
             (20..20 + u64::try_from(MAX_REFUSED_BUILDS).unwrap()).collect::<Vec<_>>()
         );
 
-        // ny's build leaves the store, and each of ay's builds lands again refusing nothing.
-        // Every entry goes, and the record is written without the key at all.
         std::fs::remove_dir_all(l.build_dir("ny", 4)).unwrap();
         for build in 20..20 + u64::try_from(MAX_REFUSED_BUILDS).unwrap() {
             record_refused_shims(&l, "ay", build, &[]).unwrap();
@@ -1420,8 +1225,6 @@ mod tests {
     }
 
     /// The record's refused-name map holds the bound every read and write holds: no more
-    /// programs than [`MAX_STATUS_PROGRAMS`], no more than [`MAX_REFUSED_BUILDS`] entries
-    /// for one. The control is a record at both bounds, written and read back.
     #[test]
     fn a_record_over_the_refused_shims_bounds_is_neither_written_nor_read() {
         let l = layout("refused-bounds");
@@ -1465,7 +1268,6 @@ mod tests {
                 good,
                 "{what}: a refused write leaves the record"
             );
-            // The same bytes on disk, as another writer could leave them, are refused too.
             std::fs::write(l.status(), over.to_toml().unwrap()).unwrap();
             let err = read_checked(&l).unwrap_err();
             assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{what}: {err}");
@@ -1475,12 +1277,10 @@ mod tests {
     }
 
     /// "Never checked" is exactly `status.toml` absent or `last_success_at` empty: a record
-    /// a failed pass wrote still reads as never checked; only [`stamp_success`] clears it.
     #[test]
     fn never_checked_holds_until_a_successful_pass_stamps_last_success_at() {
         let l = layout("never-checked");
         assert!(never_checked(&l), "no status.toml at all");
-        // A failed pass's record: written, stamped, and still not a completed check.
         let mut programs = BTreeMap::new();
         programs.insert(
             "*index*".to_string(),
@@ -1505,12 +1305,10 @@ mod tests {
             never_checked(&l),
             "a failed pass moves updated_at but is not a check that ran"
         );
-        // A record from before the field existed parses as never checked too.
         let legacy = "schema = 1\nupdated_at = \"2026-08-01T00:00:00Z\"\nenabled = true\n\
              index_source = \"o/r\"\noutcome = \"up to date\"\n";
         std::fs::write(l.status(), legacy).unwrap();
         assert!(never_checked(&l), "pre-field record: empty last_success_at");
-        // The success stamp — and only it — clears the condition, keeping the rest.
         stamp_success(&l, "2026-09-10T07:00:00Z").unwrap();
         assert!(!never_checked(&l));
         let back = read(&l).unwrap();
@@ -1519,10 +1317,8 @@ mod tests {
         assert_eq!(back.outcome, "up to date", "the sentence is not touched");
         let text = std::fs::read_to_string(l.status()).unwrap();
         assert!(text.contains("last_success_at = \"2026-09-10T07:00:00Z\""));
-        // Whitespace is not a stamp.
         std::fs::write(l.status(), "schema = 1\nlast_success_at = \"  \"\n").unwrap();
         assert!(never_checked(&l));
-        // No record at all: the stamp creates a minimal one.
         std::fs::remove_file(l.status()).unwrap();
         stamp_success(&l, "2026-09-10T08:00:00Z").unwrap();
         assert!(!never_checked(&l));
@@ -1531,13 +1327,6 @@ mod tests {
     }
 
     /// Tier-1 of the derived model `AtpkgFullPassRule` (aterm-spec): every record the model
-    /// reaches at `Buggy=0`, laid down by the real writers and read as the session lane reads
-    /// it ([`pass_stamps`], then `full_pass_owed`), gives the model's `verdict` and pass in
-    /// flight, and starts a pass exactly when `SessionLook` does. Negative control: the
-    /// replaced reader ([`full_pass_rule_tier1::legacy_stamps`]) over `Buggy=1`'s records is
-    /// `Buggy=1`'s lane, and holds back the pass owed after a head-watch write. The current
-    /// reader over those pre-`last_pass` records reads no failure, and a writer that records
-    /// no pass end reads a failed pass as none.
     #[test]
     fn the_full_pass_rule_conforms_to_its_derived_model() {
         use super::full_pass_rule_tier1::{legacy_stamps, looks, realize, records};
@@ -1585,7 +1374,6 @@ mod tests {
             drop(sink);
             let _ = std::fs::remove_dir_all(&l.prefix);
         });
-        // The replayed defect: a success an interval old, then the head watch writes.
         let defect = super::full_pass_rule_tier1::walk(
             &model,
             &[
@@ -1613,7 +1401,6 @@ mod tests {
         );
         assert_eq!(looks(&buggy, "SessionLook", &defect)["queued"], 0);
         let _ = std::fs::remove_dir_all(&l.prefix);
-        // A writer that records no pass end: its failed pass reads as none.
         let failed = fixed
             .iter()
             .find(|s| s["rec"] == 2 && s["ever_ok"] == 1 && s["running"] == 0)
@@ -1627,9 +1414,7 @@ mod tests {
     }
 }
 
-/// Tier-1 fixtures of the derived model `AtpkgFullPassRule` (aterm-spec), shared by this
-/// module's conformance test and `cli`'s (a queued pass's stand-down). A model tick is a
-/// wall-clock age on each side of the spacing and of the interval.
+/// Tier-1 fixtures of the derived model `AtpkgFullPassRule` (aterm-spec), shared by this module's conformance test and `cli`'s (a queued pass's stand-down).
 #[cfg(test)]
 pub(crate) mod full_pass_rule_tier1 {
     use super::*;
@@ -1665,8 +1450,7 @@ pub(crate) mod full_pass_rule_tier1 {
         order
     }
 
-    /// One reachable state per distinct record: the readers see nothing else, so states
-    /// that differ only in the truth, the queue or the ghosts are read alike.
+    /// One reachable state per distinct record.
     pub(crate) fn records(model: &Model) -> Vec<State> {
         let mut seen = std::collections::BTreeSet::new();
         reachable(model)
@@ -1693,11 +1477,7 @@ pub(crate) mod full_pass_rule_tier1 {
         next
     }
 
-    /// `state`'s record laid down at `now` in a fresh store by the real writers: the success
-    /// ([`stamp_success`]); with `records_pass_end`, each pass's end ([`stamp_pass_end`]),
-    /// else a failed pass as a bare write (the writer before `last_pass`); another writer's
-    /// row after the last pass ([`write`], as the vendor head watch writes one); and a live
-    /// progress file while a pass is `running`.
+    /// `state`'s record laid down at `now` in a fresh store by the real writers: the success ([`stamp_success`]).
     pub(crate) fn realize(
         label: &str,
         state: &State,
@@ -1712,7 +1492,6 @@ pub(crate) mod full_pass_rule_tier1 {
         let stamp = |unix: i64| aterm_types::rfc3339::format_rfc3339(unix.unsigned_abs());
         let (rec, pass_age) = (state["rec"], state["pass_age"]);
         if state["ever_ok"] == 1 {
-            // Strictly before a failed pass that ended in the same saturated age.
             let success = stamp(at(state["ok_age"]) - i64::from(rec == 2));
             stamp_success(&layout, &success).unwrap();
             if records_pass_end {
@@ -1754,9 +1533,7 @@ pub(crate) mod full_pass_rule_tier1 {
         (layout, sink)
     }
 
-    /// The reader [`pass_stamps`] replaced, kept as the negative control: the attempt is
-    /// `updated_at`, else the success; a failure is an attempt after the success, or an
-    /// attempt with no success; returned as [`Stamps`] for today's rule to read.
+    /// The reader [`pass_stamps`] replaced, kept as the negative control: the attempt is `updated_at`, else the success.
     pub(crate) fn legacy_stamps(layout: &Layout, now: i64) -> Stamps {
         let status = read(layout).unwrap_or_default();
         let unix = |stamp: &str| aterm_update_core::pkg_check::rfc3339_to_unix(stamp.trim());

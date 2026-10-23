@@ -1,17 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! agy's live upgrade, its quiet flow, driven: a stand-in aterm instance on a
-//! real socket (every request recorded) whose screen is agy 1.4.0's until the
-//! `signal`, the shell's prompt after it, and the relaunched agy once the
-//! relaunch line is typed; a scripted kernel whose agy lives until the signal,
-//! holding its conversation's presence lock, and whose relaunch appears under
-//! the shell when its line is, taking that lock; a store with the running
-//! build and a newer one the twin execs, each with its record; and the
-//! conversation's transcript, messages and summary answer as 1.4.0 wrote
-//! them in the lab. Each guard of the gate positive and negative, the claim
-//! on disk before the signal, nothing typed after, the live database read in
-//! both of its states, and the Tier-1 bind of `HarnessAgyQuietUpgrade`.
+//! agy's live upgrade, its quiet flow, driven: a stand-in aterm instance on a real socket (every request recorded) whose screen is agy 1.4.0's until the `signal`, the shell's prompt after it, and the relaunched agy once the relaunch line is typed; a scripted kernel whose agy lives until the signal, holding its conversation's presence lock, and whose relaunch appears under the shell when its line is, taking that lock; a store with the running build and a newer one the twin execs, each with its record; and the conversation's transcript, messages and summary answer as 1.4.0 wrote them in the lab.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
@@ -45,7 +35,6 @@ enum Twin {
 }
 
 /// One message of the conversation: its id, its priority, how long ago it
-/// was written (ms), and whether `read.json` marks it read.
 #[derive(Clone, Debug)]
 struct Msg {
     id: &'static str,
@@ -60,15 +49,12 @@ enum Shared {
     /// Its argv names the conversation (`--conversation=<uuid>`).
     Resuming,
     /// It holds the conversation's database with no presence lock (`-c`, an
-    /// in-TUI `/resume`).
     Lockless,
     /// The process table cannot be read.
     Unread,
 }
 
 /// One witness of the gate that changes between the first look and the last
-/// (from the hand's `lease` on): what a cron firing or a task ending in that
-/// window writes, or what a person starts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Between {
     /// A background task's `RUNNING` row lands in the transcript.
@@ -89,17 +75,14 @@ enum Between {
 #[derive(Clone, Debug, Default)]
 struct Knobs {
     /// The screen before the signal (a lab fixture): `None` idle at a turn's
-    /// end.
     screen: Option<&'static str>,
     /// The tab is held (`hold=1`).
     held: bool,
     /// Held from the Nth `status` read on (the last look's).
     held_from: Option<usize>,
     /// The transcript's rows (default: a finished turn of this process);
-    /// `Err(())` for no transcript at all.
     transcript: Option<Result<String, ()>>,
     /// The summary query's answer (default: the conversation's row idle);
-    /// `Err(())` for a database that cannot be read.
     summary: Option<Result<String, ()>>,
     /// The conversation's messages.
     messages: Vec<Msg>,
@@ -126,7 +109,6 @@ struct Knobs {
     /// The host's step (hand the relaunch back to the loop).
     hand_back: bool,
     /// Another process holds the conversation's lock from the hand's take on
-    /// (between the first look and the last).
     lock_moves: bool,
     /// The agy holds no presence lock (a fresh agy that took no turn).
     no_conversation: bool,
@@ -135,13 +117,10 @@ struct Knobs {
     /// One witness changes between the first look and the last.
     between: Option<Between>,
     /// The command line the shell's integration recorded for the command the
-    /// tab runs (default `sh agy.sh`, a launcher naming no agy).
     cmdline: Option<&'static str>,
 }
 
 /// The scripted kernel: [`TUI`] runs under [`SHELL`] until the signal,
-/// holding the conversation's lock; its relaunch [`NEW`] appears when the
-/// line is typed and takes it.
 struct LiveKernel {
     exited: Arc<AtomicBool>,
     relaunched: Arc<AtomicBool>,
@@ -248,8 +227,6 @@ impl AgyKernel for LiveKernel {
             return None;
         }
         let mut out = Vec::new();
-        // The agy itself, launched on the conversation, names it while it
-        // lives: never a sharer of its own conversation.
         if AgyKernel::alive(self, TUI)
             && ag::resumed_conversation(&self.argv).as_deref() == Some(conversation)
         {
@@ -428,7 +405,6 @@ fn message_body(id: &str, priority: &str) -> String {
 }
 
 /// One idle agy behind a build: its config with the conversation's files,
-/// the store's builds and the twin, the stand-in instance, the kernel.
 struct LiveRig {
     dir: ScratchDir,
     opts: Opts,
@@ -441,7 +417,6 @@ struct LiveRig {
 }
 
 /// Lays a store build `build` of `version` under `store`: its program and
-/// its record.
 fn lay(store: &Path, build: &str, version: &str) -> PathBuf {
     let exe = store.join(build).join("bin/agy");
     std::fs::create_dir_all(exe.parent().expect("bin")).expect("store");
@@ -460,9 +435,6 @@ fn served(fixture: &str) -> String {
 }
 
 /// The conversation's files a [`Between`] change writes under `generated`
-/// (`<config>/brain/<uuid>/.system_generated`) as the hand is taken: a
-/// background task's `RUNNING` row appended to the transcript, or a HIGH
-/// message unread. The other changes are the kernel's or the screen's.
 fn change_on_disk(generated: &Path, what: Between) {
     match what {
         Between::Transcript => {
@@ -503,7 +475,6 @@ impl LiveRig {
         std::fs::write(&crash, "").expect("crash file");
         let generated = config.join("brain").join(C1).join(".system_generated");
         std::fs::create_dir_all(generated.join("logs")).expect("logs");
-        // `Err(())`: no transcript at all.
         if let Ok(text) = knobs
             .transcript
             .clone()
@@ -677,7 +648,6 @@ impl LiveRig {
             hand_back: knobs.hand_back,
             background: knobs.background,
             aterm_state: None,
-            // `[harness] upgrade_ask` on: agy's flow is quiet whatever it says.
             ask: true,
             several_logins: false,
             usage_credits: false,
@@ -743,8 +713,6 @@ impl LiveRig {
     }
 
     /// The lane's own carry of the tab's record in flight (what the host's
-    /// exit watch and its idle point reach, `agy_carry_in_flight`), over this
-    /// rig's kernel, as a loop's carry takes it (`hand_back` off).
     fn carry(&self) -> Report {
         let st = self.record().expect("a record in flight");
         let r = Report {
@@ -774,15 +742,6 @@ impl Drop for LiveRig {
 }
 
 /// AN IDLE AGY BEHIND A NEWER BUILD IS RESTARTED ONTO IT, ITS CONVERSATION
-/// KEPT, AND NOTHING IS TYPED AFTER: one SIGTERM to that very process; the
-/// claim on disk before it (in flight, the upgrade's cause, the process, the
-/// conversation, the twin, quiet), which makes its exit `0` the harness's own
-/// restart; one line typed — the managed twin with the launch's `--effort`
-/// and `--conversation=<uuid>` — and no continuation; the record done once the
-/// new process holds the conversation's presence lock (`done:resumed`).
-/// `[harness] upgrade_ask` is on in this rig: the flow is quiet whatever it
-/// says. NEGATIVE CONTROL: a crash relaunch's record of the same process (its
-/// cause) is no claim.
 #[test]
 fn an_idle_agy_behind_is_restarted_onto_the_new_build_and_nothing_is_typed() {
     let rig = LiveRig::new("idle", Knobs::default());
@@ -856,9 +815,6 @@ fn an_idle_agy_behind_is_restarted_onto_the_new_build_and_nothing_is_typed() {
 }
 
 /// THE HOST'S STEP hands the relaunched agy back to its loop (`adopted`: it
-/// leads the tab and holds the conversation's lock), whose next idle point
-/// carries it on QUIETLY: the lock held by the new process, nothing typed
-/// (`done:resumed`).
 #[test]
 fn the_hosts_step_adopts_and_its_carry_types_nothing() {
     let rig = LiveRig::new(
@@ -879,10 +835,6 @@ fn the_hosts_step_adopts_and_its_carry_types_nothing() {
 }
 
 /// THE EXIT CARRIED BY THE HOST'S EXIT WATCH: a shell slow to take its
-/// terminal back leaves the step `wait:shell-prompt` with the claim in
-/// flight. The host reads that exit as the harness's own restart
-/// (`relaunch::restarted`), never `ended:graceful-exit`, and the lane's own
-/// carry types the line once the prompt is back.
 #[test]
 fn a_restart_left_in_flight_is_carried_as_the_harnesss_own() {
     let ready = Arc::new(AtomicBool::new(false));
@@ -907,8 +859,6 @@ fn a_restart_left_in_flight_is_carried_as_the_harnesss_own() {
 }
 
 /// THE QUIET ADOPTION NEEDS THE LOCK: a relaunched agy that never takes the
-/// conversation's presence lock started a fresh one (agy says `conversation
-/// not found`): `refused:started-fresh`, nothing typed but the line.
 #[test]
 fn a_relaunch_that_never_holds_the_lock_started_fresh() {
     let mut rig = LiveRig::new(
@@ -918,8 +868,6 @@ fn a_relaunch_that_never_holds_the_lock_started_fresh() {
             ..Knobs::default()
         },
     );
-    // A lock that is never taken is waited out to the bound: 50 ms of it
-    // decides as the test clock's second did.
     rig.opts.timings.agy_lock = Duration::from_millis(50);
     let r = rig.visit();
     assert_eq!(r.step, "refused:started-fresh", "{r:?}");
@@ -927,7 +875,6 @@ fn a_relaunch_that_never_holds_the_lock_started_fresh() {
 }
 
 /// One knob, the word the step waits on, and nothing signalled or typed: no
-/// record is left where none stood.
 fn holds(name: &str, knobs: Knobs, want: &str) {
     let rig = LiveRig::new(name, knobs);
     let r = rig.visit();
@@ -945,10 +892,6 @@ fn restarts(name: &str, knobs: Knobs) {
 }
 
 /// G-A2(b), THE TRANSCRIPT: a command task running, a daemon task, a
-/// subagent working — each with no end row in this process's rows — hold the
-/// restart; a torn transcript, and none at all, fail closed. POSITIVE: the
-/// task ended and the subagent gone idle hold nothing, nor do rows of an
-/// earlier process (a task its SIGTERM killed keeps its `RUNNING` row).
 #[test]
 fn the_transcript_holds_running_work() {
     let with = |rows: String| Knobs {
@@ -1000,10 +943,6 @@ fn the_transcript_holds_running_work() {
 }
 
 /// G-A1 AND G-A2(c), THE SUMMARY ROW: `RUNNING` (a turn, or a turn's end a
-/// moment after the screen reads it over) holds the restart as `turn-open`,
-/// `not_fully_idle` as background work, a subagent's own row `RUNNING` as a
-/// subagent; a database that cannot be read, and no row of the
-/// conversation, fail closed.
 #[test]
 fn the_summary_row_holds_the_turn_and_the_work() {
     let answer = |text: String| Knobs {
@@ -1052,9 +991,6 @@ fn the_summary_row_holds_the_turn_and_the_work() {
 }
 
 /// G-A2(e), THE WAKES: a waking message unread, or read but just written,
-/// holds the restart (`queued-work`); one `read.json` cannot parse fails
-/// closed. POSITIVE: an old message read, and a LOW one unread (a cancelled
-/// task's end waits for the person's next message), hold nothing.
 #[test]
 fn a_pending_wake_holds_the_restart() {
     let msg = |priority, ago_ms, read| Msg {
@@ -1094,12 +1030,6 @@ fn a_pending_wake_holds_the_restart() {
 }
 
 /// G-A1'S SCREEN HALF AND G-A2(a)/(d), AND THE PERSON: agy's own background
-/// work drawn under the composer (a task's panel row; with the panel turned
-/// off, a subagent's count alone) holds the restart as background work; a
-/// turn's spinner, an exit pending and a turn that ended on a wall as a
-/// screen not idle; a draft, a hold, a child process of any name (a daemon
-/// task's bare `sleep`, which Claude Code's shell-name list misses) and an
-/// unreadable process table each by its own word.
 #[test]
 fn the_screen_the_person_and_any_child_hold_the_restart() {
     use aterm_phase::agy::fixtures::lab;
@@ -1148,11 +1078,6 @@ fn the_screen_the_person_and_any_child_hold_the_restart() {
 }
 
 /// THE BUILD AND THE ORDER: a probe of the new build out of time or exiting
-/// is no proof (`wait:build-fails`); a twin naming the running build or an
-/// older one moves nothing (`current`); a launch no relaunch can carry is
-/// never restarted (`skip:…`); a fresh agy that holds no conversation has
-/// nothing to resume (`wait:no-session`); and at a background break nothing
-/// acts (`wait:break`).
 #[test]
 fn the_build_the_order_and_the_launch_hold_the_restart() {
     holds(
@@ -1210,13 +1135,6 @@ fn the_build_the_order_and_the_launch_hold_the_restart() {
 }
 
 /// THE LAST LOOK AND THE SIGNAL put the claim back: a hold landing between
-/// the claim and the signal, the conversation's lock taken by another
-/// process meanwhile, or ANY witness of the gate turning in that window — a
-/// background task's row in the transcript, a waking message unread, the
-/// summary row `RUNNING`, a child process, a busy screen, another agy on the
-/// conversation (`wait:changed-before-signal`: the last look is the whole
-/// gate again, never its hold half alone) — and a signal the server refuses
-/// (`wait:signal-held`) leave no record, nothing typed.
 #[test]
 fn a_change_before_the_signal_or_its_refusal_takes_the_claim_back() {
     holds(
@@ -1265,10 +1183,6 @@ fn a_change_before_the_signal_or_its_refusal_takes_the_claim_back() {
 }
 
 /// G-A3, THE CLAIM ON DISK BEFORE THE SIGNAL: a claim whose write does not
-/// complete (a directory where the tab's record goes) waits
-/// (`wait:claim-unwritten`), signals nothing and types nothing, and leaves
-/// what stood there as it was — an exit with no claim on disk would be read
-/// as someone's graceful end, and the agy it ended never relaunched.
 #[test]
 fn a_claim_that_cannot_be_written_signals_nothing() {
     let blocked = LiveRig::new("claim-write-refused", Knobs::default());
@@ -1290,10 +1204,6 @@ fn a_claim_that_cannot_be_written_signals_nothing() {
 }
 
 /// G-A4, ANOTHER AGY ON THE CONVERSATION: one whose argv names it, or one
-/// holding its database with no lock (`agy -c` in another tab), holds the
-/// restart (`wait:conversation-shared`) — its relaunch could never type while
-/// that agy has it open — and so does a process table that cannot be read.
-/// POSITIVE: the agy's own argv naming its conversation is no other agy.
 #[test]
 fn another_agy_on_the_conversation_holds_the_restart() {
     for (name, shared) in [
@@ -1320,11 +1230,6 @@ fn another_agy_on_the_conversation_holds_the_restart() {
 }
 
 /// G-A4, A LAUNCH THAT SET ITS OWN ENVIRONMENT on its typed line (the shell's
-/// record of the command the tab runs) is never restarted
-/// (`skip:env-not-carried`): the relaunch line runs in the shell's
-/// environment, and the key and endpoint would be gone. POSITIVE: a line
-/// that sets nothing ahead of agy, and one setting `HOME` alone (which the
-/// relaunch carries), restart.
 #[test]
 fn a_launch_that_set_its_own_environment_is_not_restarted() {
     holds(
@@ -1354,7 +1259,6 @@ fn a_launch_that_set_its_own_environment_is_not_restarted() {
 }
 
 /// [`live::upgrade_due`]: due while behind, not due when current, never
-/// another lane's tab (a leader that is no `agy`).
 #[test]
 fn the_tab_is_due_while_its_build_is_behind() {
     let behind = LiveRig::new("due", Knobs::default());
@@ -1382,17 +1286,7 @@ fn the_tab_is_due_while_its_build_is_behind() {
     );
 }
 
-// ---------------------------------------------------------------- the live database
-
 /// THE SUMMARY DATABASE IS READ LIVE, WITH NO LOCK, IN BOTH OF ITS STATES
-/// (macOS: Apple's `/usr/bin/sqlite3`), over a database laid as agy lays its
-/// own (WAL mode, the table's columns): CLOSED — no `-wal`, no `-shm`, as agy
-/// leaves it some 30 s after its last write — it is read as an immutable
-/// file, and the read leaves neither file behind; OPEN — another connection
-/// holding it with rows still in its `-wal` — from a private copy of the file
-/// and its `-wal`, which holds them once the holder has committed. NEGATIVE
-/// CONTROLS: a rollback journal with something in it beside the file (a write
-/// under way) is no answer, and neither is a conversation that is no UUIDv4.
 #[cfg(target_os = "macos")]
 #[test]
 fn the_summary_database_is_read_only_open_or_closed() {
@@ -1421,9 +1315,6 @@ fn the_summary_database_is_read_only_open_or_closed() {
     )
     .unwrap_or_else(|e| panic!("sqlite3 within the hang detector: {e}"));
     assert!(made.status.success(), "{made:?}");
-    // Closed as agy closes it: every write checkpointed into the file, and
-    // the `-wal` and `-shm` gone (Apple's `sqlite3` keeps them; agy's own
-    // SQLite deletes both at its close, measured).
     let _ = std::fs::remove_file(side("wal"));
     let _ = std::fs::remove_file(side("shm"));
     let out = live::read_summaries(&config, C1).expect("read closed");
@@ -1432,13 +1323,6 @@ fn the_summary_database_is_read_only_open_or_closed() {
         !side("wal").exists() && !side("shm").exists(),
         "the read writes nothing"
     );
-    // Open: a connection holds it, its last write still in the `-wal`. The
-    // holder reads its row back once its INSERT is done, and the database is
-    // read only then. (Read through SQLite's own open while the holder's first
-    // transaction ran, a reader that found the WAL index not yet built took
-    // its write lock to build it, and the shell, which sets no busy timeout,
-    // failed the INSERT `database is locked` and lost it: fc50504bd3, and the
-    // reason the read now takes no lock.)
     let mut holder = aterm_uds::spawnfd::command("/usr/bin/sqlite3")
         .arg(&db)
         .stdin(aterm_uds::spawnfd::Stdio::piped())
@@ -1447,7 +1331,6 @@ fn the_summary_database_is_read_only_open_or_closed() {
         .expect("holder");
     let mut stdin = holder.stdin.take().expect("its stdin");
     let stdout = holder.stdout.take().expect("its stdout");
-    // What it printed, up to the row it read back or its end.
     let (tell, heard) = std::sync::mpsc::channel();
     let listener = std::thread::spawn(move || {
         let mut said = String::new();
@@ -1469,7 +1352,6 @@ fn the_summary_database_is_read_only_open_or_closed() {
     )
     .expect("write");
     stdin.flush().expect("flush");
-    // A hang detector: the holder reads its row back within a minute.
     let said = heard
         .recv_timeout(Duration::from_secs(60))
         .unwrap_or_default();
@@ -1493,7 +1375,6 @@ fn the_summary_database_is_read_only_open_or_closed() {
     );
     drop(stdin);
     let _ = holder.wait();
-    // A rollback journal with something in it: a write under way, no answer.
     std::fs::write(side("journal"), b"\xd9\xd5\x05\xf9").expect("journal");
     assert_eq!(live::read_summaries(&config, C1), Err(()));
     std::fs::remove_file(side("journal")).expect("no journal");
@@ -1506,17 +1387,6 @@ fn the_summary_database_is_read_only_open_or_closed() {
 }
 
 /// THE SUMMARY READ NEVER LOCKS OUT A WRITER (macOS: Apple's `/usr/bin/sqlite3`),
-/// over the database as a holder that died leaves it — rows still in a large
-/// `-wal`, the `-shm` beside it, no connection: the state in which a reader
-/// through SQLite, the first to open it, empties the WAL index and rebuilds it
-/// holding the index's write and recover locks (agy's own open makes the same
-/// unbuilt index for a moment). The witness (`aterm_uds::foreign_db::witness`)
-/// watches the recover lock for the whole read; had the read held it, it froze
-/// the reader there and ran a writer with NO busy timeout (the shell, as
-/// fc50504bd3's holder): measured with the read through SQLite's read-only
-/// open, its INSERT failed `database is locked` and the row was lost. The read
-/// holds none, answers the `-wal`'s row (from its private copy), and the
-/// writer's row lands.
 #[cfg(all(target_os = "macos", debug_assertions))]
 #[test]
 fn the_summary_read_never_locks_out_a_writer_with_no_busy_timeout() {
@@ -1530,9 +1400,6 @@ fn the_summary_read_never_locks_out_a_writer_with_no_busy_timeout() {
             "INSERT OR REPLACE INTO conversation_summaries VALUES ('{C1}','{status}',{nfi},'');"
         )
     };
-    // The holder: the table, eight thousand pages more (their recovery is
-    // what a reader would hold the lock through), the conversation's row; and
-    // then it is killed, as a crash ends agy, its writes still in the `-wal`.
     let mut holder = aterm_uds::spawnfd::command("/usr/bin/sqlite3")
         .arg(&db)
         .stdin(aterm_uds::spawnfd::Stdio::piped())
@@ -1552,7 +1419,6 @@ fn the_summary_read_never_locks_out_a_writer_with_no_busy_timeout() {
     )
     .expect("write");
     stdin.flush().expect("flush");
-    // A hang detector: the holder says it wrote, or ends.
     let said: Vec<String> =
         std::io::BufRead::lines(std::io::BufReader::new(holder.stdout.take().expect("out")))
             .map_while(Result::ok)
@@ -1572,10 +1438,6 @@ fn the_summary_read_never_locks_out_a_writer_with_no_busy_timeout() {
         )
         .unwrap_or_else(|e| panic!("the writer within the hang detector: {e}"))
     };
-    // The index's recover lock (byte 122 of the `-shm`): held, with its write
-    // lock, from the moment a reader has the index's first page laid until the
-    // index is rebuilt, when a writer that opens meets it at once (a writer
-    // that came sooner retries for some 10 s by itself).
     let (read, caught) = aterm_uds::foreign_db::witness::while_read(
         &side("shm"),
         122,
@@ -1617,7 +1479,6 @@ fn the_summary_read_never_locks_out_a_writer_with_no_busy_timeout() {
 }
 
 /// The messages look: none, a directory that cannot be read, a message that
-/// cannot be read.
 #[test]
 fn the_messages_look_reads_the_directory_and_fails_closed() {
     let dir = scratch("messages-look");
@@ -1649,8 +1510,6 @@ fn the_messages_look_reads_the_directory_and_fails_closed() {
     let _ = std::fs::remove_dir_all(&*dir);
 }
 
-// ---------------------------------------------------------------- Tier-1
-
 type State = BTreeMap<&'static str, i64>;
 
 /// The running build's version, and the twin's for each `landed`.
@@ -1663,10 +1522,6 @@ fn versions(landed: i64) -> (&'static str, &'static str) {
 }
 
 /// The screen a state stands for, as agy 1.4.0 draws it: a draft (over the
-/// panel where work runs and it is drawn); a screen not idle (a turn's
-/// spinner over the panel, a turn's spinner, an exit pending); else the work
-/// drawn under an ended turn (its panel row, or its count alone with the
-/// panel off) or the end of a turn.
 fn state_rows(s: &State) -> Vec<String> {
     use aterm_phase::agy::fixtures::lab;
     let work = s["task"] == 1 || s["daemon"] == 1 || s["subagent"] == 1;
@@ -1708,9 +1563,6 @@ fn state_rows(s: &State) -> Vec<String> {
 }
 
 /// The summary query's answer a state stands for: the row `RUNNING` through
-/// a turn (and a moment past its end), not fully idle while a task, a timer
-/// or a subagent runs — never for a daemon task (measured) — and the
-/// subagent's own row `RUNNING` while it works.
 fn state_summary(s: &State) -> String {
     let status = if s["turn"] == 1 {
         "CASCADE_RUN_STATUS_RUNNING"
@@ -1726,8 +1578,6 @@ fn state_summary(s: &State) -> String {
 }
 
 /// The transcript a state stands for: a finished turn, a command task's
-/// `RUNNING` row, a daemon task's, a subagent's spawn — each still open — and
-/// a torn tail where it cannot be read.
 fn state_transcript(s: &State) -> String {
     let mut text = finished_turn(AT);
     if s["task"] == 1 {
@@ -1746,17 +1596,6 @@ fn state_transcript(s: &State) -> String {
 }
 
 /// THE REAL DECISION AT STATE `s`: the order of its builds
-/// ([`pure::moves_onto`]) and the gate ([`pure::gate`]) over the look the
-/// real readers make of its world, composed by the drive's own
-/// [`live::look_of`] — the person by the `status` line's own rule
-/// (`held_by_status`), the screen by agy's reader and the background-work
-/// witness, the summary by its rule, the transcript by
-/// [`pure::quiet_transcript`], the children by the process rule
-/// (`descendants_in`: a command task's shell, a daemon's bare command; a
-/// timer and a subagent are no process), the wakes by [`pure::wakes`], the
-/// other agys on the conversation by [`live::sharers`] over a kernel that
-/// answers one (`agy -c` in another tab) where the state says so: `rigs`,
-/// alone and shared.
 fn real_restarts(s: &State, rigs: &(LiveRig, LiveRig)) -> bool {
     let (running, target) = versions(s["landed"]);
     let rows = state_rows(s);
@@ -1780,7 +1619,6 @@ fn real_restarts(s: &State, rigs: &(LiveRig, LiveRig)) -> bool {
     };
     let rig = if s["shared"] == 1 { &rigs.1 } else { &rigs.0 };
     let shared = live::sharers(&rig.kernel, &rig.config, C1, TUI);
-    // The look composed as the drive's own `look_at` composes it.
     let look: Look = live::look_of(
         crate::harness::upgrade_drive::held_by_status(&status, 120),
         Some(&rows),
@@ -1795,9 +1633,6 @@ fn real_restarts(s: &State, rigs: &(LiveRig, LiveRig)) -> bool {
 }
 
 /// THE REAL CLAIM: the record the step writes before its signal, from a
-/// snapshot of the agy it ends, read by the one rule the host's exit watch
-/// reads a leaving agent by (`relaunch::ended_by_restart`): `true` is its exit
-/// relaunched as the harness's own restart.
 fn real_claim_relaunches() -> bool {
     let rig = LiveRig::new("tier1-claim", Knobs::default());
     let args = rig.kernel.args(TUI).expect("argv");
@@ -1823,23 +1658,6 @@ fn real_claim_relaunches() -> bool {
 }
 
 /// Tier-1 of `HarnessAgyQuietUpgrade` (aterm-models-harness
-/// `harness_agy_quiet_upgrade_model`): every state the model reaches before
-/// the move is replayed through the real order, screen reader, summary rule,
-/// transcript reader, person rule, process rule, wake rule, sharers and gate:
-/// the model's first `Look` is enabled EXACTLY where the real quiet flow's
-/// first look opens, and once the claim is on disk its `Restart` exactly
-/// where the real last look still opens and its `TakeBack` exactly where it
-/// does not (the last look is the whole gate again). Its `ReadExit`
-/// relaunches exactly as the real claim makes the exit the harness's own
-/// (`ended_by_restart`), where the unclaimed exit, agy's `0`, is read by its
-/// own table as someone's end (`exit_kind`: clean, never relaunched); the
-/// drive test `a_claim_that_cannot_be_written_signals_nothing` binds
-/// `ClaimUnwritten`. Negative controls, each mutant caught alone in a
-/// reachable state: a restart over open work, over a daemon task, mid-turn,
-/// over a pending wake, over another agy on the conversation, or on a stale
-/// first look is where the real gate holds; `BuildReadAsOlder` where the real
-/// order moves; `BuildReadAsNewer` where it does not; `RestartUnclaimed`
-/// where the real claim relaunches.
 #[test]
 fn tier1_the_real_agy_quiet_upgrade_conforms_to_the_model() {
     let model = aterm_models_harness::harness_agy_quiet_upgrade_model();
@@ -1855,8 +1673,6 @@ fn tier1_the_real_agy_quiet_upgrade_conforms_to_the_model() {
         "BuildReadAsOlder",
         "BuildReadAsNewer",
     ];
-    // The model's Buggy members are exactly these: the actions no state of
-    // the faithful model fires.
     let fired = aterm_spec::interp::fired_actions(&model);
     let dead: BTreeSet<&str> = model
         .actions
@@ -1919,7 +1735,6 @@ fn tier1_the_real_agy_quiet_upgrade_conforms_to_the_model() {
             .entry(key)
             .or_insert_with(|| real_restarts(&s, &rigs));
         match (s["looked"], s["claimed"]) {
-            // The first look.
             (0, _) => {
                 assert_eq!(model.action_enabled("Look", &s), real, "Look at {s:?}");
                 assert!(
@@ -1927,7 +1742,6 @@ fn tier1_the_real_agy_quiet_upgrade_conforms_to_the_model() {
                     "Restart unlooked {s:?}"
                 );
             }
-            // The last look, the claim on disk.
             (1, 1) => {
                 assert_eq!(
                     model.action_enabled("Restart", &s),
@@ -1941,7 +1755,6 @@ fn tier1_the_real_agy_quiet_upgrade_conforms_to_the_model() {
                 );
                 lasts += 1;
             }
-            // Looked, the claim not yet on disk: nothing signals.
             _ => assert!(
                 !model.action_enabled("Restart", &s),
                 "Restart unclaimed {s:?}"
@@ -1959,8 +1772,6 @@ fn tier1_the_real_agy_quiet_upgrade_conforms_to_the_model() {
             let caught_here = match mutant {
                 "BuildReadAsOlder" => real,
                 "RestartUnclaimed" => {
-                    // The mutant's exit is left as someone's; the real
-                    // restart claims it first and it is relaunched.
                     let mut wrong = s.clone();
                     assert!(buggy.fire(mutant, &mut wrong));
                     assert!(buggy.fire("Exit", &mut wrong));

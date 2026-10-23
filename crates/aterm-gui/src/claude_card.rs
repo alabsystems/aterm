@@ -15,8 +15,8 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
 use aterm_core::render::{
-    ChromeIcon, ChromeRaster, DecoBlend, DecoGlyph, FxLayer, GlowQuad, InkCell, PxRect, RainHalo,
-    RenderInput, WordDecoration,
+    BandIcon, ChromeIcon, ChromeRaster, DecoBlend, DecoGlyph, FxLayer, GlowQuad, InkCell, PxRect,
+    RainHalo, RenderInput, WordDecoration,
 };
 use aterm_core::terminal::RenderCell;
 use aterm_effects::harness_card::{
@@ -566,6 +566,9 @@ pub(crate) struct WindowCards {
     spare_halos: Vec<RainHalo>,
     spare_ink: Vec<InkCell>,
     spare_decos: Vec<WordDecoration>,
+    /// The empty pixel row every icon-only raster shares as its ground and
+    /// rail ([`Self::paint_icon`]).
+    no_px: Arc<[u32]>,
     panels: crate::claude_panel::WindowPanels,
     notice_hits: Vec<NoticeHit>,
     away: Option<Instant>,
@@ -595,15 +598,43 @@ impl WindowCards {
         scratch.fx_layers.push(layer);
     }
 
-    /// Record and draw `icon` on `row`'s chrome raster for [`strip`].
+    /// Draw each full-size, narrow cell of `cells` (written on frame row
+    /// `frame_row` from column `col`) whose character is a glass mark
+    /// ([`BandIcon::glass_mark`]) as the chrome's icon of it, the cell keeping
+    /// its character; a facts' `Script::Sub` mark keeps its glyph.
+    pub(crate) fn paint_marks(
+        &mut self,
+        scratch: &mut RenderInput,
+        frame_row: usize,
+        col: usize,
+        cells: &[RenderCell],
+    ) {
+        let Ok(row) = u16::try_from(frame_row) else {
+            return;
+        };
+        for (k, cell) in cells.iter().enumerate() {
+            if cell.wide || cell.script != aterm_core::terminal::Script::Normal {
+                continue;
+            }
+            if let Some(icon) = BandIcon::glass_mark(cell.ch)
+                && let Ok(col) = u16::try_from(col + k)
+            {
+                self.paint_icon(scratch, row, ChromeIcon { col, icon });
+            }
+        }
+    }
+
+    /// Record and draw `icon` on `row`'s chrome raster for [`strip`]. A row
+    /// with no raster gets one whose ground and rail are the one shared empty
+    /// row, so it allocates only its icon list.
     pub(crate) fn paint_icon(&mut self, scratch: &mut RenderInput, row: u16, icon: ChromeIcon) {
         let rasters = &mut scratch.chrome_rasters;
         match rasters.iter_mut().find(|raster| raster.row == row) {
             Some(raster) => raster.icons.push(icon),
             None => rasters.push(ChromeRaster {
                 row,
-                ground: Arc::from(Vec::new()),
-                rail: Arc::from(Vec::new()),
+                ground: Arc::clone(&self.no_px),
+                rail: Arc::clone(&self.no_px),
                 rail_h: 0,
                 clear_rail: false,
                 own: Vec::new(),

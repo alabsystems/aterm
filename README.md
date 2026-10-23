@@ -89,8 +89,8 @@ This is the same installer, served by alab.systems as of the latest release;
 whose architecture the release serves. It supports `aarch64-unknown-linux-gnu`
 and `x86_64-unknown-linux-gnu` when the release carries their signed
 executables (`aterm-<version>-linux-aarch64`, `aterm-<version>-linux-x86_64`),
-and says so when there is none for your architecture. It needs curl, `timeout`,
-OpenSSL with Ed25519 support, and Python 3.11+ with `hashlib.file_digest` and
+and says so when there is none for your architecture. It needs curl, OpenSSL
+with Ed25519 support, and Python 3.11+ with `hashlib.file_digest` and
 `os.memfd_create`. It verifies the signature chain and the
 executable before running anything, then installs the binary under `~/.local`
 and enrolls it for signed updates:

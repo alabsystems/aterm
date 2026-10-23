@@ -1,28 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `App` glue for the Overview ([`crate::overview`],
-//! `docs/DESIGN-owner-surfaces-2026-10-16.md` §6, was the Connection Map):
-//! snapshot every session's words — its published need verdict, else what its
-//! agent is doing and for how long, its task, and who drives it — grouped by
-//! window, then who manages whom from the task records' `from=`; open the card
-//! on the frontmost window WITH raise/focus, or from one of its entrances (the
-//! status item, the needs pill's `+N`, a manager's Team chip) on its window,
-//! at the session it names, the window raised; keep an OPEN card fresh (the
-//! status glance's rebuild, the connection and close funnels, and at most one
-//! re-read a minute at paint time, so its coarse ages advance); and settle the
-//! acts: ⏎ raises through the SAME body as the `raise` wire verb, `t` is Take
-//! Over / Hand Back, `r` opens a done worker's result as a document tab, ⌫
-//! stops a worker behind the inline confirm. A control client's key into the
-//! card is marked (`App::person_gesture_refused`): its `t` is refused, and its
-//! ⌫ on a held tab is refused as the wire `signal` verb is.
-//!
-//! The words come from the values every other reader reads (the one need
-//! publication, the agent publication, the task record, the holds), under the
-//! same leaf locks, never a second classification. The state lives in the
-//! one modal [`crate::overlay::Overlay`] slot (keys structurally gated before
-//! the terminal), every mutator repaints and refreshes the a11y tree, and the
-//! pointer follows the palette's claim/hover/arm discipline.
+//! `App` glue for the Overview ([`crate::overview`]) in the modal [`crate::overlay::Overlay`] slot.
 
 use aterm_session::SessionId;
 
@@ -39,17 +18,14 @@ pub(crate) enum OverviewAt {
     Top,
     /// A session's chip, by local id (the pill's `+N`: the next need).
     Session(u64),
-    /// A manager's manages line, by its local id, else its chip (its Team
-    /// chip).
+    /// A manager's manages line, by its local id, else its chip (its Team chip).
     Manager(u64),
 }
 
-/// How often an open card's coarse ages are read again at paint time
-/// ([`App::overview_prepaint`]): the finest unit [`coarse_age`] prints.
+/// How often an open card's coarse ages are read again at paint time ([`App::overview_prepaint`]).
 pub(crate) const OVERVIEW_AGE_STEP: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// A coarse age, so a card left open does not repaint every second: `just
-/// now`, `4m`, `2h`, `3d`.
+/// A coarse age, so a card left open does not repaint every second.
 pub(crate) fn coarse_age(ms: u64) -> String {
     const MIN: u64 = 60_000;
     const HOUR: u64 = 60 * MIN;
@@ -65,7 +41,7 @@ pub(crate) fn coarse_age(ms: u64) -> String {
     }
 }
 
-/// A result's size in words: `812 B`, `2.1 KB`, `1.4 MB`.
+/// A result's size in words.
 pub(crate) fn size_words(bytes: u64) -> String {
     const KB: u64 = 1024;
     const MB: u64 = 1024 * KB;
@@ -85,9 +61,6 @@ fn short_sid(sid: &str) -> String {
 
 impl App {
     /// One session's line: its need, else what it is doing; its task; who
-    /// drives it. Leaf locks only, each released before the next: the
-    /// timeline's (verdict, agent publication, task record), the fabric's
-    /// (holds), the meta's (Autopilot word, inside `autopilot::word_of`).
     fn overview_chip(
         &self,
         h: &crate::session_store::SessionHandle,
@@ -128,13 +101,10 @@ impl App {
             None => ChipMark::Quiet,
         };
         let doing = match (&verdict.need, &verdict.waiting) {
-            // A harness's need, whose `what` has no frame (§12.2.3), says it
-            // is a need: no header above the line does (§12.2.9).
             (Some(need), _) => need.harness.as_ref().map_or_else(
                 || need.what.clone(),
                 |ask| ask.cued_line(crate::needs::ROW_WHAT_MAX),
             ),
-            // A person's words, as ❯ ▸ Waiting says them, never the wire word.
             (None, Some(wait)) => {
                 let words = crate::needs::wait_words(wait, verdict.recheck_unix.is_some());
                 match &wait.reset {
@@ -147,8 +117,6 @@ impl App {
         };
         let task_words = task.as_ref().map(|t| {
             let age = coarse_age(t.since_ms());
-            // A landing says `landed` (§12.4.1): `task landed 4m`, never
-            // `task done 4m (landed)`; an older build's done keeps its why.
             let landed = t.state == crate::task_record::TaskState::Done
                 && t.why == Some(crate::task_record::WHY_LANDED);
             let mut words = if landed {
@@ -179,13 +147,6 @@ impl App {
                     None => Driver::WorkerOfElsewhere(short_sid(&t.from)),
                 }
             });
-        // Who drives, in the chip's own words (`crate::app_presence::
-        // driven_words`: `land, landed`, §12.4.1), and why a landing holds
-        // (§12.3.1) on a line of its own under the chip's: the hold's words
-        // with no clock, as the menu bar's landing worker's tip says them
-        // (`hold_words`' tip form), only where a land act's yield was read.
-        // On the chip's own line the hover's long words would push `typed
-        // by` past the card's width.
         let (driven, held) = program
             .filter(|agent| hosting.hosts(h.sid.as_str(), autopilot, *agent))
             .map_or((None, None), |_| {
@@ -239,7 +200,6 @@ impl App {
                     .unwrap_or(0)
                     .saturating_sub(typed.at_unix_ms);
                 let age = coarse_age(ago);
-                // `just now`, else `4m ago`.
                 let when = if ago < 60_000 {
                     age
                 } else {
@@ -255,12 +215,6 @@ impl App {
     }
 
     /// Snapshot the card: sessions grouped by window (tab order, pane leaves
-    /// included), a trailing `elsewhere` group for registered sessions no
-    /// window shows, and one manages line per manager a task's `from=` names
-    /// (a manager not on this aterm is named by its sid, `(not here)`).
-    /// Registry snapshot first; each session's leaf locks inside
-    /// [`Self::overview_chip`], no store lock held across them. Exited
-    /// sessions are not listed.
     fn overview_parts(&self) -> (Vec<OverviewGroup>, Vec<Manages>) {
         let hosting = self.harness_hosting();
         let handles: Vec<crate::session_store::SessionHandle> = {
@@ -292,6 +246,7 @@ impl App {
                         continue;
                     };
                     let Some(h) = by_local.get(&local) else {
+                        // an unregistered stub labels no chip
                         continue; // an unregistered stub labels no chip
                     };
                     if placed.insert(local) {
@@ -300,6 +255,7 @@ impl App {
                 }
             }
             if chips.is_empty() {
+                // an all-native window has no session lines to head
                 continue; // an all-native window has no session lines to head
             }
             let active_title = ws
@@ -327,8 +283,6 @@ impl App {
                 chips: elsewhere,
             });
         }
-        // Who manages whom: every task record a manager started, by manager,
-        // in session order.
         let mut manages: Vec<Manages> = Vec::new();
         for h in &handles {
             let from = h
@@ -365,9 +319,7 @@ impl App {
         (groups, manages)
     }
 
-    /// Open the Overview (host+raise): on the FRONTMOST window, which comes
-    /// forward with it. `Err` (nothing opens) with no window resolvable, so the
-    /// wire caller reports honestly; the menu path logs and moves on.
+    /// Open the Overview (host+raise).
     pub(crate) fn open_overview(&mut self) -> Result<(), String> {
         let Some(wid) = self.frontmost_window else {
             return Err("no front window to open the overview on".to_string());
@@ -375,12 +327,7 @@ impl App {
         self.open_overview_on(wid)
     }
 
-    /// The tab menu's Stop Worker… where no sheet can ask the person
-    /// (headless, off macOS): the Overview opens on `wid` with `session`'s
-    /// chip selected and its inline confirm armed for the person's hand, so
-    /// their second ⌫ stops it and anything else keeps it. Nothing is
-    /// stopped here. A control client's choice never comes here: it is the
-    /// `signal` verb's act, with no card (`App::dispatch_tab_menu_connection`).
+    /// The tab menu's Stop Worker… where no sheet can ask the person (headless, off macOS).
     pub(crate) fn overview_arm_stop(&mut self, wid: WindowId, session: u64) {
         let controller = self.person_gesture_refused();
         if let Err(e) = self.open_overview_on(wid) {
@@ -398,15 +345,7 @@ impl App {
         self.repaint_overview_pointer(wid, true);
     }
 
-    /// THE OVERVIEW'S OWN ENTRANCES (§3, §5): the status item's Overview… on
-    /// the frontmost window, the needs pill's `+N` on its window at the
-    /// window's next need, and a manager's Team chip on the window clicked
-    /// at that manager. Each opens the card on `wid` with its cursor `at`
-    /// (where the card lists it), then RAISES the window
-    /// ([`Self::raise_window`]: de-miniaturize, then focus): a status item
-    /// click never activates aterm, and the pill and the chip may sit in a
-    /// window behind. The Agents menu's row and the wire's `open overview`
-    /// keep [`Self::open_overview`], whose card comes forward without one.
+    /// Open the Overview at `entrance`, raising the window.
     pub(crate) fn open_overview_raised(
         &mut self,
         wid: WindowId,
@@ -429,9 +368,6 @@ impl App {
     }
 
     /// [`Self::open_overview`] on `wid`, which comes forward with it. Where
-    /// this aterm's fabric is configured, the card lists what the last read
-    /// of the fabric's log said ("On the fabric") and kicks the
-    /// next read ([`Self::kick_fabric_read`]), whose landing re-renders it.
     fn open_overview_on(&mut self, wid: WindowId) -> Result<(), String> {
         let (groups, manages) = self.overview_parts();
         self.agents.overview_read_at = Some(std::time::Instant::now());
@@ -457,11 +393,7 @@ impl App {
         self.close_overlay_card(wid, |ws| ws.overview().is_some());
     }
 
-    /// Re-snapshot every OPEN card, selection and confirm surviving by
-    /// identity, and repaint those whose words moved: the status glance's
-    /// rebuild calls it on the way to the wait (the same changes the menu bar
-    /// shows), and so do the connection and close funnels. Nothing open costs
-    /// one scan of the windows.
+    /// Re-snapshot every open card, selection and confirm surviving by identity.
     pub(crate) fn overview_refresh_all(&mut self) {
         let open: Vec<WindowId> = self
             .windows
@@ -494,12 +426,7 @@ impl App {
         }
     }
 
-    /// Re-read the words into an open card on `wid` from the redraw path, at
-    /// most once a [`OVERVIEW_AGE_STEP`]: its ages are coarse (minutes), and
-    /// they move with no wake, so a card open on a quiet aterm still advances
-    /// them at its next paint past the step. Every other frame costs one
-    /// clock compare; what moves with a wake re-snapshots where the glance is
-    /// rebuilt ([`Self::overview_refresh_all`]).
+    /// Re-read the words into an open card on `wid` from the redraw path.
     pub(crate) fn overview_prepaint(&mut self, wid: WindowId) {
         if self
             .windows
@@ -528,8 +455,6 @@ impl App {
     }
 
     /// How many sessions the other aterms on this Mac hold, as the last
-    /// sibling scan counted them: the figure ❯'s This Mac line names
-    /// (`status_item::Here::elsewhere`), so the Overview's title says the same.
     fn sessions_elsewhere(&self) -> usize {
         self.siblings.iter().map(|s| s.sessions).sum()
     }
@@ -542,7 +467,7 @@ impl App {
         self.repaint_overview_pointer(wid, true);
     }
 
-    /// esc: cancel an armed confirm first, close second.
+    /// Esc: cancel an armed confirm first, close second.
     pub(crate) fn overview_escape(&mut self, wid: WindowId) {
         let close = self
             .windows
@@ -566,8 +491,6 @@ impl App {
                 }
             }
             OverviewAct::TakeOverOrHandBack(local) => {
-                // Hand Back where it has a hold to lift: the person's, or an
-                // Owner client's where no person's stands.
                 let held = self
                     .pool
                     .get(local)
@@ -595,9 +518,6 @@ impl App {
                 self.overview_refresh_all();
                 self.repaint_overview_pointer(wid, true);
             }
-            // A CONTROL CLIENT'S ⌫ ON A HELD TAB ARMS NOTHING: the stop it
-            // would confirm is refused (the wire `signal` verb's halt), so no
-            // confirm is left standing for any key to resolve.
             OverviewAct::Armed(local) => {
                 if let Some(why) = self
                     .stop_worker_refusal(local)
@@ -615,8 +535,7 @@ impl App {
         }
     }
 
-    /// ⏎ / click: go there (a chip's session, a manages line's manager); an
-    /// armed Stop Worker confirm is dropped, never resolved.
+    /// ⏎ / click: go there (a chip's session, a manages line's manager).
     pub(crate) fn overview_activate(&mut self, wid: WindowId) {
         let act = self
             .windows
@@ -629,8 +548,6 @@ impl App {
     }
 
     /// One key's act on the open card: `t`, `r` or ⌫. A ⌫ carries whose
-    /// hand pressed it ([`Self::person_gesture_refused`]), so a confirm one
-    /// hand armed is resolved by no other's.
     fn overview_key(&mut self, wid: WindowId, key: OverviewKey) {
         let controller = self.person_gesture_refused();
         let act = self
@@ -647,17 +564,7 @@ impl App {
         }
     }
 
-    /// Why Stop Worker would stop nothing on `session` right now, before any
-    /// signal: no such session, a task that is not working or stalled (the
-    /// card or the menu was drawn a moment ago), a CONTROL CLIENT'S gesture
-    /// on a held tab ([`Self::person_gesture_refused`]): a control client's
-    /// ⌫ into the Overview is the wire `signal` verb's act, so the same halt
-    /// refuses it, word for word, and a refusal under the person's hold is
-    /// counted toward it as the verb's is — or NO AGENT IN FRONT
-    /// ([`StopRefused::NoAgent`]): the tab's foreground program is its
-    /// shell (a worker that never started its agent, one whose agent
-    /// returned to its prompt), which ignores the SIGTERM `killpg` would
-    /// still report sent, so the stop would say done and end nothing.
+    /// Why Stop Worker would stop nothing on `session` right now, before any signal.
     pub(crate) fn stop_worker_refusal(&self, session: u64) -> Option<StopRefused> {
         let Some(ctx) = self.pool.get(session).map(|s| s.ctx.clone()) else {
             return Some(StopRefused::Gone);
@@ -686,20 +593,7 @@ impl App {
         None
     }
 
-    /// SAY WHY STOP WORKER STOPPED NOTHING, to whom it concerns
-    /// (`docs/DESIGN-owner-surfaces-2026-10-16.md` §1's alert rule):
-    ///
-    /// * A CONTROL CLIENT'S gesture ([`Self::person_gesture_refused`]): the
-    ///   person did nothing and aterm settled it (a held tab's refusal is
-    ///   already counted toward the hold, as the wire `signal` verb's is), so
-    ///   nothing reaches the person's glass: one log line.
-    /// * The person asked for what already is — the task ended, the tab is
-    ///   gone — or a hold refused it: a RECORD (R10's rule), no step.
-    /// * No agent runs in the tab (its shell is in front), or the `signal`
-    ///   verb refused the person's own stop (no foreground program, a
-    ///   platform with no signals): their gesture failed, said for the
-    ///   gesture's short hold, with the act that still ends it (close its
-    ///   tab).
+    /// Say why stop worker stopped nothing, to whom it concerns.
     pub(crate) fn stop_worker_refused(&mut self, session: u64, why: StopRefused) {
         #[cfg(test)]
         {
@@ -724,14 +618,7 @@ impl App {
         self.post_message(msg);
     }
 
-    /// STOP WORKER: SIGTERM to `session`'s agent, in process, through the
-    /// `signal` verb's own body (it drops the input the program left unread
-    /// first); the task reads `exited` when the agent ends. The person's own
-    /// act at the window — the Overview's confirmed ⌫, the tab menu's sheet —
-    /// is refused by no hold: Take Over stops the robots, not the person. A
-    /// control client's gesture into the same card is refused where the wire
-    /// `signal` verb would be ([`Self::stop_worker_refusal`], re-read here
-    /// when it acts). `Err` says why nothing was signalled.
+    /// Stop worker: SIGTERM to `session`'s agent, in process, through the `signal` verb's own body.
     pub(crate) fn stop_worker(&mut self, session: u64) -> Result<String, StopRefused> {
         let refused = self.stop_worker_refusal(session);
         #[cfg(test)]
@@ -760,9 +647,7 @@ impl App {
         }
     }
 
-    /// READ RESULT: a done worker's result file as a Markdown document tab on
-    /// `wid` (the admission every Open Markdown… takes). `Err` when the task
-    /// has no result to read.
+    /// Read result: open a done worker's result file as a Markdown document tab on `wid`.
     pub(crate) fn read_result(&mut self, wid: WindowId, session: u64) -> Result<(), String> {
         let path = self
             .pool
@@ -782,8 +667,7 @@ impl App {
         Ok(())
     }
 
-    /// While the card is open on `wid`, drive it from the keyboard and
-    /// SWALLOW every key (the modal-overlay gate contract).
+    /// While the card is open on `wid`, drive it from the keyboard and swallow every key.
     pub(crate) fn on_key_overview_mode(
         &mut self,
         wid: WindowId,
@@ -817,10 +701,7 @@ impl App {
         true
     }
 
-    /// The ENGINE-NEUTRAL twin of [`Self::on_key_overview_mode`] — reached by
-    /// controller `key`/`text` verbs. The caller still swallows the event from
-    /// the PTY, and marks it a controller's gesture: Take Over and Hand Back
-    /// refuse under it (`App::person_gesture_refused`).
+    /// The engine-neutral twin of [`Self::on_key_overview_mode`].
     pub(crate) fn overview_input_event(&mut self, wid: WindowId, ev: &crate::input::InputEvent) {
         use crate::input::InputEvent;
         use aterm_types::keyboard::{Key as TKey, KeyEventType, NamedKey as TNamed};
@@ -871,10 +752,7 @@ impl App {
         }
     }
 
-    // ---- Pointer boundary (the palette_claims_pointer discipline) ----------
-
-    /// Modal pointer boundary: whether the open card owns the gesture on
-    /// `wid`.
+    /// Modal pointer boundary.
     pub(crate) fn overview_claims_pointer(&mut self, wid: WindowId) -> bool {
         self.overlay_card_claims_pointer(
             wid,
@@ -884,7 +762,6 @@ impl App {
     }
 
     /// The item index under a window-space point, through the same zoom-aware
-    /// transform the card was composited with.
     fn overview_item_at_pointer(&self, wid: WindowId, x: f64, y: f64) -> Option<usize> {
         let card = self.windows.get(&wid)?.overview()?;
         let (transform, x, y) = self.overlay_card_point(wid, x, y)?;
@@ -927,8 +804,7 @@ impl App {
         self.repaint_overview_pointer(wid, changed);
     }
 
-    /// Settle a left release: same-item press+release activates through the
-    /// SAME seam as Enter.
+    /// Settle a left release: same-item press+release activates through the same seam as Enter.
     pub(crate) fn overview_pointer_release(&mut self, wid: WindowId, x: f64, y: f64) {
         let hit = self.overview_item_at_pointer(wid, x, y);
         let (changed, activate) = self
@@ -942,7 +818,7 @@ impl App {
         }
     }
 
-    /// Scroll the band (wheel) — the cursor stays put.
+    /// Scroll the band (wheel).
     pub(crate) fn overview_pointer_wheel(&mut self, wid: WindowId, delta: isize) {
         let changed = self
             .windows
@@ -966,26 +842,17 @@ enum OverviewKey {
 pub(crate) enum StopRefused {
     /// The session is gone.
     Gone,
-    /// Its task is not working or stalled: it ended since the row was drawn,
-    /// or never ran.
+    /// Its task is not working or stalled.
     NotRunning,
-    /// A control client's gesture on a held tab: the `signal` verb's own
-    /// `ERR halted …`, word for word.
+    /// A control client's gesture on a held tab.
     Halted(String),
-    /// No agent runs in the tab: its foreground program is its shell, which
-    /// a SIGTERM would not end ([`shell_in_front`]). Nothing is signalled.
+    /// No agent runs in the tab.
     NoAgent,
-    /// The `signal` verb's own refusal (no foreground program, a platform
-    /// with no signals).
+    /// The `signal` verb's own refusal (no foreground program, a platform with no signals).
     Signal(String),
 }
 
-/// Whether `publication` says the tab's foreground program is its shell and
-/// no agent: the program is a shell by name
-/// ([`crate::quit_safety::is_shell_name`], the survey's `shell` word) and no
-/// agent is identified in front ([`crate::harness_host::agent_of`]). An
-/// unresolved program is not a shell: the stop is sent as before, since
-/// nothing says it would end nothing.
+/// Whether `publication` says the tab's foreground program is its shell and no agent.
 pub(crate) fn shell_in_front(publication: &crate::session_timeline::AgentPublication) -> bool {
     crate::harness_host::agent_of(publication).is_none()
         && publication
@@ -995,8 +862,7 @@ pub(crate) fn shell_in_front(publication: &crate::session_timeline::AgentPublica
 }
 
 impl StopRefused {
-    /// The refusal in words: the record's line, the log's, or (for
-    /// [`Self::Signal`]) the failed gesture's detail.
+    /// The refusal in words: the record's line.
     pub(crate) fn words(&self) -> String {
         match self {
             Self::Gone => "the tab is gone".to_string(),
@@ -1029,7 +895,6 @@ mod tests {
     }
 
     /// Three registered stub sessions in one window; returns their sids in
-    /// registration order (tab 0 is the harness session).
     fn app_with_three() -> (App, WindowId, Vec<aterm_session::SessionId>) {
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
@@ -1085,10 +950,6 @@ mod tests {
     }
 
     /// WHO TYPED (S9), named on the main thread where the person and a
-    /// poller look: a client types into a worker over an edge minted for
-    /// another tab, and the worker's `status`, its hover's last line and its
-    /// Overview line name the client on that tab's edge, the tab by its role.
-    /// CONTROL: before the stamp none says it.
     #[test]
     fn status_the_hover_and_the_card_name_who_typed() {
         use crate::typed_by::{Caller, Who};
@@ -1126,10 +987,6 @@ mod tests {
     }
 
     /// A TAB NAMES WHO TYPED FROM IT BY WHAT SOMEONE SET ON IT (S9): its
-    /// role, else the person's name for it, else its session id; the
-    /// survey's facts get the role or the id, never the person's name.
-    /// NEGATIVE CONTROL: a title the program sets, and a role that is a word
-    /// aterm credits by, name nothing: the tab reads as its id.
     #[test]
     fn a_typist_tab_is_named_by_its_role_its_pin_or_its_id() {
         let (app, _wid, sids) = app_with_three();
@@ -1162,8 +1019,6 @@ mod tests {
         );
         ctx.meta.lock().unwrap().role = Some("aterm".to_string());
         assert_eq!(named(&app).0, "acme-renewal", "no role takes aterm's word");
-        // Nor another Mac's: a name that ends as a drive's credit would read
-        // as that Mac's typing (the step-in), however it is cased or spaced.
         for posing in [
             "mac-03 over the fleet",
             "mac-03 (node 1a2b3c4d)  Over The  Fleet",
@@ -1171,7 +1026,6 @@ mod tests {
             ctx.meta.lock().unwrap().role = Some(posing.to_string());
             assert_eq!(named(&app).0, "acme-renewal", "{posing}");
         }
-        // NEGATIVE CONTROL: a role that only names the fleet is a role.
         ctx.meta.lock().unwrap().role = Some("fleet-sweeper".to_string());
         assert_eq!(named(&app).0, "fleet-sweeper");
         ctx.meta.lock().unwrap().role = Some("lab-sweep".to_string());
@@ -1182,10 +1036,6 @@ mod tests {
     }
 
     /// `open overview`: the card opens on the front window, lists every
-    /// session under its window, counts the workers a task's `from=` names
-    /// and lists the manager with them; `controls overview` mirrors it, and
-    /// the map's old `connections` keyword still reaches it. Closed, it says
-    /// so.
     #[test]
     fn open_lists_sessions_workers_and_who_manages_them() {
         let (mut app, wid, sids) = app_with_three();
@@ -1235,10 +1085,6 @@ mod tests {
     }
 
     /// THE CARD NAMES A BACKGROUND WORKER AS THE STRIP DOES: its chip, its
-    /// manager's word on its line and the manages line all read the tabs'
-    /// OSC titles (no role, pin or registry title stands for either), and an
-    /// untitled tab reads its position. CONTROL: the third tab, with no
-    /// title, is not named by either title.
     #[test]
     fn the_card_names_background_tabs_by_their_osc_titles() {
         use crate::overview::Driver;
@@ -1293,8 +1139,6 @@ mod tests {
     }
 
     /// `t` takes the selected tab over and, pressed again, hands it back —
-    /// the person's key; the chip says `yours`. A control client's `t` (the
-    /// overlay gate's controller path) moves nothing.
     #[test]
     fn t_takes_the_selected_tab_over_and_a_controllers_t_does_not() {
         use crate::input::Source;
@@ -1304,7 +1148,6 @@ mod tests {
         app.overview_move(wid, target as isize);
         let ctx = ctx_of(&app, &sids[1]);
         let t = InputEvent::Text("t".to_string());
-        // A control client's `t`, through the overlay gate: refused.
         let _ = app.input_to_session(
             wid,
             t.clone(),
@@ -1313,7 +1156,6 @@ mod tests {
             crate::app_input::PressPhase::Initial,
         );
         assert!(ctx.fabric.holds().person().is_none(), "a controller's t");
-        // The person's `t`: taken over, and the chip says so.
         app.overview_input_event(wid, &t);
         assert!(ctx.fabric.holds().person().is_some());
         let line = chip_line(&app, &sids[1]);
@@ -1326,20 +1168,15 @@ mod tests {
     }
 
     /// ⌫ arms the inline confirm on a worker and only the second press stops
-    /// it; esc cancels first. A session with no live task is never armed.
-    /// The stop is the `signal` verb's body on the session's own PTY: a stub
-    /// has no foreground group, so the refusal is said on the band.
     #[test]
     fn delete_confirms_inline_before_it_stops_a_worker() {
         let (mut app, wid, sids) = app_with_three();
         give_task(&app, &sids[1], crate::task_record::FROM_CTL);
         assert!(app.open_overview().is_ok());
-        // No task: ⌫ does nothing.
         let quiet = chip_ordinal(&app, wid, &sids[2]);
         app.overview_move(wid, quiet as isize);
         app.overview_input_event(wid, &key(aterm_types::keyboard::NamedKey::Backspace));
         assert!(app.read_aux_controls(AuxTarget::Overview)[0].contains("confirm=-"));
-        // The worker: the first ⌫ arms, esc keeps, the card stays open.
         let worker = chip_ordinal(&app, wid, &sids[1]);
         app.overview_move(wid, worker as isize - quiet as isize);
         app.overview_input_event(wid, &key(aterm_types::keyboard::NamedKey::Backspace));
@@ -1349,13 +1186,10 @@ mod tests {
         app.overview_input_event(wid, &key(aterm_types::keyboard::NamedKey::Escape));
         assert!(app.windows[&wid].overview().is_some());
         assert!(app.read_aux_controls(AuxTarget::Overview)[0].contains("confirm=-"));
-        // Armed, ⏎ goes there and stops nothing.
         app.overview_input_event(wid, &key(aterm_types::keyboard::NamedKey::Backspace));
         app.overview_input_event(wid, &key(aterm_types::keyboard::NamedKey::Enter));
         assert!(app.windows[&wid].overview().is_none(), "⏎ went there");
         assert_eq!(app.agents.stop_signals, 0, "⏎ never confirms a stop");
-        // Armed and confirmed by a second ⌫: the stop runs, and the signal's
-        // refusal (a stub has no foreground group) is the person's row.
         assert!(app.open_overview().is_ok());
         let worker = chip_ordinal(&app, wid, &sids[1]);
         app.overview_move(wid, worker as isize);
@@ -1385,8 +1219,6 @@ mod tests {
     }
 
     /// Arm ⌫ on `sid`'s chip and confirm it with a second ⌫, both from `src`
-    /// (`Source::Controller` is the `key` verb's road through the overlay
-    /// gate).
     fn stop_twice(
         app: &mut App,
         wid: WindowId,
@@ -1413,9 +1245,6 @@ mod tests {
     }
 
     /// STOP WORKER READS THE TASK AGAIN WHEN IT ACTS: armed on a working
-    /// worker whose task then ends, the confirming ⌫ stops nothing and says
-    /// it is not running — no signal is sent. NEGATIVE CONTROL: a task still
-    /// working at the confirm reaches the signal.
     #[test]
     fn stop_worker_reads_the_task_again_when_it_acts() {
         use crate::app_overview::StopRefused;
@@ -1450,8 +1279,6 @@ mod tests {
                     "asked for what already is: a record"
                 );
             } else {
-                // It reached the signal (a stub has no foreground group, so
-                // the verb's own refusal is what comes back).
                 assert!(
                     matches!(
                         app.agents.last_stop_refused,
@@ -1466,12 +1293,6 @@ mod tests {
     }
 
     /// A WORKER WITH ONLY ITS SHELL IN FRONT IS NOT "STOPPED". Its SIGTERM
-    /// would go to the interactive shell, which ignores it while `killpg`
-    /// reports it sent, so the stop would say done and end nothing: the
-    /// confirmed ⌫⌫ and the tab menu's Stop are refused before any signal
-    /// (no sheet is asked), and the person's failed gesture is one row on
-    /// the glass with the act that still ends it. NEGATIVE CONTROL: the same
-    /// worker with its agent in front reaches the signal.
     #[test]
     fn a_worker_with_only_its_shell_in_front_is_refused() {
         use crate::app_overview::StopRefused;
@@ -1501,7 +1322,6 @@ mod tests {
                     })
                     .count();
                 assert_eq!(rows, 1, "one gesture row");
-                // The tab menu's row refuses before any sheet is asked.
                 app.agents.owner_sheet_for_test = Some(Some(true));
                 let tab = app.windows[&wid].tab_set.tabs()[1].id;
                 app.dispatch_tab_menu_connection(wid, tab, &sids[1], ConnVerb::StopWorker);
@@ -1514,11 +1334,6 @@ mod tests {
     }
 
     /// A CONTROL CLIENT'S TAB-MENU STOP PUTS NOTHING ON THE PERSON'S GLASS.
-    /// Its choice of Stop Worker… (keys into the tab menu, under the gesture
-    /// mark) is the wire `signal` verb's act on an unheld worker: the stop
-    /// goes out, and no sheet, no card and no row appear. NEGATIVE CONTROL:
-    /// the person's choice with no sheet to ask on (headless) opens the
-    /// Overview with the stop armed for their hand and sends nothing.
     #[test]
     fn a_control_clients_tab_menu_stop_opens_no_card() {
         use crate::session_chrome::ConnVerb;
@@ -1546,18 +1361,6 @@ mod tests {
     }
 
     /// A CONTROL CLIENT CANNOT STOP A HELD WORKER THROUGH THE OVERVIEW OR THE
-    /// TAB MENU, AND ITS REFUSAL IS NOT THE PERSON'S NEWS. The wire `signal`
-    /// verb to a held tab answers `ERR halted`; a control client's ⌫ into the
-    /// open card (the `key` verb's road) on that tab's chip is the same act
-    /// and is refused the same way, under an Owner's hold and under the
-    /// person's Take Over alike: each ⌫ arms nothing (no confirm is left for
-    /// the person's next key), no signal is sent, the hold stands, a refusal
-    /// under the person's hold is counted, and nothing reaches the person's
-    /// glass. The tab menu's Stop Worker under the same mark is refused the
-    /// same way. NEGATIVE CONTROL: the person's own ⌫⌫ on the same chip,
-    /// under the same hold, reaches the signal (Take Over stops the robots,
-    /// not the person); and a control client's ⌫⌫ on an unheld worker does
-    /// too, as the wire verb would.
     #[test]
     fn a_controller_cannot_stop_a_held_worker_and_the_person_can() {
         use crate::app_overview::StopRefused;
@@ -1604,7 +1407,6 @@ mod tests {
                 !app.person_gesture_refused(),
                 "the mark ends with the gesture"
             );
-            // The tab menu's row, chosen under the same mark.
             app.agents.last_stop_refused = None;
             let tab = app.windows[&wid].tab_set.tabs()[0].id;
             app.with_gesture_source(true, |app| {
@@ -1617,13 +1419,11 @@ mod tests {
             assert_eq!(app.agents.stop_signals, 0);
             assert!(!stop_row_on_glass(&app), "person={person}: no row");
 
-            // CONTROL: the person's own ⌫⌫ on the same chip is signalled.
             stop_twice(&mut app, wid, &sids[1], Source::Human);
             assert_eq!(
                 app.agents.stop_signals, 1,
                 "person={person}: the person stops it"
             );
-            // CONTROL: a control client's ⌫⌫ on an unheld worker is too.
             stop_twice(&mut app, wid, &sids[2], Source::Controller);
             assert_eq!(
                 app.agents.stop_signals, 2,
@@ -1633,7 +1433,6 @@ mod tests {
     }
 
     /// A session close while the card is open re-snapshots it: the closed
-    /// session's line leaves now.
     #[test]
     fn session_close_retargets_the_open_card() {
         let (mut app, _wid, sids) = app_with_three();
@@ -1647,10 +1446,6 @@ mod tests {
     }
 
     /// THE TITLE COUNTS THE OTHER ATERMS' SESSIONS APART (§6; ❯'s This Mac
-    /// line says the same figure): a sibling scan that finds another aterm
-    /// with three sessions reaches an open card's title as "(+3 in another
-    /// aterm)" beside this aterm's own count. NEGATIVE CONTROL: with no
-    /// sibling the title names this aterm alone.
     #[test]
     fn the_title_counts_another_aterms_sessions_apart() {
         let (mut app, wid, _sids) = app_with_three();
@@ -1681,14 +1476,6 @@ mod tests {
     }
 
     /// THE OVERVIEW NAMES WHO DRIVES AS THE HOVER DOES (§12.4.1; one helper,
-    /// `app_presence::driven_words`): a Claude Code under Land this host
-    /// supervises reads `driven by aterm (land)`, then `(land, landed)` once
-    /// its loop tells the landing; a worker Land landed reads `task landed
-    /// …`, never `task done … (landed)` nor `task landed … (landed)`.
-    /// NEGATIVE CONTROLS (as run): main's mode word alone reads `driven by
-    /// aterm (land)` after the landing, and its task words `task done just
-    /// now (landed)`; the why kept beside `landed` reads `task landed just
-    /// now (landed)`.
     #[test]
     fn the_overview_names_the_chips_face_and_a_landed_task() {
         use crate::overview::Driver;
@@ -1751,7 +1538,6 @@ mod tests {
             chip(&app).driver.map(|d| d.words()).as_deref(),
             Some("driven by aterm (land, landed)")
         );
-        // A worker Land landed.
         let mut mark = crate::task_record::TaskMark::new(crate::task_record::TaskState::Done);
         mark.why = Some(crate::task_record::WHY_LANDED);
         crate::task_record::mark_session_task(&ctx, 0, &mark).expect("marked");
@@ -1763,17 +1549,6 @@ mod tests {
     }
 
     /// THE OVERVIEW SAYS WHY A LANDING HOLDS, ON A LINE OF ITS OWN (Autopilot
-    /// v5 §12.3.1): a Claude Code under Land this
-    /// host supervises reads `driven by aterm (land)` on its chip's line
-    /// throughout — the hover's long words there pushed `typed by` past the
-    /// card's width — and, once its loop tells a hold whose yield was read,
-    /// the hold's words with no clock on the chip's held line (`not landed
-    /// yet: 2 unpushed commits; open work in its report: follow-up · 3
-    /// nudges`, the menu's tip form); none before a yield is read, none under
-    /// Cruise, none once the hold is taken down. NEGATIVE CONTROLS (as run):
-    /// the builder passing the hold to `driven_words` (3c's first cut) puts
-    /// the hold on the chip's line; the builder with no held line reads
-    /// `None` with the hold standing.
     #[test]
     fn the_overview_says_why_a_landing_holds() {
         use aterm_agent::harness::acts::{HoldLeg, LandHeld, OpenWord, TaskFace};
@@ -1869,12 +1644,6 @@ mod tests {
     }
 
     /// A HARNESS'S NEED SAYS IT IS ONE ON THE OVERVIEW (Autopilot v5
-    /// §12.2.9): no header above an Overview line says "needs you", and a
-    /// harness's `what` now carries the need without aterm's frame, so the
-    /// chip's doing (painted and spoken alike) leads with `needs you: ` and
-    /// keeps ` (+1 more)` whole within main's 72 bytes. Another owner's ask
-    /// keeps its own words. NEGATIVE CONTROL (run for the landing): the
-    /// doing arm reading `need.what` drops the lead.
     #[test]
     fn a_harness_need_says_needs_you_on_the_overview() {
         let (mut app, _wid, sids) = app_with_three();
@@ -1923,7 +1692,6 @@ mod tests {
     }
 
     /// The words are coarse, so a card left open does not repaint each
-    /// second, and a result's size reads in units.
     #[test]
     fn ages_and_sizes_read_in_coarse_units() {
         assert_eq!(super::coarse_age(59_000), "just now");

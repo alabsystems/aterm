@@ -1,11 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tests for [`super`]: the step fold over rows shaped as Claude Code
-//! writes them (values made up), the end against the harness's own
-//! `transcript_ends_on` over every `supervise/fixtures` transcript and
-//! every corpus row (the agreement, addendum A9), the wall judge, the tap
-//! through the real cursor, and the leak rule (no text in a step, S6).
+//! Tests for [`super`] step folding, wall judgment, cursor tap, and S6 text-leak guards.
 
 use super::*;
 use crate::supervise::run::wall_confirm::{confirms, transcript_ends_on, transcript_wall};
@@ -84,7 +80,6 @@ fn notice(ms: u64, text: &str, error: &str) -> String {
 }
 
 /// A fold bound to an empty file (everything after is fresh) at floor 0,
-/// fed `rows` one line each.
 struct Fed {
     fold: StepFold,
     off: u64,
@@ -124,12 +119,7 @@ fn id(s: &str) -> StepId {
     StepId::new(s).expect("an id")
 }
 
-// ---- the rows a turn writes ---------------------------------------------
-
 /// Plan §2.4: a turn's rows fold to its steps in order — the prompt, the
-/// model, a parallel pair of calls (a `Task` among them), their results
-/// (one failed), the turn's end with its tokens — and each step of a row
-/// has its own offset inside the row's line, the row's last at its end.
 #[test]
 fn a_turn_folds_to_its_steps_in_order() {
     let mut f = Fed::new();
@@ -184,7 +174,6 @@ fn a_turn_folds_to_its_steps_in_order() {
     );
     let offs: Vec<u64> = batch.steps.iter().skip(1).map(|s| s.pos.off).collect();
     assert!(offs.windows(2).all(|w| w[0] < w[1]), "{offs:?}");
-    // The call row's three steps end at its line's end; its first is inside it.
     assert_eq!(batch.steps[4].pos.off, f.ends[1]);
     assert!(batch.steps[2].pos.off > f.ends[0]);
     assert_eq!(
@@ -200,9 +189,6 @@ fn a_turn_folds_to_its_steps_in_order() {
 }
 
 /// A11: a turn's tokens count each message id once, at its largest (a
-/// streamed message's rows grow), by the usage fold's own dedupe; a prompt
-/// starts the count over. NEGATIVE CONTROL: a message with no id is summed
-/// as it comes.
 #[test]
 fn a_turns_tokens_count_each_message_once_at_its_largest() {
     let mut f = Fed::new();
@@ -241,15 +227,6 @@ fn a_turns_tokens_count_each_message_once_at_its_largest() {
 }
 
 /// S3, A10: the user rows that are no prompt — a task notification (by its
-/// words or its origin), a shell-mode command and its output, a meta row, a
-/// compaction's summary, a command's own rows — emit nothing at their row;
-/// Esc's row is the interrupt. A wake, a `!` command, a prompt command's row
-/// and a numbered `isMeta` row still start the vendor turn the model's next
-/// row says ran ([`a_prompt_command_or_a_wake_starts_the_turn_its_reply_says_ran`],
-/// [`a_turn_claude_code_numbers_of_its_own_starts_its_vendor_turn`]).
-/// NEGATIVE CONTROLS: a prompt that only mentions a marker, a prompt in a
-/// text part, a prompt led by escaped whitespace, and a peer's message
-/// (meta, but someone's) are prompts.
 #[test]
 fn the_user_rows_that_ask_nothing_emit_no_prompt() {
     let quiet = [
@@ -314,8 +291,6 @@ fn the_user_rows_that_ask_nothing_emit_no_prompt() {
         let mut f = Fed::new();
         assert_eq!(f.push(&row).events(), vec![StepEvent::Prompt { vref: id(vref) }], "{row}");
     }
-    // A peer's message, recorded `isMeta`, is someone's ask, and no entry
-    // of the end's (the harness skips meta rows).
     let peer = prompt("v5", 0, "from a peer").replace(
         r#""type":"user","#,
         r#""type":"user","isMeta":true,"origin":{"kind":"peer"},"#,
@@ -326,7 +301,6 @@ fn the_user_rows_that_ask_nothing_emit_no_prompt() {
         vec![StepEvent::Prompt { vref: id("v5") }]
     );
     assert_eq!(f.fold.end().last, EndClass::Nothing);
-    // A text part led by a marker asks nothing either (S3 reads the first text).
     let part = prompt("v4", 0, "x").replace(
         r#""content":"x""#,
         r#""content":[{"type":"text","text":"<task-notification>done"}]"#,
@@ -336,15 +310,6 @@ fn the_user_rows_that_ask_nothing_emit_no_prompt() {
 }
 
 /// A TURN WITH NO PROMPT ROW (S3 as `upgrade.rs`'s `TaskScan` reads it):
-/// a prompt command's row (`/init`, as Claude Code writes it) and its
-/// `isMeta` expansion start the vendor turn the model's next row says ran:
-/// its steps are the same as after a typed prompt, the prompt named by the
-/// command row's `promptId`, dated at the command row and queued before the
-/// reply's steps, its tokens counted from there. A background task's wake
-/// after a closed turn (by its words or its origin) starts one the same
-/// way. NEGATIVE CONTROLS: a local command (`/model`) and its output name
-/// nothing though a reply follows, Claude Code's own `<synthetic>` row says
-/// no turn ran, and a wake while a vendor turn runs joins that turn.
 #[test]
 fn a_prompt_command_or_a_wake_starts_the_turn_its_reply_says_ran() {
     let command = prompt(
@@ -382,7 +347,6 @@ fn a_prompt_command_or_a_wake_starts_the_turn_its_reply_says_ran() {
     assert_eq!(steps[0].ev, StepEvent::Prompt { vref: id("p-5") });
     assert_eq!(steps[0].pos.at_ms, T0, "dated at the command row");
     assert!(steps[0].pos.off > f.ends[1] && steps[0].pos.off < steps[1].pos.off);
-    // A wake after a closed turn, by its words and by its origin.
     for wake in [
         prompt("w-1", 5_000, "<task-notification><task-id>b1</task-id>"),
         prompt("w-1", 5_000, "a wake").replace(
@@ -411,8 +375,6 @@ fn a_prompt_command_or_a_wake_starts_the_turn_its_reply_says_ran() {
             "{wake}"
         );
     }
-    // A `!` shell command a model turn follows (as 2.1.294 wrote one):
-    // its output says nothing, and the command row names the turn.
     let mut f = Fed::new();
     f.push(&prompt("s-1", 0, "<bash-input>cat notes.txt</bash-input>"))
         .push(&prompt(
@@ -425,8 +387,6 @@ fn a_prompt_command_or_a_wake_starts_the_turn_its_reply_says_ran() {
     let evs = no_model(f.events());
     assert_eq!(evs.first(), Some(&StepEvent::Prompt { vref: id("s-1") }));
     assert!(matches!(evs.last(), Some(StepEvent::TurnEnd { .. })));
-    // NEGATIVE CONTROL: a shell command no model turn follows names none;
-    // the next prompt is its own turn's.
     let mut f = Fed::new();
     f.push(&prompt("s-1", 0, "<bash-input>ls</bash-input>"))
         .push(&prompt("s-1", 20, "<bash-stdout>a</bash-stdout>"))
@@ -436,7 +396,6 @@ fn a_prompt_command_or_a_wake_starts_the_turn_its_reply_says_ran() {
         no_model(f.events()),
         vec![StepEvent::Prompt { vref: id("v2") }]
     );
-    // NEGATIVE CONTROLS. A local command and its output, then a reply.
     let mut f = Fed::new();
     f.push(&prompt("c-1", 0, "<command-name>/model</command-name>"))
         .push(&prompt(
@@ -451,12 +410,10 @@ fn a_prompt_command_or_a_wake_starts_the_turn_its_reply_says_ran() {
             .any(|e| matches!(e, StepEvent::Prompt { .. })),
         "a local command runs no turn"
     );
-    // Claude Code's own row after a command: no turn ran.
     let mut f = Fed::new();
     f.push(&command)
         .push(&notice(1_000, "API Error", "unknown"));
     assert!(f.events().is_empty());
-    // A wake while a vendor turn runs joins it.
     let mut f = Fed::new();
     f.push(&prompt("v1", 0, "go"))
         .push(&calls("m1", 100, &[("toolu_a", "Bash")]))
@@ -475,8 +432,6 @@ fn a_prompt_command_or_a_wake_starts_the_turn_its_reply_says_ran() {
 }
 
 /// A8: a row whose words are spelt with `\u` escapes is read as the words
-/// they spell — a prompt whose every `user` is escaped, a call whose
-/// `tool_use` is, a result whose `tool_result` is.
 #[test]
 fn an_escaped_key_is_read_as_its_word() {
     let ask = prompt("v1", 0, "go").replace(r#""user""#, r#""\u0075ser""#);
@@ -507,8 +462,6 @@ fn an_escaped_key_is_read_as_its_word() {
 }
 
 /// The relaunched first prompt written after newer rows (`parentUuid:
-/// null`, the harness's measured exception) starts no turn and ends
-/// nothing. NEGATIVE CONTROL: the first row of a conversation does.
 #[test]
 fn a_relaunched_first_prompt_after_newer_rows_starts_no_turn() {
     let first = prompt("v0", 0, "hello").replace(r#""parentUuid":"p""#, r#""parentUuid":null"#);
@@ -527,7 +480,6 @@ fn a_relaunched_first_prompt_after_newer_rows_starts_no_turn() {
 }
 
 /// A row Claude Code writes `isMeta` (no prompt by its words): under
-/// `promptId` `id` (none: no key), named `uuid`, with `extra` keys.
 fn meta(id: Option<&str>, uuid: &str, ms: u64, extra: &str, text: &str) -> String {
     let row = prompt("x", ms, text)
         .replace(
@@ -549,17 +501,6 @@ fn no_model(evs: Vec<StepEvent>) -> Vec<StepEvent> {
 }
 
 /// A TURN CLAUDE CODE NUMBERS OF ITS OWN starts the vendor turn its model's
-/// row says ran, as a task notification's wake does (module docs, by
-/// `upgrade.rs`'s `numbered_anew`): a `/loop`'s wake, written `isMeta` and
-/// no prompt by its words, under a `promptId` of its own (with the
-/// `promptSource`, `scheduledTaskId` and `turnOrigin` 2.1.302 writes), or
-/// under none with a `scheduledTaskId` (the 2.1.252 and 2.1.267 bundles) or
-/// a `turnOrigin`, and a missed one-shot task's notice under none: its
-/// call, result and turn end follow its `Prompt`, which is dated at the
-/// wake's row, and the turn end carries the wake's tokens. NEGATIVE
-/// CONTROLS: a Stop hook's feedback and `/goal`'s check-in under the running
-/// turn's `promptId`, a Stop hook's feedback under none, and the notice's
-/// words quoted in a hook's, go on the running turn — no second `Prompt`.
 #[test]
 fn a_turn_claude_code_numbers_of_its_own_starts_its_vendor_turn() {
     let loop_words = "keep going: check the land log";
@@ -649,7 +590,6 @@ fn a_turn_claude_code_numbers_of_its_own_starts_its_vendor_turn() {
         );
         assert_eq!(steps[0].pos.at_ms, T0 + 5_000, "{what}: dated at the wake");
     }
-    // NEGATIVE CONTROLS: rows that go on the running turn.
     for (what, kept) in [
         (
             "a Stop hook's feedback under the turn's promptId",
@@ -710,18 +650,6 @@ fn a_turn_claude_code_numbers_of_its_own_starts_its_vendor_turn() {
 }
 
 /// A RUNNING TURN THE BIND DID NOT READ (module docs). A tap armed after
-/// the footer's first read binds at the file's length (`bind_tap`), so the
-/// fold knows neither the running turn's `promptId` nor whether one runs
-/// (`Fed::new` is such a bind). A number is then no evidence of a turn of
-/// its own, and a model's row says a turn runs: a Stop hook's feedback
-/// under the running turn's `promptId`, read after the turn's reply or as
-/// the first row, and a task notification's wake after the reply, go on
-/// the running turn. No `Prompt` is queued, and the turn end counts the
-/// tokens of every row read since the bind. Every `claude/goes-on/` corpus
-/// row read first queues no `Prompt` either. NEGATIVE CONTROLS: every
-/// `claude/begins/` corpus row read first is a turn of its own (by its own
-/// words), and so is a row under a `promptId` of its own after a turn end
-/// read since the bind (by its number alone).
 #[test]
 fn a_running_turn_the_bind_did_not_read_is_no_new_one() {
     use super::super::transcript::corpus_tests::TURN_ROWS;
@@ -800,8 +728,6 @@ fn a_running_turn_the_bind_did_not_read_is_no_new_one() {
         );
     }
     assert!(begins >= 4 && goes_on >= 3, "{begins} {goes_on}");
-    // NEGATIVE CONTROL: after a turn end read since the bind, a number of
-    // its own begins a turn, though the row names no marker.
     let mut f = Fed::new();
     f.push(&calls("m1", 100, &[("toolu_a", "Bash")]))
         .push(&results(150, &[("toolu_a", false)]))
@@ -830,9 +756,6 @@ fn a_running_turn_the_bind_did_not_read_is_no_new_one() {
 }
 
 /// The steps of fixture `name` read by a fold bound after its first `from`
-/// lines with none of them read (as `bind_tap` binds), floor 0, taken
-/// twice (the opening hold hands its rows on), but the bind's and the
-/// model's.
 fn fold_fixture_from(name: &str, from: usize) -> Vec<Step> {
     let (_, jsonl) = fixtures()
         .into_iter()
@@ -855,9 +778,6 @@ fn fold_fixture_from(name: &str, from: usize) -> Vec<Step> {
 }
 
 /// The measured 2.1.294 turn, bound after its call's result (a tap armed
-/// mid-turn): Claude Code's own `isMeta` nudge under the running turn's
-/// `promptId` ("no visible output") goes on that turn, and the turn end
-/// counts both replies read since the bind.
 #[test]
 fn a_measured_nudge_in_a_turn_the_bind_did_not_read_goes_on_it() {
     let steps = fold_fixture_from("claude-2.1.294-transcript-bash-output-wall-phrase.jsonl", 4);
@@ -873,10 +793,6 @@ fn a_measured_nudge_in_a_turn_the_bind_did_not_read_goes_on_it() {
 }
 
 /// THE CLASS over every `supervise/fixtures` transcript: a fold bound
-/// after any line with none read (as `bind_tap` binds) queues no `Prompt`
-/// that the fold from the file's first byte does not, by its `vref` and its
-/// date: a running turn it did not read is never one of its own.
-/// NEGATIVE CONTROL: the bound folds do queue prompts to check.
 #[test]
 fn a_bind_that_read_no_history_invents_no_prompt() {
     let prompts = |steps: Vec<Step>| -> Vec<(StepId, u64)> {
@@ -905,7 +821,6 @@ fn a_bind_that_read_no_history_invents_no_prompt() {
 }
 
 /// The fixture `name` folded from its first byte at floor 0, taking after
-/// the rows `split` says (by line index), each take's steps but the bind's.
 fn fold_fixture(name: &str, split: &[usize]) -> Vec<Vec<Step>> {
     let (_, jsonl) = fixtures()
         .into_iter()
@@ -933,18 +848,6 @@ fn fold_fixture(name: &str, split: &[usize]) -> Vec<Vec<Step>> {
 }
 
 /// A FIRST PROMPT WRITTEN AFTER ITS TURN'S FIRST ROWS heads them (the
-/// opening hold, module docs). Claude Code 2.1.300 wrote a new
-/// conversation's first prompt (`parentUuid: null`) after the turn's first
-/// call and dated it before that call; folded from the file's first byte,
-/// the turn's one `Prompt` comes first, dated at its own row and queued
-/// before the call's steps, and both calls and the result follow it, also
-/// when a take falls between the first call and the prompt. 2.1.294 wrote
-/// one after the session limit's notice and the turn's end: the `Prompt`
-/// heads the turn end and its wall. NEGATIVE CONTROLS: a parentless prompt
-/// dated after the held rows names none of them, and they are handed on as
-/// they were read; with no prompt after them, the second take hands them
-/// on; a parentless prompt after a prompted turn starts none
-/// ([`a_relaunched_first_prompt_after_newer_rows_starts_no_turn`]).
 #[test]
 fn a_first_prompt_written_after_its_turns_first_rows_heads_them() {
     let edit = "claude-2.1.300-transcript-box-edit-star-hook-pending.jsonl";
@@ -1004,7 +907,6 @@ fn a_first_prompt_written_after_its_turns_first_rows_heads_them() {
     );
     assert!(evs.iter().any(|e| matches!(e, StepEvent::TurnEnd { .. })));
     assert!(evs.iter().any(|e| matches!(e, StepEvent::EndWall { .. })));
-    // NEGATIVE CONTROLS. A parentless prompt dated after the held call.
     let parentless = |ms: u64| {
         prompt("v9", ms, "a new ask").replace(r#""parentUuid":"p""#, r#""parentUuid":null"#)
     };
@@ -1021,14 +923,12 @@ fn a_first_prompt_written_after_its_turns_first_rows_heads_them() {
             subagent: false,
         }]
     );
-    // The same prompt dated before it heads it.
     let mut f = Fed::new();
     f.push(&call).push(&parentless(50));
     assert_eq!(
         no_model(f.events()).first(),
         Some(&StepEvent::Prompt { vref: id("v9") })
     );
-    // No prompt after the held call: the second take hands it on.
     let mut f = Fed::new();
     f.push(&call);
     assert!(no_model(f.events()).is_empty(), "held through one take");
@@ -1036,10 +936,6 @@ fn a_first_prompt_written_after_its_turns_first_rows_heads_them() {
 }
 
 /// THE OPENING HOLD WAITS IN THE QUEUE ITSELF: its steps count toward
-/// [`STEP_QUEUE`] with the rest, and a take hands on just the steps read
-/// before the hold, also when a burst of held steps dropped one of those
-/// (the hold's start moves with it). NEGATIVE CONTROL: with no burst the
-/// first take hands on the step before the hold and nothing held.
 #[test]
 fn the_opening_hold_waits_in_the_bounded_queue() {
     let boundary = format!(
@@ -1085,10 +981,6 @@ fn the_opening_hold_waits_in_the_bounded_queue() {
 }
 
 /// THE CLASS over every `supervise/fixtures` transcript (each one added there
-/// is in it): folded from its first byte, no call, result, turn end or wall
-/// of a turn comes before a `Prompt` — however Claude Code ordered the
-/// turn's prompt row among its rows. NEGATIVE CONTROL: the fixtures hold
-/// calls and turn ends to check, and the late-written first prompts.
 #[test]
 fn every_fixtures_turn_steps_follow_a_prompt() {
     let (mut checked, mut prompts) = (0, 0);
@@ -1115,7 +1007,6 @@ fn every_fixtures_turn_steps_follow_a_prompt() {
 }
 
 /// S24: a compaction's boundary is an instant step; its summary row is no
-/// prompt.
 #[test]
 fn a_compact_boundary_is_a_compact_step() {
     let boundary = format!(
@@ -1127,9 +1018,6 @@ fn a_compact_boundary_is_a_compact_step() {
 }
 
 /// §2.6: a limit notice closed by its turn's end is the turn's wall
-/// (`EndWall`), and the end confirms the screen's limit wall of any limit
-/// kind and no other class. NEGATIVE CONTROL: an open notice is no turn
-/// end's wall.
 #[test]
 fn a_notice_closed_by_the_turn_end_is_the_turns_wall() {
     let mut f = Fed::new();
@@ -1166,12 +1054,7 @@ fn a_notice_closed_by_the_turn_end_is_the_turns_wall() {
     );
 }
 
-// ---- fail closed ------------------------------------------------------------
-
 /// Plan §2.8: each discriminant of the wrong shape latches the fold off,
-/// says so once, and nothing more is queued from the path. NEGATIVE
-/// CONTROLS: an unknown row type, and a known row whose key the fold does
-/// not need has the wrong shape, latch nothing.
 #[test]
 fn a_wrong_shaped_discriminant_latches_the_fold_off() {
     let bad = [
@@ -1205,22 +1088,17 @@ fn a_wrong_shaped_discriminant_latches_the_fold_off() {
 }
 
 /// THE LATCH IS THE BOUND FILE'S: a fold latched off on one file reads
-/// the next file it binds (a `/clear`'s, a `/resume`'s) afresh, from its
-/// bind on. NEGATIVE CONTROL: a restart of the latched file itself stays
-/// off and queues nothing, not even a bind (the log keeps saying `off`).
 #[test]
 fn a_latch_lifts_on_a_bind_of_another_file() {
     let mut f = Fed::new();
     f.push(&turn_end(0, 5).replace(r#""durationMs":5"#, r#""durationMs":"5""#));
     assert!(f.fold.broken());
     assert_eq!(f.events(), vec![StepEvent::Off { why: "unknown" }]);
-    // NEGATIVE CONTROL: the same file, rewritten.
     f.fold.read_at(FP, ID, 0, true);
     let row = prompt("v2", 10, "next");
     f.fold.push(row.as_bytes(), row.len() as u64 + 1);
     assert!(f.fold.broken());
     assert!(f.fold.take().steps.is_empty());
-    // Another file.
     f.fold.read_at(FP + 1, ID, 0, false);
     let row = prompt("v3", 20, "fresh");
     f.fold.push(row.as_bytes(), row.len() as u64 + 1);
@@ -1235,12 +1113,7 @@ fn a_latch_lifts_on_a_bind_of_another_file() {
     );
 }
 
-// ---- floor, seed, queue, losses --------------------------------------------
-
 /// S1, S23: rows older than the floor, and rows ending at or below the
-/// seed (the file's length at the bind, else the log's watermark for that
-/// file), queue nothing, and are still folded into the end; a restart
-/// re-reads from the first byte and queues nothing it queued before.
 #[test]
 fn history_below_the_floor_or_the_seed_queues_nothing() {
     let rows = [
@@ -1256,7 +1129,6 @@ fn history_below_the_floor_or_the_seed_queues_nothing() {
             Some(*o)
         })
         .collect();
-    // The floor.
     let mut fold = StepFold::new(T0 + 1_000, None);
     fold.read_at(FP, ID, 0, false);
     for (r, e) in rows.iter().zip(&line_ends) {
@@ -1270,7 +1142,6 @@ fn history_below_the_floor_or_the_seed_queues_nothing() {
             StepEvent::Prompt { vref: id("v2") }
         ]
     );
-    // The seed: a bind at the file's length.
     let mut fold = StepFold::new(0, None);
     fold.read_at(FP, ID, line_ends[2], false);
     for (r, e) in rows.iter().zip(&line_ends) {
@@ -1279,8 +1150,6 @@ fn history_below_the_floor_or_the_seed_queues_nothing() {
     let batch = fold.take();
     assert_eq!(batch.steps.len(), 2, "{:?}", batch.steps);
     assert_eq!(fold.end().last, EndClass::Input);
-    // A restart of the same file: nothing it queued again, and a row past
-    // what it queued is queued.
     let newer = prompt("v3", 6_000, "newer");
     let newer_end = line_ends[3] + newer.len() as u64 + 1;
     fold.read_at(FP, ID, newer_end, true);
@@ -1296,7 +1165,6 @@ fn history_below_the_floor_or_the_seed_queues_nothing() {
             StepEvent::Prompt { vref: id("v3") }
         ]
     );
-    // The log's watermark for this file seeds the bind; another file's does not.
     for (given, want) in [
         (
             StepMark {
@@ -1326,9 +1194,6 @@ fn history_below_the_floor_or_the_seed_queues_nothing() {
 }
 
 /// A11: the model is said from the first row past the seed, even when the
-/// history's rows named the same one (the history's model is the run's to
-/// name, never the fold's). NEGATIVE CONTROL: the same model again says
-/// nothing.
 #[test]
 fn a_fresh_row_names_the_model_the_history_had() {
     let old = reply("m0", 0, 1);
@@ -1357,12 +1222,6 @@ fn a_fresh_row_names_the_model_the_history_had() {
 }
 
 /// A11 AT THE FLOOR: a row past the seed but older than the floor (the
-/// run's open, which the host arms the fold with, on a file read from its
-/// first byte) is history the log never takes, so it names no model either:
-/// the first row no older than the floor says it, though it is the same
-/// model. NEGATIVE CONTROL (scratch, the unit's notes): a model said on any
-/// row past the seed is said by the row below the floor, which is never
-/// queued, and the row the log takes says nothing.
 #[test]
 fn a_row_below_the_floor_names_no_model() {
     let mut fold = StepFold::new(T0 + 15, None);
@@ -1390,10 +1249,6 @@ fn a_row_below_the_floor_names_no_model() {
 }
 
 /// The queue keeps its bind and the newest steps after it, [`STEP_QUEUE`]
-/// in all, and counts the rest (a burst past the bound right after a bind
-/// still tells the log which file the kept steps came from); rows past the
-/// seed it cannot read are counted lost. NEGATIVE CONTROL: an unreadable
-/// row in the history is no loss.
 #[test]
 fn a_full_queue_drops_its_oldest_and_unread_rows_are_counted() {
     let mut f = Fed::new();
@@ -1426,9 +1281,6 @@ fn a_full_queue_drops_its_oldest_and_unread_rows_are_counted() {
 }
 
 /// S9, A19, T8: the lab measured 2.1.303 alone, so its steps are exact and
-/// every other build's partial; a build the set names is exact, and any
-/// other — older, newer or unnamed — is partial (no "at or below": an
-/// older build stays partial until its own reduction is committed).
 #[test]
 fn every_build_is_partial_until_one_is_measured() {
     assert_eq!(MEASURED_BUILDS, ["2.1.303"]);
@@ -1458,12 +1310,6 @@ const MEASURED_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/src/harness/tes
 const CODEX_REDUCTION: &str = "codex-";
 
 /// THE GUARD (T8): every build `builds` names has its reduction in `dir`
-/// (`<build>.jsonl`, as `targo --unverified lab reduce` writes one), which
-/// folds with no `Off`, no loss and no overflow, every step at the state
-/// the set gives its build, holding what a lab run reads (a prompt, a
-/// shell call and its good result, a turn end and a limit's wall); and
-/// every reduction in `dir` names a build `builds` names. An absent `dir`
-/// holds none.
 fn measured_builds_hold(dir: &std::path::Path, builds: &[&str]) -> Result<(), String> {
     for b in builds {
         let path = dir.join(format!("{b}.jsonl"));
@@ -1507,8 +1353,6 @@ fn measured_builds_hold(dir: &std::path::Path, builds: &[&str]) -> Result<(), St
     };
     for e in entries.filter_map(Result::ok) {
         let name = e.file_name().to_string_lossy().into_owned();
-        // A Codex rollout's reduction (`codex-<build>[-<leg>].jsonl`, session
-        // log 5G) is no Claude Code build's: the Codex fold's tests hold it.
         if name.starts_with(CODEX_REDUCTION) {
             continue;
         }
@@ -1530,7 +1374,6 @@ fn a_build_is_exact_iff_its_reduction_is_committed() {
 }
 
 /// NEGATIVE CONTROL (T8): a listed build with no reduction fails the guard,
-/// and so does a reduction no listed build names.
 #[test]
 fn a_listed_build_with_no_reduction_fails_the_guard() {
     let dir = std::path::Path::new(MEASURED_DIR);
@@ -1545,8 +1388,6 @@ fn a_listed_build_with_no_reduction_fails_the_guard() {
 }
 
 /// A11: the class table by name. The names the approval policy knows
-/// (`box_call::PROVABLE` and the tools `unvoiced_tools` can name) are
-/// classed by what they are, never by the box a Bash `sed -i` is drawn as.
 #[test]
 fn tools_are_classed_by_name() {
     for (name, want) in [
@@ -1595,12 +1436,7 @@ fn tools_are_classed_by_name() {
     assert!(StepId::new(&"a".repeat(41)).is_none() && StepId::new("a b").is_none());
 }
 
-// ---- the leak rule ----------------------------------------------------------
-
 /// S6, plan §2.7: no text of a prompt, a reply, a tool's input or result,
-/// a notice or a local command's output reaches a step or the end.
-/// NEGATIVE CONTROL: a sentinel in a tool's NAME is kept (it is the
-/// host-tier `tool=`).
 #[test]
 fn a_transcripts_text_never_reaches_a_step() {
     let local = format!(
@@ -1638,10 +1474,7 @@ fn a_transcripts_text_never_reaches_a_step() {
     assert_eq!(batch.end.last, EndClass::Opaque);
 }
 
-// ---- the end and the judge --------------------------------------------------
-
 /// Every transcript under `supervise/fixtures` (A9: all of them, so one
-/// added there is in the agreement without a list to keep), by name.
 fn fixtures() -> Vec<(String, String)> {
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/supervise/fixtures");
     let mut all: Vec<(String, String)> = std::fs::read_dir(&dir)
@@ -1662,7 +1495,6 @@ fn fixtures() -> Vec<(String, String)> {
 }
 
 /// One screen wall of every kind the screen reads that the transcript can
-/// answer, and the memory wall it never does.
 const SCREENS: &[WallKind] = &[
     WallKind::UsageSession,
     WallKind::UsageWeekly,
@@ -1695,13 +1527,6 @@ fn class_of(e: &Entry) -> EndClass {
 }
 
 /// THE AGREEMENT (A9, S7): after every line of every `supervise/fixtures`
-/// transcript, and of the corpus rows, the fold's end is the harness's
-/// `transcript_ends_on` of the lines so far — its entry, its close, its
-/// row's time, the wall a closed notice is, whether it lags — and for every
-/// screen wall the fold confirms exactly where `confirms` does; or the end
-/// is opaque and the judge waits. The two never give opposite answers.
-/// NEGATIVE CONTROL: the comparison sees a difference (an end the fold
-/// never had).
 #[test]
 fn the_end_agrees_with_the_harness_on_every_fixture_and_corpus_row() {
     let corpus: String = super::super::transcript::corpus_tests::ROWS
@@ -1767,8 +1592,6 @@ fn the_end_agrees_with_the_harness_on_every_fixture_and_corpus_row() {
         opaque_seen > 0 && confirmed > 0 && refuted > 0,
         "{opaque_seen} {confirmed} {refuted}"
     );
-    // The negative control: a fold that missed the notice row ends
-    // elsewhere than the harness, and the comparison says so.
     let (_, limit) = fixtures
         .iter()
         .find(|(n, _)| n == "claude-2.1.294-transcript-session-limit.jsonl")
@@ -1789,8 +1612,6 @@ fn the_end_agrees_with_the_harness_on_every_fixture_and_corpus_row() {
 }
 
 /// §2.6: the judge confirms the end's own class, waits while the end lags,
-/// is opaque, or is older than the wall's turn, never asks a memory wall,
-/// and refutes anything else.
 #[test]
 fn the_wall_judge_confirms_waits_and_refutes() {
     let mut f = Fed::new();
@@ -1824,8 +1645,6 @@ fn the_wall_judge_confirms_waits_and_refutes() {
         Judge::Refute,
         "closed on a reply"
     );
-    // A local command's output (unread) closed by a turn's end: opaque, so
-    // the judge waits.
     g.push(&format!(
         r#"{{"parentUuid":"p","isSidechain":false,"type":"system","subtype":"local_command","content":"x","uuid":"l-1","timestamp":"{}"}}"#,
         at(50)
@@ -1839,8 +1658,6 @@ fn the_wall_judge_confirms_waits_and_refutes() {
         "opaque"
     );
 }
-
-// ---- the tap through the real cursor -----------------------------------------
 
 struct Dir(aterm_tempfile::TempDir);
 
@@ -1866,11 +1683,6 @@ fn append(path: &std::path::Path, rows: &[String]) {
 }
 
 /// A20: the cursor hands the tap each completed main-chain line once, with
-/// its end offset, binds it at its first read (the file's length then is
-/// history), and a torn last line waits for its newline and is tapped
-/// whole once it comes. A rewrite of the
-/// file restarts the fold and queues nothing again. The usage fold's
-/// totals are those of an untapped cursor.
 #[test]
 fn the_cursor_taps_each_line_once_with_its_end_offset() {
     use super::super::session_usage::TranscriptCursor;
@@ -1910,7 +1722,6 @@ fn the_cursor_taps_each_line_once_with_its_end_offset() {
         (steps[0].ev, steps[0].pos.off),
         (StepEvent::Prompt { vref: id("v1") }, len1)
     );
-    // The torn line's rest: tapped once, whole, at its newline.
     write(format!("{tail}\n").as_bytes());
     cursor
         .advance_tapped(u64::MAX, Some(&mut tap))
@@ -1926,7 +1737,6 @@ fn the_cursor_taps_each_line_once_with_its_end_offset() {
     plain.advance(u64::MAX).expect("read");
     assert_eq!(cursor.fold().rows, plain.fold().rows);
     assert_eq!(cursor.fold().assistant_rows, plain.fold().assistant_rows);
-    // Rewritten in place, shorter: the fold restarts; nothing is queued twice.
     let rewritten = format!("{}\n{}\n", prompt("v0", 0, "old"), prompt("v1", 20, "new"));
     std::fs::write(&path, &rewritten).expect("rewrite");
     let a = cursor
@@ -1943,11 +1753,6 @@ fn the_cursor_taps_each_line_once_with_its_end_offset() {
 }
 
 /// A FILE THAT DID NOT EXIST HELD NO HISTORY (S1 as built): a fold told
-/// the registry's session had no transcript, then shown that session's
-/// file, binds the file from its first byte (`Bind { len: 0 }`), its rows
-/// older than the floor still history. NEGATIVE CONTROL: the same rows in
-/// a file the fold never saw absent are history (`Bind { len: <its
-/// length> }`, nothing queued); a vacancy is spent by the bind it seeded.
 #[test]
 fn a_file_the_fold_saw_absent_is_bound_from_its_first_byte() {
     let rows = [
@@ -1982,7 +1787,6 @@ fn a_file_the_fold_saw_absent_is_bound_from_its_first_byte() {
             StepEvent::Prompt { vref: id("v1") }
         ]
     );
-    // NEGATIVE CONTROL: never seen absent, the file's rows are history.
     let evs: Vec<StepEvent> = fold_of(false)
         .take()
         .steps
@@ -1990,17 +1794,12 @@ fn a_file_the_fold_saw_absent_is_bound_from_its_first_byte() {
         .map(|s| s.ev)
         .collect();
     assert_eq!(evs, vec![StepEvent::Bind { len: end }]);
-    // Spent: another file bound later seeds at its length again.
     vacant.read_at(FP + 1, ID, 7, false);
     let evs: Vec<StepEvent> = vacant.take().steps.into_iter().map(|s| s.ev).collect();
     assert_eq!(evs, vec![StepEvent::Bind { len: 7 }]);
 }
 
 /// THE VACANCY IS THE ABSENT SESSION'S: a fold bound to one file, told
-/// the registry's session X had no transcript, and then shown another
-/// session's existing file (a `/resume` of an older conversation) binds
-/// that file at its length: its history queues nothing. NEGATIVE CONTROL:
-/// X's own file, found next, binds from its first byte.
 #[test]
 fn a_vacancy_seeds_only_the_absent_sessions_file() {
     let rows = [prompt("v1", 2_000, "an older conversation's")];
@@ -2034,10 +1833,6 @@ fn a_vacancy_seeds_only_the_absent_sessions_file() {
 }
 
 /// The same through the footer's cache, as `read_pid` tells it of each
-/// registry read: bound to A, a read naming session X with no file, then a
-/// read naming session D with D's file (a `/resume`): D binds at its length
-/// and its history queues nothing. NEGATIVE CONTROL: X's file, once a read
-/// names X with it, binds from its first byte.
 #[test]
 fn the_footer_cache_keys_a_vacancy_to_its_session() {
     use super::super::footer::FooterCache;
@@ -2064,7 +1859,6 @@ fn the_footer_cache_keys_a_vacancy_to_its_session() {
             StepEvent::Bind { len: len(&d) }
         ]
     );
-    // NEGATIVE CONTROL: X's own file.
     cache.note_entry(None, "x", None);
     append(&x, &[prompt("v2", 200, "x's first")]);
     cache.note_entry(None, "x", Some((&x, true)));
@@ -2080,8 +1874,6 @@ fn the_footer_cache_keys_a_vacancy_to_its_session() {
 }
 
 /// The footer's cache taps nothing until the glue arms it; armed on a
-/// transcript it already reads, the tap seeds at the file's length then
-/// (S1), and what is appended after comes through `take_steps`.
 #[test]
 fn the_footer_cache_taps_only_once_armed() {
     use super::super::footer::FooterCache;

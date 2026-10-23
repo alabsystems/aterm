@@ -1,41 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The GL arm's X11 binding: a device on an X11 display makes its OpenGL ES 3
-//! context with GLX, and its windows post with `glXSwapBuffers`.
-//!
-//! EGL's X11 platform is a vendor library, and NVIDIA's
-//! (`libnvidia-egl-xlib`, the driver's X11 EGL since 560) posts nothing on an
-//! Xorg server the NVIDIA X driver runs: every `eglSwapBuffers` succeeds and
-//! the window stays black. GLX on the same server posts (driver 580.159.03,
-//! Xorg 21.1.11, 2026-10-21). GLX is the GL API every X server's driver
-//! serves, so an X11 device opens a GLX OpenGL ES 3.0 context
-//! (`GLX_EXT_create_context_es_profile`, which Mesa and NVIDIA both offer;
-//! its `es2` forerunner promises only 2.0) and EGL stays the binding
-//! everywhere else: Wayland and headless. An X server whose GLX makes no ES
-//! 3.0 context gets no EGL device instead (its windows draw on the CPU
-//! renderer, `GlDevice::on_window_system`): an EGL swap that posts nothing
-//! still answers success, so the arm could not tell a working X11 EGL from
-//! NVIDIA's. A GLX refusal also raises an X error, which the windowing
-//! crate's handler logs and keeps out of its own error slot: a GLX request's
-//! error is the GL arm's, which reads its failures from GLX's answers.
-//!
-//! * The context reports a GPU reset where GLX can make it so
-//!   (`GLX_ARB_create_context_robustness`: robust access, and the context
-//!   lost on a reset), and NVIDIA's purge of its video memory as one too
-//!   (`GLX_NV_robustness_video_memory_purge`: a VT switch, a mode switch,
-//!   suspend and resume can erase every texture). Without it a reset or a
-//!   purge left the window drawing from erased atlases, or frozen, and never
-//!   reached the frontend's CPU fallback. A driver that refuses the robust
-//!   attributes gets the plain context (see [`context_attempts`]).
-//! * The config is the screen's default visual's exactly-RGB888,
-//!   double-buffered, single-sampled one: the visual every aterm window has
-//!   (the windowing crate makes each window on its parent's visual), so every
-//!   window's `GLXWindow` shares the context's config.
-//! * Between posts the context is current on a 1x1 pbuffer, as an EGL
-//!   context is on its pbuffer where the display has no surfaceless binding.
-//! * The calls share the windowing crate's Xlib connection, which ran
-//!   `XInitThreads` first, so the render thread may make them.
+//! The GL arm's X11 binding.
 
 use std::ffi::{CStr, c_int, c_uint, c_void};
 
@@ -54,32 +20,26 @@ enum SwapControl {
     Absent,
 }
 
-/// How a GLX context hears of a GPU reset: what it was made with, by what
-/// GLX offered and the driver accepted.
+/// How a GLX context hears of a GPU reset: what it was made with, by what GLX offered and the driver accepted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Robustness {
-    /// No reset notification: GLX offers no
-    /// `GLX_ARB_create_context_robustness`, or the driver refused it.
+    /// No reset notification: GLX offers no `GLX_ARB_create_context_robustness`, or the driver refused it.
     Plain,
-    /// Robust access, and the context lost on a reset, which
-    /// `glGetGraphicsResetStatus` and `GL_CONTEXT_LOST` then report.
+    /// Robust access, and the context lost on a reset, which `glGetGraphicsResetStatus` and `GL_CONTEXT_LOST` then report.
     LoseOnReset,
-    /// As [`Self::LoseOnReset`], and a purge of the context's video memory
-    /// reported as a reset (`GL_PURGED_CONTEXT_RESET_NV`).
+    /// As [`Self::LoseOnReset`], and a purge of the context's video memory reported as a reset (`GL_PURGED_CONTEXT_RESET_NV`).
     LoseOnResetOrPurge,
 }
 
 impl Robustness {
-    /// Whether `glGetGraphicsResetStatus` can answer anything but
-    /// `GL_NO_ERROR` on such a context.
+    /// Whether `glGetGraphicsResetStatus` can answer anything but `GL_NO_ERROR` on such a context.
     #[inline]
     pub(crate) const fn reports_resets(self) -> bool {
         !matches!(self, Self::Plain)
     }
 }
 
-/// A GLX OpenGL ES 3 context on an X11 display, the config its windows share
-/// and the pbuffer it is current on between posts.
+/// A GLX OpenGL ES 3 context on an X11 display, the config its windows share and the pbuffer it is current on between posts.
 pub(crate) struct GlxContext {
     glx: &'static Glx,
     display: XDisplay,
@@ -102,10 +62,6 @@ struct ConfigFacts {
 }
 
 /// The config a context and its windows share: on `visual`, exactly RGB888
-/// (the sizes `glXChooseFBConfig` matches are minimums, so 10-bit configs are
-/// listed too, whose back buffer would rescale every byte the stand-in
-/// carries), alpha 0 or 8, and single-sampled (GLES 3 refuses a blit into a
-/// multisampled back buffer); the first such in GLX's order.
 fn pick_config(configs: &[ConfigFacts], visual: u32) -> Option<usize> {
     configs.iter().position(|c| {
         c.visual == visual
@@ -121,12 +77,6 @@ fn has_ext(list: &str, ext: &str) -> bool {
 }
 
 /// The OpenGL ES 3.0 context's attribute lists (each 0-terminated) to try in
-/// order, with the robustness each makes: robust access and the context lost
-/// on a reset where GLX offers `GLX_ARB_create_context_robustness`, first
-/// with a video memory purge reported as a reset where it also offers
-/// `GLX_NV_robustness_video_memory_purge`; the plain context last, which a
-/// driver refusing the robust attributes (a robust ES profile is the
-/// driver's to grant) still makes.
 fn context_attempts(exts: &str) -> Vec<(Robustness, Vec<c_int>)> {
     let es30 = [
         ffi::GLX_CONTEXT_MAJOR_VERSION_ARB,
@@ -158,18 +108,12 @@ fn context_attempts(exts: &str) -> Vec<(Robustness, Vec<c_int>)> {
 }
 
 impl GlxContext {
-    /// A GLX OpenGL ES 3.0 context on `display` (an Xlib `Display*` the caller
-    /// keeps open for the context's life) for windows on screen `screen`'s
-    /// default visual, robust where GLX offers it ([`context_attempts`]).
-    /// `Err` says why GLX cannot serve: no library, no ES context, no matching
-    /// config, or a refused context or pbuffer.
+    /// A GLX OpenGL ES 3.0 context on `display` (an Xlib `Display*` the caller keeps open for the context's life) for windows on screen `screen`'s default visual, robust where GLX offers it ([`context_attempts`]).
     pub(crate) fn new(display: XDisplay, screen: c_int) -> Result<Self, String> {
         Self::offering(display, screen, "")
     }
 
     /// [`Self::new`], as if GLX's extension list also named `also` (a test
-    /// offers the robustness extensions to a GLX that lists none, whose
-    /// driver may grant or refuse the attributes).
     fn offering(display: XDisplay, screen: c_int, also: &str) -> Result<Self, String> {
         let glx = Glx::get()?;
         let fns = &glx.fns;
@@ -210,8 +154,7 @@ impl GlxContext {
         if list.is_null() {
             return Err("gl: GLX has no RGB888 double-buffered window config".to_owned());
         }
-        // SAFETY: GLX returned `n` configs at `list`; the configs outlive the
-        // array, which is GLX's to free (`XFree`).
+        // SAFETY: GLX returned `n` configs at `list`; the configs outlive the array, which is GLX's to free (`XFree`).
         let configs =
             unsafe { std::slice::from_raw_parts(list, usize::try_from(n).unwrap_or(0)) }.to_vec();
         // SAFETY: the array `glXChooseFBConfig` allocated, freed once.
@@ -235,8 +178,7 @@ impl GlxContext {
                 visual: u32::try_from(attrib(c, ffi::GLX_VISUAL_ID)).unwrap_or(0),
             })
             .collect();
-        // SAFETY: a live display and one of its screens; the visual is the
-        // display's own.
+        // SAFETY: a live display and one of its screens; the visual is the display's own.
         let visual =
             unsafe { (glx.x.visual_id_from_visual)((glx.x.default_visual)(display, screen)) };
         let visual = u32::try_from(visual).unwrap_or(0);
@@ -247,8 +189,7 @@ impl GlxContext {
                     "gl: GLX has no RGB888 single-sampled config on the default visual {visual:#x}"
                 )
             })?;
-        // SAFETY: `GLX_ARB_create_context` is offered (checked above), so the
-        // name resolves to the function its registry signature declares.
+        // SAFETY: `GLX_ARB_create_context` is offered (checked above), so the name resolves to the function its registry signature declares.
         let create = unsafe {
             proc_address(glx, c"glXCreateContextAttribsARB")
                 .map(|p| std::mem::transmute::<*const c_void, ffi::CreateContextAttribsFn>(p))
@@ -257,8 +198,7 @@ impl GlxContext {
         let mut refused = Vec::new();
         let mut made = None;
         for (robustness, attribs) in context_attempts(&exts) {
-            // SAFETY: a config of this display, no share context, direct
-            // rendering, a 0-terminated list.
+            // SAFETY: a config of this display, no share context, direct rendering, a 0-terminated list.
             let context =
                 unsafe { create(display, config, std::ptr::null_mut(), 1, attribs.as_ptr()) };
             if !context.is_null() {
@@ -270,8 +210,6 @@ impl GlxContext {
         let (context, robustness) =
             made.ok_or("gl: GLX refused an OpenGL ES 3.0 context".to_owned())?;
         if !refused.is_empty() {
-            // GLX offered robustness and the driver refused some of it: the
-            // device works, but what it was refused goes unheard. One note.
             let unheard = if robustness.reports_resets() {
                 "a video memory purge"
             } else {
@@ -283,16 +221,13 @@ impl GlxContext {
             );
         }
         let pbuffer_attribs = [ffi::GLX_PBUFFER_WIDTH, 1, ffi::GLX_PBUFFER_HEIGHT, 1, 0];
-        // SAFETY: a pbuffer-capable config (`GLX_PBUFFER_BIT` above) and a
-        // 0-terminated list.
+        // SAFETY: a pbuffer-capable config (`GLX_PBUFFER_BIT` above) and a 0-terminated list.
         let pbuffer = unsafe { (fns.create_pbuffer)(display, config, pbuffer_attribs.as_ptr()) };
         if pbuffer == 0 {
             // SAFETY: the context made above, never current.
             unsafe { (fns.destroy_context)(display, context) };
             return Err("gl: GLX refused a 1x1 pbuffer".to_owned());
         }
-        // SAFETY (each arm): the extension that defines the name is offered,
-        // so it resolves to the function its alias type declares.
         let swap = unsafe {
             let named = |ext: &str, name: &CStr| {
                 has_ext(&exts, ext)
@@ -327,8 +262,7 @@ impl GlxContext {
         self.robustness
     }
 
-    /// The GL (or GLX) function named `sym`, for the GL table; null when GLX
-    /// has none.
+    /// The GL (or GLX) function named `sym`, for the GL table; null when GLX has none.
     pub(crate) fn proc_address(&self, sym: &CStr) -> *const c_void {
         proc_address(self.glx, sym).unwrap_or(std::ptr::null())
     }
@@ -338,16 +272,13 @@ impl GlxContext {
         self.bind(self.pbuffer)
     }
 
-    /// Make the context current on `window`, a `GLXWindow` of this context's
-    /// ([`Self::create_window`]): the default framebuffer is then its back
-    /// buffer.
+    /// Make the context current on `window`, a `GLXWindow` of this context's ([`Self::create_window`]).
     pub(crate) fn bind_window(&self, window: GLXDrawable) -> Result<(), String> {
         self.bind(window)
     }
 
     fn bind(&self, drawable: GLXDrawable) -> Result<(), String> {
-        // SAFETY: a drawable made on this display with the context's config;
-        // the device lock keeps every other thread off the context.
+        // SAFETY: a drawable made on this display with the context's config; the device lock keeps every other thread off the context.
         let ok = unsafe {
             (self.glx.fns.make_context_current)(self.display, drawable, drawable, self.context)
         };
@@ -366,8 +297,7 @@ impl GlxContext {
         }
     }
 
-    /// A `GLXWindow` on the X11 window `window`, whose visual (`None`:
-    /// unknown) must be the context's.
+    /// A `GLXWindow` on the X11 window `window`, whose visual (`None`: unknown) must be the context's.
     pub(crate) fn create_window(
         &self,
         window: u64,
@@ -382,8 +312,7 @@ impl GlxContext {
             ));
         }
         let attribs = [0];
-        // SAFETY: a live window of this display on the config's visual, and a
-        // 0-terminated (empty) list.
+        // SAFETY: a live window of this display on the config's visual, and a 0-terminated (empty) list.
         let drawable = unsafe {
             (self.glx.fns.create_window)(self.display, self.config, window, attribs.as_ptr())
         };
@@ -400,9 +329,7 @@ impl GlxContext {
         unsafe { (self.glx.fns.destroy_window)(self.display, window) };
     }
 
-    /// The X11 window `xid`'s width and height now, which its `GLXWindow`
-    /// follows: one round trip (`glXQueryDrawable` takes one a side); (0, 0)
-    /// when the server answers none.
+    /// The X11 window `xid`'s width and height now, which its `GLXWindow` follows: one round trip (`glXQueryDrawable` takes one a side).
     pub(crate) fn size(&self, xid: u64) -> (u32, u32) {
         let (mut root, mut x, mut y) = (0, 0, 0);
         let (mut w, mut h, mut border, mut depth): (c_uint, c_uint, c_uint, c_uint) = (0, 0, 0, 0);
@@ -423,11 +350,8 @@ impl GlxContext {
         if ok == 0 { (0, 0) } else { (w, h) }
     }
 
-    /// Set `window`'s swap interval (0: post at once; 1: wait for the
-    /// refresh). The window is current on the calling thread.
+    /// Set `window`'s swap interval (0: post at once; 1: wait for the refresh).
     pub(crate) fn swap_interval(&self, window: GLXDrawable, interval: i32) -> Result<(), String> {
-        // SAFETY (each call): the function the offered extension defines;
-        // the window is current, which the MESA and SGI forms act on.
         match self.swap {
             SwapControl::Ext(f) => {
                 unsafe { f(self.display, window, interval) };
@@ -448,8 +372,7 @@ impl GlxContext {
         }
     }
 
-    /// Post `window`'s back buffer. The window is current on the calling
-    /// thread.
+    /// Post `window`'s back buffer.
     pub(crate) fn swap(&self, window: GLXDrawable) {
         // SAFETY: a `GLXWindow` of this display, current here.
         unsafe { (self.glx.fns.swap_buffers)(self.display, window) };
@@ -458,8 +381,7 @@ impl GlxContext {
 
 impl Drop for GlxContext {
     fn drop(&mut self) {
-        // SAFETY: the device owning this context is gone, so no thread holds
-        // it current; the pbuffer and the context were made on this display.
+        // SAFETY: the device owning this context is gone, so no thread holds it current.
         unsafe {
             (self.glx.fns.destroy_pbuffer)(self.display, self.pbuffer);
             (self.glx.fns.destroy_context)(self.display, self.context);
@@ -467,9 +389,7 @@ impl Drop for GlxContext {
     }
 }
 
-/// Whether a compositing manager runs on `display`'s screen `screen` (it owns
-/// the `_NET_WM_CM_S<screen>` selection, EWMH): it then composites every frame
-/// at its own refresh. `false` where libX11 cannot be read.
+/// Whether a compositing manager runs on `display`'s screen `screen` (it owns the `_NET_WM_CM_S<screen>` selection, EWMH).
 pub(crate) fn composited(display: XDisplay, screen: c_int) -> bool {
     let Ok(glx) = Glx::get() else {
         return false;
@@ -477,8 +397,7 @@ pub(crate) fn composited(display: XDisplay, screen: c_int) -> bool {
     let Ok(name) = std::ffi::CString::new(format!("_NET_WM_CM_S{screen}")) else {
         return false;
     };
-    // SAFETY: a live display and a NUL-terminated name; `only_if_exists`
-    // false, so the atom is made if no client named it yet.
+    // SAFETY: a live display and a NUL-terminated name; `only_if_exists` false, so the atom is made if no client named it yet.
     unsafe {
         let selection = (glx.x.intern_atom)(display, name.as_ptr(), 0);
         selection != 0 && (glx.x.get_selection_owner)(display, selection) != 0
@@ -508,9 +427,6 @@ mod tests {
     }
 
     /// The shared config is the first exactly-RGB888, single-sampled one on
-    /// the window's visual: a 10-bit config, a multisampled one and one on
-    /// another visual are each passed over even when GLX lists them first,
-    /// and a visual no config serves has none.
     #[test]
     fn the_shared_config_is_exactly_rgb888_single_sampled_on_the_visual() {
         let listed = [
@@ -532,15 +448,6 @@ mod tests {
     }
 
     /// The context's attribute lists, tried in order: where GLX offers
-    /// `GLX_ARB_create_context_robustness`, the first asks for robust access
-    /// (`GLX_CONTEXT_FLAGS_ARB` with the robust-access bit) and the context
-    /// lost on a reset (`GLX_LOSE_CONTEXT_ON_RESET_ARB`), with a video memory
-    /// purge reported as a reset ahead of it where GLX also offers
-    /// `GLX_NV_robustness_video_memory_purge` (NVIDIA's libGLX_nvidia
-    /// 580.159.03 offers both); the plain ES 3.0 list always comes last, and
-    /// alone where GLX offers no robustness (Mesa's GLX on the private
-    /// Xwayland test bed), or only the purge, which asks nothing without it.
-    /// Every list is attribute pairs and a 0.
     #[test]
     fn the_context_asks_for_robustness_where_glx_offers_it() {
         use Robustness::{LoseOnReset, LoseOnResetOrPurge, Plain};
@@ -597,8 +504,6 @@ mod tests {
     }
 
     /// The test's own Xlib: a window to post to and a pixel read back from it
-    /// (`XGetImage`), which is what the X server holds as the window's
-    /// content, the content a compositor shows.
     mod xlib {
         use std::ffi::{CStr, c_char, c_int, c_long, c_uint, c_ulong, c_void};
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -715,8 +620,7 @@ mod tests {
                         "$DISPLAY names an X server, but libX11.so.6 does not open",
                     );
                 }
-                // SAFETY: `dlsym` on a live handle; the table declares each
-                // function's Xlib.h signature.
+                // SAFETY: `dlsym` on a live handle; the table declares each function's Xlib.h signature.
                 unsafe { Xlib::load(&mut |sym: &CStr| libc::dlsym(h, sym.as_ptr()).cast_const()) }
                     .expect("libX11 has the calls the test makes")
             }
@@ -725,8 +629,7 @@ mod tests {
         /// The X errors the connection raised.
         pub(super) static ERRORS: AtomicUsize = AtomicUsize::new(0);
 
-        /// An X error handler that counts the error and returns, as
-        /// aterm-window's does (Xlib's default handler exits the process).
+        /// An X error handler that counts the error and returns, as aterm-window's does (Xlib's default handler exits the process).
         pub(super) unsafe extern "C" fn count_errors(_: Display, _: *mut c_void) -> c_int {
             ERRORS.fetch_add(1, Ordering::Relaxed);
             0
@@ -734,8 +637,6 @@ mod tests {
     }
 
     /// The child's display and window: both closed when it drops, after the
-    /// surface and the device declared later, and the error handler it
-    /// replaced put back.
     struct Desk<'x> {
         x: &'x xlib::Xlib,
         dpy: xlib::Display,
@@ -753,17 +654,11 @@ mod tests {
 
     impl<'x> Desk<'x> {
         /// `$DISPLAY`'s X server, opened with [`xlib::count_errors`] as the
-        /// process's error handler (the first Xlib calls the process makes),
-        /// and a mapped `w` x `h` window on it: override-redirect (no window
-        /// manager frames or moves it) with no background (the server never
-        /// paints over a post). The wait for the map is a one-minute hang
-        /// detector.
         fn open(x: &'x xlib::Xlib, w: u32, h: u32) -> Self {
             use aterm_spec::host::could_not_run;
             use aterm_spec::wait::{MUST_HAPPEN, until_within};
 
-            // SAFETY: the first Xlib calls this process makes; the handler
-            // only counts.
+            // SAFETY: the first Xlib calls this process makes; the handler only counts.
             let (previous, dpy) = unsafe {
                 (x.init_threads)();
                 let previous = (x.set_error_handler)(Some(xlib::count_errors));
@@ -782,9 +677,7 @@ mod tests {
                 event_mask: xlib::STRUCTURE_NOTIFY_MASK | xlib::EXPOSURE_MASK,
                 ..Default::default()
             };
-            // SAFETY: a live display; a top-level window on its default
-            // screen with the root's depth and visual, its attributes read
-            // from `attributes`, then mapped.
+            // SAFETY: a live display.
             let (screen, win) = unsafe {
                 let screen = (x.default_screen)(dpy);
                 let root = (x.root_window)(dpy, screen);
@@ -835,7 +728,6 @@ mod tests {
         }
 
         /// The GL arm's device on this display; a server it cannot open one
-        /// on could not run the test.
         fn device(&self) -> GlDevice {
             GlDevice::on_window_system(self.window_system()).unwrap_or_else(|e| {
                 aterm_spec::host::could_not_run(format!("no GL device on $DISPLAY's X server: {e}"))
@@ -854,8 +746,7 @@ mod tests {
             // SAFETY: a live display.
             while unsafe { (self.x.pending)(self.dpy) } > 0 {
                 let mut ev = xlib::XEvent::zeroed();
-                // SAFETY: a live display with an event queued; room for any
-                // event.
+                // SAFETY: a live display with an event queued; room for any event.
                 unsafe { (self.x.next_event)(self.dpy, &raw mut ev) };
                 seen.mapped |= ev.kind == xlib::MAP_NOTIFY;
                 seen.exposed |= ev.kind == xlib::EXPOSE;
@@ -864,7 +755,6 @@ mod tests {
         }
 
         /// The window's pixel at (`px`, `py`) as the X server holds it, or
-        /// `None` when the server answers no image.
         fn pixel(&self, px: c_int, py: c_int) -> Option<[u8; 3]> {
             // SAFETY: a live display; the window is this display's.
             let img = unsafe {
@@ -898,8 +788,7 @@ mod tests {
                 channel(i.green_mask),
                 channel(i.blue_mask),
             ];
-            // SAFETY: the image's data and the image, each freed once, as
-            // `XDestroyImage` frees them.
+            // SAFETY: the image's data and the image, each freed once, as `XDestroyImage` frees them.
             unsafe {
                 (self.x.free)(i.data.cast());
                 (self.x.free)(img.cast());
@@ -910,8 +799,7 @@ mod tests {
 
     impl Drop for Desk<'_> {
         fn drop(&mut self) {
-            // SAFETY: the window and the display this test opened, each closed
-            // once, then the handler Xlib had before.
+            // SAFETY: the window and the display this test opened, each closed once, then the handler Xlib had before.
             unsafe {
                 (self.x.destroy_window)(self.dpy, self.win);
                 (self.x.close_display)(self.dpy);
@@ -924,12 +812,6 @@ mod tests {
     const CHILD: &str = "ATERM_GPU_GLX_CHILD";
 
     /// Run `body` as the test `name` in a child, and its stdout, which must
-    /// hold `done`. Xlib's error and IO handlers are process-wide, so each X11
-    /// test's work runs in a child: this test binary run again on that one
-    /// test, with [`CHILD`] set (`None` there, once `body` ran). It runs where
-    /// `$DISPLAY` names an X server; elsewhere it says SKIP (`None`). The
-    /// child's own one-minute detectors run inside this one's, so a wait
-    /// that never ends fails in the child, with what it read.
     fn in_child(name: &str, done: &str, body: fn()) -> Option<String> {
         use std::io::Read as _;
 
@@ -993,7 +875,6 @@ mod tests {
             stdout.contains(done),
             "the child never said {done:?}; {said}"
         );
-        // libtest prints the child's own `test … ` prefix on the same line.
         for line in stdout.lines().filter_map(|l| l.find(done).map(|i| &l[i..])) {
             eprintln!("{line}");
         }
@@ -1001,49 +882,12 @@ mod tests {
     }
 
     /// What the child prints once its window held the posted colour, grown
-    /// too.
     const POSTED: &str = "GL-X11-POST: the window holds the posted colour, grown too";
 
     /// The frame background the posts fill past the answered size with
-    /// (`0xRRGGBB`), unlike the stand-in's colour and black.
     const FILL: u32 = 0x30_50_70;
 
     /// A frame the arm posts to an X11 window becomes that window's content:
-    /// the X server answers `XGetImage` with the colour the stand-in held.
-    /// On an Xorg server the NVIDIA X driver runs, the EGL binding this
-    /// device replaces posted nothing (the negative control: with
-    /// `on_window_system`'s GLX attempt removed the window reads black on
-    /// such a desk, driver 580.159.03, 2026-10-21); elsewhere both bindings
-    /// post, and the test holds the GLX device the arm picks to it.
-    ///
-    /// The surface's present mode is checked too: it waits for the refresh
-    /// only where no compositing manager runs (`_NET_WM_CM_S<screen>`).
-    ///
-    /// Then the window grows behind the surface's back, as a window manager's
-    /// resize does before the frontend hears of it, and the next post still
-    /// covers all of it: the area past the stand-in reads the stand-in's edge
-    /// colour. The negative control: without `present`'s edge stretch, that
-    /// area reads [0, 0, 0] on this desk's NVIDIA GLX (2026-10-22), the back
-    /// buffer's bytes.
-    ///
-    /// Then the window grows again while the size the window system answers
-    /// lags it (`asked_size`), as NVIDIA's GLX answer does in a burst of
-    /// resizes (the desk, 2026-10-22: one resize step of black at the right
-    /// and the top): the frame lands low and short, and the buffer above it
-    /// and right of the answered width reads the frame's background. The
-    /// negative control: without `present`'s scissored clears, those points
-    /// read the buffer's bytes.
-    ///
-    /// Last the answer lags once (`asked_once`), as when a resize lands
-    /// between the ask and the swap: the post lands low, the ask after the
-    /// swap answers the window's size, and the stand-in is posted again at
-    /// it, so the window reads the stand-in at its top-left and its stretched
-    /// edges everywhere else. The negative control: without the post-swap ask
-    /// in `present`, the point above the low frame keeps the fill.
-    ///
-    /// The arm posts once the window maps ([`Desk::open`]), and again on each
-    /// `Expose`, as a terminal does; the wait for the colour is a one-minute
-    /// hang detector. It runs in a child ([`in_child`]).
     #[test]
     fn a_frame_posted_to_an_x11_window_is_its_content() {
         let Some(stdout) = in_child(
@@ -1062,9 +906,6 @@ mod tests {
     }
 
     /// The child's work: an override-redirect window on `$DISPLAY`, a device
-    /// and a surface on it, a colour cleared into the stand-in and posted, and
-    /// the window's pixel read until it is that colour; then the window
-    /// doubled, posted again, and read past the stand-in.
     fn post_and_read_back() {
         use std::sync::atomic::Ordering;
 
@@ -1085,8 +926,6 @@ mod tests {
         );
         let mut surface = GlWindowSurface::create(&dev, desk.native(), w, h, Box::new(()))
             .expect("a window surface");
-        // The present mode: synchronized only where no compositing manager
-        // owns `_NET_WM_CM_S<screen>`, asked here on the test's own terms.
         let name = std::ffi::CString::new(format!("_NET_WM_CM_S{}", desk.screen)).expect("a name");
         // SAFETY: a live display and a NUL-terminated name.
         let composited = unsafe {
@@ -1101,7 +940,6 @@ mod tests {
                  (composited: {composited})"
             );
         }
-        // 0.2, 0.6, 1.0 in the stand-in's linear RGBA8: 51, 153, 255.
         let colour = [0.2_f32, 0.6, 1.0, 1.0];
         let want = [51_u8, 153, 255];
         {
@@ -1109,8 +947,7 @@ mod tests {
             let cur = dev.enter().expect("enter");
             let fbo = standin.fbo(&cur).expect("the stand-in's framebuffer");
             let gl = cur.gl();
-            // SAFETY: the context is current; the stand-in's complete
-            // framebuffer; four floats for one colour attachment.
+            // SAFETY: the context is current; the stand-in's complete framebuffer; four floats for one colour attachment.
             unsafe {
                 (gl.bind_framebuffer)(ffi::GL_FRAMEBUFFER, fbo);
                 (gl.clear_bufferfv)(ffi::GL_COLOR, 0, colour.as_ptr());
@@ -1135,8 +972,6 @@ mod tests {
              ({errors} X errors)"
         );
 
-        // The window doubles; the surface is not told. Points past the
-        // stand-in's right edge, past its bottom edge, and past both.
         // SAFETY: a live display and its window.
         unsafe { (x.resize_window)(desk.dpy, desk.win, 2 * w, 2 * h) };
         surface
@@ -1160,12 +995,6 @@ mod tests {
              {MUST_HAPPEN:?} after {posts} posts ({errors} X errors)"
         );
 
-        // The window grows again, and the size the window system answers lags
-        // it, as NVIDIA's GLX answer does in a burst of resizes: the frame
-        // lands low and short. Points above it, right of the answered width,
-        // and both read the fill; one inside the landed frame reads the
-        // stand-in. The window is 192 x 144, the answer 128 x 96, so the frame
-        // lands 48 rows low.
         surface.asked_size = Some((128, 96));
         // SAFETY: a live display and its window.
         unsafe { (x.resize_window)(desk.dpy, desk.win, 3 * w, 3 * h) };
@@ -1203,10 +1032,6 @@ mod tests {
              {points:?}, {MUST_HAPPEN:?} after {posts} posts ({errors} X errors)"
         );
 
-        // The answer lags once, as when a resize lands between the ask and
-        // the swap: the first post lands 48 rows low and the second, made at
-        // the size asked after the swap, covers the window. No post follows,
-        // so what the window reads is that present's.
         surface.asked_size = None;
         surface.asked_once.set(Some((128, 96)));
         surface
@@ -1230,23 +1055,9 @@ mod tests {
     }
 
     /// What the child prints once each context's reset strategy matched the
-    /// robustness it was made with.
     const ROBUST: &str = "GL-X11-ROBUST: each context's reset strategy is the one it was made with";
 
     /// A GLX context reports resets exactly where it was made to: the
-    /// driver's own answer (`GL_RESET_NOTIFICATION_STRATEGY`) is
-    /// `GL_LOSE_CONTEXT_ON_RESET` on a context the arm made robust, and not
-    /// on a plain one. Where GLX offers no `GLX_ARB_create_context_robustness`
-    /// the context is plain and the robust attributes are never sent (Mesa's
-    /// GLX on the private Xwayland test bed, whose arm context answers
-    /// `GL_NO_RESET_NOTIFICATION`). Offered both extensions by the test, the
-    /// attributes are sent, and a refused attempt falls to the next: the
-    /// test bed's llvmpipe refuses the purge attribute (one X error) and
-    /// makes the `LoseOnReset` context, which answers
-    /// `GL_LOSE_CONTEXT_ON_RESET` (the negative control: with only the first
-    /// attempt tried, the forced mint fails there). NVIDIA's GLX offers both
-    /// extensions, and the arm asks it for `LoseOnResetOrPurge` first. It
-    /// runs in a child ([`in_child`]).
     #[test]
     fn a_glx_context_reports_resets_where_it_was_made_to() {
         let _ = in_child(
@@ -1257,7 +1068,6 @@ mod tests {
     }
 
     /// The child's work: the arm's own context and one offered robustness
-    /// by the test, each held to the driver's reset strategy.
     fn robust_contexts() {
         use std::sync::atomic::Ordering;
 
@@ -1310,10 +1120,8 @@ mod tests {
     }
 
     /// `ctx`'s `GL_RESET_NOTIFICATION_STRATEGY`, as the driver answers it on
-    /// its pbuffer; `None` where the context has no such query.
     fn reset_strategy(ctx: &GlxContext) -> Option<ffi::GLint> {
-        // SAFETY: GLX's entry points for the two core GLES functions, whose
-        // registry signatures the casts name.
+        // SAFETY: GLX's entry points for the two core GLES functions, whose registry signatures the casts name.
         let (get_error, get_integerv) = unsafe {
             (
                 std::mem::transmute::<*const c_void, unsafe extern "C" fn() -> ffi::GLenum>(
@@ -1338,20 +1146,9 @@ mod tests {
     }
 
     /// What the child prints once a refused GLX mint left the window system
-    /// with no device.
     const NO_EGL: &str = "GL-X11-NO-EGL: a refused GLX mint makes no EGL device";
 
     /// A GLX mint failure on an X11 window system makes no device, which
-    /// sends its windows to the CPU renderer, never to EGL's X11 platform:
-    /// NVIDIA's answers every swap with success and posts nothing on an Xorg
-    /// server its own driver runs (the black window of 2026-10-21). The test
-    /// refuses the mint itself, and the refusal comes back naming the CPU
-    /// renderer. The controls: GLX's own mint on the same display makes a
-    /// GLX device; and this server's EGL does make a device (Mesa's on the
-    /// private Xwayland test bed), so the fallback the arm had would have
-    /// chosen it (the negative control: with `on_window_system_via` trying
-    /// `on_egl_window_system` after the refusal, as it did, the test fails on
-    /// the test bed). It runs in a child ([`in_child`]).
     #[test]
     fn a_glx_mint_failure_on_x11_draws_on_the_cpu_not_egl() {
         let _ = in_child(
@@ -1391,18 +1188,6 @@ mod tests {
     const DRILL: &str = "GL-X11-DRILL: the drill latched at the present's reset check";
 
     /// The loss drill on a GLX device (`ATERM_GL_INJECT_LOSS`) runs the path
-    /// a real reset takes: its present binds the window through GLX, then
-    /// reads the reset status, where the drill's `GL_UNKNOWN_CONTEXT_RESET`
-    /// stands in for the driver's answer; the present fails naming it, the
-    /// device latches lost with it as the cause (what the frontend's
-    /// downgrade line prints), and refuses every later guard. Twice: on the
-    /// arm's own device, and on one whose context the test made robust
-    /// (`LoseOnReset` on the test bed's llvmpipe), whose reset check asks
-    /// the driver's real `glGetGraphicsResetStatus` at every present. The
-    /// control: each surface's undrilled presents post and latch nothing,
-    /// the robust one's answered by the driver. The negative control: with
-    /// `poll_reset` dropped from the GLX present, the drilled present posts
-    /// and the device stays live. It runs in a child ([`in_child`]).
     #[test]
     fn the_loss_drill_on_glx_latches_at_the_present_s_reset_check() {
         let _ = in_child(
@@ -1470,16 +1255,6 @@ mod tests {
     const REFUSED: &str = "GL-X11-BIND: a window GLX keeps refusing latches the device lost";
 
     /// A GLX window whose bind keeps failing latches the device lost at the
-    /// third present in a row, and not before: the window's `GLXWindow` is
-    /// destroyed behind the surface's back, so every later
-    /// `glXMakeContextCurrent` on it fails while the context still binds its
-    /// own pbuffer. The first two presents fail and latch nothing (a window
-    /// in teardown can be refused once); the third latches, with the bind's
-    /// failure as the cause. The control: the window's first present, before
-    /// the destroy, posts. The negative control: before this rule a window
-    /// GLX refused dropped every present and never latched (every present
-    /// here fails, and the device stays live through all of them). It runs
-    /// in a child ([`in_child`]).
     #[test]
     fn a_window_glx_keeps_refusing_latches_the_device_lost() {
         let _ = in_child(

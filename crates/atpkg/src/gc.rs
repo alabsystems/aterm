@@ -1,38 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Rollback-aware GC retention (§10.2): which store builds may be reclaimed, and the single
-//! destructive entry point that decision goes through.
-//!
-//! Retention is live + one rollback per program: [`reclaimable`] keeps the live build and the
-//! most recent build below it that `aterm pkg rollback` may land on
-//! ([`crate::flow::rollback_lands_on`] under the verified channel, or a vendor program's
-//! [`crate::vendor_direct::lane::rollback_lands_on`] under the latched vendor yanks).
-//!
-//! The live build is a witness, not an inference. [`crate::ops::active_builds`] folds the
-//! `bin/` shims in `read_dir` order, so where a program's shims disagree it can name an older
-//! build, and retention from that number deletes the live toolchain. Hence:
-//!
-//! * [`LiveBuild`] has private fields and one producer, [`live_builds`], which resolves the
-//!   `store/<program>/current` link [`crate::activate::activate_build`] writes and requires
-//!   the `bin/` view to agree with it.
-//! * [`reclaimable`] takes that witness, not a bare `u64`.
-//! * [`discard_superseded`] is the only reclaim of an installed build (`store::discard_build`
-//!   is `pub(crate)`). It refuses only the witness's own build: the retention rule lives in
-//!   [`reclaimable`] alone.
-//!
-//! The retired per-channel `channels/<c>/current` links witness nothing and are swept at the
-//! start of every pass ([`sweep_retired_channel_links`]).
-//!
-//! The second destructive path, `interrupted_debris`, cannot be witness-guarded: an install
-//! killed mid-extract leaves a marker-less tree, and an interrupted first install has no live
-//! build at all. It is guarded on claims instead: a build any `current` link or `bin/` shim
-//! resolves into is never swept, however partial it looks. A missing marker alone proves
-//! nothing, since a live build can lose its marker (a restore, a hand-edited prefix).
-//!
-//! Everything fails closed: an unreadable link directory, a dangling or out-of-store
-//! `current`, or disagreeing authorities or shims yield no witness, and the program is skipped
-//! (there is no fallback to the shim map). Each skip is a [`Divergence`] that `doctor` prints.
+//! Rollback-aware GC retention (§10.2).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -41,9 +10,6 @@ use crate::manifest::Channel;
 use crate::store::Layout;
 
 /// Evidence that `build` is the live build of `program`.
-///
-/// [`live_builds`] is the only constructor: the program's `store/<program>/current` link names
-/// `<build>` and no `bin/` shim of the program contradicts it.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct LiveBuild {
     program: String,
@@ -65,18 +31,14 @@ impl LiveBuild {
     }
 }
 
-/// Why a program has no live witness: deleting anything would be a guess, so GC abstains and
-/// `doctor` names the disagreement.
+/// Why a program has no live witness: deleting anything would be a guess, so GC abstains and `doctor` names the disagreement.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Diverged {
     /// The program's `current` link selects one build; its `bin/` shims run another.
     LinkShimMismatch { link_says: u64, shims_say: u64 },
-    /// This program's own tools resolve into different builds: an
-    /// [`crate::activate::install_shims`] loop that failed before its prune.
+    /// This program's own tools resolve into different builds: an [`crate::activate::install_shims`] loop that failed before its prune.
     ShimsDisagree { builds: Vec<u64> },
-    /// The program is live on `PATH` but no `current` link resolves into it: shimmed but
-    /// never activated, or its `current` dangles. Reported because the cost is otherwise
-    /// silent: its superseded builds are never reclaimed.
+    /// The program is live on `PATH` but no `current` link resolves into it: shimmed but never activated, or its `current` dangles.
     NoLiveWitness { shims_say: u64 },
 }
 
@@ -87,8 +49,7 @@ pub struct Divergence {
     pub reason: Diverged,
 }
 
-/// The prefix's reconciled answer to "which build of each program is live": the witnesses it
-/// could prove, plus the programs it could not and why.
+/// The prefix's reconciled answer to "which build of each program is live".
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct LiveSet {
     live: BTreeMap<String, LiveBuild>,
@@ -130,21 +91,12 @@ impl LiveSet {
 /// Why a reclaim was refused: a report line, not a panic mid-pass.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Retained {
-    /// The build is the live one. Unreachable from [`run`], whose candidates come from
-    /// [`reclaimable`]; this makes that a property of the code, not the caller.
+    /// The build is the live one.
     IsLive { program: String, build: u64 },
 }
 
 /// Resolve one `current` symlink into the `(program, build)` it proves live, or `None`.
-/// Fail-closed, because a false witness is worse than none:
-///
-/// * The target must strip `<prefix>/store` ([`crate::ops::store_build_of`]), so a `..` or a
-///   lookalike `store/<name>/<n>` tail elsewhere is not ours.
-/// * It must be exactly `store/<program>/<build>`, no deeper.
-/// * A dangling link proves nothing: there is no live tree to protect.
 fn current_target(prefix: &Path, current: &Path) -> Option<(String, u64)> {
-    // read_link, not platform::resolve_shim: `current` is a directory symlink (Unix) or
-    // junction (Windows), both of which std reads; resolve_shim's Windows half parses `.cmd`.
     let target = std::fs::read_link(current).ok()?;
     if target
         .strip_prefix(prefix.join("store"))
@@ -162,10 +114,6 @@ fn current_target(prefix: &Path, current: &Path) -> Option<(String, u64)> {
 }
 
 /// Every build the authoritative `store/<program>/current` links select, one per program.
-///
-/// Unreadable directories yield an empty map (no witnesses, so GC reclaims nothing); a
-/// dangling or out-of-store link claims nothing until the next activation rewrites it. A stale
-/// link is still safe to prefer: [`live_builds`] refuses a witness when the shims disagree.
 fn authority_claims(layout: &Layout) -> BTreeMap<String, u64> {
     let mut out: BTreeMap<String, u64> = BTreeMap::new();
     if let Ok(programs) = std::fs::read_dir(layout.prefix.join("store")) {
@@ -174,8 +122,6 @@ fn authority_claims(layout: &Layout) -> BTreeMap<String, u64> {
             else {
                 continue;
             };
-            // The link must resolve into its own `store/<dir>/`: a hand-made
-            // `store/ay/current -> store/ny/7` claims nothing about either.
             if p.file_name() == std::ffi::OsStr::new(&program) {
                 out.insert(program, build);
             }
@@ -184,9 +130,7 @@ fn authority_claims(layout: &Layout) -> BTreeMap<String, u64> {
     out
 }
 
-/// Remove the retired per-channel `channels/<c>/current` links and their directories. Each
-/// link is removed as a link ([`crate::platform::remove_link`]: never followed), a directory
-/// only once empty; anything else there is left alone. Best-effort and idempotent.
+/// Remove the retired per-channel `channels/<c>/current` links and their directories.
 pub(crate) fn sweep_retired_channel_links(layout: &Layout) {
     let root = layout.prefix.join("channels");
     let Ok(channels) = std::fs::read_dir(&root) else {
@@ -203,8 +147,6 @@ pub(crate) fn sweep_retired_channel_links(layout: &Layout) {
 }
 
 /// Every build the derived `bin/` shims point into, keyed by program. Unlike
-/// [`crate::ops::active_builds`] it keeps the whole set, so a program whose tools disagree is
-/// visibly contested. It only corroborates or contradicts a `current` claim.
 fn shim_claims(layout: &Layout) -> BTreeMap<String, BTreeSet<u64>> {
     let mut out: BTreeMap<String, BTreeSet<u64>> = BTreeMap::new();
     let Ok(entries) = std::fs::read_dir(layout.bin_dir()) else {
@@ -212,9 +154,6 @@ fn shim_claims(layout: &Layout) -> BTreeMap<String, BTreeSet<u64>> {
     };
     for e in entries.flatten() {
         // resolve_shim, not read_link: a Windows shim is a `.cmd` file read_link errs on,
-        // which would fail open there. store_build_of, not program_build_of_target: the
-        // latter is unanchored, so a dev-link into a checkout with a `store/ay/18/` tail
-        // would fabricate a claim about our ay@18.
         if let Some(target) = crate::platform::resolve_shim(&e.path())
             && let Some((program, build)) = crate::ops::store_build_of(&layout.prefix, &target)
         {
@@ -225,17 +164,12 @@ fn shim_claims(layout: &Layout) -> BTreeMap<String, BTreeSet<u64>> {
 }
 
 /// Reconcile the authoritative and derived views into witnesses plus divergences.
-///
-/// A witness needs the `current` link to speak and the shims not to contradict it. Silent
-/// shims (every tool tombstoned, an empty `exposes`) do not block a witness; disagreeing ones
-/// do, because the shim is what the user's next command runs.
 #[must_use]
 pub fn live_builds(layout: &Layout) -> LiveSet {
     live_from_claims(&authority_claims(layout), &shim_claims(layout))
 }
 
 /// [`live_builds`]' reconciliation over claim views already read, so a gc pass, whose sweep
-/// guard is their union, reads them once. Pure.
 fn live_from_claims(
     authority: &BTreeMap<String, u64>,
     shims: &BTreeMap<String, BTreeSet<u64>>,
@@ -267,7 +201,6 @@ fn live_from_claims(
                     continue;
                 }
                 (None, Some(s)) => Diverged::NoLiveWitness { shims_say: s },
-                // Unreachable: `program` came from one of the two maps.
                 (None, None) => continue,
             }
         };
@@ -279,14 +212,7 @@ fn live_from_claims(
     set
 }
 
-/// The store builds of one program that may be reclaimed, given all `installed` builds, its
-/// live witness, and the predicate `aterm pkg rollback` selects by (`lands_on`:
-/// [`crate::flow::rollback_lands_on`], or a vendor program's
-/// [`crate::vendor_direct::lane::rollback_lands_on`]).
-///
-/// Kept: the live build and the highest build below it that `lands_on` admits (the rollback
-/// target). Returned, ascending: everything else, including a build above the live one (staged,
-/// never activated) and a revoked one below it.
+/// Reclaimable store builds of a program given `installed`, its live witness, and `lands_on` ([`crate::flow::rollback_lands_on`]).
 #[must_use]
 pub fn reclaimable(
     installed: &[u64],
@@ -314,11 +240,6 @@ pub fn reclaimable(
 }
 
 /// Reclaim a superseded build of the witnessed program.
-///
-/// The only reclaim reachable from the GC decision: `store::discard_build` is `pub(crate)`,
-/// and the path comes from the witness's own program. It refuses only `build == live.build`;
-/// it does not re-derive supersession, so a new caller takes its candidates from
-/// [`reclaimable`] (handed the rollback target, this deletes it).
 pub fn discard_superseded(layout: &Layout, live: &LiveBuild, build: u64) -> Result<(), Retained> {
     if build == live.build {
         return Err(Retained::IsLive {
@@ -331,18 +252,13 @@ pub fn discard_superseded(layout: &Layout, live: &LiveBuild, build: u64) -> Resu
 }
 
 /// What an interrupted install left in `store/<program>/`. A partial tree is named by a build
-/// number, its stage scratch only by a directory name.
 #[derive(Default)]
 struct Debris {
     /// `(program, build, dir)` — numeric build dirs with no completeness marker.
     partial: Vec<(String, u64, PathBuf)>,
     /// `(program, dir name, dir)` — `<build>.incoming-<pid>` / `<build>.superseded-<pid>`.
-    /// Reported by name, not number: the scratch of build 19 is not build 19, which may be
-    /// live.
     scratch: Vec<(String, String, PathBuf)>,
     /// Stage sidecar files (`<build>.vendor`, `.shim-env`, `.modes`) whose `<build>` is gone:
-    /// a record of a tree that no longer exists, which only a later build of that number could
-    /// misread.
     orphan_sidecars: Vec<PathBuf>,
 }
 
@@ -355,25 +271,11 @@ fn orphan_sidecar_build(name: &str) -> Option<u64> {
 }
 
 /// Whether `name` is stage scratch this manager produced: `<build>.incoming-<pid>` or
-/// `<build>.superseded-<pid>` with a real build number. It matches the producer's exact shape
-/// because the sweep is an unguarded `remove_dir_all` in a directory the user can also write
-/// (`notes.incoming-drafts/` is not ours). [`crate::store::stage_scratch_of`] is the one
-/// recogniser, shared with the producer's own sweep.
 fn is_stage_scratch(name: &str) -> bool {
     crate::store::stage_scratch_of(name).is_some()
 }
 
 /// Move back any tree a swap was killed midway through, before the sweep decides what is
-/// debris. `store/<p>/<n>` absent with exactly one `<n>.superseded-<pid>` beside it is the
-/// two-rename window in [`crate::install::verify_and_stage`], and the parked tree is the
-/// user's only copy ([`crate::store::recover_interrupted_swap`] says why the test is this
-/// narrow). The recovered tree is unmarked, so the partial arm re-examines it under the claim
-/// guard.
-///
-/// Returns `(program, build)` for every window it could not close (two siblings, or a failed
-/// rename), which [`interrupted_debris`] must not read as scratch. Measured here, before this
-/// pass's reclaim loop runs: afterwards a stale sibling of a just-reclaimed build would also
-/// look like a window.
 fn recover_interrupted_swaps(layout: &Layout) -> BTreeMap<String, BTreeSet<u64>> {
     let mut parked: BTreeMap<String, BTreeSet<u64>> = BTreeMap::new();
     let Ok(programs) = std::fs::read_dir(layout.prefix.join("store")) else {
@@ -386,7 +288,6 @@ fn recover_interrupted_swaps(layout: &Layout) -> BTreeMap<String, BTreeSet<u64>>
         let Ok(entries) = std::fs::read_dir(prog.path()) else {
             continue;
         };
-        // Collect first: recovery mutates the directory being read.
         let mut candidates: BTreeSet<u64> = BTreeSet::new();
         for entry in entries.flatten() {
             let name = entry.file_name();
@@ -399,8 +300,6 @@ fn recover_interrupted_swaps(layout: &Layout) -> BTreeMap<String, BTreeSet<u64>>
         }
         for build in candidates {
             let dir = prog.path().join(build.to_string());
-            // `store::sweep_stage_scratch`'s `parked_only_copy`: no tree was put back and
-            // nothing stands at `<build>`.
             if !crate::store::recover_interrupted_swap(&dir)
                 && std::fs::symlink_metadata(&dir).is_err()
             {
@@ -412,20 +311,6 @@ fn recover_interrupted_swaps(layout: &Layout) -> BTreeMap<String, BTreeSet<u64>>
 }
 
 /// Everything an install killed mid-extract leaves behind, across all programs.
-///
-/// [`crate::ops::list_installed`] counts only marker-bearing numeric dirs, and
-/// `store::sweep_stage_scratch` clears scratch only for a build that is staged again, so
-/// without this a half-extracted toolchain leaks for good.
-///
-/// Guarded on claims, never on the missing marker alone: a live build can lose its marker
-/// (`doctor`'s "store missing/incomplete"), so a build in `claimed` (the union of
-/// [`authority_claims`] and [`shim_claims`]) is skipped however partial it looks. Not gated on
-/// a [`LiveBuild`]: an interrupted first install has none, and that is the case that leaks.
-///
-/// Scratch needs no claim guard: neither view can name a `<build>.incoming-<pid>`, and the
-/// store-wide writer lock means its stager is gone. The exception is `parked`: a
-/// `<build>.superseded-<pid>` whose `<build>` is absent is the only copy of that build, a swap
-/// window [`recover_interrupted_swaps`] could not close.
 fn interrupted_debris(
     layout: &Layout,
     claimed: &BTreeMap<String, BTreeSet<u64>>,
@@ -448,7 +333,6 @@ fn interrupted_debris(
         };
         for entry in entries.flatten() {
             // A sidecar whose build is provably absent describes nothing. A build parked
-            // mid-swap is absent too, but its sidecars belong to the parked tree and stay.
             if entry.file_type().is_ok_and(|t| t.is_file())
                 && let Some(build) = entry.file_name().to_str().and_then(orphan_sidecar_build)
                 && !parked.get(&program).is_some_and(|b| b.contains(&build))
@@ -460,34 +344,27 @@ fn interrupted_debris(
                 out.orphan_sidecars.push(entry.path());
                 continue;
             }
-            // Directories only. `DirEntry::file_type` does not follow symlinks, so `current`
-            // (a symlink, or a junction on Windows) is excluded here too.
             if !entry.file_type().is_ok_and(|t| t.is_dir()) {
                 continue;
             }
             let name = entry.file_name();
             let Some(name) = name.to_str() else { continue };
-            // The store's strict reader ([`crate::store::parse_build_name`]): `+18/` and
-            // `018/` are not builds this manager wrote. A name that is neither a build nor
-            // scratch falls through both arms.
             if let Some(build) = crate::store::parse_build_name(name) {
                 if crate::store::build_is_complete(&entry.path()) {
-                    continue; // an installed build — `reclaimable` owns it
+                    // an installed build — `reclaimable` owns it
+                    continue;
                 }
                 if crate::store::build_marks_another_slice(&entry.path()) {
                     // A complete install of the universal binary's other slice:
-                    // `build_is_complete` refuses it so this slice re-stages it, but it did
-                    // finish, and nothing claims a rollback tree.
                     continue;
                 }
                 if claimed.get(&program).is_some_and(|s| s.contains(&build)) {
-                    continue; // something on disk points into it: not ours to delete
+                    // something on disk points into it: not ours to delete
+                    continue;
                 }
                 out.partial.push((program.clone(), build, entry.path()));
             } else if is_stage_scratch(name) {
                 // A parked `<build>.superseded-<pid>` (nothing at `<build>`) is that build's
-                // only copy. Still swept: `.incoming-<pid>` half-extracts and superseded
-                // siblings of a build that is there.
                 if let Some((build, crate::store::Scratch::Superseded)) =
                     crate::store::stage_scratch_of(name)
                     && parked.get(&program).is_some_and(|b| b.contains(&build))
@@ -499,7 +376,6 @@ fn interrupted_debris(
             }
         }
     }
-    // `read_dir` order is arbitrary; the report is a user-facing list.
     out.partial.sort();
     out.scratch.sort();
     out
@@ -511,72 +387,30 @@ pub struct GcReport {
     /// `(program, discarded builds ascending)` for every program that had reclaimable builds.
     pub reclaimed: Vec<(String, Vec<u64>)>,
     /// `(program, swept builds ascending)` for marker-less trees an interrupted install left.
-    /// Kept apart from `reclaimed`: these were never installed.
     pub swept_partial: Vec<(String, Vec<u64>)>,
-    /// `(program, swept scratch dir names ascending)`: the `<build>.incoming-<pid>` /
-    /// `<build>.superseded-<pid>` siblings of a stage killed between its extract and its swap.
+    /// `(program, swept scratch dir names ascending)`.
     pub swept_scratch: Vec<(String, Vec<String>)>,
     /// Programs skipped because the prefix could not prove which of their builds is live.
-    /// GC never settles a disagreement by deleting; `doctor` prints these.
     pub diverged: Vec<Divergence>,
-    /// `(program, staged file names ascending)` for archives a killed download left in
-    /// `staging/<program>/`: a leak apart from the extracted trees under `store/`, and often
-    /// hundreds of MB.
+    /// `(program, staged file names ascending)` for archives a killed download left in `staging/<program>/`.
     pub swept_staging: Vec<(String, Vec<String>)>,
-    /// Exec roots (`<prefix>/compat/trust/<n>`, [`crate::compat`]) removed because their
-    /// build is gone or no longer needs one, and the dot debris a killed rebuild left. A stray
-    /// root is a clone that keeps a reclaimed build's blocks allocated outside `store/`.
+    /// Exec roots (`<prefix>/compat/trust/<n>`, [`crate::compat`]) removed because their build is gone or no longer needs one, and the dot debris a killed rebuild left.
     pub swept_exec_roots: Vec<PathBuf>,
     /// What the exec-root sweep could not remove, one sentence each.
     pub exec_root_errors: Vec<String>,
-    /// `(program, build, who)` for every build this pass would have reclaimed but KEPT
-    /// because a run holds a lease on it ([`crate::lease`]) — a release cut, or a command
-    /// run under `aterm pkg lease`, that resolved it and has steps still to run — or
-    /// because its leases could not be
-    /// read. Its own category: a kept build is disk the owner may wonder about, and the
-    /// line says whose it is and that the next pass after the run takes it.
+    /// `(program, build, who)` for every build this pass would have reclaimed but KEPT because a run holds a lease on it ([`crate::lease`]).
     pub leased: Vec<(String, u64, crate::lease::Holders)>,
-    /// `(program, staged file name)` for every archive kept because a held Trust toolchain
-    /// update installs from it ([`crate::quiet::held_archives`]).
+    /// `(program, staged file name)` for every archive kept because a held Trust toolchain update installs from it ([`crate::quiet::held_archives`]).
     pub held_staging: Vec<(String, String)>,
 }
 
-/// Reclaim superseded builds per program, keeping the live build and one rollback. Runs after
-/// a successful activate and behind `gc`.
-///
-/// A program with no live witness is skipped, and lands in `diverged` when a shim claims it.
-/// Deletion stays inside the prefix and never touches a live or rollback tree. The
-/// interrupted-debris sweep runs for every program, witnessed or not, under the claim guard
-/// (module docs).
-///
-/// `channel` is the signed channel the caller verified (`None`: it holds none); its
-/// revocations pick each rollback target, so the kept build is one `aterm pkg rollback` would
-/// land on, never a yanked or floored one.
-///
-/// This standalone form spares no staging partials: with no resolved index there is no honest
-/// way to tell a live pinned `.part` from a superseded one. An install/update pass ends with
-/// [`run_keeping_pinned_partials`] instead, so a failed member's resume state survives.
+/// Reclaim superseded builds per program, keeping the live build and one rollback.
 #[must_use]
 pub fn run(layout: &Layout, channel: Option<&Channel>) -> GcReport {
     run_in(layout, None, channel, &|_| None, &running_executables)
 }
 
-/// [`run`], with the staging sweep sparing, per program, the `.part` and the complete archive
-/// named by `pinned_asset` (the program's current pinned asset, from the caller's resolved
-/// signed index; `None` spares nothing).
-///
-/// The `.part` is a failed download's resume state, which this pass-end gc would otherwise
-/// take. The complete `<asset>` is a staged member of an aborted coherence group: `flow`
-/// keeps its verified archive and the next pass re-stages from it after re-checking the signed
-/// sha256 and `tree_root` ([`crate::flow::carried_archive`]), so a multi-GB toolchain is not
-/// re-downloaded on every retry.
-///
-/// Exact name matches, so at most one archive and one partial per program are spared
-/// (`flow::sweep_foreign_partials`' bound); the standalone [`run`] reclaims them. A
-/// vendor-direct program the caller pins nothing for keeps [`pursued_asset`]'s.
-///
-/// `pinned_asset` only shrinks the sweep: it cannot make gc delete anything the plain sweep
-/// would not, follow a symlink, or touch other programs' directories.
+/// [`run`], with the staging sweep sparing, per program, the `.part` and the complete archive named by `pinned_asset` (the program's current pinned asset, from the caller's resolved signed index; `None` spares nothing).
 #[must_use]
 pub fn run_keeping_pinned_partials(
     layout: &Layout,
@@ -593,12 +427,6 @@ pub fn run_keeping_pinned_partials(
 }
 
 /// The staging name a vendor-direct program is still working towards: the asset of the last
-/// head its lane read ([`ProgramStamp`]'s `last_head`) while that head is above the active
-/// build. A pass that did not read the head (offline, or a verb visiting other programs)
-/// resolves no asset and would sweep the `.part` or carried archive. A later head, or its
-/// install, ends the spare; [`run`] reclaims it too.
-///
-/// [`ProgramStamp`]: crate::vendor_direct::ProgramStamp
 fn pursued_asset(layout: &Layout, program: &str) -> Option<String> {
     let spec = crate::vendor_direct::spec(program)?;
     let head = crate::vendor_direct::ProgramStamp::read(layout, program)?.last_head?;
@@ -608,11 +436,7 @@ fn pursued_asset(layout: &Layout, program: &str) -> Option<String> {
     })
 }
 
-/// [`run_keeping_pinned_partials`] confined to `programs`: only their builds are reclaimed and
-/// only their debris, sidecars and `staging/` files swept; every other program's state and
-/// the exec roots are left as they are. A lane that resolved only some programs (the vendor
-/// lane) ends with this form. It holds no channel: a vendor program's rollback target is its
-/// lane's.
+/// [`run_keeping_pinned_partials`] confined to `programs`.
 #[must_use]
 pub fn run_for_programs(
     layout: &Layout,
@@ -629,8 +453,6 @@ pub fn run_for_programs(
 }
 
 /// [`run_keeping_pinned_partials`] with no channel and the process enumeration injected:
-/// `running` answers the executable paths of the processes alive now, or `None` when they
-/// cannot be enumerated ([`InUse`]).
 #[cfg(test)]
 fn run_with(
     layout: &Layout,
@@ -641,8 +463,6 @@ fn run_with(
 }
 
 /// The whole pass over the programs `scope` admits (`None`: the whole prefix, exec roots
-/// included), each program's rollback target read under `channel`
-/// ([`run_keeping_pinned_partials`]) and the process enumeration injected ([`InUse`]).
 fn run_in(
     layout: &Layout,
     scope: Option<&dyn Fn(&str) -> bool>,
@@ -656,17 +476,11 @@ fn run_in(
         enumerate: running,
         running: None,
     };
-    // First, before any view is read or anything deleted: put back trees a killed swap
-    // parked, so the claim views see a `current` link that resolves. The debris scan spares
-    // what could not be put back.
     let parked = recover_interrupted_swaps(layout);
     sweep_retired_channel_links(layout);
-    // The claim views, read once: the witness needs them to agree, the sweep their union.
     let authority = authority_claims(layout);
     let shims = shim_claims(layout);
     let live = live_from_claims(&authority, &shims);
-    // Their union guards the sweep: a contested build has no witness, but the user's next
-    // command may run it, so it survives.
     let mut claimed: BTreeMap<String, BTreeSet<u64>> = authority
         .into_iter()
         .map(|(program, build)| (program, BTreeSet::from([build])))
@@ -687,9 +501,6 @@ fn run_in(
         let Some(witness) = live.get(&program) else {
             continue;
         };
-        // The kept build below the live one is where `aterm pkg rollback` lands: an index
-        // program's under the verified channel, a vendor program's under its lane
-        // (`vendor_direct::lane::roll_back_by_hand`) and the latched vendor yanks.
         let vendor_yanks = crate::vendor_direct::is_vendor(&program)
             .then(|| crate::vendor_direct::policy::Policy::current(layout, None));
         let lands_on = |b: u64| match &vendor_yanks {
@@ -700,18 +511,12 @@ fn run_in(
         };
         let mut gone = Vec::new();
         for b in reclaimable(&installed, witness, &lands_on) {
-            // A leased build is a run's toolchain between two stages: kept and reported. The
-            // guard holds the subject's gate across the delete ([`crate::lease`]).
             let Some(_gate) = lease_clear(layout, &program, b, &mut leased) else {
                 continue;
             };
             if in_use.holds(&program, &layout.build_dir(&program, b), Some(b)) {
                 continue;
             }
-            // `Retained::IsLive` cannot fire (`reclaimable` never yields the witness), but it
-            // is honoured, not unwrapped, so a retention bug loses a reclaim, not the
-            // toolchain. A reclaim is reported only once its tree is gone ([`is_gone`]):
-            // `discard_build` can fail (root-owned after `sudo`, an immutable flag, EROFS).
             if discard_superseded(layout, witness, b).is_ok()
                 && is_gone(&layout.build_dir(&program, b))
             {
@@ -732,12 +537,7 @@ fn run_in(
         if in_use.holds(&program, &path, Some(build)) {
             continue;
         }
-        // `store::discard_build`, not `discard_superseded`: a partial tree has no witness,
-        // and the claim guard already showed nothing points at it. It also takes the build's
-        // marker and sidecars, so none mis-marks a later reinstall of that number.
         crate::store::discard_build(&path);
-        // Reported only once the tree is gone: `discard_build` is best-effort and silent, so
-        // an EACCES/EROFS/EBUSY tree would otherwise read "swept" on every pass.
         if is_gone(&path) {
             swept_partial.entry(program).or_default().push(build);
         }
@@ -753,14 +553,8 @@ fn run_in(
         }
     }
 
-    // Sweep `staging/`. Safe for the scratch sweep's reason: this runs under the store-wide
-    // writer lock, so an archive here belongs to a process that no longer exists.
     let mut swept_staging: Vec<(String, Vec<String>)> = Vec::new();
     let mut held_staging: Vec<(String, String)> = Vec::new();
-    // …and every form spares the archive a held toolchain flip installs from
-    // ([`crate::quiet::held_archives`]), whichever verb runs gc: only the pass that held the
-    // flip resolves it as `pinned_asset`. `uninstall` removes the builds before its sweep,
-    // so the archive goes with them.
     let held = crate::quiet::held_archives(layout);
     if let Ok(programs) = std::fs::read_dir(layout.prefix.join("staging")) {
         for program in programs.filter_map(Result::ok) {
@@ -773,21 +567,15 @@ fn run_in(
             let Ok(entries) = std::fs::read_dir(program.path()) else {
                 continue;
             };
-            // Spared, keyed to the current pinned asset: `<asset>.part` (resume state) and
-            // `<asset>`, the verified archive an aborted coherence group carried to the next
-            // pass (`flow::carried_archive`).
             let pinned = pinned_asset(&name);
             let keep_part = pinned.as_ref().map(|asset| format!("{asset}.part"));
             let keep_archive = pinned;
             let mut gone: Vec<String> = Vec::new();
             for e in entries.filter_map(Result::ok) {
                 // Regular files only: never follow a symlink out of the prefix, and
-                // never recurse into something that is not ours to interpret.
                 if !e.file_type().is_ok_and(|t| t.is_file()) {
                     continue;
                 }
-                // A non-UTF-8 name is never a pinned asset (manifest names are UTF-8): swept,
-                // unreported.
                 let entry_name = e.file_name().into_string().ok();
                 if entry_name.is_some() && (keep_archive == entry_name || keep_part == entry_name) {
                     continue;
@@ -812,17 +600,11 @@ fn run_in(
         swept_staging.sort();
     }
 
-    // Last, over the store as this pass left it: exec roots (`crate::compat`) that outlived
-    // their build some other way (a removal that failed part-way, a build that stopped
-    // needing one) and a killed rebuild's dot debris. Each discard above already took its
-    // build's root.
     let exec_roots = if scope.is_none() {
         crate::compat::sweep(layout)
     } else {
         crate::compat::Report::default()
     };
-    // …and the lease files of runs killed before their `Drop`, and the gates of builds and
-    // views that are gone. Whole-prefix passes only, like the exec roots.
     if scope.is_none() {
         crate::lease::sweep(&layout.prefix, &|subject| {
             std::fs::symlink_metadata(subject.path(layout)).is_ok()
@@ -847,15 +629,11 @@ fn run_in(
 }
 
 /// Whether `tree` is gone from disk, all a reclaim or sweep line may claim. Only `NotFound`
-/// says so: any other stat failure (no search bit, EIO) is a tree nobody could look at.
 fn is_gone(tree: &Path) -> bool {
     matches!(std::fs::symlink_metadata(tree), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
 }
 
 /// The lease verdict on reclaiming `program`'s `build`: `Some(guard)` when no run holds it,
-/// the guard to hold until the tree is gone ([`crate::lease::reclaim`]; `Some(None)` for a
-/// name no lease can carry), or `None` with the build recorded in `leased` (held, or its
-/// leases unreadable).
 fn lease_clear(
     layout: &Layout,
     program: &str,
@@ -875,18 +653,6 @@ fn lease_clear(
 }
 
 /// Whether a live process runs from a build, asked before any build is reclaimed: a `codex`
-/// session execs helpers from its own build, and a `targo build` spawns a `trustc` per crate
-/// from the build it started on. A trust build is also judged by its exec root
-/// ([`crate::compat::root_dir`]), which [`crate::store::discard_build`] takes with it.
-///
-/// The enumeration runs at most once per pass, and only once a build is a candidate. When it
-/// cannot be taken, agent and trust builds are kept and every other build follows the plain
-/// rule, so a platform with no process table does not stop gc.
-///
-/// A process is only half of "in use". A run that resolved a build and runs its stages
-/// from it — a release cut, a command under `aterm pkg lease` — has no process there
-/// between two steps; it holds a LEASE instead ([`crate::lease`]), which the reclaim asks first
-/// ([`lease_clear`]) and holds the gate of across the delete.
 struct InUse<'a> {
     layout: &'a Layout,
     enumerate: &'a dyn Fn() -> Option<Vec<PathBuf>>,
@@ -895,7 +661,6 @@ struct InUse<'a> {
 
 impl InUse<'_> {
     /// `true` when `build_dir` of `program` (build number `build`, when it is one) must be
-    /// kept because a process may run from it.
     fn holds(&mut self, program: &str, build_dir: &Path, build: Option<u64>) -> bool {
         let enumerate = self.enumerate;
         let Some(running) = self.running.get_or_insert_with(enumerate) else {
@@ -905,7 +670,6 @@ impl InUse<'_> {
         let root = build
             .filter(|_| program == crate::seam::SEAM_PROGRAM)
             .map(|b| crate::compat::root_dir(self.layout, b));
-        // Both spellings: the kernel reports resolved paths, the layout may not be one.
         let mut dirs = vec![build_dir.to_path_buf()];
         dirs.extend(root);
         let resolved: Vec<PathBuf> = dirs
@@ -913,7 +677,8 @@ impl InUse<'_> {
             .filter_map(|d| std::fs::canonicalize(d).ok())
             .collect();
         if resolved.is_empty() && std::fs::symlink_metadata(build_dir).is_ok() {
-            return true; // there, but not resolvable: keep it
+            // there, but not resolvable: keep it
+            return true;
         }
         running.iter().any(|exe| {
             dirs.iter()
@@ -923,17 +688,13 @@ impl InUse<'_> {
     }
 }
 
-/// Whether a live process runs from under `dir` (either spelling: the kernel reports resolved
-/// paths). `None` when the process table cannot be read.
+/// Whether a live process runs from under `dir` (either spelling: the kernel reports resolved paths).
 #[must_use]
 pub fn runs_from(dir: &Path) -> Option<bool> {
     running_from(dir, &running_executables).map(|exe| exe.is_some())
 }
 
-/// [`runs_from`]'s rule over an injected enumeration, naming the first executable under
-/// `dir`: `Some(None)` when none is, `None` when the table cannot be read. [`crate::seam`]
-/// asks it before re-laying a rustup view, which is not a store build and so outside
-/// [`InUse`]'s reach.
+/// [`runs_from`]'s rule over an injected enumeration, naming the first executable under `dir`.
 pub(crate) fn running_from(
     dir: &Path,
     running: &dyn Fn() -> Option<Vec<PathBuf>>,
@@ -951,17 +712,12 @@ pub(crate) fn running_from_table(dir: &Path, running: &[PathBuf]) -> Option<Path
         .cloned()
 }
 
-/// The live process table ([`running_executables`]) under one ungated name, for another
-/// module to hand to [`running_from`]. The platform declarations below cover every
-/// target between them, but only as a split by platform, and a `crate::`-qualified reference
-/// must name a declaration that survives wherever the reference does: the foreign compile
-/// cells (`verify cells`) type-check it off this host.
+/// The live process table ([`running_executables`]) under one ungated name, for another module to hand to [`running_from`].
 pub(crate) fn process_table() -> Option<Vec<PathBuf>> {
     running_executables()
 }
 
 /// The executable path of every process alive now ([`running_processes`] without the
-/// pids). `None` when the process table cannot be read.
 fn running_executables() -> Option<Vec<PathBuf>> {
     Some(
         running_process_table()?
@@ -971,17 +727,13 @@ fn running_executables() -> Option<Vec<PathBuf>> {
     )
 }
 
-/// Every process alive now as `(pid, executable path)`, by the kernel's path for each (so a
-/// relative, symlinked or PATH launch is seen, unlike `ps`'s argv[0]). `None` when the table
-/// cannot be read, never an empty list standing in for unknown.
+/// Every process alive now as `(pid, executable path)`, by the kernel's path for each (so a relative, symlinked or PATH launch is seen, unlike `ps`'s argv[0]).
 #[must_use]
 pub fn running_processes() -> Option<Vec<(i32, PathBuf)>> {
     running_process_table()
 }
 
 /// The pid and executable path of every process alive now, from `proc_listallpids` +
-/// `proc_pidpath`. A process that exits mid-walk, or whose executable has no path left,
-/// is skipped; any other failure is `None` (unknown).
 #[cfg(target_os = "macos")]
 fn running_process_table() -> Option<Vec<(i32, PathBuf)>> {
     use std::os::unix::ffi::OsStrExt as _;
@@ -1006,11 +758,9 @@ fn running_process_table() -> Option<Vec<(i32, PathBuf)>> {
         }
         let mut pids: Vec<libc::c_int> = vec![0; capacity];
         let bytes = libc::c_int::try_from(capacity * std::mem::size_of::<libc::c_int>()).ok()?;
-        // SAFETY: `pids` holds exactly `bytes` bytes and outlives the call, which writes at
-        // most that many and answers how many pids it wrote.
+        // SAFETY: `pids` holds exactly `bytes` bytes and outlives the call, which writes at most that many and answers how many pids it wrote.
         let n = unsafe { proc_listallpids(pids.as_mut_ptr().cast(), bytes) };
         let n = usize::try_from(n).ok().filter(|&n| n > 0)?;
-        // A full table may have been cut short by processes born between the two calls.
         if n < capacity {
             pids.truncate(n);
             break pids;
@@ -1038,8 +788,6 @@ fn running_process_table() -> Option<Vec<(i32, PathBuf)>> {
 }
 
 /// The pid and executable path of every process alive now, from `/proc/<pid>/exe`
-/// (procfs's ` (deleted)` annotation removed). A process that exits mid-walk, a kernel
-/// thread and another user's process are skipped; any other failure is `None` (unknown).
 #[cfg(target_os = "linux")]
 fn running_process_table() -> Option<Vec<(i32, PathBuf)>> {
     use std::os::unix::ffi::OsStrExt as _;
@@ -1071,20 +819,9 @@ fn running_process_table() -> Option<Vec<(i32, PathBuf)>> {
 }
 
 /// The pid and executable path of every process alive now, from `K32EnumProcesses` and
-/// `QueryFullProcessImageNameW`, each path resolved (`canonicalize`, the final path) as the
-/// other arms' kernel paths are. A process that exits mid-walk, or that this user may not
-/// query (another user's, the kernel's own), is skipped, as `/proc` skips what it will not
-/// show this user; a failed enumeration is `None` (unknown).
-///
-/// Without it every agent build was kept as possibly running, so each Claude Code or Codex
-/// update left its predecessor in the store for good
-/// (`the_scoped_sweep_touches_only_its_programs`, the first Windows run of this crate's
-/// tests, 2026-10-17).
 #[cfg(windows)]
 fn running_process_table() -> Option<Vec<(i32, PathBuf)>> {
     use std::os::windows::ffi::OsStringExt as _;
-    // Declared dependency-free, as `platform::windows` declares its Win32 calls: std links
-    // `kernel32`, which exports the `K32` psapi entry points.
     unsafe extern "system" {
         fn K32EnumProcesses(pids: *mut u32, bytes: u32, needed: *mut u32) -> i32;
         fn OpenProcess(access: u32, inherit: i32, pid: u32) -> *mut core::ffi::c_void;
@@ -1109,13 +846,11 @@ fn running_process_table() -> Option<Vec<(i32, PathBuf)>> {
         let mut pids: Vec<u32> = vec![0; capacity];
         let bytes = u32::try_from(capacity * std::mem::size_of::<u32>()).ok()?;
         let mut needed = 0;
-        // SAFETY: `pids` holds exactly `bytes` bytes and outlives the call, which writes at
-        // most that many and answers in `needed` how many it wrote.
+        // SAFETY: `pids` holds exactly `bytes` bytes and outlives the call, which writes at most that many and answers in `needed` how many it wrote.
         if unsafe { K32EnumProcesses(pids.as_mut_ptr(), bytes, &mut needed) } == 0 {
             return None;
         }
         let n = usize::try_from(needed).ok()? / std::mem::size_of::<u32>();
-        // A full buffer may have cut the table short.
         if n < capacity {
             pids.truncate(n);
             break pids;
@@ -1131,8 +866,7 @@ fn running_process_table() -> Option<Vec<(i32, PathBuf)>> {
             continue;
         }
         let mut len = u32::try_from(buf.len()).ok()?;
-        // SAFETY: `buf` holds `len` UTF-16 units and outlives the call; `len` is a valid
-        // in/out-param.
+        // SAFETY: `buf` holds `len` UTF-16 units and outlives the call; `len` is a valid in/out-param.
         let named = unsafe { QueryFullProcessImageNameW(process, 0, buf.as_mut_ptr(), &mut len) };
         // SAFETY: the handle `OpenProcess` returned, closed exactly once.
         unsafe { CloseHandle(process) };
@@ -1149,7 +883,6 @@ fn running_process_table() -> Option<Vec<(i32, PathBuf)>> {
 }
 
 /// No process table is read here, so whether a session runs from an agent build is
-/// unknown and every agent build is kept: disk is spent before a running tree is lost.
 #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
 fn running_process_table() -> Option<Vec<(i32, PathBuf)>> {
     None
@@ -1181,21 +914,16 @@ mod tests {
             pairs.iter().map(|(p, b)| ((*p).to_string(), *b)).collect()
         };
 
-        // Agreement mints a witness…
         let set = live_from_claims(&link(&[("ay", 19)]), &claims(&[("ay", &[19])]));
         assert_eq!(build_of(&set), Some(19));
         assert!(set.diverged.is_empty());
-        // …and so does an authority whose shims are silent: nothing on PATH points elsewhere.
         let set = live_from_claims(&link(&[("ay", 19)]), &claims(&[]));
         assert_eq!(build_of(&set), Some(19));
         assert!(set.diverged.is_empty());
 
-        // Shims that contradict the authority block the witness.
         let set = live_from_claims(&link(&[("ay", 19)]), &claims(&[("ay", &[18])]));
         assert!(set.live.is_empty());
         assert_eq!(set.diverged.len(), 1);
-        // Two shim targets, and a shim with no authority at all: no witness. (Two
-        // authorities cannot be written down: one `current` link per program.)
         for (a, sh) in [
             (link(&[("ay", 19)]), claims(&[("ay", &[18, 19])])),
             (link(&[]), claims(&[("ay", &[19])])),
@@ -1207,7 +935,6 @@ mod tests {
     }
 
     /// The retention rule with live build 19: it and one rollback below it are kept; the rest,
-    /// including staged builds above a live one with no rollback, is reclaimable.
     #[test]
     fn reclaimable_keeps_current_plus_one_rollback() {
         let rows: [(&[u64], &[u64], &str); 4] = [
@@ -1238,8 +965,6 @@ mod tests {
         }
     }
 
-    // --- the imperative executor -------------------------------------------------------
-
     use crate::activate::{activate_build, install_shims};
 
     fn tool(name: &str) -> crate::store::ToolName {
@@ -1251,7 +976,6 @@ mod tests {
     }
 
     /// A complete (marked) build dir with `bin/<program>`; `shim` also installs its shims and
-    /// activates it, making it the live build.
     fn seed(layout: &Layout, program: &str, build: u64, shim: bool) -> PathBuf {
         let dir = layout.build_dir(program, build);
         std::fs::create_dir_all(dir.join("bin")).unwrap();
@@ -1275,7 +999,6 @@ mod tests {
     }
 
     /// A populated build dir with no completeness marker: what an install killed between its
-    /// extract and `mark_build_ready` leaves. Invisible to `list_installed`.
     fn seed_partial(layout: &Layout, program: &str, build: u64) -> PathBuf {
         let dir = layout.build_dir(program, build);
         std::fs::create_dir_all(dir.join("bin")).unwrap();
@@ -1292,7 +1015,6 @@ mod tests {
     }
 
     /// Stage scratch beside a build: the `<build>.incoming-<pid>` / `<build>.superseded-<pid>`
-    /// siblings `verify_and_stage` extracts into and retires through.
     fn seed_scratch(layout: &Layout, program: &str, name: &str) -> PathBuf {
         let dir = layout.prefix.join("store").join(program).join(name);
         std::fs::create_dir_all(dir.join("bin")).unwrap();
@@ -1306,9 +1028,8 @@ mod tests {
         for b in [16u64, 17, 18] {
             seed(&l, "ay", b, false);
         }
-        seed(&l, "ay", 19, true); // ay@19 is live
+        seed(&l, "ay", 19, true);
         let report = run(&l, None);
-        // Keep 19 (live) and 18 (the rollback target).
         assert_eq!(report.reclaimed, vec![("ay".to_string(), vec![16u64, 17])]);
         assert!(report.diverged.is_empty(), "the two views agree");
         for gone in [16u64, 17] {
@@ -1317,8 +1038,6 @@ mod tests {
         for keep in [18u64, 19] {
             assert!(l.build_dir("ay", keep).exists(), "{keep} survives");
         }
-        // …and a reclaim is said only of a tree that went: one without write bits (a
-        // root-owned tree's shape) stays, so nothing was reclaimed.
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
@@ -1343,8 +1062,6 @@ mod tests {
     #[test]
     fn run_skips_a_program_with_no_active_build() {
         let l = layout("run-noactive");
-        // No shim and no `current` link: nothing claims the program, so nothing is reclaimed
-        // and nothing is reported (never activated is not a disagreement).
         seed(&l, "ay", 17, false);
         seed(&l, "ay", 18, false);
         let report = run(&l, None);
@@ -1359,16 +1076,12 @@ mod tests {
     }
 
     /// A shim left on an older build must not let retention delete the build `current`
-    /// selects: the views disagree, so there is no witness and nothing is deleted.
     #[test]
     fn a_stale_shim_never_deletes_the_linked_live_build() {
         let l = layout("stale-shim-brick");
         seed(&l, "ay", 18, false);
         let b19 = seed(&l, "ay", 19, false);
-        // The authority says 19 …
         activate_build(&l, &b19).unwrap();
-        // … but `bin/ay` still forwards into 18 (a shim loop that failed partway). `bin/` is
-        // made by hand: nothing here called `install_shims`.
         crate::platform::ensure_private_dir(&l.bin_dir()).unwrap();
         let ay = tool("ay");
         crate::platform::install_shim(&l.build_dir("ay", 18).join("bin"), &ay, &l.shim(&ay))
@@ -1398,7 +1111,6 @@ mod tests {
     }
 
     /// One program's tools split across two builds (an `install_shims` loop that failed
-    /// before its prune).
     #[test]
     fn tools_of_one_program_split_across_builds_yield_no_witness() {
         let l = layout("split-shims");
@@ -1406,7 +1118,6 @@ mod tests {
         let b19 = seed(&l, "ay", 19, false);
         activate_build(&l, &b19).unwrap();
         install_shims(&l, &b19, &["ay".to_string()], crate::activate::Aliases::Off).unwrap();
-        // Written after install_shims, whose prune would otherwise remove it.
         let aylint = tool("aylint");
         crate::platform::install_shim(&b18.join("bin"), &aylint, &l.shim(&aylint)).unwrap();
 
@@ -1426,17 +1137,15 @@ mod tests {
     }
 
     /// An authority that cannot be resolved (dangling, out-of-store, absent) gives no witness,
-    /// and there is no fallback to the shim view.
-    #[cfg(unix)] // dangling/out-of-store link fixtures: a Windows junction needs a real target
+    #[cfg(unix)]
     #[test]
     fn a_broken_authority_skips_the_program_instead_of_reclaiming() {
         let l = layout("bad-channel");
         seed(&l, "ay", 17, false);
         seed(&l, "ay", 18, false);
-        seed(&l, "ay", 19, true); // shims + the `current` link at 19
+        seed(&l, "ay", 19, true);
         let links = [l.program_current("ay")];
 
-        // 1. The link dangles (the build dir was removed out from under it).
         for link in &links {
             crate::activate::atomic_symlink(&l.build_dir("ay", 77), link).unwrap();
         }
@@ -1453,7 +1162,6 @@ mod tests {
             }]
         );
 
-        // 2. The link resolves outside store/, a shape activation never writes.
         let outside = l.prefix.join("elsewhere").join("ay").join("19");
         std::fs::create_dir_all(&outside).unwrap();
         for link in &links {
@@ -1464,7 +1172,6 @@ mod tests {
             "an out-of-store authority proves nothing"
         );
 
-        // 3. The link does not exist at all.
         std::fs::remove_file(l.program_current("ay")).unwrap();
         assert!(
             run(&l, None).reclaimed.is_empty(),
@@ -1478,13 +1185,12 @@ mod tests {
     }
 
     /// Installed and shimmed but never activated: skipped, and reported, or the program is
-    /// silently never collected.
     #[test]
     fn a_program_that_was_never_activated_is_reported_diverged() {
         let l = layout("no-channel");
         seed(&l, "ay", 17, false);
         let b18 = seed(&l, "ay", 18, false);
-        install_shims(&l, &b18, &["ay".to_string()], crate::activate::Aliases::Off).unwrap(); // shims, but no activate
+        install_shims(&l, &b18, &["ay".to_string()], crate::activate::Aliases::Off).unwrap();
 
         let report = run(&l, None);
         assert!(
@@ -1503,16 +1209,15 @@ mod tests {
     }
 
     /// One `current` link per program, so activating `ny` leaves `ay` witnessed and its
-    /// superseded builds reclaimable (a link shared per channel remembered only the last).
     #[test]
     fn two_programs_on_one_channel_are_both_reclaimed() {
         let l = layout("two-progs");
         for b in [16u64, 17, 18] {
             seed(&l, "ay", b, false);
         }
-        seed(&l, "ay", 19, true); // ay@19 activated …
+        seed(&l, "ay", 19, true);
         seed(&l, "ny", 6, false);
-        seed(&l, "ny", 7, true); // … then ny@7
+        seed(&l, "ny", 7, true);
 
         let report = run(&l, None);
         assert_eq!(
@@ -1537,7 +1242,6 @@ mod tests {
     }
 
     /// Remove a `current` link whatever shape the platform gave it (a symlink, or a junction
-    /// on Windows), so the pre-per-program-link fixtures below are not Unix-only.
     fn unlink_current(link: &Path) {
         let _ = std::fs::remove_file(link);
         let _ = std::fs::remove_dir(link);
@@ -1549,17 +1253,16 @@ mod tests {
     }
 
     /// A retired `channels/<c>/current` is swept (the link, never what it names) and proves
-    /// nothing: a program whose only link it was abstains until its next activation.
     #[test]
     fn a_retired_channel_link_is_swept_and_is_never_a_witness() {
         let l = layout("legacy-channel");
         seed(&l, "ay", 17, false);
         seed(&l, "ay", 18, false);
         let b19 = seed(&l, "ay", 19, true);
-        unlink_current(&l.program_current("ay")); // the pre-migration on-disk shape …
+        unlink_current(&l.program_current("ay"));
         let legacy = l.prefix.join("channels").join("stable");
         std::fs::create_dir_all(&legacy).unwrap();
-        crate::activate::atomic_symlink(&b19, &legacy.join("current")).unwrap(); // … its link
+        crate::activate::atomic_symlink(&b19, &legacy.join("current")).unwrap();
 
         let report = run(&l, None);
         assert!(
@@ -1584,7 +1287,6 @@ mod tests {
                 "{b} is untouched by the sweep"
             );
         }
-        // The next activation writes the program's own link, and the witness is back.
         activate_build(&l, &b19).unwrap();
         assert_eq!(
             run(&l, None).reclaimed,
@@ -1594,7 +1296,6 @@ mod tests {
     }
 
     /// The sweep removes only what the retired layout put there: a `channels/<c>/` that
-    /// holds anything besides its `current` link keeps that entry and itself.
     #[test]
     fn the_channel_sweep_leaves_what_it_did_not_write() {
         let l = layout("legacy-channel-foreign");
@@ -1611,10 +1312,7 @@ mod tests {
     }
 
     /// The shim view uses the anchored containment test, so a dev-link into
-    /// `~/src/store/ay/18/bin/aydev` claims nothing about our ay@18 and does not contest its
-    /// witness. (`activate::prune_stale_shims` leaving such a link is asserted in
-    /// `activate.rs`.)
-    #[cfg(unix)] // out-of-prefix symlink fixture
+    #[cfg(unix)]
     #[test]
     fn a_shim_into_a_lookalike_store_outside_the_prefix_claims_nothing() {
         let l = layout("foreign-store-claim");
@@ -1646,18 +1344,14 @@ mod tests {
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
-    // --- interrupted-install debris ----------------------------------------------------
-
     /// A tree an install killed mid-extract is invisible to `list_installed`; the sweep takes
-    /// it and reports it apart from `reclaimed`, since it was never an installed build.
     #[test]
     fn an_unclaimed_partial_tree_is_swept_and_never_counted_as_a_reclaim() {
         let l = layout("sweep-partial");
         for b in [16u64, 17, 18] {
             seed(&l, "ay", b, false);
         }
-        seed(&l, "ay", 19, true); // ay@19 is live
-        // An update to 20 killed between extract and marker: unmarked, and unclaimed.
+        seed(&l, "ay", 19, true);
         let partial = seed_partial(&l, "ay", 20);
 
         let report = run(&l, None);
@@ -1676,7 +1370,6 @@ mod tests {
     }
 
     /// A first install killed mid-extract has no live build, shim or `current` link; the sweep
-    /// still takes it.
     #[test]
     fn an_interrupted_fresh_install_is_swept_although_nothing_is_live() {
         let l = layout("sweep-fresh");
@@ -1697,7 +1390,6 @@ mod tests {
     }
 
     /// A live build can lose its sibling marker and keep its tree; the claim
-    /// (`store/ay/current` resolves into 19) keeps it from the sweep.
     #[test]
     fn a_live_build_that_lost_its_marker_is_claimed_and_never_swept() {
         let l = layout("marker-less-live");
@@ -1718,14 +1410,12 @@ mod tests {
     }
 
     /// …and from the side no witness could guard: the views disagree, so there is no
-    /// `LiveBuild`, yet `bin/ay` runs the marker-less 18. Only the claim union protects it.
     #[test]
     fn a_marker_less_build_the_shims_still_run_is_never_swept() {
         let l = layout("marker-less-contested");
         let b18 = seed(&l, "ay", 18, false);
         let b19 = seed(&l, "ay", 19, false);
-        activate_build(&l, &b19).unwrap(); // the authority says 19 …
-        // … and `bin/ay` says 18, the build the user's next command runs.
+        activate_build(&l, &b19).unwrap();
         crate::platform::ensure_private_dir(&l.bin_dir()).unwrap();
         let ay = tool("ay");
         crate::platform::install_shim(&b18.join("bin"), &ay, &l.shim(&ay)).unwrap();
@@ -1743,7 +1433,6 @@ mod tests {
     }
 
     /// Stage scratch a killed install left is swept, reported by name: a
-    /// `19.superseded-<pid>` is not build 19.
     #[test]
     fn stage_scratch_of_a_killed_install_is_swept_by_name_not_by_build() {
         let l = layout("sweep-scratch");
@@ -1774,7 +1463,6 @@ mod tests {
     }
 
     /// The scratch test licenses a `remove_dir_all` in a directory the user can write, so it
-    /// matches only the exact shape the producer writes (`<build>.incoming-<pid>`).
     #[test]
     fn only_the_producers_own_scratch_shape_is_sweepable() {
         for ours in [
@@ -1796,8 +1484,6 @@ mod tests {
             "18.pending-4242",
             "18incoming-4242",
             "18.incoming-42.42",
-            // `u64::from_str` accepts a leading `+` and leading zeros; the producer writes
-            // neither ([`crate::store::parse_build_name`]).
             "+18.incoming-1",
             "018.incoming-1",
             "+0.incoming-1",
@@ -1808,15 +1494,12 @@ mod tests {
     }
 
     /// A directory that merely looks scratch-ish survives a real pass: `run` consults the
-    /// predicate pinned above.
     #[test]
     fn a_lookalike_directory_survives_a_gc_pass() {
         let l = layout("sweep-lookalike");
         seed(&l, "ay", 18, false);
         seed(&l, "ay", 19, true);
         let theirs = seed_scratch(&l, "ay", "notes.incoming-drafts");
-        // Lookalikes `u64::from_str` alone would accept: build 20's scratch and a marker-less
-        // build 21.
         let plus_scratch = seed_scratch(&l, "ay", "+20.incoming-4242");
         let plus_build = seed_scratch(&l, "ay", "+21");
         let ours = seed_scratch(&l, "ay", "20.incoming-4242");
@@ -1840,14 +1523,11 @@ mod tests {
     }
 
     /// A marker-bearing lookalike must not displace the rollback target: read by a bare
-    /// `u64::from_str`, `+19/` would be installed build 19 and take the rollback slot from 17,
-    /// which would then be reclaimed.
     #[test]
     fn a_marker_bearing_lookalike_cannot_displace_the_rollback_target() {
         let l = layout("lookalike-rollback-slot");
         let real_rollback = seed(&l, "ay", 17, false);
-        seed(&l, "ay", 25, true); // ay@25 is live
-        // `+19`: complete to every marker-reading gate, and a name the producer never writes.
+        seed(&l, "ay", 25, true);
         let lookalike = l.prefix.join("store").join("ay").join("+19");
         std::fs::create_dir_all(lookalike.join("bin")).unwrap();
         std::fs::write(
@@ -1883,7 +1563,6 @@ mod tests {
     }
 
     /// Park a build's tree at `<build>.superseded-<pid>` with nothing at `<build>`: what a
-    /// SIGKILL between the swap's two renames leaves (the swap clears the marker first).
     fn seed_killed_mid_swap(l: &Layout, program: &str, build: u64) -> (PathBuf, PathBuf) {
         let dir = l.build_dir(program, build);
         let parked = dir.with_file_name(format!("{build}.superseded-4242"));
@@ -1897,13 +1576,11 @@ mod tests {
     }
 
     /// GC run from the other slice must not delete the native install: `build_is_complete`'s
-    /// `false` means only "not complete for me", and nothing claims a rollback build.
     #[test]
     fn a_build_the_other_slice_installed_is_not_an_interrupted_install() {
         let l = layout("other-slice");
-        seed(&l, "ay", 18, false); // the rollback build: complete, and claimed by nothing
-        seed(&l, "ay", 19, true); // ay@19 is live
-        // 18's marker as the other slice wrote it: well formed, simply not our platform.
+        seed(&l, "ay", 18, false);
+        seed(&l, "ay", 19, true);
         let marker = l.prefix.join("store").join("ay").join("18.ready");
         std::fs::write(&marker, b"ok\nplatform=sparc64-solaris\n").unwrap();
         assert!(
@@ -1923,7 +1600,6 @@ mod tests {
             report.swept_partial
         );
 
-        // Non-vacuity: a tree with no marker at all, claimed by nothing, is still swept.
         let partial = seed_partial(&l, "ay", 17);
         let report = run(&l, None);
         assert!(
@@ -1935,7 +1611,6 @@ mod tests {
     }
 
     /// A crash in the swap window is recovered, not swept: between `rename(build,
-    /// superseded)` and `rename(incoming, build)` the parked tree is the user's only copy.
     #[test]
     fn a_tree_parked_by_a_killed_swap_is_moved_back_not_swept() {
         let l = layout("swap-window-recover");
@@ -1964,7 +1639,6 @@ mod tests {
             "and the claim guard must keep the recovered tree: {:?}",
             report.swept_partial
         );
-        // Unmarked: the swap cleared the marker, so the next run re-stages it.
         assert!(
             !crate::store::build_is_complete(&build19),
             "recovery must never claim a completeness it cannot prove"
@@ -1974,12 +1648,10 @@ mod tests {
     }
 
     /// A recovered tree nothing claims is an ordinary orphan, swept as a partial under the
-    /// claim guard.
     #[test]
     fn a_recovered_tree_nothing_claims_is_still_swept_as_a_partial() {
         let l = layout("swap-window-orphan");
         seed(&l, "ay", 19, true);
-        // A second program with no shims and no links at all.
         seed(&l, "ny", 7, false);
         let (build7, parked) = seed_killed_mid_swap(&l, "ny", 7);
 
@@ -1997,15 +1669,12 @@ mod tests {
     }
 
     /// Two superseded siblings with `<build>` absent: recovery cannot tell which is the
-    /// outgoing tree and moves neither, and both are the build's only copies, so the sweep
-    /// keeps them and the program lands in `diverged`. A half-extract beside them still goes.
     #[test]
     fn an_ambiguous_pair_with_the_build_absent_is_reported_and_left_standing() {
         let l = layout("swap-window-ambiguous");
         seed(&l, "ay", 19, true);
         let (build19, first) = seed_killed_mid_swap(&l, "ay", 19);
         let second = seed_scratch(&l, "ay", "19.superseded-9999");
-        // Non-vacuity: an unverified half-extract is nobody's only copy.
         let incoming = seed_scratch(&l, "ay", "19.incoming-4242");
 
         let report = run(&l, None);
@@ -2054,7 +1723,6 @@ mod tests {
             })
         );
         assert!(l.build_dir("ay", 19).exists(), "the live tree is untouched");
-        // A genuinely superseded build goes.
         assert_eq!(discard_superseded(&l, &witness, 18), Ok(()));
         assert!(!l.build_dir("ay", 18).exists());
         let _ = std::fs::remove_dir_all(&l.prefix);
@@ -2101,7 +1769,6 @@ mod tests {
             report.swept_staging,
             vec![(String::from("claude"), vec![String::from("claude-5.part")])]
         );
-        // The whole-prefix form still reclaims what the scoped one left.
         let report = run(&l, None);
         assert!(!resume.exists() && !l.build_dir("ay", 16).exists());
         assert!(!other_partial.exists());
@@ -2110,7 +1777,6 @@ mod tests {
     }
 
     /// The pass-closing sweep spares exactly the pinned artifact's `.part` and complete
-    /// `<asset>`; superseded files and other programs' files are swept.
     #[test]
     fn the_pass_closing_sweep_spares_the_live_pinned_archive_and_partial_only() {
         let l = layout("staging-keep");
@@ -2164,7 +1830,6 @@ mod tests {
             "the report lists what went, never what was spared"
         );
 
-        // The standalone verb still sweeps everything spared above.
         let _ = run(&l, None);
         assert!(
             !pinned.exists(),
@@ -2178,8 +1843,6 @@ mod tests {
     }
 
     /// A pass that did not read a vendor program's head still spares the `.part` and carried
-    /// archive of the head the lane last read and has not installed; an older head's asset is
-    /// swept, and once that head is active both go.
     #[test]
     fn an_unread_vendor_head_keeps_the_resume_state_of_the_head_it_pursues() {
         use crate::vendor_direct::{ProgramStamp, Version, spec};
@@ -2222,8 +1885,6 @@ mod tests {
     }
 
     /// The archive a held toolchain flip waits on survives an install's pass-end sweep and a
-    /// plain `gc`, both reporting it, while the record names a build still in the store;
-    /// once the record outlived those builds it is swept like any other.
     #[test]
     fn a_held_flips_staged_archive_survives_every_gc_while_the_wait_stands() {
         let l = layout("held-archive");
@@ -2247,7 +1908,6 @@ mod tests {
                 assets: BTreeMap::from([("trust".to_string(), "trust-9200.tar.zst".to_string())]),
             },
         ));
-        // An install of another program: its resolved assets name nothing of trust's.
         let report = run_keeping_pinned_partials(&l, None, &|program| {
             (program == "ay").then(|| "ay-18.tar.zst".to_string())
         });
@@ -2258,12 +1918,9 @@ mod tests {
             vec![("trust".to_string(), "trust-9200.tar.zst".to_string())],
             "and says what it kept"
         );
-        // A plain `gc` keeps it too: the flip that follows needs no network.
         let report = run(&l, None);
         assert!(held.exists(), "a plain gc keeps the held archive");
         assert_eq!(report.held_staging.len(), 1);
-        // A record that outlived every build it moves off waits for nothing: `uninstall`
-        // removes the store tree before its sweep, and the archive goes with it.
         crate::ops::uninstall(&l, "trust").unwrap();
         assert!(!l.build_dir("trust", 9192).exists());
         let report = run(&l, None);
@@ -2282,7 +1939,6 @@ mod tests {
     }
 
     /// A live process keeps its agent build; once nothing runs from it, the plain rule
-    /// reclaims it.
     #[test]
     fn an_agent_build_a_live_process_runs_from_is_not_reclaimed() {
         let l = codex_with_a_reclaimable_build("agent-live");
@@ -2301,7 +1957,6 @@ mod tests {
     }
 
     /// A process table that cannot be read keeps every agent and trust build, and only those:
-    /// other programs reclaim under the plain rule.
     #[test]
     fn an_unreadable_process_table_keeps_every_agent_and_toolchain_build() {
         let l = codex_with_a_reclaimable_build("agent-unknown");
@@ -2320,7 +1975,6 @@ mod tests {
             l.build_dir("trust", 8580).exists(),
             "the toolchain is kept too"
         );
-        // The same store with a table that reads: the toolchain's superseded build goes.
         let report = run_with(&l, &|_| None, &|| Some(Vec::new()));
         assert!(
             report
@@ -2333,9 +1987,6 @@ mod tests {
     }
 
     /// A LEASED BUILD IS KEPT, AND SAID (gap #31). A release cut pinned to a
-    /// superseded trust build holds a lease on it between its steps, when no process runs
-    /// from it: gc keeps it, the report names who holds it, and the first pass after the run
-    /// reclaims it. A lease on one build keeps nothing else.
     #[test]
     fn a_leased_build_is_kept_until_its_run_ends() {
         let l = layout("leased");
@@ -2369,7 +2020,6 @@ mod tests {
         assert_eq!(report.reclaimed, vec![("trust".to_string(), vec![8590u64])]);
         assert!(report.leased.is_empty());
         assert!(!l.build_dir("trust", 8590).exists());
-        // The pass swept the gone build's gate: nothing of 8590 is left under `leases/`.
         let left: Vec<String> = std::fs::read_dir(crate::lease::dir(&l.prefix))
             .unwrap()
             .flatten()
@@ -2411,7 +2061,6 @@ mod tests {
     }
 
     /// Every program is asked about, and the process table is read at most once per pass and
-    /// only when a build is a candidate.
     #[test]
     fn a_live_process_keeps_any_programs_build_and_the_table_is_read_once() {
         let l = layout("any-once");
@@ -2447,7 +2096,6 @@ mod tests {
     }
 
     /// A trust build run from its exec root is in use too: a shim routed through
-    /// `compat/trust/<build>` runs a clone, and discarding the build takes that root.
     #[test]
     fn a_trust_build_running_from_its_exec_root_is_not_reclaimed() {
         let l = layout("trust-root");
@@ -2455,7 +2103,6 @@ mod tests {
             seed(&l, "trust", b, false);
         }
         seed(&l, "trust", 9192, true);
-        // 8595 is the rollback target and kept anyway; 8580 and 8590 are candidates.
         let root = crate::compat::root_dir(&l, 8590);
         std::fs::create_dir_all(root.join("bin")).unwrap();
         let exe = root.join("bin/trustc");
@@ -2483,36 +2130,21 @@ mod tests {
     }
 
     /// `runs_from` sees a process by the kernel's path: a launch through a symlink is caught,
-    /// and a sibling directory whose name merely starts the same is not.
     #[cfg(target_os = "macos")]
     #[test]
     fn runs_from_sees_a_symlinked_launch_and_not_a_prefix_sibling() {
-        // Removed below, once the copy has run; never by an unwind before that.
         let scratch = std::mem::ManuallyDrop::new(layout("runs-from"));
         let root = scratch.prefix.clone();
         let app = root.join("A.app");
         let macos = app.join("Contents/MacOS");
         std::fs::create_dir_all(&macos).expect("layout");
         let exe = macos.join("A");
-        // A copy of a platform binary off the system volume keeps Apple's signature
-        // but not its standing: the kernel SIGKILLs it (Code Signature Invalid)
-        // within about a second, and `runs_from` does not count the dead child. The
-        // test passed only when its first poll beat that kill, and every run wrote a
-        // crash report (measured 2026-09-27: alive at +260 ms, killed by +1.3 s).
-        // Signed ad hoc, the copy runs for as long as it is let. A copy of `cat`:
-        // the bundle is removed only once it has echoed a line, which a run of it
-        // proves is past macOS's assessment of its first exec (`runs_from`'s
-        // kernel path shows from the exec on, while the child may still wait on
-        // it; `aterm_uds::deadline::ad_hoc_copy` says why that matters).
         aterm_uds::deadline::ad_hoc_copy(Path::new("/bin/cat"), &exe);
         let link = root.join("via-link");
         std::os::unix::fs::symlink(&exe, &link).expect("symlink");
         std::fs::create_dir_all(root.join("A.app.rollback")).expect("sibling");
 
         assert_eq!(runs_from(&app), Some(false), "nothing runs from it yet");
-        // It runs until its stdin closes or it is killed once seen. `spawnfd`'s:
-        // it holds its stdio and nothing else of this process, not another test
-        // thread's pipe while it lives.
         let mut child = aterm_uds::spawnfd::command(&link)
             .stdin(aterm_uds::spawnfd::Stdio::piped())
             .stdout(aterm_uds::spawnfd::Stdio::piped())
@@ -2539,7 +2171,6 @@ mod tests {
     }
 
     /// The real enumeration sees this very test process — the proof it reads the table
-    /// it claims to, in the resolved spelling [`InUse`] compares against.
     #[cfg(any(target_os = "macos", target_os = "linux", windows))]
     #[test]
     fn the_process_table_includes_this_process() {
@@ -2554,7 +2185,6 @@ mod tests {
     }
 
     /// A stage sidecar whose build is gone is swept; one beside a build that exists is not;
-    /// and a discard takes the build's `.vendor` with it.
     #[test]
     fn orphan_sidecars_are_swept_and_a_discard_takes_the_vendor_record() {
         let l = layout("orphan-sidecars");
@@ -2597,8 +2227,6 @@ mod tests {
     }
 
     /// Builds that look absent but are not keep their sidecars: a partial a session runs
-    /// from, and a swap-parked build recovery could not put back. Once the partial is swept,
-    /// its sidecars go too.
     #[test]
     fn sidecars_of_a_partial_or_a_swap_parked_build_are_kept() {
         let l = layout("orphan-sidecars-kept");

@@ -1,95 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The macOS access card: one question that stands in for macOS's many per-folder dialogs
-//! (`docs/DESIGN-macos-tcc-prompts-2026-08-30.md` §3.4).
-//!
-//! # What this is, and what it replaces
-//!
-//! It is not a consent dialog (aterm renders and answers nothing macOS would), not an
-//! auto-open of System Settings (the pane opens on a press, never on detection), and not the
-//! warm-up (nothing here touches a protected folder). Nor is it a coverage claim: which
-//! services a held grant silences is unmeasured (design §7 S4), and a denied probe does not
-//! prove the switch is off, so the words name unconfirmed access and ask the owner to leave
-//! an enabled switch on.
-//!
-//! # When it asks
-//!
-//! # What it is not
-//!
-//! Not a consent dialog: aterm renders nothing macOS would render, answers
-//! nothing, and the grant is still made by the human, in Settings (§0.2, §6).
-//! Not an auto-open of System Settings: the card's pane opens on a press and
-//! never on detection (§6). What brings the Full Disk Access page up unasked is
-//! the window's own launch hand-over (owner ask 2026-10-16, a recorded exception
-//! beside the Developer Tools page): when [`decide_launch`] answers
-//! [`NotDue::NoNeedYet`] with the probe reading `denied`,
-//! `App::hand_fda_to_owner` opens the page at a quiet moment with aterm's panel
-//! beside it (aterm-gui's `consent_launch` and `devtools_helper::admit_fda`).
-//! Not the warm-up: pressing nothing here touches a protected folder, so no
-//! dialog is raised by the card itself (§3.5 is the Security panel's gesture and
-//! the launch pass in aterm-gui's `consent_launch`, never the card's). And not a
-//! coverage claim: the copy names the access check
-//! and the Full Disk Access setting without promising fewer interruptions.
-//! Which services a held grant silences is §7 S4's measurement and S4 is unrun.
-//! A denied access probe is not proof that the System Settings switch is off:
-//! the owner may already have enabled it. The card names unconfirmed access,
-//! and its Settings follow-up asks the owner to leave an enabled switch on.
-//!
-//! # When it shows — once per real need, never at launch (the card)
-//!
-//! # The two files beside `aterm.toml` ([`crate::config_marker`])
-//!
-//! * [`MARKER`]: `not-now` (the owner's answer, permanent) or `opened` (*Open Settings* was
-//!   pressed and the outcome is not yet known). The next process, finding `opened` beside a
-//!   probe that reads `granted`, shows the ✓ record once and clears it.
-//! * [`RECORD`]: four unix-second facts (`asked_at`, `opened_at`, `verified_at`,
-//!   `verified_build`), each written as the max of old and new so two processes cannot move a
-//!   field backwards. It makes "once" survive an update: the successor has a fresh
-//!   [`CardState`] and finds the same record.
-//!
-//! [`decide_launch`] runs once per process at the first park and NEVER posts
-//! anything: it only acknowledges a grant (the ✓ record) and logs. The card
-//! still never asks at launch; a `NoNeedYet` verdict beside a `denied` probe is
-//! what the window's own Full Disk Access hand-over follows
-//! (`App::note_launch_fda`).
-//!
-//! # The three files, and what each records
-//!
-//! # The words
-//!
-//! # Lifetime, in one process
-//!
-//! [`CardState`] is the per-process machine the event loop drives from its
-//! park point. `Idle` runs the launch check once (a worker warms the signing
-//! identity and reads the marker and the record OFF the event loop). A need
-//! event ([`CardState::on_need`]) re-arms a `Settled` card into `Deciding`;
-//! the main thread decides against a completed CACHED probe (a pending probe
-//! is waited on with the watch's own patience, [`WATCH_FOR`]); a due card posts
-//! ONE question through the host seam (`App::raise_fda_need`) and WATCHES the
-//! probe for the grant, for at most [`WATCH_FOR`], and the question itself
-//! through `center.live(id)`. The prompt-free access probe runs on a detached
-//! worker; the event loop never joins it or calls its `open`. This observes
-//! whether access became effective; it does not read the System Settings
-//! switch. `Settled` means "not currently active", not "done for this
-//! process": a later need may re-arm it, and [`decide_need`] alone decides
-//! whether that asks anything.
-//!
-//! # The words: one source
-//!
-//! Every string the owner reads about this question is a const here, and the
-//! exceptions digest imports them rather than retyping them
-//! ([`FDA_WHAT`], [`FDA_WHY`], [`FDA_THEN`], [`FDA_GRANTS`], [`FDA_AFTER`],
-//! [`FDA_DETAIL`], [`FDA_TITLE`]). None claims anything S1 (when a running
-//! process sees a new grant) or S4 (which services a held grant silences)
-//! decides.
-//!
-//! # No protected-folder literal lives here
-//!
-//! Nothing in this module names a folder or touches one (the aterm-census guard
-//! `protected-folder`).
-//! The card's whole contact with the filesystem is the marker and the record
-//! beside `aterm.toml`, through [`crate::config_marker`].
+//! The macOS access card: one question that stands in for macOS's many per-folder dialogs (`docs/DESIGN-macos-tcc-prompts-2026-08-30.md` §3.4).
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -99,133 +11,72 @@ use aterm_containment::consent::{DrClass, FdaState, Folder};
 /// The marker beside `aterm.toml` ([`crate::config_marker`]).
 pub const MARKER: &str = "privacy-access-card-answered";
 
-/// A marker holds one token; anything bigger reads as "never answered", so the
-/// card shows (erring toward disclosure).
+/// A marker holds one token; anything bigger reads as "never answered", so the card shows (erring toward disclosure).
 pub const MAX_MARKER_BYTES: usize = 64;
 
-/// The record beside `aterm.toml`: four `key=value` lines. A second file, so
-/// an older build reading the marker pair behaves exactly as it did.
+/// The record beside `aterm.toml`: four `key=value` lines.
 pub const RECORD: &str = "privacy-fda-record";
 
-/// A record is four short lines; anything bigger is something else wearing
-/// the name and reads as an empty record.
+/// A record is four short lines; anything bigger is something else wearing the name and reads as an empty record.
 pub const MAX_RECORD_BYTES: usize = 160;
 
-/// How long, after the question is raised, the instance keeps re-checking the probe for the
-/// grant, and how long a due card waits on a pending probe before it is retired unraised.
-/// Bounded so a process that outlives an unanswered card does not check at every park
-/// forever; observations run off the event loop at the `[privacy] probe_interval_ms` cadence.
+/// How long, after the question is raised, the instance keeps re-checking the probe for the grant, and how long a due card waits on a pending probe before it is retired unraised.
 pub const WATCH_FOR: Duration = Duration::from_secs(30 * 60);
 
 /// How long the launch one-shot waits for its worker's verdict before asking
-/// again. A verdict can be lost: an uncommitted incoming handoff drops every
-/// wake but Commit.
 const DECIDE_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// How many verdicts the one-shot will wait for before giving up for the life
-/// of the process.
+/// How many verdicts the one-shot will wait for before giving up for the life of the process.
 pub const DECIDE_ATTEMPTS: u8 = 3;
 
-/// How long after an ask the next may be made in the same epoch. The dialogs the question
-/// explains recur, so a weekly pointer is not nagging.
+/// How long after an ask the next may be made in the same epoch.
 pub const RENEW_AFTER: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
-/// How long an owner who pressed *Open Settings* is presumed to have acted
-/// ([`NotDue::OwnerActed`]): a window that started before the press cannot be expected to
-/// see the switch, so asking again could not be acted on.
+/// How long an owner who pressed *Open Settings* is presumed to have acted ([`NotDue::OwnerActed`]): a window that started before the press cannot be expected to see the switch, so asking again could not be acted on.
 pub const OWNER_ACTED_HOLD: Duration = Duration::from_secs(14 * 24 * 60 * 60);
 
-/// How long a fresh process gives the window's own probe before a denied read beside a
-/// verified grant is believed. An update leaves the new build's first seconds inside the
-/// `.rollback` window, where a held grant can read off; the need is kept and decided again
-/// after this, and only a second denied read marks the grant regressed.
+/// How long a fresh process gives the window's own probe before a denied read beside a verified grant is believed.
 pub const LAUNCH_SETTLE: Duration = Duration::from_secs(90);
 
-/// Needs closer together than this are one need (a `find /` raises a burst of
-/// dialogs' worth of log lines in a second).
+/// Needs closer together than this are one need (a `find /` raises a burst of dialogs' worth of log lines in a second).
 pub const NEED_DEBOUNCE: Duration = Duration::from_secs(60);
 
 /// At most one `aterm.log` line per this interval says that macOS asked.
 pub const NEED_LOG_EVERY: Duration = Duration::from_secs(6 * 60 * 60);
 
 /// The pre-digest ROW's title (R15): the ASK — a question, so it claims nothing.
-/// The digest entry leads with [`FDA_WHAT`] instead; this const is the retired
-/// row's (`message_reporters::file_access_question`, test-only since the seam
-/// hands the need to the digest), and the words of the doc below are why it
-/// stayed short.
-///
-/// [`FDA_DETAIL`], behind Details, acknowledges that Full Disk Access may
-/// already be enabled (the probe does not read the Settings toggle). The copy
-/// names no folder, no coverage and no scope, and never promises the
-/// interruptions go away: it mitigates, never eliminates.
-///
-/// The title names the one action, a switch in Settings. The verb is
-/// deliberately not the button of the dialog the owner has just met ("Allow"),
-/// because the action asked for is a different one. The first detail line
-/// ([`FDA_WHY`]) says why, and [`FDA_GRANTS`] says what the switch grants (it
-/// grants a lot: every program run under aterm, agents included). It does NOT
-/// name a folder, does NOT say which services the grant covers, does NOT say
-/// when a running process sees it and does NOT promise the interruptions go
-/// away: coverage is §7 S4's claim to make, timing is S1's, and the owner's
-/// ruling is that mitigating this annoyance is acceptable, so the row must
-/// never read as elimination.
-///
-/// # Why it is short
-///
-/// The band's width law keeps a decision row's capsules whole and shortens
-/// the words, so on an ordinary window the question must fit beside "Open
-/// Settings" and "Not now" or the owner sees two buttons and no ask. Title and
-/// first detail together are held under ~75 characters.
 #[cfg_attr(not(test), allow(dead_code))]
 pub const FDA_TITLE: &str = "Turn on Full Disk Access?";
 
 /// The entry's `what` in the exceptions digest (glass-title form, cap 48).
 pub const FDA_WHAT: &str = "macOS keeps asking for access";
 
-/// The entry's `what` when no prompt was seen: macOS refused aterm's own read
-/// under a protected root ([`NeedCause::ProtectedRead`]). Same cap as
-/// [`FDA_WHAT`].
+/// The entry's `what` when no prompt was seen: macOS refused aterm's own read under a protected root ([`NeedCause::ProtectedRead`]).
 pub const FDA_WHAT_DENIED: &str = "macOS refused aterm a protected read";
 
-/// The entry's `what` when a grant aterm had verified reads off again
-/// (`NeedWords::regressed`). Same cap as [`FDA_WHAT`].
+/// The entry's `what` when a grant aterm had verified reads off again (`NeedWords::regressed`).
 pub const FDA_WHAT_REGRESSED: &str = "Full Disk Access reads off again";
 
-/// Why the owner is needed: an Allow is forgotten when aterm updates. For a live tab the
-/// Allow ends when the window is replaced; for a tab that survived an update it ends
-/// earlier, with that program, so "when aterm updates" is an upper bound. The entry's `Why`
-/// (cap 90).
+/// Why the owner is needed: an Allow is forgotten when aterm updates.
 pub const FDA_WHY: &str = "macOS forgets an Allow when aterm updates";
 
-/// The one action, as an imperative: the entry's `Then::press` sentence (cap 90: no `; `, no
-/// ` or `, no newline, no restart phrase).
+/// The one action, as an imperative: the entry's `Then::press` sentence (cap 90: no `; `, no ` or `, no newline, no restart phrase).
 pub const FDA_THEN: &str = "turn on aterm in Full Disk Access";
 
-/// What the switch grants, said where the ask is: a consequence Apple's own pane states
-/// ("data like Mail, Messages, Safari"), not a promise of a benefit, so it says nothing about
-/// which prompts the switch silences or when a running process sees it. A `more` line of the
-/// digest entry.
+/// What the switch grants, said where the ask is: a consequence Apple's own pane states ("data like Mail, Messages, Safari"), not a promise of a benefit, so it says nothing about which prompts the switch silences or when a running process sees it.
 pub const FDA_GRANTS: &str = "Full Disk Access lets programs you run in aterm, agents included, read protected data such as Mail and Messages";
 
-/// What aterm does next, true whatever S1 answers. A `more` line of the digest entry.
+/// What aterm does next, true whatever S1 answers.
 pub const FDA_AFTER: &str = "aterm checks now and after each update, and says so in \
                                     aterm's Messages once Full Disk Access is on";
 
-/// The hedge, always shown: a failed probe does not read the switch, and a window may not
-/// yet see a switch that is on. A `more` line of the digest entry.
+/// The hedge, always shown: a failed probe does not read the switch, and a window may not yet see a switch that is on.
 pub const FDA_DETAIL: &str = "Full Disk Access may already be enabled";
 
-/// The ✓ record's title once the probe observes the grant
-/// (`message_reporters::file_access_granted`). It names the fact and stops; the success
-/// glyph is the record's own, so the words carry no marker.
+/// The ✓ record's title once the probe observes the grant (`message_reporters::file_access_granted`).
 pub const GRANTED_CAPTION: &str = "Full Disk Access granted";
 
-/// The words after *Open Settings*: one sentence in the `"<title> — <detail>"` shape that
-/// `messages_host::route_words` splits at the dash and at `; `. `openURL:` reports only that
-/// System Settings took the URL, never that it scrolled to the row, so the route in words
-/// (`route`, from `menu::privacy_settings_path_words`) goes first on every outcome; then how
-/// to find aterm there (`+` adds an unlisted app), what to do if it is already on, and that
-/// aterm keeps checking.
+/// The words after *Open Settings*: one sentence in the `"<title> — <detail>"` shape that `messages_host::route_words` splits at the dash and at `; `.
 pub fn opened_settings_caption(opened: bool, route: &str) -> String {
     if opened {
         format!(
@@ -240,19 +91,15 @@ pub fn opened_settings_caption(opened: bool, route: &str) -> String {
     }
 }
 
-/// What made the card think the owner is needed. Data only.
+/// What made the card think the owner is needed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NeedCause {
-    /// The sentinel saw `AUTHREQ_PROMPTING` for our own subject. `service` is
-    /// `Some(folder)` when it is one of the four the roster knows and `None`
-    /// for any other service; `session` is the tab the prompting program
-    /// belongs to, when it resolved (best effort, never a gate).
+    /// The sentinel saw `AUTHREQ_PROMPTING` for our own subject.
     PromptObserved {
         service: Option<Folder>,
         session: Option<u64>,
     },
-    /// aterm's own read under a protected root took `EPERM`. `session` is
-    /// `None` for aterm's own instance-level work (the warm-up).
+    /// aterm's own read under a protected root took `EPERM`.
     ProtectedRead { session: Option<u64> },
 }
 
@@ -271,16 +118,14 @@ impl NeedCause {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NeedWords {
     pub cause: NeedCause,
-    /// The 1-based tab number the prompting program belongs to, when it
-    /// resolved. Never a path, never a program name.
+    /// The 1-based tab number the prompting program belongs to, when it resolved.
     pub tab_number: Option<usize>,
     /// A verified grant later read as off: the epoch is a new one.
     pub regressed: bool,
 }
 
 impl NeedWords {
-    /// What macOS did, in one sentence, from the cause. The digest entry's three `more` lines
-    /// are the consts', so this goes to `aterm.log` (`App::raise_fda_need`).
+    /// What macOS did, in one sentence, from the cause.
     pub fn event_line(&self) -> String {
         if self.regressed {
             return "Full Disk Access was on for aterm and macOS now reports it off".to_owned();
@@ -305,8 +150,7 @@ impl NeedWords {
 
 #[cfg(any(test, debug_assertions))]
 impl PendingDecision {
-    /// A launch-check half as the worker would deliver it: `marker` on disk,
-    /// no record.
+    /// A launch-check half as the worker would deliver it: `marker` on disk, no record.
     pub fn launch(marker: Option<Marker>) -> Self {
         Self {
             marker,
@@ -319,8 +163,7 @@ impl PendingDecision {
 
 #[cfg(any(test, debug_assertions))]
 impl NeedWords {
-    /// A sample need for tests of the reporter and the host: an app-data
-    /// prompt from tab 1, first epoch.
+    /// A sample need for tests of the reporter and the host: an app-data prompt from tab 1, first epoch.
     pub fn sample() -> Self {
         Self {
             cause: NeedCause::PromptObserved {
@@ -336,11 +179,9 @@ impl NeedWords {
 /// What the marker records.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Marker {
-    /// *Not now* was pressed: the card is not offered again for the life of
-    /// the config directory.
+    /// *Not now* was pressed: the card is not offered again for the life of the config directory.
     NotNow,
-    /// *Open Settings* was pressed and the outcome is not yet known (see the
-    /// module doc). Consumed by the decision that resolves it.
+    /// *Open Settings* was pressed and the outcome is not yet known (see the module doc).
     Opened,
 }
 
@@ -372,7 +213,7 @@ pub fn marker_path(config_path: Option<&Path>) -> Option<PathBuf> {
         .map(|dir| dir.join(MARKER))
 }
 
-/// The recorded marker, if any. A disk read — worker thread only.
+/// The recorded marker, if any.
 pub fn read_marker(config_path: Option<&Path>) -> Option<Marker> {
     marker_path(config_path)
         .and_then(|path| crate::config_marker::read_marker(&path, MAX_MARKER_BYTES))
@@ -380,13 +221,9 @@ pub fn read_marker(config_path: Option<&Path>) -> Option<Marker> {
 }
 
 /// Every marker and record write in this process holds this: the owner's
-/// answer and an `opened` can be recorded from two workers at once, and
-/// `record_marker`'s keep-`not-now` check (and the record's read-merge-write)
-/// must see the other's write, not race it.
 static MARKER_WRITES: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// Record `marker`. Best-effort, worker thread only: an unwritable config directory means
-/// the card comes back at the next need, which errs toward disclosure.
+/// Record `marker`.
 pub fn record_marker(config_path: Option<&Path>, marker: Marker) -> std::io::Result<()> {
     let _serial = MARKER_WRITES.lock().unwrap_or_else(|p| p.into_inner());
     let Some(path) = marker_path(config_path) else {
@@ -395,9 +232,6 @@ pub fn record_marker(config_path: Option<&Path>, marker: Marker) -> std::io::Res
             "no config directory to record the answer in",
         ));
     };
-    // An `opened` never replaces a `not-now`: the Security page's *Open Privacy
-    // & Security…* (which `key` can press) is not an answer to the card, and
-    // replacing the marker would bring back a declined question.
     if marker == Marker::Opened
         && crate::config_marker::read_marker(&path, MAX_MARKER_BYTES)
             .and_then(|text| Marker::parse(&text))
@@ -405,8 +239,6 @@ pub fn record_marker(config_path: Option<&Path>, marker: Marker) -> std::io::Res
     {
         return Ok(());
     }
-    // Ordered: a lost or torn marker reads as none and brings the card back, which
-    // errs toward disclosure.
     crate::config_marker::write_marker(
         &path,
         marker.as_str(),
@@ -415,8 +247,7 @@ pub fn record_marker(config_path: Option<&Path>, marker: Marker) -> std::io::Res
     )
 }
 
-/// Clear an `opened` marker once its grant has been acknowledged. A `not-now`
-/// answer is never touched. Worker thread only.
+/// Clear an `opened` marker once its grant has been acknowledged.
 pub fn clear_opened(config_path: Option<&Path>) -> std::io::Result<()> {
     let _serial = MARKER_WRITES.lock().unwrap_or_else(|p| p.into_inner());
     let Some(path) = marker_path(config_path) else {
@@ -445,8 +276,7 @@ pub struct AccessRecord {
 }
 
 impl AccessRecord {
-    /// The field-wise MAX of two records: no field ever moves backwards, so
-    /// two processes writing at once cannot undo each other.
+    /// The field-wise MAX of two records: no field ever moves backwards, so two processes writing at once cannot undo each other.
     #[inline]
     pub const fn merged(self, other: Self) -> Self {
         const fn max(a: Option<u64>, b: Option<u64>) -> Option<u64> {
@@ -480,9 +310,7 @@ impl AccessRecord {
         out
     }
 
-    /// Parse a record's text, strictly: a line that is not `key=<unsigned>` for one of the four
-    /// keys makes the whole file "not a record this code wrote", read as empty (the card errs
-    /// toward speaking once, never toward a guess).
+    /// Parse a record's text, strictly: a line that is not `key=<unsigned>` for one of the four keys makes the whole file "not a record this code wrote", read as empty (the card errs toward speaking once, never toward a guess).
     pub fn parse(text: &str) -> Self {
         let mut record = Self::default();
         for line in text.lines() {
@@ -516,8 +344,7 @@ pub fn record_path(config_path: Option<&Path>) -> Option<PathBuf> {
         .map(|dir| dir.join(RECORD))
 }
 
-/// The recorded facts; empty when there is no record. A disk read — worker
-/// thread only.
+/// The recorded facts; empty when there is no record.
 pub fn read_record(config_path: Option<&Path>) -> AccessRecord {
     record_path(config_path)
         .and_then(|path| crate::config_marker::read_marker(&path, MAX_RECORD_BYTES))
@@ -525,8 +352,7 @@ pub fn read_record(config_path: Option<&Path>) -> AccessRecord {
         .unwrap_or_default()
 }
 
-/// Merge `update` into the record on disk (field-wise max, under the shared
-/// write lock) and return what is there now. Best-effort, worker thread only.
+/// Merge `update` into the record on disk (field-wise max, under the shared write lock) and return what is there now.
 pub fn write_record(
     config_path: Option<&Path>,
     update: AccessRecord,
@@ -543,8 +369,6 @@ pub fn write_record(
         .unwrap_or_default();
     let merged = current.merged(update);
     if merged != current || !path.exists() {
-        // Ordered: a field-wise max merge; an older or absent record parses to the
-        // default and the next event merges it again.
         crate::config_marker::write_marker(
             &path,
             &merged.render(),
@@ -555,14 +379,7 @@ pub fn write_record(
     Ok(merged)
 }
 
-/// Where a grant was verified: `<hardware UUID> <bundle id>` per line
-/// (`aterm_containment::consent::host_uuid`), beside the record. The record lives in the
-/// config directory, which a dotfile sync or Migration Assistant carries to another Mac,
-/// and which every aterm on a Mac shares (the release, `aterm (dev)`, an ad hoc build:
-/// each its own TCC identity); this says whether the `verified_at` there was seen HERE,
-/// for THIS bundle. A set, not the last line: two Macs or two bundles sharing the
-/// directory must not erase each other. Its own file, because [`AccessRecord::parse`]
-/// reads a record with an unknown key as empty.
+/// Where a grant was verified: `<hardware UUID> <bundle id>` per line (`aterm_containment::consent::host_uuid`), beside the record.
 pub const VERIFIED_HOST: &str = "privacy-fda-verified-host";
 
 /// The most Macs the stamp names; the oldest leaves first.
@@ -582,9 +399,7 @@ fn verified_key(here: &str, bundle_id: &str) -> String {
     format!("{here} {bundle_id}")
 }
 
-/// Whether the record's grant was verified on the Mac whose hardware UUID is `here`, for
-/// `bundle_id`: `None` when any is unknown (no stamp — a record from an older build — no
-/// UUID, no bundle id), which keeps the record's word. A disk read — worker thread only.
+/// Whether the record's grant was verified on the Mac whose hardware UUID is `here`, for `bundle_id`: `None` when any is unknown (no stamp — a record from an older build — no UUID, no bundle id), which keeps the record's word.
 pub fn verified_here(
     config_path: Option<&Path>,
     here: Option<&str>,
@@ -597,7 +412,6 @@ pub fn verified_here(
 }
 
 /// The stamp's next text: `current`'s lines with `key` added (none twice), the newest
-/// [`MAX_VERIFIED_HOSTS`] kept. `None` when `key` is already there. Pure.
 fn with_verified_host(current: &str, key: &str) -> Option<String> {
     let mut hosts: Vec<&str> = current
         .lines()
@@ -617,8 +431,7 @@ fn with_verified_host(current: &str, key: &str) -> Option<String> {
     )
 }
 
-/// Note that the grant was verified on the Mac whose hardware UUID is `here`, for
-/// `bundle_id`. Best-effort, worker thread only.
+/// Note that the grant was verified on the Mac whose hardware UUID is `here`, for `bundle_id`.
 pub fn write_verified_host(
     config_path: Option<&Path>,
     here: &str,
@@ -631,8 +444,6 @@ pub fn write_verified_host(
     let current =
         crate::config_marker::read_marker(&path, MAX_VERIFIED_HOST_BYTES).unwrap_or_default();
     match with_verified_host(&current, &verified_key(here, bundle_id)) {
-        // Ordered: a lost line means the grant is not seen here, so it is verified
-        // again; the set only grows.
         Some(text) => crate::config_marker::write_marker(
             &path,
             &text,
@@ -644,7 +455,6 @@ pub fn write_verified_host(
 }
 
 /// This process's start, in unix seconds. Set by [`note_process_start`] at the
-/// top of the GUI's entry; a successor is a new process and so a new value.
 static PROCESS_STARTED_AT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
 
 /// The current unix time in seconds (`0` if the clock is before the epoch).
@@ -654,14 +464,12 @@ pub fn now_unix_secs() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
-/// Stamp this process's start. Idempotent: the first call wins.
+/// Stamp this process's start.
 pub fn note_process_start() {
     let _ = PROCESS_STARTED_AT.set(now_unix_secs());
 }
 
-/// When this process started, in unix seconds. A process that never stamped
-/// ([`note_process_start`]) reports its first read, which errs toward the window being
-/// newer than any press, i.e. toward speaking.
+/// When this process started, in unix seconds.
 pub fn process_started_at() -> u64 {
     *PROCESS_STARTED_AT.get_or_init(now_unix_secs)
 }
@@ -673,8 +481,7 @@ pub enum DecideWhy {
     Need(NeedCause),
 }
 
-/// The worker's half of a decision, held by the host while a pending probe is
-/// waited on.
+/// The worker's half of a decision, held by the host while a pending probe is waited on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PendingDecision {
     pub marker: Option<Marker>,
@@ -684,20 +491,14 @@ pub struct PendingDecision {
     pub verified_here: Option<bool>,
 }
 
-/// The host-side state of the card that is not the lifecycle machine: the
-/// in-flight decision, the last need, the words, and a cache of what the
-/// worker read from disk merged with what this process wrote since. One
-/// struct so `App` carries one field.
+/// The host-side state of the card that is not the lifecycle machine: the in-flight decision, the last need, the words, and a cache of what the worker read from disk merged with what this process wrote since.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct CardHost {
     /// A verdict that arrived while the probe was still pending.
     pub pending: Option<PendingDecision>,
-    /// The cause the in-flight need worker was started for (kept across a lapse so the retry
-    /// decides the same need, not a launch check).
+    /// The cause the in-flight need worker was started for (kept across a lapse so the retry decides the same need, not a launch check).
     pub need: Option<NeedCause>,
-    /// The latest need that arrived while the card could not decide it (busy,
-    /// launch check still to run, an incoming handoff uncommitted, no event
-    /// loop). Decided when the card is idle again.
+    /// The latest need that arrived while the card could not decide it (busy, launch check still to run, an incoming handoff uncommitted, no event loop).
     pub kept_need: Option<NeedCause>,
     /// The words of the question that is due.
     pub words: Option<NeedWords>,
@@ -711,15 +512,11 @@ pub struct CardHost {
     pub need_last: Option<Instant>,
     /// The last time a need was written to `aterm.log` ([`NEED_LOG_EVERY`]).
     pub need_logged: Option<Instant>,
-    /// A kept need must not be decided again before this
-    /// ([`NotDue::Settling`]).
+    /// A kept need must not be decided again before this ([`NotDue::Settling`]).
     pub settle_retry_at: Option<Instant>,
 }
 
-/// The `state=` token of the `access_card` line of `aterm ctl privacy`: where
-/// the question stands, from the marker, the record and the window's own probe.
-/// `quiet` (never asked, or the week has run out), `asked`, `opened` (the owner
-/// pressed *Open Settings* and no verification followed), `granted`, `declined`.
+/// The `state=` token of the `access_card` line of `aterm ctl privacy`: where the question stands, from the marker, the record and the window's own probe.
 pub fn report_state(
     marker: Option<Marker>,
     record: &AccessRecord,
@@ -732,9 +529,6 @@ pub fn report_state(
     if fda == FdaState::Granted {
         return "granted";
     }
-    // `opened` lapses with the rule it reports (`OwnerActed`): past the hold the
-    // card would ask again, so the token must not tell a reader nothing more
-    // will be asked.
     if record.opened_at.is_some_and(|at| {
         now_secs < at.saturating_add(OWNER_ACTED_HOLD.as_secs())
             && record.verified_at.is_none_or(|verified| verified <= at)
@@ -750,8 +544,7 @@ pub fn report_state(
     "quiet"
 }
 
-/// Everything the launch decision reads. All of it observed; none of it
-/// inferred.
+/// Everything the launch decision reads.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CardFacts {
     /// `[privacy] enabled && check && notice`.
@@ -764,8 +557,7 @@ pub struct CardFacts {
     pub dr: DrClass,
 }
 
-/// Everything the need decision reads: the launch facts plus the clock, this
-/// process's age and why the card was asked.
+/// Everything the need decision reads: the launch facts plus the clock, this process's age and why the card was asked.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NeedFacts {
     pub card: CardFacts,
@@ -786,16 +578,13 @@ pub enum NotDue {
     Answered,
     /// The probe reports the grant is held.
     Granted,
-    /// The probe did not observe a denial (`unknown`: refused, or the lane
-    /// is off) — not a denial, so not a card.
+    /// The probe did not observe a denial (`unknown`: refused, or the lane is off) — not a denial, so not a card.
     NotObservedDenied,
     /// A grant keyed to this requirement class would not survive a rebuild.
     GrantUnstable(DrClass),
-    /// The prompt was for a service this card is not about (its Allow is
-    /// durable, so one answer ends it): a log line only.
+    /// The prompt was for a service this card is not about (its Allow is durable, so one answer ends it): a log line only.
     NotThisClass,
-    /// The owner pressed *Open Settings* and this window started before the press: it cannot
-    /// be expected to see the switch, so another ask could not be acted on.
+    /// The owner pressed *Open Settings* and this window started before the press: it cannot be expected to see the switch, so another ask could not be acted on.
     OwnerActed,
     /// The question was already asked this epoch.
     RecentlyAsked,
@@ -803,12 +592,9 @@ pub enum NotDue {
     NoNeedYet,
     /// The launch check found the grant held, as it was before.
     Held,
-    /// A grant was verified before and the probe reads off now; the words of
-    /// the next ask will say so.
+    /// A grant was verified before and the probe reads off now; the words of the next ask will say so.
     ReadsOffAfterVerified,
-    /// A verified grant reads off inside [`LAUNCH_SETTLE`] of this process
-    /// starting: not concluded. The host keeps the need and decides it again
-    /// once the window has settled.
+    /// A verified grant reads off inside [`LAUNCH_SETTLE`] of this process starting: not concluded.
     Settling,
 }
 
@@ -847,7 +633,6 @@ impl std::fmt::Display for NotDue {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum NeedVerdict {
     /// Raise the question once the cached probe confirms the denial.
-    /// `regressed`: a verified grant later read as off, so the words say so.
     Ask { regressed: bool },
     /// Nothing to show, and why.
     Quiet(NotDue),
@@ -856,8 +641,7 @@ pub enum NeedVerdict {
 /// What the launch decision resolved to; never an ask.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LaunchVerdict {
-    /// The grant the owner started (or was asked for) is now held: record it
-    /// once (the ✓ record), clear the `opened` marker, write `verified_at`.
+    /// The grant the owner started (or was asked for) is now held: record it once (the ✓ record), clear the `opened` marker, write `verified_at`.
     Confirm,
     /// Nothing to show, and why.
     Quiet(NotDue),
@@ -892,16 +676,13 @@ impl From<&LaunchVerdict> for Verdict {
     }
 }
 
-/// Whether a need verdict is the anomaly the log keeps a trace of: macOS showed a dialog for
-/// a program of this aterm while this process reads Full Disk Access as granted (a program
-/// whose macOS record does not match the window's). It asks nothing: the switch is on.
+/// Whether a need verdict is the anomaly the log keeps a trace of: macOS showed a dialog for a program of this aterm while this process reads Full Disk Access as granted (a program whose macOS record does not match the window's).
 pub fn is_prompt_while_granted(cause: NeedCause, verdict: &NeedVerdict) -> bool {
     matches!(cause, NeedCause::PromptObserved { .. })
         && matches!(verdict, NeedVerdict::Quiet(NotDue::Granted))
 }
 
-/// The need decision, pure over the facts, the marker and the record. The first rule that
-/// applies wins; the module doc says why each exists.
+/// The need decision, pure over the facts, the marker and the record.
 pub fn decide_need(
     facts: &NeedFacts,
     marker: Option<Marker>,
@@ -928,8 +709,6 @@ pub fn decide_need(
     if card.fda == FdaState::Granted {
         return NeedVerdict::Quiet(NotDue::Granted);
     }
-    // A verified grant that reads off in a fresh process does not conclude yet: see
-    // `LAUNCH_SETTLE`.
     if card.fda == FdaState::Denied
         && record.verified_at.is_some()
         && facts.now_secs
@@ -939,11 +718,6 @@ pub fn decide_need(
     {
         return NeedVerdict::Quiet(NotDue::Settling);
     }
-    // The owner who acted: `opened` is set, the hold has not lapsed, no verification is newer
-    // than the press, and this process started before it. A grant that reached running
-    // processes would read `granted` above; one that did not cannot be seen by this window, so
-    // another ask could not be acted on. A window started after the press that still reads
-    // `denied` is evidence the switch is off, and the renewal below decides.
     if let Some(opened_at) = record.opened_at
         && facts.now_secs < opened_at.saturating_add(OWNER_ACTED_HOLD.as_secs())
         && record
@@ -969,12 +743,7 @@ pub fn decide_need(
     }
 }
 
-/// The launch decision: runs once per process at the first park and never asks. An `opened`
-/// marker (or an ask on record) beside a probe that now reads `granted` is confirmed once;
-/// everything else is a log line.
-/// A [`NotDue::NoNeedYet`] beside a probe reading `denied` is what the window's
-/// own Full Disk Access hand-over follows (`App::note_launch_fda`); the card
-/// itself asks nothing.
+/// The launch decision: runs once per process at the first park and never asks.
 pub fn decide_launch(
     facts: &CardFacts,
     marker: Option<Marker>,
@@ -1008,9 +777,7 @@ pub fn decide_launch(
     }
 }
 
-/// Whether a new process should re-assert a standing question at its launch check
-/// (`App::reassert_fda_need`): asked, no grant verified since, and the owner has neither
-/// declined nor acted (`marker` is empty).
+/// Whether a new process should re-assert a standing question at its launch check (`App::reassert_fda_need`): asked, no grant verified since, and the owner has neither declined nor acted (`marker` is empty).
 pub fn should_reassert(record: &AccessRecord, marker: Option<Marker>, fda: FdaState) -> bool {
     marker.is_none()
         && fda != FdaState::Granted
@@ -1020,27 +787,18 @@ pub fn should_reassert(record: &AccessRecord, marker: Option<Marker>, fda: FdaSt
             .is_none_or(|verified| verified <= record.asked_at.unwrap_or(0))
 }
 
-/// The per-process lifecycle of the card, driven from the event loop's park
-/// point. Every transition is a method, so the machine is table-testable
-/// without an `App`.
+/// The per-process lifecycle of the card, driven from the event loop's park point.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CardPhase {
     /// Nothing asked yet — the launch-time one-shot has not run.
     Idle,
-    /// The worker is warming the identity and reading the marker and the
-    /// record, since `since` — stamped so a verdict that never arrives
-    /// ([`DECIDE_TIMEOUT`]) is asked for again instead of waiting for a wake
-    /// that cannot come.
+    /// The worker is warming the identity and reading the marker and the record, since `since` — stamped so a verdict that never arrives ([`DECIDE_TIMEOUT`]) is asked for again instead of waiting for a wake that cannot come.
     Deciding { since: Instant },
-    /// Due; the question is raised at the next park whose cached probe still
-    /// reads `denied` (a pending probe is waited on, for at most
-    /// [`WATCH_FOR`]).
+    /// Due; the question is raised at the next park whose cached probe still reads `denied` (a pending probe is waited on, for at most [`WATCH_FOR`]).
     Due,
-    /// The question is raised since `since` (or the owner opened Settings
-    /// then); the instance watches the probe for the grant and the question
-    /// for its end.
+    /// The question is raised since `since` (or the owner opened Settings then); the instance watches the probe for the grant and the question for its end.
     Watching { since: Instant },
-    /// Not currently active. A later need ([`CardState::on_need`]) re-arms it.
+    /// Not currently active.
     Settled,
 }
 
@@ -1049,18 +807,14 @@ pub enum CardPhase {
 pub struct CardState {
     phase: CardPhase,
     /// When the offer became due — the anchor of a due card's wait on a
-    /// pending probe.
     due_since: Option<Instant>,
     /// When the question was first raised in this episode.
     first_raised: Option<Instant>,
     /// The owner pressed something on the row (Open Settings, or Details).
     owner_acted: bool,
     /// How many times the one-shot has asked its worker for a verdict
-    /// ([`DECIDE_ATTEMPTS`]).
     decide_attempts: u8,
     /// A need arrived while the card was busy (launch check under way, or a
-    /// question already raised): it is re-evaluated the moment the phase
-    /// settles ([`CardState::take_pending_need`]).
     pending_need: bool,
 }
 
@@ -1081,8 +835,6 @@ impl CardState {
     }
 
     /// Every active phase owns an absolute expiry, even with no probe result.
-    /// The host combines this with its refresh deadline, so a slow or stuck
-    /// probe cannot extend a phase's lifetime.
     pub fn lifecycle_deadline(self) -> Option<Instant> {
         match self.phase {
             CardPhase::Idle | CardPhase::Settled => None,
@@ -1093,8 +845,6 @@ impl CardState {
     }
 
     /// Retire an expired probe wait or grant watch before asking for another observation.
-    /// Deciding uses its bounded retry path instead; this never consumes a marker the next
-    /// process may still acknowledge.
     pub fn expire_wait(&mut self, now: Instant) -> bool {
         if matches!(self.phase, CardPhase::Due | CardPhase::Watching { .. })
             && self
@@ -1108,22 +858,18 @@ impl CardState {
         }
     }
 
-    /// Admit one lifecycle step against the current settings, including a pending worker
-    /// verdict or a raised question. Turning the notice off is an answer for this process: a
-    /// late worker cannot bring it back.
+    /// Admit one lifecycle step against the current settings, including a pending worker verdict or a raised question.
     pub fn admit_current_policy(&mut self, enabled: bool, notice: bool) -> bool {
         if enabled && notice {
             true
         } else {
             self.settle();
-            // A kept need is answered too: re-enabling the notice waits for a new need.
             self.pending_need = false;
             false
         }
     }
 
-    /// The launch one-shot fired: a worker is deciding. Only from
-    /// [`CardPhase::Idle`].
+    /// The launch one-shot fired: a worker is deciding.
     pub fn begin_deciding(&mut self, now: Instant) -> bool {
         if self.phase != CardPhase::Idle {
             return false;
@@ -1133,11 +879,7 @@ impl CardState {
         true
     }
 
-    /// A need arrived (macOS showed the dialog, or aterm's own read was refused). From `Settled`
-    /// the card re-arms into `Deciding` with a fresh attempt budget and episode, and `true` says
-    /// the host should start its worker. In any other phase the need is kept
-    /// ([`Self::take_pending_need`]) and `false` is returned: `Idle` has its launch check still
-    /// to run, `Deciding` has a verdict coming, and a `Due` or `Watching` card already covers it.
+    /// A need arrived (macOS showed the dialog, or aterm's own read was refused).
     pub fn on_need(&mut self, now: Instant) -> bool {
         if self.phase != CardPhase::Settled {
             self.pending_need = true;
@@ -1151,22 +893,17 @@ impl CardState {
         true
     }
 
-    /// Keep a need without acting on it (the host cannot decide right now: an
-    /// incoming handoff is uncommitted, or there is no event loop yet). It is
-    /// given up by [`Self::take_pending_need`] once the card is settled.
+    /// Keep a need without acting on it (the host cannot decide right now: an incoming handoff is uncommitted, or there is no event loop yet).
     pub fn defer_need(&mut self) {
         self.pending_need = true;
     }
 
-    /// The grant answers a need that was kept before it: drop the kept need
-    /// without deciding it (the dialog it stands for predates the grant, and
-    /// a later dialog is a new need).
+    /// The grant answers a need that was kept before it: drop the kept need without deciding it (the dialog it stands for predates the grant, and a later dialog is a new need).
     pub fn discard_pending_need(&mut self) {
         self.pending_need = false;
     }
 
-    /// Whether a need was kept while busy; consumed by the call. Only a
-    /// `Settled` card gives it up (the host then calls [`Self::on_need`]).
+    /// Whether a need was kept while busy; consumed by the call.
     pub fn take_pending_need(&mut self) -> bool {
         if self.phase == CardPhase::Settled && self.pending_need {
             self.pending_need = false;
@@ -1182,9 +919,7 @@ impl CardState {
             if now.duration_since(since) >= DECIDE_TIMEOUT)
     }
 
-    /// A lapsed decision: back to `Idle` to ask again (`true`), or settled once
-    /// [`DECIDE_ATTEMPTS`] are spent, so a dropped wake ([`DECIDE_TIMEOUT`]) cannot silently
-    /// kill the card.
+    /// A lapsed decision: back to `Idle` to ask again (`true`), or settled once [`DECIDE_ATTEMPTS`] are spent, so a dropped wake ([`DECIDE_TIMEOUT`]) cannot silently kill the card.
     pub fn reopen_deciding(&mut self) -> bool {
         if self.decide_attempts >= DECIDE_ATTEMPTS {
             self.settle();
@@ -1194,10 +929,7 @@ impl CardState {
         true
     }
 
-    /// The main thread decided. A verdict that arrives in any phase but
-    /// [`CardPhase::Deciding`] is stale (a second worker, a re-entrant wake)
-    /// and is ignored. `Confirm` settles here: the caller posts the ✓ record
-    /// and clears the marker.
+    /// The main thread decided.
     pub fn on_decided(&mut self, verdict: &Verdict, now: Instant) -> bool {
         if !matches!(self.phase, CardPhase::Deciding { .. }) {
             return false;
@@ -1212,10 +944,7 @@ impl CardState {
         true
     }
 
-    /// Whether the question may be raised at `now`: only while due, and only
-    /// inside the wait a pending probe is given ([`WATCH_FOR`] from
-    /// `due_since`) — a probe that never completes does not keep a card due
-    /// for the life of the process.
+    /// Whether the question may be raised at `now`: only while due, and only inside the wait a pending probe is given ([`WATCH_FOR`] from `due_since`) — a probe that never completes does not keep a card due for the life of the process.
     pub fn raise_allowed(&mut self, now: Instant) -> bool {
         if self.phase != CardPhase::Due {
             return false;
@@ -1238,9 +967,7 @@ impl CardState {
         }
     }
 
-    /// The row folded with nothing pressed: the unanswered path, settled (`true`); `asked_at` is
-    /// on record, so the next ask waits for [`RENEW_AFTER`]. A row the owner acted on (*Open
-    /// Settings*, Details) keeps its watch (`false`), since the grant may still be observed.
+    /// The row folded with nothing pressed: the unanswered path, settled (`true`); `asked_at` is on record, so the next ask waits for [`RENEW_AFTER`].
     pub fn on_row_retired(&mut self) -> bool {
         if !matches!(self.phase, CardPhase::Watching { .. }) || self.owner_acted {
             return false;
@@ -1249,22 +976,18 @@ impl CardState {
         true
     }
 
-    /// The owner pressed *Open Settings* through either UI: start a bounded
-    /// watch even if the card was idle or settled. The host admits this
-    /// explicit gesture against current settings before calling it.
+    /// The owner pressed *Open Settings* through either UI: start a bounded watch even if the card was idle or settled.
     pub fn on_opened_settings(&mut self, now: Instant) {
         self.phase = CardPhase::Watching { since: now };
         self.owner_acted = true;
     }
 
-    /// Whether the probe should be re-checked at `now`. True only while
-    /// watching and inside [`WATCH_FOR`]; a watch past its window settles.
+    /// Whether the probe should be re-checked at `now`.
     pub fn wants_probe(&mut self, now: Instant) -> bool {
         matches!(self.phase, CardPhase::Watching { .. }) && !self.expire_wait(now)
     }
 
-    /// Nothing more in this episode: *Not now*, the grant observed, or the
-    /// decision said no. A later need may re-arm the card.
+    /// Nothing more in this episode: *Not now*, the grant observed, or the decision said no.
     pub fn settle(&mut self) {
         self.phase = CardPhase::Settled;
     }
@@ -1289,8 +1012,6 @@ mod tests {
     use aterm_containment::consent::{DrClass, FdaState, Folder};
 
     /// The stamp is a set: each Mac that verified the grant stays named whatever another
-    /// sharing the directory writes later, none twice, the newest sixteen kept; a Mac
-    /// not named reads `Some(false)`, and no stamp or no UUID reads `None`.
     #[test]
     fn the_verified_stamp_keeps_every_mac_that_verified() {
         use super::{MAX_VERIFIED_HOSTS, verified_here, with_verified_host, write_verified_host};
@@ -1354,14 +1075,10 @@ mod tests {
     }
 
     /// The two bounded waiting phases share one expiry contract: the clock step
-    /// is the host reaching the phase's absolute deadline, which a pending
-    /// observation cannot extend. `Buggy = 1` (a due card that never expires)
-    /// is the negative control.
     fn bounded_wait_model() -> aterm_spec::derive::Model {
         aterm_spec::ty_model! {
             MacosAccessCardBoundedWait {
                 const Buggy = 0;
-                // Due, Watching, Settled, matching current_policy.
                 var phase = 2;
                 var expired = 0;
                 action Raise when (phase == 2 && expired == 0) {
@@ -1384,8 +1101,6 @@ mod tests {
     }
 
     /// Drives the real due and watching states to just before and exactly at
-    /// their scheduled expiry; expiry settles without further pending
-    /// observations.
     #[test]
     fn bounded_wait_conforms_at_each_real_phase_deadline() {
         let now = Instant::now();
@@ -1445,14 +1160,12 @@ mod tests {
     }
 
     /// The live settings guard over the lifecycle phases: disabling a visible
-    /// or queued card retires it for good. `Buggy = 1` guards only at launch.
     fn current_policy_model() -> aterm_spec::derive::Model {
         aterm_spec::ty_model! {
             MacosAccessCardCurrentPolicy {
                 const Buggy = 0;
                 var enabled = 1;
                 var notice = 1;
-                // Idle, Deciding, Due, Watching, Settled.
                 var phase = 0;
                 action Begin when (phase == 0 && enabled == 1 && notice == 1) {
                     phase = 1;
@@ -1478,8 +1191,6 @@ mod tests {
                     enabled = 1;
                     notice = 1;
                 }
-                // A need re-arms a settled card (`CardState::on_need`) only while both switches
-                // are on; `Buggy = 1` re-arms regardless, which breaks `DisabledSettles`.
                 action Rearm when (phase == 4 && (Buggy == 1 || (enabled == 1 && notice == 1))) {
                     phase = 1;
                 }
@@ -1496,8 +1207,6 @@ mod tests {
     }
 
     /// Drive all five phases, then disable either or both settings; a late verdict or
-    /// re-enabling cannot resurrect a settled card. The launch-only guard is projected as the
-    /// negative control.
     #[test]
     fn current_policy_conforms_in_every_real_phase() {
         fn phase_value(state: CardState) -> i64 {
@@ -1565,8 +1274,6 @@ mod tests {
             "three active phases, three disabled policies"
         );
 
-        // A need re-arms a settled card only under both switches; the host admits the current
-        // policy first, so a disabled card is never armed.
         for (enabled, notice) in [(true, true), (false, true), (true, false), (false, false)] {
             let mut actual = CardState::new();
             actual.settle();
@@ -1589,7 +1296,6 @@ mod tests {
                 assert_eq!(phase_value(actual), expected["phase"]);
             } else {
                 assert_eq!(actual.phase(), CardPhase::Settled);
-                // Negative control: re-arming regardless.
                 let mut buggy = expected.clone();
                 buggy.insert("phase", 1);
                 assert!(!model.check_invariant("DisabledSettles", &buggy));
@@ -1614,7 +1320,6 @@ mod tests {
     }
 
     /// A verified grant reading off inside [`LAUNCH_SETTLE`] neither asks nor marks the grant
-    /// regressed; after it, the same facts do.
     #[test]
     fn a_verified_grant_reading_off_in_a_fresh_process_is_settling_not_regressed() {
         let verified = AccessRecord {
@@ -1638,7 +1343,6 @@ mod tests {
             NeedVerdict::Ask { regressed: true },
             "the second denied read marks the grant regressed"
         );
-        // Never verified: nothing to doubt, so a fresh process asks at once.
         assert_eq!(
             decide_need(&fresh, None, &AccessRecord::default()),
             NeedVerdict::Ask { regressed: false }
@@ -1646,7 +1350,6 @@ mod tests {
     }
 
     /// A prompt while the probe reads granted asks nothing and is logged as an anomaly; aterm's
-    /// own refused read is not that anomaly.
     #[test]
     fn a_prompt_while_the_probe_reads_granted_logs_an_anomaly_and_asks_nothing() {
         let granted = NeedFacts {
@@ -1670,7 +1373,6 @@ mod tests {
     }
 
     /// `state=opened` lapses with the rule it reports: past `OWNER_ACTED_HOLD`
-    /// the card asks again, so the token must not say nothing more is coming.
     #[test]
     fn the_opened_state_lapses_with_the_owner_acted_hold() {
         let record = AccessRecord {
@@ -1724,7 +1426,6 @@ mod tests {
             decide_need(&headless, None, &none),
             NeedVerdict::Quiet(NotDue::Headless)
         );
-        // A prompt for any other service is a log line only; an unknown one too.
         for service in [Some(Folder::Documents), Some(Folder::Desktop), None] {
             let other = need_facts(NeedCause::PromptObserved {
                 service,
@@ -1736,7 +1437,6 @@ mod tests {
                 "{service:?}"
             );
         }
-        // aterm's own refused read is a need of its own kind.
         let eperm = need_facts(NeedCause::ProtectedRead { session: Some(2) });
         assert_eq!(
             decide_need(&eperm, None, &none),
@@ -1783,7 +1483,6 @@ mod tests {
             NeedVerdict::Quiet(NotDue::NotObservedDenied),
             "unknown is not denied"
         );
-        // The epoch: asked inside the week is refused, the week renews it.
         let asked = AccessRecord {
             asked_at: Some(facts.now_secs - 60),
             ..none
@@ -1811,7 +1510,6 @@ mod tests {
             NeedVerdict::Ask { regressed: false },
             "the renewal boundary is exact"
         );
-        // Every reason renders as one sentence a log line can carry.
         for reason in [
             NotDue::Off,
             NotDue::Headless,
@@ -1832,7 +1530,6 @@ mod tests {
     }
 
     /// A grant verified earlier and read as off now opens a new epoch: the ask is allowed at once
-    /// and its words say so, and once asked it is `RecentlyAsked` again.
     #[test]
     fn an_ask_after_a_verified_grant_reads_regressed_and_opens_a_new_epoch() {
         let facts = need_facts(app_data_prompt());
@@ -1942,8 +1639,6 @@ mod tests {
             decide_launch(&unknown, None, &none),
             LaunchVerdict::Quiet(NotDue::NoNeedYet)
         );
-        // Re-assertion (the digest host): asked, not verified after, and the
-        // owner neither declined nor acted.
         assert!(should_reassert(&asked, None, FdaState::Denied));
         assert!(!should_reassert(
             &asked,
@@ -1961,8 +1656,6 @@ mod tests {
     }
 
     /// *Open Settings*, the switch on, `Later` on Apple's sheet: the older window still reads
-    /// `denied` and, past the renewal, a program of it prompts. Nothing is asked; a window started
-    /// after the press, or the hold lapsing, allows the ask again.
     #[test]
     fn an_owner_who_opened_settings_is_not_asked_again_by_an_older_window() {
         let t = 10_000_000_u64;
@@ -1981,7 +1674,6 @@ mod tests {
             NeedVerdict::Quiet(NotDue::OwnerActed),
             "the week elapsed and the probe reads denied, but this window predates the press"
         );
-        // The hold lapses after fourteen days.
         let lapsed = NeedFacts {
             now_secs: t - 50 + OWNER_ACTED_HOLD.as_secs(),
             ..older_window.clone()
@@ -1999,8 +1691,6 @@ mod tests {
             decide_need(&just_inside, None, &record),
             NeedVerdict::Quiet(NotDue::OwnerActed)
         );
-        // A window that started after the press and still reads denied is
-        // evidence the switch is off: the weekly renewal decides.
         let newer_window = NeedFacts {
             process_started_at: t,
             ..older_window.clone()
@@ -2018,7 +1708,6 @@ mod tests {
             decide_need(&newer_soon, None, &record),
             NeedVerdict::Quiet(NotDue::RecentlyAsked)
         );
-        // A verification newer than the press ends the owner's act.
         let verified = AccessRecord {
             verified_at: Some(t),
             ..record
@@ -2030,8 +1719,6 @@ mod tests {
     }
 
     /// The marker: path beside `aterm.toml`, one token, round-trips through the shared marker
-    /// rules, tolerates a hand edit's trailing newline, and `clear_opened` removes only an
-    /// `opened` marker.
     #[test]
     fn the_marker_round_trips_beside_the_config() {
         let dir = std::env::temp_dir().join(format!(
@@ -2074,10 +1761,8 @@ mod tests {
             assert!(marker.as_str().len() <= MAX_MARKER_BYTES);
             assert_eq!(Marker::parse(marker.as_str()), Some(marker));
         }
-        // A hand edit with a trailing newline still reads as the answer.
         std::fs::write(dir.join(MARKER), "not-now\n").unwrap();
         assert_eq!(read_marker(Some(&config)), Some(Marker::NotNow));
-        // Something else wearing the name is not an answer: the card shows.
         std::fs::write(dir.join(MARKER), "x".repeat(MAX_MARKER_BYTES + 1)).unwrap();
         assert_eq!(read_marker(Some(&config)), None);
         std::fs::write(dir.join(MARKER), "granted").unwrap();
@@ -2090,9 +1775,6 @@ mod tests {
     }
 
     /// The card's answer, the access record and the verified-host line are only
-    /// ordered ahead of their renames (aterm-durable's counting seam): each one lost
-    /// brings its question back, or is merged again, and nothing off this device
-    /// waits on it.
     #[test]
     fn the_cards_records_are_only_ordered() {
         use aterm_durable::{Flush, seam::Recording};
@@ -2140,18 +1822,12 @@ mod tests {
             tab_number: Some(2),
             regressed: false,
         };
-        // Each cause is named: a regression and a refused read do not read as a prompt.
         assert_ne!(regressed.event_line(), tab.event_line());
         assert_ne!(eperm.event_line(), tab.event_line());
         assert!(eperm.event_line().contains("tab 2"));
     }
 
     /// One question per epoch, however many process generations an update brings. The only
-    /// resets are `Regress` (a verified grant reads off), `Renew` ([`RENEW_AFTER`]) and
-    /// `HoldLapses` ([`OWNER_ACTED_HOLD`], longer, so it renews the ask too); `Update` is none of
-    /// them. `opened`/`fresh`: an owner who acted on an older window is not asked again.
-    /// `Buggy = 1` is a new process that forgot it asked (`Need, Ask, Update, Need, Ask`) and an
-    /// ask to an owner whose window predates the press (`Need, Ask, Open, Renew, Need, Ask`).
     fn asked_once_model() -> aterm_spec::derive::Model {
         aterm_spec::ty_model! {
             AccessCardAskedOnce {
@@ -2193,8 +1869,6 @@ mod tests {
     }
 
     /// The real rules through simulated restarts: the record file is the only memory between
-    /// generations, the model's actions fire in lockstep, and its variables are projected from
-    /// the real state.
     struct Epochs {
         dir: std::path::PathBuf,
         config: std::path::PathBuf,
@@ -2210,7 +1884,6 @@ mod tests {
         /// Negative control: an ask that ignores the window's age.
         ignores_window_age: bool,
         /// A negative control: the run departs from the model, so its guards are not asserted
-        /// (its invariants are the check).
         lenient: bool,
     }
 
@@ -2296,7 +1969,6 @@ mod tests {
         }
 
         /// Do the real thing the model action stands for; `Err` if a decision
-        /// disagrees with the model's guard.
         fn apply(
             &mut self,
             model: &aterm_spec::derive::Model,
@@ -2307,8 +1979,6 @@ mod tests {
             match action {
                 "Need" => self.need = true,
                 "Ask" | "Suppress" => {
-                    // A need inside the new process's `LAUNCH_SETTLE` is decided once it has
-                    // settled (`NotDue::Settling`), so the model's decision moment is that one.
                     self.now = self.now.max(self.started + LAUNCH_SETTLE.as_secs());
                     let verdict = self.verdict();
                     let asks = matches!(verdict, NeedVerdict::Ask { .. });
@@ -2402,7 +2072,6 @@ mod tests {
     }
 
     /// The real `decide_need` and record persistence follow the model action by action across
-    /// process generations.
     #[test]
     fn asked_once_conforms_across_process_generations() {
         let model = asked_once_model();
@@ -2454,7 +2123,6 @@ mod tests {
     #[test]
     fn asked_once_catches_the_process_that_forgets_and_the_ask_that_ignores_the_window() {
         let model = asked_once_model();
-        // 1. A new process that keeps no record asks a second time in one epoch.
         let mut forgetful = Epochs::new("forgets");
         forgetful.forgets_record = true;
         forgetful.lenient = true;
@@ -2470,7 +2138,6 @@ mod tests {
             !model.check_invariant("AtMostOncePerEpoch", &forgetful.project()),
             "the invariant reports it"
         );
-        // 2. An ask that ignores how old the window is.
         let mut blind = Epochs::new("blind");
         blind.ignores_window_age = true;
         blind.lenient = true;
@@ -2502,7 +2169,6 @@ mod tests {
         };
         assert_eq!(write_record(config, first).unwrap(), first);
         assert_eq!(read_record(config), first);
-        // An older value never replaces a newer one; a new field is added.
         let merged = write_record(
             config,
             AccessRecord {
@@ -2535,8 +2201,6 @@ mod tests {
             maximal.render().len() <= MAX_RECORD_BYTES,
             "four maximal fields still fit the bound"
         );
-        // A foreign file, an unknown key, a bad number, or an oversized file
-        // reads as an empty record: the card errs toward speaking once.
         let path = epochs.dir.join(RECORD);
         for foreign in [
             "hello\n",
@@ -2549,7 +2213,6 @@ mod tests {
         }
         std::fs::write(&path, "asked_at=1\n".repeat(MAX_RECORD_BYTES)).unwrap();
         assert_eq!(read_record(config), AccessRecord::default(), "oversized");
-        // A hand edit with blank lines and spaces still reads.
         std::fs::write(&path, "\nasked_at = 12\n\nverified_at=13\n").unwrap();
         assert_eq!(
             read_record(config),
@@ -2562,12 +2225,10 @@ mod tests {
     }
 
     /// `on_need` re-arms only a settled card; a need that arrives while it is busy is kept and
-    /// given up when it settles.
     #[test]
     fn on_need_re_arms_a_settled_card_and_reoffer_no_longer_exists() {
         let t0 = Instant::now();
         let mut s = CardState::new();
-        // Idle: the launch check has not run; the need waits for it.
         assert!(!s.on_need(t0));
         assert_eq!(s.phase(), CardPhase::Idle);
         assert!(!s.take_pending_need(), "only a settled card gives it up");
@@ -2577,7 +2238,6 @@ mod tests {
         assert_eq!(s.phase(), CardPhase::Settled);
         assert!(s.take_pending_need(), "re-evaluated the moment it settles");
         assert!(!s.take_pending_need(), "and only once");
-        // Settled -> Deciding with a fresh episode and a full attempt budget.
         assert!(s.on_need(t0 + Duration::from_secs(1)));
         assert!(matches!(s.phase(), CardPhase::Deciding { .. }));
         assert_eq!(
@@ -2586,13 +2246,11 @@ mod tests {
         );
         assert!(s.on_decided(&Verdict::Offer, t0));
         assert_eq!(s.phase(), CardPhase::Due);
-        // A Due or Watching card already covers a further need.
         assert!(!s.on_need(t0));
         assert!(s.raise_allowed(t0));
         s.on_raised(t0);
         assert!(!s.on_need(t0));
         assert!(!s.take_pending_need(), "still watching");
-        // The row folding unanswered settles it.
         assert!(s.on_row_retired());
         assert_eq!(s.phase(), CardPhase::Settled);
         assert_eq!(s.lifecycle_deadline(), None);
@@ -2600,7 +2258,6 @@ mod tests {
             s.take_pending_need(),
             "the need kept while watching returns"
         );
-        // A retry budget is fresh for every need: three lapses, then settled.
         let mut lapses = CardState::new();
         lapses.settle();
         assert!(lapses.on_need(t0));
@@ -2615,7 +2272,6 @@ mod tests {
     }
 
     /// A verdict that never arrives lapses and is asked for again, given up on only after
-    /// [`DECIDE_ATTEMPTS`].
     #[test]
     fn a_swallowed_verdict_is_asked_for_again_and_then_given_up_on() {
         let t0 = Instant::now();
@@ -2639,7 +2295,6 @@ mod tests {
             !s.on_decided(&Verdict::Offer, t0),
             "a late verdict is stale"
         );
-        // A verdict that does arrive still ends the deciding phase.
         let mut ok = CardState::new();
         assert!(ok.begin_deciding(t0));
         assert!(ok.on_decided(&Verdict::Offer, t0));
@@ -2676,7 +2331,6 @@ mod tests {
         assert!(s.wants_probe(t0 + Duration::from_secs(60)));
         assert!(!s.raise_allowed(t0), "posted once; never twice");
 
-        // A due card whose probe stays pending is retired unraised at `WATCH_FOR`.
         let mut d = CardState::new();
         assert!(d.begin_deciding(Instant::now()));
         assert!(d.on_decided(&Verdict::Offer, t0));
@@ -2685,15 +2339,12 @@ mod tests {
         assert_eq!(d.phase(), CardPhase::Settled);
         assert_eq!(d.lifecycle_deadline(), None);
 
-        // `Confirm` settles at once: the ✓ record is the caller's to post.
         let mut c = CardState::new();
         assert!(c.begin_deciding(Instant::now()));
         assert!(c.on_decided(&Verdict::Confirm, t0));
         assert_eq!(c.phase(), CardPhase::Settled);
         assert_eq!(c.lifecycle_deadline(), None);
 
-        // Opening Settings restarts the window and records the press, so the
-        // row's fold is no longer an unanswered end.
         let t2 = t0 + Duration::from_secs(20);
         let mut o = CardState::new();
         assert!(o.begin_deciding(Instant::now()));
@@ -2719,7 +2370,6 @@ mod tests {
             "an explicit gesture never reoffers the card"
         );
 
-        // Details: read; the watch continues and the fold is not an unanswered end.
         let mut b = CardState::new();
         assert!(b.begin_deciding(Instant::now()));
         assert!(b.on_decided(&Verdict::Offer, t0));
@@ -2731,13 +2381,11 @@ mod tests {
         assert!(!b.wants_probe(t0 + WATCH_FOR));
         assert_eq!(b.lifecycle_deadline(), None, "read rows do not return");
 
-        // A decision that says no settles without ever raising.
         let mut n = CardState::new();
         assert!(n.begin_deciding(Instant::now()));
         assert!(n.on_decided(&Verdict::Quiet(NotDue::Granted), t0));
         assert_eq!(n.phase(), CardPhase::Settled);
 
-        // Not now / the grant observed: settle from watching.
         let mut w = CardState::new();
         assert!(w.begin_deciding(Instant::now()));
         assert!(w.on_decided(&Verdict::Offer, t0));

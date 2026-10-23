@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The small verbs on a lab that is up: the stub's mode and scripts, the
-//! scratch settings and `aterm.toml`, typing into the tab, reading it, the
-//! witnesses, fixtures in the repo's shape, and a newer managed build.
+//! Small verbs on a running lab: stub modes/scripts, scratch settings, tab typing/reading, witnesses, and fixtures.
 
 use std::fs;
 
@@ -46,8 +44,7 @@ pub fn settings_merge(run: &Run, patch: &J) -> Result<J, Fail> {
     Ok(d)
 }
 
-/// A file of the scratch, read through no link on its whole path; the refusal
-/// when it is missing or is not this user's regular file with one name.
+/// Read a regular file in the scratch directory through no symlinks.
 ///
 /// # Errors
 /// It is missing, or refused.
@@ -79,9 +76,7 @@ pub fn set_mode(run: &Run, m: &str) -> Result<String, Fail> {
     Ok(answer)
 }
 
-/// `mode [tag] [name ['<spec>']]`: read or switch the stub's mode; with a
-/// spec, the custom mode `name` is written first (`modes/<name>.json`: the
-/// stub module's `{"status", "headers", "json"|"body", "stream", …}`).
+/// `mode [tag] [name ['<spec>']]`: read or switch the stub's mode.
 pub fn cmd_mode(args: &[String]) -> Res {
     let (run, a) = lab(args)?;
     match (a.first(), a.get(1)) {
@@ -95,13 +90,10 @@ pub fn cmd_mode(args: &[String]) -> Res {
     Ok(0)
 }
 
-/// Write the custom mode `m` (`modes/<m>.json`, the stub module's `{"status",
-/// "headers", "json"|"body", "stream", …}`) and switch the stub to it; the
-/// stub's answer.
+/// Write the custom mode `m` (`modes/<m>.json`) and switch the stub to it.
 ///
 /// # Errors
-/// `m` is no custom mode's name ([`custom_mode_name`]), `spec` no JSON
-/// object, or the write or the switch failed.
+/// `m` is no custom mode's name ([`custom_mode_name`]), `spec` no JSON object, or the write or switch failed.
 pub fn set_custom_mode(run: &Run, m: &str, spec: &J) -> Result<String, Fail> {
     let name = custom_mode_name(m)?;
     if !matches!(spec, J::Obj(_)) {
@@ -115,10 +107,7 @@ pub fn set_custom_mode(run: &Run, m: &str, spec: &J) -> Result<String, Fail> {
     set_mode(run, &name)
 }
 
-/// `m` as the name of a custom mode the stub will serve from
-/// `modes/<m>.json`; refused when the stub would answer it otherwise (a
-/// built-in mode's name, Codex's `refresh` answer: [`crate::stub::not_custom`])
-/// or would read another name (what [`crate::stub::clean_mode`] changes, a `:`).
+/// Validate `m` as the name of a custom mode served from `modes/<m>.json`.
 ///
 /// # Errors
 /// `m` is not such a name.
@@ -138,7 +127,6 @@ pub fn custom_mode_name(m: &str) -> Result<String, Fail> {
 }
 
 /// The `bg` mode's tool use runs `sleep N` in the background: let Claude run it
-/// without asking (a prompt would stall it).
 fn allow_sleep(run: &Run) -> Result<(), Fail> {
     let p = run.settings();
     let text = read_scratch(&p)?;
@@ -158,9 +146,7 @@ fn allow_sleep(run: &Run) -> Result<(), Fail> {
     atomic_write(&p, d.dump(SETTINGS_STYLE).as_bytes()).map_err(|e| Fail::die(e.to_string()))
 }
 
-/// `limit [tag] CLAIM SECONDS [PLAN]`: a subscription usage limit that resets
-/// SECONDS from now, then lifts; Codex gets its own `usage_limit_reached` body
-/// (PLAN: its `plan_type`) with the claim's window at 100% in its `x-codex-*` headers.
+/// `limit [tag] CLAIM SECONDS [PLAN]`: configure a temporary subscription usage limit.
 pub fn cmd_limit(args: &[String]) -> Res {
     let (run, a) = lab(args)?;
     let claim = a.first().cloned().unwrap_or_default();
@@ -237,8 +223,7 @@ pub fn cmd_tool(args: &[String]) -> Res {
     Ok(0)
 }
 
-/// Write the tool mode's script (`@PROJ@` the project dir, `@PORT@` the
-/// stub's port) and switch the stub to that mode: the script and the stub's answer.
+/// Write the tool mode's script and switch the stub to that mode.
 ///
 /// # Errors
 /// Not JSON, the script could not be written, or the stub did not take the mode.
@@ -258,9 +243,7 @@ pub fn set_tool(run: &Run, text: &str) -> Result<(J, String), Fail> {
     Ok((j, answer))
 }
 
-/// `headers`' argument (none reads as `{}`, which clears them): the
-/// `{"on200":{…},"on429":{…}}` blocks, an object of objects under those keys
-/// alone ([`crate::stub::RATE_BLOCKS`]).
+/// Parse `headers`' argument into `{"on200":{…},"on429":{…}}` blocks.
 ///
 /// # Errors
 /// Not JSON, or not that shape.
@@ -280,10 +263,7 @@ pub fn rate_blocks(text: Option<&str>) -> Result<J, String> {
     }
 }
 
-/// Write `new`'s own entries into the lab's `--headers-file`
-/// (`scratch/headers.json`) and keep the other verb's
-/// ([`crate::stub::headers_file_with`]): the `on200`/`on429` blocks when
-/// `blocks` (`headers`), else the flat entries (`ratelimits`).
+/// Write `new`'s entries into `scratch/headers.json` while keeping the other verb's entries.
 ///
 /// # Errors
 /// The file could not be written.
@@ -298,10 +278,7 @@ pub fn write_headers(w: &Path, new: J, blocks: bool) -> Result<(), Fail> {
     atomic_write(&p, text.as_bytes()).map_err(|e| Fail::die(e.to_string()))
 }
 
-/// `headers [tag] ['<json>']`: the stub's extra headers per answer status on
-/// `/v1/messages` (`{"on200":{…},"on429":{…}}`, re-read per request;
-/// [`crate::stub::rate_headers`]); `{}` or nothing clears them, and the flat
-/// entries `ratelimits` wrote stay ([`write_headers`]).
+/// `headers [tag] ['<json>']`: set or clear the stub's extra headers per status on `/v1/messages`.
 pub fn cmd_headers(args: &[String]) -> Res {
     let (run, a) = lab(args)?;
     let j = rate_blocks(a.first().map(String::as_str)).map_err(Fail::die)?;
@@ -354,9 +331,7 @@ fn setenv(run: &Run, key: &str, value: Option<&str>) -> Res {
     Ok(0)
 }
 
-/// `survey [tag] on|off [--reread]`: `CLAUDE_FORCE_DISPLAY_SURVEY` in the running Claude's settings env. With
-/// `--reread` the write is made as `selftest` arms the flag: again every 3 s until Claude Code reports re-reading
-/// the file ([`crate::settings_witness`]), then the writes and the seconds to that report are printed.
+/// `survey [tag] on|off [--reread]`: set `CLAUDE_FORCE_DISPLAY_SURVEY` in the running Claude's settings env.
 pub fn cmd_survey(args: &[String]) -> Res {
     const KEY: &str = "CLAUDE_FORCE_DISPLAY_SURVEY";
     let (run, a) = lab(args)?;
@@ -364,15 +339,7 @@ pub fn cmd_survey(args: &[String]) -> Res {
     if !reread {
         return setenv(&run, KEY, value);
     }
-    let r = crate::settings_witness::set_env_reread(
-        &run,
-        KEY,
-        value,
-        (
-            crate::settings_witness::REWRITE_EVERY,
-            crate::settings_witness::HANG,
-        ),
-    )?;
+    let r = crate::settings_witness::set_env_reread(&run, KEY, value)?;
     println!(
         "survey {}: Claude Code reported a re-read {:.2} s after the first write ({} write(s))",
         if value.is_some() { "on" } else { "off" },
@@ -383,8 +350,6 @@ pub fn cmd_survey(args: &[String]) -> Res {
 }
 
 /// `survey`'s words after the tag: the flag's value (`on`: `1`, `off`: none)
-/// and whether the write waits for Claude Code's re-read (`--reread`).
-///
 /// # Errors
 /// Anything else.
 fn survey_words(a: &[String]) -> Result<(Option<&'static str>, bool), Fail> {
@@ -401,8 +366,7 @@ fn survey_words(a: &[String]) -> Result<(Option<&'static str>, bool), Fail> {
     }
 }
 
-/// Set `key = value` lines in the `[harness]` table of an `aterm.toml` text
-/// (the table is added when there is none; a key already there is replaced).
+/// Set `key = value` lines in the `[harness]` table of an `aterm.toml` text.
 #[must_use]
 pub fn harness_set(text: &str, kvs: &[(String, String)]) -> String {
     let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
@@ -432,7 +396,6 @@ pub fn harness_set(text: &str, kvs: &[(String, String)]) -> String {
             }
         }
         if !found {
-            // after the table's last non-blank line
             let mut at = end;
             while at > head + 1 && lines[at - 1].trim().is_empty() {
                 at -= 1;
@@ -459,16 +422,10 @@ pub fn set_harness(run: &Run, kvs: &[(String, String)]) -> Result<String, Fail> 
     Ok(t)
 }
 
-/// A `harness` value as the scratch `aterm.toml` holds it: as typed when it
-/// is a TOML value (`false`, `3`, `"none"`, `["a"]`), else a word, written as
-/// a TOML string (`none` → `"none"`). Unquoted, such a word makes the file
-/// invalid TOML, and aterm reads none of it ("Couldn't read your settings").
-/// A value over more than one line is never taken as typed (`true` and a
-/// second line `[update]` parse as a document, not one value): it is a word.
+/// Format a `harness` value as a TOML value for the scratch `aterm.toml`.
 ///
 /// # Errors
-/// A value that opens as a string, an array or a table (`"`, `'`, `[`, `{`)
-/// and is no TOML value: quoting it would change what was meant.
+/// Value opens as a string, array, or table and is not a valid TOML value.
 pub fn toml_value(v: &str) -> Result<String, String> {
     if !v.contains(['\n', '\r'])
         && aterm_toml::from_str::<aterm_toml::Value>(&format!("k = {v}\n")).is_ok()
@@ -493,8 +450,7 @@ pub fn toml_value(v: &str) -> Result<String, String> {
     Ok(s)
 }
 
-/// `harness [tag] key=value ...`: set `[harness]` keys in the scratch
-/// `aterm.toml` (live), each value a TOML value ([`toml_value`]).
+/// `harness [tag] key=value ...`: set `[harness]` keys in the scratch `aterm.toml`.
 pub fn cmd_harness(args: &[String]) -> Res {
     let (run, a) = lab(args)?;
     let kvs = a
@@ -526,7 +482,6 @@ pub fn cmd_enter(args: &[String]) -> Res {
 }
 
 /// Whether `text` stands in the composer of the agent in the tab now;
-/// `None` when the screen could not be read (never taken for "sent").
 fn standing(door: &Door<'_>, text: &str) -> Option<bool> {
     let r = door.ctl(&["text"]).ok()?;
     if r.code != 0 {
@@ -535,16 +490,7 @@ fn standing(door: &Door<'_>, text: &str) -> Option<bool> {
     Some(crate::screen::composer_row(door.run().agent(), &r.stdout).as_deref() == Some(text))
 }
 
-/// A turn: TEXT typed, then Enter once TEXT stands in the composer (0.3 s
-/// after the typing at least, so the agent reads a typed prompt and an Enter,
-/// not one pasted burst whose Enter is a newline), and it is taken once the
-/// composer has let it go. An Enter lost at an agent's start leaves the text
-/// standing (codex-cli 0.163.0 drew its composer and kept `› hi` with no
-/// request made, in 1 of 5 runs): Enter again, once, and only while the text
-/// stands there, where Enter sends it. Whether it was taken: never when the
-/// text did not stand there (no Enter pressed), still stands after the second
-/// Enter, or the screen could not be read, so a caller never goes on as if a
-/// turn was taken.
+/// Type `text` and press Enter once `text` stands in the composer.
 ///
 /// # Errors
 /// A door rule refused it, or the run was interrupted.
@@ -690,7 +636,6 @@ pub fn cmd_security(args: &[String]) -> Res {
 pub fn cmd_paths() -> Res {
     let p = paths();
     println!("LAB_STATE={}", p.state.display());
-    // the aterm a NEW lab tests; a lab that is up runs the one its env.sh recorded at up
     println!(
         "LAB_ATERM={}",
         p.aterm
@@ -722,7 +667,6 @@ pub fn journal_line(line: &str) -> String {
     };
     let t = r.get("t").and_then(J::as_f64).unwrap_or(0.0) / 1000.0;
     let s = |k: &str, d: &str| r.get(k).and_then(J::as_str).unwrap_or(d).to_string();
-    // whole milliseconds of the stamp, as the journal's own clock writes them
     #[allow(clippy::cast_possible_truncation)]
     let secs = t.floor() as i64;
     #[allow(clippy::cast_possible_truncation)]
@@ -766,7 +710,6 @@ pub fn cmd_journal(args: &[String]) -> Res {
 }
 
 /// The pids of a lab's processes that live: everything in its jail (the
-/// instance's tree, the agents, codex-runs) and the stub.
 fn live_pids(run: &Run) -> Vec<String> {
     crate::procs::lab_tree(run)
         .into_iter()
@@ -795,16 +738,14 @@ pub fn lsof_text(run: &Run) -> Result<String, Fail> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-/// `lsof [tag]`: the network sockets of THIS lab's processes only (instance,
-/// shells, agents, codex-runs, stub); never a machine-wide list.
+/// `lsof [tag]`: list network sockets of this lab's processes only.
 pub fn cmd_lsof(args: &[String]) -> Res {
     let (run, _) = lab(args)?;
     print!("{}", lsof_text(&run)?);
     Ok(0)
 }
 
-/// `egress [tag] [minutes]`: what the lab's processes did on the network, and
-/// what the unified log kept of the jail's refusals.
+/// `egress [tag] [minutes]`: report network activity and sandbox refusals for this lab's processes.
 pub fn cmd_egress(args: &[String]) -> Res {
     let (run, a) = lab(args)?;
     print!(
@@ -814,9 +755,7 @@ pub fn cmd_egress(args: &[String]) -> Res {
     Ok(0)
 }
 
-/// The unified log's sandbox refusal reports: the kernel's (sender
-/// `Sandbox`) and sandboxd's, which on macOS 27 carries them (`Sandbox:
-/// codex(<pid>) deny(1) mach-lookup …`).
+/// Unified log predicate for sandbox refusal reports.
 pub const SANDBOX_LOG: &str =
     "sender == \"Sandbox\" OR subsystem == \"com.apple.sandbox.reporting\"";
 
@@ -837,8 +776,7 @@ pub fn sandbox_log(minutes: &str) -> String {
         .unwrap_or_default()
 }
 
-/// The `<what>` of a `Sandbox: <cmd>(<pid>) deny…` report whose pid is one of
-/// `pids`, as `<time> <what>`; `None` for any other line.
+/// Extract `<time> <what>` from a `Sandbox: <cmd>(<pid>) deny…` report matching `pids`.
 #[must_use]
 pub fn refusal_of(line: &str, pids: &[String]) -> Option<String> {
     let i = line.find("Sandbox: ")?;
@@ -848,7 +786,6 @@ pub fn refusal_of(line: &str, pids: &[String]) -> Option<String> {
     if rest[..open].contains(' ') || !pids.iter().any(|p| *p == rest[open + 1..open + close]) {
         return None;
     }
-    // `<date> <time>-<zone> … Sandbox: <what>` → `<time> <what>`
     let time = line
         .split_whitespace()
         .nth(1)
@@ -857,11 +794,7 @@ pub fn refusal_of(line: &str, pids: &[String]) -> Option<String> {
     Some(format!("{time} {rest}"))
 }
 
-/// The `egress` report: the witness's sockets, the external ones, the proxy's
-/// refusals and what the unified log kept of the jail's refusals naming a
-/// process of this lab. On macOS 27.0.1 the log kept mach-lookup,
-/// process-exec and system-info refusals and none of a refused connect or of
-/// a file refusal: no witness of network attempts, and its silence shows nothing.
+/// Format the `egress` report for `run` over the last `minutes`.
 #[must_use]
 pub fn egress_text(run: &Run, minutes: &str) -> String {
     let mut s = String::from(
@@ -912,8 +845,7 @@ pub fn egress_text(run: &Run, minutes: &str) -> String {
     s
 }
 
-/// The one-line `# …` header of a fixture, in the repo's shape, for this lab
-/// and the agent its tab runs.
+/// Format the one-line `# …` fixture header for this lab and the agent its tab runs.
 #[must_use]
 pub fn fixture_header(run: &Run, door: &Door<'_>, what: &str) -> String {
     let av = run
@@ -937,7 +869,6 @@ pub fn fixture_header(run: &Run, door: &Door<'_>, what: &str) -> String {
                 .unwrap_or_else(|_| "?".into())
         })
         .unwrap_or_else(|| "?".into());
-    // the grid as it is now (a `ctl resize` changes it), and the login the launcher gave the agent
     let size = door
         .out(&["dims"])
         .lines()
@@ -984,6 +915,7 @@ pub fn fixture_header(run: &Run, door: &Door<'_>, what: &str) -> String {
                  `base_url=http://127.0.0.1:<port>/v1` with `requires_openai_auth`"
             }
             _ => {
+                //127.0.0.1:<port>/v1`, `wire_api = \"responses\"`, a fake `env_key`"
                 "the lab provider `base_url=http://127.0.0.1:<port>/v1`, `wire_api = \"responses\"`, a fake `env_key`"
             }
         };
@@ -1022,8 +954,7 @@ pub fn cmd_header(args: &[String]) -> Res {
     Ok(0)
 }
 
-/// Write `$LAB_STATE/captures/claude-<version>-<name>.txt` (header, then the
-/// rows without trailing blank ones) and its PNG; their paths.
+/// Write `$LAB_STATE/captures/claude-<version>-<name>.txt` and its PNG; return their paths.
 ///
 /// # Errors
 /// The captures directory could not be made or written.
@@ -1062,12 +993,7 @@ pub fn write_fixture_rows_in(
     Ok((out, png(door, dir, &full)))
 }
 
-/// The frame as a PNG next to the fixtures, or `None`. The instance writes it
-/// into the socket dir's `images/`, which jailed code may write: a link renamed
-/// over it the moment it shows would make a plain copy carry what the link
-/// names (`~/.codex/auth.json`, say) into the fixtures. It is taken only from
-/// this lab's `images/`, read through no link, only as a regular file, and
-/// kept by a rename ([`crate::sys::put`]).
+/// Capture the current frame as a PNG next to the fixtures, or `None`.
 pub fn png(door: &Door<'_>, dir: &Path, full: &str) -> Option<std::path::PathBuf> {
     let name = format!("{full}.png");
     let r = door.out(&["image", &name]);
@@ -1083,8 +1009,7 @@ pub fn png(door: &Door<'_>, dir: &Path, full: &str) -> Option<std::path::PathBuf
         .map(|()| dst)
 }
 
-/// The screen as it is NOW, in the repo's fixture shape, as
-/// `$LAB_STATE/captures/<agent>-<version>-<name>.txt` (+ `.png`): the text's and the PNG's paths.
+/// Capture the screen into `$LAB_STATE/captures/<agent>-<version>-<name>.txt` (and `.png`).
 ///
 /// # Errors
 /// The screen could not be read, or the capture could not be written.
@@ -1098,7 +1023,6 @@ pub fn capture(
     if body.code != 0 {
         return Err(Fail::die("ctl text failed"));
     }
-    // the rows exactly as `ctl text` printed them (blank tail rows included, as the screen holds them)
     let full = format!("{}-{name}", run.fixture_prefix());
     let out = paths().state.join("captures").join(format!("{full}.txt"));
     fs::create_dir_all(paths().state.join("captures")).map_err(|e| Fail::die(e.to_string()))?;
@@ -1109,7 +1033,6 @@ pub fn capture(
     );
     fs::write(&out, &text).map_err(|e| Fail::die(e.to_string()))?;
     let png = png(&door, &paths().state.join("captures"), &full);
-    // PII guard: the fixture must not carry the owner's name, host or home
     let host = aterm_uds::spawnfd::command("/bin/hostname")
         .arg("-s")
         .output()
@@ -1133,9 +1056,6 @@ pub fn capture(
 }
 
 /// What of the owner's a capture's `text` carries, by the PII guard: the
-/// login name, the host's short name, and every home the lab guards (the
-/// account's, whatever `HOME` says, and the caller's `HOME` when it names
-/// another: [`crate::paths::Paths::guarded_homes`]).
 fn pii_found(p: &crate::paths::Paths, host: &str, text: &str) -> Vec<String> {
     [p.user.clone(), host.to_string()]
         .into_iter()
@@ -1170,20 +1090,7 @@ pub fn version_key(v: &str) -> Vec<u64> {
         .collect()
 }
 
-/// `twin [tag] <claude-bin>|--crashing [ver]`: present a build as a NEWER managed
-/// Claude Code the way atpkg lays one (the build at
-/// `store/claude/<build>/bin/claude` under the scratch HOME's package prefix,
-/// the `agents/claude` twin whose `exec '<path>' "$@"` line names it, and the
-/// activation notice renamed into place, which wakes the instance's live
-/// upgrade). The build is a clone made from OUTSIDE the jail (a build in the
-/// owner's store is denied to the jail). Every file is written by
-/// [`crate::sys::put`], which follows no link on its path: the package store
-/// sits under `home/Library`, which the instance makes and a jailed process
-/// can replace with a link (to the owner's `~/Library`, say, whose store and
-/// activation notice the owner's live aterm acts on). The build's `--version`
-/// runs only inside the jail, from a clone in the run directory (which the
-/// jail reads and cannot write). `--crashing` presents a stand-in that names
-/// its version and exits 1 at any other launch.
+/// `twin [tag] <claude-bin>|--crashing [ver]`: present a build as a newer managed Claude Code in the scratch package prefix.
 pub fn cmd_twin(args: &[String]) -> Res {
     let (run, a) = lab(args)?;
     twin(&run, &a)
@@ -1273,15 +1180,7 @@ pub fn twin(run: &Run, a: &[String]) -> Res {
     Ok(0)
 }
 
-/// The selftests' check of [`twin`]: from INSIDE the jail, `home/Library` is
-/// moved aside and made a link to a decoy directory (as a jailed process could
-/// make it one to the owner's `~/Library`: a link needs no access to its
-/// target); `twin --crashing` must refuse and the decoy stay empty. The decoy
-/// is in the run directory, which the jail cannot write, so only the lab could
-/// fill it. The link and the move are undone from inside the jail as well:
-/// the instance and the agent still run there and may write `home/`, so a link
-/// one of them put at `home/Library` between the lab's removal and its move
-/// would take the move, unjailed, into whatever it names. Whether it held.
+/// Selftest check that [`twin`] refuses a symlinked `home/Library` inside the jail.
 #[must_use]
 pub fn twin_link_refused(run: &Run) -> bool {
     let lib = run.w.join("home/Library");
@@ -1324,11 +1223,6 @@ mod tests {
     use super::*;
 
     /// THE CAPTURE'S PII GUARD LOOKS FOR EVERY HOME THE LAB GUARDS: under a
-    /// scratch `HOME` (a fake account home handed in through
-    /// [`crate::paths::Paths::resolve_with`]) a capture naming the account's
-    /// home or the scratch one is flagged, as is the login name. NEGATIVE
-    /// CONTROLS: a capture naming none is clean, and the facts of a run from
-    /// the account's own `HOME` do not take the scratch home for the owner's.
     #[test]
     fn the_capture_pii_guard_looks_for_the_account_home_and_a_scratch_home() {
         let top = aterm_tempfile::Builder::new()
@@ -1356,7 +1250,6 @@ mod tests {
             pii_found(&p, host, "lab-owner-name@lab-host-name"),
             ["lab-owner-name", "lab-host-name"]
         );
-        // NEGATIVE CONTROLS
         assert!(pii_found(&p, host, "cwd ~/x").is_empty());
         let mut own =
             crate::paths::Paths::resolve_with(Some(account.clone()), Some(account.into()));
@@ -1365,9 +1258,6 @@ mod tests {
     }
 
     /// `survey on|off [--reread]`: `on` sets the flag, `off` removes it, and
-    /// `--reread` after either waits for Claude Code's re-read. NEGATIVE
-    /// CONTROLS: no word, another word, `--reread` alone or first, and a word
-    /// past the flag are refused.
     #[test]
     fn survey_takes_on_or_off_and_reread_after_it() {
         let w = |s: &str| -> Vec<String> { s.split_whitespace().map(str::to_string).collect() };
@@ -1413,10 +1303,6 @@ mod tests {
     }
 
     /// `harness TAG approve=none` writes `approve = "none"`, a file aterm can
-    /// read; a TOML value is written as typed, and a word with a quote or a
-    /// backslash is escaped. NEGATIVE CONTROLS: the unquoted line (what the
-    /// verb wrote before) is no TOML, and a value that opens an array or a
-    /// string but is none is refused rather than quoted into a string.
     #[test]
     fn a_harness_value_is_written_as_toml() {
         let parses = |t: &str| aterm_toml::from_str::<aterm_toml::Value>(t).is_ok();
@@ -1436,7 +1322,6 @@ mod tests {
         for bad in ["[1,", "\"open", "{a = }"] {
             assert!(toml_value(bad).is_err(), "{bad}");
         }
-        // A second line is never written as typed: one key, its value a string.
         let two = toml_value("true\n[update]\nenabled = true").unwrap();
         assert_eq!(two, r#""true\u000A[update]\u000Aenabled = true""#);
         let t = harness_set(base, &[("approve".to_string(), two)]);
@@ -1473,10 +1358,6 @@ mod tests {
     }
 
     /// Both verbs write the one `--headers-file` through [`write_headers`],
-    /// and each leaves the other's entries: `headers` then `ratelimits` on
-    /// one file reads back the block and the flat entry. NEGATIVE CONTROL:
-    /// the second verb's entries written over the whole file, as each verb
-    /// wrote it before, read back without the first's.
     #[test]
     fn both_headers_verbs_writes_stand_in_the_one_file() {
         let d = std::fs::canonicalize(std::env::temp_dir())
@@ -1508,12 +1389,10 @@ mod tests {
     fn a_custom_mode_is_named_what_the_stub_serves_from_its_file() {
         assert_eq!(custom_mode_name("fable-noreset").unwrap(), "fable-noreset");
         let refused = |m: &str| custom_mode_name(m).unwrap_err().msg.unwrap_or_default();
-        // a built-in mode's name is answered by that mode, whatever its file holds
         for m in ["ok", "limit", "tool", "bg", "slow", "rate-limit"] {
             assert!(refused(m).contains("is a built-in mode"), "{m}");
         }
         assert!(refused("refresh").contains("token refresh"));
-        // a name the stub would read as another
         for m in ["a b", "custom:x", "limit:five_hour:1", "x/../y"] {
             assert!(refused(m).contains("letters, digits"), "{m}");
         }

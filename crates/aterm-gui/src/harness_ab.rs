@@ -1,45 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE A/B BOOK, BY WORD AND CAUSE (`docs/DESIGN-harness-autopilot-2026-10-15.md`
-//! §10.5.3 B): how a supervisable agent's time went under each Autopilot
-//! state, per local day, and how long its boxes and questions stood.
-//!
-//! **The split.** Each published agent word is a phase ([`AbPhase`]):
-//! `busy`, `prompt` (at a box), `question` (asked) and `idle` (at its
-//! prompt). The words are published whether or not the harness runs
-//! (`SessionTimeline::publish_agent`), so every arm is split alike. The arm
-//! ([`AbArm`]) is the Autopilot state the stretch ran under. Under Cruise
-//! and Land, the time at the prompt also has a cause ([`AbCause`]): under
-//! Land the work landed (the task's face `landed`; Cruise takes nothing as
-//! the end), or the harness was pausing after short turns. Off has no harness
-//! to say why.
-//!
-//! **Holds.** A run of a box (or of a question) ends at the first word that
-//! is not that one. Its length goes into a log₂ histogram of 250 ms
-//! buckets ([`bucket`]) for the arm in force at the run's START: an arm or
-//! a cause that moves inside a run splits the time shares, never the
-//! sample. The page says a median ([`median`]) as the bucket's geometric
-//! centre, `about 0.7 s` ([`about_words`]). No sample list, no allocation.
-//!
-//! **Seven days.** The totals and the histograms sit in a ring of
-//! [`DAYS`] local-day slots ([`AbDay`]). The book reads no clock: its
-//! instants are on the ledger clock (`turn_ledger::now_ms`, the one a
-//! published word's `changed_ms` is on), and the ledger instant of the next
-//! local midnight is kept ([`AbCalendar`]) — one wall read where the book is
-//! first fed and one where the wall moved under the ledger clock
-//! (`Wake::WallMoved`: a sleep stops the ledger clock). A stretch that
-//! crosses the midnight is split there. No "time saved" is derived (§6).
-//!
-//! **The ends** (§11.6.3, item 4): each day also counts the tasks that came
-//! down ([`AbEnds`]) — Land's landings, the one end under Autopilot Cruise /
-//! Autopilot Land (Cruise ends nothing, Land is never quiet) — and the time
-//! from Land to landed, one log₂ sample per landing whose Land start the book
-//! saw ([`AbBook::landed`]). That start is
-//! kept per session apart from the open stretch ([`AbTask`]), so a word that
-//! counts in no phase (a wall) drops nothing of it. Kept the way every other
-//! number of the book is: a seamless update loses the part since the last
-//! reading (§10.5.4).
+//! A/B telemetry book tracking supervised agent time and hold durations across Autopilot arms ([`AbBook`], [`AbWeek`]).
 
 use std::collections::HashMap;
 
@@ -48,57 +10,45 @@ use crate::harness_glass::Stamp;
 use crate::harness_screen::{duration_words, local_midnight_ms, share_words};
 use crate::native_ui::FACT_SEPARATOR;
 
-/// The local days the ring keeps: today and the seven before, so the day
-/// that just left the page's week is still there while the next one opens.
+/// Number of local days retained in the ring buffer.
 pub(crate) const DAYS: usize = 8;
 
-/// The local days the page sums: today and the six before.
+/// Number of local days summed on the Harness page (`today` and the six prior days).
 pub(crate) const WEEK_DAYS: i64 = 7;
 
-/// A hold histogram's buckets: 250 ms doubling, the last from about 36 h.
+/// Number of doubling histogram buckets (`250 ms` base).
 pub(crate) const BUCKETS: usize = 20;
 
-/// Under this many holds a side has no median: `not enough yet (2)`.
+/// Minimum sample count required to report a histogram median.
 pub(crate) const ENOUGH: u32 = 3;
 
 /// The first bucket's floor, and the doubling's unit.
 const BUCKET_MS: u64 = 250;
 
-/// One kind of hold's histogram: counts per [`bucket`].
+/// Hold duration histogram with counts per [`bucket`].
 pub(crate) type Hist = [u32; BUCKETS];
 
-/// Every arm's holds: `[Cruise, Land, Off][box, question]`. Unsupervised
-/// time is counted but its holds are compared with nothing, so none kept.
+/// Hold histograms indexed by `[Cruise, Land, Off][box, question]`.
 pub(crate) type Holds = [[Hist; 2]; 3];
 
-/// The ring of local days ([`AbBook`]): a day sits at its number modulo
-/// [`DAYS`].
+/// Ring buffer of local days ([`AbBook`]) indexed by `day % DAYS`.
 pub(crate) type AbRing = [Option<AbDay>; DAYS];
 
-/// Which arm of the A/B a stretch of an agent's time falls in (§4 item 5):
-/// the Autopilot state it ran under.
+/// Autopilot A/B arm under which a stretch of agent time ran.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum AbArm {
-    /// Cruise under this host's live claim: the harness kept the work moving.
+    /// Autopilot Cruise under this host's live claim.
     Cruise,
-    /// Land under this host's live claim: the harness was wrapping the work
-    /// up. A landing ends waiting, so this share is its own, never compared.
+    /// Autopilot Land under this host's live claim.
     Land,
-    /// Plain Claude Code, the baseline: no harness's hands on the session —
-    /// its Autopilot Off, the master switch off, or no host here — and no
-    /// supervisor's claim live on it.
+    /// Autopilot Off under this host's live claim (baseline).
     Off,
-    /// None of these: a mode the harness carries with no claim of this
-    /// host's (the agent not yet attached, another supervisor's claim), or
-    /// Off while a claim is still live. Counted, so no time is dropped; never
-    /// compared.
+    /// Unclaimed or unattached time.
     Unsupervised,
 }
 
 impl AbArm {
-    /// The arm of a session whose effective Autopilot is `view`, whose live
-    /// claim is this host's (`supervised`), and on which anyone's claim is
-    /// live (`claimed`; `supervised` implies it).
+    /// Determines the [`AbArm`] from `view`, `supervised`, and `claimed`.
     #[must_use]
     pub(crate) const fn of(view: AutopilotView, supervised: bool, claimed: bool) -> Self {
         match view {
@@ -116,7 +66,7 @@ impl AbArm {
         }
     }
 
-    /// Its place in [`AbDay::arms`].
+    /// Index of this arm in [`AbDay::arms`].
     #[must_use]
     pub(crate) const fn index(self) -> usize {
         match self {
@@ -127,8 +77,7 @@ impl AbArm {
         }
     }
 
-    /// Its place in [`Holds`]; `None` for unsupervised time, whose holds
-    /// are kept nowhere.
+    /// Index of this arm in [`Holds`], or `None` for [`Self::Unsupervised`].
     #[must_use]
     pub(crate) const fn holds(self) -> Option<usize> {
         match self {
@@ -140,23 +89,21 @@ impl AbArm {
     }
 }
 
-/// What an agent was doing in a stretch the A/B counts, from its published
-/// word. Every other word — a wall, a survey, `unknown`, `-` — counts in
-/// none.
+/// Published agent phase counted by the A/B book.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum AbPhase {
-    /// `busy`: a turn (or background work) runs.
+    /// `busy`: turn or background work running.
     Busy,
-    /// `prompt`: a permission box stands.
+    /// `prompt`: permission box standing.
     AtBox,
-    /// `question`: the agent asked the person something.
+    /// `question`: agent waiting on a user question.
     Asked,
-    /// `idle`: the agent sits at its prompt.
+    /// `idle`: agent sitting at its prompt.
     AtPrompt,
 }
 
 impl AbPhase {
-    /// The phase a published agent word (`AgentPublication::word`) counts as.
+    /// Maps a published agent word (`AgentPublication::word`) to an [`AbPhase`].
     #[must_use]
     pub(crate) fn of(word: &str) -> Option<Self> {
         match word {
@@ -168,8 +115,7 @@ impl AbPhase {
         }
     }
 
-    /// A hold's kind, where this phase holds the agent for the person: `0`
-    /// a box, `1` a question ([`Holds`]' inner index).
+    /// Hold kind index in [`Holds`] (`0` box, `1` question), if this phase is a hold.
     #[must_use]
     pub(crate) const fn held(self) -> Option<usize> {
         match self {
@@ -180,21 +126,17 @@ impl AbPhase {
     }
 }
 
-/// Why an agent under Cruise or Land sat at its prompt, where the harness
-/// can say.
+/// Reason an agent under Cruise or Land sat at its prompt.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum AbCause {
-    /// Under Land, the work landed: the task's face is `landed` (§9.4.2).
+    /// Work landed under Land (`face == landed`).
     Landed,
-    /// The harness's own pause after short turns (§10.5.1).
+    /// Harness pausing after consecutive short turns.
     Pausing,
 }
 
 impl AbCause {
-    /// The cause of a stretch in `phase` under `arm`, from the session's
-    /// glass: whether its face says landed, and whether a pause stands.
-    /// Cruise and Land at the prompt only; landed first and under Land alone
-    /// (a landed agent is not waiting on the pause, and Cruise never lands).
+    /// Determines the [`AbCause`] for `phase` under `arm` from the session's end and pause state.
     #[must_use]
     pub(crate) fn of(
         arm: AbArm,
@@ -215,26 +157,25 @@ impl AbCause {
     }
 }
 
-/// One arm's time, by phase, in milliseconds.
+/// Cumulative milliseconds spent in each phase for one arm.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub(crate) struct AbArmTotals {
-    /// Busy.
+    /// Milliseconds spent busy.
     pub(crate) busy_ms: u64,
-    /// At a box.
+    /// Milliseconds spent at a permission box.
     pub(crate) at_box_ms: u64,
-    /// At a question.
+    /// Milliseconds spent at a question.
     pub(crate) asked_ms: u64,
-    /// At its prompt.
+    /// Milliseconds spent at the prompt.
     pub(crate) at_prompt_ms: u64,
-    /// Of `at_prompt_ms`, after the work landed (Land alone; a day an older
-    /// build kept holds its finished time here).
+    /// Subset of `at_prompt_ms` after work landed under Land.
     pub(crate) landed_ms: u64,
-    /// Of `at_prompt_ms`, the harness pausing after short turns.
+    /// Subset of `at_prompt_ms` spent in short-turn pause.
     pub(crate) pausing_ms: u64,
 }
 
 impl AbArmTotals {
-    /// All the time this arm measured.
+    /// Total milliseconds measured across all phases.
     #[must_use]
     pub(crate) const fn measured_ms(self) -> u64 {
         self.busy_ms
@@ -243,14 +184,13 @@ impl AbArmTotals {
             .saturating_add(self.at_prompt_ms)
     }
 
-    /// The time held for the person: at a box or a question.
+    /// Milliseconds held waiting for the person (`at_box_ms + asked_ms`).
     #[must_use]
     pub(crate) const fn held_ms(self) -> u64 {
         self.at_box_ms.saturating_add(self.asked_ms)
     }
 
-    /// WORKING time: busy, or held for the person. An agent's idle after its
-    /// work is in no comparison of holds.
+    /// Working milliseconds (`busy_ms + held_ms`).
     #[must_use]
     pub(crate) const fn working_ms(self) -> u64 {
         self.busy_ms.saturating_add(self.held_ms())
@@ -282,22 +222,17 @@ impl AbArmTotals {
     }
 }
 
-/// THE ENDS ONE DAY COUNTED (§11.6.3, item 4): Land's landings
-/// ([`AbBook::landed`]), and the time from Land to landed as a hold's is
-/// kept, one sample per landing whose Land start the book saw, in
-/// [`bucket`]s. (An older build also counted Cruise's dones and Land's quiet
-/// ends; Autopilot Cruise / Land has neither, and their counts in an
-/// older day file are passed over.)
+/// Per-day task landing counts and Land-to-landed duration histogram.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub(crate) struct AbEnds {
-    /// Land's landings.
+    /// Number of tasks landed under Land.
     pub(crate) landed: u32,
-    /// The time from Land to landed.
+    /// Histogram of elapsed times from entering Land to landing.
     pub(crate) landing: Hist,
 }
 
 impl AbEnds {
-    /// Another day's ends added to these.
+    /// Adds `other`'s landing counts and histogram into `self`.
     pub(crate) fn plus(&mut self, other: &Self) {
         self.landed = self.landed.saturating_add(other.landed);
         for (count, add) in self.landing.iter_mut().zip(other.landing) {
@@ -306,24 +241,23 @@ impl AbEnds {
     }
 }
 
-/// One local day of the book: every arm's time, every arm's holds and the
-/// ends counted.
+/// Single local day of A/B totals, hold histograms, and task ends.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct AbDay {
-    /// The local day number (days since 1970-01-01, local time).
+    /// Local day number (days since `1970-01-01`).
     pub(crate) day: i64,
-    /// The unix ms the day's first counted stretch began.
+    /// Wall-clock timestamp (unix ms) when the day's first stretch began.
     pub(crate) first_unix_ms: i64,
-    /// Each arm's time, at its [`AbArm::index`].
+    /// Per-arm phase totals indexed by [`AbArm::index`].
     pub(crate) arms: [AbArmTotals; 4],
-    /// Each compared arm's holds ([`Holds`]).
+    /// Per-arm hold histograms ([`Holds`]).
     pub(crate) holds: Holds,
-    /// The tasks that came down this day ([`AbEnds`]).
+    /// Landed task counts and durations ([`AbEnds`]).
     pub(crate) ends: AbEnds,
 }
 
 impl AbDay {
-    /// An empty day.
+    /// Creates an empty [`AbDay`] for `day` starting at `first_unix_ms`.
     #[must_use]
     pub(crate) fn new(day: i64, first_unix_ms: i64) -> Self {
         Self {
@@ -335,8 +269,7 @@ impl AbDay {
         }
     }
 
-    /// Another day's counts added to this one's (two processes' books of
-    /// the same local day), the earlier first stretch kept.
+    /// Merges `other` into `self` for the same local day.
     pub(crate) fn plus(&mut self, other: &Self) {
         self.first_unix_ms = self.first_unix_ms.min(other.first_unix_ms);
         for (mine, theirs) in self.arms.iter_mut().zip(other.arms) {
@@ -356,9 +289,7 @@ impl AbDay {
     }
 }
 
-/// The bucket a hold of `ms` falls in: `⌊log₂(ms / 250)⌋`, the first
-/// taking everything under 500 ms and the last everything from 2¹⁹ × 250 ms
-/// (about 36 h) on.
+/// Histogram bucket index (`0..BUCKETS`) for duration `ms`.
 #[must_use]
 pub(crate) fn bucket(ms: u64) -> usize {
     let log = (ms / BUCKET_MS).max(1).ilog2();
@@ -370,8 +301,7 @@ fn centre_ms(bucket: usize) -> u64 {
     (BUCKET_MS << bucket.min(BUCKETS - 1)) * 1_414 / 1_000
 }
 
-/// A histogram's median and its count: the bucket holding the `⌈n/2⌉`-th
-/// sample, at its geometric centre; `None` with no sample.
+/// Geometric-center median (ms) and total sample count of `hist`.
 #[must_use]
 pub(crate) fn median(hist: &Hist) -> (Option<u64>, u32) {
     let n = hist
@@ -388,8 +318,7 @@ pub(crate) fn median(hist: &Hist) -> (Option<u64>, u32) {
     (None, n)
 }
 
-/// A median as the page says it: `about 0.4 s`, `about 23 s`, `about 2m`,
-/// `about 1.6h`, `about 25h` — a bucket's centre, so never more digits.
+/// Formats a median duration `ms` as `about …`.
 #[must_use]
 pub(crate) fn about_words(ms: u64) -> String {
     if ms < 9_950 {
@@ -418,13 +347,7 @@ fn day_of(unix_ms: i64, offset_at: fn(i64) -> Option<i64>) -> i64 {
         .div_euclid(86_400)
 }
 
-/// THE BOOK'S CALENDAR: one wall read and the ledger instant it was taken
-/// at, today's local day, its start on the ledger clock, and the next local
-/// midnight on both clocks. Read where the book is first fed and again where
-/// the wall moved under the ledger clock ([`AbBook::set_calendar`]);
-/// between, a midnight passed is found by comparing ledger instants, so the
-/// book reads no clock. One calendar serves every session: an instant before
-/// today's start is placed in its own day ([`Self::day_at`]), never today.
+/// Mapping between monotonic ledger timestamps and local calendar days.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct AbCalendar {
     /// The ledger instant of the read.
@@ -434,19 +357,17 @@ pub(crate) struct AbCalendar {
     /// The local day stretches are charged to.
     today: i64,
     /// Today's local midnight on the ledger clock (0 where it fell before
-    /// the ledger's epoch: every instant is then today's or later).
     today_start_ms: u64,
     /// The next local midnight, unix ms.
     next_midnight_unix_ms: i64,
     /// The same midnight on the ledger clock.
     next_midnight_ms: u64,
     /// The zone's offset east of UTC at a unix second
-    /// (`presence::local_offset_at`; `None`: UTC's days).
     offset_at: fn(i64) -> Option<i64>,
 }
 
 impl AbCalendar {
-    /// The calendar at ledger instant `ledger_ms`, whose wall is `unix_ms`.
+    /// Computes the [`AbCalendar`] at `ledger_ms` and wall time `unix_ms`.
     #[must_use]
     pub(crate) fn read(ledger_ms: u64, unix_ms: i64, offset_at: fn(i64) -> Option<i64>) -> Self {
         let today_start = local_midnight_ms(unix_ms, offset_at);
@@ -467,7 +388,7 @@ impl AbCalendar {
         }
     }
 
-    /// Today's local day number, as the calendar last rolled.
+    /// Current local day number.
     #[must_use]
     pub(crate) const fn today(&self) -> i64 {
         self.today
@@ -502,13 +423,6 @@ impl AbCalendar {
     }
 
     /// The local day ledger instant `at` falls on, and the ledger instant
-    /// that day ends. From today's start on, the calendar moves on to `at`
-    /// ([`Self::advance_to`]). An instant before today's start — a stretch
-    /// one session opened before the midnight another session's change
-    /// already moved the calendar past, or a word told late — is placed by
-    /// the zone at its own wall instant (zone math, no clock read), and its
-    /// day ends by today's start at the latest, so no piece of it is ever
-    /// charged to today.
     fn day_at(&mut self, at: u64) -> (i64, u64) {
         if at >= self.today_start_ms {
             self.advance_to(at);
@@ -527,10 +441,6 @@ impl AbCalendar {
 }
 
 /// The ring's slot for local day `day`, emptied where it held an earlier
-/// day; `first_unix_ms` is kept where it is the day's earliest. `None` for
-/// a day the ring no longer keeps: [`DAYS`] or more before `today`, or older
-/// than the later day its slot holds (a stretch open since before the ring's
-/// oldest day never pushes a kept day out).
 fn slot(ring: &mut AbRing, day: i64, first_unix_ms: i64, today: i64) -> Option<&mut AbDay> {
     if day <= today.saturating_sub(DAYS as i64) {
         return None;
@@ -548,9 +458,6 @@ fn slot(ring: &mut AbRing, day: i64, first_unix_ms: i64, today: i64) -> Option<&
 }
 
 /// Charge `from..to` (ledger ms) to `arm`, `phase` and `cause`, split at
-/// each local midnight it crosses: each piece in the day its own instant
-/// falls on ([`AbCalendar::day_at`]), however far another session's change
-/// has moved the calendar.
 fn charge(
     ring: &mut AbRing,
     calendar: &mut AbCalendar,
@@ -562,7 +469,6 @@ fn charge(
     let mut from = from;
     while from < to {
         let (day, ends) = calendar.day_at(from);
-        // A zone whose next midnight would not move on: the rest is the day's.
         let end = if ends > from { to.min(ends) } else { to };
         let first = calendar.unix_at(from);
         if let Some(kept) = slot(ring, day, first, calendar.today) {
@@ -573,7 +479,6 @@ fn charge(
 }
 
 /// A hold of kind `kind` that began at `start` under `arm` and ended at
-/// `end`: one sample, in the day it ended.
 fn sample(
     ring: &mut AbRing,
     calendar: &mut AbCalendar,
@@ -594,7 +499,6 @@ fn sample(
 }
 
 /// One session's open stretch: the phase, cause and arm in force since
-/// `since_ms`, and the hold it is part of.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct AbClock {
     phase: AbPhase,
@@ -602,73 +506,31 @@ struct AbClock {
     arm: AbArm,
     since_ms: u64,
     /// The box's or question's run this stretch is part of: when it began,
-    /// and the arm in force then (its sample's arm).
     hold: Option<(u64, AbArm)>,
 }
 
 impl AbClock {
     /// Whether this stretch is THE TASK'S WORK (§11.2.3, item 2): the
-    /// agent busy under any arm but [`AbArm::Off`]. Off's work is the
-    /// person's — no loop watched it (§11.2.4) — so a session set Off, worked
-    /// by hand to a done, then set to Cruise again, whose loop restates open
-    /// from unknown and reads that done at its first point, arms no end and
-    /// no Cruise count. A stretch with no claim of this host's under a
-    /// supervised word ([`AbArm::Unsupervised`]: the agent not yet attached,
-    /// a loop between its runs, a successor before its loop claims) is still
-    /// the harness's task, and counts.
     const fn is_task_work(&self) -> bool {
         matches!(self.phase, AbPhase::Busy) && !matches!(self.arm, AbArm::Off)
     }
 }
 
-/// ONE SESSION'S TASK as the book follows it (§11.2.3, item 2; §11.6.3,
-/// item 4), kept APART from its [`AbClock`]: `observe(…, None, …)` drops a
-/// session's clock at any word that counts in no phase — a wall's among
-/// them — and a landing's start and a task's work must outlive that. Made
-/// where the book first reads the session's mode ([`AbBook::follow_mode`]),
-/// charges its busy time or hears its task open, whichever comes first;
-/// only [`AbBook::retire`] drops it.
-///
-/// It follows the session's MODE — its Autopilot word, else the table's
-/// default — never its [`AbArm`]: the arm is Land only under this host's
-/// live claim, so a claim that lapses and is taken again (a supervisor's
-/// restart), or one first taken after a relaunch or a seamless update,
-/// would move the arm into Land with no word moved, and start the time from
-/// Land to landed where nobody said Land.
-///
-/// It also keeps THE WORK SINCE THE TASK OPENED (§11.2.3, item 2): the
-/// agent's busy time under any arm but Off ([`AbClock::is_task_work`])
-/// charged after [`Self::from_ms`], added wherever the
-/// book charges a busy piece ([`AbBook::observe`], and
-/// [`AbBook::set_calendar`]'s split, so a calendar read mid-stretch loses
-/// nothing), read by [`AbBook::worked`] and zeroed by
-/// [`AbBook::task_opened`] — the work floor of the one end
-/// (`harness_task::is_a_task_end`).
+/// Per-session task work and Land entry tracking for [`AbBook`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct AbTask {
     /// Whether the session's mode was Land when the book last read it;
-    /// `None` until the book first reads it ([`AbBook::follow_mode`]).
     lands: Option<bool>,
     /// The ledger instant the session's mode moved into Land, as the book
-    /// read it move: where the time from Land to landed starts. Carried
-    /// while the mode stays Land, whatever the claim does; cleared where it
-    /// leaves Land; spent by the landing it measures. `None` for a session
-    /// whose mode the book first read as Land (a landing begun before this
-    /// process, or before the book read it): its landing counts, with no
-    /// span.
     land_from: Option<u64>,
     /// The agent's busy time charged since [`Self::from_ms`], ledger ms.
     worked_ms: u64,
     /// The ledger instant the task opened ([`AbBook::task_opened`]); 0 for
-    /// a session no move from a known face has opened a task in yet (its
-    /// first task, a seamless update's successor, a cold restore): every
-    /// busy piece the book saw counts.
     from_ms: u64,
 }
 
 impl AbTask {
     /// The task of a session the book has just begun to follow: no mode
-    /// read, no work, open since the book first saw it.
     const fn new() -> Self {
         Self {
             lands: None,
@@ -679,7 +541,6 @@ impl AbTask {
     }
 
     /// The session's mode is Land (`lands`) or not, read at `at_ms`. A mode
-    /// first read as Land has no start.
     fn mode(&mut self, lands: bool, at_ms: u64) {
         self.land_from = match (self.lands, lands) {
             (Some(true), true) => self.land_from,
@@ -690,26 +551,19 @@ impl AbTask {
     }
 
     /// The session's mode is Land (`lands`) or not as CARRIED from before
-    /// this process ([`AbBook::carry_mode`]): read as a first read is, with
-    /// no start; the work is kept.
     const fn carried(&mut self, lands: bool) {
         self.lands = Some(lands);
         self.land_from = None;
     }
 
     /// A busy piece `from..to` was charged: its part after the task opened
-    /// is the task's work.
     fn worked(&mut self, from: u64, to: u64) {
         let ms = to.saturating_sub(from.max(self.from_ms));
         self.worked_ms = self.worked_ms.saturating_add(ms);
     }
 }
 
-/// THE A/B BOOK: each session's open stretch and its task, the ring of days
-/// and the calendar. Fed at each change ([`Self::observe`]), at a task's end
-/// ([`Self::landed`]) and at a session's end ([`Self::retire`]); read with the
-/// open stretches counted up to a given instant ([`Self::ring_at`],
-/// [`Self::week_at`]). Every instant is on the ledger clock.
+/// Per-process A/B telemetry book across sessions and local days.
 #[derive(Debug, Default)]
 pub(crate) struct AbBook {
     /// Session → its open stretch. A session counted in no phase has none.
@@ -723,20 +577,13 @@ pub(crate) struct AbBook {
 }
 
 impl AbBook {
-    /// Whether the calendar was read.
+    /// Whether a calendar has been initialized on this book.
     #[must_use]
     pub(crate) const fn has_calendar(&self) -> bool {
         self.calendar.is_some()
     }
 
-    /// THE CALENDAR READ: where the book is first fed, and again where the
-    /// wall moved under the ledger clock. Every open stretch is charged up
-    /// to the read's instant under the calendar it ran under, and goes on
-    /// from there under the new one — so a sleep that crossed a midnight
-    /// leaves the time before it in the day it was spent, and a clock set
-    /// back charges no negative (ledger instants only ever grow). A busy
-    /// piece charged here is its task's work too ([`AbTask`]), since the
-    /// stretch goes on from the read.
+    /// Updates the book's calendar, charging open stretches up to the new reading.
     pub(crate) fn set_calendar(&mut self, calendar: AbCalendar) {
         let at = calendar.ledger_ms;
         if let Some(old) = self.calendar.as_mut() {
@@ -762,15 +609,7 @@ impl AbBook {
         self.calendar = Some(calendar);
     }
 
-    /// Session `session` is in `phase` under `arm`, with `cause` (kept
-    /// only at the prompt under Cruise or Land: [`AbCause::of`]), from
-    /// `at_ms` on: the time since its last change goes to the arm, phase
-    /// and cause that were in force (never now's), split at each midnight,
-    /// and a new stretch opens. A box's or question's run that ends here is
-    /// one sample for the arm it began under; one that goes on (the same
-    /// phase, an arm or cause moved) keeps its start. An instant before the
-    /// open stretch's start counts nothing (never a negative). Nothing is
-    /// charged before the calendar is read.
+    /// Records that `session` is in `phase` under `arm` (with `cause`) at `at_ms`.
     pub(crate) fn observe(
         &mut self,
         session: u64,
@@ -787,8 +626,6 @@ impl AbBook {
         let mut hold = None;
         if let Some(open) = open {
             // The task's work: the busy piece's part after the task opened,
-            // kept apart from the clock, so the word that drops the clock (a
-            // wall's) keeps it; never under Off (`AbClock::is_task_work`).
             if open.is_task_work() {
                 self.tasks
                     .entry(session)
@@ -829,9 +666,7 @@ impl AbBook {
         }
     }
 
-    /// Session `session` ended at `at_ms`: its open stretch is settled (a
-    /// box standing at its end is one sample) and the book forgets it, its
-    /// task too.
+    /// Settles and removes `session`'s open stretch and task state at `at_ms`.
     pub(crate) fn retire(&mut self, session: u64, at_ms: u64) {
         if let Some(open) = self.clocks.get(&session).copied() {
             self.observe(session, None, None, open.arm, at_ms);
@@ -839,16 +674,7 @@ impl AbBook {
         self.tasks.remove(&session);
     }
 
-    /// SESSION `session`'S MODE IS LAND (`lands`: its Autopilot word, else
-    /// the table's default, is `land`) or not, read at `at_ms` (§11.6.3,
-    /// item 4; [`AbTask`]). Read where the session's arm may have moved
-    /// (`App::note_harness_arm`: every write of the word — a press, a `meta
-    /// set`, the timer's fire — the policy's default moved, a claim taken or
-    /// given back). Where the mode MOVED into Land since the book last read
-    /// it, the time from Land to landed starts here; read Land again, it is
-    /// carried, whatever the claim, the master switch or the host did
-    /// meanwhile; read anything else, it is dropped. A session whose mode
-    /// the book first reads as Land has no start.
+    /// Updates whether `session`'s effective mode is Land at `at_ms`.
     pub(crate) fn follow_mode(&mut self, session: u64, lands: bool, at_ms: u64) {
         self.tasks
             .entry(session)
@@ -856,11 +682,7 @@ impl AbBook {
             .mode(lands, at_ms);
     }
 
-    /// THE WORK SINCE SESSION `session`'S TASK OPENED, at `now_ms`
-    /// (§11.2.3, item 2): the busy time charged after the task opened, and a
-    /// busy stretch still open counted up to `now_ms` (its part after the
-    /// opening) — never Off's ([`AbClock::is_task_work`]). 0 for a session
-    /// the book never charged.
+    /// Busy milliseconds accumulated on `session`'s current task as of `now_ms`.
     #[must_use]
     pub(crate) fn worked(&self, session: u64, now_ms: u64) -> u64 {
         let Some(task) = self.tasks.get(&session) else {
@@ -876,15 +698,7 @@ impl AbBook {
         task.worked_ms.saturating_add(open)
     }
 
-    /// SESSION `session`'S TASK OPENED at `at_ms` (§11.2.3, item 2): its
-    /// face moved from a known face to open or landed
-    /// (`App::apply_task_face`; at an end, after the end has read the sum).
-    /// The work is zeroed and counts only what is charged after `at_ms` —
-    /// the CLIP: a reply whose busy time ran before the move that opened the
-    /// task (the done seed's withdrawal, `open` then `done` at one point)
-    /// counts none of it. Under Land the time from Land to landed starts
-    /// here again (§11.6.3, item 4), so the next landing of one Land
-    /// stretch is timed from its own task, not from the mode's move.
+    /// Resets `session`'s task work counter when its task reopens at `at_ms`.
     pub(crate) fn task_opened(&mut self, session: u64, at_ms: u64) {
         let task = self.tasks.entry(session).or_insert_with(AbTask::new);
         task.worked_ms = 0;
@@ -894,15 +708,7 @@ impl AbBook {
         }
     }
 
-    /// SESSION `session`'S TASK WORK CARRIED across a seamless update
-    /// (§11.2.3, items 2 and 8; the review's R12): `worked_ms`, the busy time
-    /// the outgoing process's book had charged since the task opened
-    /// (`SessionRecord::autopilot_end`, spent by `App::adopt_end_carry`), is
-    /// added to what this book has charged of the session since — a task 25
-    /// s into its work before the update needs 5 s more after it, as across
-    /// a loop's restart, which zeroes nothing either. Only where no task has
-    /// opened in this process yet ([`AbTask::from_ms`] 0): the carried work
-    /// is that task's, and a task opened here since is another.
+    /// Seeds `session`'s carried task work (`worked_ms`) across a seamless update.
     pub(crate) fn carry_work(&mut self, session: u64, worked_ms: u64) {
         let task = self.tasks.entry(session).or_insert_with(AbTask::new);
         if task.from_ms == 0 {
@@ -910,13 +716,7 @@ impl AbBook {
         }
     }
 
-    /// SESSION `session`'S MODE WAS CARRIED from before this process (a
-    /// relaunch's restored word, a seamless update's owed one, grafted onto a
-    /// shell the book may have read under the default first): it is read as
-    /// Land (`lands`) or not with NO move, as a first read is — a landing it
-    /// carries began before this process (§11.6.4 "Before this process").
-    /// The task's work since it opened (§11.2.3 item 2) is the task's, not
-    /// the mode's: a carried word moves no task, so its sum is kept.
+    /// Seeds whether `session`'s mode was carried as Land (`lands`).
     pub(crate) fn carry_mode(&mut self, session: u64, lands: bool) {
         self.tasks
             .entry(session)
@@ -924,12 +724,7 @@ impl AbBook {
             .carried(lands);
     }
 
-    /// SESSION `session`'S TASK LANDED at `at_ms` (§11.6.3, item 4): one
-    /// landing counted in the day `at_ms` falls on, as a hold's sample is
-    /// placed; and where the book read its Land start ([`AbTask`]), one
-    /// sample of the time from Land to landed, the start spent. The caller
-    /// decides that it is an end, once (`harness_task::is_an_end`, the
-    /// records' own rule). Nothing is counted before the calendar is read.
+    /// Records that `session`'s task landed at `at_ms`.
     pub(crate) fn landed(&mut self, session: u64, at_ms: u64) {
         let span = self
             .tasks
@@ -951,20 +746,19 @@ impl AbBook {
         }
     }
 
-    /// Where session `session`'s time from Land to landed starts, if the
-    /// book read it ([`AbTask::land_from`]).
+    /// Ledger timestamp when `session` entered Land for its current task, if known.
     #[cfg(test)]
     pub(crate) fn land_from(&self, session: u64) -> Option<u64> {
         self.tasks.get(&session).and_then(|task| task.land_from)
     }
 
-    /// How many sessions' tasks the book follows.
+    /// Number of sessions whose tasks the book currently tracks.
     #[cfg(test)]
     pub(crate) fn tasks(&self) -> usize {
         self.tasks.len()
     }
 
-    /// Session `session`'s open stretch: its phase, arm and cause.
+    /// Open stretch `(phase, arm, cause)` for `session`, if any.
     #[cfg(test)]
     pub(crate) fn stretch(&self, session: u64) -> Option<(AbPhase, AbArm, Option<AbCause>)> {
         self.clocks
@@ -972,15 +766,13 @@ impl AbBook {
             .map(|open| (open.phase, open.arm, open.cause))
     }
 
-    /// How many sessions have a stretch open.
+    /// Number of sessions with an open stretch.
     #[cfg(test)]
     pub(crate) fn open_stretches(&self) -> usize {
         self.clocks.len()
     }
 
-    /// The ring at `now_ms` — the settled days and every open stretch
-    /// charged up to `now_ms`, in a copy — and today's day there. `None`
-    /// before the calendar is read: nothing was counted.
+    /// Returns a snapshot of the day ring with open stretches charged up to `now_ms`.
     #[must_use]
     pub(crate) fn ring_at(&self, now_ms: u64) -> Option<(AbRing, i64)> {
         let mut calendar = self.calendar?;
@@ -998,11 +790,7 @@ impl AbBook {
         Some((ring, calendar.today()))
     }
 
-    /// The page's week at `now_ms`: today and the six days before, of this
-    /// book and of `others` (other processes' books, summed by day:
-    /// `harness_ab_store::read_others`), summed ([`AbWeek::of_days`]). With
-    /// no calendar read, the others' alone, against the newest of their
-    /// days.
+    /// Sums the 7-day [`AbWeek`] ending at `now_ms` across this book and `others`.
     #[must_use]
     pub(crate) fn week_at(&self, now_ms: u64, others: &[AbDay]) -> AbWeek {
         match self.ring_at(now_ms) {
@@ -1017,34 +805,25 @@ impl AbBook {
     }
 }
 
-/// THE PAGE'S WEEK: the days of the last [`WEEK_DAYS`] summed — every
-/// arm's time and holds, and the ends — when the earliest began, and the
-/// instant it was counted to.
+/// Seven-day summed A/B totals, hold histograms, and task ends for the Harness page.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub(crate) struct AbWeek {
-    /// Each arm's time, at its [`AbArm::index`].
+    /// Per-arm phase totals indexed by [`AbArm::index`].
     pub(crate) arms: [AbArmTotals; 4],
-    /// Each compared arm's holds.
+    /// Per-arm hold histograms.
     pub(crate) holds: Holds,
-    /// The tasks that came down ([`AbEnds`]).
+    /// Summed task landings ([`AbEnds`]).
     pub(crate) ends: AbEnds,
-    /// The earliest day summed and the unix ms its first stretch began;
-    /// `None`: nothing measured.
+    /// Earliest included `(day, first_unix_ms)`, or `None` when nothing was measured.
     pub(crate) first: Option<(i64, i64)>,
-    /// That instant's local clock and day, read where the page is built
-    /// (`App::harness_ab`); `None` where the zone cannot be read.
+    /// Local [`Stamp`] of the earliest included measurement.
     pub(crate) since: Option<Stamp>,
-    /// THE END CLOCK (§11.6.3, item 3): the publish's own wall, as the
-    /// local clock and day the numbers were counted to — stamped where the
-    /// page is built (`App::harness_ab`), never where the book was; `None`
-    /// where the zone cannot be read.
+    /// Local [`Stamp`] when the week summary was published.
     pub(crate) until: Option<Stamp>,
 }
 
 impl AbWeek {
-    /// The days among `days` within the week ending `today` (today and the
-    /// six before), summed. A day after `today` (a clock set back) is left
-    /// out: it is no part of this week yet.
+    /// Sums days within the [`WEEK_DAYS`] window ending on `today`.
     #[must_use]
     pub(crate) fn of_days<'a>(days: impl IntoIterator<Item = &'a AbDay>, today: i64) -> Self {
         let oldest = today.saturating_sub(WEEK_DAYS - 1);
@@ -1072,14 +851,13 @@ impl AbWeek {
         })
     }
 
-    /// An arm's time.
+    /// Phase totals for `arm`.
     #[must_use]
     pub(crate) const fn arm(&self, arm: AbArm) -> AbArmTotals {
         self.arms[arm.index()]
     }
 
-    /// An arm's holds of `kind` (0 boxes, 1 questions); none for
-    /// unsupervised time.
+    /// Hold histogram for `arm` and `kind` (`0` boxes, `1` questions).
     #[must_use]
     pub(crate) fn hist(&self, arm: AbArm, kind: usize) -> Hist {
         arm.holds()
@@ -1090,58 +868,48 @@ impl AbWeek {
     }
 }
 
-/// The working time each of Cruise and Off needs before the card leads
-/// with their shares ([`ab_lead`]): 10 minutes.
+/// Minimum working time (`10m`) required on both Cruise and Off before showing [`AbLead::Both`].
 pub(crate) const LEAD_FLOOR_MS: u64 = 10 * 60_000;
 
-/// What the lead's shares measure, said above them in plain type: the
-/// share of WORKING time (busy plus held) — two rows above At its prompt's
-/// share of ALL the arm's time, whose total is larger — held at a box or a
-/// question.
+/// Caption displayed above the Hero lead shares.
 pub(crate) const LEAD_CAPTION: &str = "Working time held at a box or a question";
 
-/// The lead where Cruise has working time and Off none.
+/// Note shown when Cruise has working time but Off has none.
 pub(crate) const LEAD_NOTE: &str = "Set a session Off to measure plain Claude Code beside Cruise";
 
-/// One side of the lead: its share of its working time held at a box or a
-/// question (`<1%`, drawn in Hero type) and that working time (`of 6h 10m
-/// on Cruise`, plain).
+/// Formatted hold share (`<1%`) and working-time denominator for one arm.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct LeadShare {
-    /// The share ([`share_words`]).
+    /// Formatted percentage share ([`share_words`]).
     pub(crate) share: String,
-    /// Of how much working time, and on which side ([`duration_words`]).
+    /// Formatted working-time denominator (`of 6h 10m on Cruise`).
     pub(crate) of: String,
 }
 
 impl LeadShare {
-    /// The side as one phrase: `<1% of 6h 10m on Cruise`.
+    /// Formats `<share> <of>` as a single phrase.
     #[must_use]
     pub(crate) fn words(&self) -> String {
         format!("{} {}", self.share, self.of)
     }
 }
 
-/// THE VERDICT UP FRONT (§11.6.1): what EFFECT OF EACH AUTOPILOT opens with.
+/// Lead comparison headline for the EFFECT OF EACH AUTOPILOT card.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum AbLead {
-    /// Cruise and Off each have [`LEAD_FLOOR_MS`] of working time: each
-    /// side's share held at a box or a question, beside the other.
+    /// Both Cruise and Off have at least [`LEAD_FLOOR_MS`] of working time.
     Both {
-        /// Cruise's side.
+        /// Cruise lead share.
         cruise: LeadShare,
-        /// Off's side.
+        /// Off lead share.
         off: LeadShare,
     },
-    /// Cruise has working time and Off none: [`LEAD_NOTE`].
+    /// Cruise has working time and Off has none ([`LEAD_NOTE`]).
     NoOff,
 }
 
 impl AbLead {
-    /// The whole lead as one line — how a screen reader says it and how a
-    /// page too narrow for the Hero shares draws it: `Working time held at a
-    /// box or a question: <1% of 6h 10m on Cruise · 14% of 25m off`, or the
-    /// note.
+    /// Formats the lead comparison as a single line.
     #[must_use]
     pub(crate) fn words(&self) -> String {
         match self {
@@ -1157,10 +925,7 @@ impl AbLead {
     }
 }
 
-/// THE LEAD'S RULE (§11.6.3, item 2): [`AbLead::Both`] where Cruise's and
-/// Off's working time (busy plus held, [`AbArmTotals::working_ms`]) are
-/// each at least [`LEAD_FLOOR_MS`]; [`AbLead::NoOff`] where Cruise has
-/// working time and Off none; else no lead. Land is never part of it. Pure.
+/// Computes the [`AbLead`] headline for `week`, if any.
 #[must_use]
 pub(crate) fn ab_lead(week: &AbWeek) -> Option<AbLead> {
     let (cruise, off) = (week.arm(AbArm::Cruise), week.arm(AbArm::Off));
@@ -1180,21 +945,7 @@ pub(crate) fn ab_lead(week: &AbWeek) -> Option<AbLead> {
     }
 }
 
-/// THE EFFECT OF EACH AUTOPILOT card (§10.5.1, §11.6.1): the boxes and
-/// questions (medians with n on each side), the time held as a share of
-/// working time — left out where the lead says it ([`ab_lead`]'s
-/// [`AbLead::Both`]) — the time at the prompt with its causes, Land on its
-/// own row, the ends ([`ends_words`]), the unsupervised time, and how long
-/// the book has measured, to when. Cruise is set beside Off only; Land
-/// never is, since a landing ends waiting by design. Never a "time saved":
-/// nothing measures one (§6). `today` is the publish's local day. Pure.
-///
-/// THE ROWS STAND WHERE NOTHING IS COUNTED YET (§11.6.7): the card sits
-/// above SUPERVISION's switches, so a row that appeared at a background
-/// event — the week's first landing, its first unsupervised minute — would
-/// move the switches under a still pointer. The Ends row reads `none yet`
-/// and the Unsupervised row `none` until they count something, as every
-/// other row says what it has not measured.
+/// Formats the key-value rows of the EFFECT OF EACH AUTOPILOT card for `week`.
 #[must_use]
 pub(crate) fn ab_rows(week: &AbWeek, today: i64) -> Vec<(String, String)> {
     let row = |label: &str, words: String| (label.to_string(), words);
@@ -1229,7 +980,6 @@ pub(crate) fn ab_rows(week: &AbWeek, today: i64) -> Vec<(String, String)> {
 }
 
 /// One side's median: `about 2m off`, or `not enough yet (2) off` under
-/// [`ENOUGH`].
 fn side_words(hist: &Hist, on: &str) -> String {
     match median(hist) {
         (Some(ms), n) if n >= ENOUGH => format!("{} {on}", about_words(ms)),
@@ -1238,7 +988,6 @@ fn side_words(hist: &Hist, on: &str) -> String {
 }
 
 /// The Boxes or Questions row: Cruise's median beside Off's, and how many
-/// each is of.
 fn holds_words(week: &AbWeek, kind: usize, noun: &str) -> String {
     let (cruise, off) = (week.hist(AbArm::Cruise, kind), week.hist(AbArm::Off, kind));
     let (cruise_n, off_n) = (median(&cruise).1, median(&off).1);
@@ -1259,7 +1008,6 @@ fn holds_words(week: &AbWeek, kind: usize, noun: &str) -> String {
 }
 
 /// The Held row: the time at a box or a question as a share of WORKING
-/// time (busy plus held), Cruise beside Off.
 fn held_words(week: &AbWeek) -> String {
     let (cruise, off) = (week.arm(AbArm::Cruise), week.arm(AbArm::Off));
     if cruise.working_ms() == 0 && off.working_ms() == 0 {
@@ -1280,9 +1028,6 @@ fn held_words(week: &AbWeek) -> String {
 }
 
 /// The At its prompt row: how much of Cruise's and Off's time the agent
-/// sat at its prompt, and for Cruise how much was the harness's pause — a
-/// share of the arm's whole time (Cruise never lands, so it has no landed
-/// share).
 fn prompt_words(week: &AbWeek) -> String {
     let mut parts = Vec::new();
     for (arm, label) in [(AbArm::Cruise, "Cruise"), (AbArm::Off, "Off")] {
@@ -1312,8 +1057,6 @@ fn prompt_words(week: &AbWeek) -> String {
 }
 
 /// Land's own row: held, at its prompt and landed as shares of its time
-/// (pausing where it paused), and its boxes' median. Never set beside
-/// Cruise.
 fn land_words(week: &AbWeek) -> String {
     let t = week.arm(AbArm::Land);
     let measured = t.measured_ms();
@@ -1342,12 +1085,7 @@ fn land_words(week: &AbWeek) -> String {
     words
 }
 
-/// THE ENDS ROW (§11.6.1): its two parts, each only where it counted
-/// anything — Land's landings, and the median time from Land to landed with
-/// its n (`Land to landed: about 6m (5)`; `Land to landed: not enough yet
-/// (2)` under [`ENOUGH`]) — `None` with nothing to count (the row then reads
-/// `none yet`, [`ab_rows`]). No Cruise or Off side: under Autopilot Cruise /
-/// Autopilot Land a landing is the one end.
+/// Formats the `Tasks landed` summary row for `ends`, if non-empty.
 #[must_use]
 pub(crate) fn ends_words(ends: &AbEnds) -> Option<String> {
     let mut parts = Vec::new();
@@ -1365,8 +1103,6 @@ pub(crate) fn ends_words(ends: &AbEnds) -> Option<String> {
 }
 
 /// The Measured row: how many local days the week holds, since when, and
-/// to when — the publish's clock ([`AbWeek::until`]): `7 days, since Mon
-/// 09:12, to 14:05`; `today, since 09:12, to 14:05`.
 fn measured_words(week: &AbWeek, today: i64) -> String {
     let Some((first_day, _)) = week.first else {
         return "nothing yet".to_string();

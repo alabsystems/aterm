@@ -2,30 +2,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! `art_rig` — the authoring rigs behind the parametric glyph rosters.
-//!
-//! ```text
-//! targo --unverified run -q -p aterm-effects --example art_rig -- dogs
-//! targo --unverified run -q -p aterm-effects --example art_rig -- pet target/pet-source
-//! ```
-//!
-//! Each rig is one parameterized drawing whose poses or breeds are tables of
-//! numbers, emitted as glyph-asset TOML in the cat roster's semantic schema
-//! (`art/glyphs/README.md`, `docs/CAT_ART.md`):
-//!
-//! * `dogs` — one head, ten breeds, written to `art/dogs/` (the typed-word dog
-//!   cameo; `gen_dog_glyphs` then regenerates the drawlist);
-//! * `pet` — the full-body cursor companion, 67 cat poses and their 67 dog
-//!   twins, written to the directory given (review there, then copy the
-//!   `pet_*.toml` into `art/pet/` and run `gen_pet_glyphs`), with
-//!   `sheet.toml` and `dog_sheet.toml`, every pose merged into one grid for a
-//!   single render; keep the sheets out of `art/pet/`, whose every `.toml` the
-//!   codegen reads as a pose. A pose that escapes the viewbox prints `OOB`.
-//!
-//! The committed TOMLs are this program's output byte for byte, so a change is
-//! made here and regenerated, never by hand. The arithmetic keeps the order the
-//! rigs were authored in, so every float rounds the same: each coordinate is
-//! rounded to one decimal on emission, and `pet` builds its paths as text and
-//! re-reads them to register a pose.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -51,8 +27,6 @@ fn write(path: &Path, text: &str) -> Result<(), String> {
     std::fs::write(path, text).map_err(|e| format!("{}: {e}", path.display()))
 }
 
-// Shared numerics
-
 /// One decimal, a trailing `.0` dropped (`12.0` is `12`, `-0.04` is `-0`).
 fn fmt(v: f64) -> String {
     let s = format!("{v:.1}");
@@ -68,8 +42,6 @@ fn radians(deg: f64) -> f64 {
 }
 
 /// The Euclidean norm the rigs were measured with: the two-term case of
-/// CPython 3.9's `math.hypot` (scaled by the larger magnitude, compensated
-/// summation from 1.0), so a joint normal lands on the same last bit.
 fn hypot(dx: f64, dy: f64) -> f64 {
     let v = [dx.abs(), dy.abs()];
     let max = v[0].max(v[1]);
@@ -88,7 +60,6 @@ fn hypot(dx: f64, dy: f64) -> f64 {
 }
 
 /// [`hypot`], with a zero length read as one (a degenerate segment has no
-/// direction to divide by).
 fn length_or_one(dx: f64, dy: f64) -> f64 {
     let ln = hypot(dx, dy);
     if ln == 0.0 { 1.0 } else { ln }
@@ -106,8 +77,6 @@ fn layer_block(out: &mut Vec<String>, role: &str, fill: &str, recolor: &str, pat
         format!("paths = [{}]", quoted.join(", ")),
     ]);
 }
-
-// The segment-list path model the dog and robot rigs share
 
 mod seg {
     use super::{fmt, radians};
@@ -213,11 +182,7 @@ mod seg {
     }
 }
 
-// dogs: one parameterized head rig, ten breeds
-
 mod dogs {
-    //! The breed heads for the typed-word dog cameo, in the cat-head schema.
-    //! A separate roster: dog heads never join the collectible `GLYPHS` table.
 
     use super::seg::{Path, Seg, apply, ellipse, emit, mouth_open, rotate, smile};
     use super::{fmt, layer_block, write};
@@ -225,21 +190,20 @@ mod dogs {
     const VB_W: f64 = 160.0;
     const VB_H: f64 = 136.0;
 
-    // The ink: the cat sheet's reference palette, dog-adjusted.
-    const INK: &str = "#2B2530"; // outline (recolored to context ink at bake time)
-    const COAT: &str = "#C8955C"; // recolorable coat reference
-    const MUZZLE: &str = "#F7E9DE"; // fixed cream muzzle
-    const EYE: &str = "#241F29"; // fixed dark eye (DogBaker swaps to adaptive eye ink)
-    const LIGHT: &str = "#FFFFFF"; // glints
-    const NOSE: &str = "#2A2029"; // the big dog nose
+    const INK: &str = "#2B2530";
+    const COAT: &str = "#C8955C";
+    const MUZZLE: &str = "#F7E9DE";
+    const EYE: &str = "#241F29";
+    const LIGHT: &str = "#FFFFFF";
+    const NOSE: &str = "#2A2029";
     const MOUTH: &str = "#2A2029";
-    const TONGUE: &str = "#E87E8E"; // fixed pink tongue
+    const TONGUE: &str = "#E87E8E";
     const INNER_EAR: &str = "#EFA3AE";
     const BLUSH: &str = "#F2A9B4";
-    const PATTERN: &str = "#8A6242"; // fixed mid-brown markings
-    const PALE: &str = "#F3EBDF"; // fixed pale markings (mask / blaze)
-    const SPOT: &str = "#332C38"; // dalmatian spots / dark points
-    const WHITE_COAT: &str = "#F2EEE6"; // the dalmatian's fixed coat
+    const PATTERN: &str = "#8A6242";
+    const PALE: &str = "#F3EBDF";
+    const SPOT: &str = "#332C38";
+    const WHITE_COAT: &str = "#F2EEE6";
 
     /// The outline margin grown around every coat part.
     const S: f64 = 4.0;
@@ -250,7 +214,6 @@ mod dogs {
     }
 
     /// An upright rounded-triangle ear: base centred at (cx, base_y), apex
-    /// above by h, half-width w; `tip_round` softens the apex.
     fn teardrop(cx: f64, base_y: f64, w: f64, h: f64, tip_round: f64) -> Path {
         let (ax, ay) = (cx, base_y - h);
         let r = w * tip_round;
@@ -350,7 +313,6 @@ mod dogs {
     }
 
     /// One breed's feature table; every field but the first five has the
-    /// default [`Breed::new`] gives it.
     struct Breed {
         id: &'static str,
         note: &'static str,
@@ -423,11 +385,9 @@ mod dogs {
             all.extend(b.extra_coat.map_or_else(Vec::new, |f| f(m)));
             all
         };
-        // The outline under everything: head and ears grown by S.
         let mut outline = ear_paths(S);
         outline.push(head_shape(S));
         h.layer("outline", INK, "fixed", &outline);
-        // The coat: ears, then the head over them (drop ears tuck behind the cheeks).
         let mut coat = ear_paths(0.0);
         coat.push(head_shape(0.0));
         h.layer("coat", b.coat.0, b.coat.1, &coat);
@@ -500,8 +460,6 @@ mod dogs {
         h
     }
 
-    // ── ear builders (the left ear; the rig mirrors) ───────────────────────
-
     fn drop_ear_at(m: f64, cx: f64, cy: f64, rx: f64, ry: f64, tilt: f64) -> Vec<Path> {
         vec![rotate(
             &ellipse(cx - m * 0.3, cy, rx + m, ry + m),
@@ -546,7 +504,6 @@ mod dogs {
     }
 
     /// The inner ear of a prick ear, both sides; it pivots where the default
-    /// prick ear does (`44 / 2` above its base) whatever its own height.
     fn inner_prick(cx: f64, base_y: f64, w: f64, hh: f64, tilt: f64) -> Vec<Path> {
         let left = rotate(
             &teardrop(cx, base_y, w, hh, 0.55),
@@ -566,8 +523,6 @@ mod dogs {
             ellipse(102.0, 26.0, 17.0 + m, 14.0 + m),
         ]
     }
-
-    // ── the breeds ─────────────────────────────────────────────────────────
 
     fn breeds() -> Vec<Breed> {
         vec![
@@ -733,24 +688,16 @@ mod dogs {
     }
 }
 
-// pet: the full-body cursor companion
-
 mod pet {
     pub use poses::main;
 
     mod rig {
-        //! Geometry primitives for the pet rig. Everything emits SVG path `d`
-        //! strings in the pet's own frame (y down), using only M / L / C / Z,
-        //! the subset `aterm_scene::vector::parse_path` accepts.
 
         use super::super::{fmt, length_or_one, radians};
 
         pub const VB_W: f64 = 244.0;
         pub const VB_H: f64 = 148.0;
-        /// Where the lowest INK of a planted pose lands in the viewbox. The
-        /// emitter puts the sprite's bottom edge on the text baseline, so this
-        /// is the cat's floor; six units of slack under it absorb the
-        /// outline's outward cap.
+        /// Where the lowest INK of a planted pose lands in the viewbox.
         pub const GROUND_INK: f64 = 143.0;
         /// The rig -> viewbox offset, sized by the widest pose (the leap).
         pub const OX: f64 = 34.0;
@@ -770,8 +717,7 @@ mod pet {
             nums(&ps.iter().flat_map(|&(x, y)| [x, y]).collect::<Vec<_>>())
         }
 
-        /// A closed ellipse as four cubics, rotated `rot` radians about its
-        /// centre.
+        /// A closed ellipse as four cubics, rotated `rot` radians about its centre.
         pub fn ellipse(cx: f64, cy: f64, rx: f64, ry: f64, rot: f64) -> String {
             let (c, s) = (rot.cos(), rot.sin());
             let t = |(x, y): Pt| {
@@ -805,9 +751,7 @@ mod pet {
             d.join(" ")
         }
 
-        /// A closed smooth shape through `spokes` = [(angle_deg, radius)],
-        /// angles clockwise from 12 o'clock in screen space (y down), as
-        /// Catmull-Rom through the spoke tips, one cubic per span.
+        /// A closed smooth shape through `spokes` = [(angle_deg, radius)], angles clockwise from 12 o'clock in screen space (y down), as Catmull-Rom through the spoke tips, one cubic per span.
         pub fn blob(cx: f64, cy: f64, spokes: &[Pt], rot: f64, sx: f64, sy: f64) -> String {
             let tips: Vec<Pt> = spokes
                 .iter()
@@ -877,7 +821,6 @@ mod pet {
         }
 
         /// The unit normal at each joint of a polyline, averaged across the
-        /// joint, with a miter compensation so a bend does not pinch.
         fn normals(ps: &[Pt]) -> Vec<Pt> {
             let n = ps.len();
             let segn: Vec<Pt> = ps
@@ -911,10 +854,7 @@ mod pet {
                 .collect()
         }
 
-        /// A closed tapered stroke around the polyline `ps`, with per-joint
-        /// `radii`. `smooth` runs the side rails through Catmull-Rom cubics
-        /// (tails, curled legs); otherwise the rails are straight `L` segments
-        /// (cheap, and right for the two-bone legs). Both ends are round caps.
+        /// A closed tapered stroke around the polyline `ps`, with per-joint `radii`.
         pub fn limb(ps: &[Pt], radii: &[f64], smooth: bool) -> String {
             let nrm = normals(ps);
             let rails = |sign: f64| -> Vec<Pt> {
@@ -939,8 +879,6 @@ mod pet {
             } else {
                 d.extend(left[1..].iter().map(|p| format!("L {}", pts(&[*p]))));
             }
-            // the round cap at the far end, from left[-1] to right[-1],
-            // bulging ALONG the limb's direction of travel
             d.push(cap(
                 left[last],
                 right[last],
@@ -966,14 +904,6 @@ mod pet {
         }
 
         /// A semicircular cap from rail point `a` to rail point `b`, bulging
-        /// `r` along the unit vector `out`.
-        ///
-        /// The outward direction is passed IN rather than derived from the
-        /// rail points: at a cap the two rails are exactly diametric, so their
-        /// bisector does not exist, and a 90-degree rotation of the offset (the
-        /// shape this rig shipped with first) points into the limb on this
-        /// winding, drawing the cap CONCAVE: a notched, hollow paw on every
-        /// limb, and a hole through the body on the short ones.
         fn cap(a: Pt, b: Pt, r: f64, out: Pt) -> String {
             let k = 1.3333 * r;
             let c1 = (a.0 + out.0 * k, a.1 + out.1 * k);
@@ -989,8 +919,7 @@ mod pet {
             (cx + x * c - y * s, cy + x * s + y * c)
         }
 
-        /// A forward-kinematic chain: `bones` = [(length, absolute_angle_deg)],
-        /// 0 degrees pointing DOWN the screen, positive rotating toward +x.
+        /// A forward-kinematic chain: `bones` = [(length, absolute_angle_deg)], 0 degrees pointing DOWN the screen, positive rotating toward +x.
         pub fn chain(root: Pt, bones: &[Pt]) -> Vec<Pt> {
             let mut out = vec![root];
             let (mut x, mut y) = root;
@@ -1005,17 +934,6 @@ mod pet {
     }
 
     mod model {
-        //! The pet: one rig, many poses, emitted as glyph-asset TOML.
-        //!
-        //! THE DOG SKIN. The pet dog is not a second rig: it is the SAME rig
-        //! (torso, limb chains, gait, registration) wearing a different head.
-        //! Owner, 2026-08-11: "make a dog like the walking cat … you can use
-        //! the same code". Every pose is emitted twice, and the species switch
-        //! changes only what separates a dog's head from a cat's at 16 px: the
-        //! ears hang instead of standing, the muzzle projects into a snout, the
-        //! nose is a big dark button on its end, and there are no whiskers. The
-        //! tabby goes with them: bars belong to a tabby, not a dog. Every branch
-        //! keys off `Pose::species`, which defaults to "cat".
 
         use super::super::{fmt, radians};
         use super::rig::{
@@ -1023,10 +941,9 @@ mod pet {
             rot_about,
         };
 
-        // ── ink ─────────────────────────────────────────────────────────────
-        pub const INK: &str = "#2B2530"; // outline
-        const COAT: &str = "#D9A273"; // recolorable coat
-        const PATTERN: &str = "#A9754C"; // tabby, fixed
+        pub const INK: &str = "#2B2530";
+        const COAT: &str = "#D9A273";
+        const PATTERN: &str = "#A9754C";
         const INNER_EAR: &str = "#EFA3AE";
         const MUZZLE: &str = "#F7E9DE";
         const EYE: &str = "#241F29";
@@ -1044,34 +961,25 @@ mod pet {
         /// A leg: (thigh_angle, shin_angle, thigh_len, shin_len).
         pub type Leg = (f64, f64, f64, f64);
 
-        /// The seated rump: a circle (cx, cy, r), or an ellipse (cx, cy, rx,
-        /// ry, rot_deg) for a pose that needs the hip mass ORIENTED (the peek's
-        /// rump swings away from the viewer, and a circle has no away to swing).
+        /// The seated rump: a circle (cx, cy, r), or an ellipse (cx, cy, rx, ry, rot_deg) for a pose that needs the hip mass ORIENTED (the peek's rump swings away from the viewer, and a circle has no away to swing).
         #[derive(Clone, Copy, Debug)]
         pub enum Haunch {
             Circle(f64, f64, f64),
             Ellipse(f64, f64, f64, f64, f64),
         }
 
-        /// One authored frame of the pet. Angles are degrees, 0 = straight
-        /// down, positive swings toward +x (the direction the cat faces).
+        /// One authored frame of the pet.
         #[derive(Clone, Debug)]
         pub struct Pose {
             pub ident: String,
             pub note: String,
-            /// Which animal wears this pose: "cat" reproduces the original rig;
-            /// "dog" swaps the head skin. Body, limbs, gait and registration
-            /// are shared, which is the whole point: the dog walks the cat's walk.
+            /// Which animal wears this pose: "cat" reproduces the original rig; "dog" swaps the head skin.
             pub species: &'static str,
-            // the torso, and its tilt
             pub bx: f64,
             pub by: f64,
             pub brx: f64,
             pub bry: f64,
             pub brot: f64,
-            // The head: the artist's proportions, a real cat's head on a real
-            // cat's body. Ship-size legibility is the BAKE's job (pet_baker's
-            // face LOD), not the rig's; a balloon head just breaks every pose.
             pub hx: f64,
             pub hy: f64,
             pub hr: f64,
@@ -1105,56 +1013,25 @@ mod pet {
             /// A sit puts the haunch on the ground instead.
             pub hide_hind: bool,
             pub haunch_at: Option<Haunch>,
-            /// Vertical registration. The emitter stands the sprite's BOTTOM
-            /// EDGE on the text row's baseline, so where a pose's lowest ink
-            /// sits inside the box is how high off the line the cat looks.
-            /// Every weight-bearing pose is planted on one ground line by
-            /// construction, and only the poses genuinely off the floor float,
-            /// by this authored amount (viewbox units under the paws).
+            /// Vertical registration.
             pub airborne: f64,
             /// The forelimb's attach point override.
             pub fl_root: Option<Pt>,
             /// The tail's attach point override.
             pub tail_root: Option<Pt>,
             /// Face-on mode: the whole drawing turns to address the viewer.
-            /// The 3/4 asymmetries (off-side eye smaller, far ear swept back,
-            /// one whisker fan shortened, the travel-direction torso arch)
-            /// collapse to left-right symmetry, and both forelegs paint IN
-            /// FRONT of the chest.
             pub front: bool,
-            /// The off-side whisker fan. It pokes past the far cheek onto AIR
-            /// and reads as whiskers; when a settled pose parks body mass
-            /// BEHIND the far cheek (the loaf's dome, the peek's shoulder) the
-            /// strokes paint ON the coat and read as scratches, so those poses
-            /// turn it off.
+            /// The off-side whisker fan.
             pub whisker_far: bool,
-            /// The NEAR whisker fan. Its roots sit ~3.6 units under the near
-            /// eye's lower edge, under a pixel apart at the 34 px art height,
-            /// so on a head that also tips the eye toward them the fan, the eye
-            /// and the head outline rasterise into ONE black clot: such a pose
-            /// spends the near fan.
+            /// The NEAR whisker fan.
             pub whisker_near: bool,
-            /// Where the tabby back bars ride: "torso" (the topline), or
-            /// "haunch" for a pose whose head covers the torso's top (the
-            /// peek's over-the-shoulder seat).
+            /// Where the tabby back bars ride: "torso" (the topline), or "haunch" for a pose whose head covers the torso's top (the peek's over-the-shoulder seat).
             pub bar_site: &'static str,
-            /// Head yaw: 0 = the rest read (a nearly frontal face, eye contact,
-            /// the point of a settled pose), 1 = the full 3/4 locomotion head:
-            /// the far eye foreshortened and pulled toward the leading edge,
-            /// the muzzle pushed into the travel direction, the near ear
-            /// rotated out while the far ear narrows behind, the whiskers
-            /// asymmetric, the skull egg-shaped toward the muzzle. The art faces
-            /// right and the engine mirrors the sprite (`flip_x`).
+            /// Head yaw: 0 = the rest read (a nearly frontal face, eye contact, the point of a settled pose), 1 = the full 3/4 locomotion head: the far eye foreshortened and pulled toward the leading edge, the muzzle pushed into the travel direction, the near ear rotated out while the far ear narrows behind, the whiskers asymmetric, the skull egg-shaped toward the muzzle.
             pub yaw: f64,
-            /// (dx, dy, sx, sy) for the FAR eye only. `pet_leap_descend` read
-            /// ONE-EYED at ship size: grown ~25% and nudged clear of the muzzle
-            /// boundary, the far eye clears the face LOD's compression
-            /// threshold. Its iris, pupil and catch-light follow it.
+            /// (dx, dy, sx, sy) for the FAR eye only.
             pub far_eye: Option<[f64; 4]>,
-            /// (cx, cy, rx, ry) of a coat blob painted with the coat, under the
-            /// face: `pet_bat`'s raised hind leg encloses a counter that would
-            /// show the terminal background THROUGH the animal. Authored in
-            /// pre-registration coordinates.
+            /// (cx, cy, rx, ry) of a coat blob painted with the coat, under the face: `pet_bat`'s raised hind leg encloses a counter that would show the terminal background THROUGH the animal.
             pub belly: Option<[f64; 4]>,
         }
 
@@ -1216,12 +1093,9 @@ mod pet {
             p.species == "dog"
         }
 
-        // ── attachment points, derived from the torso ───────────────────────
-
         /// The off-side pair sits back and up: an instant 3/4 read.
         const FAR_OFFSET: Pt = (-7.0, -2.0);
         /// Face-on, the off-side foreleg mirrors across the chest (24 units
-        /// apart: any closer and the two mitts' outlines fuse into one paw).
         const FRONT_OFFSET: Pt = (-24.0, 0.0);
 
         fn hip(p: &Pose, far: bool) -> Pt {
@@ -1275,7 +1149,6 @@ mod pet {
 
         fn torso_paths(p: &Pose) -> Part {
             let spokes: &[Pt] = if p.curl {
-                // a sleeping loaf: domed back, flat underside, the rump a touch fuller
                 &[
                     (0.0, 1.02),
                     (38.0, 1.04),
@@ -1289,10 +1162,6 @@ mod pet {
                     (324.0, 1.05),
                 ]
             } else if p.front {
-                // the face-on seated chest: an upright pear, left-right
-                // symmetric, wide over the hips and tapering under the chin; the
-                // lower spokes stay INSIDE the seated haunch so the forepaws can
-                // break the bottom silhouette instead of drowning in it
                 &[
                     (0.0, 0.96),
                     (38.0, 1.00),
@@ -1306,9 +1175,6 @@ mod pet {
                     (322.0, 1.00),
                 ]
             } else {
-                // a standing torso: the chest lifts toward the head, the belly
-                // tucks, the rump stays round; the arch is what stops it reading
-                // as a sausage
                 &[
                     (0.0, 1.00),
                     (42.0, 1.10),
@@ -1359,8 +1225,6 @@ mod pet {
 
         fn head_spokes(p: &Pose) -> Vec<Pt> {
             if p.front {
-                // face-on: symmetric about the vertical, full cheeks on both
-                // sides, the chin tapering dead centre
                 return vec![
                     (0.0, 0.96),
                     (36.0, 1.00),
@@ -1374,9 +1238,6 @@ mod pet {
                     (324.0, 1.00),
                 ];
             }
-            // At rest an even egg. Yawed, the skull leans into the travel
-            // direction: the muzzle-side spokes swell and the back of the head
-            // shaves down, so the silhouette itself says "turned".
             let rest = [
                 (0.0, 0.94),
                 (35.0, 0.99),
@@ -1412,22 +1273,20 @@ mod pet {
             let flat_scale = 1.0;
             let near = side > 0.0;
             let mut base_a = if p.front {
-                36.0 * side // face-on: the pair sits symmetric
+                // face-on: the pair sits symmetric
+                36.0 * side
             } else {
                 30.0 * side + if near { 14.0 } else { -6.0 }
             };
             if !p.front {
                 // yawed, the near ear rotates OUT with the turning skull and
-                // the far ear trails behind the crown
                 base_a += (if near { 4.0 } else { -6.0 }) * p.yaw;
             }
             let sweep = if near { p.ear_near } else { p.ear_far };
             let pin = p.ear_flat;
-            // the base sits on the skull, the tip pushed outward and (pinned) backward
             let th = radians(base_a - 90.0 + p.hrot);
             let bx = p.hx + th.cos() * (p.hr - 4.0) * p.hsx;
             let by = p.hy + th.sin() * (p.hr - 4.0) * p.hsy;
-            // the far ear foreshortens with the yaw: narrower, and a step shorter
             let ear_k = if p.front || near {
                 1.0
             } else {
@@ -1445,7 +1304,6 @@ mod pet {
             let tth = radians(tip_a - 90.0 + p.hrot);
             let tx = bx + tth.cos() * h;
             let ty = by + tth.sin() * h;
-            // the base corners, perpendicular to the base -> tip axis
             let (px, py) = (-tth.sin(), tth.cos());
             let a = (bx + px * w * 0.5, by + py * w * 0.5);
             let b = (bx - px * w * 0.5, by - py * w * 0.5);
@@ -1455,13 +1313,6 @@ mod pet {
         }
 
         /// The DOG ear: a long rounded lobe HANGING down the side of the skull.
-        ///
-        /// Same contract as [`ear_tri`] (a larger `inset` shrinks the lobe).
-        /// The cat's ear is a triangle whose tip pushes AWAY from the skull; a
-        /// dog's swings down past the jaw, the single cue that carries the
-        /// species at 16 px. The authored sweep still tilts the lobe and
-        /// `ear_flat` still pins it, but pinning a hanging ear presses it BACK
-        /// along the neck, so both sides rotate the same way.
         fn ear_drop(p: &Pose, side: f64, inset: f64) -> String {
             let flat_scale = 1.0;
             let near = side > 0.0;
@@ -1474,12 +1325,9 @@ mod pet {
                 base_a += (if near { 4.0 } else { -6.0 }) * p.yaw;
             }
             let sweep = if near { p.ear_near } else { p.ear_far };
-            // The lobe roots slightly deeper into the skull than the cat's
-            // triangle: a hanging ear is attached along a seam.
             let th = radians(base_a - 90.0 + p.hrot);
             let bx = p.hx + th.cos() * (p.hr - 6.0) * p.hsx;
             let by = p.hy + th.sin() * (p.hr - 6.0) * p.hsy;
-            // the far ear foreshortens with the yaw, exactly like the cat's
             let ear_k = if p.front || near {
                 1.0
             } else {
@@ -1493,8 +1341,6 @@ mod pet {
                 } else {
                     lerp(1.0, 0.90, p.yaw)
                 };
-            // DROOP is what makes it a dog: ~82 degrees of swing past the
-            // ear's root angle lands the tip below the jaw on both sides.
             let tip_a = base_a + side * 82.0 + sweep + p.ear_flat * 26.0;
             let tth = radians(tip_a - 90.0 + p.hrot);
             let (dx, dy) = (tth.cos(), tth.sin());
@@ -1505,8 +1351,6 @@ mod pet {
                     by + dy * h * along + py * w * across,
                 )
             };
-            // A teardrop hanging from its narrow end: the root is the width of
-            // the seam, the belly swells below it, and the tip rounds off.
             catmull_closed(
                 &[
                     at(0.0, 0.46),
@@ -1540,8 +1384,6 @@ mod pet {
         }
 
         /// The dog's inner lobe insets harder: on a hanging ear only the upper
-        /// inside shows, so a cat-sized inner shape would paint pink over the
-        /// whole flap and read as a tongue.
         fn inner_ear_paths(p: &Pose) -> Vec<String> {
             let inset = if dog(p) { 13.0 } else { 9.0 };
             vec![ear_shape(p, -1.0, inset), ear_shape(p, 1.0, inset)]
@@ -1553,7 +1395,6 @@ mod pet {
         }
 
         /// A dog's tail is a thicker, blunter club than a cat's tapering whip:
-        /// with the tabby rings gone its OUTLINE has to carry it.
         fn tail_paths(p: &Pose) -> Part {
             let ps = tail_pts(p);
             let t = p.tail_thick * if dog(p) { 1.18 } else { 1.0 };
@@ -1566,8 +1407,6 @@ mod pet {
             let mut specs = vec![(shoulder(p, !near), if near { p.fl_near } else { p.fl_far })];
             if near && p.front {
                 // face-on both forelegs stand IN FRONT of the chest, side by
-                // side: the far pass would bury one behind the torso, so it
-                // joins the near pass (off-side first, equal width)
                 specs.insert(0, (shoulder(p, true), p.fl_far));
             }
             if !p.hide_hind {
@@ -1577,7 +1416,6 @@ mod pet {
             for (root, spec) in specs {
                 let ps = leg_pts(root, spec);
                 let w = if near { 8.2 } else { 7.2 };
-                // the paw flares back out so the foot reads as a foot at 16 px
                 let radii = [w, w * 0.76, w * 0.94];
                 let grown: Vec<f64> = radii.iter().map(|r| r + S).collect();
                 coat.push(limb(&ps, &radii, false));
@@ -1585,8 +1423,6 @@ mod pet {
             }
             (coat, out)
         }
-
-        // ── face ────────────────────────────────────────────────────────────
 
         /// A face feature in head-local units (x right, y down, 1 = radius).
         fn face_anchor(p: &Pose, dx: f64, dy: f64) -> Pt {
@@ -1596,8 +1432,6 @@ mod pet {
         }
 
         /// The muzzle group's x offset: at rest a hint toward the near cheek;
-        /// yawed ~0.22 head radii into the travel direction (the strongest
-        /// "the face turned" cue); face-on dead centre.
         fn muzzle_dx(p: &Pose) -> f64 {
             if p.front {
                 0.0
@@ -1628,9 +1462,6 @@ mod pet {
         }
 
         /// How far the DOG's muzzle sits ahead of the cat's: modest on purpose.
-        /// The muzzle carries no outline of its own (a cream patch ON the
-        /// head's coat), so anything past the skull's edge reads as a sticker;
-        /// its SHAPE and the dark nose on its leading edge sell the snout.
         fn dog_snout_dx(p: &Pose) -> f64 {
             muzzle_dx(p)
                 + if p.front {
@@ -1641,7 +1472,6 @@ mod pet {
         }
 
         /// The snout: the cat's round muzzle drawn out along the facing axis,
-        /// shallower on top and longer ahead (90 degrees is the +x side).
         fn dog_muzzle_paths(p: &Pose) -> Vec<String> {
             if p.front {
                 let (cx, cy) = face_anchor(p, dog_snout_dx(p), 0.46);
@@ -1678,8 +1508,6 @@ mod pet {
         }
 
         /// The eye line rides the skull's equator. Yawed, both eyes slide
-        /// toward the leading edge (the far eye most of the way to the nose
-        /// bridge) and ride a step higher, keeping the nose out of the near eye.
         fn eye_centres(p: &Pose) -> (Pt, Pt) {
             if p.front {
                 return (face_anchor(p, 0.42, 0.04), face_anchor(p, -0.42, 0.04));
@@ -1693,8 +1521,6 @@ mod pet {
         }
 
         /// (near_r, far_rx, far_ry): the far eye foreshortens in WIDTH with
-        /// the yaw and only mildly in height: a turning eyeball loses azimuth,
-        /// not elevation.
         fn eye_scales(p: &Pose) -> (f64, f64, f64) {
             let rn = 8.6;
             if p.front {
@@ -1716,8 +1542,6 @@ mod pet {
                 "happy" => vec![arc_eye(near, rn), arc_eye(far, rfx)],
                 "squint" => vec![lid(near, rn, 0.55), lid(far, rfx, 0.55)],
                 "halflid" => vec![half(near, rn, 1.0), half(far, rfx, -1.0)],
-                // The NEAR eye is the closed one (an arc), the FAR eye stays
-                // open, and the iris, pupil and catch-light follow: far only.
                 "wink" => vec![
                     arc_eye(near, rn),
                     ellipse(far.0, far.1, rfx, rfy * 1.06, 0.0),
@@ -1733,8 +1557,6 @@ mod pet {
         }
 
         /// A closed sleeping lid: a shallow downward arc with body. Fat on
-        /// purpose: a thin lid rasterizes to NOTHING at terminal sizes, and a
-        /// closed eye that renders zero pixels reads as no face at all.
         fn lid((x, y): Pt, r: f64, thick: f64) -> String {
             let w = r * 1.15;
             let t = 4.8 * thick;
@@ -1750,14 +1572,11 @@ mod pet {
         }
 
         /// A half-lidded eye: a slim lens on the upper half of the aperture
-        /// (where a half-closed lid sits, clear of the whisker roots) whose
-        /// OUTER corner (`sgn`, +1 near / -1 far) droops a step lower: drowsy
-        /// contentment, not the squint's wince.
         fn half((x, y): Pt, r: f64, sgn: f64) -> String {
             let yy = y - r * 0.14;
             let w = r * 0.90;
-            let li = r * if sgn < 0.0 { 0.16 } else { 0.0 }; // left corner drop
-            let ri = r * if sgn > 0.0 { 0.16 } else { 0.0 }; // right corner drop
+            let li = r * if sgn < 0.0 { 0.16 } else { 0.0 };
+            let ri = r * if sgn > 0.0 { 0.16 } else { 0.0 };
             catmull_closed(
                 &[
                     (x - w, yy + li),
@@ -1898,10 +1717,6 @@ mod pet {
 
         fn nose_paths(p: &Pose) -> Vec<String> {
             if dog(p) {
-                // A dark button on the END of the snout, rounded and oversized:
-                // the only dark mass on the face besides the eyes, so it is
-                // what survives the face LOD. BELOW THE EYE LINE, ALWAYS: it is
-                // the one face layer painted after the eyes.
                 let (cx, cy) = if p.front {
                     face_anchor(p, dog_snout_dx(p), 0.56)
                 } else {
@@ -1928,16 +1743,9 @@ mod pet {
             }
             let mut out = Vec::new();
             if p.mouth == "yawn" {
-                // The gape is painted TWICE: here in the nose layer as well as
-                // in `mouth_paths`. The bake culls the `mouth` role below
-                // MOUTH_DETAIL_MIN_H (40 px) and the ship tile is 34 px, so a
-                // yawn authored only as a mouth has no mouth at the one size
-                // that matters; at 40 px and up the mouth paints exactly over it.
                 let (mcx, mcy) = face_anchor(p, muzzle_dx(p), 0.38);
                 out.push(gape(mcx, mcy));
             }
-            // the nose slides DOWN the muzzle as the head yaws, keeping the
-            // pink triangle off the near eye's lower lid
             let (cx, cy) = face_anchor(
                 p,
                 muzzle_dx(p),
@@ -1951,18 +1759,12 @@ mod pet {
         }
 
         fn mouth_paths(p: &Pose) -> Vec<String> {
-            // anchored at the MUZZLE CENTRE, not its top edge: a smile hung off
-            // the nose line pulls the corners up and reads as a grimace. The
-            // dog's hangs off its own nose (0.62 lands the omega's top stroke
-            // on the nose's lower edge, its lowest ink inside the chin).
             let (cx, cy) = if dog(p) {
                 face_anchor(p, dog_nose_dx(p), 0.62)
             } else {
                 face_anchor(p, muzzle_dx(p), 0.38)
             };
             match p.mouth {
-                // No mouth at all, for the sleeping loaf: under ^ ^ eyes any
-                // dark stroke here adds back the bar that made the face read awake.
                 "none" => Vec::new(),
                 "open" => vec![blob0(
                     cx,
@@ -1977,8 +1779,6 @@ mod pet {
                     ],
                 )],
                 "yawn" => vec![gape(cx, cy)],
-                // The landing's grunt: a small round "oof", ~60% of the open
-                // mouth, which keeps a readable muzzle at ship size.
                 "oof" => vec![blob0(
                     cx,
                     cy + 7.4,
@@ -1996,7 +1796,6 @@ mod pet {
                     &[1.6, 1.6],
                     false,
                 )],
-                // the kawaii omega: two filled strokes hanging off the nose
                 _ => [-1.0, 1.0]
                     .into_iter()
                     .map(|sgn: f64| {
@@ -2015,23 +1814,16 @@ mod pet {
         }
 
         /// Dogs have whiskers in life and never in drawings of dogs: the fan is
-        /// a CAT cue, and leaving it on undoes the ears and the snout.
         fn whisker_paths(p: &Pose) -> Vec<String> {
             if dog(p) {
                 return Vec::new();
             }
-            // (side, base_dx, scale, droot) per fan; (dy, sweep, ln0) per row
             let (fans, rows): ([Fan; 2], [Pt3; 2]) = if p.front {
-                // face-on: rooted at the cheek edges BELOW the huge eyes and
-                // swept down-and-out
                 (
                     [(1.0, 0.68, 0.82, 0.0), (-1.0, -0.68, 0.82, 0.0)],
                     [(0.14, 4.0, 26.0), (0.26, 16.0, 27.0)],
                 )
             } else {
-                // yawed, the near fan slides forward with the muzzle and drops
-                // below the lifted eye; the far fan shortens and migrates in
-                // toward the nose bridge, mostly hidden by the muzzle
                 (
                     [
                         (1.0, lerp(0.42, 0.50, p.yaw), 1.0, 0.08 * p.yaw),
@@ -2078,7 +1870,6 @@ mod pet {
         type Fan = (f64, f64, f64, f64);
 
         /// Tucked just under the eyes, not beside the muzzle: the kawaii
-        /// placement.
         fn blush_paths(p: &Pose) -> Vec<String> {
             if !p.blush {
                 return Vec::new();
@@ -2100,22 +1891,17 @@ mod pet {
         }
 
         /// The tabby: three back bars and two tail rings, riding the torso. A
-        /// CAT marking: the dog wears a plain coat.
         fn pattern_paths(p: &Pose) -> Vec<String> {
             if dog(p) {
                 return Vec::new();
             }
             let mut out = Vec::new();
             if p.front {
-                // face-on the back bars would paint across the face, so the
-                // tabby wears its classic forehead M between the ears instead
                 for (i, t) in [-0.42, 0.0, 0.42].into_iter().enumerate() {
                     let (x, y) = face_anchor(p, t * 0.60, -0.64);
                     out.push(ellipse(x, y, 3.4 - (i as f64 - 1.0).abs() * 0.3, 7.0, 0.0));
                 }
             } else if let (true, Some(haunch)) = (p.bar_site == "haunch", p.haunch_at) {
-                // the over-the-shoulder seat: the head parks on the torso's top,
-                // so the bars ride the haunch's crown
                 let (cx, cy, hrx, hry, hrot_deg) = match haunch {
                     Haunch::Ellipse(cx, cy, rx, ry, rot) => (cx, cy, rx, ry, rot),
                     Haunch::Circle(cx, cy, r) => (cx, cy, r, r, 0.0),
@@ -2153,8 +1939,6 @@ mod pet {
             }
             out
         }
-
-        // ── fit ─────────────────────────────────────────────────────────────
 
         /// Every coordinate of a path string, as (xs, ys).
         fn coords(d: &str) -> (Vec<f64>, Vec<f64>) {
@@ -2194,8 +1978,6 @@ mod pet {
             b
         }
 
-        // ── assembly ────────────────────────────────────────────────────────
-
         /// The painter-ordered layers of one pose, registered into the viewbox.
         pub fn build(p: &Pose) -> Vec<Layer> {
             let ((far_coat, far_out), (near_coat, near_out)) = if p.hide_legs {
@@ -2225,7 +2007,6 @@ mod pet {
             .concat();
             if let Some([bx, by, brx, bry]) = p.belly {
                 // LAST in the coat list, and coat-only: it fills a counter the
-                // limbs already enclose, so an outline would draw a seam.
                 coat.push(ellipse(bx, by, brx, bry, 0.0));
             }
             let layers: Vec<Layer> = vec![
@@ -2256,10 +2037,6 @@ mod pet {
         }
 
         /// The pose's (dx, dy) into the viewbox. `dy` PLANTS the pose: the
-        /// lowest ink lands on [`GROUND_INK`], less the authored `airborne`
-        /// clearance, by measurement rather than by trusting the limb angles,
-        /// so the whole roster stands on one floor. `dx` is one constant for
-        /// every pose: a per-pose fit would slide the cat between gait frames.
         fn registration(raw: &[Layer], p: &Pose) -> Pt {
             (OX, GROUND_INK - p.airborne - bbox(raw)[3])
         }
@@ -2316,7 +2093,6 @@ mod pet {
                 ),
                 "anchor = { eye_y = 0.34, center_x = 0.5, word_top = 1.0 }".to_string(),
             ];
-            // painter order stays global: re-sort by the canonical role order
             let canon: Vec<&str> = build(&poses[0]).iter().map(|l| l.0).collect();
             let mut keyed: Vec<usize> = (0..order.len()).collect();
             keyed.sort_by_key(|&k| canon.iter().position(|r| *r == order[k].0).unwrap_or(99));
@@ -2345,9 +2121,6 @@ mod pet {
     }
 
     mod poses {
-        //! The pose sheet: every authored frame of the pet kitty. Every frame
-        //! shares one viewbox and one anchor set, so the renderer may swap any
-        //! frame for any other in place.
 
         use super::model::{Haunch, Leg, Pose, bbox, build, emit, sheet};
         use super::rig::{VB_H, VB_W};
@@ -2387,10 +2160,6 @@ mod pet {
             }
         }
 
-        // ── walk: a diagonal trot, one full cycle in four frames ────────────
-        // Reach forward with a nearly straight leg; trail back with a bent
-        // one: the asymmetry is what makes a cycle read as walking rather than
-        // scissoring.
         const REACH: Leg = leg(26.0, 12.0);
         const PASS_F: Leg = leg(6.0, -14.0);
         const TRAIL: Leg = leg(-24.0, -6.0);
@@ -2450,7 +2219,6 @@ mod pet {
             ]
         }
 
-        // ── run: a bounding gallop, ears back, tail streaming ───────────────
         fn run() -> Vec<Pose> {
             vec![
                 Pose {
@@ -2476,19 +2244,6 @@ mod pet {
                         "Run, gather: the back rounds up and every paw swings under.",
                     )
                 },
-                // The two suspension frames of the gallop are the moments no
-                // paw is on the floor. The brain adds no lift during a run
-                // (only a pounce arcs), so the clearance lives in the art, or
-                // the gallop reads as a shuffle. Measured: the motion doc's
-                // RUN_BOB 0.05*ramp rounds to 0 px at cell_h 16 for every ramp
-                // under 0.67 (`the_gaits_vertical_survives_the_pixel_grid_at_
-                // every_cell_height`), while the art's clearance is sub-pixel
-                // and anti-aliased at every size because `registration` bakes
-                // it into the geometry; the brain keeps `lift == 0.0` on a run.
-                // 7 -> 11 and 8 -> 13 (2026-08-27): 1.29 / 1.47 px at cell_h 16
-                // read as a shuffle beside the contact frames; now 2.02 / 2.39
-                // px at 16, 2.53 / 2.99 at the 20 px ship cell, 4.04 / 4.78 at
-                // 32, still far past PLANT_TOL so the AIRBORNE assertion holds.
                 Pose {
                     yaw: 1.0,
                     airborne: 11.0,
@@ -2560,14 +2315,7 @@ mod pet {
             ]
         }
 
-        // ── sit / purr / groom: the settled family ──────────────────────────
-
         /// An upright chest over a seated haunch: the hind legs fold away and
-        /// the rump is the ground contact, the forelegs dropping straight down
-        /// the front edge. The head carries a HINT of the chibi un-hunch (hx
-        /// 134, not the over-corrected 126 of a parade-ground seat). The tail
-        /// roots at the haunch's front-bottom so the sweep clears the rump and
-        /// reads as curled around the forepaws.
         fn sit_base(p: Pose) -> Pose {
             Pose {
                 bx: 104.0,
@@ -2633,19 +2381,7 @@ mod pet {
             ]
         }
 
-        // ── sleep: a curled loaf that breathes ──────────────────────────────
-        //
-        // The face is `happy` + `none`, NOT `closed` + `flat` (owner, from a
-        // ship-size screenshot: "the eyes still look open"). A fat downward lid
-        // at 24-36 px collapses into a solid dark bar tilted at the outer
-        // corner, the silhouette of a narrowed, scowling OPEN eye, and the flat
-        // mouth put a second bar under it. The upward ^ arc carries the same
-        // ink in a shape no open eye has.
-
         /// Both whisker fans are spent here: the FAR fan lands on the curled
-        /// torso's dome (strokes on coat read as scratches), and the NEAR fan
-        /// roots under an eye this pose tips toward it (eye, fan and outline
-        /// clot into a black smear).
         fn sleep_base(p: Pose) -> Pose {
             Pose {
                 curl: true,
@@ -2691,7 +2427,6 @@ mod pet {
             ]
         }
 
-        // ── the reactive family ─────────────────────────────────────────────
         fn reactive() -> Vec<Pose> {
             vec![
                 Pose {
@@ -2738,8 +2473,6 @@ mod pet {
                         "Pounce, flight: stretched along the arc, front paws leading.",
                     )
                 },
-                // The "oof" mouth: the full open blob smeared the muzzle black
-                // at ship size.
                 Pose {
                     yaw: 1.0,
                     by: 72.0,
@@ -2819,8 +2552,6 @@ mod pet {
                     fl_near: leg4(112.0, 116.0, 22.0, 18.0),
                     fl_far: leg4(46.0, 26.0, 21.0, 17.0),
                     tail: [92.0, 108.0, 142.0, 184.0],
-                    // fills the counter the reared hind leg's loop encloses
-                    // (see `Pose::belly`); pre-registration coordinates
                     belly: Some([139.0, 108.6, 11.5, 13.5]),
                     ..sat(
                         "pet_bat",
@@ -2870,12 +2601,7 @@ mod pet {
             ]
         }
 
-        // ── the direct-address pair: the cat finally looks AT you ───────────
-
         /// The bell: a compact seated silhouette whose base is about one
-        /// head-width across, the head overlapping the chest by a third: the
-        /// classic face-on cat, not a totem pole. Two neat mitts break the
-        /// bottom edge and the tail sweeps out beside them, tip flicked up.
         fn sit_front(ident: &str, note: &str) -> Pose {
             Pose {
                 front: true,
@@ -2901,16 +2627,6 @@ mod pet {
         }
 
         /// The over-the-shoulder seat, built on body/head OPPOSITION: the body
-        /// faces AWAY while the head comes BACK. The hip mass is a big ellipse
-        /// rotated away (rump left-and-down), the chest rises to a shoulder
-        /// up-right of it, and the head parks BEHIND and left of that shoulder,
-        /// overlapping it: one contour forward, one backward, the twist cue.
-        /// Seated facing away only ONE foreleg edge shows (the doubled pair
-        /// reads as a notched two-toed mess from behind), dropping from the
-        /// SHOULDER; the bars ride the haunch's crown and the off-side whiskers
-        /// (shoulder coat behind them, not air) stay hidden; the tail emerges
-        /// BELOW the rump's curve, lying forward along the ground, so the
-        /// outline separates tail from rump.
         fn shoulder_seat(ident: &str, note: &str) -> Pose {
             Pose {
                 hide_hind: true,
@@ -2943,11 +2659,6 @@ mod pet {
                     "pet_sit_front",
                     "Sit, face-on: square to the viewer, tail swept round beside the mitts.",
                 ),
-                // THE FACE-ON BLINK. `pet_sit_front` is the most-worn awake
-                // frame in the roster (measured over 368 506 frames of five
-                // session shapes: 9.0 % of everything, 88.8 % of settled
-                // frames) and had no beat of its own. ONE field departs from
-                // the pose above, so nothing in the silhouette moves but the lids.
                 Pose {
                     eyes: "closed",
                     ..sit_front(
@@ -2955,8 +2666,6 @@ mod pet {
                         "Sit, face-on, blink: eye contact, both lids down.",
                     )
                 },
-                // The yaw deepens to 0.8: a genuine 3/4, not the near-frontal
-                // half turn that read as "sitting sideways".
                 Pose {
                     hx: 116.0,
                     hy: 40.0,
@@ -2969,17 +2678,8 @@ mod pet {
             ]
         }
 
-        // ── flight: the two halves of every arc the brain throws ────────────
-        // Unlike `pet_leap` (planted art, arced by the brain's lift), these are
-        // true mid-air frames: the rise serves flight u < 0.25, the descent
-        // u > 0.6, and both carry authored clearance.
         fn flight() -> Vec<Pose> {
             vec![
-                // The head sits ON the climbing chest, overlapping the torso's
-                // leading end: a connected neck, not a balloon on a string. The
-                // torso climbs at 30 degrees (at 22 the centre of mass read as
-                // level flight with a lifted chin); the hind pair is swept a
-                // step back so it does not notch the belly line.
                 Pose {
                     yaw: 1.0,
                     airborne: 6.0,
@@ -3004,11 +2704,6 @@ mod pet {
                         "Flight, rise: hind legs still driving, forepaws tucked, nose up.",
                     )
                 },
-                // The mirror half: the head down-forward of the dropping chest,
-                // the forelegs at full reach for the floor, rump and tail the
-                // highest things in the frame. Two more degrees of nose-down
-                // pitch and the pupils aimed at the landing spot; the far eye
-                // grown clear of the muzzle (see `Pose::far_eye`).
                 Pose {
                     yaw: 1.0,
                     airborne: 7.0,
@@ -3035,12 +2730,6 @@ mod pet {
                         "Flight, descent: forelegs reaching for the floor, rump high.",
                     )
                 },
-                // THE APEX: the top of a BIG bound, the answer to the longest
-                // frozen sprite in the product (`pet_leap` held a mean unbroken
-                // run of 15.4 / 19.0 / 29.4 ticks on glass). The back ROUNDS
-                // off the hero's full extension, the hind pair swings under and
-                // the fore begin to fold: compact and high where the hero is
-                // long and low, so it separates at 34 px. A true mid-air frame.
                 Pose {
                     yaw: 1.0,
                     airborne: 9.0,
@@ -3069,12 +2758,7 @@ mod pet {
             ]
         }
 
-        // ── the wiggle and the loaf ─────────────────────────────────────────
-
         /// The awake bread: one smooth arc, zero visible limbs, the head
-        /// RESTING on the dome's front end (leading edge flush with the
-        /// bread's), the tail trimmed to a nub-and-tip, and the off-side fan
-        /// flat against the bread.
         fn loaf_base(p: Pose) -> Pose {
             Pose {
                 curl: true,
@@ -3100,15 +2784,6 @@ mod pet {
 
         fn low() -> Vec<Pose> {
             vec![
-                // Alternates with pet_crouch at wiggle rate: the forepaws stay
-                // pinned on the crouch's exact shoulder root so only the
-                // hindquarters shimmy. The rump raise comes from the torso's
-                // tilt over hind legs folded under it, NOT from longer legs (the
-                // registration plants the lowest ink); the head holds the
-                // crouch's mark and the pelvis alone swings (the anchored-front
-                // law); the hind shins are a step shorter so they finish ABOVE
-                // the pinned forepaws' ink; the tail flags high, eased off
-                // dead vertical.
                 Pose {
                     yaw: 1.0,
                     by: 76.0,
@@ -3133,9 +2808,6 @@ mod pet {
                         "Pounce, wiggle: the crouch with its hindquarters up and offset.",
                     )
                 },
-                // The long-dwell settle: awake, legs tucked, about a row tall
-                // so the parked cat never shades the line above the prompt;
-                // serene happy arcs, since a squint here reads as regret.
                 Pose {
                     eyes: "happy",
                     ..loaf_base(d(
@@ -3146,13 +2818,6 @@ mod pet {
             ]
         }
 
-        // ── the roll: belly-up wriggling, the bored cat's third act ─────────
-        // The whole trick is `brot` near 180: the torso's chest-arch rotates to
-        // the floor and the tucked belly line faces the sky, the hip and
-        // shoulder roots ride to the TOP of the mass, and the tabby bars land
-        // on the grounded back, all from the rig's own math. Loose folded legs
-        // paw at the air; the head lies cheek down beside the body. The brain
-        // cycles 0 -> 1 -> 2 -> 1 at wiggle rate.
         fn roll() -> Vec<Pose> {
             vec![
                 Pose {
@@ -3239,12 +2904,6 @@ mod pet {
             ]
         }
 
-        // ── lateral walk: the slow gait, one paw at a time ──────────────────
-        // The trot above is a diagonal couplet. A cat merely strolling beside
-        // the caret moves one leg at a time in the lateral order LH -> LF ->
-        // RH -> RF, three paws planted while the fourth swings; each frame is
-        // sampled mid-swing, and the body rides a half unit lower on the two
-        // frames where the swinging leg is a foreleg.
         const LW_FWD: Leg = leg(19.0, 10.0);
         const LW_MID: Leg = leg(1.0, -1.0);
         const LW_BACK: Leg = leg(-18.0, -6.0);
@@ -3311,12 +2970,8 @@ mod pet {
             ]
         }
 
-        // ── launch, hop, skid: the beats around a flight ────────────────────
         fn loco() -> Vec<Pose> {
             vec![
-                // The release between the crouch and the rise: the hind legs
-                // still drive off the floor, so the frame is PLANTED (on the
-                // hind paws, the forepaws already clear). Not an AIRBORNE frame.
                 Pose {
                     yaw: 1.0,
                     by: 68.0,
@@ -3340,9 +2995,6 @@ mod pet {
                         "Pounce, launch: hind legs driving off the floor, chest up, forepaws lifting.",
                     )
                 },
-                // The row hop's tuck: every paw gathered under, the tail up as
-                // a counterweight, the eyes on the landing; a mid-air frame
-                // with authored clearance (AIRBORNE).
                 Pose {
                     yaw: 1.0,
                     airborne: 6.0,
@@ -3368,9 +3020,6 @@ mod pet {
                         "Hop: a tight tuck, every paw gathered, tail up, eyes on the landing.",
                     )
                 },
-                // The drift-brake: planted on the forepaws; the folded hind
-                // pair sits under a unit above the ground line, inside
-                // PLANT_TOL, so the registration does not re-plant on it.
                 Pose {
                     yaw: 1.0,
                     by: 78.0,
@@ -3397,14 +3046,8 @@ mod pet {
             ]
         }
 
-        // ── idle: the small beats of a settled cat ──────────────────────────
-        // Every frame is a one- or two-field departure from a shipped base, so
-        // the swap-in-place rule holds by construction: an ear flick moves an
-        // ear, a blink moves the lids. None of them carries lift.
         fn idle() -> Vec<Pose> {
             vec![
-                // The sulk: a sphinx flat to the floor, ears pinned, head hung,
-                // plainly not the contented loaf the code borrowed until now.
                 Pose {
                     by: 84.0,
                     brx: 42.0,
@@ -3432,7 +3075,6 @@ mod pet {
                         "Droop: the sulk — flat to the floor, ears pinned, head hung, tail limp behind.",
                     )
                 },
-                // The same sulk from the seat.
                 Pose {
                     hy: 50.0,
                     hx: 131.0,
@@ -3448,7 +3090,6 @@ mod pet {
                         "Droop, seated: the seat, head hung, ears pinned, tail flat forward.",
                     )
                 },
-                // Ear flicks: a +70 sweep on the near ear is what survives 34 px.
                 Pose {
                     ear_near: 70.0,
                     ..sat(
@@ -3475,13 +3116,10 @@ mod pet {
                         "Loaf, ear flick: the near ear swivelled out.",
                     ))
                 },
-                // The blink: `closed` lids on the seat, held for a tenth of a
-                // second between two open-eyed frames.
                 Pose {
                     eyes: "closed",
                     ..sat("pet_sit_blink", "Sit, blink: the seat with both lids down.")
                 },
-                // The yawn before the loaf (see `nose_paths` for its doubled gape).
                 Pose {
                     eyes: "happy",
                     mouth: "yawn",
@@ -3494,8 +3132,6 @@ mod pet {
                         "Yawn: head tipped back, eyes squeezed, the gape wide.",
                     )
                 },
-                // The tail swept BEHIND the seat, resting and tip-flicked: the
-                // sitting cat's tail beat gets a second side to deal.
                 Pose {
                     tail_root: Some((80.0, 108.0)),
                     tail: [-85.0, -90.0, -98.0, -110.0],
@@ -3509,14 +3145,11 @@ mod pet {
                     tail: [-95.0, -115.0, -150.0, -178.0],
                     ..sat("pet_sit_tail_back", "Sit, tail behind, tip flicked up.")
                 },
-                // The loaf's drowsy check: the same bread, the eyes open a moment.
                 Pose {
                     eyes: "open",
                     gaze: (0.6, 0.4),
                     ..loaf_base(d("pet_loaf_open", "Loaf, eyes open: the drowsy check."))
                 },
-                // The gaze rows: a seated cat whose caret is on the line above
-                // or below looks there, chin and pupils together.
                 Pose {
                     hrot: -20.0,
                     hy: 36.0,
@@ -3537,8 +3170,6 @@ mod pet {
                         "Sit, look down: chin tucked, pupils dropped to the line below.",
                     )
                 },
-                // The second groom: the peek's body with the head turned back
-                // and DOWN into the shoulder, the flank lick.
                 Pose {
                     hx: 112.0,
                     hy: 52.0,
@@ -3550,9 +3181,6 @@ mod pet {
                         "Groom, flank: seated facing away, head turned back and down into the shoulder.",
                     )
                 },
-                // The second half of the wake-up: the rump comes up and one
-                // hind leg reaches straight back, planted on the forepaws and
-                // the other hind paw.
                 Pose {
                     yaw: 0.6,
                     by: 72.0,
@@ -3575,8 +3203,6 @@ mod pet {
                         "Stretch, hind: forepaws planted, rump up, a hind leg reaching straight back.",
                     )
                 },
-                // The perk with the head yawed INTO the facing: looking where
-                // it is about to go rather than at you.
                 Pose {
                     yaw: 1.0,
                     by: 63.0,
@@ -3598,12 +3224,6 @@ mod pet {
                 },
             ]
         }
-
-        // ── console contact: weight, local attention, and a supported edge ──
-        // Authored joint poses, not transforms of a rasterized rest frame.
-        // Every one is weight-bearing: registration keeps its lowest ink at
-        // 143 and the engine supplies any movement between safe places; an
-        // edge pose puts no dangling limb below the shared contact plane.
 
         /// The supported edge seat the edge family departs from.
         fn edge_seat(p: Pose) -> Pose {
@@ -3637,9 +3257,6 @@ mod pet {
                     "Safe block edge: a compact supported seat, forepaws together at the lip and tail counterbalancing behind.",
                 ))
             };
-            // Reading moves only the head and pupils: these derive from the
-            // exact edge seat, so the registered body paths stay byte-for-byte
-            // (`reading_gaze_keeps_the_perch_body_geometry_fixed`).
             let look_up = Pose {
                 ident: "pet_edge_look_up".to_string(),
                 note: "Reading above: only the head lifts and pupils rise; the supported perch remains planted."
@@ -3808,12 +3425,6 @@ mod pet {
         }
 
         /// THE DOG IS THE SAME POSE SHEET, RE-SKINNED (owner, 2026-08-11:
-        /// "make a dog like the walking cat … you can use the same code"). A
-        /// dog roster authored apart would drift out of gait sync, and every
-        /// behaviour in `kitty_pet` is written against these pose idents, so
-        /// the brain picks a cat pose and the species swaps the sprite under
-        /// it. The `pet_dog_` prefix makes the shared codegen mint
-        /// `PetGlyphId::PetDogWalk0` beside `PetWalk0`.
         fn dog_poses(cats: &[Pose]) -> Vec<Pose> {
             cats.iter()
                 .map(|p| Pose {

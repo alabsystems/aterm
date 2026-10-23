@@ -316,7 +316,7 @@ impl InputLedger {
     /// behind the flush, it is not evidence of a read. A short in-flight write
     /// leaves the mark past `accepted`, under-counting later bytes (the side
     /// that claims no read).
-    pub fn mark_discard(&mut self, epoch: u64) {
+    pub const fn mark_discard(&mut self, epoch: u64) {
         self.discard_mark = Some((epoch, self.accepted.saturating_add(self.inflight)));
     }
 

@@ -1,19 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-// THE TASK'S FACE in the loop, over the scripted server
-// (`docs/DESIGN-harness-autopilot-2026-10-15.md` §9.4.2, §9.4.5): what a
-// recording host is told through `IdleHost::task_face` — once at the loop's
-// start, then where a point moves it (landed, theirs) and at the
-// first live read of someone else's turn — and the landing a loop before
-// this one landed, read back from the journal beside the ledger
-// (`ended_before`, with the time its note was journaled; an older build's
-// done note seeds nothing), so a restart types no
-// land instruction into finished work, and never takes someone else's later
-// done turn for the landing. Each
-// behaviour has its negative control. Included from `run_tests.rs` (`mod
-// task_face_loop`), so the `Mock` and its helpers are in scope.
-
 use crate::harness::acts::TaskFace;
 use crate::supervise::policy::turn_end::{RULE_DONE_CHECK, RULE_LAND, RULE_LAND_NUDGE, RULE_LEFT};
 
@@ -24,22 +11,17 @@ const LANDING_REPLY: &str = "Committed and pushed the parser and its tests.\nNot
 const PROGRESS: &str = "Committing the parser now; the lexer is next.";
 
 /// A host that records every face it is told, and how it started the loop
-/// ([`IdleHost::lifted_off`]).
 #[derive(Debug, Default)]
 struct Faces {
     told: Mutex<Vec<TaskFace>>,
     /// What the conversation's record says of the landing
-    /// ([`IdleHost::finished`]).
     finished: Option<bool>,
     /// What the repository probe finds ([`IdleHost::repo_work`]), and how
-    /// often it was asked.
     repo: Option<crate::harness::repo_work::RepoWork>,
     probes: std::sync::atomic::AtomicUsize,
     /// What the probe finds at each ask in turn, before [`Self::repo`]
-    /// answers every later one.
     repos: Mutex<std::collections::VecDeque<Option<crate::harness::repo_work::RepoWork>>>,
     /// The faces told restated from the journal, with their note's time
-    /// ([`IdleHost::task_face_noted`]); each is in `told` too.
     noted: Mutex<Vec<(TaskFace, i64)>>,
     lifted: bool,
 }
@@ -101,7 +83,6 @@ impl IdleHost for Faces {
 }
 
 /// A turn that ended after 3 minutes of work (the done row's measure), the
-/// worker's last words `said` (each line its own row), at an empty composer.
 fn ended(said: &str) -> Vec<String> {
     let mut lines: Vec<String> = said.lines().map(|l| format!("⏺ {l}")).collect();
     for l in lines.iter_mut().skip(1) {
@@ -119,7 +100,6 @@ fn ended(said: &str) -> Vec<String> {
 }
 
 /// [`ended`] under the `❯` row of the prompt `prompt` it answers: the turn
-/// that prompt opened, closed on the screen.
 fn answered(prompt: &str, said: &str) -> Vec<String> {
     let mut r = rows(&[&format!("❯ {prompt}"), ""]);
     r.extend(ended(said));
@@ -127,8 +107,6 @@ fn answered(prompt: &str, said: &str) -> Vec<String> {
 }
 
 /// A run over `screens` with the session's word `word` and `host`, at test
-/// speed (a 30 ms back-off): the lines said and the turns typed. `ledger`:
-/// the approval ledger the loop keeps, its journal beside it.
 fn run(
     screens: Vec<Vec<String>>,
     word: &'static str,
@@ -141,7 +119,6 @@ fn run(
 }
 
 /// [`run`], the mock set up further by `more` (a word the owner changes
-/// while the loop runs, say).
 fn run_on(
     screens: Vec<Vec<String>>,
     word: &'static str,
@@ -156,7 +133,6 @@ fn run_on(
 }
 
 /// [`run_on`], the mock handed back as the run left it (the word it ended
-/// on, how often the loop read it).
 fn run_kept(
     screens: Vec<Vec<String>>,
     word: &'static str,
@@ -196,11 +172,6 @@ fn run_kept(
 }
 
 /// LAND, ITS CLEAN DEFENSE: told `open` once at the loop's start, `landed`
-/// exactly once at the point the journal says `DONE … rule=land@v1`, and
-/// nothing more while that point stands. Then SOMEONE ELSE'S TURN, read busy
-/// with no act of the policy's awaited: `open` at its first live read, before
-/// any point of it. NEGATIVE CONTROL: the same run with that turn never begun
-/// stays landed.
 #[test]
 fn a_landing_is_told_landed_once_and_someone_elses_live_turn_opens_it() {
     let landed = |then: Vec<Vec<String>>| {
@@ -226,18 +197,10 @@ fn a_landing_is_told_landed_once_and_someone_elses_live_turn_opens_it() {
         landed(vec![busy_screen()]),
         [TaskFace::Open, TaskFace::Landed, TaskFace::Open]
     );
-    // NEGATIVE CONTROL: nobody's turn after it.
     assert_eq!(landed(Vec::new()), [TaskFace::Open, TaskFace::Landed]);
 }
 
 /// A LANDED TASK'S OWN WAKE KEEPS ITS FACE: after the landing, a turn the
-/// conversation's record says nobody asked (Claude Code's wake for a
-/// background task), read running and then ended on a quiet report, tells no
-/// face — `landed` stands through its live frames and its point, and nothing
-/// is typed. The recheck of d88a7bf289 found its first live read told `open`
-/// and its point `landed` again, which the window logged as a fresh landing
-/// at every wake. NEGATIVE CONTROL: with no record to say so, the same turn
-/// is someone else's — told `open` at its first live read.
 #[test]
 fn a_landed_tasks_own_wake_tells_no_face() {
     let wake = |finished: Option<bool>| {
@@ -259,7 +222,6 @@ fn a_landed_tasks_own_wake_tells_no_face() {
     let (told, turns, lines) = wake(Some(true));
     assert_eq!(told, [TaskFace::Open, TaskFace::Landed], "{lines:#?}");
     assert_eq!(turns, 1, "the instruction alone: {lines:#?}");
-    // NEGATIVE CONTROL: no record.
     let (told, _, lines) = wake(None);
     assert_eq!(
         told.get(..3),
@@ -269,14 +231,6 @@ fn a_landed_tasks_own_wake_tells_no_face() {
 }
 
 /// A LANDED TASK'S OWN WAKE OVER SOMEONE ELSE'S EDITS KEEPS THE LANDING
-/// (`Session::took` probes as the wake begins,
-/// `TurnEndState::wake_began_over`): the landing over a clean repository,
-/// then the person's hand edit, then Claude Code's background wake the
-/// record says nobody asked, ended on a quiet report over the same edit —
-/// nothing typed, the face landed throughout. The recheck of ea564676a3
-/// found the landing reopened and the worker told to commit the person's
-/// edit. NEGATIVE CONTROL: the edit made during the wake (the probe clean
-/// as it began) reopens the landing: Land's nudge.
 #[test]
 fn a_landed_tasks_own_wake_over_someone_elses_edit_keeps_the_landing() {
     let edit = crate::harness::repo_work::RepoWork {
@@ -307,7 +261,6 @@ fn a_landed_tasks_own_wake_over_someone_elses_edit_keeps_the_landing() {
     let (told, turns, lines) = wake(Some(edit.clone()));
     assert_eq!(turns, 1, "the instruction alone: {lines:#?}");
     assert_eq!(told, [TaskFace::Open, TaskFace::Landed], "{lines:#?}");
-    // NEGATIVE CONTROL: the edit made during the wake.
     let (told, turns, lines) = wake(None);
     assert_eq!(turns, 2, "the nudge: {lines:#?}");
     assert!(
@@ -324,14 +277,6 @@ fn a_landed_tasks_own_wake_over_someone_elses_edit_keeps_the_landing() {
 }
 
 /// A RESTART WHOSE FIRST READ IS THE LANDED TASK'S OWN WAKE KEEPS THE
-/// LANDING (`TurnEndState::wake_may_keep_landing` for the journal's seed):
-/// the loop restarted over a landing (the land act typed, the landing's
-/// `DONE` noted after it), its first read the background wake the record
-/// says nobody asked, running and then ended on a quiet report: told
-/// `landed` at its start and nothing more, nothing typed. The recheck of
-/// ea564676a3 found the seed dropped at the wake's first frame and Land's
-/// act typed into the landed work. NEGATIVE CONTROL: with no record to say
-/// so, the wake is someone's turn — told `open`, and Land's act typed.
 #[test]
 fn a_restart_whose_first_read_is_the_landed_tasks_own_wake_keeps_the_landing() {
     let min = |n: u64| Duration::from_secs(60 * n);
@@ -356,16 +301,12 @@ fn a_restart_whose_first_read_is_the_landed_tasks_own_wake_keeps_the_landing() {
     let (told, turns, lines) = restart("restart-wake", Some(true));
     assert_eq!(turns, 0, "nothing typed: {lines:#?}");
     assert_eq!(told, [TaskFace::Landed], "{lines:#?}");
-    // NEGATIVE CONTROL: no record.
     let (told, turns, lines) = restart("restart-wake-unknown", None);
     assert_eq!(turns, 1, "Land's act: {lines:#?}");
     assert_eq!(told, [TaskFace::Landed, TaskFace::Open], "{lines:#?}");
 }
 
 /// CRUISE TELLS NO END: the retired token after a continuation, and the done
-/// check's second done report, are each a done claim owed the check again —
-/// told nothing past the start's `open`. A person's quick greeting under
-/// Land is told `theirs` (the journal's `LEFT`), never `landed`.
 #[test]
 fn a_cruise_done_claim_tells_no_end_and_a_persons_exchange_is_theirs() {
     for (last, check) in [
@@ -376,8 +317,6 @@ fn a_cruise_done_claim_tells_no_end_and_a_persons_exchange_is_theirs() {
         let mut screens = vec![busy_screen(), ended(PROGRESS), busy_screen(), ended(last)];
         let mut gates = vec![1];
         if check {
-            // The done report gets the check, and the check's reply says
-            // done again: the check again.
             screens.extend([busy_screen(), ended(last)]);
             gates.push(3);
         }
@@ -392,7 +331,6 @@ fn a_cruise_done_claim_tells_no_end_and_a_persons_exchange_is_theirs() {
         assert!(!lines.iter().any(|l| l.starts_with("DONE ")), "{lines:#?}");
         assert_eq!(host.told(), [TaskFace::Open], "{last}");
     }
-    // A person's greeting under Land: theirs.
     let host = Arc::new(Faces::default());
     let mut quick = rows(&["⏺ Hi! What would you like me to work on?", ""]);
     quick.extend(composer("  ⏵⏵ bypass permissions on (shift+tab to cycle)"));
@@ -410,10 +348,6 @@ fn a_cruise_done_claim_tells_no_end_and_a_persons_exchange_is_theirs() {
 }
 
 /// Autopilot Land IN THE LOOP: the instruction and three nudges answered with
-/// work, and a fourth nudge typed — told nothing past `open` (no spent face:
-/// the landing goes on). NEGATIVE CONTROL: the third nudge's clean defense
-/// is told `landed`, nothing more is typed, and someone else's live turn
-/// after it reads open.
 #[test]
 fn a_landing_goes_on_past_two_nudges_and_is_told_landed_only_on_its_defense() {
     let land_on = |last: &str| {
@@ -437,7 +371,6 @@ fn a_landing_goes_on_past_two_nudges_and_is_told_landed_only_on_its_defense() {
     let (turns, told, lines) = land_on(PROGRESS);
     assert_eq!(turns, 5, "the instruction and four nudges: {lines:#?}");
     assert_eq!(told, [TaskFace::Open], "{lines:#?}");
-    // NEGATIVE CONTROL: the defense lands it.
     let (turns, told, lines) = land_on(LANDING_REPLY);
     assert_eq!(turns, 4, "the instruction and three nudges: {lines:#?}");
     assert_eq!(
@@ -448,9 +381,6 @@ fn a_landing_goes_on_past_two_nudges_and_is_told_landed_only_on_its_defense() {
 }
 
 /// A RESTART OF A LANDED TASK TELLS `landed` AT ITS START and types nothing
-/// (the journal's land `DONE`, read back by `landed_before`), however many
-/// nudges the landing took. NEGATIVE CONTROL: a restart of a landing still
-/// going (its last reply progress) is told `open` at its start.
 #[test]
 fn a_restart_of_a_landing_tells_landed_and_types_nothing() {
     for (last, face) in [
@@ -489,8 +419,6 @@ fn a_restart_of_a_landing_tells_landed_and_types_nothing() {
 }
 
 /// THE LOOP'S START TELLS ITS FACE ONCE, whatever it is: an idle session
-/// with nothing to end is told `open` and nothing more. With no host (a CLI
-/// `watch`), nothing is told and nothing fails.
 #[test]
 fn the_loops_start_is_told_once() {
     let host = Arc::new(Faces::default());
@@ -518,7 +446,6 @@ fn journal_row(line: &str, ago: Duration, sid: Option<&str>) -> String {
 }
 
 /// [`journal_row`] of a review point, the worker's last words there marked
-/// `mark` ([`said_mark`]).
 fn marked_row(line: &str, ago: Duration, sid: Option<&str>, mark: Option<u64>) -> String {
     let at = crate::supervise::journal::unix_ms() - i64::try_from(ago.as_millis()).unwrap();
     let mut rec = crate::supervise::journal::JournalRecord::of_line(at, sid, line, None);
@@ -546,7 +473,6 @@ fn files(tag: &str, ledger: &[String], journal: &[String]) -> (PathBuf, PathBuf)
 }
 
 /// A later box disproves a legacy landing even if a successor reuses its seq.
-/// Fixed journal buffers exercise the actual reader without clocks or files.
 #[test]
 fn an_old_landing_never_survives_a_later_box_with_the_same_sequence() {
     const POINT: &str = r#"{"t":1,"sid":null,"kind":"event","phase":"idle","seq":104,"complete":null,"rows":null,"summary":"ATERM-TASK-DONE","line":"EVENT idle seq=104 ATERM-TASK-DONE","turn":null,"report":null}"#;
@@ -557,8 +483,6 @@ fn an_old_landing_never_survives_a_later_box_with_the_same_sequence() {
     const PROMPT: &str = r#"{"t":3,"sid":null,"kind":"event","phase":"prompt","seq":104,"complete":null,"rows":null,"summary":"kind=bash classify=- command=touch c","line":"EVENT prompt seq=104 kind=bash classify=- command=touch c","turn":null,"report":null}"#;
     const APPROVED: &str = r#"{"t":3,"sid":null,"kind":"approved","phase":"prompt","seq":104,"complete":null,"rows":null,"summary":"touch c.txt","line":"APPROVED seq=104 touch c.txt","turn":null,"report":null}"#;
 
-    // Ordinary old journals still seed, with or without a recorded point;
-    // an ordinary point on the same seq preserves that compatibility.
     for prefix in [NOTE.to_string(), format!("{POINT}\n{NOTE}")] {
         assert_eq!(landed_before(&prefix, None, Some(1)), Some(None));
         assert_eq!(
@@ -566,7 +490,6 @@ fn an_old_landing_never_survives_a_later_box_with_the_same_sequence() {
             Some(None)
         );
     }
-    // A marked landing also retains its ordinary redraw at a different seq.
     let mark = crate::supervise::journal::JournalRecord::from_json(MARKED_POINT)
         .expect("the captured marked point")
         .mark;
@@ -586,8 +509,6 @@ fn an_old_landing_never_survives_a_later_box_with_the_same_sequence() {
             "a marked landing also refuses an explicit later box"
         );
     }
-    // Collect all four legacy failures before the final assertion: no point
-    // or an unmarked point before the note, then either actual box syntax.
     let mut wrong = Vec::new();
     for (history, prefix) in [
         ("no prior point", NOTE.to_string()),
@@ -607,12 +528,6 @@ fn an_old_landing_never_survives_a_later_box_with_the_same_sequence() {
 }
 
 /// THE LANDING READ BACK (`landed_before`): the last note of a task's end is
-/// the land's `DONE`, and no typed row came after it. Not where a person's
-/// `LEFT` or another end (`rule=finished@v1`, the done check's) came after
-/// it, not where a typed row did, not for another session's note, and not
-/// with no journal at all. A note with no marked point before it (a journal
-/// a build before the mark wrote) reads its later points by `seq=` and seeds
-/// no words; the marked case is the test after this one.
 #[test]
 fn the_landing_is_read_back_from_the_journal_beside_the_ledger() {
     let min = |n: u64| Duration::from_secs(60 * n);
@@ -633,7 +548,6 @@ fn the_landing_is_read_back_from_the_journal_beside_the_ledger() {
         std::slice::from_ref(&land_typed),
         std::slice::from_ref(&note)
     ));
-    // A note after it, of a task's end other than the land's.
     for later in [
         "LEFT seq=110 rule=left-to-person@v1 a person's own exchange (their message, answered \
          within 10 min): nothing is typed until the next turn ends",
@@ -652,9 +566,6 @@ fn the_landing_is_read_back_from_the_journal_beside_the_ledger() {
             "{later}"
         );
     }
-    // Lines after it that say no point of a turn: what an idle screen shows
-    // with no turn, what the loop says of itself, and the landing's own
-    // point said again (its seq).
     for other in [
         "EVENT context seq=111 9% until auto-compact",
         "EVENT survey seq=111 dismiss with: aterm ctl @s-1 key 'if=^●.How.is.Claude.doing' 0",
@@ -673,11 +584,6 @@ fn the_landing_is_read_back_from_the_journal_beside_the_ledger() {
             "{other}"
         );
     }
-    // A LATER POINT OR BOX: someone else's turn after the landing, its end
-    // handed over or a box of it approved — though nothing was typed and no
-    // end was noted (the Together run: a person's turn ending on the token).
-    // This read seeded the landing before the fix, which is how that reply
-    // was journaled "after the land instruction".
     for later in [
         "EVENT idle seq=111 ⏺ Done.",
         "EVENT idle seq=111 ATERM-TASK-DONE",
@@ -696,43 +602,29 @@ fn the_landing_is_read_back_from_the_journal_beside_the_ledger() {
             "{later}"
         );
     }
-    // …and another session's point is not this one's.
     let elsewhere = journal_row("EVENT idle seq=111 ⏺ Done.", min(5), Some("s-other"));
     assert!(seeded(
         "read-back-point-sid",
         std::slice::from_ref(&land_typed),
         &[note.clone(), elsewhere]
     ));
-    // A typed row after it.
     let nudge = ledger_row("continue@v1", "keep going", min(2));
     assert!(!seeded(
         "read-back-typed",
         &[land_typed.clone(), nudge],
         std::slice::from_ref(&note)
     ));
-    // Another session's note.
     let theirs = journal_row(LANDED_NOTE, min(9), Some("s-other"));
     assert!(!seeded(
         "read-back-sid",
         std::slice::from_ref(&land_typed),
         &[theirs]
     ));
-    // No note, and no journal (the door reads a missing one as empty).
     assert!(!seeded("read-back-none", &[land_typed], &[]));
     assert!(landed_before("", None, None).is_none());
 }
 
 /// THE LANDING'S POINT IS READ BY ITS WORDS, NEVER ITS SEQ (the review of
-/// Together D3, 2026-10-17): the journal keeps the mark of the worker's last
-/// words with each point ([`said_mark`]), and the landing's mark is the one
-/// on the point before its note. A later point with the same mark is the
-/// landing's own — said again after an outage under the successor's
-/// restarted seq (`RECONNECTED`, then `EVENT idle seq=9`), or after a
-/// resize — and the seed holds, carrying that mark for the first point to
-/// compare. Another reply's mark, a point that marks none and any box drop
-/// it. NEGATIVE CONTROL: the same outage's point read by its seq (a journal
-/// with no marks, the test above) drops the seed, which typed the land
-/// instruction into finished work after the next restart.
 #[test]
 fn a_landings_point_said_again_is_read_by_its_words_never_its_seq() {
     let min = |n: u64| Duration::from_secs(60 * n);
@@ -803,7 +695,6 @@ fn a_landings_point_said_again_is_read_by_its_words_never_its_seq() {
             "{tag}"
         );
     }
-    // NEGATIVE CONTROL: the outage's point with no mark (read by its seq).
     let unmarked = journal_row("EVENT idle seq=9 ATERM-TASK-DONE", min(8), None);
     let (dir, path) = files(
         "words-by-seq",
@@ -824,14 +715,6 @@ fn a_landings_point_said_again_is_read_by_its_words_never_its_seq() {
 }
 
 /// ONLY A LANDING IS READ BACK AS AN END (`ended_before`, §10.2.7 under
-/// Autopilot Cruise / Land): the last note of a task's end is the
-/// land's `DONE`, nothing typed or judged came after it — the landing, its
-/// point's mark with it, and the last of several notes is the one read.
-/// NEGATIVE CONTROLS: an older build's done notes (`rule=finished@v1`, the
-/// done check's, the open-items challenge's) read as nothing ended, alone and
-/// as the last note after a landing; a person's `LEFT` as the last end, a
-/// typed row after the note, another reply's point after it, and another
-/// session's note each seed nothing.
 #[test]
 fn only_a_landing_is_read_back_and_an_older_builds_done_seeds_nothing() {
     let min = |n: u64| Duration::from_secs(60 * n);
@@ -849,7 +732,6 @@ fn only_a_landing_is_read_back_and_an_older_builds_done_seeds_nothing() {
     let point = "EVENT idle seq=104 Nothing left: all of it is merged into the remote main branch.";
     let read =
         |tag: &str, ledger: &[String], notes: &[&str], after: &[String], sid: Option<&str>| {
-            // Each note after its point, as the loop writes them.
             let mut journal: Vec<String> = notes
                 .iter()
                 .flat_map(|n| {
@@ -892,7 +774,6 @@ fn only_a_landing_is_read_back_and_an_older_builds_done_seeds_nothing() {
         Some(mark),
         "its own point said again keeps it"
     );
-    // NEGATIVE CONTROLS: an older build's done seeds nothing.
     for note in [finished, check, open_items] {
         assert_eq!(
             read("ended-old-done", &earlier, &[note], &[], None),
@@ -938,12 +819,6 @@ fn only_a_landing_is_read_back_and_an_older_builds_done_seeds_nothing() {
 }
 
 /// AN OLDER BUILD'S CRUISE DONE IS NEVER RESTATED (Autopilot Cruise: nothing
-/// ends a Cruise task, and an old journal's `DONE … rule=finished@v1` reads
-/// as nothing ended): a loop started over that note, under Cruise or as the
-/// session's Off lifts under Land, is told `open` at its start, never
-/// `landed`, and tells no note's time. NEGATIVE CONTROL: the same journal
-/// with the land's `DONE` as its last note restates the landing, its time
-/// with it.
 #[test]
 fn an_older_builds_done_note_is_never_restated() {
     let min = |n: u64| Duration::from_secs(60 * n);
@@ -978,7 +853,6 @@ fn an_older_builds_done_note_is_never_restated() {
             assert!(!host.told().contains(&TaskFace::Landed), "{lines:#?}");
         }
     }
-    // NEGATIVE CONTROL: the land's note is restated.
     let (dir, path) = files(
         "old-done-control",
         &[ledger_row(RULE_LAND, "land", min(10))],
@@ -1000,7 +874,6 @@ fn an_older_builds_done_note_is_never_restated() {
 }
 
 /// The wall time (unix ms) of the last `DONE … rule=<rule>` note in the
-/// journal beside `ledger`.
 fn note_time(ledger: &Path, rule: &str) -> i64 {
     let (records, _) = crate::supervise::journal::read_journal(
         &crate::supervise::approvals::journal_beside(ledger),
@@ -1015,17 +888,9 @@ fn note_time(ledger: &Path, rule: &str) -> i64 {
 }
 
 /// A RESTATED LANDING CARRIES THE TIME ITS NOTE WAS JOURNALED (§10.2.7: a
-/// seamless update's new window holds no face of the session, so the landing
-/// a restarted loop restated was stamped with the update's clock there): a
-/// restarted loop over a real landing, and over a landing whose note is nine
-/// minutes old, tells its start face through `IdleHost::task_face_noted` with
-/// the `t` of the journal's note — and every other face through `task_face`
-/// alone. NEGATIVE CONTROLS: a fresh loop, and a restart after a typed row
-/// (no seed: open at the start), tell nothing with a time.
 #[test]
 fn a_restated_landing_carries_the_time_its_note_was_journaled() {
     let min = |n: u64| Duration::from_secs(60 * n);
-    // A real landing, restarted in place.
     let (dir, ledger) = files("noted-real", &[], &[]);
     let (told, turns, lines) = land_first(&ledger, Vec::new(), &[]);
     assert_eq!(
@@ -1047,7 +912,6 @@ fn a_restated_landing_carries_the_time_its_note_was_journaled() {
     assert_eq!(host.told(), [TaskFace::Landed], "{lines:#?}");
     assert_eq!(host.noted(), [(TaskFace::Landed, at)], "{lines:#?}");
     let _ = std::fs::remove_dir_all(&dir);
-    // A landing noted nine minutes back, restarted under Land.
     let (dir, path) = files(
         "noted-landed",
         &[ledger_row(RULE_LAND, "land", min(10))],
@@ -1067,7 +931,6 @@ fn a_restated_landing_carries_the_time_its_note_was_journaled() {
     assert_eq!(turns, 0, "{lines:#?}");
     assert_eq!(host.noted(), [(TaskFace::Landed, at)], "{lines:#?}");
     let _ = std::fs::remove_dir_all(&dir);
-    // NEGATIVE CONTROL: a fresh loop.
     let (dir, path) = files("noted-fresh", &[], &[]);
     let host = Arc::new(Faces::default());
     run(
@@ -1081,7 +944,6 @@ fn a_restated_landing_carries_the_time_its_note_was_journaled() {
     assert_eq!(host.told().first(), Some(&TaskFace::Open));
     assert_eq!(host.noted(), []);
     let _ = std::fs::remove_dir_all(&dir);
-    // NEGATIVE CONTROL: a typed row after the note.
     let (dir, ledger) = files("noted-typed", &[], &[]);
     land_first(&ledger, Vec::new(), &[]);
     std::thread::sleep(Duration::from_millis(5));
@@ -1117,17 +979,9 @@ fn last_done(ledger: &Path) -> crate::supervise::journal::JournalRecord {
 }
 
 /// A RESTATED LANDING'S NOTE CARRIES ITS FIRST TIME FORWARD (§10.2.7): every
-/// restarted loop journals the landing again at its first point — its note
-/// must be newer than the point record that loop wrote, or no loop after it
-/// could seed — and that note keeps the time the landing was FIRST noted
-/// (`JournalRecord::ended`), so the loop after a restart and then another (a
-/// seamless update, say) restates the landing with the first time rather
-/// than the last restart's. NEGATIVE CONTROL: the first loop's own note
-/// carries none.
 #[test]
 fn a_restated_landings_note_carries_its_first_time_forward() {
     let min = |n: u64| Duration::from_secs(60 * n);
-    // A real landing, restarted twice.
     let (dir, ledger) = files("chain-real", &[], &[]);
     land_first(&ledger, Vec::new(), &[]);
     let first = last_done(&ledger);
@@ -1155,7 +1009,6 @@ fn a_restated_landings_note_carries_its_first_time_forward() {
         assert_eq!(note.ended, Some(first.t), "{again}: {note:?}");
     }
     let _ = std::fs::remove_dir_all(&dir);
-    // A landing noted nine minutes back, restarted twice under Land.
     let (dir, path) = files(
         "chain-landed",
         &[ledger_row(RULE_LAND, "land", min(10))],
@@ -1182,17 +1035,6 @@ fn a_restated_landings_note_carries_its_first_time_forward() {
 }
 
 /// THE PAGE COUNTS EACH LANDING ONCE, FROM THE FILES THE LOOPS WROTE (design
-/// §12.4.3, item 2): a real landing kept through the task's own
-/// wake (its note restated, `WAKE_KEPT`), then two loops restarted over it
-/// (a seamless update, a relaunch), each restating it with its first time
-/// (`ended`) — the page's one reading of the ledger and the journal
-/// (`stats_windows`) counts ONE landing beside the one land prompt, today, in
-/// the week and in the session's share, after every loop: across the
-/// restarts the count is the journal's. Someone else's turn then reopens the
-/// task and Land's next act lands it again: two. NEGATIVE CONTROLS: the
-/// journal holds four `DONE … rule=land@v1` notes of the first landing (a
-/// count of the notes reads 4), and a window opened after the first landing
-/// counts only the second.
 #[test]
 fn the_page_counts_each_landing_once_through_its_wake_and_restarts() {
     use crate::harness::stats::stats_windows;
@@ -1207,7 +1049,6 @@ fn the_page_counts_each_landing_once_through_its_wake_and_restarts() {
     std::fs::write(&ledger, "").expect("ledger");
     std::fs::write(crate::supervise::approvals::journal_beside(&ledger), "").expect("journal");
     let opened = crate::supervise::journal::unix_ms() - 3_600_000;
-    // (today's landings, the week's, the session's share, today's land prompts)
     let read = |since: i64| {
         let (today, week) = stats_windows(&state, &dir.join("harness"), since, since - 86_400_000);
         let share: u64 = today
@@ -1228,7 +1069,6 @@ fn the_page_counts_each_landing_once_through_its_wake_and_restarts() {
             ..Faces::default()
         })
     };
-    // The first loop: the land instruction, its clean defense, the wake.
     let host = wakeful();
     let screens = vec![
         busy_screen(),
@@ -1253,7 +1093,6 @@ fn the_page_counts_each_landing_once_through_its_wake_and_restarts() {
         "the wake restated the landing: {first:#?}"
     );
     assert_eq!(read(opened), (1, 1, 1, 1), "{first:#?}");
-    // Two loops restarted over it, each restating it.
     for again in 0..2 {
         std::thread::sleep(Duration::from_millis(5));
         let host = wakeful();
@@ -1269,9 +1108,7 @@ fn the_page_counts_each_landing_once_through_its_wake_and_restarts() {
         assert_eq!(host.told(), [TaskFace::Landed], "{again}: {lines:#?}");
         assert_eq!(read(opened), (1, 1, 1, 1), "{again}: the journal's count");
     }
-    // NEGATIVE CONTROL: four notes of the one landing.
     assert_eq!(notes(), 4, "{:#?}", journal_lines(&ledger));
-    // Someone else's turn reopens the task, and Land's act lands it again.
     std::thread::sleep(Duration::from_millis(5));
     let reopened = crate::supervise::journal::unix_ms();
     let host = Arc::new(Faces::default());
@@ -1292,29 +1129,11 @@ fn the_page_counts_each_landing_once_through_its_wake_and_restarts() {
         journal_lines(&ledger)
     );
     assert_eq!(prompts, 2, "two land prompts, one per landing");
-    // NEGATIVE CONTROL: a window opened after the first landing.
     assert_eq!(read(reopened).0, 1, "{:#?}", journal_lines(&ledger));
     let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A RESTART OF A LANDED SESSION TYPES NOTHING (§9.4.5): the loop finds the
-/// land's `DONE` as the journal's last end and no typed row after it, and the
-/// screen's reply still a clean defense — it is told `landed` AT ITS START and
-/// nothing after (the landing restated, never a move from open the window
-/// would record as a new landing), nothing is typed, and it says the landing
-/// once more in its journal. NEGATIVE CONTROLS: with a typed row after the
-/// note, or no note (and no land act in the ledger), the start tells open and
-/// the land instruction is typed into the finished work, as before the seed;
-/// and a reply that no longer says done drops the seed — the landing told at
-/// the start moves to open — as does a done that is no clean defense (an
-/// older build's note, which has no words to compare, at a done in words:
-/// the landing's nudge owed, the review of 2026-10-20). THE LEDGER'S LAND
-/// EPISODE (RS7-2,
-/// `approvals::land_episode`): the land instruction a loop before typed, no
-/// note of its end, and its clean defense on the screen — that loop never judged
-/// it, so this one lands it there, as that loop would have: nothing typed,
-/// open at the start and landed at the point (a move: no landing was said
-/// before).
 #[test]
 fn a_restart_of_a_landed_session_types_no_land_instruction() {
     let min = |n: u64| Duration::from_secs(60 * n);
@@ -1356,7 +1175,6 @@ fn a_restart_of_a_landed_session_types_no_land_instruction() {
             "{said}: {notes:#?}"
         );
     }
-    // NEGATIVE CONTROLS: a typed row after the note; no note at all.
     let nudge = ledger_row("continue@v1", "keep going", min(2));
     for (tag, ledger, journal) in [
         (
@@ -1380,9 +1198,6 @@ fn a_restart_of_a_landed_session_types_no_land_instruction() {
         );
         assert_eq!(told, [TaskFace::Open], "{tag}");
     }
-    // The land instruction typed, no note of its end: the ledger's land
-    // episode holds it awaited, and its clean defense — the act's own `❯`
-    // row over it, so the act was taken — lands the task here.
     let (turns, told, notes, lines) = restart_on(
         "restart-land-awaited",
         std::slice::from_ref(&land_typed),
@@ -1396,9 +1211,6 @@ fn a_restart_of_a_landed_session_types_no_land_instruction() {
         notes[0].contains(&format!("rule={RULE_LAND} ")),
         "{notes:#?}"
     );
-    // NEGATIVE CONTROL: the same defense with no `❯` row of the act over it
-    // (said before the act, which a quit kept from being taken): no landing,
-    // and Land's act is typed again.
     let (turns, told, notes, lines) = restart(
         "restart-land-untaken",
         std::slice::from_ref(&land_typed),
@@ -1414,8 +1226,6 @@ fn a_restart_of_a_landed_session_types_no_land_instruction() {
     );
     assert_eq!(told, [TaskFace::Open]);
     assert!(notes.is_empty(), "{notes:#?}");
-    // A reply that no longer says done: the seed goes, the point is decided
-    // as any first point is.
     let (turns, told, _, lines) = restart(
         "restart-moved-on",
         std::slice::from_ref(&land_typed),
@@ -1424,7 +1234,6 @@ fn a_restart_of_a_landed_session_types_no_land_instruction() {
     );
     assert_eq!(turns, 1, "{lines:#?}");
     assert_eq!(told, [TaskFace::Landed, TaskFace::Open]);
-    // A done that is no defense: the seed goes, the land nudge is typed.
     let (turns, told, _, lines) = restart("restart-undefended", &[land_typed], &[note], done);
     assert_eq!(turns, 1, "{lines:#?}");
     assert!(
@@ -1437,16 +1246,6 @@ fn a_restart_of_a_landed_session_types_no_land_instruction() {
 }
 
 /// A RESTART OVER SOMEONE ELSE'S EDITS KEEPS THE LANDING AND ASKS NO
-/// REPOSITORY (`Session::repo_read`, `TurnEndState::landing_words_read`):
-/// the journal's landing, the restarted loop's first point the landing's own
-/// words (the mark its point kept) with no turn run since, over a checkout
-/// that now holds work: the probe is never asked, nothing is typed, the face
-/// is landed. The recheck of d88a7bf289 found the restarted loop probed,
-/// reopened the landed worker and typed `land@v1`. NEGATIVE CONTROLS: a turn
-/// run after it re-probes, and over that work Land's nudge is typed; and a
-/// loop started as the session's Off lifted — a person's act, which re-arms
-/// Land (`TurnEndState::park_off`) — asks the repository, and over the same
-/// work the landing is over: Land's instruction again, the face open.
 #[test]
 fn a_restart_over_someone_elses_edits_keeps_the_landing_and_asks_no_repository() {
     let min = |n: u64| Duration::from_secs(60 * n);
@@ -1484,7 +1283,6 @@ fn a_restart_over_someone_elses_edits_keeps_the_landing_and_asks_no_repository()
     assert_eq!(turns, 0, "{lines:#?}");
     assert_eq!(told, [TaskFace::Landed], "{lines:#?}");
     assert_eq!(probes, 0, "no repository asked: {lines:#?}");
-    // NEGATIVE CONTROL: a turn run since.
     let (turns, told, probes, lines) = restart(
         "restart-edited-turn",
         vec![ended(LANDING_REPLY), busy_screen(), ended(LANDING_REPLY)],
@@ -1500,7 +1298,6 @@ fn a_restart_over_someone_elses_edits_keeps_the_landing_and_asks_no_repository()
     );
     assert_eq!(told.first(), Some(&TaskFace::Landed), "{lines:#?}");
     assert!(told.contains(&TaskFace::Open), "{lines:#?}");
-    // NEGATIVE CONTROL: the loop started as the session's Off lifted.
     let (turns, told, probes, lines) = restart_as(
         "restart-edited-off",
         vec![ended(LANDING_REPLY)],
@@ -1519,8 +1316,6 @@ fn a_restart_over_someone_elses_edits_keeps_the_landing_and_asks_no_repository()
 }
 
 /// The reply that ends SOMEONE ELSE'S TASK after a landing: their own job,
-/// ended on the worker's token (the Together run's person's turn: a module
-/// docstring, its tests and its commit).
 const THEIR_LANDING_REPLY: &str =
     "Added the module docstring, ran the tests and committed it.\nATERM-TASK-DONE";
 
@@ -1537,10 +1332,6 @@ fn landed_note(line: &str) -> bool {
 }
 
 /// THE FIRST LOOP OF A LANDING: under Land, the job's progress, the land
-/// instruction, its done reply — `DONE … rule=land@v1` — then `then` (a turn
-/// of someone else's, say), over the ledger and journal at `ledger`, with a
-/// person's hand on the script's screens `hand`. What the host was told and
-/// the turns typed.
 fn land_first(
     ledger: &Path,
     then: Vec<Vec<String>>,
@@ -1563,8 +1354,6 @@ fn land_first(
 }
 
 /// A LOOP STARTED AS THE SESSION'S OFF LIFTED, under `word`, at the screen
-/// `said`, over the same ledger and journal: what the host was told, the
-/// turns typed, the lines it added to the journal, and what it said.
 fn after_off(
     ledger: &Path,
     word: &'static str,
@@ -1575,7 +1364,6 @@ fn after_off(
 }
 
 /// [`after_off`] over `screens`, the mock set up further by `more` (the
-/// timer's word, say) and handed back as the run left it.
 fn after_off_on(
     ledger: &Path,
     word: &'static str,
@@ -1593,27 +1381,10 @@ fn after_off_on(
 }
 
 /// [`THEIR_LANDING_REPLY`] drawn again at another width: its words wrapped
-/// onto other rows (a resize's redraw), a new point to the loop's key.
 const THEIR_LANDING_REPLY_REWRAPPED: &str =
     "Added the module docstring, ran the tests\nand committed it.\nATERM-TASK-DONE";
 
 /// SOMEONE ELSE'S DONE TURN AFTER A LANDING IS NEVER READ AS THE LANDING
-/// (Together D3, the real sequence of 2026-10-16 on Claude Code 2.1.302:
-/// `DONE seq=41432 rule=land@v1`; a person's turn typed into Claude ended on
-/// `ATERM-TASK-DONE`, `EVENT idle seq=46002`; Autopilot Off; then Cruise
-/// with a timer, whose new loop journaled `DONE seq=46004 rule=land@v1 the
-/// worker said it is done after the land instruction` and read
-/// `task=landed`; then the same again when Land was chosen). The first loop
-/// lands the task and someone else's turn after it ends on a done claim:
-/// open again (or theirs, their hand in it), never landed. The loops started
-/// as Off lifts — under Cruise with a timer that turns the word Land, and
-/// under Land — read that turn in the files beside the session (its point
-/// judged in the ledger, its words not the landing's) and are never told
-/// `landed`, and no loop after the landing notes a second `DONE …
-/// rule=land@v1`. NEGATIVE CONTROLS:
-/// `a_plain_landing_restarted_after_off_still_reads_landed` (a plain landing
-/// restarted reads landed); the same turn where no loop watched it, in
-/// neither file, is the next test, whose first point's words drop the seed.
 #[test]
 fn someone_elses_done_turn_after_a_landing_is_never_read_as_the_landing() {
     for (tag, hand) in [
@@ -1644,7 +1415,6 @@ fn someone_elses_done_turn_after_a_landing_is_never_read_as_the_landing() {
             1,
             "{tag}: the landing, once: {log}"
         );
-        // Off, then Cruise with a timer that fires; then Off again, and Land.
         for word in ["cruise", "land"] {
             let (told, _, added, lines, m) = if word == "cruise" {
                 after_off_on(
@@ -1681,18 +1451,6 @@ fn someone_elses_done_turn_after_a_landing_is_never_read_as_the_landing() {
 }
 
 /// A DONE TURN NO LOOP WATCHED, AFTER A LANDING, IS NO LANDING (the review of
-/// Together D3, 2026-10-17): the first loop lands; then a turn is typed and
-/// ends on the worker's token while Off has stopped the loop, so the journal
-/// holds nothing of it. The loop started as Off lifts under Land arms the
-/// landing's seed from the journal, told `landed` at its start as any seeded
-/// loop under Land is; but its first point's last words are not the
-/// landing's ([`said_mark`]): the seed is dropped there, the face is open,
-/// and no `DONE … rule=land@v1` is noted over a reply no land act preceded.
-/// Under Cruise (a timer armed) the seed is dropped before the start face
-/// ([`TurnEndState::start_under`]): `open` only. NEGATIVE CONTROLS: the
-/// plain landing restarted over its own reply reads landed (below); and this
-/// test with the words' check taken out of `TurnEndState::observe` fails at
-/// `[Landed]` and the false landed note.
 #[test]
 fn a_done_turn_no_loop_watched_after_a_landing_is_no_landing() {
     for word in ["cruise", "land"] {
@@ -1709,7 +1467,6 @@ fn a_done_turn_no_loop_watched_after_a_landing_is_no_landing() {
         };
         assert_eq!(told, start, "{word}: {log}");
         assert!(!added.iter().any(|l| landed_note(l)), "{word}: {log}");
-        // …and the loop after it seeds nothing.
         let (told, _, _, _) = after_off(&ledger, word, THEIR_LANDING_REPLY);
         assert_eq!(told.first(), Some(&TaskFace::Open), "{word}");
         assert!(!told.contains(&TaskFace::Landed), "{word}");
@@ -1718,26 +1475,11 @@ fn a_done_turn_no_loop_watched_after_a_landing_is_no_landing() {
 }
 
 /// A LANDING RIDDEN THROUGH A SEAMLESS UPDATE'S CUT STILL READS LANDED AFTER
-/// ITS RESTART (the review of Together D3, 2026-10-17). After the landing an
-/// update cuts the loop's wait (exit 75): the loop rides it out and hands the
-/// same, unmoved point over again under the successor's seq, which starts
-/// over (`RECONNECTED`, then `EVENT idle seq=9`). Read by its seq that point
-/// was another one, so the next restart under Land dropped the seed: the
-/// landing's defense got the land instruction typed into landed work (the v1
-/// defect §9.4.5's seed was made for). Read by its words ([`said_mark`]) it
-/// is the landing's own: the restart is told `landed`, types nothing and
-/// notes the landing once more, for each defense. NEGATIVE CONTROL: this
-/// test with `landed_before` reading the later points by `seq=` again fails
-/// at the restart's `[Open]` and its one turn.
 #[test]
 fn a_landing_ridden_through_an_update_cut_reads_landed_after_its_restart() {
     const SHORT_DEFENSE: &str =
         "Verified, committed and pushed the parser.\nNothing left: it is all on remote main.";
     for reply in [SHORT_DEFENSE, LANDING_REPLY] {
-        // The cut's request index, after the landing: the first that leaves
-        // the landing's point handed over again after the reconnect. Every
-        // index is tried at once, each on a thread of its own: a run whose cut
-        // misses waits its loop out.
         let cut = |i: usize| {
             let (dir, ledger) = files("update-cut", &[], &[]);
             let host = Arc::new(Faces::default());
@@ -1794,16 +1536,6 @@ fn a_landing_ridden_through_an_update_cut_reads_landed_after_its_restart() {
 }
 
 /// A PLAIN LANDING, RESTARTED, STILL READS LANDED (the negative control of
-/// `someone_elses_done_turn_after_a_landing_is_never_read_as_the_landing` and
-/// `a_done_turn_no_loop_watched_after_a_landing_reads_done_not_landed`, over
-/// a journal and ledger the first loop wrote itself, not hand-made ones):
-/// with no turn after the landing, the loop started as Off lifts under Land
-/// seeds the landing: told `landed` at its start and nothing after, nothing
-/// typed, its journal saying the landing once more. What the first loop
-/// journals after its landing, while that point stands, is no later point.
-/// Under Cruise (a timer armed) the landed session goes on: Cruise takes
-/// nothing as the end, so the landing's defense is a done claim, owed the
-/// done check, and the face the loop leaves told is `open`.
 #[test]
 fn a_plain_landing_restarted_after_off_still_reads_landed() {
     let (dir, ledger) = files("plain-landing", &[], &[]);
@@ -1836,11 +1568,6 @@ fn a_plain_landing_restarted_after_off_still_reads_landed() {
 }
 
 /// THE HOST THAT TAKES THE TASK'S END AND STOPS ITS LOOP THERE: it wants the
-/// idle point after the `at`-th turn ran — the point the task ends at — and
-/// takes it with a step that moves the session (the live upgrade's quiet
-/// restart, `done:resumed`), raising the loop's stop as it steps, as the
-/// window's host stops a worker whose session reads Off, whose SUPERVISION
-/// setting was saved, or whose aterm updates itself. Every face is recorded.
 #[derive(Debug)]
 struct EndTaker {
     at: usize,
@@ -1891,28 +1618,19 @@ impl IdleHost for EndTaker {
 }
 
 /// HOW THE FIRST LOOP OF A TASK THAT ENDS IS CUT at the task's end
-/// ([`ended_first_cut`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Cut {
-    /// Not cut: no host step comes, and the loop runs on to the session's
-    /// end.
+    /// Not cut: no host step comes, and the loop runs on to the session's end.
     No,
-    /// The host's step takes the end's point and stops the loop there
-    /// ([`EndTaker`]).
+    /// The host's step takes the end's point and stops the loop there ([`EndTaker`]).
     HostStep,
-    /// The reader of the loop's lines goes away as the end's point line is
-    /// printed: that print and every one after it fail ([`ReaderGone`]), as
-    /// a CLI `aterm supervise watch` piped into a reader that quit.
+    /// The reader of the loop's lines goes away as the end's point line is printed.
     ReaderGone,
-    /// The host hangs the loop's connection up as the fold publishes the
-    /// end (`task mark done …`, [`Mock::hang_up_at`]): that request and
-    /// every one after it fail in the transport, as the window's host cuts
-    /// a loop short to stop it at once.
+    /// The host hangs the loop's connection up as the fold publishes the end (`task mark done …`, [`Mock::hang_up_at`]).
     HungUp,
 }
 
 /// THE LOOP'S STDOUT, whose reader goes away at its `ok + 1`-th `EVENT
-/// idle` line: that write and every one after it fail (`BrokenPipe`).
 #[derive(Debug)]
 struct ReaderGone {
     ok: usize,
@@ -1941,11 +1659,6 @@ impl std::io::Write for ReaderGone {
 }
 
 /// THE FIRST LOOP OF A TASK THAT ENDS, under Land, over the ledger and
-/// journal at `ledger`: the job's progress, Land's instruction the policy
-/// types there, then `last`, its answer (Autopilot Land: the one end is a
-/// landing; Cruise never ends). With `take`, the host takes the end's point
-/// and stops the loop there ([`EndTaker`]); else no host step comes. The
-/// faces told, the turns typed, the lines said.
 fn ended_first(ledger: &Path, last: &str, take: bool) -> (Vec<TaskFace>, usize, Vec<String>) {
     ended_first_cut(ledger, last, if take { Cut::HostStep } else { Cut::No })
 }
@@ -1965,7 +1678,6 @@ fn ended_first_cut(ledger: &Path, last: &str, cut: Cut) -> (Vec<TaskFace>, usize
     m.vanish_after = Some(6);
     m.cursor_on_caret = true;
     m.stall_sleep = Some(Duration::from_millis(20));
-    // The published end: a manager's worker, its record `working`.
     let tasks = (cut == Cut::HungUp).then(|| ledger.with_file_name("tasks"));
     if tasks.is_some() {
         m.task = Some((
@@ -1994,7 +1706,6 @@ fn ended_first_cut(ledger: &Path, last: &str, cut: Cut) -> (Vec<TaskFace>, usize
         s.set_approval_ledger(Some(ledger.to_path_buf()));
     };
     let lines = if cut == Cut::ReaderGone {
-        // The points before the end's print; the end's own fails.
         let mut out = ReaderGone {
             ok: 1,
             gone: false,
@@ -2039,11 +1750,6 @@ fn ended_first_cut(ledger: &Path, last: &str, cut: Cut) -> (Vec<TaskFace>, usize
 }
 
 /// The follower of a landing's books, on them alone ([`run`], its screen
-/// the landing's reply): under Land — restarted in place, or started as the
-/// session's Off lifts — it restates the landing at its start with the first
-/// note's time and types nothing; under Cruise (started as Off lifts) the
-/// landed session goes on, its defense a done claim owed the done check, the
-/// face it leaves told `open`.
 fn follow_landing(ledger: &Path, tag: &str, follower: &'static str, lifted: bool) {
     let at = note_time(ledger, RULE_LAND);
     let host = Arc::new(Faces {
@@ -2084,27 +1790,9 @@ fn follow_landing(ledger: &Path, tag: &str, follower: &'static str, lifted: bool
 }
 
 /// A LANDING THE HOST'S STEP TOOK IS NOTED, AND A LOOP THAT FOLLOWS READS IT
-/// AS THE FIRST LOOP DID (the claim of 2026-10-20 against main's `look()`:
-/// the end's point journaled, its `DONE …` note owed to the point's act,
-/// which the host's step there skips). Under Autopilot Land the one end is a
-/// landing: the host's step takes the very point the task lands at — the
-/// clean defense answering Land's instruction — and the loop is stopped as
-/// it steps. The journal still says the landing right after its point's
-/// line, before the host's step; and a loop that follows on those books —
-/// restarted in place, or started as the session's Off lifts under Land —
-/// restates the landing at its start with the first note's time and types
-/// nothing ([`follow_landing`]). Before the fix no note was written: every
-/// follower started `open` and stamped the end with its own clock, and a
-/// landing whose Land episode ended with the Off its loop was stopped under
-/// got the land instruction again, typed into the finished work. A follower
-/// started under Cruise goes on, as Cruise does over any landing. NEGATIVE
-/// CONTROL: the same first loop with no host step notes the landing, and its
-/// followers read the same.
 #[test]
 fn a_tasks_end_the_hosts_step_took_is_noted_and_its_follower_types_nothing() {
     for take in [true, false] {
-        // Each follower on the first loop's books alone: a follower's own
-        // note would seed the next.
         for (follower, lifted) in [("land", false), ("land", true), ("cruise", true)] {
             let tag = format!("end-taken-{take}-{follower}-{lifted}");
             let (dir, ledger) = files(&tag, &[], &[]);
@@ -2136,21 +1824,6 @@ fn a_tasks_end_the_hosts_step_took_is_noted_and_its_follower_types_nothing() {
 }
 
 /// A LANDING IS NOTED HOWEVER ITS LOOP IS CUT AT ITS POINT, and a loop that
-/// follows reads it as the first loop did (the review of 2026-10-20 of
-/// `Session::say_point`). Two cuts that are no host step: the reader of the
-/// loop's lines goes away as the landing's point line prints (a CLI `aterm
-/// supervise watch` piped into a reader that quit, [`Cut::ReaderGone`]), and
-/// the host hangs the loop's connection up as the fold publishes the end
-/// (the window's host stopping a worker at once, [`Cut::HungUp`]). Either
-/// way the journal says the landing's point, then its note, before the
-/// loop's `EXIT`; and a loop that follows on those books reads it as
-/// [`follow_landing`] says. Before, the note stayed owed past the failure:
-/// the print that failed returned before it, and the request that failed in
-/// the fold returned before the point's line too, so the books held the
-/// end's ledger rows and no note — every follower started `open`, stamped
-/// the end with its own clock, and (Off lifted) typed the land instruction
-/// into the finished work. NEGATIVE CONTROL: the uncut first loops of
-/// [`a_tasks_end_the_hosts_step_took_is_noted_and_its_follower_types_nothing`].
 #[test]
 fn a_tasks_end_is_noted_when_its_point_line_or_its_publish_fails() {
     for cut in [Cut::ReaderGone, Cut::HungUp] {
@@ -2181,12 +1854,6 @@ fn a_tasks_end_is_noted_when_its_point_line_or_its_publish_fails() {
 }
 
 /// A PERSON'S TURN AFTER A LANDING THAT LEAVES THE TASK OPEN SEEDS OPEN:
-/// their own exchange after the landing (their hand in it), whose reply
-/// says no done — `theirs`, nothing typed after it. The loop after an Off
-/// starts open, never `landed` for a moment, no landing is journaled, and
-/// the exchange stays the person's (`theirs`, `LEFT … left-to-person@v1`):
-/// nothing is typed until the next turn ends, as the loop that left it to
-/// them would have. NEGATIVE CONTROL: the plain landing above reads landed.
 #[test]
 fn a_persons_turn_after_a_landing_that_leaves_the_task_open_seeds_open() {
     let (dir, ledger) = files("open-own-exchange", &[], &[]);
@@ -2221,11 +1888,6 @@ fn a_persons_turn_after_a_landing_that_leaves_the_task_open_seeds_open() {
 }
 
 /// A host owed one carry-on, as the window's host is after a relaunch
-/// (`harness_host`'s `WorkerIdle`): it wants the first idle point, records
-/// what the loop told it of that point ([`IdlePoint`]) and every face, and
-/// answers as `relaunch::resume_as` does — nothing typed at a task done
-/// under Land (`done:said-done`), else its continuation typed
-/// (`continued`).
 #[derive(Debug, Default)]
 struct Carrier {
     points: Mutex<Vec<IdlePoint>>,
@@ -2289,10 +1951,6 @@ impl IdleHost for Carrier {
 }
 
 /// A relaunched agent's first point under the word `word`, its screen
-/// `said` (the conversation it resumed), its carry-on owed to `host`, at
-/// test speed, its approval ledger and journal at `ledger`: what the loop
-/// said, the turns it typed, and its journal's lines. A cold restore's new
-/// tab has both empty; a restart of the same session has its own.
 fn relaunched(
     said: &str,
     word: &'static str,
@@ -2330,17 +1988,6 @@ fn relaunched(
 }
 
 /// A RELAUNCHED TASK LANDED UNDER LAND GETS NO CARRY-ON (the Autopilot
-/// design's §9.4.8; Autopilot Land: only Land's landing is done): a restart
-/// of the same session whose landing is seeded (its journal's `DONE …
-/// rule=land@v1`) is told done under Land at its first point; the host
-/// types nothing (`HOST … carry-on step=done:said-done`), its reply reads
-/// landed — noted right after the point's own line and before the host's
-/// (`Session::say_point`) — and the face is landed. NEGATIVE CONTROLS: a cold restore's new
-/// tab — its journal and ledger empty — whose resumed conversation's last
-/// reply is a defense is told no such thing (no landing of this loop's or
-/// seeded: the words alone are a claim), nor is a Land session mid-work, or
-/// a Cruise session whose reply is a defense; the host's carry-on is its to
-/// decide as before.
 #[test]
 fn a_relaunched_task_landed_under_land_is_told_so_and_typed_nothing() {
     let min = |n: u64| Duration::from_secs(60 * n);
@@ -2362,7 +2009,6 @@ fn a_relaunched_task_landed_under_land_is_told_so_and_typed_nothing() {
     let done = IdlePoint {
         done_under_land: true,
     };
-    // A restart of the same session, its landing seeded: told so, landed.
     let (points, faces, turns, notes, lines) = carried("carry-landed", LANDING_REPLY, "land", true);
     assert_eq!(points, [done], "{notes:#?}");
     assert_eq!(turns, 0, "nothing typed: {lines:#?}");
@@ -2371,8 +2017,6 @@ fn a_relaunched_task_landed_under_land_is_told_so_and_typed_nothing() {
         .iter()
         .position(|l| l.starts_with("HOST ") && l.ends_with("carry-on step=done:said-done"))
         .unwrap_or_else(|| panic!("the host's word: {notes:#?}"));
-    // The landing restated at the point is noted right after the point's
-    // own line and before the host's (`Session::say_point`).
     let end = notes
         .iter()
         .rposition(|l| l.starts_with("DONE ") && l.contains(&format!(" rule={RULE_LAND} ")))
@@ -2381,8 +2025,6 @@ fn a_relaunched_task_landed_under_land_is_told_so_and_typed_nothing() {
         end > 0 && notes[end - 1].starts_with("EVENT idle ") && end < host_line,
         "the point, its landing, then the host's word: {notes:#?}"
     );
-    // NEGATIVE CONTROLS: a cold restore's defense, mid-work under Land, a
-    // defense under Cruise.
     for (tag, said, word) in [
         ("carry-cold", LANDING_REPLY, "land"),
         ("carry-mid-work", PROGRESS, "land"),
@@ -2400,10 +2042,6 @@ fn a_relaunched_task_landed_under_land_is_told_so_and_typed_nothing() {
 }
 
 /// A host that restarts its agent for the memory banner, as the window's
-/// host does (`harness_host`'s `IdleHost::restart`: `adopted`), and then owes
-/// the relaunch's carry-on at the next idle point: it records what the loop
-/// told it of that point ([`IdlePoint`]) and answers as `relaunch::resume_as`
-/// does, as [`Carrier`] does.
 #[derive(Debug, Default)]
 struct Restarter {
     carry: std::sync::atomic::AtomicBool,
@@ -2455,15 +2093,6 @@ impl IdleHost for Restarter {
 }
 
 /// A LANDING THE MEMORY BANNER CUT IS CARRIED ON AFTER ITS RESTART (the
-/// review of 2026-10-16, §9.4.8): under Land a job's done report gets the
-/// land instruction, whose turn ends at Claude Code's memory banner; the
-/// host restarts the agent in place, and at the relaunched agent's first
-/// point, its resumed reply progress, the loop tells the host nothing of a
-/// task done (the done report before the banner stands, but the banner's
-/// reply said nothing), so the carry-on is typed (`continued`). NEGATIVE
-/// CONTROL: the landing lands (its clean defense), the banner comes after it,
-/// and the relaunched agent's first point is told done under Land: nothing
-/// typed (`done:said-done`).
 #[test]
 fn a_landing_the_memory_banner_cut_is_carried_on_after_its_restart() {
     use aterm_phase::prompt::fixtures::{MEMORY_BANNER_IDLE, screen};
@@ -2522,7 +2151,6 @@ fn a_landing_the_memory_banner_cut_is_carried_on_after_its_restart() {
             .iter()
             .any(|l| l.starts_with("HOST ") && l.ends_with(&format!("carry-on step={step}")))
     };
-    // The landing cut by the banner, its agent restarted mid-landing.
     let (points, restarts, notes, lines) = restarted("carry-cut", Vec::new(), PROGRESS);
     let log = format!("{notes:#?}\n{lines:#?}");
     assert!(
@@ -2541,7 +2169,6 @@ fn a_landing_the_memory_banner_cut_is_carried_on_after_its_restart() {
         !notes.iter().any(|l| l.contains("rule=land-nudge@v1")),
         "no land nudge in the carry-on's place: {log}"
     );
-    // NEGATIVE CONTROL: landed before the banner; nothing typed after it.
     let (points, restarts, notes, lines) = restarted(
         "carry-landed-then-banner",
         vec![ended(LANDING_REPLY)],
@@ -2571,14 +2198,6 @@ fn a_landing_the_memory_banner_cut_is_carried_on_after_its_restart() {
 }
 
 /// A LOOP STARTED UNDER CRUISE OVER A LANDING'S BOOKS TELLS NO LANDING (the
-/// merge review's P2): the journal holds a real landing (`DONE …
-/// rule=land@v1`), and the session is now under Cruise — started fresh, or
-/// as its Off lifts. The loop reads the session's word before it tells its
-/// start face ([`TurnEndState::start_under`]), so it tells `open` and never
-/// `landed`: told `landed` first, the window showed `status task=landed`,
-/// the glass's end mark and the chip's `· landed` for a Cruise task until
-/// its first point. NEGATIVE CONTROL: the same books under Land restate the
-/// landing, with its note's time, and type nothing.
 #[test]
 fn a_cruise_loop_over_a_landings_books_tells_no_landing() {
     let (dir, ledger) = files("cruise-over-landing", &[], &[]);
@@ -2612,7 +2231,6 @@ fn a_cruise_loop_over_a_landings_books_tells_no_landing() {
         assert_eq!(host.noted(), [], "lifted={lifted}: {lines:#?}");
     }
     let _ = std::fs::remove_dir_all(&dir);
-    // NEGATIVE CONTROL: under Land.
     let (dir, ledger) = files("land-over-landing", &[], &[]);
     let (told, _, lines) = ended_first(&ledger, LANDING_REPLY, false);
     assert_eq!(told, [TaskFace::Open, TaskFace::Landed], "{lines:#?}");
@@ -2634,16 +2252,6 @@ fn a_cruise_loop_over_a_landings_books_tells_no_landing() {
 }
 
 /// A LOOP THAT ATTACHES TO THE LANDED TASK'S OWN WAKE OVER WORK IN THE
-/// REPOSITORY KEEPS NO LANDING (`TurnEndState::wake_start_owed`, the Off's
-/// rule of `TurnEndState::observe`): the loop's first read is the wake
-/// running, so no probe of its own saw the wake begin, and what the probe
-/// finds at the wake's end may be the wake's work — or, where the loop
-/// started as the session's Off lifted (a person's act), the person's own
-/// edit made under Off. The review of b8/residuals found a successor take
-/// its first live frame's probe as the wake's start (the wake forgiven the
-/// work), and an Off and back then the wake come back landed over the
-/// person's edit. Both now reopen: Land's nudge is typed. NEGATIVE CONTROL:
-/// the same wakes over a clean repository keep the landing, nothing typed.
 #[test]
 fn a_loop_attached_to_the_tasks_own_wake_keeps_no_landing_over_work_found() {
     let min = |n: u64| Duration::from_secs(60 * n);
@@ -2701,7 +2309,6 @@ fn a_loop_attached_to_the_tasks_own_wake_keeps_no_landing_over_work_found() {
                     || l.contains(&format!("rule={RULE_LAND} "))),
             "lifted={lifted}: {lines:#?}"
         );
-        // NEGATIVE CONTROL: a clean repository.
         let (turns, told, lines) = go(&format!("attach-clean-{lifted}"), lifted, None);
         assert_eq!(turns, 0, "lifted={lifted}: {lines:#?}");
         assert_eq!(
@@ -2713,15 +2320,6 @@ fn a_loop_attached_to_the_tasks_own_wake_keeps_no_landing_over_work_found() {
 }
 
 /// A LANDED TASK'S TALL WAKE WITH A NEED ABOVE THE SCREEN KEEPS NO LANDING
-/// (`TurnEndState::reads_turn_whole`): a successor's first read is the
-/// landed task's own wake (the record saying nobody asked), a turn whose
-/// start — a `NEEDS YOU:` said there — is in the history above the screen,
-/// its last words claiming no done. The review of b8/residuals found the
-/// history read only where the last words claimed done: the landing held
-/// over the need, which was never raised. Now the turn is read whole: the
-/// need is put up and the landing reopens. NEGATIVE CONTROLS: the same
-/// wake short enough to fit does the same, and a tall wake with no need in
-/// it keeps the landing, nothing typed.
 #[test]
 fn a_tall_wake_with_a_need_above_the_screen_keeps_no_landing() {
     let min = |n: u64| Duration::from_secs(60 * n);
@@ -2797,7 +2395,6 @@ fn a_tall_wake_with_a_need_above_the_screen_keeps_no_landing() {
         assert_eq!(turns, 1, "tall={tall}: {lines:#?}");
         assert_eq!(told.last(), Some(&TaskFace::Open), "tall={tall}: {told:?}");
     }
-    // NEGATIVE CONTROL: a tall wake that names no need.
     let (tall, turns, told, raised, lines) = go(20, false);
     assert!(tall);
     assert!(!raised, "{lines:#?}");
@@ -2806,18 +2403,6 @@ fn a_tall_wake_with_a_need_above_the_screen_keeps_no_landing() {
 }
 
 /// A RESTART AFTER A KEPT WAKE KEEPS THE LANDING
-/// (`TurnEndState::take_wake_restated`, `TurnEndState::seed_landed_by_wake`):
-/// a live landing, then the landed task's own wake (nobody's act), kept
-/// landed; then the loop restarts (nobody's act) over the wake's screen.
-/// The review of b8/residuals found the restart read the wake's turn-ran row
-/// and its point (the wake's own words, no defense) as a turn after the
-/// landing: the seed was dropped and Land's nudge typed into the landed
-/// work. The loop now restates the landing's note after the wake's point,
-/// and the restart takes it up — and a second restart, over the note the
-/// first restated, keeps it too, as does the loop after a successor that
-/// attached as a later wake ran and kept it. NEGATIVE CONTROLS: a restart with no wake
-/// keeps it as before, and a restart over other last words (a turn no loop
-/// watched after the wake) drops it.
 #[test]
 fn a_restart_after_a_kept_wake_keeps_the_landing() {
     let wake = "The monitor fired: the deploy finished.";
@@ -2871,8 +2456,6 @@ fn a_restart_after_a_kept_wake_keeps_the_landing() {
                 "with_wake={with_wake} restart {again}"
             );
         }
-        // A successor that attaches as the next wake runs keeps the landing
-        // through it, and restates it so: the loop after it keeps it too.
         let later = "The second monitor fired: the backup finished.";
         let host = Arc::new(Faces {
             finished: Some(true),
@@ -2894,7 +2477,6 @@ fn a_restart_after_a_kept_wake_keeps_the_landing() {
             "with_wake={with_wake} after the successor's wake: {lines:#?}"
         );
         assert_eq!(told, [TaskFace::Landed], "with_wake={with_wake}");
-        // NEGATIVE CONTROL: other last words since.
         let (_, told, lines) = restart(&ledger, "Rebased the docs branch onto main.");
         assert_ne!(told.last(), Some(&TaskFace::Landed), "{lines:#?}");
         let _ = std::fs::remove_dir_all(&dir);
@@ -2902,14 +2484,6 @@ fn a_restart_after_a_kept_wake_keeps_the_landing() {
 }
 
 /// A SWITCH FROM LAND TO CRUISE ON THE LANDED SCREEN IS READ AT THE WAKE'S
-/// END (`Session::turn_end_at_point`'s fresh word): the loop idles on the
-/// landed screen and reads no word there, so the owner's switch to Cruise
-/// was unread when the landed task's own wake ended, and the wake kept the
-/// landing under Cruise — nothing went on (the review of b8/residuals). The
-/// word is read fresh where a turn ends over a landing: under Cruise the
-/// task reopens and Cruise's continuation is typed. NEGATIVE CONTROL: with
-/// no switch (Land) the same wake keeps the landing, nothing typed after
-/// the land instruction.
 #[test]
 fn a_switch_to_cruise_on_the_landed_screen_is_read_at_the_wakes_end() {
     let wake = "The monitor fired: the deploy finished.";
@@ -2955,7 +2529,6 @@ fn a_switch_to_cruise_on_the_landed_screen_is_read_at_the_wakes_end() {
             .is_some_and(|l| l.contains(" rule=continue@v1 ")),
         "{typed:#?}"
     );
-    // NEGATIVE CONTROL: no switch.
     let (turns, told, typed, lines) = go(false);
     assert_eq!(turns, 1, "{lines:#?}");
     assert_eq!(told, [TaskFace::Open, TaskFace::Landed], "{lines:#?}");
@@ -2963,8 +2536,6 @@ fn a_switch_to_cruise_on_the_landed_screen_is_read_at_the_wakes_end() {
 }
 
 /// What a client says where nothing serves the control socket yet: a
-/// seamless update's successor starts its loops a few milliseconds before
-/// its socket listens, so their first bare `meta` is not served.
 const UNSERVED: &str = "connect /d/aterm-7.sock: Connection refused (os error 61) — aterm \
                         isn't running (nothing is serving this control socket); launch \
                         aterm.app (`open -a aterm`), then `aterm ctl instances` names its pid";
@@ -2979,17 +2550,6 @@ fn bare_metas(m: &Mock) -> Vec<bool> {
 }
 
 /// A LANDING RESTARTED BY A LOOP WHOSE START-UP `meta` WAS NOT SERVED STILL
-/// READS LANDED under the session's own Land (the final check of
-/// 2026-10-20, W1: a seamless update's successor, its loops started before
-/// its control socket listened). The table says Cruise; the session says
-/// Land. The word is unread, not absent: the seed is not decided under the
-/// table's word at the start, and the first point reads the word before it
-/// folds, so the landing is taken up — told `landed`, nothing typed, no
-/// done check — and the word is read again once served. NEGATIVE CONTROL:
-/// the same restart with the start-up `meta` served reads the same; with the
-/// read gated on the host keeping a word (head before the fix) the lost read
-/// left the table's Cruise deciding — told `open`, the done check typed
-/// (`continue-done-check@v1`), and no second `meta` read.
 #[test]
 fn a_landing_whose_successors_first_meta_is_unserved_still_reads_landed() {
     for lose in [false, true] {
@@ -3024,12 +2584,6 @@ fn a_landing_whose_successors_first_meta_is_unserved_still_reads_landed() {
 }
 
 /// A SESSION'S OWN LAND UNDER A CRUISE TABLE, ITS LOOP'S START-UP `meta`
-/// UNSERVED, GETS LAND'S INSTRUCTION at its first point, never Cruise's
-/// continuation: the word never read is read where the decision would act
-/// (`Session::autopilot_read`), not left to the table's because no reply
-/// ever said the host keeps one (W1's second case). NEGATIVE CONTROL: the
-/// same run with the start-up `meta` served types the same `land@v1`; head
-/// before the fix typed the table's Cruise continuation instead.
 #[test]
 fn an_unread_word_is_read_at_the_first_decision_not_left_to_the_table() {
     for lose in [false, true] {
@@ -3066,11 +2620,6 @@ fn an_unread_word_is_read_at_the_first_decision_not_left_to_the_table() {
 }
 
 /// A RESTART OVER A LANDING'S BOOKS under the session's word `word` and the
-/// table's `table`, its first bare `meta` lost where `lose` (a seamless
-/// update's successor, its socket not listening yet), the host as `lifted`
-/// says it started the loop, the mock set up further by `more`: what the
-/// host was told, what the loop said, the turns typed, the bare `meta`s
-/// read, and the lines it added to the journal.
 fn restart_over_landing(
     ledger: &Path,
     screens: Vec<Vec<String>>,
@@ -3120,17 +2669,6 @@ fn restart_over_landing(
 }
 
 /// AN OFF SESSION'S LANDING SURVIVES A LOST START-UP `meta`, and lands
-/// again when the owner turns it to Land (the second review of 2026-10-20,
-/// R1). The session's word is `off`, the table's Cruise; the word turns
-/// `land` at the third read served. Served at the start, the loop keeps
-/// the seed under Off (`TurnEndState::start_under`), parks, and at the
-/// landing's point under Land notes `DONE … rule=land@v1` — told `landed`
-/// alone, nothing typed. Lost at the start, the word is read at the first
-/// look, before its first decision (the Off park among them), so the run
-/// reads the same. NEGATIVE CONTROL: the served run; and the branch with the
-/// word read only at the point (the first fix of W1) passed the Off park
-/// under the table's Cruise, folded the point under Off — dropping the
-/// seed — and was told `[Landed, Open]` and typed `land@v1` into landed work.
 #[test]
 fn an_off_landing_whose_first_meta_is_lost_reads_as_if_it_were_served() {
     for lose in [false, true] {
@@ -3163,15 +2701,6 @@ fn an_off_landing_whose_first_meta_is_lost_reads_as_if_it_were_served() {
 }
 
 /// A RESTART OVER A LANDING'S BOOKS WHOSE START-UP `meta` WAS LOST TELLS NO
-/// FACE BEFORE THE WORD IS READ (the merge review's P2, its lost-read case;
-/// the second review of 2026-10-20, R1). Each word under each table, the
-/// loop started fresh or as Off lifts: lost, the face waits for the first
-/// look's read and is told what the served start tells — `open` alone under
-/// Cruise (never `landed` first: the window read `status task=landed` and
-/// drew the end mark for a Cruise task until its first point), `landed`
-/// alone under Land and Off. NEGATIVE CONTROL: the served start, told the
-/// same; the branch that told the seeded face before the read was told
-/// `[Landed, Open]` under Cruise and under Off.
 #[test]
 fn a_restart_whose_first_meta_is_lost_tells_the_face_its_served_start_tells() {
     for (word, table, want) in [

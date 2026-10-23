@@ -23,5 +23,5 @@ impl Terminal {
 
     /// No-op: no resolver cache to sync.
     #[inline]
-    pub(super) fn sync_bidi_from_damage(&mut self) {}
+    pub(super) const fn sync_bidi_from_damage(&mut self) {}
 }

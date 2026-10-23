@@ -76,6 +76,7 @@ use crate::supervise::policy::turn_end::{HeldBy, Ready, RosterWord, SignInNext};
 use crate::supervise::run::{
     Guard, HostStep, IdlePoint, ProbeMiss, ProbeNo, StallSeen, StuckSurvey, UsageSeen, WaitPlan,
 };
+use crate::supervise::tap_clock::{TapWindow, UsageWindow};
 
 // -- the two hosts ------------------------------------------------------------
 
@@ -226,6 +227,7 @@ tape_arg_debug!(
     ProbeMiss,
     ResetAsk,
     ResetEnd,
+    UsageWindow,
 );
 
 /// A call's request as a tape holds it: `name=<Debug>` for each argument, a
@@ -876,6 +878,38 @@ impl TapeValue for Option<StandingLimit> {
             window: w.window,
             at: w.at,
             row: w.row,
+        }))
+    }
+}
+
+/// The usage tap's newest reading of one window
+/// ([`super::super::IdleHost::tap_window`]) as a tape holds it: the window's
+/// figure (its whole percent, its reset in unix seconds and its tenths, as
+/// [`crate::harness::tap::Window`] holds them), and when the tap wrote it.
+#[derive(Serialize, Deserialize)]
+struct TapWindowWire {
+    figure: Option<(u32, i64, Option<u32>)>,
+    read_at: i64,
+}
+
+impl TapeValue for Option<TapWindow> {
+    fn to_tape(&self) -> Vec<u8> {
+        json(&self.map(|w| TapWindowWire {
+            figure: w.figure.map(|f| (f.pct, f.resets_at, f.pct_x10)),
+            read_at: w.read_at,
+        }))
+    }
+
+    fn from_tape(bytes: &[u8]) -> Result<Self, CodecError> {
+        Ok(of_json::<Option<TapWindowWire>>(bytes)?.map(|w| TapWindow {
+            figure: w
+                .figure
+                .map(|(pct, resets_at, pct_x10)| crate::harness::tap::Window {
+                    pct,
+                    resets_at,
+                    pct_x10,
+                }),
+            read_at: w.read_at,
         }))
     }
 }

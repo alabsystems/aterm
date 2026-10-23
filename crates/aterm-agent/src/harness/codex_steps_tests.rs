@@ -1,11 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tests for [`super`]: the Codex step fold over the lab's committed Codex
-//! 0.163.0 rollouts (reduced: keys, order, closed words and numbers kept,
-//! ids remapped, every other string replaced) and over rows composed in the
-//! shapes those rollouts and `super::super::codex_rollout`'s measured forks
-//! show (values made up).
+//! Tests for [`super`] over committed Codex rollout reductions and synthetic rows.
 
 use super::*;
 use crate::harness::codex_rollout::PAGINATED;
@@ -35,7 +31,6 @@ fn rows(text: &str) -> impl Iterator<Item = &str> {
 }
 
 /// `text`'s rows pushed through a fold bound at `seed` with floor `floor`,
-/// each ending past its newline, and what the fold queued.
 fn fold_with(text: &str, seed: u64, floor: u64) -> (CodexStepFold, StepBatch) {
     let mut fold = CodexStepFold::new(floor);
     fold.bind(FP, ID, seed);
@@ -103,7 +98,6 @@ fn turn(n: &str) -> String {
 }
 
 /// A `turn_context` of turn `id` on `model`, as 0.163.0 writes one (its
-/// policies and profiles stand-ins).
 fn ctx(ms: i64, id: &str, model: &str) -> String {
     format!(
         "{{\"timestamp\":\"{}\",\"type\":\"turn_context\",\"payload\":{{\"turn_id\":\"{id}\",\
@@ -157,16 +151,6 @@ fn opening() -> String {
 }
 
 /// THE LAB'S ROLLOUT, FOLDED (5G-2; T9). Each leg the lab ran on Codex
-/// 0.163.0 is its turn: a plain turn, a tool call (`exec`), an approval
-/// (`exec` again, its command escalated), a question
-/// (`request_user_input`), Esc (`turn_aborted`), the usage wall
-/// (`task_complete` with `usage_limit_exceeded`), a compaction (its count
-/// and `compacted` before its `turn_context`, so its compaction is said
-/// before its prompt and its tokens are its own) and a subagent
-/// (`spawn_agent` in `collaboration`). Each turn opens once, at its
-/// `turn_context`; its tokens are its growing counts' `last_token_usage`;
-/// the model is said once. Every step is partial: no codex-alab build was
-/// measured. Nothing is lost.
 #[test]
 fn the_labs_rollout_folds_to_its_legs() {
     let batch = fold(MAIN);
@@ -204,8 +188,6 @@ fn the_labs_rollout_folds_to_its_legs() {
     assert_eq!((batch.lost, batch.overflow), (0, 0));
     assert!(batch.steps.iter().all(|s| s.state == StepState::Partial));
     assert_eq!(batch.end, End::default());
-    // Each step has its own place, in the rollout's order, and its row's
-    // time (the reduction's, moved to 2000).
     let offs: Vec<u64> = batch.steps.iter().map(|s| s.pos.off).collect();
     assert!(offs.windows(2).all(|w| w[0] < w[1]), "{offs:?}");
     let y2000 = u64::try_from(stamp_ms("2000-01-01T00:00:00Z").expect("a stamp")).expect("ms");
@@ -214,13 +196,6 @@ fn the_labs_rollout_folds_to_its_legs() {
 }
 
 /// A SUBAGENT'S COPY IS NO ONE'S TURN (measured on the lab's subagent): its
-/// rollout copies its parent's `session_meta`, a compaction and two of its
-/// parent's turns in one burst, then writes its own
-/// `thread_settings_applied`, and only its own turn is read, on its own
-/// model and effort. NEGATIVE CONTROLS: read with no fork's `session_meta`
-/// first, the copy opens and ends the parent's turns (the phantoms the copy
-/// rule keeps out); with its settings line naming another thread, the burst
-/// holds its own turn too (a loss, never a phantom).
 #[test]
 fn a_subagents_copy_steps_nothing() {
     let batch = fold(SUBAGENT);
@@ -234,7 +209,6 @@ fn a_subagents_copy_steps_nothing() {
         ]
     );
     assert_eq!((batch.lost, batch.overflow), (0, 0));
-    // NEGATIVE CONTROLS.
     let headless: String = rows(SUBAGENT).skip(1).map(|r| format!("{r}\n")).collect();
     let phantoms = saids(&fold(&headless));
     for parent in [turn("10"), turn("17")] {
@@ -260,13 +234,6 @@ fn a_subagents_copy_steps_nothing() {
 }
 
 /// A LEGACY FORK'S COPY (`super::super::codex_rollout`'s header, measured on
-/// 0.163.0): its parent's rows, counts among them, under one stamp, a
-/// `turn_aborted` of its parent's open turn, a copied settings line naming
-/// the parent, then its own in the same millisecond, and the prompt's turn
-/// at once. Only that turn is read, its tokens its own count's (the copy's
-/// total stands). NEGATIVE CONTROLS: with no fork's `session_meta` first the
-/// parent's turns open, end and abort; with its own settings line naming
-/// another thread the burst holds the prompt's turn.
 #[test]
 fn a_legacy_forks_copy_steps_nothing() {
     let forked = |own: &str| {
@@ -298,7 +265,6 @@ fn a_legacy_forks_copy_steps_nothing() {
             "end 16 13992 0"
         ]
     );
-    // NEGATIVE CONTROLS.
     let headless: String = forked(FORK)
         .lines()
         .skip(1)
@@ -317,11 +283,6 @@ fn a_legacy_forks_copy_steps_nothing() {
 }
 
 /// A PAGINATED `/fork` copies nothing (measured on 0.163.0): its
-/// `session_meta` and its own settings line in one millisecond, then a
-/// person's turn seconds on, read on its own counts. A turn right after the
-/// settings line is read too: the line, not the stamps, ends the copy.
-/// NEGATIVE CONTROL: with the settings line naming another thread, a turn
-/// inside the burst is held as the copy's.
 #[test]
 fn a_paginated_fork_reads_its_own_turn() {
     let fork = |own: &str, after: i64| {
@@ -343,15 +304,10 @@ fn a_paginated_fork_reads_its_own_turn() {
     assert_eq!(saids(&fold(&fork(FORK, 14_000))), read);
     assert_eq!(saids(&fold(&fork(FORK, 9))), read);
     assert_eq!(saids(&fold(&fork(OTHER, 14_000))), read, "the burst ended");
-    // NEGATIVE CONTROL.
     assert_eq!(saids(&fold(&fork(OTHER, 9))), ["bind 0"]);
 }
 
 /// ONE TURN-OPEN KEY, ONCE PER TURN: a `turn_context` written again for a
-/// running turn opens nothing, and `task_started` opens nothing — with no
-/// `turn_context`, the lab's rollout opens, ends and interrupts no turn,
-/// its calls still read. A key spelled with escapes is read. NEGATIVE
-/// CONTROL: a second `turn_context` naming another turn opens it.
 #[test]
 fn a_turn_opens_once_at_its_turn_context() {
     let again: String = rows(MAIN)
@@ -381,7 +337,6 @@ fn a_turn_opens_once_at_its_turn_context() {
     ]
     .concat();
     assert!(saids(&fold(&escaped)).contains(&"prompt turn-1".to_string()));
-    // NEGATIVE CONTROL.
     let other = [
         opening(),
         ctx(T0 + 1, "turn-1", "gpt-6.1-sol"),
@@ -393,10 +348,6 @@ fn a_turn_opens_once_at_its_turn_context() {
 }
 
 /// FAIL CLOSED: a key the fold reads with the wrong shape latches it off
-/// for the rollout, and it steps nothing more until a bind lifts the latch;
-/// a call id over the log's 40 bytes is counted lost. A bad row in the
-/// history (at or below the seed) latches nothing. NEGATIVE CONTROL: the
-/// well-shaped rows latch nothing.
 #[test]
 fn a_wrong_shape_latches_the_fold_off() {
     let base = [opening(), ctx(T0 + 1, "turn-1", "gpt-6.1-sol")].concat();
@@ -426,13 +377,11 @@ fn a_wrong_shape_latches_the_fold_off() {
             !read.iter().any(|s| s.starts_with("end")),
             "{row}: {read:?}"
         );
-        // In the history, the same row latches nothing.
         let seed = (base.len() + row.len()) as u64;
         let (fold, batch) = fold_with(&text, seed, 0);
         assert!(!fold.broken(), "{row}");
         assert_eq!(saids(&batch), [format!("bind {seed}"), "end 5 0 0".into()]);
     }
-    // A bind lifts the latch.
     let text = [base.as_str(), &bad[0]].concat();
     let (mut fold, _) = fold_with(&text, 0, 0);
     fold.bind(FP, ID, 0);
@@ -441,13 +390,11 @@ fn a_wrong_shape_latches_the_fold_off() {
     }
     assert!(!fold.broken());
     assert!(saids(&fold.take()).contains(&"prompt turn-1".to_string()));
-    // A call id over 40 bytes is lost, never cut.
     let long_call = [base.as_str(), &call(T0 + 2, &long, "functions", "exec")].concat();
     let (fold, batch) = fold_with(&long_call, 0, 0);
     assert!(!fold.broken());
     assert_eq!(batch.lost, 1);
     assert!(!saids(&batch).iter().any(|s| s.starts_with("call")));
-    // NEGATIVE CONTROL.
     let good = [
         base.as_str(),
         &call(T0 + 2, "call-1", "functions", "exec"),
@@ -471,9 +418,6 @@ fn a_wrong_shape_latches_the_fold_off() {
 }
 
 /// THE SEED AND THE FLOOR: rows at or below the seed, and rows older than
-/// the floor, fold into the open turn and its tokens but queue nothing, and
-/// the model is said from the first row past them. NEGATIVE CONTROL: bound
-/// at 0 with no floor, the same rows queue the turn's prompt.
 #[test]
 fn history_folds_and_queues_nothing() {
     let text: String = rows(MAIN).map(|r| format!("{r}\n")).collect();
@@ -498,19 +442,15 @@ fn history_folds_and_queues_nothing() {
     );
     assert_eq!(read[5], "model gpt-6.1-sol - 0.163.0");
     assert!(batch.steps[1..].iter().all(|s| s.pos.off > seed));
-    // The floor: the third turn's start.
     let floor = u64::try_from(stamp_ms("2000-01-01T11:41:24.538Z").expect("a stamp")).expect("ms");
     let (_, batch) = fold_with(&text, 0, floor);
     let read = saids(&batch);
     assert_eq!(read[..2], ["bind 0".to_string(), turn("18")]);
     assert!(batch.steps[1..].iter().all(|s| s.pos.at_ms >= floor));
-    // NEGATIVE CONTROL.
     assert!(saids(&fold(&text)).contains(&turn("0e")));
 }
 
 /// THE QUEUE IS BOUNDED: past [`STEP_QUEUE`] steps between takes the oldest
-/// go and are counted; the bind stays. NEGATIVE CONTROL: a take between
-/// keeps every step.
 #[test]
 fn the_queue_is_bounded() {
     let calls: String = (0..STEP_QUEUE + 10)
@@ -521,7 +461,6 @@ fn the_queue_is_bounded() {
     assert_eq!(batch.steps.len(), STEP_QUEUE);
     assert_eq!(batch.overflow, 13);
     assert_eq!(said(&batch.steps[0].ev), "bind 0");
-    // NEGATIVE CONTROL.
     let mut fold = CodexStepFold::new(0);
     fold.bind(FP, ID, 0);
     let (mut end, mut n) = (0u64, 0usize);
@@ -538,10 +477,6 @@ fn the_queue_is_bounded() {
 }
 
 /// A BOUNDED READ: [`fold_rollout`] reads at most its cap from the
-/// rollout's first byte; a line over the line bound is skipped as it
-/// streams and counted lost past the seed, as is a line that is not UTF-8,
-/// and a torn last line is not read. NEGATIVE CONTROLS: a cap that stops
-/// short says so; a seed past the long line counts it as history.
 #[test]
 fn a_rollout_is_read_within_its_bounds() {
     let dir = aterm_tempfile::Builder::new()
@@ -575,7 +510,6 @@ fn a_rollout_is_read_within_its_bounds() {
             "end 5 0 0"
         ]
     );
-    // NEGATIVE CONTROLS.
     let mut fold = CodexStepFold::new(0);
     fold.bind(FP, ID, long_end);
     fold_rollout(&path, &mut fold, u64::MAX).expect("read");
@@ -589,9 +523,6 @@ fn a_rollout_is_read_within_its_bounds() {
 }
 
 /// The build a committed reduction is of: `<stem>.jsonl` or a leg of it,
-/// `<stem>-<leg>.jsonl` (the stem `rollout_reduction_stem`'s: `codex-<build>`,
-/// an ALab build's `codex-alab-<release>`), as its header (`# codex <build>
-/// · …`) names it.
 fn build_of<'a>(name: &str, header: &'a str) -> Option<&'a str> {
     let build = header.strip_prefix("# codex ")?.split(' ').next()?;
     let rest = name.strip_prefix(&rollout_reduction_stem(build))?;
@@ -615,12 +546,6 @@ fn committed_of(build: &str) -> Vec<(String, String)> {
 }
 
 /// EVERY COMMITTED CODEX REDUCTION FOLDS WHOLE (rule, for
-/// Codex): each `codex-<build>[-<leg>].jsonl` is the build its header names,
-/// every `session_meta` in it names that build, and the fold reads it with
-/// no latch, no loss and no overflow, every step at the build's state —
-/// partial while [`CODEX_MEASURED_BUILDS`] names none, and each build it
-/// names has its reduction committed. NEGATIVE CONTROLS: a name and a
-/// header of two builds name none, and a header naming no build names none.
 #[test]
 fn every_committed_codex_reduction_folds_whole() {
     let mut read = 0;
@@ -664,7 +589,6 @@ fn every_committed_codex_reduction_folds_whole() {
             "{b} is named, and its reduction is not committed"
         );
     }
-    // NEGATIVE CONTROLS.
     assert_eq!(
         build_of("codex-0.164.0.jsonl", "# codex 0.163.0 · lab reduce"),
         None
@@ -685,7 +609,6 @@ fn every_committed_codex_reduction_folds_whole() {
         build_of("codex-alab-0.164.0-dev.12521-first.jsonl", alab),
         Some("0.164.0-dev.12521+g3d3eb12d8")
     );
-    // An ALab build is named by its release, never by its whole version.
     assert_eq!(
         build_of("codex-0.164.0-dev.12521+g3d3eb12d8-first.jsonl", alab),
         None
@@ -693,10 +616,6 @@ fn every_committed_codex_reduction_folds_whole() {
 }
 
 /// THE CLASS TABLE holds only what a lab rollout showed: `spawn_agent` in
-/// `collaboration` starts a subagent (0.163.0), and `exec_command` in no
-/// namespace runs a shell command (codex-alab's approval leg). NEGATIVE
-/// CONTROLS: either name in another namespace, or none, is `other`, as is
-/// every other call (0.163.0's `exec`, either build's `request_user_input`).
 #[test]
 fn only_what_a_lab_rollout_showed_is_classed() {
     assert_eq!(
@@ -719,7 +638,6 @@ fn only_what_a_lab_rollout_showed_is_classed() {
 }
 
 /// NO TEXT: no step of the lab's rollouts, or of composed rows
-/// carrying sentinels where Codex writes text, holds any of that text.
 #[test]
 fn no_step_holds_text() {
     let text = [
@@ -744,19 +662,13 @@ fn no_step_holds_text() {
 }
 
 /// The codex-alab builds the lab measured: the one
-/// built from its source for the run, and the owner's managed one, read
-/// from its store.
 const ALAB_BUILDS: [&str; 2] = [ALAB, "0.164.0-dev.12479+g07a25d86a"];
 
 /// The build the legs' steps are written out for ([`ALAB_LEGS`]).
 const ALAB: &str = "0.164.0-dev.12521+g3d3eb12d8";
 
 /// What each leg of `lab codex-alab-proof` did on [`ALAB`], as its rollout
-/// folds (6D-3a): the leg, and its steps after the bind.
 const ALAB_LEGS: [(&str, &[&str]); 6] = [
-    // The instance's first session: one turn that ends on the done mark
-    // (its two crash relaunches resume the thread and add only its own
-    // settings lines).
     (
         "first",
         &[
@@ -765,7 +677,6 @@ const ALAB_LEGS: [(&str, &[&str]); 6] = [
             "end 64 1 1",
         ],
     ),
-    // A turn without the done mark, then the one `keep going` continued.
     (
         "continue",
         &[
@@ -776,7 +687,6 @@ const ALAB_LEGS: [(&str, &[&str]); 6] = [
             "end 8 1 1",
         ],
     ),
-    // An escalated `exec_command`, approved once and run, in one turn.
     (
         "approval",
         &[
@@ -787,7 +697,6 @@ const ALAB_LEGS: [(&str, &[&str]); 6] = [
             "end 5083 2 2",
         ],
     ),
-    // A `request_user_input` answered with its recommended option.
     (
         "question",
         &[
@@ -798,8 +707,6 @@ const ALAB_LEGS: [(&str, &[&str]); 6] = [
             "end 5048 2 2",
         ],
     ),
-    // The model's 429 ends the turn on the usage wall (no tokens served);
-    // waited out, the resumed turn.
     (
         "usage",
         &[
@@ -811,8 +718,6 @@ const ALAB_LEGS: [(&str, &[&str]); 6] = [
             "end 8 1 1",
         ],
     ),
-    // The turn `SIGKILL`ed mid-request writes no end (the rollout holds
-    // none); the relaunched process carries it on in a turn of its own.
     (
         "carry",
         &[
@@ -825,18 +730,10 @@ const ALAB_LEGS: [(&str, &[&str]); 6] = [
 ];
 
 /// The forever-port codex-alab build the lab measured (B5c): source
-/// `089291d37`, codex-alab's `alab/forever-align`, under the lab's
-/// Autopilot Cruise / LAND proof, so its Cruise legs take the defend prompt
-/// after each done claim and its legs hold more turns than [`ALAB`]'s; its
-/// steps are written out on their own ([`FOREVER_LEGS`]).
 const FOREVER: &str = "0.164.0-dev.12672+g089291d37";
 
 /// What each leg of `lab codex-alab-proof` did on [`FOREVER`], as its
-/// rollout folds: the leg, and its steps after the bind.
 const FOREVER_LEGS: [(&str, &[&str]); 6] = [
-    // A turn ending on the done mark, then three turns of Cruise's defend
-    // prompt and the defenses after it (its two crash relaunches resume the
-    // thread and add only its own settings lines).
     (
         "first",
         &[
@@ -851,8 +748,6 @@ const FOREVER_LEGS: [(&str, &[&str]); 6] = [
             "end 8 1 1",
         ],
     ),
-    // A turn without the done mark, the one `keep going` continued, and
-    // the continued reply's defend prompt.
     (
         "continue",
         &[
@@ -865,8 +760,6 @@ const FOREVER_LEGS: [(&str, &[&str]); 6] = [
             "end 9 1 1",
         ],
     ),
-    // An escalated `exec_command`, approved once and run, in one turn; then
-    // two more acts' turns.
     (
         "approval",
         &[
@@ -881,8 +774,6 @@ const FOREVER_LEGS: [(&str, &[&str]); 6] = [
             "end 22 1 1",
         ],
     ),
-    // A `request_user_input` answered with its recommended option; then
-    // the question asked in prose and Land's answer to it.
     (
         "question",
         &[
@@ -897,8 +788,6 @@ const FOREVER_LEGS: [(&str, &[&str]); 6] = [
             "end 22 1 1",
         ],
     ),
-    // The model's 429 ends the turn on the usage wall (no tokens served);
-    // waited out, the resumed turn and the continuations after it.
     (
         "usage",
         &[
@@ -916,9 +805,6 @@ const FOREVER_LEGS: [(&str, &[&str]); 6] = [
             "end 22 1 1",
         ],
     ),
-    // The turn `SIGKILL`ed mid-request writes no end; the relaunched
-    // process carries it on in a turn of its own, and the defend prompts
-    // follow its done claim.
     (
         "carry",
         &[
@@ -958,11 +844,6 @@ fn shape(said: &str) -> String {
 }
 
 /// What the rollout itself says of each turn, apart from the fold: the
-/// turns its `turn_context`s open, each `task_complete`'s duration, the
-/// tokens codex-alab's own per-turn record (`token_usage_record`'s
-/// `turn_token_usage`, a count the fold never reads) gives the turn last,
-/// and whether its error is the usage limit; and the calls and outputs by
-/// id. The fold's steps, said as [`said`] says them (no bind, no model).
 fn rollout_says(text: &str) -> Result<Vec<String>, String> {
     let mut out = Vec::new();
     let mut opened: Vec<String> = Vec::new();
@@ -1011,8 +892,6 @@ fn rollout_says(text: &str) -> Result<Vec<String>, String> {
             (Some("response_item"), Some("function_call")) => {
                 let id = s("call_id").ok_or("a call has its id")?;
                 let name = s("name").ok_or("a call has its name")?;
-                // The approval leg's call ran the shell command its model
-                // asked for; the question leg's asked the person.
                 let cls = match (s("namespace"), name) {
                     (None, "exec_command") => "shell",
                     _ => "other",
@@ -1030,27 +909,9 @@ fn rollout_says(text: &str) -> Result<Vec<String>, String> {
 }
 
 /// THE MEASURED BUILDS, EXACT: each
-/// leg of `lab codex-alab-proof` folds, on each codex-alab build the lab ran
-/// it on ([`ALAB_BUILDS`] and [`FOREVER`]), to what the leg did
-/// ([`ALAB_LEGS`], written out for [`ALAB`], whose managed sibling's legs
-/// take the same steps, numbers and ids aside; [`FOREVER_LEGS`], written out
-/// for the forever-port build, B5c): its turns open once each at their `turn_context`, end at
-/// their `task_complete` with its duration, the usage wall on the 429's,
-/// the calls and their outputs by id, the model once, the build said as its
-/// release. Every step is the rollout's own account too ([`rollout_says`]):
-/// each turn's tokens are the ones codex-alab's own per-turn record gives
-/// it, which the fold never reads; and every step past the bind is exact,
-/// each build being measured. The legs that showed no new step (`hold` is
-/// `continue`'s shape) are not committed. NEGATIVE CONTROLS: a turn record
-/// whose tokens are not the counts' is told apart; and read as an
-/// unmeasured build (its `cli_version` one release on), every step is
-/// partial.
 #[test]
 fn the_codex_alab_legs_fold_exact() {
     let mut kinds = std::collections::BTreeSet::new();
-    // Each build, the legs its steps are written out by, and whether they
-    // are written out for it (else they are another build's, its own taking
-    // the same steps, numbers and ids aside).
     let builds = ALAB_BUILDS
         .iter()
         .map(|b| (*b, &ALAB_LEGS, *b == ALAB))
@@ -1089,13 +950,10 @@ fn the_codex_alab_legs_fold_exact() {
             }
         }
     }
-    // What the build's measurement holds (T8's guard, for Codex): a turn
-    // opened and ended, a call and its output, the usage wall, the model.
     assert_eq!(
         kinds.into_iter().collect::<Vec<_>>(),
         ["call", "end", "model", "prompt", "result", "wall"]
     );
-    // NEGATIVE CONTROLS.
     let approval = alab_leg("approval");
     let off = approval.replacen(
         "\"turn_token_usage\":{\"input_tokens\":2",
@@ -1123,11 +981,6 @@ fn the_codex_alab_legs_fold_exact() {
 }
 
 /// THE BUILD, SAID AND MATCHED (6D-3a): a build that is a log id is said
-/// whole; an ALab build, whose `+` no log id holds, is said as its release
-/// and matched whole; a bind handed the build its tap read says the bind at
-/// that build's state. NEGATIVE CONTROLS: a build that is no id even before
-/// a `+` is said as none, and a bind handed no build, or an unmeasured one,
-/// is partial.
 #[test]
 fn a_build_is_said_as_its_release_and_matched_whole() {
     assert_eq!(
@@ -1143,7 +996,6 @@ fn a_build_is_said_as_its_release_and_matched_whole() {
     let mut fold = CodexStepFold::new(0);
     fold.bind_build(FP, ID, 0, Some(ALAB));
     assert_eq!(fold.take().steps[0].state, StepState::On);
-    // NEGATIVE CONTROLS.
     assert!(log_build("0 163+x").is_none());
     for build in [None, Some("0.164.0-dev.12521")] {
         let mut fold = CodexStepFold::new(0);
@@ -1156,28 +1008,12 @@ fn a_build_is_said_as_its_release_and_matched_whole() {
 const ALAB_MANAGED: &str = "0.164.0-dev.12479+g07a25d86a";
 
 /// THE WRITER HOLDS THE ROWS TO ITS BUILD: a thread's
-/// `session_meta` names the build that started it, and a thread resumed or
-/// re-exec'd onto another build appends without restating it (measured:
-/// the `first` leg's rollout, written by three processes, holds one
-/// `session_meta`), so where its reader knows the build writing the rows
-/// now ([`CodexStepFold::set_writer`]) the fold holds them to it. The
-/// `continue` leg, started on [`ALAB`]: written by [`ALAB`] it folds as its
-/// golden; by the other measured build, exact still, the build said the
-/// writer's; by a build nobody measured, every step partial; a writer that
-/// moves between its turns says the model again, at its build; and a reader
-/// that stops says `off` once ([`CodexStepFold::stop`]), folding nothing
-/// more. NEGATIVE CONTROLS (scratch, the unit's notes): a state that
-/// ignores the writer reads the unmeasured writer `On`; a model said at the
-/// thread's build names 12521 for the 12479 writer; a move that keeps the
-/// model said says it once.
 #[test]
 fn the_writer_holds_the_rows_to_its_build() {
     let text = alab_leg("continue");
     let second = rows(&text)
         .position(|r| r.contains("\"turn_context\"") && r.contains("8000-00000000000b"))
         .expect("the continued turn's context");
-    // The leg's rows folded with `writer` writing them, the writer moving to
-    // `moved` at the continued turn's context, or the reader stopping there.
     let fold_by = |writer: &str, moved: Option<&str>, stop: bool| {
         let mut fold = CodexStepFold::new(0);
         fold.set_writer(writer);
@@ -1202,7 +1038,6 @@ fn the_writer_holds_the_rows_to_its_build() {
         .find(|(leg, _)| *leg == "continue")
         .map(|(_, want)| *want)
         .expect("the continue leg");
-    // (The bind is said before the thread's `session_meta` is read.)
     let batch = fold_by(ALAB, None, false);
     assert_eq!(saids(&batch)[1..], *golden);
     assert!(batch.steps[1..].iter().all(|s| s.state == StepState::On));

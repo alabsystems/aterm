@@ -1,126 +1,14 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! What Codex's own files say: where a Codex keeps its home ([`codex_home`]),
-//! its rollouts (`sessions/<y>/<m>/<d>/rollout-<stamp>-<thread>.jsonl`,
-//! [`rollouts_by_write`], [`is_rollout_of`]), its thread ids ([`is_thread_id`],
-//! [`thread_created_ms`]), and the turns a rollout served, once each, for the
-//! spend fold ([`TurnReader`], [`read_rollout`], [`conversation_rollouts`]).
-//! Never the screen, and no supervision: the spend fold (`harness::spend`),
-//! `aterm harness usage` from a Codex session's own shell
-//! (`harness::cli::run_codex_usage`), `aterm ai`'s limit reader
-//! (`ai::codex_limits`), the session log's Codex step fold
-//! (`harness::codex_steps`) and the codex-alab path read Codex through it. Codex's
-//! files are a third party's, so every reader refuses a shape it was not
-//! written for.
-//!
-//! Spend ([`TurnReader`], the account stats' C1,
-//! `docs/DESIGN-account-stats-2026-10-15.md` §3.3, §3.5, §4.3): a rollout
-//! read from its start yields each served turn once — the `last_token_usage`
-//! of every `token_count` whose running total (`total_token_usage`) grew, on
-//! the model of the latest `turn_context` before it. Codex writes a
-//! `token_count` again with the same total (most often after a reasoning
-//! item, and at a turn's start once the thread has a total), and those count
-//! nothing. A LEGACY FORK (a `session_meta` naming `forked_from_id`, its
-//! `history_mode` `legacy` or none) begins with a copy of its parent's
-//! lines, its `token_count`s among them, rewritten under new stamps in one
-//! burst; summing them counts the parent's turns again. So the copied prefix
-//! — the run of lines from the fork's `session_meta` up to the first
-//! `thread_settings_applied` naming the fork's own thread (Codex 0.163.0
-//! writes one right after the copy; a copied one names the thread it was
-//! copied from), or, in a fork that writes none, each stamped within
-//! [`FORK_BURST_MS`] of the newest before it — counts for nothing: no
-//! tokens, no model, no usage reading. Its totals stand: the fork's own go
-//! on from the copy's last, so a count the fork writes again with that total
-//! is a repeat, not its parent's last turn. A rollout whose first line names
-//! no session is read the same way, since nothing rules a fork out, and a
-//! turn needs a model's answer, which no burst holds. A PAGINATED thread's
-//! fork ([`PAGINATED`]) copies no count, and is read from its first line:
-//! a subagent's own first turn follows its copy within milliseconds, inside
-//! any burst a gap between stamps could tell. Each turn
-//! carries a fingerprint of its total and its counts ([`Turn::key`]), one
-//! per turn within its rollout (the total grows at every one), so a rollout
-//! read again from its start is known by them. Across rollouts it names no
-//! turn: two threads served the same counts (one prompt run twice, the lab's
-//! stub) share it, so no fold dedupes across rollouts by it.
-//!
-//! MEASURED on the 133 rollouts of the machine this was built on (Codex
-//! 0.145.0 and 0.146.0, July and August 2026; 121 of them forks, each with
-//! lines after its copy): the copy's consecutive stamps were at most 26 ms
-//! apart and the fork's own first line came at least 1.47 s after the
-//! copy's last; the fork's own running total continued from the copy's last;
-//! outside the copies no total fell, each growth equalled the line's
-//! `last_token_usage.total_tokens`, and every `token_count` had a model.
-//! There, 1,063 `token_count`s repeated their thread's total; the first
-//! count of a turn after a thread's first did so in 151 of 218 turns, and
-//! the first of a thread's first turn, a fork's included, never did.
-//! Summing every growth per file, copies included, gave 20.4 times the
-//! fork-aware sum. `cache_write_input_tokens` was 0 on all 463,935
-//! `token_count` lines, and no `turn_context` named a `service_tier`.
-//! MEASURED again on the lab's 34 rollouts of Codex 0.163.0 (stub replies,
-//! no forks): the same `token_count` and `turn_context` keys, and 79 turns
-//! with only 46 distinct fingerprints among them.
-//!
-//! MEASURED in the lab on Codex 0.163.0 (2026-10-16; the stub's provider,
-//! the lab's composed ChatGPT logins, stand-in replies; a tool call scripted
-//! at the stub): every new thread is `history_mode: "paginated"`, and every
-//! line carries an `ordinal`.
-//! * `/fork`, and `codex fork --last` twice (once under another login), of a
-//!   paginated thread: the fork's rollout copies nothing. It holds its
-//!   `session_meta` (its ordinals going on from the parent's last) and a
-//!   `thread_settings_applied` in the same millisecond, then its own turn
-//!   when a person typed one, 6 to 14 s on. Its running total went on from
-//!   the parent's (47,303 after 31,433).
-//! * A subagent (`spawn_agent` in the `collaboration` namespace, `fork_turns:
-//!   "all"`): its rollout opens with its own `session_meta`, its parent's,
-//!   and the parent's turns compacted (`task_started`, messages,
-//!   `world_state`, `turn_context`, `task_complete`): 21 lines in one
-//!   millisecond, no `token_count` among them. Its own lines began 2 ms
-//!   later, its own `turn_context` 9 ms later, and on the stub's instant
-//!   answer its first count came 24 ms after the copy, its total from zero
-//!   (15,577, that turn alone). The burst rule took that turn for its
-//!   parent's: over the lab's rollouts the fold counted 13 of 14 turns,
-//!   173,891 of 189,468 tokens. Read from its first line, it counts 14 and
-//!   189,468, as an independent count does.
-//! * `/fork` of a legacy thread (a composed 0.146.0-shaped rollout): the fork
-//!   is `history_mode: "legacy"`, with no ordinals. It copied the parent's
-//!   `session_meta`, `turn_context`s, messages and `token_count`s (their
-//!   rate limits among them) under one stamp (1 ms spread), then a
-//!   `turn_aborted` and its own `thread_settings_applied` in the same
-//!   millisecond. A person's turn came 21 s later, its total going on
-//!   (20,022 after 6,030). A fork of that fork copied the parent's
-//!   `thread_settings_applied` lines too, each naming the parent's thread,
-//!   then wrote its own naming itself. The parent's file was not rewritten.
-//! * `codex fork <legacy thread> <prompt>` (three times): the same copy, and
-//!   the prompt's turn at once. Its first own line came 247 ms after the copy
-//!   on a cold start, 17 and 14 ms after it warm, its count 37 ms after: well
-//!   inside [`FORK_BURST_MS`], and inside the 26 ms gaps 0.145's copies
-//!   showed, so no gap between stamps tells this copy's end. In all five
-//!   legacy forks the first `thread_settings_applied` naming the fork's own
-//!   thread came in the copy's millisecond, after the copy (and after a
-//!   `turn_aborted` the fork writes when its parent's last turn did not
-//!   complete), before any line of a turn of its own.
-//! * A legacy thread is offered no `collaboration` tools: a `spawn_agent`
-//!   call there was answered `unsupported call: collaborationspawn_agent`.
-//!   So 0.163.0 spawns only from paginated threads, and a copy holding
-//!   counts comes only from a person's fork of a legacy thread.
-//! * The login: a ChatGPT login's `session_meta` names `creator_account_id`
-//!   and `creator_user_id`; an API-key login's names neither
-//!   (`ai::codex_limits::opening_account`).
-//! * The rate limits on the stub's provider: `plan_type`,
-//!   `individual_limit` and `spend_control_reached` were null on every line,
-//!   and the credits were carried over. A turn whose answer carried no rate
-//!   headers wrote its windows null and kept the credits.
+//! Codex home, rollout file discovery, and turn token reader ([`TurnReader`], [`read_rollout`], [`conversation_rollouts`]).
 
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use aterm_json::Value;
 
-// Codex's names: thread ids and rollout files
-
-/// Whether `s` is a thread id Codex prints and takes back: a hyphenated UUID
-/// (8-4-4-4-12 hex digits). Nothing else is ever put on a relaunch line.
+/// Whether `s` is a valid hyphenated UUID thread ID (`8-4-4-4-12` hex digits).
 #[must_use]
 pub fn is_thread_id(s: &str) -> bool {
     let parts: Vec<&str> = s.split('-').collect();
@@ -131,8 +19,7 @@ pub fn is_thread_id(s: &str) -> bool {
             .all(|(p, n)| aterm_codec::hex::is_hex(p, n))
 }
 
-/// When a thread was created, in unix milliseconds, from its UUIDv7 id's first
-/// 48 bits. `None` for any id that is not version-7.
+/// Extracts the creation timestamp in unix milliseconds from a UUIDv7 thread ID.
 #[must_use]
 pub fn thread_created_ms(thread: &str) -> Option<u64> {
     if !is_thread_id(thread) || thread.as_bytes().get(14) != Some(&b'7') {
@@ -142,8 +29,7 @@ pub fn thread_created_ms(thread: &str) -> Option<u64> {
     u64::from_str_radix(&hex, 16).ok()
 }
 
-/// Whether `name` is a rollout file of `thread`:
-/// `rollout-<stamp>-<thread>.jsonl`. A compressed `.jsonl.zst` is not read.
+/// Whether `name` is a rollout filename for `thread` (`rollout-<stamp>-<thread>.jsonl`).
 #[must_use]
 pub fn is_rollout_of(name: &str, thread: &str) -> bool {
     name.starts_with("rollout-")
@@ -152,13 +38,7 @@ pub fn is_rollout_of(name: &str, thread: &str) -> bool {
             .is_some_and(|stem| stem.ends_with(&format!("-{thread}")))
 }
 
-/// The `$CODEX_HOME` a Codex started with `env` in the working directory
-/// `cwd` uses: `CODEX_HOME`, a relative one joined to `cwd` (Codex
-/// canonicalizes it against its own working directory as it starts), else
-/// `$HOME/.codex` (the Codex upgrade's own rule); an empty `CODEX_HOME` is
-/// unset. A relative `CODEX_HOME` with no absolute `cwd` names no home aterm
-/// can place — never `$HOME/.codex`, which may be another Codex's records —
-/// so nothing is read (`None`).
+/// Resolves `$CODEX_HOME` for a Codex process started with `env` in `cwd`.
 #[must_use]
 pub fn codex_home(
     codex_home: Option<&str>,
@@ -175,9 +55,7 @@ pub fn codex_home(
     }
 }
 
-/// Every rollout under `home`'s `sessions/<y>/<m>/<d>/`, newest write first.
-/// A thread's rollout sits in the folder of the day it started, so the one
-/// written last may be in an old day's folder.
+/// Lists all rollout files under `home/sessions/<y>/<m>/<d>/`, newest mtime first.
 #[must_use]
 pub fn rollouts_by_write(home: &Path) -> Vec<(PathBuf, SystemTime)> {
     let dirs = |p: &Path| -> Vec<PathBuf> {
@@ -213,15 +91,13 @@ pub fn rollouts_by_write(home: &Path) -> Vec<(PathBuf, SystemTime)> {
     out
 }
 
-/// The last `bytes` of `path`, its cut first line dropped.
+/// Reads the last `bytes` of `path`, dropping a partial leading line.
 #[must_use]
 pub fn tail_of(path: &Path, bytes: u64) -> Option<String> {
     tail_after(path, 0, bytes)
 }
 
-/// The last `bytes` of `path`, read from no earlier than `floor` (the start
-/// of a line): a first line cut by the read's start is dropped, one starting
-/// at `floor` is kept whole.
+/// Reads up to the last `bytes` of `path` starting no earlier than line-aligned `floor`.
 pub(crate) fn tail_after(path: &Path, floor: u64, bytes: u64) -> Option<String> {
     use std::io::{Read as _, Seek as _, SeekFrom};
     let mut f = crate::harness::footer::open_regular(path)?;
@@ -239,29 +115,13 @@ pub(crate) fn tail_after(path: &Path, floor: u64, bytes: u64) -> Option<String> 
     })
 }
 
-// Spend: each served turn of a rollout, once (module header)
-
-/// How far apart, in milliseconds, two lines of a legacy fork's copied
-/// prefix may be stamped, in a fork that writes no `thread_settings_applied`
-/// of its own: the prefix runs from the fork's `session_meta` while each
-/// line is stamped within this of the newest stamp before it (module
-/// header: 0.145 and 0.146's copies measured at most 26 ms apart and the
-/// fork's own first line at least 1.47 s after them). Codex 0.163.0's legacy
-/// fork writes that line right after its copy, and its own turn can follow
-/// within 14 ms, so there the line ends the copy. A paginated thread's fork
-/// copies no count and is read without either ([`PAGINATED`]).
+/// Maximum timestamp gap (ms) between consecutive lines in a legacy fork's copied prefix.
 pub const FORK_BURST_MS: i64 = 500;
 
-/// The `session_meta` `history_mode` of a thread whose forks copy no count
-/// (module header: Codex 0.163.0 makes every new thread so; a fork of a
-/// `legacy` one is `legacy` too).
+/// `session_meta` `history_mode` value for threads whose forks copy no token counts.
 pub const PAGINATED: &str = "paginated";
 
-/// One turn's token counts as Codex records them (`last_token_usage`), in
-/// OpenAI's classes: `input` holds `cached`, and `output` holds `reasoning`.
-/// Whether `input` holds `cache_write` too is UNKNOWN (none was seen, module
-/// header); the spend fold reads it as a part, as OpenAI's usage details are
-/// parts of the input, and calls such a turn approximate.
+/// Per-turn token usage counts (`last_token_usage`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct TurnTokens {
     /// `input_tokens`.
@@ -278,8 +138,6 @@ pub struct TurnTokens {
 
 impl TurnTokens {
     /// The counts of a usage object; a missing class reads 0. `None` for
-    /// anything but an object holding `input_tokens` or `output_tokens` as a
-    /// whole number.
     fn of(v: Option<&Value>) -> Option<Self> {
         let o = v?.as_object()?;
         let n = |key: &str| o.get(key).and_then(Value::as_u64);
@@ -296,86 +154,68 @@ impl TurnTokens {
     }
 }
 
-/// One served turn, counted once.
+/// Single served turn extracted from a rollout.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Turn {
-    /// The `token_count`'s stamp, unix seconds.
+    /// `token_count` timestamp in unix seconds.
     pub at: i64,
-    /// The model of the latest `turn_context` before it, outside a fork's
-    /// copied prefix; `None` where none named one.
+    /// Model from the latest `turn_context` preceding this turn.
     pub model: Option<String>,
-    /// Its counts (`last_token_usage`).
+    /// Turn token usage (`last_token_usage`).
     pub tokens: TurnTokens,
-    /// That `turn_context` named a service tier (`fast`, `flex`): the list
-    /// price is another than the standard one.
+    /// Whether the preceding `turn_context` named a non-standard service tier (`fast` or `flex`).
     pub tier: bool,
-    /// FNV-1a/64 of its running total and its counts: one per turn within
-    /// its rollout, never an identity across rollouts (module header).
+    /// FNV-1a/64 hash of the running total and turn counts within this rollout.
     pub key: u64,
 }
 
-/// Where a [`TurnReader`] stands in its rollout.
+/// Position of a [`TurnReader`] relative to a fork's copied prefix.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Prefix {
     /// No line read yet.
     #[default]
     Start,
-    /// Inside a fork's copied prefix, or the first burst of a rollout whose
-    /// first line names no session: the newest stamp read, unix ms.
+    /// Inside a fork's copied prefix, holding the last copied line's timestamp (ms).
     Copy(i64),
-    /// Past it, or a rollout that is no fork: every line counts.
+    /// Past any copied prefix; all turns belong to this rollout.
     Own,
 }
 
-/// What one rollout line was to the fold.
+/// Classification of a single rollout line by [`TurnReader::line`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Row {
-    /// A served turn.
+    /// Served turn belonging to this rollout.
     Turn(Turn),
-    /// A `token_count` whose running total did not grow: written again (after
-    /// a rate-limit update), no turn.
+    /// `token_count` whose running total did not increase.
     Repeat,
-    /// A `token_count` in a fork's copied prefix: its parent's turn.
+    /// `token_count` inside a fork's copied prefix.
     Copied,
-    /// A turn with no readable stamp: placed in no window, so not counted.
+    /// Turn without a valid timestamp.
     Untimed,
-    /// A line that is not JSON, or a `token_count` whose counts cannot be
-    /// read.
+    /// Malformed JSON line or unreadable `token_count` payload.
     Unparsed,
-    /// Any other line.
+    /// Any other rollout record.
     Other,
 }
 
-/// The spend fold of one rollout, a line at a time from its start (module
-/// header), its state kept between reads: where it stands against a fork's
-/// copied prefix (inside a legacy fork's, the fork's own thread too), the
-/// largest running total read, and the model and service tier of the latest
-/// `turn_context`.
+/// Incremental line-by-line spend reader for a single Codex rollout.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct TurnReader {
-    /// Where the reader stands.
+    /// Current prefix state.
     pub prefix: Prefix,
-    /// The largest `total_token_usage.total_tokens` read, a fork's copied
-    /// prefix included: the fork's own totals go on from its copy's (module
-    /// header), so a count its own lines write again with the copy's total
-    /// is a repeat, not its parent's last turn again.
+    /// Highest `total_token_usage.total_tokens` seen so far (including any copied prefix).
     pub top: u64,
-    /// The latest `turn_context`'s `model` past the prefix.
+    /// Latest `turn_context` model seen past the prefix.
     pub model: Option<String>,
-    /// That `turn_context` named a service tier other than the standard one.
+    /// Whether the latest `turn_context` named a non-standard service tier.
     pub tier: bool,
-    /// While a legacy fork's copy is read, the fork's own thread: the `id`
-    /// its `session_meta` names, where that is a thread id. The copy ends at
-    /// the first `thread_settings_applied` naming it (module header);
-    /// `None` past the copy, and for a rollout whose first line names none.
+    /// Fork's own thread ID while scanning a legacy fork's copied prefix.
     pub thread: Option<String>,
 }
 
-/// Unix milliseconds of a rollout stamp (`2026-08-01T17:36:47.998Z`): the
-/// whole second, plus the fraction's first three digits.
+/// Parses an RFC 3339 rollout timestamp into unix milliseconds.
 pub(crate) fn stamp_ms(stamp: &str) -> Option<i64> {
     let secs = aterm_types::rfc3339::parse_utc_fractional(stamp)?;
-    // The parser accepted the fraction: ASCII digits only.
     let millis = stamp
         .strip_suffix('Z')
         .and_then(|head| head.get(19..))
@@ -408,10 +248,7 @@ fn turn_key(total: &TurnTokens, total_tokens: u64, last: &TurnTokens) -> u64 {
     aterm_hash::fnv1a_64(text.as_bytes())
 }
 
-/// A `token_count` payload's running total, its `total_tokens` (else input
-/// plus output), and its last turn; `None` where `info` holds no readable
-/// pair of counts (the rate limits alone, or counts that cannot be read).
-/// The Codex step fold reads a turn's counts by it (`super::codex_steps`).
+/// Extracts `(last_token_usage, total_tokens)` from a `token_count` payload.
 pub(crate) fn counts_of(payload: Option<&Value>) -> Option<(TurnTokens, u64, TurnTokens)> {
     let info = payload?.get("info").filter(|i| i.is_object())?;
     let total_usage = info.get("total_token_usage");
@@ -425,9 +262,7 @@ pub(crate) fn counts_of(payload: Option<&Value>) -> Option<(TurnTokens, u64, Tur
 }
 
 impl TurnReader {
-    /// Read the rollout's next line (module header). Past the prefix only a
-    /// `token_count` or `turn_context` line is opened; inside it every line
-    /// is, for its stamp.
+    /// Processes the next line of the rollout and returns its [`Row`] classification.
     pub fn line(&mut self, line: &str) -> Row {
         let line = line.trim();
         if line.is_empty() {
@@ -449,8 +284,6 @@ impl TurnReader {
             .get("timestamp")
             .and_then(Value::as_str)
             .and_then(stamp_ms);
-        // A copied count counts nothing, but its total stands: the fork's
-        // own totals go on from it (module header).
         let copied = |reader: &mut Self| {
             if !is_count {
                 return Row::Other;
@@ -464,8 +297,6 @@ impl TurnReader {
             Prefix::Start => {
                 let fork = word(payload.and_then(|p| p.get("forked_from_id")))
                     .is_some_and(|parent| !parent.is_empty());
-                // A paginated thread's fork copies no count (module header):
-                // its every line is its own.
                 let paginated =
                     word(payload.and_then(|p| p.get("history_mode"))).as_deref() == Some(PAGINATED);
                 if kind.as_deref() == Some("session_meta") && (!fork || paginated) {
@@ -476,18 +307,12 @@ impl TurnReader {
                     self.thread =
                         word(payload.and_then(|p| p.get("id"))).filter(|id| is_thread_id(id));
                 }
-                // A fork's `session_meta`, or a first line naming no
-                // session: the burst starts at its stamp. One with none is
-                // no start; the next line's stamp is.
                 if let Some(at) = stamp {
                     self.prefix = Prefix::Copy(at);
                 }
                 return copied(self);
             }
             Prefix::Copy(newest) => {
-                // The fork's own settings line ends the copy, however soon
-                // after it (module header); a copied one names the thread it
-                // was copied from.
                 let own_settings = kind.as_deref() == Some("event_msg")
                     && word(payload.and_then(|p| p.get("type"))).as_deref()
                         == Some("thread_settings_applied")
@@ -545,24 +370,18 @@ impl TurnReader {
     }
 }
 
-/// What one whole read of a rollout ([`read_rollout`]) did.
+/// Summary of a [`read_rollout`] pass.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct RolloutRead {
-    /// Bytes read.
+    /// Total bytes read.
     pub read: u64,
-    /// It was read to the end it had (a torn last line aside), not stopped
-    /// at the cap or by an error.
+    /// Whether the rollout was read to EOF without hitting the byte cap or an I/O error.
     pub complete: bool,
-    /// Lines longer than [`crate::harness::usage::MAX_LINE_BYTES`], skipped
-    /// unread.
+    /// Number of lines exceeding [`crate::harness::usage::MAX_LINE_BYTES`] skipped unread.
     pub long: u64,
 }
 
-/// Read the rollout at `path` from its start, at most `cap` bytes, each
-/// complete line through `reader` into `each`. A line longer than
-/// [`crate::harness::usage::MAX_LINE_BYTES`] is skipped as it streams, never
-/// held, and a torn last line (one still being written) is not read. `None`
-/// when the file cannot be opened.
+/// Reads up to `cap` bytes of `path` from the start through `reader` (`TurnReader`).
 pub fn read_rollout(
     path: &Path,
     reader: &mut TurnReader,
@@ -575,14 +394,7 @@ pub fn read_rollout(
     })
 }
 
-/// The lines of the rollout at `path` from its start, at most `cap` bytes,
-/// each complete one handed to `each` with the offset it starts at — its
-/// text, `None` for one that is not UTF-8 — until `each` breaks. A line
-/// longer than [`crate::harness::usage::MAX_LINE_BYTES`] is skipped as it
-/// streams, never held (counted in [`RolloutRead::long`]), and a torn last
-/// line is not handed. `complete`: it was read to its end, neither stopped
-/// at the cap, by an error, nor by `each`. `None` when the file cannot be
-/// opened.
+/// Streams complete lines of `path` up to `cap` bytes into `line`.
 pub(crate) fn stream_lines(
     path: &Path,
     cap: u64,
@@ -594,20 +406,16 @@ pub(crate) fn stream_lines(
     })
 }
 
-/// One line [`stream_lines_ends`] hands on.
+/// Single line item yielded by [`stream_lines_ends`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Streamed<'a> {
-    /// A complete line: its text, `None` for one that is not UTF-8.
+    /// Complete line (`Some` if valid UTF-8, `None` otherwise).
     Line(Option<&'a str>),
-    /// A complete line longer than
-    /// [`crate::harness::usage::MAX_LINE_BYTES`], skipped unread.
+    /// Complete line exceeding [`crate::harness::usage::MAX_LINE_BYTES`], skipped unread.
     Long,
 }
 
-/// [`stream_lines`], each complete line handed on with the offsets it
-/// starts and ends at (past its newline), a long one too, unread
-/// ([`Streamed::Long`]): for a reader that places every line it could not
-/// read (the Codex step fold, `super::codex_steps::fold_rollout`).
+/// Streams complete lines of `path` with their `(start, end)` byte offsets.
 pub(crate) fn stream_lines_ends(
     path: &Path,
     cap: u64,
@@ -617,13 +425,7 @@ pub(crate) fn stream_lines_ends(
     Some(stream_open_ends(file, 0, None, cap, each))
 }
 
-/// [`stream_lines_ends`] over the open `file` from offset `from`, the start
-/// of a line (where a reader that reads on stopped: the Codex rollout tap,
-/// `super::codex_tap`), or, with `skip` (where that line began), a point
-/// inside a line the reader skips, handed on as [`Streamed::Long`] at its
-/// newline and counted in [`RolloutRead::long`] there: the offsets handed on
-/// are the file's own, `read` counts the bytes read from `from`, and at most
-/// `cap` of them are. A file that cannot be sought there reads nothing.
+/// Streams complete lines from open `file` starting at byte offset `from`.
 pub(crate) fn stream_open_ends(
     file: std::fs::File,
     from: u64,
@@ -640,8 +442,6 @@ pub(crate) fn stream_open_ends(
     }
     let mut line: Vec<u8> = Vec::new();
     let mut skipping = skip.is_some();
-    // Whether the line being skipped is counted long yet: one carried in
-    // from an earlier read is counted at its newline.
     let mut counted = false;
     let mut start = skip.unwrap_or(from);
     loop {
@@ -653,7 +453,6 @@ pub(crate) fn stream_open_ends(
         if buf.is_empty() {
             break;
         }
-        // Bytes are left past the cap: the read stops short.
         if out.read >= cap {
             return out;
         }
@@ -695,32 +494,24 @@ pub(crate) fn stream_open_ends(
     out
 }
 
-/// How much of a rollout's first line is read for its `session_meta`
-/// ([`conversation_rollouts`]); the line carries base instructions (about
-/// 20 KB).
+/// Maximum bytes read from a rollout's first line when inspecting `session_meta`.
 pub const META_BYTES: u64 = 1 << 20;
 
-/// The most rollouts [`conversation_rollouts`] opens the first line of.
+/// Maximum number of rollout files scanned by [`conversation_rollouts`].
 pub const MAX_CONVERSATION_SCAN: usize = 16_384;
 
-/// The rollouts of one Codex conversation under a home, for `harness usage`.
+/// Rollout files belonging to a single Codex conversation under a home directory.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Conversation {
-    /// The thread whose conversation it is: the `session_id` the named
-    /// thread's `session_meta` gives (its conversation's first thread, the
-    /// TUI's own), else the named thread.
+    /// Conversation root thread ID (`session_id` from `session_meta`).
     pub root: String,
-    /// The named thread's own rollout, where it has one.
+    /// Rollout file of the queried thread itself, if found.
     pub own: Option<PathBuf>,
-    /// The root's rollout first, where found, then every rollout whose
-    /// `session_meta` names the root as its `session_id` (the subagents),
-    /// oldest write first.
+    /// Root rollout (if found) followed by all subagent rollouts in the conversation.
     pub files: Vec<PathBuf>,
-    /// How many of `files` are subagents'.
+    /// Number of entries in `files` belonging to subagents.
     pub subagents: usize,
-    /// Rollouts written since the root began whose first line could not be
-    /// read: any of them may be one of its subagents. Past
-    /// [`MAX_CONVERSATION_SCAN`], each one not opened.
+    /// Count of rollouts written since the root began whose first line could not be read.
     pub unread: usize,
 }
 
@@ -735,13 +526,12 @@ fn session_ids(first_line: &str) -> Option<(Option<String>, Option<String>)> {
     Some((id("session_id"), id("id")))
 }
 
-/// The first line of `path`, at most [`META_BYTES`] of it; `None` when it
-/// cannot be read or runs past the bound.
+/// Reads the first line of `path` up to [`META_BYTES`].
 pub(crate) fn first_line(path: &Path) -> Option<String> {
     first_line_of(&crate::harness::footer::open_regular(path)?)
 }
 
-/// [`first_line`] of the open `file`, read from its start.
+/// Reads the first line of open `file` from offset 0 up to [`META_BYTES`].
 pub(crate) fn first_line_of(file: &std::fs::File) -> Option<String> {
     use std::io::{BufRead as _, Seek as _};
     let mut file = file;
@@ -754,11 +544,7 @@ pub(crate) fn first_line_of(file: &std::fs::File) -> Option<String> {
         .then(|| String::from_utf8_lossy(&line).into_owned())
 }
 
-/// The rollouts of the conversation `thread` belongs to under `home`
-/// ([`Conversation`]): the conversation's own thread, by the `session_id`
-/// the named thread's rollout gives, and every subagent whose
-/// `session_meta` names it. Only rollouts written since the root began are
-/// opened (a UUIDv7 id says when; another id opens every one).
+/// Finds all rollout files belonging to `thread`'s conversation under `home`.
 #[must_use]
 pub fn conversation_rollouts(home: &Path, thread: &str) -> Conversation {
     let all = rollouts_by_write(home);
@@ -785,7 +571,6 @@ pub fn conversation_rollouts(home: &Path, thread: &str) -> Conversation {
     let mut subagents = Vec::new();
     let mut unread = 0;
     let mut opened = 0;
-    // Oldest write first, so the root's first turns are read first.
     for (path, at) in all.iter().rev() {
         if since.is_some_and(|s| *at < s) {
             continue;
@@ -820,20 +605,16 @@ pub fn conversation_rollouts(home: &Path, thread: &str) -> Conversation {
     }
 }
 
-/// Composed rollout lines in the shapes Codex writes them (key names as on
-/// 0.145–0.163; the `token_count` as the survey in the module header read
-/// it), each with its newline, stamped in unix milliseconds. Stand-in values
-/// only: no real rollout is copied.
+/// Synthetic Codex rollout line builders for tests.
 #[cfg(test)]
 pub(crate) mod fixtures {
-    /// A rollout stamp: `2026-08-01T17:36:47.998Z`.
+    /// Formats unix milliseconds `ms` as an RFC 3339 rollout timestamp.
     pub(crate) fn stamp(ms: i64) -> String {
         let whole = crate::harness::usage::rfc3339_utc(ms.div_euclid(1000));
         format!("{}.{:03}Z", &whole[..19], ms.rem_euclid(1000))
     }
 
-    /// A thread's `session_meta`: its id, its conversation (`session_id`),
-    /// and the thread it was forked from, if any.
+    /// Builds a `session_meta` JSON line.
     pub(crate) fn meta(ms: i64, thread: &str, session: &str, fork: Option<&str>) -> String {
         let fork = fork.map_or_else(String::new, |f| format!(",\"forked_from_id\":\"{f}\""));
         format!(
@@ -846,8 +627,7 @@ pub(crate) mod fixtures {
         )
     }
 
-    /// [`meta`] as Codex 0.163.0 writes it: with its `history_mode`, and the
-    /// ids of the login it was made under, where given.
+    /// Builds a Codex 0.163.0 `session_meta` JSON line with `history_mode` and login IDs.
     pub(crate) fn meta_as(
         ms: i64,
         thread: &str,
@@ -869,7 +649,7 @@ pub(crate) mod fixtures {
         )
     }
 
-    /// A `turn_context` naming `model`, and `tier` as its service tier.
+    /// Builds a `turn_context` JSON line for `model` and optional `tier`.
     pub(crate) fn context(ms: i64, model: &str, tier: Option<&str>) -> String {
         let tier = tier.map_or_else(String::new, |t| format!(",\"service_tier\":\"{t}\""));
         format!(
@@ -880,7 +660,7 @@ pub(crate) mod fixtures {
         )
     }
 
-    /// One count's classes: input (cached ones in it), cached input, output.
+    /// Tuple `(input_tokens, cached_input_tokens, output_tokens)`.
     pub(crate) type Counts = (u64, u64, u64);
 
     fn usage((input, cached, output): Counts) -> String {
@@ -893,8 +673,7 @@ pub(crate) mod fixtures {
         )
     }
 
-    /// A `token_count`: the running total and the last turn's counts, with
-    /// the rate limits Codex writes beside them.
+    /// Builds a `token_count` JSON line with running `total` and `last` turn counts.
     pub(crate) fn count(ms: i64, total: Counts, last: Counts) -> String {
         format!(
             "{{\"timestamp\":\"{}\",\"type\":\"event_msg\",\"payload\":{{\"type\":\"token_count\",\
@@ -908,7 +687,7 @@ pub(crate) mod fixtures {
         )
     }
 
-    /// A `token_count` of the rate limits alone (`info` null).
+    /// Builds a rate-limits-only `token_count` JSON line (`info: null`).
     pub(crate) fn limits_only(ms: i64) -> String {
         format!(
             "{{\"timestamp\":\"{}\",\"type\":\"event_msg\",\"payload\":{{\"type\":\"token_count\",\
@@ -917,12 +696,10 @@ pub(crate) mod fixtures {
         )
     }
 
-    /// One slot of [`rate`]: `(used_percent, window_minutes, resets_at)`.
+    /// Rate-limit slot `(used_percent, window_minutes, resets_at)`.
     pub(crate) type RateSlot = (f64, u64, i64);
 
-    /// A `token_count` of the rate limits alone (`info` null) for `family`,
-    /// its two slots each a [`RateSlot`] or null, the rest as Codex 0.163.0
-    /// writes it on the lab's provider (credits carried, the plan null).
+    /// Builds a rate-limits-only `token_count` JSON line for `family` with two slots.
     pub(crate) fn rate(
         ms: i64,
         family: &str,
@@ -952,7 +729,7 @@ pub(crate) mod fixtures {
         )
     }
 
-    /// Any other line: the model's message.
+    /// Builds a model message rollout JSON line.
     pub(crate) fn message(ms: i64) -> String {
         format!(
             "{{\"timestamp\":\"{}\",\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\
@@ -961,8 +738,7 @@ pub(crate) mod fixtures {
         )
     }
 
-    /// A `thread_settings_applied` naming `thread`, as Codex 0.163.0 writes
-    /// one when a thread's settings take effect (the settings stand-ins).
+    /// Builds a `thread_settings_applied` JSON line for `thread`.
     pub(crate) fn settings(ms: i64, thread: &str) -> String {
         format!(
             "{{\"timestamp\":\"{}\",\"type\":\"event_msg\",\"payload\":{{\"type\":\
@@ -973,8 +749,7 @@ pub(crate) mod fixtures {
         )
     }
 
-    /// `lines` re-stamped the way a fork copies them: in one burst from
-    /// `ms`, a millisecond apart.
+    /// Restamps `lines` in a 1-ms burst starting at `ms` to simulate a fork's copied prefix.
     pub(crate) fn copied(lines: &str, ms: i64) -> String {
         lines
             .lines()
@@ -1003,11 +778,9 @@ mod tests {
     use super::fixtures::{context, copied, count, limits_only, message, meta, meta_as, rate};
 
     /// The lab's composed login (Codex 0.163.0 wrote it into its
-    /// `session_meta`s, 2026-10-16): stand-in ids, no real account's.
     const LOGIN_A: (&str, &str) = ("acct-lab-1", "user-lab");
 
     /// Thread ids in UUIDv7 form, made in 2024: every file a test writes
-    /// now is written since they began.
     const ROOT: &str = "01900000-0000-7000-8000-000000000001";
 
     const SUB: &str = "01900000-0000-7000-8000-000000000002";
@@ -1031,12 +804,6 @@ mod tests {
     }
 
     /// EACH SERVED TURN ONCE: a `token_count` whose running total grew is
-    /// one turn, its `last_token_usage` on the latest `turn_context`'s
-    /// model, stamped with its own second. A count written again with the
-    /// same total, one of the rate limits alone, a line that is not JSON and
-    /// a turn with no stamp count nothing. Negative control: counting every
-    /// `token_count` that carries counts, as a per-line sum would, finds
-    /// four where two turns were served.
     #[test]
     fn each_served_turn_counts_once_on_its_turns_model() {
         let untimed = count(T0 + 20_000, (5000, 4000, 300), (2000, 1400, 150))
@@ -1081,7 +848,6 @@ mod tests {
         assert_eq!(served[1].tokens.input, 2000);
         assert_ne!(served[0].key, served[1].key);
         assert_eq!(reader.top, 5300, "the untimed turn still raised the total");
-        // NEGATIVE CONTROL: every count that carries counts.
         let per_line = text
             .lines()
             .filter(|l| l.ends_with('}') && l.contains("\"last_token_usage\""))
@@ -1090,11 +856,6 @@ mod tests {
     }
 
     /// THE FORK RULE (the design's §3.5, §8.4): a fork opens with its
-    /// parent's lines rewritten in one burst; that copied prefix counts
-    /// nothing, and the fork's own turn — its total continuing from the
-    /// copy's — counts once. Negative control: the same fork read without
-    /// its `forked_from_id`, as the per-file rule reads it, counts the
-    /// parent's two turns again.
     #[test]
     fn a_forks_copied_prefix_counts_nothing() {
         let parent = [
@@ -1120,10 +881,8 @@ mod tests {
         assert_eq!(served.len(), 1, "{got:?}");
         assert_eq!(served[0].model.as_deref(), Some("gpt-6-luna"));
         assert_eq!(served[0].tokens.input, 500);
-        // The parent read alone: its own two turns.
         let parents = rows(&mut TurnReader::default(), &parent);
         assert_eq!(turns(&parents).len(), 2);
-        // The copies carry the parent's fingerprints exactly.
         let fork_keys: Vec<u64> = rows(
             &mut TurnReader::default(),
             &fork.replace(&format!(",\"forked_from_id\":\"{ROOT}\""), ""),
@@ -1134,17 +893,12 @@ mod tests {
             _ => None,
         })
         .collect();
-        // NEGATIVE CONTROL: no fork named, the copies count again.
         assert_eq!(fork_keys.len(), 3, "the parent's two again, and its own");
         let parent_keys: Vec<u64> = turns(&parents).iter().map(|t| t.key).collect();
         assert_eq!(fork_keys[..2], parent_keys[..]);
     }
 
     /// The burst's edge: a line stamped [`FORK_BURST_MS`] after the newest
-    /// before it is still the copy; one a millisecond later is the fork's
-    /// own. A slow copy whose every step is within the burst stays a copy
-    /// however long it runs. Negative control: the same counts in a rollout
-    /// that is no fork are turns.
     #[test]
     fn the_copy_ends_at_the_first_gap_past_the_burst() {
         let fork = |gap: i64| {
@@ -1161,17 +915,11 @@ mod tests {
         let past = rows(&mut TurnReader::default(), &fork(FORK_BURST_MS + 1));
         assert_eq!(turns(&past).len(), 1, "{past:?}");
         assert_eq!(turns(&past)[0].tokens.input, 100);
-        // NEGATIVE CONTROL.
         let own = fork(FORK_BURST_MS).replace(&format!(",\"forked_from_id\":\"{ROOT}\""), "");
         assert_eq!(turns(&rows(&mut TurnReader::default(), &own)).len(), 3);
     }
 
     /// A FORK'S OWN TOTALS GO ON FROM ITS COPY'S (module header): a
-    /// `token_count` its own lines write again with the copy's last total —
-    /// as Codex writes one at a turn's start once the thread has a total —
-    /// is a repeat, never its parent's last turn counted again; its own turn
-    /// after it counts once. Negative control: the same own lines with no
-    /// copy before them count that total as a turn.
     #[test]
     fn a_count_repeating_the_copys_total_is_no_turn() {
         let parent = [
@@ -1202,7 +950,6 @@ mod tests {
         assert_eq!(served.len(), 1, "{got:?}");
         assert_eq!(served[0].tokens.input, 500);
         assert_eq!(reader.top, 3750);
-        // A reader stopped inside the copy holds the copy's total so far.
         let mut stopped = TurnReader::default();
         let lines: Vec<&str> = fork.lines().collect();
         for line in &lines[..lines.len() - 3] {
@@ -1210,15 +957,11 @@ mod tests {
         }
         assert!(matches!(stopped.prefix, Prefix::Copy(_)));
         assert_eq!(stopped.top, 3150);
-        // NEGATIVE CONTROL.
         let alone = [meta(fork_at, SUB, SUB, None), own].concat();
         assert_eq!(turns(&rows(&mut TurnReader::default(), &alone)).len(), 2);
     }
 
     /// A rollout whose first line names no session (cut, or of a shape this
-    /// reader does not know) may be a fork: its first burst counts nothing,
-    /// and turns after it count. Negative control: the same lines under a
-    /// plain `session_meta` count from the first.
     #[test]
     fn a_rollout_whose_first_line_names_no_session_is_read_as_a_fork() {
         let body = [
@@ -1234,14 +977,11 @@ mod tests {
         assert_eq!(got[2], Row::Copied);
         assert_eq!(turns(&got).len(), 1);
         assert_eq!(turns(&got)[0].model.as_deref(), Some("gpt-6-sol"));
-        // NEGATIVE CONTROL.
         let plain = format!("{}{body}", meta(T0 - 10, ROOT, ROOT, None));
         assert_eq!(turns(&rows(&mut TurnReader::default(), &plain)).len(), 3);
     }
 
     /// A turn whose `turn_context` named a service tier other than the
-    /// standard one says so; one naming none or `standard` does not, and a
-    /// model that is no model id is none.
     #[test]
     fn a_service_tier_and_a_bad_model_are_read_as_they_are() {
         let text = |tier: Option<&str>, model: &str| {
@@ -1258,7 +998,6 @@ mod tests {
         };
         assert!(turn(Some("fast"), "gpt-6-sol").tier);
         assert!(turn(Some("flex"), "gpt-6-sol").tier);
-        // NEGATIVE CONTROLS.
         assert!(!turn(Some("standard"), "gpt-6-sol").tier);
         assert!(!turn(None, "gpt-6-sol").tier);
         assert_eq!(turn(None, "gpt 6 sol!").model, None);
@@ -1266,9 +1005,6 @@ mod tests {
     }
 
     /// A whole read streams the rollout's complete lines through the reader:
-    /// a torn last line (one still being written) is not read, and a cap
-    /// stops the read short and says so. Negative control: the whole file
-    /// within its cap is complete.
     #[test]
     fn a_whole_read_takes_complete_lines_within_its_cap() {
         let dir = aterm_tempfile::Builder::new()
@@ -1295,14 +1031,12 @@ mod tests {
         let short = read_rollout(&path, &mut TurnReader::default(), 10, |_| {}).expect("read");
         assert!(!short.complete);
         assert_eq!(short.read, 10);
-        // A cap the file ends at is a whole read.
         let len = std::fs::metadata(&path).expect("meta").len();
         assert!(
             read_rollout(&path, &mut TurnReader::default(), len, |_| {})
                 .expect("read")
                 .complete
         );
-        // NEGATIVE CONTROL.
         std::fs::write(&path, &whole).expect("write");
         let full = read_rollout(&path, &mut TurnReader::default(), u64::MAX, |_| {}).expect("read");
         assert!(full.complete);
@@ -1318,11 +1052,6 @@ mod tests {
     }
 
     /// A CONVERSATION's rollouts: the TUI's own thread — the `session_id`
-    /// the named thread's rollout gives — first, then every subagent whose
-    /// `session_meta` names it, oldest write first, named by a subagent or
-    /// by the root alike; a rollout whose first line cannot be read is
-    /// counted unread. Negative control: another conversation's rollout is
-    /// never among them, and it alone is its own.
     #[test]
     fn a_conversation_is_its_tuis_thread_and_the_subagents_it_spawned() {
         let home = aterm_tempfile::Builder::new()
@@ -1374,18 +1103,15 @@ mod tests {
             conversation_rollouts(home.path(), SUB).own.as_deref(),
             Some(sub.as_path())
         );
-        // NEGATIVE CONTROL.
         let c = conversation_rollouts(home.path(), OTHER);
         assert_eq!(c.root, OTHER);
         assert_eq!(c.files, [other]);
         assert_eq!(c.subagents, 0);
-        // A thread with no rollout yet: nothing of anyone's.
         let none = conversation_rollouts(home.path(), "01900000-0000-7000-8000-00000000000f");
         assert!(none.own.is_none() && none.files.is_empty());
     }
 
     /// A rollout stamp to the millisecond: the fraction's first three
-    /// digits, padded.
     #[test]
     fn a_stamp_reads_to_the_millisecond() {
         let s = unix("2026-08-01T17:36:47Z");
@@ -1401,16 +1127,6 @@ mod tests {
     }
 
     /// A PAGINATED THREAD'S FORK COPIES NO COUNT (module header, measured on
-    /// 0.163.0 in the lab): a subagent spawned with its parent's turns opens
-    /// with its own `session_meta`, its parent's, and the parent's turns —
-    /// messages and `turn_context`s, no `token_count` — in one millisecond;
-    /// its own `turn_context` follows within 10 ms and, on the stub's instant
-    /// answer, its first count within 25 ms, its total from zero. Read from
-    /// its first line, that turn counts once on its model. A `/fork` (and
-    /// `codex fork`) of a paginated thread copies nothing: its own turn
-    /// counts either way. Negative control: the same subagent marked
-    /// `legacy` is read with the burst rule, which takes its first turn for
-    /// its parent's and loses it — the undercount this rule ends.
     #[test]
     fn a_paginated_forks_own_first_turn_counts_on_its_model() {
         let spawn = |history: &str| {
@@ -1443,24 +1159,12 @@ mod tests {
             let text = user_fork.replace(PAGINATED, history);
             assert_eq!(turns(&rows(&mut TurnReader::default(), &text)).len(), 1);
         }
-        // NEGATIVE CONTROL.
         let legacy = rows(&mut TurnReader::default(), &spawn("legacy"));
         assert!(turns(&legacy).is_empty(), "{legacy:?}");
         assert_eq!(legacy.last(), Some(&Row::Copied));
     }
 
     /// A LEGACY FORK'S OWN SETTINGS LINE ENDS ITS COPY (module header,
-    /// measured on 0.163.0): `codex fork <legacy thread> <prompt>` copies its
-    /// parent's lines under one stamp, writes its own
-    /// `thread_settings_applied` in the same millisecond, and runs the
-    /// prompt's turn at once: its next line 14 ms on, its count 37 ms on,
-    /// inside any burst. That turn counts once, on its own model, and its
-    /// reading is the file's own. A copied settings line (a fork of a fork
-    /// copies its parent's), naming the thread it came from, ends nothing.
-    /// A reader that stops inside the copy and goes on with its state kept
-    /// ends it at the same line. Negative control: the same fork whose own
-    /// settings lines name another thread is read by the stamps alone, which
-    /// take the prompt's turn and its reading for the copy's.
     #[test]
     fn a_legacy_forks_own_settings_line_ends_its_copy() {
         use super::fixtures::settings;
@@ -1490,7 +1194,6 @@ mod tests {
         assert_eq!(t[0].model.as_deref(), Some("gpt-6.1-sol"));
         assert_eq!(t[0].tokens.input, 13_992);
         assert_eq!(got[4], Row::Copied, "the copy's count");
-        // Read in two parts, the reader kept between them.
         let mut reader = TurnReader::default();
         let (head, tail) = text.split_at(text.find(&settings(T0, ROOT)).expect("a copied line"));
         let first = rows(&mut reader, head);
@@ -1502,7 +1205,6 @@ mod tests {
             (reader.prefix, reader.thread.as_deref()),
             (Prefix::Own, None)
         );
-        // The readings: the file's own past its copy.
         let dir = aterm_tempfile::Builder::new()
             .prefix("codex-usage-settings-")
             .tempdir()
@@ -1517,7 +1219,6 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         assert_eq!(shares(&text), [12.0, 55.0], "the own count's and reading");
-        // NEGATIVE CONTROL.
         let other = prompted(OTHER);
         let got = rows(&mut TurnReader::default(), &other);
         assert!(turns(&got).is_empty(), "{got:?}");
@@ -1526,10 +1227,6 @@ mod tests {
     }
 
     /// The home Codex's records are read under: `CODEX_HOME`, else
-    /// `~/.codex`; a relative one is the TUI's directory's, as Codex resolves
-    /// it. Negative controls: a relative home with no absolute directory to
-    /// resolve it against is none, never another home's records; an empty one
-    /// is unset.
     #[test]
     fn codex_home_is_codex_home_else_the_users() {
         use crate::harness::host_path::abs;

@@ -2,69 +2,6 @@
 // Copyright 2026 Andrew Yates
 
 //! `attest`: the provenance and license notary over `vendor/`.
-//!
-//! Upstream crates live under `vendor/` as aterm-owned forks, wired in by the root
-//! `[patch.crates-io]` table; each redistributes someone else's work with aterm's edits and must
-//! be drivable standalone by `targo trust check -p`. The patch table is partitioned first by
-//! [`aterm_census::scan_set::classify_patch_target`]:
-//!
-//! * a `vendor/` path is a fork and owes every obligation;
-//! * a `crates/` path that keeps an upstream license and a NOTICE line is absorbed: upstream
-//!   source aterm owns as a member. The license obligations follow the code, so it owes
-//!   `[OB-5]`, `[OB-6]`, `[OB-7]` and `[OB-9]` besides `[OB-1]` and `[OB-2]`; the fork-upkeep
-//!   ones (`[OB-3]`, `[OB-4]`, `[OB-8]`, `[OB-10]`) do not apply;
-//! * a `crates/` path with neither record is a first-party member (e.g. `tracing` →
-//!   `crates/aterm-tracing`) and owes only `[OB-1]` and `[OB-2]`.
-//!
-//! Any other location, or a `crates/` path with only one of the two records, is an `[OB-1]`
-//! failure.
-//!
-//! An absorbed crate renamed off its upstream name leaves the patch table (winit →
-//! `crates/aterm-window`, the package `aterm-window` since winit-core step 7). NOTICE still
-//! lists it, under the upstream name and version, and that line is what finds it: a NOTICE
-//! entry under `crates/` that no patch row targets is an ABSORBED MEMBER, which owes the same
-//! license obligations and `[OB-1]` (it must be a crate with sources), but not `[OB-2]`, which
-//! asks whether a patch took. Every obligation is fail-closed and tagged `[OB-n]` in the log, which is returned,
-//! not printed, so `check` can splice it into the gate report.
-//!
-//! # The obligations
-//!
-//! * `[OB-1]`  patch ↔ `vendor/` agreement, both directions: every vendored patch
-//!   key resolves to a real `vendor/<dir>` with sources, and every directory
-//!   under `vendor/` is claimed by one of three shapes: a patch entry (a
-//!   redistributed fork), a row on [`crate::provenance::FIRST_PARTY_VENDORED`]
-//!   (aterm's own code vendored so a clean clone builds, which a member must
-//!   reach by `path = …`), or the astream git submodule (`.gitmodules` entry, a
-//!   lone gitlink in the index, a clean checkout at exactly the gitlink commit,
-//!   and Cargo metadata resolving its crates there as non-member path packages;
-//!   see `direct_vendor`). Forks are cross-checked against the census review,
-//!   `vendor/forge.toml`'s `[[fork]]` blocks
-//!   ([`aterm_census::scan_set::reviewed_forks`]), and absorbed crates against
-//!   [`aterm_census::scan_set::ABSORBED_CRATES`], each in both directions; a
-//!   review block inside a first-party vendored root is a failure. Every patch
-//!   path is under `vendor/` or `crates/`, and a first-party target is a real
-//!   directory with sources.
-//! * `[OB-2]`  version equality: a patched version outside the workspace's
-//!   requirement leaves the patch silently unused (cargo warns and exits 0), so
-//!   `Cargo.lock` is checked for a source-less entry. Also covers first-party
-//!   targets.
-//! * `[OB-3]`  the empty `[workspace]` stub, without which `cargo metadata` run
-//!   inside the crate fails ("current package believes it's in a workspace").
-//! * `[OB-4]`  upstream provenance: `.cargo_vcs_info.json` + `Cargo.toml.orig`.
-//! * `[OB-5]`  a retained upstream `LICENSE*` in every fork and absorbed crate root.
-//! * `[OB-6]`  `NOTICE` agreement, both directions, including version, SPDX and directory.
-//! * `[OB-7]`  Apache-2.0 §4(b) modification notices, where the Apache arm is unavoidable (a
-//!   dual `… OR MIT` crate can elect MIT). Modified files are found by byte diff against a
-//!   pristine copy; without one the crate is reported UNVERIFIED.
-//! * `[OB-8]`  the marker census: `// aterm-trust:` and `// LOCAL PATCH (aterm):` per fork. A
-//!   fork with zero markers has no recorded reason to exist.
-//! * `[OB-9]`  every license arm is on `deny.toml`'s `[licenses] allow` list.
-//! * `[OB-10]` nothing under `vendor/` is swallowed by `.gitignore` (read-only
-//!   `git check-ignore -v --no-index`). A submodule's working tree is another repository and is
-//!   not descended into.
-//!
-//! The astream submodule's pin is its gitlink commit: `[OB-1]` proves the checkout is that
-//! commit, not that astream's `main` reached it (that is reviewed in astream).
 
 use aterm_uds::output::CommandOutput as _;
 use aterm_uds::spawnfd::command;
@@ -81,10 +18,9 @@ pub const TRUST_MARKER: &str = "// aterm-trust:";
 /// The marker each behavioural local patch inside a fork carries.
 pub const LOCAL_PATCH_MARKER: &str = "// LOCAL PATCH (aterm):";
 /// How many leading lines of a file count as its "header" for the Apache-2.0
-/// §4(b) prominent-notice test.
 const HEADER_LINES: usize = 20;
 
-/// The `attest` verb. `check` calls [`report`] directly to splice the same log into the gate's.
+/// The `attest` verb.
 pub fn run(root: &Path) -> Result<Outcome, String> {
     if !root.join("Cargo.toml").is_file() {
         return Err(format!(
@@ -94,7 +30,6 @@ pub fn run(root: &Path) -> Result<Outcome, String> {
     }
     let attested = report(root);
     match attested.could_not_run {
-        // The reason first (`main` prefixes "could not run:"), then the transcript.
         Some(why) => Err(format!(
             "{why}\n\nthe transcript up to that point:\n{}",
             attested.log
@@ -106,10 +41,7 @@ pub fn run(root: &Path) -> Result<Outcome, String> {
     }
 }
 
-/// What [`report_with`] found: green or not, its transcript, and — when an
-/// obligation could not be judged on this machine (its Cargo cache lacks a
-/// crate the lock names, [`crate::direct_vendor::machine_refusal`]) — why: the
-/// run is then COULD NOT RUN, never FAIL (OF-30).
+/// What [`report_with`] found: green or not, its transcript, and — when an obligation could not be judged on this machine (its Cargo cache lacks a crate the lock names, [`crate::direct_vendor::machine_refusal`]) — why: the run is then COULD NOT RUN, never FAIL (OF-30).
 pub struct Attestation {
     /// No obligation was found violated.
     pub ok: bool,
@@ -117,24 +49,16 @@ pub struct Attestation {
     pub log: String,
     /// Why an obligation could not be judged here, if one could not.
     pub could_not_run: Option<String>,
-    /// The Apache-only forks `[OB-7]` could not diff here, for want of a pristine copy: their
-    /// §4(b) notices are UNVERIFIED, never passed. `ok` can hold beside them (nothing was found
-    /// wrong), so a verdict built on `ok` names these too. Until 2026-10-20 the transcript said
-    /// "✓ [OB-7] every file … carries a modification notice" with no diff run, and an added
-    /// aterm-window file without its notice passed a day of runs that way.
+    /// The Apache-only forks `[OB-7]` could not diff here, for want of a pristine copy: their §4(b) notices are UNVERIFIED, never passed.
     pub unverified: Vec<String>,
 }
-
-// --- facts -----------------------------------------------------------------
 
 /// One vendored fork, as attest sees it on disk.
 #[derive(Debug, Clone)]
 struct VendoredFork {
     /// The crates-io package being replaced
-    /// ([`crate::policy::patched_package`]).
     name: String,
     /// The patch row is renamed, so it claims one version line of `name`
-    /// ([`crate::policy::in_row_scope`]).
     renamed: bool,
     /// The replacement path exactly as the patch table spells it.
     rel: String,
@@ -161,8 +85,6 @@ impl VendoredFork {
 }
 
 /// Read the root `[patch.crates-io]` table as rows naming the package each
-/// replaces. A non-path entry (git/registry) yields an empty path and is
-/// reported by `[OB-1]`.
 fn patch_paths(root: &Path) -> Result<PatchTable, String> {
     let manifest = root.join("Cargo.toml");
     let text = std::fs::read_to_string(&manifest)
@@ -225,8 +147,6 @@ struct Partition {
 }
 
 /// Split the patch table by replacement path. Only a target `classify_patch_target` accepts as
-/// first-party or absorbed leaves the vendored arm; an empty path (git/registry patch), a third
-/// location or a half-recorded `crates/` redistribution stays there so `[OB-1]` reports it.
 fn partition_patches(patch: &[PatchRow], root: &Path) -> Partition {
     use aterm_census::scan_set::PatchTargetKind;
     let mut out = Partition {
@@ -246,9 +166,6 @@ fn partition_patches(patch: &[PatchRow], root: &Path) -> Partition {
 }
 
 /// The absorbed crates renamed off their upstream name: each `NOTICE` list entry under
-/// `crates/` that no patch row targets, as a row naming the upstream package (the NOTICE name,
-/// which the pristine copy and `[OB-6]` key on) at that directory. An unreadable NOTICE yields
-/// none here; `[OB-6]` reports it.
 fn absorbed_members(root: &Path, patch: &[PatchRow]) -> PatchTable {
     let text = std::fs::read_to_string(root.join("NOTICE")).unwrap_or_default();
     let mut out: PatchTable = parse_notice(&text)
@@ -265,7 +182,6 @@ fn absorbed_members(root: &Path, patch: &[PatchRow]) -> PatchTable {
 }
 
 /// Directory names directly under `vendor/`, sorted. Absent `vendor/` is an
-/// empty list, not an error: `[OB-1]` decides whether that is a defect.
 fn vendor_dirs(root: &Path) -> Vec<String> {
     let mut out = Vec::new();
     let Ok(entries) = std::fs::read_dir(root.join("vendor")) else {
@@ -349,7 +265,6 @@ fn survey_forks(root: &Path, patch: &[PatchRow]) -> Vec<VendoredFork> {
 }
 
 /// Count both markers over every `*.rs` under a fork, using the shared
-/// `aterm_census` walk.
 fn count_markers(root: &Path, fork: &mut VendoredFork) {
     let mut files = Vec::new();
     if aterm_census::collect_rs_files(&fork.dir, &mut files).is_err() {
@@ -378,11 +293,7 @@ fn rel_display(root: &Path, path: &Path) -> String {
         .replace('\\', "/")
 }
 
-// --- SPDX ------------------------------------------------------------------
-
 /// Split an SPDX expression into its individual license identifiers.
-/// `WITH <exception>` is folded into the license it qualifies, so
-/// `Apache-2.0 WITH LLVM-exception OR MIT` yields `Apache-2.0`, `MIT`.
 fn license_arms(expr: &str) -> Vec<String> {
     let flat = expr.replace(['(', ')'], " ");
     let mut arms = Vec::new();
@@ -399,9 +310,7 @@ fn license_arms(expr: &str) -> Vec<String> {
     arms
 }
 
-/// Is the Apache-2.0 grant unavoidable for this expression? A dual
-/// `MIT OR Apache-2.0` fork can be redistributed under MIT, which carries no
-/// §4(b) obligation; a bare `Apache-2.0` fork cannot.
+/// Is the Apache-2.0 grant unavoidable for this expression? A dual `MIT OR Apache-2.0` fork can be redistributed under MIT, which carries no §4(b) obligation; a bare `Apache-2.0` fork cannot.
 pub(crate) fn apache_is_mandatory(expr: &str) -> bool {
     let arms: Vec<&str> = expr.split(" OR ").collect();
     !arms.is_empty()
@@ -431,10 +340,7 @@ fn deny_allow(root: &Path) -> Result<Vec<String>, String> {
         .collect())
 }
 
-// --- version requirements --------------------------------------------------
-
-/// A parsed dotted version. `stated_*` record which components the text
-/// actually spelled, which is what decides a caret requirement's upper bound.
+/// A parsed dotted version.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Ver {
     major: u64,
@@ -450,8 +356,7 @@ impl Ver {
     }
 }
 
-/// Parse a dotted version, tolerant of omitted components and of a
-/// `-prerelease` / `+build` suffix.
+/// Parse a dotted version, tolerant of omitted components and of a `-prerelease` / `+build` suffix.
 pub(crate) fn parse_version(text: &str) -> Option<Ver> {
     let core = text.split(['-', '+']).next().unwrap_or(text);
     let mut parts = core.split('.');
@@ -476,9 +381,6 @@ pub(crate) fn parse_version(text: &str) -> Option<Ver> {
 }
 
 /// Does `version` satisfy `req`? `None` means the requirement form is not
-/// understood; callers treat that as a failure.
-///
-/// Only caret (bare or explicit) and exact `=` are modelled.
 fn req_satisfied(req: &str, version: &str) -> Option<bool> {
     let req = req.trim();
     if req.contains(',') || req.contains('*') || req.starts_with('>') || req.starts_with('<') {
@@ -492,9 +394,6 @@ fn req_satisfied(req: &str, version: &str) -> Option<bool> {
             && (!r.stated_patch || v.patch == r.patch);
         return Some(ok);
     }
-    // Caret: >= the stated floor, < the next incompatible release. The
-    // leftmost non-zero stated component is the compatibility axis, so `0.30`
-    // admits 0.30.13 but not 0.31.0.
     let upper = if r.major > 0 {
         (r.major + 1, 0, 0)
     } else if !r.stated_minor {
@@ -510,8 +409,6 @@ fn req_satisfied(req: &str, version: &str) -> Option<bool> {
 }
 
 /// Every version requirement the workspace states on `name`, as `(manifest, requirement)`.
-/// Inherited (`workspace = true`) entries are skipped: the root `[workspace.dependencies]` entry
-/// they inherit is read instead.
 fn workspace_requirements(root: &Path, name: &str) -> Vec<(String, String)> {
     let mut manifests = vec![root.join("Cargo.toml")];
     if let Ok(entries) = std::fs::read_dir(root.join("crates")) {
@@ -556,8 +453,6 @@ fn workspace_requirements(root: &Path, name: &str) -> Vec<(String, String)> {
             let Some(entry) = entry.as_table_like() else {
                 continue;
             };
-            // A path/git replacement states no registry requirement, and an
-            // inherited entry restates the root's — neither is a new fact.
             if entry.get("path").is_some() || entry.get("git").is_some() {
                 continue;
             }
@@ -574,8 +469,7 @@ fn workspace_requirements(root: &Path, name: &str) -> Vec<(String, String)> {
     out
 }
 
-/// Every `[[package]]` entry in `Cargo.lock` for `name`, as
-/// `(version, has_source)`. A live path patch has no `source` key.
+/// Every `[[package]]` entry in `Cargo.lock` for `name`, as `(version, has_source)`.
 pub(crate) fn lock_entries(root: &Path, name: &str) -> Result<Vec<(String, bool)>, String> {
     let path = root.join("Cargo.lock");
     let text = std::fs::read_to_string(&path)
@@ -602,10 +496,7 @@ pub(crate) fn lock_entries(root: &Path, name: &str) -> Result<Vec<(String, bool)
     Ok(out)
 }
 
-// --- NOTICE ----------------------------------------------------------------
-
 /// One `- <name> <version>, <SPDX> (`<dir>/`)` line of `NOTICE`; `dir` is repo-relative, under
-/// `vendor/` for a fork or `crates/` for an absorbed crate.
 #[derive(Debug, Clone)]
 struct NoticeEntry {
     name: String,
@@ -648,8 +539,6 @@ fn parse_notice(text: &str) -> Vec<NoticeEntry> {
     out
 }
 
-// --- .gitignore ------------------------------------------------------------
-
 /// One `git check-ignore -v --no-index` verdict.
 #[derive(Debug, Clone)]
 struct IgnoreVerdict {
@@ -661,8 +550,6 @@ struct IgnoreVerdict {
 }
 
 /// Ask git which of `paths` its ignore rules match. `--no-index` is required:
-/// without it git reports tracked files as not ignored. Returns `None` when git
-/// cannot answer; callers report that, never pass it.
 fn check_ignore(root: &Path, paths: &[String]) -> Option<Vec<IgnoreVerdict>> {
     if paths.is_empty() {
         return Some(Vec::new());
@@ -673,8 +560,6 @@ fn check_ignore(root: &Path, paths: &[String]) -> Option<Vec<IgnoreVerdict>> {
         .args(paths)
         .output_owned()
         .ok()?;
-    // 0 = at least one match, 1 = no match. Anything else (128: not a
-    // repository) means git did not answer the question.
     match output.status.code() {
         Some(0 | 1) => {}
         _ => return None,
@@ -696,7 +581,6 @@ fn check_ignore(root: &Path, paths: &[String]) -> Option<Vec<IgnoreVerdict>> {
 }
 
 /// The gitlinks (mode 160000 entries) the index records under `vendor/`,
-/// repo-relative: the submodules. `None` when git cannot answer.
 fn vendor_gitlinks(root: &Path) -> Option<BTreeSet<String>> {
     let output = command("git")
         .current_dir(root)
@@ -718,7 +602,6 @@ fn vendor_gitlinks(root: &Path) -> Option<BTreeSet<String>> {
 }
 
 /// Every path under `vendor/`, repo-relative, files and directories alike,
-/// except beneath a submodule in `skip`. The submodule's own path is listed.
 fn vendor_paths(root: &Path, dir: &Path, skip: &BTreeSet<String>, out: &mut Vec<String>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
@@ -735,10 +618,7 @@ fn vendor_paths(root: &Path, dir: &Path, skip: &BTreeSet<String>, out: &mut Vec<
     }
 }
 
-// --- the report ------------------------------------------------------------
-
-/// Run every obligation ([`Attestation`]); the log is complete on its own and
-/// ends with [`crate::PRECISION_NOTE`] whenever anything failed.
+/// Run every obligation ([`Attestation`]); the log is complete on its own and ends with [`crate::PRECISION_NOTE`] whenever anything failed.
 pub fn report(root: &Path) -> Attestation {
     report_with(&crate::resolve::Cargo::from_env(), root)
 }
@@ -781,8 +661,6 @@ pub fn report_with(cargo: &crate::resolve::Cargo, root: &Path) -> Attestation {
     let first_party_forks = survey_forks(root, &partition.first_party);
     let absorbed = survey_forks(root, &partition.absorbed);
     let members = survey_forks(root, &absorbed_members(root, &patch));
-    // Forks and absorbed crates are both redistributed on someone else's terms, so both owe the
-    // license obligations.
     let mut redistributed: Vec<VendoredFork> = forks
         .iter()
         .chain(&absorbed)
@@ -818,7 +696,6 @@ pub fn report_with(cargo: &crate::resolve::Cargo, root: &Path) -> Attestation {
     );
     fails += ob1_fails;
     could_not_run = ob1_refused;
-    // [OB-2] asks whether a patch took: a renamed member is in no patch row.
     let mut ob2_all: Vec<VendoredFork> = Vec::new();
     ob2_all.extend(forks.iter().cloned());
     ob2_all.extend(absorbed.iter().cloned());
@@ -881,19 +758,6 @@ pub fn report_with(cargo: &crate::resolve::Cargo, root: &Path) -> Attestation {
 }
 
 /// `[OB-1]` Every vendored patch key resolves to a real `vendor/<dir>` with
-/// sources. Every vendor directory is claimed by such a patch, a
-/// [`crate::provenance::FIRST_PARTY_VENDORED`] row that a member reaches by
-/// `path = …`, or the astream submodule (`direct_vendor`). Forks are
-/// cross-checked against the census review (the ledger's `[[fork]]` blocks)
-/// when this root is the workspace it describes.
-///
-/// First-party patch targets must exist and have sources, and are named in the
-/// log. They are excluded from the review cross-check in both directions,
-/// since a review block for a workspace member would be a false provenance
-/// claim.
-///
-/// Returns the violations and, when the astream review could not be judged on
-/// this machine ([`crate::direct_vendor::machine_refusal`]), why.
 fn ob1_patch_vendor_agreement(
     cargo: &crate::resolve::Cargo,
     root: &Path,
@@ -1065,8 +929,6 @@ fn ob1_patch_vendor_agreement(
              here is held to patch ↔ vendor/ agreement alone."
         );
     }
-    // A roster row whose directory is gone would grant a permanent exemption,
-    // so stale rows are checked first.
     for row in crate::provenance::stale_rows(root) {
         if !roster_applies {
             break;
@@ -1085,9 +947,6 @@ fn ob1_patch_vendor_agreement(
         if forks.iter().any(|f| f.rel == rel) {
             continue;
         }
-        // First-party path dependency: aterm's own code, vendored so a clean
-        // clone builds, reached by `path = …`. No patch entry can name it
-        // (these crates are unpublished).
         if let Some(row) = crate::provenance::roster_row(&rel).filter(|_| roster_applies) {
             if let Some(fork) = forks.iter().find(|f| f.rel == rel) {
                 let _ = writeln!(
@@ -1113,8 +972,6 @@ fn ob1_patch_vendor_agreement(
                 fails += 1;
                 continue;
             }
-            // The pin is read from the tree, never from the roster: the row
-            // names the repository, the gitlink names the commit.
             let pin = submodule
                 .as_ref()
                 .filter(|_| dir == crate::direct_vendor::DIRECTORY)
@@ -1143,10 +1000,6 @@ fn ob1_patch_vendor_agreement(
             );
             continue;
         }
-        // The astream submodule, classified on roots the roster does not
-        // describe (test fixtures). On this workspace the roster branch above
-        // takes `vendor/astream`; the submodule check still runs and reports
-        // its pin.
         if submodule.is_some() && dir == crate::direct_vendor::DIRECTORY {
             continue;
         }
@@ -1163,8 +1016,6 @@ fn ob1_patch_vendor_agreement(
         fails += 1;
     }
 
-    // The census review is cross-checked on this workspace only (the ABSORBED
-    // rows below are compiled in, and attest's fixtures carry no ledger).
     if root.join("crates/aterm-census/src/scan_set.rs").is_file() {
         let ledger = aterm_census::scan_set::FORK_LEDGER;
         let registry = aterm_census::scan_set::reviewed_forks(root).unwrap_or_else(|e| {
@@ -1205,9 +1056,6 @@ fn ob1_patch_vendor_agreement(
                 fails += 1;
             }
         }
-        // A review block for a directory the provenance roster calls aterm's
-        // own is a category error that would re-impose the obligations the
-        // roster lifts.
         for entry in &registry {
             if let Some(row) = crate::provenance::roster_row(&entry.path).filter(|_| roster_applies)
             {
@@ -1221,8 +1069,6 @@ fn ob1_patch_vendor_agreement(
                 fails += 1;
             }
         }
-        // The census scans an absorbed crate by its ABSORBED_CRATES row (namespace and platform
-        // slices), so the rows and the absorbed crates, patched or renamed, must agree both ways.
         let rows = aterm_census::scan_set::ABSORBED_CRATES;
         for crate_ in absorbed.iter().chain(members) {
             if !rows
@@ -1289,8 +1135,6 @@ fn ob1_patch_vendor_agreement(
 }
 
 /// `[OB-2]` The patched crate's version must satisfy every requirement the workspace states, and
-/// `Cargo.lock` must show the patch took. Runs over every patch target (forks, absorbed crates
-/// and first-party targets alike): cargo hides an unused patch behind a warning at exit 0.
 fn ob2_version_equality(root: &Path, forks: &[VendoredFork], log: &mut String) -> usize {
     let mut fails = 0;
     for fork in forks {
@@ -1315,7 +1159,6 @@ fn ob2_version_equality(root: &Path, forks: &[VendoredFork], log: &mut String) -
             continue;
         }
         for (manifest, req) in workspace_requirements(root, &fork.name) {
-            // A renamed row answers for its own version line only: a
             // requirement on another line is another row's, or the registry's.
             if !crate::policy::in_row_scope(fork.renamed, Some(&fork.version), &req) {
                 continue;
@@ -1426,7 +1269,6 @@ fn ob2_version_equality(root: &Path, forks: &[VendoredFork], log: &mut String) -
 }
 
 /// `[OB-3]` The empty `[workspace]` stub, without which the fork cannot be
-/// driven standalone.
 fn ob3_workspace_stub(forks: &[VendoredFork], log: &mut String) -> usize {
     let mut fails = 0;
     for fork in forks {
@@ -1523,7 +1365,6 @@ fn ob5_license_files(forks: &[VendoredFork], log: &mut String) -> usize {
 }
 
 /// `[OB-6]` `NOTICE` lists every fork and absorbed crate, with the right version, SPDX and
-/// directory, and lists nothing else.
 fn ob6_notice_agreement(root: &Path, forks: &[VendoredFork], log: &mut String) -> usize {
     let path = root.join("NOTICE");
     let text = match std::fs::read_to_string(&path) {
@@ -1628,8 +1469,6 @@ fn ob6_notice_agreement(root: &Path, forks: &[VendoredFork], log: &mut String) -
 }
 
 /// `[OB-7]` Apache-2.0 §4(b): every modified file must carry a prominent
-/// notice stating that it changed. Returns the violations and the in-scope forks no diff could
-/// judge ([`Attestation::unverified`]).
 fn ob7_apache_modification_notices(
     root: &Path,
     forks: &[VendoredFork],
@@ -1644,9 +1483,6 @@ fn ob7_apache_modification_notices(
         }
         scoped.push(fork.name.clone());
 
-        // Modified files are found by diffing against pristine, not by aterm's
-        // markers: §4(b) attaches to the edit, and an unmarked edit would be
-        // invisible.
         let Some(pristine) = pristine_dir(root, &fork.name, &fork.version) else {
             let _ = writeln!(
                 log,
@@ -1717,7 +1553,6 @@ fn ob7_apache_modification_notices(
             scoped.join(", ")
         }
     );
-    // The tick is a claim about files a diff read: a fork none was read for gets its own line.
     if !unverified.is_empty() {
         let _ = writeln!(
             log,
@@ -1744,15 +1579,7 @@ struct Divergence {
 }
 
 /// The unpacked pristine source for `name@version`, if this checkout or the
-/// local registry has it. Offline.
-///
-/// Presence depends on the machine: `[patch.crates-io]` makes the lock entry
-/// source-less, so cargo never downloads the pristine copy. Without it `[OB-7]`
-/// reports UNVERIFIED rather than passing.
 fn pristine_dir(root: &Path, name: &str, version: &str) -> Option<PathBuf> {
-    // A repo-local pristine tree (`vendor/.forge/<name>/pristine/`) wins over the registry, so a
-    // fork whose upstream is unfetchable stays diffable. `aterm_census::collect_rs_files` skips
-    // the dot-directory.
     let local = root
         .join("vendor")
         .join(".forge")
@@ -1777,7 +1604,6 @@ fn pristine_dir(root: &Path, name: &str, version: &str) -> Option<PathBuf> {
 }
 
 /// Byte-compare every file under `fork` against `pristine`, skipping
-/// `.cargo-ok` (a registry unpack stamp), `.git` and build output.
 fn diff_against_pristine(pristine: &Path, fork: &Path) -> Option<Divergence> {
     let mut modified = Vec::new();
     let mut added = Vec::new();
@@ -1814,7 +1640,6 @@ fn diff_against_pristine(pristine: &Path, fork: &Path) -> Option<Divergence> {
 }
 
 /// Does this file's header claim aterm changed it? Generous about wording,
-/// strict about position: §4(b) asks for a prominent notice.
 fn has_modification_notice(text: &str) -> bool {
     text.lines().take(HEADER_LINES).any(|line| {
         let lower = line.to_ascii_lowercase();
@@ -1822,9 +1647,6 @@ fn has_modification_notice(text: &str) -> bool {
             && (lower.contains("modif")
                 || lower.contains("local patch")
                 || lower.contains("change")
-                // An added file is not "modified" under §4(b), but NOTICE says
-                // modified and added files carry notices, so the new-file
-                // wording counts (e.g. crates/aterm-window's seat/data_device.rs).
                 || lower.contains("added by"))
     })
 }
@@ -1929,17 +1751,10 @@ fn ob9_spdx_allowlist(root: &Path, forks: &[VendoredFork], log: &mut String) -> 
 }
 
 /// `[OB-10]` Nothing under `vendor/` is swallowed by `.gitignore`.
-///
-/// Submodules are not swept: their working tree is another repository, which
-/// applies its own ignore rules (the root `target` rule would otherwise match
-/// its build output). `[OB-1]` owns the submodule.
 fn ob10_gitignore(root: &Path, forks: &[VendoredFork], log: &mut String) -> usize {
     let submodules = vendor_gitlinks(root).unwrap_or_default();
     let mut existing = Vec::new();
     vendor_paths(root, &root.join("vendor"), &submodules, &mut existing);
-    // Also probe the paths `[OB-4]` requires, even if not yet written: a rule
-    // that swallows them would lose a re-vendor's provenance. A fork's own
-    // `target/` is not probed.
     let mut probes = Vec::new();
     for fork in forks {
         for leaf in [".cargo_vcs_info.json", "Cargo.toml.orig"] {
@@ -2018,8 +1833,6 @@ fn ob10_gitignore(root: &Path, forks: &[VendoredFork], log: &mut String) -> usiz
     fails
 }
 
-// --- tests -----------------------------------------------------------------
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2055,7 +1868,6 @@ mod tests {
         assert_eq!(req_satisfied("1", "2.0.0"), Some(false));
         assert_eq!(req_satisfied("=0.33.1", "0.33.1"), Some(true));
         assert_eq!(req_satisfied("=0.33.1", "0.33.2"), Some(false));
-        // Unmodelled forms are `None`, never a silent pass.
         assert_eq!(req_satisfied(">=1, <3", "2.0.0"), None);
     }
 
@@ -2091,8 +1903,6 @@ mod tests {
             "§4(b) wants a PROMINENT notice"
         );
     }
-
-    // --- fixtures ----------------------------------------------------------
 
     struct Fixture(aterm_tempfile::TempDir);
 
@@ -2139,7 +1949,6 @@ mod tests {
     }
 
     /// Each case is the green fixture with ONE file changed, so a red can only
-    /// come from the plant, and it must be the planted obligation that fails.
     #[test]
     fn every_planted_fork_defect_reds_its_own_obligation() {
         let Attestation { ok, log, .. } = report(good_fixture("green").0.path());
@@ -2203,8 +2012,6 @@ mod tests {
             )
             .unwrap();
         };
-        // A modelled requirement on another version line is outside the renamed row, so the
-        // report stays green.
         require("2");
         let Attestation { ok, log, .. } = report(root);
         assert!(ok, "a valid other-major requirement stays excluded:\n{log}");
@@ -2224,9 +2031,6 @@ mod tests {
     }
 
     /// [`good_fixture`] plus one absorbed crate: an Apache-2.0 member under `crates/` with its
-    /// upstream LICENSE, a NOTICE line and a pristine copy to diff against, every modified or
-    /// added file carrying its notice. Patched in under its upstream name, or with `renamed`
-    /// renamed off it (its own package name, in no patch row).
     fn absorbed_fixture(tag: &str, renamed: bool) -> Fixture {
         let fixture = good_fixture(tag);
         let root = fixture.0.path().to_path_buf();
@@ -2290,8 +2094,6 @@ mod tests {
     }
 
     /// An absorbed crate owes the license obligations and can meet them; a file
-    /// edited without its notice, or a NOTICE that stops naming the crate, is
-    /// red.
     #[test]
     fn an_absorbed_crate_owes_the_license_obligations() {
         let fixture = absorbed_fixture("absorbed-green", false);
@@ -2307,7 +2109,6 @@ mod tests {
         let Attestation { ok, log, .. } = report(fixture.0.path());
         assert!(!ok && log.contains("FAIL [OB-7]"), "{log}");
 
-        // Without its NOTICE line the crate is a half-recorded redistribution, refused outright.
         let fixture = absorbed_fixture("absorbed-no-notice-line", false);
         let notice = fixture.0.path().join("NOTICE");
         let text = std::fs::read_to_string(&notice).unwrap().replace(
@@ -2320,9 +2121,6 @@ mod tests {
     }
 
     /// An absorbed crate renamed off its upstream name is in no patch row; its NOTICE line finds
-    /// it, and it owes the license obligations as before. Each control below is a defect the
-    /// patched form is held to: an edit without its notice, a dropped upstream LICENSE, and a
-    /// NOTICE line left naming a crate that is gone.
     #[test]
     fn a_renamed_absorbed_member_owes_the_license_obligations() {
         let fixture = absorbed_fixture("member-green", true);
@@ -2358,10 +2156,6 @@ mod tests {
     }
 
     /// `[OB-7]` with no pristine copy diffed nothing, so it claims nothing: no tick, and the
-    /// verdict names the member UNVERIFIED. This is how crates/aterm-window's added
-    /// `seat/retire_tests.rs` went without its notice from 2026-10-19 to 2026-10-20: no machine
-    /// had winit 0.30.13's pristine copy, and every run printed the tick. The control is the
-    /// same member with its pristine copy, which earns the tick.
     #[test]
     fn a_member_without_a_pristine_copy_is_unverified_never_ticked() {
         let fixture = absorbed_fixture("member-pristine", true);
@@ -2379,7 +2173,6 @@ mod tests {
 
         let fixture = absorbed_fixture("member-no-pristine", true);
         std::fs::remove_dir_all(fixture.0.path().join("vendor/.forge/absorbed")).unwrap();
-        // An edit with no notice, which only a diff could find.
         std::fs::write(
             fixture.0.path().join("crates/aterm-absorbed/src/lib.rs"),
             "pub fn upstream() { /* edited */ }\n",
@@ -2403,7 +2196,6 @@ mod tests {
     }
 
     /// A vendor directory nothing claims is red, and NAMING one `astream` is no
-    /// exemption: it must be the declared, pinned submodule.
     #[test]
     fn an_unreviewed_vendor_directory_still_fails_the_astream_submodule_check() {
         let fixture = good_fixture("unreviewed-bundle");
@@ -2419,7 +2211,6 @@ mod tests {
     }
 
     /// Run git in a fixture with a fixed identity and no inherited repository
-    /// variables, so it needs no machine config and touches only the fixture.
     fn git(dir: &Path, args: &[&str]) -> String {
         let out = command("git")
             .env_remove("GIT_DIR")
@@ -2446,8 +2237,6 @@ mod tests {
     }
 
     /// A submodule is another repository: its build output under the root
-    /// `target` rule is not this repository's source, and must not fail
-    /// [OB-10]. The same output in an ordinary vendor directory still does.
     #[test]
     fn the_ignore_sweep_does_not_descend_into_a_submodule_working_tree() {
         let fixture = good_fixture("ob10-submodule");
@@ -2482,8 +2271,6 @@ mod tests {
         std::fs::write(sub.join("target/debug/out"), "").unwrap();
         let mut log = String::new();
         assert_eq!(ob10_gitignore(root, &[], &mut log), 0, "{log}");
-        // Non-vacuity: an ordinary vendor directory's copy of the same output IS
-        // reported.
         std::fs::create_dir_all(root.join("vendor/goodfork/target")).unwrap();
         std::fs::write(root.join("vendor/goodfork/target/out"), "").unwrap();
         let mut log = String::new();
@@ -2491,7 +2278,6 @@ mod tests {
     }
 
     /// `[OB-7]`: an Apache-only fork's file that differs from the pristine copy
-    /// in the ledger's slot owes a header notice, and adding one discharges it.
     #[test]
     fn an_apache_only_fork_needs_header_notices() {
         let fixture = good_fixture("apache");

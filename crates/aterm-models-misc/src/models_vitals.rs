@@ -1,64 +1,11 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
-// Author: Andrew Yates
 
-//! THE STUCK VERDICT (`docs/DESIGN-system-awareness-2026-10-16.md` §11.7,
-//! §17): how one job's verdict moves with its class, its suspect quiet and
-//! the readings, in `aterm_vitals::jobs::step::classify_tick`. THE SCOPE
-//! BALANCE (§7.7, §17): how `aterm_vitals::explain::split` divides the busy
-//! CPU of one window into parts that add up.
+//! THE STUCK VERDICT (`docs/DESIGN-system-awareness-2026-10-16.md` §11.7, §17).
 
 use aterm_spec::derive::*;
 
-/// One job's verdict machine, scalar: `cls` is how the job counts this tick
-/// (0 running, 1 a legitimate wait in effect, 2 a stuck-capable suspect, 3 a
-/// suspect capped at quiet, 4 exited); `q` is its suspect quiet in φ bands
-/// (`T3` the band where φ reaches 3, `T8` where it reaches 8); `v` is the
-/// verdict's rank (0 fine or a legitimate word, 1 quiet/busy/slow, 2 stuck).
-/// One latch per law records the way the classifier could be wrong, and each
-/// latch can be set only under its own `Buggy` value.
-///
-/// Laws (each broken by its own mutant):
-///
-/// * `NeverStuckWhileProgressing` (Buggy 1: progress keeps the verdict);
-/// * `LegitWaitNeverAccrues` (Buggy 2: a legitimate wait's age accrues);
-/// * `RefusedReadingIsNotZeroProgress` (Buggy 3: a refused reading resets
-///   the age — unknown is never zero);
-/// * `UnnamedNeverEntersStuck` (Buggy 4: a capped wait reaches stuck);
-/// * `NoFlap` (Buggy 5: stuck falls to quiet while φ ≥ 3 because μ grew);
-/// * `FlaggedOnTime` (Buggy 6: a named stuck-capable wait is never raised);
-/// * `AgeResetsOnlyOnProgress`: the suspect quiet restarts only on progress,
-///   a legitimate run or a new suspect run — broken by the three
-///   environment mutants the liveness obligation names
-///   ([`stuck_verdict_liveness`]): a CR redraw, idle churn, or a refused
-///   reading taken for progress.
-///
-/// Why `FlaggedOnTime` is not a ghost: with no mutant, every path to
-/// `cls == 2 && q ≥ T8` sets `v = 2` on the way (`QuietTick` from
-/// `q = T8 − 1`, or `Relabel` from a capped wait at `q ≥ T8`), and the only
-/// action that lowers `v` (`MuGrows`) lowers `q` below `T8` first, so `Watch`
-/// never latches `late`. Under Buggy 6 `QuietTick` leaves a named wait at
-/// quiet while `q` reaches `T8`.
-///
-/// `MuGrows` is bounded (`grows ≤ GrowCap` per suspect run): μ grows from a
-/// finite set of intervals and a bounded stretch, so φ cannot be pushed back
-/// for ever; without the bound an endless grow-and-tick loop would starve the
-/// flag and no fairness could rescue the liveness.
-///
-/// Tier-1: `aterm-vitals`' `tests/conformance_stuck_verdict.rs` replays every
-/// scenario of the design's §18 table through the real `classify_tick`
-/// (through `Jobs::absorb`), projects each tick onto `(cls, q band, v)` and
-/// fires the action the tick's own record names (progress, a refused reading,
-/// μ grown, the class's change, the band's move); every step must be enabled
-/// here and every law hold after it. NEGATIVE CONTROLS: the real step with
-/// one injected defect (`aterm_vitals::jobs::Fault`) is rejected at Buggy 0
-/// and admitted only by its own mutant, which breaks its own law — φ accrued
-/// on `tail -f` (`LegitWaitNeverAccrues`), the age reset on an EPERM reading
-/// (`RefusedReadingIsNotZeroProgress`), an unnamed `flock` wait let reach
-/// stuck (`UnnamedNeverEntersStuck`), a silent TCP peer never raised
-/// (`FlaggedOnTime`); and a CR redraw, idle churn and M7's logical-write noise
-/// taken for progress fail the scenarios' flags (the liveness side). No
-/// `#[refines]` anchors: the binding is the conformance test.
+/// One job's verdict machine, scalar.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn stuck_verdict_model() -> Model {
@@ -81,7 +28,6 @@ pub fn stuck_verdict_model() -> Model {
             var late = 0;
             var faked = 0;
 
-            // LF output, side writes, churn with work, typed input read.
             action Progress when (cls <= 3) {
                 stuck_while_progressing = if (Buggy == 1 && v == 2) { 1 } else { stuck_while_progressing };
                 v = if (Buggy == 1) { v } else { 0 };
@@ -89,10 +35,8 @@ pub fn stuck_verdict_model() -> Model {
                 q = 0;
                 grows = 0;
             }
-            // Time passes in a suspect wait: φ climbs one band.
             action QuietTick when (2 <= cls && cls <= 3 && q <= QMax - 1) {
                 capped_stuck = if (cls == 3 && T8 <= q + 1 && Buggy == 4) { 1 } else { capped_stuck };
-                // Buggy 6: a named suspect wait is never raised to stuck.
                 v = if (T8 <= q + 1 && cls == 2) {
                     if (Buggy == 6) { if (v == 0) { 1 } else { v } } else { 2 }
                 } else {
@@ -104,8 +48,6 @@ pub fn stuck_verdict_model() -> Model {
                 };
                 q = q + 1;
             }
-            // EPERM or no reading: unknown, never zero progress. (Buggy 3: the
-            // age restarts, and with φ under 1 the verdict falls to fine.)
             action RefusedTick when (2 <= cls && cls <= 3) {
                 refused_moved = if (Buggy == 3 && q > 0) { 1 } else { refused_moved };
                 v = if (Buggy == 3) { 0 } else { v };
@@ -116,8 +58,6 @@ pub fn stuck_verdict_model() -> Model {
                 q = if (Buggy == 2 && q <= QMax - 1) { q + 1 } else { 0 };
                 v = 0;
             }
-            // μ grows (its own median, its class's, the stretch): φ falls one
-            // band; stuck holds while φ ≥ 3, quiet leaves under it.
             action MuGrows when (2 <= cls && cls <= 3 && q > 0 && grows <= GrowCap - 1) {
                 flapped = if (Buggy == 5 && v == 2 && T3 <= q - 1) { 1 } else { flapped };
                 v = if (v == 2 && T3 <= q - 1) {
@@ -139,7 +79,6 @@ pub fn stuck_verdict_model() -> Model {
                 q = 0;
                 grows = 0;
             }
-            // A capped wait gets its name, or a named one loses it.
             action Relabel when (2 <= cls && cls <= 3) {
                 v = if (cls == 3 && T8 <= q) { if (Buggy == 6) { v } else { 2 } } else { v };
                 cls = if (cls == 2) { 3 } else { 2 };
@@ -148,12 +87,9 @@ pub fn stuck_verdict_model() -> Model {
                 v = 0;
                 cls = 4;
             }
-            // The observer: a named suspect wait at φ ≥ 8 must read stuck.
             action Watch when (cls == 2 && T8 <= q) {
                 late = if (v == 2) { late } else { 1 };
             }
-            // ENVIRONMENT MUTANTS (liveness): a reading taken for progress
-            // that is none restarts the age while the class stays suspect.
             action CrRedrawAsProgress when (Buggy == 1 && cls == 2 && q > 0) {
                 q = 0;
                 v = if (v == 2) { v } else { 0 };
@@ -181,13 +117,7 @@ pub fn stuck_verdict_model() -> Model {
     }
 }
 
-/// `SuspectWaitIsEventuallyFlagged`: a stuck-capable suspect wait is flagged
-/// or stops being one, again and again (goal `v == 2 || cls != 2`), with only
-/// time's passing assumed (`QuietTick` weakly fair). This replaces the old
-/// `AlwaysFlagsATrueStall`, which cannot hold for BUSY-SILENT (capped by
-/// design). Each environment mutant alone breaks it: a reading taken for
-/// progress that is none (a CR redraw, idle churn, a refused reading) can
-/// restart the age for ever.
+/// `SuspectWaitIsEventuallyFlagged`.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 #[aterm_spec::liveness(stuck_verdict_model)]
@@ -205,51 +135,7 @@ pub fn stuck_verdict_liveness() -> Liveness {
     }
 }
 
-/// THE SCOPE BALANCE, CPU (`docs/DESIGN-system-awareness-2026-10-16.md` §7.7,
-/// §17): how `aterm_vitals::explain::split` divides the machine's busy CPU
-/// over one matched window into the caller's tab, the rest of aterm, others,
-/// services and a signed residual.
-///
-/// The readings, in units of work over the window (each environment action
-/// adds one): `g` the cores' busy figure; `a` aterm's coalitions `C(I)`; `t`
-/// the caller tab's live members in them over the split's window, and `tf`
-/// over the last sweep's window (the fast set); `d` the tab's delegated
-/// members under a launcher outside aterm, live; `l` that launcher's
-/// coalition, `d`'s work in it; `o` the user's other coalitions; `s` the
-/// services' coalitions. `Move` moves the delegated work to aterm's side,
-/// capped at the launcher's figure, and takes the tab's figure; `Close`
-/// makes the rest of aterm and the residual. `fresh` is 0 once a reading
-/// moved, 1 after `Move`, 2 after `Close`: the laws read the printed parts.
-///
-/// Laws (each broken by its own mutant):
-///
-/// * `PartsSumToWhole`: the four parts and the residual add up to the busy
-///   figure exactly (Buggy 2 `ChargeSharedLauncher`: the launcher keeps the
-///   work its tab counts; Buggy 1 too);
-/// * `PartsNeverNegative` (Buggy 3: the delegated subtraction uncapped, so a
-///   member read ahead of its launcher's counter takes the launcher below 0);
-/// * `ResidualIsShown`: the residual is the work outside every listed
-///   coalition, signed, plus the tab's live figure past aterm's coalitions,
-///   never clamped and never folded into a part (Buggy 1
-///   `ClampResidualSilently`; Buggy 4 `ServicesSwallowUnaccountedWithLaneOn`,
-///   the built split's subtraction with the lane on);
-/// * `DelegatedCountedOnce`: the launcher gives up exactly what the split
-///   moved to aterm's side (Buggy 2);
-/// * `MatchedWindowsOnly`: every part is over the split's window, so the
-///   printed tab is its live members' work over it, `t + d` (Buggy 5
-///   `MixFastAndSplitWindows`: the tab's figure from the last sweep, a 1 s
-///   rate against a 5 s split, shows once the two differ).
-///
-/// Tier-1: `aterm-vitals`' `tests/conformance_scope_balance.rs` reads scenes
-/// through the real `Vitals::absorb`, projects each scene's readings and the
-/// split's parts onto this model, and requires `Move` and then `Close` to
-/// take the one to the other with every law holding. NEGATIVE CONTROLS: the
-/// real split with one injected defect (`aterm_vitals::explain::Fault`) is
-/// refused at Buggy 0 and admitted only by its own mutant, which breaks its
-/// own law — services by subtraction with the lane on (Buggy 4,
-/// `ResidualIsShown`) and the tab over the sweep's window (Buggy 5,
-/// `MatchedWindowsOnly`). No `#[refines]` anchors: the binding is the
-/// conformance test.
+/// THE SCOPE BALANCE, CPU (`docs/DESIGN-system-awareness-2026-10-16.md` §7.7, §17).
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn scope_balance_model() -> Model {
@@ -274,15 +160,12 @@ pub fn scope_balance_model() -> Model {
             var residual = 0;
             var fresh = 2;
 
-            // Work in aterm's coalitions beside the caller tab's live
-            // members: aterm itself, its helpers, other tabs, finished work.
             action AtermWork when (n <= Work - 1) {
                 n = n + 1;
                 g = g + 1;
                 a = a + 1;
                 fresh = 0;
             }
-            // The caller tab's live members work, in aterm's coalitions.
             action TabWork when (n <= Work - 1) {
                 n = n + 1;
                 g = g + 1;
@@ -291,14 +174,11 @@ pub fn scope_balance_model() -> Model {
                 tf = tf + 1;
                 fresh = 0;
             }
-            // A build starts: the tab's last-sweep rate runs past its
-            // window's average.
             action BuildStarts when (n <= Work - 1) {
                 n = n + 1;
                 tf = tf + 1;
                 fresh = 0;
             }
-            // The tab's live figure read ahead of aterm's coalition counter.
             action TabAhead when (n <= Work - 1) {
                 n = n + 1;
                 t = t + 1;
@@ -311,8 +191,6 @@ pub fn scope_balance_model() -> Model {
                 l = l + 1;
                 fresh = 0;
             }
-            // A delegated member works: its launcher's coalition counts it,
-            // and so does its tab.
             action DelegatedWork when (n <= Work - 1) {
                 n = n + 1;
                 g = g + 1;
@@ -320,8 +198,6 @@ pub fn scope_balance_model() -> Model {
                 d = d + 1;
                 fresh = 0;
             }
-            // A delegated member's live figure read ahead of its launcher's
-            // counter.
             action DelegatedAhead when (n <= Work - 1) {
                 n = n + 1;
                 d = d + 1;
@@ -339,14 +215,11 @@ pub fn scope_balance_model() -> Model {
                 s = s + 1;
                 fresh = 0;
             }
-            // Work no listed coalition read: a kernel thread, a coalition
-            // reaped inside the window.
             action Unread when (n <= Work - 1) {
                 n = n + 1;
                 g = g + 1;
                 fresh = 0;
             }
-            // A coalition's counter read past the end of the cores' window.
             action CounterAhead when (n <= Work - 1) {
                 n = n + 1;
                 s = s + 1;
@@ -392,6 +265,198 @@ pub fn scope_balance_model() -> Model {
                             + (if (a + moved <= tab) { a + moved - tab } else { 0 });
             invariant DelegatedCountedOnce: fresh == 0 || others + moved == o + l;
             invariant MatchedWindowsOnly: fresh == 0 || tab == t + d;
+            bound Box: n <= Work;
+        }
+    }
+}
+
+/// THE EXPLANATION'S HONESTY (`docs/DESIGN-resource-details-2026-10-20.md` §17, the laws of its first slice).
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn explain_honesty_model() -> Model {
+    aterm_spec::ty_model! {
+        ExplainHonesty {
+            const Buggy = 0;
+            const Work = 2;
+            var n = 0;
+            var claims = 1;
+            var vouched = 1;
+            var terms = 1;
+            var above = 1;
+            var tab = 1;
+            var young = 1;
+            var bycpu = 1;
+            var bycount = 1;
+            var swept = 1;
+            var live = 1;
+            var bound = 1;
+            var lowpid = 0;
+            var other = 0;
+            var fresh = 0;
+            var shown = 0;
+            var tabshown = 0;
+            var role = 0;
+            var start = 0;
+            var actstart = 0;
+            var tabstart = 0;
+            var cand = 0;
+            var held = 0;
+            var fail = 0;
+            var clause = 0;
+            var was = 0;
+
+            action Claims when (n <= Work - 1) {
+                n = n + 1;
+                claims = 1 - claims;
+                fresh = 0;
+            }
+            action Vouched when (n <= Work - 1) {
+                n = n + 1;
+                vouched = 1 - vouched;
+                fresh = 0;
+            }
+            action Terms when (n <= Work - 1) {
+                n = n + 1;
+                terms = 1 - terms;
+                fresh = 0;
+            }
+            action Above when (n <= Work - 1) {
+                n = n + 1;
+                above = 1 - above;
+                fresh = 0;
+            }
+            action TabMoves when (n <= Work - 1) {
+                n = n + 1;
+                tab = 3 - tab;
+                fresh = 0;
+            }
+            action Young when (n <= Work - 1) {
+                n = n + 1;
+                young = 1 - young;
+                fresh = 0;
+            }
+            action ByCpu when (n <= Work - 1) {
+                n = n + 1;
+                bycpu = 1 - bycpu;
+                fresh = 0;
+            }
+            action ByCount when (n <= Work - 1) {
+                n = n + 1;
+                bycount = 1 - bycount;
+                fresh = 0;
+            }
+            action Swept when (n <= Work - 1) {
+                n = n + 1;
+                swept = 1 - swept;
+                fresh = 0;
+            }
+            action LiveUp when (n <= Work - 1 && live <= 2) {
+                n = n + 1;
+                live = live + 1;
+                fresh = 0;
+            }
+            action LiveDown when (n <= Work - 1 && live > 0) {
+                n = n + 1;
+                live = live - 1;
+                fresh = 0;
+            }
+            action BoundUp when (n <= Work - 1 && bound <= 2) {
+                n = n + 1;
+                bound = bound + 1;
+                fresh = 0;
+            }
+            action BoundDown when (n <= Work - 1 && bound > 0) {
+                n = n + 1;
+                bound = bound - 1;
+                fresh = 0;
+            }
+            action LowPidBirth when (n <= Work - 1) {
+                n = n + 1;
+                lowpid = 1 - lowpid;
+                fresh = 0;
+            }
+            action OtherBirth when (n <= Work - 1) {
+                n = n + 1;
+                other = 1 - other;
+                fresh = 0;
+            }
+
+            action Detect when (fresh == 0) {
+                shown = if (claims == 1
+                    && (vouched == 1 || Buggy == 2)
+                    && (terms == 1 || Buggy == 1)
+                    && (above == 1 || Buggy == 6))
+                {
+                    1
+                } else {
+                    0
+                };
+                tabshown = if (tab == 2 || Buggy == 6) { 1 } else { 0 };
+                role = if (swept == 0) {
+                    if (Buggy == 8) { 0 } else { 4 }
+                } else {
+                    if (live == bound || Buggy == 7) { live } else { 5 }
+                };
+                start = if (swept == 0) {
+                    if (Buggy == 8) { 0 } else { 2 }
+                } else {
+                    if (Buggy == 3 || lowpid <= other) { lowpid } else { other }
+                };
+                fresh = 1;
+            }
+            action Attach when (fresh == 1) {
+                actstart = if (shown == 1
+                    && young == 1
+                    && swept == 1
+                    && ((Buggy == 4 && bycount == 1) || (bycpu == 1 && (Buggy <= 3 || Buggy > 4))))
+                {
+                    1
+                } else {
+                    0
+                };
+                tabstart = if (Buggy == 5 && tabshown == 1 && young == 1) { 1 } else { 0 };
+                fresh = 2;
+            }
+
+            action Hold {
+                was = clause;
+                clause = if (clause == 1 || (cand == 1 && held > 0) || Buggy == 9) { 1 } else { 0 };
+                held = if (cand == 1) { if (held <= 1) { held + 1 } else { 2 } } else { 0 };
+                fail = 0;
+                cand = 1;
+            }
+            action Fail {
+                was = clause;
+                clause = if (Buggy == 9) {
+                    0
+                } else {
+                    if (clause == 1 && (cand == 1 || fail <= 4)) { 1 } else { 0 }
+                };
+                fail = if (clause == 1) {
+                    if (cand == 1) { 0 } else { if (fail <= 5) { fail + 1 } else { 6 } }
+                } else {
+                    0
+                };
+                held = 0;
+                cand = 0;
+            }
+
+            invariant CauseOnlyWithEvidence: fresh == 0 || shown == 0 || terms == 1;
+            invariant ClaimNeverVouches: fresh == 0 || shown == 0 || vouched == 1;
+            invariant StartIsEarliestBirth:
+                fresh == 0
+                    || swept == 0
+                    || (start <= lowpid && start <= other && (start == lowpid || start == other));
+            invariant ContextOnlyWhereItHolds:
+                fresh <= 1
+                    || ((actstart == 0 || (shown == 1 && young == 1 && bycpu == 1)) && tabstart == 0);
+            invariant CauseNeedsFloor:
+                fresh == 0 || ((shown == 0 || above == 1) && (tabshown == 0 || tab == 2));
+            invariant RoleNeedsBound:
+                fresh == 0 || swept == 0 || role == 5 || (role == live && role == bound);
+            invariant UnknownNeverZero: fresh == 0 || swept == 1 || (role == 4 && start == 2);
+            invariant ClauseNeverFlickers:
+                (was == 1 || clause == 0 || held == 2) && (was == 0 || clause == 1 || fail == 6);
             bound Box: n <= Work;
         }
     }

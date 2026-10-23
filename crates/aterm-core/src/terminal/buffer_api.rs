@@ -133,7 +133,7 @@ impl Terminal {
     /// Get a reference to the tiered scrollback storage, if attached.
     #[inline]
     #[must_use]
-    pub fn scrollback(&self) -> Option<&crate::scrollback::ScrollbackStorage> {
+    pub const fn scrollback(&self) -> Option<&crate::scrollback::ScrollbackStorage> {
         self.grid.scrollback()
     }
 
@@ -143,7 +143,7 @@ impl Terminal {
     /// parked in `alt_grid`, so accounting and memory-pressure shedding read this.
     #[inline]
     #[must_use]
-    pub fn history_scrollback(&self) -> Option<&crate::scrollback::ScrollbackStorage> {
+    pub const fn history_scrollback(&self) -> Option<&crate::scrollback::ScrollbackStorage> {
         self.main_grid().scrollback()
     }
 
@@ -456,7 +456,7 @@ impl Terminal {
     /// BEL fired since the last drain, then clears it. Lets a poll-based host
     /// react to a bell without wiring the synchronous `bell_callback`.
     #[inline]
-    pub fn drain_bell(&mut self) -> bool {
+    pub const fn drain_bell(&mut self) -> bool {
         let pending = self.transient.bell_pending;
         self.transient.bell_pending = false;
         pending

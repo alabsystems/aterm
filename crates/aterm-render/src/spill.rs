@@ -1,40 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Spill-band rasterizer: the chrome-band slice of the window-space effects layer as a
-//! host-blittable straight-alpha RGBA buffer, so an embedder can composite a pane's
-//! effect overflow (glow rings, flames) over its neighbours.
-//!
-//! The composed frame already paints the chrome band
-//! (`[head][pad_top][grid][2*pad-pad_top]` minus the grid box), but opaquely: theme bg
-//! plus light, which a host cannot blit over another pane. [`SpillBand`] re-rasterizes
-//! only the four streams that can leave the grid (`glow_under`, `fire_patch`,
-//! `cursor_glow_add`, `glow_halo`) into four packed strips (top including head, bottom,
-//! left, right) and solves each covered pixel to a straight `(rgb, alpha)` pair with
-//!
-//! > `over_rgb(band_bg, rgb, alpha) == the composed frame's band byte`
-//!
-//! exactly, so a host compositing it source-over onto the pane's own background
-//! reproduces the in-frame ring and the `.pane` clip line never shows a seam. Over any
-//! other background the pair approximates the engine's saturating-add light.
-//!
-//! The per-pixel kernels are the renderer's own ([`add_sat`]/[`premul_rgb`],
-//! [`halo_row_ny`]/[`halo_weight`] + [`over_rgb`], and [`fire_field`]), replayed in the
-//! frame's band z-order (glow_under → fire Add → fire Over → cursor_glow_add → halo Add
-//! → halo Over), so spill and frame cannot drift.
-//!
-//! The fx layers (`docs/DESIGN-card-engine-2026-10-19.md` §4.4) replay too: every
-//! layer whose extent reaches the band, in either space, is drawn by the frame's own
-//! fx rasterizer onto each strip ([`fx_raster::draw_layers_on`]: the same slicing,
-//! occluder subtraction and pixel law F, cut to the strip), at its slot's place in
-//! that order: Linear Under → glow_under → Exact Under → fire → cursor_glow_add →
-//! Glow → halo → Exact Over → Linear Over. A card's border in the padding is then
-//! part of the spill, and the occluders cut it there exactly as in the frame.
-//!
-//! With 0/0 chrome there is no band: the buffer is empty and the revision never
-//! advances. Frames whose band inputs are unchanged (typing under a grid-interior glow,
-//! idle re-renders) keep the revision and report no dirty rects, so a host can skip its
-//! blit.
+//! Spill-band rasterizer.
 
 use aterm_core::render::{FxBlend, FxInk, FxLayer, FxSlot, FxSpace, PxRect};
 
@@ -46,9 +13,6 @@ use crate::{
 };
 
 /// The band geometry a spill buffer was laid out for. `pad_top` is explicit because
-/// moving only the asymmetric grid origin keeps the frame size but changes every
-/// horizontal strip split. Any change re-derives the strips and is the one event that
-/// may move [`SpillBand::rgba`]'s allocation.
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
 struct SpillGeom {
     pad: usize,
@@ -75,7 +39,6 @@ impl SpillGeom {
     }
 
     /// The trailing band absorbs the top-pad reduction so the fixed frame
-    /// extent still contains exactly `2 * pad` vertical padding pixels.
     #[inline]
     const fn trailing_h(&self) -> usize {
         self.pad.saturating_mul(2).saturating_sub(self.pad_top)
@@ -87,8 +50,6 @@ impl SpillGeom {
     }
 
     /// The four band strips in packed buffer order (top including head, bottom, left,
-    /// right), each row-major, concatenated. Zero-area strips (e.g. `pad == 0` with a
-    /// head band) stay in the layout with 0 bytes.
     #[inline]
     const fn strips(&self) -> [StripRect; 4] {
         let grid_bottom = self.grid_bottom();
@@ -122,7 +83,6 @@ impl SpillGeom {
     }
 
     /// A window-pixel rect clipped to the frame, as a [`Rect`]; `None` when
-    /// nothing of it lies in the frame. Unbounded edges clip like any other.
     #[inline]
     const fn frame_rect(&self, r: PxRect) -> Option<Rect> {
         #[inline]
@@ -144,7 +104,6 @@ impl SpillGeom {
     }
 
     /// The window pixels `layer` may write ([`FxLayer::extent`] at its space's
-    /// origin), clipped to the frame.
     #[inline]
     fn layer_rect(&self, layer: &FxLayer) -> Option<Rect> {
         let e = layer.extent();
@@ -169,8 +128,6 @@ impl SpillGeom {
     }
 
     /// Whether a frame-space rect reaches the band: non-empty after the frame clip and
-    /// not inside the grid box. Mirrors the renderer's clipping, so grid-interior
-    /// emissions never advance the revision.
     #[inline]
     const fn rect_touches_band(&self, (x, y, w, h): Rect) -> bool {
         let xe_raw = x + w;
@@ -196,15 +153,12 @@ impl SpillGeom {
 }
 
 /// Union of two coverages as source-over alpha accumulation (`a' = s + a·(255−s)/255`,
-/// round-half). Additive light contributes its max channel as a pseudo-coverage, veils
-/// their real one.
 #[inline]
 const fn cover_union(a: u8, s: u8) -> u8 {
     ((s as u32) + ((a as u32) * (255 - (s as u32)) + 127) / 255) as u8
 }
 
 /// The max RGB channel of a premultiplied light colour — the pseudo-alpha an
-/// additive emission contributes to the spill coverage.
 #[inline]
 const fn max_channel(premul: u32) -> u8 {
     let r = (premul >> 16) & 0xff;
@@ -215,14 +169,6 @@ const fn max_channel(premul: u32) -> u8 {
 }
 
 /// Solve one band pixel to a straight `(r, g, b, a)` with `over_rgb(base, rgb, a) == c`
-/// per channel: `c` is the pixel after the band's op replay over `base`, `a0` the
-/// accumulated coverage.
-///
-/// Per channel `out(s) = (s·a + b·(255−a) + 127) / 255` is monotone in `s` with steps
-/// ≤ 1, so every target in `[out(0), out(255)]` is reachable; both bounds widen with
-/// `a`, so lifting `a` to the per-channel minima below makes every channel solvable with
-/// one shared alpha (`a = 255` always works). The natural `a0` is kept when feasible so
-/// the spill stays translucent light, not paint.
 #[inline]
 fn solve_spill_px(base: u32, c: u32, a0: u8) -> [u8; 4] {
     if a0 == 0 {
@@ -248,8 +194,6 @@ fn solve_spill_px(base: u32, c: u32, a0: u8) -> [u8; 4] {
     let mut out = [0u8; 4];
     out[3] = a as u8;
     for k in 0..3 {
-        // Smallest s with out(s) == C; minimality + the ≤1 output step make the
-        // floor-division round-trip exact (debug-asserted).
         let s = (255 * t[k])
             .saturating_sub(b[k] * (255 - a) + 127)
             .div_ceil(a)
@@ -264,36 +208,24 @@ fn solve_spill_px(base: u32, c: u32, a0: u8) -> [u8; 4] {
     out
 }
 
-/// The engine half of the cross-pane effects compositor: a persistent straight-alpha
-/// RGBA rasterization of the effect emissions in the chrome band, plus the change
-/// signal (revision and packed dirty rects) a host needs to blit it without polling.
-/// Owned by the wasm terminals and fed once per rendered frame via [`SpillBand::update`].
+/// The engine half of the cross-pane effects compositor.
 #[derive(Default)]
 pub struct SpillBand {
     geom: SpillGeom,
     /// The band's base bg (frame default-bg RGB) the solve is exact over.
     base_bg: u32,
     /// Whether `HaloMode::Over` veils are excluded from the spill (inverted so the
-    /// derived default includes them and the byte-parity law holds out of the box).
-    /// Excluding keeps only additive light and fire ink, for light-theme smoke.
     veils_excluded: bool,
     rev: u32,
     /// The exported straight-alpha RGBA strips (packed as `SpillGeom::strips`). The
-    /// allocation moves only on a geometry change: the host's pointer-stability contract.
     rgba: Vec<u8>,
     /// This update's dirty rects, packed `x,y,w,h` frame-absolute device px.
     rects: Vec<i32>,
-    // Replay planes (band colour over base_bg + accumulated coverage),
-    // strip-packed like `rgba`; retained so a change-frame allocates nothing.
     color: Vec<u32>,
     cover: Vec<u8>,
-    // The previous frame's band-clipped emissions — the content fingerprint
-    // that keeps the revision still on typing-only/settled frames.
     prev: BandStreams,
-    // Scratch for the current frame's clip (swapped into `prev` on a raster).
     cur: BandStreams,
     /// The fx rasterizer's resident scratch (occluder pieces, sprite column
-    /// tables), so a replay allocates nothing once warm.
     fx_scratch: FxScratch,
 }
 
@@ -305,11 +237,8 @@ struct BandStreams {
     glow: Vec<GlowQuad>,
     halo: Vec<RainHalo>,
     /// The fx layers whose extent reaches the band, in frame order. Compared
-    /// by identity (the content `Arc`), and held, so a settled card costs a
-    /// pointer compare and a freed content can never alias a new one.
     fx: Vec<FxLayer>,
     /// The occluders reaching the band, kept only while `fx` is not empty
-    /// (an occluder only cuts layers).
     fx_occluders: Vec<PxRect>,
 }
 
@@ -348,8 +277,6 @@ macro_rules! impl_emission {
 impl_emission!(GlowQuad, FirePatch, RainHalo);
 
 /// Band-clip one emission stream into `dst` (allocation-reusing), mirroring the
-/// renderer's `row >= rows` skip so the fingerprint matches what the frame
-/// actually drew.
 fn clip_stream<T: Emission>(
     dst: &mut Vec<T>,
     src: &[T],
@@ -371,40 +298,31 @@ impl SpillBand {
         Self::default()
     }
 
-    /// Band-content revision: advances only when the exported bytes changed (band
-    /// emissions appeared, moved or vanished; the bg, the veil policy or the geometry
-    /// changed under live content). Unchanged ⇒ the host may skip its blit.
+    /// Band-content revision.
     #[inline]
     pub const fn rev(&self) -> u32 {
         self.rev
     }
 
-    /// The last update's dirty rects, packed `x,y,w,h` (frame-absolute device px), 4
-    /// `i32`s per rect. Empty on a no-change frame. Content changes report the prev∪cur
-    /// emission bbox clipped per strip; geometry/bg/policy changes report the full band.
+    /// The last update's dirty rects, packed `x,y,w,h` (frame-absolute device px), 4 `i32`s per rect.
     #[inline]
     pub const fn rects(&self) -> &[i32] {
         self.rects.as_slice()
     }
 
-    /// The straight-alpha RGBA strip buffer (packing in the module docs); empty at 0/0
-    /// chrome.
+    /// The straight-alpha RGBA strip buffer (packing in the module docs).
     #[inline]
     pub const fn rgba(&self) -> &[u8] {
         self.rgba.as_slice()
     }
 
-    /// Include `HaloMode::Over` veils in the spill (default `true`), from the next
-    /// [`Self::update`]. A flip re-rasters and ticks the revision only when veils are
-    /// in the band.
+    /// Include `HaloMode::Over` veils in the spill (default `true`), from the next [`Self::update`].
     #[inline]
     pub const fn set_include_veils(&mut self, on: bool) {
         self.veils_excluded = !on;
     }
 
-    /// Refresh the spill for the frame `input` the renderer just composed. When nothing
-    /// band-relevant changed this is a clip and compare of the four streams, leaving the
-    /// revision, bytes and pointer untouched.
+    /// Refresh the spill for the frame `input` the renderer just composed.
     pub fn update(&mut self, renderer: &Renderer, input: &RenderInput) {
         let geom = SpillGeom {
             pad: renderer.pad(),
@@ -413,8 +331,6 @@ impl SpillBand {
             frame_w: 0,
             frame_h: 0,
         };
-        // 0/0 chrome has no band. A chrome→0 transition drops the buffers, with one
-        // revision tick if content vanished so the host clears its overlay.
         if geom.pad == 0 && geom.head == 0 {
             self.rects.clear();
             if self.geom != geom {
@@ -437,20 +353,14 @@ impl SpillBand {
         };
         let base_bg = renderer.frame_bg(input) & 0x00FF_FFFF;
 
-        // Band-clip the four window-absolute streams; grid-interior emissions vanish
-        // here, which keeps typing-only frames still.
         let (rows, cur) = (input.rows, &mut self.cur);
         clip_stream(&mut cur.glow_under, &input.glow_under, rows, geom, |_| true);
         clip_stream(&mut cur.fire, &input.fire_patch, rows, geom, |_| true);
         clip_stream(&mut cur.glow, &input.cursor_glow_add, rows, geom, |_| true);
-        // Excluded veils are dropped at the clip, so the veil policy is part of the
-        // fingerprint: a flip with veils present re-rasters, without them it is free.
         let include_veils = !self.veils_excluded;
         clip_stream(&mut cur.halo, &input.glow_halo, rows, geom, |q| {
             include_veils || q.mode == HaloMode::Add
         });
-        // The fx layers reaching the band (Arc clones: no payload is copied),
-        // and the occluders that can cut them there.
         cur.fx.clear();
         cur.fx.extend(
             input
@@ -480,13 +390,10 @@ impl SpillBand {
         let bg_changed = base_bg != self.base_bg;
         let streams_changed = self.cur != self.prev;
         if !(geom_changed || bg_changed || streams_changed) {
-            // Typing-only / settled / idle frame: rev, rects and bytes all still.
             self.rects.clear();
             return;
         }
         if geom_changed {
-            // The one event that may move the exported allocation; zeroed means
-            // transparent until rastered below.
             let px = geom.band_px();
             self.rgba.clear();
             self.rgba.resize(px * 4, 0);
@@ -499,7 +406,6 @@ impl SpillBand {
         self.base_bg = base_bg;
 
         if self.prev.is_empty() && self.cur.is_empty() {
-            // A bg/geometry change under an all-transparent band: no visible
             // bytes changed, so the revision (the host's blit signal) holds.
             self.rects.clear();
         } else {
@@ -507,13 +413,10 @@ impl SpillBand {
             self.rasterize(renderer.cell_size().1, rows);
             self.rev = self.rev.wrapping_add(1);
         }
-        // Swap the just-clipped streams into the fingerprint (allocation-reusing).
         std::mem::swap(&mut self.prev, &mut self.cur);
     }
 
     /// Pack this update's dirty rects: the full band on a geometry/bg/policy
-    /// event, else the prev∪cur emission bbox ∩ each strip (prev so vanished
-    /// light is repainted away, cur so new light lands).
     fn emit_dirty_rects(&mut self, full_band: bool) {
         self.rects.clear();
         let geom = self.geom;
@@ -533,7 +436,6 @@ impl SpillBand {
             }
             return;
         }
-        // Frame-clipped bbox over every prev∪cur band emission rect.
         let mut bb: Option<(usize, usize, usize, usize)> = None;
         let mut grow = |(x, y, w, h): Rect| {
             let xe = (x + w).min(geom.frame_w);
@@ -558,8 +460,6 @@ impl SpillBand {
         for q in self.prev.halo.iter().chain(&self.cur.halo) {
             grow(q.rect());
         }
-        // A layer's pixels lie in its extent, and an occluder change moves
-        // pixels only inside some layer's, so the layers' rects bound both.
         for l in self.prev.fx.iter().chain(&self.cur.fx) {
             if let Some(r) = geom.layer_rect(l) {
                 grow(r);
@@ -580,8 +480,6 @@ impl SpillBand {
     }
 
     /// Replay the band's ops over `base_bg` per strip in the frame's z-order, then solve
-    /// every pixel to the exported straight-alpha pair, in place (stable pointer).
-    /// `cell_h` and `rows` place the fx layers' band slicing as the frame's.
     fn rasterize(&mut self, cell_h: usize, rows: usize) {
         let base = self.base_bg;
         self.color.fill(base);
@@ -648,9 +546,6 @@ impl SpillBand {
 }
 
 /// One strip's replay planes as an fx stamp target: the frame's kernels on
-/// the colour plane, and each paint's coverage folded into the cover plane as
-/// the glow quads fold theirs (an Exact paint covers by `max(a, max channel)`,
-/// so additive light counts by its brightness; a Linear one by its opacity).
 struct StripCanvas<'a> {
     s: StripRect,
     color: &'a mut [u32],
@@ -717,15 +612,6 @@ fn clip_to_strip(s: StripRect, (x, y, w, h): Rect) -> Option<(usize, usize, usiz
 }
 
 /// The flat glow quads (`glow_under`, `cursor_glow_add`), restricted to one strip: the
-/// `draw_flat_add` contract, window-absolute premultiplied light, [`add_sat`] at
-/// `GlowQuad::alpha == 0` and premultiplied source-over otherwise (the rainbow bed).
-/// Pure per-pixel functions of absolute coords, so the strip clip is byte-identical.
-///
-/// Every quad takes the frame's gradient law ([`GlowQuad::color2`]): per column, colour
-/// and opacity are [`crate::glow_lerp`]'d between the quad's edges and composited
-/// source-over; a flat quad is the lerp's identity and opacity 0 is `add_sat` byte for
-/// byte, so one loop replays both branches. The column index is read against the
-/// quad's unclipped left edge, as the frame reads it.
 fn replay_flat_add(color: &mut [u32], cover: &mut [u8], s: StripRect, quads: &[GlowQuad]) {
     for q in quads {
         let Some((x0, y0, xe, ye)) = clip_to_strip(s, q.rect()) else {
@@ -734,12 +620,9 @@ fn replay_flat_add(color: &mut [u32], cover: &mut [u8], s: StripRect, quads: &[G
         let (a0, a1) = (u32::from(q.alpha), u32::from(q.alpha2));
         let qw = u32::from(q.w);
         for x in x0..xe {
-            // `x − q.x < q.w ≤ u16::MAX`, so the cast is exact.
             let i = (x - q.x as usize) as u32;
             let a = crate::glow_lerp(a0, a1, i, qw) as u8;
             let c = crate::glow_lerp_rgb(q.color, q.color2, i, qw);
-            // The Over case occludes by its own opacity as well as its light —
-            // the solver's `a0` must reflect the paint's real coverage.
             let ap = a.max(max_channel(c));
             for y in y0..ye {
                 let k = (y - s.y) * s.w + (x - s.x);
@@ -751,9 +634,6 @@ fn replay_flat_add(color: &mut [u32], cover: &mut [u8], s: StripRect, quads: &[G
 }
 
 /// The radial halos (`glow_halo`), restricted to one strip: the `draw_radial_add`
-/// contract, Add quads then Over veils, weighted by the shared [`halo_row_ny`] /
-/// [`halo_weight`] kernels. (The frame loop's ellipse-span clamp only skips zero-weight
-/// pixels, so omitting it is byte-identical.)
 fn replay_halo(color: &mut [u32], cover: &mut [u8], s: StripRect, quads: &[RainHalo]) {
     for mode in [HaloMode::Add, HaloMode::Over] {
         for q in quads.iter().filter(|q| q.mode == mode) {
@@ -763,8 +643,6 @@ fn replay_halo(color: &mut [u32], cover: &mut [u8], s: StripRect, quads: &[RainH
             let (cx, cy) = (q.cx as i32, q.cy as i32);
             let rx2 = (q.rx as i32) * (q.rx as i32);
             let ry2 = (q.ry as i32) * (q.ry as i32);
-            // Mirror the frame loop's [`HaloMode::Over`] alpha ceiling so the band
-            // stays byte-continuous with the in-frame veil (`0` high byte: uncapped).
             let over_cap = crate::halo_over_cap(q.color);
             for y in y0..ye {
                 let ny = halo_row_ny(y as i32 - cy, ry2);
@@ -798,9 +676,6 @@ fn replay_halo(color: &mut [u32], cover: &mut [u8], s: StripRect, quads: &[RainH
 }
 
 /// The fire field (`fire_patch`), restricted to one strip: the `draw_fire_patch`
-/// contract, Add patches then Over patches, each pixel a pure [`fire_field`] function of
-/// absolute window coords, so a strip-clipped sweep is byte-identical. `pad` feeds
-/// `top_fade_y` exactly as the frame does.
 fn replay_fire(color: &mut [u32], cover: &mut [u8], s: StripRect, pad: usize, quads: &[FirePatch]) {
     for mode in [FireMode::Add, FireMode::Over] {
         for q in quads.iter().filter(|q| q.mode == mode) {
@@ -858,8 +733,6 @@ mod tests {
     use aterm_core::terminal::Terminal;
 
     /// The solver alone: over a (bg byte, target byte) lattice and several natural
-    /// coverages, the solved straight pair round-trips through `over_rgb` to the target
-    /// exactly.
     #[test]
     fn solver_reproduces_band_bytes_exactly_across_the_lattice() {
         for b in (0..=255u32).step_by(3) {
@@ -880,8 +753,6 @@ mod tests {
                 }
             }
         }
-        // Mixed-channel pairs: one shared alpha must satisfy asymmetric
-        // channels (a lifts to the most demanding channel; the others re-solve).
         for (base, c) in [
             (0x0010_2030u32, 0x00FF_E0B0u32),
             (0x00F0_F0F0, 0x0010_2030),
@@ -901,9 +772,6 @@ mod tests {
     }
 
     /// Walk every band pixel of the composed frame and assert the parity law:
-    /// `over_rgb(base, spill_rgb, spill_a) == frame_band_rgb` (transparent
-    /// spill pixels must sit on an untouched-bg frame byte). Returns the
-    /// per-strip count of lit (alpha > 0) spill pixels for non-vacuity checks.
     fn assert_band_parity(
         r: &mut Renderer,
         input: &RenderInput,
@@ -916,8 +784,6 @@ mod tests {
     }
 
     /// The parity walk of [`assert_band_parity`]: the per-strip lit counts and
-    /// the number of band pixels where spill ∘ bg and the frame differ (the
-    /// seams), panicking at the first one when `strict`.
     fn band_parity(
         r: &mut Renderer,
         input: &RenderInput,
@@ -1025,11 +891,6 @@ mod tests {
     }
 
     /// Layers of every slot and blend, in both spaces, reaching all four
-    /// strips of a `fw × fh` frame (pad 10, grid_top 27): a card border in
-    /// the padding (Window, Under, Exact), a Grid-space Over rect and ramps
-    /// that reach up and left out of the grid, a Glow Index8 sprite on the
-    /// right strip, Linear Straight sprites Under (right strip) and Over
-    /// (bottom strip, from the grid), and a Premul sprite in the head band.
     fn band_layers(fw: usize, fh: usize, ch: usize) -> Vec<FxLayer> {
         let (fwi, fhi) = (fw as i32, fh as i32);
         let border = FxLayer::new(
@@ -1132,14 +993,6 @@ mod tests {
     }
 
     /// THE FX LAYERS SPILL (design §4.4): with layers of every slot and blend,
-    /// in both spaces, reaching all four strips (a card border in the padding
-    /// among them) and two occluders cutting them there, the spill over the
-    /// theme bg equals the composed frame's band byte for byte, alone and
-    /// interleaved with the glow_under, fire, aurora and halo streams on the
-    /// same pixels, on a dark and a light theme.
-    ///
-    /// CONTROLS (in the test): the same frame's spill without its fx layers,
-    /// and its spill without its occluders, each leave a seam.
     #[test]
     fn fx_layers_spill_byte_identical_over_the_frame_band() {
         let dark = Theme::default();
@@ -1169,15 +1022,11 @@ mod tests {
                 s.update(r, i);
                 s
             };
-            // Alone: every strip is lit by the layers.
             let spill = spill_of(&r, &input);
             let lit = assert_band_parity(&mut r, &input, &spill, base);
             for (i, n) in lit.iter().enumerate() {
                 assert!(*n > 0, "strip {i} carries fx light (non-vacuous)");
             }
-            // Interleaved with the streams on the same pixels.
-            // Each stream overlaps a layer it must not commute with: the
-            // order of every fx slot against its neighbours shows in a byte.
             input.glow_under = vec![
                 GlowQuad::gradient(0, 2, 4, 60, 14, 0x0030_0810, 0x30, 0x0008_1030, 0x50),
                 GlowQuad::gradient(
@@ -1240,13 +1089,11 @@ mod tests {
             let spill = spill_of(&r, &input);
             assert_band_parity(&mut r, &input, &spill, base);
 
-            // CONTROL: the spill of the frame without its layers has a seam.
             let mut bare = input.clone();
             bare.fx_layers.clear();
             let partial = spill_of(&r, &bare);
             let (_, seams) = band_parity(&mut r, &input, &partial, base, false);
             assert!(seams > 0, "CONTROL: a spill without the fx shows a seam");
-            // CONTROL: so does its spill without the occluders.
             let mut uncut = input.clone();
             uncut.fx_occluders.clear();
             let partial = spill_of(&r, &uncut);
@@ -1259,10 +1106,6 @@ mod tests {
     }
 
     /// The fx layers move the revision as the other streams do: a layer wholly
-    /// inside the grid and settled layers (the same `Arc`s) keep it still with
-    /// no rects; a moved band layer ticks it once with rects covering its old
-    /// and new place in the band; an occluder change over a band layer ticks
-    /// it; the layer vanishing ticks it and leaves the band transparent.
     #[test]
     fn fx_layers_tick_the_revision_only_when_the_band_changes() {
         let mut r = Renderer::from_system(16.0, Theme::default()).expect(crate::NO_FONT);
@@ -1276,7 +1119,6 @@ mod tests {
         spill.update(&r, &input);
         assert_eq!(spill.rev(), 0);
 
-        // Inside the grid: invisible to the band, even as it changes.
         let inner = fx_layer(
             1,
             fx_rect(2 * cw as i32, ch as i32, 4 * cw, ch),
@@ -1294,7 +1136,6 @@ mod tests {
         assert_eq!(spill.rev(), 0, "grid-interior layers never tick");
         assert!(spill.rects().is_empty());
 
-        // A border in the head band: one tick.
         let border = fx_layer(
             2,
             fx_rect(4, 4, 40, 6),
@@ -1308,13 +1149,11 @@ mod tests {
         assert_eq!(spill.rev(), 1);
         assert!(!spill.rgba().iter().all(|&b| b == 0), "the border is lit");
 
-        // Settled: the same Arcs keep the revision and report nothing.
         input.fx_layers = vec![inner.clone(), border.clone()];
         spill.update(&r, &input);
         assert_eq!(spill.rev(), 1, "settled layers never tick");
         assert!(spill.rects().is_empty());
 
-        // Moved 30 px right: one tick, rects covering old and new place.
         let mut moved = border.clone();
         moved.offset.0 = 30;
         input.fx_layers = vec![inner.clone(), moved.clone()];
@@ -1336,11 +1175,9 @@ mod tests {
             assert!(q[0] >= 0 && q[1] >= 0 && q[0] + q[2] <= fw as i32 && q[1] + q[3] <= fh as i32);
         }
 
-        // An occluder over the band layer: one tick.
         input.fx_occluders = vec![PxRect::new(0, 0, 50, 8)];
         spill.update(&r, &input);
         assert_eq!(spill.rev(), 3, "an occluder cutting band light ticks");
-        // An occluder change inside the grid only: still.
         input.fx_occluders.push(PxRect::new(
             3 * cw as i32 + 8,
             30 + ch as i32,
@@ -1354,7 +1191,6 @@ mod tests {
             "an occluder off the band is not band content"
         );
 
-        // Vanished: one tick, transparent again.
         input.fx_layers = vec![inner];
         spill.update(&r, &input);
         assert_eq!(spill.rev(), 4);
@@ -1363,9 +1199,6 @@ mod tests {
     }
 
     /// The byte-parity property: spill over the theme bg equals the composed frame's
-    /// band byte for byte, with every window-absolute stream (flat adds, fire Add and
-    /// Over, radial Add halos, Over veils) straddling all four strips and the grid edge,
-    /// on a dark and a light theme.
     #[test]
     fn spill_band_composes_byte_identical_over_the_frame_band() {
         let dark = Theme::default();
@@ -1383,8 +1216,6 @@ mod tests {
             let mut term = Terminal::new(6, 20);
             let mut input = term.cell_frame(6, 20);
             let (fw, fh) = r.frame_size(6, 20);
-            // Flat additive quads: head band + one straddling grid_top AND the
-            // left grid edge (its grid-interior part must stay frame-only).
             input.glow_under = vec![
                 GlowQuad {
                     row: 0,
@@ -1415,20 +1246,13 @@ mod tests {
                     w: 24,
                     h: 12,
                     color: 0x0009_1216,
-                    // Source-over paint (the rainbow bed's blend) straddling
-                    // grid_top: the replay must take draw_flat_add's Over branch.
                     alpha: 0x16,
                     color2: 0x0009_1216,
                     alpha2: 0x16,
                 },
-                // Gradient quads, ramped per column from the unclipped left edge:
-                // an additive ramp in the head band, and a source-over ramp that
-                // starts left of the pad and straddles grid_top, so the strip clip
-                // cuts both its left end and its bottom.
                 GlowQuad::gradient(0, 20, 6, 100, 8, 0x0060_0000, 0, 0x0000_0060, 0),
                 GlowQuad::gradient(0, 4, 18, 60, 14, 0x0030_0810, 0x30, 0x0008_1030, 0x50),
             ];
-            // Fire field patches in the head band, Add then Over ink.
             input.fire_patch = vec![
                 FirePatch {
                     row: 0,
@@ -1463,7 +1287,6 @@ mod tests {
                     mode: FireMode::Over,
                 },
             ];
-            // Aurora quads: right strip + bottom strip.
             input.cursor_glow_add = vec![
                 GlowQuad {
                     row: 0,
@@ -1488,8 +1311,6 @@ mod tests {
                     alpha2: 0,
                 },
             ];
-            // Radial halos: an Add ember on the left strip + an Over veil on
-            // the bottom strip (the light-theme smoke path).
             input.glow_halo = vec![
                 RainHalo {
                     row: 1,
@@ -1537,9 +1358,6 @@ mod tests {
     }
 
     /// A top-pad-only origin move preserves the framebuffer size and total
-    /// spill allocation length, so `pad_top` itself must participate in the
-    /// geometry key. The move must force a full-band re-raster and remain
-    /// byte-identical to the newly positioned composed frame.
     #[test]
     fn asymmetric_top_pad_invalidates_spill_geometry_at_constant_frame_size() {
         let theme = Theme::default();
@@ -1600,8 +1418,6 @@ mod tests {
     }
 
     /// The revision/dirty-rect discipline: idle frames, grid-interior-only emissions and
-    /// settled band content keep the revision and report no rects; band content
-    /// appearing, moving and vanishing each tick it exactly once with in-band rects.
     #[test]
     fn rev_advances_only_on_band_content_change() {
         let mut r = Renderer::from_system(16.0, Theme::default()).expect(crate::NO_FONT);
@@ -1612,7 +1428,6 @@ mod tests {
         let (fw, fh) = r.frame_size(6, 20);
         let mut spill = SpillBand::new();
 
-        // Idle: buffer allocated for the geometry, fully transparent, rev 0.
         spill.update(&r, &input);
         assert_eq!(spill.rev(), 0, "no content → no revision");
         assert!(spill.rects().is_empty());
@@ -1625,7 +1440,6 @@ mod tests {
             "idle band transparent"
         );
 
-        // A grid-interior glow (mid-frame) is invisible to the band.
         let (ix, iy) = ((fw / 2) as u16, (fh / 2) as u16);
         input.cursor_glow_add = vec![GlowQuad {
             row: 2,
@@ -1641,13 +1455,11 @@ mod tests {
         spill.update(&r, &input);
         assert_eq!(spill.rev(), 0, "grid-interior emissions must not tick");
 
-        // ... even when it moves (typing under a glow deep in the grid).
         input.cursor_glow_add[0].x = ix + 6;
         spill.update(&r, &input);
         assert_eq!(spill.rev(), 0, "typing-only frame must not tick");
         assert!(spill.rects().is_empty());
 
-        // Band content appears: exactly one tick, rects confined to the band.
         input.cursor_glow_add.push(GlowQuad {
             row: 0,
             x: 0,
@@ -1669,19 +1481,15 @@ mod tests {
             assert!(x >= 0 && y >= 0 && x + w <= fw as i32 && y + h <= fh as i32);
         }
 
-        // Settled band content: unchanged emissions → rev and rects still.
         spill.update(&r, &input);
         assert_eq!(spill.rev(), 1, "settled content must not re-tick");
         assert!(spill.rects().is_empty());
 
-        // Interior churn while the band part is settled: still still.
         input.cursor_glow_add[0].x = ix;
         spill.update(&r, &input);
         assert_eq!(spill.rev(), 1);
         assert!(spill.rects().is_empty());
 
-        // Band content vanishes: one tick, the vacated spot is reported dirty,
-        // the buffer returns to fully transparent.
         input.cursor_glow_add.truncate(1);
         spill.update(&r, &input);
         assert_eq!(spill.rev(), 2);
@@ -1693,7 +1501,6 @@ mod tests {
     }
 
     /// Pointer stability: content re-rasters write in place (the host may hold its view
-    /// across frames of one geometry); only a geometry change re-derives the allocation.
     #[test]
     fn spill_ptr_stays_stable_across_content_re_rasters() {
         let mut r = Renderer::from_system(16.0, Theme::default()).expect(crate::NO_FONT);
@@ -1718,7 +1525,6 @@ mod tests {
         let ptr = spill.rgba().as_ptr();
         let len = spill.rgba().len();
 
-        // Animate the band content: revision ticks, allocation holds.
         input.cursor_glow_add[0].x = 6;
         spill.update(&r, &input);
         assert_eq!(spill.rev(), 2);
@@ -1729,7 +1535,6 @@ mod tests {
         );
         assert_eq!(spill.rgba().len(), len);
 
-        // Geometry change: the one event allowed to re-derive the allocation.
         r.set_pad(12);
         spill.update(&r, &input);
         assert_eq!(spill.rev(), 3, "resize with content re-rasters");
@@ -1744,7 +1549,6 @@ mod tests {
     }
 
     /// 0/0 chrome has no band (no bytes, no revision ticks, no rects), and chrome→0
-    /// clears with exactly one tick.
     #[test]
     fn zero_chrome_is_identity_and_transitions_clear() {
         let mut r = Renderer::from_system(16.0, Theme::default()).expect(crate::NO_FONT);
@@ -1757,7 +1561,6 @@ mod tests {
             w: 10,
             h: 10,
             color: 0x0020_2020,
-            // `alpha: 0` is additive light (see `GlowQuad::alpha`).
             alpha: 0,
             color2: 0x0020_2020,
             alpha2: 0,
@@ -1769,14 +1572,12 @@ mod tests {
         assert_eq!(spill.rgba().len(), 0, "0/0 chrome: empty buffer");
         assert!(spill.rects().is_empty());
 
-        // Chrome arrives: the edge emission now lands in the band.
         r.set_pad(8);
         r.set_head(20);
         spill.update(&r, &input);
         assert_eq!(spill.rev(), 1);
         assert!(!spill.rgba().is_empty());
 
-        // Chrome leaves: one clearing tick, then still.
         r.set_pad(0);
         r.set_head(0);
         spill.update(&r, &input);
@@ -1788,9 +1589,6 @@ mod tests {
     }
 
     /// `set_include_veils(false)` drops `HaloMode::Over` veils from the band
-    /// (Add light stays), the flip itself re-rasters exactly when veils are
-    /// present, and is free when they are not — the policy is part of the
-    /// clipped-stream fingerprint.
     #[test]
     fn include_veils_policy_gates_over_halos() {
         let mut r = Renderer::from_system(16.0, Theme::default()).expect(crate::NO_FONT);
@@ -1799,7 +1597,6 @@ mod tests {
         let mut term = Terminal::new(6, 20);
         let mut input = term.cell_frame(6, 20);
         let (fw, _) = r.frame_size(6, 20);
-        // Disjoint Add ember + Over veil, both in the top strip.
         input.glow_halo = vec![
             RainHalo {
                 row: 0,
@@ -1831,8 +1628,6 @@ mod tests {
         let mut spill = SpillBand::new();
         spill.update(&r, &input);
         assert_eq!(spill.rev(), 1);
-        // Top strip is packed first at full frame width: alpha at (x, y) is
-        // buf[(y·fw + x)·4 + 3].
         let alpha_at = |spill: &SpillBand, x: usize, y: usize| spill.rgba()[(y * fw + x) * 4 + 3];
         assert!(alpha_at(&spill, 8, 8) > 0, "Add ember centre lit");
         assert!(alpha_at(&spill, 46, 10) > 0, "veil centre lit by default");
@@ -1851,7 +1646,6 @@ mod tests {
         assert_eq!(spill.rev(), 3);
         assert!(alpha_at(&spill, 46, 10) > 0, "veil restored");
 
-        // No veils in the input: the flip is invisible to the fingerprint.
         input.glow_halo.truncate(1);
         spill.update(&r, &input);
         assert_eq!(spill.rev(), 4, "removing the veil is a content change");

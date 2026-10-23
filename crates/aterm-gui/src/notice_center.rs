@@ -1,70 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! ATERM'S OWN VOICE on macOS: a notice posted through
-//! `UNUserNotificationCenter` from the running bundle, as aterm, whose click
-//! goes to the tab it is about.
-//!
-//! `notify.rs`'s other macOS paths, a bare binary's, are subprocesses: a
-//! banner is terminal-notifier's or `osascript`'s, which macOS shows as Script
-//! Editor's, and neither hands a click back, so neither can take the owner to
-//! the tab. This module posts in-process instead,
-//! naming the session and this process in the notice's `userInfo`
-//! (`aterm.session`, `aterm.pid`, `aterm.instance`), and is the center's delegate, so a click
-//! comes back here ([`clicked_session`]) and on to the App as
-//! `Wake::NoticeClicked`, which takes the ❯ menu's Go path
-//! (`App::go_to_session`): the window raised, the tab selected, the pane given
-//! the keyboard.
-//!
-//! **Consent.** Posting as the bundle needs the bundle's own notification
-//! consent, which macOS asks the owner for once. aterm asks when the owner
-//! turns on Notify Me When I'm Needed (`App::toggle_desktop_alerts` →
-//! [`NoticeCenter::ask`]) and, where `desktop_alerts` was turned on another
-//! way (aterm.toml, or before aterm asked), with the first notice that would
-//! post while it is on (`notify::way_for`, once per process): the person
-//! turned notices on, so macOS's prompt is the expected next step, and that
-//! notice goes out as aterm's own on a yes. Never at launch, never while it
-//! is off (a program's notification then asks nothing). A read of what macOS
-//! said ([`NoticeCenter::answer`]) never prompts. A bundled aterm posts only
-//! through the center: until macOS has said yes none of its notices reaches
-//! the desktop, nor once macOS has said no, which is the owner's answer, nor
-//! where it has no center (a bundle under a protected root such as
-//! ~/Downloads, whose `Info.plist` aterm declines to read, so it has no
-//! bundle id, or one whose center did not open: each notice one `aterm.log`
-//! line), and aterm's own stay in the band, the menu bar and `messages.log`.
-//! Only a bare binary, which has no bundle at all, posts the old way
-//! (`notify::route`). The Notify Me row's hover says which, and for a bundle
-//! under a protected root that moving it to /Applications gives it its own
-//! voice (`notify::own_voice`). `desktop_alerts` (default off) still drops
-//! every one of aterm's own notices before any of this. A notice is silent,
-//! as the old way's always were: aterm asks macOS for no sound and attaches
-//! none.
-//!
-//! **Only from a bundle, never headless, never in a test.**
-//! `+[UNUserNotificationCenter currentNotificationCenter]` raises an
-//! `NSInternalInconsistencyException` in a process with no bundle proxy (a
-//! bare `target/debug` binary), so the center is touched only once aterm's own
-//! reading of the bundle id (`signing_identity::running_bundle_id`, which
-//! refuses an `Info.plist` under a protected root) and Foundation's
-//! (`-[NSBundle bundleIdentifier]`) both have one, and then under containment.
-//! The framework is opened at run time, never linked, so a headless instance
-//! and the CLI never load it, and the only test that does
-//! (`tests::every_prototype_the_notices_state_is_the_runtimes`) opens it to
-//! read type encodings and never asks for the center. Every center call goes
-//! through [`NoticeCenter`], injected at `App` construction: a windowed macOS
-//! instance gets the live arms, a headless instance and every unit test the
-//! inert ones, which read [`Center::Absent`], post nothing and ask nothing, so
-//! no test reaches the owner's Notification Center (a routing test's
-//! stand-in arms are its own functions). The delegate is the one piece a
-//! test drives whole: a click and a presentation, built of runtime-made
-//! stand-ins for macOS's objects, sent to a real `NoticeDelegate`
-//! (`tests::a_click_on_a_notice_goes_to_its_session`), with no center.
-//!
-//! **Prototypes.** Every send and block the live arms make is typed by an
-//! alias in [`abi`], which a test holds to the Objective-C runtime's own
-//! encodings ([`aterm_objc::prototype_check`], [`aterm_objc::block_check`]):
-//! the live arms run only in a bundle, where no test reaches them, and a
-//! release build does not check a send at the call.
+//! ATERM'S OWN VOICE on macOS.
 
 /// What macOS has said about aterm posting its own notices as itself.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -73,35 +10,21 @@
     expect(dead_code, reason = "UNUserNotificationCenter is macOS's")
 )]
 pub(crate) enum Center {
-    /// No center to post through: not an app bundle, a bundle whose identity
-    /// aterm does not read (under a protected root) or whose center did not
-    /// open, a headless instance, a unit test, or not macOS. A bundle posts
-    /// nothing then (`notify::route`).
+    /// No center to post through.
     Absent,
-    /// A bundle macOS has not been asked about yet
-    /// (`UNAuthorizationStatusNotDetermined`): turning Notify Me on asks, and
-    /// so does the first notice while it is on; no notice is posted until
-    /// macOS says yes (`notify::route`).
+    /// A bundle macOS has not been asked about yet (`UNAuthorizationStatusNotDetermined`).
     Unasked,
-    /// macOS said no, or aterm's notifications are off in System Settings ▸
-    /// Notifications: no notice reaches the desktop (`notify::route`).
+    /// macOS said no, or aterm's notifications are off in System Settings ▸ Notifications.
     Refused,
     /// macOS lets aterm post as itself.
     Granted,
 }
 
-/// `UNNotificationDefaultActionIdentifier`: the owner clicked the notice
-/// itself (not a dismissal, which a delegate hears only for a category that
-/// asks for it, and aterm registers none).
+/// `UNNotificationDefaultActionIdentifier`.
 #[cfg(any(target_os = "macos", test))]
 pub(crate) const DEFAULT_ACTION: &str = "com.apple.UNNotificationDefaultActionIdentifier";
 
-/// What macOS's `UNAuthorizationStatus` says, as a [`Center`]: not
-/// determined is [`Center::Unasked`], denied [`Center::Refused`], and
-/// authorized, provisional and ephemeral each [`Center::Granted`] (aterm asks
-/// for none but the first; macOS delivers the others too). A status this
-/// build does not know is [`Center::Refused`]: aterm posts nothing on an
-/// answer it cannot read.
+/// What macOS's `UNAuthorizationStatus` says, as a [`Center`].
 #[cfg(any(target_os = "macos", test))]
 pub(crate) const fn status_answer(status: isize) -> Center {
     match status {
@@ -111,11 +34,7 @@ pub(crate) const fn status_answer(status: isize) -> Center {
     }
 }
 
-/// THE SESSION A RESPONSE GOES TO: `session` when the owner clicked the notice
-/// itself ([`DEFAULT_ACTION`]) and both the PID and process incarnation match.
-/// `None` for any other action, an older or unbound notice, or one that names
-/// no session (update health's, which is about no tab). Pure: the delegate
-/// reads the strings off the response and hands them here.
+/// THE SESSION A RESPONSE GOES TO.
 #[cfg(any(target_os = "macos", test))]
 pub(crate) fn clicked_session(
     action: &str,
@@ -144,35 +63,25 @@ pub(crate) struct Notice<'a> {
     pub(crate) session: Option<u64>,
 }
 
-/// THE CENTER'S ARMS, injected at `App` construction like the consent probes
-/// (`consent_state::ConsentProbes`): the live ones in a windowed macOS
-/// instance ([`Self::for_instance`]), the inert ones in a headless instance
-/// and in every unit test ([`Self::inert`]). `Copy`, so the delivery thread
-/// and the update-health banner's thread each carry their own. Off macOS it
-/// holds nothing: there is no center there.
+/// THE CENTER'S ARMS, injected at `App` construction like the consent probes (`consent_state::ConsentProbes`).
 #[derive(Clone, Copy)]
 pub(crate) struct NoticeCenter {
     /// What macOS has said ([`Center`]), read fresh: a bounded wait for the
-    /// center's settings, on the thread that asks. Never prompts.
     #[cfg(target_os = "macos")]
     answer: fn() -> Center,
     /// Hand one notice to the center; `false` when it could not be.
     #[cfg(target_os = "macos")]
     post: fn(&Notice<'_>) -> bool,
     /// Ask macOS to let aterm post as itself, where it has not been asked
-    /// yet, then call `then` (on another thread) once it has answered; a
-    /// `then` dropped uncalled is an ask that could not be made.
     #[cfg(target_os = "macos")]
     ask: fn(Box<dyn FnOnce() + Send>),
     /// Become the center's delegate, so a click comes back (main thread;
-    /// once per process, and only once a read has opened the center).
     #[cfg(target_os = "macos")]
     adopt_clicks: fn(),
 }
 
 impl NoticeCenter {
-    /// The arms for this instance: live in a windowed macOS instance, inert
-    /// in a headless one, in a unit test and off macOS.
+    /// The arms for this instance: live in a windowed macOS instance, inert in a headless one, in a unit test and off macOS.
     #[must_use]
     pub(crate) fn for_instance(headless: bool) -> Self {
         #[cfg(all(target_os = "macos", not(test)))]
@@ -188,8 +97,7 @@ impl NoticeCenter {
         Self::inert()
     }
 
-    /// The inert arms: macOS has nothing to say ([`Center::Absent`]), nothing
-    /// is posted, nothing asked, no delegate set.
+    /// The inert arms: macOS has nothing to say ([`Center::Absent`]), nothing is posted, nothing asked, no delegate set.
     #[must_use]
     pub(crate) const fn inert() -> Self {
         Self {
@@ -204,9 +112,7 @@ impl NoticeCenter {
         }
     }
 
-    /// A test's stand-in arms: what macOS says and what an ask does are the
-    /// test's own functions, so no center is reached; nothing is posted and no
-    /// delegate is set.
+    /// A test's stand-in arms: what macOS says and what an ask does are the test's own functions, so no center is reached.
     #[cfg(all(target_os = "macos", test))]
     #[must_use]
     pub(crate) const fn stand_in(
@@ -224,8 +130,7 @@ impl NoticeCenter {
 
 #[cfg(target_os = "macos")]
 impl NoticeCenter {
-    /// What macOS has said about aterm posting as itself. Blocks for a bounded
-    /// wait: never on the event loop.
+    /// What macOS has said about aterm posting as itself.
     pub(crate) fn answer(self) -> Center {
         (self.answer)()
     }
@@ -235,10 +140,7 @@ impl NoticeCenter {
         (self.post)(notice)
     }
 
-    /// Ask macOS, if it has not been asked (the owner turned Notify Me on, or
-    /// the first notice while it is on: `notify::way_for`), and call `then`
-    /// once it has answered (or at once where nothing is asked). Returns at
-    /// once.
+    /// Ask macOS, if it has not been asked (the owner turned Notify Me on, or the first notice while it is on: `notify::way_for`), and call `then` once it has answered (or at once where nothing is asked).
     pub(crate) fn ask(self, then: Box<dyn FnOnce() + Send>) {
         (self.ask)(then);
     }
@@ -260,9 +162,6 @@ fn inert_post(_notice: &Notice<'_>) -> bool {
 }
 
 /// The inert ask: macOS is not asked, and `then` is dropped uncalled (there
-/// is no answer to read again). A test build counts the asks
-/// ([`take_asks`]), so a test can say when the owner's gesture would have
-/// asked.
 #[cfg(target_os = "macos")]
 fn inert_ask(_then: Box<dyn FnOnce() + Send>) {
     #[cfg(test)]
@@ -278,21 +177,13 @@ thread_local! {
     static ASKS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
-/// How many times this thread's inert center was asked since the last call
-/// (test-only).
+/// How many times this thread's inert center was asked since the last call (test-only).
 #[cfg(all(target_os = "macos", test))]
 pub(crate) fn take_asks() -> u32 {
     ASKS.with(|asks| asks.replace(0))
 }
 
 /// THE PROTOTYPES the notices state for UserNotifications, named so a test
-/// can hold each to the runtime's own record without the center
-/// (`tests::every_prototype_the_notices_state_is_the_runtimes`). The live arms
-/// cast every hand-written send to one of these, build every handler with
-/// `RcBlock::of` and call the delegate's handlers with `BlockPtr::call`, each
-/// through its alias, so a prototype changed here is the one the test checks.
-/// The sends through `aterm_objc::send`'s helpers are typed by the helper's
-/// name, and the test checks those rows too.
 #[cfg(target_os = "macos")]
 mod abi {
     use aterm_objc::{BlockPtr, Bool, Id, Sel};
@@ -301,12 +192,9 @@ mod abi {
     pub(super) type GetSettings = unsafe extern "C-unwind" fn(Id, Sel, BlockPtr);
     /// Its handler: `void (^)(UNNotificationSettings *settings)`.
     pub(super) type SettingsHandler = fn(Id);
-    /// `-[UNUserNotificationCenter
-    /// requestAuthorizationWithOptions:completionHandler:]`; the options are
-    /// an `NSUInteger` bitmask.
+    /// `-[UNUserNotificationCenter requestAuthorizationWithOptions:completionHandler:]`; the options are an `NSUInteger` bitmask.
     pub(super) type RequestAuthorization = unsafe extern "C-unwind" fn(Id, Sel, usize, BlockPtr);
-    /// Its handler: `void (^)(BOOL granted, NSError *error)`. `Bool` is `BOOL`
-    /// on both slices.
+    /// Its handler: `void (^)(BOOL granted, NSError *error)`.
     pub(super) type AuthorizationHandler = fn(Bool, Id);
     /// `-[UNUserNotificationCenter addNotificationRequest:withCompletionHandler:]`.
     pub(super) type AddRequest = unsafe extern "C-unwind" fn(Id, Sel, Id, BlockPtr);
@@ -314,42 +202,28 @@ mod abi {
     pub(super) type AddHandler = fn(Id);
     /// `+[UNNotificationRequest requestWithIdentifier:content:trigger:]`.
     pub(super) type MakeRequest = unsafe extern "C-unwind" fn(Id, Sel, Id, Id, Id) -> Id;
-    /// `+[NSDictionary dictionaryWithObjects:forKeys:count:]`, for a notice's
-    /// `userInfo`.
+    /// `+[NSDictionary dictionaryWithObjects:forKeys:count:]`, for a notice's `userInfo`.
     pub(super) type MakeDictionary =
         unsafe extern "C-unwind" fn(Id, Sel, *const Id, *const Id, usize) -> Id;
-    /// The handler a delegate's
-    /// `-userNotificationCenter:didReceiveNotificationResponse:withCompletionHandler:`
-    /// calls: `void (^)(void)`.
+    /// The handler a delegate's `-userNotificationCenter:didReceiveNotificationResponse:withCompletionHandler:` calls: `void (^)(void)`.
     pub(super) type ResponseDone = fn();
-    /// The handler a delegate's
-    /// `-userNotificationCenter:willPresentNotification:withCompletionHandler:`
-    /// calls: `void (^)(UNNotificationPresentationOptions)`, an `NSUInteger`.
+    /// The handler a delegate's `-userNotificationCenter:willPresentNotification:withCompletionHandler:` calls.
     pub(super) type PresentDone = fn(usize);
 }
 
 /// UserNotifications' binary (in the shared cache; `dlopen` finds it there).
-/// Opened, never linked: no process that does not post as aterm loads it.
 #[cfg(target_os = "macos")]
 const FRAMEWORK: &std::ffi::CStr =
     c"/System/Library/Frameworks/UserNotifications.framework/UserNotifications";
 
 /// Load UserNotifications, so its classes register with the runtime; `false`
-/// when it would not load. Never closed: the center lives for the process.
-/// Loading touches no center: that is `+currentNotificationCenter`, which only
-/// the live arm sends.
 #[cfg(target_os = "macos")]
 fn open_framework() -> bool {
     use std::ffi::{c_char, c_int, c_void};
-    // aterm-libc's macOS cells declare no `dlopen` (a cell carries only the
-    // names the tree used when it was generated). libSystem's, with
-    // `<dlfcn.h>`'s signature.
     unsafe extern "C" {
         fn dlopen(path: *const c_char, mode: c_int) -> *mut c_void;
     }
     /// `<dlfcn.h>` on Darwin: bind on first use, keep the framework's C
-    /// symbols out of the global namespace (its classes register with the
-    /// runtime regardless).
     const RTLD_LAZY: c_int = 0x1;
     const RTLD_LOCAL: c_int = 0x4;
     // SAFETY: a NUL-terminated path and a valid mode.
@@ -361,21 +235,14 @@ fn open_framework() -> bool {
 const SESSION_KEY: &str = "aterm.session";
 
 /// The `userInfo` key naming the process that posted the notice: a decimal
-/// pid. It is checked alongside [`INSTANCE_KEY`]: a PID may be reused, and
-/// process-local session numbers can name another tab in a later process.
 #[cfg(target_os = "macos")]
 const PID_KEY: &str = "aterm.pid";
 
 /// The existing opaque identity of the exact process that posted the notice
-/// (`control_auth::process_instance_id`), retained with it across PID reuse.
 #[cfg(target_os = "macos")]
 const INSTANCE_KEY: &str = "aterm.instance";
 
 /// A notice's `userInfo`: this process's pid ([`PID_KEY`]) and opaque
-/// incarnation ([`INSTANCE_KEY`]) and, for a notice about a tab, its session
-/// ([`SESSION_KEY`]), each a decimal string — what the live arm's post writes
-/// and the delegate reads back ([`clicks`]). Autoreleased into the caller's
-/// pool.
 #[cfg(target_os = "macos")]
 fn user_info(session: Option<u64>) -> Option<aterm_objc::Id> {
     use aterm_objc::{Id, Obj, checked_msg, class, sel};
@@ -397,9 +264,7 @@ fn user_info(session: Option<u64>) -> Option<aterm_objc::Id> {
     }
     let keys: Vec<Id> = keys.iter().map(Obj::id).collect();
     let values: Vec<Id> = values.iter().map(Obj::id).collect();
-    // SAFETY: `+dictionaryWithObjects:forKeys:count:` is
-    // `abi::MakeDictionary`; both arrays hold `count` live objects, which
-    // the dictionary retains (and copies, for keys). Autoreleased.
+    // SAFETY: `+dictionaryWithObjects:forKeys:count:` is `abi::MakeDictionary`.
     let info = unsafe {
         let make: abi::MakeDictionary = checked_msg();
         make(
@@ -427,34 +292,21 @@ mod live {
     use super::{Center, Notice, abi};
 
     /// What aterm asks to post: `UNAuthorizationOptionAlert`
-    /// (`UNUserNotificationCenter.h`: badge `1 << 0`, sound `1 << 1`, alert
-    /// `1 << 2`). No badge: aterm keeps no count on its Dock icon. No sound:
-    /// its notices are silent, as terminal-notifier's and `osascript`'s
-    /// always were.
     const ASK_OPTIONS: usize = 1 << 2;
 
     /// How long a read of the center's settings may take before the last
-    /// answer stands. usernoted answers at once; the bound only keeps a wedged
-    /// daemon from holding the delivery thread, whose bounded queue drops
-    /// what arrives meanwhile.
     const ANSWER_WAIT: Duration = Duration::from_secs(5);
 
     /// The center, opened once per process ([`open_center`]): its address,
-    /// retained for the process, or `None` where there is none.
     static CENTER: OnceLock<Option<usize>> = OnceLock::new();
 
     /// The last answer read, which stands while a fresh read times out.
-    /// `None` until one has been read: an open center with no answer yet reads
-    /// as [`Center::Refused`] (as an answer this build cannot read does,
-    /// [`super::status_answer`]), so a bundle posts nothing on it, and nothing
-    /// through a subprocess.
     static LAST: Mutex<Option<Center>> = Mutex::new(None);
 
     /// Whether this process is the center's delegate yet.
     static ADOPTED: AtomicBool = AtomicBool::new(false);
 
     /// Each request's identifier is this process's and unique, so no notice
-    /// replaces another.
     static NEXT_REQUEST: AtomicU64 = AtomicU64::new(0);
 
     fn at(addr: usize) -> Id {
@@ -462,16 +314,11 @@ mod live {
     }
 
     /// The center, opening it on first use: not on the event loop, since
-    /// [`crate::signing_identity::running_bundle_id`] may read the signing
-    /// identity there.
     fn center() -> Option<Id> {
         (*CENTER.get_or_init(open_center)).map(at)
     }
 
     /// Open the center where this process may: windowed, run from an app
-    /// bundle both aterm and Foundation can name, and the framework loads.
-    /// The accessor raises in a process with no bundle proxy, which the two
-    /// bundle checks rule out; a raise is contained all the same.
     fn open_center() -> Option<usize> {
         if crate::menu::process_is_headless()
             || crate::signing_identity::running_bundle_id().is_none()
@@ -479,8 +326,7 @@ mod live {
             return None;
         }
         aterm_objc::autoreleasepool(|_| {
-            // SAFETY: `+mainBundle` and `-bundleIdentifier` are `-(id)`
-            // accessors; both answers are borrowed for this pool.
+            // SAFETY: `+mainBundle` and `-bundleIdentifier` are `-(id)` accessors; both answers are borrowed for this pool.
             let named = unsafe {
                 let bundle = send_id(class(c"NSBundle").as_id(), sel!(mainBundle));
                 !bundle.is_null() && !send_id(bundle, sel!(bundleIdentifier)).is_null()
@@ -509,13 +355,11 @@ mod live {
             }
             let center = aterm_objc::contain(
                 "+[UNUserNotificationCenter currentNotificationCenter]",
-                // SAFETY: `+currentNotificationCenter` is `-(id)`, the
-                // process's singleton, borrowed for this pool.
+                // SAFETY: `+currentNotificationCenter` is `-(id)`, the process's singleton, borrowed for this pool.
                 || unsafe { send_id(cls.as_id(), sel!(currentNotificationCenter)) },
             )
             .ok()?;
-            // SAFETY: a live (or nil) object; retained once and never
-            // released, so its address stays good for the process.
+            // SAFETY: a live (or nil) object; retained once and never released, so its address stays good for the process.
             let Some(held) = (unsafe { Obj::retain(center) }) else {
                 aterm_log::info!("notices: macOS gave aterm no center, so it posts no notice");
                 return None;
@@ -527,21 +371,17 @@ mod live {
         })
     }
 
-    /// What macOS has said: the center's settings, read fresh within
-    /// [`ANSWER_WAIT`], else the last answer read.
+    /// What macOS has said: the center's settings, read fresh within [`ANSWER_WAIT`], else the last answer read.
     pub(super) fn answer() -> Center {
         let Some(center) = center() else {
             return Center::Absent;
         };
         let (tx, rx) = std::sync::mpsc::sync_channel::<isize>(1);
-        // Bound first and wrapped second, so its send keeps its own `unsafe`
-        // (the `app_launch_successor.rs` note).
         let read = move |settings: Id| {
             let status = if settings.is_null() {
                 -1
             } else {
-                // SAFETY: the settings object is live for the call, and
-                // `-authorizationStatus` is `-(NSInteger)`.
+                // SAFETY: the settings object is live for the call, and `-authorizationStatus` is `-(NSInteger)`.
                 unsafe { send_isize(settings, sel!(authorizationStatus)) }
             };
             let _ = tx.try_send(status);
@@ -551,8 +391,7 @@ mod live {
             let Some(handler) = (unsafe { RcBlock::of::<abi::SettingsHandler, _>(read) }) else {
                 return false;
             };
-            // SAFETY: `-getNotificationSettingsWithCompletionHandler:` is
-            // `abi::GetSettings` on the live center, which copies the handler.
+            // SAFETY: `-getNotificationSettingsWithCompletionHandler:` is `abi::GetSettings` on the live center, which copies the handler.
             unsafe {
                 let get: abi::GetSettings = checked_msg();
                 get(
@@ -572,8 +411,6 @@ mod live {
         match fresh {
             Some(status) => {
                 let now = super::status_answer(status);
-                // Once per change, so the log holds what macOS said and when it
-                // changed (a consent given or taken back), not every read.
                 if *last != Some(now) {
                     aterm_log::info!(
                         "notices: macOS's answer is {now:?} (authorizationStatus {status})"
@@ -595,9 +432,7 @@ mod live {
         last.unwrap_or(Center::Refused)
     }
 
-    /// Ask macOS, on a thread of its own, where it has not been asked: the
-    /// system's one consent prompt for the bundle. `then` runs once macOS
-    /// has answered, or at once where nothing was asked.
+    /// Ask macOS, on a thread of its own, where it has not been asked: the system's one consent prompt for the bundle.
     pub(super) fn ask(then: Box<dyn FnOnce() + Send>) {
         let spawned = std::thread::Builder::new()
             .name("aterm-notice-ask".to_string())
@@ -623,17 +458,14 @@ mod live {
                     }
                 };
                 aterm_objc::autoreleasepool(|_| {
-                    // SAFETY: the handler is `abi::AuthorizationHandler`,
-                    // exactly `answered`'s.
+                    // SAFETY: the handler is `abi::AuthorizationHandler`, exactly `answered`'s.
                     let Some(handler) =
                         (unsafe { RcBlock::of::<abi::AuthorizationHandler, _>(answered) })
                     else {
                         aterm_log::warn!("notices: macOS was not asked: no handler block");
                         return;
                     };
-                    // SAFETY: `-requestAuthorizationWithOptions:completionHandler:`
-                    // is `abi::RequestAuthorization`, and the center copies the
-                    // handler.
+                    // SAFETY: `-requestAuthorizationWithOptions:completionHandler:` is `abi::RequestAuthorization`, and the center copies the handler.
                     unsafe {
                         let request: abi::RequestAuthorization = checked_msg();
                         request(
@@ -650,11 +482,7 @@ mod live {
         }
     }
 
-    /// Post `notice` as aterm: a `UNMutableNotificationContent` with its
-    /// title, body and `userInfo` ([`user_info`]) and no sound, delivered at
-    /// once (no trigger). `false` when the center or an object could not be
-    /// had; macOS's own refusal arrives later, in the handler, and is one log
-    /// line.
+    /// Post `notice` as aterm.
     pub(super) fn post(notice: &Notice<'_>) -> bool {
         let Some(center) = center() else {
             return false;
@@ -671,8 +499,7 @@ mod live {
             ) else {
                 return false;
             };
-            // SAFETY: `+alloc` then `-init` give a +1 content object, which
-            // `content` owns.
+            // SAFETY: `+alloc` then `-init` give a +1 content object, which `content` owns.
             let content = unsafe {
                 Obj::from_owned(send_id(aterm_objc::send::alloc(content_class), sel!(init)))
             };
@@ -680,8 +507,7 @@ mod live {
                 return false;
             };
             let info = super::user_info(notice.session);
-            // SAFETY: each setter is `-(void)(id)` on the live content, which
-            // copies what it is given.
+            // SAFETY: each setter is `-(void)(id)` on the live content, which copies what it is given.
             unsafe {
                 send_v_id(content.id(), sel!(setTitle:), title.id());
                 send_v_id(content.id(), sel!(setBody:), body.id());
@@ -697,9 +523,7 @@ mod live {
             let Some(identifier) = aterm_objc::ns_string(&identifier) else {
                 return false;
             };
-            // SAFETY: `+requestWithIdentifier:content:trigger:` is
-            // `abi::MakeRequest`; a nil trigger delivers at once. The request is
-            // autoreleased into this pool.
+            // SAFETY: `+requestWithIdentifier:content:trigger:` is `abi::MakeRequest`; a nil trigger delivers at once.
             let request = unsafe {
                 let make: abi::MakeRequest = checked_msg();
                 make(
@@ -728,9 +552,7 @@ mod live {
                 BlockPtr::from_ptr(std::ptr::null_mut()),
                 RcBlock::as_block_ptr,
             );
-            // SAFETY: `-addNotificationRequest:withCompletionHandler:` is
-            // `abi::AddRequest` on the live center; the handler may be nil, and
-            // the center copies it.
+            // SAFETY: `-addNotificationRequest:withCompletionHandler:` is `abi::AddRequest` on the live center.
             unsafe {
                 let add: abi::AddRequest = checked_msg();
                 add(
@@ -744,10 +566,7 @@ mod live {
         })
     }
 
-    /// Become the center's delegate, so a click on one of aterm's notices
-    /// comes back ([`NoticeDelegate`]). Main thread only, once per process,
-    /// and only once a read has opened the center: opening it here could
-    /// read the signing identity on the event loop.
+    /// Become the center's delegate, so a click on one of aterm's notices comes back ([`NoticeDelegate`]).
     pub(super) fn adopt_clicks() {
         if ADOPTED.load(Ordering::Acquire) {
             return;
@@ -761,9 +580,7 @@ mod live {
         let Some(delegate) = NoticeDelegate::alloc_init(main, ()) else {
             return;
         };
-        // SAFETY: `-setDelegate:` is `-(void)(id)` on the live center, which
-        // holds its delegate weakly — so the delegate is kept for the process
-        // below.
+        // SAFETY: `-setDelegate:` is `-(void)(id)` on the live center, which holds its delegate weakly.
         unsafe { send_v_id(center, sel!(setDelegate:), delegate.as_id()) };
         std::mem::forget(delegate);
         ADOPTED.store(true, Ordering::Release);
@@ -772,11 +589,6 @@ mod live {
 }
 
 /// The center's delegate and what it reads off a response: declared in a test
-/// build too, where a test reads the encodings it registered against the
-/// protocol's (`tests::every_prototype_the_notices_state_is_the_runtimes`)
-/// and sends it a click and a presentation built of stand-ins
-/// (`tests::a_click_on_a_notice_goes_to_its_session`,
-/// `tests::a_notice_shows_while_aterm_is_in_front`).
 #[cfg(target_os = "macos")]
 mod clicks {
     use aterm_objc::send::{send_bool_cls, send_id, send_id_id};
@@ -785,45 +597,22 @@ mod clicks {
     use super::{INSTANCE_KEY, PID_KEY, SESSION_KEY, abi};
 
     /// How a notice shows while aterm is the active app:
-    /// `UNNotificationPresentationOptionList | Banner` (`1 << 3`, `1 << 4`;
-    /// no sound, as aterm asks for none). macOS shows none for the frontmost
-    /// app unless its delegate says so, and the delivery thread has already
-    /// dropped a notice about the tab the owner is looking at, so one that
-    /// arrives is about another tab and shows.
     const PRESENT_OPTIONS: usize = (1 << 3) | (1 << 4);
 
     aterm_objc::declare_class! {
-        /// The center's delegate. A click on one of aterm's notices comes
-        /// here, and the session its `userInfo` names goes to the App as
-        /// `Wake::NoticeClicked` (`notify::raise_clicked`); while aterm is
-        /// the active app, a notice still shows as a banner
-        /// ([`PRESENT_OPTIONS`]). Either method may be sent on any thread: it
-        /// reads only the response and posts a wake.
-        ///
-        /// It claims `UNUserNotificationCenterDelegate`, which the host
-        /// registers, though not from UserNotifications: on macOS 27 that
-        /// framework carries no `__objc_protolist` entry for it, and the
-        /// protocol comes from CoreUtils, which AppKit loads (its
-        /// `CUUserNotificationSession` conforms). aterm links AppKit, so the
-        /// claim is the host's protocol and not a name-only stand-in, which
-        /// the prototype test asserts before it declares the class. The
-        /// center reaches a delegate's rows by selector either way.
-        /// `diagnostics::CLAIMED_OBJC_PROTOCOLS` (the window layer's claims,
-        /// read before any class is declared) does not list it.
+        /// The center's delegate.
         pub(super) struct NoticeDelegate: NSObject {
             const NAME: &str = "ATermNoticeDelegate";
             type Ivars = ();
             protocols: [NSObject, UNUserNotificationCenterDelegate];
 
             /// The owner answered a notice: go to its session if it was a
-            /// click on one of this process's, then tell the center.
             @sel(userNotificationCenter:didReceiveNotificationResponse:withCompletionHandler:)
             fn did_receive(&self, _center: Id, response: Id, done: BlockPtr) {
                 if let Some(session) = clicked(response) {
                     crate::notify::raise_clicked(session);
                 }
-                // SAFETY: the handler is `abi::ResponseDone`
-                // (`UNUserNotificationCenter.h`).
+                // SAFETY: the handler is `abi::ResponseDone` (`UNUserNotificationCenter.h`).
                 unsafe { done.call::<abi::ResponseDone>(()) };
             }
 
@@ -837,15 +626,12 @@ mod clicks {
     }
 
     /// The session a response goes to ([`super::clicked_session`]), read off
-    /// `response.actionIdentifier` and
-    /// `response.notification.request.content.userInfo`.
     fn clicked(response: Id) -> Option<u64> {
         if response.is_null() {
             return None;
         }
         aterm_objc::autoreleasepool(|_| {
-            // SAFETY: each is a `-(id)` accessor on a live object or nil (a
-            // send to nil answers nil); the answers are borrowed for this pool.
+            // SAFETY: each is a `-(id)` accessor on a live object or nil (a send to nil answers nil); the answers are borrowed for this pool.
             unsafe {
                 let action =
                     aterm_objc::ns_string_to_rust(send_id(response, sel!(actionIdentifier)));
@@ -869,8 +655,6 @@ mod clicks {
     }
 
     /// `info[key]` when it is a string (as the live arm's `user_info` writes
-    /// it).
-    ///
     /// # Safety
     /// `info` must be a live `NSDictionary`, or nil.
     unsafe fn string_for(info: Id, key: &str) -> Option<String> {
@@ -878,9 +662,7 @@ mod clicks {
             return None;
         }
         let key = aterm_objc::ns_string(key)?;
-        // SAFETY: `-objectForKey:` is `-(id)(id)` and `-isKindOfClass:`
-        // `-(BOOL)(Class)`, on live objects; the value is borrowed from
-        // `info`.
+        // SAFETY: `-objectForKey:` is `-(id)(id)` and `-isKindOfClass:` `-(BOOL)(Class)`, on live objects.
         unsafe {
             let value = send_id_id(info, sel!(objectForKey:), key.id());
             if value.is_null() || !send_bool_cls(value, sel!(isKindOfClass:), class(c"NSString")) {
@@ -896,11 +678,6 @@ mod tests {
     use super::{Center, DEFAULT_ACTION, clicked_session, status_answer};
 
     /// A CLICK GOES TO THE SESSION ITS NOTICE NAMES, and only a click on one
-    /// this process posted: the default action with this pid and a session
-    /// routes there. NEGATIVE CONTROLS: a dismissal or a custom action,
-    /// another process's notice (a sibling's, or this aterm's before a restart
-    /// or an update, whose session ids are not this one's), a notice about no
-    /// tab, and a garbled `userInfo` route nowhere.
     #[test]
     fn a_response_routes_to_the_session_its_notice_names() {
         let own = 4242;
@@ -935,8 +712,6 @@ mod tests {
                 "{case}"
             );
         }
-        // The PID and tab number can both recur: only this launch's exact
-        // opaque binding routes the click. Legacy notices have none.
         for previous in [None, Some(""), Some("p4242-captured-old-launch")] {
             assert_eq!(
                 clicked_session(DEFAULT_ACTION, Some("7"), ours, previous, own, incarnation),
@@ -947,9 +722,6 @@ mod tests {
     }
 
     /// macOS's authorization status, read: not determined is the ask
-    /// Notify Me makes, denied a refusal, and the three statuses macOS
-    /// delivers under each a grant. A status this build does not know is a
-    /// refusal: aterm posts nothing on an answer it cannot read.
     #[test]
     fn macos_answers_read_as_ask_refuse_or_grant() {
         assert_eq!(status_answer(0), Center::Unasked);
@@ -963,8 +735,6 @@ mod tests {
     }
 
     /// A unit test's center is inert whatever it is asked for: a windowed
-    /// instance's arms are not even compiled into a test build, so the
-    /// center reads absent, posts nothing, and an ask is only counted.
     #[cfg(target_os = "macos")]
     #[test]
     fn a_test_build_never_reaches_the_notification_center() {
@@ -987,29 +757,6 @@ mod tests {
     }
 
     /// EVERY PROTOTYPE THE NOTICES STATE IS THE RUNTIME'S, read without the
-    /// center: the live arms run only in a bundle, where no test reaches them,
-    /// and a release build checks no send at the call. UserNotifications is
-    /// loaded as the live arm loads it, but `+currentNotificationCenter` is
-    /// never sent, nothing is posted and nothing asked; every row below reads
-    /// a type encoding.
-    ///
-    /// * Each send's prototype ([`super::abi`]'s aliases, and the helper the
-    ///   live arm sends through) against `method_getTypeEncoding` on the class
-    ///   that receives it, a class method's on the metaclass.
-    /// * The center's three handlers. The center's own encodings spell each
-    ///   block `@?` alone; the runtime records their signatures in
-    ///   `UNUserNotificationServerProtocol`, the protocol the center hands each
-    ///   request to usernoted through, whose rows take the same handlers.
-    /// * The delegate: the encodings `NoticeDelegate` registers against
-    ///   `UNUserNotificationCenterDelegate`'s, which must be the host's
-    ///   protocol and not a stand-in, and the two handlers it calls against
-    ///   the protocol's extended encodings.
-    /// * The click's action identifier, against the framework's exported
-    ///   `UNNotificationDefaultActionIdentifier`.
-    ///
-    /// NEGATIVE CONTROLS: a signed read of `-authorizationStatus`'s unsigned
-    /// twin and a settings handler taking the options word are refused, so
-    /// neither comparison passes everything.
     #[cfg(target_os = "macos")]
     #[test]
     fn every_prototype_the_notices_state_is_the_runtimes() {
@@ -1043,8 +790,7 @@ mod tests {
         let center = named(c"UNUserNotificationCenter");
         let content = named(c"UNMutableNotificationContent");
 
-        // SAFETY: live classes; `prototype_check` reads an encoding and sends
-        // nothing.
+        // SAFETY: live classes; `prototype_check` reads an encoding and sends nothing.
         let sends: Vec<(&str, Result<(), String>)> = unsafe {
             vec![
                 (
@@ -1154,8 +900,6 @@ mod tests {
         };
         assert!(signed_twin.is_err(), "an unsigned status read passed");
 
-        // The center's handlers, as the protocol it forwards them through
-        // records them.
         let server = protocol(c"UNUserNotificationServerProtocol");
         assert!(
             !server.is_null(),
@@ -1194,14 +938,12 @@ mod tests {
             "a settings handler taking an options word passed"
         );
 
-        // The delegate, claiming the host's protocol.
         let (delegate, cls) = delegate_class();
         let receive =
             sel!(userNotificationCenter:didReceiveNotificationResponse:withCompletionHandler:);
         let present = sel!(userNotificationCenter:willPresentNotification:withCompletionHandler:);
         for row in [receive, present] {
-            // SAFETY: a live protocol and a class this module declared;
-            // read-only queries.
+            // SAFETY: a live protocol and a class this module declared; read-only queries.
             let (want, got) = unsafe {
                 (
                     protocol_method_types(delegate, row, true),
@@ -1226,7 +968,6 @@ mod tests {
             "the presentation handler"
         );
 
-        // The click's action identifier.
         unsafe extern "C" {
             fn dlsym(
                 handle: *mut std::ffi::c_void,
@@ -1235,8 +976,7 @@ mod tests {
         }
         /// `<dlfcn.h>`'s `RTLD_DEFAULT`: every loaded image.
         const RTLD_DEFAULT: *mut std::ffi::c_void = -2_isize as *mut std::ffi::c_void;
-        // SAFETY: a NUL-terminated symbol name; the answer is the address of
-        // an `NSString *const`, or null.
+        // SAFETY: a NUL-terminated symbol name; the answer is the address of an `NSString *const`, or null.
         let symbol = unsafe {
             dlsym(
                 RTLD_DEFAULT,
@@ -1253,10 +993,6 @@ mod tests {
     }
 
     /// THE DELEGATE'S CLASS, claiming the host's
-    /// `UNUserNotificationCenterDelegate`, with that protocol: the protocol
-    /// must be the host's before the class claims it, or the claim registers a
-    /// stand-in with no rows that every later reader sees, so each test that
-    /// declares the class asks here first.
     #[cfg(target_os = "macos")]
     fn delegate_class() -> (aterm_objc::ProtocolPtr, aterm_objc::ClassPtr) {
         use aterm_objc::ClassType as _;
@@ -1271,13 +1007,6 @@ mod tests {
     }
 
     /// Stand-ins for what macOS hands the delegate: a response
-    /// (`UNNotificationResponse`) for the notice it answers (`UNNotification`)
-    /// for its request (`UNNotificationRequest`) for its content
-    /// (`UNNotificationContent`), each an `NSObject` subclass made at run time
-    /// that answers only the selectors the delegate reads off that link, with
-    /// the runtime's `-(id)` encoding. A read that skipped a link, or asked one
-    /// for what it does not answer, raises: the delegate's containment then
-    /// calls no handler, which the tests see.
     #[cfg(target_os = "macos")]
     mod stand_ins {
         use aterm_objc::{Id, Obj, Retained};
@@ -1347,8 +1076,7 @@ mod tests {
             Notification::alloc_init(witness, request)
         }
 
-        /// The response `action` makes to a notice whose content carries
-        /// `info`.
+        /// The response `action` makes to a notice whose content carries `info`.
         pub(super) fn response(action: &str, info: Option<Obj>) -> Option<Retained<Response>> {
             let action = aterm_objc::ns_string(action)?;
             Response::alloc_init(crate::appkit::test_witness(), (action, notification(info)?))
@@ -1356,29 +1084,15 @@ mod tests {
     }
 
     /// The `userInfo` a post writes for `session` ([`super::user_info`]),
-    /// owned.
     #[cfg(target_os = "macos")]
     fn posted_info(session: Option<u64>) -> Option<aterm_objc::Obj> {
         aterm_objc::autoreleasepool(|_| {
-            // SAFETY: an autoreleased dictionary, live for this pool, retained
-            // to outlive it.
+            // SAFETY: an autoreleased dictionary, live for this pool, retained to outlive it.
             super::user_info(session).and_then(|info| unsafe { aterm_objc::Obj::retain(info) })
         })
     }
 
     /// A CLICK ON ONE OF aterm's NOTICES GOES TO ITS SESSION, through the
-    /// real delegate: `-userNotificationCenter:didReceiveNotificationResponse:
-    /// withCompletionHandler:` sent to a `NoticeDelegate`, with a response
-    /// built of stand-ins ([`stand_ins`]) around the very `userInfo` a post
-    /// writes ([`super::user_info`]) and a real block for the completion
-    /// handler. The click reaches the App as `Wake::NoticeClicked` for that
-    /// session (the arm `App::go_to_session` takes, which `app_tabs`'
-    /// `a_notice_click_goes_to_its_tab_and_pane` follows to the tab and pane),
-    /// and the handler runs exactly once. NEGATIVE CONTROLS: a notice whose
-    /// `userInfo` names no session (update health's) and a dismissal route
-    /// nowhere — a click then only brings aterm forward, which macOS does
-    /// itself — and each still runs the handler exactly once. No center is
-    /// opened, nothing is posted, and no bundle is needed.
     #[cfg(target_os = "macos")]
     #[test]
     fn a_click_on_a_notice_goes_to_its_session() {
@@ -1388,7 +1102,6 @@ mod tests {
         use aterm_objc::{BlockPtr, Id, RcBlock, Sel, checked_msg, sel};
 
         /// The delegate row's prototype (the prototype test holds the class's
-        /// encoding to the protocol's).
         type DidReceive = unsafe extern "C-unwind" fn(Id, Sel, Id, Id, BlockPtr);
 
         let _ = delegate_class();
@@ -1398,17 +1111,14 @@ mod tests {
             let response = stand_ins::response(action, posted_info(session)).expect("a response");
             let calls = Rc::new(Cell::new(0_u32));
             let counted = Rc::clone(&calls);
-            // SAFETY: `abi::ResponseDone` is the handler's prototype, and the
-            // closure's.
+            // SAFETY: `abi::ResponseDone` is the handler's prototype, and the closure's.
             let done = unsafe {
                 RcBlock::of::<super::abi::ResponseDone, _>(move || counted.set(counted.get() + 1))
             }
             .expect("a handler block");
             let _ = crate::notify::take_wakes();
             aterm_objc::autoreleasepool(|_| {
-                // SAFETY: the delegate row is `DidReceive`; the delegate and
-                // the response are live, the center nil (the delegate reads
-                // none) and the block a live `abi::ResponseDone`.
+                // SAFETY: the delegate row is `DidReceive`.
                 unsafe {
                     let send: DidReceive = checked_msg();
                     send(
@@ -1447,12 +1157,6 @@ mod tests {
     }
 
     /// A NOTICE THAT ARRIVES WHILE aterm IS IN FRONT STILL SHOWS, through the
-    /// real delegate's `-userNotificationCenter:willPresentNotification:
-    /// withCompletionHandler:`, with a stand-in notice about a tab and a real
-    /// block: the handler is handed List | Banner
-    /// (`UNNotificationPresentationOptions`, `1 << 3 | 1 << 4`: no sound, no
-    /// badge), exactly once, and the presentation goes to no tab, since it is
-    /// not a click.
     #[cfg(target_os = "macos")]
     #[test]
     fn a_notice_shows_while_aterm_is_in_front() {
@@ -1472,8 +1176,7 @@ mod tests {
         let notice = stand_ins::notification(posted_info(Some(7))).expect("a notice");
         let handed = Rc::new(RefCell::new(Vec::new()));
         let seen = Rc::clone(&handed);
-        // SAFETY: `abi::PresentDone` is the handler's prototype, and the
-        // closure's.
+        // SAFETY: `abi::PresentDone` is the handler's prototype, and the closure's.
         let done = unsafe {
             RcBlock::of::<super::abi::PresentDone, _>(move |options: usize| {
                 seen.borrow_mut().push(options);
@@ -1482,9 +1185,7 @@ mod tests {
         .expect("a handler block");
         let _ = crate::notify::take_wakes();
         aterm_objc::autoreleasepool(|_| {
-            // SAFETY: the delegate row is `WillPresent`; the delegate and the
-            // notice are live, the center nil and the block a live
-            // `abi::PresentDone`.
+            // SAFETY: the delegate row is `WillPresent`.
             unsafe {
                 let send: WillPresent = checked_msg();
                 send(

@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Where the lab keeps what it makes, which aterm it tests, whose homes it
-//! guards, and the rule that the calling shell's own agent and aterm
-//! variables never reach a lab.
+//! Lab state paths, binary resolution, home guards, and environment scrubbing.
 
 use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
@@ -12,27 +10,17 @@ use std::sync::OnceLock;
 /// The facts every verb shares, resolved once.
 #[derive(Debug)]
 pub struct Paths {
-    /// `$LAB_STATE`, else [`default_state`] (`/private/tmp/at.lab-<uid>/<checkout>`,
-    /// outside every home): `runs/ logs/ captures/ results/`.
+    /// `$LAB_STATE`, else [`default_state`] (`/private/tmp/at.lab-<uid>/<checkout>`, outside every home).
     pub state: PathBuf,
-    /// Whether [`Self::state`] is the default ([`default_state`]: `$LAB_STATE`
-    /// unset or empty), which [`Paths::make_default_state`] makes private.
+    /// Whether [`Self::state`] is the default ([`default_state`]: `$LAB_STATE` unset or empty), which [`Paths::make_default_state`] makes private.
     pub state_default: bool,
-    /// `$LAB_STATE` as given, when it is relative: refused before anything is
-    /// made ([`Paths::need_state`]): each call would read it from its own cwd,
-    /// which a jailed process may write.
+    /// `$LAB_STATE` as given, when it is relative.
     pub state_relative: Option<String>,
-    /// The aterm a NEW lab tests, when one was found (a lab that is up runs
-    /// the one its `env.sh` recorded at `up`, which its jail pins).
+    /// The aterm a NEW lab tests, when one was found (a lab that is up runs the one its `env.sh` recorded at `up`, which its jail pins).
     pub aterm: Option<PathBuf>,
     /// Why `$LAB_ATERM` was not taken, when it was not.
     pub aterm_note: Option<String>,
-    /// The UID account's physical home, independently of `HOME` (the account
-    /// database's: [`aterm_uds::account::home`]); empty when it cannot be
-    /// resolved safely, which [`Paths::need_home`] refuses. A lab run under a
-    /// scratch `HOME`, as every agent run here is, guards this one all the
-    /// same ([`Paths::guarded_homes`]) and finds the managed agents in its
-    /// package store ([`Paths::store_home`]).
+    /// The UID account's physical home, independently of `HOME` (the account database's: [`aterm_uds::account::home`]).
     pub real_home: String,
     /// The calling shell's physical `HOME`, when it names a directory.
     pub caller_home: String,
@@ -51,11 +39,7 @@ pub fn paths() -> &'static Paths {
     PATHS.get_or_init(Paths::resolve)
 }
 
-/// The variable prefixes a calling shell's aterm, agent or package manager
-/// sets: a lab forgets them all, since the ctl client resolves its target from
-/// such variables and the lab must never reach the owner's live aterm (nor
-/// hand on a real key: Muse Code's `META_API_KEY` beats its login, and
-/// `MUSE_*`/`TBH_*` steer it).
+/// The variable prefixes a calling shell's aterm, agent or package manager sets.
 pub const FORGET_PREFIXES: &[&str] = &[
     "ATERM",
     "CLAUDE",
@@ -69,12 +53,7 @@ pub const FORGET_PREFIXES: &[&str] = &[
     "TBH_",
 ];
 
-/// Whether the variable `key` is one a lab forgets: [`FORGET_PREFIXES`], two
-/// exact names, and the caller's proxies in any case (`http_proxy`,
-/// `ALL_PROXY`, …) with curl's `CURL_HOME`. What the lab runs outside the jail
-/// reaches loopback only, and a proxy it inherited would carry those requests,
-/// and what they hold, to another host; what it starts in the jail is handed
-/// the black hole as its proxy by name.
+/// Whether the variable `key` is one a lab forgets.
 #[must_use]
 pub fn forgotten(key: &str) -> bool {
     let proxy = key.split_once('_').is_some_and(|(head, tail)| {
@@ -99,17 +78,13 @@ impl Paths {
         Paths::resolve_with(aterm_uds::account::home(), std::env::var_os("HOME"))
     }
 
-    /// [`Paths::resolve`] with the account database's home (`account`) and
-    /// `$HOME` (`home`) given: the seam a test hands a fake account home.
+    /// [`Paths::resolve`] with the account database's home (`account`) and `$HOME` (`home`) given.
     #[must_use]
     pub fn resolve_with(account: Option<PathBuf>, home: Option<OsString>) -> Paths {
         let repo = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .and_then(Path::parent)
             .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
-        // The default is taken as written, never through what stands at its
-        // root in the shared /private/tmp: [`Paths::make_default_state`]
-        // refuses a link there before anything is made.
         let fallback = || default_state(crate::sys::getuid(), &physical(&repo));
         let (state, state_relative, state_default) = match std::env::var("LAB_STATE") {
             Ok(s) if !s.is_empty() && !s.starts_with('/') => (fallback(), Some(s), false),
@@ -137,16 +112,13 @@ impl Paths {
         }
     }
 
-    /// Every home the jail's witnesses and scrubs take as the owner's
-    /// ([`guarded`]): the account's, and the caller's `HOME` when it names
-    /// another (the homes [`crate::jail::render`] fences).
+    /// Every home the jail's witnesses and scrubs take as the owner's ([`guarded`]).
     #[must_use]
     pub fn guarded_homes(&self) -> Vec<String> {
         guarded(&self.real_home, &self.caller_home)
     }
 
-    /// The guarded homes, or the refusal when neither the account database
-    /// nor `HOME` names a directory.
+    /// The guarded homes, or the refusal when neither the account database nor `HOME` names a directory.
     ///
     /// # Errors
     /// No home to guard.
@@ -162,9 +134,7 @@ impl Paths {
         Ok(homes)
     }
 
-    /// The home whose package store holds the managed agents: the account's,
-    /// whatever `HOME` says (a scratch `HOME` holds no store), else the
-    /// caller's.
+    /// The home whose package store holds the managed agents.
     #[must_use]
     pub fn store_home(&self) -> &str {
         if self.real_home.is_empty() {
@@ -185,23 +155,16 @@ impl Paths {
         }
     }
 
-    /// Whether the caller's `HOME` is a scratch one: it names a directory
-    /// that is not the account's home (every agent run here sets one).
+    /// Whether the caller's `HOME` is a scratch one.
     #[must_use]
     pub fn scratch_home(&self) -> bool {
         !self.caller_home.is_empty() && self.caller_home != self.real_home
     }
 
-    /// The state dir to make things in: the refusal of a relative
-    /// `$LAB_STATE`, and the default made this user's private directory
-    /// first ([`Self::make_default_state`]), so no verb, one that skips the
-    /// lab's up-front check (`fleet-sim`'s record) among them, makes anything
-    /// through a link or in a directory another user planted at the shared
-    /// `/private/tmp`.
+    /// The state dir to make things in.
     ///
     /// # Errors
-    /// `$LAB_STATE` is relative, or the default is not this user's own
-    /// private directory.
+    /// `$LAB_STATE` is relative, or the default is not this user's own private directory.
     pub fn need_state(&self) -> Result<&Path, String> {
         let state = self.state_named()?;
         self.make_default_state()?;
@@ -209,7 +172,6 @@ impl Paths {
     }
 
     /// The state dir, or the refusal of a relative `$LAB_STATE`: a check that
-    /// makes nothing.
     fn state_named(&self) -> Result<&Path, String> {
         match &self.state_relative {
             Some(s) => Err(format!(
@@ -220,11 +182,7 @@ impl Paths {
         }
     }
 
-    /// The state dir, or the refusal of one inside a home the jail fences
-    /// (`homes`, [`Self::guarded_homes`]): the fence refuses every directory
-    /// from that home down to a run's state root, which the harness's tape
-    /// store opens one at a time, so a lab there would keep no tape. The
-    /// default sits outside every home.
+    /// The state dir, or the refusal of one inside a home the jail fences (`homes`, [`Self::guarded_homes`]).
     ///
     /// # Errors
     /// `$LAB_STATE` is the home or lies under it.
@@ -250,19 +208,10 @@ impl Paths {
         }
     }
 
-    /// The default state dir made private before anything goes into it, when
-    /// it is the one in use ([`Self::state_default`]; a `$LAB_STATE` the
-    /// caller named is left as it is): its root, `/private/tmp/at.lab-<uid>`,
-    /// and its own directory, each made mode 0700 and then required to be a
-    /// directory (no link) this user owns that nobody else may write
-    /// ([`private_dir`]). `/private/tmp` is shared, so a squatted or linked
-    /// root is refused, never followed; every lab's jail refuses writes there
-    /// (`jail.sb`'s `/private/tmp/at.*` rule), as it does in the lab's
-    /// socket dirs.
+    /// Ensure the default state directory is private when [`Self::state_default`] is true.
     ///
     /// # Errors
-    /// Either directory cannot be made, or is not this user's own private
-    /// directory.
+    /// Either directory cannot be made, or is not this user's own private directory.
     pub fn make_default_state(&self) -> Result<(), String> {
         if !self.state_default {
             return Ok(());
@@ -282,8 +231,7 @@ impl Paths {
         Ok(())
     }
 
-    /// The directory this program runs from: the lab trusts it from outside
-    /// the jail (the copy in `runs/<tag>/bin/` aside), so the jail may not write it.
+    /// The directory this program runs from.
     #[must_use]
     pub fn exe_dir(&self) -> PathBuf {
         self.exe
@@ -291,8 +239,7 @@ impl Paths {
             .map_or_else(|| PathBuf::from("/"), physical)
     }
 
-    /// This program's own source (`crates/aterm-lab`): the next `targo
-    /// --unverified lab` compiles it and runs it outside the jail.
+    /// This program's own source (`crates/aterm-lab`).
     #[must_use]
     pub fn crate_dir(&self) -> PathBuf {
         physical(Path::new(env!("CARGO_MANIFEST_DIR")))
@@ -344,12 +291,6 @@ impl Paths {
 }
 
 /// The aterm a new lab tests, and why `$LAB_ATERM` was not taken: `$LAB_ATERM`,
-/// else the `aterm` beside this program, else this checkout's debug build,
-/// else its release build. The lab's door runs it under the recorded jail, which
-/// pins the file and its parents by their physical paths only: a link on the
-/// path as written could be re-pointed from inside the jail, and a relative one
-/// names another file from each cwd. So a `$LAB_ATERM` must already be the
-/// build's physical path; a found one is taken by its physical path.
 fn find_aterm(exe: &Path, repo: &Path) -> (Option<PathBuf>, Option<String>) {
     if let Some(a) = std::env::var_os("LAB_ATERM").filter(|a| !a.is_empty()) {
         let a = PathBuf::from(a);
@@ -388,8 +329,7 @@ fn find_aterm(exe: &Path, repo: &Path) -> (Option<PathBuf>, Option<String>) {
     (found.map(|c| std::fs::canonicalize(&c).unwrap_or(c)), None)
 }
 
-/// A path the CALLER gave (`LAB_CLAUDE`, `LAB_CODEX`, `twin`'s build), made
-/// absolute against the caller's directory: the lab itself works from `/`.
+/// A path the CALLER gave (`LAB_CLAUDE`, `LAB_CODEX`, `twin`'s build), made absolute against the caller's directory.
 #[must_use]
 pub fn from_caller(p: &str) -> String {
     if p.is_empty() || p.starts_with('/') {
@@ -399,8 +339,7 @@ pub fn from_caller(p: &str) -> String {
     format!("{}/{p}", cwd.trim_end_matches('/'))
 }
 
-/// The directory the lab was started from (its physical path), read once
-/// before the lab moves to `/`.
+/// The directory the lab was started from (its physical path), read once before the lab moves to `/`.
 pub fn caller_dir() -> String {
     static D: OnceLock<String> = OnceLock::new();
     D.get_or_init(|| {
@@ -412,8 +351,7 @@ pub fn caller_dir() -> String {
     .clone()
 }
 
-/// `path` with its longest existing prefix resolved through links and `..`,
-/// the rest as written (nothing is made).
+/// `path` with its longest existing prefix resolved through links and `..`, the rest as written (nothing is made).
 #[must_use]
 pub fn physical(path: &Path) -> PathBuf {
     let mut head = path.to_path_buf();
@@ -441,33 +379,19 @@ pub fn physical(path: &Path) -> PathBuf {
     }
 }
 
-/// Where the default state dirs of every checkout of this user sit:
-/// `/private/tmp/at.lab-<uid>`, outside every home (the jail fences the homes'
-/// contents, and the harness's tape store must open each directory down to a
-/// run's state root) and short (a state dir under it is at most 56 bytes, so
-/// a socket a lab's program names under a run keeps within the 103 bytes a
-/// unix socket name may take). Its `at.` prefix puts it under every lab
-/// jail's `/private/tmp/at.*` write refusal, which older builds' jails hold
-/// too. macOS's `tmp_cleaner` clears `/private/tmp` of what nobody used for
-/// days: the default is scratch, and a `$LAB_STATE` keeps logs that must
-/// last.
+/// Where the default state dirs of every checkout of this user sit.
 #[must_use]
 pub fn state_root(uid: u32) -> PathBuf {
     PathBuf::from(format!("/private/tmp/at.lab-{uid}"))
 }
 
-/// The state dir a checkout at `repo` uses when `$LAB_STATE` is unset:
-/// [`state_root`] and the checkout's own name ([`checkout_key`]), so that two
-/// worktrees' labs of the same tag never share a run dir.
+/// The state dir a checkout at `repo` uses when `$LAB_STATE` is unset.
 #[must_use]
 pub fn default_state(uid: u32, repo: &Path) -> PathBuf {
     state_root(uid).join(checkout_key(repo))
 }
 
-/// A checkout's directory name under [`state_root`]: its last component in
-/// letters, digits, `.`, `_` and `-` (anything else `_`), at most 16 of them,
-/// then `-` and eight hex digits of the FNV-1a hash of its whole path, so
-/// two checkouts of one name differ.
+/// A checkout's directory name under [`state_root`].
 #[must_use]
 pub fn checkout_key(repo: &Path) -> String {
     use std::os::unix::ffi::OsStrExt as _;
@@ -498,14 +422,10 @@ pub fn checkout_key(repo: &Path) -> String {
     format!("{name}-{hash:08x}")
 }
 
-/// `dir` made (mode 0700) when missing, then required to be what a private
-/// directory of `uid` is: a directory, not a link to one, owned by `uid`,
-/// writable by nobody else (a looser mode on one `uid` owns is narrowed to
-/// 0700).
+/// `dir` made (mode 0700) when missing, then required to be what a private directory of `uid` is.
 ///
 /// # Errors
-/// It cannot be made, or it is a link, not a directory, another user's, or
-/// its mode cannot be narrowed.
+/// It cannot be made, or it is a link, not a directory, another user's, or its mode cannot be narrowed.
 pub fn private_dir(dir: &Path, uid: u32) -> Result<(), String> {
     use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, PermissionsExt as _};
     match std::fs::DirBuilder::new().mode(0o700).create(dir) {
@@ -548,11 +468,7 @@ pub fn valid_tag(t: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
-/// The homes a lab guards, from the account's home (`account`, the account
-/// database's) and the caller's `HOME` (`caller`): the account's first, then
-/// the caller's when it names another, each only when known. A superset of
-/// either, never a narrowing: a scratch `HOME` adds its own home and takes
-/// nothing of the account's away.
+/// The homes a lab guards, from the account's home (`account`, the account database's) and the caller's `HOME` (`caller`).
 #[must_use]
 pub fn guarded(account: &str, caller: &str) -> Vec<String> {
     let mut homes: Vec<String> = Vec::new();
@@ -565,7 +481,6 @@ pub fn guarded(account: &str, caller: &str) -> Vec<String> {
 }
 
 /// A home fence must name an existing physical directory exactly, never a
-/// lossy replacement of its name or the whole filesystem.
 fn home_path(path: Option<&Path>) -> String {
     path.filter(|p| p.is_absolute() && *p != Path::new("/") && p.to_str().is_some())
         .and_then(|p| std::fs::canonicalize(p).ok())
@@ -574,7 +489,7 @@ fn home_path(path: Option<&Path>) -> String {
         .unwrap_or_default()
 }
 
-/// A path that may go into a sandbox profile: no quote, backslash or control character.
+/// A path that may go into a sandbox profile.
 #[must_use]
 pub fn profile_safe(s: &str) -> bool {
     !s.chars().any(|c| c == '"' || c == '\\' || c.is_control())
@@ -651,8 +566,6 @@ mod tests {
         use std::os::unix::ffi::OsStrExt as _;
         let owned = aterm_tempfile::tempdir().unwrap();
         let bytes = owned.path().join(std::ffi::OsStr::from_bytes(b"home-\xff"));
-        // Reject the input without requiring this filesystem to support a
-        // non-UTF8 directory name in the first place.
         assert!(
             home_path(Some(&bytes)).is_empty(),
             "a fence cannot use a lossy name"
@@ -660,8 +573,6 @@ mod tests {
     }
 
     /// The homes a lab guards are a superset, never a narrowing: the
-    /// account's first, then the caller's `HOME` when it names another, each
-    /// once, an unknown one left out.
     #[test]
     fn the_guarded_homes_are_the_account_s_and_home_s_each_once() {
         assert_eq!(guarded("/Users//o", "/tmp/s"), ["/Users//o", "/tmp/s"]);
@@ -672,12 +583,6 @@ mod tests {
     }
 
     /// THE ACCOUNT'S HOME IS RESOLVED FROM THE ACCOUNT DATABASE, NOT `HOME`: a
-    /// fake account home handed in through the seam ([`Paths::resolve_with`])
-    /// is guarded beside a scratch `HOME`, by its physical path, and is the
-    /// package store's home. NEGATIVE CONTROLS: with no account home known
-    /// (or one that names no directory) only `$HOME` is guarded and holds the
-    /// store, `HOME` the account's own is no scratch home, and with neither
-    /// the lab has no home to guard.
     #[test]
     fn a_fake_account_home_is_guarded_beside_a_scratch_home() {
         let top = aterm_tempfile::Builder::new()
@@ -703,7 +608,6 @@ mod tests {
         assert_eq!(p.store_home(), a);
         assert_eq!(p.need_home(), Ok(a.as_str()));
         assert!(p.scratch_home());
-        // NEGATIVE CONTROLS
         let own = Paths::resolve_with(Some(account.clone()), Some(account.clone().into()));
         assert_eq!(own.guarded_homes(), std::slice::from_ref(&a));
         assert!(
@@ -724,13 +628,6 @@ mod tests {
     }
 
     /// THE LAB'S OWN FACTS ([`paths`]) TAKE THE ACCOUNT'S HOME FROM THE
-    /// ACCOUNT DATABASE: whatever `HOME` the test runs under (a scratch one,
-    /// by this repository's rule, or the account's own), `real_home` is the
-    /// home `getpwuid_r` names, by its physical path; it is guarded, holds the
-    /// store, and `caller_home` is `HOME`'s. Only the paths are compared:
-    /// nothing under the account's home is read. NEGATIVE CONTROL: the same
-    /// facts resolved without the account database (`HOME` alone, the lab
-    /// before the fence) name no account home, which the jail refuses.
     #[test]
     fn the_lab_s_own_paths_take_the_account_home_from_the_account_database() {
         let want = home_path(aterm_uds::account::home().as_deref());
@@ -750,16 +647,11 @@ mod tests {
             p.scratch_home(),
             !p.caller_home.is_empty() && p.caller_home != want
         );
-        // NEGATIVE CONTROL
         let env_only = Paths::resolve_with(None, std::env::var_os("HOME"));
         assert!(env_only.real_home.is_empty() && env_only.need_home().is_err());
     }
 
     /// THE DEFAULT STATE DIR SITS OUTSIDE EVERY HOME, SHORT AND PER CHECKOUT:
-    /// `/private/tmp/at.lab-<uid>/<name>-<hash>`, the name the checkout's own
-    /// in safe letters (at most 16), the hash its whole path's, so two
-    /// worktrees of one name differ; the longest is 56 bytes. NEGATIVE
-    /// CONTROL: the same checkout path gives the same key.
     #[test]
     fn the_default_state_sits_outside_every_home_short_and_per_checkout() {
         let a = default_state(501, Path::new("/Users//o/Developer/aterm"));
@@ -787,7 +679,6 @@ mod tests {
                 .starts_with("/private/tmp/at.lab-4294967295/a-checkout-whose-")
         );
         assert_eq!(long.as_os_str().len(), 56, "{}", long.display());
-        // the lab's own facts take it when LAB_STATE is unset
         let p = paths();
         if std::env::var_os("LAB_STATE").is_none_or(|s| s.is_empty()) {
             assert!(p.state_default);
@@ -823,10 +714,6 @@ mod tests {
     }
 
     /// THE DEFAULT STATE DIR IS MADE THIS USER'S PRIVATE DIRECTORY: its root
-    /// and its own directory are made 0700, and a looser root of this user's
-    /// is narrowed. NEGATIVE CONTROLS: a link in the root's place, a file
-    /// there, and a root another user owns (the uid seam) are each refused,
-    /// naming `LAB_STATE`; a named `$LAB_STATE` is left as it is.
     #[test]
     fn the_default_state_is_made_private_and_a_squatted_root_is_refused() {
         use std::os::unix::fs::PermissionsExt as _;
@@ -841,7 +728,6 @@ mod tests {
         std::fs::set_permissions(t.0.join("root"), std::fs::Permissions::from_mode(0o755)).unwrap();
         p.make_default_state().unwrap();
         assert_eq!(mode(&t.0.join("root")), 0o700, "a looser root is narrowed");
-        // NEGATIVE CONTROLS
         std::fs::create_dir_all(t.0.join("elsewhere")).unwrap();
         std::os::unix::fs::symlink(t.0.join("elsewhere"), t.0.join("linked")).unwrap();
         p.state = t.0.join("linked/key");
@@ -872,13 +758,6 @@ mod tests {
     }
 
     /// THE STATE DIR A VERB MAKES THINGS IN IS MADE PRIVATE FIRST, whichever
-    /// verb asks ([`Paths::need_state`]): `fleet-sim` skips the lab's
-    /// up-front check and writes its record under `need_state()`, so a link
-    /// planted at the default's root in the shared `/private/tmp` is refused
-    /// there and nothing is made through it, and a fresh default comes back
-    /// made, mode 0700. NEGATIVE CONTROLS: the same calls on a named
-    /// `$LAB_STATE` make nothing and go through, a relative one is refused,
-    /// and [`Paths::need_state_outside`] (a check) makes nothing.
     #[test]
     fn the_state_a_verb_makes_things_in_is_made_private_first() {
         let t = tree("need");
@@ -900,7 +779,6 @@ mod tests {
         assert!(!t.0.join("root").exists(), "a check makes nothing");
         assert_eq!(p.need_state().unwrap(), t.0.join("root/key"));
         assert_eq!((mode(&t.0.join("root")), mode(&p.state)), (0o700, 0o700));
-        // NEGATIVE CONTROLS
         p.state_default = false;
         p.state = t.0.join("named/key");
         assert_eq!(p.need_state().unwrap(), t.0.join("named/key"));
@@ -913,10 +791,6 @@ mod tests {
     }
 
     /// A STATE DIR INSIDE A FENCED HOME IS REFUSED: in the account's home,
-    /// in a scratch `HOME`, the home itself, and a path outside that leads in
-    /// by a link, each naming the home and the default. NEGATIVE CONTROLS: a
-    /// directory outside both homes and a sibling whose name only starts like
-    /// the home's go through.
     #[test]
     fn a_state_dir_inside_a_home_is_refused_and_one_outside_goes_through() {
         let t = tree("inside");
@@ -943,7 +817,6 @@ mod tests {
                 "{err}"
             );
         }
-        // NEGATIVE CONTROLS
         for state in [t.0.join("outside"), t.0.join("account2/state")] {
             p.state = state.clone();
             assert_eq!(p.need_state_outside(&homes), Ok(state.as_path()));

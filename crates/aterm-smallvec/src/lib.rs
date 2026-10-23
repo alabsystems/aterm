@@ -1,90 +1,12 @@
 // Copyright 2026 Andrew Yates
 // Copyright (c) 2018 The Servo Project Developers
 // SPDX-License-Identifier: Apache-2.0
-//
-// Derived in part from smallvec 1.15.1 (https://github.com/servo/rust-smallvec,
-// MIT OR Apache-2.0, used here under Apache-2.0): the `smallvec!` macro is
-// upstream's, and `retain`, `drain`'s bounds, `reserve`, `reserve_exact`,
-// `resize`, `resize_with`, `from_elem` and `clone_from` follow upstream's
-// algorithms. Modified by the aterm project in 2026: the vector is
-// aterm_alloc's and everything here is safe code over it.
 
-//! `smallvec`: aterm's first-party replacement for the upstream `smallvec` 1.x
-//! crate. The vector itself is [`aterm_alloc::SmallVec<T, N>`]; this crate
-//! gives it upstream's `SmallVec<[T; N]>` spelling and the rest of the 1.x API
-//! that aterm's graph calls.
-//!
-//! It is published into the build under the package name `smallvec` (the
-//! directory is `crates/aterm-smallvec`) so that `[patch.crates-io]` can
-//! redirect the third-party consumers at code aterm owns:
-//!
-//! - `parking_lot_core`, `wgpu`, `wgpu-core` and `wgpu-hal` wherever wgpu
-//!   compiles (linux, win, wasm-gpu, and the macOS `wgpu-oracle` test graph);
-//! - `wayland-backend` on linux, which re-exports the crate
-//!   (`wayland_backend::smallvec`) and puts the type in its public
-//!   `Message::args`, so `wayland-client`, the scanner's generated protocol code
-//!   and `smithay-client-toolkit` name it too.
-//!
-//! # How `SmallVec<[T; N]>` wraps `SmallVec<T, N>` on stable Rust
-//!
-//! Upstream's type is generic over an array type `A: Array`, aterm_alloc's over
-//! an element type and a `const N`. Writing the wrapper as
-//! `SmallVec<A::Item, { A::SIZE }>` needs `generic_const_exprs`. This crate
-//! does not take that route. [`Array`] carries an associated TYPE, `Store`,
-//! and the impl for `[T; N]`, where `N` is in scope, names
-//! `aterm_alloc::SmallVec<T, N>` as that type. [`SmallVec<A>`] holds an
-//! `A::Store` and forwards to it through the hidden [`Store`] trait. Everything
-//! else is composed from those forwarding calls in safe code: the crate is
-//! `#![forbid(unsafe_code)]`, and every `MaybeUninit` this vector touches is
-//! aterm_alloc's, under that crate's Trust gate.
-//!
-//! # Where this is NOT exactly upstream
-//!
-//! The contents, lengths, panics and element drop order match upstream 1.15.1.
-//! `tests/upstream_transcript.rs` replays a script recorded from the registry
-//! crate, and `tests/differential.rs` runs a `Vec` model of upstream's contract
-//! op for op. `spilled()` matches too, including `from_vec`'s rule that a `Vec`
-//! with more capacity than the inline buffer stays on the heap. The
-//! differences, none of which a consumer in the graph depends on:
-//!
-//! * **Heap capacity.** Upstream grows a spilled vector to the next power of
-//!   two; here the first spill reserves twice the inline size and `Vec` grows
-//!   it after that. `capacity() >= len()` holds either way, and an unspilled
-//!   vector reports `inline_size()` in both. An oversized `reserve` that would
-//!   abort upstream with an allocation failure is capped here by aterm_alloc's
-//!   16 Mi-element bound on the advisory allocation instead.
-//! * **`size_of`.** The storage is aterm_alloc's enum, not upstream's union.
-//!   No consumer asserts a size or puts the type in a `#[repr(C)]` struct.
-//! * **Zero-sized items.** Upstream never spills them (its inline capacity is
-//!   `usize::MAX` for a zero-sized `T`); here they spill past `N` like any
-//!   other item. No consumer stores a zero-sized type.
-//! * **A leaked `Drain`.** Upstream leaves the vector cut to the drain's start
-//!   and leaks the rest. Here [`SmallVec::drain`] moves the drained range to
-//!   the end (reversed) and pops from there, so a `mem::forget`-ed `Drain`, or
-//!   one whose element destructor panics, leaves those elements in the vector
-//!   rather than leaking them. Both are memory-safe; nothing in the graph
-//!   forgets a `Drain`.
-//! * **`insert` past the end of a full inline vector.** Upstream spills before
-//!   it checks the index and then panics; here it panics with the vector
-//!   untouched.
-//! * **`into_vec`** moves the items into a new `Vec` (of the same capacity,
-//!   when spilled) instead of handing over the heap buffer, so it costs a move
-//!   per item.
-//! * **Variance.** `SmallVec<A>` is invariant in `A` (the field is a
-//!   projection); upstream's is covariant. Every consumer compiles either way.
-//! * **Absent API.** Only what the graph calls is here. Upstream's `from_buf`,
-//!   `into_inner`, `insert_many`, `dedup*`, `append`, `try_reserve`,
-//!   `ToSmallVec`, `smallvec_inline!`, `io::Write` and the serde impls are not.
-//!   A consumer that starts calling one fails to compile; it does not change
-//!   behaviour.
-//!
-//! The four features consumers request (`union`, `const_generics`,
-//! `const_new`, `serde`) are declared and inert; see the manifest.
+//! `smallvec`: aterm's first-party replacement for the upstream `smallvec` 1.x crate.
 
 #![no_std]
 #![forbid(unsafe_code)]
 
-// `smallvec!` spells the heap arm `$crate::alloc::vec!`, as upstream's does.
 #[doc(hidden)]
 pub extern crate alloc;
 
@@ -98,22 +20,8 @@ use core::ops::{Bound, Deref, DerefMut, Index, IndexMut, RangeBounds};
 use core::slice::{self, SliceIndex};
 
 /// Creates a [`SmallVec`] containing the arguments, as `vec!` does a `Vec`.
-///
-/// Upstream's macro, verbatim: up to `inline_size()` listed elements are pushed
-/// inline; more go through `from_vec(vec![..])`; `smallvec![elem; n]` is
-/// `from_elem`.
-///
-/// ```
-/// use smallvec::{smallvec, SmallVec};
-/// let v: SmallVec<[u8; 4]> = smallvec![1, 2, 3];
-/// assert_eq!(&v[..], &[1, 2, 3]);
-/// assert!(!v.spilled());
-/// let w: SmallVec<[u8; 2]> = smallvec![7; 3];
-/// assert!(w.spilled());
-/// ```
 #[macro_export]
 macro_rules! smallvec {
-    // count helper: transform any expression into 1
     (@one $x:expr) => (1usize);
     () => (
         $crate::SmallVec::new()
@@ -133,12 +41,7 @@ macro_rules! smallvec {
     });
 }
 
-/// The inline buffer type of a [`SmallVec`]: implemented for `[T; N]` for
-/// every `N`.
-///
-/// Upstream's trait is `unsafe` because its `SmallVec` reads raw storage
-/// through it. Nothing here does, so this one is safe; no consumer implements
-/// it.
+/// The inline buffer type of a [`SmallVec`].
 pub trait Array {
     /// The element type.
     type Item;
@@ -158,8 +61,7 @@ impl<T, const N: usize> Array for [T; N] {
     }
 }
 
-/// The operations [`SmallVec`] forwards to its storage. Implemented only for
-/// `aterm_alloc::SmallVec<T, N>`; public because [`Array::Store`] names it.
+/// The operations [`SmallVec`] forwards to its storage.
 #[doc(hidden)]
 pub trait Store: Sized {
     type Item;
@@ -231,8 +133,7 @@ impl<T, const N: usize> Store for aterm_alloc::SmallVec<T, N> {
     }
 }
 
-/// A vector that keeps up to `A::size()` items inline and spills to the heap
-/// past that. `SmallVec<[T; N]>` is `aterm_alloc::SmallVec<T, N>`.
+/// A vector that keeps up to `A::size()` items inline and spills to the heap past that.
 pub struct SmallVec<A: Array> {
     store: A::Store,
 }
@@ -246,8 +147,7 @@ impl<A: Array> SmallVec<A> {
         }
     }
 
-    /// An empty vector with room for `n` items: inline when `n` fits the
-    /// array, otherwise spilled with a heap buffer of that size.
+    /// An empty vector with room for `n` items.
     #[inline]
     pub fn with_capacity(n: usize) -> Self {
         SmallVec {
@@ -255,11 +155,9 @@ impl<A: Array> SmallVec<A> {
         }
     }
 
-    /// Takes over `vec`. As upstream: a `Vec` whose CAPACITY fits the array is
-    /// moved inline; any other stays on the heap, even when its length fits.
+    /// Takes over `vec`.
     pub fn from_vec(vec: Vec<A::Item>) -> SmallVec<A> {
         let store = if vec.len() <= A::size() && vec.capacity() > A::size() {
-            // aterm_alloc would move these inline; upstream keeps them spilled.
             let mut store = A::Store::with_capacity(vec.capacity());
             for item in vec {
                 store.push(item);
@@ -289,8 +187,7 @@ impl<A: Array> SmallVec<A> {
         self.store.is_empty()
     }
 
-    /// The number of items the vector holds without reallocating:
-    /// `inline_size()` until it spills.
+    /// The number of items the vector holds without reallocating.
     #[inline]
     pub fn capacity(&self) -> usize {
         self.store.capacity()
@@ -317,7 +214,6 @@ impl<A: Array> SmallVec<A> {
     /// Inserts `element` at `index`, shifting the items after it right.
     ///
     /// # Panics
-    ///
     /// If `index > len`.
     pub fn insert(&mut self, index: usize, element: A::Item) {
         let len = self.len();
@@ -326,11 +222,9 @@ impl<A: Array> SmallVec<A> {
         self.store.as_mut_slice()[index..].rotate_right(1);
     }
 
-    /// Removes and returns the item at `index`, shifting the items after it
-    /// left.
+    /// Removes and returns the item at `index`, shifting the items after it left.
     ///
     /// # Panics
-    ///
     /// If `index >= len`.
     pub fn remove(&mut self, index: usize) -> A::Item {
         let len = self.len();
@@ -342,11 +236,9 @@ impl<A: Array> SmallVec<A> {
         }
     }
 
-    /// Removes and returns the item at `index`, moving the last item into its
-    /// place.
+    /// Removes and returns the item at `index`, moving the last item into its place.
     ///
     /// # Panics
-    ///
     /// If `index >= len`.
     pub fn swap_remove(&mut self, index: usize) -> A::Item {
         let len = self.len();
@@ -361,8 +253,7 @@ impl<A: Array> SmallVec<A> {
         }
     }
 
-    /// Keeps the first `len` items and drops the rest, last first. Does not
-    /// reallocate.
+    /// Keeps the first `len` items and drops the rest, last first.
     #[inline]
     pub fn truncate(&mut self, len: usize) {
         while self.len() > len {
@@ -376,9 +267,7 @@ impl<A: Array> SmallVec<A> {
         self.truncate(0);
     }
 
-    /// Keeps the items for which `f` returns `true`, in order. `f` sees each
-    /// item once, mutably, front to back; the rejected ones are dropped
-    /// afterwards. Upstream's algorithm, so the drop order is upstream's.
+    /// Keeps the items for which `f` returns `true`, in order.
     pub fn retain<F: FnMut(&mut A::Item) -> bool>(&mut self, mut f: F) {
         let mut del = 0;
         let len = self.len();
@@ -399,7 +288,7 @@ impl<A: Array> SmallVec<A> {
         self.retain(f);
     }
 
-    /// Makes the length `new_len`: truncates, or appends `f()` until it fits.
+    /// Makes the length `new_len`.
     pub fn resize_with<F>(&mut self, new_len: usize, f: F)
     where
         F: FnMut() -> A::Item,
@@ -417,11 +306,9 @@ impl<A: Array> SmallVec<A> {
         }
     }
 
-    /// Makes room for `additional` more items, rounding the new capacity up
-    /// to a power of two.
+    /// Makes room for `additional` more items, rounding the new capacity up to a power of two.
     ///
     /// # Panics
-    ///
     /// If the new capacity overflows `usize`.
     pub fn reserve(&mut self, additional: usize) {
         let len = self.len();
@@ -438,7 +325,6 @@ impl<A: Array> SmallVec<A> {
     /// Makes room for exactly `additional` more items.
     ///
     /// # Panics
-    ///
     /// If the new capacity overflows `usize`.
     pub fn reserve_exact(&mut self, additional: usize) {
         let len = self.len();
@@ -450,8 +336,6 @@ impl<A: Array> SmallVec<A> {
     }
 
     /// Moves the items into fresh storage with room for `new_cap`. Called only
-    /// with `new_cap` above the current capacity, which is at least the inline
-    /// size, so the new storage is a heap buffer.
     fn regrow(&mut self, new_cap: usize) {
         let old = core::mem::replace(&mut self.store, A::Store::with_capacity(new_cap));
         for item in old.into_iter() {
@@ -472,17 +356,9 @@ impl<A: Array> SmallVec<A> {
     }
 
     /// Removes the items in `range` and yields them by value, front to back.
-    /// Items the `Drain` has not yielded when it drops are dropped then, in
-    /// order.
-    ///
-    /// The drained range is moved to the end of the vector, reversed, when
-    /// the `Drain` is made, so each `next` is a `pop`. See the crate docs for
-    /// what that means for a leaked `Drain`.
     ///
     /// # Panics
-    ///
-    /// If the start is greater than the end, or the end is greater than the
-    /// length.
+    /// If the start is greater than the end, or the end is greater than the length.
     pub fn drain<R>(&mut self, range: R) -> Drain<'_, A>
     where
         R: RangeBounds<usize>,
@@ -501,7 +377,6 @@ impl<A: Array> SmallVec<A> {
         assert!(start <= end);
         assert!(end <= len);
 
-        // [head | d0 .. dk | tail] -> [head | tail | dk .. d0]
         let items = self.store.as_mut_slice();
         items[start..end].reverse();
         items[start..].rotate_left(end - start);
@@ -511,8 +386,7 @@ impl<A: Array> SmallVec<A> {
         }
     }
 
-    /// The items as a `Vec`. A spilled vector's `Vec` keeps its capacity, as
-    /// upstream's (which hands over the buffer itself) does.
+    /// The items as a `Vec`.
     pub fn into_vec(self) -> Vec<A::Item> {
         if self.spilled() {
             let mut vec = Vec::with_capacity(self.capacity());
@@ -528,8 +402,7 @@ impl<A: Array> SmallVec<A>
 where
     A::Item: Copy,
 {
-    /// A vector holding a copy of `slice`: inline when it fits, otherwise a
-    /// heap buffer of exactly its length.
+    /// A vector holding a copy of `slice`.
     pub fn from_slice(slice: &[A::Item]) -> Self {
         let mut vec: Self = SmallVec::with_capacity(slice.len());
         for item in slice {
@@ -551,7 +424,7 @@ impl<A: Array> SmallVec<A>
 where
     A::Item: Clone,
 {
-    /// Makes the length `len`: truncates, or appends clones of `value`.
+    /// Makes the length `len`.
     #[allow(
         clippy::manual_repeat_n,
         reason = "upstream clones `value` once per new item and drops it; `repeat_n` would move it into the last slot instead, which a `Clone`/`Drop` with side effects can see"
@@ -565,9 +438,7 @@ where
         }
     }
 
-    /// `n` clones of `elem`. As upstream: past the inline size this is
-    /// `vec![elem; n]` moved onto the heap; within it, `n` clones pushed
-    /// inline and `elem` dropped.
+    /// `n` clones of `elem`.
     pub fn from_elem(elem: A::Item, n: usize) -> Self {
         if n > A::size() {
             SmallVec::from_vec(alloc::vec![elem; n])
@@ -582,8 +453,7 @@ where
 }
 
 impl<T, const N: usize> SmallVec<[T; N]> {
-    /// [`SmallVec::new`] in a `const` context (upstream's `const_new`
-    /// feature; always present here).
+    /// [`SmallVec::new`] in a `const` context (upstream's `const_new` feature; always present here).
     #[inline]
     pub const fn new_const() -> Self {
         SmallVec {
@@ -709,14 +579,12 @@ where
     A::Item: Clone,
 {
     /// As upstream: a clone of a spilled vector whose items fit inline is
-    /// inline.
     #[inline]
     fn clone(&self) -> SmallVec<A> {
         SmallVec::from(self.as_slice())
     }
 
     fn clone_from(&mut self, source: &Self) {
-        // Drop anything that will not be overwritten, reuse the rest.
         self.truncate(source.len());
         let (init, tail) = source.split_at(self.len());
         self.clone_from_slice(init);
@@ -768,7 +636,6 @@ where
 }
 
 /// An iterator that consumes a [`SmallVec`] and yields its items by value.
-/// Items it has not yielded when it drops are dropped then, in order.
 pub struct IntoIter<A: Array> {
     iter: <A::Store as Store>::IntoIter,
 }
@@ -829,7 +696,6 @@ impl<'a, A: Array> IntoIterator for &'a mut SmallVec<A> {
 pub struct Drain<'a, A: Array> {
     vec: &'a mut SmallVec<A>,
     /// The items not yet yielded: the last `remaining` items of `vec`, in
-    /// reverse order, so the next one is `vec`'s last.
     remaining: usize,
 }
 
@@ -857,7 +723,6 @@ impl<A: Array> DoubleEndedIterator for Drain<'_, A> {
         if self.remaining == 0 {
             return None;
         }
-        // The back of the drained range sits first in the reversed run.
         let at = self.vec.len() - self.remaining;
         self.remaining -= 1;
         Some(self.vec.remove(at))
@@ -870,7 +735,6 @@ impl<A: Array> FusedIterator for Drain<'_, A> {}
 
 impl<A: Array> Drop for Drain<'_, A> {
     /// Drops the items not yielded, front to back (the reversed run's last
-    /// first), leaving `[head | tail]`.
     fn drop(&mut self) {
         let keep = self.vec.len() - self.remaining;
         self.remaining = 0;

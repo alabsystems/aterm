@@ -1,16 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-// The fx layers on the CPU renderer (`docs/DESIGN-card-engine-2026-10-19.md` §4,
-// §7 "B, the primitive"), end to end through `Renderer`: the damaged path
-// restamps only a dirty band's slice of a layer spanning three rows; several
-// occluders compose; an fx rect under the glyphs is the glow_under quad stack
-// it replaces; each slot sits where the GPU will draw it; Grid space is Window
-// space at the grid origin; a Straight sprite is the FreeSprite stamp; and over
-// random frame sequences the damaged path equals a full render. The rasterizer's
-// own laws (run lists, slicing, the nearest map) are `fx_raster`'s unit tests;
-// the empty-channel no-op is a row of `tests/empty_channels.rs`.
-
 use std::sync::Arc;
 
 use aterm_core::render::{
@@ -26,8 +16,6 @@ use aterm_render::{
 fn renderer() -> Renderer {
     let mut r = Renderer::from_system(18.0, Theme::default())
         .expect("no font: build with aterm-render's default embedded-font feature");
-    // Deterministic pixels: a lazy fallback parse landing between two renders
-    // could recolour a frame under comparison.
     r.debug_block_on_lazy_fallbacks();
     r
 }
@@ -92,14 +80,6 @@ fn straight_art(w: u16, h: u16) -> Arc<FxArt> {
 }
 
 /// THE DIRTY-BAND LAW, through the renderer: frame A draws layers of every
-/// slot spanning rows 1..=3; frame B changes only row 2's text with the same
-/// layer `Arc`s. B is a `Rows` frame repainting row 2 alone, and its pixels
-/// equal a full render of B: each layer's row-2 slice was restamped over the
-/// rebuilt band and rows 1 and 3 kept their light, taken once.
-///
-/// The negative control is a mutation (run by hand, recorded in the lane
-/// report): passing `None` as the damaged path's gate double-adds the light
-/// on rows 1 and 3 and fails this test.
 #[test]
 fn a_dirty_band_restamps_only_its_slice_of_a_spanning_layer() {
     let mut rend = renderer();
@@ -176,10 +156,6 @@ fn a_dirty_band_restamps_only_its_slice_of_a_spanning_layer() {
 }
 
 /// OCCLUDERS COMPOSE, through the renderer: three overlapping chrome rects
-/// (a band, a menu card, a tab menu) each keep the bare frame's pixels, and
-/// every other pixel takes the layer's light exactly once.
-///
-/// CONTROL: with only the first occluder, light lands inside the other two.
 #[test]
 fn occluders_compose_over_a_window_layer() {
     let mut rend = renderer();
@@ -235,10 +211,6 @@ fn occluders_compose_over_a_window_layer() {
 }
 
 /// An fx rect under the glyphs IS the glow_under quad stack the card draws
-/// today: one rect spanning three rows renders byte for byte as the producer's
-/// per-row split, gradient and opacity included.
-///
-/// CONTROL: the same rect at the Over slot (above the glyph ink) differs.
 #[test]
 fn an_under_fx_rect_is_the_glow_under_stack_it_replaces() {
     let mut rend = renderer();
@@ -326,24 +298,12 @@ fn frame_of(
 }
 
 /// EACH SLOT SITS WHERE THE GPU DRAWS IT. An opaque fx rect is a store, so
-/// whatever a stream drew BEFORE it in the rect vanishes and whatever it
-/// draws AFTER shows:
-///
-/// * Under: below the glyph ink (ink shows through an opaque Under rect,
-///   never through an Over one), after glow_under, before the fire body.
-/// * Glow: after the aurora (`cursor_glow_add`), before the glow halo.
-/// * Over: after the nova, before the rain halos.
-/// * Linear Under / Over: right after the free sprites of their z.
-///
-/// Each "after" leg is also its own control: the stream under test changes
-/// the frame when drawn alone, so an order swap would show.
 #[test]
 fn each_slot_sits_where_the_gpu_draws_it() {
     let mut rend = renderer();
     let (cw, ch) = rend.cell_size();
     let (pad, top) = (rend.pad(), rend.grid_top());
     let mut t = term(4, 14);
-    // The rect: rows 1..=2, columns 1..=8, in window pixels.
     let (x, y, w, h) = (pad + cw, top + ch, 8 * cw, 2 * ch);
     let solid = 0x0040_5060;
     let store = |slot| {
@@ -357,7 +317,6 @@ fn each_slot_sits_where_the_gpu_draws_it() {
         )
     };
     let fw = rend.render_input(&t.cell_frame(4, 14)).width;
-    // A light quad strictly inside the rect, window pixels, on row 1.
     let light = GlowQuad {
         row: 1,
         x: (x + 2) as u16,
@@ -381,7 +340,6 @@ fn each_slot_sits_where_the_gpu_draws_it() {
         ry: ch as u16,
         ..Default::default()
     };
-    // A flame body on the same rows, rooted at the rect's row-1 bottom.
     let fire = FirePatch {
         row: 1,
         x: (x + 2) as u16,
@@ -396,7 +354,6 @@ fn each_slot_sits_where_the_gpu_draws_it() {
         cell_h: ch as u16,
         ..Default::default()
     };
-    // Grid-interior twins for the nova and rain streams.
     let grid_light = GlowQuad {
         x: light.x - pad as u16,
         y: light.y - top as u16,
@@ -410,7 +367,6 @@ fn each_slot_sits_where_the_gpu_draws_it() {
         ..halo
     };
 
-    // Under: the ink shows through; Over: the rect is solid.
     let under = frame_of(&mut rend, &mut t, &[store(FxSlot::Under)], |_| {});
     let over = frame_of(&mut rend, &mut t, &[store(FxSlot::Over)], |_| {});
     let area = (x, y, w, h);
@@ -473,8 +429,6 @@ fn each_slot_sits_where_the_gpu_draws_it() {
         }
     }
 
-    // Linear: an opaque free sprite under an opaque Straight fx sprite at the
-    // same place shows the fx sprite, at both z.
     let art = Arc::new(
         FxArt::new(
             2,
@@ -542,10 +496,6 @@ fn each_slot_sits_where_the_gpu_draws_it() {
 }
 
 /// GRID SPACE IS WINDOW SPACE AT THE GRID ORIGIN: a Grid layer (offset, clip
-/// and items) renders as the Window layer shifted by `(pad, grid_top)`, under
-/// a padded grid with a head band.
-///
-/// CONTROL: the Window layer left unshifted is another frame.
 #[test]
 fn grid_space_is_window_space_at_the_grid_origin() {
     let mut rend = renderer();
@@ -620,10 +570,6 @@ fn grid_space_is_window_space_at_the_grid_origin() {
 }
 
 /// THE LINEAR LAW IS FREESPRITE'S, through the renderer: a Grid-space
-/// Straight sprite at a 1:1 and an integer scale renders byte for byte as the
-/// FreeSprite of the same texels, tint and opacity at the matching z.
-///
-/// CONTROL: the fx sprite at the other z is another frame.
 #[test]
 fn a_linear_fx_sprite_is_the_free_sprite_stamp() {
     let mut rend = renderer();
@@ -716,7 +662,6 @@ impl Rng {
 }
 
 /// A random premultiplied art: additive texels (`a = 0` with colour), clear,
-/// opaque and translucent ones.
 fn premul_art(rng: &mut Rng) -> Arc<FxArt> {
     let (w, h) = (rng.range(1, 5) as u16, rng.range(1, 5) as u16);
     let mut data = Vec::new();
@@ -733,7 +678,6 @@ fn premul_art(rng: &mut Rng) -> Arc<FxArt> {
 }
 
 /// A sprite clip: none, or a box around the sprite's own origin (content
-/// space, so it moves with the layer).
 fn sprite_clip(rng: &mut Rng, x: i32, y: i32) -> PxRect {
     if rng.below(3) == 0 {
         PxRect::new(
@@ -748,9 +692,6 @@ fn sprite_clip(rng: &mut Rng, x: i32, y: i32) -> PxRect {
 }
 
 /// A random well-formed layer: an all-additive or all-over palette (so every
-/// rect is one kind at both ends), rects, ramps, Index8 and Premul sprites
-/// for an Exact layer, Straight sprites for a Linear one, items anywhere
-/// around the grid, sprites sometimes clipped, the layer sometimes clipped.
 fn random_layer(rng: &mut Rng, id: u64, cw: usize, ch: usize) -> FxLayer {
     let linear = rng.below(4) == 0;
     let additive = rng.below(2) == 0;
@@ -854,14 +795,6 @@ fn random_layer(rng: &mut Rng, id: u64, cw: usize, ch: usize) -> FxLayer {
 }
 
 /// THE DAMAGED PATH EQUALS A FULL RENDER over random frame sequences: layers
-/// kept (same `Arc`s), replaced, moved, added and dropped, occluders toggled,
-/// and text changed on random rows, every frame of the cached path is
-/// byte-equal to a fresh full render, and the sequence reaches `Rows` frames
-/// that slice live layers.
-///
-/// The negative control is a mutation (run by hand, recorded in the lane
-/// report): dropping the fx clause from `compute_dirty_rows`' reuse test lets
-/// a moved layer keep its stale light and fails this test.
 #[test]
 fn the_damaged_path_equals_a_full_render_over_fx_sequences() {
     let mut rend = renderer();
@@ -929,14 +862,6 @@ fn the_damaged_path_equals_a_full_render_over_fx_sequences() {
 }
 
 /// A HISTORY SCROLL NEVER SLIDES A LAYER'S LIGHT: with layers held still (the
-/// same `Arc`s) over a scrolling viewport, every cached frame equals a full
-/// render. The layers never refuse the whole-row blit (design §4.4): the
-/// scroll planner marks the bands their light was slid to and the bands it
-/// lands on, and the damaged tail rebuilds both over the slid pixels.
-///
-/// The negative control is a mutation (run by hand, recorded in the lane
-/// report): dropping `fx_damage::mark_fx_scroll` from `scroll_shift_plan`
-/// leaves the light the blit slid with the text and fails this test.
 #[test]
 fn a_history_scroll_never_slides_a_layers_light() {
     let mut rend = renderer();
@@ -981,7 +906,6 @@ fn a_history_scroll_never_slides_a_layers_light() {
 }
 
 /// The rows of a `rows`-row frame `h` pixels tall whose bands (the renderer's
-/// own band rule) window pixel rows `[y0, y1)` reach.
 fn rows_reached(rend: &Renderer, rows: usize, h: usize, (y0, y1): (i32, i32)) -> Vec<usize> {
     (0..rows)
         .filter(|&r| {
@@ -1010,17 +934,6 @@ fn union(sets: &[&[usize]]) -> Vec<usize> {
 }
 
 /// THE FX ARM OF THE SHARED DAMAGE SEAM (design §4.4), under a padded grid
-/// with a head band so Window and Grid space map to rows differently: a layer
-/// that MOVED, CHANGED (a new `Arc`), was re-CLIPPED, APPEARED or VANISHED marks
-/// exactly the bands of its previous and current extent; layers equal by
-/// identity mark nothing and the frame gate-hits; a reorder marks the
-/// reordered layers; an occluder change marks the bands where it meets a
-/// layer, and nothing (a gate hit) with no layer on either side. Each case's
-/// cached frame then equals a full render.
-///
-/// The negative control is a mutation (run by hand, recorded in the lane
-/// report): marking only the CURRENT extent of a changed or vanished layer
-/// leaves its old light as a ghost in the cached frame and fails this test.
 #[test]
 fn compute_dirty_rows_tracks_fx_layers() {
     let mut rend = renderer();
@@ -1045,9 +958,7 @@ fn compute_dirty_rows_tracks_fx_layers() {
             FxBlend::Exact,
         )
     };
-    // Window space: the lower half of row 2 and the upper half of row 3.
     let a = glow(1, top + 2 * chi + chi / 2, 0x0030_2010);
-    // Grid space: inside row 6.
     let b = layer(
         2,
         vec![rect(cw as i32, 6 * chi + 2, 4 * cw, ch - 4, 0)],
@@ -1056,7 +967,6 @@ fn compute_dirty_rows_tracks_fx_layers() {
         FxSpace::Grid,
         FxBlend::Exact,
     );
-    // Window space in the head band, above the grid: row 0's band holds it.
     let c = layer(
         3,
         vec![rect(0, 1, 9 * cw, 4, 0)],
@@ -1080,7 +990,6 @@ fn compute_dirty_rows_tracks_fx_layers() {
     let changed = glow(1, top + 2 * chi + chi / 2, 0x0010_3020);
     let mut clipped = a.clone();
     clipped.clip = PxRect::new(i32::MIN, i32::MIN, i32::MAX, top + 3 * chi);
-    // An occluder over rows 3..=4, full width: it meets `a` on row 3 alone.
     let occ = PxRect::new(i32::MIN, top + 3 * chi, i32::MAX, top + 5 * chi);
 
     type Frame<'a> = (&'a [FxLayer], &'a [PxRect]);
@@ -1174,8 +1083,6 @@ fn compute_dirty_rows_tracks_fx_layers() {
         let DirtyDecision::Rows(v) = d else {
             panic!("{name}: the fx arm never forces a full repaint");
         };
-        // Through the renderer first, so an under-marking seam shows as the
-        // ghost it leaves: the damaged frame is the full render.
         let mut wc = WindowCpu::new();
         let _ = rend.render_input_cached(&mut wc, &prev);
         let cached = rend.render_input_cached(&mut wc, &cur).pixels().to_vec();
@@ -1198,25 +1105,12 @@ fn compute_dirty_rows_tracks_fx_layers() {
 }
 
 /// THE LAYERS NEVER REFUSE THE SCROLL BLIT (design §4.4): with settled layers
-/// of every slot and both spaces (one reaching up into the head band, one
-/// down into the bottom padding), a three-row wheel scroll-back, the scroll
-/// forward again, and an inline stream that scrolls three lines each take the
-/// whole-row blit, mark every band the current layers draw, repaint fewer
-/// rows than the frame has, and equal a full render.
-///
-/// The negative control is a mutation (run by hand, recorded in the lane
-/// report): dropping `fx_damage::mark_fx_scroll` from `scroll_shift_plan`
-/// leaves the light the blit slid with the text as a ghost and fails this
-/// test.
 #[test]
 fn fx_layers_never_refuse_the_blit_and_mark_their_rows() {
     let mut rend = renderer();
     rend.set_pad(5);
     rend.set_head(7);
     let (cw, ch) = rend.cell_size();
-    // Tall enough that the blit's rows (exposed strip, apron, the layers'
-    // bands before and after) are strictly fewer than the diff's: the
-    // planner takes a blit only when it saves rows.
     let (rows, cols) = (20u16, 16u16);
     let nr = usize::from(rows);
     let mut t = Terminal::new(rows, cols);
@@ -1309,8 +1203,6 @@ fn fx_layers_never_refuse_the_blit_and_mark_their_rows() {
             "{name}: the layers do not refuse the blit ({:?})",
             wc.last_damage()
         );
-        // The pixels first, so an under-marking planner shows as the ghost
-        // light it leaves.
         let fresh = rend.render_input(&input).pixels;
         assert!(
             cached == fresh,
@@ -1328,9 +1220,6 @@ fn fx_layers_never_refuse_the_blit_and_mark_their_rows() {
 }
 
 /// A renderer at an explicit font px: the upward-overshoot seams of the
-/// damaged path show only at some cell-height/baseline geometries (px 13, 14
-/// and 18 with the accented capitals below, not 16), so the overshoot tests
-/// sweep px.
 fn renderer_px(px: f32) -> Renderer {
     let mut r = Renderer::from_system(px, Theme::default())
         .expect("no font: build with aterm-render's default embedded-font feature");
@@ -1339,9 +1228,6 @@ fn renderer_px(px: f32) -> Renderer {
 }
 
 /// Line `i` of a glyph class (newline included): `accent` is accented
-/// capitals on every row, whose diacritics overshoot up into the row above;
-/// `mixed` alternates them with plain ASCII, so neighbouring rows differ in
-/// overshoot.
 fn overshoot_line(class: &str, i: usize) -> String {
     let accent = format!("\u{c9}\u{c1}\u{d1}\u{c5}\u{ca}\u{cd}\u{c9}\u{c1}\u{d1}\u{c5} r{i}\r\n");
     match class {
@@ -1358,20 +1244,6 @@ fn diverging(cached: &[u32], fresh: &[u32]) -> usize {
 }
 
 /// THE BLIT DRAWS AN OVERSHOOT UNDER THE LIGHT ABOVE IT (design §4.4): a
-/// settled layer of each post-pass slot (Glow, Over Exact, Over Linear) and
-/// of the Under slot lights rows 2..=4 edge to edge over accented capitals,
-/// so row 5's diacritics reach up into the layer's last band, which the blit
-/// rebuilds while row 5 is blitted. An inline stream and a wheel scroll back
-/// and forward each take the whole-row blit, and every frame equals a full
-/// render at every px of the sweep: the blit's lower apron draws row 5's
-/// overshoot in the glyph phase, under the light, as the full path does.
-///
-/// The negative control is a mutation (run by hand, recorded in the lane
-/// report): running the E7 apron steps 2 and 3 after the post-passes, as
-/// before this test, draws row 5's diacritics over the Glow and Over light
-/// and fails this test at px 13 (accented rows, Glow, the first streamed
-/// frame). The Under slot's light is drawn before the glyphs, so its frames
-/// do not depend on that order.
 #[test]
 fn the_blit_draws_an_overshoot_under_the_light_above_it() {
     let mut blits = 0usize;
@@ -1464,19 +1336,6 @@ fn the_blit_draws_an_overshoot_under_the_light_above_it() {
 }
 
 /// LAYERS THAT CHANGE ON A SCROLL FRAME (design §4.4, §4.10): the blit's fx
-/// marks hold when the layers or occluders change on the very frame that
-/// scrolls, under a padded grid with a head band. A Window layer lighting only
-/// the head band vanishes as the wheel scrolls forward; a layer moves; an
-/// occluder appears and then goes; and an inline card rides its stream (its
-/// Grid offset follows each scrolled line, design §4.9's offset change). Each
-/// frame takes the whole-row blit and equals a full render.
-///
-/// The negative control is a mutation (run by hand, recorded in the lane
-/// report): dropping `mark_fx_scroll`'s padding rule (previous light above
-/// the grid marks row 0, below it the last row) leaves the vanished head-band
-/// light in place, the blit keeping the padding, and fails this test at
-/// "the head-band layer vanishes"; the other scroll tests hold their layers
-/// still, so the current frame's marks hid that rule.
 #[test]
 fn layers_that_change_on_a_scroll_frame_equal_a_full_render() {
     let mut rend = renderer();
@@ -1493,7 +1352,6 @@ fn layers_that_change_on_a_scroll_frame_equal_a_full_render() {
         i32::try_from(rend.grid_top()).expect("small"),
         i32::try_from(ch).expect("small"),
     );
-    // Light in the head band only, above the grid: row 0's band holds it.
     let head = layer(
         1,
         vec![rect(
@@ -1508,7 +1366,6 @@ fn layers_that_change_on_a_scroll_frame_equal_a_full_render() {
         FxSpace::Window,
         FxBlend::Exact,
     );
-    // Over rows 6..=8 of the grid.
     let card = layer(
         2,
         vec![rect(2 * cw as i32, 6 * chi + 3, 8 * cw, 2 * ch, 0)],
@@ -1538,8 +1395,6 @@ fn layers_that_change_on_a_scroll_frame_equal_a_full_render() {
         assert_eq!(bad, 0, "{what}: the blitted frame equals a full render");
     };
 
-    // Into history, with both layers; then forward one row as the head-band
-    // layer vanishes.
     t.scroll_display(4);
     let _ = frame(&mut t, &[head.clone(), card.clone()], &[], "warm");
     t.scroll_display(-1);
@@ -1578,8 +1433,6 @@ fn layers_that_change_on_a_scroll_frame_equal_a_full_render() {
         "the layer moves back",
     ));
 
-    // Live at the bottom: an inline card rides its stream. Each streamed line
-    // moves the content up a row, and the card's Grid offset with it.
     t.scroll_display(-100);
     let mut riding = card.clone();
     riding.offset.1 += 8 * chi;
@@ -1597,20 +1450,6 @@ fn layers_that_change_on_a_scroll_frame_equal_a_full_render() {
 }
 
 /// A LAYER THAT RIDES THE BLIT IS SLID, NOT REBUILT (design §4.4 as built,
-/// B3): an inline card's two layers (Window Under, Grid Over) moved by exactly
-/// each streamed line keep the whole-row blit and mark none of their rows: the
-/// blit carried their light to where the frame draws it. A layer the blit
-/// cannot carry is rebuilt as before, each case on its own stream: one held
-/// still while the text scrolls, one its clip cuts in both frames, one an
-/// occluder sits on, one reaching up into the head band (the blit keeps the
-/// padding), one moved two rows for one line, and two riding layers that swap
-/// order. Every frame equals a full render.
-///
-/// The negative controls are mutations (run by hand, recorded in the lane
-/// report): dropping the clip clause of `fx_damage::rides_the_blit` fails
-/// "clipped", dropping its occluder clause fails "occluded", and dropping its
-/// grid-band clause fails "into the head band", each on the light the blit
-/// slid where the frame no longer draws it.
 #[test]
 fn a_layer_that_rides_the_blit_is_slid_not_rebuilt() {
     let mut rend = renderer();
@@ -1623,8 +1462,6 @@ fn a_layer_that_rides_the_blit_is_slid_not_rebuilt() {
         i32::try_from(rend.grid_top()).expect("small"),
         i32::try_from(ch).expect("small"),
     );
-    // The card: Under in Window space over rows 9..=10, Over in Grid space
-    // over row 10, overlapping it.
     let under = layer(
         1,
         vec![rect(cw as i32, top + 9 * chi + 2, 9 * cw, 2 * ch - 4, 0)],
@@ -1650,12 +1487,8 @@ fn a_layer_that_rides_the_blit_is_slid_not_rebuilt() {
         FxSpace::Grid,
         FxBlend::Linear,
     );
-    // Through the Under layer's middle in its first two frames.
     let cut = PxRect::new(i32::MIN, i32::MIN, i32::MAX, top + 9 * chi + chi / 2);
-    // On the card's rows as it starts, which it leaves in two lines.
     let shelf = PxRect::new(i32::MIN, top + 9 * chi, i32::MAX, top + 11 * chi);
-    // Four pixels into the head band and three rows down, a row further up
-    // each line.
     let head = layer(
         1,
         vec![rect(cw as i32, top - 4, 9 * cw, 3 * ch, 0)],
@@ -1758,17 +1591,6 @@ fn moved(l: &FxLayer, dy: i32) -> FxLayer {
 }
 
 /// LAYERS RIDING RANDOM SCROLLS EQUAL A FULL RENDER: over random sequences on
-/// a padded, headed 16-row grid, each frame streams 1-3 lines at the live
-/// bottom or wheels 1-2 rows either way, and each random layer (every slot,
-/// space and blend, clipped or not) rides the frame's shift exactly, stays
-/// put, or drifts a row off it, while occluders come and go. Every cached
-/// frame equals a full render, and the corpus reaches blitted frames that
-/// leave a riding layer's rows unrebuilt.
-///
-/// The negative controls are mutations (run by hand, recorded in the lane
-/// report): dropping any one clause of `fx_damage::rides_the_blit` (the clip,
-/// the occluders, the grid band, the offset's row delta) fails this sweep on a
-/// frame whose slid light the full render does not draw.
 #[test]
 fn layers_riding_random_scrolls_equal_a_full_render() {
     let mut rend = renderer();
@@ -1803,7 +1625,6 @@ fn layers_riding_random_scrolls_equal_a_full_render() {
         let _ = rend.render_input_cached(&mut wc, &frame(&mut t, &layers, &occluders));
         let mut back = 0i32;
         for step in 0..10 {
-            // The rows the content moves up this frame.
             let up = match rng.below(3) {
                 0 if back < 30 => {
                     let n = rng.range(1, 2) as i32;

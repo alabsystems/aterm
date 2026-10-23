@@ -36,8 +36,6 @@ fn type_word(app: &mut App, wid: WindowId, word: &str) {
 }
 
 /// Drive enough echo-correlated pulses to cross every real earn threshold.
-/// The owner gate is applied to every pulse, so the disabled fixture stays
-/// cold while the enabled negative control eventually arms.
 fn drive_cursor_cat_momentum(app: &mut App, wid: WindowId, enabled: bool) {
     let base = Instant::now();
     for i in 0..160 {
@@ -61,9 +59,6 @@ fn drive_cursor_cat_momentum(app: &mut App, wid: WindowId, enabled: bool) {
 }
 
 /// Host binding for the derived cursor-cat owner gate: with `cursor_trail = false` the
-/// echo-correlated momentum seam withholds the decisive pulse and the glass/capture predicate
-/// does not draw the ordinary branch; enabling the master proves the fixture can arm. A
-/// collection hello still presents with the master off.
 #[test]
 fn cursor_trail_master_owns_ordinary_kitty_but_not_the_collection_hello() {
     let model = cursor_cat_model();
@@ -101,8 +96,6 @@ fn cursor_trail_master_owns_ordinary_kitty_but_not_the_collection_hello() {
     );
     assert_eq!(off_spec[&"ordinary_visible"], 0);
 
-    // Negative control: the style-only gate (`Buggy=1`) arms the state the healthy invariant
-    // rejects.
     let mut buggy = cursor_cat_model();
     for cst in &mut buggy.consts {
         if cst.0 == "Buggy" {
@@ -115,8 +108,6 @@ fn cursor_trail_master_owns_ordinary_kitty_but_not_the_collection_hello() {
     assert_eq!(leaked[&"ordinary_visible"], 1);
     assert!(!buggy.check_invariant("TrailMasterOwnsOrdinary", &leaked));
 
-    // The same preheated real engine must arm when its owner is enabled;
-    // otherwise the master-off assertion above could pass vacuously.
     let mut on_app = App::headless_for_test();
     on_app.config.cursor_trail = Some(true);
     on_app.config.cursor_trail_style = Some("rainbow kitty".into());
@@ -139,9 +130,6 @@ fn cursor_trail_master_owns_ordinary_kitty_but_not_the_collection_hello() {
     assert_eq!(on_spec[&"ordinary_armed"], 1);
     assert_eq!(on_spec[&"ordinary_visible"], 1);
 
-    // The collection hello is independent of the trail master (the model's
-    // `Collect` arm): a discovery shows even with no cursor trail; the
-    // ordinary earned flight above is what the master owns.
     let hello_at = Instant::now();
     {
         let look = aterm_effects::kitty_registry::KittyLook::for_launch(App::TEST_LAUNCH_SEED);
@@ -152,8 +140,6 @@ fn cursor_trail_master_owns_ordinary_kitty_but_not_the_collection_hello() {
             .cursor_cat
             .set_collection_presentable(hello_at, true);
     }
-    // Sampled inside the hello's fade-in (0.35 s) and its 2.8 s discovery
-    // hold: at the summoning instant the fade is at alpha 0.
     let hello_visible = {
         let ws = off_app.windows.get_mut(&wid).expect("window 0");
         let f = ws
@@ -172,9 +158,6 @@ fn cursor_trail_master_owns_ordinary_kitty_but_not_the_collection_hello() {
 }
 
 /// Typing `dog` through the REAL input path summons the dog cameo — but
-/// only after the window has typed a lot ([`aterm_effects::kitty_summon`]'s
-/// `DOG_SUMMON_KEYS`), and nothing lands in the Kitty Log (dogs are
-/// visitors). The re-summon parade is `dog_cameo`'s own test.
 #[test]
 fn typing_dog_after_the_gate_pops_the_dog_cameo() {
     let mut app = App::headless_for_test();
@@ -209,9 +192,6 @@ fn typing_dog_after_the_gate_pops_the_dog_cameo() {
 }
 
 /// The word engine's "a human typed" witness is wired. A spent cat re-arms only on a committed
-/// edit keystroke, a signal only this input path produces, so a dropped seam would silently stop
-/// every retype replaying its cat. A printable key arms the witness; a navigation key, which
-/// moves the caret over words without editing, does not.
 #[test]
 fn a_committed_edit_key_arms_the_word_engine_typing_witness() {
     use aterm_types::keyboard::Key;
@@ -234,7 +214,6 @@ fn a_committed_edit_key_arms_the_word_engine_typing_witness() {
         "a committed printable key is what the re-arm may trust"
     );
 
-    // Navigation only, on a fresh window so the arm above cannot leak in.
     let mut nav = App::headless_for_test();
     nav.recompute_sparkle();
     for _ in 0..4 {
@@ -260,8 +239,6 @@ fn a_committed_edit_key_arms_the_word_engine_typing_witness() {
 }
 
 /// An app whose session sink writes to a test-owned pipe. The private fd matters: the ordering
-/// FIFO is a process-global registry keyed by PTY master, and every plain `headless_for_test`
-/// shares master `-1`, so pinning that key would divert concurrent tests' keystrokes.
 #[cfg(unix)]
 pub(super) fn app_with_private_pty() -> (
     App,
@@ -296,27 +273,16 @@ pub(super) fn drain(pipe: [i32; 2]) -> Vec<u8> {
 }
 
 /// A frame observing a key is presented at most one refresh after the key's edge (its dispatch
-/// inline, the writer's completed write when queued). The licences a key banks (typed stamp,
-/// Return, newline, nav, quench, gesture) are fresh for a quarter second from that edge and are
-/// judged at the observing frame's clock, not at `Instant::now()` after polling the FIFO writer.
 #[cfg(unix)]
 pub(super) const OBSERVING_FRAME: Duration = Duration::from_millis(16);
 
 /// The clock of the `nth` (1-based) frame after the key edge `edge`
-/// ([`OBSERVING_FRAME`]): never before `edge` (an edge the caller has
-/// already observed), monotone in `nth` and in real time. An inline
-/// key's edge is bounded below by an instant read just before its
-/// dispatch; a queued key's is its receipt ([`delivery_edge`]).
 #[cfg(unix)]
 pub(super) fn observing_frame(edge: Instant, nth: u32) -> Instant {
     Instant::now().min(edge + OBSERVING_FRAME * nth)
 }
 
 /// The delivery edge of a queued write: the newest of the `receipts`
-/// receipts `wid`'s session published past the window's baseline
-/// (`delivery_seen`), placed as the render prelude places it. Waited for,
-/// because a finished FIFO job can hold its receipt until its spill reaches
-/// the kernel.
 #[cfg(unix)]
 pub(super) fn delivery_edge(app: &App, wid: WindowId, receipts: u64) -> Instant {
     let session = app.front_terminal(wid).expect("a terminal").session;
@@ -324,7 +290,6 @@ pub(super) fn delivery_edge(app: &App, wid: WindowId, receipts: u64) -> Instant 
         .delivery_seen
         .map_or(0, |(_, serial)| serial);
     let ctx = &app.pool.get(session).expect("the session").ctx;
-    // A hang detector, never a latency budget.
     let deadline = std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN;
     while std::time::Instant::now() < deadline {
         let batch = ctx
@@ -345,10 +310,6 @@ pub(super) fn delivery_edge(app: &App, wid: WindowId, receipts: u64) -> Instant 
 }
 
 /// A control fence (`signal`'s, say) recorded on a session is not an empty
-/// synthetic key: the next look of every window presenting the session clears
-/// only the two movement candidates (no PTY bytes, typing heat, rain
-/// scheduling or latency-hot stamp). Negative control: a look with no fence
-/// recorded since leaves both licences standing.
 #[cfg(unix)]
 #[test]
 fn a_session_fence_clears_only_the_licence_in_every_window_presenting_it() {
@@ -361,12 +322,8 @@ fn a_session_fence_clears_only_the_licence_in_every_window_presenting_it() {
     let second = app
         .open_active_session_in_new_window_logical()
         .expect("share the active session through the canonical view-count seam");
-    // Focused(true) for B can precede Focused(false) for A. Both windows
-    // temporarily present the same session while the global front already
-    // points at B; the fence must still retire A and B together.
     assert_eq!(app.frontmost_window, Some(second));
     assert_eq!(app.pool.views(session), Some(2));
-    // Each window's first look, as its first event or frame takes it.
     app.reconcile_licence(wid);
     app.reconcile_licence(second);
     app.config.cursor_trail = Some(true);
@@ -541,9 +498,6 @@ fn ime_and_external_local_boundaries_retire_older_candidates_before_consumers() 
         app.on_ime_commit(wid, "é".to_string());
     });
 
-    // The candidate-only preflight at the top of `dispatch_menu_action`: even an inert Copy
-    // reaches it before any early return, and a Paste (which keeps the glow's hand on its row)
-    // still closes the licence.
     for action in [
         crate::menu::MenuAction::Copy,
         crate::menu::MenuAction::Paste,
@@ -561,19 +515,12 @@ fn ime_and_external_local_boundaries_retire_older_candidates_before_consumers() 
     assert_boundary_dark(App::headless_for_test(), |app, _wid| {
         app.clear_tab_surface_move_license(None);
     });
-    // The titlebar needs pill's click, as its wake delivers it, even one that
-    // acts on nothing (no pill stands).
     assert_boundary_dark(App::headless_for_test(), |app, wid| {
         app.on_pill_wake(wid, 0, crate::presence::PillHit::Go);
     });
 }
 
 /// The typing witness's clock starts when the key reaches the terminal, not at event-loop
-/// arrival. A key submitted while a paste drains waits on the per-session ordering FIFO; stamped
-/// at arrival, its witness would expire before the echo lands and a genuine retype would not
-/// replay its cat. Drives the ordered branch of `ordered_or_inline` through `App::input`: the
-/// queued key witnesses its echo past the bare budget, the grace is finite, and a key bound to
-/// another pane witnesses nothing.
 #[cfg(unix)]
 #[test]
 fn a_key_queued_behind_a_paste_still_witnesses_its_own_echo() {
@@ -581,9 +528,6 @@ fn a_key_queued_behind_a_paste_still_witnesses_its_own_echo() {
     let wid = WindowId(0);
     let session = app.front_terminal(wid).unwrap().session;
 
-    // Control: the inline path. Nothing is in flight, so the write returns
-    // inside `App::input` and the witness dies on the bare budget. Asserted
-    // first so the queued case cannot pass by the witness never expiring.
     assert!(
         !super::paste_order::is_ordering(&sink),
         "PRECONDITION: a fresh session has no paste draining"
@@ -605,9 +549,6 @@ fn a_key_queued_behind_a_paste_still_witnesses_its_own_echo() {
         "and is granted no head start it did not spend in a queue"
     );
 
-    // The queued path: one occupied FIFO slot is what a draining paste
-    // presents, so this key takes the ordered branch and its bytes leave
-    // on the writer thread.
     let pin = super::paste_order::pin_ordering_for_test(&sink);
     assert!(
         super::paste_order::is_ordering(&sink),
@@ -627,8 +568,6 @@ fn a_key_queued_behind_a_paste_still_witnesses_its_own_echo() {
         "and must still witness the echo that only arrives after the queue \
          drains — the arrival-stamped witness expired here"
     );
-    // Still finite: a key whose echo never comes eventually stops
-    // licensing anything.
     assert!(
         !app.windows[&wid]
             .fx
@@ -637,9 +576,6 @@ fn a_key_queued_behind_a_paste_still_witnesses_its_own_echo() {
         "the queue's head start is a bounded grace, not an open licence"
     );
 
-    // Negative control: the grace extends the clock, never the scope. With
-    // the engine scanning a different pane, a queued edit here witnesses
-    // nothing at any point in the grace.
     app.windows
         .get_mut(&wid)
         .unwrap()
@@ -663,8 +599,6 @@ fn a_key_queued_behind_a_paste_still_witnesses_its_own_echo() {
         "and the queue grace must not smuggle it in later either"
     );
 
-    // Release the pin and let the writer thread finish the jobs it took, so
-    // the pipe is closed with nothing still writing into it.
     drop(pin);
     super::paste_order::await_drain_for_test(&sink);
     assert!(
@@ -678,20 +612,6 @@ fn a_key_queued_behind_a_paste_still_witnesses_its_own_echo() {
 }
 
 /// A key queued behind a draining paste keeps its licence. A typed key's
-/// arrival stamp is revoked at enqueue and the prelude re-stamps it at its
-/// delivery receipt (one stamp, one echo, as for an inline key: without the
-/// re-stamp the hop reads as program output, `no-fresh-hint`). Enter,
-/// navigation and Backspace have their one-shot licences (return / nav /
-/// quench + poof) revoked at enqueue; the delivery ticket carries the class
-/// and the prelude re-stamps it (a pure re-stamp: the v2 `Return` / `Erase`
-/// / `Kill` and the credit retire / quench thermals were banked at dispatch
-/// and never revoked). Also covered: a composer newline (Shift+Enter on the
-/// alternate screen), a kill chord (^W, its retreat licensed by the nav
-/// stamp `note_kill` arms) and a Tab's gesture.
-///
-/// Under `comet` the trail's Return, nav and gesture re-stamps are read too; under
-/// `rainbow kitty` the trail's tick is disabled and clears its hints every frame, so only the
-/// glow is read.
 #[cfg(unix)]
 #[test]
 fn a_queued_one_shot_key_keeps_its_licence_at_delivery() {
@@ -753,9 +673,6 @@ fn a_queued_one_shot_key_keeps_its_licence_at_delivery() {
                 app.frontmost_window = Some(wid);
                 let session = app.front_terminal(wid).unwrap().session;
                 if alt_screen {
-                    // The composer newline is armed on the alternate screen
-                    // only (Claude Code's composer); the main screen's
-                    // Shift+Enter arms nothing and carries no class.
                     let term = app.front_terminal(wid).expect("terminal").term.clone();
                     crate::term_lock(&term).process(b"\x1b[?1049h");
                 }
@@ -775,17 +692,12 @@ fn a_queued_one_shot_key_keeps_its_licence_at_delivery() {
                 drop(pin);
                 super::paste_order::await_drain_for_test(&sink);
                 assert!(!super::paste_order::is_ordering(&sink));
-                // The key's edge: its dispatch inline, its receipt queued.
                 let mut edge = pressed;
                 if queued {
                     let ctx = &app.pool.get(session).unwrap().ctx;
-                    // A finished FIFO job can hold its receipt until its
-                    // spill reaches the kernel, and the prelude sees it
-                    // only then; wait for the same visible delivery.
                     let mut batch =
                         ctx.output_echo
                             .deliveries_after(&ctx.sink, Some(0), Instant::now());
-                    // A hang detector, never a latency budget.
                     let deadline = std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN;
                     while std::time::Instant::now() < deadline {
                         if batch.items.iter().flatten().next().is_some() {
@@ -808,8 +720,6 @@ fn a_queued_one_shot_key_keeps_its_licence_at_delivery() {
                     );
                     edge = batch.items.iter().flatten().next_back().unwrap().0;
                 }
-                // The prelude is the frame that observes the key
-                // ([`observing_frame`]).
                 let now = observing_frame(edge, 1);
                 let mut live = CursorFxInputs::sample_for_test(now);
                 live.cur = Some((2, 2));
@@ -818,12 +728,6 @@ fn a_queued_one_shot_key_keeps_its_licence_at_delivery() {
                     app.windows[&wid].fx.cursor().glow.move_licensed(now),
                     "{style} {label} queued={queued}: the key's one-shot licence stands after the prelude"
                 );
-                // The cadence comet's twin is not read here: a native window
-                // runs no cadence comet under any presentation (the comet's
-                // tail is its streak, `comet_tail_is_its_streak`; the rainbow
-                // kitty never ran one), and its disabled tick clears its
-                // hints every frame. The streak's licence above is the
-                // witness.
                 drop(app);
                 drop(sink);
                 unsafe {
@@ -836,9 +740,6 @@ fn a_queued_one_shot_key_keeps_its_licence_at_delivery() {
 }
 
 /// A Tab's dispatch arm claims no hop refused before the key. A bare Tab / ⌃V is written inline
-/// and armed at dispatch (`note_insert_armed`) without the late-receipt claim, whose backward
-/// window (`INSERT_RETRO_FRESH`) is for a spill-held receipt and would light a refused prompt
-/// print as `insert`. A delivery receipt (`note_insert_delivered_from`) still claims.
 #[cfg(unix)]
 #[test]
 fn a_tabs_dispatch_arm_claims_no_hop_refused_before_the_key() {
@@ -866,8 +767,6 @@ fn a_tabs_dispatch_arm_claims_no_hop_refused_before_the_key() {
     {
         let glow = &mut app.windows.get_mut(&wid).unwrap().fx.cursor_mut().glow;
         glow.tick(Some((2, 2)), t0, &glow_cfg, geom, &mut out);
-        // A program's own same-row +2 (a prompt print) — no key behind
-        // it: refused, and remembered as the pending hop.
         glow.tick(
             Some((2, 4)),
             t0 + Duration::from_millis(20),
@@ -877,8 +776,6 @@ fn a_tabs_dispatch_arm_claims_no_hop_refused_before_the_key() {
         );
         assert_eq!(glow.spawns(), 0, "the keyless hop is refused");
     }
-    // The Tab: nothing of it is on the wire yet when the host arms the
-    // insert, so nothing refused before this instant can be its echo.
     assert_eq!(
         app.input(wid, named(NamedKey::Tab), Source::Human),
         crate::input::InputOutcome::Ok
@@ -896,7 +793,6 @@ fn a_tabs_dispatch_arm_claims_no_hop_refused_before_the_key() {
         assert_eq!(glow.insert_tally().lit, 0);
         assert_eq!(glow.insert_tally().delivered, 1, "the licence is armed");
     }
-    // The completion itself: an 8-cell completion on the hand's row.
     let glow = &mut app.windows.get_mut(&wid).unwrap().fx.cursor_mut().glow;
     glow.tick(
         Some((2, 12)),
@@ -922,9 +818,6 @@ fn a_tabs_dispatch_arm_claims_no_hop_refused_before_the_key() {
 }
 
 /// A key release queued behind a draining paste carries no ticket. Under Kitty flags 2|8
-/// (REPORT_EVENT_TYPES + REPORT_ALL_KEYS_AS_ESC) a release (`CSI n;1:3 u`) is written like a
-/// press but banks nothing at dispatch; a ticket would re-stamp the key-up as a typed press or
-/// arm a second insert licence. The wire bytes prove the encode is untouched.
 #[cfg(unix)]
 #[test]
 fn a_queued_key_release_publishes_no_receipt() {
@@ -964,7 +857,6 @@ fn a_queued_key_release_publishes_no_receipt() {
         "a key-up is not typing and not an insert: {tickets:?}"
     );
     assert_eq!(batch.latest, 0, "no receipt at all");
-    // The wire is untouched: both releases were encoded and written.
     let bytes = drain(pipe);
     assert_eq!(bytes, b"\x1b[97;1:3u\x1b[9;1:3u");
     assert!(
@@ -978,11 +870,6 @@ fn a_queued_key_release_publishes_no_receipt() {
 }
 
 /// A queued ticket carries its dispatch instant. The insert's late-receipt
-/// claim reaches back `INSERT_RETRO_FRESH` from the writer's completion,
-/// which for a Tab queued behind a short paste reaches past the Tab's own
-/// press. The ticket names when its bytes were dispatched (a key's and a
-/// paste's alike), and the engine's claim stops there
-/// (`a_late_receipt_claims_no_hop_refused_before_its_dispatch`).
 #[cfg(unix)]
 #[test]
 fn a_queued_ticket_carries_its_dispatch_instant() {
@@ -1046,11 +933,6 @@ fn a_queued_ticket_carries_its_dispatch_instant() {
 }
 
 /// The prelude hands a queued Tab's dispatch instant to the engine
-/// (`note_insert_delivered_from`): the seam between
-/// [`a_queued_ticket_carries_its_dispatch_instant`] and the engine's
-/// `a_late_receipt_claims_no_hop_refused_before_its_dispatch`. A keyless same-row +2 is refused,
-/// then a Tab queued behind the FIFO reaches the prelude late. `deliver_insert` drops the
-/// pending hop either way, so what is pinned is the claim: nothing spawned, nothing lit.
 #[cfg(unix)]
 #[test]
 fn the_prelude_bounds_a_queued_tabs_late_claim_at_its_dispatch() {
@@ -1069,22 +951,17 @@ fn the_prelude_bounds_a_queued_tabs_late_claim_at_its_dispatch() {
     let mut seed = CursorFxInputs::sample_for_test(t0);
     seed.cur = Some((2, 2));
     app.cursor_frame(wid, seed).expect("seed");
-    // A program's own same-row +2 (a prompt print): no key behind it,
-    // refused, remembered as the pending hop.
     std::thread::sleep(Duration::from_millis(5));
     let hop_at = Instant::now();
     let mut hop = CursorFxInputs::sample_for_test(hop_at);
     hop.cur = Some((2, 4));
     app.cursor_frame(wid, hop).expect("the keyless hop");
-    // Real clock order: the hop is refused before the Tab is pressed.
     std::thread::sleep(Duration::from_millis(30));
     {
         let glow = &app.windows[&wid].fx.cursor().glow;
         assert_eq!(glow.spawns(), 0, "the keyless hop is refused");
         assert_eq!(glow.insert_tally().lit, 0);
     }
-    // The Tab, queued behind the ordering FIFO so its receipt reaches
-    // the prelude late, carrying the dispatch instant.
     let pin = super::paste_order::pin_ordering_for_test(&sink);
     assert!(super::paste_order::is_ordering(&sink));
     assert_eq!(
@@ -1094,8 +971,6 @@ fn the_prelude_bounds_a_queued_tabs_late_claim_at_its_dispatch() {
     drop(pin);
     super::paste_order::await_drain_for_test(&sink);
     assert!(!super::paste_order::is_ordering(&sink));
-    // The prelude reads the receipt; the caret has not moved since the
-    // refused hop, so anything lit now is the pre-dispatch hop.
     let now = Instant::now();
     let mut live = CursorFxInputs::sample_for_test(now);
     live.cur = Some((2, 4));
@@ -1126,15 +1001,10 @@ fn the_prelude_bounds_a_queued_tabs_late_claim_at_its_dispatch() {
 }
 
 /// A real PTY pair whose slave this test puts into `lflag` mode, with no
-/// child: the master reflects the slave's termios directly (as aterm-pty's
-/// real-spawn test proves for IUTF8 + B230400), so the session sink
-/// reads what a `read -s` / raw TUI would set. Returns `(master, slave)`;
-/// the caller closes both. `pub(super)` for the kitty-command seam tests.
 #[cfg(unix)]
 pub(super) fn pty_pair_with_lflag(edit: impl FnOnce(&mut libc::tcflag_t)) -> (i32, i32) {
     let (master, slave) = aterm_pty::open_pty_pair().expect("open_pty_pair");
-    // SAFETY: `libc::termios` is plain integer fields plus a byte array;
-    // zeroed is a valid value, and `tcgetattr` fills it on the open slave.
+    // SAFETY: `libc::termios` is plain integer fields plus a byte array; zeroed is valid.
     let mut t: libc::termios = unsafe { std::mem::zeroed() };
     assert_eq!(
         unsafe { libc::tcgetattr(slave, &mut t) },
@@ -1152,7 +1022,6 @@ pub(super) fn pty_pair_with_lflag(edit: impl FnOnce(&mut libc::tcflag_t)) -> (i3
 }
 
 /// A headless app on a real pty pair whose slave is in `lflag` mode, with
-/// the rainbow kitty trail on. [`close_pty`] gives the fds back.
 #[cfg(unix)]
 fn pty_app(
     edit: impl FnOnce(&mut libc::tcflag_t),
@@ -1180,20 +1049,14 @@ fn close_pty(
 ) {
     drop(app);
     drop(sink);
-    // SAFETY: both fds are the caller's and open; the borrowed-fd sink did
-    // not close the master.
+    // SAFETY: both fds are the caller's and open; the borrowed-fd sink did not close master.
     unsafe {
-        // The master first: a slave closed over output its master never read
-        // waits out the tty's drain (0.6 s on macOS).
         libc::close(master);
         libc::close(slave);
     }
 }
 
 /// The three tty modes a press can meet: cooked (a shell's baseline),
-/// canonical no-echo (`read -s`, `sudo`, an `ssh` passphrase) and raw
-/// (Claude Code's `setRawMode`, vim, ZLE at rest: the program echoes for
-/// itself), each with whether the tty echoes what is typed.
 #[cfg(unix)]
 type SetMode = fn(&mut libc::tcflag_t);
 #[cfg(unix)]
@@ -1208,10 +1071,6 @@ const TTY_MODES: [(&str, SetMode, bool); 3] = [
 ];
 
 /// A press the tty will not echo banks no credit. The host reads the pty's
-/// ECHO/ICANON off the session sink at the key (iTerm2's password-mode
-/// rule); a press into canonical no-echo mode arms no typed licence and no
-/// press credit on either engine, so a program write on that row has
-/// nothing to spend. The bytes still reach the PTY.
 #[cfg(unix)]
 #[test]
 fn a_press_the_tty_will_not_echo_banks_no_credit() {
@@ -1248,13 +1107,6 @@ fn a_press_the_tty_will_not_echo_banks_no_credit() {
 }
 
 /// A password prompt clicks one tone and rings no ting. Real pty pairs and the audio host's
-/// capture tap; `a`, `A` (Shift), `1`, `.`, a space and a bare Shift go into each:
-///
-/// - Canonical no-echo (`read -s`, `sudo`, an `ssh` passphrase): every glyph key clicks with one
-///   stamp (`Typed`, the space too; unshifted, class `SECRET`, rank 0); the bare Shift cues
-///   nothing.
-/// - Cooked (positive control): each press carries its own class, rank, shift and the space's
-///   comma, and the Shift lifts.
 #[cfg(unix)]
 #[test]
 fn a_password_prompt_clicks_one_tone_and_rings_no_ting() {
@@ -1355,8 +1207,6 @@ fn a_password_prompt_clicks_one_tone_and_rings_no_ting() {
             .iter()
             .any(|(ev, _)| matches!(ev.kind, SoundGesture::Trail(SoundKind::Shift)));
         assert_eq!(lifted, !secret, "{label}: the bare Shift's ting");
-        // The press is otherwise the press it was: the swallowed tally
-        // counts the five glyph keys at the prompt and none off it.
         let ws = app.windows.get(&wid).unwrap();
         assert_eq!(
             ws.fx.cursor().glow.in_flight_tally().swallowed_no_echo,
@@ -1365,11 +1215,8 @@ fn a_password_prompt_clicks_one_tone_and_rings_no_ting() {
         );
         drop(app);
         drop(sink);
-        // SAFETY: both fds are ours and open; the borrowed-fd sink did
-        // not close the master.
+        // SAFETY: both fds are ours and open; the borrowed-fd sink did not close master.
         unsafe {
-            // The master first: a slave closed over output its master never read
-            // waits out the tty's drain (0.6 s on macOS).
             libc::close(master);
             libc::close(slave);
         }
@@ -1423,20 +1270,11 @@ fn paste_drained(
 }
 
 /// A Backspace into a committed IME run gives back one glyph's credit. The
-/// host banks an IME commit as one press priced at its summed width, and
-/// remembers the last typed dispatch's per-grapheme widths to price each
-/// Backspace: `日本語` (6) ⌫ → 4 ⌫ → 2 ⌫ → 0. The memory is held at the
-/// press bank's depth as a whole, even across consecutive pastes, and a
-/// pasted line break is one erasable unit (ZLE, readline and Claude Code's
-/// composer keep the newline and one Backspace erases it). Real cooked
-/// pty: the writes must land, or the failed-write revoke takes the credits
-/// itself.
 #[cfg(unix)]
 #[test]
 fn a_backspace_into_an_ime_run_gives_back_one_glyphs_credit() {
     let (mut app, sink, master, slave) = pty_app(|_| {});
     let wid = WindowId(0);
-    // Seed the engine: the unseeded first draw drops every bank.
     assert_eq!(erase_credits(&mut app, wid), 0);
     let ok = crate::input::InputOutcome::Ok;
     let backspace = |app: &mut App| {
@@ -1479,9 +1317,6 @@ fn a_backspace_into_an_ime_run_gives_back_one_glyphs_credit() {
 }
 
 /// A Backspace erasing a zero-width glyph gives back a priced nothing. `\u{0301}日本` (a
-/// base-less combining mark, then two CJK glyphs) prices 0, 2, 2 and banks one press of four
-/// cells. A priced zero retires nothing, unlike "nothing remembered": `x` then the run (5)
-/// ⌫ → 3 ⌫ → 1 ⌫ → 1, and only the fourth Backspace (memory empty, unpriced) takes `x`.
 #[cfg(unix)]
 #[test]
 fn a_backspace_erasing_a_zero_width_glyph_gives_back_a_priced_nothing() {
@@ -1525,11 +1360,6 @@ fn a_backspace_erasing_a_zero_width_glyph_gives_back_a_priced_nothing() {
 }
 
 /// A key typed after a paste keeps the paste's price zeros. A typed press
-/// keeps the memory and appends its own widths behind the zeros, so the
-/// memory is the row's erasable tail in order: under a stall `abc`, paste
-/// `yz`, `d`, then Backspaces retire `d`, nothing for `z`, nothing for `y`,
-/// then `c`. An IME commit appends per grapheme the same way, and every
-/// other class still empties it (an arrow moves the erase point).
 #[cfg(unix)]
 #[test]
 fn a_key_typed_after_a_paste_keeps_the_pastes_price_zeros() {
@@ -1586,11 +1416,6 @@ fn a_key_typed_after_a_paste_keeps_the_pastes_price_zeros() {
 }
 
 /// A paste the tty will not echo carries no delivery ticket, like the press
-/// path: a paste into `read -s` / `sudo` / an `ssh` passphrase must not arm
-/// a same-row insert licence that a program print on that row could spend
-/// as a phantom. Cooked and raw publish the priced insert; canonical
-/// no-echo publishes no receipt at all. The bytes reach the PTY in every
-/// case, and a paste's gesture stamp is revoked at enqueue whatever the tty.
 #[cfg(unix)]
 #[test]
 fn a_paste_the_tty_will_not_echo_publishes_no_insert_receipt() {
@@ -1632,11 +1457,6 @@ fn a_paste_the_tty_will_not_echo_publishes_no_insert_receipt() {
 }
 
 /// A bare Tab the tty will not echo arms no insert and no gesture. A bare
-/// Tab / ⌃V has `typed_forward == None`, so the tty's verdict is read
-/// separately: a press the tty will not echo is neither a licence nor a
-/// credit in the classes that read the tty. Inline and queued behind a
-/// pinned FIFO: cooked and raw arm, stamp and ticket as usual; canonical
-/// no-echo arms nothing on either engine and publishes no receipt.
 #[cfg(unix)]
 #[test]
 fn a_bare_tab_the_tty_will_not_echo_arms_no_insert() {
@@ -1699,8 +1519,6 @@ fn a_bare_tab_the_tty_will_not_echo_arms_no_insert() {
 }
 
 /// Typing `kitty` never wakes an animal on the input path: the screen scanner answers the echoed
-/// word with the ambient word-cat, centred on it. This path logs exactly one episode as what it
-/// visually is (`head_peek`, ordinary magic); the consumed completion's tail adds nothing.
 #[test]
 fn typing_kitty_logs_one_episode_and_wakes_no_companion() {
     let mut app = App::headless_for_test();
@@ -1748,20 +1566,13 @@ fn typing_kitty_logs_one_episode_and_wakes_no_companion() {
 }
 
 /// Keys alone build no cat momentum: the metric builds only from a real
-/// keystroke correlated with its forward echo (the glow's
-/// `take_momentum_pulse`, fed in `cursor_frame`). A printable keystream
-/// with no rendered echo (e.g. a password prompt) leaves it at zero. The
-/// correlated case is pinned by `momentum_unifies_glow_and_cat_metrics`.
 #[test]
 fn key_only_input_builds_no_cat_momentum() {
     let mut app = App::headless_for_test();
     app.recompute_sparkle();
     let wid = WindowId(0);
-    // The style the cat rides, so a key-only feed would build momentum here.
     app.config.cursor_trail_style = Some("nyan".to_string());
     let now = std::time::Instant::now();
-    // 40 printable presses through the real seam. No present/tick runs, so
-    // the glow never observes a forward echo and never pulses the cat.
     for _ in 0..40 {
         app.input(wid, key('j'), Source::Human);
     }
@@ -1777,7 +1588,6 @@ fn key_only_input_builds_no_cat_momentum() {
 }
 
 /// A word-breaking key (plain Enter) clears the run on the real path:
-/// `kit` ⏎ `ty` was never the typed word.
 #[test]
 fn enter_breaks_the_typed_run() {
     let mut app = App::headless_for_test();
@@ -1788,8 +1598,6 @@ fn enter_breaks_the_typed_run() {
     type_word(&mut app, wid, "ty");
     assert!(!app.windows[&wid].fx.companions().cursor_cat.is_active());
     assert_eq!(app.kitty_log.log().sightings, 0);
-    // The orphaned `ty` is still in the window, so the next word needs its
-    // delimiter: `tykitty` is not the word `kitty`.
     type_word(&mut app, wid, " kitty");
     assert_eq!(
         app.kitty_log.log().sightings,
@@ -1799,11 +1607,6 @@ fn enter_breaks_the_typed_run() {
 }
 
 /// With sparkle words off, or the feline family off while other families
-/// keep the master on (`[sparkle_words.feline] enabled = false`), nothing
-/// can draw a cat, so the typed summon is inert: no companion, no log
-/// entry (a `head_peek` row would land in a category the config can never
-/// produce ambiently). The unresolved render cache (`sparkle` starts
-/// `None`) is not "off"; see the next test.
 #[test]
 fn summon_is_inert_with_sparkle_words_off() {
     use crate::app_config::{SparkleFelineConfig, SparkleWordsConfig};
@@ -1828,8 +1631,6 @@ fn summon_is_inert_with_sparkle_words_off() {
     ] {
         let mut app = App::headless_for_test();
         app.config.sparkle_words = Some(words);
-        // Runtime activation is memory-only: config mutations take effect
-        // when the worker-prepared generation is installed.
         app.prepared_sparkle = app.config.prepare_sparkle_runtime();
         app.sparkle_dirty = true;
         app.recompute_sparkle();
@@ -1848,8 +1649,6 @@ fn summon_is_inert_with_sparkle_words_off() {
 }
 
 /// Unresolved is not off: with the vocabulary on, the first keystroke
-/// summons before any frame has filled the cache, which is the state at
-/// launch and for a headless instance driven over the control socket.
 #[test]
 fn a_typed_summon_before_the_first_frame_is_not_taken_for_effects_off() {
     let mut app = App::headless_for_test();
@@ -1867,8 +1666,6 @@ fn a_typed_summon_before_the_first_frame_is_not_taken_for_effects_off() {
 }
 
 /// Every granted summon is a fresh `(session, ident)` episode, so the
-/// dedupe ring (which absorbs recounts of one episode for its TTL) does not
-/// eat a later summon of the same session.
 #[test]
 fn each_granted_summon_logs_a_fresh_episode() {
     let mut app = App::headless_for_test();
@@ -1878,8 +1675,6 @@ fn each_granted_summon_logs_a_fresh_episode() {
     let now = std::time::Instant::now();
     app.record_typed_kitty(wid, session, now);
     assert_eq!(app.kitty_log.log().sightings, 1);
-    // Bypassing the detector's cooldown on purpose: this seam proves the
-    // ident sequence, not the rate limit (the detector owns that proof).
     app.record_typed_kitty(wid, session, now);
     assert_eq!(
         app.kitty_log.log().sightings,
@@ -1889,8 +1684,6 @@ fn each_granted_summon_logs_a_fresh_episode() {
 }
 
 /// The typed summon logs the cat on glass: its roster row wears the
-/// companion verdict's look (the launch kitty, or the pinned favourite),
-/// never `KittyLook::default()`.
 #[test]
 fn a_typed_summon_records_the_verdicts_look() {
     use aterm_effects::kitty_registry::{KittyLook, glyph_key};
@@ -1921,7 +1714,6 @@ fn a_typed_summon_records_the_verdicts_look() {
         "…in the launch coat"
     );
 
-    // Pin a different cat: the verdict moves to the pin, and so does what the next summon logs.
     let pinned = KittyLook {
         variant: aterm_effects::cat_glyphs_gen::CatGlyphId::S101,
         coat: (launch.coat + 3) % 16,

@@ -25,8 +25,6 @@ fn the_session_corpus_classifies_as_the_manager_did() {
         ),
         (
             "timeout 120 python3 scripts/sat2026_standing.py 2>&1 | tail -40",
-            // A script is not a read by default (DEFAULT_PYTHON_ALLOW is
-            // empty); `the_python_allowlist_is_opt_in` pins it opted in.
             false,
         ),
         (
@@ -82,7 +80,6 @@ fn the_session_corpus_classifies_as_the_manager_did() {
 }
 
 /// A `>` inside a quoted string is data; a redirect to /dev/null and a descriptor dup are not
-/// writes; an unquoted `>` is.
 #[test]
 fn quotes_hide_redirect_glyphs_but_not_substitutions() {
     assert!(ro("git log --format='%h <%ae> -> %s' | head"));
@@ -90,10 +87,8 @@ fn quotes_hide_redirect_glyphs_but_not_substitutions() {
     assert!(!ro("ls >> log.txt"));
     assert!(!ro("ls 2> err.txt"));
     assert!(!ro("ls &> all.txt"));
-    // A substitution inside double quotes still runs, so it is still judged.
     assert!(!ro("echo \"now: $(rm -rf x)\""));
     assert!(ro("echo \"now: $(date)\""));
-    // A quoted danger word is data.
     assert!(ro("grep -n 'rm -rf' notes.md"));
     assert!(ro("echo \"git push later\""));
 }
@@ -137,7 +132,6 @@ fn danger_tokens_anywhere_fail_the_line() {
 }
 
 /// An unknown head is not read-only even with no danger token; keyword laundering (`do
-/// <cmd>`) is seen through; git needs a read subcommand; read subcommands' write forms fail.
 #[test]
 fn segment_heads_must_be_known_reads() {
     assert!(!ro("./deploy.sh"));
@@ -167,7 +161,6 @@ fn segment_heads_must_be_known_reads() {
     assert!(!ro("python3 scripts/sat_score_table.py"));
     assert!(!ro("python3 -m http.server"));
     assert!(!ro("python3"));
-    // The caller's allowlist replaces the default.
     let allow = ["tools/*.py".to_string()];
     assert!(classify_command_with("python3 tools/audit.py", &allow).read_only);
     assert!(!classify_command_with("python3 scripts/sat2026_standing.py", &allow).read_only);
@@ -184,7 +177,6 @@ fn segment_heads_must_be_known_reads() {
 }
 
 /// A wrapper's command is the head: each write behind one is refused with its deciding rule,
-/// and the neighbours stay reads.
 #[test]
 fn a_wrapper_cannot_launder_the_program_it_runs() {
     assert_eq!(classify_command("ls | xargs touch").reason, "touch");
@@ -208,8 +200,6 @@ fn a_wrapper_cannot_launder_the_program_it_runs() {
     assert!(ro("env | sort"));
     assert!(ro("timeout 5 env FOO=1 git status"));
     assert!(!ro("timeout 5 xargs ./x.sh"));
-    // `env -P` picks the program from a directory: a system one is the
-    // named program, any other is the line's choice.
     assert!(ro("env -P /usr/bin git status"));
     for line in [
         "env -P /tmp/evil git status",
@@ -220,8 +210,6 @@ fn a_wrapper_cannot_launder_the_program_it_runs() {
         assert!(!ro(line), "{line}");
         assert!(classify_command(line).reason.contains("env -P"), "{line}");
     }
-    // Short options cluster as getopt reads them: `-iC..` is `-i -C ..`,
-    // and a capital S inside a value is no `-S`.
     assert!(ro("env -iC.. git status"));
     assert!(ro("env -iC .. git status"));
     assert!(ro("env -uSOME ls"));
@@ -299,8 +287,6 @@ fn git_branch_creation_and_remote_set_branches_are_writes() {
 }
 
 /// Shell arithmetic expands an array subscript held in a variable's value and runs its
-/// substitution from behind an opaque quote: arithmetic on a non-literal is refused, literal
-/// forms stay reads.
 #[test]
 fn arithmetic_that_can_expand_a_subscript_is_not_a_read() {
     for line in [
@@ -328,9 +314,6 @@ fn arithmetic_that_can_expand_a_subscript_is_not_a_read() {
         let v = classify_command(line);
         assert!(!v.read_only, "{line:?} read-only ({})", v.reason);
     }
-    // Negative controls: literal subscripts and offsets, the default
-    // forms, the pattern forms, `[`/`test` comparing integers, `[[`
-    // comparing strings, and a quoted here-document body.
     for line in [
         "echo ${PIPESTATUS[0]} ${X[@]} ${#X[*]} ${a[-1]}",
         "echo ${y:1} ${y: -2} ${y:1:3} ${a[@]:1:2}",
@@ -348,9 +331,6 @@ fn arithmetic_that_can_expand_a_subscript_is_not_a_read() {
 }
 
 /// Repository-config hazards (`core.fsmonitor`, `diff.external`, textconv)
-/// are checked on the machine (`policy::git_config`), not here. Refused
-/// here: a repository named on the line (`--git-dir`, `--work-tree`) and
-/// flags that run filter and textconv drivers on purpose. `-C` stays a read.
 #[test]
 fn git_reads_of_a_chosen_repository_or_through_its_drivers_are_refused() {
     for line in [
@@ -368,8 +348,6 @@ fn git_reads_of_a_chosen_repository_or_through_its_drivers_are_refused() {
 }
 
 /// Read tools' write forms: `git branch -v <name>` creates, `sysctl` sets
-/// with `=`/`-w`, `hostname` sets with an operand or `-F`, `file -C` writes
-/// `magic.mgc`, `tree -R` writes `00Tree.html`, and `<>` opens read-write.
 #[test]
 fn the_write_forms_of_system_reads_are_refused() {
     for line in [
@@ -388,7 +366,6 @@ fn the_write_forms_of_system_reads_are_refused() {
     ] {
         assert!(!ro(line), "{line}");
     }
-    // Negative controls: the list and query forms.
     for line in [
         "git branch -v; git branch -vv; git branch -av; git branch -v --list 'f*'",
         "sysctl -n hw.ncpu; sysctl kern.maxfiles",
@@ -452,7 +429,6 @@ fn a_python_path_cannot_step_out_of_the_allowlist() {
 }
 
 /// The awk program and the sed script are read from the raw words: what
-/// the quote-stripped scan cannot see.
 #[test]
 fn awk_programs_and_sed_scripts_are_read_not_dropped() {
     assert!(!ro("awk 'BEGIN{system(\"rm -rf x\")}'"));
@@ -468,8 +444,6 @@ fn awk_programs_and_sed_scripts_are_read_not_dropped() {
     assert!(ro("awk '$3 > 100 {print $1}' f"));
     assert!(ro("awk '$1 > $2' f; awk 'NR>1' f; awk '$3 >= 4' f"));
     assert!(ro("awk '/foo|bar/' f; awk '/a/ || /b/ {print}' f"));
-    // A `>` against a variable could be `print > out`: refused on purpose
-    // (a read handed over costs a glance; a write approved does not).
     assert!(!ro("awk -v n=3 'NR > n' f"));
     assert!(ro("awk '{print \"a>b|c\"}' f"));
     assert!(ro("awk '{ s += $1 } END { print s / NR }' f"));
@@ -515,24 +489,6 @@ fn awk_programs_and_sed_scripts_are_read_not_dropped() {
 }
 
 /// AN AWK PROGRAM RUNS OR WRITES IN EVERY SPELLING AWK READS. MEASURED
-/// 2026-10-22 on macOS awk 20200816 in a scratch directory, each of the first
-/// ten ran a command or made a file the classifier called a read: `system`
-/// with a blank before its `(`, a bare `system` (it runs `$0`), a `print` or
-/// `printf` redirect to a field or a number (`>` in a print statement is a
-/// redirect whatever follows), one continued over a `,` newline, one after a
-/// `#` comment that held a `"`, one after a regex that held a `"`, and a pipe
-/// after a pattern regex on a new line. A `/` after `++`, which may divide
-/// or start a regex, is refused unplaced. An `awk` that is gawk (Linux, a
-/// Homebrew PATH) has options and forms the classifier skipped, refused too: a
-/// program it does not see (`-E`, `--exec`, a second `-e`, `--source=`), a
-/// file it writes (`-d`, `-o`, `-W`), and `@include`/`@load` and its indirect
-/// calls.
-///
-/// NEGATIVE CONTROL: the reads beside each stay reads — a comparison in an
-/// `if`'s or in print's own parentheses, a string or a comment holding the
-/// characters, an escaped `/` in a regex, `systemd` as text, a pattern
-/// comparison on the line after a `print`, and the separator and variable
-/// options.
 #[test]
 fn an_awk_program_that_runs_or_writes_in_any_spelling_is_no_read() {
     for cmd in [
@@ -561,7 +517,6 @@ fn an_awk_program_that_runs_or_writes_in_any_spelling_is_no_read() {
         let v = classify_command(cmd);
         assert!(!v.read_only, "{cmd:?} is no read");
     }
-    // NEGATIVE CONTROL
     for cmd in [
         "awk '{ if ($1 > 3) print $2 }' f",
         "awk '{print ($1 > 3)}' f",
@@ -581,17 +536,6 @@ fn an_awk_program_that_runs_or_writes_in_any_spelling_is_no_read() {
 }
 
 /// SORT AND GIT TAKE AN ABBREVIATED LONG OPTION FOR THE WHOLE ONE
-/// ([`long_option_spells`]). MEASURED 2026-10-22 in a scratch directory:
-/// macOS sort 2.3-Apple wrote `--outp`'s file and ran `--compress=`'s and
-/// `--co=`'s program (with `-S 100K` over 200000 lines), and git 2.54.0 (a
-/// scratch repository and HOME) removed a key on `config --unset-a`, a
-/// section on `config --rem`, the branch's upstream on `branch --unset-u` and
-/// wrote its description on `branch --edit-d` (`config --ed` opens the
-/// editor on the file). `tag -l --del v1` git refuses (`--delete` and `-l`
-/// cannot be used together): taking the prefix there only over-refuses.
-///
-/// NEGATIVE CONTROL: the read options sort and git share no prefix with stay
-/// reads.
 #[test]
 fn an_abbreviated_write_option_is_the_write() {
     for cmd in [
@@ -609,7 +553,6 @@ fn an_abbreviated_write_option_is_the_write() {
         let v = classify_command(cmd);
         assert!(!v.read_only, "{cmd:?} is no read");
     }
-    // NEGATIVE CONTROL
     for cmd in [
         "sort -t: -k2 f",
         "sort --numeric-sort --reverse --unique --key=2 f",
@@ -628,7 +571,6 @@ fn an_abbreviated_write_option_is_the_write() {
 }
 
 /// A substitution is a word of its command here too, its body's words a
-/// segment of their own, first; a parameter is a substitution too.
 #[test]
 fn program_words_resolve_quotes_and_split_where_the_segments_do() {
     assert_eq!(
@@ -708,9 +650,6 @@ fn the_measured_bypasses_are_not_read_only() {
 }
 
 /// `git grep -O`/`--open-files-in-pager` runs the pager without a terminal,
-/// in any cluster or abbreviation; `git <sub> --help`, `git --help <sub>`
-/// and `git -h <sub>` run the configured viewer. Negative controls: an `O`
-/// that is a pattern or value, and other long options, stay reads.
 #[test]
 fn git_grep_pager_spellings_and_git_help_are_not_read_only() {
     for cmd in [
@@ -749,7 +688,6 @@ fn git_grep_pager_spellings_and_git_help_are_not_read_only() {
 }
 
 /// Negative controls for the pre-pass: shapes it reads rather than refuses
-/// stay reads.
 #[test]
 fn comments_heredocs_and_quoting_that_only_read_stay_reads() {
     assert!(ro("git log --oneline -3 # what's new"));
@@ -763,31 +701,17 @@ fn comments_heredocs_and_quoting_that_only_read_stay_reads() {
     assert!(ro("echo \"#not a comment\" x#y $#"));
     assert!(ro("ls >&2; ls 2>&1; ls >&-"));
     assert!(ro("ls>/dev/null"));
-    // A body under a quoted terminator is never expanded.
     assert_eq!(
         prelex("cat <<'EOF'\n$(rm x)\nEOF\nls").as_deref(),
         Ok("cat <<'EOF'\nls")
     );
     assert_eq!(prelex("ls # a 'b\ncat").as_deref(), Ok("ls \ncat"));
     assert!(prelex("cat <<EOF\n$(rm x)\nEOF").is_err());
-    // A here-document still feeds an interpreter its program.
     assert!(!ro("python3 <<'EOF'\nprint(1)\nEOF"));
     assert!(!ro("bash <<'EOF'\nls\nEOF"));
 }
 
 /// A `#` RIGHT AFTER AN ESCAPED BLANK OR NEWLINE OPENS NO COMMENT: the escaped
-/// character is its word's, so the `#` is too, and what follows on the line
-/// runs (MEASURED 2026-10-22: `echo ab\ #; echo RAN`, the same with a tab
-/// after the backslash, and `echo ab\⏎#; echo RAN` each print `RAN` under
-/// `/bin/bash` 3.2 and `/bin/zsh` 5.9). Each is no read with `tee x` there.
-/// A `#` after a blank and a line continuation (`echo ab \⏎#`) is refused
-/// too, though both shells read a comment there: this reader joins no
-/// lines, so it is stricter than the shell, never wider.
-///
-/// NEGATIVE CONTROLS: a `#` after an unescaped blank or tab is a comment,
-/// and its line's rest is hidden (a read; both shells print only `ab`); so
-/// is one after an escaped `#` and a blank (`ab\# #`, both print `ab#`);
-/// an escaped `#` with no blank after it opens none.
 #[test]
 fn a_hash_after_an_escaped_blank_or_newline_opens_no_comment() {
     for cmd in [
@@ -800,7 +724,6 @@ fn a_hash_after_an_escaped_blank_or_newline_opens_no_comment() {
         assert!(!v.read_only, "{cmd:?}: {v:?}");
         assert_eq!(v.reason, "tee", "{cmd:?}");
     }
-    // NEGATIVE CONTROLS
     for cmd in [
         "echo ab #; tee x",
         "echo ab\t#; tee x",
@@ -812,7 +735,6 @@ fn a_hash_after_an_escaped_blank_or_newline_opens_no_comment() {
 }
 
 /// A program word is judged where it runs: as an argument it is data; at a
-/// head (also behind a wrapper, keyword or substitution) it is the program.
 #[test]
 fn a_program_word_is_judged_only_at_a_head() {
     assert!(ro("grep -rn open src"));
@@ -854,8 +776,6 @@ fn the_added_reads_are_reads_and_their_neighbours_are_not() {
     assert!(ro("FOO=1 ls; LC_ALL=C sort f"));
     assert!(ro("date 2>/dev/null; date +%s 2> /dev/null"));
     assert!(!ro("date 2>/dev/null 0101120026"));
-    // `time` is seen through like `timeout`, and an assignment after a
-    // keyword is an assignment.
     assert!(ro("time ls; time -p git status"));
     assert!(!ro("time rm x"));
     assert!(ro("for d in *; do n=$(ls $d | wc -l); echo $n; done"));
@@ -863,7 +783,6 @@ fn the_added_reads_are_reads_and_their_neighbours_are_not() {
 }
 
 /// `aterm ctl` is read-only by verb and form: `meta` reads and `meta set` writes the owner's
-/// badge; `inbox` reads and `inbox seen` writes.
 #[test]
 fn aterm_forms_are_judged_by_their_full_subform() {
     for read in [
@@ -910,10 +829,6 @@ fn aterm_forms_are_judged_by_their_full_subform() {
 }
 
 /// A manager's worker verbs: the task record, the wait on it, the result and
-/// the survey only read, so a box that runs one is a read; `task mark` writes
-/// the record and `spawn agent=claude` starts a worker on a task, so a box
-/// that runs either goes to a person under `approve = "safe"`. `aterm drive
-/// ledger` reads unless `--out` names the file it writes.
 #[test]
 fn the_worker_verbs_are_judged_by_their_form() {
     for read in [
@@ -968,8 +883,6 @@ fn the_worker_verbs_are_judged_by_their_form() {
 }
 
 /// `mark` (phase 3A) writes a claim into a session's log: a worker's `aterm
-/// ctl … mark …` box is judged a write, never auto-approved as a read; the
-/// session log's reads (`log`, `brief`, `await log …`) stay reads.
 #[test]
 fn mark_is_not_a_read_only_ctl_verb() {
     for write in [
@@ -1035,7 +948,6 @@ fn strip_quotes_keeps_shape() {
 }
 
 /// A substitution is no separator: it is a word of the segment around
-/// it, and its body's segments come first.
 #[test]
 fn split_segments_sees_every_separator() {
     let segs = split_segments("a; b && c || d | e $(f) (g) x `h`\ni \\; j & k 2>&1 &>l m&>n");
@@ -1061,7 +973,6 @@ fn split_segments_sees_every_separator() {
 }
 
 /// A command substitution is a word of the command around it and its body a command line of
-/// its own; a command whose name is unreadable cannot be cleared (`R=rm; $R -rf /usr`).
 #[test]
 fn a_substitution_is_a_word_of_the_command_around_it() {
     for (cmd, reason) in MEASURED_SUBSTITUTION_BYPASSES {
@@ -1069,7 +980,6 @@ fn a_substitution_is_a_word_of_the_command_around_it() {
         assert!(!v.read_only, "{cmd:?} must not be read-only: {v:?}");
         assert_eq!(v.reason, *reason, "{cmd:?}");
     }
-    // An unreadable command name is refused with its own reason.
     for (cmd, name) in [
         ("R=rm; $R -rf /usr", "$R"),
         ("R=rm; ${R} -rf $HOME", "${R}"),
@@ -1086,8 +996,6 @@ fn a_substitution_is_a_word_of_the_command_around_it() {
             "{cmd:?}"
         );
     }
-    // Words a program's own text is read from: an awk program, a sed
-    // script, a python script's path, an `export` operand.
     for (cmd, reason) in [
         (
             "awk \"$(cat prog.awk)\" f",
@@ -1134,8 +1042,6 @@ fn a_substitution_is_a_word_of_the_command_around_it() {
         );
     }
     assert!(classify_command_with("python3 scripts/sat2026_standing.py", &allow).read_only);
-    // An unreadable argument may be the flag by which a read tool writes
-    // or runs a program (`sort -o`, `printf -v`, `rg --pre`).
     for (cmd, reason) in [
         (
             "sort $(echo -o /etc/hosts) /etc/hosts",
@@ -1158,8 +1064,6 @@ fn a_substitution_is_a_word_of_the_command_around_it() {
         assert!(!v.read_only, "{cmd:?} must not be read-only: {v:?}");
         assert_eq!(v.reason, reason, "{cmd:?}");
     }
-    // The negative control: a substitution as an argument of a read is
-    // still a read, so nothing above is refusing every `$(`.
     for cmd in [
         "echo $(date)",
         "echo \"now: $(date)\"",
@@ -1172,8 +1076,6 @@ fn a_substitution_is_a_word_of_the_command_around_it() {
         "x=$(date); echo $x",
         "for f in $(ls); do wc -l $f; done",
         "echo $(echo $(echo $(date)))",
-        // A substitution inside double quotes is part of its word:
-        // `x="$(…)"` assigns, and names no command.
         "x=\"$(git rev-parse HEAD)\"; echo $x",
         "export X=\"$(date)\"; echo $X",
         "export FOO=1 BAR 2>/dev/null; export -p",
@@ -1183,8 +1085,6 @@ fn a_substitution_is_a_word_of_the_command_around_it() {
         let v = classify_command(cmd);
         assert!(v.read_only, "{cmd:?} must stay read-only: {v:?}");
     }
-    // A backtick substitution nested in another by `\``: its body is a
-    // command line no reader here sees.
     for cmd in [
         "echo `echo \\`rm -rf /usr\\``",
         "echo `echo \"\\`rm -rf /usr\\`\"`",
@@ -1198,7 +1098,6 @@ fn a_substitution_is_a_word_of_the_command_around_it() {
         );
     }
     assert!(ro("echo \\` `date`; echo \"a \\` b\""));
-    // Nesting past the bound is not read; the bound itself is.
     let nest = |n: usize| format!("{}date{}", "echo $(".repeat(n), ")".repeat(n));
     assert!(ro(&nest(MAX_SUBSTITUTION_DEPTH)), "the bound is read");
     let v = classify_command(&nest(MAX_SUBSTITUTION_DEPTH + 1));
@@ -1210,9 +1109,6 @@ fn a_substitution_is_a_word_of_the_command_around_it() {
 }
 
 /// A redirect may precede a command's name or be glued to it by `&>`, and
-/// zsh runs `- cmd` as `cmd`: `2>/dev/null touch M`, `touch&>/dev/null M`
-/// and `- touch M` all run `touch`. The name after them is the head; a
-/// segment that is only a redirect, or a group's tail, is still no command.
 #[test]
 fn a_redirect_or_a_dash_before_the_name_does_not_hide_it() {
     for (cmd, reason) in [
@@ -1252,16 +1148,6 @@ fn a_redirect_or_a_dash_before_the_name_does_not_hide_it() {
 }
 
 /// A RESERVED WORD IS A KEYWORD ONLY WHERE A COMMAND BEGINS: behind an assignment, a redirect,
-/// zsh's `-`, `timeout` or a wrapper (`env`, `xargs`, `/usr/bin/time` behind an assignment or a
-/// pipe), bash reads it as the command's name and runs a program by that name (MEASURED, bash
-/// 3.2: with an `if` first on `PATH`, `X=1 if true; echo b` ran it; with a `time` first on `PATH`,
-/// `echo x | time if true` ran that `time` with `if true`). A segment does not say whether a
-/// pipeline begins at its `time`, so a reserved word after `time` is never a keyword: `time if …`
-/// is refused too. Claude Code 2.1.307's rm breaker can draw its too-many box over such a line,
-/// whose own statement-follows note would otherwise flag it. NEGATIVE CONTROLS: the same words
-/// where a command begins (`if …; then …; fi`, `for … do … done`, `! grep`, a keyword after a
-/// keyword), a program after `time` (`time ls`, `ls | time -p ls`), and assignments and
-/// redirects after a keyword (`then X=1 ls`, `if 2>/dev/null ls`), stay reads.
 #[test]
 fn a_reserved_word_behind_an_assignment_or_a_redirect_is_a_program() {
     for cmd in [
@@ -1322,11 +1208,6 @@ fn a_reserved_word_behind_an_assignment_or_a_redirect_is_a_program() {
 }
 
 /// AN OPTION AFTER `time` IS `/usr/bin/time`'S OWN: behind a pipe or an assignment `time` is the
-/// program, whose `-o FILE` writes FILE (MEASURED, bash 3.2: `ls | time -o out.txt ls` and `X=1
-/// time -o out.txt ls` each made `out.txt`). The head check had passed the `-o` as a fragment, so
-/// each line was a read, and Claude Code 2.1.307's too-many box over one would have been approved.
-/// The command there is `time` itself, which no list clears. NEGATIVE CONTROLS: `time [-p]` before
-/// a read stays one, at a line's start, behind a pipe and behind an assignment.
 #[test]
 fn an_option_after_time_is_the_time_programs_own() {
     for cmd in [
@@ -1344,7 +1225,6 @@ fn an_option_after_time_is_the_time_programs_own() {
         assert!(!v.read_only, "{cmd:?} must not be read-only: {v:?}");
         assert!(v.reason.contains("time"), "{cmd:?}: {v:?}");
     }
-    // NEGATIVE CONTROLS
     for cmd in [
         "time ls",
         "time -p ls",
@@ -1362,11 +1242,6 @@ fn an_option_after_time_is_the_time_programs_own() {
 }
 
 /// WHAT A WRAPPER OR `time` RUNS IS NEVER A KEYWORD, in [`runs`] as in the head check: `env if
-/// git status` runs a program `if` (the word `env` execs), not `git`, so `runs` names the `if`.
-/// `supervise::policy::git_config` and [`arithmetic_scan`] place a segment's command by it.
-/// NEGATIVE CONTROLS: where a command begins, the keyword is skipped and the program after it is
-/// the command (`if git status`, `then git log`, `! git status`), and a wrapper's program that is
-/// no reserved word is placed as before (`env git status`, `time git log`).
 #[test]
 fn what_a_wrapper_or_time_runs_is_never_a_keyword() {
     let placed = |line: &str| -> String {
@@ -1387,7 +1262,6 @@ fn what_a_wrapper_or_time_runs_is_never_a_keyword() {
     ] {
         assert_eq!(placed(line), want, "{line:?}");
     }
-    // NEGATIVE CONTROLS
     for (line, want) in [
         ("if git status", "git"),
         ("then git log", "git"),
@@ -1401,14 +1275,6 @@ fn what_a_wrapper_or_time_runs_is_never_a_keyword() {
 }
 
 /// AN ARITHMETIC EVALUATION IS REFUSED WHOLE ([`ARITHMETIC_RUNS`]): `$((…))` and `((…))` assign
-/// any variable in their list, the second and later too, and evaluate a value's subscript.
-/// MEASURED, bash 3.2 in a directory holding `./0/ls`: `echo $((x=1,PATH=0)); ls` and `(( x=1,
-/// PATH=0 )); ls` ran it, and `ls='a[$(touch M)]'; echo $((ls))` made `M`. The segment readers
-/// had read `$((x=1,PATH=0))` as a subshell running an assignment to `x`, so the line was a read
-/// (and Claude Code 2.1.307's too-many box over one, `breaker-read-only@v1`'s, was approved).
-/// NEGATIVE CONTROLS: a substitution or subshell holding a subshell, spaced (`$( (ls) )`, `( (ls)
-/// )`), the same text single-quoted, and a comma in a plain assignment (bash 3.2: `x=1,PATH=0;
-/// ls` leaves `PATH` alone and runs the real `ls`) stay reads.
 #[test]
 fn an_arithmetic_evaluation_is_refused_whole() {
     for cmd in [
@@ -1436,7 +1302,6 @@ fn an_arithmetic_evaluation_is_refused_whole() {
             "{cmd:?}: {v:?}"
         );
     }
-    // NEGATIVE CONTROLS
     for cmd in [
         "echo $( (ls) )",
         "( (ls) )",
@@ -1454,7 +1319,6 @@ fn an_arithmetic_evaluation_is_refused_whole() {
 }
 
 /// An awk program or sed script supplied by a parameter is refused like one supplied by a
-/// substitution ([`program_words`] marks every expansion).
 #[test]
 fn an_awk_or_sed_program_from_a_parameter_is_not_read() {
     for (cmd, reason) in [
@@ -1488,8 +1352,6 @@ fn an_awk_or_sed_program_from_a_parameter_is_not_read() {
         assert!(!v.read_only, "{cmd:?} must not be read-only: {v:?}");
         assert_eq!(v.reason, reason, "{cmd:?}");
     }
-    // Negative controls: single-quoted `$1`/`$x` are awk's or sed's own language, and a
-    // double-quoted awk program with no expansion stays a read.
     for cmd in [
         "awk '{print $1}' f",
         "awk -F: '$3 > 100 {print $1}' /etc/passwd",
@@ -1497,7 +1359,6 @@ fn an_awk_or_sed_program_from_a_parameter_is_not_read() {
         "sed -n '/$/p' f",
         "awk \"{print}\" f",
         "echo \"$x\"; awk '{print $2}' f",
-        // A lone `$` with no name after it is literal to the shell.
         "sed \"s/ *$//\" f",
         "sed \"/^$/d\" f",
     ] {
@@ -1511,10 +1372,6 @@ fn an_awk_or_sed_program_from_a_parameter_is_not_read() {
 }
 
 /// A double-quoted `"$(…)"` or `"$X"` cannot split, but its value can start
-/// with `-`, so where a tool reads options it can be the write or run flag
-/// (`sort "$X" f`, `rg x "$(echo --pre=./x.sh)"`). After `--` every word is
-/// an operand; `test`/`[` go by argument count, where a string or file
-/// test's operand is no option slot.
 #[test]
 fn an_expansion_in_an_option_slot_is_refused_quoted_or_not() {
     for cmd in [
@@ -1532,8 +1389,6 @@ fn an_expansion_in_an_option_slot_is_refused_quoted_or_not() {
         "sed -n '1,20p' \"$(echo f)\"",
         "file \"$(echo f)\"",
         "printf \"$fmt\" x",
-        // test/[: an unquoted expansion (it can split into `-v name`), or
-        // four or more words.
         "[ $n -gt 2 ] && echo big",
         "test $n -gt 2",
         "[ $x ]",
@@ -1547,11 +1402,7 @@ fn an_expansion_in_an_option_slot_is_refused_quoted_or_not() {
             "{cmd:?} is refused for its unreadable word: {v:?}"
         );
     }
-    // `-v` names a variable whose subscript is evaluated: refused by its
-    // own rule, whatever the word.
     assert!(!ro("[ -v \"$x\" ]"));
-    // Operands: after `--`, and quoted test operands by argument count,
-    // numeric tests included (`[`/`test` do not evaluate them).
     for cmd in [
         "[ \"$(grep -c ready log)\" -gt 5 ]",
         "test \"$(wc -l < f)\" -gt 0",
@@ -1565,7 +1416,6 @@ fn an_expansion_in_an_option_slot_is_refused_quoted_or_not() {
         "test -d \"$dir\"",
         "[ \"$a\" != \"$b\" ]",
         "[ \"$x\" ]",
-        // A single-quoted `$` is literal: sed's own last-line address.
         "sed -n '$p' f",
         "sed -n '1,$p' f",
     ] {
@@ -1575,11 +1425,6 @@ fn an_expansion_in_an_option_slot_is_refused_quoted_or_not() {
 }
 
 /// zsh arithmetic runs substitutions in array subscripts, and evaluates
-/// `printf` arguments under a numeric format, `-t`'s operand in `test`, `[`
-/// and `[[`, `export -i`/`-E`/`-F` values and integer-variable assignments,
-/// from quoted words, named variables, `"$A"` or globbed names. Negative
-/// controls: the same text under `%s` or plain `export`, numbers, `-t` on a
-/// descriptor.
 #[test]
 fn zsh_arithmetic_that_can_run_a_command_is_not_a_read() {
     for cmd in [
@@ -1639,9 +1484,6 @@ fn zsh_arithmetic_that_can_run_a_command_is_not_a_read() {
 }
 
 /// bash brace-expands `printf {-vS,%s} /etc`, `printf -{vS,-} /etc` and
-/// `printf -v{S,} /etc` into `printf -vS …`, as a glob `-v?` does beside a
-/// file `-vS`; so an unquoted `{` or glob up to the format is refused.
-/// Negative controls: a quoted brace, brace-expanded data after the format.
 #[test]
 fn a_brace_or_glob_word_before_printfs_format_may_be_its_v_option() {
     for cmd in [
@@ -1667,9 +1509,6 @@ fn a_brace_or_glob_word_before_printfs_format_may_be_its_v_option() {
 }
 
 /// An unreadable git argument is refused anywhere before `--`: it may be
-/// the verb (`remote "$(echo add)"`), change the arity (`config` get vs
-/// set) or be a flag (`diff "$(echo --output=f)"`). After `--` every word
-/// is a path.
 #[test]
 fn a_git_argument_this_check_cannot_read_is_refused_before_the_double_dash() {
     for cmd in [
@@ -1712,8 +1551,6 @@ fn a_git_argument_this_check_cannot_read_is_refused_before_the_double_dash() {
 }
 
 /// A `for` loop assigning [`ZSH_ARITHMETIC_VARS`] evaluates each word as
-/// arithmetic (`for SECONDS in 'path[$(…)]'`). Negative controls: numbers,
-/// a variable zsh does not evaluate, a globbed loop.
 #[test]
 fn a_for_loop_over_a_zsh_arithmetic_variable_is_not_a_read() {
     for cmd in [
@@ -1751,9 +1588,6 @@ fn a_for_loop_over_a_zsh_arithmetic_variable_is_not_a_read() {
 }
 
 /// zsh's `~` flag makes a value a pattern and an unquoted `(` in a word is
-/// a glob qualifier; `(e:…:)` and `(+cmd)` run commands during expansion
-/// (`N='/(e:print -u2 X:)'; echo $~N`). Negative controls: a subshell, a
-/// group, `$((…))`, a process substitution, a leading `~`.
 #[test]
 fn a_glob_qualifier_that_can_run_a_command_is_not_a_read() {
     for cmd in [
@@ -1804,9 +1638,6 @@ fn a_glob_qualifier_that_can_run_a_command_is_not_a_read() {
 }
 
 /// Under `EXTENDED_GLOB` `^`, `#` and `~` glob too: beside files `-t`,
-/// `-vS` and `S=5`, `[ ^-vS ]` is `[ -t S=5 ]`, and `printf %d 8#A` beside a
-/// file `A` reads `A` as arithmetic. Negative controls: a leading `~`, an
-/// absolute word, a base-16 number.
 #[test]
 fn an_extended_glob_word_may_become_a_flag_or_a_name() {
     for cmd in [
@@ -1833,9 +1664,6 @@ fn an_extended_glob_word_may_become_a_flag_or_a_name() {
 }
 
 /// zsh ties arrays to scalars, so `path=DIR ls`, `for path in DIR; do ls`
-/// run `DIR/ls` and `module_path=DIR; echo $terminfo` loads from `DIR`.
-/// Negative controls: a tied array of system directories, a pair whose
-/// scalar is harmless, a name only starting like one.
 #[test]
 fn a_tied_array_is_assigned_as_its_scalar() {
     for cmd in [
@@ -1867,10 +1695,6 @@ fn a_tied_array_is_assigned_as_its_scalar() {
 }
 
 /// Parameters whose value zsh runs or loads during reads
-/// ([`ZSH_RUNS_A_VALUE`]) and `STTY`: `READNULLCMD=DIR/x; < f` and
-/// `NULLCMD=DIR/x; > /dev/null` run `DIR/x`. Beside an rm, assignment-only
-/// segments are judged too ([`classify_except_rm`]). Negative controls: the
-/// same reads without the assignment.
 #[test]
 fn a_parameter_zsh_runs_is_a_hazard() {
     for cmd in [
@@ -1917,9 +1741,6 @@ fn a_parameter_zsh_runs_is_a_hazard() {
 }
 
 /// Inside a `${…}` operand a `$` form expands as it does bare, so the bare
-/// refusals apply there (`${x:-$path[A]}`, `${x:-$~N}`), as do subscripts
-/// behind zsh's flags (`$=A[A]`). Negative controls: plain, positional and
-/// special parameters, a lone `$`.
 #[test]
 fn a_dollar_form_inside_a_braced_operand_is_refused_as_it_is_bare() {
     for cmd in [
@@ -1958,9 +1779,6 @@ fn a_dollar_form_inside_a_braced_operand_is_refused_as_it_is_bare() {
 }
 
 /// zsh subscripts special parameters as it does names (`$*[A]`, `$@[A]`,
-/// `$#[A]`… with `A='path[$(cmd)]'`), bare, in `${…}` operands and in
-/// unquoted here-document bodies. Negative controls: special parameters
-/// without a subscript, a glob after a name, `$#` at a `${…}`'s end.
 #[test]
 fn a_subscript_on_a_special_parameter_is_refused() {
     for sub in [
@@ -2007,10 +1825,6 @@ fn a_subscript_on_a_special_parameter_is_refused() {
 }
 
 /// `${NAME:=v}` and `${NAME=v}` assign like `NAME=v`: `${REPORTTIME:=A}`
-/// before a pipe, `${DIRSTACKSIZE:=A}` before a `cd`, `${ERRNO:=A}` alone
-/// run a subscript, and `${NULLCMD:=DIR/x}` acts like `NULLCMD=DIR/x`; also
-/// in here-document bodies. Negative controls: a plain number, a harmless
-/// name, the other default forms.
 #[test]
 fn a_default_assignment_is_judged_as_an_assignment() {
     for cmd in [
@@ -2044,9 +1858,6 @@ fn a_default_assignment_is_judged_as_an_assignment() {
 }
 
 /// [`classify_except_rm`] still judges redirects on the skipped `rm` and
-/// `mktemp` segments: `mktemp > ~/.zshrc; rm -rf /tmp/w/x` (and `>>`, `2>`,
-/// `&>`, `1<>`, quoted targets) truncates a file. Negative controls:
-/// `/dev/null`, a descriptor, an input redirect.
 #[test]
 fn a_redirect_on_a_left_out_segment_is_judged() {
     for cmd in [
@@ -2079,8 +1890,6 @@ fn a_redirect_on_a_left_out_segment_is_judged() {
 }
 
 /// zsh's `printf` decodes Unicode escapes in its format first, so `\u0025d` is `%d` and runs a
-/// subscript; [`numeric_format`] (shared with the rm rule) must see it. Negative controls:
-/// octal and `x` escapes of `%`, and plain formats.
 #[test]
 fn a_unicode_escape_in_a_printf_format_may_be_a_conversion() {
     for format in [
@@ -2099,7 +1908,6 @@ fn a_unicode_escape_in_a_printf_format_may_be_a_conversion() {
         let format = format.replace("BS", "\\");
         assert!(numeric_format(&format), "{format:?}");
     }
-    // These decode to no numeric conversion and evaluate nothing.
     for format in [
         "%s\\n",
         "BS045d",
@@ -2142,7 +1950,6 @@ fn a_unicode_escape_in_a_printf_format_may_be_a_conversion() {
 }
 
 /// macOS sed edits in place under `-I` as under `-i`, alone or clustered.
-/// Negative controls: `-n`, `-E`, and an `I` flag inside the script.
 #[test]
 fn sed_capital_i_edits_in_place() {
     for cmd in [
@@ -2169,9 +1976,6 @@ fn sed_capital_i_edits_in_place() {
 }
 
 /// bash's `${!NAME}` expands the variable named by NAME's value, evaluating
-/// its subscript (`A='a[$(…)]'; echo "${!A}"`); refused, in here-documents
-/// too. The listings `${!A[@]}`, `${!A[*]}`, `${!A@}`, `${!A*}`, and `${!}`
-/// and `${#A}`, stay reads. `${A@P}` is refused.
 #[test]
 fn a_bash_indirection_is_not_literal() {
     for cmd in [
@@ -2206,8 +2010,6 @@ fn a_bash_indirection_is_not_literal() {
 }
 
 /// zsh runs a command written after a closing `}` or `]]` in the same list (`{ ls } always {
-/// ./p/x }`, `if [[ -n a ]] ./p/x`), which a word reader would take as an argument. Negative
-/// controls: a closing word ending its segment, nested closings, a quoted `}`.
 #[test]
 fn a_word_after_a_closing_brace_is_a_command() {
     for cmd in [
@@ -2248,9 +2050,6 @@ fn a_word_after_a_closing_brace_is_a_command() {
 }
 
 /// Fail-safe regressions of the tests above: a redirect after a closing word
-/// is the compound's own (`{ ls; echo } 2>&1 | head`) and its target is still
-/// judged; a `}` or `]]` with no opener closes nothing; `${!#}` is the last
-/// positional, not an indirection. `${!1}` and `${!A[@]:-x}` stay refused.
 #[test]
 fn a_closing_word_redirect_and_an_unopened_close_stay_reads() {
     for cmd in [
@@ -2296,9 +2095,6 @@ fn a_closing_word_redirect_and_an_unopened_close_stay_reads() {
 }
 
 /// zsh closes a `{` group at a `}` glued to a word's end, unless the word's
-/// own braces balance: `{ echo a} always { cmd }` and `{ echo ${HOME}}
-/// always { cmd }` run `cmd`. Negative controls: balanced braces (`{a,b}`,
-/// `${HOME}`, `{}`), an escaped `}`, and a glued close ending its segment.
 #[test]
 fn a_brace_glued_to_a_word_closes_the_group() {
     for cmd in [
@@ -2338,10 +2134,6 @@ fn a_brace_glued_to_a_word_closes_the_group() {
 }
 
 /// The reads a worker writes are plain; every form known to run a command under zsh is not, by
-/// the character that opens it rather than by a rule of its own, and neither is any expansion
-/// but a plain parameter read or command substitution
-/// ([`a_plain_line_admits_only_the_expansions_zsh_takes_no_further_than_bash`]), so a form
-/// nobody has measured needs one of these characters too.
 #[test]
 fn a_plain_line_expands_nothing() {
     for line in [
@@ -2366,14 +2158,11 @@ fn a_plain_line_expands_nothing() {
         assert_eq!(plain_zsh_line(line), Ok(()), "{line:?}");
     }
     for line in [
-        // Forms that run a command under zsh: tied arrays, arithmetic, modifiers, process
-        // substitution, glob qualifiers, `=cmd`.
         "path=/x ls",
         "path=/x; ls",
         "for path in /x; do ls; done",
         "ls; select path in /x; do ls; done",
         "repeat 3 ls",
-        // A leading redirect leaves the next word a command's first.
         "2>/dev/null for path in /x; ls",
         "2>&1 repeat 2 ls",
         "</dev/null for path in /x; ls",
@@ -2389,7 +2178,6 @@ fn a_plain_line_expands_nothing() {
         "=ls",
         "ls ~[x]",
         "ls ~root",
-        // Any other expansion, quote escape or compound.
         "echo `id`",
         "ls $'\\x41'",
         "echo \"\\$x\"",
@@ -2401,7 +2189,6 @@ fn a_plain_line_expands_nothing() {
         "[[ -t 1 ]] && ls",
         "a=1 ls",
         "ls x=y",
-        // Redirects that write, duplicate or read otherwise.
         "ls > out",
         "ls >> /dev/null",
         "ls >| /dev/null",
@@ -2420,22 +2207,6 @@ fn a_plain_line_expands_nothing() {
 }
 
 /// A PLAIN LINE ADMITS ONLY THE EXPANSIONS ZSH TAKES NO FURTHER THAN BASH (MEASURED 2026-10-22
-/// against `/bin/zsh` 5.9 run as Claude Code's Bash tool runs it, a scratch HOME and ZDOTDIR,
-/// `docs/measured/breaker-transcript-and-zsh-2026-10-22.md`): a parameter read `$NAME` or
-/// `${NAME}`, quoted or not (zsh neither splits nor globs it unquoted; bash does both), and a
-/// command substitution `$(…)` over a plain line (zsh splits and does not glob it; bash globs
-/// too), nested, quoted, and with quotes inside; the classifier still judges what each runs and
-/// which words it feeds (`printf %d "path[$(id)]"` is plain and no read: zsh evaluates printf's
-/// numeric argument as arithmetic).
-///
-/// NEGATIVE CONTROLS, each measured to run code, assign or expand further under zsh, or written
-/// so this reader could not tell where zsh ends it: `${(e)x}` (ran `touch`), `${~x}` (globs),
-/// `${=x}` (splits), `${^x}`, a subscript right after a read (`$x[PATH=0]` assigned PATH and ran
-/// `./0/ls`, quoted and braced too), a modifier (`$x:h`), `${x:=v}` (assigns), `$=x`, `$~x`,
-/// `$^x`, `$((…))`, every special parameter, `$'…'`, `$"…"`, a bare `$`, a name run into a
-/// character outside ASCII (zsh may read it as more of the name), and inside a `$(…)`: a
-/// comment (it can hide the `)` from this reader), a newline, a backtick, a subshell, a
-/// reserved word, an assignment, an arithmetic `$((`, a missing `)`, nesting past eight.
 #[test]
 fn a_plain_line_admits_only_the_expansions_zsh_takes_no_further_than_bash() {
     for line in [
@@ -2462,7 +2233,6 @@ fn a_plain_line_admits_only_the_expansions_zsh_takes_no_further_than_bash() {
     assert!(!v.read_only, "{v:?}");
     let v = classify_command("echo \"$(ls)\" $x ${HOME}");
     assert!(v.read_only, "{v:?}");
-    // NEGATIVE CONTROLS
     for line in [
         "echo ${(e)x}",
         "echo ${~x}",

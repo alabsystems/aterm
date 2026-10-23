@@ -1,93 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The session log (`docs/DESIGN-session-log-2026-10-15.md` §9): the
-//! per-session ring with its open/close discipline and level-aware eviction,
-//! a reader's cursor over it, the turn tracker over screen verdict words, and
-//! the disk journal's reader view. Tier-1 bound in aterm-slog
-//! (`tests/conformance_ring.rs`, `tests/conformance_cursor.rs`,
-//! `tests/conformance_turn.rs`, `tests/conformance_journal.rs`), which drive
-//! the shipping `Log`, `TurnTracker` and `journal::view_of` and project them onto these
-//! variables; no per-method `#[refines]` anchors (aterm-slog links no
-//! aterm-spec outside its tests).
+//! The session log (`docs/DESIGN-session-log-2026-10-15.md` §9): the per-session ring with its open/close discipline and level-aware eviction, a reader's cursor over it, the turn tracker over screen verdict words, and the disk journal's reader view.
 
 use aterm_spec::derive::*;
 
-/// SESSION LOG RING (phase 2A): one session's bounded ring of records,
-/// evicting level-aware (§5.1), over the open path of one run, its turn and
-/// the turn's step. The ring is abstracted to how many live records it holds
-/// in each eviction class (`aterm_slog::evict_class`), which is what the
-/// policy reads; positions within a class are the unit tests'.
-///
-/// Variables: `seq` the last seq assigned, `lost` the records evicted (or
-/// shed by a carry), `first` the first seq the log accounts for, `holes` the
-/// seqs it never held; the update: `ep`
-/// the epoch (0 before it, 1 after), `drawn` whether the manifest was drawn
-/// and `ceil` the seq it carried (the last plus the overlap's `Reserve`), `hi`
-/// the last seq the outgoing process assigned, `hseq` the successor's first;
-/// `run`/`turn`/`step` the open path, `sorph` whether the open step is an
-/// orphan hanging from the run (§2.3), `oold` whether that orphan's open
-/// predates the newest turn close (its records are then history once it
-/// closes), `tclose` the closes written for the current turn node, `tn` the
-/// turns opened; the fold, kept outside the ring: `fturn` its open turn,
-/// `fturns` its turn total. Live records by class: `prun`/`pturn`/`pstep`
-/// the open path's own open records (pinned); `dturn` current detail under
-/// the open turn, `dout` current detail outside a turn (on the run, the
-/// session or an orphan step, newer than the newest close beneath it);
-/// `tdet` closed detail under the newest closed turn, `dold` all other
-/// closed detail; `ocl` the open records of closed runs and turns, `cls`
-/// the closes of runs and turns, `tcl` whether the newest closed turn's
-/// close is live. `nw` is the class of the record appended last, which no
-/// batch takes (0 pinned, 1 `dturn`, 2 `dout`, 3 the newest turn's close, 4
-/// another close).
-///
-/// An append that takes the ring past `Cap` arms a batch (`ev = 1`); the
-/// batch evicts one record a step, in policy order, until the ring is at
-/// `Low` (`aterm_slog::low_water`) or nothing but the pinned records and the
-/// newest is left (`EvictDone`). The order: closed detail (`dold`, `tdet`),
-/// closed opens (`ocl`), closes while they pass half the ring
-/// (`aterm_slog::closes_over_half`), current detail, the remaining closes.
-/// `Mark` lands on the deepest open node (a turn's when one is open);
-/// `MarkOutside` hangs from the run or the session whatever is open (an
-/// agent's verdict mark, a person's input burst, a gap). `CloseTurnCascade`
-/// is a turn closed over its open step (two records: the
-/// step `out=gone`, then the turn), `CloseRunCascade` a run closed over its
-/// open turn and step, innermost first. A turn closes without touching an
-/// orphan step, which hangs from the run.
-///
-/// An update that carries no records: `Draw` takes the manifest's count
-/// (`SessionRecord::log_seq`), the outgoing process goes on appending, a
-/// Commit past the count stands down (`StandDown`, a lossless retry), and
-/// `HandoffUncarried` starts the successor's log at `ceil + 1` with its `gap
-/// why=handoff` (the open path, the ring and the fold start over). An update
-/// that carries the log: `HandoffCarried` arms the carry's shed (`cv = 1`),
-/// admitted only when its pinned path and newest record fit `CarryCap`,
-/// which takes records in the same policy order down to that bound, each
-/// counted lost (`aterm_slog::Log::carry`'s cut), and `CarryDone` continues
-/// the same log at `ceil + 1` with its `mark - handoff`, the seqs between
-/// (the overlap the outgoing process may still have used) never held
-/// (`holes`); the open path, the fold and `first` cross unchanged. `cpath`
-/// is the open path at the carry (plus one) and `moved` whether the
-/// successor opened or closed anything since. The successor then appends at
-/// most `After` records, which keeps the box small. `Crash` is a crash
-/// adoption (a shell the PTY keeper held): a new seq space from 1, `gap
-/// why=crash` first, at an epoch above the last one (the keeper tag carries
-/// it); `eplast` is the epoch before the adoption, `adoptions` whether one
-/// happened.
-///
-/// `Buggy = 1` adds dead mutants for the laws: an append that arms no batch
-/// (`Bounded`), a batch that takes the open turn's open record
-/// (`OpenPathRetained`), one that takes the newest turn's close while its
-/// detail lives (`RollupOutlivesDetail`), an eviction nobody counts
-/// (`NoSilentLoss`), a turn closed with its step left open and a step
-/// attached to a closed turn (`WellNested`), a second close of a closed turn
-/// (`CloseOnce`), a fold recomputed from a ring that evicted a turn's
-/// records (`ProjectionIndependentOfEviction`), an update that restarts
-/// seqs where the outgoing process had used them (`SeqNeverReused`), a
-/// carried update that drops the open path (`CarryKeepsOpenPath`), a carry
-/// that sheds a record without counting it (`NoSilentLoss`), and a crash
-/// adoption that keeps the epoch (`EpochGrows`). Tier-1:
-/// aterm-slog's `slog_ring_conforms_to_derived_model`.
+/// SESSION LOG RING (phase 2A): one session's bounded ring of records, evicting level-aware (§5.1), over the open path of one run, its turn and the turn's step.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn session_log_ring_model() -> Model {
@@ -563,37 +481,7 @@ pub fn session_log_ring_model() -> Model {
     }
 }
 
-/// SESSION LOG CURSOR (phase 2A): what a reader pulling through
-/// `aterm_slog::Log::read` is told, over four seqs, now that level-aware
-/// eviction takes records from the middle of the window and a carried update
-/// leaves seqs the log never held (`Log::skip_to`).
-///
-/// Variables: `s1`..`s4` each seq's standing (0 not yet assigned, 1 live,
-/// 2 evicted, 3 a hole: never held, 4 written in an update's overlap), `seq`
-/// the seqs assigned; the reader's
-/// cursor `cur` (the last seq it covered: `since=` is exclusive), the records
-/// it was handed `got`, the losses it was told `rlost`, and `told` whether a
-/// read told it of a hole (`gap why=handoff`). `Evict<i>` takes any live
-/// record, whatever its place. `ReadTo<k>` is a read cut at the live record
-/// `k` (`max` reached there), `ReadAll` one that reaches the head; each counts
-/// what it covered.
-///
-/// A carried update's overlap: `Export` takes the carry and fences the
-/// outgoing log's readers at its head (`fence`, `aterm_slog::Log::fence_reads`;
-/// the fenced records are not evicted meanwhile);
-/// `OverlapAppend` is a record the outgoing process writes after (seq
-/// standing 4), which the successor never holds and may contradict (a turn
-/// it closes again, a step it never closes); `Commit` hands over (those seqs
-/// become holes: the successor continues the carry, `ep = 1`), `StandDown`
-/// lifts the fence and keeps them. `ov` counts overlap records a reader was
-/// handed: the law `ReaderNeverSeesOverlap` is the reader's view of
-/// `CloseOnce` across an update.
-///
-/// `Buggy = 1` adds one dead mutant per law: a read that leaves evicted seqs
-/// untold (`NoSilentLoss`), one that counts a hole as a loss
-/// (`HoleNeverCountsAsLoss`), one that crosses a hole without saying so
-/// (`HandoffSaid`), and one that reads past the fence (`ReaderNeverSeesOverlap`).
-/// Tier-1: aterm-slog's `slog_cursor_conforms_to_derived_model`.
+/// SESSION LOG CURSOR (phase 2A): what a reader pulling through `aterm_slog::Log::read` is told, over four seqs, now that level-aware eviction takes records from the middle of the window and a carried update leaves seqs the log never held (`Log::skip_to`).
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn session_log_cursor_model() -> Model {
@@ -738,97 +626,7 @@ pub fn session_log_cursor_model() -> Model {
     }
 }
 
-/// TURN TRACKER: at most one open turn per agent run, driven by the screen
-/// verdict (design §2.4).
-///
-/// `word` is the current verdict: 0 `unknown`, 1 `busy`, 2 `idle`, 3
-/// `prompt` with the question dialog, 4 `prompt` with an approval box, 5
-/// `wall:<kind>`, 6 `wall:unresponsive`, 7 `survey`, 8 `question` (asked in
-/// prose), 9 `-`. `turn` is the open turn and `extra` a second one under the
-/// same run; `step` the screen step held open (0 none, 1 approval, 2
-/// question, 3 wall, 4 stall, 5 survey) and `sturn` whether it hangs from
-/// the turn (a wall or stall seen with no turn hangs from the run). `pend`
-/// is an armed settle and `ticks` its elapsed half-seconds (`Settle` = 1 s);
-/// `Tick` is time passing and `Rest` the host's wake after the settle (a
-/// wake before it changes nothing; a late one is applied by the next
-/// verdict first). `CtlTurn` is a `ctl turn` exchange arriving while the
-/// agent rests, before the settle: the exchange it starts is the next turn,
-/// so the resting one closes at once (`cw = 11`). `cw` is the word that
-/// closed the last turn (10 none yet, 11 a ctl exchange, 12 the transcript)
-/// and `cticks` how long its resting word had held.
-///
-/// The transcript adds two actions through
-/// `TurnTracker::transcript`: `TxClose`, the vendor turn's end closing the
-/// open turn when no screen step is open under it (`cw = 12`; a wall on
-/// the run stays), and `TxRefute`, the wall judge retracting the screen's
-/// wall, which disarms its settle and latches (`rf`) until the screen's
-/// word moves (every `See*`). `wg` is the GHOST of a wall's need taken by a
-/// transcript close.
-///
-/// WHO DISMISSED A BOX. `bk` is the input bound to the
-/// open approval or question step (`step` 1 or 2): 0 none, 1 a control or
-/// harness input (who it came from and its `act=` decide `out=`, which the
-/// conformance binding reads off the real close), 2 a person's, 3 one
-/// accepted more than `STEP_ACT_MS` before now (`Age`: it dismisses
-/// nothing). `pd` is the one input in flight: 1 admitted under the open step
-/// (`AdmitCtl` or `AdmitHarness` while a step is open; `Accept` binds it), 2 admitted with none
-/// open (the lead: the first approval or question step to open inside
-/// `STEP_INPUT_LEAD_MS` with no close between is the step it was admitted
-/// under, so such an open turns 2 into 1), 3 accepted on the lead (the next
-/// such open binds it), 4 dead: its step closed before its acceptance, or
-/// its lead passed (`LeadOut`); its acceptance binds nothing. `SeeNextBox` is
-/// a box of another word replacing the open one (one `observe` closes box 1
-/// and opens box 2; boxes of one word are one step). A close consumes the
-/// binding; `Person` binds the open step at once (`pp`: the step's latest
-/// input is a person's). With no approval or question step open, a person's
-/// input leads as any input does (`PersonLeads`: `pl`, a person's input
-/// accepted on the lead, which the next such open binds as the person's,
-/// `bk = 2`, or `PersonLeadOut` drops once the lead passed); it is the latest
-/// input, so it takes the lead from an act accepted on it (`pd` 3 to 0), and
-/// an act accepted on the lead after it takes the lead back (`Accept` from
-/// `pd = 2`).
-///
-/// WHO SENT AN ACT (phase 6, 6A-5). Two acting actors beside the person:
-/// `ctl` and the harness, which the real tracker tells apart on the bound
-/// input (`by=ctl` closes `out=passed`, an unproven author; `by=harness`
-/// reads its `act=`). `pa` is the sender of the input in flight or on the
-/// lead (0 none, 1 ctl, 2 harness), set by `AdmitCtl`/`AdmitHarness` and
-/// cleared when the input leaves (`pd` to 0); `ba` is the actor the binding
-/// names when `bk = 1`, and `bs` the GHOST of who sent the bound act. A
-/// binding names the actor who sent it (`ActorKeepsItsAct`), and a
-/// harness act is never read as ctl's (`HarnessActNotCtl`): the law is
-/// split by direction so each is the one law a swap from its side breaks.
-/// At `Buggy = 1` only the harness admits (`AdmitCtl` is off): no law of
-/// that family reads who sent an input, and a second sender would double
-/// its walk (80 319 states to 177 652) past the interpreter's bound.
-///
-/// Ghosts: `gn`, an input bound to a step that was
-/// neither open at its admission nor the lead's first; `ab`, a binding still
-/// held after it attributed a close; `ga`, a close read
-/// `approved|declined|answered` with no fresh, proven, acted input bound to
-/// it.
-///
-/// `Buggy = 1` adds one dead mutant per law: a second turn opened without
-/// superseding the first (`AtMostOneOpenTurn`), `unknown` read as an end
-/// (`UnknownNeverClosesATurn`), `idle` closing the turn before the settle —
-/// the 220 ms mid-answer idle Codex shows (`IdleClosesOnlyAfterSettle`), the
-/// question dialog closing its turn (`DialogStaysInTurn`), a step opened
-/// under a turn that has closed (`StepsNestInTheirTurn`), the input
-/// stall closing the turn (`StallNeverClosesATurn`), a turn end closing the
-/// turn with the wall under it (`tx_end` without its screen-step test:
-/// `WallNeedOutlivesTxClose`), and a refutation that leaves the wall's
-/// settle armed (`tx_wall` without its disarm: `RefutedWallStaysShut`).
-/// `Buggy = 2` is T1's family, apart so neither multiplies the other's
-/// space: an acceptance after box 1 closed that binds box 2
-/// (`ActBindsNextBox`: `ActNeverBindsNextBox`), a close past `STEP_ACT_MS`
-/// that reads approved (`AttributeStaleInput`: `ApprovalByObservedInput`), a
-/// person's input that leaves the harness's act bound (`ActOverPerson`:
-/// `PersonSupersedesAct`), a person's input on the lead that leaves an act
-/// waiting on it to bind the next box (`ActLeadOverPerson`, the same law: a
-/// person's lead and an act's never stand together), a close that keeps
-/// its binding for the next box (`ActTwice`: `AttributesOnce`) and a
-/// binding that names the other acting actor (`ActorSwap`: from a ctl act
-/// `ActorKeepsItsAct`, from a harness act `HarnessActNotCtl`).
+/// TURN TRACKER: at most one open turn per agent run, driven by the screen verdict (design §2.4).
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn turn_tracker_model() -> Model {
@@ -1223,51 +1021,7 @@ pub fn turn_tracker_model() -> Model {
     }
 }
 
-/// SESSION LOG JOURNAL VIEW (phase 2B): what a `log @<sid>` answered from the
-/// disk journal shows, over three seqs of one session's space: the session's
-/// open (seq 1), a run's under it (2) and a turn's under the run (3). The
-/// producer appends them (`Append`: `lg` of them in the log) and the writer,
-/// behind it, handles them in seq order: each is journaled (`Write`) or said
-/// lost by a gap frame (`Lose`: the ring evicted it before the writer reached
-/// it; never one a snap restated, an open node's record, which the ring
-/// pins), and any journaled line may be journaled again (`Again<i>`: an
-/// update's overlap, a stopped writer's successor, a chain restated). `Snap`
-/// is a snap the writer writes at its cursor `nxt`, behind the log or not (a
-/// new segment, a rollback's restatement), restating the open path as of
-/// that head; `sb` remembers the log's head at a snap written behind it.
-/// `Hand` is an update's `#handed` for the session, written once the drain
-/// reached the fence (`hd`); a later record, gap frame or snap voids it, and
-/// `sd` says a snap did (an update that stood down). `Crash` is the chain's
-/// writer dying with no `#fin` (its lock free), with whatever backlog it had.
-/// `Read` is the reader's view of the journal as it stands: `v<i>` how many
-/// times seq `i` is shown, `vlost` the losses it says, `vs`/`vr`/`vt` whether
-/// the session, run and turn read open, `cs`/`cr`/`ct` the place of each
-/// one's synthetic close among the view's closes (0: none), which the reader
-/// derives at read time for a dead chain that did not hand the session on,
-/// and `ca` the `after=` of its `gap why=crash` (0: none). Any
-/// change to the journal makes an earlier view stale (`rd = 0`, the view's
-/// variables cleared).
-///
-/// Laws: `ViewAtMostOnce` (each `(sid, space, seq)` once in any
-/// reply), `DeadViewClosed` (every tree in a dead chain's view is closed,
-/// unless its last line for the session hands it on: a rolled-back update's
-/// is closed), `ChildClosesFirst` (closes innermost first: ORDER, not counts;
-/// no child closes after its parent), `LossSaid` (every loss the journal
-/// knows is said as a gap) and `CrashAfterHead` (the crash gap says
-/// `after=` the last seq the journal accounted for, never a seq a snap
-/// restated past it, nor the last one it holds a record of).
-///
-/// `Buggy = 1` adds one dead mutant per law: a read that shows a line once
-/// per time it was journaled (`ViewAtMostOnce`), one that leaves a dead
-/// chain's tree open (`DeadViewClosed`), one that keeps a `#handed` a later
-/// snap voided (`DeadViewClosed`), one that closes the parent first
-/// (`ChildClosesFirst`), one that numbers what it holds densely and says no
-/// loss (`LossSaid`), and the writer and reader before phase 2B's fixes, a
-/// snap written behind restating the open path past its head and a reader
-/// counting it toward the head (`CrashAfterHead`). Tier-1: aterm-slog's
-/// `slog_journal_view_conforms_to_derived_model`, through the real
-/// `journal::take`, `journal::take_frames` and `journal::view_of`, with a
-/// negative control per mutant.
+/// SESSION LOG JOURNAL VIEW (phase 2B): what a `log @<sid>` answered from the disk journal shows, over three seqs of one session's space: the session's open (seq 1), a run's under it (2) and a turn's under the run (3).
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn session_log_journal_model() -> Model {
@@ -1459,35 +1213,7 @@ pub fn session_log_journal_model() -> Model {
     }
 }
 
-/// SESSION LOG MARK QUOTA (design §7.4): the claims a
-/// consumer writes back (`mark`, `src=mark`) hold at most a quarter of a
-/// ring's capacity, and the quota keeps that by taking only marks, the
-/// oldest first, never the record just appended and never one the readers'
-/// fence holds during an update's overlap.
-///
-/// Variables: `seq` the last seq assigned, `lost` the records the log
-/// counts lost; live records split by whether the fence holds them: `uo`/`fo`
-/// observations, `um`/`fm` marks; `fence` whether readers are fenced; `mq`
-/// the quota in records (2, or 1 once the byte budget is lowered); `nwm`
-/// whether the newest record is a mark and `nwf` whether it is fenced (no
-/// eviction takes it); `qobs` the observations the quota took and `fgone` the
-/// fenced records anything took (both ghosts).
-///
-/// `AppendMark` is `aterm_slog::Log::enforce_mark_quota` inline: it takes as
-/// many older unfenced marks as the live marks pass `mq` by (at most all of
-/// them). `Lift` (the fence lifted) and `LowerBudget` run the quota again.
-/// `EvictObs`/`EvictMark` are the level-aware batch, whose order the ring
-/// model holds: here it may take any unfenced record but the newest.
-///
-/// Laws: `MarkQuota`: the marks pass the quota only while the fence holds
-/// some, and then by the newest mark alone; `NoSilentLoss`: every seq is
-/// live or counted lost; `QuotaTakesOnlyMarks`; `FenceHolds` (R4).
-///
-/// `Buggy = 1` adds one dead mutant per law: a mark appended without the
-/// quota (`MarkQuota`), a quota that takes an observation too
-/// (`QuotaTakesOnlyMarks`), one whose taking is uncounted (`NoSilentLoss`),
-/// and one that takes a fenced mark (`FenceHolds`). Tier-1: aterm-slog's
-/// `slog_mark_quota_conforms_to_derived_model`.
+/// SESSION LOG MARK QUOTA (design §7.4): the claims a consumer writes back (`mark`, `src=mark`) hold at most a quarter of a ring's capacity, and the quota keeps that by taking only marks, the oldest first, never the record just appended and never one the readers' fence holds during an update's overlap.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn session_log_mark_quota_model() -> Model {
@@ -1591,43 +1317,7 @@ pub fn session_log_mark_quota_model() -> Model {
     }
 }
 
-/// SESSION LOG PROGRAM SHARE: the program
-/// marks (OSC 7501's reports) hanging from one node hold at most its share of
-/// the ring, and the share keeps that by taking only that node's program
-/// marks, the oldest first, never the record just appended and never one the
-/// readers' fence holds, each counted lost: a flapping program spends its own
-/// share, never another node's nor the facts beside it.
-///
-/// Variables: `seq` the last seq assigned, `lost` the records the log counts
-/// lost; live records split by whether the fence holds them: `uo`/`fo` other
-/// records (a mail mark, a bell), `ua`/`fa` the program marks of node `a` (a
-/// run), `ub`/`fb` those of node `b` (the session, or another run); `fence`
-/// whether readers are fenced; `nwp` which node's program mark the newest
-/// record is (0 none, 1 `a`, 2 `b`) and `nwf` whether it is fenced (no
-/// eviction takes it); `qoth` the records the share took that were not the
-/// over-share node's program marks, and `fgone` the fenced records anything
-/// took (both ghosts). `Ps` is the share (64 at a session's bound; 2 here,
-/// a 64-record ring's).
-///
-/// `AppendA`/`AppendB` are `aterm_slog::Log::enforce_program_share` inline:
-/// they take as many of the node's older unfenced program marks as its live
-/// ones pass `Ps` by (at most all of them). `Lift` (the fence lifted) runs it
-/// again for both nodes. `EvictOther`/`EvictA`/`EvictB` are the level-aware
-/// batch, whose order the ring model holds: here it may take any unfenced
-/// record but the newest.
-///
-/// Laws: `ProgramShare`: a node's program marks pass the share only while
-/// the fence holds some, and then by the newest alone; `NoSilentLoss`: every
-/// seq is live or counted lost; `ShareTakesOnlyProgram`: the share takes the
-/// over-share node's program marks and nothing else; `FenceHolds` (R4).
-///
-/// `Buggy = 1` adds one dead mutant per law: a program mark appended
-/// without the share (`ProgramShare`), a share that evicts any record, an
-/// observation (`ProgramShareEvictsAny`) or the other node's program mark
-/// (`ShareTakesOtherNode`), both `ShareTakesOnlyProgram`'s, one whose taking
-/// is uncounted (`NoSilentLoss`), and one that takes a fenced program mark
-/// (`FenceHolds`). Tier-1: aterm-slog's
-/// `slog_program_share_conforms_to_derived_model`.
+/// SESSION LOG PROGRAM SHARE: the program marks (OSC 7501's reports) hanging from one node hold at most its share of the ring, and the share keeps that by taking only that node's program marks, the oldest first, never the record just appended and never one the readers' fence holds, each counted lost: a flapping program spends its own share, never another node's nor the facts beside it.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn session_log_program_share_model() -> Model {
@@ -1752,56 +1442,7 @@ pub fn session_log_program_share_model() -> Model {
     }
 }
 
-/// SESSION LOG ROWS: the records a host's
-/// timeline prints as rows (`aterm_slog::Log::keep_rows`), numbered densely
-/// from a counter the host carries across an update, and the row floor: the
-/// newest rows, up to a quarter of the ring, which an eviction batch takes
-/// only once every other record it may take is taken.
-///
-/// Variables: `seq` the records this log accounts for and `lost` those it
-/// counts lost; live records: `u` the ones that are no row of this log (an
-/// unflagged record, or a carried one, which is never a row), `ro` the rows
-/// outside the floor and `rf` the rows within it (`Floor`, the quarter: 2
-/// here, a ring of 8 records); `nw` what the newest record is (0 none, 1
-/// another record, 2 a row), which no batch takes. The ids: `rid` the row
-/// counter's head (the last id issued, or the count carried in), `rfirst`
-/// the first id this log issues, `rapp` how many it issued, `rprev` the
-/// highest id an earlier process of this id space may have issued (a
-/// seamless update continues the space, its predecessor's ceiling the head
-/// plus the overlap's `Reserve`; a crash adoption at a new epoch starts its
-/// own); `ups` whether the update or adoption happened (one a walk:
-/// `MaxEp`, which keeps the box small); `under` whether a batch took a floor
-/// row while another record it may take was live (a ghost).
-///
-/// `AppendOther` and `AppendRow` append; a row takes the next id and joins
-/// the floor, whose oldest leaves it once it is full (a record that prints
-/// two rows, a session close, takes two ids: aterm-slog's
-/// `row_ids_are_dense_in_append_order_and_a_session_close_takes_two`, kept
-/// out of the box, which it would double). `EvictOther`,
-/// `EvictOutside` and `EvictFloor` are the level-aware batch (whose order
-/// among the rest is the ring model's): a floor row goes only once no other
-/// record but the newest is live. `HandoffCarried` is a carried update: the
-/// records cross as no rows, and the successor's ids continue past the
-/// count its host carried (`aterm_slog::Log::continue_rows`), its `mark -
-/// handoff` the first; `HandoffUncarried` starts a new log at its `gap
-/// why=handoff`, its ids continuing too; `Crash` is a crash adoption at a
-/// new epoch, its `gap why=crash` row id 1 (a row is named by its epoch and
-/// id, never by a start second).
-///
-/// Laws: `RowFloor`: no floor row goes while another record could;
-/// `DenseRowIds`: this log's ids are `rfirst ..= rid`, each issued once, in
-/// order, all above any earlier process's of its id space; `NoSilentLoss`:
-/// every record is live or counted lost.
-///
-/// `Buggy = 1` adds dead mutants, each at most once a walk (which keeps
-/// the mutated box within the interpreter's): a batch that takes a floor
-/// row while another record could go (`EvictRowUnderFloor`, `RowFloor`'s),
-/// a carried update whose successor's counter is not carried
-/// (`HandoffRowsRestart`) and a crash adoption whose ids start over in its
-/// predecessor's id space (`CrashKeepsEpoch`), both `DenseRowIds`', and a
-/// carried update that drops a record nobody counts (`CarryShedUncounted`,
-/// `NoSilentLoss`'s). Tier-1: aterm-slog's
-/// `slog_rows_conform_to_derived_model`.
+/// SESSION LOG ROWS: the records a host's timeline prints as rows (`aterm_slog::Log::keep_rows`), numbered densely from a counter the host carries across an update, and the row floor: the newest rows, up to a quarter of the ring, which an eviction batch takes only once every other record it may take is taken.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn session_log_rows_model() -> Model {
@@ -1940,45 +1581,7 @@ pub fn session_log_rows_model() -> Model {
     }
 }
 
-/// SESSION LOG CLAIMS (design §3.7 and §7.3):
-/// the claim half of the fold.
-/// A claim is an attributed opinion: it never lifts an observed need, a need
-/// it raises ranks below every observed one and stays its raiser's, the label
-/// `brief` and the clause show is only ever a trusted author's and a proven
-/// one's first, and no other author's verdict displaces the trusted one, nor
-/// a `ctl` verdict the proven (the harness's): `ctl` is every in-session
-/// client, the supervised agent among them.
-///
-/// Variables: `obs` an observed need open (a failed run's) and `live` its
-/// ghost — raised, and not since closed by observation or by a non-claim
-/// clear; `hn`, `cn`, `en` a claim's need open, raised by the harness, by a
-/// `ctl` client, by an edge; `hlive` the harness's ghost — raised, and not
-/// since cleared by the harness; `top` the most urgent need (0 none, 1 the
-/// observed one, 2 a claim's); `lab` the newest label of any author and `tl`
-/// the one shown (0 none, 1 a trusted author's, 2 another's), `lby` whose
-/// the trusted slot holds (0 none, 1 the harness's, 2 a `ctl` client's),
-/// `hl` a proven label held and `sh` the one shown is it; `vany` the newest
-/// verdict (as `lab`), `tv` a trusted verdict held and `hadt` its ghost,
-/// `vby` whose (as `lby`), `hv` a proven verdict held and `hadh` its ghost.
-///
-/// Actions are what `aterm_slog::Fold::apply` does with the records:
-/// `RaiseObserved` a run closed `fail`, `ObserveLifts` a later run of its
-/// kind closed `ok`, `HarnessNeed`/`CtlNeed`/`EdgeNeed` a `need` mark of each
-/// author (the same word: each its own need), `HarnessClear`/`CtlClear`/
-/// `EdgeClear` a claim's `clear` (`src=mark`) of each, `OwnerClear` a
-/// non-claim `clear` from `ctl` (the 2A rule, src=meta), and
-/// `HarnessLabel`/`CtlLabel`/`OtherLabel` and
-/// `HarnessVerdict`/`CtlVerdict`/`OtherVerdict` the claim marks.
-///
-/// `Buggy = 1` adds one dead mutant per law, two for the raiser's: the 2A
-/// rule for a claim's clear (`ClaimNeverOverridesObservation`), a claim ranked
-/// by arrival (`ClaimsRankLast`), another author's label shown
-/// (`LabelOnlyFromTrusted`), another author's verdict taking the trusted slot
-/// (`TrustedVerdictStands`), a `ctl` verdict taking the proven slot
-/// (`ProvenVerdictStands`), a `ctl` label shown over the harness's
-/// (`ProvenLabelFirst`), and an edge's raise of the same word taking the
-/// harness's need over or a `ctl` clear lifting it (`RaiserKeepsItsNeed`).
-/// Tier-1: aterm-slog's `fold_claims_conform_to_derived_model`.
+/// SESSION LOG CLAIMS (design §3.7 and §7.3): the claim half of the fold.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn session_log_claims_model() -> Model {
@@ -2136,56 +1739,7 @@ pub fn session_log_claims_model() -> Model {
     }
 }
 
-/// SESSION LOG FOLD (plan §4.2):
-/// what `aterm_slog::Fold::apply` and the clause make of one agent run,
-/// its one turn, one need-bearing step of that turn (a wall the screen saw),
-/// one claimed need and one label, as records arrive and time passes.
-///
-/// Variables: `r` the run and `t` the turn (0 none, 1 open, 2 closed); `ow`
-/// the outcome the fold holds for the closed turn (0 while it is open, 1
-/// `done`, 2 `wall:*`, 3 `gone`) and `oc` the rank of the record that set it
-/// (`Conf::rank`: 3 strong, 4 exact); `gw`/`gc` the GHOST of the outcome
-/// given over every close and amend of the turn: the close's
-/// own, unless an EXACT amend (the transcript, on a measured build) refines
-/// it, before the close or after; a strong amend never does; `nd`, `nw`,
-/// `ng` the session totals' `done`, `walled` and `other` buckets; `s` the
-/// step (0 none, 1 open, 2 closed), `nc` the rank of its need in the fold (0
-/// when none) and `sg` the GHOST of the best rank that need was given (its
-/// open's, or an exact `confirmed=1`'s); `cn` a claimed need open (a `need`
-/// mark's, which raises no clause row); `top` the most urgent need (0 none,
-/// 1 the step's, 2 the claim's); `lab` a label held (abstract, A31: what
-/// `shown_label` shows while it lives) and `lx` that it expired; `cl` the
-/// clause's row (`ClauseRow`: 0 none, 1 need, 2 label, 3 step, turn or run);
-/// `dup` that a replayed record changed the fold.
-///
-/// Actions, each a real record or a real read: `OpenRun`, `OpenTurn`;
-/// `CloseDone` the screen's strong close; `AmendOutExact` an exact `out=`
-/// amend (open turn or closed); `AmendOutStrong` a strong one; `OpenStep` a
-/// strong wall step (raises its need), `ConfirmStep` an exact `confirmed=1`
-/// amend of it, `RetractStep` its close; `CloseRun` the run's close (which
-/// cascades its open turn and step `out=gone`); `MarkNeed` a claim's need;
-/// `Label` a label mark; `Expire` time passing the label's TTL; `Tick` time
-/// passing (the clause and hints read at a later `now_wall` over an
-/// unchanged fold); `Replay` a record at or below `as_of` applied again.
-///
-/// `Buggy = 1` adds dead mutants, each naming the real call it breaks
-/// (S13): `ReplayApplies` (`Fold::apply` without its `as_of` check:
-/// `Idempotent`); `StrongAmendRefines` (`on_amend` through `confidence_law`
-/// in place of `amend_refines_out`, a strong amend overruling the screen's
-/// close: the fold half of S9's `PartialNeverOverrules`) and
-/// `LowerAmendWins` (an amend's `out=` written past the law) and
-/// `ConfirmNoUpgrade` (`need_takes_amend` answering no:
-/// `ConfidenceMonotone`); `RebucketWithoutDecrement` (`turn_out_rebucket`
-/// that only adds: `TotalsMatchClosedTurns`); `RetractKeepsNeed`
-/// (`on_close` keeping a closed step's need: `NeedLivesWithItsStep`);
-/// `TickRaisesNeed` (`clause` at a later `now_wall` naming a need the fold
-/// does not hold: `SilenceRaisesNoNeed`); `CloseRunLeavesTurn` (`on_close`
-/// without its child walk: `OpenPathWellNested`); `ExpiredLabelShown`
-/// (`shown_label` without its `until` test) and `LabelHidesNeed`
-/// (`clause_of` with the label row above the need row: `ClauseNeedFirst`).
-/// The claims laws (`ClaimsRankLast`, `LabelOnlyFromTrusted`,
-/// `ProvenLabelFirst`) are `SessionLogClaims`' and not restated. Tier-1:
-/// aterm-slog's `fold_conforms_to_derived_model`.
+/// SESSION LOG FOLD (plan §4.2): what `aterm_slog::Fold::apply` and the clause make of one agent run, its one turn, one need-bearing step of that turn (a wall the screen saw), one claimed need and one label, as records arrive and time passes.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn session_log_fold_model() -> Model {
@@ -2346,81 +1900,7 @@ pub fn session_log_fold_model() -> Model {
     }
 }
 
-/// TRANSCRIPT JOIN (plan §4.3):
-/// what `aterm_slog::TurnTracker::transcript` makes of one
-/// agent run's vendor turns while the screen drives the same tracker.
-///
-/// Variables: `wm` the join holds a watermark (bound to the file); `pt` the
-/// source is `partial` (an unmeasured build) rather than `on`; `lt` the open
-/// turn (0 none, 1 open with no `vref`, 2 open with one); `old` that it
-/// opened outside a prompt's attribution window (5 s before now); `lc` that
-/// the newest closed turn could take a late prompt (no `vref`, opened within
-/// the window); `lv` that it could take one dated near its own open (no
-/// `vref`, this run's: `lc` without the window's clause, for a prompt row
-/// dated in the past); `vm` what the running vendor turn maps to (0 none, 1 the open
-/// turn, 2 a closed turn, 3 nothing: a partial build with no turn to attach)
-/// and `ve` that its end (a turn end, or Esc's interrupt) was read; `vo` that
-/// the prompt of a vendor turn mapped to nothing is older than the window;
-/// `ss` the screen's step under the open turn
-/// (0 none, 1 a box, 2 a wall), `wr` a wall on the run, `pend` the wall's
-/// settle armed, `wd` the screen's word resting (idle: a settle armed on any
-/// open turn), `rf` the refuted latch, `ts` the transcript steps open (tool
-/// and subagent, up to two here).
-///
-/// `g` is ONE GHOST, the first wrong record the real calls appended (0:
-/// none; one variable, not eight, so the mutants' space stays small): 1 a
-/// second open turn; 2 a `confirmed=` or `vref=` the screen wrote; 3 a row
-/// at or below the watermark applied again; 4 a turn the transcript opened
-/// dated before the run's open or the adoption (S1); 5 a prompt attached to
-/// a turn opened more than 5 s from it, either side (S13); 6 a transcript
-/// close that took a screen box with it (S4); 7 one that took the screen's
-/// wall, its need gone (S2); 8 a partial record that closed a turn or
-/// screen node or changed a held outcome (S9); 9 a prompt that named any
-/// turn but the nearer one that could take it (the newest closed turn,
-/// when the prompt is dated nearer its open than the open turn's).
-///
-/// Actions: the screen's `ScreenBusy` (opens a turn, ends any step; a
-/// vendor turn still running on the turn the screen closed continues into
-/// it, `cont=`; one mapped to nothing whose prompt came within the window
-/// is the new turn's, `vref=`), `ScreenBox`, `ScreenWall` (on the turn, armed; else on the
-/// run), `ScreenRest` (the idle settle's close: the cascade takes the
-/// transcript steps), `WallRest` (the wall's settle: it continues on the
-/// run), `Age` (time passes, no settle armed); the source's `Bind` (a first
-/// read or a new file: seeded at its end, the old vendor turn forgotten),
-/// `Lapse` (a re-bind of the same file), `AdoptWithoutWatermark` (a
-/// successor adopted a carry with no `tx_` tokens), `Carry` (one with them),
-/// `SetPartial`, `SetOn`; the rows' `PromptAttach` (the open turn, in the
-/// window, takes `vref=`), `PromptShare` (a turn held by a screen step, or
-/// any on a partial build, is shared), `PromptSupersede` (any other open
-/// turn closes `out=superseded` and the vendor turn opens its own),
-/// `PromptLate` (the newest closed turn takes it), `PromptUnmapped`,
-/// `PromptOpens`; a prompt row dated in the past while a turn is open:
-/// `PromptOld` (older than the open turn by more than the window: an
-/// earlier turn's, read late, it maps to nothing) and `PromptLateNear`
-/// (dated nearer the newest closed turn's open, which takes it though a
-/// turn is open); `ToolUse` (under the open turn its vendor turn maps, else
-/// counted), `ToolResult`, `TxEndCloses` (a measured build's turn end with
-/// no screen step under the turn), `TxEndHeld` (any other: amends only),
-/// `Interrupt` (Esc's row: the vendor turn ended, no turn end follows),
-/// `Refute`, `Confirm`, `Compact` (an instant step: nothing projected);
-/// `Replay` (a row at or below the watermark) and `OldRow` (one past it,
-/// older than the floor): nothing.
-///
-/// `Buggy = 1` adds one dead mutant per broken real call:
-/// `PromptOpensBeside` (`AtMostOneOpenTurn`), `LateStepOrphan` (a
-/// `ToolUse` for a closed turn opening its step) and `RestLeavesSteps` (a
-/// settle without the cascade: `StepsUnderOpenTurn`), `ScreenConfirms`
-/// (`ConfirmedOnlyFromTranscript`), `ReplayAfterLapse` (a lapsed watch
-/// re-emitting: `NoReplay`), `ReplayFromProcess` (a floor of the process
-/// start alone: `NoTurnBeforeRunOpen`), `AttachEarly`
-/// (`AttachOnlyWithinWindow`), `OldPromptAttaches` (an old prompt taken by
-/// the turn opened after its window: `AttachOnlyWithinWindow`),
-/// `LateNamesOpen` (a prompt dated near the closed turn's open taken by the
-/// open turn: `PromptNamesNearestTurn`), `MergeClosesBox`
-/// (`TxNeverClosesScreenStep`), `TxCloseTakesWall`
-/// (`WallNeedOutlivesTxClose`), `RefuteLeavesSettle`
-/// (`RefutedWallStaysShut`) and `PartialCloses` (`PartialNeverOverrules`).
-/// Tier-1: aterm-slog's `transcript_join_conforms_to_derived_model`.
+/// TRANSCRIPT JOIN (plan §4.3): what `aterm_slog::TurnTracker::transcript` makes of one agent run's vendor turns while the screen drives the same tracker.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn transcript_join_model() -> Model {
@@ -2725,49 +2205,7 @@ pub fn transcript_join_model() -> Model {
     }
 }
 
-/// SESSION LOG MAIL LINK (
-/// design §2.6, DESIGN:203-207): the heuristic mail → turn link
-/// `aterm_slog::Fold::apply` makes as a session's mail and turns arrive and
-/// time passes (`aterm_slog::mail_link_of`, `fold_mail.rs`).
-///
-/// Variables: `cands` the delivered `kind=task` mails waiting for a turn
-/// inside the window (the fold's waiting list, 0..2); `old` one waiting past
-/// the window (still listed until a turn or a person drops it); `t` the
-/// newest turn (0 none, 1 open, 2 closed); `lk` it holds a link and `lc` the
-/// link's confidence (0 none, 1 heuristic, 2 any other); `ex` it names its
-/// cause; `th` it is a person's; `amb` some turn found mail ambiguous (the
-/// totals' `mail_amb=`, T10c). GHOSTS, what the walk knows of the mails
-/// themselves: `hm` a task mail inside the window that a person's act took
-/// off the list; `notes` a note (any kind but `task`) inside the window
-/// since the last person's act; `lm` a mail inside the window already linked
-/// (heuristically or by an explicit `cause=`) since then; and the breaks:
-/// `ga` a link to a mail a person's act took, `gw` to one past the window,
-/// `g2` to one already linked, `gn` to a note, `gm` a link made among two or
-/// more.
-///
-/// Actions, each a real record or time: `TaskMail`, `NoteMail` (`mail
-/// dir=in`); `Human` (a `human` mark: the person's input, since 5D-4 also
-/// the first after mail that reached the program, T39); `HumanNoReach` (a
-/// `human reached=0` mark: a burst's first gesture reached no program, a
-/// view scroll or a selection; it answers nothing, so every mail still
-/// waits); `Age` (time past the window of every mail so
-/// far); `OpenTurn` (a turn of `ctl`, the harness or the screen, no cause:
-/// links the one waiting mail, counts two as ambiguous); `OpenCausedTurn`
-/// (`cause=`: no heuristic link; the mail it names, the newest waiting one,
-/// is taken); `OpenPersonTurn` (`by=human`: no link, every waiting mail
-/// taken); `CloseTurn`.
-///
-/// Laws: `HeuristicStaysHeuristic` (a link is always `~`, never the turn's
-/// own confidence); `ExplicitCauseWins`; `NoLinkAcrossHuman` (no link to a
-/// mail a person's act stands after, and a person's turn links none);
-/// `LinkWithinWindow`; `OneMailOneTurn`; `OnlyTaskLinks`; and
-/// `AmbiguityLinksNone` (T10c: two waiting, none linked).
-///
-/// `Buggy = 1` adds one dead mutant per law, each the broken rule it names:
-/// `LinkAtTurnConf`, `LinkOverExplicit`, `LinkAcrossHuman`,
-/// `LinkPastWindow`, `MailLinksTwice`, `LinkNote` and `LinkAmongMany`.
-/// Tier-1: aterm-slog's `mail_link_conforms_to_derived_model`, its negative
-/// controls hand-built successors over the real fold (T11).
+/// SESSION LOG MAIL LINK ( design §2.6, DESIGN:203-207): the heuristic mail → turn link `aterm_slog::Fold::apply` makes as a session's mail and turns arrive and time passes (`aterm_slog::mail_link_of`, `fold_mail.rs`).
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn session_log_mail_link_model() -> Model {

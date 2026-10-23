@@ -2,12 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Row storage for the terminal grid: a contiguous array of cells, a length
-//! (one past the last cell output wrote, printed blanks included; see
-//! [`Row::len`]) and [`RowFlags`].
-//!
-//! `write.rs` holds single/wide writes with wide-char fixup, `char_ops.rs`
-//! ICH/DCH/ECH, `clear.rs` full/partial/selective clears.
+//! Row storage for the terminal grid: a contiguous array of cells, a length (one past the last cell output wrote, printed blanks included; see [`Row::len`]) and [`RowFlags`].
 
 use super::cell::Cell;
 use super::page::{PageSlice, PageStore};
@@ -25,16 +20,10 @@ const fn u16_from_usize(value: usize) -> u16 {
     }
 }
 
-/// Where the halves of wide pairs an ICH/DCH/ECH blanked with its BCE fill ended
-/// up once its shift was done (at most four), beyond the span it vacated or
-/// erased. The grid gives each the fill's dense-RGB-ring bytes, as it gives that
-/// span (`Grid::fill_bce_rgb_cols`): a truecolour blank resolves its colour
-/// there, and finds no bytes, or a dead glyph's, if none were written.
+/// Where the halves of wide pairs an ICH/DCH/ECH blanked with its BCE fill ended up once its shift was done (at most four), beyond the span it vacated or erased.
 pub type BlankedHalves = [Option<u16>; 4];
 
 /// A cell an early-wrap hole can still be: a blank (space) that is no half of
-/// a wide glyph and no complex cluster. Its colours do not matter, since xterm
-/// blanks the hole with the current background (BCE).
 #[inline]
 const fn is_wrap_hole_blank(cell: &Cell) -> bool {
     use super::CellFlags;
@@ -51,7 +40,6 @@ pub struct Row {
     /// Cell storage.
     cells: PageSlice<Cell>,
     /// One past the last cell output wrote (see [`Row::len`]). If 0, the row
-    /// holds nothing written.
     len: u16,
     /// Row flags.
     flags: RowFlags,
@@ -73,40 +61,12 @@ aterm_types::bitflags! {
         /// Double-height line, bottom half (DECDHL).
         const DOUBLE_HEIGHT_BOTTOM = 1 << 4;
         /// At least one cell is a WIDE head. Set by every wide write and by
-        /// `Row::set`/`overwrite_span` of a wide cell; cleared by whole-row
-        /// clears. Gates the wide fixups so narrow-only rows skip the scan.
         const HAS_WIDE_CHARS = 1 << 5;
         /// The row was filled from a history [`Line`](aterm_scrollback::Line)
-        /// that ends two or more cells before the last column: its line goes on
-        /// at the row's length when the next row continues it, as the line
-        /// does in the tiered store, not at the last column an autowrap would
-        /// have filled. A rewrap makes such a line where it splits a line the
-        /// screen continues (the straddling line under a cursor on its tail).
-        /// The one-cell case is [`Self::EARLY_WRAP_HOLE`].
-        ///
-        /// Set by a row filled from a history line (`fill_row_cells`). Cleared
-        /// by a write into the last cell and every whole-row clear/reset; moved
-        /// with a margined row move as the hole is.
         const ENDS_AT_LEN = 1 << 6;
         /// The row's last cell is an early-wrap hole: a width-2 glyph that
-        /// could not start there wrapped to the next row and left the cell
-        /// unwritten (xterm blanks it with the current background; Ghostty's
-        /// `spacer_head`). It is not content: a rewrap that rejoins the row
-        /// with its continuation drops this one cell, so a space or glyph a
-        /// program really wrote in the last column is kept
-        /// ([`Row::has_early_wrap_hole`]).
-        ///
-        /// Set by the write path's early wrap (`Grid::blank_wide_wrap_tail`),
-        /// the visible rewrap's chunker when it backs a chunk off a wide glyph,
-        /// and a row filled from a history [`Line`](aterm_scrollback::Line)
-        /// that ends one cell short. Cleared by any write into or shift of the
-        /// last cell, every whole-row clear/erase/reset, and a width change
-        /// without rewrap. An erase of the cell (DECERA, ECH, EL) keeps it.
         const EARLY_WRAP_HOLE = 1 << 7;
         /// Mask of DEC line attribute flags (DECDWL/DECDHL).
-        ///
-        /// Erase operations clear character content but keep these line
-        /// attributes, per VT420/VT510 and xterm.
         const LINE_ATTRIBUTES = Self::DOUBLE_WIDTH.bits()
             | Self::DOUBLE_HEIGHT_TOP.bits()
             | Self::DOUBLE_HEIGHT_BOTTOM.bits();
@@ -130,11 +90,8 @@ pub enum LineSize {
 
 impl Row {
     /// Create a new row with the given width.
-    ///
     /// # Safety
-    ///
-    /// `pages` must outlive the returned row. If the row is stored inside
-    /// another owner, that owner must not outlive the backing page store.
+    /// `pages` must outlive the returned row.
     #[must_use]
     #[cfg_attr(
         any(test, debug_assertions),
@@ -155,10 +112,7 @@ impl Row {
     }
 
     /// Return this removed row's cell storage for another row of the same width.
-    /// Snapshots/extras must already own any content that survives the removal.
-    ///
     /// # Safety
-    ///
     /// `pages` must be the live PageStore that allocated this row's cells.
     #[cfg_attr(
         any(test, debug_assertions),
@@ -169,8 +123,7 @@ impl Row {
         )
     )]
     pub(crate) unsafe fn recycle(self, pages: &mut PageStore) {
-        // SAFETY: the caller supplies the originating arena; consuming the Row
-        // transfers its non-Clone PageSlice and leaves no row owning the range.
+        // SAFETY: the caller supplies the originating arena; consuming the Row transfers its non-Clone PageSlice and leaves no row owning the range.
         unsafe { pages.recycle_cells(self.cells) };
     }
 
@@ -202,12 +155,7 @@ impl Row {
         self.cells.page_id()
     }
 
-    /// One past the last cell output wrote on the row: a printed glyph, a
-    /// printed blank included, or a mark attached to a cell. Every writer keeps
-    /// this one rule (`Row::settle_len_after_write`), so the render frame, copy,
-    /// search, history and rewrap see the same line whichever writer printed it
-    /// and wherever the reads were cut. Erasing shrinks it to the last cell that
-    /// still holds content; a cell at or past it was never written.
+    /// One past the last cell output wrote on the row: a printed glyph, a printed blank included, or a mark attached to a cell.
     #[must_use]
     #[inline]
     pub const fn len(&self) -> u16 {
@@ -245,10 +193,7 @@ impl Row {
         }
     }
 
-    /// Is this row's last cell an early-wrap hole
-    /// ([`RowFlags::EARLY_WRAP_HOLE`])? The flag must be set and the cell must
-    /// still hold the blank the wrap left: a glyph written there since (by any
-    /// path) makes it content again.
+    /// Is this row's last cell an early-wrap hole ([`RowFlags::EARLY_WRAP_HOLE`])? The flag must be set and the cell must still hold the blank the wrap left: a glyph written there since (by any path) makes it content again.
     #[must_use]
     #[inline]
     pub fn has_early_wrap_hole(&self) -> bool {
@@ -257,7 +202,6 @@ impl Row {
     }
 
     /// Record (or forget) that this row's last cell is an early-wrap hole.
-    /// Not a visual change, so the row is not marked dirty.
     #[inline]
     pub(crate) fn set_early_wrap_hole(&mut self, hole: bool) {
         if hole {
@@ -267,11 +211,7 @@ impl Row {
         }
     }
 
-    /// The cells output wrote on this row, less a recorded early-wrap hole: the
-    /// row's text as written. [`Row::len`] covers the hole when the wrap blanked
-    /// it with a background colour (BCE), but the hole is still not content
-    /// ([`RowFlags::EARLY_WRAP_HOLE`]), so every reader of a row as written (a
-    /// history line, a copy, a search row) stops before it.
+    /// The cells output wrote on this row, less a recorded early-wrap hole: the row's text as written.
     #[must_use]
     #[inline]
     pub fn written_len(&self) -> u16 {
@@ -282,12 +222,7 @@ impl Row {
         }
     }
 
-    /// How many cells this row contributes to its logical line when the next
-    /// row continues it (soft wrap): autowrap filled it to its last column, so
-    /// every cell is content, blanks included, except a recorded early-wrap
-    /// hole. A row filled from a history line that ends short of that
-    /// ([`RowFlags::ENDS_AT_LEN`]) contributes its length. Single-width rows
-    /// only; the caller checks the continuation.
+    /// How many cells this row contributes to its logical line when the next row continues it (soft wrap): autowrap filled it to its last column, so every cell is content, blanks included, except a recorded early-wrap hole.
     #[must_use]
     #[inline]
     pub(crate) fn continued_len(&self) -> u16 {
@@ -298,8 +233,7 @@ impl Row {
             .saturating_sub(u16::from(self.has_early_wrap_hole()))
     }
 
-    /// Record (or forget) that this row's line goes on at its length when the
-    /// next row continues it ([`RowFlags::ENDS_AT_LEN`]). Not a visual change.
+    /// Record (or forget) that this row's line goes on at its length when the next row continues it ([`RowFlags::ENDS_AT_LEN`]).
     #[inline]
     pub(crate) fn set_ends_at_len(&mut self, short: bool) {
         if short {
@@ -309,10 +243,7 @@ impl Row {
         }
     }
 
-    /// The marks that say where a continued row's content ends, as a margined
-    /// row move carries them from one row to another: a recorded early-wrap
-    /// hole (only while the cell still holds the blank the wrap left) and
-    /// [`RowFlags::ENDS_AT_LEN`].
+    /// The marks that say where a continued row's content ends, as a margined row move carries them from one row to another: a recorded early-wrap hole (only while the cell still holds the blank the wrap left) and [`RowFlags::ENDS_AT_LEN`].
     #[must_use]
     #[inline]
     pub(crate) fn end_marks(&self) -> RowFlags {
@@ -331,8 +262,6 @@ impl Row {
     }
 
     /// A write that lands on the last cell (`end`, exclusive, reaches the row
-    /// end) fills an early-wrap hole: the cell is content from now on, and the
-    /// row is as full as an autowrap leaves it.
     #[inline]
     fn note_write_through(&mut self, end: usize) {
         if end >= self.cells.len() {
@@ -402,8 +331,6 @@ impl Row {
     }
 
     /// Get a cell at the given column.
-    ///
-    /// Returns None if column is out of bounds.
     #[must_use]
     #[inline]
     pub fn get(&self, col: u16) -> Option<&Cell> {
@@ -411,8 +338,6 @@ impl Row {
     }
 
     /// Get a mutable cell at the given column.
-    ///
-    /// Returns None if column is out of bounds.
     #[must_use]
     #[inline]
     pub fn get_mut(&mut self, col: u16) -> Option<&mut Cell> {
@@ -420,9 +345,7 @@ impl Row {
     }
 
     /// Get a cell at the given column (unchecked).
-    ///
     /// # Safety
-    ///
     /// Column must be less than cols().
     #[must_use]
     #[inline]
@@ -433,9 +356,7 @@ impl Row {
     }
 
     /// Get a mutable cell at the given column (unchecked).
-    ///
     /// # Safety
-    ///
     /// Column must be less than cols().
     #[must_use]
     #[inline]
@@ -446,9 +367,6 @@ impl Row {
     }
 
     /// Get mutable access to a cell range after clearing any orphaned wide-char halves.
-    ///
-    /// Returns a clipped slice when `count` would extend past the row end.
-    /// Returns `None` only when `start_col` is past the row bounds.
     #[must_use]
     #[inline]
     pub fn cells_mut_with_fixup(&mut self, start_col: u16, count: u16) -> Option<&mut [Cell]> {
@@ -458,7 +376,6 @@ impl Row {
         }
 
         let old_len = self.len as usize;
-        // The gate keeps the ASCII path free of the cold call.
         let end_half_blanked = self.flags.contains(RowFlags::HAS_WIDE_CHARS)
             && self.fixup_wide_chars_in_range(start_col, count);
         let end = start
@@ -468,19 +385,13 @@ impl Row {
             self.flags |= RowFlags::DIRTY;
             self.note_write_through(end);
         }
-        // `fixup_wide_chars_in_range` can clear a wide continuation at `end`,
-        // one past the returned slice, when the last covered cell is a WIDE
-        // head. When that orphan was the row's last cell, `len` ends at the
-        // span (`settle_len_after_write`'s rule); the caller's update_len()
-        // grows len for what it writes.
         if end_half_blanked && end + 1 == old_len {
             self.len = u16_from_usize(end);
         }
         Some(&mut self.cells[start..end])
     }
 
-    /// Grow `len` to cover content written up to `end_col - 1` by a path that
-    /// does not keep it (e.g. [`Self::cells_mut_with_fixup`]). Never shrinks.
+    /// Grow `len` to cover content written up to `end_col - 1` by a path that does not keep it (e.g. [`Self::cells_mut_with_fixup`]).
     #[inline]
     pub fn update_len(&mut self, end_col: u16) {
         if end_col > self.len {
@@ -488,14 +399,7 @@ impl Row {
         }
     }
 
-    /// Overwrite the cells from column `left` with `cells` (clipped to the
-    /// row), keeping the row's hint as [`Self::set`] does: `HAS_WIDE_CHARS`
-    /// for a copied wide head. `len` is left to the caller, which recomputes
-    /// it after its boundary fixup.
-    ///
-    /// The margined scrolls and IL/DL copy through here: a copy that dropped
-    /// `HAS_WIDE_CHARS` would let the bulk writers (whose wide fixups it gates)
-    /// overwrite a copied head without blanking its continuation.
+    /// Overwrite the cells from column `left` with `cells` (clipped to the row), keeping the row's hint as [`Self::set`] does: `HAS_WIDE_CHARS` for a copied wide head.
     #[inline]
     pub(crate) fn overwrite_span(&mut self, left: usize, cells: &[Cell]) {
         let Some(dst) = self.cells.get_mut(left..) else {
@@ -514,8 +418,6 @@ impl Row {
     }
 
     /// Set a cell at the given column.
-    ///
-    /// Returns true if successful, false if out of bounds.
     #[inline]
     pub fn set(&mut self, col: u16, cell: Cell) -> bool {
         if let Some(c) = self.cells.get_mut(col as usize) {
@@ -524,8 +426,6 @@ impl Row {
                 self.len = col.saturating_add(1);
             }
             let mut new_flags = RowFlags::DIRTY;
-            // Propagate HAS_WIDE_CHARS so fixup_wide_char_overwrite is not
-            // bypassed after reflow copies wide cells via this method.
             if cell.flags().contains(super::CellFlags::WIDE) {
                 new_flags |= RowFlags::HAS_WIDE_CHARS;
             }
@@ -537,18 +437,9 @@ impl Row {
         }
     }
 
-    /// Settle `len` after a bulk wide-char run written through
-    /// [`Row::write_wide_char_packed_no_fixup`]. The run's edge fixup can blank
-    /// an orphaned wide continuation that was the row's last content, which
-    /// must shrink `len` (or `row_text`, search and scrollback show a phantom
-    /// trailing space), and [`Row::update_len`] only grows. Once per run gives
-    /// the same answer as once per glyph: glyphs advance left to right over
-    /// cells the run owns.
+    /// Settle `len` after a bulk wide-char run written through [`Row::write_wide_char_packed_no_fixup`].
     pub fn settle_len_after_wide_run(&mut self, end_col: u16, end_half_blanked: bool) {
-        // The run's unchecked writes skip `note_write_through`; a run that
-        // reached the last cell wrote over any early-wrap hole there.
         self.note_write_through(usize::from(end_col));
-        // The fixup and the unchecked writes leave `len` as it was.
         let old_len = usize::from(self.len);
         self.settle_len_after_write(old_len, usize::from(end_col), end_half_blanked);
     }
@@ -565,20 +456,13 @@ impl Row {
     }
 
     /// Recompute `len` by scanning the entire row for the last non-empty cell.
-    ///
-    /// For callers writing cells via [`Row::set`] (grow-only len) that may
-    /// have overwritten the tail with blanks, e.g. DECCRA `copy_rect` copying
-    /// source blanks and blanking orphaned wide halves; otherwise the emptied
-    /// tail stays inside `len` (phantom trailing spaces). Never over-shrinks.
     #[inline]
     pub(crate) fn recompute_len(&mut self) {
         self.recalculate_len_up_to(self.cells.len());
     }
 
     /// Resize the row to `new_cols`: new cells are empty, excess cells dropped.
-    ///
     /// # Safety
-    ///
     /// `pages` must outlive `self` after the resize, as for [`Row::new`].
     pub unsafe fn resize(&mut self, new_cols: u16, pages: &mut PageStore) {
         let old_cols = self.cols();
@@ -604,21 +488,14 @@ impl Row {
             if let Some(last_cell) = self.cells.get_mut(last_col)
                 && last_cell.flags().contains(super::CellFlags::WIDE)
             {
-                // Wide char at last column can't display its second cell,
-                // replace with space to maintain valid grid state
                 *last_cell = Cell::EMPTY;
                 cleared = true;
             }
-            // WIDE_CONTINUATION at position 0 is not cleared: a true spacer
-            // would sit at position 1 (after WIDE at 0), and the bit is shared
-            // with PROTECTED, so clearing it would corrupt protected cells.
             if cleared {
                 self.recalculate_len_up_to(self.cells.len());
             }
         }
 
-        // The old last cell is no longer the last: a recorded early-wrap hole
-        // names a cell this width does not end on.
         self.flags = (self.flags | RowFlags::DIRTY) - RowFlags::EARLY_WRAP_HOLE;
     }
 
@@ -644,10 +521,7 @@ impl Row {
         self.flags = other.flags | RowFlags::DIRTY;
     }
 
-    /// An owned copy of this row that no [`PageStore`] backs, for a holder that
-    /// must outlive the grid's pages (the alt-screen resize undo: the grid
-    /// replaces its store on a width change, an ED 3 and a ring eviction, so a
-    /// kept `Row` would dangle).
+    /// An owned copy of this row that no [`PageStore`] backs, for a holder that must outlive the grid's pages (the alt-screen resize undo: the grid replaces its store on a width change, an ED 3 and a ring eviction, so a kept `Row` would dangle).
     pub(crate) fn snapshot(&self) -> RowSnapshot {
         RowSnapshot {
             cells: self.cells.to_vec().into_boxed_slice(),
@@ -656,11 +530,8 @@ impl Row {
         }
     }
 
-    /// Rebuild a row from a [`RowSnapshot`], `cols` wide (the snapshot is
-    /// clamped or padded with empty cells when the widths differ).
-    ///
+    /// Rebuild a row from a [`RowSnapshot`], `cols` wide (the snapshot is clamped or padded with empty cells when the widths differ).
     /// # Safety
-    ///
     /// Same contract as [`Row::new`]: `pages` must outlive the returned row.
     pub(crate) unsafe fn from_snapshot(
         snapshot: &RowSnapshot,
@@ -677,8 +548,7 @@ impl Row {
     }
 }
 
-/// A row's cells, length and flags held outside any [`PageStore`]
-/// ([`Row::snapshot`]).
+/// A row's cells, length and flags held outside any [`PageStore`] ([`Row::snapshot`]).
 #[derive(Debug, Clone)]
 pub(crate) struct RowSnapshot {
     cells: Box<[Cell]>,

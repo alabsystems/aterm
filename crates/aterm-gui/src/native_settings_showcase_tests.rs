@@ -1,11 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Settings ▸ Themes: the chooser (highlight is the trial), the strip that
-//! never moves, the trial lane's two endings (one write on Keep; no write,
-//! byte for byte, on every way of reverting), community themes kept through
-//! the pack, Save as theme's round trip, the Customize sheet, and the page's
-//! rows in the compiled tree.
+//! Settings ▸ Themes: the chooser (highlight is the trial), the strip that never moves, the trial lane's two endings (one write on Keep; no write, byte for byte, on every way of reverting), community themes kept through the pack, Save as theme's round trip, the Customize sheet, and the page's rows in the compiled tree.
 
 use super::*;
 use crate::settings_preview::theme_card::Section;
@@ -14,8 +10,6 @@ use showcase_page::{
     palette_with, save_as_text, save_name_problem, suggested_save_name,
 };
 
-/// A Settings view on the Themes page over `source`, and the config service
-/// that owns `source`.
 fn themes_view(
     source: &str,
 ) -> (
@@ -107,13 +101,8 @@ fn user_scheme(
     )
 }
 
-/// Trying a theme writes nothing and asks the host to draw it; Keep (here,
-/// activating the tried card again) writes `theme` exactly once, and the
-/// trial ends when that write lands.
 #[test]
 fn showcase_try_then_keep_writes_config_once() {
-    // One theme always, so Keep writes the name (a theme that follows the
-    // system keeps one side: below).
     let (mut service, mut runtime, instance, view) = themes_view("theme = \"Dracula\"\n");
     let nord = card_action(&runtime, view, "Nord");
     let tried = act(&mut runtime, instance, view, &nord, None);
@@ -138,7 +127,6 @@ fn showcase_try_then_keep_writes_config_once() {
         )),
         "the trial stands while the write is in flight"
     );
-    // A second Keep while it is in flight writes nothing more.
     assert!(
         config_patches(&act(
             &mut runtime,
@@ -174,13 +162,10 @@ fn showcase_try_then_keep_writes_config_once() {
     assert_eq!(state(&runtime, view).showcase.trial, ShowcaseTrial::Idle);
 }
 
-/// While the theme follows the system, Keep writes only the side the page
-/// shows; the other side stays as configured.
 #[test]
 fn showcase_keep_on_a_split_writes_only_the_shown_side() {
     let (_service, mut runtime, instance, view) =
         themes_view("theme = \"dark:Nord,light:Solarized Light\"\n");
-    // The view has seen a light OS: the light side is the one shown.
     let card = card_action(&runtime, view, "Gruvbox Light");
     let _ = act(&mut runtime, instance, view, &card, None);
     let kept = act(&mut runtime, instance, view, "settings/showcase/keep", None);
@@ -192,10 +177,6 @@ fn showcase_keep_on_a_split_writes_only_the_shown_side() {
     );
 }
 
-/// With no theme set (Default, one theme), Keep writes the kept theme's own
-/// name, for whichever side the page shows, and the status names it alone:
-/// keeping never starts following the OS. Negative control: a pair the
-/// person chose keeps having only its shown side replaced.
 #[test]
 fn showcase_keep_with_no_theme_writes_the_plain_name() {
     let keep = |source: &str, id: &str| {
@@ -226,7 +207,6 @@ fn showcase_keep_with_no_theme_writes_the_plain_name() {
         Some("dark:Aterm Day,light:Default Light".to_string())
     );
 
-    // Once it lands, the status names the one theme.
     let mut lab = super::modified::Lab::new("");
     lab.state_mut().navigate(SettingsRoute::Themes);
     let slug = lab
@@ -248,9 +228,6 @@ fn showcase_keep_with_no_theme_writes_the_plain_name() {
     );
 }
 
-/// Every way of ending a trial without Keep — Revert, Esc, leaving the
-/// page — writes nothing: aterm.toml stays byte for byte, and the view stops
-/// asking for the theme.
 #[test]
 fn showcase_try_then_revert_leaves_toml_byte_equal() {
     let source = "# mine\ntheme = \"Hearth\"  # warm\nforeground = \"#c0c0c0\"\n";
@@ -305,12 +282,6 @@ fn showcase_try_then_revert_leaves_toml_byte_equal() {
     }
 }
 
-/// Search Results or the compact category list replacing the Themes page
-/// end its trial, as leaving it does: the host reverts, nothing is written,
-/// the search preview draws the configured theme, and Escape goes to the
-/// surface on glass (the search, then the list), never to the hidden page
-/// (its trial, its filter). Focus alone (the search field before any text)
-/// keeps the trial: the page is still on glass.
 #[test]
 fn a_search_or_the_category_list_over_the_themes_page_ends_the_trial() {
     let source = "theme = \"Dracula\"\n";
@@ -375,7 +346,6 @@ fn a_search_or_the_category_list_over_the_themes_page_ends_the_trial() {
     );
     assert_eq!(service.snapshot().text.to_string(), before);
 
-    // The compact category list over the page.
     let (_service, mut runtime, instance, view) = themes_view(source);
     let hearth = card_action(&runtime, view, "Hearth");
     act(&mut runtime, instance, view, &hearth, None);
@@ -397,10 +367,6 @@ fn a_search_or_the_category_list_over_the_themes_page_ends_the_trial() {
     );
 }
 
-/// The Themes page keeps its heading at every size page_chrome keeps
-/// headings (it alone dropped it, at 80x24 and the shipped 102x29), and the
-/// filter field never moves while a filter is typed (the heading came back
-/// with "Nordz", which matched nothing, and the field dropped 39pt).
 #[test]
 fn the_themes_page_keeps_its_heading_and_its_filter_stays_put() {
     for (width, height) in [
@@ -425,7 +391,6 @@ fn the_themes_page_keeps_its_heading_and_its_filter_stays_put() {
                     crate::native_text_input::TextInputState::new(filter.to_string());
             }
             let compiled = compile_settings_view(&runtime, instance, view, &cx);
-            // Nothing runs past the page's bottom: the demo gives up rows.
             assert_zero_top_paint(&compiled, &context);
             let heading = compiled
                 .semantic(&UiKey::new("settings/page-heading/themes"))
@@ -444,8 +409,6 @@ fn the_themes_page_keeps_its_heading_and_its_filter_stays_put() {
     }
 }
 
-/// Where `node`'s own top is: its painted rect's, uncut by the list's edge
-/// (its semantic rect is what shows of it).
 fn own_top(compiled: &crate::native_ui::CompiledUi, node: &crate::native_ui::SemanticNode) -> f32 {
     compiled
         .paint
@@ -454,10 +417,6 @@ fn own_top(compiled: &crate::native_ui::CompiledUi, node: &crate::native_ui::Sem
         .map_or(node.rect.y, |paint| paint.rect.y)
 }
 
-/// Every screen of the chooser names the section it starts in: a screen that
-/// starts inside BUILT IN repeats its caption over its first row there, as
-/// every Settings list repeats a group's caption; and the Customize sheet
-/// repeats COLORS over a screen that starts inside it.
 #[test]
 fn every_themes_screen_names_the_section_it_starts_in() {
     let mut inside = 0;
@@ -467,13 +426,9 @@ fn every_themes_screen_names_the_section_it_starts_in() {
         let cards = state(&runtime, view).showcase.cards.clone();
         each_screen(&mut runtime, instance, view, &cx, |compiled, top| {
             let list = rect_of(compiled, "settings/showcase/list");
-            // A list whose room cannot hold a caption over a row (the
-            // smallest windows, where the demo is down to one row) shows the
-            // row, its stop's content, and no caption can repeat.
             if list.height < 24.0 + 8.0 + 32.0 {
                 return;
             }
-            // The first row whose top is on the screen.
             let first = compiled
                 .semantics
                 .iter()
@@ -508,7 +463,6 @@ fn every_themes_screen_names_the_section_it_starts_in() {
     }
     assert!(inside > 0, "some screen starts inside a captioned section");
 
-    // The Customize sheet: a screen that starts inside COLORS repeats it.
     let mut inside = 0;
     for (width, height) in [(584.0, 350.0), (738.0, 418.0)] {
         let cx = view_cx_at(width, height);
@@ -528,8 +482,6 @@ fn every_themes_screen_names_the_section_it_starts_in() {
             else {
                 return;
             };
-            // The first colour row whose top is on the screen: a row peeking
-            // in over the last screen's top is the screen before's.
             let first = compiled
                 .semantics
                 .iter()
@@ -566,9 +518,6 @@ fn every_themes_screen_names_the_section_it_starts_in() {
     let _ = inside;
 }
 
-/// Save as theme writes a file that reads back to exactly the colours the
-/// stage shows (theme plus overrides), and once the catalog lists it, one
-/// patch selects it and clears the overrides it now carries.
 #[test]
 fn save_as_writes_conf_that_parses_to_resolved_scheme() {
     let source = "theme = \"Nord\"\nforeground = \"#fafafa\"\nselection_foreground = \"#101010\"\npalette = [\"#ff0000\", \"#00ff00\"]\n";
@@ -582,7 +531,6 @@ fn save_as_writes_conf_that_parses_to_resolved_scheme() {
         aterm_types::Rgb::new(0xfa, 0xfa, 0xfa)
     );
     assert_eq!(resolved.scheme.ansi[0], aterm_types::Rgb::new(0xff, 0, 0));
-    // The pure builder: the text parses to the resolved scheme, renamed.
     let text = save_as_text(
         &resolved,
         "Nord Custom",
@@ -605,7 +553,6 @@ fn save_as_writes_conf_that_parses_to_resolved_scheme() {
         ]
     );
 
-    // Through the page: Save as… then Save.
     let _ = act(
         &mut runtime,
         instance,
@@ -653,7 +600,6 @@ fn save_as_writes_conf_that_parses_to_resolved_scheme() {
             },
         )
         .unwrap();
-    // The catalog lists the new file: its snapshot selects it.
     let (name, scheme) = (id.clone(), parsed.scheme);
     let published =
         service.replace_theme_catalog(crate::app_config::ThemeCatalog::from_schemes([(
@@ -683,7 +629,6 @@ fn save_as_writes_conf_that_parses_to_resolved_scheme() {
         ])
     );
     let (published, _) = apply_real_config_patch(&mut service, &patches[0].0);
-    // Selected and cleared, the terminal draws what the stage showed.
     let after = published
         .config
         .resolved_colors(resolved.side, &published.assets.themes, None);
@@ -692,8 +637,6 @@ fn save_as_writes_conf_that_parses_to_resolved_scheme() {
     assert_eq!(after.scheme.selection_fg, resolved.scheme.selection_fg);
 }
 
-/// A save name is refused before anything is written when it is empty, a
-/// built-in's, already taken or not a theme name.
 #[test]
 fn save_as_refuses_names_that_cannot_be_new_themes() {
     let themes = crate::app_config::ThemeCatalog::from_schemes([user_scheme(
@@ -755,8 +698,6 @@ fn publish_saved_catalog(
         .unwrap()
 }
 
-/// A refused file write cannot consume the colour/palette drafts whose
-/// values it tried to save, including their selection and undo state.
 #[test]
 fn save_as_failure_preserves_exact_unsaved_colour_and_palette_drafts() {
     for outcome in [
@@ -800,8 +741,6 @@ fn save_as_failure_preserves_exact_unsaved_colour_and_palette_drafts() {
     }
 }
 
-/// A saved file's delayed appearance must not rebase its old selection and
-/// override removal onto values committed after the Save click.
 #[test]
 fn save_as_delayed_catalog_preserves_newer_theme_or_colour_values() {
     for (key, value) in [
@@ -843,8 +782,6 @@ fn save_as_delayed_catalog_preserves_newer_theme_or_colour_values() {
     }
 }
 
-/// The watcher and worker are independent: observing the file before its
-/// successful completion must still select it once that completion arrives.
 #[test]
 fn save_as_catalog_before_completion_selects_after_its_own_success() {
     let (mut service, mut runtime, instance, view) = themes_view("theme = \"Nord\"\n");
@@ -880,8 +817,6 @@ fn save_as_catalog_before_completion_selects_after_its_own_success() {
     assert_eq!(snapshot.config.theme.as_deref(), Some(id.as_str()));
 }
 
-/// Leaving a page cancels its pending auto-selection, not the file write
-/// already admitted. Its later completion cannot change the new page's theme.
 #[test]
 fn save_as_leaving_the_page_cancels_delayed_auto_selection() {
     let (mut service, mut runtime, instance, view) = themes_view("theme = \"Nord\"\n");
@@ -913,8 +848,6 @@ fn save_as_leaving_the_page_cancels_delayed_auto_selection() {
     );
 }
 
-/// The select a save sends lets go of exactly the submitted authoring state.
-/// Retyping the same text with new selection/history is still a newer draft.
 #[test]
 fn save_as_success_retires_only_its_unchanged_submitted_drafts() {
     let (mut service, mut runtime, instance, view) = themes_view("theme = \"Nord\"\n");
@@ -1155,8 +1088,6 @@ fn save_as_keeps_drafts_shadowed_by_retained_extended_palette_sources() {
     }
 }
 
-/// Other folder work may finish while the saved file is waiting for the
-/// watcher. Its failure does not revoke this different Save's selection.
 #[test]
 fn save_as_ignores_another_theme_operations_failure() {
     let (mut service, mut runtime, instance, view) = themes_view("theme = \"Nord\"\n");
@@ -1213,9 +1144,6 @@ fn save_as_ignores_another_theme_operations_failure() {
     assert_eq!(snapshot.config.theme.as_deref(), Some(id.as_str()));
 }
 
-/// The positional `palette` list is edited only where it reaches: a slot
-/// past its end is not written into it (it goes to `palette_overrides`), and
-/// resetting drops trailing slots equal to the theme's, down to no key.
 #[test]
 fn palette_list_edits_in_place_and_never_grows() {
     let theme = aterm_types::ColorScheme::default().ansi;
@@ -1230,10 +1158,6 @@ fn palette_list_edits_in_place_and_never_grows() {
     assert_eq!(palette_reset(&two, 2, &theme), vec!["#abcdef".to_string()]);
 }
 
-/// While Themes shows, the rail lists its own row right under Appearance's,
-/// indented, and that row is the selected one — in the semantic tree and in
-/// `controls` alike. Back on Appearance the row is gone and Appearance is
-/// selected: the row is transient and the selection follows the route.
 #[test]
 fn the_rail_selects_the_themes_row_under_appearance() {
     let (_service, mut runtime, instance, view) = themes_view("");
@@ -1256,8 +1180,6 @@ fn the_rail_selects_the_themes_row_under_appearance() {
     );
     let navigation = row("settings/navigation");
     let wallpaper = row("settings/nav/wallpaper");
-    // Directly under Appearance: the column's one gap between them, the
-    // same gap Wallpaper sits under Themes by.
     let gap = wallpaper.rect.y - themes.rect.bottom();
     assert!(gap >= 0.0, "{gap}");
     assert!(
@@ -1280,8 +1202,6 @@ fn the_rail_selects_the_themes_row_under_appearance() {
     assert!(line("settings/nav/themes").contains("selected:true"));
     assert!(line("settings/nav/appearance").contains("selected:false"));
 
-    // Negative control: on Appearance the row is gone and Appearance is
-    // the selected one.
     let _ = act(
         &mut runtime,
         instance,
@@ -1306,7 +1226,6 @@ fn the_rail_selects_the_themes_row_under_appearance() {
     );
 }
 
-/// Put `schemes` in the view's catalog, as a folder rescan does.
 fn admit_catalog(
     service: &mut VersionedConfigService,
     runtime: &mut NativeRuntime,
@@ -1337,8 +1256,6 @@ fn finish_patch(
     operation: OperationId,
     applied: bool,
 ) {
-    // Landed at the revision after the page's snapshot, as a write the
-    // snapshot that holds it has not reached yet.
     let outcome = if applied {
         ConfigPatchOutcome::Applied {
             revision: state(runtime, view).snapshot_revision + 1,
@@ -1358,10 +1275,6 @@ fn finish_patch(
         .unwrap();
 }
 
-/// Save as theme lets go of nothing before the write lands: a failed write
-/// reopens the name row with the name and the reason, and the colour and
-/// palette drafts are still there. Once the saved theme is selected, the
-/// drafts it carries go (the control: they do go on success).
 #[test]
 fn save_as_keeps_drafts_and_name_until_the_theme_is_selected() {
     let (mut service, mut runtime, instance, view) = themes_view("theme = \"Nord\"\n");
@@ -1477,10 +1390,6 @@ fn save_as_keeps_drafts_and_name_until_the_theme_is_selected() {
     );
 }
 
-/// A save made while a theme is tried keeps that trial standing until the
-/// patch selecting the saved theme lands (as Keep does), so the screen never
-/// falls back to the old configured theme in between; the live region then
-/// names the saved theme, the one the patch wrote, not the trial it ended.
 #[test]
 fn save_as_during_a_trial_holds_it_until_the_select_lands() {
     let (mut service, mut runtime, instance, view) = themes_view("");
@@ -1531,10 +1440,6 @@ fn save_as_during_a_trial_holds_it_until_the_select_lands() {
     assert!(!settled.ends_with(&showcase.label_of("Nord")), "{settled}");
 }
 
-/// A row the arrows reach after Save, before the catalog lists the saved
-/// file, is a new choice, as a click is: the save is not selected over it
-/// and the trial is not ended by a write that did not keep it. Negative
-/// control: with no arrow the save is selected.
 #[test]
 fn a_highlight_move_after_save_drops_the_select() {
     for arrow in [true, false] {
@@ -1592,10 +1497,6 @@ fn a_highlight_move_after_save_drops_the_select() {
     }
 }
 
-/// Keep and Keep colours only pressed from the keyboard leave it on a live
-/// control once they land (the kept row), where the next Tab goes on from;
-/// the strip's buttons are gone by then. Negative control: a keyboard
-/// elsewhere (on a row) stays where it is.
 #[test]
 fn keep_from_the_keyboard_lands_on_the_kept_row() {
     let cx = view_cx_at(1_284.0, 714.0);
@@ -1609,7 +1510,6 @@ fn keep_from_the_keyboard_lands_on_the_kept_row() {
             studio_catalog("font_family = Berkeley Mono\n"),
         );
         let studio = card_action(&runtime, view, "Studio");
-        // The page is drawn before anything on it is pressed.
         let _ = compile_settings_view(&runtime, instance, view, &cx);
         let _ = act(&mut runtime, instance, view, &studio, None);
         if button == SHOWCASE_KEEP_COLOURS_KEY {
@@ -1642,12 +1542,6 @@ fn keep_from_the_keyboard_lands_on_the_kept_row() {
     }
 }
 
-/// WHILE A KEEP SAVES THE CHOOSER TAKES THE ARROW: the theme the Keep
-/// writes is the one in use at once, so the arrow tries the next row over
-/// it, the keyboard with the highlight, and the Keep still lands. Before,
-/// the highlight held while the Keep saved ("Keeping the theme you tried…")
-/// and the arrow was dropped. Negative control: the kept row's own press
-/// changes nothing (it is the theme in use).
 #[test]
 fn an_arrow_during_keeping_tries_the_next_row() {
     let (mut service, mut runtime, instance, view) = themes_view("");
@@ -1657,7 +1551,6 @@ fn an_arrow_during_keeping_tries_the_next_row() {
     let (patch, operation) = config_patches(&kept)[0].clone();
     let _ = compile_settings_view(&runtime, instance, view, &view_cx_at(1_284.0, 714.0));
     focus_on(&mut runtime, view, &nord);
-    // The kept row's own press: still the Keep on its way.
     let _ = act(&mut runtime, instance, view, &nord, None);
     assert!(matches!(
         state(&runtime, view).showcase.trial,
@@ -1710,8 +1603,6 @@ fn an_arrow_during_keeping_tries_the_next_row() {
     );
 }
 
-/// The compiled page's `key`: whether it takes a press, and whether it
-/// reads as busy.
 fn takes_press(
     runtime: &NativeRuntime,
     instance: crate::native_app::AppInstanceId,
@@ -1726,7 +1617,6 @@ fn takes_press(
     (state.enabled, state.busy)
 }
 
-/// The follows `outcome`'s config writes carry, in order.
 fn write_follows(outcome: &crate::native_app::DispatchOutcome) -> Vec<Vec<OperationId>> {
     outcome
         .effects
@@ -1738,11 +1628,6 @@ fn write_follows(outcome: &crate::native_app::DispatchOutcome) -> Vec<Vec<Operat
         .collect()
 }
 
-/// Land `patch` (`operation`) as the config lane does: written to the real
-/// service, finished, and the snapshot that holds it published. A write
-/// that follows another of the page's is checked at the revision that one
-/// landed at (`follows_landed`), as the lane checks it
-/// (`App::native_config_followed_base`). The revision it landed at.
 fn land_patch(
     service: &mut VersionedConfigService,
     runtime: &mut NativeRuntime,
@@ -1776,16 +1661,6 @@ fn land_patch(
     revision
 }
 
-/// KEEP AND REVERT TAKE EVERY PRESS WHILE A KEEP SAVES (the press shows at
-/// once; the writes follow one another in the config lane). With the Keep's
-/// write on its way, Keep and Revert are drawn enabled and never busy; a
-/// second Keep asks for what the first already writes and writes nothing;
-/// Revert writes the theme back over the Keep, following it, ends the trial
-/// at once ("Reverted to Dracula", the highlight on Dracula, no trial asked
-/// of the host), and once both land aterm.toml is as it began. Escape over
-/// a Keep on its way is the same Revert. Before, Keep read disabled and busy
-/// and Revert disabled while the Keep saved, so a second press was dropped
-/// (`aterm ctl pointer click` answered key=-) and Escape did nothing.
 #[test]
 fn keep_and_revert_take_presses_while_the_keep_saves() {
     let source = "theme = \"Dracula\"\n";
@@ -1802,8 +1677,6 @@ fn keep_and_revert_take_presses_while_the_keep_saves() {
                 "{key} takes a press while the Keep saves"
             );
         }
-        // The strip still says what the trial replaces, not the kept theme
-        // the key already shows.
         let compiled = compile_settings_view(&runtime, instance, view, &view_cx_at(1_284.0, 714.0));
         let detail =
             painted_text(&compiled, "settings/showcase/status/detail").expect("the strip's detail");
@@ -1887,12 +1760,6 @@ fn keep_and_revert_take_presses_while_the_keep_saves() {
     }
 }
 
-/// KEEP COLOURS ONLY FOLLOWS A KEEP ON ITS WAY: while a typography theme's
-/// Keep saves, Keep ▾ is still offered (the Keep on its way is read as the
-/// trial it keeps), and Keep colours only writes the type pins over it,
-/// following it; a second press of it asks for what the first holds and
-/// writes nothing. Both land: the theme and the pins. Before, Keep ▾ was
-/// gone while the Keep saved.
 #[test]
 fn keep_colours_only_follows_a_keep_on_its_way() {
     let (mut service, mut runtime, instance, view) = typography_view(
@@ -1971,14 +1838,6 @@ fn keep_colours_only_follows_a_keep_on_its_way() {
     assert_eq!(state(&runtime, view).showcase.trial, ShowcaseTrial::Idle);
 }
 
-/// A REVERT TAKES BACK EVERY KEEP OF THE TRIAL ON ITS WAY: Keep, then Keep
-/// colours only over it, then Revert, all within one save. The strip still
-/// says what the trial replaces ("was Dracula", never the kept Studio), and
-/// Revert puts `theme` back to Dracula and takes the type pin off in one
-/// write that follows them, so aterm.toml ends as it began. Before, Revert
-/// and the strip read only the newest Keep (Keep colours only, whose
-/// `theme` edit went from Studio to Studio): the strip said "was Studio" and
-/// Revert left `theme = "Studio"`.
 #[test]
 fn a_revert_takes_back_a_keep_and_its_keep_colours_only() {
     let source = "theme = \"Dracula\"\n";
@@ -2065,13 +1924,6 @@ fn a_revert_takes_back_a_keep_and_its_keep_colours_only() {
     assert_eq!(state(&runtime, view).showcase.trial, ShowcaseTrial::Idle);
 }
 
-/// A REVERT THAT LANDS SAYS IT REVERTED, from the operation's own kind,
-/// whatever its take-back wrote: after a Keep alone (one key back) and after
-/// a Keep and Keep colours only over it (the theme and its type pins back),
-/// the status once every write lands is "Reverted to Dracula". Before, the
-/// landing named the Revert from the keys it wrote, like any other change:
-/// "Color theme set to Dracula" for the one key, "Changed 3 settings" for
-/// the three.
 #[test]
 fn a_landed_revert_says_it_reverted() {
     let source = "theme = \"Dracula\"\n";
@@ -2139,13 +1991,6 @@ fn a_landed_revert_says_it_reverted() {
     }
 }
 
-/// A REFUSED REVERT SAYS IT DID NOT REVERT, from the operation's own kind:
-/// pressed while a Keep saves (one key back) and while a Keep and a Keep
-/// colours only over it save (three keys back), the Keeps landing, a Revert
-/// the config lane refuses reads "Couldn't revert to Dracula: " and why.
-/// Before, it was named from the keys it wrote, like any other change:
-/// "Color theme was not saved: no" for the one key, "Couldn't apply: no"
-/// for the three.
 #[test]
 fn a_refused_revert_says_it_did_not_revert() {
     for colours_only in [false, true] {
@@ -2172,7 +2017,6 @@ fn a_refused_revert_says_it_did_not_revert() {
             );
             writes.push(config_patches(&pinned)[0].clone());
         }
-        // Revert pressed while the Keeps save: its take-back follows them.
         let reverted = act(
             &mut runtime,
             instance,
@@ -2202,12 +2046,6 @@ fn a_refused_revert_says_it_did_not_revert() {
     }
 }
 
-/// KEEP COLOURS ONLY SAYS WHAT IT KEPT, from the operation's own kind:
-/// once it lands, "Kept Studio's colors and your type settings", the words
-/// it said while it saved with "Keeping" put by; refused, "Couldn't keep
-/// Studio's colors: " and why. Before, the landing was named from the
-/// three keys it wrote, "Changed 3 settings", and the refusal "Couldn't
-/// apply: no".
 #[test]
 fn keep_colours_only_says_what_it_kept() {
     for applied in [true, false] {
@@ -2259,11 +2097,6 @@ fn keep_colours_only_says_what_it_kept() {
     }
 }
 
-/// KEEP AFTER KEEP COLOURS ONLY KEEPS THE THEME AS TRIED: with Keep colours
-/// only on its way, Keep writes the type pin off again (its theme's own
-/// type comes back), following it; a third press asks nothing more. Both
-/// land: `theme = "Studio"` and no pin. Before, Keep over a Keep on its way
-/// wrote nothing and the press was lost.
 #[test]
 fn keep_after_keep_colours_only_takes_the_pins_off() {
     let (mut service, mut runtime, instance, view) =
@@ -2290,7 +2123,6 @@ fn keep_after_keep_colours_only_takes_the_pins_off() {
     assert_eq!(keep.len(), 1, "Keep over Keep colours only is a write");
     assert_eq!(write_follows(&kept), vec![vec![pins_op]]);
     let (keep, keep_op) = keep[0].clone();
-    // Each type key Keep colours only pinned goes back to unset.
     let mut pinned: Vec<(&str, Option<&str>)> = pins
         .edits
         .iter()
@@ -2341,10 +2173,6 @@ fn keep_after_keep_colours_only_takes_the_pins_off() {
     assert_eq!(state(&runtime, view).showcase.trial, ShowcaseTrial::Idle);
 }
 
-/// SAVE TAKES A SECOND SAVE WHILE THE FIRST IS ON ITS WAY: each is its own
-/// request to the themes folder, the newest the one selected once listed.
-/// Before, the second was refused ("Working on the themes folder…") while
-/// any themes request was out.
 #[test]
 fn save_as_takes_a_second_save_while_the_first_is_on_its_way() {
     let (_service, mut runtime, instance, view) = themes_view("theme = \"Dracula\"\n");
@@ -2381,8 +2209,6 @@ fn save_as_takes_a_second_save_while_the_first_is_on_its_way() {
     );
 }
 
-/// A name the theme file spells differently (a space before `#`) still
-/// saves: the scheme is named as the file writes it.
 #[test]
 fn save_as_text_accepts_a_name_the_file_respells() {
     let (_service, runtime, _instance, view) = themes_view("theme = \"Nord\"\n");
@@ -2409,9 +2235,6 @@ fn save_as_text_accepts_a_name_the_file_respells() {
     );
 }
 
-/// Return in the filter keeps the trial only while the filter lists its
-/// row: a trial the typed text hid writes nothing. Negative control: a
-/// filter that still lists it keeps it, in one write.
 #[test]
 fn return_in_the_filter_keeps_only_a_listed_trial() {
     for (typed, writes) in [("nord", 0), ("drac", 1)] {
@@ -2432,9 +2255,6 @@ fn return_in_the_filter_keeps_only_a_listed_trial() {
     }
 }
 
-/// Tuning one palette slot with no `palette` list writes that slot alone
-/// (`palette_overrides.<slot>`): every other slot keeps following the theme
-/// tried, and the slot's Reset removes just its key.
 #[test]
 fn palette_slot_edit_writes_one_sparse_key() {
     let (mut service, mut runtime, instance, view) = themes_view("theme = \"Nord\"\n");
@@ -2477,8 +2297,6 @@ fn palette_slot_edit_writes_one_sparse_key() {
         .dispatch(instance, view, AppEvent::ConfigChanged(published))
         .unwrap();
     let state_now = state(&runtime, view);
-    // The notice names the slot as its chip does and says the colour, never
-    // the raw key as an unknown one.
     let said = state_now.feedback.clone().unwrap_or_default();
     assert!(said.starts_with("Palette color 12, bright blue "), "{said}");
     assert!(said.contains("#123456"), "{said}");
@@ -2518,8 +2336,6 @@ fn palette_slot_edit_writes_one_sparse_key() {
     assert_eq!(edits, vec![("palette_overrides.12".to_string(), None)]);
 }
 
-/// A theme of the person's own carries Open and Trash. Trash asks once and
-/// moves on the second press; the theme in use is never moved.
 #[test]
 fn yours_cards_open_and_trash_their_file() {
     let (mut service, mut runtime, instance, view) = themes_view("theme = \"paper\"\n");
@@ -2584,9 +2400,6 @@ fn yours_cards_open_and_trash_their_file() {
     );
 }
 
-/// A palette slot set in `[palette_overrides]` is carried by the saved
-/// theme, so the select that names the new theme also clears that table, and
-/// the real config service accepts the pair.
 #[test]
 fn save_as_over_a_slot_override_selects_the_theme_and_clears_the_slot() {
     let (mut service, mut runtime, instance, view) =
@@ -2607,7 +2420,6 @@ fn save_as_over_a_slot_override_selects_the_theme_and_clears_the_slot() {
     let patches = config_patches(&published);
     assert_eq!(patches.len(), 1, "one select patch");
     let (snapshot, _) = apply_real_config_patch(&mut service, &patches[0].0);
-    // Over the unset theme the select is the saved theme's own name.
     assert_eq!(snapshot.config.theme.as_deref(), Some(id.as_str()));
     assert!(
         snapshot
@@ -2618,8 +2430,6 @@ fn save_as_over_a_slot_override_selects_the_theme_and_clears_the_slot() {
         "{:?}",
         snapshot.config.palette_overrides
     );
-    // The notice says where the palette comes from now, by the theme's name,
-    // never the raw key's label and "its default".
     finish_patch(&mut runtime, instance, view, patches[0].1, true);
     runtime
         .dispatch(instance, view, AppEvent::ConfigChanged(snapshot))
@@ -2632,13 +2442,6 @@ fn save_as_over_a_slot_override_selects_the_theme_and_clears_the_slot() {
     assert!(!said.contains("its default"), "{said}");
 }
 
-/// Save as over a pair that draws one theme on both sides selects the saved
-/// theme by Keep's rule, as for any pair: only one side changes — the side
-/// the saved theme is made for (Dark, Hearth's, though this OS is light)
-/// where the page's Dark | Light segment names none, and the page then shows
-/// that side, the saved theme highlighted; the side the segment names once
-/// the person chose one. The old special case wrote the saved theme on both
-/// sides, a pair that follows nothing.
 #[test]
 fn save_as_over_a_one_theme_pair_selects_by_keeps_rule() {
     let select = |segment: Option<&str>| {
@@ -2682,7 +2485,6 @@ fn save_as_over_a_one_theme_pair_selects_by_keeps_rule() {
         Some(id.as_str()),
         "the page shows it"
     );
-    // Negative control: the side the person chose wins.
     let (id, theme, highlighted) = select(Some("settings/showcase/side/light"));
     assert_eq!(theme, Some(format!("dark:Hearth,light:{id}")));
     assert_eq!(highlighted.as_deref(), Some(id.as_str()));
@@ -2692,7 +2494,6 @@ fn hex(color: aterm_types::Rgb) -> String {
     format!("#{:02x}{:02x}{:02x}", color.r, color.g, color.b)
 }
 
-/// The stage's preview spec on a compiled page, if the page draws one.
 fn stage_spec(
     compiled: &crate::native_ui::CompiledUi,
 ) -> Option<crate::settings_preview::SettingsPreviewSpec> {
@@ -2702,8 +2503,6 @@ fn stage_spec(
     })
 }
 
-/// Off the Themes page too, a preview over a Follow system pair names the
-/// side it draws, not `Dark:Nord,light:…`.
 #[test]
 fn a_pair_preview_names_the_side_it_draws() {
     let (_service, mut runtime, instance, view) =
@@ -2725,7 +2524,6 @@ fn a_pair_preview_names_the_side_it_draws() {
     );
 }
 
-/// The one AddPack request a pack card's press sends, if it sent one.
 fn add_pack_request(outcome: &crate::native_app::DispatchOutcome) -> Vec<(String, OperationId)> {
     outcome
         .effects
@@ -2740,20 +2538,16 @@ fn add_pack_request(outcome: &crate::native_app::DispatchOutcome) -> Vec<(String
         .collect()
 }
 
-/// A catalog of one typography theme `Studio` (and the built-ins).
 fn studio_catalog(extra: &str) -> std::sync::Arc<crate::app_config::ThemeCatalog> {
     let text = format!("foreground = #e0e0e0\nbackground = #101418\n{extra}");
     let parsed = aterm_types::scheme::parse_theme_str(&text).expect("a theme");
     crate::app_config::ThemeCatalog::from_parsed([("Studio".to_string(), parsed)])
 }
 
-/// Type settings Keep colours only can pin each of at aterm's own value:
-/// a font family, and a line height whose pin is aterm's default (1.0).
 const PINNABLE_TYPE: &str = "font_family = Berkeley Mono\nline_height = 1.15\n";
 
 const STUDIO_TYPE: &str = "font_family = Berkeley Mono\nline_height = 1.15\nfont_weight = 450\n";
 
-/// The Themes page over `source` with `themes` admitted.
 fn typography_view(
     source: &str,
     themes: std::sync::Arc<crate::app_config::ThemeCatalog>,
@@ -2774,7 +2568,6 @@ fn typography_view(
     (service, runtime, instance, view)
 }
 
-/// The control at `key` in `compiled`, enabled or not.
 fn enabled(compiled: &crate::native_ui::CompiledUi, key: &str) -> Option<bool> {
     compiled
         .semantic(&UiKey::new(key))
@@ -2783,9 +2576,6 @@ fn enabled(compiled: &crate::native_ui::CompiledUi, key: &str) -> Option<bool> {
 
 const SHOWCASE_KEEP_COLOURS_KEY: &str = "settings/showcase/keep-colours";
 
-/// A font row the config leaves unset reads the theme's value "(from theme
-/// X)", its picker's reset reads "Use theme's (…)", and a row the config sets
-/// says it overrides the theme while its Reset returns to the theme's.
 #[test]
 fn font_rows_name_the_themes_values() {
     let (_service, runtime, _instance, view) = typography_view(
@@ -2807,7 +2597,6 @@ fn font_rows_name_the_themes_values() {
         view_state.theme_fallback_for(prefs::EDIT_LINE_HEIGHT),
         Some(("1.15".to_string(), "Studio".to_string()))
     );
-    // Negative control: without the theme the row is aterm's default.
     let (_service, runtime, _instance, view) =
         typography_view("line_height = 1.4\n", studio_catalog(STUDIO_TYPE));
     let view_state = state(&runtime, view);
@@ -2821,15 +2610,6 @@ fn font_rows_name_the_themes_values() {
     );
 }
 
-/// A ROW THAT OVERRIDES THE THEME'S TYPE COMPILES, ITS RESET NAMED BY ITS
-/// WORDS: Text & Fonts over `theme = "Studio"` with the line height and the
-/// font family set over Studio's (the state Keep colours only leaves) lays
-/// out, and each Reset that returns to the theme's value paints "Use
-/// theme's" inside an accessible name that says it and the value it returns
-/// to. Before, the name read "Reset Line height to theme Studio's (1.15)",
-/// which does not hold the painted words, so the page refused to compile in
-/// every development build (`VisibleLabelNotInName`) and a person speaking
-/// the button's words could not reach it.
 #[test]
 fn a_reset_to_the_themes_type_is_named_by_its_words() {
     let (_service, mut runtime, instance, view) = typography_view(
@@ -2860,13 +2640,6 @@ fn a_reset_to_the_themes_type_is_named_by_its_words() {
     }
 }
 
-/// A RESET THAT HANDS A TYPE SETTING BACK TO THE THEME SAYS THE THEME'S
-/// VALUE: pressing "Use theme's" on Line height over `theme = "Studio"`
-/// (1.15) says "Line height reset to Studio's 1.15×", the value now drawn,
-/// and so does Keep after Keep colours only, which hands the pins back.
-/// Negative control: with no theme behind it the Reset says aterm's own
-/// default. Before, both said "reset to 1.0×", aterm's default, while the
-/// theme's 1.15 was drawn.
 #[test]
 fn a_reset_to_the_themes_type_says_the_themes_value() {
     for (source, words) in [
@@ -2901,9 +2674,6 @@ fn a_reset_to_the_themes_type_says_the_themes_value() {
     }
 }
 
-/// Save as theme with "Include type settings" writes the type the page shows
-/// and reads it back whole, and carries those keys; without it the file
-/// carries none.
 #[test]
 fn save_as_theme_includes_type_settings_on_request() {
     let resolved = Config::default().resolved_colors(
@@ -2939,8 +2709,6 @@ fn save_as_theme_includes_type_settings_on_request() {
     );
 }
 
-/// A refused Keep goes back to trying, so the strip never claims a write
-/// that did not happen, and its second line says why.
 #[test]
 fn showcase_refused_keep_returns_to_the_trial() {
     let (_service, mut runtime, instance, view) = themes_view("");
@@ -2979,10 +2747,6 @@ fn showcase_refused_keep_returns_to_the_trial() {
     );
 }
 
-/// The page's rows are in the compiled tree like every other row, at every
-/// shape: the list (a ListBox) of options named by the theme with its
-/// appearance and contrast as the value, the filter, the strip, the demo
-/// and the footer; in Customize, the registry rows and the palette.
 #[test]
 fn showcase_page_compiles_its_rows_into_the_semantic_tree() {
     let (_service, mut runtime, instance, view) = themes_view("");
@@ -3017,7 +2781,6 @@ fn showcase_page_compiles_its_rows_into_the_semantic_tree() {
                 == 1,
             "{width}x{height}: one highlighted row"
         );
-        // Compact lists the footer as the list's last rows, out of view.
         let footer = (width >= 640.0).then_some("settings/showcase/follow-system");
         for key in [
             "settings/showcase/filter",
@@ -3065,8 +2828,6 @@ fn showcase_page_compiles_its_rows_into_the_semantic_tree() {
     );
 }
 
-/// The palette slot editor is drawn wherever its swatch is, and Save as
-/// draws its name row: neither opens out of sight.
 #[test]
 fn customize_editors_open_on_the_page_shown() {
     let (_service, mut runtime, instance, view) = themes_view("");
@@ -3120,8 +2881,6 @@ fn customize_editors_open_on_the_page_shown() {
     );
 }
 
-/// A Yours row in use still says its whole name beside Open, and Open sits
-/// inside the row.
 #[test]
 fn a_yours_card_keeps_its_name_beside_its_file_actions() {
     let (mut service, mut runtime, instance, view) = themes_view("theme = \"Harbor Dusk\"\n");
@@ -3171,8 +2930,6 @@ fn a_yours_card_keeps_its_name_beside_its_file_actions() {
     }
 }
 
-/// The chooser is one list: ↓ walks its rows in order, trying each, and the
-/// focused row is always in the tree (scrolled into view); ↑ walks back.
 #[test]
 fn list_arrows_walk_rows_and_the_list_follows() {
     let (_service, mut runtime, instance, view) = themes_view("theme = \"Dracula\"\n");
@@ -3237,10 +2994,6 @@ fn list_arrows_walk_rows_and_the_list_follows() {
     );
 }
 
-/// Esc unwinds the page deepest first (§5.5): the slot editor, then the
-/// Customize sheet; the filter's text while it has the keyboard, then the
-/// trial. With nothing left to cancel it does nothing: the page stays
-/// (navigation is the sidebar's, and on a compact page All Settings').
 #[test]
 fn showcase_escape_unwinds_slot_sheet_filter_trial_then_stays() {
     let escape = |runtime: &mut NativeRuntime,
@@ -3282,7 +3035,6 @@ fn showcase_escape_unwinds_slot_sheet_filter_trial_then_stays() {
         Some("nord"),
     );
     let _ = compile_settings_view(&runtime, instance, view, &view_cx_at(1_284.0, 714.0));
-    // ↓ from the filter tries the first match and keeps the keyboard there.
     runtime
         .dispatch(instance, view, AppEvent::StepFocus(1))
         .unwrap();
@@ -3304,7 +3056,6 @@ fn showcase_escape_unwinds_slot_sheet_filter_trial_then_stays() {
     assert_eq!(state(&runtime, view).route, SettingsRoute::Themes);
 }
 
-/// The ids a showcase lists.
 fn listed_ids(showcase: &ShowcaseState) -> BTreeSet<String> {
     showcase
         .visible()
@@ -3313,11 +3064,6 @@ fn listed_ids(showcase: &ShowcaseState) -> BTreeSet<String> {
         .collect()
 }
 
-/// A COPY AN EARLIER RELEASE INSTALLED HAS NO COMMUNITY TWIN: a pack theme
-/// the chooser now shows under another name (its id kept), installed by a
-/// release that showed it under its id, is listed once, under Yours, and
-/// Community offers no second row that Keep would add again. Negative
-/// control: with no file, Community offers it under the name it is shown by.
 #[test]
 fn an_earlier_releases_pack_copy_has_no_community_twin() {
     let renamed = aterm_theme_pack::themes()
@@ -3357,9 +3103,6 @@ fn an_earlier_releases_pack_copy_has_no_community_twin() {
     }
 }
 
-/// COMMUNITY lists exactly the pack themes the folder has no file for, and
-/// only while it is open. Negative control: once the folder holds "Kanagawa
-/// Wave" its community row goes (its own row is under Yours).
 #[test]
 fn community_lists_only_the_pack_themes_the_folder_lacks() {
     let pack: BTreeSet<String> = aterm_theme_pack::themes()
@@ -3405,9 +3148,6 @@ fn community_lists_only_the_pack_themes_the_folder_lacks() {
     );
 }
 
-/// A typography row says what it sets, in its value, and the filter finds
-/// it by its font or by "font". Negative control: a colours-only row sets
-/// nothing and says none of it.
 #[test]
 fn a_typography_card_says_what_type_it_sets() {
     let cards = crate::settings_preview::theme_card::showcase_cards(&studio_catalog(STUDIO_TYPE));
@@ -3437,12 +3177,6 @@ fn a_typography_card_says_what_type_it_sets() {
     );
 }
 
-/// The demo of a tried theme whose family is `display:` draws those display
-/// faces over the automatic font, as Keep would leave them
-/// (`Config::display_faces_request`): the candidate's font is never the
-/// display family, which no resolver answers with a face (the demo fell back
-/// to the current font and drew no display face at all). The config's own
-/// `display_font` still wins. Negative control: a real family is the font.
 #[test]
 fn a_tried_display_family_is_the_demos_display_layer() {
     let tried = |source: &str, theme_type: &str| {
@@ -3469,11 +3203,6 @@ fn a_tried_display_family_is_the_demos_display_layer() {
     assert!(font.display.is_empty());
 }
 
-/// Trying a typography theme draws its colours only and lists, by key, what
-/// its type settings would change, with the value each takes. Keep ▾'s Keep
-/// colours only writes ONE patch: the theme and each changed setting pinned
-/// at its current value. Negative control: a colours-only theme lists
-/// nothing and offers no second Keep.
 #[test]
 fn trying_a_typography_theme_offers_keep_colours_only() {
     let studio_type = "font_family = Berkeley Mono\nline_height = 1.15\nligatures = false\n";
@@ -3488,7 +3217,6 @@ fn trying_a_typography_theme_offers_keep_colours_only() {
         .iter()
         .map(|change| (change.key, change.theme.as_str()))
         .collect();
-    // The line height now is the platform default (`app_config::DEFAULT_LINE_HEIGHT`).
     let line = if cfg!(windows) { "1.1" } else { "1.0" };
     assert_eq!(
         changes,
@@ -3533,8 +3261,6 @@ fn trying_a_typography_theme_offers_keep_colours_only() {
             (prefs::EDIT_LIGATURES.to_string(), Some("true".to_string())),
         ]),
     );
-    // The pins really keep the face: the config they make resolves to no
-    // theme typography at all.
     let pinned: Config = aterm_toml::from_str(&format!(
         "theme = \"Studio\"\nfont_family = \"\"\nline_height = {line}\nligatures = true\n",
     ))
@@ -3546,7 +3272,6 @@ fn trying_a_typography_theme_offers_keep_colours_only() {
     );
     assert!(typo.applied.keys().is_empty(), "{:?}", typo.applied.keys());
 
-    // Negative control.
     let (_service, mut runtime, instance, view) =
         typography_view("theme = \"Dracula\"\n", studio_catalog(""));
     let studio = card_action(&runtime, view, "Studio");
@@ -3562,11 +3287,6 @@ fn trying_a_typography_theme_offers_keep_colours_only() {
     assert_eq!(enabled(&compiled, SHOWCASE_KEEP_COLOURS_KEY), None);
 }
 
-/// Trying a colours-only theme while the configured theme sets the line
-/// height is a type change too: Keep returns the line height to aterm's own,
-/// so the demo draws that line height, and Keep colours only is offered and
-/// pins the configured theme's. Negative control: between two colours-only
-/// themes nothing changes and only Keep is offered.
 #[test]
 fn trying_away_from_a_typography_theme_shows_and_offers_its_type_change() {
     let cx = view_cx_at(1_284.0, 714.0);
@@ -3628,7 +3348,6 @@ fn trying_away_from_a_typography_theme_shows_and_offers_its_type_change() {
         edit.key == prefs::EDIT_LINE_HEIGHT && edit.value.as_deref() == Some("1.4")
     }));
 
-    // Negative control.
     let (_service, mut runtime, instance, view) =
         typography_view("theme = \"Studio\"\n", studio_catalog(""));
     let dracula = card_action(&runtime, view, "Dracula");
@@ -3640,10 +3359,6 @@ fn trying_away_from_a_typography_theme_shows_and_offers_its_type_change() {
     assert_eq!(enabled(&compiled, "settings/showcase/keep-more"), None);
 }
 
-/// A theme that sets `font_weight` cannot be kept as colours only: no
-/// aterm.toml value keeps the font's own weight. Keep ▾'s chevron is
-/// absent, and pressing Keep colours only anyway (the palette) writes
-/// nothing. Negative control: the same theme without the weight offers it.
 #[test]
 fn keep_colours_only_is_withheld_when_a_change_cannot_be_pinned() {
     let (_service, mut runtime, instance, view) =
@@ -3688,10 +3403,6 @@ fn keep_colours_only_is_withheld_when_a_change_cannot_be_pinned() {
     );
 }
 
-/// Save as theme draws the type switch's own words beside it (a plain
-/// switch paints none) while there is type to include, and Save's
-/// description says what the save writes: with the switch on, the type
-/// settings too. Negative control: with no type in force, no switch.
 #[test]
 fn save_as_theme_labels_its_type_switch() {
     let cx = view_cx_at(1_284.0, 714.0);
@@ -3756,15 +3467,11 @@ fn save_as_theme_labels_its_type_switch() {
     );
 }
 
-// The chooser, the strip and the demo (design §2–§8)
-
 const ROW: &str = "settings/showcase/card/";
 const STATUS: &str = "settings/showcase/status";
 const STAGE: &str = "settings/showcase/stage";
-/// The widths the page takes its three shapes at: Compact, Medium, Wide.
 const SHAPES: [f32; 3] = [556.0, 934.0, 1_284.0];
 
-/// Put the keyboard on `key`, as Tab or a click would.
 fn focus_on(runtime: &mut NativeRuntime, view: crate::native_app::ViewId, key: &str) {
     let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
         unreachable!()
@@ -3773,9 +3480,6 @@ fn focus_on(runtime: &mut NativeRuntime, view: crate::native_app::ViewId, key: &
     state.common.focus_visible = true;
 }
 
-/// The chooser scrolled back to the top of its list, as a reader scrolls it:
-/// the page opens on the highlighted row ([`SettingsViewState::reset_page_scroll`]),
-/// and a test of the list's first screen starts it there.
 fn list_at_top(runtime: &mut NativeRuntime, view: crate::native_app::ViewId) {
     let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
         unreachable!()
@@ -3796,7 +3500,6 @@ fn show(id: &str) -> Option<crate::control_theme::ThemeTrialIntent> {
     Some(crate::control_theme::ThemeTrialIntent::Show(id.to_string()))
 }
 
-/// The theme id behind a row's slug.
 fn id_of(runtime: &NativeRuntime, view: crate::native_app::ViewId, slug: &str) -> String {
     state(runtime, view)
         .showcase
@@ -3815,7 +3518,6 @@ fn rect_of(compiled: &crate::native_ui::CompiledUi, key: &str) -> LogicalRect {
         .rect
 }
 
-/// Whether the chooser's row `key` is drawn whole inside the list's room.
 fn whole_in_list(compiled: &crate::native_ui::CompiledUi, key: &str) -> bool {
     let list = rect_of(compiled, "settings/showcase/list");
     compiled.semantic(&UiKey::new(key)).is_some_and(|row| {
@@ -3823,7 +3525,6 @@ fn whole_in_list(compiled: &crate::native_ui::CompiledUi, key: &str) -> bool {
     })
 }
 
-/// The chooser's rows in the compiled tree, by key.
 fn drawn_rows(compiled: &crate::native_ui::CompiledUi) -> Vec<String> {
     compiled
         .semantics
@@ -3842,8 +3543,6 @@ fn dispatch(
     runtime.dispatch(instance, view, event).unwrap()
 }
 
-/// Whether an outcome writes anything: a config patch or a themes-folder
-/// request.
 fn writes(outcome: &crate::native_app::DispatchOutcome) -> bool {
     outcome.effects.iter().any(|effect| {
         matches!(
@@ -3853,9 +3552,6 @@ fn writes(outcome: &crate::native_app::DispatchOutcome) -> bool {
     })
 }
 
-/// The highlight IS the trial: ↓ tries the next row, ↓ back onto the theme
-/// in use ends the trial, and Return (a press on the focused row) keeps.
-/// Negative control: in the filter, ← and → move the caret and try nothing.
 #[test]
 fn highlight_is_the_trial() {
     let (_service, mut runtime, instance, view) = themes_view("theme = \"Nord\"\n");
@@ -3894,7 +3590,6 @@ fn highlight_is_the_trial() {
         Some(crate::control_theme::ThemeTrialIntent::Keeping(next_id))
     );
 
-    // Negative control: the filter's caret keys stay text editing.
     let (_service, mut runtime, instance, view) = themes_view("theme = \"Nord\"\n");
     let _ = act(
         &mut runtime,
@@ -3923,10 +3618,6 @@ fn highlight_is_the_trial() {
     assert_eq!(intent(&runtime, view), None);
 }
 
-/// From the Community disclosure the keys move the highlight as they do on
-/// a row, and the keyboard goes with it: Down tries the first community
-/// theme, Up the row over the disclosure, End the last row. Negative
-/// control: plain focus landing on a row tries nothing (`hover_never_tries`).
 #[test]
 fn keys_on_the_community_disclosure_move_the_highlight() {
     let (_service, mut runtime, instance, view) = themes_view("theme = \"Nord\"\n");
@@ -3971,10 +3662,6 @@ fn keys_on_the_community_disclosure_move_the_highlight() {
     }
 }
 
-/// Pointer hover is host paint (a tint) and reaches no reducer; the one
-/// passive event a row gets is focus landing on it (Tab, a screen reader's
-/// cursor). Landing on five rows tries nothing. Negative control: a press
-/// on the same row tries it.
 #[test]
 fn hover_never_tries() {
     let (_service, mut runtime, instance, view) = themes_view("theme = \"Nord\"\n");
@@ -4003,10 +3690,6 @@ fn hover_never_tries() {
     );
 }
 
-/// A community theme is tried from the pack, never the folder: trying and
-/// reverting write nothing (no patch, no themes-folder request). Negative
-/// control: Keep adds the file, then writes `theme` naming it once the
-/// catalog lists it.
 #[test]
 fn trying_a_pack_theme_writes_no_file() {
     let (mut service, mut runtime, instance, view) = themes_view("theme = \"Dracula\"\n");
@@ -4024,7 +3707,6 @@ fn trying_a_pack_theme_writes_no_file() {
     assert!(!writes(&reverted), "reverting writes nothing");
     assert_eq!(intent(&runtime, view), None);
 
-    // Negative control: Keep writes the file, then the theme.
     let _ = act(&mut runtime, instance, view, &card, None);
     let kept = act(&mut runtime, instance, view, "settings/showcase/keep", None);
     let added = add_pack_request(&kept);
@@ -4061,9 +3743,6 @@ fn trying_a_pack_theme_writes_no_file() {
     );
 }
 
-/// A community add that fails keeps the trial, and the strip says why (in
-/// its spoken label and its second line). A later catalog that lists the
-/// theme writes nothing.
 #[test]
 fn a_failed_pack_add_keeps_the_trial() {
     let (mut service, mut runtime, instance, view) = themes_view("theme = \"Dracula\"\n");
@@ -4118,9 +3797,6 @@ fn a_failed_pack_add_keeps_the_trial() {
     assert!(config_patches(&listed).is_empty());
 }
 
-/// With Follow system on and the Light side chosen, Keep writes that side
-/// alone; the Dark side stays. Negative control: with one theme for both,
-/// Keep writes the plain name.
 #[test]
 fn match_system_keep_writes_only_the_chosen_side() {
     let (_service, mut runtime, instance, view) =
@@ -4165,14 +3841,6 @@ fn match_system_keep_writes_only_the_chosen_side() {
     );
 }
 
-/// KEEP FILES A THEME BY THE SIDE IT IS MADE FOR: with Follow system on and
-/// no side chosen in the Dark | Light segment, keeping a light theme while the
-/// OS is dark replaces the Light side (the segment defaulted to the OS side
-/// and filed it under Dark) — and while it is tried the segment shows Light
-/// and the strip says "for Light". A dark theme still goes to Dark, and the
-/// light side's own theme, highlighted, is in use there, no trial. Negative
-/// controls: a side the person chose in the segment still wins, and Revert
-/// puts the page back on the side the OS picks.
 #[test]
 fn keep_files_a_theme_by_the_side_it_is_made_for() {
     let mut cx = view_cx_at(1_284.0, 714.0);
@@ -4213,7 +3881,6 @@ fn keep_files_a_theme_by_the_side_it_is_made_for() {
             .and_then(|(patch, _)| patch.edits[0].value.clone())
     };
 
-    // A light theme on a dark OS: tried for Light, kept on Light.
     let (_service, mut runtime, instance, view) = open();
     assert_eq!(
         segment(&runtime, instance, view),
@@ -4233,7 +3900,6 @@ fn keep_files_a_theme_by_the_side_it_is_made_for() {
         Some("dark:Nord,light:GitHub Light")
     );
 
-    // A dark theme goes to Dark; the light side's own theme is in use.
     let (_service, mut runtime, instance, view) = open();
     let solarized = card_action(&runtime, view, "Solarized Light");
     let _ = act(&mut runtime, instance, view, &solarized, None);
@@ -4247,7 +3913,6 @@ fn keep_files_a_theme_by_the_side_it_is_made_for() {
         Some("dark:Dracula,light:Solarized Light")
     );
 
-    // Negative control: the person's side wins.
     let (_service, mut runtime, instance, view) = open();
     let _ = act(
         &mut runtime,
@@ -4264,7 +3929,6 @@ fn keep_files_a_theme_by_the_side_it_is_made_for() {
         Some("dark:GitHub Light,light:Solarized Light")
     );
 
-    // Negative control: Revert is back on the OS side, its theme in use.
     let (_service, mut runtime, instance, view) = open();
     let card = card_action(&runtime, view, "GitHub Light");
     let _ = act(&mut runtime, instance, view, &card, None);
@@ -4282,13 +3946,6 @@ fn keep_files_a_theme_by_the_side_it_is_made_for() {
     );
 }
 
-/// THE CHOOSER COMES ON GLASS ON THE ROW IN USE, WHOLE: the list's first
-/// screen used to leave it wherever it fell — off the screen on a short
-/// window, cut by the chooser's bottom edge at 220×60 (GitHub Light, the
-/// last built-in row). Opening Themes, coming back to it from another page
-/// or from Search Results, and closing Customize land the list on it.
-/// Negative control: a row the filter hides asks for nothing, and the list
-/// starts at its top.
 #[test]
 fn the_chooser_comes_on_glass_on_the_row_in_use_whole() {
     let whole = |compiled: &crate::native_ui::CompiledUi, key: &str| {
@@ -4300,7 +3957,6 @@ fn the_chooser_comes_on_glass_on_the_row_in_use_whole() {
                 && node.clip.width + 0.01 >= node.rect.width
         })
     };
-    // 220×60, 80×24 and between, at the 12px cell.
     for (width, height) in [
         (1_564.0, 852.0),
         (584.0, 348.0),
@@ -4356,7 +4012,6 @@ fn the_chooser_comes_on_glass_on_the_row_in_use_whole() {
         );
         on_glass(&mut runtime, "Customize closed");
     }
-    // Negative control: a filter that hides the row in use lands on nothing.
     let (_service, mut runtime, instance, view) = themes_view("theme = \"GitHub Light\"\n");
     let _ = act(
         &mut runtime,
@@ -4377,13 +4032,6 @@ fn the_chooser_comes_on_glass_on_the_row_in_use_whole() {
     assert_eq!(state(&runtime, view).page_reveal, None);
 }
 
-/// A LANDING A SCREEN HAS DRAWN IS LET GO AS DRAWN: Themes opened with the
-/// keyboard already on its Community disclosure (pressed open before the
-/// page first drew, as a driver's press ahead of the frame does) draws the
-/// disclosure, the landing on the row in use yielding to it, and so does the
-/// next frame, with no event between. The next frame landed on the row in
-/// use instead: the list went back up to Nord. CONTROL: with no press, the
-/// first screen lands on Nord, the disclosure off it.
 #[test]
 fn a_landing_the_keyboard_took_over_is_let_go_as_drawn() {
     const PACK: &str = "settings/showcase/pack";
@@ -4413,17 +4061,6 @@ fn a_landing_the_keyboard_took_over_is_let_go_as_drawn() {
     );
 }
 
-/// A LIST MEASURED AGAIN LANDS AGAIN: a window resized or a text size
-/// changed sends the view no event, so the frame after it measures the list
-/// otherwise before any event has let the landing go, and lands again —
-/// Themes opened on the theme in use (One Dark, Nord, Dracula, each listed
-/// past the list's first screen), drawn and then drawn shorter or at 2×
-/// text with nothing between, keeps that row whole in the list. (Let go as
-/// drawn by every frame before an event, the landing went with the resize:
-/// Nord at 1144x700 made 1144x462 left its row out of view.) NEGATIVE
-/// CONTROL: the same frames after an event has let the landing go
-/// ([`SettingsViewState::settle_page_scroll`]) lose the row, for a resize
-/// and for a text size.
 #[test]
 fn a_resize_before_any_event_keeps_the_theme_in_use_in_view() {
     let set_scale = |scale: f32| {
@@ -4434,8 +4071,6 @@ fn a_resize_before_any_event_keeps_the_theme_in_use_in_view() {
             },
         );
     };
-    // The theme in use, the window's width, and each frame's height and
-    // text size.
     let mut cases = Vec::new();
     for theme in ["One Dark", "Nord", "Dracula"] {
         for width in [864.0, 1_144.0] {
@@ -4449,8 +4084,6 @@ fn a_resize_before_any_event_keeps_the_theme_in_use_in_view() {
             }
         }
     }
-    // Each case whose second frame did not show the row whole, and whether
-    // an event had let the landing go.
     let lost = std::sync::Mutex::new(Vec::new());
     on_workers(&cases, "landings measured again", |case| {
         let &(theme, width, first, then) = case;
@@ -4498,19 +4131,8 @@ fn a_resize_before_any_event_keeps_the_theme_in_use_in_view() {
     }
 }
 
-/// THE THEMES PAGE IS MEASURED, NEVER CUT: wherever the window is short,
-/// every part of it — the demo, the strip, the filter, the Dark | Light
-/// segment, each row, the Community disclosure, the footer, the Customize
-/// sheet's rows — is drawn whole on some screen of its list: the demo gives
-/// up rows, then the chooser's pinned parts join its list (beside the demo
-/// the footer first, then the filter), then the demo and the strip are the
-/// list's first stops. (At 80×24 at 2× the chooser got 122 of the 142pt its
-/// pinned filter and one row need: every row was cut on every screen.)
 #[test]
 fn every_part_of_the_themes_page_is_whole_on_some_screen() {
-    // The stops of the page: the demo, the strip's words and buttons (a list
-    // with a hard edge may cut the strip's empty band under them, never what
-    // it holds), the chooser's parts and rows, the sheet's colour rows.
     let part = |key: &str| {
         key == "settings/showcase/stage"
             || key == "settings/showcase/status/title"
@@ -4537,9 +4159,6 @@ fn every_part_of_the_themes_page_is_whole_on_some_screen() {
             "theme = \"dark:Nord,light:GitHub Light\"\n",
         ] {
             for sheet in [false, true] {
-                // 80×24, 80×20, 80×16 and 60×12 of the 12px cell, and short
-                // windows wide enough to set the chooser beside the demo
-                // (each with room for the page's tallest stop at 2×).
                 for (width, height) in [
                     (584.0, 348.0),
                     (584.0, 292.0),
@@ -4590,9 +4209,6 @@ fn every_part_of_the_themes_page_is_whole_on_some_screen() {
     });
 }
 
-/// Keep ▾'s chevron is there for a theme that carries type and can be kept
-/// as colours alone, and opening it offers Keep colours only. Negative
-/// control: trying a colours-only theme draws no chevron.
 #[test]
 fn keep_more_exists_only_for_type_carrying_themes() {
     let cx = view_cx_at(1_284.0, 714.0);
@@ -4630,15 +4246,10 @@ fn keep_more_exists_only_for_type_carrying_themes() {
     assert_eq!(enabled(&compiled, SHOWCASE_KEEP_COLOURS_KEY), None);
 }
 
-/// The strip holds one rect through every state, at every shape: Idle,
-/// Idle with overrides, Trying, Trying a typography theme, Keeping, a
-/// refused Keep, and Customize.
 #[test]
 fn the_strip_never_moves() {
     for width in SHAPES {
         let cx = view_cx_at(width, 714.0);
-        // The strip, and where the name on its first line starts (its width
-        // gives way to the buttons): a trial starting or ending moves neither.
         let mut seen: Vec<(&str, (LogicalRect, [f32; 3]))> = Vec::new();
         let mut take = |name: &'static str,
                         runtime: &NativeRuntime,
@@ -4702,7 +4313,6 @@ fn the_strip_never_moves() {
     }
 }
 
-/// Starting a trial moves no row: the list's first row is where it was.
 #[test]
 fn the_list_does_not_move_on_a_trial() {
     for width in SHAPES {
@@ -4724,9 +4334,6 @@ fn the_list_does_not_move_on_a_trial() {
     }
 }
 
-/// A row the list holds off its screen says so in `controls` and comes into
-/// view when a reader asks to scroll it there, with the keyboard left where
-/// it was. Negative control: a key no list holds scrolls nothing.
 #[test]
 fn a_reader_scrolls_an_offscreen_row_into_view() {
     let (_service, mut runtime, instance, view) = themes_view("theme = \"Dracula\"\n");
@@ -4779,10 +4386,6 @@ fn a_reader_scrolls_an_offscreen_row_into_view() {
     assert_eq!(state(&runtime, view).common.last_focus, focus);
 }
 
-/// Every theme option is a direct child of the list box, and nothing of a
-/// row's face reaches the tree (its option carries the name, the value and
-/// the state): under an option there is only a Yours row's file actions.
-/// Negative control: those file actions are there, as controls.
 #[test]
 fn each_option_is_the_lists_child_and_its_only_node() {
     let dir = aterm_tempfile::tempdir().expect("a themes folder");
@@ -4835,9 +4438,6 @@ fn each_option_is_the_lists_child_and_its_only_node() {
     assert!(file_actions >= 2, "the Yours row's Open and Trash");
 }
 
-/// The demo is on the page at every shape, dark and light, at least 180 px
-/// tall and 40 columns wide; and on a short Compact body the list still
-/// shows three rows.
 #[test]
 fn the_demo_is_present_at_every_shape() {
     for source in ["theme = \"Dracula\"\n", "theme = \"Solarized Light\"\n"] {
@@ -4847,7 +4447,6 @@ fn the_demo_is_present_at_every_shape() {
             let compiled = compile_settings_view(&runtime, instance, view, &cx);
             let stage = rect_of(&compiled, STAGE);
             assert!(stage.height >= 180.0, "{source} {width}: {stage:?}");
-            // 40 cells of the 12 px terminal face (0.6 em advance).
             assert!(
                 stage.width >= 40.0 * 12.0 * 0.6,
                 "{source} {width}: {stage:?}"
@@ -4861,17 +4460,6 @@ fn the_demo_is_present_at_every_shape() {
     assert!(rows.len() >= 3, "{rows:?}");
 }
 
-/// THE STACKED CHOOSER HOLDS A WHOLE STOP at the least window, whatever the
-/// terminal's line height makes the demo's rows: the demo gives up rows
-/// rather than leave the list short of its tallest stop. (Six rows on
-/// Windows' default 1.1 line left the list 19pt at 584×348, and the
-/// Community disclosure was cut to 25 of its 32pt; that window now sets the
-/// demo beside the chooser, and is held to the same.) Every screen draws its
-/// controls inside the chooser, under or beside a demo that still shows,
-/// each live over exactly what shows of it and cut, if at all, only by the
-/// list's edge (THE LIST'S EDGE RULE) — the top edge of a screen's rows
-/// under the caption it repeats over them, where the last screen's peek
-/// comes in — and holds one at least whole.
 #[test]
 fn the_stacked_chooser_holds_a_whole_stop_at_every_line_height() {
     for (line_height, width) in ["1.0", "1.1", "1.5"]
@@ -4889,8 +4477,6 @@ fn the_stacked_chooser_holds_a_whole_stop_at_every_line_height() {
             );
             let chooser = rect_of(compiled, "settings/showcase/chooser");
             let list = rect_of(compiled, showcase_page::SHOWCASE_LIST);
-            // Where a screen repeats a section's caption over its rows, the
-            // rows' frame starts under it.
             let rows_top = compiled
                 .paint
                 .iter()
@@ -4929,8 +4515,6 @@ fn the_stacked_chooser_holds_a_whole_stop_at_every_line_height() {
     }
 }
 
-/// No node crosses its column's edge, and while the list scrolls its rows
-/// stop short of the scroll thumb's gutter.
 #[test]
 fn no_node_crosses_its_column_edge() {
     for width in SHAPES {
@@ -4952,7 +4536,6 @@ fn no_node_crosses_its_column_edge() {
                     node.key.as_str(),
                     node.rect
                 );
-                // A row and its parts.
                 if node.key.as_str().starts_with(ROW) {
                     let edge = if scrolls {
                         list.right() - showcase_page::THUMB_GUTTER
@@ -4971,7 +4554,6 @@ fn no_node_crosses_its_column_edge() {
     }
 }
 
-/// The text a button paints, if it paints words.
 fn visible_words(compiled: &crate::native_ui::CompiledUi, key: &str) -> Option<String> {
     compiled.paint.iter().find_map(|node| match &node.content {
         UiContent::Button(control) if node.key.as_str() == key => {
@@ -4986,9 +4568,6 @@ fn visible_words(compiled: &crate::native_ui::CompiledUi, key: &str) -> Option<S
     })
 }
 
-/// Every control on the page, in every state, is a node with a key, a
-/// label and an action, and a label holds the words the control shows
-/// (WCAG 2.5.3; a count after " · " is the value's).
 #[test]
 fn every_interactive_node_has_key_label_and_action() {
     let cx = view_cx_at(1_284.0, 714.0);
@@ -5073,8 +4652,6 @@ fn every_interactive_node_has_key_label_and_action() {
     assert!(checked > 20, "{checked} controls");
 }
 
-/// Every control's action is its key, so `act <key>` read off the live
-/// tree reaches it, and pressing it is handled.
 #[test]
 fn every_showcase_key_round_trips_through_act() {
     let cx = view_cx_at(1_284.0, 714.0);
@@ -5111,8 +4688,6 @@ fn every_showcase_key_round_trips_through_act() {
     }
 }
 
-/// The filter is in the tree with no query; a query finds community
-/// themes with the disclosure closed, and sections with no match go.
 #[test]
 fn filter_finds_pack_themes_and_collapses_empty_sections() {
     let cx = view_cx_at(1_284.0, 714.0);
@@ -5169,9 +4744,6 @@ fn filter_finds_pack_themes_and_collapses_empty_sections() {
     );
 }
 
-/// The demo's spoken value names the theme and why it rests, never the
-/// frame: it holds across ten tape moments, and moves with a trial and with
-/// Reduce Motion.
 #[test]
 fn the_stage_value_changes_only_with_the_theme() {
     let (_service, mut runtime, instance, view) = themes_view("theme = \"Dracula\"\n");
@@ -5199,8 +4771,6 @@ fn the_stage_value_changes_only_with_the_theme() {
     assert_ne!(value_at(&runtime, 720, false), first, "a trial");
 }
 
-/// Customize stands in the chooser's place: its rows join the tree only
-/// while it is open, and the list's rows leave it meanwhile.
 #[test]
 fn sheet_rows_join_the_tree_only_while_open() {
     let cx = view_cx_at(1_284.0, 714.0);
@@ -5245,10 +4815,6 @@ fn sheet_rows_join_the_tree_only_while_open() {
     assert!(!has(&compiled, "settings/showcase/sheet"));
 }
 
-/// The strip's live label says a trial once: it holds still across frames
-/// while the trial stands, and says the settled word when it ends.
-/// Negative control: focus landing on rows (the passive move) changes
-/// nothing it says.
 #[test]
 fn the_live_region_announces_once_per_settled_trial() {
     let (_service, mut runtime, instance, view) = themes_view("theme = \"Dracula\"\n");
@@ -5295,10 +4861,6 @@ fn the_live_region_announces_once_per_settled_trial() {
     assert_ne!(reverted, trying, "the revert is said");
 }
 
-/// A community theme's trial ends when a file by its name lands in the
-/// folder and does not load: the pack no longer stands in for it (Keep could
-/// not write over that file), and the page says why. Negative control: a
-/// file that loads keeps the trial.
 #[test]
 fn a_community_trial_ends_when_its_name_turns_up_broken() {
     for (text, ends) in [
@@ -5334,9 +4896,6 @@ fn a_community_trial_ends_when_its_name_turns_up_broken() {
     }
 }
 
-/// A theme file that did not load is listed under NEEDS ATTENTION with its
-/// reason and Open, and its row tries nothing. Negative control: a file
-/// that loads is an ordinary row.
 #[test]
 fn failed_theme_files_list_under_needs_attention() {
     let dir = aterm_tempfile::tempdir().expect("a themes folder");
@@ -5379,23 +4938,11 @@ fn failed_theme_files_list_under_needs_attention() {
     let pressed = act(&mut runtime, instance, view, &row, None);
     assert!(!writes(&pressed));
     assert_eq!(intent(&runtime, view), None, "not a theme to try");
-    // Negative control: the file that loads is a row like any other.
     let harbour = card_action(&runtime, view, "Harbour");
     let _ = act(&mut runtime, instance, view, &harbour, None);
     assert_eq!(intent(&runtime, view), show("Harbour"));
 }
 
-/// NEEDS ATTENTION HOLDS ONLY THE FILES THAT DID NOT LOAD (the review of the
-/// themes page, ox4-1: with a theme file that failed, Aterm Night, Aterm Day
-/// — the theme in use — Hearth and Linen sat in NEEDS ATTENTION's card, its
-/// caption repeated over Linen where a screen started there). Under it the
-/// signature themes take a caption of their own, ATERM, and on every screen
-/// of the list — at the 864×574 window the review imaged and at the page's
-/// other shapes — the caption nearest over each row is its own section's,
-/// never NEEDS ATTENTION. NEGATIVE CONTROLS: with no file failing, the
-/// signature themes lead the list uncaptioned, as ever; and the list's
-/// blocks without their caption (the grouping that misread) put them in
-/// NEEDS ATTENTION's card, which with it holds the failed file alone.
 #[test]
 fn needs_attention_holds_only_the_files_that_did_not_load() {
     const ATTENTION: &str = "NEEDS ATTENTION";
@@ -5416,8 +4963,6 @@ fn needs_attention_holds_only_the_files_that_did_not_load() {
         }
         (service, runtime, instance, view)
     };
-    // The caption each row's section is listed under, with NEEDS ATTENTION
-    // over the list.
     let own = |section: Section| section.caption_after_rows(true);
     let mut signature_captioned = 0;
     for (width, height) in [(864.0, 574.0), (584.0, 350.0), (1_284.0, 714.0)] {
@@ -5436,7 +4981,6 @@ fn needs_attention_holds_only_the_files_that_did_not_load() {
             else {
                 return;
             };
-            // On the list: the sidebar's captions sit beside it.
             let on_list = |rect: LogicalRect| {
                 rect.x >= list.x - 0.5
                     && rect.x < list.right() - 0.5
@@ -5490,8 +5034,6 @@ fn needs_attention_holds_only_the_files_that_did_not_load() {
         "premise: a signature row is listed under a caption"
     );
 
-    // NEGATIVE CONTROL: no file failing, the signature themes lead the list
-    // uncaptioned.
     let cx = view_cx_at(864.0, 574.0);
     let (_service, mut runtime, instance, view) = failing(false);
     list_at_top(&mut runtime, view);
@@ -5503,8 +5045,6 @@ fn needs_attention_holds_only_the_files_that_did_not_load() {
         "the signature themes lead uncaptioned"
     );
 
-    // NEGATIVE CONTROL: the grouping. With their caption the attention card
-    // holds the failed file's row alone; without it, the rows after it too.
     let (_service, runtime, _instance, view) = failing(true);
     let state = state(&runtime, view);
     let failed = format!("{ROW}{}", state.showcase.attention[0].slug);
@@ -5544,9 +5084,6 @@ fn needs_attention_holds_only_the_files_that_did_not_load() {
     );
 }
 
-/// Beside the demo the chooser panel holds every part inside its inset, and
-/// its footer sits on the panel's bottom edge whether the list is full or a
-/// filter leaves it one row.
 #[test]
 fn the_chooser_holds_its_footer_on_its_bottom_edge() {
     const INSET: f32 = 8.0;
@@ -5586,16 +5123,12 @@ fn the_chooser_holds_its_footer_on_its_bottom_edge() {
     }
 }
 
-/// A section's caption starts on the rows' name column, and so do the
-/// no-match line and the footer's label: one left edge for the chooser's
-/// words.
 #[test]
 fn captions_and_names_share_one_column() {
     for width in SHAPES {
         let cx = view_cx_at(width, 934.0);
         let (_service, mut runtime, instance, view) = themes_view("theme = \"Dracula\"\n");
         let compiled = compile_settings_view(&runtime, instance, view, &cx);
-        // The name is paint only: the row's option carries it.
         let name = compiled
             .paint
             .iter()
@@ -5637,9 +5170,6 @@ fn captions_and_names_share_one_column() {
     }
 }
 
-/// A Customize colour row left to the theme shows the theme's colour in its
-/// well (the button beside the field that opens the colour picker); one the
-/// person set shows theirs.
 #[test]
 fn colour_rows_show_the_colour_they_draw() {
     let cx = view_cx_at(1_284.0, 934.0);
@@ -5674,15 +5204,6 @@ fn colour_rows_show_the_colour_they_draw() {
     );
 }
 
-/// Each Customize colour row is one line in every shape whose column holds
-/// it (a narrower one, the short page's chooser, puts the name over the
-/// field: [`opening_customize_never_squeezes_or_moves_the_demo`]): its name,
-/// its field and its Reset share the row's band, and the fields keep one
-/// right edge whether or not a row has a Reset. A stacked row (the name over
-/// a page-wide field) fails it. The keyboard on a field left to the theme
-/// paints the theme's hex, whole, not the field's own words cut ("Theme…",
-/// the audit at every size): NEGATIVE CONTROL, those words,
-/// "Theme (default)", are wider than the field.
 #[test]
 fn colour_rows_are_one_line_with_one_field_column() {
     let paint_rect = |compiled: &crate::native_ui::CompiledUi, key: &str| {
@@ -5692,7 +5213,6 @@ fn colour_rows_are_one_line_with_one_field_column() {
             .find(|node| node.key.as_str() == key)
             .map(|node| node.rect)
     };
-    // Tall enough for the whole sheet, and short enough that it scrolls.
     for (width, height) in SHAPES
         .into_iter()
         .flat_map(|width| [(width, 934.0), (width, 560.0)])
@@ -5710,10 +5230,6 @@ fn colour_rows_are_one_line_with_one_field_column() {
         let compiled = compile_settings_view(&runtime, instance, view, &cx);
         let mut right = None;
         for key in showcase_page::SHOWCASE_COLOR_KEYS {
-            // A row off the sheet's screen is in the tree where scrolling
-            // brings it; its painted name is checked where it is drawn, beside
-            // the field as painted (a field the sheet's edge cuts answers over
-            // the part that shows, so its live rect is shorter than its row).
             let control = format!("settings/control/{key}");
             let field =
                 paint_rect(&compiled, &control).unwrap_or_else(|| rect_of(&compiled, &control));
@@ -5746,8 +5262,6 @@ fn colour_rows_are_one_line_with_one_field_column() {
                 .is_none(),
             "{width}x{height}: a colour left to the theme has no Reset"
         );
-        // The keyboard on the background's field, left to the theme, as Tab
-        // or a click puts it there.
         let control = "settings/control/background";
         {
             let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
@@ -5774,7 +5288,6 @@ fn colour_rows_are_one_line_with_one_field_column() {
             )),
             "{width}x{height}: the focused field paints the theme's hex: {line}"
         );
-        // NEGATIVE CONTROL: the field's own words would not fit it.
         let field = rect_of(&focused, control);
         assert!(
             crate::native_ui::text_field_width_for("Theme (default)", true) > field.width + 0.5,
@@ -5783,9 +5296,6 @@ fn colour_rows_are_one_line_with_one_field_column() {
     }
 }
 
-/// The chooser's names are its words, in the primary ink; its section
-/// captions are the quieter voice over them. A name in the captions' ink
-/// (the flat hierarchy this replaced) fails it.
 #[test]
 fn row_names_outrank_their_captions() {
     let cx = view_cx_at(1_284.0, 934.0);
@@ -5814,9 +5324,6 @@ fn row_names_outrank_their_captions() {
     );
 }
 
-/// While the theme follows the system, the ✓ marks the one theme the
-/// segment's side draws, and moves with the segment: two ✓ would not say
-/// which theme Keep replaces.
 #[test]
 fn one_check_marks_the_side_the_segment_shows() {
     let cx = view_cx_at(1_284.0, 934.0);
@@ -5851,9 +5358,6 @@ fn one_check_marks_the_side_the_segment_shows() {
     }
 }
 
-/// The filter shows a Clear over its end only while it holds a query, the
-/// query's text stops short of it, and pressing it empties the filter and
-/// gives the field the keyboard.
 #[test]
 fn the_filter_clears_from_its_own_end() {
     let cx = view_cx_at(1_284.0, 934.0);
@@ -5916,12 +5420,6 @@ fn the_filter_clears_from_its_own_end() {
     );
 }
 
-/// Every theme the chooser lists is in the tree, the rows off the list's
-/// screen included, at the bounds scrolling would give them: a screen
-/// reader and `controls` see the whole list. Only the screen's rows are
-/// hit or in the Tab order, and only they and the peek the list's edge
-/// cuts are painted. A list that holds only its screen (its rows off it
-/// absent) fails it.
 #[test]
 fn every_listed_theme_is_in_the_tree_and_only_the_screen_is_live() {
     let cx = view_cx_at(1_284.0, 684.0);
@@ -5929,7 +5427,6 @@ fn every_listed_theme_is_in_the_tree_and_only_the_screen_is_live() {
     let top = compile_settings_view(&runtime, instance, view, &cx);
     let order = state(&runtime, view).showcase.listed();
     assert!(order.len() > 12, "the list scrolls: {} rows", order.len());
-    // Off the screen below it at the list's top, and above it at its end.
     let check = |compiled: &crate::native_ui::CompiledUi, at: &str| {
         let list = rect_of(compiled, "settings/showcase/list");
         let mut off = 0;
@@ -5960,8 +5457,6 @@ fn every_listed_theme_is_in_the_tree_and_only_the_screen_is_live() {
                     "{at}: {key:?} {:?} is off the list's screen {list:?}, or cut by its edge",
                     node.rect
                 );
-                // A row the edge cuts is painted as the list's peek; one
-                // wholly off the screen is not painted at all.
                 let cut = node.rect.y < list.bottom() && node.rect.bottom() > list.y;
                 assert!(
                     painted == cut,
@@ -5995,9 +5490,6 @@ fn every_listed_theme_is_in_the_tree_and_only_the_screen_is_live() {
     check(&compiled, "end");
 }
 
-/// A community theme's row under a closed Community disclosure is reached
-/// as a hand reaches it: the disclosure opens and the row is listed. A row
-/// no section holds is not.
 #[test]
 fn a_closed_disclosure_opens_for_a_row_it_holds() {
     let cx = view_cx_at(1_284.0, 934.0);
@@ -6022,15 +5514,6 @@ fn a_closed_disclosure_opens_for_a_row_it_holds() {
     );
 }
 
-/// A LIST IS SEATED ONCE PER RENDER: a theme of your own that turns up
-/// (listed under YOURS, over Community) while the keyboard is on a Community
-/// row in the middle of the screen moves the list by the rows it adds, so
-/// that row stays where it was, and every row is in the tree once. (Two
-/// seatings in one render put the screen's rows off it too, and the page did
-/// not compile: `DuplicateKey`.) Seated again before any event — the next
-/// frame — the list keeps that place. Negative control: once an event has
-/// taken the place, the scroll the render was asked to draw seats the list
-/// at another top.
 #[test]
 fn rows_added_over_the_keyboards_row_hold_its_place_and_list_each_row_once() {
     let cx = view_cx_at(1_284.0, 684.0);
@@ -6064,7 +5547,6 @@ fn rows_added_over_the_keyboards_row_hold_its_place_and_list_each_row_once() {
         .map(|node| node.key.as_str().to_string())
         .filter(|key| community(&runtime, key.strip_prefix(ROW).unwrap_or(key)))
         .collect();
-    // A Community row with rows of the screen under it: not at its edge.
     let target = shown.get(2).expect("Community rows on the screen").clone();
     let _ = act(&mut runtime, instance, view, &target, None);
     let before = compile_settings_view(&runtime, instance, view, &cx);
@@ -6105,7 +5587,6 @@ fn rows_added_over_the_keyboards_row_hold_its_place_and_list_each_row_once() {
         "each listed row is in the tree once"
     );
 
-    // The next frame, before any event, seats it there again.
     let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
         unreachable!()
     };
@@ -6116,8 +5597,6 @@ fn rows_added_over_the_keyboards_row_hold_its_place_and_list_each_row_once() {
         reseated.start, shown.start,
         "a second seating before any event keeps the place"
     );
-    // NEGATIVE CONTROL: once an event has taken that place, the scroll the
-    // render was asked to draw is a scroll away from it.
     state.scroll_page_to(asked);
     let scrolled = state.seat_scroll(&mut plan.clone());
     assert_ne!(
@@ -6126,7 +5605,6 @@ fn rows_added_over_the_keyboards_row_hold_its_place_and_list_each_row_once() {
     );
 }
 
-/// The words a text node `key` paints.
 fn painted_text(compiled: &crate::native_ui::CompiledUi, key: &str) -> Option<String> {
     compiled.paint.iter().find_map(|node| match &node.content {
         UiContent::Text(text) if node.key.as_str() == key => Some(text.text.clone()),
@@ -6134,7 +5612,6 @@ fn painted_text(compiled: &crate::native_ui::CompiledUi, key: &str) -> Option<St
     })
 }
 
-/// Whether the compiled tree draws `key` with the keyboard on it.
 fn has_focus(compiled: &crate::native_ui::CompiledUi, key: &str) -> bool {
     compiled
         .semantic(&UiKey::new(key))
@@ -6142,12 +5619,6 @@ fn has_focus(compiled: &crate::native_ui::CompiledUi, key: &str) -> bool {
         .is_some_and(|state| state.focused)
 }
 
-/// AN UNDO TAKES THE THEME BACK, AND THE STRIP AND THE KEYBOARD WITH IT: Nord
-/// kept from the keyboard, then Undo — Dracula is in use again, the strip's
-/// live region no longer says what the Keep settled on and names Dracula,
-/// and the keyboard is on Dracula's row, the highlighted one, so the arrows
-/// step from there. Negative control: before the Undo the strip says the
-/// words the Keep settled on, for Nord, and the keyboard is on Nord's row.
 #[test]
 fn undo_of_a_keep_takes_the_strip_and_the_keyboard_to_the_restored_theme() {
     let (width, height) = (1_284.0, 714.0);
@@ -6208,11 +5679,6 @@ fn undo_of_a_keep_takes_the_strip_and_the_keyboard_to_the_restored_theme() {
     assert!(!has_focus(&compiled, &nord));
 }
 
-/// SAVE AS THEME PUTS THE KEYBOARD BACK ON SAVE AS THEME: Return in the name
-/// field, or Save, closes the name row, and the keyboard goes to the button
-/// that opened it, which the sheet draws focused — as Cancel and Escape send
-/// it. Negative control: while the row is open the keyboard is in the name
-/// field, a node that leaves the tree with the row.
 #[test]
 fn saving_puts_the_keyboard_back_on_save_as_theme() {
     let cx = view_cx_at(1_284.0, 714.0);
@@ -6267,11 +5733,6 @@ fn saving_puts_the_keyboard_back_on_save_as_theme() {
     }
 }
 
-/// A ROW THAT LEAVES THE LIST TAKES NO KEYBOARD WITH IT: a theme of your own
-/// moved to the Trash from its row's Trash goes from the list once the
-/// folder is read again, and the keyboard goes to the row that followed it,
-/// or, for the last row, the one before it — never to nothing. Negative
-/// control: until the catalog drops the row the keyboard stays on its Trash.
 #[test]
 fn trashing_a_row_puts_the_keyboard_on_its_neighbour() {
     let cx = view_cx_at(1_284.0, 934.0);
@@ -6330,15 +5791,9 @@ fn trashing_a_row_puts_the_keyboard_on_its_neighbour() {
     }
 }
 
-/// THE SEGMENT LANDS THE LIST ON ITS SIDE'S THEME: with the theme following
-/// the system, pressing Dark (the keyboard goes to the segment) scrolls the
-/// list to the Dark side's theme in use, its ✓ and its highlight shown, and
-/// the keyboard stays on the segment. Negative control: before the press
-/// that row is off the screen.
 #[test]
 fn choosing_a_side_shows_that_sides_theme() {
     let cx = view_cx_at(1_284.0, 684.0);
-    // The dark theme listed last: off the first screen of the list.
     let (_service, runtime, instance, view) = themes_view("");
     let _ = compile_settings_view(&runtime, instance, view, &cx);
     let dark = state(&runtime, view)
@@ -6355,7 +5810,6 @@ fn choosing_a_side_shows_that_sides_theme() {
     let (_service, mut runtime, instance, view) =
         themes_view(&format!("theme = \"dark:{dark},light:Default Light\"\n"));
     let row = card_action(&runtime, view, &dark);
-    // The page opens on the highlighted row; the reader scrolled to the top.
     let _ = compile_settings_view(&runtime, instance, view, &cx);
     list_at_top(&mut runtime, view);
     let before = compile_settings_view(&runtime, instance, view, &cx);
@@ -6393,11 +5847,6 @@ fn choosing_a_side_shows_that_sides_theme() {
     );
 }
 
-/// Save as theme counts from a saved theme's own name: from Dracula it
-/// offers "Dracula Custom" (then 2, 3, … while those are taken), and from
-/// "Dracula Custom" — a theme saved here, customized again — the next free
-/// number, never "Dracula Custom Custom". Negative control: a name that only
-/// ends in a number keeps it.
 #[test]
 fn save_as_suggests_the_next_number_for_a_saved_custom_theme() {
     let none = crate::app_config::ThemeCatalog::from_schemes([]);
@@ -6418,9 +5867,6 @@ fn save_as_suggests_the_next_number_for_a_saved_custom_theme() {
     assert_eq!(suggested_save_name("Base 2", &none), "Base 2 Custom");
 }
 
-/// WHILE A FILTER IS TYPED, COMMUNITY IS A CAPTION: its matches are listed
-/// whatever the disclosure says, so nothing there looks pressable. Negative
-/// control: with no filter it is the disclosure, a button that opens.
 #[test]
 fn community_is_a_caption_while_a_filter_is_typed() {
     let cx = view_cx_at(1_284.0, 714.0);
@@ -6451,13 +5897,6 @@ fn community_is_a_caption_while_a_filter_is_typed() {
     assert!(filtered.semantic(&UiKey::new(nightfox.as_str())).is_some());
 }
 
-/// A NEEDS ATTENTION ROW SAYS WHY IN WORDS IT CAN SHOW: its name on one line
-/// and, under it, where and what in a few words (`Line 2: background isn't
-/// a color`), both at the column's one text edge, its caption's. The whole
-/// reason is what a reader hears. Another terminal's theme, of each format
-/// the parser names, paints its few words whole at every chooser width, so
-/// the step they give is on screen. Negative control: the parser's
-/// preamble, which a row cut to "theme parse…", is not in the row's words.
 #[test]
 fn a_needs_attention_row_reads_at_the_columns_edge() {
     let dir = aterm_tempfile::tempdir().expect("a themes folder");
@@ -6466,7 +5905,6 @@ fn a_needs_attention_row_reads_at_the_columns_edge() {
         "foreground = #dddddd\nbackground = #zzz\n",
     )
     .unwrap();
-    // One file per foreign format the parser names.
     for (name, text) in [
         ("From kitty", "foreground #c0caf5\nbackground #1a1b26\n"),
         ("From Ghostty", "background = 1a1b26\npalette = 0=#15161e\n"),
@@ -6503,7 +5941,6 @@ fn a_needs_attention_row_reads_at_the_columns_edge() {
             .find(|row| row.id == "Broken Sunset")
             .expect("premise: the broken file's row");
         let row = format!("{ROW}{}", sunset.slug);
-        // The rows that need attention head the list.
         list_at_top(&mut runtime, view);
         let compiled = compile_settings_view(&runtime, instance, view, &view_cx_at(width, 934.0));
         for other in rows.iter() {
@@ -6548,12 +5985,6 @@ fn a_needs_attention_row_reads_at_the_columns_edge() {
     }
 }
 
-/// THE SHEET SAYS WHAT IT EDITS: the color settings drawn on every theme —
-/// its title says so, and while the theme follows the system it says when
-/// they leave the side the page does not show at text contrast under 3:1;
-/// a tried theme is drawn under them too, and the strip says that as well,
-/// in the one noun the Customize button counts them in. Negative control: a
-/// background the other side stays readable on says nothing of it.
 #[test]
 fn the_sheet_says_its_colors_draw_on_every_theme() {
     let cx = view_cx_at(1_284.0, 714.0);
@@ -6603,20 +6034,12 @@ fn the_sheet_says_its_colors_draw_on_every_theme() {
     }
 }
 
-/// A CHOOSER ROW'S MARKS ARE WHOLE AT EVERY TEXT SIZE: the ✓ on the theme
-/// in use, "Aa" on a theme that sets type and ⚠ on one whose text contrast
-/// is low each paint in a column as wide as they draw at the live text
-/// size, so none runs past its column (the ✓ took 16.1 of a fixed 16pt at
-/// 2× text). Every row of every screen, Community open, in use on a theme of
-/// each mark.
 #[test]
 fn a_chooser_rows_marks_are_whole_at_every_text_size() {
     at_each_text_scale(&[1.0, 1.5, 2.0], "chooser marks", |scale| {
         let marks = ["/check", "/aa", "/low"];
         let mut drawn = std::collections::BTreeSet::new();
         for (width, height) in [(584.0, 700.0), (1_284.0, 900.0)] {
-            // Yours: a theme that sets type, and one whose text contrast
-            // is low and that sets type too (the row with every mark).
             let theme = |text: &str| aterm_types::scheme::parse_theme_str(text).expect("a theme");
             let themes = crate::app_config::ThemeCatalog::from_parsed([
                 (
@@ -6674,12 +6097,6 @@ fn a_chooser_rows_marks_are_whole_at_every_text_size() {
     });
 }
 
-/// THE STRIP IS MEASURED, NEVER CUT: at every width and text size, idle,
-/// trying a theme that sets type and with Keep ▾ open, its title is drawn
-/// and no button of it is cut by the strip's edge or cuts its words; and
-/// moving from one tried theme to another never changes its height. (At 22
-/// columns at 2× Customize took the strip and more, so the name was not
-/// drawn; Keep ▾ open cut Revert to nothing at 444pt.)
 #[test]
 fn the_strip_draws_its_title_and_every_button_whole() {
     at_each_text_scale(&[1.0, 1.25, 2.0], "the strip", |scale| {
@@ -6705,10 +6122,6 @@ fn the_strip_draws_its_title_and_every_button_whole() {
                         None,
                     );
                 }
-                // The strip is the list's lead where the page lists it (a
-                // phone-width page at 2×): measured on the screen it is on,
-                // the list's first, not the one that keeps the tried row in
-                // view, whose wrapped name can take the strip past its top.
                 list_at_top(&mut runtime, view);
                 {
                     let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
@@ -6756,11 +6169,6 @@ fn the_strip_draws_its_title_and_every_button_whole() {
     });
 }
 
-/// A CHOOSER ROW'S NAME COMES FIRST: at every chooser width and text size a
-/// row whose name is cut inside its first word draws no slab beside it (the
-/// slab gives its column up to the name), and every row of a list keeps one
-/// form. (At 22 columns the slab left "GitHub Light" 36pt, painted "Git…",
-/// and at 2× every name was "…".)
 #[test]
 fn a_chooser_rows_name_comes_before_its_slab() {
     at_each_text_scale(&[1.0, 1.5, 2.0], "row names", |scale| {
@@ -6797,7 +6205,6 @@ fn a_chooser_rows_name_comes_before_its_slab() {
                         let crate::native_ui::UiContent::Text(text) = &node.content else {
                             continue;
                         };
-                        // A row a list's edge cuts may draw none of its slab.
                         if node.clip.height + 0.5 < node.rect.height {
                             continue;
                         }
@@ -6826,16 +6233,6 @@ fn a_chooser_rows_name_comes_before_its_slab() {
     });
 }
 
-/// THE THEMES PAGE OPENS ON THE THEME IN USE (the review of the owner's
-/// pages, 2026-10-20: at 864×462 the stacked chooser opened at Aterm Night
-/// with `theme = "Dracula"`, its ✓ row out of view, and at 1144×462 the
-/// side-by-side one showed a sliver of Default under BUILT IN). Opened, the
-/// page lands the list on the highlighted row, as its Dark | Light segment
-/// does: the row is drawn whole inside the list's room, for a theme listed
-/// far down (One Dark: the short page's list beside the demo shows Dracula
-/// from its top) and for the default one, in either layout. NEGATIVE
-/// CONTROL: the same page at the top of its list, where it used to open,
-/// does not show that row whole.
 #[test]
 fn the_themes_page_opens_on_the_theme_in_use() {
     for (width, height) in [(864.0, 462.0), (1_144.0, 462.0)] {
@@ -6854,7 +6251,6 @@ fn the_themes_page_opens_on_the_theme_in_use() {
             if source.is_empty() {
                 continue;
             }
-            // NEGATIVE CONTROL: the list at its top.
             {
                 let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
                     unreachable!()
@@ -6872,15 +6268,6 @@ fn the_themes_page_opens_on_the_theme_in_use() {
     }
 }
 
-/// PAGE UP AND PAGE DOWN TURN THE CHOOSER BY THE SCREEN IT DRAWS: from the
-/// first row, Page Down after Page Down shows every row of the list whole
-/// on some screen and then turns on past the rows to the Community
-/// disclosure, whole; Page Up back from there shows every row whole again
-/// and ends on the first. (The step was the list's room in row heights, but
-/// a screen that starts inside a section repeats its caption over its first
-/// row: at 102×29 a screen held four whole rows under BUILT IN, the step was
-/// five, and One Dark was only ever a 1pt peek under the screen's edge; and
-/// from the last row Page Down did nothing, the disclosure left cut.)
 #[test]
 fn the_page_keys_show_every_chooser_row_whole() {
     let whole = |node: &crate::native_ui::PaintNode| {
@@ -6889,7 +6276,6 @@ fn the_page_keys_show_every_chooser_row_whole() {
             && node.clip.bottom() + 0.5 >= node.rect.bottom()
     };
     at_each_text_scale(&[1.0, 2.0], "chooser page keys", |scale| {
-        // 102×29, 80×24, 150×48 and 220×60 of the 12px cell.
         for (width, height) in [
             (738.0, 418.0),
             (584.0, 348.0),
@@ -6899,7 +6285,6 @@ fn the_page_keys_show_every_chooser_row_whole() {
             let cx = view_cx_at(width, height);
             let (_service, mut runtime, instance, view) = themes_view("theme = \"Default\"\n");
             let _ = compile_settings_view(&runtime, instance, view, &cx);
-            // The rows the list shows, in its order.
             let shown = state(&runtime, view);
             let order: Vec<String> = shown
                 .showcase
@@ -6914,9 +6299,6 @@ fn the_page_keys_show_every_chooser_row_whole() {
                 &format!("settings/showcase/card/{}", order[0]),
                 None,
             );
-            // Down from the first row past the last, then Up back to the
-            // first: each press moves the highlight or the keyboard, until
-            // the list's end.
             for direction in [1, -1] {
                 let mut seen = std::collections::BTreeSet::new();
                 let place = |runtime: &NativeRuntime| {
@@ -6965,8 +6347,6 @@ fn the_page_keys_show_every_chooser_row_whole() {
                     Some(end),
                     "{width}×{height} at {scale}×: paging {direction} ends on the list's end"
                 );
-                // Every row the keys turned over: all of them going down from
-                // the first, every one over the keyboard's going back up.
                 let never: Vec<&String> = order
                     .iter()
                     .filter(|slug| direction > 0 || Some(*slug) != start.as_ref())
@@ -6987,8 +6367,6 @@ fn the_page_keys_show_every_chooser_row_whole() {
     });
 }
 
-/// The theme rows the chooser's list paints whole inside it, and those it
-/// paints cut (by its edge, or past it), by key.
 fn whole_and_cut_rows(compiled: &crate::native_ui::CompiledUi) -> (Vec<String>, Vec<String>) {
     let list = rect_of(compiled, showcase_page::SHOWCASE_LIST);
     let options = drawn_rows(compiled);
@@ -7009,20 +6387,6 @@ fn whole_and_cut_rows(compiled: &crate::native_ui::CompiledUi) -> (Vec<String>, 
     (whole, cut)
 }
 
-/// THE CHOOSER IS USABLE AT THE DEFAULT WINDOW (the review of Settings at
-/// 80x24, 2026-10-20: at 584x350 the demo stacked over a list that showed a
-/// row and a half, the second cut mid-row). There the chooser stands beside
-/// the demo: on open its list paints four whole theme rows at the least and
-/// none cut, the demo keeps its 40 columns beside it with the strip under
-/// it, the strip and the chooser end on one line, and Down on a row tries
-/// the next theme in that demo. A tall window keeps the demo over the
-/// chooser, and a wide one keeps them side by side with the footer pinned
-/// under the list, as they were. (Every screen, the Customize sheet's and
-/// the one Community opens on included:
-/// [`no_stop_is_cut_on_any_screen`].) NEGATIVE CONTROL: a
-/// window too narrow for the demo beside even a chooser narrowed to keep
-/// it 40 columns (514x348, 70 columns) stacks them, and the same count
-/// finds fewer than four whole rows there.
 #[test]
 fn the_default_window_shows_four_whole_theme_rows_beside_the_demo() {
     for source in ["theme = \"Default\"\n", "theme = \"Dracula\"\n"] {
@@ -7045,8 +6409,6 @@ fn the_default_window_shows_four_whole_theme_rows_beside_the_demo() {
             (strip.bottom() - chooser.bottom()).abs() < 0.01,
             "{source}: {strip:?} {chooser:?}"
         );
-        // Down on the first whole row tries the next one, and the demo
-        // beside the list draws it.
         let order = drawn_rows(&compiled);
         let at = order
             .iter()
@@ -7068,13 +6430,11 @@ fn the_default_window_shows_four_whole_theme_rows_beside_the_demo() {
         );
         assert!(rect_of(&compiled, STAGE).x >= chooser.right());
     }
-    // A tall window: the demo over the chooser, as before.
     let (_service, runtime, instance, view) = themes_view("theme = \"Dracula\"\n");
     let compiled = compile_settings_view(&runtime, instance, view, &view_cx_at(584.0, 574.0));
     let stage = rect_of(&compiled, STAGE);
     let chooser = rect_of(&compiled, "settings/showcase/chooser");
     assert!(stage.bottom() <= chooser.y, "tall: {stage:?} {chooser:?}");
-    // A wide window: side by side, the footer pinned under the list.
     let compiled = compile_settings_view(&runtime, instance, view, &view_cx_at(1_144.0, 434.0));
     let list = rect_of(&compiled, showcase_page::SHOWCASE_LIST);
     let follow = rect_of(&compiled, "settings/showcase/footer/follow");
@@ -7083,7 +6443,6 @@ fn the_default_window_shows_four_whole_theme_rows_beside_the_demo() {
         "wide"
     );
     assert!(follow.y >= list.bottom(), "wide: {follow:?} under {list:?}");
-    // NEGATIVE CONTROL: too narrow for the demo beside, stacked and short.
     let compiled = compile_settings_view(&runtime, instance, view, &view_cx_at(514.0, 348.0));
     let (whole, _) = whole_and_cut_rows(&compiled);
     assert!(
@@ -7093,10 +6452,6 @@ fn the_default_window_shows_four_whole_theme_rows_beside_the_demo() {
     assert!(whole.len() < 4, "the control: {whole:?}");
 }
 
-/// The shape the themes page took, read off what it draws: the demo beside
-/// the chooser with the footer pinned under its list (`Beside`) or listed
-/// among its stops (`Short`), else the demo over the chooser or among its
-/// stops (`Stacked`).
 fn page_shape(compiled: &crate::native_ui::CompiledUi) -> &'static str {
     let chooser = rect_of(compiled, "settings/showcase/chooser");
     let list = rect_of(compiled, showcase_page::SHOWCASE_LIST);
@@ -7113,19 +6468,8 @@ fn page_shape(compiled: &crate::native_ui::CompiledUi) -> &'static str {
     }
 }
 
-/// The chooser's row height at the default text size.
 const CHOOSER_ROW: f32 = 32.0;
 
-/// THE PAGE CHANGES SHAPE ONCE AS THE WINDOW GROWS TALLER (the audit of
-/// the short page, 2026-10-20: measured under a demo that gave up rows at
-/// another line than the one the page decided by, 80 and 92 columns went
-/// Short, Stacked, Short and Stacked again between 34 and 39 lines, and 37
-/// lines showed nine rows beside the demo where 39 showed two under it). At
-/// 584, 668 and 1144pt wide, from 240pt to 760pt tall, once the demo first
-/// stands beside the chooser every shape the page takes holds one unbroken
-/// run of heights, and where it then stacks the demo over the chooser the
-/// list keeps four rows' room. PREMISE: the sweep sees Short give way to
-/// Stacked at 584 and 668, and to Beside at 1144.
 #[test]
 fn the_themes_page_changes_shape_once_as_the_window_grows_taller() {
     let (_service, runtime, instance, view) = themes_view("theme = \"Dracula\"\n");
@@ -7161,20 +6505,6 @@ fn the_themes_page_changes_shape_once_as_the_window_grows_taller() {
     }
 }
 
-/// WIDENING THE WINDOW NEVER TAKES ROWS FROM THE CHOOSER (the audit of the
-/// short page, 2026-10-20: at 24 lines 93 columns showed four rows and a
-/// 7pt sliver where 92 showed six whole; 123 columns one theme row and a
-/// sliver where 122 showed four; and 106 and 107 columns, where the sidebar
-/// comes, stacked a one-line demo over a row and a cut, between a demo
-/// beside the chooser at 105 and 108). At 348pt and 434pt tall, from 70
-/// columns to 182, a column at a time: once the demo stands beside the
-/// chooser it does at every wider width, at least 40 cells wide; beside it
-/// the chooser's list is whole rows tall and paints no row cut; and its
-/// rows never fall below four, or below what a narrower width showed,
-/// while the page's heading stays as it was (a heading that comes with the
-/// sidebar takes its own room). NEGATIVE CONTROL: at 70 columns the page is
-/// too narrow for the demo beside a chooser that keeps its slabs, and
-/// stacks.
 #[test]
 fn widening_the_window_never_takes_rows_from_the_chooser() {
     let (_service, runtime, instance, view) = themes_view("theme = \"Dracula\"\n");
@@ -7221,14 +6551,10 @@ fn widening_the_window_never_takes_rows_from_the_chooser() {
             "{height}: the demo beside from 72 columns"
         );
     }
-    // NEGATIVE CONTROL: too narrow for the demo beside, stacked.
     let compiled = compile_settings_view(&runtime, instance, view, &view_cx_at(514.0, 348.0));
     assert_eq!(page_shape(&compiled), "Stacked");
 }
 
-/// Every node the list `key` paints that its edges cut: what lies within
-/// the list's columns and reaches past its top or bottom, the list's own
-/// frame and thumb aside.
 fn cut_by_the_list(compiled: &crate::native_ui::CompiledUi, key: &str) -> Vec<String> {
     let list = rect_of(compiled, key);
     compiled
@@ -7248,9 +6574,6 @@ fn cut_by_the_list(compiled: &crate::native_ui::CompiledUi, key: &str) -> Vec<St
         .collect()
 }
 
-/// Every node the list `key` paints cut at the top of the rows a screen
-/// draws under the caption it keeps over them (a section's `/scrolled-rows`
-/// frame): a row scrolled half under its caption.
 fn cut_under_a_caption(compiled: &crate::native_ui::CompiledUi, key: &str) -> Vec<String> {
     let list = rect_of(compiled, key);
     let inside = |rect: &LogicalRect| {
@@ -7276,9 +6599,6 @@ fn cut_under_a_caption(compiled: &crate::native_ui::CompiledUi, key: &str) -> Ve
         .collect()
 }
 
-/// Each caption of the Customize sheet that a screen of its list `key`
-/// paints over none of the rows of its section that hold a colour: PALETTE
-/// with no chip under it, COLORS with no colour row.
 fn captions_over_no_colour(compiled: &crate::native_ui::CompiledUi, key: &str) -> Vec<String> {
     let list = rect_of(compiled, key);
     let painted: Vec<&str> = compiled
@@ -7320,37 +6640,6 @@ fn captions_over_no_colour(compiled: &crate::native_ui::CompiledUi, key: &str) -
         .collect()
 }
 
-/// NO STOP IS CUT ON ANY SCREEN, IN ANY SHAPE (the audit of the short page,
-/// 2026-10-20: the columns beside the demo were snapped to whole 32pt rows,
-/// but the Customize sheet's rows are 38pt apart under a caption — at a lab
-/// instance's 80x24, 584x348, `Selected text` showed 20 of its 32pt at the
-/// sheet's foot — and the 40pt Community disclosure and a NEEDS ATTENTION
-/// row's two lines left the rows after them cut at the chooser's foot; then
-/// the review of the stacked page, whose lists ended on a peek: every
-/// screen but the last ended on a cut row, at 514x348 (70x24) the last
-/// screen of a one-row list cut "Follow system light/dark" under the filter,
-/// at 584x516 and 584x530 (80x36, 80x37) it kept BUILT IN over a cut GitHub
-/// Light, and at 584x558 (80x39) the sheet's last screen kept PALETTE over
-/// its first chips, scrolled under it; then the audit of the sheet's
-/// last screen, measured 4pt longer than it draws: at 80x37 and 106x24 it
-/// was PALETTE and "Choose a color to change it" over Save as, no chip on
-/// it, where the bright chips fitted over them, and the screen before it
-/// left Save as undrawn with 40pt of the list blank under it). At 584x350,
-/// 675x448, 766x348 and 1144x448, where the demo stands beside the list,
-/// and at 514x348, 584x516, 584x530 and 584x558, where it stands over it,
-/// on every screen of the chooser — as it opens, with Community open, with
-/// a theme file that needs attention — and of the Customize sheet: no node
-/// the list draws reaches past its edges or starts under the caption a
-/// screen keeps over its rows; the screen draws exactly the stops it shows,
-/// seated at the first, and no stop after them that, laid out as the list
-/// lays out its runs, would end inside the list; and every caption the
-/// sheet's last screen paints stands over a row of its section's colours.
-/// NEGATIVE CONTROLS: at every one of those sizes the same stops ending on
-/// a peek (as the stacked lists did) draw one they do not show whole on
-/// some screen; what each screen draws, laid out so, ends inside the list,
-/// so a screen of two or more stops (none at 514x348, where every screen
-/// is one), one stop short, leaves out a stop that would end inside it;
-/// and at 766x348 and 584x530 the sheet's last screen paints PALETTE.
 #[test]
 fn no_stop_is_cut_on_any_screen() {
     let dir = aterm_tempfile::tempdir().expect("a themes folder");
@@ -7360,11 +6649,6 @@ fn no_stop_is_cut_on_any_screen() {
         "foreground = #dddddd\nbackground = #101218\n",
     )
     .unwrap();
-    // What the list cuts or leaves out on its screens, and the controls:
-    // whether some screen of it, its stops ending on a peek, draws a stop it
-    // does not show whole; whether some screen, one stop short, leaves out a
-    // stop that would end inside the list; and whether the last screen paints
-    // PALETTE.
     let check = |width: f32, height: f32, form: &str, stacked: bool| -> (Vec<String>, [bool; 3]) {
         let (mut service, mut runtime, instance, view) = themes_view("theme = \"Dracula\"\n");
         let cx = view_cx_at(width, height);
@@ -7401,14 +6685,10 @@ fn no_stop_is_cut_on_any_screen() {
         }
         let at = format!("{width}x{height} {form}");
         let mut faults = Vec::new();
-        // Each screen's first stop and how tall its list is; the captions the
-        // sheet's last screen paints over none of its colours, and whether it
-        // paints PALETTE.
         let mut rooms = Vec::new();
         let mut last_bare = Vec::new();
         let mut last_palette = false;
         each_screen(&mut runtime, instance, view, &cx, |compiled, top| {
-            // PREMISE: the shape the size is listed under.
             let stage = rect_of(compiled, STAGE);
             assert_eq!(
                 stage.bottom() <= rect_of(compiled, panel).y + 0.5,
@@ -7433,13 +6713,7 @@ fn no_stop_is_cut_on_any_screen() {
                 });
             }
         });
-        // THE LAST SCREEN IS NO CAPTION OVER ITS SECTION'S TOOLS: every
-        // caption the sheet's last screen paints stands over a row of its
-        // section's colours. (A screen the wheel seats at the palette's tools
-        // row, PALETTE kept over it, is one stop of the list; the last screen
-        // is the list's choice, the fullest that reaches its end.)
         faults.extend(last_bare);
-        // The list's stops and room, the same on every screen.
         let plan = state(&runtime, view)
             .scroll_plan()
             .expect("the list's plan");
@@ -7453,10 +6727,6 @@ fn no_stop_is_cut_on_any_screen() {
                 .collect::<Vec<_>>()
         };
         faults.extend(cuts(&plan));
-        // NO STOP LEFT OUT THAT FITS: the stops a screen draws and the next,
-        // laid out from the list's top as the list lays out its runs (each
-        // as tall as the card it draws, the list's gap between them), end
-        // inside the list only where the screen draws that next stop too.
         let fits = |stops: std::ops::Range<usize>, room: f32| plan.span(stops) <= room + 0.5;
         let mut short_flagged = false;
         for (top, room) in rooms {
@@ -7469,17 +6739,12 @@ fn no_stop_is_cut_on_any_screen() {
                     plan.span(drawn.start..drawn.end + 1)
                 ));
             }
-            // PREMISE: what the screen draws, laid out so, ends inside the
-            // list (a first stop taller than the list aside); so, NEGATIVE
-            // CONTROL, a screen of two or more stops, one stop short, leaves
-            // out a stop that ends inside the list.
             assert!(
                 drawn.len() < 2 || fits(drawn.clone(), room),
                 "{at} screen {top}: {drawn:?} laid out ends past a list {room} tall"
             );
             short_flagged |= drawn.len() >= 2;
         }
-        // NEGATIVE CONTROL: the same stops ending on a peek.
         let mut peek = plan;
         peek.set_foot(scroll::ListFoot::Peek);
         (
@@ -7526,8 +6791,6 @@ fn no_stop_is_cut_on_any_screen() {
     assert!(controls.is_empty(), "the controls: {controls:#?}");
 }
 
-/// Land every config write `outcome` asked for, as the host does: the real
-/// service applies it, the view hears it finished and the new snapshot.
 fn land_writes(
     service: &mut VersionedConfigService,
     runtime: &mut NativeRuntime,
@@ -7553,27 +6816,6 @@ fn land_writes(
     }
 }
 
-/// OPENING CUSTOMIZE, OR SETTING AND RESETTING A COLOUR IN IT, NEVER
-/// SQUEEZES OR MOVES THE DEMO (the audit of the short page's narrowed
-/// chooser, 2026-10-20: at 72x24 the chooser is 192pt so the demo beside it
-/// keeps its 40 cells, but the sheet in its place took 224.2pt to hold its
-/// colour rows on one line, and the demo, 255.8pt, moved right and wrapped
-/// its lines; then the audit: Reset's place came with the first
-/// colour set and went with the last reset, so at a Retina default window
-/// the first set moved the demo 18pt, and at the 1x default window every
-/// colour row went from one line to two and back). At 528, 556, 584, 766 and
-/// 885x348, 1152x420 and 1074x684, with no colour set and with one: the open
-/// sheet leaves the demo exactly where the chooser left it, at least 40 cells
-/// wide — rendered twice, so a page that seats its chrome again from the
-/// sheet's list is caught — and setting a colour there, then resetting it
-/// (or the other way round), moves the demo not at all and keeps every
-/// colour row's form, its name beside its field or over it; its rows paint
-/// every name whole and its title whole. PREMISE: at 885x348 and 1152x420
-/// the panel is wider than the 232pt chooser, as wide as the rows need on
-/// one line with Reset's place, so a sheet that took that width only while
-/// a colour was set would move the demo there. NEGATIVE CONTROL: the form
-/// check tells the forms apart — 584x348 puts every name over its field,
-/// 885x348 beside it.
 #[test]
 fn opening_customize_never_squeezes_or_moves_the_demo() {
     let painted = |compiled: &crate::native_ui::CompiledUi, key: &str| {
@@ -7584,8 +6826,6 @@ fn opening_customize_never_squeezes_or_moves_the_demo() {
             _ => None,
         })
     };
-    // Each colour row's form where the sheet draws it: its name beside its
-    // field (true) or over it.
     let forms = |compiled: &crate::native_ui::CompiledUi, at: &str| {
         let mut forms = Vec::new();
         for key in showcase_page::SHOWCASE_COLOR_KEYS {
@@ -7669,7 +6909,6 @@ fn opening_customize_never_squeezes_or_moves_the_demo() {
             let (title, _) =
                 painted(&sheet, "settings/showcase/sheet-title").expect("the sheet's title");
             assert!(!title.contains('\u{2026}'), "{at}: the title {title:?}");
-            // Set the cursor's colour, then reset it, or the other way round.
             let steps = if source == set {
                 [
                     ("settings/reset/cursor_color", None),
@@ -7695,8 +6934,6 @@ fn opening_customize_never_squeezes_or_moves_the_demo() {
                     unmoved(before, moved),
                     "{at} after {action}: the demo {moved:?} where it stood {before:?}"
                 );
-                // The rows this screen and the opened one both draw (the
-                // keyboard on the row it set may scroll the list).
                 let now_forms = forms(&now, &at);
                 let both: Vec<_> = now_forms
                     .iter()
@@ -7721,7 +6958,6 @@ fn opening_customize_never_squeezes_or_moves_the_demo() {
             }
         }
     }
-    // NEGATIVE CONTROL: the forms the check tells apart.
     let all =
         |size: (u32, u32), beside: bool| seen_forms[&size].iter().all(|(_, form)| *form == beside);
     assert!(
@@ -7736,23 +6972,9 @@ fn opening_customize_never_squeezes_or_moves_the_demo() {
     );
 }
 
-/// NO SCREEN OF THE SHEET IS MOSTLY BLANK (the audit of the sheet's whole
-/// stops, 2026-10-20: the palette was one 118pt stop — its caption, both
-/// rows of chips and the tools row — so at 106x24, 107x24 and 123x24 the
-/// last screen of a 128pt list was "Save as theme…" alone over 96pt of
-/// blank, and at 80x24 a screen showed two colour rows over a 96pt hole).
-/// With no slot open, every stop of the sheet is at most a caption over one
-/// of its rows, so on every screen, at 72, 80, 106 and 123 columns of 24
-/// lines, the room under the last stop drawn is less than a captioned
-/// colour row and the list's gap — the most the next stop can take.
-/// NEGATIVE CONTROL: an open slot's editor pages with its swatches as one
-/// tall stop, and at 80x24 a screen ends that much short of its foot.
 #[test]
 fn no_screen_of_the_sheet_is_mostly_blank() {
     let list = "settings/showcase/sheet-list";
-    // The most blank a screen of the sheet at `width`x348 leaves, and the
-    // most its stops allow: a caption over a colour row as it draws, the
-    // card's gap under the row, and the list's gap.
     let blanks = |width: f32, slot: bool| {
         let (_service, mut runtime, instance, view) = themes_view("theme = \"Dracula\"\n");
         let cx = view_cx_at(width, 348.0);
@@ -7820,7 +7042,6 @@ fn no_screen_of_the_sheet_is_mostly_blank() {
             "{width}x348: screen {top} ends {blank}pt short of its foot (bound {bound})"
         );
     }
-    // NEGATIVE CONTROL: the open slot's swatches and editor are one stop.
     let ((blank, top), bound) = blanks(584.0, true);
     assert!(
         blank >= bound,
@@ -7828,15 +7049,6 @@ fn no_screen_of_the_sheet_is_mostly_blank() {
     );
 }
 
-/// EVERY PALETTE CHIP IS A TARGET A POINTER CAN HIT (the audit of
-/// the sheet at 72x24: the chooser's 192pt kept eight chips to a row, 15.2pt
-/// targets 21.2pt apart, a 7pt sliver of colour in each; at a Retina 70x24
-/// 17.9pt, 23.9pt apart). At 528x348 and 556x348, on every screen of the
-/// sheet, no two palette chips' targets stand closer than 24pt centre to
-/// centre (WCAG 2.5.8's spacing), and each of the sixteen is drawn whole on
-/// some screen. PREMISE: at 528x348 a row of the palette is too narrow for
-/// eight chips 24pt apart, so it stands four to a row. NEGATIVE CONTROL:
-/// where eight keep that pitch (1144x448) a row holds eight.
 #[test]
 fn palette_chips_stand_a_target_apart() {
     let chips_in = |compiled: &crate::native_ui::CompiledUi| -> Vec<(usize, LogicalRect)> {
@@ -7891,7 +7103,6 @@ fn palette_chips_stand_a_target_apart() {
                     );
                 }
             }
-            // PREMISE: at 528 a row is too narrow for eight 24pt apart.
             if width == 528.0
                 && let Some(row) = compiled.semantic(&UiKey::new("settings/showcase/palette-row/0"))
             {
@@ -7904,7 +7115,6 @@ fn palette_chips_stand_a_target_apart() {
         });
         assert_eq!(whole.len(), 16, "{width}x348: chips drawn whole {whole:?}");
     }
-    // NEGATIVE CONTROL: room for eight to a row.
     let (mut runtime, instance, view, cx) = open(1_144.0, 448.0);
     let mut most = 0;
     each_screen(&mut runtime, instance, view, &cx, |compiled, _| {

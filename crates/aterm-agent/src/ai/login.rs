@@ -177,11 +177,15 @@ fn claude(h: &Host<'_>, f: &Facts, out: &mut dyn Write) -> Done {
             a.label
         ));
     }
-    let renews = f.accounts.as_ref().is_some_and(|a| a.renews);
+    let renews = f
+        .accounts
+        .as_ref()
+        .is_some_and(|a| a.renews || a.next_sign_in.is_some());
     let label = f
         .accounts
         .as_ref()
-        .map_or_else(|| OWN_LABEL.to_string(), |a| a.label.clone());
+        .and_then(|a| a.next_sign_in.clone().or_else(|| Some(a.label.clone())))
+        .unwrap_or_else(|| OWN_LABEL.to_string());
     let env: Vec<(String, String)> = h.vars.to_vec();
     if !renews {
         let _ = writeln!(

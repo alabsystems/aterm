@@ -212,6 +212,16 @@ pub struct HostFacts {
     /// access for remote users"): the system TCC database opened for reading.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_full_disk_access: Option<bool>,
+    /// Whether the process running the items holds Full Disk Access (TCC's
+    /// `kTCCServiceSystemPolicyAllFiles`, held by the app responsible for it), measured once
+    /// per run without a prompt: the runner's measurement when it gave one
+    /// ([`crate::port::System::full_disk_access`]: `aterm init`, the doctor and System
+    /// State), else this process's own open of the system TCC database
+    /// ([`crate::facts::gather`]: the agent, root's grant, never aterm's). `None`, not
+    /// measured, counts as no grant. Only a grant lets an item read or write another app's
+    /// sandbox container ([`crate::items::defaults::withheld`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub full_disk_access: Option<bool>,
     /// Who owns `/dev/console` (absent at the login window). An owner that could not be
     /// named reads `(uid <n>)` or `(unknown)` (`facts::CONSOLE_UNKNOWN`), never absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]

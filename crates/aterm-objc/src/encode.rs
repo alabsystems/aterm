@@ -1,107 +1,29 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Objective-C type encodings.
-//!
-//! `class_addMethod` takes a `types` string describing the method's C
-//! signature. Direct sends never read it, but `NSMethodSignature` does, and
-//! AppKit uses that on every reflective path (`NSInvocation`, forwarding,
-//! accessibility, delegate arity checks).
-//!
-//! Encodings here are the offset-free form (`"v@:@"`, not `"v24@0:8@16"`):
-//! `NSMethodSignature` recomputes offsets from the type letters and ignores
-//! any that are written.
+//! Objective-C type encodings (`@encode`) and C ABI layout traits ([`Encode`]).
 
 use std::ffi::c_void;
 use std::fmt;
 
-/// The Objective-C type encoding of a value that can cross a method boundary.
+/// Objective-C type encoding of a value that can cross a method boundary.
 ///
 /// # Safety
-/// `ENCODING` must be the encoding the C ABI actually uses for `Self`. A wrong
-/// string does not affect direct sends (typed by [`crate::msg`]) but makes
-/// every reflective path read arguments at the wrong widths.
+/// `ENCODING` must match the C ABI encoding of `Self`.
 pub unsafe trait Encode {
-    /// The encoding string, e.g. `"@"` for an object or `"d"` for a `CGFloat`.
+    /// Objective-C type-encoding string (e.g. `"@"` for an object or `"d"` for `CGFloat`).
     const ENCODING: &'static str;
 
-    /// Whether `Self` contains, anywhere in its layout tree, a field at an
-    /// offset that is not a multiple of that field's own alignment.
-    ///
-    /// Transitive: a wrapper whose only field is a packed struct is still
-    /// MEMORY-classified on System V x86-64, because classification walks the
-    /// whole layout. From `clang -arch x86_64 -O1 -S`, with
-    /// `struct __attribute__((packed)) Packed9 { char c; long q; }`:
-    ///
-    /// ```text
-    /// struct Wrap    { struct Packed9 inner; }              9  1  _objc_msgSend_stret
-    /// struct WrapPad { struct Packed9 inner; char pad[7]; } 16  1  _objc_msgSend_stret
-    /// struct ArrOne  { struct Packed9 a[1]; }               9  1  _objc_msgSend_stret
-    /// struct NineChars { char c[9]; }                       9  1  _objc_msgSend
-    /// ```
-    ///
-    /// Not an encoding (`@encode` does not record packing); it lives here
-    /// because this trait is where a type declares its C ABI, and
-    /// [`crate::returns_indirectly`] needs it: on `x86_64-apple-darwin` a type
-    /// with an unaligned field is MEMORY at any size.
-    ///
-    /// Defaults to `false`; nothing in Foundation, AppKit, CoreGraphics or this
-    /// crate is packed. A packed type sets it by hand:
-    ///
-    /// ```
-    /// # use aterm_objc::{Encode, returns_indirectly};
-    /// #[repr(C, packed)]
-    /// struct Packed {
-    ///     c: i8,
-    ///     q: i64,
-    /// }
-    /// // SAFETY: `{Packed=cq}` is the layout; the `q` sits at offset 1, so
-    /// // System V x86-64 classification is MEMORY regardless of the 9-byte size.
-    /// unsafe impl Encode for Packed {
-    ///     const ENCODING: &'static str = "{Packed=cq}";
-    ///     const HAS_UNALIGNED_FIELDS: bool = true;
-    /// }
-    /// assert_eq!(size_of::<Packed>(), 9);
-    /// assert_eq!(returns_indirectly::<Packed>(), cfg!(target_arch = "x86_64"));
-    /// ```
-    ///
-    /// A wrapper inherits it; prefer `<Field as Encode>::HAS_UNALIGNED_FIELDS`
-    /// over a hand-typed `true`:
-    ///
-    /// ```
-    /// # use aterm_objc::{Encode, returns_indirectly};
-    /// #[repr(C, packed)]
-    /// struct Packed { c: i8, q: i64 }
-    /// // SAFETY: `{Packed=cq}`; the `q` sits at offset 1.
-    /// unsafe impl Encode for Packed {
-    ///     const ENCODING: &'static str = "{Packed=cq}";
-    ///     const HAS_UNALIGNED_FIELDS: bool = true;
-    /// }
-    /// #[repr(C)]
-    /// struct Wrap { inner: Packed }
-    /// // ONE field, at offset 0, alignment 1: only the field's own flag
-    /// // knows its `q` is misaligned.
-    /// // SAFETY: the misalignment is `Packed`'s and `Wrap` inherits it.
-    /// unsafe impl Encode for Wrap {
-    ///     const ENCODING: &'static str = "{Wrap={Packed=cq}}";
-    ///     const HAS_UNALIGNED_FIELDS: bool = <Packed as Encode>::HAS_UNALIGNED_FIELDS;
-    /// }
-    /// assert_eq!(size_of::<Wrap>(), 9);
-    /// assert_eq!(align_of::<Wrap>(), 1);
-    /// assert_eq!(returns_indirectly::<Wrap>(), cfg!(target_arch = "x86_64"));
-    /// ```
+    /// Whether `Self` contains any field at an offset not aligned to that field's alignment ([`crate::returns_indirectly`]).
     ///
     /// # Safety
-    /// `false` for a type that misaligns a field anywhere in its layout routes
-    /// an x86_64 send to the wrong entry point, shifting every argument by one
-    /// register.
+    /// Setting `false` when a field is misaligned routes `x86_64` sends to the wrong entry point.
     const HAS_UNALIGNED_FIELDS: bool = false;
 }
 
 macro_rules! prim {
     ($($t:ty => $e:literal),* $(,)?) => {$(
-        // SAFETY: the letters are the runtime's documented encodings and match
-        // the Rust type's C ABI on every 64-bit Apple target.
+        // SAFETY: The letters are the runtime's documented encodings and match each Rust type's C ABI on 64-bit Apple targets.
         unsafe impl Encode for $t { const ENCODING: &'static str = $e; }
     )*};
 }
@@ -123,13 +45,6 @@ prim! {
 }
 
 /// `@encode(BOOL)` for the target being compiled:
-///
-/// ```text
-/// clang -arch arm64  : @encode(BOOL) = "B", __OBJC_BOOL_IS_BOOL = 1
-/// clang -arch x86_64 : @encode(BOOL) = "c", __OBJC_BOOL_IS_BOOL = 0
-/// ```
-///
-/// Both arms are live: x86_64 is the compat slice of the universal binary.
 #[cfg(target_arch = "aarch64")]
 const BOOL_ENCODING: &str = "B";
 /// See the `aarch64` arm.
@@ -143,19 +58,7 @@ type BoolRepr = bool;
 #[cfg(not(target_arch = "aarch64"))]
 type BoolRepr = i8;
 
-/// The Objective-C `BOOL`, at the width, values and encoding this target uses.
-///
-/// On `aarch64-apple-darwin` `BOOL` is `_Bool`; on `x86_64-apple-darwin` it is
-/// `signed char`, and the sender passes the byte unnormalised:
-///
-/// ```text
-/// arm64  : cmp w1, #0 ; cset w2, ne     <- normalised to 0/1 (it is `_Bool`)
-/// x86_64 : movsbl %sil, %edx            <- the byte is passed AS IS
-/// ```
-///
-/// So a declared method can receive a `BOOL` of `3`, and reading that as a Rust
-/// `bool` is undefined behaviour. Every declared `BOOL` argument and return
-/// uses this type, `bool` has no [`Encode`] impl, and conversion is explicit.
+/// Objective-C `BOOL` at the target's native width, values, and encoding.
 #[repr(transparent)]
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
 pub struct Bool(BoolRepr);
@@ -167,14 +70,14 @@ impl Bool {
     /// Objective-C `YES`.
     pub const YES: Self = Self(true);
 
-    /// A `BOOL` from a Rust `bool`. Always exact: `bool` is a subset.
+    /// Converts a Rust `bool` into a [`Bool`].
     #[inline]
     #[must_use]
     pub const fn new(value: bool) -> Self {
         Self(value)
     }
 
-    /// The Rust `bool` this `BOOL` means.
+    /// Converts this [`Bool`] into a Rust `bool`.
     #[inline]
     #[must_use]
     pub const fn as_bool(self) -> bool {
@@ -189,15 +92,14 @@ impl Bool {
     /// Objective-C `YES`.
     pub const YES: Self = Self(1);
 
-    /// A `BOOL` from a Rust `bool`.
+    /// Converts a Rust `bool` into a [`Bool`].
     #[inline]
     #[must_use]
     pub const fn new(value: bool) -> Self {
         Self(value as BoolRepr)
     }
 
-    /// The Rust `bool` this `BOOL` means — `!= 0`, which is C's own rule and
-    /// the reason this crate never transmutes the byte.
+    /// Converts this [`Bool`] into a Rust `bool` (`!= 0`).
     #[inline]
     #[must_use]
     pub const fn as_bool(self) -> bool {
@@ -225,139 +127,91 @@ impl fmt::Debug for Bool {
     }
 }
 
-// SAFETY: `Bool` is `#[repr(transparent)]` over this target's `BOOL` C type
-// (`_Bool` on aarch64, `signed char` elsewhere), and `BOOL_ENCODING` is its
-// `@encode`. `bool_encoding_matches_what_foundation_itself_emits` re-checks it
-// against a Foundation method signature at run time.
+// SAFETY: `Bool` is `#[repr(transparent)]` over the target's C `BOOL` and `BOOL_ENCODING` is its `@encode`.
 unsafe impl Encode for Bool {
     const ENCODING: &'static str = BOOL_ENCODING;
 }
 
-// The pointer-shaped runtime types are distinct newtypes so each carries the
-// letter clang emits:
-//
-// ```text
-// @encode(id)           = @      @encode(Class)        = #
-// @encode(Protocol *)   = @      @encode(SEL)          = :
-// @encode(void *)       = ^v     @encode(const void *) = r^v
-// ```
-//
-// SAFETY: object pointers encode as `"@"`, and `Id` is `#[repr(transparent)]`
-// over exactly the pointer the runtime passes.
+// SAFETY: Object pointers encode as `"@"`, and `Id` is `#[repr(transparent)]` over the runtime pointer.
 unsafe impl Encode for crate::runtime::Id {
     const ENCODING: &'static str = "@";
 }
-// SAFETY: a class object encodes as `"#"`, not `"@"` (`- (void)
-// setDelegateClass:(Class)c` registers `v24@0:8#16`).
+// SAFETY: Class objects encode as `"#"`.
 unsafe impl Encode for crate::runtime::ClassPtr {
     const ENCODING: &'static str = "#";
 }
-// SAFETY: `@encode(Protocol *)` is `"@"` (measured; unlike `Class`).
+// SAFETY: `@encode(Protocol *)` is `"@"`.
 unsafe impl Encode for crate::runtime::ProtocolPtr {
     const ENCODING: &'static str = "@";
 }
-// SAFETY: selectors encode as `":"`; `Sel` is a newtype so this can differ from
-// the `void *` impls below.
+// SAFETY: Selectors encode as `":"`.
 unsafe impl Encode for crate::runtime::Sel {
     const ENCODING: &'static str = ":";
 }
-// A bare `void *`: an opaque caller-owned context pointer (KVO's `context:`),
-// not an object. Registering it as `"@"` would invite `NSInvocation` and
-// forwarding to retain it.
-// SAFETY: `void *` encodes as `"^v"` — `^` is "pointer to", `v` is `void`.
+// SAFETY: `void *` encodes as `"^v"`.
 unsafe impl Encode for *mut c_void {
     const ENCODING: &'static str = "^v";
 }
-// clang emits `r^v`; the `r` (const qualifier) is optional in a method type
-// string and `NSMethodSignature` skips it, so the short `"^v"` is registered.
-// SAFETY: as above.
+// SAFETY: `const void *` encodes as `"^v"` (the `r` qualifier is optional).
 unsafe impl Encode for *const c_void {
     const ENCODING: &'static str = "^v";
 }
-// `char *` — what `-[NSString UTF8String]` returns.
-// SAFETY: the runtime spells a C string `"*"`, not `"^c"`.
+// SAFETY: C strings (`char *`) encode as `"*"`.
 unsafe impl Encode for *const std::ffi::c_char {
     const ENCODING: &'static str = "*";
 }
-// `unsigned char *` — what `-[NSBitmapImageRep bitmapData]` returns. clang
-// encodes `char *`, `signed char *` and `unsigned char *` all as `*`, and the
-// live method reads `*16@0:8`; `^C` would be a string the runtime never emits.
-// SAFETY: measured with clang on both arches.
+// SAFETY: `unsigned char *` encodes as `"*"` under clang on both Apple architectures.
 unsafe impl Encode for *mut std::ffi::c_uchar {
     const ENCODING: &'static str = "*";
 }
 
-// `id *`, an array of objects: `+[NSArray arrayWithObjects:count:]` takes a
-// `const id *` (clang emits `r^@`; the qualifier is omitted as above).
-// SAFETY: a pointer to object pointers encodes as `"^@"`.
+// SAFETY: A pointer to object pointers (`id *`) encodes as `"^@"`.
 unsafe impl Encode for *const crate::runtime::Id {
     const ENCODING: &'static str = "^@";
 }
-// `unsigned char **`, the plane array of `-[NSBitmapImageRep
-// initWithBitmapDataPlanes:…]`, which the runtime reports as `^*`.
-// SAFETY: a pointer to C strings encodes as `"^*"`.
+// SAFETY: A pointer to C strings (`unsigned char **`) encodes as `"^*"`.
 unsafe impl Encode for *mut *mut std::ffi::c_uchar {
     const ENCODING: &'static str = "^*";
 }
 
-// SAFETY: `const uint8_t *` — a byte buffer an argument only reads
-// (`-initWithBytes:length:encoding:`, `-replaceRegion:…withBytes:…`); clang
-// spells it `r*` or `r^v`, every one a pointer in a general register.
+// SAFETY: `const uint8_t *` byte buffers encode as `"r*"`.
 unsafe impl Encode for *const u8 {
     const ENCODING: &'static str = "r*";
 }
 
-// SAFETY: `const uint32_t *` — a word buffer read by the caller of a getter.
+// SAFETY: `const uint32_t *` word buffers encode as `"r^I"`.
 unsafe impl Encode for *const u32 {
     const ENCODING: &'static str = "r^I";
 }
 
-// SAFETY: `unichar *` — `-getCharacters:range:`'s buffer (`^S`).
+// SAFETY: `unichar *` (`*mut u16`) encodes as `"^S"`.
 unsafe impl Encode for *mut u16 {
     const ENCODING: &'static str = "^S";
 }
 
-// SAFETY: `const unichar *` — `-initWithCharacters:length:`'s (`r^S`; the
-// qualifier changes nothing the call passes).
+// SAFETY: `const unichar *` (`*const u16`) encodes as `"^S"`.
 unsafe impl Encode for *const u16 {
     const ENCODING: &'static str = "^S";
 }
 
-// SAFETY: `id *` — an `NSError **` out-parameter (`^@`), written by the callee.
+// SAFETY: `id *` out-parameters (`NSError **`) encode as `"^@"`.
 unsafe impl Encode for *mut crate::runtime::Id {
     const ENCODING: &'static str = "^@";
 }
 
 /// `@encode(BOOL *)` for the target being compiled. Not `"^"` plus
-/// [`BOOL_ENCODING`] on x86_64, and not `*` either:
-///
-/// ```text
-/// clang -arch arm64  : @encode(BOOL*) = "^B"   (BOOL is _Bool)
-/// clang -arch x86_64 : @encode(BOOL*) = "^c"   (BOOL is signed char, but
-///                                               clang encodes the BOOL
-///                                               typedef itself, never the
-///                                               char* it aliases)
-/// ```
-///
-/// Foundation's compiled methods agree:
-/// `-[NSFileManager fileExistsAtPath:isDirectory:]` is `c32@0:8@16^c24` on
-/// x86_64. `tests/declared_abi.rs` compares that argument with this constant.
 #[cfg(target_arch = "aarch64")]
 const BOOL_PTR_ENCODING: &str = "^B";
 /// See the `aarch64` arm.
 #[cfg(not(target_arch = "aarch64"))]
 const BOOL_PTR_ENCODING: &str = "^c";
 
-// `BOOL *` — the `stop` out-parameter of Foundation's `enumerate…UsingBlock:`.
-// `*mut bool` would break [`Bool`]'s rule through a pointer (x86_64 writes an
-// arbitrary `signed char`), and neither `bool` nor `*mut bool` has an `Encode`
-// impl, so this is the only spelling `RcBlock::newN` accepts.
-// SAFETY: measured on both arms — see [`BOOL_PTR_ENCODING`].
+// SAFETY: `*mut Bool` matches `@encode(BOOL *)` (`BOOL_PTR_ENCODING`) on both Apple architectures.
 unsafe impl Encode for *mut Bool {
     const ENCODING: &'static str = BOOL_PTR_ENCODING;
 }
 
-/// A `CGPoint` / `NSPoint`.
+/// CoreGraphics `CGPoint` / AppKit `NSPoint`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct CGPoint {
@@ -366,7 +220,7 @@ pub struct CGPoint {
 }
 
 impl CGPoint {
-    /// Construct a `CGPoint` at `(x, y)`.
+    /// Constructs a `CGPoint` at `(x, y)`.
     #[inline]
     #[must_use]
     pub const fn new(x: f64, y: f64) -> Self {
@@ -374,7 +228,7 @@ impl CGPoint {
     }
 }
 
-/// A `CGSize` / `NSSize`.
+/// CoreGraphics `CGSize` / AppKit `NSSize`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct CGSize {
@@ -383,7 +237,7 @@ pub struct CGSize {
 }
 
 impl CGSize {
-    /// Construct a `CGSize` of `(width, height)`.
+    /// Constructs a `CGSize` of `(width, height)`.
     #[inline]
     #[must_use]
     pub const fn new(width: f64, height: f64) -> Self {
@@ -391,7 +245,7 @@ impl CGSize {
     }
 }
 
-/// A `CGRect` / `NSRect` — the argument `drawRect:` takes and `bounds` returns.
+/// CoreGraphics `CGRect` / AppKit `NSRect`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct CGRect {
@@ -400,7 +254,7 @@ pub struct CGRect {
 }
 
 impl CGRect {
-    /// Construct a `CGRect` from `origin` and `size`.
+    /// Constructs a `CGRect` from `origin` and `size`.
     #[inline]
     #[must_use]
     pub const fn new(origin: CGPoint, size: CGSize) -> Self {
@@ -408,56 +262,52 @@ impl CGRect {
     }
 }
 
-// SAFETY: these are Foundation's struct encodings for the same layouts;
-// `#[repr(C)]` with two `f64` fields matches `CGPoint`/`CGSize`, and `CGRect`
-// is the two in order. `CGFloat` is `double` on 64-bit.
+// SAFETY: `#[repr(C)]` with two `f64` fields matches Foundation's `{CGPoint=dd}` layout.
 unsafe impl Encode for CGPoint {
     const ENCODING: &'static str = "{CGPoint=dd}";
 }
-// SAFETY: as above.
+// SAFETY: `#[repr(C)]` with two `f64` fields matches Foundation's `{CGSize=dd}` layout.
 unsafe impl Encode for CGSize {
     const ENCODING: &'static str = "{CGSize=dd}";
 }
-// SAFETY: as above.
+// SAFETY: `#[repr(C)]` over `CGPoint` and `CGSize` matches Foundation's `{CGRect={CGPoint=dd}{CGSize=dd}}` layout.
 unsafe impl Encode for CGRect {
     const ENCODING: &'static str = "{CGRect={CGPoint=dd}{CGSize=dd}}";
 }
 
-/// An `NSRange` — a location/length pair over `NSUInteger`, needed by the
-/// `NSTextInputClient` methods (`selectedRange`, `markedRange`,
-/// `firstRectForCharacterRange:actualRange:`).
+/// Foundation `NSRange` (`location` and `length` in UTF-16 code units).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct NSRange {
-    /// `NSNotFound` (`NSIntegerMax`) when there is no range.
+    /// Start index, or `NSNotFound` (`NSIntegerMax`) when absent.
     pub location: usize,
-    /// Length in UTF-16 code units, which is what `NSTextInputClient` counts.
+    /// Length in UTF-16 code units.
     pub length: usize,
 }
 
 impl NSRange {
-    /// Construct an `NSRange` with `(location, length)`.
+    /// Constructs an `NSRange` with `(location, length)`.
     #[inline]
     #[must_use]
     pub const fn new(location: usize, length: usize) -> Self {
         Self { location, length }
     }
 
-    /// Return `true` when `length == 0`.
+    /// Whether `length == 0`.
     #[inline]
     #[must_use]
     pub const fn is_empty(self) -> bool {
         self.length == 0
     }
 
-    /// Return `location.saturating_add(length)`.
+    /// Returns `location.saturating_add(length)`.
     #[inline]
     #[must_use]
     pub const fn end_saturating(self) -> usize {
         self.location.saturating_add(self.length)
     }
 
-    /// Return `true` when `idx >= location` and `idx - location < length`.
+    /// Whether `idx` lies within `location..location + length`.
     #[inline]
     #[must_use]
     pub const fn contains_index(self, idx: usize) -> bool {
@@ -467,7 +317,7 @@ impl NSRange {
         (idx - self.location) < self.length
     }
 
-    /// Encode this `NSRange` into 16 little-endian bytes (`location` as `u64`, `length` as `u64`).
+    /// Encodes this `NSRange` into 16 little-endian bytes.
     #[inline]
     #[must_use]
     pub const fn encode_le(self) -> [u8; 16] {
@@ -493,7 +343,7 @@ impl NSRange {
         ]
     }
 
-    /// Decode 16 little-endian bytes into an `NSRange`.
+    /// Decodes 16 little-endian bytes into an `NSRange`.
     #[inline]
     #[must_use]
     pub const fn decode_le(bytes: [u8; 16]) -> Self {
@@ -520,88 +370,24 @@ impl NSRange {
     }
 }
 
-// SAFETY: `@encode(NSRange)` is `{_NSRange=QQ}` (the tag is `_NSRange`; `NSRange`
-// is a typedef), and `Q` is `usize` on 64-bit Apple targets. `#[repr(C)]` with
-// two `usize` fields matches the C layout.
+// SAFETY: `#[repr(C)]` with two `usize` fields matches `@encode(NSRange)` (`{_NSRange=QQ}`) on 64-bit Apple targets.
 unsafe impl Encode for NSRange {
     const ENCODING: &'static str = "{_NSRange=QQ}";
 }
 
-// `NSRangePointer` (`NSRange *`), the out-parameter of
-// `firstRectForCharacterRange:actualRange:`, which clang registers as
-//
-// ```text
-// {CGRect={CGPoint=dd}{CGSize=dd}}40@0:8{_NSRange=QQ}16^{_NSRange=QQ}32
-// ```
-//
-// A pointer to a struct encodes as `^` plus the pointee's encoding. Spelled per
-// type because stable Rust cannot concatenate associated consts; another
-// pointee needs a `#[repr(transparent)]` pointer newtype and its own impl.
-// SAFETY: `^` is "pointer to" and `{_NSRange=QQ}` is the pointee's encoding.
+// SAFETY: `*mut NSRange` (`NSRangePointer`) encodes as `"^{_NSRange=QQ}"`.
 unsafe impl Encode for *mut NSRange {
     const ENCODING: &'static str = "^{_NSRange=QQ}";
 }
-// SAFETY: as above; the `const` qualifier `r` is omitted for the reason given
-// on `*const c_void`.
+// SAFETY: `*const NSRange` encodes as `"^{_NSRange=QQ}"`.
 unsafe impl Encode for *const NSRange {
     const ENCODING: &'static str = "^{_NSRange=QQ}";
 }
 
-/// The offset-free form of a compiler-emitted method type encoding.
-///
-/// clang registers `"v24@0:8@16"` for `-(void)foo:(id)a`; this crate registers
-/// `"v@:@"`. Comparing a declared row with its protocol or superclass needs one
-/// normalised, and the short form loses nothing.
-///
-/// ```
-/// # use aterm_objc::strip_method_offsets;
-/// // `-[NSWindowDelegate windowDidResize:]`, as the runtime reports it.
-/// assert_eq!(strip_method_offsets("v24@0:8@16"), "v@:@");
-/// // `-[NSDraggingDestination draggingEntered:]` — an NSUInteger return.
-/// assert_eq!(strip_method_offsets("Q24@0:8@16"), "Q@:@");
-/// // The struct-returning row, offsets and all.
-/// assert_eq!(
-///     strip_method_offsets(
-///         "{CGRect={CGPoint=dd}{CGSize=dd}}40@0:8{_NSRange=QQ}16^{_NSRange=QQ}32"
-///     ),
-///     "{CGRect={CGPoint=dd}{CGSize=dd}}@:{_NSRange=QQ}^{_NSRange=QQ}"
-/// );
-/// ```
-///
-/// Offsets appear only at the top level, after a complete type, so digits are
-/// stripped only at nesting depth zero and outside quotes. That keeps array
-/// counts (`[16c]`), bitfield widths (`b4b1b24`), and digits in struct, union,
-/// template or quoted class names (`CATransform3D`, `MTLHashMask<4>`);
-/// `tests/encode_offsets.rs` checks these against the live runtime.
-///
-/// ```
-/// # use aterm_objc::strip_method_offsets;
-/// // An array count.
-/// assert_eq!(strip_method_offsets("v20@0:8[4i]16"), "v@:[4i]");
-/// // A bitfield width — `NSDecimal`, off `-[NSString decimalValue]`.
-/// assert_eq!(
-///     strip_method_offsets("{?=b8b4b1b1b18[8S]}16@0:8"),
-///     "{?=b8b4b1b1b18[8S]}@:"
-/// );
-/// // A digit in a struct tag.
-/// assert_eq!(
-///     strip_method_offsets("v144@0:8{CATransform3D=dddddddddddddddd}16"),
-///     "v@:{CATransform3D=dddddddddddddddd}"
-/// );
-/// // A digit inside a QUOTED class name, which clang emits for a typed
-/// // object argument.
-/// assert_eq!(
-///     strip_method_offsets("v24@0:8@\"NSISO8601DateFormatter\"16"),
-///     "v@:@\"NSISO8601DateFormatter\""
-/// );
-/// ```
-///
-/// A `const` qualifier (`r`) is a letter and is not stripped, so `"r^v"` versus
-/// `"^v"` remains a reported difference.
+/// Strips top-level argument frame offsets from a compiler-emitted Objective-C method type encoding.
 #[must_use]
 pub fn strip_method_offsets(types: &str) -> String {
     let mut out = String::with_capacity(types.len());
-    // One depth counter for all bracket kinds: only "inside anything" matters.
     let mut depth = 0_usize;
     let mut in_quotes = false;
     for c in types.chars() {
@@ -625,30 +411,7 @@ pub fn strip_method_offsets(types: &str) -> String {
     out
 }
 
-/// Build a method type-encoding string: return type, then the implicit
-/// `self`/`_cmd` pair, then the explicit arguments. A `String` because
-/// associated consts cannot be concatenated; it runs once per method at
-/// registration.
-///
-/// ```
-/// # use aterm_objc::{method_encoding, Bool, CGRect, Encode, Id, Sel};
-/// // `- (void)reduceMotionDidChange:(id)note`
-/// assert_eq!(method_encoding!(() ; Id), "v@:@");
-/// // `- (BOOL)validateMenuItem:(id)item` — `BOOL` is "B" on arm64 and "c" on
-/// // the x86_64 compat slice, so the expectation is written from the type.
-/// assert_eq!(method_encoding!(Bool ; Id), format!("{}@:@", Bool::ENCODING));
-/// // `- (void)drawRect:(NSRect)r`
-/// assert_eq!(method_encoding!(() ; CGRect), "v@:{CGRect={CGPoint=dd}{CGSize=dd}}");
-/// // no explicit arguments: `- (void)updateTrackingAreas`
-/// assert_eq!(method_encoding!(()), "v@:");
-/// // TWO arguments, and three: one semicolon, then a comma-separated list.
-/// // `- (BOOL)control:(id)c textView:(id)tv doCommandBySelector:(SEL)s`
-/// assert_eq!(
-///     method_encoding!(Bool ; Id, Id, Sel),
-///     format!("{}@:@@:", Bool::ENCODING)
-/// );
-/// assert_eq!(method_encoding!(Id ; Id, Id, Bool), format!("@@:@@{}", Bool::ENCODING));
-/// ```
+/// Builds an offset-free Objective-C method type-encoding string from return and argument types.
 #[macro_export]
 macro_rules! method_encoding {
     ($ret:ty $(; $($arg:ty),* $(,)?)?) => {{

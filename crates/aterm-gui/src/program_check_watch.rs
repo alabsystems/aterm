@@ -18,8 +18,9 @@
 //! hang for good (reading the arguments of a program held mid-start, M29 of
 //! the leftover-processes design), and the watch must still read. Every
 //! macOS instance starts it, a headless one too: its harness supervises
-//! agents by default (`[harness] headless`), and the hold is theirs. No test
-//! starts one.
+//! agents by default (`[harness] headless`), and the hold is theirs. A live
+//! instance a test boots starts one too, at the same cadence ([`every`]); no
+//! unit test does.
 //!
 //! A development build's `program-check full` holds each look's reading at
 //! the kernel's limit ([`cmd`]), so the whole path — the five-minute judge,
@@ -240,10 +241,12 @@ pub(crate) fn status_fields() -> String {
 }
 
 /// How often the watch reads: the disk watch's tick
-/// ([`crate::harness_host::DISK_TICK`]), through the timing value a debug build's
-/// `ATERM_DEV_FAST_TIMERS` shortens.
+/// ([`crate::harness_host::DISK_TICK`]), at production in every build, as the disk
+/// watch's own is. `ATERM_DEV_FAST_TIMERS` would make it a `ps` every 60 ms in each
+/// live test instance and buy nothing: the judge's five minutes run on the real clock,
+/// and `program-check full` is how a development build reaches them.
 fn every() -> std::time::Duration {
-    aterm_gui_timing::current().of(crate::harness_host::DISK_TICK)
+    crate::harness_host::DISK_TICK
 }
 
 /// Start the watch: on macOS, windowed or headless, a thread of its own reads

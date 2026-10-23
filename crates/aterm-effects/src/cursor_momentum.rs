@@ -1,94 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Typing-momentum glow: the cursor glows with how fast you type and cools when
-//! you stop. While warm it does not blink.
-//!
-//! # Not [`crate::typing_momentum::TypingMomentum`]
-//!
-//! That metric is rate-normalised (time spent typing, not key count), so it cannot glow brighter
-//! for faster typing; its τ = 2 s arc gates cat drama; and it advances only on echo-correlated
-//! typing inside an enabled `CursorGlow`. This glow is a cursor feature for any style or shape,
-//! trail on or off. It reuses the integrator pattern (a `Copy` state, an `Option<Instant>` stamp,
-//! lazy decay, snap-to-zero), which keeps it pure in the injected `now`.
-//!
-//! # The law
-//!
-//! * One key adds [`MOMENTUM_GLOW_KEY_CREDIT`] (0.10) to the decayed value,
-//!   clamped to 1. A steady rate `r` keys/s settles at `K / (1 − exp(−1/(r·τ)))`:
-//!   with τ = 1.2 s that is 0.18 at 1/s, 0.29 at 2/s, 0.53 at 4/s, and 1.0 from
-//!   ≈ 8/s, monotone in rate.
-//! * Between keys it decays on [`MOMENTUM_GLOW_TAU_S`]: half in 0.83 s, and from
-//!   1.0 to the floor ([`MOMENTUM_GLOW_HOT`], 0.02) in `τ·ln 50 ≈ 4.7 s`.
-//! * Only printable typing feeds it; deletes, kills and navigation neither build
-//!   nor drain it.
-//! * At or above the floor the cursor is hot: the host pins a Blinking* style to
-//!   its Steady* twin (the rainbow twinkle's precedence) and the halo is drawn.
-//!   Fully cooled, the cursor is exactly the configured one.
-//!
-//! # What it draws
-//!
-//! A warm tint on the block body and a soft halo around the cursor cell, both
-//! ramping amber → gold → white-hot with momentum. On a light page the body
-//! concentrates in its own hue instead (`color_math::light_charge_in_hue`)
-//! and the halo wears the style's hue (below). The halo is one radial profile, `(1 − ρ²)²` over an ellipse that
-//! reaches [`MOMENTUM_GLOW_RADIUS_CELLS`] past the cell at full momentum, laid
-//! as per-row horizontal ramps ([`GlowQuad::color2`]) that never overlap, so it
-//! falls off smoothly instead of in stepped rings. Its peak is at most
-//! [`HALO_PEAK_COV`] (the over-ink budget, [`OVER_INK_COV_CAP`]), rising with
-//! the momentum, so no pixel it lights carries more than the budget: not the
-//! letter just typed beside the caret, not the rows above and below, and not
-//! the caret's own cell under a bar or underline caret, where a glyph shows.
-//! At full momentum it is as large as it ever was, and dimmer.
-//!
-//! On a dark page the halo is additive light. On a light page additive light
-//! is invisible and would only lift the ink, so the glow is ink beneath the
-//! letters instead (the under-ink stream, where Lumen's light glow and the
-//! beam family's light bodies are): one round mark
-//! (`cursor_glow::push_ink_ellipse`) in the style's own hue
-//! ([`MomentumGlowConfig::hue`]), as wide as the dark halo and held inside
-//! the caret's row, so it melts to nothing at the row's edges and the rows
-//! above and below stay clean paper. Its ink is solved against the theme's
-//! text (`cursor_glow::light_body_ink`), so the letters it lies under keep
-//! the light bar even where it stacks on a light body; it peaks at 0.85 of
-//! the body ceiling. Over the caret row's letters it keeps only the opacity
-//! that leaves them [`LIGHT_GLOW_TEXT_KEEP`] of their reading
-//! ([`MomentumGlowConfig::glyph_span`]), so the glow shows ahead of the caret
-//! and around it while the letter just typed reads as it would without it.
-//!
-//! # When it asks for frames
-//!
-//! Everything drawn is a function of the amplitude's `u8` step, so the
-//! fingerprint changes exactly when the glass does. While it changes frame to
-//! frame the glow is [`MomentumGlow::is_active`] (frame cadence). Once two
-//! frames match it is [`MomentumGlow::settling`]: the cool-down still owes
-//! steps, a few frames apart and then further, and the host wakes it at the
-//! analytic instant of the next one ([`MomentumGlow::next_change_deadline`]),
-//! down to the crossing below the hot floor, whose frame clears the halo, the
-//! tint and the blink pin. Neither arm is a poll.
-//!
-//! The halo is in window px (`Geom::cell_center` + `push_fx_ramp`), the
-//! `cursor_glow_add` stream's contract
-//! (`halo_surrounds_the_caret_in_a_padded_headed_window`); at origin (0,0) it
-//! matches the grid form.
-//!
-//! Off (disabled, intensity 0, degenerate geometry, no cursor, or cold) equals
-//! no effect: `fill: None`, `hot: false`, `fp: 0`, scratch untouched.
-//!
-//! # Hosted as an Aos task
-//!
-//! Two pure additions let the glow run as a checkpointed, replayable task. The
-//! engine above does not change.
-//! * [`snapshot`]: [`MomentumGlow::snapshot`] and [`MomentumGlow::restore`]
-//!   capture the semantic state fieldwise, with instants as signed offsets from
-//!   a declared epoch. [`MomentumGlowSnapshot`] has a fixed canonical encoding
-//!   with a schema, and restore refuses every state that breaks an invariant
-//!   the engine's transitions keep, or a bound of the hosted profile. The
-//!   light-ink memo is a cache, so it is left out.
-//! * [`admission`]: [`MOMENTUM_PROFILE`] and the `admit_*` checks refuse, before
-//!   the call, any input outside the range where every engine call is total
-//!   and bounded. [`admit_tick`] returns the worst-case [`ScratchBudget`] the host
-//!   reserves so that a tick never reallocates.
+//! Typing-momentum glow: the cursor glows with how fast you type and cools when you stop.
 
 pub mod admission;
 pub mod snapshot;
@@ -118,52 +31,32 @@ pub const MOMENTUM_GLOW_KEY_CREDIT: f32 = 0.10;
 /// The cool-down time constant in seconds (half-life ≈ 0.83 s).
 pub const MOMENTUM_GLOW_TAU_S: f32 = 1.2;
 
-/// At or above this the cursor is hot: blink suppressed, halo drawn. Below it the cursor is
-/// exactly the configured one. Matches the rainbow twinkle's settled-energy floor.
-///
-/// [`MomentumGlow::tick`] compares the rate scaled by `intensity` (what is
-/// drawn), so a dimmed glow cools sooner than the hand does; the latched,
-/// post-intensity value is what [`MomentumGlow::is_active`],
-/// [`MomentumGlow::settling`] and [`MomentumGlow::cold_at`] read.
+/// At or above this the cursor is hot: blink suppressed, halo drawn.
 pub const MOMENTUM_GLOW_HOT: f32 = 0.02;
 
 /// Snap-to-exact-zero threshold: below this the value reads 0 and the state
-/// unstamps, so a cold cursor stays cold on every frame with no drift.
 const SNAP_ZERO: f32 = 0.005;
 
 /// Halo reach in cell widths at full momentum, beyond the cell's own half.
 pub const MOMENTUM_GLOW_RADIUS_CELLS: f32 = 1.6;
 
 /// The halo's peak premultiplied coverage at full momentum: the over-ink
-/// budget, spent once. The halo is one profile of non-overlapping quads
-/// peaking at the caret, so this bounds every pixel it lights at any momentum
-/// (`no_pixel_carries_more_than_the_over_ink_budget`).
 const HALO_PEAK_COV: f32 = OVER_INK_COV_CAP;
 
 /// Linear ramp pieces per side of each halo row: the `(1 − ρ²)²` profile to
-/// within about 2 % of its peak.
 const HALO_SEGMENTS: usize = 4;
 
 /// Halo row height is `ch / HALO_ROW_DIV`, at least 2 px: a few levels of
-/// light from one row to the next at most, so the vertical falloff is smooth.
 const HALO_ROW_DIV: f32 = 12.0;
 
 /// The halo's colour climbs the ramp toward its core by up to this much
-/// momentum, full inside [`HALO_WARM_CORE`] of the radius and none at the rim,
-/// so the centre burns hotter than the edge.
 const HALO_WARMTH: f32 = 0.7;
 const HALO_WARM_CORE: f32 = 0.42;
 
-/// The light-page glow's peak opacity at full momentum, beneath the letters:
-/// 0.85 of the body ceiling ([`crate::cursor_glow::LIGHT_BODY_ALPHA_CAP`]).
-/// Its ink ([`light_glow_ink`]) is solved so that at any opacity, over the
-/// paper or over a style's light body of any hue, the theme's text keeps the
-/// light bar (`the_light_glow_stacked_on_a_light_body_keeps_the_light_bar`).
+/// The light-page glow's peak opacity at full momentum, beneath the letters.
 pub(crate) const LIGHT_GLOW_PEAK: f32 = crate::cursor_glow::LIGHT_BODY_ALPHA_CAP * 0.85;
 
 /// A settle wake lands this long after the predicted step, so a float ulp
-/// between the forecast and the tick never wakes a frame just short of the
-/// step it was armed for.
 const SETTLE_MARGIN: Duration = Duration::from_millis(1);
 
 /// The typing-rate integrator — pure in the injected `now`.
@@ -176,8 +69,7 @@ pub struct TypingRate {
 }
 
 impl TypingRate {
-    /// The value at `now`: decayed over the elapsed gap on `tau`, snapped to
-    /// exactly 0 once negligible. NaN/garbage in `tau` reads as 0 — inert.
+    /// The value at `now`: decayed over the elapsed gap on `tau`, snapped to exactly 0 once negligible.
     #[must_use]
     #[inline]
     pub fn value(&self, now: Instant, tau: f32) -> f32 {
@@ -214,11 +106,9 @@ impl TypingRate {
 /// Host-side inputs for one tick.
 #[derive(Clone, Copy, Debug)]
 pub struct MomentumGlowConfig {
-    /// The user's switch (default on) combined with the host's gates: serious mode, focus, live
-    /// viewport.
+    /// The user's switch (default on) combined with the host's gates: serious mode, focus, live viewport.
     pub enabled: bool,
-    /// `0..=1` — the aurora's folded intensity (the brightness dial × the
-    /// motion amplitude × the load-shed envelope), as every body takes it.
+    /// `0..=1` — the aurora's folded intensity (the brightness dial × the motion amplitude × the load-shed envelope), as every body takes it.
     pub intensity: f32,
     /// The cool-down τ in seconds ([`MOMENTUM_GLOW_TAU_S`] unless configured).
     pub tau_s: f32,
@@ -226,26 +116,16 @@ pub struct MomentumGlowConfig {
     pub radius_cells: f32,
     /// The resolved cursor colour `0x00RRGGBB` — what the tint is built from.
     pub base: u32,
-    /// The page the light lands on is dark: additive halo. `false`: ink
-    /// beneath the letters in [`Self::hue`].
+    /// The page the light lands on is dark: additive halo.
     pub dark_theme: bool,
-    /// The hue a LIGHT page's glow wears, `0x00RRGGBB`: the style's own
-    /// caret/glow colour (its trail colour, or the signature shade its caret
-    /// wears), so the glow reads as the style's, never as a fixed warm halo.
-    /// The dark page's additive halo keeps its temperature ramp.
+    /// The hue a LIGHT page's glow wears, `0x00RRGGBB`.
     pub hue: u32,
-    /// The theme's text and paper, which a light ground's glow solves its
-    /// ink against.
+    /// The theme's text and paper, which a light ground's glow solves its ink against.
     pub theme_fg: u32,
     pub theme_bg: u32,
     /// Whether the cursor is a block (the body tint applies); bar/underline get the halo only.
     pub block: bool,
-    /// The caret row's letters as columns `first..end` (a blank between two
-    /// glyphs counts, as it reads as part of the line), or `None` for a
-    /// blank row. A host that cannot read the row passes every column left
-    /// of the caret. A LIGHT page's glow keeps only
-    /// [`LIGHT_GLOW_TEXT_KEEP`]'s worth of ink over them; a dark page's halo
-    /// spends the over-ink account instead.
+    /// The caret row's letters as columns `first..end` (a blank between two glyphs counts, as it reads as part of the line), or `None` for a blank row.
     pub glyph_span: Option<(i32, i32)>,
 }
 
@@ -277,8 +157,7 @@ struct LightInkMemo {
     text_alpha: f32,
 }
 
-/// The engine: one integrator plus the fingerprint law that tells frame
-/// cadence from the cool-down's sparse steps.
+/// The engine: one integrator plus the fingerprint law that tells frame cadence from the cool-down's sparse steps.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct MomentumGlow {
     rate: TypingRate,
@@ -308,8 +187,7 @@ impl MomentumGlow {
         light_ink_memo: None,
     };
 
-    /// One printable key. The host calls this for glyph-producing keys only (never a bare
-    /// modifier, never delete/kill/navigation).
+    /// One printable key.
     #[inline]
     pub fn on_key(&mut self, now: Instant, tau_s: f32) {
         self.rate.on_key(now, tau_s);
@@ -328,42 +206,28 @@ impl MomentumGlow {
         *self = Self::DEFAULT;
     }
 
-    /// Frame cadence: the light is hot and its last two frames differed (the
-    /// rainbow body's fingerprint law).
+    /// Frame cadence: the light is hot and its last two frames differed (the rainbow body's fingerprint law).
     #[must_use]
     #[inline]
     pub const fn is_active(&self) -> bool {
         self.latched >= MOMENTUM_GLOW_HOT && self.fp_last != self.fp_prev
     }
 
-    /// Hot, but its last two frames were identical: not settled. A cooling
-    /// amplitude moves one `u8` step every few frames, then every few
-    /// hundred milliseconds, so two identical frames come long before the
-    /// glow is cold. The host keeps the lane and wakes it at
-    /// [`Self::next_change_deadline`] instead of at frame cadence.
-    ///
-    /// Disjoint from [`Self::is_active`]; their OR is "hot".
+    /// Hot, but its last two frames were identical: not settled.
     #[must_use]
     #[inline]
     pub const fn settling(&self) -> bool {
         self.latched >= MOMENTUM_GLOW_HOT && self.fp_last == self.fp_prev
     }
 
-    /// The analytic instant the latched amplitude decays below
-    /// [`MOMENTUM_GLOW_HOT`] (`stamp + τ·ln(a/floor)`): the frame that clears
-    /// the halo, the tint and the blink pin. `None` once cold.
+    /// The analytic instant the latched amplitude decays below [`MOMENTUM_GLOW_HOT`] (`stamp + τ·ln(a/floor)`).
     #[must_use]
     #[inline]
     pub fn cold_at(&self) -> Option<Instant> {
         self.decays_to(MOMENTUM_GLOW_HOT)
     }
 
-    /// When the glass next changes. `Some(now + frame_interval)` while
-    /// [`Self::is_active`]; `None` once cold; while [`Self::settling`], the
-    /// analytic instant of the latched amplitude's next `u8` step down its
-    /// exponential or its crossing below the hot floor, whichever comes first,
-    /// never sooner than `now + frame_interval`. A tick at that instant
-    /// re-latches, so a changed intensity is re-measured, not extrapolated.
+    /// When the glass next changes.
     #[must_use]
     pub fn next_change_deadline(&self, now: Instant, frame_interval: Duration) -> Option<Instant> {
         let floor = now + frame_interval;
@@ -383,12 +247,10 @@ impl MomentumGlow {
         .into_iter()
         .flatten()
         .min();
-        // A latched amplitude with no forecast fails onto the cadence.
         Some(next.map_or(floor, |at| (at + SETTLE_MARGIN).max(floor)))
     }
 
     /// The instant the latched amplitude decays to `level`, from the last real
-    /// tick: `stamp + τ·ln(latched / level)`.
     #[inline]
     fn decays_to(&self, level: f32) -> Option<Instant> {
         if self.latched < MOMENTUM_GLOW_HOT || level <= 0.0 {
@@ -399,10 +261,7 @@ impl MomentumGlow {
         self.stamp.map(|stamp| stamp + after)
     }
 
-    /// One frame. Pushes the halo into `out` (the host's additive
-    /// `cursor_glow_add` scratch) on a dark page, or into `under` (the
-    /// under-ink stream, beneath the letters) on a light one, and returns the
-    /// fill / blink verdict / fingerprint.
+    /// One frame.
     pub fn tick(
         &mut self,
         cur: Option<(u16, u16)>,
@@ -418,8 +277,6 @@ impl MomentumGlow {
         } else {
             0.0
         };
-        // Inert — byte-identical to the plain cursor — when off, when the
-        // geometry is degenerate, when there is no cursor, or when cold.
         let Some((cr, cc)) = cur else {
             return self.inert();
         };
@@ -437,16 +294,10 @@ impl MomentumGlow {
         self.stamp = Some(now);
         self.tau = cfg.tau_s;
 
-        // Everything below is drawn from the `u8` step, so the fingerprint
-        // (the step, the fill, the cell) changes exactly when the glass does
-        // and the settle schedule can name the next change.
         let q = (a * 255.0) as u8;
         let a = f32::from(q) / 255.0;
         let s = smoothstep(a);
         let tint = ramp(a, cfg.dark_theme);
-        // On a dark page the body warms toward the ramp; on a light one it
-        // concentrates in its own hue instead, since the ramp's orange mixed
-        // into a blue or pink caret reads as mud.
         let fill = cfg.block.then(|| {
             if cfg.dark_theme {
                 mix_rgb(cfg.base, tint, 0.55 * s)
@@ -478,8 +329,6 @@ impl MomentumGlow {
             emit_light_halo((cr, cc), a, s, light_ink, geom, cfg, under);
         }
 
-        // The light glow's hue is drawn too, so a hue that moves at one
-        // amplitude step (a phaser's rolling beam) still repaints.
         let fp = u64::from(q)
             .wrapping_mul(1_000_003)
             .wrapping_add(u64::from(fill.unwrap_or(0)) << 8)
@@ -487,7 +336,6 @@ impl MomentumGlow {
             .wrapping_add(if cfg.dark_theme {
                 0
             } else {
-                // …and so are the letters it keeps its ink off.
                 let span = cfg.glyph_span.map_or(0, |(first, end)| {
                     (u64::from(first as u32) << 20) ^ u64::from(end as u32)
                 });
@@ -514,10 +362,6 @@ impl MomentumGlow {
 }
 
 /// The dark page's halo around the caret at amplitude `a` (its smoothstep
-/// `s`, its ramp `tint`): one `(1 − ρ²)²` profile over the ellipse, laid row
-/// by row as [`HALO_SEGMENTS`] linear ramps a side that meet but never
-/// overlap, so each pixel carries one quad's light, at most the peak at the
-/// caret's centre, which is at most [`HALO_PEAK_COV`].
 fn emit_halo(
     (cr, cc): (u16, u16),
     a: f32,
@@ -531,18 +375,12 @@ fn emit_halo(
     let (cx, cy) = geom.cell_center(cr, cc);
     let rx = cw * (0.55 + cfg.radius_cells * s);
     let ry = ch * (0.45 + 0.6 * cfg.radius_cells * s);
-    // Eased out (`a·(2 − a)`): the budget is the ceiling, and an ordinary
-    // pace (5 keys/s, `a` ≈ 0.6) spends 84 % of it, so the glow still reads
-    // at a typing speed and not only at a sprint. Linear at the floor, so
-    // the frame that goes cold steps by about two levels.
     let peak = HALO_PEAK_COV * a * (2.0 - a);
     if !(rx >= 1.0 && ry >= 1.0 && peak >= 0.5) {
         return;
     }
     let row_h = ((ch / HALO_ROW_DIV) as i32).max(2);
     let half_row_h = row_h as f32 * 0.5;
-    // Rows on a grid anchored at the caret row's top edge, from the first
-    // row reaching the ellipse's top.
     let cell_y0 = i32::from(geom.origin_y) + i32::from(cr) * geom.ch as i32;
     let top = (cy - ry).floor() as i32;
     let bot = (cy + ry).ceil() as i32;
@@ -553,8 +391,6 @@ fn emit_halo(
         let w2 = 1.0 - v2;
         if w2 > 0.0 {
             let half = rx * w2.sqrt();
-            // Knot `k` of the row: its rounded edges and its ramp end
-            // (premultiplied light, opacity 0: additive).
             let knot = |k: usize| {
                 let t = k as f32 / HALO_SEGMENTS as f32;
                 let dx = half * t;
@@ -583,7 +419,6 @@ fn emit_halo(
 }
 
 /// The halo's colour at normalised radius `rho`: the tint mixed with the ramp
-/// up to [`HALO_WARMTH`] hotter toward the core.
 #[inline]
 fn halo_colour(tint: u32, a: f32, rho: f32) -> u32 {
     let warm = (HALO_WARMTH * (1.0 - rho) / (1.0 - HALO_WARM_CORE)).clamp(0.0, HALO_WARMTH);
@@ -591,16 +426,6 @@ fn halo_colour(tint: u32, a: f32, rho: f32) -> u32 {
 }
 
 /// The light glow's ink for `hue`: its vivid ink walked toward white until,
-/// laid opaque on the page, the theme's text keeps [`LIGHT_GLOW_INK_BAR`]
-/// over it (`cursor_glow::light_ink_over_floor`).
-///
-/// Stricter than a body's own law (`cursor_glow::light_body_ink`, 5.25:1)
-/// because the glow lies over the style's light body in the same stream, and
-/// two inks solved to the same luminance composite DARKER than either where
-/// their hues differ (sRGB mixing under a convex luminance): over an opaque
-/// body of the opposite hue a glow solved at the body law leaves the text
-/// about 4.45:1. Solved at this bar, any glow over any body keeps 5.25:1
-/// (`the_light_glow_stacked_on_a_light_body_keeps_the_light_bar`).
 #[inline]
 fn light_glow_ink(hue: u32, theme_fg: u32, theme_bg: u32) -> u32 {
     crate::cursor_glow::light_ink_over_floor(
@@ -611,32 +436,19 @@ fn light_glow_ink(hue: u32, theme_fg: u32, theme_bg: u32) -> u32 {
     )
 }
 
-/// The share of the theme's text contrast on its paper a light glow keeps
-/// where it lies under a letter of the caret's row
-/// ([`MomentumGlowConfig::glyph_span`]): the glow stands well clear of the
-/// letters' reading (the newest letter typed reads within about half a point
-/// of the glow-off frame, on the paper and over a style's light body), and
-/// lands whole over the blank cells around the caret, where it is seen.
+/// The share of the theme's text contrast on its paper a light glow keeps where it lies under a letter of the caret's row ([`MomentumGlowConfig::glyph_span`]).
 pub const LIGHT_GLOW_TEXT_KEEP: f32 = 0.97;
 
 /// The opacity `0..=255` at which the light glow's `ink` leaves the theme's
-/// text [`LIGHT_GLOW_TEXT_KEEP`] of its contrast on its paper, composited as
-/// the renderer composites a source-over quad.
 #[inline]
 fn light_glow_text_alpha(ink: u32, theme_fg: u32, theme_bg: u32) -> f32 {
     crate::cursor_glow::light_alpha_keeping(ink, theme_fg, theme_bg, LIGHT_GLOW_TEXT_KEEP)
 }
 
 /// The contrast the theme's text keeps over the light glow's ink laid opaque
-/// ([`light_glow_ink`]): the least at which a glow at [`LIGHT_GLOW_PEAK`]
-/// over a light body of any hue still leaves the 5.25:1 light bar.
 const LIGHT_GLOW_INK_BAR: f32 = 7.5;
 
 /// The light page's glow at amplitude `a` (its smoothstep `s`): one round
-/// ink mark beneath the letters in [`MomentumGlowConfig::hue`], as wide as
-/// the dark halo and held inside the caret's row
-/// (`cursor_glow::push_ink_ellipse`), in [`light_glow_ink`], at most
-/// [`LIGHT_GLOW_PEAK`].
 fn emit_light_halo(
     (cr, cc): (u16, u16),
     a: f32,
@@ -653,9 +465,6 @@ fn emit_light_halo(
     let ry_full = ch * (0.45 + 0.6 * cfg.radius_cells * s);
     let peak = LIGHT_GLOW_PEAK * a;
     let budget = under.len().saturating_add(LIGHT_MARK_QUADS);
-    // Over the caret row's letters the glow keeps only the opacity that
-    // leaves them their reading; a block caret's own cell is covered by the
-    // block, so the glow lands whole under it.
     let on_letters = (text_alpha / peak.max(1.0)).min(1.0);
     let ox = f32::from(geom.origin_x);
     let caret = i32::from(cc);
@@ -671,7 +480,6 @@ fn emit_light_halo(
     let share = |x0: f32, x1: f32| match letters {
         Some((l0, l1, caret_cell)) if x1 > l0 && x0 < l1 => {
             // A sample whose reach lies inside the covered caret cell alone
-            // keeps the whole glow.
             if caret_cell.is_some_and(|(c0, c1)| x0 >= c0 && x1 <= c1) {
                 1.0
             } else {
@@ -699,8 +507,7 @@ const fn smoothstep(x: f32) -> f32 {
     x * x * (3.0 - 2.0 * x)
 }
 
-/// Colour temperature with momentum: amber → gold → warm white → white-hot on a
-/// dark theme; on a light theme the top is a deep orange.
+/// Colour temperature with momentum: amber → gold → warm white → white-hot on a dark theme.
 #[inline]
 #[must_use]
 pub fn ramp(a: f32, dark_theme: bool) -> u32 {
@@ -758,7 +565,6 @@ mod tests {
     }
 
     /// The halo a glow draws on the frame its `keys`-th key is struck (all at
-    /// one instant, so the amplitude is `keys × 0.1`, clamped).
     fn charged(keys: u32, cell: (u16, u16), g0: Geom, cfg: &MomentumGlowConfig) -> Vec<GlowQuad> {
         let t0 = Instant::now();
         let mut g = MomentumGlow::default();
@@ -772,8 +578,6 @@ mod tests {
     }
 
     /// Every quad of `quads` composited over a plane of `ground` exactly as
-    /// the CPU rasterizer does it (the gradient law per column, then
-    /// `over_premul`, which is `add_sat` at opacity 0).
     fn composite(quads: &[GlowQuad], ground: u32, w: usize, h: usize) -> Vec<u32> {
         let mut px = vec![ground; w * h];
         for q in quads {
@@ -795,7 +599,6 @@ mod tests {
     }
 
     /// The light (additive) or veil opacity (source-over) every quad lays on
-    /// each pixel, summed: the brightest channel of the light, or the opacity.
     fn spent_per_pixel(quads: &[GlowQuad], w: usize, h: usize) -> Vec<u32> {
         let mut px = vec![0u32; w * h];
         for q in quads {
@@ -819,8 +622,6 @@ mod tests {
     }
 
     /// The wake deadline agrees with the glass: at low intensity (reduced motion
-    /// times the load-shed envelope) where `raw * intensity` is below the hot
-    /// floor, `tick` draws nothing and no deadline is asked for.
     #[test]
     fn the_wake_deadline_never_outlives_what_the_glass_draws() {
         let t0 = Instant::now();
@@ -829,14 +630,12 @@ mod tests {
         let mut cfg = on(0x0000_0000, true);
         let mut out: Vec<GlowQuad> = Vec::new();
 
-        // A real run of typing, read at the last key: hot on the raw rate.
         let last = script(&mut glow.rate, t0, 12.0, 2.0);
         assert!(
             glow.rate.value(last, cfg.tau_s) >= MOMENTUM_GLOW_HOT,
             "fixture: the raw rate is hot"
         );
 
-        // Positive control at full intensity: drawn, and a deadline asked for.
         out.clear();
         let full = glow.tick(Some((1, 1)), last, geom(), &cfg, &mut out, &mut Vec::new());
         assert!(full.hot, "fixture: at intensity 1 it is on glass");
@@ -845,8 +644,6 @@ mod tests {
             "and the host is asked for the next frame"
         );
 
-        // Now scale it below the floor — the state a low motion amplitude or a
-        // load-shed envelope produces.
         cfg.intensity = MOMENTUM_GLOW_HOT / glow.rate.value(last, cfg.tau_s) * 0.5;
         out.clear();
         let dim = glow.tick(Some((1, 1)), last, geom(), &cfg, &mut out, &mut Vec::new());
@@ -861,8 +658,6 @@ mod tests {
     }
 
     /// Feed keys at `rate` keys/s from `t0` for `secs`; returns the instant of
-    /// the last key (the value is read there, since silence is the cool-down
-    /// the other test measures).
     fn script(r: &mut TypingRate, t0: Instant, rate: f32, secs: f32) -> Instant {
         let gap = Duration::from_secs_f32(1.0 / rate);
         let mut t = t0;
@@ -877,7 +672,6 @@ mod tests {
     }
 
     /// The value is strictly increasing in the key rate (which the
-    /// rate-normalised family metric deliberately is not).
     #[test]
     fn rises_with_key_rate() {
         let t0 = Instant::now();
@@ -890,21 +684,18 @@ mod tests {
         for w in vals.windows(2) {
             assert!(w[1] > w[0] + 0.05, "faster typing must glow more: {vals:?}");
         }
-        // 24 keys at 8/s climb the 1 − e^{−n/(r·τ)} arc to ≈ 0.93; the clamp is
-        // reached asymptotically. White-hot on the ramp starts at 0.75.
         assert!(vals[3] >= 0.9, "8 keys/s is white-hot: {vals:?}");
         assert!(vals[0] <= 0.25, "1 key/s is a warm ember: {vals:?}");
     }
 
     /// Cooling: monotone non-increasing in silence, half-life at τ·ln 2, exactly
-    /// zero at the end, and the engine's analytic cold crossing matches the
-    /// tick that first draws nothing.
     #[test]
     fn cooldown_is_monotone_and_snaps_to_exact_zero() {
         let t0 = Instant::now();
         let mut g = MomentumGlow::default();
         for _ in 0..40 {
-            g.on_key(t0, TAU); // clamps to 1.0
+            // clamps to 1.0
+            g.on_key(t0, TAU);
         }
         assert!((g.value(t0, TAU) - 1.0).abs() < 1e-6);
         let mut out = Vec::new();
@@ -946,7 +737,6 @@ mod tests {
     }
 
     /// Hot after one key, and cold once the value drops below the floor: the host reads this to
-    /// pin a Blinking* style to its Steady* twin.
     #[test]
     fn blink_is_suppressed_while_hot_and_returns_when_cold() {
         let t0 = Instant::now();
@@ -993,7 +783,6 @@ mod tests {
     }
 
     /// A key-repeat flood, a zero gap, a 10-year silence: finite, in [0, 1],
-    /// never a panic. A NaN intensity is inert.
     #[test]
     fn absurd_rates_never_nan_or_exceed_one() {
         let t0 = Instant::now();
@@ -1024,8 +813,6 @@ mod tests {
     }
 
     /// Pure in the injected `now`: two engines fed one script agree bit for bit,
-    /// and 60 Hz and 7 Hz sampling agree at shared instants (lazy decay trusts
-    /// no dt).
     #[test]
     fn deterministic_given_timestamps() {
         let t0 = Instant::now();
@@ -1040,7 +827,6 @@ mod tests {
         let mut out_a = Vec::new();
         let mut out_b = Vec::new();
         let end = keys[keys.len() - 1];
-        // 60 Hz samples for a; only every 8th (≈ 7 Hz) for b.
         let mut fa = MomentumGlowFrame::default();
         let mut fb = MomentumGlowFrame::default();
         for k in 0..240u64 {
@@ -1071,12 +857,10 @@ mod tests {
                 assert_eq!(out_a, out_b);
             }
         }
-        // Both engines were live for the whole script.
         assert!(fa.fp != 0 || fb.fp == 0);
     }
 
     /// Off is byte-identical to no effect: disabled, intensity 0, no cursor,
-    /// or a cursor outside the grid — fill None, not hot, fp 0, scratch untouched.
     #[test]
     fn off_is_byte_identical() {
         let t0 = Instant::now();
@@ -1133,8 +917,6 @@ mod tests {
     }
 
     /// The halo hugs the cell — every quad inside the frame, its reach bounded
-    /// by the radius law — in a bounded number of quads, and the ramp tops out
-    /// white-hot on a dark page and orange on a light one.
     #[test]
     fn halo_hugs_the_cell_in_bounded_quads() {
         let g0 = geom();
@@ -1153,7 +935,6 @@ mod tests {
             assert!((f32::from(q.x + q.w) - cx).abs() <= reach + 1.0);
             assert_eq!((q.alpha, q.alpha2), (0, 0), "dark: additive light");
         }
-        // A tall cell lays more rows; still a bounded handful per row.
         let big = Geom {
             cw: 20,
             ch: 40,
@@ -1170,14 +951,6 @@ mod tests {
     }
 
     /// The over-ink budget, solved per pixel: at every momentum, on every
-    /// geometry and caret shape, the light the halo lays on any one pixel
-    /// (summed over every quad, by the renderer's gradient law) stays within
-    /// [`OVER_INK_COV_CAP`], so the letter just typed beside the caret, the
-    /// rows above and below, and the glyph in a bar or underline caret's own
-    /// cell keep the over-ink bar. At full momentum it is spent (the halo is
-    /// dimmer, not starved) and it still reaches more than a cell and a half
-    /// past the caret (dimmer, not smaller). Negative control: two halos
-    /// stacked on one caret overrun it, so the raster sees overlap.
     #[test]
     fn no_pixel_carries_more_than_the_over_ink_budget() {
         let padded = Geom {
@@ -1221,8 +994,6 @@ mod tests {
                     );
                 }
             }
-            // Full momentum: the budget is spent beside the caret, and the
-            // light still reaches past a cell and a half on each side.
             let out = charged(40, cell, g0, &on(0x0050_FA7B, true));
             let light = spent_per_pixel(&out, w, h);
             let row = (i32::from(g0.origin_y) + i32::from(cell.0) * g0.ch as i32 + g0.ch as i32 / 2)
@@ -1246,10 +1017,6 @@ mod tests {
     }
 
     /// The letter left of the caret keeps the over-ink bar (5.25:1) under a
-    /// full-momentum halo on the harness theme (`#C8D3F5` on `#16171D`): every
-    /// pixel of the column beside the caret, composited as the renderer does
-    /// it, ink against ground. Negative control: the light the pre-budget
-    /// halo stacked there (about four budgets' worth) drops it under the bar.
     #[test]
     fn the_letter_beside_the_caret_keeps_the_over_ink_bar() {
         const INK: u32 = 0x00C8_D3F5;
@@ -1274,10 +1041,6 @@ mod tests {
     }
 
     /// A light page gets ink beneath the letters: every quad is source-over
-    /// (no additive light, which white would swallow), its opacity summed per
-    /// pixel within [`LIGHT_GLOW_PEAK`], deepening the ground around the
-    /// caret; GitHub Light's ink drawn over it keeps the 5.25:1 light bar.
-    /// Negative control: the dark arm on the same caret lays additive light.
     #[test]
     fn the_light_page_halo_is_a_source_over_veil_under_the_budget() {
         const INK: u32 = 0x0024_292F;
@@ -1312,16 +1075,6 @@ mod tests {
     }
 
     /// On a light page the glow is one round glow inside the caret's row, in
-    /// the style's hue. Composited over GitHub Light's paper from three keys
-    /// of momentum on (a single key's glow is still inside the block caret),
-    /// no pixel of the rows above or below changes (a selection row under the
-    /// prompt keeps its letters), the glow deepens the row on both sides of
-    /// the caret, and its opacity melts to nothing at the
-    /// row's top and bottom edges as it does sideways, with no straight cut.
-    /// Its deepest pixel wears the configured hue. Negative controls: the
-    /// dark arm's taller profile cut at the row's edges (the halves the
-    /// previous light veil drew) leaves a hard edge there, and a red style's
-    /// glow is not a blue one's.
     #[test]
     fn the_light_page_glow_is_one_round_glow_inside_the_caret_row() {
         use crate::color_math::rgb2hsv;
@@ -1331,15 +1084,11 @@ mod tests {
         let cell = (6u16, 20u16);
         let band = usize::from(cell.0) * g0.ch..(usize::from(cell.0) + 1) * g0.ch;
         let cell_x = usize::from(cell.1) * g0.cw..(usize::from(cell.1) + 1) * g0.cw;
-        // The deepest opacity in the band's top and bottom pixel rows,
-        // against the deepest anywhere.
         let edge_and_peak = |spent: &[u32]| {
             let row_max = |y: usize| (0..w).map(|x| spent[y * w + x]).max().unwrap_or(0);
             let edge = row_max(band.start).max(row_max(band.end - 1));
             (edge, spent.iter().copied().max().unwrap_or(0))
         };
-        // From three keys on: a single key's glow is still inside the block
-        // caret.
         for keys in [3u32, 6, 40] {
             let glow = charged(keys, cell, g0, &on(0x0009_69DA, false));
             assert!(!glow.is_empty(), "{keys} keys: a hot caret glows");
@@ -1400,11 +1149,6 @@ mod tests {
     }
 
     /// ON A LIGHT PAGE A HOT CARET STAYS IN ITS OWN HUE: for a blue, a pink
-    /// and a green caret, at every momentum the block's fill keeps the
-    /// caret's hue within a few degrees, is no greyer than it, and is the
-    /// caret's colour exactly at the cold edge. Negative control: the dark
-    /// page's warm ramp mixed into the same carets swings their hue far off
-    /// (blue toward grey-mauve, pink toward brown): the mud the judges saw.
     #[test]
     fn a_hot_light_caret_stays_in_its_own_hue() {
         use crate::color_math::rgb2hsv;
@@ -1454,14 +1198,6 @@ mod tests {
     }
 
     /// THE LIGHT GLOW KEEPS THE NEWEST LETTER WITHIN HALF A POINT: at full
-    /// momentum behind a typed run on GitHub Light and Default Light, over
-    /// the bare paper and over a style's warm body under the letters, the
-    /// letter just typed (one cell, or the two of a wide glyph) reads within
-    /// half a point of the same frame with the glow off, while the glow still
-    /// deepens the blank cells ahead of the caret to most of its peak and
-    /// lands whole under the block. Negative control: the same glow with no
-    /// letters named lies its whole ink on them and costs the newest letter
-    /// well over half a point.
     #[test]
     fn the_light_glow_keeps_the_newest_letter_within_half_a_point() {
         let g0 = geom();
@@ -1471,8 +1207,6 @@ mod tests {
             let (x0, y0) = (usize::from(col) * g0.cw, usize::from(row) * g0.ch);
             (y0..y0 + g0.ch).flat_map(move |y| (x0..x0 + g0.cw).map(move |x| y * w + x))
         };
-        // The worst letter reading in `cols` of the caret's row: the theme's
-        // ink against the deepest ground pixel under it.
         let reads = |ground: &[u32], ink: u32, cols: std::ops::Range<u16>| {
             cols.flat_map(|c| px(cell.0, c))
                 .map(|i| contrast_ratio(ink, ground[i]))
@@ -1540,13 +1274,6 @@ mod tests {
     }
 
     /// The light glow, stacked over a style's light body at its cap (both are
-    /// ink beneath the letters of the caret's row, the body in its own ink
-    /// law, `light_body_ink`), keeps Default Light's and GitHub Light's ink at
-    /// the 5.25:1 light bar for every pair of hues and every glow opacity up
-    /// to its peak, composited as the renderer composites source-over quads.
-    /// Negative control: the glow in the body's own ink law sinks under the
-    /// bar where the two hues differ, which is why the glow's ink is solved
-    /// stricter.
     #[test]
     fn the_light_glow_stacked_on_a_light_body_keeps_the_light_bar() {
         use crate::cursor_glow::{LIGHT_BODY_ALPHA_CAP, light_body_ink};
@@ -1592,9 +1319,6 @@ mod tests {
     }
 
     /// Siting: the halo joins the window-absolute `cursor_glow_add` stream, so in
-    /// a real window (cell 15×28, pad 24, head 80, origin (24, 84)) its bounding
-    /// box surrounds the caret cell on every side with its centre of light at
-    /// the cell's centre.
     #[test]
     fn halo_surrounds_the_caret_in_a_padded_headed_window() {
         let t0 = Instant::now();
@@ -1624,7 +1348,6 @@ mod tests {
             &mut Vec::new(),
         );
         assert!(f.hot && !out.is_empty());
-        // The caret cell in window px, from the one anchor every emitter shares.
         let (cell_x0, cell_y0) = (
             i32::from(real.origin_x) + i32::from(cc) * real.cw as i32,
             i32::from(real.origin_y) + i32::from(cr) * real.ch as i32,
@@ -1639,8 +1362,6 @@ mod tests {
             "halo bbox x {x0}..{x1} y {y0}..{y1} does not surround the caret cell \
              x {cell_x0}..{cell_x1} y {cell_y0}..{cell_y1}"
         );
-        // Centre of light = the cell centre (the profile is symmetric about
-        // it, so the bbox midpoint is within a row of it on each axis).
         let (ecx, ecy) = real.cell_center(cr, cc);
         assert!(
             ((x0 + x1) as f32 * 0.5 - ecx).abs() <= 2.0,
@@ -1652,7 +1373,6 @@ mod tests {
             "y centre {} vs {ecy}",
             (y0 + y1) as f32 * 0.5
         );
-        // Every quad inside the effects box (the grid plus the head band).
         for q in &out {
             assert!(i32::from(q.x) >= real.fx_left() && i32::from(q.x + q.w) <= real.fx_right());
             assert!(i32::from(q.y) >= real.fx_top() && i32::from(q.y + q.h) <= real.fx_bot());
@@ -1660,8 +1380,6 @@ mod tests {
     }
 
     /// The frame cadence releases when the light stops changing, not when the
-    /// value reaches zero: once the quantised output settles, `is_active` is
-    /// false while `value` is still > 0, and the glow is settling instead.
     #[test]
     fn fingerprint_settles_so_the_lane_releases() {
         let t0 = Instant::now();
@@ -1671,7 +1389,6 @@ mod tests {
         let cfg = on(0x0010_2030, true);
         let f1 = g.tick(Some((1, 1)), t0, geom(), &cfg, &mut out, &mut Vec::new());
         assert!(f1.hot);
-        // Same instant twice: the fingerprint repeats, so the lane releases…
         let f2 = g.tick(Some((1, 1)), t0, geom(), &cfg, &mut out, &mut Vec::new());
         assert_eq!(f1.fp, f2.fp);
         assert!(!g.is_active(), "an unchanged frame must not hold the lane");
@@ -1680,7 +1397,6 @@ mod tests {
             "…even though the value is still warm"
         );
         assert!(g.settling(), "…so it owes its next step instead");
-        // …and a later, dimmer frame re-arms it.
         let f3 = g.tick(
             Some((1, 1)),
             t0 + Duration::from_millis(400),
@@ -1694,16 +1410,6 @@ mod tests {
     }
 
     /// A burst, then silence, through the host's scheduler predicate: armed
-    /// while the glow is active (next frame at the lane interval) or
-    /// settling (at its named step), parked otherwise. At a 120 Hz (16.7 ms)
-    /// and an Apple-silicon 60 Hz (33.3 ms) lane, with a steady cursor (no
-    /// blink clock to repaint it), every armed deadline is in the future and
-    /// the lane parks only on a frame that drew nothing: no halo, no tint, not
-    /// hot. Negative control: the frame-cadence predicate alone parks with
-    /// the halo still on glass, the freeze this arm closes.
-    ///
-    /// Prints the frames rendered and presented per burst (the cost of the
-    /// honest release); nothing pins those counts.
     #[test]
     fn a_cooling_glow_keeps_the_lane_until_its_last_frame_clears_the_halo() {
         for lane_ms in [16.7f32, 33.3] {
@@ -1725,7 +1431,6 @@ mod tests {
                     }
                     drawn = (out.len(), f);
                 };
-                // 24 keys at 60 ms, each moving the caret, a frame after each.
                 let (mut now, mut col) = (t0, 10u16);
                 for k in 0..24u16 {
                     now = t0 + Duration::from_millis(60 * u64::from(k));
@@ -1783,13 +1488,6 @@ mod tests {
     }
 
     /// While the glow settles, each wake it names is its next visible step,
-    /// read against the engine's own decay: until the wake the step the glass
-    /// last drew is still the true one (no step slept through), and the
-    /// wake's frame draws a different one (no wasted wake: not a poll). A
-    /// step nearer than a frame is woken at the frame floor, which lands only
-    /// after it. Negative controls on the same burst: a fixed 33 ms poll
-    /// wastes wakes, and waking only at the cold crossing sleeps through
-    /// steps.
     #[test]
     fn each_settle_wake_is_the_glows_next_visible_step() {
         #[derive(Clone, Copy)]
@@ -1799,7 +1497,6 @@ mod tests {
             ColdOnly,
         }
         let cfg = on(0x0050_FA7B, true);
-        // The `u8` step `tick` draws at `t` (intensity 1), 0 once cold.
         let shown = |g: &MomentumGlow, t: Instant| {
             let a = g.value(t, TAU);
             if a < MOMENTUM_GLOW_HOT {
@@ -1808,7 +1505,6 @@ mod tests {
                 (a * 255.0) as u8
             }
         };
-        // (settle wakes, wasted wakes, wakes that slept through a step).
         let run = |schedule: Schedule, lane: Duration| -> (u32, u32, u32) {
             let t0 = Instant::now();
             let mut g = MomentumGlow::default();
@@ -1880,7 +1576,6 @@ mod tests {
     }
 
     /// The temperature ramp is continuous and monotone in luminance on a dark
-    /// theme, so a rising momentum never flickers darker.
     #[test]
     fn ramp_is_monotone_in_luminance_on_dark() {
         let lum = |c: u32| {

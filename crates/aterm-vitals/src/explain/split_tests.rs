@@ -384,7 +384,7 @@ fn with_the_lane_off_the_split_is_the_built_one_by_subtraction() {
         );
         assert!(s.rows.is_empty());
     }
-    assert_eq!(CoalLane::Unsupported.word(), Some("unsupported"));
+    assert_eq!(CoalLane::Unsupported.word(), Some("lane_off:coalitions"));
     assert_eq!(CoalLane::Off.word(), Some("lane_off:coalitions"));
     assert_eq!(CoalLane::On.word(), None);
 }

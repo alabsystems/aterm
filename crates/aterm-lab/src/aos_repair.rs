@@ -1,82 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `aos-repair [--aterm PATH] [--control] [--keep] [--out DIR]`: Aos M2's live
-//! repair on a WINDOWED private aterm (`docs/DESIGN-aos-hosted-execution-2026-10-21.md`
-//! §5 and §8.2), the in-process story of `aterm-gui`'s `lib_aos_repair_tests.rs` run
-//! through the instance's control socket. It OPENS ONE WINDOW: the momentum glow's settle
-//! wake is planned only for a window with glass (`has_glass`), so a headless instance
-//! cannot strand or clear it.
-//!
-//! The run: a private windowed instance ([`crate::instance`]: scratch HOME and XDG dirs,
-//! the automatic lanes off, its own control socket, a lifeline, ended by its process
-//! group, the stats Deck off) whose tab runs a program that prints one line and sleeps,
-//! so nothing but the typed keys' echo and the cursor effects ever draws. Only the
-//! momentum glow is lit (`cursor_trail_style = "off"`, `cursor_momentum_glow = true`, no
-//! blink, full motion, no sounds, Serious Mode off) and the GPU-only present passes are
-//! off (bloom, shimmer, EDR, the SDR crown) so the window's frame and its `image clean`
-//! twin differ only in the model's overlays. On one held control connection
-//! ([`aterm_agent::RelayClient`]):
-//!
-//! 1. `aos attach code=demo-stranded-settle` (`--control`: `code=shipped`);
-//! 2. 24 printable keys, unguarded `key <c>` to the front tab, 60 ms apart (the normal
-//!    key dispatch that credits the glow; `send`, `feed`, `paste` and a guarded `key` do
-//!    not);
-//! 3. STRANDED (not with `--control`): the glow settles and the lane parks; past its
-//!    `cold_at` (`aos status`, ns from the attach epoch) two readings a second apart show
-//!    it still hot and settling, the planner asked after `cold_at` and was named no wake,
-//!    no present happened in between (`metrics` `frames`), and the last delivered tick
-//!    still carries the halo and the tint (`aos status` `frame_hot`, `quads`; `trail
-//!    status` `block_fill=momentum` in a key window, `none` under the inactive outline of
-//!    a window without OS key focus, read as `focused=` before the first key);
-//! 4. `aos repair code=shipped`: the live code failed `HotHasWake`, the candidate passed,
-//!    the same code reproduced the head, grade `tested`, a new revision;
-//! 5. the clearing frame: a present with no key (`frames` past the hold's), the glow cold,
-//!    the last tick inert, no tint; then `image` and `image clean` measured by
-//!    [`crate::trail_contrast`]: `outside_caret_px` 0; then `aos trace`: the log the commit
-//!    started (a later epoch, from the repaired range's end), sealed, with no key and no
-//!    reset in it;
-//! 6. 12 fresh keys through the same path: hot, settling with a wake named, presents with
-//!    no key until it is cold, the last tick inert, `outside_caret_px` 0 again; replays,
-//!    publications and rejections unchanged since the commit, `refused=0`; `aos trace`
-//!    agrees with `aos status`, is sealed, and holds exactly the 12 keys and no reset;
-//! 7. `metrics percentiles`; the instance stopped by its pid, and checked gone.
-//!
-//! `--control` attaches the shipped code instead and skips 3 to 6: the glow must settle,
-//! name its wake, present by itself and clear (the inert last tick, `outside_caret_px` 0),
-//! and its sealed trace must hold exactly the 24 keys and no reset.
-//!
-//! The per-kind counts are `aos trace`'s `sealed= keys= resets= ticks= queries=` (the
-//! events of each kind in the exported, decoded log); a reply without them is an error,
-//! so a host that cannot count them fails the run rather than passing it unwitnessed.
-//!
-//! # What witnesses what, and why nothing here repaints the stranded glow
-//!
-//! A windowed `image` is bound to a present the capture forces (`present_before_capture`
-//! redraws the window), and that redraw ticks the glow: past `cold_at` the tick is inert,
-//! so a photograph of the stranded frame would clear it, the fault's symptom erased by the
-//! instrument. `video` forces a baseline redraw at its start and books every present of
-//! its take to the tainted ledger. So the stranded state is witnessed with reads alone:
-//! `aos status` (the glow's own state, its last delivered tick, the planner's last query
-//! and its answer), `trail status` (the caret's fill owner), and `metrics` `frames` (every
-//! successful present; `n_present` counts only presents that close a PTY-output interval,
-//! so it cannot see an effect-only frame). `aos status` and `trail status` are main-loop
-//! turns, answered before that turn's planner records its query (the "later turn still
-//! arms nothing" of the in-process test), and `metrics` is answered off the main loop, so
-//! a status reading reports an earlier turn's query: each stranded reading follows a
-//! status request made past `cold_at`. None requests a redraw: `frames` standing still
-//! over the hold is the witness of that (a count, not a reading of the glass). Pixels are
-//! taken only once the glow is cold, where the forced present's tick is inert as the last
-//! presented one was; they confirm the cleared glass, and the counters say the clearing
-//! frame came before them.
-//!
-//! The run prints each step's verb line, each gate as `gate <name> PASS|FAIL <observed>`,
-//! and ends with one machine-readable line, `aos-repair result=pass|fail mode=… gates=…`.
-//! Frames, sidecars, the contrast reports and the transcript go to `--out` (outside the
-//! repository), else into the world, removed at the end unless `--keep`.
-//!
-//! Exit: 0 every gate passed; 1 a gate failed or a step did not happen (its hang detector
-//! fired); 2 usage; 3 not run (no aterm to drive); 128 + the signal when interrupted.
+//! `aos-repair`: Aos M2 proof runner for live momentum-glow fault detection and hot-swap repair.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -115,12 +40,7 @@ hold exactly its 24 keys and no reset. A host whose `aos trace` lacks sealed=/ke
 exit: 0 every gate passed; 1 a gate failed or a step never happened (a one-minute hang detector); 2 usage; 3 not run
 ";
 
-/// The aterm.toml lines that light the momentum glow alone and keep the window quiet.
-/// Top-level keys only: the run appends [`instance::CONFIG_OFF`]'s tables and then
-/// [`crate::linux_proof::DECK_OFF`], which holds the stats Deck off as the Linux lane and
-/// the Windows lane's `--cpu` runs hold it. The Deck redraws its live CPU figures every
-/// second, so with it on, in a key window, a frame and its `image clean` twin differed
-/// outside the caret, and its presents ticked a stranded glow cold.
+/// `aterm.toml` lines enabling momentum glow alone on a quiet window.
 pub const CONFIG: &[&str] = &[
     "cursor_trail_style = \"off\"",
     "cursor_momentum_glow = true",
@@ -128,8 +48,6 @@ pub const CONFIG: &[&str] = &[
     "motion = \"full\"",
     "trail_sounds = false",
     "serious_mode = false",
-    // Present-time GPU passes the `image clean` rerender has no twin of: off, so the
-    // frame and its twin differ only in the model's overlays.
     "cursor_trail_bloom = false",
     "cursor_fire_shimmer = false",
     "hdr_glow = false",
@@ -137,7 +55,6 @@ pub const CONFIG: &[&str] = &[
 ];
 
 /// The instance's aterm.toml: [`CONFIG`], [`instance::CONFIG_OFF`]'s tables, then the
-/// stats Deck held off.
 fn world_config() -> String {
     let top: Vec<String> = CONFIG.iter().map(|l| (*l).to_string()).collect();
     format!(
@@ -148,7 +65,6 @@ fn world_config() -> String {
 }
 
 /// The tab's program: one line, then nothing ever draws again but the line discipline's
-/// echo of the typed keys.
 const PROGRAM: &str =
     "printf 'aos-repair: the typed keys echo below; nothing else draws\\n'; exec /bin/sleep 3600";
 
@@ -387,17 +303,14 @@ pub struct TraceLine {
     pub bytes: String,
     /// Whether the exported bytes decoded with their end seal.
     pub sealed: bool,
-    /// The events of each kind in the exported, decoded log (the log since the last
-    /// commit, attach, restore or re-anchor).
+    /// Per-kind event counts in the exported log since the last anchor.
     pub keys: u64,
     pub resets: u64,
     pub ticks: u64,
     pub queries: u64,
 }
 
-/// Parse an `aos trace` reply. The seal and the per-kind counts are required: a host
-/// that does not report them cannot witness "no reset" or "each key once", so its
-/// reply is an error, not a pass.
+/// Parse an `aos trace` reply.
 ///
 /// # Errors
 /// Not an OK reply, or a field missing or malformed.
@@ -550,20 +463,11 @@ pub struct Stranded {
     pub hold_ms: u64,
     /// `trail status` at the first reading.
     pub trail: TrailRow,
-    /// Whether the window held OS key focus: `trail status` `focused=` read before the
-    /// first key, when no typed wake can stand in for it.
+    /// Whether the window held OS key focus before the first key.
     pub key_window: bool,
 }
 
-/// The stranded gates: the fault attached, the glow hot and settling past its cold
-/// instant with the planner asked after it and named no wake, no present over the hold,
-/// the last tick unchanged and still carrying the halo and the tint.
-///
-/// The tint is the caret's: in a key window the glow owns the block fill
-/// (`block_fill=momentum`). A window without OS key focus draws the host's inactive
-/// outline over every effect fill (`presented_block_fill` keeps no owner under a
-/// `HollowBlock` caret), so there `block_fill=none` is the only correct reading and the
-/// halo stands on the last tick alone.
+/// Evaluate the stranded-glow verification gates.
 #[must_use]
 pub fn stranded_gates(e: &Stranded) -> Vec<Gate> {
     let (a, b) = (&e.a, &e.b);
@@ -643,9 +547,7 @@ pub fn stranded_gates(e: &Stranded) -> Vec<Gate> {
     ]
 }
 
-/// The repair gates: paused first, the fault failed `HotHasWake`, the shipped candidate
-/// passed, the same code reproduced the head, graded `tested`, a new revision of the
-/// shipped code over the fault, nothing queued.
+/// Evaluate the `aos repair` verification gates.
 #[must_use]
 pub fn repair_gates(r: &Repair, before: &Status) -> Vec<Gate> {
     vec![
@@ -705,8 +607,7 @@ pub struct Cleared {
     pub outside_caret_px: Option<i64>,
 }
 
-/// The clearing gates: a present with no key since the hold, the glow cold under the
-/// published revision, the last tick inert, no tint, and no halo in the pixels.
+/// Evaluate the post-commit clearing gates.
 #[must_use]
 pub fn cleared_gates(e: &Cleared) -> Vec<Gate> {
     let s = &e.status;
@@ -754,8 +655,7 @@ fn px_word(v: Option<i64>) -> String {
     v.map_or_else(|| "unmeasured".to_string(), |p| p.to_string())
 }
 
-/// A glow typed hot and left to cool by itself under the shipped code: the fresh keys
-/// after a repair (step 6) and the control run.
+/// Readings of a glow typed hot and left to cool under the shipped code.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Cooled {
     /// A reading with the glow hot after the keys.
@@ -770,9 +670,7 @@ pub struct Cooled {
     pub outside_caret_px: Option<i64>,
 }
 
-/// The gates every self-cooling glow meets: heated by the keys, settled with a wake
-/// named, presented with no key until cold, the last tick inert and no tint, no halo in
-/// the pixels, every input admitted.
+/// Evaluate the self-cooling glow verification gates.
 #[must_use]
 pub fn cooled_gates(e: &Cooled) -> Vec<Gate> {
     let c = &e.cold;
@@ -823,9 +721,7 @@ pub fn cooled_gates(e: &Cooled) -> Vec<Gate> {
     ]
 }
 
-/// The continuation gates after a repair: the published code and revision still live,
-/// and no replay, publication, rejection, re-anchor, break or restore since the commit;
-/// the trace summary agrees with the status read beside it.
+/// Evaluate the post-repair continuation gates.
 #[must_use]
 pub fn continuation_gates(
     committed: &Status,
@@ -877,9 +773,7 @@ pub fn continuation_gates(
     ]
 }
 
-/// The exported log by kind (`aos trace`'s `sealed= keys= resets= ticks= queries=`):
-/// sealed, exactly `keys` keys and no reset, and the four kinds adding up to the log's
-/// length (an event of no kind, or one counted twice, fails it).
+/// Evaluate the exported trace log kind-counts gate.
 #[must_use]
 pub fn log_kinds_gate(name: &'static str, trace: &TraceLine, keys: u64) -> Gate {
     let kinds = [trace.keys, trace.resets, trace.ticks, trace.queries]
@@ -895,9 +789,7 @@ pub fn log_kinds_gate(name: &'static str, trace: &TraceLine, keys: u64) -> Gate 
     )
 }
 
-/// The gates on `aos trace` read after the commit, before any fresh key: it is the log the
-/// commit started (a later epoch, first cursor at the repaired range's end, unbroken), and
-/// that log holds no key and no reset (the commit delivered nothing the drive did not send).
+/// Evaluate the `aos trace` gates immediately after commit before fresh keys.
 #[must_use]
 pub fn post_commit_gates(r: &Repair, trace: &TraceLine) -> Vec<Gate> {
     vec![
@@ -1075,7 +967,6 @@ impl Drive<'_> {
     }
 
     /// The keys of `word`, unguarded `key <c>` to the front tab [`KEY_GAP`] apart on the
-    /// held connection. Returns the last key's send instant.
     fn type_keys(&mut self, word: &str) -> Result<Instant, Halt> {
         let start = Instant::now();
         let mut last = start;
@@ -1103,7 +994,6 @@ impl Drive<'_> {
     }
 
     /// An upper bound of `t`'s offset from the attach epoch, in ns (the epoch is no
-    /// earlier than the attach request).
     fn offset_upper(&self, t: Instant) -> i128 {
         i128::try_from(t.saturating_duration_since(self.attach_sent).as_nanos())
             .unwrap_or(i128::MAX)
@@ -1137,7 +1027,6 @@ impl Drive<'_> {
     }
 
     /// A kept frame of the cold glass, its clean twin and sidecars, measured by
-    /// `trail-contrast`: its `outside_caret_px`. Both captures force a present.
     fn capture(&mut self, frame: &str) -> Result<Option<i64>, Halt> {
         let png = self.out.join(format!("{}.{frame}.png", self.stem));
         let clean = self.out.join(format!("{}.{frame}.clean.png", self.stem));
@@ -1186,7 +1075,6 @@ impl Drive<'_> {
 /// The repair run's steps 3 to 6 (after the keys).
 fn repair_story(d: &mut Drive<'_>, last_key: Instant) -> Result<Vec<Gate>, Halt> {
     let mut gates = Vec::new();
-    // The lane parks once the glow settles; the fault names no wake for it.
     let settle = d.wait_for("the faulty glow settles", |s| s.settling && !s.active)?;
     let cold_at = settle
         .cold_at
@@ -1204,10 +1092,6 @@ fn repair_story(d: &mut Drive<'_>, last_key: Instant) -> Result<Vec<Gate>, Halt>
         wait.as_millis()
     ));
     stop::sleep(wait)?;
-    // `aos status` is answered on the main loop before that turn's planner records its
-    // Query, and `metrics` off it, so a reading reports the Query of an earlier turn.
-    // One status request first gives the first reading a turn past `cold_at` to report;
-    // the second has the first reading's and `trail status`'s turns.
     let _ = d.status()?;
     let frames_a = d.frames()?;
     let a = d.status()?;
@@ -1249,7 +1133,6 @@ fn repair_story(d: &mut Drive<'_>, last_key: Instant) -> Result<Vec<Gate>, Halt>
         outside_caret_px: outside,
     }));
     let _ = d.frames()?;
-    // The log the commit started, before any fresh key: no key, no reset.
     let committed = read_trace(d)?;
     gates.extend(post_commit_gates(&repair, &committed));
 
@@ -1274,7 +1157,6 @@ fn read_trace(d: &mut Drive<'_>) -> Result<TraceLine, Halt> {
 }
 
 /// A glow typed hot, left to cool by itself: hot, settling (a query made after the last
-/// key, whose offset is at most `after_keys`), cold, then the cold glass photographed.
 fn cool(d: &mut Drive<'_>, after_keys: i128, frame: &str) -> Result<Cooled, Halt> {
     let hot = d.wait_for("the keys heat the glow", |s| s.hot)?;
     let settling = d.wait_for("the glow settles, asked after the last key", |s| {
@@ -1301,8 +1183,6 @@ fn story(d: &mut Drive<'_>, control: bool) -> Result<Vec<Gate>, Halt> {
     let dims = d.inst.ctl(&["dims"]);
     d.keep("dims.txt", &format!("{}{}", dims.stdout, dims.stderr));
     d.note(format!("> dims\n< {}", dims.first()));
-    // Before any key no typed wake stands in for focus, so this `focused=` is the
-    // window's OS key focus.
     d.key_window = d.trail()?.focused;
     let _ = d.frames()?;
     let before = d.status()?;
@@ -1349,7 +1229,6 @@ fn story(d: &mut Drive<'_>, control: bool) -> Result<Vec<Gate>, Halt> {
 }
 
 /// The aterm processes of a windowed instance: the keeper's descendants whose command
-/// line names the instance's own socket.
 fn aterm_pids(inst: &Instance) -> Vec<i32> {
     let mark = format!("--control-sock {}", inst.sock.display());
     crate::procs::descendants(inst.pid)
@@ -1549,7 +1428,6 @@ mod tests {
     use super::*;
 
     /// An attached status line as a debug build's `aos status` answers it (taken from a
-    /// headless instance with six keys typed under the demonstration fault).
     const HOT: &str = "OK window=0 attached=true code=demo-stranded-settle hot=true active=true \
         settling=false build=0.110.0+geee60c4e22d2 code_digest=f337aa19938f rev=0 branch=0 \
         paused=false queued=0/1024 log=8 log_epoch=1 cursor=8 broken=false \
@@ -1769,7 +1647,6 @@ mod tests {
     }
 
     /// An `aos trace` line of the agreed shape: the summary, then the seal and the
-    /// per-kind counts at its end.
     const TRACE: &str = "OK window=0 log=8 log_epoch=1 first=0 end=8 \
         trace=0356c26b403b57eb92e88d0323cc7c2d3e3de743dcb3e6a7f203383fd6a79c30 \
         checkpoint=31ecd090f577e87f65549fe2b74ac40c921a79cc8a5795079008b9194ddea798 \
@@ -1800,7 +1677,6 @@ mod tests {
     }
 
     /// The trace line the host printed before the seal and the counts existed is not a
-    /// trace the drive can judge: each missing word is named.
     #[test]
     fn a_trace_line_without_its_seal_or_a_count_is_an_error_naming_it() {
         let unsealed = TRACE.replace(" sealed=true keys=6 resets=0 ticks=1 queries=1", "");
@@ -1830,30 +1706,25 @@ mod tests {
         );
 
         let fails = |t: &TraceLine, typed: u64| !log_kinds_gate("k", t, typed).pass;
-        // A key recorded twice, or one lost.
         assert!(fails(&t, 5));
         assert!(fails(&t, 7));
-        // A reset the drive never caused, in place of a query.
         let reset = TraceLine {
             resets: 1,
             queries: 0,
             ..t.clone()
         };
         assert!(fails(&reset, 6));
-        // The bytes decoded without their seal.
         let unsealed = TraceLine {
             sealed: false,
             ..t.clone()
         };
         assert!(fails(&unsealed, 6));
-        // An event of no kind: the counts no longer add up to the log.
         let uncounted = TraceLine {
             log: 9,
             end: 9,
             ..t.clone()
         };
         assert!(fails(&uncounted, 6));
-        // Counts that would overflow never add up.
         let huge = TraceLine {
             ticks: u64::MAX,
             ..t
@@ -1881,7 +1752,6 @@ mod tests {
         };
         assert_eq!(failed(&post_commit_gates(&r, &t)), Vec::<&str>::new());
 
-        // The live log the repair read (its epoch, its 24 keys) is not the new one.
         let old = TraceLine {
             log_epoch: 1,
             first: 0,
@@ -1893,7 +1763,6 @@ mod tests {
             failed(&post_commit_gates(&r, &old)),
             vec!["post-commit-log", "post-commit-no-key-or-reset"]
         );
-        // A log that does not start where the repaired range ended.
         let elsewhere = TraceLine {
             first: 170,
             ..t.clone()
@@ -1902,7 +1771,6 @@ mod tests {
             failed(&post_commit_gates(&r, &elsewhere)),
             vec!["post-commit-log"]
         );
-        // A reset delivered by the commit.
         let reset = TraceLine {
             resets: 1,
             queries: 2,
@@ -1912,7 +1780,6 @@ mod tests {
             failed(&post_commit_gates(&r, &reset)),
             vec!["post-commit-no-key-or-reset"]
         );
-        // A key nobody typed.
         let key = TraceLine {
             keys: 1,
             queries: 2,
@@ -2035,8 +1902,6 @@ mod tests {
             vec!["halo-on-last-frame"]
         );
 
-        // Without key focus the inactive outline owns the caret: `none` is the
-        // correct reading there and a momentum owner is the failure.
         let mut outline = untinted.clone();
         outline.key_window = false;
         assert_eq!(failed(&stranded_gates(&outline)), Vec::<&str>::new());

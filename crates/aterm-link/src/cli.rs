@@ -1,27 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `aterm-link`: the fabric bridge's command line (`USAGE` lists the subcommands).
-//!
-//! An unknown subcommand is refused by name (exit 2). The retired `hook` verb
-//! exits 0 with one stderr line ([`retired_hook`]) so surviving settings-file
-//! hook entries do not block prompts.
-//!
-//! ## `ls` columns
-//!
-//! `ls` prints `<node> <host> <sid> state= inc= role= detail= driving=
-//! holder= hold= fabric= attention= gen= observer= epoch= phase= context=
-//! title= proto= aterm=`; `--attention` keeps only rows with a non-`-`
-//! `attention=`.
-//!
-//! * `driving=` is not published on session rows and prints `-`. `role=`,
-//!   `detail=`, `phase=` and `title=` are written by [`crate::presence`] on a
-//!   `meta` bridge (the default); a `minimal` bridge prints `-`.
-//! * `host=`, `fabric=`, `proto=` and `aterm=` are published on the node's own
-//!   presence row only; session rows print `-`.
-//! * Every column is normalised through [`crate::pct`] into a single printable
-//!   ASCII token so untrusted presence bodies cannot inject terminal escapes or
-//!   whitespace.
+//! `aterm-link` fabric bridge CLI (`ls`, `serve`, `notify`, `broker`, `mint`).
 
 use std::process::ExitCode;
 
@@ -68,10 +48,7 @@ Command-line flags override defaults.
   attention= gen= observer= epoch= phase= context= title= proto= aterm=
 ";
 
-/// The bridge's whole command line, as a LIBRARY entry.
-///
-/// A library entry so the ONE `aterm` binary carries it: `aterm link ...` and
-/// the `aterm-link` symlink both land here.
+/// Library entry point for the `aterm-link` CLI.
 #[must_use]
 pub fn dispatch(args: &[String]) -> ExitCode {
     dispatch_with_inherited_lanes(args, || {
@@ -82,10 +59,7 @@ pub fn dispatch(args: &[String]) -> ExitCode {
     })
 }
 
-/// Dispatch with the composing executable's one-shot lane admission. It is
-/// called only after parsing selects inherited `serve`, never for observer or
-/// other verbs. The provider transfers already-owned descriptors; this safe
-/// library never infers ownership from raw descriptor flags.
+/// Dispatch with the composing executable's one-shot lane admission.
 #[must_use]
 pub fn dispatch_with_inherited_lanes(
     args: &[String],
@@ -93,13 +67,6 @@ pub fn dispatch_with_inherited_lanes(
 ) -> ExitCode {
     match args.first().map(String::as_str) {
         Some("serve") => run(&args[1..], true, take_lanes),
-        // The read-side verbs default their flags from the rendezvous file
-        // (`crate::enable`); `serve` does not, because aterm launches it with
-        // every flag spelled out and a bridge that silently took a different
-        // broker than its config names would make the report lie about itself.
-        //
-        // No rendezvous file and no flags: say what was checked, not "no
-        // fabric" — a hand-written `[fabric] command` writes no rendezvous file.
         Some("ls") => {
             let given = |flag: &str| args[1..].iter().any(|a| a == flag);
             if !given("--fleet")
@@ -122,11 +89,8 @@ pub fn dispatch_with_inherited_lanes(
         Some("broker") => broker(&args[1..]),
         Some("mint") => mint(&args[1..]),
         Some("fabric") => crate::fabric::main(&args[1..]),
-        // Retired: a no-op, never a refusal ([`retired_hook`]).
         Some("hook") => retired_hook(),
-        // Asked for: stdout, exit 0, like `aterm --help` and `broker -h`.
         Some("-h" | "--help" | "help") => aterm_uds::stdout::answer_exit("aterm link", USAGE, 0),
-        // Refused by name (module doc).
         Some(other) => {
             eprintln!("aterm-link: unknown subcommand `{other}`");
             eprint!("{USAGE}");
@@ -138,19 +102,12 @@ pub fn dispatch_with_inherited_lanes(
         }
     }
 }
-
 /// The one line `aterm link hook …` prints, on stderr ([`retired_hook`]).
 pub const RETIRED_HOOK_LINE: &str =
     "aterm-link: `hook` is retired and does nothing — delete this entry from the settings file \
      that runs it";
 
 /// `aterm link hook …`, any arguments: exit 0, nothing on stdout, one stderr line
-/// ([`RETIRED_HOOK_LINE`]). Permanent: no cleanup reaches every project's settings file.
-///
-/// A hook entry aterm once wrote can survive in a project's `.claude/settings.local.json` or a
-/// running Claude Code, where exit 2 is a blocking error and a `UserPromptSubmit` or
-/// `SessionStart` hook's stdout joins the model's context. Stdin (the event's JSON) is drained
-/// first, uncapped, so the writer never meets a closed pipe; a terminal is never read.
 fn retired_hook() -> ExitCode {
     use std::io::IsTerminal as _;
     let stdin = std::io::stdin();
@@ -175,7 +132,6 @@ fn run(
         }
     };
     if serve {
-        // `--attention` is an `ls` filter; `serve` refuses it by name rather
         // than parsing it and doing nothing.
         if parsed.attention {
             eprintln!("aterm-link: --attention is an `ls` filter; `serve` has no roster");
@@ -183,8 +139,6 @@ fn run(
             return ExitCode::from(2);
         }
         let mut cfg = parsed.cfg;
-        // `serve` defaults `[fabric] presence` and `receipts` from aterm.toml: they shape what
-        // the bridge publishes, not which broker it reaches.
         if !parsed.presence_given {
             cfg.presence = crate::fabric::presence_from_config();
         }
@@ -217,35 +171,23 @@ fn run(
     }
 }
 
-/// What `parse` answers: the bridge's own config, plus the flags that belong to
-/// the command line rather than to a running bridge.
+/// Parsed bridge config and CLI-only flags.
 pub(crate) struct Parsed {
     pub(crate) cfg: Config,
     /// `ls --attention` (§9.3): keep only the rows carrying an escalation.
     pub(crate) attention: bool,
-    /// Whether `--presence` was on the command line — else `serve` reads
-    /// `[fabric] presence` from aterm.toml ([`crate::fabric::presence_from_config`]).
+    /// Whether `--presence` was explicitly passed on the command line.
     pub(crate) presence_given: bool,
-    /// Whether `--receipts`/`--no-receipts` was on the command line — else
-    /// `serve` reads `[fabric] receipts` ([`crate::fabric::receipts_from_config`]).
+    /// Whether `--receipts` or `--no-receipts` was explicitly passed on the command line.
     pub(crate) receipts_given: bool,
-    /// Whether `--log` was on the command line — else `serve` reads
-    /// `[fabric] log` ([`crate::fabric::log_from_config`]).
+    /// Whether `--log` was explicitly passed on the command line.
     pub(crate) log_given: bool,
 }
 
 /// One printed column as one safe token: printable ASCII, no whitespace, no escape sequence,
-/// `-` when empty.
-///
-/// A value arrives pct-encoded by its writer, or not if the writer is hostile. Decoding and
-/// re-encoding ([`crate::pct`]) is idempotent on a well-formed token and total on a malformed
-/// one.
 fn column(raw: &str) -> String {
     let mut safe = crate::pct::encode(&crate::pct::decode(raw));
-    // Bounded by the cap the bridge's writer and `glance` use (another host's row need not
-    // have gone through that writer), cut on an escape boundary, never inside a `%XX`.
     if safe.len() > crate::glance::ATTENTION_CAP {
-        // The mark is inside the cap.
         safe = crate::presence::clamp_pct(&safe, crate::glance::ATTENTION_CAP - ELLIPSIS.len());
         safe.push_str(ELLIPSIS);
     }
@@ -257,22 +199,10 @@ fn column(raw: &str) -> String {
 }
 
 /// `pct::encode("…")` — the mark a truncated column ends with, spelled in the
-/// escape so a row stays printable ASCII.
 const ELLIPSIS: &str = "%E2%80%A6";
 
 /// `aterm-link ls` — every node's roster: `Last{/f/<F>/pub/*/*/presence}`, which
-/// is one bounded last-value walk and no filesystem scan, no `dial`, and no
-/// saved peer names.
-///
-/// It pages on the resume cursor through [`transport::walk_last`]; an empty
-/// page is not the end of the answer. A short roster is indistinguishable from
-/// a small fleet, so a walk that could not FINISH is an error, not an absence.
-///
-/// The row is §7's (module header). `attention_only` is §9.3's `--attention`:
-/// the same `Last` filtered on the field the notifier fires on (§4.2, A10).
 fn roster(cfg: &Config, attention_only: bool) -> std::io::Result<()> {
-    // One-shot, so bounded like every operator command: a wedged broker costs
-    // a few seconds and an error, never a hung terminal.
     let (mut client, _closer) = transport::connect(&cfg.broker, crate::fabric::IO_TIMEOUT)
         .map_err(|e| {
             std::io::Error::new(
@@ -293,7 +223,6 @@ fn roster(cfg: &Config, attention_only: bool) -> std::io::Result<()> {
 }
 
 /// One roster line, and whether it is an escalation; split out of [`roster`] so §7's column
-/// set is testable without a broker.
 fn row(subject: &str, body: &crate::body::Body) -> (String, bool) {
     let segs: Vec<&str> = subject.split('/').collect();
     let node = column(segs.get(4).unwrap_or(&"-"));
@@ -304,8 +233,6 @@ fn row(subject: &str, body: &crate::body::Body) -> (String, bool) {
             .map_or_else(|| "-".into(), |v| column(v))
     };
     let attention = field("attention");
-    // The test `notify::Sel::Attention` makes: absent, empty and `-` are all no escalation, so
-    // `ls --attention` and the notifier cannot disagree.
     let escalating = attention != "-";
     let line = format!(
         "{node} {} {owner} state={} inc={} role={} detail={} driving={} \
@@ -320,32 +247,21 @@ fn row(subject: &str, body: &crate::body::Body) -> (String, bool) {
         field("holder"),
         field("hold"),
         field("fabric"),
-        // Known body fields (§4.1): parsed into `Body`, so never in `unknown`.
         body.gen.as_deref().map_or_else(|| "-".into(), column),
-        // Absent means `0`, not unknown: only an observer attachment writes it (§11.2).
         body.unknown
             .get("observer")
             .map_or_else(|| "0".to_string(), |v| column(v)),
         body.epoch.as_deref().map_or_else(|| "-".into(), column),
-        // Written by a `meta`-mode bridge; `-` from any other.
         field("phase"),
         field("context"),
         field("title"),
-        // A NODE's row says what it runs (`proto=` the astream protocol,
-        // `aterm=` the release); `-` on a session row and from a node whose
-        // bridge predates the tokens. Last, so every column before keeps its
-        // place.
         field("proto"),
         field("aterm"),
     );
     (line, escalating)
 }
 
-/// Parse argv. A flag that takes a value and has none is a usage error, not a defaulted
-/// setting.
-///
-/// `aterm fabric` reads the fleet, broker, cap files and state dir out of `[fabric] command`
-/// with this parser, the one the bridge was started with, so the two cannot disagree.
+/// Parse `aterm-link` command-line arguments.
 pub(crate) fn parse(args: &[String]) -> Result<Parsed, String> {
     let mut attention = false;
     let mut presence_given = false;
@@ -418,9 +334,6 @@ pub(crate) fn parse(args: &[String]) -> Result<Parsed, String> {
     if cfg.state_dir.is_empty() {
         cfg.state_dir = default_state_dir();
     }
-    // Read as every control client reads an instance token
-    // (`aterm_ctl::read_control_token_file`): a symlink is refused, only a regular file is
-    // read, and no more than a token's bound of it.
     if let Some(path) = token_file {
         cfg.token = Some(
             aterm_ctl::read_control_token_file(std::path::Path::new(&path))
@@ -444,9 +357,7 @@ pub(crate) fn parse(args: &[String]) -> Result<Parsed, String> {
     })
 }
 
-/// `$XDG_STATE_HOME/aterm-link`, else `$HOME/.local/state/aterm-link`, else
-/// `./aterm-link-state`; never a temp dir, because losing the node id loses the node's mail
-/// lane. `aterm-link notify` keeps its journal under the same directory (§9.3).
+/// Resolve the default `aterm-link` state directory.
 pub(crate) fn default_state_dir() -> String {
     if let Ok(x) = std::env::var("XDG_STATE_HOME") {
         if !x.is_empty() {
@@ -462,26 +373,7 @@ pub(crate) fn default_state_dir() -> String {
 }
 
 /// `aterm link broker`: run the local fabric bus on a Unix socket.
-///
-/// * **Guarding**: With `--secret-file` (or a `mint.secret` beside the socket when
-///   `--secret-file` is omitted), the broker opens guarded (`Broker::open_guarded`)
-///   and checks every attach and request against capabilities minted under that secret.
-///   An unreadable secret file is refused, never served unguarded.
-/// * **Durability** (`--durability strict|ordered|relaxed`, [`crate::durability`]):
-///   `strict` acks after a full flush (`F_FULLFSYNC` on macOS); `ordered` acks after
-///   an ordering barrier (`F_BARRIERFSYNC`) with a 100 ms full-flush horizon (served
-///   `strict` where the device cannot guarantee ordering); `relaxed` acks after the
-///   page-cache write. On `ordered` and `relaxed`, halts and person-facing records
-///   flush in full before ack, and SIGTERM/SIGINT/SIGHUP flush and mark the log
-///   `Closed`. An unclean stop advances the log generation on the next boot.
-/// * **Lifecycle & retention**: Polls its executable every [`EXE_WATCH`] and exits 0
-///   when replaced by a settled new build so its supervisor restarts it. Polls
-///   `broker.poisoned()` every [`crate::broker_health::POLL`] and exits
-///   [`crate::broker_health::POISONED_EXIT`] (75) on a poisoned log so its supervisor
-///   reopens it. Applies [`crate::broker_rules`] default log retention at open.
 fn broker(args: &[String]) -> ExitCode {
-    // Capture the running image and invocation before opening the broker or
-    // announcing readiness. An update during startup must remain observable.
     let watch = ExeWatch::capture();
     const USAGE: &str = "\
 usage: aterm link broker <socket> [log] [--secret-file <path>] [--durability <tier>]
@@ -530,7 +422,6 @@ to 7 days / 64 MiB, latest presence, and other records up to 7 days / 32 MiB (`<
     let durability = parsed.durability.cloned();
     let repair = parsed.repair;
     let words: Vec<&str> = parsed.words.iter().map(|word| word.as_str()).collect();
-    // `--repair` serves nothing: one local file, and any other flag is refused.
     if repair {
         if secret_file.is_some() || durability.is_some() {
             eprintln!("aterm link broker: --repair takes <log> alone: it serves nothing");
@@ -554,15 +445,9 @@ to 7 days / 64 MiB, latest presence, and other records up to 7 days / 32 MiB (`<
         .map(crate::durability::Durability::parse)
         .transpose()
     {
-        // A bare argv runs the build's default for a broker its argv names a
-        // mint secret for or not ([`crate::durability::default_for`]), judged
-        // from the argv's words alone — before the fallback to the secret
-        // beside the socket below — as `aterm fabric` and doctor judge them off
-        // the running process.
         Ok(d) => crate::durability::resolve(d, secret_file.is_some()),
         Err(e) => return usage_error(&e),
     };
-    // A surplus word is refused, never dropped.
     let (endpoint, log) = match words.as_slice() {
         [sock] => ((*sock).to_string(), format!("{sock}.log")),
         [sock, log] => ((*sock).to_string(), (*log).to_string()),
@@ -574,10 +459,6 @@ to 7 days / 64 MiB, latest presence, and other records up to 7 days / 32 MiB (`<
             return usage_error(&format!("unexpected argument `{extra}`"));
         }
     };
-    // A socket broker without `--secret-file` takes the `mint.secret` beside its socket,
-    // read as a directory (the socket's) and a name, by the rule every secret is read by.
-    // Present at all (a symlink, an unreadable file) makes it the secret, so a broken one is
-    // refused below, never served unguarded.
     let secret_file = secret_file.or_else(|| {
         let beside = std::path::Path::new(&endpoint).with_file_name(crate::enable::MINT_SECRET);
         std::fs::symlink_metadata(&beside)
@@ -598,31 +479,12 @@ to 7 days / 64 MiB, latest presence, and other records up to 7 days / 32 MiB (`<
             return ExitCode::FAILURE;
         }
     };
-    // Whether this call creates the log, so a refused bind can remove the empty file.
     let log_created_here = !std::path::Path::new(&log).exists();
-    // Whether it checks capabilities: what its promise says of a person's own
-    // posts ([`crate::durability::describe_served`]).
     let guarded = secret.is_some();
-    // The tier, and the boot it is opened in ([`crate::durability::open`]): a
-    // legacy relaxed mark from another boot is read into astream's unclean
-    // verdict, under the log's lock, whatever this run's tier. The boot is
-    // astream's own reading, the one the bridge's incarnation lease trusts
-    // ([`crate::durability::this_boot`]).
     let boot = crate::durability::this_boot();
-    // A broker of any tier but strict stops cleanly: from here the stop
-    // signals wake the loop below instead of killing the process, so its
-    // listeners are dropped and astream closes the log cleanly (a full flush,
-    // then `Closed` in its sidecar) before it exits. Taken before the open:
-    // astream's writer and acceptors are this process's first threads after
-    // main, and each inherits the mask. A strict broker's acks are on the
-    // disk already, and it keeps the default action.
     let stop = (durability != crate::durability::Durability::Strict)
         .then(|| take_stop_signals(std::thread::current()))
         .flatten();
-    // The fault seam ([`crate::broker_health::Seam`]): nothing in a release
-    // build. In a dev one, the escalation rules a test adds go into the open,
-    // and its `sync` is armed once the log is open and before anything is
-    // served, so the first full flush meets it.
     let seam = crate::broker_health::Seam::from_env(std::path::Path::new(&log));
     let opened = crate::durability::open_escalating(
         std::path::Path::new(&log),
@@ -654,9 +516,6 @@ to 7 days / 64 MiB, latest presence, and other records up to 7 days / 32 MiB (`<
         }
         Err(e) => {
             eprintln!("aterm link broker: open {log}: {e}");
-            // The last line is aterm's remedy, when the refusal has one: the
-            // supervisor appends this stderr to `<root>/broker.err`, whose last
-            // line `aterm fabric` and doctor quote ([`log_refusal_remedy`]).
             if let Some(remedy) = log_refusal_remedy(e.kind(), &log) {
                 eprintln!("aterm link broker: {remedy}");
             }
@@ -664,8 +523,6 @@ to 7 days / 64 MiB, latest presence, and other records up to 7 days / 32 MiB (`<
         }
     };
     seam.arm(&broker, std::path::Path::new(&log));
-    // Set default retention rules at every open before serving so `Hello` advertises them.
-    // If setting rules fails, serve unretained rather than taking the fabric down.
     let retained = match crate::broker_rules::retain(&broker) {
         Ok(()) => format!(
             "retained by aterm's default rules ({})",
@@ -682,7 +539,6 @@ to 7 days / 64 MiB, latest presence, and other records up to 7 days / 32 MiB (`<
     let handle = match broker.serve(&endpoint) {
         Ok(h) => h,
         Err(e) => {
-            // A refused bind leaves no empty log behind (see `log_created_here`).
             eprintln!("aterm link broker: serve {endpoint}: {e}");
             if log_created_here
                 && std::fs::metadata(&log)
@@ -695,7 +551,6 @@ to 7 days / 64 MiB, latest presence, and other records up to 7 days / 32 MiB (`<
             return ExitCode::FAILURE;
         }
     };
-    // Keep `<log>.health` once the socket is served so a refused bind leaves no snapshot.
     if let Err(e) = broker.keep_health(crate::broker_health::HEALTH_EVERY) {
         eprintln!(
             "aterm link broker: {}: could not write its health ({e}); astream tries again every \
@@ -708,7 +563,6 @@ to 7 days / 64 MiB, latest presence, and other records up to 7 days / 32 MiB (`<
         Some(path) => format!(" (guarded by {path})"),
         None => " (unguarded: it checks no capability)".to_string(),
     };
-    // Use `writeln!` rather than `println!` so a closed stdout after readiness does not panic.
     {
         use std::io::Write as _;
         let mut out = std::io::stdout().lock();
@@ -727,8 +581,6 @@ to 7 days / 64 MiB, latest presence, and other records up to 7 days / 32 MiB (`<
             broker.log_identity()
         );
     }
-    // Poll every `POLL` for stop signals, log poison (lock-free), and executable replacement
-    // every `EXE_WATCH`. Dropping `keep` shuts down the listeners and unlinks the socket.
     let keep = handle;
     let mut watch = watch;
     let mut exe_looked = std::time::Instant::now();
@@ -752,7 +604,6 @@ to 7 days / 64 MiB, latest presence, and other records up to 7 days / 32 MiB (`<
                 }
                 continue;
             }
-            // Drop listeners and broker before printing the poison line as the final stderr line.
             let restart = (!crate::broker_health::supervised()).then(|| {
                 let argv: Vec<String> = std::env::args_os()
                     .map(|a| a.to_string_lossy().into_owned())
@@ -786,8 +637,6 @@ to 7 days / 64 MiB, latest presence, and other records up to 7 days / 32 MiB (`<
         use std::io::Write as _;
         let mut err = std::io::stderr();
         let _ = writeln!(err, "aterm link broker: {why}");
-        // Dropping `keep` drains queued batches and flushes/closes the log cleanly unless
-        // that drain itself poisoned the log; check `broker.poisoned()` after the drop.
         drop(keep);
         if let Some(reason) = broker.poisoned() {
             let _ = writeln!(
@@ -838,7 +687,6 @@ fn signal_name(sig: i32) -> &'static str {
 }
 
 /// Block `SIGTERM`, `SIGINT` and `SIGHUP` on the main thread (before worker threads spawn)
-/// and unpark `main` when one arrives so astream flushes and marks the log `Closed`.
 #[cfg(unix)]
 fn take_stop_signals(main: std::thread::Thread) -> Option<StopSignal> {
     let taken = std::sync::Arc::new(std::sync::atomic::AtomicI32::new(0));
@@ -855,17 +703,14 @@ fn take_stop_signals(_main: std::thread::Thread) -> Option<StopSignal> {
     None
 }
 
-/// Remedy prefix printed when astream refuses to open a corrupt broker log (matched by
-/// [`crate::enable::fix_for`]).
+/// Remedy prefix printed when astream refuses to open a corrupt broker log.
 pub const CORRUPT_LOG_REMEDY: &str = "the log has a corrupt record and is not opened: run `aterm \
                                       link broker --repair";
 
-/// Remedy prefix printed when astream refuses a log written by a newer format (`Unsupported`;
-/// matched by [`crate::enable::fix_for`]).
+/// Remedy prefix printed when astream refuses a log written by a newer format.
 pub const NEWER_LOG_REMEDY: &str = "the log was written by a newer aterm and is not opened";
 
-/// One-line remedy for a broker log open refusal (`InvalidData` → corrupt record or retention
-/// sidecar; `Unsupported` → newer format).
+/// One-line remedy for a broker log open refusal.
 #[must_use]
 pub fn log_refusal_remedy(kind: std::io::ErrorKind, log: &str) -> Option<String> {
     match kind {
@@ -882,8 +727,6 @@ pub fn log_refusal_remedy(kind: std::io::ErrorKind, log: &str) -> Option<String>
 }
 
 /// `aterm link broker --repair <log>`: truncate `<log>` at its first corrupt record via
-/// `BrokerLog::open_repair` (`nothing to repair` if clean). Refuses missing files, non-files,
-/// logs held by a running broker (`AlreadyExists`), and newer-format logs (`Unsupported`).
 fn repair_log(log: &str) -> ExitCode {
     match std::fs::metadata(log) {
         Ok(m) if m.is_file() => {}
@@ -911,8 +754,6 @@ fn repair_log(log: &str) -> ExitCode {
         }
         Err(e) => {
             eprintln!("aterm link broker --repair: {log}: {e}");
-            // A newer format is refused by astream on the repair too, and
-            // aterm's line names the release that reads it.
             if e.kind() == std::io::ErrorKind::Unsupported {
                 if let Some(remedy) = log_refusal_remedy(e.kind(), log) {
                     eprintln!("aterm link broker --repair: {remedy}");
@@ -922,18 +763,14 @@ fn repair_log(log: &str) -> ExitCode {
         }
     };
     use std::io::Write as _;
-    // Written, never `println!`: a closed stdout must not panic the repair.
     let _ = writeln!(std::io::stdout().lock(), "{said}");
     ExitCode::SUCCESS
 }
 
 /// How often a serving broker looks at its executable: slow, because a
-/// replaced build can wait half a minute and the look is one `stat`.
 const EXE_WATCH: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// A file's identity (device, inode, length, mtime), so a replaced executable (a new inode
-/// renamed over the path, or the same inode rewritten) is told from the one a process started
-/// from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct FileId {
     dev: u64,
@@ -945,7 +782,6 @@ struct FileId {
 
 impl FileId {
     /// The regular file at `path`, symlinks followed: what a supervisor that runs `path` starts.
-    /// Errors on a failed `stat` or a path that is not a regular file.
     fn of(path: &std::path::Path) -> std::io::Result<Self> {
         use std::os::unix::fs::MetadataExt;
         let m = std::fs::metadata(path)?;
@@ -966,8 +802,6 @@ impl FileId {
 }
 
 /// The running image, not a pathname an update may already have replaced: on Linux
-/// `/proc/self/exe`'s metadata; elsewhere `crate::fabric::running_image_inode`, which keeps the
-/// original inode when `current_exe` names another file.
 enum RunningImage {
     File(FileId),
     #[cfg(not(target_os = "linux"))]
@@ -991,7 +825,6 @@ impl RunningImage {
             match (file, inode) {
                 (Some(file), Some(inode)) if file.ino == inode => Some(Self::File(file)),
                 (_, Some(inode)) => Some(Self::Inode(inode)),
-                // No OS image answer: the early file snapshot still catches a later swap.
                 (Some(file), None) => Some(Self::File(file)),
                 (None, None) => None,
             }
@@ -1008,7 +841,6 @@ impl RunningImage {
 }
 
 /// The supervisor's invocation, without resolving its final symlink. Watching
-/// `current_exe` on Linux instead would pin the old symlink target forever.
 fn invocation_path(
     argv0: &std::ffi::OsStr,
     path: Option<&std::ffi::OsStr>,
@@ -1049,23 +881,11 @@ impl ExeWatch {
 }
 
 /// Whether the broker's executable has been replaced, so it should exit for its supervisor to
-/// start the new build.
-///
-/// `start` is the running image, `seen` the previous look's file, `now` this look's. Replaced
-/// means a different file that is settled (the same on two looks running), so a build still
-/// being written is never the one started. A path that is gone or not a regular file (mid-swap,
-/// an uninstall) is not a replacement: exiting into a supervisor with nothing to start is an
-/// outage, so the broker keeps serving and looks again.
 fn replaced(start: &RunningImage, seen: Option<&FileId>, now: &std::io::Result<FileId>) -> bool {
     matches!(now, Ok(now) if !start.matches(now) && seen == Some(now))
 }
 
 /// `aterm link mint <grant> --secret-file <path>` — print one capability line.
-///
-/// A cap file is `<grant> <tag-hex>` lines, and `serve --cap-file` reads them.
-///
-/// The secret is a file, never an argument: an argv is world-readable in `ps`, and this is the
-/// key that mints every capability on the fleet.
 fn mint(args: &[String]) -> ExitCode {
     const USAGE: &str = "\
 usage: aterm link mint <grant> --secret-file <path>
@@ -1110,7 +930,6 @@ Prints one `<grant> <tag-hex>` line — append it to the file `serve --cap-file`
         eprint!("{USAGE}");
         return ExitCode::from(2);
     };
-    // The broker's own reader: a group-readable or short secret is refused here as there.
     let key = match transport::read_mint_secret(secret_path) {
         Ok(k) => k,
         Err(e) => {
@@ -1123,8 +942,7 @@ Prints one `<grant> <tag-hex>` line — append it to the file `serve --cap-file`
     };
     match astream_cap::mint(&key, grant) {
         Ok(cap) => {
-            // astream's one cap-file format; every reader splits at the last whitespace, so a
-            // grant whose filter holds a space still reads back.
+            // astream cap-file line format.
             minted_cap_to(
                 &mut std::io::stdout().lock(),
                 &astream_cap::capfile::format_line(&cap.filter, &cap.tag),
@@ -1218,7 +1036,6 @@ mod tests {
     }
 
     /// A replacement is a different file, settled over two looks (renamed over the path or
-    /// rewritten in place); the same file, or a gone or non-regular path, never is.
     #[test]
     fn a_broker_exits_only_for_a_settled_replacement_of_its_executable() {
         let dir = std::env::temp_dir().join(format!("atlink-exe-{}", std::process::id()));
@@ -1234,7 +1051,6 @@ mod tests {
             !replaced(&image, same.as_ref().ok(), &same),
             "the same file, looked at twice"
         );
-        // A new build renamed over the path: replaced once it is settled.
         std::fs::write(dir.join("aterm.new"), b"build two").expect("write");
         std::fs::rename(dir.join("aterm.new"), &exe).expect("rename over");
         let first = FileId::of(&exe);
@@ -1244,7 +1060,6 @@ mod tests {
         );
         let second = FileId::of(&exe);
         assert!(replaced(&image, first.as_ref().ok(), &second), "settled");
-        // The same inode rewritten in place is a replacement too.
         let rewritten = FileId::of(&exe).expect("now");
         std::fs::write(&exe, b"build three, longer").expect("rewrite in place");
         let again = FileId::of(&exe);
@@ -1253,7 +1068,6 @@ mod tests {
             again.as_ref().ok(),
             &FileId::of(&exe)
         ));
-        // Gone, or a directory in its place: never.
         std::fs::remove_file(&exe).expect("remove");
         let gone = FileId::of(&exe);
         assert!(gone.is_err());
@@ -1322,7 +1136,6 @@ mod tests {
             seen: None,
         };
 
-        // An update lands before readiness: the watch still compares with the captured image.
         let replacement = scratch.path().join("aterm.next");
         std::fs::write(&replacement, b"replacement image").expect("replacement");
         std::fs::rename(&replacement, &invocation).expect("replace before readiness");
@@ -1338,7 +1151,6 @@ mod tests {
             "negative control: a baseline captured after readiness misses the update"
         );
 
-        // A path replaced before the watch is built is compared with the OS's mapped image.
         let mut already_replaced = ExeWatch {
             path: invocation,
             start: RunningImage::capture().expect("this process's mapped executable"),
@@ -1349,10 +1161,8 @@ mod tests {
     }
 
     /// **`ls` PRINTS §7's ROW.** The columns with no writer are asserted
-    /// PRESENT and `-` ("unknown"), and no body moves an operator's cursor.
     #[test]
     fn ls_prints_section_7s_columns_one_safe_token_each() {
-        // §7's row in §7's order, then the six additions.
         let (body, _) = crate::body::Body::decode(
             b"v=1 t=1 inc=4 epoch=ab12 gen=9:beef state=live hold=0 holder=h-andrew \
               attention=needs%20a%20key",
@@ -1397,7 +1207,6 @@ mod tests {
             line.contains(" attention=needs%20a%20key ") && line.contains(" gen=9:beef "),
             "{line}"
         );
-        // The columns this body (a `minimal` bridge's) did not fill read `-`.
         for absent in [
             "role=-",
             "detail=-",
@@ -1411,13 +1220,11 @@ mod tests {
         ] {
             assert!(line.contains(absent), "{absent} missing from: {line}");
         }
-        // A NODE's row says what it runs, in the last two columns.
         let (node_body, _) = crate::body::Body::decode(
             b"v=1 t=1 state=live inc=2 fabric=connected host=m7 pid=1 proto=2 aterm=0.5.0",
         );
         let (line, _) = row("/f/f1/pub/n-a/node/presence", &node_body);
         assert!(line.ends_with(" proto=2 aterm=0.5.0"), "{line}");
-        // A `meta` row: the five are printed as written, in their columns.
         let (body, _) = crate::body::Body::decode(
             b"v=1 t=1 inc=4 state=live hold=0 holder=- attention=- role=worker \
               detail=claude phase=busy context=12%25 title=satcomp%20run",
@@ -1433,7 +1240,6 @@ mod tests {
             assert!(line.contains(present), "{present} missing from: {line}");
         }
 
-        // No escalation in all three spellings: absent, empty, and `-`.
         for quiet in [
             &b"v=1 t=1 state=live"[..],
             b"v=1 t=1 state=live attention=",
@@ -1446,7 +1252,6 @@ mod tests {
             assert!(!esc, "{}", String::from_utf8_lossy(quiet));
         }
 
-        // A hostile body still prints one token of printable ASCII per column.
         let (hostile, _) = crate::body::Body::decode(
             "v=1 t=1 state=\u{1b}[2J\u{1b}[H attention=%1B%5B31mred".as_bytes(),
         );
@@ -1461,7 +1266,6 @@ mod tests {
             "one token per column, always: {line:?}"
         );
 
-        // Every column is bounded by the cap the bridge and glance use.
         let long = format!("v=1 t=1 attention={}", "é".repeat(400));
         let (line, _) = row(
             "/f/f1/pub/n-a/s-w/presence",
@@ -1477,7 +1281,6 @@ mod tests {
             printed.len()
         );
         assert!(printed.ends_with(ELLIPSIS), "{printed}");
-        // The cut never lands inside a `%XX` escape.
         assert!(
             crate::pct::decode(printed).ends_with('…'),
             "the cut landed inside a %XX escape: {printed}"

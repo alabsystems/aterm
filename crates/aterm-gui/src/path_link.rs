@@ -1,114 +1,35 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE PLAIN-TEXT FILE CITATION: Cmd-click (Ctrl elsewhere) on
-//! `path[:line[:col]]` or `path#L12` that a program printed opens aterm's own
-//! editor tab at that line.
-//!
-//! Compilers (`src/main.rs:12:5`), grep (`src/lib.rs:40:`), Codex and Claude
-//! Code (`crates/foo/src/bar.rs:42`, `README.md#L7`) all print citations as
-//! plain text. One general reading serves every one of them; nothing here
-//! knows which program wrote the row (law 3).
-//!
-//! # What a citation may open, and what it may never do
-//!
-//! * It opens ONE thing: aterm's own editor, an inert document tab
-//!   (`App::open_document_tab_at`). It never reaches `open_url_external`:
-//!   [`decide`] is the one place a click becomes an action, and a
-//!   [`PathTarget`] has no arm that hands it to the OS. So the exec half of
-//!   aterm's `file:` refusal (`is_safe_url`, `NEVER_ALLOW_SCHEMES`) never
-//!   arises: no `.app` is launched and no handler runs.
-//! * It names an EXISTING REGULAR FILE ([`resolve`]): symlinks are resolved
-//!   (the tab opens the target, and the caption names the target), the
-//!   target must be readable, and a directory, an `.app` bundle (or anything
-//!   inside one), a FIFO or a device never qualifies.
-//! * A relative citation is resolved against the session's own directories
-//!   only: the foreground program's OS working directory (`agent_cwd`, the
-//!   directory a Codex or Claude Code shortened its citation against), then
-//!   the shell's OSC 7 report. Never aterm's own cwd: a session that names
-//!   no directory gets no relative link.
-//! * A citation resolves only while the session is known to run HERE
-//!   (`App::resolve_citation`), read when it is asked. The program in front
-//!   must be one aterm has named for the group in front right now and knows
-//!   runs on this machine ([`runs_here`]: a shell alone in the group it leads
-//!   and still a shell by the kernel's name, or an agent it identifies);
-//!   anything else in front (`ssh`,
-//!   `mosh`, `tmux`, `sudo`, `docker exec`, a pager, a script whose shell
-//!   runs `ssh` in its own group, a name not resolved yet) offers no
-//!   citation, so a remote or multiplexed session needs no list of remote
-//!   programs to be refused. The session's root shell in front while its
-//!   integration says a command runs (an `exec`) is refused, and the shell's
-//!   running command (`status detail=`) may not be a remote shell either
-//!   ([`is_remote_shell`]). And the shell's OSC 7 report, while it stands
-//!   ([`report_stands`]: under the group in front when aterm first saw it,
-//!   in a sweep that saw that group in front before it too), must not name
-//!   another host (`tab_label::names_this_machine`, the whole name).
-//! * What stays open: text an earlier remote session left on the screen,
-//!   read once a local shell is back in front, resolves against this
-//!   machine. So does what an identified agent prints of a remote tool it
-//!   runs (Claude Code running `ssh prod cat …`), and a runtime (`node`,
-//!   `bun`) aterm identifies by its screen may be a
-//!   wrapper around a remote one: the agent is local, its output's paths
-//!   need not be. A displayed OSC 7501 report does not identify its writer
-//!   and grants no local citation. On Linux the kernel reader here cannot
-//!   establish a complete group census, so a shell offers no citation.
-//! * Text carrying a control, format or default-ignorable character never
-//!   resolves ([`hides_text`]), nor does a file whose real (symlink resolved)
-//!   name carries one or is not UTF-8: the caption could not show what it
-//!   names. The one such character a name keeps is an emoji presentation
-//!   selector (U+FE0F) right after a character it turns into an emoji (`☁️`),
-//!   which changes what is drawn; a zero-width joiner (U+200D, the glue of an
-//!   emoji ZWJ sequence) or a redundant selector may hide a character and is
-//!   refused.
-//! * A click opens only what a caption showed: a citation opens only when
-//!   the caption the window last drew for that cell named that very file,
-//!   line and column; a URL under a standing caption only when it is the URL
-//!   the caption named. Otherwise nothing opens and the caption is asked
-//!   again (`App::open_link_under_pointer`).
-//! * The hover discloses where the click goes before the hand is used:
-//!   `opens in aterm: <path>:<line>` (`link_target::path_caption_row`), the
-//!   resolved path, so a symlink's real target is what the band names. It is
-//!   named where it really is, `~/…` under home or else in full
-//!   ([`display`]), never relative to a directory the band does not show. A
-//!   name too long for the band is cut at its head (`…/src/main.rs:12`), so
-//!   two captions can read alike and name two projects' files; the press
-//!   compares the whole path the drawn caption named, so it opens only that
-//!   one.
-//! * The filesystem is never looked at on the UI thread ([`Looks`]): a look
-//!   runs on its own thread, the UI waits a moment for it, and an answer not
-//!   back by then is no link yet. A hung or slow mount, an automount or a
-//!   dataless file costs at most that moment, once per citation.
+//! Plain-text file citation parsing and safe local path resolution.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
-/// The column marker a wide glyph's continuation cell carries in the row
-/// [`find_path_span`] reads: part of the token, contributing no character.
+/// Sentinel char for a wide glyph's continuation cell in [`find_path_span`].
 pub(crate) const WIDE_CONTINUATION: char = '\0';
 
 /// The longest token read as a path, in cells. A citation longer than this
-/// is not one a person reads, and the bound keeps a hover's work fixed.
 const MAX_TOKEN_CELLS: usize = 1024;
 
-/// One citation found in a row ([`find_path_span`]).
+/// Plain-text file citation span found in a row ([`find_path_span`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PathSpan {
-    /// The path as printed (no line suffix).
+    /// Printed path without `:line[:col]` or `#L` suffix.
     pub(crate) path: String,
-    /// The 1-based line the citation names, if any.
+    /// Optional 1-based line number.
     pub(crate) line: Option<u32>,
-    /// The 1-based column the citation names, if any.
+    /// Optional 1-based column number.
     pub(crate) col: Option<u32>,
-    /// First column of the span (inclusive).
+    /// Inclusive start column.
     pub(crate) start: usize,
-    /// Last column of the span (inclusive).
+    /// Inclusive end column.
     pub(crate) end: usize,
 }
 
 /// Characters that end a path token: whitespace, the quotes and brackets a
-/// citation is wrapped in, and the pipes of a table.
 fn is_delimiter(ch: char) -> bool {
     ch.is_whitespace()
         || matches!(
@@ -131,11 +52,9 @@ fn positive(digits: &str) -> Option<u32> {
 }
 
 /// Split a token into `(path, line, col)`: `path:L[:C]` or `path#L<l>[C<c>]
-/// [-L<m>[C<n>]]`. A suffix that does not parse stays part of the path.
 fn split_suffix(token: &str) -> (&str, Option<u32>, Option<u32>) {
     if let Some(hash) = token.rfind("#L") {
         let frag = &token[hash + 2..];
-        // `#L4-L9` and `#L4-9`: the range starts at its first line.
         let first = frag.split('-').next().unwrap_or("");
         let (line, col) = match first.split_once('C') {
             Some((l, c)) => (positive(l), positive(c)),
@@ -145,7 +64,6 @@ fn split_suffix(token: &str) -> (&str, Option<u32>, Option<u32>) {
             return (&token[..hash], line, col);
         }
     }
-    // `path:12:3` or `path:12`.
     if let Some((head, last)) = token.rsplit_once(':')
         && let Some(n) = positive(last)
     {
@@ -160,10 +78,6 @@ fn split_suffix(token: &str) -> (&str, Option<u32>, Option<u32>) {
 }
 
 /// Whether `path` reads as a file path at all: it has a separator or an
-/// extension, and a letter or digit somewhere. Keeps ordinary words from
-/// costing a filesystem look on every hover. On Windows a backslash is a
-/// separator too (`C:\proj\Makefile`, `src\main.rs`), as Windows programs
-/// print it.
 fn looks_like_path(path: &str) -> bool {
     if path.is_empty() || !path.chars().any(char::is_alphanumeric) {
         return false;
@@ -175,12 +89,7 @@ fn looks_like_path(path: &str) -> bool {
         .is_some_and(|(_, ext)| !ext.is_empty() && ext.chars().all(char::is_alphanumeric))
 }
 
-/// Find a plain-text citation covering column `col` of a row of chars (one
-/// char per column; [`WIDE_CONTINUATION`] for a wide glyph's second column).
-/// The span runs between delimiters ([`is_delimiter`]), so a path never
-/// spans a space; trailing sentence punctuation is trimmed
-/// (`see src/a.rs:12.` yields `src/a.rs` line 12). A URL (`://`) is not a
-/// citation: the URL reader owns it.
+/// Find a plain-text file citation covering column `col` of `chars`.
 pub(crate) fn find_path_span(chars: &[char], col: usize) -> Option<PathSpan> {
     let at = *chars.get(col)?;
     let in_token = |ch: char| ch == WIDE_CONTINUATION || !(is_delimiter(ch) || ch.is_control());
@@ -191,15 +100,13 @@ pub(crate) fn find_path_span(chars: &[char], col: usize) -> Option<PathSpan> {
     while start > 0 && in_token(chars[start - 1]) {
         start -= 1;
     }
-    let mut end = col; // exclusive bound below
+    let mut end = col;
     while end < chars.len() && in_token(chars[end]) {
         end += 1;
     }
     if end - start > MAX_TOKEN_CELLS {
         return None;
     }
-    // A wide continuation that opens the token belongs to a glyph that is not
-    // in it; skip it.
     while start < end && chars[start] == WIDE_CONTINUATION {
         start += 1;
     }
@@ -229,44 +136,30 @@ pub(crate) fn find_path_span(chars: &[char], col: usize) -> Option<PathSpan> {
     })
 }
 
-/// Why a citation opens nothing ([`resolve`]).
+/// Reason a file citation refuses to open ([`resolve`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PathRefusal {
-    /// The text, or the real name of the file it names, carries a control,
-    /// format or default-ignorable character ([`hides_text`]), or that real
-    /// name is not UTF-8.
+    /// Path or canonical target contains a control, format, or non-printable character ([`hides_text`]).
     Control,
-    /// A relative path, and the session names no directory to resolve it in.
+    /// Relative path with no session base directory.
     NoBase,
-    /// Nothing exists there (or `~user`, which is never expanded).
+    /// Target does not exist (or starts with unexpanded `~user`).
     Missing,
-    /// A directory.
+    /// Target is a directory.
     Directory,
-    /// An `.app` bundle, or a file inside one.
+    /// Target is or lies inside an `.app` bundle.
     AppBundle,
-    /// It exists but is not a regular file (a FIFO, a socket, a device).
+    /// Target exists but is not a regular file.
     NotRegular,
-    /// A regular file this process cannot open for reading.
+    /// Target is a regular file that cannot be opened for reading.
     Unreadable,
 }
 
 /// Characters that may reorder, hide or impersonate text, by general rule
-/// rather than by list of known tricks: every control (general category `Cc`,
-/// [`char::is_control`]), every format character (`Cf`: the bidi marks,
-/// embeddings, overrides and isolates, the zero-width characters, the word
-/// joiner and invisible operators, the soft hyphen, the Arabic letter mark,
-/// the BOM, the tag characters, …), and every other code point Unicode says
-/// a renderer draws as nothing (`Default_Ignorable_Code_Point`: the
-/// combining grapheme joiner, the Hangul fillers, the Khmer inherent vowels,
-/// the Mongolian free variation selectors, the variation selectors and their
-/// supplement, and the unassigned rest of the tag plane). Tables from Unicode
-/// 16.0 (`DerivedGeneralCategory.txt`, `DerivedCoreProperties.txt`); a
-/// character a later version adds to `Cf` is one more row here.
 fn is_hostile_char(ch: char) -> bool {
     ch.is_control()
         || matches!(
             ch,
-            // Cf and Default_Ignorable_Code_Point, merged and sorted.
             '\u{00ad}'
                 | '\u{034f}'
                 | '\u{0600}'..='\u{0605}'
@@ -295,13 +188,7 @@ fn is_hostile_char(ch: char) -> bool {
         )
 }
 
-/// Whether `text` carries a character that may hide or impersonate what is
-/// drawn ([`is_hostile_char`]), read in context: an emoji presentation
-/// selector (U+FE0F) right after a character whose default is text
-/// presentation ([`aterm_grapheme::is_vs16_emoji_capable`]: `☁`, `❤`, a
-/// keycap's digit) turns it into an emoji, a visible change, and is kept.
-/// After anything else (a letter, an emoji already drawn as one) it changes
-/// nothing on screen and is refused, as is every zero-width joiner.
+/// Whether `text` contains any control, bidi/format, or default-ignorable character that can hide or spoof text.
 pub(crate) fn hides_text(text: &str) -> bool {
     let mut prev = None;
     for ch in text.chars() {
@@ -314,49 +201,20 @@ pub(crate) fn hides_text(text: &str) -> bool {
     false
 }
 
-/// What [`runs_here`] reads of the program in front of a session, each fact
-/// read when the citation is asked (`App::resolve_citation`).
+/// Foreground process facts read by [`runs_here`] when resolving a citation.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Front<'a> {
-    /// The status sweep's published name for the group in front (`status
-    /// program=`, its leader's `argv[0]` word), believed only for that group.
+    /// Published foreground process name (`status program=`).
     pub(crate) program: Option<&'a str>,
-    /// The agent aterm identifies in front (`harness_host::identified_agent`:
-    /// by its own name, or a runtime like `node` by its screen).
+    /// Identified agent in the foreground (`harness_host::identified_agent`).
     pub(crate) agent: Option<aterm_phase::Program>,
-    /// The group in front is the session's own root shell's (its pid leads it).
+    /// Whether the foreground process group is the session's root shell.
     pub(crate) root: bool,
-    /// The shell's integration says it is running a command (a block it opened
-    /// is executing, `quit_safety::shell_executing`, or `status detail=` names
-    /// one).
+    /// Whether shell integration reports a command currently executing.
     pub(crate) running: bool,
 }
 
-/// Whether the program in front of a session is known to run on THIS
-/// machine, so the paths it prints name this machine's files. An allow-list
-/// by construction: anything else (a remote shell, a multiplexer whose panes
-/// may be remote, a wrapper that opens its own terminal, a program not named
-/// yet) is not known to, and offers no citation (`App::resolve_citation`).
-///
-/// * A SHELL (`quit_safety::is_shell_name`) only when it is what the person
-///   types into: alone in the group it leads, and still a shell now
-///   (`lone_leader`, the kernel's name for the group's leader when no other
-///   process is in its group: `aterm_sysprobe::lone_group_leader`). A
-///   non-interactive shell (a script, `sh -c`) keeps every child it starts in
-///   its own group, so `./prod.sh` running `ssh prod` leads a group the ssh
-///   is in, and is refused; an interactive shell gives each job a group of
-///   its own, so at its prompt it is alone. The kernel's name moves the
-///   moment an `exec` replaces the shell (`exec tmux`, `exec docker exec …`),
-///   before the sweep names the new program. And the session's own root
-///   shell, in front while its integration says it runs a command (an
-///   `exec`, which no prompt follows), is refused.
-/// * An agent aterm identifies (`harness_host::identified_agent`).
-///
-/// A displayed OSC 7501 report identifies no writer: an unseen old report
-/// may cross a foreground move, so it grants no local citation to an
-/// otherwise unidentified runtime.
-///
-/// `lone_leader` is asked only of a shell.
+/// Whether the foreground program is known to run locally on this machine.
 pub(crate) fn runs_here(front: &Front<'_>, lone_leader: impl FnOnce() -> Option<String>) -> bool {
     let Some(program) = front.program else {
         return false;
@@ -368,9 +226,7 @@ pub(crate) fn runs_here(front: &Front<'_>, lone_leader: impl FnOnce() -> Option<
     front.agent.is_some()
 }
 
-/// [`runs_here`]'s shipping `lone_leader` (`SessionFactory::lone_leader`):
-/// the kernel's name for group `pgid`'s leader while it is alone in it
-/// (`aterm_sysprobe::lone_group_leader`), `None` for no group.
+/// Kernel process name for `pgid`'s leader when it is the sole member of its process group.
 pub(crate) fn lone_leader(pgid: i32) -> Option<String> {
     u32::try_from(pgid)
         .ok()
@@ -378,28 +234,14 @@ pub(crate) fn lone_leader(pgid: i32) -> Option<String> {
         .and_then(aterm_sysprobe::lone_group_leader)
 }
 
-/// Whether the engine's cwd report `seq` (`Terminal::reported_cwd_seq`)
-/// still speaks for the session with group `front` in front, given the
-/// status sweep's `witness` (`SessionTimeline::cwd_witness`: the report and
-/// the group in front when the sweep first saw it). A report stands under
-/// the group it was made under, so an OSC 7 an ssh's remote shell sent says
-/// nothing once the local shell is back in front, and neither its host nor
-/// its directory is read. A report newer than the sweep's last look stands
-/// (it may be the remote's own: its host is read). A cwd a checkpoint
-/// carried (`None`) was made under a group this process never saw, and
-/// does not stand, nor does one the sweep first saw as the front moved (held
-/// to no group, `0`: `SessionTimeline::witness_cwd_report`).
+/// Whether cwd report `seq` still applies to foreground process group `front`.
 pub(crate) fn report_stands(seq: Option<u64>, witness: Option<(u64, i32)>, front: i32) -> bool {
     seq.is_some_and(|seq| {
         witness.is_none_or(|(seen, group)| seen != seq || (group > 0 && group == front))
     })
 }
 
-/// The remote shells: a program in front by one of these names runs its
-/// session on another machine, so the directory every local reading names
-/// for it (its own OS cwd, a stale OSC 7) is not where its output's paths
-/// live. Matched on the program's word as `status program=` and `detail=`
-/// spell it (the `argv[0]` basename; the running command's program).
+/// Whether `program` is a remote-shell client (`ssh`, `mosh`, `docker`, etc.).
 pub(crate) fn is_remote_shell(program: &str) -> bool {
     let word = program.split_whitespace().next().unwrap_or("");
     let word = word.rsplit('/').next().unwrap_or(word);
@@ -427,9 +269,6 @@ fn admit(candidate: &Path) -> Result<PathBuf, PathRefusal> {
     if !meta.is_file() {
         return Err(PathRefusal::NotRegular);
     }
-    // Readable, asked of what the open reached: never blocking (a FIFO swapped in
-    // after the look above opens at once instead of waiting for a writer), never
-    // through a link swapped in, and still a regular file once open.
     let file = open_for_look(&canonical).map_err(|_| PathRefusal::Unreadable)?;
     if !file.metadata().is_ok_and(|opened| opened.is_file()) {
         return Err(PathRefusal::NotRegular);
@@ -449,11 +288,7 @@ fn open_for_look(path: &Path) -> std::io::Result<std::fs::File> {
     options.open(path)
 }
 
-/// Resolve a printed path to the canonical regular file it names: `~/…`
-/// against `home`, an absolute path as itself, a relative one against each of
-/// `bases` in order (the session's `agent_cwd`, then its OSC 7 cwd). The first
-/// candidate that is an admissible file wins; else the refusal of the first
-/// candidate that exists (a directory says so), else [`PathRefusal::Missing`].
+/// Resolve `raw` against `bases` and `home` to a canonical readable regular file.
 pub(crate) fn resolve(
     raw: &str,
     bases: &[PathBuf],
@@ -465,7 +300,6 @@ pub(crate) fn resolve(
     if hides_text(raw) {
         return Err(PathRefusal::Control);
     }
-    // `~\…` is the same citation where a backslash separates (Windows).
     let home_relative = raw.starts_with("~/") || (cfg!(windows) && raw.starts_with("~\\"));
     let candidates: Vec<PathBuf> = if raw == "~" || home_relative {
         let home = home.ok_or(PathRefusal::Missing)?;
@@ -488,11 +322,6 @@ pub(crate) fn resolve(
     let mut refusal = None;
     for candidate in &candidates {
         match admit(candidate) {
-            // The caption names the real file; a name it could not show
-            // honestly is no link (a symlink's target may carry what the
-            // printed text does not).
-            // A name that is not UTF-8 would be drawn with replacement
-            // characters, which two different names can share.
             Ok(path) if path.to_str().is_none_or(hides_text) => {
                 refusal.get_or_insert(PathRefusal::Control);
             }
@@ -506,22 +335,21 @@ pub(crate) fn resolve(
     Err(refusal.unwrap_or(PathRefusal::Missing))
 }
 
-/// A citation resolved to a file aterm may open ([`resolve`]).
+/// Resolved file citation ready to open ([`resolve`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PathTarget {
-    /// The canonical regular file.
+    /// Canonical regular file path.
     pub(crate) path: PathBuf,
-    /// The 1-based line to reveal.
+    /// Optional 1-based line number.
     pub(crate) line: Option<u32>,
-    /// The 1-based column to reveal.
+    /// Optional 1-based column number.
     pub(crate) col: Option<u32>,
-    /// What the caption names ([`display`]).
+    /// Display caption ([`display`]).
     pub(crate) shown: String,
 }
 
 impl PathTarget {
-    /// Resolve `span` against the session's `bases` ([`resolve`]), on this
-    /// thread: the filesystem is looked at here. The UI asks through [`Looks`].
+    /// Resolve `span` synchronously against `bases` and `home`.
     #[cfg(test)]
     pub(crate) fn resolve(
         span: &PathSpan,
@@ -544,7 +372,6 @@ impl PathTarget {
 }
 
 /// What the filesystem is asked about one citation: the printed path and the
-/// directories it is read against.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct Question {
     raw: String,
@@ -563,41 +390,28 @@ impl Question {
 }
 
 /// What a look found: the canonical file and the caption's name for it (no
-/// line), or why it opens nothing.
 type Found = Result<(PathBuf, String), PathRefusal>;
 
 /// The look itself: [`resolve`], then the caption's name: the file where it
-/// really is (`~/…` under home, else in full), never relative to one of the
-/// session's directories, which the band does not show. A citation printed
-/// relative names a different file in each project that has one; two
-/// captions that read alike must name one file, so a press refused because
-/// the target moved under the pointer is seen to have moved.
 fn look(question: &Question) -> Found {
     let path = resolve(&question.raw, &question.bases, question.home.as_deref())?;
     let name = display(&path, None, None, None, question.home.as_deref());
     Ok((path, name))
 }
 
-/// How long the UI waits for a look: far past a local file's (well under a
-/// millisecond), short enough that a hung mount is a hitch, not a freeze.
+/// Maximum UI wait per filesystem lookup.
 pub(crate) const UI_WAIT: Duration = Duration::from_millis(25);
 
 /// How long a known answer is reused: a pointer resting on a citation while
-/// output streams asks once, not on every frame.
 const LOOK_FRESH: Duration = Duration::from_secs(2);
 
 /// Looks in flight at once, at most: a hung mount strands no more threads than
-/// this, and a citation asked past it is no link until one comes back.
 const LOOKS_IN_FLIGHT: usize = 4;
 
 /// Answers kept, at most; the stale ones go first.
 const LOOKS_KEPT: usize = 256;
 
-/// THE UI'S WAY TO THE FILESYSTEM for a citation. Each new question is looked
-/// at on its own thread; the asker waits up to `wait` for it, and an answer
-/// not back by then is `None` (no link yet: the next pointer motion or frame
-/// asks again and finds it). A question already in flight is never waited on
-/// twice. Answers are reused for [`LOOK_FRESH`].
+/// Bounded background filesystem resolver and cache for UI citation lookups.
 pub(crate) struct Looks {
     book: Arc<(Mutex<Book>, Condvar)>,
     wait: Duration,
@@ -632,7 +446,7 @@ impl Book {
 }
 
 impl Looks {
-    /// Looks the UI waits on for at most `wait` each.
+    /// Create a resolver that waits up to `wait` per lookup.
     pub(crate) fn new(wait: Duration) -> Self {
         Self {
             book: Arc::new((Mutex::new(Book::default()), Condvar::new())),
@@ -640,8 +454,7 @@ impl Looks {
         }
     }
 
-    /// `span` resolved against `bases`: `Some` once the filesystem has
-    /// answered, `None` while it has not (see [`Looks`]).
+    /// Resolve `span` against `bases` and `home`, returning `None` while the lookup is still in flight.
     pub(crate) fn target(
         &self,
         span: &PathSpan,
@@ -649,7 +462,6 @@ impl Looks {
         home: Option<&Path>,
     ) -> Option<Result<PathTarget, PathRefusal>> {
         let question = Question::new(&span.path, bases, home);
-        // The text alone refuses without a look.
         if question.raw.is_empty() {
             return Some(Err(PathRefusal::Missing));
         }
@@ -717,10 +529,7 @@ impl Looks {
     }
 }
 
-/// The caption's name for a resolved file: relative to `base` when it lies
-/// under it (canonically, so `/tmp` and `/private/tmp` agree), else `~/…` under
-/// `home` (`~\…` on Windows, in the separator the rest is written in), else
-/// absolute ([`plain_text`]); then `:line[:col]`.
+/// Format a resolved `target` for display relative to `base` or `home`, appending `:line[:col]`.
 pub(crate) fn display(
     path: &Path,
     line: Option<u32>,
@@ -746,10 +555,6 @@ pub(crate) fn display(
 }
 
 /// `path` as a person reads it. On Windows without the `\\?\` prefix
-/// `std::fs::canonicalize` puts on every path it resolves (`\\?\C:\x` reads
-/// `C:\x`, `\\?\UNC\host\share` reads `\\host\share`): no shell prints it,
-/// and the caption named every citation's file with it. Elsewhere the path
-/// as it is.
 fn plain_text(path: &Path) -> String {
     let text = path.to_string_lossy();
     if cfg!(windows) {
@@ -776,22 +581,18 @@ fn with_line(mut text: String, line: Option<u32>, col: Option<u32>) -> String {
     text
 }
 
-/// What a link click does ([`decide`]).
+/// Action chosen for a link click ([`decide`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum LinkAction {
-    /// Hand an allowlisted URL to the OS (`open_url_external`).
+    /// Open an allowlisted URL externally.
     External(String),
-    /// Open aterm's own editor tab on a resolved citation.
+    /// Open a resolved file citation in aterm's editor tab.
     Document(PathTarget),
-    /// Nothing opens; the press goes on as an ordinary press.
+    /// Perform no link action.
     Nothing,
 }
 
-/// THE ONE PLACE A LINK CLICK BECOMES AN ACTION. The URL under the pointer (an
-/// OSC 8 hyperlink or a plain-text URL) wins, and only an `is_safe_url` one
-/// opens, through the OS. Only with no URL there is a resolved citation
-/// opened, and only ever in aterm's own editor: no arm turns a [`PathTarget`]
-/// into [`LinkAction::External`].
+/// Choose the [`LinkAction`] for a link click from optional URL and resolved path targets.
 #[must_use]
 pub(crate) fn decide(url: Option<String>, path: Option<PathTarget>) -> LinkAction {
     match (url, path) {
@@ -802,9 +603,7 @@ pub(crate) fn decide(url: Option<String>, path: Option<PathTarget>) -> LinkActio
     }
 }
 
-/// The 1-based `(line, col)` as a byte offset into `text`: the line's start
-/// (the last line when `line` is past the end), then `col - 1` characters
-/// into it, never past its end. Pure; the editor's caret lands here.
+/// Convert a 1-based `(line, col)` into a UTF-8 byte offset in `text`.
 #[must_use]
 pub(crate) fn line_col_offset(text: &str, line: u32, col: Option<u32>) -> usize {
     let mut start = 0;

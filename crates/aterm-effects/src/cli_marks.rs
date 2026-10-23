@@ -1,54 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE TOP LINE'S MARKS: one drawn icon and one brand colour per agent CLI.
-//! The owner: "each CLI has an emoji-sized icon and color on the left
-//! side of the top line of CLI to standardize". Every agent CLI's top line
-//! opens, two cells in, with the same LOCKUP: a pad cell, the icon over two
-//! cells, a pad cell, the CLI's name in its brand ink, a trailing pad
-//! (`──[##]claude ────`, [`CliMark::lockup_cells`]).
-//!
-//! This module is the art and its law, and draws nothing itself: the host
-//! (the composer footer's top line) lays the cells and hands the renderer
-//! [`layer`]. It holds:
-//!
-//! * **The brand table** ([`brand`]): one row per mark, one exhaustive match,
-//!   so a new [`CliMark`] does not compile until its row is written. A row is
-//!   the CLI's word, its name inks and icon inks for both polarities, and its
-//!   masters: an SD drawing and, where one is drawn, an HD drawing at twice
-//!   the design scale. Each master is art strings for
-//!   [`aterm_render::fx::indexed`]: `'.'` is transparent and `chars[k]` is
-//!   texel `k + 1`, which paints palette entry `k` ([`Texel`] says how).
-//! * **The fit law** ([`fit`]): which master at which integer scale fills the
-//!   icon's box (two cells wide, one row tall) with a pixel of air above and
-//!   below. An integer scale makes whole texel blocks under pixel law F, so a
-//!   mark is crisp at every scale and never sampled.
-//! * **The inks** ([`name_fg`], [`icon_palette`]): the name is text, held to
-//!   4.5:1 on its ground; the icon is a graphic, held to 3:1 (WCAG 1.4.11).
-//!   Both floors move lightness alone ([`floor_contrast_keeping_hue`]), so the
-//!   hue holds, and on a dark ground no brand ink moves. Polarity is the
-//!   harness card's own test ([`dark_ground`] of the cell's background), so
-//!   the icon, the name and the switch letters flip together.
-//! * **The payload** ([`content`], [`layer`]): one sprite of the fitted
-//!   master over that palette, sealed once per key; the host keeps the last
-//!   few and hands the same `Arc` frame after frame, so a mark at rest costs
-//!   the renderer one pointer compare.
-//!
-//! # Keyed by its own enum
-//!
-//! The brand table matches on [`CliMark`], not on `aterm_phase::Program`:
-//! this crate is host-agnostic and does not link the phase reader (the host
-//! reads the screen and hands the effects plain data, as it does the harness
-//! card's place). A mark is named by the CLI's lowercase word
-//! ([`CliMark::for_app`]), the same canonical app id the kitty registry keys
-//! its flagship art by, and the same word `Program::name` prints; the host
-//! maps its `Program` onto a mark with an exhaustive match of its own. That
-//! is also why Grok has a row while the reader has no `Program::Grok`: its
-//! word, inks and masters are ready as data, and nothing draws them until the
-//! host can read a Grok top line and maps a program onto [`CliMark::Grok`].
-//!
-//! The brand marks identify the program running in the pane (nominative use
-//! inside the terminal), never aterm's own branding.
+//! Agent CLI top-line brand marks, icons, and contrast-floored palettes.
 
 use std::sync::{Arc, OnceLock};
 
@@ -61,50 +14,43 @@ use aterm_render::premul_rgb;
 use crate::color_math::floor_contrast_keeping_hue;
 use crate::harness_card::dark_ground;
 
-/// The contrast a CLI's name holds on its ground (WCAG 1.4.3, text).
+/// Minimum WCAG contrast ratio for a CLI's name against its ground.
 pub const NAME_CONTRAST: f32 = 4.5;
 
-/// The contrast every icon ink but a [`Texel::Hole`] holds on its ground
-/// (WCAG 1.4.11, graphics).
+/// Minimum WCAG contrast ratio for non-hole icon texels against their ground.
 pub const ICON_CONTRAST: f32 = 3.0;
 
-/// The opacity of a half-tone texel ([`Texel::Half`]): its full ink at
-/// alpha 128, premultiplied, an antialiased edge over any ground.
+/// Alpha value for half-tone texels ([`Texel::Half`]).
 pub const HALF_ALPHA: u8 = 128;
 
-/// The cells the icon's box spans: the sprite is drawn over two blank cells.
+/// Width of the icon box in terminal cells.
 pub const ICON_CELLS: u16 = 2;
 
-/// The rows of air the fit keeps clear inside the box, one pixel above and one
-/// below, so a mark never touches the rows around it.
+/// Vertical padding rows kept clear inside the icon box.
 pub const AIR_PX: u16 = 2;
 
-/// The cells the icon takes in the lockup without the name: a pad, the
-/// [`ICON_CELLS`] the sprite covers, a pad.
+/// Total cell span of the icon run before the CLI name.
 pub const ICON_RUN: usize = 2 + ICON_CELLS as usize;
 
-/// An agent CLI that wears a mark on its top line.
+/// Agent CLI that wears a brand mark on its top line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CliMark {
-    /// Claude Code: its whole mascot, in its terracotta.
+    /// Claude Code.
     Claude,
-    /// Codex (and codex-alab, whose lockup names it apart): the OpenAI
-    /// knot, in OpenAI blue.
+    /// OpenAI Codex (and `codex-alab`).
     Codex,
-    /// Google's Antigravity CLI: its own launch banner, in the colours it
-    /// paints it.
+    /// Google Antigravity CLI.
     Agy,
-    /// Meta's Muse Code: the `◈` its status row cycles.
+    /// Meta Muse Code.
     Muse,
-    /// Google's Gemini CLI: the four-point sparkle in its own gradient.
+    /// Google Gemini CLI.
     Gemini,
-    /// xAI's Grok: the slashed ring, monochrome. No reader maps a program
-    /// onto it yet.
+    /// xAI Grok.
     Grok,
 }
 
 impl CliMark {
-    /// Every mark, in declaration order (each at its own discriminant).
+    /// All marks in declaration order.
     pub const ALL: [CliMark; 6] = [
         CliMark::Claude,
         CliMark::Codex,
@@ -114,9 +60,7 @@ impl CliMark {
         CliMark::Grok,
     ];
 
-    /// The mark for a CLI's lowercase word (the canonical app id
-    /// `kitty_registry` keys flagship art by, and `Program::name`'s word);
-    /// `None` for any other program.
+    /// Look up the mark for a canonical lowercase CLI app id.
     #[must_use]
     pub const fn for_app(app_id: &str) -> Option<Self> {
         let target = app_id.as_bytes();
@@ -138,16 +82,13 @@ impl CliMark {
         None
     }
 
-    /// The CLI's own lowercase word: its canonical app id, and the name a
-    /// vendor build's lockup prints.
+    /// Canonical lowercase word for this CLI.
     #[must_use]
     pub const fn word(self) -> &'static str {
         brand(self).word
     }
 
-    /// The name the lockup prints for `build`: the ALab build's own word
-    /// where the brand table names one apart ([`Brand::alab_word`]:
-    /// `codex-alab`), else the CLI's [`word`](Self::word).
+    /// Display name printed by the lockup for `build`.
     #[must_use]
     pub const fn name(self, build: Build) -> &'static str {
         match (build, brand(self).alab_word) {
@@ -156,54 +97,45 @@ impl CliMark {
         }
     }
 
-    /// The cells the whole lockup takes for `build`: [`ICON_RUN`], the
-    /// [`name`](Self::name), a trailing pad. The same with or without a
-    /// sprite drawn ([`fit`] refusing one leaves blank cells), so the layout
-    /// never moves.
+    /// Total cell width of the lockup for `build`.
     #[must_use]
     pub const fn lockup_cells(self, build: Build) -> usize {
         ICON_RUN + self.name(build).len() + 1
     }
 }
 
-/// Which build of a CLI a pane runs, as the host proves it: the vendor's, or
-/// ALab's own (codex-alab: a Codex the host admits, by its proven
-/// self-claim, aterm's copy of its record or its ALab image). The icon and
-/// the inks are the CLI's either way; only the name the lockup prints may
-/// differ ([`CliMark::name`]).
+/// Proven build provenance of the CLI running in a pane.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum Build {
-    /// The vendor's build, or one the host has not proven ALab's.
+    /// Vendor build (or unproven).
     #[default]
     Vendor,
-    /// ALab's build, proven.
+    /// Proven ALab build.
     Alab,
 }
 
 impl Build {
-    /// Both builds, the vendor's first.
+    /// Both builds, vendor first.
     pub const ALL: [Build; 2] = [Build::Vendor, Build::Alab];
 }
 
-/// How a master's character paints: the palette entry its texel names.
+/// How a master character paints in the icon palette.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Texel {
-    /// Icon ink `i` of the polarity ([`Brand::icon`]), floored to
-    /// [`ICON_CONTRAST`], opaque.
+    /// Opaque icon ink `i` ([`Brand::icon`]), contrast-floored to [`ICON_CONTRAST`].
     Ink(u8),
-    /// Icon ink `i`, floored as [`Texel::Ink`] floors it, at [`HALF_ALPHA`].
+    /// Contrast-floored icon ink `i` at [`HALF_ALPHA`].
     Half(u8),
-    /// A hole the mark paints in exactly this `0x00RRGGBB`, never floored:
-    /// Claude's black eyes, as Claude paints them.
+    /// Unfloored exact `0x00RRGGBB` hole colour.
     Hole(u32),
 }
 
-/// A pair of ink lists, one per polarity.
+/// Dark-ground and paper-ground ink lists.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Inks {
-    /// On a dark ground.
+    /// Inks on a dark ground.
     pub dark: &'static [u32],
-    /// On paper.
+    /// Inks on a paper ground.
     pub paper: &'static [u32],
 }
 
@@ -216,24 +148,24 @@ impl Inks {
         }
     }
 
-    /// The list for a ground of polarity `dark`.
+    /// Select the ink list for ground polarity `dark`.
     #[must_use]
     pub const fn on(self, dark: bool) -> &'static [u32] {
         if dark { self.dark } else { self.paper }
     }
 }
 
-/// Which drawing of a mark.
+/// Resolution tier of a mark drawing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Master {
-    /// The standard drawing, design scale 1.
+    /// Standard-definition drawing (design scale 1).
     Sd,
-    /// The fine drawing, design scale 2 (twice the SD's texels a side).
+    /// High-definition drawing (design scale 2).
     Hd,
 }
 
 impl Master {
-    /// The scale the drawing was designed at: one HD texel is half an SD one.
+    /// Design scale factor of this master.
     #[must_use]
     pub const fn design_scale(self) -> u16 {
         match self {
@@ -243,32 +175,29 @@ impl Master {
     }
 }
 
-/// One row of the brand table.
+/// Brand specification row for one [`CliMark`].
 #[derive(Debug, Clone, Copy)]
 pub struct Brand {
-    /// The CLI's word: the name a vendor build's lockup prints.
+    /// Vendor lockup word.
     pub word: &'static str,
-    /// The name an ALab build's lockup prints, where aterm tells that build
-    /// apart (the owner calls aterm's Codex build "codex-alab"); `None`: the
-    /// [`word`](Self::word) for every build.
+    /// ALab lockup word, if distinct.
     pub alab_word: Option<&'static str>,
-    /// The name's inks before the floor: one for the whole word, or one a
-    /// letter.
+    /// Name inks before contrast flooring.
     pub name: Inks,
-    /// The icon's full inks before the floor, indexed by [`Texel`].
+    /// Icon inks before contrast flooring.
     pub icon: Inks,
-    /// The masters' characters: `chars[k]` is texel `k + 1`.
+    /// Master character table (`chars[k]` maps to texel `k + 1`).
     pub chars: &'static [u8],
-    /// How each character paints: `texels[k]` is `chars[k]`'s.
+    /// Texel mapping for each entry in `chars`.
     pub texels: &'static [Texel],
-    /// The standard drawing.
+    /// Standard-definition sprite rows.
     pub sd: &'static [&'static str],
-    /// The fine drawing, where one is drawn.
+    /// High-definition sprite rows, if any.
     pub hd: Option<&'static [&'static str]>,
 }
 
 impl Brand {
-    /// The drawing `master`, if this mark has one.
+    /// Sprite rows for `master`, if present.
     #[must_use]
     pub const fn master(&self, master: Master) -> Option<&'static [&'static str]> {
         match master {
@@ -278,8 +207,7 @@ impl Brand {
     }
 }
 
-/// The brand table: each mark's row. One exhaustive match, so a new mark does
-/// not compile until its row is written.
+/// Look up the [`Brand`] specification for `mark`.
 #[must_use]
 pub const fn brand(mark: CliMark) -> &'static Brand {
     match mark {
@@ -293,7 +221,6 @@ pub const fn brand(mark: CliMark) -> &'static Brand {
 }
 
 /// Claude Code. MEASURED: the mascot's `38;2;215;119;87` and the eyes'
-/// `48;2;0;0;0` (2.1.304), on every ground.
 const CLAUDE: Brand = Brand {
     word: "claude",
     alab_word: None,
@@ -306,8 +233,6 @@ const CLAUDE: Brand = Brand {
 };
 
 /// Codex: the owner's "OpenAI blue". Codex itself draws no brand colour
-/// (`>_ OpenAI Codex` in bold, `/model` in ANSI cyan, 0.154). ALab's build
-/// prints the owner's name for it, `codex-alab`, in the same ink.
 const CODEX: Brand = Brand {
     word: "codex",
     alab_word: Some("codex-alab"),
@@ -320,17 +245,6 @@ const CODEX: Brand = Brand {
 };
 
 /// agy. MEASURED on screen (1.4.4 in the real-agy lab, 2026-10-21, `ctl
-/// cell` of every banner cell): the banner is one fixed two-dimensional
-/// gradient, the same on a dark and a light ground and at every launch —
-/// gold to red over the apex, green to teal down the left leg, violet to
-/// blue down the right — and its `▀` cells carry a colour in their
-/// background too, so the logo is a solid `A`, not an outline. The icon is
-/// that banner texel for texel ([`AGY_SD`]: one ink a texel, in the order
-/// they first appear, row by row). The name takes the ink agy prints its
-/// own product name in (`Antigravity CLI`, bold): `#5c5cff` on a dark
-/// ground, `#004da3` on paper. The ramp strings in its binary
-/// (`#FF7518…#9B5DE5` and the deep `#C2410C…#6D28D9`) are not what the
-/// banner draws.
 const AGY: Brand = Brand {
     word: "agy",
     alab_word: None,
@@ -365,11 +279,6 @@ const AGY_TEXELS: [Texel; 49] = {
 };
 
 /// Muse Code: the name and the diamond's outline in Meta blue `#0082fb`,
-/// the brand main's footer gave Muse on 2026-10-21 (its blue diamond, "the
-/// whole brand is Meta blue, not purple"), which replaced the violet
-/// `#a882ff` this mark first kept; the core is Muse's own lighter blue,
-/// MEASURED from 1.4.10's caret `❯` and its bold argv rows. The edge `n` is
-/// the outline at half alpha.
 const MUSE: Brand = Brand {
     word: "muse",
     alab_word: None,
@@ -382,9 +291,6 @@ const MUSE: Brand = Brand {
 };
 
 /// Gemini CLI. MEASURED: 0.46.0's `GradientColors: ["#4796E4", "#847ACE",
-/// "#C3677F"]` (its default theme, light and dark). The name's letter `k` of
-/// six sits at `t = k/5` along it, the icon's eight stops at `t = k/7`, one a
-/// band of columns left to right; `a`–`h` are stops 1–8 at half alpha.
 const GEMINI: Brand = Brand {
     word: "gemini",
     alab_word: None,
@@ -418,7 +324,6 @@ const GEMINI: Brand = Brand {
 };
 
 /// Grok: xAI's monochrome, flipped with the ground. Ready as data; a take of
-/// Grok's own screen confirms the ink before a program maps onto it.
 const GROK: Brand = Brand {
     word: "grok",
     alab_word: None,
@@ -436,9 +341,6 @@ const GROK: Brand = Brand {
     hd: Some(GROK_HD),
 };
 
-// Every row's inks are well formed, checked at compile time, so no ink read
-// below can miss: a texel per character, every texel's ink in both lists,
-// both icon lists one length, and a name ink for the word or for each letter.
 const _: () = {
     let mut m = 0;
     while m < CliMark::ALL.len() {
@@ -457,8 +359,6 @@ const _: () = {
         assert!(w > 0);
         assert!(b.name.dark.len() == 1 || b.name.dark.len() == w);
         assert!(b.name.paper.len() == 1 || b.name.paper.len() == w);
-        // An ALab build's name has letters, and inks for them: one for the
-        // whole name, or one a letter of it.
         if let Some(alab) = b.alab_word {
             let a = alab.len();
             assert!(a > 0);
@@ -469,41 +369,32 @@ const _: () = {
     }
 };
 
-/// Where a master sits in the icon's box: the fit law's choice ([`fit`]).
+/// Placement and integer scale of a master sprite inside the icon box ([`fit`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Fit {
-    /// The drawing.
+    /// Selected master tier.
     pub master: Master,
-    /// Its integer scale: one texel is `scale × scale` pixels.
+    /// Integer texel scale in pixels.
     pub scale: u16,
-    /// The drawn width in pixels (`w · scale`).
+    /// Drawn width in pixels.
     pub dw: u16,
-    /// The drawn height in pixels (`h · scale`).
+    /// Drawn height in pixels.
     pub dh: u16,
-    /// The drawing's left edge in the box.
+    /// Left offset in pixels inside the icon box.
     pub dx: u16,
-    /// The drawing's top edge in the box.
+    /// Top offset in pixels inside the icon box.
     pub dy: u16,
 }
 
 impl Fit {
-    /// The effective scale: the design scale times the drawn scale, in SD
-    /// texels' worth of pixels per texel. The fit law maximises it.
+    /// Effective resolution in SD-texel units.
     #[must_use]
     pub const fn effective(self) -> u32 {
         self.master.design_scale() as u32 * self.scale as u32
     }
 }
 
-/// THE FIT LAW: where `mark` sits in the icon's box of a `cw × ch` cell (the
-/// box is `2·cw` wide, its [`ICON_CELLS`], and `ch` tall), or `None` when no
-/// master fits, and the lockup keeps its cells with no sprite.
-///
-/// The candidates are every master at every integer scale `s ≥ 1` with
-/// `w·s ≤ 2·cw` and `h·s ≤ ch − 2` ([`AIR_PX`]); the choice is the largest
-/// [`Fit::effective`] scale, a tie going to the HD master, the finer drawing;
-/// the placement is centred, floored. An integer scale is whole texel
-/// blocks, so no scale blurs.
+/// Compute the [`Fit`] of `mark` inside a `cw × ch` cell's icon box.
 #[must_use]
 pub const fn fit(mark: CliMark, cw: u16, ch: u16) -> Option<Fit> {
     let box_w = ICON_CELLS as u32 * cw as u32;
@@ -531,7 +422,6 @@ pub const fn fit(mark: CliMark, cw: u16, ch: u16) -> Option<Fit> {
         if w == 0 || h == 0 {
             continue;
         }
-        // The largest scale in the box, and in a sprite's u16 sides.
         let most = u16::MAX as u32;
         let mut s = box_w / w;
         let rh = room_h / h;
@@ -559,7 +449,6 @@ pub const fn fit(mark: CliMark, cw: u16, ch: u16) -> Option<Fit> {
             dx: ((box_w - dw) / 2) as u16,
             dy: ((box_h - dh) / 2) as u16,
         };
-        // SD is offered first, so an equal HD replaces it.
         let replace = match best {
             None => true,
             Some(kept) => cand.effective() >= kept.effective(),
@@ -571,8 +460,7 @@ pub const fn fit(mark: CliMark, cw: u16, ch: u16) -> Option<Fit> {
     best
 }
 
-/// `mark`'s drawing `master` as an interned Index8 art, built once per
-/// process; `None` where the mark has no such drawing.
+/// Interned `Index8` [`FxArt`] for `mark` and `master`.
 #[must_use]
 pub fn art(mark: CliMark, master: Master) -> Option<&'static Arc<FxArt>> {
     static ARTS: [OnceLock<[Option<Arc<FxArt>>; 2]>; CliMark::ALL.len()] =
@@ -585,8 +473,7 @@ pub fn art(mark: CliMark, master: Master) -> Option<&'static Arc<FxArt>> {
     arts[master as usize].as_ref()
 }
 
-/// The ink of letter `letter` of `mark`'s name on a ground of polarity
-/// `dark`, before the floor (the last letter's for a letter past the word).
+/// Unfloored ink for letter `letter` of `mark`'s name on ground polarity `dark`.
 #[must_use]
 pub const fn name_ink(mark: CliMark, letter: usize, dark: bool) -> u32 {
     let inks = brand(mark).name.on(dark);
@@ -594,20 +481,14 @@ pub const fn name_ink(mark: CliMark, letter: usize, dark: bool) -> u32 {
     inks[if letter < last { letter } else { last }]
 }
 
-/// The ink letter `letter` of `mark`'s name is drawn in on `ground`
-/// (`0x00RRGGBB`): its brand ink for the ground's polarity, floored to
-/// [`NAME_CONTRAST`] with its hue held.
+/// Contrast-floored foreground RGB for letter `letter` of `mark`'s name on `ground`.
 #[must_use]
 pub fn name_fg(mark: CliMark, letter: usize, ground: u32) -> u32 {
     let ink = name_ink(mark, letter, dark_ground(ground));
     floor_contrast_keeping_hue(ink, ground, NAME_CONTRAST)
 }
 
-/// `mark`'s icon palette on `ground` (`0x00RRGGBB`): entry `k` paints texel
-/// `k + 1`, as [`Texel`] says. Each full ink is the brand's for the ground's
-/// polarity, floored to [`ICON_CONTRAST`] with its hue held, so on every dark
-/// built-in ground it is the brand's exact bytes; a half-tone is its full
-/// ink's floored value at [`HALF_ALPHA`]; a hole is never floored.
+/// Contrast-floored icon palette for `mark` on `ground`.
 #[must_use]
 pub fn icon_palette(mark: CliMark, ground: u32) -> Vec<FxInk> {
     let b = brand(mark);
@@ -623,12 +504,7 @@ pub fn icon_palette(mark: CliMark, ground: u32) -> Vec<FxInk> {
         .collect()
 }
 
-/// `mark`'s payload for one icon box: one sprite of the fitted master at
-/// `(dx, dy)`, palette base 0, over [`icon_palette`] on `ground`, sealed.
-/// Box-local, so the host lays it at the icon's first cell ([`layer`]). Every
-/// call seals a new content: the host keeps the last few by
-/// `(mark, fit, ground)` and hands the kept `Arc` at rest. Empty for a
-/// master the mark does not have.
+/// Build the [`FxContent`] sprite payload for `mark` at `fit` on `ground`.
 #[must_use]
 pub fn content(mark: CliMark, fit: Fit, ground: u32) -> Arc<FxContent> {
     let Some(art) = art(mark, fit.master) else {
@@ -650,11 +526,7 @@ pub fn content(mark: CliMark, fit: Fit, ground: u32) -> Arc<FxContent> {
     ))
 }
 
-/// The mark's layer: `content` over the glyphs (the slot the card's kitty
-/// is in), in grid pixels, by the byte-exact law, so the CPU and the GPU
-/// draw the same bytes. `offset` is the icon's first cell
-/// (`(col · cw, row · ch)`), and `clip` the pane's box, so a mark never draws
-/// past its pane.
+/// Build the [`FxLayer`] placing `content` above the terminal glyphs.
 #[must_use]
 pub fn layer(id: u64, content: Arc<FxContent>, offset: (i32, i32), clip: PxRect) -> FxLayer {
     let mut layer = FxLayer::new(id, content, FxSlot::Over, FxSpace::Grid, FxBlend::Exact);
@@ -663,17 +535,7 @@ pub fn layer(id: u64, content: Arc<FxContent>, offset: (i32, i32), clip: PxRect)
     layer
 }
 
-// ---- The masters ------------------------------------------------------------
-//
-// Transcribed from the judged spec's pixel maps (top-line icons, §2.4). One
-// string a row; `'.'` is transparent and every other byte is one of its
-// brand's `chars`. Upper case and digits are full ink; Codex's `o`, Muse's
-// `n`, Gemini's `a`–`h` and Grok's `g` are half-tones; Claude's `k` is its
-// eyes' hole and Muse's `m` its core.
-
 /// Claude Code's whole mascot, SD 14×10: its five equal bands (head, eyes,
-/// arms, body, legs) at two pixels each, decoded from 2.1.30x's quadrant
-/// rows ` ▐▛███▛█` / `▝▜██████▀` / ` ▝▝   ▝▝`.
 const CLAUDE_SD: &[&str] = &[
     "..CCCCCCCCCC..",
     "..CCCCCCCCCC..",
@@ -688,7 +550,6 @@ const CLAUDE_SD: &[&str] = &[
 ];
 
 /// Claude Code's whole mascot, HD 28×16 (aspect 1.75 against the true 1.7):
-/// head 3, eyes 3 (each 2×3), arms 4, body 3, legs 3 (each 2 wide).
 const CLAUDE_HD: &[&str] = &[
     "...CCCCCCCCCCCCCCCCCCCCCC...",
     "...CCCCCCCCCCCCCCCCCCCCCC...",
@@ -709,7 +570,6 @@ const CLAUDE_HD: &[&str] = &[
 ];
 
 /// The OpenAI knot, SD 12×12: six blades round a hexagonal hole, 180°
-/// symmetric, hand-cleaned so each blade's gap reads at one pixel.
 const CODEX_SD: &[&str] = &[
     "....O.OO....",
     "..OOO.OOOo..",
@@ -726,7 +586,6 @@ const CODEX_SD: &[&str] = &[
 ];
 
 /// The OpenAI knot, HD 24×24: supersampled 8×8 (hole 0.31, gap 0.12,
-/// twist 60°, rotation 30°).
 const CODEX_HD: &[&str] = &[
     ".........OO.OOO.........",
     ".......oOOo.OOOOo.......",
@@ -755,11 +614,6 @@ const CODEX_HD: &[&str] = &[
 ];
 
 /// agy's own launch banner (` ▄▀▀▄` / `▀▀▀▀▀▀` / `▀▀▀▀▀▀▀▀` /
-/// `▄▀▀    ▀▀▄` / `▄▀▀      ▀▀▄`, 1.4.0 to 1.4.4), one banner half-cell a
-/// pixel in the colour 1.4.4 paints it: a `▀` is its foreground over its
-/// background, so the apex and the bar are solid and only the two cells
-/// under the bar's middle are the ground. The one master: at 2x the law
-/// draws it at ×2.
 const AGY_SD: &[&str] = &[
     ".....AB.....",
     "....CDEF....",
@@ -818,7 +672,6 @@ const MUSE_HD: &[&str] = &[
 ];
 
 /// Gemini CLI's four-point sparkle, SD 12×12: two-pixel arms tapering to
-/// half-tone tips, column `k` in gradient stop `1 + round(k·7/11)`.
 const GEMINI_SD: &[&str] = &[
     ".....de.....",
     ".....45.....",
@@ -835,7 +688,6 @@ const GEMINI_SD: &[&str] = &[
 ];
 
 /// Gemini CLI's four-point sparkle, HD 24×24: an astroid (pinch 0.70),
-/// column `k` in gradient stop `1 + round(k·7/23)`.
 const GEMINI_HD: &[&str] = &[
     "........................",
     "...........de...........",
@@ -916,7 +768,6 @@ mod tests {
     use aterm_types::scheme::{builtin, builtin_names};
 
     /// Codex's slab: the tinted pad row its composer is erased with
-    /// (`48;2;45;47;51`, 0.154), a ground of its own.
     const CODEX_SLAB: u32 = 0x2D_2F33;
 
     /// A built-in theme's background as `0x00RRGGBB`.
@@ -944,12 +795,6 @@ mod tests {
     }
 
     /// ICONS READ AT 3:1 ON EVERY GROUND (spec §3.3, WCAG 1.4.11): on every
-    /// built-in theme's ground and on Codex's slab, each full icon ink is
-    /// floored to 3:1 or better with its hue held, a half-tone is its full
-    /// ink's floored value at half alpha, a hole is its exact bytes, and on
-    /// Default every ink is the brand's exact bytes.
-    /// NEGATIVE CONTROL: Muse's raw core on Gruvbox Light is under 3:1
-    /// (2.34), so there the floor does the work.
     #[test]
     fn icon_inks_read_at_3_on_every_ground() {
         let default = ground("Default");
@@ -1017,15 +862,6 @@ mod tests {
     }
 
     /// NAMES READ AT 4.5:1 ON EVERY GROUND (spec §3.2, WCAG 1.4.3): every
-    /// letter of every name a lockup prints — each mark's word, and
-    /// codex-alab's longer name — on every built-in theme's ground and on
-    /// Codex's slab, is drawn in an ink that reads at 4.5:1 or better, its
-    /// HSV hue within 2° of the brand's own; on Default each is the brand's
-    /// exact bytes wherever those already read.
-    /// NEGATIVE CONTROLS: Claude's raw `#d77757` on Default Light reads under
-    /// 4.5:1 (2.94), so there the floor does the work; and codex-alab's
-    /// last letter, past the vendor's word, reads under 4.5:1 in Codex's raw
-    /// blue on Codex's slab (3.65), so there too.
     #[test]
     fn names_read_at_4_5_on_every_ground() {
         let default = ground("Default");
@@ -1089,10 +925,6 @@ mod tests {
     }
 
     /// EVERY BUILD'S NAME IS ITS OWN (the owner calls aterm's Codex build
-    /// "codex-alab"): codex-alab's lockup prints `codex-alab`, five cells
-    /// wider than vendor `codex`'s, and every other mark prints its word for
-    /// either build — none names an ALab build apart.
-    /// NEGATIVE CONTROL: the vendor build of Codex prints `codex`.
     #[test]
     fn every_build_prints_its_own_name() {
         for mark in CliMark::ALL {
@@ -1152,7 +984,6 @@ mod tests {
     }
 
     /// What is wrong with a master: no rows, a ragged row, or a byte neither
-    /// `'.'` nor one of `chars`.
     fn master_faults(rows: &[&str], chars: &[u8]) -> Vec<String> {
         let mut faults = Vec::new();
         let w = rows.first().map_or(0, |r| r.len());
@@ -1171,14 +1002,6 @@ mod tests {
     }
 
     /// EVERY MARK IS CRISP AND CENTRED (spec §2.2–§2.4): every master is
-    /// rectangular, holds only its chars, builds as an art of its size, and
-    /// keeps its symmetry (Claude, agy, Muse and Gemini mirror; Codex, Muse
-    /// and Gemini turn half round); and the fit at each measured cell is
-    /// §2.2's: the master, an integer scale, whole texel blocks inside the
-    /// box with a pixel of air above and below, centred.
-    /// NEGATIVE CONTROL: a 6×12 cell (box 12×12, so a mark may be at most 12
-    /// wide and 10 tall) refuses every master but agy's, the lockup keeping
-    /// its cells with no sprite; a ragged master and a stray byte are faults.
     #[test]
     fn every_mark_is_crisp_and_centred() {
         use CliMark::{Agy, Claude, Codex, Gemini, Grok, Muse};
@@ -1210,8 +1033,6 @@ mod tests {
                 }
             }
         }
-        // §2.2's table, with the 9×23 Windows cell its law gives: the cell,
-        // the mark, its master and scale, and where it sits in the box.
         let table = [
             ((7, 14), Claude, Sd, 1, (0, 2)),
             ((7, 14), Codex, Sd, 1, (1, 1)),
@@ -1308,10 +1129,6 @@ mod tests {
     }
 
     /// agy 1.4.4's launch banner as the real-agy lab read it (`aterm ctl cell`
-    /// of every cell, 2026-10-21; the same on Default and Default Light and
-    /// at a second launch): each cell's column and row from the banner's
-    /// top left, its glyph, its foreground, and its background (`None`: the
-    /// pane's own ground).
     #[rustfmt::skip]
     const AGY_BANNER_1_4_4: &[(usize, usize, char, u32, Option<u32>)] = &[
         (4, 0, '▄', 0xDB_B131, None), (5, 0, '▀', 0xF2_922E, Some(0xF6_912E)),
@@ -1332,9 +1149,6 @@ mod tests {
     ];
 
     /// A half-block banner as pixels, one half-cell each (`None`: the
-    /// ground): a `▀` is its foreground over its background, a `▄` the
-    /// ground over its foreground. `as_text` reads it as its glyphs alone, a
-    /// `▀`'s lower half always the ground.
     fn banner_pixels(
         cells: &[(usize, usize, char, u32, Option<u32>)],
         (w, h): (usize, usize),
@@ -1355,11 +1169,6 @@ mod tests {
     }
 
     /// AGY'S MARK IS ITS BANNER (spec §2.4 and §10.2.3: the lab's cell read
-    /// decides): agy's master, each texel in its raw ink, on either
-    /// polarity, is the banner 1.4.4 paints, one half-cell a pixel.
-    /// NEGATIVE CONTROL: the banner read as text alone (each `▀`'s
-    /// background dropped, all a text fixture shows) is a hollow arch, not
-    /// the master: the reading the first drawing was made from.
     #[test]
     fn agys_mark_is_its_banner() {
         let b = brand(CliMark::Agy);
@@ -1400,9 +1209,6 @@ mod tests {
     }
 
     /// What `mark`'s map shows on `ground` in a `w × h` buffer when its box
-    /// sits at pixel `at`: each texel of the fitted master a whole
-    /// `scale × scale` block, an ink opaque, a half-tone blended over the
-    /// ground by the byte law, a hole exact, the rest the ground.
     fn map_pixels(
         mark: CliMark,
         f: Fit,
@@ -1440,7 +1246,6 @@ mod tests {
     }
 
     /// `mark`'s layer for `f` on `ground`, its first cell at `offset`, painted
-    /// over the ground by the renderers' CPU path, every band open.
     fn painted(
         mark: CliMark,
         f: Fit,
@@ -1467,14 +1272,9 @@ mod tests {
     }
 
     /// THE MARKS ARE THEIR MAPS ON THE CPU (spec §2.3, §6.4): each mark's
-    /// layer at 7×14 and 15×28, laid at a cell of a pane on Default, Default
-    /// Light and Codex's slab, paints exactly its map, texel for texel,
-    /// half-tones blended exactly, and nothing outside its box.
-    /// NEGATIVE CONTROL: the same layer laid one pixel off is caught.
     #[test]
     fn the_marks_are_their_maps_on_the_cpu() {
         for (cw, ch) in [(7u16, 14u16), (15, 28)] {
-            // Three boxes by three rows; the mark's box is the middle one.
             let w = 3 * usize::from(ICON_CELLS) * usize::from(cw);
             let at = (usize::from(ICON_CELLS) * usize::from(cw), usize::from(ch));
             let offset = (at.0 as i32, at.1 as i32);

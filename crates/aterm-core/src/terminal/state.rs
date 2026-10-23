@@ -20,47 +20,25 @@ use aterm_types::{KittyKeyboardState, XtermKeyboardState};
 
 pub use aterm_grid::RowBandMove;
 
-/// How many row-band moves [`ContentScrollState::bands`] remembers. Denser
-/// bursts or a delayed present can overwrite unread moves; `delta_since` then
-/// answers `Invalidate` and the host discards old coordinates.
+/// Number of row-band moves retained in [`ContentScrollState::bands`].
 pub const CONTENT_SCROLL_BAND_RING: usize = 16;
 
-/// Cumulative, non-consuming summary of terminal content-coordinate motion. Hosts diff a
-/// kept copy against a later snapshot with [`ContentScrollState::delta_since`]: an advance
-/// in [`uniform_up_rows`](Self::uniform_up_rows) means the whole viewport moved up that
-/// many rows; an advance in [`invalidation_epoch`](Self::invalidation_epoch) means discard.
-///
-/// [`band_batches`](Self::band_batches) and [`bands`](Self::bands) are an optional exact
-/// transform: an epoch step whose whole row motion was a short list of [`RowBandMove`]s
-/// (DECSTBM region scroll, reverse index at a region top, IL/DL, the top-anchored archival
-/// scroll) is counted in `band_batches` and its moves appended to the `bands` ring. A
-/// consumer that can translate bands applies them, oldest first, when every epoch step
-/// since its snapshot is explained (`delta_since` decides); others treat any epoch change
-/// as an invalidation.
-///
-/// All counters are monotonic for the [`Terminal`]'s life and survive RIS and
-/// [`Terminal::reset`] (which bump the epoch without a band batch, so consumers discard).
-/// Not checkpointed. `Copy`, 128 bytes.
+/// Cumulative, non-consuming summary of terminal content-coordinate motion.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ContentScrollState {
     /// Total rows of composable, full-screen upward motion on the active screen.
     pub uniform_up_rows: u64,
     /// Number of coordinate-invalidating content-motion batches observed.
     pub invalidation_epoch: u64,
-    /// Invalidating batches whose whole row motion is in [`bands`](Self::bands),
-    /// a subset of [`invalidation_epoch`](Self::invalidation_epoch). Counted only
-    /// for a non-empty exact band record, with no whole-screen scroll, no screen
-    /// switch and no splice degraded to `Invalidate` in the same batch.
+    /// Invalidating batches whose whole row motion is recorded in [`bands`](Self::bands).
     pub band_batches: u64,
-    /// Band moves recorded for the Terminal's life; `bands[seq % 16]` holds move
-    /// `seq`. A consumer reads the moves `previous.band_seq..current.band_seq`.
+    /// Total band moves recorded; `bands[seq % 16]` holds move `seq`.
     pub band_seq: u64,
     /// The ring of the most recent [`CONTENT_SCROLL_BAND_RING`] moves.
     pub bands: [RowBandMove; CONTENT_SCROLL_BAND_RING],
 }
 
-/// What a host should do with the coordinates it cached at `previous` now that
-/// the terminal reads `current`; the one decision every host calls.
+/// Host coordinate update action between two [`ContentScrollState`] snapshots.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ContentScrollDelta {
     /// No previous snapshot: adopt `current` and translate nothing.
@@ -69,8 +47,7 @@ pub enum ContentScrollDelta {
     Unchanged,
     /// The whole screen moved up by exactly this many rows (no epoch step).
     Translate(u16),
-    /// Every epoch step since `previous` is explained by the `count` band moves
-    /// `bands[first_seq..first_seq + count]` (oldest first; `count` is 1..=16).
+    /// Every epoch step since `previous` is explained by `bands[first_seq..first_seq + count]`.
     Bands {
         /// Sequence number of the oldest move to replay.
         first_seq: u64,
@@ -83,18 +60,16 @@ pub enum ContentScrollDelta {
 
 impl ContentScrollState {
     #[inline]
-    pub(super) fn record_uniform_up(&mut self, rows: u64) {
+    pub(super) const fn record_uniform_up(&mut self, rows: u64) {
         self.uniform_up_rows = self.uniform_up_rows.saturating_add(rows);
     }
 
     #[inline]
-    pub(super) fn invalidate(&mut self) {
+    pub(super) const fn invalidate(&mut self) {
         self.invalidation_epoch = self.invalidation_epoch.saturating_add(1);
     }
 
     /// Record that the epoch step `invalidate` just took is explained by `moves`: append
-    /// them to the ring, oldest first, and count the batch. Called only by `post_process`,
-    /// right after `invalidate`, with a non-empty exact record.
     pub(super) fn record_band_batch(&mut self, moves: &[RowBandMove]) {
         for &m in moves {
             let slot = usize::try_from(self.band_seq % CONTENT_SCROLL_BAND_RING as u64)
@@ -107,9 +82,7 @@ impl ContentScrollState {
         self.band_batches = self.band_batches.saturating_add(1);
     }
 
-    /// The band move with sequence number `seq`, valid for the last
-    /// [`CONTENT_SCROLL_BAND_RING`] moves; an older `seq` reads whatever overwrote its slot,
-    /// which is why [`Self::delta_since`] never hands out more than 16.
+    /// Band move with sequence number `seq` (valid for the last [`CONTENT_SCROLL_BAND_RING`] moves).
     #[must_use]
     #[inline]
     #[allow(clippy::cast_possible_truncation)]
@@ -118,26 +91,14 @@ impl ContentScrollState {
         self.bands[slot]
     }
 
-    /// One number that changes exactly when content rows moved under the active screen's
-    /// coordinates (a uniform scroll or an invalidating batch), for a host that only needs
-    /// "did every cached row coordinate go stale" (the predictive-echo generation). Both
-    /// counters only grow, so the sum moves whenever either does.
+    /// Monotonic counter that advances whenever content rows move under the active screen's coordinates.
     #[must_use]
     #[inline]
     pub const fn coordinate_generation(&self) -> u64 {
         self.uniform_up_rows.wrapping_add(self.invalidation_epoch)
     }
 
-    /// The host decision between two snapshots ([`ContentScrollDelta`]). With
-    /// `d_u/d_e/d_bb/d_bs` the advances of `uniform_up_rows`, `invalidation_epoch`,
-    /// `band_batches` and `band_seq`:
-    ///
-    /// * no `previous`: `Baseline`;
-    /// * any counter went backwards (another terminal's snapshot): `Invalidate`;
-    /// * `d_e == 0`: `Unchanged` for `d_u == 0`, `Translate` for a `d_u` that fits `u16`,
-    ///   else `Invalidate`; band counts moving without an epoch step are `Invalidate`;
-    /// * `d_e > 0`: `Bands` iff `d_u == 0`, every epoch step was a band batch
-    ///   (`d_e == d_bb`) and the moves fit the ring (`1 <= d_bs <= 16`); else `Invalidate`.
+    /// Compute the [`ContentScrollDelta`] between `previous` and `current`.
     #[must_use]
     #[inline]
     #[allow(clippy::cast_possible_truncation)]
@@ -181,12 +142,6 @@ impl ContentScrollState {
 }
 
 /// The host values last applied for the three [`apply_config`](Terminal::apply_config)
-/// settings an application also controls over the wire: DECAWM (7), focus reporting (1004)
-/// and bracketed paste (2004). A live value that differs from the config usually means the
-/// shell set the mode, so a reload diffs against the previous config instead of
-/// re-asserting it. For bracketed paste that is a safety property: dropping the paste guards
-/// while the shell still frames pastes turns a multi-line paste into executed keystrokes.
-/// The seed is the power-on value, where RIS and DECSTR return these modes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[allow(
     clippy::struct_excessive_bools,
@@ -203,7 +158,6 @@ pub(super) struct ConfiguredModes {
 
 impl Default for ConfiguredModes {
     /// The DEC power-on values, also `TerminalConfig`'s defaults, so applying a default
-    /// config to a fresh terminal writes nothing.
     #[inline]
     fn default() -> Self {
         Self {
@@ -223,15 +177,12 @@ pub struct Terminal {
     /// Terminal modes.
     pub(super) modes: TerminalModes,
     /// Host config's last-applied values for the app-negotiated modes
-    /// ([`ConfiguredModes`]). Never forwarded to the VT handler: no escape sequence may
-    /// move a host setting.
     pub(super) configured_modes: ConfiguredModes,
     /// Current text style.
     pub(super) style: CurrentStyle,
     /// Character set state (G0-G3, GL, single shift).
     pub(super) charset: CharacterSetState,
     /// The inactive grid: the main grid (with its scrollback) while the alternate screen is
-    /// up, else the parked alternate buffer, if any.
     pub(super) alt_grid: Option<Grid>,
     /// Grouped cursor save/restore state (DECSC/DECRC + mode 1049).
     pub(super) cursor_save: CursorSaveState,
@@ -240,34 +191,19 @@ pub struct Terminal {
     /// Bell callback (called when BEL is received).
     pub(super) bell_callback: Option<Box<dyn FnMut() + Send>>,
     /// Host resolver for Kitty non-direct transmission mediums (`t=f` file, `t=t` temp
-    /// file, `t=s` shared memory). The engine stays pure and wasm-safe: it hands the host
-    /// `(medium, path/name)` and the host, under its own policy, returns the bytes or
-    /// `None`. Absent by default (non-direct mediums skipped). Set via
-    /// [`Terminal::set_kitty_file_resolver`].
     #[allow(clippy::type_complexity)]
     pub(super) kitty_file_resolver: Option<
         Box<dyn Fn(crate::terminal::kitty_graphics::KittyMedium, &str) -> Option<Vec<u8>> + Send>,
     >,
     /// Last time a BEL callback fired, for rate limiting BEL floods. Shares
-    /// `transient.process_now`'s type.
     pub(super) last_bell_time: Option<aterm_time::Instant>,
     /// Monotonic count of bells that fired past the throttle, for poll and watermark
-    /// observers (`subscribe events`); unlike the take-and-clear `bell_pending`, never
-    /// resets. Not checkpointed.
     pub(super) bell_total: u64,
     /// Monotonic count of desktop notifications the program asked for (OSC 9,
-    /// a final OSC 99 chunk, OSC 777 `notify`), counted before the
-    /// `allow_notifications` gate, so a session with notifications off still
-    /// says it asked (`mark - notify n=`).
-    /// Never their text. Not checkpointed.
     pub(super) notify_total: u64,
     /// Host-preferred default cursor style, used before any DECSCUSR and restored on
-    /// RIS/DECSTR; outside `modes` so the `TerminalModes::new()` reset keeps it.
     pub(super) default_cursor_style: aterm_types::CursorStyle,
     /// The host's default for alternate scroll (DEC 1007), set by
-    /// [`Terminal::set_host_alternate_scroll`]: like the default cursor style a host
-    /// preference, not app state, so RIS, DECSTR and the foreground handback restore
-    /// 1007 to it; outside `modes` so the `TerminalModes::new()` reset keeps it.
     pub(super) host_alternate_scroll: bool,
     /// Grouped notification state (OSC 9, OSC 99, OSC 777).
     pub(super) notifications: NotificationState,
@@ -276,25 +212,16 @@ pub struct Terminal {
     /// Grouped state for Terminal OSC 1337 protocol extensions.
     pub(super) iterm2: Iterm2State,
     /// Transient state cleared on reset (hyperlink, underline color, last graphic char,
-    /// VT52, sync, SGR stack), plus the response buffer a reset keeps (its replies are owed
-    /// to the PTY peer).
     pub(super) transient: TransientState,
     /// The observation kernel: armed `await`/quiescence watchers over `content_seq`.
-    /// Never checkpointed, so it cannot affect replay.
     pub(super) watchers: super::observe::WatcherSet,
     /// Reusable scratch for the observation kernel's per-batch row scan (`observe_at`,
-    /// refilled through [`row_text_into`](Self::row_text_into)). Never checkpointed.
     pub(super) row_text_scratch: Vec<Option<String>>,
     /// Reusable row mask for the damage-scoped refill
-    /// ([`cell_frame_damage_scoped_into`](Self::cell_frame_damage_scoped_into)): one bit per
-    /// viewport row, taken and put back so refills reuse the capacity. Render scratch only.
     pub(super) refill_mask_scratch: Vec<u64>,
     /// The alt-screen scroll-off archive and its `process_at` hook state (`alt_archive.rs`).
-    /// Never checkpointed or forwarded to the handler; a self-update handoff carries its tail
-    /// beside the checkpoint (`alt_archive_carry_head`, then `alt_archive_import`).
     pub(super) alt_archive: super::alt_archive::AltArchiveState,
     /// Current working directory from OSC 7 (`file://hostname/path`), path
-    /// portion only.
     pub(super) current_working_directory: Option<String>,
     /// Grouped color state (palette, defaults, cursor, selection).
     pub(super) color: ColorState,
@@ -309,18 +236,14 @@ pub struct Terminal {
     /// Taskbar progress state (ConEmu OSC 9;4), for the host's taskbar/dock.
     pub(super) taskbar_progress: Option<TaskbarProgress>,
     /// The program's own state report (OSC 7501, [`super::program_state`]), a claim the
-    /// host shows and logs.
     pub(super) program_state: super::program_state::ProgramStateReport,
     /// Kitty keyboard protocol state.
     pub(super) kitty_keyboard: KittyKeyboardState,
     /// xterm keyboard modifier/format options (XTMODKEYS/XTFMTKEYS).
     pub(super) xterm_keyboard: XtermKeyboardState,
     /// Lock-free mirror of `keyboard_mode()` / `mouse_mode()` ([`super::ModeMirror`]) for
-    /// the session's input seam, so key presses need not take this terminal's mutex.
-    /// Refreshed after every `process()` batch and by every host mutator of an input.
     pub(super) mode_mirror: std::sync::Arc<super::ModeMirror>,
     /// The host's watchers of this terminal's frame ([`super::FrameWatchers`]): the
-    /// host's lock wrapper asks them at the end of a hold, the engine never does.
     pub(super) frame_watchers: Option<std::sync::Arc<dyn super::FrameWatchers>>,
     /// Grouped Sixel graphics processing state.
     pub(super) sixel: SixelState,
@@ -329,103 +252,60 @@ pub struct Terminal {
     /// Text selection, managed by the UI but kept here so scrolls and edits adjust it.
     pub(super) text_selection: crate::selection::TextSelection,
     /// What the last mouse report the host encoded carried (`Terminal::note_mouse_report`):
-    /// xterm's `mouse_row`/`mouse_col`, so motion is reported only on a new cell. Written by
-    /// the UI's input seam under this terminal's lock; never checkpointed.
     pub(super) mouse_report_memo: Option<super::mouse::MouseReportMemo>,
     /// The main screen's selection, parked while the alternate screen is up. Invariant:
-    /// empty whenever `alternate_screen` is false. `post_process` parks it with `mem::take`
-    /// on the batch that enters alt and restores it on the batch that leaves, so it is
-    /// never a durable second selection. A batch that exits and re-enters runs neither arm:
-    /// the alt selection is cleared on `alt_screen_left_in_batch` and this stays parked.
     pub(super) parked_text_selection: crate::selection::TextSelection,
     /// The selection a grid resize undo will put back
-    /// ([`super::resize_journal::ResizeUndoSelection`]).
     pub(super) resize_undo_selection: Option<super::resize_journal::ResizeUndoSelection>,
     /// The custody transition that last fired ([`super::custody`]), read by the `custody`
-    /// verb and the `PressCustody` conformance. Not checkpointed.
     pub(super) last_custody: Option<super::custody::CustodyTransition>,
     /// The last transition that took the reading position or the highlight
-    /// ([`super::custody::CustodyTransition::always_takes_custody`]): `last_custody` is
-    /// overwritten by every `OutputAtLive`, so this keeps the `custody` verb's answer.
     pub(super) last_custody_change: Option<super::custody::CustodyTransition>,
     /// The last transition that took a live highlight the user did not release (a
-    /// deliberate deselect overwrites `last_custody_change`, not this).
     pub(super) last_selection_taker: Option<super::custody::CustodyTransition>,
     /// Reader gestures recorded ([`super::custody::CustodyTransition::is_reader_gesture`]):
-    /// typing, paste, scroll, selection, return to live. A counter, so output cannot hide
-    /// one; the self-update scrollback restore uses it to learn whether the session was
-    /// used between adopt and import. Not checkpointed.
     pub(super) reader_gestures: u64,
     /// Secure keyboard entry: the UI layer enables platform secure input (macOS
-    /// `EnableSecureEventInput()`).
     pub(super) secure_keyboard_entry: bool,
     /// Synchronized-output (mode 2026) timeout, `TerminalConfig.sync_timeout_ms` via
-    /// `apply_config()`; default 1 s.
     pub(super) sync_timeout_duration: std::time::Duration,
     /// Host-side authorization for OSC 52 clipboard set and query
-    /// ([`super::clipboard_auth`]): its capability tokens are the only way a handler reaches
-    /// the clipboard callback.
     pub(super) clipboard_auth: super::clipboard_auth::ClipboardAuth,
     /// Host-side authorization for the OSC 133 / 633 capability nonce
-    /// ([`super::shell_integration_auth`]).
     pub(super) shell_integration_auth: super::shell_integration_auth::ShellIntegrationAuth,
     /// Extra OSC 8 URI schemes the host authorized beyond the built-in allowlist
-    /// ([`super::Terminal::authorize_hyperlink_scheme`], [`super::hyperlink_auth`]).
     pub(super) hyperlink_auth: super::hyperlink_auth::HyperlinkAuth,
     /// The policy engine ([`super::Terminal::apply_policy_engine`]) and the gate verdicts
-    /// compiled from it, in one field so a gate never answers from a policy no longer
-    /// installed ([`super::policy_gates`]). With no engine every gate defers to the
-    /// `TerminalModes::allow_*` / per-capability bits.
     pub(super) policy: super::policy_gates::PolicyState,
     /// Monotonic damage epoch ([`Terminal::damage_epoch`]).
     pub(super) damage_epoch: u64,
     /// The current grid damage already advanced `damage_epoch`; cleared by `take_damage`.
     pub(super) damage_epoch_counted: bool,
     /// Process-unique identity of this engine, stamped into every render snapshot, so a
-    /// damage-scoped re-extraction never takes another terminal's scratch as its baseline
-    /// (two same-size panes pass every dims check). Never 0, so an `empty()` scratch never
-    /// matches.
     pub(super) extract_identity: u64,
     /// Extraction-continuity generation, bumped by every
-    /// [`take_damage`](Terminal::take_damage): a scratch filled at generation G is a sound
-    /// damage-scoped baseline only while no other consumer has taken damage since (else the
-    /// tracker's bits undercount the rows changed since the fill). Starts at 1 so a
-    /// never-filled scratch (gen 0) fails.
     pub(super) extract_gen: u64,
     /// The full-history search index and what it was built for
-    /// ([`Terminal::search_plan`], [`Terminal::indexed_search`]).
     pub(super) search_slot: Option<super::search_index::SearchSlot>,
     /// The budgeted resumable search, if any ([`Terminal::search_budgeted`]).
     pub(super) budgeted_search: Option<super::search_budgeted::BudgetedSearchState>,
     /// Search-index builds finished ([`Terminal::finish_search`],
-    /// [`Terminal::search_index_rebuilds`]).
     pub(super) search_index_rebuilds: u64,
     /// Incremental refreshes among them, each also counted in `search_index_rebuilds`.
     pub(super) search_index_refreshes: u64,
     /// Monotonic revision of top-anchored protected-footer row insertions (a top-anchored
-    /// partial scroll inserting rows before a protected footer): hosts caching absolute
-    /// anchors recompute them when it changes.
     pub(super) absolute_row_revision: u64,
     /// Which main-screen rows each drawer wrote while it held the terminal
-    /// ([`super::holder_fence`]); its anchors live in the main grid.
     pub(super) holder_fence: super::HolderFence,
     /// [`screen_mutations`](Self::screen_mutations) when a checkpoint's fence
-    /// was installed: equal at the adoption, no byte came between, so the
-    /// carried current mark still speaks for the screen.
     pub(super) holder_carried_at: Option<u64>,
     /// Monotonic repaint-blink epoch: bumped on each DECTCEM hide (`CSI ?25l`) inside DEC
-    /// 2026 synchronized output, the per-keystroke repaint of full-redraw TUIs (vim/less
-    /// and ConPTY hide without sync). Read-only for hosts' cursor-effect classifiers.
     pub(super) repaint_blink_epoch: u64,
     /// The foreground handback's asserted evidence: each
-    /// [`program_evidence`](super::program_evidence) bit whose setter was parsed since the
-    /// host last took it ([`Terminal::take_evidence_asserted`]). Never checkpointed.
     pub(super) evidence_asserted: u16,
     /// Host projection of content-coordinate motion, updated once per batch; cumulative, so
-    /// several renderers can observe it.
     pub(super) content_scroll_state: ContentScrollState,
     /// What each resize did to the active grid ([`super::resize_journal`]). Written only by
-    /// the two resize entry points; never checkpointed.
     pub(super) resize_journal: super::resize_journal::ResizeJournal,
 }
 
@@ -450,9 +330,7 @@ impl Terminal {
         &self.grid
     }
 
-    /// The main-buffer grid whatever the alt-screen state: while the alternate screen is up
-    /// it is the inactive grid in `alt_grid`, holding the only real scrollback. Use it to
-    /// reach scrollback that must survive an alt-screen session (snapshot, cold restore).
+    /// Main-buffer grid regardless of alternate-screen state.
     #[inline]
     #[must_use]
     pub const fn main_grid(&self) -> &Grid {
@@ -468,37 +346,27 @@ impl Terminal {
 
     /// The active grid, mutably.
     #[inline]
-    pub fn grid_mut(&mut self) -> &mut Grid {
-        // The caller may replace or regrid it without a parsed close.
+    pub const fn grid_mut(&mut self) -> &mut Grid {
         self.transient.sync_end_caret = None;
         &mut self.grid
     }
 
-    /// Whether the grid holds damage since the last [`take_damage`](Self::take_damage)
-    /// (a new terminal starts fully damaged). Visual-only state (blink phase, bell flash,
-    /// selection) is not tracked here.
+    /// Whether the grid holds damage since the last [`take_damage`](Self::take_damage).
     #[must_use]
     #[inline]
     pub fn has_damage(&self) -> bool {
         self.grid.damage().has_damage()
     }
 
-    /// Consume and clear the grid's damage after a present (the
-    /// [`Damage`](crate::grid::Damage) tracker keeps its allocations) and re-arm
-    /// [`damage_epoch`](Self::damage_epoch). Call exactly once per real present.
+    /// Consume and clear the grid's damage after a present and re-arm [`damage_epoch`](Self::damage_epoch).
     #[inline]
     pub fn take_damage(&mut self) {
         self.grid.clear_damage();
         self.damage_epoch_counted = false;
-        // Every other scratch's damage-scoped continuity ends here;
-        // `cell_frame_damage_scoped_into` sees it from the generation in O(1).
         self.extract_gen = self.extract_gen.wrapping_add(1);
     }
 
-    /// A monotonic counter that advances on net-new grid damage, at most once per damage
-    /// session (re-armed by [`take_damage`](Self::take_damage)): a write, scroll, erase or
-    /// resize advances it, a no-op `process()` does not. It keys off the grid's damage
-    /// tracker, so every path that marks damage feeds it.
+    /// Monotonic counter that advances at most once per damage session on net-new grid damage.
     #[inline]
     pub fn damage_epoch(&mut self) -> u64 {
         if !self.damage_epoch_counted && self.grid.damage().has_damage() {
@@ -508,29 +376,21 @@ impl Terminal {
         self.damage_epoch
     }
 
-    /// Monotonic content generation of the active grid ([`Grid::content_gen`]):
-    /// advances on every content mutation but not on a pure viewport scroll,
-    /// so caches can compare it in O(1).
+    /// Monotonic content generation of the active grid ([`Grid::content_gen`]).
     #[must_use]
     #[inline]
-    pub fn content_seq(&self) -> u64 {
+    pub const fn content_seq(&self) -> u64 {
         self.grid.content_gen()
     }
 
-    /// How many times something reached the screen on a path
-    /// [`content_seq`](Self::content_seq) may not see: every non-empty batch
-    /// [`process`](Self::process) / [`process_at`](Self::process_at) consumed, and every
-    /// Kitty animation frame step [`advance_kitty_animations`](Self::advance_kitty_animations)
-    /// made. Never reset, RIS included: equal values mean no output arrived and no animation
-    /// stepped in between.
+    /// Monotonic count of non-empty processed batches and Kitty animation frame steps.
     #[must_use]
     #[inline]
     pub const fn screen_mutations(&self) -> u64 {
         self.transient.screen_mutations
     }
 
-    /// The cumulative content-scroll snapshot, to diff against an earlier one with
-    /// [`ContentScrollState::delta_since`].
+    /// Cumulative content-scroll snapshot for diffing with [`ContentScrollState::delta_since`].
     #[must_use]
     #[inline]
     pub const fn content_scroll_state(&self) -> ContentScrollState {
@@ -564,22 +424,14 @@ impl Terminal {
         &self.modes
     }
 
-    /// Monotonic count of synchronized-update (mode 2026) closes: every
-    /// processed `?2026l`, reset or timeout force-clear. A present-hold host
-    /// releases when it advances; the mode level alone cannot tell a closed and
-    /// reopened bracket from one still open.
+    /// Monotonic count of synchronized-update (mode 2026) closes.
     #[inline]
     #[must_use]
     pub const fn sync_end_seq(&self) -> u64 {
         self.transient.sync_end_seq
     }
 
-    /// Cursor cell at the latest ordered synchronized-output close, on this
-    /// screen and grid. Read with [`Self::sync_end_seq`] and [`Self::cursor`]:
-    /// an advanced close count alone does not prove the current cursor ended
-    /// that frame, since later unbracketed output may already have moved it.
-    /// A timeout, reset, screen replacement or resize invalidates the reading;
-    /// it is transient and a restored engine starts with none.
+    /// Cursor cell at the latest ordered synchronized-output close on this screen and grid.
     #[inline]
     #[must_use]
     pub fn sync_end_caret(&self) -> Option<(u16, u16)> {
@@ -593,50 +445,28 @@ impl Terminal {
             .map(|end| end.caret)
     }
 
-    /// Whether the open synchronized-output window has accepted a complete PTY action since
-    /// its `?2026h`: a conservative glass-safety signal (queries and no-ops count), not a
-    /// damage predicate. `false` with an advanced [`sync_end_seq`](Self::sync_end_seq) lets
-    /// a presenter show the just-closed frame; `true` means the grid may hold a prefix of
-    /// the next frame and stays held (subject to the timeout).
+    /// Whether the open synchronized-output window has accepted a complete PTY action since `?2026h`.
     #[inline]
     #[must_use]
     pub const fn sync_open_dirty(&self) -> bool {
         self.modes.synchronized_output && self.transient.sync_open_dirty
     }
 
-    /// Whether the screen holds a frame the program has not finished: its own DEC 2026
-    /// bracket is open and it has written into it. Unlike the mode level this survives the
-    /// `sync_timeout_ms` force-clear, ending only on the program's `?2026l`, DECSTR or RIS;
-    /// a bracket reopened with nothing written reads `false`. Hosts use it to know the
-    /// visible cursor may be the program's write position, not its caret.
+    /// Whether the program's DEC 2026 bracket is open with content written into it.
     #[inline]
     #[must_use]
     pub const fn sync_frame_unfinished(&self) -> bool {
         self.transient.app_sync_open && self.transient.app_sync_dirty
     }
 
-    /// Whether a reader that judges only WHOLE frames must not read the screen at
-    /// `now`: the program's frame is unfinished ([`Self::sync_frame_unfinished`]) and
-    /// every batch since less than [`FRAME_HANG`](super::FRAME_HANG) before `now` ended
-    /// with one unfinished. A redraw that the PTY's reads split leaves the grid holding
-    /// a prefix of it: rows the frame has not reached yet still show the frame before,
-    /// or nothing (measured on Claude Code 2.1.308 and agy 1.4.0,
-    /// `docs/measured/half-drawn-frame-2026-10-22.md`). Past the hang detector the frame
-    /// is read as it stands: a program that opened a frame and never closed it, or whose
-    /// every read ends inside its next frame, cannot freeze every reader. The row
-    /// predicates of the observation kernel, `await frame`, `text --json`'s `"frame"`
-    /// and the server's agent verdict read this.
+    /// Whether a whole-frame reader must wait at `now` because a DEC 2026 frame is unfinished within [`FRAME_HANG`](super::FRAME_HANG).
     #[inline]
     #[must_use]
     pub fn frame_unfinished_at(&self, now: aterm_time::Instant) -> bool {
         self.frame_hang_deadline().is_some_and(|hang| now < hang)
     }
 
-    /// When the unfinished frame's hang detector fires ([`Self::frame_unfinished_at`]):
-    /// the first batch end of the run of batches that ended with a frame unfinished,
-    /// plus [`FRAME_HANG`](super::FRAME_HANG). Per run, not per frame: a batch that
-    /// closes one frame and opens the next does not restart it. `None` while no frame
-    /// is unfinished; an unrepresentable instant reads as already fired (fail open).
+    /// Deadline when the unfinished frame's hang detector fires ([`Self::frame_unfinished_at`]).
     #[inline]
     #[must_use]
     pub fn frame_hang_deadline(&self) -> Option<aterm_time::Instant> {
@@ -647,11 +477,7 @@ impl Terminal {
         Some(since.checked_add(super::FRAME_HANG).unwrap_or(since))
     }
 
-    /// Whether the screen is a frame the program finished and nothing has been drawn
-    /// since: its last DEC 2026 frame, one it wrote into, was closed by its own `?2026l`
-    /// on this screen at this size, and the content has not moved after. Such a screen
-    /// is whole by the program's own word; any other may be a redraw the PTY's reads
-    /// split, which only time tells apart ([`super::GONE_SETTLE`]).
+    /// Whether the screen holds a DEC 2026 frame closed by `?2026l` with no content motion since.
     #[inline]
     #[must_use]
     pub fn screen_is_closed_frame(&self) -> bool {
@@ -665,10 +491,6 @@ impl Terminal {
     }
 
     /// The batch's end, before the observation kernel reads it: the run of unfinished
-    /// frames ([`Self::frame_hang_deadline`]) starts at the first batch that ends inside
-    /// one and ends at the first that ends whole, and the screen's last change
-    /// ([`super::Frame::drawn_at`]) is stamped when the content generation or the
-    /// screen moved.
     pub(super) fn note_batch_end(&mut self) {
         let now = self.transient.process_now;
         if self.sync_frame_unfinished() {
@@ -689,14 +511,10 @@ impl Terminal {
         self.transient.drawn.map(|(at, _)| at)
     }
 
-    /// Whether the VT parser is in Ground state (no pending escape sequence),
-    /// outside a tmux passthrough wrapper (whose payload the parser reads
-    /// unwrapped until the wrapper's `ESC \\`). The I/O-queue fast path uses it
-    /// to route reads after a chunk that ended mid-sequence through the
-    /// ordered slow path.
+    /// Whether the VT parser is in Ground state outside a tmux passthrough wrapper.
     #[inline]
     #[must_use]
-    pub fn parser_is_ground(&self) -> bool {
+    pub const fn parser_is_ground(&self) -> bool {
         self.parser.state().is_ground() && !self.parser.tmux_passthrough().is_open()
     }
 
@@ -706,10 +524,6 @@ impl Terminal {
     pub const fn is_alternate_screen(&self) -> bool {
         self.modes.alternate_screen
     }
-
-    // Elsewhere: keyboard, cursor, modes and title in state_accessors.rs; scrollback,
-    // viewport, paste and the response buffer in buffer_api.rs; shell integration in
-    // shell_api.rs; output blocks in blocks_api.rs.
 }
 
 #[cfg(test)]
@@ -717,7 +531,6 @@ mod damage_epoch_tests {
     use super::Terminal;
 
     /// A fresh terminal starts damaged; `take_damage` clears it; a real write advances the
-    /// epoch once, a no-op write not at all.
     #[test]
     fn damage_epoch_advances_on_write_not_on_noop() {
         let mut term = Terminal::new(4, 10);
@@ -755,13 +568,10 @@ mod damage_epoch_tests {
     }
 
     /// `content_seq` advances on content mutations (write, erase, content scroll), not on a
-    /// no-op or a pure `scroll_display`; unlike `damage_epoch`, a viewport scroll leaves it
-    /// untouched, so a cached search index survives scrolling.
     #[test]
     fn content_seq_advances_on_content_not_on_viewport_scroll() {
         let mut term = Terminal::new(3, 10);
 
-        // Nonzero from the start, so 0 is a usable "never observed" sentinel.
         let g0 = term.content_seq();
         assert!(g0 > 0, "content_gen is initialized nonzero");
 
@@ -786,7 +596,6 @@ mod damage_epoch_tests {
         let g3 = term.content_seq();
         assert!(g3 > g2, "a content scroll (scroll_up) advances content_gen");
 
-        // A pure viewport scroll advances damage_epoch but not content_gen.
         let epoch_before = term.damage_epoch();
         term.take_damage();
         term.grid_mut().scroll_display(2);
@@ -822,7 +631,6 @@ mod content_scroll_delta_tests {
     use super::{CONTENT_SCROLL_BAND_RING, ContentScrollDelta, ContentScrollState, RowBandMove};
 
     /// The writer can overwrite the bounded ring while a reader is between
-    /// presents. A reader may replay only a complete, explained interval.
     fn band_history_model() -> aterm_spec::derive::Model {
         aterm_spec::ty_model! {
             ContentScrollBandHistory {
@@ -830,7 +638,6 @@ mod content_scroll_delta_tests {
                 const Buggy = 0;
                 var moves = 0;
                 var unexplained = 0;
-                // Unchanged, Bands, Invalidate.
                 var verdict = 0;
                 action Step when (moves <= Cap) {
                     moves = moves + 1;
@@ -862,8 +669,6 @@ mod content_scroll_delta_tests {
     }
 
     /// Real VT processing writes the history; the shipping snapshot reader
-    /// decides what hosts may replay. Re-baselining and writing a second
-    /// interval exercises physical ring wrap.
     #[test]
     fn terminal_band_history_conforms_through_overflow_and_rebaseline() {
         use crate::terminal::TerminalBuilder;
@@ -890,8 +695,6 @@ mod content_scroll_delta_tests {
                 let mut written = Vec::new();
                 for step in 0..=CONTENT_SCROLL_BAND_RING + 1 {
                     if poison_at == Some(step) {
-                        // RIS is an unexplained coordinate replacement. Later
-                        // exact moves must not make that lost interval replayable.
                         term.process(b"\x1bc");
                         assert!(model.fire("Poison", &mut expected));
                     }
@@ -962,9 +765,6 @@ mod content_scroll_delta_tests {
     }
 
     /// The whole decision table: the `d_e == 0` rows (`Baseline`, `Unchanged`,
-    /// `Translate`, overflow to `Invalidate`), and `Bands` only when every epoch
-    /// step since the snapshot was a band batch, no uniform rows intervened and
-    /// the moves fit the 16-ring.
     #[test]
     fn delta_since_replays_only_fully_explained_epochs() {
         let prev = state(10, 4, 2, 7);
@@ -989,7 +789,6 @@ mod content_scroll_delta_tests {
             "an unrepresentable exact delta retires instead of under-translating"
         );
 
-        // One explained epoch step carrying one move.
         assert_eq!(
             ContentScrollState::delta_since(Some(prev), state(10, 5, 3, 8)),
             ContentScrollDelta::Bands {
@@ -997,7 +796,6 @@ mod content_scroll_delta_tests {
                 count: 1
             }
         );
-        // One explained step carrying five moves.
         assert_eq!(
             ContentScrollState::delta_since(Some(prev), state(10, 5, 3, 12)),
             ContentScrollDelta::Bands {
@@ -1005,7 +803,6 @@ mod content_scroll_delta_tests {
                 count: 5
             }
         );
-        // Several explained steps between two presents replay together.
         assert_eq!(
             ContentScrollState::delta_since(Some(prev), state(10, 9, 7, 12)),
             ContentScrollDelta::Bands {
@@ -1013,18 +810,15 @@ mod content_scroll_delta_tests {
                 count: 5
             }
         );
-        // Two epoch steps, one band batch: the other step is unexplained.
         assert_eq!(
             ContentScrollState::delta_since(Some(prev), state(10, 6, 3, 8)),
             ContentScrollDelta::Invalidate
         );
-        // Uniform rows beside a band batch: the epoch wins.
         assert_eq!(
             ContentScrollState::delta_since(Some(prev), state(13, 5, 3, 8)),
             ContentScrollDelta::Invalidate,
             "later uniform output cannot hide an intervening non-uniform batch"
         );
-        // Exactly the ring fits; one more does not.
         let ring = CONTENT_SCROLL_BAND_RING as u64;
         assert_eq!(
             ContentScrollState::delta_since(Some(prev), state(10, 5, 3, 7 + ring)),
@@ -1038,12 +832,10 @@ mod content_scroll_delta_tests {
             ContentScrollDelta::Invalidate,
             "seventeen moves between presents overflow the ring: today's reset"
         );
-        // A band batch with no moves cannot happen; refused rather than trusted.
         assert_eq!(
             ContentScrollState::delta_since(Some(prev), state(10, 5, 3, 7)),
             ContentScrollDelta::Invalidate
         );
-        // Bands without an epoch step are another lineage's numbers.
         assert_eq!(
             ContentScrollState::delta_since(Some(prev), state(10, 4, 2, 8)),
             ContentScrollDelta::Invalidate
@@ -1052,7 +844,6 @@ mod content_scroll_delta_tests {
             ContentScrollState::delta_since(Some(prev), state(10, 4, 3, 7)),
             ContentScrollDelta::Invalidate
         );
-        // Every regression is an invalidation.
         for regressed in [
             state(9, 4, 2, 7),
             state(10, 3, 2, 7),

@@ -8,7 +8,7 @@ use std::time::Instant;
 
 use aterm_grapheme::GraphemeClusters;
 use aterm_secrets::SecretBytes;
-use aterm_types::macos_setup::{Plan, Setting};
+use aterm_types::macos_setup::{Plan, SECRETS_SUBSCRIBER_ROW, SECRETS_VAULT_ROW, Setting};
 
 use crate::native_app::{
     AppDescriptor, AppEvent, AppIcon, AppIndicators, AppKind, AppPresentation, CloseReadiness,
@@ -56,19 +56,13 @@ pub struct SetupStatusRow {
     pub detail: String,
 }
 
-/// The Secrets stage's row in setup's report (aterm-cli's `Stage::Secrets` name).
-const SECRETS_ROW: &str = "Secrets vault";
-
-/// The subscriber's row, which a later stage's read of the vault reports beside
-/// [`SECRETS_ROW`] (aterm-cli's `vault_rows`).
-const SUBSCRIBER_ROW: &str = "Secrets subscriber";
-
 impl SetupStatus {
     /// Whether setup's own report, not a Check's, reads this Mac in its vault, synced, with
-    /// its subscriber running: the Secrets stage's vault item reported at least one
-    /// [`SECRETS_ROW`] row and every one `ok` or `applied` (a pass that joined, synced or
-    /// installed the subscriber reports `applied`; a Mac still waiting for approval reports
-    /// otherwise), and no [`SUBSCRIBER_ROW`] row is anything but `ok`. The record's own row
+    /// its subscriber running: the Secrets stage reported at least one [`SECRETS_VAULT_ROW`] row
+    /// (its vault item's, or its read of a vault it left in place beside the row saying so)
+    /// and every one `ok` or `applied` (a pass that joined, synced or installed the
+    /// subscriber reports `applied`; a Mac still waiting for approval reports otherwise),
+    /// and no [`SECRETS_SUBSCRIBER_ROW`] row is anything but `ok`. The record's own row
     /// for a stage a run finished, `applied` with no detail, says what a run did once, not
     /// what holds now, and is not read; a row the item reported always says why.
     pub(crate) fn vault_synced(&self) -> bool {
@@ -76,7 +70,7 @@ impl SetupStatus {
             .rows
             .iter()
             .filter(|row| {
-                row.name == SECRETS_ROW && !(row.status == "applied" && row.detail.is_empty())
+                row.name == SECRETS_VAULT_ROW && !(row.status == "applied" && row.detail.is_empty())
             })
             .peekable();
         reported.peek().is_some()
@@ -84,7 +78,7 @@ impl SetupStatus {
             && self
                 .rows
                 .iter()
-                .all(|row| row.name != SUBSCRIBER_ROW || row.status == "ok")
+                .all(|row| row.name != SECRETS_SUBSCRIBER_ROW || row.status == "ok")
     }
 
     fn rows_for(
@@ -521,6 +515,7 @@ impl SystemStateApp {
         }
         self.interact();
         let plan = self.reviewed_plan();
+        let vault_typed = plan.vault_url != self.submitted.vault_url.trim();
         // The callback may refuse to start. Keep the reviewed fields and their
         // scrubbable password until the host confirms this answer was accepted.
         let password = self
@@ -535,6 +530,7 @@ impl SystemStateApp {
                 password,
                 receipt: None,
                 cancel_receipt: None,
+                vault_typed,
             }));
     }
 
@@ -1929,6 +1925,34 @@ mod tests {
                 .decision,
             WorkstationSetupDecision::Begin(_)
         ));
+    }
+
+    /// An Apply says whether the person typed the vault. A field left as System State
+    /// showed it (here from a published status) asks for the vault setup shows when the
+    /// Apply is admitted; only an edited one is a vault the person chose. Negative control:
+    /// a flag that compares nothing reads every Apply as typed.
+    #[test]
+    fn an_apply_says_whether_the_vault_was_typed() {
+        let mut app = SystemStateApp::new(Plan::default());
+        app.publish(SetupStatus {
+            plan: Some(Plan {
+                vault_url: "http://shown.local:7484/v1/team".into(),
+                ..Plan::default()
+            }),
+            ..SetupStatus::default()
+        });
+        let typed = |app: &mut SystemStateApp| {
+            app.apply();
+            let Some(SystemStateAction::Apply(answer)) = app.take_action() else {
+                panic!("Apply must produce one action");
+            };
+            app.status.busy = false;
+            answer.vault_typed
+        };
+        assert!(!typed(&mut app));
+        app.url.select_all();
+        app.url.insert("http://typed.local:7484/v1/team");
+        assert!(typed(&mut app));
     }
 
     #[test]

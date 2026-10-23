@@ -1,13 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
-// Author: Andrew Yates
 
-//! A scrollback erase (ED 3, the `clear` command's `ESC[H ESC[2J ESC[3J`,
-//! Cmd-K) takes only the anchors that lay wholly in the erased history
-//! ([`super::forget_erased_history`]). The running command's block survives
-//! it, so the shell's D still lands on that block with its exit status; and
-//! the block the last D completed is held apart from the block store, so an
-//! erase that later takes the block does not take the exit status with it.
+//! Tests for scrollback erase (`ED 3`), full clears (`ED 2`), and prompt/command anchors.
 
 use crate::terminal::{BlockState, BlockText, Terminal, TerminalBuilder};
 
@@ -35,7 +29,6 @@ fn finish(t: &mut Terminal, exit: i32) {
 }
 
 /// Twelve finished commands, a line of output each: the first ones are in
-/// the history (8 rows on screen), the last ones on the screen.
 fn with_history() -> Terminal {
     let mut t = term();
     t.process(PROMPT);
@@ -57,22 +50,11 @@ fn held(t: &Terminal) -> Vec<u64> {
 }
 
 /// How the probe's block stands: its state and exit code, `None` when the
-/// terminal no longer holds it.
 fn probe(t: &Terminal, id: u64) -> Option<(BlockState, Option<i32>)> {
     t.block_by_id(id).map(|b| (b.state, b.exit_code))
 }
 
 /// THE REVIEWER'S PROBES: `sh -c 'exit 6'`, then a command that writes ED 3
-/// and exits 5, `clear; sh -c 'exit 4'` (macOS `clear` writes ED 3), and a
-/// Cmd-K while a command runs. Each leaves its own block, complete, with its
-/// own exit code, archived by the next prompt, and the command mark and the
-/// last D's copy agree. An erase alone renumbers nothing, so the block's rows
-/// (all on the screen) are the ones it had; a full clear (`clear`, ED 2)
-/// moves them to the cleared screen's top row ([`super::note_full_clear`]).
-/// The erase took the blocks wholly in the history, and what is held is one
-/// run of ids. ED 2 alone is the CONTROL that already held. NEGATIVE CONTROL:
-/// a RIS while the command runs still takes its block and the phase, so its
-/// D is refused: the same reading sees the loss.
 #[test]
 fn a_running_command_keeps_its_block_through_a_scrollback_erase() {
     enum Erase {
@@ -156,7 +138,6 @@ fn a_running_command_keeps_its_block_through_a_scrollback_erase() {
         );
     }
 
-    // NEGATIVE CONTROL: a RIS takes the block and the phase; the D is refused.
     let mut t = with_history();
     let id = t.current_block().expect("a prompt").id;
     let seq = t.completed_command_seq();
@@ -168,15 +149,6 @@ fn a_running_command_keeps_its_block_through_a_scrollback_erase() {
 }
 
 /// WHAT AN ERASE TAKES: the blocks, command marks, OSC 1337 marks and
-/// annotations wholly in the erased history, and nothing else. A running
-/// command's block that straddles the erase (its prompt and first output rows
-/// went into the history before it) is held, and it and its command mark
-/// start again at the oldest row left: its output reads what is left of it,
-/// and its command line, which the erase took, reads `Evicted`, never another
-/// line in its place. NEGATIVE CONTROL: the rows it had read `Evicted`. A
-/// finished block that straddles keeps its rows. A block on the screen reads
-/// as before. A mark and an annotation on the screen stay; ones in the
-/// history go.
 #[test]
 fn a_scrollback_erase_takes_only_what_lay_wholly_in_the_history() {
     let mut t = term();
@@ -226,7 +198,6 @@ fn a_scrollback_erase_takes_only_what_lay_wholly_in_the_history() {
     finish(&mut t, 0);
     let block = t.block_by_id(straddling).cloned().expect("held");
     assert!(forward(&block), "{:?}", rows(&block));
-    // Row `r` holds the number `r - 1`: the prompt is on row 1, `1` on row 2.
     let left: Vec<String> = ((oldest - 1)..=20).map(|i| i.to_string()).collect();
     assert_eq!(
         t.block_output_text(&block),
@@ -263,10 +234,6 @@ fn a_scrollback_erase_takes_only_what_lay_wholly_in_the_history() {
         "no completed command mark wholly in the history is held"
     );
 
-    // A FINISHED block that straddles the erase: `seq 20` done and archived
-    // by the next prompt, its prompt and first lines in the history and its
-    // last lines on the screen. Held as it was, and so is every block after
-    // it; the ones wholly in the history went.
     start(&mut t, "seq 20");
     let archived = t.current_block().expect("running").id;
     for i in 1..=20 {
@@ -291,11 +258,6 @@ fn a_scrollback_erase_takes_only_what_lay_wholly_in_the_history() {
 }
 
 /// AN ED 3 ON THE ALTERNATE SCREEN erases the alt grid's history only: the
-/// main grid's history, where every block and mark lives, is untouched, and
-/// so is every anchor. The program scrolls the alt screen past every row the
-/// main grid's anchors name first (`less` paging 400 lines), so the alt grid's
-/// oldest row is past them all: an erase that read the alt grid's oldest row
-/// as the main grid's would take every one.
 #[test]
 fn an_erase_on_the_alternate_screen_leaves_every_anchor() {
     let mut t = with_history();
@@ -333,11 +295,6 @@ fn an_erase_on_the_alternate_screen_leaves_every_anchor() {
 }
 
 /// THE LAST D'S COPY OUTLIVES ITS BLOCK: a command whose rows all went into
-/// the history before its prompt (it printed past the screen, then homed with
-/// ED 2), and a Cmd-K or an ED 3 at that prompt: the erase takes the block
-/// and the archive is empty, while `last_finished_block` still names it with
-/// its exit, the id before the prompt's own. NEGATIVE CONTROL: the prompt
-/// closed it, so the archive held it before the erase.
 #[test]
 fn the_last_finished_block_outlives_an_erase_of_its_rows() {
     for cmd_k in [true, false] {
@@ -375,16 +332,6 @@ fn the_last_finished_block_outlives_an_erase_of_its_rows() {
 }
 
 /// A FULL CLEAR TAKES THE TEXT OF THE BLOCKS IT BLANKED, NOT THE BLOCKS: the
-/// reviewer's probe on a screen with no history to erase. `echo old` prints
-/// `old-output`, then `clear` (macOS's writes `ESC[H ESC[2J ESC[3J`) and
-/// `echo new` printing `NEW-OUTPUT` on the same rows. The `echo old` block is
-/// still held, complete with its exit code, and its text reads `Evicted`,
-/// never the rows' new text; Ctrl-L (the same ED 2, no ED 3) does the same.
-/// The block being built at the clear (`clear`'s own) is not marked, and the
-/// next command reads as written. A checkpoint carries the mark. CONTROLS: an
-/// ED 3 alone, and an ED 2 on the alternate screen, blank no main-screen row,
-/// so the block reads its own text. NEGATIVE CONTROL (the pre-fix reading):
-/// the rows the block names hold the next command's text.
 #[test]
 fn a_full_clear_takes_the_text_of_the_blocks_it_blanked() {
     for (case, clear, blanks) in [
@@ -464,11 +411,8 @@ fn a_full_clear_takes_the_text_of_the_blocks_it_blanked() {
 }
 
 /// `command` typed at the prompt, Enter, and what the zsh integration's
-/// preexec writes: OSC 633;E naming the command line, then C.
 fn start_named(t: &mut Terminal, command: &str) {
     t.process(command.as_bytes());
-    // The VS Code escaping the integration applies: `\` and `;` would end or
-    // split the field.
     let named = command.replace('\\', "\\\\").replace(';', "\\x3b");
     t.process(format!("\r\n\x1b]633;E;{named}\x07\x1b]133;C\x07").as_bytes());
 }
@@ -484,18 +428,12 @@ fn rows(block: &crate::terminal::OutputBlock) -> [Option<u64>; 4] {
 }
 
 /// Whether the rows a block names never run backwards (prompt, command,
-/// output, end), so every range read from them is a forward one.
 fn forward(block: &crate::terminal::OutputBlock) -> bool {
     let named: Vec<u64> = rows(block).into_iter().flatten().collect();
     named.windows(2).all(|w| w[0] <= w[1])
 }
 
 /// The full clears a running command writes, each blanking the whole main
-/// screen: macOS `clear` (`ESC[H ESC[2J ESC[3J`, and `ESC[3J ESC[H ESC[2J` as
-/// the private-instance probe recorded it: the erase first), ncurses `clear`
-/// (`ESC[H ESC[2J`, what Ctrl-L writes too), ED 0 from home, and the `printf
-/// '\e[2J\e[H'` idiom (ED 2 with the cursor where the output left it, then
-/// home).
 const FULL_CLEARS: [(&str, &[u8]); 5] = [
     ("clear", b"\x1b[H\x1b[2J\x1b[3J"),
     ("clear, erase first", b"\x1b[3J\x1b[H\x1b[2J"),
@@ -510,17 +448,6 @@ fn erases(clear: &[u8]) -> bool {
 }
 
 /// A FULL CLEAR MOVES A RUNNING BLOCK ON THE SCREEN TO ITS HOME ROW: bytes in
-/// as a shell and a command write them (prompt, the command, two lines of
-/// output, a full clear, two more lines, D;4, the next prompt), on a terminal
-/// with and without history, for every full clear. The whole block was on the
-/// screen, so the clear blanked every row it had. It keeps its id and gets
-/// its exit status, and every row it names is the cleared screen's top row
-/// (the clear's home row) or later: its output reads exactly the two lines
-/// written after the clear, its command (blanked, and not among its rows)
-/// reads `Evicted`, or the OSC 633;E command line where the shell named it.
-/// Its command mark runs forward too. The next command reads as written.
-/// NEGATIVE CONTROL (the pre-fix reading): the command rows the block had
-/// before the clear now hold its own post-clear output.
 #[test]
 fn a_full_clear_moves_a_running_block_on_the_screen_to_its_home_row() {
     for (case, clear) in FULL_CLEARS {
@@ -598,7 +525,6 @@ fn a_full_clear_moves_a_running_block_on_the_screen_to_its_home_row() {
             assert_eq!(t.block_command(&next).as_deref(), Some("$ echo next"));
             assert_eq!(t.block_output(&next).as_deref(), Some("next"), "{case}");
             if !history {
-                // NEGATIVE CONTROL: where its command was is now its output.
                 let (start, end) = before.command_rows().expect("command rows");
                 assert_eq!(
                     t.text_range(start, end),
@@ -611,18 +537,6 @@ fn a_full_clear_moves_a_running_block_on_the_screen_to_its_home_row() {
 }
 
 /// A FULL CLEAR KEEPS WHAT IS STILL IN THE HISTORY (the reviewer's probe,
-/// `seq 40; tput clear; echo done` on an 8-row screen): the command's prompt,
-/// its command line and its first 33 lines had scrolled into the history
-/// before the clear, which blanks only the screen. Where the clear leaves the
-/// history (ncurses `clear`, ED 0 from home, ED 2 then home) the block keeps
-/// those rows: its command reads as typed, its output reads its lines still
-/// in the history and then `done`, and its prompt row, and its command mark's
-/// (which the prompt jump reads with it), stay on the prompt. Where macOS
-/// `clear` erased the history as well (in either order), the erase took those
-/// rows: the block and its mark start at the oldest row left, the cleared
-/// screen's top, its output reads `done` and its command `Evicted`. Its id and
-/// exit stay either way. NEGATIVE CONTROL: the clear blanked `L34`..`L40`;
-/// the first row they were on now holds `done`, and neither reading has them.
 #[test]
 fn a_full_clear_keeps_the_running_blocks_rows_in_the_history() {
     for (case, clear) in FULL_CLEARS {
@@ -693,20 +607,9 @@ fn a_full_clear_keeps_the_running_blocks_rows_in_the_history() {
 }
 
 /// What zsh writes at a prompt, as the private-instance probe recorded it: A,
-/// then `CR ESC[J` (an ED 0 from the prompt's first column, a full clear when
-/// the prompt is on the top row), the prompt, `ESC[K`, B.
 const ZSH_PROMPT: &[u8] = b"\x1b]133;A\x07\r\x1b[J$ \x1b[K\x1b]133;B\x07";
 
 /// THE AUTHOR'S PROBE, `clear; sh -c 'exit 4'` (macOS `clear` as the probe
-/// recorded it, `ESC[3J ESC[H ESC[2J`), with zsh's prompt after it: nothing is
-/// written after the clear, so the block's output is an empty range at the
-/// clear's home row (`blocktext` answers `OK 0`), its exit is 4 and its id
-/// unchanged. zsh's ED 0 on the top row is a full clear, and the earlier
-/// blocks with text on that screen read `Evicted`, but this one had no text
-/// there, so it is not marked. NEGATIVE CONTROLS (the pre-fix readings): the
-/// output start it had is past the end the next prompt gave it (`out=5
-/// end=0`), a range that ran backwards; and its rows do reach the cleared
-/// screen, so a rule by rows rather than by text would have marked it.
 #[test]
 fn clear_then_exit_4_leaves_an_empty_output_range_not_a_backward_one() {
     for history in [false, true] {
@@ -760,21 +663,10 @@ fn clear_then_exit_4_leaves_an_empty_output_range_not_a_backward_one() {
 }
 
 /// A FULL CLEAR AT THE PROMPT (Ctrl-L: zle's clear-screen homes, clears and
-/// redraws the prompt and what was typed so far, with no new A or B), for a
-/// one-line prompt and a two-line one (`~/dir on main` above `$ `, the B
-/// after the `$ `): the block being edited starts again at the screen's top
-/// row, where the shell redrew it, with its command row as far below as the
-/// shell's B was, and its command mark with it. So the command, typed half
-/// before the clear and half after, and its output read as written, and
-/// nothing is marked. NEGATIVE CONTROLS (the pre-fix readings): the command
-/// row it had (the bottom line) is past where its output starts; and with two
-/// lines, the top row, where a command row moved there would start, reads the
-/// prompt's first line.
 #[test]
 fn a_full_clear_at_the_prompt_starts_it_where_the_shell_redraws_it() {
     for (case, prompt) in [("one line", "$ "), ("two lines", "~/dir on main\r\n$ ")] {
         let mut t = with_history();
-        // Enter at the empty prompt, and the shell's next one.
         t.process(format!("\r\n\x1b]133;A\x07{prompt}\x1b]133;B\x07").as_bytes());
         let before = t.current_block().cloned().expect("the prompt");
         t.process(b"echo h");
@@ -825,7 +717,6 @@ fn a_full_clear_at_the_prompt_starts_it_where_the_shell_redraws_it() {
 }
 
 /// Whether the rows a command mark names never run backwards (prompt,
-/// command, output, the D's).
 fn mark_forward(mark: &crate::terminal::CommandMark) -> bool {
     let named: Vec<u64> = [
         Some(mark.prompt_start_row),
@@ -840,27 +731,6 @@ fn mark_forward(mark: &crate::terminal::CommandMark) -> bool {
 }
 
 /// A FULL CLEAR AT THE PROMPT WHOSE REDRAW IS NOT WHAT IT WAS: the shell's
-/// next mark keeps the block's rows and its command mark's in order, wherever
-/// the redraw went.
-/// - A precmd hook that wrote one or two lines between the shell's A and its
-///   prompt (zsh, `precmd_functions=(__aterm_precmd h1)`): Ctrl-L redraws the
-///   prompt and the buffer, not the hook's lines, so the shell's B was further
-///   below the A than the redrawn prompt is. Its C keeps the command row at
-///   most its own; the command reads as OSC 633;E named it.
-/// - fish, whose redraw sends A and B again: the A archives the block being
-///   edited with no row past its end, and the redrawn block reads as written.
-/// - A clear away from home (a background job's `ESC[2J`, or `ESC[2J ESC[H`)
-///   is none the line editor sent, and nothing redraws: the prompt keeps its
-///   rows, so the command reads what was typed on its row; after a home, the
-///   C brings the prompt and command rows up to its own.
-///
-/// NEGATIVE CONTROLS (the readings before): a command row as far below the
-/// redrawn prompt as the B was is at the C's row (one hook line: the rows
-/// hold no command text, the OSC 633;E does) or past it; the restart
-/// put the edited block's command row past the redraw's A; restarted at the
-/// top row, the command would read blank lines before what was typed; and the
-/// prompt row a clear away from home leaves is past where the C came after
-/// the home.
 #[test]
 fn a_full_clear_at_the_prompt_keeps_its_rows_in_order_however_it_is_redrawn() {
     for hook_lines in [1_u64, 2] {
@@ -902,7 +772,6 @@ fn a_full_clear_at_the_prompt_keeps_its_rows_in_order_however_it_is_redrawn() {
         );
     }
 
-    // fish: the redraw sends A and B again.
     let prompt = "~/dir on main\r\n$ ";
     let mut t = with_history();
     t.process(format!("\r\n\x1b]133;A\x07{prompt}\x1b]133;B\x07").as_bytes());
@@ -941,7 +810,6 @@ fn a_full_clear_at_the_prompt_keeps_its_rows_in_order_however_it_is_redrawn() {
         "fish: NEGATIVE CONTROL: the restart's command row is past the redraw's A"
     );
 
-    // A clear away from home: in place, and then home.
     for (case, clear) in [
         ("ED 2 in place", &b"\x1b[2J"[..]),
         ("ED 2 then home", b"\x1b[2J\x1b[H"),
@@ -1006,12 +874,6 @@ fn a_full_clear_at_the_prompt_keeps_its_rows_in_order_however_it_is_redrawn() {
 }
 
 /// CTRL-L AT A PROMPT TALLER THAN THE SCREEN (nine lines above `$ ` on an
-/// 8-row screen): the redraw from home scrolls, so the shell's B lands as far
-/// below the clear's top row as it was below the A, past the last row the
-/// screen had at the clear. The block's command row goes there, and its
-/// command and output read as written. NEGATIVE CONTROL: the screen's last row
-/// at the clear holds a prompt line, so a command row kept on the screen
-/// would read prompt lines as the command.
 #[test]
 fn ctrl_l_at_a_prompt_taller_than_the_screen_finds_its_command_row() {
     let prompt: String = (1..=9).map(|i| format!("p{i}\r\n")).collect::<String>() + "$ ";
@@ -1045,11 +907,6 @@ fn ctrl_l_at_a_prompt_taller_than_the_screen_finds_its_command_row() {
 }
 
 /// A COMMAND RANGE LEFT EMPTY (an integration that sends its C on the B's
-/// row, before the newline) has no command text to lose: neither a full clear
-/// that blanks its row while the command runs nor a scrollback erase that
-/// takes it marks the command line gone (`command_text_cleared`), and it
-/// reads empty, as it did. NEGATIVE CONTROLS: the clear did blank its row (on
-/// the screen, below the top row), and the erase did take it.
 #[test]
 fn an_empty_command_range_loses_no_command_text() {
     for (case, lines, erase) in [
@@ -1092,13 +949,6 @@ fn an_empty_command_range_loses_no_command_text() {
 }
 
 /// AN ERASE AFTER THE D, BEFORE THE NEXT PROMPT, LEAVES THE FINISHED BLOCK AS
-/// IT WAS: `seq 20` on the 8-row screen, its D, then a Cmd-K. The command has
-/// nothing more to write, so like an archived block it keeps its rows and the
-/// erased part reads `Evicted`: its output, once the prompt closes it, though
-/// `L14`..`L20` are still on the screen. CONTROL: the same erase one step
-/// earlier, while the command runs, starts the block at the oldest row left,
-/// so its output reads what is left (`L14`..`L20`) and its command line, which
-/// the erase took, is marked gone.
 #[test]
 fn an_erase_after_the_d_leaves_the_finished_block_as_it_was() {
     for after_d in [true, false] {
@@ -1150,20 +1000,6 @@ fn an_erase_after_the_d_leaves_the_finished_block_as_it_was() {
 }
 
 /// A CARRY KEEPS THE BLOCK A FULL CLEAR PUT ABOVE THE ONE BEFORE IT, WHATEVER
-/// HISTORY IT HOLDS: `echo a` finishes on the screen, then `clear; seq 300`
-/// (the clear moves the running block's rows it blanked to the cleared
-/// screen's top row, above `echo a`'s prompt) or Ctrl-L at the next prompt
-/// and `seq 300` (the prompt starts again at the top row). A seamless
-/// update's carry of every history bound, from none of it to all of it,
-/// holds one run of ids: the blocks from the first one that names a line it
-/// holds, as the live terminal does from there. The cleared block is among
-/// them with its exit code and its command mark (its output reaches the
-/// screen), and so is every block whose prompt row it holds. NEGATIVE
-/// CONTROL: for the bounds whose oldest row is past `echo a`'s prompt row and
-/// at most the row the cleared block's prompt had before the clear, the
-/// prompt rows of `echo a` and of the cleared block are both older than the
-/// carry's oldest row, so a carry that kept blocks by their prompt rows
-/// dropped the cleared one.
 #[test]
 fn a_carry_keeps_the_block_a_clear_moved_above_the_one_before_it() {
     for (case, ctrl_l) in [("clear; seq 300", false), ("Ctrl-L, seq 300", true)] {
@@ -1190,8 +1026,6 @@ fn a_carry_keeps_the_block_a_clear_moved_above_the_one_before_it() {
         let top = t.grid().visible_to_absolute(0);
         let live = held(&t);
         let history_max = t.grid().scrollback_lines();
-        // Whether a block names a line at or past `oldest` (its end is one
-        // past its last row).
         let names_a_line_from = |b: &crate::terminal::OutputBlock, oldest: u64| {
             rows(b)[..3].iter().flatten().any(|&row| row >= oldest)
                 || b.end_row.is_some_and(|end| end > oldest)
@@ -1243,14 +1077,6 @@ fn a_carry_keeps_the_block_a_clear_moved_above_the_one_before_it() {
 }
 
 /// A COMMAND THAT LEFT THE CURSOR ABOVE ITS OWN COMMAND LINE, WITH NO CLEAR
-/// (`tput cup 2 0; echo hello`, or a TUI on the main screen that exits with
-/// the cursor high): the next prompt's A comes above the block's rows. The
-/// block keeps the rows it had, as its command mark does: its command reads
-/// as typed (no OSC 633;E names it), and a carry whose history reaches its
-/// prompt row, once later output scrolled it there, keeps it. Only a prompt
-/// the A archives (no C came) has its rows brought up to the A's. NEGATIVE
-/// CONTROL: the A is above the block's command row, so a block with no row
-/// past the A would read its command from an empty range.
 #[test]
 fn a_command_that_homes_the_cursor_keeps_its_rows() {
     let mut t = with_history();
@@ -1284,7 +1110,6 @@ fn a_command_that_homes_the_cursor_keeps_its_rows() {
         ),
         "the block and its command mark name the same rows"
     );
-    // Output that scrolls its prompt row into the history.
     start(&mut t, "seq 20");
     for i in 1..=20 {
         t.process(format!("{i}\r\n").as_bytes());
@@ -1311,14 +1136,6 @@ fn a_command_that_homes_the_cursor_keeps_its_rows() {
 }
 
 /// THE D'S ROW COMES FROM THE BLOCK'S OWN MARK: a full clear after the D
-/// reads where the finished output ended off the command mark that D
-/// completed, and off no other. Every mark updates the block and its mark
-/// together, so this check is defensive: a state holding the block without
-/// its mark (an installed checkpoint can carry one) takes the output to reach
-/// the cleared screen, and it loses its text. The latest mark there is an
-/// earlier command's, whose D row (above where the block's output starts)
-/// would read the output as an empty range. CONTROL: with its own mark,
-/// whose D row is above the cleared screen, the block keeps its text.
 #[test]
 fn a_clear_after_the_d_reads_the_end_off_the_blocks_own_mark() {
     use crate::terminal::{CommandMark, OutputBlock};
@@ -1353,12 +1170,6 @@ fn a_clear_after_the_d_reads_the_end_off_the_blocks_own_mark() {
 }
 
 /// A FULL CLEAR AFTER THE COMMAND'S D, BEFORE THE NEXT PROMPT (a precmd that
-/// clears): the command has finished, so what is written after the clear is
-/// not its own. Its output was on the screen, so the block loses its text as
-/// an archived one does (`text_cleared`), and its rows move to the cleared
-/// screen's top row, so its end, the next prompt's row, is not above its
-/// start. NEGATIVE CONTROL: its rows hold the shell's line written after the
-/// clear.
 #[test]
 fn a_full_clear_after_the_d_takes_the_finished_commands_text() {
     let mut t = with_history();
@@ -1387,17 +1198,6 @@ fn a_full_clear_after_the_d_takes_the_finished_commands_text() {
 }
 
 /// A FULL CLEAR AFTER THE D THAT NEVER REACHED THE COMMAND'S TEXT: `seq 3`,
-/// its D, then a hook that writes ten lines before the next prompt (enough to
-/// scroll the command into the history) and clears. The command's output, up
-/// to its D's row, is all in the history, which the clear leaves: the block
-/// keeps its rows, is not marked, and reads its command and its lines (then
-/// the hook's, as a finished block reads what came between its D and the
-/// next prompt). CONTROL (the reviewer's probe): `seq 40`, its D, the clear
-/// and the prompt. Its last lines were on the screen, so it is marked as an
-/// archived block would be, and its rows in the history stay where they
-/// were, so its prompt row is still the prompt's. NEGATIVE CONTROL: its rows
-/// then read a cut copy, `L1`..`L33` without the `L34`..`L40` the clear
-/// blanked.
 #[test]
 fn a_full_clear_after_the_d_keeps_a_finished_output_it_never_reached() {
     for reached in [false, true] {
@@ -1459,16 +1259,6 @@ fn a_full_clear_after_the_d_keeps_a_finished_output_it_never_reached() {
 }
 
 /// A PROGRAM THAT REDRAWS (a TUI on the main screen): it scrolls output into
-/// the history, clears with macOS `clear`, draws a frame, scrolls again and
-/// clears again. That `clear` is a full clear and a scrollback erase, in the
-/// order `ESC[H ESC[2J ESC[3J` or the probe's `ESC[3J ESC[H ESC[2J`: the
-/// clear keeps the block's rows in the history and the erase takes them, so
-/// it starts again at the oldest row left, the cleared screen's top. Its
-/// output reads only the frame after the last clear, while it runs and once
-/// archived; its command line, which the erase took, reads `Evicted`; and a
-/// checkpoint carries the block as it stands. CONTROL: with ED 3 alone in
-/// place of each clear nothing is blanked, so the block reads the lines its
-/// program left on the screen at the last erase, then the frame.
 #[test]
 fn a_program_that_redraws_reads_only_its_last_frame() {
     for (case, erase) in [
@@ -1499,7 +1289,6 @@ fn a_program_that_redraws_reads_only_its_last_frame() {
         let expected = if full {
             "frame-2".to_string()
         } else {
-            // The seven rows above the cursor's on the 8-row screen.
             let mut lines = vec!["scroll"; 7];
             lines.push("frame-2");
             lines.join("\n")
@@ -1516,8 +1305,6 @@ fn a_program_that_redraws_reads_only_its_last_frame() {
 }
 
 /// CONTROL: a full clear on the alternate screen (`vim`) blanks no main-screen
-/// row, so the running block keeps its rows and reads its own command and
-/// output.
 #[test]
 fn a_full_clear_on_the_alternate_screen_leaves_the_running_block() {
     let mut t = term();

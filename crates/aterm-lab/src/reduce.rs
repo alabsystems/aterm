@@ -1,135 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `lab reduce`: A KEY-ONLY REDUCTION of a Claude Code transcript or a Codex
-//! rollout.
-//! It is the shape a lab-read build's rows are committed in
-//! (`aterm-agent`'s `harness/testdata/steps/<build>.jsonl`; a
-//! Codex rollout's `codex-<build>[-<leg>].jsonl`, session log 5G), and it
-//! holds nothing anyone said.
-//!
-//! KEPT:
-//! - every key, in its row's order, but RENAMED `k<n>`, one to one across
-//!   the file, where it may be what someone said or named: a key that is no
-//!   identifier (a path the vendor keys a map by), and every key inside a
-//!   FREE subtree ([`opens_free`]: what a tool takes or returns, what a
-//!   schema's author named, what Claude Code sends or attaches for the
-//!   model, a map keyed by tracked files). So an MCP tool's own argument
-//!   names go, in its calls' input (both copies Claude Code 2.1.303 writes:
-//!   the `tool_use` part's and the `wireToolInputs` map's) and in every
-//!   tool list it writes (a `prompt_snapshot`'s, an `api-request-shape`'s
-//!   and a deferred tool's `tool_addition` part in an `api-request-blob`
-//!   row), and so do a question's words keying its answer and an MCP
-//!   result's own keys. A key that is an id is REMAPPED as that id (below);
-//! - row order, `null`, the booleans, and the numbers as written;
-//! - THE CLOSED WORDS A READER READS. A candidate is a word
-//!   ([`is_word`]: no space, at most [`WORD_MAX`] bytes) under a key of
-//!   [`CLAUDE_WORDS`] or [`CODEX_WORDS`] (`type`, `subtype`, `version`,
-//!   `model`, `effort`, a notice's `error` and `apiError`, …), outside a free
-//!   subtree; those lists only filter candidates. The COMMITTED READERS
-//!   decide which are kept ([`Readings`]: the step folds, each notice as
-//!   the wall check reads it, the standing limit, the login wall,
-//!   [`FinishedScan`], the spend fold and the limits reader, and every row
-//!   as the harness's shapes read it, [`claude_reads`] and [`codex_reads`]):
-//!   a `(key, word)` pair is kept only when blanking it changes a reading
-//!   ([`Candidates::by_readings`]: the pairs needed alone, then each other
-//!   pair put back in the order the file first names them until the
-//!   readings are the source's, then each kept pair dropped again while
-//!   they stay so), and a file nothing restores is refused. So
-//!   `"mode":"normal"` on a row no reader opens goes, a `turn_duration`'s
-//!   `subtype` and a limit notice's `error` stay. What the verb writes reads
-//!   as its source ([`reads_as`]: the folds, each notice, the standing
-//!   limit, the login wall and the limits after every row, times one
-//!   shift, ids one to one), and each word it keeps, blanked alone, changes
-//!   its readings ([`unread_words`]), or nothing is written
-//!   ([`check_written`]).
-//!
-//! REBASED by whole days, so the first row is dated [`BASE_DAY`]: a row's
-//! `timestamp` (its time of day and zone as written, and only when the
-//! whole string is one RFC 3339 stamp, [`stamp_day`]: anything after it
-//! would be kept, so a string that only begins like one is replaced whole),
-//! an epoch number under a time key ([`is_time_key`]: `resetsAt`,
-//! `resets_at`, and Codex's
-//! `started_at_ms` and `create_time`, a fraction kept as written), and a
-//! usage limit notice's reset clause (`resets Oct 11 at 9:35am` → `resets
-//! Jan 4 at 9:35am`; its zone dropped).
-//!
-//! REMAPPED one to one across the file: ids (`uuid`, `promptId`, a call's
-//! `id` and its result's `tool_use_id`, `message.id`, `requestId`, …, and any
-//! UUID-shaped string), and a KEY that is one of them (a map keyed by a
-//! call's id, `wireToolInputs`; a first pass learns the file's ids, so a key
-//! is known wherever it sits). Each takes an id the step fold reads exactly
-//! as it read the source's: a valid `StepId` stays valid, an invalid one
-//! stays invalid, and a lowercase prefix such as `toolu_` is kept.
-//!
-//! WORDS OF A ROW'S OWN, read by name:
-//! - a user row's text keeps only the marker it opens with
-//!   (`aterm_agent::harness::steps::USER_MARKERS` and `COMPACT`, the shape
-//!   test's own list), and so does a `system` `local_command` row's;
-//! - a tool's name stays only when the class table names it
-//!   (`steps::tool_class`); an `mcp__` name keeps that prefix. A Codex
-//!   call's name (`payload.name` of a `response_item` whose payload is a
-//!   `function_call` or a `custom_tool_call`) stays while it is a word with
-//!   no `__`; a `name` anywhere else (a `parsed_cmd` read's file) is no
-//!   tool's, and is replaced;
-//! - CLAUDE CODE'S OWN NOTICE (`isApiErrorMessage`), and a local command's
-//!   output that reads as a full context, becomes the CANONICAL PHRASE of
-//!   the wall its words read as ([`canonical`]). That phrase is the first of
-//!   [`phrases`] (the anchor phrases, `aterm_phase::anchor`, before the
-//!   others) whose reading equals the source's: `aterm_phase::classify_wall`
-//!   and the three tests `wall_confirm`'s `notice_wall` adds
-//!   (`not_a_wall`, `named_by_status_alone`, the `/compact` remedy). A
-//!   notice no phrase reads as is refused, never kept.
-//!
-//! REPLACED by `""`: every other string. Every FREE subtree
-//! ([`opens_free`]: a call's input and a result's output, wherever a row
-//! or a message nested in a `progress` row holds them, and what a map
-//! keyed by an id holds; a JSON schema wherever it sits ([`is_schema`]),
-//! and a member whose key ends in `schema`; an `api-request-shape`'s
-//! `shape` and each field of an `attachment` but its `type` and `origin`,
-//! what Claude Code sends or attaches for the model; a file-history
-//! snapshot's `trackedFileBackups`; a Codex call's `arguments`, `input` and
-//! `output`) is replaced whole, its keys renamed (KEPT, above). The step
-//! fold and the wall check read none of them; `upgrade::FinishedScan`
-//! reads a `queued_command`'s `type` and `origin`, which are kept.
-//!
-//! The reduction opens with one `#` line of its own, as the repository's
-//! fixtures do; a `#` line of the source (a fixture's header) is dropped.
-//! A source that is itself a reduction (its `#` line is one [`header`]
-//! wrote) is said so in the new line, whose day count is then the whole
-//! move from the first source, so a reduction reduced again is
-//! itself. A line that is not one JSON value refuses the whole file.
-//!
-//! Its proof is its tests (`reduce_tests.rs`): over every `supervise/fixtures`
-//! transcript the reduction folds as its source (the same steps, ids one to
-//! one, times one shift, the same walls and end), every notice classes as
-//! its source's, the harness reads each reduction as its source (the login
-//! wall, the standing limit, the model, the last answer, the resumed build,
-//! the finish and the task after every row, and each notice as the wall
-//! check reads it), the committed 2.1.303 reduction reads its usage limit
-//! as the harness does, and no 8-byte run of any source string survives
-//! outside the kept vocabulary: no value, no key inside a free subtree, and
-//! no stamp's tail. Apart from [`opens_free`], the check finds a tool's
-//! arguments by their shape (a JSON schema's `properties`, a `…tool_use`
-//! part's `input`, what a map keyed by a call's id holds) wherever they
-//! sit: no argument name may be kept as written, and no word there. And it
-//! holds ids one to one across keys and values, so no id the reduction
-//! remaps as a value is kept as written as a key. A planted transcript (an
-//! MCP tool's argument names in its call, in its `wireToolInputs` copy, in
-//! an `api-request-shape`'s tool list and in an `api-request-blob`'s
-//! `tool_addition`, a question keying its answer, in a row and in a row a
-//! `progress` row nests, an MCP result's keys, a server tool's input, a
-//! tracked file's name, words after a stamp, a call's id keying a map) and
-//! a planted Codex rollout (a `parsed_cmd` read naming a file) keep none of
-//! their words. A planted word no reader reads under a closed key
-//! (`"mode":"quokkaledger"`) is emptied, and every word a reduction keeps
-//! is read ([`unread_words`]). Negative controls: a reducer that keeps
-//! content, one that replaces `type`, one that blanks a notice's text, the
-//! earlier rules' reductions of the plant, a reducer that keeps any Codex
-//! `name` as a tool's, one that keeps every candidate word (the output-side
-//! check, which the verb refuses), one that blanks a word a reader reads
-//! (the fold check, which the verb refuses) and one that blanks a notice's
-//! `error`, `status` or `rateLimitType` (the harness's reading) each fail.
+//! `lab reduce`: A KEY-ONLY REDUCTION of a Claude Code transcript or a Codex rollout.
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
@@ -186,12 +58,7 @@ pub const BASE_DAY: (i64, u32, u32) = (2000, 1, 1);
 /// The longest closed word kept.
 pub const WORD_MAX: usize = 64;
 
-/// The keys a Claude Code word MAY be kept under: the row's and a part's
-/// `type`, the build, the model and effort, a notice's typed fields
-/// (`error`, `apiError`, its quota's words), who asked (`origin.kind`,
-/// `turnOrigin`), a system row's `level`, and the usage figures' words. A
-/// CANDIDATE FILTER only: a word under one is kept when a
-/// reading reads it ([`Candidates::by_readings`]), and goes otherwise.
+/// The keys a Claude Code word MAY be kept under: the row's and a part's `type`, the build, the model and effort, a notice's typed fields (`error`, `apiError`, its quota's words), who asked (`origin.kind`, `turnOrigin`), a system row's `level`, and the usage figures' words.
 pub const CLAUDE_WORDS: &[&str] = &[
     "type",
     "subtype",
@@ -221,23 +88,7 @@ pub const CLAUDE_WORDS: &[&str] = &[
     "mode",
 ];
 
-/// The keys a Codex rollout's word MAY be kept under, a candidate filter as
-/// [`CLAUDE_WORDS`] is. The five before the last are as the
-/// lab's Codex 0.163.0 rollouts read them (
-/// Codex's keys from a committed reduction, never a guess):
-/// a call's `namespace` (`functions`, `collaboration`: the step fold's class
-/// table reads it beside the `name`), a `turn_aborted`'s `reason`
-/// (`interrupted`), who began a thread or a turn (`thread_source`: `user`,
-/// `subagent`; `turn_trigger`) and the turn's `collaboration_mode_kind`
-/// (`default`). Then a `turn_context`'s `service_tier`, a key that rollout
-/// shows and the spend fold reads (`TurnReader`'s tier, one of the
-/// [`readings`]), so a tier it names is kept; and last the words of a
-/// `token_count`'s `rate_limits` that the limits reader reads
-/// (`ai::codex_limits::rollout_rate_limits`: the family `limit_id` it
-/// needs to read the row at all, its `limit_name`, the credits' `balance`
-/// and an `individual_limit` it reads as a number written as text, and the
-/// `rate_limit_reached_type`), so a reduction's limits read as its
-/// source's.
+/// The keys a Codex rollout's word MAY be kept under, a candidate filter as [`CLAUDE_WORDS`] is.
 pub const CODEX_WORDS: &[&str] = &[
     "type",
     "role",
@@ -267,7 +118,6 @@ pub const CODEX_WORDS: &[&str] = &[
 ];
 
 /// The keys a Claude Code transcript names an id by (besides any
-/// UUID-shaped string).
 const CLAUDE_IDS: &[&str] = &[
     "uuid",
     "parentUuid",
@@ -311,8 +161,6 @@ const CODEX_IDS: &[&str] = &[
     "creator_user_id",
 ];
 
-// The ordered tree
-
 /// A JSON value as written: objects in their order, numbers as their text.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Node {
@@ -331,8 +179,7 @@ pub enum Node {
 }
 
 impl Node {
-    /// The member `key` of an object (the last of that name, as JSON
-    /// readers take it).
+    /// The member `key` of an object (the last of that name, as JSON readers take it).
     #[must_use]
     pub fn get(&self, key: &str) -> Option<&Node> {
         match self {
@@ -350,8 +197,7 @@ impl Node {
         }
     }
 
-    /// Spell the value as one compact JSON line, strings escaped as
-    /// `JSON.stringify` escapes them.
+    /// Spell the value as one compact JSON line, strings escaped as `JSON.stringify` escapes them.
     #[must_use]
     pub fn dump(&self) -> String {
         let mut out = String::new();
@@ -415,7 +261,6 @@ fn write_str(out: &mut String, s: &str) {
 const DEPTH_MAX: usize = 256;
 
 /// Parse one JSON value (whitespace around it allowed).
-///
 /// # Errors
 /// The text is not exactly one JSON value.
 pub fn parse(text: &str) -> Result<Node, String> {
@@ -556,7 +401,6 @@ impl Parser<'_> {
                 return self.err("an exponent's digit expected");
             }
         }
-        // ASCII only, so a char boundary.
         Ok(Node::Num(
             String::from_utf8_lossy(&self.b[at..self.i]).into_owned(),
         ))
@@ -613,7 +457,6 @@ impl Parser<'_> {
                                 if (0xDC00..0xE000).contains(&lo) {
                                     0x10000 + ((hi - 0xD800) << 10) + (lo - 0xDC00)
                                 } else {
-                                    // Two lone halves: each the replacement character.
                                     out.extend_from_slice("\u{fffd}".as_bytes());
                                     lo
                                 }
@@ -637,10 +480,7 @@ impl Parser<'_> {
     }
 }
 
-// Words, ids and times
-
-/// A closed word: 1 to [`WORD_MAX`] bytes of `[A-Za-z0-9._:@<>+-]`, so no
-/// space, no path and no sentence.
+/// A closed word: 1 to [`WORD_MAX`] bytes of `[A-Za-z0-9._:@<>+-]`, so no space, no path and no sentence.
 #[must_use]
 pub fn is_word(s: &str) -> bool {
     (1..=WORD_MAX).contains(&s.len())
@@ -648,8 +488,7 @@ pub fn is_word(s: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b"._:@<>+-".contains(&b))
 }
 
-/// A key kept as written: an identifier (`[A-Za-z_][A-Za-z0-9_-]*`, at most
-/// [`WORD_MAX`] bytes), never a path or a sentence.
+/// A key kept as written: an identifier (`[A-Za-z_][A-Za-z0-9_-]*`, at most [`WORD_MAX`] bytes), never a path or a sentence.
 #[must_use]
 pub fn is_ident(s: &str) -> bool {
     let b = s.as_bytes();
@@ -680,10 +519,7 @@ pub fn is_uuid(s: &str) -> bool {
         })
 }
 
-/// Whether a key names a time: `timestamp`, a name ending `At`/`_at`, or
-/// Codex's millisecond stamps (`started_at_ms`, `completed_at_ms`) and an
-/// item's `create_time` (fractional seconds), as its 0.163.0 rollouts
-/// write them (session log 5G).
+/// Whether a key names a time: `timestamp`, a name ending `At`/`_at`, or Codex's millisecond stamps (`started_at_ms`, `completed_at_ms`) and an item's `create_time` (fractional seconds), as its 0.163.0 rollouts write them (session log 5G).
 #[must_use]
 pub fn is_time_key(key: &str) -> bool {
     key == "timestamp"
@@ -693,8 +529,7 @@ pub fn is_time_key(key: &str) -> bool {
         || key == "create_time"
 }
 
-/// The date of an RFC 3339 stamp (`YYYY-MM-DDTHH:MM:SS…`), read from its
-/// first 19 bytes.
+/// The date of an RFC 3339 stamp (`YYYY-MM-DDTHH:MM:SS…`), read from its first 19 bytes.
 #[must_use]
 pub fn iso_day(s: &str) -> Option<(i64, u32, u32)> {
     let b = s.as_bytes();
@@ -721,15 +556,10 @@ pub fn iso_day(s: &str) -> Option<(i64, u32, u32)> {
         .then_some((i64::from(y), m, d))
 }
 
-/// The date of a WHOLE RFC 3339 stamp: [`iso_day`]'s first 19 bytes, then
-/// at most a `.` fraction and a zone (`Z`, `z`, `±HH:MM` or `±HHMM`), and
-/// nothing after. A time is rebased only from one, since everything past
-/// its date is kept as written ([`P11`]); a string that only begins like a
-/// stamp is no time.
+/// The date of a WHOLE RFC 3339 stamp: [`iso_day`]'s first 19 bytes, then at most a `.` fraction and a zone (`Z`, `z`, `±HH:MM` or `±HHMM`), and nothing after.
 #[must_use]
 pub fn stamp_day(s: &str) -> Option<(i64, u32, u32)> {
     let day = iso_day(s)?;
-    // `iso_day` read 19 ASCII bytes, so byte 19 is a character boundary.
     let mut rest = s.get(19..)?;
     if let Some(fraction) = rest.strip_prefix('.') {
         let digits = fraction.bytes().take_while(u8::is_ascii_digit).count();
@@ -791,10 +621,7 @@ const MONTHS: [&str; 12] = [
     "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
 ];
 
-/// A notice's reset clause, rebased: `resets [<Mon> <D> at ]<H>[:<MM>]am|pm`
-/// with its date moved `shift` days (in `year`, the first row's), its time
-/// of day as written and its zone dropped (` · resets Jan 4 at 9:35am`).
-/// `None` when the notice names no reset in that form.
+/// A notice's reset clause, rebased: `resets [<Mon> <D> at ]<H>[:<MM>]am|pm` with its date moved `shift` days (in `year`, the first row's), its time of day as written and its zone dropped (` · resets Jan 4 at 9:35am`).
 #[must_use]
 pub fn reset_clause(text: &str, shift: i64, year: i64) -> Option<String> {
     let rest = &text[text.find("resets ")? + "resets ".len()..];
@@ -836,10 +663,7 @@ pub fn reset_clause(text: &str, shift: i64, year: i64) -> Option<String> {
     ))
 }
 
-// The canonical phrase of a notice (T7)
-
-/// How the readers take a notice's words: the wall `classify_wall` names,
-/// and the three readings `wall_confirm`'s `notice_wall` adds to it.
+/// How the readers take a notice's words: the wall `classify_wall` names, and the three readings `wall_confirm`'s `notice_wall` adds to it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Reading {
     /// `aterm_phase::classify_wall`.
@@ -848,8 +672,7 @@ pub struct Reading {
     pub not_a_wall: bool,
     /// `aterm_phase::wall::named_by_status_alone`.
     pub by_status: bool,
-    /// The vendor's `/compact` remedy (`wall.compact_images`,
-    /// `wall.compact_attachments`), which `notice_wall` reads as a full context.
+    /// The vendor's `/compact` remedy (`wall.compact_images`, `wall.compact_attachments`), which `notice_wall` reads as a full context.
     pub compact: bool,
 }
 
@@ -869,10 +692,7 @@ impl Reading {
     }
 }
 
-/// The canonical phrases, in the order they are tried: the anchor phrases
-/// of the walls (`aterm_phase::anchor`) first, then the table's own words
-/// for the walls no anchor names alone, the API error's forms, the notice
-/// that is no wall, the `/compact` remedy, and nothing.
+/// The canonical phrases, in the order they are tried: the anchor phrases of the walls (`aterm_phase::anchor`) first, then the table's own words for the walls no anchor names alone, the API error's forms, the notice that is no wall, the `/compact` remedy, and nothing.
 #[must_use]
 pub fn phrases() -> Vec<&'static str> {
     vec![
@@ -905,14 +725,7 @@ fn coded(code: u16) -> [String; 2] {
     ]
 }
 
-/// THE CANONICAL PHRASE of a notice whose text is `text` (T7): the first
-/// phrase ([`phrases`], or an `API Error` printing the status the source
-/// printed) whose [`Reading`] is the source's, with its reset clause rebased
-/// ([`reset_clause`]) when the source names one and the phrase reads the
-/// same with it. `joins` is how many text parts beyond the first the notice
-/// joins (`wall_confirm`'s `texts`), each written empty: the reading is
-/// held equal as joined.
-///
+/// THE CANONICAL PHRASE of a notice whose text is `text` (T7): the first phrase ([`phrases`], or an `API Error` printing the status the source printed) whose [`Reading`] is the source's, with its reset clause rebased ([`reset_clause`]) when the source names one and the phrase reads the same with it.
 /// # Errors
 /// No phrase reads as the source does: the notice is refused, never kept.
 pub fn canonical(text: &str, joins: usize, shift: i64, year: i64) -> Result<String, String> {
@@ -939,8 +752,6 @@ pub fn canonical(text: &str, joins: usize, shift: i64, year: i64) -> Result<Stri
     ))
 }
 
-// The rules
-
 /// Where a string sits in its row.
 pub struct At<'a> {
     /// The program that wrote the row.
@@ -953,22 +764,18 @@ pub struct At<'a> {
     pub part: Option<&'a str>,
     /// The row's `type`.
     pub row: Option<&'a str>,
-    /// A Codex row's `payload.type` (`function_call`, `exec_command_begin`,
-    /// …).
+    /// A Codex row's `payload.type` (`function_call`, `exec_command_begin`, …).
     pub payload: Option<&'a str>,
     /// The row is Claude Code's own notice (`isApiErrorMessage`).
     pub notice: bool,
-    /// It sits in a FREE subtree ([`opens_free`]: what a tool takes or
-    /// returns, what a schema's author named, what Claude Code sends or
-    /// attaches for the model, a map keyed by tracked files).
+    /// It sits in a FREE subtree ([`opens_free`]: what a tool takes or returns, what a schema's author named, what Claude Code sends or attaches for the model, a map keyed by tracked files).
     pub free: bool,
 }
 
 /// What becomes of a string.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Treat {
-    /// As written: the negative controls' (`reduce_tests.rs`); [`P11`] keeps
-    /// nothing as written that is no closed word.
+    /// As written: the negative controls' (`reduce_tests.rs`); [`P11`] keeps nothing as written that is no closed word.
     #[cfg_attr(
         not(test),
         expect(
@@ -977,8 +784,7 @@ pub enum Treat {
         )
     )]
     Keep,
-    /// A CANDIDATE closed word: as written while it is a word ([`is_word`])
-    /// and a reader reads it ([`Rules::words`]), else replaced.
+    /// A CANDIDATE closed word: as written while it is a word ([`is_word`]) and a reader reads it ([`Rules::words`]), else replaced.
     Word,
     /// Remapped, one to one.
     Id,
@@ -994,19 +800,14 @@ pub enum Treat {
     Replace,
 }
 
-/// The rule a reducer follows. [`P11`] is the one `lab reduce` runs; the
-/// tests' negative controls wrap it to break one case.
+/// The rule a reducer follows.
 pub trait Rules {
     /// What becomes of the string `s` at `at`.
     fn string(&self, at: &At<'_>, s: &str) -> Treat;
 
-    /// Which of the file's candidate closed words its reduction keeps: one
-    /// flag per pair of [`Candidates::pairs`]. The readers decide
-    /// ([`Candidates::by_readings`]).
-    ///
+    /// Which of the file's candidate closed words its reduction keeps: one flag per pair of [`Candidates::pairs`].
     /// # Errors
-    /// The file is refused: with every candidate kept, its reduction still
-    /// does not read as its source.
+    /// The file is refused: with every candidate kept, its reduction still does not read as its source.
     fn words(&self, c: &Candidates<'_>) -> Result<Vec<bool>, String> {
         c.by_readings()
     }
@@ -1032,12 +833,6 @@ impl Rules for P11 {
         }
         match at.program {
             Program::Claude => {
-                // A message's text as its readers read it: its string
-                // content, or any content part's `text`, whatever the part's
-                // `type` says (`wall_confirm`'s `texts`, the step fold's
-                // lead), so a part whose `type` no reader reads, emptied, is
-                // still read and reduced as one (a reduction
-                // reduced again is itself).
                 let message_text = at.path.first().map(String::as_str) == Some("message")
                     && at.path.get(1).map(String::as_str) == Some("content")
                     && (at.path.len() == 2 || (at.path.len() == 3 && at.key == "text"));
@@ -1059,8 +854,6 @@ impl Rules for P11 {
             }
             Program::Codex => {
                 // A call's own tool name: `payload.name` of a call item.
-                // Every other `name` (a `parsed_cmd` read's file name, …)
-                // is what a command named, never a tool's.
                 if at.key == "name"
                     && at.row == Some("response_item")
                     && matches!(at.payload, Some("function_call" | "custom_tool_call"))
@@ -1077,8 +870,6 @@ impl Rules for P11 {
     }
 }
 
-// The reduction
-
 /// A file reduced.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Reduction {
@@ -1094,29 +885,24 @@ pub struct Reduction {
     pub notices: usize,
     /// Days every time was moved by.
     pub shift_days: i64,
-    /// Days every time has moved from the first source, through the
-    /// reductions the source was itself made by ([`header`]'s count).
+    /// Days every time has moved from the first source, through the reductions the source was itself made by ([`header`]'s count).
     pub moved_days: i64,
     /// The source was itself a reduction.
     pub again: bool,
     /// The newest build a row named (`version`, Codex's `cli_version`).
     pub build: Option<String>,
-    /// Distinct `(key, word)` candidate pairs ([`Candidates::pairs`]), and
-    /// how many of them the reduction keeps.
+    /// Distinct `(key, word)` candidate pairs ([`Candidates::pairs`]), and how many of them the reduction keeps.
     pub words: (usize, usize),
 }
 
 /// Reduce `source` by [`P11`].
-///
 /// # Errors
-/// A line is not one JSON value, a notice reads as no canonical phrase, or
-/// the reduction cannot read as its source ([`Rules::words`]).
+/// A line is not one JSON value, a notice reads as no canonical phrase, or the reduction cannot read as its source ([`Rules::words`]).
 pub fn reduce(source: &str, program: Program) -> Result<Reduction, String> {
     reduce_with(source, program, &P11)
 }
 
 /// Reduce `source` by `rules`.
-///
 /// # Errors
 /// As [`reduce`].
 pub fn reduce_with(source: &str, program: Program, rules: &dyn Rules) -> Result<Reduction, String> {
@@ -1153,8 +939,6 @@ pub fn reduce_with(source: &str, program: Program, rules: &dyn Rules) -> Result<
 }
 
 /// A file walked by its rule: its reduction with EVERY candidate closed word
-/// kept ([`Candidates`]), the pairs and where each sits, and what the walk
-/// counted.
 struct Walked {
     rows: Vec<Node>,
     pairs: Vec<(String, String)>,
@@ -1164,7 +948,6 @@ struct Walked {
     notices: usize,
     shift: i64,
     /// The day count the source's own reduction header names, when the
-    /// source is a reduction ([`moved_before`]).
     before: Option<i64>,
     build: Option<String>,
 }
@@ -1189,10 +972,6 @@ fn walked(source: &str, program: Program, rules: &dyn Rules) -> Result<Walked, S
         }
         rows.push(parse(t).map_err(|e| format!("line {}: not one JSON value ({e})", n + 1))?);
     }
-    // The first pass learns the file's ids (every string the rule remaps
-    // as one), so a key that names an id is remapped as that id wherever it
-    // sits, before its value or after (`wireToolInputs`, keyed by the ids
-    // of the calls its row makes); it writes nothing.
     let mut learn = Walk::new(program, rules, true, HashSet::new());
     for (n, row) in rows.iter().enumerate() {
         let mut state = RowState::of(row, program, 0, BASE_DAY.0, true)
@@ -1203,7 +982,6 @@ fn walked(source: &str, program: Program, rules: &dyn Rules) -> Result<Walked, S
     }
     let mut w = Walk::new(program, rules, false, learn.ids.into_keys().collect());
     w.taken = learn.taken;
-    // The first row's own stamp, else the first a row holds anywhere.
     let first = rows
         .iter()
         .find_map(|r| {
@@ -1253,16 +1031,11 @@ fn walked(source: &str, program: Program, rules: &dyn Rules) -> Result<Walked, S
         notices,
         shift,
         before,
-        // A source reduction's rows may keep no build (no reader read it):
-        // its own line names it.
         build: build.or(named),
     })
 }
 
-/// A reduction's own `#` line: the program, the build its rows named (a
-/// closed word), how many days its times have moved from the first source,
-/// the row count, and, for a source that was itself a reduction (`again`),
-/// that it was reduced again, in fixed words.
+/// A reduction's own `#` line: the program, the build its rows named (a closed word), how many days its times have moved from the first source, the row count, and, for a source that was itself a reduction (`again`), that it was reduced again, in fixed words.
 #[must_use]
 pub fn header(
     program: Program,
@@ -1284,8 +1057,6 @@ pub fn header(
 }
 
 /// The build a reduction's own `#` line for `program` names (`# <program>
-/// <build> · lab reduce (…`), a closed word; `None` for `-` and any other
-/// line.
 fn build_named(line: &str, program: Program) -> Option<String> {
     let rest = line.strip_prefix(&format!("# {} ", program.name()))?;
     let (build, _) = rest.split_once(" · lab reduce (")?;
@@ -1293,8 +1064,6 @@ fn build_named(line: &str, program: Program) -> Option<String> {
 }
 
 /// The day count of a reduction's own `#` line for `program` (this rule's
-/// [`header`], or an earlier rule's: `# <program> <build> · lab reduce (…`
-/// naming `times moved <n> days`); `None` for any other line.
 fn moved_before(line: &str, program: Program) -> Option<i64> {
     let rest = line.strip_prefix(&format!("# {} ", program.name()))?;
     let (_, tail) = rest.split_once(" · lab reduce (")?;
@@ -1304,43 +1073,6 @@ fn moved_before(line: &str, program: Program) -> Option<i64> {
 }
 
 /// Whether member `key` of the object that sits under `parent`, `key`
-/// being `depth` keys deep in a row and in content part `part`, opens a
-/// FREE subtree: one whose keys a tool, a person or a schema's author named
-/// and whose strings are what they said, so every key in it is renamed
-/// `k<n>` (an id remapped as that id) and every string emptied. `id_key`:
-/// the key is an id the file names ([`Walk::is_id`]). Each is named by what
-/// it holds:
-///
-/// - what a tool TAKES: the `input` of any `…tool_use` part (`tool_use`,
-///   `server_tool_use`, `mcp_tool_use`), wherever the part sits; and what
-///   a map keyed by an id holds under each id, since a map keyed by a
-///   call's id holds what that call took (Claude Code 2.1.303 writes each
-///   call's input a second time in its row's `wireToolInputs`, and its
-///   working directory in `wireIngestContext`, both keyed so);
-/// - what a tool RETURNS: the `content` of any `…tool_result` part, and a
-///   message's `toolUseResult` and `mcpMeta` (an MCP tool's
-///   `structuredContent` and `_meta`) at any depth, since a `progress` row
-///   (`agent_progress`) nests a subagent's whole message under its `data`;
-/// - what a SCHEMA's author named: a member whose key ends in `schema`, any
-///   case (a tool definition's `input_schema`, MCP's `inputSchema` and
-///   `outputSchema`), wherever it sits, so a tool list keeps none of its
-///   arguments' names wherever Claude Code writes it (a deferred tool's
-///   `tool_addition` part in an `api-request-blob` row's `message` among
-///   them); and any object that is a JSON schema by its shape
-///   ([`is_schema`]) is free whole wherever it sits;
-/// - what Claude Code SENDS or ATTACHES for the model: an
-///   `api-request-shape` row's `shape` (its system prompt and its tool
-///   list), and each field of an `attachment` row's payload but its `type`
-///   and `origin`, which `upgrade::FinishedScan` reads (a
-///   `prompt_snapshot`'s tool list among them);
-/// - a map keyed by the files it tracks (a file-history snapshot's
-///   `trackedFileBackups`, keyed by each file's path, a bare file name
-///   among them).
-///
-/// A Codex call's `arguments`, `input` and `output` are free wherever they
-/// sit. The step fold, the wall check and the shape test read none of
-/// these. A tool's argument names in a place this rule does not name are
-/// what the text check's argument check finds by their shape.
 fn opens_free(
     program: Program,
     parent: &str,
@@ -1363,10 +1095,7 @@ fn opens_free(
         }
 }
 
-/// A JSON SCHEMA by its shape: an object whose `properties` is an object
-/// and whose `type` is `"object"` or absent. Its property names are what
-/// its author named (a tool's arguments), so it is free whole wherever it
-/// sits, in a tool list no rule names or nested in another schema.
+/// A JSON SCHEMA by its shape: an object whose `properties` is an object and whose `type` is `"object"` or absent.
 #[must_use]
 pub fn is_schema(v: &Node) -> bool {
     matches!(v.get("properties"), Some(Node::Obj(_)))
@@ -1374,7 +1103,6 @@ pub fn is_schema(v: &Node) -> bool {
 }
 
 /// What a row's walk carries: its type and, for a notice, the phrase its
-/// first text is written as.
 struct RowState {
     kind: Option<String>,
     /// A Codex row's `payload.type`.
@@ -1385,7 +1113,6 @@ struct RowState {
 
 impl RowState {
     /// A row's state; `learn`: for the first pass, which writes nothing,
-    /// so no notice's phrase is made.
     fn of(
         row: &Node,
         program: Program,
@@ -1420,8 +1147,7 @@ impl RowState {
     }
 }
 
-/// A notice row's text as `wall_confirm`'s `texts` joins it, and how many
-/// text parts it joined (0 for a string content).
+/// A notice row's text as `wall_confirm`'s `texts` joins it, and how many text parts it joined (0 for a string content).
 #[must_use]
 pub fn notice_text(row: &Node) -> (String, usize) {
     match row.get("message").and_then(|m| m.get("content")) {
@@ -1441,27 +1167,21 @@ struct Walk<'r> {
     program: Program,
     rules: &'r dyn Rules,
     /// The first pass: it learns the file's ids ([`Walk::id`]) and writes
-    /// nothing.
     learn: bool,
     /// The ids the first pass learned: every string the rule remaps as an
-    /// id where it is a value.
     known: HashSet<String>,
     ids: HashMap<String, String>,
     names: HashMap<String, String>,
     keys: HashMap<String, String>,
     /// The last `k<n>` named, and the names the file already holds as keys
-    /// (the first pass collects them).
     next_key: usize,
     taken: HashSet<String>,
     shift: i64,
     year: i64,
     /// The row being walked, and the member and element indices from its
-    /// root down to where the walk is ([`Site::trail`]).
     row: usize,
     trail: Vec<usize>,
     /// THE CANDIDATES: each `(key, word)` pair the rule keeps a
-    /// word of ([`Treat::Word`] while it is a word), in the order the file
-    /// first names it, and every place one sits.
     pairs: Vec<(String, String)>,
     pair_of: HashMap<(String, String), usize>,
     sites: Vec<Site>,
@@ -1507,18 +1227,11 @@ impl<'r> Walk<'r> {
 
 impl Walk<'_> {
     /// Whether a key is an ID the file names: a UUID's shape, or a string
-    /// the rule remaps as an id where it is a value (the first pass learns
-    /// them all, [`Walk::known`]). It is remapped as that id, one to one
-    /// with its values, and what it keys is free ([`opens_free`]).
     fn is_id(&self, k: &str) -> bool {
         is_uuid(k) || self.known.contains(k) || self.ids.contains_key(k)
     }
 
     /// The first rebased date in a row, in file order, outside a FREE
-    /// subtree ([`opens_free`], [`is_schema`]). `key` is the member `v`
-    /// sits under, `depth` how many keys deep it is, `part` the content
-    /// part it is in, and `in_content` whether it is an element of a
-    /// `content` array.
     fn first_day(
         &self,
         v: &Node,
@@ -1589,7 +1302,6 @@ impl Walk<'_> {
                     None
                 };
                 let part = own.or(part);
-                // A JSON schema is free whole, wherever it sits.
                 let free = free || is_schema(v);
                 let mut out = Vec::with_capacity(members.len());
                 for (i, (k, x)) in members.iter().enumerate() {
@@ -1600,8 +1312,6 @@ impl Walk<'_> {
                     self.trail.push(i);
                     let id_key = self.is_id(k);
                     let opens = opens_free(self.program, key, k, path.len(), part, id_key);
-                    // Named before its value, so `k<n>` follows reading
-                    // order; an id is that id, one to one with its values.
                     let name = if id_key {
                         self.id(k)
                     } else {
@@ -1679,7 +1389,6 @@ impl Walk<'_> {
                     None => format!("r{n:04}"),
                 }
             };
-        // An id the step fold cannot read stays one it cannot read.
         let v = if StepId::new(s).is_some() {
             v
         } else {
@@ -1690,7 +1399,6 @@ impl Walk<'_> {
     }
 
     /// A stamp with its date moved by the file's shift, the rest (its time
-    /// of day, fraction and zone, [`stamp_day`]) as written.
     fn time(&self, s: &str) -> String {
         match stamp_day(s) {
             Some((y, m, d)) => {
@@ -1702,8 +1410,6 @@ impl Walk<'_> {
     }
 
     /// An epoch number under a time key, moved by the file's shift (seconds
-    /// or milliseconds by its size; a fraction after the whole part kept as
-    /// written, Codex's `create_time`); any other number as written.
     fn epoch(&self, n: &str) -> String {
         if let Some((whole, fraction)) = n.split_once('.')
             && !whole.is_empty()
@@ -1731,9 +1437,6 @@ impl Walk<'_> {
     }
 
     /// A user row's text (or a local command's): the marker it opens with,
-    /// and nothing past it, but the canonical phrase of a local command's
-    /// output that reads as a full context (`wall_confirm`'s
-    /// `command_notice`) in its tags.
     fn lead(&self, s: &str) -> Result<String, String> {
         let t = s.trim_start();
         if t.trim_end() == COMPACT || t.strip_prefix(COMPACT).is_some_and(|r| r.starts_with(' ')) {
@@ -1757,9 +1460,6 @@ impl Walk<'_> {
     }
 
     /// A tool's name: the class table's names as written (Claude Code), a
-    /// vendor's word with no `__` (Codex: every name its 0.163.0 rollouts
-    /// called is a word, T9), else `tool<n>`,
-    /// an `mcp__` name keeping that prefix.
     fn tool(&mut self, s: &str) -> String {
         let kept = match self.program {
             Program::Claude => !s.starts_with("mcp__") && tool_class(s).0 != "other",
@@ -1782,12 +1482,6 @@ impl Walk<'_> {
     }
 
     /// A key: as written when it is an identifier outside a free subtree
-    /// (`free`: [`opens_free`], where a key is whatever a tool, a person or
-    /// a schema's author named), else `k<n>`, one to one. A key that is
-    /// already such a name ([`is_key_name`]: a reduction's own) is that name
-    /// wherever it sits, and a new name is never one the file holds
-    /// ([`Walk::taken`]), so a reduction reduced again names its keys as it
-    /// did.
     fn key(&mut self, k: &str, free: bool) -> String {
         if (!free && is_ident(k)) || is_key_name(k) {
             return k.to_string();
@@ -1807,10 +1501,7 @@ impl Walk<'_> {
     }
 }
 
-// The readings
-
 /// The fingerprint and identity a reading binds its fold to: any, the same
-/// for every file read.
 const READ_FP: u64 = 0x5eed_0000_0000_0007;
 const READ_ID: Option<(u64, u64)> = Some((16_777_220, 7));
 
@@ -1829,9 +1520,7 @@ fn is_row(line: &str) -> bool {
     !t.is_empty() && !t.starts_with('#')
 }
 
-/// One step a fold made of a file: the row its offset lies in (0-based,
-/// among the file's rows), its time, its state and what it is. Never its
-/// offset, which a word blanked moves.
+/// One step a fold made of a file: the row its offset lies in (0-based, among the file's rows), its time, its state and what it is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StepRead {
     /// The row.
@@ -1859,8 +1548,7 @@ pub struct Finish {
     pub last: LastTurn,
 }
 
-/// What the harness's standing-limit scan says after a row
-/// ([`StandingScan`]: the limit row a transcript stands at).
+/// What the harness's standing-limit scan says after a row ([`StandingScan`]: the limit row a transcript stands at).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Standing {
     /// `transcript_limit_until`.
@@ -1871,8 +1559,7 @@ pub struct Standing {
     pub spend: bool,
     /// `transcript_standing_wall`.
     pub wall: Option<StandingWall>,
-    /// `transcript_standing_limit`, its words as their [`Reading`] (the
-    /// row's text emptied).
+    /// `transcript_standing_limit`, its words as their [`Reading`] (the row's text emptied).
     pub limit: Option<(Reading, StandingLimit)>,
 }
 
@@ -1892,24 +1579,7 @@ impl Standing {
     }
 }
 
-/// WHAT THE COMMITTED READERS READ OF A FILE, row by row, which
-/// decides the closed words a reduction keeps ([`Candidates::by_readings`]).
-/// Claude Code's: the step fold's steps (bound at the file's start, floor
-/// 0, every row pushed, then taken twice: a held prompt's release), its
-/// losses and the main chain's end after every row and at the last; each
-/// notice as the wall check reads it ([`notice_read`]: its words as their
-/// [`Reading`], its typed fields, its wall, the walls it confirms and the
-/// limit it names); after every row, [`FinishedScan`]'s reading, the
-/// standing limit's ([`StandingScan`]: the limit's reset, its spend, the
-/// quota wall and the limit row) and the login wall's ([`LoginScan`]). A
-/// Codex rollout's: the Codex step fold's steps and losses, the spend
-/// fold's row by row ([`TurnReader`], whose copy rule the step fold
-/// shares) and the limits reader's ([`rollout_rate_limits`]). And for
-/// either, EVERY ROW AS THE HARNESS'S SHAPES READ IT ([`claude_reads`],
-/// [`codex_reads`]: the metadata-only reads every one of its readers
-/// decides from), so a closed word any committed reader reads, the wall
-/// check's `served_since_notice` and the upgrade's `resumed_build_warned`
-/// among them, is a reading's.
+/// WHAT THE COMMITTED READERS READ OF A FILE, row by row, which decides the closed words a reduction keeps ([`Candidates::by_readings`]).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Readings {
     /// The step fold's steps, oldest first.
@@ -1922,15 +1592,13 @@ pub struct Readings {
     pub end: End,
     /// The main chain's end after each row (Claude Code).
     pub ends: Vec<End>,
-    /// Each notice: its row, its words' reading, and the wall check's read
-    /// of it with its words emptied (Claude Code).
+    /// Each notice: its row, its words' reading, and the wall check's read of it with its words emptied (Claude Code).
     pub notices: Vec<(usize, Reading, NoticeRead)>,
     /// [`FinishedScan`] after each row (Claude Code).
     pub finished: Vec<Finish>,
     /// The standing limit after each row (Claude Code).
     pub standing: Vec<Standing>,
-    /// The login wall after each row: whether it stands, and when the last
-    /// one was lifted (Claude Code).
+    /// The login wall after each row: whether it stands, and when the last one was lifted (Claude Code).
     pub login: Vec<(bool, Option<u64>)>,
     /// The spend fold's reading of each row (Codex).
     pub spend: Vec<SpendRow>,
@@ -1940,8 +1608,7 @@ pub struct Readings {
     pub reads: Vec<Vec<Option<Value>>>,
 }
 
-/// The [`Readings`] of a file's rows (its `#` lines and blank lines are
-/// none).
+/// The [`Readings`] of a file's rows (its `#` lines and blank lines are none).
 #[must_use]
 pub fn readings(text: &str, program: Program) -> Readings {
     let rows: Vec<&str> = text.lines().filter(|l| is_row(l)).collect();
@@ -2067,7 +1734,6 @@ fn kind(e: &StepEvent) -> &'static str {
 }
 
 /// The step events of two folds agree: the same kinds and states, closed
-/// words and numbers, ids one to one.
 fn same_event(a: &StepEvent, b: &StepEvent, ids: &mut OneToOne) -> Result<(), String> {
     use StepEvent as E;
     match (a, b) {
@@ -2111,7 +1777,6 @@ fn same_event(a: &StepEvent, b: &StepEvent, ids: &mut OneToOne) -> Result<(), St
 }
 
 /// Two ends agree, the second's time `shift_ms` after the first's: the
-/// newest entry's class, the close, the wall and every class it confirms.
 fn same_end(a: &End, b: &End, shift_ms: i64) -> bool {
     let ms = |t: u64| i64::try_from(t).unwrap_or(i64::MAX);
     a.last == b.last
@@ -2122,7 +1787,6 @@ fn same_end(a: &End, b: &End, shift_ms: i64) -> bool {
 }
 
 /// Two spend rows agree, the second's turn stamped `shift_s` after the
-/// first's.
 fn same_spend(a: &SpendRow, b: &SpendRow, shift_s: i64) -> bool {
     match (a, b) {
         (SpendRow::Turn(x), SpendRow::Turn(y)) => {
@@ -2137,7 +1801,6 @@ fn same_spend(a: &SpendRow, b: &SpendRow, shift_s: i64) -> bool {
 }
 
 /// Two standing limits agree, the second's times `shift_s` after the
-/// first's and its row's id the first's one to one.
 fn same_standing(a: &Standing, b: &Standing, shift_s: i64, ids: &mut OneToOne) -> bool {
     let at = |t: Option<u64>| t.map(|t| i64::try_from(t).unwrap_or(i64::MAX));
     let moved = |x: Option<u64>, y: Option<u64>| at(x).map(|t| t.saturating_add(shift_s)) == at(y);
@@ -2180,7 +1843,6 @@ fn same_standing(a: &Standing, b: &Standing, shift_s: i64, ids: &mut OneToOne) -
 }
 
 /// Two rows' Codex limits readings agree, the second's times `shift_s`
-/// after the first's.
 fn same_limits(a: &[CodexLimits], b: &[CodexLimits], shift_s: i64) -> bool {
     a.len() == b.len()
         && a.iter().zip(b).all(|(x, y)| {
@@ -2204,21 +1866,7 @@ fn same_limits(a: &[CodexLimits], b: &[CodexLimits], shift_s: i64) -> bool {
         })
 }
 
-/// Whether `b`, a reduction's [`Readings`], READS AS `a`, its source's
-/// (fold check, which the reducer and its tests share): the same
-/// steps at the same rows in the same states, the same closed words and
-/// numbers, ids one to one, times `shift_days` apart (a bind's excepted);
-/// the same losses; the same end after every row and at the last (its wall
-/// and the classes it confirms); every notice read as its source's (its
-/// words' reading, its typed fields, its wall, what it confirms and the
-/// limit it names); the standing limit and the login wall after every row,
-/// their times the same days apart; and the spend fold's and the limits
-/// reader's rows, their stamps the same days apart. [`FinishedScan`]'s
-/// readings and the rows as the harness's shapes read them are not
-/// compared: they read the words a reduction empties or remaps (a prompt's,
-/// a reply's, an id), so a candidate is judged against the reduction with
-/// every candidate kept ([`Candidates::by_readings`]).
-///
+/// Whether `b`, a reduction's [`Readings`], READS AS `a`, its source's (fold check, which the reducer and its tests share): the same steps at the same rows in the same states, the same closed words and numbers, ids one to one, times `shift_days` apart (a bind's excepted); the same losses; the same end after every row and at the last (its wall and the classes it confirms); every notice read as its source's (its words' reading, its typed fields, its wall, what it confirms and the limit it names); the standing limit and the login wall after every row, their times the same days apart; and the spend fold's and the limits reader's rows, their stamps the same days apart.
 /// # Errors
 /// The first reading that differs, named.
 pub fn reads_as(a: &Readings, b: &Readings, shift_days: i64) -> Result<(), String> {
@@ -2237,8 +1885,6 @@ pub fn reads_as(a: &Readings, b: &Readings, shift_days: i64) -> Result<(), Strin
     let mut ids = OneToOne::default();
     for (sa, sb) in a.steps.iter().zip(&b.steps) {
         let ms = |s: &StepRead| i64::try_from(s.at_ms).unwrap_or(i64::MAX);
-        // A bind is dated at the floor, and so is a step of a row with no
-        // readable stamp (a latch): neither moves with the file's times.
         let timed = !matches!(sa.ev, StepEvent::Bind { .. }) && (sa.at_ms, sb.at_ms) != (0, 0);
         if sa.row != sb.row || sa.state != sb.state || (timed && ms(sb) - ms(sa) != shift) {
             return Err(format!(
@@ -2339,8 +1985,6 @@ pub fn reads_as(a: &Readings, b: &Readings, shift_days: i64) -> Result<(), Strin
 }
 
 /// Where a candidate closed word sits: its row (0-based, among the file's
-/// rows), the member and element indices from the row's root down to it,
-/// and its pair ([`Candidates::pairs`]).
 #[derive(Clone, Debug)]
 struct Site {
     row: usize,
@@ -2376,10 +2020,7 @@ fn blank_at(v: &mut Node, trail: &[usize]) {
     }
 }
 
-/// A file's CANDIDATE CLOSED WORDS: its reduction with every one
-/// kept, each `(key, word)` pair the rule keeps a word of, in the order the
-/// file first names it, and every place one sits; what [`Rules::words`]
-/// chooses from.
+/// A file's CANDIDATE CLOSED WORDS: its reduction with every one kept, each `(key, word)` pair the rule keeps a word of, in the order the file first names it, and every place one sits; what [`Rules::words`] chooses from.
 pub struct Candidates<'a> {
     program: Program,
     /// The file reduced.
@@ -2426,8 +2067,7 @@ impl<'a> Candidates<'a> {
         })
     }
 
-    /// The candidate pairs, `(key, word)`, in the order the file first names
-    /// them.
+    /// The candidate pairs, `(key, word)`, in the order the file first names them.
     #[must_use]
     #[cfg_attr(
         not(test),
@@ -2440,15 +2080,13 @@ impl<'a> Candidates<'a> {
         &self.pairs
     }
 
-    /// Every candidate kept: the reduction as the string rule alone writes
-    /// it.
+    /// Every candidate kept: the reduction as the string rule alone writes it.
     #[must_use]
     pub fn every(&self) -> Vec<bool> {
         vec![true; self.pairs.len()]
     }
 
     /// The reduction's rows with the pairs `keep` flags kept, and every
-    /// other pair's words emptied wherever they sit.
     fn lines(&self, keep: &[bool]) -> Vec<Cow<'_, str>> {
         let gone = |s: &&Site| !keep.get(s.pair).copied().unwrap_or(true);
         self.rows
@@ -2478,12 +2116,7 @@ impl<'a> Candidates<'a> {
         readings_of(&rows, self.program)
     }
 
-    /// THE READERS DECIDE. With every candidate kept the
-    /// reduction must read as its source ([`reads_as`]), else the file is
-    /// refused: nothing restores it. Then the pairs are chosen by the
-    /// reduction's [`Readings`] ([`choose`]): each is kept only when
-    /// blanking it alone, across the file, changes them.
-    ///
+    /// THE READERS DECIDE.
     /// # Errors
     /// With every candidate kept, the reduction does not read as its source.
     pub fn by_readings(&self) -> Result<Vec<bool>, String> {
@@ -2501,13 +2134,6 @@ impl<'a> Candidates<'a> {
 }
 
 /// THE CHOICE OF `n` CANDIDATE PAIRS BY A READING: `read` of the
-/// flags kept, which with every flag set is the reading to keep. Each pair
-/// is kept only when blanking it alone changes that reading. Blanked
-/// together, the rest may change it (two rows a reader reads either of):
-/// they are put back, in the order the file first names them, until it
-/// reads as it did. Last, a pair another kept pair made needless is blanked
-/// again, until each kept pair, blanked alone, changes the reading. So
-/// what is kept reads as every pair kept, and no pair kept is needless.
 fn choose<R: PartialEq>(n: usize, read: impl Fn(&[bool]) -> R) -> Vec<bool> {
     let all = vec![true; n];
     let base = read(&all);
@@ -2543,14 +2169,9 @@ fn choose<R: PartialEq>(n: usize, read: impl Fn(&[bool]) -> R) -> Vec<bool> {
     }
 }
 
-/// THE OUTPUT-SIDE CHECK: the closed words the reduction `text`
-/// keeps that no reading reads — each candidate pair ([`Candidates::pairs`])
-/// whose words, blanked alone, leave its [`readings`] as they were. A
-/// reduction `lab reduce` writes keeps none.
-///
+/// THE OUTPUT-SIDE CHECK: the closed words the reduction `text` keeps that no reading reads — each candidate pair ([`Candidates::pairs`]) whose words, blanked alone, leave its [`readings`] as they were.
 /// # Errors
-/// `text` is no file `lab reduce` reads (a line that is no JSON value, a
-/// notice that reads as no canonical phrase).
+/// `text` is no file `lab reduce` reads (a line that is no JSON value, a notice that reads as no canonical phrase).
 pub fn unread_words(text: &str, program: Program) -> Result<Vec<(String, String)>, String> {
     let w = walked(text, program, &P11)?;
     let own = text
@@ -2571,11 +2192,7 @@ pub fn unread_words(text: &str, program: Program) -> Result<Vec<(String, String)
         .collect())
 }
 
-/// THE VERB'S CHECK OF WHAT IT WRITES: the reduction `r` of `source` reads
-/// as its source ([`reads_as`]) and keeps no closed word no
-/// reader reads ([`unread_words`]). `lab reduce` writes nothing
-/// that fails it.
-///
+/// THE VERB'S CHECK OF WHAT IT WRITES: the reduction `r` of `source` reads as its source ([`reads_as`]) and keeps no closed word no reader reads ([`unread_words`]).
 /// # Errors
 /// The first that fails, named.
 pub fn check_written(source: &str, r: &Reduction, program: Program) -> Result<(), String> {
@@ -2597,27 +2214,14 @@ pub fn check_written(source: &str, r: &Reduction, program: Program) -> Result<()
     }
 }
 
-// The verb
-
-/// `reduce <transcript|rollout> --program claude|codex [--out FILE]`: the
-/// reduction to FILE (never one that exists) or to stdout, and what it did
-/// to stderr. Both paths are the caller's, read against the directory it
-/// ran the lab from (`paths::from_caller`), since the lab itself works
-/// from `/`.
-///
-/// What it writes passes the output-side check ([`unread_words`]: every
-/// closed word kept is one a reader reads), or nothing is written.
-///
+/// `reduce <transcript|rollout> --program claude|codex [--out FILE]`: the reduction to FILE (never one that exists) or to stdout, and what it did to stderr.
 /// # Errors
-/// Usage; the file cannot be read; a line is not JSON or a notice reads as
-/// no canonical phrase; the reduction cannot read as its source, or keeps a
-/// word no reader reads; FILE exists or cannot be written.
+/// Usage; the file cannot be read; a line is not JSON or a notice reads as no canonical phrase; the reduction cannot read as its source, or keeps a word no reader reads; FILE exists or cannot be written.
 pub fn cmd_reduce(args: &[String]) -> Res {
     reduce_verb(args, reduce)
 }
 
 /// [`cmd_reduce`], reducing `by` ([`reduce`]): the verb's negative controls
-/// reduce by a rule that keeps what [`check_written`] refuses.
 fn reduce_verb(args: &[String], by: fn(&str, Program) -> Result<Reduction, String>) -> Res {
     let usage = || {
         Fail::usage(format!(
@@ -2647,13 +2251,10 @@ fn reduce_verb(args: &[String], by: fn(&str, Program) -> Result<Reduction, Strin
     let source =
         std::fs::read_to_string(&file).map_err(|e| Fail::die(format!("reduce: {file}: {e}")))?;
     let r = by(&source, program).map_err(|e| Fail::die(format!("reduce: {file}: {e}")))?;
-    // What is written reads as its source and keeps no word no reader
-    // reads, or nothing is written.
     check_written(&source, &r, program)
         .map_err(|e| Fail::die(format!("reduce: {file}: its reduction: {e}")))?;
     match &out {
         Some(path) => {
-            // Never over an existing file: a reduction is written once.
             let mut f = std::fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)

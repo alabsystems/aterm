@@ -2,25 +2,6 @@
 // Copyright 2026 Andrew Yates
 
 //! The resident across a coordinate seam.
-//!
-//! A window resize (every frame of a live drag), a font step, a DPI change, a zoom,
-//! an alternate-screen enter or exit, and a tab or pane switch are coordinate
-//! seams. The pet crosses each with a cat on every frame: a regrid keeps the body;
-//! a new surface crossfades, the old body fading as a ghost on the glass it was
-//! drawn on while the arriver comes up; an incoherent world observation holds the
-//! frame, and a sub-row scroll is not incoherent.
-//!
-//! The laws drive the shipping `CompanionOwner` over a real `Terminal` in the
-//! native frame order (observe, prepare, tick, rescan) and conform each seam to
-//! `PetSurfaceSeam` (`aterm_models_effects::pet_surface_seam_model`). Negative
-//! controls replay the retiring seams (`retire_coordinate_space`, `retire_owner`)
-//! on the same real state and reproduce the cut the model refuses.
-//!
-//! Ghost rules pinned here: every ghost knows its own pane and fades there; glass
-//! that goes takes its ghost; unknown is not evidence; a refused ghost hands its
-//! presence to the arriver; a ghost is drawn at its body's last stance, tile and
-//! palette; and an arriver that adopts its ghost on a quick return goes on in that
-//! look, and in its palette on the surface the ghost was drawn on.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
@@ -59,14 +40,12 @@ struct Host {
     /// The terminal's session (the world and the facts are keyed on it).
     session: u64,
     /// A composed host's focused pane: its cell `(0, 0)` in window-grid
-    /// pixels (`PetFacts::pane`). `None` for a single grid.
     pane: Option<(i32, i32)>,
     /// The other pane of a split, unfocused and still on glass.
     other: Option<Pane>,
     /// A third pane beside them, unfocused and still on glass.
     third: Option<Pane>,
     /// Offer the split's panes as glass before each tick, as the composed
-    /// host does (`CompanionOwner::offer_glass`).
     offer: bool,
     owner: CompanionOwner,
     decos: WordDecorations,
@@ -76,7 +55,6 @@ struct Host {
     cell: (u16, u16),
     origin: (i32, i32),
     /// Present the cells as a snapshot extracted before a scroll the facts
-    /// already saw — an observation the world map must refuse.
     stale: bool,
     /// The renderer's sub-row scroll translate for the next presents.
     frac: i32,
@@ -95,7 +73,6 @@ struct Shot {
     /// The live body's rect in window-grid pixels `(x0, y0, x1, y1)`.
     body_win: Option<(i32, i32, i32, i32)>,
     /// The first ghost drawn, in window-grid pixels: a ghost on its own
-    /// glass from the window channel, else the live lane's.
     ghost_win: Option<(i32, i32, i32, i32)>,
     /// Its opacity and z-order.
     ghost_alpha: u8,
@@ -107,14 +84,10 @@ struct Shot {
     /// The focused pane's cell `(0, 0)` in window pixels.
     pane_at: (i32, i32),
     /// Every pet-sized body drawn this frame, either channel, in window
-    /// pixels: the ghosts and the live body, with the atlas tile each wears.
     pets: [Option<Drawn>; 8],
 }
 
 /// One pet-sized sprite as drawn: its window rect `(x0, y0, x1, y1)`, the atlas
-/// tile it wears (the bake of its pose, look and palette), its opacity, and whether
-/// it is the frame's live body (the last sprite the live lane pushed, at
-/// `body_win`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Drawn {
     rect: (i32, i32, i32, i32),
@@ -182,8 +155,6 @@ impl Host {
     /// One present in the native order: observe, prepare, tick, rescan.
     fn present(&mut self) -> Shot {
         self.now += FRAME;
-        // A composed host opens every presented frame: the bake budget, the
-        // atlas clock and the one-body door are per frame.
         self.decos.begin_host_frame();
         let (rows, cols) = self.grid();
         let mut input = self.term.cell_frame(usize::from(rows), usize::from(cols));
@@ -249,10 +220,6 @@ impl Host {
             &mut self.decos,
         );
         let frame = self.owner.tick(tick);
-        // The performance seam, as the hosts run it: it dresses the pet (the
-        // worn look a re-sighting ghost carries) and draws the sprites — the
-        // live lane into the focused surface's channel, a ghost on its own
-        // glass into the window's, as the composed host does.
         let mut free = Vec::new();
         let mut window = Vec::new();
         let _ = self.owner.emit_on(
@@ -286,7 +253,6 @@ impl Host {
                 s.y + at.1 + i32::from(s.h),
             )
         };
-        // The live lane pushes its ghosts first.
         let lane_ghosts = frame
             .pet
             .departures
@@ -350,9 +316,6 @@ impl Host {
     }
 
     /// A vertical split of a 30x100 window: the left pane (session 8, cols 0..50,
-    /// prompt on row 20) and the focused right pane (session 7, cols 51..100 past
-    /// the divider, prompt on row 10) with the pet settled beside its prompt. Both
-    /// are offered as glass.
     fn split_settled() -> Self {
         let mut h = Self::new(30, 49);
         let cw = i32::from(h.cell.0);
@@ -375,9 +338,6 @@ impl Host {
     }
 
     /// Three panes side by side in a 30x98 window, each 32 columns: left (session 8,
-    /// cols 0..32, prompt on row 20), the focused middle (session 7, cols 33..65,
-    /// prompt on row 10) with the pet settled beside its prompt, and right (session
-    /// 9, cols 66..98, prompt on row 5). All three are offered as glass.
     fn three_settled() -> Self {
         let mut h = Self::new(30, 32);
         let cw = i32::from(h.cell.0);
@@ -407,9 +367,6 @@ impl Host {
     }
 
     /// Focus the split's other pane: the terminal, the session and the
-    /// pixel frame the pet chases swap, and the hosts' two fences run — the
-    /// layout fence (another view is focused) and the owner fence (another
-    /// terminal), both through the re-sighting crossfade.
     fn focus_other(&mut self) {
         self.focus_pane(false);
     }
@@ -521,8 +478,6 @@ fn project(
             post.insert("refused", 0);
             post.insert("lit", i64::from(owner.brain().is_active()));
             post.insert("hit", i64::from(owner.hit_rect().is_some()));
-            // A dark boundary draws nothing: the ghosts still fading are
-            // held by value for the next tick, not on glass.
             post.insert("ghost", 0);
         }
         ("Spend", None) => {
@@ -535,8 +490,6 @@ fn project(
             post.insert("refused", 1);
         }
         ("Handoff", Some(s)) => {
-            // The breed handoff's leaver on glass beside the body: a ghost
-            // in another coat than the body's.
             let worn = owner.brain().worn_pair().map(|(coat, _)| coat);
             let mut ghosts = s.frame.pet.departures.iter().flatten();
             let leaver = s.cat() && ghosts.any(|d| Some(d.coat) != worn);
@@ -552,9 +505,6 @@ fn project(
             post.insert("hit", i64::from(s.hit));
             let g = ghost(s);
             post.insert("ghost", i64::from(g.is_some()));
-            // The old body stood at `before`'s cell, in `before`'s frame: a ghost
-            // anywhere else on glass (window pixels, every edge), or at another
-            // size, stands where the old body never was.
             let near = |a: (i32, i32, i32, i32), b: (i32, i32, i32, i32)| a == b;
             post.insert(
                 "ghost_moved",
@@ -567,7 +517,6 @@ fn project(
                             .is_some_and(|(ghost, body)| near(ghost, body))
                 })),
             );
-            // Only the regrid and the blind frame keep the body's place.
             post.insert("moved", i64::from(post["seam"] != 2 && jumped(before, s)));
         }
         _ => panic!("no projection for {action}"),
@@ -576,7 +525,6 @@ fn project(
 }
 
 /// Fire `action` on the model and check the real projection is its
-/// successor, with every invariant holding. `Err` names the refusal.
 fn conform(model: &Model, state: &mut State, action: &str, post: State) -> Result<(), String> {
     let lawful = model.successors(action, state).contains(&post)
         && model
@@ -600,7 +548,6 @@ fn shipped_step(shipped: &Model, state: &State, action: &str, post: &State) -> R
 }
 
 /// A ghost's opacity as drawn: its fade envelope times the lane's presence
-/// (`WordDecorations::pet_departure_sprite`).
 fn drawn_alpha(shot: &Shot, d: &aterm_effects::kitty_pet::PetDepartureSprite) -> u8 {
     (u16::from(d.alpha) * u16::from(shot.frame.pet.lane_alpha) / 255) as u8
 }
@@ -635,11 +582,6 @@ fn step(
 }
 
 /// A font step and a live window drag keep the cat: cells 8x16 to 9x18 with the grid
-/// following, then the window a column narrower per frame, leave the resident on
-/// glass on every frame within a cell of its seat (`Regrid`).
-///
-/// Negative control: the retiring seam (`retire_coordinate_space`) blanks the cat
-/// after the font step and on every frame of the drag, and the model refuses it.
 #[test]
 fn a_font_step_and_a_live_drag_keep_the_resident_on_glass() {
     let model = pet_surface_seam_model();
@@ -658,7 +600,6 @@ fn a_font_step_and_a_live_drag_keep_the_resident_on_glass() {
         )
         .expect("the settled resident is drawn");
 
-        // ⌘+ : the cells grow and the grid follows the fixed window.
         h.cell = (9, 18);
         h.term.resize(26, 88);
         match rule {
@@ -688,7 +629,6 @@ fn a_font_step_and_a_live_drag_keep_the_resident_on_glass() {
             assert!(far.is_none(), "the font step moved the cat: {far:?}");
         }
 
-        // A live drag: one column narrower on every frame.
         let mut prev = h.present();
         let mut blank = 0;
         for k in 1..=30u16 {
@@ -718,14 +658,6 @@ fn a_font_step_and_a_live_drag_keep_the_resident_on_glass() {
 }
 
 /// Launching and quitting a full-screen program crossfades. The alternate screen
-/// enters (a TUI paints text where the pet sat) and exits, each through the owner
-/// fence (`CompanionOwner::resight_owner`). The boundary is dark and owns no hit
-/// target; the next frame has the replacement at its new station and the old body
-/// as a ghost exactly where it was drawn, beneath the TUI's text, fading over a
-/// quarter second while the arriver comes up. No frame is without a cat.
-///
-/// Negative control: the retiring fence (`retire_owner`) cuts the cat, and the model
-/// refuses it.
 #[test]
 fn an_alt_screen_enter_and_exit_crossfade_instead_of_cutting() {
     let model = pet_surface_seam_model();
@@ -802,8 +734,6 @@ fn an_alt_screen_enter_and_exit_crossfade_instead_of_cutting() {
         }
     }
 
-    // Glass that is gone spends no ghost: the grid's origin moves before the next
-    // frame and no glass is offered where the old body was drawn.
     let mut h = Host::settled();
     let before = h.present();
     let mut state = model.init_state();
@@ -822,19 +752,9 @@ fn an_alt_screen_enter_and_exit_crossfade_instead_of_cutting() {
 }
 
 /// A split-pane focus switch crossfades across panes. The pet settled in the right
-/// pane; the focus moves left and the layout and owner fences run. The boundary is
-/// dark and owns no hit target; the next frame has the arriver at the left pane's
-/// caret on its homecoming ramp and the old body as a ghost on its own glass (the
-/// window channel, at the window pixels it was drawn at, beneath that pane's text),
-/// fading over a quarter second. No frame is without a cat.
-///
-/// Negative control: an owner offered no glass drops the ghost and cuts the cat,
-/// which the model refuses (`PaneCut`). Controls: the ghost goes when its glass
-/// goes.
 #[test]
 fn a_split_pane_focus_switch_crossfades_across_panes() {
     let model = pet_surface_seam_model();
-    // The `PaneCut` mutant: a same-glass replacement crossfades, a shifted one cuts.
     let shipped = aterm_spec::interp::with_consts(&model, &[("PaneCut", 1)]);
     for offer in [true, false] {
         let label = if offer { "after" } else { "before" };
@@ -933,9 +853,6 @@ fn a_split_pane_focus_switch_crossfades_across_panes() {
         );
     }
 
-    // Glass that goes takes its ghost: the old pane closes at the switch, or a font
-    // step lands with it, and the arriver fades in alone; the old pane closing
-    // mid-fade drops the ghost on the next frame.
     for lose in ["closed", "font step"] {
         let mut h = Host::split_settled();
         let before = h.present();
@@ -978,16 +895,11 @@ fn a_split_pane_focus_switch_crossfades_across_panes() {
 }
 
 /// The same seat in one surface's cells: on the row, within a cell
-/// (`kitty_pet::ADOPT_REACH`).
 fn at_seat(col: f32, row: f32, seat: (f32, f32)) -> bool {
     (col - seat.0).abs() <= 1.0 && (row - seat.1).abs() < 0.5
 }
 
 /// The cat at `seat` this frame: how many bodies stand there, and the
-/// presence the eye sees there — their composite coverage, `0..=255`. On the
-/// focused surface (`own == false`) that is the arriver and the ghosts of the
-/// live lane; on the pane the focus left (`own == true`), its own-glass
-/// ghosts.
 fn seat_cat(shot: &Shot, seat: (f32, f32), own: bool) -> (usize, u8) {
     let mut alphas: Vec<u8> = shot
         .frame
@@ -1007,7 +919,6 @@ fn seat_cat(shot: &Shot, seat: (f32, f32), own: bool) -> (usize, u8) {
 }
 
 /// Everything of the cat on glass this frame, summed: the arriver and every
-/// ghost, as drawn. One cat is 255.
 fn total_presence(shot: &Shot) -> u16 {
     if !shot.cat() {
         return 0;
@@ -1024,10 +935,6 @@ fn total_presence(shot: &Shot) -> u16 {
 }
 
 /// For every ghost that leaves glass during `shots` — the first frame it is
-/// no longer drawn — the alpha it should still have had there under the
-/// crossfade's complement law: its starting presence times what its arriver
-/// was still missing on that frame (`255 − alpha`). Zero when it leaves on
-/// the arriver's full frame; up to one for the bytes' rounding.
 fn tails(shots: &[Shot]) -> Vec<u8> {
     type Key = (bool, i32, i32);
     let drawn = |shot: &Shot| -> Vec<(Key, u8)> {
@@ -1063,9 +970,6 @@ fn tails(shots: &[Shot]) -> Vec<u8> {
 }
 
 /// The look of the most present body at `seat` this frame — `(pose,
-/// facing_left)` as drawn — on the focused surface (`own == false`: the
-/// arriver and the live lane's ghosts) or on the pane the focus left (`own`:
-/// its own-glass ghosts).
 fn seat_look(shot: &Shot, seat: (f32, f32), own: bool) -> Option<(PetGlyphId, bool)> {
     let mut bodies: Vec<(u8, (PetGlyphId, bool))> = shot
         .frame
@@ -1088,13 +992,6 @@ fn seat_look(shot: &Shot, seat: (f32, f32), own: bool) -> Option<(PetGlyphId, bo
 }
 
 /// The seat a return brings the cat back to, as the frames after it draw it:
-/// `(restarted, most bodies there, presence floor there, what the user saw
-/// there before the return)`. The seat is where the arriver stands on the
-/// first frame; before the return it was on the pane the focus left
-/// (`own`, a ghost on its own glass) or on the same glass. It `restarted` if
-/// a second body of the cat stood there, the presence there fell below what
-/// the user saw (a frame's rounding allowed), or the body there changed its
-/// look — pose or facing — on the frame it came back.
 fn return_seat(seen: &Shot, after: &[Shot], own: bool) -> (bool, usize, u8, u8) {
     let seat = (after[0].frame.pet.col, after[0].frame.pet.row);
     let (_, there) = seat_cat(seen, seat, own);
@@ -1124,12 +1021,6 @@ fn tui_bytes() -> Vec<u8> {
 }
 
 /// A quick return continues the one cat it comes back to. The focus leaves a surface
-/// and comes back two frames later, while the body it left still fades as a ghost:
-/// a split pane (the ghost on its own glass) and a full-screen program that quits at
-/// once (the same glass). The arriver is seated at the ghost's seat in its look and
-/// adopts the ghost's cell and presence: one body at the seat on every frame, its
-/// presence never below what the user saw, and the pane the focus left keeps a
-/// ghost no brighter than its body was.
 #[test]
 fn a_quick_return_continues_the_one_cat_it_comes_back_to() {
     let model = pet_surface_seam_model();
@@ -1234,12 +1125,6 @@ fn a_quick_return_continues_the_one_cat_it_comes_back_to() {
 }
 
 /// Every crossfade ghost leaves glass on its arriver's full frame: a ghost's envelope
-/// runs on its arriver's ramp from the presence it had on glass, so on every frame
-/// the arriver and the ghosts sum to about one cat (255), the arriver's 6 %
-/// first-frame floor the only excess. Cases: a split-pane switch, a full-screen
-/// program, and a return to the pane the focus left after its caret moved a row
-/// (its ghost then fades apart from the arriver's seat), two and eight frames into
-/// the first crossfade.
 #[test]
 fn every_crossfade_ghost_leaves_glass_on_its_arrivers_full_frame() {
     let model = pet_surface_seam_model();
@@ -1282,7 +1167,6 @@ fn every_crossfade_ghost_leaves_glass_on_its_arrivers_full_frame() {
                 after.push(h.present());
             }
             let seen = *after.last().expect("frames");
-            // Output in the pane the focus left moves its caret a row.
             h.other.as_mut().expect("a split").term.process(b"\r\n$ ");
             h.focus_other();
             step(&model, &mut state, "Return", &h.owner, &seen, None)
@@ -1329,19 +1213,10 @@ fn every_crossfade_ghost_leaves_glass_on_its_arrivers_full_frame() {
 }
 
 /// An adopted body goes on in the look the user saw. A quick return adopts the ghost
-/// at the arriver's seat, and the body goes on in the ghost's pose and facing while
-/// it rests there: through the homecoming ramp and, for a still pose, until the
-/// brain's own look steps. Every handover rides a step the brain takes anyway (its
-/// look stepping at rest, a mid-stride pose folding at the ramp's end, or the body
-/// set in motion), and the held look never travels or flies. Cases: mid-stretch
-/// after a key (the brain walks on at once), standing, sitting face-on, asleep,
-/// mid-stride, and standing with Enter two frames after the return.
 #[test]
 fn an_adopted_body_goes_on_in_the_look_the_user_saw() {
     let model = pet_surface_seam_model();
     for (case, keys, wait, input) in [
-        // Inside the stretch's lead: the body drawn stretched, and its
-        // ghost at that stretch (`ghost_moved` reads its pixels).
         ("mid-stretch", 1usize, 4usize, None),
         ("standing", 3, 30, None),
         ("face-on", 6, 120, None),
@@ -1417,8 +1292,6 @@ fn an_adopted_body_goes_on_in_the_look_the_user_saw() {
         conform(&model, &mut state, "Tick", post)
             .unwrap_or_else(|e| panic!("{case}: one body goes on in the look the user saw: {e}"));
         assert_eq!(most, 1, "{case}: one body at the seat");
-        // The held look rests at its seat: it never slides, lifts or rides a
-        // gather, a flight or a landing.
         let flying = |p: &PetFrame| {
             p.lift.abs() > 0.05
                 || matches!(
@@ -1442,10 +1315,6 @@ fn an_adopted_body_goes_on_in_the_look_the_user_saw() {
                 .map(|s| s.frame.pet)
                 .collect::<Vec<_>>()
         );
-        // Every handover rides a step the brain takes anyway: after the ramp
-        // (a still look until the brain's own steps — the standing cat's own
-        // stand may creep a little before it folds — and a mid-stride one at
-        // the ramp's end, at rest), or the brain setting the body in motion.
         let handover = handover.unwrap_or_else(|| panic!("{case}: the look hands over: {looks:?}"));
         let moving = flying(&handover)
             || (handover.col - a0.col)
@@ -1479,10 +1348,6 @@ fn an_adopted_body_goes_on_in_the_look_the_user_saw() {
 }
 
 /// Every ghost fades in its own pane across three panes. A quick cycle M → L → R
-/// inside the first crossfade leaves two ghosts on two own glasses (M's and L's);
-/// each fades where it was drawn and reaches zero on the arriver's full frame, so no
-/// pane loses its cat in one frame and the cat never dips. Coming back to M or L,
-/// the ghost there is the cat the arriver adopts.
 #[test]
 fn every_ghost_fades_in_its_own_pane_across_three_panes() {
     let model = pet_surface_seam_model();
@@ -1517,8 +1382,6 @@ fn every_ghost_fades_in_its_own_pane_across_three_panes() {
             match back {
                 "none" => {
                     after.extend(h.shots(Duration::from_millis(400)));
-                    // From the frame before the switch to R: a ghost cut at
-                    // that boundary leaves glass there.
                     let tails = tails(&[&[seen][..], &after[..]].concat());
                     let mut post = project(&state, "Spend", &h.owner, &seen, None);
                     post.insert("tail", i64::from(tails.iter().any(|&t| t > 1)));
@@ -1588,8 +1451,6 @@ fn every_ghost_fades_in_its_own_pane_across_three_panes() {
 }
 
 /// The cat in each of `Host::three_settled`'s panes (L, M, R by window x)
-/// this frame, summed as drawn: the focused pane's arriver and its
-/// same-glass ghosts, and each window-channel ghost in the pane it stands in.
 fn by_pane(shot: &Shot, cw: i32) -> [u16; 3] {
     let pane = |x: i32| ((x / cw) / 33).clamp(0, 2) as usize;
     let mut out = [0u16; 3];
@@ -1615,14 +1476,6 @@ fn by_pane(shot: &Shot, cw: i32) -> [u16; 3] {
 }
 
 /// An incoherent frame holds, and a sub-row scroll is not incoherent. A stale
-/// snapshot (cells extracted before a scroll the facts saw) certifies nothing, so
-/// the pet is held where it was drawn, at full opacity, for the visibility hold's
-/// blind grace, then faded. A sub-row scroll offset (a glide's tail, the overscroll
-/// bounce) is observed coherently: the renderer translates the grid band and the
-/// sprite together, so the pet does not change.
-///
-/// Controls: the stale snapshot is refused, and so is the model's `Buggy` blind
-/// frame.
 #[test]
 fn an_incoherent_frame_holds_the_pet_and_a_sub_row_scroll_moves_nothing() {
     let model = pet_surface_seam_model();
@@ -1685,7 +1538,6 @@ fn an_incoherent_frame_holds_the_pet_and_a_sub_row_scroll_moves_nothing() {
     conform(&model, &mut state, "BlindLong", post).expect("the grace is bounded");
     assert!(!gone.frame.on_glass);
 
-    // Coherence returns: the cat comes back where it belongs.
     h.stale = false;
     let back = h.run(Duration::from_secs(2));
     assert!(back.frame.on_glass && back.frame.pet.alpha == 255);
@@ -1693,16 +1545,6 @@ fn an_incoherent_frame_holds_the_pet_and_a_sub_row_scroll_moves_nothing() {
 }
 
 /// A tall screen crossfades the body it replaced. A surface is judged in a bounded
-/// window of rows around its caret (`pet_world::MAX_WORLD_ROWS`), so on a 90-row
-/// terminal a program with its caret at the bottom cannot see where the shell's body
-/// stood, nor the shell the program's. Unknown is not evidence: the ghost keeps its
-/// own surface's verdict at the boundary and fades where it was drawn, beneath
-/// whatever ink is there, entering the program and quitting it.
-///
-/// The one guarantee that forbids the ghost (`Refuse`): protected cells under the
-/// old body, here double-width rows, whether the world sees both rows or only the
-/// feet row with the head outside its window. No ghost is drawn and the arriver
-/// carries its presence.
 #[test]
 fn a_tall_screen_crossfades_the_body_it_replaced() {
     let model = pet_surface_seam_model();
@@ -1712,8 +1554,6 @@ fn a_tall_screen_crossfades_the_body_it_replaced() {
             _ => Host::new(90, 100),
         };
         if case == "quit" {
-            // The program is up, its caret at the bottom; the cat settled
-            // there.
             h.term.process(b"\x1b[?1049h\x1b[2J\x1b[90;5H");
             h.owner.resight_owner();
         }
@@ -1728,9 +1568,6 @@ fn a_tall_screen_crossfades_the_body_it_replaced() {
             "enter" => h.term.process(b"\x1b[?1049h\x1b[2J\x1b[90;5H"),
             "quit" => h.term.process(b"\x1b[?1049l"),
             "half-seen" => {
-                // The world's window starts at the old body's feet row (its
-                // caret 32 rows below it), which is double-width; the head's
-                // row above is outside the window.
                 let feet = before.frame.pet.row as u16;
                 let screen = format!(
                     "\x1b[?1049h\x1b[2J\x1b[{};1H\x1b#6\x1b[{};5H",
@@ -1799,8 +1636,6 @@ fn a_tall_screen_crossfades_the_body_it_replaced() {
 }
 
 /// A full-screen program whose rows `feet - 1..=feet` are double width (an
-/// expanded row: protected, a ghost may not fade over it), its caret on
-/// `caret_row`.
 fn protected_screen(feet: u16, caret_row: u16) -> Vec<u8> {
     let mut screen = b"\x1b[?1049h\x1b[2J".to_vec();
     for row in feet - 1..=feet {
@@ -1811,11 +1646,6 @@ fn protected_screen(feet: u16, caret_row: u16) -> Vec<u8> {
 }
 
 /// A refused ghost is handed over once. A full-screen program with expanded rows
-/// under the old body refuses its ghost, and the arriver carries its presence for
-/// good: the ghost leaves the lane on the frame it is refused. A few frames later
-/// the program quits, the focus moves to the other pane, or the rows go single width
-/// (the protection lifts); throughout, the cat sums to one cat and the arriver never
-/// falls in one frame.
 #[test]
 fn a_refused_ghost_is_handed_over_once() {
     for (case, k) in [
@@ -1893,16 +1723,6 @@ fn coat_presence(shot: &Shot, coat: u8) -> u16 {
 }
 
 /// The breed handoff's leaver crosses a boundary where it was drawn. A new cat takes
-/// over (`PetArrival::Ceremony`: the old coat runs off while the new fades up;
-/// `Quiet`: the old coat fades in place), and mid-handoff a full-screen program
-/// starts or the focus moves to the other pane. The leaver is carried with the
-/// crossfade ghosts, stopped where the user saw it, and fades there on the arriver's
-/// ramp (in its own pane for the split): no fall larger than one fade step, and it
-/// leaves glass on the arriver's full frame (`GhostLeavesAtFullPresence`).
-///
-/// What is carried is what was drawn: a selection over the leaver, clear of the
-/// body, culls it before the seam, so nothing of it crosses and the old coat is
-/// never brighter after the boundary than before it.
 #[test]
 fn a_breed_leaver_crosses_a_boundary_where_it_was_drawn() {
     use aterm_core::selection::{SelectionSide, SelectionType};
@@ -1932,7 +1752,6 @@ fn a_breed_leaver_crosses_a_boundary_where_it_was_drawn() {
             .expect("a far coat");
         h.owner
             .set_look((coat, old.1), arrival, CompanionRung::Program);
-        // The handoff fires after its debounce, at a cat kept awake.
         let mut fired = false;
         for k in 0..400 {
             if k % 60 == 0 {
@@ -1949,9 +1768,6 @@ fn a_breed_leaver_crosses_a_boundary_where_it_was_drawn() {
             shots.push(h.present());
         }
         if selected {
-            // A block selection over the leaver's side of the body's rows,
-            // clear of the body: the console culls the leaver on every frame
-            // and keeps the body.
             let shot = *shots.last().expect("frames");
             let (cw, ch) = (i32::from(h.cell.0), i32::from(h.cell.1));
             let (x0, y0, x1, y1) = shot.body_win.expect("fixture: the body on glass");
@@ -2037,8 +1853,6 @@ fn a_breed_leaver_crosses_a_boundary_where_it_was_drawn() {
                 carried.iter().all(|&a| a <= seen),
                 "{label}: a leaver nobody saw came onto glass: {seen} before, {carried:?} after"
             );
-            // Nor is it handed to the arriver: the cat sums to one cat, the
-            // crossfade's rounding allowed.
             assert!(
                 sums.iter().all(|&s| s <= 275),
                 "{label}: a leaver nobody saw doubled the cat: {sums:?}"
@@ -2054,8 +1868,6 @@ fn a_breed_leaver_crosses_a_boundary_where_it_was_drawn() {
         )
         .unwrap_or_else(|e| panic!("{label}: {e}"));
         if selected {
-            // The selection cut the leaver, not the boundary: what it owed
-            // as it left glass is the selection's, and nothing crossed.
             assert!(after.iter().all(Shot::cat), "{label}: a frame with no cat");
             continue;
         }
@@ -2066,8 +1878,6 @@ fn a_breed_leaver_crosses_a_boundary_where_it_was_drawn() {
             .map(|w| w[0].saturating_sub(w[1]))
             .max()
             .unwrap_or(0);
-        // What the leaver still owed when it left glass: its presence then
-        // times what its arriver was still missing.
         let gone = leaver.iter().rposition(|&a| a > 0).expect("drawn") + 1;
         let tail = shots.get(gone).map_or(0, |s| {
             u32::from(leaver[gone - 1]) * u32::from(255 - s.frame.pet.alpha) / 255
@@ -2090,10 +1900,6 @@ fn a_breed_leaver_crosses_a_boundary_where_it_was_drawn() {
 }
 
 /// A ghost its own glass refuses hands its presence to the arriver: a split-pane
-/// switch the frame after a stale snapshot of the pane the focus leaves (the body
-/// held lit, nothing under it certified). That pane cannot admit the ghost (`Refuse`
-/// after a `Shift`), so none is drawn there, and the arriver comes up from the
-/// presence the user saw.
 #[test]
 fn a_ghost_its_own_glass_refuses_hands_its_presence_to_the_arriver() {
     let model = pet_surface_seam_model();
@@ -2132,11 +1938,6 @@ fn a_ghost_its_own_glass_refuses_hands_its_presence_to_the_arriver() {
 }
 
 /// A carried ghost keeps its own tile. The emitter bakes at most two new tiles a
-/// frame and re-emits a ghost's held tile when its bake is deferred, the hold keyed
-/// on the ghost (`PetDepartureSprite::id`). A breed homecoming's leaver carried to a
-/// tab of another background is the third new tile of the frame after the switch,
-/// so it is drawn in the tile it wore a frame ago; every ghost on the lane is drawn
-/// on every frame.
 #[test]
 fn a_carried_ghost_keeps_its_own_tile() {
     use aterm_effects::companion::CompanionRung;
@@ -2160,7 +1961,6 @@ fn a_carried_ghost_keeps_its_own_tile() {
         }
     }
     assert!(fired, "fixture: the homecoming fired");
-    // The other tab: a light background under its prompt.
     let mut tab = Terminal::new(30, 100);
     let mut paint = b"\x1b]11;#f0f0f0\x07\x1b[47m".to_vec();
     for row in 1..=30 {
@@ -2205,8 +2005,6 @@ fn dims(r: (i32, i32, i32, i32)) -> (i32, i32, i32, i32) {
 }
 
 /// Drive a settled host until its body is drawn `caught`: mid-breath (a fresh pet
-/// sleeps and breathes), mid-stretch (a key wakes it), or mid-hop (awake, Enter
-/// sends it to the next row). Returns that frame, the last before the boundary.
 fn caught(h: &mut Host, caught: &str) -> Shot {
     let drawn = |s: &Shot| s.frame.on_glass && s.frame.pet.alpha == 255;
     let (want, frames): (fn(&PetFrame) -> bool, usize) = match caught {
@@ -2242,12 +2040,6 @@ fn caught(h: &mut Host, caught: &str) -> Shot {
 }
 
 /// A ghost is drawn as the body the user last saw: at a split-pane switch or an
-/// alternate-screen enter the body becomes a still ghost at its cell, pose, facing
-/// and the squash, stretch and lift its last frame drew (`Departure::stance0`), so
-/// its rect is the body's to the pixel on every frame of its fade, mid-breath,
-/// mid-stretch and mid-hop. An arriver adopting it on a quick return is drawn at the
-/// ghost's rect on the adoption frame and eases from there, at most a pixel an edge
-/// per frame while it wears the adopted look.
 #[test]
 fn a_ghost_is_drawn_as_the_body_the_user_last_saw() {
     let mut wrong = Vec::new();
@@ -2294,7 +2086,6 @@ fn a_ghost_is_drawn_as_the_body_the_user_last_saw() {
         }
     }
 
-    // The adopted arriver: a quick return to the ghost's seat.
     for case in ["mid-breath", "mid-stretch"] {
         for glass in ["split", "screen"] {
             let label = format!("{case}, {glass}, back");
@@ -2369,8 +2160,6 @@ fn a_ghost_is_drawn_as_the_body_the_user_last_saw() {
 }
 
 /// A screen on a light ground: every row painted in an SGR background (not
-/// erase-in-colour), the caret at `(caret_row, 5)`; `alt` enters the alternate
-/// screen first.
 fn light_screen(rows: u16, cols: u16, caret_row: u16, alt: bool) -> Vec<u8> {
     let mut b = if alt {
         b"\x1b[?1049h\x1b[2J".to_vec()
@@ -2387,8 +2176,6 @@ fn light_screen(rows: u16, cols: u16, caret_row: u16, alt: bool) -> Vec<u8> {
 }
 
 /// A ghost on `after` standing where a body stood on `before` (the same window rect)
-/// in another atlas tile than every body there: `(rect, tile before, tile now)`.
-/// The tile bakes pose, look and palette, so this is that body repainted.
 type Repaint = ((i32, i32, i32, i32), (u16, u16), (u16, u16));
 
 fn repainted(before: &Shot, after: &Shot) -> Vec<Repaint> {
@@ -2422,17 +2209,6 @@ fn ghosts_in_place(before: &Shot, after: &Shot) -> usize {
 }
 
 /// A ghost wears the palette its body was drawn in. The pet's contrast palette
-/// (`CatColorKey`) is frozen per appearance, sampled under the body, and an arriver
-/// on a new surface samples its own. On every frame of its fade a ghost wears the
-/// atlas tile (pose, look and palette) its body wore on the last frame before the
-/// boundary: alternate-screen enter and leave, a tab switch, a split-pane switch, a
-/// tall screen, the breed handoff's leaver, and a quick return, where the adopting
-/// arriver goes on in that tile too (on the ghost's own surface:
-/// [`an_arriver_resumes_a_ghosts_palette_only_on_the_surface_it_was_drawn_on`]).
-///
-/// Negative control: a theme change at the boundary
-/// (`CompanionOwner::invalidate_colors`) retires every frozen palette, and the
-/// repainted ghost is seen.
 #[test]
 fn a_ghost_wears_the_palette_its_body_was_drawn_in() {
     use aterm_effects::companion::CompanionRung;
@@ -2457,7 +2233,6 @@ fn a_ghost_wears_the_palette_its_body_was_drawn_in() {
             _ => Host::settled(),
         };
         if let Some(other) = h.other.as_mut() {
-            // The other pane on a light ground, its prompt where it was.
             other.term.process(&light_screen(30, 50, 21, false));
             other.term.process(b"$ ");
         }
@@ -2467,9 +2242,6 @@ fn a_ghost_wears_the_palette_its_body_was_drawn_in() {
         }
         let mut before = h.run(Duration::from_secs(3));
         if case == "quick return, repainted ground" {
-            // The ground under the settled cat turns light: its appearance keeps
-            // the palette it was first drawn in, where a fresh sample would pick
-            // another.
             let mut paint = b"\x1b7\x1b[48;2;236;236;236m".to_vec();
             for row in 9..=10 {
                 paint.extend_from_slice(format!("\x1b[{row};1H").as_bytes());
@@ -2544,8 +2316,6 @@ fn a_ghost_wears_the_palette_its_body_was_drawn_in() {
         boundary(&mut h);
         let born = h.shots(Duration::from_millis(16));
         if !case.contains("negative control") && !case.starts_with("quick return") {
-            // Every ghost the boundary made carries the palette its body was
-            // drawn in.
             let carried: Vec<_> = born[0]
                 .frame
                 .pet
@@ -2559,7 +2329,6 @@ fn a_ghost_wears_the_palette_its_body_was_drawn_in() {
             }
         }
         if case.starts_with("quick return") {
-            // Two frames into the first crossfade, the focus comes back.
             before = *born.last().expect("frames");
             was = h.owner.brain().appearance_colors();
             match case {
@@ -2621,8 +2390,6 @@ fn a_ghost_wears_the_palette_its_body_was_drawn_in() {
             ));
         }
         if case.starts_with("quick return") {
-            // On the adoption frame the arriver is that body, in the tile the
-            // user saw.
             let body = after[0]
                 .pets
                 .iter()
@@ -2656,16 +2423,11 @@ fn a_ghost_wears_the_palette_its_body_was_drawn_in() {
 }
 
 /// An arriver that adopts a carried ghost goes on in the ghost's palette only on the
-/// surface the ghost was drawn on. A quick tab cycle A (dark) → B (dark) → C
-/// (light), C's caret on A's cell: C's arriver adopts A's ghost there and wears the
-/// palette a cat arriving on C straight from A picks, not A's dark-ground palette,
-/// whose pale outline all but vanishes on a light ground.
 #[test]
 fn an_arriver_resumes_a_ghosts_palette_only_on_the_surface_it_was_drawn_on() {
     let tab = |rows, cols, light: bool| {
         let mut t = Terminal::new(rows, cols);
         if light {
-            // A light ground, `$ ` on row 11: the caret on A's cell.
             t.process(&light_screen(rows, cols, 11, false));
             t.process(b"\x1b[11;1H$ ");
         } else {
@@ -2678,7 +2440,6 @@ fn an_arriver_resumes_a_ghosts_palette_only_on_the_surface_it_was_drawn_on() {
         h.session = session;
         h.owner.resight_owner();
     };
-    // The palette a cat coming to C straight from A picks.
     let direct = {
         let mut h = Host::settled();
         switch(&mut h, tab(30, 100, true), 11);

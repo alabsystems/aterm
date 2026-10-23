@@ -1,48 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! What a git read would load that can run a program: the check behind the
-//! read-only rule's git reads ([`super::approval::RULE_READ_ONLY`]).
-//!
-//! Under `approve = "safe"` a git read is approved only when no configuration
-//! it would load can execute a program. The classifier
-//! ([`crate::supervise::classify`]) judges the line; this module judges the
-//! machine: an accept-edits worker can write `.git/config`, and `git status`
-//! then runs whatever `core.fsmonitor` names.
-//!
-//! **Where** ([`git_reads`]): each segment's command is found as
-//! [`crate::supervise::classify::runs`] finds it, and runs in the session's cwd
-//! as the worker's transcript last recorded it ([`WorkerEnv::claude_dir`],
-//! [`crate::harness::footer::shell_cwds`]), every `cd`/`pushd` target, an
-//! `env -C` directory, and every `-C` target against each (a superset). An
-//! unresolvable directory escalates.
-//!
-//! **What** ([`hazard`]): the effective configuration (`git config --list
-//! --show-scope`, includes and `GIT_CONFIG_*`) in each directory and every
-//! populated submodule, recursively:
-//!
-//! * `core.fsmonitor` naming a program;
-//! * `diff.external`, `diff.<driver>.textconv`/`command`, `GIT_EXTERNAL_DIFF`;
-//! * `filter.<driver>.*` when the attributes select it for a tracked path;
-//! * a partial clone (a read may fetch from the promisor remote);
-//! * `gpg.program` when the read displays signatures;
-//! * an executable `post-index-change` hook where the read would run it.
-//!
-//! A read that contacts a remote escalates outright. `core.pager`/`pager.*`
-//! are exempt: Claude Code's Bash tool gives git no terminal, and the
-//! classifier refuses the reads that start a pager or viewer without one
-//! (`git grep -O`, `git <cmd> --help`).
-//!
-//! **As the worker reads it** ([`WorkerEnv`]): every probe runs the git the
-//! worker's `PATH` finds with the worker process's environment, read from the
-//! kernel, never aterm's own. Escalated instead: an unreadable environment; a
-//! `PATH` entry ahead of git the worker could write ([`WorkerEnv::raw_git_view`]); a
-//! git-relevant variable Claude Code's settings give the Bash tool but not the
-//! process ([`WorkerEnv::git_settings_env`]).
-//!
-//! Not covered: a box that runs on another machine (escalated). The shell
-//! snapshot, `CLAUDE_ENV_FILE` and rc files Claude Code sources before each
-//! command are [`super::shell_startup`]'s.
+//! Git configuration hazard check ([`hazard`], [`git_reads`]) for
+//! [`super::approval::RULE_READ_ONLY`] over [`crate::supervise::classify`]
+//! ([`crate::supervise::classify::runs`]), [`WorkerEnv`] ([`WorkerEnv::claude_dir`],
+//! [`WorkerEnv::raw_git_view`], [`WorkerEnv::git_settings_env`]),
+//! [`crate::harness::footer::shell_cwds`], and [`super::shell_startup`].
 
 use aterm_uds::spawnfd::{Command, Stdio};
 use std::path::{Component, Path, PathBuf};
@@ -57,23 +20,15 @@ use crate::supervise::classify::{SUBSTITUTION, command_words, program, runs};
 pub(crate) struct GitReads {
     /// Every directory a git invocation on the line may run in, deduplicated.
     pub dirs: Vec<PathBuf>,
-    /// A read that displays signatures on its own (`--show-signature`, a `%G`
-    /// format placeholder, `tag -v`).
+    /// A read that displays signatures on its own.
     pub signatures: bool,
-    /// A `log`/`show`/`whatchanged`/`reflog`, which `log.showSignature` turns
-    /// into a signature display.
+    /// A `log`/`show`/`whatchanged`/`reflog`.
     pub log_like: bool,
     /// The first read that contacts a remote, as a reason.
     pub remote: Option<String>,
 }
 
-/// The git reads on `line`, run from any of `cwds` (the session's directory
-/// and wherever its Bash tool may stand): `Ok(None)` when it runs no git at
-/// all, `Err` when a directory one may run in cannot be resolved, or a
-/// segment's command cannot be read. A segment's command is found exactly as
-/// the classifier's head check finds it ([`runs`]): through its prefixes and
-/// through `env` and `xargs`, so every git the classifier approves as a read
-/// is one this check places.
+/// The git reads on `line`, run from any of `cwds`.
 pub(crate) fn git_reads(
     line: &str,
     cwds: &[PathBuf],
@@ -90,10 +45,6 @@ pub(crate) fn git_reads(
     if !commands.iter().any(|(seg, run)| is_git(seg, run.at)) {
         return Ok(None);
     }
-    // Every directory a `cd`/`pushd` on the line may leave the shell in.
-    // A loop repeats a relative one (`while …; do cd ..; git status; done`
-    // climbs one level a pass), so there the set has no bound this check can
-    // name.
     let looped = segments.iter().any(|seg| {
         seg.iter()
             .find(|w| w.as_str() != "!")
@@ -135,7 +86,6 @@ pub(crate) fn git_reads(
             continue;
         }
         let fed = run.fed;
-        // `env -C DIR` moves the git before its own `-C` does.
         let mut dirs = bases.clone();
         if !run.chdir.is_empty() {
             if fed {
@@ -152,7 +102,6 @@ pub(crate) fn git_reads(
             }
             dirs = moved;
         }
-        // Global options up to the subcommand; `-C` chains.
         let mut j = i + 1;
         while let Some(t) = seg.get(j).map(String::as_str) {
             if t == "-C" {
@@ -217,8 +166,6 @@ pub(crate) fn git_reads(
 }
 
 /// Where directory operand `t` of a `cd` or `git -C` in `base` leads: every
-/// reading of it (`~/x` is `$HOME/x` unquoted and `./~/x` quoted, and the
-/// word no longer says which), lexically normalised.
 fn resolve(base: &Path, t: &str, home: Option<&Path>) -> Result<Vec<PathBuf>, String> {
     if t.contains(SUBSTITUTION) || t.contains('$') {
         return Err(format!(
@@ -241,8 +188,7 @@ fn resolve(base: &Path, t: &str, home: Option<&Path>) -> Result<Vec<PathBuf>, St
     Ok(out)
 }
 
-/// `.` and `..` resolved lexically (git's `-C` and the shell's `cd` resolve
-/// them the same way for a path whose parents are not symlinks).
+/// `.` and `..` resolved lexically.
 pub(crate) fn normalise(p: &Path) -> PathBuf {
     let mut out = PathBuf::new();
     for c in p.components() {
@@ -260,67 +206,36 @@ pub(crate) fn normalise(p: &Path) -> PathBuf {
 /// What a git command in one directory would load.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GitView {
-    /// `(scope, key, value)` as `git config --list --show-scope` reports them
-    /// (section and variable names lowercased by git); `None` for a bare key.
+    /// `(scope, key, value)` as `git config --list --show-scope` reports them.
     pub config: Vec<(String, String, Option<String>)>,
-    /// The executable `post-index-change` hook of the repository, if any.
+    /// The executable `post-index-change` hook of the repository.
     pub index_hook: Option<PathBuf>,
-    /// The filter drivers the repository's attributes select for a tracked
-    /// path (`git check-attr filter`), read only when a filter is configured.
-    /// `None` when it was not read: every configured filter then counts.
+    /// The filter drivers the repository's attributes select for a tracked path.
     pub filters_selected: Option<Vec<String>>,
-    /// Each populated submodule, recursively, with what git loads there: a
-    /// read that recurses (`status`, `diff`) runs git in it.
+    /// Each populated submodule, recursively, with what git loads there.
     pub submodules: Vec<(PathBuf, GitView)>,
-    /// The worker's `GIT_EXTERNAL_DIFF`, which git runs for a diff as it runs
-    /// `diff.external`.
+    /// The worker's `GIT_EXTERNAL_DIFF`, which git runs for a diff as it runs `diff.external`.
     pub external_diff: Option<String>,
 }
 
 /// How deep submodules are followed before the check gives up (and escalates).
 const MAX_SUBMODULE_DEPTH: usize = 8;
 /// How many populated submodules one view reads before the check gives up
-/// (and escalates) rather than read at length.
 const MAX_SUBMODULES: usize = 64;
 
 /// How long one git the check runs may take before it is killed and the read
-/// is refused (the line escalates, as for any read that cannot be made). A
-/// healthy read answers in tens of milliseconds; the bound names a git that
-/// never does.
-///
-/// A test waits the one-minute hang detector instead: the git it reads through
-/// can be a wrapper it just wrote, whose first exec waits on the system, not on
-/// git (macOS assesses each new executable's first exec, one scan at a time
-/// machine-wide: a fresh script took 5.4 s behind 40 queued scans), and under
-/// that queue a ten-second bound refused a read that git answers.
 #[cfg(not(test))]
 const GIT_READ_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 #[cfg(test)]
 const GIT_READ_WAIT: std::time::Duration = aterm_spec::wait::MUST_HAPPEN;
 
-/// The worker process as the kernel recorded it at exec
-/// ([`atpkg::caller_shell::process_args`]): its environment, `KEY=value` in
-/// the kernel's order, which every command its Bash tool runs starts from,
-/// and its argv (a `--settings` it was launched with,
-/// [`Self::git_settings_env`]) — and git as it runs there ([`Self::raw_git_view`]).
-///
-/// THE ENVIRONMENT NEVER LEAVES THIS VALUE. It holds whatever the person's
-/// shell exported — API keys, tokens, a cloud credential — so its `Debug`
-/// names how many variables there are, never one of them, and a harness tape
-/// holds only its [`Self::digest`] and the derived answers the approval
-/// policy's probes read off it (`super::probe`): the reads that see the
-/// variables run inside a probe's live call, and what crosses the probe is
-/// what they concluded.
+/// The worker process as the kernel recorded it at exec ([`atpkg::caller_shell::process_args`]).
 #[derive(Clone, Default, PartialEq, Eq)]
 pub struct WorkerEnv {
     process: ProcArgs,
-    /// The worker's pid — the session's foreground process group's leader —
-    /// where it was read from the kernel ([`Self::with_pid`]): what the files
-    /// its job holds open are read by.
+    /// The worker's pid.
     pid: Option<u32>,
-    /// The digest a harness tape knows this worker by, fixed where the worker
-    /// crossed the probe that read it ([`Self::digested`]); `None`: computed
-    /// from the environment when asked.
+    /// The digest a harness tape knows this worker by.
     digest: Option<u64>,
 }
 
@@ -335,9 +250,6 @@ impl std::fmt::Debug for WorkerEnv {
 }
 
 /// Variables the probe does not pass on to its own git. `GIT_CONFIG` names
-/// the one file `git config` alone reads instead of the effective set — the
-/// probe's `git config --list` would list that file, not what a read loads;
-/// `GIT_TRACE*` would have the probe write trace files.
 fn withheld_from_probe(key: &str) -> bool {
     key == "GIT_CONFIG" || key.starts_with("GIT_TRACE")
 }
@@ -353,13 +265,7 @@ impl WorkerEnv {
         }
     }
 
-    /// The digest a harness tape names this worker by in each probe's request
-    /// (`super::probe`): an xxh64, seeded with `seed` (the tape's own), of the
-    /// environment and argv as the kernel recorded them — the one fixed where
-    /// it crossed a probe ([`Self::digested`]), else computed now. A probe's
-    /// answer is keyed by it, so a later read under another environment is
-    /// another key. Seeded per tape, it says nothing across tapes; it is no
-    /// copy of a variable, and the variables are never written beside it.
+    /// The digest a harness tape names this worker by in each probe's request (`super::probe`).
     #[must_use]
     pub fn digest(&self, seed: u64) -> u64 {
         self.digest.unwrap_or_else(|| {
@@ -375,17 +281,14 @@ impl WorkerEnv {
         })
     }
 
-    /// This worker with its [`Self::digest`] under `seed` fixed: what a probe
-    /// that read the worker hands on, so every later request names it the way
-    /// the tape did.
+    /// This worker with its [`Self::digest`] under `seed` fixed.
     #[must_use]
     pub fn digested(mut self, seed: u64) -> Self {
         self.digest = Some(self.digest(seed));
         self
     }
 
-    /// A worker known only by what a harness tape holds of it: its digest and
-    /// pid, no variable — what a read of the tape hands back.
+    /// A worker known only by what a harness tape holds of it.
     #[must_use]
     pub fn recorded(digest: u64, pid: Option<u32>) -> Self {
         Self {
@@ -423,22 +326,13 @@ impl WorkerEnv {
         &self.process.argv
     }
 
-    /// The value of `key`, as `getenv` answers it: the first entry.
+    /// The value of `key`, as `getenv` answers it.
     #[must_use]
     pub fn var(&self, key: &str) -> Option<&str> {
         self.process.env_var(key)
     }
 
-    /// The worker's Claude Code directory, for a worker standing in `cwd`, as
-    /// Claude Code resolves it ([`claude_dir_at`] over its `CLAUDE_CONFIG_DIR`
-    /// and the variable its `os.homedir()` reads,
-    /// [`crate::harness::accounts::HOMEDIR_ENV`]: `HOME`, on Windows
-    /// `USERPROFILE` — a scratch one included, whatever `HOME` says; with
-    /// that unset or empty, the account's home,
-    /// [`atpkg::platform::account_home`]: the passwd database's, on Windows
-    /// the token's profile): where its user settings, session files,
-    /// transcripts and shell snapshots are. `Err` says why it cannot be
-    /// named.
+    /// The worker's Claude Code directory, for a worker standing in `cwd`.
     pub fn claude_dir(&self, cwd: &Path) -> Result<PathBuf, String> {
         use crate::harness::accounts::{HOME_ENV, HOMEDIR_ENV};
         claude_dir_at(
@@ -449,9 +343,7 @@ impl WorkerEnv {
         )
     }
 
-    /// A test's worker: this process's `PATH`, no system configuration,
-    /// `global` (none: empty) as its global one, and no Claude Code directory,
-    /// so nothing of the developer's own configuration is read.
+    /// A test's worker: this process's `PATH`, no system configuration.
     #[cfg(test)]
     pub(crate) fn hermetic(global: Option<&Path>) -> Self {
         let global = global.unwrap_or(Path::new("/dev/null"));
@@ -480,11 +372,6 @@ impl WorkerEnv {
     }
 
     /// The git the worker's shell runs: the first executable `git` on its
-    /// `PATH`. Refused when an entry at or ahead of it is one the worker could
-    /// have put a `git` in: a relative entry (resolved against wherever the
-    /// command runs), or one `worker_writes` (its project, a virtualenv's or
-    /// `node_modules`' `bin` in it, a scratch directory). A git planted there
-    /// would run here, in the supervisor, before anything is approved.
     fn git_program(&self, worker_writes: &dyn Fn(&Path) -> bool) -> Result<PathBuf, String> {
         let path = self
             .var("PATH")
@@ -513,30 +400,13 @@ impl WorkerEnv {
         Err("a git read with no git on the worker's PATH".to_string())
     }
 
-    /// What a git command run in `dir` by the worker would load. A directory
-    /// that does not exist yet is read at its nearest existing ancestor, where
-    /// git's own repository discovery would start.
-    ///
-    /// Only commands that run no configured program read it: `git config
-    /// --list`, `rev-parse`, and, once the configuration names no
-    /// `core.fsmonitor` program (which reading the index would run),
-    /// `ls-files` and `check-attr` for the populated submodules and the filter
-    /// drivers the attributes select. The git is [`Self::git_program`]'s.
-    ///
-    /// RAW: every entry and value as loaded. The policy never judges this one
-    /// — its probe's live arm projects it ([`GitView::project`]) and hands on
-    /// only that — and its name is its own, never the probe's `git_view`, so
-    /// the `supervise-fx` source guard (`aterm-census`) can tell a call of it
-    /// from above the probe's door, which it names, from a call of the probe.
+    /// What a git command run in `dir` by the worker would load.
     pub fn raw_git_view(
         &self,
         dir: &Path,
         worker_writes: &dyn Fn(&Path) -> bool,
     ) -> Result<GitView, String> {
         // A `/`-rooted directory names no drive on Windows: the Bash tool's
-        // shell there (Git Bash) reads `/c/x` as `C:\x` and its `/tmp` as a
-        // folder of its own, where this process would read `\c\x` and `\tmp`
-        // on its current drive — another directory's configuration.
         if dir.has_root() && !dir.is_absolute() {
             return Err(format!(
                 "a git read in {} (a `/` path names no drive on Windows: where it runs is \
@@ -551,28 +421,12 @@ impl WorkerEnv {
         git.view_at(dir, 0, &mut 0)
     }
 
-    /// `Err` naming the file and the variable when Claude Code's settings
-    /// would give the worker's Bash tool a variable that changes what a git
-    /// read loads or which git runs ([`git_relevant`]) with a value other than
-    /// the worker process's own: an `env` block anywhere along the settings
-    /// chain for an agent launched in `launch`
-    /// ([`super::claude_settings::sources`]; the project's files are content an
-    /// accept-edits worker writes). Claude Code applies those to its Bash
-    /// tool's commands, not to the process environment this check reads, so
-    /// such a read escalates, as it does where a settings file cannot be read
-    /// whole or does not parse (its `env` could say anything).
-    ///
-    /// The live body of the probe's `settings_env`, named apart from it for
-    /// the same reason as [`Self::raw_git_view`].
+    /// `Err` naming the file and variable when Claude Code settings inject a git variable.
     pub fn git_settings_env(&self, launch: &Path) -> Result<(), String> {
         self.settings_env_where(launch, git_relevant, "a git read")
     }
 
-    /// [`Self::git_settings_env`] for the variables `relevant` names, the
-    /// escalation's reason about `subject` (`a git read`): the same settings
-    /// files, read the same way — the shell-startup check
-    /// ([`super::shell_startup`]) asks it for the variables that choose the
-    /// Bash tool's shell and what that shell reads before a command.
+    /// [`Self::git_settings_env`] for the variables `relevant` names.
     pub fn settings_env_where(
         &self,
         launch: &Path,
@@ -609,14 +463,6 @@ impl WorkerEnv {
 }
 
 /// Why a git the probe ran in `at` failed: `what` and the directory, git's
-/// exit status, and the command that shows the person git's own complaint.
-///
-/// Not git's stderr: that complaint can quote what git read — a malformed
-/// `GIT_CONFIG_PARAMETERS` entry from the worker's environment is echoed
-/// whole (`bogus config parameter: …`), an include's path as written — and
-/// this reason is `probe.git_view`'s answer, which a harness tape holds
-/// (`super::probe`: what crosses a probe is what it concluded, never what it
-/// read). The person runs `command` in `at` to read it.
 fn git_failed(what: &str, at: &Path, status: std::process::ExitStatus, command: &str) -> String {
     format!(
         "{what} {} (git {status}; `{command}` there says why)",
@@ -624,16 +470,7 @@ fn git_failed(what: &str, at: &Path, status: std::process::ExitStatus, command: 
     )
 }
 
-/// The Claude Code directory of a process whose `CLAUDE_CONFIG_DIR` is
-/// `config_dir` and whose `HOME` (`USERPROFILE` on Windows,
-/// [`crate::harness::accounts::HOMEDIR_ENV`]) is `home`, standing in `cwd`,
-/// as Claude Code resolves it: `path.resolve(CLAUDE_CONFIG_DIR ??
-/// join(os.homedir(), ".claude"))`. A `CLAUDE_CONFIG_DIR` that is set at all
-/// counts, even an empty one (`??`); otherwise `os.homedir()` is the
-/// non-empty `home`, else the account's home (the worker's account is this
-/// process's: [`atpkg::caller_shell::process_args`] reads only this uid's
-/// processes). A relative result is taken against `cwd`, lexically. `Err`
-/// says what is missing where the account names no home either.
+/// The Claude Code directory of a process whose `CLAUDE_CONFIG_DIR` is `config_dir`.
 pub(crate) fn claude_dir_at(
     config_dir: Option<&str>,
     home: Option<&str>,
@@ -651,9 +488,6 @@ pub(crate) fn claude_dir_at(
 }
 
 /// Whether a variable changes which git runs or what a git read loads: `PATH`,
-/// `HOME` and `XDG_CONFIG_HOME` (where the global config is), and git's own
-/// `GIT_*` — but for `GIT_PAGER` (a pager is exempt, the module doc) and
-/// `GIT_EDITOR` (a read opens no editor).
 fn git_relevant(key: &str) -> bool {
     matches!(key, "PATH" | "HOME" | "XDG_CONFIG_HOME")
         || (key.starts_with("GIT_") && !matches!(key, "GIT_PAGER" | "GIT_EDITOR"))
@@ -667,9 +501,6 @@ struct Probe<'a> {
 
 impl Probe<'_> {
     /// `git --no-pager` in `dir`, with the worker's environment and nothing
-    /// of this process's ([`withheld_from_probe`] aside), stdin closed. Built
-    /// by `spawnfd::command`, so from a process with no console `git.exe` gets
-    /// a windowless one on Windows, not a visible one.
     fn git(&self, dir: &Path) -> Command {
         let mut cmd = aterm_uds::spawnfd::command(&self.program);
         cmd.arg("--no-pager")
@@ -683,7 +514,6 @@ impl Probe<'_> {
             let Some((key, value)) = kv.split_once('=') else {
                 continue;
             };
-            // The first entry is the one git's `getenv` reads.
             if key.is_empty() || withheld_from_probe(key) || set.contains(&key) {
                 continue;
             }
@@ -694,7 +524,6 @@ impl Probe<'_> {
     }
 
     /// [`WorkerEnv::raw_git_view`] of `dir`, `depth` submodules down, `count`
-    /// populated submodules read so far.
     fn view_at(&self, dir: &Path, depth: usize, count: &mut usize) -> Result<GitView, String> {
         let dir = dir
             .ancestors()
@@ -724,7 +553,6 @@ impl Probe<'_> {
                 .map(str::to_string),
             ..GitView::default()
         };
-        // Outside a repository `rev-parse` fails and there is no hook.
         if let Ok(hook) = run(&["rev-parse", "--git-path", "hooks/post-index-change"])
             && hook.status.success()
         {
@@ -734,13 +562,9 @@ impl Probe<'_> {
                 view.index_hook = Some(path);
             }
         }
-        // Reading the index would run a configured fsmonitor program — the
-        // very thing checked for. With one set nothing more is read: the
-        // hazard escalates on it anyway.
         if fsmonitor_program(&view) {
             return Ok(view);
         }
-        // The worktree's top; a bare repository or no repository has none.
         let Some(top) = run(&["rev-parse", "--show-toplevel"])
             .ok()
             .filter(|o| o.status.success())
@@ -759,6 +583,7 @@ impl Probe<'_> {
         for path in self.gitlinks(&top)? {
             let sub = normalise(&top.join(&path));
             if !sub.starts_with(&top) || !sub.join(".git").exists() {
+                // not populated: a read does not recurse into it
                 continue; // not populated: a read does not recurse into it
             }
             *count += 1;
@@ -776,7 +601,6 @@ impl Probe<'_> {
     }
 
     /// The paths of the submodules (gitlinks, mode 160000) in the index of
-    /// the worktree at `top`.
     fn gitlinks(&self, top: &Path) -> Result<Vec<String>, String> {
         let mut cmd = self.git(top);
         cmd.args(["ls-files", "-z", "--stage"]);
@@ -800,8 +624,6 @@ impl Probe<'_> {
     }
 
     /// The filter drivers the attributes select for any tracked path of the
-    /// worktree at `top` (`git ls-files -z | git check-attr --stdin -z
-    /// filter`); `None` when they could not be read.
     fn filters_selected(&self, top: &Path) -> Option<Vec<String>> {
         let mut cmd = self.git(top);
         cmd.args(["ls-files", "-z"]);
@@ -816,8 +638,6 @@ impl Probe<'_> {
             .spawn()
             .ok()?;
         let mut stdin = child.stdin.take()?;
-        // A writer thread: check-attr answers while it reads, and a pipe
-        // left full on both sides would stall.
         let writer = std::thread::spawn(move || {
             use std::io::Write as _;
             stdin.write_all(&paths)
@@ -843,7 +663,6 @@ impl Probe<'_> {
 }
 
 /// Whether `view`'s configuration names an fsmonitor program (a boolean is
-/// git's own daemon).
 fn fsmonitor_program(view: &GitView) -> bool {
     view.config
         .iter()
@@ -888,7 +707,6 @@ fn is_executable(p: &Path) -> bool {
 }
 
 /// Whether git reads a config value as a boolean (`core.fsmonitor = true` is
-/// git's own daemon, not a program).
 fn is_bool(v: Option<&str>) -> bool {
     match v {
         None => true,
@@ -920,12 +738,6 @@ fn is_true(v: Option<&str>) -> bool {
 }
 
 /// What a configuration key is to [`hazard`]: the ONE place a key's name is
-/// tested, read by [`hazard`] to judge a view and by [`GitView::project`] to
-/// decide which entries a harness tape keeps ([`consulted`]). Keeping the two
-/// on one predicate is what makes the projection safe: a key [`hazard`] would
-/// look at can never be one the projection dropped, so `hazard(v, r) ==
-/// hazard(v.project(), r)` holds for every view and every read by
-/// construction, not by a second list kept in step with this one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Consulted<'a> {
     /// `core.fsmonitor`: a program unless its value is a boolean.
@@ -934,16 +746,15 @@ enum Consulted<'a> {
     DiffExternal,
     /// `extensions.partialclone`.
     PartialClone,
-    /// `remote.<name>.promisor`: a partial clone unless its value is false.
+    /// `remote.<name>.promisor`.
     Promisor,
     /// `diff.<driver>.textconv` / `.command`.
     DiffDriver,
     /// `filter.<driver>.clean|smudge|process`, with its driver.
     Filter(&'a str),
-    /// `gpg.program`, `gpg.<format>.program`: run to verify a signature.
+    /// `gpg.program`, `gpg.<format>.program`.
     Signer,
-    /// `log.showsignature`: makes a plain `log` display signatures — read for
-    /// its truth alone.
+    /// `log.showsignature`: makes a plain `log` display signatures.
     ShowSignature,
 }
 
@@ -963,30 +774,19 @@ fn consult(key: &str) -> Option<Consulted<'_>> {
     })
 }
 
-/// Whether [`hazard`] reads a configuration key named `key` at all: the
-/// entries a view projected for a harness tape keeps ([`GitView::project`]).
+/// Whether [`hazard`] reads a configuration key named `key` at all.
 #[must_use]
 pub(crate) fn consulted(key: &str) -> bool {
     consult(key).is_some()
 }
 
-/// The version of [`GitView::project`]'s rule, written on every projected
-/// view a harness tape holds. A later build whose `consulted` reads more
-/// keys sees a recorded view as missing them; the version beside the record
-/// is how a counterfactual replay knows the view it was handed was projected
-/// by another rule, and says so (`Unrecorded`), instead of judging a key
-/// that was never kept as one that was never set.
+/// The version of [`GitView::project`]'s rule.
 pub const PROJECTION: u32 = 1;
 
-/// The one value a projected entry keeps in place of anything but a boolean
-/// ([`GitView::project`]).
+/// The one value a projected entry keeps in place of anything but a boolean ([`GitView::project`]).
 pub const VALUE_SET: &str = "<set>";
 
 /// A configuration value as [`hazard`] can tell it apart, and no finer: a
-/// bare key (`None`), git's true (`true`), git's false (`false`, the empty
-/// value among them) or anything else ([`VALUE_SET`]). [`is_bool`],
-/// [`is_false`] and [`is_true`] each answer the class exactly as they answer
-/// every value in it, so a projected view judges as the view did.
 fn value_class(v: Option<&str>) -> Option<String> {
     let v = v?;
     Some(
@@ -1002,17 +802,7 @@ fn value_class(v: Option<&str>) -> Option<String> {
 }
 
 impl GitView {
-    /// This view as a harness tape keeps it: only the entries `hazard`
-    /// reads (`consulted`), each value reduced to its class
-    /// (`value_class`); the worker's `GIT_EXTERNAL_DIFF` reduced to its
-    /// presence; the hook's path, the selected filter drivers and each
-    /// submodule (projected the same way, recursively) kept, as `hazard`'s
-    /// reasons name them. `hazard` judges the projection as it judges the
-    /// view, reason for reason — its reasons print a key, its scope, a hook's
-    /// path and a submodule's, never a value — while nothing of a URL, a
-    /// token, a credential helper or an `http.<url>.extraheader` survives:
-    /// none of those keys is one `hazard` reads, and a URL in a key's
-    /// own name (`url.<base>.insteadof`) goes with its key.
+    /// This view as a harness tape keeps it.
     #[must_use]
     pub fn project(&self) -> GitView {
         GitView {
@@ -1036,10 +826,7 @@ impl GitView {
     }
 }
 
-/// The first thing in `view` that `reads` would run, as a reason naming the
-/// key (or the hook) — `None` when nothing it loads runs a program. Every key
-/// is told apart by [`consult`] alone, the predicate the projection a tape
-/// keeps is cut by.
+/// The first thing in `view` that `reads` would run, as a reason naming the key (or the hook).
 pub(crate) fn hazard(view: &GitView, reads: &GitReads) -> Option<String> {
     let shows = view
         .config

@@ -1,30 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The overlay scrollbar (`scrollbar = true`, the Windows default): a Fluent
-//! panning indicator in each terminal pane's right gutter.
-//!
-//! It is a zero-row, zero-column surface (`docs/DESIGN-render-integrity-2026-09-28.md`
-//! §3, clause 1): it draws in the window's right padding, or on the divider's
-//! hairline beside an inner pane (centred on it, so it keeps the same air from
-//! the text on both sides of the gap), and never takes a cell, so showing or
-//! hiding it can never re-grid a program.
-//!
-//! What it shows, per pane with history on its main screen:
-//!
-//! * nothing at the live bottom while nothing scrolls;
-//! * a thin rounded thumb while the pane scrolls (under the Fluent chrome
-//!   WinUI's two-pixel panning indicator, the same width and ink at the window's
-//!   edge and in a divider gap: [`rest_width`], [`rest_alpha`], [`rest_span`]),
-//!   fading ([`crate::scroll_motion::pill_alpha`]: a hold, then a ramp, binary
-//!   under Reduce Motion) to nothing at the bottom, or to a quieter resting thumb
-//!   while the view is parked in history, so a view that is not live always says
-//!   so;
-//! * under the pointer, a wider thumb over a faint track: dragging it moves the
-//!   view, and a press on the track pages toward the pointer.
-//!
-//! Everything here is geometry and paint over explicit inputs; the host side
-//! (facts, keying, the splice and the pointer) is [`crate::pane_chrome`].
+//! The overlay scrollbar (`scrollbar = true`, the Windows default): a Fluent panning indicator in each terminal pane's right gutter.
 
 use aterm_render::GlowQuad;
 
@@ -44,9 +21,7 @@ pub(crate) const ALPHA_TRACK: u8 = 22;
 pub(crate) struct Metrics {
     /// The resting and scrolling thumb's width (the Classic chrome).
     pub thin: u32,
-    /// The resting and scrolling thumb's width under the Fluent chrome: WinUI's
-    /// panning indicator (`ScrollBar`'s `VerticalPanningThumb`, `Width="2"`),
-    /// two device pixels at the 9 px Windows cell, three at 150%, four at 200%.
+    /// The resting and scrolling thumb's width under the Fluent chrome: WinUI's panning indicator (`ScrollBar`'s `VerticalPanningThumb`, `Width="2"`), two device pixels at the 9 px Windows cell, three at 150%, four at 200%.
     pub fine: u32,
     /// The thumb's width under the pointer or while dragged.
     pub wide: u32,
@@ -56,22 +31,17 @@ pub(crate) struct Metrics {
     pub inset: u32,
     /// The shortest thumb.
     pub min_len: u32,
-    /// The divider hairline's thickness: the renderer's light box-drawing
-    /// stroke for this cell ([`hairline_stroke`]), so a thumb or a focus line
-    /// placed against the hairline lands on the pixels the `│` glyph draws.
+    /// The divider hairline's thickness: the renderer's light box-drawing stroke for this cell ([`hairline_stroke`]), so a thumb or a focus line placed against the hairline lands on the pixels the `│` glyph draws.
     pub stroke: u32,
 }
 
 impl Metrics {
-    /// Sizes scaled from the cell, so a 2x display draws a 2x bar: at the 9x23
-    /// Windows default a 3 px thumb (2 px under the Fluent chrome) that widens
-    /// to 6 px, 2 px from the edge.
+    /// Sizes scaled from the cell, so a 2x display draws a 2x bar: at the 9x23 Windows default a 3 px thumb (2 px under the Fluent chrome) that widens to 6 px, 2 px from the edge.
     #[must_use]
     pub(crate) fn for_cell(cell_w: u32, cell_h: u32) -> Self {
         let unit = (cell_w / 9).max(1);
         Metrics {
             thin: (cell_w / 3).clamp(2, 6),
-            // Two pixels per 9 px of cell, rounded.
             fine: (cell_w.saturating_mul(2).saturating_add(4) / 9).max(1),
             wide: (cell_w * 2 / 3).clamp(4, 14),
             margin: 2 * unit,
@@ -82,45 +52,33 @@ impl Metrics {
     }
 }
 
-/// The light box-drawing stroke of a `cell_w × cell_h` cell, in device pixels:
-/// `max(1, (min(w, h) + 4) / 8)`, `aterm_render`'s procedural rounding rule.
+/// The light box-drawing stroke of a `cell_w × cell_h` cell, in device pixels: `max(1, (min(w, h) + 4) / 8)`, `aterm_render`'s procedural rounding rule.
 #[must_use]
 pub(crate) fn hairline_stroke(cell_w: u32, cell_h: u32) -> u32 {
     (cell_w.min(cell_h).saturating_add(4) / 8).max(1)
 }
 
-/// Where a light `│` (or `─`) of `stroke` px starts across a cell `extent` px
-/// wide (or tall): `(extent − stroke) / 2`, the extra pixel of an odd remainder
-/// going right (down), as the renderer places it.
+/// Where a light `│` (or `─`) of `stroke` px starts across a cell `extent` px wide (or tall): `(extent − stroke) / 2`, the extra pixel of an odd remainder going right (down), as the renderer places it.
 #[must_use]
 pub(crate) fn hairline_start(extent: u32, stroke: u32) -> u32 {
     extent.saturating_sub(stroke) / 2
 }
 
-/// Where one pane's bar may draw, in terminal-grid pixels (the grid's own
-/// origin, chrome rows above it excluded).
+/// Where one pane's bar may draw, in terminal-grid pixels (the grid's own origin, chrome rows above it excluded).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Lane {
-    /// The pixel column the gutter ends at (exclusive): the window's right
-    /// edge, or the divider gap's right edge.
+    /// The pixel column the gutter ends at (exclusive): the window's right edge, or the divider gap's right edge.
     pub right: u32,
-    /// How much room the gutter has left of `right`: the right padding, or the
-    /// whole divider gap (one cell), whose hairline the bar is centred on.
+    /// How much room the gutter has left of `right`: the right padding, or the whole divider gap (one cell), whose hairline the bar is centred on.
     pub room: u32,
     /// The track's top and length.
     pub top: u32,
     pub len: u32,
-    /// The lane is the window's own padding (pages on a track press), not a
-    /// divider gap (which keeps the rest of its width for resizing).
+    /// The lane is the window's own padding (pages on a track press), not a divider gap (which keeps the rest of its width for resizing).
     pub edge: bool,
 }
 
-/// The lane of the pane whose content occupies cells `(row, col, rows, cols)`
-/// in a `win_cols`-wide grid, or `None` where there is no gutter to draw in.
-///
-/// The right-most pane draws in the window's right padding (`pad` pixels). An
-/// inner pane draws in the 1-cell divider gap beside it, on the hairline
-/// `crate::pane_chrome` centres there ([`span`]).
+/// The lane of the pane whose content occupies cells `(row, col, rows, cols)` in a `win_cols`-wide grid, or `None` where there is no gutter to draw in.
 #[must_use]
 pub(crate) fn lane(
     (row, col, rows, cols): (usize, usize, usize, usize),
@@ -150,15 +108,6 @@ pub(crate) fn lane(
 }
 
 /// The bar's horizontal span `(x, w)` in `lane` at `width`.
-///
-/// In the window's padding the thumb hugs the lane's right side, keeping the
-/// margin, and fits the gutter. In a divider gap it is centred on the gap's
-/// hairline, covering the line over its length, so the text on either side
-/// keeps the same air: 3 px each side of the 3 px resting thumb in the 9 px
-/// gap of the Windows default cell, where hugging the gap's left half left it
-/// touching the pane's last column and 1 px off the line (the 2026-10-18
-/// judges' `split-thumb-touches-text`, `split-scroll-thumb-crowded`). A
-/// widened thumb stays centred, held inside the gap.
 #[must_use]
 pub(crate) fn span(lane: Lane, width: u32, m: Metrics) -> (u32, u32) {
     if lane.edge {
@@ -169,35 +118,18 @@ pub(crate) fn span(lane: Lane, width: u32, m: Metrics) -> (u32, u32) {
     }
     let gap_x = lane.right.saturating_sub(lane.room);
     let w = width.clamp(1, lane.room.max(1));
-    // Centred on the hairline `[line, line + stroke)`, in doubled coordinates
-    // so an odd difference rounds the same way at every scale.
     let line = gap_x + hairline_start(lane.room, m.stroke);
     let x = (2 * line + m.stroke).saturating_sub(w) / 2;
     (x.clamp(gap_x, lane.right.saturating_sub(w)), w)
 }
 
-/// The resting (and scrolling) thumb's width, for [`rest_span`]: under the
-/// Fluent chrome (`fluent`, Windows) WinUI's thin panning indicator,
-/// [`Metrics::fine`], at the window's edge and in a divider gap alike; under
-/// the Classic chrome the [`Metrics::thin`] thumb. The pointer widens either to
-/// [`Metrics::wide`].
-///
-/// One idiom in both places: the Fluent gap thumb used to be the hairline's own
-/// stroke lit twice as bright (one pixel at 100%) while the thumb at the
-/// window's edge stayed a three-pixel pill at the plain opacity, so one
-/// scrolled split showed two scrollbars (the 2026-10-18 judge's
-/// `two-scrollbar-idioms-in-one-split`).
+/// The resting (and scrolling) thumb's width, for [`rest_span`]: under the Fluent chrome (`fluent`, Windows) WinUI's thin panning indicator, [`Metrics::fine`], at the window's edge and in a divider gap alike; under the Classic chrome the [`Metrics::thin`] thumb.
 #[must_use]
 pub(crate) fn rest_width(m: Metrics, fluent: bool) -> u32 {
     if fluent { m.fine } else { m.thin }
 }
 
-/// The opacity a resting (or scrolling) thumb of `alpha` paints at: under the
-/// Fluent chrome twice `alpha` (opaque at most), so the thin indicator carries
-/// the ink of WinUI's (its `ControlStrongFillColorDefault`, about 55% white on
-/// dark) and stands off the divider's hairline it covers in a gap, where the
-/// plain resting opacity laid almost the hairline's own tone; the scrolling
-/// and parked steps stay apart. The Classic thumb keeps `alpha`.
+/// The opacity a resting (or scrolling) thumb of `alpha` paints at: under the Fluent chrome twice `alpha` (opaque at most), so the thin indicator carries the ink of WinUI's (its `ControlStrongFillColorDefault`, about 55% white on dark) and stands off the divider's hairline it covers in a gap, where the plain resting opacity laid almost the hairline's own tone; the scrolling and parked steps stay apart.
 #[must_use]
 pub(crate) fn rest_alpha(alpha: u8, fluent: bool) -> u8 {
     if fluent {
@@ -207,8 +139,7 @@ pub(crate) fn rest_alpha(alpha: u8, fluent: bool) -> u8 {
     }
 }
 
-/// Which side of a divider gap's hairline a focus-ring stroke runs on beside a
-/// lane's track (`crate::pane_chrome::focus_ring_rects`).
+/// Which side of a divider gap's hairline a focus-ring stroke runs on beside a lane's track (`crate::pane_chrome::focus_ring_rects`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RingSide {
     /// Left of the hairline: the pane on the gap's left has the keyboard.
@@ -217,17 +148,7 @@ pub(crate) enum RingSide {
     Right,
 }
 
-/// The resting (or scrolling) thumb's span `(x, w)` in `lane` at `width`
-/// ([`rest_width`]): [`span`], except in a divider gap where the focus ring
-/// runs beside the hairline (`ring`). There the thumb covers the hairline and
-/// grows away from the ring: from the line's ring-side edge toward the other
-/// pane. The ring stands one stroke clear of the line on its pane's side
-/// (`crate::pane_chrome::push_focus_ring`), so a stroke of ground stays between
-/// it and the thumb at every scale, and the thumb keeps three pixels from the
-/// far pane's text at 100% (five or six at 200%). A thumb wider than the line,
-/// centred on it, would touch the ring on one side or the other (at 100% the
-/// two-pixel thumb on the one-pixel line); the ring was what kept the gap's
-/// thumb to the line's own pixel.
+/// The resting (or scrolling) thumb's span `(x, w)` in `lane` at `width` ([`rest_width`]): [`span`], except in a divider gap where the focus ring runs beside the hairline (`ring`).
 #[must_use]
 pub(crate) fn rest_span(lane: Lane, width: u32, m: Metrics, ring: Option<RingSide>) -> (u32, u32) {
     let Some(side) = ring.filter(|_| !lane.edge) else {
@@ -243,16 +164,7 @@ pub(crate) fn rest_span(lane: Lane, width: u32, m: Metrics, ring: Option<RingSid
     (x.clamp(gap_x, lane.right.saturating_sub(w)), w)
 }
 
-/// The widened (hovered or dragged) bar's track span `(x, w)` in `lane`:
-/// [`span`]'s centred track, `m.wide + 2` wide, except in a divider gap where
-/// the focus ring runs beside the hairline (`ring`). There it keeps to the
-/// ring's far side as the resting thumb does ([`rest_span`]): from the
-/// hairline's ring-side edge toward the other pane, stopping a stroke short
-/// of that pane's text, so the ring stays whole under the pointer with a
-/// stroke of ground between them. Centred, the widened track and thumb
-/// covered the ring's column and tinted it (the 2026-10-18 judge's
-/// `J4F-3-gap-thumb-hover-and-two-tone`). The widened thumb is the track's
-/// width at most.
+/// The widened (hovered or dragged) bar's track span `(x, w)` in `lane`: [`span`]'s centred track, `m.wide + 2` wide, except in a divider gap where the focus ring runs beside the hairline (`ring`).
 #[must_use]
 pub(crate) fn wide_span(lane: Lane, m: Metrics, ring: Option<RingSide>) -> (u32, u32) {
     let width = m.wide + 2;
@@ -272,14 +184,7 @@ pub(crate) fn wide_span(lane: Lane, m: Metrics, ring: Option<RingSide>) -> (u32,
     }
 }
 
-/// The quad `(rgb, alpha)` that paints `ink` at `alpha` over `ground` in ONE
-/// tone, whatever lies under it (a divider gap's hairline): from `solid` up,
-/// the ink precomposed over the ground and drawn opaque; below it, the
-/// `solid` tone fading, so a thumb fading out gives the hairline back. Over
-/// the ground it is `ink` at `alpha` either way. A translucent thumb on the
-/// hairline was two-tone, lighter over the line's column than over the
-/// ground's (the 2026-10-18 judge's `J4F-3-gap-thumb-hover-and-two-tone`),
-/// where the thumb at the window's edge, all on the ground, was one.
+/// The quad `(rgb, alpha)` that paints `ink` at `alpha` over `ground` in ONE tone, whatever lies under it (a divider gap's hairline): from `solid` up, the ink precomposed over the ground and drawn opaque; below it, the `solid` tone fading, so a thumb fading out gives the hairline back.
 #[must_use]
 pub(crate) fn over_ground(ink: [u8; 3], ground: [u8; 3], alpha: u8, solid: u8) -> ([u8; 3], u8) {
     let solid = solid.max(1);
@@ -297,10 +202,7 @@ pub(crate) fn over_ground(ink: [u8; 3], ground: [u8; 3], alpha: u8, solid: u8) -
     }
 }
 
-/// The thumb's `(top, len)` on `lane` for a view of `view_rows` over
-/// `history` lines scrolled back `offset` lines, or `None` with no history:
-/// [`crate::scroll_motion::pill_geometry`]'s proven laws (containment, the
-/// length floor, a monotone position with exact ends) over the lane's track.
+/// The thumb's `(top, len)` on `lane` for a view of `view_rows` over `history` lines scrolled back `offset` lines, or `None` with no history: [`crate::scroll_motion::pill_geometry`]'s proven laws (containment, the length floor, a monotone position with exact ends) over the lane's track.
 #[must_use]
 pub(crate) fn thumb(
     lane: Lane,
@@ -313,9 +215,7 @@ pub(crate) fn thumb(
         .map(|(y, len)| (lane.top + y, len))
 }
 
-/// The scroll offset that puts the thumb's top at `top` (track pixels from
-/// the lane's top, clamped), the inverse of [`thumb`]: the track's top is the
-/// top of history, its bottom the live view.
+/// The scroll offset that puts the thumb's top at `top` (track pixels from the lane's top, clamped), the inverse of [`thumb`]: the track's top is the top of history, its bottom the live view.
 #[must_use]
 pub(crate) fn offset_for_top(
     lane: Lane,
@@ -341,8 +241,7 @@ pub(crate) fn offset_for_top(
 pub(crate) enum Hit {
     /// The thumb, `grab` pixels below its top.
     Thumb { grab: f64 },
-    /// The track above (`true`) or below (`false`) the thumb, in the window's
-    /// padding only: an inner pane's gap belongs to the divider off the thumb.
+    /// The track above (`true`) or below (`false`) the thumb, in the window's padding only: an inner pane's gap belongs to the divider off the thumb.
     Track { above: bool },
 }
 
@@ -351,14 +250,11 @@ pub(crate) enum Hit {
 pub(crate) fn hit(lane: Lane, thumb: (u32, u32), x: f64, y: f64, m: Metrics) -> Option<Hit> {
     let (top, len) = thumb;
     let (left, right) = if lane.edge {
-        // The whole padding strip beside the track, to the window edge.
         (
             f64::from(lane.right.saturating_sub(lane.room)),
             f64::from(lane.right),
         )
     } else {
-        // Only the thumb's own span at its hovered width: off it, the gap
-        // stays the divider's (a press there resizes the split).
         let (sx, sw) = span(lane, m.wide, m);
         (f64::from(sx), f64::from(sx + sw))
     };
@@ -376,11 +272,7 @@ pub(crate) fn hit(lane: Lane, thumb: (u32, u32), x: f64, y: f64, m: Metrics) -> 
     lane.edge.then_some(Hit::Track { above: y < y0 })
 }
 
-/// Append a rounded bar `(x, y, w, h)` in frame pixels (grid-interior, the
-/// chrome rows included) as source-over [`GlowQuad`]s of `rgb` at `alpha`: the
-/// body one quad per cell-row band (each quad lies in one band, as the stream
-/// requires), the two semicircular caps per pixel row at their antialiased
-/// coverage.
+/// Append a rounded bar `(x, y, w, h)` in frame pixels (grid-interior, the chrome rows included) as source-over [`GlowQuad`]s of `rgb` at `alpha`: the body one quad per cell-row band (each quad lies in one band, as the stream requires), the two semicircular caps per pixel row at their antialiased coverage.
 pub(crate) fn push_bar(
     out: &mut Vec<GlowQuad>,
     (x, y, w, h): (u32, u32, u32, u32),
@@ -393,7 +285,6 @@ pub(crate) fn push_bar(
     }
     let radius = (f64::from(w) / 2.0).min(f64::from(h) / 2.0);
     let cap = (radius.ceil() as u32).min(h / 2);
-    // Body rows: full coverage, split at row bands.
     let (b0, b1) = (y + cap, y + h - cap);
     let mut row_y = b0;
     while row_y < b1 {
@@ -402,7 +293,6 @@ pub(crate) fn push_bar(
         push_quad(out, (x, row_y, w, end - row_y), rgb, alpha, cell_h);
         row_y = end;
     }
-    // Cap rows: supersampled coverage against the rounded rectangle.
     let (fx, fy, fw, fh) = (f64::from(x), f64::from(y), f64::from(w), f64::from(h));
     let inside = |px: f64, py: f64| -> bool {
         if px < fx || px >= fx + fw || py < fy || py >= fy + fh {
@@ -425,7 +315,6 @@ pub(crate) fn push_bar(
         }
         ((u32::from(alpha) * hits + SS * SS / 2) / (SS * SS)) as u8
     };
-    // Each cap row as runs of equal coverage, one quad per run.
     for py in (y..y + cap).chain((y + h - cap)..(y + h)) {
         let mut start = x;
         let mut run: Option<u8> = None;
@@ -446,9 +335,7 @@ pub(crate) fn push_bar(
     }
 }
 
-/// Append a 1-device-pixel-scaled rectangular outline `(x, y, w, h)` (frame
-/// pixels, within one cell-row band) as four source-over quads: the hollow
-/// cursor of an unfocused pane.
+/// Append a 1-device-pixel-scaled rectangular outline `(x, y, w, h)` (frame pixels, within one cell-row band) as four source-over quads: the hollow cursor of an unfocused pane.
 pub(crate) fn push_outline(
     out: &mut Vec<GlowQuad>,
     (x, y, w, h): (u32, u32, u32, u32),
@@ -467,9 +354,7 @@ pub(crate) fn push_outline(
     push_quad(out, (x + w - t, y + t, t, h - 2 * t), rgb, alpha, cell_h);
 }
 
-/// Append the rectangle `(x, y, w, h)` (frame pixels, any number of row bands
-/// tall) as flat source-over [`GlowQuad`]s, one per cell-row band it crosses:
-/// the Fluent split's focus line.
+/// Append the rectangle `(x, y, w, h)` (frame pixels, any number of row bands tall) as flat source-over [`GlowQuad`]s, one per cell-row band it crosses: the Fluent split's focus line.
 pub(crate) fn push_rect(
     out: &mut Vec<GlowQuad>,
     (x, y, w, h): (u32, u32, u32, u32),
@@ -491,8 +376,6 @@ pub(crate) fn push_rect(
 }
 
 /// One flat source-over quad: `rgb` premultiplied by `alpha` (the stream's
-/// contract, `out = color + dst·(255 − alpha)/255`). A zero alpha would read
-/// as additive light, so it is never emitted.
 fn push_quad(
     out: &mut Vec<GlowQuad>,
     (x, y, w, h): (u32, u32, u32, u32),
@@ -552,16 +435,11 @@ mod tests {
         let (wx, ww) = span(edge, m().wide, m());
         assert!(wx >= 111 * 9 && ww == 6, "and neither does the wide one");
 
-        // A left pane of 55 columns beside a divider at column 55.
         let inner = lane((1, 0, 30, 55), 111, CELL, 12, m()).expect("inner lane");
         assert_eq!((inner.right, inner.room, inner.edge), (56 * 9, 9, false));
     }
 
     /// THE THUMB IN A DIVIDER GAP sits on the hairline with the same air from
-    /// the text on each side, at every scale, resting or widened, and never
-    /// covers a column of either pane. NEGATIVE CONTROL: at 1x the 3 px thumb
-    /// keeps 3 px from each pane's text, where the 2026-10-18 build drew it at
-    /// the gap's first pixel, touching the left pane's last column.
     #[test]
     fn a_gap_thumb_is_centred_on_the_hairline_clear_of_both_panes() {
         for (cw, ch) in [(9u32, 23u32), (14, 35), (18, 46), (10, 20), (7, 17)] {
@@ -576,7 +454,6 @@ mod tests {
                     x >= gap.0 && x + w <= gap.1,
                     "{cw}x{ch} w{width}: inside the gap: {x}+{w}"
                 );
-                // Centred on the hairline to the half pixel (doubled coordinates).
                 assert!(
                     (2 * x + w).abs_diff(2 * line + m.stroke) <= 1,
                     "{cw}x{ch} w{width}: centred on the line at {line}: {x}+{w}"
@@ -603,13 +480,6 @@ mod tests {
     }
 
     /// A FLUENT RESTING THUMB IN A GAP BESIDE THE RING covers the hairline and
-    /// grows away from the ring, at every scale and on either side: a stroke
-    /// of ground between it and the ring (which stands one stroke clear of the
-    /// line on its pane's side), at least two pixels from the far pane's text,
-    /// inside the gap. With no ring beside it, it is [`span`]'s centred thumb;
-    /// at the window's edge the ring changes nothing. NEGATIVE CONTROL: the
-    /// centred thumb of the same width comes within a stroke of the ring on one
-    /// side or the other at every scale.
     #[test]
     fn a_fluent_resting_thumb_beside_the_ring_grows_away_from_it() {
         for (cw, ch) in [
@@ -626,7 +496,6 @@ mod tests {
             let inner = lane((0, 0, 30, 40), 81, cell, 12, m).expect("inner lane");
             let gap = (40 * cw, 41 * cw);
             let line = gap.0 + hairline_start(cw, t);
-            // The ring's stroke beside the line: [x, x + t).
             let ring_left = line - 2 * t;
             let ring_right = line + 2 * t;
             let w = rest_width(m, true);
@@ -643,7 +512,6 @@ mod tests {
                     x >= gap.0 + 2 && x + sw + 2 <= gap.1,
                     "{cw}x{ch} {side:?}: clear of both panes' text: {x}+{sw}"
                 );
-                // Pixels of ground between the thumb and the ring's stroke.
                 let ground = |x: u32, sw: u32| {
                     if ring_x >= x + sw {
                         ring_x - (x + sw)
@@ -674,12 +542,6 @@ mod tests {
     }
 
     /// THE WIDENED BAR IN A GAP BESIDE THE RING keeps to the ring's far side
-    /// at every scale and on either side: it covers the hairline, a stroke of
-    /// ground lies between it and the ring's stroke, it stays a stroke clear
-    /// of the far pane's text, and it is no wider than the centred track.
-    /// With no ring beside it, and at the window's edge, it is [`span`]'s
-    /// centred track. NEGATIVE CONTROL: the centred track covers the ring's
-    /// stroke at every scale.
     #[test]
     fn a_widened_gap_bar_beside_the_ring_keeps_off_it() {
         for (cw, ch) in [
@@ -737,14 +599,9 @@ mod tests {
     }
 
     /// ONE TONE OVER THE HAIRLINE: from `solid` up the thumb is opaque in the
-    /// ink composed over the ground, so the hairline under it cannot show;
-    /// below it the solid tone fades, and over the ground every step is the
-    /// plain translucent ink's tone. NEGATIVE CONTROL: the translucent ink is
-    /// two tones over the line and the ground.
     #[test]
     fn a_thumb_over_the_ground_is_one_tone_over_the_hairline_too() {
         let (ink, ground, line) = ([0xf8, 0xf8, 0xf2], [0x28, 0x2a, 0x36], [0x5a, 0x5c, 0x68]);
-        // A source-over quad `(rgb, alpha)` over `dst`, per channel.
         let over = |rgb: [u8; 3], alpha: u8, dst: [u8; 3]| -> [u8; 3] {
             std::array::from_fn(|i| {
                 let a = u32::from(alpha);
@@ -780,8 +637,6 @@ mod tests {
     }
 
     /// ONE RESTING IDIOM UNDER THE FLUENT CHROME: the thin indicator, at the
-    /// same width and the same (doubled) opacity whatever lane it rests in;
-    /// the Classic chrome keeps its thin thumb at its own opacity.
     #[test]
     fn the_fluent_resting_thumb_is_one_width_and_one_ink() {
         let m = m();
@@ -820,8 +675,6 @@ mod tests {
         for offset in [0u32, 1, 17, 150, 299, 300] {
             let (top, _) = thumb(l, 30, 300, offset, m()).unwrap();
             let back = offset_for_top(l, 30, 300, f64::from(top), m());
-            // A pixel covers more than one line on a long history: the inverse
-            // lands within the lines one pixel of travel spans.
             let (_, len) = thumb(l, 30, 300, 0, m()).unwrap();
             let per_px = 300.0 / f64::from(l.len - len);
             assert!(
@@ -888,7 +741,6 @@ mod tests {
     }
 
     /// Every quad is source-over (alpha > 0), lies in one row band, and the
-    /// bar's pixels are exactly its rectangle: corners shaved, the middle solid.
     #[test]
     fn a_bar_is_rounded_source_over_and_banded() {
         let mut out = Vec::new();

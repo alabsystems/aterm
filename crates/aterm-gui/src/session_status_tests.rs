@@ -6,7 +6,6 @@ use std::sync::{Arc, Mutex};
 use crate::session_timeline::SessionTimeline;
 
 /// The record ends `seq=<n|-> hash=<hex16|->`, in that order: the pair a stamped report opens
-/// with and `history` can be held against.
 fn assert_stamp_rides_last(record: &str) {
     let stamp = record
         .rsplit_once(" seq=")
@@ -45,8 +44,6 @@ fn stale_claude_sample_cannot_restart_a_stopped_footer_watch() {
         current.set_program(42, Some("claude".into()));
         current.set_program(42, Some("zsh".into()));
     }
-    // The UI sampled Claude before the worker published zsh and sent its
-    // stop. A later request from that stale sample would revive the watch.
     observer.request_footer_if_due(
         7,
         &timeline,
@@ -76,14 +73,6 @@ fn stale_claude_sample_cannot_restart_a_stopped_footer_watch() {
 }
 
 /// THE RE-ASK AT THE DRAWER'S EXEC EDGE (card engine §3.10). atpkg's shim
-/// is named `claude` and `exec`s the store build in place: the group and the
-/// name stay, so the sweep would not ask again for `RECHECK`, and its first
-/// ask may have fallen in the shim, whose environment macOS hides (no Claude
-/// dir, no registry watch). An edged visit whose group's published image is
-/// a store or Native Claude Code drawer the last ask was not made under asks
-/// at once, once per image (an ALab build the store's record names, too).
-/// CONTROLS: the shim's own image, an unclassified `claude` and a visit off
-/// the edge ask nothing.
 #[test]
 fn an_exec_into_a_store_or_native_claude_asks_for_the_footer_again() {
     use atpkg::image::{ImageBuild, ImageSource, ProgramTag};
@@ -193,11 +182,6 @@ fn settle(fsm: &mut StatusFsm, ev: &Evidence, at: Instant) -> Instant {
 }
 
 /// cmd.exe's `%PROMPT%` integration marks prompts and never a command, so `ping
-/// -n 30 127.0.0.1` runs under the `Entering` block of the prompt it was typed
-/// at. The snapshot of 2026-09-29 records the defect on 0.95.0 (2026-09-27):
-/// `status` read `phase=idle` while the close guard refused the close as a
-/// running job. With no command ever reported, the live job outranks that
-/// prompt. CONTROL: the same evidence without the yield reads idle.
 #[test]
 fn a_prompt_only_shell_running_a_job_reads_running() {
     let t0 = Instant::now();
@@ -227,10 +211,6 @@ fn a_prompt_only_shell_running_a_job_reads_running() {
 }
 
 /// The other side of the line: a shell whose marks HAVE reported a command keeps
-/// its prompt's authority over a child it started in the background
-/// (`Start-Process notepad`), and a prompt-only shell with no live child stays
-/// idle on its prompt block. Only the prompt arms yield: an executing or
-/// completed block already says what it is.
 #[test]
 fn only_a_prompt_that_never_reported_a_command_yields_to_a_job() {
     for shell in [ShellEvidence::Prompt, ShellEvidence::Entering] {
@@ -258,8 +238,6 @@ fn only_a_prompt_that_never_reported_a_command_yields_to_a_job() {
     }
     assert_eq!(prompt_yields_to_job(None, false, Some(true)), None);
 
-    // Through the FSM: the reporting shell's prompt reads Idle on the shell
-    // block, never the foreground job.
     let t0 = Instant::now();
     let mut fsm = StatusFsm::new(policy(), t0);
     let mut ev = evidence(blank(1));
@@ -273,8 +251,6 @@ fn only_a_prompt_that_never_reported_a_command_yields_to_a_job() {
 }
 
 /// What "reported a command" is read from: cmd.exe's prompt marks (A, B, then
-/// the typed line and its output, then the next prompt) never move the
-/// completed-command count; pwsh's C…D does.
 #[test]
 fn prompt_marks_alone_never_report_a_command() {
     use crate::quit_safety::shell_reports_commands;
@@ -300,7 +276,6 @@ fn prompt_marks_alone_never_report_a_command() {
 }
 
 /// Every phase has a wire spelling and the classifier produces each one: the `status` verb's
-/// vocabulary is exhaustive.
 #[test]
 fn every_phase_is_reachable_and_has_a_wire_spelling() {
     let spellings = [
@@ -319,7 +294,6 @@ fn every_phase_is_reachable_and_has_a_wire_spelling() {
     let mut fsm = StatusFsm::new(policy(), t0);
     assert_eq!(fsm.status().phase, Phase::Starting, "seeded");
 
-    // No evidence reports unknown rather than guessing.
     let mut ev = evidence(blank(1));
     settle(&mut fsm, &ev, t0);
     assert_eq!(fsm.status().phase, Phase::Unknown, "no evidence");
@@ -335,19 +309,14 @@ fn every_phase_is_reachable_and_has_a_wire_spelling() {
     let t2 = settle(&mut fsm, &ev, t1 + Duration::from_millis(10));
     assert_eq!(fsm.status().phase, Phase::Running);
 
-    // Silence is Quiet, and only heuristically: a pager, a REPL, a password prompt and a
-    // `sleep` look alike from here.
     ev.activity.last_output = None;
     settle(&mut fsm, &ev, t2 + QUIET * 2);
     assert_eq!(fsm.status().phase, Phase::Quiet);
     assert_eq!(fsm.status().confidence, Confidence::Heuristic);
-    // `exited`: `a_collected_exit_code_becomes_the_outcome`.
 }
 
 #[test]
 fn alt_screen_transition_is_a_resync_not_activity() {
-    // Entering the alternate screen restarts content_gen. A naive
-    // comparison would read that jump as a burst of work.
     let t0 = Instant::now();
     let mut fsm = StatusFsm::new(policy(), t0);
     let mut ev = evidence(ActivitySample {
@@ -373,11 +342,6 @@ fn alt_screen_transition_is_a_resync_not_activity() {
 }
 
 /// On a shell-integrated session, output that moves nothing reads `output_activity` (the
-/// `movement_reason` the foreground-job arm uses), so `ctl status` shows whether the movement
-/// clock is stale (`docs/EFFECTS-AND-WAKE-FOLLOWUPS-2026-08-24.md` item 21). The work starts with
-/// the grid moving (output alone starts no `Running`:
-/// [`output_that_moves_no_cell_sustains_running_but_never_starts_it`]), and bytes that mark no
-/// cell keep it alive once the movement clock is stale.
 #[test]
 fn executing_names_output_only_movement_as_output_activity() {
     let t0 = Instant::now();
@@ -395,7 +359,6 @@ fn executing_names_output_only_movement_as_output_activity() {
         "the work started with the grid moving"
     );
 
-    // The grid stands still past the quiet window while bytes keep coming.
     let t2 = t1 + QUIET;
     ev.activity.last_output = Some(t2);
     fsm.observe(&ev, t2);
@@ -406,7 +369,6 @@ fn executing_names_output_only_movement_as_output_activity() {
         "bytes arrived and the grid never moved"
     );
 
-    // Control: the grid moves, and the record says so.
     ev.activity.content_seq = 3;
     ev.activity.last_output = Some(t2 + Duration::from_millis(10));
     fsm.observe(&ev, t2 + Duration::from_millis(10));
@@ -419,16 +381,6 @@ fn executing_names_output_only_movement_as_output_activity() {
 }
 
 /// OUTPUT THAT MOVES NO CELL NEVER STARTS `Running`
-/// (docs/measured/vitals-multi-tab-2026-10-22.md): a program at rest whose
-/// writes mark no cell (Muse Code's SGR reset every ~9 s, Gemini CLI's OSC 11
-/// query once a minute) stays where it rests (`Quiet` with a foreground job,
-/// `Unknown` with no foreground evidence at all) and owes the sweep no wake.
-/// Before, each such write read `quiet -> running -> quiet` and cost three
-/// timed sweeps: the dwell's publish, the retirement, and its dwell.
-/// NEGATIVE CONTROLS: a write that moves the grid still starts `Running`
-/// after the dwell and owes its wakes, and a published `Running` is still
-/// sustained by output alone
-/// ([`executing_names_output_only_movement_as_output_activity`]).
 #[test]
 fn output_that_moves_no_cell_sustains_running_but_never_starts_it() {
     for (shell, job, rest) in [
@@ -446,7 +398,6 @@ fn output_that_moves_no_cell_sustains_running_but_never_starts_it() {
         assert_eq!(fsm.status().phase, rest, "{case}: at rest");
         assert_eq!(fsm.owed_wake(), None, "{case}");
 
-        // Writes that mark no cell, one a second for a minute.
         for n in 1..=60 {
             let at = t1 + Duration::from_secs(n);
             ev.activity.last_output = Some(at);
@@ -455,7 +406,6 @@ fn output_that_moves_no_cell_sustains_running_but_never_starts_it() {
             assert_eq!(fsm.owed_wake(), None, "{case}: no sweep is owed");
         }
 
-        // Control: a write that moves the grid starts the work.
         let t2 = t1 + Duration::from_secs(61);
         ev.activity.content_seq = 2;
         ev.activity.last_output = Some(t2);
@@ -496,11 +446,6 @@ fn published(phase: Phase, last_outcome: Outcome) -> Status {
 }
 
 /// A command Ctrl+C stopped reads as interrupted, not as a failure code:
-/// STATUS_CONTROL_C_EXIT, which a Windows console program (`ping -t` in pwsh,
-/// measured 2026-10-17 as `failed (exit -1073741510)`) and a pwsh line Ctrl+C
-/// stopped report, everywhere; Git Bash's 130 on Windows, so its tabs read as
-/// pwsh's. The outcome stays a failure with its code (the wire and the tab's
-/// failure mark are unchanged). NEGATIVE CONTROL: any other code is its code.
 #[test]
 fn a_ctrl_c_exit_reads_as_interrupted() {
     let text = |phase, exit_code| {
@@ -541,27 +486,19 @@ fn indicators_map_work_and_failure_without_claiming_unsaved_state() {
 
     let cases = [
         (Phase::Running, Outcome::None, (true, false)),
-        // An exited session with no collectable status (an unwitnessed adopted shell, an
-        // unreadable master) is unknown, not a failure worth marking.
         (Phase::Exited, Outcome::None, (false, false)),
-        // A finished failure keeps the tab marked while the shell honestly
-        // sits back at a prompt.
         (
             Phase::Idle,
             Outcome::Failure { exit_code: 1 },
             (false, true),
         ),
         (Phase::Exited, Outcome::Signal { signal: 9 }, (false, true)),
-        // Running and failed: the previous unit's result is still worth showing,
-        // and neither bit hides the other.
         (
             Phase::Running,
             Outcome::Failure { exit_code: 2 },
             (true, true),
         ),
         (Phase::Idle, Outcome::Success, (false, false)),
-        // Quiet is work in flight that has printed nothing recently (reachable only with a
-        // known foreground job), so the dot stays lit.
         (Phase::Quiet, Outcome::None, (true, false)),
         (Phase::Starting, Outcome::None, (false, false)),
         (Phase::Unknown, Outcome::None, (false, false)),
@@ -572,8 +509,6 @@ fn indicators_map_work_and_failure_without_claiming_unsaved_state() {
             TabIndicators {
                 dirty: false,
                 busy,
-                // A terminal never writes the out-of-band bit, so the classifier's own
-                // bit can be recomputed rather than latched.
                 attention: false,
                 status_attention: attention,
             },
@@ -583,14 +518,12 @@ fn indicators_map_work_and_failure_without_claiming_unsaved_state() {
 }
 
 /// End to end on the real fan-out: a background pane's transition reaches the tab its window
-/// renders, which a focus-addressed status path would miss.
 #[test]
 fn a_background_pane_going_busy_marks_its_tab() {
     use crate::tab_model::TabIndicators;
 
     let mut app = crate::App::headless_for_test();
     let wid = crate::WindowId(0);
-    // The new pane takes focus, so session 0 becomes the background leaf.
     let focused = app.split_active_stub_tab(wid);
     assert_ne!(focused, 0, "the split spawns a second session");
 
@@ -627,13 +560,10 @@ fn a_background_pane_going_busy_marks_its_tab() {
 }
 
 /// The classifier's bit (`status_attention`) is refolded from the leaves, never ORed back from
-/// the stored one: a cleared failure releases the tab while a native sibling's out-of-band
-/// `attention` survives.
 #[test]
 fn a_cleared_failure_releases_the_tab_while_a_native_sibling_keeps_its_own_mark() {
     let mut app = crate::App::headless_for_test();
     let wid = crate::WindowId(0);
-    // A mixed tab: the terminal leaf (session 0) plus a native sibling.
     let native = app
         .view_store
         .insert_native(crate::tab_model::AppInstanceId::from_stored(7))
@@ -656,9 +586,6 @@ fn a_cleared_failure_releases_the_tab_while_a_native_sibling_keeps_its_own_mark(
         "a failed command marks the tab"
     );
 
-    // The native sibling raises its own attention out of band (a failed document shutdown, an
-    // update announcement), which the status path must never erase. It is set while the
-    // classifier's bit is also set, which one shared bool could not tell apart.
     app.windows
         .get_mut(&wid)
         .and_then(|window| window.tab_set.active_mut())
@@ -667,7 +594,6 @@ fn a_cleared_failure_releases_the_tab_while_a_native_sibling_keeps_its_own_mark(
         .indicators
         .attention = true;
 
-    // A new unit of work clears the terminal's outcome.
     ev.shell = Some(ShellEvidence::Executing);
     ev.activity.content_seq = 2;
     ev.activity.last_output = Some(t0 + Duration::from_millis(10));
@@ -688,7 +614,6 @@ fn a_cleared_failure_releases_the_tab_while_a_native_sibling_keeps_its_own_mark(
         "the NATIVE sibling's out-of-band mark survives"
     );
 
-    // The native owner clears its own bit: nothing is left claiming attention.
     app.windows
         .get_mut(&wid)
         .and_then(|window| window.tab_set.active_mut())
@@ -704,7 +629,6 @@ fn a_cleared_failure_releases_the_tab_while_a_native_sibling_keeps_its_own_mark(
 }
 
 /// What the chrome shows: the fold both renderers and the introspection serializer read, not
-/// either owner's field alone.
 fn attention_of(app: &crate::App, wid: crate::WindowId, tab_id: crate::tab_model::TabId) -> bool {
     app.windows[&wid]
         .tab_set
@@ -729,11 +653,6 @@ fn settle_observer(
 }
 
 /// The sweep records each published transition as one `status-change` event on the session's
-/// timeline (RFC §7), which the `events` digest pushes as `EVENT <local> status …`.
-///
-/// The bytes are a real integration's: the precmd's `133;D` is followed at once by the next
-/// prompt's `133;A` and `133;B`, which archive the finished block before the sweep reads it, so
-/// the outcome must come from the block the prompt closed.
 #[test]
 fn the_status_sweep_records_one_status_change_per_published_transition() {
     let mut app = crate::App::headless_for_test();
@@ -752,8 +671,6 @@ fn the_status_sweep_records_one_status_change_per_published_transition() {
                 .map(|e| e.payload.to_string())
                 .collect::<Vec<_>>()
         };
-    // A command ran and failed: OSC 133 A, B, C, then the precmd's D with
-    // exit 7 and the next prompt's A and B, in one batch.
     const NEXT_PROMPT: &[u8] = b"\x1b]133;A\x1b\\\x1b]133;B\x1b\\";
     let run = |exit: &str| {
         let mut bytes = format!("\x1b]133;C\x1b\\\x1b]133;D;{exit}\x1b\\").into_bytes();
@@ -771,7 +688,6 @@ fn the_status_sweep_records_one_status_change_per_published_transition() {
         vec!["phase=idle outcome=failure exit_code=7 signal=- confidence=strong".to_string()],
         "one event for the one published transition"
     );
-    // Nothing moved: another sweep records nothing.
     let _ = app.observe_session_statuses(t0 + Duration::from_secs(2));
     assert_eq!(
         status_events(&timeline).len(),
@@ -784,8 +700,6 @@ fn the_status_sweep_records_one_status_change_per_published_transition() {
         "the events digest pushes it"
     );
 
-    // The failure marks the tab until it is seen. A second failing command inside one sweep
-    // interval is no status change; only its block, closed by the trailing prompt, re-arms it.
     let attention = |app: &crate::App| {
         app.session_status
             .indicators(session)
@@ -815,7 +729,6 @@ fn the_status_sweep_records_one_status_change_per_published_transition() {
         "the second failure is not a status change"
     );
 
-    // A command that succeeds reports that, through the same prompt.
     run("0");
     let _ = app.observe_session_statuses(t0 + Duration::from_secs(5));
     assert_eq!(
@@ -826,9 +739,6 @@ fn the_status_sweep_records_one_status_change_per_published_transition() {
 }
 
 /// A prompt reports only the block it closed ([`completed_block`]): the finished command behind
-/// a prompt, the current block while it is `Complete`, nothing while a command runs, and nothing
-/// when the prompt closed a block that never completed (an empty Enter, a replaced shell), so an
-/// older command's result never comes back.
 #[test]
 fn a_prompt_reports_the_block_it_closed_and_no_older_one() {
     let mut term = aterm_core::terminal::Terminal::new(24, 80);
@@ -857,7 +767,6 @@ fn a_prompt_reports_the_block_it_closed_and_no_older_one() {
     );
     assert_eq!(shell_evidence(&term), Some(ShellEvidence::Entering));
 
-    // An empty Enter: A with no C or D closes a block that ran nothing.
     term.process(prompt);
     assert_eq!(
         completed_block(&term),
@@ -865,27 +774,12 @@ fn a_prompt_reports_the_block_it_closed_and_no_older_one() {
         "a prompt that closed an empty block reports no older result"
     );
 
-    // A command whose shell never reported its end (`exec zsh`): the next
-    // prompt closes an Executing block.
     term.process(b"\x1b]133;C\x1b\\");
     term.process(prompt);
     assert_eq!(completed_block(&term), None);
 }
 
 /// A SCROLLBACK ERASE NEVER LEAVES THE STATUS ON AN EARLIER EXIT: the
-/// reviewer's probes through the real sweep, typed into a zsh-style prompt:
-/// `sh -c 'exit 6'`, a command that writes ED 3 and exits 5, and `clear; sh
-/// -c 'exit 4'` (macOS `clear` writes ED 3). Each publishes its own exit: the
-/// erase keeps the running block, so its D lands there. Then a command whose
-/// rows all went into the history before its prompt (it printed past the
-/// screen and homed with ED 2), and a Cmd-K at that prompt before the next
-/// sweep: the erase takes its block, and its exit still publishes (the last
-/// D's copy, [`completed_block`]). Before the fix the first erase took the
-/// running block and `exit_code=6` stood over 5, 4 and 3; NEGATIVE CONTROL:
-/// a RIS still takes the block and swallows its D (by design), and the
-/// published outcome stands, so the reading tells a lost block apart; the
-/// last D's copy answers only for the block the prompt closed, so a finished
-/// command before the RIS that no sweep read is not published over it.
 #[test]
 fn a_scrollback_erase_never_leaves_the_status_on_an_earlier_exit() {
     let mut app = crate::App::headless_for_test();
@@ -943,12 +837,6 @@ fn a_scrollback_erase_never_leaves_the_status_on_an_earlier_exit() {
         "Cmd-K at the prompt took the finished block before a sweep read it"
     );
 
-    // NEGATIVE CONTROL: a RIS takes the running block and the phase, so the
-    // shell's D is refused and no exit is read: the outcome stands. A command
-    // that exited 2 just before it, with no sweep between, is the last D's
-    // copy, but the prompt after the RIS closed the `reset` block, not that
-    // one, so the copy is not read either (the same prompt with no erase or
-    // RIS reports nothing: a prompt reports only the block it closed).
     run("sh -c 'exit 2'", b"", 2);
     run("reset", b"\x1bc", 0);
     assert_eq!(
@@ -967,7 +855,6 @@ fn a_scrollback_erase_never_leaves_the_status_on_an_earlier_exit() {
 }
 
 /// A session without shell integration has one failure edge, its lifecycle exit, and no block
-/// to tell failures apart: the mark arms once on the published edge and a look quiets it.
 #[test]
 fn a_session_without_shell_integration_arms_its_mark_on_the_published_edge() {
     let t0 = Instant::now();
@@ -987,8 +874,6 @@ fn a_session_without_shell_integration_arms_its_mark_on_the_published_edge() {
 }
 
 /// The flapping policy (RFC §15): a `status-change` event is taken only when the published phase
-/// or outcome moved, and dwell bounds how often that happens, so output alternating with silence
-/// faster than dwell yields at most one event per dwell interval.
 #[test]
 fn rapid_heuristic_transitions_append_at_most_one_status_event_per_dwell() {
     let fast = StatusPolicy {
@@ -1005,7 +890,6 @@ fn rapid_heuristic_transitions_append_at_most_one_status_event_per_dwell() {
     let mut at = t0;
     let mut seq = 1;
     while at < t0 + span {
-        // Output for 150 ms, then 150 ms of silence: Running and Quiet
         // candidates alternate every few samples.
         if (at - t0).as_millis() % 300 < 150 {
             seq += 1;
@@ -1025,7 +909,6 @@ fn rapid_heuristic_transitions_append_at_most_one_status_event_per_dwell() {
         "{} status events in {span:?} (bound {bound}): {events:?}",
         events.len()
     );
-    // Not vacuous: a transition that survives dwell is an event.
     let mut steady = evidence(blank(1));
     steady.foreground_job = Some(true);
     steady.shell = Some(ShellEvidence::Complete { exit_code: Some(1) });
@@ -1046,8 +929,6 @@ fn rapid_heuristic_transitions_append_at_most_one_status_event_per_dwell() {
 }
 
 /// A PTY exit publishes `Exited` immediately and stays there. Under `--hold` the pane outlives
-/// its shell and keeps being swept; `tcgetpgrp` then fails, which reads as "no foreground job"
-/// and would publish `Idle` (chrome's "ready") for a dead pane.
 #[test]
 fn an_exited_pane_stays_exited_instead_of_reverting_to_ready() {
     let mut app = crate::App::headless_for_test();
@@ -1057,7 +938,6 @@ fn an_exited_pane_stays_exited_instead_of_reverting_to_ready() {
     ev.foreground_job = Some(true);
     ev.activity.last_output = Some(t0);
     app.session_status.observe(0, &ev, t0);
-    // The job draws: a moved grid starts `Running` (output alone never does).
     ev.activity.content_seq += 1;
     settle_observer(&mut app.session_status, 0, &ev, t0);
     assert_eq!(
@@ -1065,8 +945,6 @@ fn an_exited_pane_stays_exited_instead_of_reverting_to_ready() {
         Some(Phase::Running)
     );
 
-    // The stub session's pid is not a real child, so the collector honestly
-    // answers "unknown" rather than inventing a code.
     app.note_session_exit(0);
     assert_eq!(
         app.session_status.status(0).map(|s| s.phase),
@@ -1079,7 +957,6 @@ fn an_exited_pane_stays_exited_instead_of_reverting_to_ready() {
         "an uncollectable status is unknown, NEVER success"
     );
 
-    // The `--hold` sweep: the child is gone, so `tcgetpgrp` reports no foreground job.
     let mut after = evidence(blank(2));
     after.foreground_job = Some(false);
     let t1 = t0 + DWELL * 4;
@@ -1131,7 +1008,6 @@ fn a_collected_exit_code_becomes_the_outcome() {
 }
 
 /// A live policy edit reaches sessions that already exist: each FSM holds its own copy of the
-/// policy, so updating only the observer would leave open tabs on the old numbers.
 #[test]
 fn a_policy_edit_reaches_live_sessions_and_reopens_the_deadline() {
     let t0 = Instant::now();
@@ -1140,7 +1016,6 @@ fn a_policy_edit_reaches_live_sessions_and_reopens_the_deadline() {
     ev.foreground_job = Some(true);
     settle_observer(&mut observer, 1, &ev, t0);
 
-    // A candidate serving its dwell owes a wake at first_seen + dwell.
     ev.foreground_job = Some(false);
     let t1 = t0 + DWELL;
     observer.observe(1, &ev, t1);
@@ -1184,7 +1059,6 @@ fn a_policy_edit_reaches_live_sessions_and_reopens_the_deadline() {
 }
 
 /// `tab_status = false` is a real off: no classification at all, and the records already on
-/// screen are retired rather than frozen.
 #[test]
 fn turning_tab_status_off_stops_classifying_and_retires_the_records() {
     let mut app = crate::App::headless_for_test();
@@ -1219,7 +1093,6 @@ fn turning_tab_status_off_stops_classifying_and_retires_the_records() {
 }
 
 /// `tab_status_badge = false` keeps the record and only quiets the chrome: the two switches are
-/// independent.
 #[test]
 fn the_badge_switch_quiets_chrome_without_stopping_classification() {
     let mut app = crate::App::headless_for_test();
@@ -1242,17 +1115,6 @@ fn the_badge_switch_quiets_chrome_without_stopping_classification() {
 }
 
 /// `land_at=` AND `task=` (the Autopilot design, §9.3.5 and §9.4.1), on
-/// `status`, the `sessions` roster and the bare `meta`: `-` with nothing
-/// stored, just before the screen's stamp on `status` and last on the
-/// roster's row. The task's face prints only for an agent session whose
-/// live claim THIS window's host holds — told through the host's own wake
-/// (`App::apply_harness_fact`) — or a proven self-claim holds (Autopilot Land
-/// §10.4: its own `landed@v1` act, told as `HarnessFact::SelfTask`), and the
-/// instant only for an agent session, where `meta` prints what is stored.
-/// NEGATIVE CONTROLS: a face told with no claim, or under another holder's,
-/// prints `-`, and so does the self-claim's face once its claim is gone; a
-/// stored instant on a session that runs no agent prints `-` on `status` and
-/// the roster.
 #[test]
 fn the_status_record_and_the_roster_carry_land_at_and_task() {
     use aterm_agent::harness::acts::TaskFace;
@@ -1304,7 +1166,6 @@ fn the_status_record_and_the_roster_carry_land_at_and_task() {
     );
     assert_eq!(field(&roster(&app), "land_at="), "1792249200");
 
-    // A face told with no claim of this host's: kept, never printed.
     app.apply_harness_fact(&sid, crate::HarnessFact::Task(Some(TaskFace::Landed)));
     assert_eq!(
         ctx.timeline.lock().unwrap().task_face().map(|(f, _)| f),
@@ -1326,7 +1187,6 @@ fn the_status_record_and_the_roster_carry_land_at_and_task() {
     assert_eq!(field(&status(&app), "task="), "theirs");
     app.apply_harness_fact(&sid, crate::HarnessFact::Task(None));
     assert_eq!(field(&status(&app), "task="), "-", "unknown again");
-    // Another holder's claim: this host hears nothing from its loop.
     app.apply_harness_fact(&sid, crate::HarnessFact::Task(Some(TaskFace::Open)));
     assert_eq!(field(&status(&app), "task="), "open");
     assert!(crate::session_timeline::release_supervisor(
@@ -1345,8 +1205,6 @@ fn the_status_record_and_the_roster_carry_land_at_and_task() {
     .unwrap();
     assert_eq!(field(&status(&app), "task="), "-", "another holder's claim");
     assert_eq!(field(&roster(&app), "task="), "-", "another holder's claim");
-    // A proven self-claim: its own landed@v1 act's face prints, on both
-    // rows, and the hosted loop's facts beside it are no face of its.
     assert!(crate::session_timeline::release_supervisor(
         &ctx,
         None,
@@ -1376,7 +1234,6 @@ fn the_status_record_and_the_roster_carry_land_at_and_task() {
         "landed",
         "the hosted loop tells no face beside a proven self-claim"
     );
-    // NEGATIVE CONTROL: its claim gone, its face prints no more.
     assert!(crate::session_timeline::release_supervisor(
         &ctx,
         None,
@@ -1385,7 +1242,6 @@ fn the_status_record_and_the_roster_carry_land_at_and_task() {
     ));
     assert_eq!(field(&status(&app), "task="), "-", "no live claim");
     assert_eq!(field(&roster(&app), "task="), "-", "no live claim");
-    // A fact for a sid this window does not hold is dropped.
     app.apply_harness_fact(
         "no-such-sid",
         crate::HarnessFact::Task(Some(TaskFace::Open)),
@@ -1395,12 +1251,6 @@ fn the_status_record_and_the_roster_carry_land_at_and_task() {
 }
 
 /// `pause=` AFTER `task=` (the Autopilot design, §10.5.1), on `status` and
-/// the `sessions` roster: the unix second the loop's pause after short
-/// turns ends, told through the host's own wake (`App::apply_harness_fact`,
-/// `HarnessFact::Pause`), printed under `task=`'s rule — an agent session
-/// whose live claim THIS window's host holds — and `-` once the pause is
-/// over. NEGATIVE CONTROLS: a pause told with no claim, or under another
-/// holder's, prints `-`; so does one on a session that runs no agent.
 #[test]
 fn the_status_record_and_the_roster_carry_the_pause_after_task() {
     const AT: i64 = 1_792_249_260;
@@ -1457,7 +1307,6 @@ fn the_status_record_and_the_roster_carry_the_pause_after_task() {
     app.apply_harness_fact(&sid, crate::HarnessFact::Pause(None));
     assert_eq!(field(&status(&app), "pause="), "-", "the pause is over");
     assert_eq!(field(&roster(&app), "pause="), "-");
-    // Another holder's claim: this host hears nothing from its loop.
     app.apply_harness_fact(&sid, pause);
     assert_eq!(field(&status(&app), "pause="), AT.to_string());
     assert!(crate::session_timeline::release_supervisor(
@@ -1488,9 +1337,6 @@ fn the_status_record_and_the_roster_carry_the_pause_after_task() {
 }
 
 /// `autopilot=` beside `supervisor=` (the Autopilot design, §5): `-` for a session that runs no
-/// agent the harness supervises; once one does, its effective Autopilot (`off` with no host to
-/// supervise it, then the table's default under one, then the session's own word) on both arms
-/// of the record. Negative control: the master switch off reads `off` whatever the word.
 #[test]
 fn the_status_record_carries_the_effective_autopilot_beside_supervisor() {
     let mut app = crate::App::headless_for_test();
@@ -1545,9 +1391,6 @@ fn the_status_record_carries_the_effective_autopilot_beside_supervisor() {
 }
 
 /// `launch=` and `launch_seq=` (the launch witness, `crate::launch_witness`)
-/// ride after `human_seq=` and are judged against THAT count: `person` while
-/// it is the mark's, `since` once a person's gesture moved it; the screen's
-/// stamp stays last.
 #[test]
 fn the_status_record_judges_the_launch_witness_by_its_own_count() {
     use crate::launch_witness::{Launch, Why};
@@ -1575,16 +1418,12 @@ fn the_status_record_judges_the_launch_witness_by_its_own_count() {
 }
 
 /// `editing=<n>` (amacs §6.7) counts the open `edit` tickets holding the
-/// session, just before the stamp: each ticket's hold adds one, and its
-/// resolve (or an orphan's lapse) takes it away again. A driver polling
-/// `status` learns why its `send` answers `ERR busy editing` without trying.
 #[test]
 fn status_reports_editing_count() {
     use crate::control_edit::hold::{self, Hold};
     use amacs::protocol::edit::Ticket;
 
     let mut app = crate::App::headless_for_test();
-    // A session id no other test's App mints: the hold map is process-wide.
     let sid = 1 << 44;
     app.next_session_id = sid;
     app.push_stub_tab(crate::WindowId(0), crate::stub_session(sid));
@@ -1659,21 +1498,16 @@ fn fabric_batch_matches_single_status_fields_for_each_session() {
         assert!(lines.next().is_none(), "framed count is exact: {batch}");
     };
 
-    // Both sessions start unclassified. An unavailable terminal must not
-    // invent an observed detail or revision for either one.
     let locked_term = app.pool.get(0).unwrap().term.clone();
     let guard = locked_term.lock().unwrap();
     assert_same(&app);
     drop(guard);
-    // No hold, so no origin: the bridge's row says whose hold stands.
     assert!(
         app.fabric_status_fields(0)
             .unwrap()
             .contains(" hold=0 hold_origin=- ")
     );
 
-    // One session becomes classified and held; its cached detail supplies
-    // the same percent-encoded fallback when its terminal is contended.
     let t0 = Instant::now();
     let mut ev = evidence(blank(1));
     ev.shell = Some(ShellEvidence::Complete { exit_code: Some(0) });
@@ -1704,7 +1538,6 @@ fn fabric_batch_matches_single_status_fields_for_each_session() {
             .contains(" hold=1 hold_origin=fleet ")
     );
 
-    // The owner's local hold is named as one: the bridge never lifts it.
     let ctx = app.pool.get(1).unwrap().ctx.clone();
     crate::fabric::apply_hold_for_test(
         &ctx,
@@ -1742,8 +1575,6 @@ fn fabric_batch_does_not_wait_for_a_background_timeline_writer() {
     }
     let (held_tx, held_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel();
-    // The writer keeps the lock until the batch is back, so `true` from the join means the batch
-    // returned while the writer still held the lock. The minute is a hang detector only.
     let worker = std::thread::spawn(move || {
         let _guard = timeline.lock().unwrap();
         held_tx.send(()).unwrap();
@@ -1771,14 +1602,6 @@ fn fabric_batch_does_not_wait_for_a_background_timeline_writer() {
 }
 
 /// The `status` verb's reply, the machine contract a poller parses: ONE
-/// line, `schema=1` first so a consumer can reject an unknown major, the
-/// `seq= hash=` stamp last, and the SAME keys in the same order on both
-/// arms — never classified and classified — so no field appears from
-/// nowhere and an additive field cannot land on one arm only. Never
-/// classified is `observed=false`, distinct from `phase=unknown` ("looked
-/// and found no evidence"). The values a driver acts on come from their
-/// sources: the hold, an adopted session's attribution
-/// and the `tab_status` switch.
 #[test]
 fn the_status_record_keeps_one_field_set_on_both_arms() {
     crate::fabric::with_link_reset(the_status_record_keeps_one_field_set_on_both_arms_body);
@@ -1818,10 +1641,6 @@ fn the_status_record_keeps_one_field_set_on_both_arms_body() {
         keys(&observed),
         "both arms, one field set"
     );
-    // The field set a poller parses (`help status`): an additive field
-    // lands before the `seq= hash=` stamp, and none is dropped or renamed.
-    // `conpty=` rides before `integration=` on Windows only; `needs_told=`
-    // rides `needs_n=` in a development build only, as every test builds.
     let conpty = if cfg!(windows) { " conpty" } else { "" };
     assert_eq!(
         keys(&observed).join(" "),
@@ -1875,8 +1694,6 @@ fn the_status_record_keeps_one_field_set_on_both_arms_body() {
 }
 
 /// `consent_at_risk` is emitted on the conjunction and nothing else: silent while the cwd is
-/// unknown (every session without shell integration), present once a reported cwd lands under
-/// a protected root. It is not a claim that a dialog is showing.
 #[test]
 fn consent_at_risk_rides_the_reasons_token_only_on_the_conjunction() {
     assert_eq!(Reason::ConsentPrompt.as_str(), "consent_at_risk");
@@ -1893,15 +1710,8 @@ fn consent_at_risk_rides_the_reasons_token_only_on_the_conjunction() {
         "no cwd reported, so no token: {record}"
     );
 
-    // The conjunction half is Unix-only: the OSC 7 below is `file://localhost<cwd>` with a
-    // `/`-rooted cwd, and a Windows protected root is `C:\Users\…`.
     #[cfg(unix)]
     {
-        // The protected roots are resolved data from the consent module: this file writes no
-        // protected-folder literal (the `protected-folder` guard).
-        // They are the App's published mirror, the same value the record's
-        // consent check reads, so a seamless test pointing the process-global
-        // HOME at a scratch dir cannot make the two disagree.
         let policy = app.consent.policy();
         let Some(root) = policy.protected_roots().first() else {
             aterm_spec::host::could_not_run("no $HOME resolves here, so nothing is protected");
@@ -1925,12 +1735,6 @@ fn consent_at_risk_rides_the_reasons_token_only_on_the_conjunction() {
 }
 
 /// A prompt is `Idle` however its grid moves. `EnteringCommand` is the steady
-/// state whenever a prompt is DISPLAYED, so the keystroke echo of a command
-/// line being typed and a background job printing at an idle prompt
-/// (`tail -f &`, a sibling build) look alike here, and neither is work: the
-/// record publishes nothing new and owes the event loop no wake, so typing
-/// costs no chrome refresh. A bare prompt (`133;A` alone) is the same
-/// `tail -f &` case, and movement never promotes either to `Running`.
 #[test]
 fn movement_at_a_prompt_publishes_nothing_and_owes_no_wake() {
     for shell in [ShellEvidence::Entering, ShellEvidence::Prompt] {
@@ -1949,7 +1753,6 @@ fn movement_at_a_prompt_publishes_nothing_and_owes_no_wake() {
             "{shell:?}: a settled prompt parks"
         );
 
-        // The grid moves at the prompt: a keystroke echo or ambient output.
         ev.activity.content_seq = 2;
         let t2 = t1 + Duration::from_millis(10);
         assert!(
@@ -1972,8 +1775,6 @@ fn movement_at_a_prompt_publishes_nothing_and_owes_no_wake() {
 }
 
 /// A TUI that outputs without moving the grid (identical sync-bracketed repaints, heartbeats)
-/// keeps a `Running` its grid movement started alive through `output_recently` while
-/// `last_movement` goes stale, so the retire wake rides the fresher clock (`owed_wake` says why).
 #[test]
 fn output_without_movement_arms_the_retire_wake_off_the_freshest_clock() {
     let t0 = Instant::now();
@@ -1982,15 +1783,11 @@ fn output_without_movement_arms_the_retire_wake_off_the_freshest_clock() {
     ev.foreground_job = Some(true);
     ev.activity.last_output = Some(t0);
     observer.observe(1, &ev, t0);
-    // One real grid movement starts `Running` (output alone never does), then the grid goes
-    // still while output flows.
     ev.activity.content_seq = 2;
     ev.activity.last_output = Some(t0 + DWELL);
     let t1 = settle_observer(&mut observer, 1, &ev, t0 + DWELL);
     assert_eq!(observer.status(1).map(|s| s.phase), Some(Phase::Running));
 
-    // Far past `quiet_after` on the movement clock, raw output still sustains Running, so the
-    // owed wake rides the output clock.
     let t2 = t1 + QUIET * 2;
     ev.activity.last_output = Some(t2);
     observer.observe(1, &ev, t2);
@@ -2003,16 +1800,12 @@ fn output_without_movement_arms_the_retire_wake_off_the_freshest_clock() {
     );
     assert!(owed > t2, "an owed wake is never already in the past");
 
-    // At that wake the phase retires with no new bytes: output sustains the busy state, true
-    // silence ages it out.
     observer.observe(1, &ev, owed);
     observer.observe(1, &ev, owed + DWELL);
     assert_eq!(observer.status(1).map(|s| s.phase), Some(Phase::Quiet));
 }
 
 /// `next_wake` clamps every slot's owed instant to its own observation gate: `due()` refuses the
-/// slot until `next_due`, so an earlier deadline could only fire, be refused and re-arm. The
-/// clamp bounds any such bug to the observation rate.
 #[test]
 fn an_armed_wake_never_precedes_its_own_observation_gate() {
     let t0 = Instant::now();
@@ -2022,8 +1815,6 @@ fn an_armed_wake_never_precedes_its_own_observation_gate() {
     ev.foreground_job = Some(false);
     observer.observe(1, &ev, t0);
 
-    // Re-observe near the dwell edge: the pending candidate's raw owed
-    // instant (t0 + dwell) now precedes the refreshed observation gate.
     let t1 = t0 + DWELL - Duration::from_millis(50);
     observer.observe(1, &ev, t1);
     let gate = observer.sessions.get(&1).expect("slot").next_due;
@@ -2041,34 +1832,26 @@ fn an_armed_wake_never_precedes_its_own_observation_gate() {
         "an armed wake at which observation is forbidden is a contradiction"
     );
 
-    // The clamped wake still publishes: dwell was served well before it.
     assert!(observer.observe(1, &ev, owed), "the transition lands");
     assert_eq!(observer.status(1).map(|s| s.phase), Some(Phase::Idle));
 }
 
 /// The sweep skips a session whose terminal `try_lock` the PTY reader holds, a path that never
-/// reaches `observe`; `note_skipped` still advances the slot's `next_due`, or `next_wake` would
-/// re-arm the same past instant every turn under the sustained output that contends the lock.
 #[test]
 fn a_refused_sample_still_advances_the_observation_gate() {
     let t0 = Instant::now();
     let interval = Duration::from_millis(250);
     let mut observer = StatusObserver::new(policy(), interval);
 
-    // A Running session whose clocks then go stale: `owed_wake` returns
-    // `last_activity + quiet_after`, which recedes into the past.
     let mut ev = evidence(blank(1));
     ev.foreground_job = Some(true);
     observer.observe(1, &ev, t0);
-    // Movement needs two samples and the candidate then serves its dwell, so the third
-    // observation publishes `Running` (`owed_wake` reads the published record).
     let moved_at = t0 + Duration::from_millis(10);
     ev.activity.content_seq = 2;
     observer.observe(1, &ev, moved_at);
     observer.observe(1, &ev, moved_at + DWELL);
     assert_eq!(observer.status(1).map(|s| s.phase), Some(Phase::Running));
 
-    // Long past the retirement instant, with the lock contended ever since.
     let now = t0 + QUIET + Duration::from_secs(30);
     assert!(
         observer.next_wake().is_some_and(|wake| wake < now),
@@ -2076,8 +1859,6 @@ fn a_refused_sample_still_advances_the_observation_gate() {
     );
 
     observer.note_skipped(1, now);
-    // Every sweep ends in `note_swept`, which restores `next_due_any` to the exact minimum
-    // (`note_skipped`, like `observe`, only folds a lower bound); mirrored here.
     observer.note_swept(observer.swept_pool_epoch(), Vec::new());
     let wake = observer.next_wake().expect("the slot still owes a wake");
     assert!(
@@ -2097,8 +1878,6 @@ fn a_refused_sample_still_advances_the_observation_gate() {
         "the armed wake is admissible when it fires"
     );
 
-    // An unknown session is not charged: it holds no slot, so it owes no deadline, and
-    // inserting one would bank the pool epoch over a session that was never classified.
     observer.note_skipped(404, now);
     assert!(
         !observer.knows(404),
@@ -2107,13 +1886,10 @@ fn a_refused_sample_still_advances_the_observation_gate() {
 }
 
 /// The RFC §4 privacy rule as a table: the program's basename, an
-/// allow-listed subcommand at most, never an argument — and the wrappers,
-/// assignments and paths an agent's real command lines carry.
 #[test]
 fn command_detail_keeps_the_program_and_an_allowlisted_subcommand_only() {
     let cases: &[(&str, Option<&str>)] = &[
         ("claude --dangerously-skip-permissions", Some("claude")),
-        // A prompt glyph a scrape left in front is not the program.
         ("$ sleep 30", Some("sleep")),
         ("❯ codex", Some("codex")),
         ("% ", None),
@@ -2121,35 +1897,25 @@ fn command_detail_keeps_the_program_and_an_allowlisted_subcommand_only() {
         ("targo --unverified test -p x", Some("targo test")),
         ("cargo build --release", Some("cargo build")),
         ("git status", Some("git status")),
-        // `env -S`'s one string: the subcommand is read from its words,
-        // from the closed list, and never an argument of it.
         (
             "env -S 'git status --porcelain /secret/repo'",
             Some("git status"),
         ),
         ("env -S 'git /secret/tok'", Some("git")),
-        // A flag's value is never a subcommand, even one that looks like a bare identifier:
-        // only vocabulary membership tells them apart, and a directory, namespace, context or
-        // prefix is what the rule keeps off the wire.
         ("git -C /secret/repo status", Some("git")),
         ("git -C aterm status", Some("git")),
         ("kubectl -n prod get pods", Some("kubectl")),
         ("docker --context customer-acme ps", Some("docker")),
         ("npm --prefix web run build", Some("npm")),
-        // A word outside the vocabulary is an argument even in the subcommand slot.
         ("git customer-acme", Some("git")),
         ("cargo xtask release", Some("cargo")),
         ("ssh me@host", Some("ssh")),
         ("/usr/local/bin/python3 secret.py", Some("python3")),
         ("./run.sh --token abc", Some("run.sh")),
-        // Quoting is honoured: a quoted path with a space is one word, and a Windows launcher's
-        // `.exe` names the same program as the bare name.
         (
             "\"C:\\Program Files\\Git\\usr\\bin\\less.exe\" README.md",
             Some("less"),
         ),
-        // pwsh's call operator (a glyph, skipped as a prompt's is), then a single-quoted path
-        // with a space, and the 8.3 short spelling of the same path.
         (
             "& 'C:\\Program Files\\Git\\usr\\bin\\less.exe' C:\\Windows\\win.ini",
             Some("less"),
@@ -2161,12 +1927,8 @@ fn command_detail_keeps_the_program_and_an_allowlisted_subcommand_only() {
         ("'/opt/my tools/claude' --resume", Some("claude")),
         ("C:\\Windows\\System32\\cmd.exe /c dir", Some("cmd")),
         ("C:\\tools\\build.CMD release", Some("build")),
-        // An escaped space is part of the word, but a program's name is never published with
-        // whitespace: it ends at the first one.
         ("my\\ tool --flag", Some("my")),
         ("\"git\" status", Some("git status")),
-        // Only the executable extensions Windows resolves are dropped: a dotted program name is
-        // not a path with an extension.
         ("python3.11 -m http.server", Some("python3.11")),
         ("/usr/bin/a.out", Some("a.out")),
         ("FOO=1 cmd --secret", Some("cmd")),
@@ -2174,14 +1936,11 @@ fn command_detail_keeps_the_program_and_an_allowlisted_subcommand_only() {
         ("sudo -u root targo --unverified test", Some("targo test")),
         ("sudo apt install x", Some("apt")),
         ("env FOO=1 codex", Some("codex")),
-        // A wrapper by full path is the same wrapper: basename first.
         ("/usr/bin/env FOO=1 codex", Some("codex")),
         (
             "/usr/bin/sudo -u root targo --unverified test",
             Some("targo test"),
         ),
-        // A make/just target is user-named: only the conventional ones
-        // are vocabulary.
         ("time make deploy-prod", Some("make")),
         ("make test", Some("make test")),
         ("just fmt", Some("just fmt")),
@@ -2190,19 +1949,13 @@ fn command_detail_keeps_the_program_and_an_allowlisted_subcommand_only() {
         ("nice -n 5 kubectl get pods -n prod", Some("kubectl get")),
         ("docker compose up", Some("docker compose")),
         ("'claude' 'resume'", Some("claude")),
-        // Control removal applies before wrapper/vocabulary matching.
         ("clau\u{7f}de --private", Some("claude")),
         ("s\u{7f}udo -u user codex", Some("codex")),
         ("targo te\u{7f}st private", Some("targo test")),
         ("npm run build:prod", Some("npm run")),
         ("pnpm dlx create-foo", Some("pnpm dlx")),
         ("yarn build --token abc", Some("yarn build")),
-        // A subcommand slot holding a path or an assignment is dropped.
         ("make ./target/x", Some("make")),
-        // A compound line names the program of the segment that is running, not its first word
-        // (`cd x && claude` is the supervise-agent skill's launch shape): the last of an `&&`/`;`
-        // chain; before a trailing `|| …`, which runs only on failure, its operand; `exec` is a
-        // wrapper.
         ("cd ~/ay && claude", Some("claude")),
         ("cd ~/ay && exec claude", Some("claude")),
         ("exec claude --resume", Some("claude")),
@@ -2218,23 +1971,15 @@ fn command_detail_keeps_the_program_and_an_allowlisted_subcommand_only() {
         ("cd x &&", Some("cd")),
         ("(cd ~/ay && claude)", Some("claude")),
         ("cd x\nclaude", Some("claude")),
-        // A pipeline is still named by its first command.
         ("cd x && cat log | grep err", Some("cat")),
-        // An operator inside quotes or behind a backslash is an argument,
-        // not a cut.
         ("claude -p \"fix a; then b\"", Some("claude")),
         ("echo 'x && y' && codex", Some("codex")),
         ("echo a \\; codex", Some("echo")),
-        // A keyword opener stays the keyword: the body is not parsed, and the `;` in `for …; do`
-        // is the keyword's grammar, not a list operator. `{` opens a group the same way.
         ("for i in 1 2 3; do sleep 1; done", Some("for")),
         ("$ for i in 1 2 3; do sleep 1; done", Some("for")),
         ("while true; do claude; done", Some("while")),
         ("if [ -f x ]; then claude; fi", Some("if")),
         ("{ cd x; claude; }", Some("cd")),
-        // The keyword need not open the line: behind `cd x &&` or a wrapper the running
-        // segment's `;`-cut would be a closer (`done`, `fi`), so the first segment whose program
-        // slot holds an opener is read instead.
         ("cd x && for i in 1 2 3; do sleep 1; done", Some("for")),
         ("cd x && if true; then claude; fi", Some("if")),
         ("time for i in 1 2 3; do sleep 1; done", Some("for")),
@@ -2242,7 +1987,6 @@ fn command_detail_keeps_the_program_and_an_allowlisted_subcommand_only() {
         ("   \t ", None),
         (";", None),
     ];
-    // A keyword that closes a compound command is never a program, so no row may read one.
     const KEYWORD_CLOSERS: [&str; 8] = ["done", "fi", "esac", "}", "then", "do", "else", "elif"];
     for (cmd, want) in cases {
         let got = command_detail(cmd);
@@ -2252,7 +1996,6 @@ fn command_detail_keeps_the_program_and_an_allowlisted_subcommand_only() {
             "{cmd:?} reads a closer, which is never a program: {got:?}"
         );
     }
-    // Bounded: a screen-scraped line can be long; the reply cannot.
     let long = format!("{} arg", "p".repeat(200));
     let detail = command_detail(&long).unwrap();
     assert_eq!(detail.chars().count(), 48);
@@ -2262,25 +2005,15 @@ fn command_detail_keeps_the_program_and_an_allowlisted_subcommand_only() {
     );
     let wide = format!("{} private", "終".repeat(80));
     assert_eq!(command_detail(&wide), Some("終".repeat(48)));
-    // A program name is never reported with a subcommand it does not own.
     assert_eq!(command_detail("claude commit").as_deref(), Some("claude"));
 }
 
 /// A quoted or escaped space is part of its word, so a program at a spaced
-/// path reads its name — the live upgrade's relaunch from `Application
-/// Support` read `detail=Application` (D3, 2026-09-26), and pwsh's backtick
-/// escape read `detail=Program` (0.95.0) — and that quote must never carry
-/// an ARGUMENT into `detail=`: the first D3 fix published `'t' --token
-/// SECRET`, a session id, and `tok`/`hunter2` from lines whose quoting POSIX
-/// and fish read differently. A word ends where EITHER reading ends it, a
-/// quote left open ends it at its first whitespace, `env -S`'s string is
-/// read for its first word, and the published name never holds whitespace.
 #[test]
 fn a_quoted_program_path_reads_its_name_and_never_an_argument() {
     let store = "Library/Application Support/aterm/pkg/agents/claude";
     let abs = format!("/Users//me/{store}");
     let cases: &[(String, &str)] = &[
-        // The upgrade's relaunch line, verbatim in shape, and its spellings.
         (
             format!(
                 ". '/Users//me/.aterm/shell.d/00-atpkg.zsh'; rehash; '{abs}' \
@@ -2299,9 +2032,7 @@ fn a_quoted_program_path_reads_its_name_and_never_an_argument() {
             format!(r"'/Users//o'\''neil/{store}' '--resume' 'SECRET'"),
             "claude",
         ),
-        // A quoted assignment with a space is one assignment, skipped.
         ("env 'FOO=a b' '/opt/my tools/codex' resume".into(), "codex"),
-        // CONTROL: no space in the path; an argument with spaces.
         (
             "/Users//me/.local/share/claude/versions/2.1.281 --resume x".into(),
             "2.1.281",
@@ -2310,8 +2041,6 @@ fn a_quoted_program_path_reads_its_name_and_never_an_argument() {
             "claude -p 'fix the bug in Application Support'".into(),
             "claude",
         ),
-        // pwsh's backtick escape inside a Windows path; a backtick after a
-        // bare name ends the word as a POSIX shell would.
         (
             r"& C:\Program` Files\Git\usr\bin\less.exe C:\Windows\win.ini".into(),
             "less",
@@ -2333,9 +2062,7 @@ fn a_quoted_program_path_reads_its_name_and_never_an_argument() {
             r"& 'C:\Program Files\Git\usr\bin\less.exe' C:\Windows\win.ini".into(),
             "less",
         ),
-        // bash/zsh `$'…'`: a piece of the program's name, never the argument.
         (r"$'/usr/local/bin/don\'t' --token SECRET".into(), "t"),
-        // fish quoting of an apostrophe home: POSIX runs on into the id.
         (
             r"'/Users//o\'neil/bin/claude' '--resume' 'b87ea568-277e-4ba7-bbd2-f0ab8bd14d1c'".into(),
             "claude",
@@ -2348,8 +2075,6 @@ fn a_quoted_program_path_reads_its_name_and_never_an_argument() {
             format!(r"'/Users//o\'neil/{store}' '--resume' 'SECRET'"),
             "Application",
         ),
-        // An apostrophe in a bare word opens a quote that never closes, and
-        // an argument's opening quote may close it.
         ("don't --token SECRET".into(), "don't"),
         ("don't /secret/tok".into(), "don't"),
         ("don't '/secret/tok'".into(), "don't"),
@@ -2375,7 +2100,6 @@ fn a_quoted_program_path_reads_its_name_and_never_an_argument() {
         ),
         ("can't 'x' '/secret/tok'".into(), "can't"),
         ("it's 'a' b '/secret/tok'".into(), "it's"),
-        // `env -S`'s ONE string: its first word, never a basename in it.
         (
             "env -S \"node --inspect /Users//me/secret-project/server.js\"".into(),
             "node",
@@ -2396,9 +2120,7 @@ fn a_quoted_program_path_reads_its_name_and_never_an_argument() {
         ("env -vS 'node /srv/secret/server.js'".into(), "node"),
         ("env -S'node /srv/secret/server.js'".into(), "node"),
         ("env -S '-i FOO=1 /usr/bin/node /srv/x.js'".into(), "node"),
-        // Control: `-u` takes a value, so `-uS` unsets `S` and is no split.
         ("env -uS /usr/bin/node /srv/x.js".into(), "node"),
-        // A space in the program's own name is never published.
         (r"/Users//me/my\ tool --token SECRET".into(), "my"),
         ("\"/opt/my tools/run me\" --token SECRET".into(), "run"),
     ];
@@ -2420,7 +2142,6 @@ fn a_quoted_program_path_reads_its_name_and_never_an_argument() {
 }
 
 /// `executing_detail` is the one producer: an executing block names its (sanitized)
-/// command; a prompt, an entering block and a completed block name nothing.
 #[test]
 fn executing_detail_reads_only_an_executing_block() {
     let mut term = aterm_core::terminal::Terminal::new(24, 80);
@@ -2437,12 +2158,9 @@ fn executing_detail_reads_only_an_executing_block() {
     );
     term.process(b"running\n\x1b]133;D;0\x07");
     assert_eq!(executing_detail(&term), None, "complete");
-    // OSC 633;E's explicit command line wins over the screen scrape.
     term.process(b"\x1b]133;A\x07$ \x1b]633;E;claude --dangerously-skip-permissions\x07\x1b]133;B\x07claude --dangerously-skip-permissions\n\x1b]133;C\x07");
     assert_eq!(executing_detail(&term).as_deref(), Some("claude"));
     term.process(b"\x1b]133;D;0\x07");
-    // A wide prompt glyph before the 133;B mark: the cut is by display
-    // column, so the program keeps its first letter.
     term.process(
         "]133;A🐱 $ ]133;Bcodex resume
 ]133;C"
@@ -2452,13 +2170,6 @@ fn executing_detail_reads_only_an_executing_block() {
 }
 
 /// A FULL CLEAR WHILE THE COMMAND RUNS (a program that clears and draws on
-/// the main screen): the engine moves the block's rows the clear blanked to
-/// the cleared screen's top row and its command rows are gone, so the scrape
-/// names nothing rather than what the program drew on the row the command
-/// was typed on; OSC 633;E's line still names it. CONTROL: before the clear
-/// both roads name `vim`. NEGATIVE CONTROL (the pre-fix reading): that row
-/// now reads the program's text, which the scrape would have named
-/// `python3`.
 #[test]
 fn a_full_clear_while_the_command_runs_never_names_what_the_program_drew() {
     for named in [false, true] {
@@ -2496,9 +2207,6 @@ fn a_full_clear_while_the_command_runs_never_names_what_the_program_drew() {
 }
 
 /// The `status` record's `detail=`: the sanitized running command while the block executes, `-`
-/// otherwise; answered before the classifier's first publish and never by waiting on a contended
-/// terminal. Under contention the subject reads `unavailable` rather than a lower rung (which a
-/// poller would read as a title change), and a pin answers from the metadata leaf lock.
 #[test]
 fn the_status_record_details_the_executing_block_and_nothing_else() {
     let mut app = crate::App::headless_for_test();
@@ -2525,15 +2233,11 @@ fn the_status_record_details_the_executing_block_and_nothing_else() {
         record.contains(" observed=true ") && record.contains(" detail=sleep "),
         "{record}"
     );
-    // The argument is a word no other field can spell: a number could match one of the
-    // record's wall-clock ages (`since_ms=`, `agent_since_ms=`).
     assert!(
         !record.contains("xyzzy"),
         "arguments never reach the wire: {record}"
     );
 
-    // Contended: `-`, never a wait, and the subject is `unavailable`, not
-    // a lower rung.
     let held = term.lock().unwrap();
     let record = app.session_status_record(0).expect("live session");
     assert!(
@@ -2541,8 +2245,6 @@ fn the_status_record_details_the_executing_block_and_nothing_else() {
         "a contended terminal is `-`, not a stall or a lower rung: {record}"
     );
 
-    // A pin answers the subject from the leaf lock with the terminal still
-    // held, and keeps the detail once the terminal is free.
     app.pool
         .get(0)
         .expect("session 0")
@@ -2570,14 +2272,12 @@ fn the_status_record_details_the_executing_block_and_nothing_else() {
 }
 
 /// The sweep folds `executing_detail` onto the published status ([`StatusObserver::set_detail`]):
-/// an Executing block publishes the sanitized program, and idle clears it.
 #[test]
 fn the_sweep_publishes_the_running_detail_onto_the_chrome_status() {
     let mut app = crate::App::headless_for_test();
     let term = app.pool.get(0).expect("session 0").term.clone();
     let t0 = Instant::now();
 
-    // Idle: no executing block, no detail.
     app.observe_session_statuses(t0);
     assert_eq!(
         app.session_status.status(0).and_then(|s| s.detail.clone()),
@@ -2585,7 +2285,6 @@ fn the_sweep_publishes_the_running_detail_onto_the_chrome_status() {
         "idle publishes no detail"
     );
 
-    // An executing block: the sweep folds its sanitized program onto the status.
     term.lock()
         .unwrap()
         .process(b"\x1b]133;A\x07$ \x1b]133;B\x07sleep 30\n\x1b]133;C\x07");
@@ -2600,7 +2299,6 @@ fn the_sweep_publishes_the_running_detail_onto_the_chrome_status() {
         "the executing block's sanitized program reaches the chrome status"
     );
 
-    // The block completes: the detail clears.
     term.lock().unwrap().process(b"\x1b]133;D;0\x07");
     let t2 = t1 + Duration::from_secs(10);
     app.observe_session_statuses(t2);
@@ -2612,11 +2310,6 @@ fn the_sweep_publishes_the_running_detail_onto_the_chrome_status() {
 }
 
 /// `task_state=<state|-> task_rev=<n>` (2026-10-15), after `pause=`: the
-/// session's task record, read from the timeline leaf the agent columns come
-/// from — `-`/`0` for a session with no task, the state and rev once one is
-/// marked — and named apart from `task=`, the task's face under Land, which
-/// a session with no live claim here prints `-` whatever its record says.
-/// Additive: the stamp still rides last.
 #[test]
 fn the_status_record_carries_the_task_record() {
     use crate::task_record::{TaskMark, TaskState, mark_session_task};
@@ -2644,8 +2337,6 @@ fn the_status_record_carries_the_task_record() {
 }
 
 /// `conpty=` names the console host a Windows session runs in, `-` for a key
-/// no pseudoconsole is behind, and is absent off Windows, where a live
-/// record keeps the bytes every earlier build wrote.
 #[test]
 fn the_conpty_field_names_the_host_on_windows_and_is_absent_elsewhere() {
     use aterm_pty::ConsoleHostKind;
@@ -2665,8 +2356,6 @@ fn the_conpty_field_names_the_host_on_windows_and_is_absent_elsewhere() {
     ] {
         assert_eq!(conpty_status_field(false, host), "");
     }
-    // The headless App's session is a stub key: on Windows it reads `-`,
-    // elsewhere the field is not there at all.
     let app = crate::App::headless_for_test();
     let record = app.session_status_record(0).expect("live session");
     let want = if cfg!(windows) {
@@ -2679,21 +2368,12 @@ fn the_conpty_field_names_the_host_on_windows_and_is_absent_elsewhere() {
 }
 
 /// ONE FOREGROUND READ PER LOOK. The group in front (`tcgetpgrp` on the PTY
-/// master, ~51k instructions per call on macOS) is read once, under the
-/// terminal hold, and the cwd witness, the job evidence and the program
-/// identity all take that answer: a sweep over N looked-at sessions asks the
-/// probe N times, however many readers each answer has, and the job verdict
-/// is the injected probe's. NEGATIVE CONTROL: the sweep as it was (a read
-/// under the hold, the job probe's own `tcgetpgrp`, and a third read for the
-/// program identity) asks the injected probe twice per look and fails the
-/// count, and its job verdict ignores the scripted group.
 #[test]
 fn a_look_reads_the_foreground_group_once() {
     use std::cell::Cell;
     thread_local! {
         static READS: Cell<u64> = const { Cell::new(0) };
     }
-    // Groups no process holds: past every pid the kernel issues.
     const SHELL: i32 = 2_000_000_201;
     const JOB: i32 = 2_000_000_202;
     /// The injected probe: a job in front of every session, counted.
@@ -2706,8 +2386,6 @@ fn a_look_reads_the_foreground_group_once() {
     app.session_factory.fg_probe = counted;
     for i in 0..STAGED {
         let mut session = crate::stub_session(1000 + i);
-        // A descriptor number no file holds: the probe is scripted, and
-        // nothing below it touches the fd.
         session.master = i32::MAX - i32::try_from(i).expect("small fixture");
         session.pid = SHELL;
         app.pool.insert(session);
@@ -2736,10 +2414,6 @@ fn a_look_reads_the_foreground_group_once() {
 }
 
 /// `status needs_n=` (Autopilot v5 §12.2.1): a harness's ask naming one more
-/// need reads `needs=ask needs_n=2`; a lone need `needs_n=1`; an approval,
-/// another owner's ask and no need `needs_n=-`. NEGATIVE CONTROL (run for the
-/// landing): counting only the first need (`needs_n=1` for the counted
-/// entry) fails the first row.
 #[test]
 fn status_counts_a_harness_needs() {
     use aterm_types::needs::AttentionKind;

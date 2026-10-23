@@ -1,25 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The native macOS application menu bar (`NSApp.mainMenu`).
+//! Native macOS application menu bar (`NSApp.mainMenu`).
 //!
-//! Installed once, with the first OS window (`App::attach_os_window`), so a headless process
-//! builds none. An item is a dispatch stub: it shows its key equivalent and, when chosen, posts
-//! [`Wake::MenuAction`](crate::Wake) with a [`MenuAction`], marked so keys typed behind its key
-//! equivalent wait for its dispatch (`tab_spawn::post_native_menu_action`), which
-//! `App::dispatch_menu_action` turns into the same `App` command the keybinding calls. The action
-//! rides in the item's `NSMenuItem.tag`, so one selector (`menuAction:`) serves every item. AppKit
-//! holds the target weakly, so [`install`] returns it retained for `App` to keep.
-//!
-//! Everything imperative is `#[cfg(target_os = "macos")]`. On other targets the
-//! [`MenuAction`] enum and a no-op [`install`] still exist so the workspace builds
-//! everywhere and `Wake::MenuAction { action, mark }` is a valid variant on every target.
+//! [`install`] attaches the menu bar on the first OS window and routes item selections through
+//! [`Wake::MenuAction`](crate::Wake) with a [`MenuAction`].
 
-/// Pure arbitration behind AppKit's synchronous `applicationShouldTerminate:`: AppKit is
-/// answered at once and the quit decision runs later on the event loop, where `App` owns
-/// document durability. Every answer names its generation (new, still pending, or already
-/// exiting), so delayed or duplicate callbacks are harmless and a system quit is noted against
-/// the quit it rides ([`crate::system_quit`]).
+/// Pure arbitration behind AppKit's synchronous `applicationShouldTerminate:`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg(any(target_os = "macos", test))]
 pub(crate) enum NativeTerminateDecision {
@@ -126,10 +113,7 @@ pub(crate) fn native_termination_is_current(generation: u64) -> bool {
     with_native_terminate(|state| state.is_current(generation))
 }
 
-/// A `terminate:` from AppKit, admitted: the arbiter's answer, and — when the
-/// quit Apple Event names a logout, a restart or a shutdown (`systems`) — the
-/// system's mark on the generation that answer belongs to. Both under the one
-/// arbiter lock, so no cancel can fall between them and leave a mark behind.
+/// A `terminate:` from AppKit, admitted.
 #[cfg(any(target_os = "macos", test))]
 pub(crate) fn admit_native_terminate(systems: bool) -> NativeTerminateDecision {
     with_native_terminate(|state| {
@@ -141,10 +125,7 @@ pub(crate) fn admit_native_terminate(systems: bool) -> NativeTerminateDecision {
     })
 }
 
-/// Cancel the quit of `generation` if it is the one pending. A cancelled quit is no longer the
-/// system's either ([`crate::system_quit::forget`]): every cancel runs through here or
-/// [`cancel_current_native_termination`], so a logout aterm answered Cancel to never marks the
-/// person's next ⌘Q.
+/// Cancel the quit of `generation` if it is the one pending.
 #[cfg(unix)]
 pub(crate) fn cancel_native_termination(generation: u64) -> bool {
     with_native_terminate(|state| {
@@ -156,7 +137,7 @@ pub(crate) fn cancel_native_termination(generation: u64) -> bool {
     })
 }
 
-/// Cancel whichever quit is pending; see [`cancel_native_termination`].
+/// Cancel whichever quit is pending.
 pub(crate) fn cancel_current_native_termination() -> bool {
     with_native_terminate(|state| {
         let pending = state.pending;
@@ -168,9 +149,7 @@ pub(crate) fn cancel_current_native_termination() -> bool {
     })
 }
 
-/// Serialises the tests that drive the process-wide arbiter and the system-quit mark, and hands
-/// each a fresh arbiter. No test reaches the paths that complete a quit (they need an
-/// `ActiveEventLoop`), so the reset discards nothing real.
+/// Serialises the tests that drive the process-wide arbiter and the system-quit mark.
 #[cfg(test)]
 pub(crate) fn terminate_test_serial() -> std::sync::MutexGuard<'static, ()> {
     static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -189,37 +168,22 @@ pub(crate) fn complete_current_native_termination() -> bool {
     with_native_terminate(NativeTerminateArbiter::complete_current)
 }
 
-/// One menu command, independent of AppKit. Its [`MenuAction::tag`] is the `NSMenuItem.tag`,
-/// decoded by [`MenuAction::from_tag`]; `App::dispatch_menu_action` calls the matching command.
-/// Standard responder items (minimise, zoom, full screen, hide, quit) route here too, not via
-/// `nil`-target selectors, so the whole menu has one dispatch path into `App`.
+/// One menu command, independent of AppKit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MenuAction {
-    // App menu
     /// About aterm — open the About route in the native Settings tab.
     About,
-    /// Check for Updates… — open the Software Update route in the native Settings tab and start
-    /// a fresh check. The Version menu's "Update details…" and the [`MenuAction::ApplyUpdate`]
-    /// fallback open the same route.
+    /// Check for Updates….
     SoftwareUpdate,
-    /// Version — the top-level menu whose title shows `v<version>`, with a trailing ⬆️ while
-    /// an update is staged ([`update_version_menu`], [`staged_for_version_menu`]). Its About
-    /// item opens the native About route. Off macOS, Windows' tab-strip version label fires it
-    /// too ([`version_slot_click`]).
+    /// Version — the top-level menu whose title shows `v<version>`.
     Version,
-    /// One-click update (`App::apply_update_or_details`), fired by the Version menu's install
-    /// item, the palette's Version row, the "Update ready" pill and the off-macOS tab-strip ↻.
-    /// A strictly newer staged build applies at once (`Wake::ApplyStagedUpdate`); one on hold or
-    /// nothing staged opens the Software Update route instead.
+    /// One-click update (`App::apply_update_or_details`).
     ApplyUpdate,
-    /// Open aterm.toml — the canonical config in Settings ▸ Manual's assisted editor, on every
-    /// platform.
+    /// Open aterm.toml.
     Preferences,
     /// Quit aterm.
     Quit,
-    // File menu
-    /// New Window — a new in-process window of this App, sharing its sessions
-    /// (`App::open_window_off_loop`); no second process is spawned.
+    /// New Window — a new in-process window of this App, sharing its sessions.
     NewWindow,
     /// New Tab — a new in-window session (`App::open_tab`).
     NewTab,
@@ -233,20 +197,14 @@ pub(crate) enum MenuAction {
     ReopenClosedTab,
     /// Reinsert the most recently closed split leaf at its original topology path.
     ReopenClosedView,
-    /// Move Tab to New Window — pull the active tab out into a fresh in-process
-    /// window (`App::detach_active_tab`).
+    /// Move Tab to New Window.
     MoveTabToNewWindow,
-    /// Move Tab to Next Window — move the active tab into the next existing window
-    /// (wrapping; `App::migrate_active_tab_to_next_window`).
+    /// Move Tab to Next Window.
     MoveTabToNextWindow,
-    /// Open Session in New Window — show the active session in a second window
-    /// (same live grid in two windows; `App::open_active_session_in_new_window`).
+    /// Open Session in New Window.
     ViewSessionInNewWindow,
-    /// Close Tab — close the focused pane; a tab's last pane closes the tab
-    /// (`App::close_active_tab`). The row reads Close Pane on a split tab
-    /// ([`close_row_title`]).
+    /// Close Tab — close the focused pane.
     CloseTab,
-    // Edit menu
     /// Copy the selection (`App::copy_selection`).
     Copy,
     /// Paste the clipboard (`App::paste_clipboard`).
@@ -259,7 +217,6 @@ pub(crate) enum MenuAction {
     FindNext,
     /// Find Previous — resume/step to the previous match.
     FindPrev,
-    // View menu
     /// Toggle the window's full-screen state (winit `set_fullscreen`).
     ToggleFullScreen,
     /// Increase font size (`set_font_size(font_size + step)`).
@@ -272,177 +229,83 @@ pub(crate) enum MenuAction {
     SplitVertical,
     /// Split the focused pane top/bottom (`split_focused_pane(Horizontal)`).
     SplitHorizontal,
-    /// Toggle matrix rain for the front session of the frontmost window
-    /// (`App::toggle_matrix_rain`): a per-session override of `[matrix_rain]`, either way,
-    /// until the session ends. Terminal-only ([`requires_terminal_tab`]). The palette
-    /// checkmark mirrors the front session's effective state.
+    /// Toggle matrix rain for the front session of the frontmost window (`App::toggle_matrix_rain`)
     ToggleMatrixRain,
-    /// Promote the front window's promotable kitty — the tenured program cat
-    /// on its glass, else the launch kitty (the base cat generated at launch,
-    /// per computer) — into the durable kitty
-    /// registry and pin it as the cursor companion (`App::favourite_kitty_checked`).
-    /// Since a pinned favourite outranks both program cats
-    /// and the launch kitty, this is also how a cat is kept across
-    /// launches and programs. Process-wide (never terminal-only: the launch
-    /// kitty exists without a front session). The palette row's checkmark
-    /// reports whether that promotable kitty is the current pin. One-way: the
-    /// pin is transferable, not toggleable. Wire id 46 is kept.
+    /// Promote the front window's promotable kitty.
     FavouriteKitty,
     /// Wear the next cat in the collection, one per press, wrapping at the end.
-    /// [`Self::FavouriteKitty`] pins the cat that would ride anyway, so it never puts on a
-    /// different one. `kitty wear <key>` on the control socket is the addressed form.
     NextKitty,
-    /// Toggle the process-wide serious-mode policy. While enabled it suppresses
-    /// every audible and decorative effect without overwriting the underlying
-    /// preferences; disabling it restores those requested settings exactly.
+    /// Toggle the process-wide serious-mode policy.
     ToggleSeriousMode,
-    /// Focus or create the process-singleton Settings tab. The app-menu Settings…
-    /// item — ⌘, — uses the standard macOS settings chord.
+    /// Focus or create the process-singleton Settings tab.
     ToggleSettings,
-    /// View ▸ Show Needs in Windows — checkable: the window's needs
-    /// border and its pill, on or off together. Persisted as `[presence] rim`
-    /// through the one serialized config lane
-    /// (`App::user_toggle_needs_in_windows`). `TogglePresenceRim` (the same key) is its alias.
+    /// View ▸ Show Needs in Windows.
     ToggleNeedsInWindows,
-    /// View ▸ Stats Bars: Deck — one of three radio rows: the three bars
-    /// at full size under the titlebar, the default. Persisted as
-    /// `[sys] stats_bars = "deck"` through the one serialized config lane
-    /// (`App::user_set_stats_bars`); a change into or out of the Deck
-    /// re-grids every window once.
+    /// View ▸ Stats Bars: Deck.
     StatsBarsDeck,
-    /// View ▸ Stats Bars: Sill — the compact form, three light lanes in the
-    /// window's bottom pad that take no terminal row (`"sill"`).
+    /// View ▸ Stats Bars: Sill.
     StatsBarsSill,
-    /// View ▸ Stats Bars: Off — no bars (`"off"`).
+    /// View ▸ Stats Bars.
     StatsBarsOff,
-    /// View ▸ Deck Size: Automatic — one of three radio rows
-    /// (`docs/DESIGN-stats-deck-v2-2026-10-20.md` §2.2, §11.5): each window's
-    /// Deck is Full or Folded by its height, the default. Persisted as
-    /// `[sys] stats_deck_size = "auto"` through the one serialized config
-    /// lane (`App::user_set_deck_size`); every window re-decides its form,
-    /// and one whose Deck changes height re-grids once.
+    /// View ▸ Deck Size: Automatic.
     DeckSizeAuto,
-    /// View ▸ Deck Size: Full — every window's Deck Full (`"full"`).
+    /// View ▸ Deck Size: Full.
     DeckSizeFull,
-    /// View ▸ Deck Size: Folded — every window's Deck Folded (`"folded"`).
+    /// View ▸ Deck Size: Folded.
     DeckSizeFolded,
-    /// View ▸ Stats Lens (⌘I): open the keyboard lens, the bars' close-up,
-    /// on the front window, or close the open one (`App::toggle_stats_lens`).
+    /// View ▸ Stats Lens (⌘I).
     ToggleStatsLens,
-    /// Open Settings at the Packages route (the batteries-included toolchain
-    /// surface: install/update the ALab toolset, posture, consent switches).
-    /// The app-menu Packages… item beneath Settings… — the menu-bar path to the
-    /// same page the seed notice pill points at.
+    /// Open Settings at the Packages route.
     Packages,
-    /// Open Settings at the Messages route:
-    /// everything aterm told the person, newest first; the page the band's `Details ›` opens.
+    /// Open Settings at the Messages route.
     Messages,
-    /// aterm ▸ System State…: focus or create the System State tab in the front window,
-    /// the tab `aterm ctl open app system-state` opens (`App::open_app`), where first-run
-    /// setup, the secrets vault join and its subscriber are reviewed and applied. The
-    /// in-app way back to it after the first run, and the menu item the setup and vault
-    /// digest lines name. Offered on macOS only, the one platform whose setup it runs
-    /// ([`Self::offered_on_this_platform`]).
+    /// Aterm ▸ System State…: focus or create the System State tab in the front window.
     SystemState,
     /// Toggle the command palette overlay (`App::toggle_palette`).
     OpenPalette,
-    /// View ▸ Choose Theme… — open the command palette scoped to its Theme
-    /// section (`App::open_theme_palette`): the arrow keys preview each theme
-    /// live, Enter writes `theme` to aterm.toml, Esc puts the configured theme
-    /// back. Bindable as `choose_theme`.
+    /// View ▸ Choose Theme….
     ChooseTheme,
-    /// View ▸ Browse & Customize Themes… and the palette Theme section's last
-    /// row: the one Settings tab, at Settings ▸ Themes — the Theme Showcase,
-    /// where every theme can be tried on a live stage and its fonts and
-    /// colors tuned. Instance-level: no session needed.
+    /// View ▸ Browse & Customize Themes… and the palette Theme section's last row.
     BrowseThemes,
-    /// View ▸ Choose Tab Theme… — the palette's Theme section scoped to the
-    /// front session (`App::open_tab_theme_palette`): the arrow keys draw each
-    /// theme on this tab only, Enter keeps it as the tab's own theme
-    /// (`theme session set`), Esc puts the tab's previous theme back. Nothing
-    /// is written to aterm.toml. Terminal-only; no default binding.
+    /// View ▸ Choose Tab Theme….
     ChooseTabTheme,
-    /// View ▸ Clear Tab Theme — the front session draws the instance theme
-    /// again (`theme session clear`). Terminal-only.
+    /// View ▸ Clear Tab Theme.
     ClearTabTheme,
-    // Tab-strip context menu. These two live only in the per-tab right-click
-    // menu the native strip pops (`toolbar.rs` / `session_chrome::compose_tab_menu`),
-    // not in the menu bar, so they are absent from `MENU_MODEL`. They ride the
-    // same tag→action decode as every bar item.
-    /// Copy the right-clicked tab's session id (the registry `sid`) to the
-    /// clipboard — the handle an agent needs to address this session over the
-    /// control socket (`meta`, `timeline`, `turn`, …).
+    /// Copy the right-clicked tab's session id (the registry `sid`) to the clipboard.
     CopySessionId,
-    /// Copy the right-clicked tab's shell-reported cwd to the clipboard, raw (never
-    /// `~`-abbreviated: a pasted path must be real).
+    /// Copy the right-clicked tab's shell-reported cwd to the clipboard, raw.
     CopyCwd,
-    /// Overview… ⌃⌘O: every session of this aterm on one card — what
-    /// each needs, else what it is doing, its task, who drives it, and who
-    /// manages whom — `App::open_overview` (app_overview.rs) on the front
-    /// window. `ShowConnectionMap`, `Fleet` and `ShowFleet` are aliases.
+    /// Overview… ⌃⌘O: every session of this aterm on one card.
     Overview,
-    // The Agents menu: what needs the person, everyone at a glance, stepping in.
-    /// Next That Needs You ⇧⌘J: go to the most pressing local need, stuck
-    /// before decide; pressed again, to the next (`App::next_need`, the cursor
-    /// keyed by need so a need that resolved drops out).
+    /// Next That Needs You ⇧⌘J.
     NextNeed,
-    /// Harness Log for This Tab ⇧⌘L: the ledger
-    /// key's action (`App::open_session_ledger`: `aterm drive ledger @<sid>
-    /// --format html`, opened in the browser). `LedgerForSession` and
-    /// `OpenLedger` are its aliases.
+    /// Harness Log for This Tab ⇧⌘L.
     HarnessLog,
-    /// Take Over This Tab:
-    /// the person's hold on the focused session (`fabric::person_hold`,
-    /// `origin=person`, `App::take_over`) — only the person types there until
-    /// they hand it back. Greyed while the person's hold already stands.
-    /// [`InvokeAuthority::PersonOnly`]: no socket fires it. `HoldSession` is an alias.
+    /// Take Over This Tab: the person's hold on the focused session.
     TakeOver,
-    /// Hand Back This Tab: lift the person's hold, and only it
-    /// (`App::hand_back`). Enabled only while it stands.
-    /// [`InvokeAuthority::PersonOnly`]; `LiftHold` is an alias.
+    /// Hand Back This Tab: lift the person's hold, and only it (`App::hand_back`).
     HandBack,
-    /// Read This Mac: `aterm ctl survey` as a child, its text in a document
-    /// tab (`App::run_cli_to_tab`).
+    /// Read This Mac: `aterm ctl survey` as a child, its text in a document tab.
     ReadThisMac,
-    /// Read the Fleet: `aterm ctl survey --fleet --timeout 3` into a
-    /// document tab. Live only in a fleet (`summarize::in_fleet`).
+    /// Read the Fleet: `aterm ctl survey --fleet --timeout 3` into a document tab.
     ReadFleet,
-    /// Summarize the Fleet in a New Tab (Summarize This Mac in a New Tab with
-    /// no fleet): one worker, raised, no role, `from=ctl`
-    /// (`App::summarize_in_new_tab`). Grey with the reason when no worker can
-    /// start here.
+    /// Summarize the Fleet in a New Tab (Summarize This Mac in a New Tab with no fleet).
     SummarizeFleet,
-    // Palette-only rows (`PALETTE_ONLY`): no bar item, a palette row and an
-    // `invoke` name each.
-    /// Message Bus: Status — `aterm fabric` (the bus's status screen) into a
-    /// document tab. A bus that is off is an Info record, never an error.
+    /// Message Bus: Status.
     FabricStatus,
-    /// Message Bus: Turn On… — `aterm fabric on`, behind a confirmation
-    /// sheet. Owner only.
+    /// Message Bus: Turn On….
     FabricOn,
-    /// Message Bus: Turn Off… — `aterm fabric off`, behind a confirmation
-    /// sheet. Owner only.
+    /// Message Bus: Turn Off….
     FabricOff,
     /// Fleet Machines — `aterm fleet peers` into a document tab.
     FleetMachines,
-    // Window menu
-    /// Edit the focused pane's session pin in place on the tab strip — the keyboard/menu twin
-    /// of double-clicking a tab. "Rename Session", not "Rename Tab": it sets session metadata
-    /// (`meta set title`) and a tab can hold several split sessions. Also in the tab context
-    /// menu.
+    /// Edit the focused pane's session pin in place on the tab strip.
     RenameSession,
-    /// Set Role… — the same inline editor over the active tab, editing the focused session's
-    /// `meta role` (the presence band's first slot). Terminal-only.
+    /// Set Role… — the same inline editor over the active tab.
     SetRole,
-    /// Edit ▸ Reset Terminal (`crate::manual_reset`): return the front session's terminal modes,
-    /// a torn escape sequence and an open OSC 8 link to host defaults, keeping the screen and
-    /// scrollback. The menu twin of the `reset` verb. Terminal-only.
+    /// Edit ▸ Reset Terminal (`crate::manual_reset`).
     ResetTerminal,
-    /// View ▸ Coding Agent Harness…: the one Settings tab, at Settings ▸ Harness — the harness's
-    /// switches, the default Autopilot, each session's Autopilot and what the
-    /// harness did. The menu and palette twin of the Autopilot menu's
-    /// `Harness settings…` (`App::open_harness_settings`). Instance-level: no
-    /// session needed.
+    /// View ▸ Coding Agent Harness….
     HarnessSettings,
     /// Minimise the window.
     Minimize,
@@ -452,20 +315,17 @@ pub(crate) enum MenuAction {
     NextTab,
     /// Show the previous tab (`App::cycle_tab(false)`).
     PrevTab,
-    // Help menu
     /// Help — open the bundled, offline features guide (`open_help_url`).
     Help,
 }
 
 impl MenuAction {
-    /// The integer stored in the menu item's `tag`: stable, starting at 1 (0 is the
-    /// `NSMenuItem` default, so an untagged item never looks like an action).
+    /// The integer stored in the menu item's `tag`.
     #[must_use]
     pub(crate) fn tag(self) -> isize {
         match self {
             MenuAction::About => 1,
             MenuAction::Preferences => 2,
-            // 3 is retired (was Hide aterm). A retired tag is never reused.
             MenuAction::Quit => 4,
             MenuAction::NewWindow => 5,
             MenuAction::NewTab => 6,
@@ -490,10 +350,8 @@ impl MenuAction {
             MenuAction::SplitHorizontal => 25,
             MenuAction::NextTab => 26,
             MenuAction::PrevTab => 27,
-            // 28, 29, 32 and 33 are retired (bottom-HUD commands).
             MenuAction::ToggleSettings => 30,
             MenuAction::OpenPalette => 31,
-            // 34 is retired (a separate Check for Updates… alert).
             MenuAction::SoftwareUpdate => 35,
             MenuAction::Version => 36,
             MenuAction::ApplyUpdate => 37,
@@ -508,12 +366,8 @@ impl MenuAction {
             MenuAction::FavouriteKitty => 46,
             MenuAction::Packages => 47,
             MenuAction::RenameSession => 48,
-            // 49-53, 55 and 56 are retired (connection presets and ids; their
-            // invoke names answer `ERR retired`).
             MenuAction::Overview => 54,
             MenuAction::NextKitty => 57,
-            // 58 is retired (was Fleet).
-            // 59 is retired (was Inbox).
             MenuAction::HarnessLog => 60,
             MenuAction::TakeOver => 61,
             MenuAction::HandBack => 62,
@@ -521,10 +375,8 @@ impl MenuAction {
             MenuAction::FabricOn => 64,
             MenuAction::FabricOff => 65,
             MenuAction::SetRole => 66,
-            // 67 is retired (was Presence Band); 68 is Show Needs in Windows.
             MenuAction::ToggleNeedsInWindows => 68,
             MenuAction::Messages => 69,
-            // 70-72 retired (named session identities).
             MenuAction::ResetTerminal => 73,
             MenuAction::HarnessSettings => 74,
             MenuAction::ChooseTheme => 75,
@@ -538,20 +390,17 @@ impl MenuAction {
             MenuAction::StatsBarsSill => 85,
             MenuAction::StatsBarsOff => 86,
             MenuAction::ToggleStatsLens => 87,
-            // The Deck's size (Stats Deck v2, 2026-10-20).
             MenuAction::DeckSizeAuto => 88,
             MenuAction::DeckSizeFull => 89,
             MenuAction::DeckSizeFolded => 90,
             MenuAction::Save => 91,
             MenuAction::SystemState => 92,
-            // Per-session themes (palette-256-session).
             MenuAction::ChooseTabTheme => 77,
             MenuAction::ClearTabTheme => 78,
         }
     }
 
-    /// Inverse of [`MenuAction::tag`]; `None` for an unknown, retired or zero tag, so the action
-    /// selector ignores a tag it cannot decode rather than dispatching the wrong command.
+    /// Inverse of [`MenuAction::tag`].
     #[must_use]
     #[cfg(any(target_os = "macos", test))]
     pub(crate) fn from_tag(tag: isize) -> Option<MenuAction> {
@@ -598,11 +447,8 @@ impl MenuAction {
             46 => MenuAction::FavouriteKitty,
             47 => MenuAction::Packages,
             48 => MenuAction::RenameSession,
-            // 49-53, 55 and 56 retired (the connection presets and ids).
             54 => MenuAction::Overview,
             57 => MenuAction::NextKitty,
-            // 58 retired (was Fleet) — see `tag`.
-            // 59 retired (was Inbox).
             60 => MenuAction::HarnessLog,
             61 => MenuAction::TakeOver,
             62 => MenuAction::HandBack,
@@ -610,10 +456,8 @@ impl MenuAction {
             64 => MenuAction::FabricOn,
             65 => MenuAction::FabricOff,
             66 => MenuAction::SetRole,
-            // 67 retired (was Presence Band).
             68 => MenuAction::ToggleNeedsInWindows,
             69 => MenuAction::Messages,
-            // 70-72 retired (named session identities).
             73 => MenuAction::ResetTerminal,
             74 => MenuAction::HarnessSettings,
             75 => MenuAction::ChooseTheme,
@@ -639,28 +483,7 @@ impl MenuAction {
     }
 }
 
-/// Fold a legacy `invoke` spelling onto the current Debug token. The rule of
-/// this table: a wire name an agent may already call is never broken — it is
-/// aliased. Every earlier name still resolves as itself (pinned by
-/// `every_earlier_invoke_name_resolves_or_is_retired`); the aliases here are the
-/// spellings a caller could reasonably have written for a row whose bar
-/// identity moved:
-///
-/// * `OpenLedger`, `LedgerForSession` — the ledger key's `[keybindings]`
-///   action name and the Fabric menu's "Ledger for This Session" row, both
-///   now Harness Log for This Tab ([`MenuAction::HarnessLog`]).
-/// * `ShowConnectionMap`, `Fleet` / `ShowFleet` — the Connection Map's row and
-///   the Fabric menu's retired Fleet row, both now the Overview
-///   ([`MenuAction::Overview`]).
-/// * `HoldSession` / `LiftHold` — the Fabric menu's halt pair, now Take Over
-///   and Hand Back on the person's slot: the same row, the hold
-///   the person meant. [`InvokeAuthority::PersonOnly`], so both spellings
-///   answer `ERR denied` over the wire.
-/// * `TogglePresenceRim` — View ▸ Presence Rim, whose key (`[presence] rim`)
-///   Show Needs in Windows writes ([`MenuAction::ToggleNeedsInWindows`]).
-///
-/// A name whose row is gone with nothing in its place is not aliased: it is
-/// retired ([`retired_invoke_name`]) and answers `ERR retired: <what to use>`.
+/// Fold a legacy `invoke` spelling onto the current Debug token.
 #[must_use]
 pub(crate) fn canonical_invoke_name(name: &str) -> &str {
     match name {
@@ -673,11 +496,7 @@ pub(crate) fn canonical_invoke_name(name: &str) -> &str {
     }
 }
 
-/// What a retired `invoke` name answers instead (`ERR retired: <this>`), or
-/// `None` for a name that is not retired. These rows went with nothing that does
-/// what they did, so the name is refused with the thing to use instead —
-/// never resolved to a different act, never an unknown-action error that
-/// says nothing.
+/// What a retired `invoke` name answers instead (`ERR retired: <this>`).
 #[must_use]
 pub(crate) fn retired_invoke_name(name: &str) -> Option<&'static str> {
     match name {
@@ -691,8 +510,6 @@ pub(crate) fn retired_invoke_name(name: &str) -> Option<&'static str> {
         | "NewControllerTab" => Some(
             "every in-session client already holds Owner; start workers with spawn agent=claude",
         ),
-        // The row went with S7 and the band itself with the needs border
-        // (S8): what replaces it has a switch of its own.
         "TogglePresenceBand" => Some(
             "the presence band is gone; the needs border and its pill replace it \
              (ToggleNeedsInWindows)",
@@ -704,9 +521,7 @@ pub(crate) fn retired_invoke_name(name: &str) -> Option<&'static str> {
     }
 }
 
-/// Commands that need a live terminal leaf: they act on the focused session or its metadata.
-/// A native app is a whole-tab surface with no session, so these grey out over one. The
-/// connection map, the fabric commands and the identity spawns are instance-wide and not listed.
+/// Commands that need a live terminal leaf.
 #[must_use]
 #[cfg(any(target_os = "macos", test))]
 pub(crate) const fn requires_terminal_tab(action: MenuAction) -> bool {
@@ -717,29 +532,16 @@ pub(crate) const fn requires_terminal_tab(action: MenuAction) -> bool {
             | MenuAction::ViewSessionInNewWindow
             | MenuAction::ToggleMatrixRain
             | MenuAction::RenameSession
-            // The Agents menu's session rows: the harness log and the person's
-            // hold are the focused session's; the role is its metadata, like
-            // the pin. Overview, the reads, Summarize and the bus commands
-            // are instance-wide and deliberately not listed.
             | MenuAction::HarnessLog
             | MenuAction::TakeOver
             | MenuAction::HandBack
             | MenuAction::SetRole
             | MenuAction::ResetTerminal
-            // A tab's own theme is the front session's.
             | MenuAction::ChooseTabTheme
             | MenuAction::ClearTabTheme
     )
 }
 
-/// A value the App publishes for AppKit's synchronous `validateMenuItem:`,
-/// which cannot reach the App; [`Published::published`] is its one access.
-/// A shipping build keeps one per process, written and read on the main
-/// thread. A test binary keeps one per thread (`menu_static!`): each test
-/// runs on a thread of its own and every test App publishes (each focus runs
-/// `sync_active_session`), so a value shared by the process would hand a test
-/// another test's bits between its write and its read. A test reads exactly
-/// what it, or the App it drives, published.
 trait Published<T: 'static> {
     fn published<R>(&'static self, f: impl FnOnce(&T) -> R) -> R;
 }
@@ -758,8 +560,7 @@ impl<T: 'static> Published<T> for std::thread::LocalKey<T> {
     }
 }
 
-/// Declare a [`Published`] value: a `static` in a shipping build, a
-/// `thread_local!` in a test binary.
+/// Declare a [`Published`] value.
 macro_rules! menu_static {
     ($(#[$meta:meta])* static $name:ident: $ty:ty = $init:expr;) => {
         $(#[$meta])*
@@ -774,10 +575,6 @@ macro_rules! menu_static {
 }
 
 menu_static! {
-    /// The active-content bit read synchronously by AppKit's `validateMenuItem:`.
-    /// `sync_active_session` publishes it at the same stabilization point used for
-    /// title, toolbar, and control-handle changes, so opening the menu never exposes
-    /// terminal-only actions as enabled over a native whole tab.
     static ACTIVE_TAB_IS_TERMINAL: std::sync::atomic::AtomicBool =
         std::sync::atomic::AtomicBool::new(true);
 }
@@ -788,12 +585,6 @@ pub(crate) fn set_active_tab_is_terminal(terminal: bool) {
 }
 
 menu_static! {
-    /// Whether the front window can actually PRESENT an inline rename editor. Off
-    /// macOS the editor is drawn by the tab strip, so `tab_strip_rows = 0` leaves
-    /// nowhere to put it — and an action that cannot run must not look available.
-    /// Published exactly like [`set_active_tab_is_terminal`], from the same
-    /// stabilization point, because AppKit validates menu commands synchronously
-    /// when a menu opens.
     static RENAME_SURFACE_AVAILABLE: std::sync::atomic::AtomicBool =
         std::sync::atomic::AtomicBool::new(true);
 }
@@ -809,15 +600,6 @@ pub(crate) fn rename_surface_available() -> bool {
 }
 
 menu_static! {
-    /// Whether Hand Back has a hold to lift on the FRONT window's focused
-    /// session — the PERSON'S (`origin=person`, Take Over), or an Owner
-    /// client's where no person's stands (`fabric::Holds::hand_back_origin`)
-    /// — as the native menu's synchronous `validateMenuItem:` needs it: Take
-    /// Over is live without it, Hand Back with it. Published by
-    /// `App::publish_front_hold` from the same stabilization point as
-    /// [`set_active_tab_is_terminal`] AND from every presence refresh of the
-    /// front window, because a hold arrives on a fabric wake, not on a tab
-    /// switch. A fleet hold moves neither row: it is not the window's to lift.
     static FRONT_PERSON_HOLD: std::sync::atomic::AtomicBool =
         std::sync::atomic::AtomicBool::new(false);
 }
@@ -834,10 +616,6 @@ pub(crate) fn front_person_hold() -> bool {
 }
 
 menu_static! {
-    /// Whether the hold Hand Back would lift on the front session is ANOTHER
-    /// MAC'S (the step-in's `origin=remote`): Take Over is live beside Hand
-    /// Back then — the person wins. Published with [`FRONT_PERSON_HOLD`] by
-    /// `App::publish_front_hold`.
     static FRONT_REMOTE_HOLD: std::sync::atomic::AtomicBool =
         std::sync::atomic::AtomicBool::new(false);
 }
@@ -854,11 +632,6 @@ pub(crate) fn front_remote_hold() -> bool {
 }
 
 menu_static! {
-    /// View ▸ Show Needs in Windows' LIVE state (`[presence] rim`, as the App
-    /// currently applies it), so `validateMenuItem:` can stamp the checkmark
-    /// synchronously when the menu opens. Published through
-    /// [`set_needs_in_windows`] by `App::adopt_presence_config` (load, reload),
-    /// `App::set_presence_bit` (every toggle) and `App::sync_active_session`.
     static NEEDS_IN_WINDOWS: std::sync::atomic::AtomicBool =
         std::sync::atomic::AtomicBool::new(true);
 }
@@ -869,12 +642,6 @@ pub(crate) fn set_needs_in_windows(on: bool) {
 }
 
 menu_static! {
-    /// View ▸ Stats Bars' LIVE form (`[sys] stats_bars` as the App applies
-    /// it: 0 Deck, 1 Sill, 2 Off), so `validateMenuItem:` can stamp the
-    /// radio's checkmark synchronously. Published through
-    /// [`set_stats_bars_form`] by the config apply (load, reload, the
-    /// radio's own write), `App::publish_menu_live` on the way to every wait
-    /// and `App::sync_active_session`.
     static STATS_BARS_FORM: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 }
 
@@ -887,9 +654,7 @@ pub(crate) fn set_stats_bars_form(form: crate::stats_deck::StatsBars) {
     STATS_BARS_FORM.published(|bit| bit.store(bits, std::sync::atomic::Ordering::Relaxed));
 }
 
-/// The published Stats Bars form ([`set_stats_bars_form`]); the Deck before
-/// any publish, as the config defaults. Read by the native menu's checkmark
-/// ([`native_menu_checked`]), so it exists where that does.
+/// The published Stats Bars form ([`set_stats_bars_form`]).
 #[cfg(any(target_os = "macos", test))]
 pub(crate) fn stats_bars_form() -> crate::stats_deck::StatsBars {
     let bits = STATS_BARS_FORM.published(|bit| bit.load(std::sync::atomic::Ordering::Relaxed));
@@ -900,9 +665,6 @@ pub(crate) fn stats_bars_form() -> crate::stats_deck::StatsBars {
 }
 
 menu_static! {
-    /// View ▸ Deck Size's LIVE choice (`[sys] stats_deck_size` as the App
-    /// applies it: 0 Automatic, 1 Full, 2 Folded), published and read exactly
-    /// as [`STATS_BARS_FORM`] is.
     static DECK_SIZE_PREF: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 }
 
@@ -915,9 +677,7 @@ pub(crate) fn set_deck_size_pref(pref: crate::stats_plan::DeckSizePref) {
     DECK_SIZE_PREF.published(|bit| bit.store(bits, std::sync::atomic::Ordering::Relaxed));
 }
 
-/// The published Deck Size choice ([`set_deck_size_pref`]); Automatic before
-/// any publish, as the config defaults. Read by the native menu's checkmark
-/// ([`native_menu_checked`]), so it exists where that does.
+/// The published Deck Size choice ([`set_deck_size_pref`]).
 #[cfg(any(target_os = "macos", test))]
 pub(crate) fn deck_size_pref() -> crate::stats_plan::DeckSizePref {
     let bits = DECK_SIZE_PREF.published(|bit| bit.load(std::sync::atomic::Ordering::Relaxed));
@@ -949,13 +709,7 @@ impl MenuAction {
     }
 }
 
-/// The Agents menu's live bits, as `validateMenuItem:` needs them when the
-/// menu opens (it cannot reach the App): Next That Needs You is live while a
-/// local need stands, Overview while a window exists, Read the Fleet and
-/// Fleet Machines in a fleet, and Summarize while a worker can start here —
-/// its tool tip says why not, and its title names the fleet or this Mac.
-/// Published by `App::publish_menu_live` on the way to every wait. The
-/// default (every bit off) is the palette's pure-test state.
+/// The Agents menu's live bits, as `validateMenuItem:` needs them when the menu opens.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct AgentsLive {
     /// A session of this aterm has a need ([`MenuAction::NextNeed`]).
@@ -964,13 +718,12 @@ pub(crate) struct AgentsLive {
     pub in_fleet: bool,
     /// A window exists ([`MenuAction::Overview`]).
     pub any_window: bool,
-    /// Why Summarize cannot start a worker here, `None` when it can.
+    /// Why Summarize cannot start a worker here, `None` when it.
     pub summarize_block: Option<String>,
 }
 
 impl AgentsLive {
-    /// Before the first publish: the rows that need no fact live, the rest
-    /// grey (a fleet, a need are facts).
+    /// Before the first publish.
     #[cfg(any(target_os = "macos", test))]
     pub(crate) const UNPUBLISHED: AgentsLive = AgentsLive {
         needs_local: false,
@@ -982,9 +735,6 @@ impl AgentsLive {
 
 #[cfg(any(target_os = "macos", test))]
 menu_static! {
-    /// The Agents menu's live bits as last published: read by the native menu's
-    /// `validateMenuItem:` (macOS), written on the way to a wait
-    /// (`App::publish_agents_live`), so neither exists where no native menu does.
     static AGENTS_LIVE: std::sync::Mutex<AgentsLive> =
         std::sync::Mutex::new(AgentsLive::UNPUBLISHED);
 }
@@ -1015,9 +765,7 @@ pub(crate) const fn summarize_title(in_fleet: bool) -> &'static str {
     }
 }
 
-/// The LIVE tool tip a native row carries at the moment the menu opens, where
-/// it says live state: Summarize's says why it cannot start. `None` keeps the
-/// row's help sentence.
+/// The live tool tip a native row carries at the moment the menu opens, where it says live state.
 #[cfg(any(target_os = "macos", test))]
 pub(crate) fn native_item_tip(action: MenuAction) -> Option<String> {
     match action {
@@ -1028,8 +776,7 @@ pub(crate) fn native_item_tip(action: MenuAction) -> Option<String> {
     }
 }
 
-/// The full-screen row's title: it names what the row does now. The palette
-/// row and the native View item both take it from here.
+/// The full-screen row's title.
 pub(crate) const fn full_screen_title(fullscreen: bool) -> &'static str {
     if fullscreen {
         "Exit Full Screen"
@@ -1038,18 +785,12 @@ pub(crate) const fn full_screen_title(fullscreen: bool) -> &'static str {
     }
 }
 
-/// The ⌘W row's title: on a split tab ⌘W closes the focused pane (`App::close_active_tab`), so
-/// the row says so. Shared by the palette row and the native File item; the tab context menu's
-/// "Close Tab" really closes the tab and keeps its words.
+/// The ⌘W row's title: on a split tab ⌘W closes the focused pane (`App::close_active_tab`).
 pub(crate) const fn close_row_title(split: bool) -> &'static str {
     if split { "Close Pane" } else { "Close Tab" }
 }
 
-/// The front window's live state that the palette's `resolve` reads from `PaletteLive` and the
-/// native bar's `validateMenuItem:` needs synchronously: the checkmarks (Serious Mode, Matrix
-/// Rain, Favourite This Kitty), the enabled bits (Copy, Show Next / Previous Tab, the two Reopen
-/// rows) and the ⌘W title. `App::publish_menu_live` publishes it before every wait, since these
-/// move on a selection drag, a toggle or a close, not only on a tab switch.
+/// The front window's live state that the palette's `resolve` reads from `PaletteLive`.
 #[cfg(any(target_os = "macos", test))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct MenuLive {
@@ -1079,7 +820,7 @@ pub(crate) struct MenuLive {
 
 #[cfg(any(target_os = "macos", test))]
 impl MenuLive {
-    /// Before the first publish: Save and Find disabled, other rows enabled, nothing checked.
+    /// Before the first publish.
     pub(crate) const UNPUBLISHED: MenuLive = MenuLive {
         has_selection: true,
         can_save: false,
@@ -1144,7 +885,6 @@ pub(crate) fn menu_live() -> MenuLive {
 }
 
 /// The checkmark a checkable native row shows, or `None` for a plain command.
-/// The same rows the palette checkmarks (`PaletteState::resolve`).
 #[cfg(any(target_os = "macos", test))]
 pub(crate) fn native_menu_checked(action: MenuAction) -> Option<bool> {
     match action {
@@ -1164,8 +904,7 @@ pub(crate) fn native_menu_checked(action: MenuAction) -> Option<bool> {
     }
 }
 
-/// The title a native row carries at the moment the menu opens, where it
-/// names live state; `None` keeps the row's static label.
+/// The title a native row carries at the moment the menu opens, where it names live state.
 #[cfg(any(target_os = "macos", test))]
 pub(crate) fn native_live_title(action: MenuAction) -> Option<&'static str> {
     match action {
@@ -1175,11 +914,7 @@ pub(crate) fn native_live_title(action: MenuAction) -> Option<&'static str> {
     }
 }
 
-/// The title `chrome` prints for a native row tagged `tag`: its live title where it
-/// has one ([`native_live_title`]), else `stamped`, the title the item carries.
-/// `validateMenuItem:` stamps a live title only when the menu opens or a key
-/// equivalent fires, so the item's own title can name state that has since moved
-/// (⌘W on a split tab leaves Close Pane on a tab that is no longer split).
+/// The title `chrome` prints for a native row tagged `tag`.
 #[cfg(any(target_os = "macos", test))]
 pub(crate) fn native_row_title(tag: isize, stamped: String) -> String {
     MenuAction::from_tag(tag)
@@ -1194,8 +929,6 @@ fn native_menu_action_enabled(action: MenuAction) -> bool {
     {
         return false;
     }
-    // The person's hold pair reads the live projection: Take Over without
-    // it, Hand Back with it. The Agents rows read their own live bits.
     match action {
         MenuAction::TakeOver if front_person_hold() && !front_remote_hold() => return false,
         MenuAction::HandBack if !front_person_hold() => return false,
@@ -1217,11 +950,6 @@ fn native_menu_action_enabled(action: MenuAction) -> bool {
         }
         _ => {}
     }
-    // The palette's preconditions (`PaletteState::resolve`): a row that would do nothing greys
-    // out. A disabled row's key equivalent falls to the first responder, normally `on_key`,
-    // whose ⌘C / ⇧⌘] / ⇧⌘T arms do the same, so a stale bit costs no keystroke. An open overlay
-    // swallows the ⌘ chord (`App::on_key_overlay_mode`) and a native rename field has no ⌘C of
-    // its own, so a live rename keeps Copy enabled (`App::publish_menu_live`).
     let live = menu_live();
     let precondition = match action {
         MenuAction::Copy => live.has_selection,
@@ -1239,11 +967,7 @@ fn native_menu_action_enabled(action: MenuAction) -> bool {
                 .published(|bit| bit.load(std::sync::atomic::Ordering::Relaxed)))
 }
 
-/// Take Over's tool tip: what
-/// the person's hold does, and what any hold costs the whole instance, in
-/// the one sentence the You hold section and `aterm ctl help hold` use too
-/// ([`aterm_types::control_verbs::HOLD_COST`]). Gated as [`MenuAction::help`],
-/// its one reader.
+/// Take Over's tool tip: what the person's hold does, and what any hold costs the whole instance.
 #[cfg(any(unix, a11y_tree, test))]
 pub(crate) const TAKE_OVER_TIP: &str = concat!(
     "Only you type here until you hand it back. aterm's harness, managers and scripts get ERR \
@@ -1251,59 +975,32 @@ pub(crate) const TAKE_OVER_TIP: &str = concat!(
     aterm_types::hold_cost!()
 );
 
-/// The control authority a socket caller must hold to reach a [`MenuAction`] through the
-/// `invoke <action>` verb (and its `open <surface>` twins). The `invoke` verb's base op
-/// is the benign `WriteInput` (it drives the human input vocabulary), but several menu
-/// actions reach a strictly-greater capability that a plain child `WriteInput` edge must
-/// not inherit — this is the classification the control layer's `argument_escalation`
-/// reads to fence those indirect seams. Compiler-exhaustive over every variant (see
-/// [`MenuAction::invoke_authority`]): a new `MenuAction` cannot compile until it is
-/// classified here, so the fence can never silently miss a newly-added privileged action.
+/// The control authority a socket caller must hold to reach a [`MenuAction`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum InvokeAuthority {
-    /// Benign: the `invoke` verb's base `WriteInput` gate suffices (view, window, tab and
-    /// navigation state, runtime-only font zoom — nothing durable or exfiltrating).
+    /// Benign: the `invoke` verb's base `WriteInput` gate suffices.
     WriteInput,
-    /// Rewrites durable `aterm.toml` on invoke or raises the durable-config surface
-    /// (`Preferences` opens aterm.toml in the native editor;
-    /// `ToggleSettings` raises Top Settings) — the `ConfigWrite` fine op.
+    /// Rewrites durable `aterm.toml` on invoke or raises the durable-config surface.
     ConfigWrite,
-    /// Moves text onto or off the OS pasteboard — the `copy` verb's `ClipboardWrite` fine op.
+    /// Moves text onto or off the OS pasteboard.
     ClipboardWrite,
-    /// Owner-only, which no single fine op expresses: a gateway to every action
-    /// (`OpenPalette`) or a re-exec of a staged update (`SoftwareUpdate`/`ApplyUpdate`, twins
-    /// of the Owner-only `update` verb).
+    /// Owner-only, which no single fine op expresses.
     OwnerOnly,
-    /// The person's own: no socket scope fires it, the Owner token included —
-    /// every in-session client holds Owner, so [`Self::OwnerOnly`] would let
-    /// the held agent invoke its own Hand Back. Take Over and Hand Back
-    /// (`invoke TakeOver|HandBack`, and their aliases) answer `ERR denied`;
-    /// the window's menu, palette, tab menu, Overview and pill reach them.
-    /// The stats lens (`invoke ToggleStatsLens`) is the person's too: the
-    /// window's View menu and ⌘I reach it.
+    /// The person's own: no socket scope fires it, the Owner token included.
     PersonOnly,
 }
 
 impl MenuAction {
     /// The [`InvokeAuthority`] a socket caller needs to fire this action via `invoke <action>`.
-    /// Exhaustive and fail-closed: a new `MenuAction` must be classified here.
     pub(crate) fn invoke_authority(self) -> InvokeAuthority {
-        // Every menu face goes through the command registry, which carries the finer effect
-        // ceiling native reducers use, before mapping to the socket-op classes below.
         let _ = crate::command_registry::menu_command(self);
         use InvokeAuthority::{ClipboardWrite, ConfigWrite, OwnerOnly, PersonOnly, WriteInput};
         match self {
-            // The clipboard boundary, the `copy` verb's fine op; the tab-context copies put
-            // session id and cwd text on the pasteboard.
             MenuAction::Copy
             | MenuAction::Paste
             | MenuAction::SelectAll
             | MenuAction::CopySessionId
             | MenuAction::CopyCwd => ClipboardWrite,
-            // Durable `aterm.toml` writes / the security-knob config surface.
-            // `Packages`, `HarnessSettings` and `Messages` raise the SAME
-            // durable-config Settings tab as `ToggleSettings`, just at their
-            // routes — same fence.
             MenuAction::Preferences
             | MenuAction::ToggleSettings
             | MenuAction::Packages
@@ -1311,24 +1008,10 @@ impl MenuAction {
             | MenuAction::BrowseThemes
             | MenuAction::Messages
             | MenuAction::ToggleSeriousMode => ConfigWrite,
-            // System State is the setup surface `open app system-state` raises, which
-            // the control gate classifies with `open prefs` (`ConfigWrite`): the same
-            // fence for its menu twin.
             MenuAction::SystemState => ConfigWrite,
-            // Gateway to every action + the staged-update re-exec twins.
             MenuAction::OpenPalette | MenuAction::SoftwareUpdate | MenuAction::ApplyUpdate => {
                 OwnerOnly
             }
-            // The Agents menu. The Overview lists every session of the
-            // instance (the `open overview` OwnerOnly class). The harness log
-            // runs a child on this instance's own socket and raises the
-            // browser; Read This Mac / the Fleet and Fleet Machines run a
-            // child that discloses the whole Mac or fleet; Summarize starts a
-            // worker (`spawn agent=` is Owner-only on the wire). The three bus
-            // commands run `aterm fabric` as a child: `on`/`off` rewrite the
-            // machine's bus (the verb is Owner-only by its own doc),
-            // and `status` discloses all of it. No fine op expresses any of
-            // these.
             MenuAction::Overview
             | MenuAction::HarnessLog
             | MenuAction::ReadThisMac
@@ -1338,36 +1021,16 @@ impl MenuAction {
             | MenuAction::FabricStatus
             | MenuAction::FabricOn
             | MenuAction::FabricOff => OwnerOnly,
-            // The person's hold is the person's: a held agent holds Owner,
-            // so no scope may take a tab over or hand it back for them.
             MenuAction::TakeOver | MenuAction::HandBack => PersonOnly,
-            // Show Needs in Windows writes `[presence] rim` in aterm.toml —
-            // durable config, the `ConfigWrite` fine op, exactly as Serious
-            // Mode is classified.
             MenuAction::ToggleNeedsInWindows => ConfigWrite,
-            // The Stats Bars radio writes `[sys] stats_bars` in aterm.toml:
-            // durable config, as Show Needs in Windows is.
             MenuAction::StatsBarsDeck | MenuAction::StatsBarsSill | MenuAction::StatsBarsOff => {
                 ConfigWrite
             }
-            // The Deck Size radio writes `[sys] stats_deck_size`: the same.
             MenuAction::DeckSizeAuto | MenuAction::DeckSizeFull | MenuAction::DeckSizeFolded => {
                 ConfigWrite
             }
-            // The lens is the person's close-up, summoned by their hand
-            // (design §12.2: agents never summon the lens). Every in-session
-            // client holds Owner, so only the person's own class keeps agents
-            // from opening it.
             MenuAction::ToggleStatsLens => PersonOnly,
-            // The theme palette writes `theme` to aterm.toml on Enter, and a
-            // caller that may open it may also press that Enter: the
-            // `settings set theme` class, not the palette gateway's Owner-only
-            // one (its rows reach no other action).
             MenuAction::ChooseTheme => ConfigWrite,
-            // Benign runtime/view/window/tab state. Font zoom is runtime-only
-            // (`set_font_size` changes the live size; it does NOT persist to `aterm.toml`), so it
-            // stays `WriteInput`. `Quit` is a denial of service, not a capability escalation, so it
-            // is left with the base gate rather than over-reaching to Owner-only.
             MenuAction::About
             | MenuAction::Version
             | MenuAction::Quit
@@ -1391,30 +1054,13 @@ impl MenuAction {
             | MenuAction::FontActualSize
             | MenuAction::SplitVertical
             | MenuAction::SplitHorizontal
-            // Runtime-only per-session visual toggle: nothing durable is written.
             | MenuAction::ToggleMatrixRain
-            // Writes only the machine-owned toy ledger (`kitty-collectibles.toml` and its
-            // `kitty-log.toml` mirror), never `aterm.toml`, so not `ConfigWrite`.
             | MenuAction::FavouriteKitty
-            // Same ledger: moves one pin stamp; also the class of the `kitty` control verb.
             | MenuAction::NextKitty
-            // Opens the inline pin editor. Its eventual write is `meta set title`,
-            // which the control verb table's `meta` form already classifies as
-            // `WriteInput` (not `ConfigWrite` — nothing durable on disk is
-            // rewritten), so this matches rather than tunnels under it.
             | MenuAction::RenameSession
-            // Same editor, same eventual write (`meta set role`).
             | MenuAction::SetRole
-            // Moves focus to the tab that needs the person: what `raise`
-            // does, and it writes nothing.
             | MenuAction::NextNeed
-            // The `reset` verb's twin, and the verb is `Write`: it moves the
-            // front session's terminal modes, writes no input and nothing
-            // durable.
             | MenuAction::ResetTerminal
-            // `theme session set|clear`'s twins: one session's colours,
-            // runtime only (carried by an update and a restore), the verb's
-            // `Write` class.
             | MenuAction::ChooseTabTheme
             | MenuAction::ClearTabTheme
             | MenuAction::Minimize
@@ -1425,19 +1071,11 @@ impl MenuAction {
         }
     }
 
-    /// Whether firing this action writes input bytes to a session's PTY — the
-    /// question the unread-input gate (`crate::input_stall::gate`)
-    /// asks of `invoke <action>`. Exhaustive for the reason
-    /// [`Self::invoke_authority`] is: a new action that pastes must be
-    /// classified here, not default to "writes nothing" and slip past the gate.
-    /// Only `Paste` writes input (the OS clipboard into the front tab's PTY);
-    /// the rest move view, window or tab state, the pasteboard, or config.
+    /// Whether firing this action writes input bytes to a session's PTY.
     #[must_use]
     pub(crate) const fn writes_pty_input(self) -> bool {
         match self {
             MenuAction::Paste => true,
-            // The stats bars' form and the Deck's size are config; the lens
-            // is a view.
             MenuAction::StatsBarsDeck
             | MenuAction::StatsBarsSill
             | MenuAction::StatsBarsOff
@@ -1502,9 +1140,7 @@ impl MenuAction {
             | MenuAction::FabricOff
             | MenuAction::RenameSession
             | MenuAction::SetRole
-            // Resets the terminal's modes; nothing reaches the program's input.
             | MenuAction::ResetTerminal
-            // Recolour one session; nothing reaches its input.
             | MenuAction::ChooseTabTheme
             | MenuAction::ClearTabTheme
             | MenuAction::Minimize
@@ -1515,9 +1151,7 @@ impl MenuAction {
         }
     }
 
-    /// The row's help: one sentence, the native `NSMenuItem` tool tip and the palette row's
-    /// accessibility description. Exhaustive, so a new action cannot ship without one. Plain
-    /// sentences: no command text, no mail body, nothing a session wrote.
+    /// The row's help: one sentence.
     #[must_use]
     #[cfg(any(unix, a11y_tree, test))]
     pub(crate) const fn help(self) -> &'static str {
@@ -1669,24 +1303,17 @@ impl MenuAction {
         }
     }
 
-    /// Whether this platform can do what the row offers: the update rows only where the in-app
-    /// updater exists ([`aterm_update::enabled`]), System State only on macOS. The palette, the
-    /// native bar and the `chrome` lines all ask this.
+    /// Whether this platform can do what the row offers.
     #[must_use]
     pub(crate) fn offered_on_this_platform(self) -> bool {
         match self {
             MenuAction::SoftwareUpdate | MenuAction::ApplyUpdate => aterm_update::enabled(),
-            // System State runs macOS setup: only a macOS launch installs its handlers.
             MenuAction::SystemState => cfg!(target_os = "macos"),
             _ => true,
         }
     }
 
-    /// Recover a [`MenuAction`] from the `{:?}` Debug token carried on the wire by
-    /// `invoke <Name>` (the exact token [`crate::palette::PaletteState::action_by_name`]
-    /// matches and `controls menu` prints), or `None` for an unknown token. The control
-    /// layer uses this to classify a socket `invoke` BEFORE the action is dispatched, so
-    /// a scoped edge is fenced from the privileged actions at the authority layer.
+    /// Recover a [`MenuAction`] from the `{:?}` Debug token carried on the wire by `invoke <Name>`.
     #[must_use]
     pub(crate) fn from_invoke_name(name: &str) -> Option<MenuAction> {
         match canonical_invoke_name(name) {
@@ -1768,21 +1395,17 @@ impl MenuAction {
     }
 }
 
-/// Modifier mask of a menu item's visual key-equivalent. Platform-neutral; the macOS
-/// builder maps it to `NSEventModifierFlags`.
+/// Modifier mask of a menu item's visual key-equivalent.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum MenuMods {
     /// No modifier (or no key-equivalent at all when `key` is empty).
     None,
-    /// ⌘
     Command,
-    /// ⇧⌘
     CommandShift,
-    /// ⌃⌘
     CommandControl,
 }
 
-/// One entry of a menu section: a command, a submenu or a divider.
+/// One entry of a menu section.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum MenuEntry {
     Separator,
@@ -1793,17 +1416,14 @@ pub(crate) enum MenuEntry {
     Item {
         label: &'static str,
         action: MenuAction,
-        /// Lowercase key-equivalent character ("" for none), visual only: `App::on_key`
-        /// handles the keystroke.
+        /// Lowercase key-equivalent character ("" for none), visual.
         key: &'static str,
         mods: MenuMods,
     },
 }
 
 impl MenuEntry {
-    /// This entry's item, if it is one — the one walk every consumer shares
-    /// (the completeness proof, the palette, the accelerator hints), including
-    /// commands nested in submenus.
+    /// This entry's item, if it is one.
     pub(crate) fn items(
         &self,
     ) -> impl Iterator<Item = (&'static str, MenuAction, &'static str, MenuMods)> + '_ {
@@ -1821,8 +1441,6 @@ impl MenuEntry {
             }
             MenuEntry::Separator => None,
         };
-        // Ordinary items allocate nothing. A submenu retains only its current
-        // ancestry while walking the same commands in menu order.
         std::iter::from_fn(move || {
             if let Some(item) = item.take() {
                 return Some(item);
@@ -1866,10 +1484,6 @@ const APP_MENU: &[MenuEntry] = &[
         mods: MenuMods::None,
     },
     Separator,
-    // The ONE update entry point: opens the Software Update route and checks in one gesture.
-    // Live only where the in-app updater exists (`MenuAction::offered_on_this_platform`):
-    // elsewhere the palette leaves the row out (`palette::PaletteState::new`) rather than
-    // listing a row that can never act, and the `chrome` menu lines leave it out too.
     Item {
         label: "Check for Updates…",
         action: MenuAction::SoftwareUpdate,
@@ -1895,8 +1509,6 @@ const APP_MENU: &[MenuEntry] = &[
         key: "",
         mods: MenuMods::None,
     },
-    // The way back to first-run setup and the secrets vault, named by their digest
-    // lines (`message_reporters::workstation_setup_failure_entry`, `secrets_join`).
     Item {
         label: "System State…",
         action: MenuAction::SystemState,
@@ -1918,17 +1530,11 @@ const APP_MENU: &[MenuEntry] = &[
     },
 ];
 
-/// The quit row's words: Windows names the verb Exit (every Windows app's File ▸
-/// Exit); macOS and Linux keep Quit aterm.
 const QUIT_LABEL: &str = if cfg!(windows) { "Exit" } else { "Quit aterm" };
 
-/// Window ▸ Zoom's words in the model, before [`zoom_title`] reads the window's
-/// state. On Windows "Zoom" reads as the font zoom beside Increase Font Size; the
-/// verb there is Maximize (and Restore Down on a maximized window).
 const ZOOM_LABEL: &str = zoom_title(false);
 
-/// Window ▸ Zoom's title for a window that is (or is not) `maximized`: the
-/// caption button's own tooltip on Windows, the green button's Zoom elsewhere.
+/// Window ▸ Zoom's title for a window that is (or is not) `maximized`.
 pub(crate) const fn zoom_title(maximized: bool) -> &'static str {
     if !cfg!(windows) {
         "Zoom"
@@ -1992,12 +1598,6 @@ const FILE_MENU: &[MenuEntry] = &[
     },
 ];
 
-/// The Agents menu: what needs the person, everyone at a glance, stepping in,
-/// and reading the Mac or the fleet. Placed between View and Window, where an
-/// application's own menus go on macOS. Live greying comes from
-/// `validateMenuItem:`'s statics ([`AgentsLive`], [`front_person_hold`]); the
-/// keystrokes are the menu's own key equivalents (`MENU_CMD_CHORDS`), and
-/// ⇧⌘L is `App::on_key`'s (`BUILTIN_CMD_CHORDS`).
 const AGENTS_MENU: &[MenuEntry] = &[
     Item {
         label: "Next That Needs You",
@@ -2058,11 +1658,7 @@ const AGENTS_MENU: &[MenuEntry] = &[
     },
 ];
 
-/// The palette-only rows:
-/// commands with no bar item, listed in the palette under [`PALETTE_ONLY_SECTION`]
-/// and reachable by `invoke`. The message bus's administration lives here and
-/// on the CLI (`aterm fabric`), never in a menu: a bus that is off (the
-/// default) is mentioned nowhere else.
+/// The palette-only rows: commands with no bar item.
 pub(crate) const PALETTE_ONLY: &[(&str, MenuAction)] = &[
     ("Message Bus: Status", MenuAction::FabricStatus),
     ("Message Bus: Turn On…", MenuAction::FabricOn),
@@ -2070,8 +1666,7 @@ pub(crate) const PALETTE_ONLY: &[(&str, MenuAction)] = &[
     ("Fleet Machines", MenuAction::FleetMachines),
 ];
 
-/// The palette section the [`PALETTE_ONLY`] rows sit in: the menu whose
-/// matter they are.
+/// The palette section the [`PALETTE_ONLY`] rows sit.
 pub(crate) const PALETTE_ONLY_SECTION: &str = "Agents";
 
 const FIND_MENU: &[MenuEntry] = &[
@@ -2120,8 +1715,6 @@ const EDIT_MENU: &[MenuEntry] = &[
         entries: FIND_MENU,
     },
     Separator,
-    // No key equivalent: Terminal.app's ⌥⌘R needs an Option modifier `MenuMods` does not carry,
-    // and every free ⌘ letter is the shell's.
     Item {
         label: "Reset Terminal",
         action: MenuAction::ResetTerminal,
@@ -2170,8 +1763,6 @@ const VIEW_MENU: &[MenuEntry] = &[
         mods: MenuMods::CommandControl,
     },
     Separator,
-    // The needs border and its pill (design §4, replacing Presence Band and
-    // Presence Rim): checkable, on by default, persisted as `[presence] rim`.
     Item {
         label: "Show Needs in Windows",
         action: MenuAction::ToggleNeedsInWindows,
@@ -2179,10 +1770,6 @@ const VIEW_MENU: &[MenuEntry] = &[
         mods: MenuMods::None,
     },
     Separator,
-    // The stats bars' form (design §12.2): a radio of three, the Deck by
-    // default, persisted as `[sys] stats_bars`; the Deck's size (Stats Deck
-    // v2 §11.5), a radio of three, Automatic by default, persisted as
-    // `[sys] stats_deck_size`; then the lens, ⌘I.
     Item {
         label: "Stats Bars: Deck",
         action: MenuAction::StatsBarsDeck,
@@ -2251,10 +1838,6 @@ const VIEW_MENU: &[MenuEntry] = &[
         mods: MenuMods::None,
     },
     Separator,
-    // Settings at the /harness route (the Autopilot design, §1): the coding
-    // agent harness's switches (Claude Code's, Codex's), Autopilot and what
-    // it did — the bar twin of the Autopilot menu's `Harness settings…`,
-    // named as the page is.
     Item {
         label: "Coding Agent Harness…",
         action: MenuAction::HarnessSettings,
@@ -2262,18 +1845,12 @@ const VIEW_MENU: &[MenuEntry] = &[
         mods: MenuMods::None,
     },
     Separator,
-    // The palette scoped to its Theme section: live preview on the arrow
-    // keys, Enter keeps. No key equivalent; `choose_theme` binds one.
     Item {
         label: "Choose Theme…",
         action: MenuAction::ChooseTheme,
         key: "",
         mods: MenuMods::None,
     },
-    // Settings at the /themes route: the Theme Showcase, every theme on a
-    // live stage with its fonts and colors to tune.
-    // The same palette scoped to the front tab: its own theme, nothing
-    // written to aterm.toml. No key equivalent.
     Item {
         label: "Choose Tab Theme…",
         action: MenuAction::ChooseTabTheme,
@@ -2346,8 +1923,6 @@ const WINDOW_MENU: &[MenuEntry] = &[
         mods: MenuMods::CommandShift,
     },
     Separator,
-    // No key equivalent: every free ⌘ letter near "rename" is the bar's or the shell's. Bind
-    // `rename_session` in `[keybindings]` instead.
     Item {
         label: "Rename Session…",
         action: MenuAction::RenameSession,
@@ -2363,11 +1938,6 @@ const HELP_MENU: &[MenuEntry] = &[Item {
     mods: MenuMods::None,
 }];
 
-/// The top-level Version menu. Its live macOS title is `v<version>` ([`version_menu_bar_title`]);
-/// the model says "Version" because it is serialised only off macOS and in tests, where a
-/// runtime version would be nondeterministic. The one-click apply comes first (the palette
-/// relabels it with the live version and drops it when nothing applies; [`update_version_menu`]
-/// rebuilds the live NSMenu likewise and adds a staged-only "Update details…" row), then About.
 const VERSION_MENU: &[MenuEntry] = &[
     Item {
         label: "↑ Install update now",
@@ -2383,26 +1953,11 @@ const VERSION_MENU: &[MenuEntry] = &[
     },
 ];
 
-/// The Version menu's LIVE menu-bar title: `v<version>`, plus a trailing ⬆️ while
-/// `attention` holds. The live caller ([`update_version_menu`]) sets `attention` for a
-/// STAGED update ONLY — the always-visible bar badge means "an update is waiting, act
-/// on it", so an apply that re-execs into that build clears it at once. The post-update
-/// REALIZED celebration is NOT a bar badge; it lives in the menu's "Updated to aterm v…"
-/// row and its palette twin (self-dismissing after
-/// [`crate::relaunch_notice::REALIZED_ARROW_TTL`]). The color emoji is safe HERE:
-/// AppKit renders NSMenu titles/items with the system font + Apple Color Emoji
-/// fallback. In-window overlay surfaces (the palette rows, Windows' tab-strip
-/// version label) must use plain `↑` instead — the own-rendered text stack has no
-/// color-emoji face (verified coverage).
-///
-/// The text between the glyphs is [`version_signature`]'s FULL rung; Windows' tab
-/// strip shows its quiet form ([`strip_version_label`]), and the bar alone adds
-/// the colour glyphs AppKit can draw.
+/// The Version menu's live menu-bar title.
 #[must_use]
 #[cfg(any(target_os = "macos", test))]
 pub(crate) fn version_menu_bar_title(attention: bool) -> String {
     let facts = VersionFacts::this_build();
-    // A dev build leads with the wrench; a release does not.
     let wrench = if facts.release {
         ""
     } else {
@@ -2413,23 +1968,16 @@ pub(crate) fn version_menu_bar_title(attention: bool) -> String {
     format!("{wrench}{signature}{arrow}")
 }
 
-/// How much of the version signature a surface has room for
-/// ([`version_signature`]). The macOS menu bar always shows [`Self::Full`];
-/// Windows' tab strip steps down to [`Self::Short`] before it hides the label
-/// (`tab_bar::layout_segments_with_version`).
+/// How much of the version signature a surface has room for ([`version_signature`]).
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub(crate) enum VersionRung {
-    /// `v<version>` on a release; `v<maj.min>.<dev commits>+g<hash>[*] · DEV` on a
-    /// dev build.
+    /// `v<version>` on a release.
     Full,
-    /// A dev build without its hash: `v<maj.min>.<dev commits>[*] · DEV`. A release
-    /// has no short rung — `v<version>` is already as short as it is honest.
+    /// A dev build without its hash.
     Short,
 }
 
-/// The compile-time facts a version signature is composed from, stamped by `build.rs` and read
-/// from [`crate::build_info`]. Separate from the constants so one test binary can compose every
-/// kind of build (release, dev, dirty, no git).
+/// The compile-time facts a version signature is composed.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) struct VersionFacts<'a> {
     /// A release lane produced the binary ([`crate::build_info::is_release_build`]).
@@ -2438,8 +1986,7 @@ pub(crate) struct VersionFacts<'a> {
     pub(crate) version: &'a str,
     /// Commits since the newest release tag ([`crate::build_info::dev_commits`]).
     pub(crate) dev_commits: &'a str,
-    /// The short commit, `-dirty` suffixed for a dirty tree
-    /// ([`crate::build_info::git_commit`]).
+    /// The short commit, `-dirty` suffixed for a dirty tree ([`crate::build_info::git_commit`]).
     pub(crate) commit: &'a str,
 }
 
@@ -2456,14 +2003,7 @@ impl VersionFacts<'static> {
     }
 }
 
-/// The version signature, without any glyph a surface adds: `v0.101.0` on a release,
-/// `v0.101.1576+g25a5963 · DEV` on a dev build (`*` after the hash for a dirty tree), and on
-/// the [`VersionRung::Short`] rung the dev form without its hash (`v0.101.1576 · DEV`). `None`
-/// only for a release's short rung.
-///
-/// A release's third slot is always 0, so the dev counter there (commits since the newest
-/// release tag) marks a non-release unambiguously. Display only: none of this reaches an update
-/// comparison. The AppKit bar and the own-rendered face both cover U+00B7.
+/// The version signature, without any glyph a surface adds.
 #[must_use]
 pub(crate) fn version_signature(facts: VersionFacts<'_>, rung: VersionRung) -> Option<String> {
     if facts.release {
@@ -2491,11 +2031,7 @@ pub(crate) fn version_signature(facts: VersionFacts<'_>, rung: VersionRung) -> O
     })
 }
 
-/// The text of Windows' tab-strip version label (`tab_bar::TabHit::Version`): this
-/// build's [`strip_version_text`] at `rung`, plus ` ↑` (a space and U+2191) while
-/// `attention` holds — plain, because the own-rendered strip has no colour-emoji
-/// face. `attention` is the bar's own staged-only rule ([`staged_for_version_menu`]),
-/// so a realized update never lights it. `None` for a release's short rung.
+/// The text of Windows' tab-strip version label (`tab_bar::TabHit::Version`).
 #[must_use]
 pub(crate) fn strip_version_label(rung: VersionRung, attention: bool) -> Option<String> {
     let text = strip_version_text(VersionFacts::this_build(), rung)?;
@@ -2506,12 +2042,7 @@ pub(crate) fn strip_version_label(rung: VersionRung, attention: bool) -> Option<
     })
 }
 
-/// The strip label's quiet form of the version: `v<maj.min>.<dev commits>` on a
-/// dev build (`v0.106.3605`) and `v<maj.min>` on its short rung; a release's
-/// `v<version>` and no short rung, as [`version_signature`].
-///
-/// The commit and a dirty tree's mark stay one click away: the label opens
-/// Settings ▸ About ([`version_slot_click`]), which names the whole build.
+/// The strip label's quiet form of the version.
 #[must_use]
 pub(crate) fn strip_version_text(facts: VersionFacts<'_>, rung: VersionRung) -> Option<String> {
     if facts.release {
@@ -2527,10 +2058,7 @@ pub(crate) fn strip_version_text(facts: VersionFacts<'_>, rung: VersionRung) -> 
     })
 }
 
-/// What a click on the tab-strip version label fires: Software Update while an update is staged
-/// and this platform has an updater ([`MenuAction::offered_on_this_platform`]), otherwise
-/// [`MenuAction::Version`] (Settings ▸ About). Never an install: the strip's leading `↻` is the
-/// one-click apply.
+/// What a click on the tab-strip version label fires.
 #[must_use]
 pub(crate) fn version_slot_click(attention: bool) -> MenuAction {
     if attention && MenuAction::SoftwareUpdate.offered_on_this_platform() {
@@ -2540,16 +2068,7 @@ pub(crate) fn version_slot_click(attention: bool) -> MenuAction {
     }
 }
 
-/// The apply-now label for a staged build, given the arrow the calling surface can render
-/// (`⬆️` in an NSMenu, `↑` in own-rendered text). The install is the overlap handoff, which
-/// keeps every window, tab and live shell, so the row never asks for a restart.
-///
-/// [`crate::update_words::staged_build_name`] names the build number when a strictly newer build
-/// carries the running one's display version (the updater orders by build number), so the row
-/// never offers to update a build to itself. `trouble` (`App::apply_trouble_for`) replaces the
-/// bare "now" with [`ApplyTrouble::row_tail`]: "install now" beside a build that already failed
-/// to start is not credible. `on_hold` (`App::latched_activation_trial_spent`) reads "aterm vX is
-/// on hold" instead of offering it; a press then opens the details.
+/// The apply-now label for a staged build, given the arrow the calling surface can render.
 #[must_use]
 pub(crate) fn staged_apply_label(
     arrow: &str,
@@ -2570,30 +2089,20 @@ pub(crate) fn staged_apply_label(
     }
 }
 
-/// The post-update row's words, the Version menu's and the palette's alike (`arrow` as for
-/// [`staged_apply_label`]). No age: the row stays up for
-/// [`crate::relaunch_notice::REALIZED_ARROW_TTL`] (ten minutes) unrewritten, so "just now" would
-/// be false for most of its life.
+/// The post-update row's words, the Version menu's and the palette's alike.
 #[must_use]
 pub(crate) fn realized_row_label(arrow: &str, version: &str) -> String {
     format!("{arrow} Updated to aterm v{version}")
 }
 
-/// Whether the menu-bar Version arrow shows: for a staged update not on hold (no press may start
-/// a held build), never for the post-update `realized` state. That lives on self-dismissing
-/// surfaces (the menu's "Updated to aterm v…" row and its palette twin), so an apply that
-/// re-execs into the staged build clears the badge the instant it lands.
+/// Whether the menu-bar Version arrow shows.
 #[must_use]
 #[cfg(any(target_os = "macos", test))]
 pub(crate) fn bar_title_attention(staged_present: bool, on_hold: bool, _realized: bool) -> bool {
     staged_present && !on_hold
 }
 
-/// The staged update the Version menu may offer, given the running build: only one strictly
-/// newer. The updater orders builds by number, so a staged record naming this build or an older
-/// one is a record the process outlived (the build it was handed off into, or one a newer
-/// install overtook), and offering it would make a landed update look pending. Every surface
-/// that draws the offer (`App::refresh_version_menu`) asks this first.
+/// The staged update the Version menu may offer, given the running build.
 #[must_use]
 pub(crate) fn staged_for_version_menu(
     staged: Option<(u64, &str)>,
@@ -2602,16 +2111,7 @@ pub(crate) fn staged_for_version_menu(
     staged.filter(|(build, _)| *build > running_build)
 }
 
-/// The Version title an outgoing process publishes for its successor once that
-/// successor's proof is in: the successor's own plain `v<version>`,
-/// no arrow — or `None` when this process cannot name it (a same-image relaunch
-/// is not a new version; a staged record for another build is not this target).
-///
-/// If the outgoing parent quits while not frontmost and the successor's
-/// launch-time activation is denied, the menu bar keeps the menu the parent
-/// published last until the user clicks the successor; publishing the
-/// successor's title on the outgoing side avoids leaving the stale arrow up
-/// without stealing focus.
+/// The Version title an outgoing process publishes for its successor once that successor's proof.
 #[cfg(any(unix, test))]
 #[must_use]
 pub(crate) fn handoff_target_bar_title(
@@ -2626,20 +2126,7 @@ pub(crate) fn handoff_target_bar_title(
     (build == target_build && !version.is_empty()).then(|| format!("v{version}"))
 }
 
-/// The whole menu bar, declaratively — the platform-neutral description the
-/// cross-platform `chrome` introspection serialiser ([`menu_chrome_lines`]) renders so
-/// the menu is introspectable on every platform (off macOS there is no `NSMenu` to read),
-/// the palette flattens, and the macOS `install` builds its
-/// `NSMenu`s from item-for-item (`macos::build_section`), so the model is the menu:
-/// what `chrome` prints off macOS and what the live bar reads back agree by
-/// construction, not by a second hand-kept list. Order is the standard Mac arrangement
-/// (App / File / Edit / View / <the app's own: Agents> / Window / Help), the App section
-/// titled with the app name by convention; the Version menu is the one section the
-/// builder composes dynamically ([`macos::build_version_menu`], the documented
-/// divergence — its rows depend on the update state).
-///
-/// A `#[test]` asserts every [`MenuAction`] appears here exactly once (the tab-context
-/// copies and the [`PALETTE_ONLY`] rows excepted), submenus included.
+/// The whole menu bar, declaratively.
 pub(crate) const MENU_MODEL: &[MenuSection] = &[
     MenuSection {
         title: "aterm",
@@ -2669,22 +2156,13 @@ pub(crate) const MENU_MODEL: &[MenuSection] = &[
         title: "Help",
         entries: HELP_MENU,
     },
-    // Last, so `v<version>` is the rightmost item in the bar, a quiet trailing badge.
     MenuSection {
         title: "Version",
         entries: VERSION_MENU,
     },
 ];
 
-/// Serialise [`MENU_MODEL`] to the `chrome` verb's menu lines (`menu "<title>": a, b, …`, the
-/// non-separator labels), byte-matching the macOS live-`NSMenu` reader
-/// (`app_introspect::read_native_chrome`), so off-macOS `chrome` reports the menu the macOS
-/// bar shows.
-///
-/// A submenu prints twice, as both readers do: `<label> ▸` in its parent's line, then its own
-/// line titled `"<parent> ▸ <label>"`. The Version menu's first row is dynamic: `apply_row` is
-/// its live label ([`crate::palette::apply_row_label`]) and `None` leaves it out. ⌘W's title
-/// follows `front_tab_split` ([`close_row_title`]).
+/// Serialise [`MENU_MODEL`] to the `chrome` verb's menu lines.
 #[cfg(any(not(target_os = "macos"), test))]
 pub(crate) fn menu_chrome_lines(apply_row: Option<&str>, front_tab_split: bool) -> Vec<String> {
     let mut out = Vec::with_capacity(MENU_MODEL.len() + 1);
@@ -2699,8 +2177,6 @@ pub(crate) fn menu_chrome_lines(apply_row: Option<&str>, front_tab_split: bool) 
     out
 }
 
-/// One section's line. Shared with nothing on macOS (the live reader walks the
-/// `NSMenu`), but the SHAPE it prints is the contract that reader byte-matches.
 #[cfg(any(not(target_os = "macos"), test))]
 fn chrome_lines_for(
     title: &str,
@@ -2712,14 +2188,11 @@ fn chrome_lines_for(
     let mut submenus = Vec::new();
     for e in entries {
         match e {
-            // A row this platform cannot act on is not reported (`offered_on_this_platform`).
             MenuEntry::Item { action, .. } if !action.offered_on_this_platform() => {}
-            // The dynamic update row: its live label, or nothing.
             MenuEntry::Item {
                 action: MenuAction::ApplyUpdate,
                 ..
             } => labels.extend(apply_row.map(str::to_string)),
-            // ⌘W's row names what it closes now.
             MenuEntry::Item {
                 action: MenuAction::CloseTab,
                 ..
@@ -2750,31 +2223,20 @@ pub(crate) use macos::{
     update_version_menu,
 };
 
-/// Whether this process was launched `--headless`, set once by `main_entry`
-/// ([`mark_process_headless`]). A headless process has no application object, so a modal
-/// (`choose_local_file`, `confirm`, `notify`) would park the main thread in a nested run loop
-/// nothing can see or dismiss, and an `NSWorkspace` open would steal focus for a process with
-/// no glass. Process-wide because its readers are free functions.
 static PROCESS_HEADLESS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Record that this process is headless. Called once, by `main_entry`.
+/// Record that this process is headless.
 pub(crate) fn mark_process_headless() {
     PROCESS_HEADLESS.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// Whether this process is headless, for a presenter that refuses quietly: the
-/// desktop-notification delivery (`notify::deliver`), whose refusal would
-/// otherwise print one stderr line per program notification, and the macOS
-/// notice center (`notice_center`), which a headless process never opens.
+/// Whether this process is headless, for a presenter that refuses quietly.
 #[cfg(any(target_os = "macos", target_os = "linux", windows))]
 pub(crate) fn process_is_headless() -> bool {
     PROCESS_HEADLESS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// Whether a helper about to present OS UI (a modal, or an open that fronts
-/// another app) must refuse because this process is headless — saying so on
-/// stderr, which is the only surface a headless instance has. Every such
-/// helper in the macOS module asks this FIRST.
+/// Whether a helper about to present OS UI (a modal, or an open that fronts another app).
 #[cfg(target_os = "macos")]
 pub(crate) fn os_ui_refused(what: &str) -> bool {
     let refused = PROCESS_HEADLESS.load(std::sync::atomic::Ordering::Relaxed);
@@ -2786,27 +2248,23 @@ pub(crate) fn os_ui_refused(what: &str) -> bool {
     refused
 }
 
-/// Off macOS there is no NSWorkspace, and "Open Log" spawns nothing in its place: the
-/// Settings page names the file's path in the log's feedback instead. `false`.
+/// Off macOS there is no NSWorkspace, and "Open Log" spawns nothing in its place.
 #[cfg(not(target_os = "macos"))]
 pub(crate) fn open_file_in_workspace(_path: &std::path::Path) -> bool {
     false
 }
 
-/// Off macOS there is no Finder to select a file in: `false`, and the Manual
-/// page names the file's path instead.
+/// Off macOS there is no Finder to select a file.
 #[cfg(not(target_os = "macos"))]
 pub(crate) fn reveal_file_in_workspace(_path: &std::path::Path) -> bool {
     false
 }
 
-/// Non-macOS no-op handle: there is no platform menu off macOS. Held by `App` in
-/// the same field on every target so the struct shape is platform-independent.
+/// Non-macOS no-op handle.
 #[cfg(not(target_os = "macos"))]
 pub(crate) type MenuHandle = ();
 
-/// Non-macOS stub: there is no platform menu bar, so nothing is installed (`None`). The shared
-/// signature keeps `AppRt::install_menu` identical on every target.
+/// Non-macOS stub: there is no platform menu bar, so nothing is installed (`None`).
 #[cfg(not(target_os = "macos"))]
 pub(crate) fn install(
     _proxy: &aterm_window::event_loop::EventLoopProxy<crate::Wake>,
@@ -2819,8 +2277,6 @@ pub(crate) fn install(
 pub fn show_handoff_target_version(_handle: &MenuHandle, _title: &str) {}
 
 /// Non-macOS stub: no native menu bar, so there is no Version menu to retitle/rebuild.
-/// The palette's Version-section rows are the cross-platform mirror of this state,
-/// and, on Windows, the tab strip's trailing version label ([`strip_version_label`]).
 #[cfg(not(target_os = "macos"))]
 pub(crate) fn update_version_menu(
     _handle: &MenuHandle,
@@ -2831,9 +2287,7 @@ pub(crate) fn update_version_menu(
 ) {
 }
 
-/// Windows: the shell's own Common Item Dialog (`IFileOpenDialog`), with the
-/// macOS panel's exact semantics — one existing local file, aliases resolved, no
-/// type restriction, cancel is `None`. See [`crate::file_picker_win`].
+/// Windows: the shell's own Common Item Dialog (`IFileOpenDialog`).
 #[cfg(windows)]
 pub(crate) fn choose_local_file(title: &str, prompt: &str) -> Option<std::path::PathBuf> {
     crate::file_picker_win::choose(title, prompt)
@@ -2845,26 +2299,19 @@ pub(crate) fn choose_local_image(title: &str, prompt: &str) -> Option<std::path:
     crate::file_picker_win::choose_image(title, prompt)
 }
 
-/// No native picker is linked on the remaining targets (Linux): the palette row stays visible
-/// but greys, since every surface asks [`local_file_picker_available`] first.
+/// No native picker is linked on the remaining targets (Linux).
 #[cfg(not(any(target_os = "macos", windows)))]
 pub(crate) fn choose_local_file(_title: &str, _prompt: &str) -> Option<std::path::PathBuf> {
     None
 }
 
-/// No picker here either; see [`choose_local_file`].
+/// No picker here.
 #[cfg(not(any(target_os = "macos", windows)))]
 pub(crate) fn choose_local_image(_title: &str, _prompt: &str) -> Option<std::path::PathBuf> {
     None
 }
 
-/// Whether [`choose_local_file`] can actually produce a path here — the one
-/// predicate every picker-backed surface gates on (the palette's File rows, and
-/// Settings ▸ Wallpaper's "Choose Image…"), so a platform gains or loses the rows and
-/// the button together.
-///
-/// Windows answers with a live probe rather than a `cfg!` — see
-/// [`crate::file_picker_win::available`].
+/// Whether [`choose_local_file`] can actually produce a path here.
 #[cfg(target_os = "macos")]
 pub(crate) fn local_file_picker_available() -> bool {
     true
@@ -2880,38 +2327,28 @@ pub(crate) fn local_file_picker_available() -> bool {
     false
 }
 
-/// Windows: a real modal alert. A GUI-subsystem launch has no stderr, so without it a failure
-/// routed through `notify` (a rejected document path, an update-check result) reaches no one.
+/// Windows: a real modal alert.
 #[cfg(windows)]
 pub(crate) fn notify(title: &str, body: &str) {
     crate::win_alert_ok(title, body);
 }
 
 /// Linux: a desktop notification (`org.freedesktop.Notifications`), sent before this returns.
-/// A launch from the desktop has no terminal, so the caller's own `eprintln!` reaches only the
-/// journal, and a launch that cannot start (or a file that cannot open) would vanish unseen.
 #[cfg(target_os = "linux")]
 pub(crate) fn notify(title: &str, body: &str) {
     crate::notify::deliver_now(title, body);
 }
 
-/// Elsewhere off macOS and Windows no alert is wired: the caller's own `eprintln!` is the channel.
+/// Elsewhere off macOS and Windows no alert is wired.
 #[cfg(not(any(target_os = "macos", windows, target_os = "linux")))]
 pub(crate) fn notify(_title: &str, _body: &str) {}
 
-/// Help, off macOS: the project page in the default browser, through the helper a Ctrl-clicked
-/// link uses (`open_url_external`: `ShellExecuteW` on Windows, `xdg-open` on Linux). No other
-/// target has the `.app`'s bundled `Help.html`.
+/// Help, off macOS: the project page in the default browser.
 #[cfg(not(target_os = "macos"))]
 pub(crate) fn open_help_url() {
     crate::app_mouse::open_url_external(&help_url());
 }
 
-/// The project page — Help's destination when no bundled guide is reachable (every non-macOS
-/// target, and macOS outside the `.app`). `is_safe_url`-clean because `open_url_external`
-/// trusts its input. The public channel the updater reads
-/// ([`aterm_update_core::DEFAULT_OWNER`] / [`aterm_update_core::DEFAULT_REPO`]), not
-/// `[workspace.package] repository`, which is the private staging repo.
 fn help_url() -> String {
     format!(
         "https://github.com/{}/{}",
@@ -2920,24 +2357,14 @@ fn help_url() -> String {
     )
 }
 
-// System Settings deep links — the macOS privacy panes
-
-/// Which section of Privacy & Security a deep link aims at. Only registered anchors in the
-/// Settings extension's `searchTerms` index are spellable; the per-folder strings in its Mach-O
-/// (`Privacy_DocumentsFolder` and siblings) name sub-rows of the one Files & Folders section,
-/// not anchors, so they are not offered.
+/// Which section of Privacy & Security a deep link aims.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum PrivacyPane {
-    /// Full Disk Access — the single grant macOS offers for this class. Which folders it covers
-    /// is unmeasured, so neither this module nor its callers may name one.
+    /// Full Disk Access.
     FullDiskAccess,
-    /// The per-app Files & Folders list — the repair route, where an already-answered folder
-    /// row can be turned back on.
+    /// The per-app Files & Folders list.
     FilesAndFolders,
-    /// The Developer Tools list (`kTCCServiceDeveloperTool`): apps allowed to "run software
-    /// locally that does not meet the system's security policy". A human adds an app there
-    /// with `+`; aterm only opens the page. `Privacy_DevTools` is a registered anchor. On
-    /// macOS 26 the page also holds the Processor Trace switch, a different setting.
+    /// The Developer Tools list (`kTCCServiceDeveloperTool`).
     DeveloperTools,
 }
 
@@ -2951,17 +2378,11 @@ impl PrivacyPane {
     ];
 }
 
-/// Full Disk Access, through the modern Settings extension. The scheme is
-/// `x-apple.systempreferences`, with a dot; the hyphenated spelling is a different string, the
-/// one `crate::is_safe_url`'s rejection test names, so [`open_privacy_settings`] does not borrow
-/// the link allowlist.
+/// Full Disk Access, through the modern Settings extension.
 #[cfg(any(target_os = "macos", test))]
 pub(crate) const SETTINGS_FULL_DISK_ACCESS: &str =
     "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_AllFiles";
 
-/// Full Disk Access, through the legacy pane id the extension still declares
-/// for itself (`legacyBundleIdentifier`). Tried only if the modern id is
-/// refused outright.
 #[cfg(any(target_os = "macos", test))]
 const SETTINGS_FULL_DISK_ACCESS_LEGACY: &str =
     "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles";
@@ -2970,30 +2391,23 @@ const SETTINGS_FULL_DISK_ACCESS_LEGACY: &str =
 #[cfg(any(target_os = "macos", test))]
 pub(crate) const SETTINGS_FILES_AND_FOLDERS: &str = "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_FilesAndFolders";
 
-/// Files & Folders, through the legacy pane id.
 #[cfg(any(target_os = "macos", test))]
 const SETTINGS_FILES_AND_FOLDERS_LEGACY: &str =
     "x-apple.systempreferences:com.apple.preference.security?Privacy_FilesAndFolders";
 
-/// The Developer Tools list, through the modern Settings extension (the consent module's
-/// spelling).
+/// The Developer Tools list, through the modern Settings extension (the consent module's spelling).
 #[cfg(any(target_os = "macos", test))]
 pub(crate) const SETTINGS_DEVELOPER_TOOLS: &str = aterm_containment::consent::DEVTOOLS_SETTINGS_URL;
 
-/// The Developer Tools list, through the legacy pane id (the consent module's spelling).
 #[cfg(any(target_os = "macos", test))]
 const SETTINGS_DEVELOPER_TOOLS_LEGACY: &str =
     aterm_containment::consent::DEVTOOLS_SETTINGS_URL_LEGACY;
 
-/// The Privacy & Security page with no anchor (no `?`), the degradation target: always the last
-/// of [`privacy_settings_urls`] (`the_last_candidate_is_the_unanchored_pane_root`).
 #[cfg(any(target_os = "macos", test))]
 const SETTINGS_PRIVACY_ROOT: &str =
     "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension";
 
-/// Every URL that may be tried for `pane`, best first: the modern extension id, the legacy
-/// alias, then the unanchored pane root. None is Apple-documented; the root keeps this from
-/// being a dead end, and the caller shows [`privacy_settings_path_words`] for the rest.
+/// Every URL that may be tried for `pane`, best first.
 #[cfg(any(target_os = "macos", test))]
 pub(crate) const fn privacy_settings_urls(pane: PrivacyPane) -> [&'static str; 3] {
     match pane {
@@ -3016,8 +2430,6 @@ pub(crate) const fn privacy_settings_urls(pane: PrivacyPane) -> [&'static str; 3
 }
 
 /// The route to `pane` in words, for when the anchor did not land the person on the section.
-/// Always offered: `openURL:` accepting a URL means System Settings took it, not that it
-/// scrolled to the row. Names the pane only — no folder, no claim about what a grant covers.
 pub(crate) const fn privacy_settings_path_words(pane: PrivacyPane) -> &'static str {
     match pane {
         PrivacyPane::FullDiskAccess => {
@@ -3030,21 +2442,15 @@ pub(crate) const fn privacy_settings_path_words(pane: PrivacyPane) -> &'static s
     }
 }
 
-/// What [`macos::open_privacy_settings`] achieved. On anything but [`Self::Anchored`] the words
-/// are the person's only route, so the caller must say them, not just log.
+/// What [`macos::open_privacy_settings`] achieved.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum SettingsOpen {
-    /// An anchored URL was accepted. System Settings opened; whether it
-    /// scrolled to the section is not observable from here, which is why the
-    /// second open exists and why the words stay on screen.
+    /// An anchored URL was accepted.
     Anchored,
-    /// Both anchors were refused; the un-anchored Privacy & Security page
-    /// opened instead. The caller must show [`privacy_settings_path_words`].
+    /// Both anchors were refused.
     #[cfg(target_os = "macos")]
     PaneRoot,
-    /// Nothing opened — off the main thread, off macOS, or the shell refused
-    /// every candidate. The caller must show the words and must not claim a
-    /// pane is up.
+    /// Nothing opened — off the main thread, off macOS, or the shell refused every candidate.
     Refused,
 }
 
@@ -3055,23 +2461,7 @@ impl SettingsOpen {
     }
 }
 
-/// Open System Settings at `pane` — the owner-gesture entry point the Security
-/// page presses, the Developer Tools hand-over's opener (`devtools_helper::Reach::live`), which the
-/// window's own lane and `aterm ctl devtools hand-over` reach at a quiet
-/// moment, and the Full Disk Access hand-over's opener
-/// (`devtools_helper::FdaReach::live`), which only the window's own launch
-/// check reaches at a quiet moment.
-///
-/// macOS does the work in [`macos::open_privacy_settings`], which documents why
-/// a Settings URL may be opened from here and never from a hyperlink. Off macOS
-/// there is no System Settings and no TCC, so nothing opens and the answer is
-/// [`SettingsOpen::Refused`] — the same instruction to the caller as a refused
-/// anchor: show the route in words.
-///
-/// A degraded outcome is logged with that route, because a windowed launch has
-/// no stderr and "the button did nothing visible" is otherwise unexplainable
-/// after the fact. The caller still has to show the words; the log is the
-/// diagnostic copy, not the user-facing one.
+/// Open System Settings at `pane`.
 pub(crate) fn open_privacy_settings(pane: PrivacyPane) -> SettingsOpen {
     #[cfg(target_os = "macos")]
     let outcome = macos::open_privacy_settings(pane);
@@ -3104,93 +2494,62 @@ mod macos {
     };
     use crate::Wake;
 
-    /// Installed before the AppKit terminate hook. `EventLoopProxy` is the only
-    /// cross-thread/callback capability retained here; all document/application
-    /// state remains on the event-loop thread.
     static TERMINATE_PROXY: std::sync::OnceLock<EventLoopProxy<Wake>> = std::sync::OnceLock::new();
 
-    /// What [`install`] returns: the retained action target and the Version menu's top-level
-    /// `NSMenuItem`, which [`update_version_menu`] retitles and rebuilds as an update stages,
-    /// realizes or expires. AppKit holds item targets weakly, so `App` keeps this for the
-    /// process lifetime. `()` off macOS.
+    /// What [`install`] returns.
     pub(crate) struct MenuHandle {
-        /// The single `menuAction:` relay target every item is wired to.
+        /// The single `menuAction:` relay target every item is wired.
         target: Retained<MenuTarget>,
-        /// The Version menu's top-level bar item (title `v<version>[ ⬆️]`), whose
-        /// submenu [`update_version_menu`] rebuilds on update-state transitions.
+        /// The Version menu's top-level bar item (title `v<version>[ ⬆️]`).
         version_item: Obj,
     }
 
     aterm_objc::declare_class! {
-        /// The target of every menu item: relays `menuAction:` (the sender's `tag`, decoded to a
-        /// [`MenuAction`]) as [`Wake::MenuAction`] for `App` to dispatch on the loop's next turn.
-        /// No menu logic lives here. `pub(crate)` only so `MenuHandle` and `install`'s return
-        /// type are not more private than it; [`aterm_objc::Retained`] is `!Send` and
-        /// instantiation takes a [`MainThread`] witness.
+        /// The target of every menu item.
         pub(crate) struct MenuTarget: NSObject {
             const NAME: &str = "ATermMenuTarget";
             type Ivars = EventLoopProxy<Wake>;
 
-            /// `menuAction:`, wired to every item: `sender` is the clicked `NSMenuItem`, whose
-            /// `tag` decodes to the action. A tag that does not decode is ignored.
+            /// `menuAction:`, wired to every item.
             @sel(menuAction:)
             fn menu_action(&self, sender: Id) {
                 if sender.is_null() {
                     return;
                 }
-                // SAFETY: `sender` is the live NSMenuItem AppKit passed as the
-                // action sender; `-tag` is `-(NSInteger)` with no side effects.
+                // SAFETY: `sender` is the live NSMenuItem AppKit passed as the action sender.
                 let tag = unsafe { appkit::send_isize(sender, sel!(tag)) };
                 if let Some(action) = MenuAction::from_tag(tag) {
-                    // Fire-and-forget: a closed loop (app shutting down) just
                     // drops the event — mirrors every other `send_event` here.
                     let _ = crate::tab_spawn::post_native_menu_action(self.ivars(), action);
                 }
             }
 
-            /// AppKit asks this just before displaying or dispatching an item. Terminal-only
-            /// commands grey out over a native whole tab.
-            ///
-            /// Returns [`aterm_objc::Bool`], not `bool`: on the `x86_64-apple-darwin` slice
-            /// `BOOL` is `signed char`, so `bool` is the wrong ABI type.
+            /// AppKit asks this just before displaying or dispatching an item.
             @sel(validateMenuItem:)
             fn validate_menu_item(&self, sender: Id) -> aterm_objc::Bool {
                 if sender.is_null() {
                     return aterm_objc::Bool::NO;
                 }
-                // SAFETY: AppKit supplied a live NSMenuItem; reading its integer tag
-                // has no side effects. Unknown/untagged items fail closed.
+                // SAFETY: AppKit supplied a live NSMenuItem.
                 let tag = unsafe { appkit::send_isize(sender, sel!(tag)) };
                 let Some(action) = MenuAction::from_tag(tag) else {
                     return aterm_objc::Bool::NO;
                 };
-                // A CHECKABLE row (View ▸ Show Needs in Windows, Serious Mode,
-                // Matrix Rain, Favourite This Kitty) shows the live
-                // state as its checkmark, stamped here because AppKit asks at
-                // exactly the moment the menu opens — the same live-projection
-                // rule the enabled bit follows. `-setState:` is
-                // `-(void)(NSControlStateValue)`, an NSInteger: 1 on, 0 off.
                 if let Some(on) = super::native_menu_checked(action) {
-                    // SAFETY: a plain setter on the live NSMenuItem AppKit
-                    // passed, main thread, no preconditions.
+                    // SAFETY: A plain setter on the live NSMenuItem AppKit passed, main thread.
                     unsafe { appkit::send_v_isize(sender, sel!(setState:), isize::from(on)) };
                 }
-                // The full-screen row names what it does now, as its palette row does.
                 if matches!(action, MenuAction::ToggleFullScreen) {
                     stamp_full_screen_title(sender);
                 }
-                // So does ⌘W's: Close Pane on a split tab, Close Tab otherwise
-                // (and Summarize names the fleet or this Mac).
                 if let Some(title) = super::native_live_title(action) {
                     set_item_title(sender, title);
                 }
-                // Summarize's tool tip says why it cannot start, when it cannot.
                 if matches!(action, MenuAction::SummarizeFleet) {
                     let tip = super::native_item_tip(action)
                         .unwrap_or_else(|| action.help().to_string());
                     if let Some(tip) = appkit::nsstring(&tip) {
-                        // SAFETY: `-setToolTip:` is `-(void)(NSString *)` on the
-                        // live NSMenuItem AppKit passed; it COPIES its argument.
+                        // SAFETY: `-setToolTip:` is `-(void)(NSString *)` on the live NSMenuItem.
                         unsafe { appkit::send_v_id(sender, sel!(setToolTip:), tip.id()) };
                     }
                 }
@@ -3199,20 +2558,11 @@ mod macos {
         }
     }
 
-    /// Retitle the full-screen item for the main window's state
-    /// (`NSWindowStyleMaskFullScreen`, `1 << 14`): `Exit Full Screen` while it
-    /// is full screen, `Enter Full Screen` otherwise or with no main window.
     fn stamp_full_screen_title(item: Id) {
-        // Only items of the bar `install` built reach here, and it builds one
-        // only windowed; the proof keeps a headless `+sharedApplication` out
-        // all the same.
         let Some(_windowed) = crate::platform::Windowed::get() else {
             return;
         };
-        // SAFETY: `+sharedApplication` and `-mainWindow` are `-(id)` accessors
-        // read on the main thread (AppKit calls `validateMenuItem:` there);
-        // `-styleMask` is `-(NSWindowStyleMask)`, an `NSUInteger`, sent only to
-        // a non-nil window.
+        // SAFETY: `+sharedApplication` and `-mainWindow` are `-(id)` accessors read on the main.
         let fullscreen = unsafe {
             let app = appkit::send_id(class(c"NSApplication").as_id(), sel!(sharedApplication));
             let window = if app.is_null() {
@@ -3225,22 +2575,15 @@ mod macos {
         set_item_title(item, super::full_screen_title(fullscreen));
     }
 
-    /// Retitle a live menu item (`validateMenuItem:`'s live titles).
     fn set_item_title(item: Id, title: &str) {
         if let Some(title) = appkit::nsstring(title) {
-            // SAFETY: `-setTitle:` is `-(void)(NSString *)` on the live
-            // NSMenuItem the caller holds; it COPIES its argument.
+            // SAFETY: `-setTitle:` is `-(void)(NSString *)` on the live NSMenuItem the caller.
             unsafe { appkit::send_v_id(item, sel!(setTitle:), title.id()) };
         }
     }
 
-    /// Build aterm's menu bar and install it as the shared application's main menu, returning
-    /// the retained [`MenuTarget`] for the caller to keep (AppKit holds item targets weakly).
-    /// Called with the first OS window, never headless. Off the main thread
-    /// (`MainThread::new` is `None`) nothing is installed.
+    /// Build aterm's menu bar and install it as the shared application's main menu.
     pub(crate) fn install(proxy: &EventLoopProxy<Wake>) -> Option<MenuHandle> {
-        // A menu bar is a windowed process's: headless, the `-setMainMenu:`
-        // below would first CREATE the application object.
         let _windowed = crate::platform::Windowed::get()?;
         let main_thread = MainThread::new()?;
         let _ = TERMINATE_PROXY.set(proxy.clone());
@@ -3248,8 +2591,6 @@ mod macos {
 
         let main = new_menu()?;
 
-        // Each section is built from `MENU_MODEL`, in its order; the Version section's rows are
-        // dynamic, so it is built below instead.
         for section in MENU_MODEL {
             if section.title == "Version" {
                 continue;
@@ -3260,19 +2601,13 @@ mod macos {
                 build_section(&target, section.entries)?,
             );
         }
-        // The Version menu goes last (rightmost), installed plain; `App::refresh_version_menu`
-        // retitles it through the retained item. A bare top-level item with an action greys out
-        // in the main menu bar, so its commands live in this submenu.
         let version_item = attach_submenu(
             &main,
             &super::version_menu_bar_title(false),
             build_version_menu(&target, None, None, false, false)?,
         )?;
 
-        // SAFETY: `+sharedApplication` is `-(id)` and is the main-thread AppKit
-        // singleton accessor (`_main_thread` is the witness); `-setMainMenu:` is
-        // `-(void)(NSMenu *)` and RETAINS the menu, which is why `main` may drop
-        // at the end of this frame.
+        // SAFETY: `+sharedApplication` is `-(id)` and is the main-thread AppKit singleton accessor.
         unsafe {
             let app = appkit::send_id(class(c"NSApplication").as_id(), sel!(sharedApplication));
             if app.is_null() {
@@ -3286,12 +2621,7 @@ mod macos {
         })
     }
 
-    /// Re-sync the live Version menu (title and items) to the update state, from
-    /// `App::refresh_version_menu` (on `Wake::UpdateStaged`, the post-update boot and the
-    /// realized-arrow TTL sweep). `staged` is the strictly newer `(build, version)` ready to
-    /// apply; `realized` marks the freshly updated window. Rebuilding the submenu, not toggling
-    /// hidden flags, keeps the items an exact function of the state. The bar arrow tracks
-    /// `staged` only ([`super::bar_title_attention`]). Off the main thread it is a no-op.
+    /// Re-sync the live Version menu (title and items) to the update state.
     pub(crate) fn update_version_menu(
         handle: &MenuHandle,
         staged: Option<(u64, &str)>,
@@ -3314,12 +2644,7 @@ mod macos {
         set_version_menu(&_main_thread, handle, &title, &submenu);
     }
 
-    /// The outgoing side of a seamless handoff: retitle this process's Version item to the
-    /// successor's plain `title` (`super::handoff_target_bar_title`) over the About-only
-    /// submenu, so the bar is right even if no app claims it after this process exits. Called
-    /// from the successor's ProofReady, which leaves the ≥30 ms dispatch fence for AppKit to
-    /// publish it before Commit; a returned attempt re-syncs the item
-    /// (`App::refresh_version_menu`). Steals no focus.
+    /// The outgoing side of a seamless handoff.
     pub fn show_handoff_target_version(handle: &MenuHandle, title: &str) {
         let Some(_main_thread) = MainThread::new() else {
             return;
@@ -3330,8 +2655,6 @@ mod macos {
         set_version_menu(&_main_thread, handle, title, &submenu);
     }
 
-    /// Put `title` and `submenu` on the Version bar item (`_main_thread` is the
-    /// witness that this runs where AppKit requires).
     fn set_version_menu(
         _main_thread: &MainThread,
         handle: &MenuHandle,
@@ -3341,12 +2664,7 @@ mod macos {
         let Some(ns_title) = appkit::nsstring(title) else {
             return;
         };
-        // Set the title on both the bar item and the submenu: which one AppKit takes for a
-        // top-level title has varied by toolkit version.
-        // SAFETY: `-setTitle:` is `-(void)(NSString *)` and `-setSubmenu:` is
-        // `-(void)(NSMenu *)`, both plain main-thread setters on live objects
-        // that COPY/RETAIN their argument, so the +1 title and the submenu may
-        // drop at the end of this frame.
+        // SAFETY: `-setTitle:` is `-(void)(NSString *)` and `-setSubmenu:` is `-(void)(NSMenu *)`.
         unsafe {
             appkit::send_v_id(submenu.id(), sel!(setTitle:), ns_title.id());
             appkit::send_v_id(handle.version_item.id(), sel!(setTitle:), ns_title.id());
@@ -3354,14 +2672,6 @@ mod macos {
         }
     }
 
-    /// The Version submenu for the given update state (the palette rewrites
-    /// [`super::VERSION_MENU`]'s apply row the same way):
-    ///   * staged: "⬆️ Install aterm v<staged> now" (one click installs in place), About, then
-    ///     "Update details…". A build on hold reads "⬆️ aterm v<staged> is on hold — …" and its
-    ///     click opens the details ([`super::staged_apply_label`]).
-    ///   * realized (fresh post-update, nothing staged): "⬆️ Updated to aterm v<current>"
-    ///     (fires About), then About.
-    ///   * neither: just About.
     fn build_version_menu(
         target: &MenuTarget,
         staged: Option<(u64, &str)>,
@@ -3403,8 +2713,6 @@ mod macos {
             false,
         );
         if staged.is_some() {
-            // The details surface, one row under the one-click apply — mirrors the App
-            // menu's "Check for Updates…" (same SoftwareUpdate action, staged-only here).
             add_item(
                 &menu,
                 target,
@@ -3417,13 +2725,6 @@ mod macos {
         Some(menu)
     }
 
-    /// Build one menu from the model's entries: every [`MenuEntry::Item`] as an
-    /// item wired to `menuAction:` with the model's key equivalent and modifier
-    /// mask and the action's [`MenuAction::help`] as its tool tip, every
-    /// separator as a separator. The one builder for
-    /// every static section — so the live bar the `chrome`
-    /// verb reads back on macOS and the model `menu_chrome_lines` prints off
-    /// it are the same tree by construction.
     fn build_section(target: &MenuTarget, entries: &[super::MenuEntry]) -> Option<Obj> {
         let menu = new_menu()?;
         for entry in entries {
@@ -3443,7 +2744,6 @@ mod macos {
         Some(menu)
     }
 
-    /// The model's platform-neutral modifier onto the AppKit mask.
     fn mods_mask(mods: super::MenuMods) -> usize {
         match mods {
             super::MenuMods::None => 0,
@@ -3453,37 +2753,27 @@ mod macos {
         }
     }
 
-    /// `Cmd` modifier mask (the default for a single-letter key equivalent).
     fn command_mask() -> usize {
         NS_EVENT_MODIFIER_FLAG_COMMAND
     }
 
-    /// `Cmd-Ctrl` mask (Enter Full Screen's ⌃⌘F).
     fn command_control_mask() -> usize {
         NS_EVENT_MODIFIER_FLAG_COMMAND | NS_EVENT_MODIFIER_FLAG_CONTROL
     }
 
-    /// `Cmd-Shift` mask (Move Tab to New Window's ⇧⌘N).
     fn command_shift_mask() -> usize {
         NS_EVENT_MODIFIER_FLAG_COMMAND | NS_EVENT_MODIFIER_FLAG_SHIFT
     }
 
-    /// `[[NSMenu alloc] init]`, +1, or `None` if the allocation failed.
     fn new_menu() -> Option<Obj> {
-        // SAFETY: `+alloc` gives a +1 uninitialised NSMenu and `-init` consumes
-        // it, so `Obj::from_owned` adopts exactly one +1.
+        // SAFETY: `+alloc` gives a +1 uninitialised NSMenu and `-init` consumes it.
         unsafe { Obj::from_owned(appkit::send_id(appkit::alloc(class(c"NSMenu")), sel!(init))) }
     }
 
-    /// `[[NSMenuItem alloc] initWithTitle:action:keyEquivalent:]`, +1. `action`
-    /// is [`Sel::NULL`] for an item that only holds a submenu.
     fn new_item(title: &str, action: Sel, key: &str) -> Option<Obj> {
         let title = appkit::nsstring(title)?;
         let key = appkit::nsstring(key)?;
-        // SAFETY: NSMenuItem's designated initializer,
-        // `-(id)(NSString *, SEL, NSString *)`; a nil SEL is its documented
-        // "no action" value. `+alloc` is +1 and the initializer consumes it.
-        // Both strings are live +1 NSStrings the initializer copies.
+        // SAFETY: NSMenuItem's designated initializer, `-(id)(NSString *, SEL, NSString *)`.
         unsafe {
             Obj::from_owned(appkit::send_id_id_sel_id(
                 appkit::alloc(class(c"NSMenuItem")),
@@ -3495,9 +2785,6 @@ mod macos {
         }
     }
 
-    /// Build one menu item wired to `menuAction:` on `target`, tagged with `action`, and append
-    /// it to `menu`. `key` is the lowercase key-equivalent character ("" for none); `cmd` adds
-    /// ⌘. The equivalent is visual only: `App::on_key` handles the keystroke.
     fn add_item(
         menu: &Obj,
         target: &MenuTarget,
@@ -3510,8 +2797,6 @@ mod macos {
         add_item_mods(menu, target, title, action, key, mods);
     }
 
-    /// As [`add_item`] but with an explicit modifier mask (for non-⌘ equivalents
-    /// like Enter Full Screen's ⌃⌘F).
     fn add_item_mods(
         menu: &Obj,
         target: &MenuTarget,
@@ -3523,14 +2808,8 @@ mod macos {
         let Some(item) = new_item(title, sel!(menuAction:), key) else {
             return;
         };
-        // The help sentence is the tool tip, which VoiceOver reads as the item's help.
         let tip = appkit::nsstring(action.help());
-        // SAFETY: plain setters on a fresh NSMenuItem, then `-addItem:` on the
-        // live menu. `-setTarget:` is `-(void)(id)` and holds the target WEAKLY
-        // (which is why `MenuHandle` retains it), `-setTag:` is
-        // `-(void)(NSInteger)`, `-setToolTip:` is `-(void)(NSString *)` and
-        // COPIES its argument, and `-setKeyEquivalentModifierMask:` is
-        // `-(void)(NSEventModifierFlags)`, an `NSUInteger` bitmask.
+        // SAFETY: Plain setters on a fresh NSMenuItem, then `-addItem:` on the live menu.
         unsafe {
             appkit::send_v_id(item.id(), sel!(setTarget:), target.as_id());
             appkit::send_v_isize(item.id(), sel!(setTag:), action.tag());
@@ -3544,12 +2823,8 @@ mod macos {
         }
     }
 
-    /// Append a separator line to `menu`.
     fn add_separator(menu: &Obj) {
-        // SAFETY: `+separatorItem` is `-(id)` and returns a shared, AUTORELEASED
-        // item — borrowed for the length of `-addItem:`, which retains it into
-        // the menu. The pool it lives in is the caller's; every path into this
-        // module opens one.
+        // SAFETY: `+separatorItem` is `-(id)` and returns a shared, autoreleased item.
         unsafe {
             let sep = appkit::send_id(class(c"NSMenuItem").as_id(), sel!(separatorItem));
             if !sep.is_null() {
@@ -3558,29 +2833,21 @@ mod macos {
         }
     }
 
-    /// Present the system open panel and return exactly the one local path the user
-    /// approved. The panel grants no directory or multiple-file authority; the caller
-    /// still canonicalizes, bounds, UTF-8-validates, and mints the process-local
-    /// document grant before reading the file.
+    /// Present the system open panel and return exactly the one local path the user approved.
     pub(crate) fn choose_local_file(title: &str, prompt: &str) -> Option<std::path::PathBuf> {
         open_panel(title, prompt, &[])
     }
 
-    /// [`choose_local_file`] offering only images: the panel greys out every
-    /// file whose type does not conform to `public.image`.
+    /// [`choose_local_file`] offering only images.
     pub(crate) fn choose_local_image(title: &str, prompt: &str) -> Option<std::path::PathBuf> {
         open_panel(title, prompt, &["public.image"])
     }
 
-    /// The open panel, limited to `types` (type identifiers or extensions;
-    /// empty offers every file).
     fn open_panel(title: &str, prompt: &str, types: &[&str]) -> Option<std::path::PathBuf> {
         if super::os_ui_refused(title) {
             return None;
         }
         let _main_thread = MainThread::new()?;
-        // `-runModal` below spins a nested run loop for as long as the panel is
-        // up; park the main-thread watchdog for exactly that long.
         let _park = crate::watchdog::park_modal();
         let title = appkit::nsstring(title)?;
         let prompt = appkit::nsstring(prompt)?;
@@ -3589,14 +2856,7 @@ mod macos {
             .map(|kind| appkit::nsstring(kind))
             .collect::<Option<Vec<Obj>>>()?;
         let type_ids = types.iter().map(Obj::id).collect::<Vec<Id>>();
-        // SAFETY: NSOpenPanel is created and run on AppKit's main thread
-        // (`_main_thread` is the witness). `+openPanel` is `-(id)` and returns an
-        // AUTORELEASED panel — borrowed for the length of this pool, which is
-        // why the whole body is inside one. The setters are `-(void)(BOOL)` and
-        // `-(void)(NSString *)`; `-runModal` is `-(NSModalResponse)`, i.e.
-        // `NSInteger`, and owns its nested modal loop; `-URL` and `-path` are
-        // `-(id)` accessors valid until the pool pops. Only an affirmative
-        // response is converted to a local path.
+        // SAFETY: NSOpenPanel is created and run on AppKit's main thread.
         autoreleasepool(|_| unsafe {
             let panel = appkit::send_id(class(c"NSOpenPanel").as_id(), sel!(openPanel));
             if panel.is_null() {
@@ -3609,10 +2869,6 @@ mod macos {
             appkit::send_v_id(panel, sel!(setTitle:), title.id());
             appkit::send_v_id(panel, sel!(setPrompt:), prompt.id());
             if !type_ids.is_empty() {
-                // `+arrayWithObjects:count:` copies the pointers and retains
-                // the strings `types` keeps alive; the array is autoreleased
-                // into this pool, and `-setAllowedFileTypes:` (`-(void)(NSArray
-                // *)`, type identifiers or extensions) copies it.
                 let allowed = appkit::send_id_idptr_usize(
                     class(c"NSArray").as_id(),
                     sel!(arrayWithObjects:count:),
@@ -3639,16 +2895,10 @@ mod macos {
         })
     }
 
-    /// Attach `submenu` under a new action-less top-level item titled `title` on `bar`,
-    /// returning the retained item (the Version menu is retitled through it, see
-    /// [`update_version_menu`]). The submenu gets the same title: AppKit takes a top-level bar
-    /// title from the submenu on some paths.
     fn attach_submenu(bar: &Obj, title: &str, submenu: Obj) -> Option<Obj> {
         let ns_title = appkit::nsstring(title)?;
         let item = new_item(title, Sel::NULL, "")?;
-        // SAFETY: `-setTitle:` is `-(void)(NSString *)`, `-setSubmenu:` is `-(void)(NSMenu *)`
-        // and retains, `-addItem:` is `-(void)(NSMenuItem *)` and retains, so both the +1 title
-        // and the moved `submenu` may drop at the end of this frame.
+        // SAFETY: `-setTitle:` is `-(void)(NSString *)`, `-setSubmenu:` is `-(void)(NSMenu *)`.
         unsafe {
             appkit::send_v_id(submenu.id(), sel!(setTitle:), ns_title.id());
             appkit::send_v_id(item.id(), sel!(setSubmenu:), submenu.id());
@@ -3657,52 +2907,29 @@ mod macos {
         Some(item)
     }
 
-    /// Show a native modal confirmation (a ⌘Q quit, or a close that would lose work) and block
-    /// until the user answers. `proceed_label` titles the affirmative, default button; a Cancel
-    /// button is always added and Escape maps to it. Returns `true` iff the user proceeds.
-    /// `runModal` spins a nested modal loop on the main thread, so this is safe straight from
-    /// the winit event handler.
-    ///
-    /// # Return with ⌘ held
-    ///
-    /// The default button's Return equivalent has an empty modifier mask and AppKit matches key
-    /// equivalents exactly, so ⌘Return (⌘ still held after ⌘Q) would not answer. The
-    /// [`crate::alert_keys`] interceptor is installed for the `runModal` call: Return (any
-    /// modifiers) proceeds, Escape cancels, everything else passes through.
+    /// Show a native modal confirmation (a ⌘Q quit, or a close that would lose work) and block.
     pub(crate) fn confirm(title: &str, body: &str, proceed_label: &str) -> bool {
-        // Proceed whenever no alert could be shown (headless included, as
         // `confirm_destructive_close` does): a quit that cannot ask must not wedge.
         ask(title, body, proceed_label, AlertDefault::Proceed).unwrap_or(true)
     }
 
-    /// [`confirm`] for an owner gesture that changes this Mac (the Security panel's reset,
-    /// warm-up and *Move to Trash*). Fails closed: with no window, off the main thread or with
-    /// no alert built, nobody is asked and it returns `None`, which the caller must not read as
-    /// a decline. Control input arrives as a `Wake`, queued while `runModal` spins, so no
-    /// control verb can answer it. Since a program can choose when the alert appears, its
-    /// default button is Cancel and the destructive button refuses keyboard focus: only a
-    /// deliberate click on `proceed_label` says yes.
+    /// [`confirm`] for an owner gesture that changes this Mac.
     pub(crate) fn confirm_owner(title: &str, body: &str, proceed_label: &str) -> Option<bool> {
         ask(title, body, proceed_label, AlertDefault::Cancel)
     }
 
-    /// Which button of [`ask`]'s alert Return presses.
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum AlertDefault {
-        /// Return (with any modifiers, via `alert_keys`) proceeds: ⌘Q's alert.
+        /// Return (with any modifiers, via `alert_keys`) proceeds.
         Proceed,
         /// Return and Escape cancel, and no key watch is installed.
         Cancel,
     }
 
-    /// The alert behind [`confirm`] and [`confirm_owner`]: `None` when none
-    /// could be shown, else whether the user chose to proceed.
     fn ask(title: &str, body: &str, proceed_label: &str, default: AlertDefault) -> Option<bool> {
         if super::os_ui_refused(title) || MainThread::new().is_none() {
             return None;
         }
-        // `-runModal` below spins a nested run loop until the user answers;
-        // park the main-thread watchdog for exactly that long.
         let _park = crate::watchdog::park_modal();
         let (Some(title), Some(body), Some(proceed), Some(cancel)) = (
             appkit::nsstring(title),
@@ -3713,39 +2940,24 @@ mod macos {
             // Foundation refused a string, so no alert can be built.
             return None;
         };
-        // A nil alert is "could not ask" too.
-        // SAFETY: `+[NSAlert new]` is `+(instancetype)` and +1 (alloc+init), which is what
-        // `Obj::from_owned` adopts.
+        // SAFETY: `+[NSAlert new]` is `+(instancetype)` and +1 (alloc+init).
         let alert =
             unsafe { Obj::from_owned(appkit::send_id(class(c"NSAlert").as_id(), sel!(new))) }?;
-        // SAFETY: standard `NSAlert` setters and `runModal`, on the main thread
-        // (`MainThread::new()` above proves it). `-setMessageText:` and `-setInformativeText:`
-        // are `-(void)(NSString *)` and copy their argument, so the +1 strings may drop at the
-        // end of this frame. `-addButtonWithTitle:` is `-(NSButton *)(NSString *)` and `-window`
-        // is `-(NSWindow *)`, both +0, so both are retained into `Obj`, not adopted. The alert
-        // keeps the default `NSAlertStyleWarning`. `-runModal` is `-(NSModalResponse)`, an
-        // `NSInteger`.
+        // SAFETY: Standard `NSAlert` setters and `runModal`, on the main thread.
         unsafe {
             appkit::send_v_id(alert.id(), sel!(setMessageText:), title.id());
             appkit::send_v_id(alert.id(), sel!(setInformativeText:), body.id());
             if default == AlertDefault::Cancel {
-                // The first button added is the default, so Cancel goes first: Return and
-                // Escape both cancel, and the destructive button refuses keyboard focus, so
-                // neither Tab nor Space reaches it. No key watch: its job is to make Return
-                // proceed.
                 let _ = appkit::send_id_id(alert.id(), sel!(addButtonWithTitle:), cancel.id());
                 let proceed_button =
                     appkit::send_id_id(alert.id(), sel!(addButtonWithTitle:), proceed.id());
                 if !proceed_button.is_null() {
-                    // `-setRefusesFirstResponder:` is `-(void)(BOOL)` on NSControl,
                     // which the NSButton `-addButtonWithTitle:` returns is.
                     appkit::send_v_bool(proceed_button, sel!(setRefusesFirstResponder:), true);
                 }
                 let response = appkit::send_isize(alert.id(), sel!(runModal));
                 return Some(response == NS_ALERT_SECOND_BUTTON_RETURN);
             }
-            // The first button added is the default (Return with an empty modifier mask, hence
-            // the key watch below): proceed. The second is Cancel (AppKit binds Escape to it).
             let accept = Obj::retain(appkit::send_id_id(
                 alert.id(),
                 sel!(addButtonWithTitle:),
@@ -3757,9 +2969,6 @@ mod macos {
                 cancel.id(),
             ));
             let panel = Obj::retain(appkit::send_id(alert.id(), sel!(window)));
-            // Dropped when this function returns, the moment `runModal` comes back, so the
-            // interceptor lives exactly as long as the alert. With a button or the panel
-            // missing there is nothing to click: no watch, and the alert keeps its stock keys.
             let _keys = match (panel, accept, refuse) {
                 (Some(panel), Some(accept), Some(refuse)) => {
                     crate::alert_keys::watch_alert_keys(panel, None, accept, refuse)
@@ -3771,29 +2980,22 @@ mod macos {
         }
     }
 
-    /// Show an informational alert (one OK button) and block until it is dismissed: a file that
-    /// could not open, a failed start. Off the main thread it does nothing.
+    /// Show an informational alert (one OK button) and block until it is dismissed.
     pub(crate) fn notify(title: &str, body: &str) {
         if super::os_ui_refused(title) || MainThread::new().is_none() {
             return;
         }
-        // `-runModal` below spins a nested run loop until the user dismisses
-        // the alert; park the main-thread watchdog for exactly that long.
         let _park = crate::watchdog::park_modal();
         autoreleasepool(|_| {
             let Some(alert) = ok_alert(title, body) else {
                 return;
             };
-            // SAFETY: main thread (checked above); `-runModal` is
-            // `-(NSModalResponse)` on the live alert.
+            // SAFETY: Main thread (checked above).
             let _ = unsafe { appkit::send_isize(alert.id(), sel!(runModal)) };
         });
     }
 
-    /// [`notify`]'s alert, built and not yet run: also the launch-fatal alert's
-    /// (`launch_alert`), which puts its panel in before asking to be the active
-    /// app. Main thread only, as every caller checks first. `None` when AppKit
-    /// builds none.
+    /// [`notify`]'s alert, built and not yet run.
     pub(crate) fn ok_alert(title: &str, body: &str) -> Option<Obj> {
         let (Some(title), Some(body), Some(ok)) = (
             appkit::nsstring(title),
@@ -3802,11 +3004,7 @@ mod macos {
         ) else {
             return None;
         };
-        // SAFETY: standard `NSAlert` construction + setters on the main thread.
-        // `+new` is +1 (alloc+init) and lands in `Obj`;
-        // `-setMessageText:`/`-setInformativeText:` are `-(void)(NSString *)`;
-        // `-addButtonWithTitle:` is `-(id)` returning a BORROWED button this
-        // caller does not keep.
+        // SAFETY: Standard `NSAlert` construction + setters on the main thread.
         unsafe {
             let alert = Obj::from_owned(appkit::send_id(class(c"NSAlert").as_id(), sel!(new)))?;
             appkit::send_v_id(alert.id(), sel!(setMessageText:), title.id());
@@ -3816,18 +3014,8 @@ mod macos {
         }
     }
 
-    /// Whether the `terminate:` AppKit is asking about now is the system's — a logout, a restart
-    /// or a shutdown: the quit Apple Event being handled carries a `kAEQuitReason` naming one
-    /// ([`crate::system_quit::reason_is_the_systems`]). A Dock Quit or an AppleScript `quit`
-    /// carries none; ⌘Q is the app menu's and never reaches here. A failed read is no reason.
     fn terminate_is_the_systems() -> bool {
-        // SAFETY: Foundation sends on the main thread inside
-        // `applicationShouldTerminate:`. `+sharedAppleEventManager` and
-        // `-currentAppleEvent` return BORROWED objects (nil outside an event);
-        // `-attributeDescriptorForKeyword:` takes an `AEKeyword` (a 32-bit
-        // `FourCharCode`, passed in a full register) and returns a borrowed
-        // descriptor or nil; `-enumCodeValue` returns an `OSType`, the low
-        // 32 bits of the return register.
+        // SAFETY: Foundation sends on the main thread inside `applicationShouldTerminate:`.
         autoreleasepool(|_| unsafe {
             let manager = appkit::send_id(
                 class(c"NSAppleEventManager").as_id(),
@@ -3853,15 +3041,8 @@ mod macos {
         })
     }
 
-    /// AppKit's synchronous `applicationShouldTerminate:` hook. The first request
-    /// is vetoed and posted to the typed event loop; duplicates remain vetoed while
-    /// the same generation is awaiting confirmation/save proofs. Once `App` marks
-    /// the generation complete, a re-entrant terminate is allowed (normal aterm
-    /// shutdown uses `ActiveEventLoop::exit` and does not need to re-enter AppKit).
+    /// AppKit's synchronous `applicationShouldTerminate:` hook.
     pub(crate) fn defer_quit_for_terminate() -> bool {
-        // A restart, logout or shutdown is an exit the person did not choose, so its quit keeps
-        // the agents aterm hosts for the next launch (`crate::system_quit`), noted against this
-        // request's generation so a cancel takes the mark with it.
         let decision = super::admit_native_terminate(terminate_is_the_systems());
         match decision {
             NativeTerminateDecision::AllowExit(_) => true,
@@ -3883,9 +3064,7 @@ mod macos {
         }
     }
 
-    /// Help ▸ aterm Help: open the bundled offline guide (`Contents/Resources/Help.html`, put
-    /// there by aterm-release's `bundle.rs`) in the default browser, or the project page when
-    /// running outside the `.app`.
+    /// Help ▸ aterm Help: open the bundled offline guide.
     pub(crate) fn open_help_url() {
         if let Some(help) = bundled_resource("Help.html") {
             open_in_workspace(&help, true);
@@ -3894,19 +3073,12 @@ mod macos {
         }
     }
 
-    /// Resolve a file inside the running app bundle's `Contents/Resources/`, returning
-    /// its path only when the file exists. The executable lives at
-    /// `<app>/Contents/MacOS/<bin>`, so resources are two levels up then `Resources/`.
     fn bundled_resource(name: &str) -> Option<String> {
         let exe = std::env::current_exe().ok()?;
         let res = exe.parent()?.parent()?.join("Resources").join(name);
         res.is_file().then(|| res.to_string_lossy().into_owned())
     }
 
-    /// Open `s` via `NSWorkspace openURL:` — a file path (`is_file`) as a `file://` URL,
-    /// otherwise an absolute URL. Main thread only. Returns whether the shell accepted the URL,
-    /// which is not whether the app did what it asked (see [`open_privacy_settings`]); `false`
-    /// also covers a refusal, so "not attempted" never reads as "opened".
     fn open_in_workspace(s: &str, is_file: bool) -> bool {
         if super::os_ui_refused(&format!("opening {s}")) || MainThread::new().is_none() {
             return false;
@@ -3914,11 +3086,7 @@ mod macos {
         let Some(ns) = appkit::nsstring(s) else {
             return false;
         };
-        // SAFETY: `+fileURLWithPath:` / `+URLWithString:` are `-(id)(NSString *)`
-        // convenience constructors returning an AUTORELEASED NSURL (nil for a
-        // string that is not a URL, which is checked); `+sharedWorkspace` is the
-        // `-(id)` singleton; `-openURL:` is `-(BOOL)(NSURL *)` and its answer is
-        // handed straight back. Both borrows live inside this pool.
+        // SAFETY: `+fileURLWithPath:` / `+URLWithString:` are `-(id)(NSString *)` convenience.
         autoreleasepool(|_| unsafe {
             let url = appkit::send_id_id(
                 class(c"NSURL").as_id(),
@@ -3940,20 +3108,12 @@ mod macos {
         })
     }
 
-    /// Open a local file aterm itself names (Settings ▸ Packages' "Open Log", for the package log
-    /// atpkg resolved) through `NSWorkspace openURL:` with a `file://` URL, so macOS opens it in
-    /// the app that owns the type. No shell or Terminal is spawned, and nothing a program printed
-    /// can reach this (the link allowlist stays closed). Main thread only; `false` when refused.
+    /// Open a local file aterm itself names.
     pub(crate) fn open_file_in_workspace(path: &std::path::Path) -> bool {
         path.to_str().is_some_and(|s| open_in_workspace(s, true))
     }
 
-    /// Show the local file `path` aterm itself names — Settings ▸ Manual's
-    /// aterm.toml — selected in a Finder window: `NSWorkspace
-    /// selectFile:inFileViewerRootedAtPath:` with an empty root (Finder's own
-    /// viewer). Its answer is Finder's: `false` when the file could not be
-    /// selected (a missing file), so "Showed" is said only of what was shown.
-    /// Main thread only; `false` when refused.
+    /// Show the local file `path` aterm itself names.
     pub(crate) fn reveal_file_in_workspace(path: &std::path::Path) -> bool {
         let Some(s) = path.to_str() else {
             return false;
@@ -3964,10 +3124,7 @@ mod macos {
         let (Some(file), Some(root)) = (appkit::nsstring(s), appkit::nsstring("")) else {
             return false;
         };
-        // SAFETY: `+sharedWorkspace` is the `-(id)` singleton;
-        // `-selectFile:inFileViewerRootedAtPath:` is `-(BOOL)(NSString *,
-        // NSString *)`, and its answer is handed straight back. The two
-        // strings live inside this pool.
+        // SAFETY: `+sharedWorkspace` is the `-(id)` singleton.
         autoreleasepool(|_| unsafe {
             let ws = appkit::send_id(class(c"NSWorkspace").as_id(), sel!(sharedWorkspace));
             if ws.is_null() {
@@ -3982,26 +3139,9 @@ mod macos {
         })
     }
 
-    /// How long after the first open the same URL is issued again: the `?` anchor is not
-    /// Apple-documented and not always honoured on the first open. Long enough for a cold
-    /// System Settings launch, short enough to read as one gesture.
     const SECOND_OPEN_DELAY_SECS: f64 = 1.0;
 
-    /// Open System Settings at `pane` — twice, about [`SECOND_OPEN_DELAY_SECS`] apart, the second
-    /// a delayed perform on the main run loop ([`open_in_workspace_after_delay`]) — and report how
-    /// far it got.
-    ///
-    /// The URL is a `&'static str` compiled into aterm with no untrusted bytes, reached from
-    /// the owner's presses (a button on the Security page, a digest line's capsule) and from
-    /// the Developer Tools (`App::hand_devtools_to_owner`) and Full Disk Access
-    /// (`App::hand_fda_to_owner`) hand-over lanes at a quiet moment (`devtools_helper::quiet`).
-    /// It goes to `NSWorkspace` directly rather than through the link path, so the allowlist
-    /// stays closed.
-    ///
-    /// Candidates come best first from [`privacy_settings_urls`], whose last has no anchor, so a
-    /// refused anchor still opens Privacy & Security ([`SettingsOpen::PaneRoot`]); off the main
-    /// thread nothing is attempted ([`SettingsOpen::Refused`]). Either way the caller shows
-    /// [`privacy_settings_path_words`].
+    /// Open System Settings at `pane`.
     pub(crate) fn open_privacy_settings(pane: PrivacyPane) -> SettingsOpen {
         if MainThread::new().is_none() {
             return SettingsOpen::Refused;
@@ -4011,8 +3151,6 @@ mod macos {
             if !open_in_workspace(url, false) {
                 continue;
             }
-            // The last candidate is the un-anchored pane root, and re-issuing a
-            // URL with no anchor buys nothing but a second activation.
             if i + 1 < urls.len() {
                 open_in_workspace_after_delay(url, SECOND_OPEN_DELAY_SECS);
                 return SettingsOpen::Anchored;
@@ -4022,33 +3160,16 @@ mod macos {
         SettingsOpen::Refused
     }
 
-    /// Put `window` — a panel aterm itself built, never another app's — in front
-    /// of every app's windows WITHOUT activating aterm (`-orderFrontRegardless`):
-    /// the Developer Tools helper panel beside System Settings
-    /// (`devtools_helper`), which must show while System Settings stays the
-    /// active app. `false`, and nothing shown, on a headless process or off the
-    /// main thread.
-    ///
-    /// Here and not in the panel's own module so the headless refusal this
-    /// module's pin holds every OS-UI site to covers it: a headless instance has
-    /// no glass to put a panel on, and a panel it could raise would float over
-    /// the owner's desktop with nothing behind it.
+    /// Put `window` — a panel aterm itself built, never another.
     pub(crate) fn order_front_regardless(window: Id, what: &str) -> bool {
         if super::os_ui_refused(what) || MainThread::new().is_none() || window.is_null() {
             return false;
         }
-        // SAFETY: `-orderFrontRegardless` is `-(void)` on the live `NSWindow` the
-        // caller owns, on the main thread (checked above).
+        // SAFETY: `-orderFrontRegardless` is `-(void)` on the live `NSWindow` the caller owns.
         unsafe { appkit::send_v(window, sel!(orderFrontRegardless)) };
         true
     }
 
-    /// Issue `s` through `NSWorkspace openURL:` again after `secs`.
-    /// `performSelector:withObject:afterDelay:` schedules on the calling thread's run loop and
-    /// this runs only on the main thread, so the second open runs there while the thread stays
-    /// free meanwhile: no worker, no timer to own, nothing to cancel. The perform uses the
-    /// default run-loop mode, so during a tracking loop (a drag, an open menu) the second open
-    /// lands late, when tracking ends, but is never lost.
     fn open_in_workspace_after_delay(s: &str, secs: f64) {
         if super::os_ui_refused(&format!("opening {s}")) || MainThread::new().is_none() {
             return;
@@ -4056,12 +3177,7 @@ mod macos {
         let Some(ns) = appkit::nsstring(s) else {
             return;
         };
-        // SAFETY: standard AppKit. Every `s` reaching here is one of this module's own
-        // `&'static str` URL constants, so `URLWithString:` is non-nil. `NSWorkspace` retains
-        // the receiver and the argument until the perform fires, so nothing here outlives this
-        // frame. The delayed perform invokes `openURL:` (really `BOOL`-returning) as
-        // `id`-returning; the value lands in the same return register on every target aterm
-        // builds for and is discarded.
+        // SAFETY: Standard AppKit.
         autoreleasepool(|_| unsafe {
             let url = appkit::send_id_id(class(c"NSURL").as_id(), sel!(URLWithString:), ns.id());
             let ws = appkit::send_id(class(c"NSWorkspace").as_id(), sel!(sharedWorkspace));
@@ -4087,7 +3203,6 @@ mod macos {
         use super::MenuTarget;
         use crate::appkit;
 
-        /// The registered class is what the runtime says it is.
         #[test]
         fn the_registered_class_is_what_the_runtime_reports() {
             let cls = MenuTarget::class();
@@ -4110,11 +3225,6 @@ mod macos {
             }
         }
 
-        /// The method encodings, read back from the runtime with `method_getTypeEncoding`.
-        /// `validateMenuItem:` registers `"B@:@"` on `aarch64-apple-darwin` and `"c@:@"` on
-        /// `x86_64-apple-darwin` (`@encode(BOOL)` differs), so the expectation is built from
-        /// `Bool::ENCODING`, and the literal is asserted on aarch64 so a wrong `Bool::ENCODING`
-        /// cannot make the test vacuous.
         #[test]
         fn the_runtime_reports_the_encodings_the_table_says() {
             let cls = MenuTarget::class();
@@ -4143,15 +3253,11 @@ mod tests {
         set_active_tab_is_terminal, staged_apply_label, version_menu_bar_title,
     };
 
-    /// The updater orders by build number (the display version never affects an
-    /// update comparison), so a strictly-newer staged build may share the running
-    /// build's version string, and the apply row must never be spellable as the badge.
     #[test]
     fn the_apply_row_can_never_read_as_the_version_already_running() {
         let running = crate::build_info::version_display();
         let badge = version_menu_bar_title(true);
 
-        // The colliding case: the staged build carries the same version string.
         let same = staged_apply_label("\u{2B06}\u{FE0F}", 1_785_910_394, running, None, false);
         assert!(
             same.contains("build 1785910394"),
@@ -4163,7 +3269,6 @@ mod tests {
              (badge {badge:?}, offer {same:?})"
         );
 
-        // The ordinary case is untouched: a genuinely different version is named.
         let newer = staged_apply_label("\u{2B06}\u{FE0F}", 1_785_910_394, "9.9.9", None, false);
         assert!(
             newer.contains("v9.9.9") && !newer.contains("build"),
@@ -4171,9 +3276,6 @@ mod tests {
         );
     }
 
-    /// The always-visible offer must carry the apply lane's verdict on itself:
-    /// a scheduled retry asks for nothing; a lane that stopped names the action
-    /// that resumes it; a build on hold offers no start.
     #[test]
     fn the_apply_row_admits_when_applying_has_already_been_tried() {
         use crate::update_apply_trouble::{ApplyRetry, ApplyTrouble};
@@ -4201,14 +3303,10 @@ mod tests {
         }
     }
 
-    /// The palette-only actions (`PALETTE_ONLY`): no bar item, a palette row
-    /// and an `invoke` name each.
     fn palette_only_actions() -> Vec<MenuAction> {
         super::PALETTE_ONLY.iter().map(|(_, a)| *a).collect()
     }
 
-    /// Every action the bar, the palette and the tab menu offer: the model's
-    /// items, the palette-only rows and the tab menu's own copy rows.
     fn offered_actions() -> Vec<MenuAction> {
         model_items()
             .into_iter()
@@ -4218,10 +3316,6 @@ mod tests {
             .collect()
     }
 
-    /// Every `invoke` name an agent's script may already carry, verbatim. Each
-    /// resolves (to the action it named, or the alias its row became) or answers
-    /// `ERR retired: <what to use>` — never an unknown action. Pinned by
-    /// `every_earlier_invoke_name_resolves_or_is_retired`.
     const EARLIER_INVOKE_NAMES: &[&str] = &[
         "About",
         "SoftwareUpdate",
@@ -4291,7 +3385,6 @@ mod tests {
         "TogglePresenceRim",
     ];
 
-    /// Every item of the model, submenus flattened.
     fn model_items() -> Vec<(&'static str, MenuAction, &'static str, super::MenuMods)> {
         MENU_MODEL
             .iter()
@@ -4300,11 +3393,6 @@ mod tests {
             .collect()
     }
 
-    /// The tab-context actions are a deliberate non-bar vocabulary: their invoke
-    /// names round-trip (so `invoke CopySessionId` is fenceable + dispatchable),
-    /// each classifies at its honest boundary (the copies move text onto the
-    /// pasteboard), and they must not leak into `MENU_MODEL` (the bar mirror
-    /// stays exactly the bar).
     #[test]
     fn tab_context_actions_round_trip_and_stay_out_of_the_bar() {
         for a in [MenuAction::CopySessionId, MenuAction::CopyCwd] {
@@ -4322,9 +3410,6 @@ mod tests {
         }
     }
 
-    /// Every earlier `invoke` name resolves or is retired: a name resolves to
-    /// the action its canonical spelling names, or is retired with a replacement
-    /// (`ERR retired: <what to use>`), and no name is both.
     #[test]
     fn every_earlier_invoke_name_resolves_or_is_retired() {
         for name in EARLIER_INVOKE_NAMES {
@@ -4375,20 +3460,12 @@ mod tests {
                 "{retired}: the palette's lookup says so too"
             );
         }
-        // Control: a live name is neither refused nor retired.
         assert_eq!(
             crate::control::control_media::invoke_refusal("NewTab"),
             None
         );
     }
 
-    /// The Agents menu sits where an app's own menu goes, between View and Window,
-    /// and holds its rows in order with their chords (⇧⌘J, ⌃⌘O, ⇧⌘L). Its
-    /// classification: Take Over and Hand Back are the person's own; Next
-    /// That Needs You and Set Role… are `WriteInput` (they move focus or open
-    /// an editor); every other row sees the whole Mac or fleet and is
-    /// Owner-only. The session rows need a focused session; the rest never
-    /// grey for want of one.
     #[test]
     fn the_agents_menu_holds_its_rows_in_order_with_their_classes() {
         use super::{InvokeAuthority, MenuMods};
@@ -4449,7 +3526,6 @@ mod tests {
                 "{action:?}"
             );
         }
-        // The palette-only rows: no bar item, Owner-only like the menu's reads.
         for (_, action) in super::PALETTE_ONLY {
             assert!(
                 !model_items().iter().any(|(_, a, _, _)| a == action),
@@ -4463,9 +3539,6 @@ mod tests {
         }
     }
 
-    /// The person's hold pair reads the live projection: no person hold ⇒
-    /// Take Over live, Hand Back not; the person's hold ⇒ the other way. No
-    /// session at all greys both with every other session row.
     #[test]
     fn take_over_and_hand_back_follow_the_front_person_hold() {
         set_active_tab_is_terminal(true);
@@ -4475,7 +3548,6 @@ mod tests {
         super::set_front_person_hold(true);
         assert!(!native_menu_action_enabled(MenuAction::TakeOver));
         assert!(native_menu_action_enabled(MenuAction::HandBack));
-        // Another Mac's hold: the person may take it or hand it back.
         super::set_front_remote_hold(true);
         assert!(native_menu_action_enabled(MenuAction::TakeOver));
         assert!(native_menu_action_enabled(MenuAction::HandBack));
@@ -4487,10 +3559,6 @@ mod tests {
         set_active_tab_is_terminal(true);
     }
 
-    /// The Agents rows grey from their live bits, as the palette's do: Next
-    /// That Needs You only with a local need, Overview only with a window,
-    /// Read the Fleet only in a fleet; Summarize greys with its block, and
-    /// its tool tip says why, and its title names the fleet or this Mac.
     #[test]
     fn the_agents_rows_grey_from_their_live_bits() {
         use super::{AgentsLive, native_item_tip, native_live_title, set_agents_live};
@@ -4546,8 +3614,6 @@ mod tests {
         set_agents_live(AgentsLive::UNPUBLISHED);
     }
 
-    /// View ▸ Show Needs in Windows is checkable and reads its checkmark from
-    /// the published live state.
     #[test]
     fn the_needs_row_is_checkable_from_the_live_state() {
         super::set_needs_in_windows(false);
@@ -4575,15 +3641,11 @@ mod tests {
         );
     }
 
-    /// The native bar checks and greys what the palette does (Serious Mode, Matrix Rain and
-    /// Favourite This Kitty checkmarks; Copy, Show Next / Previous Tab and the Reopen rows
-    /// enabled bits), from the same facts (`MenuLive`, published beside `PaletteLive`).
     #[test]
     fn the_native_bar_checks_and_greys_what_the_palette_does() {
         use super::{MenuLive, menu_live, native_live_title, native_menu_checked, set_menu_live};
         set_active_tab_is_terminal(true);
         let before = menu_live();
-        // Before the first publish: content-dependent Find and Save stay disabled.
         set_menu_live(MenuLive::UNPUBLISHED);
         assert_eq!(menu_live(), MenuLive::UNPUBLISHED);
         for a in [
@@ -4651,7 +3713,6 @@ mod tests {
         ] {
             assert_eq!(native_menu_checked(a), Some(true), "{a:?}");
         }
-        // ⌘W on a split tab closes the focused pane, and the row says so.
         assert_eq!(native_live_title(MenuAction::CloseTab), Some("Close Pane"));
         assert_eq!(native_live_title(MenuAction::Copy), None);
 
@@ -4674,8 +3735,6 @@ mod tests {
         set_menu_live(before);
     }
 
-    /// `chrome` on macOS prints ⌘W's live title, not the one last stamped on its `NSMenuItem`
-    /// (stamped only when the menu validates, so it can outlive a split).
     #[test]
     fn chrome_reads_the_close_row_live_not_as_last_stamped() {
         use super::{MenuLive, menu_live, native_row_title, set_menu_live};
@@ -4697,8 +3756,6 @@ mod tests {
             native_row_title(close, "Close Tab".to_string()),
             "Close Pane"
         );
-        // A row with no live title, and an item that is not ours (tag 0), keep
-        // the title they carry.
         let copy = MenuAction::Copy.tag();
         assert_eq!(native_row_title(copy, "Copy".to_string()), "Copy");
         assert_eq!(
@@ -4708,15 +3765,6 @@ mod tests {
         set_menu_live(before);
     }
 
-    /// Every command the bar and the tab menu carry decodes back from the
-    /// integer its `NSMenuItem` carries, and no two share one, so a press
-    /// dispatches exactly its own command. It also decodes from its `invoke`
-    /// name, the token the control socket's authority fence classifies
-    /// (`control::argument_escalation`): a name the fence cannot decode escalates
-    /// nothing, while the palette still dispatches it, so an Owner-only
-    /// action would run under the base `WriteInput` gate. The default tag (0)
-    /// and any unknown tag or name decode to `None`, so an untagged item never
-    /// dispatches a real command.
     #[test]
     fn every_action_decodes_from_its_tag_and_its_invoke_name() {
         let mut by_tag = std::collections::HashMap::new();
@@ -4777,8 +3825,6 @@ mod tests {
         set_active_tab_is_terminal(true);
         assert!(native_menu_action_enabled(MenuAction::ApplyUpdate));
 
-        // Negative control: the modeled buggy predicate disables the row with a native tab
-        // frontmost, violating the obligation, and cannot reach decode/dispatch.
         let buggy = aterm_spec::interp::with_buggy(&model, 1);
         let mut disabled = buggy.init_state();
         assert!(buggy.fire("StageUpdate", &mut disabled));
@@ -4788,12 +3834,6 @@ mod tests {
         assert!(buggy.successors("DecodeApplyTag", &disabled).is_empty());
     }
 
-    /// The menu tree, structurally — the `chrome` serialiser's lines over
-    /// section titles and row counts, so a label's rewording never churns it.
-    /// One `menu "<title>": …` line per section, in the standard Mac order with
-    /// the app's own Agents menu between View and Window; each line lists
-    /// exactly the rows its section offers here (the dynamic update row only
-    /// while live); submenu contents have their own lines, with no separator artifacts.
     #[test]
     fn chrome_lines_render_titled_sections() {
         let lines = menu_chrome_lines(None, false);
@@ -4895,9 +3935,6 @@ mod tests {
         }
     }
 
-    /// `chrome` offers "Check for Updates…" exactly where an updater exists
-    /// ([`aterm_update::enabled`]), and the Version menu's install row only there and only while
-    /// it is live, agreeing with `controls menu` (the palette) and `update status`.
     #[test]
     fn update_rows_are_not_offered_where_no_updater_exists() {
         let offered = |label: &str| {
@@ -4906,8 +3943,6 @@ mod tests {
                 .any(|l| l.contains(label))
         };
         let updater = aterm_update::enabled();
-        // Anchor the oracle to the hosts this was measured on, so a change to
-        // the updater's platform list cannot silently pass through here.
         if cfg!(windows) {
             assert!(!updater, "Windows has no in-app updater");
         }
@@ -4920,10 +3955,7 @@ mod tests {
         );
         assert_eq!(MenuAction::ApplyUpdate.offered_on_this_platform(), updater);
         assert_eq!(offered("Check for Updates…"), updater);
-        // Nothing staged: no install row, and never the model's placeholder.
         assert!(!offered("Install"), "{:?}", menu_chrome_lines(None, false));
-        // Nothing else is platform-gated but System State
-        // (`system_state_is_an_app_menu_row_where_its_setup_runs`).
         for section in MENU_MODEL {
             for (_, action, _, _) in section.entries.iter().flat_map(MenuEntry::items) {
                 if !matches!(
@@ -4936,11 +3968,6 @@ mod tests {
         }
     }
 
-    /// SYSTEM STATE HAS AN IN-APP WAY IN: aterm ▸ System State…, a row of the app menu
-    /// beside Settings' with no chord, offered (in the bar, the palette and the `chrome`
-    /// lines) where its macOS setup runs and nowhere else, fenced as `open app
-    /// system-state` is (`ConfigWrite`, the Settings rows' class), firing no input, and
-    /// reachable by `invoke SystemState`.
     #[test]
     fn system_state_is_an_app_menu_row_where_its_setup_runs() {
         let app = MENU_MODEL.iter().find(|s| s.title == "aterm").unwrap();
@@ -4982,8 +4009,6 @@ mod tests {
         assert!(!super::requires_terminal_tab(MenuAction::SystemState));
     }
 
-    /// The load-bearing key equivalents are transcribed correctly: a wrong chord silently
-    /// shadows a primary keybinding on macOS.
     #[test]
     fn critical_key_equivalents_are_correct() {
         let item = |action: MenuAction| {
@@ -4992,7 +4017,6 @@ mod tests {
                 .find_map(|(_, a, key, mods)| (a == action).then_some((key, mods)))
                 .unwrap_or_else(|| panic!("{action:?} not in MENU_MODEL"))
         };
-        // ⇧⌘O, not "d", which would shadow ⇧⌘D (Split Down).
         assert_eq!(
             item(MenuAction::ViewSessionInNewWindow),
             ("o", super::MenuMods::CommandShift)
@@ -5013,7 +4037,6 @@ mod tests {
             item(MenuAction::ToggleFullScreen),
             ("f", super::MenuMods::CommandControl)
         );
-        // ⌘, is the Settings tab's; the aterm.toml escape hatch carries no chord to shadow it.
         assert_eq!(
             item(MenuAction::ToggleSettings),
             (",", super::MenuMods::Command)
@@ -5024,9 +4047,6 @@ mod tests {
             ("o", super::MenuMods::Command)
         );
         assert_eq!(item(MenuAction::OpenMarkdown), ("", super::MenuMods::None));
-        // ⇧⌘L is the ledger key (`cmd+shift+l` in BUILTIN_CMD_CHORDS), shown on
-        // the Harness Log row; ⇧⌘J and ⌃⌘O are the Agents menu's own. No other
-        // row may claim any of them.
         for (action, key, mods) in [
             (MenuAction::HarnessLog, "l", super::MenuMods::CommandShift),
             (MenuAction::NextNeed, "j", super::MenuMods::CommandShift),
@@ -5042,9 +4062,6 @@ mod tests {
         }
     }
 
-    /// The signature for every kind of build, on both rungs, composed from
-    /// synthetic facts — the test binary is one dev build, so this is the only
-    /// place a release, a dirty tree and a build without git are exercised.
     #[test]
     fn version_signature_composes_every_build_kind() {
         use super::{VersionFacts, VersionRung, version_signature};
@@ -5083,8 +4100,6 @@ mod tests {
             Some("v0.101.1576* \u{00B7} DEV"),
             "the short rung keeps the dirty mark"
         );
-        // No git at build time: `build.rs` stamps `unknown` and a zero counter,
-        // and the signature says exactly that rather than inventing a hash.
         let no_git = facts(false, "0", "unknown");
         assert_eq!(
             version_signature(no_git, VersionRung::Full).as_deref(),
@@ -5096,9 +4111,6 @@ mod tests {
         );
     }
 
-    /// The macOS bar title is the full signature plus the colour glyphs only
-    /// AppKit can draw: the wrench before it on a dev build and ⬆️ after it under
-    /// attention. The strip writes its quiet form with a plain ` ↑` instead.
     #[test]
     fn the_bar_title_is_the_full_signature_plus_its_colour_glyphs() {
         use super::{
@@ -5128,9 +4140,6 @@ mod tests {
         );
     }
 
-    /// The strip's version is quiet: the version and the dev counter, no hash,
-    /// no dirty mark, no `· DEV` (every Windows build is one); the short rung is
-    /// the bare `v<maj.min>`. A release keeps its `v<version>`.
     #[test]
     fn the_strip_label_is_the_quiet_version() {
         use super::{VersionFacts, VersionRung, strip_version_text};
@@ -5159,9 +4168,6 @@ mod tests {
         assert_eq!(strip_version_text(release, VersionRung::Short), None);
     }
 
-    /// The own-rendered strip has no colour-emoji face, so its label must never
-    /// carry one: no character past the BMP, no variation selector, and neither
-    /// of the bar's colour glyphs, on either rung, with or without attention.
     #[test]
     fn the_strip_label_carries_no_colour_emoji() {
         use super::{VersionFacts, VersionRung, strip_version_label, version_signature};
@@ -5197,8 +4203,6 @@ mod tests {
         assert!(short.contains('*'), "a dirty short rung keeps `*`: {short}");
     }
 
-    /// The label opens About — and the update details only where an update is staged and this
-    /// platform has an updater to describe. It never installs.
     #[test]
     fn version_slot_click_opens_about_and_details_only_where_offered() {
         use super::{MenuAction, version_slot_click};
@@ -5224,8 +4228,6 @@ mod tests {
         }
     }
 
-    /// The title an outgoing process publishes for its successor is the
-    /// successor's plain `v<version>`, and only when it can name it.
     #[test]
     fn the_handoff_target_title_is_the_successor_s_plain_version() {
         let b = 1_790_278_596;
@@ -5248,9 +4250,6 @@ mod tests {
         assert_eq!(super::handoff_target_bar_title(b, false, None), None);
     }
 
-    /// A staged record for the running build or an older one is not offered (plain title, no
-    /// install row); a strictly newer build is, and a running build of `0` (a dev binary
-    /// without a build number) filters nothing.
     #[test]
     fn the_version_menu_never_offers_the_running_build() {
         let running = 1_790_278_596;
@@ -5282,16 +4281,12 @@ mod tests {
         assert_eq!(super::staged_for_version_menu(None, running), None);
     }
 
-    /// The menu-bar arrow tracks a staged update only, never the post-update `realized` state,
-    /// so an apply that re-execs into the staged build clears it at once.
     #[test]
     fn menu_bar_arrow_tracks_staged_not_realized() {
-        // Action-needed staged update -> arrow.
         assert!(
             super::bar_title_attention(true, false, false),
             "staged shows the arrow"
         );
-        // The post-update celebration is not a persistent bar badge.
         assert!(
             !super::bar_title_attention(false, false, true),
             "realized alone must not light the persistent bar arrow"
@@ -5300,17 +4295,14 @@ mod tests {
             !super::bar_title_attention(false, false, false),
             "quiet steady state: no arrow"
         );
-        // If a newer build stages right after an update, staged still wins.
         assert!(
             super::bar_title_attention(true, false, true),
             "staged wins over realized"
         );
-        // A build on hold: no press may start it, so no act-now arrow.
         assert!(
             !super::bar_title_attention(true, true, false),
             "a staged build on hold shows no arrow"
         );
-        // End to end: realized-only renders a plain title, no ⬆️ glyph.
         let realized_only =
             super::version_menu_bar_title(super::bar_title_attention(false, false, true));
         assert!(
@@ -5337,10 +4329,6 @@ mod tests {
         );
     }
 
-    /// A quit that reaches an update's successor before Commit is resolved: the event loop
-    /// swallows the wake (`App::drops_wake_before_commit`), so the drop cancels the generation
-    /// (AppKit already answered Cancel) and its system mark, and the next request dispatches
-    /// instead of meeting `DeferExisting` for the rest of the process's life.
     #[test]
     #[cfg(target_os = "macos")]
     fn a_dropped_candidate_terminate_frees_the_arbiter() {
@@ -5371,7 +4359,6 @@ mod tests {
             matches!(next, super::NativeTerminateDecision::Dispatch(g) if g != logout),
             "the next logout reaches the event loop: {next:?}"
         );
-        // A committed successor handles it; the drop no longer applies.
         app.incoming_handoff_pending = false;
         assert!(
             !app.drops_wake_before_commit(&crate::Wake::NativeTerminateRequested {
@@ -5402,8 +4389,6 @@ mod tests {
         assert!(!arbiter.is_current(second));
     }
 
-    /// Help's destination passes `is_safe_url`, the gate `open_url_external` trusts its callers
-    /// to have run.
     #[test]
     fn the_help_destination_passes_the_url_gate() {
         let url = super::help_url();
@@ -5413,11 +4398,6 @@ mod tests {
         );
     }
 
-    // ---- the System Settings deep link -------------------------------------------
-
-    /// Every candidate uses the dotted `x-apple.systempreferences` scheme. The hyphenated
-    /// spelling is a different string (the one the link allowlist's rejection list names), and a
-    /// one-character slip turns every deep link into a no-op.
     #[test]
     fn every_settings_deep_link_uses_the_dotted_scheme() {
         for pane in super::PrivacyPane::ALL {
@@ -5446,9 +4426,6 @@ mod tests {
         );
     }
 
-    /// The last candidate is the unanchored Privacy & Security page, the same for every pane,
-    /// so the deep link is never a dead end; only the three registered anchors ever ship
-    /// (`Privacy_DocumentsFolder` and its siblings are not anchors).
     #[test]
     fn the_last_candidate_is_the_unanchored_pane_root() {
         let fda = super::privacy_settings_urls(super::PrivacyPane::FullDiskAccess);
@@ -5483,9 +4460,6 @@ mod tests {
         }
     }
 
-    /// `is_safe_url` keeps rejecting every deep link: a pane a program can raise is a consent
-    /// surface that program controls. The deep link has its own path to `NSWorkspace`, so the
-    /// allowlist is never widened for it.
     #[test]
     fn program_output_still_cannot_open_a_settings_pane() {
         for pane in super::PrivacyPane::ALL {

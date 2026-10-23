@@ -196,6 +196,34 @@ pub(crate) fn fact_title(facts: &FooterFacts, cwd: Option<&Path>, fact: Fact) ->
             };
             (whole, "click: graph".to_owned())
         }
+        Fact::Account => {
+            let mut parts: Vec<&str> = Vec::new();
+            if let Some(sub) = facts.subscription.as_ref() {
+                if let Some(email) = sub.email.as_deref() {
+                    parts.push(email);
+                }
+                if let Some(plan) = sub.plan.as_deref() {
+                    parts.push(plan);
+                }
+                if let Some(weekly) = sub.weekly.as_deref() {
+                    parts.push(weekly);
+                }
+            }
+            if parts.is_empty()
+                && let Some(acct) = facts.account.as_deref()
+            {
+                parts.push(acct);
+            }
+            let summary = if parts.is_empty() {
+                "accounts".to_owned()
+            } else {
+                parts.join(" \u{b7} ")
+            };
+            (
+                format!("\u{2386} {summary} \u{b7} click: accounts"),
+                "click: accounts".to_owned(),
+            )
+        }
     }
 }
 
@@ -291,6 +319,7 @@ pub(crate) fn fact_spoken_of(
         Fact::Branch => "Branch",
         Fact::Context => "Context left",
         Fact::Usage => "Token traffic",
+        Fact::Account => "Account",
         Fact::TopEffort => return top_spoken(facts.top_effort.unwrap_or(false)),
     };
     if !restores.is_empty() {
@@ -341,6 +370,30 @@ pub(crate) fn fact_spoken_of(
                 "Activate for a graph over time.".to_owned(),
             )
         }
+        Fact::Account => {
+            let mut parts: Vec<&str> = Vec::new();
+            if let Some(sub) = facts.subscription.as_ref() {
+                if let Some(email) = sub.email.as_deref() {
+                    parts.push(email);
+                }
+                if let Some(plan) = sub.plan.as_deref() {
+                    parts.push(plan);
+                }
+                if let Some(weekly) = sub.weekly.as_deref() {
+                    parts.push(weekly);
+                }
+            }
+            if parts.is_empty()
+                && let Some(acct) = facts.account.as_deref()
+            {
+                parts.push(acct);
+            }
+            let words = parts.join(", ");
+            (
+                format!("{name}: {words}"),
+                "Activate for the accounts menu.".to_owned(),
+            )
+        }
         Fact::TopEffort => top_spoken(facts.top_effort.unwrap_or(false)),
     }
 }
@@ -372,9 +425,9 @@ impl App {
             self.press_top_effort(wid, session);
             return;
         }
-        // The usage is never hidden: its click opens the Traffic card, hung
-        // from `Σ` (`crate::fact_menu`).
-        if fact == Fact::Usage {
+        // The usage and account are never hidden: their click opens the
+        // Traffic card or Accounts menu (`crate::fact_menu`).
+        if matches!(fact, Fact::Usage | Fact::Account) {
             if let Some(anchor) = self.fact_anchor(wid, session, fact) {
                 self.open_fact_menu(wid, session, fact, anchor, false);
             }

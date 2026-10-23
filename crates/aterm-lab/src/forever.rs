@@ -1,285 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `forever --harness <claude|gemini|agy|muse|all> [--mode land|cruise|both|cover|cap|wall|wall-hid|wall-day|wall-climb]
-//! [--chains a,b] [--no-surfaces] [--window] [tag] [--keep]`: Autopilot Land and Cruise, LIVE, on every harness
-//! aterm supervises — the real Claude Code, Gemini CLI, agy and Muse Code TUIs
-//! under a private headless aterm with the harness ON (its defaults), against
-//! the stub, each conversation scripted turn by turn
-//! ([`crate::stub::scripted_reply`]: the custom mode `forever`, whose rules pick
-//! a turn's reply by the scenario's word in the conversation and the act of the
-//! harness it answers).
-//!
-//! A lab of its own per harness (`forever-<pid>` unless a tag is given; `all`
-//! runs the four one after another, `<tag>-<harness>`). Every scenario CHAIN
-//! ([`Chain`]) is a tab of its own, spawned in a scratch git repository of its
-//! own under the lab's project (`<proj>/<chain>`, its `main` pushed to a local
-//! bare `origin`, `origin/HEAD` naming it, then left as the chain's [`Repo`]
-//! says), its Autopilot set on the tab (`meta set autopilot`) — and for
-//! `land-e` a worker's task record (`task mark working from=ctl`) — before
-//! the agent starts there, and its first prompt carrying the chain's word. The
-//! chains run side by side, so a harness takes its longest chain's time (about
-//! 15 min: `land-a` lands at about +6 min and is watched past the ladder's
-//! next step, 8 min, after it; up to 30 before P3's fix, where an agent's
-//! first screen counted as a turn). Each scenario is judged from the instance's own records — the
-//! tab's harness journal (`<state>/drive/<sid>.journal.jsonl`), its ledger
-//! (`<sid>.jsonl`), `status` (`task=`, `needs=`, `autopilot=`,
-//! `supervisor=`), `meta` (`attention_owners=`, `attention_kinds=`,
-//! `attention=`), the task record (`task`) and the stub's request dumps —
-//! never the screen alone ([`judge`]):
-//!
-//! * LAND (`autopilot=land`):
-//!   * `land-a`: L1 a work reply with no defense: `land@v1` typed and
-//!     ledgered; L3 the land act answered with `NEEDS YOU: rotate the deploy
-//!     key` and a defense: the needs entry raised (`NEEDS` journaled, `meta`
-//!     `attention_kinds=` naming `ask:needs`, `<program> needs you: … —
-//!     carrying on`, `status needs=ask`), a nudge typed that tells the worker
-//!     its need is on the person's screen, not landed; L5 the nudge answered
-//!     with a clean defense over the clean, pushed repository: `DONE …
-//!     rule=land@v1`, `status task=landed`, the needs entry cleared, no task
-//!     record invented (`OK task -` throughout: none was given), and the
-//!     ladder over — no `WAITING` after the DONE, its last ledger row
-//!     `task-done@v1` — with nothing typed (no journal act, no ledger act, no
-//!     new harness turn in the stub's dumps) through the ladder's next step
-//!     and a minute past it.
-//!   * `land-b`: L2 the land act answered with a `Nothing left:` defense beside
-//!     a stated leftover (`The docs PR is still open.`): a nudge whose text
-//!     names the open word and not the repository, its yield read and
-//!     waited on, not landed.
-//!   * `land-c`, `land-f`, `land-g`, `land-h`, `land-i`: L4, L8, L9, L10, L11
-//!     a clean defense while the repository holds an untracked file, a
-//!     changed tracked file, a stash entry on `main`, a commit no remote
-//!     holds, a commit pushed to `origin/wip` but not on `origin/main`: a
-//!     nudge naming that leg of the repository's work in aterm's words (and
-//!     no other leg, no open word), its yield read and waited on, not landed.
-//!   * `land-d`: L6 a reply taller than the window, a `NEEDS YOU:` near its
-//!     top and `Nothing left:` at its bottom: not landed, the need raised,
-//!     the carry-on nudge typed.
-//!   * `land-e`: L7 a worker's task (the record `working`): the land act
-//!     answered with a clean defense lands it, and the record reads `done
-//!     why=landed` (journaled `TASK … done why=landed`), quiet after as L5;
-//!     the record reads nothing but `working` before it (no stall while the
-//!     worker works) and `status` no need of any kind.
-//! * CRUISE (`autopilot=cruise`), `cruise`: C1 a done claim:
-//!   `continue-done-check@v1` typed and ledgered, naming no open work and no
-//!   repository; C2 the check answered with a `Nothing left:` defense, read
-//!   (`EVENT idle … Nothing left:`) and waited on (`WAITING` of that point):
-//!   no `DONE`, the task never `landed`, and the next point continues (an
-//!   act typed after its back-off).
-//! * INSTANT (P4, `instant-land` under Land, `instant-cruise` under Cruise):
-//!   every reply sent at once — over before any read, or any sweep of the
-//!   server's verdict, sees the worker busy (the other chains' replies wait
-//!   [`REPLY_DELAY_MS`], so theirs are read run). P4L: the first reply judged
-//!   (`EVENT idle` with its words), `land@v1` typed once, and its clean
-//!   defense, answered at once, landed within the take window — `DONE`,
-//!   quiet after, no act typed twice with no point judged between. P4C: the
-//!   check's defense, answered at once, judged as its answer (read and
-//!   decided by a back-off's `WAITING`, not the take window's) and the next
-//!   point going on (an act after it, past the person's prompt's own
-//!   back-off). P4P: a person's prompt typed mid-chain while the loop waits
-//!   out that back-off ([`Chain::asks`], through the control socket: no
-//!   person's keystroke), answered at once, read within the take window and
-//!   decided there by its own back-off (the same `seq=`: never another
-//!   point's, never a `LEFT`), nothing typed into it first, and the act at
-//!   that back-off's due typed — the tab watched until it is.
-//! * OFF (`autopilot=off`, every mode), `off`: a done reply, then the
-//!   supervisor never on the tab (`supervisor=-`, no journal), nothing typed
-//!   (no ledger act, no harness-marked turn in the stub's dumps) for at
-//!   least 270 s — past a 4 min first step.
-//! * THE END PAST THE FLOOR (Land), `land-j` and `land-k`: L16, L17 the land
-//!   act's clean defense held and paced past an end's 30 s work floor
-//!   ([`long_reply_ms`]), so the landing marks the tab (`status end=<t>
-//!   end_seen=0`, its `•`, its Done for you row); at END a look sees
-//!   `land-j`'s and a press on its row `land-k`'s.
-//! * THE NEEDS MOVING (Cruise), `cruise-n`, opened first and brought in front
-//!   with `tab` once every tab is open, so its chip is the one drawn: N1 two needs, N2 a `Nothing left:` defense naming none (the
-//!   continuation's), N3 the first need again (the done check's), N4 it and
-//!   another (the next continuation's): `NEEDS … count=` and `status needs_n=`
-//!   2, `-`, 1, 2.
-//!
-//! THE WINDOW ([`surfaces`], §12.5.4; `--no-surfaces` makes its wants named
-//! skips): Settings ▸ Harness in a window of its own, then the chains' own,
-//! in front; each tab titled with its chain's name; at each look the front
-//! tab captured, `chrome` (each tab's `autopilot` line, its `toolbar-tabs`
-//! states, the `statusmenu` rows naming it, This Mac and the presence line)
-//! and the page's text read; at END a 20 s idle window with no read (`metrics`
-//! after it: no timer wake, no frame, nothing armed but `presence`), each
-//! chain brought in front with no look (`drawn=` its `face=`), then the look
-//! and the press. Every scenario's window wants ([`surfaces::WANTS`]) are
-//! composed into its verdict, and END is judged once a harness.
-//!
-//! Every chain whose replies carry no need is also its own negative control
-//! of the needs entry: a `NEEDS` line, an `ask:needs` entry or `needs=ask`
-//! there fails its scenario.
-//!
-//! EVERY CHAIN'S RECORDS are held to what no scenario's own judge asks
-//! ([`chain_faults`], the review of `b9/forever-gaps`): an act typed before
-//! the due its back-off's `WAITING … until=` named, an act typed twice with
-//! no point judged between, a point judged before the first prompt or a
-//! first point that closed other than one short turn (P3) — any of them
-//! fails every scenario of the chain. And PERSISTENCE is a verdict: where
-//! the next act was due and none came, a watch past that due and a minute
-//! more, or past five minutes with no point judged at all, is PERSISTENCE
-//! LOST, a FAIL ([`lost_after`]); UNOBSERVED only where the watch ended
-//! first.
-//!
-//! Each tab's report also names its first point and its first back-off
-//! (`first     <chain> @<sid>: …`, [`first_point_line`]) and every point
-//! record written before its first prompt ([`points_before_prompt`], P3 of
-//! `docs/measured/forever-lab-2026-10-20.md`: none expected, and the first
-//! back-off then 2 min — a verdict too, [`p3_faults`]).
-//!
-//! `--mode cover` runs the chains of what the measured pass left unobserved
-//! ([`cover`] holds their judges), each beside the negative controls its
-//! unit tests fail:
-//!
-//! * `land-q`: L12 a question in prose at the land act's yield: `land-answer@v1`
-//!   typed (Land's answer, no suffix, never a nudge, never a landing), and the
-//!   clean defense at ITS yield lands the task, quiet after as L5.
-//! * `land-p`: L13 a PERSON'S OWN EXCHANGE: the first prompt typed as a person
-//!   types it (the draft standing in the composer, then Enter):
-//!   `LEFT … rule=left-to-person@v1`, `status task=theirs`, nothing typed
-//!   (journal, ledger, the stub's dumps) for 270 s; then an orchestrator's
-//!   turn (`lab turn`'s way), judged (its reply read, its back-off decided
-//!   there) and Land's act only at that back-off's due. The person types
-//!   through the development seam `send|key as=person` (`help send`), the
-//!   window's own input seam with a person's source, since a headless lab has
-//!   no window to key: judged only where that reached the session (`status
-//!   human_ms=` a stamp after the Enter), UNOBSERVED, said so, where the seam
-//!   took the keys and no stamp followed. An aterm without the seam cannot run
-//!   the chain: one that refuses it, or one older than it that types the word
-//!   into the composer, ends the run COULD NOT RUN, naming the seam. With
-//!   `--window` the lab's instance OPENS A WINDOW (the same jail,
-//!   [`crate::lab::windowed`]) and the person types through `hwkey` instead
-//!   ([`person_keys`]): each key a real `NSEvent` in the window's own event
-//!   queue, the path a key press takes, at an idle desk, the tab raised;
-//!   judged only where `status human_seq=` moved by exactly the keys posted
-//!   ([`cover::keys_unaccounted`]), else UNOBSERVED.
-//! * `land-w`, `wrote-c`: L14 and C3, P2 LIVE — replies opening `Wrote the …`
-//!   (Muse Code's reader once read such a head as its own tool row, with no
-//!   last words): the words read, and L1, L3, L5 (Land) and C1, C2 (Cruise)
-//!   on them.
-//! * `land-t`: P5 a worker's record (`task mark working from=ctl` before the
-//!   agent starts) read `working` past its startup deadline (120 s) and half
-//!   a minute more (land@v1 answered as work: a 4 min step before the nudge
-//!   lands it), never `stalled why=startup`, no need, no "never started".
-//! * `mgr`, `worker`: L15 a worker of the harness under test, which the lab
-//!   starts with `@<mgr> spawn agent=<harness> from=<mgr> -` aimed at a
-//!   manager tab running that same harness (its launcher's agent, idle at its
-//!   composer: [`Cover::starter`]), so the manager's program and homes ride
-//!   the worker's line ([`worker_shell`] gives the worker's new shell what a
-//!   person's has: the provider's environment, and for agy and Muse Code
-//!   atpkg's managed twin of the lab's build): the spawn named that agent,
-//!   `meta worker=` it, its record `working from=<mgr>`, Land's landing (`done
-//!   why=landed`, quiet after), the manager's `await task` returning at the
-//!   landing with `state=done`, and `result` its report and defense byte for
-//!   byte, from its transcript (Claude Code) or its screen (`source=screen
-//!   program=<harness>`). On Gemini CLI the lab's folder trust is ON for the
-//!   run (the project trusted in the home's file), so the worker starts
-//!   trusted by its own trusted-folders file alone.
-//! * `cruise-o`: C4 THE OWNER'S CONTINUATION IN TWO PARAGRAPHS: a run holding
-//!   it sets the lab's `[harness] continue_text` to [`OWNER_CONTINUE`] (a
-//!   blank line, then a `Nothing left:` and a `NEEDS YOU:` line of the
-//!   owner's), and its work reply's point types it: as ONE line (the ledger's
-//!   text and what reached the agent, read from the stub's dumps), its reply
-//!   read as the agent's and the act's rows never (no need raised, no read
-//!   holding the owner's words, no `DONE`). On agy a message's blank line is
-//!   a blank row with the rows under it drawn as a reply's, which its reader
-//!   cannot tell apart (`aterm_phase::agy`).
-//!
-//! `--mode cap` runs `cap` alone (and Off) on a lab whose `[harness]` says
-//! `continue_per_hour = 1`: CAP the land act is the hour's one act, the next
-//! point is escalated naming the cap, nothing is typed for the hour after
-//! the act, and an orchestrator's turn after the hour is acted on again (the
-//! policy re-decides at a new point, never on a timer: the turn's reply
-//! read, its back-off decided there, the act at that due): about 72 min.
-//!
-//! `--mode wall` runs `wall` alone (the stub's wall meets every conversation
-//! it serves) on every harness, each drawing its OWN usage wall from the
-//! stub's answer ([`wall_claim`]): Muse Code its `◆ Usage limit reached`
-//! notice; agy, on the lab's Gemini API key, its `⚠ agent executor error: …
-//! Error 429 … You exceeded your current quota …` block with the RetryInfo's
-//! delay; Claude Code, launched on its subscriber path for the walled modes
-//! ([`launcher`]: on the lab's API key the same 429 draws only `⏺ API Error:
-//! Request rejected (429) · Rate limit exceeded`), its `You've hit your
-//! session limit · resets …` with its own `continuing automatically at …`;
-//! Gemini CLI its usage-limit dialog (`Usage limit reached for <model>.`,
-//! `Access resets at …`, `1. Keep trying` / `2. Stop`) on a Google account's
-//! spent Code Assist quota (`crate::stub::gemini::exhausted_error`). W1 the
-//! stub's usage limit raised at the first point, so Land's act meets it;
-//! nothing typed into the wall, no landing while it stands; at its reset (and
-//! the program's grace, [`wall_grace_ms`]) the harness goes on (its own act,
-//! or at Gemini CLI's dialog its `Keep trying` pressed past the reset the
-//! dialog names, `limit-retry@v1`: the program's own retry landing it shows
-//! nothing of the harness, UNOBSERVED) — or the program by itself (Claude Code's own continuation,
-//! read in the stub's requests: [`Cover::went_on_ms`]), and then nothing is
-//! typed on top of it — and the clean defense lands the task, quiet after as
-//! L5; nothing going on within [`WALL_LOST_MS`] after the reset is
-//! persistence lost. A run takes about 6 to 12 min. The notice stands on the
-//! screen the whole wait there: every point W1 reads draws it.
-//!
-//! `--mode wall-hid` runs `hid-wall` alone the same way, on each harness
-//! ([`hide_of`] says how the lab takes its notice away): W2 the REMEMBERED
-//! WALL. W1's wall, set to reset further ahead ([`WALL_HID_AHEAD_MS`]), and
-//! once the loop waits on its reset the notice is taken off the screen
-//! ([`hide_step`]): Muse Code's `/rules` (three indented rows under the turn's
-//! end), agy's `/title` (one `⎿  Error: No title command configured …` row
-//! under its `> /title`), Claude Code's `/rename forever-w2` (one `⎿  Session
-//! renamed to: …` row, once Esc has cancelled its countdown, whose footer
-//! banner stands under every local command's rows while it is armed:
-//! [`CLAUDE_CANCEL`]), entered again and again — a local command sends no
-//! request — until the notice has scrolled out of sight, the wait still
-//! standing; Gemini CLI's dialog answered `2. Stop` (Down, then
-//! Enter once the focus stands on it), as a person at the keyboard would
-//! answer it: the turn ends on `✕ [API Error: An unknown error occurred.]`,
-//! which no longer says it was the quota, and no request is sent. W1's judge
-//! holds, and the loop must read a screen without the notice before the reset
-//! (its reader finding no wall there; after Gemini CLI's Stop, no wall naming
-//! the limit), type nothing into it, and type the resume past the reset at a
-//! screen without the notice ([`cover::judge_wall_hidden`]). A run takes
-//! about 15 min. (`/status` cards hide Muse Code's notice too, and since
-//! `fix/muse-wall-reader` a screen of cards alone is a session at rest to
-//! its reader: W2 passed so with this command `/status`, once,
-//! `docs/measured/forever-lab-2026-10-20.md`. The lab keeps `/rules`, whose
-//! rows under the notice are what its reader must leave out of the wall's
-//! message. agy's `/help`, `/context`, `/skills` and `/agents` open panels
-//! only Esc closes.)
-//!
-//! A walled run's Gemini CLI runs in a zone not the machine's
-//! ([`foreign_tz`]: `TZ=Asia/Kolkata`), so the reset its dialog names (`Access
-//! resets at 10:13 PM GMT+5:30.`) is placed only by reading its zone.
-//!
-//! `--mode wall-day` runs `day-wall` alone, on Gemini CLI only (the others
-//! draw no such dialog, [`wall_out_of_reach`]): W1 on the usage-limit dialog
-//! a key's spent PER-DAY quota draws ([`Chain::wall_claim_on`]: the stub's
-//! [`crate::stub::gemini::quota_error`]), which names no reset. The loop
-//! tells a person (its badge, ledgered `escalated` beside the ladder's own
-//! `limit-retry@v1` wait: [`cover`]'s `ladder_badge`, NEEDS YOU and never a
-//! stall) and presses `Keep trying` at the entitlement ladder's first rung,
-//! 30 min from the dialog's first read; the lab lifts the wall at 25 min, so
-//! that press gets through and the defense lands the task. W1's deadline
-//! counts from the later of the lift and the ladder's due. A run takes about
-//! 40 min.
-//!
-//! `--mode wall-climb` runs `climb-wall` alone, on Gemini CLI only: the same
-//! per-day dialog, its quota standing past the ladder's first rung (the lab
-//! lifts it at 45 min). The first `Keep trying` (30 min) comes in the wall
-//! and the dialog is drawn again; the loop's NEEDS YOU stands through it, its
-//! next try waits the ladder's next rung (2 h from the first), climbed, and
-//! that try gets through: NEEDS YOU comes down and the defense lands the task
-//! ([`cover`]'s `ladder_climbed`, `ladder_cleared`). A run takes about 2 h
-//! 45 min: no seam scales the ladder.
-//!
-//! The report names each observation with its time. A scenario a failed
-//! earlier step left unreachable is UNOBSERVED, never a pass. Exit 0 every
-//! scenario passed, 1 one failed or went unobserved, 2 usage, 3 could not run.
-//! NOT OBSERVED by this lane: walls past each harness's usage wall (the
-//! account moves, the model buckets, the relaunches, Claude Code's limit
-//! resets), the back-off past its fourth step (no
-//! seam scales the ladder: a host's turn-end timing is
-//! `TurnEndTiming::default()`, and the lab clock's sleep ends a pause rather
-//! than scaling it), `task=spent` (no such face: `TaskFace` is open, landed,
-//! theirs).
+//! `forever --harness <claude|gemini|agy|muse|all> [--mode land|cruise|both|cover|cap|wall|wall-hid|wall-day|wall-climb] [--chains a,b] [--no-surfaces] [--window] [tag] [--keep]`: Autopilot Land and Cruise, LIVE, on every harness aterm supervises — the real Claude Code, Gemini CLI, agy and Muse Code TUIs under a private headless aterm with the harness ON (its defaults), against the stub, each conversation scripted turn by turn ([`crate::stub::scripted_reply`]: the custom mode `forever`, whose rules pick a turn's reply by the scenario's word in the conversation and the act of the harness it answers).
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -299,71 +21,41 @@ use crate::{Fail, LAB, Res};
 /// The custom stub mode the lab's conversations are scripted in.
 pub const MODE: &str = "forever";
 
-/// How long a PACED chain's reply waits before its first byte: the agent's
-/// busy row stands that long, so its loop reads the turn run — the busy path,
-/// which every chain but the instant ones walks. The instant chains
-/// ([`Chain::instant`]) answer at once, over before any read sees the worker
-/// busy, and hold the loop to judging such a turn as well (P4; before its
-/// fix, measured 2026-10-20, such a turn went unjudged — Gemini CLI 0.46.0's
-/// first reply, Claude Code 2.1.304's person's prompt — or an act's answer
-/// was judged only at its take window's end, as an act never taken — agy
-/// 1.4.0's and Muse Code 1.4.10's land act and done check).
 const REPLY_DELAY_MS: i64 = 3000;
-// a paced reply's busy row outlasts many of the server's verdict sweeps
-// (four a second) and the loop's reads: its turn is read run
 const _: () = assert!(REPLY_DELAY_MS >= 2000);
 
-/// The pause between a reply's deltas, in seconds.
 const REPLY_PACE_S: f64 = 0.02;
 
-/// A plain report of progress: no done claim, no defense, no question. It
-/// opens with none of Muse Code's tool-row heads (`Ran `, `Wrote `,
-/// `Edited `): Muse Code's reader reads a reply that does as the binary's
-/// own row, with no last words (measured 2026-10-20, 1.4.10-R6427.1: `Wrote
-/// the parser module …` journaled `EVENT idle … -`).
+/// A plain report of progress: no done claim, no defense, no question.
 pub const WORK: &str = "Implemented the parser module and its unit tests in this turn.";
 
 /// A done claim (`says_done`), with no defense.
 pub const DONE_CLAIM: &str = "Merged the parser and pushed it to origin/main. All done.";
 
-/// A defense's head (`turn_end`'s `Nothing left:` line).
 const DEFENSE_HEAD: &str = "Nothing left:";
 
 /// A clean defense: a `Nothing left:` line, no need, no open work.
 pub const CLEAN: &str = "Nothing left: the parser is committed and pushed to origin/main.";
 
-/// The words a person's prompt mid-chain carries ([`Chain::asks`]), which no
-/// act of the harness holds. No `?`: Gemini CLI 0.46.0 takes a typed `?` as
-/// its shortcuts key, so the prompt stood without it and the composer never
-/// read back what was typed (measured: p4c-gemini, 2026-10-20).
 const ASK_KEY: &str = "a person asks: what stands now";
 
-/// The reply to it: no done claim, no defense, no question, opening with none
-/// of Muse Code's tool-row heads.
+/// The reply to it: no done claim, no defense, no question, opening with none of Muse Code's tool-row heads.
 pub const ASK_REPLY: &str = "Here is where it stands: the parser module is written and tested.";
 
 /// The need L3 and L6 name.
 pub const NEED: &str = "rotate the deploy key";
 
-/// N1–N4's needs (`cruise-n`), each under the 64 cells the needs entry's
-/// writer keeps of a need, so every surface can read it whole.
+/// N1–N4's needs (`cruise-n`), each under the 64 cells the needs entry's writer keeps of a need, so every surface can read it whole.
 pub const NEED_A: &str = "grant Screen Recording to com.aterm.aterm in System Settings";
 /// …the second of N1's.
 pub const NEED_B: &str = "the release credential to sign 0.48.0";
 /// …N4's other.
 pub const NEED_C: &str = "a second reviewer for the parser's error paths";
-/// The heads of N1's, N3's and N4's replies: plain reports of progress
-/// (no done claim, no defense, no question, no tool row's head).
 const N1_HEAD: &str = "Implemented the parser module and its unit tests in this turn.";
 const N3_HEAD: &str = "Reviewed the parser module again in this turn.";
 const N4_HEAD: &str = "Hardened the parser's error paths in this turn.";
 
-/// L16's and L17's land replies: held this long before their first byte,
-/// then paced [`LONG_PACE_S`] before each delta, so the agent is busy past an
-/// end's work floor ([`surfaces::END_WORK_FLOOR_MS`], [`long_reply_ms`]) and
-/// the stream never stands silent long enough for a client's read timeout.
 const LONG_DELAY_MS: i64 = 10_000;
-/// …the pause before each delta of one (a few words, [`crate::stub::split_deltas`]).
 const LONG_PACE_MS: i64 = 7_000;
 #[expect(
     clippy::cast_precision_loss,
@@ -371,145 +63,73 @@ const LONG_PACE_MS: i64 = 7_000;
 )]
 const LONG_PACE_S: f64 = LONG_PACE_MS as f64 / 1000.0;
 
-/// How long a long reply of `text` keeps its agent busy at the least: its
-/// hold, and its pace before each of its deltas ([`crate::stub::split_deltas`]).
+/// How long a long reply of `text` keeps its agent busy at the least: its hold, and its pace before each of its deltas ([`crate::stub::split_deltas`]).
 #[must_use]
 pub fn long_reply_ms(text: &str) -> i64 {
     let words = i64::try_from(crate::stub::split_deltas(text).len()).unwrap_or(0);
     LONG_DELAY_MS + words * LONG_PACE_MS
 }
 
-/// The words a land act opens with (`turn_end::LAND`).
 const LAND_KEY: &str = "Autopilot is Land:";
-/// …a land nudge (`turn_end::LAND_NUDGE`).
 const NUDGE_KEY: &str = "Still landing:";
-/// …Cruise's done check (`turn_end::DONE_CHECK`).
 const CHECK_KEY: &str = "done is never the end";
-/// …Cruise's continuation (`config::CONTINUE_TEXT`).
 const CONTINUE_KEY: &str = "Autopilot is Cruise: keep going";
 
-/// The open-work suffix's words (`turn_end::open_work_suffix`).
 const OPEN_SUFFIX: &str = "Your report still names open work";
-/// The repository suffix's words (`turn_end::repo_work_suffix`).
 const REPO_SUFFIX: &str = "Your repository still holds work";
 
-/// How the needs entry's text ends (`escalate::needs_attention_text`).
 const CARRYING_ON: &str = "— carrying on";
 
-/// The least a landing is watched for after it (L5, L7).
 const QUIET_AFTER_LANDED_MIN_MS: i64 = 90_000;
-/// How far past the ladder's next step a landing is watched ([`quiet_after_landed_ms`]).
 const PAST_NEXT_STEP_MS: i64 = 60_000;
-/// How long after its done reply nothing may be typed under Off: past the
-/// 4 min step a first point takes where the agent's fresh screen counted as
-/// a turn before it (P3), and half a minute more.
 const QUIET_UNDER_OFF_MS: i64 = 270_000;
-/// The hang detector: how long a chain may take to reach what it waits for.
 const CHAIN_LIMIT_MS: i64 = 16 * 60 * 1000;
-/// `cruise-n`'s: N4's reply comes after the 2, 4 and 8 min back-offs.
 const CRUISE_N_LIMIT_MS: i64 = 20 * 60 * 1000;
-/// `day-wall`'s: the land act at about 2 min, the dialog's ladder's first
-/// rung 30 min after it, and the landing after that press.
 const WALL_DAY_LIMIT_MS: i64 = 45 * 60 * 1000;
-/// `climb-wall`'s: the land act at about 2 min, the ladder's first rung 30
-/// min after it (in the wall), its second 2 h after that try, and the
-/// landing after that press.
 const WALL_CLIMB_LIMIT_MS: i64 = 3 * 60 * 60 * 1000;
-/// How near the DONE a ledger row is the DONE's own point (its `point@v1` and
-/// `task-done@v1` rows; measured 0–22 ms apart).
 const AT_DONE_MS: i64 = 500;
 
-/// How far before the due its back-off named an act may come and still be
-/// at that due (F10 of the review of `b9/forever-gaps`): the journal cuts
-/// `until=` to its second, and an act at the due is measured 53 ms to 1.5 s
-/// after the stamp (332 acts over the review's runs).
 const DUE_SLACK_MS: i64 = 2_000;
 
-/// How long past the due its back-off named the next act may stay untyped
-/// before the session counts as no longer continued: PERSISTENCE LOST, a
-/// FAIL (F9 of the review of `b9/forever-gaps`; every act measured came
-/// within 1.5 s of its due).
 const PERSISTENCE_GRACE_MS: i64 = 60_000;
 
-/// How long after a turn (an act, a prompt, an orchestrator's turn) the loop
-/// may go without judging a point there — no back-off, no `DONE`, no `LEFT`
-/// journaled — before the session counts as no longer continued: the take
-/// window (30 s) judges an act whose turn nothing showed, so a point comes
-/// well inside this.
 const UNJUDGED_MS: i64 = 300_000;
 
-/// The words the work reply ([`WORK`]) is read by.
 const WORK_KEY: &str = "Implemented the parser";
 
-/// The words the open defense ([`open_defense`]) is read by: its last line.
 const OPEN_KEY: &str = "The docs PR is still open";
 
-/// L12's question in prose (`classify_said`: a question, no choice, no
-/// destructive word; no done claim).
+/// L12's question in prose (`classify_said`: a question, no choice, no destructive word; no done claim).
 pub const QUESTION: &str = "Should the parser also accept tab-indented input?";
-/// The words of it its yield must read.
 const QUESTION_KEY: &str = "tab-indented input";
-/// The words Land's answer opens with (`turn_end::LAND_ANSWER`).
 const ANSWER_KEY: &str = "Nobody is here to choose:";
-/// The head every answer of the harness's opens with (`LAND_ANSWER`,
-/// `REVERSIBLE_ANSWER`, `answer_text`): unmarked, they are the harness's
-/// turns all the same ([`harness_said`]).
 const ANSWER_HEAD: &str = "Nobody is here to ";
 
-/// L13's first prompt: a person's question, with no `?` in it (Gemini CLI
-/// reads a `?` typed into its composer as its shortcuts key: the panel opens
-/// and the draft never holds it).
 const PERSON_ASKS: &str = "tell me what this repository holds so far";
 /// Its reply: a plain answer.
 pub const PERSON_REPLY: &str = "The repository holds a README and nothing else yet.";
-/// The orchestrator's turn after the person's exchange (L13).
 const ORCHESTRATED: &str = "now write the parser for this repository and land it";
-/// The words its reply is picked by.
 const ORCHESTRATED_KEY: &str = "now write the parser";
-/// How long a person's draft stands in the composer before their Enter, as a
-/// person's would: the loop reads it standing (`draft_seen`), though a draft
-/// is no hand once it is sent: the turn is a person's only by their window
-/// gesture's stamp (`status human_ms=`, [`Cover::person_stamp`]).
 const PERSON_STAND_MS: u64 = 8_000;
-/// The hang detector of the wait for the draft a person's keys type
-/// ([`person_keys`]): something that must happen, so a minute, never a
-/// latency budget.
 const DRAFT_HANG: Duration = Duration::from_secs(60);
-/// How long after the person's Enter the orchestrator's turn is typed: past
-/// [`QUIET_UNDER_OFF_MS`], the quiet L13 needs.
 const EXCHANGE_WATCH_MS: i64 = QUIET_UNDER_OFF_MS + 30_000;
 
-/// P2's replies, each opening `Wrote ` (Muse Code's tool-row head) with a
-/// plain word after it: L14's work report, its need and defense, its clean
-/// defense; C3's done claim and its defense.
+/// P2's replies, each opening `Wrote ` (Muse Code's tool-row head) with a plain word after it: L14's work report, its need and defense, its clean defense; C3's done claim and its defense.
 pub const W_WORK: &str = "Wrote the parser module and its unit tests in this turn.";
 pub const W_NEEDS: &str = "Wrote the docs for the parser too.\nNEEDS YOU: rotate the deploy key\nNothing left: the parser is committed and pushed to origin/main.";
 pub const W_DEFENSE: &str = "Wrote the last commit to origin/main.\nNothing left: the parser is committed and pushed to origin/main.";
 pub const W_DONE: &str = "Wrote the parser and pushed it to origin/main. All done.";
 pub const W_CHECKED: &str = "Wrote the last checks for the parser.\nNothing left: the parser is committed and pushed to origin/main.";
-/// The heads of L14's and C3's first replies its yields must read.
 const W_WORK_KEY: &str = "Wrote the parser module";
 const W_DONE_KEY: &str = "Wrote the parser and pushed";
 
-/// C4: THE OWNER'S OWN CONTINUATION, IN TWO PARAGRAPHS (`[harness]
-/// continue_text`, set on the lab of a run holding `cruise-o`:
-/// [`owner_keys`]): a blank line, then a `Nothing left:` line and a `NEEDS
-/// YOU:` line of its own, every line a head agy's reader would take where a
-/// blank line in a message cut it (agy draws the rows under it two columns
-/// in, as a reply's: `aterm_phase::agy`'s header). The control wire refuses a
-/// line break in a typed text, so the harness types it as one line
-/// (`turn_end_loop::one_turn`); unfolded it was never typed at all.
+/// C4: THE OWNER'S OWN CONTINUATION, IN TWO PARAGRAPHS (`[harness] continue_text`, set on the lab of a run holding `cruise-o`: [`owner_keys`]): a blank line, then a `Nothing left:` line and a `NEEDS YOU:` line of its own, every line a head agy's reader would take where a blank line in a message cut it (agy draws the rows under it two columns in, as a reply's: `aterm_phase::agy`'s header).
 pub const OWNER_CONTINUE: &str = "Keep going on the owner's terms: finish the parser, verify it and land it.\n\nNothing left: is a line you write only once everything is on remote main.\nNEEDS YOU: lines are for credentials only.";
-/// The owner's first paragraph's words, by which the stub's rule knows the
-/// continuation ([`Chain::rules`]) and the judge its typed text.
 const OWNER_KEY: &str = "on the owner's terms";
-/// The owner's last line's words: in the typed text, never in the agent's.
 const OWNER_TAIL: &str = "lines are for credentials only";
-/// The done claim's head its reply's read must hold ([`DONE_CLAIM`]).
 const DONE_CLAIM_KEY: &str = "Merged the parser";
 
-/// The `[harness]` line that sets [`OWNER_CONTINUE`] as the lab's
-/// `continue_text`: a TOML basic string, its line breaks escaped.
+/// The `[harness]` line that sets [`OWNER_CONTINUE`] as the lab's `continue_text`: a TOML basic string, its line breaks escaped.
 #[must_use]
 pub fn owner_keys() -> String {
     let mut q = String::from("continue_text = \"");
@@ -525,11 +145,8 @@ pub fn owner_keys() -> String {
     q
 }
 
-/// The startup deadline of a worker's record (`harness_host::STARTUP_DEADLINE`,
-/// the crate's own): a record `working` as its starter left it whose agent
-/// shows no composer by then is marked `stalled why=startup`.
+/// The startup deadline of a worker's record (`harness_host::STARTUP_DEADLINE`, the crate's own): a record `working` as its starter left it whose agent shows no composer by then is marked `stalled why=startup`.
 pub const STARTUP_DEADLINE_MS: i64 = 120_000;
-/// How far past it P5 must read the record `working`.
 const PAST_DEADLINE_MS: i64 = 30_000;
 
 /// The cap `--mode cap` sets (`[harness] continue_per_hour`).
@@ -544,35 +161,17 @@ pub fn cap_reason() -> String {
 pub fn cap_window_ms() -> i64 {
     i64::try_from(turn_end::TurnEndTiming::default().window.as_millis()).unwrap_or(i64::MAX)
 }
-/// How long after the window frees the orchestrator's turn is typed (CAP).
 const PAST_WINDOW_MS: i64 = 30_000;
-/// CAP's turn after the hour.
 const RESUMED: &str = "carry on with the parser and land it";
-/// The words its reply is picked by.
 const RESUMED_KEY: &str = "carry on with the parser";
-/// CAP's hang detector: the hour, the turn, the ladder's step after it, and
-/// the landing.
 const CAP_LIMIT_MS: i64 = 95 * 60 * 1000;
 
-/// W1's usage window: a five-hour one (Muse Code draws its wall from the
-/// stub's `usage_limit_reached` body, `limit_window_minutes: 300`; Claude
-/// Code reads it off `anthropic-ratelimit-unified-representative-claim`).
 const WALL_CLAIM: &str = "five_hour";
-/// How far ahead of its raising the wall resets, at least: past the land
-/// act's 2 min step, so the act meets it, and a minute or two of wall after.
 const WALL_AHEAD_MS: i64 = 240_000;
-/// How long before its reset the lab gives the stub its scripted mode back:
-/// a request in between is answered by the script, which a resume typed
-/// before the reset would show (W1 fails an act before the reset).
 const WALL_LIFT_EARLY_MS: i64 = 3_000;
-/// How long after the reset and its grace ([`wall_grace_ms`]) W1 waits for
-/// anything to go on before it calls the persistence lost.
 const WALL_LOST_MS: i64 = 5 * 60_000;
 
-/// The grace past a reset the harness waits on `program` (the harness's word,
-/// [`Harness::name`]) before it goes on (`TurnEndTiming::grace_for`): 60 s
-/// for a program with no auto-continue (Muse Code, agy, Gemini CLI), 150 s for
-/// Claude Code, whose own continue comes 30 to 90 s past the reset.
+/// The grace past a reset the harness waits on `program` (the harness's word, [`Harness::name`]) before it goes on (`TurnEndTiming::grace_for`): 60 s for a program with no auto-continue (Muse Code, agy, Gemini CLI), 150 s for Claude Code, whose own continue comes 30 to 90 s past the reset.
 #[must_use]
 pub fn wall_grace_ms(program: &str) -> i64 {
     use aterm_phase::Program;
@@ -586,13 +185,7 @@ pub fn wall_grace_ms(program: &str) -> i64 {
     i64::try_from(turn_end::TurnEndTiming::default().grace_for(p).as_millis()).unwrap_or(i64::MAX)
 }
 
-/// The claim the stub's wall is raised with on harness `h` ([`wall_step`]):
-/// a five-hour window, which Claude Code reads off the unified-limit headers
-/// and Muse Code off the `usage_limit_reached` body; on agy's Gemini API key
-/// the claim names nothing and the stub answers the key's spent per-day
-/// quota; Gemini CLI gets a Google account's spent usage limit
-/// ([`crate::stub::gemini::ACCOUNT_CLAIM`]), the 429 on which its usage-limit
-/// dialog names the reset.
+/// The claim the stub's wall is raised with on harness `h` ([`wall_step`]): a five-hour window, which Claude Code reads off the unified-limit headers and Muse Code off the `usage_limit_reached` body; on agy's Gemini API key the claim names nothing and the stub answers the key's spent per-day quota; Gemini CLI gets a Google account's spent usage limit ([`crate::stub::gemini::ACCOUNT_CLAIM`]), the 429 on which its usage-limit dialog names the reset.
 #[must_use]
 pub fn wall_claim(h: Harness) -> &'static str {
     match h {
@@ -601,189 +194,84 @@ pub fn wall_claim(h: Harness) -> &'static str {
     }
 }
 
-/// The unix second a wall raised at `now` (ms) resets at: the first whole
-/// minute at least `ahead` ms on (W1's [`WALL_AHEAD_MS`], W2's further,
-/// [`Chain::wall_ahead_ms`]). Muse Code names the reset to the minute, `wait
-/// for usage to reset at 1:06 PM`: on a whole minute its words and the stub's
-/// `resets_at` agree.
+/// The unix second a wall raised at `now` (ms) resets at: the first whole minute at least `ahead` ms on (W1's [`WALL_AHEAD_MS`], W2's further, [`Chain::wall_ahead_ms`]).
 #[must_use]
 pub fn reset_s_ahead(now: i64, ahead: i64) -> i64 {
     (now + ahead + 59_999) / 60_000 * 60
 }
 
-/// W2's wall resets further ahead than W1's: the land act meets it about two
-/// minutes on, the take window ends half a minute after, the notice is
-/// scrolled away then, and it is out of sight at least [`HIDE_BEFORE_RESET_MS`]
-/// before the reset.
 const WALL_HID_AHEAD_MS: i64 = 420_000;
-/// The per-day quota's wall lifts this far after its raising: before the
-/// ladder's first rung (`TurnEndTiming::entitlement_backoff`'s 30 min, from
-/// the dialog's first read just after the land act), so the `Keep trying`
-/// pressed there gets through.
 const WALL_DAY_AHEAD_MS: i64 = 25 * 60 * 1000;
-/// The climbing quota's wall lifts this far after its raising: past the
-/// ladder's first rung (30 min from the dialog's first read just after the
-/// land act), so that try comes in the wall and the dialog is drawn again,
-/// and long before its second (2 h after that try), which gets through.
 const WALL_CLIMB_AHEAD_MS: i64 = 45 * 60 * 1000;
-/// The latest the notice may leave the screen: this long before the reset, so
-/// the loop reads and decides the screen without it while the wait stands. A
-/// hide that would come later is given up (W2 UNOBSERVED).
+/// The latest the notice may leave the screen: this long before the reset, so the loop reads and decides the screen without it while the wait stands.
 pub const HIDE_BEFORE_RESET_MS: i64 = 120_000;
-/// How many times W2 enters the hiding command ([`Hide::command`]) at most to
-/// scroll the notice out of sight: on a 50-row tab ten `/rules` took it off
-/// Muse Code's screen (measured on 1.4.10, 2026-10-21; its reader read the
-/// wall no more after eight), sixteen `/title` off agy's (two rows each,
-/// measured on 1.4.0, 2026-10-21). The deadline before the reset
-/// ([`HIDE_BEFORE_RESET_MS`]) bounds them too.
 const HIDE_TRIES: usize = 32;
-/// The local command whose output scrolls the notice away: Muse Code prints
-/// `  Rules loaded this session (in precedence order):`, `  user: none`,
-/// `  project: none` under the turn's end and sends no request (measured on
-/// 1.4.10, 2026-10-21). Its menu draws its argument hint after it, `❯ /rules
-/// [import]` ([`menu_offers`]).
+/// The local command whose output scrolls the notice away: Muse Code prints `  Rules loaded this session (in precedence order):`, `  user: none`, `  project: none` under the turn's end and sends no request (measured on 1.4.10, 2026-10-21).
 pub const HIDE_COMMAND: &str = "/rules";
-/// The words of Muse Code's usage wall (`◆ Usage limit reached · /upgrade (…) …`):
-/// a screen holding none of them has lost the notice.
+/// The words of Muse Code's usage wall (`◆ Usage limit reached · /upgrade (…) …`): a screen holding none of them has lost the notice.
 pub const WALL_WORDS: &str = "Usage limit reached";
-/// agy's local command whose output scrolls the notice away: with no `title`
-/// block in its settings (the lab's), `/title` prints `  ⎿  Error: No title
-/// command configured in settings.json. Please add a "title" block.` under
-/// its own `> /title` and sends no request, one Enter, no panel (measured on
-/// 1.4.0, 2026-10-21: `/help`, `/context`, `/skills` and `/agents` each open a
-/// panel that only Esc closes; the stub logged no request for any of them).
-/// The menu's focused row reads `> /title  Toggle custom terminal window
-/// title` ([`menu_offers`]).
+/// agy's local command whose output scrolls the notice away: with no `title` block in its settings (the lab's), `/title` prints `  ⎿  Error: No title command configured in settings.json.`
 pub const AGY_HIDE_COMMAND: &str = "/title";
-/// The words of agy's quota wall: the Gemini API's message in its `⚠ agent
-/// executor error: …` block, and the block's last row (`Error ID: <id>`),
-/// which leaves the screen last as the rows above it scroll away.
+/// The words of agy's quota wall: the Gemini API's message in its `⚠ agent executor error: …` block, and the block's last row (`Error ID: <id>`), which leaves the screen last as the rows above it scroll away.
 pub const AGY_WALL_WORDS: [&str; 2] = ["exceeded your current quota", "Error ID: "];
-/// The option of Gemini CLI's usage-limit dialog that takes it away: `2.
-/// Stop` ends the turn on `✕ [API Error: An unknown error occurred.]` and
-/// `ℹ This request failed. …`, sends no request, and gives the composer back
-/// (measured on 0.46.0, 2026-10-16: `gemini_captures`' `wall-429-stopped`,
-/// answered with Down and Enter). The dialog draws its focus as `● ` before
-/// the focused option (`● 1. Keep trying` before any key).
+/// The option of Gemini CLI's usage-limit dialog that takes it away: `2.`
 pub const GEMINI_HIDE_OPTION: &str = "2. Stop";
-/// The words of Gemini CLI's usage-limit dialog: its title, and the reset
-/// row a Google account's spent quota draws under it.
+/// The words of Gemini CLI's usage-limit dialog: its title, and the reset row a Google account's spent quota draws under it.
 pub const GEMINI_WALL_WORDS: [&str; 2] = ["Usage limit reached", "Access resets at"];
-/// Claude Code's local command whose output scrolls the notice away once its
-/// countdown is cancelled ([`CLAUDE_CANCEL`]): `/rename <name>` prints `  ⎿
-/// Session renamed to: <name>` under its own `❯ /rename <name>` row and sends
-/// no request; the composer's top rule carries the name from then on
-/// (`──── <name> ─`), and with an argument typed no command menu is drawn
-/// (measured on 2.1.307, 2026-10-21, the stub's five-hour limit standing:
-/// twelve of them took the notice off a 50-row tab; the stub read no request).
+/// Claude Code's local command whose output scrolls the notice away once its countdown is cancelled ([`CLAUDE_CANCEL`]): `/rename <name>` prints `  ⎿ Session renamed to: <name>` under its own `❯ /rename <name>` row and sends no request; the composer's top rule carries the name from then on (`──── <name> ─`), and with an argument typed no command menu is drawn (measured on 2.1.307, 2026-10-21, the stub's five-hour limit standing: twelve of them took the notice off a 50-row tab; the stub read no request).
 pub const CLAUDE_HIDE_COMMAND: &str = "/rename forever-w2";
-/// The words of Claude Code's usage limit: the turn's `⎿  You've hit your
-/// session limit · resets …`, its `⏺ Usage limit reached · continuing
-/// automatically at …` row, and the footer's `⚠ Usage limit reached · limit
-/// resets …` banner.
+/// The words of Claude Code's usage limit: the turn's `⎿  You've hit your session limit · resets …`, its `⏺ Usage limit reached · continuing automatically at …` row, and the footer's `⚠ Usage limit reached · limit resets …` banner.
 pub const CLAUDE_WALL_WORDS: [&str; 4] = [
     "session limit",
     "Usage limit",
     "usage limit",
     "limit resets",
 ];
-/// Claude Code's countdown, cancelled before the notice can be scrolled away
-/// ([`Hide::cancel`]): while it is armed its footer draws `⚠ Usage limit
-/// reached · limit resets …` and `Continuing automatically at … · esc to
-/// cancel` under every local command's rows; Esc cancels it — `⏺ Automatic
-/// continue cancelled · /rate-limit-options to re-arm` — and the banner leaves
-/// the footer (measured on 2.1.307, 2026-10-21). Claude Code then goes on by
-/// itself no more: past the reset the harness must.
+/// Claude Code's countdown, cancelled before the notice can be scrolled away ([`Hide::cancel`]): while it is armed its footer draws `⚠ Usage limit reached · limit resets …` and `Continuing automatically at … · esc to cancel` under every local command's rows; Esc cancels it — `⏺ Automatic continue cancelled · /rate-limit-options to re-arm` — and the banner leaves the footer (measured on 2.1.307, 2026-10-21).
 pub const CLAUDE_CANCEL: Cancel = Cancel {
     key: "escape",
     armed: "esc to cancel",
     cancelled: "Automatic continue cancelled",
 };
 
-/// THE RESIDUALS, LIVE (`--mode resid`, `--mode ladder`): what the review's
-/// fix pass and `b9/resid3` left to their unit tests.
-///
-/// `same-words`' first prompt carries this token, holding no space, so its
-/// opener — one row of the window's 144 columns, two of [`RESIZED`]'s — re-wraps
-/// at the narrower width (F2: a long word split elsewhere hashed as another
-/// opener). The prompt still fits one composer row, as the lab reads a
-/// composer's draft by its first row.
+/// THE RESIDUALS, LIVE (`--mode resid`, `--mode ladder`): what the review's fix pass and `b9/resid3` left to their unit tests.
 pub const LONG_TOKEN: &str = "lab/parser-module-parser-module-parser.rs";
-/// The size `same-words`' tab is resized to once its first point is decided
-/// (`resize <rows> <cols>`): narrower, so the opener re-wraps, and taller, so
-/// more of the conversation above the reply comes into sight.
+/// The size `same-words`' tab is resized to once its first point is decided (`resize <rows> <cols>`): narrower, so the opener re-wraps, and taller, so more of the conversation above the reply comes into sight.
 pub const RESIZED: (u16, u16) = (104, 62);
-// narrower than the window
 const _: () = assert!(RESIZED.0 < 144);
-/// How long after the first point's back-off was decided the tab is resized.
 const RESIZE_AFTER_MS: i64 = 5_000;
-/// How long after the resize the orchestrator's turn comes: the loop has read
-/// the re-wrapped screen (its recheck is 5 s at the most) and decided there.
 const TURN_AFTER_RESIZE_MS: i64 = 30_000;
-/// `same-words`' orchestrator's turn, answered with the very words of the
-/// reply before it ([`WORK`]) under its own opener.
 const SAME_TURN: &str = "now carry on with the parser module and report";
-/// The words its reply is picked by: none (every turn of the chain is
-/// answered with [`WORK`]).
 const SAME_TURN_KEY: &str = "now carry on with the parser module";
-/// `tall-scroll`'s report rows ([`scroll_reply`]): with its head, the work
-/// report's words and each agent's own rows around them, a few rows taller
-/// than the tab's 50, so a few notches bring its opener back.
+/// `tall-scroll`'s report rows ([`scroll_reply`]): with its head, the work report's words and each agent's own rows around them, a few rows taller than the tab's 50, so a few notches bring its opener back.
 pub const SCROLL_LINES: usize = 46;
-/// How long after the first point's back-off was decided the wheel is
-/// turned ([`scroll_step`]).
 const SCROLL_AFTER_MS: i64 = 5_000;
-/// The notches the wheel is turned at the most, one row each, looking for
-/// the opener after each.
 const SCROLL_NOTCHES: u32 = 40;
-/// The notches in a row that moved nothing on the screen before the wheel
-/// stops: nothing it turns brings the history back.
 const SCROLL_STILL: u32 = 3;
-/// When the screen is read again after the last notch: whether the scroll
-/// held ([`Scrolled::held`]).
 const SCROLL_HELD_MS: i64 = 10_000;
-/// How long the chain is watched after the last notch: the loop has read
-/// the scrolled screen (its recheck is 5 s at the most) and decided there,
-/// long before the first point's due.
+/// How long the chain is watched after the last notch: the loop has read the scrolled screen (its recheck is 5 s at the most) and decided there, long before the first point's due.
 pub const SCROLL_WATCH_MS: i64 = 40_000;
 
-/// F3's reply to its tool's result: no words, so the turn ends on the tool's
-/// row ([`read_call`]).
+/// F3's reply to its tool's result: no words, so the turn ends on the tool's row ([`read_call`]).
 pub const TOOL_AFTER: &str = "";
 
-/// The factor `--mode ladder` scales the short back-off ladder by (the
-/// product's development seam, `turn_end::LADDER_SCALE_SEAM`): an eighth, so
-/// the steps of 2, 4, 8, 16, 32 and 60 min are 15 s to 7.5 min, and the
-/// ladder to its cap and the cap decided again fit in about 16 min.
+/// The factor `--mode ladder` scales the short back-off ladder by (the product's development seam, `turn_end::LADDER_SCALE_SEAM`): an eighth, so the steps of 2, 4, 8, 16, 32 and 60 min are 15 s to 7.5 min, and the ladder to its cap and the cap decided again fit in about 16 min.
 pub const LADDER_SCALE: f64 = 0.125;
-/// How many back-offs `ladder` must see decided: the doubling steps to the
-/// cap (2, 4, 8, 16, 32, 60 min), and the cap once more.
+/// How many back-offs `ladder` must see decided: the doubling steps to the cap (2, 4, 8, 16, 32, 60 min), and the cap once more.
 pub const LADDER_STEPS: u32 = 7;
-/// `ladder`'s hang detector: the scaled ladder's six steps waited out
-/// (about 15.3 min) and the seventh decided, with room.
 const LADDER_LIMIT_MS: i64 = 25 * 60 * 1000;
-/// How far a step measured off the journal (its `until=` less the time its
-/// `WAITING` was journaled) may fall short of the step the ladder names: the
-/// journal cuts `until=` to its second, and journals the decision at the read
-/// that judged the point, a moment after it showed.
 const STEP_SLACK_MS: i64 = 2_500;
 
-/// The instance environment `--mode ladder` runs its aterm under: the
-/// ladder's seam at [`LADDER_SCALE`] (a development build reads it, a shipped
-/// one never).
+/// The instance environment `--mode ladder` runs its aterm under: the ladder's seam at [`LADDER_SCALE`] (a development build reads it, a shipped one never).
 #[must_use]
 pub fn ladder_env() -> String {
     format!("{}={LADDER_SCALE}", turn_end::LADDER_SCALE_SEAM)
 }
 
-/// The shipped short back-off ladder, in minutes, one step per short turn
-/// in a row from the first: 2 min doubled to the 60 min cap, and the cap
-/// again — the judge's own word of it, which the product's timing is held to
-/// in a test (`forever_tests.rs`).
+/// The shipped short back-off ladder, in minutes, one step per short turn in a row from the first: 2 min doubled to the 60 min cap, and the cap again — the judge's own word of it, which the product's timing is held to in a test (`forever_tests.rs`).
 pub const SHIPPED_LADDER_MIN: [i64; LADDER_STEPS as usize] = [2, 4, 8, 16, 32, 60, 60];
 
-/// The step the ladder names for a point that closed `streak` short turns
-/// ([`SHIPPED_LADDER_MIN`], the cap past its end), scaled by `scale`, in ms.
+/// The step the ladder names for a point that closed `streak` short turns ([`SHIPPED_LADDER_MIN`], the cap past its end), scaled by `scale`, in ms.
 #[must_use]
 pub fn ladder_step_ms(streak: u32, scale: f64) -> i64 {
     let i = usize::try_from(streak.max(1) - 1)
@@ -798,12 +286,7 @@ pub fn ladder_step_ms(streak: u32, scale: f64) -> i64 {
     ms
 }
 
-/// F3's tool call on harness `h`: a read of the chain's own `README.md`
-/// (`file`, its physical path), read-only, which each CLI runs with no
-/// confirm in the lab's jail: Claude Code's `Read`, Gemini CLI's
-/// `read_file`, agy's `view_file`, Muse Code's `read_file` (its path read
-/// from its workspace root: an absolute one only where its file policy
-/// allows).
+/// F3's tool call on harness `h`: a read of the chain's own `README.md` (`file`, its physical path), read-only, which each CLI runs with no confirm in the lab's jail: Claude Code's `Read`, Gemini CLI's `read_file`, agy's `view_file`, Muse Code's `read_file` (its path read from its workspace root: an absolute one only where its file policy allows).
 #[must_use]
 pub fn read_call(h: Harness, file: &Path) -> J {
     let abs = file.to_string_lossy().into_owned();
@@ -823,12 +306,7 @@ pub fn read_call(h: Harness, file: &Path) -> J {
     J::obj([("name", J::s(name)), ("input", input)])
 }
 
-/// Why F3 is out of this lab's reach on harness `h`: no turn of its ends on a
-/// tool's row with no words after it (`None` where one does). Measured live
-/// on agy 1.4.0 (`r3-res-agy`, 2026-10-21): an empty reply after the tool's
-/// result is no output to it, so it sends `Error: model output error: model
-/// output must contain either output text or tool calls, these cannot both be
-/// empty, please try again` as a turn of its own and asks again, every time.
+/// Why F3 is out of this lab's reach on harness `h`: no turn of its ends on a tool's row with no words after it (`None` where one does).
 #[must_use]
 pub fn tool_end_out_of_reach(h: Harness) -> Option<&'static str> {
     (h == Harness::Agy).then_some(
@@ -836,13 +314,7 @@ pub fn tool_end_out_of_reach(h: Harness) -> Option<&'static str> {
     )
 }
 
-/// Why W1 or W2 (`mode`'s scenario) is out of this lab's reach on harness
-/// `h`, where it is: `None` where the stub draws the harness's own usage wall
-/// and, for W2, the lab takes its notice off the screen ([`hide_of`]). Claude Code reads the stub's usage limit (its unified-limit
-/// headers) only on its subscriber path, which the walled modes launch it on
-/// ([`launcher`]); on the lab's API key the same 429 draws `⏺ API Error:
-/// Request rejected (429) · Rate limit exceeded`, an API error the harness
-/// retries on its ladder, no usage wall.
+/// Why W1 or W2 (`mode`'s scenario) is out of this lab's reach on harness `h`, where it is: `None` where the stub draws the harness's own usage wall and, for W2, the lab takes its notice off the screen ([`hide_of`]).
 #[must_use]
 pub fn wall_out_of_reach(h: Harness, mode: Mode) -> Option<&'static str> {
     match mode {
@@ -867,46 +339,34 @@ pub fn wall_out_of_reach(h: Harness, mode: Mode) -> Option<&'static str> {
     }
 }
 
-/// How W2 takes the wall's notice off harness `h`'s screen while the wait
-/// stands ([`hide_step`]): a local command entered again and again (it
-/// sends no request), or the dialog's option chosen once; or why the harness
-/// has neither.
+/// How W2 takes the wall's notice off harness `h`'s screen while the wait stands ([`hide_step`]): a local command entered again and again (it sends no request), or the dialog's option chosen once; or why the harness has neither.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Hide {
     /// What takes the notice away.
     pub by: HideBy,
-    /// The words of the harness's usage wall: a screen holding none of them
-    /// has lost the notice ([`notice_gone`]).
+    /// The words of the harness's usage wall: a screen holding none of them has lost the notice ([`notice_gone`]).
     pub words: &'static [&'static str],
-    /// A key pressed once first, where the program draws the notice for as
-    /// long as its own countdown is armed (Claude Code's [`CLAUDE_CANCEL`]).
+    /// A key pressed once first, where the program draws the notice for as long as its own countdown is armed (Claude Code's [`CLAUDE_CANCEL`]).
     pub cancel: Option<Cancel>,
 }
 
-/// The key that cancels a program's own countdown to its reset, and the
-/// words that show it armed and cancelled ([`Hide::cancel`]).
+/// The key that cancels a program's own countdown to its reset, and the words that show it armed and cancelled ([`Hide::cancel`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Cancel {
     /// The key (`aterm ctl key`).
     pub key: &'static str,
-    /// Words on the screen while the countdown is armed: the key is pressed
-    /// only where they stand.
+    /// Words on the screen while the countdown is armed: the key is pressed only where they stand.
     pub armed: &'static str,
-    /// Words the program draws once it is cancelled: the hide goes on only
-    /// where they stand.
+    /// Words the program draws once it is cancelled: the hide goes on only where they stand.
     pub cancelled: &'static str,
 }
 
 /// What takes a harness's notice away ([`Hide::by`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HideBy {
-    /// A local command, typed into the empty composer and entered once the
-    /// menu offers it first ([`menu_offers`]), again and again until the
-    /// notice has scrolled away.
+    /// A local command, typed into the empty composer and entered once the menu offers it first ([`menu_offers`]), again and again until the notice has scrolled away.
     Command(&'static str),
-    /// The dialog's option, chosen once: the focus moved onto it (Down) and
-    /// Enter pressed only once the dialog draws it focused
-    /// ([`dialog_focus`]).
+    /// The dialog's option, chosen once: the focus moved onto it (Down) and Enter pressed only once the dialog draws it focused ([`dialog_focus`]).
     Option(&'static str),
 }
 
@@ -920,11 +380,7 @@ impl Hide {
     }
 }
 
-/// [`Hide`] of harness `h`, or why none takes its notice away. Every
-/// harness the lab drives has one; the `Result` stays for one that has none.
-///
-/// # Errors
-/// None today.
+/// [`Hide`] of harness `h`, or why none takes its notice away.
 pub fn hide_of(h: Harness) -> Result<Hide, &'static str> {
     match h {
         Harness::Muse => Ok(Hide {
@@ -968,8 +424,7 @@ impl Harness {
         Harness::Muse,
     ];
 
-    /// The verb's word, the lab's `agent`, the reader's program word (the
-    /// needs entry's `<program>`: `Program::name`).
+    /// The verb's word, the lab's `agent`, the reader's program word (the needs entry's `<program>`: `Program::name`).
     #[must_use]
     pub fn name(self) -> &'static str {
         match self {
@@ -984,7 +439,6 @@ impl Harness {
         Harness::ALL.into_iter().find(|h| h.name() == word)
     }
 
-    /// The binary and its version, as the lab's `up` recorded them.
     fn bin_ver(self, run: &Run) -> (&str, &str) {
         match self {
             Harness::Claude => (&run.claude_bin, &run.claude_ver),
@@ -995,9 +449,7 @@ impl Harness {
     }
 }
 
-/// Which chains run: the measured pass's by Autopilot (`land`, `cruise`,
-/// `both`), the coverage chains (`cover`), or the hour's cap on a lab of its
-/// own (`cap`).
+/// Which chains run: the measured pass's by Autopilot (`land`, `cruise`, `both`), the coverage chains (`cover`), or the hour's cap on a lab of its own (`cap`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
     Land,
@@ -1012,11 +464,9 @@ pub enum Mode {
     Resid,
     /// The back-off ladder past its fourth step, scaled (`ladder`).
     Ladder,
-    /// W1 on the usage-limit dialog that names no reset (`wall-day`): Gemini
-    /// CLI's on a key's spent per-day quota.
+    /// W1 on the usage-limit dialog that names no reset (`wall-day`): Gemini CLI's on a key's spent per-day quota.
     WallDay,
-    /// W1 on that dialog, its quota standing past the ladder's first rung
-    /// (`wall-climb`): the ladder climbed while NEEDS YOU stands.
+    /// W1 on that dialog, its quota standing past the ladder's first rung (`wall-climb`): the ladder climbed while NEEDS YOU stands.
     WallClimb,
 }
 
@@ -1038,8 +488,7 @@ impl Mode {
         })
     }
 
-    /// A mode of the stub's usage wall, on a lab of its own on each harness
-    /// it reaches ([`wall_out_of_reach`]), and its one scenario.
+    /// A mode of the stub's usage wall, on a lab of its own on each harness it reaches ([`wall_out_of_reach`]), and its one scenario.
     #[must_use]
     pub fn walled(self) -> Option<Scenario> {
         match self {
@@ -1056,9 +505,7 @@ impl Mode {
     }
 }
 
-/// What a chain's repository holds once laid ([`lay_repo`]), beside its
-/// `main`, committed and pushed to `origin`: the five legs of the repository
-/// probe (`aterm_agent::harness::repo_work::probe`) one at a time.
+/// What a chain's repository holds once laid ([`lay_repo`]), beside its `main`, committed and pushed to `origin`: the five legs of the repository probe (`aterm_agent::harness::repo_work::probe`) one at a time.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Repo {
     /// Nothing the remote's `main` lacks.
@@ -1076,8 +523,7 @@ pub enum Repo {
 }
 
 impl Repo {
-    /// What the repository suffix must name of it (`RepoWork::summary`'s
-    /// words), and the words of the other legs it must not.
+    /// What the repository suffix must name of it (`RepoWork::summary`'s words), and the words of the other legs it must not.
     #[must_use]
     pub fn named(self) -> (&'static [&'static str], &'static [&'static str]) {
         match self {
@@ -1105,7 +551,6 @@ impl Repo {
         }
     }
 
-    /// The repository line of the report.
     fn says(self) -> &'static str {
         match self {
             Repo::Clean => "clean and pushed",
@@ -1157,8 +602,7 @@ pub enum Chain {
     WroteC,
     /// P5 (a worker's record past its startup deadline).
     LandT,
-    /// The manager tab, running the harness under test, whose spawn starts
-    /// L15's worker.
+    /// The manager tab, running the harness under test, whose spawn starts L15's worker.
     Mgr,
     /// L16 (an end past the work floor, seen by a look at its tab).
     LandJ,
@@ -1176,25 +620,19 @@ pub enum Chain {
     Wall,
     /// W2 (the usage wall whose notice leaves the screen: the remembered wall).
     WallHid,
-    /// F18 (a person's keystroke into an instant turn: P4C's chain, its
-    /// person's prompt typed `as=person`).
+    /// F18 (a person's keystroke into an instant turn: P4C's chain, its person's prompt typed `as=person`).
     InstantPerson,
-    /// F1 and F2 (a judged turn's opener re-wrapped and revealed by a resize)
-    /// and SAME (a new turn answered with the very words of the one before).
+    /// F1 and F2 (a judged turn's opener re-wrapped and revealed by a resize) and SAME (a new turn answered with the very words of the one before).
     SameWords,
-    /// F1 BY A SCROLL (a judged turn's opener scrolled into sight from the
-    /// history above the screen by a wheel, nothing submitted).
+    /// F1 BY A SCROLL (a judged turn's opener scrolled into sight from the history above the screen by a wheel, nothing submitted).
     TallScroll,
     /// F3 (a first turn ended on a tool's row after a launch).
     ToolEnd,
     /// LADDER (the back-off ladder doubled to its cap, scaled).
     Ladder,
-    /// W1 on Gemini CLI's usage-limit dialog that names no reset (a key's
-    /// spent per-day quota), kept trying on the entitlement ladder while a
-    /// person is told.
+    /// W1 on Gemini CLI's usage-limit dialog that names no reset (a key's spent per-day quota), kept trying on the entitlement ladder while a person is told.
     WallDay,
-    /// W1 on that dialog, its quota standing past the ladder's first rung:
-    /// the ladder climbed while a person is told.
+    /// W1 on that dialog, its quota standing past the ladder's first rung: the ladder climbed while a person is told.
     WallClimb,
 }
 
@@ -1234,21 +672,15 @@ pub enum Scenario {
     N2,
     N3,
     N4,
-    /// The harness's END (§12.5.4): the window at rest with ends and needs
-    /// standing, then each chain's chip in front ([`surfaces::judge_end`]).
+    /// The harness's END (§12.5.4): the window at rest with ends and needs standing, then each chain's chip in front ([`surfaces::judge_end`]).
     End,
-    /// A person's keystroke into an instant turn no read saw run: their own
-    /// exchange, left to them (the review's F18).
+    /// A person's keystroke into an instant turn no read saw run: their own exchange, left to them (the review's F18).
     F18,
-    /// A judged turn's opener re-wrapped and revealed by a resize, nothing
-    /// submitted: not judged again (the review's F1 and F2).
+    /// A judged turn's opener re-wrapped and revealed by a resize, nothing submitted: not judged again (the review's F1 and F2).
     Rewrap,
-    /// A new turn answered with the very words of the reply before it, under
-    /// its own opener: judged as its own point (`b9/resid3`'s submission).
+    /// A new turn answered with the very words of the reply before it, under its own opener: judged as its own point (`b9/resid3`'s submission).
     SameWords,
-    /// A judged turn's opener scrolled into sight from the history above the
-    /// screen by a wheel, nothing submitted: not judged again (F1's other
-    /// path).
+    /// A judged turn's opener scrolled into sight from the history above the screen by a wheel, nothing submitted: not judged again (F1's other path).
     Scrolled,
     /// A first turn ended on a tool's row after a launch: judged (F3).
     F3,
@@ -1362,8 +794,7 @@ impl Scenario {
 pub enum Opening {
     /// Its first prompt, typed as `lab turn` types one.
     Prompt,
-    /// Its first prompt typed as a person types it: the draft stands in the
-    /// composer, then Enter ([`person_turn`]).
+    /// Its first prompt typed as a person types it: the draft stands in the composer, then Enter ([`person_turn`]).
     Person,
     /// No prompt: the manager tab stands at its composer (L15's starter).
     Idle,
@@ -1372,10 +803,7 @@ pub enum Opening {
 }
 
 impl Chain {
-    /// The measured pass's chains (`--mode both`), with P4's instant ones
-    /// and the window's three (L16, L17, N1–N4). Where the window is read,
-    /// `cruise-n` opens first (the page lists its rows on its first screen)
-    /// and is brought in front with `tab` ([`surfaces::front_of`]).
+    /// The measured pass's chains (`--mode both`), with P4's instant ones and the window's three (L16, L17, N1–N4).
     pub const ALL: [Chain; 16] = [
         Chain::LandA,
         Chain::LandB,
@@ -1395,8 +823,7 @@ impl Chain {
         Chain::CruiseN,
     ];
 
-    /// The coverage chains (`--mode cover`): what the measured pass left
-    /// unobserved, and the Off control.
+    /// The coverage chains (`--mode cover`): what the measured pass left unobserved, and the Off control.
     pub const COVER: [Chain; 9] = [
         Chain::LandQ,
         Chain::LandP,
@@ -1409,23 +836,16 @@ impl Chain {
         Chain::Off,
     ];
 
-    /// The cap's chains (`--mode cap`, on a lab of their own: the cap is the
-    /// instance's).
+    /// The cap's chains (`--mode cap`, on a lab of their own: the cap is the instance's).
     pub const CAPPED: [Chain; 2] = [Chain::Cap, Chain::Off];
 
-    /// The wall's chain (`--mode wall`, alone on a lab of its own: the
-    /// stub's usage wall meets every conversation it serves, so not even the
-    /// Off control shares it).
+    /// The wall's chain (`--mode wall`, alone on a lab of its own: the stub's usage wall meets every conversation it serves, so not even the Off control shares it).
     pub const WALLED: [Chain; 1] = [Chain::Wall];
 
-    /// The remembered wall's chain (`--mode wall-hid`, alone on a lab of its
-    /// own for W1's reason).
+    /// The remembered wall's chain (`--mode wall-hid`, alone on a lab of its own for W1's reason).
     pub const WALL_HID: [Chain; 1] = [Chain::WallHid];
 
-    /// The residuals' chains (`--mode resid`): F18's beside its negative
-    /// control, P4C's chain whose person's prompt goes through the control
-    /// socket (judged as a turn of the conversation); F1, F2 and SAME's; F1's
-    /// by a scroll; F3's; and the Off control.
+    /// The residuals' chains (`--mode resid`): F18's beside its negative control, P4C's chain whose person's prompt goes through the control socket (judged as a turn of the conversation); F1, F2 and SAME's; F1's by a scroll; F3's; and the Off control.
     pub const RESID: [Chain; 6] = [
         Chain::InstantCruise,
         Chain::InstantPerson,
@@ -1435,19 +855,15 @@ impl Chain {
         Chain::Off,
     ];
 
-    /// The ladder's chain (`--mode ladder`, on a lab of its own: the scale is
-    /// the instance's, [`ladder_env`]) and the Off control.
+    /// The ladder's chain (`--mode ladder`, on a lab of its own: the scale is the instance's, [`ladder_env`]) and the Off control.
     pub const LADDER: [Chain; 2] = [Chain::Ladder, Chain::Off];
-    /// The per-day quota's chain (`--mode wall-day`, alone on a lab of its
-    /// own for W1's reason).
+    /// The per-day quota's chain (`--mode wall-day`, alone on a lab of its own for W1's reason).
     pub const WALL_DAY: [Chain; 1] = [Chain::WallDay];
 
-    /// The climbing quota's chain (`--mode wall-climb`, alone on a lab of
-    /// its own for W1's reason).
+    /// The climbing quota's chain (`--mode wall-climb`, alone on a lab of its own for W1's reason).
     pub const WALL_CLIMB: [Chain; 1] = [Chain::WallClimb];
 
-    /// Every chain of every mode, each once (`--chains` names one of
-    /// them; the tests' census of them).
+    /// Every chain of every mode, each once (`--chains` names one of them; the tests' census of them).
     #[must_use]
     pub fn every() -> Vec<Chain> {
         let mut v: Vec<Chain> = Chain::ALL.to_vec();
@@ -1491,9 +907,7 @@ impl Chain {
         }
     }
 
-    /// The chains of `mode` harness `h` runs: W2's only where a local command
-    /// takes the notice away ([`wall_out_of_reach`]). L15's two run on every
-    /// harness (`spawn agent=<harness>`).
+    /// The chains of `mode` harness `h` runs: W2's only where a local command takes the notice away ([`wall_out_of_reach`]).
     #[must_use]
     pub fn of_mode_on(mode: Mode, h: Harness) -> Vec<Chain> {
         Chain::of_mode(mode)
@@ -1528,11 +942,7 @@ impl Chain {
         }
     }
 
-    /// The claim its wall is raised with on harness `h` ([`wall_step`]):
-    /// [`wall_claim`]'s, but on the per-day quota's chain the one on which
-    /// the stub answers the Gemini API's key a spent per-day quota
-    /// ([`WALL_CLAIM`]: it names no Code Assist limit), whose dialog names no
-    /// reset.
+    /// The claim its wall is raised with on harness `h` ([`wall_step`]): [`wall_claim`]'s, but on the per-day quota's chain the one on which the stub answers the Gemini API's key a spent per-day quota ([`WALL_CLAIM`]: it names no Code Assist limit), whose dialog names no reset.
     #[must_use]
     pub fn wall_claim_on(self, h: Harness) -> &'static str {
         match self {
@@ -1557,19 +967,15 @@ impl Chain {
     pub fn limit_ms(self) -> i64 {
         match self {
             Chain::Cap => CAP_LIMIT_MS,
-            // three back-offs (2, 4 and 8 min) before N4's reply
             Chain::CruiseN => CRUISE_N_LIMIT_MS,
             Chain::Ladder => LADDER_LIMIT_MS,
-            // the ladder's first rung, 30 min from the dialog's first read
             Chain::WallDay => WALL_DAY_LIMIT_MS,
-            // its second rung, 2 h after the first
             Chain::WallClimb => WALL_CLIMB_LIMIT_MS,
             _ => CHAIN_LIMIT_MS,
         }
     }
 
-    /// Its worker is one a manager waits on (a task record), so the ladder
-    /// after its landing is a managed worker's ([`next_step_ms`]).
+    /// Its worker is one a manager waits on (a task record), so the ladder after its landing is a managed worker's ([`next_step_ms`]).
     #[must_use]
     pub fn managed(self) -> bool {
         self.tasked() || self == Chain::Worker
@@ -1615,10 +1021,7 @@ impl Chain {
         }
     }
 
-    /// The word its conversation carries (its first prompt), by which the
-    /// stub's rules know it: no other chain's word holds it. It ends in a
-    /// `.`, which no name holds, so a name that extends another's
-    /// (`cruise-n`, `cruise`) gives a word that does not hold the other's.
+    /// The word its conversation carries (its first prompt), by which the stub's rules know it: no other chain's word holds it.
     #[must_use]
     pub fn token(self) -> String {
         format!("FOREVERLAB-{}.", self.name().to_ascii_uppercase())
@@ -1694,15 +1097,13 @@ impl Chain {
         }
     }
 
-    /// Its tab carries a worker's task record (`task mark working
-    /// from=ctl` before the agent starts): a manager waits on it.
+    /// Its tab carries a worker's task record (`task mark working from=ctl` before the agent starts): a manager waits on it.
     #[must_use]
     pub fn tasked(self) -> bool {
         matches!(self, Chain::LandE | Chain::LandT)
     }
 
-    /// Its landing is the scenario: watched past the ladder's next step
-    /// after it, and the stub's dumps read for a new turn after it.
+    /// Its landing is the scenario: watched past the ladder's next step after it, and the stub's dumps read for a new turn after it.
     #[must_use]
     pub fn lands(self) -> bool {
         matches!(
@@ -1720,9 +1121,7 @@ impl Chain {
         )
     }
 
-    /// Its replies are sent at once: no delay before the first byte, no
-    /// pause between deltas (P4: a turn over before any read sees the
-    /// worker busy). The other chains' are paced ([`REPLY_DELAY_MS`]).
+    /// Its replies are sent at once: no delay before the first byte, no pause between deltas (P4: a turn over before any read sees the worker busy).
     #[must_use]
     pub fn instant(self) -> bool {
         matches!(
@@ -1736,18 +1135,14 @@ impl Chain {
         )
     }
 
-    /// A PERSON'S PROMPT MID-CHAIN (P4P): typed as the first prompt is, once
-    /// the done check's defense was decided, while the loop waits out its
-    /// back-off. Its reply ([`ASK_REPLY`]) is sent at once.
+    /// A PERSON'S PROMPT MID-CHAIN (P4P): typed as the first prompt is, once the done check's defense was decided, while the loop waits out its back-off.
     #[must_use]
     pub fn asks(self) -> Option<String> {
         matches!(self, Chain::InstantCruise | Chain::InstantPerson)
             .then(|| format!("{} {ASK_KEY}", self.token()))
     }
 
-    /// Its person's prompt mid-chain ([`Self::asks`]) is typed AS A PERSON
-    /// TYPES IT ([`person_turn`]: `send|key as=person`, a person's hand on the
-    /// session), not through the control socket (F18).
+    /// Its person's prompt mid-chain ([`Self::asks`]) is typed AS A PERSON TYPES IT ([`person_turn`]: `send|key as=person`, a person's hand on the session), not through the control socket (F18).
     #[must_use]
     pub fn asks_as_person(self) -> bool {
         self == Chain::InstantPerson
@@ -1771,8 +1166,7 @@ impl Chain {
         )
     }
 
-    /// The stub's rules for its conversation, most specific first
-    /// ([`crate::stub::scripted_reply`]).
+    /// The stub's rules for its conversation, most specific first ([`crate::stub::scripted_reply`]).
     #[must_use]
     pub fn rules(self) -> Vec<J> {
         let token = self.token();
@@ -1789,16 +1183,12 @@ impl Chain {
             }
             r
         };
-        // a reply that keeps the agent busy past the end's work floor
-        // ([`long_reply_ms`]): held, then paced word by word
         let long = |last: &str, text: &str| {
             let mut r = rule(last, text);
             r.set("delay_ms", J::Int(LONG_DELAY_MS));
             r.set("pace_s", J::Float(LONG_PACE_S));
             r
         };
-        // a turn told from another of the same act by an act the
-        // conversation met before it (`after`, [`crate::stub::scripted_reply`])
         let after = |last: &str, before: &str, text: &str| {
             let mut r = rule(last, text);
             r.set("after", J::s(before));
@@ -1864,17 +1254,11 @@ impl Chain {
                 rule(CONTINUE_KEY, W_DONE),
                 rule("", W_DONE),
             ],
-            // C4: a work reply, so the first act is the continuation, the
-            // owner's; it answered with a done claim, and the done check
-            // after it with a clean defense
             Chain::CruiseO => vec![
                 rule(CHECK_KEY, CLEAN),
                 rule(OWNER_KEY, DONE_CLAIM),
                 rule("", WORK),
             ],
-            // P5: land@v1 answered as work, a second short turn, so the
-            // record stands `working` through a 4 min back-off, past the
-            // startup deadline twice over, before the nudge lands it
             Chain::LandT => vec![rule(NUDGE_KEY, CLEAN), rule("", WORK)],
             Chain::Cap => {
                 let open = open_defense();
@@ -1885,7 +1269,6 @@ impl Chain {
                     rule("", WORK),
                 ]
             }
-            // the manager is given no prompt: its conversation is never scripted
             Chain::Mgr => Vec::new(),
             Chain::InstantLand | Chain::Worker => vec![
                 rule(NUDGE_KEY, CLEAN),
@@ -1898,16 +1281,11 @@ impl Chain {
                 rule(CONTINUE_KEY, DONE_CLAIM),
                 rule("", DONE_CLAIM),
             ],
-            // L16, L17: the land act's clean defense (or a nudge's), long, so
-            // the landing comes past the end's work floor
             Chain::LandJ | Chain::LandK => vec![
                 long(NUDGE_KEY, CLEAN),
                 long(LAND_KEY, CLEAN),
                 rule("", WORK),
             ],
-            // N1–N4: two needs; the continuation answered with a defense
-            // naming none; the done check with the first need again; the
-            // continuation after the check with it and another
             Chain::CruiseN => vec![
                 rule(CHECK_KEY, &needs_reply(N3_HEAD, &[NEED_A])),
                 after(
@@ -1918,36 +1296,24 @@ impl Chain {
                 rule(CONTINUE_KEY, CLEAN),
                 rule("", &needs_reply(N1_HEAD, &[NEED_A, NEED_B])),
             ],
-            // W1, W2: the land act meets the wall (no reply); whatever the
-            // harness types after it (its resume, Land's words, marked) is
-            // answered with the clean defense
             Chain::Wall | Chain::WallHid | Chain::WallDay | Chain::WallClimb => vec![
                 rule(NUDGE_KEY, CLEAN),
                 rule(LAND_KEY, CLEAN),
                 rule(MARK, CLEAN),
                 rule("", WORK),
             ],
-            // F1, F2, SAME: every turn answered with the work report, the
-            // orchestrator's too — the very words of the reply before it
             Chain::SameWords => vec![rule(SAME_TURN_KEY, WORK), rule("", WORK)],
-            // F1 by a scroll: every turn answered with the tall report, its
-            // opener above the screen once it is over
             Chain::TallScroll => vec![rule("", &scroll_reply())],
-            // F3: the first prompt answered with a tool's call ([`read_call`],
-            // filled per harness by [`spec_on`]), its result with no words
             Chain::ToolEnd => vec![
                 rule(NUDGE_KEY, CLEAN),
                 rule(LAND_KEY, CLEAN),
                 rule("", TOOL_AFTER),
             ],
-            // LADDER: every turn short and plain, paced: read run, and each
-            // point closes one short turn more
             Chain::Ladder => vec![rule("", WORK)],
         }
     }
 
-    /// The orchestrator's turn the lab types into its tab mid-watch, and
-    /// when ([`orchestrator_due`]).
+    /// The orchestrator's turn the lab types into its tab mid-watch, and when ([`orchestrator_due`]).
     #[must_use]
     pub fn orchestrated(self) -> Option<&'static str> {
         match self {
@@ -1959,8 +1325,7 @@ impl Chain {
     }
 }
 
-/// A report `head` naming `needs`, each on a `NEEDS YOU:` line of its own
-/// (N1, N3, N4).
+/// A report `head` naming `needs`, each on a `NEEDS YOU:` line of its own (N1, N3, N4).
 #[must_use]
 pub fn needs_reply(head: &str, needs: &[&str]) -> String {
     let mut s = head.to_string();
@@ -1982,11 +1347,7 @@ pub fn open_defense() -> String {
     format!("{CLEAN}\nThe docs PR is still open.")
 }
 
-/// L6's reply, `lines` tall: ONE need near its top, the defense at its bottom. One
-/// `NEEDS YOU:` line names one need (the contract: one a line), and the `- check <n> passed`
-/// rows under it are the report's own list, no needs: the needs reader reads one need here
-/// (`aterm-agent`'s `policy/needs.rs`; before 2026-10-22 it read the list as 80 more,
-/// `NEEDS … count=80` and "(+79 more)").
+/// L6's reply, `lines` tall: ONE need near its top, the defense at its bottom.
 #[must_use]
 pub fn tall_reply(lines: usize) -> String {
     let mut s = format!("Here is the landing report.\nNEEDS YOU: {NEED}\n");
@@ -1997,11 +1358,7 @@ pub fn tall_reply(lines: usize) -> String {
     s
 }
 
-/// `tall-scroll`'s reply: a head, [`SCROLL_LINES`] rows of a report, then
-/// the work report's words ([`WORK`]) — taller than the 50 rows of the
-/// window's tab, so once the turn is over its opener stands in the history
-/// above the screen (the agent's own, where it draws its transcript in a
-/// view of its own). No row of it holds the chain's token.
+/// `tall-scroll`'s reply: a head, [`SCROLL_LINES`] rows of a report, then the work report's words ([`WORK`]) — taller than the 50 rows of the window's tab, so once the turn is over its opener stands in the history above the screen (the agent's own, where it draws its transcript in a view of its own).
 #[must_use]
 pub fn scroll_reply() -> String {
     let mut s = String::from("Here is where the parser stands.\n");
@@ -2012,8 +1369,7 @@ pub fn scroll_reply() -> String {
     s
 }
 
-/// The custom mode's spec: every chain's rules, each reply after
-/// [`REPLY_DELAY_MS`], and the plain work reply for a turn no rule picks.
+/// The custom mode's spec: every chain's rules, each reply after [`REPLY_DELAY_MS`], and the plain work reply for a turn no rule picks.
 #[must_use]
 pub fn spec(chains: &[Chain]) -> J {
     J::obj([
@@ -2028,9 +1384,7 @@ pub fn spec(chains: &[Chain]) -> J {
     ])
 }
 
-/// [`spec`] for a run on harness `h`, `dirs` its chains' repositories (in
-/// `chains`' order): F3's first turn answered with that harness's read of
-/// its own `README.md` ([`read_call`]) on the rule that answers its prompt.
+/// [`spec`] for a run on harness `h`, `dirs` its chains' repositories (in `chains`' order): F3's first turn answered with that harness's read of its own `README.md` ([`read_call`]) on the rule that answers its prompt.
 #[must_use]
 pub fn spec_on(chains: &[Chain], h: Harness, dirs: &[PathBuf]) -> J {
     let mut sp = spec(chains);
@@ -2098,9 +1452,7 @@ pub struct Row {
 }
 
 impl Row {
-    /// The row records something done to the agent: a key pressed or a text
-    /// typed (`approved`, `declined`, `typed`), or one tried (`escalated`,
-    /// `deferred`) — every decision but a record (`waiting`) or a skip.
+    /// The row records something done to the agent: a key pressed or a text typed (`approved`, `declined`, `typed`), or one tried (`escalated`, `deferred`) — every decision but a record (`waiting`) or a skip.
     #[must_use]
     pub fn acted(&self) -> bool {
         !matches!(self.decision.as_str(), "waiting" | "skipped")
@@ -2110,19 +1462,15 @@ impl Row {
 /// What the stub's request dumps said of a conversation ([`StubSeen::of`]).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct StubSeen {
-    /// The harness-marked user texts the conversation held at the landing
-    /// (Off: none).
+    /// The harness-marked user texts the conversation held at the landing (Off: none).
     pub baseline: usize,
     /// Its requests read (after the landing; Off: all of them).
     pub read: usize,
-    /// Of those, the ones holding more harness-marked user texts than
-    /// [`Self::baseline`]: a new turn of the harness's.
+    /// Of those, the ones holding more harness-marked user texts than [`Self::baseline`]: a new turn of the harness's.
     pub new_turns: usize,
 }
 
-/// What one tab's records said, each with its time (ms), in order: the
-/// journal's lines, the ledger's rows, and the `status`, `meta` and `task`
-/// words at each change.
+/// What one tab's records said, each with its time (ms), in order: the journal's lines, the ledger's rows, and the `status`, `meta` and `task` words at each change.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Seen {
     pub journal: Vec<(i64, String)>,
@@ -2131,8 +1479,7 @@ pub struct Seen {
     pub status: Vec<(i64, String)>,
     /// Actual status reads, even where the recorded words did not change.
     pub status_reads: Vec<i64>,
-    /// `attention_owners=… attention_kinds=… attention=…` of `meta`, the
-    /// attention decoded.
+    /// `attention_owners=… attention_kinds=… attention=…` of `meta`, the attention decoded.
     pub meta: Vec<(i64, String)>,
     /// The `task` record's line.
     pub task: Vec<(i64, String)>,
@@ -2140,13 +1487,11 @@ pub struct Seen {
     pub reply_ms: Option<i64>,
     /// When a person's prompt mid-chain was typed (P4P, [`Chain::asks`]).
     pub asked_ms: Option<i64>,
-    /// When one was typed that the composer did not take: it never stood
-    /// there as typed, or stood there still after Enter twice.
+    /// When one was typed that the composer did not take: it never stood there as typed, or stood there still after Enter twice.
     pub ask_refused_ms: Option<i64>,
     /// When watching stopped.
     pub end_ms: i64,
-    /// The stub's witness (L5, L7: after the landing; Off: the whole
-    /// conversation); `None` where it was never read.
+    /// The stub's witness (L5, L7: after the landing; Off: the whole conversation); `None` where it was never read.
     pub stub: Option<StubSeen>,
     /// What the coverage chains' run did and read beside the records.
     pub cover: Cover,
@@ -2154,94 +1499,61 @@ pub struct Seen {
     pub window: surfaces::Window,
 }
 
-/// What a coverage chain's run did to its tab, and read of it, beside the
-/// records ([`Seen`]), each with its time (ms).
+/// What a coverage chain's run did to its tab, and read of it, beside the records ([`Seen`]), each with its time (ms).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Cover {
     /// L13: when the person's Enter went in under their standing draft.
     pub person_ms: Option<i64>,
-    /// L13: `status human_ms=` read once their Enter took the draft: how long
-    /// ago a person's gesture reached the session (`-`: none ever). A plain
-    /// control verb never stamps it (`help status`); the lab's person types
-    /// through the development seam `as=person`, which does, or (`forever
-    /// --window`) through `hwkey`, the key press's own path ([`Keyed`]).
+    /// L13: `status human_ms=` read once their Enter took the draft: how long ago a person's gesture reached the session (`-`: none ever).
     pub person_stamp: Option<String>,
-    /// L13 typed through `hwkey` in a windowed lab ([`person_keys`]): what
-    /// the real key path posted and counted. `None`: the `as=person` seam
-    /// typed it.
+    /// L13 typed through `hwkey` in a windowed lab ([`person_keys`]): what the real key path posted and counted.
     pub keyed: Option<Keyed>,
     /// L13, CAP: when the lab's orchestrator turn went in.
     pub turn_ms: Option<i64>,
-    /// The stub's witness of a window no harness turn may fall in: L13's
-    /// exchange (its first prompt to the orchestrator's turn), CAP's hour
-    /// (after the act to the turn after it).
+    /// The stub's witness of a window no harness turn may fall in: L13's exchange (its first prompt to the orchestrator's turn), CAP's hour (after the act to the turn after it).
     pub window_stub: Option<StubSeen>,
     /// L15: the manager's sid.
     pub starter: Option<String>,
     /// L15: the worker's spawn reply.
     pub spawn: Option<String>,
-    /// L15: when the manager's `await task @<w> since=0` returned, its exit
-    /// status and what it printed.
+    /// L15: when the manager's `await task @<w> since=0` returned, its exit status and what it printed.
     pub awaited: Option<(i64, i32, String)>,
     /// L15: the worker's `result`, as printed (its standard output).
     pub result: Option<String>,
-    /// L15: the agent the lab's spawn named (`agent=<word>`): the harness
-    /// under test's.
+    /// L15: the agent the lab's spawn named (`agent=<word>`): the harness under test's.
     pub agent: Option<String>,
-    /// L15: the `result` reply's header (`OK <n> source=… bytes=<n>`, on its
-    /// standard error).
+    /// L15: the `result` reply's header (`OK <n> source=… bytes=<n>`, on its standard error).
     pub result_head: Option<String>,
-    /// L15: the agent the worker's spawn started, as `meta worker=` names it
-    /// once the watch is over.
+    /// L15: the agent the worker's spawn started, as `meta worker=` names it once the watch is over.
     pub worker: Option<String>,
-    /// W1: when the lab raised the stub's usage wall, and the unix second
-    /// it resets at ([`wall_step`]).
+    /// W1: when the lab raised the stub's usage wall, and the unix second it resets at ([`wall_step`]).
     pub wall: Option<(i64, i64)>,
     /// W1: when the lab gave the stub its scripted mode back.
     pub lifted_ms: Option<i64>,
-    /// W1: when the PROGRAM WENT ON BY ITSELF past the wall: the first of the
-    /// conversation's requests from the wall's lift on carrying its own
-    /// continuation ([`carries_continuation`]: Claude Code's, which goes on
-    /// at the reset with no act of the harness's), read from the stub's
-    /// dumps once the watch is over ([`went_on_witness`]). `None`: none came
-    /// (a program that does not go on by itself, a countdown cancelled), or
-    /// the dumps were not read.
+    /// W1: when the PROGRAM WENT ON BY ITSELF past the wall: the first of the conversation's requests from the wall's lift on carrying its own continuation ([`carries_continuation`]: Claude Code's, which goes on at the reset with no act of the harness's), read from the stub's dumps once the watch is over ([`went_on_witness`]).
     pub went_on_ms: Option<i64>,
-    /// C4: the user texts of the conversation's requests that carry the
-    /// owner's continuation ([`OWNER_KEY`]), each as the agent sent it, read
-    /// from the stub's dumps once the watch is over ([`owner_witness`]).
-    /// `None` for any other chain, and where the dumps were not read.
+    /// C4: the user texts of the conversation's requests that carry the owner's continuation ([`OWNER_KEY`]), each as the agent sent it, read from the stub's dumps once the watch is over ([`owner_witness`]).
     pub owner_texts: Option<Vec<String>>,
     /// W2: the notice scrolled out of sight ([`hide_step`]).
     pub hidden: Option<Hidden>,
     /// W2: why the notice was not taken off the screen, where it was not.
     pub hide_gave_up: Option<String>,
-    /// F18: `status human_ms=` read once the person's mid-chain Enter took
-    /// their draft ([`Chain::asks_as_person`]): a stamp where a person's hand
-    /// reached the session.
+    /// F18: `status human_ms=` read once the person's mid-chain Enter took their draft ([`Chain::asks_as_person`]): a stamp where a person's hand reached the session.
     pub ask_stamp: Option<String>,
-    /// F1, F2: when the lab resized the tab ([`RESIZED`]), and what the
-    /// resize and `dims` answered.
+    /// F1, F2: when the lab resized the tab ([`RESIZED`]), and what the resize and `dims` answered.
     pub resized: Option<(i64, String)>,
-    /// F1 BY A SCROLL: the wheel the lab turned over the tab, and what the
-    /// screen showed ([`scroll_step`]).
+    /// F1 BY A SCROLL: the wheel the lab turned over the tab, and what the screen showed ([`scroll_step`]).
     pub scrolled: Option<Scrolled>,
-    /// F3: how many of the conversation's requests carried a tool's result
-    /// back (the stub's dumps), read once its watch is over.
+    /// F3: how many of the conversation's requests carried a tool's result back (the stub's dumps), read once its watch is over.
     pub tool_results: Option<usize>,
-    /// F3: the screen's last rows read once the first point after the prompt
-    /// was journaled, and when.
+    /// F3: the screen's last rows read once the first point after the prompt was journaled, and when.
     pub first_screen: Option<(i64, Vec<String>)>,
 }
 
-/// F1 BY A SCROLL, AS DRIVEN ([`scroll_step`]): the wheel turned up over
-/// `tall-scroll`'s tab, a row a notch, until its opener was in sight.
+/// F1 BY A SCROLL, AS DRIVEN ([`scroll_step`]): the wheel turned up over `tall-scroll`'s tab, a row a notch, until its opener was in sight.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Scrolled {
-    /// When the first notch was turned: F1's law holds from there
-    /// ([`crate::forever_cover`]'s `judge_scrolled`), the harness's reads
-    /// during the notches (the screen the opener first came into sight on
-    /// among them) included.
+    /// When the first notch was turned: F1's law holds from there ([`crate::forever_cover`]'s `judge_scrolled`), the harness's reads during the notches (the screen the opener first came into sight on among them) included.
     pub from: i64,
     /// When the last notch was turned.
     pub at: i64,
@@ -2249,44 +1561,30 @@ pub struct Scrolled {
     pub notches: u32,
     /// What `mouse` answered where it did not say `OK`.
     pub refused: Option<String>,
-    /// The tab's `modes` before the first notch: `alt_screen=` and
-    /// `mouse_mode=`, whether the agent takes the wheel (it scrolls its own
-    /// view) or the tab's viewport moves.
+    /// The tab's `modes` before the first notch: `alt_screen=` and `mouse_mode=`, whether the agent takes the wheel (it scrolls its own view) or the tab's viewport moves.
     pub modes: String,
-    /// The tab's history above its screen before the first notch, as
-    /// `lines` answered (`OK <rows> …`): the rows a viewport can scroll back.
+    /// The tab's history above its screen before the first notch, as `lines` answered (`OK <rows> …`): the rows a viewport can scroll back.
     pub history: String,
-    /// Whether the opener (the chain's token) was on the screen before the
-    /// first notch.
+    /// Whether the opener (the chain's token) was on the screen before the first notch.
     pub before: bool,
-    /// Whether it was in sight after the last notch: on the live screen where
-    /// the agent took the wheel, in the tab's viewport where it did not.
+    /// Whether it was in sight after the last notch: on the live screen where the agent took the wheel, in the tab's viewport where it did not.
     pub after: bool,
-    /// Where the agent takes no wheel (`mouse_mode=none`): the tab's viewport
-    /// after the last notch, as `scroll` answered it (`OK <offset> <max>`),
-    /// with where the opener and the live screen were (`search`).
+    /// Where the agent takes no wheel (`mouse_mode=none`): the tab's viewport after the last notch, as `scroll` answered it (`OK <offset> <max>`), with where the opener and the live screen were (`search`).
     pub viewport: Option<String>,
-    /// Whether the live screen (the one the harness reads) changed under the
-    /// wheel at all.
+    /// Whether the live screen (the one the harness reads) changed under the wheel at all.
     pub moved: bool,
     /// The screen's rows after the last notch, blank rows left out.
     pub rows: Vec<String>,
-    /// Whether the opener was still on the screen [`SCROLL_HELD_MS`] after
-    /// the last notch; `None` before that read.
+    /// Whether the opener was still on the screen [`SCROLL_HELD_MS`] after the last notch; `None` before that read.
     pub held: Option<bool>,
 }
 
-/// L13's prompt typed through `hwkey` (`forever --window`, [`person_keys`]):
-/// each key a real `NSEvent` posted into the windowed instance's own event
-/// queue, and the session's count of a person's gestures around them.
+/// L13's prompt typed through `hwkey` (`forever --window`, [`person_keys`]): each key a real `NSEvent` posted into the windowed instance's own event queue, and the session's count of a person's gestures around them.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Keyed {
-    /// The presses `hwkey` handed to the window's event queue (`OK
-    /// posted=<n>`): the text's characters and each Enter.
+    /// The presses `hwkey` handed to the window's event queue (`OK posted=<n>`): the text's characters and each Enter.
     pub posted: u64,
-    /// How many of them it posted while the window was the key window of
-    /// the active app (`key=1`): none in the jail, whose instance is no
-    /// Launch Services application, so nothing can activate it.
+    /// How many of them it posted while the window was the key window of the active app (`key=1`): none in the jail, whose instance is no Launch Services application, so nothing can activate it.
     pub key_window: u64,
     /// `status human_seq=` before the first key.
     pub seq_before: u64,
@@ -2297,36 +1595,24 @@ pub struct Keyed {
 /// W2's hide ([`hide_step`]): the notice out of sight while the wait stands.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Hidden {
-    /// When the first hiding command's Enter went in: the screen before it
-    /// was the notice's own.
+    /// When the first hiding command's Enter went in: the screen before it was the notice's own.
     pub first_ms: i64,
-    /// When the Enter of the command that scrolled the notice away went in
-    /// (the screen before it still drew the notice).
+    /// When the Enter of the command that scrolled the notice away went in (the screen before it still drew the notice).
     pub enter_ms: i64,
     /// When the lab read the screen without it.
     pub seen_ms: i64,
-    /// That screen's content seq (`status seq=`, the journal's `seq=`): a point
-    /// read at it or after is a screen without the notice.
+    /// That screen's content seq (`status seq=`, the journal's `seq=`): a point read at it or after is a screen without the notice.
     pub seq: Option<u64>,
-    /// The hiding commands entered, or the dialog's option chosen (once)
-    /// ([`Hide::by`]).
+    /// The hiding commands entered, or the dialog's option chosen (once) ([`Hide::by`]).
     pub commands: usize,
-    /// That command or option ([`Hide::label`]): Muse Code's
-    /// [`HIDE_COMMAND`], agy's [`AGY_HIDE_COMMAND`], Gemini CLI's
-    /// [`GEMINI_HIDE_OPTION`].
+    /// That command or option ([`Hide::label`]): Muse Code's [`HIDE_COMMAND`], agy's [`AGY_HIDE_COMMAND`], Gemini CLI's [`GEMINI_HIDE_OPTION`].
     pub command: &'static str,
-    /// The notice was taken by choosing the dialog's option
-    /// ([`HideBy::Option`]): the screen after it draws the turn's error that
-    /// option leaves (Gemini CLI's `✕ [API Error: An unknown error
-    /// occurred.]`), a wall its reader reads that no longer names the limit.
-    /// A point read there is one without the notice when it names none of the
-    /// notice's words ([`Hidden::words`]).
+    /// The notice was taken by choosing the dialog's option ([`HideBy::Option`]): the screen after it draws the turn's error that option leaves (Gemini CLI's `✕ [API Error: An unknown error occurred.]`), a wall its reader reads that no longer names the limit.
     pub stopped: bool,
     /// The notice's words ([`Hide::words`]).
     pub words: &'static [&'static str],
 }
 
-/// A journal line's act: `CONTINUED`/`TYPED seq=… rule=<rule> …`.
 fn act_rule(line: &str) -> Option<&str> {
     let rest = line
         .strip_prefix("CONTINUED ")
@@ -2335,16 +1621,12 @@ fn act_rule(line: &str) -> Option<&str> {
         .find_map(|w| w.strip_prefix("rule="))
 }
 
-/// An `EVENT idle seq=<n> <words>` line's words (`-` for none read).
 fn idle_words(line: &str) -> Option<&str> {
     let rest = line.strip_prefix("EVENT idle ")?;
     let (seq, words) = rest.split_once(' ').unwrap_or((rest, ""));
     seq.starts_with("seq=").then_some(words.trim())
 }
 
-/// A point's yield as the journal read it: the first `EVENT idle` line
-/// with words after the act, and the `WAITING` the loop decided at that
-/// point (the same `seq=`).
 #[derive(Clone, Copy, Debug, Default)]
 struct Yield<'a> {
     event: Option<&'a (i64, String)>,
@@ -2352,7 +1634,6 @@ struct Yield<'a> {
 }
 
 impl Seen {
-    /// The journal's acts of `rule`, `(t, line)`.
     fn acts(&self, rule: &str) -> Vec<&(i64, String)> {
         self.journal
             .iter()
@@ -2360,7 +1641,6 @@ impl Seen {
             .collect()
     }
 
-    /// Every act the journal says was typed, any rule.
     fn all_acts(&self) -> Vec<&(i64, String)> {
         self.journal
             .iter()
@@ -2368,14 +1648,12 @@ impl Seen {
             .collect()
     }
 
-    /// The first journal line opening with `head`, after `t`.
     fn first_after(&self, head: &str, t: i64) -> Option<&(i64, String)> {
         self.journal
             .iter()
             .find(|(at, l)| *at > t && l.starts_with(head))
     }
 
-    /// The ledger's typed row of `rule` nearest after `t` (its full text).
     fn typed_row(&self, rule: &str, t: i64) -> Option<&Row> {
         self.ledger
             .iter()
@@ -2383,26 +1661,21 @@ impl Seen {
             .min_by_key(|r| r.ts)
     }
 
-    /// The text an act at `t` typed: its ledger row's, else the journal's line.
     fn act_text<'a>(&'a self, rule: &str, at: &'a (i64, String)) -> &'a str {
         self.typed_row(rule, at.0)
             .map_or(at.1.as_str(), |r| r.command.as_str())
     }
 
-    /// A `status` word as it stood last.
     fn last_status(&self, key: &str) -> Option<String> {
         self.status.last().and_then(|(_, s)| word(s, key))
     }
 
-    /// Whether `status` ever said `key=value`.
     fn status_said(&self, key: &str, value: &str, after: i64) -> bool {
         self.status
             .iter()
             .any(|(t, s)| *t >= after && word(s, key).as_deref() == Some(value))
     }
 
-    /// The yield of the act at `t`, read before `until` (the next act): its
-    /// first `EVENT idle` with words — words holding `holding`, where given.
     fn yield_after(&self, t: i64, until: Option<i64>, holding: Option<&str>) -> Yield<'_> {
         let before = |at: i64| until.is_none_or(|u| at < u);
         let event = self.journal.iter().find(|(at, l)| {
@@ -2421,8 +1694,6 @@ impl Seen {
         Yield { event, waiting }
     }
 
-    /// What says a need was raised on this tab, if anything: a `NEEDS`
-    /// line, an `ask:needs` entry in `meta`, `needs=ask` in `status`.
     fn needs_seen(&self) -> Option<String> {
         if let Some((_, l)) = self.journal.iter().find(|(_, l)| l.starts_with("NEEDS ")) {
             return Some(format!("journal {}", crate::util::one_line(l, 100)));
@@ -2466,14 +1737,10 @@ pub fn pct_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// When a time is said, relative to the watch's start `t0`.
 fn at(t0: i64, t: i64) -> String {
     crate::restore::since(t0, t)
 }
 
-/// The short turns in a row the point at `t` closed: its `point@v1` row's
-/// mark (`… (short turns in a row: N)`), else the last `WAITING` before it
-/// (`N short turn(s) in a row`) and one more.
 fn streak_at(seen: &Seen, t: i64) -> Option<u32> {
     let marked = seen
         .ledger
@@ -2495,12 +1762,7 @@ fn streak_at(seen: &Seen, t: i64) -> Option<u32> {
     })
 }
 
-/// P3 OF `docs/measured/forever-lab-2026-10-20.md`: the point records
-/// (`point@v1`) written before the first prompt at `t0` — a point judged
-/// before anyone asked the agent anything (a frame drawn before its banner,
-/// a blank first screen), which counts a short turn the agent never ran and
-/// starts every back-off a step late. None is the product's word: a first
-/// loop reads such a screen, after a launch its host saw, as no turn.
+/// P3 OF `docs/measured/forever-lab-2026-10-20.md`: the point records (`point@v1`) written before the first prompt at `t0` — a point judged before anyone asked the agent anything (a frame drawn before its banner, a blank first screen), which counts a short turn the agent never ran and starts every back-off a step late.
 #[must_use]
 pub fn points_before_prompt(seen: &Seen, t0: i64) -> Vec<&Row> {
     seen.ledger
@@ -2509,11 +1771,7 @@ pub fn points_before_prompt(seen: &Seen, t0: i64) -> Vec<&Row> {
         .collect()
 }
 
-/// The tab's first point and first back-off, as `lab forever` reports them
-/// (P3): `first point +5.6 s (short turns in a row: 1), first back-off +5.6 s
-/// "1 short turn(s) in a row: 2 min back-off", 0 point record(s) before the
-/// first prompt` — every point record before the first prompt named with its
-/// time (before `t0`: `-…`).
+/// The tab's first point and first back-off, as `lab forever` reports them (P3): `first point +5.6 s (short turns in a row: 1), first back-off +5.6 s "1 short turn(s) in a row: 2 min back-off", 0 point record(s) before the first prompt` — every point record before the first prompt named with its time (before `t0`: `-…`).
 #[must_use]
 pub fn first_point_line(seen: &Seen, t0: i64) -> String {
     let streak = |r: &Row| {
@@ -2570,10 +1828,7 @@ pub fn first_point_line(seen: &Seen, t0: i64) -> String {
     )
 }
 
-/// The ladder's next step after a point that closed `streak` short turns:
-/// the wait before the next act, were the ladder still going (none for a
-/// worker its manager waits on, through its first
-/// [`turn_end::MANAGED_SHORT_TURNS`]).
+/// The ladder's next step after a point that closed `streak` short turns: the wait before the next act, were the ladder still going (none for a worker its manager waits on, through its first [`turn_end::MANAGED_SHORT_TURNS`]).
 #[must_use]
 pub fn next_step_ms(streak: u32, managed: bool) -> i64 {
     if managed && streak <= turn_end::MANAGED_SHORT_TURNS {
@@ -2588,9 +1843,7 @@ pub fn next_step_ms(streak: u32, managed: bool) -> i64 {
     i64::try_from(d.as_millis()).unwrap_or(i64::MAX)
 }
 
-/// How long the landing at `t` is watched for after it (L5, L7): through
-/// the ladder's next step and [`PAST_NEXT_STEP_MS`] more, at least
-/// [`QUIET_AFTER_LANDED_MIN_MS`].
+/// How long the landing at `t` is watched for after it (L5, L7): through the ladder's next step and [`PAST_NEXT_STEP_MS`] more, at least [`QUIET_AFTER_LANDED_MIN_MS`].
 #[must_use]
 pub fn quiet_after_landed_ms(seen: &Seen, t: i64, managed: bool) -> i64 {
     let step = next_step_ms(streak_at(seen, t).unwrap_or(1), managed);
@@ -2598,11 +1851,7 @@ pub fn quiet_after_landed_ms(seen: &Seen, t: i64, managed: bool) -> i64 {
         .max(QUIET_AFTER_LANDED_MIN_MS)
 }
 
-/// THE JUDGE of one chain's records `seen` (its `program`: the reader's word
-/// the needs entry names), `t0` the first prompt's time: each of its
-/// scenarios' verdict, in order — every one a FAIL where the chain's records
-/// hold a fault of their own ([`chain_faults`]: an act before its due, an act
-/// typed twice, a point before the first prompt), its own judge's words kept.
+/// THE JUDGE of one chain's records `seen` (its `program`: the reader's word the needs entry names), `t0` the first prompt's time: each of its scenarios' verdict, in order — every one a FAIL where the chain's records hold a fault of their own ([`chain_faults`]: an act before its due, an act typed twice, a point before the first prompt), its own judge's words kept.
 #[must_use]
 pub fn judge(chain: Chain, seen: &Seen, program: &str, t0: i64) -> Vec<(Scenario, Verdict)> {
     let faults = chain_faults(seen, t0);
@@ -2626,7 +1875,6 @@ pub fn judge(chain: Chain, seen: &Seen, program: &str, t0: i64) -> Vec<(Scenario
         .collect()
 }
 
-/// Each scenario's own judge over the chain's records ([`judge`]).
 fn judge_scenarios(chain: Chain, seen: &Seen, program: &str, t0: i64) -> Vec<(Scenario, Verdict)> {
     let done = seen.first_after("DONE ", t0);
     let land = seen.acts(turn_end::RULE_LAND).first().copied();
@@ -2674,7 +1922,6 @@ fn judge_scenarios(chain: Chain, seen: &Seen, program: &str, t0: i64) -> Vec<(Sc
             Scenario::N2 => surfaces::judge_needs_step(seen, t0, 1),
             Scenario::N3 => surfaces::judge_needs_step(seen, t0, 2),
             Scenario::N4 => surfaces::judge_needs_step(seen, t0, 3),
-            // the harness's, judged once over every tab ([`surfaces::judge_end`])
             Scenario::End => continue,
             Scenario::W2 => cover::judge_wall_hidden(seen, land, program, t0),
             Scenario::F18 => cover::judge_person_instant(seen, t0),
@@ -2690,11 +1937,6 @@ fn judge_scenarios(chain: Chain, seen: &Seen, program: &str, t0: i64) -> Vec<(Sc
     out
 }
 
-/// L16, L17: AN END PAST THE WORK FLOOR: the land act's clean defense, long
-/// ([`long_reply_ms`]), lands the task — `DONE … rule=land@v1`, `status
-/// task=landed` — at least [`surfaces::END_WORK_FLOOR_MS`] after the act, so
-/// its busy time since the task opened is past the floor and the landing
-/// marks the tab (its end, judged on the window: [`surfaces::WANTS`]).
 fn judge_long_landing(seen: &Seen, land: Option<&(i64, String)>, t0: i64) -> Verdict {
     let Some((t1, _)) = land else {
         return Verdict::Unobserved("no land act was typed".into());
@@ -2736,7 +1978,6 @@ fn judge_long_landing(seen: &Seen, land: Option<&(i64, String)>, t0: i64) -> Ver
     }
 }
 
-/// L1: the work reply's point typed the land act, and the ledger kept its text.
 fn judge_land_act(
     seen: &Seen,
     land: Option<&(i64, String)>,
@@ -2761,20 +2002,14 @@ fn judge_land_act(
     }
 }
 
-/// What a nudge must say (L2, L4, L8–L11), and what it must not.
 struct Want {
-    /// The suffix the report quotes from, which the nudge must carry.
     head: &'static str,
-    /// The words it must carry after `head`.
     named: &'static [&'static str],
-    /// Words it must not carry after `head` (another leg's).
     not_named: &'static [&'static str],
-    /// Words it must not carry anywhere (another suffix).
     not_anywhere: [&'static str; 2],
 }
 
 impl Want {
-    /// L2: the open-work suffix, no repository suffix, no needs carry-on.
     fn open() -> Want {
         Want {
             head: OPEN_SUFFIX,
@@ -2784,8 +2019,6 @@ impl Want {
         }
     }
 
-    /// L4, L8–L11: the repository suffix naming `repo`'s leg and no other
-    /// leg, no open-work suffix, no needs carry-on.
     fn repo(repo: Repo) -> Want {
         let (named, not_named) = repo.named();
         Want {
@@ -2797,9 +2030,6 @@ impl Want {
     }
 }
 
-/// L2, L4, L8–L11: the land act's defense names open work (L2) or meets a
-/// repository holding work (the others): a nudge whose text says `want`, its
-/// yield read and waited on, no landing, no need raised.
 fn judge_nudge<'a>(
     seen: &'a Seen,
     land: Option<&(i64, String)>,
@@ -2897,32 +2127,22 @@ fn done_line(done: Option<&(i64, String)>) -> String {
     done.map_or_else(String::new, |(_, l)| crate::util::one_line(l, 120))
 }
 
-/// Whether a `meta` list (`a,b,…`, decoded) holds `item`.
 fn listed(list: &str, item: &str) -> bool {
     list.split([',', ' ']).any(|x| x == item)
 }
 
-/// Whether a `meta` snapshot holds owner `needs`'s entry as an ask
-/// (`attention_kinds=` names `ask:needs`; `attention_owners=` is a count).
 fn needs_up(m: &str) -> bool {
     word(m, "attention_kinds").is_some_and(|k| listed(&k, "ask:needs"))
 }
 
-/// The needs entry at or after `t`: the first `meta` snapshot that holds it.
 fn needs_entry(seen: &Seen, t: i64) -> Option<&(i64, String)> {
     seen.meta.iter().find(|(at, m)| *at >= t && needs_up(m))
 }
 
-/// The attention text a `meta` snapshot carries (after `attention=`, to the end).
 fn attention_text(m: &str) -> &str {
     m.split_once("attention=").map_or("", |(_, t)| t)
 }
 
-/// L3: the land act answered with a need and a defense: `NEEDS` journaled,
-/// the needs entry up with the program's word and the carry-on, `status
-/// needs=ask` while it stands, a nudge typed that tells the worker its need
-/// reached the person (and names no open work or repository), no landing
-/// before it.
 fn judge_needs<'a>(
     seen: &'a Seen,
     land: Option<&(i64, String)>,
@@ -2944,7 +2164,6 @@ fn judge_needs<'a>(
         let t = attention_text(m);
         t.starts_with(&want_text) && t.trim_end().ends_with(CARRYING_ON)
     });
-    // `needs=ask` while the entry stands: from its raise to the landing
     let until = seen.first_after("DONE ", *t1).map_or(i64::MAX, |(d, _)| *d);
     let ask = entry.and_then(|(te, _)| {
         seen.status.iter().find(|(t, s)| {
@@ -3009,14 +2228,6 @@ fn judge_needs<'a>(
     }
 }
 
-/// THE LANDING AT `t3` AND ITS QUIET (L5, L7): what is wrong with it, and
-/// what it said: `DONE … rule=land@v1`, `task=landed`, the ladder over (no
-/// `WAITING` or `until=` journaled after the DONE, no ledger row after its
-/// own point's (in the ledger's order) but `point@v1` and `task-done@v1`
-/// records, no acting row from [`AT_DONE_MS`] before the DONE on, the last row
-/// `task-done@v1` — [`TASK_DONE`]), nothing typed after it (no journal act,
-/// no ledger act, no new harness turn in the stub's dumps), and how long it
-/// was watched against [`quiet_after_landed_ms`].
 fn landing_quiet(
     seen: &Seen,
     (t3, line): &(i64, String),
@@ -3058,9 +2269,6 @@ fn landing_quiet(
         .filter(|r| r.ts >= t3 - AT_DONE_MS)
         .collect();
     let acted_after = rows_at.iter().filter(|r| r.acted()).count();
-    // After the landing's own point, in the ledger's order. A record of the
-    // read that judged it, written just before it, is that read's (a wall's
-    // track ended: `wall-wait-end@v1`, measured 4 ms ahead of the point).
     let own_point = rows_at
         .iter()
         .position(|r| r.decision == "waiting" && r.rule == RULE_POINT)
@@ -3130,10 +2338,6 @@ fn landing_quiet(
     (bad, said, window)
 }
 
-/// L5: the nudge answered with a clean defense over a clean repository:
-/// the landing and its quiet ([`landing_quiet`]), the needs entry cleared,
-/// the nudge naming no open work or repository, and no task record where
-/// none was given (`OK task -` throughout: the record's leg is L7's).
 fn judge_landed<'a>(
     seen: &'a Seen,
     land: Option<&(i64, String)>,
@@ -3206,9 +2410,6 @@ fn judge_landed<'a>(
     landed_verdict(bad, said, seen, done.0, window)
 }
 
-/// A landing's verdict from what is wrong with it: FAIL on anything, then
-/// UNOBSERVED where the stub's witness went unread or the watch ended inside
-/// `window`, else PASS.
 fn landed_verdict(bad: Vec<String>, said: String, seen: &Seen, t3: i64, window: i64) -> Verdict {
     if !bad.is_empty() {
         return Verdict::Fail(format!("{said}: {}", bad.join("; ")));
@@ -3225,11 +2426,6 @@ fn landed_verdict(bad: Vec<String>, said: String, seen: &Seen, t3: i64, window: 
     Verdict::Pass(said)
 }
 
-/// L7: a worker's task (its record `working`, given before the agent
-/// started) landed by a clean defense at the land act's yield: the landing
-/// and its quiet ([`landing_quiet`]), `TASK … done why=landed` journaled,
-/// the record `state=done why=landed` after it, every change of it read
-/// ([`rev_gaps`]), no need raised.
 fn judge_tasked(seen: &Seen, land: Option<&(i64, String)>, t0: i64) -> Verdict {
     let given = seen
         .task
@@ -3282,9 +2478,6 @@ fn judge_tasked(seen: &Seen, land: Option<&(i64, String)>, t0: i64) -> Verdict {
     if let Some(n) = seen.needs_seen() {
         bad.push(format!("a need was raised, though no reply named one: {n}"));
     }
-    // Every change of the record read (F13 of the review of
-    // `b9/forever-gaps`): a stall raised and lifted between two looks moves
-    // its rev by two, and shows nowhere else.
     let gaps = rev_gaps(seen, t0);
     if !gaps.is_empty() {
         bad.push(format!(
@@ -3292,8 +2485,6 @@ fn judge_tasked(seen: &Seen, land: Option<&(i64, String)>, t0: i64) -> Verdict {
             gaps.join(", ")
         ));
     }
-    // The worker worked from its first reply to the landing: its record
-    // reads working, then done, and nothing stands for a person between.
     if let Some((t, r)) = seen
         .task
         .iter()
@@ -3330,9 +2521,6 @@ fn judge_tasked(seen: &Seen, land: Option<&(i64, String)>, t0: i64) -> Verdict {
     landed_verdict(bad, said, seen, done.0, window)
 }
 
-/// L6: a reply taller than the window, a need at its top and the defense at
-/// its bottom: no landing, the need raised, and the worker carried on — the
-/// nudge after the need typed, telling it the need reached the person.
 fn judge_tall(
     seen: &Seen,
     land: Option<&(i64, String)>,
@@ -3400,9 +2588,6 @@ fn judge_tall(
     }
 }
 
-/// C1: the done claim's point typed Cruise's done check, ledgered, naming
-/// no open work (the claim names none) and no repository (it is clean), no
-/// need raised.
 fn judge_check(seen: &Seen, t0: i64) -> Verdict {
     let Some(check) = seen.acts(turn_end::RULE_DONE_CHECK).first().copied() else {
         return Verdict::Fail(format!(
@@ -3436,11 +2621,6 @@ fn judge_check(seen: &Seen, t0: i64) -> Verdict {
     ))
 }
 
-/// C2: the done check answered with a defense, READ (an `EVENT idle` line
-/// after the check whose words carry `Nothing left:`, before the next act)
-/// and WAITED ON (that point's `WAITING`): never `DONE`, never
-/// `task=landed`, no need raised, and the next point continues (an act
-/// typed after the back-off).
 fn judge_cruise_goes_on(seen: &Seen, done: Option<&(i64, String)>, t0: i64) -> Verdict {
     let checks = seen.acts(turn_end::RULE_DONE_CHECK);
     let Some((t1, _)) = checks.first() else {
@@ -3507,19 +2687,10 @@ fn judge_cruise_goes_on(seen: &Seen, done: Option<&(i64, String)>, t0: i64) -> V
     }
 }
 
-/// The longest an act's point may come after it to be the act's answer
-/// judged as it showed (P4L, P4C): under the take window
-/// ([`turn_end::TurnEndTiming::take_within`]), whose end judges an act
-/// whose turn nothing showed as one never taken.
 fn take_window_ms() -> i64 {
     i64::try_from(turn_end::TurnEndTiming::default().take_within.as_millis()).unwrap_or(i64::MAX)
 }
 
-/// Every act typed twice with no point judged between (every chain's:
-/// [`chain_faults`]; F12 of the review of `b9/forever-gaps`, where only P4's
-/// chains asked): a pair of journal acts with no `WAITING` (but the take
-/// window's own), no `DONE` and no `LEFT` journaled between them, said as
-/// `+t1 rule then +t2 rule`.
 fn doubled_acts(seen: &Seen, t0: i64) -> Vec<String> {
     let acts = seen.all_acts();
     acts.windows(2)
@@ -3545,12 +2716,8 @@ fn doubled_acts(seen: &Seen, t0: i64) -> Vec<String> {
         .collect()
 }
 
-/// A journal line and when it was read.
 type Line = (i64, String);
 
-/// The first point judged after `t` (before `until`): the first `EVENT
-/// idle` line with words (`-` is none), and the `WAITING` or `DONE` decided
-/// at it — the point's own line, or the next of either.
 fn point_after(seen: &Seen, t: i64, until: Option<i64>) -> Option<(&Line, Option<&Line>)> {
     let before = |at: i64| until.is_none_or(|u| at < u);
     let event = seen.journal.iter().find(|(at, l)| {
@@ -3562,12 +2729,6 @@ fn point_after(seen: &Seen, t: i64, until: Option<i64>) -> Option<(&Line, Option
     Some((event, decided))
 }
 
-/// Whether a journal line is a BACK-OFF the loop waits out before its next
-/// act: `WAITING … until=<stamp> N short turn(s) in a row: M min back-off`
-/// (the turn-end ladder), or `… usage-session resets` / `… spend resets`
-/// (a wall's) — not the take window's (`the worker to take the … act`), a
-/// person's (`a person is typing`, `… stopped the turn with Esc`), which
-/// name no act's due.
 fn backoff_named(line: &str) -> bool {
     line.starts_with("WAITING ")
         && line.split_once(" until=").is_some_and(|(_, rest)| {
@@ -3576,8 +2737,6 @@ fn backoff_named(line: &str) -> bool {
         })
 }
 
-/// A back-off's due ([`backoff_named`]): its `until=` stamp, unix ms; `None`
-/// where the line is none, or its stamp does not read.
 fn backoff_due(line: &str) -> Option<i64> {
     if !backoff_named(line) {
         return None;
@@ -3586,16 +2745,8 @@ fn backoff_due(line: &str) -> Option<i64> {
     crate::workers::iso_ms(rest.split_whitespace().next()?)
 }
 
-/// How far apart two dues of ONE back-off may be read ([`same_backoff`]):
-/// each `until=` is the decision's own stamp, to the second.
 const SAME_DUE_MS: i64 = 1000;
 
-/// Whether two journal lines tell THE SAME BACK-OFF ([`backoff_named`]): the
-/// same short turns in a row (none, for a wall's) and dues within
-/// [`SAME_DUE_MS`]. A standing back-off told again at a re-read of its point
-/// keeps its streak and its due, under the re-read's own `seq=` or its
-/// point's (`r3-res-claude`, agy, Muse Code: the re-wrap's re-read journaled
-/// `WAITING seq=1219`, `1147`, `1198` with the first point's `until=`).
 fn same_backoff(a: &str, b: &str) -> bool {
     backoff_named(a)
         && backoff_named(b)
@@ -3603,10 +2754,6 @@ fn same_backoff(a: &str, b: &str) -> bool {
         && matches!((backoff_due(a), backoff_due(b)), (Some(x), Some(y)) if (x - y).abs() <= SAME_DUE_MS)
 }
 
-/// The first back-off decided after `t` at a point of its own
-/// ([`backoff_named`]): a `WAITING` that tells none journaled at or before
-/// `t` again — neither by its `seq=` (the same point's) nor by its streak and
-/// due ([`same_backoff`]: a re-read of the point under a `seq=` of its own).
 fn own_backoff_after(seen: &Seen, t: i64) -> Option<&Line> {
     let standing: Vec<&str> = seen
         .journal
@@ -3623,8 +2770,6 @@ fn own_backoff_after(seen: &Seen, t: i64) -> Option<&Line> {
     })
 }
 
-/// The short turns in a row a turn-end back-off names (`WAITING … until=<stamp>
-/// N short turn(s) in a row: …`).
 fn backoff_streak(line: &str) -> Option<u32> {
     let (_, rest) = line.split_once(" until=")?;
     let mut words = rest.split_whitespace().skip(1);
@@ -3632,8 +2777,7 @@ fn backoff_streak(line: &str) -> Option<u32> {
     (words.next() == Some("short")).then_some(n)
 }
 
-/// A step of the short back-off ladder as the journal decided it
-/// ([`ladder_steps`]).
+/// A step of the short back-off ladder as the journal decided it ([`ladder_steps`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Step {
     /// When its `WAITING` was journaled first.
@@ -3646,11 +2790,7 @@ pub struct Step {
     pub line: String,
 }
 
-/// The short back-off ladder's steps from `t0`, as the journal decided them:
-/// the first turn-end `WAITING … N short turn(s) in a row: …` of each point,
-/// in order — a wall's back-off and the take window's left out, and a step
-/// told again left out whether under its point's `seq=` or a re-read's own
-/// ([`same_backoff`]: the same streak and due).
+/// The short back-off ladder's steps from `t0`, as the journal decided them: the first turn-end `WAITING … N short turn(s) in a row: …` of each point, in order — a wall's back-off and the take window's left out, and a step told again left out whether under its point's `seq=` or a re-read's own ([`same_backoff`]: the same streak and due).
 #[must_use]
 pub fn ladder_steps(seen: &Seen, t0: i64) -> Vec<Step> {
     let mut seqs: Vec<Option<String>> = Vec::new();
@@ -3676,8 +2816,6 @@ pub fn ladder_steps(seen: &Seen, t0: i64) -> Vec<Step> {
     out
 }
 
-/// A point's journal line with words: `EVENT <phase> seq=<n> <words>`, its
-/// words neither empty nor `-`.
 fn worded_event(line: &str) -> bool {
     line.strip_prefix("EVENT ")
         .and_then(|rest| rest.split_once(' '))
@@ -3688,12 +2826,6 @@ fn worded_event(line: &str) -> bool {
         .is_some_and(|w| !w.is_empty() && w != "-")
 }
 
-/// EVERY ACT TYPED BEFORE THE DUE ITS BACK-OFF NAMED (F10 of the review of
-/// `b9/forever-gaps`): an act whose last back-off journaled since the act
-/// before it ([`backoff_named`]) — no point judged after that back-off (no
-/// `EVENT` with words of another `seq=`: that point's own decision typed it)
-/// — came more than [`DUE_SLACK_MS`] before the back-off's `until=`; and a
-/// back-off whose stamp does not read. Said as `+t rule typed … before …`.
 fn early_acts(seen: &Seen, t0: i64) -> Vec<String> {
     let mut out = Vec::new();
     let mut prev = i64::MIN;
@@ -3735,13 +2867,6 @@ fn early_acts(seen: &Seen, t0: i64) -> Vec<String> {
     out
 }
 
-/// PERSISTENCE AFTER `t` (F9 of the review of `b9/forever-gaps`): nothing was
-/// typed after `t`, and the session was watched past where it should have
-/// gone on — the last back-off journaled after `t` named its act due at a
-/// time the watch ran [`PERSISTENCE_GRACE_MS`] past, or no point was judged
-/// after `t` at all (no back-off, no `DONE`, no `LEFT`) for [`UNJUDGED_MS`].
-/// Then why, opening `PERSISTENCE LOST`, for a FAIL; `None` where an act was
-/// typed after `t`, or the watch ended before either (UNOBSERVED).
 fn lost_after(seen: &Seen, t: i64, t0: i64) -> Option<String> {
     if seen.all_acts().iter().any(|(at, _)| *at > t) {
         return None;
@@ -3780,13 +2905,6 @@ fn lost_after(seen: &Seen, t: i64, t0: i64) -> Option<String> {
     }
 }
 
-/// P3 AS A VERDICT (F11 of the review of `b9/forever-gaps`): no point record
-/// (`point@v1`) before the chain's first prompt — a person's Enter where a
-/// person typed it ([`Cover::person_ms`], L13), else `t0` — and the first one
-/// after it closing one short turn (none where that point was left to its
-/// person: its `left-to-person@v1` record beside it). A launch's frame
-/// judged as a turn counts a short turn the agent never ran and starts every
-/// back-off a step late, which no act's due shows.
 fn p3_faults(seen: &Seen, t0: i64) -> Vec<String> {
     let from = seen.cover.person_ms.unwrap_or(t0);
     let streak = |r: &Row| -> Option<u32> {
@@ -3828,11 +2946,7 @@ fn p3_faults(seen: &Seen, t0: i64) -> Vec<String> {
     out
 }
 
-/// What fails every scenario of a chain, whatever each scenario's own judge
-/// says (the review of `b9/forever-gaps`, F10–F12): an act typed before the
-/// due its back-off named ([`early_acts`]), an act typed twice with no point
-/// judged between ([`doubled_acts`]), a point before the first prompt or a
-/// first point that closed other than one short turn ([`p3_faults`]).
+/// What fails every scenario of a chain, whatever each scenario's own judge says (the review of `b9/forever-gaps`, F10–F12): an act typed before the due its back-off named ([`early_acts`]), an act typed twice with no point judged between ([`doubled_acts`]), a point before the first prompt or a first point that closed other than one short turn ([`p3_faults`]).
 #[must_use]
 pub fn chain_faults(seen: &Seen, t0: i64) -> Vec<String> {
     let mut out = early_acts(seen, t0);
@@ -3846,11 +2960,6 @@ pub fn chain_faults(seen: &Seen, t0: i64) -> Vec<String> {
     out
 }
 
-/// TASK RECORD CONTINUITY (F13 of the review of `b9/forever-gaps`): the
-/// record's `rev=` moves by one at every change (its state, its attention),
-/// and the run reads it at each look; a rev that moved by more than one
-/// between looks is a change nobody read (a stall raised and lifted between
-/// two looks), said as `rev a then b at +t`.
 fn rev_gaps(seen: &Seen, t0: i64) -> Vec<String> {
     let revs: Vec<(i64, u64)> = seen
         .task
@@ -3863,14 +2972,6 @@ fn rev_gaps(seen: &Seen, t0: i64) -> Vec<String> {
         .collect()
 }
 
-/// P4L: under Land, every reply sent at once — over before any read sees
-/// the worker busy. The first prompt's reply is judged: READ (a point
-/// holding its words) and its back-off decided there, the land act typed
-/// after it. The land act's clean defense is
-/// its answer, judged as it shows (within the take window, never at its
-/// end as an act never taken): the task lands, `land@v1` typed once and
-/// nothing else before the landing, and the landing is quiet
-/// ([`landing_quiet`]).
 fn judge_instant_land(
     seen: &Seen,
     land: Option<&(i64, String)>,
@@ -3892,9 +2993,6 @@ fn judge_instant_land(
             )
         ));
     };
-    // THE FIRST REPLY READ (F7 of the review of `b9/forever-gaps`): a point
-    // holding its words before the land act, and the back-off decided at
-    // THAT point — not a land act typed after a point read as no words.
     let Some((te, el)) = seen
         .journal
         .iter()
@@ -3983,15 +3081,6 @@ fn judge_instant_land(
     landed_verdict(bad, said, seen, done.0, window)
 }
 
-/// P4C: under Cruise, every reply sent at once. The first reply's done
-/// claim is judged (the done check typed); the check's defense is its
-/// answer, judged as it shows (its point read within the take window, and
-/// decided: its `WAITING`, never the take window's own), never `DONE`; the
-/// chain goes on — an act typed after the back-off (the person's prompt
-/// mid-chain comes inside it, so the act follows that prompt's own
-/// back-off), nothing typed by the due and a minute more being persistence
-/// lost ([`lost_after`]); no act is typed twice with no point judged
-/// between.
 fn judge_instant_cruise(seen: &Seen, done: Option<&(i64, String)>, t0: i64) -> Verdict {
     let acts = seen.all_acts();
     let Some((t1, l1)) = acts.first().copied() else {
@@ -4035,8 +3124,6 @@ fn judge_instant_cruise(seen: &Seen, done: Option<&(i64, String)>, t0: i64) -> V
         ));
     }
     let again = acts.get(1).copied();
-    // The person's prompt mid-chain ([`Chain::asks`]) comes once the check's
-    // yield is decided: its point is P4P's, and the next act may follow it.
     let until = again.map(|(t, _)| *t);
     let y = seen.yield_after(*t1, until, Some(DEFENSE_HEAD));
     let Some((te, el)) = y.event else {
@@ -4078,10 +3165,6 @@ fn judge_instant_cruise(seen: &Seen, done: Option<&(i64, String)>, t0: i64) -> V
             act_rule(l2).unwrap_or("?"),
             at(t0, *t2)
         )),
-        // The person's prompt mid-chain comes in this back-off; the chain
-        // goes on only where an act follows (after that prompt's own
-        // back-off): a decision with nothing typed after it is no going on
-        // (F5 of the review of `b9/forever-gaps`).
         None => match lost_after(seen, *te, t0) {
             Some(lost) => Verdict::Fail(format!("{read}; {waited}: {lost}")),
             None => Verdict::Unobserved(format!(
@@ -4092,15 +3175,6 @@ fn judge_instant_cruise(seen: &Seen, done: Option<&(i64, String)>, t0: i64) -> V
     }
 }
 
-/// P4P: a person's prompt typed mid-chain while the loop waits out a back-off
-/// ([`Chain::asks`]), its reply sent at once — over before any read sees the
-/// worker busy — is judged as it shows: its point read (an `EVENT idle` with
-/// the reply's words, within the take window of the prompt) and decided
-/// there (its own back-off's `WAITING`, the same `seq=`: never another
-/// point's, never a `LEFT` — the control verb stamps no person's hand), no
-/// act typed between the prompt and that point, no act typed twice with no
-/// point judged between, and the act at that back-off's due typed (nothing
-/// by the due and a minute more is persistence lost).
 fn judge_instant_ask(seen: &Seen, t0: i64) -> Verdict {
     let Some(asked) = seen.asked_ms else {
         return Verdict::Unobserved(match seen.ask_refused_ms {
@@ -4159,10 +3233,6 @@ fn judge_instant_ask(seen: &Seen, t0: i64) -> Verdict {
             "{read}; acts typed with no point judged between: {doubled:?}"
         ));
     }
-    // DECIDED AT THAT POINT (F6 of the review of `b9/forever-gaps`): its own
-    // back-off, the same `seq=` — not another point's `WAITING`, and never a
-    // `LEFT`: the lab types the prompt through the control verb, which
-    // stamps no person's hand, so the turn is nobody's own exchange.
     if let Some((tl, ll)) = seen
         .journal
         .iter()
@@ -4201,7 +3271,6 @@ fn judge_instant_ask(seen: &Seen, t0: i64) -> Verdict {
         at(t0, *tw),
         crate::util::one_line(wl, 110)
     );
-    // AND THE CHAIN GOES ON after it (F5): the act at that back-off's due.
     match next_act {
         Some((ta, la)) => Verdict::Pass(format!(
             "{read}; {decided}; {} typed at +{}",
@@ -4218,10 +3287,6 @@ fn judge_instant_ask(seen: &Seen, t0: i64) -> Verdict {
     }
 }
 
-/// OFF: a done reply under Off, then for [`QUIET_UNDER_OFF_MS`] the
-/// supervisor never on the tab (`supervisor=-` at every look, no journal),
-/// nothing typed (no ledger act, no harness-marked turn in the stub's
-/// dumps of the conversation), no need raised.
 fn judge_off(seen: &Seen, t0: i64) -> Verdict {
     let acted = seen.ledger.iter().filter(|r| r.acted()).count();
     let autopilot = seen.last_status("autopilot").unwrap_or_else(|| "?".into());
@@ -4272,14 +3337,10 @@ fn judge_off(seen: &Seen, t0: i64) -> Verdict {
     Verdict::Pass(said)
 }
 
-// The live run.
-
 fn could_not(m: &str) -> Fail {
     Fail::exit(3, format!("forever: COULD NOT RUN: {m}"))
 }
 
-/// `git` in the scratch, by path, its global and system configuration
-/// left out (`GIT_CONFIG_GLOBAL=/dev/null`): the owner's is never read.
 fn git(home: &Path, dir: &Path, args: &[&str]) -> Result<(), String> {
     let out = aterm_uds::spawnfd::command("/usr/bin/git")
         .args([
@@ -4314,9 +3375,6 @@ fn git(home: &Path, dir: &Path, args: &[&str]) -> Result<(), String> {
     }
 }
 
-/// The chain's scratch repository, `<proj>/<chain>`, its `main` pushed to
-/// the local bare `<sockdir>/origin-<chain>.git` and `origin/HEAD` naming
-/// it, then left as its [`Repo`] says. Its physical path.
 fn lay_repo(run: &Run, chain: Chain) -> Result<PathBuf, String> {
     let home = run.w.join("home");
     let dir = Path::new(&run.proj).join(chain.name());
@@ -4362,8 +3420,6 @@ fn lay_repo(run: &Run, chain: Chain) -> Result<PathBuf, String> {
     std::fs::canonicalize(&dir).map_err(|e| format!("{}: {e}", dir.display()))
 }
 
-/// Claude Code's folder trust for each repository (the scratch
-/// `.claude.json`'s `projects`), written before any Claude Code runs.
 fn trust_for_claude(run: &Run, dirs: &[PathBuf]) -> Result<(), Fail> {
     let p = run.w.join("home/.claude/.claude.json");
     let text = crate::util::scratch_text(&p);
@@ -4372,7 +3428,6 @@ fn trust_for_claude(run: &Run, dirs: &[PathBuf]) -> Result<(), Fail> {
         Some(J::Obj(m)) => m.clone(),
         _ => Vec::new(),
     };
-    // each repository's physical path and its `/tmp` spelling: the key is the cwd as the agent reads it
     let keys = dirs.iter().flat_map(|d| {
         let real = d.to_string_lossy().into_owned();
         let short = real.strip_prefix("/private").map(str::to_string);
@@ -4406,9 +3461,7 @@ fn trust_for_claude(run: &Run, dirs: &[PathBuf]) -> Result<(), Fail> {
     .map_err(|e| could_not(&format!("{}: {e}", p.display())))
 }
 
-/// Gemini CLI's `trustedFolders.json` trusting the lab's project (`proj`, as
-/// named and as resolved) and every folder under it: the manager's and the
-/// other chains' folders, under L15's folder trust ([`launcher`]).
+/// Gemini CLI's `trustedFolders.json` trusting the lab's project (`proj`, as named and as resolved) and every folder under it: the manager's and the other chains' folders, under L15's folder trust ([`launcher`]).
 #[must_use]
 pub fn gemini_trusted_project(proj: &str) -> String {
     let real = std::fs::canonicalize(proj)
@@ -4420,14 +3473,6 @@ pub fn gemini_trusted_project(proj: &str) -> String {
     J::Obj(rows).dump(crate::pyjson::PY)
 }
 
-/// The script each chain's tab runs: the harness's launcher, written once
-/// into the run directory (each tab types `sh <it>` in its own repository),
-/// its seeds laid (Gemini CLI's folder trust on for a run with L15's
-/// `worker`); its path. A walled run (`walled`: a wall chain, alone on its
-/// lab) launches Claude Code on its subscriber path (`claude --subscriber`'s
-/// fake claude.ai login, the key helper out of the settings), the one on
-/// which it reads the stub's usage limit off the unified-limit headers and
-/// draws its own usage wall, and Gemini CLI in a zone not the machine's.
 fn launcher(
     run: &Run,
     h: Harness,
@@ -4455,8 +3500,6 @@ fn launcher(
         Harness::Gemini => {
             crate::gemini::seed(run, Agent::Gemini, &crate::gemini::Launch::default())?;
             if worker {
-                // L15: the folder trust on, the project trusted in the home's
-                // own file; the worker's line names a file of its own instead
                 let home = run.w.join(Agent::Gemini.home()).join(".gemini");
                 put(
                     &home.join("settings.json"),
@@ -4469,9 +3512,6 @@ fn launcher(
                     &gemini_trusted_project(&run.proj),
                 )?;
             }
-            // A walled run's Gemini CLI in a zone not the machine's: its
-            // dialog names its reset in its own process's zone, which the
-            // loop must read (`Access resets at 10:13 PM GMT+5:30.`).
             let tz = walled
                 .then(|| format!("TZ={}", foreign_tz(crate::util::now_ms() / 1000)))
                 .into_iter()
@@ -4479,7 +3519,6 @@ fn launcher(
             crate::gemini::launcher(run, Agent::Gemini, &tz, &[])
         }
         Harness::Agy => {
-            // the provider seeded (never a Google sign-in) and every repository trusted
             crate::gemini::seed(run, Agent::Agy, &crate::gemini::Launch::default())?;
             let dir = run.w.join("agy-home/.gemini/antigravity-cli");
             put(
@@ -4495,9 +3534,6 @@ fn launcher(
     Ok(script)
 }
 
-/// Every repository of the run as agy's settings trust it: each path, and
-/// each without its `/private` (agy keys a workspace by the path it was
-/// given).
 fn agy_trusted(dirs: &[PathBuf]) -> Vec<String> {
     let mut trusted: Vec<String> = dirs
         .iter()
@@ -4511,39 +3547,15 @@ fn agy_trusted(dirs: &[PathBuf]) -> Vec<String> {
     trusted
 }
 
-/// THE RENDERER THAT TAKES THE WHEEL, for `tall-scroll`'s tab
-/// ([`scroll_launcher`]): the harness reads the tab's LIVE screen (`text
-/// --json`), which a scroll of the tab's own viewport never moves, so only an
-/// agent that scrolls its own view brings a judged opener back into the
-/// harness's sight. Each renderer below draws on the alternate screen and
-/// tracks the mouse (`modes`, measured in the lab 2026-10-22, `r4-m-*`):
-/// Claude Code's fullscreen one (`CLAUDE_CODE_NO_FLICKER=1`:
-/// `mouse_mode=any`), Gemini CLI's alternate buffer (`ui.useAlternateBuffer`
-/// in a system settings file named by `GEMINI_CLI_SYSTEM_SETTINGS_PATH`:
-/// `mouse_mode=button`), and agy's no-flickering one (its `/settings`
-/// Rendering Mode, written `"altScreenMode": "always"` into its settings, in
-/// a home of the tab's own, [`SCROLL_AGY_HOME`]: `mouse_mode=button`). Each
-/// default renderer draws on the main screen with no mouse tracking
-/// (`r4-f2`); Muse Code has no other (no mouse-tracking sequence in its
-/// build), so its tab runs the run's own launcher.
+/// THE RENDERER THAT TAKES THE WHEEL, for `tall-scroll`'s tab ([`scroll_launcher`]): the harness reads the tab's LIVE screen (`text --json`), which a scroll of the tab's own viewport never moves, so only an agent that scrolls its own view brings a judged opener back into the harness's sight.
 pub const SCROLL_CLAUDE_ENV: &str = "CLAUDE_CODE_NO_FLICKER=1";
-/// agy's `tall-scroll` home under the run's scratch ([`SCROLL_CLAUDE_ENV`]'s
-/// reason): its settings the run's with `altScreenMode` `always`, and its
-/// onboarding done.
+/// agy's `tall-scroll` home under the run's scratch ([`SCROLL_CLAUDE_ENV`]'s reason): its settings the run's with `altScreenMode` `always`, and its onboarding done.
 pub const SCROLL_AGY_HOME: &str = "agy-scroll-home";
-/// The system settings Gemini CLI's `tall-scroll` tab reads
-/// ([`SCROLL_CLAUDE_ENV`]'s reason).
+/// The system settings Gemini CLI's `tall-scroll` tab reads ([`SCROLL_CLAUDE_ENV`]'s reason).
 pub const SCROLL_GEMINI_SETTINGS: &str = "{\"ui\":{\"useAlternateBuffer\":true}}";
 /// Where [`SCROLL_GEMINI_SETTINGS`] is written, under the run's scratch.
 pub const SCROLL_GEMINI_FILE: &str = "gemini-scroll-settings.json";
 
-/// `tall-scroll`'s own launcher on harness `h`, written beside the run's
-/// ([`launcher`], whose repositories `dirs` and `walled` it shares): the
-/// run's with the renderer that takes the wheel ([`SCROLL_CLAUDE_ENV`]);
-/// `None` where the run's own serves it.
-///
-/// # Errors
-/// A file could not be written.
 fn scroll_launcher(
     run: &Run,
     h: Harness,
@@ -4565,9 +3577,6 @@ fn scroll_launcher(
             },
         ),
         Harness::Gemini => {
-            // under the run's scratch, which `down` removes whole, as agy's
-            // home: in the run directory, whose sweep keeps no `.json`, it
-            // outlived the run (`r4-f3-gemini`)
             let settings = run.w.join(SCROLL_GEMINI_FILE);
             put(&settings, 0o644, SCROLL_GEMINI_SETTINGS)?;
             let mut envs = vec![format!(
@@ -4609,11 +3618,7 @@ fn scroll_launcher(
     Ok(Some(script))
 }
 
-/// The zone a walled run's Gemini CLI runs in ([`launcher`]): one whose
-/// offset at the unix second `now` is not the machine's, and a half-hour one
-/// (a guess of the machine's zone, or any whole hour off it, never lands on
-/// it): `Asia/Kolkata` (GMT+5:30, no daylight saving), or `America/St_Johns`
-/// (GMT-2:30 or -3:30) on a machine at +5:30.
+/// The zone a walled run's Gemini CLI runs in ([`launcher`]): one whose offset at the unix second `now` is not the machine's, and a half-hour one (a guess of the machine's zone, or any whole hour off it, never lands on it): `Asia/Kolkata` (GMT+5:30, no daylight saving), or `America/St_Johns` (GMT-2:30 or -3:30) on a machine at +5:30.
 #[must_use]
 pub fn foreign_tz(now: i64) -> &'static str {
     if crate::sys::local_offset_s(now) == 19_800 {
@@ -4623,20 +3628,16 @@ pub fn foreign_tz(now: i64) -> &'static str {
     }
 }
 
-/// One tab of the run: its chain, its session, its repository.
 struct Tab {
     chain: Chain,
     sid: String,
     dir: PathBuf,
     seen: Seen,
     t0: i64,
-    /// The person's prompt ([`Chain::asks`]) was tried: it is typed once.
     ask_tried: bool,
-    /// Watching ended.
     over: bool,
 }
 
-/// `@<sid> <args…>` on the lab, its standard output.
 fn on(door: &Door<'_>, sid: &str, args: &[&str]) -> String {
     let at = format!("@{sid}");
     let mut v = vec![at.as_str()];
@@ -4644,14 +3645,10 @@ fn on(door: &Door<'_>, sid: &str, args: &[&str]) -> String {
     door.out(&v)
 }
 
-/// Whether the agent in tab `sid` stands at its composer: its reader finds one.
 fn at_composer(door: &Door<'_>, sid: &str, agent: &str) -> Option<String> {
     crate::screen::composer_row(agent, &on(door, sid, &["text"]))
 }
 
-/// A turn typed into tab `sid` as `lab turn` types one (the text, then Enter
-/// once it stands in the composer; Enter again, once, while it still stands
-/// there): whether the composer took it.
 fn tab_turn(door: &Door<'_>, sid: &str, agent: &str, text: &str) -> Result<bool, Fail> {
     let at = format!("@{sid}");
     if door.ctl(&[&at, "send", text])?.code != 0 {
@@ -4684,16 +3681,6 @@ fn tab_turn(door: &Door<'_>, sid: &str, agent: &str, text: &str) -> Result<bool,
     Ok(false)
 }
 
-/// A turn typed into tab `sid` AS A PERSON TYPES ONE, through the
-/// development seam `send|key as=person` (a person's gesture through the
-/// window's own input seam, which a headless lab has no window to key): the
-/// text, which stands in the composer for [`PERSON_STAND_MS`], then Enter,
-/// once more while it still stands there: when the Enter that took it went
-/// in, and `status human_ms=` then ([`Cover::person_stamp`]: whether a
-/// person's gesture reached the session at all). `None` where the composer
-/// did not take the text; an aterm without the seam is the run's end, named:
-/// one that refuses `as=person`, or one older than it, which types the word
-/// as text into the composer.
 fn person_turn(
     door: &Door<'_>,
     sid: &str,
@@ -4743,24 +3730,6 @@ fn person_turn(
     Ok(None)
 }
 
-/// A turn typed into tab `sid` WITH A PERSON'S KEYS (`forever --window`):
-/// each character, then Enter, pressed through `hwkey`, a real `NSEvent`
-/// posted into the windowed instance's own event queue, so each key takes
-/// the path a key press takes (`sendEvent:`, winit's `keyDown:`, the
-/// `KeyboardInput` arm, the App input seam with a person's source): no
-/// seam, no control write. The desk idle first
-/// ([`crate::meta_keys::await_idle`]), then the tab raised (`raise <sid>`:
-/// its tab selected in the window `hwkey` posts to; the jail's instance is no
-/// Launch Services application, so nothing makes it the active app and
-/// `hwkey` answers `key=0`). The text stands in the composer for
-/// [`PERSON_STAND_MS`], then Enter, once more while it still stands there:
-/// when the Enter that took it went in, `status human_ms=` then, and what
-/// the keys did ([`Keyed`]: `status human_seq=` before the first key and
-/// after the Enter, which the judge holds to the keys posted). The wait for
-/// the draft is a one-minute hang detector ([`DRAFT_HANG`]), never a latency
-/// budget: one client per key makes the typing take seconds. `None` where
-/// the composer did not take the text; a refused `hwkey` (no window: a
-/// headless lab) or `raise` is the run's end, named.
 fn person_keys(
     door: &Door<'_>,
     sid: &str,
@@ -4814,8 +3783,6 @@ fn person_keys(
     let last = now_ms();
     let standing = |door: &Door<'_>| at_composer(door, sid, agent).as_deref() == Some(text);
     if !crate::wait_until(DRAFT_HANG, || standing(door)) {
-        // what the keys came to, for the COULD NOT RUN that follows: whether
-        // the window counted them as a person's, and what the composer holds
         let after = seq(&on(door, sid, &["status"]));
         println!(
             "  keys      @{sid}: no draft stood within {} s of {} key(s) posted by hwkey ({} to the key window); status human_seq= {} -> {}; the composer held {}",
@@ -4852,8 +3819,7 @@ fn person_keys(
     Ok(None)
 }
 
-/// The `hwkey` name of the key that types `c`: `space` for a space (the verb
-/// splits its words on it), the character itself otherwise.
+/// The `hwkey` name of the key that types `c`: `space` for a space (the verb splits its words on it), the character itself otherwise.
 #[must_use]
 pub fn hwkey_name(c: char) -> String {
     if c == ' ' {
@@ -4863,28 +3829,8 @@ pub fn hwkey_name(c: char) -> String {
     }
 }
 
-/// What a manager's wait on its worker came to: when it returned, its exit
-/// status and what it printed.
 type Awaited = Arc<Mutex<Option<(i64, i32, String)>>>;
 
-/// L15: THE WORKER'S SHELL, as a person's is where the harness under test
-/// runs: the shell startup file (`<scratch>/home/.zshrc`) exports what the
-/// lab's launcher gives the agent but its homes, which the worker's line
-/// carries from its starter (the relaunch lanes' labs' own `shell_exports`:
-/// the provider's key and base URL at the stub, the black hole, no browser),
-/// and for agy and Muse Code, whose manager runs a store build, atpkg's
-/// managed twin of the lab's build is laid where the instance's prefix names
-/// it (`<scratch>/home/Library/Application Support/aterm/pkg/agents/<word>`),
-/// the program a worker's line types for a store-build starter (as their
-/// relaunch lines do); for Gemini CLI, whose line types the word `gemini`,
-/// the lab's wrapper of its build leads the startup file's `PATH`. Written
-/// just before the spawn, so only the worker's new shell reads it (every
-/// other tab's shell started before). Claude Code's worker needs none of it:
-/// its line carries its Claude home, whose settings name the stub. `None`
-/// for Claude Code, else what was laid, for the report.
-///
-/// # Errors
-/// A file could not be written.
 fn worker_shell(run: &Run, h: Harness) -> Result<Option<String>, Fail> {
     let put = |p: &Path, mode: u32, text: &str| {
         crate::sys::put(p, mode, &crate::sys::PutSrc::Bytes(text.as_bytes()))
@@ -4932,9 +3878,7 @@ fn worker_shell(run: &Run, h: Harness) -> Result<Option<String>, Fail> {
     Ok(Some(laid))
 }
 
-/// The lab's `gemini` on the worker shell's `PATH` (`<run>/gbin`, out of the
-/// jail's reach): `exec` the lab's build, so the process is `node` running
-/// its script, as the manager's is.
+/// The lab's `gemini` on the worker shell's `PATH` (`<run>/gbin`, out of the jail's reach): `exec` the lab's build, so the process is `node` running its script, as the manager's is.
 #[must_use]
 pub fn gemini_wrapper(bin: &str) -> String {
     format!(
@@ -4943,12 +3887,6 @@ pub fn gemini_wrapper(bin: &str) -> String {
     )
 }
 
-/// L15: the worker the manager tab's agent starts, `@<mgr> spawn agent=<h>
-/// from=<mgr> cwd=<wdir> -` with its task on stdin (the worker's line follows
-/// the starter's agent of its kind: its program and its homes; its shell is
-/// [`worker_shell`]'s), and the manager's wait on it, `await task @<w>
-/// since=0`, on a thread of its own (a client of its own: it returns when the
-/// record has news, which the lab reads at the end).
 fn spawn_worker(
     (tag, run, h): (&str, &Run, Harness),
     door: &Door<'_>,
@@ -5026,9 +3964,6 @@ fn spawn_worker(
     Ok((tab, slot))
 }
 
-/// When the lab types a chain's orchestrator turn ([`Chain::orchestrated`]):
-/// L13's once the person's exchange was watched [`EXCHANGE_WATCH_MS`]; CAP's
-/// once the hour after its first act is over and [`PAST_WINDOW_MS`] more.
 fn orchestrator_due(chain: Chain, seen: &Seen, now: i64) -> bool {
     if seen.cover.turn_ms.is_some() {
         return false;
@@ -5042,8 +3977,6 @@ fn orchestrator_due(chain: Chain, seen: &Seen, now: i64) -> bool {
             .all_acts()
             .first()
             .is_some_and(|(t1, _)| now - t1 >= cap_window_ms() + PAST_WINDOW_MS),
-        // once the resized screen was read and decided: the turn the very
-        // words of the reply before it answer
         Chain::SameWords => seen
             .cover
             .resized
@@ -5053,13 +3986,6 @@ fn orchestrator_due(chain: Chain, seen: &Seen, now: i64) -> bool {
     }
 }
 
-/// F1 AND F2's DRIVE of the screen ([`Cover::resized`]): once `same-words`'
-/// first point's back-off was decided [`RESIZE_AFTER_MS`] ago, with nothing
-/// typed since its prompt, its tab is resized to [`RESIZED`] (`resize <rows>
-/// <cols>`, the cell form: the session's own grid and PTY, never the
-/// window's, as the tab is not the front one): its opener's long token
-/// ([`LONG_TOKEN`]) re-wraps, and more of the conversation comes into sight,
-/// with nothing submitted. Once.
 fn resize_step(door: &Door<'_>, tab: &mut Tab, now: i64) -> Result<(), Fail> {
     if tab.chain != Chain::SameWords || tab.seen.cover.resized.is_some() {
         return Ok(());
@@ -5097,8 +4023,6 @@ fn resize_step(door: &Door<'_>, tab: &mut Tab, now: i64) -> Result<(), Fail> {
     Ok(())
 }
 
-/// The screen of tab `sid` (`text`: what the tab shows, its viewport
-/// where it is scrolled back), its blank rows left out.
 fn shown_rows(door: &Door<'_>, sid: &str) -> Vec<String> {
     on(door, sid, &["text"])
         .lines()
@@ -5107,21 +4031,6 @@ fn shown_rows(door: &Door<'_>, sid: &str) -> Vec<String> {
         .collect()
 }
 
-/// F1 BY A SCROLL, ITS DRIVE ([`Cover::scrolled`]): once `tall-scroll`'s
-/// first point's back-off was decided [`SCROLL_AFTER_MS`] ago, with nothing
-/// typed since its prompt, the wheel is turned up over its tab, a row a
-/// notch (`mouse wheelup left <row> <col> lines=1`), as a person reading back
-/// turns it. Where the agent tracks the mouse (`modes`' `mouse_mode=`), the
-/// notch goes to it and it scrolls its own view, which the harness reads as
-/// the screen: the screen is read after each notch until the opener (the
-/// chain's token) is in sight — [`SCROLL_NOTCHES`] at the most, none more
-/// once [`SCROLL_STILL`] in a row moved nothing — and read again
-/// [`SCROLL_HELD_MS`] later ([`Scrolled::held`]). Where it does not, the
-/// notch scrolls the tab's viewport, which the harness never reads (it reads
-/// the live screen, `text --json`): the wheel is turned until the opener's
-/// row (`search`) is in the viewport (`scroll`, `dims`) or the history's top,
-/// and the drive records the viewport and whether the live screen moved
-/// ([`Scrolled::viewport`]). Nothing is typed. Once.
 fn scroll_step(door: &Door<'_>, tab: &mut Tab, now: i64) -> Result<(), Fail> {
     if tab.chain != Chain::TallScroll {
         return Ok(());
@@ -5259,19 +4168,11 @@ fn scroll_step(door: &Door<'_>, tab: &mut Tab, now: i64) -> Result<(), Fail> {
     Ok(())
 }
 
-/// Where `token` was last found in tab `sid` and where its live screen
-/// begins, both absolute rows (`search`: its header `OK <n> …
-/// screen_first=<row>` on the client's stderr, then a `<row> <col> <len>`
-/// line a match on its stdout): `(None, 0)` where it answered neither.
 fn opener_row(door: &Door<'_>, sid: &str, token: &str) -> (Option<u64>, u64) {
     door.ctl(&[&format!("@{sid}"), "search", token])
         .map_or((None, 0), |r| search_rows(&r))
 }
 
-/// [`opener_row`]'s reading of a `search` reply: the client's header
-/// (`aterm-ctl: OK …`), which it writes to its STDERR (measured `r4-f3`:
-/// read off stdout, Muse Code's opener was `found nowhere`), and the match
-/// rows on its stdout.
 fn search_rows(r: &Reply) -> (Option<u64>, u64) {
     let rows = r.stdout.as_str();
     let Some(head) = r
@@ -5294,8 +4195,6 @@ fn search_rows(r: &Reply) -> (Option<u64>, u64) {
     (row, first)
 }
 
-/// `scroll`'s answer (`OK <offset> <max>`): how far the tab's viewport is
-/// scrolled back and how far it can be; `(0, 0)` for any other answer.
 fn scroll_place(reply: &str) -> (u64, u64) {
     let mut w = reply.split_whitespace();
     if w.next() != Some("OK") {
@@ -5306,9 +4205,6 @@ fn scroll_place(reply: &str) -> (u64, u64) {
     (off, n())
 }
 
-/// F3's EVIDENCE of the screen ([`Cover::first_screen`]): its last rows, read
-/// once the first point after the prompt was judged (its `point@v1` record),
-/// where a turn ended on a tool's row draws that row last above the composer.
 fn first_screen_step(door: &Door<'_>, tab: &mut Tab) {
     if tab.chain != Chain::ToolEnd || tab.seen.cover.first_screen.is_some() {
         return;
@@ -5334,11 +4230,6 @@ fn first_screen_step(door: &Door<'_>, tab: &mut Tab) {
     tab.seen.cover.first_screen = Some((t, rows));
 }
 
-/// How many of conversation `token`'s requests carried a tool's result back,
-/// in their newest message or the conversation before it (the stub's dumps:
-/// each API's reader, [`crate::stub::messages_answered`],
-/// [`crate::stub::gemini::results_answered`],
-/// [`crate::stub::muse::results_answered`]): F3's call run by its agent.
 fn tool_results_of(run: &Run, token: &str) -> usize {
     crate::stub::turn_dumps(&run.w.join("dump"))
         .into_iter()
@@ -5352,7 +4243,6 @@ fn tool_results_of(run: &Run, token: &str) -> usize {
         .count()
 }
 
-/// The tab's journal lines `(t, line)` and ledger rows, read through no link.
 fn records(run: &Run, sid: &str) -> (Vec<(i64, String)>, Vec<Row>) {
     let drive = run.state().join("drive");
     let journal = crate::util::scratch_text(&drive.join(format!("{sid}.journal.jsonl")))
@@ -5380,10 +4270,6 @@ fn records(run: &Run, sid: &str) -> (Vec<(i64, String)>, Vec<Row>) {
     (journal, ledger)
 }
 
-/// The `status` words the judge reads, one line: the end's
-/// (`end= end_seen= end_cheered=`, §12.5.2), the needs' count (`needs_n=`)
-/// and Land's hold (`land_held= land_nudges= land_since=`, §12.3.1)
-/// beside the record's.
 fn status_words(door: &Door<'_>, sid: &str) -> String {
     let s = on(door, sid, &["status"]);
     [
@@ -5406,7 +4292,6 @@ fn status_words(door: &Door<'_>, sid: &str) -> String {
     .join(" ")
 }
 
-/// The `meta` attention words, the text decoded and last.
 fn meta_words(door: &Door<'_>, sid: &str) -> String {
     let m = on(door, sid, &["meta"]);
     let w = |k: &str| word(&m, k).unwrap_or_else(|| "?".into());
@@ -5418,26 +4303,15 @@ fn meta_words(door: &Door<'_>, sid: &str) -> String {
     )
 }
 
-/// The harness's mark on what it types (`harness_mark!`).
 const MARK: &str = "[aterm harness]";
 
-/// Whether a user text is the harness's: its mark, or one of its answers
-/// (`Nobody is here to …`: Land's answer, the reversible answer and the
-/// answer text carry no mark).
+/// Whether a user text is the harness's: its mark, or one of its answers (`Nobody is here to …`: Land's answer, the reversible answer and the answer text carry no mark).
 #[must_use]
 pub fn harness_said(text: &str) -> bool {
     text.contains(MARK) || text.contains(ANSWER_HEAD)
 }
 
-/// The harness's user texts a request `body` of conversation `token` holds
-/// ([`harness_said`], by the reader of whichever of the three APIs it
-/// speaks); `None` for a request of another conversation. A request holding
-/// more than the conversation held at the landing carries a NEW turn of the
-/// harness's ([`StubSeen::of`]): an agent's own side calls after a turn (Muse
-/// Code's reminder observers, its prompt hint, its away recap; Claude Code's
-/// title) carry the conversation as it stood, or a question of their own
-/// with no mark, and hold no more; an act typed again, the same words as one
-/// before included, is one more.
+/// The harness's user texts a request `body` of conversation `token` holds ([`harness_said`], by the reader of whichever of the three APIs it speaks); `None` for a request of another conversation.
 #[must_use]
 pub fn marked_turns(body: &[u8], token: &str) -> Option<usize> {
     if !String::from_utf8_lossy(body).contains(token) {
@@ -5453,20 +4327,10 @@ pub fn marked_turns(body: &[u8], token: &str) -> Option<usize> {
     .max()
 }
 
-/// CLAUDE CODE'S OWN CONTINUATION of a usage limit, as its request carries
-/// it: the opening words of the user text it sends when its countdown fires
-/// at the reset (`Your claude.ai usage limit has reset. Continue the task you
-/// were working on when the limit was reached; do not repeat work that is
-/// already complete.`, the transcript's `origin.kind` `auto-continuation`
-/// prompt), beside the act the limit cut. Measured on 2.1.306 (the lab's W1,
-/// run sw4, 2026-10-21: the request 75 s past the reset, no act of the
-/// harness's before it).
+/// CLAUDE CODE'S OWN CONTINUATION of a usage limit, as its request carries it: the opening words of the user text it sends when its countdown fires at the reset (`Your claude.ai usage limit has reset.`
 pub const CLAUDE_CONTINUES: &str = "Your claude.ai usage limit has reset. Continue the task";
 
-/// Whether request `body` of conversation `token` carries the program's own
-/// continuation of a usage limit: one of its user texts holds
-/// [`CLAUDE_CONTINUES`] (a Messages API body: Claude Code's). `false` for
-/// another conversation's request.
+/// Whether request `body` of conversation `token` carries the program's own continuation of a usage limit: one of its user texts holds [`CLAUDE_CONTINUES`] (a Messages API body: Claude Code's).
 #[must_use]
 pub fn carries_continuation(body: &[u8], token: &str) -> bool {
     String::from_utf8_lossy(body).contains(token)
@@ -5475,18 +4339,11 @@ pub fn carries_continuation(body: &[u8], token: &str) -> bool {
             .any(|u| u.contains(CLAUDE_CONTINUES))
 }
 
-/// The stub's request dumps of the turns, `(modified ms, body)` each
-/// ([`dumps_in`]).
 fn dumps(run: &Run) -> Vec<(i64, Vec<u8>)> {
     dumps_in(&run.w.join("dump"))
 }
 
-/// The stub's dumps of the conversations' TURNS in `dir`, `(modified ms,
-/// body)` each: `req-<n>.json` alone ([`crate::stub::turn_dumps`]), never a
-/// side call's `side-<n>.json`, whose copy of a conversation is no request
-/// of its turns' — Muse Code's reminder observer renders the whole
-/// conversation into one text with line breaks, which C4 read as the owner's
-/// words reaching the agent so (the lab's `r10-cv`, 2026-10-22).
+/// The stub's dumps of the conversations' TURNS in `dir`, `(modified ms, body)` each: `req-<n>.json` alone ([`crate::stub::turn_dumps`]), never a side call's `side-<n>.json`, whose copy of a conversation is no request of its turns' — Muse Code's reminder observer renders the whole conversation into one text with line breaks, which C4 read as the owner's words reaching the agent so (the lab's `r10-cv`, 2026-10-22).
 #[must_use]
 pub fn dumps_in(dir: &Path) -> Vec<(i64, Vec<u8>)> {
     crate::stub::turn_dumps(dir)
@@ -5504,8 +4361,6 @@ pub fn dumps_in(dir: &Path) -> Vec<(i64, Vec<u8>)> {
         .collect()
 }
 
-/// The stub's request dumps of conversation `token`, `(modified ms, marked
-/// turns)` each ([`marked_turns`]).
 fn dumps_of(run: &Run, token: &str) -> Vec<(i64, usize)> {
     dumps(run)
         .into_iter()
@@ -5513,9 +4368,6 @@ fn dumps_of(run: &Run, token: &str) -> Vec<(i64, usize)> {
         .collect()
 }
 
-/// The first of `dumps` (`(modified ms, body)`) at or after `since` that
-/// carries conversation `token`'s own continuation
-/// ([`carries_continuation`]): when it reached the stub.
 #[must_use]
 fn first_continuation(dumps: &[(i64, Vec<u8>)], token: &str, since: i64) -> Option<i64> {
     dumps
@@ -5525,11 +4377,6 @@ fn first_continuation(dumps: &[(i64, Vec<u8>)], token: &str, since: i64) -> Opti
         .min()
 }
 
-/// W1's and W2's witness of the program going on by itself past the wall
-/// ([`Cover::went_on_ms`]): the first of the conversation's requests from the
-/// wall's lift on (its reset, where it was never lifted) that carries the
-/// program's own continuation ([`first_continuation`]). `None` for any other
-/// chain, and where the wall was never raised.
 fn went_on_witness(run: &Run, tab: &Tab) -> Option<i64> {
     if !tab.chain.walled() {
         return None;
@@ -5539,9 +4386,7 @@ fn went_on_witness(run: &Run, tab: &Tab) -> Option<i64> {
     first_continuation(&dumps(run), &tab.chain.token(), since)
 }
 
-/// C4's witness of what reached the agent ([`Cover::owner_texts`]): every
-/// user text of conversation `token`'s requests holding [`OWNER_KEY`], by
-/// the reader of whichever of the three APIs it speaks, each once.
+/// C4's witness of what reached the agent ([`Cover::owner_texts`]): every user text of conversation `token`'s requests holding [`OWNER_KEY`], by the reader of whichever of the three APIs it speaks, each once.
 #[must_use]
 pub fn owner_texts(dumps: &[Vec<u8>], token: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
@@ -5562,7 +4407,6 @@ pub fn owner_texts(dumps: &[Vec<u8>], token: &str) -> Vec<String> {
     out
 }
 
-/// [`owner_texts`] of `tab`'s conversation, for C4's chain alone.
 fn owner_witness(run: &Run, tab: &Tab) -> Option<Vec<String>> {
     (tab.chain == Chain::CruiseO).then(|| {
         let bodies: Vec<Vec<u8>> = dumps(run).into_iter().map(|(_, b)| b).collect();
@@ -5571,11 +4415,6 @@ fn owner_witness(run: &Run, tab: &Tab) -> Option<Vec<String>> {
 }
 
 impl StubSeen {
-    /// The witness of conversation `token` (whose acts the ledger typed
-    /// `typed_before` of before `since`): the requests after `since` holding
-    /// more harness-marked user texts than any request before it, or than
-    /// the acts typed, held. Off passes `since` 0 and no acts: any marked
-    /// text is a turn of the harness's.
     fn of(dumps: &[(i64, usize)], since: i64, typed_before: usize) -> StubSeen {
         let baseline = dumps
             .iter()
@@ -5597,8 +4436,6 @@ impl StubSeen {
     }
 }
 
-/// The stub's witness of a tab, read once its watch is over: after its
-/// landing (L5, L7), or over its whole conversation (Off).
 fn stub_witness(run: &Run, tab: &Tab) -> Option<StubSeen> {
     let token = tab.chain.token();
     if tab.chain == Chain::Off {
@@ -5618,10 +4455,6 @@ fn stub_witness(run: &Run, tab: &Tab) -> Option<StubSeen> {
 }
 
 impl StubSeen {
-    /// The witness of a window no harness turn may fall in, `(since,
-    /// until)`, the conversation holding `typed_before` of the harness's
-    /// texts at its start: the requests inside it, and those holding more
-    /// than any request at or before `since` held, or than those acts ([`Self::of`]).
     fn within(dumps: &[(i64, usize)], since: i64, until: i64, typed_before: usize) -> StubSeen {
         let inside: Vec<(i64, usize)> =
             dumps.iter().copied().filter(|(t, _)| *t <= until).collect();
@@ -5629,12 +4462,6 @@ impl StubSeen {
     }
 }
 
-/// The stub's witness of a tab's window ([`Cover::window_stub`]): L13's
-/// exchange, from its first prompt to the orchestrator's turn (no harness
-/// text before it); CAP's hour, from its act to the turn after it (the act's
-/// own text, and no other); W1's wall, from the land act it met to its reset
-/// (that act's text, and no other: the program's own retries of it hold no
-/// more).
 fn window_witness(run: &Run, tab: &Tab) -> Option<StubSeen> {
     let token = tab.chain.token();
     let typed_by = |t: i64| {
@@ -5655,8 +4482,6 @@ fn window_witness(run: &Run, tab: &Tab) -> Option<StubSeen> {
             let typed = usize::from(tab.seen.ledger.iter().any(|r| r.decision == "typed"));
             Some(StubSeen::within(&dumps_of(run, &token), *t1, until, typed))
         }
-        // F18: from the person's Enter to the watch's end, the acts typed
-        // before it (the done check) the conversation's baseline
         Chain::InstantPerson => {
             let asked = tab.seen.asked_ms?;
             Some(StubSeen::within(
@@ -5680,11 +4505,6 @@ fn window_witness(run: &Run, tab: &Tab) -> Option<StubSeen> {
     }
 }
 
-/// W1's and W2's drive of the stub ([`Cover::wall`]): its usage wall raised once the
-/// wall chain's first point is read (the land act meets it), resetting at
-/// [`reset_s_ahead`] (W2's further ahead, [`Chain::wall_ahead_ms`]); its scripted
-/// mode given back [`WALL_LIFT_EARLY_MS`] before the reset (the stub alone would
-/// answer `ok` after it). Each step once.
 fn wall_step(run: &Run, h: Harness, tab: &mut Tab, now: i64) -> Result<(), Fail> {
     if !tab.chain.walled() {
         return Ok(());
@@ -5727,12 +4547,6 @@ fn wall_step(run: &Run, h: Harness, tab: &mut Tab, now: i64) -> Result<(), Fail>
     Ok(())
 }
 
-/// The point at which W2's notice may be taken off the screen: the land act
-/// typed, the wall read after it (`EVENT limited`, or Gemini CLI's
-/// usage-limit dialog's `EVENT prompt … kind=usage-limit`), and the loop
-/// waiting on its reset at that point (a `WAITING` of its seq, past the take
-/// window's wait for the worker to take the act; at Gemini CLI's dialog, the
-/// `Keep trying` held to the reset, `rule=limit-retry@v1`).
 fn waits_on_the_wall(s: &Seen) -> bool {
     let Some((t1, _)) = s.acts(turn_end::RULE_LAND).first().copied() else {
         return false;
@@ -5753,12 +4567,7 @@ fn waits_on_the_wall(s: &Seen) -> bool {
     })
 }
 
-/// Whether harness `h`'s screen `text` no longer draws the wall's notice:
-/// its composer drawn, no row holding any of the wall's words
-/// ([`Hide::words`]), and its reader reading no wall — at Gemini CLI, no
-/// usage-limit dialog (its Stop leaves `✕ [API Error: An unknown error
-/// occurred.]`, a wall that no longer names the limit). A harness with no
-/// [`Hide`] never loses it.
+/// Whether harness `h`'s screen `text` no longer draws the wall's notice: its composer drawn, no row holding any of the wall's words ([`Hide::words`]), and its reader reading no wall — at Gemini CLI, no usage-limit dialog (its Stop leaves `✕ [API Error: An unknown error occurred.]`, a wall that no longer names the limit).
 #[must_use]
 pub fn notice_gone(h: Harness, text: &str) -> bool {
     let Ok(hide) = hide_of(h) else {
@@ -5787,10 +4596,7 @@ pub fn notice_gone(h: Harness, text: &str) -> bool {
     composer && !wall && !hide.words.iter().any(|w| text.contains(w))
 }
 
-/// Claude Code's composer's first row (its `❯` taken off), between the
-/// composer's rules as its reader finds them (`aterm_phase::phase::
-/// composer_rules`, which takes a rule carrying a label: `──── forever-w2 ─`
-/// once `/rename` named the session), or `None` where no frame is drawn.
+/// Claude Code's composer's first row (its `❯` taken off), between the composer's rules as its reader finds them (`aterm_phase::phase:: composer_rules`, which takes a rule carrying a label: `──── forever-w2 ─` once `/rename` named the session), or `None` where no frame is drawn.
 #[must_use]
 pub fn claude_composer(rows: &[String]) -> Option<String> {
     let (top, bottom) = aterm_phase::phase::composer_rules(rows)?;
@@ -5799,8 +4605,7 @@ pub fn claude_composer(rows: &[String]) -> Option<String> {
     Some(first.strip_prefix('❯').unwrap_or(&first).trim().to_string())
 }
 
-/// The option a dialog on `text` draws focused (`● 2. Stop` inside its box's
-/// `│` borders reads `2. Stop`), or `None` where no row draws one.
+/// The option a dialog on `text` draws focused (`● 2.`
 #[must_use]
 pub fn dialog_focus(text: &str) -> Option<String> {
     text.lines().find_map(|r| {
@@ -5816,14 +4621,7 @@ pub fn dialog_focus(text: &str) -> Option<String> {
     })
 }
 
-/// Whether harness `h`'s composer holds `cmd` as typed and its command menu's
-/// first row is that very command, so Enter runs it. Muse Code: the composer
-/// alone or with the argument hint its menu draws after it (`❯ /rules
-/// [import]`), the menu's first row right under the caret
-/// (`muse_captures::menu_offers_first`, the hint allowed). agy: the composer
-/// holding `cmd` alone, the menu's focused row (`> /title  Toggle custom
-/// terminal window title`) right under the composer's bottom rule. Any other
-/// harness: never.
+/// Whether harness `h`'s composer holds `cmd` as typed and its command menu's first row is that very command, so Enter runs it.
 #[must_use]
 pub fn menu_offers(h: Harness, text: &str, cmd: &str) -> bool {
     let rows: Vec<String> = text.lines().map(str::to_string).collect();
@@ -5857,8 +4655,6 @@ pub fn menu_offers(h: Harness, text: &str, cmd: &str) -> bool {
                     .and_then(|r| r.strip_prefix("> "))
                     .is_some_and(names)
         }
-        // Claude Code draws no menu once the command's argument is typed:
-        // the composer holding `cmd` and no menu row focused (`  ❯ /usage …`).
         Harness::Claude => {
             claude_composer(&rows).as_deref() == Some(cmd)
                 && !rows
@@ -5869,17 +4665,6 @@ pub fn menu_offers(h: Harness, text: &str, cmd: &str) -> bool {
     }
 }
 
-/// W2's drive of the screen ([`Cover::hidden`]): once the loop waits on the
-/// wall's reset ([`waits_on_the_wall`]), harness `h`'s hiding command
-/// ([`hide_of`]: Muse Code's [`HIDE_COMMAND`], agy's [`AGY_HIDE_COMMAND`])
-/// entered again and again until the notice is out of sight
-/// ([`notice_gone`]). A local command: it prints its rows under the turn's end
-/// and sends no request. It is entered only on positive evidence that the
-/// menu offers that very command first ([`menu_offers`]), into an empty
-/// composer; at most [`HIDE_TRIES`] times, and none later than
-/// [`HIDE_BEFORE_RESET_MS`] before the reset. Gemini CLI's dialog is answered
-/// instead, once ([`HideBy::Option`], [`choose_option`]). What stops it short
-/// is said ([`Cover::hide_gave_up`]): W2 is then UNOBSERVED. Once.
 fn hide_step(door: &Door<'_>, h: Harness, tab: &mut Tab, now: i64) -> Result<(), Fail> {
     if tab.chain != Chain::WallHid
         || tab.seen.cover.hidden.is_some()
@@ -5936,8 +4721,6 @@ fn hide_step(door: &Door<'_>, h: Harness, tab: &mut Tab, now: i64) -> Result<(),
         let why = match choose_option(door, &at_tab, &tab.sid, option, deadline)? {
             Ok(enter) => {
                 say(tab, &format!("{option} chosen"));
-                // The dialog gives the composer back at once (measured on
-                // Gemini CLI 0.46.0): ten looks a second apart.
                 let mut left = false;
                 for _ in 0..10 {
                     stop::sleep(Duration::from_millis(1000))?;
@@ -6033,11 +4816,6 @@ fn hide_step(door: &Door<'_>, h: Harness, tab: &mut Tab, now: i64) -> Result<(),
     Ok(())
 }
 
-/// Cancel the program's own countdown on tab `sid` ([`Hide::cancel`]): its
-/// key pressed only where the countdown stands armed ([`Cancel::armed`]),
-/// and the hide goes on only once the program says it is cancelled
-/// ([`Cancel::cancelled`]). Not later than `deadline`. The time the key went
-/// in, or why it was not pressed or did not take.
 fn cancel_countdown(
     door: &Door<'_>,
     at_tab: &str,
@@ -6072,12 +4850,6 @@ fn cancel_countdown(
     Ok(Ok(at_key))
 }
 
-/// Choose the dialog's `option` on tab `sid` ([`HideBy::Option`]): only on
-/// positive evidence — the dialog drawn with its first option focused
-/// ([`dialog_focus`]: `1. Keep trying`), Down pressed, and Enter only once the
-/// focus stands on `option` (else Up puts the focus back, and nothing is
-/// chosen). Not later than `deadline`. The time Enter went in, or why
-/// nothing was chosen.
 fn choose_option(
     door: &Door<'_>,
     at_tab: &str,
@@ -6115,7 +4887,6 @@ fn choose_option(
     Ok(Ok(enter))
 }
 
-/// One look at a tab: what changed since the last is added to its records.
 fn look(run: &Run, door: &Door<'_>, tab: &mut Tab) {
     let now = now_ms();
     let (journal, ledger) = records(run, &tab.sid);
@@ -6173,12 +4944,6 @@ fn look(run: &Run, door: &Door<'_>, tab: &mut Tab) {
     tab.seen.end_ms = now;
 }
 
-/// Whether a person's prompt is due on a chain that types one
-/// ([`Chain::asks`]): the done check's defense was read and its point
-/// decided — a back-off's `WAITING` (not the wait for the worker to take the
-/// act), at its own judgement or at the take window's end (P4C says which) —
-/// five seconds ago, and nothing was typed since: the loop is waiting out
-/// that back-off.
 fn ask_due(s: &Seen, now: i64) -> bool {
     let Some((t1, _)) = s
         .all_acts()
@@ -6198,9 +4963,6 @@ fn ask_due(s: &Seen, now: i64) -> bool {
     decided.is_some_and(|(tw, _)| now - *tw >= 5000) && s.all_acts().iter().all(|(t, _)| *t <= t1)
 }
 
-/// Whether a tab's chain has seen what it waits for (or its hang detector
-/// fired): then it is watched no more. A landing is watched through its
-/// window ([`quiet_after_landed_ms`]) whatever the hang detector says.
 fn finished(tab: &Tab, now: i64) -> bool {
     let s = &tab.seen;
     let done = s.first_after("DONE ", tab.t0).map(|(t, _)| *t);
@@ -6230,13 +4992,10 @@ fn finished(tab: &Tab, now: i64) -> bool {
         | Chain::WallHid
         | Chain::WallDay
         | Chain::WallClimb => false,
-        // the manager is only the worker's starter
         Chain::Mgr => true,
         Chain::LandT => done_since(20_000),
-        // the act after the exchange, and its landing
         Chain::LandP => done_since(20_000),
         Chain::Cap => cover::cap_watched(s, now) || done_since(20_000),
-        // nothing typed past the first reply's back-off: never judged (P4)
         Chain::InstantLand => s.all_acts().is_empty() && now - tab.t0 > 300_000,
         Chain::LandB | Chain::LandC | Chain::LandF | Chain::LandG | Chain::LandH | Chain::LandI => {
             nudge.is_some_and(|n| {
@@ -6264,22 +5023,15 @@ fn finished(tab: &Tab, now: i64) -> bool {
                             || l.starts_with("DONE "))
                 })
             });
-            // decided, then watched until the chain goes on (an act after the
-            // person's point) or past that back-off's due and a minute more,
-            // persistence lost (F5 of the review of `b9/forever-gaps`)
             let gone_on = judged
                 .is_some_and(|e| s.all_acts().iter().any(|(t, _)| *t > e && now - *t >= 3000));
             let watched_out = decision.is_some_and(|(td, dl)| match backoff_due(dl) {
                 Some(due) => now >= due + PERSISTENCE_GRACE_MS + 5000,
                 None => now - td >= 3000,
             });
-            // a prompt never judged is watched past its take window and the
-            // first back-off a turn there would take, then judged
             let unjudged = s
                 .asked_ms
                 .is_some_and(|a| judged.is_none() && now - a > 150_000);
-            // a prompt the composer did not take is no person's turn: the
-            // verdict is unobserved, and nothing more is watched for it
             let refused = s.ask_refused_ms.is_some_and(|a| now - a > 5000);
             (decision.is_some() && (gone_on || watched_out))
                 || unjudged
@@ -6291,8 +5043,6 @@ fn finished(tab: &Tab, now: i64) -> bool {
             let check = first(turn_end::RULE_DONE_CHECK);
             check.is_some_and(|c| s.all_acts().iter().any(|(t, _)| *t > c)) || done_since(20_000)
         }
-        // C4: the owner's continuation typed, then the act after it, or its
-        // reply read and 20 s more
         Chain::CruiseO => {
             first(turn_end::RULE_CONTINUE).is_some_and(|c| {
                 s.all_acts().iter().any(|(t, _)| *t > c)
@@ -6304,11 +5054,7 @@ fn finished(tab: &Tab, now: i64) -> bool {
         Chain::Off => s
             .reply_ms
             .is_some_and(|r| now - r >= QUIET_UNDER_OFF_MS + 5000),
-        // its end stands (the window reads it at END)
         Chain::LandJ | Chain::LandK => done_since(20_000),
-        // F18: left to the person and quiet past the window; or an act typed
-        // into the exchange, a back-off decided at its point (judged as a
-        // turn of the conversation), a prompt never judged or not taken
         Chain::InstantPerson => {
             let asked = s.asked_ms;
             let left = asked.and_then(|a| {
@@ -6331,8 +5077,6 @@ fn finished(tab: &Tab, now: i64) -> bool {
                 || done_since(20_000)
                 || (s.all_acts().is_empty() && now - tab.t0 > 300_000)
         }
-        // F1, F2, SAME: the act after the orchestrator's turn typed, and
-        // watched 20 s past it
         Chain::SameWords => {
             s.cover.turn_ms.is_some_and(|tt| {
                 s.all_acts()
@@ -6341,8 +5085,6 @@ fn finished(tab: &Tab, now: i64) -> bool {
             }) || done_since(20_000)
                 || (s.all_acts().is_empty() && now - tab.t0 > 330_000)
         }
-        // F1 by a scroll: watched SCROLL_WATCH_MS past the last notch; an act
-        // first, or nothing judged past the persistence deadline, ends it
         Chain::TallScroll => {
             s.cover
                 .scrolled
@@ -6352,18 +5094,14 @@ fn finished(tab: &Tab, now: i64) -> bool {
                 || done_since(20_000)
                 || (s.all_acts().is_empty() && now - tab.t0 > 330_000)
         }
-        // F3: the act at the first point's due typed, and watched 30 s past
-        // it; nothing judged past the persistence deadline
         Chain::ToolEnd => {
             s.all_acts().first().is_some_and(|(t, _)| now - t >= 30_000)
                 || done_since(20_000)
                 || (s.all_acts().is_empty() && now - tab.t0 > 330_000)
         }
-        // LADDER: its last step decided
         Chain::Ladder => ladder_steps(s, tab.t0)
             .get(LADDER_STEPS as usize - 1)
             .is_some_and(|st| now - st.at >= 5_000),
-        // N4's reply read, and its needs settled
         Chain::CruiseN => {
             let acts = s.all_acts();
             acts.len() >= 3
@@ -6374,7 +5112,6 @@ fn finished(tab: &Tab, now: i64) -> bool {
     }
 }
 
-/// The screen's last rows of a tab, for the report.
 fn tail_rows(door: &Door<'_>, sid: &str, n: usize) -> Vec<String> {
     let text = on(door, sid, &["text"]);
     let rows: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
@@ -6384,8 +5121,6 @@ fn tail_rows(door: &Door<'_>, sid: &str, n: usize) -> Vec<String> {
         .collect()
 }
 
-/// One harness's run on the lab `tag`, which [`run_lab`] brought up: every
-/// scenario's verdict.
 #[allow(clippy::too_many_lines)]
 fn run_check(
     tag: &str,
@@ -6413,7 +5148,6 @@ fn run_check(
     );
     run.agent = h.name().into();
     run.save();
-    // ---- the repositories, the seeds, the launcher, the stub's script
     let mut dirs = Vec::new();
     for &c in chains {
         let d = lay_repo(&run, c).map_err(|e| could_not(&format!("{}: {e}", c.name())))?;
@@ -6440,9 +5174,6 @@ fn run_check(
         chains.iter().map(|c| c.rules().len()).sum::<usize>()
     );
     let door = Door::new(&run)?;
-    // ---- the windows: Settings ▸ Harness in one of its own, then the chains' own, in front;
-    // read only where a chain of the run has window wants (the main pass's: the cover, cap
-    // and wall chains have none)
     let unread = surfaces::unread_why(surfaces_on, chains);
     let mut desk = if let Some(why) = unread {
         println!("  windows   not read ({why}): the window's wants are named skips");
@@ -6456,12 +5187,7 @@ fn run_check(
         );
         Some(d)
     };
-    // ---- a tab per chain, its Autopilot set (and a worker's task), the agent launched there
-    // (L15's worker is opened by its manager's spawn, below)
     let mut tabs: Vec<Tab> = Vec::new();
-    // cruise-n opens first: Settings ▸ Harness draws one screen of its rows
-    // in tab order, and `inspect … text` reads that screen, so the chain
-    // whose page rows N1–N4 judge is listed on it (land-a's L5 next)
     let mut order: Vec<usize> = (0..chains.len()).collect();
     if desk.is_some()
         && let Some(i) = chains.iter().position(|c| *c == Chain::CruiseN)
@@ -6483,7 +5209,6 @@ fn run_check(
             .map(str::to_string)
             .ok_or_else(|| could_not(&format!("spawn: {}{}", r.stdout, r.stderr)))?;
         let _ = on(&door, &sid, &["await", "idle", "400", "timeout=30000"]);
-        // the label every surface names it by, in the chains' window
         let titled = if let Some(d) = &desk {
             let r = on(&door, &sid, &["meta", "set", "title", chain.name()]);
             let w = surfaces::window_of(&door.out(&["ls"]), &sid).unwrap_or_default();
@@ -6546,9 +5271,6 @@ fn run_check(
             over: false,
         });
     }
-    // the chains' window's front tab, whose chip is drawn, brought in front
-    // by `tab`: cruise-n (it opened first), else the Off control, never a tab
-    // whose end END looks at ([`surfaces::front_of`])
     if let Some(d) = desk.as_mut()
         && let Some(i) = surfaces::front_of(&tabs.iter().map(|t| t.chain).collect::<Vec<_>>())
     {
@@ -6583,7 +5305,6 @@ fn run_check(
             surfaces::FRONT.map(Chain::name).join(", ")
         );
     }
-    // ---- each agent at its composer, then its first prompt
     for tab in &mut tabs {
         let ready = crate::wait_until(Duration::from_secs(90), || {
             at_composer(&door, &tab.sid, h.name()).is_some_and(|c| c.is_empty())
@@ -6601,7 +5322,6 @@ fn run_check(
         stop::sleep(Duration::from_secs(1))?;
         let opening = tab.chain.opening();
         if opening == Opening::Person {
-            // a person types into a tab its harness watches: the supervisor on first
             let on_tab = crate::wait_until(Duration::from_secs(60), || {
                 word(&on(&door, &tab.sid, &["status"]), "supervisor").is_some_and(|w| w != "-")
             });
@@ -6666,7 +5386,6 @@ fn run_check(
                 .map_or_else(String::new, |k| format!("; {}", cover::keyed_line(k)))
         );
     }
-    // ---- L15: the manager's agent starts the worker; the manager's wait on it
     let mut awaiting = None;
     if let Some((_, wdir)) = chains
         .iter()
@@ -6677,7 +5396,6 @@ fn run_check(
         tabs.push(tab);
         awaiting = Some(slot);
     }
-    // ---- watched until every chain saw what it waits for
     let watch0 = now_ms();
     loop {
         let now = now_ms();
@@ -6711,8 +5429,6 @@ fn run_check(
             {
                 tab.ask_tried = true;
                 let asked = now_ms();
-                // F18's is typed as a person types it (its Enter the time it
-                // was asked); P4P's through the control socket
                 let (took, entered) = if tab.chain.asks_as_person() {
                     match person_turn(&door, &tab.sid, h.name(), &ask)? {
                         Some((pressed, stamp)) => {
@@ -6834,15 +5550,12 @@ fn run_check(
         }
         stop::sleep(Duration::from_secs(2))?;
     }
-    // ---- THE END: the window at rest, each chain in front, the look and the press; run
-    // only with land-j's and land-k's ends to stand in it
     let ending = surfaces::end_runs(&tabs.iter().map(|t| t.chain).collect::<Vec<_>>());
     if let Some(d) = desk.as_mut()
         && ending
     {
         surfaces::end_steps(&run, &door, &mut tabs, d)?;
     }
-    // ---- the verdicts
     let mut all = Vec::new();
     for tab in &tabs {
         println!(
@@ -6886,8 +5599,6 @@ fn run_check(
     Ok(all)
 }
 
-/// One harness on a lab of its own, brought up and taken down (its request
-/// dumps kept with its logs: the stub's witness can be read again).
 fn run_lab(
     tag: &str,
     h: Harness,
@@ -6914,7 +5625,6 @@ fn run_lab(
     if let Some(w) = mode.walled()
         && let Some(why) = wall_out_of_reach(h, mode)
     {
-        // no lab: nothing it could drive on this harness reaches the wall
         println!(
             "forever: {} {} is out of this lab's reach: {why}",
             h.name(),
@@ -6947,16 +5657,6 @@ fn run_lab(
     verdicts
 }
 
-/// The lab's options for one harness's run, on top of what the environment
-/// set (`base`): its folder trust seeded, the lifeline unless `keep`, the
-/// window (`--window`: the instance OPENS A WINDOW on this desk, in the same
-/// jail, for `hwkey`), the person's seam where the window is read, and the
-/// cap's rate under `--mode cap`.
-///
-/// # Errors
-/// A usage error, before any lab is made, where the options conflict
-/// ([`crate::lab::opts_refused`]: `--window` under `LAB_RESTORE=1`), never a
-/// harness's COULD NOT RUN.
 fn lab_opts(
     base: crate::lab::UpOpts,
     mode: Mode,
@@ -6968,7 +5668,6 @@ fn lab_opts(
     u.lifeline = !keep;
     u.window = window;
     if surfaces_on && !u.instance_env.contains(PERSON_SEAM) {
-        // the person's stand-in (`person look`, `person menubar press`), armed at launch
         u.instance_env = format!("{} {PERSON_SEAM}", u.instance_env)
             .trim()
             .to_string();
@@ -6978,8 +5677,6 @@ fn lab_opts(
         u.harness_keys = format!("{}\ncontinue_per_hour = {CAP_PER_HOUR}", u.harness_keys);
     }
     if mode == Mode::Ladder {
-        // the ladder's scale is the instance's: its aterm reads the seam once
-        // at each loop's start
         u.instance_env = format!("{} {}", u.instance_env, ladder_env())
             .trim()
             .to_string();
@@ -6990,28 +5687,20 @@ fn lab_opts(
     }
 }
 
-/// The development seam that arms `person` (the stand-in for the person at
-/// the window) in the lab's instance: the window's reads need it at END.
 const PERSON_SEAM: &str = "ATERM_DEBUG_PERSON_INVOKE=1";
 
-/// What `forever`'s words ask for.
 #[derive(Debug, PartialEq, Eq)]
 struct Asked {
     harnesses: Vec<Harness>,
     mode: Mode,
-    /// `--chains a,b`: only these (of the mode's).
     chains: Option<Vec<Chain>>,
     tag: Option<String>,
     keep: bool,
-    /// The window read (`--no-surfaces`: not, its wants named skips).
     surfaces: bool,
-    /// `--window`: the lab's instance opens a window, and L13's person types
-    /// through `hwkey` ([`person_keys`]) instead of the `as=person` seam.
     window: bool,
 }
 
 impl Asked {
-    /// The chains harness `h` runs: the mode's on it, narrowed to `--chains`.
     fn chains(&self, h: Harness) -> Vec<Chain> {
         let mode = Chain::of_mode_on(self.mode, h);
         let picked = |off: bool| -> Vec<Chain> {
@@ -7020,7 +5709,6 @@ impl Asked {
                 .filter(|c| {
                     self.chains.as_ref().is_none_or(|only| {
                         only.contains(c)
-                            // A selected worker needs its manager's standing tab.
                             || (*c == Chain::Mgr && only.contains(&Chain::Worker))
                             || (*c == Chain::Off && off)
                     })
@@ -7028,10 +5716,6 @@ impl Asked {
                 .collect()
         };
         let chains = picked(false);
-        // Where the run reads the window ([`surfaces::unread_why`]), a
-        // selection with no chain to put in front ([`surfaces::front_of`])
-        // brings the mode's Off control: a front tab hides a `•`, and END's
-        // look begins on a tab with no end.
         if self.chains.is_some()
             && surfaces::unread_why(self.surfaces, &chains).is_none()
             && surfaces::front_of(&chains).is_none()
@@ -7043,7 +5727,6 @@ impl Asked {
     }
 }
 
-/// `forever`'s words read; `Ok(None)` for `-h`/`--help`.
 fn parse_args(args: &[String]) -> Result<Option<Asked>, Fail> {
     let usage = |m: &str| Fail::usage(format!("forever: {m}"));
     let mut harnesses = None;
@@ -7121,8 +5804,6 @@ fn parse_args(args: &[String]) -> Result<Option<Asked>, Fail> {
         surfaces,
         window,
     };
-    // A window is opened for a person's keys only: a run with no chain a
-    // person opens (L13's `land-p`, `--mode cover`) has nothing to press.
     if asked.window
         && !asked.harnesses.iter().any(|&h| {
             asked
@@ -7169,7 +5850,6 @@ pub fn cmd_forever(args: &[String]) -> Res {
             )));
         }
         let chains = a.chains(h);
-        // F3 where no turn ends on a tool's row: named, not run
         let tool_end_asked = Chain::of_mode(a.mode).contains(&Chain::ToolEnd)
             && a.chains
                 .as_ref()
@@ -7179,8 +5859,6 @@ pub fn cmd_forever(args: &[String]) -> Res {
             lines.push((h, Scenario::F3, Verdict::Unobserved(why.to_string())));
         }
         if chains.is_empty() && a.mode.walled().is_none() {
-            // `--chains` names none this harness runs of the mode's: nothing
-            // here to bring up
             println!(
                 "forever: {} runs none of the chains --chains asks of its mode",
                 h.name()

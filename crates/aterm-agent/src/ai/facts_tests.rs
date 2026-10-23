@@ -203,3 +203,76 @@ fn codexs_limit_is_the_newest_logins_largest_share_past_a_forks_copy() {
     write(ROOT, limited(now - 100), 600);
     assert_eq!(limit(&b), None);
 }
+
+#[test]
+fn claude_accounts_surfaces_next_sign_in_and_prefers_ready_enrolled_row() {
+    use crate::harness::{accounts, upgrade};
+    let b = machine(&["claude"]);
+    let now = 1_800_000_000_i64;
+    let h_state = b.dir.path().join("harness-state");
+    let store = accounts::Store::at(&h_state);
+    let m27_dir = store.login_dir("m27").expect("m27 dir");
+    std::fs::create_dir_all(&m27_dir).expect("mkdir m27");
+    let roster_path = b.dir.path().join("accounts.toml");
+    let roster_toml = format!(
+        "[[account]]\nlabel = \"m27-3\"\nclass = \"dedicated\"\nemail = \"m27-3@example.test\"\n\n\
+         [[account]]\nlabel = \"m27\"\nclass = \"dedicated\"\ndir = {:?}\nemail = \"m27@example.test\"\n",
+        m27_dir.display().to_string()
+    );
+    std::fs::write(&roster_path, &roster_toml).expect("roster");
+    let roster = accounts::Roster::load(&roster_path).expect("load roster");
+    let mut note = None;
+    store
+        .transact_logins(now, &mut note, |state, logins| {
+            accounts::note_served_login(logins, "m27-3", now - 60);
+            Ok(accounts::note_auth(
+                state,
+                "m27-3",
+                accounts::Auth::Ok,
+                now - 60,
+            ))
+        })
+        .expect("transact logins");
+    let wall = upgrade::StandingWall {
+        at: u64::try_from(now).unwrap(),
+        until: Some(u64::try_from(now + 86_400).unwrap()),
+        window: Some("seven_day".to_owned()),
+        credits: None,
+    };
+    let who = accounts::ProcessLogin {
+        login: None,
+        default_home: true,
+        stored_login: true,
+    };
+    let _ = accounts::record_wall(&store, &roster, "s-test", &who, &wall, now - 60, now);
+
+    let home_str = b.home.display().to_string();
+    let var = |k: &str| (k == "HOME").then(|| home_str.clone());
+    let m = Machine {
+        now,
+        home: Some(b.home.clone()),
+        var: &var,
+        pkg: Some(b.pkg.clone()),
+        exclude: Vec::new(),
+        records: Records::default(),
+        harness_state: Some(h_state.clone()),
+        roster: Some(roster_path.clone()),
+    };
+
+    // While m27 is not enrolled yet, m27-3 is reported as limited with next_sign_in = Some("m27").
+    let f = gather(&m, &CLAUDE);
+    let view = f.accounts.expect("accounts view");
+    assert_eq!(view.label, "m27-3");
+    assert!(view.limited_until.is_some_and(|u| u >= now + 86_400));
+    assert_eq!(view.next_sign_in.as_deref(), Some("m27"));
+
+    // Once m27 is enrolled (.credentials.json written in its login dir), claude_accounts
+    // switches to the ready enrolled m27 row so `aterm ai` and `aterm ai review` use it.
+    std::fs::write(m27_dir.join(".credentials.json"), "{}").expect("enroll m27");
+    let f_after = gather(&m, &CLAUDE);
+    let view_after = f_after.accounts.expect("accounts view after enroll");
+    assert_eq!(view_after.label, "m27");
+    assert_eq!(view_after.limited_until, None);
+    assert_eq!(view_after.next_sign_in, None);
+    assert!(view_after.made);
+}

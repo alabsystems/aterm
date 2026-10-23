@@ -1,62 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Per-session UI CHROME composer (session-metadata stage 2): the ONE pure
-//! source of truth for what a terminal tab's HOVER TOOLTIP and RIGHT-CLICK
-//! CONTEXT MENU say about a session.
-//!
-//! Stage 1 ([`crate::session_timeline`]) gave every session a user identity
-//! (`meta set title|description|icon|role|attention`) and a bounded lifecycle timeline. This
-//! module turns those — plus the session-status activity line, the engine's cwd,
-//! and the registry's lifecycle state — into TWO renderings of the same identity
-//! facts:
-//!
-//! * [`compose_tooltip`] — the multi-line text applied to a macOS strip
-//!   [`crate::toolbar`] `TabView` via `setToolTip:` (and carried on
-//!   [`crate::tab_model::TabPresentation::tooltip`], the field the settings/
-//!   markdown/editor tabs already populate).
-//! * [`compose_tab_menu`] — the context-menu MODEL a right-click / ctrl-click on
-//!   a tab chip pops as a native `NSMenu`: disabled identity headers, the recent
-//!   timeline tail, then the actions (`Copy Session ID` / `Copy CWD` /
-//!   `Close Tab`, routed through the existing [`MenuAction`] tag dispatch).
-//!
-//! One composer feeding both surfaces is the point: the tooltip can never say
-//! something the menu doesn't (the menu adds the recent timeline tail, a log
-//! rather than a glance), and the `chrome` introspection verb's
-//! [`tab_menu_chrome_line`] mirror (read off the live strip) is provably the
-//! same items a human sees, because there is exactly one place items are made.
-//!
-//! PURE by construction — no locks, no AppKit, no clocks (a timeline row
-//! carries its event's stamp and is aged against an EXPLICIT `now_ms` where a
-//! surface shows it, [`TabMenuEntry::shown_at`]; the `~`-abbreviation takes
-//! an EXPLICIT `home` like
-//! [`crate::app_tabs::home_relative_suffix`], which it reuses) — so every
-//! ordering/truncation/degradation rule is unit-proved headlessly, on every
-//! platform. The impure work (leaf-lock reads, epoch caching) lives in
-//! `App::composed_session_chrome` (`app_tabs.rs`).
+//! Per-session UI CHROME composer (session-metadata stage 2).
 
 use aterm_session::SessionId;
 
 use crate::menu::MenuAction;
 
-/// How many timeline events the context menu shows (the tooltip shows none) —
-/// the "recent" TAIL, newest-first. Small on purpose: the `timeline` verb
-/// serves the full ring.
+/// How many timeline events the context menu shows (the tooltip shows none) — the "recent" TAIL, newest-first.
 pub(crate) const TIMELINE_TAIL: usize = 5;
 
-/// Display cap for authored description and status activity prose (GRAPHEME
-/// CLUSTERS, not bytes or `char`s — the cap must never split a user-perceived
-/// glyph, and a ZWJ emoji or combining sequence spans several `char`s).
-/// `meta set description` stores up to 1024 BYTES; a tooltip/menu header is a
-/// one-liner, so anything longer is shown truncated with an ellipsis.
-/// Truncation here is DISPLAY-only — the durable stored value is untouched (the
-/// `meta` verb still returns it whole).
+/// Display cap for authored description and status activity prose (GRAPHEME CLUSTERS, not bytes or `char`s — the cap must never split a user-perceived glyph, and a ZWJ emoji or combining sequence spans several `char`s).
 pub(crate) const DESCRIPTION_DISPLAY_MAX: usize = 160;
 
-/// Everything the composer knows about one session, gathered by the caller
-/// under its own (leaf) locks and handed over as plain data. `label` is the
-/// already-resolved tab label (the `tab_titles` chain: user title ▸ OSC title ▸
-/// cwd), so the tooltip's first line always matches the chip it hovers.
+/// Everything the composer knows about one session, gathered by the caller under its own (leaf) locks and handed over as plain data.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct SessionChromeInput {
     /// The resolved tab label — the chip text this chrome annotates.
@@ -64,108 +21,62 @@ pub(crate) struct SessionChromeInput {
     /// `meta set icon` token (emoji / short name), prefixed onto the title line.
     pub icon: Option<String>,
     /// `meta set description` free text (display-truncated, see the cap).
-    /// This is durable, user-authored identity and is never replaced by the
-    /// activity line.
     pub description: Option<String>,
-    /// The live activity line — Tab Subject & Status's words
-    /// (`App::session_status_text`). This is transient presentation data,
-    /// kept distinct from the user-authored [`Self::description`]. When no
-    /// authored description exists it supplies the descriptive header line;
-    /// when both exist the composer renders both with honest labels.
+    /// The live activity line — Tab Subject & Status's words (`App::session_status_text`).
     pub activity: Option<String>,
-    /// The engine's reported cwd (OSC 7 / shell integration), RAW — the
-    /// composer abbreviates it against `home` for display, while `Copy CWD`
-    /// copies the raw form (a pasted path must be real, never `~`-relative).
+    /// The engine's reported cwd (OSC 7 / shell integration), RAW.
     pub cwd: Option<String>,
-    /// The `$HOME` to abbreviate against (explicit, like
-    /// [`crate::app_tabs::home_relative_suffix`], so tests need no env).
+    /// The `$HOME` to abbreviate against (explicit, like [`crate::app_tabs::home_relative_suffix`], so tests need no env).
     pub home: Option<String>,
-    /// The registry's lifecycle state (`spawning`/`alive`/`exited`/…), `None`
-    /// when the session is not registered (a stub) — the line is then omitted.
+    /// The registry's lifecycle state (`spawning`/`alive`/`exited`/…), `None` when the session is not registered (a stub).
     pub state: Option<String>,
-    /// Whether a registry identity exists — gates the `Copy Session ID` action
-    /// (greyed out rather than copying an empty string).
+    /// Whether a registry identity exists — gates the `Copy Session ID` action (greyed out rather than copying an empty string).
     pub has_session: bool,
-    /// The session's registry sid, when it has one: the AGENT section's Stop
-    /// Worker row carries it as its argument.
+    /// The session's registry sid, when it has one: the AGENT section's Stop Worker row carries it as its argument.
     pub sid: Option<SessionId>,
-    /// Whether this window can PRESENT a rename editor at all. Off macOS the
-    /// editor is painted by the tab strip, so `tab_strip_rows = 0` leaves the
-    /// command with nowhere to go and the row greys out instead of accepting a
-    /// click that only reaches a log line.
+    /// Whether this window can PRESENT a rename editor at all.
     pub can_rename: bool,
-    /// The recent timeline tail, NEWEST-FIRST, already cut to the rows it
-    /// shows and capped to [`TIMELINE_TAIL`] by the caller ([`timeline_tail`];
-    /// the composer re-applies both defensively).
+    /// The recent timeline tail, NEWEST-FIRST, already cut to the rows it shows and capped to [`TIMELINE_TAIL`] by the caller ([`timeline_tail`]; the composer re-applies both defensively).
     pub timeline: Vec<TimelineNote>,
-    /// This session's live SESSION CONNECTIONS (design §2.3/§4), one fact per
-    /// peer, gathered by the caller from the in-process edge tables (the
-    /// authority record — never lineage, never the token store) and already
-    /// sorted for a stable listing. Empty = no CONNECTIONS rows beyond the
-    /// always-present spawn presets / picker entries.
+    /// Sorted live session connections (design §2.3/§4), one fact per peer, gathered from the in-process edge tables.
     pub connections: Vec<ConnectionFact>,
-    /// The LIVE AGENT UPGRADE of the agent this tab runs, as its menu offers
-    /// the owner's words on it (gap #21), from the window's view of the
-    /// harness host's rows; `None` when none is recorded for the tab or no
-    /// word would do anything.
+    /// The LIVE AGENT UPGRADE of the agent this tab runs, as its menu offers the owner's words on it (gap #21), from the window's view of the harness host's rows.
     pub upgrade: Option<UpgradeMenu>,
-    /// WHY the tab's attention mark stands: the session's `meta set attention`
-    /// text, as the caller read it (the composer sanitizes and caps it again).
-    /// The mark alone says "needs attention"; the hover names the reason, so a
-    /// mark that stays is never a riddle. `None` = no reason recorded.
+    /// WHY the tab's attention mark stands.
     pub attention: Option<String>,
-    /// What the menu's AGENT section offers for this session
-    /// (`docs/DESIGN-owner-surfaces-2026-10-16.md` §4): the person's hold, and
-    /// its manager or its workers, gathered by the caller from the holds and
-    /// the task records.
+    /// What the menu's AGENT section offers for this session (`docs/DESIGN-owner-surfaces-2026-10-16.md` §4).
     pub agent: AgentMenu,
-    /// THE SESSION LOG'S CLAUSE (phase 3B, plan §5; addendum A12; on by
-    /// default since D6): `now: <its head words>` after `activity:`, and a
-    /// shown label's author after them. `None` with `[session_log] clause =
-    /// false`, and then every line and row is as it was before the clause,
-    /// byte for byte.
+    /// THE SESSION LOG'S CLAUSE (phase 3B, plan §5; addendum A12; on by default since D6).
     pub clause: Option<ClauseLine>,
 }
 
 /// The facts the tab menu's AGENT section is composed from.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct AgentMenu {
-    /// Hand Back has a hold to lift — the person's, or an Owner client's
-    /// where no person's stands (`fabric::Holds::hand_back_origin`): the row
-    /// is Hand Back, else Take Over.
+    /// Hand Back has a hold to lift.
     pub person_hold: bool,
-    /// The manager this session's task names, when this aterm hosts it:
-    /// `(its sid, its label)` — the `Go to <label>` row.
+    /// The manager this session's task names, when this aterm hosts it: `(its sid, its label)` — the `Go to <label>` row.
     pub manager: Option<(SessionId, String)>,
     /// The session runs a task that is not over: Stop Worker… is offered.
     pub stoppable: bool,
-    /// The workers whose tasks THIS session started: `(sid, its row's words)`,
-    /// in session order — the `Workers (n)` rows.
+    /// The workers whose tasks THIS session started: `(sid, its row's words)`, in session order — the `Workers (n)` rows.
     pub workers: Vec<(SessionId, String)>,
 }
 
-/// The session log's clause as the chrome shows it ([`SessionChromeInput::clause`]):
-/// the tooltip's `now: <head>` line, no age and no minutes left (a clock-free
-/// cache cannot keep either true), and the menu's row aged as it pops
-/// ([`TabMenuEntry::Event`]: `now: running shell · 4m ago`). A shown label
-/// says whose it is after its words (`now: restarting · by the harness`).
+/// The session log's clause as the chrome shows it ([`SessionChromeInput::clause`]).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ClauseLine {
     /// The clause's words without their coarse age (`aterm_slog::Clause::head`).
     pub head: String,
     /// When its state began, on [`crate::turn_ledger::now_ms`]'s clock.
     pub since_ms: u64,
-    /// When a shown label leaves (its `until`, on the same clock), the clause
-    /// being that label; `None` for every other row.
+    /// When a shown label leaves (its `until`, on the same clock), the clause being that label; `None` for every other row.
     pub until_ms: Option<u64>,
-    /// A shown label's author (`aterm_slog::Clause::by` on a label row, D6):
-    /// printed after the head, outside its 48 bytes. `None` for every other
-    /// row: a need, a step, a turn or a run says no author.
+    /// A shown label's author (`aterm_slog::Clause::by` on a label row, D6): printed after the head, outside its 48 bytes.
     pub by: Option<ClauseAuthor>,
 }
 
-/// Who wrote a label the clause shows: only a proven author's label shows
-/// (`aterm_slog::shown_proven_label`), so it is the harness or the person.
+/// Who wrote a label the clause shows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ClauseAuthor {
     /// The window's harness (`by=harness`).
@@ -175,8 +86,7 @@ pub(crate) enum ClauseAuthor {
 }
 
 impl ClauseAuthor {
-    /// The author of a label written by `by`; `None` for an author whose
-    /// label never shows.
+    /// The author of a label written by `by`; `None` for an author whose label never shows.
     pub(crate) const fn of(by: &aterm_slog::Actor) -> Option<Self> {
         match by {
             aterm_slog::Actor::Harness => Some(Self::Harness),
@@ -194,9 +104,7 @@ impl ClauseAuthor {
     }
 }
 
-/// What the chrome cache keys the clause on (addendum A12): its row, its head
-/// words, its tone, whose it is and when its state began — what moves only
-/// when the state does, never with the clock.
+/// What the chrome cache keys the clause on (addendum A12): its row, its head words, its tone, whose it is and when its state began.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ClauseKey {
     pub row: aterm_slog::ClauseRow,
@@ -206,14 +114,10 @@ pub(crate) struct ClauseKey {
     pub since_wall: u64,
 }
 
-/// One tab's live agent upgrade, as its context menu offers it (gap #21):
-/// the same words, for the same build, as the upgrade's band row
-/// (`message_reporters::agent_upgrade_words`), all of them — a row has room
-/// for two capsules, a menu for every word.
+/// One tab's live agent upgrade, as its context menu offers it (gap #21).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct UpgradeMenu {
-    /// The session the upgrade is on (`s-<hex>`): the pane the menu was
-    /// composed for, which its words name ([`TabMenuEntry::Upgrade`]).
+    /// The session the upgrade is on (`s-<hex>`): the pane the menu was composed for, which its words name ([`TabMenuEntry::Upgrade`]).
     pub sid: String,
     /// What it moves, in the band's words (`Claude Code 2.1.281 → 2.1.282`).
     pub moving: String,
@@ -223,8 +127,7 @@ pub(crate) struct UpgradeMenu {
     pub words: Vec<aterm_messages::UpgradeWord>,
 }
 
-/// An upgrade word's menu item (title case, the menu's own voice — a menu
-/// item has no capsule's 16-character bound, so "Skip This Version" whole).
+/// An upgrade word's menu item (title case, the menu's own voice — a menu item has no capsule's 16-character bound, so "Skip This Version" whole).
 #[must_use]
 pub(crate) fn upgrade_menu_label(word: aterm_messages::UpgradeWord) -> &'static str {
     match word {
@@ -234,10 +137,7 @@ pub(crate) fn upgrade_menu_label(word: aterm_messages::UpgradeWord) -> &'static 
     }
 }
 
-/// Which way the AUTHORITY of a connection points, seen from the session whose
-/// chrome is being composed ("S"). A row lives in its DESTINATION's table, so:
-/// `Outbound` = S holds ops over the peer, `Inbound` = the peer holds ops over
-/// S, `Peer` = both directions exist (the §2.3 `⇆` pair).
+/// Which way the AUTHORITY of a connection points, seen from the session whose chrome is being composed ("S").
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ConnDirection {
     Outbound,
@@ -245,20 +145,14 @@ pub(crate) enum ConnDirection {
     Peer,
 }
 
-/// The push/pull face of a connection's op set — the family-row rung (§6):
-/// `write-input` present ⇒ Push (it can type), else Pull (read-only).
+/// The push/pull face of a connection's op set.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ConnFlow {
     Push,
     Pull,
 }
 
-/// One connected peer as the chrome shows it — plain data (the caller resolves
-/// titles/directions under its own locks; the composer renders). `live` is
-/// BEST-EFFORT: today's lease/watcher state names control connections, not
-/// peer sessions, so per-peer traffic cannot be attributed honestly — callers
-/// pass `false` (absent = not live) until a per-connection activity seam
-/// exists; the rendering already supports the flag.
+/// One connected peer as the chrome shows it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ConnectionFact {
     /// The peer's registry sid, which its [`TabMenuEntry::ConnectionAction`] rows target.
@@ -266,66 +160,44 @@ pub(crate) struct ConnectionFact {
     /// The peer's display title, or `unknown` for a foreign src no local session owns.
     pub peer_title: String,
     pub direction: ConnDirection,
-    /// The [`ConnFlow`] of the half seen from this session: this→peer for `Outbound`/`Peer`,
-    /// peer→this for `Inbound` (a `Peer` line does not show it).
+    /// The [`ConnFlow`] of the half seen from this session.
     pub kind: ConnFlow,
     /// Whether the connection is driving right now; `false` means not known live, never idle.
     pub live: bool,
 }
 
-/// One timeline event as the chrome shows it: the kind token (printed in a
-/// person's words, [`event_words`]) plus when it happened. The payload is
-/// deliberately NOT shown — hover chrome is a pulse ("what happened
-/// lately"), the `timeline` verb is the detail.
+/// One timeline event as the chrome shows it: the kind token (printed in a person's words, [`event_words`]) plus when it happened.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct TimelineNote {
     /// The event kind token (`spawned`, `cwd-change`, `meta-change`, …).
     pub kind: &'static str,
-    /// When the event was recorded, on its own monotonic clock
-    /// ([`crate::turn_ledger::now_ms`]): the menu row carries it and is aged
-    /// where it is shown ([`TabMenuEntry::Event`]).
+    /// When the event was recorded, on its own monotonic clock ([`crate::turn_ledger::now_ms`]).
     pub at_ms: u64,
 }
 
-/// One entry of the composed context menu: the platform-neutral model the macOS strip renders
-/// as `NSMenuItem`s and the `chrome` verb serialises ([`tab_menu_chrome_line`]). Flat, with no
-/// submenu: per-peer rows follow a per-peer [`TabMenuEntry::Header`].
+/// One entry of the composed context menu.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum TabMenuEntry {
     /// A disabled, informational row (identity / connection lines).
     Header(String),
-    /// A disabled timeline row: its event in a person's words and when it
-    /// happened ([`crate::turn_ledger::now_ms`]'s clock). Its age is the
-    /// surface's to read, AS IT SHOWS THE ROW ([`Self::shown_at`]: `changed
-    /// directory · 2m ago`) — the native menu as it pops, the in-grid card
-    /// as it opens, the `chrome` verb's mirror as it is read — so a
-    /// composition is the same at every instant and the clock never wakes the
-    /// loop to recompose a closed menu (the Together run, 2026-10-16: a timer
-    /// wake every 30 s per tab re-deriving ages nobody was reading).
+    /// A disabled timeline row: its event in a person's words and when it happened ([`crate::turn_ledger::now_ms`]'s clock).
     Event { words: String, at_ms: u64 },
     /// A native separator.
     Separator,
-    /// A command row: the `NSMenuItem` carries `action`'s tag, so the click dispatches through
-    /// the menu bar's tag→[`MenuAction`] decode. `enabled: false` renders greyed.
+    /// A command row: the `NSMenuItem` carries `action`'s tag, so the click dispatches through the menu bar's tag→[`MenuAction`] decode.
     Action {
         label: String,
         action: MenuAction,
         enabled: bool,
     },
-    /// A per-peer row (Show / Configure… / Disconnect) against `peer_sid`. The action needs a
-    /// peer argument, so the native item's tag indexes the pop-time snapshot and the click posts
-    /// `Wake::TabMenuConnection`, not a [`MenuAction`].
+    /// A per-peer row (Show / Configure… / Disconnect) against `peer_sid`.
     ConnectionAction {
         label: String,
         peer_sid: SessionId,
         verb: ConnVerb,
         enabled: bool,
     },
-    /// The owner's word on this tab's live agent upgrade, for build `to` of session `sid`. Like
-    /// a connection row, the native item's tag indexes the pop-time snapshot and the click posts
-    /// `Wake::TabMenuUpgrade`, so the word names the build and pane the owner saw: the harness
-    /// refuses it once the upgrade moved on, and focus moving to another pane changes nothing.
-    /// Offered only when it does something, so always enabled.
+    /// The owner's word on this tab's live agent upgrade, for build `to` of session `sid`.
     Upgrade {
         label: String,
         sid: String,
@@ -334,22 +206,16 @@ pub(crate) enum TabMenuEntry {
     },
 }
 
-/// The closed verb vocabulary of a [`TabMenuEntry::ConnectionAction`] row:
-/// an act that needs a session ARGUMENT (`peer_sid`), dispatched by
-/// `App::dispatch_tab_menu_connection`.
+/// The closed verb vocabulary of a [`TabMenuEntry::ConnectionAction`] row.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ConnVerb {
-    /// Raise the window hosting the session and select its tab (the `raise`
-    /// wire verb's UI twin): `Go to <manager>`, a worker row.
+    /// Raise the window hosting the session and select its tab (the `raise` wire verb's UI twin): `Go to <manager>`, a worker row.
     Show,
-    /// Stop Worker…: after the person confirms the sheet (or, with no sheet
-    /// to ask on, the Overview's inline confirm), SIGTERM to the session's
-    /// agent, in process (`App::stop_worker`); its task reads `exited`.
+    /// Stop Worker…: after the person confirms the sheet (or, with no sheet to ask on, the Overview's inline confirm), SIGTERM to the session's agent, in process (`App::stop_worker`).
     StopWorker,
 }
 
-/// The per-tab tooltip and context-menu model the app pushes to the native strip. `Default`
-/// (no tooltip, no menu) is the shape for non-terminal tabs and unknown sessions.
+/// The per-tab tooltip and context-menu model the app pushes to the native strip.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct TabChromeExt {
     /// Tooltip text for the tab chip (`None` = no tooltip installed).
@@ -358,55 +224,35 @@ pub(crate) struct TabChromeExt {
     pub menu: Vec<TabMenuEntry>,
 }
 
-/// One session's cached chrome and the input epochs it was composed from (the
-/// `App::session_chrome` map's value); the reuse policy is in `App::composed_session_chrome`.
+/// One session's cached chrome and the input epochs it was composed from (the `App::session_chrome` map's value).
 pub(crate) struct CachedChrome {
-    /// The timeline's high-water event id: every composed fact (meta, cwd, state) records an
-    /// event, so an unchanged id means unchanged facts.
+    /// The timeline's high-water event id.
     pub high_id: u64,
     /// The resolved tab label: an OSC title can move without a timeline record.
     pub label: String,
-    /// The session-status revision at compose time. The activity line can
-    /// change without a session-timeline event and is never part of the label,
-    /// so it must be an independent cache epoch rather than relying on
-    /// `high_id` or `label`.
+    /// The session-status revision at compose time.
     pub activity_revision: u64,
-    /// The connection table's revision (`ConnectionTable::bump_revision`): a mint, revoke or
-    /// sweep moves no other epoch.
+    /// The connection table's revision (`ConnectionTable::bump_revision`): a mint, revoke or sweep moves no other epoch.
     pub connections_revision: u64,
-    /// The window's `upgrade_host::UpgradeView` revision: the harness host's rows move no other
-    /// epoch.
+    /// The window's `upgrade_host::UpgradeView` revision: the harness host's rows move no other epoch.
     pub upgrade_revision: u64,
-    /// When the clock may move this composition with no input epoch moving
-    /// ([`clock_expiry_ms`], from [`crate::turn_ledger::now_ms`] at compose
-    /// time): the instant the scheduler recomposes it, or `None` when nothing
-    /// it says moves with the clock — no wake.
+    /// When the clock may move this composition with no input epoch moving ([`clock_expiry_ms`], from [`crate::turn_ledger::now_ms`] at compose time).
     pub expires_ms: Option<u64>,
-    /// The session log's clause at compose time ([`ClauseKey`]), `None` with
-    /// `[session_log] clause` off or no clause: a clause that moved, or a
-    /// switch that flipped, misses the cache.
+    /// The session log's clause at compose time ([`ClauseKey`]), `None` with `[session_log] clause` off or no clause.
     pub clause: Option<ClauseKey>,
-    /// The clause line composed from it, served again when the timeline is
-    /// contended at the next compose.
+    /// The clause line composed from it, served again when the timeline is contended at the next compose.
     pub clause_line: Option<ClauseLine>,
     /// The composed extension handed to the native strip.
     pub ext: TabChromeExt,
 }
 
-/// How long a cached composition the clock moves (an upgrade's words) may
-/// serve before it is re-derived with unchanged inputs. The event loop arms
-/// the earliest cache expiry ([`CachedChrome::expires_ms`],
-/// [`clock_expiry_ms`]) and drains due entries in bounded batches, so this
-/// bounds their drift without per-frame work — and a composition the clock
-/// cannot move arms nothing.
+/// How long a cached composition the clock moves (an upgrade's words) may serve before it is re-derived with unchanged inputs.
 pub(crate) const CACHE_MAX_AGE_MS: u64 = 30_000;
 
-/// Window inspections/toolbar refreshes the expiry fan-out performs per event-loop turn; the
-/// cursor keeps the remainder.
+/// Window inspections/toolbar refreshes the expiry fan-out performs per event-loop turn; the cursor keeps the remainder.
 pub(crate) const EXPIRY_WINDOW_SCAN_BUDGET: usize = 1;
 
-/// Observable projection of one expiry scheduler turn; the conformance test binds these counts
-/// to the derived model's `work` variable.
+/// Observable projection of one expiry scheduler turn.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ExpiryProgress {
     pub(crate) admitted_session: Option<u64>,
@@ -415,21 +261,7 @@ pub(crate) struct ExpiryProgress {
     pub(crate) completed_session: Option<u64>,
 }
 
-/// THE CLOCK'S PART IN A COMPOSITION: when the one composed at `composed_ms`
-/// from `input` may read differently though no input epoch moves, or `None`
-/// when it never does. The timeline rows' ages are no part of it: a row
-/// carries its event's stamp and is aged where it is shown
-/// ([`TabMenuEntry::Event`]). What is left is the upgrade's words
-/// (`upgrade_host::UpgradeView::menu_for` reads them against the clock: a
-/// stall, a deferral running out), re-derived every [`CACHE_MAX_AGE_MS`]
-/// while a tab has one. A tab with none arms no wake: a quiet desktop's
-/// tabs, on screen or not, cost the event loop nothing (the Together run,
-/// 2026-10-16, measured one timer wake every 30 s per tab recomposing a
-/// closed menu's ages).
-///
-/// With `[session_log] clause` on, a label the clause shows leaves at its
-/// `until`: the expiry is the earlier of the upgrade's term and
-/// that instant. Off (no clause), it is exactly the upgrade's term.
+/// THE CLOCK'S PART IN A COMPOSITION.
 #[must_use]
 pub(crate) fn clock_expiry_ms(composed_ms: u64, input: &SessionChromeInput) -> Option<u64> {
     let upgrade = input
@@ -443,9 +275,7 @@ pub(crate) fn clock_expiry_ms(composed_ms: u64, input: &SessionChromeInput) -> O
     }
 }
 
-/// Earliest absolute process-clock expiry represented by the cache, or `None`
-/// when no retained composition moves with the clock (the event loop can
-/// return to pure Wait).
+/// Earliest absolute process-clock expiry represented by the cache, or `None` when no retained composition moves with the clock (the event loop can return to pure Wait).
 #[must_use]
 pub(crate) fn next_cache_expiry_ms(
     cache: &std::collections::HashMap<u64, CachedChrome>,
@@ -453,8 +283,7 @@ pub(crate) fn next_cache_expiry_ms(
     cache.values().filter_map(|c| c.expires_ms).min()
 }
 
-/// At most `budget` entries due at `now_ms`, ordered by deadline then session id. Selection
-/// does not mutate: the App removes each entry before recomposing the windows that use it.
+/// At most `budget` entries due at `now_ms`, ordered by deadline then session id.
 #[must_use]
 pub(crate) fn due_cache_batch(
     cache: &std::collections::HashMap<u64, CachedChrome>,
@@ -464,8 +293,6 @@ pub(crate) fn due_cache_batch(
     if budget == 0 {
         return Vec::new();
     }
-    // Keep only the earliest `budget` candidates while scanning, so a mass expiry allocates
-    // O(budget). Not pre-reserved: most calls find nothing due and stay allocation-free.
     let mut due: Vec<(u64, u64)> = Vec::new();
     for (session, entry) in cache {
         let Some(expiry) = entry.expires_ms.filter(|at| *at <= now_ms) else {
@@ -484,8 +311,7 @@ pub(crate) fn due_cache_batch(
     due.into_iter().map(|(_, session)| session).collect()
 }
 
-/// An age delta as the coarse token the chrome shows: the chrome is recomposed on input
-/// changes, not per frame, so a coarse bucket stays true between rebuilds.
+/// An age delta as the coarse token the chrome shows.
 #[must_use]
 pub(crate) fn relative_age(age_ms: u64) -> String {
     const SEC: u64 = 1000;
@@ -506,14 +332,11 @@ pub(crate) fn relative_age(age_ms: u64) -> String {
 }
 
 /// The `~`-abbreviated display cwd ([`crate::app_tabs::home_relative_suffix`] matches whole
-/// components, so `/Users//foobar` under `home=/Users//foo` stays verbatim).
 fn display_cwd(cwd: &str, home: Option<&str>) -> String {
     let display = match home.and_then(|h| crate::app_tabs::home_relative_suffix(cwd, h)) {
         Some(rest) => format!("~{rest}"),
         None => cwd.to_string(),
     };
-    // The cwd is program-supplied (OSC 7 / 633) and may hold controls; `Copy CWD` keeps the
-    // exact value, but the display strips controls and bidi, and caps a PATH_MAX-sized path.
     let display = crate::session_timeline::sanitize_presentation_line(
         &display,
         crate::session_timeline::META_DESCRIPTION_MAX,
@@ -522,7 +345,6 @@ fn display_cwd(cwd: &str, home: Option<&str>) -> String {
 }
 
 /// The identity title line, `<icon> <label>` or the bare label: the first line of both the
-/// tooltip and the menu.
 fn title_line(input: &SessionChromeInput) -> String {
     let label = crate::session_timeline::sanitize_presentation_line(&input.label, usize::MAX);
     match input
@@ -536,8 +358,6 @@ fn title_line(input: &SessionChromeInput) -> String {
 }
 
 /// One descriptive prose line, truncated for display to [`DESCRIPTION_DISPLAY_MAX`] grapheme
-/// clusters with a trailing ellipsis, so the cut never lands inside a ZWJ sequence or between
-/// a base and its combining mark.
 fn display_description(prose: &str) -> String {
     use aterm_grapheme::GraphemeClusters;
     let mut it = prose.graphemes();
@@ -550,9 +370,6 @@ fn display_description(prose: &str) -> String {
 }
 
 /// One connection's display line, shared by the tooltip and the menu's per-peer header:
-/// `⇥ pushes into "build" · live`, `⇤ pulled by "operator"`, `⇆ peer "claude (b)"`. The glyph
-/// is the authority direction (⇥ this session holds ops over the peer, ⇤ the reverse, ⇆
-/// both), the verb the [`ConnFlow`]. Titles are program-influenced, so they are sanitized.
 fn connection_line(fact: &ConnectionFact) -> String {
     let title = display_description(&crate::session_timeline::sanitize_presentation_line(
         &fact.peer_title,
@@ -575,14 +392,6 @@ fn connection_lines(input: &SessionChromeInput) -> Vec<String> {
 }
 
 /// The shared identity HEADER LINES (title, durable description, status
-/// activity, cwd, the lifecycle state when it is news — `exited`, not the
-/// `alive` every live tab is) — the one list both surfaces render. Authored
-/// and observed prose are labeled so a transient status line can never
-/// masquerade as durable session metadata. The newest-first timeline tail is
-/// the menu's alone ([`timeline_rows`]).
-///
-/// Also where the clause goes (after `activity:`, before `cwd:`): the index
-/// the tooltip's `now:` line and the menu's row are put at.
 fn header_lines(input: &SessionChromeInput) -> (Vec<String>, usize) {
     let mut identity = vec![title_line(input)];
     if let Some(description) = input.description.as_deref().and_then(|description| {
@@ -609,8 +418,6 @@ fn header_lines(input: &SessionChromeInput) -> (Vec<String>, usize) {
             identity.push(format!("cwd: {cwd}"));
         }
     }
-    // The state is news unless it is the live default or the activity line already says it
-    // (`activity: exited (exit 1)`).
     if let Some(state) = input.state.as_deref().filter(|s| {
         !s.is_empty()
             && !matches!(*s, "-" | "alive" | "spawning")
@@ -622,9 +429,6 @@ fn header_lines(input: &SessionChromeInput) -> (Vec<String>, usize) {
 }
 
 /// The clause's words as a line shows them (`now: <head>`, and a shown
-/// label's ` · by the harness` or ` · by you` after them, outside the head's
-/// 48 bytes), through the presentation sanitizer every header line takes (a
-/// bidi or C1 character in a label is stripped); `None` when nothing is left.
 fn clause_words(clause: &ClauseLine) -> Option<String> {
     let head = crate::session_timeline::sanitize_presentation_line(
         &clause.head,
@@ -637,8 +441,6 @@ fn clause_words(clause: &ClauseLine) -> Option<String> {
 }
 
 /// The menu's newest-first timeline tail: each shown event
-/// ([`timeline_row_shown`], at most [`TIMELINE_TAIL`]) as a row its surface
-/// ages ([`TabMenuEntry::Event`]).
 fn timeline_rows(input: &SessionChromeInput) -> Vec<TabMenuEntry> {
     input
         .timeline
@@ -653,10 +455,7 @@ fn timeline_rows(input: &SessionChromeInput) -> Vec<TabMenuEntry> {
 }
 
 impl TabMenuEntry {
-    /// This entry as a surface shows it at `now_ms`
-    /// ([`crate::turn_ledger::now_ms`]'s clock): an [`Self::Event`] aged into
-    /// its row (`changed directory · 2m ago`, [`relative_age`]), every other
-    /// entry as it is.
+    /// This entry as a surface shows it at `now_ms` ([`crate::turn_ledger::now_ms`]'s clock).
     #[must_use]
     pub(crate) fn shown_at(&self, now_ms: u64) -> Self {
         match self {
@@ -669,21 +468,13 @@ impl TabMenuEntry {
     }
 }
 
-/// A composed menu as a surface shows it at `now_ms`: every timeline row
-/// aged ([`TabMenuEntry::shown_at`]).
+/// A composed menu as a surface shows it at `now_ms`: every timeline row aged ([`TabMenuEntry::shown_at`]).
 #[must_use]
 pub(crate) fn menu_shown_at(entries: &[TabMenuEntry], now_ms: u64) -> Vec<TabMenuEntry> {
     entries.iter().map(|e| e.shown_at(now_ms)).collect()
 }
 
-/// Whether a timeline event earns a row in the tab's hover chrome. An agent's
-/// verdict moves, a program's own state reports (`program-state`, a codex's
-/// turn ledger), a person's own typing, the bus's own traffic (a fetch, a
-/// topic, a read receipt, a delivery receipt) and the resize ledger's
-/// `render` verdict (a desync risk and its heal are one kind, told apart only
-/// by the payload) say nothing without their payload, which this surface
-/// never shows (the `timeline` verb does), and on an agent's or a fabric
-/// session's tab they would fill the tail.
+/// Whether a timeline event earns a row in the tab's hover chrome.
 pub(crate) fn timeline_row_shown(kind: &str) -> bool {
     !matches!(
         kind,
@@ -695,7 +486,6 @@ pub(crate) fn timeline_row_shown(kind: &str) -> bool {
             | "inbox-seen"
             | "post-landed"
             | "render"
-            // The card engine's dev rows (`crate::holder_image::DEV_ROWS`).
             | "holder-edge"
             | "holder-image"
             | "holder-named"
@@ -706,16 +496,11 @@ pub(crate) fn timeline_row_shown(kind: &str) -> bool {
             | "card-armed"
             | "card-bare"
             | "holder-adopt"
-            // The footer resolver's dev row.
             | crate::claude_footer::REGISTRY_READ
     )
 }
 
-/// The rows the hover chrome shows, from a NEWEST-FIRST walk of the
-/// session's `(kind, t_ms)` events: the newest [`TIMELINE_TAIL`] that earn a
-/// row ([`timeline_row_shown`]), each with its stamp (aged where it is
-/// shown, [`TabMenuEntry::shown_at`]). The cut runs before the cap, so the
-/// rows left out never crowd out older ones that say something.
+/// The rows the hover chrome shows, from a NEWEST-FIRST walk of the session's `(kind, t_ms)` events.
 pub(crate) fn timeline_tail(
     newest_first: impl Iterator<Item = (&'static str, u64)>,
 ) -> Vec<TimelineNote> {
@@ -747,14 +532,7 @@ fn event_words(kind: &str) -> &str {
     }
 }
 
-/// Compose the hover TOOLTIP for one terminal tab, or `None` when the session
-/// carries NOTHING beyond its bare label (no authored description, status
-/// activity, icon, cwd, exited state or connection) — the tab then keeps its
-/// no-tooltip behavior instead of a tooltip that merely repeats the chip text.
-/// Shape: the identity lines, then the per-connection lines (design §4: the
-/// mark is never visual-only). The timeline tail is the context menu's alone:
-/// raw event kinds (`spawned`, `meta-change`) are a log, not a glance, and the
-/// strip joins the tooltip's lines into one help string.
+/// Compose the hover TOOLTIP for one terminal tab, or `None` when the session carries NOTHING beyond its bare label (no authored description, status activity, icon, cwd, exited state or connection).
 #[must_use]
 pub(crate) fn compose_tooltip(input: &SessionChromeInput) -> Option<String> {
     let (mut identity, clause_at) = header_lines(input);
@@ -781,13 +559,10 @@ pub(crate) fn compose_tooltip(input: &SessionChromeInput) -> Option<String> {
 /// Prefix of the tooltip's attention line; the native hover ([`crate::toolbar`]) reads it.
 pub(crate) const NEEDS_ATTENTION_PREFIX: &str = "Needs attention: ";
 
-/// The hover's line for a harness's need in the worker's own words
-/// (`App::presence_hover`, design §12.2.1) starts with this in place of
-/// [`NEEDS_ATTENTION_PREFIX`]: the reason told, as that line is.
+/// The hover's line for a harness's need in the worker's own words (`App::presence_hover`, design §12.2.1) starts with this in place of [`NEEDS_ATTENTION_PREFIX`].
 pub(crate) const NEEDS_YOU_PREFIX: &str = "Needs you: ";
 
 /// The tooltip's `Needs attention: <reason>` line, sanitized and capped by the `attention`
-/// field's rules, then display-truncated; `None` when no reason is recorded.
 fn attention_line(input: &SessionChromeInput) -> Option<String> {
     let reason = input
         .attention
@@ -799,22 +574,11 @@ fn attention_line(input: &SessionChromeInput) -> Option<String> {
     ))
 }
 
-/// Compose the right-click CONTEXT-MENU model for one terminal tab: the same
-/// identity lines as the tooltip as disabled headers, a separator, the
-/// newest-first timeline tail (disabled), a separator, the AGENT section
-/// (`docs/DESIGN-owner-surfaces-2026-10-16.md` §4, replacing CONNECTIONS), a
-/// separator, then the actions. The menu ALWAYS exists (unlike the tooltip):
-/// a bare unnamed session still owns `Copy Session ID` / `Copy CWD` / `Close
-/// Tab`, with the unavailable copies greyed rather than hidden (a stable menu
-/// shape is learnable). The AGENT section is always present — Take Over (or
-/// Hand Back), Harness Log, Set Role… are its floor — and adds, on a worker,
-/// `Go to <manager>` and Stop Worker…, and on a manager a `Workers (n)` header
-/// with one row per worker, FLAT per design R15.
+/// Compose the right-click CONTEXT-MENU model for one terminal tab.
 #[must_use]
 pub(crate) fn compose_tab_menu(input: &SessionChromeInput) -> Vec<TabMenuEntry> {
     let (headers, clause_at) = header_lines(input);
     let mut entries: Vec<TabMenuEntry> = headers.into_iter().map(TabMenuEntry::Header).collect();
-    // The clause, aged as the menu pops ([`TabMenuEntry::shown_at`]).
     if let Some(clause) = input.clause.as_ref()
         && let Some(words) = clause_words(clause)
     {
@@ -831,7 +595,6 @@ pub(crate) fn compose_tab_menu(input: &SessionChromeInput) -> Vec<TabMenuEntry> 
         entries.push(TabMenuEntry::Separator);
         entries.extend(timeline);
     }
-    // The live agent upgrade's words, right under the identity they steer.
     if let Some(upgrade) = input.upgrade.as_ref().filter(|u| !u.words.is_empty()) {
         entries.push(TabMenuEntry::Separator);
         entries.push(TabMenuEntry::Header("AGENT UPGRADE".to_string()));
@@ -852,8 +615,6 @@ pub(crate) fn compose_tab_menu(input: &SessionChromeInput) -> Vec<TabMenuEntry> 
         action,
         enabled,
     };
-    // The person's hold pair: the one that applies (`Take Over` and `Hand
-    // Back` are the person's own; the clicked tab is their subject).
     let agent = &input.agent;
     entries.push(if agent.person_hold {
         action(
@@ -878,7 +639,6 @@ pub(crate) fn compose_tab_menu(input: &SessionChromeInput) -> Vec<TabMenuEntry> 
         MenuAction::SetRole,
         input.has_session && input.can_rename,
     ));
-    // On a worker: its manager, and the stop.
     if let Some((manager, label)) = &agent.manager {
         entries.push(TabMenuEntry::ConnectionAction {
             label: format!("Go to {label}"),
@@ -897,8 +657,6 @@ pub(crate) fn compose_tab_menu(input: &SessionChromeInput) -> Vec<TabMenuEntry> 
             enabled: true,
         });
     }
-    // On a manager: its workers, one row each, going there. Flat (design
-    // R15): the header names the count, the rows follow.
     if !agent.workers.is_empty() {
         entries.push(TabMenuEntry::Header(format!(
             "Workers ({})",
@@ -914,8 +672,6 @@ pub(crate) fn compose_tab_menu(input: &SessionChromeInput) -> Vec<TabMenuEntry> 
         }
     }
     entries.push(TabMenuEntry::Separator);
-    // Rename first: it acts on the identity the headers describe. It needs a session, since
-    // the pin is session metadata.
     entries.push(action(
         "Rename Session…",
         MenuAction::RenameSession,
@@ -935,17 +691,7 @@ pub(crate) fn compose_tab_menu(input: &SessionChromeInput) -> Vec<TabMenuEntry> 
     entries
 }
 
-/// Serialise one tab's context-menu model to the `chrome` verb's line —
-/// `tab-menu tab=<i> items=["…", "---", …]` — the introspection mirror of what
-/// a right-click on that chip pops. Separators print as `---`; a DISABLED
-/// action is suffixed ` (disabled)` so a driving AI sees the same
-/// greyed-vs-live distinction a human does. Headers print verbatim (their
-/// disabled-ness is structural: they carry no action). A connection row stays
-/// FLAT and carries its peer argument as `<label> @<sid>` — the control
-/// layer's `@<sid>` addressing spelling, so a driving AI can read the target
-/// straight off the mirror. Timeline rows are aged at `now_ms`, the instant
-/// the mirror is read, as a right-click then would show them
-/// ([`TabMenuEntry::shown_at`]).
+/// Serialise one tab's context-menu model to the `chrome` verb's line.
 #[must_use]
 pub(crate) fn tab_menu_chrome_line(index: usize, entries: &[TabMenuEntry], now_ms: u64) -> String {
     let items: Vec<String> = entries
@@ -955,15 +701,12 @@ pub(crate) fn tab_menu_chrome_line(index: usize, entries: &[TabMenuEntry], now_m
     format!("tab-menu tab={index} items={items:?}")
 }
 
-/// One entry's mirror token: the item [`tab_menu_chrome_line`] lists and the in-grid overlay's
-/// `controls tab-menu` rows reuse, so both readings spell an item the same way.
+/// One entry's mirror token.
 #[must_use]
 pub(crate) fn menu_entry_mirror(entry: &TabMenuEntry) -> String {
     let disabled_suffix = |enabled: bool| if enabled { "" } else { " (disabled)" };
     match entry {
         TabMenuEntry::Header(t) => t.clone(),
-        // Aged by the surface before it is mirrored ([`menu_shown_at`]);
-        // unaged, its words alone.
         TabMenuEntry::Event { words, .. } => words.clone(),
         TabMenuEntry::Separator => "---".to_string(),
         TabMenuEntry::Action { label, enabled, .. } => {
@@ -979,7 +722,6 @@ pub(crate) fn menu_entry_mirror(entry: &TabMenuEntry) -> String {
             peer_sid.as_str(),
             disabled_suffix(*enabled)
         ),
-        // The build rides the mirror, as a connection row's peer does.
         TabMenuEntry::Upgrade { label, to, .. } => format!("{label} ({to})"),
     }
 }
@@ -1036,17 +778,9 @@ mod tests {
     }
 
     /// The instant the tests' timelines are aged against
-    /// ([`crate::turn_ledger::now_ms`]'s clock).
     const NOW: u64 = 1_000_000_000;
 
     /// THE CLOCK MOVES A COMPOSITION ONLY BY AN UPGRADE'S WORDS (the
-    /// Together run): a timeline row carries
-    /// its event's stamp and is aged where the menu is shown, so one
-    /// composition reads `2m ago` now and `3m ago` a minute on and arms no
-    /// wake; the upgrade's words read the clock, so a tab with one is
-    /// re-derived every period; a cache entry with no expiry is never due.
-    ///
-    /// NEGATIVE CONTROL: the same input with an upgrade arms the period.
     #[test]
     fn the_clock_moves_a_composition_only_by_an_upgrades_words() {
         let mut input = full_input();
@@ -1078,13 +812,11 @@ mod tests {
             ],
             "the same composition, aged a minute on"
         );
-        // The `chrome` verb's mirror ages them as it is read.
         let line = tab_menu_chrome_line(0, &menu, NOW + 60_000);
         assert!(
             line.contains("\"changed directory \u{b7} 3m ago\""),
             "{line}"
         );
-        // Negative control: the upgrade's words read the clock.
         input.upgrade = Some(UpgradeMenu {
             sid: "s-1".to_string(),
             moving: "Claude Code 2.1.281 → 2.1.282".to_string(),
@@ -1151,9 +883,6 @@ mod tests {
     }
 
     /// The tooltip renders identity lines in the pinned order (icon+title,
-    /// durable description, status activity, ~-abbreviated cwd) — one exact
-    /// byte shape, so surfaces never drift apart silently. `alive` is every live
-    /// tab's state, so it is no line; the timeline tail is the menu's.
     #[test]
     fn tooltip_orders_identity_with_home_abbreviation() {
         let tip = compose_tooltip(&full_input()).expect("full metadata composes");
@@ -1164,7 +893,6 @@ mod tests {
              activity: Building documentation\n\
              cwd: ~/src/aterm"
         );
-        // A state that IS news keeps its line.
         let mut exited = full_input();
         exited.state = Some("exited".to_string());
         assert!(
@@ -1172,12 +900,10 @@ mod tests {
                 .unwrap()
                 .ends_with("\ncwd: ~/src/aterm\nstate: exited")
         );
-        // An activity line that already says it exited is the one exit line.
         exited.activity = Some("exited (exit 1)".to_string());
         let tip = compose_tooltip(&exited).unwrap();
         assert!(tip.contains("activity: exited (exit 1)"), "{tip}");
         assert!(!tip.contains("state: exited"), "{tip}");
-        // A bare live session with a spawn event is only its label: no tooltip.
         let bare = SessionChromeInput {
             label: "zsh".to_string(),
             state: Some("alive".to_string()),
@@ -1223,7 +949,6 @@ mod tests {
     }
 
     /// A recorded attention reason is one `Needs attention: <reason>` line after the identity
-    /// lines, and earns a tooltip on its own.
     #[test]
     fn the_tooltip_names_why_a_tab_needs_a_look() {
         let stalled = SessionChromeInput {
@@ -1281,7 +1006,6 @@ mod tests {
             ..SessionChromeInput::default()
         };
         assert_eq!(compose_tooltip(&input), None);
-        // `-` (the registry's unregistered marker) and empty strings count as absent.
         let dashed = SessionChromeInput {
             label: "zsh".to_string(),
             state: Some("-".to_string()),
@@ -1295,8 +1019,6 @@ mod tests {
     /// A multi-codepoint cluster straddling the cap is kept or dropped whole, never split.
     #[test]
     fn description_truncation_never_splits_a_grapheme_cluster() {
-        // 159 ASCII chars, then a ZWJ family emoji (5 chars, one cluster): exactly 160
-        // clusters, so it renders whole with no ellipsis.
         let family = "👨\u{200D}👩\u{200D}👧";
         let mut input = full_input();
         input.description = Some(format!("{}{family}", "x".repeat(159)));
@@ -1313,7 +1035,6 @@ mod tests {
         );
         assert!(!line.ends_with('…'), "exactly at the cap ⇒ no ellipsis");
 
-        // One cluster past the cap: the whole emoji is dropped before the ellipsis.
         input.description = Some(format!("{}{family}", "x".repeat(160)));
         let tip = compose_tooltip(&input).unwrap();
         let line = tip
@@ -1328,7 +1049,6 @@ mod tests {
             "over-cap cluster is dropped whole, cut lands on a cluster boundary"
         );
 
-        // A combining sequence (e + U+0301) straddling the cap stays together.
         input.description = Some(format!("{}e\u{301}zz", "x".repeat(159)));
         let tip = compose_tooltip(&input).unwrap();
         let line = tip
@@ -1369,7 +1089,6 @@ mod tests {
     }
 
     /// Kinds that say nothing without their payload are no rows, and the cut runs before the
-    /// cap, so a burst of them never hides older rows.
     #[test]
     fn timeline_tail_leaves_out_agent_moves_and_typing() {
         let newest_first = [
@@ -1408,7 +1127,6 @@ mod tests {
                 _ => None,
             })
             .collect();
-        // A worker's task moving is a row, in words: it is rare and it is news.
         assert_eq!(
             rows,
             [
@@ -1419,9 +1137,6 @@ mod tests {
     }
 
     /// The menu opens with the SAME header text the tooltip shows (one
-    /// composer, two surfaces), plus the timeline tail; the `AGENT` marker is
-    /// the one menu-only header, being structure rather than a fact. Then the
-    /// AGENT rows and the actions, in order; four groups, three separators.
     #[test]
     fn menu_matches_tooltip_headers_and_orders_actions() {
         let mut input = full_input();
@@ -1442,8 +1157,6 @@ mod tests {
                 _ => None,
             })
             .collect();
-        // The tooltip carries the connection line; the menu does not (its
-        // CONNECTIONS section went), and adds the timeline tail.
         let tip_identity: Vec<&str> = tip_lines
             .iter()
             .copied()
@@ -1484,10 +1197,6 @@ mod tests {
     }
 
     /// THE AGENT SECTION per state (design §4): a plain session offers Take
-    /// Over, the harness log and the role; under the person's hold the first
-    /// row is Hand Back; a worker adds `Go to <manager>` (Show, the manager's
-    /// sid) and Stop Worker… (on its own sid); a manager adds a `Workers (n)`
-    /// header and one Show row per worker. Flat throughout (design R15).
     #[test]
     fn the_agent_section_offers_the_hold_and_the_team_rows() {
         let rows = |input: &SessionChromeInput| -> Vec<(String, ConnVerb)> {
@@ -1556,7 +1265,6 @@ mod tests {
     }
 
     /// The tooltip still carries each connection line (§4: never
-    /// visual-only), and a hostile peer title cannot forge a line.
     #[test]
     fn the_tooltip_carries_connection_lines_and_no_forged_one() {
         let mut peers = full_input();
@@ -1595,9 +1303,6 @@ mod tests {
     }
 
     /// A bare session still gets a menu (label header + sections + actions),
-    /// with the acts that need a session GREYED, not hidden — and only TWO
-    /// separators (no empty timeline group; the AGENT section is always
-    /// present because its floor is).
     #[test]
     fn bare_session_menu_greys_unavailable_copies() {
         let input = SessionChromeInput {
@@ -1639,9 +1344,6 @@ mod tests {
     }
 
     /// The `chrome` verb's mirror line serialises EXACTLY the composed model:
-    /// one token per entry, separators as `---`, disabled actions annotated,
-    /// a session-argument row flat with its `@<sid>` — so the introspected
-    /// listing IS the on-screen menu.
     #[test]
     fn chrome_line_mirrors_composed_model() {
         let mut input = SessionChromeInput {
@@ -1674,7 +1376,6 @@ mod tests {
     }
 
     /// A pending agent upgrade composes an `AGENT UPGRADE` section under the identity: what it
-    /// moves, then every word that does something, each carrying its build. No word, no section.
     #[test]
     fn a_pending_upgrade_offers_the_owners_words_for_its_build() {
         use aterm_messages::UpgradeWord::{NotToday, Now, Skip};
@@ -1736,11 +1437,6 @@ mod tests {
     }
 
     /// D6: a shown label's line
-    /// names its author after its words, outside the head's 48 bytes, in the
-    /// tooltip and in the menu's aged row: `by the harness` or `by you`. A
-    /// row with no author (a need, a step, a turn, a run) names none.
-    ///
-    /// NEGATIVE CONTROL: the same label without its author is the bare line.
     #[test]
     fn a_shown_label_names_its_author_after_its_words() {
         let mut input = full_input();
@@ -1765,8 +1461,6 @@ mod tests {
                 .expect("composes")
                 .contains("\nnow: restarting \u{b7} by you\n")
         );
-        // A head at the clause's full 48 bytes keeps every one of them; the
-        // author follows.
         let head = "x".repeat(48);
         label.head.clone_from(&head);
         input.clause = Some(label.clone());
@@ -1775,7 +1469,6 @@ mod tests {
                 .expect("composes")
                 .contains(&format!("\nnow: {head} \u{b7} by you\n"))
         );
-        // Negative control.
         label.by = None;
         input.clause = Some(label);
         let bare = compose_tooltip(&input).expect("composes");
@@ -1784,11 +1477,6 @@ mod tests {
     }
 
     /// THE CLAUSE'S LINE AND ROW (phase 3B; addendum A12 item 3): the
-    /// tooltip's `now: <head>` sits right after `activity:` with no age, and
-    /// the menu's row at the same place, aged as the menu pops. Every other
-    /// line and row is the input's without a clause, byte for byte.
-    ///
-    /// NEGATIVE CONTROL: no clause, no line and no row.
     #[test]
     fn the_clause_is_a_now_line_after_activity_and_an_aged_menu_row() {
         let plain = full_input();
@@ -1820,14 +1508,12 @@ mod tests {
             TabMenuEntry::Header("now: running shell \u{b7} 4m ago".to_string()),
             "the row is aged where it is shown"
         );
-        // With no activity line the clause follows the description.
         input.activity = None;
         assert!(
             compose_tooltip(&input)
                 .expect("composes")
                 .contains("description: Rebuilds the docs site\nnow: running shell\ncwd:")
         );
-        // Negative control.
         assert!(!compose_tooltip(&plain).expect("composes").contains("now:"));
         assert!(
             !without
@@ -1837,8 +1523,6 @@ mod tests {
     }
 
     /// A label's words reach the chrome through the presentation sanitizer
-    /// every header line takes: a bidi override or a control character is
-    /// stripped, and a clause with nothing left is no line at all.
     #[test]
     fn the_clauses_words_are_sanitized_like_every_header() {
         let mut input = full_input();
@@ -1852,10 +1536,6 @@ mod tests {
     }
 
     /// a shown label leaves at its `until`, so the composition's
-    /// expiry is the earlier of the upgrade's term and that instant, and
-    /// with the switch off (no clause) it is exactly the upgrade's term —
-    /// `None` for a quiet tab, never `composed + 30 s`. A step or turn
-    /// clause (no `until`) arms nothing.
     #[test]
     fn a_shown_labels_until_bounds_the_compositions_expiry() {
         let mut input = full_input();

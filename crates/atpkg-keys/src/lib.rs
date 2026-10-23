@@ -22,6 +22,9 @@
 //! `aterm_update_core::pins` itself, and stops short of `git commit`, since arming a trust
 //! anchor is a reviewed act. See `docs/RELEASE-KEYS.md`.
 
+#[cfg(test)]
+aterm_durable::plain_durable_flushes_in_tests!();
+
 pub mod fsio;
 pub mod master;
 pub mod pins_edit;

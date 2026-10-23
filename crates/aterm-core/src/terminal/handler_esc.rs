@@ -265,7 +265,7 @@ impl TerminalHandler<'_> {
         }
     }
 
-    fn esc_dispatch_charset_designation(&mut self, intermediates: &[u8], final_byte: u8) {
+    const fn esc_dispatch_charset_designation(&mut self, intermediates: &[u8], final_byte: u8) {
         match intermediates.len() {
             1 => {}
             2 => {

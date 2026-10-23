@@ -1,39 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The fx layers on the GPU against the CPU (`docs/DESIGN-card-engine-2026-10-19.md`
-//! §4.6, §7 "B, the primitive"), on the renderer's own arm (Metal on macOS, GL on
-//! Linux, wgpu elsewhere) and, in the `--features wgpu-oracle` build, on the wgpu
-//! oracle too:
-//!
-//! * Exact layers are byte-exact (delta 0) over random frames of every item kind,
-//!   flip, scale, clip, occluder and additive or source-over ink, through the
-//!   present path frame after frame; items reaching past their palette
-//!   (which write nothing) sit where a read past the layer's own palette
-//!   would land on a neighbour's entries.
-//! * Each slot draws between the CPU's neighbours (`NovaAdd` | `FxOver` |
-//!   `RainAdd` and the rest), where the order shows in the bytes.
-//! * A `bloom` layer feeds the GPU's bloom with no aurora on the frame, the
-//!   CPU twin's halo within 2, whole on a scissored present; it takes the
-//!   HDR crown (the wgpu stand-in).
-//! * A frame past the art budget refuses the same sprites on every arm.
-//! * A settled layer under a damaged frame is cut at the dirty rows and draws
-//!   byte-equal to a full render (the band law; an ungated build double-adds).
-//! * Linear layers hold FreeSprite's tolerance (2).
-//! * Every texel byte and every palette byte survives the arm's sampling and
-//!   output conversion (`fx_texel_bytes_survive_the_arm`).
-//! * A fresh renderer (a rebuilt device) and dropped arm residency both
-//!   refill the atlases and draw byte-equal.
-//!
-//! The Metal hazard drill (185 pipelined fx frames settle no reader) is
-//! `renderer`'s `fx_hazard_tests`: it drives the present encode, which keeps
-//! frames in flight, where a readback here waits each frame out.
-//!
-//! The control for the comparator: FreeSprite's float-UV path, drawing the
-//! same art at the same odd scales, shows a nonzero delta where the fx
-//! integer map shows none (`free_sprites_float_path_misses_where_fx_maps_exactly`).
-//!
-//! No GPU: COULD NOT RUN.
+//! GPU vs. CPU fx layer parity tests.
 
 use std::sync::Arc;
 
@@ -68,7 +36,6 @@ impl Rng {
 }
 
 /// The renderers under test: the renderer's own arm and, in the oracle build
-/// on macOS or Linux, the wgpu oracle, each beside its own CPU twin.
 fn arms(theme: Theme) -> Vec<(&'static str, Renderer, aterm_gpu::GpuRenderer)> {
     let (cpu, gpu) = common::backends(18.0, theme);
     #[allow(unused_mut, reason = "the oracle build adds an arm")]
@@ -83,7 +50,6 @@ fn arms(theme: Theme) -> Vec<(&'static str, Renderer, aterm_gpu::GpuRenderer)> {
 }
 
 /// After a frame: that it drew on the arm `arm` names (Metal is the native
-/// arm on macOS and GL on Linux; the oracle is neither).
 fn assert_arm(arm: &str, gpu: &aterm_gpu::GpuRenderer) {
     #[cfg(target_os = "macos")]
     assert_eq!(
@@ -102,7 +68,6 @@ fn assert_arm(arm: &str, gpu: &aterm_gpu::GpuRenderer) {
 }
 
 /// A base whose CPU and GPU pixels are byte-equal (procedural blocks and
-/// background fills, no glyph coverage), so any delta is the fx layers'.
 fn base_terminal() -> Terminal {
     let mut t = Terminal::new(ROWS as u16, COLS as u16);
     t.process(b"\x1b[?25l");
@@ -137,7 +102,6 @@ fn layer(
 }
 
 /// A random premultiplied art: additive texels (`a = 0` with colour), clear,
-/// opaque and translucent ones.
 fn premul_art(rng: &mut Rng) -> Arc<FxArt> {
     let (w, h) = (rng.range(1, 7) as u16, rng.range(1, 7) as u16);
     let mut data = Vec::new();
@@ -191,14 +155,6 @@ fn sprite_clip(rng: &mut Rng, x: i32, y: i32) -> PxRect {
 }
 
 /// A random layer over a `w × h` frame: an all-additive or all-over palette
-/// (so a rect is one kind at both ends), rects, ramps and Index8 and Premul
-/// sprites at any scale for an Exact layer, Straight sprites for a Linear
-/// one; sometimes clipped, sometimes off the frame's edges, in either space,
-/// at any slot its blend allows. One item in five reaches past the palette
-/// (a rect's far end, ramps rows, Index8 indices, a Straight tint), which
-/// pixel law F says writes nothing; the frame palette packs the other
-/// layers' entries right after this one's, so an arm that reads past the
-/// layer's own palette paints them.
 fn random_layer(rng: &mut Rng, id: u64, linear: bool, w: i64, h: i64) -> FxLayer {
     let additive = rng.below(2) == 0;
     let palette: Vec<FxInk> = (0..12)
@@ -224,7 +180,6 @@ fn random_layer(rng: &mut Rng, id: u64, linear: bool, w: i64, h: i64) -> FxLayer
                     dh: rng.range(1, 50) as u16,
                     flip_x: rng.below(2) == 0,
                     art: straight_art(rng),
-                    // 12: no tint entry.
                     ink: if past { 12 } else { rng.below(12) as u32 },
                     clip: sprite_clip(rng, x, y),
                 });
@@ -235,7 +190,6 @@ fn random_layer(rng: &mut Rng, id: u64, linear: bool, w: i64, h: i64) -> FxLayer
                     y,
                     w: rng.range(1, 120) as u16,
                     h: rng.range(1, 50) as u16,
-                    // 11: the far end is past the palette.
                     ink: if past { 11 } else { rng.below(11) as u32 },
                 }),
                 1 => FxItem::Ramps(FxRamps {
@@ -243,7 +197,6 @@ fn random_layer(rng: &mut Rng, id: u64, linear: bool, w: i64, h: i64) -> FxLayer
                     y,
                     w: rng.range(1, 90) as u16,
                     h: rng.range(1, 6) as u16,
-                    // From 5 on, the last rows run past the palette.
                     ink: if past { rng.range(5, 11) as u32 } else { 0 },
                 }),
                 2 => FxItem::Sprite(FxSprite {
@@ -263,7 +216,6 @@ fn random_layer(rng: &mut Rng, id: u64, linear: bool, w: i64, h: i64) -> FxLayer
                     dh: rng.range(1, 50) as u16,
                     flip_x: rng.below(2) == 0,
                     art: index_art(rng, 4),
-                    // From 9 on, index 4 (and up) names an entry past the end.
                     ink: if past {
                         rng.range(9, 11) as u32
                     } else {
@@ -305,14 +257,10 @@ fn random_layer(rng: &mut Rng, id: u64, linear: bool, w: i64, h: i64) -> FxLayer
 }
 
 /// Items pixel law F says write nothing or write their lerped ink: a rect
-/// whose right end is past the palette, an Index8 texel past it, a ramps
-/// stack whose last rows run off the palette, and a rect additive at one end
-/// and source-over at the other.
 fn malformed_layer() -> FxLayer {
     let art =
         Arc::new(FxArt::new(3, 2, FxTexels::Index8, vec![1u8, 2, 3, 3, 2, 1]).expect("sized"));
     let items = vec![
-        // ink 3: entry 4 is past the end.
         FxItem::Rect(FxRect {
             x: 4,
             y: 4,
@@ -320,7 +268,6 @@ fn malformed_layer() -> FxLayer {
             h: 9,
             ink: 3,
         }),
-        // Index 3 names entry 2 + 3 − 1 = 4: past the end.
         FxItem::Sprite(FxSprite {
             x: 40,
             y: 20,
@@ -331,7 +278,6 @@ fn malformed_layer() -> FxLayer {
             ink: 2,
             clip: PxRect::EVERYWHERE,
         }),
-        // Rows 0..2 have both ends; row 2 needs entries 4 and 5.
         FxItem::Ramps(FxRamps {
             x: 90,
             y: 30,
@@ -339,7 +285,6 @@ fn malformed_layer() -> FxLayer {
             h: 4,
             ink: 0,
         }),
-        // Entry 1 additive, entry 2 over: one end each.
         FxItem::Rect(FxRect {
             x: 60,
             y: 50,
@@ -364,12 +309,6 @@ fn malformed_layer() -> FxLayer {
 }
 
 /// One frame of every kind at once: an additive gradient rect crossing three
-/// bands, a source-over flat rect, ramps, an Index8 sprite at an odd scale
-/// and flipped, a Premul sprite magnified and clipped, a sprite whose origin
-/// sits far left of the frame, two occluders, and the malformed layer. The
-/// malformed layer comes first, so its palette opens the frame palette and a
-/// read past its end lands on the next layer's entries (last, a read past
-/// it would find nothing to paint and pass unseen).
 fn every_kind() -> (Vec<FxLayer>, Vec<PxRect>) {
     let index = Arc::new(
         FxArt::new(
@@ -386,10 +325,7 @@ fn every_kind() -> (Vec<FxLayer>, Vec<PxRect>) {
             2,
             FxTexels::Rgba8Premul,
             vec![
-                0x30, 0x20, 0x10, 0, // additive
-                200, 100, 50, 255, // opaque
-                40, 30, 20, 90, // translucent
-                0, 0, 0, 0, // clear
+                0x30, 0x20, 0x10, 0, 200, 100, 50, 255, 40, 30, 20, 90, 0, 0, 0, 0,
             ],
         )
         .expect("sized"),
@@ -480,9 +416,6 @@ fn every_kind() -> (Vec<FxLayer>, Vec<PxRect>) {
 }
 
 /// THE BYTE LAW: Exact fx layers draw byte-equal to the CPU on every arm,
-/// over the every-kind frame and random frames through the present path on
-/// one window (a frame whose layers changed repaints in full: the row diff
-/// takes only settled layers, `aterm_render::compute_dirty_rows`).
 #[test]
 fn exact_fx_layers_are_byte_exact_on_the_gpu() {
     let theme = Theme::default();
@@ -520,7 +453,6 @@ fn exact_fx_layers_are_byte_exact_on_the_gpu() {
         let mut next_id = 10;
         for frame in 0..48 {
             next_id += 1;
-            // Keep, replace, add and drop layers; toggle occluders.
             match rng.below(4) {
                 0 if !layers.is_empty() => {
                     let at = rng.below(layers.len() as u64) as usize;
@@ -558,10 +490,6 @@ fn exact_fx_layers_are_byte_exact_on_the_gpu() {
 }
 
 /// THE BAND LAW on the GPU: a settled additive layer spans every row while
-/// only rows 2 and 5 change, so the damaged frame repaints the band 2..=5 under
-/// one scissor and Loads rows 3 and 4. Its fx instances are cut at the dirty
-/// rows alone, and the frame equals a full CPU render of the same input; an
-/// ungated slice build re-adds the light on the Loaded rows.
 #[test]
 fn fx_dirty_band_restamps_only_its_band_on_the_gpu() {
     let theme = Theme::default();
@@ -632,7 +560,6 @@ fn fx_dirty_band_restamps_only_its_band_on_the_gpu() {
 }
 
 /// Linear layers (Straight sprites in the sRGB groups) hold FreeSprite's
-/// linear-light tolerance: at most 2 per channel.
 #[test]
 fn linear_fx_layers_hold_the_free_sprite_tolerance() {
     let theme = Theme::default();
@@ -666,25 +593,15 @@ fn linear_fx_layers_hold_the_free_sprite_tolerance() {
 }
 
 /// THE BYTE RECOVERY per arm: all 256 values of every channel through the
-/// Rgba8 atlas (a Premul art), every index through the R8 atlas and every
-/// palette byte (an Index8 art over 255 entries), drawn 1:1 and opaque,
-/// reach the frame unchanged. The shaders read a texel as normalized floats
-/// and recover its byte with `rint`. On Apple GPUs the Unorm-to-float read is
-/// exact, so a truncating recovery passes here too (measured, Metal and wgpu
-/// on Metal); the mutation this test catches on every arm is a palette word
-/// decoded in the wrong byte order.
 #[test]
 fn fx_texel_bytes_survive_the_arm() {
     let theme = Theme::default();
     let mut t = Terminal::new(ROWS as u16, COLS as u16);
     t.process(b"\x1b[?25l");
-    // Premul: texel k carries (k, 255 − k, 37k mod 256), opaque.
     let premul: Vec<u8> = (0..256u32)
         .flat_map(|k| [k as u8, (255 - k) as u8, (k * 37) as u8, 255])
         .collect();
     let premul = Arc::new(FxArt::new(16, 16, FxTexels::Rgba8Premul, premul).expect("sized"));
-    // Index8: texel k names entry k − 1 (0 is clear); entry j is opaque
-    // (j, 3j, 255 − j).
     let index: Vec<u8> = (0..256u32).map(|k| k as u8).collect();
     let index = Arc::new(FxArt::new(16, 16, FxTexels::Index8, index).expect("sized"));
     let palette: Vec<FxInk> = (0..255u32)
@@ -736,13 +653,6 @@ fn fx_texel_bytes_survive_the_arm() {
 }
 
 /// THE COMPARATOR'S CONTROL: the same art through FreeSprite's float path
-/// (a float UV picks the texel, a float linear-light blend composites it)
-/// shows a nonzero delta at odd scales, where the fx integer path (integer
-/// texel map, `over_premul` on the Unorm view) shows none. So the zero
-/// deltas above are the law's, not a blind comparator's. The art mixes
-/// opaque and translucent texels: on Metal the tie-biased float UV picks the
-/// CPU's texel at every odd scale measured (opaque texels read delta 0), and
-/// the float path's delta is its blend's, within FreeSprite's declared 2.
 #[test]
 fn free_sprites_float_path_misses_where_fx_maps_exactly() {
     let theme = Theme::default();
@@ -842,10 +752,6 @@ fn free_sprites_float_path_misses_where_fx_maps_exactly() {
 }
 
 /// THE PASS LAW (design §4.5): an fx layer draws inside a group of its own
-/// format, so a frame drawing one opens exactly the passes of the same frame
-/// drawing the effect whose slot it shares: Exact Under as a `glow_under`
-/// quad, Exact Glow and Over as a `nova_add` quad, Linear Under and Over as a
-/// FreeSprite under and over the text.
 #[test]
 fn fx_layers_open_the_passes_their_slots_already_open() {
     let theme = Theme::default();
@@ -951,10 +857,6 @@ fn fx_layers_open_the_passes_their_slots_already_open() {
 }
 
 /// `fx_prefetch` makes arts resident without drawing (design §4.6, eager
-/// residency): a prefetch-only frame uploads the art's texels and draws
-/// byte-equal to the frame without it; the same prefetch again uploads
-/// nothing; and the first frame that draws the art uploads only its instances
-/// and palette, where a renderer with no prefetch also uploads the texels.
 #[test]
 fn fx_prefetch_makes_arts_resident_without_drawing() {
     let theme = Theme::default();
@@ -1027,7 +929,6 @@ fn fx_prefetch_makes_arts_resident_without_drawing() {
         );
         assert_eq!(max_channel_delta(&c, &g), 0, "{arm}: and draws byte-exact");
     }
-    // Control: without the prefetch the drawing frame pays the texels.
     for (arm, _cpu, mut gpu) in arms(theme) {
         let draw = input_with(&mut t, vec![drawn.clone()], Vec::new());
         let _ = gpu.render_input(&mut aterm_gpu::WindowGpu::new(), &draw, None);
@@ -1041,9 +942,6 @@ fn fx_prefetch_makes_arts_resident_without_drawing() {
 }
 
 /// A rebuilt device holds no fx residency: a fresh renderer handed the same
-/// layer `Arc`s, and a renderer whose arm residency was dropped mid-life,
-/// re-mint the atlases, refill them from the atlas log and draw byte-equal
-/// to the CPU and to the frame before.
 #[test]
 fn fx_residency_refills_after_a_device_rebuild() {
     let theme = Theme::default();
@@ -1056,8 +954,6 @@ fn fx_residency_refills_after_a_device_rebuild() {
         let first = gpu.render_input(&mut win, &input, None).pixels;
         assert_arm(arm, &gpu);
         assert_eq!(max_channel_delta(&want, &first), 0, "{arm}: first frame");
-        // Dropped residency: the next frame that encodes (a new window, so
-        // no gate hit) refills.
         gpu.drop_fx_arm_residency_for_test();
         let mut win2 = aterm_gpu::WindowGpu::new();
         let again = gpu.render_input(&mut win2, &input, None).pixels;
@@ -1070,8 +966,6 @@ fn fx_residency_refills_after_a_device_rebuild() {
             "{arm}: refilled residency draws the same bytes"
         );
     }
-    // A rebuilt stack (what the frontend does on device loss): a fresh
-    // renderer on the same layer `Arc`s.
     let mut fresh = common::independent_gpu(18.0, theme);
     let mut win = aterm_gpu::WindowGpu::new();
     let (mut cpu, _) = common::backends(18.0, theme);
@@ -1085,8 +979,6 @@ fn fx_residency_refills_after_a_device_rebuild() {
 }
 
 /// Whether a neighbour stream changes a pixel the fx layer paints: some pixel
-/// `solo` (the layer alone) moved from `base` (no layer) and `with` (the layer
-/// and the neighbour) moved from `solo`. Only there does the order show.
 fn shares_pixels(base: &[u32], solo: &[u32], with: &[u32]) -> bool {
     base.iter()
         .zip(solo)
@@ -1095,16 +987,6 @@ fn shares_pixels(base: &[u32], solo: &[u32], with: &[u32]) -> bool {
 }
 
 /// THE SLOT LAW (design §4.5): each slot draws between the same neighbours on
-/// the GPU as on the CPU. An Exact slot's source-over veil covers the frame
-/// between an additive stream drawn just before it and one drawn just after
-/// it, where light-then-veil and veil-then-light are different bytes:
-/// `glow_under` | Under | `fire_patch`, `cursor_glow_add` | Glow |
-/// `glow_halo`, `nova_add` | Over | `rain_add`. A Linear slot's translucent
-/// sprite lies over the FreeSprite of its z and under what follows it: the
-/// cursor trail's opaque cells for Under, the cursor block for Over. Every
-/// neighbour is checked to change the frame, Exact frames are byte-exact and
-/// Linear ones within FreeSprite's 2, so a stream drawn on the wrong side of
-/// its slot shows (swapping the `NovaAdd` and `FxOver` pushes fails here).
 #[test]
 fn fx_slots_draw_between_their_neighbours_on_the_gpu() {
     use aterm_render::{FireMode, FirePatch, GlowQuad, HaloMode, RainHalo};
@@ -1112,8 +994,6 @@ fn fx_slots_draw_between_their_neighbours_on_the_gpu() {
     let mut t = base_terminal();
     let exact = common::ByteExact::default();
     for (arm, mut cpu, mut gpu) in arms(theme) {
-        // The bloom is GPU-only light over `cursor_glow_add` (the bloom test
-        // below covers it); off, the frames compare the slot order alone.
         gpu.set_bloom(false);
         let mut win = aterm_gpu::WindowGpu::new();
         let (cw, ch) = cpu.cell_size();
@@ -1229,9 +1109,6 @@ fn fx_slots_draw_between_their_neighbours_on_the_gpu() {
                 );
             }
         }
-        // Linear: a translucent FreeSprite of the slot's z first, the fx
-        // sprite over it, then the trail's opaque cells (Under) or the cursor
-        // block (Over) over both.
         let atlas = Arc::new(SceneAtlas {
             width: 1,
             height: 1,
@@ -1284,7 +1161,6 @@ fn fx_slots_draw_between_their_neighbours_on_the_gpu() {
             };
             let after = |i: &mut RenderInput| {
                 if matches!(slot, FxSlot::Under) {
-                    // Row 3 is blank (row 2's blocks would hide both).
                     i.cursor_trail = (2..6)
                         .map(|col| aterm_core::render::TrailCell {
                             row: 3,
@@ -1326,7 +1202,6 @@ fn fx_slots_draw_between_their_neighbours_on_the_gpu() {
 }
 
 /// A `bloom` layer with no aurora on the frame: an additive rect and an
-/// Index8 sprite at the Glow slot.
 fn blooming_layer() -> FxLayer {
     let art =
         Arc::new(FxArt::new(3, 2, FxTexels::Index8, vec![1u8, 0, 2, 2, 1, 0]).expect("sized"));
@@ -1365,13 +1240,6 @@ fn blooming_layer() -> FxLayer {
 }
 
 /// THE BLOOM FEED (design §4.6): a `bloom` layer is the bloom's light on a
-/// frame with no aurora. On every arm the GPU's halo is the CPU twin's
-/// (`aterm_render::bloom::apply` over `fx_bloom_quads`) within its float
-/// rounding (2) and the same light in total; the frame without the bloom is
-/// byte-exact. On a scissored present (one row repainted) the halo still
-/// spreads from the whole layer: the frame equals a full present of the same
-/// input. Dropping the layers from the bloom source leaves no halo (the
-/// light-in-total check fails).
 #[test]
 fn bloom_fx_layers_feed_the_gpu_bloom() {
     let theme = Theme::default();
@@ -1427,7 +1295,6 @@ fn bloom_fx_layers_feed_the_gpu_bloom() {
         let worst = max_channel_delta(&twin.pixels, &lit.pixels);
         assert!(worst <= 2, "{arm}: the CPU twin's halo: delta {worst}");
 
-        // The scissored present: frame B repaints row 2 only.
         gpu.set_bloom(true);
         let mut win = aterm_gpu::WindowGpu::new();
         let _ = gpu.present_input_readback(&mut win, &input);
@@ -1453,9 +1320,6 @@ fn bloom_fx_layers_feed_the_gpu_bloom() {
 }
 
 /// The crown (the present's HDR aurora boost over the bloom source) reads a
-/// `bloom` layer on a frame with no aurora: on a 2.0× EDR panel the fx-only
-/// frame emits above reference white, and the same layer without `bloom`
-/// does not (the control). The HDR present stand-in is the wgpu arm's.
 #[cfg(wgpu_arm)]
 #[test]
 fn an_fx_only_bloom_frame_takes_the_crown() {
@@ -1481,12 +1345,6 @@ fn an_fx_only_bloom_frame_takes_the_crown() {
 }
 
 /// THE FRAME ART BUDGET on the GPU (design §4.6): a frame naming nine
-/// distinct 2048×1024 Index8 arts (half again what a 4096² atlas holds)
-/// draws the first two, which fill [`aterm_core::render::FX_FRAME_ART_TEXELS`],
-/// and refuses the other seven on the CPU and every arm alike: byte-exact,
-/// with the refusals counted in `fx_refused`. An RGBA art on the same frame
-/// is ruled in its own width class and draws. Without the budget the CPU
-/// draws all nine while the atlas holds eight (the control, by hand).
 #[test]
 fn an_over_budget_frame_draws_the_same_arts_on_the_gpu() {
     use aterm_core::render::{FX_ART_MAX_SIDE, FX_FRAME_ART_TEXELS};
@@ -1504,7 +1362,6 @@ fn an_over_budget_frame_draws_the_same_arts_on_the_gpu() {
     let rgba = Arc::new(
         FxArt::new(2, 2, FxTexels::Rgba8Premul, [90, 40, 20, 255].repeat(4)).expect("sized"),
     );
-    // Entry k − 1 is what art k's texels name: nine opaque inks.
     let palette: Vec<FxInk> = (0..9u32)
         .map(|k| FxInk::over(0x0030_2010 + k * 0x0010_1418, 0xff))
         .collect();
@@ -1552,11 +1409,6 @@ fn an_over_budget_frame_draws_the_same_arts_on_the_gpu() {
 }
 
 /// THE GATE OWES THE PREFETCH (design §4.6, eager residency): an unchanged
-/// frame re-presents cached pixels through `render_input_cached`'s gate, but
-/// a new `fx_prefetch` list (which draws nothing, so the pixels compare
-/// equal) misses once, and that encode uploads the arts; the same list again
-/// hits. A gate blind to the prefetch would hit and leave the arts for the
-/// frame that draws them (the control, by hand).
 #[test]
 fn a_new_prefetch_misses_the_cached_gate_once() {
     let theme = Theme::default();
@@ -1592,10 +1444,6 @@ fn a_new_prefetch_misses_the_cached_gate_once() {
 }
 
 /// A frame whose fx staging fails closed (design §4.6, device loss) draws no
-/// fx and the rest of the frame, and its metrics say so: no fx instance, and
-/// only the atlas texels the sync did upload. The next frame draws the
-/// layer, its arts already resident (instances and palette only). Control:
-/// counting the built instances whatever the arm staged reports them.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_frame_whose_fx_fails_closed_counts_no_fx() {

@@ -104,25 +104,7 @@ use super::window::set_skip_taskbar;
 use super::SelectedCursor;
 
 /// some backends like macos uses an uninhabited `Never` type,
-/// on windows, `UserEvent`s are also dispatched through the
-/// WNDPROC callback, and due to the re-entrant nature of the
-/// callback, recursively delivered events must be queued in a
-/// buffer, the current implementation put this queue in
-/// `EventLoopRunner`, which is shared between the event pumping
-/// loop and the callback. because it's hard to decide from the
-/// outside whether a event needs to be buffered, I decided not
-/// use `Event<Never>` for the shared runner state, but use unit
-/// as a placeholder so user events can be buffered as usual,
-/// the real `UserEvent` is pulled from the mpsc channel directly
-/// when the placeholder event is delivered to the event handler
 pub(crate) struct UserEventPlaceholder;
-
-// here below, the generic `EventLoopRunnerShared<T>` is replaced with
-// `EventLoopRunnerShared<UserEventPlaceholder>` so we can get rid
-// of the generic parameter T in types which don't depend on T.
-// this is the approach which requires minimum changes to current
-// backend implementation. it should be considered transitional
-// and should be refactored and cleaned up eventually, I hope.
 
 pub(crate) struct WindowData {
     pub window_state: Arc<Mutex<WindowState>>,
@@ -131,19 +113,14 @@ pub(crate) struct WindowData {
     pub _file_drop_handler: Option<FileDropHandler>,
     pub userdata_removed: Cell<bool>,
     pub recurse_depth: Cell<u32>,
-    /// aterm: whether the last WM_SIZE minimized the window, so `WM_SIZE` reports
-    /// only the edges of a minimize as `Occluded` ([`minimize_edge`]).
+    /// Whether the last `WM_SIZE` minimized the window.
     pub minimized: Cell<bool>,
 }
 
 /// `WM_SIZE`'s `wParam` for a minimize (the vendored windows-sys carries only
-/// `SIZE_MAXIMIZED`).
 const SIZE_MINIMIZED: u32 = 1;
 
 /// aterm: the `Occluded` edge one `WM_SIZE` makes, given whether the window was
-/// minimized at the last one (`was`, updated here): `Some(true)` as it minimizes,
-/// `Some(false)` as it comes back (restored or maximized), `None` for every other
-/// resize.
 fn minimize_edge(was: &Cell<bool>, wparam: WPARAM) -> Option<bool> {
     let minimized = wparam == SIZE_MINIMIZED as usize;
     (was.replace(minimized) != minimized).then_some(minimized)
@@ -160,7 +137,6 @@ mod minimize_edge_tests {
     const SIZE_RESTORED: u32 = 0;
 
     /// A minimize and its return are one edge each; the resize steps of a drag
-    /// and a maximize of a shown window are none.
     #[test]
     fn only_the_edges_of_a_minimize_are_occlusion() {
         let was = Cell::new(false);
@@ -208,9 +184,6 @@ pub struct EventLoop<T: 'static> {
     user_event_receiver: Receiver<T>,
     window_target: RootAEL,
     msg_hook: Option<Box<dyn FnMut(*const c_void) -> bool + 'static>>,
-    // It is a timer used on timed waits.
-    // It is created lazily in case if we have `ControlFlow::WaitUntil`.
-    // Keep it as a field to avoid recreating it on every `ControlFlow::WaitUntil`.
     high_resolution_timer: Option<OwnedHandle>,
 }
 
@@ -294,17 +267,9 @@ impl<T: 'static> EventLoop<T> {
 
             let event_loop_windows_ref = &self.window_target;
             let user_event_receiver = &self.user_event_receiver;
-            // # Safety
-            // We make sure to call runner.clear_event_handler() before
-            // returning
+            // SAFETY: `runner.clear_event_handler()` is called before returning.
             unsafe {
                 runner.set_event_handler(move |event| {
-                    // the shared `EventLoopRunner` is not parameterized
-                    // `EventLoopProxy::send_event()` calls `PostMessage`
-                    // to wakeup and dispatch a placeholder `UserEvent`,
-                    // when we received the placeholder event here, the
-                    // real UserEvent(T) should already be put in the
-                    // mpsc channel and ready to be pulled
                     let event = match event.map_nonuser_event() {
                         Ok(non_user_event) => non_user_event,
                         Err(_user_event_placeholder) => Event::UserEvent(
@@ -320,8 +285,6 @@ impl<T: 'static> EventLoop<T> {
 
         let exit_code = loop {
             self.wait_for_messages(None);
-            // wait_for_messages calls user application before and after waiting
-            // so it may have decided to exit.
             if let Some(code) = self.exit_code() {
                 break code;
             }
@@ -336,9 +299,7 @@ impl<T: 'static> EventLoop<T> {
         let runner = &self.window_target.p.runner_shared;
         runner.loop_destroyed();
 
-        // # Safety
-        // We assume that this will effectively call `runner.clear_event_handler()`
-        // to meet the safety requirements for calling `runner.set_event_handler()` above.
+        // SAFETY: `reset_runner()` clears the event handler.
         runner.reset_runner();
 
         if exit_code == 0 {
@@ -357,13 +318,7 @@ impl<T: 'static> EventLoop<T> {
             let event_loop_windows_ref = &self.window_target;
             let user_event_receiver = &self.user_event_receiver;
 
-            // # Safety
-            // We make sure to call runner.clear_event_handler() before
-            // returning
-            //
-            // Note: we're currently assuming nothing can panic and unwind
-            // to leave the runner in an unsound state with an associated
-            // event handler.
+            // SAFETY: `runner.clear_event_handler()` is called before returning.
             unsafe {
                 runner.set_event_handler(move |event| {
                     let event = match event.map_nonuser_event() {
@@ -383,8 +338,6 @@ impl<T: 'static> EventLoop<T> {
         if self.exit_code().is_none() {
             self.wait_for_messages(timeout);
         }
-        // wait_for_messages calls user application before and after waiting
-        // so it may have decided to exit.
         if self.exit_code().is_none() {
             self.dispatch_peeked_messages();
         }
@@ -394,8 +347,6 @@ impl<T: 'static> EventLoop<T> {
         let status = if let Some(code) = runner.exit_code() {
             runner.loop_destroyed();
 
-            // Immediately reset the internal state for the loop to allow
-            // the loop to be run more than once.
             runner.reset_runner();
             PumpStatus::Exit(code)
         } else {
@@ -403,37 +354,18 @@ impl<T: 'static> EventLoop<T> {
             PumpStatus::Continue
         };
 
-        // We wait until we've checked for an exit status before clearing the
-        // application callback, in case we need to dispatch a LoopExiting event
-        //
-        // # Safety
-        // This pairs up with our call to `runner.set_event_handler` and ensures
-        // the application's callback can't be held beyond its lifetime.
+        // SAFETY: pairs with `runner.set_event_handler()` so the callback does not outlive its borrow.
         runner.clear_event_handler();
 
         status
     }
 
     /// Waits until new event messages arrive to be peeked.
-    /// Doesn't peek messages itself.
-    ///
-    /// Parameter timeout is optional. This method would wait for the smaller timeout
-    /// between the argument and a timeout from control flow.
     fn wait_for_messages(&mut self, timeout: Option<Duration>) {
         let runner = &self.window_target.p.runner_shared;
 
-        // We aim to be consistent with the MacOS backend which has a RunLoop
-        // observer that will dispatch AboutToWait when about to wait for
-        // events, and NewEvents after the RunLoop wakes up.
-        //
-        // We emulate similar behaviour by treating `MsgWaitForMultipleObjectsEx` as our wait
-        // point and wake up point (when it returns) and we drain all other
-        // pending messages via `PeekMessage` until we come back to "wait" via
-        // `MsgWaitForMultipleObjectsEx`.
-        //
         runner.prepare_wait();
         wait_for_messages_impl(&mut self.high_resolution_timer, runner.control_flow(), timeout);
-        // Before we potentially exit, make sure to consistently emit an event for the wake up
         runner.wakeup();
     }
 
@@ -441,18 +373,9 @@ impl<T: 'static> EventLoop<T> {
     fn dispatch_peeked_messages(&mut self) {
         let runner = &self.window_target.p.runner_shared;
 
-        // We generally want to continue dispatching all pending messages
-        // but we also allow dispatching to be interrupted as a means to
-        // ensure the `pump_events` won't indefinitely block an external
-        // event loop if there are too many pending events. This interrupt
-        // flag will be set after dispatching `RedrawRequested` events.
         runner.interrupt_msg_dispatch.set(false);
 
-        // # Safety
-        // The Windows API has no documented requirement for bitwise
-        // initializing a `MSG` struct (it can be uninitialized memory for the C
-        // API) and there's no API to construct or initialize a `MSG`. This
-        // is the simplest way avoid uninitialized memory in Rust
+        // SAFETY: `MSG` is a plain C struct safe to zero-initialize.
         let mut msg: MSG = unsafe { mem::zeroed() };
 
         loop {
@@ -517,7 +440,6 @@ impl ActiveEventLoop {
         RootCustomCursor { inner }
     }
 
-    // TODO: Investigate opportunities for caching
     pub fn available_monitors(&self) -> VecDeque<MonitorHandle> {
         monitor::available_monitors()
     }
@@ -581,35 +503,11 @@ impl OwnedDisplayHandle {
 }
 
 /// Returns the id of the main thread.
-///
-/// Windows has no real API to check if the current executing thread is the "main thread", unlike
-/// macOS.
-///
-/// Windows will let us look up the current thread's id, but there's no API that lets us check what
-/// the id of the main thread is. We would somehow need to get the main thread's id before a
-/// developer could spin off any other threads inside of the main entrypoint in order to emulate the
-/// capabilities of other platforms.
-///
-/// We can get the id of the main thread by using CRT initialization. CRT initialization can be used
-/// to setup global state within a program. The OS will call a list of function pointers which
-/// assign values to a static variable. To have get a hold of the main thread id, we need to place
-/// our function pointer inside of the `.CRT$XCU` section so it is called before the main
-/// entrypoint.
-///
-/// Full details of CRT initialization can be found here:
-/// <https://docs.microsoft.com/en-us/cpp/c-runtime-library/crt-initialization?view=msvc-160>
 fn main_thread_id() -> u32 {
     static mut MAIN_THREAD_ID: u32 = 0;
 
-    // Function pointer used in CRT initialization section to set the above static field's value.
-
-    // Mark as used so this is not removable.
     #[used]
     #[allow(non_upper_case_globals)]
-    // Place the function pointer inside of CRT initialization section so it is loaded before
-    // main entrypoint.
-    //
-    // See: https://doc.rust-lang.org/stable/reference/abi.html#the-link_section-attribute
     #[link_section = ".CRT$XCU"]
     static INIT_MAIN_THREAD_ID: unsafe extern "C" fn() = {
         unsafe extern "C" fn initer() {
@@ -624,20 +522,11 @@ fn main_thread_id() -> u32 {
 }
 
 /// Returns the minimum `Option<Duration>`, taking into account that `None`
-/// equates to an infinite timeout, not a zero timeout (so can't just use
-/// `Option::min`)
 fn min_timeout(a: Option<Duration>, b: Option<Duration>) -> Option<Duration> {
     a.map_or(b, |a_timeout| b.map_or(Some(a_timeout), |b_timeout| Some(a_timeout.min(b_timeout))))
 }
 
-// Implementation taken from https://github.com/rust-lang/rust/blob/db5476571d9b27c862b95c1e64764b0ac8980e23/src/libstd/sys/windows/mod.rs
 fn dur2timeout(dur: Duration) -> u32 {
-    // Note that a duration is a (u64, u32) (seconds, nanoseconds) pair, and the
-    // timeouts in windows APIs are typically u32 milliseconds. To translate, we
-    // have two pieces to take care of:
-    //
-    // * Nanosecond precision is rounded up
-    // * Greater than u32::MAX milliseconds (50 days) is rounded up to INFINITE (never time out).
     dur.as_secs()
         .checked_mul(1000)
         .and_then(|ms| ms.checked_add((dur.subsec_nanos() as u64) / 1_000_000))
@@ -661,12 +550,8 @@ impl<T> Drop for EventLoop<T> {
 }
 
 /// Set upper limit for waiting time to avoid overflows.
-/// I chose 50 days as a limit because it is used in dur2timeout.
 const FIFTY_DAYS: Duration = Duration::from_secs(50_u64 * 24 * 60 * 60);
 /// Waitable timers use 100 ns intervals to indicate due time.
-/// <https://learn.microsoft.com/en-us/windows/win32/api/synchapi/nf-synchapi-setwaitabletimer#parameters>
-/// And there is no point waiting using other ways for such small timings
-/// because they are even less precise (can overshoot by few ms).
 const MIN_WAIT: Duration = Duration::from_nanos(100);
 
 fn create_high_resolution_timer() -> Option<OwnedHandle> {
@@ -677,9 +562,6 @@ fn create_high_resolution_timer() -> Option<OwnedHandle> {
             CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
             TIMER_ALL_ACCESS,
         );
-        // CREATE_WAITABLE_TIMER_HIGH_RESOLUTION is supported only after
-        // Win10 1803 but it is already default option for rustc
-        // (std uses it to implement `std::thread::sleep`).
         if handle.is_null() {
             None
         } else {
@@ -688,21 +570,14 @@ fn create_high_resolution_timer() -> Option<OwnedHandle> {
     }
 }
 
-/// This function should not return error if parameters are valid
-/// but there is no guarantee about that at MSDN docs
-/// so we return result of GetLastError if fail.
-///
-/// ## Safety
-///
-/// timer must be a valid timer handle created by [create_high_resolution_timer].
-/// timeout divided by 100 nanoseconds must be more than 0 and less than i64::MAX.
+/// # Safety
+/// `timer` must be a valid handle from [`create_high_resolution_timer`] and `timeout` must fit in `(0, i64::MAX * 100ns)`.
 unsafe fn set_high_resolution_timer(timer: RawHandle, timeout: Duration) -> Result<(), u32> {
     const INTERVAL_NS: u32 = MIN_WAIT.subsec_nanos();
     const INTERVALS_IN_SEC: u64 = (Duration::from_secs(1).as_nanos() / INTERVAL_NS as u128) as u64;
     let intervals_to_wait: u64 =
         timeout.as_secs() * INTERVALS_IN_SEC + u64::from(timeout.subsec_nanos() / INTERVAL_NS);
     debug_assert!(intervals_to_wait < i64::MAX as u64, "Must be called with smaller duration",);
-    // Use negative time to indicate relative time.
     let due_time: i64 = -(intervals_to_wait as i64);
     unsafe {
         let set_result = SetWaitableTimer(timer, &due_time, 0, None, ptr::null(), FALSE);
@@ -715,9 +590,6 @@ unsafe fn set_high_resolution_timer(timer: RawHandle, timeout: Duration) -> Resu
 }
 
 /// Implementation detail of [EventLoop::wait_for_messages].
-///
-/// Does actual system-level waiting and doesn't process any messages itself,
-/// including winits internal notifications about waiting and new messages arrival.
 fn wait_for_messages_impl(
     high_resolution_timer: &mut Option<OwnedHandle>,
     control_flow: ControlFlow,
@@ -756,14 +628,10 @@ fn wait_for_messages_impl(
     let use_timer: bool;
     if let (Some(handle), Some(timeout)) = (high_resolution_timer, timeout) {
         let res = unsafe {
-            // Safety: handle can be Some only if we succeeded in creating high resolution
-            // timer. We properly clamped timeout so it can be used as argument
-            // to timer.
+            // SAFETY: `handle` was created by `create_high_resolution_timer` and `timeout` is clamped.
             set_high_resolution_timer(handle, timeout)
         };
         if let Err(_error_code) = res {
-            // We successfully got timer but failed to set it?
-            // Should be some bug in our code.
             tracing::trace!("Failed to set high resolution timer: last error {}", _error_code);
             use_timer = false;
         } else {
@@ -774,15 +642,11 @@ fn wait_for_messages_impl(
     }
 
     unsafe {
-        // Either:
-        //  1. User wants to wait indefinitely if timeout is not set.
-        //  2. We failed to get and set high resolution timer and we need something instead of it.
         let wait_duration_ms = timeout.map(dur2timeout).unwrap_or(INFINITE);
 
         let (num_handles, raw_handles) =
             if use_timer { (1, [high_resolution_timer.unwrap()]) } else { (0, [ptr::null_mut()]) };
 
-        // We must use `QS_ALLINPUT` to wake on accessibility messages.
         let result = MsgWaitForMultipleObjectsEx(
             num_handles,
             raw_handles.as_ptr() as *const _,
@@ -792,7 +656,6 @@ fn wait_for_messages_impl(
         );
         if result == WAIT_FAILED {
             // Well, nothing smart to do in such case.
-            // Treat it as spurious wake up.
             tracing::warn!("Failed to MsgWaitForMultipleObjectsEx: error code {}", GetLastError(),);
         }
     }
@@ -814,18 +677,6 @@ impl EventLoopThreadExecutor {
     }
 
     /// Executes a function in the event loop thread. If we're already in the event loop thread,
-    /// we just call the function directly.
-    ///
-    /// The `Inserted` can be used to inject a `WindowState` for the callback to use. The state is
-    /// removed automatically if the callback receives a `WM_CLOSE` message for the window.
-    ///
-    /// Note that if you are using this to change some property of a window and updating
-    /// `WindowState` then you should call this within the lock of `WindowState`. Otherwise the
-    /// events may be sent to the other thread in different order to the one in which you set
-    /// `WindowState`, leaving them out of sync.
-    ///
-    /// Note that we use a FnMut instead of a FnOnce because we're too lazy to create an equivalent
-    /// to the unstable FnBox.
     pub(super) fn execute_in_thread<F>(&self, mut function: F)
     where
         F: FnMut() + Send + 'static,
@@ -834,7 +685,6 @@ impl EventLoopThreadExecutor {
             if self.in_event_loop_thread() {
                 function();
             } else {
-                // We double-box because the first box is a fat pointer.
                 let boxed2: ThreadExecFn = Box::new(Box::new(function));
 
                 let raw = Box::into_raw(boxed2);
@@ -892,15 +742,13 @@ impl LazyMessageId {
 
     /// Get the message ID.
     pub fn get(&self) -> u32 {
-        // Load the ID.
         let id = self.id.load(Ordering::Relaxed);
 
         if id != INVALID_ID {
             return id;
         }
 
-        // Register the message.
-        // SAFETY: We are sure that the pointer is a valid C string ending with '\0'.
+        // SAFETY: `self.name` is a NUL-terminated string.
         assert!(self.name.ends_with('\0'));
         let new_id = unsafe { RegisterWindowMessageA(self.name.as_ptr()) };
 
@@ -912,45 +760,21 @@ impl LazyMessageId {
             std::io::Error::last_os_error()
         );
 
-        // Store the new ID. Since `RegisterWindowMessageA` returns the same value for any given
-        // string, the target value will always either be a). `INVALID_ID` or b). the
-        // correct ID. Therefore a compare-and-swap operation here (or really any
-        // consideration) is never necessary.
         self.id.store(new_id, Ordering::Relaxed);
 
         new_id
     }
 }
 
-// Message sent by the `EventLoopProxy` when we want to wake up the thread.
-// WPARAM and LPARAM are unused.
 static USER_EVENT_MSG_ID: LazyMessageId = LazyMessageId::new("Winit::WakeupMsg\0");
-// Message sent when we want to execute a closure in the thread.
-// WPARAM contains a Box<Box<dyn FnMut()>> that must be retrieved with `Box::from_raw`,
-// and LPARAM is unused.
 static EXEC_MSG_ID: LazyMessageId = LazyMessageId::new("Winit::ExecMsg\0");
-// Message sent by a `Window` when it wants to be destroyed by the main thread.
-// WPARAM and LPARAM are unused.
 pub(crate) static DESTROY_MSG_ID: LazyMessageId = LazyMessageId::new("Winit::DestroyMsg\0");
-// WPARAM is a bool specifying the `WindowFlags::MARKER_RETAIN_STATE_ON_SIZE` flag. See the
-// documentation in the `window_state` module for more information.
 pub(crate) static SET_RETAIN_STATE_ON_SIZE_MSG_ID: LazyMessageId =
     LazyMessageId::new("Winit::SetRetainMaximized\0");
-// aterm patch (see the repository NOTICE): id of the per-window `SetTimer` timer
-// that keeps the event-loop runner ticking while Windows holds the thread inside
-// the `WM_ENTERSIZEMOVE` modal loop (caption drag / edge resize). Armed on
-// `WM_ENTERSIZEMOVE`, serviced by the `WM_TIMER` arm below, killed on
-// `WM_EXITSIZEMOVE`. Winit itself never calls `SetTimer` on a window HWND (its
-// `ControlFlow::WaitUntil` timing rides a waitable-timer HANDLE inside
-// `MsgWaitForMultipleObjectsEx`, and gestures are raw pointer messages), so any
-// nonzero id is free today; the ASCII tag just makes a collision with a future
-// in-process `SetTimer` user — control libraries favour small integers —
-// unlikely, and greppable from a stray-timer bug report.
-const SIZE_MOVE_PUMP_TIMER_ID: usize = 0x4154_524d; // "ATRM"
+const SIZE_MOVE_PUMP_TIMER_ID: usize = 0x4154_524d;
 static THREAD_EVENT_TARGET_WINDOW_CLASS: Lazy<Vec<u16>> =
     Lazy::new(|| util::encode_wide("Winit Thread Event Target"));
 /// When the taskbar is created, it registers a message with the "TaskbarCreated" string and then
-/// broadcasts this message to all top-level windows <https://docs.microsoft.com/en-us/windows/win32/shell/taskbar#taskbar-creation-notification>
 pub(crate) static TASKBAR_CREATED: LazyMessageId = LazyMessageId::new("TaskbarCreated\0");
 
 fn create_event_target_window() -> HWND {
@@ -964,7 +788,7 @@ fn create_event_target_window() -> HWND {
             cbWndExtra: 0,
             hInstance: util::get_instance_handle(),
             hIcon: std::ptr::null_mut(),
-            hCursor: std::ptr::null_mut(), // must be null in order for cursor state to work properly
+            hCursor: std::ptr::null_mut(),
             hbrBackground: std::ptr::null_mut(),
             lpszMenuName: ptr::null(),
             lpszClassName: THREAD_EVENT_TARGET_WINDOW_CLASS.as_ptr(),
@@ -975,13 +799,6 @@ fn create_event_target_window() -> HWND {
     }
 
     unsafe {
-        // WS_EX_TOOLWINDOW prevents this window from ever showing up in the taskbar, which
-        // we want to avoid. If you remove this style, this window won't show up in the
-        // taskbar *initially*, but it can show up at some later point. This can sometimes
-        // happen on its own after several hours have passed, although this has proven
-        // difficult to reproduce. Alternatively, it can be manually triggered by killing
-        // `explorer.exe` and then starting the process back up.
-        // It is unclear why the bug is triggered by waiting for several hours.
         let window = CreateWindowExW(
             WS_EX_NOACTIVATE | WS_EX_TRANSPARENT | WS_EX_LAYERED | WS_EX_TOOLWINDOW,
             THREAD_EVENT_TARGET_WINDOW_CLASS.as_ptr(),
@@ -1000,9 +817,7 @@ fn create_event_target_window() -> HWND {
         super::set_window_long(
             window,
             GWL_STYLE,
-            // The window technically has to be visible to receive WM_PAINT messages (which are
-            // used for delivering events during resizes), but it isn't displayed to
-            // the user because of the LAYERED style.
+            // Visible so the layered target receives WM_PAINT during resize.
             (WS_VISIBLE | WS_POPUP) as isize,
         );
         window
@@ -1020,18 +835,15 @@ fn insert_event_target_window_data(
 }
 
 /// Capture mouse input, allowing `window` to receive mouse events when the cursor is outside of
-/// the window.
 unsafe fn capture_mouse(window: HWND, window_state: &mut WindowState) {
     window_state.mouse.capture_count += 1;
     unsafe { SetCapture(window) };
 }
 
 /// Release mouse input, stopping windows on this thread from receiving mouse input when the cursor
-/// is outside the window.
 unsafe fn release_mouse(mut window_state: MutexGuard<'_, WindowState>) {
     window_state.mouse.capture_count = window_state.mouse.capture_count.saturating_sub(1);
     if window_state.mouse.capture_count == 0 {
-        // ReleaseCapture() causes a WM_CAPTURECHANGED where we lock the window_state.
         drop(window_state);
         unsafe { ReleaseCapture() };
     }
@@ -1045,7 +857,6 @@ fn normalize_pointer_pressure(pressure: u32) -> Option<Force> {
 }
 
 /// Emit a `ModifiersChanged` event whenever modifiers have changed.
-/// Returns the current modifier state
 fn update_modifiers(window: HWND, userdata: &WindowData) {
     use crate::event::WindowEvent::ModifiersChanged;
 
@@ -1058,7 +869,6 @@ fn update_modifiers(window: HWND, userdata: &WindowData) {
     if window_state.modifiers_state != modifiers {
         window_state.modifiers_state = modifiers;
 
-        // Drop lock
         drop(window_state);
 
         userdata.send_event(Event::WindowEvent {
@@ -1095,11 +905,6 @@ unsafe fn lose_active_focus(window: HWND, userdata: &WindowData) {
 }
 
 /// Any window whose callback is configured to this function will have its events propagated
-/// through the events loop of the thread the window was created in.
-// This is the callback that is called by `DispatchMessage` in the events loop.
-//
-// Returning 0 tells the Win32 API that the message has been processed.
-// FIXME: detect WM_DWMCOMPOSITIONCHANGED and call DwmEnableBlurBehindWindow if necessary
 pub(super) unsafe extern "system" fn public_window_callback(
     window: HWND,
     msg: u32,
@@ -1118,13 +923,11 @@ pub(super) unsafe extern "system" fn public_window_callback(
                     super::set_window_long(window, GWL_USERDATA, userdata as _);
                     DefWindowProcW(window, msg, wparam, lparam)
                 },
-                None => -1, // failed to create the window
+                None => -1,
             };
 
             return result;
         },
-        // Getting here should quite frankly be impossible,
-        // but we'll make window creation fail here just in case.
         (0, WM_CREATE) => return -1,
         (_, WM_CREATE) => unsafe {
             let createstruct = &mut *(lparam as *mut CREATESTRUCTW);
@@ -1168,7 +971,6 @@ unsafe fn public_window_callback_inner(
 ) -> LRESULT {
     let mut result = ProcResult::DefWindowProc(wparam);
 
-    // Send new modifiers before sending key events.
     let mods_changed_callback = || match msg {
         WM_KEYDOWN | WM_SYSKEYDOWN | WM_KEYUP | WM_SYSKEYUP => {
             update_modifiers(window, userdata);
@@ -1195,8 +997,6 @@ unsafe fn public_window_callback_inner(
                 },
             });
         }
-        // aterm: the character an Alt code composed arrives with no key event of its own;
-        // it is committed text, as an input method's is (`KeyEventBuilder::take_alt_code_commit`).
         if let Some(text) = userdata.key_event_builder.take_alt_code_commit() {
             userdata.send_event(Event::WindowEvent {
                 window_id: RootWindowId(WindowId(window)),
@@ -1209,9 +1009,6 @@ unsafe fn public_window_callback_inner(
         .catch_unwind(keyboard_callback)
         .unwrap_or_else(|| result = ProcResult::Value(-1));
 
-    // I decided to bind the closure to `callback` and pass it to catch_unwind rather than passing
-    // the closure to catch_unwind directly so that the match body indentation wouldn't change and
-    // the git blame and history would be preserved.
     let callback = || match msg {
         WM_NCCALCSIZE => {
             let window_flags = userdata.window_state_lock().window_flags;
@@ -1223,28 +1020,11 @@ unsafe fn public_window_callback_inner(
             let params = unsafe { &mut *(lparam as *mut NCCALCSIZE_PARAMS) };
 
             if util::is_maximized(window) {
-                // Limit the window size when maximized to the current monitor.
-                // Otherwise it would include the non-existent decorations.
-                //
-                // Use `MonitorFromRect` instead of `MonitorFromWindow` to select
-                // the correct monitor here.
-                // See https://github.com/MicrosoftEdge/WebView2Feedback/issues/2549
                 let monitor = unsafe { MonitorFromRect(&params.rgrc[0], MONITOR_DEFAULTTONULL) };
                 if let Ok(monitor_info) = monitor::get_monitor_info(monitor) {
                     params.rgrc[0] = monitor_info.monitorInfo.rcWork;
                 }
             } else if window_flags.contains(WindowFlags::MARKER_UNDECORATED_SHADOW) {
-                // Extend the client area to cover the whole non-client area.
-                // https://docs.microsoft.com/en-us/windows/win32/winmsg/wm-nccalcsize#remarks
-                //
-                // HACK(msiglreith): To add the drop shadow we slightly tweak the non-client area.
-                // This leads to a small black 1px border on the top. Adding a margin manually
-                // on all 4 borders would result in the caption getting drawn by the DWM.
-                //
-                // Another option would be to allow the DWM to paint inside the client area.
-                // Unfortunately this results in janky resize behavior, where the compositor is
-                // ahead of the window surface. Currently, there seems no option to achieve this
-                // with the Windows API.
                 params.rgrc[0].top += 1;
                 params.rgrc[0].bottom += 1;
             }
@@ -1256,23 +1036,6 @@ unsafe fn public_window_callback_inner(
             userdata
                 .window_state_lock()
                 .set_window_flags_in_place(|f| f.insert(WindowFlags::MARKER_IN_SIZE_MOVE));
-            // aterm patch (see the repository NOTICE): `DefWindowProc` is about to
-            // run a MODAL message loop for the whole caption drag / edge resize.
-            // Our outer pump — `wait_for_messages`'s `prepare_wait()`/`wakeup()`
-            // bracket, and with it every `ControlFlow::WaitUntil` deadline — is
-            // parked under that loop's stack frame until `WM_EXITSIZEMOVE`.
-            // Window events still flow (the modal loop dispatches straight into
-            // this wndproc), but `NewEvents`/`AboutToWait` never fire, so timed
-            // work (cursor blink, decoration animation, the live-resize settle
-            // that repairs PTY winsize) freezes for the drag's duration. macOS
-            // never had this problem: its wakeup is a runloop observer in
-            // `kCFRunLoopCommonModes`, which includes the event-tracking mode.
-            // The classic Win32 remedy is a coarse `WM_TIMER` — timers are
-            // delivered by the modal loop itself — whose arm below re-runs the
-            // same runner bracket the outer pump would have. `USER_TIMER_MINIMUM`
-            // (10ms, quantized to the ~15.6ms system tick) is deliberately not
-            // faster: WM_TIMER only fires when the queue has gone quiet, so an
-            // active drag's WM_MOUSEMOVE flood naturally suppresses it.
             unsafe {
                 SetTimer(window, SIZE_MOVE_PUMP_TIMER_ID, USER_TIMER_MINIMUM, None);
             }
@@ -1288,50 +1051,13 @@ unsafe fn public_window_callback_inner(
 
             state.set_window_flags_in_place(|f| f.remove(WindowFlags::MARKER_IN_SIZE_MOVE));
             drop(state);
-            // aterm patch: retire the modal-loop pump armed in WM_ENTERSIZEMOVE.
-            // The outer `wait_for_messages` pump takes over again from here.
             unsafe {
                 KillTimer(window, SIZE_MOVE_PUMP_TIMER_ID);
             }
             result = ProcResult::Value(0);
         },
 
-        // aterm patch (see the repository NOTICE): the modal size/move pump.
-        // Only our private timer is intercepted; any other WM_TIMER on this
-        // window (none are armed today) falls through to `DefWindowProc`, which
-        // is what dispatches lparam TIMERPROC callbacks.
         WM_TIMER if wparam == SIZE_MOVE_PUMP_TIMER_ID => {
-            // Re-run the runner bracket the outer pump would have run: Idle →
-            // `AboutToWait` (the app re-folds its deadlines and re-arms
-            // `ControlFlow::WaitUntil`), then HandlingMainEvents →
-            // `NewEvents(cause)` + buffered-event drain. `call_new_events`
-            // computes `cause` from the control flow it just re-read, so a
-            // deadline that lapsed mid-drag yields a GENUINE
-            // `StartCause::ResumeTimeReached` — downstream deadline servicing
-            // gated on that cause (aterm's blink/settle/effect sweep) fires with
-            // no synthetic cause and no app-side allowance. Redraws requested by
-            // the handler post `WM_PAINT` via `RDW_INTERNALPAINT`, which the
-            // modal loop delivers once the queue idles, so painting flows too.
-            //
-            // Guards, both required:
-            //  * MARKER_IN_SIZE_MOVE — a straggler WM_TIMER already posted when
-            //    `KillTimer` ran must not pump outside the modal loop; the outer
-            //    pump owns the bracket there and a second driver would emit
-            //    spurious AboutToWait/NewEvents pairs mid-dispatch.
-            //  * !should_buffer() — if the handler cell is currently taken we are
-            //    re-entrant inside the user's own event handler (a nested pump it
-            //    started: SendMessage, a system menu, a message box). Pumping the
-            //    runner would panic in `call_event_handler`; skip the tick and
-            //    let the next one retry. (The normal drag path never hits this:
-            //    `drag_window()` POSTS its WM_NCLBUTTONDOWN, and a native caption
-            //    hit dispatches from the OS queue, so the modal loop always nests
-            //    under `DefWindowProc`, outside any handler borrow.)
-            //
-            // Rejected alternatives: SetCoalescableTimer with TIMERV_COALESCING
-            // (buys nothing at this coarseness); pumping from a worker thread via
-            // PostMessage (identical delivery constraints, plus a thread); a
-            // WH_MSGFILTER hook on MSGF_SIZE (fires per queue message, i.e. never
-            // while the user holds still — the exact case the settle needs).
             let in_size_move = userdata
                 .window_state_lock()
                 .window_flags()
@@ -1345,30 +1071,6 @@ unsafe fn public_window_callback_inner(
 
         WM_NCLBUTTONDOWN => {
             if wparam == HTCAPTION as _ {
-                // Prevent the user event loop from pausing when left clicking the title bar.
-                //
-                // When the user interacts with the title bar, Windows enters the modal event
-                // loop. Currently, a left click causes a pause for about 500ms. Sending a dummy
-                // mouse-move event seems to cancel the modal loop early, preventing the pause.
-                // The application will never see this dummy event.
-                //
-                // The mouse coordinates are encoded into the lparam value, however the WM_MOUSEMOVE
-                // event is not using the same coordinate system of the WM_NCLBUTTONDOWN event.
-                // One uses client-area coordinates and the other is screen-coordinates. In any
-                // case, passing the lparam as-is with the dummy event does not seem the cancel
-                // the modal loop.
-                //
-                // However, passing in a value of 0 has been observed to always cancel the pause.
-                //
-                // Other notes:
-                //
-                // For some unknown reason, the cursor will blink when clicking the title bar.
-                // Cancelling the modal loop early causes the blink to happen *immediately*.
-                // Otherwise, the blank happens *after* the pause.
-                //
-                // When right-click the title bar, the system window menu is presented to the user,
-                // and the modal event loop begins. This dummy event does *not* prevent the freeze
-                // in the main event loop caused by that popup menu.
                 let lparam = 0;
                 unsafe { PostMessageW(window, WM_MOUSEMOVE, 0, lparam) };
             }
@@ -1405,9 +1107,6 @@ unsafe fn public_window_callback_inner(
             userdata.window_state_lock().redraw_requested =
                 userdata.event_loop_runner.should_buffer();
 
-            // We'll buffer only in response to `UpdateWindow`, if win32 decides to redraw the
-            // window outside the normal flow of the event loop. This way mark event as handled
-            // and request a normal redraw with `RedrawWindow`.
             if !userdata.event_loop_runner.should_buffer() {
                 userdata.send_event(Event::WindowEvent {
                     window_id: RootWindowId(WindowId(window)),
@@ -1415,10 +1114,6 @@ unsafe fn public_window_callback_inner(
                 });
             }
 
-            // NOTE: calling `RedrawWindow` during `WM_PAINT` does nothing, since to mark
-            // `WM_PAINT` as handled we should call the `DefWindowProcW`. Call it and check whether
-            // user asked for redraw during `RedrawRequested` event handling and request it again
-            // after marking `WM_PAINT` as handled.
             result = ProcResult::Value(unsafe { DefWindowProcW(window, msg, wparam, lparam) });
             if std::mem::take(&mut userdata.window_state_lock().redraw_requested) {
                 unsafe {
@@ -1506,7 +1201,6 @@ unsafe fn public_window_callback_inner(
             result = ProcResult::Value(0);
         },
 
-        // WM_MOVE supplies client area positions, so we send Moved here instead.
         WM_WINDOWPOSCHANGED => {
             use crate::event::WindowEvent::Moved;
 
@@ -1520,7 +1214,6 @@ unsafe fn public_window_callback_inner(
                 });
             }
 
-            // This is necessary for us to still get sent WM_SIZE.
             result = ProcResult::DefWindowProc(wparam);
         },
 
@@ -1537,19 +1230,11 @@ unsafe fn public_window_callback_inner(
 
             {
                 let mut w = userdata.window_state_lock();
-                // See WindowFlags::MARKER_RETAIN_STATE_ON_SIZE docs for info on why this `if` check
-                // exists.
                 if !w.window_flags().contains(WindowFlags::MARKER_RETAIN_STATE_ON_SIZE) {
                     let maximized = wparam == SIZE_MAXIMIZED as usize;
                     w.set_window_flags_in_place(|f| f.set(WindowFlags::MAXIMIZED, maximized));
                 }
             }
-            // aterm: a minimize takes the window off the screen and a restore brings it
-            // back, so report them as `Occluded`, the event the macOS and X11 backends send
-            // for a window nobody can see (upstream winit sends none on Windows). The app
-            // parks its presents on it. WM_SIZE fires on every resize step, so only the
-            // edges send, and the return is sent before the restore's `Resized` so that
-            // resize's frame is not drawn under a stale occlusion.
             if let Some(occluded) = minimize_edge(&userdata.minimized, wparam) {
                 userdata.send_event(Event::WindowEvent {
                     window_id: RootWindowId(WindowId(window)),
@@ -1580,11 +1265,8 @@ unsafe fn public_window_callback_inner(
             };
 
             let side = wparam as u32;
-            // The desired new size of the window, decorations included.
             let rect = unsafe { &mut *(lparam as *mut RECT) };
 
-            // We need to calculate the dimensions of the window decorations to get the true
-            // size of the window's contents
             let adj_rect = userdata
                 .window_state_lock()
                 .window_flags
@@ -1599,9 +1281,6 @@ unsafe fn public_window_callback_inner(
             let mut width_delta = snap_to_nearest_increment_delta(width, inc.width);
             let mut height_delta = snap_to_nearest_increment_delta(height, inc.height);
 
-            // Windows won't bound check the value of `rect` after we're done here, so we
-            // have to check manually. If the width/height we snap to would go out of bounds, just
-            // set it equal to the min/max bound.
             let min_size =
                 userdata.window_state_lock().min_size.map(|size| size.to_physical(scale_factor));
             let max_size =
@@ -1652,9 +1331,6 @@ unsafe fn public_window_callback_inner(
             result = ProcResult::Value((MNC_CLOSE << 16) as isize);
         },
 
-        // aterm: the three arms' decisions are `ime::ime_events`, so a recorded composition
-        // drives the same code (`super::recorded`). Not calling DefWindowProc for
-        // WM_IME_COMPOSITION hides the composing text the IME would draw.
         WM_IME_STARTCOMPOSITION | WM_IME_COMPOSITION | WM_IME_ENDCOMPOSITION => {
             let (allowed, mut state) = {
                 let w = userdata.window_state_lock();
@@ -1678,12 +1354,10 @@ unsafe fn public_window_callback_inner(
         },
 
         WM_IME_SETCONTEXT => {
-            // IME UI visibility flags are in lparam.
             let lparam = lparam & !(ISC_SHOWUICOMPOSITIONWINDOW as isize);
             result = ProcResult::Value(unsafe { DefWindowProcW(window, msg, wparam, lparam) });
         },
 
-        // this is necessary for us to maintain minimize/restore state
         WM_SYSCOMMAND => {
             if wparam == SC_RESTORE as usize {
                 let mut w = userdata.window_state_lock();
@@ -1693,7 +1367,6 @@ unsafe fn public_window_callback_inner(
                 let mut w = userdata.window_state_lock();
                 w.set_window_flags_in_place(|f| f.set(WindowFlags::MINIMIZED, true));
             }
-            // Send `WindowEvent::Minimized` here if we decide to implement one
 
             if wparam == SC_SCREENSAVE as usize {
                 let window_state = userdata.window_state_lock();
@@ -1731,7 +1404,6 @@ unsafe fn public_window_callback_inner(
                             event: CursorEntered { device_id: DEVICE_ID },
                         });
 
-                        // Calling TrackMouseEvent in order to receive mouse leave events.
                         unsafe {
                             TrackMouseEvent(&mut TRACKMOUSEEVENT {
                                 cbSize: mem::size_of::<TRACKMOUSEEVENT>() as u32,
@@ -1755,9 +1427,6 @@ unsafe fn public_window_callback_inner(
                     PointerMoveKind::None => drop(w),
                 }
 
-                // handle spurious WM_MOUSEMOVE messages
-                // see https://devblogs.microsoft.com/oldnewthing/20031001-00/?p=42343
-                // and http://debugandconquer.blogspot.com/2015/08/the-cause-of-spurious-mouse-move.html
                 let mut w = userdata.window_state_lock();
                 cursor_moved = w.mouse.last_position != Some(position);
                 w.mouse.last_position = Some(position);
@@ -1814,7 +1483,7 @@ unsafe fn public_window_callback_inner(
             use crate::event::MouseScrollDelta::LineDelta;
 
             let value = (wparam >> 16) as i16;
-            let value = -value as f32 / WHEEL_DELTA as f32; // NOTE: inverted! See https://github.com/rust-windowing/winit/pull/2105/
+            let value = -value as f32 / WHEEL_DELTA as f32;
 
             update_modifiers(window, userdata);
 
@@ -1839,7 +1508,6 @@ unsafe fn public_window_callback_inner(
         WM_KEYUP | WM_SYSKEYUP => {
             if msg == WM_SYSKEYUP && unsafe { !GetMenu(window).is_null() } {
                 // let Windows handle event if the window has a native menu, a modal event loop
-                // is started here on Alt key up.
                 result = ProcResult::DefWindowProc(wparam);
             }
         },
@@ -1992,9 +1660,6 @@ unsafe fn public_window_callback_inner(
 
         WM_CAPTURECHANGED => {
             // lparam here is a handle to the window which is gaining mouse capture.
-            // If it is the same as our window, then we're essentially retaining the capture. This
-            // can happen if `SetCapture` is called on our window when it already has the mouse
-            // capture.
             if lparam != super::handle::to_isize(window) {
                 userdata.window_state_lock().mouse.capture_count = 0;
             }
@@ -2037,7 +1702,7 @@ unsafe fn public_window_callback_inner(
                                 continue;
                             },
                             location,
-                            force: None, // WM_TOUCH doesn't support pressure information
+                            force: None,
                             id: input.dwID as u64,
                             device_id: DEVICE_ID,
                         }),
@@ -2090,9 +1755,6 @@ unsafe fn public_window_callback_inner(
                 }
                 unsafe { pointer_infos.set_len(pointer_info_count) };
 
-                // https://docs.microsoft.com/en-us/windows/desktop/api/winuser/nf-winuser-getpointerframeinfohistory
-                // The information retrieved appears in reverse chronological order, with the most
-                // recent entry in the first row of the returned array
                 for pointer_info in pointer_infos.iter().rev() {
                     let mut device_rect = mem::MaybeUninit::uninit();
                     let mut display_rect = mem::MaybeUninit::uninit();
@@ -2111,17 +1773,11 @@ unsafe fn public_window_callback_inner(
                     let device_rect = unsafe { device_rect.assume_init() };
                     let display_rect = unsafe { display_rect.assume_init() };
 
-                    // For the most precise himetric to pixel conversion we calculate the ratio
-                    // between the resolution of the display device (pixel) and
-                    // the touch device (himetric).
                     let himetric_to_pixel_ratio_x = (display_rect.right - display_rect.left) as f64
                         / (device_rect.right - device_rect.left) as f64;
                     let himetric_to_pixel_ratio_y = (display_rect.bottom - display_rect.top) as f64
                         / (device_rect.bottom - device_rect.top) as f64;
 
-                    // ptHimetricLocation's origin is 0,0 even on multi-monitor setups.
-                    // On multi-monitor setups we need to translate the himetric location to the
-                    // rect of the display device it's attached to.
                     let x = display_rect.left as f64
                         + pointer_info.ptHimetricLocation.x as f64 * himetric_to_pixel_ratio_x;
                     let y = display_rect.top as f64
@@ -2199,7 +1855,6 @@ unsafe fn public_window_callback_inner(
             let is_active = wparam != false.into();
             if is_active {
                 // The process-wide menu mode, back on this window's caption side
-                // before its system menu can open (`dark_mode::reassert_menu_theme`).
                 super::dark_mode::reassert_menu_theme(window);
             }
             let active_focus_changed = userdata.window_state_lock().set_active(is_active);
@@ -2232,9 +1887,6 @@ unsafe fn public_window_callback_inner(
         WM_SETCURSOR => {
             let set_cursor_to = {
                 let window_state = userdata.window_state_lock();
-                // The return value for the preceding `WM_NCHITTEST` message is conveniently
-                // provided through the low-order word of lParam. We use that here since
-                // `WM_MOUSEMOVE` seems to come after `WM_SETCURSOR` for a given cursor movement.
                 let in_client_area = super::loword(lparam as u32) as u32 == HTCLIENT;
                 if in_client_area {
                     Some(window_state.mouse.selected_cursor.clone())
@@ -2282,15 +1934,9 @@ unsafe fn public_window_callback_inner(
             result = ProcResult::Value(0);
         },
 
-        // Only sent on Windows 8.1 or newer. On Windows 7 and older user has to log out to change
-        // DPI, therefore all applications are closed while DPI is changing.
         WM_DPICHANGED => {
             use crate::event::WindowEvent::ScaleFactorChanged;
 
-            // This message actually provides two DPI values - x and y. However MSDN says that
-            // "you only need to use either the X-axis or the Y-axis value when scaling your
-            // application since they are the same".
-            // https://msdn.microsoft.com/en-us/library/windows/desktop/dn312083(v=vs.85).aspx
             let new_dpi_x = super::loword(wparam as u32) as u32;
             let new_scale_factor = dpi_to_scale_factor(new_dpi_x);
             let old_scale_factor: f64;
@@ -2311,24 +1957,15 @@ unsafe fn public_window_callback_inner(
                 (allow_resize, window_state.window_flags)
             };
 
-            // New size as suggested by Windows.
             let suggested_rect = unsafe { *(lparam as *const RECT) };
 
-            // The window rect provided is the window's outer size, not it's inner size. However,
-            // win32 doesn't provide an `UnadjustWindowRectEx` function to get the client rect from
-            // the outer rect, so we instead adjust the window rect to get the decoration margins
-            // and remove them from the outer size.
             let margin_left: i32;
             let margin_top: i32;
-            // let margin_right: i32;
-            // let margin_bottom: i32;
             {
                 let adjusted_rect =
                     window_flags.adjust_rect(window, suggested_rect).unwrap_or(suggested_rect);
                 margin_left = suggested_rect.left - adjusted_rect.left;
                 margin_top = suggested_rect.top - adjusted_rect.top;
-                // margin_right = adjusted_rect.right - suggested_rect.right;
-                // margin_bottom = adjusted_rect.bottom - suggested_rect.bottom;
             }
 
             let old_physical_inner_rect = util::WindowArea::Inner
@@ -2339,11 +1976,7 @@ unsafe fn public_window_callback_inner(
                 (old_physical_inner_rect.bottom - old_physical_inner_rect.top) as u32,
             );
 
-            // `allow_resize` prevents us from re-applying DPI adjustment to the restored size after
-            // exiting fullscreen (the restored size is already DPI adjusted).
             let new_physical_inner_size = match allow_resize {
-                // We calculate our own size because the default suggested rect doesn't do a great
-                // job of preserving the window's logical size.
                 true => old_physical_inner_size
                     .to_logical::<f64>(old_scale_factor)
                     .to_physical::<u32>(new_scale_factor),
@@ -2368,7 +2001,6 @@ unsafe fn public_window_callback_inner(
                 let window_state = userdata.window_state_lock();
                 dragging_window =
                     window_state.window_flags().contains(WindowFlags::MARKER_IN_SIZE_MOVE);
-                // Unset maximized if we're changing the window's size.
                 if new_physical_inner_size != old_physical_inner_size {
                     WindowState::set_window_flags(window_state, window, |f| {
                         f.set(WindowFlags::MAXIMIZED, false)
@@ -2392,8 +2024,6 @@ unsafe fn public_window_callback_inner(
                     .adjust_rect(window, conservative_rect)
                     .unwrap_or(conservative_rect);
 
-                // If we're dragging the window, offset the window so that the cursor's
-                // relative horizontal position in the title bar is preserved.
                 if dragging_window {
                     let bias = {
                         let cursor_pos = {
@@ -2415,8 +2045,6 @@ unsafe fn public_window_callback_inner(
                     conservative_rect.right += bias;
                 }
 
-                // Check to see if the new window rect is on the monitor with the new DPI factor.
-                // If it isn't, offset the window so that it is.
                 let new_dpi_monitor = unsafe { MonitorFromWindow(window, MONITOR_DEFAULTTONULL) };
                 let conservative_rect_monitor =
                     unsafe { MonitorFromRect(&conservative_rect, MONITOR_DEFAULTTONULL) };
@@ -2435,9 +2063,6 @@ unsafe fn public_window_callback_inner(
                     let wrong_monitor_rect = get_monitor_rect(wrong_monitor);
                     let new_monitor_rect = get_monitor_rect(new_dpi_monitor);
 
-                    // The direction to nudge the window in to get the window onto the monitor with
-                    // the new DPI factor. We calculate this by seeing which monitor edges are
-                    // shared and nudging away from the wrong monitor based on those.
                     #[allow(clippy::bool_to_int_with_if)]
                     let delta_nudge_to_dpi_monitor = (
                         if wrong_monitor_rect.left == new_monitor_rect.right {
@@ -2553,7 +2178,6 @@ unsafe extern "system" fn thread_event_target_callback(
         unsafe { super::get_window_long(window, GWL_USERDATA) } as *mut ThreadMsgTargetData;
     if userdata_ptr.is_null() {
         // `userdata_ptr` will always be null for the first `WM_GETMINMAXINFO`, as well as
-        // `WM_NCCREATE` and `WM_CREATE`.
         return unsafe { DefWindowProcW(window, msg, wparam, lparam) };
     }
     let userdata = unsafe { Box::from_raw(userdata_ptr) };
@@ -2564,9 +2188,6 @@ unsafe extern "system" fn thread_event_target_callback(
 
     let mut userdata_removed = false;
 
-    // I decided to bind the closure to `callback` and pass it to catch_unwind rather than passing
-    // the closure to catch_unwind directly so that the match body indentation wouldn't change and
-    // the git blame and history would be preserved.
     let callback = || match msg {
         WM_NCDESTROY => {
             unsafe { super::set_window_long(window, GWL_USERDATA, 0) };
@@ -2575,8 +2196,6 @@ unsafe extern "system" fn thread_event_target_callback(
         },
         WM_PAINT => unsafe {
             ValidateRect(window, ptr::null());
-            // Default WM_PAINT behaviour. This makes sure modals and popups are shown immediately
-            // when opening them.
             DefWindowProcW(window, msg, wparam, lparam)
         },
 
@@ -2602,11 +2221,6 @@ unsafe extern "system" fn thread_event_target_callback(
         },
 
         _ if msg == USER_EVENT_MSG_ID.get() => {
-            // synthesis a placeholder UserEvent, so that if the callback is
-            // re-entered it can be buffered for later delivery. the real
-            // user event is still in the mpsc channel and will be pulled
-            // once the placeholder event is delivered to the wrapper
-            // `event_handler`
             userdata.send_event(Event::UserEvent(UserEventPlaceholder));
             0
         },
@@ -2729,7 +2343,8 @@ fn get_pointer_move_kind(
     let rect: RECT = unsafe {
         let mut rect: RECT = mem::zeroed();
         if GetClientRect(window, &mut rect) == false.into() {
-            return PointerMoveKind::None; // exit early if GetClientRect failed
+            // exit early if GetClientRect failed
+            return PointerMoveKind::None;
         }
         rect
     };

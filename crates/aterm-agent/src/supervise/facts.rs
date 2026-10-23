@@ -117,14 +117,26 @@ impl FactsState {
     /// A successor loop's state from the ledger's fact rows, oldest first, at `now_ms`: each
     /// episode whose LAST row says it was typed is told, and its kind is held told while that
     /// row is younger than [`SEED_HOLD_MS`]. An intent with no outcome after it, or a skip, leaves
-    /// the episode untold.
+    /// the episode untold (`OccupancyDoor`'s `Crash`).
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "OccupancyDoor",
+            action = "Crash",
+            project = "conformance_occupancy::project"
+        )
+    )]
     pub fn seed(&mut self, rows: &[(EpisodeKey, i64, SeedOutcome)], now_ms: i64) {
+        use crate::supervise::occupancy::fault::{Fault, armed};
         let mut last: BTreeMap<EpisodeKey, (i64, SeedOutcome)> = BTreeMap::new();
         for &(key, at_ms, outcome) in rows {
             last.insert(key, (at_ms, outcome));
         }
         for (key, (at_ms, outcome)) in last {
-            if outcome != SeedOutcome::Typed {
+            let told = outcome == SeedOutcome::Typed
+                || (outcome == SeedOutcome::Intent && armed(Fault::SeedIntentAsTold))
+                || (outcome == SeedOutcome::Skipped && armed(Fault::SeedSkipAsTold));
+            if !told {
                 continue;
             }
             self.told.insert(key, at_ms);

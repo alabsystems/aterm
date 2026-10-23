@@ -1,27 +1,6 @@
 // Copyright The winit contributors
 // SPDX-License-Identifier: Apache-2.0
-//
-// Derived from winit 0.30.13 src/platform_impl/linux/x11/event_processor.rs,
-// modified by the aterm project in 2026 (see the repository NOTICE).
 
-// Modified by the aterm project in 2026; see the repository NOTICE. (Events are read through
-// aterm-x11's Xlib and XInput 2 declarations, and the requests are its encoders, where
-// upstream used x11-dl and x11rb: docs/AUDIT-third-party-2026-10-15.md, LW.7.)
-//
-// LOCAL PATCH (aterm), 2026-10-21 (docs/AUDIT-third-party-2026-10-15.md, WC.8): no device
-// events. No aterm crate handles `ApplicationHandler::device_event`, so the raw XInput 2
-// motion, button and key events are no longer selected on the root while a window has focus,
-// and hot-plugged devices only update the scroll axes; `WindowEvent::AxisMotion`, which aterm
-// ignores, is not reported either.
-//
-// LOCAL PATCH (aterm), 2026-10-22: a window manager's `_NET_WM_SYNC_REQUEST` is noted on its
-// window, and the `ConfigureNotify` after it decides what the window waits for before it answers
-// (`sync_request.rs`).
-//
-// LOCAL PATCH (aterm), 2026-10-21 (X11-GONE): a request an event's handling makes that fails is
-// reported (`XConnection::report`), where upstream's `expect`s panicked: the connection can break
-// while an event is handled, and the loop's next look ends the run with the loss. The IME
-// requests queued behind such an event are not sent on the broken connection.
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
 use std::os::raw::{c_char, c_int, c_long, c_ulong};
@@ -104,27 +83,15 @@ pub struct EventProcessor {
     pub xkbext: QueryExtensionReply,
     pub target: RootAEL,
     pub xkb_context: Context,
-    // Number of touch events currently in progress
     pub num_touch: u32,
-    // This is the last pressed key that is repeatable (if it hasn't been
-    // released).
-    //
-    // Used to detect key repeats.
     pub held_key_press: Option<u32>,
     pub first_touch: Option<u64>,
-    // Currently focused window belonging to this process
     pub active_window: Option<xproto::Window>,
     /// Latest modifiers we've sent for the user to trigger change in event.
     pub modifiers: Cell<ModifiersState>,
-    // Track modifiers based on keycodes. NOTE: that serials generally don't work for tracking
-    // since they are not unique and could be duplicated in case of sequence of key events is
-    // delivered at near the same time.
     pub xfiltered_modifiers: VecDeque<u8>,
     pub xmodmap: util::ModifierKeymap,
-    /// The window whose input context has a composition open: its preedit started and has
-    /// not ended. Its keys go to the input method's lookup (`xinput_key_input`), which gives
-    /// arrows, Home, End and the function keys no text, so a composition left open after it
-    /// ended keeps them dead: `end_composition`.
+    /// The window whose input context has a composition open.
     pub composing: Option<xproto::Window>,
 }
 
@@ -137,18 +104,13 @@ impl EventProcessor {
         self.process_ime(&mut callback);
     }
 
-    /// Send the IME requests the windows queued (`ImeRequest`), then hand on what the input
-    /// method's callbacks queued (`ImeEvent`).
+    /// Send the IME requests the windows queued (`ImeRequest`), then hand on what the input method's callbacks queued (`ImeEvent`).
     pub(super) fn process_ime<T: 'static, F>(&mut self, mut callback: F)
     where
         F: FnMut(&RootAEL, Event<T>),
     {
         let window_target = Self::window_target_mut(&mut self.target);
 
-        // Handle IME requests, unless the event's handling found the display gone: XIM speaks
-        // through Xlib, which queues a broken connection's requests until its buffer overflows
-        // (`XConnection::set_cursor_icon`). They stay queued, and the loop's next look ends
-        // the run (X11-GONE).
         while !window_target.x_connection().is_broken() {
             let Ok(request) = self.ime_receiver.try_recv() else {
                 break;
@@ -168,13 +130,10 @@ impl EventProcessor {
             }
         }
 
-        // Drain IME events.
         while let Ok((window, event)) = self.ime_event_receiver.try_recv() {
             let window = window as xproto::Window;
             let window_id = mkwid(window);
             let event = match event {
-                // A new input context (made for the window, or remade when the input method
-                // was replaced) has no composition open.
                 ImeEvent::Enabled => {
                     self.end_composition(window);
                     WindowEvent::Ime(Ime::Enabled)
@@ -188,7 +147,6 @@ impl EventProcessor {
                 },
                 ImeEvent::End => {
                     self.end_composition(window);
-                    // Issue empty preedit on `Done`.
                     WindowEvent::Ime(Ime::Preedit(String::new(), None))
                 },
                 ImeEvent::Disabled => {
@@ -212,9 +170,6 @@ impl EventProcessor {
     }
 
     /// XFilterEvent tells us when an event has been discarded by the input method.
-    /// Specifically, this involves all of the KeyPress events in compose/pre-edit sequences,
-    /// along with an extra copy of the KeyRelease events. This also prevents backspace and
-    /// arrow keys from being detected twice.
     #[must_use]
     fn filter_event(&mut self, xev: &mut XEvent) -> bool {
         let wt = Self::window_target(&self.target);
@@ -230,10 +185,6 @@ impl EventProcessor {
     {
         let event_type = unsafe { xev.type_ };
 
-        // If we have IME disabled, don't try to `filter_event`, since only IME can consume them
-        // and forward back. This is not desired for e.g. games since some IMEs may delay the input
-        // and game can toggle IME back when e.g. typing into some field where latency won't really
-        // matter.
         let filtered =
             if event_type == event_type::KEY_PRESS || event_type == event_type::KEY_RELEASE {
                 let wt = Self::window_target(&self.target);
@@ -247,7 +198,6 @@ impl EventProcessor {
                 if filtered {
                     let xev: &XKeyEvent = unsafe { &xev.key };
                     if self.xmodmap.is_modifier(xev.keycode as u8) {
-                        // Don't grow the buffer past the `MAX_MOD_REPLAY_LEN`. This could happen
                         // when the modifiers are consumed entirely.
                         if self.xfiltered_modifiers.len() == MAX_MOD_REPLAY_LEN {
                             self.xfiltered_modifiers.pop_back();
@@ -261,12 +211,10 @@ impl EventProcessor {
                 self.filter_event(xev)
             };
 
-        // Don't process event if it was filtered.
         if filtered {
             return;
         }
 
-        // SAFETY (each arm's union read): Xlib wrote the member that `event_type` names.
         match event_type {
             event_type::CLIENT_MESSAGE => {
                 self.client_message(unsafe { &xev.client_message }, &mut callback)
@@ -290,7 +238,6 @@ impl EventProcessor {
                 self.visibility_notify(unsafe { &xev.visibility }, &mut callback)
             },
             event_type::EXPOSE => self.expose(unsafe { &xev.expose }, &mut callback),
-            // Note that in compose/pre-edit sequences, we'll always receive KeyRelease events.
             ty @ event_type::KEY_PRESS | ty @ event_type::KEY_RELEASE => {
                 let state = if ty == event_type::KEY_PRESS {
                     ElementState::Pressed
@@ -379,7 +326,7 @@ impl EventProcessor {
             },
             _ => {
                 if event_type == self.xkbext.first_event as _ {
-                    // SAFETY: an XKB event; `XEvent`'s padding covers every XKB event struct.
+                    // SAFETY: an XKB event.
                     let xev: &XkbAnyEvent =
                         unsafe { &*(xev as *const XEvent).cast::<XkbAnyEvent>() };
                     self.xkb_event(xev, &mut callback);
@@ -400,12 +347,6 @@ impl EventProcessor {
 
     pub unsafe fn poll_one_event(&mut self, event_ptr: *mut XEvent) -> bool {
         let window_target = Self::window_target(&self.target);
-        // This function is used to poll and remove a single event
-        // from the Xlib event queue in a non-blocking, atomic way.
-        // XCheckIfEvent is non-blocking and removes events from queue.
-        // XNextEvent can't be used because it blocks while holding the
-        // global Xlib mutex.
-        // XPeekEvent does not remove events from the queue.
         unsafe extern "C" fn predicate(
             _display: *mut XDisplay,
             _event: *mut XEvent,
@@ -463,7 +404,6 @@ impl EventProcessor {
         result
     }
 
-    // NOTE: we avoid `self` to not borrow the entire `self` as not mut.
     /// Get the platform window target.
     pub fn window_target(window_target: &RootAEL) -> &ActiveEventLoop {
         match &window_target.p {
@@ -496,8 +436,6 @@ impl EventProcessor {
             return;
         }
 
-        // The window manager is about to resize the window and waits for its counter to reach
-        // this serial: `data.l[2]` is its low half and `data.l[3]` its high (EWMH).
         if xev.message_type == atoms[WM_PROTOCOLS] as c_ulong
             && client_long(xev, 0) as xproto::Atom == atoms[_NET_WM_SYNC_REQUEST]
         {
@@ -536,7 +474,6 @@ impl EventProcessor {
             let source_window = client_long(xev, 0) as xproto::Window;
             let flags = client_long(xev, 1);
             let version = flags >> 24;
-            // A new drag: nothing of an earlier one is its data.
             self.dnd.reset();
             self.dnd.target_window = Some(window);
             self.dnd.source_window = Some(source_window);
@@ -556,33 +493,12 @@ impl EventProcessor {
         }
 
         if xev.message_type == atoms[XdndPosition] as c_ulong {
-            // This event occurs every time the mouse moves while a file's being dragged
-            // over our window. We emit HoveredFile in response; while the macOS backend
-            // does that upon a drag entering, XDND doesn't have access to the actual drop
-            // data until this event. For parity with other platforms, we only emit
-            // `HoveredFile` the first time, though if winit's API is later extended to
-            // supply position updates with `HoveredFile` or another event, implementing
-            // that here would be trivial.
-
             let source_window = client_long(xev, 0) as xproto::Window;
             if !self.dnd.matches_drag(window, source_window) {
                 return;
             }
 
-            // Equivalent to `(x << shift) | y`
-            // where `shift = mem::size_of::<c_short>() * 8`
-            // Note that coordinates are in "desktop space", not "window space"
-            // (in X11 parlance, they're root window coordinates)
-            // let packed_coordinates = client_long(xev, 2);
-            // let shift = mem::size_of::<libc::c_short>() * 8;
-            // let x = packed_coordinates >> shift;
-            // let y = packed_coordinates & !(x << shift);
-
-            // By our own state flow, `version` should never be `None` at this point.
             let version = self.dnd.version.unwrap_or(5);
-
-            // Action is specified in versions 2 and up, though we don't need it anyway.
-            // let action = client_long(xev, 4);
 
             let accepted = if let Some(ref type_list) = self.dnd.type_list {
                 type_list.contains(&atoms[TextUriList])
@@ -606,11 +522,8 @@ impl EventProcessor {
                 // In version 0, time isn't specified
                 aterm_x11::proto::CURRENT_TIME
             };
-            // This results in the `SelectionNotify` event below, once per drag.
             self.dnd.request(window, time);
 
-            // Accepted until the data shows it names no local file (`selection_notify`), then
-            // refused: the source shows a no-drop cursor, not a copy that drops nothing.
             let state = if self.dnd.refused() { DndState::Rejected } else { DndState::Accepted };
             unsafe {
                 self.dnd
@@ -633,8 +546,6 @@ impl EventProcessor {
                 self.dnd.result = Some(Vec::new());
             }
             if self.dnd.source_window.is_some() && self.dnd.result.is_none() {
-                // Dropped before its data came: ask (if no request is outstanding) and finish
-                // the drop when the answer comes (`selection_notify`).
                 let time = if self.dnd.version.unwrap_or(5) >= 1 {
                     client_long(xev, 2) as xproto::Timestamp
                 } else {
@@ -645,12 +556,8 @@ impl EventProcessor {
                     self.dnd.dropped = true;
                     return;
                 }
-                // Allocation, creation or conversion failed synchronously. There will be no
-                // SelectionNotify to finish this drop: send the refusal below now.
             }
             let (source_window, state) = if let Some(source_window) = self.dnd.source_window {
-                // A drag whose data names no local file is refused, even where its source drops
-                // it anyway.
                 let path_list = self.dnd.result.take().unwrap_or_default();
                 for path in &path_list {
                     let event = Event::WindowEvent {
@@ -663,8 +570,6 @@ impl EventProcessor {
                     if path_list.is_empty() { DndState::Rejected } else { DndState::Accepted };
                 (source_window, state)
             } else {
-                // `source_window` won't be part of our DND state if we already rejected the drop in
-                // our `XdndPosition` handler.
                 let source_window = client_long(xev, 0) as xproto::Window;
                 (source_window, DndState::Rejected)
             };
@@ -701,8 +606,6 @@ impl EventProcessor {
             return;
         };
 
-        // The answer to this drag's request for its data (the property is `None` where the
-        // source refused it). Any other answers an earlier drag, which has ended.
         if xev.selection != atoms[XdndSelection] as c_ulong
             || xev.target != atoms[TextUriList] as c_ulong
             || (xev.property != 0 && xev.property != atoms[XdndSelection] as c_ulong)
@@ -711,13 +614,10 @@ impl EventProcessor {
             return;
         }
 
-        // This is where we receive data from drag and drop
         let data = if xev.property == atoms[XdndSelection] as c_ulong {
             match self.dnd.take_data(requestor) {
                 Some(super::dnd::Answer::List(data)) => data,
                 Some(super::dnd::Answer::Incr) => {
-                    // The list comes in chunks (`property_notify`); taking the INCR property
-                    // asked for the first.
                     self.dnd.begin_incr();
                     return;
                 },
@@ -730,7 +630,6 @@ impl EventProcessor {
     }
 
     /// The drag's data came to `window`, whole: hover its local files, or deliver and finish
-    /// the drop that came first; a drag whose data names none is refused.
     fn dnd_data_came<T: 'static, F>(&mut self, window: xproto::Window, data: &[u8], mut callback: F)
     where
         F: FnMut(&RootAEL, Event<T>),
@@ -740,7 +639,6 @@ impl EventProcessor {
         self.dnd.complete_request();
         let path_list = super::dnd::local_paths(data);
         if self.dnd.dropped {
-            // The drop came first: deliver it now and finish it.
             for path in &path_list {
                 let event =
                     Event::WindowEvent { window_id, event: WindowEvent::DroppedFile(path.clone()) };
@@ -763,9 +661,6 @@ impl EventProcessor {
             callback(&self.target, event);
         }
         if path_list.is_empty() {
-            // Nothing to drop (a web link, a trash or network item, a refused request): refuse
-            // the drag now, not at its next position, so the source's cursor says so while the
-            // pointer rests. A source takes an `XdndStatus` at any time (GTK and Qt update the
             // drag's action from it).
             if let Some(source_window) = self.dnd.source_window {
                 unsafe {
@@ -792,16 +687,8 @@ impl EventProcessor {
             None => return,
         };
 
-        // So apparently...
-        // `XSendEvent` (synthetic `ConfigureNotify`) -> position relative to root
-        // `XConfigureNotify` (real `ConfigureNotify`) -> position relative to parent
-        // https://tronche.com/gui/x/icccm/sec-4.html#s-4.1.5
-        // We don't want to send `Moved` when this is false, since then every `Resized`
-        // (whether the window moved or not) is accompanied by an extraneous `Moved` event
-        // that has a position relative to the parent window.
         let is_synthetic = xev.send_event == ffi::TRUE;
 
-        // These are both in physical space.
         let new_inner_size = (xev.width as u32, xev.height as u32);
         let new_inner_position = (xev.x, xev.y);
 
@@ -812,15 +699,10 @@ impl EventProcessor {
             let moved = if is_synthetic {
                 util::maybe_change(&mut shared_state_lock.inner_position, new_inner_position)
             } else {
-                // Detect when frame extents change.
-                // Since this isn't synthetic, as per the notes above, this position is relative to
-                // the parent window.
                 let rel_parent = new_inner_position;
                 if util::maybe_change(&mut shared_state_lock.inner_position_rel_parent, rel_parent)
                 {
-                    // This ensures we process the next `Moved`.
                     shared_state_lock.inner_position = None;
-                    // Extra insurance against stale frame extents.
                     shared_state_lock.frame_extents = None;
                 }
                 false
@@ -835,8 +717,6 @@ impl EventProcessor {
         } else {
             let mut shared_state_lock = window.shared_state_lock();
 
-            // We need to convert client area position to window position. Extents the server
-            // cannot give (the display gone) are taken as none, and not cached.
             let frame_extents =
                 shared_state_lock.frame_extents.as_ref().cloned().unwrap_or_else(|| {
                     match wt
@@ -858,7 +738,6 @@ impl EventProcessor {
                 frame_extents.inner_pos_to_outer(new_inner_position.0, new_inner_position.1);
             shared_state_lock.position = Some(outer);
 
-            // Unlock shared state to prevent deadlock in callback below
             drop(shared_state_lock);
 
             if moved {
@@ -872,9 +751,6 @@ impl EventProcessor {
 
         if is_synthetic {
             let mut shared_state_lock = window.shared_state_lock();
-            // If we don't use the existing adjusted value when available, then the user can screw
-            // up the resizing by dragging across monitors *without* dropping the
-            // window.
             let (width, height) =
                 shared_state_lock.dpi_adjusted.unwrap_or((xev.width as u32, xev.height as u32));
 
@@ -887,7 +763,6 @@ impl EventProcessor {
                     .or_report(&wt.xconn, "Failed to find monitor for window");
 
                 match monitor {
-                    // Avoid updating monitor using a dummy monitor handle, or none
                     None => last_scale_factor,
                     Some(monitor) if monitor.is_dummy() => last_scale_factor,
                     Some(monitor) => {
@@ -908,7 +783,6 @@ impl EventProcessor {
                 let old_inner_size = PhysicalSize::new(width, height);
                 let new_inner_size = PhysicalSize::new(new_width, new_height);
 
-                // Unlock shared state to prevent deadlock in callback below
                 drop(shared_state_lock);
 
                 let inner_size = Arc::new(Mutex::new(new_inner_size));
@@ -926,38 +800,25 @@ impl EventProcessor {
                 if new_inner_size != old_inner_size {
                     window.request_inner_size_physical(new_inner_size.width, new_inner_size.height);
                     window.shared_state_lock().dpi_adjusted = Some(new_inner_size.into());
-                    // if the DPI factor changed, force a resize event to ensure the logical
-                    // size is computed with the right DPI factor
                     resized = true;
                 }
             }
         }
 
-        // NOTE: Ensure that the lock is dropped before handling the resized and
-        // sending the event back to user.
         {
             let mut shared_state_lock = window.shared_state_lock();
 
-            // This is a hack to ensure that the DPI adjusted resize is actually
-            // applied on all WMs. KWin doesn't need this, but Xfwm does. The hack
-            // should not be run on other WMs, since tiling WMs constrain the window
-            // size, making the resize fail. This would cause an endless stream of
-            // XResizeWindow requests, making Xorg, the winit client, and the WM
-            // consume 100% of CPU.
             if let Some(adjusted_size) = shared_state_lock.dpi_adjusted {
                 if new_inner_size == adjusted_size || !util::wm_name_is_one_of(&["Xfwm4"]) {
                     // When this finally happens, the event will not be synthetic.
                     shared_state_lock.dpi_adjusted = None;
                 } else {
-                    // Unlock shared state to prevent deadlock in callback below
                     drop(shared_state_lock);
                     window.request_inner_size_physical(adjusted_size.0, adjusted_size.1);
                 }
             }
         }
 
-        // Before `Resized`: the application presents its frame of the new size while it
-        // handles it, which is what a pending sync request then waits for.
         window.sync_configured(resized);
 
         if resized {
@@ -969,10 +830,6 @@ impl EventProcessor {
     }
 
     /// This is generally a reliable way to detect when the window manager's been
-    /// replaced, though this event is only fired by reparenting window managers
-    /// (which is almost all of them). Failing to correctly update WM info doesn't
-    /// really have much impact, since on the WMs affected (xmonad, dwm, etc.) the only
-    /// effect is that we waste some time trying to query unsupported properties.
     fn reparent_notify(&self, xev: &XReparentEvent) {
         let wt = Self::window_target(&self.target);
 
@@ -990,11 +847,6 @@ impl EventProcessor {
         let window = xev.window as xproto::Window;
         let window_id = mkwid(window);
 
-        // NOTE: Re-issue the focus state when mapping the window.
-        //
-        // The purpose of it is to deliver initial focused state of the newly created
-        // window, given that we can't rely on `CreateNotify`, due to it being not
-        // sent.
         let focus = self.with_window(window, |window| window.has_focus()).unwrap_or_default();
         let event = Event::WindowEvent { window_id, event: WindowEvent::Focused(focus) };
 
@@ -1004,8 +856,6 @@ impl EventProcessor {
     }
 
     /// The window was unmapped: the window manager iconified it or moved it off the current
-    /// workspace (mutter unmaps both), or the application hid it. The server sends this only
-    /// for a window that was mapped.
     fn unmap_notify<T: 'static, F>(&self, xev: &ffi::XUnmapEvent, callback: F)
     where
         F: FnMut(&RootAEL, Event<T>),
@@ -1015,7 +865,6 @@ impl EventProcessor {
     }
 
     /// Applies `change` to what hides `window` (`window::Occlusion`), and reports
-    /// `WindowEvent::Occluded` when that changes what the window last reported.
     fn change_occlusion<T: 'static, F>(
         &self,
         window: xproto::Window,
@@ -1047,12 +896,8 @@ impl EventProcessor {
             self.dnd.reset();
         }
 
-        // In the event that the window's been destroyed without being dropped first, we
-        // cleanup again here.
         wt.windows.borrow_mut().remove(&WindowId(window as _));
 
-        // Since all XIM stuff needs to happen from the same thread, we destroy the input
-        // context here instead of when dropping the window.
         if let Some(ime) = wt.ime.as_ref() {
             ime.borrow_mut()
                 .remove_context(window as XWindow)
@@ -1074,8 +919,6 @@ impl EventProcessor {
             self.process_dpi_change(&mut callback);
         }
 
-        // The window manager's state for one of the windows: `_NET_WM_STATE_HIDDEN` hides it
-        // (iconified, or on another workspace where the window manager says so).
         if atom == atoms[_NET_WM_STATE] {
             let window = xev.window as xproto::Window;
             if let Some(hidden) = self.with_window(window, |shown| shown.is_minimized()) {
@@ -1084,8 +927,6 @@ impl EventProcessor {
             }
         }
 
-        // The next chunk of a drag's data coming in ICCCM INCR chunks: taking it asks for the
-        // one after; an empty one ends the transfer.
         let window = xev.window as xproto::Window;
         if atom == atoms[XdndSelection]
             && xev.state == c_int::from(aterm_x11::proto::event::property::NEW_VALUE)
@@ -1118,14 +959,11 @@ impl EventProcessor {
     where
         F: FnMut(&RootAEL, Event<T>),
     {
-        // Multiple Expose events may be received for subareas of a window.
         // We issue `RedrawRequested` only for the last event of such a series.
         if xev.count == 0 {
             let window = xev.window as xproto::Window;
             let window_id = mkwid(window);
 
-            // The server holds nothing of what the window drew there: the redraw is dispatched
-            // as an exposure (`platform::x11::redraw_is_exposure`).
             self.with_window(window, |window| window.shared_state_lock().exposed = true);
 
             let event = Event::WindowEvent { window_id, event: WindowEvent::RedrawRequested };
@@ -1155,16 +993,6 @@ impl EventProcessor {
 
         let keycode = xev.keycode as _;
 
-        // Update state to track key repeats and determine whether this key was a repeat.
-        //
-        // Note, when a key is held before focusing on this window the first
-        // (non-synthetic) event will not be flagged as a repeat (also note that the
-        // synthetic press event that is generated before this when the window gains focus
-        // will also not be flagged as a repeat).
-        //
-        // Only keys that can repeat should change the held_key_press state since a
-        // continuously held repeatable key may continue repeating after the press of a
-        // non-repeatable key.
         let key_repeats =
             self.xkb_context.keymap_mut().map(|k| k.key_repeats(keycode)).unwrap_or(false);
         let repeat = if key_repeats {
@@ -1174,8 +1002,6 @@ impl EventProcessor {
                 self.held_key_press = Some(keycode);
                 is_latest_held
             } else {
-                // Check that the released key is the latest repeatable key that has been
-                // pressed, since repeats will continue for the latest key press if a
                 // different previously pressed key is released.
                 if is_latest_held {
                     self.held_key_press = None;
@@ -1186,21 +1012,15 @@ impl EventProcessor {
             false
         };
 
-        // NOTE: When the modifier was captured by the XFilterEvents the modifiers for the modifier
-        // itself are out of sync due to XkbState being delivered before XKeyEvent, since it's
-        // being replayed by the XIM, thus we should replay ourselves.
         let replay = if let Some(position) =
             self.xfiltered_modifiers.iter().rev().position(|&s| s == xev.keycode as u8)
         {
-            // We don't have to replay modifiers pressed before the current event if some events
-            // were not forwarded to us, since their state is irrelevant.
             self.xfiltered_modifiers.resize(self.xfiltered_modifiers.len() - 1 - position, 0);
             true
         } else {
             false
         };
 
-        // Always update the modifiers when we're not replaying.
         if !replay {
             self.update_mods_from_core_event(window_id, xev.state as u16, &mut callback);
         }
@@ -1217,15 +1037,12 @@ impl EventProcessor {
                     window_id,
                     event: WindowEvent::KeyboardInput { device_id, event, is_synthetic: false },
                 };
-                // aterm: publish the server timestamp for exactly this dispatch
-                // (`crate::platform::x11::key_event_server_time`).
                 let target = &self.target;
                 crate::platform::x11::dispatch_with_key_event_server_time(xev.time as u32, || {
                     callback(target, event)
                 });
             }
 
-            // Restore the client's modifiers state after replay.
             if replay {
                 self.send_modifiers(window_id, self.modifiers.get(), true, &mut callback);
             }
@@ -1271,8 +1088,6 @@ impl EventProcessor {
         let wt = Self::window_target(&self.target);
         let xcb = wt.xconn.xcb_connection().as_raw().as_ptr();
 
-        // Use synthetic state since we're replaying the modifier. The user modifier state
-        // will be restored later.
         let mut xkb_state = match XkbState::new_x11(xcb, keymap) {
             Some(xkb_state) => xkb_state,
             None => return,
@@ -1299,7 +1114,6 @@ impl EventProcessor {
         let window_id = mkwid(event.event as xproto::Window);
         let device_id = mkdid(event.deviceid as xinput::DeviceId);
 
-        // Deliver multi-touch events instead of emulated mouse events.
         if (event.flags & XI_POINTER_EMULATED) != 0 {
             return;
         }
@@ -1313,15 +1127,6 @@ impl EventProcessor {
 
             BUTTON3 => WindowEvent::MouseInput { device_id, state, button: MouseButton::Right },
 
-            // Suppress emulated scroll wheel clicks, since we handle the real motion events for
-            // those. In practice, even clicky scroll wheels appear to be reported by
-            // evdev (and XInput2 in turn) as axis motion, so we don't otherwise
-            // special-case these button presses.
-            //
-            // LOCAL PATCH (aterm): a wheel button that is NOT emulated (a source
-            // with no scroll valuator: XTEST, so xdotool, x11vnc, Barrier/Input
-            // Leap/Synergy) sends a press AND a release per notch, and both reach
-            // here; one notch is one step, so the release is dropped.
             4..=7 if state == ElementState::Released => return,
             4..=7 => WindowEvent::MouseWheel {
                 device_id,
@@ -1370,7 +1175,6 @@ impl EventProcessor {
             return;
         }
 
-        // More gymnastics, for self.devices
         let mask = unsafe {
             slice::from_raw_parts(event.valuators.mask, event.valuators.mask_len as usize)
         };
@@ -1389,14 +1193,11 @@ impl EventProcessor {
 
             let x = unsafe { *value };
 
-            // A scroll axis scrolls; another axis's motion (upstream's `AxisMotion`, which
-            // aterm ignores) is not reported (WC.8).
             if let Some(&mut (_, ref mut info)) =
                 physical_device.scroll_axes.iter_mut().find(|&&mut (axis, _)| axis == i as _)
             {
                 let delta = (x - info.position) / info.increment;
                 info.position = x;
-                // X11 vertical scroll coordinates are opposite to winit's
                 let delta = match info.orientation {
                     ScrollOrientation::Horizontal => {
                         MouseScrollDelta::LineDelta(-delta as f32, 0.0)
@@ -1429,8 +1230,6 @@ impl EventProcessor {
         if let Some(all_info) = DeviceInfo::get(&wt.xconn, super::ALL_DEVICES.into()) {
             let mut devices = self.devices.borrow_mut();
             for device_info in all_info.iter() {
-                // The second expression is need for resetting to work correctly on i3, and
-                // presumably some other WMs. On those, `XI_Enter` doesn't include the physical
                 // device ID, so both `sourceid` and `deviceid` are the virtual device.
                 if device_info.deviceid == event.sourceid
                     || device_info.attachment == event.sourceid
@@ -1464,8 +1263,6 @@ impl EventProcessor {
     {
         let window = event.event as xproto::Window;
 
-        // Leave, FocusIn, and FocusOut can be received by a window that's already
-        // been destroyed, which the user presumably doesn't want to deal with.
         if self.window_exists(window) {
             let event = Event::WindowEvent {
                 window_id: mkwid(window),
@@ -1484,7 +1281,6 @@ impl EventProcessor {
         let wt = Self::window_target(&self.target);
         let window = xev.event as xproto::Window;
 
-        // A keyboard grab's end gives back the focus a grab took, which this window kept.
         if is_grab_focus_change(xev.mode) {
             return;
         }
@@ -1510,7 +1306,6 @@ impl EventProcessor {
         let event = Event::WindowEvent { window_id, event: WindowEvent::Focused(true) };
         callback(&self.target, event);
 
-        // Issue key press events for all pressed keys
         Self::handle_pressed_keys(
             &self.target,
             window_id,
@@ -1521,8 +1316,6 @@ impl EventProcessor {
 
         self.update_mods_from_query(window_id, &mut callback);
 
-        // The deviceid for this event is for a keyboard instead of a pointer,
-        // so we have to do a little extra work.
         let pointer_id = self
             .devices
             .borrow()
@@ -1547,8 +1340,6 @@ impl EventProcessor {
         let wt = Self::window_target(&self.target);
         let window = xev.event as xproto::Window;
 
-        // A keyboard grab (a window manager's shortcut, a media key) takes the keyboard for a
-        // moment and leaves the focus where it was: not a focus change, as xterm treats it.
         if is_grab_focus_change(xev.mode) {
             return;
         }
@@ -1563,10 +1354,6 @@ impl EventProcessor {
                 .or_report(&wt.xconn, "Failed to unfocus input context");
         }
 
-        // The input context's focus loss ends its composition, and the input method need not
-        // say so: IBus ends one on a focus loss without a preedit-done. Left open, the window's
-        // arrows, Home, End and function keys would stay dead once it has the focus again,
-        // until its next preedit. The application drops its preedit too.
         if self.end_composition(window) {
             let event = WindowEvent::Ime(Ime::Preedit(String::new(), None));
             callback(&self.target, Event::WindowEvent { window_id: mkwid(window), event });
@@ -1575,14 +1362,12 @@ impl EventProcessor {
         if self.active_window.take() == Some(window) {
             let window_id = mkwid(window);
 
-            // Clear the modifiers when unfocusing the window.
             if let Some(xkb_state) = self.xkb_context.state_mut() {
                 xkb_state.update_modifiers(0, 0, 0, 0, 0, 0);
                 let mods = xkb_state.modifiers();
                 self.send_modifiers(window_id, mods.into(), true, &mut callback);
             }
 
-            // Issue key release events for all pressed keys
             Self::handle_pressed_keys(
                 &self.target,
                 window_id,
@@ -1591,8 +1376,6 @@ impl EventProcessor {
                 &mut callback,
             );
 
-            // Clear this so detecting key repeats is consistently handled when the
-            // window regains focus.
             self.held_key_press = None;
 
             if let Some(window) = self.with_window(window, Arc::clone) {
@@ -1618,8 +1401,6 @@ impl EventProcessor {
             let id = xev.detail as u64;
             let location = PhysicalPosition::new(xev.event_x, xev.event_y);
 
-            // Mouse cursor position changes when touch events are received.
-            // Only the first concurrently active touch ID moves the mouse cursor.
             if is_first_touch(&mut self.first_touch, &mut self.num_touch, id, phase) {
                 let event = Event::WindowEvent {
                     window_id,
@@ -1637,7 +1418,7 @@ impl EventProcessor {
                     device_id: mkdid(xev.deviceid as xinput::DeviceId),
                     phase,
                     location,
-                    force: None, // TODO
+                    force: None,
                     id,
                 }),
             };
@@ -1646,7 +1427,6 @@ impl EventProcessor {
     }
 
     /// A device came or went: its scroll axes are read, or forgotten. (WC.8: the
-    /// `DeviceEvent::Added`/`Removed` upstream reported no aterm crate reads.)
     fn xinput2_hierarchy_changed(&mut self, xev: &XIHierarchyEvent) {
         let infos = unsafe { slice::from_raw_parts(xev.info, xev.num_info as usize) };
         for info in infos {
@@ -1754,8 +1534,6 @@ impl EventProcessor {
                 group.locked as u32,
             );
 
-            // NOTE: we use active window since generally sub windows don't have keyboard input,
-            // and winit assumes that unfocused window doesn't have modifiers.
             let window_id = match self.active_window.map(super::mkwid) {
                 Some(window_id) => window_id,
                 None => return,
@@ -1814,11 +1592,9 @@ impl EventProcessor {
             None => return,
         };
 
-        // NOTE: this is inspired by Qt impl.
         let mut depressed = xkb_state.depressed_modifiers() & xkb_mask;
         let latched = xkb_state.latched_modifiers() & xkb_mask;
         let locked = xkb_state.locked_modifiers() & xkb_mask;
-        // Set modifiers in depressed if they don't appear in any of the final masks.
         depressed |= !(depressed | latched | locked) & xkb_mask;
 
         xkb_state.update_modifiers(
@@ -1834,7 +1610,6 @@ impl EventProcessor {
         self.send_modifiers(window_id, mods.into(), false, &mut callback);
     }
 
-    // Bits 13 and 14 report the state keyboard group.
     pub fn core_keyboard_group(state: u16) -> u32 {
         ((state >> 13) & 3) as u32
     }
@@ -1845,7 +1620,6 @@ impl EventProcessor {
             None => return 0,
         };
 
-        // Build the XKB modifiers from the regular state.
         let mut depressed = 0u32;
         if let Some(shift) = mods_indices.shift.filter(|_| state & mod_mask::SHIFT != 0) {
             depressed |= 1 << shift;
@@ -1876,9 +1650,6 @@ impl EventProcessor {
     }
 
     /// Send modifiers for the active window.
-    ///
-    /// The event won't be sent when the `modifiers` match the previously `sent` modifiers value,
-    /// unless `force` is passed. The `force` should be passed when the active window changes.
     fn send_modifiers<T: 'static, F: FnMut(&RootAEL, Event<T>)>(
         &self,
         window_id: crate::window::WindowId,
@@ -1886,7 +1657,6 @@ impl EventProcessor {
         force: bool,
         callback: &mut F,
     ) {
-        // NOTE: Always update the modifiers to account for case when they've changed
         // and forced was `true`.
         if self.modifiers.replace(modifiers) != modifiers || force {
             let event = Event::WindowEvent {
@@ -1908,7 +1678,6 @@ impl EventProcessor {
     {
         let device_id = mkdid(util::VIRTUAL_CORE_KEYBOARD);
 
-        // Update modifiers state and emit key events based on which keys are currently pressed.
         let window_target = Self::window_target(target);
         let xcb = window_target.xconn.xcb_connection().as_raw().as_ptr();
 
@@ -1917,7 +1686,6 @@ impl EventProcessor {
             None => return,
         };
 
-        // Send the keys using the synthetic state to not alter the main state.
         let mut xkb_state = match XkbState::new_x11(xcb, keymap) {
             Some(xkb_state) => xkb_state,
             None => return,
@@ -1945,15 +1713,12 @@ impl EventProcessor {
     {
         let wt = Self::window_target(&self.target);
         wt.xconn.reload_database().or_report(&wt.xconn, "failed to reload Xft database");
-        // The pointer cursor's theme or size changed (GNOME's Large Cursor): each window's
-        // cursor is loaded anew.
         if wt.xconn.follow_cursor_settings() {
             for window in wt.windows.borrow().values().filter_map(|w| w.upgrade()) {
                 window.reload_cursor();
             }
         }
 
-        // In the future, it would be quite easy to emit monitor hotplug events.
         let prev_list = {
             let prev_list = wt.xconn.invalidate_cached_monitor_list();
             match prev_list {
@@ -1968,9 +1733,6 @@ impl EventProcessor {
             return;
         };
         for new_monitor in new_list {
-            // Previous list may be empty, in case of disconnecting and
-            // reconnecting the only one monitor. We still need to emit events in
-            // this case.
             let maybe_prev_scale_factor = prev_list
                 .iter()
                 .find(|prev_monitor| prev_monitor.name == new_monitor.name)
@@ -2012,17 +1774,11 @@ fn is_first_touch(first: &mut Option<u64>, num: &mut u32, id: u64, phase: TouchP
 
 /// The `i`th of a format-32 client message's five values.
 fn client_long(xev: &XClientMessageEvent, i: usize) -> c_long {
-    // SAFETY: every member of the data union is plain bytes; a format-32 message's are
-    // five longs, and any other format's are read as Xlib would.
+    // SAFETY: every member of the data union is plain bytes.
     unsafe { xev.data.l[i] }
 }
 
 /// Whether an XI2 focus event's `mode` is a keyboard grab's start or end (`XINotifyGrab`,
-/// `XINotifyUngrab`, `XINotifyPassiveGrab`, `XINotifyPassiveUngrab`). On X11 every shortcut a
-/// window manager holds (Super+Space, Alt+Tab, each step of a volume knob) grabs the keyboard
-/// while its key is down, and the focused window gets FocusOut and then FocusIn, though the focus
-/// never moved. A focus that moves while the keyboard is grabbed (`XINotifyWhileGrabbed`, an
-/// Alt+Tab to another window) is a real change, as `XINotifyNormal` is.
 fn is_grab_focus_change(mode: c_int) -> bool {
     /// XI2 focus modes (XI2.h).
     const GRAB: c_int = 1;

@@ -1,25 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE HOLD IN THE WINDOW (`docs/DESIGN-harness-autopilot-2026-10-15.md`
-//! §12.3.1, §12.3.3 item 3, §12.3.6): why Land still holds, as
-//! the window says it. The loop's hold (`LandHeld`, told through the host's
-//! hook onto the session's timeline, then a `HarnessFact::LandHeld` wake that
-//! carries nothing) goes onto the glass with its `since` stamped once
-//! ([`HeldGlass`]), and ONE function words it in five forms
-//! ([`hold_words`]): the chip's title (W4 wires it), the SESSIONS state
-//! line, the tab's hover and the Overview, the menu bar's landing worker's
-//! tip, and the accessibility sentence (W4 wires it). It is shown only while
-//! the chip wears `⤓ land` ([`App::shown_hold`]); a person's own exchange and
-//! a proven self-claim take a standing hold down; `status` prints
-//! `land_held= land_nudges= land_since=` after `pause=` only where this
-//! host holds the claim under Land.
-//!
-//! Surfaces are read as their readers read them: the hover as the strip was
-//! last stamped with it (`work_counts::last_tooltips_pushed`), the menu as
-//! `chrome` prints it (`menu_lines`), the page as its projection says it,
-//! `status` by key. Each test names its NEGATIVE CONTROL: the mutant it was
-//! run against, and what failed.
+//! Tests for window landing-hold display ([`HeldGlass`], [`hold_words`], [`App::shown_hold`]).
 
 use std::sync::Arc;
 
@@ -46,7 +28,6 @@ fn at_1402(day: i64) -> Option<Stamp> {
 }
 
 /// The hold §12.3.1 reads: a land act's yield, read, held by a need, two
-/// unpushed commits and two open words, three nudges since the act.
 pub(crate) fn held() -> LandHeld {
     LandHeld {
         since_ms: Some(SINCE_S * 1000),
@@ -65,7 +46,6 @@ pub(crate) fn held() -> LandHeld {
 }
 
 /// The same hold before any yield was read: Land's instruction typed,
-/// nothing judged since.
 pub(crate) fn unread() -> LandHeld {
     LandHeld {
         read: false,
@@ -85,31 +65,16 @@ pub(crate) fn glass(held: LandHeld, day: i64) -> HeldGlass {
 }
 
 /// The need a hold's first leg names, as the needs store holds it: a
-/// worker's words with the separators a title cuts at.
 pub(crate) fn ask() -> crate::needs::HarnessAsk {
     crate::needs::HarnessAsk {
         first: "sign 0.48.0 \u{b7} the release credential \u{2014} on this Mac".to_string(),
         more: 1,
-        // Counted, unread: the entry's parse (`HarnessAsk::of`).
         others: Vec::new(),
         program: aterm_phase::Program::Claude,
     }
 }
 
 /// A HOLD'S WORDS, FIVE FORMS FROM ONE FUNCTION (§12.3.1): the state line
-/// `not landed yet: needs you: <need> (+1 more); 2 unpushed commits; open
-/// work in its report: follow-up, not pushed · landing since 14:02 · 3
-/// nudges`; the title the same legs, title-safe (the need's own ` · ` and
-/// ` — ` read `, `, so a title's cut marks are its own), its clock and
-/// nudges after one ` · `; the hover `not landed yet, needs you; …` (no
-/// clock, the need by `needs you` alone: its own lines stand above); the
-/// tip the hover's legs and the nudges; the spoken form one sentence a leg,
-/// letters, digits, spaces and `.:,` alone. Another day names its weekday
-/// (`Fri 14:02`, `Friday at 14:02`). Before a yield is read, only the clock
-/// part: no hover words (main's `land`), the tip only the nudges. The
-/// repository's counts are each said only where not zero. NEGATIVE CONTROLS
-/// (as run): the title form without `title_safe` gives the title three
-/// ` · ` parts; the spoken form without `speakable` keeps `·` and `—`.
 #[test]
 fn a_holds_words_come_in_five_forms_from_one_function() {
     let hold = glass(held(), TODAY);
@@ -163,8 +128,6 @@ fn a_holds_words_come_in_five_forms_from_one_function() {
         spoken.ends_with(" Landing since 14:02, 3 nudges."),
         "{spoken}"
     );
-    // Nothing in the title's, the hover's or the tip's legs reads as another
-    // part of its line (the line keeps the worker's own words whole).
     for form in [HoldForm::Title, HoldForm::Hover, HoldForm::Tip] {
         let said = words(form).expect("said");
         for foreign in [" \u{2014} ", " \u{b7} last: ", "pausing until"] {
@@ -172,7 +135,6 @@ fn a_holds_words_come_in_five_forms_from_one_function() {
         }
     }
 
-    // Another day names its weekday; spoken, spelled out.
     let before = glass(held(), TODAY - 6);
     let day = crate::claude_lights::Weekday::of_days(TODAY - 6);
     let line = hold_words(&before, Some(&need), HoldForm::Line, Some(TODAY)).expect("a line");
@@ -192,7 +154,6 @@ fn a_holds_words_come_in_five_forms_from_one_function() {
         "{spoken}"
     );
 
-    // Before a yield is read: only the clock part.
     let fresh = glass(unread(), TODAY);
     let said = |form| hold_words(&fresh, Some(&need), form, Some(TODAY));
     assert_eq!(
@@ -222,8 +183,6 @@ fn a_holds_words_come_in_five_forms_from_one_function() {
     );
     assert_eq!(hold_words(&quiet, None, HoldForm::Tip, Some(TODAY)), None);
 
-    // Each count only where not zero, the need named earlier where the
-    // store holds none, every leg in the owner's order.
     let every = glass(
         LandHeld {
             legs: HoldLeg::ALL.iter().fold(0, |bits, leg| bits | leg.bit()),
@@ -249,17 +208,6 @@ fn a_holds_words_come_in_five_forms_from_one_function() {
 }
 
 /// THE OPEN LEG NAMES WHAT THE NUDGE NAMED, NEVER AS A QUOTE (§12.3.5,
-/// the review of 3c): every word Land's strict reading can name open — a
-/// spelling it matched (`follow-up`), its own word for a kind of line
-/// (`unchecked box`, `%`, `#n`, `a question`) or a family's word for its
-/// rows (`a part`, `local`) — reads `open work in its report: <word>` in the
-/// title, the line, the hover and the tip, as the nudge's suffix named it,
-/// with no quotation marks around it (a description is no word of the
-/// report, and a spelling may be either); spoken, `Open work in its report:
-/// <word said>.` with something said for every word (`%` `percent`, `#n`
-/// `number n`). NEGATIVE CONTROLS (as run): the open leg quoting each word
-/// (`“unchecked box” in its report`) fails the first assertion on the first
-/// word; `speakable` dropping `%` says `Open work in its report.` for it.
 #[test]
 fn the_open_leg_names_what_the_nudge_named_never_as_a_quote() {
     use aterm_agent::supervise::policy::turn_end::open_word_at;
@@ -305,11 +253,6 @@ fn the_open_leg_names_what_the_nudge_named_never_as_a_quote() {
 }
 
 /// THE GLASS STAMPS A HOLD'S `since` ONCE (§12.3.3 item 3): a hold told
-/// again as it stands is no move (nothing redrawn, the trail's generation
-/// kept); a nudge moves it and keeps the clock it was stamped with; a new
-/// `since` is stamped again; `None` takes it down. NEGATIVE CONTROL (as
-/// run): `on_land_held` without its compare (every tell a move) reports the
-/// hold told again as a move.
 #[test]
 fn the_glass_stamps_a_holds_since_once() {
     let mut app = App::headless_for_test();
@@ -319,7 +262,6 @@ fn the_glass_stamps_a_holds_since_once() {
     assert!(stamped.is_some(), "stamped where it arrived");
     assert!(!on_land_held(&mut app, 0, Some(held())), "told again");
     assert_eq!(app.harness_glass[&0].trail_gen(), first.trail_gen());
-    // A nudge: moved, the clock kept as it was stamped.
     let nudged = LandHeld {
         nudges: 4,
         ..held()
@@ -335,7 +277,6 @@ fn the_glass_stamps_a_holds_since_once() {
     assert!(on_land_held(&mut app, 0, Some(nudged)));
     assert_ne!(app.harness_glass[&0].trail_gen(), first.trail_gen());
     assert_eq!(app.harness_glass[&0].hold().expect("held").since, stamped);
-    // A new hold's since is read again.
     let later = LandHeld {
         since_ms: Some((SINCE_S + 3_600) * 1000),
         ..held()
@@ -354,7 +295,6 @@ fn the_glass_stamps_a_holds_since_once() {
 }
 
 /// A SESSIONS row under `view`, its glass `glass`, its need `need`, its hold
-/// `hold`, published on [`TODAY`].
 fn row(
     view: crate::autopilot::AutopilotView,
     glass: ChipGlass,
@@ -380,13 +320,6 @@ fn row(
 }
 
 /// THE STATE LINE SAYS WHY LAND HOLDS (§12.3.1, §12.3.6's
-/// `state_line_says_why_land_holds`): under `⤓ land`, after a yield that did
-/// not land, `not landed yet: …; … · landing since 14:02 · 3 nudges ·
-/// pausing until 18:41 (3 short turns in a row)` — the need said once, in
-/// the hold's legs, where the hold names it; before a yield, the need's own
-/// head and `landing since 14:02 · 3 nudges`. Under Cruise, at a landing and
-/// at a person's own exchange the hold says nothing. NEGATIVE CONTROL (as
-/// run): main's Land arm (no line of its own) says only the pause.
 #[test]
 fn state_line_says_why_land_holds() {
     use crate::autopilot::AutopilotView;
@@ -417,7 +350,6 @@ fn state_line_says_why_land_holds() {
             .as_str()
         )
     );
-    // Before a yield: the need heads, the hold's clock follows.
     assert_eq!(
         row(
             AutopilotView::Land,
@@ -445,7 +377,6 @@ fn state_line_says_why_land_holds() {
              in its report: follow-up, not pushed \u{b7} landing since 14:02 \u{b7} 3 nudges"
         )
     );
-    // No hold beside another face.
     assert_eq!(
         row(AutopilotView::Cruise, pausing, None, hold)
             .state_line()
@@ -476,8 +407,6 @@ fn state_line_says_why_land_holds() {
 }
 
 /// The Settings ▸ Harness fixture with landings, its landing session held:
-/// every leg, each count and nudges, so the state line is as tall as a hold
-/// makes it (the narrow sweeps read it at 22 to 42 columns, 1× and 2×).
 pub(crate) fn held_session(session: &mut crate::harness_screen::HarnessSession) {
     session.hold = Some(glass(
         LandHeld {
@@ -502,8 +431,6 @@ impl Drop for TestHost {
 }
 
 /// An App whose session 0 runs Claude Code under its own word `word`,
-/// claimed by this host, in window 0's first tab, a second tab in front,
-/// its task open. Its sid, and the host.
 fn desk(word: &str) -> (App, String, TestHost) {
     let mut app = App::headless_for_test();
     let host = TestHost(crate::harness_host::HostHandle::for_supervised_test(
@@ -537,8 +464,6 @@ fn desk(word: &str) -> (App, String, TestHost) {
 }
 
 /// Session `sid`'s loop tells `held` as the host does: stored on the
-/// timeline by the live hook (`harness_host::store_land_held`), then the
-/// wake that carries nothing, applied where it moved.
 fn tell_hold(app: &mut App, sid: &str, held: Option<LandHeld>) {
     if crate::harness_host::store_land_held(&app.store, sid, held) {
         app.apply_harness_fact(sid, crate::HarnessFact::LandHeld);
@@ -593,12 +518,6 @@ const WHY: &str = "driven by aterm (land: not landed yet, needs you; 2 unpushed 
                    work in its report: follow-up, not pushed)";
 
 /// WHO DRIVES SAYS WHY A LANDING HOLDS (§12.3.1, §12.3.6): under `⤓ land`
-/// the tab's hover says `driven by aterm (land)` until a yield is read, then
-/// `driven by aterm (land: not landed yet, needs you; 2 unpushed commits;
-/// open work in its report: follow-up, not pushed)` — no clock (the hover is read
-/// long after its push) — and `(land)` again where the loop takes the hold
-/// down. NEGATIVE CONTROL (as run): `driven_words` ignoring the hold
-/// (main's `land`) fails the second assertion.
 #[test]
 fn who_drives_says_why_a_landing_holds() {
     let (mut app, sid, _host) = desk("land");
@@ -617,16 +536,6 @@ fn who_drives_says_why_a_landing_holds() {
 }
 
 /// THE HOVER FOLLOWS THE HOLD AND THE FACE (§12.3.6's
-/// `the_hover_follows_the_hold_and_the_face`, 3c's half): the hold's wake
-/// alone — no face moved, no footer posted — stamps the strip again, so the
-/// pushed hover says why; a nudge that moves no hover words stamps nothing
-/// new; the landing stamps `(land, landed)` and the hold is not said beside
-/// it. A headless `chrome` prints the hover as pushed beside the one
-/// composed at the read (`pushed_tooltips=`), which a lab reads. NEGATIVE
-/// CONTROLS (as run): `show_land_held` dirtying the menu alone (no
-/// `restamp_for_hover`) leaves the pushed hover at `driven by aterm
-/// (land)`; `refresh_window_tabs` not keeping what it pushed leaves
-/// `chrome`'s `pushed_tooltips=[]`.
 #[test]
 fn the_hover_follows_the_hold_and_the_face() {
     let (mut app, sid, _host) = desk("land");
@@ -655,14 +564,6 @@ fn the_hover_follows_the_hold_and_the_face() {
 }
 
 /// A NUDGE THE HOVER DOES NOT SAY STILL REACHES THE MENU AND THE OVERVIEW
-/// (§12.3.1, the review of 3c): the hover's words carry no nudges, so a hold
-/// that moves only by a nudge stamps no strip; the menu bar's landing tip
-/// and the Overview's held line say the nudges, and both are composed where
-/// the glance is rebuilt, so the move owes a rebuild all the same, and the
-/// rebuilt words count the new nudge. NEGATIVE CONTROL (as run):
-/// `show_land_held` without its `mark_status_dirty` (where the hover's words
-/// stand) owes no rebuild, and the tip keeps `3 nudges` until something
-/// unrelated dirties the glance.
 #[test]
 fn a_nudge_the_hover_does_not_say_still_rebuilds_the_glance() {
     let (mut app, sid, _host) = desk("land");
@@ -694,12 +595,6 @@ fn a_nudge_the_hover_does_not_say_still_rebuilds_the_glance() {
 }
 
 /// A HOLD IS SHOWN ONLY WHILE THE WORD IS LAND (§12.3.10, 3b's contract):
-/// the window owns the word, so a switch to Cruise hides a standing hold at
-/// once — the hover says `(cruise)`, `status` prints the three `-`, the
-/// worker row is no landing — though the loop tells `None` only at its next
-/// read; switched back, the hold the glass kept shows again. NEGATIVE
-/// CONTROL (as run): `shown_hold` without its face gate keeps the hold under
-/// Cruise.
 #[test]
 fn a_hold_is_shown_only_while_the_word_is_land() {
     let (mut app, sid, _host) = desk("land");
@@ -734,10 +629,6 @@ fn on_timeline(app: &App) -> Option<LandHeld> {
 }
 
 /// A PERSON'S OWN EXCHANGE CLEARS THE HOLD (§12.3.3 item 3, §12.3.5): at
-/// `task=theirs` the hold goes from the glass and the timeline alike,
-/// whichever of the two facts the loop's point tells first. NEGATIVE
-/// CONTROL (as run): the Task arm without its clear at Theirs keeps the hold
-/// on the glass and the timeline.
 #[test]
 fn a_persons_own_exchange_clears_the_hold() {
     let (mut app, sid, _host) = desk("land");
@@ -771,14 +662,6 @@ fn prove_self_claim(app: &App) {
 }
 
 /// A PROVEN SELF-CLAIM CLEARS A STANDING HOLD (§12.3.3 item 3, Autopilot Land
-/// §10.4): beside a proven self-claim the hosted loop's hold is not the
-/// session's. A hold standing as the proof arrives goes at the hosted
-/// loop's next hold fact, which shows none, at its next task face, which
-/// moves nothing beside the proof, and at the self-claim's own first act.
-/// NEGATIVE CONTROLS (as run): a LandHeld arm that only skips beside the
-/// proof (as the Task arm skips the face) leaves the old legs on the glass
-/// and the timeline; the Task arm without its clear beside the proof does
-/// too; the SelfTask arm without its clear does too.
 #[test]
 fn a_proven_self_claim_clears_a_standing_hold() {
     let (mut app, sid, _host) = desk("land");
@@ -792,7 +675,6 @@ fn a_proven_self_claim_clears_a_standing_hold() {
     assert_eq!(app.harness_glass[&0].hold(), None, "never shown beside it");
     assert_eq!(on_timeline(&app), None, "nor kept for `status`");
 
-    // The hosted loop's next face, beside the proof: skipped, the hold gone.
     let (mut app, sid, _host) = desk("land");
     tell_hold(&mut app, &sid, Some(held()));
     prove_self_claim(&app);
@@ -803,7 +685,6 @@ fn a_proven_self_claim_clears_a_standing_hold() {
     let (mut app, sid, _host) = desk("land");
     tell_hold(&mut app, &sid, Some(held()));
     prove_self_claim(&app);
-    // The act's face is queued where its row commits; the wake is a bell.
     app.pool
         .get(0)
         .expect("0")
@@ -818,13 +699,6 @@ fn a_proven_self_claim_clears_a_standing_hold() {
 }
 
 /// `status` PRINTS WHY LAND HOLDS, BY KEY, ONLY WHERE CLAIMED HERE (§12.3.1,
-/// §12.6): `land_held=- land_nudges=- land_since=-` with no hold; before a
-/// yield is read `land_held=-` beside the nudges and the act's second; after
-/// one `land_held=needs,repo,open land_nudges=3 land_since=<s>`; all three
-/// `-` once this host's claim is gone, under another process's claim, and
-/// at the landing. `pause=` reads by key as before. NEGATIVE CONTROL (as
-/// run): `land_fields` over the timeline's hold whatever the claim and the
-/// word prints `land_held=needs,repo,open` with the claim released.
 #[test]
 fn status_prints_land_fields_only_where_claimed_here() {
     let (mut app, sid, _host) = desk("land");
@@ -863,16 +737,6 @@ fn status_prints_land_fields_only_where_claimed_here() {
 }
 
 /// A WORKER READS `landing` ONLY AFTER ITS INSTRUCTION (§12.4.3 item 1,
-/// §12.4.6; its tip §12.3.1): a worker whose session is landing reads `●
-/// bench — landing 4m` (the task's age, as `working`'s), its tip the hold's
-/// words with no clock; one not landing reads `working 4m`; its manager
-/// counts `1 landing, 1 working`. The App fills the row from the hold it
-/// shows: under Land with no hold (its first working turn) no landing, with
-/// one a landing (and under Cruise none: `a_hold_is_shown_only_while_the_
-/// word_is_land`). NEGATIVE CONTROLS (as run): `WorkerRow::word` without its
-/// landing arm prints `● bench — working 4m` and `2 working`; a row's
-/// `landing` made from the view and the open face alone is a landing
-/// before the instruction.
 #[test]
 fn a_worker_reads_landing_only_after_its_instruction() {
     use crate::status_item::{Glance, SessionRow, TaskRow, compose_status_menu, menu_lines};
@@ -935,7 +799,6 @@ fn a_worker_reads_landing_only_after_its_instruction() {
         "{lines:#?}"
     );
 
-    // The App fills the row from the hold it shows, no clock in the tip.
     let (mut app, sid, _host) = desk("land");
     let handle = app.store.read().unwrap().by_local(0).cloned().expect("0");
     let row = app.status_session_row(&handle);
@@ -953,9 +816,6 @@ fn a_worker_reads_landing_only_after_its_instruction() {
 }
 
 /// THE PAGE SAYS IT AS THE HOLD MOVES (§12.3.1): Settings ▸ Harness open,
-/// the hold's wake alone republishes it, and its SESSIONS row's state line
-/// says why Land holds. NEGATIVE CONTROL (as run): `show_land_held` without
-/// `harness_screen_moved` leaves the line without the hold.
 #[test]
 fn the_page_says_why_as_the_hold_moves() {
     let (mut app, sid, _host) = desk("land");
@@ -989,8 +849,6 @@ fn the_page_says_why_as_the_hold_moves() {
 }
 
 /// A GONE SESSION'S HOLD GOES WITH ITS GLASS (§12.3.3 item 3): the hold is
-/// on the session's glass, and a retired session's glass goes. NEGATIVE
-/// CONTROL (as run): the retire without `forget_harness_glass` keeps it.
 #[test]
 fn a_gone_sessions_hold_goes_with_its_glass() {
     let (mut app, _sid, _host) = desk("land");
@@ -1004,10 +862,6 @@ fn a_gone_sessions_hold_goes_with_its_glass() {
 }
 
 /// A LAND HOLD DOES NOT GROW THE WAKE (§12.3.3 item 3): its fact carries
-/// nothing, so `HarnessFact` stays main's 24 bytes and `Wake` does not grow
-/// beyond the recorded main size. Unrelated field removals may shrink it.
-/// NEGATIVE CONTROL (as run): a fact carrying the hold inline
-/// (`LandHeld(Option<LandHeld>)`) grows `HarnessFact` to 40 bytes.
 #[test]
 fn a_land_hold_does_not_grow_the_wake() {
     /// `size_of::<HarnessFact>()` on main at 7607bb9d70.

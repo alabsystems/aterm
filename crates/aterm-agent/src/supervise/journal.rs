@@ -1,12 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The supervising loop's own record of what it decided
-//! ([`super::SuperviseOpts::journal`], the file its window host names), one JSON object per
-//! line, which `aterm drive ledger` replays.
-//!
-//! Every line the loop prints is journaled as printed, and so is every journal-only line it
-//! decides silently, as
+//! Supervisor decision journal ([`super::SuperviseOpts::journal`], [`JournalRecord::of_line`],
+//! [`NEEDS`]):
 //!
 //! ```text
 //! {"t":<unix ms>,"sid":"<sid>"|null,
@@ -19,92 +15,33 @@
 //!  "line":"<the exact line>","turn":<id>|null,"report":<id>|null[,"mark":"<16 hex>"]
 //!  [,"ended":<unix ms>]}
 //! ```
-//!
-//! read from the line itself ([`JournalRecord::of_line`]), so record and line cannot disagree.
-//! An `EVENT`'s phase is its second word; a policy line's is its `rule=<id>` where it names
-//! one. `complete`, `rows`, `turn` and `report` are an older build's, read back from its
-//! journals and written `null` now: the `complete=<0|1> rows=<n>` of a removed `watch
-//! --report`, with the ledger turn its report was counted from, and the inbox row id of the
-//! report a removed `watch --mail` folded into an `EVENT turn` line; a `MAIL …` line is `kind`
-//! `mail`, its words the summary. `mark`, on a review point's `EVENT` alone and only where the
-//! worker's last words were read there, is their mark (`policy::turn_end::said_mark`): what
-//! the next loop compares a landing's point with (`run.rs`'s `ended_before`), never printed.
-//! `ended`, on a task end's `DONE` note a restarted loop wrote for the end a loop before it
-//! noted, is when that end was first noted (unix ms), carried forward by each restatement:
-//! the time the next loop restates the end with (`ended_before`), never printed.
-//!
-//! Some lines are journal-only, never printed (`Review::note`): `ESCALATED`, `CLEARED`,
-//! `NEEDS` (the worker's NEEDS YOU put on the person's screen: [`NEEDS`]),
-//! `WAITING`, `HOLD` (where the loop typed nothing though the agent stood still, and why: a
-//! `point` decided nothing, a `background` break no host step was offered at; its door is
-//! its phase), `OCCUPANCY` (what the occupancy measures of the agent's wait, once a change:
-//! `hold open|declared|closed`, its phase the measure, `hold`; and what a built-in rule would
-//! do at a break, `rule=<id> rev=builtin episode=<hex> door=break
-//! would|held:<guard>|paced next_s=<n>|spent`, its phase the rule; `supervise::occupancy`),
-//! `UNVERIFIED`, most `SKIPPED`, `UNPROVEN` (after a full-power `APPROVED`: why no
-//! safe rule proved the box), `DIALOG` (a question decision's rows joined by ` ⏎ `),
-//! `DECLINED`, `PROBED … /usage no sample (<word>)`, and every `RESET` but `used (<n> left)`.
-//! A due usage probe not run is the printed `SKIPPED seq=<n> rule=usage-probe@v1
-//! gate=<word>[ host=<word>]` (`ProbeGate`'s words). `PROBE <sent|deferred> seq=<n> …` is an
-//! older build's limit probe, still read as `probe`.
-//!
-//! The file is opened append-only, created `0600` when missing; a failure to open or write it
-//! is said once on stderr and never stops the loop.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use super::screen::Json;
 
-// THE WORDS A READER MATCHES ON. The loop's lines below are written through
-// these consts, and `harness::stats` reads the person's waits back through
-// the same ones, so a line reworded on one side cannot leave the other
-// counting nothing.
-
-/// The line that adopts a badge a previous loop left on the session, at this
-/// loop's start (`lifecycle.rs`'s `reconcile`): `ADOPTED seq=<n>
-/// attention=<text>` — its point still shows, so the badge is this loop's
-/// from here, and no second one goes up for it. A record of kind `other`.
+/// The line that adopts a badge a previous loop left on the session, at this loop's start.
 pub const ADOPTED: &str = "ADOPTED";
 
-/// The badge a `CLEARED seq=<n> box attention=<reply>` line ended: a box's,
-/// a question's or an idle point's the loop escalated (`escalate.rs`'s
-/// `close_box`).
+/// The badge a `CLEARED seq=<n> box attention=<reply>` line ended.
 pub const CLEARED_BOX: &str = "box";
-/// … `CLEARED seq=<n> turn-end attention=<reply>`: the turn-end policy's,
-/// raised with no point to carry it (`/login` typed, a switch's note), gone
-/// once the worker works again.
+/// … `CLEARED seq=<n> turn-end attention=<reply>`.
 pub const CLEARED_TURN_END: &str = "turn-end";
-/// … `CLEARED seq=<n> goal attention=<reply>`: the note that Codex's goal
-/// runs on under a save-then-wait switch, written by older loops (the Codex
-/// harness is retired) and still read in their journals.
+/// … `CLEARED seq=<n> goal attention=<reply>`.
 pub const CLEARED_GOAL: &str = "goal";
-/// … `CLEARED seq=<n> memory attention=<reply>: …`: the memory measure's,
-/// no longer acted on.
+/// … `CLEARED seq=<n> memory attention=<reply>: …`.
 pub const CLEARED_MEMORY: &str = "memory";
-/// … `CLEARED seq=<n> stale attention=<reply> (…)`: one a previous loop left
-/// whose point is gone, unset at this loop's start.
+/// … `CLEARED seq=<n> stale attention=<reply> (…)`.
 pub const CLEARED_STALE: &str = "stale";
-/// … `CLEARED seq=- hidden attention=<reply> (…)`: one a previous loop may
-/// have left under another owner's entry, unset unread at this loop's start
-/// (its `seq=` is `-`: no read was made).
+/// … `CLEARED seq=- hidden attention=<reply> (…)`.
 pub const CLEARED_HIDDEN: &str = "hidden";
-/// The line that puts THE WORKER'S NEEDS YOU on the person's screen
-/// (`escalate.rs`'s `sync_needs`, the `needs` owner's entry): `NEEDS
-/// seq=<n> count=<k> attention=<reply> <first need, clipped>`, once a set.
-/// No escalation: nothing is handed over and nothing waits, so the
-/// harness's stats count it as told ([`crate::harness::stats`]'s
-/// `needs_told`), never as a person's wait. A record of kind `needs`.
+/// The line that puts the worker's NEEDS YOU on the person's screen.
 pub const NEEDS: &str = "NEEDS";
-/// … `CLEARED seq=<n> needs attention=<reply> <why>`: the needs entry taken
-/// down (none stands now, an Off park, the loop's end, or — one a loop
-/// before this one left — no need stands at the loop's start). No badge of the
-/// loop's escalations ([`CLEARED_BADGES`] does not hold it): it closes no
-/// person's wait.
+/// … `CLEARED seq=<n> needs attention=<reply> <why>`.
 pub const CLEARED_NEEDS: &str = "needs";
 
-/// Every word a `CLEARED` line names a badge by. A limit episode's names
-/// none: `CLEARED seq=<n> attention=<reply> <why>`.
+/// Every word a `CLEARED` line names a badge by.
 pub const CLEARED_BADGES: [&str; 6] = [
     CLEARED_BOX,
     CLEARED_TURN_END,
@@ -114,50 +51,21 @@ pub const CLEARED_BADGES: [&str; 6] = [
     CLEARED_HIDDEN,
 ];
 
-/// The `<reply>` a badge's `CLEARED` line names where the loop's entry was
-/// NOT taken down: the server keeps one entry per owner, and it now carries
-/// another of this loop's escalations (`escalate.rs`'s `unset_if_ours`) —
-/// the badge it named is over, the loop's still stands.
+/// The `<reply>` a badge's `CLEARED` line names where the loop's entry was not taken.
 pub const ATTENTION_KEPT: &str = "kept";
 
-/// The line a stall's hold writes (`stall.rs`'s `hold_for_stall`): `FROZEN
-/// seq=<n> input=<word> wait_ms=<n> bytes=<n> rss_mb=<n> attention=<reply>`.
-/// A record of kind `other`. The hold takes the loop's point badge down (the
-/// server's own entry says "frozen" over it), and no `CLEARED` line follows:
-/// its `attention=<reply>` is that unset's — [`ATTENTION_KEPT`] where the
-/// entry carries a limit's badge, which stands, and [`ATTENTION_SKIPPED`]'s
-/// `skipped: …` behind another supervisor, which touched nothing. Any other
-/// reply took the loop's entry down (or found none).
+/// The line a stall's hold writes (`stall.rs`'s `hold_for_stall`).
 pub const FROZEN: &str = "FROZEN";
 
-/// How an `ESCALATED seq=<n> attention=<reply>` line's tail begins where NO
-/// BADGE went up, with why after it: another supervisor holds the session
-/// ([`ESCALATED_BEHIND`]), or a stall was in hand and the ask was withheld
-/// (`stall.rs`). Nobody was asked by this loop.
+/// How an `ESCALATED seq=<n> attention=<reply>` line's tail begins where no badge went.
 pub const ATTENTION_SKIPPED: &str = "attention=skipped: ";
-/// Why [`ATTENTION_SKIPPED`] behind another supervisor's claim: `… another
-/// supervisor (<holder>) answers this session`.
+/// Why [`ATTENTION_SKIPPED`] behind another supervisor's claim.
 pub const ESCALATED_BEHIND: &str = "another supervisor";
-/// The `again=<why>` an `ESCALATED` line ends with where its badge is the
-/// same ask set again, no new one — the harness's stats count no second
-/// escalation. Here a limit episode's, where a retry hit the wall again
-/// before the worker answered, or the notice an Autopilot Off park took the
-/// badge off is still up after it (`run.rs`'s `open_episode`): `again=the
-/// retry hit the wall again, the episode of seq=<n>`. (A journal written
-/// before the manager's mail went says these as `mail=skipped: <why>`.)
+/// The `again=<why>` an `ESCALATED` line ends with where its badge is the same ask set again.
 pub const AGAIN_RETRY: &str = "the retry hit the wall again";
-/// The `again=<why>` of a limit episode's escalation over a badge adopted
-/// from a previous loop ([`ADOPTED`]): the same ask, set again. Only while
-/// the notice it was adopted for still stands: once the worker answers past
-/// it, a limit is a new episode, a new ask.
+/// The `again=<why>` of a limit episode's escalation over a badge adopted from a previous loop.
 pub const AGAIN_ADOPTED: &str = "adopted from a previous watcher";
-/// The `again=<why>` of the turn-end policy's badge set again as an
-/// Autopilot Off park ends (`lifecycle.rs`'s `raise_parked_badge`): the
-/// badge the park took down, up again with no second ask of its own. Most
-/// such badges no point raises again (`/login`'s); one an act's own miss
-/// raised (a text not written or left typed, a draft with no fenced Enter)
-/// may be escalated again after this line, by its act decided afresh and
-/// missing again — its own `ESCALATED` line and ask.
+/// The `again=<why>` of the turn-end policy's badge set again as an Autopilot Off park ends.
 pub const AGAIN_UNPARKED: &str = "set again after an off park";
 
 /// One journaled line.
@@ -165,14 +73,11 @@ pub const AGAIN_UNPARKED: &str = "set again after an off park";
 pub struct JournalRecord {
     /// When it was printed, Unix milliseconds.
     pub t: i64,
-    /// The session the loop watched (the `@sid` it was given, without the
-    /// `@`), `None` when it was given none.
+    /// The session the loop watched (the `@sid` it was given, without the `@`).
     pub sid: Option<String>,
-    /// The line's leading word lowercased (`RECONNECTED` is `reconnect`), `other` for a word
-    /// the reader does not know.
+    /// The line's leading word lowercased (`RECONNECTED` is `reconnect`).
     pub kind: String,
-    /// The phase the line is about (an `EVENT`'s second word, `prompt` for an `APPROVED`) or a
-    /// policy line's `rule=` id; `-` for none.
+    /// The phase the line is about (an `EVENT`'s second word, `prompt` for an `APPROVED`).
     pub phase: String,
     /// The line's `seq=`.
     pub seq: Option<u64>,
@@ -184,21 +89,13 @@ pub struct JournalRecord {
     pub summary: String,
     /// The line exactly as printed.
     pub line: String,
-    /// The ledger turn the point's report counted from.
+    /// The ledger turn the point's report counted.
     pub turn: Option<u64>,
     /// The inbox row id of the report folded into an `EVENT turn` line.
     pub report: Option<u64>,
-    /// The mark of the worker's last words at a review point
-    /// (`policy::turn_end::said_mark`), `None` on every other line and where
-    /// no words were read.
+    /// The mark of the worker's last words at a turn end (`policy::turn_end::said_mark`).
     pub mark: Option<u64>,
-    /// THE TIME THE END THIS NOTE RESTATES WAS FIRST NOTED (unix ms), on a
-    /// task end's note (`DONE …`) a restarted loop wrote for the end a loop
-    /// before it noted — a landing seeded and taken up at its first point
-    /// (`policy::turn_end::TurnEndState::restated_noted_ms`) — carried
-    /// forward by every restatement, so the end's time survives any number
-    /// of restarts and seamless updates (`run.rs`'s `ended_before`); `None`
-    /// on every other line, and on a note of an end of its own.
+    /// The time the end this note restates was first noted (unix ms).
     pub ended: Option<i64>,
 }
 
@@ -316,7 +213,6 @@ impl JournalRecord {
                     rec.seq = Some(seq);
                     tail = after;
                 }
-                // A rule's line names its rule; the hold's, its measure.
                 let (measure, after) = split_word(tail);
                 rec.phase = measure.strip_prefix("rule=").unwrap_or(measure).to_string();
                 tail = after;
@@ -337,8 +233,7 @@ impl JournalRecord {
         rec
     }
 
-    /// One JSON object, no newline, keys in the order the module doc lists
-    /// (`mark` and `ended` only where there is one).
+    /// One JSON object, no newline, keys in the order the module doc lists.
     pub fn to_json(&self) -> String {
         let opt_str = |s: &Option<String>| s.as_deref().map_or("null".to_string(), json_str);
         let opt_num = |n: Option<u64>| n.map_or("null".to_string(), |n| n.to_string());
@@ -365,8 +260,7 @@ impl JournalRecord {
         )
     }
 
-    /// Read one journal line back. `t`, `kind` and `line` are required; every
-    /// other key may be absent or `null`.
+    /// Read one journal line back.
     pub fn from_json(text: &str) -> Result<Self, String> {
         let v = Json::parse(text.trim())?;
         let s = |k: &str| v.get(k).and_then(Json::as_str).map(str::to_string);
@@ -393,10 +287,7 @@ impl JournalRecord {
     }
 }
 
-/// `s` as a quoted JSON string through the control path's one escape
-/// ([`aterm_codec::json::escape_into`]): RFC 8259's escapes, plus every other character a
-/// terminal acts on (DEL, C1, the bidi controls, U+2028/9) as `\uXXXX`, since a journal line
-/// carries a screen's rows (`DIALOG`) and a person may read the file raw.
+/// `s` as a quoted JSON string through the control path's one escape.
 pub fn json_str(s: &str) -> String {
     let mut out = String::with_capacity(s.len().saturating_add(2));
     out.push('"');
@@ -431,11 +322,7 @@ impl Journal {
         }
     }
 
-    /// A journal at `path` for a loop on `sid` that is NAMED and never
-    /// opened: [`Self::record`] returns each row it would write and writes
-    /// none, and nothing is said. What a REPLAY's loop keeps
-    /// (`supervise::tape::replay`): its rows are outputs it compares with the
-    /// recorded ones, and the directory the path names does not exist.
+    /// A journal at `path` for a loop on `sid` that is named and never opened.
     #[must_use]
     pub fn named(path: Option<&Path>, sid: Option<&str>) -> Self {
         let mut j = Self::off();
@@ -446,9 +333,7 @@ impl Journal {
         j
     }
 
-    /// Open `path` append-only (created `0600` when missing) for a loop on
-    /// `sid`; no path is no journal. A failure to open it is said once, to
-    /// `warn`, and the loop goes on without one.
+    /// Open `path` append-only (created `0600` when missing) for a loop on `sid`.
     pub fn open(path: Option<&Path>, sid: Option<&str>, warn: &mut dyn Write) -> Self {
         let mut j = Self::off();
         let Some(path) = path else {
@@ -470,20 +355,12 @@ impl Journal {
         j
     }
 
-    /// Append the record of `line` (see [`JournalRecord::of_line`]), stamped
-    /// `t_ms` (Unix milliseconds, from the caller's clock: the supervising
-    /// loop's stamp clock, `Fx::stamp_ms` behind its crate-private clock door
-    /// `supervise::fx`; [`unix_ms`] elsewhere). A write that
-    /// fails is said once, to `warn`; the next line is tried all the same.
-    /// Returns the row it wrote (its newline included) — or would have
-    /// written, to a file it could not open — for a journal it was given;
-    /// `None` with none: what a harness tape holds of the journal.
+    /// Append the record of `line` (see [`JournalRecord::of_line`]), stamped `t_ms`.
     pub fn record(&mut self, t_ms: i64, line: &str, warn: &mut dyn Write) -> Option<String> {
         self.record_marked(t_ms, line, None, warn)
     }
 
-    /// [`Self::record`] of a review point's line, with the mark of the
-    /// worker's last words there ([`JournalRecord::mark`]).
+    /// [`Self::record`] of a turn end's line, with the mark of the worker's last words.
     pub fn record_marked(
         &mut self,
         t_ms: i64,
@@ -494,9 +371,7 @@ impl Journal {
         self.record_with(t_ms, line, mark, None, warn)
     }
 
-    /// [`Self::record`] of a task end's note that restates an end a loop
-    /// before this one noted, with the time that end was first noted
-    /// ([`JournalRecord::ended`]).
+    /// [`Self::record`] of a task end's note that restates an end a loop before this one noted.
     pub fn record_ended(
         &mut self,
         t_ms: i64,
@@ -538,15 +413,9 @@ impl Journal {
         self.path.is_some()
     }
 
-    /// Append one line that is already a JSON object (the approval ledger's rows,
-    /// [`super::approvals`]), warning once like [`Self::record`]. `false` with no journal or when
-    /// the write failed, for a caller that must not act on what it could not record (the disk
-    /// journal's intent rows).
+    /// Append one line that is already a JSON object.
     pub fn append_raw(&mut self, json: &str, warn: &mut dyn Write) -> bool {
         let res = match self.file.as_mut() {
-            // The row and its newline in one write call, as `record_with`
-            // writes its own: one syscall a row, not two, and no other
-            // appender's row can land between a row and its end.
             Some(f) => {
                 let mut row = String::with_capacity(json.len() + 1);
                 row.push_str(json);
@@ -563,9 +432,6 @@ impl Journal {
     }
 
     /// A write that failed: said once ([`Self::warn`]), and when the file
-    /// system is out of space or quota, the window's disk watch is asked to
-    /// look now ([`crate::harness::disk::poke`]) — aterm's own failing write
-    /// is a sighting of the full disk like an agent's screen.
     fn failed(&mut self, e: &std::io::Error, what: &str, warn: &mut dyn Write) {
         if crate::harness::disk::poke::is_out_of_space(e) {
             let path = self
@@ -595,8 +461,7 @@ impl Journal {
     }
 }
 
-/// Every record in a journal file, and how many of its non-blank lines are
-/// not one (a line cut short by a crash, a hand edit).
+/// Every record in a journal file, and how many of its non-blank lines are not one.
 pub fn read_journal(path: &Path) -> Result<(Vec<JournalRecord>, usize), String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let mut out = Vec::new();
@@ -615,9 +480,6 @@ mod tests {
     use super::*;
 
     /// Every kind of line the loops print, read into its kind, phase, `seq=`
-    /// and free-text tail: one row per arm of the reader. A `rule=` is the
-    /// phase; a word nothing here knows (or a lowercase one) is `other`, its
-    /// line whole.
     #[test]
     fn each_printed_line_is_read_into_its_fields() {
         let rec = |line: &str| JournalRecord::of_line(7, Some("@s-1"), line, None);
@@ -808,8 +670,6 @@ mod tests {
         );
         let r = rec("EVENT turn seq=106 report=5 rows=12 ⏺ Done.");
         assert_eq!((r.complete, r.rows, r.report), (None, Some(12), Some(5)));
-        // Every word the loops print with a `rule=` is its own kind, the rule
-        // its phase: a word dropped from the reader would read as `other`.
         for word in [
             "TYPED",
             "RESTARTED",
@@ -828,7 +688,6 @@ mod tests {
                 "{word}"
             );
         }
-        // Every gate's word reads as the probe's `skipped`.
         for gate in crate::supervise::policy::turn_end::ProbeGate::ALL {
             let line = format!("SKIPPED seq=7 rule=usage-probe@v1 gate={}", gate.word());
             let r = rec(&line);
@@ -846,7 +705,6 @@ mod tests {
     }
 
     /// The JSON round-trips, escapes what it must, and prints `null` for what
-    /// the line did not say.
     #[test]
     fn a_record_round_trips_through_its_json() {
         let r = JournalRecord::of_line(
@@ -876,14 +734,11 @@ mod tests {
         let json = r.to_json();
         assert!(json.ends_with(",\"turn\":null,\"report\":5}"), "{json}");
         assert_eq!(JournalRecord::from_json(&json), Ok(r));
-        // A journal written before `report` existed reads back without it.
         let old = JournalRecord::from_json(
             "{\"t\":1,\"kind\":\"event\",\"phase\":\"idle\",\"line\":\"EVENT idle seq=1 x\"}",
         )
         .expect("an older record");
         assert_eq!((old.report, old.turn, old.mark), (None, None, None));
-        // A point's mark: written only where there is one, read back whole
-        // (16 hex digits, past what a JSON number holds exactly).
         let mut r =
             JournalRecord::of_line(3, Some("s-1"), "EVENT idle seq=4 ATERM-TASK-DONE", None);
         r.mark = Some(0xfeed_0000_0000_beef);
@@ -893,8 +748,6 @@ mod tests {
             "{json}"
         );
         assert_eq!(JournalRecord::from_json(&json), Ok(r));
-        // A restated end's first time: written only where there is one, and
-        // an older record reads back without it.
         let mut r = JournalRecord::of_line(
             5,
             Some("s-1"),
@@ -915,17 +768,11 @@ mod tests {
     }
 
     /// AN OUT-OF-SPACE WRITE ASKS THE DISK WATCH TO LOOK: a journal write
-    /// that fails with `ENOSPC` or `EDQUOT` pokes the watch
-    /// ([`crate::harness::disk::poke`]) naming the journal, as the watch's
-    /// handler hears it; NEGATIVE CONTROL: any other failure (a permission
-    /// denied) pokes nothing. Each failure is still said once.
     #[test]
     fn a_journal_write_out_of_space_pokes_the_disk_watch() {
         use crate::harness::disk::poke::{Cause, set_handler};
         use std::io::{Error, ErrorKind};
         use std::sync::{Arc, Mutex, PoisonError};
-        // The one handler, as the window's watch registers it; every poke of
-        // this test process reaches it, so each case is told by its tag.
         static HEARD: Mutex<Vec<String>> = Mutex::new(Vec::new());
         set_handler(Arc::new(|cause| {
             if let Cause::Write(w) = cause {

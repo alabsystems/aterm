@@ -1,19 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! What the loop hands a person, and taking it back: the worker's `attention`
-//! (the menu bar badges it). Nothing is mailed: a manager waits on the
-//! worker's task record, whose `attention=` this entry raises (`await task`).
-//!
-//! The attention reads `<program> <kind>: <subject, cut at 64 cells> (<why no rule answered>)`
-//! on one line, cut by terminal cells ([`cut_cells`]) to the server's 200 bytes for a keyed
-//! entry with the reason's closing `)` kept; a box with no command, path or question is named
-//! by its own first row ([`prompt_box_first_row`]). A limit's reads `limited: <message>`.
-//!
-//! The attention is keyed: this loop writes and clears only its own entry (`meta set|unset
-//! attention owner=supervisor`), never the bare form, which is the human's. The key proves
-//! ownership; the text ([`Session::attention_ours`]) only tells a box's badge from a limit's.
-//! A loop watching behind another supervisor's claim writes none.
+//! What the loop hands a person, and taking it back: the worker's `attention` (the menu bar badges it).
 
 use super::super::journal::{
     AGAIN_ADOPTED, AGAIN_RETRY, ATTENTION_KEPT, ATTENTION_SKIPPED, CLEARED_BOX, CLEARED_NEEDS,
@@ -22,13 +10,11 @@ use super::super::journal::{
 use super::*;
 
 /// How much of the subject (command, path, question) the attention carries,
-/// in terminal cells.
 const SUBJECT_CELLS: usize = APPROVAL_LINE_CELLS;
 /// How much of the reason the attention carries, in terminal cells.
 const REASON_CELLS: usize = 120;
 
 /// `s` on one line and within `cells` terminal cells ([`cut_cells`]), `…`
-/// (one cell) where it was cut.
 fn clip_to(s: &str, cells: usize) -> String {
     let (whole, cut) = cut_cells(s, cells);
     if !cut {
@@ -40,7 +26,6 @@ fn clip_to(s: &str, cells: usize) -> String {
 }
 
 /// The path a folder-trust dialog names (the row under `Accessing
-/// workspace:`).
 fn trust_path(rows: &[String]) -> Option<&str> {
     let title = aterm_phase::anchor("trust.title");
     let at = rows.iter().position(|r| r.trim() == title)?;
@@ -51,9 +36,6 @@ fn trust_path(rows: &[String]) -> Option<&str> {
 }
 
 /// The question above the rows the box parser reads as the box, for a dialog aterm-phase did not
-/// read whole (form `Unknown`; else [`aterm_phase::QuestionDialog::question`]): the nearest row
-/// ending in `?` above `first`, stopping at the transcript (a `⏺` row, or a `❯` row that is not
-/// an option's cursor).
 fn question_above(rows: &[String], first: usize) -> Option<&str> {
     for r in rows[first.saturating_sub(30)..first].iter().rev() {
         let t = r.trim();
@@ -75,11 +57,6 @@ fn question_above(rows: &[String], first: usize) -> Option<&str> {
 }
 
 /// The kind and subject a point's attention names, read by the session's
-/// reader: a question's last row; at an idle point the turn-end policy
-/// escalated, the wall it ended on (`wall`) or the worker's last words
-/// (`idle`); a box's command, path or question. Another program's point
-/// (Codex's, agy's, Muse Code's, Gemini CLI's) is named from its reading
-/// alone ([`kind_and_subject_read`]).
 fn kind_and_subject(reader: &dyn ScreenReader, point: &Turn) -> (String, String) {
     match reader.program() {
         aterm_phase::Program::Claude => {}
@@ -115,15 +92,11 @@ fn kind_and_subject(reader: &dyn ScreenReader, point: &Turn) -> (String, String)
     let Some(p) = parse_prompt(rows) else {
         return ("other".to_string(), String::new());
     };
-    // The rm/rmdir breaker family, whatever its kind (aterm-phase's
-    // `PromptV2::rm_breaker`, the one reading the decider uses).
     let kind = if aterm_phase::parse_prompt_v2(rows).is_some_and(|v| v.rm_breaker().is_some()) {
         "rm-breaker".to_string()
     } else {
         p.kind.name().to_string()
     };
-    // A question dialog read whole names its question, the `│` gutter
-    // stripped and its rows joined.
     let asked = (p.kind == PromptKind::Question)
         .then(|| aterm_phase::parse_prompt_v2(rows))
         .flatten()
@@ -136,9 +109,6 @@ fn kind_and_subject(reader: &dyn ScreenReader, point: &Turn) -> (String, String)
     } else if p.kind == PromptKind::Workflow && !p.description.is_empty() {
         p.description.clone()
     } else {
-        // An unparsed box: its question row, the nearest row above the
-        // options that asks one, else the box's own first row — never a
-        // transcript row above a headerless box ([`prompt_box_first_row`]).
         let first = prompt_box_first_row(rows);
         let footer = prompt_box_span(rows).map(|(_, b)| b);
         match (first, footer) {
@@ -156,7 +126,6 @@ fn kind_and_subject(reader: &dyn ScreenReader, point: &Turn) -> (String, String)
 }
 
 /// [`kind_and_subject`] from a program's [`aterm_phase::Reading`] alone —
-/// its wall, its last words, its box's kind and command, path or title.
 fn kind_and_subject_read(reader: &dyn ScreenReader, point: &Turn) -> (String, String) {
     let rows = &point.screen.rows;
     let last_said = || {
@@ -190,8 +159,7 @@ fn kind_and_subject_read(reader: &dyn ScreenReader, point: &Turn) -> (String, St
     }
 }
 
-/// `<program> <kind>: <subject>`, the subject cut at 64 cells: how an attention names its
-/// point. The program is the reader's (`claude`, `codex`).
+/// `<program> <kind>: <subject>`, the subject cut at 64 cells: how an attention names its point.
 pub(crate) fn point_label(reader: &dyn ScreenReader, point: &Turn) -> String {
     let (kind, subject) = kind_and_subject(reader, point);
     format!(
@@ -201,12 +169,7 @@ pub(crate) fn point_label(reader: &dyn ScreenReader, point: &Turn) -> String {
     )
 }
 
-/// `<program> <kind>: <subject> (<reason>)` ([`point_label`]), the reason cut at 120 cells and
-/// then to what the label leaves of [`ATTENTION_BYTES`], `…` where it was cut and its `)` kept.
-///
-/// A resume line in the reason (`…, then resume with claude … --resume <id>`) is never cut: kept
-/// whole, else in its bare form, else dropped with its clause
-/// ([`crate::harness::resume::never_cut`]); a cut id names no conversation.
+/// `<program> <kind>: <subject> (<reason>)` ([`point_label`]), the reason cut at 120 cells and then to what the label leaves of [`ATTENTION_BYTES`], `…` where it was cut and its `)` kept.
 pub(crate) fn attention_text(reader: &dyn ScreenReader, point: &Turn, reason: &str) -> String {
     let label = point_label(reader, point);
     crate::harness::resume::never_cut(reason, |reason| fit_reason(&label, reason))
@@ -220,8 +183,6 @@ fn fit_reason(label: &str, reason: &str) -> String {
 }
 
 /// `s` within `room` bytes, cut at a character boundary with `…` (one `…`,
-/// never two) where it did not fit: what aterm's own words around it leave
-/// of [`ATTENTION_BYTES`], so the cap never falls in those words.
 fn clip_bytes(s: String, room: usize) -> String {
     if s.len() <= room {
         return s;
@@ -233,7 +194,6 @@ fn clip_bytes(s: String, room: usize) -> String {
 }
 
 /// The cap a refusal names (`ERR attention too long (max <n> bytes)`), when
-/// it is tighter than the text that was sent.
 fn refused_cap(r: &CtlReply, sent: &str) -> Option<usize> {
     let err = r.err_text();
     let rest = &err[err.find("too long (max ")? + "too long (max ".len()..];
@@ -249,14 +209,9 @@ pub(crate) use super::super::screen::status_field;
 /// What one escalation hands the person ([`Session::escalate`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Escalation {
-    /// A box, a question, a point the turn-end policy hands over: the person
-    /// is asked. Its entry names no `kind=`: an entry with none whose text
-    /// does not open with [`ATTENTION_PREFIX`] is an ask to every reader
-    /// (`docs/DESIGN-owner-surfaces-2026-10-16.md` §2.4).
+    /// A box, a question, a point the turn-end policy hands over: the person is asked.
     Ask,
-    /// A limit (`limited: <message>`). `waits`: this loop waits it out by
-    /// itself ([`Session::waits_out`]), so the entry is `kind=wait`, a
-    /// record; otherwise `kind=ask`, as a limit nothing here ends.
+    /// A limit (`limited: <message>`).
     Limit { waits: bool },
 }
 
@@ -278,20 +233,7 @@ impl Escalation {
 }
 
 impl<C: Ctl> Session<'_, C> {
-    /// The escalation: `meta set attention <text>` on the worker (cut to the
-    /// server's keyed cap, and once more to the cap a `too long (max <n>
-    /// bytes)` refusal names), and one journal line, `ESCALATED seq=<n>
-    /// attention=<reply>`. A refusal is recorded, never the loop's end. `kind`
-    /// is what is escalated ([`Escalation`]): an ask (a box, a question, a
-    /// point the turn-end policy hands over) or a limit, written `kind=wait`
-    /// where this loop waits it out and `kind=ask` where it does not.
-    ///
-    /// The same episode opened again (`again`, [`Retry`]) or a limit's badge
-    /// adopted from a previous watcher is the same ask set again: its line
-    /// ends `again=<why>` ([`AGAIN_RETRY`], [`AGAIN_ADOPTED`]), which the
-    /// harness's stats count as no second escalation. While a stall is in
-    /// hand an ask raises no badge ([`Self::withhold_badge`],
-    /// [`stall::WITHHELD`]).
+    /// Escalate via `meta set attention <text>` on the worker (bounded to the server cap) and append `ESCALATED seq=<n> attention=<reply>`.
     pub(super) fn escalate(
         &mut self,
         seq: u64,
@@ -345,26 +287,7 @@ impl<C: Ctl> Session<'_, C> {
         Ok(())
     }
 
-    /// A box the loop did not answer, or a point the turn-end policy
-    /// escalates (`reason`: why — a question the owner's policy may not
-    /// answer among them), escalated ONCE
-    /// PER REVIEW POINT: the worker's `attention` set to [`attention_text`] —
-    /// `reason`, else the reason the approval policy gave for a box
-    /// ([`Session::box_reason`]); see [`Self::escalate`]. It is called only
-    /// where the loop hands a NEW point over — a later look at the same point
-    /// raises nothing again: the box redrawn, re-wrapped, its focus moved, its
-    /// countdown ticking, the transcript reflowed above it
-    /// ([`Session::review_key`]) — so the same box back after the worker worked
-    /// (or after an outage) is a new point, a new `EVENT prompt` AND a new
-    /// badge (deduping on the box's key alone leaves a cleared badge gone),
-    /// and so is another box drawn over it with no read between (another
-    /// command, another diff on the same path).
-    /// The one exception is the point a previous watcher's badge was
-    /// ADOPTED for at the start ([`Self::reconcile`]): its first review
-    /// raises nothing, the badge standing already. The manager's own
-    /// `key`/`turn` that answers it is the screen change the loop already
-    /// waits on ([`Self::wait_for_next`]), and the badge goes when the point
-    /// has ([`Self::close_box`]).
+    /// A box the loop did not answer, or a point the turn-end policy escalates (`reason`: why — a question the owner's policy may not answer among them), escalated ONCE PER REVIEW POINT.
     pub(super) fn escalate_point(
         &mut self,
         point: &Turn,
@@ -377,8 +300,6 @@ impl<C: Ctl> Session<'_, C> {
         {
             return Ok(());
         }
-        // A "question" whose last row is a `❯` user row is the watcher's
-        // own probe, typed and unanswered: nothing the worker asked.
         if point.phase == Phase::Question
             && last_said_row(&point.screen.rows).is_some_and(|r| r.trim_start().starts_with('❯'))
         {
@@ -389,10 +310,6 @@ impl<C: Ctl> Session<'_, C> {
             (None, _, Some((k, why))) if *k == key => why.clone(),
             _ => "no approval rule answers this box".to_string(),
         };
-        // THE OWNER'S NOTICE STANDS FOR THIS POINT ([`super::policy::notice`],
-        // Claude Code's lost login: `/login` held back, its method picker
-        // left to them): it is the one thing they see, with its step — a
-        // badge beside it would tell them twice, in other words. Journaled.
         if let Some(notice) = self.exception_now.as_ref().and_then(|e| e.notice.as_ref()) {
             review.note(&format!(
                 "NOT ESCALATED seq={} the notice {} stands: {}",
@@ -408,10 +325,7 @@ impl<C: Ctl> Session<'_, C> {
         Ok(())
     }
 
-    /// Unset this loop's own attention entry (`meta unset attention owner=supervisor`) when
-    /// `ours` says its text is the kind being closed. Returns the unset's reply word, `kept` when
-    /// the entry holds another kind (a box badge over a limit's), `none` when the loop holds no
-    /// entry. `meta set attention ''` is a usage error, so the clear is `meta unset`.
+    /// Unset this loop's own attention entry (`meta unset attention owner=supervisor`) when `ours` says its text is the kind being closed.
     pub(super) fn unset_if_ours(&mut self, ours: fn(&str) -> bool) -> Result<String, Fail> {
         Ok(match self.attention_ours.as_deref() {
             Some(text) if ours(text) => {
@@ -427,9 +341,7 @@ impl<C: Ctl> Session<'_, C> {
         })
     }
 
-    /// The escalated point has left the screen: its badge cleared if it is
-    /// still ours ([`Self::unset_if_ours`]) and journaled `CLEARED seq=<n>
-    /// box attention=<said>`.
+    /// The escalated point has left the screen.
     pub(super) fn close_box(&mut self, seq: u64, review: &mut dyn Review) -> Result<(), Fail> {
         self.adopted_box = false;
         if self.box_ask.take().is_none() {
@@ -440,9 +352,7 @@ impl<C: Ctl> Session<'_, C> {
         Ok(())
     }
 
-    /// The episode is over: the `limited:` attention cleared if it is still
-    /// ours (another writer's badge stays) and journaled as `CLEARED seq=<n>
-    /// attention=<said> <why>`, `seq` the read it closed on.
+    /// The episode is over: the `limited:` attention cleared if it is still ours (another writer's badge stays) and journaled as `CLEARED seq=<n> attention=<said> <why>`, `seq` the read it closed on.
     pub(super) fn close_episode(
         &mut self,
         seq: u64,
@@ -460,10 +370,7 @@ impl<C: Ctl> Session<'_, C> {
         Ok(())
     }
 
-    /// Take down a limit's badge adopted from a previous loop ([`Session::adopted_limit`]) while it
-    /// is still this loop's entry, leaving the marker set; journaled as an episode's close is,
-    /// `CLEARED seq=<n> attention=<said> <why>`. Nothing when the entry holds no `limited:` badge
-    /// (an episode's close took it down already).
+    /// Take down a limit's badge adopted from a previous loop ([`Session::adopted_limit`]) while it is still this loop's entry, leaving the marker set.
     pub(super) fn lower_adopted_limit(
         &mut self,
         seq: u64,
@@ -482,13 +389,7 @@ impl<C: Ctl> Session<'_, C> {
         Ok(())
     }
 
-    /// The worker answered on a point that is not the limit's notice (a look's
-    /// point, or a read of an Off park), with no episode open: the limit a
-    /// previous loop's badge was adopted for ([`Session::adopted_limit`]) is
-    /// over. Its marker goes, so a later limit is a new episode, a new ask —
-    /// never `again=adopted …` for a wall nobody was told of — and its badge,
-    /// if still up, goes with it ([`Self::lower_adopted_limit`]). Nothing
-    /// while an episode is open: its close is the episode's.
+    /// The worker answered on a point that is not the limit's notice (a look's point, or a read of an Off park), with no episode open.
     pub(super) fn adopted_limit_over(
         &mut self,
         seq: u64,
@@ -502,38 +403,20 @@ impl<C: Ctl> Session<'_, C> {
     }
 }
 
-/// THE KEY [`Session::needs_told`] HOLDS FOR A NEEDS ENTRY A LOOP BEFORE THIS
-/// ONE LEFT (`lifecycle.rs`'s `reconcile`: a crash, a kill, an update's old
-/// loop that ended before its last act): no set of needs keys to `0`
-/// ([`super::policy::needs::needs_key`]), so the first set this loop puts up
-/// replaces that entry, and the first point with none standing takes it down
-/// ([`NEEDS_LEFT_DOWN`]), as an Off park and the loop's end take down one of
-/// this loop's own.
+/// THE KEY [`Session::needs_told`] HOLDS FOR A NEEDS ENTRY A LOOP BEFORE THIS ONE LEFT (`lifecycle.rs`'s `reconcile`: a crash, a kill, an update's old loop that ended before its last act).
 pub(super) const NEEDS_LEFT: u64 = 0;
 
-/// Why the entry a loop before this one left ([`NEEDS_LEFT`]) is taken
-/// down at this loop's first point: `CLEARED seq=<n> needs attention=<reply>
-/// no need stands at the loop's start`.
+/// Why the entry a loop before this one left ([`NEEDS_LEFT`]) is taken down at this loop's first point.
 pub(super) const NEEDS_LEFT_DOWN: &str = "no need stands at the loop's start";
 
-/// Whether a `meta` reply's `attention_kinds=` (`<ask|wait|->:<owner>` per
-/// entry, comma-joined, oldest first; an owner may hold a `:`) names an
-/// entry of `owner`.
+/// Whether a `meta` reply's `attention_kinds=` (`<ask|wait|->:<owner>` per entry, comma-joined, oldest first; an owner may hold a `:`) names an entry of `owner`.
 pub(super) fn kinds_name_owner(kinds: &str, owner: &str) -> bool {
     kinds
         .split(',')
         .any(|entry| entry.split_once(':').is_some_and(|(_, o)| o == owner))
 }
 
-/// THE NEEDS ENTRY'S TEXT ([`Session::sync_needs`]): `<program> needs you:
-/// <first need, cut at 64 cells>[ (+N more)] — carrying on`, on one line and
-/// within the server's keyed cap ([`ATTENTION_BYTES`]). aterm's own words
-/// around the worker's; the need itself is the worker's line, sanitized and
-/// cut by the policy (`policy::needs::needs_you`) and here by cells, then
-/// to the bytes the frame leaves of the cap ([`clip_bytes`]): 64 cells of a
-/// script whose letters take three bytes (Devanagari, Thai) outrun it, and
-/// the cap then falls in the need, never in the count or ` — carrying on`,
-/// which the window reads the need back by (`aterm-gui`'s `need_words`).
+/// THE NEEDS ENTRY'S TEXT ([`Session::sync_needs`]).
 pub(super) fn needs_attention_text(program: &str, needs: &[String]) -> String {
     let first = needs.first().map_or("", String::as_str);
     let more = match needs.len() {
@@ -548,36 +431,7 @@ pub(super) fn needs_attention_text(program: &str, needs: &[String]) -> String {
 }
 
 impl<C: Ctl> Session<'_, C> {
-    /// THE WORKER'S NEEDS YOU, ON THE PERSON'S SCREEN (Autopilot Cruise /
-    /// Autopilot Land: loud, never blocking): where the needs the policy holds
-    /// standing ([`TurnEndState::standing_needs`], its set's
-    /// [`TurnEndState::needs_key`]) differ from the set this loop last put
-    /// up ([`Session::needs_told`]), the `needs` owner's entry is set —
-    /// `meta set attention owner=needs kind=ask <text>`
-    /// ([`needs_attention_text`]), journaled `NEEDS seq=<n> count=<k>
-    /// attention=<reply> <first need>`, never `ESCALATED`: nothing is handed
-    /// over and the worker carries on — or, none standing, taken down
-    /// ([`Self::needs_down`]; an entry a loop before this one left,
-    /// [`NEEDS_LEFT`], with [`NEEDS_LEFT_DOWN`]). Called as each point is
-    /// folded in and again as it is carried out (`turn_end_loop.rs`'s
-    /// `task_edge_with`), so it
-    /// goes up at the point itself, whatever back-off or grace the point's
-    /// act waits on. Not under Autopilot Off (an Off park takes it down);
-    /// and never beside a proven self-claim or behind another supervisor's
-    /// claim ([`Session::needs_not_ours`]) — codex-alab raises its own, and
-    /// this loop neither writes nor unsets that owner's entry there. A
-    /// request the connection lost is asked again at the next point; any
-    /// other reply is the set told.
-    ///
-    /// THE WINDOW HEARS THE WHOLE SET FIRST (§12.2.3): before each `meta
-    /// set` — the first and the one a cap's refusal sends cut — the host is
-    /// told the set and that request's exact text ([`Self::tell_needs`]), so
-    /// the words are stored where the entry lands before it lands. Where the
-    /// set standing is the one this loop holds up and a request the
-    /// connection lost since left the window told otherwise (an `unset`'s
-    /// take-down, another set's words, each told before its request), the
-    /// window is told that set again with the text it was put up with, and
-    /// no request is sent ([`Self::retell_standing`]).
+    /// THE WORKER'S NEEDS YOU, ON THE PERSON'S SCREEN (Autopilot Cruise / Autopilot Land: loud, never blocking).
     pub(super) fn sync_needs(
         &mut self,
         screen: &Screen,
@@ -631,18 +485,7 @@ impl<C: Ctl> Session<'_, C> {
         Ok(())
     }
 
-    /// THE NEEDS ENTRY TAKEN DOWN, `why`: none stands now, an Off park, the
-    /// loop's end — `meta unset attention owner=needs`, journaled `CLEARED
-    /// seq=<n> needs attention=<reply> <why>` ([`CLEARED_NEEDS`]), which no
-    /// reader takes for a badge of an escalation. Nothing this loop put up:
-    /// nothing is said. Beside a proven self-claim or behind another
-    /// supervisor's claim nothing is unset ([`Session::needs_not_ours`]:
-    /// that owner's entry may be the self-claim's own, an Off park's
-    /// given-back claim and the loop's end included): the loop only forgets
-    /// its set, and the window forgets with it — told `(&[], "")` where it
-    /// was told any of this loop's words, with no request sent, so it keeps
-    /// none for an entry this loop no longer holds. Else the window hears
-    /// `(&[], "")` before the unset ([`Self::tell_needs`]).
+    /// THE NEEDS ENTRY TAKEN DOWN, `why`: none stands now, an Off park, the loop's end.
     pub(super) fn needs_down(
         &mut self,
         seq: u64,
@@ -676,13 +519,6 @@ impl<C: Ctl> Session<'_, C> {
     }
 
     /// THE WINDOW TOLD THE NEEDS SET (`docs/DESIGN-harness-autopilot-2026-10-15.md`
-    /// §12.2.3, [`IdleHost::needs_standing`]): `needs` and `entry`, the text
-    /// of the request about to be sent (`(&[], "")` before an unset), under
-    /// the set's `key` — where the key or the text differs from what the
-    /// host was last told ([`Session::needs_heard`]), and only there, so a
-    /// request the connection lost and the next point sends again tells
-    /// nothing twice. Called just before that request, so the host hears
-    /// first. With no host (a CLI `watch`), nothing.
     fn tell_needs(&mut self, key: u64, needs: &[String], entry: &str) {
         let Some(host) = &self.stall_host else {
             return;
@@ -695,7 +531,6 @@ impl<C: Ctl> Session<'_, C> {
     }
 
     /// Whether the window's host was last told `key`'s set with `entry`
-    /// ([`Session::needs_heard`]).
     fn needs_heard_as(&self, key: u64, entry: &str) -> bool {
         self.needs_heard
             .as_ref()
@@ -703,14 +538,6 @@ impl<C: Ctl> Session<'_, C> {
     }
 
     /// THE WINDOW TOLD AGAIN WHAT STANDS ([`Self::sync_needs`]): the set
-    /// standing is `key`'s, the one this loop holds up ([`Session::needs_told`]),
-    /// so no request is sent — yet a request the connection lost since may
-    /// have left the window told otherwise, each told before its request: an
-    /// `unset`'s take-down whose entry still stands, or another set's words
-    /// whose `meta set` never landed. There, and only there, the window is
-    /// told the standing set again with the text it was put up with
-    /// ([`Session::needs_told_text`], cut where a cap's refusal cut it).
-    /// Where it heard just that, nothing.
     fn retell_standing(&mut self, key: u64) {
         if self.stall_host.is_none() || self.needs_heard_as(key, &self.needs_told_text) {
             return;
@@ -765,8 +592,6 @@ mod tests {
     }
 
     /// An rm-breaker box's attention (its command and the vendor's note as the
-    /// reason) fits the server's 200 bytes for a keyed entry, its reason cut
-    /// and closed.
     #[test]
     fn an_rm_breaker_boxs_attention_fits_the_keyed_cap_and_stays_closed() {
         let rows: Vec<String> = include_str!("policy/fixtures/cap-rm.txt")
@@ -784,7 +609,6 @@ mod tests {
     }
 
     /// A question dialog's badge names its question, never `4. Chat about this`. Control: a `?`
-    /// row in the transcript above it is never taken.
     #[test]
     fn a_question_dialogs_badge_names_its_question() {
         let rule = "─".repeat(120);
@@ -819,7 +643,6 @@ mod tests {
     }
 
     /// A question aterm-phase reads whole is badged by its question, the `│`
-    /// gutter stripped: never a transcript row, never `4. Chat about this`.
     #[test]
     fn a_question_read_whole_is_badged_by_its_question() {
         use aterm_phase::prompt::fixtures as f;
@@ -851,12 +674,6 @@ mod tests {
     }
 
     /// THE NEEDS ENTRY KEEPS ITS FRAME WHATEVER THE NEED'S SCRIPT (§12.2.9):
-    /// 64 cells of Devanagari or Thai are up to 192 bytes, which with the
-    /// frame outrun the cap; the need gives way, so the entry still ends
-    /// with its count and ` — carrying on` (the window reads it back by
-    /// them) and stays within [`ATTENTION_BYTES`]. A need that fits is
-    /// untouched. NEGATIVE CONTROL (run for the landing): main's form, the
-    /// whole text cut at the cap, drops the count and the tail.
     #[test]
     fn the_needs_entry_keeps_its_frame_for_a_long_need_in_any_script() {
         for letter in ["\u{915}", "\u{e01}", "\u{9a8}", "\u{25b8}"] {
@@ -877,8 +694,6 @@ mod tests {
     }
 
     /// The memory wall's escalation never cuts its resume line: each `--resume` in the
-    /// attention is followed by the whole id, or no command is named. Control: [`fit_reason`]
-    /// alone cuts the id away.
     #[test]
     fn the_memory_escalation_names_its_conversation_whole_or_not_at_all() {
         const ID: &str = "5f1c2d3e-4b5a-4c6d-8e7f-0a1b2c3d4e5f";
@@ -898,8 +713,6 @@ mod tests {
                 crate::harness::resume::THEN_RESUME_WITH
             )
         };
-        // Every command named is whole: each `resume with claude` runs to
-        // `--resume <the whole id>`.
         let whole_or_absent = |t: &str| {
             t.match_indices("resume with claude")
                 .all(|(i, _)| t[i..].contains(&format!("--resume {ID}")))
@@ -926,13 +739,11 @@ mod tests {
             assert!(whole_or_absent(&t), "{name}: a cut id: {t}");
             assert!(t.starts_with("claude bash: echo x"), "{name}: {t}");
         }
-        // The flagged line does not fit beside this label: the bare one does.
         let t = attention_text(CLAUDE, &point, &reason(&flagged));
         assert!(
             t.contains(&format!("then resume with claude --resume {ID}")),
             "{t}"
         );
-        // Control: the cutting renderer alone names the command and cuts its id away.
         let label = point_label(CLAUDE, &point);
         let old = fit_reason(&label, &reason(&flagged));
         assert!(
@@ -951,7 +762,6 @@ mod tests {
     }
 
     /// Every rm-breaker form, a workflow subagent's unresolvable one included, is badged
-    /// `rm-breaker`. Control: a plain Bash box is `bash`.
     #[test]
     fn every_rm_breaker_kind_is_badged_rm_breaker() {
         use aterm_phase::prompt::fixtures as f;
@@ -969,11 +779,6 @@ mod tests {
             &turn(Phase::Prompt, f::bash_one_row()),
         );
         assert_eq!(kind, "bash");
-        // 2.1.307's breakers, all MEASURED: the `not ruled out — …` ones over
-        // a command with an rm and over ones with none (manual and bypass),
-        // and the mounted drive's (a `bash` box with a vendor note before
-        // MountedDrivePath). Controls: the same build's plain Bash box, and
-        // the nested shape inside the vendor's budget (a plain vendor note).
         for (text, want) in [
             (f::BOX_RM_TOO_MANY_2_1_307, "rm-breaker"),
             (f::BOX_RM_TOO_MANY_NO_RM_2_1_307, "rm-breaker"),
@@ -982,7 +787,6 @@ mod tests {
             (f::BOX_RM_MOUNTED_DRIVE_2_1_307, "rm-breaker"),
             (f::BOX_BASH_TOUCH_2_1_307, "bash"),
             (f::BOX_STATEMENT_FOLLOWS_16_2_1_307, "bash"),
-            // 2.1.308's, MEASURED: the same boxes, read the same.
             (f::BOX_RM_TOO_MANY_2_1_308, "rm-breaker"),
             (f::BOX_RM_TOO_MANY_NO_RM_2_1_308, "rm-breaker"),
             (f::BOX_RM_MOUNTED_DRIVE_2_1_308, "rm-breaker"),
@@ -1000,9 +804,6 @@ mod tests {
     }
 
     /// A `meta` reply's `attention_kinds=` names the `needs` owner's entry
-    /// by its owner alone, whatever its kind or place, an owner with a `:`
-    /// read whole. NEGATIVE CONTROLS: other owners, an owner that only begins
-    /// or ends with the word, and no entries at all name none.
     #[test]
     fn the_kinds_field_names_an_owner_by_its_whole_name() {
         for yes in [

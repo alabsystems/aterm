@@ -174,7 +174,15 @@ impl Base {
 
 /// Run `aterm init`. Parsing and help precede every live probe, including HOME checks.
 /// `base` gives the base layer's items for a run that applies (`true`) or only reads.
-pub fn main_entry(args: Vec<OsString>, base: &dyn Fn(bool) -> Base) -> ExitCode {
+/// `full_disk_access` measures this process's Full Disk Access without a prompt
+/// (`aterm_containment::probe_fda`, which the front door links): asked once, for a run
+/// whose workstation items run, and handed to them through [`Live`]
+/// ([`System::full_disk_access`]).
+pub fn main_entry(
+    args: Vec<OsString>,
+    base: &dyn Fn(bool) -> Base,
+    full_disk_access: &dyn Fn() -> Option<bool>,
+) -> ExitCode {
     let options = match options(&args) {
         Ok(options) => options,
         Err(why) => {
@@ -201,7 +209,12 @@ pub fn main_entry(args: Vec<OsString>, base: &dyn Fn(bool) -> Base) -> ExitCode 
         eprintln!("aterm init: run in your own macOS login and home directory");
         return ExitCode::FAILURE;
     }
-    let sys = Live::new();
+    // `--only` runs base items alone, which touch no other app's data: nothing to measure.
+    let sys = Live::new().with_full_disk_access(if options.only.is_empty() {
+        full_disk_access()
+    } else {
+        None
+    });
     let result = sys.journal().and_then(|mut journal| {
         let mode = if options.action == Action::Apply {
             Mode::Apply
@@ -306,6 +319,12 @@ pub enum WorkstationGroup {
     InputActivation,
     /// The complete workstation profile, excluding optional repository setup.
     All,
+    /// Of the selected preference rows, only the keys in another app's sandbox container
+    /// ([`crate::items::defaults::CONTAINED`]) that a pass without Full Disk Access left
+    /// alone ([`crate::items::Item::withheld`]): the follow-up once the grant is held
+    /// ([`crate::init_preferences::withheld_items`]). The rows' other keys are not read, so
+    /// a person's change to them since stays theirs.
+    Withheld,
 }
 
 impl WorkstationGroup {
@@ -316,7 +335,7 @@ impl WorkstationGroup {
             let belongs = match self {
                 Self::All => setting.is_workstation(),
                 Self::Accounts => matches!(setting, Setting::Messages | Setting::FaceTime),
-                Self::Preferences => {
+                Self::Preferences | Self::Withheld => {
                     setting.is_workstation()
                         && !matches!(setting, Setting::Messages | Setting::FaceTime)
                 }
@@ -392,6 +411,11 @@ pub struct WorkstationRun {
     /// Each item whose apply or refresh ran, in run order. A refused plan, a held item
     /// and an apply that stood aside contribute nothing: none of them changed anything.
     pub attempts: Vec<Attempt>,
+    /// The items that left keys in another app's container alone for want of Full Disk
+    /// Access ([`Item::withheld`]), by id, held or not: whatever their rows read, none is
+    /// done until a pass with the grant reaches those keys. A caller that records them for
+    /// that pass tells a held one apart by its hold: nothing of it ran.
+    pub withheld: Vec<String>,
 }
 
 /// One item whose apply or refresh this pass ran.
@@ -502,6 +526,12 @@ impl Workstation {
         journal: &mut dyn Journal,
     ) -> Result<WorkstationRun, String> {
         let attempted = Arc::new(Mutex::new(Vec::new()));
+        let withheld: Vec<String> = self
+            .items
+            .iter()
+            .filter(|item| item.withheld().is_some())
+            .map(|item| item.id())
+            .collect();
         let mut snapshots = self.snapshots.map(Vec::into_iter);
         let items: Vec<Box<dyn Item>> = self
             .items
@@ -552,7 +582,11 @@ impl Workstation {
                 })
             })
             .collect();
-        Ok(WorkstationRun { rows, attempts })
+        Ok(WorkstationRun {
+            rows,
+            attempts,
+            withheld,
+        })
     }
 }
 
@@ -661,6 +695,9 @@ impl Item for Guard {
     }
     fn stood_aside(&self) -> Option<aterm_converge::StoodAside> {
         self.inner.stood_aside()
+    }
+    fn withheld(&self) -> Option<String> {
+        self.inner.withheld()
     }
     fn stands_aside(&self, sys: &dyn System, ctx: &Ctx) -> Option<aterm_converge::StoodAside> {
         self.inner.stands_aside(sys, ctx)
@@ -781,10 +818,12 @@ pub fn run_initial_spotlight(
 /// ([`crate::init_secrets`]), for the vault the plan names (`source`), through the same
 /// probe/apply/read-back engine, every change journaled in the journal of the account
 /// `sys` acts as before it is made. Nobody is asked anything; the join waits up to `wait`
-/// for an approval. `password` is the join password the person typed in System State: it
-/// is given to the one join that needs it and comes back `None` once that join has queued
-/// its proof (or let this Mac in), and as it was when no join took it or the join failed,
-/// so an unattended retry neither loses it to the network nor sends it again.
+/// for an approval, and replaces only the vault configuration `replaces` admits (the one
+/// the stage read when it chose to join). `password` is the join password the person typed
+/// in System State: it is given to the one join that needs it and comes back `None` once
+/// that join has queued its proof (or let this Mac in), and as it was when no join took it
+/// or the join failed, so an unattended retry neither loses it to the network nor sends it
+/// again.
 ///
 /// # Errors
 /// The context names no one user, or the journal cannot be resolved; nothing was changed.
@@ -793,27 +832,42 @@ pub fn run_initial_secrets(
     ctx: &Ctx,
     ops: Arc<dyn crate::init_secrets::SecretsOps>,
     source: &str,
+    replaces: crate::init_secrets::Replaces,
     password: &mut Option<aterm_secrets::SecretBytes>,
     wait: std::time::Duration,
 ) -> Result<Vec<ItemReport>, String> {
     let mut journal = sys.journal()?;
-    run_initial_secrets_with(sys, ctx, ops, source, password, wait, journal.as_mut())
+    run_initial_secrets_with(
+        sys,
+        ctx,
+        ops,
+        source,
+        replaces,
+        password,
+        wait,
+        journal.as_mut(),
+    )
 }
 
 /// [`run_initial_secrets`], journaling in `journal`.
 ///
 /// # Errors
 /// As [`run_initial_secrets`].
+#[expect(
+    clippy::too_many_arguments,
+    reason = "run_initial_secrets's inputs plus the journal it resolves"
+)]
 pub fn run_initial_secrets_with(
     sys: &dyn System,
     ctx: &Ctx,
     ops: Arc<dyn crate::init_secrets::SecretsOps>,
     source: &str,
+    replaces: crate::init_secrets::Replaces,
     password: &mut Option<aterm_secrets::SecretBytes>,
     wait: std::time::Duration,
     journal: &mut dyn Journal,
 ) -> Result<Vec<ItemReport>, String> {
-    let vault = crate::init_secrets::selected(ctx, ops, source, wait)?;
+    let vault = crate::init_secrets::selected(ctx, ops, source, wait, replaces)?;
     vault.hold_password(password.take());
     let bound = crate::engine::bind(
         [(&vault as &dyn Item, workstation_place(Class::Install))],
@@ -834,6 +888,9 @@ fn workstation_items_selected(
 ) -> Result<Vec<Box<dyn Item>>, String> {
     let mut items = Vec::new();
     match group {
+        WorkstationGroup::Withheld => {
+            items.extend(crate::init_preferences::withheld_items(ctx, selected)?);
+        }
         WorkstationGroup::All | WorkstationGroup::Preferences => {
             items.extend(crate::init_preferences::selected_items(ctx, selected)?);
             if selected.contains(Setting::NaturalScrolling) {
@@ -1030,6 +1087,9 @@ fn context_for_selected(
             .into(),
         console_user: at_console.then(|| user.name.clone()),
         users: vec![user.clone()],
+        // What the runner measured of this process, once, before the pass: whether the
+        // widgets item may touch Notification Center's container (`init_preferences`).
+        full_disk_access: sys.full_disk_access(),
         ..HostFacts::default()
     };
     if !at_console {
@@ -1170,37 +1230,226 @@ mod tests {
         );
     }
 
+    /// The widgets row reads only its own domains: with Full Disk Access, the Window
+    /// Manager's and Notification Center's (three keys); without it (refused or not
+    /// measured), the Window Manager's alone (two keys), and no command names Notification
+    /// Center's container. Negative control: the grant arm's export of that container.
     #[test]
     fn selected_widgets_do_not_read_keyboard_dock_trackpad_or_accounts() {
         let who = user("alice", 501);
-        let context = ctx(&[who]);
-        let sys = Fake::root();
+        for (full_disk_access, keys) in [(Some(true), 3), (Some(false), 2), (None, 2)] {
+            let mut context = ctx(std::slice::from_ref(&who));
+            context.facts.full_disk_access = full_disk_access;
+            let sys = Fake::root();
+            sys.on(
+                "alice$ /usr/bin/defaults export com.apple.WindowManager -",
+                export("<dict/>"),
+            );
+            sys.on(
+                "alice$ /usr/bin/defaults export com.apple.notificationcenterui -",
+                export("<dict/>"),
+            );
+            let mut selected = Selection::none();
+            selected.set(Setting::Widgets, true);
+            let items =
+                workstation_items_selected(&context, WorkstationGroup::All, selected).unwrap();
+            assert_eq!(items.len(), 1);
+            let snapshots = items[0].preference_changes(&sys, &context).unwrap();
+            assert_eq!(snapshots.len(), keys, "{full_disk_access:?}");
+            assert!(matches!(
+                items[0].probe(&sys, &context),
+                Probe::Change { .. } | Probe::Deferred { .. }
+            ));
+            let calls = sys.calls();
+            for call in &calls {
+                assert!(
+                    call.contains("com.apple.WindowManager")
+                        || (full_disk_access == Some(true)
+                            && call.contains("com.apple.notificationcenterui"))
+                        || call.contains("/init-activation/desktopwidgets.pending")
+                        || call.contains("/init-activation/widgets.pending"),
+                    "{full_disk_access:?}: unchecked setting queried: {call}"
+                );
+            }
+            assert_eq!(
+                calls
+                    .iter()
+                    .any(|call| call.contains("com.apple.notificationcenterui")),
+                full_disk_access == Some(true),
+                "{calls:?}"
+            );
+        }
+    }
+
+    /// The local pass carries the Full Disk Access its runner measured
+    /// ([`System::full_disk_access`]) into the items' context: `aterm init`, the doctor and
+    /// System State measure it once and hand it over through the port. Without it the
+    /// widgets row names the wait and never exports Notification Center's container.
+    /// Negative control: the same pass on a port that answers the grant exports it.
+    #[test]
+    fn the_runners_full_disk_access_reaches_the_widgets_row_through_the_port() {
+        for full_disk_access in [None, Some(false), Some(true)] {
+            let mut sys = Fake::root();
+            sys.euid = 501;
+            sys.full_disk_access = full_disk_access;
+            sys.on("/usr/bin/id -un", Ran::ok("alice\n"));
+            sys.on(
+                "/usr/bin/dscl . -read /Groups/admin GroupMembership",
+                Ran::ok("GroupMembership: alice\n"),
+            );
+            sys.on("/usr/bin/dscl . -read /Users//alice UniqueID PrimaryGroupID NFSHomeDirectory UserShell", Ran::ok("UniqueID: 501\nPrimaryGroupID: 20\nNFSHomeDirectory: /Users//alice\nUserShell: /bin/zsh\n"));
+            sys.stat_of(
+                "/dev/console",
+                Stat {
+                    uid: 501,
+                    gid: 20,
+                    mode: 0o600,
+                    dir: false,
+                    symlink: false,
+                    len: 0,
+                },
+            );
+            sys.on("/usr/bin/uname -m", Ran::ok("arm64\n"));
+            sys.on("/usr/bin/sw_vers -productVersion", Ran::ok("27.0\n"));
+            sys.on(
+                "alice$ /usr/bin/defaults export com.apple.WindowManager -",
+                export("<dict><key>StandardHideWidgets</key><true/><key>StageManagerHideWidgets</key><true/></dict>"),
+            );
+            sys.on(
+                "alice$ /usr/bin/defaults export com.apple.notificationcenterui -",
+                export("<dict><key>widgets</key><dict><key>instances</key><array/></dict></dict>"),
+            );
+            let mut selected = Selection::none();
+            selected.set(Setting::Widgets, true);
+            let pass = prepare_workstation_selected(&sys, WorkstationGroup::All, selected).unwrap();
+            let rows = pass
+                .run_recording_with(&sys, Mode::Plan, &mut NoJournal)
+                .unwrap()
+                .rows;
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].outcome, Outcome::Ok, "{:?}", rows[0]);
+            let granted = full_disk_access == Some(true);
+            assert_eq!(
+                rows[0].title.contains("Full Disk Access"),
+                !granted,
+                "{}",
+                rows[0].title
+            );
+            assert_eq!(
+                sys.calls()
+                    .iter()
+                    .any(|call| call.contains("com.apple.notificationcenterui")),
+                granted,
+                "{:?}",
+                sys.calls()
+            );
+        }
+    }
+
+    /// The follow-up group builds, of the selected rows, only an item for each row with
+    /// keys in another app's container, under its row's id and reaching those keys alone:
+    /// for the widgets and the Dock, one widgets item whose snapshot, plan and apply read
+    /// Notification Center's widget list and no Window Manager or Dock key, and its run
+    /// withholds nothing with the grant. Negative control: the preferences group of the
+    /// same selection builds both rows and reads the Window Manager's keys.
+    #[test]
+    fn the_withheld_group_reaches_only_the_keys_a_pass_without_the_grant_left_alone() {
+        assert_eq!(
+            WorkstationGroup::Withheld.selected(Selection::all()),
+            WorkstationGroup::Preferences.selected(Selection::all())
+        );
+        let mut selected = Selection::none();
+        selected.set(Setting::Widgets, true);
+        selected.set(Setting::Dock, true);
+        let console = |full_disk_access| {
+            let mut sys = Fake::root();
+            sys.euid = 501;
+            sys.full_disk_access = full_disk_access;
+            sys.on("/usr/bin/id -un", Ran::ok("alice\n"));
+            sys.on(
+                "/usr/bin/dscl . -read /Groups/admin GroupMembership",
+                Ran::ok("GroupMembership: alice\n"),
+            );
+            sys.on("/usr/bin/dscl . -read /Users//alice UniqueID PrimaryGroupID NFSHomeDirectory UserShell", Ran::ok("UniqueID: 501\nPrimaryGroupID: 20\nNFSHomeDirectory: /Users//alice\nUserShell: /bin/zsh\n"));
+            sys.stat_of(
+                "/dev/console",
+                Stat {
+                    uid: 501,
+                    gid: 20,
+                    mode: 0o600,
+                    dir: false,
+                    symlink: false,
+                    len: 0,
+                },
+            );
+            sys.on("/usr/bin/uname -m", Ran::ok("arm64\n"));
+            sys.on("/usr/bin/sw_vers -productVersion", Ran::ok("27.0\n"));
+            sys.on(
+                "alice$ /usr/bin/defaults export com.apple.notificationcenterui -",
+                export("<dict><key>widgets</key><dict><key>instances</key><array><data>Kg==</data></array></dict></dict>"),
+            );
+            sys
+        };
+        let sys = console(Some(true));
+        let mut follow_up =
+            prepare_workstation_selected(&sys, WorkstationGroup::Withheld, selected).unwrap();
+        let snapshot = follow_up.preference_changes(&sys).unwrap();
+        assert_eq!(snapshot.len(), 1, "{snapshot:?}");
+        assert_eq!(snapshot[0].0.domain, "com.apple.notificationcenterui");
+        let run = follow_up
+            .run_recording_with(&sys, Mode::Plan, &mut NoJournal)
+            .unwrap();
+        let rows: Vec<(&str, &str, Outcome)> = run
+            .rows
+            .iter()
+            .map(|row| (row.id.as_str(), row.title.as_str(), row.outcome))
+            .collect();
+        assert_eq!(
+            rows,
+            [(
+                "init.widgets@alice",
+                "No widgets in Notification Center",
+                Outcome::Planned
+            )]
+        );
+        assert!(run.withheld.is_empty());
+        for call in sys.calls() {
+            assert!(
+                !call.contains("com.apple.WindowManager") && !call.contains("com.apple.dock"),
+                "{call}"
+            );
+        }
+
+        // Without the grant the preferences group's run names the widgets row withheld.
+        let sys = console(None);
         sys.on(
             "alice$ /usr/bin/defaults export com.apple.WindowManager -",
             export("<dict/>"),
         );
+        let mut widgets = Selection::none();
+        widgets.set(Setting::Widgets, true);
+        let pass =
+            prepare_workstation_selected(&sys, WorkstationGroup::Preferences, widgets).unwrap();
+        let run = pass
+            .run_recording_with(&sys, Mode::Plan, &mut NoJournal)
+            .unwrap();
+        assert_eq!(run.withheld, ["init.widgets@alice"]);
+        // Negative control: the preferences group reads the rows' other keys.
+        let sys = console(Some(true));
         sys.on(
-            "alice$ /usr/bin/defaults export com.apple.notificationcenterui -",
+            "alice$ /usr/bin/defaults export com.apple.WindowManager -",
             export("<dict/>"),
         );
         let mut selected = Selection::none();
         selected.set(Setting::Widgets, true);
-        let items = workstation_items_selected(&context, WorkstationGroup::All, selected).unwrap();
-        assert_eq!(items.len(), 1);
-        let snapshots = items[0].preference_changes(&sys, &context).unwrap();
-        assert_eq!(snapshots.len(), 3);
-        assert!(matches!(
-            items[0].probe(&sys, &context),
-            Probe::Change { .. } | Probe::Deferred { .. }
-        ));
-        for call in sys.calls() {
-            assert!(
-                call.contains("com.apple.WindowManager")
-                    || call.contains("com.apple.notificationcenterui")
-                    || call.contains("/init-activation/widgets.pending"),
-                "unchecked setting queried: {call}"
-            );
-        }
+        let mut all =
+            prepare_workstation_selected(&sys, WorkstationGroup::Preferences, selected).unwrap();
+        assert_eq!(all.preference_changes(&sys).unwrap().len(), 3);
+        assert!(
+            sys.calls()
+                .iter()
+                .any(|call| call.contains("com.apple.WindowManager"))
+        );
     }
 
     #[test]

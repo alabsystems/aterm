@@ -1,77 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The region's records and their strict decoders (the crash-restore plan §2.4).
-//!
-//! # Tail records
-//!
-//! Raw engine input, in the order the engine took it. No CRC, for two reasons: a
-//! record below the tail's commit word was written in full by a process whose stores
-//! all stay visible, and anything above the word is never read; and the VT parser
-//! accepts any bytes. The reader still bounds-checks every length and kind and stops
-//! at the first invalid record, counting a fault. Each record is 8-byte aligned and
-//! never straddles the ring's end (a PAD record, or fewer than 16 bytes the reader
-//! skips, fills the gap):
-//!
-//! ```text
-//! u8  kind     0 PAD · 1 BYTES · 2 RESIZE · 3 RESIZES_LOST · 4 ENGINE_REPLACED
-//!              · 5 SUPERSEDED
-//! u8  flags    BYTES: bit0 synthesized (foreground handback / manual reset);
-//!              RESIZE: the ResizePolicy (0 Native, 1 ConPty)
-//! u16 reserved (0)
-//! u32 payload_len
-//! u64 stream_end   PTY bytes processed after this record (synthesized bytes add none)
-//! payload  BYTES: the bytes · RESIZE: rows u16, cols u16, pad u32, lifetime u64,
-//!          ordinal u64 · RESIZES_LOST: n u32
-//! pad to 8
-//! ```
-//!
-//! # Keyframes (KFR v1) and history chunks (HCR v1)
-//!
-//! Both are astream step records (`astream_wire::steps`): a CRC frame around
-//! `STEP_VERSION | step u64 | len u32 | body`. A keyframe's step is its sequence
-//! number, which must equal its slot's commit word; a history chunk's steps are
-//! dense across the ring's wraps. Inside a region bounded by a commit word, a torn
-//! tail cannot appear, so any end the step scan reports other than `Clean` is a
-//! fault (astream's "refuse to build on a mid-log fault", applied read-only), save
-//! one: the zeroed gap the writer leaves at the ring's physical end when the next
-//! chunk would straddle it. The ring walk (`recover.rs`) reads a non-`Clean` end there
-//! as that gap when every byte after the last record is zero and the run goes on at
-//! the ring's start, so it relies on the scan accepting every record before the zeros
-//! and stopping where they start.
-//!
-//! A keyframe's body is `aterm_lz4::compress_prepend_size` of:
-//!
-//! ```text
-//! u8 version=1 · u8 flags (bit0 parser_ground, bit1 alt_active, bit2 bridge_on_inactive,
-//!                         bit3 integration_on)
-//! u16 rows · u16 cols · u16 0
-//! u64 seq · u64 tail_from · u64 stream_at · u64 resize_lifetime · u64 resize_ordinal
-//! HistoryFence at capture: u64 renumber_epoch · u64 clear_gen · u64 reveal_gen · u16 cols
-//!                          · u64 oldest · u64 end · u8 detached
-//! u32 bridge_lines · u64 config_fp
-//! u32 meta_len, the CheckpointMeta JSON (no nonce; parser and output_state kept)
-//! u32 grid_len, the main grid (serialize_lines, scrollback-then-visible)
-//! u32 alt_len, the inactive grid (0 = none)
-//! ```
-//!
-//! A history chunk's body is a 40-byte head and one handoff-history sidecar frame,
-//! LZ4-compressed with its size prepended:
-//!
-//! ```text
-//! u8 version=1 · u8 0 · u16 cols · u32 n_lines · u64 first_row · u64 renumber_epoch
-//! · u64 clear_gen · u64 reveal_gen
-//! lz4( u32 frame_len | serialize_lines(≤ 1024 lines) )
-//! ```
-//!
-//! # The control record (CTR v1)
-//!
-//! The control slot holds one astream step record whose step is the slot's commit word,
-//! around `u8 version=1 · aterm_lz4::compress_prepend_size(carry)`. The carry is the
-//! window's (`aterm-gui`'s crash carry of the session's turn ledger), opaque here.
-//!
-//! Every decoder here is panic-free on any bytes: lengths are checked before they
-//! index, and every LZ4 size prefix is bounded before anything is allocated.
+//! Crash-restore region record encoders and strict decoders.
 
 use astream_wire::steps::{StepEnd, encode_step, scan_steps_from};
 use aterm_core::grid::{HistoryFence, MAX_GRID_COLS, MAX_GRID_ROWS, ResizePolicy};
@@ -80,83 +10,68 @@ use aterm_core::scrollback::{
 };
 use aterm_core::terminal::{CHECKPOINT_META_REQUIRED_KEYS, CheckpointMeta, TerminalCheckpoint};
 
-// Tail records
-
-/// A tail record's header length.
+/// Tail record header byte length.
 pub const TAIL_RECORD_HEADER: usize = 16;
-/// PAD: fills the ring from a record's end to the ring's end.
+/// `PAD` record kind filling the remainder of the ring.
 pub const KIND_PAD: u8 = 0;
-/// BYTES: engine input.
+/// `BYTES` record kind for engine input.
 pub const KIND_BYTES: u8 = 1;
-/// RESIZE: a resize the engine applied, in engine order.
+/// `RESIZE` record kind for an applied engine resize.
 pub const KIND_RESIZE: u8 = 2;
-/// RESIZES_LOST: the engine's resize journal overran; that many resizes are not here.
+/// `RESIZES_LOST` record kind when the engine resize journal overran.
 pub const KIND_RESIZES_LOST: u8 = 3;
-/// ENGINE_REPLACED: the session's engine was replaced; what follows is another
-/// lifetime's.
+/// `ENGINE_REPLACED` record kind when the session engine was replaced.
 pub const KIND_ENGINE_REPLACED: u8 = 4;
-/// SUPERSEDED: the region's last record. The session's journal goes on in another region
-/// (a memory-pressure shed replaced this one with a history-less one, `aterm-gui`'s
-/// `crash_restore`), so everything the session read after this point is somewhere else.
-/// A restore that crosses it is never exact: the region speaks for the session only up to
-/// here, and the keeper may still hold it for a moment (until the new region's COMPANION
-/// reaches it), so a window that died in that moment is restored from it. A reader that
-/// predates the kind stops at it as at any unknown kind, a counted fault, so it is never
-/// read as exact by any build.
+/// `SUPERSEDED` record kind marking a region replaced by another region.
 pub const KIND_SUPERSEDED: u8 = 5;
-/// A RESIZE record's payload length.
+/// `RESIZE` record payload byte length.
 pub const RESIZE_PAYLOAD: usize = 24;
-/// A RESIZES_LOST record's payload length.
+/// `RESIZES_LOST` record payload byte length.
 pub const RESIZES_LOST_PAYLOAD: usize = 4;
-/// The most bytes one BYTES record carries; a longer slice is split, so one record
-/// never needs more than a small part of the ring.
+/// Maximum payload byte length for a single `BYTES` record.
 pub const MAX_BYTES_PAYLOAD: usize = 32 * 1024;
 
-/// `n` rounded up to a multiple of 8.
+/// Round `n` up to a multiple of 8.
 #[must_use]
 pub const fn pad8(n: usize) -> usize {
     n.div_ceil(8).saturating_mul(8)
 }
 
-/// One tail record's content.
+/// Decoded tail record payload.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TailRecord<'a> {
-    /// Engine input. `synthesized` bytes (a foreground handback, a manual reset)
-    /// reached the engine without coming from the PTY, so they add nothing to the
-    /// stream count.
+    /// Engine input bytes.
     Bytes {
-        /// Not PTY output.
+        /// Whether the bytes were synthesized rather than read from the PTY.
         synthesized: bool,
-        /// The bytes, as the engine processed them.
+        /// Engine input slice.
         bytes: &'a [u8],
     },
-    /// A resize the engine applied.
+    /// Applied engine resize.
     Resize {
         /// Rows after the resize.
         rows: u16,
         /// Columns after the resize.
         cols: u16,
-        /// The host's resize policy.
+        /// Host resize policy.
         policy: ResizePolicy,
-        /// The engine's resize lifetime.
+        /// Engine resize lifetime.
         lifetime: u64,
-        /// The resize's ordinal in that lifetime.
+        /// Resize ordinal within `lifetime`.
         ordinal: u64,
     },
-    /// This many resizes the engine's journal no longer held when the tail caught up.
+    /// Count of resizes lost when the engine resize journal overran.
     ResizesLost {
-        /// How many.
+        /// Number of lost resizes.
         n: u32,
     },
-    /// The session's engine was replaced.
+    /// Marker that the session's engine was replaced.
     EngineReplaced,
-    /// The session's journal went on in another region ([`KIND_SUPERSEDED`]).
+    /// Marker that the session's journal continued in another region ([`KIND_SUPERSEDED`]).
     Superseded,
 }
 
 /// A policy's byte. `ResizePolicy` is non-exhaustive: a policy this build does not know is
-/// journaled as a byte no reader accepts, so a replay across it stops and is counted
-/// rather than reflow the grid under the wrong policy.
 fn policy_byte(policy: ResizePolicy) -> u8 {
     match policy {
         ResizePolicy::Native => 0,
@@ -192,7 +107,7 @@ impl TailRecord<'_> {
         }
     }
 
-    /// The payload's length.
+    /// Unpadded payload byte length.
     #[must_use]
     pub fn payload_len(&self) -> usize {
         match self {
@@ -203,14 +118,13 @@ impl TailRecord<'_> {
         }
     }
 
-    /// The record's length in the ring: header, payload, padding to 8.
+    /// Total 8-byte-aligned record byte length in the ring.
     #[must_use]
     pub fn encoded_len(&self) -> usize {
         TAIL_RECORD_HEADER.saturating_add(pad8(self.payload_len()))
     }
 
-    /// The record's 16-byte header, `stream_end` in it: what the writer copies before a
-    /// BYTES payload it copies straight from the slice.
+    /// Build the 16-byte record header with `stream_end`.
     #[must_use]
     pub fn header(&self, stream_end: u64) -> [u8; TAIL_RECORD_HEADER] {
         let mut out = [0u8; TAIL_RECORD_HEADER];
@@ -222,9 +136,7 @@ impl TailRecord<'_> {
         out
     }
 
-    /// Append the record, `stream_end` in its header, to `out`. A BYTES payload over
-    /// `u32::MAX` is the caller's to split (the writer splits at
-    /// [`MAX_BYTES_PAYLOAD`]); its length field saturates.
+    /// Append the encoded record with `stream_end` to `out`.
     pub fn encode(&self, stream_end: u64, out: &mut Vec<u8>) {
         let start = out.len();
         out.extend_from_slice(&self.header(stream_end));
@@ -251,8 +163,7 @@ impl TailRecord<'_> {
     }
 }
 
-/// A PAD record's header, filling `gap` bytes (at least [`TAIL_RECORD_HEADER`]) to the
-/// ring's end. Its payload bytes are left as they are.
+/// Build a `PAD` record header filling `gap` bytes to the end of the ring.
 #[must_use]
 pub fn pad_header(gap: usize, stream_end: u64) -> [u8; TAIL_RECORD_HEADER] {
     let mut out = [0u8; TAIL_RECORD_HEADER];
@@ -263,23 +174,23 @@ pub fn pad_header(gap: usize, stream_end: u64) -> [u8; TAIL_RECORD_HEADER] {
     out
 }
 
-/// A tail record's header, as read.
+/// Raw 16-byte tail record header.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TailHeader {
-    /// The record kind.
+    /// Record kind tag.
     pub kind: u8,
-    /// The kind's flags.
+    /// Kind-specific flags.
     pub flags: u8,
-    /// Must be zero.
+    /// Reserved field (must be zero).
     pub reserved: u16,
-    /// The payload's length (before padding).
+    /// Unpadded payload length in bytes.
     pub payload_len: u32,
-    /// PTY bytes processed after the record.
+    /// Cumulative PTY bytes processed after this record.
     pub stream_end: u64,
 }
 
 impl TailHeader {
-    /// Read a header. Total: any 16 bytes are a header; [`decode_tail_payload`] judges.
+    /// Decode a 16-byte header for validation by [`decode_tail_payload`].
     #[must_use]
     pub fn read(bytes: &[u8; TAIL_RECORD_HEADER]) -> Self {
         let [
@@ -309,7 +220,7 @@ impl TailHeader {
         }
     }
 
-    /// The record's whole length in the ring (header, payload, padding), saturating.
+    /// Total 8-byte-aligned record length in the ring, saturating on overflow.
     #[must_use]
     pub fn record_len(&self) -> usize {
         let payload = usize::try_from(self.payload_len).unwrap_or(usize::MAX);
@@ -317,26 +228,24 @@ impl TailHeader {
     }
 }
 
-/// Why the tail stopped being read: the first invalid record ends the replay, and is
-/// counted.
+/// Fault that terminated tail replay.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TailFault {
-    /// A kind this build does not know.
+    /// Unrecognized record kind.
     UnknownKind(u8),
-    /// Flags or the reserved field hold bits the kind does not define.
+    /// Undefined flags or non-zero reserved bits.
     BadFlags,
-    /// A payload length the kind does not allow, or one past the ring's end.
+    /// Invalid payload length for the record kind or ring bounds.
     BadLength,
-    /// A PAD that does not end exactly at the ring's end.
+    /// `PAD` record does not end at the ring boundary.
     BadPad,
-    /// A record that runs past the commit word, or a commit word inconsistent with the
-    /// floor and the ring.
+    /// Record extends past the commit word or commit bounds are inconsistent.
     PastCommit,
-    /// A record whose stream position is behind the one before it.
+    /// Record `stream_end` regressed relative to the previous record.
     StreamBackwards,
-    /// The keyframe's tail position is not a record boundary of the tail.
+    /// Keyframe tail offset does not land on a record boundary.
     Misplaced,
-    /// The region refused a read.
+    /// Region read failed.
     Unreadable,
 }
 
@@ -355,12 +264,10 @@ impl std::fmt::Display for TailFault {
     }
 }
 
-/// Judge a record's payload against its header. The PAD kind is the reader's to
-/// handle (it carries no content), so it is refused here.
+/// Decode and validate a tail record payload against `header`.
 ///
 /// # Errors
-///
-/// The [`TailFault`] that ends the replay.
+/// Returns the [`TailFault`] that stops tail replay.
 pub fn decode_tail_payload<'a>(
     header: &TailHeader,
     payload: &'a [u8],
@@ -459,15 +366,12 @@ pub fn decode_tail_payload<'a>(
     }
 }
 
-// Shared step-record reading
-
-/// What made a step record unreadable.
+/// Fault making a step record unreadable.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StepFault {
-    /// The scan did not accept exactly one record ending at the bytes' end (inside a
-    /// commit word any end but `Clean` is a fault).
+    /// Step scan did not end cleanly at the buffer boundary.
     Frame(StepEnd),
-    /// The scan accepted no record, or more than one.
+    /// Step scan did not yield exactly one record.
     Count(usize),
 }
 
@@ -486,7 +390,6 @@ fn one_step(bytes: &[u8], seq: u64) -> Result<&[u8], StepFault> {
 }
 
 /// Decompress a size-prepended LZ4 block whose size is at most `max`, allocating only
-/// after the bound holds and only fallibly.
 fn bounded_lz4(input: &[u8], max: usize) -> Option<Vec<u8>> {
     let (size, rest) = aterm_lz4::uncompressed_size(input).ok()?;
     if size > max {
@@ -541,14 +444,14 @@ fn put_blob(out: &mut Vec<u8>, blob: &[u8]) -> Result<(), EncodeError> {
     Ok(())
 }
 
-/// Why a record could not be encoded.
+/// Error returned when encoding a region record.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EncodeError {
-    /// The meta did not serialize.
+    /// Metadata serialization failed.
     Meta(String),
-    /// A part, or the record, is past what its length field or the frame can hold.
+    /// Part or total record length exceeds format limits.
     TooLarge,
-    /// The checkpoint carries a shell-integration nonce, which never enters a region.
+    /// Checkpoint contains a shell-integration nonce, which is never journaled.
     Nonce,
 }
 
@@ -562,39 +465,26 @@ impl std::fmt::Display for EncodeError {
     }
 }
 
-// The control record (CTR v1, increment 7)
-
-/// The control record's body version.
+/// Control record body format version.
 pub const CTR_VERSION: u8 = 1;
-/// The largest carry a reader decompresses from a control record: what the update
-/// handoff's own control sidecar may hold (`aterm-gui`'s `handoff_carry::MAX_SIDECAR_BYTES`,
-/// which a whole 512-record ledger stays well under), so a crash carry is held to the
-/// bound an update's is, and a size prefix past it is refused before anything is
-/// allocated.
+/// Maximum decompressed byte length of a control carry.
 pub const MAX_CONTROL_CARRY: usize = 4 * 1024 * 1024;
 
-/// Why a control record was refused.
+/// Fault returned when decoding a control record.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ControlFault {
-    /// Not one step record whose step is the slot's commit word, or its CRC fails.
+    /// Step frame or sequence mismatch.
     Step(StepFault),
-    /// A body version this build does not read.
+    /// Unsupported control record body version.
     Version(u8),
-    /// The LZ4 block is malformed or its size prefix is past [`MAX_CONTROL_CARRY`].
+    /// Malformed LZ4 payload or uncompressed size above [`MAX_CONTROL_CARRY`].
     Compressed,
 }
 
-/// Encode a control record (the slot's sequence number `seq`, nonzero): the window's
-/// CONTROL CARRY (`carry`, opaque here: `aterm-gui`'s crash carry of the session's turn
-/// ledger) as an astream step record whose step is `seq`, around
-/// `u8 CTR_VERSION · aterm_lz4::compress_prepend_size(carry)`. The carry is compressed
-/// because the slot is small and a ledger's JSON compresses well: more of the newest turns
-/// fit.
+/// Encode a control carry into step record `seq`.
 ///
 /// # Errors
-///
-/// [`EncodeError::TooLarge`] for a carry past [`MAX_CONTROL_CARRY`] or a record past what
-/// a frame holds.
+/// Returns [`EncodeError::TooLarge`] if `carry` exceeds [`MAX_CONTROL_CARRY`] or step framing limits.
 pub fn encode_control(seq: u64, carry: &[u8]) -> Result<Vec<u8>, EncodeError> {
     if carry.len() > MAX_CONTROL_CARRY {
         return Err(EncodeError::TooLarge);
@@ -606,15 +496,10 @@ pub fn encode_control(seq: u64, carry: &[u8]) -> Result<Vec<u8>, EncodeError> {
     encode_step(seq, &body).map_err(|_| EncodeError::TooLarge)
 }
 
-/// Decode the control step record `record`, whose slot's commit word is `seq`: the carry.
-///
-/// Strict: one step record whose step is `seq` and whose CRC holds, a body version this
-/// build reads, and an LZ4 size bounded before anything is allocated. Panic-free on any
-/// bytes.
+/// Strictly decode control step record `record` at sequence `seq`.
 ///
 /// # Errors
-///
-/// The first [`ControlFault`].
+/// Returns the first [`ControlFault`] encountered.
 pub fn decode_control(record: &[u8], seq: u64) -> Result<Vec<u8>, ControlFault> {
     let body = one_step(record, seq).map_err(ControlFault::Step)?;
     let (&version, compressed) = body
@@ -626,13 +511,9 @@ pub fn decode_control(record: &[u8], seq: u64) -> Result<Vec<u8>, ControlFault> 
     bounded_lz4(compressed, MAX_CONTROL_CARRY).ok_or(ControlFault::Compressed)
 }
 
-// Keyframes (KFR v1)
-
-/// The keyframe record's body version.
+/// Keyframe record body format version.
 pub const KFR_VERSION: u8 = 1;
-/// The largest keyframe body a reader decompresses: a 384 KiB slot cannot honestly
-/// hold more than this much screen, and a size prefix past it is refused before any
-/// allocation.
+/// Maximum decompressed byte length of a keyframe body.
 pub const MAX_KEYFRAME_BODY: usize = 64 * 1024 * 1024;
 
 const FLAG_PARSER_GROUND: u8 = 0b001;
@@ -640,71 +521,60 @@ const FLAG_ALT_ACTIVE: u8 = 0b010;
 const FLAG_BRIDGE_ON_INACTIVE: u8 = 0b100;
 const FLAG_INTEGRATION_ON: u8 = 0b1000;
 
-/// A keyframe's facts beside its checkpoint: where in the tail and the stream it was
-/// cut, what the engine's resize journal and history fence said then, how much history
-/// its bridge may carry, and the config it ran under.
+/// Keyframe header metadata alongside its [`TerminalCheckpoint`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KeyframeHead {
-    /// Its sequence number: its step, and its slot's commit word.
+    /// Keyframe sequence number and slot commit word.
     pub seq: u64,
-    /// The tail position (`tail_commit`) it was captured at: the tail it needs starts
-    /// here.
+    /// Tail commit offset where this keyframe was captured.
     pub tail_from: u64,
-    /// PTY bytes processed when it was captured.
+    /// Cumulative PTY bytes processed at capture.
     pub stream_at: u64,
-    /// The engine's resize lifetime then.
+    /// Engine resize lifetime at capture.
     pub resize_lifetime: u64,
-    /// The engine's resize ordinal then.
+    /// Engine resize ordinal at capture.
     pub resize_ordinal: u64,
-    /// The engine's history fence then.
+    /// Engine history fence at capture.
     pub fence: HistoryFence,
-    /// The most history lines its bridge may carry (the decoder's bound).
+    /// Maximum history bridge lines permitted by the decoder.
     pub bridge_lines: u32,
-    /// The engine-relevant config's fingerprint then.
+    /// Engine-relevant config fingerprint at capture.
     pub config_fp: u64,
-    /// The engine required a shell-integration nonce and had one in use then
-    /// (`ShellIntegrationPosture::On`). The checkpoint carries no nonce (a restored shell
-    /// re-keys), yet the replay depends on the posture: an OSC 7 a background job prints
-    /// while an authenticated shell sits at its prompt waits for the shell's next prompt
-    /// in such an engine, and lands at once in one with no nonce in use. So the recovery
-    /// authorizes a nonce of its own in the scratch engine when this is set
-    /// (`RecoverPolicy::scratch_nonce`).
+    /// Whether shell-integration nonce posture was active at capture.
     pub integration_on: bool,
 }
 
-/// A decoded keyframe.
+/// Decoded keyframe record.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Keyframe {
-    /// Its facts.
+    /// Keyframe header metadata.
     pub head: KeyframeHead,
-    /// The engine as it was.
+    /// Captured terminal checkpoint.
     pub checkpoint: TerminalCheckpoint,
 }
 
-/// Why a keyframe slot holds no keyframe this build restores.
+/// Fault returned when decoding a keyframe slot.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KeyframeFault {
-    /// The step record is damaged or not the one the commit word names.
+    /// Step frame or sequence mismatch.
     Step(StepFault),
-    /// The LZ4 body is damaged, or its size prefix is past [`MAX_KEYFRAME_BODY`].
+    /// Malformed LZ4 payload or uncompressed size above [`MAX_KEYFRAME_BODY`].
     Compressed,
-    /// A body version this build does not know.
+    /// Unsupported keyframe body version.
     Version(u8),
-    /// The body ends early, or holds bytes past its last field.
+    /// Truncated body or trailing bytes after the final field.
     Truncated,
-    /// The body's own sequence number is not its step's.
+    /// Body sequence number does not match the step sequence.
     Seq,
-    /// Flags or reserved bits this build does not define, or flags that disagree with
-    /// the meta.
+    /// Undefined flags/reserved bits or flag mismatch with checkpoint metadata.
     Flags,
-    /// The meta is not JSON, lacks a required key, or does not deserialize.
+    /// Invalid or incomplete checkpoint metadata JSON.
     Meta,
-    /// A geometry no grid has, or one the meta and the head disagree on.
+    /// Invalid grid dimensions or mismatch between header and metadata.
     Geometry,
-    /// A grid blob fails the strict line decode or holds the wrong number of records.
+    /// Grid blob failed strict line decoding or line-count validation.
     Grid,
-    /// The meta carries a shell-integration nonce, in its own field or in an OSC 133/633
-    /// mark its parser carry holds: no journal keyframe may carry either form.
+    /// Checkpoint metadata or parser carry contains a shell-integration nonce.
     Nonce,
 }
 
@@ -726,11 +596,6 @@ impl std::fmt::Display for KeyframeFault {
 }
 
 /// The strict per-line bounds a grid record is decoded under at `cols`: at most
-/// `cols * 256` content bytes (one 256-byte grapheme unit a cell), and a record of at
-/// most the handoff's cap (`16 KiB + cols * 512`) plus one OSC 8 link span a column at
-/// the ingestion ceilings (`max_linked_record_bytes`). A line the engine holds is never
-/// over that; the journal was written by a build of this program in the same session,
-/// so nothing a link-heavy row legitimately holds is refused.
 fn line_caps(cols: u16) -> (usize, usize, usize) {
     let cells = usize::from(cols);
     let content_cap = cells.saturating_mul(256);
@@ -745,21 +610,15 @@ fn line_caps(cols: u16) -> (usize, usize, usize) {
 }
 
 /// Decode a grid blob strictly: at most `max_records` records at `cols`, each under
-/// [`line_caps`], no trailing bytes. Returns the record count.
 fn strict_records(blob: &[u8], max_records: usize, cols: u16) -> Option<usize> {
     let (cells, content_cap, record_cap) = line_caps(cols);
     deserialize_lines_strict(blob, max_records, cells, content_cap, record_cap).map(|l| l.len())
 }
 
-/// Encode one keyframe as the step record a slot holds.
+/// Encode a keyframe (`head` and `checkpoint`) as step record `head.seq`.
 ///
 /// # Errors
-///
-/// [`EncodeError::Nonce`] for a checkpoint that carries a nonce, in its own field (only
-/// the seamless carry projects one) or inside an OSC 133/633 mark its parser carry holds
-/// (`TerminalCheckpoint::parser_holds_shell_mark`); the journal takes
-/// `Terminal::checkpoint_journal`, which never does either. [`EncodeError::Meta`] or
-/// [`EncodeError::TooLarge`] otherwise.
+/// Returns [`EncodeError::Nonce`] if `checkpoint` holds a nonce, or [`EncodeError::Meta`] / [`EncodeError::TooLarge`].
 pub fn encode_keyframe(
     head: &KeyframeHead,
     checkpoint: &TerminalCheckpoint,
@@ -816,20 +675,10 @@ pub fn encode_keyframe(
     encode_step(head.seq, &compressed).map_err(|_| EncodeError::TooLarge)
 }
 
-/// Decode the keyframe step record `record`, whose slot's commit word is `seq`.
-///
-/// Strict: the step must be `seq`, the frame's CRC must hold, the LZ4 size is bounded
-/// before anything is allocated, the meta must name every key of
-/// `CHECKPOINT_META_REQUIRED_KEYS` and carry no nonce (in its own field, or in an OSC
-/// 133/633 mark its parser carry holds), and each grid must pass the
-/// strict line decode with the record count its role allows: the main grid exactly
-/// `rows + history_lines` (the bridge on the main screen, `history_lines ≤
-/// bridge_lines`), the inactive grid `rows` — or, while the alternate screen is up and
-/// the bridge rides the saved primary, between `rows` and `rows + bridge_lines`.
+/// Strictly decode keyframe step record `record` at sequence `seq`.
 ///
 /// # Errors
-///
-/// The first [`KeyframeFault`].
+/// Returns the first [`KeyframeFault`] encountered.
 pub fn decode_keyframe(record: &[u8], seq: u64) -> Result<Keyframe, KeyframeFault> {
     let compressed = one_step(record, seq).map_err(KeyframeFault::Step)?;
     let body = bounded_lz4(compressed, MAX_KEYFRAME_BODY).ok_or(KeyframeFault::Compressed)?;
@@ -899,8 +748,6 @@ pub fn decode_keyframe(record: &[u8], seq: u64) -> Result<Keyframe, KeyframeFaul
     let bridge = usize::try_from(bridge_lines).map_err(|_| KeyframeFault::Grid)?;
     let visible = usize::from(rows);
 
-    // The main grid: exactly `rows + history_lines`, the history bounded by the bridge
-    // (none at all while the bridge rides the saved primary).
     let main_bridge = if on_inactive { 0 } else { bridge };
     let history = usize::try_from(meta.history_lines).map_err(|_| KeyframeFault::Grid)?;
     if history > main_bridge {
@@ -912,7 +759,6 @@ pub fn decode_keyframe(record: &[u8], seq: u64) -> Result<Keyframe, KeyframeFaul
         return Err(KeyframeFault::Grid);
     }
 
-    // The inactive grid: present exactly when the meta has its cursor.
     let alt_grid = match (alt.is_empty(), meta.alt_cursor.is_some()) {
         (true, false) => None,
         (false, true) => {
@@ -959,7 +805,6 @@ pub fn decode_keyframe(record: &[u8], seq: u64) -> Result<Keyframe, KeyframeFaul
 }
 
 /// The meta, read as the screen carry reads one: JSON, an object naming every required
-/// key, then the typed form.
 fn parse_meta(bytes: &[u8]) -> Result<CheckpointMeta, KeyframeFault> {
     let text = std::str::from_utf8(bytes).map_err(|_| KeyframeFault::Meta)?;
     let value: aterm_json::Value = aterm_json::from_str(text).map_err(|_| KeyframeFault::Meta)?;
@@ -973,36 +818,30 @@ fn parse_meta(bytes: &[u8]) -> Result<CheckpointMeta, KeyframeFault> {
     aterm_json::from_value(value).map_err(|_| KeyframeFault::Meta)
 }
 
-// History chunks (HCR v1)
-
-/// The history chunk body version.
+/// History chunk body format version.
 pub const HCR_VERSION: u8 = 1;
-/// A history chunk head's length.
+/// History chunk header byte length.
 pub const HCR_HEAD_LEN: usize = 40;
-/// The most lines one chunk holds: one handoff-history sidecar frame
-/// (`aterm-gui`'s `handoff_history::CHUNK_LINES`).
+/// Maximum lines per history chunk.
 pub const CHUNK_LINES: usize = 1024;
-/// Absolute decompressed history-frame budget, including the length-prefixed block.
-/// This matches the scrollback codec's 64 MiB decompressed-page ceiling.
+/// Maximum decompressed byte budget for a history frame.
 pub const MAX_HISTORY_FRAME_BYTES: usize = 64 * 1024 * 1024;
 
-/// What a history export is fenced on, less its extent: two fences with the same
-/// identity number the same history the same way (`HistoryFence::holds_at`, the
-/// `end` half aside).
+/// History identity fields shared by compatible [`HistoryFence`]s.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct HistoryIdentity {
-    /// Advanced by any width reflow or unscroll.
+    /// Epoch bumped by width reflow or unscroll.
     pub renumber_epoch: u64,
-    /// Advanced by ED3 and a full reset.
+    /// Generation bumped by ED3 or full reset.
     pub clear_gen: u64,
-    /// Advanced by a rows-grow that handed history lines back to the screen.
+    /// Generation bumped when a rows-grow resize reveals history lines.
     pub reveal_gen: u64,
-    /// The width every history line is wrapped at.
+    /// Column width at which history lines are wrapped.
     pub cols: u16,
 }
 
 impl HistoryIdentity {
-    /// The identity half of `fence`.
+    /// Extract the [`HistoryIdentity`] from `fence`.
     #[must_use]
     pub fn of(fence: &HistoryFence) -> Self {
         Self {
@@ -1014,38 +853,36 @@ impl HistoryIdentity {
     }
 }
 
-/// A history chunk as the ring holds it: its head, and its compressed frame.
+/// Encoded history chunk header and compressed frame.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HistoryChunk {
-    /// The ring step it was read at.
+    /// Ring step sequence number.
     pub seq: u64,
-    /// The absolute row of its first line.
+    /// Absolute row index of the chunk's first line.
     pub first_row: u64,
-    /// How many lines it holds.
+    /// Number of lines in the chunk.
     pub n_lines: u32,
-    /// The history identity it was exported under.
+    /// History identity under which the chunk was exported.
     pub identity: HistoryIdentity,
-    /// `compress_prepend_size(u32 frame_len | serialize_lines(lines))`.
+    /// Size-prepended LZ4-compressed history frame.
     pub frame: Vec<u8>,
 }
 
-/// Why a history chunk is unreadable.
+/// Fault returned when decoding a history chunk.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChunkFault {
-    /// The step record is damaged, or not the next step.
+    /// Step frame or sequence mismatch.
     Step(StepFault),
-    /// The head is short, of another version, or holds undefined bits.
+    /// Truncated, wrong-version, or malformed chunk header.
     Head,
-    /// The frame does not decompress within its bound, or does not decode strictly.
+    /// Frame failed bounded LZ4 decompression or strict line decoding.
     Frame,
 }
 
-/// Encode `lines` (at most [`CHUNK_LINES`], wrapped at `identity.cols`, the first at
-/// absolute row `first_row`) as the step record `seq` of the history ring.
+/// Encode `lines` (at most [`CHUNK_LINES`]) as history ring step record `seq`.
 ///
 /// # Errors
-///
-/// [`EncodeError::TooLarge`] past [`CHUNK_LINES`] lines or the frame's cap.
+/// Returns [`EncodeError::TooLarge`] if `lines` exceeds [`CHUNK_LINES`] or frame limits.
 pub fn encode_history_chunk(
     seq: u64,
     first_row: u64,
@@ -1055,7 +892,6 @@ pub fn encode_history_chunk(
     encode_history_chunk_with_budget(seq, first_row, identity, lines, MAX_HISTORY_FRAME_BYTES)
 }
 
-// Supplied-budget seam shared by the public entry and its small allocation controls.
 fn encode_history_chunk_with_budget(
     seq: u64,
     first_row: u64,
@@ -1098,11 +934,10 @@ fn encode_history_chunk_with_budget(
     encode_step(seq, &body).map_err(|_| EncodeError::TooLarge)
 }
 
-/// Read a chunk's head from its step body, keeping its frame.
+/// Decode a [`HistoryChunk`] header from step payload `body` at sequence `seq`.
 ///
 /// # Errors
-///
-/// [`ChunkFault::Head`].
+/// Returns [`ChunkFault::Head`] if the header is invalid.
 pub fn decode_history_chunk(seq: u64, body: &[u8]) -> Result<HistoryChunk, ChunkFault> {
     let mut f = Fields { bytes: body };
     let version = f.u8().ok_or(ChunkFault::Head)?;
@@ -1137,20 +972,15 @@ pub fn decode_history_chunk(seq: u64, body: &[u8]) -> Result<HistoryChunk, Chunk
 }
 
 impl HistoryChunk {
-    /// The chunk's lines, decoded strictly at its width: the frame decompresses within
-    /// both the absolute frame budget and the bound its line count and width allow,
-    /// holds exactly one length-prefixed
-    /// block, and that block holds exactly `n_lines` lines.
+    /// Strictly decompress and decode the chunk's [`Line`]s.
     ///
     /// # Errors
-    ///
-    /// [`ChunkFault::Frame`].
+    /// Returns [`ChunkFault::Frame`] if decompression or strict line decoding fails.
     pub fn lines(&self) -> Result<Vec<Line>, ChunkFault> {
         self.lines_with_budget(MAX_HISTORY_FRAME_BYTES)
     }
 
     /// The decompressed frame's bound: what its line count and width allow, under the
-    /// absolute frame budget.
     fn frame_bound(&self, frame_budget: usize) -> Result<usize, ChunkFault> {
         let (_, _, record_cap) = line_caps(self.identity.cols);
         let n = usize::try_from(self.n_lines).map_err(|_| ChunkFault::Frame)?;
@@ -1161,29 +991,20 @@ impl HistoryChunk {
         Ok(max.min(frame_budget).min(MAX_HISTORY_FRAME_BYTES))
     }
 
-    /// The size the frame's LZ4 prefix says it decompresses to, when that is within the
-    /// bound [`Self::frame`] decompresses under: what a reader of the frame stream counts
-    /// before it decompresses anything.
+    /// Return the decompressed frame byte length from the LZ4 size prefix after checking bounds.
     ///
     /// # Errors
-    ///
-    /// [`ChunkFault::Frame`] for a prefix past the bound, or none.
+    /// Returns [`ChunkFault::Frame`] if the prefix is missing or exceeds [`Self::frame`] bounds.
     pub fn frame_size(&self) -> Result<usize, ChunkFault> {
         let max = self.frame_bound(MAX_HISTORY_FRAME_BYTES)?;
         let (size, _) = aterm_lz4::uncompressed_size(&self.frame).map_err(|_| ChunkFault::Frame)?;
         (size <= max).then_some(size).ok_or(ChunkFault::Frame)
     }
 
-    /// The decompressed frame, `u32 frame_len | serialize_lines(lines)`: exactly one
-    /// handoff-history sidecar frame, which the window's import reads with the sidecar's
-    /// own strict decoder (its link leniency included). Decompressed within the bound its
-    /// line count and width allow, to exactly the size its prefix names. The frame holds
-    /// exactly one block whose encoded line count equals `n_lines`; the importer still
-    /// strictly decodes that block, including its existing hyperlink leniency.
+    /// Decompress and validate the raw handoff-history sidecar frame (`u32 frame_len | serialize_lines(lines)`).
     ///
     /// # Errors
-    ///
-    /// [`ChunkFault::Frame`].
+    /// Returns [`ChunkFault::Frame`] if decompression or block validation fails.
     pub fn frame(&self) -> Result<Vec<u8>, ChunkFault> {
         let max = self.frame_bound(MAX_HISTORY_FRAME_BYTES)?;
         let frame = bounded_lz4(&self.frame, max).ok_or(ChunkFault::Frame)?;

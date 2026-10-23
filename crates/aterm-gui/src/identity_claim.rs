@@ -2,70 +2,6 @@
 // Copyright 2026 Andrew Yates
 
 //! One live holder per session id, machine-wide.
-//!
-//! A minted session id is 80 bits of OS CSPRNG ([`aterm_session::SessionId::generate`]) and
-//! never collides. An adopted one can: a pane's shell exports `ATERM_SESSION_ID` (the identity
-//! an outer aterm preminted for an inner one), and every aterm started from that shell reads the
-//! same premint, which stays re-readable (`proxy::read_edge_tokens`) so a child aterm can
-//! relaunch under it. A relaunch (a transfer) must be told apart from a second simultaneous
-//! launch (a duplicate): `@<sid>` is the control plane's address (`graph/<sid>`), and a
-//! duplicate could route a driver's keystrokes into another instance's window.
-//!
-//! ## The claim
-//!
-//! Before answering to an adopted id a process takes `<control-dir>/claims/<sid>` with
-//! `flock(LOCK_EX|LOCK_NB)` (Windows: an exclusive-share-mode handle) for its whole life. It is
-//! race-free (`flock` locks the open file description, so two opens in one process contend
-//! too), self-releasing (the lock dies with the holder, `SIGKILL` included, so there is no
-//! stale-lock sweep), and never unlinked (unlinking a file a peer holds open is how two
-//! processes could both "hold" an id).
-//!
-//! ## The second gate: a live discovery entry
-//!
-//! A seamless update hands live sessions, ids included, to a successor (`seamless.rs`) that
-//! cannot inherit the lock (the claim fd is not in the handoff's fd set). So [`live_holder_in`]
-//! treats an id whose `graph/<sid>` entry names a live process other than us as held. Adoption
-//! requires both gates; a handoff keeps its ids unconditionally.
-//!
-//! ## The third gate: the handoff window
-//!
-//! With a fixed-path socket (`--control-sock`) the predecessor exits before the successor binds
-//! and publishes, so neither gate answers in between. At Commit, before `_exit`, the predecessor
-//! writes `claims/<sid>.successor` naming the successor's pid ([`mark_successor`]), and
-//! [`claim_for_adoption`] treats a marker naming a live process other than us as held. Once
-//! published, the successor takes each transferred claim and retires its markers
-//! ([`settle_transferred`]). A stale marker names a dead pid (ignored) or a live unrelated one
-//! (a safe refusal: the launch mints a fresh identity). Model: `SessionIdClaim`.
-//!
-//! ## The epoch record
-//!
-//! A relaunch under an adopted id starts a new session log for it, whose
-//! first epoch must be above every epoch a predecessor's log of the id held
-//! (`session_log::Epochs`), or a reader's cursor of the dead
-//! process reads on into the live one with no gap. The wall seconds give that
-//! only when the relaunch comes a second or more after the predecessor's
-//! log started and the clock has not stepped back, and a restore leaf's
-//! `log_ep` only when a layout was restored. So every process that gives an
-//! adopted id's log an epoch records it beside the claim, in
-//! `claims/<sid>.ep` ([`record_epoch`]): the process that adopted the
-//! environment's premint, and each process the id is then handed to (a
-//! seamless update's successor, a crash recovery) while that record exists.
-//! The record only grows, is written tmp-then-rename, and is read by the
-//! next adoption once its claim is held ([`recorded_epoch_in`]), before its
-//! log starts. Like the claim file it is never unlinked. A build older than
-//! the record neither writes nor reads it: a relaunch by one, or after one,
-//! within the predecessor's wall second can still repeat its epoch.
-//!
-//! ## The update candidate
-//!
-//! A successor on a per-process socket (`aterm-<pid>.sock`) binds before the Commit but
-//! publishes only at it (`control::spawn`'s `publish_gate`). A successor that published early
-//! would name a live process other than this one while this one still owns the sessions, so
-//! the handoff lane registers the candidate's kernel-attested pid for as long as the attempt
-//! decides ([`register_handoff_candidate`]), and the `@<sid>` dispatch probe ([`live_holder`])
-//! does not refuse an id whose entry names it. A stranger publishing the same id is still
-//! refused, and adoption still reads the candidate's entry as a holder. Model:
-//! `HandoffAddressOwner`.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -75,26 +11,19 @@ use aterm_session::SessionId;
 /// Subdirectory of the per-user control directory holding claim files.
 const CLAIMS_DIR: &str = "claims";
 
-/// An exclusive hold on one session id, alive while this value is. Dropping the
-/// `File` drops the kernel lock, so the value is parked ([`hold`]) while the
-/// process answers to the id. Not `Clone`: two holders is the bug.
+/// An exclusive hold on one session id, alive while this value is.
 pub(crate) struct Claim {
     /// The locked claim file, held open so the lock stays taken. Unix reads it in
-    /// `Drop` to unlock; on Windows the open handle's share mode IS the claim.
     #[cfg_attr(
         windows,
         expect(dead_code, reason = "held for its close: the open handle is the claim")
     )]
     file: std::fs::File,
     /// The id this claim holds — so [`settle_transferred`] can tell an id it already
-    /// holds from one it still has to take.
     sid: String,
 }
 
 /// The drop releases the claim at once with `LOCK_UN`, not the close: a child
-/// another thread is spawning holds a copy of every descriptor until it execs.
-/// (Windows: the handle's exclusive share mode is the claim, its close the
-/// release.)
 impl Drop for Claim {
     fn drop(&mut self) {
         #[cfg(unix)]
@@ -102,22 +31,17 @@ impl Drop for Claim {
     }
 }
 
-/// The answer to a claim request. "Another live process holds it" and "could
-/// not find out" are both refusals (a caller that cannot prove it is the sole
-/// holder mints a fresh identity), but only the first is a peer, and the log
-/// says which.
+/// The answer to a claim request.
 pub(crate) enum ClaimOutcome {
-    /// Held. Park it with [`hold`] to keep it for the process's life.
+    /// Held.
     Held(Claim),
     /// Another live process holds this id.
     Taken,
-    /// The claim could not be taken or proved: no usable control directory, a
-    /// malformed id, or an I/O error. Carries the reason for the caller's log.
+    /// The claim could not be taken or proved: no usable control directory, a malformed id, or an I/O error.
     Unprovable(String),
 }
 
 /// Every claim this process holds, kept alive for its whole life. A `Vec`:
-/// claims are taken a handful of times per process and never looked up.
 static HELD: std::sync::Mutex<Vec<Claim>> = std::sync::Mutex::new(Vec::new());
 
 /// Park a claim for the process's lifetime.
@@ -125,18 +49,13 @@ pub(crate) fn hold(claim: Claim) {
     HELD.lock().unwrap_or_else(|p| p.into_inner()).push(claim);
 }
 
-/// Drop every claim this process holds: how a test models a holder exiting,
-/// which releases the `flock` so a relaunch or successor can adopt. In
-/// production a claim is released only by the process dying.
+/// Drop every claim this process holds.
 #[cfg(test)]
 pub(crate) fn release_claims_for_test() {
     HELD.lock().unwrap_or_else(|p| p.into_inner()).clear();
 }
 
 /// The ids this process adopted (from the environment premint or a handoff)
-/// rather than minted: the only ids of ours another process can also hold.
-/// Keeping them makes the dispatch probe a set lookup for every minted id and
-/// a pair of syscalls only for a contestable one.
 static ADOPTED: std::sync::RwLock<Vec<String>> = std::sync::RwLock::new(Vec::new());
 
 /// Record that this process is answering to an id it did NOT mint.
@@ -149,36 +68,26 @@ pub(crate) fn note_adopted(sid: &SessionId) {
 
 /// Whether `sid` is one this process adopted; see [`ADOPTED`].
 fn adopted_here(sid: &SessionId) -> bool {
-    // Receiver named on the acquisition line (the lock-order census resolves a
-    // lock's identity from it); a leaf hold: nothing is locked under it.
     let guard = ADOPTED.read();
     let adopted = guard.unwrap_or_else(|p| p.into_inner());
     adopted.iter().any(|s| s == sid.as_str())
 }
 
 /// The claim file for `sid` under `dir`, or `None` for an id not of the minted
-/// shape. The id comes from the environment or a handoff manifest and becomes a
-/// filename; `is_valid_session_id` admits only `s-` plus 20 hex digits, so the
-/// join cannot leave `dir`.
 fn claim_path(dir: &Path, sid: &SessionId) -> Option<PathBuf> {
     crate::spawn::is_valid_session_id(sid.as_str()).then(|| dir.join(CLAIMS_DIR).join(sid.as_str()))
 }
 
-/// Take the exclusive claim on `sid` under control directory `dir` (a parameter
-/// so tests can use a scratch directory).
+/// Take the exclusive claim on `sid` under control directory `dir` (a parameter so tests can use a scratch directory).
 pub(crate) fn claim_in(dir: &Path, sid: &SessionId) -> ClaimOutcome {
     let Some(path) = claim_path(dir, sid) else {
         return ClaimOutcome::Unprovable(format!("{} is not a session id", sid.as_str()));
     };
-    // 0700 and owner-verified, like the sibling `graph/` and `edges/`
-    // subdirectories, so another user cannot plant a claim.
     if let Err(e) = crate::control_auth::ensure_private_dir(&dir.join(CLAIMS_DIR)) {
         return ClaimOutcome::Unprovable(format!("claims directory unusable: {e}"));
     }
     let file = match open_claim(&path) {
         Ok(f) => f,
-        // Windows refuses the open when a peer holds the file exclusively; unix
-        // refuses the lock below. Both mean taken.
         Err(e) if is_sharing_violation(&e) => return ClaimOutcome::Taken,
         Err(e) => return ClaimOutcome::Unprovable(format!("{}: {e}", path.display())),
     };
@@ -187,8 +96,6 @@ pub(crate) fn claim_in(dir: &Path, sid: &SessionId) -> ClaimOutcome {
         Ok(false) => return ClaimOutcome::Taken,
         Err(e) => return ClaimOutcome::Unprovable(format!("{}: {e}", path.display())),
     }
-    // Contents are diagnostics only; the lock is the claim. The pid is whoever
-    // last won, possibly a process that no longer exists.
     let _ = write_pid(&file);
     ClaimOutcome::Held(Claim {
         file,
@@ -202,15 +109,11 @@ fn successor_marker_path(dir: &Path, sid: &SessionId) -> Option<PathBuf> {
 }
 
 /// The epoch record beside a claim file: `claims/<sid>.ep` (module doc, "The
-/// epoch record").
 fn epoch_record_path(dir: &Path, sid: &SessionId) -> Option<PathBuf> {
     claim_path(dir, sid).map(|claim| claim.with_file_name(format!("{}.ep", sid.as_str())))
 }
 
 /// A small claim-side record, read without following or waiting on a final
-/// link or FIFO. Unix also proves the held regular file is ours and has one
-/// name; Windows refuses a reparse handle, under the claims directory's
-/// existing owner/DACL admission. Old ordinary record files need no mode change.
 #[cfg(any(unix, windows))]
 fn read_claim_record(path: &Path) -> Option<String> {
     use std::io::Read as _;
@@ -227,7 +130,6 @@ fn read_claim_record(path: &Path) -> Option<String> {
     #[cfg(windows)]
     {
         use std::os::windows::fs::OpenOptionsExt as _;
-        // FILE_FLAG_OPEN_REPARSE_POINT: inspect the entry, not its target.
         options.custom_flags(0x0020_0000);
     }
     let file = options.open(path).ok()?;
@@ -245,7 +147,6 @@ fn read_claim_record(path: &Path) -> Option<String> {
     #[cfg(windows)]
     {
         use std::os::windows::fs::MetadataExt as _;
-        // FILE_ATTRIBUTE_REPARSE_POINT: a link is never record authority.
         if metadata.file_attributes() & 0x0000_0400 != 0 {
             return None;
         }
@@ -261,9 +162,6 @@ fn read_claim_record(_: &Path) -> Option<String> {
 }
 
 /// Publish through an exclusive directory of this write's own. No existing
-/// staging entry is opened or removed. The directory guard owns cleanup on
-/// every error and stays alive through the rename; the final entry is replaced,
-/// never written through. Keep the claim records' existing best-effort policy.
 fn write_claim_record(path: &Path, text: &str) -> std::io::Result<()> {
     use std::io::Write as _;
     let parent = path.parent().ok_or_else(|| {
@@ -287,11 +185,7 @@ fn write_claim_record(path: &Path, text: &str) -> std::io::Result<()> {
     std::fs::rename(&staged, path)
 }
 
-/// The largest epoch a holder of `sid` recorded for its log under control
-/// directory `dir`, or `None`: no record, one that does not read as a decimal
-/// epoch, or one no producer writes (`session_log::told_epoch`: 0, or above
-/// the ceiling a corrupt value would saturate the allocator at). A record
-/// must fit 16 bytes; one extra byte detects a truncated prefix.
+/// The largest epoch a holder of `sid` recorded for its log under control directory `dir`, or `None`.
 pub(crate) fn recorded_epoch_in(dir: &Path, sid: &SessionId) -> Option<u32> {
     let text = read_claim_record(&epoch_record_path(dir, sid)?)?;
     text.trim()
@@ -300,14 +194,7 @@ pub(crate) fn recorded_epoch_in(dir: &Path, sid: &SessionId) -> Option<u32> {
         .and_then(crate::session_log::told_epoch)
 }
 
-/// Record that this process gave `sid`'s log the epoch `ep`, under control
-/// directory `dir`: `create` for the process that adopted the id from the
-/// environment (it starts the record), otherwise only where a record exists
-/// (a handoff successor of an id that was so adopted; a minted id is never
-/// re-adopted, so it gets none). Never lowers a record. Written
-/// tmp-then-rename, so a reader sees the old record or the new, never a torn
-/// one; failures are silent (the wall seconds still stand). This is
-/// synchronous local filesystem work, not a hard bound on a spawn's wait.
+/// Record that this process gave `sid`'s log the epoch `ep`, under control directory `dir`.
 pub(crate) fn record_epoch_in(dir: &Path, sid: &SessionId, ep: u32, create: bool) {
     let Some(path) = epoch_record_path(dir, sid) else {
         return;
@@ -334,20 +221,13 @@ fn marked_successor_in(dir: &Path, sid: &SessionId) -> Option<u32> {
     text.strip_prefix("pid ")?.trim().parse().ok()
 }
 
-/// The live successor a handoff marker names for `sid`: a live process other
-/// than this one that the predecessor handed the id to at Commit (see the module
-/// doc's third gate). A recycled pid reads as live and costs a fresh identity,
-/// never a duplicate.
+/// The live successor a handoff marker names for `sid`.
 pub(crate) fn live_successor_in(dir: &Path, sid: &SessionId) -> Option<u32> {
     let pid = marked_successor_in(dir, sid)?;
     (pid != std::process::id() && crate::control_auth::pid_alive(pid)).then_some(pid)
 }
 
-/// Predecessor, at Commit, before `_exit`: name `successor` as the process about
-/// to answer to each of `sids`, so a launch between this exit and the
-/// successor's publish is refused. Written tmp-then-rename; failures are silent
-/// (the other two gates still stand). The local filesystem work remains
-/// synchronous; a slow filesystem can delay Commit.
+/// Predecessor, at Commit, before `_exit`.
 #[cfg(unix)]
 pub(crate) fn mark_successor_in(dir: &Path, sids: &[SessionId], successor: u32) {
     if crate::control_auth::ensure_private_dir(&dir.join(CLAIMS_DIR)).is_err() {
@@ -369,8 +249,7 @@ pub(crate) fn mark_successor(sids: &[SessionId], successor: u32) {
     }
 }
 
-/// Predecessor, when a Commit failed and it keeps its sessions: withdraw the
-/// markers it wrote for `successor` (only those).
+/// Predecessor, when a Commit failed and it keeps its sessions: withdraw the markers it wrote for `successor` (only those).
 #[cfg(unix)]
 pub(crate) fn withdraw_successor_markers(sids: &[SessionId], successor: u32) {
     let Some(dir) = rendezvous_dir() else {
@@ -385,9 +264,7 @@ pub(crate) fn withdraw_successor_markers(sids: &[SessionId], successor: u32) {
     }
 }
 
-/// Successor, once its own graph entries are published: take the claim on each
-/// transferred id it does not hold yet (the predecessor has exited) and retire
-/// every marker naming `me`. Idempotent; touches only `sids`.
+/// Successor, once its own graph entries are published.
 pub(crate) fn settle_transferred_in(dir: &Path, sids: &[SessionId], me: u32) {
     for sid in sids {
         let held = HELD
@@ -406,8 +283,7 @@ pub(crate) fn settle_transferred_in(dir: &Path, sids: &[SessionId], me: u32) {
     }
 }
 
-/// [`settle_transferred_in`] for every id this process adopted, on the rendezvous
-/// directory, as this process.
+/// [`settle_transferred_in`] for every id this process adopted, on the rendezvous directory, as this process.
 pub(crate) fn settle_transferred() {
     let Some(dir) = rendezvous_dir() else {
         return;
@@ -420,24 +296,14 @@ pub(crate) fn settle_transferred() {
     settle_transferred_in(&dir, &sids, std::process::id());
 }
 
-/// The pid of a live instance other than this one that serves `sid`, per its
-/// published discovery entry (`graph/<sid>`).
-///
-/// Pid liveness rather than a socket dial: the entry is same-uid writable, and
-/// dialing a path from it is the confused-deputy hop
-/// `control_auth::confine_proxy_sock` gates. A recycled pid can read as live,
-/// which costs a fresh identity, never correctness.
+/// The pid of a live instance other than this one that serves `sid`, per its published discovery entry (`graph/<sid>`).
 pub(crate) fn live_holder_in(dir: &Path, sid: &SessionId) -> Option<u32> {
     let pid = crate::proxy::graph_entry_host_pid(dir, sid)?;
     (pid != std::process::id() && crate::control_auth::pid_alive(pid)).then_some(pid)
 }
 
 /// The per-user control directory, unmodified: the one place every instance
-/// contends, whatever `--control-sock` says. Read-only (no
-/// `ensure_private_dir`), so a dispatch-path probe costs no syscalls beyond the
-/// read; [`claim_in`] tightens the subdirectory it writes.
 fn rendezvous_dir() -> Option<PathBuf> {
-    // Under test a scratch directory can stand in, so no unit test reads the live rendezvous.
     #[cfg(test)]
     {
         let guard = DIR_OVERRIDE.read();
@@ -452,8 +318,7 @@ fn rendezvous_dir() -> Option<PathBuf> {
 #[cfg(test)]
 static DIR_OVERRIDE: std::sync::RwLock<Option<PathBuf>> = std::sync::RwLock::new(None);
 
-/// Test-only: point [`rendezvous_dir`] at `dir` until the guard drops, under
-/// [`rendezvous_test_guard`]: the override is process-global.
+/// Test-only: point [`rendezvous_dir`] at `dir` until the guard drops, under [`rendezvous_test_guard`].
 #[cfg(test)]
 pub(crate) fn rendezvous_override(dir: &Path) -> RendezvousOverride {
     let serial = rendezvous_test_guard();
@@ -481,17 +346,7 @@ pub(crate) fn rendezvous_test_guard() -> std::sync::MutexGuard<'static, ()> {
     LOCK.lock().unwrap_or_else(|p| p.into_inner())
 }
 
-/// The probe behind the `@<sid>` dispatch refusal: the pid of a live other
-/// instance that also answers to `sid`, if any.
-///
-/// Gated on [`ADOPTED`] first, which keeps it off the hot path: a minted id
-/// cannot be held elsewhere, so it costs one lock read and a string compare.
-/// Only an adopted id pays the two syscalls.
-///
-/// An entry naming this process's registered update candidate
-/// ([`register_handoff_candidate`]) is the transfer being decided, and the id is
-/// still served here until the Commit (module doc, "The update candidate").
-/// Only this probe exempts it; adoption does not.
+/// The probe behind the `@<sid>` dispatch refusal: the pid of a live other instance that also answers to `sid`, if any.
 pub(crate) fn live_holder(sid: &SessionId) -> Option<u32> {
     if !adopted_here(sid) {
         return None;
@@ -501,25 +356,16 @@ pub(crate) fn live_holder(sid: &SessionId) -> Option<u32> {
 }
 
 /// The pid of this process's own seamless-update candidate while a handoff
-/// decides, `0` for none (`pid_alive(0)` is false). Set and cleared only through
-/// [`CandidateRegistration`].
 static HANDOFF_CANDIDATE: AtomicU32 = AtomicU32::new(0);
 
-/// A handoff lane's registration of its candidate, held from the candidate's
-/// creation (dial or fork) to the lane's return. A Commit `_exit`s with it held;
-/// a rejection returns only after the candidate is proven dead, and the drop
-/// clears it.
-// The handoff lanes that register a candidate are unix's alone.
+/// A handoff lane's registration of its candidate, held from the candidate's creation (dial or fork) to the lane's return.
 #[cfg(unix)]
 #[must_use = "the registration holds only while the value lives"]
 pub(crate) struct CandidateRegistration {
     pid: u32,
 }
 
-/// Register `pid` (the kernel's answer for this process's update candidate: the
-/// fork's child, or `LOCAL_PEERPID` at the rendezvous accept) as the transfer
-/// being decided: an `@<sid>` whose entry names it is served here until the
-/// Commit ([`live_holder`]).
+/// Register `pid` (the kernel's answer for this process's update candidate: the fork's child, or `LOCAL_PEERPID` at the rendezvous accept) as the transfer being decided.
 #[cfg(unix)]
 #[cfg_attr(
     any(test, debug_assertions),
@@ -537,7 +383,6 @@ pub(crate) fn register_handoff_candidate(pid: u32) -> CandidateRegistration {
 #[cfg(unix)]
 impl CandidateRegistration {
     /// The attempt is over: the candidate committed or was proven dead. Clears
-    /// only its own pid, never a later attempt's registration.
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -558,13 +403,7 @@ impl Drop for CandidateRegistration {
     }
 }
 
-/// `HandoffAddressOwner`'s variables read off the real state for `sid` under
-/// `dir`, with `candidate` this process's update candidate (`0`: none): `cand`
-/// its liveness (1 alive, 2 dead), `registered` whether the registration names
-/// it, `entry` whom `graph/<sid>` names (0 this process or no live holder, 1 the
-/// candidate, 2 another live process), `pred` 1, and no request answered yet.
-/// The Tier-1 binds fire `Request` on it and compare `refused` with the real
-/// probe.
+/// `HandoffAddressOwner`'s variables read off the real state for `sid` under `dir`, with `candidate` this process's update candidate (`0`: none).
 #[cfg(all(test, unix))]
 pub(crate) fn project_handoff_address_owner(
     dir: &Path,
@@ -600,9 +439,7 @@ pub(crate) fn registered_handoff_candidate() -> u32 {
     HANDOFF_CANDIDATE.load(Ordering::SeqCst)
 }
 
-/// Claim an identity this process is adopting. `true` only when it is provably
-/// the sole holder: no live instance publishes the id and the exclusive claim is
-/// ours. The claim is parked for the process's life.
+/// Claim an identity this process is adopting.
 pub(crate) fn claim_for_adoption(dir: &Path, sid: &SessionId) -> bool {
     if let Some(pid) = live_holder_in(dir, sid) {
         crate::logging::stderr_line!(
@@ -645,14 +482,8 @@ pub(crate) fn claim_for_adoption(dir: &Path, sid: &SessionId) -> bool {
     }
 }
 
-/// Take the claim on an identity transferred to us by a seamless-update
-/// handoff, if free. Never a refusal: the successor keeps the id regardless, or
-/// every edge, discovery entry and saved address breaks. During an overlap
-/// handoff the predecessor still holds the claim, so failing here is normal;
-/// [`settle_transferred`] takes it once the predecessor exits.
+/// Take the claim on an identity transferred to us by a seamless-update handoff, if free.
 pub(crate) fn hold_transferred(sid: &SessionId) {
-    // Registered whatever the claim answers: the successor IS answering to an id
-    // it did not mint, which is exactly what the dispatch probe must know.
     note_adopted(sid);
     let Some(dir) = rendezvous_dir() else {
         return;
@@ -663,7 +494,6 @@ pub(crate) fn hold_transferred(sid: &SessionId) {
 }
 
 /// Open (or create) the claim file. Unix: 0600, never truncated — a peer may hold
-/// it open and locked, and its bytes are diagnostics either way.
 #[cfg(unix)]
 fn open_claim(path: &Path) -> std::io::Result<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
@@ -676,7 +506,6 @@ fn open_claim(path: &Path) -> std::io::Result<std::fs::File> {
 }
 
 /// Windows: the share mode is the claim. `share_mode(0)` makes a second open
-/// fail outright, and the handle closing on exit releases it.
 #[cfg(windows)]
 fn open_claim(path: &Path) -> std::io::Result<std::fs::File> {
     use std::os::windows::fs::OpenOptionsExt;
@@ -689,13 +518,10 @@ fn open_claim(path: &Path) -> std::io::Result<std::fs::File> {
 }
 
 /// `flock(LOCK_EX | LOCK_NB)`: `Ok(true)` when the lock is ours, `Ok(false)` when
-/// a peer holds it, `Err` otherwise (e.g. no `flock` support), which must read
-/// as "cannot prove", never "free".
 #[cfg(unix)]
 fn lock_exclusive(file: &std::fs::File) -> std::io::Result<bool> {
     use std::os::fd::AsRawFd;
-    // SAFETY: `file` is a live open file, so its descriptor is valid for the call;
-    // `flock` mutates no memory and the descriptor outlives it.
+    // SAFETY: `file` is a live open file, so its descriptor is valid for the call.
     #[expect(
         clippy::disallowed_methods,
         reason = "the claim's lock: held by a `Claim`, whose Drop releases it by LOCK_UN"
@@ -712,14 +538,12 @@ fn lock_exclusive(file: &std::fs::File) -> std::io::Result<bool> {
 }
 
 /// Windows has no `flock`; the exclusive share mode in [`open_claim`] already did
-/// the work, so a handle in hand IS the lock.
 #[cfg(windows)]
 fn lock_exclusive(_file: &std::fs::File) -> std::io::Result<bool> {
     Ok(true)
 }
 
 /// Whether an open failed because a peer holds the file exclusively (Windows'
-/// sharing violation). Unix never refuses the open — it refuses the lock.
 #[cfg(windows)]
 fn is_sharing_violation(e: &std::io::Error) -> bool {
     /// `ERROR_SHARING_VIOLATION`.
@@ -749,9 +573,6 @@ mod tests {
     }
 
     /// A pid that is alive on every host and never this process: 1 (init/launchd)
-    /// on Unix; 4 (System) on Windows, where pid 1 does not exist and
-    /// `OpenProcess` on 4 fails with ERROR_ACCESS_DENIED, which `pid_alive`
-    /// counts as alive (as `kill(pid, 0)`'s `EPERM`).
     const LIVE_FOREIGN_PID: u32 = if cfg!(windows) { 4 } else { 1 };
 
     /// A discovery entry a live foreign instance would have written.
@@ -760,8 +581,6 @@ mod tests {
     }
 
     /// Two aterms reading the same `$ATERM_SESSION_ID` premint: only one may answer to it.
-    /// Same-process stands in because `flock` locks the open file description; per-process
-    /// `fcntl` locks would fail this test.
     #[test]
     fn a_second_claim_on_one_id_is_refused_while_the_first_lives() {
         let d = dir();
@@ -774,7 +593,6 @@ mod tests {
             matches!(claim_in(d.path(), &sid), ClaimOutcome::Taken),
             "a second live claimant on one id must be refused, not served"
         );
-        // The refusal lifts when the holder goes away (a relaunch).
         drop(first);
         assert!(
             matches!(claim_in(d.path(), &sid), ClaimOutcome::Held(_)),
@@ -783,8 +601,6 @@ mod tests {
     }
 
     /// A dropped claim is free at once even while a duplicate descriptor on the
-    /// same open file description (`try_clone`, as a spawning child holds until
-    /// it execs) is still open.
     #[cfg(unix)]
     #[test]
     fn a_dropped_claim_is_free_while_a_copy_of_its_descriptor_lives() {
@@ -803,15 +619,11 @@ mod tests {
     }
 
     /// Tier-1 binding for `SessionIdClaim`: each model `Launch` is one real
-    /// `claim_for_adoption`, and `holders` must equal the callers told yes, with the id free,
-    /// locked by a live holder, and unlocked while a live foreign entry holds it (the handoff
-    /// shape, where only the entry gate refuses).
     #[test]
     fn session_id_claim_conformance_real_adoption_projects_onto_model() {
         let _guard = rendezvous_test_guard();
         let d = dir();
 
-        // ── arm 1: the ordinary world (Handoff = 0) ──
         let m = aterm_models_session::session_id_claim_model();
         let mut st = m.init_state();
         let premint = SessionId::generate();
@@ -824,8 +636,6 @@ mod tests {
         assert!(first, "and the real first launch adopts the premint");
         assert_eq!(st.get("holders"), Some(&1));
 
-        // A second simultaneous launch: the model's `Launch` must not raise `holders`, and the
-        // real call answers no.
         assert!(m.fire("Launch", &mut st), "a second launch happens");
         let second = claim_for_adoption(d.path(), &premint);
         assert!(
@@ -839,8 +649,6 @@ mod tests {
         );
         assert!(m.check_invariant("AtMostOneHolder", &st));
 
-        // ── arm 2: the handoff shape (Handoff = 1), where the lock is free and
-        // a live foreign entry is the only thing holding the id ──
         let mut mh = aterm_models_session::session_id_claim_model();
         for c in &mut mh.consts {
             if c.0 == "Handoff" {
@@ -855,10 +663,7 @@ mod tests {
             "the predecessor adopts"
         );
 
-        // The successor takes the id over, the predecessor's claim with it: a transfer.
         release_claims_for_test();
-        // Its entry names a live pid other than ours (`LIVE_FOREIGN_PID`): ours would pass for
-        // the wrong reason, since an instance never reads its own entry as a rival.
         std::fs::create_dir_all(d.path().join("graph")).expect("graph dir");
         std::fs::write(
             d.path().join("graph").join(handed.as_str()),
@@ -889,7 +694,6 @@ mod tests {
             "a transfer is not a second holder"
         );
 
-        // The launch `Buggy = 1` gets wrong: the lock is free and only the live entry says no.
         assert!(mh.fire("Launch", &mut st));
         let after_handoff = claim_for_adoption(d.path(), &handed);
         assert!(
@@ -902,10 +706,6 @@ mod tests {
     }
 
     /// Tier-1 binding for the handoff window (`SessionIdClaim`'s `PredecessorExits` /
-    /// `SuccessorPublishes`) through the real `claim_for_adoption`, `mark_successor_in` and
-    /// `settle_transferred_in`: with the predecessor gone (no flock, its entry naming a dead pid)
-    /// and the successor unpublished, only the Commit marker refuses a launch. Negative control:
-    /// without the marker the real code adopts a second time, as `Unmarked = 1` does.
     #[cfg(unix)]
     #[test]
     fn the_handoff_window_is_held_by_the_successor_marker() {
@@ -914,7 +714,6 @@ mod tests {
         let base = aterm_models_session::session_id_claim_model();
         let marked = aterm_spec::interp::with_consts(&base, &[("Handoff", 1)]);
         let unmarked = aterm_spec::interp::with_consts(&base, &[("Handoff", 1), ("Unmarked", 1)]);
-        // The successor stand-in: another live process.
         let mut successor = aterm_uds::spawnfd::command("/bin/sleep")
             .arg("30")
             .stdin(aterm_uds::spawnfd::Stdio::null())
@@ -935,7 +734,6 @@ mod tests {
             let mut st = model.init_state();
             assert!(model.fire("Launch", &mut st));
             assert!(claim_for_adoption(d.path(), &sid), "the predecessor adopts");
-            // Commit: name the successor (or, in the unmarked arm, do not), then exit.
             if write_marker {
                 mark_successor_in(d.path(), std::slice::from_ref(&sid), succ);
             }
@@ -947,7 +745,6 @@ mod tests {
                 (Some(&0), Some(&0)),
                 "the window: no lock, no live entry"
             );
-            // A launch lands in the window.
             assert!(model.fire("Launch", &mut st));
             let adopted = claim_for_adoption(d.path(), &sid);
             assert_eq!(
@@ -968,7 +765,6 @@ mod tests {
                 release_claims_for_test();
                 continue;
             }
-            // The successor publishes, takes the free claim, and retires its marker.
             std::fs::write(
                 d.path().join("graph").join(sid.as_str()),
                 format!("sock /nonexistent/aterm.sock\nnonce ab\npid {succ}\n"),
@@ -990,7 +786,6 @@ mod tests {
             release_claims_for_test();
         }
 
-        // A stale marker naming a dead pid, or us, does not block adoption.
         let sid = SessionId::generate();
         mark_successor_in(d.path(), std::slice::from_ref(&sid), 2_147_483_646);
         assert_eq!(live_successor_in(d.path(), &sid), None);
@@ -1004,8 +799,6 @@ mod tests {
     }
 
     /// Anything but the minted shape is refused before it becomes a filename,
-    /// so a hostile `$ATERM_SESSION_ID` cannot aim the claim at a path; being
-    /// `Unprovable`, it also does not adopt.
     #[test]
     fn a_malformed_injected_id_never_becomes_a_path() {
         let d = dir();
@@ -1037,8 +830,6 @@ mod tests {
     }
 
     /// The second gate: an id whose discovery entry names a live foreign process
-    /// is held even when its claim file is free; an entry naming a dead process
-    /// or us is not.
     #[test]
     fn a_live_discovery_entry_holds_an_id_a_dead_one_does_not() {
         let d = dir();
@@ -1046,7 +837,6 @@ mod tests {
         let nonce = LaunchNonce::generate();
         assert_eq!(live_holder_in(d.path(), &sid), None, "no entry, no holder");
 
-        // Our own entry is not a peer.
         crate::proxy::write_graph_entry(d.path(), &sid, "/nonexistent/aterm.sock", &nonce);
         assert_eq!(
             live_holder_in(d.path(), &sid),
@@ -1054,7 +844,6 @@ mod tests {
             "an instance must not read its own discovery entry as a rival"
         );
 
-        // A live foreign pid (`LIVE_FOREIGN_PID`: alive on every host, never us).
         let foreign = d.path().join("graph").join(sid.as_str());
         std::fs::write(&foreign, live_foreign_entry()).expect("plant a foreign entry");
         assert_eq!(
@@ -1067,7 +856,6 @@ mod tests {
             "an id a live instance publishes must not be adopted, claim file free or not"
         );
 
-        // A dead pid is a crash leftover, not a holder: a relaunch still adopts.
         std::fs::write(
             &foreign,
             "sock /nonexistent/aterm.sock\nnonce ab\npid 2147483646\n",
@@ -1081,9 +869,6 @@ mod tests {
     }
 
     /// The candidate registration (bound to `HandoffAddressOwner`'s `Launch` and `Reject`):
-    /// while it lives, an adopted id whose entry names that pid is served here, and its drop
-    /// clears only its own pid. Negative controls: unregistered, the same entry is refused, as
-    /// is one naming any other live process, and adoption still reads the candidate as a holder.
     #[cfg(unix)]
     #[test]
     fn a_handoff_candidate_registration_is_exactly_its_own() {
@@ -1132,7 +917,6 @@ mod tests {
             "NEGATIVE CONTROL: a stranger is refused while the registration lives"
         );
 
-        // A later registration (another attempt) is not ended by this one's drop.
         let later = register_handoff_candidate(LIVE_FOREIGN_PID);
         drop(reg);
         assert_eq!(registered_handoff_candidate(), LIVE_FOREIGN_PID);
@@ -1160,11 +944,6 @@ mod tests {
 }
 
 /// `HandoffAddressOwner` environment actions, each waived where its Tier-1 (`tests`)
-/// binds it.
-// `HandoffAddressOwner`'s other actions are no function of this process's
-// dispatch: explicit scope boundaries, not silent coverage holes.
-// (`SuccessorPublishes` is anchored on the candidate's own gated publication,
-// `control::publish_when_committed`, and driven by its Tier-1 bind.)
 #[cfg(any(test, debug_assertions))]
 #[aterm_spec_anchor::spec_unmodeled(
     machine = "HandoffAddressOwner",

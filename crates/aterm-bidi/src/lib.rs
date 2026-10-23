@@ -3,52 +3,6 @@
 // Author: Andrew Yates
 
 //! Unicode Bidirectional Algorithm (UAX #9) line reordering for the terminal.
-//!
-//! Terminal lines are stored in logical order (the order characters were
-//! written). To display mixed left-to-right / right-to-left text correctly the
-//! renderer needs the visual order — the left-to-right sequence of columns on
-//! screen. This crate computes that reordering: given a line's characters it
-//! resolves UAX #9 embedding levels and returns a visual→logical permutation the
-//! renderer can apply per row.
-//!
-//! ## Scope
-//!
-//! The whole algorithm through rule L2, over one line:
-//!
-//! - **P1–P3** — the line splits into paragraphs at `B`; each paragraph's base
-//!   level comes from its first strong character (skipping isolates) or a
-//!   caller-forced direction.
-//! - **X1–X10** — explicit embeddings, overrides and isolates (LRE/RLE/LRO/RLO/
-//!   PDF, LRI/RLI/FSI/PDI) on the 125-deep directional status stack, X9's
-//!   removals, and the isolating run sequences with their `sos`/`eos`.
-//! - **W1–W7**, **N0** (bracket pairs, BD16, with canonical equivalence and the
-//!   NSM follow-up), **N1/N2**, **I1/I2**, **L1** and **L2**.
-//! - The full `Bidi_Class` property ([`bidi_class`]) and `Bidi_Paired_Bracket`
-//!   pairs ([`bracket_of`]), generated from the UCD (`src/tables.rs`, by
-//!   `examples/gen_tables.rs tables`).
-//!
-//! Conformance is pinned against the UCD's own `BidiTest.txt` and
-//! `BidiCharacterTest.txt` (`tests/uax9_conformance.rs`). L3 (combining-mark
-//! rendering) belongs to the renderer. For L4 the crate holds the
-//! `Bidi_Mirroring_Glyph` pairs ([`mirror_glyph`], `src/mirroring.rs`, by
-//! aterm-grapheme's `examples/unicode_tables.rs mirroring`) and says which
-//! cell of a reordered row resolved right to left ([`Scratch::cell_is_rtl`]);
-//! the caller that owns the row substitutes the mirror.
-//!
-//! Characters removed by X9 (the embedding controls and `BN`) take the level of
-//! the character before them, so every character — removed or not — has a place
-//! in the visual order and the result is always a permutation of the input.
-//!
-//! ## Example
-//!
-//! ```
-//! use aterm_bidi::{reorder_visual_to_logical, BaseDirection};
-//! // "abc" is pure LTR → identity order.
-//! assert_eq!(reorder_visual_to_logical(&['a', 'b', 'c'], BaseDirection::Auto), vec![0, 1, 2]);
-//! // A pure-RTL line (Hebrew aleph-bet-gimel) displays reversed.
-//! let hebrew = ['\u{05D0}', '\u{05D1}', '\u{05D2}'];
-//! assert_eq!(reorder_visual_to_logical(&hebrew, BaseDirection::Auto), vec![2, 1, 0]);
-//! ```
 
 #![forbid(unsafe_code)]
 #![cfg_attr(
@@ -127,10 +81,7 @@ use BidiClass::{
     WS,
 };
 
-/// A character's paired-bracket property (UAX #9 BD14/BD15), keyed by the
-/// code point of the OPENING bracket of its pair after canonical equivalence
-/// (U+2329/U+232A pair with U+3008/U+3009), so an opener and a closer match
-/// exactly when their keys are equal.
+/// A character's paired-bracket property (UAX #9 BD14/BD15), keyed by the code point of the OPENING bracket of its pair after canonical equivalence (U+2329/U+232A pair with U+3008/U+3009), so an opener and a closer match exactly when their keys are equal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum Bracket {
     /// Not a paired bracket.
@@ -265,7 +216,6 @@ pub const fn decode_bidi_run_le(bytes: [u8; 16]) -> (u32, u32, u32, u32) {
 }
 
 /// O(1) lookup table for ASCII `0x00..=0x7F` (`Bidi_Class`), matching
-/// `tables::BIDI_CLASS_RANGES` without a binary search on every ASCII cell.
 const ASCII_BIDI_CLASS: [BidiClass; 128] = {
     let mut table = [L; 128];
     let mut u = 0usize;
@@ -287,13 +237,6 @@ const ASCII_BIDI_CLASS: [BidiClass; 128] = {
     table
 };
 
-// A `clean { … }` island is Clean surface that only a Trust rustc can parse. A
-// stock rustc (the cross cells of `verify cells`, the x86_64-apple-darwin
-// compat slice) parses a cfg'd-out module's body all the same, so the island's
-// module goes through this macro, which drops its tokens there and emits them
-// unchanged under `cfg(clean_islands)`: set by this crate's build script
-// whenever the compiler is Trust (crates/aterm-log/clean_islands.rs), so the
-// island is kernel-checked at every Trust build, not only the verify lane.
 #[cfg(clean_islands)]
 macro_rules! verify_island {
     ($($tt:tt)*) => {
@@ -308,9 +251,6 @@ macro_rules! verify_island {
 
 verify_island! {
     mod bidi_ascii_proofs {
-        // Codepoints below U+0590 (Hebrew block start) never belong to any
-        // RTL-triggering Bidi_Class (`R | AL | AN | RLE | RLO | RLI | FSI`),
-        // and ASCII `< 0x80` indexes `ASCII_BIDI_CLASS[128]` in bounds.
         clean {
             section BidiAsciiFastPath
             theorem AsciiTableIndexInBounds :
@@ -363,16 +303,11 @@ const fn bidi_class_table(u: u32) -> BidiClass {
     L
 }
 
-/// The `Bidi_Mirroring_Glyph` of `c`: the character whose glyph depicts `c`
-/// at a right-to-left level (UAX #9 L4), as `)` for `(` and `≥` for `≤`.
-/// `None` for a character with no mirror pair, including a `Bidi_Mirrored`
-/// one whose mirror has no code point of its own (`∛`).
+/// The `Bidi_Mirroring_Glyph` of `c`: the character whose glyph depicts `c` at a right-to-left level (UAX #9 L4), as `)` for `(` and `≥` for `≤`.
 #[must_use]
 #[inline]
 pub const fn mirror_glyph(c: char) -> Option<char> {
     let u = c as u32;
-    // Fast path for ASCII, Latin-1 guillemets, and Hebrew/Arabic scripts
-    // (`< 0x0F3A`), plus everything past `0xFF63`.
     if u < 0x0F3A {
         return match u {
             0x0028 => Some(')'),
@@ -440,9 +375,6 @@ pub const fn bracket_of(c: char) -> Bracket {
             _ => Bracket::None,
         };
     }
-    // Every non-ASCII paired bracket in UCD `BidiBrackets.txt` lies in
-    // `0x0F3A..=0xFF63`; skip the binary searches for Latin-1, Hebrew, Arabic,
-    // Indic scripts, and all supplementary planes.
     if u < 0x0F3A || u > 0xFF63 {
         return Bracket::None;
     }
@@ -483,9 +415,7 @@ const fn bracket_of_table(u: u32) -> Bracket {
     Bracket::None
 }
 
-/// Whether rule X9 removes a character of this class (the embedding controls
-/// and `BN`). Removed characters get no level of their own in UAX #9's
-/// conformance data; here they take the level before them (see the crate docs).
+/// Whether rule X9 removes a character of this class (the embedding controls and `BN`).
 #[must_use]
 #[inline]
 pub const fn removed_by_x9(class: BidiClass) -> bool {
@@ -493,11 +423,6 @@ pub const fn removed_by_x9(class: BidiClass) -> bool {
 }
 
 /// Quick test for whether a line needs the Bidirectional Algorithm at all.
-///
-/// Returns `true` if any character is right-to-left (`R`/`AL`), an Arabic
-/// number (`AN`), or an explicit control that can open a right-to-left level
-/// (RLE/RLO/RLI/FSI). A line for which this is `false` resolves to even levels
-/// only, so its visual order is the identity and the renderer can skip it.
 #[must_use]
 #[inline]
 pub fn has_bidi(text: &[char]) -> bool {
@@ -528,10 +453,6 @@ fn classes_and_brackets(text: &[char]) -> (Vec<BidiClass>, Vec<Bracket>) {
 }
 
 /// Compute the visual→logical index permutation for `text`.
-///
-/// The returned `Vec` has the same length as `text`; `result[v] == l` means the
-/// character at logical index `l` is drawn at visual column `v` (left to right).
-/// For pure-LTR input this is the identity `0,1,2,…`.
 #[must_use]
 pub fn reorder_visual_to_logical(text: &[char], base: BaseDirection) -> Vec<usize> {
     let levels = resolve_levels(text, base);
@@ -550,14 +471,6 @@ pub fn reorder_str(s: &str, base: BaseDirection) -> Vec<usize> {
 }
 
 /// Compute the visual→logical **cell** permutation for a terminal row.
-///
-/// Terminal rows store a wide glyph (CJK, wide emoji) as two cells: a lead cell
-/// carrying the glyph and a right-half *continuation* cell. The Bidirectional
-/// Algorithm runs on the logical characters — one per lead/single cell — and each
-/// character's cell(s) are then emitted as a unit in lead-then-continuation
-/// order: a wide glyph is never mirrored, only its *position* in the line is
-/// reordered. The result is always a permutation of `0..n`; a malformed
-/// continuation cell with no lead is treated as its own character.
 #[must_use]
 #[cfg(test)]
 pub fn reorder_cells(
@@ -569,9 +482,7 @@ pub fn reorder_cells(
     reorder_cells_with_classes(&classes, &brackets, is_wide_continuation, base)
 }
 
-/// Class-taking companion to [`reorder_cells`]: per-CELL classes and brackets
-/// (parallel to `is_wide_continuation`), so a caller that already computed them
-/// does not recompute. A missing bracket entry reads as [`Bracket::None`].
+/// Class-taking companion to [`reorder_cells`]: per-CELL classes and brackets (parallel to `is_wide_continuation`), so a caller that already computed them does not recompute.
 #[must_use]
 pub fn reorder_cells_with_classes(
     cell_classes: &[BidiClass],
@@ -592,8 +503,7 @@ pub fn reorder_cells_with_classes(
     out
 }
 
-/// Reusable working memory for the `_into` entry points: a per-row caller that
-/// keeps one of these reorders without heap allocation after warmup.
+/// Reusable working memory for the `_into` entry points: a per-row caller that keeps one of these reorders without heap allocation after warmup.
 #[derive(Debug, Default)]
 pub struct Scratch {
     logical: Vec<BidiClass>,
@@ -606,15 +516,9 @@ pub struct Scratch {
 }
 
 impl Scratch {
-    /// Whether CELL `cell` of the row last passed to
-    /// [`reorder_cells_with_classes_into`] with this scratch resolved to an
-    /// odd (right-to-left) level: the cells UAX #9 L4 draws mirrored. A wide
-    /// glyph's continuation cell answers as its lead; a cell past the row is
-    /// `false`.
+    /// Whether CELL `cell` of the row last passed to [`reorder_cells_with_classes_into`] with this scratch resolved to an odd (right-to-left) level: the cells UAX #9 L4 draws mirrored.
     #[must_use]
     pub fn cell_is_rtl(&self, cell: usize) -> bool {
-        // `lead_cell` ascends, so the character owning `cell` is the last one
-        // whose lead is at or before it.
         let at = self.lead_cell.partition_point(|&lead| lead <= cell);
         let Some(c) = at.checked_sub(1) else {
             return false;
@@ -630,9 +534,7 @@ impl Scratch {
     }
 }
 
-/// Buffer-in/buffer-out companion to [`reorder_cells_with_classes`]: the
-/// visual→logical CELL permutation is written into `out` (cleared then
-/// refilled), and every working buffer lives in `scratch`.
+/// Buffer-in/buffer-out companion to [`reorder_cells_with_classes`]: the visual→logical CELL permutation is written into `out` (cleared then refilled), and every working buffer lives in `scratch`.
 pub fn reorder_cells_with_classes_into(
     cell_classes: &[BidiClass],
     cell_brackets: &[Bracket],
@@ -645,7 +547,6 @@ pub fn reorder_cells_with_classes_into(
     fold_cells_and_resolve(cell_classes, cell_brackets, is_wide_continuation, base, s);
     reorder_paragraphs_into(&s.logical, &s.levels, &mut s.char_order);
 
-    // 3. Expand each logical character back to its cell(s).
     out.clear();
     for &c in &s.char_order {
         if let Some(&lead) = s.lead_cell.get(c) {
@@ -657,11 +558,7 @@ pub fn reorder_cells_with_classes_into(
     }
 }
 
-/// The resolved UAX #9 embedding level of every CELL of a terminal row,
-/// parallel to `cell_classes`: the levels [`reorder_cells_with_classes_into`]
-/// reorders by, from the same fold, so a wide glyph's continuation cell takes
-/// its lead's level. An odd level is a right-to-left cell, whose visual left
-/// edge is its logical end — what a pointer on its left half means.
+/// The resolved UAX #9 embedding level of every CELL of a terminal row, parallel to `cell_classes`: the levels [`reorder_cells_with_classes_into`] reorders by, from the same fold, so a wide glyph's continuation cell takes its lead's level.
 #[must_use]
 pub fn cell_levels(
     cell_classes: &[BidiClass],
@@ -693,9 +590,6 @@ pub fn cell_levels(
 }
 
 /// Steps 1 and 2 of the cell reorder, shared by
-/// [`reorder_cells_with_classes_into`] and [`cell_levels`] so the two cannot
-/// fold a row differently: fold the cells into logical characters, then
-/// resolve each character's level into `s.levels`.
 fn fold_cells_and_resolve(
     cell_classes: &[BidiClass],
     cell_brackets: &[Bracket],
@@ -703,8 +597,6 @@ fn fold_cells_and_resolve(
     base: BaseDirection,
     s: &mut Scratch,
 ) {
-    // 1. Fold cells into logical characters: each non-continuation cell starts a
-    //    character that also owns the immediately-following continuation cell.
     s.logical.clear();
     s.logical_brackets.clear();
     s.lead_cell.clear();
@@ -725,7 +617,6 @@ fn fold_cells_and_resolve(
         i = i.saturating_add(if cont { 2 } else { 1 });
     }
 
-    // 2. Resolve the logical characters' levels.
     resolve_into(
         &s.logical,
         &s.logical_brackets,
@@ -735,16 +626,14 @@ fn fold_cells_and_resolve(
     );
 }
 
-/// Resolve the UAX #9 embedding level of every character in `text` (see the
-/// crate docs for the scope; removed X9 characters take the level before them).
+/// Resolve the UAX #9 embedding level of every character in `text` (see the crate docs for the scope; removed X9 characters take the level before them).
 #[must_use]
 pub fn resolve_levels(text: &[char], base: BaseDirection) -> Vec<u8> {
     let (classes, brackets) = classes_and_brackets(text);
     resolve_levels_from_classes(&classes, &brackets, base)
 }
 
-/// [`resolve_levels`] from precomputed classes and brackets (a missing bracket
-/// entry reads as [`Bracket::None`]).
+/// [`resolve_levels`] from precomputed classes and brackets (a missing bracket entry reads as [`Bracket::None`]).
 #[must_use]
 pub fn resolve_levels_from_classes(
     classes: &[BidiClass],
@@ -771,10 +660,7 @@ pub fn paragraph_level(text: &[char], base: BaseDirection) -> u8 {
     paragraph_level_of(classes.get(..end).unwrap_or(&[]), &matching, base)
 }
 
-/// Apply UAX #9 rule L2 to a resolved level array, returning the visual→logical
-/// permutation.
-///
-/// Reverses contiguous runs from the highest level down to the lowest odd level.
+/// Apply UAX #9 rule L2 to a resolved level array, returning the visual→logical permutation.
 #[must_use]
 pub fn reorder_from_levels(levels: &[u8]) -> Vec<usize> {
     let mut order = Vec::new();
@@ -790,7 +676,6 @@ pub fn reorder_from_levels_into(levels: &[u8], order_out: &mut Vec<usize>) {
 }
 
 /// L2 within each paragraph of the line: a line that holds a `B` is two
-/// paragraphs, each reordered on its own and kept in logical sequence.
 fn reorder_paragraphs_into(classes: &[BidiClass], levels: &[u8], order_out: &mut Vec<usize>) {
     order_out.clear();
     order_out.extend(0..levels.len());
@@ -847,8 +732,6 @@ fn reverse_by_levels(levels: &[u8], order: &mut [usize]) {
     }
 }
 
-// The algorithm
-
 /// The deepest explicit embedding level (BD2).
 const MAX_DEPTH: u8 = 125;
 /// The bracket-pair stack bound (BD16): past it, pairing stops for the sequence.
@@ -875,7 +758,6 @@ struct StatusEntry {
 }
 
 /// Resolve `classes` (and their brackets) into `levels` — P1 splits at `B`,
-/// then each paragraph runs X1–L1.
 fn resolve_into(
     classes: &[BidiClass],
     brackets: &[Bracket],
@@ -901,8 +783,6 @@ fn resolve_into(
 }
 
 /// BD9: `matching[i]` is the index of the PDI matching the isolate initiator at
-/// `i` (or `n` when it has none), and for a matched PDI the index of its
-/// initiator; `usize::MAX` elsewhere.
 fn match_isolates(classes: &[BidiClass], matching: &mut Vec<usize>) {
     let n = classes.len();
     matching.clear();
@@ -932,7 +812,6 @@ fn match_isolates(classes: &[BidiClass], matching: &mut Vec<usize>) {
 }
 
 /// P2/P3 over `classes[..]`, skipping isolated content: 1 when the first strong
-/// character is R/AL, else 0.
 fn first_strong_level(
     classes: &[BidiClass],
     matching: &[usize],
@@ -945,7 +824,6 @@ fn first_strong_level(
             Some(L) => return Some(0),
             Some(R | AL) => return Some(1),
             Some(LRI | RLI | FSI) => {
-                // Skip to the matching PDI (or the end when unmatched).
                 let m = matching.get(i).copied().unwrap_or(to);
                 if m >= to {
                     return None;
@@ -1003,7 +881,6 @@ fn resolve_paragraph(
     match_isolates(classes, &mut matching);
     let para = paragraph_level_of(classes, &matching, base);
 
-    // X1–X8: explicit levels and overrides.
     r.types.clear();
     r.types.extend_from_slice(classes);
     r.stack.clear();
@@ -1110,8 +987,6 @@ fn resolve_paragraph(
         }
     }
 
-    // X9: removed characters are skipped from here on (`removed_by_x9`).
-    // X10: level runs over the kept characters, then isolating run sequences.
     r.runs.clear();
     r.run_of_char.clear();
     r.run_of_char.resize(n, usize::MAX);
@@ -1145,7 +1020,6 @@ fn resolve_paragraph(
     let run_of_char = std::mem::take(&mut r.run_of_char);
     let mut seq = std::mem::take(&mut r.seq);
     for &(start, _) in &runs {
-        // A run that begins with a PDI matching an initiator continues that
         // initiator's sequence; it never starts one.
         if classes.get(start) == Some(&PDI) && matching.get(start).is_some_and(|&m| m < n) {
             continue;
@@ -1173,7 +1047,6 @@ fn resolve_paragraph(
     r.run_of_char = run_of_char;
     r.seq = seq;
 
-    // I1/I2 on the kept characters; removed ones take the level before them.
     let mut previous = para;
     for i in 0..n {
         let class = classes.get(i).copied().unwrap_or(ON);
@@ -1199,8 +1072,6 @@ fn resolve_paragraph(
         previous = resolved;
     }
 
-    // L1: separators, and whitespace/isolate controls (with removed characters
-    // among them) before a separator or at the end of the line, go to `para`.
     let mut trailing = true;
     for i in (0..n).rev() {
         let class = classes.get(i).copied().unwrap_or(ON);
@@ -1232,7 +1103,6 @@ fn set<T: Copy>(slice: &mut [T], i: usize, value: T) {
 }
 
 /// W1–W7, N0, N1/N2 over one isolating run sequence (`seq` holds its kept
-/// characters' indices in order).
 fn resolve_sequence(
     seq: &[usize],
     classes: &[BidiClass],
@@ -1247,16 +1117,12 @@ fn resolve_sequence(
     };
     let n = classes.len();
     let level = levels.get(first).copied().unwrap_or(para);
-    // sos: the higher of this level and the level of the kept character before
-    // the sequence (or the paragraph level).
     let before = (0..first)
         .rev()
         .find(|&i| classes.get(i).copied().is_some_and(|c| !removed_by_x9(c)))
         .and_then(|i| levels.get(i).copied())
         .unwrap_or(para);
     let sos = direction_of(level.max(before));
-    // eos: the same after the sequence — unless it ends with an (unmatched)
-    // isolate initiator, which takes the paragraph level.
     let after = if matches!(classes.get(last), Some(LRI | RLI | FSI)) {
         para
     } else {
@@ -1280,7 +1146,6 @@ fn resolve_sequence(
     };
     let m = seq.len();
 
-    // W1: NSM takes the previous type (ON after an isolate control; sos first).
     for k in 0..m {
         if t(r, k) == NSM {
             let prev = if k == 0 {
@@ -1294,7 +1159,6 @@ fn resolve_sequence(
             put(r, k, prev);
         }
     }
-    // W2: EN after AL (looking back to the last strong type) becomes AN.
     let mut last_strong = sos;
     for k in 0..m {
         match t(r, k) {
@@ -1303,13 +1167,11 @@ fn resolve_sequence(
             _ => {}
         }
     }
-    // W3: AL → R.
     for k in 0..m {
         if t(r, k) == AL {
             put(r, k, R);
         }
     }
-    // W4: a single ES between ENs, or a single CS between two numbers of one type.
     for k in 1..m.saturating_sub(1) {
         let (prev, cur, next) = (t(r, k - 1), t(r, k), t(r, k + 1));
         match (prev, cur, next) {
@@ -1318,7 +1180,6 @@ fn resolve_sequence(
             _ => {}
         }
     }
-    // W5: a run of ETs adjacent to EN becomes EN.
     let mut k = 0;
     while k < m {
         if t(r, k) == ET {
@@ -1337,13 +1198,11 @@ fn resolve_sequence(
             k += 1;
         }
     }
-    // W6: remaining separators and terminators → ON.
     for k in 0..m {
         if matches!(t(r, k), ES | ET | CS) {
             put(r, k, ON);
         }
     }
-    // W7: EN after L (looking back to the last strong type, sos first) → L.
     let mut last_strong = sos;
     for k in 0..m {
         match t(r, k) {
@@ -1353,7 +1212,6 @@ fn resolve_sequence(
         }
     }
 
-    // N0: paired brackets (BD16) among ON characters.
     let embedding = direction_of(level);
     r.bracket_stack.clear();
     r.pairs.clear();
@@ -1415,7 +1273,6 @@ fn resolve_sequence(
         if let Some(d) = resolved {
             for bracket_k in [open_k, close_k] {
                 put(r, bracket_k, d);
-                // NSMs that originally followed the bracket take its new type.
                 let mut j = bracket_k + 1;
                 while j < m {
                     let Some(&idx) = seq.get(j) else { break };
@@ -1430,8 +1287,6 @@ fn resolve_sequence(
     }
     r.pairs = pairs;
 
-    // N1/N2: runs of neutrals and isolate controls take the direction on both
-    // sides when it agrees (numbers count as R), else the embedding direction.
     let is_ni = |c: BidiClass| matches!(c, B | S | WS | ON | LRI | RLI | FSI | PDI);
     let mut k = 0;
     while k < m {
@@ -1464,7 +1319,7 @@ fn resolve_sequence(
 mod tests {
     use super::*;
 
-    const ALEF: char = '\u{05D0}'; // Hebrew R
+    const ALEF: char = '\u{05D0}';
 
     fn chars(s: &str) -> Vec<char> {
         s.chars().collect()
@@ -1472,8 +1327,7 @@ mod tests {
 
     #[test]
     fn pure_rtl_reverses() {
-        // Auto detects RTL from the first strong char; the line displays reversed.
-        let t = chars("\u{05D0}\u{05D1}\u{05D2}"); // ALEF BET GIMEL
+        let t = chars("\u{05D0}\u{05D1}\u{05D2}");
         assert!(has_bidi(&t));
         assert_eq!(paragraph_level(&t, BaseDirection::Auto), 1);
         assert_eq!(
@@ -1482,12 +1336,10 @@ mod tests {
         );
     }
 
-    const CJK: char = '\u{4E2D}'; // 中 — a wide (2-cell) glyph, bidi class L
+    const CJK: char = '\u{4E2D}';
 
     #[test]
     fn reorder_cells_wide_glyph_stays_paired_ltr() {
-        // "中" occupies cells [lead, continuation]; pure-LTR → identity, the pair
-        // kept together and in order.
         let cc = vec![CJK, ' '];
         let wide = vec![false, true];
         assert_eq!(reorder_cells(&cc, &wide, BaseDirection::Auto), vec![0, 1]);
@@ -1495,12 +1347,8 @@ mod tests {
 
     #[test]
     fn reorder_cells_rtl_with_wide_glyph_keeps_pair_unmirrored() {
-        // Logical: ALEF (R, 1 cell), 中 (L, 2 cells). Base auto → RTL. The Hebrew
-        // letter ends on the right; 中 moves left but its two cells stay in
-        // lead-then-continuation order (the glyph is not mirrored).
         let cc = vec![ALEF, CJK, ' '];
         let wide = vec![false, false, true];
-        // visual: 中-lead(1), 中-cont(2), ALEF(0)
         assert_eq!(
             reorder_cells(&cc, &wide, BaseDirection::Auto),
             vec![1, 2, 0]
@@ -1508,9 +1356,6 @@ mod tests {
     }
 
     /// `cell_levels` folds the row as the reorder does: a Hebrew run is odd, an
-    /// LTR word and the blank between them even, and a wide glyph's
-    /// continuation cell carries its lead's level (here an `L` glyph inside an
-    /// RTL paragraph, level 2, and the paragraph's RTL letter, level 1).
     #[test]
     fn cell_levels_marks_rtl_cells_and_pairs_wide_glyphs() {
         let cc = chars("ab \u{05D0}\u{05D1}");
@@ -1537,7 +1382,6 @@ mod tests {
                 vec![ALEF, CJK, ' ', '!', 'a'],
                 vec![false, false, true, false, false],
             ),
-            // "ab中 cd" as CELLS: 中's continuation space is an explicit cell.
             (
                 vec!['a', 'b', CJK, ' ', ' ', 'c', 'd'],
                 vec![false, false, false, true, false, false, false],
@@ -1557,8 +1401,6 @@ mod tests {
 
     #[test]
     fn reorder_cells_malformed_leading_continuation_is_safe() {
-        // A continuation flag with no preceding lead must not panic and must still
-        // yield a valid permutation (the stray cell is treated as single-width).
         let cc = vec![' ', 'a'];
         let wide = vec![true, false];
         let order = reorder_cells(&cc, &wide, BaseDirection::Auto);
@@ -1569,9 +1411,6 @@ mod tests {
 
     #[test]
     fn into_variants_match_vec_returning() {
-        // The buffer-in/buffer-out companions produce byte-identical output to the
-        // Vec-returning wrappers (the render bridge relies on this equality), and
-        // one Scratch reused across every case exercises the clear+refill path.
         let cell_cases: &[(Vec<char>, Vec<bool>)] = &[
             (chars("hello"), vec![false; 5]),
             (chars("\u{05D0}\u{05D1}\u{05D2}"), vec![false; 3]),
@@ -1618,9 +1457,7 @@ mod tests {
         assert_eq!(mirror_glyph('\u{2264}'), Some('\u{2265}'));
         assert_eq!(mirror_glyph('\u{FF08}'), Some('\u{FF09}'));
         assert_eq!(mirror_glyph('a'), None);
-        // Bidi_Mirrored, but no mirror character exists.
         assert_eq!(mirror_glyph('\u{221B}'), None);
-        // Every pair is an involution, as BidiMirroring.txt lists both ways.
         for pair in mirroring::MIRROR_PAIRS.chunks(2) {
             let (a, b) = (
                 char::from_u32(pair[0]).unwrap(),
@@ -1631,9 +1468,6 @@ mod tests {
     }
 
     /// L4 on a reordered row: brackets enclosing right-to-left text at a
-    /// right-to-left level are RTL cells, the same brackets around an RTL word
-    /// in a left-to-right context are not, and a wide continuation answers as
-    /// its lead.
     #[test]
     fn cell_is_rtl_follows_resolved_levels() {
         let rtl_brackets = chars("\u{627}(\u{628})\u{62C}");
@@ -1683,9 +1517,6 @@ mod generated {
     use aterm_spec::rng::XorShift;
 
     /// A representative bidi alphabet exercising every resolved class: LTR letters,
-    /// European numbers/separators/terminators, Hebrew (R), Arabic (AL) +
-    /// Arabic-Indic digits (AN), common separators, neutrals, whitespace, and the
-    /// directional marks.
     const ALPHABET: &[char] = &[
         'a', 'Z', '5', '0', '+', '-', '$', '%', ',', '.', ':', '/', ' ', '\t', '\n', '!', '(', ')',
         '\u{05D0}', '\u{05D1}', '\u{05EA}', '\u{0627}', '\u{0628}', '\u{0660}', '\u{0669}',
@@ -1710,7 +1541,6 @@ mod generated {
     }
 
     /// The visual order is always a permutation of 0..n, for any input and base
-    /// — the load-bearing safety property (no cell dropped or duplicated).
     #[test]
     fn reorder_is_always_a_permutation() {
         for line in lines() {
@@ -1724,8 +1554,6 @@ mod generated {
     }
 
     /// Levels match the input length and never fall below their PARAGRAPH's
-    /// base level (explicit embeddings and I1/I2 only raise; L1 resets to
-    /// base). A `B` ends a paragraph, and the next one has its own base.
     #[test]
     fn levels_well_formed() {
         for line in lines() {
@@ -1761,8 +1589,6 @@ mod generated {
     }
 
     /// The class-taking entry points, and the `_into` companion with one
-    /// Scratch reused across bases, are byte-identical to the char-taking
-    /// entry points (the dedup the bridge depends on). Resolution is deterministic.
     #[test]
     fn class_taking_and_into_variants_match_char_taking() {
         let mut scratch = Scratch::default();

@@ -1,99 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE TASK RECORD, PUBLISHED BY THE HARNESS
-//! (`docs/DESIGN-sessions-as-subagents-2026-10-15.md` §2.2-§2.3). A session
-//! started with a task — a worker — carries a record the server keeps (`task`,
-//! `task mark`: aterm-gui's `task_record`), and the window harness is the
-//! writer of its `done` and `exited`. The loop reads and marks it over the
-//! one [`Ctl`] it drives the session through, as every request it makes —
-//! `task`, then `task mark …` — so the in-GUI host and a test's scripted
-//! server see the same requests. (The host's connection is an Owner one, and
-//! `task mark` is Owner-only.)
+//! Task record publication over [`Ctl`] under [`super::claim`] ([`SuperviseOpts::tasks`],
+//! [`Session::supervise`], [`mark_task_exited`]).
 //!
-//! * DONE — ONLY AT LAND'S LANDING (Autopilot Cruise / Land): at a
-//!   point the turn-end policy judges landed ([`TurnEndState::landed`], a
-//!   clean defense at a land act's yield; the policy stays the one decider),
-//!   once a point ([`TurnEndState::point_number`]), AS THE POINT IS FOLDED
-//!   IN — before the host's step or the accounts probe can take the point
-//!   and type into it (the live upgrade's READY, a relaunched agent's
-//!   continuation): the record is read, and only a `working` one (or one
-//!   the window host's deadlines stalled — `stalled why=startup`, the worker
-//!   having started after all, or `stalled why=held`, a box a person then
-//!   answered — that landed) is marked — `task mark done why=landed
-//!   result_bytes=<n> result_path=<pct>` — after its result is snapshotted
-//!   from the agent's transcript: the landing, the report before the land
-//!   act and the defense that landed it
-//!   ([`crate::harness::result::snapshot`], [`DoneBy`]) — or, for a harness
-//!   aterm reads no transcript of (agy, Muse Code, Gemini CLI), from its
-//!   screen's reader: the words of the point the Land episode's instruction
-//!   was typed at (the report), then the landing's words at this point
-//!   ([`crate::harness::result::snapshot_screen`],
-//!   [`crate::harness::result::with_report`]) — the previous
-//!   landing's result of the session pruned ([`result::prune_results`]). A
-//!   record already `done why=landed` at this loop's first landing is this
-//!   loop restarted on a point published before it, and nothing is marked;
-//!   a session with no record has no task. Nothing else is a task's end: no
-//!   token, no answer to a check, no done claim under Cruise.
-//! * DONE AGAIN — a later landing of this loop's after someone else's turn
-//!   opened the task (a manager's follow-up, a person's question at the
-//!   window): the record a `turn` moved back to `working` is published as
-//!   any; one a `send`, a `paste` or a keyboard left `done` — or an older
-//!   build's `done` (`why=marker|done-check`: a token or a check's answer,
-//!   which ends no task now) — is marked `working why=turn` first, then
-//!   published — its own snapshot, under the record's new rev.
-//! * NEVER A PERSON'S OWN EXCHANGE ([`TurnEndState::left_to_person`]): that
-//!   `done` is theirs. It can come on a tasked session only when a person
-//!   types at the worker's window and is answered short — the task's first
-//!   turn is argv and a manager's follow-up is a `turn`, neither a window
-//!   gesture — and the record is left as it stands.
-//! * WORKING AGAIN — where the policy's `done` ends because someone else's
-//!   turn ran (the point follows no act of the harness's,
-//!   [`TurnEndState::followed`]): a `done` record is marked `working
-//!   why=turn`. The server marks the same at once when a `turn` the harness
-//!   did not type lands in a done worker (aterm-gui's `cmd_turn`); the second
-//!   mark changes nothing.
-//! * A LOOP STARTED ON A LANDED RECORD TAKES THE LANDING ON — the record is
-//!   read once a loop, at its first fold ([`Session::task_seed`]): a worker's
-//!   policy hears that a manager waits on it (its acts go without the short
-//!   back-off for its first few short turns in a row,
-//!   [`TurnEndState::set_managed`]), and a record that reads `done
-//!   why=landed` already (published by a loop before this one: the
-//!   harness's fault restart, a seamless update's successor) is this loop's
-//!   landing at the point it starts at ([`TurnEndState::seed_task_done`]) —
-//!   published and said, so no land act is typed into the landed worker,
-//!   and someone else's turn after it opens the record again as above —
-//!   ONLY WHERE THE POINT STILL COULD BE THE LANDING
-//!   ([`TurnEndState::record_landing_holds`]: its last words a clean defense
-//!   over a clean repository, no turn read running ended there, and no
-//!   landing the journal seeded dropped there because its words moved on).
-//!   A conversation that moved on since the record was published — a
-//!   person's work under Off, say — is opened again at the edge, and Land
-//!   acts there. Not
-//!   at a point that shows a wall: a done point never shows one, so that
-//!   point ended someone else's turn after the landing (a `send`, a paste
-//!   or keystrokes, which the server does not reopen on), and it is read as
-//!   one — the record marked `working why=turn` as above, the wall's retry,
-//!   resume or `/login` typed. Nor with an act of this loop's owed (the read
-//!   served only after the loop acted): nothing is read into that point. A
-//!   `done` record any other `why=` marks (an older build's token or check
-//!   answer) is no landing: it is opened again at the loop's first edge.
-//! * UNDER CRUISE NO RECORD IS DONE (Autopilot Cruise): the policy takes no
-//!   `done` record on ([`TurnEndState::seed_task_done`] refuses under
-//!   Cruise), so the loop's first edge opens it again, and Cruise's prompt
-//!   is typed whatever the record read.
-//! * EXITED — the window's host's, where its agent exited and no relaunch
-//!   follows ([`mark_task_exited`]).
-//!
-//! The requests ride the claim's rules ([`super::claim`]): sent while the
-//! claim is pending, never by a loop that watches behind another supervisor.
-//! A request not served leaves the point unpublished, and the point decided
-//! again asks again. A loop with nowhere to snapshot a result
-//! ([`SuperviseOpts::tasks`] `None`: a [`Session::supervise`] loop with no
-//! tasks dir, as the engine's tests run one) leaves the record alone, marking
-//! neither `done` nor `working`: the window's harness publishes the done,
-//! with its result, once it holds the session again (its loop, started
-//! again, folds the done point first).
+//! Publishes [`TurnEndState::landed`] points ([`TurnEndState::point_number`],
+//! [`TurnEndState::left_to_person`], [`TurnEndState::followed`]) with result snapshots
+//! ([`crate::harness::result::snapshot`], [`DoneBy`], [`crate::harness::result::snapshot_screen`],
+//! [`crate::harness::result::with_report`], [`result::prune_results`]) and seeds loops from
+//! existing records ([`Session::task_seed`], [`TurnEndState::set_managed`],
+//! [`TurnEndState::seed_task_done`], [`TurnEndState::record_landing_holds`]).
 
 use serde::{Deserialize, Serialize};
 
@@ -104,18 +20,12 @@ use crate::supervise::tape::core::TapeValue;
 use crate::supervise::tape::doors;
 
 /// What the done edge's result came to ([`Session::publish_done`]'s round
-/// trip at [`doors::TASK_RESULT`]): the transcript's settle — its waits, and
-/// whether the done edge's turn was read to its end; `None` with no
-/// transcript — and the snapshot written, or why none was.
 struct ResultTaken {
     settle: Option<(u32, bool)>,
     snap: Result<Snapshot, String>,
 }
 
 /// The words a snapshot says it has no result by
-/// (`crate::harness::result::report`'s, an older build's `no-marker`, and
-/// `no-transcript`): what a tape's `unavailable` is read back as, a word no
-/// build wrote refused.
 const UNAVAILABLE: &[&str] = &[
     "no-check",
     "no-report",
@@ -127,7 +37,6 @@ const UNAVAILABLE: &[&str] = &[
 ];
 
 /// [`ResultTaken`] as a tape holds it: the snapshot written, or why none
-/// was (`error`), exactly one of the two.
 #[derive(Serialize, Deserialize)]
 struct ResultWire {
     settle: Option<(u32, bool)>,
@@ -155,7 +64,6 @@ impl TapeValue for ResultTaken {
             }),
             error: self.snap.as_ref().err().cloned(),
         };
-        // A path that is not UTF-8 has no JSON form: no answer a replay can take.
         aterm_json::to_vec(&wire).unwrap_or_default()
     }
 
@@ -193,20 +101,13 @@ impl TapeValue for ResultTaken {
     }
 }
 
-/// How the window host's STARTUP DEADLINE's attention begins (aterm-gui's
-/// `harness_host::look_at_startups`): a worker that never started, its task
-/// `stalled why=startup`.
+/// How the window host's startup deadline's attention begins.
 pub const STARTUP_HEAD: &str = "the worker never started: ";
 
-/// How the window host's HELD DEADLINE's attention begins: a started worker
-/// held where nothing moves, its task `stalled why=held`.
+/// How the window host's held deadline's attention begins.
 pub const HELD_HEAD: &str = "the worker is held: ";
 
-/// Whether a supervisor attention `text` is one of the window host's
-/// deadlines' ([`STARTUP_HEAD`], [`HELD_HEAD`]). The host raises it with the
-/// stall and takes it down where the stall ends, so a loop that starts over
-/// it leaves it as it stands (its reconcile at a watch's start): its point
-/// is the task record's, never a box or a question this loop escalated.
+/// Whether a supervisor attention `text` is one of the window host's deadlines'.
 #[must_use]
 pub fn deadline_attention(text: &str) -> bool {
     text.starts_with(STARTUP_HEAD) || text.starts_with(HELD_HEAD)
@@ -227,9 +128,7 @@ pub(crate) struct TaskRead {
     pub(crate) why: Option<String>,
 }
 
-/// The record one `task` reply names (`OK task rev=<n> state=<s> …
-/// result_bytes=<n> [result_path=<pct>] …`, read by key); `None` for `OK task
-/// -` (no task), a refusal, and a server before the verb.
+/// The record one `task` reply names.
 pub(crate) fn task_read(reply: &CtlReply) -> Option<TaskRead> {
     if !reply.ok() {
         return None;
@@ -250,19 +149,15 @@ pub(crate) fn task_read(reply: &CtlReply) -> Option<TaskRead> {
     })
 }
 
-/// The `why=` the harness marks a task `done` by: Land's landing, the only
-/// end a task has ([the module](self)). A `done` record any other word
-/// marks is an older build's (`marker`, `done-check`) and no landing.
+/// The `why=` when the harness marks a task `done`.
 pub const LANDED_WHY: &str = "landed";
 
 /// Whether the record `t` is a landing this harness published: `done
-/// why=landed` ([`LANDED_WHY`]).
 fn is_landing(t: &TaskRead) -> bool {
     t.state == "done" && t.why.as_deref() == Some(LANDED_WHY)
 }
 
 /// The result file's stem for the task the record at `rev` stands for, in
-/// session `sel` (`@s-…`): `<gsid>-<rev>`, the task file's own pairing.
 fn result_stem(sel: Option<&str>, rev: u64) -> String {
     let sid: String = sel
         .unwrap_or_default()
@@ -275,9 +170,7 @@ fn result_stem(sel: Option<&str>, rev: u64) -> String {
 }
 
 impl<C: Ctl> Session<'_, C> {
-    /// THE TASK RECORD AT A DECIDED POINT ([the module](self)), as it is
-    /// folded in and again before its act (once a point either way):
-    /// `was_done` is the policy's `done` as the point before left it.
+    /// The task record at a decided point ([the module](self)).
     pub(super) fn task_at_point(
         &mut self,
         seq: u64,
@@ -297,7 +190,6 @@ impl<C: Ctl> Session<'_, C> {
             if !te.landed() || at.is_none() || at == self.task_point {
                 return Ok(());
             }
-            // A later done of this loop's, on someone else's turn.
             let again = self.task_point.is_some() && te.followed().is_none();
             if self.publish_done(seq, again, tasks, opts, review)? {
                 self.task_point = at;
@@ -309,11 +201,6 @@ impl<C: Ctl> Session<'_, C> {
     }
 
     /// The landing of this point, published, its result snapshotted under
-    /// `tasks`: `Ok(true)` once the record was read and, where it was
-    /// `working` — or `done` and opened `again` by someone else's turn, or
-    /// `done` by an older build's word (no landing, [`is_landing`]) — marked
-    /// (or refused for good); `Ok(false)` where a request went unserved or a
-    /// committing update held the mark back.
     fn publish_done(
         &mut self,
         seq: u64,
@@ -343,30 +230,15 @@ impl<C: Ctl> Session<'_, C> {
                 ));
             }
         }
-        // A worker the window host's deadlines stalled that moved after all —
-        // `stalled why=startup` (the person answered its dialog), `stalled
-        // why=held` (the box no rule knows, answered) — is working: its done
-        // is published as any (the host marks it `working` again as it sees
-        // it move, and this is the mark that lands first). The launcher's
-        // `stalled why=shell` typed nothing: no done of this loop's is that
-        // task's.
         let Some(record) = record.filter(|t| {
             t.state == "working"
                 || (t.state == "stalled" && matches!(t.why.as_deref(), Some("startup" | "held")))
         }) else {
             return Ok(true);
         };
-        // The rule the result is read by is the conversation's: a land act's
-        // turn newest is read as the landing, any other (a wall's retry that
-        // delivered the act again) as a plain turn ([`result::report`]).
         let by = DoneBy::Turn;
         let stem = result_stem(self.setup.sid.as_deref(), record.rev);
         let transcript = opts.idle_host.as_ref().and_then(|h| h.transcript());
-        // A harness aterm reads no transcript of (agy, Muse Code, Gemini
-        // CLI): the landing's words as its screen's reader read them at this
-        // point ([`Session::point_said`]).
-        // The report the Land episode's instruction was typed after opens it
-        // ([`Session::land_report`]), as a transcript's landing reads it.
         let screen = if transcript.is_none() {
             self.point_said
                 .clone()
@@ -382,19 +254,7 @@ impl<C: Ctl> Session<'_, C> {
         } else {
             None
         };
-        // The screen's done point can come before Claude Code wrote the
-        // turn's last rows: read on until the turn's end row, at most the
-        // bound (`result::settled`). The turn waited for is the one the done
-        // was read on: none a row stamped after that read started (a
-        // background shell's notification that landed once the screen showed
-        // the done) — the read that decided the done, never the point's
-        // first showing, which comes before the turn of a carry-on the host
-        // typed that the worker answered with the marker.
         let shown = self.turn_end.done_shown().map(|t| self.unix_ms_of(t));
-        // The settle and the snapshot are one round trip through the door
-        // ([`doors::TASK_RESULT`]): the transcript read on and the result
-        // written live, their outcome taped — a replay reads no transcript
-        // and writes no result, and is handed what the run's were.
         let request = || {
             let mut r = self.fx.path_bytes(tasks);
             r.push(b' ');
@@ -426,9 +286,6 @@ impl<C: Ctl> Session<'_, C> {
                 ),
             }
             .map_err(|e| e.to_string());
-            // The landing before this one is no result any record names now
-            // (the record was opened again first): its pair goes once this
-            // one is written.
             if snap.is_ok() {
                 result::prune_results(tasks, &stem);
             }
@@ -482,22 +339,7 @@ impl<C: Ctl> Session<'_, C> {
         Ok(true)
     }
 
-    /// THE TASK RECORD AT THIS LOOP'S FIRST FOLD, read once a loop (the
-    /// module's "a loop started on a landed record"): the policy hears that a
-    /// manager waits on the session ([`TurnEndState::set_managed`]: a record
-    /// that is not `exited`), and a record that reads `done why=landed` is
-    /// this loop's landing at the point it stands at
-    /// ([`TurnEndState::seed_task_done`]) — published there (nothing marked
-    /// again) and said (no `DONE` line again); a `done` by any other word (an
-    /// older build's) is opened again at the first edge, as one the policy
-    /// refuses (Cruise). Where the point shows a wall the done stood BEFORE it, and
-    /// the edge reads the point as the end of a turn after it
-    /// ([`Self::task_at_point`]: someone else's, the record opened again);
-    /// with an act of this loop's owed (a seed read served only after the
-    /// loop acted) nothing is read into the point. Called after the fold,
-    /// before the decision and the edge. A request not served asks again at the next fold; no record, a
-    /// server before the verb, and a loop with nowhere to publish (`tasks`
-    /// `None`) read nothing more.
+    /// The task record at this loop's first fold, read once per loop.
     pub(super) fn task_seed(&mut self, opts: &SuperviseOpts) -> Result<(), Fail> {
         if self.task_seeded || opts.tasks.is_none() || self.claim.watching_behind().is_some() {
             return Ok(());
@@ -512,18 +354,11 @@ impl<C: Ctl> Session<'_, C> {
         };
         self.turn_end.set_managed(record.state != "exited");
         if record.state == "done" {
-            // A landing the record names holds only where the point still
-            // could be one ([`TurnEndState::record_landing_holds`]): the
-            // conversation moved on since it was published (a person's
-            // work under Off, a turn no loop watched), and the record is
-            // opened again at the edge.
             let holds = self.turn_end.task_done() || self.turn_end.record_landing_holds();
             if is_landing(&record) && holds && self.turn_end.seed_task_done() {
                 self.task_point = self.turn_end.point_number();
                 self.task_done_said = true;
             } else if !self.turn_end.act_in_flight() {
-                // The done stood before this point, and the point (a wall)
-                // ends a turn after it: someone else's, where it follows no
                 // act of this loop's, and the record is opened again.
                 self.task_done_said = true;
             }
@@ -532,7 +367,6 @@ impl<C: Ctl> Session<'_, C> {
     }
 
     /// The task opened again by someone else's turn: a `done` record marked
-    /// `working why=turn`.
     fn reopen_task(&mut self, seq: u64, review: &mut dyn Review) -> Result<(), Fail> {
         let r = self.call(&["task"])?;
         if task_read(&r).is_none_or(|t| t.state != "done") {
@@ -549,16 +383,7 @@ impl<C: Ctl> Session<'_, C> {
     }
 }
 
-/// THE AGENT LEFT ITS TAB AND NOTHING BRINGS IT BACK — the window's host's
-/// word: an exit left to a person or a holder, its launch's own end, one the
-/// relaunch can never make. The task of session `sel` (`@s-…`) not marked
-/// `exited` yet is marked `exited why=exit [exit=<code>]`, the code the
-/// command block its shell is back from ended with — there only where the
-/// shell's block recorded one, its prompt drawn again; the mark is not held
-/// for it — keeping a done task's result
-/// (`result_bytes=`, `result_path=`), which `result` still answers. A session
-/// with no task is left as it is. Returns the mark's reply line, `None` where
-/// nothing was marked.
+/// The agent left its tab and nothing brings it back.
 ///
 /// # Errors
 /// The transport's failure.
@@ -602,8 +427,6 @@ mod tests {
     use super::*;
 
     /// A server that answers `task` with `record` (`None`: `OK task -`), the
-    /// tab's `blocks 2 --json` with `blocks` (`None`: refused), and every
-    /// mark `OK task … changed=1`, keeping the requests.
     struct Tab {
         record: Option<&'static str>,
         blocks: Option<&'static str>,
@@ -651,9 +474,6 @@ mod tests {
     }
 
     /// THE AGENT GONE FOR GOOD MARKS ITS TASK `exited`: with the code its
-    /// shell's block ended with, keeping a done task's result. NEGATIVE
-    /// CONTROLS: no task, and one marked `exited` already, mark nothing; a
-    /// tab whose shell has not drawn its prompt again says no code.
     #[test]
     fn an_agent_gone_for_good_marks_its_task_exited_with_its_code() {
         let run = |record, blocks| {
@@ -696,7 +516,6 @@ mod tests {
             None,
         );
         assert_eq!(marks(&tab), ["@s-1 task mark exited why=exit"]);
-        // NEGATIVE CONTROLS.
         for record in [
             None,
             Some("rev=3 state=exited from=ctl since_ms=5 result_bytes=0 why=exit"),
@@ -708,7 +527,6 @@ mod tests {
     }
 
     /// The record is read by key off the `task` reply and the mark's own;
-    /// `OK task -`, a refusal and a server before the verb are no record.
     #[test]
     fn a_task_reply_is_read_by_key() {
         let reply = |code: i32, stdout: &str| CtlReply {

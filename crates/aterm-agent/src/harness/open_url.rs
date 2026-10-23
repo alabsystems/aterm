@@ -1168,6 +1168,7 @@ pub fn main_entry(args: Vec<OsString>) -> ExitCode {
         .iter()
         .map(|a| a.to_string_lossy().into_owned())
         .collect();
+    let profile = std::env::var(PROFILE_ENV).ok();
     if let [url] = args.as_slice()
         && let Some(mailbox) = discover_mailbox_dir()
     {
@@ -1175,12 +1176,13 @@ pub fn main_entry(args: Vec<OsString>) -> ExitCode {
         match authorize_with_mailbox(url, &mailbox, email.as_deref(), AUTHORIZE_TIMEOUT) {
             Ok(()) => return ExitCode::from(0),
             Err(why) => {
-                eprintln!("{OPENER}: not authorized: {why}");
-                return ExitCode::from(1);
+                if profile.as_deref().is_none_or(|p| p.trim().is_empty()) {
+                    eprintln!("{OPENER}: not authorized: {why}");
+                    return ExitCode::from(1);
+                }
             }
         }
     }
-    let profile = std::env::var(PROFILE_ENV).ok();
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let local_state = || {
         use std::io::Read as _;

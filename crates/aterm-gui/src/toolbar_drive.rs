@@ -1,75 +1,25 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The toolbar driver: `toolbar.rs`'s four declared classes and its AppKit
-//! binding sites, entered through AppKit's own dispatch on a real `NSWindow`
-//! and read back as pixels, wakes and registered encodings.
-//!
-//! `toolbar.rs`'s `objc_tests` check registered encodings against a table in
-//! the same file, so a wrong encoding with a matching table edit passes there.
-//! This driver reads the classes off the live objects AppKit holds instead.
-//!
-//! # What it refuses to do
-//!
-//! * It never calls `toolbar::native_strip_container`. It finds the strip the
-//!   way AppKit does (`-[NSWindow toolbar]` -> `-items` -> item 0 -> `-view`),
-//!   so the thing under test is what the toolbar delegate handed AppKit.
-//! * It never sends through `crate::appkit`. Every message goes through this
-//!   module's own typed casts ([`macos`]'s `s_*` family), so a wrong prototype
-//!   in the helper layer cannot agree with itself.
-//! * It never asserts a pixel hash against a stored golden: hashes depend on
-//!   backing scale, system font and accent tint. It asserts relations (every
-//!   state draws; states that must differ do) and prints the whole state
-//!   matrix, so running it at two commits on one machine and diffing the
-//!   transcripts is the A/B oracle. The strip's ink columns catch layout
-//!   defects no encoding check sees (e.g. `NSTextAlignmentCenter` is 1 on
-//!   arm64, not 2).
-//!
-//! # Exit contract (read by `aterm_verify::stages::OBJC_DRIVES`)
-//!
-//! | code | meaning |
-//! |---|---|
-//! | 0 | every check passed |
-//! | 1 | at least one finding; the transcript names each |
-//! | 2 | not run: no event loop, no window, or no toolbar was installed; or the only failures were clicks that need this drive to be the active app with its window key, made while another app held activation. Never a pass. |
-//! | 3 | the drive hung (a modal tracking loop never returned) and the watchdog killed it |
-//!
-//! `3` has its own code because this driver enters `-mouseDown:` IMPs directly,
-//! and a context menu that really popped would run
-//! `-[NSMenu popUpContextMenu:…]`'s modal tracking loop and never return.
-//!
-//! Stages 3 to 5 click through AppKit's own routing, which reaches the strip
-//! only while the drive is the active app and its window is key; an inactive
-//! app spends the click on activation. macOS can refuse the activation the
-//! drive asks for, or hand it to another app mid-stage: at the desk on
-//! 2026-10-19 a person's trackpad click on another window did, and three clicks
-//! failed with `app active=false` (`docs/measured/desk-appkit-2026-10-19.md`).
-//! Such a click measured nothing about the strip, so it is `2`, never a
-//! finding; a click that fails while the drive held activation is still `1`.
+//! The toolbar driver.
 
 /// Every check passed.
 #[cfg(target_os = "macos")]
 pub(crate) const PASS: i32 = 0;
-/// At least one finding. See the transcript.
+/// At least one finding.
 #[cfg(target_os = "macos")]
 pub(crate) const FINDING: i32 = 1;
-/// The drive could not execute here. Not a pass.
+/// The drive could not execute here.
 #[cfg(target_os = "macos")]
 pub(crate) const NOT_RUN: i32 = 2;
-/// A modal tracking loop never returned; the watchdog killed the process.
+/// A modal tracking loop never returned.
 #[cfg(target_os = "macos")]
 pub(crate) const HUNG: i32 = 3;
 
 /// Drive the real tab strip and return the exit code above.
-///
-/// Called from `examples/objc_toolbar_drive.rs`, which owns `fn main`; the body
-/// lives here because `mod toolbar`, `Wake` and `WindowId` are library-private
-/// (as with `run_redraw_conformance`).
 #[cfg(target_os = "macos")]
 #[must_use]
 pub fn run_toolbar_drive() -> i32 {
-    // The drive is a windowed process of its own: it builds AppKit windows and
-    // reads NSApp, so it mints the proof a windowed launch carries and hands it
     // to the body that sends `+sharedApplication`.
     macos::run(crate::platform::Windowed::launch())
 }
@@ -95,25 +45,10 @@ mod macos {
     use crate::tab_model::{TabConnRole, TabIconKind, TabId};
     use crate::{Wake, WindowId, toolbar};
 
-    // ---------------------------------------------------------------- sends
-    //
-    // Not `crate::appkit`: an instrument using the helper layer would only show
-    // that layer agreeing with itself. Every prototype below is written out
-    // here and checked against clang's `@encode`-derived signature.
-
     /// `+[NSMenu popUpContextMenu:withEvent:forView:]`, the strip's one pop site
-    /// (toolbar.rs), as the class method it is: `(cls, _cmd, menu, event,
-    /// view)`, void.
     type PopUpContextMenu = unsafe extern "C-unwind" fn(Id, Sel, Id, Id, Id);
 
     /// The site that replaces it for the life of the drive process.
-    ///
-    /// No menu ever tracks in this process. A synthesized ctrl-left or right
-    /// mouse may route into the titlebar's view tree on some macOS versions,
-    /// where `popUpContextMenu:` opens a real menu whose synchronous tracking
-    /// loop never returns. So the pop site is replaced before stage 5 with a
-    /// stub that records the pop (count and item count) and returns; the stage
-    /// reads the strip's `TabContextMenuOpening` wake and this record.
     static POP_UP_CONTEXT_MENU: aterm_objc::swizzle::SwizzleSite<PopUpContextMenu> =
         aterm_objc::swizzle::SwizzleSite::new();
     /// Pops the stub swallowed, and the item count of the last one.
@@ -121,8 +56,6 @@ mod macos {
     static LAST_MENU_ITEMS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
     /// The stub, entered by the runtime as the class method it replaces.
-    /// Nothing here can unwind (two atomic stores and one `-numberOfItems` send
-    /// on a live menu).
     unsafe extern "C-unwind" fn swallow_pop_up(
         _cls: Id,
         _cmd: Sel,
@@ -131,9 +64,7 @@ mod macos {
         _view: Id,
     ) {
         use std::sync::atomic::Ordering::Relaxed;
-        // SAFETY: `menu` is the live NSMenu the strip just built (+0 for this
-        // call); `-numberOfItems` is `-(NSInteger)`, sent as that. A nil menu
-        // (or a negative answer) is recorded as zero items.
+        // SAFETY: `menu` is the live NSMenu the strip just built (+0 for this call).
         let items = if menu.is_null() {
             0
         } else {
@@ -149,8 +80,7 @@ mod macos {
     }
 
     unsafe fn s_v_id(r: Id, s: Sel, a: Id) {
-        // SAFETY: the caller passes a live receiver that implements `s`, and the
-        // cast is `s`'s exact prototype, here `void (id, SEL, id)`.
+        // SAFETY: the caller passes a live receiver that implements `s`, and the cast is `s`'s exact prototype, here `void (id, SEL, id)`.
         unsafe {
             let f: unsafe extern "C-unwind" fn(Id, Sel, Id) = checked_msg();
             f(r, s, a);
@@ -213,8 +143,7 @@ mod macos {
         }
     }
     unsafe fn s_rect(r: Id, s: Sel) -> CGRect {
-        // SAFETY: as above, for `NSRect (id, SEL)`. 32 bytes, returned in
-        // registers on both Apple ABIs for this shape.
+        // SAFETY: as above, for `NSRect (id, SEL)`.
         unsafe {
             let f: unsafe extern "C-unwind" fn(Id, Sel) -> CGRect = checked_msg();
             f(r, s)
@@ -249,9 +178,7 @@ mod macos {
         }
     }
     unsafe fn s_bytes(r: Id, s: Sel) -> *const u8 {
-        // SAFETY: as above, for `unsigned char * (id, SEL)`
-        // (`-[NSBitmapImageRep bitmapData]`). Taken as `Id` and re-cast
-        // because both are one pointer-sized return in the same register.
+        // SAFETY: as above, for `unsigned char * (id, SEL)` (`-[NSBitmapImageRep bitmapData]`).
         unsafe {
             let f: unsafe extern "C-unwind" fn(Id, Sel) -> Id = checked_msg();
             f(r, s).as_ptr().cast_const().cast::<u8>()
@@ -266,8 +193,6 @@ mod macos {
     }
 
     /// `+[NSEvent mouseEventWithType:location:modifierFlags:timestamp:windowNumber:context:eventNumber:clickCount:pressure:]`,
-    /// encoded `@92@0:8Q16{CGPoint=dd}24Q40d48q56@64q72q80f88`: `pressure` is
-    /// `f32` and the two counters are `NSInteger`.
     unsafe fn mouse_event(
         kind: usize,
         loc: CGPoint,
@@ -275,8 +200,7 @@ mod macos {
         win: isize,
         clicks: isize,
     ) -> Id {
-        // SAFETY: a class method on `NSEvent` (linked), cast to the exact
-        // prototype above; every argument is a plain scalar or nil.
+        // SAFETY: a class method on `NSEvent` (linked), cast to the exact prototype above.
         unsafe {
             let f: unsafe extern "C-unwind" fn(
                 Id,
@@ -308,7 +232,6 @@ mod macos {
     }
 
     /// `+[NSEvent keyEventWithType:…]`, encoded
-    /// `@96@0:8Q16{CGPoint=dd}24Q40d48q56@64@72@80B88S92`.
     unsafe fn key_event(kind: usize, win: isize, chars: Id, code: u16) -> Id {
         // SAFETY: as [`mouse_event`], against the signature above.
         unsafe {
@@ -355,8 +278,6 @@ mod macos {
     const CTRL: usize = 1 << 18;
 
     /// How long a stage waits for macOS to make the drive the active app with
-    /// its window key before it clicks anyway. Past it the clicks that need
-    /// activation and fail read as not measured, never as findings.
     const FOCUS_WAIT: Duration = Duration::from_secs(10);
 
     /// An autoreleased `NSString`, for an event's `-characters`.
@@ -368,19 +289,13 @@ mod macos {
         if id.is_null() {
             return "nil".to_owned();
         }
-        // SAFETY: `id` is non-null here; `class_of` and `class_name` are
-        // read-only runtime queries and the name is immortal.
+        // SAFETY: `id` is non-null here.
         unsafe { class_name(class_of(id)) }
             .to_string_lossy()
             .into_owned()
     }
 
     /// Intern a class or protocol name known only as a `&str`.
-    ///
-    /// [`aterm_objc::protocol`] takes `&'static CStr`; the names in stage 10
-    /// come from `class_protocols`. One small leak per name, bounded by four
-    /// superclass chains in a process that drives one window and exits (as
-    /// `objc_live_class_audit.rs` does).
     fn cstr_named(name: &str) -> &'static CStr {
         Box::leak(
             std::ffi::CString::new(name)
@@ -390,7 +305,6 @@ mod macos {
     }
 
     /// Round to a sixteenth of a point, so a layout figure is printable without
-    /// a float's last bit deciding whether two transcripts differ.
     fn r4(v: f64) -> f64 {
         (v * 16.0).round() / 16.0
     }
@@ -404,8 +318,6 @@ mod macos {
             r4(r.size.height)
         )
     }
-
-    // ------------------------------------------------------------------ model
 
     fn meta(
         icon: Option<TabIconKind>,
@@ -461,8 +373,6 @@ mod macos {
                     None
                 },
             ));
-            // The hover is the session chrome's tooltip with the presence lines
-            // after it (`App::tab_tooltips`); the extension carries the bare one.
             m.tooltips
                 .push(Some(format!("tip {i}\n{}", presence_line(i))));
             m.ext.push(TabChromeExt {
@@ -482,13 +392,11 @@ mod macos {
     }
 
     /// The presence line the model's hover for tab `i` ends in, which the
-    /// extension's bare tooltip lacks.
     fn presence_line(i: usize) -> String {
         format!("last typed into by worker-{i} at 14:02")
     }
 
     /// Whether every chip's hover, as `chrome` reads it, is the strip's tooltip
-    /// with its presence line, not the extension's bare one.
     fn hovers_keep_presence(handle: &toolbar::ToolbarHandle, n: usize) -> (bool, String) {
         let chrome = toolbar::read_tab_chrome(handle).unwrap_or_default();
         ((0..n).all(|i| chrome.contains(&presence_line(i))), chrome)
@@ -506,8 +414,6 @@ mod macos {
             None,
         );
     }
-
-    // ----------------------------------------------------------------- driver
 
     struct Driver {
         window: Option<Window>,
@@ -565,11 +471,9 @@ mod macos {
     }
 
     /// The findings ledger. `check` prints every question it asked, passing or
-    /// failing: the transcript is what an A/B between two commits diffs.
     struct Ctx {
         findings: Vec<String>,
         /// Clicks that failed while another app held activation: they measured
-        /// nothing about the strip (exit 2 when nothing else failed).
         unmeasured: Vec<String>,
     }
     impl Ctx {
@@ -581,9 +485,6 @@ mod macos {
         }
 
         /// A click that reaches the strip only while the drive is the active app
-        /// with its window key. `focused` says whether that held both before its
-        /// events went in and after they were pumped; a failure without it is
-        /// not a finding but a click spent on activation.
         fn check_focused(&mut self, focused: bool, ok: bool, msg: String) {
             if ok || focused {
                 self.check(ok, msg);
@@ -594,18 +495,9 @@ mod macos {
         }
     }
 
-    // ------------------------------------------------------------- tree walk
-
     /// The strip container, reached the way AppKit reaches it: window ->
-    /// toolbar -> items -> item 0 -> view.
-    ///
-    /// Never `toolbar::native_strip_container`: if
-    /// `toolbar:itemForItemIdentifier:willBeInsertedIntoToolbar:` were
-    /// mis-registered, or the delegate stopped claiming `NSToolbarDelegate`,
-    /// this returns nil and every later stage fails.
     unsafe fn strip_of(ns_window: Id) -> Id {
-        // SAFETY: `ns_window` is a live `NSWindow`; every send is a read-only
-        // accessor at the prototype its helper declares.
+        // SAFETY: `ns_window` is a live `NSWindow`.
         unsafe {
             let tb = s_id(ns_window, sel!(toolbar));
             if tb.is_null() {
@@ -621,7 +513,7 @@ mod macos {
     }
 
     unsafe fn subviews(v: Id) -> Vec<Id> {
-        // SAFETY: `v` is a live `NSView`; `-subviews` answers a live array.
+        // SAFETY: `v` is a live `NSView`.
         unsafe {
             let arr = s_id(v, sel!(subviews));
             if arr.is_null() {
@@ -636,7 +528,7 @@ mod macos {
 
     /// Every tab chip, in x order. The `+` button is excluded by class name.
     unsafe fn chips(strip: Id) -> Vec<Id> {
-        // SAFETY: `strip` is a live `NSView`; `-frame` is read-only.
+        // SAFETY: `strip` is a live `NSView`.
         unsafe {
             let mut v: Vec<(f64, Id)> = subviews(strip)
                 .into_iter()
@@ -656,13 +548,8 @@ mod macos {
     }
 
     /// Capture `view` through AppKit's `-cacheDisplayInRect:` pair and return
-    /// `(w, h, bytes)`: what `drawRect:` actually put down, so a class that
-    /// registers every encoding correctly yet draws the wrong thing is caught.
     unsafe fn capture(view: Id) -> Option<(usize, usize, Vec<u8>)> {
-        // SAFETY: `view` is a live `NSView` on the main thread; the two sends
-        // are the documented caching pair and the rep's accessors are
-        // read-only. `bitmapData` is valid while `rep` is, which is for the
-        // rest of this autorelease scope.
+        // SAFETY: `view` is a live `NSView` on the main thread.
         unsafe {
             let b = s_rect(view, sel!(bounds));
             if !(b.size.width > 1.0 && b.size.height > 1.0) {
@@ -691,8 +578,6 @@ mod macos {
     }
 
     /// Per-column ink profile: how many non-transparent samples each x column
-    /// holds. It localises a pixel difference to a column band (e.g. "the label
-    /// moved 60 points right").
     fn ink_columns(w: usize, h: usize, px: &[u8]) -> Vec<u32> {
         let spp = px.len().checked_div(w * h).unwrap_or(4).max(1);
         let mut cols = vec![0u32; w];
@@ -738,11 +623,7 @@ mod macos {
             .join(",")
     }
 
-    // --------------------------------------------------- the registered rows
-
     /// Every protocol reachable from `seed`, following protocol inheritance
-    /// (`NSTextFieldDelegate` inherits `NSControlTextEditingDelegate`, where two
-    /// of the three rename rows are declared).
     fn expand_protocols(into: &mut Vec<String>, seed: impl IntoIterator<Item = String>) {
         for name in seed {
             let mut stack = vec![name];
@@ -757,8 +638,6 @@ mod macos {
     }
 
     /// The protocols a protocol itself inherits. `protocol_copyProtocolList` has
-    /// no `aterm-objc` wrapper (no shipping call site needs one), so the
-    /// prototype is declared here.
     fn protocol_parents(proto: aterm_objc::ProtocolPtr) -> Vec<String> {
         unsafe extern "C" {
             fn protocol_copyProtocolList(
@@ -772,39 +651,29 @@ mod macos {
             return Vec::new();
         }
         let mut count: std::ffi::c_uint = 0;
-        // SAFETY: `proto` is live; the runtime writes the count through the
-        // pointer and hands back a malloc'd array this function owns.
+        // SAFETY: `proto` is live.
         let list = unsafe { protocol_copyProtocolList(proto, &raw mut count) };
         if list.is_null() {
             return Vec::new();
         }
         let mut names = Vec::with_capacity(count as usize);
         for i in 0..count as usize {
-            // SAFETY: `i < count`; protocol objects and their names are
-            // immortal.
+            // SAFETY: `i < count`; protocol objects and their names are immortal.
             let name = unsafe { CStr::from_ptr(protocol_getName(*list.add(i))) };
             names.push(name.to_string_lossy().into_owned());
         }
-        // SAFETY: the array is this function's to free; the immortal protocol
-        // objects it held are not touched.
+        // SAFETY: the array is this function's to free.
         unsafe { free(list.cast()) };
         names
     }
 
     /// Where a row's shape is written down outside this tree, and what that
-    /// authority says.
-    ///
-    /// Asked in order: every protocol the class claims (expanded through
-    /// inheritance), then the superclass chain, where an override's original
-    /// lives. `None` means nothing outside this tree declares the selector (a
-    /// first-party action such as `closeTab:`); such rows are printed.
     unsafe fn authority_for(cls: ClassPtr, s: Sel) -> Option<(String, String)> {
         // SAFETY: `cls` is a live class object.
         let mut protos: Vec<String> = Vec::new();
         expand_protocols(&mut protos, unsafe { class_protocols(cls) });
         for p in &protos {
-            // SAFETY: `protocol` answers a live protocol or nil, which
-            // `protocol_method_types` tolerates.
+            // SAFETY: `protocol` answers a live protocol or nil, which `protocol_method_types` tolerates.
             if let Some(t) = unsafe { protocol_method_types(protocol(cstr_named(p)), s, true) } {
                 return Some((format!("protocol {p}"), strip_method_offsets(&t)));
             }
@@ -829,16 +698,13 @@ mod macos {
         /// The instance this class was read from, and how it was found.
         found_by: &'static str,
         /// The name `declare_class!` registered, used only to ask
-        /// `objc_getClass` whether the live object's class is that class.
         name: &'static CStr,
         cls: ClassPtr,
         /// A protocol the class must conform to, if its rows come from one; an
-        /// encoding check cannot see a class that stopped claiming it.
         conforms: Option<&'static CStr>,
     }
 
     /// Read every registered row of `d`'s class and check it against whatever
-    /// the runtime says it should be.
     fn audit_declared(cx: &mut Ctx, d: &Declared) {
         println!("  --  {} found by {}", d.name.to_string_lossy(), d.found_by);
         if d.cls.is_null() {
@@ -866,13 +732,10 @@ mod macos {
         println!("      superclass {}", sup.to_string_lossy());
         if let Some(p) = d.conforms {
             let proto = protocol(p);
-            // Registered by the host's AppKit, not supplied by aterm, so the
-            // conformance below is about something AppKit knows.
             let hosts =
                 !proto.is_null() && !aterm_objc::protocols_registered_by_aterm().contains(&p);
             cx.check(hosts, format!("{p:?} is registered by this host's AppKit"));
-            // SAFETY: `+conformsToProtocol:` is a read-only `NSObject` query
-            // on a live class object.
+            // SAFETY: `+conformsToProtocol:` is a read-only `NSObject` query on a live class object.
             let ok = unsafe {
                 s_bool_id(
                     d.cls.as_id(),
@@ -921,8 +784,6 @@ mod macos {
         );
     }
 
-    // -------------------------------------------------------------------- run
-
     #[expect(
         clippy::too_many_lines,
         reason = "one linear drive of one window: every stage depends on the \
@@ -931,9 +792,6 @@ mod macos {
                   nothing"
     )]
     pub(crate) fn run(_windowed: crate::platform::Windowed) -> i32 {
-        // The watchdog: this driver enters `-mouseDown:`/`-rightMouseDown:`
-        // IMPs directly, and a context menu that popped would run a modal
-        // tracking loop that never returns. A hang gets its own exit code.
         std::thread::spawn(|| {
             std::thread::sleep(Duration::from_secs(180));
             crate::logging::stderr_line!(
@@ -942,10 +800,6 @@ mod macos {
             std::process::exit(HUNG);
         });
 
-        // The quiet builder starts inactive. Stage 3 asks to be the active app
-        // with its window key, which its clicks and stage 4's drag need, and
-        // stage 5 asks again for AppKit's own routing: an inactive app's click
-        // is consumed as an activation click (`Ctx::check_focused`).
         let mut el = match crate::quiet_driver_event_loop_builder::<Wake>().build() {
             Ok(el) => el,
             Err(e) => {
@@ -984,8 +838,7 @@ mod macos {
             crate::logging::stderr_line!("objc-toolbar-drive: NOT RUN — no content view");
             return NOT_RUN;
         }
-        // SAFETY: `ns_view` is winit's live content view; both accessors are
-        // read-only.
+        // SAFETY: `ns_view` is winit's live content view.
         let ns_window = unsafe { s_id(ns_view, sel!(window)) };
         // SAFETY: as above.
         let win_no = unsafe { s_isize(ns_window, sel!(windowNumber)) };
@@ -1006,7 +859,6 @@ mod macos {
         };
         println!("=== objc-toolbar-drive ===");
 
-        // ---------------------------------------------------------- stage 1
         println!("\n-- stage 1: the strip AppKit is holding");
         // SAFETY: `ns_window` is live.
         let strip = unsafe { strip_of(ns_window) };
@@ -1015,9 +867,6 @@ mod macos {
             format!("toolbar item 0 has a view: {}", name_of(strip)),
         );
         if strip.is_null() {
-            // Nothing below means anything, and an empty toolbar is what a
-            // delegate that stopped claiming `NSToolbarDelegate` leaves: a
-            // finding, not a could-not-run.
             println!("objc-toolbar-drive: 1 FINDING(S)");
             return FINDING;
         }
@@ -1069,7 +918,6 @@ mod macos {
             format!("each built chip's hover keeps its presence line: {chrome}"),
         );
 
-        // ---------------------------------------------------------- stage 2
         println!("\n-- stage 2: AppKit draws the strip (cacheDisplayInRect:)");
         // SAFETY: `strip` is a live view on the main thread.
         if let Some((w, h, px)) = unsafe { capture(strip) } {
@@ -1085,20 +933,12 @@ mod macos {
             cx.check(false, "cacheDisplayInRect: produced no bitmap".to_owned());
         }
 
-        // ---------------------------------------------------------- stage 3
         println!("\n-- stage 3: a left click on each hit-tested chip view");
-        // SAFETY: `+sharedApplication` on a linked class; later keyboard
-        // events still enter through NSApp's event dispatch.
+        // SAFETY: `+sharedApplication` on a linked class.
         let app = unsafe { s_id(class(c"NSApplication").as_id(), sel!(sharedApplication)) };
-        // Whether AppKit routes a click to this drive's window: the app active
-        // and the window key. Another app's activation takes both.
-        // SAFETY: the live NSApp and the drive's own window; `-isActive` and
-        // `-isKeyWindow` are read-only `B16@0:8` getters.
+        // SAFETY: the live NSApp and the drive's own window.
         let focused =
             || unsafe { s_bool(app, sel!(isActive)) && s_bool(ns_window, sel!(isKeyWindow)) };
-        // Asks to be the active app with the window key and pumps until macOS
-        // has granted it or `FOCUS_WAIT` has passed; macOS may refuse while a
-        // person is using another app.
         let take_focus = |d: &mut Driver, el: &mut EventLoop<Wake>| {
             // SAFETY: the live NSApp and the live window this drive built.
             unsafe {
@@ -1115,18 +955,12 @@ mod macos {
                 t.elapsed().as_secs_f64()
             );
         };
-        // Active and key first, as stage 5 does. The drive launches under the
-        // quiet posture (Accessory, no activation); this stage audits tab
-        // selection by click, which needs the key window: otherwise the click
-        // hit-tests to the chip's label (`NSTextField`, no first mouse) and
-        // AppKit spends it on key-window selection.
         take_focus(&mut d, &mut el);
         pump(&mut d, &mut el, 250);
         for (i, c) in cs.iter().enumerate() {
             d.wakes.clear();
             let before = focused();
-            // SAFETY: `c` and `strip` are live views, `ns_window` is live;
-            // the synthesized events are +0 autoreleased `NSEvent`s.
+            // SAFETY: `c` and `strip` are live views, `ns_window` is live.
             unsafe {
                 let b = s_rect(*c, sel!(bounds));
                 let mid = CGPoint {
@@ -1152,7 +986,6 @@ mod macos {
             );
         }
 
-        // ---------------------------------------------------------- stage 4
         println!("\n-- stage 4: drag chip0 across chip2 (down, 6 drags, up)");
         d.wakes.clear();
         let before = focused();
@@ -1208,16 +1041,10 @@ mod macos {
             format!("the drag posted a reorder; saw {:?}", d.wakes),
         );
 
-        // ---------------------------------------------------------- stage 5
         println!("\n-- stage 5: the context menu, two ways in");
-        // The pop site goes first (see `POP_UP_CONTEXT_MENU`). A class method is
-        // an instance method of the metaclass, so the row is claimed there;
-        // `install` refuses unless the registered encoding is the stub's.
-        // SAFETY: `NSMenu` is a live, immortal class object; `class_of` on it
-        // answers its metaclass.
+        // SAFETY: `NSMenu` is a live, immortal class object.
         let meta = unsafe { aterm_objc::class_of(class(c"NSMenu").as_id()) };
-        // SAFETY: the stub has exactly the row's prototype and cannot unwind;
-        // NSMenu's metaclass is live and the selector is interned.
+        // SAFETY: the stub has exactly the row's prototype and cannot unwind.
         let pop_site_replaced = match unsafe {
             POP_UP_CONTEXT_MENU.install(
                 meta,
@@ -1247,19 +1074,12 @@ mod macos {
         for l in &menus {
             println!("      {l}");
         }
-        // NSApp's real event routing needs the application active and this
-        // window key; otherwise the first click is consumed as an activation
-        // click. Asked again here: another app may have taken it since stage 3.
         take_focus(&mut d, &mut el);
         pump(&mut d, &mut el, 250);
-        // Exercise real NSApp dispatch for every chip as well as stage 3's
-        // direct-responder checks. These are plain left clicks; context-menu
-        // dispatch below remains guarded by a successful pop-site replacement.
         for (i, c) in cs.iter().enumerate() {
             d.wakes.clear();
             let before = focused();
-            // SAFETY: `c` is a live view, `app` is the live NSApp, and the
-            // synthesized events are +0 autoreleased `NSEvent`s.
+            // SAFETY: `c` is a live view, `app` is the live NSApp, and the synthesized events are +0 autoreleased `NSEvent`s.
             unsafe {
                 let b = s_rect(*c, sel!(bounds));
                 let mid = CGPoint {
@@ -1288,14 +1108,8 @@ mod macos {
                 ),
             );
         }
-        // The block below enters the strip's menu, through AppKit's routing
-        // and straight at the IMPs, so it runs only over the stub; over the
-        // real pop site it could hang in the tracking loop (exit 3) instead of
-        // failing with the recorded reason. Its other observations (the control
-        // click, the hit map) are skipped with it.
         if pop_site_replaced {
-            // SAFETY: live views, NSApp and NSWindow throughout this block; every
-            // synthesized event is +0 autoreleased.
+            // SAFETY: live views, NSApp and NSWindow throughout this block.
             unsafe {
                 let b = s_rect(cs[1], sel!(bounds));
                 let mid = CGPoint {
@@ -1311,8 +1125,6 @@ mod macos {
                     name_of(s_id_point(strip, sel!(hitTest:), lp))
                 );
 
-                // App and window are active/key for the real NSApp routing
-                // control below; the view's responder was checked in stage 3.
                 println!(
                     "  --  app active={} window key={} main={}",
                     s_bool(app, sel!(isActive)),
@@ -1320,9 +1132,6 @@ mod macos {
                     s_bool(ns_window, sel!(isMainWindow))
                 );
 
-                // The control: a plain click through the same NSApp routing as
-                // the context clicks must select before those observations count.
-                // The pop site is stubbed, so no route enters a tracking loop.
                 d.wakes.clear();
                 let before = focused();
                 s_v_id(
@@ -1381,10 +1190,6 @@ mod macos {
                     name_of(s_id_point(frame_view, sel!(hitTest:), wp))
                 );
 
-                // Straight into the registered IMP, which AppKit calls once its
-                // routing has picked the view. Nothing is queued to dismiss the
-                // menu: the pop lands in the stub, and a posted ESC would reach
-                // the key window as a stray Escape keyDown.
                 for (label, recv, s, ev) in [
                     (
                         "chip rightMouseDown:",
@@ -1414,8 +1219,6 @@ mod macos {
                     );
                 }
 
-                // Where a click lands across the chip (no pumping needed): the
-                // label owns the middle, the chip owns the edges.
                 let bb = s_rect(cs[1], sel!(bounds));
                 let map: Vec<String> = (0..20)
                     .map(|k| {
@@ -1434,9 +1237,6 @@ mod macos {
                     .collect();
                 println!("  --  hit map across chip1: {}", map.join(" "));
 
-                // And the label, which the user's pointer is actually over:
-                // `NSTextField` is not a chip, so both menu routes must survive
-                // the responder walk from the label up to the chip.
                 let label = subviews(cs[1])
                     .into_iter()
                     .find(|v| name_of(*v) == "NSTextField");
@@ -1467,14 +1267,12 @@ mod macos {
             println!("  --  stage 5's menu entries NOT driven: the pop site is still AppKit's");
         }
 
-        // ---------------------------------------------------------- stage 6
         println!("\n-- stage 6: a real resize, then the strip's own re-layout");
-        // SAFETY: `strip` is live; `plus_button` walks its subviews.
+        // SAFETY: `strip` is live.
         let plus_before = unsafe { plus_button(strip).map(|p| s_rect(p, sel!(frame))) };
         // SAFETY: as above.
         let strip_w0 = unsafe { s_rect(strip, sel!(bounds)) }.size.width;
-        // SAFETY: `ns_window` is live; `-setFrame:display:` is the documented
-        // resize.
+        // SAFETY: `ns_window` is live.
         unsafe {
             let f = s_rect(ns_window, sel!(frame));
             s_v_rect_bool(
@@ -1512,12 +1310,9 @@ mod macos {
                 "the \"+\" button is live before and after".to_owned(),
             );
         }
-        // The chips follow the edge too: `reflow_window_tabs` runs in the
-        // resize's own turn, so a narrowed window does not keep the wide layout
-        // with the last chip under the "+".
         toolbar::reflow_window_tabs(&handle);
         pump(&mut d, &mut el, 100);
-        // SAFETY: `strip` is live; `chips` walks its subviews.
+        // SAFETY: `strip` is live.
         let flowed: Vec<CGRect> = unsafe { chips(strip) }
             .into_iter()
             // SAFETY: live views.
@@ -1587,14 +1382,6 @@ mod macos {
             println!("  --  ink spans: {}", show_spans(&cols));
         }
 
-        // ---------------------------------------------------------- stage 7
-        //
-        // The rename editor. `control:textView:doCommandBySelector:` takes a
-        // `SEL` and returns a `BOOL`, whose one-byte-vs-eight-byte failure mode
-        // is silent on arm64. Only a real Escape typed into a real field editor
-        // reaches that row, and only a real Return reaches its commit twin, so
-        // this stage types both. Opening the editor must not end the editing
-        // session (see the relay attach in `toolbar.rs`).
         println!("\n-- stage 7: the inline rename editor, typed through AppKit's field editor");
         cx.check(
             toolbar::can_present_tab_rename(&handle),
@@ -1607,13 +1394,11 @@ mod macos {
             "begin_tab_rename".to_owned(),
         );
         pump(&mut d, &mut el, 200);
-        // Opening an editor decides nothing, so it must post nothing: a commit
-        // here is an unrequested rename and a latch that kills every later exit.
         cx.check(
             d.wakes.is_empty(),
             format!("opening the editor posted no outcome; saw {:?}", d.wakes),
         );
-        // SAFETY: `ns_window` is live; `-firstResponder` is read-only.
+        // SAFETY: `ns_window` is live.
         let fr = unsafe { s_id(ns_window, sel!(firstResponder)) };
         println!("  --  firstResponder after begin: {}", name_of(fr));
         cx.check(
@@ -1627,11 +1412,7 @@ mod macos {
                 toolbar::rename_editor_text(&handle)
             ),
         );
-        // The field editor's delegate is the NSTextField control, whose own
-        // delegate is the declared `ATermTabRenameTarget`; this is the only
-        // moment that object is live, so stage 10 reads it now.
-        // SAFETY: `fr` is a live responder while the editor is up; both
-        // `-delegate` sends are read-only accessors.
+        // SAFETY: `fr` is a live responder while the editor is up.
         unsafe {
             let ctl = s_id(fr, sel!(delegate));
             let tgt = if ctl.is_null() {
@@ -1648,7 +1429,7 @@ mod macos {
                 rename_target_cls = class_of(tgt);
             }
         }
-        // SAFETY: `app` is the live NSApp; the events are +0 autoreleased.
+        // SAFETY: `app` is the live NSApp.
         unsafe {
             for (ch, code) in [("Z", 6u16), ("Q", 12u16)] {
                 s_v_id(
@@ -1675,9 +1456,6 @@ mod macos {
             toolbar::rename_editor_edit(&handle, crate::platform::RenameEditorEdit::SelectAll),
             "rename_editor_edit(SelectAll) found a field editor".to_owned(),
         );
-        // Escape: `control:textView:doCommandBySelector:` with
-        // `cancelOperation:`, entered by a real key event through AppKit's
-        // key-binding machinery.
         d.wakes.clear();
         // SAFETY: live NSApp, +0 autoreleased events.
         unsafe {
@@ -1703,9 +1481,6 @@ mod macos {
         );
         toolbar::end_tab_rename(&handle);
         pump(&mut d, &mut el, 150);
-        // Return: the commit exit, `controlTextDidEndEditing:`, not the selector
-        // row (`abortEditing` suppresses that notification), so both need
-        // driving.
         d.wakes.clear();
         cx.check(
             toolbar::begin_tab_rename(&handle, m3.ids[1], 77, "vim", "name"),
@@ -1737,8 +1512,6 @@ mod macos {
                 d.wakes
             ),
         );
-        // Tearing the field down is `App`'s job on that wake; `end_tab_rename`
-        // removes it, and that is what this checks.
         toolbar::end_tab_rename(&handle);
         pump(&mut d, &mut el, 150);
         // SAFETY: `ns_window` is live.
@@ -1751,16 +1524,11 @@ mod macos {
             "the editor is gone after end_tab_rename".to_owned(),
         );
 
-        // ---------------------------------------------------------- stage 8
-        //
-        // The ownership ledger. Every rebuild runs inside an `autoreleasepool`,
-        // as the shipped app does (AppKit drains one per event-loop iteration);
-        // without one the driver would measure its own missing pool.
         println!("\n-- stage 8: the ownership ledger over 200 pooled strip rebuilds");
         let m4 = model(4);
         apply(&handle, &m3);
         pump(&mut d, &mut el, 100);
-        // SAFETY: `strip` is live; every send is a read-only accessor.
+        // SAFETY: `strip` is live.
         let (rc0, sv0, ta0) = unsafe {
             (
                 s_usize(strip, sel!(retainCount)),
@@ -1816,13 +1584,6 @@ mod macos {
             format!("the strip's retain count is stable: {rc0} -> {rc1}"),
         );
 
-        // ---------------------------------------------------------- stage 9
-        //
-        // The state matrix: icon kinds, status marks, connection roles, dark
-        // mode, the accent tint, hover and press. Each row applies a state, lets
-        // AppKit draw it, and prints the hash. Hashes are printed, not asserted
-        // (they are machine-specific); what is asserted is relational: every
-        // row draws, and rows that must differ do differ.
         println!("\n-- stage 9: the drawing state matrix");
         // SAFETY: `ns_window` is live.
         unsafe {
@@ -1850,8 +1611,7 @@ mod macos {
             while t.elapsed() < Duration::from_millis(90) {
                 let _ = el.pump_app_events(Some(Duration::from_millis(4)), d);
             }
-            // SAFETY: `ns_window` is live and the strip is re-found through
-            // AppKit every row, so a rebuild that replaced it is followed.
+            // SAFETY: `ns_window` is live and the strip is re-found through AppKit every row, so a rebuild that replaced it is followed.
             let s = unsafe { strip_of(ns_window) };
             // SAFETY: `s` is a live view or nil, which `capture` rejects.
             match unsafe { capture(s) } {
@@ -1924,8 +1684,6 @@ mod macos {
             row(name, &mut d, &mut el, &mut matrix);
         }
         toolbar::set_active_tab_color(&handle, None);
-        // Hover and press, driven into the registered IMPs a tracking area and
-        // a mouse would enter.
         // SAFETY: `ns_window` is live.
         let strip_now = unsafe { strip_of(ns_window) };
         // SAFETY: `strip_now` is a live view.
@@ -1937,7 +1695,7 @@ mod macos {
                 ("chip hover", sel!(mouseEntered:)),
                 ("chip hover off", sel!(mouseExited:)),
             ] {
-                // SAFETY: `chip` is a live view; the event is +0 autoreleased.
+                // SAFETY: `chip` is a live view.
                 unsafe {
                     let b = s_rect(chip, sel!(bounds));
                     let wp = s_point_point_id(
@@ -1957,7 +1715,7 @@ mod macos {
             cx.check(false, "a chip is live for the hover rows".to_owned());
         }
         if let Some(p) = plus {
-            // SAFETY: `p` is the live `+` button; the events are +0.
+            // SAFETY: `p` is the live `+` button.
             let wp = unsafe {
                 let b = s_rect(p, sel!(bounds));
                 s_point_point_id(
@@ -2013,11 +1771,6 @@ mod macos {
             );
         }
 
-        // Relational checks: absolute hashes are machine-specific, these are
-        // not, and a branch that stopped drawing a state fails them. Each group
-        // holds states that must draw differently, and together the groups name
-        // every state the matrix draws, so a row the loops above stopped
-        // capturing, or one no group judges, fails the first check.
         let groups: [&[&str]; 8] = [
             &["tabs=1", "tabs=2", "tabs=3", "tabs=5", "tabs=8"],
             &[
@@ -2079,16 +1832,8 @@ mod macos {
             );
         }
 
-        // --------------------------------------------------------- stage 10
-        //
-        // The four declared classes, read off live objects: every class is
-        // reached through the object AppKit holds, every row comes from
-        // `class_copyMethodList`, and every encoding is compared against a
-        // protocol the class claims or an ancestor class, never a string this
-        // tree wrote.
         println!("\n-- stage 10: the four declared classes, off the live objects");
-        // SAFETY: `ns_window` is live; the toolbar's delegate is the declared
-        // `ATermToolbarDelegate` while the toolbar exists.
+        // SAFETY: `ns_window` is live.
         let tb_delegate = unsafe {
             let tb = s_id(ns_window, sel!(toolbar));
             if tb.is_null() {
@@ -2136,7 +1881,6 @@ mod macos {
             audit_declared(&mut cx, dcl);
         }
 
-        // ---------------------------------------------------------- verdict
         drop(handle);
         drop(d.window.take());
         println!("\n=== VERDICT ===");

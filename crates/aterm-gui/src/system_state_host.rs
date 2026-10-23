@@ -21,7 +21,10 @@ use crate::{App, Wake};
 /// authority to provision a machine.
 #[derive(Clone, Copy)]
 pub struct InitialSetupHandlers {
-    pub apply: fn(Plan, Option<SecretBytes>, InitialSetupApplyReceipt) -> bool,
+    /// An Apply: the reviewed plan, whether its vault was typed
+    /// ([`crate::workstation_setup::SetupAnswer::vault_typed`]), the join password and the
+    /// receipt.
+    pub apply: fn(Plan, bool, Option<SecretBytes>, InitialSetupApplyReceipt) -> bool,
     pub check: fn(Plan) -> bool,
     pub restore: fn() -> bool,
     pub cancel: fn(InitialSetupCancelReceipt) -> bool,
@@ -640,7 +643,7 @@ impl App {
                     answer.receipt = Some(receipt);
                     request.finish_answer(answer)
                 } else if let Some(handlers) = handlers {
-                    (handlers.apply)(plan, answer.password, receipt)
+                    (handlers.apply)(plan, answer.vault_typed, answer.password, receipt)
                 } else {
                     false
                 };
@@ -683,6 +686,7 @@ impl App {
                 password: None,
                 receipt: None,
                 cancel_receipt: Some(receipt),
+                vault_typed: false,
             })
         } else {
             handlers.is_some_and(|handlers| (handlers.cancel)(receipt))
@@ -810,7 +814,7 @@ mod tests {
 
     fn queued_apply_handlers() -> InitialSetupHandlers {
         InitialSetupHandlers {
-            apply: |_, _, receipt| {
+            apply: |_, _, _, receipt| {
                 APPLY_RECEIPTS.with(|receipts| receipts.borrow_mut().push(receipt));
                 true
             },
@@ -972,7 +976,7 @@ mod tests {
         app.run_system_state_action_with_handlers(
             apply,
             Some(InitialSetupHandlers {
-                apply: |_, _, receipt| {
+                apply: |_, _, _, receipt| {
                     receipt.accept();
                     true
                 },
@@ -2721,7 +2725,7 @@ mod tests {
         app.run_system_state_action_with_handlers(
             action,
             Some(InitialSetupHandlers {
-                apply: |_, _, receipt| {
+                apply: |_, _, _, receipt| {
                     receipt.accept();
                     true
                 },
@@ -3253,6 +3257,7 @@ mod tests {
         }
         fn accept(
             plan: Plan,
+            vault_typed: bool,
             password: Option<SecretBytes>,
             receipt: InitialSetupApplyReceipt,
         ) -> bool {
@@ -3262,13 +3267,14 @@ mod tests {
                     password,
                     receipt: None,
                     cancel_receipt: None,
+                    vault_typed,
                 })
             });
             receipt.accept();
             true
         }
         let refused = InitialSetupHandlers {
-            apply: |_, _, _| false,
+            apply: |_, _, _, _| false,
             check: |_| false,
             restore: || false,
             cancel: |_| false,
@@ -3383,6 +3389,7 @@ mod tests {
             };
             assert!(!plan.selection.contains(Setting::Dock));
             assert_eq!(plan.vault_url, url.trim());
+            assert!(answer.vault_typed, "the reviewed vault was typed");
             assert_eq!(answer.password, Some(SecretBytes::from(secret.as_bytes())));
             assert!(app.system_state_host.action_refusal.is_none());
             assert!(

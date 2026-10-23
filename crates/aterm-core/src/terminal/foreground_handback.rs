@@ -1,23 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
-// Author: Andrew Yates
 
-//! Foreground handback: restore program-negotiable terminal modes when an
-//! owning foreground process group exits without cleaning up.
-//!
-//! At the byte offset where `tcgetpgrp` changes, the host calls
-//! [`Terminal::foreground_handback`] if a dead process group owned any
-//! input-hijacking mode bit ([`evidence::INPUT`]: mouse, kitty keyboard,
-//! modifyOtherKeys/formatOtherKeys, focus 1004, bracketed paste 2004, size
-//! 2048, color-scheme 2031). Display-only bits (`ALT_SCREEN`, `VT52`,
-//! `CURSOR_HIDDEN`, `SYNC`) do not trigger handback on their own so one-shot
-//! commands (`tput smcup`, `tput civis`) persist, but are reverted alongside
-//! an orphaned input bit.
-//!
-//! Modes are restored by feeding synthesized reset bytes through
-//! [`Terminal::process_at`] and returning them so the host can record them in
-//! `RawIn` and cast taps. A mid-sequence parser always receives `CAN` (`0x18`),
-//! even when mode restoration is skipped ([`Terminal::foreground_handback_scoped`]).
+//! Foreground handback.
 
 use core::fmt::Write as _;
 
@@ -26,9 +10,7 @@ use aterm_types::mouse::{MouseEncoding, MouseMode};
 
 use super::{ClockReading, Terminal};
 
-/// One bit per condition of [`Terminal::program_evidence`], the evidence the
-/// handback gate reads. The host attributes each bit to the process group
-/// that set it (aterm-gui's `FgOwners`).
+/// One bit per condition of [`Terminal::program_evidence`], the evidence the handback gate reads.
 pub mod evidence {
     /// The alternate screen (1049/1047/47).
     pub const ALT_SCREEN: u16 = 1 << 0;
@@ -57,16 +39,7 @@ pub mod evidence {
     /// How many bits are defined.
     pub const COUNT: usize = 12;
 
-    /// The input-hijacking bits: each makes the terminal send bytes the next
-    /// holder never asked for (mouse and focus reports, size and colour-scheme
-    /// reports), re-encode its keys (kitty flags, modifyOtherKeys,
-    /// formatOtherKeys) or frame its pastes (2004).
-    ///
-    /// The other four bits ([`ALT_SCREEN`], [`VT52`], [`CURSOR_HIDDEN`],
-    /// [`SYNC`]) are display evidence that one-shot commands set on purpose
-    /// (`tput smcup; cmd; tput rmcup`, `tput civis`). The host counts a gone
-    /// group as orphaning the terminal only when it owns one of these input
-    /// bits; such a group's display bits are then handed back with them.
+    /// The input-hijacking bits.
     pub const INPUT: u16 = MOUSE
         | SIZE_REPORTS
         | COLOR_SCHEME_REPORTS
@@ -76,10 +49,7 @@ pub mod evidence {
         | FORMAT_OTHER_KEYS
         | BRACKETED_PASTE;
 
-    /// The evidence bit a DECSET (`set`) or DECRST of private mode `param`
-    /// asserts (turns on, whether or not already on), or `0`. Read by the DEC
-    /// mode dispatcher into
-    /// [`Terminal::take_evidence_asserted`](super::Terminal::take_evidence_asserted).
+    /// The evidence bit a DECSET (`set`) or DECRST of private mode `param` asserts (turns on, whether or not already on), or `0`.
     #[inline]
     #[must_use]
     pub const fn asserted_by_dec_mode(param: u16, set: bool) -> u16 {
@@ -101,41 +71,21 @@ pub mod evidence {
 /// What one [`Terminal::foreground_handback`] did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ForegroundHandback {
-    /// The exact bytes fed through [`Terminal::process_at`], in order. The host
-    /// records them as `RawIn` and splices them into its byte taps at the cut,
-    /// so a replay of the recording reaches the same state.
+    /// The exact bytes fed through [`Terminal::process_at`], in order.
     pub bytes: Vec<u8>,
-    /// Short names of what was moved (`"alt"`, `"kitty"`, `"mouse"`,
-    /// `"parser"`, …), in emission order: the `reverted=` field of the
-    /// `modes-restored` timeline event.
+    /// Short names of what was moved (`"alt"`, `"kitty"`, `"mouse"`, `"parser"`, …), in emission order.
     pub reverted: Vec<&'static str>,
 }
 
 impl Terminal {
-    /// Whether the terminal is in a state only a running program leaves it in:
-    /// the evidence gate of [`Self::foreground_handback`].
-    ///
-    /// True when any holds: the alternate screen, VT52 mode, mouse tracking, a
-    /// hidden cursor, synchronized output (2026), in-band size reports (2048),
-    /// colour-scheme reports (2031), focus reporting (1004) or bracketed paste
-    /// (2004) the host did not configure, kitty keyboard flags or a pushed
-    /// kitty stack on the current screen, or a non-zero modifyOtherKeys /
-    /// formatOtherKeys. A line editor's own 2004 at its prompt counts too; the
-    /// host attributes it to the shell, which is alive.
-    ///
-    /// Not evidence: DECAWM, DECCKM, DECKPAM, G0/GL charsets, IRM, LNM, DECSCNM,
-    /// 1007, 67, 1036 and a mouse encoding without tracking; one-shot commands
-    /// (`tput rmam`, `smkx`, `smacs`, `smir`) set these and expect them to
-    /// persist.
+    /// Whether the terminal is in a state only a running program leaves it in.
     #[inline]
     #[must_use]
     pub fn program_owns_terminal(&self) -> bool {
         self.program_evidence() != 0
     }
 
-    /// [`Self::program_owns_terminal`]'s conditions as a bit set (see
-    /// [`evidence`]); zero iff the gate is closed. The host compares successive
-    /// readings to learn which process group set which bit.
+    /// [`Self::program_owns_terminal`]'s conditions as a bit set (see [`evidence`]).
     #[must_use]
     pub fn program_evidence(&self) -> u16 {
         let m = &self.modes;
@@ -145,14 +95,8 @@ impl Terminal {
         } else {
             k.main_sp
         };
-        // Flags pushed on the main screen before `?1049h` are parked in
-        // `main_saved_flags` while alt is up and return on leaving it. They are
-        // still the program's, so they count as evidence; otherwise a shell
-        // leaving the alt screen by itself (`echoti rmcup`) would get CSI-u
-        // chords at its prompt.
         let main_parked = m.alternate_screen
             && (k.main_saved_flags.is_some_and(|f| f.bits() != 0) || k.main_sp > 0);
-        // Behind a console host the xterm modifier family is not offered, as kitty is not.
         let xk = super::keyboard_mode::offered_xterm_keyboard(m, self.xterm_keyboard);
         let bit = |on: bool, b: u16| if on { b } else { 0 };
         bit(m.alternate_screen, evidence::ALT_SCREEN)
@@ -181,67 +125,19 @@ impl Terminal {
             | bit(xk.format_other_keys() != 0, evidence::FORMAT_OTHER_KEYS)
     }
 
-    /// The evidence bits whose setter was parsed since the last call, clearing
-    /// them: a DECSET of mouse tracking, 1004, 2004, 2048, 2031, the alt screen
-    /// or 2026, a DECRST of 25 or 2 (VT52), a kitty push or non-zero set, a
-    /// non-zero modifyOtherKeys or formatOtherKeys. Asserted even when the
-    /// condition was already on, which [`Self::program_evidence`] cannot show.
-    ///
-    /// The host gives each evidence bit to the group whose bytes set it; with
-    /// asserted bits a job that re-arms an already-on mode becomes its owner,
-    /// so its death hands the mode back even if an earlier owner was
-    /// misattributed.
+    /// The evidence bits whose setter was parsed since the last call, clearing them.
     #[inline]
     pub fn take_evidence_asserted(&mut self) -> u16 {
         core::mem::take(&mut self.evidence_asserted)
     }
 
-    /// Hand the terminal back after a foreground-process-group change:
-    /// [`Self::foreground_handback_scoped`] with the modes in scope. The host
-    /// calls it only where the modes are orphaned (see the module docs).
+    /// Hand the terminal back after a foreground-process-group change.
     #[inline]
     pub fn foreground_handback(&mut self) -> Option<ForegroundHandback> {
         self.foreground_handback_scoped(true)
     }
 
     /// Hand the terminal back after a foreground-process-group change.
-    ///
-    /// Call it exactly at the byte offset where the foreground changed (see the
-    /// module docs). Returns `None` when nothing was sent: the parser was at
-    /// ground and either `restore_modes` was false or
-    /// [`Self::program_owns_terminal`] was. Otherwise the returned bytes have
-    /// already been processed; the caller only records them.
-    ///
-    /// `restore_modes = false` sends step 0 alone: the old holder is gone but
-    /// the modes in force belong to a program that still runs.
-    ///
-    /// The byte plan, each step emitted only when the live value differs from
-    /// its target ([`TerminalModes::new`](aterm_types::TerminalModes::new), the
-    /// host-configured DECAWM/1004/2004/1007, and `XtermKeyboardState::new`):
-    ///
-    /// 0. `CAN` if the parser is mid-sequence, even with the gate closed,
-    ///    then `ESC \` if a tmux passthrough wrapper is open.
-    /// 1. `ESC <` to leave VT52 (before any CSI, which VT52 would not parse).
-    /// 2. `CSI ? 2026 l`.
-    /// 3. On the alt screen: `CSI < 8 u` (clears the alt kitty stack; depth is
-    ///    at most 7, and a pop deeper than the stack sets flags 0), then
-    ///    `CSI ? 1049 l`, which reloads main's saved kitty flags.
-    /// 4. `CSI < 8 u` for the main screen's flags/stack.
-    /// 5. `CSI ? 1000 l` (clears any tracking), then the DECRST of the active
-    ///    mouse encoding (each clears only its own).
-    /// 6. 1004 to the configured value; `?2048l`, `?2031l`; 1007 to the host's
-    ///    value ([`Self::set_host_alternate_scroll`]).
-    /// 7. `CSI > 4 m`, `CSI > 4 f` (modifyOtherKeys / formatOtherKeys).
-    /// 8. `?1l`, `ESC >`, `?67l`, `?1035h`, `?1036l`, `?1039h`.
-    /// 9. 2004 to the configured value.
-    /// 10. `4l`, `20l`, `?5l`, DECAWM to the configured value.
-    /// 11. `ESC ( B`, `SI`.
-    /// 12. `CSI ? 25 h`.
-    ///
-    /// Phase B (gate open only): a scroll region, DECOM or DECLRMM that
-    /// survived phase A (`1049l` copies the alt screen's DECSTBM onto main) is
-    /// cleared, and since DECSTBM/DECOM home the cursor, the cursor position
-    /// read before is written back with a CUP.
     #[inline]
     pub fn foreground_handback_scoped(
         &mut self,
@@ -252,11 +148,6 @@ impl Terminal {
     }
 
     /// Manual terminal reset (`reset` control verb, Edit ▸ Reset Terminal).
-    ///
-    /// Runs the [`Self::foreground_handback_scoped`] byte plan unconditionally,
-    /// closes any open OSC 8 hyperlink (`"hyperlink"`), and resets program-overridden
-    /// palette/dynamic colors via `OSC 104/110/111/112/117/119` (`"colors"`),
-    /// while preserving the screen, scrollback, SGR pen, titles, and tab stops.
     pub fn manual_handback(&mut self) -> ForegroundHandback {
         self.handback(true, true).unwrap_or(ForegroundHandback {
             bytes: Vec::new(),
@@ -265,18 +156,11 @@ impl Terminal {
     }
 
     /// The shared body of [`Self::foreground_handback_scoped`] (`owned` = the
-    /// gate's verdict, `manual` false) and [`Self::manual_handback`] (both
-    /// true). `None` when there was nothing to send.
     fn handback(&mut self, owned: bool, manual: bool) -> Option<ForegroundHandback> {
         let clock = ClockReading::now();
         let mut bytes: Vec<u8> = Vec::new();
         let mut reverted: Vec<&'static str> = Vec::new();
         if !self.parser_is_ground() {
-            // The CAN ends the torn sequence, inside an open tmux passthrough
-            // wrapper too (where it is payload, and a pending ESC is the
-            // payload's), so the `ESC \` after it ends only the wrapper: the
-            // wrapper's end would end a torn string as at its ST, and the next
-            // holder's own ESCs would otherwise still be read through it.
             bytes.push(0x18);
             if self.parser.tmux_passthrough().is_open() {
                 bytes.extend_from_slice(b"\x1b\\");
@@ -286,9 +170,6 @@ impl Terminal {
         if owned {
             self.handback_phase_a(&mut bytes, &mut reverted);
         }
-        // An open OSC 8 link turns every later character into a link. The
-        // automatic handback leaves OSC 8 alone; a manual reset closes it,
-        // after phase A so VT52 has been left and the OSC parses.
         if manual && self.transient.current_hyperlink.is_some() {
             bytes.extend_from_slice(b"\x1b]8;;\x1b\\");
             reverted.push("hyperlink");
@@ -330,10 +211,6 @@ impl Terminal {
     }
 
     /// The manual reset's colour step: exactly the OSC resets that clear what a
-    /// program set over the configured colours ([`Self::program_color_overrides`]),
-    /// each ST-terminated, and `"colors"` when there was any. Every reset is
-    /// ungated and lands on the configured baseline, so afterwards the diff is
-    /// empty. The automatic handback never runs this.
     fn manual_colour_reset(&self, bytes: &mut Vec<u8>, reverted: &mut Vec<&'static str>) {
         let o = self.color.capture_overrides();
         let start = bytes.len();
@@ -355,7 +232,6 @@ impl Terminal {
     }
 
     /// Phase A of [`Self::foreground_handback`]: the byte plan's steps 1–12,
-    /// computed from the live state (nothing is processed here).
     fn handback_phase_a(&self, bytes: &mut Vec<u8>, reverted: &mut Vec<&'static str>) {
         let m = self.modes;
         let cfg = self.configured_modes;
@@ -380,7 +256,6 @@ impl Terminal {
             );
             put(true, "\x1b[?1049l", "alt");
         }
-        // After `1049l` the live flags are main's saved flags.
         let (main_flags, main_sp) = if m.alternate_screen {
             (
                 k.main_saved_flags
@@ -401,7 +276,6 @@ impl Terminal {
             MouseEncoding::Sgr => Some("\x1b[?1006l"),
             MouseEncoding::Urxvt => Some("\x1b[?1015l"),
             MouseEncoding::SgrPixel => Some("\x1b[?1016l"),
-            // X10 is the power-on encoding; the enum is non-exhaustive.
             _ => None,
         };
         if let Some(seq) = encoding {
@@ -414,7 +288,6 @@ impl Terminal {
         );
         put(m.in_band_size_reports, "\x1b[?2048l", "size-reports");
         put(m.report_color_scheme, "\x1b[?2031l", "color-scheme-reports");
-        // 1007 goes back to the host's value (aterm-gui: on), not power-on.
         put(
             m.alternate_scroll != self.host_alternate_scroll,
             set_reset(self.host_alternate_scroll, "\x1b[?1007h", "\x1b[?1007l"),

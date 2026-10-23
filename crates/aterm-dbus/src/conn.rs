@@ -1,17 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A blocking connection to a message bus over a unix socket: SASL EXTERNAL,
-//! `Hello`, then calls, replies, signals and errors.
-//!
-//! It owns no thread and no event loop. A caller that serves calls (the AT-SPI
-//! publisher) polls [`Connection`]'s descriptor and drains [`Connection::recv`]
-//! with a zero timeout; [`Connection::has_buffered`] says when `recv` has
-//! something to answer without the descriptor turning readable.
-//!
-//! Like zbus, every message this side sends after `Hello` carries its own
-//! unique name as the sender (the bus would stamp it anyway), and serials
-//! count up from 1, `Hello`'s.
+//! Blocking D-Bus connection over a Unix socket (`EXTERNAL` auth, `Hello`, calls, and signals).
 
 use std::collections::VecDeque;
 use std::io::{ErrorKind, Read as _, Write as _};
@@ -30,19 +20,12 @@ use crate::value::Value;
 pub const BUS_NAME: &str = "org.freedesktop.DBus";
 pub const BUS_PATH: &str = "/org/freedesktop/DBus";
 
-/// The largest message a connection accepts unless told otherwise. A peer can
-/// make the decoder allocate about 32 bytes per byte it sends, and AT-SPI's
-/// calls and signals are small, so the default is far below the
-/// specification's 128 MiB. A larger message is read past, never held.
+/// Default maximum incoming message byte length (1 MiB).
 pub const DEFAULT_MAX_INCOMING: usize = 1 << 20;
 
 /// How long the handshake may take before [`Connection::handshake`] gives up.
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(25);
 
-// A method call must not turn unrelated bus traffic into an unbounded mailbox.
-// Both limits apply: tiny messages cannot evade the count, and a few legal
-// large messages cannot evade the original-wire-byte allowance. This bounds
-// retained decoded payload independently of a raised incoming frame limit.
 const MAX_QUEUED_MESSAGES: usize = 256;
 const MAX_QUEUED_BYTES: usize = 1 << 20;
 
@@ -54,8 +37,6 @@ struct Received {
 #[derive(Clone, Copy)]
 enum ReadLimit {
     Deadline(Option<Instant>),
-    // recv(Some(ZERO)) deliberately drains bytes already available. A call
-    // whose absolute deadline expired must never acquire these semantics.
     Ready,
 }
 
@@ -95,7 +76,6 @@ pub struct Connection {
     discard: usize,
     broken: bool,
     /// How long [`Connection::send`] may wait for the bus to take its bytes
-    /// ([`Connection::set_send_timeout`]); `None` waits as long as it takes.
     send_timeout: Option<Duration>,
 }
 
@@ -113,33 +93,26 @@ pub fn effective_uid() -> u32 {
 }
 
 impl Connection {
-    /// Connects to the session bus as this process's uid.
+    /// Connect to the session bus as this process's uid.
     ///
     /// # Errors
-    ///
     /// As [`address::session_bus`] and [`Connection::open`].
     pub fn session() -> Result<Self> {
         Self::open(&address::session_bus()?)
     }
 
-    /// Connects to the first of `addresses` that answers, authenticates as
-    /// this process's uid and says `Hello`.
+    /// Connect to the first answering address, authenticate as this uid, and call `Hello`.
     ///
     /// # Errors
-    ///
     /// The last entry's error when none connects.
     pub fn open(addresses: &[Address]) -> Result<Self> {
         Self::open_within(addresses, HANDSHAKE_TIMEOUT)
     }
 
-    /// [`Connection::open`], with every handshake bounded by `timeout`
-    /// instead of [`HANDSHAKE_TIMEOUT`]: for a caller that must not wait on a
-    /// bus that stopped answering (a read on a window's main thread).
+    /// [`Connection::open`] with each handshake bounded by `timeout`.
     ///
     /// # Errors
-    ///
-    /// As [`Connection::open`]; [`Error::Timeout`] when the bus did not
-    /// finish the handshake within `timeout`.
+    /// As [`Connection::open`], or [`Error::Timeout`] if the handshake exceeds `timeout`.
     pub fn open_within(addresses: &[Address], timeout: Duration) -> Result<Self> {
         let mut last = Error::Invalid("empty address");
         for address in addresses {
@@ -159,14 +132,10 @@ impl Connection {
         Err(last)
     }
 
-    /// Runs the handshake on a connected stream: EXTERNAL as `uid`, `BEGIN`,
-    /// then `Hello`. `expect_guid` is the address's `guid=`, which the server
-    /// must match.
+    /// Run the `EXTERNAL` handshake, `BEGIN`, and `Hello` on a connected stream.
     ///
     /// # Errors
-    ///
-    /// [`Error::Auth`] when the server refuses, [`Error::Remote`] when `Hello`
-    /// fails, [`Error::Timeout`] after [`HANDSHAKE_TIMEOUT`].
+    /// [`Error::Auth`], [`Error::Remote`], or [`Error::Timeout`] after [`HANDSHAKE_TIMEOUT`].
     pub fn handshake(stream: CtlStream, uid: u32, expect_guid: Option<&str>) -> Result<Self> {
         let deadline = Instant::now().checked_add(HANDSHAKE_TIMEOUT);
         Self::handshake_until(stream, uid, expect_guid, deadline)
@@ -229,17 +198,12 @@ impl Connection {
         &self.guid
     }
 
-    /// Raises or lowers the largest message accepted, up to the
-    /// specification's 128 MiB. A larger one is dropped as it arrives and
-    /// reported by [`Connection::recv`]; the connection stays usable.
+    /// Set the maximum incoming message length in bytes (capped at 128 MiB).
     pub fn set_max_incoming(&mut self, bytes: usize) {
         self.max_incoming = bytes.min(message::MAX_MESSAGE);
     }
 
-    /// Whether [`Connection::recv`] has an answer without reading the socket,
-    /// so a poll on the descriptor would not see it: a message read and
-    /// waiting, or a fault to report (bytes that frame no message, a closed
-    /// connection), which a poll loop must not wait on.
+    /// Whether [`Connection::recv`] has a queued message or terminal state without reading the socket.
     #[must_use]
     pub fn has_buffered(&self) -> bool {
         self.broken
@@ -251,28 +215,15 @@ impl Connection {
             }
     }
 
-    /// Bounds how long [`Connection::send`] (and the replies, errors and
-    /// signals sent through it) may wait for the bus to take the message's
-    /// bytes. A bus daemon reads its clients as messages arrive, so a write
-    /// waits only once the socket's buffer is full of what the daemon has not
-    /// read: a daemon that stopped (frozen, wedged) would otherwise hold the
-    /// sender for as long as it stays stopped. `None`, the default, waits for
-    /// it. [`Connection::call`] keeps its own deadline.
+    /// Set the write timeout for [`Connection::send`] (`None` waits indefinitely).
     pub fn set_send_timeout(&mut self, timeout: Option<Duration>) {
         self.send_timeout = timeout;
     }
 
-    /// Sends `msg` with the next serial (and this connection as its sender
-    /// when it names none), returning that serial.
+    /// Send `msg` with the next serial and return that serial.
     ///
     /// # Errors
-    ///
-    /// [`Error::Invalid`] for a message that cannot be encoded,
-    /// [`Error::Closed`] or [`Error::Io`] when the write fails, and
-    /// [`Error::Timeout`] when the bus took no byte or only part of the message
-    /// within [`Connection::set_send_timeout`]'s bound. A message written in
-    /// part leaves a stream no further message can follow, so that timeout
-    /// closes the connection, as [`Connection::call`]'s does.
+    /// [`Error::Invalid`], [`Error::Closed`], [`Error::Io`], or [`Error::Timeout`].
     pub fn send(&mut self, msg: Message) -> Result<u32> {
         let deadline = self
             .send_timeout
@@ -294,42 +245,19 @@ impl Connection {
         Ok(msg.serial)
     }
 
-    /// Sends a method call and waits up to `timeout` for its answer (a timeout
-    /// past what the clock can represent waits forever). Messages that arrive
-    /// meanwhile are kept for [`Connection::recv`], in order.
+    /// Send a method call and wait up to `timeout` for its reply.
     ///
     /// # Errors
-    ///
-    /// [`Error::Remote`] when the answer is an error, [`Error::Invalid`] for a
-    /// call that says it expects no reply, and the errors of
-    /// [`Connection::send`]. The deadline includes writing the call. Passed
-    /// before the bus took the call whole, it is [`Error::Timeout`], and after
-    /// a partial write it closes the connection: its unfinished frame cannot be
-    /// followed by a new message. Passed after, it is [`Error::NoReply`]: the
-    /// call went out, the connection is as it was, and an answer that comes
-    /// later reaches [`Connection::recv`] as any other message does. While
-    /// waiting, at most 256 unrelated messages and one MiB of original wire
-    /// bytes are retained; overflow is [`Error::Unsupported`] and closes the
-    /// connection. Already retained messages remain available through
-    /// [`Connection::recv`].
+    /// [`Error::Remote`], [`Error::Invalid`], [`Error::Timeout`], [`Error::NoReply`], [`Error::Unsupported`], or send/read failure.
     pub fn call(&mut self, msg: Message, timeout: Duration) -> Result<Message> {
         let deadline = Instant::now().checked_add(timeout);
         self.call_until(msg, deadline, deadline)
     }
 
-    /// The next message: a queued one first, else one from the socket within
-    /// `timeout` (`None` blocks; zero only drains what is already readable).
-    /// `Ok(None)` when none arrived in time.
-    ///
-    /// A message that is well framed but breaks the specification, or is
-    /// larger than [`Connection::set_max_incoming`] allows, is consumed and
-    /// returned as its [`Error::Malformed`] or [`Error::Unsupported`]; the
-    /// connection stays usable. A framing fault ends it ([`Error::Closed`]
-    /// from then on).
+    /// Receive the next queued or socket message within `timeout` (`None` blocks, zero polls).
     ///
     /// # Errors
-    ///
-    /// As above, plus the socket's.
+    /// [`Error::Malformed`], [`Error::Unsupported`], [`Error::Closed`], or socket I/O failure.
     pub fn recv(&mut self, timeout: Option<Duration>) -> Result<Option<Message>> {
         if let Some(received) = self.queue.pop_front() {
             self.queued_bytes = self.queued_bytes.saturating_sub(received.wire_bytes);
@@ -346,11 +274,9 @@ impl Connection {
         }
     }
 
-    /// Answers `call` with `body`; nothing is sent when the caller asked for
-    /// no reply.
+    /// Reply to `call` with `body` (no-op when `call` expects no reply).
     ///
     /// # Errors
-    ///
     /// As [`Connection::send`].
     pub fn reply(&mut self, call: &Message, body: Vec<Value>) -> Result<()> {
         if call.expects_reply() {
@@ -359,11 +285,10 @@ impl Connection {
         Ok(())
     }
 
-    /// Answers `call` with the error `name` and its text.
+    /// Reply to `call` with error `name` and `text`.
     ///
     /// # Errors
-    ///
-    /// [`Error::Invalid`] for a bad error name; as [`Connection::send`].
+    /// [`Error::Invalid`] for a bad error name, or as [`Connection::send`].
     pub fn reply_error(&mut self, call: &Message, name: &str, text: &str) -> Result<()> {
         if call.expects_reply() {
             self.send(Message::error(call, name, text)?)?;
@@ -371,10 +296,9 @@ impl Connection {
         Ok(())
     }
 
-    /// Emits the signal `interface.member` from `path`.
+    /// Emit signal `interface.member` from `path`.
     ///
     /// # Errors
-    ///
     /// As [`Message::signal`] and [`Connection::send`].
     pub fn emit(
         &mut self,
@@ -387,19 +311,17 @@ impl Connection {
             .map(drop)
     }
 
-    /// Asks the bus to route the messages `rule` matches here.
+    /// Ask the bus to route messages matching `rule` to this connection.
     ///
     /// # Errors
-    ///
     /// As [`Connection::call`].
     pub fn add_match(&mut self, rule: &str, timeout: Duration) -> Result<()> {
         self.bus_call("AddMatch", rule, timeout)
     }
 
-    /// Withdraws a rule [`Connection::add_match`] added.
+    /// Remove a match rule previously added with [`Connection::add_match`].
     ///
     /// # Errors
-    ///
     /// As [`Connection::call`].
     pub fn remove_match(&mut self, rule: &str, timeout: Duration) -> Result<()> {
         self.bus_call("RemoveMatch", rule, timeout)
@@ -412,10 +334,6 @@ impl Connection {
     }
 
     /// [`Connection::call`] with a deadline for each of its phases: the bus
-    /// takes the call whole by `send_by`, and the peer answers it by
-    /// `answer_by`. Once the call went out, a deadline that passes says only
-    /// that the peer has not answered yet, which a caller must not take for a
-    /// connection to give up on, so it is [`Error::NoReply`].
     fn call_until(
         &mut self,
         msg: Message,
@@ -436,8 +354,6 @@ impl Connection {
         loop {
             let received = match self.read_message(ReadLimit::Deadline(deadline)) {
                 Ok(received) => received,
-                // A well-framed message this side cannot read is not the
-                // answer it waits for: keep waiting.
                 Err(Error::Malformed { .. } | Error::Unsupported(_)) if !self.broken => continue,
                 Err(e) => return Err(e),
             };
@@ -479,8 +395,6 @@ impl Connection {
                     return Err(error);
                 }
             };
-            // Refresh the remaining absolute deadline for every write. One
-            // relative timeout around write_all would restart for each chunk.
             if let Err(error) = self.stream.set_write_timeout(left) {
                 self.broken |= written != 0;
                 return Err(Error::Io(error));
@@ -530,9 +444,6 @@ impl Connection {
                     n
                 }
                 left => {
-                    // macOS refuses SO_RCVTIMEO with EINVAL once the peer has
-                    // shut the socket down. The read then returns at once
-                    // (bytes still buffered, or end of stream), so it goes ahead.
                     match self.stream.set_read_timeout(left) {
                         Err(e) if e.kind() != ErrorKind::InvalidInput => return Err(Error::Io(e)),
                         _ => {}
@@ -592,9 +503,6 @@ impl Connection {
                     return Err(e);
                 }
                 Ok(Some(n)) if n > self.max_incoming => {
-                    // Its header frames it, so the stream stays in step: drop
-                    // what is here and the rest as it arrives (`fill`), and
-                    // report it as any unreadable message is reported.
                     let here = n.min(self.rbuf.len());
                     self.rbuf.drain(..here);
                     self.discard = n.saturating_sub(here);

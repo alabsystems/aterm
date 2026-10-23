@@ -34,28 +34,15 @@ fn day_at(book: &AbBook, now: u64, day: i64) -> Option<AbDay> {
 }
 
 /// THE BOOK CHARGES EACH STRETCH TO THE ARM, PHASE AND CAUSE IN FORCE when
-/// it ran: a word that moves closes the stretch under the arm, phase and
-/// cause of then; an arm that moves mid-phase charges the time so far to the
-/// arm that was in force; the open stretches count to the instant read, and
-/// a session's end settles its stretch for good. A cause is kept only at the
-/// prompt under Cruise or Land, whatever is passed. NEGATIVE CONTROLS: an
-/// instant before a stretch's start counts nothing; a session with no
-/// stretch open is not charged by its end; a word that is no phase (a wall)
-/// counts nothing however long it stands; and a book fed before its
-/// calendar is read counts nothing.
 #[test]
 fn the_book_charges_each_stretch_to_the_arm_phase_and_cause_in_force() {
     let mut book = book_at(NOON_MS);
-    // Session 1, Cruise: busy 0..1000, a box 1000..1500, busy 1500..2000,
-    // at its prompt, pausing, 2000..5000.
     book.observe(1, Some(Busy), None, Cruise, 0);
     book.observe(1, Some(AtBox), None, Cruise, 1_000);
     book.observe(1, Some(Busy), None, Cruise, 1_500);
     book.observe(1, Some(AtPrompt), Some(AbCause::Pausing), Cruise, 2_000);
-    // Its arm turns Off at the prompt: a cause passed for Off is not kept.
     book.observe(1, Some(AtPrompt), Some(AbCause::Pausing), Off, 5_000);
     assert_eq!(book.stretch(1), Some((AtPrompt, Off, None)));
-    // Session 2, Land: asked 0..700, then a wall.
     book.observe(2, Some(Asked), None, Land, 0);
     book.observe(2, None, None, Land, 700);
     let week = book.week_at(6_000, &[]);
@@ -80,14 +67,11 @@ fn the_book_charges_each_stretch_to_the_arm_phase_and_cause_in_force() {
     assert_eq!(week.arm(Land).asked_ms, 700);
     assert_eq!(week.hist(Cruise, 0)[bucket(500)], 1, "the box: one hold");
     assert_eq!(week.hist(Land, 1)[bucket(700)], 1, "the question: one hold");
-    // The wall counts nothing however long it stands.
     book.observe(2, None, None, Land, 90_000);
     assert_eq!(book.week_at(6_000, &[]).arm(Land).measured_ms(), 700);
-    // Its end settles session 1's stretch; nothing grows after.
     book.retire(1, 8_000);
     assert_eq!(book.week_at(1_000_000, &[]).arm(Off).at_prompt_ms, 3_000);
     assert_eq!(book.open_stretches(), 0);
-    // An instant before a stretch's start counts nothing (never negative).
     book.observe(3, Some(AtPrompt), None, Unsupervised, 10_000);
     book.observe(3, Some(Busy), None, Unsupervised, 9_000);
     book.retire(4, 50_000);
@@ -96,7 +80,6 @@ fn the_book_charges_each_stretch_to_the_arm_phase_and_cause_in_force() {
         book.week_at(1_000_000, &[]).arm(Unsupervised),
         AbArmTotals::default()
     );
-    // Before its calendar is read, the book counts nothing.
     let mut unread = AbBook::default();
     unread.observe(1, Some(Busy), None, Cruise, 0);
     unread.observe(1, None, None, Cruise, 5_000);
@@ -104,11 +87,6 @@ fn the_book_charges_each_stretch_to_the_arm_phase_and_cause_in_force() {
 }
 
 /// EACH PUBLISHED WORD IS ITS PHASE (§10.5.3 B.1): `busy`, `prompt` (at a
-/// box), `question` (asked), `idle` (at its prompt); and only a box and a
-/// question are holds. The arms are the design's: Cruise and Land each
-/// their own under this host's claim (NEGATIVE CONTROL: Land is never
-/// Cruise's), Off is plain Claude Code with nobody's claim live, the rest
-/// unsupervised.
 #[test]
 fn each_word_is_its_phase_and_the_arms_are_the_designs() {
     for (word, phase) in [
@@ -144,12 +122,6 @@ fn each_word_is_its_phase_and_the_arms_are_the_designs() {
 }
 
 /// A CAUSE ONLY UNDER CRUISE AND LAND AT THE PROMPT (§10.5.3 B.2): under
-/// Land, landed where the face says landed — first, an agent whose work
-/// landed is not waiting on a pause — else pausing where a pause stands;
-/// under Cruise pausing alone (Cruise takes nothing as the end). NEGATIVE
-/// CONTROLS: Off and unsupervised time has none whatever the glass holds,
-/// nor does any other phase; and the book drops a cause passed for one, so
-/// Off's prompt time never reads "landed".
 #[test]
 fn a_cause_is_kept_only_under_cruise_and_land_at_the_prompt() {
     for arm in [Cruise, Land] {
@@ -181,9 +153,6 @@ fn a_cause_is_kept_only_under_cruise_and_land_at_the_prompt() {
 }
 
 /// THE BUCKET EDGES (§10.5.5): `min(19, ⌊log₂(ms / 250)⌋)` — 249 ms and
-/// 250 ms in the first, 500 ms the second, 36 h the 19th (18), and from
-/// 2¹⁹ × 250 ms (about 36.4 h) on, the last. NEGATIVE CONTROL: a
-/// millisecond under each edge stays below it.
 #[test]
 fn a_hold_falls_in_its_log2_bucket() {
     assert_eq!(bucket(0), 0);
@@ -200,8 +169,6 @@ fn a_hold_falls_in_its_log2_bucket() {
 }
 
 /// THE MEDIAN IS THE BUCKET HOLDING THE ⌈n/2⌉-TH SAMPLE, said at its
-/// geometric centre with "about" (§10.5.3 B.4). NEGATIVE CONTROL: an even
-/// count takes the lower middle, and no sample is no median.
 #[test]
 fn the_median_is_the_middle_samples_bucket_said_about() {
     let mut hist = [0; BUCKETS];
@@ -233,8 +200,6 @@ fn the_median_is_the_middle_samples_bucket_said_about() {
 }
 
 /// A STRETCH ACROSS THE MIDNIGHT IS SPLIT THERE (§10.5.3 B.5), and the
-/// next day's first stretch begins at its midnight. NEGATIVE CONTROL: the
-/// same three hours inside one day stay whole, in that day alone.
 #[test]
 fn a_stretch_across_midnight_is_split_there() {
     let mut book = book_at(MIDNIGHT_MS + 23 * HOUR_MS);
@@ -263,24 +228,12 @@ fn a_stretch_across_midnight_is_split_there() {
 }
 
 /// EVERY SESSION'S STRETCH ACROSS THE MIDNIGHT IS SPLIT THERE, not only the
-/// first one's to cross it: the book's one calendar has moved on to the new
-/// day by the time the second session's change charges its time from
-/// before the midnight, and that time still goes in the day it was spent —
-/// whether the second stretch closes by a change ([`AbBook::observe`]),
-/// stands open at a page reading ([`AbBook::ring_at`]), or is charged by a
-/// moved wall ([`AbBook::set_calendar`]); a new day's first stretch begins
-/// no earlier than its midnight; and a box that ended before the midnight
-/// but is told after another session's change crossed it is a sample of
-/// the day it ended. NEGATIVE CONTROL: one session alone splits the same
-/// way, and a session open since before the ring's oldest day never pushes
-/// a kept day out of its slot.
 #[test]
 fn every_sessions_stretch_across_midnight_is_split_there() {
     let at_23 = MIDNIGHT_MS + 23 * HOUR_MS;
     let busy = |book: &AbBook, now: u64, day| {
         day_at(book, now, day).map(|kept| kept.arms[Cruise.index()].busy_ms)
     };
-    // Both busy from 23:00; session 1 moves at 01:00, session 2 at 02:00.
     let mut book = book_at(at_23);
     book.observe(1, Some(Busy), None, Cruise, 0);
     book.observe(2, Some(Busy), None, Cruise, 0);
@@ -288,19 +241,14 @@ fn every_sessions_stretch_across_midnight_is_split_there() {
     book.observe(2, None, None, Cruise, 3 * HOUR);
     assert_eq!(busy(&book, 3 * HOUR, DAY), Some(2 * HOUR), "an hour each");
     assert_eq!(busy(&book, 3 * HOUR, DAY + 1), Some(3 * HOUR));
-    // Both still open at a reading at 02:00.
     let mut open = book_at(at_23);
     open.observe(1, Some(Busy), None, Cruise, 0);
     open.observe(2, Some(Busy), None, Cruise, 0);
     assert_eq!(busy(&open, 3 * HOUR, DAY), Some(2 * HOUR));
     assert_eq!(busy(&open, 3 * HOUR, DAY + 1), Some(4 * HOUR));
-    // Both open where the wall is read again at 02:00.
     open.set_calendar(AbCalendar::read(3 * HOUR, at_23 + 3 * HOUR_MS, utc));
     assert_eq!(busy(&open, 3 * HOUR, DAY), Some(2 * HOUR));
     assert_eq!(busy(&open, 3 * HOUR, DAY + 1), Some(4 * HOUR));
-    // Fed at 23:00 by session 2; session 1 works 00:30..00:31; session 2
-    // moves at 01:00. The old day keeps its hour, and the new day begins at
-    // its midnight.
     let mut late = book_at(at_23);
     late.observe(2, Some(Busy), None, Cruise, 0);
     late.observe(1, Some(Busy), None, Cruise, 3 * HOUR / 2);
@@ -314,7 +262,6 @@ fn every_sessions_stretch_across_midnight_is_split_there() {
     let new = day_at(&late, 2 * HOUR, DAY + 1).unwrap();
     assert_eq!(new.arms[Cruise.index()].busy_ms, HOUR + MIN);
     assert_eq!(new.first_unix_ms, MIDNIGHT_MS + 24 * HOUR_MS);
-    // A box from 23:00 that ended at 23:50, told after 00:30's change.
     let mut told = book_at(at_23);
     told.observe(2, Some(AtBox), None, Cruise, 0);
     told.observe(1, Some(Busy), None, Cruise, 3 * HOUR / 2);
@@ -328,16 +275,11 @@ fn every_sessions_stretch_across_midnight_is_split_there() {
         [0; BUCKETS]
     );
 
-    // NEGATIVE CONTROL: one session alone, as before.
     let mut alone = book_at(at_23);
     alone.observe(2, Some(Busy), None, Cruise, 0);
     alone.observe(2, None, None, Cruise, 3 * HOUR);
     assert_eq!(busy(&alone, 3 * HOUR, DAY), Some(HOUR));
     assert_eq!(busy(&alone, 3 * HOUR, DAY + 1), Some(2 * HOUR));
-    // NEGATIVE CONTROL: an agent at its prompt for ten days beside one
-    // that works a minute each day: the ring keeps the eight newest days,
-    // each with its own day's minute, and the oldest two days' time is in
-    // none.
     let mut long = book_at(at_23);
     long.observe(1, Some(AtPrompt), None, Off, 0);
     for d in 1..=10 {
@@ -363,17 +305,11 @@ fn every_sessions_stretch_across_midnight_is_split_there() {
 }
 
 /// THE MIDNIGHT MOVED BY A MOVED WALL (§10.5.3 B.5, `Wake::WallMoved`): a
-/// sleep stops the ledger clock, so at 22:00 the next midnight is two ledger
-/// hours off — until the wall is read again. Read after an 8 h sleep, the
-/// hour before it stays in its day and the next hour is the new day's. A
-/// clock set back charges no negative. NEGATIVE CONTROL: with no read
-/// again, both hours land in the old day.
 #[test]
 fn a_moved_wall_moves_the_midnight() {
     let at_22 = MIDNIGHT_MS + 22 * HOUR_MS;
     let mut slept = book_at(at_22);
     slept.observe(1, Some(Busy), None, Cruise, 0);
-    // One ledger hour later, the wall reads 07:00 the next day.
     slept.set_calendar(AbCalendar::read(HOUR, MIDNIGHT_MS + 31 * HOUR_MS, utc));
     let (_, today) = slept.ring_at(2 * HOUR).unwrap();
     assert_eq!(today, DAY + 1);
@@ -392,7 +328,6 @@ fn a_moved_wall_moves_the_midnight() {
     );
     assert_eq!(day_at(&unread, 2 * HOUR, DAY + 1), None);
 
-    // A clock set back an hour: the ledger's time is all counted, once.
     let mut back = book_at(NOON_MS);
     back.observe(1, Some(Busy), None, Cruise, 0);
     back.set_calendar(AbCalendar::read(HOUR, NOON_MS, utc));
@@ -417,9 +352,6 @@ fn fixed(_unix: i64) -> Option<i64> {
 }
 
 /// THE DAY DAYLIGHT SAVING STARTS IS 23 HOURS (§10.5.4): a stretch from
-/// 23:00 the day before to 01:00 the day after it charges 1 h, 23 h and
-/// 1 h. NEGATIVE CONTROL: a zone with no shift charges 1 h and 24 h, and
-/// nothing to the third day.
 #[test]
 fn the_day_daylight_saving_starts_is_23_hours() {
     let at_23 = MIDNIGHT_MS + (23 + 8) * HOUR_MS;
@@ -442,10 +374,6 @@ fn the_day_daylight_saving_starts_is_23_hours() {
 }
 
 /// AN ARM CHANGE INSIDE A BOX KEEPS ONE SAMPLE (§10.5.3 B.4): the time is
-/// split between the arms, the hold is one sample of its whole length for
-/// the arm it began under, and a box still standing is no sample yet. A
-/// cause that moves at the prompt splits the shares the same way.
-/// NEGATIVE CONTROL: a box that turns into a question is two holds.
 #[test]
 fn an_arm_change_inside_a_box_keeps_one_sample() {
     let mut book = book_at(NOON_MS);
@@ -489,9 +417,6 @@ fn busy_day(day: i64, first_unix_ms: i64, busy_ms: u64) -> AbDay {
 }
 
 /// THE WEEK IS TODAY AND THE SIX DAYS BEFORE, summed, its first stretch the
-/// earliest day's; two books' days of one date add (the earlier first
-/// stretch kept). NEGATIVE CONTROLS: the day before the week and a day after
-/// today (a clock set back) are left out.
 #[test]
 fn the_week_sums_today_and_the_six_days_before() {
     let days = [
@@ -523,9 +448,6 @@ fn the_week_sums_today_and_the_six_days_before() {
 }
 
 /// THE OTHER PROCESSES' DAYS JOIN THE LIVE BOOK'S WEEK (§10.5.3 C.4): summed
-/// day by day against the book's today; a book never fed shows the others'
-/// alone, against the newest of their days. NEGATIVE CONTROL: a day before
-/// either week is left out of both.
 #[test]
 fn the_others_days_join_the_live_week() {
     let others = [busy_day(DAY - 8, 1, 4 * HOUR), busy_day(DAY - 1, 2, HOUR)];
@@ -592,14 +514,6 @@ fn drawn_week() -> AbWeek {
 }
 
 /// THE CARD, AS THE DESIGN DRAWS IT (§10.5.1, §11.6.1): Boxes and
-/// Questions as medians with n on each side (`not enough yet (2)` under
-/// three), At its prompt with Cruise's causes, Land on its own row, the
-/// Ends and Unsupervised rows saying they have counted nothing yet, and how
-/// long it measured, to when; the held shares are the lead's, so no Held
-/// row (each side has 100 minutes of working time). NEGATIVE CONTROLS: a
-/// landing that waits on and on moves Land's row and no Cruise-against-Off
-/// row; there is never a "time saved"; and unsupervised time moves its
-/// row's words, never the card's rows.
 #[test]
 fn the_card_reads_as_the_design_draws_it() {
     let rows = |week: &AbWeek| ab_rows(week, DAY);
@@ -663,9 +577,6 @@ fn the_card_reads_as_the_design_draws_it() {
 }
 
 /// THE QUIET CARD AND ITS EDGES: nothing measured reads so on every row; a
-/// side under three holds reads `not enough yet (n)` and no median; a week
-/// begun today reads `today, since 09:12`; a zone that cannot be read
-/// names the days alone; Land's pause and its few boxes read on its row.
 #[test]
 fn the_card_says_what_it_has_not_measured_yet() {
     let rows = |week: &AbWeek| ab_rows(week, DAY);
@@ -718,7 +629,6 @@ fn the_card_says_what_it_has_not_measured_yet() {
 }
 
 /// A week whose Cruise and Off sides have `cruise_ms` and `off_ms` of
-/// working time, a tenth of each held at a box.
 fn working(cruise_ms: u64, off_ms: u64) -> AbWeek {
     let mut week = AbWeek::default();
     for (arm, ms) in [(Cruise, cruise_ms), (Off, off_ms)] {
@@ -732,11 +642,6 @@ fn working(cruise_ms: u64, off_ms: u64) -> AbWeek {
 }
 
 /// THE LEAD'S FLOOR (§11.6.1, §11.6.4 "Too little Off time"): both sides at
-/// 10 minutes of working time lead with both shares, each with its working
-/// time; Cruise with no Off time leads with the note; Off at 9 min 59 s,
-/// Cruise at 9 min 59 s, Land alone and nothing at all give no lead.
-/// NEGATIVE CONTROL: the floor's comparison flipped (or moved off by a
-/// second either way) fails the edge pair.
 #[test]
 fn the_lead_stands_at_ten_minutes_of_each_side() {
     const TEN: u64 = 10 * MIN;
@@ -767,15 +672,12 @@ fn the_lead_stands_at_ten_minutes_of_each_side() {
     land.arms[Land.index()].busy_ms = 6 * HOUR;
     assert_eq!(ab_lead(&land), None, "Land is never part of it");
     assert_eq!(ab_lead(&AbWeek::default()), None);
-    // At its prompt is no working time: an Off side that only idled has none.
     let mut idle_off = working(TEN, 0);
     idle_off.arms[Off.index()].at_prompt_ms = 5 * HOUR;
     assert_eq!(ab_lead(&idle_off), Some(AbLead::NoOff));
 }
 
 /// THE HELD ROW GIVES WAY TO THE LEAD (§11.6.3, item 2): where both
-/// shares lead, no Held row; under the note, and with no lead, the Held row
-/// stands. NEGATIVE CONTROL: Held drawn always would put it in the first.
 #[test]
 fn the_held_row_gives_way_to_the_lead_alone() {
     let labels = |week: &AbWeek| {
@@ -806,11 +708,6 @@ fn the_held_row_gives_way_to_the_lead_alone() {
 }
 
 /// THE ENDS ROW (§11.6.1, §11.6.7): after Land, its parts only where they
-/// counted — Land's landings, the time from Land to landed with its n (`not
-/// enough yet (2)` under three) — and `none yet` with nothing to count.
-/// Under Autopilot Cruise / Land a landing is the one end: no Cruise
-/// done and no quiet end is ever named. NEGATIVE CONTROL: nothing counted
-/// reads no words, and the card says `none yet`.
 #[test]
 fn the_ends_row_says_each_part_it_counted() {
     let ends = |landed, landing: Hist| AbEnds { landed, landing };
@@ -829,7 +726,6 @@ fn the_ends_row_says_each_part_it_counted() {
         "a landing with no span counts alone"
     );
     assert_eq!(ends_words(&AbEnds::default()), None);
-    // On the card: after Land, before Unsupervised and Measured.
     let mut week = drawn_week();
     week.ends = ends(5, samples(bucket(6 * MIN), 5));
     let rows = ab_rows(&week, DAY);
@@ -850,11 +746,6 @@ fn the_ends_row_says_each_part_it_counted() {
 }
 
 /// THE CARD'S ROWS STAND THROUGH THE WEEK'S FIRST LANDING AND ITS FIRST
-/// UNSUPERVISED MINUTE (§11.6.7): EFFECT sits above SUPERVISION's
-/// switches, so the rows a background event changes keep their places —
-/// the same labels in the same order before and after, only the words
-/// moved. NEGATIVE CONTROL: the Ends row drawn only once something counted
-/// (the first build) adds a row at the landing.
 #[test]
 fn the_cards_rows_stand_through_a_landing() {
     let labels = |week: &AbWeek| {
@@ -873,8 +764,6 @@ fn the_cards_rows_stand_through_a_landing() {
 }
 
 /// THE END CLOCK (§11.6.3, item 3): Measured names the instant the
-/// numbers stop at, a clock time, on every form; with no zone read, none.
-/// NEGATIVE CONTROL: with no `until`, the row says no `to`.
 #[test]
 fn measured_names_the_instant_it_counted_to() {
     let mut week = AbWeek {
@@ -903,21 +792,12 @@ fn measured_names_the_instant_it_counted_to() {
 }
 
 /// What `App::note_harness_arm` tells the book: session `session`'s mode
-/// (`lands`: Land), then its stretch under `arm`, at `at_ms`.
 fn note(book: &mut AbBook, session: u64, (arm, lands): (AbArm, bool), at_ms: u64) {
     book.follow_mode(session, lands, at_ms);
     book.observe(session, Some(Busy), None, arm, at_ms);
 }
 
 /// THE BOOK COUNTS EACH END IN ITS DAY, AND THE TIME FROM LAND TO LANDED
-/// (§11.6.3, item 4; §11.6.5 "The book"): the mode moved Cruise to Land at
-/// t0 and landed at t0 + 6 min is landed 1 and one sample in `bucket(6
-/// min)`, the start spent; a session whose mode is first read as Land is
-/// landed 1 and no sample; a mode that leaves Land drops the start; an end after midnight goes in its own
-/// day; the session's end forgets its task. NEGATIVE CONTROLS: a book fed
-/// no calendar counts nothing; a second landing in the same Land stretch
-/// has no start (`task_opened` sets one), so it is a count with
-/// no sample.
 #[test]
 fn the_book_counts_each_end_and_the_time_from_land_to_landed() {
     let mut book = book_at(NOON_MS);
@@ -936,24 +816,20 @@ fn the_book_counts_each_end_and_the_time_from_land_to_landed() {
     };
     want.landing[bucket(6 * MIN)] = 1;
     assert_eq!(today(&book), want);
-    // CONTROL: a second landing in the same Land stretch has no start.
     book.landed(1, t0 + 9 * MIN);
     want.landed = 2;
     assert_eq!(today(&book), want, "a count, no sample");
-    // First read in Land: a count, no span.
     note(&mut book, 2, (Land, true), t0);
     assert_eq!(book.land_from(2), None, "first read");
     book.landed(2, t0 + 6 * MIN);
     want.landed = 3;
     assert_eq!(today(&book), want);
-    // A mode that leaves Land drops the start, whatever comes back.
     note(&mut book, 4, (Off, false), 0);
     note(&mut book, 4, (Unsupervised, true), MIN);
     note(&mut book, 4, (Unsupervised, false), 2 * MIN);
     assert_eq!(book.land_from(4), None, "left Land");
     note(&mut book, 4, (Unsupervised, true), 3 * MIN);
     assert_eq!(book.land_from(4), Some(3 * MIN), "a new move into Land");
-    // Past midnight: the next day's.
     let midnight = u64::try_from(12 * HOUR_MS).unwrap();
     book.landed(4, midnight + MIN);
     let tomorrow = day_at(&book, midnight + MIN, DAY + 1)
@@ -974,14 +850,11 @@ fn the_book_counts_each_end_and_the_time_from_land_to_landed() {
         3,
         "today keeps its own"
     );
-    // The week sums them.
     let week = book.week_at(midnight + MIN, &[]);
     assert_eq!(week.ends.landed, 4);
-    // The session's end forgets its task.
     assert_eq!(book.tasks(), 3, "sessions 1, 2 and 4");
     book.retire(4, midnight + 2 * MIN);
     assert_eq!((book.tasks(), book.land_from(4)), (2, None));
-    // CONTROL: no calendar, no count.
     let mut unread = AbBook::default();
     note(&mut unread, 1, (Cruise, false), 0);
     note(&mut unread, 1, (Land, true), MIN);
@@ -990,12 +863,6 @@ fn the_book_counts_each_end_and_the_time_from_land_to_landed() {
 }
 
 /// A WALL'S WORD KEEPS THE LANDING'S START (§11.6.3, item 4; §11.6.5 "The
-/// book"): a word that counts in no phase drops the session's open stretch
-/// (`observe(…, None, …)`), but the start lives apart from it, so the
-/// landing six minutes after the move into Land is still one sample in
-/// `bucket(6 min)`. NEGATIVE CONTROL: the start kept in the stretch's clock
-/// would be dropped by the wall (no sample) or begun again at the next word
-/// (`bucket(4 min)`, another bucket).
 #[test]
 fn a_walls_word_between_land_and_landed_keeps_the_span() {
     assert_ne!(bucket(6 * MIN), bucket(4 * MIN), "the control can tell");
@@ -1014,7 +881,6 @@ fn a_walls_word_between_land_and_landed_keeps_the_span() {
 }
 
 /// TWO DAYS' ENDS ADD (two processes' books of one date, the week's sum).
-/// NEGATIVE CONTROL: a day before the week adds nothing.
 #[test]
 fn two_days_ends_add() {
     let mut mine = busy_day(DAY, 50, HOUR);
@@ -1032,16 +898,6 @@ fn two_days_ends_add() {
 }
 
 /// THE START FOLLOWS THE MODE, NEVER THE CLAIM (§11.6.4 "Before this
-/// process"; §11.6.7): a session restored mid-landing is first read with
-/// its word Land and no claim of this host's (unsupervised), then claimed
-/// (Land): its landing counts with NO span; and a claim that lapses and is
-/// taken again mid-landing keeps the start the mode's move set, so the
-/// landing six minutes after the press is `bucket(6 min)`. The App's
-/// wiring of the two is `harness_task_tests`'
-/// `the_time_from_land_to_landed_starts_where_the_mode_moved`. NEGATIVE
-/// CONTROL (run here): the mode told as the arm is (the first build's
-/// rule) puts a sample in the restored landing and starts the blip's at the
-/// retake (`bucket(1m 50s)`).
 #[test]
 fn the_start_follows_the_mode_never_the_claim() {
     assert_ne!(
@@ -1055,11 +911,8 @@ fn the_start_follows_the_mode_never_the_claim() {
             let lands = if keyed_on_arm { arm == Land } else { lands };
             note(&mut book, session, (arm, lands), at_ms);
         };
-        // Restored: the word Land when first read, the claim 20 s later.
         note(7, (Unsupervised, true), 0);
         note(7, (Land, true), 20_000);
-        // A blip: the press at 1m, the claim lapsed at 5m and taken again
-        // at 5m 10s, landed at 7m.
         note(8, (Cruise, false), 0);
         note(8, (Land, true), MIN);
         note(8, (Unsupervised, true), 5 * MIN);

@@ -1332,7 +1332,7 @@ impl CarrySnapshot {
 
     /// The records it holds, the ones that always cross and the cut's.
     #[must_use]
-    pub fn records(&self) -> usize {
+    pub const fn records(&self) -> usize {
         self.keep.len() + self.victims.len()
     }
 }
@@ -1374,7 +1374,7 @@ impl PreparedCarry {
     /// How many records past the skeleton a carry with room for all of them
     /// adds.
     #[must_use]
-    pub fn detail_records(&self) -> usize {
+    pub const fn detail_records(&self) -> usize {
         self.snap.victims.len()
     }
 

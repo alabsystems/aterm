@@ -1616,7 +1616,7 @@ impl JsonReader<'_> {
         self.bytes.get(self.pos).copied()
     }
 
-    fn bump(&mut self) {
+    const fn bump(&mut self) {
         self.pos = self.pos.saturating_add(1);
     }
 

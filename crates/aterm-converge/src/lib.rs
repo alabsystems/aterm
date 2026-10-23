@@ -16,6 +16,9 @@
 //! platform code. `aterm_machines::Bound` wraps the machines families, whose items take
 //! their `System` and context per call.
 
+#[cfg(test)]
+aterm_durable::plain_durable_flushes_in_tests!();
+
 mod engine;
 mod journal;
 mod model;

@@ -2,68 +2,6 @@
 // Copyright 2026 Andrew Yates
 
 //! THE SIMULATION'S SEEDS, its negative controls and its replay.
-//!
-//! * [`every_seed_holds_every_law`]: the committed world, seed after seed,
-//!   breaks no law, and the seeds together exercise every fault the
-//!   scheduler has (a run that exercised nothing cannot pass);
-//! * [`each_rule_switched_off_is_caught`]: each rule the bridge, the endpoint
-//!   and the broker arm keep is switched off once, and some seed then breaks
-//!   the law that rule exists for — while, with the rule on, the same world
-//!   and seed keep it;
-//! * [`a_failing_seed_replays_exactly`]: a seed run twice is the same run,
-//!   trace for trace, failure for failure;
-//! * [`the_broker_arm_cuts_exactly_what_the_law_allows`] and
-//!   [`the_device_keeps_a_durable_write_and_may_roll_back_the_rest`]: the two
-//!   simulated arms, on their own;
-//! * the FINDINGS the simulation made: F1, a torn state file after a power cut
-//!   that wedged every later attach, is decided — the committed device tears,
-//!   the bridge sets a torn file aside, and the old refusal is its negative
-//!   control
-//!   ([`a_torn_state_file_after_a_power_cut_is_set_aside_and_the_attach_goes_on`]);
-//!   F2, a post the log lost that a later power cut brought back out of its
-//!   sender's order, is decided — the first bridge of a boot after an unclean
-//!   stop retires every whole in-flight entry, never publishing it again; the
-//!   world that loses power both ways is a committed sweep
-//!   ([`every_seed_of_the_world_that_loses_power_both_ways_holds_every_law`])
-//!   and the old republish is its negative control
-//!   ([`a_post_the_log_lost_stays_lost_after_a_later_power_cut`]); F4, a
-//!   ghost row that outlived the bridges that could retire it, is decided —
-//!   every session row carries its state dir's mark, a later bridge of the
-//!   dir in the same boot retires its predecessors' ghosts by it, the same-boot
-//!   worlds leave none, and the mark unread is its negative control
-//!   ([`a_ghost_row_is_retired_by_a_later_bridge_of_its_state_dir`]), while a
-//!   sibling under the node id is another state dir's, retired only by an
-//!   attach that witnessed its will
-//!   ([`a_siblings_row_is_retired_only_by_the_attach_that_witnessed_its_will`]),
-//!   even one that took an incarnation this dir took
-//!   ([`a_sibling_that_takes_one_of_this_dirs_incarnations_is_never_retired`],
-//!   F4's review: the chain of incarnations the dir took, the first decision,
-//!   retired such a sibling's live rows);
-//!   F3, an endpoint that forgot every offset when a killed attach left it a
-//!   generation ahead of the next bridge's witness, is fixed in
-//!   aterm-gui-fabric (`LogClock::keep_below`) and is a negative control here;
-//! * the WRITE ERRORS of sim item S7: the device fails the state dir's writes
-//!   in every other eight committed seeds, and every law holds under it
-//!   ([`every_seed_with_write_errors_holds_every_law`], where aterm quits too) —
-//!   the eight defects it found fixed, each switched off a row of
-//!   [`each_rule_switched_off_is_caught`] and each seed it broke kept in
-//!   [`FOUND_ERRING`], [`FOUND_BOTH_WAYS`], [`FOUND_BOTH_WAYS_ERRING`] and
-//!   [`FOUND_QUITTING`]; a durable write whose flush failed after its rename
-//!   is written again rather than trusted
-//!   ([`a_durable_write_whose_flush_failed_is_not_trusted_and_is_written_again`]);
-//! * the seeds a wider search found breaking a law, each fixed in the bridge
-//!   and kept here ([`the_seeds_that_broke_a_law_hold_every_law`]).
-//!
-//! One rule no END-STATE law can see broken: the inbox commit's wait for a
-//! record's delivery. Committed before delivery, a record a kill left
-//! undelivered is offered again by the next bridge's refill (§6.2), which
-//! starts below every row the endpoint never took, so the world settles with
-//! nothing lost; the model's tap sees the step itself — the group past a
-//! record no row holds — and is that rule's control
-//! (`Mutant::CommitBeforeDelivery`).
-//!
-//! A seed is a whole run, named in every failure with the tail of its trace;
-//! `world::run(&Opts::seed(n))` runs it again, the same run (the replay test).
 
 use super::bus::{self, ArmMutant, Escalation, Stop, Tier};
 use super::device::Device;
@@ -71,96 +9,14 @@ use super::endpoint::EpRules;
 use super::world::{run, Mutant, Opts, Outcome};
 use super::Rng;
 
-/// How many seeds the committed world is held to on every run (half of them
-/// one device, half two, half of each with the bus mirror on, and half of
-/// those with the broker holding acks: [`Opts::seed`]). A wider search, seeds
-/// 1..=8064 at 400 steps and 1..=400 at 1500, breaks no law once the fixes
-/// [`FOUND`] keeps are in; after aterm-0's loop and its held acks, as
-/// reviewed (an idle loop waits for its posts' answers, the idle law on, a
-/// rolled-back batch refusing commits too), 1..=4000 at 400 steps and
-/// 1..=400 at 1500 broke none (134,105 and 56,819 acks held, 5,926 and 2,078
-/// reads that went on without one, 626 and 80 records read before their
-/// ack). With the device tearing (decided) to nothing or
-/// part-way, a sweep that sets aside every file not provably whole,
-/// and a torn mirror pin left to stop the mirror, 1..=4000 at 400 steps and
-/// 1..=400 at 1500 broke none (10,153 and 3,686 power cuts, 6,964 and 3,063
-/// torn files set aside). With every whole in-flight entry of an earlier boot
-/// retired after an unclean stop (decided), 1..=8064 at 400 steps
-/// and 1..=400 at 1500 broke none (20,387 and 3,670 power cuts, 18,518 and
-/// 4,011 entries retired); and the world that loses power both ways
-/// ([`both_ways`]), 1..=4000 at 400 and 1..=400 at 1500, broke none either
-/// (20,327 and 7,412 power cuts, 16,148 and 5,707 generation moves, 18,264
-/// and 8,034 entries retired) — where the old republish broke the order at
-/// 67 of 1..=2000, and nothing else. With every session row carrying its state
-/// dir's mark and a later bridge of the dir retiring its predecessors' ghosts
-/// by it (decided), 1..=2000 at 400 steps and 1..=400 at 1500
-/// broke none and left no ghost row (5,111 and 3,671 power cuts, 11,814 and
-/// 9,003 ghost rows retired), nor did the world that loses power both ways,
-/// 1..=2000 at 400 (10,095 power cuts, 21,412 ghost rows retired), nor the
-/// worlds with a sibling ([`Opts::with_a_sibling`]), 1..=2000 at 400 and
-/// 1..=400 at 1500 (the sibling's row standing under a bridge that outranked
-/// it in 1,356 and 375, retired by the attach that witnessed its will in 340
-/// and none), nor the worlds whose sibling races an attach for one of this
-/// dir's incarnations ([`Opts::with_a_racing_sibling`]), 1..=2000 at 400 and
-/// 1..=400 at 1500 (the race run in 1,978 and 397, the sibling's row standing
-/// in every one). Those F4 measurements used the superseded, unqualified
-/// device/inode mark; they do not establish cross-boot retirement for the
-/// current boot-bound mark. With the device failing writes (sim item S7) in
-/// every other eight seeds and its fixes in, composed with main's per-open
-/// run admission, 1..=4000 at 400 steps and 1..=400 at 1500 broke none
-/// (11,961 and 4,396 writes failed before their effect, 2,113 and 738
-/// durable replaces renamed with their flush failed, 1,422 and 511 appends
-/// cut part-way, 63,281 and 23,230 writes a full disk refused), nor the
-/// world that loses power both ways, 1..=4000 at 400. With the errors on in
-/// every seed and aterm quitting now and then (`erring_quitting`,
-/// `both_ways_erring_quitting`), 1..=4000 at 400 of each and 1..=400 at 1500
-/// of the second broke none (25,002, 25,739 and 9,400 writes failed; 1,906,
-/// 2,253 and 1,208 flushes failed; 14,544 quits of aterm in the first, 9,542
-/// of them stopping the run cleanly), nor the worlds with a sibling or a
-/// racing one, erring and quitting, 1..=500 each, nor the both-ways world
-/// erring without quits, 1..=2000 — each process putting one copy of a file
-/// in the quarantine however often its recovery was tried. This many run in
-/// a few seconds.
 const SEEDS: u64 = 64;
 
-/// How many seeds the COMMITTED WORLD's own sweep runs ([`committed`]):
-/// twice [`SEEDS`] since sim item S7, whose write errors are on in every
-/// other eight seeds ([`Opts::write_errors`]), so that as many of its seeds
-/// run on a clean disk as before them, and as many again on a failing one.
 const COMMITTED_SEEDS: u64 = 2 * SEEDS;
 
-/// The most seeds a negative control may take to show its rule's law broken.
 const CONTROL_SEEDS: u64 = 64;
 
-/// How many seeds the worlds with a SIBLING under the node id are held to
-/// ([`a_siblings_row_is_retired_only_by_the_attach_that_witnessed_its_will`]).
 const SIBLING_SEEDS: u64 = 32;
 
-/// The most seeds a control of a RARE interleaving may take
-/// ([`each_rule_switched_off_is_caught`]'s list). 2000 since aterm-0: the
-/// loop that stopped parking on its own commits and acks moved F3's chain —
-/// a kill on the `link log` line between two bus-only losses — from seed 308
-/// to 1730, the first within 6000. 6000 since the mirror's durable copies
-/// (`logkey`, `logfloor`): each is a durable replace in the state dir's root,
-/// whose directory flush keeps `inc-lease`'s newest version through the next
-/// power cut, so the rollback the incarnation lease's control needs (an older
-/// `inc-lease` trusted across the boot) is rarer in a mirroring world — the
-/// first within 8000 moved from 546 to 4023, and none within 4000 with the
-/// mirror off. 9000 since sim item S6 (a clean stop's one full flush, the
-/// emptied quarantine heard): the lease's control moved from 4023 to 8483, the
-/// first within 12000. Sim item S7 adds one more such flush, the floor each
-/// open writes again before its first batch (`StateDir::raise_logfloor`):
-/// with it on, 8483 no longer breaks the lease's law, so the lease's control
-/// switches that admission off as well, and at 8483 again (neither off alone
-/// breaks it there, and the lease alone off breaks no seed of 1..=14000).
-/// 20000 since sim item S7 composed with main's per-open run admission (one
-/// more durable write at every bridge start, which moves where each erring
-/// seed's write errors land): the replay hold's control
-/// (`Mutant::DeliverBeforeTheDrain`) moved from 1844 to 18017, rare enough
-/// that it has a unit test of its own as well, `bridge.rs`'s
-/// `a_replayed_record_waits_for_its_posts_retirement_so_a_move_delivers_it_once`.
-/// A search stops at its first hit, so the wider limit costs a run only
-/// where a witness went stale.
 const RARE_SEEDS: u64 = 20000;
 
 fn report(out: &Outcome) -> String {
@@ -175,12 +31,6 @@ fn report(out: &Outcome) -> String {
     )
 }
 
-/// **THE COMMITTED WORLD BREAKS NO LAW**, over [`COMMITTED_SEEDS`] seeds — every tier,
-/// kills at every kind of I/O step, relaunches, broker restarts of every kind
-/// with generation moves and lost suffixes, power cuts of the whole machine,
-/// tabs opening and closing, session logs mirrored onto the bus, acks answered
-/// after the records they name (aterm-0's reordering) — and the seeds together
-/// exercised every one of those.
 #[test]
 fn every_seed_holds_every_law() {
     let mut total = super::world::Stats::default();
@@ -246,32 +96,18 @@ fn every_seed_holds_every_law() {
         ("sessions that left", total.exits),
         ("session-log records", total.log_records),
         ("`ms` the mirror put on the bus", total.mirrored),
-        // a power cut tore state files, and a bridge set
-        // them aside and attached ([`a_torn_state_file_after_a_power_cut_is_set_aside_and_the_attach_goes_on`]).
         ("torn state files set aside", total.set_aside),
         ("torn state files told to aterm", total.set_aside_told),
-        // THE TORN PIN'S LAW: a power cut tore the mirror's pin, and the
-        // next boot set it aside and resumed the mirror
-        // ([`a_torn_mirror_pin_after_a_power_cut_is_set_aside_and_the_mirror_resumes`]).
         ("power cuts that tore the mirror's pin", total.pins_torn),
         ("torn mirror pins set aside", total.pins_set_aside),
-        // a power cut found in-flight entries, and the first
-        // bridge of the next boot retired them unpublished
-        // ([`a_post_the_log_lost_stays_lost_after_a_later_power_cut`]).
         (
             "in-flight entries of an earlier boot retired",
             total.retired,
         ),
         ("ghost rows retired", total.ghosts_retired),
-        // THE REORDERING aterm-0's loop must survive, covered by the seeds:
-        // acks answered late, the bridge's reads that went on without them,
-        // and records handed over before their own publish's ack.
         ("acks the broker held", total.acks_held),
         ("reads that found an ack not yet there", total.tries_not_yet),
         ("records read before their ack", total.seen_before_ack),
-        // SIM ITEM S7: the device failed writes, before their effect and
-        // after it, and filled up ([`every_seed_with_write_errors_holds_every_law`]
-        // counts every kind).
         ("state-dir writes failed", total.writes_failed),
         (
             "durable replaces renamed with their flush failed",
@@ -283,14 +119,6 @@ fn every_seed_holds_every_law() {
     }
 }
 
-/// **THE LOOP GOES ON WITHOUT ITS ACKS, AND THE LAWS HOLD EITHER WAY**
-/// (aterm-0). Over the committed world's seeds whose broker holds acks, the
-/// bridge's reads that must not wait found answers not yet there and it went
-/// on — and every law held ([`every_seed_holds_every_law`]). NEGATIVE
-/// CONTROL: the same seeds with every read waiting (`WaitForEveryAck`, the
-/// loop before aterm-0) never once go on without an answer, so the count is
-/// the non-blocking loop's own — and hold every law too: what aterm-0 changes
-/// is when an answer is read, never what the bridge does with it.
 #[test]
 fn the_loop_goes_on_without_its_acks_and_a_waiting_loop_never_does() {
     let held: Vec<&Outcome> = committed()
@@ -330,12 +158,6 @@ fn the_loop_goes_on_without_its_acks_and_a_waiting_loop_never_does() {
     );
 }
 
-/// Whether violation `v` is one of `law`'s: its words contain one of the
-/// `|`-separated phrases. The model tap's violations (`model: …`) are only a
-/// law's that names the tap: each carries the tap's state legend (`occ lost g
-/// past pend …`), whose words would otherwise answer for the oracle's own
-/// laws — a control of the no-loss check (`lost:`) once passed on the word
-/// `lost` in that legend while the check itself caught nothing.
 fn breaks(v: &str, law: &str) -> bool {
     law.split('|').any(|phrase| {
         if v.starts_with("model:") {
@@ -346,17 +168,8 @@ fn breaks(v: &str, law: &str) -> bool {
     })
 }
 
-/// How many worlds run side by side: each is its own scratch dir, broker,
-/// device, endpoint thread and bridge, and nothing of one reaches another.
-/// Four, beside the test binary's own test per core: more lanes than that buy
-/// a run no wall time and spend more CPU, most of it the kernel's (each world's
-/// socket rendezvous).
 const WORKERS: usize = 4;
 
-/// `job` for every item, [`WORKERS`] at a time from ONE QUEUE — a worker takes
-/// the next item as it frees, so a long run holds no batch behind it — and
-/// the answers in item order, the same answers however the threads ran. A
-/// job's panic is the caller's, with its own payload.
 fn par_map<T: Sync, R: Send>(items: &[T], job: impl Fn(&T) -> R + Sync) -> Vec<R> {
     use std::sync::atomic::{AtomicUsize, Ordering};
     let next = AtomicUsize::new(0);
@@ -389,8 +202,6 @@ fn par_map<T: Sync, R: Send>(items: &[T], job: impl Fn(&T) -> R + Sync) -> Vec<R
         .collect()
 }
 
-/// Run `opts` for every seed in `seeds` ([`par_map`]), the outcomes in seed
-/// order.
 fn run_all(
     opts: &(dyn Fn(u64) -> Opts + Sync),
     seeds: std::ops::RangeInclusive<u64>,
@@ -399,25 +210,15 @@ fn run_all(
     par_map(&seeds, |&seed| run(&opts(seed)))
 }
 
-/// THE COMMITTED WORLD over seeds `1..=COMMITTED_SEEDS`, run once for every test that
-/// reads it — its laws ([`every_seed_holds_every_law`]), the model's Tier-1
-/// ([`the_round_refines_its_exactly_once_model`]) and the replay
-/// of a passing seed: a seed is the same run however often it is asked for
-/// ([`a_failing_seed_replays_exactly`]), so asking again only costs a run.
 fn committed() -> &'static [Outcome] {
     static RUNS: std::sync::OnceLock<Vec<Outcome>> = std::sync::OnceLock::new();
     RUNS.get_or_init(|| run_all(&Opts::seed, 1..=COMMITTED_SEEDS))
 }
 
-/// Whether `out` breaks `law` ([`breaks`]).
 fn breaks_law(out: &Outcome, law: &str) -> bool {
     out.violations.iter().any(|v| breaks(v, law))
 }
 
-/// The first seed in `1..=limit` whose run under `opts` is `hit`'s: the seeds
-/// go out in order through [`par_map`]'s queue and none above a hit is
-/// started, so every seed below the lowest hit has run when the queue ends —
-/// the same seed however the threads ran.
 fn first_within(
     opts: &(dyn Fn(u64) -> Opts + Sync),
     limit: u64,
@@ -441,12 +242,6 @@ fn first_within(
     .next()
 }
 
-/// A WITNESSED SEARCH: the run of `opts` at `witness` — the seed
-/// [`first_within`] found, kept beside its search so a control is one world
-/// rather than a search of hundreds — when it is `hit`'s, else that search of
-/// `1..=limit`, naming the seed it found so the witness can move there. The
-/// claim is the search's either way: some seed within `limit` (or the
-/// witness) is `hit`'s.
 fn witnessed(
     opts: &(dyn Fn(u64) -> Opts + Sync),
     witness: u64,
@@ -470,7 +265,6 @@ fn witnessed(
     found
 }
 
-/// [`witnessed`] with `law` broken ([`breaks`]) as the hit.
 fn breaking_at(
     opts: &(dyn Fn(u64) -> Opts + Sync),
     law: &str,
@@ -480,7 +274,6 @@ fn breaking_at(
     witnessed(opts, witness, limit, &|out| breaks_law(out, law))
 }
 
-/// `o` with every rule switched back on: the same world, seed and tier.
 fn with_every_rule(mut o: Opts) -> Opts {
     o.mutants.clear();
     o.ep = EpRules::default();
@@ -489,9 +282,6 @@ fn with_every_rule(mut o: Opts) -> Opts {
     o
 }
 
-/// **EACH RULE SWITCHED OFF IS CAUGHT** by the law it exists for, at some seed
-/// — and with the rule on, the same world and seed keep that law: the failure
-/// is the rule's.
 #[test]
 fn each_rule_switched_off_is_caught() {
     type Switch = Box<dyn Fn(u64) -> Opts + Sync>;
@@ -523,12 +313,6 @@ fn each_rule_switched_off_is_caught() {
             "dup delivery",
             2,
         ),
-        // ONE RULE, THREE LAWS, each a control of its own: the endpoint that
-        // keeps the offsets a move took answers a later record at a reused
-        // offset as the old one's row — the model's tap sees the round leave
-        // FabricExactlyOnce; the no-loss check sees a record on the bus that
-        // never reached its ring; the receipt check sees an answer naming the
-        // record that offset held before.
         (
             "the endpoint forgets the offsets a move took (the model's tap)",
             Box::new(|s| {
@@ -618,9 +402,6 @@ fn each_rule_switched_off_is_caught() {
             "order:",
             5,
         ),
-        // THE EXACTLY-ONCE WAIT aterm-0 KEEPS where the loop no longer waits
-        // for its acks: the outbox peek reads every post in flight first. Run
-        // where the broker holds acks, so a drain meets a post still owed.
         (
             "the outbox is peeked only once every post in flight is answered",
             Box::new(|s| {
@@ -631,10 +412,6 @@ fn each_rule_switched_off_is_caught() {
             "dup post",
             1,
         ),
-        // AND THE WAIT A SENDER NEEDS: an idle loop reads its posts' answers
-        // waiting before it parks, so `outbox sent` never waits out the idle
-        // backstop's grace. Run where the broker holds acks, so an idle
-        // moment meets a post's answer still in its flush.
         (
             "an idle loop reads its posts' answers before it parks",
             Box::new(|s| {
@@ -648,24 +425,6 @@ fn each_rule_switched_off_is_caught() {
         (
             "the incarnation lease is trusted only in the boot that wrote it",
             Box::new(|s| {
-                // The lease's boot is judged across a power cut, and the bus's
-                // own fence (`max(local, bus) + 1`) holds wherever a record of
-                // the incarnation survived: only a world whose log also loses
-                // power alone shows the lease alone standing between a reused
-                // incarnation and the bus ([`both_ways`],
-                // which with every rule on breaks no law).
-                // Seed 149 until the next boot's first bridge retired the
-                // entries a cut left, which moved every schedule
-                // after a power cut; 546 until the mirror's durable copies,
-                // whose directory flushes pin `inc-lease` (`RARE_SEEDS`);
-                // 4023 until sim item S6, 8483 since. Sim item S7's floor,
-                // written again by each open before its first batch, is one
-                // more such flush, and with it 8483 no longer rolls a lease
-                // back with the lease alone off. So the floor's admission is
-                // switched off too, as the incidental flush it is
-                // (`Mutant::TrustTheFloorThatReads`): at 8483 neither switched
-                // off alone breaks the law, both do, and with every rule on
-                // the same seed keeps it.
                 both_ways(s)
                     .with(Mutant::LeaseAcrossBoots)
                     .with(Mutant::TrustTheFloorThatReads)
@@ -722,46 +481,30 @@ fn each_rule_switched_off_is_caught() {
             "presence:",
             3,
         ),
-        // a later bridge of a state dir retires the ghosts
-        // its earlier bridges left, by the dir's mark on their rows — the rule
-        // the committed worlds' ghosts are all retired by, which unread leaves
-        // the ones whose writer's successors all died inside the five minutes.
         (
             "a later bridge reads its state dir's mark on a row (F4)",
             Box::new(|s| Opts::seed(s).with(Mutant::ReadNoMark)),
             "presence:",
             2,
         ),
-        // THE WITNESS, where the mark cannot stand in for it: a SIBLING'S
-        // death, a row under another state dir's mark, whose will the attach
-        // read.
         (
             "the attach records the predecessor's will it read",
             Box::new(|s| Opts::with_a_sibling(s).with(Mutant::IgnoreWitnessedWill)),
             "presence:",
             4,
         ),
-        // AND A SIBLING'S ROW IS NOT THIS DIR'S: a sweep that takes every
-        // incarnation below its own for one of the dir's earlier bridges
-        // retires it.
         (
             "a lower incarnation's row under another state dir's mark is not its own",
             Box::new(|s| Opts::with_a_sibling(s).with(Mutant::RetireEveryEarlierIncarnation)),
             "presence:",
             1,
         ),
-        // SIM ITEM S6: what ends the owner's entry for the torn files is the
-        // count the quarantine HOLDS, at every start — not what the start
-        // moved, which a later boot that moves fewer understates.
         (
             "a bridge tells aterm what its quarantine holds",
             Box::new(|s| Opts::seed(s).with(Mutant::TellMovedNotHeld)),
             "quarantine:",
             1,
         ),
-        // SIM ITEM S7, THE DEVICE'S WRITE ERRORS: each rule a failed write
-        // needs, switched off where the committed world's disk fails
-        // ([`Opts::write_errors`], every other eight seeds).
         (
             "an offset below the self-lane window is not added to it",
             Box::new(|s| Opts::seed(s).with(Mutant::RememberBelowTheWindow)),
@@ -792,32 +535,24 @@ fn each_rule_switched_off_is_caught() {
             "mirror total",
             1039,
         ),
-        // The witness's write failing after a move, and then a later move:
-        // the world that loses power both ways.
         (
             "an attach delivers on a new log only once its witness is written",
             Box::new(|s| both_ways(s).with(Mutant::AttachPastAnUnwrittenWitness)),
             "dup delivery",
             713,
         ),
-        // A replayed post whose drain's try fails, and then a move: the world
-        // that loses power both ways with the disk failing in every seed.
         (
             "a record the attach published again is delivered once its post is retired",
             Box::new(|s| both_ways_erring(s).with(Mutant::DeliverBeforeTheDrain)),
             "dup delivery",
             18017,
         ),
-        // A clean stop made while the recovery is owed: a world where aterm
-        // quits, and the disk fails, in every seed.
         (
             "a run whose recovery is owed makes no clean stop",
             Box::new(|s| erring_quitting(s).with(Mutant::CleanStopOverAnOwedRecovery)),
             "mirror",
             1535,
         ),
-        // A recovery tried again after a try whose unlink failed: the world
-        // that loses power both ways with the disk failing in every seed.
         (
             "a recovery tried again moves each file once",
             Box::new(|s| both_ways_erring(s).with(Mutant::CopyOnEveryTry)),
@@ -869,30 +604,6 @@ fn each_rule_switched_off_is_caught() {
             1,
         ),
     ];
-    // EACH ROW'S LAST NUMBER IS ITS WITNESS: the first seed the search found
-    // breaking its law (what the test prints, `OFF: … -> seed n`), so a run is
-    // two worlds a rule rather than its search ([`witnessed`]). THE RULES
-    // WHOSE LAW A SEED RARELY BREAKS get a longer search, named exactly (never
-    // matched by a word of their name). The lease is backed up by the bus's
-    // own fence in nearly every interleaving (its own conformance walk is
-    // `state.rs`'s `the_incarnation_lease_refines_its_model`). F3's chain
-    // needs a kill on the `link log` line between two bus-only losses. The
-    // mirror's pin needs a move between the acks that put a batch on the bus
-    // and the landing after them, taking what the batch put there (the
-    // bridge's own model of the batch is `bridge_mirror_tests.rs`'s
-    // `LogMirror` Tier-1). The no-loss check and the receipt check see a
-    // forgetful endpoint only where a later record lands at an offset a move
-    // took AND the endpoint is asked for it; the model's tap sees the same
-    // rule sooner. The `exited` row's control needs a session to leave under
-    // the running bridge's own incarnation and the world to settle with its
-    // row still standing: seed 28 of the first 64 until aterm-0's review fixes
-    // moved every schedule (a refused commit retried, an idle loop waiting for
-    // its posts' answers), seed 66 until a later bridge of a state dir
-    // retired its predecessors' ghosts, seed 194 since. The
-    // self-lane window's needs a move after an `acked` write failed and the
-    // replay of the entry it kept: seed 28 of the first 64 on sim item S7's
-    // own base, 92 since main's per-open run admission (one more durable
-    // write at every bridge start) moved every schedule of an erring seed.
     const RARE: &[&str] = &[
         "an offset below the self-lane window is not added to it",
         "a run whose recovery is owed makes no clean stop",
@@ -913,8 +624,6 @@ fn each_rule_switched_off_is_caught() {
             "a rare rule names no rule: {rare}"
         );
     }
-    // Every rule's two worlds through one queue: the rule off at its seed,
-    // then every rule on at the same seed.
     let shown = par_map(&rules, |(rule, opts, law, witness)| {
         let limit = if RARE.contains(rule) {
             RARE_SEEDS
@@ -955,14 +664,6 @@ fn each_rule_switched_off_is_caught() {
     );
 }
 
-/// THE SEEDS A WIDER SEARCH FOUND BREAKING A LAW (the committed world over
-/// seeds 65..=8064 at 400 steps, and 1..=400 at 1500), each a
-/// defect fixed since, kept so the fix stays one. `(seed, steps, what broke)`:
-/// the bridge, before its fix, broke these; every one now holds every law.
-/// Each was found on a disk that failed no write, and is run on one
-/// ([`on_a_clean_disk`]): sim item S7's write errors, on in every other eight
-/// seeds of the committed world, would draw another schedule for half of
-/// them, and their row would no longer replay the run that found it.
 const FOUND: &[(u64, usize, &str)] = &[
     (102, 1500, "a refused `exited` row nothing wrote again"),
     (110, 1500, "a refused `exited` row nothing wrote again"),
@@ -1028,12 +729,6 @@ const FOUND: &[(u64, usize, &str)] = &[
     (7963, 400, "a refused `exited` row nothing wrote again"),
 ];
 
-/// THE SEEDS THE DEVICE'S WRITE ERRORS FOUND BREAKING A LAW (sim item S7: the
-/// committed world, whose every other eight seeds fail writes, over 1..=4000
-/// at 400 steps; seeds 27, 28, 45, 47 and 63 broke a law too, and are among
-/// the committed world's own), each a defect fixed since: as [`FOUND`], but
-/// run in the committed world itself ([`Opts::seed`]), whose write errors
-/// are on for every one of these seeds.
 const FOUND_ERRING: &[(u64, usize, &str)] = &[
     (
         75,
@@ -1097,10 +792,6 @@ const FOUND_ERRING: &[(u64, usize, &str)] = &[
     ),
 ];
 
-/// THE SEEDS A WIDER SEARCH OF THE WORLD THAT LOSES POWER BOTH WAYS FOUND
-/// BREAKING A LAW ([`both_ways`], 1..=2000 at 400 steps, and 7470 of a search
-/// of 2001..=14000 the lease's control ran), each a defect fixed since:
-/// `(seed, steps, what broke)`, as [`FOUND`].
 const FOUND_BOTH_WAYS: &[(u64, usize, &str)] = &[
     (
         1482,
@@ -1114,22 +805,14 @@ const FOUND_BOTH_WAYS: &[(u64, usize, &str)] = &[
     ),
 ];
 
-/// THE SEEDS THE WIDE SEARCH OF THE WORLD THAT LOSES POWER BOTH WAYS WITH THE
-/// DISK FAILING IN EVERY SEED FOUND BREAKING A LAW ([`both_ways_erring`],
-/// 1..=2000 at 400 steps), each a defect fixed since: as [`FOUND`].
 const FOUND_BOTH_WAYS_ERRING: &[(u64, usize, &str)] = &[(
     1844,
     400,
     "a record the attach published again delivered while its post was queued",
 )];
 
-/// One found seed with the world it was found in: `(world, seed, steps, what
-/// broke)`.
 type FoundIn = (fn(u64) -> Opts, u64, usize, &'static str);
 
-/// THE SEEDS THE WIDE SEARCH OF THE WORLDS WHERE ATERM QUITS FOUND BREAKING A
-/// LAW ([`erring_quitting`] and [`both_ways_erring_quitting`], 1..=2000 at 400
-/// steps each), each a defect fixed since: `(world, seed, steps, what broke)`.
 const FOUND_QUITTING: &[FoundIn] = &[
     (
         erring_quitting,
@@ -1151,18 +834,6 @@ const FOUND_QUITTING: &[FoundIn] = &[
     ),
 ];
 
-/// **THE SEEDS THAT BROKE A LAW HOLD EVERY LAW** ([`FOUND`], on a clean disk,
-/// [`FOUND_ERRING`], [`FOUND_BOTH_WAYS`], [`FOUND_BOTH_WAYS_ERRING`],
-/// [`FOUND_QUITTING`]): a receipt journaled while the link was down that
-/// wedged every later attach; a refused post or a dropped receipt a power cut
-/// brought back and the next attach published; a refused `exited` row nothing
-/// wrote again; the model's tap reading a commit owed on a replaced log as the
-/// offset's own; and what the device's write errors found (sim item S7): the
-/// self-lane window moved down by a deduped replay, a sweep or a pin's
-/// reconcile a write error stopped and the run record closed, a pin judged
-/// before it was reconciled, a record delivered with its in-flight entry
-/// standing, a floor trusted as it read, and an attach that delivered on a
-/// new log whose witness it could not write.
 #[test]
 fn the_seeds_that_broke_a_law_hold_every_law() {
     let found: Vec<FoundIn> =
@@ -1203,10 +874,6 @@ fn the_seeds_that_broke_a_law_hold_every_law() {
     );
 }
 
-/// **A FAILING SEED REPLAYS EXACTLY**: the same seed, run twice, is the same
-/// run — every scheduled choice, every request the bridge made of the broker
-/// and the endpoint, every kill and every image a power cut left, in order —
-/// and fails the same way. A passing seed too.
 #[test]
 fn a_failing_seed_replays_exactly() {
     let failing = breaking_at(
@@ -1242,27 +909,6 @@ fn a_failing_seed_replays_exactly() {
     );
 }
 
-/// **A TORN STATE FILE AFTER A POWER CUT IS SET ASIDE, AND
-/// THE ATTACH GOES ON** ([`super::device`]'s module doc). The committed device
-/// is POSIX's worst case — a power cut may TEAR any file it did not find
-/// flushed, to nothing or part-way ([`Opts::seed`]) — and the committed worlds'
-/// bridges set what it tore aside (`crate::state::StateDir::set_aside_torn`:
-/// after an unclean stop in an earlier boot, an in-flight entry, reservation,
-/// key file or refill floor that is not provably whole is moved into the state
-/// dir's quarantine; a torn mirror pin too, once its durable copies are on the
-/// media, [`a_torn_mirror_pin_after_a_power_cut_is_set_aside_and_the_mirror_resumes`])
-/// and break no law, the liveness law included
-/// ([`every_seed_holds_every_law`] runs them; this names the ones that tore
-/// something).
-///
-/// NEGATIVE CONTROLS: the old refusal (`Mutant::RefuseTornAfterPowerCut`, a
-/// torn file refused where it is read, at every attach of every later boot)
-/// wedges some seed's bridge, which never attaches again; the same seed's
-/// committed world breaks no law; and the same seed under the old refusal with
-/// a device that never tears breaks none either — the wedge is the tear's. And
-/// the first fix's sweep (`Mutant::SweepByTheReaderAlone`, a file whole when
-/// its reader takes it) wedges some seed too: a reply's in-flight entry cut
-/// where it still reads, with no witness, is kept and refused at every attach.
 #[test]
 fn a_torn_state_file_after_a_power_cut_is_set_aside_and_the_attach_goes_on() {
     let torn: Vec<&Outcome> = committed()
@@ -1318,30 +964,6 @@ fn a_torn_state_file_after_a_power_cut_is_set_aside_and_the_attach_goes_on() {
     );
 }
 
-/// **A TORN MIRROR PIN AFTER A POWER CUT IS SET ASIDE, AND THE MIRROR RESUMES.**
-/// The pin (`logpin`) holds the
-/// node's alias key and its lifetime total, which no reboot ends, so a torn
-/// one used to be kept and stop the mirror for good. Each now has a durable
-/// copy on the media before each atomic batch pin or send — the key in
-/// `logkey`, before the first take names it; a floor at or above the total
-/// and the batch in `logfloor`. The current version fence is first written durably, before
-/// those copies, and a new open reestablishes it. So the next boot's first
-/// bridge sets a torn pin aside like any torn file
-/// (`crate::state::StateDir::reconcile_logpin`, which also raises a
-/// rolled-back pin's total to the floor), and the mirror resumes. Over the
-/// committed seeds, every world a power cut tore the pin in breaks no law:
-/// not the mirror's completeness, which a torn pin used to excuse; not one
-/// alias key over the node's life; not a total never below what any pin was
-/// written with; not a stop for the pin at any step.
-///
-/// NEGATIVE CONTROLS: the old rule (`Mutant::KeepTornPin`, the torn pin kept)
-/// stops some seed's mirror for its pin, while the same seed's committed world
-/// does not, nor the old rule on a device that never tears — the stop is the
-/// tear's. And WHY THE COPIES: resumed with the key off the pin alone
-/// (`Mutant::KeyInThePinAlone`), some seed's takes name a second alias key;
-/// with the total off the pin alone (`Mutant::TotalInThePinAlone`), some
-/// seed's mirror counts fewer bytes than a pin was written with. The same
-/// seeds' committed worlds break neither.
 #[test]
 fn a_torn_mirror_pin_after_a_power_cut_is_set_aside_and_the_mirror_resumes() {
     let torn: Vec<&Outcome> = committed()
@@ -1386,9 +1008,6 @@ fn a_torn_mirror_pin_after_a_power_cut_is_set_aside_and_the_mirror_resumes() {
         run(&Opts::seed(stopped.seed)).violations.is_empty(),
         "the committed world of the same seed breaks no law"
     );
-    // The stop is the tear's: with the torn pin kept on a device that never
-    // tears, no committed seed's mirror stops for its pin, and the witness
-    // breaks no law at all.
     let untorn = |s| {
         let mut o = keeping(s);
         o.torn_device = false;
@@ -1437,32 +1056,6 @@ fn a_torn_mirror_pin_after_a_power_cut_is_set_aside_and_the_mirror_resumes() {
     }
 }
 
-/// **A GHOST ROW IS RETIRED BY A LATER BRIDGE OF ITS STATE
-/// DIR** ([`super::world`]'s presence oracle). A session that left with nobody
-/// to say so — its tab closed while no bridge ran, its instance gone in a power
-/// cut, or its `exited` row taken by a lossy cut — keeps a `state=live` row.
-/// The sweep used to retire one only from the incarnation that wrote it or the
-/// one whose will it witnessed on the node face, after five minutes of its own
-/// sight; when that bridge died inside the five minutes, every later one was a
-/// stranger to the row, which stood `live` until `aterm fabric doctor
-/// --retire-ghosts`. Over 400 committed seeds, whose kills are far denser than
-/// a desk's, rows left outnumbered rows retired about twenty to one.
-///
-/// Now every session row a bridge writes carries its state dir's MARK
-/// (`crate::state::StateDir::mark`, read off the directory, never stored), and
-/// a later bridge of the dir — the one bridge the dir's lock admits, so every
-/// earlier one is dead — retires the lower incarnations' rows that carry it,
-/// under the rules its own rows are retired by. The oracle demands every ghost row of the dir retired
-/// once settled when written in the same boot. A different kernel boot is
-/// deliberately another mark: a cloned machine can repeat device and inode,
-/// so cross-boot ghosts without a witnessed will remain the operator's.
-/// (The first decision, a chain of the incarnations the
-/// dir took, kept on disk, also retired a copy's live rows under a number the
-/// dir took too: [`a_sibling_that_takes_one_of_this_dirs_incarnations_is_never_retired`].)
-///
-/// NEGATIVE CONTROL: the mark unread (`Mutant::ReadNoMark`), some seed leaves
-/// a ghost the running bridge may retire, while the same seed's committed world
-/// does not (`each_rule_switched_off_is_caught`'s row).
 #[test]
 fn a_ghost_row_is_retired_by_a_later_bridge_of_its_state_dir() {
     let same_boot = |seed| Opts {
@@ -1496,20 +1089,6 @@ fn a_ghost_row_is_retired_by_a_later_bridge_of_its_state_dir() {
     );
 }
 
-/// **A SIBLING'S ROW IS RETIRED ONLY BY THE ATTACH THAT WITNESSED ITS WILL**
-/// ([`Opts::with_a_sibling`]). A copy of the state
-/// dir runs a bridge under the same node id: another state dir, so another
-/// mark on its rows. It attaches outranking this node's bridges, carries a
-/// session, and mostly dies; its will fires unless this node outranked it
-/// first. Over the same seeds every law holds, the sibling's row among them:
-/// never retired by a bridge here that did not read its will, and retired by
-/// the running one that did. Both happen: some world ends with the row
-/// standing `live` under a bridge here that outranks it, and some with it
-/// retired.
-///
-/// NEGATIVE CONTROLS (`each_rule_switched_off_is_caught`'s rows): a sweep that
-/// takes every lower incarnation for its own retires the sibling's row; an
-/// attach that records no witnessed will leaves the dead sibling's ghost.
 #[test]
 fn a_siblings_row_is_retired_only_by_the_attach_that_witnessed_its_will() {
     let outs = run_all(&Opts::with_a_sibling, 1..=SIBLING_SEEDS);
@@ -1540,18 +1119,6 @@ fn a_siblings_row_is_retired_only_by_the_attach_that_witnessed_its_will() {
     );
 }
 
-/// **A SIBLING THAT TAKES ONE OF THIS DIR'S INCARNATIONS IS STILL ANOTHER
-/// DIR'S** ([`Opts::with_a_racing_sibling`]). An attach
-/// here takes an incarnation and the broker refuses its will, so nothing of
-/// it reaches the bus; a copy of the state dir, under the same node id, then
-/// reads the node face before the next attach here has presented anything,
-/// takes that very number, and lives on with a session under it. Over the
-/// committed seeds the race happens, and no bridge here ever retires the
-/// sibling's row: it witnessed no will of it, and the number it shares with
-/// one this dir took says nothing about whose rows are under it.
-///
-/// NEGATIVE CONTROL: a sweep that takes every incarnation below its own for
-/// one of this dir's retires the racing sibling's row at some seed.
 #[test]
 fn a_sibling_that_takes_one_of_this_dirs_incarnations_is_never_retired() {
     let outs = run_all(&Opts::with_a_racing_sibling, 1..=SEEDS);
@@ -1587,12 +1154,6 @@ fn a_sibling_that_takes_one_of_this_dirs_incarnations_is_never_retired() {
         out.violations.join("; ")
     );
 
-    // CURRENT incarnation alias: both cloned dirs read the old face before
-    // either presents. A distinct sibling connection registers the same will
-    // and publishes live first. This bridge registers its own will, collides
-    // on its first node publish, closes that connection and fires its own
-    // aliased will over the STILL-LIVE sibling. Its next attach must not take
-    // that numeric incarnation as proof the sibling died.
     let alias = Opts::with_an_aliasing_sibling(1);
     let out = run(&alias);
     assert_eq!(out.stats.sibling_alias_collided, 1, "{}", report(&out));
@@ -1629,12 +1190,6 @@ fn a_sibling_that_takes_one_of_this_dirs_incarnations_is_never_retired() {
     );
 }
 
-/// THE BROKER ARM, ON ITS OWN: over random histories of publishes and
-/// escalated records at every tier, the cuts a restart may keep are exactly
-/// the ones astream's law admits — every kept prefix from the durable head up
-/// on a weak tier's power loss, the whole log otherwise — every cut drawn
-/// passes the law check, and each of the arm's own defects is caught by the
-/// property it breaks.
 #[test]
 fn the_broker_arm_cuts_exactly_what_the_law_allows() {
     let mut rng = Rng::new(0xa57e);
@@ -1663,7 +1218,6 @@ fn the_broker_arm_cuts_exactly_what_the_law_allows() {
             let s = broker.state.lock().expect("state");
             (s.allowed_cuts(stop), s.durable, s.log.len() as u64)
         };
-        // The law's own answer, from first principles.
         let admitted: Vec<u64> = match (stop, tier) {
             (Stop::PowerLoss, Tier::Ordered | Tier::Relaxed) => (durable..=head).collect(),
             _ => vec![head],
@@ -1684,7 +1238,6 @@ fn the_broker_arm_cuts_exactly_what_the_law_allows() {
         weak_losses > 10,
         "the arm lost acked suffixes {weak_losses} times"
     );
-    // Each defect of the arm is caught.
     for (mutant, tier, law) in [
         (ArmMutant::CutBelowDurable, Tier::Ordered, "P3"),
         (ArmMutant::LoseWithoutMove, Tier::Relaxed, "P4"),
@@ -1710,7 +1263,6 @@ fn the_broker_arm_cuts_exactly_what_the_law_allows() {
         }
         assert!(caught, "{mutant:?} is never caught breaking {law}");
     }
-    // An emptied table loses an escalated record the oracle protects.
     let mut caught = false;
     for _ in 0..200 {
         let broker = bus::Broker::new(Tier::Relaxed, Escalation::none());
@@ -1733,11 +1285,6 @@ fn the_broker_arm_cuts_exactly_what_the_law_allows() {
     );
 }
 
-/// THE DEVICE, ON ITS OWN: a durable replace survives every power cut; an
-/// atomic-only replace survives as its old version or a newer whole one; a
-/// directory flush keeps an unlink; the lossless control keeps everything;
-/// and a torn device can leave an unflushed replace cut short — to nothing,
-/// or part-way — and only a torn device does.
 #[test]
 fn the_device_keeps_a_durable_write_and_may_roll_back_the_rest() {
     use crate::fx::Write;
@@ -1748,8 +1295,6 @@ fn the_device_keeps_a_durable_write_and_may_roll_back_the_rest() {
     let root = dir.path();
     let sub = root.join("sub");
     std::fs::create_dir_all(&sub).expect("a subdirectory");
-    // `gone` lives in a directory of its own: flushing that directory keeps
-    // its unlink, and says nothing of `seq`'s unflushed replace.
     let (node, seq, gone) = (root.join("node"), root.join("seq"), sub.join("gone"));
     let mut seen_old = false;
     let mut seen_new = false;
@@ -1810,13 +1355,6 @@ fn the_device_keeps_a_durable_write_and_may_roll_back_the_rest() {
     assert_eq!(std::fs::read(&seq).expect("seq"), b"3\n");
 }
 
-/// A DURABLE REPLACE FLUSHES ITS DIRECTORY FOR EVERY ENTRY IN IT, as the state
-/// dir's `replace_bytes` does (`sync_dir(parent)`): `clear_halt_acked`'s unlink
-/// followed by `set_halts`' durable write is kept by every power cut, and so is
-/// a rename made before it — but not an append's data after its file's newest
-/// entry change, which a directory flush does not write, nor anything in
-/// another directory. Before the device modelled it, a cut offered the
-/// unlinked file back: more loss than the contract allows.
 #[test]
 fn a_durable_replace_flushes_its_directory_for_its_siblings() {
     use crate::fx::Write;
@@ -1890,20 +1428,6 @@ fn a_durable_replace_flushes_its_directory_for_its_siblings() {
     assert!(entry_lost, "a write in another directory was never lost");
 }
 
-/// AN ORDERED WRITE REACHES THE MEDIA BEFORE EVERY LATER ONE — the device's
-/// flush points, on their own (`aterm_durable::ordered`'s contract: "A site
-/// may use this for 'A persists before B' on one device only after flushing
-/// every descriptor that phase A depends on, including directory
-/// publications"). A file `a` written with no flush, then the clean stop's
-/// shape: `a` flushed where it is by the barrier, its directory's barrier,
-/// the record `r` replaced, its bytes flushed by the barrier before its
-/// rename — and the cut may land after any of them.
-/// Wherever the record's new version is on the media, so is `a`'s, whole.
-/// And the cut is real: both of `r`'s versions are drawn, and `a` torn or
-/// old. NEGATIVE CONTROL: without the directory's barrier, `a`'s rename is
-/// ordered by nothing, and a cut leaves the new record over an old or torn
-/// `a` — the order the barrier exists for. A full flush at the end puts all
-/// of it on the media.
 #[test]
 fn an_ordered_write_reaches_the_media_before_every_later_one() {
     use crate::fx::Write;
@@ -1935,7 +1459,6 @@ fn an_ordered_write_reaches_the_media_before_every_later_one() {
                 });
             };
             replace(&a, b"a1\n", None);
-            // The stop, cut short after `steps` of its writes.
             let steps = round % 5;
             if steps >= 1 {
                 device.journal(Write::Flush {
@@ -1995,26 +1518,6 @@ fn an_ordered_write_reaches_the_media_before_every_later_one() {
     }
 }
 
-/// **A CLEAN STOP KEEPS THE RUN'S FILES EXACTLY, WHEREVER A KILL AND A POWER
-/// CUT LAND** (sim item S6: the clean stop ordered by the barrier, ended by
-/// one full flush). A run of boot 1 writes, with no flush, a file of every
-/// kind a power cut may tear — an in-flight entry, a reservation written
-/// twice, a receipt's, a key's, a refill floor — clears a second in-flight
-/// entry (an unlink nothing flushed), and writes the mirror's pin twice (the
-/// first write durable, the second not, as a bridge of this build writes
-/// it). Its clean stop ([`crate::state::StateDir::end_run_clean`]) is killed
-/// at its `k`-th write, or not at all, and the machine then loses power on a
-/// tearing device. In boot 2, wherever `run` says the run stopped cleanly,
-/// every one of those files holds exactly what the run left: none torn, none
-/// rolled back to an older version or to nothing, and the cleared entry not
-/// back — so damage after a clean stop stays a bug's, refused where it is
-/// read and never a power cut's, and a clean stop keeps every unlink. The law is exercised: clean
-/// records and open ones are both drawn, and an open one over files the cut
-/// changed (the next boot's sweep is that one's). NEGATIVE CONTROLS
-/// ([`crate::state::StopRules`]): the record written first, the directories
-/// left unflushed, and the files left unflushed — each leaves a clean record
-/// over files the cut changed, at some seed, where its sweep stops (all three
-/// were at seed 1, within 17 of the 744 kill points the law's own sweep takes).
 #[test]
 fn a_clean_stop_keeps_the_runs_files_exactly_under_its_record() {
     use crate::state::{StateDir, StopRules};
@@ -2106,29 +1609,6 @@ fn a_clean_stop_keeps_the_runs_files_exactly_under_its_record() {
     }
 }
 
-/// **AN OPEN ORDERED BY THE BARRIER KEEPS A CLEAN RECORD TRUE, WHEREVER A
-/// KILL AND A POWER CUT LAND** (B07: [`crate::state::StateDir::begin_run`]
-/// orders its OPEN by two barriers, the record's temp and the root, where it
-/// flushed both in full). A run of boot 1 writes a file of every kind a power
-/// cut may tear and stops cleanly. A second process then starts a run — in
-/// the same boot, over that clean stop (two full flushes), or in boot 2, over
-/// an earlier boot's (two barriers) — killed at each of its writes, between
-/// its rename and its root's barrier among them (the visible OPEN its
-/// successor must fence again, 768104f73e), or not at all. Its successor
-/// starts a run in that boot — in full over the second's visible OPEN, which
-/// may hide CLEAN after a failed publication, or by the barrier over an
-/// earlier boot's record where the kill came before the rename — and rewrites
-/// every one of those kinds with no flush, and the machine loses power on a
-/// tearing device. In the boot after, wherever `run` says the last run
-/// stopped cleanly, every one of those files holds exactly what the clean
-/// stop left: none torn, none of the successor's versions, no unlink
-/// undone. The law is exercised: clean records and open ones are both
-/// drawn, open ones over files the cut changed, and the successor's start
-/// ordered by the barrier. NEGATIVE CONTROLS
-/// ([`crate::state::StartRules`], for both starts): the OPEN published
-/// atomically with no flush, and its temp flushed by the barrier with no
-/// barrier on the root after the rename — each leaves a clean record over
-/// files the cut changed, at some seed.
 #[test]
 fn an_open_ordered_by_the_barrier_keeps_a_clean_record_true() {
     use crate::state::{StartRules, StateDir};
@@ -2174,7 +1654,6 @@ fn an_open_ordered_by_the_barrier_keeps_a_clean_record_true() {
                         StateDir::open_on(root, crate::fx::Disk::Sim(process))
                             .expect("the state dir on the device")
                     };
-                    // BOOT 1: a run, stopped cleanly.
                     let first = on(1);
                     first.set_inc_seam(boot(1));
                     first.begin_run().expect("boot 1's run");
@@ -2190,7 +1669,6 @@ fn an_open_ordered_by_the_barrier_keeps_a_clean_record_true() {
                             "a clean stop keeps its files across a reboot"
                         );
                     }
-                    // A SECOND PROCESS'S START, killed at its `kill_at`-th step.
                     let second = on(2);
                     second.set_inc_seam(boot(b));
                     if kill_at > 0 {
@@ -2209,8 +1687,6 @@ fn an_open_ordered_by_the_barrier_keeps_a_clean_record_true() {
                     }
                     core.disarm_kill();
                     drop(second);
-                    // ITS SUCCESSOR, in the same boot: a start, then every
-                    // torn kind rewritten with no flush.
                     let successor = on(3);
                     successor.set_inc_seam(boot(b));
                     let began = successor
@@ -2255,12 +1731,6 @@ fn an_open_ordered_by_the_barrier_keeps_a_clean_record_true() {
     }
 }
 
-/// Every file kind a power cut may tear written AGAIN, as a run after a clean
-/// stop writes them, with no flush and none of the mirror's pin (whose first
-/// write in a StateDir open is durable, a full flush that would settle the
-/// start's order on its own): a new in-flight entry and an unlink of the
-/// clean stop's, a reservation rewritten, a second receipt's, a second key's
-/// and a refill floor rewritten.
 fn rewrite_every_torn_kind(st: &crate::state::StateDir) {
     let pin = |seq| crate::state::PublishPin {
         seq,
@@ -2291,30 +1761,6 @@ fn rewrite_every_torn_kind(st: &crate::state::StateDir) {
     .expect("a refill floor rewritten");
 }
 
-/// **A DURABLE WRITE WHOSE FLUSH FAILED AFTER ITS RENAME IS NOT TRUSTED, AND
-/// IS WRITTEN AGAIN** (sim item S7). Its new version is what every reader of
-/// the dir sees, and the media may still hold the one before it; a write
-/// skipped because the file already reads as wanted would leave it so. On the
-/// simulated device, with the directory flush of exactly one replace failing:
-///
-/// * `run`: the start's record reads as this boot's run and is not taken for
-///   one (main's per-open admission, `StateDir::begin_run`'s run fence), and
-///   the next `begin_run` writes it again in full over this boot's visible
-///   OPEN — where after a record that finished it writes
-///   nothing (the control: the rewrite is the failure's);
-/// * `logfloor`: a floor raised with its flush failed covers no batch
-///   (`StateDir::logfloor_admitted`), and a raise to below it writes it again,
-///   as it stands; after that, a raise to below it writes nothing. A fresh
-///   open admits no floor it did not write — a killed predecessor's failed
-///   flush looks the same — and its first raise writes it again. And the
-///   media holds it: a power cut keeps the floor every batch was sent under.
-///   NEGATIVE CONTROL: the floor trusted as it reads
-///   (`StateDir::raise_logfloor_trusting_what_reads`) writes nothing after
-///   the failed raise, and the power cut may take it back.
-/// * `pins`: a first sight whose flush failed reads, and the route that reads
-///   it writes the table again (`StateDir::settle_pins`), once; a power cut
-///   then keeps the pin. NEGATIVE CONTROL: routed on as it reads (nothing
-///   written), some cut takes the first sight back.
 #[test]
 fn a_durable_write_whose_flush_failed_is_not_trusted_and_is_written_again() {
     use crate::state::{StateDir, LOGFLOOR};
@@ -2337,7 +1783,6 @@ fn a_durable_write_whose_flush_failed_is_not_trusted_and_is_written_again() {
         st.set_inc_seam(boot(1));
         (core, st)
     };
-    // THE RUN RECORD.
     let dir = aterm_tempfile::Builder::new()
         .prefix("sim-s7-run")
         .tempdir_in("/tmp")
@@ -2365,8 +1810,6 @@ fn a_durable_write_whose_flush_failed_is_not_trusted_and_is_written_again() {
         crate::state::Flushed::default(),
         "CONTROL: a record that finished is not written again"
     );
-    // A refused required directory barrier, or any other failure after the
-    // rename, cannot admit a visible floor, even after an earlier success.
     for kind in [
         std::io::ErrorKind::PermissionDenied,
         std::io::ErrorKind::Unsupported,
@@ -2408,8 +1851,6 @@ fn a_durable_write_whose_flush_failed_is_not_trusted_and_is_written_again() {
         assert_eq!(st.raise_logfloor(250).unwrap(), 300);
         assert!(st.logfloor_admitted(), "retry admits the visible floor");
     }
-    // THE MIRROR'S FLOOR: a raise whose flush fails, the raise after it, and
-    // then a power cut — what the floor reads after it.
     let floor_after = |trusting: bool, cut: u64| {
         let dir = aterm_tempfile::Builder::new()
             .prefix("sim-s7-floor")
@@ -2439,7 +1880,6 @@ fn a_durable_write_whose_flush_failed_is_not_trusted_and_is_written_again() {
             let before = st.ops().fsyncs;
             assert_eq!(st.raise_logfloor(60).unwrap(), 100);
             assert_eq!(st.ops().fsyncs, before, "a floor this open made durable");
-            // A FRESH OPEN admits none it did not write.
             let (_fresh_core, fresh) = open(root, 3);
             assert!(!fresh.logfloor_admitted(), "a fresh open admits none");
             let before = fresh.ops().fsyncs;
@@ -2460,8 +1900,6 @@ fn a_durable_write_whose_flush_failed_is_not_trusted_and_is_written_again() {
         (0..32).any(|cut| floor_after(true, cut) != Some(100)),
         "NEGATIVE CONTROL: trusted as it reads, some cut takes the floor back"
     );
-    // A TOFU PIN: a first sight whose flush fails, the route's settle of the
-    // pin it reads (`Bridge::pinned_node_for`), and then a power cut.
     let pin_after = |settle: bool, cut: u64| {
         let dir = aterm_tempfile::Builder::new()
             .prefix("sim-s7-pins")
@@ -2503,9 +1941,6 @@ fn a_durable_write_whose_flush_failed_is_not_trusted_and_is_written_again() {
     );
 }
 
-/// A file of every kind a power cut may tear, written as a run writes it —
-/// with no flush: a reservation twice, a second in-flight entry cleared
-/// again, and the mirror's pin twice, its first write durable.
 fn write_every_torn_kind(st: &crate::state::StateDir) {
     let pin = |seq| crate::state::PublishPin {
         seq,
@@ -2547,8 +1982,6 @@ fn write_every_torn_kind(st: &crate::state::StateDir) {
     }
 }
 
-/// Every file of a kind a power cut may tear, and the mirror's pin, as the
-/// directory at `root` holds them now: path inside the dir → bytes.
 fn torn_kinds_as_they_stand(root: &std::path::Path) -> std::collections::BTreeMap<String, Vec<u8>> {
     let mut out = std::collections::BTreeMap::new();
     for place in ["inflight", "sent", "acks", "keys", "unhandled"] {
@@ -2569,11 +2002,6 @@ fn torn_kinds_as_they_stand(root: &std::path::Path) -> std::collections::BTreeMa
     out
 }
 
-/// THE WORLD THAT LOSES POWER BOTH WAYS: the committed world of
-/// `seed`, whose broker's log may lose power ALONE ([`Opts::bus_losses`], a log
-/// on another volume than the state dir, a lossy flush) and whose whole
-/// machine may lose power too ([`Opts::power_cuts`]), whichever device layout
-/// [`Opts::seed`] gives the seed.
 fn both_ways(seed: u64) -> Opts {
     let mut o = Opts::seed(seed);
     o.power_cuts = true;
@@ -2581,9 +2009,6 @@ fn both_ways(seed: u64) -> Opts {
     o
 }
 
-/// The committed world of `seed` ON A CLEAN DISK: the device fails no write
-/// ([`Opts::write_errors`] off), as in every seed before sim item S7 — the
-/// world [`FOUND`]'s seeds were found in, which they replay.
 fn on_a_clean_disk(seed: u64) -> Opts {
     Opts {
         write_errors: false,
@@ -2591,8 +2016,6 @@ fn on_a_clean_disk(seed: u64) -> Opts {
     }
 }
 
-/// [`both_ways`] with the device's write errors on in every seed (sim item
-/// S7, [`Opts::write_errors`]).
 fn both_ways_erring(seed: u64) -> Opts {
     Opts {
         write_errors: true,
@@ -2600,9 +2023,6 @@ fn both_ways_erring(seed: u64) -> Opts {
     }
 }
 
-/// The committed world of `seed` with the device's write errors and aterm's
-/// quits on in every seed ([`Opts::write_errors`], [`Opts::quits`]):
-/// [`every_seed_with_write_errors_holds_every_law`]'s.
 fn erring_quitting(seed: u64) -> Opts {
     Opts {
         write_errors: true,
@@ -2611,8 +2031,6 @@ fn erring_quitting(seed: u64) -> Opts {
     }
 }
 
-/// [`both_ways_erring`] with aterm's quits on too: the lossiest world the
-/// wide search ran.
 fn both_ways_erring_quitting(seed: u64) -> Opts {
     Opts {
         quits: true,
@@ -2620,26 +2038,6 @@ fn both_ways_erring_quitting(seed: u64) -> Opts {
     }
 }
 
-/// **EVERY SEED WITH WRITE ERRORS HOLDS EVERY LAW** (sim item S7): the
-/// committed world of each of [`SEEDS`] seeds with the device's write errors
-/// on in every one ([`Opts::write_errors`]) — `EIO` and `ENOSPC` on a replace's
-/// write, flush or rename, on an append, an unlink and a flush, a durable
-/// replace whose rename was made and whose directory flush failed, an append
-/// cut part-way, and the disk full for spells — and aterm quitting and coming
-/// back now and then ([`Opts::quits`]: the bridge's clean stop, its flushes
-/// and its record, and the start after it, under the same errors) breaks no
-/// law, the settle phase's clean disk healing whatever the faults held up;
-/// and the seeds together failed every kind of write the device fails, and
-/// stopped runs cleanly.
-///
-/// NO LAW IS WEAKER FOR IT. A post whose reservation or in-flight entry the
-/// disk refuses is left queued, never published unjournaled, and goes once
-/// the disk takes the write; a record of ours whose `acked` write or entry
-/// unlink failed is not delivered until both are made; an attach whose
-/// recovery, run record or new log's witness cannot be written does not go
-/// on. Each of those waits for the disk, and LIVENESS is judged on the clean
-/// disk the settle phase runs on: a bridge held up by a full disk is not a
-/// violation, one a later clean disk does not heal is.
 #[test]
 fn every_seed_with_write_errors_holds_every_law() {
     let outs = run_all(&erring_quitting, 1..=SEEDS);
@@ -2689,13 +2087,6 @@ fn every_seed_with_write_errors_holds_every_law() {
     }
 }
 
-/// **THE WORLD THAT LOSES POWER BOTH WAYS BREAKS NO LAW** ([`both_ways`]),
-/// over [`SEEDS`] seeds — held as the committed one is
-/// ([`every_seed_holds_every_law`]): the log loses power on its own, moving
-/// its generation under a running bridge, and the machine loses power too,
-/// rolling the state dir back and ending aterm's sessions — and the seeds
-/// together lost acked records, moved the log, cut the machine's power, set
-/// torn files aside and retired the in-flight entries an earlier boot left.
 #[test]
 fn every_seed_of_the_world_that_loses_power_both_ways_holds_every_law() {
     let outs = run_all(&both_ways, 1..=SEEDS);
@@ -2731,31 +2122,6 @@ fn every_seed_of_the_world_that_loses_power_both_ways_holds_every_law() {
     }
 }
 
-/// **A POST THE LOG LOST STAYS LOST AFTER A LATER POWER
-/// CUT** — never published again out of its sender's order.
-///
-/// In the world that loses power both ways ([`both_ways`]) the log loses, on
-/// its own, a post that had landed and was retired (unescalated: the law
-/// allows it); later posts of the same sender land; then the machine's power
-/// cut rolls the state dir back to before the post's in-flight entry was
-/// removed (an unlink nothing flushed, which aterm-durable's contract lets the
-/// media lose). Republished at the next attach (`Bridge::settle_in_flight`),
-/// on a log whose dedup no longer holds it, it landed again, after the posts
-/// that followed it. Nothing the bridge can read tells that entry from one
-/// whose record never landed — a read of the log carries no producer
-/// sequence, and the same cut rolls back the later post's reservation and
-/// entry — and nothing needs it: the sessions it served ended with the boot.
-/// So the first bridge of a boot after an unclean stop retires every whole
-/// in-flight entry into the quarantine
-/// (`crate::state::StateDir::retire_in_flight_of_an_earlier_boot`).
-///
-/// NEGATIVE CONTROL: the old republish (`Mutant::RepublishInFlightOfAnEarlierBoot`)
-/// breaks the order at some seed of that world, and nothing else, the same way
-/// on a replay; the same seed with the entries retired breaks no law and
-/// retired some. Seed 8 was the first (67 of 1..=2000 broke the order that
-/// way; the test before the decision named 122, the witness it checked first)
-/// until a later bridge of a state dir retired its predecessors' ghosts,
-/// which moved every schedule: 36 since.
 #[test]
 fn a_post_the_log_lost_stays_lost_after_a_later_power_cut() {
     let republishing = |s: u64| both_ways(s).with(Mutant::RepublishInFlightOfAnEarlierBoot);
@@ -2786,16 +2152,6 @@ fn a_post_the_log_lost_stays_lost_after_a_later_power_cut() {
     );
 }
 
-/// **TIER-1 OF `FabricExactlyOnce`** (`aterm-models-session`): every inbox offset the
-/// committed worlds' messages took, followed through the model after every step of
-/// the world ([`super::conform`]) — the real bridge's deliveries and commits, its
-/// kills and relaunches, the broker's moves, the endpoint's dedup and its tell — is a
-/// run of the model, and together the seeds explain their steps with every action
-/// the committed model has.
-///
-/// NEGATIVE CONTROLS: a world whose endpoint keeps no dedup, and one whose endpoint
-/// speaks lane 2 (forgets every offset at any move), each make a round the model
-/// rejects at some seed.
 #[test]
 fn the_round_refines_its_exactly_once_model() {
     let mut opened = 0;
@@ -2820,13 +2176,6 @@ fn the_round_refines_its_exactly_once_model() {
         "{opened} offsets, {checked} steps"
     );
     let model = aterm_models_session::fabric_exactly_once_model();
-    // `CommitEarly` is the defect 2's alone. `DeliverTaken` — a record delivered
-    // after a move took it, before the bridge noticed the move — is rare: the
-    // lossiest layout reaches it (below). So, since aterm-0's loop, is `Reuse`
-    // — a later record at an offset a move took, before anything delivered the
-    // first: seed 122 the first of the committed world's since sim item S7
-    // (248 before it, 236 until aterm-0's review fixes moved every schedule),
-    // none of its first 64 (below).
     for action in model.actions.iter().map(|a| a.name) {
         if matches!(action, "CommitEarly" | "DeliverTaken" | "Reuse") {
             continue;
@@ -2836,10 +2185,6 @@ fn the_round_refines_its_exactly_once_model() {
             "no step of the world was the model's {action}: {fired:?}"
         );
     }
-    // THE LOSSIEST LAYOUT: a Relaxed log that loses power alone under a live
-    // bridge (two devices), the mirror off. The committed rules there deliver a
-    // record a move took (seeds 140 and 224 of 400 before aterm-0, 102 the
-    // first since; none of the committed mix's 400) and break nothing.
     let lossy = |s| {
         let mut o = Opts::seed(s);
         o.power_cuts = false;
@@ -2853,18 +2198,12 @@ fn the_round_refines_its_exactly_once_model() {
     })
     .expect("some run delivered a record a move took");
     assert!(taken.violations.is_empty(), "{}", report(&taken));
-    // `Reuse`, in the committed world itself, past its first 64 seeds (above).
     let reused = witnessed(&Opts::seed, 122, RARE_SEEDS, &|out| {
         out.model.2.contains("Reuse")
     })
     .expect("some committed run put a later record at an offset a move took");
     assert!(reused.violations.is_empty(), "{}", report(&reused));
-    // Rare by nature (seeds 18 and 333 of 400 in this world): a commit owed
-    // through an offset at the very move that takes it, and a later message
-    // at that offset before anything delivers it.
     let composed = breaking_at(
-        // The clamp the composition takes as given: the bridge's owed commit
-        // kept across the move.
         &|s| lossy(s).with(Mutant::KeepOwedCommitAcrossMove),
         "model:",
         18,

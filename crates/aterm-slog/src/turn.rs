@@ -1,81 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The turn tracker (design §2.4): at most one open turn per agent run,
-//! driven by the screen verdict word.
-//!
-//! | Word (detail) | Effect |
-//! |---|---|
-//! | `busy`, no open turn | open a turn, `src=screen conf=strong` |
-//! | `prompt` (`question`) | open a `question` step inside the turn |
-//! | `prompt` (any other kind) | open an `approval box=<kind>` step; leaving `prompt` closes it |
-//! | `wall:<kind>` | open a `wall` step; a wall held through the settle closes the turn `out=wall:<kind>` |
-//! | `wall:unresponsive` | open a `stall` step; it never closes the turn |
-//! | `survey` | open a `survey` step |
-//! | `idle`, held for 1 s | close the turn `out=done` (`interrupted` when the screen said so) |
-//! | `question`, held for 1 s | close the turn `out=asked conf=heuristic` |
-//! | `-` | close the turn `out=gone` |
-//! | `unknown` | nothing: never treated as idle |
-//!
-//! The 1 s settle absorbs the 220 ms mid-answer `idle` measured on Codex. It
-//! is a host-scheduled wake, not a poll: every call returns the monotonic
-//! time the tracker wants [`TurnTracker::tick`] at, and the tracker reads no
-//! clock. A wake may come early (it changes nothing) or late (the next call,
-//! a verdict included, applies the settle first). A settled turn's close is
-//! dated when its resting word first held, so `t=` and `dur_ms` describe
-//! the turn, not the wait.
-//!
-//! A box or dialog seen with no open turn opens one first (`conf=heuristic`:
-//! the busy verdict was missed between samples). A wall or stall seen with
-//! no open turn opens its step on the run (`orphan=1`), and a wall that
-//! closes its turn at rest continues there (`cont=` its step in the turn,
-//! counted once), so its need outlives the turn and closes when the wall
-//! lifts. When the agent leaves (`-`), what it had open closes `out=gone`.
-//!
-//! A `ctl turn` that arrives while the agent rests closes the resting turn
-//! at once (the exchange it starts is the next turn); its `ledger=` labels
-//! only a turn that opens within [`ATTRIBUTION_MS`] attributed to its
-//! sender.
-//!
-//! **The transcript join (phase 3B).** The vendor's transcript drives the
-//! same tracker through ONE method, [`TurnTracker::transcript`] (the join and the wall judge never write to the log themselves),
-//! with
-//! typed [`TxEvent`]s that hold no text (an id, a tool's name, numbers):
-//! a prompt confirms the screen's turn (`amend vref=`) or, when the screen
-//! missed it, opens the vendor turn's own; `tool_use` opens `tool` and
-//! `subagent` steps under it; a result closes them; a turn end closes the
-//! turn when no screen step holds it open (and amends `vdur_ms tok_in
-//! tok_out` after); the wall judge confirms (`confirmed=1`) or
-//! retracts the screen's wall. Every record is `src=transcript by=vendor`,
-//! `conf=exact` on a measured Claude Code build ([`TxState::On`]) and
-//! `strong` on another, where it only adds ([`TxState::Partial`]).
-//! Nothing before the first read of a file, the process's start, the run's
-//! open or an adoption is replayed, and nothing at or below the
-//! watermark the join applied through (S23), which the tracker's carry line
-//! keeps across an update (A1).
-//!
-//! **Who dismissed a box.** An approval or question
-//! step closes `out=passed` with `by=` the input bound to it: an input binds
-//! the step open at its ADMISSION ([`TurnTracker::admit`], the host's look
-//! under the lock it already takes before a byte is written), or, when none
-//! was open, the first such step to open within [`STEP_INPUT_LEAD_MS`] of
-//! the admission with no such step closing in between; it is bound once the
-//! host ACCEPTS it ([`TurnTracker::accept`], after the write; a person's
-//! input is both at once, [`TurnTracker::person`]). At the close, the latest
-//! input bound to the step, accepted no more than [`STEP_ACT_MS`] before it,
-//! is the close's `by=`; its `act=` makes `out=approved|declined|answered`
-//! only from a proven author ([`Actor::is_proven`]); a close consumes its
-//! binding, so an input attributes at most one close; and with no bound
-//! input in the bound the close is `by=- out=passed`: it leans toward
-//! attributing nothing rather than wrongly, and when the latest input bound
-//! to the step carried an act it is ORPHANED, named on that close (`act=<w>`
-//! with no `by=`), so a reader counts the acts that dismissed nothing. An
-//! input accepted after its step closed binds nothing ([`Binding::Late`]).
-//! Acceptance is the host's write, never the program's read: a key the
-//! program has not read yet is bound at once, and a close within
-//! [`STEP_ACT_MS`] of it is still credited to it (the bound's limit; a key
-//! the screen outlives by more is the orphan above). None of it is carried:
-//! a successor attributes only inputs it admitted.
+//! The turn tracker (design §2.4): at most one open turn per agent run, driven by the screen verdict word.
 
 use crate::field::{BoundedText, BoundedToken, Fields, Key, Val};
 use crate::log::{Amend, Close, Log, Mark, Open};
@@ -87,19 +13,12 @@ use crate::words::{BoxWord, Out, StepOut, TurnOut, WallKind};
 pub const SETTLE_MS: u64 = 1000;
 /// How recent an input must be to be the turn's `by=` (§2.5).
 pub const ATTRIBUTION_MS: u64 = 5000;
-/// How recent an input's acceptance must be, at an approval or question
-/// step's close, to be the input that dismissed it: at least two
-/// of the host's screen reads (`aterm-gui` pins it at `>= 2 ×` its agent
-/// read interval), so the read that saw the box go is within it.
+/// How recent an input's acceptance must be, at an approval or question step's close, to be the input that dismissed it.
 pub const STEP_ACT_MS: u64 = 500;
-/// How soon after an input's admission, with no approval or question step
-/// open then, the first such step must open for the input to bind it:
-/// the screen read that shows a box can trail the box.
+/// How soon after an input's admission, with no approval or question step open then, the first such step must open for the input to bind it.
 pub const STEP_INPUT_LEAD_MS: u64 = 500;
 
-/// What an input says it means for the step it dismisses (`act=`):
-/// it closes an approval `out=approved|declined`, a question
-/// `out=answered`, only from a proven author.
+/// What an input says it means for the step it dismisses (`act=`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ActWord {
     /// `approve`
@@ -114,8 +33,7 @@ impl ActWord {
     /// Every act word, in wire order.
     pub const ALL: [ActWord; 3] = [ActWord::Approve, ActWord::Deny, ActWord::Answer];
 
-    /// The wire word (an input mark's `act=`, one of
-    /// [`crate::vocab::ACT_WORDS`]).
+    /// The wire word (an input mark's `act=`, one of [`crate::vocab::ACT_WORDS`]).
     #[must_use]
     pub const fn word(self) -> &'static str {
         match self {
@@ -131,9 +49,7 @@ impl ActWord {
         ActWord::ALL.into_iter().find(|a| a.word() == w)
     }
 
-    /// The outcome it gives a step of `what` that it dismissed, `None` for a
-    /// step it does not answer (an approval's act on a question, or the
-    /// reverse).
+    /// The outcome it gives a step of `what` that it dismissed, `None` for a step it does not answer (an approval's act on a question, or the reverse).
     #[must_use]
     pub const fn out_for(self, what: ScreenStep) -> Option<StepOut> {
         match (self, what) {
@@ -145,25 +61,19 @@ impl ActWord {
     }
 }
 
-/// Whether an input accepted at `accepted` is recent enough at a step's
-/// close at `close` to be the input that dismissed it ([`STEP_ACT_MS`]):
-/// THE dismissal bound. An acceptance after the close dismissed nothing.
+/// Whether an input accepted at `accepted` is recent enough at a step's close at `close` to be the input that dismissed it ([`STEP_ACT_MS`]).
 #[must_use]
 pub const fn dismisses(accepted: Stamp, close: Stamp) -> bool {
     close.mono_ms >= accepted.mono_ms && close.mono_ms - accepted.mono_ms <= STEP_ACT_MS
 }
 
-/// Whether a step opened at `opened` is within the lead of an input admitted
-/// at `admitted` ([`STEP_INPUT_LEAD_MS`]): THE lead rule.
+/// Whether a step opened at `opened` is within the lead of an input admitted at `admitted` ([`STEP_INPUT_LEAD_MS`]): THE lead rule.
 #[must_use]
 pub const fn within_lead(admitted: Stamp, opened: Stamp) -> bool {
     opened.mono_ms >= admitted.mono_ms && opened.mono_ms - admitted.mono_ms <= STEP_INPUT_LEAD_MS
 }
 
-/// What the host admitted an input under ([`TurnTracker::admit`]):
-/// the approval or question step open then, when it was admitted, and
-/// how many such steps had opened and closed by then. A token the host holds
-/// from admission to acceptance; it names nothing the log stores.
+/// What the host admitted an input under ([`TurnTracker::admit`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Admission {
     run: Node,
@@ -192,25 +102,20 @@ impl Admission {
 pub enum Binding {
     /// Bound to this open step: its close may be the input's.
     Step(Node),
-    /// Admitted with no step open: it binds the first approval or question
-    /// step to open within the lead, if one does.
+    /// Admitted with no step open: it binds the first approval or question step to open within the lead, if one does.
     Lead,
-    /// Its step closed before it was accepted: it dismissed nothing the
-    /// tracker can say (a late acceptance; the input mark says `re=`).
+    /// Its step closed before it was accepted: it dismissed nothing the tracker can say (a late acceptance; the input mark says `re=`).
     Late(Node),
     /// Nothing: no step, and the lead is past or broken.
     Unbound,
 }
 
-/// What the tracker holds of the inputs bound to its steps, for
-/// a conformance projection or a debugger.
+/// What the tracker holds of the inputs bound to its steps, for a conformance projection or a debugger.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AttributionView {
-    /// The latest input bound to the open approval or question step: the
-    /// step, its author, its act and when it was accepted.
+    /// The latest input bound to the open approval or question step: the step, its author, its act and when it was accepted.
     pub bound: Option<(Node, Actor, Option<ActWord>, Stamp)>,
-    /// An accepted input waiting on the lead: its author, act, admission and
-    /// acceptance stamps, and the opens and closes counted at its admission.
+    /// An accepted input waiting on the lead.
     pub lead: Option<(Actor, Option<ActWord>, Stamp, Stamp, u64, u64)>,
     /// Approval and question steps opened so far.
     pub opens: u64,
@@ -242,9 +147,7 @@ pub enum Verdict {
 }
 
 impl Verdict {
-    /// The verdict a published agent word and detail name
-    /// (`AgentPublication::word`/`detail`): `prompt`'s detail is its box,
-    /// a wall kind this crate does not know reads `unknown`.
+    /// The verdict a published agent word and detail name (`AgentPublication::word`/`detail`).
     #[must_use]
     pub fn from_agent_word(word: &str, detail: Option<&str>) -> Verdict {
         match word {
@@ -334,8 +237,7 @@ pub enum SettleCause {
     Survey,
 }
 
-/// The outcome and confidence a settle closes its turn with: THE settle
-/// policy.
+/// The outcome and confidence a settle closes its turn with: THE settle policy.
 #[must_use]
 pub const fn settle_out(cause: SettleCause, interrupted: bool) -> (TurnOut, Conf) {
     match cause {
@@ -352,19 +254,13 @@ pub const fn settle_out(cause: SettleCause, interrupted: bool) -> (TurnOut, Conf
     }
 }
 
-/// Whether a resting word seen at `since_mono` has held long enough at
-/// `now_mono` to close the turn: THE settle rule.
+/// Whether a resting word seen at `since_mono` has held long enough at `now_mono` to close the turn: THE settle rule.
 #[must_use]
 pub const fn settle_due(since_mono: u64, now_mono: u64) -> bool {
     now_mono >= since_mono.saturating_add(SETTLE_MS)
 }
 
-/// Whether an input at `input` is recent enough at `now` to be the opening
-/// turn's `by=` (§2.5), by BOTH clocks: in one process they agree, and a
-/// stamp carried across a seamless update keeps its wall time while its
-/// monotonic one can only be clamped to the successor's clock start (which
-/// would make an old input look recent). A wall clock stepped forward fails
-/// closed; one stepped back leaves the monotonic clock to decide.
+/// Whether an input at `input` is recent enough at `now` to be the opening turn's `by=` (§2.5), by BOTH clocks.
 #[must_use]
 pub const fn attributes(input: Stamp, now: Stamp) -> bool {
     now.mono_ms >= input.mono_ms
@@ -372,10 +268,7 @@ pub const fn attributes(input: Stamp, now: Stamp) -> bool {
         && now.wall_ms.saturating_sub(input.wall_ms) <= ATTRIBUTION_MS
 }
 
-/// `s`, read in another process, on this process's clocks at `now`: its
-/// wall time kept, its monotonic time moved by the wall age (clamped to this
-/// clock's start; a settle so moved comes due later, never earlier, and an
-/// attribution is judged by the wall too, [`attributes`]).
+/// `s`, read in another process, on this process's clocks at `now`.
 #[must_use]
 pub const fn rebase(wall_ms: u64, now: Stamp) -> Stamp {
     Stamp::new(
@@ -398,7 +291,6 @@ const fn screen_step_word(w: ScreenStep) -> &'static str {
 
 impl Settle {
     /// Whether it is due at `now_mono`: [`settle_due`] of its `since` in one
-    /// process, the wall clock's deadline for a carried one.
     const fn is_due(self, now_mono: u64) -> bool {
         now_mono >= self.due_mono
     }
@@ -442,7 +334,6 @@ struct Held {
 }
 
 /// Whether a screen step of `what` is one an input binds (T1): an approval
-/// box or the question dialog.
 const fn binds(what: ScreenStep) -> bool {
     matches!(what, ScreenStep::Approval(_) | ScreenStep::Question)
 }
@@ -457,7 +348,6 @@ struct Bound {
 }
 
 /// An accepted input admitted with no step open, waiting for the lead's
-/// first step (T1).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Lead {
     by: Actor,
@@ -469,19 +359,13 @@ struct Lead {
 }
 
 /// An armed settle: the resting word, and the host's stamp when it first
-/// held (the close is dated there; the decision waits for [`SETTLE_MS`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Settle {
     since: Stamp,
     cause: SettleCause,
     /// Elapsed time not represented by the deadline's local origin: before
-    /// monotonic zero, or older than a deadline already due at adoption.
-    /// Zero for a local settle or a carried future origin.
     prior_ms: u64,
     /// When it comes due, on this process's monotonic clock: `since` plus
-    /// [`SETTLE_MS`] ([`settle_due`]), or, for a settle carried across an
-    /// update, when the wall clock says it does (its `since` is another
-    /// process's, its monotonic part clamped).
     due_mono: u64,
 }
 
@@ -498,8 +382,7 @@ pub struct LastClose {
     pub settled_ms: Option<u64>,
     /// Whether a `ctl turn` closed it while it rested, before its settle.
     pub ctl: bool,
-    /// Whether the transcript closed it (its vendor turn's end, or a newer
-    /// vendor turn superseding it): [`TurnTracker::transcript`].
+    /// Whether the transcript closed it (its vendor turn's end, or a newer vendor turn superseding it): [`TurnTracker::transcript`].
     pub tx: bool,
 }
 
@@ -508,8 +391,7 @@ pub struct LastClose {
 pub struct TrackerView {
     /// The open turn.
     pub turn: Option<Node>,
-    /// The screen step held open, its kind and whether it hangs from the
-    /// turn (or from the run).
+    /// The screen step held open, its kind and whether it hangs from the turn (or from the run).
     pub step: Option<(Node, ScreenStep, bool)>,
     /// The current word.
     pub word: Verdict,
@@ -529,12 +411,8 @@ pub struct TurnTracker {
     settle: Option<Settle>,
     interrupted: bool,
     /// A `ctl turn`'s ledger id, its sender, when it arrived and what it
-    /// said it acted on (`cause=`): it labels the next turn only when that
-    /// turn opens within [`ATTRIBUTION_MS`] and is attributed to the same
-    /// sender.
     pending_ledger: Option<(u64, Actor, Stamp, Option<ShortId>)>,
     /// The latest input: its sender, when it came, and the mail or record it
-    /// said it acted on (`cause=`, phase 3A), which the turn it opens names.
     last_input: Option<(Actor, Stamp, Option<ShortId>)>,
     last_close: Option<LastClose>,
     /// The transcript join (phase 3B).
@@ -544,8 +422,6 @@ pub struct TurnTracker {
     /// An accepted input waiting on the lead (T1).
     lead: Option<Lead>,
     /// Approval and question steps opened, and closed or forgotten, in this
-    /// process (T1: a lead binds only the first to open, with none closing
-    /// between).
     opens: u64,
     closes: u64,
 }
@@ -590,13 +466,7 @@ impl TurnTracker {
         self.settle.map(|s| s.due_mono)
     }
 
-    /// The published verdict moved to `v` (with its detail: a wall's reset,
-    /// kept on the wall step as `detail=`). Returns when to tick.
-    ///
-    /// A settle that came due before this call (the host's wake ran late)
-    /// is applied first: its resting word did hold, so its turn closes
-    /// before `v` is read, and a `busy` then opens the next turn instead of
-    /// merging two exchanges.
+    /// The published verdict moved to `v` (with its detail: a wall's reset, kept on the wall step as `detail=`).
     pub fn observe(
         &mut self,
         log: &mut Log,
@@ -614,14 +484,10 @@ impl TurnTracker {
         }
         self.word = v;
         self.settle = None;
-        // A refuted wall stays shut until the screen's word moves (S2).
         self.tx.refuted = None;
         match v {
             Verdict::Unknown => return None,
             Verdict::Gone => {
-                // The agent left: the turn closes `out=gone`, its cascade
-                // closing a step under it `out=gone`; a step on the run goes
-                // the same way. Nothing "passed".
                 self.close_turn(log, TurnOut::Gone, Conf::Strong, None, false, at);
                 if self.step.is_some() {
                     self.close_step(log, StepOut::Gone, at);
@@ -673,35 +539,26 @@ impl TurnTracker {
         self.wake_at()
     }
 
-    /// The host's wake, at any time: close the turn when its resting word
-    /// has held for [`SETTLE_MS`] ([`settle_due`]); an early wake changes
-    /// nothing. Returns when to tick next.
+    /// The host's wake, at any time: close the turn when its resting word has held for [`SETTLE_MS`] ([`settle_due`]).
     pub fn tick(&mut self, log: &mut Log, at: Stamp) -> Option<u64> {
         self.resync(log);
         self.settle_if_due(log, at);
         self.wake_at()
     }
 
-    /// The screen reported the turn interrupted
-    /// (`aterm_phase::turn::interrupted`): its idle close is
-    /// `out=interrupted`.
-    pub fn note_interrupted(&mut self) {
+    /// The screen reported the turn interrupted (`aterm_phase::turn::interrupted`): its idle close is `out=interrupted`.
+    pub const fn note_interrupted(&mut self) {
         if self.turn.is_some() {
             self.interrupted = true;
         }
     }
 
-    /// Input from `by` reached the session: a turn opening within
-    /// [`ATTRIBUTION_MS`] is attributed to it. Input from anyone else drops
-    /// a pending `ctl turn` ledger: the turn it opens is not that exchange.
+    /// Input from `by` reached the session: a turn opening within [`ATTRIBUTION_MS`] is attributed to it.
     pub fn note_input(&mut self, by: Actor, at: Stamp) {
         self.note_input_caused(by, None, at);
     }
 
-    /// [`Self::note_input`] of input that said what it acted on (`cause=@<off>`
-    /// for mail, `cause=<seq>` for a record, validated by the host): a turn it
-    /// opens carries `cause=` and `cause_k=`. Input from anyone after it
-    /// takes the turn without the cause.
+    /// [`Self::note_input`] of input that said what it acted on (`cause=@<off>` for mail, `cause=<seq>` for a record, validated by the host).
     pub fn note_input_caused(&mut self, by: Actor, cause: Option<ShortId>, at: Stamp) {
         if self.pending_ledger.is_some_and(|(_, who, ..)| who != by) {
             self.pending_ledger = None;
@@ -709,18 +566,12 @@ impl TurnTracker {
         self.last_input = Some((by, at, cause));
     }
 
-    /// A `ctl turn` exchange (`ledger` is its `TurnLedger` id) from `by`:
-    /// the next turn to open within [`ATTRIBUTION_MS`], attributed to `by`,
-    /// carries `by=` and `ledger=`. When the agent is resting (a settle is
-    /// armed), the exchange starts a new turn, so the resting one closes now
-    /// with its settle's outcome, dated when it came to rest. Returns when
-    /// to tick.
+    /// A `ctl turn` exchange (`ledger` is its `TurnLedger` id) from `by`.
     pub fn ctl_turn(&mut self, log: &mut Log, by: Actor, ledger: u64, at: Stamp) -> Option<u64> {
         self.ctl_turn_caused(log, by, ledger, None, at)
     }
 
-    /// [`Self::ctl_turn`] of an exchange that said what it acted on
-    /// (`turn cause=`): the turn it opens carries `cause=` too.
+    /// [`Self::ctl_turn`] of an exchange that said what it acted on (`turn cause=`): the turn it opens carries `cause=` too.
     pub fn ctl_turn_caused(
         &mut self,
         log: &mut Log,
@@ -739,11 +590,7 @@ impl TurnTracker {
         self.wake_at()
     }
 
-    /// THE ADMISSION of an input the host is about to write at `at`:
-    /// the approval or question step open now, read under the lock the
-    /// host already takes before a byte, so the input can only ever bind the
-    /// step the writer saw, never one the next screen read opens in its
-    /// place.
+    /// THE ADMISSION of an input the host is about to write at `at`.
     #[must_use]
     pub fn admit(&self, at: Stamp) -> Admission {
         Admission {
@@ -755,13 +602,7 @@ impl TurnTracker {
         }
     }
 
-    /// THE ACCEPTANCE of an input admitted as `adm` (its bytes written), from
-    /// `by` with its `act=`, at `at`: it binds the step open at
-    /// its admission while that step is still open (the latest bound input is
-    /// the one a close reads); with none open then, the first approval or
-    /// question step that opened since, within the lead and with none closing
-    /// between, or, when none has yet, the next to open within the lead.
-    /// Admitted under another run (an agent change), it binds nothing.
+    /// THE ACCEPTANCE of an input admitted as `adm` (its bytes written), from `by` with its `act=`, at `at`.
     pub fn accept(
         &mut self,
         log: &Log,
@@ -784,8 +625,6 @@ impl TurnTracker {
         if self.closes != adm.closes {
             return Binding::Unbound;
         }
-        // An admission this tracker did not count from (a predecessor's)
-        // binds nothing.
         match self.opens.checked_sub(adm.opens) {
             Some(0) if at.mono_ms.saturating_sub(adm.at.mono_ms) <= STEP_INPUT_LEAD_MS => {
                 self.lead = Some(Lead {
@@ -810,16 +649,7 @@ impl TurnTracker {
         }
     }
 
-    /// A PERSON's input at `at` (delivery): admitted and accepted
-    /// at once (the host counts a person's key before it reaches the
-    /// program), binding the approval or question step open now, or, with
-    /// none open, leading as any input does (T1): the first such step to open
-    /// within [`STEP_INPUT_LEAD_MS`], with none closing between, is the one
-    /// it dismisses. It is the latest input, so it takes the lead from an
-    /// acted input waiting on it: a person's key just before the box shows
-    /// is never lost to a harness act admitted before it (T2). A person's
-    /// input carries no act: the step it dismisses closes `by=human
-    /// out=passed`.
+    /// A PERSON's input at `at` (delivery).
     pub fn person(&mut self, log: &Log, at: Stamp) -> Binding {
         self.resync(log);
         match self.step.as_ref() {
@@ -867,15 +697,7 @@ impl TurnTracker {
         }
     }
 
-    // ---- the seamless carry ------------------------------------------
-
-    /// The tracker as one carry line (design §5.2, phase 2A): its run, turn
-    /// and screen step, the current word, an armed settle (its cause and the
-    /// wall time its word first held), whether the turn was interrupted, and
-    /// a pending `ctl turn` ledger and the last input, each with its wall
-    /// time. An input or ledger older than [`ATTRIBUTION_MS`] at `now` is
-    /// left out: it can attribute nothing any more. The last close (a
-    /// view's) does not cross.
+    /// The tracker as one carry line (design §5.2, phase 2A).
     #[must_use]
     pub fn carry_line(&self, now: Stamp) -> String {
         let mut s = format!(
@@ -908,10 +730,6 @@ impl TurnTracker {
                 }
                 _ => {}
             }
-            // As the step's own `detail=` field holds it (a token of at most
-            // its key's bytes), so the line stays within a carry line's bound
-            // whatever the screen said, and a step it continues writes the
-            // same field.
             if let Some(d) = h
                 .detail
                 .as_deref()
@@ -955,10 +773,7 @@ impl TurnTracker {
         s
     }
 
-    /// The tracker a [`TurnTracker::carry_line`] wrote, on this process's
-    /// clocks at `now` ([`rebase`]): `None` for a line this build does not
-    /// read. An input or ledger older than [`ATTRIBUTION_MS`] by the wall
-    /// clock at `now` is dropped (fail closed: it attributes nothing).
+    /// The tracker a [`TurnTracker::carry_line`] wrote, on this process's clocks at `now` ([`rebase`]).
     #[must_use]
     pub fn from_carry_line(line: &str, now: Stamp) -> Option<TurnTracker> {
         let mut toks = line.split(' ').filter(|t| !t.is_empty());
@@ -1028,8 +843,6 @@ impl TurnTracker {
             }
         };
         let fresh = |w: u64| now.wall_ms.saturating_sub(w) <= ATTRIBUTION_MS;
-        // A cause is additive (phase 3A): absent on a 2A line; one that does
-        // not read as an id refuses the line, as any malformed value does.
         let cause = |k: &str| -> Option<Option<ShortId>> {
             match get(k) {
                 None => Some(None),
@@ -1065,8 +878,6 @@ impl TurnTracker {
             last_input,
             last_close: None,
             tx: TxJoin::from_carry(&get, now),
-            // Nothing of an input's binding crosses: a successor
-            // attributes only inputs it admitted.
             bound: None,
             lead: None,
             opens: 0,
@@ -1074,10 +885,7 @@ impl TurnTracker {
         })
     }
 
-    // ---- internals ---------------------------------------------------
-
     /// Forget a turn or step the log no longer holds open (the run closed,
-    /// a supersede, a cascade).
     fn resync(&mut self, log: &Log) {
         if self.turn.is_some_and(|t| !log.is_open(t)) {
             self.turn = None;
@@ -1090,8 +898,6 @@ impl TurnTracker {
     }
 
     /// The held step is gone (closed by this tracker, a cascade or a
-    /// supersede): a bound input's step closed with it, so its binding is
-    /// spent; a close counts against every lead.
     fn forget_step(&mut self) {
         if let Some(h) = self.step.take()
             && binds(h.what)
@@ -1103,8 +909,7 @@ impl TurnTracker {
     }
 
     /// Bind the input from `by` (its `act`, accepted at `at`) to the open
-    /// step `node`: the latest bound input is the one the close reads.
-    fn bind_input(&mut self, node: Node, by: Actor, act: Option<ActWord>, at: Stamp) {
+    const fn bind_input(&mut self, node: Node, by: Actor, act: Option<ActWord>, at: Stamp) {
         self.bound = Some(Bound {
             node,
             by,
@@ -1115,10 +920,6 @@ impl TurnTracker {
     }
 
     /// The close of the held step `h` at `at` (T1): `by=` the latest input
-    /// bound to it, accepted within [`STEP_ACT_MS`] before; its act's
-    /// outcome from a proven author; else `by=- out=passed`, with the act
-    /// of a latest bound input that dismissed nothing (accepted earlier: an
-    /// ORPHANED act, the third return, which the close names).
     fn attribution_of(&self, h: &Held, at: Stamp) -> (Actor, StepOut, Option<ActWord>) {
         match self.bound.filter(|b| b.node == h.node) {
             Some(b) if dismisses(b.accepted, at) => (
@@ -1135,7 +936,6 @@ impl TurnTracker {
     }
 
     fn arm(&mut self, cause: SettleCause, at: Stamp) {
-        // THE settle rule: due once `settle_due(since, now)` holds.
         let due_mono = at.mono_ms.saturating_add(SETTLE_MS);
         debug_assert!(settle_due(at.mono_ms, due_mono) && !settle_due(at.mono_ms, due_mono - 1));
         self.settle = Some(Settle {
@@ -1156,15 +956,6 @@ impl TurnTracker {
     }
 
     /// Close the turn as settle `s` says ([`settle_out`]), decided at `now`
-    /// and dated at `s.since`, when the resting word first held: `t=` and
-    /// `dur_ms` say when the turn ended, not when the wait for it did —
-    /// but never before a child of the turn opened or closed
-    /// ([`tx_close_at`]): a transcript step dated after the rest (a call's
-    /// result written as the screen rested, applied before the settle came
-    /// due) is closed by the turn's cascade no earlier than it opened. A
-    /// wall outlives its turn: it continues on the run (`cont=` the turn's
-    /// wall step, counted once), so its need holds until the wall lifts.
-    /// `ctl`: a `ctl turn` decided it, before the settle came due.
     fn settle_now(&mut self, log: &mut Log, s: Settle, now: Stamp, ctl: bool) {
         self.settle = None;
         let (out, conf) = settle_out(s.cause, self.interrupted);
@@ -1189,10 +980,6 @@ impl TurnTracker {
         let Some(node) = self.open_turn(log, Src::Screen, conf, Fields::new(), at) else {
             return;
         };
-        // A vendor turn whose prompt was read while no screen turn was
-        // open (the footer's read beat the screen's busy word, a partial
-        // build: [`Self::tx_prompt`]) is this turn's when its prompt came
-        // within the attribution window of the open: it takes `vref=`.
         if let Some(v) = self
             .tx
             .cur
@@ -1208,9 +995,6 @@ impl TurnTracker {
             });
             return;
         }
-        // The vendor turn the screen's settle closed is still running (no
-        // turn end or interrupt read): the screen's new turn continues it
-        // (§2.5, `cont=`), and the vendor turn maps to it.
         if let Some(v) = self.tx.cur.filter(|v| v.end_ms.is_none())
             && let Some(prev) = v.node.filter(|n| !log.is_open(*n))
             && let Some(conf) = self.tx.state.and_then(TxState::conf)
@@ -1229,8 +1013,6 @@ impl TurnTracker {
     }
 
     /// Open the run's turn from `src` at `conf` with `extra` fields: its
-    /// `by=` the input attributed to it, a `ledger=` its exchange's, its
-    /// input's `cause=`.
     fn open_turn(
         &mut self,
         log: &mut Log,
@@ -1241,8 +1023,6 @@ impl TurnTracker {
     ) -> Option<Node> {
         let attributed = self.last_input.filter(|(_, t, _)| attributes(*t, at));
         let by = attributed.map_or(Actor::Nobody, |(a, ..)| a);
-        // A ledger labels only the turn its exchange opened: recent, and
-        // attributed to its sender.
         let ledger = self
             .pending_ledger
             .filter(|(_, who, t, _)| *who == by && attributes(*t, at))
@@ -1251,8 +1031,6 @@ impl TurnTracker {
         if let Some(ledger) = ledger {
             let _ = f.set(Key::Ledger, Val::U(ledger));
         }
-        // The attributed input's `cause=` (phase 3A): the turn names the mail
-        // or record its opening input said it acted on.
         if let Some(c) = attributed.and_then(|(.., c)| c)
             && let Ok(caused) = f.clone().cause(c.as_str())
         {
@@ -1314,8 +1092,6 @@ impl TurnTracker {
             });
             if binds(what) {
                 // An accepted input waiting on the lead binds the first
-                // approval or question step to open within it, with none
-                // closing between (T1).
                 if let Some(l) = self.lead.take()
                     && l.opens == self.opens
                     && l.closes == self.closes
@@ -1332,16 +1108,11 @@ impl TurnTracker {
         if let Some(h) = self.step.as_ref()
             && log.is_open(h.node)
         {
-            // Who dismissed it (T1): a step the screen moved past, never one
-            // the agent's leaving took.
             let (by, out, orphan) = if out == StepOut::Passed && binds(h.what) {
                 self.attribution_of(h, at)
             } else {
                 (Actor::Nobody, out, None)
             };
-            // An orphaned act is named on the close it did not make
-            // (`act=<w>`, no `by=`): the step closed outside the act's
-            // bound, so the act dismissed nothing anyone can say.
             let f = orphan
                 .and_then(|a| Fields::new().word(Key::Act, a.word()).ok())
                 .unwrap_or_default();
@@ -1370,8 +1141,6 @@ impl TurnTracker {
     }
 
     /// Close the open turn with `close` (outcome `out`), as the last close
-    /// (`how`: how long its resting word held, whether a `ctl turn` or the
-    /// transcript closed it).
     fn close_turn_with(
         &mut self,
         log: &mut Log,
@@ -1403,19 +1172,10 @@ impl TurnTracker {
     }
 }
 
-// ---- the transcript join (phase 3B) -------------------------------------
-
-/// The most transcript steps one turn holds open at once: a
-/// ninth parallel tool call is counted `dropped=`, never opened.
+/// The most transcript steps one turn holds open at once: a ninth parallel tool call is counted `dropped=`, never opened.
 pub const TX_TOOLS_MAX: usize = 8;
 
-/// What a run's transcript source is (`source field=transcript
-/// state=`): read at `conf=exact` from a Claude Code build the lab measured,
-/// at `conf=strong` from another, where it only adds (`vref`
-/// amends, tool, subagent and compact steps, `vdur_ms tok_*` amends, the
-/// run's `model= effort= ver=`; never a turn's open or close, an `out=`
-/// amend, `confirmed=1` or a retraction), or not read at all (its shape
-/// broke: fail closed).
+/// What a run's transcript source is (`source field=transcript state=`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum TxState {
     /// A measured build: exact.
@@ -1459,25 +1219,20 @@ impl TxState {
     }
 }
 
-/// Where a transcript row was read: the file, as its
-/// path's fingerprint and, where the platform has one, its identity
-/// (`dev`, `ino`); the end offset of the row's line; and the row's own time
-/// (wall ms, its `timestamp`).
+/// Where a transcript row was read: the file, as its path's fingerprint and, where the platform has one, its identity (`dev`, `ino`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct TxPos {
     /// The path's fingerprint.
     pub fp: u64,
     /// The file's identity, when known.
     pub id: Option<(u64, u64)>,
-    /// The end offset of the row's line (for a [`TxEvent::Bind`], the
-    /// file's length).
+    /// The end offset of the row's line (for a [`TxEvent::Bind`], the file's length).
     pub off: u64,
     /// The row's time (wall ms).
     pub wall_ms: u64,
 }
 
-/// The read position the join has applied through: a row at or below it
-/// is never applied again (watermark).
+/// The read position the join has applied through: a row at or below it is never applied again (watermark).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct TxMark {
     /// The path's fingerprint.
@@ -1503,44 +1258,31 @@ impl TxMark {
     }
 }
 
-/// The wall judge's answer for the screen's open wall step (§2.6: the
-/// harness's own rule, `steps::judge_wall`). The judge's `Wait` is no event.
+/// The wall judge's answer for the screen's open wall step (§2.6: the harness's own rule, `steps::judge_wall`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum WallJudge {
-    /// The transcript's main chain ends on the vendor's notice of the same
-    /// class: `amend confirmed=1` at exact.
+    /// The transcript's main chain ends on the vendor's notice of the same class: `amend confirmed=1` at exact.
     Confirm,
     /// It ends elsewhere, newer than the wall: `close out=retracted`.
     Refute,
 }
 
-/// One transcript fact, typed: an id, a tool's name (`tool=`, host tier,
-/// at most 64 bytes), a class word and numbers. No prompt, reply, tool
-/// input, result or notice text has a field here (D5 decision B),
-/// so none can reach a record.
+/// One transcript fact, typed: an id, a tool's name (`tool=`, host tier, at most 64 bytes), a class word and numbers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TxEvent<'a> {
-    /// The glue bound a transcript file of `len` bytes (its first read, a
-    /// `/clear` or `/resume` that moved the path, a cursor restart) for a
-    /// Claude Code process that started at `floor_ms` (wall). With no
-    /// watermark for that file, what it holds is history: seeded past,
-    /// never replayed, and said by one `source … skipped=<len>` mark (S1).
+    /// The glue bound a transcript file of `len` bytes (its first read, a `/clear` or `/resume` that moved the path, a cursor restart) for a Claude Code process that started at `floor_ms` (wall).
     Bind {
         /// The file's length (bytes).
         len: u64,
         /// The process's start (wall ms; `footer::floor_of` × 1000).
         floor_ms: u64,
     },
-    /// A user row that starts a vendor turn (S3's classifier: never an
-    /// interrupt, a bash or task-notification row, a meta or compaction
-    /// row), with its `promptId` (or `uuid`).
+    /// A user row that starts a vendor turn (S3's classifier: never an interrupt, a bash or task-notification row, a meta or compaction row), with its `promptId` (or `uuid`).
     Prompt {
         /// The vendor turn's id.
         vref: ShortId,
     },
-    /// `[Request interrupted by user…`: the open turn was interrupted (S3),
-    /// and the vendor turn ended (Claude Code writes no turn end after Esc):
-    /// a screen turn opened later never continues it.
+    /// `[Request interrupted by user…`.
     Interrupt,
     /// A `tool_use` part of an assistant row.
     ToolUse {
@@ -1571,8 +1313,7 @@ pub enum TxEvent<'a> {
     },
     /// `system subtype=compact_boundary` (S24).
     Compact,
-    /// An assistant row whose model or effort differs from the last (S21:
-    /// never a `<synthetic>` or API-error row), or the registry's version.
+    /// An assistant row whose model or effort differs from the last (S21: never a `<synthetic>` or API-error row), or the registry's version.
     Model {
         /// `message.model`.
         model: Option<&'a str>,
@@ -1588,39 +1329,31 @@ pub enum TxEvent<'a> {
         /// The answer.
         judge: WallJudge,
     },
-    /// The vendor turn mapped to a turn the screen closed ended on the
-    /// vendor's own notice of `kind`: its outcome is refined to the wall.
+    /// The vendor turn mapped to a turn the screen closed ended on the vendor's own notice of `kind`: its outcome is refined to the wall.
     EndWall {
         /// The notice's wall.
         kind: WallKind,
     },
-    /// `n` rows the glue could not hand on (an over-long line, a restart's
-    /// gap): counted `dropped=` (S23, S27: never a ring loss).
+    /// `n` rows the glue could not hand on (an over-long line, a restart's gap): counted `dropped=` (S23, S27: never a ring loss).
     Lost {
         /// How many.
         n: u64,
     },
-    /// The glue's queue overflowed by `n`: counted, and the join is
-    /// desynced until the next prompt (S23: no tool call is kept without
-    /// its prompt).
+    /// The glue's queue overflowed by `n`.
     Overflow {
         /// How many.
         n: u64,
     },
-    /// The glue's batch ended: a loss counted since the `source` mark last
-    /// said one (a row the glue lost, a ninth parallel call, an unmapped
-    /// result, a step with no turn) is said now, once a batch (S23, S27).
+    /// The glue's batch ended.
     Flush,
 }
 
-/// What the join holds, for a conformance projection, the glue or a
-/// debugger.
+/// What the join holds, for a conformance projection, the glue or a debugger.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TxView {
     /// The watermark.
     pub through: Option<TxMark>,
-    /// The floor (wall ms): the latest of the bound process's start and the
-    /// adoption; the run's open is added at each read.
+    /// The floor (wall ms): the latest of the bound process's start and the adoption; the run's open is added at each read.
     pub floor_ms: u64,
     /// The running vendor turn's id.
     pub vref: Option<ShortId>,
@@ -1628,13 +1361,11 @@ pub struct TxView {
     pub mapped: Option<Node>,
     /// Whether its turn end was read.
     pub ended: bool,
-    /// Transcript steps held (open, or closed by a cascade and still
-    /// owed a result).
+    /// Transcript steps held (open, or closed by a cascade and still owed a result).
     pub tools: usize,
     /// The state the last `source` mark said.
     pub state: Option<TxState>,
-    /// A wall the transcript refuted, latched until the screen's word
-    /// moves (S2).
+    /// A wall the transcript refuted, latched until the screen's word moves (S2).
     pub refuted: Option<WallKind>,
     /// Desynced by an overflow, until the next prompt.
     pub desync: bool,
@@ -1642,8 +1373,7 @@ pub struct TxView {
     pub dropped: u64,
     /// A loss counted that no `source` mark said yet ([`TxEvent::Flush`]).
     pub unsaid: bool,
-    /// The running vendor turn's prompt time (wall ms; 0 when not known,
-    /// a carry from before it was carried).
+    /// The running vendor turn's prompt time (wall ms; 0 when not known, a carry from before it was carried).
     pub prompt_ms: u64,
 }
 
@@ -1654,21 +1384,18 @@ struct VTurn {
     /// The log turn it maps to: the open one, or one closed since.
     node: Option<Node>,
     /// Its turn end's time (wall ms), once read: its turn end's, or its
-    /// interrupt's.
     end_ms: Option<u64>,
     /// Its prompt's time (wall ms; 0: not known).
     at_ms: u64,
 }
 
 /// The join's state, in the tracker (so one with the screen's, under the
-/// same lock, and on the same carry line).
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct TxJoin {
     through: Option<TxMark>,
     floor_ms: u64,
     cur: Option<VTurn>,
     /// Transcript steps by call id: open, or closed by their turn's cascade
-    /// and owed a result (A1: never carried; rebuilt from the log).
     tools: Vec<(ShortId, Node, Kind)>,
     state: Option<TxState>,
     refuted: Option<WallKind>,
@@ -1697,16 +1424,12 @@ impl TxJoin {
     }
 
     /// `n` events lost: counted, said by the next `source` mark
-    /// ([`TxEvent::Flush`] at the latest).
-    fn lose(&mut self, n: u64) {
+    const fn lose(&mut self, n: u64) {
         self.dropped = self.dropped.saturating_add(n);
         self.unsaid |= n > 0;
     }
 
     /// The carry tokens (A1): the watermark, the running vendor turn (its
-    /// prompt's time included), the refuted latch, the state, the desync
-    /// flag and the loss count with whether it is unsaid; no tool map. At
-    /// most about 280 bytes.
     fn carry_into(&self, s: &mut String) {
         if let Some(m) = self.through {
             s.push_str(&format!(" tx_fp={:016x} tx_off={}", m.fp, m.off));
@@ -1746,10 +1469,6 @@ impl TxJoin {
     }
 
     /// The join a carry line's tokens name, adopted at `now`: the adoption
-    /// is the floor (S1), and the transcript steps are rebuilt from the
-    /// carried log at the next read (A1). A token that does not read is
-    /// left out (no watermark: the next bind seeds past the history), never
-    /// a refusal of the tracker's line.
     fn from_carry<'l>(get: &dyn Fn(&str) -> Option<&'l str>, now: Stamp) -> TxJoin {
         let hex = |v: &str| u64::from_str_radix(v, 16).ok();
         let through = (|| {
@@ -1788,9 +1507,6 @@ impl TxJoin {
 }
 
 /// The settle a turn the transcript opened arms when the screen's word
-/// rests: idle, a prose question, the survey. Never a wall: a wall the
-/// screen still shows predates the prompt, and would close the new turn as
-/// walled a second later.
 const fn rest_cause(v: Verdict) -> Option<SettleCause> {
     match v {
         Verdict::Idle => Some(SettleCause::Idle),
@@ -1801,7 +1517,6 @@ const fn rest_cause(v: Verdict) -> Option<SettleCause> {
 }
 
 /// `at`, moved to `wall_ms` when that is later (its monotonic part by the
-/// same amount): a record never dated before what it must follow.
 const fn no_earlier(at: Stamp, wall_ms: u64) -> Stamp {
     if wall_ms <= at.wall_ms {
         at
@@ -1810,11 +1525,7 @@ const fn no_earlier(at: Stamp, wall_ms: u64) -> Stamp {
     }
 }
 
-/// THE DATE OF A TRANSCRIPT CLOSE of `node`: `chosen`,
-/// or later — never before the node's own open, nor before any child's
-/// open or close — because [`Log::close`] clamps nothing, and a turn the
-/// screen opened late, or whose steps the host stamped, may hold a child
-/// newer than the vendor's row.
+/// THE DATE OF A TRANSCRIPT CLOSE of `node`: `chosen`, or later.
 #[must_use]
 pub fn tx_close_at(log: &Log, node: Node, chosen: Stamp) -> Stamp {
     let mut newest = log.open_entry(node).map_or(0, |e| e.t);
@@ -1853,16 +1564,7 @@ impl TurnTracker {
         }
     }
 
-    /// ONE TRANSCRIPT FACT (§2.5, §2.6): `ev`,
-    /// read at `pos` while the source is `state`, applied at the host's
-    /// `now` — through this method alone (S2). A settle that came due is
-    /// applied first, as [`Self::observe`] does. Returns when to tick.
-    ///
-    /// Applied only when the join is bound to `pos`'s file, `pos` is past
-    /// its watermark, and the row is no older than the floor: the latest
-    /// of the process's start, the run's open in this log and the adoption
-    /// (S1). Records are dated at the row's time on this process's clocks
-    /// ([`rebase`]), never before what they hang under.
+    /// ONE TRANSCRIPT FACT (§2.5, §2.6): `ev`, read at `pos` while the source is `state`, applied at the host's `now`.
     pub fn transcript(
         &mut self,
         log: &mut Log,
@@ -1883,10 +1585,6 @@ impl TurnTracker {
             self.bind(log, pos, len, floor_ms, state, now);
             return self.wake_at();
         }
-        // A judge's answer and the glue's counts are no rows of the file:
-        // they carry no offset of their own (the judge reads the end the
-        // last row left), so only a row is held to the watermark and the
-        // floor. Nothing applies to a join that bound no file.
         let row = !matches!(
             ev,
             TxEvent::Wall { .. } | TxEvent::Lost { .. } | TxEvent::Overflow { .. } | TxEvent::Flush
@@ -1904,8 +1602,6 @@ impl TurnTracker {
                 return self.wake_at();
             }
         }
-        // The glue's counts are counted whatever the state (S27); the
-        // batch's end says what is unsaid.
         match ev {
             TxEvent::Lost { n } => self.tx.lose(n),
             TxEvent::Overflow { n } => {
@@ -1938,12 +1634,9 @@ impl TurnTracker {
             TxEvent::Prompt { vref } => self.tx_prompt(log, vref, state, conf, row, now),
             TxEvent::Interrupt => {
                 // An unmeasured source may end its own vendor turn below,
-                // but must not change the screen turn's eventual outcome.
                 if state == TxState::On {
                     self.note_interrupted();
                 }
-                // Esc ended the vendor turn: Claude Code writes no turn end
-                // after it, so a later screen turn never continues it.
                 if let Some(v) = self.tx.cur.filter(|v| v.end_ms.is_none()) {
                     self.tx.cur = Some(VTurn {
                         end_ms: Some(row.wall_ms),
@@ -1974,10 +1667,6 @@ impl TurnTracker {
     }
 
     /// THE BIND (S1): a file the join holds no watermark for is history up
-    /// to `len`: the watermark is seeded there, the running vendor turn is
-    /// forgotten (the old file's is not this one's), and one `source` mark
-    /// says how much was skipped. A re-bind of the watermark's own file
-    /// (a lapsed watch) keeps it.
     fn bind(
         &mut self,
         log: &mut Log,
@@ -2014,7 +1703,6 @@ impl TurnTracker {
     }
 
     /// `mark r<n> source field=transcript state=<s> [skipped=] [dropped=]`
-    /// on the run, `by=aterm` (S31): local, never bus class (S27).
     fn write_source(&mut self, log: &mut Log, state: TxState, skipped: Option<u64>, now: Stamp) {
         self.tx.state = Some(state);
         self.tx.unsaid = false;
@@ -2037,7 +1725,6 @@ impl TurnTracker {
     }
 
     /// The transcript steps the carried log holds open under the turn, by
-    /// their call ids (A1): the carry line has no tool map.
     fn rebuild_tools(&mut self, log: &Log) {
         self.tx.rebuild = false;
         let Some(turn) = self.turn else {
@@ -2071,20 +1758,6 @@ impl TurnTracker {
     }
 
     /// THE PROMPT (§2.5's join). Attaches only
-    /// within [`ATTRIBUTION_MS`] of the prompt, either side: the open turn
-    /// when it has no vendor turn and opened within that of the prompt; the
-    /// newest closed turn when it has none and opened within that — and
-    /// before the open turn when that is the nearer of the two. A prompt
-    /// older than the open turn by more than the window is an earlier
-    /// turn's, read late: the newest closed turn takes it as above, else it
-    /// maps to nothing. A screen turn holding another vendor turn, or older
-    /// than the window, merged two: it closes `out=superseded` (dated by
-    /// [`tx_close_at`]) and the vendor turn opens its own — unless a screen
-    /// step is open under it (S4) or the build is unmeasured (S9), when the
-    /// vendor turn shares it. With no turn to attach, a measured build
-    /// opens the vendor turn's own, and arms the screen's settle when its
-    /// word rests; an unmeasured one holds it mapped to nothing, for the
-    /// screen turn that opens within the window ([`Self::ensure_turn`]).
     fn tx_prompt(
         &mut self,
         log: &mut Log,
@@ -2097,8 +1770,6 @@ impl TurnTracker {
         self.tx.desync = false;
         let tp = row.wall_ms;
         let prev_end = self.tx.cur.and_then(|v| v.end_ms);
-        // The newest closed turn is this run's when it opened after the run
-        // did (the carry keeps the fold's, not the tracker's last close).
         let run_t = log.open_entry(self.run).map_or(0, |e| e.t);
         let mapped = |node: Node| VTurn {
             vref,
@@ -2112,8 +1783,6 @@ impl TurnTracker {
             end_ms: None,
             at_ms: tp,
         };
-        // The newest closed turn, when it can take this prompt late: no
-        // vendor turn, this run's, opened within the window of it.
         let late = log.state().last[1]
             .as_ref()
             .map(|c| (c.node, c.opened_t, c.f.get(Key::Vref).is_some()))
@@ -2134,7 +1803,6 @@ impl TurnTracker {
                     });
             let near = opened.abs_diff(tp);
             if let Some((node, o)) = late.filter(|(_, o)| o.abs_diff(tp) < near) {
-                // The closed turn is the nearer: the prompt is its, late.
                 debug_assert!(o.abs_diff(tp) <= ATTRIBUTION_MS);
                 Self::amend_vref(log, node, vref, conf, row);
                 self.tx.cur = Some(mapped(node));
@@ -2146,7 +1814,6 @@ impl TurnTracker {
                 return;
             }
             if tp.saturating_add(ATTRIBUTION_MS) < opened {
-                // An earlier turn's prompt, read after this turn opened.
                 self.tx.cur = Some(unmapped);
                 return;
             }
@@ -2183,7 +1850,6 @@ impl TurnTracker {
     }
 
     /// A `tool_use`: a `tool` (or `subagent`) step under the open turn its
-    /// vendor turn maps to, never under a closed one (S13: it is counted).
     fn tx_tool(
         &mut self,
         log: &mut Log,
@@ -2231,7 +1897,6 @@ impl TurnTracker {
     }
 
     /// A `tool_result`: its step closes `out=ok|error` (`dur=wall`); one its
-    /// turn's cascade closed `out=gone` takes the outcome by an exact amend.
     fn tx_result(&mut self, log: &mut Log, id: ShortId, error: bool, state: TxState, row: Stamp) {
         let at = self.tx.tools.iter().position(|(v, ..)| *v == id);
         let Some(i) = at.filter(|_| !self.tx.desync) else {
@@ -2258,11 +1923,6 @@ impl TurnTracker {
     }
 
     /// THE TURN END: the open turn its vendor turn maps to
-    /// closes when no screen step is open under it (a measured build only),
-    /// with the settle's outcome when one is armed, dated by
-    /// [`tx_close_at`]; then, open or closed, the turn takes `vdur_ms tok_in
-    /// tok_out` by an amend, so its close carries only what a screen close
-    /// does and the rollup (`tools=` first) is never cut for them.
     fn tx_end(&mut self, log: &mut Log, n: [u64; 3], state: TxState, conf: Conf, row: Stamp) {
         if self.tx.desync {
             self.tx.lose(1);
@@ -2303,7 +1963,6 @@ impl TurnTracker {
     }
 
     /// A compaction (S24): an instant `compact` step under the open turn,
-    /// else the run.
     fn tx_compact(&mut self, log: &mut Log, conf: Conf, row: Stamp) {
         if self.tx.desync {
             self.tx.lose(1);
@@ -2345,10 +2004,6 @@ impl TurnTracker {
     }
 
     /// THE WALL JUDGE'S ANSWER (§2.6), a measured build only
-    /// (S9): a confirmation amends the screen's wall step `confirmed=1`
-    /// once; a refutation closes it `out=retracted` (its need goes with
-    /// it), disarms a wall settle, latches until the screen's word moves,
-    /// and refines a turn the wall's settle closed back to `out=done`.
     fn tx_wall(
         &mut self,
         log: &mut Log,
@@ -2407,8 +2062,6 @@ impl TurnTracker {
     }
 
     /// The vendor turn's end was its own notice of `kind`, after the screen
-    /// closed its turn: the closed turn's outcome is refined to the wall
-    /// (an exact amend; the fold takes it, A5).
     fn tx_end_wall(&mut self, log: &mut Log, kind: WallKind, state: TxState, now: Stamp) {
         if state != TxState::On {
             return;

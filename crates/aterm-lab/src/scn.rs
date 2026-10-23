@@ -138,10 +138,6 @@ pub struct Ctx {
     pub sumd: J,
     harness_keys: String,
     kw: LabKw,
-    /// The survey arm's pace: a write made again this often while Claude Code
-    /// reports no re-read, and the hang detector from the first write
-    /// ([`crate::settings_witness::REWRITE_EVERY`] and `HANG`).
-    pub witness_pace: (std::time::Duration, std::time::Duration),
 }
 
 fn r3(v: f64) -> J {
@@ -188,10 +184,6 @@ impl Ctx {
             sumd: J::Obj(Vec::new()),
             harness_keys: harness_keys.into(),
             kw,
-            witness_pace: (
-                crate::settings_witness::REWRITE_EVERY,
-                crate::settings_witness::HANG,
-            ),
         }
     }
 
@@ -429,7 +421,7 @@ impl Ctx {
     ///
     /// # Errors
     /// Interrupted, or Claude Code reported no re-read within the hang
-    /// detector of [`Ctx::witness_pace`] (the lab's: one minute).
+    /// detector ([`crate::settings_witness::HANG`]: one minute).
     pub fn arm(&mut self) -> R {
         self.arm_with_wait(&crate::settings_witness::WallWait::new())
     }
@@ -440,7 +432,6 @@ impl Ctx {
             &self.run,
             "CLAUDE_FORCE_DISPLAY_SURVEY",
             Some("1"),
-            self.witness_pace,
             wait,
         )
         .map_err(|f| match f.stopped {
@@ -2969,12 +2960,14 @@ mod tests {
 
     /// THE SURVEY ARM RETURNS ONLY ONCE CLAUDE CODE REPORTED A RE-READ, AND
     /// WRITES AGAIN UNTIL THEN: the watcher's stand-in misses the first write
-    /// and answers a later one, so `arm` returns with the line in the log,
-    /// the flag in the settings and its writes counted (`arm_writes` > 1).
-    /// NEGATIVE CONTROLS: a watcher that never answers, and one whose line
-    /// names another settings file, fail the arm as "the survey flag was not
-    /// armed", at the hang detector; an arm that wrote and slept would return
-    /// with no line in the log.
+    /// and answers the second, so `arm` returns with the line in the log,
+    /// the flag in the settings and its writes counted (`arm_writes` = 2).
+    /// The clock steps a third of `REWRITE_EVERY`, so the arm's pace shows in
+    /// its writes. NEGATIVE CONTROLS: a watcher that never answers, and one
+    /// whose line names another settings file, fail the arm as "the survey
+    /// flag was not armed", at the hang detector, after one write every
+    /// `REWRITE_EVERY` (`HANG / REWRITE_EVERY` writes); an arm that wrote and
+    /// slept would return with no line in the log.
     #[test]
     fn the_survey_arm_returns_only_once_claude_code_reported_a_reread() {
         use crate::settings_witness::{HANG, LOG, REWRITE_EVERY, SteppedWait, Wait as _};
@@ -3004,7 +2997,7 @@ mod tests {
             };
             let log = run.w.join(LOG);
             let pauses = Cell::new(0);
-            let wait = SteppedWait::new(REWRITE_EVERY, || {
+            let wait = SteppedWait::new(REWRITE_EVERY / 3, || {
                 let settings = J::parse(&crate::util::scratch_text(&run.settings()))
                     .expect("the settings just written");
                 assert_eq!(
@@ -3015,9 +3008,10 @@ mod tests {
                     "the actual writer set the flag before pausing"
                 );
                 pauses.set(pauses.get() + 1);
-                // Each controlled pause advances to the next rewrite. The
-                // first write is missed; only a later write gets a line.
-                if answers && pauses.get() == 2 {
+                // Each controlled pause advances a third of the rewrite
+                // period: the second write comes after the third pause. The
+                // first write is missed; the line answers the second.
+                if answers && pauses.get() == 4 {
                     let line = J::obj([
                         ("hook_event_name", J::s("ConfigChange")),
                         ("file_path", J::s(&names)),
@@ -3037,18 +3031,22 @@ mod tests {
                     "the line was in the log when the arm returned: {logged:?}"
                 );
                 let writes = ctx.sumd.get("arm_writes").and_then(J::as_i64).unwrap_or(0);
-                assert!(
-                    writes >= 2,
+                assert_eq!(
+                    writes,
+                    2,
                     "the missed write was made again: {}",
                     ctx.sumd.py()
                 );
                 assert!(wait.elapsed() < HANG);
                 continue;
             }
+            let made = HANG.as_millis() / REWRITE_EVERY.as_millis();
             match armed {
                 Err(ScnErr::Failed(m)) => assert!(
-                    m.starts_with("the survey flag was not armed: ") && m.contains("no re-read"),
-                    "{what}: {m}"
+                    m.starts_with("the survey flag was not armed: ")
+                        && m.contains("no re-read")
+                        && m.contains(&format!("({made} writes)")),
+                    "{what}: one write every REWRITE_EVERY until HANG: {m}"
                 ),
                 other => panic!("{what}: {other:?}"),
             }
@@ -3058,11 +3056,11 @@ mod tests {
                 usize::from(answers),
                 "{what}: the controlled watcher supplied exactly its intended evidence"
             );
-            assert!(
-                wait.elapsed() >= HANG,
+            assert_eq!(
+                wait.elapsed(),
+                HANG,
                 "{what}: the simulated hang detector ended the wait"
             );
-            assert!(pauses.get() >= 2, "{what}: the missed write was made again");
         }
     }
 

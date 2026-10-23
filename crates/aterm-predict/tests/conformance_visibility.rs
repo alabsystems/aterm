@@ -1,10 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1 binding between the derived predictive-visibility model and the
-//! genuine `aterm-predict` state machine. The test drives the shipping clocked
-//! implementation, projects its user-visible decisions, and requires the same
-//! transitions as `predictive_echo_visibility_model`.
+//! Tier-1 binding between the derived predictive-visibility model and the genuine `aterm-predict` state machine.
 
 use std::time::{Duration, Instant};
 
@@ -20,8 +17,6 @@ fn echoed_a(row: u16, col: u16) -> Option<char> {
 }
 
 /// One complete DRAINED type→echo turn on row 0: arm `ch` at `col`, then confirm it
-/// `rtt` later with the real cursor advanced past it. Returns the confirmation
-/// instant. Only valid with an empty pending set (it anchors on the passed cursor).
 fn echo_turn(p: &mut Predictor, ch: char, col: u16, at: Instant, rtt: Duration) -> Instant {
     assert!(p.predict_char(ch, (0, col), G, 80, at));
     let done = at + rtt;
@@ -36,8 +31,6 @@ fn adaptive_fast_expiry_is_invisible_and_slow_echo_may_display() {
     let model = aterm_models_core::predictive_echo_visibility_model();
     let now = Instant::now();
 
-    // Fast-link path: the real implementation records the RTT and tracks the
-    // next guess, but its overlay is empty both before and across expiry.
     let mut fast_model = model.init_state();
     let mut fast = Predictor::new(PredictMode::Adaptive);
     assert!(fast.predict_char('a', (0, 0), G, 80, now));
@@ -50,11 +43,6 @@ fn adaptive_fast_expiry_is_invisible_and_slow_echo_may_display() {
     assert_eq!(fast_model["visible"], 0);
     assert!(fast.overlay(fast_echo).is_empty());
 
-    // Negative control: the genuine predictor has a tracked, deadline-bearing `b`
-    // after a real confirmation, while the shipping benefit gate keeps its overlay
-    // empty. A confirmation-only gate would expose that exact tracked
-    // glyph. Derive both operands from the shipping predictor/model transition so
-    // this control fails if tracking, confirmation, or the real overlay drifts.
     let tracked_fast_prediction = fast.next_deadline().is_some();
     assert!(
         tracked_fast_prediction,
@@ -72,16 +60,10 @@ fn adaptive_fast_expiry_is_invisible_and_slow_echo_may_display() {
     let expired = fast_echo + Duration::from_millis(251);
     assert!(model.fire("Expire", &mut fast_model));
     assert_eq!(fast_model["erased"], 0);
-    // The expiry owes `b`'s echo and voids the proof `a` earned (both sides; the
-    // shipping side is pinned through the pixels in
-    // `expiry_owes_and_voids_the_proof`, since a fast link paints nothing here).
     assert_eq!((fast_model["owed"], fast_model["confirmed"]), (1, 0));
     assert!(fast.overlay(expired).is_empty());
     assert!(fast.idle());
 
-    // Slow-link control: Adaptive remains useful. The model's `ConfirmSlow`
-    // abstracts the shipping classifier's stable-slow transition, which requires
-    // two consecutive 60 ms confirmations so one scheduler tail cannot paint.
     let mut slow_model = model.init_state();
     let mut slow = Predictor::new(PredictMode::Adaptive);
     assert!(slow.predict_char('a', (0, 0), G, 80, now));
@@ -99,8 +81,6 @@ fn adaptive_fast_expiry_is_invisible_and_slow_echo_may_display() {
     assert_eq!(slow_model["visible"], 1);
     assert_eq!(slow.overlay(slow_echo).len(), 1);
 
-    // Session switch: the model and genuine Predictor both discard that slow
-    // link's eligibility. A 1 ms confirmation in the new pane stays invisible.
     slow.reset_session();
     assert!(model.fire("SwitchSession", &mut slow_model));
     assert_eq!(slow_model["fresh"], 1);
@@ -116,17 +96,12 @@ fn adaptive_fast_expiry_is_invisible_and_slow_echo_may_display() {
     assert_eq!(slow_model["visible"], 0);
     assert!(slow.overlay(local_start).is_empty());
 
-    // Negative control: a window-global EWMA survives the switch and is
-    // explicitly rejected by the model's fresh-session invariant.
     let mut inherited = model.init_state();
     inherited.insert("slow", 1);
     assert!(!model.check_invariant("FreshSessionHasNoInheritedRtt", &inherited));
 }
 
 /// The gate is a LATCH: it stops painting only after a SUSTAINED fast run with
-/// nothing in flight. This drives the sequence a single-sample close cannot
-/// survive, on BOTH sides (the binding above only fires `ConfirmFast` at an
-/// already-closed latch, so it cannot pin this).
 #[test]
 fn the_display_gate_closes_only_on_sustained_fast_evidence() {
     let model = aterm_models_core::predictive_echo_visibility_model();
@@ -136,8 +111,6 @@ fn the_display_gate_closes_only_on_sustained_fast_evidence() {
     let slow = Duration::from_millis(60);
     let fast = Duration::from_millis(1);
 
-    // Two consecutive 60 ms confirmations are the shipping classifier's stable-slow
-    // transition, which the model folds into one `ConfirmSlow`.
     let mut at = echo_turn(&mut p, 'a', 0, now, slow);
     at = echo_turn(&mut p, 'b', 1, at, slow);
     assert!(model.fire("ConfirmSlow", &mut st));
@@ -146,9 +119,6 @@ fn the_display_gate_closes_only_on_sustained_fast_evidence() {
     assert_eq!(st["visible"], 1);
     assert_eq!(p.overlay(at).len(), 1, "control: the slow link paints");
 
-    // A fast turn taken while type-ahead is still on glass. Closing HERE is the blink
-    // itself — the very turn that decides speculation is unnecessary is the turn that
-    // un-paints the glyph the user is looking at.
     assert!(p.predict_char('d', (0, 3), G, 80, at));
     at += fast;
     p.reconcile(Some((0, 3)), G, false, at, |row, col| {
@@ -167,10 +137,6 @@ fn the_display_gate_closes_only_on_sustained_fast_evidence() {
         "the shipping gate keeps painting 'd'"
     );
 
-    // Drain, then one DECISIVE fast turn with nothing pending: still open. The model
-    // counts turns; the implementation additionally waits for its smoothed estimate to
-    // agree, so the two are bound at the DECISIONS (open / still open / closed), not
-    // turn for turn — the same abstraction `ConfirmSlow` already makes.
     at += fast;
     p.reconcile(Some((0, 4)), G, false, at, |row, col| {
         ((row, col) == (0, 3)).then_some('d')
@@ -192,8 +158,6 @@ fn the_display_gate_closes_only_on_sustained_fast_evidence() {
         "…and the shipping gate is still painting too"
     );
 
-    // Keep echoing locally until the implementation's EWMA agrees as well. Only then
-    // does the third decisive turn retire the latch on both sides.
     at += fast;
     p.reconcile(Some((0, 6)), G, false, at, |row, col| {
         ((row, col) == (0, 5)).then_some('z')
@@ -215,8 +179,6 @@ fn the_display_gate_closes_only_on_sustained_fast_evidence() {
         "a settled local link stops painting on both sides"
     );
 
-    // Tier-0 negative controls for the retraction rule: a single-sample
-    // close, and a close taken with pixels still in flight, are both rejected.
     let mut single_sample = model.init_state();
     single_sample.insert("retracted", 1);
     single_sample.insert("fast_streak", 1);
@@ -236,16 +198,8 @@ fn the_display_gate_closes_only_on_sustained_fast_evidence() {
 }
 
 /// Every epoch boundary the shipping predictor recognises is the model's `Submit`
-/// (`confirmed = 0`): the proof belongs to the epoch that ended, so the next `Key`
-/// is invisible on both sides. A boundary missed is a proven epoch carried into a
-/// line that never echoed — the password-prompt leak. The rows moving under the
-/// cursor is the model's `RowsMoved`, which ends the proof as `Submit` does and
-/// keeps THE FIRST KEY's gate (`a_scroll_keeps_the_first_key_s_gate` binds that
-/// half).
 #[test]
 fn every_epoch_boundary_is_the_models_submit() {
-    // Each boundary returns the generation and the cursor column the next key
-    // arrives with.
     type Boundary = fn(&mut Predictor, Instant) -> (u64, u16);
     let boundaries: [(&str, Boundary); 7] = [
         ("a line terminator", |p, at| {
@@ -264,16 +218,11 @@ fn every_epoch_boundary_is_the_models_submit() {
             assert!(!p.predict_char('日', (0, 2), G, 80, at));
             (G, 2)
         }),
-        // No call at all: the generation handed with the next key moved.
         ("the rows moved under the cursor", |_, _| (G + 1, 2)),
-        // No call at all: the program printed a prompt beside the echo.
         (
             "the program moved the cursor off the proven cell",
             |_, _| (G, 14),
         ),
-        // An arrow the edit lane cannot place (here behind a host that
-        // reconciles through the legacy observe): declined with its pixels kept,
-        // owed, the epoch ended.
         ("an arrow the predictor cannot place", |p, at| {
             let row = vec![Seen::Blank; 80];
             let sample = KeySample {
@@ -299,7 +248,6 @@ fn every_epoch_boundary_is_the_models_submit() {
         at = echo_turn(&mut p, 'b', 1, at, slow);
         assert!(model.fire("ConfirmSlow", &mut st));
         let (coords, col) = boundary(&mut p, at);
-        // The rows moving is the model's own boundary, which keeps the gate.
         let action = if coords == G { "Submit" } else { "RowsMoved" };
         assert!(model.fire(action, &mut st), "{label}");
         assert_eq!(st["confirmed"], 0);
@@ -312,8 +260,6 @@ fn every_epoch_boundary_is_the_models_submit() {
         );
     }
 
-    // Negative control: the state a missed boundary produces (a guess displayed on
-    // a proof the epoch never earned) is exactly what the model rejects.
     let mut leaked = model.init_state();
     leaked.insert("slow", 1);
     leaked.insert("fresh", 0);
@@ -323,12 +269,6 @@ fn every_epoch_boundary_is_the_models_submit() {
 }
 
 /// The shipping predictor through the owed-echo scenario: a slow proven line, `n`
-/// typed and painted, the program moving the cursor to the next row 10 ms later
-/// (the guess is flushed while its keystroke is in flight), `n` typed again at the
-/// new cursor `flushed_age` after the first, and the FIRST `n`'s echo landing in
-/// the new guess's cell 60 ms later. Returns the predictor, the instant, and
-/// whether the space typed next is painted, which is the shipping proof read
-/// through the pixels.
 fn owed_echo_run(flushed_age: Duration) -> (Predictor, Instant, bool) {
     let mut p = Predictor::new(PredictMode::Adaptive);
     let slow = Duration::from_millis(60);
@@ -373,13 +313,6 @@ fn first_echo(row: u16, col: u16) -> Option<char> {
 }
 
 /// ATTRIBUTION: an echo still owed to a keystroke no guess tracks proves nothing.
-/// The shipping predictor flushes a guess whose keystroke is still in flight (the
-/// program moved the cursor: the model's `Submit`, which owes that echo), the same
-/// glyph is typed again at the new cursor, and the FIRST keystroke's echo lands in
-/// the new guess's cell. Glyph and cursor advance match, the pixels retire, and
-/// the epoch stays unproven: the model's `Echo` under `owed = 1`, never a
-/// `Confirm*`. Once the owed echo's window has passed (`OwedExpire`), a drained
-/// echo turn is `ConfirmSlow` again on both sides.
 #[test]
 fn an_owed_echo_proves_nothing_until_its_window_passes() {
     let model = aterm_models_core::predictive_echo_visibility_model();
@@ -396,8 +329,6 @@ fn an_owed_echo_proves_nothing_until_its_window_passes() {
         !model.fire("ConfirmSlow", &mut st.clone()) && !model.fire("ConfirmFast", &mut st.clone()),
         "no confirm turn is enabled while the echo is owed"
     );
-    // The shipping run, the same steps: the new 'n' is typed 10 ms after the
-    // first, so the first one's echo is owed when it lands.
     let (mut p, mut at, shipping_proven) = owed_echo_run(Duration::from_millis(10));
     assert!(model.fire("Key", &mut st));
     assert_eq!(st["visible"], 0);
@@ -406,13 +337,6 @@ fn an_owed_echo_proves_nothing_until_its_window_passes() {
         "the space echoes after the second 'n', not at (1, 3)"
     );
 
-    // Negative control, from the code: crediting every match. The
-    // shipping predictor credits one exactly when the flushed key is older than
-    // its window, so the same run with the second 'n' typed a window later is
-    // that credit, measured — not a constant. Projected onto the model's state at
-    // this step (the echo owed), it must be rejected; if the shipping code ever
-    // stopped crediting a positional match at all, this run proves nothing and the
-    // control fails instead of passing vacuously.
     let (_, _, credited) = owed_echo_run(Duration::from_millis(300));
     let mut borrowed = st.clone();
     borrowed.insert("confirmed", i64::from(credited));
@@ -421,7 +345,6 @@ fn an_owed_echo_proves_nothing_until_its_window_passes() {
         "a proof borrowed from an owed echo must be rejected (credited: {credited})"
     );
 
-    // The second 'n' echoes; the space diverges and is flushed (owed in turn).
     at += slow;
     let second_echo =
         |row: u16, col: u16| first_echo(row, col).or(((row, col) == (1, 3)).then_some('n'));
@@ -429,8 +352,6 @@ fn an_owed_echo_proves_nothing_until_its_window_passes() {
     assert!(p.idle());
     assert!(model.fire("Submit", &mut st));
 
-    // Past the longest glitch window (the documented 2 s ceiling) nothing owed
-    // can still be in flight, and a drained echo turn proves the epoch again.
     at += Duration::from_millis(2001);
     assert!(model.fire("OwedExpire", &mut st));
     assert!(p.predict_char('q', (1, 5), G, 80, at));
@@ -451,11 +372,6 @@ fn an_owed_echo_proves_nothing_until_its_window_passes() {
 }
 
 /// The shipping predictor through an expiry: a slow proven line `ab`, `c` typed
-/// and painted at the proven cell, no echo within the glitch window, so `c`
-/// expires; then `d` is typed at the live cursor, which still stands on `c`'s
-/// cell. Returns whether `d` is painted: the shipping proof, read through the
-/// pixels. With `rule_off` the predictor runs with `Rule::ExpiryOwes` switched
-/// off, leaving an expired guess unowed.
 fn expiry_run(rule_off: bool) -> bool {
     let mut p = Predictor::new(PredictMode::Adaptive);
     if rule_off {
@@ -477,13 +393,6 @@ fn expiry_run(rule_off: bool) -> bool {
 }
 
 /// EXPIRY OWES: an expired guess's key was sent, so its echo is owed, and when
-/// it comes it lands on the cell the proof names. The model's `Expire` owes
-/// (`owed = 1`) and clears `confirmed`, so the next `Key` is invisible; the
-/// shipping predictor leaves `d` dark. Negative control, from the code: the same
-/// drive with `Rule::ExpiryOwes` off paints `d`, and that proof, projected onto
-/// the model's post-`Expire` state, is what `ProofIsAttributable` rejects; if the
-/// mutated code stopped painting, the control would prove nothing and fails
-/// instead of passing vacuously.
 #[test]
 fn expiry_owes_and_voids_the_proof() {
     let model = aterm_models_core::predictive_echo_visibility_model();
@@ -531,7 +440,6 @@ fn sample(row: &[Seen], cursor: u16) -> KeySample<'_> {
 }
 
 /// The press of edit `key` with the cursor at `(0, cursor)` over row 0 showing
-/// `text`.
 fn press(p: &mut Predictor, key: EditKey, text: &str, cursor: u16, at: Instant) -> EditOutcome {
     let row = row_of(text);
     p.predict_edit(key, &sample(&row, cursor), at)
@@ -546,11 +454,6 @@ fn reconcile(p: &mut Predictor, text: &str, cursor: u16, at: Instant) {
 }
 
 /// The edit classes THE CLASS LADDER proves one at a time, each with the rule
-/// that keeps it: `←` (a motion), a glyph typed inside the text (an insert that
-/// shifts the text right of it), a Backspace inside the text (an erase that
-/// shifts it left). The model has one abstract edit class; the binding drives
-/// each in turn and projects only that class's ops, the others' (the motions
-/// that bring the cursor inside the text) being steps the model does not see.
 #[derive(Clone, Copy, Debug)]
 enum EditClass {
     Motion,
@@ -570,16 +473,6 @@ impl EditClass {
 }
 
 /// The shipping predictor through the class ladder for `class`: a slow proven
-/// line typed with its rows and echoed through `reconcile_seen` (so the edit
-/// lane may place an op on it), the cursor walked into the text where the class
-/// needs it (each `←` echoed), the class's first op pressed, its echo, then a
-/// second op of the class. Returns whether each was painted (the chain's cursor
-/// in the overlay), the predictor and the instant. With `rule_off` the class
-/// proof is switched off.
-///
-/// The text is `ab` for `←` and `abc` for a shift: a shift proves its class
-/// only where its echo differs from an edit in place, and `bc` moved one cell
-/// does where a lone `b` might not.
 fn class_ladder_run(class: EditClass, rule_off: bool) -> (bool, bool, Predictor, Instant) {
     let mut p = Predictor::new(PredictMode::Adaptive);
     if rule_off {
@@ -672,18 +565,6 @@ fn class_ladder_run(class: EditClass, rule_off: bool) -> (bool, bool, Predictor,
 }
 
 /// THE EDIT CLASS, for each class the ladder proves: an op displays only once
-/// an op of its class has echoed in its epoch (a motion, an insert that shifts
-/// the text, an erase that shifts it). The model's `KeyEdit` before any
-/// `ConfirmEdit` is invisible, and so is the shipping predictor's first op of
-/// the class; its echo is `ConfirmEdit`; the second op is visible on both
-/// sides; `note_line_submit` ends both proofs, `Submit`. Tier-0 controls: the
-/// states a missing class proof and a class proof outliving the glyph proof
-/// produce are rejected. Negative control, from the code, per class: the same
-/// drive with the class's rule off (`MotionClassProof`, `InsertShiftProof`,
-/// `EraseShiftProof`) paints the first op, and that pixel, projected onto the
-/// model's state at that step, is what `EditVisibleNeedsClassProof` rejects; if
-/// the mutated code stopped painting it, the control would prove nothing and
-/// fails instead.
 #[test]
 fn an_edit_displays_only_after_its_class_is_proven() {
     let model = aterm_models_core::predictive_echo_visibility_model();
@@ -747,7 +628,6 @@ fn an_edit_displays_only_after_its_class_is_proven() {
 }
 
 /// The press's sample with the cursor at `(0, cursor)` over `row`, handing
-/// `start` as the shell's authenticated buffer start, in one editor context.
 fn signed(row: &[Seen], cursor: u16, start: Option<InputStart>) -> KeySample<'_> {
     KeySample {
         input_start: start,
@@ -763,10 +643,6 @@ const B: InputStart = InputStart {
 };
 
 /// How a line-edge run starts its line: whether its presses hand the `B`,
-/// whether a line terminator pressed at the prompt before opened THE FIRST
-/// KEY's gate, and whether the rows moved under the screen after it (a shell
-/// on the bottom row, whose Enter's output scrolls the screen: the frame before
-/// the terminator read another content-coordinate generation).
 #[derive(Clone, Copy)]
 struct Start {
     hands_b: bool,
@@ -782,8 +658,6 @@ const WITNESSED: Start = Start {
 };
 
 /// The line a line-edge run starts as `start` says (see [`line_edge_run`]):
-/// `ab` typed and echoed on a slow link, the cursor at its end. Returns when
-/// the last echo landed.
 fn typed_ab(p: &mut Predictor, start: Start) -> Instant {
     let slow = Duration::from_millis(60);
     let mut at = Instant::now();
@@ -796,7 +670,6 @@ fn typed_ab(p: &mut Predictor, start: Start) -> Instant {
         at += p.glitch_window_for_test() + Duration::from_millis(1);
     }
     if start.scrolled {
-        // The Enter's output scrolled the screen: the frame it drew, before
         // the next prompt's first key, reads `G`.
         reconcile(p, "", 0, at);
     }
@@ -813,15 +686,6 @@ fn typed_ab(p: &mut Predictor, start: Start) -> Instant {
 }
 
 /// The shipping predictor through THE LINE EDGE: `ab` typed on a slow link,
-/// after a line terminator at the prompt before when `start.first_key` (so `a`
-/// is THE FIRST KEY), the rows moving under the screen after it when
-/// `start.scrolled`, each press handing the shell's authenticated buffer start
-/// at `(0, 0)` when `start.hands_b`; then Home pressed three times from the end
-/// of the line, each echoed as beginning-of-line (the cursor on `a`), the cursor
-/// walked back to the end between them with `→` (steps the model does not
-/// see). Every Home press hands the start. Returns whether each Home was
-/// painted (the chain's cursor in the overlay), the predictor and the instant.
-/// With `off` that rule is switched off.
 fn line_edge_run(off: Option<Rule>, start: Start) -> ([bool; 3], Predictor, Instant) {
     let mut p = Predictor::new(PredictMode::Adaptive);
     if let Some(rule) = off {
@@ -859,26 +723,6 @@ fn line_edge_run(off: Option<Rule>, start: Start) -> ([bool; 3], Predictor, Inst
 }
 
 /// THE LINE EDGE: Home is placed only on a WITNESSED line and shown only once
-/// its binding is LEARNED. The model's `SubmitAtPrompt` is the line terminator
-/// pressed at the prompt before (`note_line_submit_at`), its `Key` the
-/// prompt's first key (`a`), and `Witness` the line it started at the shell's
-/// authenticated buffer start; `KeyLineEdge` before any `ConfirmLineEdge` is
-/// invisible, and so are the shipping predictor's first two Homes (probes: the
-/// code learns from two echoes, which the model folds into one step, the first
-/// echo its `Echo`); the second echo is `ConfirmLineEdge`, and the third Home
-/// is visible on both sides; `note_line_submit` ends the witness, `Submit`, and
-/// Home is then not placed. Tier-0 controls: a line-edge key shown unlearned, a
-/// binding a fresh session kept, and a line witnessed by a key that was not
-/// its prompt's first, are rejected. Negative controls, from the code: with
-/// `Rule::LearnedBindings` off the first Home is painted, and that pixel,
-/// projected onto the model's state at that step, is what
-/// `LineEdgeNeedsWitnessAndBinding` rejects; with `Rule::WitnessFreshPrompt`
-/// off, Home learned and painted on a line the presses never witnessed, which
-/// the model's state with no `Witness` rejects; and with
-/// `Rule::WitnessFirstKey` off, Home learned and painted on a line started at
-/// the `B` by a key that was not the prompt's first, which
-/// `WitnessIsTheFirstKey` rejects. Each control fails, rather than passing
-/// vacuously, if the mutated code stops painting.
 #[test]
 fn a_line_edge_key_displays_only_when_learned_at_a_witnessed_prompt() {
     let model = aterm_models_core::predictive_echo_visibility_model();
@@ -918,9 +762,6 @@ fn a_line_edge_key_displays_only_when_learned_at_a_witnessed_prompt() {
         EditOutcome::Declined,
         "nothing is placed on the line the terminator ended"
     );
-    // A run that is not the prompt's first key witnesses nothing, in the model
-    // (the gate shut: `Witness` cannot fire) as in the code (Home is then not
-    // placed: `line_edge_run`'s first Home would panic).
     let mut later = model.init_state();
     assert!(model.fire("Key", &mut later));
     assert!(model.fire("Echo", &mut later));
@@ -1006,20 +847,6 @@ fn a_line_edge_key_displays_only_when_learned_at_a_witnessed_prompt() {
 }
 
 /// THE FIRST KEY across a scroll: the rows moving under the screen between a
-/// line terminator pressed at a prompt and the next prompt's first key (a
-/// shell on the bottom row, whose Enter's own output scrolls the screen) is the
-/// model's `RowsMoved`, which ends the proof and owes as `Submit` does but
-/// keeps the gate, since a scroll lets no key past the predictor. So the next
-/// key is still the first (`first = 1`), `Witness` fires, and the learned
-/// Home shows on the third press, in the model as in the code, whose frames
-/// after the terminator read another content-coordinate generation than the
-/// frame before it. `WitnessIsTheFirstKey` holds of that state. The boundary a
-/// host reset is (it may have let keys past) is `Submit`, which shuts the
-/// gate: `Witness` cannot fire after it. Negative control, from the code:
-/// with `Rule::ScrollKeepsFirstKey` off the move shuts the gate, and Home is
-/// not placed on the line the model witnesses, so the code no longer refines
-/// `RowsMoved`; the control fails, rather than passing vacuously, if the
-/// mutated code still places it.
 #[test]
 fn a_scroll_keeps_the_first_key_s_gate() {
     let model = aterm_models_core::predictive_echo_visibility_model();
@@ -1047,7 +874,6 @@ fn a_scroll_keeps_the_first_key_s_gate() {
     assert_eq!(st["visible"], 1);
     assert_eq!(shown, [false, false, true], "the third, learned Home shows");
 
-    // A host reset at the same point is `Submit`: the gate shut, no witness.
     let mut reset = model.init_state();
     assert!(model.fire("SubmitAtPrompt", &mut reset));
     assert!(model.fire("Submit", &mut reset));
@@ -1058,8 +884,6 @@ fn a_scroll_keeps_the_first_key_s_gate() {
     assert_eq!(reset["first"], 0);
     assert!(!model.fire("Witness", &mut reset.clone()), "no first key");
 
-    // The mutant: the move shuts the gate in the code, which then places no
-    // Home on the line `RowsMoved` lets the model witness.
     for (rule_on, want) in [(true, EditOutcome::Armed), (false, EditOutcome::Declined)] {
         let mut p = Predictor::new(PredictMode::Adaptive);
         if !rule_on {

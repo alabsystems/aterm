@@ -1,66 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! What the worker is doing now, from one screen read.
+//! Worker phase classification from a single terminal screen snapshot.
 //!
-//! The busy signals, measured from Claude Code 2.1.267 on: the spinner row (`✶ Deliberating…`,
-//! with or without its `(4s · …)` suffix, absent for the first second), `Waiting for N dynamic
-//! workflow` / `N background agent`, a done row or footer that says a background shell still
-//! runs (a turn can end while a shell keeps the work going; that is still busy for a
-//! supervisor), `esc to interrupt`, `Still working` and `ctrl+b to run in background`. The
-//! footer does not always say `esc to interrupt` while a turn runs (a static `✢ Thinking…` over
-//! `? for shortcuts`; an auto-mode footer saying only `⏵⏵ auto mode on (shift+tab to cycle)`),
-//! so the status row is the primary signal.
-//!
-//! The spinner row is read by its shape, never by a list of glyphs: a glyph the reader cannot
-//! name, or an indented row, must not read idle, since reading a running turn as idle makes a
-//! supervisor type into a worker mid-turn.
-//!
-//! ONE EXCEPTION, THE WAIT CLAUDE CODE CARRIES: a `Waiting for N … to
-//! finish` row with no status row under it stands for the turns Claude Code
-//! started itself after it, until a later done row or a person's prompt
-//! replaces it. Claude Code draws a turn's `turn_duration` row only when its
-//! pending counts changed or a person's prompt came between (2.1.295 `Ad`,
-//! 2.1.300 `Nd`, read from the binaries): a turn a `<task-notification>`, a
-//! monitor's expiry or a `/loop` wakeup started, which ends with the same
-//! work still pending, draws NO row, so its `⏺` rows sit between the
-//! waiting row and the frame. Read as history, that end was an idle point,
-//! and 47 of the 133 acts of the trust session's journal (2026-09-24 to
-//! 10-15) typed `keep going` at one, every 30 minutes for days, each answered
-//! "No change since my last update". So when the walk finds no status row,
-//! it goes on up over the transcript (a parked card stepped over) and stops
-//! at a person's `❯` row, at what ends the live zone or at the first glyph
-//! row: a waiting row there is SOFT background work ([`busy_signal`]'s last
-//! rule), which a question, a limit or another wall the notification turn
-//! ended on still outranks; a done row or anything else is history, as
-//! above. The measured `/model` screen keeps its reading: its `❯ /model` row
-//! stops the walk. [`status_row`] stays `None` there. The waiting row is read
-//! as its LINE (below), and it is the one busy reading a fresher word may
-//! overrule ([`carried_wait_alone`]): a build that hid the done row of a
-//! finished wait would leave it standing for good, so aterm-agent's loop
-//! reads the turn ended where the session's transcript says it closed since
-//! with nothing pending.
-//!
-//! THE STATUS ROW IS READ AS ITS LINE. In a pane narrower than it, Ink wraps
-//! the row onto the rows under it at its text column (measured on 2.1.299 at
-//! 26 and 34 columns: `✻ Worked for 0s · done` over `  10:36 AM`), and
-//! Claude Code's flex row can put the rest of a cut verb in column 0 under
-//! the glyph. Read a row at a time, a spinner cut to `✶ Choreog` over
-//! `  raphing…` read IDLE (KI S2R-F1, measured at 12 columns) and a done row
-//! cut before `· 1 shell still running` read no shell. So every reader of
-//! the status row reads its line ([`status_block`]'s `line`, [`crate::wrap`]).
-//!
-//! A background MONITOR alone is soft ([`Busy::soft`]): a `persistent` one
-//! runs for as long as the worker lives and wakes it by itself, so a worker
-//! whose turn ended `· 1 monitor still running` (measured) is waiting on the
-//! monitor's next event — and could be asking a question, or be at its usage
-//! limit, all the same. Anything the turn ended on outranks it: a question,
-//! a limit notice, or another wall (an API error, a login, a full context).
-//!
-//! The live zone also carries how much of the worker's context is left before
-//! Claude Code auto-compacts it ([`context_left`]): `1% until auto-compact`,
-//! right-aligned on the row above the top rule (measured 2026-09-13, three
-//! hours into a turn, before the compaction that took the row away).
+//! * [`busy_signal`] and [`status_row`]: detect active turns, background work, and soft monitors
+//!   ([`Busy::soft`]) or carried waits ([`carried_wait_alone`]) across wrapped lines
+//!   ([`status_block`], [`crate::wrap`]).
+//! * [`context_left`]: reads remaining context percentage before auto-compaction from the live
+//!   zone.
 
 use std::borrow::Cow;
 use std::fmt;
@@ -75,21 +22,16 @@ pub enum Phase {
     Busy,
     /// An approval box is showing ([`parse_prompt`] is `Some`).
     Prompt,
-    /// Not busy, no prompt, and the worker's last turn ended on a usage or
-    /// rate limit notice ([`limit_notice`]). It sits at an idle composer, and
-    /// an instruction sent to it fails until the limit resets or its model is
-    /// switched — idle to the eye, a wall to a supervisor.
+    /// Not busy, no prompt, and the worker's last turn ended on a usage or rate limit notice.
     Limited {
-        /// The notice as Claude Code says it (`You've reached your Fable
-        /// limit. …`), its continuation rows joined.
+        /// The notice as Claude Code says it (`You've reached your Fable limit. …`).
         message: String,
         /// When it resets, if the notice says (`7:30pm (America/Los_Angeles)`).
         reset: Option<String>,
     },
     /// Not busy, no prompt, the last thing said does not end in `?`.
     Idle,
-    /// Not busy, no prompt, and the last thing the worker said
-    /// ([`last_said_row`]) ends with `?` — it is waiting on an answer.
+    /// Not busy, no prompt, and the last thing the worker said ([`last_said_row`]) ends with `?`.
     Question,
 }
 
@@ -108,21 +50,13 @@ impl Phase {
     }
 }
 
-/// The glyphs Claude Code's spinner cycles through, plus the static ones it leaves mid-thought,
-/// as measured. Not the busy decision ([`is_spinner_glyph`]): it keeps the loose status rows
-/// recognised, which the shape rule cannot claim for want of an ellipsis (`✻ Cooked for 4s ·
-/// done 2:41 PM`) or a non-ASCII glyph (`*`).
+/// The glyphs Claude Code's spinner cycles through, plus the static ones it leaves mid-thought.
 const SPINNERS: &[char] = &['✢', '✽', '✻', '✶', '✳', '✧', '✦', '⚡', '·', '*'];
 
-/// Glyphs that lead a row the spinner never leads: the transcript's markers (`⏺`/`●` the
-/// worker's message or tool call, `⎿` the gutter under it), the composer's caret, the footer's
-/// mode arrows, a workflow's progress ring. Without them the shape rule would read
-/// `⏺ Bloviating…`, the worker saying what it is about to do, as a live spinner.
+/// Glyphs that lead a row the spinner never leads.
 const NOT_SPINNER: &[char] = &['⏺', '●', '⎿', '❯', '⏵', '◯'];
 
-/// One glyph that can lead the spinner row: a measured one, or any non-ASCII glyph that is not
-/// layout punctuation ([`NOT_SPINNER`]), box drawing, or a letter or digit: a spinner we cannot
-/// name must not read idle.
+/// One glyph that can lead the spinner row.
 fn is_spinner_glyph(g: char) -> bool {
     SPINNERS.contains(&g)
         || (!g.is_ascii()
@@ -131,19 +65,13 @@ fn is_spinner_glyph(g: char) -> bool {
             && !g.is_alphanumeric())
 }
 
-/// A box-drawing character (U+2500–U+257F: `│`, `─`, `╌`, `╭` …), the layout's own strokes,
-/// never a spinner: otherwise a box's `│`-led row whose words run into an ellipsis (the rm
-/// breaker's `│ Dangerous rm operation on possibly-empty variable path: ${…}/tmp …`) reads as
-/// a spinner row and misplaces the box's top.
+/// A box-drawing character (U+2500–U+257F: `│`, `─`, `╌`, `╭` …), the layout's own strokes.
 #[inline]
 const fn is_box_drawing(g: char) -> bool {
     matches!(g, '\u{2500}'..='\u{257F}')
 }
 
-/// The shape of Claude Code's spinner row, whatever glyph it cycles:
-/// `^\s*<glyph> <Capitalised…>( \(<timing>\))?` — one spinner glyph, one space (ruling out the
-/// `⎿  ` gutter's two), a capitalised verb, and text that runs into an ellipsis before any
-/// parenthesised timing, at any indent. Tight enough that the transcript cannot wear it.
+/// The shape of Claude Code's spinner row, whatever glyph it cycles.
 fn is_spinner_shape(row: &str) -> bool {
     let t = crate::text::trim_start(row);
     let mut cs = t.chars();
@@ -160,23 +88,13 @@ fn is_spinner_shape(row: &str) -> bool {
     head.contains('…') || head.contains("...")
 }
 
-/// Classify one screen. A prompt wins over busy: a worker blocked on an
-/// approval box cannot proceed however many background shells its footer
-/// counts, and a supervisor that waited for those would wait forever. A
-/// running turn (a spinner, `esc to interrupt`) wins over a limit notice (a
-/// worker still running is not at the wall yet) — but not when the only thing
-/// holding the screen busy is work the agent left running in the background
-/// (a shell, a workflow): the wall the turn ended on stands then, behind it
-/// (`background_wall`, below). A limit notice wins over a question, and a busy
-/// that is only a background monitor ([`Busy::soft`]) loses to both and to any
-/// other wall the turn ended on: it can outlive any budget.
+/// Classify one screen.
 pub fn worker_phase(rows: &[String]) -> Phase {
     if parse_prompt(rows).is_some() {
         return Phase::Prompt;
     }
     let busy = busy_signal(rows);
     if let Some(b) = busy.filter(|b| !b.soft) {
-        // The turn ended on a wall and only background work holds the screen busy.
         return match background_wall(rows, b) {
             Some(w) if w.kind.reads_limited() => Phase::Limited {
                 message: w.message,
@@ -192,7 +110,6 @@ pub fn worker_phase(rows: &[String]) -> Phase {
     if last_said_row(rows).is_some_and(|r| crate::text::trim_end(r).ends_with('?')) {
         return Phase::Question;
     }
-    // A soft busy loses to any other wall the turn ended on, as a shell's work does.
     if let Some(b) = busy.filter(|b| b.soft)
         && let Some(w) = background_wall(rows, b)
     {
@@ -221,7 +138,7 @@ pub enum Zone {
     Hint,
     /// A row under the composer's bottom rule.
     Footer,
-    /// No composer frame on the screen: any row.
+    /// No composer frame on the screen.
     Screen,
 }
 
@@ -230,8 +147,7 @@ pub enum Zone {
 pub struct Busy {
     pub zone: Zone,
     pub rule: &'static str,
-    /// Only a background monitor is running: a question, a limit notice or
-    /// any other wall the turn ended on outranks it in [`worker_phase`].
+    /// Only a background monitor is running.
     pub soft: bool,
 }
 
@@ -266,21 +182,7 @@ impl fmt::Display for Busy {
     }
 }
 
-/// The busy signal on the screen, read from the live zone when the composer
-/// frame is there. The hard rules first: the status row (a spinner — a word or
-/// a todo's words running into an ellipsis — `Waiting for N dynamic workflow`
-/// / `N background agent` / `N …`, the turn ended while work it started runs
-/// on — or a done row that still counts `N shell(s) still running`), a
-/// `Still working` hint under it, then the footer (`esc to interrupt`, `Still
-/// working`, `ctrl+b to run in background`, `· N shell(s) ·`, or a workflow's
-/// `◯ <name> … agents done` progress line). Then the soft ones: a monitor still
-/// running, on the status row (`· 1 monitor still running`) or in the footer
-/// (`· N monitor(s) ·`), and then work of any other kind left running, on a
-/// done row ([`left_running`]) or counted in the footer ([`counts_work`]).
-/// Last, with no status row at all, the wait Claude Code carries over the
-/// turns it started itself ([`carried_wait`]: module docs), soft. The status
-/// row is read as its LINE, its wrapped rows joined ([`status_block`]).
-/// With no frame, the first row [`busy_reason`] names, anywhere.
+/// The busy signal on the screen, read from the live zone when the composer frame is there.
 pub fn busy_signal(rows: &[String]) -> Option<Busy> {
     let Some(frame) = composer_frame(rows) else {
         return rows
@@ -340,19 +242,12 @@ const CARRIED: Busy = Busy {
     soft: true,
 };
 
-/// THE WAIT CLAUDE CODE CARRIES (module docs): with no status row above the
-/// frame whose top rule is row `top`, the first glyph row the walk up over
-/// the transcript meets ([`glyph_above`]) is a `Waiting for N … to finish`
-/// row, read as its LINE (module docs: a narrow pane wraps it, `✻ Waiting
-/// for` over `  1 dynamic workflow…`). Claude Code drew no done row for the
-/// turns it started itself since (their pending work was the same), so that
-/// row still says what the session waits on.
+/// The WAIT claude code carries (module docs).
 fn carried_wait(rows: &[String], top: usize) -> bool {
     carried_row(rows, top).is_some()
 }
 
-/// The waiting row [`carried_wait`] reads, its first row as drawn: where the
-/// live zone starts when no status row is drawn ([`busy_zone_start`]).
+/// The waiting row [`carried_wait`] reads, its first row as drawn.
 fn carried_row(rows: &[String], top: usize) -> Option<usize> {
     const WAITING: [&str; 3] = [
         "waiting for a dynamic workflow",
@@ -367,27 +262,14 @@ fn carried_row(rows: &[String], top: usize) -> Option<usize> {
         .then_some(i)
 }
 
-/// THE SCREEN READS BUSY BY NOTHING BUT THE WAIT CLAUDE CODE CARRIES: no
-/// status row drawn, no hint or footer that says anything busy, and the
-/// first glyph row over the transcript a waiting row ([`carried_wait`],
-/// module docs). The one busy reading a fresher word may overrule: Claude
-/// Code's renderer decides which done rows it draws, and a build that hid
-/// the one a finished wait's last turn wrote would leave the waiting row
-/// standing for good, where the session's own transcript says the turn
-/// closed with nothing pending (aterm-agent's loop, BG-1). `false` without
-/// the frame.
+/// The screen reads busy by nothing but the WAIT claude code carries.
 #[must_use]
 pub fn carried_wait_alone(rows: &[String]) -> bool {
     composer_frame(rows).is_some_and(|f| status_block(rows, f.top).status.is_none())
         && busy_signal(rows) == Some(CARRIED)
 }
 
-/// Walking up from the top rule `top` over every row (a parked card stepped
-/// over, as [`status_block`] steps over it), the first glyph row
-/// ([`is_glyph_row`]) met; `None` when a person's `❯` row in column 0 (their
-/// prompt, which makes Claude Code draw the next turn's row again), a row
-/// that ends the live zone ([`ends_live_zone`]) or the screen's top comes
-/// first.
+/// Walking up from the top rule `top` over every row.
 fn glyph_above(rows: &[String], top: usize) -> Option<usize> {
     let parked = crate::survey::parked_span(rows);
     for i in (0..top).rev() {
@@ -405,13 +287,7 @@ fn glyph_above(rows: &[String], top: usize) -> Option<usize> {
     None
 }
 
-/// NO STATUS ROW ON THE SCREEN AT ALL: Claude Code's composer frame is drawn,
-/// the walk up from its top rule finds no status row, and the walk on over
-/// the transcript ([`glyph_above`]) meets no glyph row before it stops — no
-/// done row, no waiting row: the one a turn ended on scrolled off, or
-/// Claude Code draws none (`showTurnDuration: false`). Where the screen
-/// says nothing of how the last turn ended, the session's own transcript
-/// may (aterm-agent's loop, BG-1). `false` without the frame.
+/// No status row on the screen at all.
 #[must_use]
 pub fn status_unseen(rows: &[String]) -> bool {
     composer_frame(rows).is_some_and(|f| {
@@ -419,11 +295,7 @@ pub fn status_unseen(rows: &[String]) -> bool {
     })
 }
 
-/// A done row that says work is `still running` under any label: Claude Code writes one label
-/// for whatever background tasks the turn left running (`1 shell`, `1 monitor`, `1 Artifact
-/// comment monitor`, `1 MCP task`, `2 background tasks`, `◇ 1 cloud session`, …). The shell
-/// and the monitor have their own rules; any other kind is the agent's background work too,
-/// soft as a monitor is: fail closed, so a quiet restart never ends work the screen says runs.
+/// A done row that says work is `still running` under any label.
 fn left_running(row: &str) -> bool {
     row.split(" · ").skip(1).any(|item| {
         crate::text::trim_end(item)
@@ -432,10 +304,7 @@ fn left_running(row: &str) -> bool {
     })
 }
 
-/// A footer row whose pill counts background work under any label (the task kinds of
-/// [`left_running`]): an item that is a count, then words that end in a kind of work (`1 MCP
-/// task`, `1 Artifact comment monitor`, `◇ 1 cloud session`, `1 shell, 1 monitor`). A count of
-/// anything else (`10 files changed`) is no work.
+/// A footer row whose pill counts background work under any label.
 fn counts_work(row: &str) -> bool {
     const WORK: [&str; 7] = [
         "shell", "monitor", "task", "agent", "workflow", "session", "team",
@@ -455,10 +324,7 @@ fn counts_work(row: &str) -> bool {
         })
 }
 
-/// The rules of [`busy_signal`] that are the agent's own background work with its turn over (a
-/// dynamic workflow, a background agent or other task it waits for, a shell or a monitor it
-/// left running, a workflow's progress line), never a live turn's (a spinner, `esc to
-/// interrupt`, `Still working`, a foreground command's `ctrl+b to run in background`).
+/// The rules of [`busy_signal`] that are the agent's own background work with its turn.
 const BACKGROUND_RULES: &[&str] = &[
     "waiting for a dynamic workflow",
     "waiting for a background agent",
@@ -472,15 +338,7 @@ const BACKGROUND_RULES: &[&str] = &[
     "background work running",
 ];
 
-/// The wall the turn ended on, seen through the agent's own background work: `busy` is one of
-/// [`BACKGROUND_RULES`], no live turn is drawn anywhere ([`no_live_turn`]) and none has just
-/// begun ([`turn_just_begun`]).
-///
-/// A footer or banner notice is drawn while a turn is still wrapping up too (`⚠ Usage limit
-/// reached · limit resets 9:50pm · clau.de/wrap-up` over `✻ Waiting for 1 background agent and
-/// 1 dynamic workflow to finish`), so it counts only once the status row is a done row
-/// ([`turn_over`]). The vendor's `⎿` block and `⏺` error row are the turn's own last words and
-/// need no done row (a wall found after `claude --resume` has none).
+/// The wall the turn ended on, seen through the agent's own background work.
 fn background_wall(rows: &[String], busy: Busy) -> Option<Wall> {
     if !BACKGROUND_RULES.contains(&busy.rule) || !no_live_turn(rows) || turn_just_begun(rows) {
         return None;
@@ -492,8 +350,7 @@ fn background_wall(rows: &[String], busy: Busy) -> Option<Wall> {
     Some(wall)
 }
 
-/// The status row above the composer is a done row (`✻ Churned for 4h 18m 23s · done 9:22 PM ·
-/// 1 shell still running`): the turn is over, whatever the agent left running.
+/// The status row above the composer is a done row.
 fn turn_over(rows: &[String]) -> bool {
     composer_frame(rows).is_some_and(|f| {
         status_block(rows, f.top)
@@ -502,10 +359,7 @@ fn turn_over(rows: &[String]) -> bool {
     })
 }
 
-/// A message was submitted under the status row (`❯ …` between the status
-/// row and the composer): drawn a frame before the spinner of the turn it
-/// began, so until that spinner comes the waiting row is still the status row
-/// ([`background_wait`]'s guard; the wall's reading needs it too).
+/// A message was submitted under the status row (`❯ …` between the status row and the composer).
 fn turn_just_begun(rows: &[String]) -> bool {
     composer_frame(rows).is_some_and(|f| {
         let block = status_block(rows, f.top);
@@ -513,13 +367,7 @@ fn turn_just_begun(rows: &[String]) -> bool {
     })
 }
 
-/// Whether the agent's own background work (a shell, a monitor, a workflow, a background
-/// agent, hard or soft), and nothing else, keeps this screen busy: the composer frame is drawn,
-/// no live turn is drawn anywhere ([`no_live_turn`]) and none has just begun
-/// ([`turn_just_begun`]), whatever the last thing said. A screen scrolled back, or a local
-/// command's output (`❯ /model` and its `⎿` result) under a wall, hides the wall from
-/// [`worker_phase`]; this lets the loop that waited on that wall keep waiting. It says nothing
-/// of walls: a screen that shows one reads it.
+/// Whether the agent's own background work.
 #[must_use]
 pub fn background_only(rows: &[String]) -> bool {
     composer_frame(rows).is_some()
@@ -528,15 +376,7 @@ pub fn background_only(rows: &[String]) -> bool {
         && !turn_just_begun(rows)
 }
 
-/// HOW MANY BACKGROUND SHELLS Claude Code's screen counts: the `N shell(s)
-/// still running` item of the status row over the composer (`✻ Cooked for 9m
-/// 27s · done 11:07 AM · 1 shell still running`), or a footer row's `N
-/// shell(s)` pill item (`⏵⏵ auto mode on · 2 shells · ← for agents`) — the
-/// largest count either names, the items [`still_running`] and
-/// [`footer_count`] read. `Some(0)` for a composer frame that counts none,
-/// `None` without one (no Claude Code screen to read: a box covers it, or it
-/// is another program's). A count of another kind of work (`1 monitor`) is
-/// not a shell.
+/// How many background shells Claude Code's screen counts.
 #[must_use]
 pub fn shells_running(rows: &[String]) -> Option<u32> {
     let frame = composer_frame(rows)?;
@@ -555,8 +395,7 @@ pub fn shells_running(rows: &[String]) -> Option<u32> {
     Some(counted.unwrap_or(0))
 }
 
-/// One footer or status item's shell count: `N shell`, `N shells`, either
-/// with ` still running`, led by at most a `◇ `.
+/// One footer or status item's shell count.
 fn shell_count(item: &str) -> Option<u32> {
     let item = crate::text::trim(item);
     let item = item.strip_prefix("◇ ").unwrap_or(item);
@@ -568,9 +407,7 @@ fn shell_count(item: &str) -> Option<u32> {
     count.parse().ok()
 }
 
-/// No signal of a live turn on the screen: not on the status row, a hint row or any footer
-/// row (a spinner, `esc to interrupt`, `Still working`, `ctrl+b to run in background`, the
-/// vendor's retry row). Without a composer frame, no row of the screen.
+/// No signal of a live turn on the screen.
 fn no_live_turn(rows: &[String]) -> bool {
     let live = |rule: &str| !BACKGROUND_RULES.contains(&rule);
     let Some(frame) = composer_frame(rows) else {
@@ -591,14 +428,7 @@ fn no_live_turn(rows: &[String]) -> bool {
     !(status || hint || footer)
 }
 
-/// The busy rule when the agent's own background work, and nothing else, keeps this screen
-/// busy: the composer frame is drawn and its busy signal ([`busy_signal`]) is one of
-/// [`BACKGROUND_RULES`] — the turn ended (`✻ Crunched for 9m 27s · done 11:07 AM · 1 shell
-/// still running`) or the agent waits on work it started (`✻ Waiting for 1 dynamic workflow to
-/// finish`). `None` for a live turn, an idle screen, no frame, or a turn just begun
-/// (`turn_just_begun`: a notice would land in it). A natural break for a host's word that
-/// interrupts the orchestration (the live upgrade's notice), never one where anything may be
-/// ended.
+/// The busy rule when the agent's own background work, and nothing else, keeps this screen busy.
 #[must_use]
 pub fn background_wait(rows: &[String]) -> Option<&'static str> {
     composer_frame(rows)?;
@@ -609,7 +439,7 @@ pub fn background_wait(rows: &[String]) -> Option<&'static str> {
     BACKGROUND_RULES.contains(&busy.rule).then_some(busy.rule)
 }
 
-/// The [`BACKGROUND_RULES`] of a SHELL or a MONITOR the turn left running.
+/// The [`BACKGROUND_RULES`] of a SHELL or a monitor the turn left running.
 const LEFT_RUNNING_RULES: &[&str] = &[
     "a shell still running",
     "a shell running",
@@ -617,29 +447,13 @@ const LEFT_RUNNING_RULES: &[&str] = &[
     "a monitor running",
 ];
 
-/// THE TURN IS OVER, AND WHAT RUNS ON IS A SHELL OR A MONITOR IT LEFT: the
-/// status row over the composer is a DONE row ([`turn_over`]: `✻ Worked for
-/// 9m 2s · done 3:15 PM · 1 shell still running`) and what keeps the screen
-/// busy ([`background_wait`]) is a shell or a monitor. Never a turn still
-/// waiting on work it started (`✻ Waiting for 1 background agent to
-/// finish`, `✻ Waiting for 1 dynamic workflow to finish`): that turn goes on
-/// by itself when the work ends, and its last words are not its end. The
-/// worker's own end of its task read here stands over what it left running
-/// (the supervisor's done over background work).
+/// The turn is over, and what runs on is A SHELL or a monitor it left.
 #[must_use]
 pub fn turn_over_background(rows: &[String]) -> bool {
     turn_over(rows) && background_wait(rows).is_some_and(|rule| LEFT_RUNNING_RULES.contains(&rule))
 }
 
-/// WHO OPENED THE TURN DRAWN LAST, read up from the composer's top rule: the
-/// newest row that opens a turn is a person's message (`❯` in column 0, then
-/// whitespace; a message queued under the status row included) —
-/// `Some(false)` — or one of Claude Code's OWN WAKES, after which it goes on
-/// by itself with no message of anyone's (`wait_bg6.out`, `wait_bg12.out`):
-/// a background command's end (`⏺ Background command "…" completed (exit
-/// code 0)`, `… failed with exit code 144`) or a monitor's event (`⏺ Monitor
-/// event: …`) — `Some(true)`. `None`: neither is on the screen, or there is
-/// no frame to read up from.
+/// Who opened the turn drawn last, read up from the composer's top rule.
 #[must_use]
 pub fn opened_by_own_wake(rows: &[String]) -> Option<bool> {
     let top = composer_frame(rows)?.top;
@@ -660,7 +474,6 @@ pub fn opened_by_own_wake(rows: &[String]) -> Option<bool> {
 }
 
 /// Which busy signal `row` carries, if any (named for the CLI's diagnostics).
-/// This is the whole-screen rule, used when the screen has no composer frame.
 pub fn busy_reason(row: &str) -> Option<&'static str> {
     if row.contains("esc to interrupt") {
         Some("esc to interrupt")
@@ -682,8 +495,7 @@ pub fn busy_reason(row: &str) -> Option<&'static str> {
     }
 }
 
-/// The status row's hard rule. A done row (`✻ Cooked for 4s · done 2:41 PM`)
-/// is a status row that says nothing busy.
+/// The status row's hard rule.
 fn status_busy(row: &str) -> Option<&'static str> {
     if is_activity_row(row) {
         Some("spinner")
@@ -726,9 +538,7 @@ fn still_running(row: &str, noun: &str) -> bool {
         || number_then(row, "", &format!(" {noun}s still running"))
 }
 
-/// `N <noun>` or `N <noun>s` as one footer item: led by `· ` (or the start of
-/// the row), ended by ` ·`, a wide gap, the row's end or ` still running`
-/// (`⏵⏵ auto mode on · 1 shell · ← for agents`).
+/// `N <noun>` or `N <noun>s` as one footer item.
 fn footer_count(row: &str, noun: &str) -> bool {
     let t = crate::text::trim_end(row);
     t.match_indices(noun).any(|(at, _)| {
@@ -752,16 +562,7 @@ fn footer_count(row: &str, noun: &str) -> bool {
     })
 }
 
-/// A workflow's progress line under the footer: an older build's `◯ <name>
-/// <description…> 1/4 agents done · 20m 59s · ↓ 428.2k tokens`, or 2.1.304's
-/// workflow row (`◯ <name>  ▰▰▰▰▰▱▱▱  3/4 · 4h10m · ↓ 1.0m tokens`,
-/// [`crate::agents_panel`]), which no longer says `agents done` — no store
-/// build of 2.1.301 to 2.1.304 holds the words, so on those builds this rule
-/// read nothing until the panel's reader took the row. A PAUSED workflow
-/// (`⏸ <name>  …`) runs nothing, as the old rule's `◯` already said — and
-/// the paused bullet is manual and plan mode's pill glyph, so their footer
-/// row (`  ⏸ manual mode on · ? for shortcuts`) reads as a paused workflow
-/// too: leaving `⏸` out is what keeps every idle manual-mode footer idle.
+/// A workflow's progress line under the footer.
 fn is_workflow_progress(row: &str) -> bool {
     use crate::agents_panel::{Bullet, PROGRESS_OLD, RowKind, one_cell, parse_row};
     (crate::text::trim_start(row).starts_with('◯')
@@ -773,10 +574,7 @@ fn is_workflow_progress(row: &str) -> bool {
         })
 }
 
-/// `^\s*<glyph>\s+\S+…` — a spinner glyph ([`is_spinner_glyph`], so an unnamed glyph still
-/// counts), whitespace, then a word that runs into an ellipsis (`…` or `...`). One word only:
-/// this is the whole-screen scan, where several words ending in an ellipsis are anyone's
-/// prose; the status row reads those through [`is_activity_row`].
+/// `^\s*<glyph>\s+\S+…`.
 pub fn is_spinner_row(row: &str) -> bool {
     let t = crate::text::trim_start(row);
     let mut cs = t.chars();
@@ -796,12 +594,7 @@ pub fn is_spinner_row(row: &str) -> bool {
         && (chars.as_str().contains('…') || chars.as_str().contains("..."))
 }
 
-/// A status row naming an activity in progress: the glyph, then text that
-/// runs into an ellipsis before any `(` suffix — one spinner word
-/// (`✶ Deliberating…`) or the several words of the todo in progress
-/// (`✻ Running the test suite… (45s · ↑ 2.1k tokens)`), which
-/// [`is_spinner_row`]'s one-word rule does not see. Read on the status row
-/// only; the whole-screen scan keeps the one-word rule.
+/// A status row naming an activity in progress.
 fn is_activity_row(row: &str) -> bool {
     let t = crate::text::trim_start(row);
     let mut cs = t.chars();
@@ -819,56 +612,7 @@ fn is_activity_row(row: &str) -> bool {
         || is_retry_status(text)
 }
 
-/// The text of the vendor's API-retry status row, which no ellipsis ends:
-/// the row that stands in for the spinner while Claude Code retries its own
-/// request, so the worker is busy. Read as the TAIL of its line, in the
-/// vendor's own shapes whole (2.1.300's `uyn`, read from the binary; the
-/// first measured on 2.1.283, 2026-09-27), so the words in front may be cut
-/// (`…`) at a narrow width:
-/// * `<error> · Retrying in <wait>[ (<reset>)] · attempt <k>/<n>` — `Can't
-///   reach the API server — check your internet or DNS (ENOTFOUND) ·
-///   Retrying in 1s · attempt 5/10`, `Usage limit reached · Retrying in 14s
-///   (9:50pm) · attempt 3/10` (the reset when the error carries limits);
-/// * `<banner> · will retry in <wait> · check your network` (a stalled
-///   stream);
-/// * `<banner> · next try in <wait> · attempt <k>[/<n>] · esc to interrupt`
-///   (the auto-mode check unavailable, a low-priority wait);
-/// * `<banner> · retrying, waiting up to <wait> · attempt <k>/<n>`, or a last
-///   item `retrying once, waiting up to <wait>` (no response from the API);
-/// * and any status line whose LAST ` · ` item is `esc to interrupt`.
-///
-/// `<wait>` is words of a number and its unit (`14s`, `1m 30s`, `2d`). The
-/// retry clause stands in any item past the first, and every item after it
-/// is the vendor's own (`attempt <k>[/<n>]`, `check your network`, `esc to
-/// interrupt`), the last one maybe cut by the pane (`· attempt 1/3…`, `·
-/// att…`): a pane that cuts the row's tail leaves it the row. A done row
-/// (`Cogitated for 0s · done 11:02 PM`), the worker's words, a clause that is
-/// not the vendor's (`Retrying in soon`, `attempt soon`, `attempt one of
-/// 300`) are not one.
-///
-/// CLAUDE CODE'S OWN RETRY OF A USAGE LIMIT is one too: under a
-/// `CLAUDE_CODE_RETRY_WATCHDOG` a person set by hand (aterm never sets it)
-/// the vendor draws no limit notice, keeps the request and ticks `✻ Session
-/// limit reached · Retrying in 2m 28s (8:48am) · attempt 1/300` until the
-/// reset, then sends it again by itself (measured on 2.1.300 and 2.1.301 in
-/// the lab: the five-hour and the weekly limit, `Retrying in 5h (Oct 16 at
-/// 9:49am)`, at 110, 80 and 50 columns, a turn's first request and its
-/// second). Its wait names the reset after the span, in parentheses. That is
-/// a turn in progress, as any retry of the vendor's is: nothing is typed
-/// into it, the served retry goes on as the turn, and Esc on it ends the
-/// turn as Esc ends any. With a statusLine configured the footer draws no
-/// `esc to interrupt` meanwhile, so this row is the screen's only word that
-/// the turn is not over; read as a done row, the point was idle and the
-/// supervisor typed into a session that was retrying.
-///
-/// WHERE INK PUT THE WORDS AROUND THE CLAUSE is the line reader's to undo,
-/// never this rule's: under about 44 columns the vendor's glyph box wraps
-/// away from its text, and where the cut head and the tail do not fit beside
-/// each other they are laid out as two text columns side by side, their rows
-/// interleaved (MEASURED on 2.1.301 at 18 to 38 columns, `API     ·
-/// Retrying in 1s · attempt` over `error  1/10`; on 2.1.300 at 50, the
-/// watchdog's weekly retry), which [`StatusBlock::line`] reads column by
-/// column ([`bare_line`]) back into the shapes above.
+/// The text of the vendor's API-retry status row, which no ellipsis ends.
 fn is_retry_status(text: &str) -> bool {
     let items: Vec<&str> = text.split(" · ").map(crate::text::trim_end).collect();
     let [_, .., last] = items.as_slice() else {
@@ -878,14 +622,11 @@ fn is_retry_status(text: &str) -> bool {
         return true;
     }
     let number = |s: &str| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit());
-    // `14s`, `2m`, `1m 30s`, `2d`: each word a number and its unit.
     let wait = |s: &str| {
         !s.is_empty()
             && s.split(' ')
                 .all(|w| w.strip_suffix(['s', 'm', 'h', 'd']).is_some_and(number))
     };
-    // `14s (9:50pm)`, `2m 28s (8:48am)`, `5h (Oct 16 at 9:49am)`: the wait,
-    // then the reset the limit names.
     let wait_reset = |s: &str| {
         wait(s)
             || s.split_once(" (").is_some_and(|(w, reset)| {
@@ -909,7 +650,6 @@ fn is_retry_status(text: &str) -> bool {
     }) else {
         return false;
     };
-    // `attempt 3/10`, `attempt 2`: the vendor's count of its tries.
     let count = |a: &str| match a.split_once('/') {
         Some((k, n)) => number(k) && number(n),
         None => number(a),
@@ -917,8 +657,6 @@ fn is_retry_status(text: &str) -> bool {
     const WORDS: [&str; 2] = ["check your network", "esc to interrupt"];
     let tail =
         |item: &str| item.strip_prefix("attempt ").is_some_and(count) || WORDS.contains(&item);
-    // The last item cut by the pane: the start of one of the vendor's
-    // (`attempt 1/3…`, `att…`).
     let cut = |item: &str| {
         item.strip_suffix('…')
             .map(crate::text::trim_end)
@@ -957,8 +695,7 @@ fn number_then(row: &str, prefix: &str, suffix: &str) -> bool {
     false
 }
 
-/// Claude Code's composer frame: the top rule (directly above the composer's
-/// caret row) and the bottom rule under it.
+/// Claude Code's composer frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Frame {
     pub(crate) top: usize,
@@ -969,41 +706,23 @@ pub(crate) fn composer_frame(rows: &[String]) -> Option<Frame> {
     frame_at(rows, composer_index(rows)?)
 }
 
-/// The frame around caret row `caret`: the rule right above it and the first
-/// rule under it.
+/// The frame around caret row `caret`.
 fn frame_at(rows: &[String], caret: usize) -> Option<Frame> {
     let top = caret.checked_sub(1).filter(|&t| is_rule(&rows[t]))?;
     let bottom = (caret + 1..rows.len()).find(|&i| is_rule(&rows[i]))?;
     Some(Frame { top, bottom })
 }
 
-/// The composer's frame on a screen ([`composer_rules`]) and how much of the
-/// screen the search for it READ — for a caller that keeps a reading of the
-/// frame and the rows under its bottom rule from one rebuild of a pane's rows
-/// to the next, and knows which rows changed between them (aterm's footer
-/// and lights: `footer::mode_row_under`, `footer::pill_row_under`).
-///
-/// What the search reads, from [`composer_index`] and [`frame_at`]: every
-/// row from the screen's last up to the caret row it stops at, row by row;
-/// the row above a `❯` row it tests (its rule, for an option-like caret);
-/// and, for a `❯` row that is not a caret under a rule, the rows
-/// [`is_list_entry`] walks — up to the rule over the list, and on up the
-/// screen to the rule over that. So with a caret row found under its rule,
-/// the frame is a function of the rows from the one above the caret down, and
-/// of nothing over them — unless a `❯` row under the caret (the slash menu's
-/// highlighted entry, a pointed row of the agents panel, a draft that holds
-/// one) walks, which may go anywhere: then, as with no caret row at all, of
-/// every row. [`Self::from`] is that first row.
+/// The composer's frame on a screen ([`composer_rules`]) and how much of the screen the search.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FrameReach {
     frame: Option<Frame>,
-    /// The first row the search read: no row above it can move the frame.
+    /// The first row the search read.
     from: usize,
 }
 
 impl FrameReach {
-    /// The frame on `rows` and what its search read. Never panics, on any
-    /// rows.
+    /// The frame on `rows` and what its search read.
     #[must_use]
     pub fn of(rows: &[String]) -> Self {
         let Some(caret) = composer_index(rows) else {
@@ -1023,9 +742,7 @@ impl FrameReach {
         }
     }
 
-    /// [`Self::of`], falling back to agy's or Muse Code's composer rules
-    /// ([`crate::agy::composer_rules`], [`crate::muse::composer_rules`]) when
-    /// Claude Code's composer is not on `rows`.
+    /// [`Self::of`], falling back to agy's or Muse Code's composer rules.
     #[must_use]
     pub fn of_or_agy(rows: &[String]) -> Self {
         let reach = Self::of(rows);
@@ -1039,8 +756,6 @@ impl FrameReach {
             };
         }
         if let Some((top, bottom)) = crate::muse::composer_rules(rows) {
-            // Muse's open-frame test also reads the previous nonblank row
-            // above its top rule for a drawer's key hints.
             return Self {
                 frame: Some(Frame { top, bottom }),
                 from: 0,
@@ -1049,8 +764,7 @@ impl FrameReach {
         reach
     }
 
-    /// The frame's rules, `(top, bottom)` — [`composer_rules`] of the rows
-    /// it was found on.
+    /// The frame's rules, `(top, bottom)`.
     #[must_use]
     pub fn rules(&self) -> Option<(usize, usize)> {
         self.frame.map(|f| (f.top, f.bottom))
@@ -1062,22 +776,13 @@ impl FrameReach {
         self.from
     }
 
-    /// Whether the search reads the rows as it read them before the rows
-    /// `changed` changed (the count of rows the same): none of them is a row
-    /// it read, so the frame and this reach stand without a search.
+    /// Whether the search reads the rows as it read them before the rows `changed` changed.
     #[must_use]
     pub fn unmoved(&self, changed: &[usize]) -> bool {
         changed.iter().all(|&j| j < self.from)
     }
 
-    /// Whether a reading of the frame and of the rows UNDER its bottom rule
-    /// alone — the footer's rule and mode row, the lights' pill — reads the
-    /// rows as it read them before the rows `changed` changed, `now` being
-    /// the frame found on them since ([`Self::of`], or this reach where it is
-    /// [`Self::unmoved`]): the same frame, and no changed row under its bottom
-    /// rule. With no frame then and now, every such reading is the same
-    /// none. A changed row in the composer itself (a keystroke's echo) or
-    /// over it moves no such reading while the frame stands.
+    /// Whether a reading of the frame and of the rows under its bottom rule alone.
     #[must_use]
     pub fn holds_under(&self, now: &FrameReach, changed: &[usize]) -> bool {
         now.frame == self.frame
@@ -1088,19 +793,11 @@ impl FrameReach {
 }
 
 /// Whether the screen shows Claude Code's composer between its two rules.
-/// Without it the worker is something else (a build, a script, a REPL) or a
-/// box covers the screen, and the whole-screen rules apply.
 pub fn has_composer_frame(rows: &[String]) -> bool {
     composer_frame(rows).is_some()
 }
 
-/// Whether Claude Code's composer frame on `rows` is caught mid-repaint: its
-/// bottom rule drawn shorter than its top rule, or standing on the last row
-/// read, where the footer row Claude Code draws under it is not yet written.
-/// A reply growing under the window is repainted row by row with its footer
-/// last; a read in between shows the frame and no busy footer (2.1.307, the
-/// forever lab's `r7-both` L6, 2026-10-22: the bottom rule 109 of 144
-/// columns on the grid's last row). False with no frame.
+/// Whether Claude Code's composer frame on `rows` is caught mid-repaint.
 #[must_use]
 pub fn composer_frame_torn(rows: &[String]) -> bool {
     let Some(Frame { top, bottom }) = composer_frame(rows) else {
@@ -1110,12 +807,7 @@ pub fn composer_frame_torn(rows: &[String]) -> bool {
     bottom + 1 == rows.len() || width(&rows[bottom]) < width(&rows[top])
 }
 
-/// Claude Code's prompt box in shell mode: `!` typed into the empty box turns its caret from
-/// `❯` into `!`, between the same two rules (2.1.283: `!\u{a0}Try "…"` under the placeholder,
-/// `!\u{a0}ls` with a command typed; the `SHELL_MODE*` fixtures). It is the REPL, drawn and
-/// taking keys, so its `idle` is evidence ([`crate::ClaudeReader`]'s `phase_authoritative`);
-/// it is not [`composer_frame`], whose `❯` caret row is where the draft, the footer, the lights
-/// and the turn-end policy read a prompt.
+/// Claude Code's prompt box in shell mode.
 pub(crate) fn has_shell_mode_frame(rows: &[String]) -> bool {
     (1..rows.len()).rev().any(|i| {
         let caret = rows[i]
@@ -1125,18 +817,7 @@ pub(crate) fn has_shell_mode_frame(rows: &[String]) -> bool {
     })
 }
 
-/// Whether row `row` of `rows` is inside one of Claude Code's prompt boxes, from its top rule
-/// down to its bottom rule: the `❯` composer, or shell mode's `!` box
-/// ([`has_shell_mode_frame`]), its caret in column 0 right under the top rule. The box the row
-/// is in is the nearest one that starts at or above it; a box with no bottom rule yet holds
-/// nothing.
-///
-/// Claude Code keeps the terminal's cursor here while its REPL takes keys, so the box that
-/// holds the cursor is the REPL that is running (measured on 2.1.283, both renderers): from the
-/// first frame that draws the box whole the cursor sits on its caret row — at column 2 at rest,
-/// after a draft's last character, in shell mode, with the `/` and `@` menus and the shortcuts
-/// open, after one Ctrl-C. It is never in a box an earlier run left on the screen: a relaunched
-/// inline renderer keeps the cursor below the old box until its REPL is up.
+/// Whether row `row` of `rows` is inside one of Claude Code's prompt boxes.
 #[must_use]
 pub fn prompt_box_holds(rows: &[String], row: usize) -> bool {
     let caret_row = |r: &str| {
@@ -1152,30 +833,23 @@ pub fn prompt_box_holds(rows: &[String], row: usize) -> bool {
         .is_some_and(|bottom| row <= bottom)
 }
 
-/// The index of the composer's bottom rule, when the frame is on the screen, for aterm's
-/// footer (`aterm_agent::harness::footer`), which writes its facts into that rule (on the glass
-/// only) and reads the mode row under it.
+/// The index of the composer's bottom rule, when the frame is on the screen.
 pub fn composer_bottom(rows: &[String]) -> Option<usize> {
     composer_frame(rows).map(|f| f.bottom)
 }
 
-/// Both composer rules, `(top, bottom)`, when the frame is on the screen, for aterm's lights
-/// (`aterm_agent::harness::lights`), which read the tags Claude Code draws into the top rule
-/// (`──── <tag> ↯ ─`).
+/// Both composer rules, `(top, bottom)`, when the frame is on the screen.
 pub fn composer_rules(rows: &[String]) -> Option<(usize, usize)> {
     composer_frame(rows).map(|f| (f.top, f.bottom))
 }
 
-/// The index of the composer's top rule, when the frame is on the screen —
-/// for the prompt parser, which must know where the live zone begins.
+/// The index of the composer's top rule, when the frame is on the screen.
 pub(crate) fn composer_top(rows: &[String]) -> Option<usize> {
     composer_frame(rows).map(|f| f.top)
 }
 
-/// A full-width composer rule: `─` from column 0 to the last column, with at
-/// most a label inside it (`──── sandboxed ─`) and none of a table's joints.
+/// A full-width composer rule.
 pub fn is_rule(row: &str) -> bool {
-    // A rule opens on `─` (and the trim below cuts only its end): any other
     // first char rejects the row before the char-wise trims and counts.
     if !row.as_bytes().starts_with("─".as_bytes()) {
         return false;
@@ -1184,10 +858,7 @@ pub fn is_rule(row: &str) -> bool {
     t.ends_with('─') && rule_run(t)
 }
 
-/// Whether `t` holds ten `─` or more and none of the box's joins and sides
-/// (`┬ ┴ ┼ ├ ┤ ┌ ┐ └ ┘ │`). Every one of them is U+25xx, encoded
-/// `E2 94 xx`, and `E2` only ever opens a char, so one pass over the bytes
-/// counts and refuses them exactly as a char-wise count and search would.
+/// Whether `t` holds ten `─` or more and none of the box's joins and sides (`┬ ┴ ┼ ├ ┤ ┌ ┐ └ ┘ │`).
 fn rule_run(t: &str) -> bool {
     let b = t.as_bytes();
     let mut dashes = 0usize;
@@ -1196,7 +867,6 @@ fn rule_run(t: &str) -> bool {
         if b[i] == 0xE2 && i + 2 < b.len() && b[i + 1] == 0x94 {
             match b[i + 2] {
                 0x80 => dashes += 1,
-                // ┬ ┴ ┼ ├ ┤ ┌ ┐ └ ┘ │
                 0xAC | 0xB4 | 0xBC | 0x9C | 0xA4 | 0x8C | 0x90 | 0x94 | 0x98 | 0x82 => {
                     return false;
                 }
@@ -1210,9 +880,7 @@ fn rule_run(t: &str) -> bool {
     dashes >= 10
 }
 
-/// The width in chars of a PLAIN rule — ten `─` or more and nothing else,
-/// trailing blanks aside — or `None`: a rule carrying a label (`── Voice
-/// input … ──`, which [`is_rule`] takes) is not one.
+/// The width in chars of a plain rule.
 pub(crate) fn plain_rule_width(row: &str) -> Option<usize> {
     let t = crate::text::trim_end(row).as_bytes();
     let dash = "─".as_bytes();
@@ -1220,25 +888,17 @@ pub(crate) fn plain_rule_width(row: &str) -> Option<usize> {
         .then_some(t.len() / dash.len())
 }
 
-/// The live zone above the top rule, found by walking up from it: the status
-/// row, if one comes before the transcript, the last of the rows its line was
-/// wrapped onto ([`status_line_end`]), and where the rows under it (or under
-/// the transcript row the walk stopped at) begin.
+/// The live zone above the top rule, found by walking up from it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct StatusBlock {
     pub(crate) status: Option<usize>,
-    /// The status line's last row: [`Self::status`] itself when its line fits
-    /// its row (meaningless without a status row).
+    /// The status line's last row.
     pub(crate) end: usize,
     pub(crate) from: usize,
 }
 
 impl StatusBlock {
-    /// The status row's text, its line read across the rows Ink wrapped it
-    /// onto, joined with one space ([`crate::wrap::rejoined`]): `✻ Choreogr
-    /// aphing…` (a word wider than the row broken where the row ends, read in
-    /// two halves), `✻ Baked for 0s · done 7:06 AM` — a glyph alone on its
-    /// row read over the text columns Ink laid out under it ([`status_text`]).
+    /// The status row's text, its line read across the rows Ink wrapped it.
     pub(crate) fn line<'a>(&self, rows: &'a [String]) -> Option<Cow<'a, str>> {
         let status = self.status?;
         Some(if self.end > status {
@@ -1250,9 +910,6 @@ impl StatusBlock {
 }
 
 pub(crate) fn status_block(rows: &[String], top: usize) -> StatusBlock {
-    // A rating card (or the drafts card) parked above the composer is one block the walk steps
-    // over, whatever its rows say: read as a transcript row, it would end the walk and hide the
-    // status row under it.
     let parked = crate::survey::parked_span(rows);
     let width = crate::question::screen_width(rows);
     for i in (0..top).rev() {
@@ -1281,48 +938,7 @@ pub(crate) fn status_block(rows: &[String], top: usize) -> StatusBlock {
     }
 }
 
-/// THE STATUS ROW'S LINE, wrapped in a narrow pane (S2R-F1;
-/// MEASURED on 2.1.300 at 10 columns, the fixtures
-/// `claude-2.1.300-spinner-*-10col.txt`): when row `i` opens the status line
-/// — a glyph row ([`is_glyph_row`]), or its glyph alone on its row, the line
-/// under it — its last row, short of row `until`, in a pane `width` cells
-/// wide. Ink wraps the spinner's line at the row's own column (`✻ Choreogr`
-/// over `aphing…`; `·` over `Precipitat` over `ing…`, the glyph alone where
-/// the word did not fit beside it; `✻` over `Calculatin` over `g` over `…`,
-/// broken between the spans of its shimmer too: [`crate::wrap::run_end`])
-/// and a done row's text at its text column, two in (`✻ Baked for 0s · done
-/// 7:06` over `  AM`, by the rule of a row too full for the next word,
-/// [`crate::wrap::continues`]; never under a row that already reads busy
-/// alone, but for the rest of a parenthesis it left open, `✶ Deliberating…
-/// (4s · esc to` over `  interrupt)` at 30 columns); never into a row that
-/// opens a block of its own (a `⎿` tip or
-/// todo, a queued `❯` message, a transcript row, another glyph row, the
-/// survey). Read a row at a time the spinner held
-/// no `…` and the footer's `esc to interrupt` is cut off at that width: a
-/// running turn read idle, and `keep going` was typed into it.
-///
-/// A join never turns a DONE row ([`is_done_shape`]) into an activity: a
-/// word with an ellipsis under a full done row is not its verb (`Thinking
-/// about it…` in column 0, `  more to say…` at column 2). Nor does a join
-/// ever LOSE a busy reading the row has on its own ([`status_busy`]; the
-/// cross-lane review's screen F2: a row read by its tail, `· esc to
-/// interrupt` or the vendor's retry clause, took the proxy hint Claude Code
-/// draws under it at column 2 as its last item, and the turn still retrying
-/// read idle). A row in the glyph's own column joins only a row that has no
-/// status shape of its own ([`has_status_shape`]) to a line that has one, so
-/// a stray row there cannot turn a done row busy either.
-///
-/// A GLYPH INK WRAPPED AWAY FROM ITS TEXT (the cross-lane review's screen F1,
-/// MEASURED on 2.1.301: the vendor's glyph box is 2 cells wide with
-/// `flexWrap`, and where the text does not fit beside it the text moves
-/// under it — the retry row at 34, 38 and 42 columns, `✻` over `API error ·
-/// Retrying in 1s · attempt 2/10`; the spinner at 10, `✻` over `Infusing…`)
-/// opens the line where a row at its column under it does, and the line is
-/// every row under it to the first blank, a row against the right edge among
-/// them (the block's last row fills an 18-column pane, `      attempt 1/10`:
-/// the decision review's RR-LC-1), read column by column where Ink laid it
-/// out as two ([`bare_line`]). Read past, the walk took the previous turn's
-/// done row for the live one and a retrying turn read idle.
+/// The status row's line, wrapped in a narrow pane.
 fn status_line_end(rows: &[String], i: usize, until: usize, width: usize) -> Option<usize> {
     let row = rows[i].as_str();
     let t = crate::text::trim(row);
@@ -1335,11 +951,8 @@ fn status_line_end(rows: &[String], i: usize, until: usize, width: usize) -> Opt
         .unwrap_or(until);
     let lead = leading_spaces(row);
     let text = crate::text::trim(cs.as_str());
-    // The spinner's line at its own column, broken between the spans of its
-    // shimmer as well as where a row is full ([`crate::wrap::run_end`]).
     let run = crate::wrap::run_end(rows, i, lead, until);
     if text.is_empty() && !is_glyph_row(row) {
-        // The glyph alone: its text's rows, to the first blank.
         let opens = run > i && is_glyph_row(&crate::wrap::rejoined(&rows[i..=run]));
         let end = (i + 1..until)
             .take_while(|&k| !crate::text::trim(&rows[k]).is_empty())
@@ -1355,16 +968,6 @@ fn status_line_end(rows: &[String], i: usize, until: usize, width: usize) -> Opt
         !(is_done_shape(row) && is_activity_row(&joined))
             && !(status_busy(row).is_some() && status_busy(&joined).is_none())
     };
-    // A done row's text at its text column, where a row is full. A row that
-    // already reads busy alone (its verb run into its `…`, a retry status)
-    // takes nothing at column two: its line wraps at its own column, and the
-    // row there under a full retry row is the vendor's own notice (2.1.283's
-    // ` Fast mode unavailable: …`; joined,
-    // the retry read as a done row, and idle mid-retry) — unless the row's own
-    // parenthesis is still open: the spinner's `(4s · esc to` cut at the
-    // pane's edge, the row under it (`  interrupt)`) the rest of that
-    // parenthesis, never a notice (read alone, the narrow pane's hint was
-    // lost: `harness::upgrade_drive`'s `busy_footer`).
     let done_end = if is_activity_row(row) && !paren_open(text) {
         i
     } else {
@@ -1380,16 +983,12 @@ fn status_line_end(rows: &[String], i: usize, until: usize, width: usize) -> Opt
     Some(if joins { run } else { i })
 }
 
-/// Whether `text` opens a parenthesis it does not close: a status row's
-/// `(4s · esc to` cut by the pane's edge ([`status_line_end`]).
+/// Whether `text` opens a parenthesis it does not close.
 fn paren_open(text: &str) -> bool {
     text.matches('(').count() > text.matches(')').count()
 }
 
-/// A row that opens a block of its own under the status row, never the rest of
-/// its line ([`status_line_end`]): a `⎿` row (a tip, a todo list), a queued
-/// `❯` message, a `⏺`/`●` row (a transcript row, the survey's question),
-/// another glyph row, a rule.
+/// A row that opens a block of its own under the status row, never the rest of its line.
 fn opens_block(row: &str) -> bool {
     crate::text::trim_start(row).starts_with(['⎿', '❯', '!', '●', '⏺'])
         || is_glyph_row(row)
@@ -1397,9 +996,7 @@ fn opens_block(row: &str) -> bool {
         || ends_live_zone(row)
 }
 
-/// The text of a status line's rows `block` ([`StatusBlock::line`]): a glyph
-/// alone on its first row read by [`bare_line`], any other line its rows
-/// joined ([`crate::wrap::rejoined`]).
+/// The text of a status line's rows `block` ([`StatusBlock::line`]).
 fn status_text(block: &[String]) -> String {
     let mut cs = crate::text::trim(&block[0]).chars();
     if cs.next().is_some() && cs.next().is_none() {
@@ -1409,28 +1006,7 @@ fn status_text(block: &[String]) -> String {
     }
 }
 
-/// THE LINE OF A BARE GLYPH'S BLOCK (`block[0]` the glyph's row,
-/// [`status_line_end`]): where its cut head and its tail do not fit beside
-/// each other, Ink lays the vendor's retry row out as TWO text columns side
-/// by side — the cut error on the left, the dim tail from its ` · ` on — and
-/// their rows interleave (`API    · Retrying in` / `error 4s · attempt` /
-/// `      1/10` at 20 columns, MEASURED on 2.1.301; the decision review's
-/// RR-LC-1; and the watchdog's retry of the weekly limit at 50 columns,
-/// MEASURED on 2.1.300: `Weekly    · Retrying in 5h (Oct 16 at 9:49am) ·`
-/// over `li…      attempt 1/300`, read `✻ Weekly li… · Retrying in 5h (Oct
-/// 16 at 9:49am) · attempt 1/300`). Joined row by row that reads `Retrying
-/// in error 4s`, no wait, and the live retry read idle. The columns are told
-/// by the first row under the glyph: its first ` · ` is where the tail's
-/// column opens, at column `col`. Where EVERY row under the glyph is blank at
-/// `col - 1` and has text past it, the line is the glyph, the left parts
-/// joined, then the right parts joined. A head that fills its column leaves
-/// no such gap — the stalled stream's uncut `Waiting for API response` at 34
-/// to 41 columns, `Waiting for API · will retry in 2m` over `response       ·
-/// check your network` (the 2.1.301 `aSn` laid out as the measured blocks
-/// are) — and is split there too, but only where the split reads as the
-/// vendor's activity or retry row and the rows joined have no status shape:
-/// it only ever adds a busy reading. Any other block is
-/// [`crate::wrap::rejoined`], as before.
+/// The line of a bare glyph's block (`block[0]` the glyph's row, [`status_line_end`]).
 fn bare_line(block: &[String]) -> String {
     let joined = || crate::wrap::rejoined(block);
     let under: Vec<Vec<char>> = block[1..].iter().map(|r| r.chars().collect()).collect();
@@ -1475,9 +1051,7 @@ fn bare_line(block: &[String]) -> String {
     }
 }
 
-/// A status line with a shape of its own: a spinner's activity or the
-/// vendor's retry row ([`is_activity_row`]), a `Waiting for N …` row, or a
-/// done row ([`is_done_shape`]).
+/// A status line with a shape of its own.
 fn has_status_shape(line: &str) -> bool {
     is_activity_row(line)
         || line
@@ -1486,10 +1060,7 @@ fn has_status_shape(line: &str) -> bool {
         || is_done_shape(line)
 }
 
-/// A DONE row's shape: past the glyph, a word, ` for `, the turn's time (words
-/// of a number and its unit, `9m 27s`), then the row's end or ` ·` (`✻
-/// Crunched for 9m 27s · done 11:07 AM · 1 shell still running`, `✻ Worked
-/// for 0s ·` cut there by a narrow pane).
+/// A done row's shape: past the glyph, a word, ` for `.
 fn is_done_shape(line: &str) -> bool {
     let t = crate::text::trim(line);
     let mut cs = t.chars();
@@ -1510,42 +1081,25 @@ fn is_done_shape(line: &str) -> bool {
             .all(|w| w.strip_suffix(['s', 'm', 'h', 'd']).is_some_and(number))
 }
 
-/// A row no live zone reaches past, walking up from the composer's top rule: Claude Code's
-/// launch card (anchor `launch.banner`), which opens a process's output, or another composer
-/// rule, the frame of a process that drew before this one. Neither is ever between a live
-/// status row and its own frame, and everything above either was drawn by something else (a
-/// dead process's frame over a fresh `claude`'s card,
-/// [`crate::prompt::fixtures::EXIT_RELAUNCH_STALE_FOOTER`]).
+/// A row no live zone reaches past, walking up from the composer's top rule.
 fn ends_live_zone(row: &str) -> bool {
     is_rule(row) || is_launch_card_row(row)
 }
 
-/// The launch card's own logo row (` ▐▛███▜▌   Claude Code v2.1.283`): the banner text on a row
-/// that starts with the card's `▐` glyph. The banner text alone is not enough: a queued `❯`
-/// message or the worker's todo list can name "Claude Code v…" between a live status row and
-/// its frame, and stopping there would hide a running turn's spinner.
+/// The launch card's own logo row (` ▐▛███▜▌ Claude Code v2.1.283`).
 fn is_launch_card_row(row: &str) -> bool {
     crate::text::trim_start(row).starts_with('\u{2590}')
         && row.contains(const { crate::anchors::anchor_text("launch.banner") })
 }
 
-/// A row that can be the status row: a spinner glyph in column 0, then
-/// whitespace (`✶ Deliberating…`, `· Mustering… (38s)`, `✻ Cooked for 4s ·
-/// done 2:41 PM`) — or, wherever it sits on the row, the full spinner
-/// [shape](is_spinner_shape), so that an INDENTED live row is still the
-/// status row and not something the walk steps over on its way to the
-/// transcript. A glyph alone on its row is none here: it opens the status row
-/// only over the text a narrow pane wrapped away from it
-/// ([`status_line_end`], read by the status walk).
+/// A row that can be the status row.
 pub fn is_glyph_row(row: &str) -> bool {
     let mut cs = row.chars();
     (cs.next().is_some_and(|g| SPINNERS.contains(&g)) && cs.next().is_some_and(char::is_whitespace))
         || is_spinner_shape(row)
 }
 
-/// A row only the transcript has: the worker's message or tool call in column
-/// 0 (`⏺`; `●` where the platform draws that — never the session survey), or
-/// output under the `⎿` gutter that is not a tip or a todo item.
+/// A row only the transcript.
 pub(crate) fn is_transcript_row(row: &str) -> bool {
     if is_survey(row) {
         return false;
@@ -1557,9 +1111,7 @@ pub(crate) fn is_transcript_row(row: &str) -> bool {
     t.starts_with('⎿') && !is_tip_or_todo(t)
 }
 
-/// A `⎿  Tip: …` row, or a row of the todo list Claude Code can hang under
-/// its spinner (`⎿  ☐ Write the tests`, `     ☒ Read the parser`, `     … +3
-/// pending`). `t` is trimmed at the start.
+/// A `⎿ Tip: …` row, or a row of the todo list Claude Code can hang under its spinner.
 fn is_tip_or_todo(t: &str) -> bool {
     let under_gutter = t.strip_prefix('⎿').map(str::trim_start);
     under_gutter.is_some_and(|g| g.starts_with("Tip:")) || {
@@ -1568,54 +1120,25 @@ fn is_tip_or_todo(t: &str) -> bool {
     }
 }
 
-/// Claude Code's session survey, which it parks above the composer between
-/// turns and during them: `● How is Claude doing this session? (optional)`
-/// and its options row `1: Bad    2: Fine   3: Good   0: Dismiss`.
+/// Claude Code's session survey, which it parks above the composer between turns and during them.
 pub fn is_survey(row: &str) -> bool {
     let t = crate::text::trim_start(row);
     (t.starts_with('●') && t.contains("How is Claude doing this session"))
         || (t.starts_with("1: Bad") && t.contains("0: Dismiss"))
 }
 
-/// Whether a rating card (the session survey or another, [`crate::survey::survey_block`]) is
-/// open above the composer, where the next digit typed is taken as a rating (`1` bad, `2` fine,
-/// `3` good) or, `0`, dismisses it. A card quoted in the transcript is not open, nor is a
-/// question row without its options; a live spinner above it or a box on the screen changes
-/// nothing. Without the composer frame, never.
+/// Whether a rating card (the session survey or another, [`crate::survey::survey_block`]) is open.
 pub fn survey_open(rows: &[String]) -> bool {
     crate::survey::survey_block(rows).is_some()
 }
 
-/// How much of the worker's context is left before Claude Code auto-compacts it, in percent (0
-/// to 100), from its indicator in the live zone: `1% until auto-compact`, or `Context left
-/// until auto-compact: 7%` as other versions spell it. The indicator counts only where Claude
-/// Code parks it: under the status row (under the last transcript row when there is none),
-/// above the composer's top rule, against the right edge (ending within three columns of the
-/// composer's rules, past the transcript's columns), alone on its row. The edge tells it from a
-/// copy the worker quotes (in its `⏺` message, or a tool's output under the `⎿` gutter, which
-/// ends at another edge); a copy above the status row (history) or flush left does not count
-/// either. The one copy it cannot tell from the indicator is a row of the last block that ends
-/// against this very edge, alone on its row, with no status row under the block. Without the
-/// composer frame, `None`; on a framed screen `None` says only that no indicator is shown (room
-/// left, or just compacted).
+/// How much of the worker's context is left before Claude Code auto-compacts it.
 pub fn context_left(rows: &[String]) -> Option<u8> {
     let frame = composer_frame(rows)?;
     context_above(rows, frame, rule_width(rows, frame))
 }
 
-/// The context left as a screen SHOWS it, for a display of the reading (aterm's footer):
-/// [`context_left`]'s indicator above the composer, or the one Claude Code 2.1.305 draws at
-/// the right end of the row under the composer's bottom rule, after its mode and hints —
-/// `  ⏸ manual mode on · ? for shortcuts      0% until auto-compact`, ending at the rule's
-/// right edge (measured 2026-10-20 in the real-Claude lab at 80 and 144 columns, idle and
-/// busy, where [`context_left`] reads `None`). That row is Claude Code's own, never the
-/// transcript's; it counts only against the right edge, and only its last run after two or
-/// more blanks, the indicator and nothing else (`context_reading`). The supervisor's watch
-/// keeps [`context_left`]'s zone alone; a reading's displays read this
-/// ([`crate::reader::ScreenReader::context_shown`]). `None` says only that no indicator is
-/// read: whether it has gone is the footer's to judge
-/// (`aterm_agent::harness::footer::context_gone`), since Claude Code's other notices take
-/// that slot for a while.
+/// The context left as a screen shows it, for a display of the reading (aterm's footer).
 pub fn context_left_shown(rows: &[String]) -> Option<u8> {
     let frame = composer_frame(rows)?;
     let width = rule_width(rows, frame);
@@ -1642,10 +1165,7 @@ fn context_above(rows: &[String], frame: Frame, width: usize) -> Option<u8> {
         .find_map(|row| context_reading(crate::text::trim(row)))
 }
 
-/// The percentage an indicator reads, `t` its row trimmed: `<n>% until
-/// auto-compact` or `Context left until auto-compact: <n>%`, `<n>` digits
-/// only, 0 to 100 — anything before, after or between them and it is not the
-/// indicator.
+/// The percentage an indicator reads, `t` its row trimmed.
 fn context_reading(t: &str) -> Option<u8> {
     let digits = t.strip_suffix("% until auto-compact").or_else(|| {
         t.strip_prefix("Context left until auto-compact: ")
@@ -1657,10 +1177,7 @@ fn context_reading(t: &str) -> Option<u8> {
     digits.parse::<u8>().ok().filter(|&n| n <= 100)
 }
 
-/// The status row: walking up from the composer's top rule, the first row that starts with a
-/// spinner glyph in column 0, before any transcript row (`None` when a transcript row comes
-/// first, and without a composer frame). Its first row as drawn: in a pane narrower than its
-/// line, [`status_line`] is the whole of it.
+/// The status row: walking up from the composer's top rule.
 pub fn status_row(rows: &[String]) -> Option<&str> {
     let frame = composer_frame(rows)?;
     status_block(rows, frame.top)
@@ -1668,38 +1185,14 @@ pub fn status_row(rows: &[String]) -> Option<&str> {
         .map(|i| rows[i].as_str())
 }
 
-/// The status row's LINE ([`status_row`]), read across the rows Ink wrapped
-/// it onto in a pane narrower than it (`✻ Choreogr` over `aphing…` at 10
-/// columns, `✻ Baked for 0s · done 7:06` over `  AM` at 26, `✻ Worked for 9m
-/// 2s · done 3:15 PM · 1 shell still` over `  running`): every reader of what
-/// the status row says reads this (`status_line_end`).
+/// The status row's line ([`status_row`]).
 #[must_use]
 pub fn status_line(rows: &[String]) -> Option<Cow<'_, str>> {
     let frame = composer_frame(rows)?;
     status_block(rows, frame.top).line(rows)
 }
 
-/// The first row of the LIVE ZONE, by position: every row a running turn
-/// draws its busy signal on is at or under it. With the composer frame it is
-/// where [`busy_signal`] starts reading — the status row, else the waiting
-/// row of the wait Claude Code carries ([`carried_wait`]: above its own
-/// wakes' `⏺` rows; measured on 2.1.304, `✻ Waiting for 1 background agent
-/// to finish` over `⏺ Agent "bg probe" finished · 3m 20s` and its turn's
-/// reply, fixture `claude-2.1.304-agents-panel-long-bash-4m57s-120col.txt`),
-/// else the row under the transcript row, launch card or other composer rule
-/// the walk up from the top rule stopped at — and a box up with it starts it no lower than
-/// the box's own first row; with a box and no frame, the box's first row
-/// ([`crate::prompt::prompt_box_first_row`]: the box replaces the frame, and
-/// the turn it blocks draws its footer again where the box was); with
-/// neither, `0`, the whole screen, as the reading itself. Never above the
-/// row under an EXITED process's resume hint (anchor `exit.resume`, alone on
-/// its row): the frame over it is dead however the reading takes it — the
-/// only frame on the screen while a fresh `claude` has drawn nothing yet.
-///
-/// For a wait on the busy guard (`await gone esc.to.interrupt rows <this> …`): a busy row above
-/// the live zone is not the turn's, and a wait armed over it never latches (a dead process's
-/// `esc to interrupt` footer above a new launch card,
-/// [`crate::prompt::fixtures::EXIT_RELAUNCH_STALE_FOOTER_QUESTION2`]).
+/// The first row of the live zone, by position.
 #[must_use]
 pub fn busy_zone_start(rows: &[String]) -> usize {
     let boxed = crate::prompt::prompt_box_first_row(rows);
@@ -1722,22 +1215,11 @@ pub fn busy_zone_start(rows: &[String]) -> usize {
     start.max(exited)
 }
 
-/// The composer row: the last row whose first glyph is `❯` and that is not an
-/// option row (`❯ 1. Yes`) — unless it is the caret in column 0 right under a
-/// composer rule: a draft that starts with a number (`❯ 1. Keep the harness`,
-/// an answer to a numbered question typed but not sent) is still the composer.
-/// Nor is it an entry of the list Claude Code opens under the composer
-/// ([`is_list_entry`]), which a column-0 `❯` with no rule over it, as the
-/// agents panel's pointed row under the footer, is.
+/// The composer row: the last row whose first glyph is `❯` and that is not an option row.
 pub fn composer_index(rows: &[String]) -> Option<usize> {
-    // A plain loop: every reading finds the composer many times over, and a
-    // debug build's iterator adapters cost more than the test of a row.
     let mut i = rows.len();
     while i > 0 {
         i -= 1;
-        // Past its spaces a caret row opens on `❯` (`E2 9D AF`), or on bytes
-        // that can open more whitespace (`crate::text`): any other ends the
-        // trim on a char that is not the caret. Most rows end here, unparsed.
         let b = rows[i].as_bytes();
         let mut k = 0;
         while k < b.len() && b[k] == b' ' {
@@ -1762,19 +1244,7 @@ pub fn composer_index(rows: &[String]) -> Option<usize> {
     None
 }
 
-/// Whether the indented `❯` row `i` is an entry of a list drawn UNDER the
-/// composer's bottom rule, and no caret. Claude Code 2.1.291 and 2.1.292 mark
-/// the highlighted entry of their slash menu with the Select's pointer (2.1.287
-/// drew the entries alone): `  ❯ /compact   Free up context …` over
-/// `    /autocompact …`, every entry indented, the pointer on whichever one is
-/// highlighted. That row is the last `❯` row of the screen, so it took the
-/// composer's place and the frame (the rule above it, a rule below it) was
-/// gone: no composer, no wall, `agent=unknown`, and a `/compact` the loop
-/// typed was never seen as written. The caret is in column 0; a list under
-/// the frame is the run of indented rows that starts right under its bottom
-/// rule, a rule that closes a caret row in column 0. 2.1.307's agents panel,
-/// under the mode row and a blank, points at its hovered (or `↓`-selected)
-/// row in column 0 (`❯ ◯ salvage-merge …`): no rule over it, so it is no caret.
+/// Whether the indented `❯` row `i` is an entry of a list drawn under the composer's bottom rule.
 fn is_list_entry(rows: &[String], i: usize) -> bool {
     if rows[i].starts_with('❯') && i > 0 && is_rule(&rows[i - 1]) {
         return false;
@@ -1807,29 +1277,7 @@ pub struct MenuEntry {
     pub word: String,
 }
 
-/// THE COMPLETION MENU Claude Code opens under the composer's bottom rule, the one whose
-/// Enter runs an entry: its entries, top to bottom, and the one the Select's pointer
-/// marks (2.1.290 and later: `  ❯ /compact   Free up context …`). The menu is the run of
-/// indented rows right under the bottom rule; an entry is a row of it drawn at the first
-/// one's column, and a row further in is an entry's description wrapped onto a row of
-/// its own (`/code-review`'s, at the description column). While it is open the vendor's
-/// Enter runs the SELECTED suggestion (2.1.300 bundle, the typeahead's Enter handler
-/// `Cr`: `SG({suggestion: Hs[selected], shouldExecute: …})`, with no screen reader's
-/// navigation on), not the draft the composer shows: a person's `/cl` left standing is
-/// `/clear`. [`CompletionMenu::runs`] says which entries that can be.
-///
-/// THE `@` MENU of files (`+`) and agents (`*`) opens with NO entry selected, and Enter
-/// then sends the draft as shown; an entry a person's arrow selected is completed
-/// instead (`read @no` became `read @novel.txt`, `and @RE` became `and @"Explore
-/// (agent)"`), and nothing is sent (MEASURED on 2.1.302 and 2.1.268). A build that
-/// draws the pointer leaves its room before every entry ([`POINTER_ROOM`]: the entries
-/// at column 4, the pointer at 2), so an unpointed `@` menu there has none selected and
-/// is `None`: Enter sends. A build with no pointer (2.1.289 and before; its entries at
-/// column 2) draws the selection in colour only, so its `@` menu is returned
-/// ([`CompletionMenu::mentions`]) and read by its cells ([`CompletionMenu::runs`]).
-///
-/// `None` as well when the rows under the bottom rule are no such run (the footer, the
-/// shortcuts, nothing).
+/// The completion menu Claude Code opens under the composer's bottom rule.
 #[must_use]
 pub fn completion_menu(rows: &[String]) -> Option<CompletionMenu> {
     let frame = composer_frame(rows)?;
@@ -1868,8 +1316,6 @@ pub fn completion_menu(rows: &[String]) -> Option<CompletionMenu> {
             word: word.to_string(),
         });
     }
-    // Unpointed, the slash menu (its first entry opens `/`, or `@` as an older `@` menu's
-    // did) has its top entry selected as it opens (MEASURED on 2.1.268: Enter ran it).
     let first = entries.first();
     let mentions = first.is_some_and(|e: &MenuEntry| e.word.starts_with(['+', '*']));
     let menu = pointed.is_some()
@@ -1882,9 +1328,7 @@ pub fn completion_menu(rows: &[String]) -> Option<CompletionMenu> {
     })
 }
 
-/// The column a build that draws the completion menu's pointer starts every entry at:
-/// `  ❯ ` before the pointed one, four spaces before the rest (2.1.290 and later). A
-/// build with no pointer starts them at column 2 (2.1.289 and before).
+/// The column a build that draws the completion menu's pointer starts every entry.
 pub const POINTER_ROOM: usize = 4;
 
 /// One thing Enter may do over Claude Code's completion menu ([`CompletionMenu::runs`]).
@@ -1892,10 +1336,9 @@ pub const POINTER_ROOM: usize = 4;
 pub enum MenuEnter<'a> {
     /// Run this slash-menu entry, by its first word (`/clear`).
     Run(&'a str),
-    /// Complete this `@`-menu entry into the draft (`+` for a file, `*` for an agent):
-    /// nothing is sent.
+    /// Complete this `@`-menu entry into the draft (`+` for a file, `*` for an agent).
     Complete(&'a str),
-    /// Send the draft as the composer shows it: the `@` menu with no entry selected.
+    /// Send the draft as the composer shows it.
     Draft,
 }
 
@@ -1904,45 +1347,20 @@ pub enum MenuEnter<'a> {
 pub struct CompletionMenu {
     /// The entries shown, top to bottom.
     pub entries: Vec<MenuEntry>,
-    /// The entry the Select's pointer marks: an index into [`Self::entries`].
+    /// The entry the Select's pointer marks.
     pub pointed: Option<usize>,
-    /// The `@` menu of files (`+`) and agents (`*`): Enter completes its selected entry,
-    /// and with none selected (as it opens) sends the draft ([`completion_menu`]).
+    /// The `@` menu of files (`+`) and agents (`*`).
     pub mentions: bool,
 }
 
 impl CompletionMenu {
-    /// Whether the selected entry is drawn IN COLOUR ONLY, so that the rows alone do not
-    /// say which it is: more than one entry, none pointed (2.1.289 and before draw no
-    /// pointer). Claude Code draws the selected entry in its theme's suggestion colour
-    /// and the others dimmed (MEASURED on 2.1.268: the first glyph `/` in `b1b9f9`, the
-    /// others' in `999999`). The selection is not always the top one: a person's arrow
-    /// moves it, and the vendor keeps it as the draft changes (MEASURED: `/copy`, `down`,
-    /// the draft erased and `/co` typed showed its third entry selected). An `@` menu of
-    /// one entry on such a build draws its selection in colour only too, but that colour
-    /// has no other entry's to be told against ([`Self::runs`]).
+    /// Whether the selected entry is drawn IN colour.
     #[must_use]
     pub fn colour_only(&self) -> bool {
         self.pointed.is_none() && self.entries.len() > 1
     }
 
-    /// WHAT ENTER MAY DO: run the pointed or selected entry (the slash menu), complete it
-    /// (the `@` menu, [`Self::mentions`]), or send the draft (the `@` menu with none
-    /// selected). A menu that shows its selection in colour only ([`Self::colour_only`])
-    /// is read by `fg`, the colour of each entry's first glyph in entry order (`None` for
-    /// one not read).
-    ///
-    /// The slash menu has one entry selected: the one drawn unlike all the others, where
-    /// those others are at least two and all alike. Unread, or with no such entry — two
-    /// entries in two colours (nothing on the screen says which colour is the
-    /// selection's), all in one — any entry shown may be the one Enter runs, and every
-    /// one is returned.
-    ///
-    /// The `@` menu draws every entry alike with none selected (MEASURED on 2.1.268: each
-    /// first glyph `999999`, files and agents alike) and the selected one unlike the rest
-    /// (`b1b9f9`): entries all alike send the draft, and any unlike another means one is
-    /// selected, whichever it is, so Enter completes an entry. Unread, or one entry alone
-    /// (nothing to tell its colour against), either may be so, and both are returned.
+    /// What enter may do: run the pointed or selected entry (the slash menu).
     #[must_use]
     pub fn runs(&self, fg: Option<&[Option<String>]>) -> Vec<MenuEnter<'_>> {
         let one = |k: usize| {
@@ -1977,7 +1395,7 @@ impl CompletionMenu {
     }
 }
 
-/// Whether every colour of `fg` is the same; `None` when any is unread.
+/// Whether every colour of `fg` is the same.
 fn all_alike(fg: &[Option<String>]) -> Option<bool> {
     let fg: Vec<String> = fg
         .iter()
@@ -1986,8 +1404,7 @@ fn all_alike(fg: &[Option<String>]) -> Option<bool> {
     Some(fg.windows(2).all(|w| w[0] == w[1]))
 }
 
-/// The one of `fg` unlike all the others, which are at least two and all alike; `None`
-/// when any is unread.
+/// The one of `fg` unlike all the others, which are at least two and all alike.
 fn odd_one_out(fg: &[Option<String>]) -> Option<usize> {
     let fg: Vec<String> = fg
         .iter()
@@ -1996,7 +1413,6 @@ fn odd_one_out(fg: &[Option<String>]) -> Option<usize> {
     if fg.len() < 3 {
         return None;
     }
-    // The others' colour: the one the first two share, else the third's.
     let rest = if fg[0] == fg[1] { &fg[0] } else { &fg[2] };
     let mut odd = (0..fg.len()).filter(|&k| fg[k] != *rest);
     let k = odd.next()?;
@@ -2004,7 +1420,6 @@ fn odd_one_out(fg: &[Option<String>]) -> Option<usize> {
 }
 
 fn is_option_like(t: &str) -> bool {
-    // `t.trim_start_matches('❯').trim_start()`, on bytes.
     let mut k = 0;
     while t.as_bytes()[k..].starts_with("❯".as_bytes()) {
         k += '❯'.len_utf8();
@@ -2026,25 +1441,13 @@ pub fn composer_text(rows: &[String]) -> Option<String> {
     )
 }
 
-/// Whether the cursor sits inside the composer's typed text: on the caret row (`caret`,
-/// [`composer_draft`]'s index), anywhere but column 2. A placeholder keeps the cursor at column
-/// 2 of the caret row, and so does a typed draft whose caret was moved home, so the cursor can
-/// only prove typed text: at column 2, or on any other row (a re-grid can part the cursor from
-/// the composer), it says nothing and the caret row's `cell` decides. `cursor` is `(row, col)`
-/// in the coordinates of the rows [`composer_draft`] read.
-///
-/// The live upgrade's composer read (`aterm-agent` `harness/upgrade.rs`, `composer_is_empty`)
-/// uses this rule; the supervisor's (`turn_end_loop`, `composer_draft`) is stricter, a cursor
-/// off column 2 on any row making it a draft.
+/// Whether the cursor sits inside the composer's typed text.
 #[must_use]
 pub fn cursor_inside_text(cursor: Option<(usize, usize)>, caret: usize) -> bool {
     matches!(cursor, Some((row, col)) if row == caret && col != 2)
 }
 
-/// The composer's rows: the caret row's index, then the text of each row
-/// from it down to the bottom rule — the caret row's without the caret — as
-/// a draft that wraps or breaks onto more than one row fills them (the caret
-/// row alone with no rule under it). `None` without a caret row.
+/// The composer's rows: the caret row's index.
 pub fn composer_draft(rows: &[String]) -> Option<(usize, Vec<String>)> {
     let caret = composer_index(rows)?;
     let end = (caret + 1..rows.len())
@@ -2059,9 +1462,7 @@ pub fn composer_draft(rows: &[String]) -> Option<(usize, Vec<String>)> {
     Some((caret, lines))
 }
 
-/// Whether the composer's text is Claude Code's dim placeholder suggestion rather than typed
-/// input: the caret row reads `❯ <text>` but the cursor sits at column 2, where typing would
-/// have pushed it right.
+/// Whether the composer's text is Claude Code's dim placeholder suggestion rather than typed input.
 pub fn is_placeholder(rows: &[String], cursor_col: usize) -> bool {
     composer_text(rows).is_some_and(|t| !t.is_empty()) && cursor_col == 2
 }
@@ -2071,9 +1472,7 @@ fn is_separator(row: &str) -> bool {
     row.chars().filter(|c| *c == '─').count() >= 10
 }
 
-/// Claude Code's own status rows, never the worker's words: the done row (`✻ Baked for 1m 10s
-/// · done 2:50 PM`, a spinner glyph first) and the banners it parks between the transcript and
-/// the composer (`✔ Update installed · Restart to update`).
+/// Claude Code's own status rows, never the worker's words.
 const STATUS_GLYPHS: &[char] = &['✔', '✓', '✘', '✗', '⚠', 'ℹ'];
 
 fn is_status_row(row: &str) -> bool {
@@ -2083,21 +1482,14 @@ fn is_status_row(row: &str) -> bool {
         .is_some_and(|g| SPINNERS.contains(&g) || STATUS_GLYPHS.contains(&g))
 }
 
-/// The first non-space column of a right-aligned hint: transcript rows start
-/// at 0, 2, 4 or 5, and Claude Code parks its hints against the right edge.
+/// The first non-space column of a right-aligned hint.
 pub(crate) const HINT_COLUMN: usize = 20;
 
 pub(crate) fn leading_spaces(row: &str) -> usize {
     crate::text::leading_space_chars(row)
 }
 
-/// A right-aligned hint (`✔ Update installed · Restart to update`, `get pinged
-/// when Claude finishes · enable push notifications in /config`): it starts
-/// at column 20 or later — or, in a window too narrow for that (the 70-column
-/// `get pinged …` hint starts at column 8 of an 80-column grid), it starts
-/// past the gutter's text column and ends at the right margin, within three
-/// columns of `width` (measured: hints end two columns short of the composer
-/// rule).
+/// A right-aligned hint.
 fn is_hint(row: &str, width: Option<usize>) -> bool {
     let lead = leading_spaces(row);
     let end = crate::text::trim_end(row).chars().count();
@@ -2109,17 +1501,7 @@ pub fn last_said_row(rows: &[String]) -> Option<&str> {
     last_said_index(rows).map(|i| rows[i].as_str())
 }
 
-/// The index of the last thing said above the composer — the worker's words,
-/// a tool's output, a notice under the gutter, a user row: walking up from
-/// the status row (from the top rule when there is none), blanks, rules,
-/// Claude Code's status and banner rows, `⎿  Tip:` rows, todo items, the
-/// session survey, right-aligned hints and the vendor's own paragraphs
-/// ([`vendor_paragraph`]) are skipped, so a question is still a question with
-/// the done row, an update banner or the survey under it. Without a composer,
-/// the last non-blank row of the screen (above the caret when there is one).
-/// 2.1.300 draws its auto-mode paragraph after a resumed conversation's
-/// history, under the turn the conversation ended on (KI-1015-1 LC-10): read
-/// as the agent's last words, it hid the usage limit that turn ended on.
+/// The index of the last thing said above the composer.
 pub fn last_said_index(rows: &[String]) -> Option<usize> {
     let (end, width) = match composer_frame(rows) {
         Some(f) => (
@@ -2143,14 +1525,7 @@ pub fn last_said_index(rows: &[String]) -> Option<usize> {
     None
 }
 
-/// The vendor's own `⏺` paragraph that row `i` is a row of, as its bullet row: Claude Code
-/// draws a few notices of its own as a transcript message, which are no turn's words (anchors
-/// `notice.*`, e.g. the auto-mode notice after a `--permission-mode auto --resume`). The
-/// paragraph is its bullet row and the rows under it at column two ([`in_message`]), and it is
-/// the vendor's when its text, its rows joined as the one line Ink wrapped
-/// ([`crate::wrap::rejoined`]), opens with one of those notices: below about 64 columns Ink
-/// wraps the notice's own words off its bullet row. A worker's reply that opens with the same
-/// words is read as the notice: the screen cannot tell them apart.
+/// The vendor's own `⏺` paragraph that row `i` is a row of, as its bullet row.
 fn vendor_paragraph(rows: &[String], i: usize) -> Option<usize> {
     const NOTICES: &[&str] = &[crate::anchors::anchor_text("notice.auto_mode")];
     let mut open = i;
@@ -2169,15 +1544,7 @@ fn vendor_paragraph(rows: &[String], i: usize) -> Option<usize> {
     NOTICES.iter().any(|n| text.starts_with(n)).then_some(open)
 }
 
-/// Where the transcript ends on the screen, by position: the index of the first row of the live
-/// zone. With Claude Code's composer frame that is the status row ([`status_row`]) when there
-/// is one — it and everything under it down to the composer (a tip, a todo list, a hint, the
-/// survey, a queued `❯` message) are the live zone, though a done status row (`✻ Worked for 3m
-/// 21s · done 8:50 PM`) ends the turn and stays — else the top rule, less the blank rows, hints
-/// against the right edge, `⎿  Tip:` rows and the survey parked right above it. Without the
-/// frame, one past the last non-blank row. No row above it is judged by what it says: the
-/// report of what the worker said keeps a done row, a table or indented code the worker wrote,
-/// where [`last_said_index`]'s filter would not.
+/// Where the transcript ends on the screen, by position.
 pub fn transcript_end(rows: &[String]) -> usize {
     let Some(frame) = composer_frame(rows) else {
         return rows
@@ -2187,12 +1554,6 @@ pub fn transcript_end(rows: &[String]) -> usize {
     };
     let block = status_block(rows, frame.top);
     if let (Some(status), Some(line)) = (block.status, block.line(rows)) {
-        // A done row (`✻ Worked for 3m 21s · done 8:50 PM · 1 monitor still
-        // running`) ends the turn in the transcript: it is kept, the rows a
-        // narrow pane wrapped it onto with it (its LINE: `✻ Worked for 0s ·
-        // done` over `  10:36 AM`), and only what hangs under it is the live
-        // zone. A spinner or a `Waiting for …` row is the live zone itself,
-        // read on its line too (`✶ Choreog` over `  raphing…`).
         return if is_done_row(&line) {
             block.end + 1
         } else {
@@ -2211,14 +1572,12 @@ pub fn transcript_end(rows: &[String]) -> usize {
     end
 }
 
-/// A status row that reports a finished turn rather than work in flight: not
-/// a spinner's `…` activity, not `Waiting for …`.
+/// A status row that reports a finished turn rather than work in flight.
 pub fn is_done_row(row: &str) -> bool {
     !is_activity_row(row) && !row.contains("Waiting for ")
 }
 
-/// What Claude Code parks between the transcript and an idle composer: a blank row, a hint or
-/// banner against the right edge ([`is_against_right_edge`]), a `⎿  Tip:` row, the survey.
+/// What Claude Code parks between the transcript and an idle composer.
 fn is_parked_above_composer(row: &str, width: usize) -> bool {
     let t = crate::text::trim_start(row);
     t.is_empty()
@@ -2228,10 +1587,7 @@ fn is_parked_above_composer(row: &str, width: usize) -> bool {
             .is_some_and(|g| crate::text::trim_start(g).starts_with("Tip:"))
 }
 
-/// A row against the right edge, where Claude Code parks its hints, banners and context
-/// indicator: a hint ([`is_hint`]) that ends within three columns of the composer rule's
-/// `width` (measured: two short). A row that ends short of the edge is not one, however far in
-/// it starts (indented code, a right-aligned row quoted in a tool's output).
+/// A row against the right edge, where Claude Code parks its hints, banners and context indicator.
 pub(crate) fn is_against_right_edge(row: &str, width: usize) -> bool {
     is_hint(row, Some(width)) && crate::text::trim_end(row).chars().count() + 3 >= width
 }
@@ -2246,24 +1602,7 @@ pub(crate) fn is_said(row: &str, width: Option<usize>) -> bool {
         && !is_hint(row, width)
 }
 
-/// The usage or rate limit notice the worker's last turn ended on, as `(message, reset)`, found
-/// where [`notice`] places a wall: a `⎿` block that is the last thing said above the composer
-/// ([`last_said_index`]; never the worker's `⏺` prose or a user row), the footer, or a banner
-/// Claude Code parks between the last thing said and the top rule, a status glyph first
-/// (`⚠ Usage limit reached · continuing automatically at 1:50pm · esc to cancel`). Anything
-/// said after a notice makes it history: a later turn's words (a background command or a
-/// monitor event starts one with no user row), the `/model` output that switched the model, the
-/// worker's reply to a retry. Whether the worker works under a notice is [`worker_phase`]'s to
-/// say: a busy status row or footer under one makes the screen busy, never limited.
-///
-/// What counts as a limit is [`classify_wall`]'s table: a notice whose
-/// [`WallKind::reads_limited`] — a usage window (`You've hit your session limit · resets 7:30pm
-/// (America/Los_Angeles)`, `5-hour limit reached ∙ resets 3am`), a model bucket (`You've
-/// reached your Fable limit. …`), spend, or an API rate limit (`API Error: Rate limit reached
-/// for requests`). A warning (`Approaching …`) never counts, nor do the notices the worker goes
-/// on under (a subagent quota or budget, fast mode's fallback) or a full context
-/// ([`crate::wall::wall`] names that one). `reset` is read from whichever of the block's lines
-/// ([`line_at`]) names one, or the auto-continue notice's time ([`reset_of`]).
+/// The usage or rate limit notice the worker's last turn ended on, as `(message, reset)`.
 pub fn limit_notice(rows: &[String]) -> Option<(String, Option<String>)> {
     notice(rows, &|text| {
         classify_wall(text).filter(WallKind::reads_limited)
@@ -2271,39 +1610,9 @@ pub fn limit_notice(rows: &[String]) -> Option<(String, Option<String>)> {
     .map(|w| (w.message, w.reset))
 }
 
-/// The notice the worker's last turn ended on, placed as [`limit_notice`]
-/// places it — the footer, a banner under the last thing said, the vendor's
-/// `⏺` error row ([`error_row_notice`]), the `⎿` block of the last message —
-/// and named by `classify`. Shared by [`limit_notice`] (the usage kinds) and
-/// [`crate::wall::wall`] (every kind), so the two can never disagree about
-/// WHERE a wall is. A footer's or banner's GENERIC limit notice (`Usage limit
-/// reached · …`, no window, no model) is the limit the turn's own notice
-/// names, where that notice names the same reset: a weekly window, a model's
-/// bucket, money (KI-1015-1 W3, 2.1.300; [`crate::wall::named_by_the_turn`]).
-///
-/// A `⎿` block is read as the vendor's row by [`block_is_vendors`]: never at a column but 2 (a
-/// tool's output continues at column 5); never the first column-2 row under a call
-/// ([`is_tool_call`]), which is the call's output; a later column-2 row under a call, and every
-/// column-2 row under any other owner or none, read for recall. The screen cannot tell some of
-/// those from a tool's output (an MCP result's second block), so the supervisor acts on a wall
-/// only where the session's transcript confirms it (aterm-agent, `supervise/wall_confirm.rs`;
-/// with no transcript it refuses only a wall read under a call, [`Wall::under_call`]). A block
-/// that opens with the command's own echo (`⎿  $ touch x`) is output too ([`crate::wall`],
-/// module header).
+/// The notice the worker's last turn ended on, placed as [`limit_notice`] places it.
 pub(crate) fn notice(rows: &[String], classify: &dyn Fn(&str) -> Option<WallKind>) -> Option<Wall> {
     let mut found = notice_placed(rows, classify)?;
-    // Claude Code 2.1.284 draws an armed auto-continue as
-    // its own notification under the wall's row (`limit-next`: `Continuing
-    // automatically at 3pm · esc to cancel`), where 2.1.283 opened the one
-    // banner with `Usage limit reached · continuing automatically at …`. The
-    // countdown belongs to the wall it stands under: kept in its message,
-    // where `resumes_by_itself` reads it.
-    //
-    // Where these notifications are drawn is unmeasured, and a transient toast may be gone when
-    // the loop looks, so the search is by wording: every row of the live zone outside the
-    // composer (between the wall and the composer, and the footer's rows under it), but not the
-    // wall's own row or one its message already holds. Each row is read as the line it opens
-    // ([`line_at`]): at 26 columns the countdown's `Continuing` stands alone on its first row.
     if let Some(frame) = composer_frame(rows) {
         let width = crate::text::trim_end(&rows[frame.bottom]).chars().count();
         let above = found.row + 1..frame.top;
@@ -2320,10 +1629,7 @@ pub(crate) fn notice(rows: &[String], classify: &dyn Fn(&str) -> Option<WallKind
     Some(found)
 }
 
-/// A hint or banner row that says Claude Code goes on by itself: the armed
-/// countdown (`Continuing automatically at 3pm · esc to cancel`), the moment
-/// it fires (`Usage limit reset · continuing automatically`), `continuing
-/// shortly`, or `Usage limit available again · continuing now`.
+/// A hint or banner row that says Claude Code goes on by itself.
 fn says_the_vendor_goes_on(row: &str) -> bool {
     let flat = row.replace('\u{2219}', "\u{b7}");
     find_ascii_ci(
@@ -2338,9 +1644,6 @@ fn says_the_vendor_goes_on(row: &str) -> bool {
 fn notice_placed(rows: &[String], classify: &dyn Fn(&str) -> Option<WallKind>) -> Option<Wall> {
     if let Some(frame) = composer_frame(rows) {
         let width = crate::text::trim_end(&rows[frame.bottom]).chars().count();
-        // The footer's banner and a banner under the last thing said name no
-        // limit in 2.1.295 and later (`Usage limit reached`): the turn's own
-        // notice names it ([`crate::wall::named_by_the_turn`]).
         if let Some(found) = footer_notice(rows, frame.bottom + 1, width, classify)
             .or_else(|| banner_notice(rows, frame.top, width, classify))
         {
@@ -2348,10 +1651,6 @@ fn notice_placed(rows: &[String], classify: &dyn Fn(&str) -> Option<WallKind>) -
         }
     }
     let last = last_said_index(rows)?;
-    // A `/goal` notice is Claude Code's echo of the wall row above it; that row is the wall,
-    // read only when it is a kind the echo's own reason can come from: `the request was rate
-    // limited` follows a limit or a 429, never the worker's prose about a login or a full
-    // context that happens to open with a wall's words.
     if let Some(echo) = goal_echo_open(rows, last)
         && let Some(prev) = last_said_index(&rows[..echo])
         && let Some(mut cause) = notice_at(rows, prev, classify)
@@ -2364,16 +1663,7 @@ fn notice_placed(rows: &[String], classify: &dyn Fn(&str) -> Option<WallKind>) -
     notice_at(rows, last, classify)
 }
 
-/// Whether a `/goal` echo's own reason can come from a wall of `cause`'s kind
-/// (the vendor's fixed reasons, both binaries): `usage limit reached` and
-/// `the request was rate limited` follow a limit (or a 429); the API's own
-/// (`the API rejected the last request`, `the API was unavailable or the
-/// connection dropped`, `the API returned an unexpected response`, `the last
-/// turn could not finish`) follow an API error; `Goal cleared after an
-/// unrecoverable error (<label>)` names its cause's kind in the label. A
-/// reason no wall row can cause (`a hook ended the turn`, `the goal check
-/// timed out`, `goal checks kept finding it unmet this turn`, `model
-/// unavailable`) reads through to nothing.
+/// Whether a `/goal` echo's own reason can come from a wall of `cause`'s kind.
 fn echo_names_the_cause_of(echo: &str, cause: WallKind) -> bool {
     let e = echo.to_lowercase().replace('\u{2019}', "'");
     let has = |needle: &str| e.contains(needle);
@@ -2394,9 +1684,7 @@ fn echo_names_the_cause_of(echo: &str, cause: WallKind) -> bool {
             && api
 }
 
-/// The `⏺` row a `/goal` notice opens on, when the last thing said (ending at
-/// `last`) is one: `Goal paused · …`, `Goal still active · …`, `Goal cleared
-/// after …`.
+/// The `⏺` row a `/goal` notice opens on, when the last thing said (ending at `last`) is one.
 fn goal_echo_open(rows: &[String], last: usize) -> Option<usize> {
     let mut open = last;
     while !rows[open].starts_with(['⏺', '●']) {
@@ -2446,11 +1734,6 @@ fn notice_at(
         Block::UnderCall => true,
         Block::Vendors | Block::Unowned => false,
     };
-    // The block's lines, each across the rows Ink wrapped it onto ([`line_at`]): the notice is
-    // the first, named whole (at 26 columns `⎿  You've hit your` stands over `session limit ·`),
-    // and the reset is whichever line names one, its zone with it (`· resets 10:25am` over
-    // `(America/Los_Angeles)` at 34). The last line runs on past `last` over a row it wraps onto
-    // that the last-said walk passed over: one that opens with `·` reads as a status row.
     let width = crate::question::screen_width(rows);
     let mut lines: Vec<String> = Vec::new();
     let mut i = open;
@@ -2477,38 +1760,13 @@ fn notice_at(
     })
 }
 
-/// How many rows a `<notice> · <remedy>` error row may take in a pane 80
-/// columns wide or wider, its wrapped text included ([`error_row_notice`]);
-/// in a narrower pane, how many it would take at 80 ([`notice_rows_at_80`]):
-/// those notices are one sentence and a remedy, and a longer `⏺` block is
-/// the worker's own words. An `API Error` may run longer: the vendor's own
-/// messages do (a 529 wraps to three rows at 80 columns, and a message runs
-/// to 1000 characters before the expand hint).
+/// How many rows a `<notice> · <remedy>` error row may take in a pane 80 columns wide or wider.
 const ERROR_ROWS: usize = 3;
 
-/// How many columns short of the pane Claude Code draws the text of its own `⏺` rows, its
-/// error row and its dotted notices: a column `columns - 10` cells wide beside the bullet (read
-/// from the 2.1.300 binary, measured on 2.1.299 at 26 and 34 columns). The worker's reply has
-/// no such column: its prose runs to the pane's edge, `width - 2` cells from column two
-/// (`claude-2.1.300-prose-opens-with-limit-words-34col.txt`).
+/// How many columns short of the pane Claude Code draws the text of its own `⏺` rows.
 const NOTICE_MARGIN: usize = 10;
 
-/// The rows the vendor's `⏺` notice on rows `open..=end` would take at 80
-/// columns, read in a pane narrower than that, where the same notice takes
-/// more rows than [`ERROR_ROWS`] counts (`⏺ Usage limit reached ·
-/// continuing automatically at 10:25am · esc to cancel`: four rows at 34
-/// columns, two at 80). `None` in a pane 80 columns or wider, where the rows
-/// themselves are counted, and for a message not drawn in the vendor's
-/// column — a row of it wider than `width - 10` cells ([`NOTICE_MARGIN`]) is
-/// the worker's prose. Each line of it — its rows joined where Ink wrapped
-/// them, a row too full for the next row's first word in that column
-/// ([`crate::wrap::continues`]) — is counted as Ink wraps it in the 70 cells
-/// the column holds at 80 columns ([`crate::wrap::rows_in`]).
-///
-/// The limit: a hard line break under a row that happens to be that full is joined, so prose
-/// that fits the vendor's column and opens with a wall's words and a ` · ` can still read as
-/// the wall in a narrow pane, as such prose of three rows or fewer does at 80 columns; the
-/// supervisor confirms such a wall against the transcript where there is one ([`notice`]).
+/// The rows the vendor's `⏺` notice on rows `open..=end` would take at 80 columns.
 fn notice_rows_at_80(rows: &[String], open: usize, end: usize) -> Option<usize> {
     use crate::question::cells;
     const ROW_AT_80: usize = 80 - NOTICE_MARGIN;
@@ -2543,17 +1801,13 @@ fn notice_rows_at_80(rows: &[String], open: usize, end: usize) -> Option<usize> 
     Some(count + crate::wrap::rows_in(&line, ROW_AT_80))
 }
 
-/// Whether `row` is a row of the `⏺` message above it: indented two columns,
-/// its text no `⎿` row — the message's text Claude Code wrapped onto it
-/// ([`error_row_notice`], [`line_at`]).
+/// Whether `row` is a row of the `⏺` message above it.
 fn in_message(row: &str) -> bool {
     row.strip_prefix("  ")
         .is_some_and(|t| t.starts_with(|c: char| !c.is_whitespace() && c != '⎿'))
 }
 
-/// The last row of the `⏺` message (its paragraph) whose bullet row is
-/// `open`: the rows under it, short of row `until`, that are its own
-/// ([`in_message`]).
+/// The last row of the `⏺` message (its paragraph) whose bullet row is `open`.
 fn message_end(rows: &[String], open: usize, until: usize) -> usize {
     let until = until.min(rows.len());
     let mut end = open;
@@ -2563,16 +1817,7 @@ fn message_end(rows: &[String], open: usize, until: usize) -> usize {
     end
 }
 
-/// The line row `i` opens, read across the rows Ink wrapped it onto ([`crate::wrap`]), none
-/// from row `until` on, in a pane `width` cells wide: its last row and its text, the rows
-/// joined with one space (the first row's indent kept). A `⏺` or `●` row's line is its
-/// message, the rows under it at column two ([`message_end`]): no rule of full rows finds where
-/// a line of it ends, since Claude Code draws its own notices ten columns short of the pane
-/// ([`NOTICE_MARGIN`]) and the worker's prose runs to the pane's edge, a hard break under a full
-/// row as often as not. A `⎿` row's text wraps at the column it starts at past the `⎿` (the
-/// gutter's text column, [`GUTTER_TEXT_COLUMN`], for a notice; a column less for a local
-/// command's output, `  ⎿ Claude Code will continue`); any other row's at its own column. A row
-/// that is no line's first is read as one all the same: what each reader looks for opens a line.
+/// The line row `i` opens, read across the rows Ink wrapped it onto ([`crate::wrap`]).
 pub(crate) fn line_at(rows: &[String], i: usize, until: usize, width: usize) -> (usize, String) {
     let row = rows[i].as_str();
     let end = if row.starts_with(['⏺', '●']) {
@@ -2591,24 +1836,7 @@ pub(crate) fn line_at(rows: &[String], i: usize, until: usize, width: usize) -> 
 /// What the vendor adds under a message past 1000 characters.
 const EXPAND_HINT: &str = "(ctrl+o to expand)";
 
-/// The vendor's error row the last turn ended on. Claude Code draws an `isApiErrorMessage` row
-/// its message renderer has no case for as a `⏺` bullet in column 0 (in a warning colour the
-/// text cannot show), its text wrapped ten columns short of the width onto rows under column 2:
-/// `⏺ Login expired · Please run /login`, `⏺ API Error: Can't reach the API server — check
-/// your internet or DNS (ENOTFOUND)`. From 2.1.283 every `API Error: …` is drawn so. `Not
-/// logged in · …`, `OAuth token revoked · …`, `Request timed out` and a full context have cases
-/// of their own, drawn under the `⎿` gutter, which [`notice`] reads after this.
-///
-/// A worker's message is drawn the same way, so the row must be the vendor's in its words as
-/// well as its place: the last thing said, one paragraph (the `⏺` row and the rows indented two
-/// columns under it, no `⎿` row), no tool call, and the vendor's shape — `API Error` at its
-/// head, case and all, or a notice and its remedy joined by ` · ` or ` ∙ ` in at most
-/// [`ERROR_ROWS`] rows (in a pane narrower than 80 columns, drawn in the vendor's column and at
-/// most that many at 80, [`notice_rows_at_80`]) — whose text `classify` names. It cannot tell
-/// from the vendor's row a message that opens with a wall's words, a `·` and more, or a
-/// one-paragraph reply that itself opens `API Error`. The whole message is classified, its rows
-/// joined (under ~100 columns the deciding words wrap onto the second row); a wrapped row that
-/// opens with `·` or `*` is its own too, and the vendor's [`EXPAND_HINT`] is dropped.
+/// The vendor's error row the last turn ended.
 fn error_row_notice(
     rows: &[String],
     last: usize,
@@ -2654,45 +1882,22 @@ fn error_row_notice(
     })
 }
 
-/// The line the screen's LAST THING SAID opens where Claude Code draws a row
-/// of its own there ([`last_said_notice`]).
+/// The line the screen's last thing said opens where Claude Code draws a row of its own there.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SaidNotice {
-    /// Its text, the rows Ink wrapped it onto joined, the vendor's
-    /// [`EXPAND_HINT`] dropped.
+    /// Its text, the rows Ink wrapped it onto joined, the vendor's [`EXPAND_HINT`] dropped.
     pub text: String,
-    /// It has the vendor's error row's own shape, which no table needs to
-    /// name: `API Error` at its head, or (a `⏺` row) a notice and its remedy
-    /// joined by ` · ` in a few rows ([`error_row_notice`]).
+    /// It has the vendor's error row's own shape, which no table needs to name.
     pub shaped: bool,
-    /// The row its line opens on: the `⏺` row, or the block's `⎿` row.
+    /// The row its line opens.
     pub row: usize,
-    /// [`Placement::ErrorRow`] for a `⏺` row, [`Placement::Gutter`] for a
-    /// `⎿` block.
+    /// [`Placement::ErrorRow`] for a `⏺` row, [`Placement::Gutter`] for a `⎿` block.
     pub placement: Placement,
-    /// The block stands right under a hook's error row, where the hook's own
-    /// words do ([`block_is_vendors`], rule 4): never a wall on the screen,
-    /// and whether it is the hook's words or Claude Code's notice only the
-    /// caller's words can say — a blocking reason of blank space draws no
-    /// row, and the wall stands right there (2.1.304, measured). Its text is
-    /// the screen's spelling of a notice, which is not the transcript's
-    /// (`Context limit reached · …` for `Prompt is too long`).
+    /// The block stands right under a hook's error row, where the hook's own words.
     pub hook_words: bool,
 }
 
-/// THE LAST THING SAID, WHERE CLAUDE CODE DRAWS ITS OWN NOTICES, for a
-/// reader that has a notice's words from elsewhere and asks whether the
-/// screen shows it (aterm-agent's transcript of the session,
-/// `supervise/wall_confirm.rs`): a `⏺` message in column 0 that is no call
-/// — where 2.1.300 draws every `isApiErrorMessage` row its renderer has no
-/// case of its own for (`su`), in the warning colour a row of text does not
-/// keep, so the worker's prose stands there too — or a column-2 `⎿` block
-/// that no call's FIRST output row opens ([`block_is_vendors`]), the row
-/// right under a hook's error row included ([`SaidNotice::hook_words`]). `None` for
-/// anything else: a call's output, a command's echo, the person's `❯` row,
-/// a screen with nothing said. The table is not asked: what the screen
-/// cannot name (`There's an issue with the selected model (x). …`, drawn
-/// like prose) is named by the words the caller holds.
+/// The last thing said, WHERE claude code draws its own notices.
 #[must_use]
 pub fn last_said_notice(rows: &[String]) -> Option<SaidNotice> {
     let last = last_said_index(rows)?;
@@ -2740,10 +1945,7 @@ pub fn last_said_notice(rows: &[String]) -> Option<SaidNotice> {
     })
 }
 
-/// The column Claude Code draws its own `⎿` rows at (`  ⎿  …`). A tool's output continues at
-/// [`GUTTER_TEXT_COLUMN`], so a `⎿` the output itself prints lands at column 5 or deeper,
-/// behind a blank row of the output, carriage returns, tabs, cursor moves and backspaces
-/// included (`claude-2.1.294-bash-output-blank-row-then-gutter-phrase.txt`).
+/// The column Claude Code draws its own `⎿` rows at (` ⎿ …`).
 const VENDOR_GUTTER_COLUMN: usize = 2;
 
 /// What the owner walk ([`block_is_vendors`]) makes of a `⎿` block.
@@ -2751,122 +1953,24 @@ const VENDOR_GUTTER_COLUMN: usize = 2;
 enum Block {
     /// A tool's output: never a wall.
     Output,
-    /// The row right under a hook's error row (rule 4): the hook's words,
-    /// never a wall on the screen — or, where the hook drew none, Claude
-    /// Code's own notice, which only the transcript tells apart
-    /// ([`SaidNotice::hook_words`]).
+    /// The row right under a hook's error row (rule 4).
     HookWords,
-    /// Read as Claude Code's own row, from a later column-2 row under a call
-    /// (rule 3): [`Wall::under_call`].
+    /// Read as Claude Code's own row, from a later column-2 row under a call (rule 3).
     UnderCall,
-    /// Read as Claude Code's own row under any other owner, or none the
-    /// walk reaches before a blank row over a row that opens an item.
+    /// Read as Claude Code's own row under any other owner.
     Vendors,
-    /// Read as [`Block::Vendors`] is: the walk reached the first row with no
-    /// owner found, so the owner, if any, is above the rows read
-    /// ([`owner_above_rows`]).
+    /// Read as [`Block::Vendors`].
     Unowned,
 }
 
-/// Whether the `⎿` block opening at `open` is READ as Claude Code's own row —
-/// the SCREEN'S half of H6-HARNESS-1. It reads for
-/// RECALL: a wall read here is acted on only where the session's own
-/// transcript confirms it (aterm-agent, `supervise/wall_confirm.rs`), so
-/// where the screen cannot tell Claude Code's row from a tool's, it reads
-/// the wall. Four rules, measured in the real-Claude lab — the first three
-/// on Claude Code 2.1.294, the fourth on 2.1.302:
-///
-/// 1. **The column.** A `⎿` row at any column but 2 is never Claude Code's: its own rows are
-///    at column 2, and a tool's output continues at column 5 whatever the output prints.
-/// 2. **The owner walk**: up from `open`, over the rows of the blocks above it, to the first
-///    row in column 0. A call there ([`is_tool_call`]) owns the block, and its first column-2
-///    row is the call's output, never a wall.
-/// 3. **A later column-2 row under a call is read.** Claude Code draws its wall under the
-///    call's output when the request after the tool fails (`⏺ Bash(…)` / `⎿  stamped` /
-///    `⎿  Context limit reached · …`), but the later row can also be the output's own (an MCP
-///    result's second content block; the output under a PreToolUse hook's row): the transcript
-///    decides ([`Block::UnderCall`]), and with none a supervisor does not act on it. A row of
-///    the call's own (its arguments wrapped under it) is no column-2 `⎿` row, so the output's
-///    first row under a wrapped call is still its first.
-///
-/// 4. **A hook's words under a row of Claude Code's own are output**
-///    (measured on 2.1.302 in the lab). Under the
-///    STOP-HOOK SUMMARY (`⏺ Ran 1 stop hook (ctrl+o to expand)`,
-///    [`is_stop_hook_summary`]) the column-2 `⎿` rows up to its first
-///    labelled row of its own ([`is_summary_label`]) are the hooks' own: in
-///    verbose output (`claude --verbose`, the detailed transcript) a row per
-///    hook, its command's path or a prompt hook's text; a Stop hook's
-///    `stopReason` (`{"continue": false, "stopReason": …}`: its later lines
-///    at column 2 with no `⎿`). The 2.1.302 and 2.1.304 binaries draw those
-///    rows, the `stopReason` only where the hooks prevented the
-///    continuation, then a `Stop hook error: …` row per blocking error and a
-///    `Stop hook feedback: …` row per context a hook added: a continuation,
-///    and so a wall its request meets, comes only under one of those, and
-///    that wall is read (measured: `⎿  Stop hook error: [./sb]: …` for
-///    a stderr, `⎿  Stop hook error: check the tests` for a `{"decision":
-///    "block"}`, then the wall, a blank row between or none). Any other
-///    label is the hooks' words: a prompt hook's verbose row opening
-///    `Review: …` ended the walk, and the `stopReason` under it was read as
-///    the wall (2.1.304, measured, KI-1015-14). Under A HOOK'S
-///    ERROR ROW (`⎿  <hook> hook error`, `⎿  <hook> hook returned blocking
-///    error`, [`is_hook_error_row`]) the next column-2 `⎿` row is the hook's
-///    words, the error row's own sub-lines in the binary: its stderr behind
-///    `Failed with non-blocking status code: `, its blocking `reason`, or
-///    Claude Code's own `Blocked by hook` for none — under any owner, a
-///    call's included; a wall comes after it. Read as walls, `aterm drive
-///    watch` typed `/login` on a `stopReason` and parked the session until
-///    the reset a double-spaced one named (measured).
-///    THE LIMIT: a hook's error row with no row of the hook's under it puts
-///    Claude Code's wall where the hook's words stand. 2.1.302 draws one for
-///    an empty stderr and a reasonless block (measured); a blocking reason
-///    of blank space draws none (2.1.304, measured: `⎿  PostToolUse:Bash
-///    hook returned blocking error`, then the real context wall), and a
-///    reason that IS the wall's words draws the same screen. That row is
-///    [`Block::HookWords`]: no wall on the screen, and the row a caller
-///    holding the session's transcript asks about ([`last_said_notice`]),
-///    which ends on the wall's notice in the one case and on the model's
-///    reply in the other.
-///
-/// Any other owner is read as Claude Code's: the person's `❯` turn, the
-/// worker's message, a task notice, a Monitor event, a hook summary past its
-/// labelled rows. So is a block whose owner the walk does not reach — a
-/// blank row over a row that opens an item (below), or the top of the
-/// screen, comes first — which is where Claude Code's walls stand under a
-/// prompt's second paragraph, under a collapsed tool group (its row wrapped
-/// or not), and under a long output whose call has scrolled off (all
-/// measured). A Monitor's event draws its payload on its own `⏺` row and no
-/// `⎿` row of its own, so the first column-2 row under it is Claude Code's
-/// wall (2.1.302, measured). A hook's row under these owners that carries a
-/// program's words behind a label (`Stop says: …`, `Stop hook error: [./h]:
-/// …`) is read here, and is no wall by the table ([`crate::wall`]'s
-/// `opens_with_label`).
-///
-/// A blank row inside a call's rows does not end the walk; it ends it only where the next
-/// non-blank row below opens an item of its own (a row at column 2 or less that is no `⎿`
-/// row). Under any other the walk goes on over it to the owner:
-/// * a row past column 2 makes it a blank line of the output or the command, so an MCP result
-///   whose first block holds a paragraph break reads its second block under the call
-///   (`claude-2.1.294-mcp-blank-row-in-first-block-then-login-phrase.txt`), and a heredoc
-///   command's output is the first row under its call: no wall;
-/// * a column-2 `⎿` row makes it a blank line that ends a block of the output (no measured
-///   screen draws Claude Code's own `⎿` row behind a blank row under a call's rows): an MCP
-///   result whose first block ends on a blank line draws two blank rows above its second block
-///   (`claude-2.1.294-mcp-trailing-blank-rows-in-first-block-then-login-phrase.txt`).
-///
-/// The price: Claude Code's real wall under an output that holds a blank row is read under the
-/// call too ([`Block::UnderCall`]), which a supervisor with no transcript does not act on.
+/// Whether the `⎿` block opening at `open` is READ as Claude Code's own row.
 fn block_is_vendors(rows: &[String], open: usize) -> Block {
     if leading_spaces(&rows[open]) != VENDOR_GUTTER_COLUMN {
         return Block::Output;
     }
     let mut later = false;
-    // A column-2 `⎿` row between the block and its owner that opens with a
-    // label (rule 4: the stop-hook summary's own rows end there).
     let mut labelled = false;
-    // The walk has met no blank row and no column-2 `⎿` row yet: the next
-    // such `⎿` row is the one the block hangs right under (rule 4).
     let mut adjacent = true;
-    // The nearest non-blank row below the one the walk stands on.
     let mut below = &rows[open];
     for row in rows[..open].iter().rev() {
         if crate::text::trim(row).is_empty() {
@@ -2905,24 +2009,13 @@ fn block_is_vendors(rows: &[String], open: usize) -> Block {
     Block::Unowned
 }
 
-/// Whether the owner walk ([`block_is_vendors`]) from the `⎿` block row `i`
-/// stands in reaches THE FIRST OF `rows` with no owner found — no row in
-/// column 0, no blank row over a row that opens an item — so whatever owns
-/// the block, if anything does, is above the rows: a call row scrolled off
-/// the screen over its long output (2.1.304, measured: the history right
-/// above the screen holds it, `claude-2.1.304-verbose-long-output-context-wall-scrollback.txt`).
-/// A caller that can read the rows above (aterm-agent's wall confirmation,
-/// with no transcript) reads them up to the owner and reads the wall again
-/// with them. `false` for a row under no `⎿` block.
+/// Whether the owner walk ([`block_is_vendors`]) from the `⎿` block row `i` stands in reaches.
 #[must_use]
 pub fn owner_above_rows(rows: &[String], i: usize) -> bool {
     gutter_open(rows, i).is_some_and(|open| block_is_vendors(rows, open) == Block::Unowned)
 }
 
-/// Whether `row` is Claude Code's STOP-HOOK SUMMARY, an owner whose first
-/// column-2 rows are the hooks' own ([`block_is_vendors`], rule 4): `⏺ Ran 1
-/// stop hook (ctrl+o to expand)`, `⏺ Ran 2 stop hooks` (`●` off macOS; the
-/// anchors `hook.ran` and `hook.ran.stop`, the count between them).
+/// Whether `row` is Claude Code's stop-hook summary.
 fn is_stop_hook_summary(row: &str) -> bool {
     let Some(rest) = row
         .strip_prefix(['⏺', '●'])
@@ -2938,27 +2031,14 @@ fn is_stop_hook_summary(row: &str) -> bool {
             .is_some_and(|r| r.starts_with(crate::anchors::anchor("hook.ran.stop")))
 }
 
-/// Whether `text`, a column-2 `⎿` row's past its `⎿`, is one of the
-/// STOP-HOOK SUMMARY'S OWN LABELLED ROWS, the first of which ends the hooks'
-/// words under it ([`block_is_vendors`], rule 4): `<event> hook error: …`
-/// per blocking error (the event one word, `Stop` when the hook names none:
-/// the anchor `hook.error.label`) and `Stop hook feedback: …` per context a
-/// hook added (`hook.feedback`) — the 2.1.304 bundle's two, after the
-/// verbose rows and the `stopReason`. Any other label is a hook's own words:
-/// a prompt hook's text opening `Review: …` on its verbose row (measured on
-/// 2.1.304), or the bundle's own `prompt: …` form of that row.
+/// Whether `text`, a column-2 `⎿` row's past its `⎿`.
 fn is_summary_label(text: &str) -> bool {
     text.split_once(crate::anchors::anchor("hook.error.label"))
         .is_some_and(|(name, _)| !name.is_empty() && !name.contains(char::is_whitespace))
         || text.starts_with(crate::anchors::anchor("hook.feedback"))
 }
 
-/// Whether `text`, a column-2 `⎿` row's past its `⎿`, is the row A HOOK'S
-/// ERROR opens on, whose next column-2 row is the hook's words
-/// ([`block_is_vendors`], rule 4): `<hook> hook error` or `<hook> hook
-/// returned blocking error` (the anchors `hook.error` and
-/// `hook.blocking_error`), the hook's name one word (`UserPromptSubmit`,
-/// `PostToolUse:Bash`).
+/// Whether `text`, a column-2 `⎿` row's past its `⎿`, is the row a hook's error opens.
 fn is_hook_error_row(text: &str) -> bool {
     ["hook.error", "hook.blocking_error"].iter().any(|id| {
         text.strip_suffix(crate::anchors::anchor(id))
@@ -2966,45 +2046,19 @@ fn is_hook_error_row(text: &str) -> bool {
     })
 }
 
-/// Whether row `i` carries A PROGRAM'S WORDS, never a notice of Claude Code's
-/// own: its text opens with a label ([`crate::wall`]'s
-/// `labelled`: a Monitor's event, a hook's `… says:` or `… hook error:` row),
-/// or it stands under a `⎿` row the owner walk reads as output
-/// ([`block_is_vendors`]: a call's first row, a hook's words under the
-/// stop-hook summary or under its error row, a `⎿` at a column but 2) — that
-/// row or one of its own rows under it, a wrapped line or a later line of the
-/// same words ([`owning_gutter`]). The readers that walk every row above the
-/// composer, splitting a row at wide gaps (`wall::since_limit`,
-/// `wall::auto_continue_end`, the turn's own notice behind a generic banner),
-/// pass these rows over, as the gutter's reader does: a hook's `stopReason`
-/// of `note  Usage limit reached · resets 3pm` (the double space kept,
-/// measured on 2.1.302) is no limit's notice. So is a row Ink wrapped a
-/// labelled `⏺` message onto ([`message_open`]): a hook's long `stopReason`
-/// behind `⏺ Operation stopped by hook: …` wraps at column 2, and its row
-/// `  Usage limit reached · resets 3pm` named a session limit
-/// (`since_limit`; 2.1.304, measured, KI-1015-14).
+/// Whether row `i` carries a program's words, never a notice of Claude Code's own.
 pub(crate) fn programs_words(rows: &[String], i: usize) -> bool {
     words_of(rows, i) == WordsOf::Program
 }
 
-/// WHOSE WORDS row `i` holds, as [`programs_words`] reads them, with the
-/// case it cannot decide from `rows` kept apart ([`WordsOf::Above`]).
+/// Whose words row `i` holds, as [`programs_words`] reads them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WordsOf {
-    /// A program's words ([`programs_words`]): no notice of Claude Code's.
+    /// A program's words ([`programs_words`]).
     Program,
-    /// Claude Code's own row, or read as its own: the walk found its owner,
-    /// or a row that opens an item, within `rows`.
+    /// Claude Code's own row, or read as its own.
     Vendor,
-    /// Read as [`WordsOf::Vendor`] is, for want of the rows above: the walk
-    /// from row `i` up to its `⎿` row, its message's `⏺` row or the block's
-    /// owner reached THE FIRST OF `rows` undecided. A Stop hook's
-    /// `stopReason` of 35 lines drawn its summary on row 6 of 50 and its
-    /// last line, `Usage limit reached · resets 3pm`, on row 41 (2.1.304,
-    /// measured): a 40-row tail of that screen read a session limit, the
-    /// whole screen none; one of 60 lines draws its summary in the history
-    /// right above the screen. Whoever can read the rows above reads row
-    /// `i` again with them (aterm-agent's screen read).
+    /// Read as [`WordsOf::Vendor`] is, for want of the rows above.
     Above,
 }
 
@@ -3039,18 +2093,15 @@ pub fn words_of(rows: &[String], i: usize) -> WordsOf {
 /// Where a walk up from a row ended ([`message_open`], [`owning_gutter`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Walk {
-    /// At the row it looks for.
+    /// At the row it looks.
     Found(usize),
     /// At a row that says the row walked from has none.
     None,
-    /// At the first of the rows, still looking: the row may be above them.
+    /// At the first of the rows, still looking.
     Top,
 }
 
-/// The `⏺` or `●` row whose message row `i` is a later row of: up from `i`
-/// over the message's own rows ([`in_message`]) to that bullet row.
-/// [`Walk::None`] for a row that is no such message's later row;
-/// [`Walk::Top`] where the message's rows run up to the first of `rows`.
+/// The `⏺` or `●` row whose message row `i` is a later row.
 fn message_open(rows: &[String], i: usize) -> Walk {
     let mut j = i;
     while in_message(&rows[j]) {
@@ -3066,13 +2117,7 @@ fn message_open(rows: &[String], i: usize) -> Walk {
     }
 }
 
-/// The `⎿` row that row `i` stands under: itself, or the nearest above it
-/// with no blank row and no row in column 0 between — a `⎿` row's own rows,
-/// an output's at column 5 and a `stopReason`'s later lines at column 2
-/// (2.1.302, measured). Wider than [`gutter_open`], which leaves a row short
-/// of the gutter's text column to the item it opens: a row this finds is
-/// judged by its `⎿` row's owner ([`programs_words`]). [`Walk::Top`] where
-/// those rows run up to the first of `rows` with no `⎿` row among them.
+/// The `⎿` row that row `i` stands.
 fn owning_gutter(rows: &[String], mut i: usize) -> Walk {
     loop {
         let row = rows[i].as_str();
@@ -3089,25 +2134,7 @@ fn owning_gutter(rows: &[String], mut i: usize) -> Walk {
     }
 }
 
-/// A transcript row that opens a CALL — a tool's or a command's, whose `⎿`
-/// rows are what it printed, never anybody's words. Claude Code's forms
-/// (2.1.294, measured in the real-Claude lab and read from its binary):
-/// * `⏺ <Name>(…)`: a name of letters, digits, `_`, `:`, `.` or `-` (`⏺
-///   Bash(ls -la)`, `⏺ Update(notes.txt)`, `⏺ mcp__srv__tool(…)`), or one to
-///   three capitalised words (`⏺ Web Search(…)`), running straight into `(`;
-/// * an MCP tool by its `userFacingName`, `<server> - <title> (MCP)`, then
-///   its arguments' `(…)` or, with none, nothing (`⏺ github - get_issue
-///   (MCP)(owner: "acme")`, `⏺ github - ping (MCP)`); the server and the title
-///   may hold spaces (`⏺ ticket desk - …`, `⏺ claude.ai Gmail - …`), and a
-///   tool its server no longer lists is drawn `⏺ mcp__srv__tool (MCP)`;
-/// * an integration's tool, `<Name>[<tool>]` and its arguments or none (`⏺
-///   Claude in Chrome[get_page_text](tabId: 1)`);
-/// * a shell-mode command and its output: `! <command>` in column 0 (`❯
-///   !<command>` as an older echo drew it).
-///
-/// A completion notice (`⏺ Dynamic workflow "…" completed`) and the worker's prose are not.
-/// The one reader of "a call" for this crate's wall placement (`notice`), the worker's last
-/// words ([`crate::turn::said_tail`]) and aterm-agent's report blocks.
+/// A transcript row that opens a call.
 pub fn is_tool_call(row: &str) -> bool {
     if let Some(command) = row.strip_prefix('!').or_else(|| {
         row.strip_prefix('❯')
@@ -3132,10 +2159,7 @@ pub fn is_tool_call(row: &str) -> bool {
             .is_some_and(|open| is_call_name(&rest[..open]))
 }
 
-/// `<Name>[<tool>]`, then the arguments' `(…)` or nothing: one to four words,
-/// the first capitalised, each of letters, digits, `_` or `-`, then the
-/// bracketed tool, a name with no space in it (`Claude in Chrome[read_page]`,
-/// its `userFacingName` in 2.1.294).
+/// `<Name>[<tool>]`, then the arguments' `(…)` or nothing.
 fn bracketed_call(rest: &str) -> bool {
     let Some((name, tail)) = rest.split_once('[') else {
         return false;
@@ -3160,9 +2184,7 @@ fn bracketed_call(rest: &str) -> bool {
         && (crate::text::trim_end(args).is_empty() || args.starts_with('('))
 }
 
-/// The name of a `Name(…)` call: one run of letters, digits, `_`, `:`, `.`
-/// or `-`, or one to three words each a capital letter then letters, digits,
-/// `_` or `-` (`Web Search`, `Edit Notebook`), forty characters at most.
+/// The name of a `Name(…)` call.
 fn is_call_name(name: &str) -> bool {
     let one = !name.is_empty()
         && name
@@ -3179,22 +2201,7 @@ fn is_call_name(name: &str) -> bool {
     one || capitalised
 }
 
-/// A notice in the footer, under the bottom rule (from row `from`) and above
-/// the first blank row (the agents panel and a workflow's line below it are
-/// the worker's words): an item — the text read, a part of it after a wide
-/// gap or after ` · ` — that opens with a notice `classify` names, up to the
-/// next wide gap. Only where Claude Code draws ITS notices is read
-/// ([`footer_text`]): a banner row that opens with a status glyph, read with
-/// the rows Ink wrapped its line onto ([`line_at`]: in a pane narrower than
-/// the usage-limit banner, `⚠ Usage limit reached · limit` stands over
-/// `resets 10:25am`, 34 columns, 2.1.299, and the row alone names no
-/// reset); and the notification column, right-aligned or stacked under the
-/// mode row.
-/// The rest of the footer's left side is the `statusLine` command's text —
-/// the person's script, whatever it prints (KI-1015-14, measured on 2.1.304:
-/// a status line printing `Not logged in · Run /login` read as the vendor's
-/// login notice, and with no transcript `/login` was typed into a logged-in
-/// worker) — and the mode row's.
+/// A notice in the footer, under the bottom rule (from row `from`) and above the first blank row.
 fn footer_notice(
     rows: &[String],
     from: usize,
@@ -3227,29 +2234,7 @@ fn footer_notice(
         })
 }
 
-/// What of footer row `i` Claude Code itself drew a notice in, measured on
-/// 2.1.304 (`claude-2.1.304-footer-*`, `…-statusline-login-words-*`,
-/// `…-wall-session-auto-continue-*`) and on 2.1.299 and 2.1.300 at 26, 34,
-/// 50 and 80 columns: the footer is two columns. On the left the vendor's
-/// banner (`⚠ Usage limit reached · …`, a status glyph first, its countdown
-/// under it), then the `statusLine` command's rows, then the mode row
-/// (`⏵⏵ auto mode on …`, `⏸ manual mode on · ? for shortcuts`, [`is_mode_row`]);
-/// on the right, right-aligned (the binary's `flex-end`), the vendor's
-/// notifications (`Not logged in · Run /login`, `Automatic continue
-/// cancelled · …`, `◐ medium · /effort`), level with the left column's first
-/// row — and in a pane too narrow for both, stacked under the mode row, where
-/// one that fills its row starts at column 2 (`Not logged in · Run /…` at 26
-/// columns, `You're now using usage credits · …` at 80). Read: a banner row's
-/// line ([`line_at`]); a row under the mode row, whole; else the row's right
-/// segment ([`crate::wall::right_segment`]) where it ends against the right
-/// edge (within three columns, as every measured notification does: two
-/// short of 144, of 80) and starts at the hint column ([`HINT_COLUMN`]) or
-/// the row stands there whole ([`is_against_right_edge`]); else nothing. A
-/// status line's later field, after two spaces, is no notification short of
-/// the edge: ` opus-5.5 ~/proj Not logged in · Run /login` read as the
-/// login notice before. A status line that itself
-/// prints a status glyph first, or whose words reach the right edge, reads
-/// as the vendor's.
+/// What of footer row `i` Claude Code itself drew a notice.
 fn footer_text(
     rows: &[String],
     from: usize,
@@ -3270,36 +2255,20 @@ fn footer_text(
         .then(|| segment.to_string())
 }
 
-/// The footer's mode row, the left column's last: the permission mode
-/// (`⏵⏵ auto mode on (shift+tab to cycle)`, `⏵⏵ bypass permissions on`,
-/// `⏸ plan mode on`, `⏸ manual mode on · ? for shortcuts`) or, with none
-/// drawn, `? for shortcuts` — cut to the pane, never wrapped (measured to 10
-/// columns, 2.1.299 to 2.1.304).
+/// The footer's mode row, the left column's last.
 fn is_mode_row(row: &str) -> bool {
     let t = crate::text::trim_start(row);
     t.starts_with(['⏵', '⏸']) || t.starts_with("? for shortcuts")
 }
 
-/// One past the footer's last row: the first blank row from row `from` (the
-/// row under the bottom rule) on, or the screen's end.
+/// One past the footer's last row.
 pub(crate) fn footer_end(rows: &[String], from: usize) -> usize {
     (from..rows.len())
         .find(|&i| crate::text::trim(&rows[i]).is_empty())
         .unwrap_or(rows.len())
 }
 
-/// A notice on a banner row under the last thing said: of the rows after [`last_said_index`]'s
-/// (from the top when nothing is said) up to the composer's top rule, the status row's own
-/// position included, the lowest that starts with a status glyph ([`is_status_row`]: `⚠`, `✔`,
-/// …, never a spinner's) and opens with a notice `classify` names. A banner starts where Claude
-/// Code's own rows do, in the transcript's columns short of the gutter's text column or against
-/// the right edge as a hint ([`is_hint`]), and never on a row that hangs from a `⎿` gutter
-/// ([`gutter_open`]): a tool's output is the worker's words at whatever column, a peer's
-/// right-aligned screen included. A blank row ends the gutter's block; a banner under it is
-/// Claude Code's own. A notice above a said row is history. The banner's text is its line
-/// across the rows Ink wrapped it onto ([`line_at`]); a wrapped rest that [`last_said_index`]
-/// takes for the last thing said hides the banner above it (2.1.295 and later draw the usage
-/// banner in the footer, [`footer_notice`]).
+/// A notice on a banner row under the last thing said.
 fn banner_notice(
     rows: &[String],
     top: usize,
@@ -3328,14 +2297,10 @@ fn banner_notice(
     })
 }
 
-/// The column the `⎿` gutter's text starts at (`  ⎿  queued 8 runs`): a
-/// block's continuation rows are indented to it or further.
+/// The column the `⎿` gutter's text starts at (` ⎿ queued 8 runs`).
 const GUTTER_TEXT_COLUMN: usize = 5;
 
-/// Whether row `i` stands in a `⎿` block a CALL owns ([`block_is_vendors`]:
-/// the call's output, or a later column-2 row under it, which only the
-/// transcript tells from the output) or one at a tool's column: words a tool
-/// printed, as far as the screen can say. A row under no gutter is not.
+/// Whether row `i` stands in a `⎿` block a call owns.
 pub(crate) fn under_a_call(rows: &[String], i: usize) -> bool {
     gutter_open(rows, i).is_some_and(|open| {
         !matches!(
@@ -3345,10 +2310,7 @@ pub(crate) fn under_a_call(rows: &[String], i: usize) -> bool {
     })
 }
 
-/// The `⎿` row that opens the gutter block row `i` belongs to: `i` itself, or
-/// the row its continuation rows (indented to the gutter's text,
-/// [`GUTTER_TEXT_COLUMN`] or more) hang from. `None` when `i` is not under
-/// the gutter.
+/// The `⎿` row that opens the gutter block row `i` belongs.
 pub(crate) fn gutter_open(rows: &[String], mut i: usize) -> Option<usize> {
     loop {
         let t = crate::text::trim_start(&rows[i]);
@@ -3362,26 +2324,14 @@ pub(crate) fn gutter_open(rows: &[String], mut i: usize) -> Option<usize> {
     }
 }
 
-/// The reset a limit notice's text names — what [`limit_notice`] hands over
-/// as its reset — for a caller that holds the notice's text from elsewhere
-/// (the session transcript Claude Code writes the notice into).
+/// The reset a limit notice's text names.
 #[must_use]
 pub fn notice_reset(message: &str) -> Option<String> {
     reset_of(message)
 }
 
-/// When the notice says the limit resets: the text after `resets at ` /
-/// `reset at ` / `resets `, up to a ` · ` or ` ∙ ` separator, without a closing
-/// `.`. The auto-continue notice names no reset but says when Claude Code
-/// goes on by itself, which is the same clock: the text after `continuing
-/// automatically at ` (`1:50pm`), or `shortly` for `continuing shortly` —
-/// the word as printed, so the `reset=` a line carries is what the screen
-/// said (`aterm-agent`'s `limit::parse_reset` reads both).
+/// When the notice says the limit resets.
 fn reset_of(message: &str) -> Option<String> {
-    // Every key, in order of preference, at every place it occurs: the first followed by a
-    // time names the reset. A key followed by no time (`send a message after it resets to
-    // continue`) is passed over, so a countdown toast after such a row (`continuing
-    // automatically at 3pm`) still names its time.
     for key in [
         "resets at ",
         "reset at ",
@@ -3397,18 +2347,13 @@ fn reset_of(message: &str) -> Option<String> {
             from = at;
         }
     }
-    // `continuing shortly`, or `continuing automatically shortly` (its `{when}` is `shortly`
-    // when the reset is not ahead).
     ["continuing shortly", "continuing automatically shortly"]
         .iter()
         .find_map(|k| find_ascii_ci(message, k))
         .map(|_| "shortly".to_string())
 }
 
-/// The reset text at the start of `rest`, up to a ` · ` or ` ∙ ` separator
-/// and no further than its time ([`time_words`]), without a closing `.`;
-/// `None` when it is no time: a reset text opens with a digit, a month, a
-/// span or `shortly`.
+/// The reset text at the start of `rest`.
 fn time_after(rest: &str) -> Option<String> {
     let cut = [" · ", " ∙ "]
         .iter()
@@ -3430,14 +2375,7 @@ fn time_after(rest: &str) -> Option<String> {
     (!rest.is_empty() && timey).then(|| rest.to_string())
 }
 
-/// The words `text` opens with that are a time — a clock (`10:25am`, `11:05 am`), a date (`Oct
-/// 15 at`, `September 19,`, `2027`), a span (`in 2h 30m`, `in 3 hours`), `shortly` — and the
-/// zone in parentheses after them (`(America/Los_Angeles)`): the reset ends there, whatever
-/// follows (a line read across wrapped rows can run on into the notice's next line). A joining
-/// word (`at`, `on`, `in`, `of`, `the`, `and`) is the time's only with one after it. A date or
-/// day after the clock is the time's too (`3pm on Oct 15`, `9am tomorrow`, `9am Monday`): cut
-/// there, the clock alone would read as today's or tomorrow's (`aterm-agent`'s
-/// `limit::parse_reset` reads no such spelling whole, and the reset falls to the backstop).
+/// The words `text` opens with that are a time.
 fn time_words(text: &str) -> &str {
     let (mut end, mut at) = (0, 0);
     while let Some(skip) = text[at..].find(|c: char| !c.is_whitespace()) {
@@ -3466,11 +2404,7 @@ fn time_words(text: &str) -> &str {
     &text[..end]
 }
 
-/// A word of a reset's time ([`time_words`]) that is a time's own: one with a
-/// digit in it, or a month, a meridian, a span's unit or `shortly` — the
-/// words `aterm-agent`'s `limit::parse_reset` reads — or a day (`today`,
-/// `tomorrow`, a weekday, `noon`, `midnight`), which it does not, a closing
-/// `,` or `.` aside.
+/// A word of a reset's time ([`time_words`]) that is a time's own.
 fn is_time_word(word: &str) -> bool {
     const WORDS: &[&str] = &[
         "shortly",
@@ -3572,8 +2506,6 @@ mod tests {
         r
     }
 
-    /// Three live shapes of 2.1.282's question dialog (the preview form, the Submit tab, a tab
-    /// with its chat row focused) and a dialog withheld behind a draft each read a prompt.
     #[test]
     fn the_incident_screens_no_longer_read_idle() {
         use crate::prompt::fixtures::{
@@ -3597,8 +2529,6 @@ mod tests {
         }
     }
 
-    /// Only the launch card's own row ends the live zone, never a queued `❯` message or a todo
-    /// that names "Claude Code v2.1.284": the spinner above it still reads busy.
     #[test]
     fn a_row_that_names_the_banner_is_not_the_launch_card() {
         let frame = |body: &[&str], footer: &str| -> Vec<String> {
@@ -3636,8 +2566,6 @@ mod tests {
                 );
             }
         }
-        // A workflow wait with a queued question naming the version: still
-        // the wait, never the question.
         let r = frame(
             &[
                 "⏺ Started the workflow.",
@@ -3683,9 +2611,6 @@ mod tests {
         }
     }
 
-    /// Another composer's rule ends the live zone too, card or no card: a
-    /// dead frame's bottom rule sits under everything that frame owned, so
-    /// nothing above it is the live frame's status row.
     #[test]
     fn a_rule_above_the_frame_ends_the_live_zone() {
         let mut r = rows(&["⏺ Working on it.", "", "✢ Deliberating… (12s)", ""]);
@@ -3694,22 +2619,16 @@ mod tests {
         r.extend(composer("  ? for shortcuts"));
         assert_eq!(busy_signal(&r), None, "{r:#?}");
         assert_eq!(worker_phase(&r), Phase::Idle);
-        // Negative control: the live frame's own spinner is still read.
         let mut live = rows(&["user@host proj % claude", "", "✢ Deliberating… (12s)", ""]);
         live.extend(composer("  ⏵⏵ auto mode on · esc to interrupt"));
         assert_eq!(worker_phase(&live), Phase::Busy);
     }
 
-    /// The rows of `r` the busy guard (`esc to interrupt`) matches.
     fn busy_rows(r: &[String]) -> Vec<usize> {
         let busy = crate::anchor("busy.interrupt");
         (0..r.len()).filter(|&i| r[i].contains(busy)).collect()
     }
 
-    /// A wait on the busy row is armed in the live zone, under a dead process's `esc to
-    /// interrupt` footer: two seconds into the new session's first turn (`…_BUSY`) exactly one
-    /// busy row is in the zone, the running turn's own; on the idle session, the question
-    /// dialogs and the Ctrl-C relaunch, none.
     #[test]
     fn the_live_zone_starts_under_a_dead_frame_and_keeps_the_live_footer() {
         use crate::prompt::fixtures::{
@@ -3766,9 +2685,6 @@ mod tests {
         }
     }
 
-    /// Before a fresh `claude` draws anything the dead frame is the only one on the screen, but
-    /// the resume hint under it (anchor `exit.resume`) says it is dead: the live zone starts
-    /// under the hint. Cut at its own footer, as it lived, the frame keeps its footer in the zone.
     #[test]
     fn the_live_zone_starts_under_an_exited_processs_resume_hint() {
         use crate::prompt::fixtures::{
@@ -3785,8 +2701,6 @@ mod tests {
         ] {
             let r = screen(text);
             let hint = r.iter().position(|row| row == notice).expect(name);
-            // The screen a fresh `claude` has drawn nothing on yet: the dead
-            // frame, its hint and the shell's command line.
             let predraw = r[..hint + 3].to_vec();
             assert_eq!(busy_zone_start(&predraw), hint + 1, "{name}");
             let dead = predraw
@@ -3794,12 +2708,9 @@ mod tests {
                 .position(|row| row.contains(footer))
                 .expect(name);
             assert!(dead < hint, "{name}");
-            // Negative control: the frame as it lived.
             let lived = r[..=dead].to_vec();
             assert!(busy_zone_start(&lived) < dead, "{name}: {lived:#?}");
         }
-        // Only the hint alone on its row counts: quoted under the gutter, or
-        // in a message, it is the transcript's.
         let r = screen(EXIT_RELAUNCH_STALE_FOOTER);
         let hint = r.iter().position(|row| row == notice).expect("the hint");
         let dead = busy_rows(&r)[0];
@@ -3847,8 +2758,6 @@ mod tests {
         assert_eq!(busy_reason("  ⏵⏵ auto mode on (shift+tab to cycle)"), None);
     }
 
-    /// A prompt box with a background shell in the footer is a prompt: the
-    /// worker is blocked on it, whatever the shell does.
     #[test]
     fn a_prompt_beats_a_background_shell() {
         let mut r = bash_one_row();
@@ -3857,8 +2766,6 @@ mod tests {
         assert_eq!(worker_phase(&r), Phase::Prompt);
     }
 
-    /// A `?` in the last said row is a question only when nothing is busy and
-    /// no box is up; a `?` earlier in the transcript is not.
     #[test]
     fn question_reads_the_last_said_row_only() {
         let earlier = screen(
@@ -3875,13 +2782,10 @@ mod tests {
         assert_eq!(worker_phase(&earlier), Phase::Idle);
         let busy_q = screen(&["⏺ Should I continue?", ""], "  esc to interrupt");
         assert_eq!(worker_phase(&busy_q), Phase::Busy);
-        // No composer at all (a plain shell): the last non-blank row decides.
         let shell = rows(&["$ ls", "a b", "Continue?", ""]);
         assert_eq!(worker_phase(&shell), Phase::Question);
     }
 
-    /// A done row and an update banner between the transcript and the composer (its rule
-    /// carrying the git branch, a dim suggestion after a no-break space) hide no question.
     #[test]
     fn status_rows_under_the_transcript_do_not_hide_a_question() {
         let bottom = [
@@ -3913,7 +2817,6 @@ mod tests {
         idle.extend(rows(&bottom));
         assert_eq!(worker_phase(&idle), Phase::Idle);
 
-        // The done row alone under a question is also skipped.
         let done = screen(
             &[
                 "⏺ Which do you prefer?",
@@ -3946,12 +2849,9 @@ mod tests {
             composer_text(&r).as_deref(),
             Some("m7 is reachable as ssh m7, go")
         );
-        // The option rows of a prompt box are not the composer.
         let p = bash_one_row();
         let ci = composer_index(&p).expect("composer");
         assert_eq!(p[ci], "❯");
-        // Nor is the entry of the slash menu under the composer that carries the
-        // pointer (2.1.291, 2.1.292), at the top of the list or further down.
         for (menu, typed) in [
             (CONTEXT_WALL_COMPACT_MENU_MEASURED, "/compact"),
             (SLASH_MENU_POINTER_DOWN_MEASURED, "/mod"),
@@ -3967,8 +2867,6 @@ mod tests {
         }
     }
 
-    /// What Enter may do ([`CompletionMenu::runs`]) by the rows alone: each entry's word,
-    /// `<draft>` for sending the draft.
     fn runs_of(rows: &[String]) -> Option<Vec<String>> {
         completion_menu(rows).map(|m| m.runs(None).into_iter().map(said).collect())
     }
@@ -3980,13 +2878,6 @@ mod tests {
         }
     }
 
-    /// THE ENTRY ENTER WOULD RUN ([`CompletionMenu::runs`]): the slash menu's pointed
-    /// entry, at the top (`/compact` under `❯ /compact`) or arrowed down (the third,
-    /// `/plugin-authoring`, under `❯ /mod`), both MEASURED on 2.1.292; and a menu of
-    /// two with no entry pointed (2.1.287 draws the entries alone), unread, either of
-    /// them. NEGATIVE CONTROLS: the measured idle footer under the frame, a `/cl` draft
-    /// with its footer under it (the menu dismissed), the shortcuts list, and no frame
-    /// are no menu.
     #[test]
     fn the_completion_menus_entry_is_what_enter_would_run() {
         use crate::prompt::fixtures::{
@@ -4028,7 +2919,6 @@ mod tests {
         let menu = completion_menu(&pointed).expect("the menu");
         assert_eq!((menu.entries[0].row, menu.entries[0].col), (5, 4));
         assert_eq!((menu.entries[1].row, menu.entries[1].col), (6, 4));
-        // NEGATIVE CONTROLS.
         let idle = fx(include_str!("fixtures/claude-2.1.283-footer-auto-idle.txt"));
         assert_eq!(completion_menu(&idle), None);
         assert_eq!(
@@ -4046,19 +2936,6 @@ mod tests {
         assert_eq!(completion_menu(&rows(&["❯ /cl", "    /clear"])), None);
     }
 
-    /// ("with no pointer drawn, a completion menu is known only by a
-    /// first entry starting `/` or `@`"), held to what Enter did, MEASURED in the
-    /// real-Claude lab on 2026-10-17. 2.1.302: the `@` menu (files `+`, agents `*`, at
-    /// column 4) opens with no entry selected and none pointed, and Enter SENT the draft
-    /// (`@`, `and @RE`), so it is no menu Enter diverts; after `down` the pointer is drawn
-    /// (`  ❯ + notes.txt`) and Enter completed the entry, so it is read by its pointer.
-    /// 2.1.268, a build that draws no pointer: the slash menu's selected entry is drawn
-    /// in colour only, so the rows alone leave any entry the one Enter runs (Enter ran
-    /// `/clear` on `/cl`, its top entry); its `@` menu (at column 2) opens with none
-    /// selected and Enter sent the draft, but after a person's `down` its entry is
-    /// highlighted in colour only, the rows unchanged, and Enter completed it, so by the
-    /// rows alone Enter may do either (its cells decide:
-    /// [`an_at_menus_selection_drawn_in_colour_only_is_read_by_the_cells_measured`]).
     #[test]
     fn a_menu_with_no_pointer_is_what_enter_did_measured() {
         use crate::prompt::fixtures::{
@@ -4106,7 +2983,6 @@ mod tests {
         assert_eq!(fx(AT_MENU_DOWN_2_1_268), fx(AT_MENU_PARTIAL_2_1_268));
     }
 
-    /// The colour of each entry's first glyph, from a cells fixture.
     fn fg_of(menu: &CompletionMenu, cells: &str) -> Vec<Option<String>> {
         let cells = crate::prompt::fixtures::cells(cells);
         menu.entries
@@ -4120,16 +2996,6 @@ mod tests {
             .collect()
     }
 
-    /// THE SELECTION DRAWN IN COLOUR ONLY (the review of 's "no pointer"
-    /// item), on 2.1.268's slash menu MEASURED with the `cell` of each row's first glyph
-    /// and what Enter did. `/config` over nine entries: the text is the same whichever
-    /// is selected; as the menu opened `/config`'s `/` was `b1b9f9` and the others'
-    /// `999999`, and Enter opened the settings; after `down` `/update-config`'s was, and
-    /// Enter ran `/update-config`. The colours name that entry; a description's wrapped
-    /// row (column 32) is no entry. With two entries (`/copy`, `/fork`) the two colours
-    /// do not say which is the selection's, so either may run. NEGATIVE CONTROLS: an
-    /// unread cell, every entry in one colour, and two unlike the rest leave every entry
-    /// a candidate; a pointed menu is read by its pointer whatever the colours say.
     #[test]
     fn a_selection_drawn_in_colour_only_is_read_by_the_cells_measured() {
         use crate::prompt::fixtures::{
@@ -4168,7 +3034,6 @@ mod tests {
         ] {
             assert_eq!(runs(&copy, Some(&fg_of(&copy, cells))), ["/copy", "/fork"]);
         }
-        // NEGATIVE CONTROLS.
         let mut unread = fresh.clone();
         unread[3] = None;
         assert_eq!(runs(&config, Some(&unread)), words);
@@ -4188,18 +3053,6 @@ mod tests {
         );
     }
 
-    /// THE `@` MENU'S SELECTION DRAWN IN COLOUR ONLY (dialogs: no
-    /// pointer), on 2.1.268 MEASURED with the `cell` of each entry's first glyph and what
-    /// Enter did. The `@` menu opens with no entry selected, every entry alike (`999999`,
-    /// files `+` and agents `*` alike), and Enter sent the draft; after `down` the entry
-    /// selected is `b1b9f9`, the rows unchanged, and Enter completed it and sent nothing
-    /// (`read @no` became `read @novel.txt`; `and @RE`, after two, `and @"Explore
-    /// (agent)"`). So entries all alike send the draft, and any unlike the rest complete an
-    /// entry. Read by its rows alone it was sent: the turn end's Submit completed the
-    /// person's entry. One entry alone has no other's colour to be told against: either.
-    /// NEGATIVE CONTROLS: an unread cell leaves either; 2.1.302's `@` menu, which leaves
-    /// the pointer's room before its entries ([`POINTER_ROOM`]), is no menu unpointed
-    /// (Enter sent it) and its pointer's when pointed, whatever the colours say.
     #[test]
     fn an_at_menus_selection_drawn_in_colour_only_is_read_by_the_cells_measured() {
         use crate::prompt::fixtures::{
@@ -4234,7 +3087,6 @@ mod tests {
         for fg in ["999999", "b1b9f9"] {
             assert_eq!(one.runs(Some(&[Some(fg.to_string())])), either, "{fg}");
         }
-        // NEGATIVE CONTROLS.
         let mut unread = fg_of(&no, AT_MENU_NO_CELLS_2_1_268);
         unread[2] = None;
         assert_eq!(no.runs(Some(&unread)).len(), 5, "either");
@@ -4247,16 +3099,6 @@ mod tests {
             [MenuEnter::Complete("+")]
         );
     }
-
-    // ---- the live zone, against real screens ------------------------------
-    //
-    // `fixtures/` holds screens saved from a real supervision session (Claude Code 2.1.267 in a
-    // 63x138 window). A `.txt` is a whole `text` read, one row per line (its cursor at row 60,
-    // col 2, the empty composer). A `wait_bg*.out` is a waiter's capture: a `== KIND … ==` line,
-    // the screen's non-blank rows (cut at 150-170 columns), `exit=<n>`; the KIND is that waiter's
-    // conclusion, and each test reads the truth from the rows instead. The worker's words,
-    // commands, tool output and names are neutral text of the same shape, row for row; every
-    // row Claude Code draws itself is verbatim.
 
     const IDLE_AFTER_LIMIT: &str = include_str!("fixtures/idle-after-limit-and-model-switch.txt");
 
@@ -4279,14 +3121,12 @@ mod tests {
         busy_signal(rows).map(|b| b.to_string())
     }
 
-    /// Replace the footer (the row under the bottom rule) with `footer`.
     fn with_footer(mut r: Vec<String>, footer: &str) -> Vec<String> {
         let bottom = r.iter().rposition(|x| is_rule(x)).expect("bottom rule");
         r[bottom + 1] = footer.to_string();
         r
     }
 
-    /// Insert `extra` directly above the composer's top rule.
     fn above_frame(mut r: Vec<String>, extra: &[&str]) -> Vec<String> {
         let top = composer_frame(&r).expect("frame").top;
         for (k, row) in extra.iter().enumerate() {
@@ -4295,7 +3135,6 @@ mod tests {
         r
     }
 
-    /// Insert `extra` directly above the status row (the done row).
     fn above_status_row(mut r: Vec<String>, extra: &[&str]) -> Vec<String> {
         let top = composer_frame(&r).expect("frame").top;
         let at = status_block(&r, top).status.expect("a status row");
@@ -4305,12 +3144,9 @@ mod tests {
         r
     }
 
-    /// Footers an idle worker's screen shows (from wait_bg7 and wait_bg2).
     const IDLE_AUTO_FOOTER: &str = "  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents                                                                         /rc active";
     const PASTE_FOOTER: &str = "  paste again to expand                                                                                                       /rc active";
 
-    /// The turn ended, `/model` ran after it, the composer is empty: idle, though row 45, fifteen
-    /// rows above the frame, still says `✻ Waiting for 1 dynamic workflow to finish`.
     #[test]
     fn the_idle_after_limit_screen_is_idle_though_row_45_says_waiting() {
         let r = saved_screen(IDLE_AFTER_LIMIT);
@@ -4330,8 +3166,6 @@ mod tests {
         assert_eq!(worker_phase(&r), Phase::Idle);
     }
 
-    /// The same screen with a live spinner directly above the top rule, and
-    /// again above the right-aligned hint (the walk skips the hint): busy.
     #[test]
     fn a_live_spinner_above_the_top_rule_is_busy() {
         for at in [59, 58] {
@@ -4346,8 +3180,6 @@ mod tests {
         }
     }
 
-    /// The two measured 2.1.267 spinner rows read busy by their shape with the footer's `esc to
-    /// interrupt` gone: under an unlisted glyph, indented, or both.
     #[test]
     fn the_spinner_row_reads_busy_by_its_shape_not_by_a_glyph_list() {
         const BLOVIATING: &str = include_str!("fixtures/spinner-bloviating.txt");
@@ -4364,8 +3196,6 @@ mod tests {
             );
             assert_eq!(worker_phase(&measured), Phase::Busy, "{name}: as measured");
 
-            // The footer does not always carry the phrase. Then the spinner
-            // row is the only thing left saying a turn is running.
             let quiet: Vec<String> = measured
                 .iter()
                 .map(|r| r.replace(" · esc to interrupt", ""))
@@ -4391,8 +3221,6 @@ mod tests {
         }
     }
 
-    /// The shape never hands the transcript's markers to the status row: `⏺ Bloviating…` is the
-    /// worker saying what it is about to do.
     #[test]
     fn a_transcript_marker_never_reads_as_a_spinner_row() {
         for glyph in ['⏺', '●', '⎿'] {
@@ -4408,16 +3236,6 @@ mod tests {
         }
     }
 
-    /// The older waiter's captures, each read by its live zone: `wait_bg` a
-    /// turn finished while a background workflow runs (`Waiting for 1
-    /// dynamic workflow` above the frame, its progress line under the
-    /// footer); `wait_bg2` the manager answered and the worker deliberates
-    /// under a `⎿  Tip:` row, the older `Waiting for` row above the user row
-    /// history; `wait_bg3` a done row that counts no shell, the worker asking
-    /// for a call without a `?`; `wait_bg4` `1 shell still running` on the
-    /// done row and `· 1 shell ·` in the footer; `wait_bg11` the shell on the
-    /// done row under a right-aligned hint; `wait_bg12` the live done row
-    /// under the update banner, an older one with a shell far up (history).
     #[test]
     fn the_waiter_captures_read_by_their_live_zone() {
         for (name, text, busy, status, phase) in [
@@ -4475,15 +3293,12 @@ mod tests {
         assert_eq!(last_said_row(&bg3), Some("  Waiting for your call."));
     }
 
-    /// The agent's own background work is told from a live turn ([`background_wait`]).
     #[test]
     fn background_work_after_the_turn_is_told_from_a_live_turn() {
         let bg = waiter_capture(include_str!("fixtures/wait_bg.out"));
         assert_eq!(background_wait(&bg), Some("waiting for a dynamic workflow"));
         let shell = waiter_capture(include_str!("fixtures/wait_bg4.out"));
         assert_eq!(background_wait(&shell), Some("a shell still running"));
-        // Negative controls: a live spinner over the same workflow's line, an idle screen, a
-        // screen with no composer frame.
         let live = waiter_capture(include_str!("fixtures/wait_bg2.out"));
         assert_eq!(worker_phase(&live), Phase::Busy);
         assert_eq!(background_wait(&live), None);
@@ -4493,12 +3308,6 @@ mod tests {
         assert_eq!(background_wait(&bare), None);
     }
 
-    /// THE TURN OVER, A SHELL OR A MONITOR LEFT RUNNING
-    /// ([`turn_over_background`]): a done row over a shell (`wait_bg4.out`)
-    /// or over a monitor is the turn's end. NEGATIVE CONTROLS: a turn still
-    /// waiting on its workflow (`wait_bg.out`) or its background agent is
-    /// background work but not over; a live turn (`wait_bg2.out`) and an
-    /// idle screen (`wait_bg3.out`) are neither.
     #[test]
     fn a_turn_over_background_work_is_a_done_row_over_a_shell_or_a_monitor() {
         let shell = waiter_capture(include_str!("fixtures/wait_bg4.out"));
@@ -4509,7 +3318,6 @@ mod tests {
         monitor[at] = "✻ Crunched for 9m 27s · done 11:07 AM · 1 monitor still running".to_string();
         assert_eq!(background_wait(&monitor), Some("a monitor still running"));
         assert!(turn_over_background(&monitor));
-        // NEGATIVE CONTROLS.
         let workflow = waiter_capture(include_str!("fixtures/wait_bg.out"));
         assert!(background_wait(&workflow).is_some());
         assert!(!turn_over_background(&workflow));
@@ -4528,13 +3336,6 @@ mod tests {
         }
     }
 
-    /// WHO OPENED THE TURN DRAWN LAST ([`opened_by_own_wake`]): Claude Code's
-    /// own wake — a background command's end (`wait_bg6.out`; `wait_bg12.out`,
-    /// whose composer holds a draft that is no message) or a monitor's event
-    /// — with no person's row after it. A person's message after the wake,
-    /// in the transcript or queued under the status row, opened the turn.
-    /// NEGATIVE CONTROLS: a screen with no opener on it, and one with no
-    /// frame, say nothing.
     #[test]
     fn the_turn_drawn_last_was_opened_by_the_agents_own_wake_or_a_person() {
         let woke = waiter_capture(include_str!("fixtures/wait_bg6.out"));
@@ -4550,7 +3351,6 @@ mod tests {
             ],
         );
         assert_eq!(opened_by_own_wake(&monitor), Some(true));
-        // A person's message after the wake: in the transcript, and queued.
         let at = woke
             .iter()
             .rposition(|r| r.starts_with("⏺ Background command"))
@@ -4560,14 +3360,11 @@ mod tests {
         assert_eq!(opened_by_own_wake(&asked), Some(false));
         let queued = above_frame(woke, &["❯ Also update the README."]);
         assert_eq!(opened_by_own_wake(&queued), Some(false));
-        // NEGATIVE CONTROLS.
         assert_eq!(opened_by_own_wake(&shell), None);
         let bare = vec!["⏺ Background command \"x\" completed (exit code 0)".to_string()];
         assert_eq!(opened_by_own_wake(&bare), None);
     }
 
-    /// A message submitted under `✻ Waiting for 1 dynamic workflow to finish` has begun a turn
-    /// before its spinner is drawn: the waiting row is still the status row, and it is no break.
     #[test]
     fn a_message_submitted_under_the_waiting_row_is_no_break() {
         let r = waiter_capture(include_str!("fixtures/wait_bg2.out"));
@@ -4593,10 +3390,6 @@ mod tests {
         assert_eq!(background_wait(&typed), None, "{:?}", &typed[top - 3..=top]);
     }
 
-    /// THE SHELL COUNT the survey publishes (`bg=`): the done row's or the
-    /// footer's count, whichever names one, and the larger where both do.
-    /// NEGATIVE CONTROLS: a monitor is no shell, a screen with a frame that
-    /// counts none is `0`, and a screen with no frame is no reading.
     #[test]
     fn the_shell_count_is_the_done_rows_or_the_footers() {
         use crate::prompt::fixtures::IDLE_SHELLS_2_1_271 as TEXT;
@@ -4616,15 +3409,10 @@ mod tests {
         assert_eq!(shells_running(&["$ ls".to_string()]), None, "no frame");
     }
 
-    /// 2.1.271 at rest over two shells that never end (a hand-built screen): the done row's `2
-    /// shells still running` and the footer's `· 2 shells ·`, together or alone, are a break of
-    /// the agent's own work ([`background_wait`]); a message submitted under the done row is no
-    /// break, and with no shell counted the screen reads idle.
     #[test]
     fn claude_2_1_271_idle_over_two_shells_is_a_break_of_its_own_work() {
         use crate::prompt::fixtures::IDLE_SHELLS_2_1_271 as TEXT;
         use crate::reader::{Program, identify};
-        // This module's `screen` builds rows; the fixture's are read whole.
         let r = crate::prompt::fixtures::screen(TEXT);
         let done = "✻ Cogitated for 3m 12s · done 9:29 PM · 2 shells still running";
         assert_eq!(status_row(&r), Some(done));
@@ -4634,9 +3422,6 @@ mod tests {
         );
         assert_eq!(worker_phase(&r), Phase::Busy);
         assert_eq!(background_wait(&r), Some("a shell still running"));
-        // The supervisor's break, as it asks it (`host_steps_in_background`):
-        // busy, background work, no wall — the reader named by the program,
-        // or, for a Claude Code started as `node`, by its screen.
         for reader in [identify(Some("claude"), &r), identify(Some("node"), &r)] {
             assert_eq!(reader.program(), Program::Claude);
             assert_eq!(reader.phase(&r), Phase::Busy);
@@ -4644,7 +3429,6 @@ mod tests {
             assert!(reader.wall(&r).is_none(), "{:?}", reader.wall(&r));
         }
 
-        // The footer alone: the done row counts nothing.
         let at = r.iter().position(|x| x == done).expect("the done row");
         let mut footer_only = r.clone();
         footer_only[at] = "✻ Cogitated for 3m 12s · done 9:29 PM".to_string();
@@ -4655,7 +3439,6 @@ mod tests {
         assert_eq!(worker_phase(&footer_only), Phase::Busy);
         assert_eq!(background_wait(&footer_only), Some("a shell running"));
 
-        // The done row alone: the bypass footer counts nothing.
         const BARE: &str = "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents";
         let done_only = with_footer(r.clone(), BARE);
         assert_eq!(
@@ -4665,8 +3448,6 @@ mod tests {
         assert_eq!(worker_phase(&done_only), Phase::Busy);
         assert_eq!(background_wait(&done_only), Some("a shell still running"));
 
-        // Negative control: a message submitted under the done row (drawn a frame before its
-        // turn's spinner) is a turn begun, not a break.
         let top = composer_frame(&r).expect("the frame").top;
         for s in [&r, &footer_only, &done_only] {
             let mut submitted = s.clone();
@@ -4681,7 +3462,6 @@ mod tests {
             );
         }
 
-        // Negative control: no shell counted anywhere, the bypass footer over a done row is idle.
         let bare = with_footer(footer_only, BARE);
         assert_eq!(signal(&bare), None);
         assert_eq!(worker_phase(&bare), Phase::Idle);
@@ -4696,8 +3476,6 @@ mod tests {
         }
     }
 
-    /// A turn waiting on a background agent and a shell reads busy from its status row under
-    /// the update banner, the agents panel hanging under the footer.
     #[test]
     fn a_turn_waiting_for_a_background_agent_is_busy_from_its_status_row() {
         let r = rows(&[
@@ -4728,9 +3506,6 @@ mod tests {
         assert_eq!(status_busy("✻ Waiting for your call"), None);
     }
 
-    /// The agents panel under the mode row points at the row the pointer
-    /// hovers (or `↓` selects) in column 0; the composer stays the caret under
-    /// the frame's top rule, so the footer's facts, chips and switch stay put.
     #[test]
     fn a_pointed_agents_panel_row_is_not_the_composer() {
         let rule = "\u{2500}".repeat(60);
@@ -4764,9 +3539,6 @@ mod tests {
             assert_eq!(reach.rules(), Some((2, 4)), "{r:?}");
             assert_eq!(reach.rules(), composer_rules(&r));
         }
-        // Negative control: a draft that reads like a panel row, typed at the
-        // caret right under its top rule, is still the caret, with the
-        // panel's pointed row under the footer or not.
         let agent = "◯ salvage-merge  ▱▱▱▱  0/5   12m43s · ↓ 943.7k tokens";
         for under in [format!("  {agent}"), format!("❯ {agent}")] {
             let r = rows(&[
@@ -4784,13 +3556,6 @@ mod tests {
         }
     }
 
-    /// MEASURED on 2.1.304 (the lab, 2026-10-19): one background agent under
-    /// the footer, the panel at rest, its main row selected and its agent row
-    /// selected (`↓` once and twice from the empty composer). On every one
-    /// the caret is the composer's empty `❯` row under its top rule, the
-    /// frame stands, and the turn reads busy from its status row (`Waiting
-    /// for 1 background agent to finish`). The selected screens are the
-    /// defect's: the caret search took the `❯ ⏺ main` row before.
     #[test]
     fn the_measured_selected_panel_rows_are_no_caret() {
         for text in [
@@ -4815,8 +3580,6 @@ mod tests {
         }
     }
 
-    /// Each footer rule, on an otherwise idle frame; the footers an idle worker
-    /// shows fire none of them. A monitor is the soft rule.
     #[test]
     fn each_footer_rule_reads_busy_and_idle_footers_do_not() {
         let body = ["⏺ Done.", "", "✻ Cogitated for 4s · done 2:41 PM", ""];
@@ -4851,8 +3614,6 @@ mod tests {
                 "footer: a workflow running",
                 false,
             ),
-            // 2.1.304's workflow row: its pill bar, `done/total` with no
-            // `agents done`, the bar's own elapsed (read in the bundle).
             (
                 "  ◯ nightly-sweep  ▰▰▰▰▰▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱  1/4 · 3m02s · ↓ 12.4k tokens",
                 "footer: a workflow running",
@@ -4880,8 +3641,6 @@ mod tests {
             "  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents                /rc active",
             "  paste again to expand",
             "  ⏵⏵ auto mode on · shells are fine · 10 files changed",
-            // A PAUSED 2.1.304 workflow runs nothing; a panel AGENT row is
-            // not a workflow (the background-agent rules read those).
             "  ⏸ nightly-sweep  ▰▰▰▰▰▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱  1/4 · 3m02s · ↓ 12.4k tokens",
             "  ◯ general-purpose  Searching the report's consumers in tests      4m 28s · ↓ 115.4k tokens",
         ] {
@@ -4890,9 +3649,6 @@ mod tests {
         }
     }
 
-    /// The status walk passes blanks, hints, a `⎿  Tip:` row, a todo list and a user row (a
-    /// message about to be taken or queued) under a live spinner, and stops at a worker's row
-    /// or tool output above the frame.
     #[test]
     fn the_status_walk_passes_the_block_and_stops_at_the_transcript() {
         assert!(!is_spinner_row(
@@ -4902,18 +3658,14 @@ mod tests {
             "✻ Implementing the parser… (2m · ↓ 3.1k tokens)"
         ));
         assert!(!is_activity_row("✻ Cooked for 23m 0s · done 11:24 PM"));
-        // The vendor's API-retry row (no ellipsis).
         for row in [
             "✻ Can't reach the API server — check your internet or DNS (ENOTFOUND) · Retrying in 1s · attempt 5/10",
             "✻ Can't reach the API server — check your in… · Retrying in 30s · attempt 7/10",
             "✻ API Error: 529 Overloaded · Retrying in 1m 30s · attempt 2/10",
-            // The vendor's count of its tries without their total (the
-            // queued shape's `attempt 2`).
             "✻ Can't reach the API server · Retrying in 5s · attempt 5",
         ] {
             assert!(is_activity_row(row), "{row}");
         }
-        // Controls: a done row, the worker's own words, a malformed tail.
         for row in [
             "✻ Cogitated for 0s · done 11:02 PM",
             "✻ I was Retrying in 5s · attempt soon",
@@ -4937,10 +3689,6 @@ mod tests {
         );
         assert_eq!(signal(&todo).as_deref(), Some("status row: spinner"));
 
-        // A waiting row above the transcript is no STATUS row; with no done
-        // row or person's prompt under it, it is the wait Claude Code carries
-        // over the turns it started itself (module docs): soft background
-        // work, never the status row's own hard rule.
         for last in [
             "⏺ Stopped the background build.",
             "  ⎿  error: could not compile `x` (lib) due to 1 previous error",
@@ -4971,7 +3719,6 @@ mod tests {
             Some("status row: waiting for a dynamic workflow")
         );
 
-        // A hint in a narrow window still starts past column 20.
         let hint = screen(
             &[
                 "✶ Deliberating…",
@@ -4982,8 +3729,6 @@ mod tests {
         assert_eq!(signal(&hint).as_deref(), Some("status row: spinner"));
     }
 
-    /// `body` over Claude Code's frame drawn `width` columns wide, `footer`
-    /// under it: a pane of that width.
     fn pane(body: &[&str], width: usize, footer: &str) -> Vec<String> {
         let mut r = rows(body);
         r.extend(["─".repeat(width), "❯".to_string(), "─".repeat(width)]);
@@ -4991,17 +3736,6 @@ mod tests {
         r
     }
 
-    /// SM-3 (KI S2R-F1, measured by the 2026-10-15 sweep at 12 columns): the
-    /// status row is read as its LINE. A spinner cut at its text column
-    /// (`✶ Choreog` over `  raphing…`) or in column 0 under the glyph reads
-    /// busy, not idle; a done row wrapped before `still running` reads the
-    /// shell it left running; a spinner's timing wrapped under it is its
-    /// progress; the transcript ends before a cut spinner's line and past a
-    /// wrapped done row's. NEGATIVE CONTROLS: the measured narrow fixtures
-    /// keep their phase and status row (their wrapped done rows join to done
-    /// rows); a done row cut before `done`, a done row with a tip, a hint or
-    /// a queued message right under it, and a stray row under a full done
-    /// row read idle; the whole spinner at 80 columns is a spinner.
     #[test]
     fn a_status_row_ink_wrapped_is_read_as_its_line() {
         for rest in ["  raphing…", "raphing…"] {
@@ -5009,12 +3743,8 @@ mod tests {
             assert_eq!(worker_phase(&r), Phase::Busy, "{rest}");
             assert_eq!(signal(&r).as_deref(), Some("status row: spinner"), "{rest}");
             assert_eq!(status_row(&r), Some("✶ Choreog"), "{rest}");
-            // The spinner's line is the live zone, both its rows.
             assert_eq!(transcript_end(&r), 2, "{rest}");
         }
-        // A READER test, not a measurement: the narrow fixtures measured so
-        // far keep the footer's `· 1 shell` pill, which reads busy on its own;
-        // this footer is cut before it by hand.
         let shell = pane(
             &[
                 "⏺ Started the build in the background.",
@@ -5035,10 +3765,6 @@ mod tests {
             Some("✻ Worked for 9m 2s · done 3:15 PM · 1 shell still running")
         );
 
-        // NEGATIVE CONTROLS. The measured narrow screens (2.1.299 at 26 and
-        // 34 columns) keep the phase and status row main read them by; the
-        // transcript ends past a wrapped done row's whole line (its clock,
-        // `  10:36 AM`, is the transcript's, not the live zone's).
         use crate::prompt::fixtures::{
             API_ERROR_529_34_2_1_299, WALL_SESSION_AFTER_CANCEL_26_2_1_299,
             WALL_SESSION_AUTO_CONTINUE_ARMED_26_2_1_299,
@@ -5103,7 +3829,6 @@ mod tests {
             assert_eq!(transcript_end(&r), end, "{status:?}");
             assert!(busy_signal(&r).is_none(), "{status:?}");
         }
-        // A done row cut before `done`.
         let cut = pane(
             &["⏺ Fixed it.", "", "✻ Worked for 0s ·", "  done 1:02 PM"],
             20,
@@ -5114,11 +3839,7 @@ mod tests {
             status_line(&cut).as_deref(),
             Some("✻ Worked for 0s · done 1:02 PM")
         );
-        // The done row's line is the transcript's, both its rows.
         assert_eq!(transcript_end(&cut), 4);
-        // A full done row (34 columns) with a tip, a hint against the right
-        // edge, a queued message, a stray row in column 0 or a word with an
-        // ellipsis at its text column right under it: none is its line.
         for under in [
             "  ⎿  Tip: Use /clear to start fresh",
             "             ✔ Update installed",
@@ -5143,7 +3864,6 @@ mod tests {
                 "{under}"
             );
         }
-        // The whole spinner at 80 columns.
         let whole = pane(
             &["⏺ Working.", "", "✶ Choreographing… (12s · ↓ 1.2k tokens)"],
             80,
@@ -5156,15 +3876,6 @@ mod tests {
         );
     }
 
-    /// SM-4: the vendor's API-retry rows (2.1.300's `uyn`, read from the
-    /// binary) read busy whatever their kind, with no `esc to interrupt` in
-    /// the footer (a narrow pane, or any pane with a draft in the composer):
-    /// a stalled stream, no response, the auto-mode check unavailable, a
-    /// low-priority wait, an error with the limit's reset after its wait, a
-    /// wait of days, and the measured 2.1.283 screens; and a retry row a
-    /// narrow pane wrapped, read on its line. NEGATIVE CONTROLS: a done row,
-    /// the compaction's row and the worker's own words in the vendor's
-    /// shape read idle, and a done row's shell keeps its own rule.
     #[test]
     fn the_vendors_retry_rows_read_busy_whatever_their_kind() {
         let footer = "  ⏵⏵ auto mode on (shift+tab to cycle)";
@@ -5181,7 +3892,6 @@ mod tests {
             assert_eq!(worker_phase(&r), Phase::Busy, "{row}");
             assert_eq!(signal(&r).as_deref(), Some("status row: spinner"), "{row}");
         }
-        // No response, with its second row under it at column two.
         let proxy = screen(
             &[
                 "⏺ Reading the parser.",
@@ -5193,7 +3903,6 @@ mod tests {
             footer,
         );
         assert_eq!(worker_phase(&proxy), Phase::Busy);
-        // The measured 2.1.283 retry screens.
         use crate::prompt::fixtures::{
             API_RETRYING_DRAFT_MEASURED, API_RETRYING_MEASURED, API_RETRYING_QUEUED_80_MEASURED,
             API_RETRYING_QUEUED_DRAFT_MEASURED, API_RETRYING_QUEUED_MEASURED, screen as measured,
@@ -5207,9 +3916,6 @@ mod tests {
         ] {
             assert_eq!(worker_phase(&measured(text)), Phase::Busy);
         }
-        // SYNTHETIC: a retry row wrapped at its text column, the join's own
-        // rule (the vendor draws a narrow retry row with its glyph on a row
-        // of its own: [`a_status_glyph_ink_wrapped_away_from_its_text_is_the_status_row`]).
         let wrapped = pane(
             &[
                 "⏺ Reading the parser.",
@@ -5221,7 +3927,6 @@ mod tests {
             "  ⏵⏵ auto mode on (shift+tab to",
         );
         assert_eq!(worker_phase(&wrapped), Phase::Busy);
-        // NEGATIVE CONTROLS.
         for row in [
             "✻ Worked for 0s · done 11:02 PM",
             "✻ Conversation compacted (ctrl+o for history)",
@@ -5249,24 +3954,11 @@ mod tests {
         );
     }
 
-    /// A JOIN NEVER LOSES THE ROW'S OWN BUSY READING (the cross-lane review's
-    /// screen F2): the vendor's no-response retry row draws its proxy hint
-    /// under it at column 2 (2.1.300's `uyn`), and a pane 82-85 columns wide
-    /// (72-75 for the last attempt's row) puts the row's end within the
-    /// join's slack of the edge, so the hint was taken as the line's last
-    /// item: with a draft in the composer (no `esc to interrupt`) the retry
-    /// read idle. Both read busy. A row busy by its tail alone stands alone
-    /// over such a hint (synthetic: `· esc to interrupt`, the last-item rule
-    /// no clause of the hint keeps). NEGATIVE CONTROLS: the same hint under
-    /// the turn's done row reads idle (the busy reading is the row's, never
-    /// the hint's); a retry row wrapped at its text column, whose row alone is
-    /// no retry, still joins and reads busy.
     #[test]
     fn a_status_line_join_never_loses_the_rows_own_busy_reading() {
         let footer = "  ⏵⏵ auto mode on (shift+tab to cycle)";
         let hint = "A proxy or gateway that buffers streaming responses can cause this · set \
                     CLAUDE_STREAM_FIRST_BYTE_TIMEOUT_MS to change the first wait";
-        // The hint as Ink wraps it, greedily at spaces, at column 2.
         let wrapped = |width: usize| {
             let mut out: Vec<String> = Vec::new();
             let mut line = String::new();
@@ -5304,19 +3996,16 @@ mod tests {
             for width in widths {
                 let r = with_hint(row, width);
                 assert_eq!(worker_phase(&r), Phase::Busy, "{width}: {r:#?}");
-                // NEGATIVE CONTROL: the hint under the done row.
                 let done = with_hint("✻ Worked for 3m 2s · done 4:24 PM", width);
                 assert_eq!(worker_phase(&done), Phase::Idle, "{width}: {done:#?}");
             }
         }
-        // Busy by its tail alone: the row stands alone over the hint.
         let tail = "✻ Waiting on the server · esc to interrupt";
         for width in 43..=46 {
             let r = with_hint(tail, width);
             assert_eq!(status_line(&r).as_deref(), Some(tail), "{width}: {r:#?}");
             assert_eq!(worker_phase(&r), Phase::Busy, "{width}");
         }
-        // NEGATIVE CONTROL: a true wrap still joins.
         let wrap = pane(
             &[
                 "⏺ Reading the parser.",
@@ -5334,27 +4023,6 @@ mod tests {
         assert_eq!(worker_phase(&wrap), Phase::Busy);
     }
 
-    /// THE STATUS GLYPH INK WRAPPED AWAY FROM ITS TEXT IS THE STATUS ROW (the
-    /// cross-lane review's screen F1, MEASURED on 2.1.301): under about 44
-    /// columns the vendor's 2-cell glyph box wraps, the glyph alone on its
-    /// row and the text under it in column 0 — the retry row at 34, 38 and 42
-    /// columns (at 34 and 38 the cut error and the dim tail interleaved), the
-    /// spinner at 10. Each reads busy by its status row, its line the rows
-    /// under the glyph; so does a retry mid-turn under a running tool, and
-    /// one under a `·` glyph. NEGATIVE CONTROLS: each capture with the retry
-    /// block replaced by the turn's done row reads idle; a lone glyph over a
-    /// blank row is no status row (the walk goes on to the done row above),
-    /// nor over a `⏺` row (the walk stops); a done row wrapped the same way
-    /// is the status row and reads idle.
-    ///
-    /// UNDER 24 COLUMNS (the decision review's RR-LC-1, MEASURED on 2.1.301
-    /// at 18, 20 and 22): the cut `API error` and the dim tail are two text
-    /// columns side by side, and the line is read column by column — `✻ API
-    /// error · Retrying in 4s · attempt 1/10`, busy — where row by row it
-    /// read `Retrying in error 4s`, and at 18 the last row, filling the pane,
-    /// was dropped as a hint. NEGATIVE CONTROLS: the block replaced by the
-    /// done row reads idle, and a done row wrapped under a bare glyph over two
-    /// rows stays one done line.
     #[test]
     fn a_status_glyph_ink_wrapped_away_from_its_text_is_the_status_row() {
         use crate::prompt::fixtures::screen as measured;
@@ -5384,7 +4052,6 @@ mod tests {
             assert_eq!(signal(&r).as_deref(), Some("status row: spinner"), "{r:#?}");
             let line = status_line(&r).unwrap_or_default();
             assert!(line.starts_with("✻ API") || line == "✻ Infusing…", "{line}");
-            // NEGATIVE CONTROL: the block replaced by the turn's done row.
             let mut done = r.clone();
             let at = done
                 .iter()
@@ -5416,7 +4083,6 @@ mod tests {
             );
             assert_eq!(worker_phase(&mid_turn), Phase::Busy, "{glyph}");
         }
-        // NEGATIVE CONTROLS.
         let over_blank = pane(
             &[
                 "⏺ Fixed it.",
@@ -5472,19 +4138,6 @@ mod tests {
         assert_eq!(worker_phase(&done), Phase::Idle);
     }
 
-    /// A HEAD THAT FILLS ITS COLUMN IS STILL READ BY ITS COLUMNS: the stalled
-    /// stream's retry row (2.1.301's `aSn`), whose head `Waiting for API
-    /// response` is never cut, laid out at 34 to 41 columns as the measured
-    /// retry blocks are — the glyph on its own row, the head's column
-    /// `Waiting for API` wide, so its first row has one space before the
-    /// tail's ` · `. Read row by row that was `will retry in 2m response`,
-    /// no wait, and with the footer's `esc to interrupt` cut away the retry
-    /// read idle: the merge of main's strict retry rule typed `keep going`
-    /// into it. It reads busy, its line the vendor's. NEGATIVE CONTROLS: the
-    /// same block with a tail that is not the vendor's (`attempt soon`) stays
-    /// the rows joined and idle, the done row in its place reads idle, so does
-    /// a done row wrapped under its bare glyph, and rows that joined are a
-    /// done row stay one (synthetic: split, they would read as a retry).
     #[test]
     fn a_retry_head_that_fills_its_column_is_still_read_by_its_columns() {
         let footer = "  ⏵⏵ auto mode on (shift+tab to";
@@ -5553,7 +4206,6 @@ mod tests {
                 "{width}"
             );
         }
-        // NEGATIVE CONTROLS: a tail not the vendor's, the done row.
         let said = at(
             36,
             &[
@@ -5569,16 +4221,12 @@ mod tests {
         assert_eq!(worker_phase(&said), Phase::Idle);
         let done = at(36, &["✻ Crunched for 3m 2s · done 12:55 PM"]);
         assert_eq!(worker_phase(&done), Phase::Idle);
-        // The done row wrapped under its bare glyph, its second row short of
-        // the first's ` · `: one done line.
         let wrapped = at(23, &["✻", "Crunched for 30s · done", "12:52 PM"]);
         assert_eq!(
             status_line(&wrapped).as_deref(),
             Some("✻ Crunched for 30s · done 12:52 PM")
         );
         assert_eq!(worker_phase(&wrapped), Phase::Idle);
-        // SYNTHETIC: rows that joined are a done row stay one, though split
-        // they would read as the vendor's retry.
         let shaped = at(
             34,
             &[
@@ -5594,19 +4242,6 @@ mod tests {
         assert_eq!(worker_phase(&shaped), Phase::Idle);
     }
 
-    /// BG-1: a turn Claude Code started itself (a `<task-notification>`, a
-    /// monitor's expiry, a `/loop` wakeup) whose pending work did not change
-    /// draws no done row (2.1.295 `Ad`, 2.1.300 `Nd`): the waiting row above
-    /// its `⏺` rows still says what the session waits on, and reads SOFT
-    /// background work (module docs) — measured as the collapsed shape that
-    /// the trust session's journal continued 47 times — on its LINE where a
-    /// narrow pane wrapped it, and nothing else busy ([`carried_wait_alone`]).
-    /// NEGATIVE CONTROLS: a person's prompt between them, a drawn done row
-    /// under the notification turn (the wait_bg18 shape, the work done) and
-    /// woken turns drawn under that done row, the measured `/model` screen, a
-    /// question the notification turn ended on, a wall it ended on, the drawn
-    /// wait (wait_bg) read as before, and a busy footer under the carried
-    /// wait (not alone).
     #[test]
     fn a_wait_claude_code_hid_under_its_own_wake_still_stands() {
         let footer = "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents";
@@ -5632,14 +4267,11 @@ mod tests {
         assert_eq!(status_row(&r), None);
         assert!(!status_unseen(&r), "a glyph row is on the screen");
         assert!(carried_wait_alone(&r));
-        // The live zone keeps the waiting row the reading reads.
         let waiting = r
             .iter()
             .position(|row| row.starts_with("\u{273B} Waiting for"))
             .expect("the waiting row");
         assert_eq!(busy_zone_start(&r), waiting);
-        // A pane 16 columns wide: Ink wrapped the waiting row right after
-        // `Waiting for`, and the wait is read on its LINE (module docs).
         let narrow = pane(
             &[
                 "✻ Waiting for",
@@ -5662,7 +4294,6 @@ mod tests {
         );
         assert!(carried_wait_alone(&narrow));
 
-        // (a) A person's prompt between the waiting row and the turn.
         let mut prompted = vec![
             "✻ Waiting for 1 dynamic workflow to finish",
             "",
@@ -5675,13 +4306,11 @@ mod tests {
         assert_eq!(worker_phase(&r), Phase::Idle);
         assert_eq!(busy_signal(&r), None);
         assert!(status_unseen(&r), "the walk stops at the prompt");
-        // ...and the live zone starts under the reply, the waiting row out.
         let reply = r
             .iter()
             .position(|row| row.starts_with("\u{23FA} No change"))
             .expect("the reply");
         assert_eq!(busy_zone_start(&r), reply + 1);
-        // (b) The work finished: the completion turn drew its done row.
         let r = collapsed(&[
             "⏺ Dynamic workflow \"Second review pass\" completed · 5s",
             "",
@@ -5691,9 +4320,6 @@ mod tests {
         ]);
         assert_eq!(worker_phase(&r), Phase::Idle);
         assert_eq!(busy_signal(&r), None);
-        // ...and turns Claude Code started itself after that done row, drawn
-        // with no row of their own: the walk over them meets the done row
-        // first, and the waiting row above it is history.
         let r = screen(
             &[
                 "✻ Waiting for 1 dynamic workflow to finish",
@@ -5715,20 +4341,16 @@ mod tests {
         assert_eq!(busy_signal(&r), None);
         assert!(!status_unseen(&r), "the done row is on the screen");
         assert!(!carried_wait_alone(&r));
-        // (c) The notification turn ended on a question.
         let r = collapsed(&["⏺ Shall I land it now?"]);
         assert_eq!(worker_phase(&r), Phase::Question);
-        // ...or on a wall: the wall stands, behind the carried wait.
         let r = collapsed(&[
             "⏺ Background command \"Run the tests\" completed (exit code 0)",
             "  ⎿  You've reached your Fable limit. Run /usage-credits to continue or switch models with /model.",
         ]);
         assert!(matches!(worker_phase(&r), Phase::Limited { .. }), "{r:#?}");
-        // (d) The measured `/model` screen: its `❯ /model` row stops the walk.
         let r = saved_screen(IDLE_AFTER_LIMIT);
         assert_eq!(worker_phase(&r), Phase::Idle);
         assert_eq!(busy_signal(&r), None);
-        // (e) The drawn wait reads its own hard rule, as before.
         prompted.truncate(1);
         let drawn = screen(&prompted, footer);
         assert_eq!(
@@ -5737,7 +4359,6 @@ mod tests {
         );
         assert_eq!(busy_signal(&drawn).map(|b| b.soft), Some(false));
         assert!(!carried_wait_alone(&drawn), "a status row is drawn");
-        // The carried wait under a footer that reads busy is not alone.
         let footed = screen(
             &[
                 "✻ Waiting for 1 dynamic workflow to finish",
@@ -5749,8 +4370,6 @@ mod tests {
         );
         assert_eq!(worker_phase(&footed), Phase::Busy);
         assert!(!carried_wait_alone(&footed), "the footer's own rule");
-        // No glyph row anywhere above the frame: the screen says nothing of
-        // how the last turn ended.
         let bare = screen(
             &["⏺ Monitor event: \"lander\"", "", "⏺ Restarted it.", ""],
             footer,
@@ -5760,8 +4379,6 @@ mod tests {
         assert!(!status_unseen(&drawn));
     }
 
-    /// Without the composer frame (a plain shell, or a box over the whole screen) every row is
-    /// scanned.
     #[test]
     fn with_no_composer_frame_every_row_is_scanned_as_before() {
         let shell = rows(&["$ make", "✶ Building…", "", "$ "]);
@@ -5780,7 +4397,6 @@ mod tests {
             signal(&no_bottom).as_deref(),
             Some("whole screen, no composer frame: waiting for a dynamic workflow")
         );
-        // A table border is not a rule.
         assert!(!is_rule("└──────────┴─────────┴───────────┘"));
         assert!(is_rule(
             "──────────────────────────────────────────────────── sandboxed ─"
@@ -5788,11 +4404,6 @@ mod tests {
         assert!(!is_rule("  ──────────────"));
     }
 
-    // ---- what sits between the status row and the frame never hides it ----
-
-    /// `wait_bg6.out`: a live `✽ Ebbing…` with a Tip and the session survey parked under it. The
-    /// survey is neither the status row nor transcript: the spinner is read through it whatever
-    /// the footer says (wait_bg7's idle auto-mode footer, wait_bg2's `paste again to expand`).
     #[test]
     fn the_session_survey_never_hides_a_live_spinner() {
         let r = waiter_capture(include_str!("fixtures/wait_bg6.out"));
@@ -5805,10 +4416,6 @@ mod tests {
         }
     }
 
-    /// `wait_bg7.out`: an idle worker whose done row sits over the survey. The
-    /// last thing it said is its own last row, not the survey's options — and
-    /// the same screen ending in a question is a question, with the survey or
-    /// without it, with the done row or without it.
     #[test]
     fn the_survey_is_never_what_the_worker_said() {
         let r = waiter_capture(include_str!("fixtures/wait_bg7.out"));
@@ -5831,22 +4438,13 @@ mod tests {
         assert_eq!(worker_phase(&no_done_row), Phase::Question);
     }
 
-    // ---- the session survey: open above the composer, or only quoted ------
-
-    /// `survey-open.txt`: the bottom 12 rows of a real worker's screen, idle under the survey,
-    /// with a blank row and the update banner between its options row and the top rule (the
-    /// composer's words and the rule's label replaced).
     const SURVEY_OPEN: &str = include_str!("fixtures/survey-open.txt");
 
-    /// The survey's two rows as Claude Code parks them.
     const SURVEY: [&str; 2] = [
         "● How is Claude doing this session? (optional)",
         "  1: Bad    2: Fine   3: Good   0: Dismiss",
     ];
 
-    /// The real screen: the survey is open, the worker idle — the survey is
-    /// neither its status row nor what it said. Without the options row it
-    /// is not open; nor is it without the composer frame.
     #[test]
     fn the_survey_parked_above_the_composer_is_open() {
         let r = saved_screen(SURVEY_OPEN);
@@ -5859,14 +4457,11 @@ mod tests {
         no_options.retain(|row| !row.trim_start().starts_with("1: Bad"));
         assert!(!survey_open(&no_options));
 
-        // wait_bg7: the done row over the survey, the survey on the rule.
         let bg7 = waiter_capture(include_str!("fixtures/wait_bg7.out"));
         assert!(survey_open(&bg7));
         assert!(!survey_open(&rows(&[SURVEY[0], SURVEY[1], "$ "])));
     }
 
-    /// The survey is open under a live spinner (wait_bg6) and beside an approval box, where the
-    /// phase is still prompt.
     #[test]
     fn a_survey_under_a_spinner_or_beside_a_box_is_open() {
         let bg6 = waiter_capture(include_str!("fixtures/wait_bg6.out"));
@@ -5887,24 +4482,12 @@ mod tests {
         assert!(!survey_open(&bash_one_row()));
     }
 
-    // ---- the context indicator: how much is left before auto-compact -----
-
-    /// `context-low.txt`: the bottom 7 rows of a real worker's screen (2.1.267/2.1.268) three
-    /// hours into a turn: the spinner, a `⎿  Tip:` under it, and `1% until auto-compact`
-    /// right-aligned above the top rule. The two rules were not recorded and are drawn 138
-    /// columns wide, two past the indicator's end, with no label.
     const CONTEXT_LOW: &str = include_str!("fixtures/context-low.txt");
 
-    /// `text` as Claude Code parks it above a 120-column composer:
-    /// right-aligned, ending two columns short of the rule.
     fn indicator(text: &str) -> String {
         format!("{}{text}", " ".repeat(118 - text.chars().count()))
     }
 
-    /// The real screen reads `Some(1)`, and the worker is busy under it. The
-    /// other spelling (`Context left until auto-compact: 7%`) reads too; a
-    /// reading over 100, or the indicator with anything else on its row, is
-    /// not the indicator; a framed screen without it reads `None`.
     #[test]
     fn the_context_indicator_above_the_composer_is_read() {
         let r = saved_screen(CONTEXT_LOW);
@@ -5938,8 +4521,6 @@ mod tests {
         }
     }
 
-    /// The indicator quoted in the transcript (a `⏺` message or a row of it, a tool's output,
-    /// flush left, a copy above the status row) is not read, nor any of it with no composer frame.
     #[test]
     fn the_context_indicator_in_the_transcript_is_not_read() {
         for body in [
@@ -5986,8 +4567,6 @@ mod tests {
         assert_eq!(context_left(&unframed), None);
     }
 
-    /// The indicator is read beside a spinner and its `⎿  Tip:` and the survey above or under it,
-    /// the survey still open and the worker still busy.
     #[test]
     fn the_context_indicator_beside_a_survey_a_tip_and_a_spinner_is_read() {
         let busy = screen(
@@ -6010,22 +4589,15 @@ mod tests {
             assert_eq!(worker_phase(&r), Phase::Busy, "{extra:?}");
             assert_eq!(status_row(&r), Some("✻ Synthesizing… (18s)"), "{extra:?}");
         }
-        // The real screen, the survey parked between its indicator and the rule.
         let real = above_frame(saved_screen(CONTEXT_LOW), &SURVEY);
         assert_eq!(context_left(&real), Some(1));
         assert!(survey_open(&real));
     }
 
-    /// `text` as Claude Code parks it above a composer whose rules are
-    /// `width` columns: against the right edge, ending two columns short.
     fn parked(width: usize, text: &str) -> String {
         format!("{}{text}", " ".repeat(width - 2 - text.chars().count()))
     }
 
-    /// A peer's indicator quoted under the `⎿` gutter in the last transcript block
-    /// (right-aligned by the peer, ending short of this screen's edge) is not read, over a box,
-    /// at idle under a `!` command's output, or under `/model`'s output; an indicator parked
-    /// against the right edge under the same block is.
     #[test]
     fn a_quoted_indicator_in_the_last_block_is_not_read() {
         let quote = format!("     {}1% until auto-compact", " ".repeat(77));
@@ -6066,9 +4638,6 @@ mod tests {
         }
     }
 
-    /// In a narrow pane the indicator starts left of column 20 (at 18 in 55 columns, 17 in 40)
-    /// and is read against the right edge; one at a transcript column (5, the gutter's text) is
-    /// not, even against the edge.
     #[test]
     fn the_context_indicator_in_a_narrow_pane_is_read() {
         let narrow = |width: usize, text: &str| {
@@ -6086,12 +4655,6 @@ mod tests {
         assert_eq!(context_left(&narrow(29, "1% until auto-compact")), Some(1));
     }
 
-    /// Claude Code 2.1.305 draws the indicator at the right end of its mode row under the
-    /// composer (measured 2026-10-20 in the real-Claude lab, idle and busy, at 80 and 144
-    /// columns): `context_left_shown` reads it there, and still reads it above the composer
-    /// where `context_left` does. Not the indicator: a run on that row short of the right edge,
-    /// one with words after it, the row's `◐ medium · /effort`, a copy in the transcript, and
-    /// a screen with no composer.
     #[test]
     fn the_context_indicator_on_the_mode_row_is_shown() {
         let on_mode_row = |width: usize, hints: &str, end: &str| {
@@ -6150,9 +4713,6 @@ mod tests {
         }
     }
 
-    /// A long hint in an 80-column window starts at column 8, short of [`HINT_COLUMN`]: it is
-    /// passed like any row under the status row, so the spinner above it is read, and it is
-    /// never what the worker said; the same for a queued message and a wrapped todo item.
     #[test]
     fn nothing_between_the_spinner_and_the_frame_hides_it_in_a_narrow_window() {
         let text = "get pinged when Claude finishes · enable push notifications in /config";
@@ -6197,7 +4757,6 @@ mod tests {
         );
         assert_eq!(worker_phase(&asks), Phase::Question);
 
-        // `Still working` under the status row is busy.
         let still = narrow(&[
             "⏺ Running the suite.",
             "",
@@ -6207,10 +4766,6 @@ mod tests {
         assert_eq!(worker_phase(&still), Phase::Busy);
     }
 
-    /// `wait_bg17.out`: the turn ended while a `persistent` monitor runs,
-    /// `· 1 monitor still running` on the done row and `· 1 monitor ·` in the
-    /// footer. Both are the soft rule, so the status row says so even when the
-    /// footer does not — and a question or a limit notice outranks it.
     #[test]
     fn a_monitor_still_running_is_soft_busy() {
         let r = waiter_capture(include_str!("fixtures/wait_bg17.out"));
@@ -6256,7 +4811,6 @@ mod tests {
                 reset: None,
             }
         );
-        // A shell is not soft: the turn it runs in will end and wake the worker.
         let shell = screen(
             &[
                 "⏺ Should I also run the benchmarks?",
@@ -6268,10 +4822,6 @@ mod tests {
         assert_eq!(worker_phase(&shell), Phase::Busy);
     }
 
-    /// Work left running under a label aterm has no word for (`1 Artifact comment monitor`, `1
-    /// MCP task`, `2 background tasks`, `◇ 1 cloud session`) is still the agent's background
-    /// work, on both rows, the done row alone or the footer alone; with nothing left running the
-    /// screen is idle.
     #[test]
     fn work_left_running_under_any_label_is_background_work() {
         let r = waiter_capture(include_str!("fixtures/wait_bg17.out"));
@@ -6314,37 +4864,24 @@ mod tests {
         }
     }
 
-    // ---- a manager's screen ------------------------------------------------
-
-    /// A manager session's footer (rows constructed here): bypass permissions, one persistent
-    /// Monitor (the manager's mail watcher), and under the footer the artifact bar, `⧉` and the
-    /// pages' names.
     const MANAGER_FOOTER: &str = "  ⏵⏵ bypass permissions on · 1 monitor";
     const MANAGER_FOOTER_QUIET: &str = "  ⏵⏵ bypass permissions on (shift+tab to cycle)";
     const ARTIFACT_BAR: &str = "  ⧉  name · name";
     const WORKFLOW_LINE: &str =
         "  ◯ fan-out  collect the standings  1/4 agents done · 3m 2s · ↓ 12.4k tokens";
 
-    /// The three ways the rows under the footer were laid out: the bar right
-    /// under it, a blank row between, and a workflow's line between (the
-    /// measured order: footer, blank, `◯` line, bar, blank).
     const UNDER: [&[&str]; 3] = [
         &[ARTIFACT_BAR],
         &["", ARTIFACT_BAR],
         &["", WORKFLOW_LINE, ARTIFACT_BAR, ""],
     ];
 
-    /// A manager's screen: `body` over the composer, the footer, then `under`.
     fn manager(body: &[&str], footer: &str, under: &[&str]) -> Vec<String> {
         let mut r = screen(body, footer);
         r.extend(rows(under));
         r
     }
 
-    /// The manager's footer is not a box: `bypass permissions on · 1 monitor` over the artifact
-    /// bar reads what the live zone says (a spinner, a `Waiting for` row or a workflow's line
-    /// busy; a finished turn soft-busy on the monitor, losing to a question; idle without it),
-    /// never `prompt`, in any of the three layouts under the footer.
     #[test]
     fn a_manager_footer_with_a_monitor_and_the_artifact_bar_reads_busy_or_idle() {
         let working = [
@@ -6430,9 +4967,6 @@ mod tests {
         }
     }
 
-    /// A worker's approval box as a manager's transcript shows it: a Monitor
-    /// event (or a tool's output) that printed the worker's screen, under the
-    /// `⎿` gutter, indented past it.
     const BOX_UNDER_GUTTER: [&str; 12] = [
         "⏺ Monitor event: \"worker watch\"",
         "  ⎿  EVENT prompt seq=41",
@@ -6448,8 +4982,6 @@ mod tests {
         "      Esc to cancel · Tab to amend",
     ];
 
-    /// The same box quoted in the manager's own words (a `⏺` message's rows,
-    /// indented as a code block is) — not under a gutter.
     const BOX_IN_PROSE: [&str; 9] = [
         "⏺ The worker is blocked on its box:",
         "",
@@ -6462,9 +4994,6 @@ mod tests {
         "",
     ];
 
-    /// A worker's box in a manager's transcript is not the manager's prompt: under the `⎿`
-    /// gutter it is output, and quoted in prose (every row in the message's continuation
-    /// column) it is never a box; a real box over the manager's composer is a prompt.
     #[test]
     fn a_workers_box_in_a_managers_transcript_is_not_a_prompt() {
         let done_row = "✻ Worked for 12s · done 9:01 PM";
@@ -6477,7 +5006,6 @@ mod tests {
                 manager(&body, footer, under)
             };
 
-            // Under the gutter: never a box — idle, soft-busy or busy.
             let r = with(&["", done_row, ""], MANAGER_FOOTER, &BOX_UNDER_GUTTER);
             assert_eq!(parse_prompt(&r), None, "{under:?}");
             assert_eq!(crate::prompt::prompt_box_span(&r), None, "{under:?}");
@@ -6502,12 +5030,10 @@ mod tests {
                 Some("status row: spinner"),
                 "{under:?}"
             );
-            // The gutter block as the last thing on the screen above the rule.
             let r = with(&[""], MANAGER_FOOTER_QUIET, &BOX_UNDER_GUTTER);
             assert_eq!(parse_prompt(&r), None, "{under:?}");
             assert_eq!(worker_phase(&r), expect, "{under:?}");
 
-            // In prose: history under the manager's later words or a done row.
             let later = ["⏺ Approved it; the push went through.", "", done_row, ""];
             let r = with(&later, MANAGER_FOOTER_QUIET, &BOX_IN_PROSE);
             assert_eq!(parse_prompt(&r), None, "{under:?}");
@@ -6516,12 +5042,9 @@ mod tests {
             assert_eq!(parse_prompt(&r), None, "{under:?}");
             assert_ne!(worker_phase(&r), Phase::Prompt, "{under:?}");
 
-            // Only a spinner under the prose copy: not a box either — every
-            // row of it sits in the message's continuation column.
             let r = with(&[spinner, ""], MANAGER_FOOTER, &BOX_IN_PROSE);
             assert_eq!(parse_prompt(&r), None, "{under:?}");
 
-            // A real box over the manager's composer: a prompt.
             let mut live = rows(&["⏺ Pushing the branch.", ""]);
             live.extend(rows(&[
                 " Bash command",
@@ -6544,12 +5067,6 @@ mod tests {
         }
     }
 
-    // ---- the usage-limit wall ---------------------------------------------
-
-    /// The fixture cut just before `❯ /model` (rows 1-56) with its frame and
-    /// the banner over it (rows 59-63): the worker's turn ended on the limit.
-    /// Kept with row 58 too — the `/model` output, without its `❯ /model` —
-    /// the model switch is the last thing said, and the notice is history.
     #[test]
     fn the_limit_screen_cut_before_the_model_switch_is_limited() {
         let full = saved_screen(IDLE_AFTER_LIMIT);
@@ -6572,15 +5089,12 @@ mod tests {
         assert_eq!(worker_phase(&switched), Phase::Idle);
     }
 
-    /// The whole fixture: the same notice above a later user row is history.
     #[test]
     fn a_limit_above_a_later_user_row_is_history() {
         let r = saved_screen(IDLE_AFTER_LIMIT);
         assert_eq!(limit_notice(&r), None);
         assert_eq!(worker_phase(&r), Phase::Idle);
 
-        // A question asked after a limit notice and a later user row is a
-        // question.
         let q = screen(
             &[
                 "  ⎿  You've hit your session limit · resets 7:30pm (America/Los_Angeles)",
@@ -6598,9 +5112,6 @@ mod tests {
         assert_eq!(worker_phase(&q), Phase::Question);
     }
 
-    /// A turn can start with no user row — a background command's completion
-    /// (rows 52-53 of the fixture itself) or a monitor event. A notice above
-    /// such a turn, when that turn ended normally, is history.
     #[test]
     fn a_limit_above_a_later_turn_without_a_user_row_is_history() {
         let full = saved_screen(IDLE_AFTER_LIMIT);
@@ -6623,9 +5134,6 @@ mod tests {
         }
     }
 
-    /// `wait_bg18.out`: two turns that ended on the limit, the second started by a background
-    /// command's completion (no user row), under the survey and the update banner: limited, the
-    /// stale `Waiting for` row history.
     #[test]
     fn wait_bg18_is_limited_after_a_background_completion() {
         let r = waiter_capture(include_str!("fixtures/wait_bg18.out"));
@@ -6642,17 +5150,6 @@ mod tests {
         );
     }
 
-    /// A RESET ENDS WHERE ITS TIME DOES ([`time_words`]), one table over
-    /// every spelling. A line read across the rows Ink wrapped it onto runs
-    /// on into the notice's next line when the row above it was full (at 34
-    /// columns `(America/Los_Angeles)` over `/upgrade to increase your`,
-    /// 2.1.299), or into a row under it at the same column; the transcript's
-    /// own text has the next line after a newline. The time and its zone are
-    /// the reset, nothing after them — but A DATE IS NEVER CUT OFF ITS TIME
-    /// (2026-10-14: `resets at 3pm on Oct 15`
-    /// cut to `3pm` is read by `aterm-agent`'s `limit::parse_reset` as today's
-    /// session clock). A key followed by no time is passed over: the
-    /// countdown toast that follows a `/goal` echo names the time.
     #[test]
     fn a_reset_ends_where_its_time_does() {
         for (said, want) in [
@@ -6736,12 +5233,6 @@ mod tests {
         }
     }
 
-    /// A notice split over two rows keeps both, and the reset its first row
-    /// names; a `<X> limit reached ∙ resets …` row is a notice; so is one in
-    /// the footer where Claude Code draws its notifications — right-aligned,
-    /// or stacked under the mode row in a narrow pane — but never a warning
-    /// there, and never the same words where the `statusLine` command's rows
-    /// stand, at column 2 above the mode row (KI-1015-14, 2.1.304).
     #[test]
     fn a_split_notice_and_a_footer_notice_are_read_whole() {
         let split = screen(
@@ -6804,15 +5295,6 @@ mod tests {
         assert_eq!(worker_phase(&warns), Phase::Idle);
     }
 
-    /// THE VENDOR'S AUTO-MODE PARAGRAPH IS NO LAST WORD (KI-1015-1 LC-10,
-    /// measured on 2.1.300: after a relaunch's `--resume` it is drawn under
-    /// the resumed history, and was journaled as the agent's last words; the
-    /// paragraph's words and wrap are 2.1.287's measured ones). A history
-    /// that ended on a weekly limit reads as that limit, the paragraph passed
-    /// over whole; one that ended on the agent's message reads as that
-    /// message. NEGATIVE CONTROLS, each said: the agent's own words that open
-    /// `Auto mode …` otherwise, and the vendor's words quoted in a tool's
-    /// output.
     #[test]
     fn the_vendors_auto_mode_paragraph_is_no_last_word() {
         const PARAGRAPH: [&str; 4] = [
@@ -6870,7 +5352,6 @@ mod tests {
             Some("The parser is green; the docs are next.")
         );
         assert_eq!(worker_phase(&said), Phase::Idle);
-        // NEGATIVE CONTROLS: said.
         let own = resumed(
             &limit,
             &["⏺ Auto mode is on here, so I went ahead with the migration."],
@@ -6895,24 +5376,6 @@ mod tests {
         assert_eq!(worker_phase(&quoted), Phase::Idle);
     }
 
-    /// A GENERIC FOOTER IS THE LIMIT THE TURN'S OWN ROW NAMES (KI-1015-1 W3,
-    /// measured on 2.1.300; the rows hand-built in its shapes): the footer's
-    /// `⚠ Usage limit reached · limit resets 4pm` names no window and no
-    /// model, the turn's `⎿  You've hit your Sonnet limit · resets 4pm (…)`
-    /// a model's bucket — read as the bucket, where the footer is
-    /// ([`crate::wall::named_by_the_turn`]: the same reset, the zone aside).
-    /// So too a weekly window and a spend limit. A generic notice that is the
-    /// vendor's countdown (2.1.283's `⚠ Usage limit reached · continuing
-    /// automatically at …` banner) over a weekly row takes its kind and keeps
-    /// its countdown: the screen's wall ([`crate::wall::wall`]) keeps it in
-    /// its message, footer or banner, where the supervisor reads that the
-    /// vendor goes on by itself. NEGATIVE CONTROLS, the footer
-    /// kept: the turn's row a session limit (no kind of its own over the
-    /// footer's); a footer that names its window (`You've hit your session
-    /// limit · …`); the bucket's words as a tool's output, under its call,
-    /// keep the footer's kind and place (F2 of the merge review, 2026-10-16:
-    /// read as the bucket, the default fallback relaunched on opus under the
-    /// session limit) — the turn's own notice below the call still names it.
     #[test]
     fn a_generic_footer_notice_yields_to_the_turns_own_limit_row() {
         let walled = |row: &str, footer: &str| {
@@ -6964,11 +5427,6 @@ mod tests {
             let read = notice_placed(&walled(row, footer), &classify_wall);
             assert_eq!(read.map(|w| w.kind), Some(kind), "{row}");
         }
-        // The generic notice that is the vendor's COUNTDOWN (2.1.283's
-        // banner: no window, no model, the reset's clock) takes the weekly
-        // row's kind, and its message keeps the countdown, where
-        // `resumes_by_itself` reads that the vendor goes on — in the footer
-        // and in the live zone above the composer alike.
         const WEEKLY: &str =
             "  ⎿  You've hit your weekly limit · resets Oct 18 at 4pm (America/Los_Angeles)";
         const BANNER: &str =
@@ -6991,7 +5449,6 @@ mod tests {
                 "{name}: {read:?}"
             );
         }
-        // NEGATIVE CONTROLS: the footer stands.
         let session = walled(
             "  ⎿  You've hit your session limit · resets 4pm (America/Los_Angeles)",
             GENERIC,
@@ -7008,10 +5465,6 @@ mod tests {
                 "{read:?}"
             );
         }
-        // The bucket's words in a tool's output, under its call — a later
-        // `⎿` row, the output's first row, a row the output continues onto —
-        // name no limit of the turn's: the footer is the session limit it
-        // says, and no model fallback runs on another tool's words.
         const QUOTE: &str = "You've hit your Sonnet limit · resets 4pm (America/Los_Angeles)";
         let under = |output: &[String]| {
             let mut r = bucket.clone();
@@ -7044,8 +5497,6 @@ mod tests {
                 "{name}"
             );
         }
-        // CONTROL: the turn's own notice under the person's next prompt,
-        // below the quoting call, is the bucket.
         let mut own = later.clone();
         let at = own
             .iter()
@@ -7068,11 +5519,6 @@ mod tests {
         );
     }
 
-    /// The auto-continue notice (a `⚠` banner in the live zone) stays on the screen while the
-    /// worker resumes under it: alone, with nothing busy under it, the worker is limited, its
-    /// reset the time it continues at (`1:50pm`) or `shortly`; with a spinner or a busy footer
-    /// under it the worker is busy; the same in the footer or under the `⎿` gutter. With the
-    /// worker's words and a done row under it, the notice is history.
     #[test]
     fn the_auto_continue_notice_is_limited_alone_and_busy_once_the_worker_works() {
         const NOTICE: &str =
@@ -7094,7 +5540,6 @@ mod tests {
             body.extend_from_slice(live);
             screen(&body, footer)
         };
-        // The wait: the notice alone, nothing busy under it.
         let waiting = with(&[NOTICE], IDLE_FOOTER);
         assert_eq!(signal(&waiting), None);
         assert_eq!(
@@ -7115,11 +5560,9 @@ mod tests {
                 reset: Some("shortly".to_string()),
             }
         );
-        // The notice, a spinner status row, the busy footer: busy, by the status row.
         let resumed = with(&[NOTICE, SPINNER], BUSY_FOOTER);
         assert_eq!(signal(&resumed).as_deref(), Some("status row: spinner"));
         assert_eq!(worker_phase(&resumed), Phase::Busy);
-        // The footer alone busy, no spinner: busy by the footer.
         let shells = with(&[NOTICE], BUSY_FOOTER);
         assert_eq!(signal(&shells).as_deref(), Some("footer: esc to interrupt"));
         assert_eq!(worker_phase(&shells), Phase::Busy);
@@ -7127,7 +5570,6 @@ mod tests {
             worker_phase(&with(&[SHORTLY, SPINNER], IDLE_FOOTER)),
             Phase::Busy
         );
-        // The turn over, the notice above the done row is history.
         let ended = with(
             &[
                 NOTICE,
@@ -7140,8 +5582,6 @@ mod tests {
         );
         assert_eq!(limit_notice(&ended), None);
         assert_eq!(worker_phase(&ended), Phase::Idle);
-        // The same notice in the footer, and under the gutter: limited alone,
-        // busy with a spinner under it.
         let footer_wait = with(&[], &format!("  {NOTICE}"));
         assert_eq!(
             worker_phase(&footer_wait),
@@ -7154,8 +5594,6 @@ mod tests {
             worker_phase(&with(&[SPINNER], &format!("  {NOTICE}"))),
             Phase::Busy
         );
-        // Under the gutter, hanging from the worker's words as Claude Code
-        // hangs its notices from the last thing drawn.
         const SAID: &str = "⏺ The runs are queued.";
         let gutter = format!("  ⎿  {SHORTLY}");
         assert_eq!(
@@ -7169,14 +5607,8 @@ mod tests {
             worker_phase(&with(&[SAID, gutter.as_str(), "", SPINNER], BUSY_FOOTER)),
             Phase::Busy
         );
-        // A banner that is not a notice stays what it was: parked, not the
-        // wall.
         let banner = with(&["✔ Update installed · Restart to update"], IDLE_FOOTER);
         assert_eq!(worker_phase(&banner), Phase::Idle);
-        // The continuation cancelled by hand (`esc`), the turn ended on the
-        // notice: the notice above a done row with nothing said between is
-        // the wall still — and so is one drawn against the right edge, where
-        // Claude Code parks its update banner.
         let cancelled = with(
             &[NOTICE, "", "✻ Worked for 3m 2s · done 1:52 PM", ""],
             IDLE_FOOTER,
@@ -7196,9 +5628,6 @@ mod tests {
                 reset: Some("1:50pm".to_string()),
             }
         );
-        // A copy of the notice in a tool's output — a peer's screen the
-        // worker read, indented under the gutter — is the worker's words,
-        // not the wall.
         let quoted = with(
             &[
                 "⏺ Bash(aterm ctl @s-9 text)",
@@ -7212,9 +5641,6 @@ mod tests {
         assert_eq!(worker_phase(&quoted), Phase::Idle);
     }
 
-    /// A copy of the notice under the `⎿` gutter, right-aligned as a peer's screen drew it
-    /// (twenty columns in and more, where a hint starts), is the worker's words: the wall is
-    /// never read there.
     #[test]
     fn a_right_aligned_copy_under_the_gutter_is_not_the_wall() {
         const NOTICE: &str =
@@ -7233,8 +5659,6 @@ mod tests {
         );
         assert_eq!(limit_notice(&quoted), None, "{right:?}");
         assert_eq!(worker_phase(&quoted), Phase::Idle);
-        // A copy against the screen's own right edge, as the peer's was,
-        // reads the same — however many rows of the block are above it.
         let edge = format!("{NOTICE:>118}");
         let quoted = screen(
             &[
@@ -7247,8 +5671,6 @@ mod tests {
             "  ⏵⏵ auto mode on (shift+tab to cycle)",
         );
         assert_eq!(worker_phase(&quoted), Phase::Idle);
-        // A blank row under the gutter ends the block: a banner after it,
-        // wherever Claude Code draws it, is the wall.
         let after = screen(
             &["⏺ Bash(./run.sh)", "  ⎿  queued 8 runs", "", &edge],
             "  ⏵⏵ auto mode on (shift+tab to cycle)",
@@ -7256,9 +5678,6 @@ mod tests {
         assert!(matches!(worker_phase(&after), Phase::Limited { .. }));
     }
 
-    /// The worker's words about limits are never the wall (its prose, a bullet of it, a tool's
-    /// output it went on about, a quote), nor are the manager's wrapped words or a shell's output;
-    /// a warning is no wall, and a busy worker is busy whatever its transcript says.
     #[test]
     fn words_about_limits_are_not_the_wall() {
         let tail = "  ⏵⏵ auto mode on (shift+tab to cycle)";
@@ -7393,8 +5812,6 @@ mod tests {
                 reset: None,
             }
         );
-        // Claude Code's own 429 is a message of its own, its status in parentheses: the same
-        // limit (`error_row_notice`).
         let own = screen(
             &[
                 "⏺ Running the suite again.",
@@ -7415,8 +5832,6 @@ mod tests {
         );
     }
 
-    /// The cursor proves typed text only inside the caret row's text ([`cursor_inside_text`]); at
-    /// column 2, on another row (a displaced grid) or absent it says nothing.
     #[test]
     fn the_cursor_only_proves_text_it_stands_inside() {
         let caret = 55;
@@ -7437,21 +5852,6 @@ mod tests {
         assert!(!cursor_inside_text(None, caret));
     }
 
-    /// THE FRAME'S REACH IS EVERY ROW ITS SEARCH READS ([`FrameReach`]): on
-    /// every fixture screen, whole and cut to two widths, each row above
-    /// [`FrameReach::from`] — one at a time, and all of them at once —
-    /// replaced by each of a set of rows the search tests for (a rule, a
-    /// caret, an option-like caret, an indented `❯`, a list's entry, a mode
-    /// row, a blank, words) leaves the frame and the reach as they were.
-    ///
-    /// NEGATIVE CONTROLS: the reach is no deeper than it must be — on every
-    /// screen with a frame whose first read row is its top rule, that row
-    /// replaced by words moves the frame (a reach one row shallower would be
-    /// refuted); and a `❯` row past column 0 under the caret, whose list
-    /// walk goes up the screen, reaches the screen's first row — on a screen
-    /// where the walk from the `❯` under a later rule finds the rule three
-    /// rows over the caret's and reads that `❯` as a list's entry, that rule
-    /// taken away makes it the caret, and the frame moves to it.
     #[test]
     fn the_frame_reach_is_every_row_the_search_reads() {
         let rule = "\u{2500}".repeat(30);
@@ -7469,9 +5869,6 @@ mod tests {
         ]
         .map(str::to_owned)
         .into();
-        // The walk: the caret's own rule is no rule, and the `❯` under the
-        // second rule is a list's entry only while a rule stands over the
-        // caret's row.
         let walk: Vec<String> = [
             rule.as_str(),
             "\u{276F} older",
@@ -7493,7 +5890,6 @@ mod tests {
             Some((4, 6)),
             "CONTROL: a row over the caret's row moved the frame"
         );
-        // The agents panel's pointed row, under the mode row and a blank.
         let panel: Vec<String> = [
             rule.as_str(),
             "\u{276F} ",
@@ -7544,9 +5940,6 @@ mod tests {
         }
         assert!(tight > 100, "CONTROL: screens with a frame: {tight}");
 
-        // A literal indented caret in a Muse draft makes the generic search
-        // find no frame; Muse still reads its column-zero composer. Its
-        // drawer eligibility also reads above the top rule.
         let mut muse: Vec<String> = [
             "ordinary reply",
             "────────────────────────",
@@ -7569,11 +5962,6 @@ mod tests {
         assert_ne!(FrameReach::of_or_agy(&muse).rules(), reached.rules());
     }
 
-    /// At 10 columns (2.1.300) Ink wraps the spinner row (`✻ Choreogr` over `aphing…`, or its
-    /// glyph alone over the word), between its shimmer's spans too, and cuts off the footer's
-    /// `esc to interrupt`: the status row is read across its rows and is busy. A done row
-    /// wrapped at its text column still ends the turn, and a queued `❯` message under the
-    /// spinner is no part of its line.
     #[test]
     fn a_spinner_row_ink_wrapped_reads_busy() {
         use crate::prompt::fixtures::{
@@ -7591,13 +5979,11 @@ mod tests {
             assert_eq!(worker_phase(&r), Phase::Busy, "{r:#?}");
             assert_eq!(busy_signal(&r).map(|b| b.rule), Some("spinner"));
             assert_eq!(status_line(&r).as_deref(), Some(line));
-            // The row the spinner is on is its first, as drawn.
             let first = line.split(' ').next().expect("a glyph");
             assert!(status_row(&r).is_some_and(|row| row.starts_with(first)));
             let reading = crate::reader::read(Some("claude"), &r, None);
             assert_eq!(reading.phase, Phase::Busy);
         }
-        // A done row wrapped at its text column: one done row, the turn over.
         let r = screen(API_ERROR_529_34_2_1_299);
         assert_eq!(
             status_line(&r).as_deref(),
@@ -7609,7 +5995,6 @@ mod tests {
             .expect("the done row");
         assert_eq!(transcript_end(&r), done + 2);
         assert!(turn_over(&r));
-        // Control: a queued message under the spinner's line.
         let mut queued = screen(SPINNER_WRAPPED_10_2_1_300);
         let at = queued
             .iter()
@@ -7620,9 +6005,6 @@ mod tests {
         assert!(turn_just_begun(&queued));
     }
 
-    /// Relaunched `--permission-mode auto --resume <id>`, 2.1.300 draws its auto-mode notice as
-    /// the last block after the first reply: it is the vendor's, and the last thing said is the
-    /// reply above it.
     #[test]
     fn the_vendors_auto_mode_notice_is_not_the_workers_last_words() {
         use crate::prompt::fixtures::{RESUME_AUTO_MODE_NOTICE_2_1_300, screen};
@@ -7634,7 +6016,6 @@ mod tests {
             crate::turn::said_tail(&r).as_deref(),
             Some("Hi! I am the local lab stub, not a model. (reply 2)")
         );
-        // Control: a reply that only quotes the notice is the worker's words.
         let quoted: Vec<String> = r
             .iter()
             .map(|x| x.replacen("⏺ Auto mode lets", "⏺ It said: Auto mode lets", 1))
@@ -7645,9 +6026,6 @@ mod tests {
         );
     }
 
-    /// At 50 columns Ink wraps the auto-mode notice's own words off its bullet row; the
-    /// paragraph is read as its text, across its rows, and is still the vendor's. A reply that
-    /// quotes the notice is the worker's words at this width too.
     #[test]
     fn the_vendors_auto_mode_notice_wrapped_narrow_is_not_the_workers_last_words() {
         let frame = |notice: &str| {
@@ -7689,7 +6067,6 @@ mod tests {
             said.contains("(reply 2)") && !said.contains("Auto mode"),
             "{said:?}"
         );
-        // Control: the worker quoting it.
         let quoted = frame("⏺ It said: Auto mode lets Claude handle permission");
         assert_eq!(
             last_said_row(&quoted),
@@ -7697,9 +6074,6 @@ mod tests {
         );
     }
 
-    /// A status row already whole takes no row under it: a retry row that fills its row does
-    /// not join the vendor's `  Fast mode unavailable: …` notice under it, so it stays a retry,
-    /// busy with or without the footer's `esc to interrupt`.
     #[test]
     fn a_retry_row_takes_no_notice_under_it() {
         let retry = "✻ API Error: 529 Overloaded, please wait · Retrying in 22s · attempt 7/10";
@@ -7731,14 +6105,6 @@ mod tests {
         }
     }
 
-    /// A COMPOSER FRAME CAUGHT MID-REPAINT (2.1.307, the forever lab's
-    /// `r7-both` L6, 2026-10-22): a reply growing under the window is
-    /// repainted row by row with its footer last, and a read in between held
-    /// the frame with its bottom rule drawn 109 of 144 columns on the grid's
-    /// last row. Torn: the bottom rule cut short, or the bottom rule whole on
-    /// the last row, the footer row not yet under it. NEGATIVE CONTROLS:
-    /// every measured 2.1.307 footer (idle, busy, a draft, each mode), a
-    /// frame whose footer row is blank, and a screen with no frame.
     #[test]
     fn a_composer_frame_caught_mid_repaint_is_torn() {
         use crate::prompt::fixtures::screen as fx;
@@ -7761,7 +6127,6 @@ mod tests {
             &"─".repeat(109),
             &["  ⏵⏵ auto mode on (shift+tab to cycle)"]
         )));
-        // NEGATIVE CONTROLS.
         for text in [
             include_str!("fixtures/claude-2.1.307-footer-after-turn.txt"),
             include_str!("fixtures/claude-2.1.307-footer-auto-idle.txt"),

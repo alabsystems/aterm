@@ -321,7 +321,7 @@ impl Terminal {
     /// The pre-resize facts for this resize's [`ResizeReport`], taken by both resize entry
     /// points before either grid is resized.
     #[inline]
-    pub(super) fn resize_origin(&self, policy: ResizePolicy) -> ResizeOrigin {
+    pub(super) const fn resize_origin(&self, policy: ResizePolicy) -> ResizeOrigin {
         ResizeOrigin {
             native: matches!(policy, ResizePolicy::Native),
             from: (self.grid.rows(), self.grid.cols()),
@@ -414,7 +414,7 @@ impl Terminal {
     /// Carry a predecessor's render debt across a handoff: once, right after a checkpoint
     /// restore, and only while the alternate screen is up (the debt is about its cells).
     #[inline]
-    pub fn seed_render_debt(&mut self, debt: RenderDebt) {
+    pub const fn seed_render_debt(&mut self, debt: RenderDebt) {
         if self.modes.alternate_screen {
             self.transient.render_debt = debt;
         }
@@ -438,7 +438,7 @@ impl Terminal {
     /// replay of a recording made under it (`cast drift`, from the recording's
     /// `aterm_resize_undo`).
     #[inline]
-    pub fn set_resize_law(&mut self, law: ResizeLaw) {
+    pub const fn set_resize_law(&mut self, law: ResizeLaw) {
         self.grid.set_resize_law(law);
         if let Some(parked) = self.alt_grid.as_mut() {
             parked.set_resize_law(law);
@@ -448,7 +448,7 @@ impl Terminal {
     /// The resize law the rows are laid out under ([`Self::set_resize_law`]).
     #[inline]
     #[must_use]
-    pub fn resize_law(&self) -> ResizeLaw {
+    pub const fn resize_law(&self) -> ResizeLaw {
         self.grid.resize_law()
     }
 

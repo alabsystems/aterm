@@ -1,41 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! ALAB-BUILT AGENT PROGRAMS: an agent program ([`crate::stub::AGENT_PROGRAMS`]) that ALab
-//! builds itself on some targets and the signed index publishes there, beside the vendor's
-//! own lane everywhere else. Today one: `codex` on `aarch64-apple-darwin` is codex-alab,
-//! ALab's drop-in Codex (`alab/package.sh` in codex-alab: package layout v1, a
-//! `codex-package.json` and an `alab-build.json` at its root, a pre-release version
-//! `X.Y.0-dev.<n>+g<sha>`).
-//!
-//! THE SOURCE RULE ([`rule`]) is the one place that says which lane owns such a program on
-//! this machine, and every branch point that used to ask only [`crate::vendor_direct::is_vendor`]
-//! asks it ([`source`]):
-//!
-//! 1. dev-linked: the link (as for every program);
-//! 2. a person chose the vendor's build here ([`vendor_chosen`], `aterm pkg update codex
-//!    --vendor`): the vendor lane, until `aterm pkg update codex --alab` takes it back;
-//! 3. the target is one ALab builds it for, the verified index names the program from
-//!    ALab's repo ([`AlabAgent::repo`], never the legacy `aterm` row) and pins a build in the
-//!    ALab store window ([`in_store_window`]) that no yank or floor revokes: the index lane;
-//! 4. the active build is an ALab build ([`build_is_alab`], by its package marker, on a
-//!    target ALab builds it for; read off the `current` link when a tombstone hides it):
-//!    kept — never decided against the vendor's head, never replaced by it unattended or
-//!    asked. A build the signed policy revokes (a yank, or below the floor) rolls back onto
-//!    an older ALab build nothing revokes, else its commands are disabled, as the index
-//!    lane disables a revoked build;
-//! 5. otherwise: the vendor lane, exactly as before this table existed.
-//!
-//! WHY NO VERSION ORDER CROSSES THE LANES. codex-alab's version is a pre-release of the next
-//! minor (`0.164.0-dev.N`), which SemVer puts BELOW the vendor's `0.164.0` once that ships:
-//! "newer" points the wrong way at times, so it is never asked. The ALab lane orders by the
-//! signed build number alone, and the source is chosen by the rule above, never by which
-//! build is newer.
-//!
-//! WHAT FAILS CLOSED. An index that does not verify or has expired pins nothing here, so an
-//! installed ALab build is kept and a vendor build stays on its vendor's lane. A wrong repo
-//! string, another target, a pin outside the window or a revoked pin is the vendor lane for
-//! a machine with no ALab build, and the kept ALab build for one that has it.
+//! ALAB-BUILT AGENT PROGRAMS.
 
 use std::path::{Path, PathBuf};
 
@@ -45,8 +11,7 @@ use crate::store::Layout;
 /// The manifest every Codex package carries at its root (layoutVersion 1).
 pub const PACKAGE_JSON: &str = "codex-package.json";
 
-/// The file an ALab build carries in its package root beside [`PACKAGE_JSON`]: the mark of
-/// bytes ALab built, not the vendor's.
+/// The file an ALab build carries in its package root beside [`PACKAGE_JSON`].
 pub const ALAB_BUILD_JSON: &str = "alab-build.json";
 
 /// Bound on a package manifest or build record read.
@@ -55,19 +20,15 @@ const MAX_PACKAGE_JSON_BYTES: usize = 64 * 1024;
 /// One agent program ALab builds itself on some targets.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AlabAgent {
-    /// The program name (an [`crate::stub::AGENT_PROGRAMS`] name: it keeps its twin, its
-    /// self-update intercept and its vendor row for the targets ALab does not build).
+    /// The program name ([`crate::stub::AGENT_PROGRAMS`]).
     pub program: &'static str,
-    /// The repo the signed index must name for the program (`[programs.<program>].repo`)
-    /// before its pin routes here. The live index's legacy row names `aterm`, so a legacy
-    /// pin never does.
+    /// The repo the signed index must name for the program (`[programs.<program>].repo`) before its pin routes here.
     pub repo: &'static str,
-    /// The targets ALab builds it for. Everywhere else the vendor lane is untouched.
+    /// The targets ALab builds it for.
     pub targets: &'static [&'static str],
     /// The product's own name, for the lines that say where a build came from.
     pub product: &'static str,
-    /// The upstream repository the product is built from, as a release page names it
-    /// ([`Upstream::release_line`]).
+    /// The upstream repository the product is built from, as a release page names it ([`Upstream::release_line`]).
     pub upstream: &'static str,
 }
 
@@ -94,20 +55,13 @@ pub fn agent(program: &str) -> Option<&'static AlabAgent> {
     ALAB_AGENTS.iter().find(|a| a.program == program)
 }
 
-/// THE ALAB STORE WINDOW: an ALab build id is above every legacy pin of the vendor's bytes
-/// ([`LEGACY_PIN_CEILING`]) and below every vendor build id
-/// ([`crate::vendor_direct::VENDOR_BUILD_BASE`]), so it is never read as a legacy build the
-/// vendor lane replaces, nor as a vendor version. Outside it a pin routes nothing here.
+/// THE ALAB STORE WINDOW.
 #[must_use]
 pub const fn in_store_window(build: u64) -> bool {
     STORE_WINDOW.0 < build && build < STORE_WINDOW.1
 }
 
-/// The newest legacy pin of the vendor's bytes an index carried for an ALab-built program:
-/// `codex = 2026101501` on the legacy `aterm` row of `atpkg-index-71`, above
-/// [`crate::vendor_direct::LEGACY_CEILING`] (the final legacy pin the vendor lane vouches
-/// for). The window starts above it, so a row or a store build carrying that legacy pin is
-/// never read as ALab's.
+/// The newest legacy pin of the vendor's bytes an index carried for an ALab-built program.
 pub const LEGACY_PIN_CEILING: u64 = {
     let live = 2_026_101_501;
     if crate::vendor_direct::LEGACY_CEILING > live {
@@ -117,20 +71,10 @@ pub const LEGACY_PIN_CEILING: u64 = {
     }
 };
 
-/// The exclusive bounds of [`in_store_window`], `(LEGACY_PIN_CEILING, VENDOR_BUILD_BASE)`:
-/// what the producer names when it refuses a build id outside them.
+/// The exclusive bounds of [`in_store_window`], `(LEGACY_PIN_CEILING, VENDOR_BUILD_BASE)`.
 pub const STORE_WINDOW: (u64, u64) = (LEGACY_PIN_CEILING, crate::vendor_direct::VENDOR_BUILD_BASE);
 
-/// One `codex-package.json`'s entrypoint (relative to the root): `None` unless
-/// `layoutVersion` is 1 and the entrypoint is a relative path with no `..` — the harness's
-/// own reading (`aterm_agent::harness::codex_alab::package_entrypoint`), held to it by a
-/// cross-check test. Which package
-/// names a binary needs no version, and an ALab build's is a pre-release no version reader
-/// here parses, on purpose.
-///
-/// Relative means every component is a name (or `.`): `is_absolute` alone admits Windows'
-/// rooted `\bin\codex` and drive-relative `C:codex`, which `root.join` resolves off the
-/// root.
+/// One `codex-package.json`'s entrypoint (relative to the root).
 #[must_use]
 pub fn package_entrypoint(text: &str) -> Option<PathBuf> {
     use std::path::Component;
@@ -149,7 +93,6 @@ pub fn package_entrypoint(text: &str) -> Option<PathBuf> {
 }
 
 /// The package root `root`'s manifest text and entrypoint, read bounded and never through a
-/// link.
 fn manifest_of(root: &Path) -> Option<(String, PathBuf)> {
     let text = crate::metadata_io::read_bounded_regular_utf8(
         &root.join(PACKAGE_JSON),
@@ -166,10 +109,7 @@ pub fn entrypoint_of(root: &Path) -> Option<PathBuf> {
     manifest_of(root).map(|(_, entry)| entry)
 }
 
-/// Whether `root` is an ALAB PACKAGE: its [`PACKAGE_JSON`] is layout 1 with an entrypoint
-/// that is a regular file inside it, and [`ALAB_BUILD_JSON`] stands beside it as a regular
-/// file. `false` for anything that cannot be looked at (fail closed: a build this cannot
-/// read is not called ALab's, and the caller's other rules decide it).
+/// Whether `root` is an ALAB PACKAGE.
 #[must_use]
 pub fn is_alab_package(root: &Path) -> bool {
     let Some((_, entry)) = manifest_of(root) else {
@@ -180,8 +120,7 @@ pub fn is_alab_package(root: &Path) -> bool {
             .is_ok_and(|m| m.file_type().is_file())
 }
 
-/// The version an ALab package says it is (`codex-package.json`'s `version`), verbatim —
-/// for the lines that name a build, never for ordering one.
+/// The version an ALab package says it is (`codex-package.json`'s `version`), verbatim.
 #[must_use]
 pub fn package_version(root: &Path) -> Option<String> {
     let (text, _) = manifest_of(root)?;
@@ -191,12 +130,7 @@ pub fn package_version(root: &Path) -> Option<String> {
         .then(|| version.to_string())
 }
 
-/// Whether the executable `exe` runs ALab bytes: the package root is `exe`'s directory or the
-/// one above it (canonically), that root is an ALab package ([`is_alab_package`]: its
-/// manifest and marker read bounded and never through a link), and its entrypoint IS `exe`.
-/// The harness's image fact (`aterm_agent::harness::codex_alab::alab_bytes`) answers
-/// the same on every package an atpkg store or dev link holds, and never "not ALab" where
-/// this says ALab; a cross-check test holds that.
+/// Whether the executable `exe` runs ALab bytes.
 #[must_use]
 pub fn exe_is_alab(exe: &Path) -> bool {
     alab_root_of_exe(exe).is_some()
@@ -217,32 +151,21 @@ fn alab_root_of_exe(exe: &Path) -> Option<PathBuf> {
         .map(Path::to_path_buf)
 }
 
-/// The upstream Codex an ALab build is based on, as its [`ALAB_BUILD_JSON`] records it:
-/// `"upstream": {"release": "rust-v0.163.0", "commits_since_release": 241, "commit": "<40
-/// hex>", "commit_date": "2026-10-20T13:50:13Z"}`, the values `alab/package.sh` computes for
-/// `CODEX_ALAB_UPSTREAM_VERSION` (the newest stable upstream tag whose branch point the build
-/// has merged), `CODEX_ALAB_UPSTREAM_COMMIT` (the upstream commit it merged last), the
-/// commits upstream's main carries from that branch point to it, and that commit's UTC
-/// committer date. Read off the record, never by running the binary; a package from before
-/// the field, or one whose field does not hold the release and the commit in that shape, has
-/// none. The count and the date are optional (packages from 2026-10-21 carry no count), but
-/// either one present in another shape makes the whole field none.
+/// The upstream Codex an ALab build is based on, as its [`ALAB_BUILD_JSON`] records it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Upstream {
     /// The upstream release tag, verbatim (`rust-v0.163.0`).
     pub release: String,
     /// The upstream commit merged, 40 lowercase hex digits.
     pub commit: String,
-    /// How many commits upstream's main carries from the release's branch point to
-    /// `commit`, when the record says.
+    /// How many commits upstream's main carries from the release's branch point to `commit`, when the record says.
     pub since: Option<u64>,
     /// The UTC day `commit` was committed (`2026-10-20`), when the record says.
     pub day: Option<String>,
 }
 
 impl Upstream {
-    /// `based on upstream rust-v0.163.0+g0123456789ab`: the release, then the commit's
-    /// first twelve digits.
+    /// `based on upstream rust-v0.163.0+g0123456789ab`.
     #[must_use]
     pub fn words(&self) -> String {
         format!(
@@ -252,11 +175,7 @@ impl Upstream {
         )
     }
 
-    /// The line a release page names the base with, as codex-alab's `alab/package.sh
-    /// --upstream-base` prints it for the source release: `Based on upstream openai/codex
-    /// rust-v0.163.0 + 241 commits (0123456789ab, 2026-10-20)`, `repo` the upstream
-    /// ([`AlabAgent::upstream`]). The count and the day are said only when the record holds
-    /// them.
+    /// The line a release page names the base with, as codex-alab's `alab/package.sh --upstream-base` prints it for the source release.
     #[must_use]
     pub fn release_line(&self, repo: &str) -> String {
         let since = self.since.map_or_else(String::new, |n| {
@@ -277,10 +196,7 @@ impl Upstream {
 /// How many digits of the upstream commit [`Upstream::words`] says.
 const UPSTREAM_SHORT_COMMIT: usize = 12;
 
-/// One `alab-build.json`'s [`Upstream`]: `None` unless `upstream` is an object whose
-/// `release` is a short printable name and whose `commit` is a full 40-digit hex sha, and
-/// whose `commits_since_release` (a count) and `commit_date` (`YYYY-MM-DDTHH:MM:SSZ`) are
-/// each absent or in that shape. Never a partial answer from a malformed record.
+/// One `alab-build.json`'s [`Upstream`].
 #[must_use]
 pub fn parse_upstream(text: &str) -> Option<Upstream> {
     let v: aterm_json::Value = aterm_json::from_str(text).ok()?;
@@ -307,7 +223,6 @@ pub fn parse_upstream(text: &str) -> Option<Upstream> {
 }
 
 /// The day of a UTC time as `alab/package.sh` records one (`2026-10-20T13:50:13Z`), or
-/// `None` for any other shape.
 fn utc_day(time: &str) -> Option<String> {
     let shaped = time.len() == 20
         && time.bytes().enumerate().all(|(i, b)| match i {
@@ -320,8 +235,7 @@ fn utc_day(time: &str) -> Option<String> {
     shaped.then(|| time[..10].to_string())
 }
 
-/// The [`Upstream`] the ALab package at `root` records ([`is_alab_package`], its record
-/// read bounded and never through a link).
+/// The [`Upstream`] the ALab package at `root` records ([`is_alab_package`], its record read bounded and never through a link).
 #[must_use]
 pub fn upstream_of(root: &Path) -> Option<Upstream> {
     if !is_alab_package(root) {
@@ -335,24 +249,19 @@ pub fn upstream_of(root: &Path) -> Option<Upstream> {
     parse_upstream(&text)
 }
 
-/// The [`Upstream`] of the ALab package whose entrypoint is `exe` ([`exe_is_alab`]): a
-/// store build's binary, or a dev-linked package's.
+/// The [`Upstream`] of the ALab package whose entrypoint is `exe` ([`exe_is_alab`]).
 #[must_use]
 pub fn upstream_of_exe(exe: &Path) -> Option<Upstream> {
     upstream_of(&alab_root_of_exe(exe)?)
 }
 
-/// AN ATERM VERSION as the minimum-aterm pairing compares one ([`pairs_with`]):
-/// `(MAJOR, MINOR, PATCH)`, numerically. A dev build's `+g<sha>` and a pre-release tail are
-/// no part of it.
+/// AN ATERM VERSION as the minimum-aterm pairing compares one ([`pairs_with`]).
 pub type AtermVersion = (u64, u64, u64);
 
 /// The longest aterm version [`parse_aterm_version`] reads.
 const MAX_ATERM_VERSION_BYTES: usize = 64;
 
-/// `MAJOR.MINOR.PATCH`, with any `-<pre-release>` or `+<build>` tail ignored, as aterm writes
-/// its versions (`0.110.0`, a dev build's `0.110.0+g0123456789`): the three numbers, or
-/// `None` for any other shape.
+/// `MAJOR.MINOR.PATCH`, ignoring any `-<pre-release>` or `+<build>` suffix.
 #[must_use]
 pub fn parse_aterm_version(text: &str) -> Option<AtermVersion> {
     if text.len() > MAX_ATERM_VERSION_BYTES {
@@ -377,10 +286,7 @@ pub fn aterm_version_words(v: AtermVersion) -> String {
     format!("{}.{}.{}", v.0, v.1, v.2)
 }
 
-/// What one `alab-build.json` says of the aterm its build needs: `"aterm": {"min":
-/// "0.110.0"}`. `Ok(None)` when the record names no `aterm`; `Ok(Some(_))` for that shape;
-/// `Err` for any other (an `aterm` that is no object, or whose `min` is no aterm version,
-/// [`parse_aterm_version`]): a pairing this client cannot read pairs with no aterm.
+/// What one `alab-build.json` says of the aterm its build needs.
 ///
 /// # Errors
 /// The record is not JSON, or names an `aterm` in another shape.
@@ -402,20 +308,10 @@ pub fn parse_aterm_min(text: &str) -> Result<Option<AtermVersion>, String> {
         })
 }
 
-/// THE ATERM THE ALAB PACKAGE AT `root` NEEDS: its record's `aterm.min` ([`parse_aterm_min`]),
-/// or `None` where the record names none, which pairs with every aterm.
-///
-/// NO DEFAULT FLOOR (review of parity-4, R3): a floor for records that name none would be
-/// judged only by an aterm that has this pairing, and every such aterm already has what the
-/// floor asked for: the act lease (`meta prepare harness_act`, bf9d401e40) came before the
-/// 0.110.0 bump (83a22b5ca9), and the pairing after it. An aterm from before the pairing
-/// reads no record at all, whatever it names. So the pairing refuses only where a build's
-/// record names an aterm newer than the one about to lay it: codex-alab's `alab-build.json`
-/// names `"aterm": {"min": …}` once a build needs a release past the first that pairs.
+/// THE ATERM THE ALAB PACKAGE AT `root` NEEDS.
 ///
 /// # Errors
-/// `root` is no ALab package ([`is_alab_package`]), its record cannot be read, or the record
-/// names a pairing in another shape.
+/// `root` is no ALab package ([`is_alab_package`]), its record cannot be read, or the record names a pairing in another shape.
 pub fn pairing_floor(root: &Path) -> Result<Option<AtermVersion>, String> {
     if !is_alab_package(root) {
         return Err("not an ALab package".to_string());
@@ -428,18 +324,13 @@ pub fn pairing_floor(root: &Path) -> Result<Option<AtermVersion>, String> {
     parse_aterm_min(&text)
 }
 
-/// THIS ATERM's version: the workspace's, which atpkg ships in. An unreadable one is
-/// `0.0.0`, which pairs with no ALab build.
+/// THIS ATERM's version.
 #[must_use]
 pub fn this_aterm() -> AtermVersion {
     parse_aterm_version(env!("CARGO_PKG_VERSION")).unwrap_or((0, 0, 0))
 }
 
-/// THE MINIMUM-ATERM PAIRING: whether the ALab package at `root` may be handed to an aterm at
-/// version `aterm` ([`pairing_floor`]): what the client's stage holds an ALab pack to before
-/// it is laid (`flow`'s pack gate), never the producer's (which pins a build for every aterm
-/// the index serves, its own version aside, and holds the record only to a shape this rule
-/// reads: `install::check_alab_pack`). A refusal keeps the build installed now.
+/// THE MINIMUM-ATERM PAIRING.
 ///
 /// # Errors
 /// Why not, in a line that names both versions.
@@ -456,18 +347,14 @@ pub fn pairs_with(root: &Path, aterm: AtermVersion) -> Result<(), String> {
     ))
 }
 
-/// The [`Upstream`] of the copy `program`'s managed shim runs ([`crate::which`]): its store
-/// build, or the package a dev link names. `None` for a program ALab does not build.
+/// The [`Upstream`] of the copy `program`'s managed shim runs ([`crate::which`]).
 #[must_use]
 pub fn program_upstream(layout: &Layout, program: &str) -> Option<Upstream> {
     agent(program)?;
     upstream_of_exe(&crate::which(layout, program)?)
 }
 
-/// Whether `program`'s store build `build` is an ALab build: a program ALab builds, a build
-/// id that is not a vendor one, and a complete tree that is an ALab package
-/// ([`is_alab_package`]). The classification every lane reads before it may call a build
-/// legacy or decide it against a vendor's head.
+/// Whether `program`'s store build `build` is an ALab build.
 #[must_use]
 pub fn build_is_alab(layout: &Layout, program: &str, build: u64) -> bool {
     agent(program).is_some()
@@ -475,12 +362,7 @@ pub fn build_is_alab(layout: &Layout, program: &str, build: u64) -> bool {
         && is_alab_package(&layout.build_dir(program, build))
 }
 
-/// `program`'s active build when it is an ALab build ([`build_is_alab`]) on a target ALab
-/// builds it for (`triple`; elsewhere an ALab build cannot run, and the vendor lane judges it
-/// as it judged any build before this table). Read off the `bin/` shims, else off the
-/// `store/<program>/current` activation link: a tombstoned or missing shim hides the build
-/// from the shims, and the build it hides is still ALab's — never a machine with no codex
-/// for the vendor lane to install over.
+/// `program`'s active ALab build ([`build_is_alab`]) on a supported `triple`.
 #[must_use]
 pub fn active_alab_build(layout: &Layout, program: &str, triple: &str) -> Option<u64> {
     if !agent(program)?.serves(triple) {
@@ -500,8 +382,7 @@ pub fn current_build(layout: &Layout, program: &str) -> Option<u64> {
     (owner == program).then_some(build)
 }
 
-/// `program`'s retained ALab store builds below `below`, newest first: what a yank of the
-/// active one rolls back onto.
+/// `program`'s retained ALab store builds below `below`, newest first.
 #[must_use]
 pub fn retained_alab_below(layout: &Layout, program: &str, below: u64) -> Vec<u64> {
     let mut builds: Vec<u64> = crate::ops::list_installed(layout)
@@ -525,10 +406,12 @@ pub enum Source {
     /// The signed index pins this ALab build for this target: the index lane.
     Index {
         /// The pinned build.
+        /// The pinned build.
         build: u64,
     },
     /// The active build is ALab's and nothing pins one here: kept, never the vendor's.
     KeepAlab {
+        /// The active build.
         /// The active build.
         build: u64,
     },
@@ -537,9 +420,7 @@ pub enum Source {
 }
 
 impl Source {
-    /// Whether the index lane owns the program here. Every other source is the vendor
-    /// lane's door: a dev link is its to report as it always was, and a kept ALab build is
-    /// its to keep ([`crate::vendor_direct::lane`] answers it before any head is read).
+    /// Whether the index lane owns the program here.
     #[must_use]
     pub const fn index_lane(self) -> bool {
         matches!(self, Self::Index { .. })
@@ -577,10 +458,7 @@ pub const fn rule(f: &Facts) -> Source {
     Source::VendorDirect
 }
 
-/// The ALab build `index`'s channel `ch` (already the view from `triple`,
-/// [`Channel::for_target`]) pins for `program`: `None` unless ALab builds `program` for
-/// `triple`, the index names it from [`AlabAgent::repo`], the pin is in the store window
-/// ([`in_store_window`]), and no yank or floor of that channel revokes it.
+/// The ALab build `index`'s channel `ch` (already the view from `triple`, [`Channel::for_target`]) pins for `program`.
 #[must_use]
 pub fn channel_pin(index: &Index, ch: &Channel, program: &str, triple: &str) -> Option<u64> {
     let agent = agent(program)?;
@@ -602,8 +480,7 @@ pub fn index_pin(index: &Index, program: &str, triple: &str) -> Option<u64> {
     channel_pin(index, &ch, program, triple)
 }
 
-/// [`rule`] over this machine: the link, the person's choice, `index` (a VERIFIED, unexpired
-/// index the caller holds; `None` pins nothing) and the active build.
+/// [`rule`] over this machine.
 #[must_use]
 pub fn source(layout: &Layout, program: &str, triple: &str, index: Option<&Index>) -> Source {
     facts_with(layout, program, triple, |p| {
@@ -611,8 +488,7 @@ pub fn source(layout: &Layout, program: &str, triple: &str, index: Option<&Index
     })
 }
 
-/// [`source`] reading the pin off `ch`, a channel of `index` already viewed from `triple`
-/// (the planners hold one).
+/// [`source`] reading the pin off `ch`, a channel of `index` already viewed from `triple` (the planners hold one).
 #[must_use]
 pub fn source_in(
     layout: &Layout,
@@ -648,15 +524,13 @@ fn facts_with(
     })
 }
 
-/// Whether the index lane owns `program` here under `index` ([`source`] is
-/// [`Source::Index`]).
+/// Whether the index lane owns `program` here under `index` ([`source`] is [`Source::Index`]).
 #[must_use]
 pub fn index_owns(layout: &Layout, program: &str, triple: &str, index: Option<&Index>) -> bool {
     matches!(source(layout, program, triple, index), Source::Index { .. })
 }
 
-/// `<prefix>/sources/<program>.vendor`: the person's choice of the vendor's build of an
-/// ALab-built program on this machine ([`choose_vendor`]).
+/// `<prefix>/sources/<program>.vendor`.
 #[must_use]
 pub fn vendor_choice_path(layout: &Layout, program: &str) -> PathBuf {
     layout
@@ -665,7 +539,7 @@ pub fn vendor_choice_path(layout: &Layout, program: &str) -> PathBuf {
         .join(format!("{program}.vendor"))
 }
 
-/// Whether a person chose the vendor's build of `program` here. Only a regular file counts.
+/// Whether a person chose the vendor's build of `program` here.
 #[must_use]
 pub fn vendor_chosen(layout: &Layout, program: &str) -> bool {
     agent(program).is_some()
@@ -673,17 +547,10 @@ pub fn vendor_chosen(layout: &Layout, program: &str) -> bool {
             .is_ok_and(|m| m.file_type().is_file())
 }
 
-/// Record a person's choice of the vendor's build of `program` (`aterm pkg update <program>
-/// --vendor`): the one way back to the vendor for a machine on ALab's build, and never
-/// written by anything unattended.
-///
-/// The regular marker's presence is the choice; its bytes are never read. Creating it
-/// exclusively publishes that choice at once, without overwriting an existing entry. A
-/// repeated choice accepts only an opened regular, non-link marker and changes no bytes.
+/// Record a person's choice of the vendor's build of `program` (`aterm pkg update <program> --vendor`).
 ///
 /// # Errors
-/// The directory or marker could not be created, or an existing marker is not a regular
-/// non-link file.
+/// The directory or marker could not be created, or an existing marker is not a regular non-link file.
 pub fn choose_vendor(layout: &Layout, program: &str) -> std::io::Result<()> {
     let path = vendor_choice_path(layout, program);
     if let Some(dir) = path.parent() {
@@ -698,13 +565,12 @@ pub fn choose_vendor(layout: &Layout, program: &str) -> std::io::Result<()> {
     }
 }
 
-/// Forget that choice (`aterm pkg update <program> --alab`): whether one was recorded.
+/// Forget that choice (`aterm pkg update <program> --alab`).
 pub fn clear_vendor_choice(layout: &Layout, program: &str) -> bool {
     std::fs::remove_file(vendor_choice_path(layout, program)).is_ok()
 }
 
-/// The words that name an ALab build on a line: `ALab build 0.164.0-dev.12 (build
-/// 2026101601)`, or `ALab build 2026101601` when its package names no version.
+/// The words that name an ALab build on a line.
 #[must_use]
 pub fn build_words(layout: &Layout, program: &str, build: u64) -> String {
     let words = crate::state::ALAB_BUILD_WORDS;
@@ -714,10 +580,7 @@ pub fn build_words(layout: &Layout, program: &str, build: u64) -> String {
     }
 }
 
-/// The checkout-relative bin a dev link of an ALab-built `program` to a PACKAGE DIRECTORY
-/// names: the package's entrypoint (`bin/codex`), so `[packages.links] codex = "<pkgdir>"`
-/// links what `alab/package.sh` laid without a bin list. `None` when `checkout` is no
-/// package of that program.
+/// The checkout-relative bin a dev link of an ALab-built `program` to a PACKAGE DIRECTORY names.
 #[must_use]
 pub fn package_link_bin(program: &str, checkout: &Path) -> Option<PathBuf> {
     agent(program)?;

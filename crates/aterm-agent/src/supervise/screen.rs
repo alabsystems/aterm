@@ -177,6 +177,23 @@ impl HumanInput {
 }
 
 impl Screen {
+    /// THE CURSOR OF A LATER READ OF THIS SAME CONTENT, taken whole: `now`'s
+    /// cursor row and column and the row its slice starts at, when `now`
+    /// shows this screen's content at its seq (Claude Code paints its frame,
+    /// then moves the cursor into the composer, and the move bumps no content
+    /// seq). `false`, and nothing taken, when `now`'s seq or rows moved: a
+    /// fresh cursor laid over rows it was not read with would vouch for a
+    /// frame nobody drew.
+    pub fn take_cursor_of(&mut self, now: &Screen) -> bool {
+        if now.seq != self.seq || now.rows != self.rows {
+            return false;
+        }
+        self.cursor_row = now.cursor_row;
+        self.cursor_col = now.cursor_col;
+        self.first = now.first;
+        true
+    }
+
     /// The cursor's index into `rows` — its grid row less [`Self::first`];
     /// `None` when that row is not among the rows read.
     pub fn cursor_index(&self) -> Option<usize> {
@@ -534,6 +551,45 @@ pub fn status_field<'s>(stdout: &'s str, field: &str) -> Option<&'s str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// [`Screen::take_cursor_of`]: a later read of the same content gives its cursor whole (row,
+    /// column and slice start); NEGATIVE CONTROLS: a read whose seq moved, or whose rows moved
+    /// at the same seq, gives nothing, and the screen keeps the cursor it was read with.
+    #[test]
+    fn a_later_reads_cursor_is_taken_whole_only_over_the_same_content() {
+        let point = Screen {
+            rows: vec!["⏺ Done.".to_string(), "❯ ".to_string()],
+            cursor_row: 10,
+            cursor_col: 0,
+            seq: 7,
+            first: 0,
+            ..Screen::default()
+        };
+        let caret = Screen {
+            cursor_row: 3,
+            cursor_col: 2,
+            first: 2,
+            ..point.clone()
+        };
+        let mut taken = point.clone();
+        assert!(taken.take_cursor_of(&caret));
+        assert_eq!((taken.cursor_row, taken.cursor_col, taken.first), (3, 2, 2));
+        assert_eq!(taken.rows, point.rows);
+        for moved in [
+            Screen {
+                seq: 8,
+                ..caret.clone()
+            },
+            Screen {
+                rows: vec!["⏺ Done.".to_string(), "❯ hello".to_string()],
+                ..caret.clone()
+            },
+        ] {
+            let mut kept = point.clone();
+            assert!(!kept.take_cursor_of(&moved), "{moved:?}");
+            assert_eq!(kept, point, "{moved:?}");
+        }
+    }
 
     /// A `status` reply's stamp reads as a `text --json` one does, and [`HumanInput::within`]
     /// is strictly under the grace. Negative controls: the grace's own edge is outside it, and

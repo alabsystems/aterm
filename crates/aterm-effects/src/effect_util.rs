@@ -1,28 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The cursor emitters' shared render kit: the per-cell-row quad pushers, the colour ramps, and
-//! the 4-point twinkle star.
-//!
-//! The two pushers are not interchangeable: [`push_grid_quad`] takes grid-relative px, clamps
-//! to the grid and tags rows `y / ch`; [`push_fx_rect`] takes window px (the space of
-//! `cursor_glow_add`), clamps to the effects box and tags rows from the origin. A caret-anchored
-//! emitter on the grid form is displaced by the window origin; the grid form's one caller is
-//! `output_streak` (light anchored to a text run).
-//! [`push_grid_quad`], whose one caller is `output_streak` (light anchored to a
-//! text run, not the caret).
+//! Shared cursor-emitter render kit: per-cell-row quad pushers, colour ramps, and 4-point twinkle star.
 
 use aterm_render::{GlowQuad, premul_rgb};
 
 use crate::cursor_glow::Geom;
 
-/// Clamp a grid-relative pixel rect to the grid interior and split it into per-cell-row
-/// [`GlowQuad`]s tagged `y / ch` (the renderer row gate and CPU/GPU parity need one row per
-/// quad).
-///
-/// `alpha == 0` is additive light; `alpha > 0` selects premultiplied source-over
-/// (`src + dst·(1 − a)`), which a light-theme emitter needs because additive light only
-/// brightens.
+/// Clamp a grid-relative pixel rect to the grid interior and split it into per-cell-row [`GlowQuad`]s.
 #[allow(
     clippy::too_many_arguments,
     reason = "the rect + blend mode IS the call; a struct would relocate the same list and cost \
@@ -38,7 +23,6 @@ pub(crate) fn push_grid_quad(
     premul: u32,
     alpha: u8,
 ) {
-    // Zero light is skippable only when additive: a source-over quad whose
     // premultiplied colour rounds to black still darkens the cell by `alpha`.
     if w <= 0 || h <= 0 || (premul == 0 && alpha == 0) {
         return;
@@ -74,9 +58,7 @@ pub(crate) fn push_grid_quad(
     }
 }
 
-/// Push additive premultiplied light in window px (`geom.origin_*` applied), clamped to the
-/// effects box (grid + head band) and split into per-cell-row [`GlowQuad`]s with
-/// origin-anchored row tags.
+/// Push additive premultiplied light in window px, clamped to the effects box and split per cell row.
 #[inline]
 pub(crate) fn push_fx_rect(
     out: &mut Vec<GlowQuad>,
@@ -90,13 +72,10 @@ pub(crate) fn push_fx_rect(
     if premul == 0 {
         return;
     }
-    // Additive: this emitter has no other mode.
     push_fx_quad(out, geom, x, y, w, h, premul, 0);
 }
 
-/// [`push_fx_rect`] with the blend mode left to the caller: the one copy of the
-/// window-px band walk. `alpha == 0` is additive; `alpha > 0` is that
-/// coverage as source-over opacity (`src + dst·(1 − a)`), for light-theme ink.
+/// [`push_fx_rect`] with caller-selected blend mode (`alpha == 0` additive, `alpha > 0` source-over).
 #[allow(
     clippy::too_many_arguments,
     reason = "the rect + blend mode IS the call, as in `push_grid_quad`"
@@ -115,12 +94,7 @@ pub(crate) fn push_fx_quad(
     push_fx_ramp(out, geom, x, y, w, h, (premul, alpha), (premul, alpha));
 }
 
-/// A soft round mark of ADDITIVE light at `(cx, cy)` with radii `(rx, ry)`:
-/// one radial profile, `(1 − ρ²)²` peaking at `peak` (coverage `0..=255`) at
-/// the centre and reaching nothing at the rim, laid one pixel row at a time
-/// as a few linear ramps a side ([`push_fx_ramp`]), so its edge never stands
-/// as a step (a bead, a drop or a glint of light that a stack of flat slabs
-/// drew in stairs).
+/// Push a soft round mark of additive light at `(cx, cy)` with radii `(rx, ry)` and centre coverage `peak`.
 pub(crate) fn push_soft_disc(
     out: &mut Vec<GlowQuad>,
     geom: Geom,
@@ -166,13 +140,7 @@ pub(crate) fn push_soft_disc(
     }
 }
 
-/// [`push_fx_quad`] with a horizontal ramp: `(colour, alpha)` `left` at the
-/// rect's left edge and `right` at its right edge, by
-/// [`GlowQuad::color2`]'s law. Both ends are in one blend mode (both alphas
-/// `0`, additive, or both `> 0`, source-over). Where the effects box clips the
-/// rect, the cut edge takes the ramp's value at the cut, so a clipped ramp
-/// keeps its slope; equal ends pass through bit-exact, which is what keeps
-/// every flat caller byte-unchanged.
+/// [`push_fx_quad`] with a horizontal `(colour, alpha)` ramp from `left` to `right`.
 #[allow(
     clippy::too_many_arguments,
     reason = "the rect + both ramp ends IS the call, as in `push_fx_quad`"
@@ -206,7 +174,6 @@ pub(crate) fn push_fx_ramp(
     if x1 <= x0 || y1 <= y0 {
         return;
     }
-    // The ramp's value at window column `px` (an edge), for a clipped end.
     let at = |px: i32| -> (u32, u8) {
         if left == right {
             return left;
@@ -215,8 +182,6 @@ pub(crate) fn push_fx_ramp(
         let lerp = |a: u32, b: u32| (a as f32 + (b as f32 - a as f32) * t).round() as u32;
         let ch = |sh: u32| lerp((left.0 >> sh) & 0xff, (right.0 >> sh) & 0xff).min(255) << sh;
         let alpha = lerp(u32::from(left.1), u32::from(right.1)).min(255) as u8;
-        // A source-over end stays source-over (`alpha == 0` would switch
-        // the quad to additive).
         let alpha = if left.1 > 0 { alpha.max(1) } else { 0 };
         (ch(16) | ch(8) | ch(0), alpha)
     };
@@ -228,7 +193,6 @@ pub(crate) fn push_fx_ramp(
     let w_u = (x1 - x0) as u16;
     let mut yy = y0;
     while yy < y1 {
-        // Grid-row damage hint anchored at origin_y (above-grid bands tag row 0).
         let row = (yy - oy).div_euclid(ch);
         let band_end = (oy + (row + 1) * ch).min(y1);
         out.push(GlowQuad {
@@ -258,8 +222,7 @@ pub(crate) const fn lerp_rgb(a: u32, b: u32, t: f32) -> u32 {
     (mix(a, b, t, 16) << 16) | (mix(a, b, t, 8) << 8) | mix(a, b, t, 0)
 }
 
-/// Clamped per-channel RGB mix (`t` from a → b), rounded to nearest. Not
-/// [`lerp_rgb`]: its `+ 0.5`-and-truncate rounding can differ in the last ulp.
+/// Clamped per-channel RGB mix (`t` from `a` to `b`), rounded to nearest.
 #[inline]
 pub(crate) fn mix_rgb(a: u32, b: u32, t: f32) -> u32 {
     let t = t.clamp(0.0, 1.0);
@@ -278,11 +241,6 @@ pub(crate) const fn lerp(a: f32, b: f32, t: f32) -> f32 {
 }
 
 /// The fire ramp's stops: deep red → orange → yellow → near-white core.
-///
-/// Module-level `const` because the ramps run per particle per frame, and a
-/// local table is re-materialized on the stack whenever inlining declines.
-/// [`ramp_5stop`] relies on this table's shape (positions strictly ascending,
-/// first exactly 0.0, last exactly 1.0).
 const FIRE_STOPS: [(f32, u32); 5] = [
     (0.0, 0x002A_0000),
     (0.25, 0x008B_1A00),
@@ -292,8 +250,6 @@ const FIRE_STOPS: [(f32, u32); 5] = [
 ];
 
 /// The water ramp's stops: abyss → open-ocean blue → turquoise → aqua crest → foam. Saturated
-/// and green-leaning through the midband (pale sky-cyan reads as ice). Same shape contract as
-/// [`FIRE_STOPS`].
 const WATER_STOPS: [(f32, u32); 5] = [
     (0.0, 0x0005_2C48),
     (0.35, 0x000E_66B4),
@@ -303,11 +259,6 @@ const WATER_STOPS: [(f32, u32); 5] = [
 ];
 
 /// The shared 5-stop ramp core. The window index is the count of interior stop positions
-/// strictly below `t` (three compares, no branch), feeding `(t - t0) / (t1 - t0)` into
-/// [`lerp_rgb`], so every output is bit-equal to the windowed walk ("first window with
-/// `t <= t1`"), pinned by `ramp_rewrite_is_bit_identical_to_the_stop_walk`.
-// Not `.clamp()`: `f32::clamp` propagates NaN, while `min`/`max` return the other operand, so
-// min-first pins NaN to 1.0 and the lerp lands exactly on the crest colour.
 #[allow(clippy::manual_clamp)]
 #[inline]
 const fn ramp_5stop(stops: &[(f32, u32); 5], t: f32) -> u32 {
@@ -315,8 +266,6 @@ const fn ramp_5stop(stops: &[(f32, u32); 5], t: f32) -> u32 {
     let idx = (t > stops[1].0) as usize + (t > stops[2].0) as usize + (t > stops[3].0) as usize;
     let (t0, c0) = stops[idx];
     let (t1, c1) = stops[idx + 1];
-    // No `t1 > t0` divide guard: positions strictly ascend by table contract
-    // (tested).
     lerp_rgb(c0, c1, (t - t0) / (t1 - t0))
 }
 
@@ -332,86 +281,49 @@ pub(crate) const fn water_ramp(t: f32) -> u32 {
     ramp_5stop(&WATER_STOPS, t)
 }
 
-/// The twinkle's white/gold pair. One gold for the whole sparkle family: a caller wanting the
-/// warm half asks for `twinkle_rgb(true)`.
+/// Return the twinkle family's white (`false`) or gold (`true`) RGB colour.
 #[inline]
 pub(crate) const fn twinkle_rgb(gold: bool) -> u32 {
     if gold { 0x00FF_E9A8 } else { 0x00FF_FFFF }
 }
 
-// ─── the sparkle family ─────────────────────────────────────────────────────
-//
-// One silhouette, one arm ladder, one pulse rule. The additive star ([`push_twinkle_star`]) and
-// its source-over twin (`rainbow_kitty::stardust`'s `push_twinkle_over_twin`) are the same
-// mark, defined by the numbers here; a context chooses its colour, size and phase.
-
-/// Silhouette: the arms' half-thickness at the base as a fraction of the arm's half-length. The
-/// source-over star takes it as each arm's falloff minor radius, the additive star as its
-/// integer bar thickness ([`star_waist_px`]). At 0.10 the waist is the 1 px hairline for every
-/// ordinary arm and widens only on hero grains; a thick waist reads as a typographic `+`.
+/// Star arm half-thickness at the base as a fraction of the arm's half-length.
 pub(crate) const STAR_WAIST: f32 = 0.10;
 
-// ─── the taper ──────────────────────────────────────────────────────────────
-//
-// A sparkle comes to a point: a constant-thickness arm crossed with its twin is a `+`, however
-// thin. A cursor star's arm is ~3-8 px on a 1-2 px base, too small for a narrowing outline to
-// cross a pixel boundary, so the needle is a coverage ramp: a bright body at the crossing and a
-// short run of dimmer, thinner spans out to each point. The additive arm ramps per-span
-// coverage (and thickness once it has room); the source-over arm stacks a shorter body lay over
-// a full-length tip lay.
-
-/// The taper: the fraction of an arm's half-length drawn at full coverage through the
-/// crossing; beyond it the arm is the point. Less loses the solid centre (at `arm` 3-4 the body
-/// would be one pixel); more leaves too short a run to ramp; 0.42 gives the ramp one more pixel
-/// than 0.5 at starfield sizes.
+/// Fraction of an arm's half-length drawn at full coverage through the crossing.
 pub(crate) const STAR_TAPER_BODY: f32 = 0.42;
 
-/// The taper: coverage at the point as a fraction of the requested coverage, ramping linearly
-/// from full at the body's end. 0.22 dissolves the tip without shortening the arm.
+/// Coverage at the arm's tip as a fraction of the requested coverage.
 pub(crate) const STAR_TIP_COV: f32 = 0.22;
 
-/// The taper: the most spans one point is rasterized with (per side, per arm), one per pixel of
-/// its run. The additive star is a hot path and each span costs 4 quads (two arms × two sides),
-/// so at 3 a star costs at most 15 before its glints.
+/// Maximum spans one point is rasterized with per side and arm.
 pub(crate) const STAR_TAPER_STEPS: i32 = 3;
 
-/// How many coincident source-over lays `cursor_glow`'s `push_twinkle_over`
-/// stacks at the crossing: a TIP lay and a BODY lay per arm, plus the nucleus.
+/// Coincident source-over lays stacked at the star's crossing.
 pub(crate) const STAR_OVER_LAYS: usize = 5;
 
-/// How many lays the star's centre composites to: `stacked_ink_alpha` prices a round grain
-/// against `1 − (1 − a)³`, and the taper adds lays only to the arms, so the light star solves a
-/// per-lay alpha over [`STAR_OVER_LAYS`] that reproduces this stack.
+/// Effective source-over lay count at the star's centre.
 pub(crate) const STAR_OVER_CENTRE_LAYS: f32 = 3.0;
 
-/// The taper's coverage multiplier at `u` (the fraction of the way from the
-/// body's end to the point), shared by both rasterizers.
+/// Taper coverage multiplier at fraction `u` from the body's end to the point.
 #[inline]
 pub(crate) const fn star_taper_cov(u: f32) -> f32 {
     1.0 - (1.0 - STAR_TIP_COV) * u.clamp(0.0, 1.0)
 }
 
-/// Silhouette: the nucleus half-extent as a fraction of the arm's half-length.
-/// Source-over draws it; on additive the crossing supplies part of it and
-/// [`STAR_CORE_ADD`] completes it.
+/// Nucleus half-extent as a fraction of the arm's half-length.
 pub(crate) const STAR_CORE: f32 = 0.16;
 
-/// The additive nucleus's share of the star's coverage. The two arms already
-/// stack to 2x at the crossing, so a full-coverage core would reach 3x and clip
-/// a gold star to white; at 0.35 crossing plus core read as the same nucleus the
-/// light star draws.
+/// Additive nucleus's share of the star's coverage.
 pub(crate) const STAR_CORE_ADD: f32 = 0.35;
 
-/// Silhouette: the diagonal glint dots' offset from the centre, as a fraction of the arm's
-/// half-length.
+/// Diagonal glint dots' offset from the centre as a fraction of the arm's half-length.
 pub(crate) const STAR_GLINT: f32 = 0.5;
 
-/// The glints' share of the star's coverage — dim by design, so text stays
-/// legible under a starfield.
+/// Glints' share of the star's coverage.
 pub(crate) const STAR_GLINT_COV: f32 = 1.0 / 3.0;
 
-/// The one arm scale: a star's arm half-length as a fraction of cell height, times one of the
-/// named ratios below ([`star_arm`]).
+/// Base star arm half-length as a fraction of cell height.
 pub(crate) const STAR_ARM: f32 = 0.14;
 
 /// Arm ratio, starfield grain: the smallest mark that still reads as a star.
@@ -423,9 +335,7 @@ pub(crate) const STAR_ARM_STD: f32 = 1.0;
 /// Arm ratio, a hero grain.
 pub(crate) const STAR_ARM_HERO: f32 = 1.4;
 
-/// Arm ratio, the ink tax: source-over ink buys presence with area where
-/// additive light uses coverage, so a light-theme star is its dark twin's ratio
-/// times this.
+/// Source-over arm scale multiplier relative to additive light.
 pub(crate) const STAR_ARM_INK: f32 = 1.55;
 
 /// The ladder's shape, checked at build time: the rungs stay ordered and short.
@@ -450,34 +360,14 @@ pub(crate) const fn star_arm(cell_h: f32, ratio: f32) -> f32 {
     cell_h * STAR_ARM * ratio
 }
 
-/// The one float→integer arm conversion for the additive star: truncate, then floor at the
-/// 1 px arm [`push_twinkle_star`] needs. Truncate, because waist and nucleus round
-/// `2·arm·ratio`: rounding would turn the hero grain at a 40 px cell (7.84 px of arm) into a
-/// 2 px bar on a 3 px nucleus.
+/// Convert float arm half-length to integer px for the additive star (truncated, floored at 1).
 #[inline]
 pub(crate) const fn star_arm_px(arm: f32) -> i32 {
     let px = arm as i32;
     if px < 1 { 1 } else { px }
 }
 
-/// The stardust rule (owner, 2026-08-08): a population's body is round stardust
-/// (a tiny radial mote), and the 4-point star is an accent dealt to at most one
-/// particle in [`STAR_ACCENT_DEN`], decided from the particle's already-stored
-/// seed so no RNG stream shifts and no grain changes shape mid-flight. Singular
-/// gestures (the erase poof's one plus, the jump-landing starburst, the
-/// momentum shower's one shooting-star tip) sit outside the deal.
-///
-/// "Singular" is a count, not a name: the ribbon starfield's gold (about 6 % of
-/// starred cells) and the fast-glide shooting star's head (one per streak, but
-/// a streak per qualifying frame) are populations, so both are dealt.
-///
-/// At 1-in-16 (6.25 %) the nearest plus on a busy ribbon is a short word away,
-/// reading as punctuation on the dust rather than texture, while some crosses
-/// remain. This constant reaches every dealt population on both themes: the
-/// dark and light ribbon starfields, the Beam/Comet/Sparkle wakes, the erase
-/// poof, and the fresh-ink spark (owner, 2026-08-09). The Sparkle and Comet
-/// wakes are measured by `cursor_glow`'s
-/// `stardust_is_the_body_the_plus_is_the_accent`.
+/// Denominator of the 1-in-N 4-point star accent share among round stardust motes.
 pub(crate) const STAR_ACCENT_DEN: u32 = 16;
 
 /// Deal a stored particle seed: `true` is the 4-point accent, `false` a round mote.
@@ -486,55 +376,31 @@ pub(crate) const fn star_accent(seed: u32) -> bool {
     seed.is_multiple_of(STAR_ACCENT_DEN)
 }
 
-/// Stardust mote radius, px: seeded so no two motes match, floored so the smallest is still a
-/// lit point.
+/// Seeded stardust mote radius in px.
 #[inline]
 pub(crate) const fn dust_r(cell_h: f32, seed01: f32) -> f32 {
     (cell_h * (0.07 + 0.05 * seed01)).max(1.3)
 }
 
-/// The plus's composited centre as a multiple of its requested coverage: [`push_twinkle_star`]
-/// lays two arms at `cov` and the nucleus at [`STAR_CORE_ADD`] of it at the crossing. A round
-/// mote replacing a plus is priced against this, or it lands 2.35x darker; the light arm does
-/// the same with `1-(1-a)^3`.
+/// Composited centre coverage of the additive star as a multiple of requested coverage.
 pub(crate) const STAR_STACK_ADD: f32 = 2.0 + STAR_CORE_ADD;
 
-/// The one pulse rule: angular frequency (rad/s) of every twinkling star.
-///
-/// WCAG 2.3.1: this crate certifies [`TWINKLE_FLASH_BOUND_HZ`]. The envelope
-/// is rectified (`|sin|`), peaking twice per sine cycle, so the bound applies
-/// to `ω/π`. At 9 rad/s that is [`TWINKLE_FLASH_HZ`] = 2.86 Hz.
+/// Angular frequency (rad/s) of every twinkling star.
 pub(crate) const TWINKLE_OMEGA: f32 = 9.0;
 
-/// The pulse's floor. A star dims, never blinks out: a sparkle that reaches zero reads as a
-/// dropped frame.
+/// Minimum brightness multiplier of the twinkle pulse.
 pub(crate) const TWINKLE_FLOOR: f32 = 0.55;
 
-/// The pulse's depth. `TWINKLE_FLOOR + TWINKLE_DEPTH` is 1.0: the law scales a star's own
-/// coverage and never exceeds it.
+/// Depth of the twinkle pulse (`TWINKLE_FLOOR + TWINKLE_DEPTH == 1.0`).
 pub(crate) const TWINKLE_DEPTH: f32 = 0.45;
 
-/// Where in the envelope's range a star counts as at its peak, the gate the
-/// diffraction-glint accents fire on: 0.92 puts the glint on for ~26 % of each
-/// pulse.
+/// Envelope fraction above which a star fires its diffraction-glint accents.
 pub(crate) const TWINKLE_GLINT_FRAC: f32 = 0.92;
 
-/// The family's flash rate in Hz: `ω/π`, since the rectified envelope peaks twice per sine
-/// cycle.
+/// Twinkle family flash rate in Hz (`TWINKLE_OMEGA / π`).
 pub(crate) const TWINKLE_FLASH_HZ: f32 = TWINKLE_OMEGA / std::f32::consts::PI;
 
-/// WCAG 2.3.1's general-flash threshold in Hz: more than three flashes in any
-/// one-second period fails, so a rate of at most 3.0 is what this crate
-/// certifies.
-///
-/// Every flash-rate law in the crate is held under it by name: the twinkle
-/// (below), the kitty-command trick flash (`trick_flash.rs`, its
-/// luminance-reversal rate const-asserted, its measured test
-/// `the_flash_stays_under_the_photosensitivity_bound`), the rainbow cursor's
-/// flare scintillation, and lightning's onset limiter and streak ripple
-/// (`cursor_glow`) — and, outside the crate, the harness card's re-show
-/// bound (`aterm-gui`'s `claude_card::RESHOW_MS`), re-exported at the crate
-/// root for it.
+/// WCAG 2.3.1 general-flash threshold in Hz certified by this crate.
 pub const TWINKLE_FLASH_BOUND_HZ: f32 = 3.0;
 
 /// Retuning [`TWINKLE_OMEGA`] past the photosensitivity bound stops the build.
@@ -543,27 +409,19 @@ const _: () = assert!(
     "the unified twinkle flashes over the WCAG 2.3.1 general-flash bound"
 );
 
-/// The one twinkle: a star's brightness multiplier at `age_s` seconds of life
-/// on its own `phase` (radians; seed per star so a field blinks out of step).
-/// Driven by age, never a frame counter, so the rate is the same at any refresh
-/// rate; `twinkle_law_stays_under_the_photosensitivity_bound` measures the
-/// rate.
+/// Brightness multiplier of a twinkling star at `age_s` seconds and `phase` radians.
 #[inline]
 pub(crate) fn twinkle_env(age_s: f32, phase: f32) -> f32 {
     TWINKLE_FLOOR + TWINKLE_DEPTH * (age_s * TWINKLE_OMEGA + phase).sin().abs()
 }
 
-/// Whether this twinkle is at its peak, when a star throws its diffraction
-/// glints: a fraction of the envelope's own range, so a depth retune cannot
-/// change the glint duty.
+/// Whether a twinkle envelope multiplier `env` is within the peak glint gate.
 #[inline]
 pub(crate) const fn twinkle_peak(env: f32) -> bool {
     env >= TWINKLE_FLOOR + TWINKLE_DEPTH * TWINKLE_GLINT_FRAC
 }
 
-/// The additive star's integer arm thickness (px) for half-length `arm`, from
-/// [`STAR_WAIST`], floored at the 1 px hairline, so only hero grains carry
-/// visible mass.
+/// Integer arm thickness (px) of the additive star for half-length `arm`.
 #[inline]
 pub(crate) fn star_waist_px(arm: i32) -> i32 {
     ((2.0 * arm as f32 * STAR_WAIST).round() as i32).max(1)
@@ -575,37 +433,30 @@ pub(crate) fn star_core_px(arm: i32) -> i32 {
     ((2.0 * arm as f32 * STAR_CORE).round() as i32).max(1)
 }
 
-/// The additive star's integer body half-length (px), the full-coverage run of
-/// an arm, from [`STAR_TAPER_BODY`]. Floored at 1 and capped at the arm, so a
-/// 1 px arm is all body.
+/// Integer full-coverage body half-length (px) of the additive star for half-length `arm`.
 #[inline]
 pub(crate) fn star_body_px(arm: i32) -> i32 {
     ((arm as f32 * STAR_TAPER_BODY).round() as i32).clamp(1, arm)
 }
 
-/// Which paint a piece of the star takes ([`star_pieces`]): its coverage is
-/// the star's times the part's share, so a frame recolours a star by these
-/// alone.
+/// Which paint a piece of the star takes ([`star_pieces`]).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum StarPart {
     /// A needle's full-coverage body through the crossing.
     Body,
     /// The nucleus.
     Core,
-    /// Span `step` of a point, at `taper` of the body's coverage
-    /// ([`star_taper_cov`] at the span's midpoint).
+    /// Span `step` of a point at `taper` of the body's coverage.
     Tip { step: u8, taper: f32 },
     /// A diagonal glint dot.
     Glint,
 }
 
-/// How many distinct paints a star's pieces take ([`StarPart::id`]): the
-/// body, the nucleus, each point span, the glints.
+/// Number of distinct paints taken by a star's pieces ([`StarPart::id`]).
 pub(crate) const STAR_PAINTS: usize = 3 + STAR_TAPER_STEPS as usize;
 
 impl StarPart {
-    /// The part's paint id, `0..STAR_PAINTS`: the body `0`, the nucleus `1`,
-    /// point span `k` `2 + k`, a glint the last.
+    /// Paint index in `0..STAR_PAINTS`.
     #[must_use]
     #[inline]
     pub(crate) const fn id(self) -> u8 {
@@ -618,8 +469,7 @@ impl StarPart {
     }
 }
 
-/// One piece of a star: a rectangle `[x, x + w) × [y, y + h)` relative to the
-/// star's centre, and its part.
+/// One rectangular piece `[x, x + w) × [y, y + h)` of a star relative to its centre.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct StarPiece {
     pub(crate) part: StarPart,
@@ -629,8 +479,7 @@ pub(crate) struct StarPiece {
     pub(crate) h: i32,
 }
 
-/// The most pieces one star has: two body bars, the nucleus, four spans a
-/// point step, four glints.
+/// Maximum number of pieces in one star.
 pub(crate) const STAR_PIECES_MAX: usize = 3 + 4 * STAR_TAPER_STEPS as usize + 4;
 
 /// A star's pieces in the order they are laid ([`star_pieces`]).
@@ -649,20 +498,7 @@ impl std::ops::Deref for StarPieces {
     }
 }
 
-/// THE STAR'S GEOMETRY, the one source of it: the pieces of the 4-point
-/// twinkle of half-length `arm` (glints when `gold`), relative to its centre,
-/// in the order every rasterizer lays them — the horizontal body, the
-/// vertical body, the nucleus, then per point step the horizontal and the
-/// vertical span right/down of the crossing and then left/up of it, then the
-/// four glints. Each needle is a full-coverage body through the crossing at
-/// the shared waist ([`STAR_TAPER_BODY`], [`star_waist_px`]) running into
-/// [`STAR_TAPER_STEPS`] spans at most that dim toward [`STAR_TIP_COV`] and
-/// thin with them. An even thickness is biased up-left by the integer half
-/// so the centre stays on the centre pixel; at the 1 px floor a needle is a
-/// hairline. No pieces for an arm under 1.
-///
-/// [`push_twinkle_star`] (the cursor family's stars), the harness card's
-/// stars and the card's art registry lay exactly these.
+/// Compute the geometry pieces of the 4-point twinkle star of half-length `arm`.
 #[must_use]
 pub(crate) fn star_pieces(arm: i32, gold: bool) -> StarPieces {
     let none = StarPiece {
@@ -688,21 +524,14 @@ pub(crate) fn star_pieces(arm: i32, gold: bool) -> StarPieces {
     let b = star_body_px(arm);
     push(StarPart::Body, -b, -half, 2 * b + 1, t);
     push(StarPart::Body, -half, -b, t, 2 * b + 1);
-    // Nucleus: on additive light the crossing supplies part of it and this
-    // completes it. Laid before the points.
     let c = star_core_px(arm);
     let cc = (c - 1) / 2;
     push(StarPart::Core, -cc, -cc, c, c);
-    // The points: each arm runs from the body to the tip in equal spans, each
-    // dimmer (and, with thickness to spare, thinner) than the last. Two spans
-    // per step, one per side of the crossing.
     let run = arm - b;
     let steps = run.clamp(0, STAR_TAPER_STEPS);
     for k in 0..steps {
-        let d0 = b + run * k / steps; // last px of the previous span
-        let d1 = b + run * (k + 1) / steps; // last px of this one
-        // The ramp runs over the POINT — full where the body ends,
-        // [`STAR_TIP_COV`] at the tip — sampled at this span's midpoint.
+        let d0 = b + run * k / steps;
+        let d1 = b + run * (k + 1) / steps;
         let taper = star_taper_cov(((d0 + d1) as f32 * 0.5 - b as f32) / run as f32);
         let tt = ((t as f32 * taper).round() as i32).max(1);
         let th = (tt - 1) / 2;
@@ -711,7 +540,6 @@ pub(crate) fn star_pieces(arm: i32, gold: bool) -> StarPieces {
             step: k as u8,
             taper,
         };
-        // `d0 + 1` runs right/down from the body; `-d1` mirrors it.
         for off in [d0 + 1, -d1] {
             push(part, off, -th, len, tt);
             push(part, -th, off, tt, len);
@@ -726,25 +554,7 @@ pub(crate) fn star_pieces(arm: i32, gold: bool) -> StarPieces {
     out
 }
 
-/// The one star: a 4-point twinkle, a horizontal and a vertical needle crossing
-/// at `(sx, sy)` on a small nucleus, plus four dim diagonal glint dots when
-/// `gold` ([`star_pieces`], the one geometry). Each needle is a full-coverage
-/// body through the crossing ([`STAR_TAPER_BODY`]) running into points that
-/// dim toward [`STAR_TIP_COV`] and thin with them (see the taper notes above).
-///
-/// Every 4-point star goes through here (rainbow kitty typing starfield, glide
-/// stars, jump-landing burst, shooting-star heads, Beam's stardust, the comet's
-/// glint, Sparkle's star grains), so only colour and size vary with context.
-/// Waist ([`STAR_WAIST`]), nucleus ([`STAR_CORE`]) and glint offset
-/// ([`STAR_GLINT`]) are shared with `cursor_glow`'s source-over
-/// `push_twinkle_over`. This one is hard-edged and additive: the crossing
-/// supplies part of the nucleus, and the core rect at [`STAR_CORE_ADD`]
-/// finishes it without clipping to white. A point span whose light rounds to
-/// nothing ends the points: no later span is laid.
-///
-/// Window-absolute, via [`push_fx_rect`]. Returns `false` when the quad budget
-/// ran out: it is checked before every piece but the first, so a truncated
-/// star keeps its bodies and its nucleus and loses its faint tips.
+/// Push a 4-point additive twinkle star centred at `(sx, sy)` with half-length `arm`.
 #[allow(
     clippy::too_many_arguments,
     reason = "output + geometry + centre + arm + coverage + glint + colour + budget; \
@@ -798,8 +608,7 @@ pub(crate) fn push_twinkle_star(
     true
 }
 
-/// Channel-weighted lit-pixel sum of a quad batch — the effect test suites'
-/// shared brightness metric.
+/// Channel-weighted lit-pixel sum of a quad batch.
 #[cfg(test)]
 pub(crate) fn ink(out: &[GlowQuad]) -> u64 {
     out.iter()
@@ -810,13 +619,7 @@ pub(crate) fn ink(out: &[GlowQuad]) -> u64 {
         .sum()
 }
 
-/// The worst WCAG contrast against `ground` over one caret cell, window px
-/// `(x, y, w, h)`: the block `fill` painted first, then every quad composited
-/// OVER it by its own mode (`alpha == 0` a saturating add, else source-over).
-/// Harsher than the renderer's usual order, which draws the opaque block
-/// last; it is the case a translucent cursor or the GPU bloom meets, so a
-/// body that passes here keeps its caret legible under either. Quads are read
-/// flat (`color`/`alpha`), as these emitters push them.
+/// Worst WCAG contrast against `ground` over one caret cell at `(x, y, w, h)`.
 #[cfg(test)]
 pub(crate) fn caret_cell_worst_contrast(
     fill: u32,
@@ -868,9 +671,6 @@ mod tests {
     }
 
     /// Only additive zero light is skipped: a source-over quad that rounds to black still darkens.
-    /// the cell by `a`, so it must not be dropped (a light-theme tail pulling its
-    /// hue toward black would get a one-cell hole). Only additive zero light
-    /// (`alpha == 0`) may be skipped.
     #[test]
     fn a_source_over_quad_that_rounds_to_black_still_darkens() {
         let shade = 0x0003_0201;
@@ -895,10 +695,8 @@ mod tests {
     }
 
     /// The envelope's measured flash rate matches [`TWINKLE_FLASH_HZ`]: `|sin|` peaks twice per
-    /// sine cycle, so dropping the rectification would halve it.
     #[test]
     fn twinkle_law_stays_under_the_photosensitivity_bound() {
-        // Count bright peaks over ten seconds.
         let (dt, span) = (1.0f32 / 240.0, 10.0f32);
         let n = (span / dt) as usize;
         let mut peaks = 0usize;
@@ -918,7 +716,6 @@ mod tests {
     }
 
     /// The arm conversion truncates: at every shipping cell height the heaviest named grain is
-    /// a hairline, and somewhere in that band rounding would fatten it.
     #[test]
     fn the_one_arm_conversion_truncates_and_floors() {
         assert_eq!(
@@ -927,7 +724,6 @@ mod tests {
             "the conversion must truncate, not round"
         );
         assert_eq!(star_arm_px(7.0), 7);
-        // …and floors, so a tiny grain still draws a mark rather than nothing.
         assert_eq!(star_arm_px(0.2), 1);
         assert_eq!(star_arm_px(0.0), 1);
         let mut rounding_would_fatten = 0;
@@ -945,8 +741,6 @@ mod tests {
                 rounding_would_fatten += 1;
             }
         }
-        // Non-vacuous: rounding and truncating must disagree somewhere in the
-        // shipping band.
         assert!(
             rounding_would_fatten > 0,
             "no shipping cell height distinguishes truncation from rounding — \
@@ -955,7 +749,6 @@ mod tests {
     }
 
     /// The additive star's proportions (arm and waist, nucleus, glint offset and dimming)
-    /// come from the shared constants.
     #[test]
     fn the_additive_star_draws_the_family_silhouette() {
         let g = geom();
@@ -972,8 +765,6 @@ mod tests {
             0x00FF_FFFF,
             4096
         ));
-        // The body: the arm's full-coverage run through the crossing, at the shared waist
-        // and the shared body fraction.
         let t = star_waist_px(arm);
         let b = star_body_px(arm);
         let span = |q: &GlowQuad| (i32::from(q.x), i32::from(q.x) + i32::from(q.w));
@@ -987,9 +778,6 @@ mod tests {
             t,
             "the horizontal body left the shared waist"
         );
-        // The arm still reaches `arm` px either side: the taper dims the point,
-        // it does not shorten the star. Measured as the union of the row's lit
-        // columns, so body and points must be contiguous.
         let full_span = 2 * arm + 1;
         let row: Vec<_> = out
             .iter()
@@ -1000,9 +788,6 @@ mod tests {
             (sx - arm..=sx + arm).all(lit) && !lit(sx - arm - 1) && !lit(sx + arm + 1),
             "the tapered arm does not span exactly {full_span} px"
         );
-        // The points: every span past the body is dimmer than the body, dimming
-        // monotonically outward, ending near the shared tip coverage (read off
-        // the right-hand point).
         let mut point: Vec<_> = row
             .iter()
             .filter(|q| span(q).0 > sx + b)
@@ -1019,8 +804,6 @@ mod tests {
             );
             prev = *c;
         }
-        // Spans are sampled at their midpoints, so the outermost never lands
-        // exactly on the tip coverage; it must sit in the ramp's bottom half.
         let tip = f32::from(cov) * star_taper_cov(1.0);
         let midway = f32::from(cov) * star_taper_cov(0.5);
         assert!(
@@ -1028,14 +811,12 @@ mod tests {
             "the outermost span carries {prev}, outside the ramp's bottom half \
              ({tip:.0}..={midway:.0}) — the point is not reaching the shared tip"
         );
-        // Nucleus, at the shared core extent and its additive share.
         let c = star_core_px(arm);
         let core = premul_rgb(0x00FF_FFFF, (f32::from(cov) * STAR_CORE_ADD) as u8);
         assert!(
             out.iter().any(|q| i32::from(q.w) == c && q.color == core),
             "no nucleus at the shared core extent"
         );
-        // Glints: four, on the diagonals, at the shared offset and dimming.
         let d = ((arm as f32 * STAR_GLINT).round() as i32).max(1);
         let dim = premul_rgb(0x00FF_FFFF, (f32::from(cov) * STAR_GLINT_COV) as u8);
         for (ox, oy) in [(-d, -d), (d, -d), (-d, d), (d, d)] {
@@ -1048,7 +829,6 @@ mod tests {
                 "no glint at {ox},{oy}"
             );
         }
-        // A star with no gold half throws no glints.
         let mut plain = Vec::new();
         assert!(push_twinkle_star(
             &mut plain,
@@ -1069,8 +849,6 @@ mod tests {
     }
 
     /// The windowed-walk ramp (`windows(2)` walk, divide guard, raw-crest fall-through): the
-    /// byte-identity oracle for the branchless [`ramp_5stop`]. Do not rewrite it to call the
-    /// live code.
     fn walked_ramp(stops: &[(f32, u32); 5], t: f32) -> u32 {
         let t = t.clamp(0.0, 1.0);
         for w in stops.windows(2) {
@@ -1100,11 +878,8 @@ mod tests {
     }
 
     /// The branchless ramps are bit-equal to the walk (frame fingerprints miss a one-count
-    /// drift): a prime-strided march over the f32 bit space, a ±16Ki-ULP band around every stop
-    /// with its sign-bit mirror, and the named specials.
     #[test]
     fn ramp_rewrite_is_bit_identical_to_the_stop_walk() {
-        // 4099 is prime, so the probes never lock onto a mantissa stride.
         for bits in (0..=u32::MAX).step_by(4099) {
             assert_ramps_match_walk(bits);
         }
@@ -1112,7 +887,6 @@ mod tests {
             let b = anchor.to_bits();
             for bits in b.saturating_sub(16_384)..=b.saturating_add(16_384) {
                 assert_ramps_match_walk(bits);
-                // Sign-bit mirrors all clamp to 0.0, and must clamp identically.
                 assert_ramps_match_walk(bits | 0x8000_0000);
             }
         }
@@ -1124,7 +898,7 @@ mod tests {
             f32::MIN_POSITIVE,
             -f32::MIN_POSITIVE,
             f32::EPSILON,
-            f32::from_bits(1), // the smallest subnormal
+            f32::from_bits(1),
             -0.0,
             2.0,
             f32::MAX,

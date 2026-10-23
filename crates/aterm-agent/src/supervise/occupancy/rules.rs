@@ -203,6 +203,9 @@ impl Books {
     pub fn hold(&mut self, since_ms: i64) {
         if self.hold_since_ms != Some(since_ms) {
             self.hold_since_ms = Some(since_ms);
+            if super::fault::armed(super::fault::Fault::DedupeByRule) {
+                return;
+            }
             self.nudged = false;
             self.rooms.clear();
         }
@@ -300,8 +303,27 @@ fn holds_but_machine(rule: RuleId, hold: HoldSeen, books: &Books, now_ms: i64) -
 
 /// THE DECISION AT A BREAK at `now_ms` ([module docs](self)): each rule's verdict, in
 /// [`RuleId::ALL`]'s order. `books` must be of `hold` ([`Books::hold`]). A cap is judged before
-/// the machine: a spent `hold-room` needs no reading to be said spent.
+/// the machine: a spent `hold-room` needs no reading to be said spent. `OccupancyDoor`'s
+/// `Intend` is enabled where this says [`Verdict::Due`] (the anchor binds that verdict; the
+/// intent row itself is the typing path's), and its `Lapse` is a due rule whose condition no
+/// longer holds ([`Verdict::Quiet`]: dropped, never told late).
 #[must_use]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "OccupancyDoor",
+        action = "Intend",
+        project = "conformance_occupancy::project"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "OccupancyDoor",
+        action = "Lapse",
+        project = "conformance_occupancy::project"
+    )
+)]
 pub fn decide(
     r: &OccupancyReading,
     hold: Option<HoldSeen>,

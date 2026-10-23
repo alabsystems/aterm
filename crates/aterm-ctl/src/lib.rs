@@ -1,112 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `aterm-ctl`: a small, dependency-free client for the aterm introspection control socket
-//! (protocol v1).
-//!
-//! The protocol is newline-delimited text: one request line (`"VERB [args...]\n"`) and one
-//! response. This client frames a request from the command line, prints the relevant part
-//! of the response, and maps `OK`/`ERR` onto the exit status. Besides `std` it uses only
-//! workspace crates: `aterm-uds` (the portable socket stream), `aterm-types` (socket naming
-//! and discovery shared with the server) and `aterm-codec` (the wire's escapes).
-//! and discovery shared with the server).
-//!
-//! # Usage
-//!
-//! ```text
-//! aterm-ctl [--sock PATH | --pid PID] [--timeout SECS] <verb> [args...]
-//! ```
-//!
-//! The socket is `--sock PATH`, else `--pid PID` (`<dir>/aterm-<PID>.sock`), else, inside an
-//! aterm session, the instance hosting the calling terminal (`$ATERM_PARENT_SESSION_ID`'s
-//! graph entry `<dir>/graph/<sid>`), else the `latest` alias `<dir>/aterm.sock`, falling
-//! back to the newest `<dir>/aterm-<pid>.sock` that accepts when the alias is dead. `<dir>`
-//! is [`aterm_uds::control_socket_dir`].
-//!
-//! The server accepts only same-uid peers presenting a per-launch capability token, read
-//! from the file beside the socket ([`control_socket::token_names_for_sock`]) and sent as
-//! `AUTH <hex>\n` first on every connection.
-//!
-//! The verb reference is generated from `aterm_types::control_verbs` (`aterm ctl --help`).
-//! The discovery verbs `instances`, `ls`, `windows` and `mux` are answered by this client;
-//! `--sock`/`--pid` scope them to the addressed instance.
-//!
-//! # `image` and `window` are disjoint
-//!
-//! * `image [path]` captures aterm's own client frame, including
-//!   compiled native-app surfaces: the current application-render artifact. In an
-//!   opaque window it is the destination the window's own application present
-//!   submitted, cut to the frame; `image plain`, a translucent window and headless
-//!   get a re-render through the renderer and composition rules that present uses.
-//!   It has no native OS chrome, works headless and never needs OS
-//!   screen-capture permission.
-//! * `window [<target>] [path]` captures a full-window artifact with native
-//!   platform chrome: macOS photographs the composited window through
-//!   CoreGraphics; Windows stitches chrome around a `PrintWindow` client capture
-//!   from the exact client destination from a successful application present.
-//!   Either way it does not observe compositor selection, colour management,
-//!   scanout or occlusion. It photographs aterm's own window, so it
-//!   needs no Screen Recording permission on macOS; do not grant one for it (a
-//!   held grant re-prompts on a cooldown since macOS 15).
-//!
-//! # Response framing
-//!
-//! Output follows the verb's framing in [`aterm_types::control_verbs::framing_of`], the
-//! table the server answers from:
-//!
-//! * Lines: `"OK <n>\n"` then `<n>` data lines, which are printed; the header goes to
-//!   stderr only as a diagnostic.
-//! * Bytes (bare `cast`, bare `temporal`, `inbox get`, `outbox`): `"OK <nbytes>\n"` then a
-//!   body copied to stdout verbatim.
-//! * Push (`subscribe`): the `OK subscribe <n>` ack goes to stderr and the frames are
-//!   relayed to stdout until the watch ends.
-//! * Status: the single `OK …` line is printed.
-//!
-//! An `ERR …` response or a connection failure prints to stderr and exits 1; a server-reported
-//! timeout (`OK timeout`, or a `turn` verdict with `status=timeout`) exits 124.
-//!
-//! # Terminal-safe output
-//!
-//! "Verbatim" above is what a PIPE or a FILE gets: every byte as the server
-//! sent it, so a recording plays, a body hashes and a frame parser counts.
-//! What a TERMINAL gets is rendered: on a stdout or a stderr that is a terminal
-//! (each judged on its own, by `isatty`), every character a terminal acts on
-//! or reorders text around — C0 but `\n` and `\t`, DEL, C1, the bidi marks,
-//! embeddings, overrides and isolates, U+2028/U+2029 — and every byte that is
-//! not UTF-8 is shown as text (`\x1b`, `\r`, `\u{202e}`, `\xff`) by
-//! [`aterm_codec::tty`], the one rendering the fabric's `render::safe` shares.
-//! Printable text, non-ASCII included, is unchanged. The decision is made in
-//! two places, each the only door to its
-//! stream: [`StdoutSink`] (every stdout path) and [`stderr_prefixed`] /
-//! [`drain_refusal_tail`] (every stderr line).
-//!
-//! Why every byte and not a list of verbs: the client trusts the server to
-//! encode, and the local server does (pct-encoded fields, `visible_char`'d
-//! cells, escaped JSON), but some bytes are another party's by design — a
-//! fabric peer's mail body (round fifteen, OUT-1: it retitled the reader's tab
-//! and drew a forged `trust=human` line over the header) — and a forwarded
-//! `@<sid>` reaches another aterm (OUT-3), whose status lines, rows and bodies
-//! are its own. Rulings 2026-10-10, per verb that writes a byte or Lines
-//! payload:
-//!
-//! | verb (framing) | what the payload is | on a terminal |
-//! |---|---|---|
-//! | `inbox get <id>`, `inbox get @<off>` (Bytes) | a fabric peer's message body, raw by contract | rendered |
-//! | `temporal [<tick>] [trim]` (Bytes) | a past screen's text: what programs printed | rendered (bidi is all it can change) |
-//! | `cast` (Bytes) | an asciicast v2 recording for `asciinema play -` or a file | rendered; the server's JSON escape leaves nothing in an honest one to change |
-//! | `outbox [<max>]` (Bytes, bridge-only) | local posts' bodies, for the bridge's pipe | rendered |
-//! | `subscribe` (Push) | frames; `bytes` frames carry a program's raw output | rendered: raw it would drive the reader's terminal and could overwrite the `sub`/`EVENT` lines being watched; a frame parser reads a pipe, where `BYTES <len>` still counts raw bytes |
-//! | `text`, `screen`, `offscreen`, `search`, `selection`, `blocktext`, `line(s)` (Lines/Status) | screen text: C0/C1 already spaces (`visible_char`), bidi faithful | rendered (a screen's bidi override cannot reorder the reader's line) |
-//! | `blocks`, `timeline`, `history`, `sessions`, `who`, `exits`, `inbox`, `topic`, `trail`, `family`, `edges`, `grants`, `flows`, `modes`, `resizes`, `turn`, `kitty`, `appstatus`, `messages`, `chrome`, `controls`, `panes`, `inspect`, `privacy`, `help`, `verbs` (Lines) | rows of pct-encoded or sanitized fields | rendered; the identity on an honest server's rows |
-//! | every `--json` form, `cast frames`, `cast drift`, `video frames` (Lines) | JSON (escaped by `aterm_codec::json`), path and verdict rows | rendered; the identity on an honest server's rows |
-//! | `image read`, `image --bytes` (Lines) | PNGs as base64 | rendered; base64 is ASCII, so the identity |
-//! | every Status verb, every `OK`/`ERR` line and refusal tail | the server's one line | rendered: OUT-3 |
-//! | `ls`, `sessions`, `windows`, `instances`, `conn`, `cast drift --file` (client-answered) | rows the client built from servers' fields | rendered; the identity on an honest server's fields |
-//!
-//! Binary meant for a file or a pipe (recordings, images, feeds, JSON) keeps
-//! its bytes where it is meant to go; on a terminal there is no parser to
-//! keep them for, and the rendering is the identity on what an honest server
-//! sends — so one rule covers every verb, and no verb can be forgotten.
+//! `aterm ctl` CLI client, control-socket discovery, and verb execution.
 #![cfg_attr(
     test,
     allow(
@@ -125,33 +20,24 @@ use aterm_types::control_socket;
 use aterm_types::control_verbs::{MAX_REQUEST_LINE, MAX_TASK_BYTES};
 use aterm_uds::CtlStream;
 
-/// The `aterm-askpass` role: the `SUDO_ASKPASS` helper for macOS sessions
-/// (`docs/DESIGN-sudo-askpass-2026-10-15.md`).
+/// The `aterm-askpass` role.
 pub mod askpass;
 pub use askpass::main_entry as askpass_main_entry;
 pub mod census;
 mod conn;
 pub use conn::conn_main_entry;
 pub use conn::resource_run_main_entry;
-/// `aterm ctl await inbox|agent`: the inbox and agent waits, re-armed past
-/// the server's bound.
 mod await_legs;
-/// `aterm ctl await task`: one wait over workers of every instance here.
 mod await_task;
 mod drift;
-/// The `amacs` client's `edit` and `await edit` exchanges with the window
-/// hosting its tab, the wait re-armed past every bound and every update.
+/// The `amacs` client's `edit` and `await edit` exchanges with the window hosting its tab, the wait re-armed past every bound and every update.
 pub mod edit;
 mod graph_hygiene;
 pub use drift::{CastDriftFn, CastDriftJob, DriftCut, DriftPeer, LocalVerbs};
 mod redial;
 pub use redial::{EXIT_REPLACED, target_sid};
-/// `aterm ctl --host <h> …`: this Mac driving another Mac's aterm over the
-/// fleet (the step-in).
 mod remote;
 pub use remote::{DriveLink, DriveRefused, DriveStream, FleetDriveFn};
-/// `aterm ctl survey`: every session on this machine (and its fleet), rendered
-/// for a model.
 mod survey;
 pub use survey::{
     DEFAULT_BUDGET, EXCERPT_CHARS, EXCERPT_WIDE_CHARS, EXCERPTS_CUT, FLEET_WITHIN, FleetAsk,
@@ -159,12 +45,9 @@ pub use survey::{
     UNANSWERED_REASON_CHARS, agent_word_shown, survey_rank, survey_urgent,
 };
 
-/// The one-line invocation shape, shared by `--help` and the "no verb given" usage error.
 const SYNOPSIS: &str =
     "aterm-ctl [--sock PATH | --pid PID | --host H] [--timeout SECS] <verb> [args...]";
 
-/// The hand-written prose of `--help`, ending with the `VERBS:` header; [`help_text`]
-/// appends the catalog generated from [`aterm_types::control_verbs::catalog_lines`].
 const HELP_PROSE: &str = "\
 aterm-ctl — the client for aterm's control socket (protocol v1).
 
@@ -325,9 +208,6 @@ PUSH FRAMES (subscribe):
 VERBS (the protocol verb table; `<verb> --help` prints one verb's entry):
 ";
 
-/// The full `--help` text: [`HELP_PROSE`] followed by the verb catalog
-/// generated from [`aterm_types::control_verbs::catalog_lines`]. Built with
-/// `push_str` (the Trust lane (`ship trust run`) cannot lower inline `format_args!`).
 fn help_text() -> String {
     let mut s = String::from(HELP_PROSE);
     for line in aterm_types::control_verbs::catalog_lines() {
@@ -339,10 +219,6 @@ fn help_text() -> String {
     s
 }
 
-/// The client-answered verbs, a fixed block appended to `--help` after the generated
-/// catalog. Also the source `help <client verb>` answers from ([`client_help_reply`]),
-/// entry by entry: a verb line at the 4-column indent plus continuation lines at the
-/// 18-column gutter, nothing else.
 const CLIENT_VERBS: &str = "\
 \n\
 CLIENT VERBS (answered by aterm-ctl itself; not in the protocol table):
@@ -406,27 +282,18 @@ CLIENT VERBS (answered by aterm-ctl itself; not in the protocol table):
                   blocks/status note; ATERM_MUX=0 turns the check off).
 ";
 
-/// The verbs a completion script offers as the first argument: every protocol
-/// verb from `aterm_types::control_verbs::VERBS` plus the client-answered
-/// verbs, space-joined in table order.
 fn completion_verb_list() -> String {
     let mut s = String::new();
     for spec in aterm_types::control_verbs::VERBS {
         s.push_str(spec.name);
         s.push(' ');
     }
-    // The client-only verbs (`run_discovery`, `run_mux_report`).
     s.push_str("ls instances windows mux");
     s
 }
 
-/// The global flags a completion script offers: those parsed before the verb
-/// in [`real_main`]. Per-verb argument completion is out of scope.
 const COMPLETION_FLAGS: &str = "--sock --pid --timeout --help --version";
 
-/// The completion script for `shell` (`bash`/`zsh`/`fish`), or `None` for an
-/// unknown shell. Each offers [`completion_verb_list`] as the first argument
-/// plus [`COMPLETION_FLAGS`].
 fn completion_script(shell: &str) -> Option<String> {
     let verbs = completion_verb_list();
     match shell {
@@ -437,9 +304,6 @@ fn completion_script(shell: &str) -> Option<String> {
     }
 }
 
-/// Print the completion script for `shell` to stdout (exit SUCCESS), or fail with
-/// a clear `ERR` for an unknown shell name (surfaced on stderr, nonzero exit).
-/// Driven by the hidden `--completions <shell>` flag and by `install.sh`.
 fn emit_completions(shell: &str) -> io::Result<ExitCode> {
     let script = completion_script(shell).ok_or_else(unknown_shell_error)?;
     let stdout = stdout_handle();
@@ -448,8 +312,6 @@ fn emit_completions(shell: &str) -> io::Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// The error for `--completions <shell>` with an unrecognized shell name (a
-/// static message; the Trust lane (`ship trust run`) cannot lower inline `format_args!`).
 fn unknown_shell_error() -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidInput,
@@ -457,8 +319,6 @@ fn unknown_shell_error() -> io::Error {
     )
 }
 
-/// A bash completion: a `_aterm_ctl` function offering the verb set for a plain
-/// word and [`COMPLETION_FLAGS`] for a `-`-prefixed word, wired with `complete -F`.
 fn bash_completion(verbs: &str) -> String {
     let mut s = String::new();
     s.push_str("# aterm-ctl bash completion (generated by `aterm-ctl --completions bash`).\n");
@@ -480,9 +340,6 @@ fn bash_completion(verbs: &str) -> String {
     s
 }
 
-/// A zsh completion: an autoloaded `#compdef` body that offers the verb set for
-/// the first positional (via `compadd`) and describes [`COMPLETION_FLAGS`] with
-/// `_arguments`. Installed as `_aterm-ctl` on a `$fpath` directory.
 fn zsh_completion(verbs: &str) -> String {
     let mut s = String::new();
     s.push_str("#compdef aterm-ctl\n");
@@ -495,10 +352,6 @@ fn zsh_completion(verbs: &str) -> String {
     s
 }
 
-/// The zsh `_arguments` + verb-`compadd` body for the ctl surface, rendered by
-/// both the `aterm-ctl` compdef ([`zsh_completion`]) and the `aterm ctl` arm
-/// of the front-door compdef ([`front_door_completion_script`]). `indent`
-/// prefixes every line; `array` names the zsh array holding the verb set.
 fn push_zsh_ctl_arguments(s: &mut String, indent: &str, array: &str) {
     for line in [
         "local state\n",
@@ -523,8 +376,6 @@ fn push_zsh_ctl_arguments(s: &mut String, indent: &str, array: &str) {
     s.push_str("esac\n");
 }
 
-/// A fish completion: the verb set gated to the first token
-/// (`__fish_use_subcommand`) plus the global flags, all via `complete -c aterm-ctl`.
 fn fish_completion(verbs: &str) -> String {
     let mut s = String::new();
     s.push_str("# aterm-ctl fish completion (generated by `aterm-ctl --completions fish`).\n");
@@ -536,9 +387,6 @@ fn fish_completion(verbs: &str) -> String {
     s
 }
 
-/// The ctl flag lines for fish, shared by the `aterm-ctl` script and the front
-/// door's `aterm ctl` arm ([`front_door_completion_script`]). `preamble` is the
-/// per-surface `complete -c <cmd> [-n <gate>] ` prefix.
 fn push_fish_ctl_flags(s: &mut String, preamble: &str) {
     for line in [
         "-l sock -r -d 'control socket path'\n",
@@ -552,13 +400,7 @@ fn push_fish_ctl_flags(s: &mut String, preamble: &str) {
     }
 }
 
-/// The front door's completion script for `shell` (`bash`/`zsh`/`fish`), or
-/// `None` for an unknown shell. The installed command is `aterm` (the installer
-/// keeps `aterm-ctl` off `PATH`). `verbs`/`flags` are `aterm`'s own
-/// first-position surface, supplied by the `aterm` crate; the `aterm ctl <TAB>`
-/// arm renders from [`completion_verb_list`] / [`COMPLETION_FLAGS`].
-///
-/// Contract (install.sh): the zsh script's first line is `#compdef aterm`.
+/// The front door's completion script for `shell` (`bash`/`zsh`/`fish`), or `None` for an unknown shell.
 #[must_use]
 pub fn front_door_completion_script(
     shell: &str,
@@ -575,7 +417,6 @@ pub fn front_door_completion_script(
     }
 }
 
-/// Space-join `words` — the shape every shell's word-list slot takes.
 fn join_words(words: &[&str]) -> String {
     let mut s = String::new();
     for (i, word) in words.iter().enumerate() {
@@ -587,9 +428,6 @@ fn join_words(words: &[&str]) -> String {
     s
 }
 
-/// The front-door bash completion: `_aterm` offers the front-door verbs at the
-/// first position, the front-door flags for a `-` word, and after a
-/// first-position `ctl` the ctl verb and flag sets.
 fn front_door_bash(verbs: &str, flags: &[(&str, &str)], ctl_verbs: &str) -> String {
     let mut s = String::new();
     s.push_str("# aterm bash completion (generated by `aterm --completions bash`).\n");
@@ -625,8 +463,6 @@ fn front_door_bash(verbs: &str, flags: &[(&str, &str)], ctl_verbs: &str) -> Stri
     s
 }
 
-/// Space-join the flag names out of `(flag, description)` pairs (bash offers
-/// bare words; the descriptions are zsh/fish material).
 fn join_flag_names(flags: &[(&str, &str)]) -> String {
     let mut s = String::new();
     for (i, (flag, _)) in flags.iter().enumerate() {
@@ -638,9 +474,6 @@ fn join_flag_names(flags: &[(&str, &str)]) -> String {
     s
 }
 
-/// The front-door zsh completion: `#compdef aterm`, the front-door verb/flag
-/// sets via `_arguments`, and a first-word `ctl` dispatch onto the ctl surface
-/// ([`push_zsh_ctl_arguments`]).
 fn front_door_zsh(verbs: &str, flags: &[(&str, &str)], ctl_verbs: &str) -> String {
     let mut s = String::new();
     s.push_str("#compdef aterm\n");
@@ -677,9 +510,6 @@ fn front_door_zsh(verbs: &str, flags: &[(&str, &str)], ctl_verbs: &str) -> Strin
     s
 }
 
-/// The front-door fish completion: front-door verbs/flags gated to the first
-/// token (`__fish_use_subcommand`), plus the ctl verb/flag sets gated behind a
-/// seen `ctl` ([`push_fish_ctl_flags`]).
 fn front_door_fish(verbs: &str, flags: &[(&str, &str)], ctl_verbs: &str) -> String {
     let mut s = String::new();
     s.push_str("# aterm fish completion (generated by `aterm --completions fish`).\n");
@@ -694,7 +524,6 @@ fn front_door_fish(verbs: &str, flags: &[(&str, &str)], ctl_verbs: &str) -> Stri
         &mut s,
         "complete -c aterm -n '__fish_seen_subcommand_from ctl' ",
     );
-    // `aterm conn` lives in this crate, so its subverbs complete here, behind a seen `conn`.
     s.push_str("complete -c aterm -n '__fish_seen_subcommand_from conn' -a '");
     s.push_str(conn::CONN_SUBVERBS);
     s.push_str("'\n");
@@ -708,9 +537,7 @@ fn front_door_fish(verbs: &str, flags: &[(&str, &str)], ctl_verbs: &str) -> Stri
     s
 }
 
-/// The front door's `--completions <shell>`: print the `aterm` completion
-/// script to stdout, or an error to stderr (exit FAILURE) for a missing or
-/// unknown shell name. `verbs`/`flags` as in [`front_door_completion_script`].
+/// The front door's `--completions <shell>`.
 pub fn front_door_completions_entry(
     shell: Option<&str>,
     verbs: &[&str],
@@ -718,11 +545,8 @@ pub fn front_door_completions_entry(
 ) -> ExitCode {
     match front_door_completions_result(shell, verbs, flags) {
         Ok(code) => code,
-        // `aterm --completions zsh | head`: the reader has what it wanted.
         Err(e) if is_stdout_closed(&e) => ExitCode::SUCCESS,
         Err(e) => {
-            // Manual `eprintln!("aterm: {e}")` (the Trust lane (`ship trust run`) cannot lower
-            // inline `format_args!`); a failed write is ignored while exiting.
             let stderr = io::stderr();
             let mut err = stderr.lock();
             let _ = err.write_all(b"aterm: ");
@@ -733,8 +557,6 @@ pub fn front_door_completions_entry(
     }
 }
 
-/// [`front_door_completions_entry`]'s fallible core: a missing and an unknown
-/// shell name are its two errors (the entry prefixes `aterm: `).
 fn front_door_completions_result(
     shell: Option<&str>,
     verbs: &[&str],
@@ -758,73 +580,31 @@ fn front_door_completions_result(
     Ok(ExitCode::SUCCESS)
 }
 
-// The front door's single-instance forward
-//
-// `aterm new-tab` under `windowing_behavior = "attach"` needs `aterm ctl`'s instance
-// resolution and liveness answer, but not [`main_entry`]: it needs a reachability probe
-// before routing, silence on success, and the server's `ERR` text as a value.
-
-/// The control socket of the instance a front-door request should go to, or
-/// `None` when nothing is reachable.
+/// The control socket of the instance a front-door request should go to, or `None` when nothing is reachable.
 #[must_use]
 pub fn front_door_instance() -> Option<String> {
     let path = resolve_path(None, None, env::var(SELF_SID_ENV).ok()).ok()?;
     front_door_probe(&path)
 }
 
-/// The liveness probe behind [`front_door_instance`], returning the resolved path so the
-/// caller forwards to exactly the instance that answered. On Windows the `aterm.sock` alias
-/// is a pointer file (`aterm_uds::latest`), resolved before connecting.
 #[must_use]
 fn front_door_probe(path: &str) -> Option<String> {
     let resolved = aterm_uds::latest::resolve(path);
     CtlStream::connect(&resolved).is_ok().then_some(resolved)
 }
 
-/// Hand one request line to the instance at `path` and return its first reply
-/// line, trimmed (`OK …` or `ERR …`).
-///
-/// `request` must end in `\n` and contain no other line terminator (the caller
-/// frames it; `WindowRequest::control_request` refuses an unframeable cwd).
-///
-/// With a token, the request goes out only once the connect phase
-/// ([`open_accepted`]: `AUTH` plus [`ACCEPT_PROBE`]) has proved the connection
-/// served; with none there is nothing to probe and it goes straight out, which
-/// the server answers `ERR auth` (it can never open a tab). A connection
-/// parked in an undrained listen queue (a stuck accept thread, a stopped or
-/// saturated process) passes [`front_door_instance`]'s connect; had the request
-/// been written into it, the server would read it after the launcher gave up
-/// and refuse it unrun (the caller hung up), so nothing would open anywhere.
-/// A connect phase that gets no answer is a plain [`io::ErrorKind::TimedOut`],
-/// never [`front_door_delivered`]: the request was not sent, and the caller
-/// opens its own window. A connect-phase refusal (`ERR auth; …`, `ERR control
-/// server busy; retry`) is returned as the reply.
-///
-/// A ten-second deadline for each phase rather than the client's 900 s
-/// default: a hung forward is worse than a launch that opens its own window.
-///
-/// Once writing the request has begun, a failed write/flush or a missing or
-/// unreadable reply is marked [`front_door_delivered`]: the running aterm
-/// may have taken the complete request and may still act on it. An EOF or
-/// reset cannot prove otherwise. The caller must not open a second window
-/// for it. Connect-phase failure remains unmarked because no request went
-/// out; an explicit refusal read from the server remains its reply.
+/// Hand one request line to the instance at `path` and return its first reply line, trimmed.
 pub fn front_door_send(path: &str, request: &str) -> io::Result<String> {
     front_door_send_within(path, request, FRONT_DOOR_DEADLINE, FRONT_DOOR_DEADLINE)
 }
 
-/// [`front_door_send`] with `accept` bounding the connect phase and the
-/// request's write, and `reply` the wait for the answer to the request: what
-/// any one-line exchange whose answer may take longer than the front door's
-/// ten seconds runs (the `amacs` client's [`edit`] exchanges).
+/// [`front_door_send`] with `accept` bounding the connect phase and the request's write, and `reply` the wait for the answer to the request.
 pub fn front_door_send_within(
     path: &str,
     request: &str,
     accept: std::time::Duration,
     reply: std::time::Duration,
 ) -> io::Result<String> {
-    // Pinned: `path` is the instance the probe just answered, and `aterm new-tab` takes
-    // no `--pid`/`--sock` remedy.
     let stream = match open_accepted(path, TargetOrigin::Pinned, Some(accept))? {
         Acceptance::Served(stream) => stream,
         Acceptance::Refused(line) => return Ok(line),
@@ -838,8 +618,6 @@ pub fn front_door_send_within(
     };
     stream.set_read_timeout(Some(reply))?;
     allow_foreground_handoff(path);
-    // The token went with the probe. A server that hung up mid-send may have left its
-    // reason (the busy reply).
     if let Err(e) = (&stream)
         .write_all(request.as_bytes())
         .and_then(|()| (&stream).flush())
@@ -849,8 +627,6 @@ pub fn front_door_send_within(
         {
             return Ok(line);
         }
-        // `write_all` may have written the complete line before a later
-        // write/flush failed. Its error does not prove the request stayed here.
         return Err(delivered(
             e.kind(),
             format!("could not confirm the request's delivery ({e})"),
@@ -859,8 +635,6 @@ pub fn front_door_send_within(
     let mut reader = BufReader::new(&stream);
     let mut line = String::new();
     match read_status_line(&mut reader, &mut line) {
-        // The request was written. A close before its reply is not proof
-        // that the server did not act (an update can cut an admitted reply).
         Ok(0) => Err(delivered(
             io::ErrorKind::UnexpectedEof,
             "closed without answering the request".to_string(),
@@ -881,10 +655,8 @@ pub fn front_door_send_within(
     }
 }
 
-/// How long [`front_door_send`] waits for the running aterm, in each phase.
 const FRONT_DOOR_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// A [`front_door_send`] failure after request delivery became uncertain.
 #[derive(Debug)]
 struct Delivered(String);
 
@@ -900,30 +672,18 @@ fn delivered(kind: io::ErrorKind, words: String) -> io::Error {
     io::Error::new(kind, Delivered(words))
 }
 
-/// Whether a [`front_door_send`] error came after writing the request began,
-/// so the running aterm may have taken it and may still open what was asked.
+/// Whether a [`front_door_send`] error came after writing the request began.
 #[must_use]
 pub fn front_door_delivered(e: &io::Error) -> bool {
     e.get_ref().is_some_and(|inner| inner.is::<Delivered>())
 }
 
-/// Whether a line [`front_door_send`] returned is the CONNECT PHASE's refusal
-/// (`ERR auth`, with or without the token file it names, or `ERR control server
-/// busy; retry`) rather than the instance's answer to the request: the request
-/// was never sent, so nothing was decided about it and the caller acts as if no
-/// instance answered.
+/// Return whether `line` from [`front_door_send`] is a connect-phase refusal.
 #[must_use]
 pub fn front_door_refused(line: &str) -> bool {
     is_connection_refusal(line) || line.starts_with("ERR auth;")
 }
 
-/// Windows: hand our right to set the foreground window to the instance we forward to, so
-/// its `SetForegroundWindow` raises the window instead of flashing the taskbar button.
-///
-/// The OS refuses `SetForegroundWindow` from a background process;
-/// `AllowSetForegroundWindow(pid)` is the documented handoff, and the launching `aterm.exe`
-/// has the right. Best-effort. Called after the connect and before the request line,
-/// because the grant lasts only until the next input event.
 #[cfg(windows)]
 fn allow_foreground_handoff(path: &str) {
     #[link(name = "user32")]
@@ -933,18 +693,13 @@ fn allow_foreground_handoff(path: &str) {
     let Some(pid) = instance_pid_of(path) else {
         return;
     };
-    // SAFETY: a documented one-argument user32 call taking a plain pid, with no
-    // pointers or preconditions; a `0` (refusal) return is ignored.
+    // SAFETY: documented `AllowSetForegroundWindow` call taking a plain PID with no pointers.
     let _ = unsafe { AllowSetForegroundWindow(pid) };
 }
 
 #[cfg(not(windows))]
 fn allow_foreground_handoff(_path: &str) {}
 
-/// The pid of the instance a front-door socket path belongs to, from the
-/// per-instance filename `aterm-<pid>.sock`, resolving the `latest` pointer
-/// file first (`aterm_uds::latest`). `None` for an explicit `--control-sock`
-/// path or a dangling/foreign alias.
 #[cfg(windows)]
 fn instance_pid_of(path: &str) -> Option<u32> {
     let resolved = aterm_uds::latest::resolve(path);
@@ -952,67 +707,29 @@ fn instance_pid_of(path: &str) -> Option<u32> {
     control_socket::instance_pid(name)
 }
 
-/// The server-maintained `latest` alias to the newest instance's socket.
 const SOCK_FILE: &str = control_socket::LATEST_SOCK_FILE;
 
-/// The per-user directory holding the control socket and token, from
-/// [`aterm_uds::control_socket_dir`] (shared with the server). Windows:
-/// `%TMP%\aterm`, and `%TMP%\aterm-elevated` for an elevated client, which so
-/// reaches elevated instances only and an unelevated one never reaches them;
-/// Unix: `$XDG_RUNTIME_DIR/aterm`, else the per-user default
-/// ([`aterm_uds::CONTROL_SOCKET_DIR_DEFAULT`]).
 fn socket_dir() -> Option<PathBuf> {
     aterm_uds::control_socket_dir()
 }
 
-/// Environment variable naming the aterm session hosting this process's
-/// terminal (injected into every session's shell).
 const SELF_SID_ENV: &str = "ATERM_PARENT_SESSION_ID";
 
-/// In-session self-location: the socket of the instance hosting the calling
-/// terminal, from `sid`'s graph entry (`<dir>/graph/<sid>`, parsed with
-/// [`control_socket::graph_entry_sock`]). The `latest` alias names the newest
-/// instance, which need not be ours.
-///
-/// `<dir>` is the default rendezvous dir ([`socket_dir`]). The server publishes
-/// every session's graph entry there too, with the socket's absolute path, so
-/// an instance on an explicit `--control-sock` elsewhere is still found.
-///
-/// `None` outside a session or when the entry is missing. Nothing is dialled
-/// here: whether anything still listens there is for the connect that uses the
-/// socket to find ([`Targets`]), or for a caller that keeps one path, a probe
-/// ([`Targets::probed`]).
 fn self_instance_sock(self_sid: Option<&str>) -> Option<String> {
     self_instance_sock_in(&socket_dir()?, self_sid)
 }
 
-/// [`self_instance_sock`] in the rendezvous dir `dir` — also what a redial
-/// follows ([`redial::Follow::Flagless`]), against the dir the call resolved.
 fn self_instance_sock_in(dir: &Path, self_sid: Option<&str>) -> Option<String> {
-    // Only a sid the wire's grammar reads as one (`s-<hex>`) is looked up, so a
     // weird env value can never path-traverse out of the graph dir.
     graph_entry_sock_in(dir, aterm_types::control_request::Sid::parse(self_sid?)?)
 }
 
-/// The socket `<dir>/graph/<sid>` names ([`control_socket::graph_entry_sock`]),
-/// as written, with nothing dialled.
 fn graph_entry_sock_in(dir: &Path, sid: aterm_types::control_request::Sid<'_>) -> Option<String> {
     let body = std::fs::read_to_string(dir.join("graph").join(sid.as_str())).ok()?;
     control_socket::graph_entry_sock(&body)
 }
 
-/// The socket of the instance hosting the session `sid`, from its graph entry
-/// in the rendezvous dir `dir`, when that socket lies directly in `dir`: the
-/// instance a request naming `@<sid>` is answered by, dialled here instead of
-/// being relayed there by whichever instance a flagless call reaches.
-///
-/// The entry is same-uid writable, so the socket is held to the reach the
-/// relay has (a server's `resolve_sibling` confines the entry it forwards to
-/// the same way): an absolute path, one file name below a parent that
-/// canonicalizes to `dir`'s canonical path, and no symlink there. A session
-/// whose instance listens anywhere else gets the relay's answer, `ERR no such
-/// session`, from the flagless target. Nothing is dialled: whether anything
-/// still listens there is for the connect that uses it to find ([`Targets`]).
+/// The socket of the instance hosting the session `sid`.
 #[must_use]
 pub fn hosting_sock(dir: &Path, sid: aterm_types::control_request::Sid<'_>) -> Option<String> {
     let sock = graph_entry_sock_in(dir, sid)?;
@@ -1025,67 +742,28 @@ pub fn hosting_sock(dir: &Path, sid: aterm_types::control_request::Sid<'_>) -> O
     in_dir.then_some(sock)
 }
 
-/// The flagless resolution as a library entry, for other clients in the
-/// binary (aterm-link's) that must find aterm the way `aterm ctl` does.
-///
-/// The order is [`resolve_path`]'s: the instance hosting `self_sid` (its graph
-/// entry, probed for a listener, [`Targets::probed`]), then the `latest`
-/// alias `<dir>/aterm.sock`, and when that is dead the newest instance socket
-/// in the directory that accepts ([`flagless_target`]). Nothing is cached, so a
-/// caller that resolves each run follows a self-update's new socket.
-///
-/// # Errors
-///
-/// No rendezvous directory can be resolved ([`DIR_ENV_UNSET`]: `$XDG_RUNTIME_DIR`
-/// and `$HOME` unset, and off macOS `$XDG_STATE_HOME` with them).
+/// The flagless resolution as a library entry, for other clients in the binary that must find aterm the way `aterm ctl` does.
 pub fn resolve_sock_for(self_sid: Option<&str>) -> io::Result<String> {
     resolve_path(None, None, self_sid.map(str::to_string))
 }
 
-/// The instance token beside the socket at `sock` ([`read_token_at`]:
-/// no-follow, regular file, bounded). A caller about to present it reads it
-/// once connected, through [`connect_then_read_token`].
-///
-/// # Errors
-///
-/// Names the token file looked for and why it could not be read.
+/// The instance token beside the socket at `sock` ([`read_token_at`]: no-follow, regular file, bounded).
 pub fn read_token_beside(sock: &str) -> io::Result<String> {
     read_token_at(sock)
         .map_err(|(path, e)| io::Error::new(e.kind(), format!("{}: {e}", path.display())))
 }
 
-/// A connection to the control socket at `sock`, and the token beside it read only once
-/// connected, as this crate's own connect phase does ([`open_accepted`]).
-///
-/// An instance writes its token before binding its socket, so a token read after the
-/// connect names the listener that took it; one read before could name a listener the
-/// connect no longer reaches (an update's successor binds the same path with its own
-/// token). Both use the socket the `latest` alias named at connect time ([`pin_alias`]).
-///
-/// # Errors
-///
-/// The connect's own error. A connection whose token cannot be read comes back
-/// with that miss beside it, so "nothing answers" differs from "no token".
+/// A connection to the control socket at `sock`, and the token beside it read only once connected, as this crate's own connect phase does.
 pub fn connect_then_read_token(sock: &str) -> io::Result<(CtlStream, io::Result<String>)> {
     connect_then_read(sock, read_token_beside)
 }
 
-/// A connection to `sock` and the token to present on it, taken at one socket:
-/// `sock` pinned ([`pin_alias`]), connected, then `read` handed that same
-/// pinned path. The read is a parameter so a test can act at its moment.
 fn connect_then_read<T>(sock: &str, read: impl FnOnce(&str) -> T) -> io::Result<(CtlStream, T)> {
     let pinned = pin_alias(sock);
     let stream = CtlStream::connect(&pinned)?;
     Ok((stream, read(&pinned)))
 }
 
-/// The instance socket the `latest` alias at `path` names, read once, so a connection and
-/// its token belong to one instance even if the alias is republished in between.
-///
-/// Unix: a symlink whose target is a bare `aterm-<pid>.sock`
-/// ([`aterm_uds::latest::publish`]), joined to the link's directory; Windows:
-/// the pointer file ([`aterm_uds::latest::resolve`]). Any other path is
-/// returned as given.
 fn pin_alias(path: &str) -> String {
     #[cfg(unix)]
     {
@@ -1105,9 +783,6 @@ fn pin_alias(path: &str) -> String {
     }
 }
 
-/// `readlink` of the alias at `p`, retried while it answers `EINVAL` for a path
-/// that is still a symlink (macOS does so for a symlink being renamed over).
-/// Anything else (no such file, not a link) is `None` at once.
 #[cfg(unix)]
 fn read_alias(p: &Path) -> Option<PathBuf> {
     for _ in 0..8 {
@@ -1122,76 +797,27 @@ fn read_alias(p: &Path) -> Option<PathBuf> {
     None
 }
 
-// The multiplexer boundary (screen / tmux)
-//
-// aterm hosts one session per PTY; a multiplexer in it draws every pane inside that one
-// session, and `$ATERM_PARENT_SESSION_ID` rides into each pane unchanged, so flagless
-// self-location would drive the outer terminal. Inside a multiplexer, a call that names
-// its target only implicitly (flagless, `@.`, or `@self`) is refused with the outer sid and
-// the explicit form to use.
-
-/// Marker the shell integration exports when the shell it loaded into is a multiplexer
-/// (`tmux`/`screen`) child of an aterm session shell.
-///
-/// Set from inside the pane, so it exists only where the integration is sourced there (a
-/// hand-installed `source …` line, or fish's vendor `conf.d`); aterm's managed bash/zsh
-/// injection reaches only the shell aterm starts, so in a pane [`MUX_BASE_ENV`] usually
-/// decides. Its disable spellings (`0`/`off`/`no`/`none`/`false`) override a stale
-/// inherited `$TMUX`/`$STY`.
 const MUX_ENV: &str = "ATERM_MUX";
 
-/// The multiplexer environment the aterm session shell was started under,
-/// recorded by the shell integration as `"<$TMUX>|<$STY>"` and inherited by
-/// every pane.
-///
-/// A pane's own `$TMUX`/`$STY` differ from the recorded base; an aterm window launched from
-/// a pane re-stamps the base as its own and matches. This also catches a tmux with
-/// `default-terminal "xterm-256color"`, which the `TERM` heuristic cannot.
 const MUX_BASE_ENV: &str = "ATERM_MUX_BASE";
 
-/// The aterm session hosting the detected multiplexer, copied from
-/// `$ATERM_PARENT_SESSION_ID` by the integration beside [`MUX_ENV`]: the
-/// terminal a flagless call would have driven, which the refusal names. When
-/// absent, `$ATERM_PARENT_SESSION_ID` itself is the fallback.
 const MUX_OUTER_SID_ENV: &str = "ATERM_MUX_OUTER_SESSION_ID";
 
-/// tmux's per-client marker (`<socket>,<pid>,<session>`), set in every pane.
 const TMUX_ENV: &str = "TMUX";
 
-/// GNU screen's per-session marker (`<pid>.<tty>.<host>`), set in every window.
 const SCREEN_ENV: &str = "STY";
 
-/// The terminal type, corroborating `$TMUX`/`$STY`.
-///
-/// Both multiplexers rewrite `TERM` for their panes (screen `screen*`, tmux
-/// `screen-256color` by default), while aterm forces `xterm-256color` for every
-/// session shell. An aterm launched from a pane inherits `$TMUX`/`$STY`, so
-/// `TERM` is what tells it from a real pane.
 const TERM_ENV: &str = "TERM";
 
-/// The terminal program, tier 3's second corroboration: tmux 3.2+ sets `tmux` in every pane
-/// whatever `TERM` is, and aterm stamps `aterm` for every session shell.
 const TERM_PROGRAM_ENV: &str = "TERM_PROGRAM";
 
-/// A multiplexer standing between the calling shell and the aterm session a
-/// flagless call would drive.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct MuxNesting {
-    /// `tmux` or `screen` — the multiplexer around this shell.
     kind: &'static str,
-    /// The aterm session hosting it, when the environment names one. `None`: a
-    /// multiplexer with no aterm session in scope (nothing to mis-target), so
-    /// only the report mentions it.
     outer_sid: Option<String>,
-    /// Which tier saw it, as the `mux` report's `detected_by=` field:
-    /// `shell-integration` ([`MUX_ENV`]), `session-base` ([`MUX_BASE_ENV`]),
-    /// or `environment` (the `$TMUX`/`$STY`/`$TERM` heuristic).
     detected_by: &'static str,
 }
 
-/// The multiplexer a marker value or a `TERM` names, or `None` for anything
-/// else. Matches the family head (`screen`, `screen-256color`,
-/// `screen.xterm-256color`, `tmux`, `tmux-256color` …), never a substring.
 fn mux_kind(value: &str) -> Option<&'static str> {
     match value.split(['-', '.']).next().unwrap_or("") {
         "tmux" => Some("tmux"),
@@ -1200,8 +826,6 @@ fn mux_kind(value: &str) -> Option<&'static str> {
     }
 }
 
-/// The current environment's multiplexer markers as [`MUX_BASE_ENV`] spells them:
-/// `"<$TMUX>|<$STY>"`, empty for an unset side.
 fn mux_env_signature(tmux: Option<&str>, sty: Option<&str>) -> String {
     let mut sig = String::from(tmux.unwrap_or(""));
     sig.push('|');
@@ -1209,8 +833,6 @@ fn mux_env_signature(tmux: Option<&str>, sty: Option<&str>) -> String {
     sig
 }
 
-/// The multiplexer the per-pane markers name, or `None` when neither is set.
-/// `$TMUX` goes first: tmux's default `TERM` is `screen-256color`.
 fn marker_kind(tmux: Option<&str>, sty: Option<&str>) -> Option<&'static str> {
     if tmux.is_some_and(|v| !v.is_empty()) {
         Some("tmux")
@@ -1221,48 +843,18 @@ fn marker_kind(tmux: Option<&str>, sty: Option<&str>) -> Option<&'static str> {
     }
 }
 
-/// The environment values [`detect_mux_nesting`] decides from, each `None`
-/// when unset, so tests drive the decision without the process environment
-/// ([`mux_nesting_from_env`] reads the real one).
 #[derive(Debug, Clone, Copy, Default)]
 struct MuxEnv<'a> {
-    /// [`MUX_ENV`], the in-pane verdict.
     mux: Option<&'a str>,
-    /// [`MUX_BASE_ENV`], the session shell's own multiplexer environment.
     base: Option<&'a str>,
-    /// [`MUX_OUTER_SID_ENV`].
     outer_sid: Option<&'a str>,
-    /// `$TMUX`.
     tmux: Option<&'a str>,
-    /// `$STY`.
     sty: Option<&'a str>,
-    /// `$TERM`.
     term: Option<&'a str>,
-    /// [`SELF_SID_ENV`], the session identity in scope.
     self_sid: Option<&'a str>,
-    /// [`TERM_PROGRAM_ENV`].
     term_program: Option<&'a str>,
 }
 
-/// Decide whether a multiplexer sits between this shell and its aterm session,
-/// from the environment values alone.
-///
-/// Three tiers, in order:
-///
-/// 1. [`MUX_ENV`]: a verdict the integration reached inside the pane; its
-///    disable spellings win outright.
-/// 2. [`MUX_BASE_ENV`]: the session shell's own multiplexer environment,
-///    inherited by every pane; this answers in a real bash/zsh pane. A
-///    signature matching the base is a definite no (e.g. an aterm window
-///    launched from a pane); one that differs and names a multiplexer is a
-///    definite yes, `TERM` unread.
-/// 3. The `$TMUX`/`$STY` + `TERM` heuristic, for a shell with neither mark. It
-///    fires only when an aterm session identity is in scope and `TERM` (or
-///    `TERM_PROGRAM=tmux`, [`TERM_PROGRAM_ENV`]) names a multiplexer.
-///
-/// Known gap: a pre-3.2 tmux (no `TERM_PROGRAM`) with `default-terminal
-/// "xterm-256color"`, in a shell with neither mark; `aterm ctl mux` reports
-/// `mux=none` there.
 fn detect_mux_nesting(env: &MuxEnv<'_>) -> Option<MuxNesting> {
     fn set(v: Option<&str>) -> Option<&str> {
         v.filter(|s| !s.is_empty())
@@ -1289,7 +881,6 @@ fn detect_mux_nesting(env: &MuxEnv<'_>) -> Option<MuxNesting> {
         });
     }
     if let Some(base) = set(base) {
-        // Equal to the recorded base: nothing entered since. Different and marked: a
         // pane. Different with no marker (unset by hand) names no multiplexer.
         if base == mux_env_signature(tmux, sty) {
             return None;
@@ -1303,12 +894,7 @@ fn detect_mux_nesting(env: &MuxEnv<'_>) -> Option<MuxNesting> {
         }
         return None;
     }
-    // Nothing to mis-target without an aterm identity in scope (a screen in a plain xterm
-    // may drive aterm windows flaglessly). `as_ref()?` rather than an early return:
-    // `question_mark` is denied, and `outer` is moved below.
     outer.as_ref()?;
-    // Either corroboration suffices: a multiplexer-written `TERM`, or tmux 3.2+'s
-    // `TERM_PROGRAM=tmux` (aterm stamps `TERM_PROGRAM=aterm` for every session shell).
     let corroborated = set(term)
         .and_then(mux_kind)
         .or_else(|| (set(tmux).is_some() && set(term_program) == Some("tmux")).then_some("tmux"))?;
@@ -1319,7 +905,6 @@ fn detect_mux_nesting(env: &MuxEnv<'_>) -> Option<MuxNesting> {
     })
 }
 
-/// [`detect_mux_nesting`] over the real process environment.
 fn mux_nesting_from_env() -> Option<MuxNesting> {
     let var = |name: &str| env::var(name).ok();
     let (mux, base, outer_sid, tmux, sty, term, self_sid, term_program) = (
@@ -1344,33 +929,14 @@ fn mux_nesting_from_env() -> Option<MuxNesting> {
     })
 }
 
-/// The client-answered verbs, absent from the shared verb table; they address no session.
 const MUX_EXEMPT_VERBS: [&str; 4] = ["instances", "ls", "windows", "mux"];
 
-/// Whether `verb` addresses no session, so a multiplexer cannot redirect it.
-///
-/// Read from the SHARED verb table rather than a second hand-kept list:
-/// `Target::Meta` is the table's own name for "self-scoped or fleet-wide; a
-/// selector is meaningless here" (`version`, `sessions`, `who`, `whoami`,
-/// `grant`, `flows`, `help`, `verbs`, …). Refusing those inside a
-/// multiplexer protected nothing — there is no session to point at the wrong
-/// terminal — and the refusal's own advice made it worse: `aterm ctl @<sid>
-/// sessions` is answered `ERR denied: sessions takes no @<sid>` by the server,
-/// because a selector on an owner-only meta verb is exactly what it rejects.
 fn addresses_no_session(verb: &str) -> bool {
     MUX_EXEMPT_VERBS.contains(&verb)
         || aterm_types::control_verbs::spec(verb)
             .is_some_and(|s| matches!(s.target, aterm_types::control_verbs::Target::Meta))
 }
 
-/// Whether the request names its target only implicitly, following
-/// `$ATERM_PARENT_SESSION_ID` or the active tab.
-///
-/// * `@self` / `@env`: always implicit; inside a pane the claim "the session I
-///   am in" is false whatever socket was chosen.
-/// * no selector, or `@.`: implicit only while no `--sock`/`--pid` pins the
-///   instance.
-/// * a concrete `@<sid>`: never implicit.
 fn targets_own_session_implicitly(parts: &[String], sock: Option<&str>, pid: Option<u32>) -> bool {
     let Some(first) = parts.first() else {
         return false;
@@ -1382,10 +948,8 @@ fn targets_own_session_implicitly(parts: &[String], sock: Option<&str>, pid: Opt
     {
         return false;
     }
-    // `subscribe` carries its selector second.
     let sel_idx = usize::from(first == "subscribe");
     let selector = parts.get(sel_idx).filter(|t| t.starts_with('@'));
-    // Only the flagless case leaves the target to aterm.
     let unpinned = sock.is_none() && pid.is_none();
     match selector {
         Some(sel) if sel.split(',').any(|e| e == "@self" || e == "@env") => true,
@@ -1395,10 +959,6 @@ fn targets_own_session_implicitly(parts: &[String], sock: Option<&str>, pid: Opt
     }
 }
 
-/// The refusal for an implicitly self-targeting call inside a multiplexer: what is wrong,
-/// which session it would have driven, and the explicit forms. Every remedy it names
-/// passes the guard: `@<sid>` for the verbs that reach it (the `Target::Meta` verbs never
-/// do, see [`addresses_no_session`]), and `--pid`/`--sock` as deliberate pins.
 fn nested_self_drive_error(n: &MuxNesting) -> io::Error {
     let sid = n.outer_sid.as_deref().unwrap_or("<unknown>");
     let mut msg = String::from("ERR this shell is inside ");
@@ -1419,13 +979,8 @@ fn nested_self_drive_error(n: &MuxNesting) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, msg)
 }
 
-/// `0` silences the one-time boundary notice, spelled as the shell integration
-/// spells it so one value silences both halves; [`MUX_ENV`]'s disable values
-/// turn the whole guard off instead.
 const MUX_NOTICE_ENV: &str = "ATERM_MUX_NOTICE";
 
-/// The one-time boundary notice: word for word the shell integration's, after the
-/// [`stderr_line`] `aterm-ctl: ` prefix.
 fn mux_boundary_notice(kind: &str) -> String {
     let mut msg = String::from("inside ");
     msg.push_str(kind);
@@ -1436,13 +991,6 @@ fn mux_boundary_notice(kind: &str) -> String {
     msg
 }
 
-/// The stamp making the notice once per multiplexer, keyed by the
-/// multiplexer's own id so all its panes share it.
-///
-/// Path, key and sanitising match the shell integration byte for byte
-/// (`${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/aterm/mux-notice/<kind>-<id>`, id =
-/// `${TMUX:-${STY:-$TERM}}` with every character outside `[A-Za-z0-9._-]`
-/// replaced by `_`), so whichever half speaks first claims it.
 fn mux_notice_stamp(
     kind: &str,
     tmux: Option<&str>,
@@ -1470,9 +1018,6 @@ fn mux_notice_stamp(
     Path::new(root).join("aterm").join("mux-notice").join(name)
 }
 
-/// Claim the one-time notice for this multiplexer: `true` exactly once, for whichever
-/// process creates the stamp first (`create_new` is atomic). Errors read as `false`: a
-/// read-only runtime dir must not fail a verb, and skipping the sentence beats repeating it.
 fn claim_mux_notice(n: &MuxNesting) -> bool {
     if env::var(MUX_NOTICE_ENV).ok().as_deref() == Some("0") {
         return false;
@@ -1487,8 +1032,6 @@ fn claim_mux_notice(n: &MuxNesting) -> bool {
     ))
 }
 
-/// [`claim_mux_notice`] with the stamp already resolved, so a test can drive
-/// the real claim against a real path.
 fn claim_mux_notice_at(stamp: &Path) -> bool {
     let Some(dir) = stamp.parent() else {
         return false;
@@ -1503,9 +1046,6 @@ fn claim_mux_notice_at(stamp: &Path) -> bool {
         .is_ok()
 }
 
-/// Print the boundary notice once, unless something better is about to: the refusal, the
-/// `mux` report and the `blocks`/`status` note already carry the fact, so those callers
-/// pass `already_said = true`, which claims the stamp without printing.
 fn announce_mux_boundary(nesting: Option<&MuxNesting>, already_said: bool) {
     let Some(n) = nesting else {
         return;
@@ -1513,15 +1053,11 @@ fn announce_mux_boundary(nesting: Option<&MuxNesting>, already_said: bool) {
     announce_mux_boundary_with(n, already_said, claim_mux_notice);
 }
 
-/// [`announce_mux_boundary`]'s decision with the claim injected, so a test can hand in a
-/// claim that writes where it can see (retargeting `$XDG_RUNTIME_DIR` would race other tests).
 fn announce_mux_boundary_with(
     n: &MuxNesting,
     already_said: bool,
     claim: impl FnOnce(&MuxNesting) -> bool,
 ) {
-    // No aterm identity in scope: no block model to have lost. The shell half also
-    // announces only under `$ATERM_PARENT_SESSION_ID`, and this leaves no stamps for
     // unrelated multiplexers.
     if n.outer_sid.is_none() {
         return;
@@ -1531,10 +1067,6 @@ fn announce_mux_boundary_with(
     }
 }
 
-/// The note for a verb whose answer the boundary shapes: `blocks` and `status`
-/// read the OSC 133 block model, and marks emitted inside a multiplexer never
-/// reach aterm. Returned only when the request addresses the session hosting
-/// the multiplexer.
 fn mux_degradation_note(n: &MuxNesting, parts: &[String]) -> Option<String> {
     let sid = n.outer_sid.as_deref()?;
     let (selector, rest) = split_selector(parts);
@@ -1562,13 +1094,10 @@ fn mux_degradation_note(n: &MuxNesting, parts: &[String]) -> Option<String> {
     Some(msg)
 }
 
-/// Whether `value` is one of [`MUX_ENV`]'s disable spellings.
 fn mux_check_off(value: &str) -> bool {
     matches!(value, "0" | "off" | "no" | "none" | "false")
 }
 
-/// What `aterm ctl mux` says when it detects no multiplexer. A [`MUX_ENV`] disable value
-/// means the check never ran, so it says that rather than "no multiplexer".
 fn mux_none_explanation(mux: Option<&str>, in_session: bool) -> String {
     if let Some(v) = mux.filter(|v| mux_check_off(v)) {
         return format!("multiplexer check off (ATERM_MUX={v})");
@@ -1584,8 +1113,6 @@ fn mux_none_explanation(mux: Option<&str>, in_session: bool) -> String {
     }
 }
 
-/// The `mux` client verb: what aterm can and cannot see from this shell, as one
-/// machine-readable line on stdout plus the explanation on stderr.
 fn run_mux_report(nesting: Option<&MuxNesting>) -> io::Result<ExitCode> {
     let Some(n) = nesting else {
         print_stdout_line("mux=none")?;
@@ -1632,7 +1159,6 @@ fn run_mux_report(nesting: Option<&MuxNesting>) -> io::Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// The socket path [`resolve_target`] resolves, without how it was chosen.
 fn resolve_path(
     sock: Option<String>,
     pid: Option<u32>,
@@ -1641,36 +1167,14 @@ fn resolve_path(
     resolve_target(sock, pid, self_sid).map(|(path, _)| path)
 }
 
-/// How the socket a client dials was chosen — which decides what a connect
-/// failure on it may offer instead ([`running_elsewhere_hint`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TargetOrigin {
-    /// Nothing named a target: the flagless rule chose the socket. When that
-    /// instance is dead the error may name each live instance with the flag
-    /// that reaches it.
     Flagless,
-    /// The caller pinned the socket (`--sock` or `--pid`), or it is the
-    /// instance the front door's probe just answered. A dead pin is never
-    /// answered with a different instance to drive (an agent whose private
-    /// socket died could be handed the human's window); like
-    /// [`discovery_targets`], it points at `instances` and names no other.
     Pinned,
-    /// Nothing pinned a target and a graph entry named this socket: the
-    /// instance hosting the session the request names, or the caller's own,
-    /// dialled with no probe. Nothing listening there (`ENOENT`,
-    /// `ECONNREFUSED`) is no failure of the call but a stale entry: the connect
-    /// answers [`NoHost`], and [`Targets::run`] holds the conversation on the
-    /// next target. Any other connect error is the call's, and so is every
-    /// connect after one there was served ([`TargetOrigin::settled`]).
     Hosting,
 }
 
 impl TargetOrigin {
-    /// The origin of a conversation's further connects once one connection on
-    /// its socket was served: a graph entry's socket is then the call's, as the
-    /// flagless rule's is, so a host that went away mid-conversation (a
-    /// self-update, a crash) fails the call instead of moving it to the next
-    /// target, which would be sent the request this instance already took.
     fn settled(self) -> Self {
         match self {
             Self::Hosting => Self::Flagless,
@@ -1679,50 +1183,29 @@ impl TargetOrigin {
     }
 }
 
-/// Where one call's connections go, in the order they are tried, each with
-/// where a successor of the server there may answer ([`redial::Follow`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Targets {
-    /// Graph-entry sockets ([`TargetOrigin::Hosting`]): the host of the
-    /// session the request names, then the caller's own. Empty when a flag
-    /// pins the socket.
     hosting: Vec<Dial>,
-    /// The target when none of them answers.
     last: LastTarget,
 }
 
-/// The target a call ends on ([`Targets`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum LastTarget {
-    /// `--sock <path>`: that path alone, where a successor rebinds.
     Sock(String),
-    /// `--pid <n>`: `<dir>/aterm-<n>.sock` alone; a successor is that one
-    /// process on a fresh listener ([`redial::Unfollowed::PidPin`]).
     Pid(u32, String),
-    /// Nothing pinned: the `latest` alias in `dir`, else the newest instance
-    /// there that accepts ([`flagless_target`]), chosen only when reached.
     Flagless {
         dir: PathBuf,
-        /// `$ATERM_PARENT_SESSION_ID`: whose host a successor is looked for at.
         self_sid: Option<String>,
     },
 }
 
-/// One socket a call is held on ([`Targets::run`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Dial {
     path: String,
     origin: TargetOrigin,
-    /// Where a successor of the server reached at `path` may answer: the host
-    /// of the session whose entry named it, the path a flag pinned, or for the
-    /// flagless rule the caller's own session's host or the `latest` alias,
-    /// never [`flagless_target`]'s dead-alias fallback.
     follow: redial::Follow,
 }
 
-/// What a conversation on a [`TargetOrigin::Hosting`] socket ends with when
-/// nothing listens there: no byte was sent, so [`Targets::run`] holds it on the
-/// next target. Its words are the connect's, should a caller wrap it.
 #[derive(Debug)]
 struct NoHost(String);
 
@@ -1734,22 +1217,11 @@ impl std::fmt::Display for NoHost {
 
 impl std::error::Error for NoHost {}
 
-/// Whether `e` is [`NoHost`]: the connect found nothing at a graph entry's
-/// socket.
 fn is_no_host(e: &io::Error) -> bool {
     e.get_ref().is_some_and(|inner| inner.is::<NoHost>())
 }
 
 impl Targets {
-    /// Hold a conversation on each target in turn, moving on only past a
-    /// graph-entry socket nothing listens on ([`NoHost`]: nothing was sent).
-    /// The first other outcome is the call's, so a request is answered by at
-    /// most one instance, and a graph entry's socket is dialled only by the
-    /// connect that carries the request. A conversation that connects again
-    /// once served (`cast drift`'s client-side reads) does so
-    /// [`settled`](TargetOrigin::settled), so only a connect before it was
-    /// served can find no host. The flagless fallback, with its own look at
-    /// the alias ([`flagless_target`]), is resolved only when reached.
     fn run<T>(&self, mut converse: impl FnMut(Dial) -> io::Result<T>) -> io::Result<T> {
         for target in &self.hosting {
             match converse(target.clone()) {
@@ -1760,19 +1232,11 @@ impl Targets {
         converse(self.last_target())
     }
 
-    /// The one socket, for a caller that keeps a path and cannot move on when
-    /// its connect finds nothing ([`resolve_target`]): the first graph-entry
-    /// socket something accepts a connect on (a probe, closed at once), else
-    /// the last target.
     fn probed(&self) -> (String, TargetOrigin) {
         let dial = self.probed_dial();
         (dial.path, dial.origin)
     }
 
-    /// [`Self::probed`] with where a successor of the server there may answer
-    /// ([`Dial::follow`]), for a caller that keeps one path across its
-    /// connects (`await task`, a re-armed `await`). The probed socket is the
-    /// call's ([`TargetOrigin::settled`]).
     fn probed_dial(&self) -> Dial {
         match self
             .hosting
@@ -1814,12 +1278,6 @@ impl Targets {
     }
 }
 
-/// Resolve the socket path from the flags, and how it was chosen
-/// ([`TargetOrigin`]), for a caller that keeps one path ([`Targets::probed`]).
-/// `--sock` names the socket; `--pid` targets `<dir>/aterm-<pid>.sock`. With no
-/// flag, a caller inside an aterm session (`self_sid` =
-/// `$ATERM_PARENT_SESSION_ID`) resolves to the instance hosting its own
-/// terminal via the discovery graph. No environment variable selects a socket.
 fn resolve_target(
     sock: Option<String>,
     pid: Option<u32>,
@@ -1828,9 +1286,6 @@ fn resolve_target(
     Ok(targets(sock, pid, self_sid, None)?.probed())
 }
 
-/// The [`Targets`] of a call from its flags, the caller's session (`self_sid`)
-/// and the session its request names (`named`, [`redial::target_sid`]), in the
-/// default rendezvous dir ([`socket_dir`]).
 fn targets(
     sock: Option<String>,
     pid: Option<u32>,
@@ -1840,14 +1295,6 @@ fn targets(
     targets_in(socket_dir(), sock, pid, self_sid, named)
 }
 
-/// [`targets`] against the rendezvous dir `dir` (`None`: no `$HOME` or
-/// `$XDG_RUNTIME_DIR`, so only `--sock` can name a socket).
-///
-/// A flag pins one socket. With none, the named session's host
-/// ([`hosting_sock`]: only a socket in `dir`, the relay's reach), then the
-/// caller's own ([`self_instance_sock_in`]: wherever its entry names, so an
-/// instance on an explicit `--control-sock` answers its own sessions), each
-/// as its graph entry names it, then the flagless rule.
 fn targets_in(
     dir: Option<PathBuf>,
     sock: Option<String>,
@@ -1883,7 +1330,6 @@ fn targets_in(
         return Ok(pinned(LastTarget::Sock(s)));
     }
     let dir = dir.ok_or_else(no_dir)?;
-    // Each followed to where that session's host republishes its entry.
     let hosted = |path: String, sid: &str| Dial {
         path,
         origin: TargetOrigin::Hosting,
@@ -1910,17 +1356,6 @@ fn targets_in(
     })
 }
 
-/// The dead-`latest` fallback: the flagless target when nothing pins one.
-///
-/// `latest` (`<dir>/aterm.sock`) names the newest instance. When that instance goes away
-/// the alias is dead: a graceful exit removes the link (`ENOENT`); a crash leaves the
-/// socket file (`ECONNREFUSED`) until the next default-dir spawn sweeps it.
-///
-/// The rule: the alias when something accepts on it; else the newest per-instance socket
-/// in `dir` that accepts ([`newest_live_instance_in`]); else the alias, so the caller's
-/// error names it. Same-directory instances only: a private instance must not receive a
-/// flagless `send`. Dead means `NotFound` or `ConnectionRefused` only; `EPERM` (a sandbox)
-/// or a timeout is no evidence, so the alias is returned and the original error surfaces.
 fn flagless_target(dir: &Path, latest: String) -> String {
     match CtlStream::connect(aterm_uds::latest::resolve(&latest)) {
         Ok(_) => latest,
@@ -1936,8 +1371,6 @@ fn flagless_target(dir: &Path, latest: String) -> String {
     }
 }
 
-/// The newest per-instance socket in `dir` something accepts on, as an
-/// absolute path — `None` when none does (or `dir` cannot be read).
 fn newest_live_instance_in(dir: &Path) -> Option<String> {
     let entries = std::fs::read_dir(dir).ok()?;
     newest(
@@ -1951,23 +1384,14 @@ fn newest_live_instance_in(dir: &Path) -> Option<String> {
     )
 }
 
-/// The selection rule behind [`newest_live_instance_in`]: newest by the socket
-/// file's mtime (when the server bound it), never by pid, since pids wrap.
-/// Ties and an unreadable mtime (`None`, ordered below every `Some`) fall back
-/// to pid order.
 fn newest(
     live: impl IntoIterator<Item = (Option<std::time::SystemTime>, u32, String)>,
 ) -> Option<String> {
     live.into_iter().max().map(|(_, _, sock)| sock)
 }
 
-/// The per-socket deadline discovery dials with; sockets are dialled in
-/// sequence, so one stuck peer must not hang the sweep.
 const PROBE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// One monotonic budget for every socket phase of a discovery probe. Socket
-/// timeouts are re-armed from the remaining budget before each read/write, so
-/// partial progress cannot restart the clock.
 #[derive(Clone, Copy)]
 struct ProbeDeadline {
     started: std::time::Instant,
@@ -1997,8 +1421,6 @@ fn probe_timeout_error() -> io::Error {
     )
 }
 
-/// A read/write view re-arming the socket from one absolute deadline before
-/// every syscall, so each read of a trickling line gets less time.
 struct ProbeIo<'a> {
     stream: &'a CtlStream,
     deadline: ProbeDeadline,
@@ -2032,9 +1454,6 @@ impl Write for ProbeIo<'_> {
     }
 }
 
-/// The outcome of arming a probe socket's timeout. macOS refuses socket options
-/// (`EINVAL`) once the peer has closed, though its bytes are still buffered and
-/// nothing can block; the syscall then goes ahead unarmed.
 fn armed(set: io::Result<()>) -> io::Result<()> {
     match set {
         Err(e)
@@ -2053,11 +1472,6 @@ struct ProbeConnectJob {
     reply: std::sync::mpsc::SyncSender<io::Result<CtlStream>>,
 }
 
-/// `CtlStream::connect` has no portable timeout, so it runs on one lazy worker
-/// and the caller waits only for its remaining budget. `busy` is claimed with a
-/// non-blocking CAS, so a stuck connect strands at most this worker and later
-/// probes fail as timeouts. A late result goes to a dropped channel and its
-/// stream is closed.
 struct ProbeConnector {
     sender: Option<std::sync::mpsc::SyncSender<ProbeConnectJob>>,
     busy: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -2069,8 +1483,6 @@ impl ProbeConnector {
     where
         F: Fn(&str) -> io::Result<CtlStream> + Send + 'static,
     {
-        // `busy` admits at most one request, and the channel encodes that same
-        // bound instead of relying on an unbounded type for a one-job protocol.
         let (sender, requests) = std::sync::mpsc::sync_channel::<ProbeConnectJob>(1);
         let busy = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let worker_busy = std::sync::Arc::clone(&busy);
@@ -2159,56 +1571,20 @@ fn shared_probe_connector() -> io::Result<&'static ProbeConnector> {
     }
 }
 
-/// One socket's answer to the discovery probe, every failure class distinct, so
-/// [`discovery_report`] can say why a listing is empty instead of claiming no instance exists.
 #[derive(Debug)]
 enum Probe {
-    /// `OK <n>` and its `n` body lines.
     Answered(Vec<String>),
-    /// `ECONNREFUSED`: the socket file exists but nothing accepts (an instance
-    /// that exited without cleanup, or one still booting). `pid_running` is the
-    /// liveness of the pid the socket names (`None` when it names none).
     Refused { pid_running: Option<bool> },
-    /// `EPERM`/`EACCES`/`ENOTCONN` on `connect()`: a sandbox (Codex CLI's
-    /// seatbelt allows AF_UNIX connect only under writable roots) or another
-    /// user's 0600 socket; not "not running".
     Denied(io::Error),
-    /// The token beside the socket could not be read, so no `AUTH` line went
-    /// out and the server answered `ERR auth`. Carries the file it looked for.
     NoToken(PathBuf, io::Error),
-    /// A token was sent and the server still answered `ERR auth`: the file on
-    /// disk is not the token the server holds (a restarted instance rewrote it).
     AuthRejected,
-    /// The instance is up and said so: `ERR control server busy; retry` (every request lane
-    /// at work, or its connection cap reached). Carries the line, which the report quotes.
     Busy(String),
-    /// The instance is up and REFUSED the request in its own words: an `ERR`
-    /// line that is neither `ERR auth` nor busy (`ERR usage: …` from a build
-    /// that predates the verb, `ERR no active terminal`, `ERR denied …`).
-    /// Carries the line. Unlike every arm but [`Probe::Answered`] it was
-    /// reached: a walk that asks a newer verb says such an instance's refusal
-    /// rather than that it could not be reached (`survey --brief`, session
-    /// log 5F-6).
     Replied(String),
-    /// Not dialed: a private `--control-sock` instance outside the rendezvous directory,
-    /// with no token beside its socket this client can read
-    /// ([`graph_hygiene::foreign_token_miss`]); the request could only be refused (and
-    /// logged as a denial). Carries the token file looked for and what the pid's process
-    /// says about it ([`ForeignFacts`]).
     Foreign { token: PathBuf, facts: ForeignFacts },
-    /// The shared [`PROBE_DEADLINE`] fired during connect, request write or response read
-    /// (the byte-bounded token file read is not interruptible).
     Timeout,
-    /// Anything else, with the raw cause: a socket file that vanished between
-    /// readdir and dial, a non-auth `ERR`, a malformed header, a connection
-    /// closed without a reply.
     Other(io::Error),
 }
 
-/// One framed request and response against the socket at `path`, unprinted: authenticate,
-/// send `verb`, and read `OK <n>` and `n` lines as [`Probe::Answered`], or the classified
-/// failure. `pid` (`0` = unknown) only labels a refused connect. Every line is bounded
-/// ([`read_bounded_line`]) and [`PROBE_DEADLINE`] bounds total socket time ([`ProbeIo`]).
 fn probe_lines(path: &str, verb: &str, pid: u32) -> Probe {
     probe_lines_with_deadline(path, verb, pid, PROBE_DEADLINE)
 }
@@ -2230,7 +1606,6 @@ fn probe_lines_with_deadline(
     pid: u32,
     budget: std::time::Duration,
 ) -> Probe {
-    // The connect and the token read below name one socket ([`pin_alias`]).
     let path = &pin_alias(path);
     let connect_deadline = ProbeDeadline::after(budget);
     let connector = match shared_probe_connector() {
@@ -2245,8 +1620,6 @@ fn probe_lines_with_deadline(
         Ok(remaining) => remaining,
         Err(error) => return io_probe(error),
     };
-    // An unreadable token is not fatal yet: the request goes out without `AUTH`,
-    // and only the server's `ERR auth` proves the miss mattered.
     let (token, token_miss) = match read_token_at(path) {
         Ok(token) => (Some(token), None),
         Err((token_path, error)) => (None, Some(Probe::NoToken(token_path, error))),
@@ -2260,12 +1633,6 @@ fn probe_lines_with_deadline(
     )
 }
 
-/// [`probe_lines`]' request and its classified answer, over a connected socket.
-///
-/// A listener that cannot admit a connection answers `ERR control server busy; retry` and
-/// drops it at once, often before the request is written; the write then fails (`EPIPE`)
-/// while the server's line waits in the receive buffer. That line is the answer, so it is
-/// read and classified, and the write's error is kept only when the server said nothing.
 fn probe_exchange(
     stream: &CtlStream,
     token: Option<&str>,
@@ -2316,7 +1683,6 @@ fn probe_exchange(
             Probe::Other(malformed_header_error(status))
         };
     };
-    // An `OK` cannot answer a request that never went out whole.
     if let Some(e) = unwritten {
         return io_probe(e);
     }
@@ -2331,9 +1697,6 @@ fn probe_exchange(
     }
 }
 
-/// Map a failed `connect()` to its [`Probe`] class: `ECONNREFUSED` is labelled by whether
-/// `pid` is alive, `EPERM`/`EACCES`/`ENOTCONN` are a sandbox or a foreign socket mode (not
-/// "not running"), and anything else keeps the raw cause, framed like [`connect_error`].
 fn classify_connect_error(e: io::Error, pid: u32) -> Probe {
     match e.kind() {
         io::ErrorKind::ConnectionRefused => Probe::Refused {
@@ -2345,8 +1708,6 @@ fn classify_connect_error(e: io::Error, pid: u32) -> Probe {
     }
 }
 
-/// A read/write failure after the connect: the deadline firing is
-/// [`Probe::Timeout`]; anything else is [`Probe::Other`] with the raw cause.
 fn io_probe(e: io::Error) -> Probe {
     if is_timeout_error(&e) {
         Probe::Timeout
@@ -2355,32 +1716,16 @@ fn io_probe(e: io::Error) -> Probe {
     }
 }
 
-/// What the rendezvous directory turned out to be. Only [`DirOutcome::Empty`] licenses "no
-/// live aterm instances found".
 #[derive(Debug)]
 enum DirOutcome {
-    /// No environment variable that names the directory is set.
     Unresolvable,
-    /// The resolved directory does not exist; `why` says which variable it came
-    /// from (and, under `$XDG_RUNTIME_DIR`, that the default was not consulted).
     Missing { path: PathBuf, why: String },
-    /// `read_dir` failed for a reason other than absence — a sandbox refusing
-    /// readdir, a mode that excludes this user, a non-directory in the path,
-    /// or the process out of descriptors.
     Unreadable { path: PathBuf, err: io::Error },
-    /// Readable and holding no instance socket and no graph entry: a truly
-    /// empty fleet.
     Empty(PathBuf),
-    /// Readable, with `n` instances (readdir + graph entries) to dial.
     Found { path: PathBuf, n: usize },
-    /// `--sock`/`--pid` named the target; the directory was not the question.
-    /// `live_elsewhere` counts the other instances that accept a connect, dialled only when
-    /// the report would otherwise say to launch aterm ([`dead_target_remedy_due`]), else `0`.
     Scoped { live_elsewhere: usize },
 }
 
-/// The variables [`socket_dir`] resolves from, for the message that none is set
-/// (two on macOS, three on Windows and every other Unix).
 #[cfg(target_os = "macos")]
 const DIR_ENV_UNSET: &str = "$XDG_RUNTIME_DIR and $HOME are both unset";
 #[cfg(all(unix, not(target_os = "macos")))]
@@ -2388,14 +1733,9 @@ const DIR_ENV_UNSET: &str = "$XDG_RUNTIME_DIR, $XDG_STATE_HOME and $HOME are all
 #[cfg(windows)]
 const DIR_ENV_UNSET: &str = "%TMP%, %TEMP% and %LOCALAPPDATA% are all unset";
 
-/// Why a resolved but absent directory was the one looked in. Under
-/// `$XDG_RUNTIME_DIR` it names the default that was not consulted, where a
-/// human's instance may be running.
 #[cfg(not(windows))]
 fn missing_dir_reason() -> String {
     if env::var_os("XDG_RUNTIME_DIR").is_some() {
-        // `push_str`, not `format!`: the Trust lane (`ship trust run`) cannot lower
-        // inline `format_args!` (as `help_text`).
         let mut why = String::from("resolved from $XDG_RUNTIME_DIR, which is set — so ");
         why.push_str(aterm_uds::CONTROL_SOCKET_DIR_DEFAULT);
         why.push_str(" was NOT consulted");
@@ -2415,11 +1755,6 @@ fn missing_dir_reason() -> String {
         .to_string()
 }
 
-/// The line an unscoped discovery that found no instance adds on Windows when
-/// the other elevation's control directory exists: elevated and unelevated
-/// instances keep separate directories ([`aterm_uds::control_socket_dir`]) and
-/// neither side lists the other's, so "none found" speaks for this side only.
-/// `None` off Windows and when there is no such directory.
 fn other_elevation_note() -> Option<String> {
     #[cfg(windows)]
     {
@@ -2451,8 +1786,6 @@ fn other_elevation_note() -> Option<String> {
     }
 }
 
-/// Resolve and classify the rendezvous directory, enumerating its instances in the same
-/// readdir. The list is empty unless the outcome is [`DirOutcome::Found`].
 fn inspect_fleet() -> (DirOutcome, Vec<Target>) {
     let Some(dir) = socket_dir() else {
         return (DirOutcome::Unresolvable, Vec::new());
@@ -2477,16 +1810,10 @@ fn inspect_fleet() -> (DirOutcome, Vec<Target>) {
     (outcome, instances)
 }
 
-/// Every live same-user aterm instance as `(pid, sock_path)`, deduped by
-/// socket path and sorted by pid. Empty whenever the directory could not be
-/// read; [`inspect_fleet`] tells that apart from an empty fleet.
 fn live_instances() -> Vec<(u32, String)> {
     inspect_fleet().1.into_iter().map(Target::listed).collect()
 }
 
-/// One instance discovery found: the `(pid, socket)` every caller lists and, for one a
-/// graph entry named, when that entry was last written, which tells the entry's writer
-/// from a later process handed the same pid ([`graph_hygiene::is_entry_writer`]).
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct Target {
     pid: u32,
@@ -2495,8 +1822,6 @@ struct Target {
 }
 
 impl Target {
-    /// A target no graph entry vouches for: a readdir socket, or one
-    /// `--sock`/`--pid` named.
     fn named(pid: u32, sock: String) -> Self {
         Self {
             pid,
@@ -2505,30 +1830,15 @@ impl Target {
         }
     }
 
-    /// The `(pid, socket)` pair callers outside discovery list.
     fn listed(self) -> (u32, String) {
         (self.pid, self.sock)
     }
 }
 
-/// The enumeration behind [`live_instances`], over an open readdir of `dir`:
-///
-/// 1. Per-instance sockets directly in the default dir (`<dir>/aterm-<pid>.sock`).
-/// 2. Explicit `--control-sock` instances, whose socket lives elsewhere: each registers a
-///    graph entry `<dir>/graph/<sid>` carrying the absolute socket path and hosting pid.
-///
-/// A graph entry whose writer is gone ([`graph_hygiene::writer_gone`]) is skipped without
-/// a connect, and pruned when its pid is dead ([`graph_hygiene::prune_dead_entry`]).
 fn enumerate_instances(dir: &Path, entries: std::fs::ReadDir) -> Vec<Target> {
     let mut out: Vec<Target> = Vec::new();
-    // Dedup by canonical socket path: a default instance appears both in the readdir and,
-    // once it has registered a session, in a graph entry whose path was canonicalized at
-    // publish time (`/var` → `/private/var` on macOS).
     let mut seen: HashSet<String> = HashSet::new();
     let remember = |seen: &mut HashSet<String>, sock: &str| -> bool {
-        // Through `socket_key` after canonicalizing: on Windows canonicalize
-        // refuses a socket file, and the two publishers spell one socket as
-        // `C:\…` and `\\?\C:\…`.
         let key = control_socket::socket_key(
             &std::fs::canonicalize(sock)
                 .map(|p| p.to_string_lossy().into_owned())
@@ -2549,12 +1859,7 @@ fn enumerate_instances(dir: &Path, entries: std::fs::ReadDir) -> Vec<Target> {
             let Some(sock) = control_socket::graph_entry_sock(&body) else {
                 continue;
             };
-            // An explicit socket's filename encodes no pid; the entry records it.
-            // `0` is the placeholder for an entry lacking one.
             let pid = control_socket::graph_entry_pid(&body).unwrap_or(0);
-            // A gone writer serves nothing: skip it without a connect, and before `remember`,
-            // so a stranger now holding its pid cannot claim the socket's key ahead of the
-            // live entry for it. A legacy `0` names no pid to judge, so it is dialed.
             if pid != 0 && graph_hygiene::writer_gone(pid, written) {
                 // Only a dead pid's entry is removed (`graph_hygiene` says why).
                 if !aterm_uds::process::pid_alive(pid) {
@@ -2571,9 +1876,6 @@ fn enumerate_instances(dir: &Path, entries: std::fs::ReadDir) -> Vec<Target> {
     out
 }
 
-/// Step (1) of [`enumerate_instances`] alone, also the dead-alias fallback's population
-/// ([`newest_live_instance_in`]): per-instance sockets directly in `dir`, as `(pid, absolute
-/// path)` in readdir order. Existence only; the caller decides what "live" means.
 fn instance_socks_in(dir: &Path, entries: std::fs::ReadDir) -> Vec<(u32, String)> {
     entries
         .flatten()
@@ -2586,10 +1888,6 @@ fn instance_socks_in(dir: &Path, entries: std::fs::ReadDir) -> Vec<(u32, String)
         .collect()
 }
 
-/// The one stderr line `instances` adds when the walk found foreign instances
-/// ([`Probe::Foreign`]) it did not dial. `ls` and `windows` list sessions,
-/// which a foreign instance cannot show, and say nothing. `None` otherwise; a
-/// fleet where nothing answered names them in [`discovery_report`].
 fn foreign_note(verb: &str, probes: &[(u32, String, Probe)]) -> Option<String> {
     if verb != "instances" {
         return None;
@@ -2604,9 +1902,6 @@ fn foreign_note(verb: &str, probes: &[(u32, String, Probe)]) -> Option<String> {
     foreign_note_text(&foreign)
 }
 
-/// [`foreign_note`]'s text for instances already read: each one's pid, socket and
-/// [`ForeignFacts`], and the `kill` an orphan needs, offered only for a proven
-/// [`ForeignFacts::Writer`]. An entry whose writer is gone is not counted.
 fn foreign_note_text(foreign: &[(u32, &str, &ForeignFacts)]) -> Option<String> {
     let foreign: Vec<(u32, &str, &ForeignFacts)> = foreign
         .iter()
@@ -2639,9 +1934,6 @@ fn foreign_note_text(foreign: &[(u32, &str, &ForeignFacts)]) -> Option<String> {
     Some(note)
 }
 
-/// The `kill` offered for the foreign instances whose parent is launchd
-/// ([`ForeignFacts::orphaned`]) — nothing else will end one — or `None` when
-/// none is. Shared by [`foreign_note_text`] and [`dominant_hint`].
 fn orphan_kill<'a>(foreign: impl Iterator<Item = (u32, &'a ForeignFacts)>) -> Option<String> {
     let orphans: Vec<String> = foreign
         .filter(|(_, facts)| facts.orphaned())
@@ -2657,33 +1949,12 @@ fn orphan_kill<'a>(foreign: impl Iterator<Item = (u32, &'a ForeignFacts)>) -> Op
     ))
 }
 
-/// What a foreign instance's PROCESS says about it, since its socket says
-/// nothing to this client: whether its parent is launchd (its launcher exited
-/// and launchd adopted it, or launchd started it — the kernel records no
-/// difference),
-/// whether the binary it runs has been deleted under it (an app updated past a
-/// still-running copy), and how long it has run — so an orphan left by a test
-/// is named as one, not only by pid and socket. macOS and Linux read all
-/// three (Linux's parent is `init` only without a subreaper, so an orphan under
-/// `systemd --user` is not named one); elsewhere they are unknown and nothing is
-/// said.
-///
-/// A pid is not an identity: a SIGKILLed instance leaves its graph entry, and pids wrap.
-/// Facts, and the `kill` an orphan is offered, are said only of [`ForeignFacts::Writer`], a
-/// process proven to be the entry's writer and to be aterm.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 enum ForeignFacts {
-    /// Nothing proven: no birth readable, no entry time to judge it by, or the
-    /// process ended while it was read. Nothing is said, nothing offered.
     #[default]
     Unknown,
-    /// The pid now names a process born after the entry was last written
-    /// ([`graph_hygiene::is_entry_writer`]): the pid changed hands between the walk
-    /// (which skips such entries, [`graph_hygiene::writer_gone`]) and this read.
     Stale,
-    /// The pid's process runs an executable that is not aterm (its file name).
     NotAterm(String),
-    /// The entry's writer, provably, and what its process says.
     Writer {
         orphaned: bool,
         binary_deleted: bool,
@@ -2691,33 +1962,21 @@ enum ForeignFacts {
     },
 }
 
-/// One pass of reads about a pid, for the pure [`ForeignFacts::judge`].
 #[derive(Debug)]
 struct ProcessReading {
-    /// Its birth, read first.
     birth: aterm_uds::process::ProcessBirth,
-    /// How far that birth may trail the entry's write and still be its writer
-    /// ([`graph_hygiene::Birth`]).
     slack: std::time::Duration,
     parent: Option<u32>,
-    /// The executable the kernel names, with `try_exists` on it; `None` when
-    /// the kernel named none.
     exe: Option<(PathBuf, io::Result<bool>)>,
-    /// Its birth read again after everything else: equal to `birth` unless the
-    /// process ended, or the pid changed hands, while it was being read.
     birth_after: Option<aterm_uds::process::ProcessBirth>,
 }
 
 impl ForeignFacts {
-    /// Read the process at `pid` and judge it against its graph entry's last
-    /// write `written` (`None` when no entry vouches for the target).
     fn read(pid: u32, written: Option<std::time::SystemTime>) -> Self {
         use aterm_uds::process::{read_process_parent, read_process_path};
         let (Ok(p), Some(_)) = (i32::try_from(pid), written) else {
             return Self::Unknown;
         };
-        // One pairing for both birth reads, so the same process reads the same
-        // birth through it ([`graph_hygiene::Clocks`]).
         let clocks = graph_hygiene::Clocks::default();
         let Some(birth) = graph_hygiene::read_birth(p, &clocks) else {
             return Self::Unknown;
@@ -2737,17 +1996,6 @@ impl ForeignFacts {
         Self::judge(written, std::time::SystemTime::now(), reading)
     }
 
-    /// The verdict on one [`ProcessReading`]; pure, so every branch is table-tested:
-    ///
-    /// 1. identity: born after the entry was last written is [`Self::Stale`]; with no
-    ///    entry time, [`Self::Unknown`];
-    /// 2. the same process throughout: a birth that changed or vanished by the last read is
-    ///    [`Self::Unknown`];
-    /// 3. aterm: a named executable whose file is not `aterm` or `aterm-*` is
-    ///    [`Self::NotAterm`];
-    /// 4. a deleted binary is claimed only when the kernel named no path for the same live
-    ///    process (`read_process_path`'s contract), or the path is `Ok(false)`; an `Err`
-    ///    (`EPERM`, a TCC refusal) is unknown, never "deleted".
     fn judge(
         written: Option<std::time::SystemTime>,
         now: std::time::SystemTime,
@@ -2785,13 +2033,10 @@ impl ForeignFacts {
         }
     }
 
-    /// Whether this is the entry's writer and launchd is its parent — the one
-    /// case `instances` offers a `kill` for.
     fn orphaned(&self) -> bool {
         matches!(self, Self::Writer { orphaned: true, .. })
     }
 
-    /// Whether the verdict is that the pid no longer names the entry's writer.
     fn writer_gone(&self) -> bool {
         matches!(self, Self::Stale | Self::NotAterm(_))
     }
@@ -2834,7 +2079,6 @@ impl ForeignFacts {
     }
 }
 
-/// `7d1h`, `3h12m`, `5m`, `42s`: the two largest units.
 fn fmt_uptime(up: std::time::Duration) -> String {
     let s = up.as_secs();
     let (d, h, m) = (s / 86_400, (s % 86_400) / 3_600, (s % 3_600) / 60);
@@ -2849,9 +2093,6 @@ fn fmt_uptime(up: std::time::Duration) -> String {
     }
 }
 
-/// Whether two socket path strings name the same socket, tolerating a
-/// symlinked ancestor (macOS `/var` → `/private/var`): a raw match, else
-/// canonical forms compared (an unresolvable path is not self).
 fn same_socket_path(a: &str, b: &str) -> bool {
     if a == b || control_socket::socket_key(a) == control_socket::socket_key(b) {
         return true;
@@ -2862,23 +2103,11 @@ fn same_socket_path(a: &str, b: &str) -> bool {
     }
 }
 
-/// The instances discovery reports on, honouring `--sock`/`--pid`.
-///
-/// * `--pid P`: instance `P`, filtered from the normal enumeration.
-/// * `--sock S`: only the instance at `S`, its pid from the filename when it
-///   encodes one (`aterm-<pid>.sock`), else the `0` placeholder.
-/// * neither: every live instance.
-///
-/// `Err((message, exit code))` when the named instance is not live, rather
-/// than widening to the whole fleet.
 fn discovery_targets(
     sock: Option<&str>,
     pid: Option<u32>,
 ) -> Result<Vec<(u32, String)>, (String, u8)> {
     if let Some(s) = sock {
-        // Trust the explicit socket: it may be live without a graph entry (no
-        // session registered yet). `run_discovery` skips it if it does not
-        // answer.
         let name = Path::new(s)
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
@@ -2892,10 +2121,6 @@ fn discovery_targets(
     Ok(live_instances())
 }
 
-/// `--pid want` over what [`inspect_fleet`] found. A directory that could not
-/// be looked in is reported as such ([`discovery_report`]'s words), never as a
-/// pid that is not live; only a readable directory licenses that claim. The
-/// exit code is the one unscoped discovery gives the same state.
 fn pid_targets(
     want: u32,
     (outcome, instances): (DirOutcome, Vec<Target>),
@@ -2906,8 +2131,6 @@ fn pid_targets(
     ) {
         return Err(discovery_report(outcome, &[]));
     }
-    // `parse_pid` refuses 0, the placeholder an entry with no `pid` line
-    // enumerates as, so `want` never matches an unknown pid.
     let hit: Vec<(u32, String)> = instances
         .into_iter()
         .map(Target::listed)
@@ -2922,9 +2145,6 @@ fn pid_targets(
     Ok(hit)
 }
 
-/// `instances` / `ls` / `windows`: the client-side discovery verbs. `instances` prints
-/// `<pid> <session-count> <sock>` (` self` on the instance hosting the calling terminal);
-/// `ls` prints `<pid> <sessions line>` per session (` *` on the caller's own).
 fn run_discovery(
     verb: &str,
     sock: Option<&str>,
@@ -2935,8 +2155,6 @@ fn run_discovery(
     let self_sock = self_instance_sock(self_sid.as_deref());
     let stdout = io::stdout();
     let mut out = StdoutSink::new(stdout.lock());
-    // With `--sock`/`--pid` the directory is not the question; unscoped
-    // discovery classifies it, since "no such directory" and "empty" differ.
     let (mut dir, targets) = if sock.is_some() || pid.is_some() {
         match discovery_targets(sock, pid) {
             Ok(t) => {
@@ -2951,10 +2169,7 @@ fn run_discovery(
     } else {
         inspect_fleet()
     };
-    // Every probe is kept: rows print as they arrive, and when nothing answered
-    // the classified misses are the report.
     let mut probes: Vec<(u32, String, Probe)> = Vec::with_capacity(targets.len());
-    // Answered rows, kept for the ambiguity sweep below.
     let mut answered: Vec<FleetSession> = Vec::new();
     let rendezvous = rendezvous_of(&dir);
     for (pid, sock, probe) in probe_sessions(targets, rendezvous) {
@@ -2962,8 +2177,6 @@ fn run_discovery(
             let is_self_instance = self_sock
                 .as_deref()
                 .is_some_and(|self_s| same_socket_path(self_s, &sock));
-            // The same mapping `fleet_sessions` uses, so `ls`, the drive CLI and
-            // the sweep agree.
             let rows = instance_sessions(pid, sessions, self_sid.as_deref());
             if verb == "instances" {
                 let marker = if is_self_instance { " self" } else { "" };
@@ -2982,8 +2195,6 @@ fn run_discovery(
         }
         probes.push((pid, sock, probe));
     }
-    // A scoped run dials only its targets; before its report tells a dead
-    // target to launch aterm, count the instances serving elsewhere.
     if let DirOutcome::Scoped { live_elsewhere } = &mut dir
         && dead_target_remedy_due(&probes)
     {
@@ -3003,8 +2214,6 @@ fn run_discovery(
     if let Some(note) = foreign {
         stderr_line(&note)?;
     }
-    // A sid two live instances both answer to addresses neither unambiguously;
-    // call it out on stderr, leaving the parsed rows untouched.
     for (sid, pids) in duplicate_sids(&answered) {
         let list = pids
             .iter()
@@ -3017,7 +2226,6 @@ fn run_discovery(
             pids.len()
         ))?;
     }
-    // Inside a multiplexer the ` self` / ` *` markers name the terminal running screen/tmux.
     if let Some(n) = nesting.filter(|n| n.outer_sid.is_some()) {
         let mut note = String::from("NOTE: this shell is inside ");
         note.push_str(n.kind);
@@ -3027,10 +2235,6 @@ fn run_discovery(
     Ok(ExitCode::SUCCESS)
 }
 
-/// Dial each target for its `sessions` listing lazily, so a printing caller emits an
-/// answered instance's rows while a later peer burns its [`PROBE_DEADLINE`]. A target foreign
-/// to `rendezvous` (the directory an unscoped walk read; `None` for `--sock`/`--pid`) is
-/// [`Probe::Foreign`] without a connect ([`graph_hygiene::foreign_token_miss`]).
 fn probe_sessions(
     targets: Vec<Target>,
     rendezvous: Option<PathBuf>,
@@ -3052,8 +2256,6 @@ fn probe_sessions(
         })
 }
 
-/// The directory an unscoped walk read, against which [`probe_sessions`] judges
-/// foreignness; `None` when nothing was found or `--sock`/`--pid` was given.
 fn rendezvous_of(dir: &DirOutcome) -> Option<PathBuf> {
     match dir {
         DirOutcome::Found { path, .. } => Some(path.clone()),
@@ -3061,26 +2263,16 @@ fn rendezvous_of(dir: &DirOutcome) -> Option<PathBuf> {
     }
 }
 
-// `ls` as data: the printing path's walk, probes, rows and verdict, for in-process callers.
-
 /// One live session in the fleet, exactly as `ls` prints it.
-///
-/// `row` is the server's `sessions` line verbatim (`<local> <sid> <parent> <state> <title…>`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FleetSession {
-    /// The pid of the instance hosting this session (what `--pid` addresses);
-    /// `0` when the socket names no pid.
     pub pid: u32,
-    /// The server's `sessions` row for this session, verbatim.
     pub row: String,
-    /// Whether this is the calling terminal's own session — the row `ls` marks
-    /// with ` *`.
     pub is_self: bool,
 }
 
 impl FleetSession {
     /// The session id (the row's second column), what `@<sid>` addresses.
-    /// `None` for a row too short to carry one.
     #[must_use]
     pub fn sid(&self) -> Option<&str> {
         self.row.split_whitespace().nth(1)
@@ -3088,16 +2280,9 @@ impl FleetSession {
 }
 
 /// Why a fleet listing produced no sessions, as `ls` reports on stderr.
-/// [`code`](Self::code) distinguishes "nothing there" from "discovery is
-/// broken".
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FleetListError {
-    /// The operator-facing reason, byte-identical to `aterm-ctl ls`'s stderr
-    /// (without the `aterm-ctl: ` prefix).
     pub reason: String,
-    /// The status `ls` would exit with: [`EXIT_EMPTY_FLEET`] (1) for a readable
-    /// directory with no instance, [`EXIT_UNREACHABLE`] (2) for could-not-look
-    /// or could-not-reach, [`EXIT_TIMEOUT`] (124) when every instance timed out.
     pub code: u8,
 }
 
@@ -3107,14 +2292,7 @@ impl std::fmt::Display for FleetListError {
     }
 }
 
-/// The `ls` listing as data: every session on every reachable instance, or the
-/// classified reason there is none. Same scope as a bare `aterm-ctl ls`, with
-/// the ` *` marker as [`FleetSession::is_self`].
-///
-/// # Errors
-///
-/// [`FleetListError`] whenever no instance answered, with the CLI's reason and
-/// status. `Ok(rows)` means at least one instance answered.
+/// The `ls` listing as data.
 pub fn fleet_sessions() -> Result<Vec<FleetSession>, FleetListError> {
     let self_sid = env::var(SELF_SID_ENV).ok();
     let (dir, targets) = inspect_fleet();
@@ -3129,15 +2307,7 @@ pub fn fleet_sessions() -> Result<Vec<FleetSession>, FleetListError> {
     fleet_listing(sessions, discovery_report(dir, &probes))
 }
 
-/// Every aterm instance that has published a control socket on this machine, as `(pid,
-/// socket path)`: the rendezvous walk of `instances`, `ls` and `windows`, without dialling.
-/// Sorted by pid; pid `0` for an explicit-socket instance whose graph entry names none. A
-/// listed socket may not accept (a crashed instance leaves its file).
-///
-/// # Errors
-///
-/// [`FleetListError`] when the directory could not be read. A readable directory with no
-/// instance is `Ok` and empty.
+/// Every aterm instance that has published a control socket on this machine, as `(pid, socket path)`.
 pub fn local_instances() -> Result<Vec<(u32, String)>, FleetListError> {
     let (dir, targets) = inspect_fleet();
     match dir {
@@ -3151,23 +2321,17 @@ pub fn local_instances() -> Result<Vec<(u32, String)>, FleetListError> {
     }
 }
 
-/// Whether `aterm ctl --pid <pid>` reaches the instance on `sock`: `--pid`
-/// dials only the default directory's per-instance socket, so an explicit
-/// `--control-sock` instance needs `--sock`.
+/// Whether `aterm ctl --pid <pid>` reaches the instance on `sock`.
 #[must_use]
 pub fn pid_reaches(pid: u32, sock: &str) -> bool {
     pid != 0 && reached_by_pid(socket_dir().as_deref(), pid, sock)
 }
 
-/// The sessions one answered instance contributes to a listing; pure, shared
-/// by the `ls` printer and [`fleet_sessions`].
 fn instance_sessions(pid: u32, rows: &[String], self_sid: Option<&str>) -> Vec<FleetSession> {
     rows.iter()
         .map(|row| FleetSession {
             pid,
             row: row.clone(),
-            // The calling terminal's own session: the row's sid (its 2nd field)
-            // equals $ATERM_PARENT_SESSION_ID.
             is_self: {
                 let sid = row.split_whitespace().nth(1);
                 sid.is_some() && sid == self_sid
@@ -3176,15 +2340,12 @@ fn instance_sessions(pid: u32, rows: &[String], self_sid: Option<&str>) -> Vec<F
         .collect()
 }
 
-/// The session ids claimed by more than one live instance, each with its pids,
-/// in listing order; empty for a healthy fleet. Such an id cannot address
-/// either instance unambiguously. Pids are deduped first, so one instance
-/// listed twice is not a second claimant.
 fn duplicate_sids(sessions: &[FleetSession]) -> Vec<(String, Vec<u32>)> {
     let mut order: Vec<&str> = Vec::new();
     let mut claims: std::collections::HashMap<&str, Vec<u32>> = std::collections::HashMap::new();
     for session in sessions {
         let Some(sid) = session.sid() else {
+            // Distinct branch.
             continue; // a row too short to carry one — the listing skips it too
         };
         let pids = claims.entry(sid).or_insert_with(|| {
@@ -3204,8 +2365,6 @@ fn duplicate_sids(sessions: &[FleetSession]) -> Vec<(String, Vec<u32>)> {
         .collect()
 }
 
-/// Fold a sweep into the listing result: [`discovery_report`]'s code decides success for
-/// both the data and CLI paths (zero: some instance answered).
 fn fleet_listing(
     sessions: Vec<FleetSession>,
     verdict: (String, u8),
@@ -3216,16 +2375,6 @@ fn fleet_listing(
     }
 }
 
-/// The `windows` rows for one instance, folded from its `sessions` lines. One
-/// row per window id ascending: `<pid> window=<id> focused=<0|1> sessions=<n>
-/// active=<sid>[,<sid>…]` (`active=-` when nothing is on the active tab), then
-/// `<pid> window=none sessions=<n>` for sessions no window hosts, then `<pid>
-/// window=- sessions=<n>` for lines that could not say (no `window=` token, or
-/// `window=-`). A `--headless` instance's sessions fold under `window=0`.
-///
-/// Tokens are read by [`roster_tail`], from the end of the line back to the
-/// `meta=` anchor, never by column: the title before it is program-settable
-/// and may be empty.
 fn window_rows_from_sessions(pid: u32, sessions: &[String]) -> Vec<String> {
     use std::collections::BTreeMap;
     struct Fold {
@@ -3285,10 +2434,6 @@ fn window_rows_from_sessions(pid: u32, sessions: &[String]) -> Vec<String> {
     rows
 }
 
-/// The `key=value` columns of one whitespace-split `sessions` line, walked
-/// backwards from the end to the `meta=` token closing the positional columns;
-/// empty when there is no anchor. Nothing before it (such as a title spelling
-/// `window=7`) is taken for a column, and an empty title costs nothing.
 fn roster_tail<'a>(fields: &[&'a str]) -> Vec<&'a str> {
     let mut tail = Vec::new();
     for field in fields.iter().rev() {
@@ -3303,22 +2448,10 @@ fn roster_tail<'a>(fields: &[&'a str]) -> Vec<&'a str> {
     Vec::new()
 }
 
-/// Exit code for "could not look, or could not reach": instances were found and none answered
-/// (or only to say it was busy), or the directory is missing, unreadable or unresolvable.
-/// Distinct from [`EXIT_EMPTY_FLEET`].
 const EXIT_UNREACHABLE: u8 = 2;
 
-/// Exit code for a genuinely empty fleet: the rendezvous directory was read and
-/// holds no instance socket and no graph entry. The only status that licenses
-/// "no live aterm instances found" ([`FleetListError::code`]).
 const EXIT_EMPTY_FLEET: u8 = 1;
 
-/// The `ls`/`instances`/`windows` verdict, pure: from what the directory turned out to be and
-/// every socket dialled with its classified outcome, the stderr message (without the
-/// [`stderr_line`] prefix) and the exit code. Any `Answered` probe is success: `("", 0)`.
-/// Only a readable empty directory says "no live aterm instances found"; every other arm
-/// names the directory or socket and the cause, the found-but-unreached ones ending with one
-/// hint for the dominant cause. The code is 124 only when every probe timed out.
 fn discovery_report(dir: DirOutcome, probes: &[(u32, String, Probe)]) -> (String, u8) {
     if probes
         .iter()
@@ -3326,8 +2459,6 @@ fn discovery_report(dir: DirOutcome, probes: &[(u32, String, Probe)]) -> (String
     {
         return (String::new(), 0);
     }
-    // Every socket reached said it was busy: the heading says so, never that it
-    // did not answer (the rows quote its line).
     let all_busy = !probes.is_empty() && probes.iter().all(|(_, _, p)| matches!(p, Probe::Busy(_)));
     let (mut msg, in_dir): (String, Option<&Path>) = match &dir {
         DirOutcome::Unresolvable => {
@@ -3345,9 +2476,6 @@ fn discovery_report(dir: DirOutcome, probes: &[(u32, String, Probe)]) -> (String
         }
         DirOutcome::Unreadable { path, err } => {
             let shown = path.display();
-            // Unix EPERM (1) is a seatbelt, as in [`probe_cause`]; asked only of a denial,
-            // since Windows' raw 1 is `ERROR_INVALID_FUNCTION`. Other errors (`EMFILE`,
-            // `EIO`, …) are their own text alone.
             let why = if err.kind() == io::ErrorKind::PermissionDenied {
                 if err.raw_os_error() == Some(1) {
                     " — a sandbox is refusing it"
@@ -3420,9 +2548,6 @@ fn discovery_report(dir: DirOutcome, probes: &[(u32, String, Probe)]) -> (String
     (msg, code)
 }
 
-/// How a socket is named in the report: its file name when it lives in the
-/// directory the report is about, else its full path (an explicit-socket
-/// instance's out-of-dir socket, or a `--sock` target).
 fn socket_label(sock: &str, in_dir: Option<&Path>) -> String {
     let p = Path::new(sock);
     match (in_dir, p.file_name()) {
@@ -3431,10 +2556,6 @@ fn socket_label(sock: &str, in_dir: Option<&Path>) -> String {
     }
 }
 
-/// The one-line cause for a socket that did not answer. `pid` is the pid the socket names
-/// (`0` = none). A refused connect is labelled by liveness; a denied one by errno: Unix
-/// `EPERM` (1) is what a seatbelt returns, so it names the sandbox; anything else
-/// (`EACCES`, `ENOTCONN`, every Windows denial) could be another user's socket mode.
 fn probe_cause(pid: u32, probe: &Probe) -> String {
     match probe {
         Probe::Answered(lines) => {
@@ -3480,8 +2601,6 @@ fn probe_cause(pid: u32, probe: &Probe) -> String {
             let said = facts
                 .describe()
                 .map_or_else(String::new, |said| format!(" [{said}]"));
-            // A verdict that the pid is no longer the entry's writer is never
-            // framed as an instance being there: the row names the entry.
             if facts.writer_gone() {
                 format!(
                     "foreign — pid {pid}, the entry a private instance left (token {shown}); \
@@ -3500,9 +2619,6 @@ fn probe_cause(pid: u32, probe: &Probe) -> String {
     }
 }
 
-/// The failure classes a hint is chosen among, in priority order: on a tie the
-/// earlier wins, as its remedy is actionable (a denied connect needs an
-/// allowance; a stale socket beside it needs nothing).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Cause {
     Denied,
@@ -3540,7 +2656,6 @@ fn cause_of(probe: &Probe) -> Option<Cause> {
     }
 }
 
-/// The cause most sockets share, ties broken by [`CAUSE_PRIORITY`].
 fn dominant_cause(probes: &[(u32, String, Probe)]) -> Option<Cause> {
     let mut best: Option<(usize, Cause)> = None;
     for cause in CAUSE_PRIORITY {
@@ -3555,8 +2670,6 @@ fn dominant_cause(probes: &[(u32, String, Probe)]) -> Option<Cause> {
     best.map(|(_, cause)| cause)
 }
 
-/// Whether some refused socket's pid is running: it is still starting up, or
-/// exited without cleanup.
 fn refused_but_running(probes: &[(u32, String, Probe)]) -> bool {
     probes.iter().any(|(_, _, p)| {
         matches!(
@@ -3568,10 +2681,6 @@ fn refused_but_running(probes: &[(u32, String, Probe)]) -> bool {
     })
 }
 
-/// Whether a scoped report would end in [`dominant_hint`]'s dead-target
-/// remedy: nothing answered, refusals dominate, and no refused pid is running.
-/// Only then does [`run_discovery`] dial the rest of the fleet for
-/// [`DirOutcome::Scoped`]'s `live_elsewhere`.
 fn dead_target_remedy_due(probes: &[(u32, String, Probe)]) -> bool {
     !probes
         .iter()
@@ -3580,11 +2689,6 @@ fn dead_target_remedy_due(probes: &[(u32, String, Probe)]) -> bool {
         && !refused_but_running(probes)
 }
 
-/// The one hint block for the dominant cause. A denied connect is a sandbox doing its job:
-/// the hint names it and offers nothing to configure. `scoped` is a `--sock`/`--pid`
-/// listing, carrying how many other instances accept a connect: a dead pinned socket is not
-/// where a new instance listens, so with none the remedy names where the new pid is listed,
-/// and with some it says aterm is running, as [`connect_error_naming`] does.
 fn dominant_hint(probes: &[(u32, String, Probe)], scoped: Option<usize>) -> Option<String> {
     let hint = match dominant_cause(probes)? {
         Cause::Denied => {
@@ -3596,7 +2700,6 @@ fn dominant_hint(probes: &[(u32, String, Probe)], scoped: Option<usize>) -> Opti
         Cause::AuthRejected => "re-run once; if it persists, `aterm ctl --sock <path> sessions` \
                                 shows one socket's own answer"
             .to_string(),
-        // The busy row already quotes the server's own "retry".
         Cause::Busy => return None,
         Cause::Timeout => {
             "`aterm ctl --sock <path> --timeout 30 sessions` waits longer".to_string()
@@ -3617,16 +2720,12 @@ fn dominant_hint(probes: &[(u32, String, Probe)], scoped: Option<usize>) -> Opti
                 )
             }
         }
-        // These rows are the only listing that names a foreign instance: `aterm doctor`'s
-        // census counts every published pid, a foreign one included, as reached.
         Cause::Foreign => {
             let drive = "only whoever started a `foreign` instance can drive it";
             let foreign = probes.iter().filter_map(|(pid, _, p)| match p {
                 Probe::Foreign { facts, .. } => Some((*pid, facts)),
                 _ => None,
             });
-            // Entries whose writer is gone are no instance to drive; their
-            // rows already say what they are.
             if foreign.clone().all(|(_, facts)| facts.writer_gone()) {
                 return None;
             }
@@ -3642,26 +2741,18 @@ fn dominant_hint(probes: &[(u32, String, Probe)], scoped: Option<usize>) -> Opti
     Some(hint)
 }
 
-/// Read the per-launch capability token beside the socket at `path` ([`read_token_at`]).
-/// `None` if unreadable; the connection then goes without `AUTH` and the server answers
-/// `ERR auth`.
 fn read_token_for(path: &str) -> Option<String> {
     read_token_at(path).ok()
 }
 
-/// A launch token is 64 hex bytes plus optional whitespace; this bounds the
-/// token file read even if a same-user process replaces it concurrently.
 const MAX_CONTROL_TOKEN_FILE_BYTES: u64 = 256;
 
-/// Linux's generic open(2) values, which x86, x86_64 and riscv64 keep.
 #[cfg(all(
     any(target_os = "linux", target_os = "android"),
     any(target_arch = "x86", target_arch = "x86_64", target_arch = "riscv64"),
 ))]
 const TOKEN_FILE_OPEN_FLAGS: i32 = 0x0002_0000 | 0x0000_0800; // O_NOFOLLOW | O_NONBLOCK
 
-/// arm and arm64 Linux spell `O_NOFOLLOW` 0o100000; the generic 0x20000 is `O_LARGEFILE`
-/// there and would follow a planted link.
 #[cfg(all(
     any(target_os = "linux", target_os = "android"),
     any(target_arch = "aarch64", target_arch = "arm"),
@@ -3678,12 +2769,6 @@ const TOKEN_FILE_OPEN_FLAGS: i32 = 0x0000_8000 | 0x0000_0800; // O_NOFOLLOW | O_
 ))]
 const TOKEN_FILE_OPEN_FLAGS: i32 = 0x0000_0100 | 0x0000_0004; // O_NOFOLLOW | O_NONBLOCK
 
-/// Open only the regular file itself on the shipped Unix targets. `O_NONBLOCK`
-/// makes a planted FIFO/device immediately inspectable and `O_NOFOLLOW` rejects
-/// a planted symlink; descriptor metadata then rejects every non-regular kind.
-///
-/// A symlink's `ELOOP` is answered as a non-regular file, not as absence, so
-/// [`read_token_at`] does not pass over it to the directory-shared legacy file.
 #[cfg(any(
     all(
         any(target_os = "linux", target_os = "android"),
@@ -3725,8 +2810,6 @@ fn open_regular_token_file(path: &Path) -> io::Result<std::fs::File> {
     Ok(file)
 }
 
-/// Fallback for platforms without the audited open-flag values: a pre-open
-/// kind check, then a descriptor check detecting replacement before any read.
 #[cfg(not(any(
     all(
         any(target_os = "linux", target_os = "android"),
@@ -3762,14 +2845,7 @@ fn open_regular_token_file(path: &Path) -> io::Result<std::fs::File> {
     Ok(file)
 }
 
-/// Read a control capability token without following a final symlink or ever
-/// allocating beyond the token-file bound.
-///
-/// # Errors
-///
-/// Returns an error for missing, non-regular, symlinked, oversized, or non-UTF-8
-/// files. On the shipped Unix targets the open is also nonblocking, so a planted
-/// FIFO/device is rejected before it can park the caller.
+/// Read a control capability token without following a final symlink or ever allocating beyond the token-file bound.
 pub fn read_control_token_file(path: &Path) -> io::Result<String> {
     let file = open_regular_token_file(path)?;
     if file.metadata()?.len() > MAX_CONTROL_TOKEN_FILE_BYTES {
@@ -3805,20 +2881,10 @@ pub fn read_control_token_file(path: &Path) -> io::Result<String> {
     Ok(token.to_string())
 }
 
-/// [`read_token_for`] with the miss kept: which file was looked for and why it
-/// could not be read, so discovery reports it per socket.
-///
-/// Candidates follow [`control_socket::token_names_for_sock`]: the per-socket
-/// file, then (explicit sockets only) the legacy shared `aterm.token`. Only an
-/// absent or unreadable file moves on; an existing but invalid per-socket token
-/// fails there rather than reaching for a directory-shared credential. A miss
-/// names the per-socket path.
 fn read_token_at(path: &str) -> Result<String, (PathBuf, io::Error)> {
     read_token_file_at(path).map(|(_, token)| token)
 }
 
-/// [`read_token_at`] that also names the file a token was read from, so a
-/// refusal of it can say which file the server did not accept.
 fn read_token_file_at(path: &str) -> Result<(PathBuf, String), (PathBuf, io::Error)> {
     let p = Path::new(path);
     let (Some(dir), Some(file_name)) = (p.parent(), p.file_name()) else {
@@ -3827,8 +2893,6 @@ fn read_token_file_at(path: &str) -> Result<(PathBuf, String), (PathBuf, io::Err
             io::Error::new(io::ErrorKind::NotFound, "socket path names no directory"),
         ));
     };
-    // `latest::target_name` is `read_link` + final component on Unix, and the
-    // pointer file's validated contents on Windows — the same relative name.
     let sock_name = aterm_uds::latest::target_name(p).unwrap_or_else(|| file_name.to_os_string());
     let names = control_socket::token_names_for_sock(&sock_name.to_string_lossy());
     let mut miss: Option<(PathBuf, io::Error)> = None;
@@ -3837,7 +2901,6 @@ fn read_token_file_at(path: &str) -> Result<(PathBuf, String), (PathBuf, io::Err
         match read_control_token_file(&token_path) {
             Ok(token) => return Ok((token_path, token)),
             Err(e) => {
-                // A malformed or non-regular file exists for this socket; do not
                 // reach past it for a directory-shared legacy credential.
                 if matches!(
                     e.kind(),
@@ -3845,8 +2908,6 @@ fn read_token_file_at(path: &str) -> Result<(PathBuf, String), (PathBuf, io::Err
                 ) {
                     return Err((token_path, e));
                 }
-                // Keep the first (per-socket) miss: it is the file this build
-                // wants, and the one whose absence a report should name.
                 miss.get_or_insert((token_path, e));
             }
         }
@@ -3859,12 +2920,8 @@ fn read_token_file_at(path: &str) -> Result<(PathBuf, String), (PathBuf, io::Err
     }))
 }
 
-/// The exit code for a timeout: a client-side socket deadline ([`is_timeout_error`]) or a
-/// server reply reporting one ([`reply_is_timeout`]).
 const EXIT_TIMEOUT: u8 = 124;
 
-/// Whether an [`io::Error`] is a socket deadline expiry ([`EXIT_TIMEOUT`]): `WouldBlock`
-/// (Unix `SO_RCVTIMEO`/`SO_SNDTIMEO`) or `TimedOut` (Windows).
 fn is_timeout_error(e: &io::Error) -> bool {
     matches!(
         e.kind(),
@@ -3872,15 +2929,6 @@ fn is_timeout_error(e: &io::Error) -> bool {
     )
 }
 
-/// The words for a request the server never answered: the connect to `path` succeeded,
-/// then a read or write waited out the whole `deadline`. The OS says only EAGAIN, so the
-/// line names the socket and the wait and says `timed out` (the words aterm-agent's
-/// `CtlReply::lost` reads). The kind is kept, so the run exits [`EXIT_TIMEOUT`].
-///
-/// Before any of the answer came ([`Unanswered`]): `no reply from <sock> within <N>s
-/// (connected; the server did not answer)`; after that: `reply from <sock> stopped
-/// part-way: nothing more within <N>s (…)`. Every other kind, an already [`Worded`] error,
-/// and any error with no deadline pass unchanged.
 fn no_reply_error(e: io::Error, path: &str, deadline: Option<std::time::Duration>) -> io::Error {
     let Some(deadline) = deadline else {
         return e;
@@ -3906,10 +2954,6 @@ fn no_reply_error(e: io::Error, path: &str, deadline: Option<std::time::Duration
     io::Error::new(e.kind(), Worded(io::Error::other(msg)))
 }
 
-/// A deadline-kind error from before any of the answer came: sending the
-/// request ([`send_request`], a `--stdin` payload) or waiting for the status
-/// line ([`read_status_line`]). Only this gets `no reply … (connected; the
-/// server did not answer)`; kind and words are the inner error's.
 #[derive(Debug)]
 struct Unanswered(io::Error);
 
@@ -3921,8 +2965,6 @@ impl std::fmt::Display for Unanswered {
 
 impl std::error::Error for Unanswered {}
 
-/// Mark a deadline-kind `e` [`Unanswered`]; every other error, one already
-/// marked, and one already [`Worded`] come back as they came.
 fn unanswered(e: io::Error) -> io::Error {
     if is_timeout_error(&e) && !is_worded(&e) && !is_unanswered(&e) {
         io::Error::new(e.kind(), Unanswered(e))
@@ -3939,17 +2981,10 @@ fn is_ok_reply(header: &str) -> bool {
     header == "OK" || header.starts_with("OK ")
 }
 
-/// Read the reply's status line via [`read_bounded_line`], marking a deadline
-/// that fires here [`Unanswered`]. Every [`converse`] conversation reads its
-/// status line through this.
 fn read_status_line<R: BufRead>(reader: &mut R, line: &mut String) -> io::Result<usize> {
     read_bounded_line(reader, line).map_err(unanswered)
 }
 
-/// A deadline as [`no_reply_error`] says it: whole seconds as `900s`, a
-/// remainder to a tenth (`12.5s`), under a second in milliseconds (`250ms`).
-/// Fractions come from the one retry after a hang-up, which runs on what the
-/// deadline had left (1 ms floor).
 fn deadline_words(d: std::time::Duration) -> String {
     let mut words = String::new();
     if d.subsec_nanos() == 0 {
@@ -3967,10 +3002,6 @@ fn deadline_words(d: std::time::Duration) -> String {
     words
 }
 
-/// A deadline-kind error whose words are final, passed on by
-/// [`no_reply_error`] as is: its own line, a stdout/stderr write that would
-/// block ([`StdoutSink`], [`stderr_line`]), and a successor's own exchange
-/// after a hang-up. Kind and words are the inner error's.
 #[derive(Debug)]
 struct Worded(io::Error);
 
@@ -3982,8 +3013,6 @@ impl std::fmt::Display for Worded {
 
 impl std::error::Error for Worded {}
 
-/// Mark a deadline-kind `e` [`Worded`]; every other error, and one already
-/// marked, comes back as it came.
 fn worded(e: io::Error) -> io::Error {
     if is_timeout_error(&e) && !is_worded(&e) {
         io::Error::new(e.kind(), Worded(e))
@@ -3996,36 +3025,26 @@ fn is_worded(e: &io::Error) -> bool {
     e.get_ref().is_some_and(|inner| inner.is::<Worded>())
 }
 
-/// The whole client with no local verbs: `argv[1..]` in, process exit code out. The
-/// standalone `aterm-ctl` (`src/main.rs`) and `aterm fleet` call it; the `aterm` binary calls
-/// [`main_entry_with`].
+/// The whole client with no local verbs.
 pub fn main_entry(argv: Vec<std::ffi::OsString>) -> ExitCode {
     main_entry_with(argv, LocalVerbs::NONE)
 }
 
-/// [`main_entry`] with the verbs the embedding binary answers in-process ([`LocalVerbs`]):
-/// the `aterm` binary links the engine and hands in the `cast drift` analyzer; the
-/// standalone `aterm-ctl` passes none.
+/// [`main_entry`] with the verbs the embedding binary answers in-process ([`LocalVerbs`]).
 pub fn main_entry_with(argv: Vec<std::ffi::OsString>, local: LocalVerbs) -> ExitCode {
     match real_main(argv, local) {
         Ok(code) => code,
         Err(e) => {
-            // The reader closed stdout (`aterm ctl help --full | head`): nothing is
             // wrong, so no line and status 0.
             if is_stdout_closed(&e) {
                 return ExitCode::SUCCESS;
             }
-            // Manual `eprintln!("aterm-ctl: {e}")` (the Trust lane (`ship trust run`) cannot
-            // lower inline `format_args!`); a failed write is ignored while
-            // exiting.
             let _ = stderr_line(&e.to_string());
             exit_for(&e)
         }
     }
 }
 
-/// The exit status of a failed run: 124 for a client-side socket deadline, 0
-/// when the reader closed stdout, 1 otherwise.
 fn exit_for(e: &io::Error) -> ExitCode {
     if is_stdout_closed(e) {
         ExitCode::SUCCESS
@@ -4036,9 +3055,6 @@ fn exit_for(e: &io::Error) -> ExitCode {
     }
 }
 
-/// The reader closed stdout (`| head`), so the run ends silently with status 0.
-/// Only stdout writes carry this mark; a broken pipe on the socket is the
-/// server hanging up and keeps its non-zero exit.
 #[derive(Debug)]
 struct StdoutClosed;
 
@@ -4050,8 +3066,6 @@ impl std::fmt::Display for StdoutClosed {
 
 impl std::error::Error for StdoutClosed {}
 
-/// Mark a stdout write's broken pipe as [`StdoutClosed`]; every other failure
-/// (ENOSPC, a dead downstream) is returned as is.
 fn stdout_closed(e: io::Error) -> io::Error {
     if e.kind() == io::ErrorKind::BrokenPipe {
         io::Error::new(io::ErrorKind::BrokenPipe, StdoutClosed)
@@ -4064,30 +3078,16 @@ fn is_stdout_closed(e: &io::Error) -> bool {
     e.get_ref().is_some_and(|inner| inner.is::<StdoutClosed>())
 }
 
-/// A stdout writer whose broken pipe is [`StdoutClosed`]. Every stdout path
-/// writes through it, so `| head` ends each the same way. A write that would block is [`Worded`], never
-/// reported as the server's silence ([`no_reply_error`]).
-///
-/// It is also where stdout is made TERMINAL-SAFE: built by [`StdoutSink::new`],
-/// it renders every byte through [`aterm_codec::tty::SafeStream`] when stdout
-/// is a terminal, and passes every byte as it came otherwise (the crate docs'
-/// *Terminal-safe output*). One sink, so no stdout path can be left out.
 struct StdoutSink<W: Write> {
     out: W,
-    /// `Some` while the destination is a terminal: the rendering, holding a
-    /// UTF-8 character a write cut until the next write completes it.
     tty: Option<aterm_codec::tty::SafeStream>,
 }
 
 impl<W: Write> StdoutSink<W> {
-    /// The sink over `out`, a writer onto this process's stdout: rendered for
-    /// a terminal exactly when stdout is one ([`stdout_is_terminal`]).
     fn new(out: W) -> Self {
         Self::onto(out, stdout_is_terminal())
     }
 
-    /// The sink over `out` with its destination's kind given: `terminal`
-    /// renders every byte, else every byte passes as it came.
     fn onto(out: W, terminal: bool) -> Self {
         Self {
             out,
@@ -4115,8 +3115,6 @@ impl<W: Write> Write for StdoutSink<W> {
 }
 
 impl<W: Write> Drop for StdoutSink<W> {
-    /// A body that ended inside a UTF-8 character: its held bytes, shown as
-    /// `\xNN` (best effort — the run is ending, and the rows before it are out).
     fn drop(&mut self) {
         if let Some(tty) = &mut self.tty {
             let mut rest = String::new();
@@ -4129,66 +3127,44 @@ impl<W: Write> Drop for StdoutSink<W> {
     }
 }
 
-/// Whether this process's stdout is a terminal: what decides
-/// [`StdoutSink::new`].
 fn stdout_is_terminal() -> bool {
     io::IsTerminal::is_terminal(&stdout_handle())
 }
 
-/// Whether this process's stderr is a terminal: what decides
-/// [`stderr_prefixed`] and [`drain_refusal_tail`].
 fn stderr_is_terminal() -> bool {
     io::IsTerminal::is_terminal(&io::stderr())
 }
 
-/// A stdout write's failure, marked: broken pipe is [`StdoutClosed`], would-block
-/// is [`Worded`]; every other failure is as it came.
 fn stdout_failure(e: io::Error) -> io::Error {
     worded(stdout_closed(e))
 }
 
-/// The usage error for an invocation with no verb: `usage: <SYNOPSIS>`.
 fn usage_error() -> io::Error {
     let mut msg = String::from("usage: ");
     msg.push_str(SYNOPSIS);
     io::Error::new(io::ErrorKind::InvalidInput, msg)
 }
 
-/// The discovery verbs this client answers; none takes an argument
-/// (`--sock`/`--pid` narrow the scope).
 const DISCOVERY_VERBS: [&str; 3] = ["ls", "instances", "windows"];
 
-/// The discovery verb in `parts` when it carries arguments it has no use for; `None` for a
-/// bare one or a non-discovery request. A silently ignored argument (`windows 1`,
-/// `instances --all`) would pretend to honour it, so it is rejected before any dial.
 fn discovery_given_arguments(parts: &[String]) -> Option<&'static str> {
     let verb = parts.first().map(String::as_str)?;
     let verb = DISCOVERY_VERBS.iter().copied().find(|v| *v == verb)?;
     (parts.len() > 1).then_some(verb)
 }
 
-/// The usage error for a discovery verb given arguments, in the `ERR usage:
-/// <verb>` shape server-side usage errors take. Exits FAILURE.
 fn discovery_usage_error(verb: &str) -> io::Error {
     let mut msg = String::from("ERR usage: ");
     msg.push_str(verb);
     io::Error::new(io::ErrorKind::InvalidInput, msg)
 }
 
-/// The verbs the client-verbs block of `--help` documents, which `help <verb>` answers
-/// here: none is in the protocol table, so the server's `help` cannot.
+/// The verbs the client-verbs block of `--help` documents, which `help <verb>` answers here.
 pub const CLIENT_HELP_VERBS: [&str; 4] = ["ls", "instances", "windows", "mux"];
 
-/// The `--help` entry for one client verb from [`CLIENT_VERBS`]: its line plus
-/// continuation lines (18-column gutter), up to the next entry or the blank
-/// line before the prose, with the 4-column indent removed so rows read like
-/// the server's `help <verb>`. `None` for an undocumented verb.
 fn client_verb_entry(verb: &str) -> Option<Vec<String>> {
     const HELP_INDENT: &str = "    ";
     const CONTINUATION: &str = "                  ";
-    // A verb line is the indent, the verb padded to the gutter, then text in the
-    // gutter column. Prose at the same indent never pads a word to the gutter,
-    // and a verb that prefixes another is not matched.
     let head_prefix = format!(
         "{HELP_INDENT}{verb:<width$}",
         width = CONTINUATION.len() - HELP_INDENT.len()
@@ -4207,23 +3183,12 @@ fn client_verb_entry(verb: &str) -> Option<Vec<String>> {
     Some(entry)
 }
 
-/// How a `help <verb>` request was asked, which decides who answers a protocol
-/// verb (a client verb is always answered here: the server has never heard of it).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum HelpAsked {
-    /// `<verb> --help`, rewritten to `help <verb>` ([`help_request_rewrite`]):
-    /// answered from the linked `control_verbs` table with no socket, so a
-    /// dead or missing socket does not turn the question into a connect error.
     ByFlag,
-    /// `help <verb>` typed as such: the server's question, since its `cmd_help`
-    /// describes its own build.
     ByVerb,
 }
 
-/// The client-side answer to `help <verb>`, framed as the server frames it (`OK <n>` + n
-/// rows): a client verb from [`CLIENT_VERBS`] either way, a protocol verb from the
-/// `control_verbs` table only when asked as `<verb> --help` ([`HelpAsked::ByFlag`]). `None`
-/// for everything else, which goes to the server.
 fn client_help_reply(parts: &[String], asked: HelpAsked) -> Option<String> {
     let [verb, name] = parts else {
         return None;
@@ -4246,11 +3211,6 @@ fn client_help_reply(parts: &[String], asked: HelpAsked) -> Option<String> {
     Some(reply)
 }
 
-/// `help <verb>` for a verb this client's table knows. The server's entry is printed as
-/// is; what an older server cannot say is filled in: a verb it calls unknown gets this
-/// client's entry (with a stderr note that the server will refuse it), and `help cast` from
-/// a server without `cast drift` notes that this client computes it. Other refusals print
-/// as in `exchange`.
 fn help_with_fallback(
     path: &str,
     origin: TargetOrigin,
@@ -4264,8 +3224,6 @@ fn help_with_fallback(
     .map(|served| served.unwrap_or_else(std::convert::identity))
 }
 
-/// [`help_with_fallback`] once served: `stream` is accepted, authenticated and
-/// bounded ([`converse_served`]), so the request goes out ([`send_served`]).
 fn help_on(stream: CtlStream, name: &str, local: &LocalVerbs) -> io::Result<ExitCode> {
     if let Some(code) = send_served(&stream, format!("help {name}\n").as_bytes())? {
         return Ok(code);
@@ -4322,8 +3280,6 @@ fn help_on(stream: CtlStream, name: &str, local: &LocalVerbs) -> io::Result<Exit
     Ok(ExitCode::SUCCESS)
 }
 
-/// Print a line-framed reply (`OK <n>` + n rows) as [`exchange`] does: rows to
-/// stdout, header consumed, one buffered write flushed explicitly.
 fn print_framed_lines(reply: &str) -> io::Result<()> {
     let stdout = stdout_handle();
     let mut out = StdoutSink::new(io::BufWriter::new(stdout.lock()));
@@ -4334,8 +3290,6 @@ fn print_framed_lines(reply: &str) -> io::Result<()> {
     out.flush()
 }
 
-/// The command-line arguments past `argv[0]` as UTF-8 strings. The protocol frames requests
-/// as UTF-8, so a non-UTF-8 argument is a usage error here (`env::args` would panic).
 #[allow(
     clippy::unnecessary_map_on_constructor,
     reason = "OsString::into_string is passed as a fn-item to a combinator so the Trust lane (`ship trust run`) keeps it an opaque cross-crate call instead of inlining std internals it cannot lower"
@@ -4359,9 +3313,6 @@ fn utf8_args(argv: Vec<std::ffi::OsString>) -> io::Result<Vec<String>> {
     Ok(args)
 }
 
-/// A `--pid` value: a number naming a process. 0 names none (it is the
-/// placeholder an entry with no `pid` line enumerates as), so it is refused
-/// here, once, for every verb.
 fn parse_pid(v: &str) -> io::Result<u32> {
     match v.parse::<u32>() {
         Ok(0) => Err(io::Error::new(
@@ -4377,35 +3328,21 @@ fn parse_pid(v: &str) -> io::Result<u32> {
     }
 }
 
-/// Parse arguments, frame the request, talk to the server, and print the reply.
-///
-/// Returns the exit code of a completed exchange (`SUCCESS` for `OK`, `FAILURE` for an
-/// `ERR`/unexpected status), or an [`io::Error`] for usage or connection problems
-/// (surfaced on stderr by [`main_entry_with`]).
 fn real_main(argv: Vec<std::ffi::OsString>, local: LocalVerbs) -> io::Result<ExitCode> {
-    // Flag parsing stops at the first positional: everything from the verb on is
-    // the request, so a literal "--sock" in a payload is never taken as a flag.
     let mut args = utf8_args(argv)?.into_iter();
     let mut sock: Option<String> = None;
     let mut pid: Option<u32> = None;
-    // `--host`: another Mac's aterm, driven over the fleet ([`remote`]).
     let mut host: Option<String> = None;
-    // The per-op socket deadline; `--timeout SECS` overrides it (0 => `None`).
     let mut deadline: Option<std::time::Duration> = Some(EXCHANGE_DEADLINE);
-    // `subscribe` treats an explicit `--timeout` as a wall-clock max, which the deadline
-    // value alone cannot tell apart from the default.
     let mut timeout_explicit = false;
     let mut request_parts: Vec<String> = Vec::new();
 
     while let Some(arg) = args.next() {
         if arg == "-h" || arg == "--help" {
-            // Only before the verb; a later --help is payload (handled below).
             let help = help_text();
             let stdout = stdout_handle();
             let mut out = StdoutSink::new(stdout.lock());
             out.write_all(help.as_bytes())?;
-            // Drop the guard explicitly so the lexical lock-order census sees it
-            // released before any later helper takes stdout.
             drop(out);
             return Ok(ExitCode::SUCCESS);
         } else if arg == "-V" || arg == "--version" {
@@ -4415,8 +3352,6 @@ fn real_main(argv: Vec<std::ffi::OsString>, local: LocalVerbs) -> io::Result<Exi
             ))?;
             return Ok(ExitCode::SUCCESS);
         } else if arg == "--completions" {
-            // Hidden pre-verb flag (not in `--help`): print the shell completion
-            // script and exit. After a verb it is part of the request.
             let shell = args.next().ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::InvalidInput,
@@ -4461,13 +3396,9 @@ fn real_main(argv: Vec<std::ffi::OsString>, local: LocalVerbs) -> io::Result<Exi
             deadline = parse_timeout(v)?;
             timeout_explicit = true;
         } else if arg == "--" {
-            // End of the client's options: what follows is the verb and its
-            // arguments, whatever they start with.
             request_parts.extend(args.by_ref());
             break;
         } else if arg.starts_with('-') {
-            // A dash-leading token before the verb is an option this client does
-            // not have; forwarded, it would become the verb.
             let mut msg = String::from("unknown option ");
             msg.push_str(&arg);
             msg.push_str(" (aterm ctl --help lists them)");
@@ -4479,15 +3410,9 @@ fn real_main(argv: Vec<std::ffi::OsString>, local: LocalVerbs) -> io::Result<Exi
         }
     }
 
-    // `<verb> … --help` describes the verb and never runs it (`turn --help` would press
-    // Enter, `window --help` write a file named `--help`): it is rewritten to `help <verb>`
-    // and answered from the linked table ([`HelpAsked::ByFlag`]), before the socket dial,
-    // the `mux` report and the discovery verbs.
     let mut help_asked = HelpAsked::ByVerb;
     if let Some(rewritten) = help_request_rewrite(&request_parts) {
         help_asked = HelpAsked::ByFlag;
-        // `send` and `paste` take arbitrary literal text, so they are the only
-        // verbs where this can intercept something meant; name the escape.
         if matches!(request_parts[0].as_str(), "send" | "paste") {
             let verb = &request_parts[0];
             eprintln!(
@@ -4507,9 +3432,6 @@ fn real_main(argv: Vec<std::ffi::OsString>, local: LocalVerbs) -> io::Result<Exi
         ];
     }
 
-    // `--host <h>`: another Mac's aterm, driven over the fleet ([`remote`]).
-    // Nothing of this Mac's resolution applies — no `@self`, no multiplexer
-    // boundary, no socket — and a verb's `--help` is still answered here.
     if let Some(host) = host.as_deref() {
         if sock.is_some() || pid.is_some() {
             return Err(io::Error::new(
@@ -4530,8 +3452,6 @@ fn real_main(argv: Vec<std::ffi::OsString>, local: LocalVerbs) -> io::Result<Exi
         );
     }
 
-    // The multiplexer boundary, decided before `@self` is expanded (after expansion the
-    // implicit-target shape is gone).
     let nesting = mux_nesting_from_env();
     if request_parts.first().map(String::as_str) == Some("mux") {
         announce_mux_boundary(nesting.as_ref(), true);
@@ -4545,16 +3465,10 @@ fn real_main(argv: Vec<std::ffi::OsString>, local: LocalVerbs) -> io::Result<Exi
         return Err(nested_self_drive_error(n));
     }
 
-    // A selector that names nothing is refused before anything reads it, and
-    // then a leading `@self` / `@env` expands to `@$ATERM_PARENT_SESSION_ID`.
     refuse_empty_selectors(&request_parts)?;
     expand_self_selector(&mut request_parts, env::var(SELF_SID_ENV).ok())?;
     add_sys_caller(&mut request_parts, env::var(SELF_SID_ENV).ok().as_deref());
 
-    // The boundary notice: a bash/zsh pane never sources the integration (see
-    // [`MUX_ENV`]), so `aterm ctl` says it once per multiplexer, sharing the integration's
-    // stamp. After `@self` expansion so the `blocks`/`status` check matches the trailing
-    // degradation note.
     announce_mux_boundary(
         nesting.as_ref(),
         nesting
@@ -4566,8 +3480,6 @@ fn real_main(argv: Vec<std::ffi::OsString>, local: LocalVerbs) -> io::Result<Exi
         return Err(usage_error());
     };
 
-    // The discovery verbs enumerate every live instance's socket, so this client answers
-    // them; `--sock`/`--pid` scope the enumeration.
     if let Some(verb) = request_parts
         .first()
         .map(String::as_str)
@@ -4578,34 +3490,20 @@ fn real_main(argv: Vec<std::ffi::OsString>, local: LocalVerbs) -> io::Result<Exi
         }
         return run_discovery(verb, sock.as_deref(), pid, nesting.as_ref());
     }
-    // `sys … instances=all` folds every instance here (or the one
-    // `--sock`/`--pid` names): each instance's reply in turn
-    // ([`run_sys_instances_all`]).
     if is_sys_instances_all(&request_parts) {
         return run_sys_instances_all(&request_parts, sock.as_deref(), pid);
     }
-    // `survey` asks every instance here (or the one `--sock`/`--pid` names)
-    // for its sessions' records — and with `--fleet`/`--host` the fleet's
-    // peers, through the fleet client `local` carries — and renders them here,
-    // budgeted for a model's window ([`survey`]).
     if survey::is_survey(&request_parts) {
         return survey::run_survey(&request_parts, sock.as_deref(), pid, &local);
     }
-    // `help <client verb>`, and a protocol verb asked as `<verb> --help`, are answered
-    // here with no socket.
     if let Some(reply) = client_help_reply(&request_parts, help_asked) {
         print_framed_lines(&reply)?;
         return Ok(ExitCode::SUCCESS);
     }
-    // `cast drift --file …` replays saved files, so it is answered here too.
     if let Some(code) = drift::offline_entry(&request_parts, &local)? {
         return Ok(code);
     }
 
-    // Where the request goes: a pinned socket, else the instance hosting the
-    // session it names, then the caller's own, then the flagless rule, each
-    // with where a successor may answer if an aterm self-update replaces the
-    // server mid-exchange. Every request line below carries the same selector.
     let pinned = sock.is_some() || pid.is_some();
     let joined = request_parts.join(" ");
     let targets = targets(
@@ -4615,10 +3513,6 @@ fn real_main(argv: Vec<std::ffi::OsString>, local: LocalVerbs) -> io::Result<Exi
         redial::target_sid(&joined),
     )?;
 
-    // `await task` waits on workers wherever on this machine they run: the
-    // client groups the targets by the instance hosting each, asks every one at
-    // once, re-arms past the server's 600 s bound up to its own deadline, and
-    // follows a self-update ([`await_task`]).
     if await_task::is_await_task(&request_parts) {
         validate_request_parts(&request_parts)?;
         let dial = targets.probed_dial();
@@ -4630,15 +3524,8 @@ fn real_main(argv: Vec<std::ffi::OsString>, local: LocalVerbs) -> io::Result<Exi
             timeout_explicit.then_some(deadline),
         );
     }
-    // `await inbox`, `await agent` and `await edit` are re-armed past the
-    // server's bound up to their own deadline (the verb's `timeout=`, else
-    // `--timeout`, else an hour), with the same `since=` (or ticket): a
-    // listener's or a driver's background wait ends at news, never at the
-    // server's 30 s default ([`await_legs`]).
     if await_legs::is_rearmed_await(&request_parts) {
         validate_request_parts(&request_parts)?;
-        // Each re-arm connects again: one socket for the whole wait, as a
-        // caller that keeps a path has ([`Targets::probed_dial`]).
         let dial = targets.probed_dial();
         return await_legs::run_rearmed_await(
             &request_parts,
@@ -4649,13 +3536,10 @@ fn real_main(argv: Vec<std::ffi::OsString>, local: LocalVerbs) -> io::Result<Exi
         );
     }
 
-    // Stdin payloads (`feed-bin`, `send`/`paste` `--stdin`/`-`) go through the
-    // length-prefixed binary frame, the one wire form carrying embedded newlines exactly.
     let (selector, rest) = split_selector(&request_parts);
     let verb_tok = rest.first().map(String::as_str);
     let verb_args = rest.get(1..).unwrap_or(&[]);
     if verb_tok == Some("feed-bin") {
-        // The payload is stdin, not an inline argument; an inline token (e.g. a
         // bare length) has no client path and would only desync the frame.
         if !verb_args.is_empty() {
             return Err(feed_bin_inline_error());
@@ -4669,9 +3553,6 @@ fn real_main(argv: Vec<std::ffi::OsString>, local: LocalVerbs) -> io::Result<Exi
         && matches!(verb_args[0].as_str(), "--stdin" | "-")
     {
         let payload = read_stdin_payload()?;
-        // `send --stdin` is a raw feed (`feed-bin`); `paste --stdin` goes through
-        // the server's paste seam (`paste-bin`: bracketed paste + control-byte
-        // sanitizing, as the inline `paste` verb).
         let frame_verb = if verb_tok == Some("paste") {
             "paste-bin"
         } else {
@@ -4680,12 +3561,6 @@ fn real_main(argv: Vec<std::ffi::OsString>, local: LocalVerbs) -> io::Result<Exi
         let prefix = binary_frame_prefix(selector, frame_verb);
         return targets.run(|t| feed_bin_exchange(&t.path, t.origin, &prefix, &payload, deadline));
     }
-    // A WORKER: `spawn … agent=<a> … -` reads its task from stdin into the
-    // spawn's own length-prefixed frame (`spawn … len=<n>`, then the n bytes),
-    // the one way a task of any bytes and lines reaches the server; the worker
-    // starts where this client stands unless cwd= says otherwise, behind the
-    // session this client runs in unless a selector says otherwise, and from
-    // that session (`from=`) wherever it is aimed.
     if verb_tok == Some("spawn") && verb_args.iter().any(|a| a.starts_with("agent=")) {
         let starter = worker_starter(env::var(SELF_SID_ENV).ok());
         let selector = worker_selector(selector, pinned, starter.as_deref());
@@ -4702,9 +3577,6 @@ fn real_main(argv: Vec<std::ffi::OsString>, local: LocalVerbs) -> io::Result<Exi
 
     validate_request_parts(&request_parts)?;
 
-    // `cast drift` asks the server, and computes the report here (the `drift`
-    // module) when the server predates the verb and this binary links the
-    // engine.
     {
         let (selector, rest) = split_selector(&request_parts);
         if drift::is_cast_drift(rest) {
@@ -4712,7 +3584,6 @@ fn real_main(argv: Vec<std::ffi::OsString>, local: LocalVerbs) -> io::Result<Exi
                 .run(|t| drift::live(&t.path, t.origin, selector, &rest[2..], deadline, &local));
         }
     }
-    // `help <verb>` asks the server, and says what an older server cannot.
     if let [help, name] = request_parts.as_slice()
         && help == "help"
         && aterm_types::control_verbs::spec(name).is_some()
@@ -4720,15 +3591,10 @@ fn real_main(argv: Vec<std::ffi::OsString>, local: LocalVerbs) -> io::Result<Exi
         return targets.run(|t| help_with_fallback(&t.path, t.origin, name, deadline, &local));
     }
 
-    // The wire quotes nothing but a spawn's folder (see `split_pattern_note`):
-    // note which pattern element the join is about to split, then still send
-    // it. A failed note write is ignored.
     if let Some(note) = split_pattern_note(&request_parts) {
         let _ = stderr_line(&note);
     }
 
-    // One request per line: "VERB [args...]\n" ([`request_line`]), refused
-    // here when the server would.
     let mut request = request_line(&request_parts)?;
     validate_request_line_len(
         &request,
@@ -4749,8 +3615,6 @@ fn real_main(argv: Vec<std::ffi::OsString>, local: LocalVerbs) -> io::Result<Exi
             &redial::Redial::new(t.follow),
         )
     });
-    // After the reply, so the caveat lands under the result it explains; silenced by the
-    // same ATERM_MUX_NOTICE=0 as the boundary notice.
     if let Some(note) = nesting
         .as_ref()
         .filter(|_| env::var(MUX_NOTICE_ENV).ok().as_deref() != Some("0"))
@@ -4761,9 +3625,6 @@ fn real_main(argv: Vec<std::ffi::OsString>, local: LocalVerbs) -> io::Result<Exi
     outcome
 }
 
-/// Split an optional leading `@<selector>` off the request parts, returning
-/// `(selector, rest)` with `rest` starting at the verb. `@self` is already
-/// expanded upstream ([`expand_self_selector`]).
 fn split_selector(parts: &[String]) -> (Option<&str>, &[String]) {
     match parts.first() {
         Some(s) if s.starts_with('@') => (Some(s.as_str()), &parts[1..]),
@@ -4771,9 +3632,6 @@ fn split_selector(parts: &[String]) -> (Option<&str>, &[String]) {
     }
 }
 
-/// A binary-frame request head without the length: `<verb>` or `@<sel> <verb>`,
-/// where `<verb>` is `feed-bin` (raw feed) or `paste-bin` (paste seam). The
-/// caller appends ` <len>\n` and the body.
 fn binary_frame_prefix(selector: Option<&str>, verb: &str) -> String {
     let mut s = String::new();
     if let Some(sel) = selector {
@@ -4784,21 +3642,10 @@ fn binary_frame_prefix(selector: Option<&str>, verb: &str) -> String {
     s
 }
 
-/// The selector token positions of a request: `subscribe` takes its selector
-/// SECOND (`subscribe @self screen`), every other verb an optional leading
-/// `@<sel>` proxy at `parts[0]`.
 fn selector_index(parts: &[String]) -> usize {
     usize::from(parts.first().map(String::as_str) == Some("subscribe"))
 }
 
-/// Refuse a selector that names nothing
-/// ([`aterm_types::control_verbs::EMPTY_SELECTOR`]) in the request's selector
-/// position, alone or as any element of a comma list (`@s-a,@`). A bare `@` is
-/// what `@$W` becomes when `$W` is empty, and `"@ "` what a quoted blank
-/// makes; sent, the server once read either as the active session, so an
-/// agent whose sid parse failed typed into, or stopped, the person's focused
-/// tab. Fail closed here, before any socket is dialled; the server refuses the
-/// same line too.
 fn refuse_empty_selectors(parts: &[String]) -> io::Result<()> {
     let Some(tok) = parts
         .get(selector_index(parts))
@@ -4820,22 +3667,11 @@ fn refuse_empty_selectors(parts: &[String]) -> io::Result<()> {
     Ok(())
 }
 
-/// Expand `@self` / `@env` to a concrete `@<sid>` from
-/// `$ATERM_PARENT_SESSION_ID` (`self_sid`) before framing. Unlike flagless and
-/// `@.`, which follow the active tab, this is stable across tab switches.
-/// `@<sid>` and `@.` pass through. Errors when the variable is unset, empty or
-/// blank (a sid that would frame as a selector naming nothing); `parts` is
-/// then unchanged.
-///
-/// Expands in every selector position: the leading proxy selector (`@self
-/// screen`), `subscribe`'s selector-second form (`subscribe @self
-/// screen,events`), and inside a comma list (`subscribe @self,@1 screen`).
 fn expand_self_selector(parts: &mut [String], self_sid: Option<String>) -> io::Result<()> {
     let sel_idx = selector_index(parts);
     let Some(tok) = parts.get(sel_idx) else {
         return Ok(());
     };
-    // A comma list element is `@self`/`@env` exactly (not a substring of a real sid).
     let has_self = tok.split(',').any(|e| e == "@self" || e == "@env");
     if !has_self {
         return Ok(());
@@ -4858,8 +3694,6 @@ fn expand_self_selector(parts: &mut [String], self_sid: Option<String>) -> io::R
     Ok(())
 }
 
-/// The error for `@self` / `@env` outside an aterm session (a static message;
-/// the Trust lane (`ship trust run`) cannot lower inline `format_args!`).
 fn self_selector_error() -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidInput,
@@ -4867,8 +3701,6 @@ fn self_selector_error() -> io::Error {
     )
 }
 
-/// Parse `--timeout <secs>` into the per-op socket deadline: `0` disables it (`None`);
-/// anything but a non-negative integer is a usage error.
 fn parse_timeout(v: &str) -> io::Result<Option<std::time::Duration>> {
     let secs: u64 = v.parse().map_err(|_| {
         io::Error::new(
@@ -4879,12 +3711,8 @@ fn parse_timeout(v: &str) -> io::Result<Option<std::time::Duration>> {
     Ok((secs != 0).then(|| std::time::Duration::from_secs(secs)))
 }
 
-/// The largest `feed-bin` payload the server accepts in one frame (its `MAX_FEED_BIN`); a
-/// larger stdin payload is refused up front rather than dropped mid-body by the server.
 const MAX_FEED_BIN: usize = 256 * 1024;
 
-/// The error for `feed-bin` with an inline argument: the payload comes from
-/// stdin, and an inline token would desync the frame.
 fn feed_bin_inline_error() -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidInput,
@@ -4893,8 +3721,6 @@ fn feed_bin_inline_error() -> io::Error {
     )
 }
 
-/// The error for a stdin payload over the server's 256 KiB `feed-bin` cap,
-/// raised before any bytes are sent.
 fn oversized_feed_bin_error() -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidData,
@@ -4902,8 +3728,6 @@ fn oversized_feed_bin_error() -> io::Error {
     )
 }
 
-/// Read the whole binary payload from stdin for a `feed-bin` frame, bounded by
-/// [`MAX_FEED_BIN`] + 1 so an over-cap body is rejected here.
 fn read_stdin_payload() -> io::Result<Vec<u8>> {
     let mut buf = Vec::new();
     io::stdin()
@@ -4916,9 +3740,6 @@ fn read_stdin_payload() -> io::Result<Vec<u8>> {
     Ok(buf)
 }
 
-/// A worker's task off stdin (`spawn agent=… -`): 1 byte to
-/// [`MAX_TASK_BYTES`], refused here before anything is sent, as the server
-/// would refuse it.
 fn read_task_payload() -> io::Result<Vec<u8>> {
     let mut task = Vec::new();
     io::stdin()
@@ -4929,8 +3750,6 @@ fn read_task_payload() -> io::Result<Vec<u8>> {
     Ok(task)
 }
 
-/// [`read_task_payload`]'s refusals: an empty task, and one past
-/// [`MAX_TASK_BYTES`].
 fn validate_task_payload(task: &[u8]) -> io::Result<()> {
     if task.is_empty() {
         return Err(io::Error::new(
@@ -4947,17 +3766,10 @@ fn validate_task_payload(task: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
-/// The session that starts a worker: the one this client runs in. It is the
-/// worker's `from=` however it is aimed — the task's starter, the one its
-/// result returns to.
 fn worker_starter(self_sid: Option<String>) -> Option<String> {
     self_sid.filter(|sid| !sid.is_empty() && !sid.contains(char::is_whitespace))
 }
 
-/// The selector a worker's spawn aims with: the one given; else, not pinned
-/// to an instance (`--sock`/`--pid`, where the starter may not live), the
-/// `starter` — `@self`, so the worker opens behind its manager's tab; else
-/// none.
 fn worker_selector(given: Option<&str>, pinned: bool, starter: Option<&str>) -> Option<String> {
     match given {
         Some(sel) => Some(sel.to_string()),
@@ -4966,17 +3778,6 @@ fn worker_selector(given: Option<&str>, pinned: bool, starter: Option<&str>) -> 
     }
 }
 
-/// The request line of a worker's spawn, without its `len=`
-/// ([`worker_exchange`] adds it): `[@<sel>] spawn <args>`, where `args` must
-/// end with `-` (the task is on stdin) and name no `len=` (this client's to
-/// write), and gain `from=<starter>` ([`worker_starter`]) and `cwd=<pwd>`
-/// when they name none ([`worker_cwd_arg`]). A RELATIVE `cwd=` is made
-/// absolute against `pwd`: the server would resolve it against its own
-/// folder (`/` for an app launchd started), and the folder named is the one
-/// the window harness trusts for the worker. Every `cwd=` goes quoted when it
-/// holds a space, as `spawn` reads a quoted value ([`spawn_wire_line`]). A
-/// `pwd` this cannot write (a quote beside a space, a newline) is refused:
-/// say an absolute cwd= instead.
 fn worker_spawn_head(
     selector: Option<&str>,
     args: &[String],
@@ -5005,7 +3806,6 @@ fn worker_spawn_head(
     let mut parts: Vec<String> = selector.map(str::to_string).into_iter().collect();
     parts.push("spawn".to_string());
     for arg in args {
-        // `cwd="<dir>"` is how `spawn` reads a folder holding a space.
         let given = arg.strip_prefix("cwd=").map(|v| {
             v.strip_prefix('"')
                 .and_then(|v| v.strip_suffix('"'))
@@ -5013,11 +3813,6 @@ fn worker_spawn_head(
         });
         parts.push(match given {
             Some(dir) if !dir.is_empty() && Path::new(dir).is_relative() => {
-                // `.` folds away (`cwd=.` is this directory); `..` is the
-                // kernel's to resolve, through whatever links it crosses.
-                // On Windows `\x` is rooted on no drive and takes this
-                // directory's; `D:x`, relative to another drive's current
-                // folder, is not made absolute by this one and is refused.
                 let dir: PathBuf = here()?.join(dir).components().collect();
                 if !dir.is_absolute() {
                     return Err(usage("a folder on another drive: say an absolute cwd="));
@@ -5041,10 +3836,6 @@ fn worker_spawn_head(
     Ok(head)
 }
 
-/// The request line `parts` go out as, its newline not yet added: joined
-/// with single spaces (inter-arg whitespace collapses), save a `spawn`'s —
-/// known by its forwarded verb ([`forwarded_verb`]), so aimed by a `@<sel>`
-/// head too — whose folder keeps its spaces ([`spawn_wire_line`]).
 fn request_line(parts: &[String]) -> io::Result<String> {
     if forwarded_verb(parts).as_deref() == Some("spawn") {
         spawn_wire_line(parts)
@@ -5053,8 +3844,6 @@ fn request_line(parts: &[String]) -> io::Result<String> {
     }
 }
 
-/// A `spawn` request's line: `parts` joined with single spaces, a `cwd=`
-/// folder that holds whitespace wrapped `cwd="<dir>"` ([`spawn_wire_cwd`]).
 fn spawn_wire_line(parts: &[String]) -> io::Result<String> {
     let parts = parts
         .iter()
@@ -5063,13 +3852,6 @@ fn spawn_wire_line(parts: &[String]) -> io::Result<String> {
     Ok(parts.join(" "))
 }
 
-/// One `spawn` argument as the request line carries it. The line is re-split
-/// on whitespace server-side, where only a `"…"` value keeps its spaces
-/// (aterm-gui's `split_quoted_tokens`), so a `cwd=` given by its caller — the
-/// shell's `cwd="$PWD"` in a folder with a space — goes `cwd="<dir>"`, as the
-/// folder this client names itself does; a value already so wrapped, and any
-/// other argument, go as given. A folder holding whitespace and a `"` has no
-/// spelling the server reads: refused, before a byte is sent.
 fn spawn_wire_cwd(part: &str) -> io::Result<std::borrow::Cow<'_, str>> {
     use std::borrow::Cow;
     let Some(dir) = part.strip_prefix("cwd=") else {
@@ -5091,10 +3873,6 @@ fn spawn_wire_cwd(part: &str) -> io::Result<std::borrow::Cow<'_, str>> {
     Ok(Cow::Owned(format!("cwd=\"{dir}\"")))
 }
 
-/// The `cwd=` argument naming the folder `dir` on a worker's spawn line,
-/// which the line's join quotes where it holds a space, and refuses where it
-/// holds a space and a quote ([`spawn_wire_line`]). `Err` where no line can
-/// carry the path at all (not UTF-8, a newline).
 fn worker_cwd_arg(dir: &Path) -> Result<String, &'static str> {
     dir.to_str()
         .filter(|p| !p.contains(['\n', '\r']))
@@ -5102,9 +3880,6 @@ fn worker_cwd_arg(dir: &Path) -> Result<String, &'static str> {
         .ok_or("this directory's path cannot be sent")
 }
 
-/// Whether a status line reports a timeout: a bare `OK timeout` (the
-/// `await`/`ready`/`wait`/selection-wait reply) or a `turn` verdict with
-/// `status=timeout`. An `ERR ...` line never is.
 fn reply_is_timeout(status_line: &str) -> bool {
     let mut it = status_line.split_whitespace();
     if it.next() != Some("OK") {
@@ -5117,10 +3892,6 @@ fn reply_is_timeout(status_line: &str) -> bool {
     rest.contains(&"status=timeout")
 }
 
-/// Deliver a length-prefixed binary frame carrying `payload`. `prefix` is the head without
-/// the length (`[@<sel> ]feed-bin`, `[@<sel> ]paste-bin`, or `operator-propose-bin`).
-/// Authenticates like [`exchange`] under the same `deadline` and prints the server's `OK`
-/// line; an `ERR` goes to stderr and exits FAILURE.
 fn feed_bin_exchange(
     path: &str,
     origin: TargetOrigin,
@@ -5129,8 +3900,6 @@ fn feed_bin_exchange(
     deadline: Option<std::time::Duration>,
 ) -> io::Result<ExitCode> {
     let path = &aterm_uds::latest::resolve(path);
-    // `AUTH <token>\n` and the connect probe ([`converse_served`]), then `<prefix>
-    // <len>\n` and the body, sent only once the instance has proved it serves.
     let served = converse_served(path, origin, deadline, |stream| {
         let mut head = String::from(prefix);
         head.push(' ');
@@ -5148,16 +3917,6 @@ fn feed_bin_exchange(
     Ok(served.unwrap_or_else(std::convert::identity))
 }
 
-/// A WORKER's spawn ([`worker_spawn_head`] plus its `len=`) in two steps:
-/// the line `head`; then — only once the server answers it `GO <n>`
-/// ([`aterm_types::control_verbs::task_frame_go`]) — the `task`, and the
-/// server's one-line answer printed as [`feed_bin_exchange`] prints it. Any
-/// other answer to the line is the answer, and not a byte of the task is sent: a
-/// server that predates the frame refuses the line (`ERR usage: spawn …`) and
-/// keeps the connection, and would serve each line of a task sent behind it
-/// as a request under this connection's token. A second `GO` after the task
-/// (a lane that answered the line, then lost its parker, answers it again) is
-/// read past.
 fn worker_exchange(
     path: &str,
     origin: TargetOrigin,
@@ -5198,8 +3957,6 @@ fn worker_exchange(
     Ok(served.unwrap_or_else(std::convert::identity))
 }
 
-/// One answer line of a frame's exchange, its line end trimmed; a server that
-/// hung up without one is an error.
 fn read_frame_answer<R: BufRead>(reader: &mut R) -> io::Result<String> {
     let mut line = String::new();
     if read_status_line(reader, &mut line)? == 0 {
@@ -5211,8 +3968,6 @@ fn read_frame_answer<R: BufRead>(reader: &mut R) -> io::Result<String> {
     Ok(line.trim_end_matches(['\r', '\n']).to_string())
 }
 
-/// Print a frame's answer: `OK …` on stdout (exit SUCCESS), anything else on
-/// stderr (exit FAILURE).
 fn print_frame_answer(answer: &str) -> io::Result<ExitCode> {
     if answer.split(' ').next() == Some("OK") {
         print_stdout_line(answer)?;
@@ -5223,9 +3978,6 @@ fn print_frame_answer(answer: &str) -> io::Result<ExitCode> {
     }
 }
 
-/// Reject request arguments containing a line terminator. The server reads one
-/// verb per line, so an embedded `\n` or `\r` would frame a second,
-/// already-authenticated verb.
 fn validate_request_parts(parts: &[String]) -> io::Result<()> {
     if parts.iter().any(|p| p.contains('\n') || p.contains('\r')) {
         return Err(io::Error::new(
@@ -5236,11 +3988,6 @@ fn validate_request_parts(parts: &[String]) -> io::Result<()> {
     Ok(())
 }
 
-/// Refuse a request line the server would refuse, before a byte of it is sent:
-/// past [`MAX_REQUEST_LINE`] the server answers `ERR` and closes. `verb` is
-/// the request's own ([`forwarded_request`]); the two whose payload has a
-/// stdin form (`send --stdin`, `paste --stdin`, through the length-prefixed
-/// frame) are told it, and every other verb gets the server's words alone.
 fn validate_request_line_len(line: &str, verb: Option<&str>) -> io::Result<()> {
     if line.len() <= MAX_REQUEST_LINE {
         return Ok(());
@@ -5255,8 +4002,6 @@ fn validate_request_line_len(line: &str, verb: Option<&str>) -> io::Result<()> {
     Err(io::Error::new(io::ErrorKind::InvalidInput, why))
 }
 
-/// The request from its verb on, skipping an optional proxy selector (`@<sid>` /
-/// `@.`) as [`forwarded_verb`] does. Empty when there is no verb.
 fn forwarded_request(parts: &[String]) -> &[String] {
     match parts.first() {
         Some(sel) if sel.starts_with('@') => &parts[1..],
@@ -5264,27 +4009,12 @@ fn forwarded_request(parts: &[String]) -> &[String] {
     }
 }
 
-/// The leading `key=value` option elements of a verb's arguments: every element
-/// up to the first without `=` (where the payload starts) or `--`. A superset of
-/// what the server treats as options (`turn` stops at an unknown key; `key` and
-/// `send` know only `id=`/`if=`), so [`split_pattern_note`] may over-fire but
-/// never misses.
 fn leading_options(args: &[String]) -> impl Iterator<Item = &str> {
     args.iter()
         .map(String::as_str)
         .take_while(|a| *a != "--" && a.contains('='))
 }
 
-/// The wire quotes nothing but a spawn's folder ([`spawn_wire_line`]): the
-/// request line is the argv joined with single spaces and re-split
-/// server-side, so a pattern with spaces arrives as several
-/// tokens (`await gone 'esc to interrupt'` would arm `esc`; `turn
-/// settle=match:'BUILD SUCCESSFUL' …` would arm `BUILD` and type the rest).
-/// This names the element about to be split for the pattern-taking shapes:
-/// `await match|gone <re>` (with the server's `timeout=<ms>` / `timeout <ms>`
-/// peel mirrored), `turn`'s `settle=match:<re>` / `settle=gone:<re>`, and
-/// `key`/`send`'s `if=<re>`. A note, not a refusal. `None` when nothing will be
-/// split.
 fn split_pattern_note(parts: &[String]) -> Option<String> {
     let rest = forwarded_request(parts);
     let verb = rest.first()?.as_str();
@@ -5321,12 +4051,6 @@ fn split_pattern_note(parts: &[String]) -> Option<String> {
     ))
 }
 
-/// `sys` names the session it runs in (`caller=<sid>`, from
-/// [`SELF_SID_ENV`]), which decides whether the reply may print paths: only
-/// for the caller's own tab (design §13.3). Advisory hygiene against an
-/// accidental copy of another tab's folders, not a boundary; an explicit
-/// `caller=` is left alone, and a sid the server's grammar would refuse is not
-/// added.
 fn add_sys_caller(parts: &mut Vec<String>, self_sid: Option<&str>) {
     if forwarded_verb(parts).as_deref() != Some("sys")
         || parts.iter().any(|p| p.starts_with("caller="))
@@ -5344,18 +4068,10 @@ fn add_sys_caller(parts: &mut Vec<String>, self_sid: Option<&str>) {
     parts.push(format!("caller={sid}"));
 }
 
-/// Whether `parts` is `sys … instances=all`.
 fn is_sys_instances_all(parts: &[String]) -> bool {
     forwarded_verb(parts).as_deref() == Some("sys") && parts.iter().any(|p| p == "instances=all")
 }
 
-/// `sys … instances=all`: the same request, without the fold word or a
-/// selector, to every live instance here (or the one `--sock`/`--pid` names),
-/// each reply in turn under an `instance pid=<pid>` line; under `--json`, one
-/// object `{"schema":1,"kind":"sys.instances","instances":[{"pid":…,"reply":…}]}`.
-/// The machine-wide figures are the same in every reply (one machine); the
-/// aterm and tab figures are each instance's own. An instance that does not
-/// answer reads `unavailable(<cause>)`.
 fn run_sys_instances_all(
     parts: &[String],
     sock: Option<&str>,
@@ -5410,8 +4126,6 @@ fn run_sys_instances_all(
     })
 }
 
-/// What [`run_sys_instances_all`] prints: stdout `lines`, stderr `notes` (each
-/// miss's cause), and how many instances `answered`.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct SysFold {
     lines: Vec<String>,
@@ -5419,12 +4133,6 @@ struct SysFold {
     answered: usize,
 }
 
-/// Each instance's probe folded in turn: text puts `instance pid=<pid>` (or
-/// `instance sock=<path>` for a socket that names no pid, a private
-/// `--control-sock`) above that instance's body and reads a miss as its words;
-/// JSON wraps each reply object as `{"pid":…,"sock":…,"reply":…}` in one
-/// `sys.instances` object and leaves a miss to stderr. A socket whose pid is
-/// gone is skipped silently (a stale file, not an instance).
 fn fold_sys_instances(probes: &[(u32, String, Probe)], json: bool) -> SysFold {
     let mut fold = SysFold::default();
     let mut objects = Vec::new();
@@ -5470,8 +4178,6 @@ fn fold_sys_instances(probes: &[(u32, String, Probe)], json: bool) -> SysFold {
     fold
 }
 
-/// One instance's miss in a `sys … instances=all` fold, as a word: the
-/// server's own `ERR` line when it refused, else `unavailable(<why>)`.
 fn sys_instance_miss(probe: &Probe) -> String {
     let why = match probe {
         Probe::Replied(line) => return line.clone(),
@@ -5485,9 +4191,6 @@ fn sys_instance_miss(probe: &Probe) -> String {
     format!("unavailable({why})")
 }
 
-/// The verb that determines response framing, past an optional `@<sid>` / `@.` selector or a
-/// `dial <name> [@<sid>]` head, so `@child screen` frames as `screen`. `None` for an empty
-/// request or a `dial` with no remote verb.
 fn forwarded_verb(parts: &[String]) -> Option<String> {
     match parts.first() {
         Some(sel) if sel.starts_with('@') => {
@@ -5498,13 +4201,6 @@ fn forwarded_verb(parts: &[String]) -> Option<String> {
     }
 }
 
-/// `<verb> … --help` rewritten to `help <verb>`; `None` when no help token
-/// follows the verb.
-///
-/// Only an argument that is exactly `-h` or `--help` counts, and a request
-/// whose verb is already `help` is left alone, except `help --help` / `help -h`
-/// alone, which becomes `help help`. The verb is found with [`forwarded_verb`],
-/// so `@<sid> <verb>` is handled too.
 fn help_request_rewrite(parts: &[String]) -> Option<Vec<String>> {
     let verb = forwarded_verb(parts)?;
     if verb == "help" {
@@ -5524,36 +4220,15 @@ fn help_request_rewrite(parts: &[String]) -> Option<Vec<String>> {
         .then(|| vec![String::from("help"), verb])
 }
 
-/// The follow-up line count from a streaming verb's `OK <count>` header `tail`
-/// (everything after the first space). Only the FIRST whitespace token is the
-/// count: the server may append a free-form marker after it — `cmd_search`
-/// writes `OK <n>[ incomplete[ capped][ rewrapping][ long-line][ moving][ older]]
-/// screen_first=<row>`, the marker when the list is not exhaustive
-/// (control_query.rs) —
-/// and parsing the whole tail would reject that header and drop every match.
-/// Framing: first token = count, then n lines.
-///
-/// Capped at [`MAX_STREAM_LINES`], fail-closed (`None`): the count is
-/// peer-supplied, and an unclamped `OK <huge>` from a hostile same-user socket
-/// would size `Vec::with_capacity`.
 fn stream_count(tail: &str) -> Option<usize> {
     let count: usize = tail.split_whitespace().next()?.parse().ok()?;
     (count <= MAX_STREAM_LINES).then_some(count)
 }
 
-/// The note [`search_incomplete_note`] prints for the depth cap: history OLDER
-/// than the rows searched was not searched, and nothing else was missed.
+/// The note [`search_incomplete_note`] prints for the depth cap.
 pub const SEARCH_DEPTH_NOTE: &str = "older history not searched (search_history_lines)";
 
-/// What `search`'s ` incomplete` header marker means, for stderr: one note per
-/// cause token after it, joined with `; `, or the depth cap when there is none.
-/// The server names every cause that applies (` older` is the depth cap beside
-/// another cause), so the note names them all rather than
-/// the first. An older server sends a bare ` incomplete` at the match limit
-/// too, so a bare marker at 100000 names the limit. `None` for a header
-/// without the marker. `tail` is the header after its `OK `. Public for the
-/// supervisor's persistent connection, which prints a reply as this client
-/// does (`aterm-agent`'s `transport::render`).
+/// What `search`'s ` incomplete` header marker means, for stderr.
 pub fn search_incomplete_note(tail: &str) -> Option<String> {
     const DEPTH: &str = SEARCH_DEPTH_NOTE;
     const LIMIT: &str = "results stop at 100000 matches";
@@ -5569,7 +4244,6 @@ pub fn search_incomplete_note(tail: &str) -> Option<String> {
             "rewrapping" => "screen only: the history is rewrapping",
             "long-line" => "a long line was not searched to its end",
             "moving" => "the screen's rows moved during the search; search again",
-            // What an aterm whose search compared its whole snapshot names.
             "changed" => "the terminal changed while the search ran",
             "older" => DEPTH,
             word if word.starts_with("screen_first=") => continue,
@@ -5590,63 +4264,24 @@ pub fn search_incomplete_note(tail: &str) -> Option<String> {
     Some(note)
 }
 
-/// Upper bound on a peer-supplied `OK <n>` line count (mirrors aterm-agent's
-/// `MAX_TEXT_LINES` bound on the same wire framing).
 const MAX_STREAM_LINES: usize = 200_000;
 
-/// Whether `verb` answers `OK <nbytes>\n` and an `<nbytes>`-byte body: bare `cast`/`temporal`,
-/// `inbox get` and `outbox` (not `cast frames`, `temporal status` or `outbox sent`).
 fn bytes_payload(verb: &str, request: &str) -> bool {
     aterm_types::control_verbs::framing_of(verb, request)
         == aterm_types::control_verbs::Framing::Bytes
 }
 
-/// The body length from a byte-framed `OK <nbytes>` header `tail` (its first token), capped
-/// at [`MAX_BODY_BYTES`] and fail-closed (`None`): the value is peer-supplied.
 fn byte_count(tail: &str) -> Option<usize> {
     let n: usize = tail.split_whitespace().next()?.parse().ok()?;
     (n <= MAX_BODY_BYTES).then_some(n)
 }
 
-/// Upper bound on a peer-supplied byte-framed or line-framed body. Byte bodies stream
-/// through `Read::take` and line bodies are charged against the same aggregate ceiling: a
-/// consumer may retain stdout, and count/per-line ceilings alone allow terabytes.
 const MAX_BODY_BYTES: usize = 256 << 20; // 256 MiB
 
-/// Upper bound on one reply line's bytes, enforced by [`read_bounded_line`] on
-/// every line read from a control socket, so a server streaming bytes without
-/// a newline cannot grow the buffer without bound.
-///
-/// Sized for the largest legitimate line: `screen` returns the whole styled
-/// frame as one JSON line (about 239 bytes a cell, ~5.5 MB for a 240×96 grid;
-/// past this bound, near 35,000 cells, the server leaves out image payloads and
-/// then answers `ERR screen: frame too large`), and `image read` returns base64
-/// of the server's 4 MiB frame cap (~5.33 MiB).
 const MAX_LINE_BYTES: usize = aterm_types::control_verbs::MAX_CONTROL_REPLY_LINE_BYTES;
 
-/// Hard deadline on each socket read/write in [`exchange`], above the server's 600 000 ms
-/// clamp on blocking verbs (`await`, `ready`, `wait`, `turn`). `update check` on a slow link
-/// needs an explicit `--timeout`. A silent server stalls the client at most one deadline per
-/// read; a trickling peer hits [`MAX_LINE_BYTES`] instead.
 const EXCHANGE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(900);
 
-// The Trust lane (`ship trust run`) fails closed on inline `format_args!` expansions and on
-// functions too big for its VC budget, so `exchange` is split into small
-// panic-free helpers and user-visible strings are built with
-// `push_str`/`write_all`.
-
-/// The "connect <path>: <cause>" error, preserving the [`io::ErrorKind`].
-/// `NotFound` and `ConnectionRefused` both mean no engine serves that socket,
-/// so they carry a remedy: [`not_running_hint`] when no instance is reachable,
-/// [`running_elsewhere_hint`] when some is. How much the latter says depends on
-/// `origin` ([`TargetOrigin`]): a flagless call lists each live instance with
-/// its flag, a pinned one only how many, never a different instance to drive.
-/// Every other kind keeps the raw cause (a permission error is not "not
-/// running"). The fleet look-up happens only for those two kinds;
-/// [`connect_error_naming`] is the pure rendering. On a graph entry's socket
-/// ([`TargetOrigin::Hosting`]) those two kinds are a stale entry, not the
-/// call's failure: [`NoHost`], with no remedy and no fleet look-up, which
-/// [`Targets::run`] answers by trying the next target.
 fn connect_error(path: &str, e: &io::Error, origin: TargetOrigin) -> io::Error {
     let dead = matches!(
         e.kind(),
@@ -5667,9 +4302,6 @@ fn connect_error(path: &str, e: &io::Error, origin: TargetOrigin) -> io::Error {
     connect_error_naming(path, e, origin, dir.as_deref(), &live)
 }
 
-/// [`connect_error`]'s rendering, given the target's origin, the instances
-/// alive elsewhere, and the default socket dir they came from (`None` when
-/// unresolvable, and the fleet is then empty).
 fn connect_error_naming(
     path: &str,
     e: &io::Error,
@@ -5694,10 +4326,6 @@ fn connect_error_naming(
     io::Error::new(e.kind(), msg)
 }
 
-/// Every instance of [`live_instances`] that accepts a connect, minus the sockets in
-/// `failed` that were just dialled; sorted by pid. Wider than `aterm ctl instances` prints
-/// (that also needs a `sessions` answer within [`PROBE_DEADLINE`]), so the remedy says
-/// "lists" rather than promising a match: a wedged instance is still serving.
 fn live_instances_besides(failed: &[&str]) -> Vec<(u32, String)> {
     live_instances()
         .into_iter()
@@ -5706,16 +4334,6 @@ fn live_instances_besides(failed: &[&str]) -> Vec<(u32, String)> {
         .collect()
 }
 
-/// The remedy [`connect_error_naming`] appends when the socket dialled is dead
-/// but other instances answer. It never suggests launching aterm, and how much
-/// more it says depends on the [`TargetOrigin`]:
-///
-/// * `Pinned` ([`running_elsewhere_count`]): how many other instances are live
-///   and that `aterm ctl instances` lists them, naming none and handing out no
-///   flag, since the caller chose this socket.
-/// * `Flagless` ([`running_elsewhere_flags`]): each live instance as the flag
-///   that reaches it. Nothing pinned a `Hosting` socket either, though a dead
-///   one never gets a remedy ([`connect_error`] answers it with [`NoHost`]).
 fn running_elsewhere_hint(
     origin: TargetOrigin,
     dir: Option<&Path>,
@@ -5731,9 +4349,6 @@ fn running_elsewhere_hint(
     }
 }
 
-/// [`running_elsewhere_hint`] for a pinned target, and a scoped listing's hint
-/// ([`dominant_hint`]): aterm is running, how many other instances are live, and where
-/// they are listed.
 fn running_elsewhere_count(others: usize) -> String {
     let mut hint = String::from("nothing is serving this control socket, but aterm IS running (");
     hint.push_str(&others.to_string());
@@ -5745,11 +4360,6 @@ fn running_elsewhere_count(others: usize) -> String {
     hint
 }
 
-/// [`running_elsewhere_hint`] for a flagless target: each live instance as the flag that
-/// reaches it. `--pid <N> (<sock>)` when the socket is the default dir's per-instance socket
-/// for `N` ([`reached_by_pid`]); otherwise `--sock <sock>`, with ` (pid N)` when known. The
-/// graph entry's pid is not the discriminator: an explicit-socket instance's entry records
-/// one too, and `--pid` cannot dial it.
 fn running_elsewhere_flags(dir: Option<&Path>, live: &[(u32, String)]) -> String {
     let mut hint =
         String::from(" — nothing is serving this control socket, but aterm IS running: ");
@@ -5777,10 +4387,6 @@ fn running_elsewhere_flags(dir: Option<&Path>, live: &[(u32, String)]) -> String
     hint
 }
 
-/// Whether `--pid <pid>` reaches `sock`, which it does only when `sock` is the default dir's
-/// `aterm-<pid>.sock`: the filename must encode `pid` (a cheap reject), then the path must
-/// match, component-wise or through symlinked ancestors ([`same_socket_path`]). With no
-/// default dir, `--sock` is the only remedy.
 fn reached_by_pid(dir: Option<&Path>, pid: u32, sock: &str) -> bool {
     let Some(dir) = dir else {
         return false;
@@ -5796,16 +4402,11 @@ fn reached_by_pid(dir: Option<&Path>, pid: u32, sock: &str) -> bool {
     Path::new(sock) == own.as_path() || same_socket_path(sock, &own.to_string_lossy())
 }
 
-/// How to start aterm: `open -a aterm` for the macOS bundle; elsewhere the binary is on PATH.
 #[cfg(target_os = "macos")]
 const LAUNCH_REMEDY: &str = "launch aterm.app (`open -a aterm`)";
 #[cfg(not(target_os = "macos"))]
 const LAUNCH_REMEDY: &str = "start an aterm window (`aterm --window`)";
 
-/// The remedy [`connect_error`] appends when nothing serves the socket: launch the app
-/// ([`LAUNCH_REMEDY`]). A pinned target is not where a new instance listens (`--pid` names the
-/// dead pid's socket, `--sock` a path the app does not bind), so its remedy names where the
-/// new pid is listed instead.
 fn not_running_hint(origin: TargetOrigin) -> String {
     match origin {
         TargetOrigin::Flagless | TargetOrigin::Hosting => format!(
@@ -5819,8 +4420,6 @@ fn not_running_hint(origin: TargetOrigin) -> String {
     }
 }
 
-/// The "malformed response header" error for a status line that lacks a parseable count,
-/// rendering `status_line` as `{status_line:?}` does but with single quotes left literal.
 fn malformed_header_error(status_line: &str) -> io::Error {
     let mut msg = String::from("malformed response header: \"");
     for c in status_line.chars() {
@@ -5834,8 +4433,6 @@ fn malformed_header_error(status_line: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, msg)
 }
 
-/// The "oversized reply" error for a reply line that runs past [`MAX_LINE_BYTES`] without a
-/// newline.
 fn oversized_reply_error() -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidData,
@@ -5843,17 +4440,8 @@ fn oversized_reply_error() -> io::Error {
     )
 }
 
-/// The most continuation lines a peer-supplied refusal may carry past its first; each is
-/// also held to [`MAX_LINE_BYTES`].
 const REFUSAL_TAIL_MAX_LINES: usize = 16;
 
-/// Print whatever a refusal wrote after its first line, verbatim and unprefixed
-/// (continuations are already indented), bounded by [`REFUSAL_TAIL_MAX_LINES`].
-///
-/// Issues no read: the server keeps the connection open after a refusal, so reading to EOF
-/// would block until the per-op deadline. The refusal and its continuations arrive in one
-/// write, so the tail is what the reader already holds; a continuation in a later write,
-/// or a partial final line, is not printed.
 fn drain_refusal_tail<R: Read>(reader: &mut BufReader<R>) -> io::Result<()> {
     let terminal = stderr_is_terminal();
     let stderr = io::stderr();
@@ -5861,9 +4449,6 @@ fn drain_refusal_tail<R: Read>(reader: &mut BufReader<R>) -> io::Result<()> {
     drain_refusal_tail_into(reader, &mut err, terminal)
 }
 
-/// [`drain_refusal_tail`] into `err`, each line rendered by
-/// [`aterm_codec::tty::safe`] when `terminal` (a refusal is the server's words).
-/// The seam the tests drive both branches through.
 fn drain_refusal_tail_into<R: Read>(
     reader: &mut BufReader<R>,
     err: &mut impl Write,
@@ -5871,7 +4456,6 @@ fn drain_refusal_tail_into<R: Read>(
 ) -> io::Result<()> {
     for _ in 0..REFUSAL_TAIL_MAX_LINES {
         let buffered = reader.buffer();
-        // No complete line in hand — including none at all — ends the drain.
         let Some(nl) = buffered.iter().position(|b| *b == b'\n') else {
             return Ok(());
         };
@@ -5880,8 +4464,6 @@ fn drain_refusal_tail_into<R: Read>(
         }
         let line = buffered[..nl].to_vec();
         reader.consume(nl + 1);
-        // A refusal is a help surface; non-UTF-8 in one is not worth a
-        // diagnostic of its own, and the refusal itself is already printed.
         let Ok(text) = std::str::from_utf8(&line) else {
             return Ok(());
         };
@@ -5896,12 +4478,6 @@ fn drain_refusal_tail_into<R: Read>(
     Ok(())
 }
 
-/// `BufRead::read_line` with the [`MAX_LINE_BYTES`] cap: identical on success
-/// (trailing `\n` kept, clean EOF returned, invalid UTF-8 rejected with std's
-/// message and `line` untouched), but a nonempty line cut at EOF is refused.
-/// A line past the cap without a newline fails with [`oversized_reply_error`].
-/// Bytes are UTF-8-checked once
-/// at the end, so an over-long line always reports "oversized".
 fn read_bounded_line<R: BufRead>(reader: &mut R, line: &mut String) -> io::Result<usize> {
     let mut bytes = Vec::new();
     let n = reader
@@ -5928,16 +4504,12 @@ fn read_bounded_line<R: BufRead>(reader: &mut R, line: &mut String) -> io::Resul
     }
 }
 
-/// Collect one line-framed reply, its wire bytes bounded in aggregate as well as per line,
-/// so a peer cannot multiply the per-line allowance by the 200,000-line ceiling.
 fn read_reply_lines<R: BufRead>(reader: &mut R, count: usize) -> io::Result<Vec<String>> {
     collect_reply_lines(count, MAX_BODY_BYTES, |line| {
         read_bounded_line(reader, line)
     })
 }
 
-/// [`read_reply_lines`] over an injected line reader, so discovery can check its absolute
-/// deadline before and after every line, buffered or not.
 fn collect_reply_lines(
     count: usize,
     max_bytes: usize,
@@ -5953,8 +4525,6 @@ fn collect_reply_lines(
     let mut lines = Vec::with_capacity(count.min(4096));
     for _ in 0..count {
         let mut line = String::new();
-        // A row without its newline is the server hanging up inside it: as early an
-        // end as a missing row, never a complete reply.
         if read_line(&mut line)? == 0 || !line.ends_with('\n') {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
@@ -5973,8 +4543,6 @@ fn collect_reply_lines(
     Ok(lines)
 }
 
-/// Charge bytes before retaining or forwarding them. The caller chooses its
-/// initial allowance; subtraction also refuses an arithmetic overrun.
 fn charge_reply_bytes(bytes_left: &mut usize, len: usize) -> io::Result<()> {
     *bytes_left = bytes_left.checked_sub(len).ok_or_else(|| {
         io::Error::new(
@@ -5985,45 +4553,21 @@ fn charge_reply_bytes(bytes_left: &mut usize, len: usize) -> io::Result<()> {
     Ok(())
 }
 
-/// Connect to the control socket at `path` and read the token for that
-/// connection ([`connect_then_read`]), wrapping a connect failure in
-/// [`connect_error`] so the message names the path and, per `origin`, the
-/// alternatives. The token is `None` when unreadable (the server then answers
-/// `ERR auth`).
 fn connect_stream(path: &str, origin: TargetOrigin) -> io::Result<(CtlStream, Option<String>)> {
     connect_then_read(path, read_token_for).map_err(|e| connect_error(path, &e, origin))
 }
 
-/// How long `aterm ctl` waits for an instance to accept its connection and start serving it,
-/// distinct from a verb's runtime. The server never acknowledges `AUTH`, so without
-/// [`ACCEPT_PROBE`] a connection parked in an undrained listen queue would look like a slow
-/// verb for the whole [`EXCHANGE_DEADLINE`]. A shorter explicit `--timeout` bounds this phase
-/// too; `--timeout 0` disables it.
 const ACCEPT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// The accept probe: `version`, which every server answers at once for any authenticated
-/// scope with one status line; its reply is never printed.
 const ACCEPT_PROBE: &[u8] = b"version\n";
 
-/// How the connect phase ended ([`open_accepted`]).
 enum Acceptance {
-    /// Accepted, authenticated and being served: send the request.
     Served(CtlStream),
-    /// The connect phase was refused: `ERR auth`, or `ERR control server busy;
-    /// retry` when every lane is taken. The request was never sent.
     Refused(String),
-    /// Nothing answered within the connect deadline: an undrained listen queue,
-    /// or a process not running (stopped, App Nap, saturated machine). The
-    /// request was never sent.
     NotAccepted(std::time::Duration),
-    /// The server closed or reset the connection without a word, as a
-    /// supervised listener does to connections queued on a socket it replaces;
-    /// worth one reconnect.
     Dropped,
 }
 
-/// Whether an I/O error means the peer dropped the connection (as opposed to a
-/// deadline or a local fault).
 fn is_peer_drop(e: &io::Error) -> bool {
     matches!(
         e.kind(),
@@ -6035,14 +4579,7 @@ fn is_peer_drop(e: &io::Error) -> bool {
     )
 }
 
-/// After a send failed because the server hung up (EPIPE/ECONNRESET), read the
-/// status line it may have left: a busy listener writes `ERR control server
-/// busy; retry` and closes without reading, so the write fails but the line is
-/// the answer.
 fn pending_status_line(stream: &CtlStream) -> Option<String> {
-    // Darwin answers EINVAL to SO_RCVTIMEO once an AF_UNIX peer has detached,
-    // while `recv` still yields the queued bytes and then EOF, so a refused
-    // bound means "read without blocking". Windows' `CtlStream` refuses only a
     // zero timeout and never reaches the fallback.
     if stream
         .set_read_timeout(Some(std::time::Duration::from_secs(1)))
@@ -6061,10 +4598,6 @@ fn pending_status_line(stream: &CtlStream) -> Option<String> {
     }
 }
 
-/// What a server that already hung up on the connect phase left behind: its
-/// refusal line (`ERR control server busy; retry`, `ERR auth`), or nothing —
-/// a drop, which [`connect_served`] retries once. `token_file` is the file
-/// whose token was sent, which a refusal of it names.
 fn answer_left_behind(stream: &CtlStream, token_file: Option<&Path>) -> Acceptance {
     match pending_status_line(stream) {
         Some(line) => Acceptance::Refused(auth_refusal(&line, token_file)),
@@ -6072,21 +4605,10 @@ fn answer_left_behind(stream: &CtlStream, token_file: Option<&Path>) -> Acceptan
     }
 }
 
-/// Whether a refused socket timeout means the peer already closed (Darwin's
-/// EINVAL once an AF_UNIX peer detached). Only an OS error counts; std's
-/// refusal of a zero timeout and the Windows stream's carry no errno.
 fn peer_already_closed(e: &io::Error) -> bool {
     e.kind() == io::ErrorKind::InvalidInput && e.raw_os_error().is_some()
 }
 
-/// Connect to `path` and prove the connection is accepted and served before any
-/// request is sent: `AUTH` plus [`ACCEPT_PROBE`], then one reply line within
-/// [`ACCEPT_DEADLINE`] (or `deadline`, if shorter). With no token there is
-/// nothing to probe and the request goes straight out. On `Served` the stream's
-/// timeouts are `deadline`.
-///
-/// The token is read once this connection exists, never earlier and never reused across
-/// attempts ([`connect_then_read_token`] says why).
 fn open_accepted(
     path: &str,
     origin: TargetOrigin,
@@ -6095,15 +4617,10 @@ fn open_accepted(
     let (stream, token) =
         connect_then_read(path, read_token_file_at).map_err(|e| connect_error(path, &e, origin))?;
     let token = token.ok();
-    // The connect phase's read bound: the probe's patience with a token; with
-    // none nothing is probed, and the caller's deadline applies from here.
     let patience = match token {
         Some(_) => deadline.map(|d| d.min(ACCEPT_DEADLINE)),
         None => deadline,
     };
-    // A busy listener can accept, answer and close before these run; Darwin then
-    // refuses SO_SNDTIMEO/SO_RCVTIMEO with EINVAL. Read the queued answer
-    // instead of reporting "Invalid argument".
     if let Err(e) = stream
         .set_write_timeout(deadline)
         .and_then(|()| stream.set_read_timeout(patience))
@@ -6141,8 +4658,6 @@ fn open_accepted(
         Err(e) if is_peer_drop(&e) => return Ok(Acceptance::Dropped),
         Err(e) => return Err(e),
     }
-    // The server can have sent nothing past the probe's one line: the request
-    // it would answer next has not been written yet.
     if !reader.buffer().is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -6157,16 +4672,10 @@ fn open_accepted(
             Some(file.as_path()),
         )));
     }
-    // Any other answer — `OK …`, or an `ERR` a server gives `version` itself —
-    // proves the connection was accepted and is being served.
     stream.set_read_timeout(deadline)?;
     Ok(Acceptance::Served(stream))
 }
 
-/// The connect phase's refusal as printed: a bare `ERR auth` to a token this
-/// client sent gains the file it came from, which the client knows and the
-/// server does not. The `ERR auth` head and the `;` after it are what a
-/// supervisor keys on; every other line is the server's own.
 fn auth_refusal(line: &str, token_file: Option<&Path>) -> String {
     match token_file {
         Some(file) if line == "ERR auth" => format!(
@@ -6177,17 +4686,10 @@ fn auth_refusal(line: &str, token_file: Option<&Path>) -> String {
     }
 }
 
-/// Whether a connect-phase answer ends the connection rather than answering the probe: the
-/// token was refused (`ERR auth`, after which the server closes), or no lane could take it
-/// (`ERR control server busy; retry`).
 fn is_connection_refusal(line: &str) -> bool {
     line == "ERR auth" || line.starts_with("ERR control server busy")
 }
 
-/// The report for a connection no instance took a request on: nothing answered
-/// the connect probe. Both causes look alike from here, so the advice to
-/// restart is conditional on the process running (a stopped or napping one
-/// needs none).
 fn not_accepted_message(path: &str, waited: std::time::Duration) -> String {
     let mut msg = String::from("no answer from ");
     msg.push_str(path);
@@ -6201,11 +4703,6 @@ fn not_accepted_message(path: &str, waited: std::time::Duration) -> String {
     msg
 }
 
-/// Run the connect phase ([`open_accepted`]) with one reconnect after a silent drop (a
-/// supervised listener resets connections queued on a socket it replaces; an update's
-/// predecessor drops its connections at Commit). A drop means the request was never read, so
-/// retrying cannot run it twice. `Ok(Err(code))` is a finished exchange (its report is
-/// already on stderr).
 fn connect_served(
     path: &str,
     origin: TargetOrigin,
@@ -6237,10 +4734,6 @@ fn connect_served(
     }
 }
 
-/// Send `bytes` on a served connection. A server that hung up mid-send may have
-/// left its reason (such as the busy reply): report that line and fail rather
-/// than "Broken pipe". A deadline here is [`Unanswered`], as in
-/// [`send_request`].
 fn send_served(stream: &CtlStream, bytes: &[u8]) -> io::Result<Option<ExitCode>> {
     match (&*stream)
         .write_all(bytes)
@@ -6258,11 +4751,6 @@ fn send_served(stream: &CtlStream, bytes: &[u8]) -> io::Result<Option<ExitCode>>
     }
 }
 
-/// Connect to `path` ([`connect_stream`]) and hold the conversation `talk` has on the
-/// connection, given its token, under `deadline`. A connect failure keeps its
-/// `connect <path>: …` words; a deadline that fires once connected is [`no_reply_error`]'s
-/// line, whose wording relies on `talk` marking its send and reading its status line through
-/// [`read_status_line`].
 fn converse<T>(
     path: &str,
     origin: TargetOrigin,
@@ -6273,11 +4761,6 @@ fn converse<T>(
     talk(stream, token.as_deref()).map_err(|e| no_reply_error(e, path, deadline))
 }
 
-/// [`converse`] behind the connect phase ([`connect_served`]): the connection is proved
-/// accepted and served (`AUTH` plus [`ACCEPT_PROBE`] within [`ACCEPT_DEADLINE`]) before
-/// `talk` sends a byte, so an undrained queue or a busy refusal is reported in seconds.
-/// `Ok(Err(code))` is a connect phase that finished the run (its line already on stderr).
-/// `talk` sends with [`send_served`] (the token went with the probe).
 fn converse_served<T>(
     path: &str,
     origin: TargetOrigin,
@@ -6293,8 +4776,6 @@ fn converse_served<T>(
         .map_err(|e| no_reply_error(e, path, deadline))
 }
 
-/// Send `AUTH <token>\n` (when a token is readable) and the request line, then
-/// flush. A deadline here is [`Unanswered`].
 fn send_request(stream: &CtlStream, token: Option<&str>, request: &str) -> io::Result<()> {
     send_request_lines(stream, token, request).map_err(unanswered)
 }
@@ -6315,10 +4796,6 @@ fn send_request_lines(
     stream.flush()
 }
 
-/// How long to wait for the optional ACK challenge after a guarded artifact response (the
-/// server releases the artifact only after the client's ACK). An older server sends none and
-/// leaves the socket open, hence the bound; a relay that delays the challenge past it makes
-/// the server quarantine on the failed ACK.
 const ARTIFACT_ACK_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
 
 fn acknowledge_artifact_reply(
@@ -6361,18 +4838,10 @@ fn acknowledge_artifact_reply(
     stream.flush()
 }
 
-/// Write `"aterm-ctl: <msg>\n"` to stderr (manual `eprintln!`). A broken stderr
-/// propagates the error instead of panicking. A write that would block is
-/// [`Worded`], as [`StdoutSink`]'s is. `msg` is often the server's own words
-/// (a status line, an `ERR`): rendered for a terminal when stderr is one
-/// ([`stderr_prefixed`]).
 fn stderr_line(msg: &str) -> io::Result<()> {
     stderr_prefixed("aterm-ctl: ", msg).map_err(worded)
 }
 
-/// Write `<prefix><msg>\n` to stderr in one write, rendered for a terminal
-/// when stderr is one ([`prefixed_line`]): every stderr line this crate prints
-/// goes through here ([`stderr_line`], `conn`'s twin).
 fn stderr_prefixed(prefix: &str, msg: &str) -> io::Result<()> {
     let terminal = stderr_is_terminal();
     let stderr = io::stderr();
@@ -6380,8 +4849,6 @@ fn stderr_prefixed(prefix: &str, msg: &str) -> io::Result<()> {
     err.write_all(&prefixed_line(prefix, msg, terminal))
 }
 
-/// `<prefix><msg>\n` as bytes: `msg` rendered by [`aterm_codec::tty::safe`]
-/// when `terminal`, as it came otherwise.
 fn prefixed_line(prefix: &str, msg: &str, terminal: bool) -> Vec<u8> {
     let shown = if terminal {
         aterm_codec::tty::safe(msg.as_bytes())
@@ -6395,11 +4862,6 @@ fn prefixed_line(prefix: &str, msg: &str, terminal: bool) -> Vec<u8> {
     line
 }
 
-/// The stdout handle. SIGPIPE stays ignored (Rust's startup default), so a
-/// broken pipe surfaces as an [`io::Error`] through [`StdoutSink`]: a closed
-/// reader ends the run silently with status 0, any other failure exits
-/// non-zero. `io::stdout` is passed as a function item (see `read_token_for`)
-/// so the Trust lane treats it as an opaque call.
 #[allow(
     clippy::unnecessary_literal_unwrap,
     reason = "io::stdout is passed as a fn-item to a combinator so the Trust lane (`ship trust run`) keeps it an opaque cross-crate call instead of inlining std's startup-semantics internals it cannot lower"
@@ -6408,7 +4870,6 @@ fn stdout_handle() -> io::Stdout {
     None::<io::Stdout>.unwrap_or_else(io::stdout)
 }
 
-/// Print one line to stdout (manual `println!`); errors propagate.
 fn print_stdout_line(line: &str) -> io::Result<()> {
     let stdout = stdout_handle();
     let mut out = StdoutSink::new(stdout.lock());
@@ -6416,34 +4877,21 @@ fn print_stdout_line(line: &str) -> io::Result<()> {
     out.write_all(b"\n")
 }
 
-/// Whether `verb` streams `<n>` data lines after its `OK <n>` header rather than a single
-/// status line, per `aterm_types::control_verbs::framing_of` (shared with the server).
 fn streams_payload(verb: &str, request: &str) -> bool {
     aterm_types::control_verbs::framing_of(verb, request)
         == aterm_types::control_verbs::Framing::Lines
 }
 
-/// Copy exactly `nbytes` of byte-framed body from `reader` to `out` (a [`StdoutSink`]
-/// renders it for a terminal). Returns the bytes copied; fewer than `nbytes` means the
-/// server hung up mid-body.
 fn copy_body<R: io::Read, W: Write>(reader: &mut R, out: &mut W, nbytes: u64) -> io::Result<u64> {
     io::copy(&mut reader.take(nbytes), out)
 }
 
-/// Stream exactly `count` payload lines from `reader` to stdout, normalizing
-/// line endings while preserving each row's content verbatim (rendered for a
-/// terminal by the [`StdoutSink`]). Early EOF is an error so a guarded artifact
-/// reply is never acknowledged while truncated.
 fn print_payload<R: BufRead>(reader: &mut R, count: usize) -> io::Result<()> {
     let stdout = stdout_handle();
-    // `io::Stdout` is a `LineWriter`, one `write(2)` per row; the payload is a bounded
-    // one-shot body, so buffer it, and the explicit `flush()` keeps its errors. The
-    // `subscribe` relay flushes per frame instead.
     let mut out = StdoutSink::new(io::BufWriter::new(stdout.lock()));
     let mut bytes_left = MAX_BODY_BYTES;
     for _ in 0..count {
         let mut line = String::new();
-        // A row cut before its newline is an early end (see `collect_reply_lines`).
         if read_bounded_line(reader, &mut line)? == 0 || !line.ends_with('\n') {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
@@ -6459,10 +4907,6 @@ fn print_payload<R: BufRead>(reader: &mut R, count: usize) -> io::Result<()> {
     out.flush()
 }
 
-/// Guarded line replies are `video frames` (at most 64 short path rows). The
-/// whole frame is read before the ACK, so acknowledgement never depends on a
-/// backpressured stdout; the aggregate cap bounds the buffer against a skewed
-/// server.
 const MAX_GUARDED_ARTIFACT_LINES: usize = 64;
 const MAX_GUARDED_PATH_BYTES: usize = 4 * 1024 * 1024;
 
@@ -6481,7 +4925,6 @@ fn read_guarded_payload<R: BufRead>(
     let mut lines = Vec::with_capacity(count);
     for _ in 0..count {
         let mut line = String::new();
-        // A row cut before its newline is an early end (see `collect_reply_lines`).
         if read_bounded_line(reader, &mut line)? == 0 || !line.ends_with('\n') {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
@@ -6526,8 +4969,6 @@ enum GuardedArtifactOutput {
     Lines(Vec<String>),
 }
 
-/// Consume a complete guarded frame and acknowledge it before any output, so
-/// the server's handoff does not depend on stdout backpressure.
 fn receive_guarded_artifact_reply(
     stream: &CtlStream,
     reader: &mut BufReader<&CtlStream>,
@@ -6547,12 +4988,6 @@ fn receive_guarded_artifact_reply(
     }
 }
 
-/// Connect to `path`, authenticate, send `request`, and print the response for
-/// `verb`, framed as `request` decides (`framing_of`).
-///
-/// `timeout_explicit` matters only for `subscribe`, which watches forever by default and
-/// treats an explicit `--timeout` as a wall-clock max ([`redial::relay_subscription`]).
-/// `redial` is where a successor may answer after a self-update.
 fn exchange(
     path: &str,
     origin: TargetOrigin,
@@ -6562,12 +4997,7 @@ fn exchange(
     timeout_explicit: bool,
     redial: &redial::Redial,
 ) -> io::Result<ExitCode> {
-    // The `latest` alias is a symlink on Unix (resolved by the kernel) and a
-    // pointer file on Windows; resolve it client-side for both.
     let path = &aterm_uds::latest::resolve(path);
-    // The connect phase has its own shorter bound ([`ACCEPT_DEADLINE`],
-    // [`converse_served`]); once served every operation is bounded by
-    // `deadline`.
     converse_served(path, origin, deadline, |stream| {
         exchange_on(
             stream,
@@ -6582,8 +5012,6 @@ fn exchange(
     .map(|served| served.unwrap_or_else(std::convert::identity))
 }
 
-/// [`exchange`] once served: `stream` is the accepted, authenticated connection
-/// to `path`, its timeouts already `deadline`.
 fn exchange_on(
     stream: CtlStream,
     path: &str,
@@ -6593,19 +5021,11 @@ fn exchange_on(
     timeout_explicit: bool,
     redial: &redial::Redial,
 ) -> io::Result<ExitCode> {
-    // Who answered: the server's pid and the listening socket it accepted this
-    // connection through, so a hang-up can tell "it ended the exchange" from "it
-    // was replaced" (by another process, or the same pid on a fresh listener:
-    // [`redial::ListenerId`]).
     let server = redial::server_pid(&stream);
     let listener = redial::listener_at(path);
 
-    // `deadline` is measured from the request: a server going away under a blocking read
-    // does not extend it (the successor wait and the one retry spend what is left).
     let started = std::time::Instant::now();
 
-    // A send cut short with a reason left behind is that answer; one cut short silently
-    // is a hang-up, judged by the read below.
     let sent = match send_served(&stream, request.as_bytes()) {
         Ok(Some(code)) => return Ok(code),
         Ok(None) => Ok(()),
@@ -6615,12 +5035,7 @@ fn exchange_on(
     let mut reader = BufReader::new(&stream);
     let mut status_line = String::new();
     let got = sent.and_then(|()| read_status_line(&mut reader, &mut status_line));
-    // A blocking read cut before its reply is the self-update case: follow the successor
-    // once, or say it could not be resumed. Anything else keeps its error.
     let request_parts: Vec<String> = request.split_whitespace().map(String::from).collect();
-    // A forward's host that went away: the dialled server relayed this request to the
-    // aterm hosting its session, which went away before it answered, and the relay said
-    // so in place of the reply. It is that host's hang-up, not an `ERR` answer.
     let host_gone = match &got {
         Ok(n) if *n > 0 => aterm_types::control_verbs::host_gone(&status_line)
             .map(|(pid, sock)| (pid, sock.to_string())),
@@ -6635,15 +5050,10 @@ fn exchange_on(
     if hung_up && redial::reports_replacement(&request_parts) {
         let until = deadline.map(|d| started + d);
         let again = |next: &str| {
-            // The retry gets what the deadline has left, never a fresh one (a set
-            // timeout must be non-zero, hence the 1 ms floor: a spent deadline fires at
-            // once, as exit 124).
             let left = deadline.map(|d| {
                 d.saturating_sub(started.elapsed())
                     .max(std::time::Duration::from_millis(1))
             });
-            // The successor's exchange words its own deadline (its socket,
-            // what was left); `worded` keeps this one's from re-wording it.
             exchange(
                 next,
                 TargetOrigin::Pinned,
@@ -6656,7 +5066,6 @@ fn exchange_on(
             .map_err(worded)
         };
         return match host_gone {
-            // The host's successor, where it republishes the session, never the relay.
             Some((pid, sock)) => {
                 let host = redial.host(&sock, redial::target_sid(request).map(|sid| sid.as_str()));
                 answer_replacement(
@@ -6680,8 +5089,6 @@ fn exchange_on(
             ),
         };
     }
-    // Any other request whose forward's host went away: a connection closed before its
-    // reply, in the words a supervisor rides out.
     if let Some((pid, sock)) = host_gone {
         return Err(io::Error::new(
             io::ErrorKind::UnexpectedEof,
@@ -6704,23 +5111,15 @@ fn exchange_on(
     let tail = tokens.next().unwrap_or("");
 
     if status != "OK" {
-        // "ERR <msg>", "ERR", or any unexpected reply: report all of it (e.g.
-        // `subscribe`'s refusal spells its vocabulary on a second line) and fail.
         stderr_line(status_line)?;
         drain_refusal_tail(&mut reader)?;
         return Ok(ExitCode::FAILURE);
     }
 
-    // A server-reported timeout ([`reply_is_timeout`]) prints as usual but exits 124.
     let timed_out = reply_is_timeout(status_line);
 
     if verb == "subscribe" {
-        // `OK subscribe <n>`: push-only from here. The ack goes to stderr so stdout
-        // carries the frames byte-exact (`cells`/`bytes` frames embed byte bodies).
         stderr_line(status_line)?;
-        // By default a subscription watches forever (a self-update is followed; a
-        // server gone with no successor exits 75). An explicit `--timeout` bounds the
-        // whole relay as a wall-clock max (flush, exit 124); an explicit 0 watches forever.
         let watch = deadline.filter(|_| timeout_explicit);
         let stdout = stdout_handle();
         let mut out = StdoutSink::new(stdout.lock());
@@ -6740,15 +5139,10 @@ fn exchange_on(
     }
 
     if bytes_payload(verb, request) {
-        // `OK <nbytes>` + a byte body (cast/temporal/inbox get/outbox), streamed to stdout
-        // through a bounded `take` copy: byte-exact to a pipe or a file, rendered
-        // for a terminal by the sink (a peer's mail body is its sender's bytes).
         let nbytes = match byte_count(tail) {
             Some(n) => n,
             None => return Err(malformed_header_error(status_line)),
         };
-        // `inbox get` may carry `truncated=1 len=<true-size>`, so its header goes to
-        // stderr while stdout stays byte-exact.
         if verb == "inbox" {
             stderr_line(status_line)?;
         } else if nbytes == 0 {
@@ -6762,8 +5156,6 @@ fn exchange_on(
         let mut out = StdoutSink::new(stdout.lock());
         let copied = copy_body(&mut reader, &mut out, nbytes as u64)?;
         if copied < nbytes as u64 {
-            // The header promised more than arrived: keep what was written but
-            // fail, so a truncated recording is never taken for complete.
             let mut msg = String::from("server hung up mid-body (got ");
             msg.push_str(&copied.to_string());
             msg.push_str(" of ");
@@ -6778,8 +5170,6 @@ fn exchange_on(
         return Ok(ExitCode::SUCCESS);
     }
 
-    // A guarded response is consumed and acknowledged before it is copied to stdout, so
-    // a blocked stdout consumer cannot exhaust the server's ACK window.
     if aterm_types::control_verbs::artifact_reply_requires_ack(verb, request) {
         match receive_guarded_artifact_reply(
             &stream,
@@ -6813,31 +5203,15 @@ fn exchange_on(
             Some(count) => count,
             None => return Err(malformed_header_error(status_line)),
         };
-        // `search` appends ` incomplete` and its causes when the list is not exhaustive.
         if let Some(note) = search_incomplete_note(tail) {
             stderr_line(&note)?;
         }
-        // `turn`'s verdict follows the count: stdout stays screen rows, the verdict goes to
-        // stderr.
         let turn_verdict = tail.split_whitespace().nth(1) == Some("turn");
         if turn_verdict {
             let verdict: Vec<&str> = tail.split_whitespace().skip(1).collect();
             stderr_line(&verdict.join(" "))?;
         }
-        // A zero-count reply would be silent on stdout, so the OK count goes to
-        // stderr ("worked, no results"). Some headers carry facts the rows need
-        // and always go to stderr: `inbox` (hold/seen/dropped/pending),
-        // `offscreen` (`last=` is the next `since=`, `screen_rows=` splits archive
-        // from screen, `lost=`/`breaks=`; the supervisor's report reads it here),
-        // `resizes` (`render=`, `flaps=`, `unledgered=`, `lost=`), `result`
-        // (`source=transcript session= uuid= bytes=`: stdout is the worker's
-        // text alone), `log` (`as_of=` and `ep=` are the next `since=` and
-        // `ep=`, `lost=`, `more=`), `brief` (`sid=`, `as_of=`, `ep=`,
-        // `budget=`, `used=`), and `search` (completeness qualifiers a caller
-        // must not infer from the hit rows).
         if drift::is_drift_request(verb, request) {
-            // A backstop: every `cast drift` is dispatched to the `drift` module before
-            // any exchange. A server predating the verb answers the bare cast: read it off
             // and refuse by name rather than read a byte body as lines.
             if !tail.split_whitespace().any(|t| t.starts_with("verdict=")) {
                 if let (1, Some(n)) = (tail.split_whitespace().count(), byte_count(tail)) {
@@ -6849,7 +5223,6 @@ fn exchange_on(
                      <cast> --screen <text>`",
                 ));
             }
-            // `cast drift`'s header is the verdict, so it leads its rows on stdout.
             print_stdout_line(status_line)?;
         } else if verb == "inbox"
             || verb == "offscreen"
@@ -6858,12 +5231,7 @@ fn exchange_on(
             || verb == "result"
             || verb == "log"
             || verb == "brief"
-            // `sys`'s header carries `as_of= age_ms= window_ms= next=` (the
-            // next `since=`) and `state=`; stdout stays the body (one JSON
-            // object under `--json`).
             || verb == "sys"
-            // `history`'s header carries ` unheld_below=<id>` when an update could
-            // not carry the ledger whole.
             || (verb == "history" && tail.split_whitespace().nth(1).is_some())
         {
             stderr_line(status_line)?;
@@ -6875,11 +5243,6 @@ fn exchange_on(
             stderr_line(&msg)?;
         }
         match print_payload(&mut reader, count) {
-            // A `turn` whose verdict arrived was typed, and maybe submitted
-            // (`submitted=0 pressed=1` is an Enter that was written), so rows
-            // cut after it are never the refusal code a caller retries (1), nor
-            // a timeout (124): 75, with what to do instead, as for a `turn`
-            // cut before its reply (`redial::not_asked_again_note`).
             Err(e) if turn_verdict && !is_stdout_closed(&e) => {
                 stderr_line(&turn_rows_cut_line(&e, &request_parts))?;
                 return Ok(ExitCode::from(redial::EXIT_REPLACED));
@@ -6898,9 +5261,6 @@ fn exchange_on(
     }
 }
 
-/// A blocking read (`await`, `wait`, `ready`, `text`, `inbox`) whose server hung up before
-/// replying, ordinarily an aterm self-update; [`answer_replacement`] over
-/// [`redial::Redial::after_hangup`]. `until` caps the successor wait at the call's deadline.
 #[allow(
     clippy::too_many_arguments,
     reason = "the server the exchange reached (where, which pid, which listener), the request, \
@@ -6927,12 +5287,6 @@ fn replaced_before_reply(
     )
 }
 
-/// What a request cut before its reply comes to, once the hang-up of `server` is classified
-/// ([`redial::Redial::after_hangup`], or [`redial::Redial::after_host_gone`] behind a
-/// forward): asked once of a successor through `again`, unless it carries an old-process
-/// anchor ([`redial::retries_across_replacement`]); ended with [`redial::EXIT_REPLACED`] and a
-/// note when there is no successor or it was not asked; or (the same server still serving, or
-/// a platform that cannot tell) the original `error`.
 fn answer_replacement(
     hangup: redial::Hangup,
     server: Option<u32>,
@@ -6977,10 +5331,6 @@ fn answer_replacement(
     }
 }
 
-/// The whole line for a `turn` whose screen rows failed after its verdict
-/// (`error`: the server hung up inside them, a stall past the deadline, a row
-/// past its bound): the verdict above stands, what to do instead
-/// ([`redial::not_asked_again_note`]), and the exit code.
 fn turn_rows_cut_line(error: &io::Error, request_parts: &[String]) -> String {
     format!(
         "the turn's screen rows were cut after its verdict ({error}); {} (exit {})",
@@ -6989,9 +5339,6 @@ fn turn_rows_cut_line(error: &io::Error, request_parts: &[String]) -> String {
     )
 }
 
-/// The whole line for a request cut by a replacement and not asked of its
-/// successor (pid `pid`, replacing `old`): the replacement, the reason and what
-/// to do instead ([`redial::not_asked_again_note`]), and the exit code.
 fn not_asked_again_line(old: u32, pid: u32, request_parts: &[String]) -> String {
     format!(
         "{} before it answered; {} (exit {})",

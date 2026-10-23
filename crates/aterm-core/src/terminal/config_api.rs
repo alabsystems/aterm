@@ -15,7 +15,7 @@ use super::Terminal;
 /// live would re-assert the power-on value on every reload (for mode 2004,
 /// stripping a shell's bracketed-paste guards).
 #[inline]
-fn apply_negotiated_mode(live: &mut bool, seed: &mut bool, configured: bool) -> bool {
+const fn apply_negotiated_mode(live: &mut bool, seed: &mut bool, configured: bool) -> bool {
     if *seed == configured {
         return false;
     }

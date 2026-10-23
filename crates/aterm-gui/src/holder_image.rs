@@ -1,51 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! WHICH IMAGE HOLDS THE TERMINAL, published before its bytes
-//! (`docs/DESIGN-card-engine-2026-10-19.md` §3.4-§3.6, invariant I1).
-//!
-//! The PTY gather samples the foreground group at every dry-gap park and batch
-//! end (`crate::foreground_handback`). At each edge it reads the new holder's
-//! image from the kernel ([`read`]: the executable, its start time and, for a
-//! script shell only, its first argument) and classifies it
-//! (`atpkg::image::image_build`). The result rides the batch as a
-//! [`HolderImage`]. The parse stage offers it to the session's timeline
-//! before the term-lock hold of the chosen slice
-//! (`SessionTimeline::offer_holder_image`). This orders a sampled observation
-//! before that hold, not a proof of which process wrote every queued byte.
-//!
-//! Only CARD-RELEVANT edges publish ([`HolderImage::card_relevant`]): entering
-//! or leaving a card drawer (Claude Code, agy, Muse Code) or atpkg's own shim
-//! before its `exec`. Every other edge costs the gather's read and nothing
-//! else: no timeline write, no inbox push, no wake. Publication is
-//! deduplicated by token ([`Offer::Same`]); the engine's foreground cut never
-//! is.
-//!
-//! A published edge also pushes the session's id into the App's
-//! [`EdgeInbox`], which the status sweep empties first on its next wake,
-//! bypassing the observation interval (§3.5). Publication wakes naming; it
-//! does not establish a one-frame or elapsed-time naming guarantee.
-//!
-//! THE BYTE-DRIVEN ARM (§3.6, [`ByteArm`]): an `exec` in place (`exec claude`,
-//! a shim's `exec` of the store build) changes the image with no group edge.
-//! The first nonempty batch observes the initial holder, including direct
-//! `-e` and an already-running adopted program. An accepted signed C owes
-//! another read before the next slice; while its shell remains unresolved,
-//! it is observed once per later batch until the command ends or an image
-//! resolves. A Launcher is also observed once per batch. Settled drawer and
-//! other non-shell output batches add no image reads. A changed description
-//! is offered as an Exec edge, not proof of a kernel exec generation. The slice loop ends a slice right after every
-//! complete OSC 133/633 C ([`CScan`]) while the arm is on, so the re-read runs
-//! before the bytes after the C are parsed. Lane A2's kqueue edges will turn
-//! the arm off on macOS; in A1 it runs on every unix.
-//!
-//! The dev rows ([`DEV_ROWS`]: debug builds and `dev-seams`) put each step on
-//! the session timeline with the present ordinal (`metrics::frames_presented`)
-//! and the process clock (`metrics::now_ns`): `holder-edge`, `holder-image`,
-//! `holder-named`, `holder-claim` and `card-seen`. The latter requires the
-//! current drawer's family and known version on screen, but is only a screen
-//! observation: stale same-build cells and other tty writers are not ruled
-//! out. These rows alone do not establish writer attribution or lead times.
+//! Foreground process-image inspection and title/prompt tracking for a session's PTY.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -53,27 +9,17 @@ use std::sync::{Arc, Mutex};
 use atpkg::image::{ImageBuild, ImageRoots, ImageSource};
 
 /// Whether the dev timeline rows are recorded: debug builds and an optimized
-/// `dev-seams` QA build. A shipping build records none.
 pub(crate) const DEV_ROWS: bool = cfg!(any(debug_assertions, feature = "dev-seams"));
 
 /// How many batches the dev `card-seen` probe looks for one drawer token's
-/// card before it gives up (`DEV_ROWS` builds only).
 pub(crate) const CARD_PROBE_BATCHES: u16 = 256;
 
 /// Whether this process runs the dev `card-seen` probe
-/// (`SessionFactory::card_probe`): a [`DEV_ROWS`] build started with
-/// `ATERM_DEV_CARD_PROBE=1`, read once at startup. The probe takes a term-lock
-/// hold of its own after each batch while a drawer's card is unseen, so it is
-/// off unless a lead measurement asks for it, and a dev build's timing runs
-/// hold the term lock as the product does.
 pub(crate) fn card_probe_requested() -> bool {
     DEV_ROWS && std::env::var_os("ATERM_DEV_CARD_PROBE").is_some_and(|v| v == "1")
 }
 
 /// The longest OSC 133/633 `C` [`CScan`] cuts after, introducer through
-/// terminator: a signed `133;C;id=<64 hex>` is under 80 bytes. A longer one
-/// is no C to the scan, within one batch or across several, so the cuts never
-/// depend on where the batches split; the carry is bounded by it too.
 const C_MAX: usize = 512;
 
 /// A program that draws a launch card the harness decorates.
@@ -86,7 +32,6 @@ pub(crate) enum CardProgram {
 
 impl CardProgram {
     /// The card drawer `program` names (`aterm_phase::program_of`: `claude`,
-    /// `claude-code`, `agy`, `muse`, `muse-bin-<version>`), or `None`.
     pub(crate) fn of(program: &str) -> Option<Self> {
         Self::from_program(aterm_phase::program_of(program)?)
     }
@@ -113,8 +58,6 @@ impl CardProgram {
     }
 
     /// Which card reader reads this drawer's card
-    /// (`claude_card::CardReading::rows_kind`): `3` Claude Code, `4` agy,
-    /// `1` Muse Code.
     pub(crate) const fn rows_kind(self) -> usize {
         match self {
             Self::Claude => 3,
@@ -124,7 +67,6 @@ impl CardProgram {
     }
 
     /// What this drawer's banner says about its build, as aterm-phase
-    /// declares it beside the reader (`aterm_phase::BannerBuild`).
     pub(crate) const fn banner_build(self) -> aterm_phase::BannerBuild {
         match self {
             Self::Claude => aterm_phase::turn::LAUNCH_CARD_BUILD,
@@ -134,7 +76,6 @@ impl CardProgram {
     }
 
     /// The rows this drawer's reader reads of a card from its banner down:
-    /// what the fence must hold for the card to be the drawer's.
     pub(crate) const fn card_rows(self) -> usize {
         match self {
             Self::Claude => aterm_phase::turn::LAUNCH_CARD_ROWS,
@@ -145,26 +86,18 @@ impl CardProgram {
 }
 
 /// THE CARD'S GATE for the current holder image (card engine §3.8): the
-/// drawer's token, which the frame's fence must carry
-/// (`RenderInput::holder`), the card reader its card must come from, the
-/// rows that reader reads, and the build policy the card's banner is held to.
-/// Made under the splice's one timeline lock
-/// (`SessionTimeline::card_gate`); `Copy`, integers only.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct CardGate {
     pub(crate) token: u64,
     /// The reader ([`CardProgram::rows_kind`]).
     pub(crate) kind: usize,
     /// The rows the fence must admit from the banner down
-    /// ([`CardProgram::card_rows`]).
     pub(crate) rows: usize,
     pub(crate) build: GateBuild,
 }
 
 impl CardGate {
     /// The repaint key's term for the gate (`App::claude_footer_fp`): a
-    /// drawer, reader or build policy that moves asks for a frame, whose
-    /// splice judges the card anew. Integers only.
     pub(crate) fn key(&self) -> u64 {
         let (policy, build) = match self.build {
             GateBuild::Exact(b) => (1, b.build_id()),
@@ -179,21 +112,15 @@ impl CardGate {
 }
 
 /// What a card's banner build is held to ([`HolderImage::gate_build`]): the
-/// image's source × the program's `aterm_phase::BannerBuild`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum GateBuild {
     /// The image's own build (a store, ALab or vendor-installer image of a
-    /// program whose banner prints it): the banner must name it.
     Exact(atpkg::vendor_direct::Version),
     /// An image of unknown build (brew, a dev link, an ALab build without
-    /// its record) of a program whose banner prints its build: the banner
-    /// must name the build its own registry row reports.
     Registry(atpkg::vendor_direct::Version),
     /// A program whose banner is not known to print its build: the fence
-    /// alone decides.
     ProvenanceOnly,
     /// No build to hold the banner to (an unknown image whose row has not
-    /// landed or does not parse): bare.
     None,
 }
 
@@ -201,10 +128,8 @@ pub(crate) enum GateBuild {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum EdgeKind {
     /// The foreground group changed (the gather's sampled cut, or a kqueue
-    /// `exec` in the group that took the terminal).
     Group,
     /// The group's image changed in place (a kqueue `NOTE_EXEC` of its leader,
-    /// or the byte-driven arm's re-read).
     Exec,
 }
 
@@ -222,17 +147,12 @@ impl EdgeKind {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct HolderImage {
     /// A hash of pid, process start, executable and classified build
-    /// ([`token_of`]). This names a sampled image description, not an exec
-    /// generation: re-execing the same path and build can keep it. `None`
-    /// when the start or executable could not be read (I5).
     pub(crate) token: Option<u64>,
     /// The group (its leader's pid) the image was read for.
     pub(crate) pgid: i32,
     /// The leader's start, in microseconds on the platform's start clock
-    /// (macOS: the BSD info's wall time; Linux: `CLOCK_BOOTTIME`); `0` unread.
     pub(crate) start_us: u64,
     /// The executable the kernel mapped, canonical; on Linux its ` (deleted)`
-    /// annotation is removed (an unlinked image is the same image). Empty when unread.
     pub(crate) exe: Arc<Path>,
     /// What `atpkg::image` makes of it.
     pub(crate) build: ImageBuild,
@@ -246,10 +166,6 @@ pub(crate) struct HolderImage {
 
 impl HolderImage {
     /// The image of `pgid` from its parts: `start_us` and `exe` as read (`None`
-    /// where the read failed) and the classifier's `build`. On Linux the
-    /// executable is kept and hashed without its ` (deleted)` annotation: a
-    /// self-updater unlinking the running version leaves its token. On other
-    /// platforms that suffix is part of the literal executable path.
     pub(crate) fn of(
         pgid: i32,
         start_us: Option<u64>,
@@ -283,20 +199,16 @@ impl HolderImage {
     }
 
     /// An image nothing could be read of: the inert arm the test App's factory
-    /// carries ([`unread`]), and what a read of a gone group gives.
     pub(crate) fn unread(pgid: i32) -> Self {
         Self::of(pgid, None, None, ImageBuild::unknown(None), 0)
     }
 
     /// Whether an edge into (or out of) this image is the card's business: a
-    /// card drawer, or atpkg's shim that will `exec` one.
     pub(crate) const fn card_relevant(&self) -> bool {
         self.drawer.is_some() || self.launcher_for.is_some()
     }
 
     /// Whether the represented image descriptions agree. Compare the fields
-    /// too: neither a hash collision nor a refreshed classification keeps an
-    /// older build or launcher on the timeline.
     pub(crate) fn same_image(&self, other: &Self) -> bool {
         self.token == other.token
             && self.pgid == other.pgid
@@ -306,8 +218,6 @@ impl HolderImage {
     }
 
     /// Whether a read of `pgid` that found `exe`, started at `start_us`, is
-    /// this image's process as it was read: a tracked image (both read), the
-    /// same group, start and executable.
     fn is_process(&self, pgid: i32, start_us: Option<u64>, exe: &Path) -> bool {
         self.token.is_some()
             && self.pgid == pgid
@@ -316,19 +226,11 @@ impl HolderImage {
     }
 
     /// Whether this is a script shell still able to exec the command it
-    /// signed. Only its mapped executable decides this, not argv text.
     fn script_shell(&self) -> bool {
         is_script_shell(&self.exe)
     }
 
     /// THE BUILD POLICY (card engine §3.8): what this drawer image's card
-    /// banner is held to, its source × its program's banner. A store
-    /// (vendor or ALab) or vendor-installer image of an Exact program is
-    /// held to its own build; an image of unknown build to `registry()`,
-    /// the build its own registry row reports (`None`: not yet, or not
-    /// parseable, so bare) — asked for that image alone, so no other image
-    /// reads the registry; a ProvenanceOnly program to nothing but its
-    /// fence. `None` for an image that is no drawer.
     pub(crate) fn gate_build(
         &self,
         registry: impl FnOnce() -> Option<atpkg::vendor_direct::Version>,
@@ -347,8 +249,6 @@ impl HolderImage {
     }
 
     /// [`CardGate`] for this image: a drawer with a token, its build held to
-    /// [`Self::gate_build`]. `None` for an untracked image (no token: I5) or
-    /// one that is no drawer.
     pub(crate) fn gate(
         &self,
         registry: impl FnOnce() -> Option<atpkg::vendor_direct::Version>,
@@ -363,7 +263,6 @@ impl HolderImage {
     }
 
     /// A matching family and known version on the screen. This is evidence
-    /// about visible text, never proof that this process wrote those cells.
     pub(crate) fn matches_card(&self, rows_kind: usize, version: &str) -> bool {
         let Some(expected_kind) = self.drawer.map(CardProgram::rows_kind) else {
             return false;
@@ -375,7 +274,6 @@ impl HolderImage {
     }
 
     /// `holder-image`'s payload: `token= pgid= program= build= source=
-    /// drawer= launcher_for=`.
     pub(crate) fn payload(&self) -> String {
         format!(
             "token={} pgid={} program={} build={} source={} drawer={} launcher_for={}",
@@ -396,8 +294,6 @@ impl HolderImage {
 }
 
 /// `exe` as an image keeps it: on Linux without the ` (deleted)` the kernel
-/// annotates an unlinked image with (the same image); elsewhere that suffix
-/// is literal filename content and stays.
 fn kept_exe(exe: &Path) -> &Path {
     #[cfg(target_os = "linux")]
     let exe = atpkg::image::strip_deleted(exe);
@@ -405,7 +301,6 @@ fn kept_exe(exe: &Path) -> &Path {
 }
 
 /// Whether `exe` (` (deleted)` already stripped) is one of atpkg's
-/// [`atpkg::image::SCRIPT_SHELLS`].
 fn is_script_shell(exe: &Path) -> bool {
     exe.file_name()
         .and_then(|n| n.to_str())
@@ -418,10 +313,6 @@ pub(crate) fn token_word(token: Option<u64>) -> String {
 }
 
 /// THE SNAPSHOT TOKEN (I5): FNV-1a/64 of the pid, process start,
-/// executable and classification. A different mapped path or classified
-/// program/build/source refreshes it. The represented fields cannot detect
-/// an invisible exec of the same path and build; this is not a kernel exec
-/// generation, and a finite hash is not a collision-free identity.
 pub(crate) fn token_of(pid: i32, start_us: u64, exe: &Path, build: &ImageBuild) -> u64 {
     let mut h = aterm_hash::Fnv1a64::new();
     h.write_u32_le(pid.cast_unsigned());
@@ -436,34 +327,15 @@ pub(crate) fn token_of(pid: i32, start_us: u64, exe: &Path, build: &ImageBuild) 
 }
 
 /// A holder image read (`SessionFactory::edge_image`): the image of `pgid`,
-/// given the image this reader last read of that group, if any (the read may
-/// keep it, [`read`]).
 pub(crate) type ReadImage = fn(i32, Option<&HolderImage>) -> HolderImage;
 
 /// The test App's inert `SessionFactory::edge_image` (and ConPTY's): reads
-/// nothing.
 #[cfg(any(test, feature = "bench-support", not(unix)))]
 pub(crate) fn unread(pgid: i32, _last: Option<&HolderImage>) -> HolderImage {
     HolderImage::unread(pgid)
 }
 
 /// THE READ (shipping `SessionFactory::edge_image`), on the gather thread at
-/// an edge, or on the parse stage for the byte arm's re-read: `pgid`'s
-/// leader's executable (`proc_pidpath`, `/proc/<pid>/exe`), its start (BSD
-/// info; `/proc/<pid>/stat`), for a script shell its first argument
-/// (`KERN_PROCARGS2`, `/proc/<pid>/cmdline`), and the classifier over the
-/// managed prefix's roots ([`roots`]).
-///
-/// `last`, the image this reader last read of `pgid`, is KEPT (re-stamped
-/// with this read's time) when the leader's start and executable are the
-/// ones it was read with: no argument read, no roots, no classification.
-/// That is the byte arm's re-read of an unresolved script shell, once per
-/// output batch while a script runs, at the price of two kernel reads. An
-/// exec that changes the executable is read afresh, and a drawer is never a
-/// script shell, so the exec into one always is. What a kept image cannot
-/// see is a script shell's exec of the same shell binary (an `sh` script's
-/// `exec` of atpkg's `sh` shim), which keeps the leader's start and
-/// executable: that Launcher is named at its own exec of the drawer instead.
 pub(crate) fn read(pgid: i32, last: Option<&HolderImage>) -> HolderImage {
     let read_ns = crate::metrics::now_ns();
     let Some(pid) = u32::try_from(pgid).ok().filter(|p| *p > 1) else {
@@ -528,7 +400,6 @@ fn stamp(path: &Path) -> Stamp {
 }
 
 /// The roots last resolved, and what they were resolved from: `aterm.toml`'s
-/// stamp and the prefix's.
 struct RootsCache {
     config: Stamp,
     prefix: Stamp,
@@ -538,14 +409,6 @@ struct RootsCache {
 static ROOTS: Mutex<Option<RootsCache>> = Mutex::new(None);
 
 /// The managed prefix's [`ImageRoots`], resolved once and again only when
-/// `aterm.toml` or the prefix directory changes (two `stat`s per call): every
-/// PTY gather reads images through one cache, and none re-reads the config
-/// per edge.
-///
-/// The lock is held for a clone or a swap only, never across a `stat` or a
-/// resolution: every PTY gather and parse stage reads through this one cache,
-/// and none waits behind another's file system. Two that miss at once both
-/// resolve; the later swap wins, and either answer is the configured one.
 pub(crate) fn roots() -> Option<Arc<ImageRoots>> {
     let config = atpkg::config::config_path().and_then(|p| stamp(&p));
     let cached = ROOTS
@@ -570,7 +433,6 @@ pub(crate) fn roots() -> Option<Arc<ImageRoots>> {
 }
 
 /// What the timeline made of an offered image
-/// (`SessionTimeline::offer_holder_image`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Offer {
     /// Published: it is the session's holder image now.
@@ -582,7 +444,6 @@ pub(crate) enum Offer {
 }
 
 /// THE PUBLICATION RULE, pure: an image is published when it, or the image it
-/// replaces, is card-relevant, and it is not that same image.
 pub(crate) fn decide(current: Option<&HolderImage>, offered: &HolderImage) -> Offer {
     if !offered.card_relevant() && !current.is_some_and(HolderImage::card_relevant) {
         return Offer::Irrelevant;
@@ -594,10 +455,6 @@ pub(crate) fn decide(current: Option<&HolderImage>, offered: &HolderImage) -> Of
 }
 
 /// THE EDGED INBOX (§3.5): the sessions whose holder image was published since
-/// the status sweep last looked. Owned by the App (through its
-/// `SessionFactory`), cloned into every session's parse stage, which pushes its
-/// id at most once per published edge; the sweep takes the whole list first
-/// and visits exactly those sessions, bypassing their observation interval.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct EdgeInbox(Arc<Mutex<Vec<u64>>>);
 
@@ -623,14 +480,6 @@ impl EdgeInbox {
 }
 
 /// THE C-CUT SCAN (§3.6): the offsets in a batch right after each complete
-/// OSC 133 or 633 `C` as the engine reads one ([`osc_c_end`]), so the slice
-/// loop ends a slice there and the byte arm's re-read runs before the next
-/// byte is parsed. Whether the engine accepted the C (its nonce) is the
-/// engine's to say; a cut at an unsigned one only splits a slice, which the
-/// streaming parser makes byte-identical. An OSC unfinished at a batch's end
-/// is carried (it is under [`C_MAX`] bytes) and its end found in the next
-/// batch, as is a lone ESC that ends one; the cuts never depend on where the
-/// batches split, short of a cut that falls on a batch's own end.
 #[derive(Debug, Default)]
 pub(crate) struct CScan {
     carry: Vec<u8>,
@@ -638,7 +487,6 @@ pub(crate) struct CScan {
 
 impl CScan {
     /// Clear `ends` and fill it with the cut offsets in `batch`, ascending,
-    /// each in `1..=batch.len()`.
     pub(crate) fn ends(&mut self, batch: &[u8], ends: &mut Vec<usize>) {
         ends.clear();
         let mut at = 0;
@@ -661,21 +509,15 @@ impl CScan {
                 OscEnd::NotC => at = esc + 1,
             }
         }
-        // A lone ESC at the end may open an OSC whose `]` the next batch
-        // brings, which the search by `]` cannot see from here.
         if batch.len() > at && batch.last() == Some(&0x1b) {
             self.carry.push(0x1b);
         }
     }
 
     /// The carried OSC (or lone ESC) read on with `batch`'s head: its cut,
-    /// when it is a C that ends in this batch, and the offset in `batch` the
-    /// scan goes on from; `None` when it is still open, carried on.
     fn finish_carry(&mut self, batch: &[u8], ends: &mut Vec<usize>) -> Option<usize> {
         let mut joined = std::mem::take(&mut self.carry);
         let carried = joined.len();
-        // A carry holds no ESC past its first byte (any ESC would have ended
-        // it), so only its own OSC starts before this batch's bytes.
         let take = batch.len().min(C_MAX);
         joined.extend_from_slice(&batch[..take]);
         let next = match osc_c_end(&joined, 0) {
@@ -686,7 +528,6 @@ impl CScan {
                 resume
             }
             OscEnd::Open => {
-                // Open means under `C_MAX` bytes from its ESC: all of them.
                 debug_assert_eq!(take, batch.len(), "an open C fits its bound");
                 self.carry = joined;
                 return None;
@@ -701,8 +542,6 @@ impl CScan {
 #[derive(Debug, PartialEq, Eq)]
 enum OscEnd {
     /// A complete OSC 133/633 `C`, dispatched by the engine once `end` bytes
-    /// are parsed: one past its BEL, its ST's `\`, or the ESC that broke it
-    /// off. The next OSC can start at `resume`: `end`, or that ESC.
     C { end: usize, resume: usize },
     /// A prefix of one, cut by the end of the bytes.
     Open,
@@ -711,14 +550,6 @@ enum OscEnd {
 }
 
 /// Whether the OSC at `bytes[esc..]` (an `ESC ]`) is a `C` as the engine
-/// reads one, and where it ends: the parser's OSC string state
-/// (`aterm_parser`) drops the C0 controls other than BEL, ESC, CAN and SUB
-/// from the payload, dispatches it at a BEL or at an ESC, whatever follows
-/// (`ESC \` is the whole ST), and discards it at CAN or SUB. The engine reads
-/// the first parameter as `str::parse::<u32>` (an optional `+`, decimal
-/// digits) and takes 133 and 633 (`Terminal::handle_osc`), whose `C` is a
-/// second parameter that is UTF-8 and starts with `C`
-/// (`Terminal::parse_shell_osc`). One longer than [`C_MAX`] bytes is `NotC`.
 fn osc_c_end(bytes: &[u8], esc: usize) -> OscEnd {
     /// Which parameter the payload's next byte belongs to.
     enum Part {
@@ -753,7 +584,6 @@ fn osc_c_end(bytes: &[u8], esc: usize) -> OscEnd {
             return OscEnd::Open;
         };
         match b {
-            // BEL or ESC: dispatched here; CAN or SUB: discarded.
             0x07 | 0x1b => {
                 let is_c = match &part {
                     Part::Number { .. } => false,
@@ -779,7 +609,6 @@ fn osc_c_end(bytes: &[u8], esc: usize) -> OscEnd {
                 };
             }
             0x18 | 0x1a => return OscEnd::NotC,
-            // The C0 controls the payload drops.
             0x00..=0x1f => {}
             b';' => match &part {
                 Part::Number {
@@ -824,14 +653,11 @@ fn osc_c_end(bytes: &[u8], esc: usize) -> OscEnd {
 }
 
 /// Whether a second parameter names a `C` to the engine: UTF-8, its first
-/// character `C`.
 fn is_c_code(code: &[u8]) -> bool {
     code.first() == Some(&b'C') && std::str::from_utf8(code).is_ok()
 }
 
 /// The next OSC introducer (`ESC ]`) whose ESC is at or after `from`: its
-/// ESC's offset. Found by its `]`, which output rarely carries outside an OSC,
-/// where colour runs put an ESC every few bytes.
 fn find_osc(bytes: &[u8], from: usize) -> Option<usize> {
     let mut at = from + 1;
     while let Some(close) = find_byte(bytes, at, b']') {
@@ -844,8 +670,6 @@ fn find_osc(bytes: &[u8], from: usize) -> Option<usize> {
 }
 
 /// The first `needle` in `bytes` at or after `from`: 32 bytes a step (four
-/// SWAR words, their zero tests OR-ed), then byte by byte inside the block
-/// that holds it and in the tail.
 fn find_byte(bytes: &[u8], from: usize, needle: u8) -> Option<usize> {
     const LO: u64 = 0x0101_0101_0101_0101;
     const HI: u64 = 0x8080_8080_8080_8080;
@@ -874,10 +698,8 @@ fn find_byte(bytes: &[u8], from: usize, needle: u8) -> Option<usize> {
 #[derive(Debug)]
 pub(crate) struct ByteArm {
     /// One initial observation also covers an already-running or direct -e
-    /// holder, where the foreground group never changes.
     initial: bool,
     /// The signed command is still an unresolved shell. It can exec after
-    /// any number of output batches, not just the next four slices.
     unresolved: bool,
     /// An accepted C owes a read before the next slice in this batch.
     boundary_due: bool,
@@ -886,14 +708,11 @@ pub(crate) struct ByteArm {
     /// A launcher's group, re-read until a resolved image replaces it.
     launcher: i32,
     /// The image last read or published here, which a re-read of its group
-    /// keeps while its process is unchanged ([`read`]).
     last: Option<Arc<HolderImage>>,
     /// The C-cut scan and this batch's cuts.
     pub(crate) scan: CScan,
     pub(crate) ends: Vec<usize>,
     /// The reader hears the kernel's `exec`s (card engine §3.3): the arm makes
-    /// its initial read alone, with no C cut and no re-read, since `NOTE_EXEC`
-    /// orders every later one.
     kernel: bool,
 }
 
@@ -915,9 +734,6 @@ impl Default for ByteArm {
 
 impl ByteArm {
     /// The arm of a reader starting on `timeline`: a Launcher already
-    /// published (a reader re-attached mid-launch) is re-read from the first
-    /// batch. An engine carrying an accepted executing command also remains
-    /// unresolved: its C may predate this reader.
     pub(crate) fn seeded(
         timeline: &std::sync::Mutex<crate::session_timeline::SessionTimeline>,
         executing: bool,
@@ -936,7 +752,6 @@ impl ByteArm {
     }
 
     /// This arm, for a reader that hears the kernel's `exec`s: its initial
-    /// read alone (no Launcher or unresolved command re-read, no C cut).
     pub(crate) fn kernel_edges(self) -> Self {
         Self {
             kernel: true,
@@ -952,7 +767,6 @@ impl ByteArm {
     }
 
     /// The image this arm last noted for `pgid`, if that is the group it last
-    /// noted (a re-read that differs is an `exec` in place).
     pub(crate) fn last_of(&self, pgid: i32) -> Option<&HolderImage> {
         self.last.as_deref().filter(|l| l.pgid == pgid)
     }
@@ -965,15 +779,11 @@ impl ByteArm {
     }
 
     /// Allow one ordinary read in this batch. A settled drawer or other
-    /// non-shell image owes none, however many output batches follow.
     pub(crate) fn begin_batch(&mut self) {
         self.batch_due = true;
     }
 
     /// Read the initial holder, an unresolved signed command, or a launcher.
-    /// There is at most one ordinary read per batch plus one after each
-    /// accepted C. The read is given the image last noted here when it is
-    /// `holder`'s. No term lock is held by this caller.
     pub(crate) fn read_due(
         &mut self,
         holder: i32,
@@ -999,9 +809,6 @@ impl ByteArm {
     }
 
     /// A gather read or re-read satisfies this batch's observation even if
-    /// publication was irrelevant. A known drawer/non-shell resolves the
-    /// command; a shell may still exec and stays watched until its signed
-    /// command ends. An unread launcher is retried while its group remains.
     pub(crate) fn note_read(&mut self, image: &Arc<HolderImage>) {
         self.initial = false;
         self.boundary_due = false;
@@ -1020,8 +827,6 @@ impl ByteArm {
     }
 
     /// The engine's accepted command mark and resulting shell state, read
-    /// under its existing hold. A prompt/completion cancels only the pending
-    /// shell command, not a launcher still waiting to exec.
     pub(crate) fn note_shell(&mut self, signed_c: bool, executing: bool) {
         if self.kernel {
             return;
@@ -1047,17 +852,12 @@ pub(crate) fn dev_tail() -> String {
 }
 
 /// THE I1 TEST SEAMS: what a watched session's timeline held inside each
-/// slice's term-lock hold, and the mutant that publishes after the hold
-/// (`spawn_tests`' I1 bind and its control). Only a session a test registered
-/// is touched.
 #[cfg(test)]
 pub(crate) mod hold_hook {
     use std::collections::HashMap;
     use std::sync::Mutex;
 
     /// One hold: the slice's start offset in its batch, the token the
-    /// timeline held then, and the engine fence's current mark as the
-    /// slice's bytes were parsed.
     #[derive(Clone, Debug, PartialEq, Eq)]
     pub(crate) struct Hold {
         pub(crate) off: usize,
@@ -1137,7 +937,6 @@ pub(crate) mod hold_hook {
     }
 
     /// How many holds `session` has recorded so far: a test's `post` stamps
-    /// each wake with it, to order the wake against the holds.
     #[cfg_attr(
         not(unix),
         expect(dead_code, reason = "only the unix reader tests watch a session")
@@ -1152,9 +951,6 @@ pub(crate) mod hold_hook {
     }
 
     /// What a test runs once, inside a session's gather, right after its next
-    /// read and before the drain that tops the batch up: a process event
-    /// posted there lands after bytes the batch already holds, which no poll
-    /// of the gather's own can order.
     type AfterRead = Box<dyn FnOnce() + Send>;
 
     static AFTER_READ: Mutex<Option<HashMap<u64, AfterRead>>> = Mutex::new(None);
@@ -1189,7 +985,6 @@ pub(crate) mod hold_hook {
     }
 
     /// Inside a hold: record what `token` reads and the engine fence's mark,
-    /// for a watched session.
     pub(crate) fn at_hold(
         session: u64,
         off: usize,
@@ -1210,18 +1005,6 @@ pub(crate) mod hold_hook {
 }
 
 /// The byte arm's C cut, timed (`benches/c_cut_cost.rs`, `bench-support`
-/// only): a corpus through a fresh engine in the gather's batches and the
-/// parse stage's idle slices, each slice under the engine's lock as the parse
-/// stage takes it, once as a reader without the arm slices it and once as the
-/// arm does (its scan of each batch, then a slice ending right after each
-/// complete OSC 133 C). With a holder to read, the arm also pays the image
-/// reads it owes for a command its shell signed before the corpus began, and
-/// for every cut, each taken as an accepted C (its boundary read before the
-/// next slice): the holder, a live script shell, stays unresolved and
-/// executing throughout (one read per nonempty batch besides), the arm's most
-/// expensive state. The engine and grid are `verify perf throughput`'s
-/// (`Terminal::process`, 24x80). The prefetch is not in it: it runs on every
-/// slice in both arms, as many slices as the cuts make.
 #[cfg(feature = "bench-support")]
 pub(crate) mod cut_cost {
     use super::ByteArm;
@@ -1237,7 +1020,6 @@ pub(crate) mod cut_cost {
     }
 
     /// One pass. `arm`: `None` is a reader without the arm; `Some(holder)`
-    /// runs it, reading `holder` (when positive) as the arm owes.
     fn pass(corpus: &[u8], batch: usize, arm: Option<i32>) -> Pass {
         let term = std::sync::Mutex::new(aterm_core::terminal::Terminal::new(24, 80));
         let mut state = ByteArm::default();
@@ -1281,8 +1063,6 @@ pub(crate) mod cut_cost {
     }
 
     /// Median MB/s of `runs` passes without the arm and with it (alternating,
-    /// after one untimed pass of each), and the cuts and image reads one pass
-    /// with it made. `holder`: the process the arm reads, or 0 for none.
     pub(crate) fn c_cut_cost(
         corpus: &[u8],
         batch: usize,
@@ -1302,9 +1082,6 @@ pub(crate) mod cut_cost {
     }
 
     /// The shipping image read of `pid`, timed `reads` times (after one
-    /// untimed read): `(p50, p95, p99)` microseconds, and what it read. `kept`:
-    /// each read is given that first image as the group's last, as the byte
-    /// arm's re-read of an unchanged process is.
     pub(crate) fn read_cost(pid: i32, reads: usize, kept: bool) -> (f64, f64, f64, String) {
         let first = super::read(pid, None);
         let last = kept.then_some(&first);
@@ -1347,8 +1124,6 @@ mod tests {
     }
 
     /// I5: represented image descriptions, pid reuse and another executable
-    /// refresh the token; an unreadable start makes none. A same-path,
-    /// same-build exec is deliberately not claimed to be distinguishable.
     #[test]
     fn the_token_names_one_image() {
         let build = ImageBuild::unknown(ProgramTag::new("claude"));
@@ -1386,8 +1161,6 @@ mod tests {
             0,
         );
         assert_eq!(zero.token, None, "a hash with start = 0 is never formed");
-        // Linux annotates an unlinked image. Elsewhere the same suffix is
-        // literal filename content and remains in this captured identity.
         let read =
             |exe: &str| HolderImage::of(100, Some(5), Some(PathBuf::from(exe)), build.clone(), 0);
         let unlinked = read("/s/versions/2.1.304 (deleted)");
@@ -1404,7 +1177,6 @@ mod tests {
     }
 
     /// Drawer and launcher by source: a shim names the drawer it will exec,
-    /// never one it is.
     #[test]
     fn a_launcher_is_never_a_drawer() {
         let store = image(
@@ -1434,8 +1206,6 @@ mod tests {
     }
 
     /// The publication rule: entering and leaving a drawer publish, a second
-    /// offer of the same image does not, and edges between irrelevant images
-    /// touch nothing.
     #[test]
     fn publication_is_by_relevance_and_deduplicated_by_token() {
         let shell = image(10, 1, "/bin/zsh", "zsh", ImageSource::Unknown);
@@ -1466,8 +1236,6 @@ mod tests {
             Offer::Irrelevant
         );
 
-        // The interpreter is unchanged, but another shim's classification
-        // must replace the old launcher and get its own snapshot token.
         let agy_shim = image(30, 3, "/bin/sh", "agy", ImageSource::Launcher);
         assert_ne!(shim.token, agy_shim.token);
         assert_eq!(decide(Some(&shim), &agy_shim), Offer::Published);
@@ -1482,8 +1250,6 @@ mod tests {
     }
 
     /// The production selector with a captured reader: initial direct exec,
-    /// an exec later than four slices, cancellation, and zero steady-drawer
-    /// probes. All order/count controls are deterministic, with no real IO.
     #[test]
     fn the_byte_arm_keeps_an_unresolved_command_and_stops_at_a_drawer() {
         use std::cell::Cell;
@@ -1520,8 +1286,6 @@ mod tests {
         }
         assert_eq!(calls.get(), 1, "no settled drawer probes");
 
-        // A signed C owes a re-read inside this same batch, then one per
-        // later batch while its shell remains unresolved.
         arm.note_shell(true, true);
         assert_eq!(observe(&mut arm, &shell), Some(shell.clone()));
         for _ in 0..8 {
@@ -1561,8 +1325,6 @@ mod tests {
     }
 
     /// The arm gives its read the image it last noted, and only for that
-    /// image's group: a gather's edge image or its own last re-read, never
-    /// another group's.
     #[test]
     fn the_arm_gives_its_read_the_groups_last_image() {
         let shell = Arc::new(image(10, 1, "/bin/zsh", "zsh", ImageSource::Unknown));
@@ -1588,11 +1350,6 @@ mod tests {
     }
 
     /// A READ OF AN UNCHANGED PROCESS KEEPS ITS IMAGE: given the image last
-    /// read of this group, a read that finds the same start and executable
-    /// returns it re-stamped, with no argument read and no classification:
-    /// a kept description no fresh read of this test process would make
-    /// (a Launcher) comes back. NEGATIVE CONTROLS: another start, another
-    /// executable, another group, or an untracked last image is read afresh.
     #[test]
     fn a_reread_of_an_unchanged_process_keeps_its_image() {
         let pid = i32::try_from(std::process::id()).expect("a pid");
@@ -1653,8 +1410,6 @@ mod tests {
     }
 
     /// A kept image reads the executable as its token does: Linux's
-    /// ` (deleted)` annotation is the same image (kept), and elsewhere the
-    /// same suffix is another path (read afresh), as the token says.
     #[test]
     fn a_kept_image_reads_the_executable_as_its_token_does() {
         let last = image(10, 1, "/s/versions/2.1.304", "claude", ImageSource::Native);
@@ -1690,9 +1445,6 @@ mod tests {
     }
 
     /// The C-cut: right after each complete 133/633 C by either terminator,
-    /// never at A/B/D, an unterminated or aborted one, or a lookalike; one
-    /// split across batches is cut in the batch that finishes it. A second
-    /// parameter that only starts with `C` is a C to the engine, and cut.
     #[test]
     fn a_slice_ends_right_after_each_complete_c() {
         let mut scan = CScan::default();
@@ -1715,27 +1467,20 @@ mod tests {
                 "{no:?}"
             );
         }
-        // Split across batches: the cut is in the second, where it ends.
         let mut scan = CScan::default();
         assert!(cuts(&mut scan, b"abc\x1b]133;C;id=0").is_empty());
         assert_eq!(cuts(&mut scan, b"123\x07next"), vec![4]);
-        // Split inside the head.
         let mut scan = CScan::default();
         assert!(cuts(&mut scan, b"abc\x1b]13").is_empty());
         assert_eq!(cuts(&mut scan, b"3;C\x07"), vec![4]);
-        // A carry that was not a C leaves the next batch's own cuts.
         let mut scan = CScan::default();
         assert!(cuts(&mut scan, b"\x1b]13").is_empty());
         assert_eq!(cuts(&mut scan, b"4;x\x07\x1b]133;C\x07"), vec![12]);
-        // Split right after the ESC: the `]` the search finds is the next
-        // batch's first byte.
         let mut scan = CScan::default();
         assert!(cuts(&mut scan, b"abc\x1b").is_empty());
         assert_eq!(cuts(&mut scan, b"]133;C\x07z"), vec![7]);
-        // A `]` that opens no OSC, and colour runs, leave the C after them.
         let noisy = [&b"a[1] \x1b[31mred\x1b[0m ]]"[..], c].concat();
         assert_eq!(cuts(&mut CScan::default(), &noisy), vec![noisy.len()]);
-        // Found at every alignment of the block scan.
         for pad in 0..70 {
             let batch = [vec![b'.'; pad], c.to_vec()].concat();
             assert_eq!(
@@ -1756,8 +1501,6 @@ mod tests {
     }
 
     /// THE ORACLE: where the engine's parser dispatches each OSC the engine
-    /// takes as a 133/633 `C` (`Terminal::handle_osc`'s number,
-    /// `parse_shell_osc`'s first character), byte by byte.
     #[derive(Default)]
     struct EngineCs {
         at: usize,
@@ -1794,7 +1537,6 @@ mod tests {
     }
 
     /// Each engine C's dispatch offset and the end of its terminator (one
-    /// past a BEL or a lone ESC, two past an ST's ESC).
     fn engine_cs(stream: &[u8]) -> Vec<(usize, usize)> {
         let mut parser = aterm_parser::Parser::new();
         let mut sink = EngineCs::default();
@@ -1812,7 +1554,6 @@ mod tests {
     }
 
     /// `stream` through one scan in `batches`: every cut and every batch end,
-    /// in stream offsets.
     fn scanned(stream: &[u8], batches: &[usize]) -> (Vec<usize>, Vec<usize>) {
         let mut scan = CScan::default();
         let (mut cuts, mut bounds, mut ends) = (Vec::new(), Vec::new(), Vec::new());
@@ -1837,8 +1578,6 @@ mod tests {
     }
 
     /// The law over one split: every C the engine dispatches ends a slice
-    /// (a cut or a batch's end) after its dispatch and within its terminator,
-    /// and every cut is such a C's. The violations, or none.
     fn law(stream: &[u8], batches: &[usize]) -> Vec<String> {
         let cs = engine_cs(stream);
         let (cuts, bounds) = scanned(stream, batches);
@@ -1877,8 +1616,6 @@ mod tests {
     }
 
     /// A stream of shell output and OSCs: Cs and lookalikes, each spelling
-    /// the engine reads, every terminator, aborts, unterminated heads, colour
-    /// runs, `]` in text and 8-bit bytes.
     fn stream(rng: &mut Rng) -> Vec<u8> {
         const TEXT: [&[u8]; 8] = [
             b"ls -la\r\n",
@@ -1936,13 +1673,6 @@ mod tests {
     }
 
     /// THE SCAN IS THE ENGINE'S C, HOWEVER THE BATCHES SPLIT: over thousands
-    /// of generated streams, each whole and in random batches of 1-12 bytes,
-    /// every C the engine's own parser dispatches ends a slice before the
-    /// byte after its terminator is parsed, and no cut falls anywhere else.
-    /// A C terminated by an ESC and any byte is one (the engine dispatches at
-    /// the ESC); so is `0133;C`, `+133;C` or `133;CX`; a C split anywhere,
-    /// its carried ESC's `]` this batch's first byte included, is cut where
-    /// the whole stream is.
     #[test]
     fn the_scan_cuts_after_every_engine_c_however_the_batches_split() {
         let mut failures = Vec::new();
@@ -1969,9 +1699,6 @@ mod tests {
     }
 
     /// The law's rows by hand, each a shape the generator reaches: a C ended
-    /// by an ESC and another OSC, and a carried ESC whose `]` opens the next
-    /// batch. NEGATIVE CONTROL: a C longer than [`C_MAX`] is the scan's one
-    /// exception, and the law catches it.
     #[test]
     fn the_scan_law_rows() {
         let broken = b"\x1b]133;C;id=\x1b]133;C\x1b\\z";

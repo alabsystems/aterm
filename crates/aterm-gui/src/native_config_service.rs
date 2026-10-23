@@ -2,40 +2,27 @@
 // Copyright 2026 Andrew Yates
 
 //! Serialized, versioned preference transaction core for native Settings.
-//!
-//! The reducer is pure and deterministic. A host worker reads/writes the file and
-//! feeds whole snapshots here; the service does OCC, per-key stale rebase, conditional
-//! undo and one `aterm-toml` document transform per accepted patch. The UI never
-//! writes config bytes directly.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::Path;
 use std::sync::Arc;
 
 const UNDO_LIMIT: usize = 64;
-/// Admission budget shared by startup, watcher reloads and Manual's semantic
-/// analysis, so startup never accepts a generation the watcher cannot fingerprint or
-/// the editor cannot validate.
+/// Admission budget shared by startup, watcher reloads and Manual's semantic analysis, so startup never accepts a generation the watcher cannot fingerprint or the editor cannot validate.
 pub(crate) const MAX_CONFIG_FILE_BYTES: usize = 512 * 1024;
 
 #[derive(Clone, PartialEq)]
 pub(crate) struct ConfigSnapshot {
     pub(crate) revision: u64,
-    /// Environment generation Manual diagnostics were last requested against. A stable
-    /// file observation advances it even when `aterm.toml` is byte-identical, since
-    /// referenced assets and installed fonts can change independently.
+    /// Environment generation Manual diagnostics were last requested against.
     pub(crate) analysis_generation: u64,
     pub(crate) text: Arc<str>,
-    /// Parsed semantic projection produced before admission; Settings and process-wide
-    /// policy clone this Arc instead of reparsing on the event loop.
+    /// Parsed semantic projection produced before admission.
     pub(crate) config: Arc<crate::app_config::Config>,
     pub(crate) semantic_values: Arc<BTreeMap<String, String>>,
-    /// The values of `text` the harness's `[disk]` reader does not read as written
-    /// ([`parse_disk_faults`]); Settings ▸ Modified checks them before calling an authored
-    /// key "No effect".
+    /// The values of `text` the harness's `[disk]` reader does not read as written ([`parse_disk_faults`]).
     pub(crate) disk_faults: DiskFaults,
-    /// Immutable non-text assets admitted with `text` at `revision`, shared as one outer
-    /// Arc; consumers never re-resolve the custom kitty sprite.
+    /// Immutable non-text assets admitted with `text` at `revision`, shared as one outer Arc.
     pub(crate) assets: Arc<crate::app_config::ConfigAssetCatalog>,
 }
 
@@ -53,20 +40,16 @@ impl std::fmt::Debug for ConfigSnapshot {
     }
 }
 
-/// What the harness's `[disk]` reader does not read as written in one text
-/// (`aterm_agent::harness::cli::disk_faults`).
+/// What the harness's `[disk]` reader does not read as written in one text (`aterm_agent::harness::cli::disk_faults`).
 pub(crate) type DiskFaults = Arc<[aterm_agent::harness::cli::DiskFault]>;
 
 /// [`DiskFaults`] of `text`, computed wherever [`parse_values`] runs on it: at load, on the
-/// host worker for a disk observation, and in the reducer for a patch.
 fn parse_disk_faults(text: &str) -> DiskFaults {
     aterm_agent::harness::cli::disk_faults(text).into()
 }
 
 impl ConfigSnapshot {
     /// Semantic values (every key and dotted table path) the service compares for OCC.
-    /// Settings uses them for "Modified" and edit expectations; an effective default is
-    /// presentation, not evidence the key exists in `aterm.toml`.
     pub(crate) fn values(&self) -> Result<BTreeMap<String, String>, String> {
         Ok((*self.semantic_values).clone())
     }
@@ -74,8 +57,7 @@ impl ConfigSnapshot {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ExpectedValue {
-    /// No expectation beyond the patch's base revision. Settings always says
-    /// what it expects; only tests write without an expectation.
+    /// No expectation beyond the patch's base revision.
     #[cfg(test)]
     Any,
     Exact(Option<String>),
@@ -85,7 +67,7 @@ pub(crate) enum ExpectedValue {
 pub(crate) struct ConfigKeyEdit {
     pub(crate) key: String,
     pub(crate) expected: ExpectedValue,
-    /// Raw semantic value. `None` removes the key and restores its default.
+    /// Raw semantic value.
     pub(crate) value: Option<String>,
 }
 
@@ -95,10 +77,7 @@ pub(crate) struct ConfigPatchRequest {
     pub(crate) edits: Vec<ConfigKeyEdit>,
 }
 
-/// Immutable handoff from the optimistic reducer to the sole durable config worker:
-/// `expected_text` and `baseline` are the last synchronized disk generation, and
-/// `snapshot` is the candidate to publish. Bundled so later service mutations cannot
-/// change a queued commit's compare-and-swap authority.
+/// Immutable handoff from the optimistic reducer to the sole durable config worker.
 #[derive(Clone, Debug)]
 pub(crate) struct ConfigPersistencePlan {
     pub(crate) snapshot: ConfigSnapshot,
@@ -107,18 +86,14 @@ pub(crate) struct ConfigPersistencePlan {
     pub(crate) baseline: Option<crate::native_document_host::AtomicFileBaseline>,
 }
 
-/// One stable UTF-8 disk read plus the logical-target/file generation it came from,
-/// carried through Manual refresh, strict parse and config-service admission so no
-/// consumer reads the content a second time.
+/// One stable UTF-8 disk read plus the logical-target/file generation it came from, carried through Manual refresh, strict parse and config-service admission so no consumer reads the content a second time.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ConfigDiskObservation {
     pub(crate) text: String,
     pub(crate) baseline: crate::native_document_host::AtomicFileBaseline,
 }
 
-/// Disk bytes plus every filesystem-backed asset and effect-feed runtime needed to
-/// admit them on the event loop. Built on a host worker; admission and the font
-/// worker only compute over this immutable generation.
+/// Disk bytes plus every filesystem-backed asset and effect-feed runtime needed to admit them on the event loop.
 #[derive(Clone)]
 pub(crate) struct PreparedConfigObservation {
     pub(crate) observation: ConfigDiskObservation,
@@ -179,13 +154,6 @@ struct UndoRecord {
     before: Vec<(String, Option<String>)>,
     after: Vec<(String, Option<String>)>,
     /// The admitted text just before the patch and just after it. Undo
-    /// restores the DOCUMENT, not the values: while the file still holds
-    /// `after_text` it goes back to `before_text` byte for byte (every
-    /// line where it stood, every comment with the key it described, the
-    /// value as it was spelled); once the file moved on it reverses only
-    /// the patch's own lines ([`merge_reverting`]). Replaying `before`
-    /// through the forward writer instead appended re-created keys and
-    /// tables at the end and left their comments behind.
     before_text: Arc<str>,
     after_text: Arc<str>,
 }
@@ -218,9 +186,7 @@ impl VersionedConfigService {
         Self::new_with_themes(text, crate::app_config::ThemeCatalog::empty())
     }
 
-    /// Runtime constructor used before presentation. Theme/rainbow kitty discovery is
-    /// bounded and parsed once here; Sparkle feeds stay pending for the startup
-    /// worker. Tests use the deterministic test constructor instead.
+    /// Runtime constructor used before presentation.
     pub(crate) fn new_runtime(text: String) -> Result<Self, String> {
         Self::new_with_themes_mode(text, crate::app_config::ThemeCatalog::discover(), true)
     }
@@ -269,9 +235,7 @@ impl VersionedConfigService {
         })
     }
 
-    /// Seed the process service from the watched user config path. A missing file is
-    /// the valid empty document; unreadable or malformed input is reported so startup
-    /// degrades without clobbering the file.
+    /// Seed the process service from the watched user config path.
     pub(crate) fn load_current() -> Result<Self, String> {
         let Some(path) = crate::app_config::config_path() else {
             return Self::new_runtime(String::new());
@@ -297,8 +261,7 @@ impl VersionedConfigService {
         })
     }
 
-    /// [`Self::observe_path`] for a caller that words a refused read for a
-    /// person ([`crate::save_words`]): the host's refusal is kept as it is.
+    /// [`Self::observe_path`] for a caller that words a refused read for a person ([`crate::save_words`]).
     pub(crate) fn observe_path_for_a_person(
         path: &Path,
         allow_missing: bool,
@@ -316,8 +279,7 @@ impl VersionedConfigService {
         })
     }
 
-    /// Resolve one worker-observed generation before it crosses to the event loop. Runs
-    /// on a host worker, since a custom kitty sprite needs file I/O.
+    /// Resolve one worker-observed generation before it crosses to the event loop.
     pub(crate) fn prepare_observation(
         observation: ConfigDiskObservation,
         themes: Arc<crate::app_config::ThemeCatalog>,
@@ -356,9 +318,7 @@ impl VersionedConfigService {
         }
     }
 
-    /// Install the path-backed effect generation prepared for startup before any view
-    /// observes the service. Completes revision 1's preliminary asset catalog without
-    /// advancing the revision.
+    /// Install the path-backed effect generation prepared for startup before any view observes the service.
     pub(crate) fn complete_startup_path_generation(
         &mut self,
         consumers: aterm_effects::spec::SpecConsumerCapabilities,
@@ -400,16 +360,14 @@ impl VersionedConfigService {
             .map(|baseline| baseline.target.logical_path())
     }
 
-    /// Disk generation the service was initialized from. The watcher uses it to close
-    /// the load→watch handoff: a differing first observation is a real edge.
+    /// Disk generation the service was initialized from.
     pub(crate) fn observed_disk_baseline(
         &self,
     ) -> Option<&crate::native_document_host::AtomicFileBaseline> {
         self.disk_baseline.as_ref()
     }
 
-    /// A writer reported an unknown or externally won disk generation; until a stable
-    /// observation is admitted, persistence plans must not reuse the old baseline.
+    /// A writer reported an unknown or externally won disk generation.
     pub(crate) fn mark_reconciliation_required(&mut self) {
         self.disk_text_admitted = false;
         self.write_reconciliation_required = true;
@@ -419,12 +377,7 @@ impl VersionedConfigService {
         self.write_reconciliation_required
     }
 
-    /// The admitted disk observation, when the service holds no optimistic
-    /// edit ahead of disk (DTP §6.4's retained observation): the text it last
-    /// admitted from disk and the baseline it came from. `None` while a write
-    /// is unreconciled, the text is an unwritten edit, or nothing was read
-    /// from disk. Derived from the authority itself, never cached a second
-    /// time, and it reads no file: a theme refresh re-prepares the face from it.
+    /// The admitted disk observation, when the service holds no optimistic edit ahead of disk (DTP §6.4's retained observation).
     pub(crate) fn admitted_observation(&self) -> Option<ConfigDiskObservation> {
         (self.disk_text_admitted
             && !self.write_reconciliation_required
@@ -437,9 +390,7 @@ impl VersionedConfigService {
             })
     }
 
-    /// Keep path/generation authority when startup read UTF-8 bytes but could not admit
-    /// malformed TOML. Opening Manual supplies its config grant here; the service text
-    /// stays unchanged until a valid durable Manual observation is admitted.
+    /// Keep path/generation authority when startup read UTF-8 bytes but could not admit malformed TOML.
     pub(crate) fn bind_unparsed_disk_baseline(
         &mut self,
         baseline: crate::native_document_host::AtomicFileBaseline,
@@ -456,8 +407,7 @@ impl VersionedConfigService {
         Ok(())
     }
 
-    /// Re-read the bound (or default) config path and admit it; revision and key stamps
-    /// stay monotonic.
+    /// Re-read the bound (or default) config path and admit it; revision and key stamps stay monotonic.
     #[cfg(test)]
     pub(crate) fn synchronize_from_disk(&mut self) -> Result<ConfigSnapshot, String> {
         let path = self
@@ -484,11 +434,7 @@ impl VersionedConfigService {
         self.synchronize_prepared_observation(prepared)
     }
 
-    /// Admit the config and assets resolved by the worker, including path-fed policy
-    /// changes with identical text. Authored fields are determined by the text;
-    /// `ai` and `harness` are resolved independently. Policy or asset changes advance
-    /// the snapshot revision; only authored value changes stamp keys. Every
-    /// observation advances analysis.
+    /// Admit the config and assets resolved by the worker, including path-fed policy changes with identical text.
     pub(crate) fn synchronize_observation_prepared(
         &mut self,
         observation: ConfigDiskObservation,
@@ -550,9 +496,7 @@ impl VersionedConfigService {
         self.synchronize_observation_prepared(observation, config, values, disk_faults, assets)
     }
 
-    /// Roll an optimistic candidate back to the last durable bytes when its worker
-    /// commit fails and the current disk generation is not admissible (e.g. malformed
-    /// external TOML). Stamps stay monotonic through the external-replacement reducer.
+    /// Roll an optimistic candidate back to the last durable bytes when its worker commit fails and the current disk generation is not admissible (e.g. malformed external TOML).
     pub(crate) fn restore_durable_snapshot(&mut self) -> Result<ConfigSnapshot, String> {
         let changed = self.text != self.durable_text
             || self.values != self.durable_values
@@ -586,14 +530,7 @@ impl VersionedConfigService {
         Ok(self.values.get(key).cloned())
     }
 
-    /// Apply one all-or-nothing patch. A stale patch is accepted only when every touched
-    /// key is unchanged since its base revision and every expectation still matches.
-    ///
-    /// A value equal to its key's default is written as a removal
-    /// ([`crate::prefs::unset_equivalent_edits`]) — here, where every writer
-    /// meets (Settings, `aterm ctl settings set`, Serious Mode, presence, the
-    /// theme commit), so no lane can leave `window_theme = "auto"` behind for
-    /// Modified to count as a change.
+    /// Apply one all-or-nothing patch.
     pub(crate) fn patch(&mut self, request: ConfigPatchRequest) -> ConfigPatchResult {
         if let Err(result) = self.check_patch(&request) {
             return result;
@@ -616,10 +553,6 @@ impl VersionedConfigService {
             .iter()
             .map(|(key, _)| (*key).to_string())
             .collect::<BTreeSet<_>>();
-        // A document transform can remove retired spellings or pin a sibling.
-        // Those leaf writes share the patch's OCC and conditional Undo. Parent
-        // projections are not extra writes, and an explicit whole parent
-        // already owns its descendants.
         let before = match leaf_values(&self.text) {
             Ok(values) => values,
             Err(message) => return self.rejected(message),
@@ -658,9 +591,6 @@ impl VersionedConfigService {
     }
 
     /// The patch's own validation and optimistic concurrency: a known base
-    /// revision, unique non-empty keys, no asset-source key, and every touched
-    /// key unchanged since its base revision with its expectation current.
-    /// `Err` carries the result to return.
     fn check_patch(&self, request: &ConfigPatchRequest) -> Result<(), ConfigPatchResult> {
         if request.base_revision == 0 || request.base_revision > self.revision {
             return Err(self.rejected("invalid base revision"));
@@ -715,10 +645,6 @@ impl VersionedConfigService {
     }
 
     /// Admit `next` as the new text, the one revision bump a patch or an undo
-    /// makes: validate the whole typed config before any state moves, rewrap
-    /// the sparkle and wallpaper assets it changed, stamp the revision on
-    /// every key in `touched` and every key whose value moved, and record the
-    /// undo of exactly this transition.
     fn admit_text(&mut self, next: String, touched: &BTreeSet<String>) -> ConfigPatchResult {
         if next == self.text {
             return ConfigPatchResult::Unchanged {
@@ -726,11 +652,6 @@ impl VersionedConfigService {
             };
         }
 
-        // Validate the full typed config before advancing any state. Host-backed
-        // source keys were rejected above (Manual's worker admits text and decoded
-        // assets together), so structured toggle/theme/font changes reuse the admitted
-        // trail-style/rainbow kitty/theme assets with no event-thread I/O. A sparkle-table
-        // change below rewraps them with a pending consumer projection.
         let next_config = match parse_config(&next) {
             Ok(config) => config,
             Err(message) => return self.rejected(message),
@@ -740,9 +661,6 @@ impl VersionedConfigService {
             Err(message) => return self.rejected(message),
         };
 
-        // The consumer projection belongs to the `[sparkle_words]` generation that produced
-        // it and cannot be rebuilt on the event thread, so a changed sparkle table publishes
-        // `None`; the config/font worker fills it in from the durable generation.
         if self.config.sparkle_words != next_config.sparkle_words
             && self.assets.sparkle_spec_consumers.is_some()
         {
@@ -754,9 +672,6 @@ impl VersionedConfigService {
                 sparkle_spec_consumers: None,
             });
         }
-        // Wallpaper is structured-writable (the Settings file picker writes it),
-        // unlike the manual-only asset-source keys, so this lane re-resolves the image
-        // inline; otherwise the catalog would serve the previous picture.
         if self.config.wallpaper != next_config.wallpaper {
             self.assets = Arc::new(crate::app_config::ConfigAssetCatalog {
                 trail_style: Arc::clone(&self.assets.trail_style),
@@ -778,9 +693,6 @@ impl VersionedConfigService {
             .map(|key| (key.clone(), after_values.get(key).cloned()))
             .collect::<Vec<_>>();
         self.revision = self.revision.saturating_add(1);
-        // An undo's restored text can bring back keys the forward patch took
-        // out with it (a retired spelling the new key replaced), so every
-        // key whose value moved is stamped, not only the touched ones.
         let moved = self
             .values
             .keys()
@@ -791,8 +703,6 @@ impl VersionedConfigService {
         for key in touched.iter().chain(&moved) {
             self.key_revision.insert(key.clone(), self.revision);
         }
-        // Each revision's text is held once: a patch right after another
-        // starts from the text the previous record ended on.
         let before_text = match self.undo.back() {
             Some(previous) if *previous.after_text == *self.text => {
                 Arc::clone(&previous.after_text)
@@ -822,8 +732,7 @@ impl VersionedConfigService {
         }
     }
 
-    /// Reset a complete named set in one transform/revision. Consumers pass the
-    /// editable schema keys; unrelated hand-authored configuration survives.
+    /// Reset a complete named set in one transform/revision.
     #[cfg(test)]
     pub(crate) fn reset_all(
         &mut self,
@@ -843,15 +752,7 @@ impl VersionedConfigService {
         })
     }
 
-    /// Conditional undo: it succeeds only if every value written by the target patch
-    /// is still current. Later unrelated changes are preserved.
-    ///
-    /// It restores the document, not the values ([`UndoRecord::before_text`]):
-    /// while the file is still the patch's result it goes back to the text
-    /// before the patch exactly; after an unrelated change it reverses the
-    /// patch's own lines and keeps the change ([`merge_reverting`]), and only
-    /// where those lines were edited too, or the merge would not read as the
-    /// undone values, does it write the values back through the writer.
+    /// Conditional undo: it succeeds only if every value written by the target patch is still current.
     pub(crate) fn undo(&mut self, token: UndoToken) -> ConfigPatchResult {
         let Some(record) = self
             .undo
@@ -875,17 +776,8 @@ impl VersionedConfigService {
         }
         let next = if *self.text == *record.after_text {
             // Still the patch's result: the text before it, exactly, whatever
-            // it spelled — a value only a file holds (an old style alias the
-            // writer reads but never writes) comes back as it was, so Undo
-            // never needs the writer to take it.
             record.before_text.to_string()
         } else {
-            // The merge stands where it reads as the file now with the
-            // patch taken back, whatever the patch's lines spelled: an old
-            // style alias comes back as the file held it, not as the name the
-            // writer would give it, and a key the writer wrote beside the
-            // edit (the style Off replaced, the trail colour an old `classic
-            // mono` says) goes back with it.
             let merged = merge_reverting(&record.after_text, &record.before_text, &self.text)
                 .filter(|merged| {
                     parse_config(merged).is_ok()
@@ -915,16 +807,13 @@ impl VersionedConfigService {
         self.admit_text(next, &touched)
     }
 
-    /// Accept a whole watcher/file snapshot. Changed keys are revision-stamped so a
-    /// queued stale UI patch can rebase across unrelated external changes only.
+    /// Accept a whole watcher/file snapshot.
     #[cfg(test)]
     pub(crate) fn replace_external(&mut self, text: String) -> Result<ConfigSnapshot, String> {
         let before = self.values.clone();
         let after = parse_values(&text)?;
         let before_config = Arc::clone(&self.config);
         let after_config = Arc::new(parse_config(&text)?);
-        // A byte-equal observation is the refresh signal for a touched manifest or sprite.
-        // A changed text reuses the asset Arc unless an asset source changed.
         let refresh_assets =
             text == self.text || asset_sources_changed(&before_config, &after_config);
         let assets = if refresh_assets {
@@ -969,9 +858,7 @@ impl VersionedConfigService {
         Ok(self.snapshot())
     }
 
-    /// Admit a catalog parsed by the background theme-directory watcher. Text, trail
-    /// style and rainbow kitty keep their values; a changed catalog advances the one
-    /// outer snapshot revision.
+    /// Admit a catalog parsed by the background theme-directory watcher.
     pub(crate) fn replace_theme_catalog(
         &mut self,
         themes: Arc<crate::app_config::ThemeCatalog>,
@@ -1017,16 +904,14 @@ fn asset_sources_changed(
         != normalized_kitty_sprite(after.cursor_nyan_sprite.as_deref())
 }
 
-/// Why an observation of aterm.toml failed: the host refused the read, or
-/// what it read is not text.
+/// Why an observation of aterm.toml failed: the host refused the read, or what it read is not text.
 #[derive(Debug)]
 pub(crate) enum ObserveFailure {
     Refused(crate::native_document_host::DocumentHostError),
     Text(String),
 }
 
-/// Why `aterm.toml` at `path` could not be read, naming the file once: the host's
-/// sentence without its internal stage tag. Every config-file reader reports this way.
+/// Why `aterm.toml` at `path` could not be read, naming the file once: the host's sentence without its internal stage tag.
 pub(crate) fn config_read_error(
     path: &Path,
     error: crate::native_document_host::DocumentHostError,
@@ -1055,17 +940,12 @@ fn parse_values(text: &str) -> Result<BTreeMap<String, String>, String> {
     let mut values = BTreeMap::new();
     for (key, item) in document.iter() {
         // Full-depth dotted projection, mirroring `prefs::apply_prefs_edits`, so Settings
-        // and OCC expectations address the leaf (`sparkle_words.profanity.enabled`). Each
-        // table keeps its whole-table entry too, so an edit anywhere in it stamps it.
         project_item(&mut values, &join_config_key_path("", key), item);
     }
     Ok(values)
 }
 
 /// Whether `merged` reads as `current` with the patch from `before` to
-/// `after` taken back out: every leaf the patch moved as `before` held it,
-/// every other leaf as `current` holds it ([`leaf_values`]). A text that does
-/// not parse reads as nothing.
 fn reads_as_reverted(merged: &str, after: &str, before: &str, current: &str) -> bool {
     let (Ok(merged), Ok(after), Ok(before), Ok(current)) = (
         leaf_values(merged),
@@ -1091,9 +971,6 @@ fn reads_as_reverted(merged: &str, after: &str, before: &str, current: &str) -> 
 }
 
 /// The values of `text`'s leaves — every key whose value is not a table —
-/// under their dotted paths, as [`parse_values`] names them. A table's own
-/// entry is its text, comments and order included, so two documents that
-/// hold the same settings laid out differently compare equal here only.
 fn leaf_values(text: &str) -> Result<BTreeMap<String, String>, String> {
     fn walk(values: &mut BTreeMap<String, String>, path: &str, item: &aterm_toml::edit::Item) {
         if let Some(table) = item.as_table_like() {
@@ -1115,21 +992,12 @@ fn leaf_values(text: &str) -> Result<BTreeMap<String, String>, String> {
 }
 
 /// `current` with the change from `before` to `after` taken back out, line
-/// for line: the three-way merge of `after` (the base both texts grew from),
-/// `before` (what the undo wants there) and `current` (the file now, with a
-/// later change of its own). `None` where a line the undo would restore was
-/// edited in `current` too, so the two cannot both stand. The later change
-/// keeps its own bytes, comments included.
 fn merge_reverting(after: &str, before: &str, current: &str) -> Option<String> {
     let base: Vec<&str> = after.split_inclusive('\n').collect();
     let wanted: Vec<&str> = before.split_inclusive('\n').collect();
     let theirs: Vec<&str> = current.split_inclusive('\n').collect();
     let revert = line_hunks(&base, &wanted)?;
     let later = line_hunks(&base, &theirs)?;
-    // Both lists are in base order. A hunk replaces base[start..end] with
-    // other[other_start..other_end]; two hunks clash where their base ranges
-    // share a line, or where both insert at one place.
-    // An insertion at the start of the other's range goes ahead of it.
     let clash = |a: &LineHunk, b: &LineHunk| {
         (a.start < b.end && b.start < a.end)
             || (a.start == a.end && b.start == b.end && a.start == b.start)
@@ -1158,7 +1026,6 @@ fn merge_reverting(after: &str, before: &str, current: &str) -> Option<String> {
 }
 
 /// One difference between two line lists: `base[start..end]` became
-/// `other[other_start..other_end]`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct LineHunk {
     start: usize,
@@ -1168,9 +1035,6 @@ struct LineHunk {
 }
 
 /// The shortest edit from `base` to `other` as hunks in base order (Myers'
-/// O((N+M)D) greedy diff over whole lines). `None` past a bounded number of
-/// differences: a merge over a rewritten file is no longer an undo of one
-/// change, and the caller writes the values back instead.
 fn line_hunks(base: &[&str], other: &[&str]) -> Option<Vec<LineHunk>> {
     const MAX_DIFFERENCES: usize = 512;
     let (n, m) = (base.len(), other.len());
@@ -1204,7 +1068,6 @@ fn line_hunks(base: &[&str], other: &[&str]) -> Option<Vec<LineHunk>> {
         }
     }
     let differences = found?;
-    // Walk the trace back from (n, m), collecting the snake each step took.
     let mut matched: Vec<(usize, usize)> = Vec::new();
     let (mut x, mut y) = (n, m);
     for d in (1..=differences).rev() {
@@ -1256,10 +1119,6 @@ fn line_hunks(base: &[&str], other: &[&str]) -> Option<Vec<LineHunk>> {
 }
 
 /// Append one semantic TOML key segment to the identity used by `ConfigSnapshot::values`.
-///
-/// `packages.include` (two segments) and `"packages.include"` (one) must not collide, or an
-/// unknown value could impersonate a registered setting; `aterm_toml::edit::Key` quotes a
-/// segment that needs it, so the result is readable and injective.
 pub(crate) fn join_config_key_path(parent: &str, segment: &str) -> String {
     let segment = aterm_toml::edit::Key::new(segment).to_string();
     if parent.is_empty() {
@@ -1270,8 +1129,6 @@ pub(crate) fn join_config_key_path(parent: &str, segment: &str) -> String {
 }
 
 /// Insert `item`'s value at `path` and, for header or inline tables, recurse into
-/// each child under `path.child`. Arrays of tables stay one opaque entry, as in the
-/// nested writer.
 fn project_item(values: &mut BTreeMap<String, String>, path: &str, item: &aterm_toml::edit::Item) {
     if let Some(table) = item.as_table_like() {
         for (child, child_item) in table.iter() {
@@ -1282,12 +1139,6 @@ fn project_item(values: &mut BTreeMap<String, String>, path: &str, item: &aterm_
 }
 
 /// How `raw`, written for `key`, reads among [`ConfigSnapshot::values`] —
-/// the projection a patch's expectation is compared in (`12` for a typed
-/// `12.0`) — or `None` where the writer refuses it.
-/// Whether `key`, holding `held`, holds the value `expected` names: the
-/// same text, or the same value once written (`1.0` names a held `1`, as
-/// the writer spells it). A press composed over a value still on its way
-/// names it as the person chose it, not as the file will spell it.
 fn holds(key: &str, held: Option<&String>, expected: Option<&str>) -> bool {
     match (held, expected) {
         (None, None) => true,
@@ -1298,25 +1149,13 @@ fn holds(key: &str, held: Option<&String>, expected: Option<&str>) -> bool {
     }
 }
 
-/// The write a patch makes ([`planned_write`]): the edits the writer takes,
-/// and the text it makes of them.
+/// The write a patch makes ([`planned_write`]): the edits the writer takes, and the text it makes of them.
 pub(crate) struct PlannedWrite<'a> {
     pub(crate) edits: Vec<(&'a str, Option<String>)>,
     pub(crate) text: String,
 }
 
-/// THE WRITE A PATCH MAKES, the one judgement every writer shares — the
-/// service, and the Settings page deciding whether a press has anything to
-/// send: `edits` with each value equal to its key's default made a removal
-/// ([`crate::prefs::unset_equivalent_edits`]) and each value its key already
-/// holds dropped ([`written_value`]: `14` over the file's `14.0` would only
-/// re-spell the person's line and report a save of nothing), and the text
-/// the writer makes of the rest. `Ok(None)` where that text is `text`: a
-/// patch that changes nothing. A removal is always the writer's to judge,
-/// even of a key the file does not hold: its document transforms (a retired
-/// spelling folded into the key that replaced it, the style Off replaced,
-/// an old Classic's colour) can change the file all the same. `Err` is the
-/// writer's refusal, in its words.
+/// THE WRITE A PATCH MAKES, the one judgement every writer shares.
 pub(crate) fn planned_write<'a>(
     text: &str,
     edits: &[(&'a str, Option<String>)],
@@ -1329,7 +1168,6 @@ pub(crate) fn planned_write<'a>(
         .zip(elide)
         .map(|((key, value), elide)| (*key, if elide { None } else { value.clone() }))
         .filter(|(key, value)| {
-            // A value the writer refuses is kept, so the writer refuses it.
             value.as_deref().is_none_or(|value| {
                 written_value(key, value).is_none_or(|written| held.get(*key) != Some(&written))
             })
@@ -1403,7 +1241,6 @@ mod tests {
     }
 
     /// A patch whose base was never published (zero, or the revision the write would
-    /// produce) is refused before anything moves.
     #[test]
     fn a_base_revision_the_service_never_published_is_refused_without_a_write() {
         let mut service =
@@ -1433,22 +1270,13 @@ mod tests {
     }
 
     /// `aterm ctl settings set cursor_trail_style …` and a Settings re-commit
-    /// reduce through this service: an alias released configs carry (`rainbow
-    /// kitty`), a hidden canonical (`classic mono`) and the Settings label
-    /// `lightning` all apply and save as their canonical name; a near miss is
-    /// refused without a write.
     #[test]
     fn settings_set_accepts_trail_aliases() {
-        // An alias of the default style is the default: written as a removal
-        // (`an_alias_of_the_default_style_is_written_as_a_removal`).
         for (input, written) in [
             ("nyan", "rainbow kitty flying"),
-            // The owner's own spelling.
             ("nyan rainbow", "rainbow kitty flying"),
             ("lightning", "laser"),
             ("rainbow dog", "rainbow dog pet"),
-            // The one alias that draws differently from its row is written
-            // as authored, so the file keeps drawing the one-colour face.
             ("classic mono", "classic mono"),
             ("classic lumen", "classic mono"),
             ("rainbow kitty flat", "rainbow kitty flat"),
@@ -1518,8 +1346,6 @@ mod tests {
         assert!(unchanged.analysis_generation > refreshed.analysis_generation);
         assert_eq!(unchanged.assets, refreshed.assets);
 
-        // The worker resolves path-fed policy independently of the unchanged TOML.
-        // Tests supply the config directory explicitly rather than reading HOME.
         let config_path = dir.join("aterm.toml");
         let fleet_path = dir.join(aterm_agent::ai::config::FLEET_FILE);
         std::fs::write(&config_path, &text).unwrap();
@@ -1669,8 +1495,6 @@ mod tests {
         let initial = service.snapshot();
         let initial_fp = initial.assets.kitty_sprite.fingerprint();
 
-        // If the external-edit path accidentally resolves assets, corrupting
-        // the admitted source makes the regression fail visibly.
         std::fs::write(&first, b"not a PNG").unwrap();
         let unrelated = service
             .replace_external(format!(
@@ -1834,8 +1658,6 @@ mod tests {
             panic!("valid patch must apply before persistence");
         };
         let plan = service.persistence_plan(snapshot);
-        // Mint from a regular path, then replace it with a symlink: an issued plan
-        // cannot be redirected after its baseline was captured.
         std::fs::rename(&logical, &first).unwrap();
         symlink(&second, &logical).unwrap();
 
@@ -1856,15 +1678,6 @@ mod tests {
     }
 
     /// A TYPE VALUE THE THEME SETS OTHERWISE IS KEPT, EVEN AT ATERM'S DEFAULT:
-    /// under a theme that sets the line height (1.15), `line_height = 1.0`
-    /// is what keeps the theme's off, so it stays written, whether the theme
-    /// is already in aterm.toml or comes in the same patch (Keep colours
-    /// only writes the theme and its pins together). Negative controls: with
-    /// no theme, or one that leaves the key alone, the default is still a
-    /// removal. Before, the pin was always elided: Keep colours only lost
-    /// the line height it said it kept ("Line height set to 1×", the theme's
-    /// 1.15 drawn), and a Revert composed over the pin on its way conflicted
-    /// with the file that lacked it.
     #[test]
     fn a_default_over_a_themes_type_value_stays_written() {
         let catalog = |extra: &str| {
@@ -1913,12 +1726,6 @@ mod tests {
     }
 
     /// AN EXPECTATION NAMES A VALUE, NOT ITS SPELLING: a patch expecting
-    /// `line_height` at `1.0` lands over the file's `1` (the writer's
-    /// spelling of the `1.0` a press on its way chose), as does one
-    /// expecting the exact text. Negative controls: a different value, and
-    /// a value where the key is absent, conflict. Before, the `1.0` a Revert
-    /// was composed over conflicted with the `1` Keep colours only had
-    /// written ("Changed externally · Review before retrying").
     #[test]
     fn an_expectation_names_a_value_not_its_spelling() {
         let patch = |source: &str, expected: Option<&str>| {
@@ -1949,17 +1756,6 @@ mod tests {
     }
 
     /// A VALUE EQUAL TO ITS DEFAULT IS WRITTEN AS A REMOVAL, by every writer
-    /// the service serves: for every Settings key with an unset value,
-    /// writing that value to an empty file changes nothing, and writing it
-    /// over another value removes the key. Negative controls: `theme =
-    /// "Default"` (a named theme is a choice, written as chosen so a later
-    /// change of default never moves it) and a value that differs stay
-    /// written, and a default that follows another
-    /// setting is that setting's (Laser's own bloom size is elided under
-    /// Laser; the kitty's default bloom size is not). `display_font = "off"`
-    /// over a display layer — a `display:` font family, the config's or its
-    /// theme's — is what keeps those faces off, so it stays written there and
-    /// only there.
     #[test]
     fn a_default_value_is_written_as_a_removal() {
         let fields = crate::prefs::editable_fields(&crate::app_config::Config::default());
@@ -2005,7 +1801,6 @@ mod tests {
             Some("dark")
         );
 
-        // A theme whose font family is a display face.
         let arcade = {
             let text = "foreground = #e0e0e0\nbackground = #101418\nfont_family = display:pixel\n";
             let parsed = aterm_types::scheme::parse_theme_str(text).expect("a theme");
@@ -2077,9 +1872,6 @@ mod tests {
     }
 
     /// AN ALIAS OF THE DEFAULT IS THE DEFAULT: the writer stores `kitty` as
-    /// `rainbow kitty pet`, so the rule that writes a default as a removal
-    /// judges the stored spelling, not the typed one. An alias of another
-    /// style is still written, as its row.
     #[test]
     fn an_alias_of_the_default_style_is_written_as_a_removal() {
         let default = crate::app_config::default_cursor_trail_style();
@@ -2119,7 +1911,6 @@ mod tests {
                 "{alias:?} over no style: {result:?}"
             );
         }
-        // Negative control: an alias of another style is that style.
         let mut service = VersionedConfigService::new(String::new()).unwrap();
         let base = service.snapshot().revision;
         service.patch(edit(
@@ -2138,11 +1929,6 @@ mod tests {
     }
 
     /// A VALUE THE KEY ALREADY HOLDS IS NO WRITE, whoever sends it (`aterm
-    /// ctl settings set font_px 14` over the file's `font_px = 14`): the
-    /// patch is Unchanged, no revision or Undo is minted, and the person's
-    /// line keeps its spelling and its comment. In a patch that also changes
-    /// another key only that key moves. Negative control: a different value
-    /// is written.
     #[test]
     fn a_value_the_key_already_holds_is_no_write() {
         let source = "font_px = 14  # projector\nbidi = \"disabled\"\n";
@@ -2191,8 +1977,6 @@ mod tests {
     }
 
     /// The file a reset-and-undo test starts from: root keys with a comment
-    /// above one and an inline comment on another, tables in an authored
-    /// order, a comment above a table's key and one under a table's last key.
     const AUTHORED: &str = "\
 # note
 font_px = 14  # projector
@@ -2218,9 +2002,6 @@ enabled = false
 ";
 
     /// UNDO RESTORES THE FILE, NOT THE VALUES: a reset of several keys, then
-    /// Undo, gives back the exact bytes (every key where it stood, every
-    /// comment with the key it described, `14` still spelled `14`); Undo of
-    /// that Undo gives back the reset text, and once more the original.
     #[test]
     fn undo_of_a_reset_restores_the_file_byte_for_byte() {
         let mut service = VersionedConfigService::new(AUTHORED.into()).unwrap();
@@ -2260,10 +2041,6 @@ enabled = false
     }
 
     /// After an unrelated change, Undo takes back only its own lines: the
-    /// reset `font_px` returns where it stood with the comment above it and
-    /// its inline comment, and a hand edit made since (a changed value and a
-    /// new comment elsewhere) keeps its bytes. Negative control: an edit of
-    /// the undone key itself still refuses the Undo.
     #[test]
     fn undo_after_an_unrelated_edit_reverts_only_its_own_lines() {
         let mut service = VersionedConfigService::new(AUTHORED.into()).unwrap();
@@ -2304,8 +2081,6 @@ enabled = false
     }
 
     /// The line merge Undo uses: the later change and the reverted change
-    /// both stand where they touch different lines, and lines both touched
-    /// are refused (the caller writes the values back instead).
     #[test]
     fn the_reverting_merge_keeps_both_changes_or_refuses() {
         let before = "a\nb\nc\nd\n";
@@ -2376,8 +2151,6 @@ enabled = false
         ));
         let initial_fp = initial.assets.kitty_sprite.fingerprint();
 
-        // Make a re-read observable by invalidating the admitted source: a patch that
-        // changes no asset source must keep the exact catalog allocation.
         std::fs::write(&path, b"not a PNG").unwrap();
 
         let ConfigPatchResult::Applied {
@@ -2407,8 +2180,6 @@ enabled = false
         assert!(Arc::ptr_eq(&patched.assets, &undone.assets));
         assert_eq!(service.value("theme").unwrap().as_deref(), Some("Nord"));
 
-        // A structured source-key patch is rejected before mutation: resolving assets here
-        // would put I/O on the event loop, and reusing the old Arc would split the generation.
         let second_rgba = [0xee, 0x22, 0x66, 0xff, 0x22, 0xee, 0x66, 0xff];
         let second_png = crate::app_introspect::encode_rgba8_png(&second_rgba, 2, 1).unwrap();
         std::fs::write(&second_path, second_png).unwrap();
@@ -2422,7 +2193,6 @@ enabled = false
         assert!(matches!(rejected, ConfigPatchResult::Rejected { .. }));
         assert_eq!(service.snapshot(), undone);
 
-        // Manual and the watcher admit the source change as one prepared observation.
         let config_path = path.with_extension("toml");
         std::fs::write(
             &config_path,
@@ -2482,8 +2252,6 @@ enabled = false
     }
 
     /// An authored empty collection is still an authored value. Clearing it
-    /// and applying the actual Undo token restores its typed empty collection,
-    /// rather than refusing or silently turning it into an absent setting.
     #[test]
     fn undo_restores_authored_empty_collections() {
         for (key, authored) in [
@@ -2519,8 +2287,6 @@ enabled = false
             );
             let _: crate::app_config::Config = aterm_toml::from_str(&snapshot.text).unwrap();
         }
-        // A retired master and the sibling a style choice pins are part of
-        // its actual inverse, including after an unrelated later edit.
         for master in [false, true] {
             let original = format!("font_px = 13.0\ncursor_trail = {master}\n");
             let mut service = VersionedConfigService::new(original.clone()).unwrap();
@@ -2564,8 +2330,6 @@ enabled = false
             );
         }
 
-        // A newer value of the implicitly pinned sibling prevents Undo;
-        // its value must not be silently restored along with the old master.
         let source = "cursor_trail = false\ncursor_momentum_glow = true\n";
         let mut service = VersionedConfigService::new(source.into()).unwrap();
         let ConfigPatchResult::Applied { snapshot, undo } = service.patch(edit(
@@ -2588,8 +2352,6 @@ enabled = false
         );
         assert_eq!(service.snapshot(), newer);
 
-        // A stale style request cannot overwrite a newer sibling through the
-        // writer, despite its own explicit style expectation still matching.
         let source = "cursor_trail = false\ncursor_trail_style = \"laser\"\n";
         let mut service = VersionedConfigService::new(source.into()).unwrap();
         let base = service.snapshot().revision;
@@ -2601,8 +2363,6 @@ enabled = false
             ConfigPatchResult::Conflict { keys, .. } if keys.contains(&"cursor_momentum_glow".to_string())));
         assert_eq!(service.snapshot(), newer);
 
-        // An opaque parent's revision does not block independent leaf writes,
-        // and conditional Undo of one leaf preserves the other child's edit.
         let mut service =
             VersionedConfigService::new("[matrix_rain]\nenabled = false\nfps = 37\n".into())
                 .unwrap();
@@ -2643,9 +2403,6 @@ enabled = false
     }
 
     /// The value the service reports for a cleared palette (the slot table in
-    /// either spelling, the `palette` array) is what Undo writes back, and it
-    /// lands as the same TOML, so the file still loads. Control: a slot table
-    /// with an out-of-range slot or a non-colour is refused, never written.
     #[test]
     fn a_reported_palette_value_writes_back_as_toml() {
         for text in [
@@ -2774,8 +2531,6 @@ include = ["nested"]
     }
 
     /// Depth-2 dotted keys behave like depth-1: `sparkle_words.profanity.enabled` gets
-    /// its own entry, a stale expectation conflicts while the current one applies, and
-    /// blank-revert removes the leaf and the tables it left bare at both depths.
     #[test]
     fn depth_two_dotted_key_projection_occ_and_blank_revert() {
         let values = parse_values(
@@ -2809,7 +2564,6 @@ include = ["nested"]
         .unwrap();
         let base = service.snapshot().revision;
 
-        // An external edit flips the depth-2 child; a stale exact expectation conflicts.
         service
             .replace_external(
                 "[sparkle_words]\n\n[sparkle_words.profanity]\nenabled = true\n".into(),
@@ -2826,7 +2580,6 @@ include = ["nested"]
         };
         assert_eq!(keys, vec!["sparkle_words.profanity.enabled".to_string()]);
 
-        // The current expectation applies, typed (bool, not string).
         let rev = service.snapshot().revision;
         let applied = service.patch(edit(
             rev,
@@ -2846,7 +2599,6 @@ include = ["nested"]
             Some("false")
         );
 
-        // Blank reverts the leaf, and the tables it left bare at both depths.
         let rev = service.snapshot().revision;
         let reverted = service.patch(edit(
             rev,

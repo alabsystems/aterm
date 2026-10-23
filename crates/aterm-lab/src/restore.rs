@@ -1,95 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `restore [tag] quit|crash [--keep] [--land|--land-open]`: the cold restore against the real
-//! Claude Code. When aterm quits or crashes while an agent runs, the next
-//! launch reopens the tab and the harness relaunches the agent there, on its
-//! conversation, in the Claude home and on the login it ran under
-//! (`relaunch::after_host_ended`).
-//!
-//! A lab of its own (`restore-<pid>` unless a tag is given; trust seeded, the
-//! headless-restore seam on: a headless instance then keeps its desk as a
-//! window does — `ATERM_DEBUG_HEADLESS_RESTORE`, a debug build or one with
-//! `--features dev-seams`; aterm-gui's `desk::Desk`). Claude Code takes a turn;
-//! the run waits until the crash journal names its conversation, then aterm
-//! ends: `quit` sends `invoke Quit`, `crash` SIGKILLs the instance. The
-//! instance and its tree end (one still alive after 15 s is said and ended:
-//! it would hold the conversation), the socket and its token are removed from
-//! outside the jail (the jail denies a jailed process unlinking them), and the
-//! instance starts again on the same state. The report: the relaunch's typed
-//! line (the upgrade ledger's rows), whether the agent resumed the SAME
-//! conversation or sits in onboarding, the relaunch's carry-on, and the
-//! timings. The plain run is the Cruise control: its tab under Cruise before
-//! aterm ends (a config default of Land or Off cannot run, exit 3), and once
-//! the agent is back the restored tab's journal is watched (at most
-//! [`LAND_WATCH`]) until its carry-on settles — past the waits and another
-//! sweep's lock, as the Land runs read it ([`carry_on_settled`]) — which
-//! must be `HOST … carry-on step=continued` with the ledger's `continued`
-//! row, no word of Land's (`done:landing`, `done:said-done`) among its
-//! steps, and the tab under Cruise ([`cruise_judged`]): Cruise's carry-on
-//! typed into open work. Exit 0 resumed with that carry-on; 1 it did not
-//! (another conversation, none within 90 s, onboarding, another carry-on or
-//! none, an instance that would not end or come back); 2 usage; 3 could not
-//! run. NOT OBSERVED: a windowed aterm's own quit (the Apple Event, the
-//! confirm), a person's ⌘Q, a crash that leaves the agent running (the step
-//! is `crash --keep-tree` under a PTY keeper, [`crate::crash`], judged by its
-//! driver), an account move. (A Codex is restored by no lane since the Codex
-//! screen lane's retirement, 2026-10-16: codex-alab's restore is
-//! `codex-alab-proof`'s.)
-//!
-//! `--hold` (crash only: a held tab refuses `invoke Quit`, `ERR halted`): the
-//! owner holds the tab (`hold <sid> on reason=review`) once the journal names
-//! the conversation, and the run waits until the journal carries the hold too
-//! (ruling 23 of `docs/HANDOFF-robustness-rounds-2026-10-08.md`): the live
-//! instance's own journal, on the tab's leaf (30 s; a journal that never
-//! carries it FAILS the run there, aterm not ended). After the
-//! restart the report is the held tab's: no agent relaunched and nothing typed
-//! (30 s), the reopened tab's `hold=`, the record the restore said of it
-//! (`messages tag=harness`, its key `harness.restored-held.<sid>`), the lift
-//! command that record names run AS WRITTEN, and the tab's `hold=` after it.
-//! Exit 0 when every one of those is what the ruling says; 1 otherwise.
-//!
-//! `--clear` (LC-1 of ): after the turn the run types `/clear`,
-//! waits until Claude Code's record names the new conversation and the desk
-//! names it too (30 s; said when it does not), then ends aterm: the relaunch
-//! must resume the NEW conversation, never the one the agent left, and its
-//! carry-on settle on `done:taskless` with nothing typed — nobody has asked
-//! the new conversation anything ([`cruise_step`]). It takes no `--land` or
-//! `--land-open` (usage, exit 2): taskless, the relaunch types nothing
-//! whatever the Autopilot, and Land has no work to land or leave open.
-//!
-//! `--land` (§9.4.5 and §9.4.8 of `docs/DESIGN-harness-autopilot-2026-10-15.md`):
-//! after the turn the tab goes under Land — a tab under Land already (a
-//! config default) cannot run, exit 3: its restored Land would prove nothing
-//! of the layout — and the run waits until the crash journal carries the
-//! word, as `--hold` waits for its hold. The stub's answers become clean
-//! defenses, a few lines starting `Nothing left:` (the lab's project is no
-//! repository, so its probe finds nothing unlanded), and the run waits (6
-//! min) until the tab's `status` says `task=landed` — the short turn's
-//! back-off, the land instruction typed, its defense. After the restart the
-//! restored tab is watched for [`LAND_WATCH`], past the back-off an attach
-//! waits before it types: its task must end `landed`, with no land
-//! instruction typed since the relaunch (the ledger's `land@v1` rows), the
-//! tab under Land (`status` `autopilot=land`), and the relaunch's carry-on
-//! settled with nothing typed (the restored tab's journal's carry-on settles
-//! on `HOST … carry-on step=done:said-done`, [`carry_on_judged`], and never
-//! says `step=continued`) — no line typed into finished work. Exit 0 only
-//! when that holds and the conversation resumed.
-//!
-//! `--land-open`, `--land`'s negative control: the tab goes under Land
-//! mid-work (the stub's ordinary reply, no done; a tab under Land already
-//! cannot run, as with `--land`) and aterm ends as soon as the crash journal
-//! carries the word, as `--land` waits for it. After the restart the
-//! restored tab must be under Land and its journal's carry-on must settle on
-//! `HOST … carry-on step=done:landing` within [`LAND_WATCH`] — past the waits
-//! and another sweep's lock, which the host settles again after
-//! (`busy:another-sweep`), and on no other word: a failed relaunch, a
-//! refusal or a word the lab was never taught settles it too, and fails —
-//! never `done:said-done`, and never `continued` — with no carry-on line
-//! typed: Land's work that was not done is not read as done, and under Land
-//! no relaunch types Cruise's carry-on (`upgrade_drive::Opts::land`, F2);
-//! the point is the land policy's. Exit 0 only when it does and the
-//! conversation resumed.
+//! `restore [tag] quit|crash [--keep] [--land|--land-open]`: the cold restore against the real Claude Code.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -106,16 +18,12 @@ use crate::util::now_ms;
 use crate::{Fail, Res};
 
 /// `--land`'s stub mode: every answer a clean defense, as Land's instruction
-/// asks for it — so the instruction's answer LANDS the task.
 const LANDED_MODE: &str = "landed";
 
 /// …its words: a `Nothing left:` defense with no need and no open work in
-/// Land's strict reading (`turn_end::clean_defense`).
 const LANDED_TEXT: &str = "Nothing left: the lab's work is committed and pushed to origin/main.";
 
 /// How long `--land` watches the restored tab: past the 2-minute back-off a
-/// loop that attaches to an idle agent waits before its first act, so a land
-/// instruction typed for want of the seed is seen.
 const LAND_WATCH: Duration = Duration::from_secs(170);
 
 /// The tab's `task=` as its `status` prints it (`?` where it does not).
@@ -124,7 +32,6 @@ fn task_of(door: &Door<'_>) -> String {
 }
 
 /// The land instructions the harness typed into tab `sid` (its ledger's
-/// rows of `land@v1` that say `typed`).
 fn land_typed(door: &Door<'_>, sid: &str) -> Vec<String> {
     door.harness_ledger(sid)
         .unwrap_or_default()
@@ -135,8 +42,6 @@ fn land_typed(door: &Door<'_>, sid: &str) -> Vec<String> {
 }
 
 /// `--land`, before aterm ends: tab `sid` under Land, the stub's answers
-/// clean defenses, until its `status` says `task=landed` (6 min). The land
-/// instructions typed by then.
 fn land_first(run: &Run, door: &Door<'_>, sid: &str) -> Result<Vec<String>, Fail> {
     let spec = J::obj([("stream", J::Bool(true)), ("text", J::s(LANDED_TEXT))]);
     crate::util::atomic_write(
@@ -176,9 +81,6 @@ fn land_first(run: &Run, door: &Door<'_>, sid: &str) -> Result<Vec<String>, Fail
 }
 
 /// `--land`, after the restart: the restored tab `sid` watched for
-/// [`LAND_WATCH`] — the `task=` values it read, in order, and the land
-/// instructions typed since the relaunch (`before`: the old tab's, where the
-/// restored tab is the same session).
 fn land_after(
     door: &Door<'_>,
     sid: &str,
@@ -211,8 +113,6 @@ enum Land {
 }
 
 /// The `HOST` and `DONE` lines of tab `sid`'s journal (the loop's
-/// `<sid>.journal.jsonl` under the lab's state, read through no link): the
-/// relaunch's carry-on step among them.
 fn journal_lines(run: &Run, sid: &str) -> Vec<String> {
     let name = format!("{sid}.journal.jsonl");
     let mut files = Vec::new();
@@ -238,17 +138,6 @@ fn journal_lines(run: &Run, sid: &str) -> Vec<String> {
 }
 
 /// The relaunch's carry-on step a journal line says, past the words a later
-/// carry-on line follows (`HOST seq=… carry-on step=<word>`): `continued`,
-/// `done:said-done`, `done:landing`, `failed:<why>`, …. Skipped: a wait, and
-/// what the relaunch's own settle is asked again after
-/// ([`settles_again`](aterm_agent::harness::relaunch::settles_again):
-/// another sweep's lock, `busy:another-sweep` — the real step came 20 s
-/// later in the live lab of 2026-10-17). Not its `done:<word>`, which keeps
-/// one look open but is the step: the look can only end it `done:lost`.
-/// Every other word is the step, fail-closed: a relaunch that failed or was
-/// refused stops, and no carry-on line comes after it (`relaunch::owed`), and
-/// a word nobody taught the lab is read, never waited past (reviews OW-L1
-/// and LAB-1).
 fn carry_on_step(line: &str) -> Option<&str> {
     let word = line
         .strip_prefix("HOST ")?
@@ -262,21 +151,11 @@ fn carry_on_step(line: &str) -> Option<&str> {
 }
 
 /// The first carry-on step the journal `lines` say ([`carry_on_step`]), or
-/// `None` while every carry-on line is one the host looks at again: not
-/// settled.
 fn carry_on_settled(lines: &[String]) -> Option<&str> {
     lines.iter().find_map(|l| carry_on_step(l))
 }
 
 /// The restored tab's carry-on (its journal `lines`), judged against `want`,
-/// the step its Land asks for (`done:landing` mid-work, `done:said-done`
-/// once landed): the carry-on SETTLED on `want` ([`carry_on_settled`]: a
-/// `want` written after another settled word rescues nothing), no word of it
-/// typed Cruise's carry-on (`continued`) or, mid-work, read the work done;
-/// and the restored tab is under Land (`autopilot`, its `status`'s word) —
-/// which the run made sure no config default gives it
-/// ([`land_proves_the_journal`]), so it came back from the layout (review
-/// LAB-3). `Err` says what it came to instead.
 fn carry_on_judged(lines: &[String], want: &str, autopilot: &str) -> Result<(), String> {
     use aterm_agent::harness::relaunch::CARRIED_DONE;
     let steps: Vec<&str> = lines.iter().filter_map(|l| carry_on_step(l)).collect();
@@ -293,8 +172,6 @@ fn carry_on_judged(lines: &[String], want: &str, autopilot: &str) -> Result<(), 
 }
 
 /// `--land-open` and the Cruise controls, after the restart: tab `sid`'s
-/// journal until it says the relaunch's carry-on step ([`carry_on_settled`];
-/// at most [`LAND_WATCH`]); its `HOST` and `DONE` lines.
 fn carry_on_seen(run: &Run, sid: &str) -> Result<Vec<String>, Fail> {
     let end = now_ms() + i64::try_from(LAND_WATCH.as_millis()).unwrap_or(i64::MAX);
     loop {
@@ -307,21 +184,12 @@ fn carry_on_seen(run: &Run, sid: &str) -> Result<Vec<String>, Fail> {
 }
 
 /// The carry-on step of a relaunch under Land whose task is not done
-/// (`relaunch::carry_on_once`, F2): nothing of Cruise's typed, the point
-/// left to the land policy.
 const LAND_RESUMED: &str = "done:landing";
 
 /// The carry-on step of a relaunch under Cruise into open work: Cruise's
-/// continuation typed (`relaunch::carry_on_once`). The stub's reply is no
-/// done report, so never `continued:check`.
 const CRUISE_RESUMED: &str = "continued";
 
 /// The carry-on step a Cruise control (no `--land`, `--land-open` or
-/// `--hold`) asks for: [`CRUISE_RESUMED`]; after `--clear`,
-/// `done:taskless` — the relaunch resumes the NEW conversation, which
-/// nobody has asked anything (its record holds the `/clear` and its empty
-/// output alone), and a carry-on there would start a task nobody asked for
-/// (`relaunch::nothing_owed`).
 fn cruise_step(clear: bool) -> &'static str {
     if clear {
         "done:taskless"
@@ -330,20 +198,12 @@ fn cruise_step(clear: bool) -> &'static str {
     }
 }
 
-/// How many of the upgrade ledger's `rows` say a continuation was typed
-/// (`continued`, `continued:check`).
+/// How many of the upgrade ledger's `rows` say a continuation was typed (`continued`, `continued:check`).
 pub(crate) fn continued_typed(rows: &[String]) -> usize {
     rows.iter().filter(|r| r.starts_with("continued")).count()
 }
 
 /// A Cruise control's carry-on (the restored tab's journal `lines`), judged
-/// against `want` ([`cruise_step`]): the carry-on SETTLED on `want`
-/// ([`carry_on_settled`]), no word of it Land's (`done:landing`,
-/// `done:said-done`: a tab misreading Land), the ledger's continuation rows
-/// (`typed`, [`continued_typed`]) there exactly when `want` types one, and
-/// the restored tab under Cruise (`autopilot`, its `status`'s word) — which
-/// it was before aterm ended ([`cruise_is_the_control`]). `Err` says what it
-/// came to instead.
 fn cruise_judged(
     lines: &[String],
     want: &str,
@@ -369,10 +229,6 @@ fn cruise_judged(
 }
 
 /// Before aterm ends on a Cruise control: the tab's `autopilot` (its
-/// `status`'s word) must be Cruise. Under Land or Off — a config default
-/// (`LAB_HARNESS_KEYS`) — the control would prove nothing of Cruise's
-/// carry-on: COULD NOT RUN.
-///
 /// # Errors
 /// The tab is not under Cruise.
 fn cruise_is_the_control(autopilot: &str) -> Result<(), Fail> {
@@ -392,7 +248,6 @@ fn leaf_under_land(leaf: &aterm_toml::Table) -> bool {
 }
 
 /// A crash journal's terminal leaf the owner holds as `--hold` does
-/// (`holds` names `local review`).
 fn leaf_held(leaf: &aterm_toml::Table) -> bool {
     leaf.get("holds")
         .and_then(aterm_toml::Value::as_array)
@@ -400,8 +255,6 @@ fn leaf_held(leaf: &aterm_toml::Table) -> bool {
 }
 
 /// Whether the crash journal TOML `text` carries, on session `sid`'s
-/// terminal leaf (the table whose `sid = "<sid>"`), what `on_leaf` looks for.
-/// Another tab's leaf, or text that is no TOML, carries nothing.
 fn leaf_carries(text: &str, sid: &str, on_leaf: fn(&aterm_toml::Table) -> bool) -> bool {
     use aterm_toml::Value;
     fn walk(value: &Value, sid: &str, on_leaf: fn(&aterm_toml::Table) -> bool) -> bool {
@@ -418,7 +271,6 @@ fn leaf_carries(text: &str, sid: &str, on_leaf: fn(&aterm_toml::Table) -> bool) 
 }
 
 /// The status word `key=` of the door's tab as its `status` prints it (`?`
-/// where it does not).
 fn status_word(door: &Door<'_>, key: &str) -> String {
     door.out(&["status"])
         .split_whitespace()
@@ -428,11 +280,6 @@ fn status_word(door: &Door<'_>, key: &str) -> String {
 }
 
 /// Before the run puts the tab under Land: its `autopilot` (its `status`'s
-/// word) must not be Land already. A config default of Land
-/// (`LAB_HARNESS_KEYS`) reopens every tab under Land whatever the layout
-/// held, so the restored tab's Land would prove nothing of the crash
-/// journal (review LAB-3): COULD NOT RUN.
-///
 /// # Errors
 /// The tab is under Land already.
 fn land_proves_the_journal(autopilot: &str) -> Result<(), Fail> {
@@ -447,7 +294,6 @@ fn land_proves_the_journal(autopilot: &str) -> Result<(), Fail> {
 
 /// `F s` between two millisecond stamps.
 pub(crate) fn since(a: i64, b: i64) -> String {
-    // milliseconds as seconds with one decimal, for the report
     #[allow(clippy::cast_precision_loss)]
     let s = (b - a) as f64 / 1000.0;
     format!("{s:.1} s")
@@ -464,7 +310,6 @@ pub fn agents_of(sessions: &Path, pids: &[i32]) -> Vec<(i64, String)> {
         .into_iter()
         .filter(|p| p.extension().is_some_and(|e| e == "json"))
         .filter_map(|p| {
-            // each record through no link: the jail writes the Claude home
             let j = J::parse_bytes(&crate::sys::scratch_read(&p).ok()??).ok()?;
             let pid = j.get("pid").and_then(J::as_i64)?;
             let sid = j.get("sessionId").and_then(J::as_str)?.to_string();
@@ -498,8 +343,7 @@ fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// The quit layout or crash journal under the lab's state that names
-/// conversation `conv` (each read through no link: the jail writes the state).
+/// The quit layout or crash journal under the lab's state that names conversation `conv` (each read through no link: the jail writes the state).
 pub(crate) fn desk_naming(run: &Run, conv: &str) -> Option<PathBuf> {
     let mut files = Vec::new();
     walk(&run.state(), &mut files);
@@ -552,8 +396,6 @@ pub(crate) enum Verdict {
 }
 
 /// `%XX` read back as the byte it stands for, as the control socket encodes a
-/// free field (every byte that is not ASCII-graphic, and `%` itself); a `%` not
-/// followed by two hex digits stays.
 fn pct_decode(s: &str) -> String {
     let b = s.as_bytes();
     let hex = |c: u8| {
@@ -581,7 +423,6 @@ fn pct_decode(s: &str) -> String {
 }
 
 /// The `title=` and the `detail=` lines of the newest `messages` row keyed
-/// `key`, decoded.
 fn message_keyed(messages: &str, key: &str) -> Option<(String, Vec<String>)> {
     let row = messages
         .lines()
@@ -601,7 +442,6 @@ fn message_keyed(messages: &str, key: &str) -> Option<(String, Vec<String>)> {
 }
 
 /// The `aterm ctl` words of the lift a held tab's record names: the
-/// command from `aterm ctl ` up to its `off`, as a person would type it.
 fn lift_named(lines: &[String]) -> Option<Vec<String>> {
     lines.iter().find_map(|line| {
         let (_, from) = line.split_once("aterm ctl ")?;
@@ -628,8 +468,6 @@ fn hold_of(door: &Door<'_>, sid: &str) -> String {
 }
 
 /// `--hold`'s report on the restarted instance: the held tab stays the
-/// holder's, its record names a lift the socket takes (module docs). `after`
-/// names the Claude Code relaunched (its pid and conversation), if any.
 fn held_report(
     run: &Run,
     door: &Door<'_>,
@@ -703,8 +541,7 @@ fn could_not(m: &str) -> Fail {
     Fail::exit(3, format!("restore: COULD NOT RUN: {m}"))
 }
 
-/// The aterm under test, once its instance has taken the headless-restore
-/// seam (its `aterm.out` says so).
+/// The aterm under test, once its instance has taken the headless-restore seam (its `aterm.out` says so).
 ///
 /// # Errors
 /// The lab records no aterm, or the instance runs without the seam.
@@ -722,8 +559,7 @@ pub(crate) fn seam_checked(run: &Run) -> Result<String, Fail> {
     }
 }
 
-/// `--hold`: the owner holds the lab's tab (`hold <sid> on reason=review`),
-/// then the crash journal carries the hold ([`journal_carries`]).
+/// `--hold`: the owner holds the lab's tab (`hold <sid> on reason=review`), then the crash journal carries the hold ([`journal_carries`]).
 ///
 /// # Errors
 /// The journal never carried the hold (FAIL), or interrupted.
@@ -740,16 +576,6 @@ pub(crate) fn hold_tab(run: &Run, door: &Door<'_>) -> Result<(), Fail> {
 }
 
 /// The owner's word on tab `sid`, just said at `t0` (a hold, a Land),
-/// reaches the layout the next launch reads before aterm ends: the live
-/// instance's own crash journal ([`own_journal_carries`]) carries it on the
-/// tab's leaf (`on_leaf`; 30 s, said either way). aterm journals such a word
-/// on the loop turn that moved it (`crash_journal::Lane::note_owner_words`);
-/// a run that ended aterm without waiting measured the write throttle, not
-/// the restore (the live lab of 2026-10-17). One whose journal never carries
-/// it has FAILED before any restore, and says so — aterm is not ended, and no
-/// restore is judged, so the fault is never pinned on the restore (reviews
-/// OW-L2 and LAB-2).
-///
 /// # Errors
 /// The journal never carried the word (FAIL, exit 1), or interrupted.
 fn journal_carries(
@@ -809,9 +635,6 @@ fn journal_carries_within(
 }
 
 /// The live instance's own crash journal (`journal-<its pid>-<nanos>.toml`
-/// under the lab's state, read through no link) that carries `on_leaf` on
-/// session `sid`'s leaf ([`leaf_carries`]). Never a quit's `session.toml`,
-/// another instance's journal, or another tab's leaf.
 fn own_journal_carries(
     run: &Run,
     sid: &str,
@@ -831,10 +654,7 @@ fn own_journal_carries(
     })
 }
 
-/// aterm ends — `quit` sends `invoke Quit`, `crash` SIGKILLs the instance —
-/// and its tree with it (one still alive after 15 s is said and ended: it
-/// would hold the conversation); the line of it names what on disk names the
-/// conversation `conv`. When it ended.
+/// aterm ends — `quit` sends `invoke Quit`, `crash` SIGKILLs the instance.
 ///
 /// # Errors
 /// The instance did not end within 30 s, or interrupted.
@@ -857,7 +677,6 @@ pub(crate) fn end_aterm(run: &Run, door: &Door<'_>, how: &str, conv: &str) -> Re
         ));
     }
     let t_gone = now_ms();
-    // its shell and the agent hang up with the PTYs; one that does not would hold the conversation, so it is said and ended
     let mut left: Vec<i32> = Vec::new();
     for _ in 0..60 {
         left = old_tree.iter().copied().filter(|&p| alive(p)).collect();
@@ -897,14 +716,10 @@ pub(crate) fn end_aterm(run: &Run, door: &Door<'_>, how: &str, conv: &str) -> Re
     Ok(t_end)
 }
 
-/// The next launch on the same state and socket, `t_end` the end's stamp. The
-/// jail denies unlinking the socket and its token, so no jailed instance can
-/// clear what the last one left: the lab removes both, from outside. When the
-/// launch began and when its socket came up.
+/// The next launch on the same state and socket, `t_end` the end's stamp.
 ///
 /// # Errors
-/// Not a lab socket directory, a link at the socket or its token, or the
-/// instance did not come up.
+/// Not a lab socket directory, a link at the socket or its token, or the instance did not come up.
 pub(crate) fn relaunch_instance(
     run: &mut Run,
     how: &str,
@@ -969,7 +784,6 @@ fn run_restore(
         run.claude_ver
     );
 
-    // ---- Claude Code in the first tab, one turn, and the conversation it registered
     crate::lab::launch_claude(
         &run,
         &Launch {
@@ -1009,7 +823,6 @@ fn run_restore(
         ));
     };
     let t0 = now_ms();
-    // the desk names the agent: the crash journal's image (a quit's layout names the agents the same way, at the quit)
     let mut named = None;
     for _ in 0..120 {
         named = desk_naming(&run, &conv);
@@ -1027,8 +840,6 @@ fn run_restore(
         }
     );
 
-    // ---- `/clear` in the app (LC-1 of ): Claude Code's record
-    // names a new conversation within a second, and the desk must name it too
     let conv = if clear {
         let t_c = now_ms();
         if !crate::verbs::turn(&door, "/clear")? {
@@ -1075,18 +886,14 @@ fn run_restore(
         conv
     };
 
-    // ---- the owner holds the tab, and the crash journal carries the hold
     if hold {
         hold_tab(&run, &door)?;
     }
 
-    // ---- `--land`: the tab LANDED before aterm ends
     let old_sid = crate::verbs::sid(&door);
     let landed_before = match land {
         Some(Land::Landed) => land_first(&run, &door, &old_sid)?,
         Some(Land::Open) => {
-            // mid-work: the stub's ordinary reply on screen, and aterm ends
-            // before Land's back-off could type anything
             land_proves_the_journal(&status_word(&door, "autopilot"))?;
             let said = door
                 .ctl(&[&format!("@{old_sid}"), "meta", "set", "autopilot", "land"])
@@ -1101,7 +908,6 @@ fn run_restore(
             journal_carries(&run, &old_sid, "the Land word", leaf_under_land, now_ms())?;
             Vec::new()
         }
-        // a Cruise control: its tab under Cruise, or it controls nothing
         None if !hold => {
             cruise_is_the_control(&status_word(&door, "autopilot"))?;
             Vec::new()
@@ -1109,14 +915,11 @@ fn run_restore(
         None => Vec::new(),
     };
 
-    // ---- aterm ends, and comes back on the same state and socket
     let t_end = end_aterm(&run, &door, how, &conv)?;
     let (t_launch, t_up) = relaunch_instance(&mut run, how, armed, t_end)?;
 
-    // ---- the restored tab: the harness types the relaunch and Claude Code comes back, to its conversation or not
     let door = Door::new(&run)?;
     let (mut after, mut t_agent) = (None, 0);
-    // a held tab's agent must not come back: 30 s is past every relaunch measured
     for _ in 0..if hold { 120 } else { 360 } {
         after = the_agent(&run);
         if after.is_some() {
@@ -1237,10 +1040,6 @@ fn run_restore(
             }
         }
     } else if resumed && !onboarding {
-        // A Cruise control: the relaunch's carry-on settles a few seconds
-        // after the agent is back (its first idle point), and is judged as
-        // the Land runs judge theirs — a tab that misread Land or Off
-        // would otherwise pass on its resume alone.
         let sid = crate::verbs::sid(&door);
         let journal = carry_on_seen(&run, &sid)?;
         let rows = ledger_since(&run, t_launch);
@@ -1294,7 +1093,6 @@ struct Asked {
 }
 
 /// `restore`'s words read; `Ok(None)` for `-h`/`--help`.
-///
 /// # Errors
 /// An unknown option, no `quit`/`crash`, or options that do not go together.
 fn parse_args(args: &[String]) -> Result<Option<Asked>, Fail> {
@@ -1329,10 +1127,6 @@ fn parse_args(args: &[String]) -> Result<Option<Asked>, Fail> {
             "--land and --land-open take no --hold: a held tab's agent is not relaunched",
         ));
     }
-    // A cleared conversation is taskless: its relaunch settles on
-    // `done:taskless` whatever the tab's Autopilot (`relaunch::nothing_owed`
-    // is asked before Land), so a Land run on it judges a landing nothing
-    // can reach.
     if a.clear && a.land.is_some() {
         return Err(usage(
             "--clear takes no --land or --land-open: a cleared conversation is taskless, so its \
@@ -1369,11 +1163,9 @@ pub fn cmd_restore(args: &[String]) -> Res {
         )));
     }
     stop::install();
-    // the seam, and the folder trust seeded: the restored agent must come back to its conversation, not to a dialog
     let mut u = UpOpts::from_env();
     u.restore = true;
     u.trust = true;
-    // a lab of its own ends with this run, unless it is kept
     u.lifeline = !keep;
     if let Err(f) = crate::lab::up(&tag, &u) {
         if let Some(m) = &f.msg {
@@ -1403,7 +1195,6 @@ mod tests {
 
     #[test]
     fn the_agent_is_the_sessions_record_whose_pid_is_in_the_tree() {
-        // a physical path, as the lab's state dir is: a record is read through no link on its whole path
         let dir = fs::canonicalize(std::env::temp_dir())
             .unwrap()
             .join(format!("lab-sessions-{}", std::process::id()));
@@ -1416,7 +1207,6 @@ mod tests {
             vec![(200, "conv-b".to_string())]
         );
         assert!(agents_of(&dir, &[1]).is_empty());
-        // through a link anywhere on the path, nothing is read
         let link = dir.with_extension("link");
         let _ = fs::remove_file(&link);
         std::os::unix::fs::symlink(&dir, &link).unwrap();
@@ -1427,7 +1217,6 @@ mod tests {
     }
 
     /// `--land` and `--land-open` read the relaunch's carry-on step off the
-    /// restored tab's journal lines: the word past its waits, of a HOST line.
     #[test]
     fn the_carry_on_step_is_read_off_a_host_line() {
         assert_eq!(
@@ -1442,20 +1231,12 @@ mod tests {
             carry_on_step("HOST seq=5 carry-on step=done:landing"),
             Some(LAND_RESUMED)
         );
-        // its waits, another host step and a policy line say no step
         assert_eq!(carry_on_step("HOST seq=3 carry-on step=wait:held"), None);
         assert_eq!(carry_on_step("HOST seq=3 upgrade step=announced:1"), None);
         assert_eq!(carry_on_step("DONE seq=4 carry-on step=continued"), None);
     }
 
     /// THE CARRY-ON SETTLES ON ITS LAST WORD, NOT ITS FIRST (the live lab of
-    /// 2026-10-17, `restore crash --land-open`): the restored tab's first
-    /// carry-on line said `busy:another-sweep` — another sweep held the
-    /// lock, and the host settled again (`relaunch::settles_again`) — and the
-    /// real step, `done:landing`, came 20 s later; the run read the first
-    /// line and failed. A lone word the host looks again after is not
-    /// settled, whichever it is. NEGATIVE CONTROL: a state directory that
-    /// cannot hold the lock (`busy:state-unwritable`) is a last word, read.
     #[test]
     fn the_carry_on_settles_past_another_sweeps_lock() {
         let lines = |words: &[&str]| -> Vec<String> {
@@ -1489,13 +1270,6 @@ mod tests {
     }
 
     /// A CARRY-ON SETTLES ON EVERY WORD NO LATER CARRY-ON LINE FOLLOWS
-    /// (reviews OW-L1 and LAB-1 of the owner-word fix): only a wait and
-    /// another sweep's lock are settled again later (`relaunch::settles_again`).
-    /// A relaunch that failed or was refused stops (`st.stop`: `relaunch::owed`
-    /// goes false, and the host journals no other carry-on line), and a word
-    /// the host was never taught is no wait. Each is the step: the run
-    /// settles on it and fails naming it — never skipped past to a
-    /// `done:landing` written after it, which would pass.
     #[test]
     fn a_failed_refused_or_untaught_carry_on_is_the_step() {
         let lines = |words: &[&str]| -> Vec<String> {
@@ -1523,13 +1297,6 @@ mod tests {
     }
 
     /// THE VERDICT IS THE SETTLED WORD, ON A TAB THE LAYOUT PUT UNDER LAND
-    /// (reviews LAB-1 and LAB-3): `--land-open` passes only where the
-    /// carry-on settled on `done:landing` and the restored tab reads
-    /// `autopilot=land`; `--land` only on `done:said-done`. NEGATIVE
-    /// CONTROLS: a `done:landing` after a failed relaunch or an untaught word
-    /// rescues nothing, nor a later `continued` or done read; a restored tab
-    /// that is not under Land fails however its carry-on settled; and a tab
-    /// under Land before the run sets it (a config default) cannot run.
     #[test]
     fn the_land_verdicts_read_the_settled_word_on_a_tab_under_land() {
         use aterm_agent::harness::relaunch::CARRIED_DONE;
@@ -1574,16 +1341,6 @@ mod tests {
     }
 
     /// THE CRUISE CONTROLS JUDGE THEIR CARRY-ON TOO (the live lab of
-    /// 2026-10-17): a plain `restore crash` or `quit` passes only where the
-    /// restored tab's carry-on SETTLED on `continued` — Cruise's carry-on
-    /// typed into open work, the ledger's `continued` row with it — on a tab
-    /// under Cruise; `--clear` only on `done:taskless` (nobody asked the new
-    /// conversation anything), nothing typed. NEGATIVE CONTROLS: a lone
-    /// `done:landing` (a tab misreading Land) or `done:said-done` fails, so
-    /// do a Land word anywhere among the steps, a `continued` after a failed
-    /// relaunch, a carry-on that never settled, a journal's `continued` the
-    /// ledger never typed, and a restored tab not under Cruise; a tab not
-    /// under Cruise before the run ends aterm cannot run.
     #[test]
     fn the_cruise_controls_read_a_settled_continued() {
         use aterm_agent::harness::relaunch::CARRIED_DONE;
@@ -1650,12 +1407,6 @@ mod tests {
     }
 
     /// THE OWNER'S WORD IS LOOKED FOR WHERE THE NEXT LAUNCH READS IT, AND ITS
-    /// ABSENCE FAILS THE RUN BEFORE ANY RESTORE (reviews OW-L2 and LAB-2):
-    /// the live instance's own crash journal, on the tab's own leaf. A
-    /// journal there carrying Land or the hold on the tab's leaf is found;
-    /// NEGATIVE CONTROLS: the word on another tab's leaf, in a quit's
-    /// `session.toml`, or in another instance's journal is not, and the wait
-    /// then ends in a FAIL (exit 1) that names the journal.
     #[test]
     fn the_owners_word_is_found_on_the_tabs_leaf_of_the_live_journal_or_fails() {
         let scratch = aterm_tempfile::Builder::new()
@@ -1693,7 +1444,6 @@ mod tests {
             );
         };
 
-        // NEGATIVE CONTROLS: nowhere the next launch reads it for this tab.
         fs::write(state.join("session.toml"), journal("s-tab", land)).unwrap();
         fs::write(state.join("journal-99-1.toml"), journal("s-tab", land)).unwrap();
         fs::write(state.join("journal-4242-1.toml"), journal("s-other", land)).unwrap();
@@ -1701,7 +1451,6 @@ mod tests {
         assert!(!leaf_carries(&journal("s-tab", land), "s-tab", leaf_held));
         assert!(!leaf_carries("no toml [", "s-tab", leaf_under_land));
 
-        // On the tab's leaf of the live instance's journal: found.
         fs::write(
             state.join("journal-4242-1.toml"),
             journal("s-tab", &format!("{land}\n{held}")),
@@ -1713,9 +1462,6 @@ mod tests {
     }
 
     /// The words every restore takes: Claude Code's `--clear` and `--land`,
-    /// and the rules each keeps (`--hold` takes `crash`). NEGATIVE CONTROLS:
-    /// the retired `--codex` (a vendor Codex is restored by no lane) is an
-    /// unknown option, and so is no `quit` or `crash`.
     #[test]
     fn a_restore_takes_claude_codes_own_drives_and_refuses_the_retired_codex() {
         let words = |s: &str| s.split_whitespace().map(str::to_string).collect::<Vec<_>>();
@@ -1739,11 +1485,6 @@ mod tests {
     }
 
     /// `--clear` takes neither Land run (the review's RV2-LAB-1): a cleared
-    /// conversation is taskless, so its relaunch settles on `done:taskless`
-    /// whatever the tab's Autopilot, and `--land` or `--land-open` would judge
-    /// a landing nothing can reach. Refused as usage, in either order.
-    /// NEGATIVE CONTROLS: `--clear` alone, each Land run alone, and `--clear`
-    /// with `--hold` are taken.
     #[test]
     fn a_cleared_conversation_takes_no_land_run() {
         let words = |s: &str| s.split_whitespace().map(str::to_string).collect::<Vec<_>>();
@@ -1776,7 +1517,6 @@ mod tests {
     }
 
     /// `--hold` reads the lift off the record as the socket prints it: the
-    /// newest row of the key, its detail decoded, the command up to its `off`.
     #[test]
     fn the_lift_is_read_off_the_held_tabs_record() {
         let messages = "message 3 at=1 ago_ms=1 tag=harness sev=info origin=host state=recorded \
@@ -1813,8 +1553,6 @@ mod tests {
     }
 
     /// `--land`'s stub answer LANDS the work under Land's own reading: a
-    /// clean defense. NEGATIVE CONTROL: the retired token reply it once gave
-    /// lands nothing.
     #[test]
     fn the_land_drills_stub_answer_is_a_clean_defense() {
         use aterm_agent::supervise::policy::turn_end::clean_defense;

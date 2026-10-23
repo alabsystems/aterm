@@ -1,104 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `trail-gallery`: photographs of cursor trail styles, one fresh private
-//! headless aterm per style, theme and scenario, through [`crate::instance`]'s
-//! machinery (a scratch HOME and XDG dirs, the automatic lanes off, a private
-//! control socket, a lifeline; ended by its process group, never by name).
-//! [`crate::trail_contrast`] turns a frame into WCAG numbers. Every check of a
-//! trail's legibility, caret or demo is measured with these two, so results
-//! compare across changes. They replace `tools/visual-judge/trail-gallery.sh`
-//! and `trail-contrast.py`, frame for frame and file for file.
-//!
-//! ```sh
-//! targo --unverified build --release -p aterm
-//! L='targo --unverified lab'
-//! $L trail-gallery --aterm target/release/aterm "$TMPDIR/g" phaser          # dark and light, typing
-//! $L trail-gallery --theme dark --scenario all "$TMPDIR/g"                    # every style the picker offers
-//! $L trail-gallery --scenario typing,idle10 --extra 'cursor_momentum_glow = false' "$TMPDIR/g-nomom" fire
-//! $L trail-contrast "$TMPDIR/g/off-dark.t470.png" --find fox --min 7         # the 'fox' glyphs, failing under 7:1
-//! ```
-//!
-//! The output goes to the directory the caller names, which must be outside
-//! the repository: one inside this checkout or any of its worktrees is
-//! refused, compared by device and inode, however it is spelled.
-//!
-//! # Headless ticks
-//!
-//! A headless instance advances the effects engine only when it renders a
-//! frame. So every key is followed by a frame, and the fade and idle phases
-//! keep rendering (`image --bytes` on one held connection, thrown away) so that
-//! time passes for the effects: a run that typed and then slept before one
-//! capture would photograph a frozen trail, not a faded one. Keys and ticks
-//! ride that held connection ([`aterm_agent::RelayClient`]); the kept frames
-//! and every sidecar are `aterm ctl` replies, as the shell gallery wrote them.
-//!
-//! # Scenarios
-//!
-//! | Scenario | What happens | Frames |
-//! |----------|--------------|--------|
-//! | `typing` (default) | `echo the quick brown fox` typed on a blank screen, a key per 60 ms (~17 keys/s) when frames keep up; then Enter, then Ctrl-L | `mid` `t0` `t120` `t470` `jump` `rest` |
-//! | `context` | the same burst on a prompt with a coloured segment, between a powerline-style row above and a selection-coloured row below, with plain text rows around them | `mid` `t0` `t120` `t470` |
-//! | `steam` | the burst under two text rows, then 12 Backspaces about 50 ms apart | `t0` `bs03` `bs06` `bs09` `bs12` `t120` `t470` |
-//! | `enter-bottom` | the burst on the last row of a full screen, then Enter (the screen scrolls) | `typed` `enter` `e120` `e470` |
-//! | `idle10` | the burst, then 10 s with no input | `mid` `t0` `idle1` `idle2` `idle5` `idle10` |
-//! | `redraw-stall` | a native Rust echo fixture types the burst, clears a suffix inside DEC-2026 for 500 ms, then restores exactly the same text without another key | `typed` `stalled` `restored` |
-//! | `fold-rest` | bare terminal echo, three keys coalesced across the margin, then the independent row exits | `folded` `f1100` `f1250` `f1400` `rest` |
-//! | `cjk` | `echo 你好世界` (double-width input) | `mid` `t0` `t120` `t470` |
-//! | `bidi` | `echo שלום עולם` (right-to-left input) | `mid` `t0` `t120` `t470` |
-//! | `settings` | Settings ▸ Cursor & Motion, then ▸ Cursor Kitty, each with its live preview, at 110×40 cells of 16 px | `motion-0300` … `motion-2100`, `kitty-0300` `kitty-1200`, plus each page's `controls prefs` |
-//!
-//! Frame names count milliseconds from an event: `e470` is taken at least 470
-//! ms after Enter, `idle5` 5 s after the burst. `t120` and `t470` keep the
-//! cadence of the 2026-10 cursor-trail audit's gallery (three frames 40 ms
-//! apart, then six 60 ms apart) so they compare with its frames of those
-//! names; captures and sidecars take time, so they land after their names.
-//! `<name>.frames.tsv` records when each frame was really taken, beside
-//! `@event` rows on the same clock.
-//!
-//! # Output
-//!
-//! Per instance `<name>` = `<style-slug>-<theme>[-<scenario>]` (typing has no
-//! suffix, so its names match the audit's gallery):
-//!
-//! * `<name>.<frame>.png` the frame (`image`), `<name>.<frame>.clean.png` the
-//!   same frame with every cursor effect off (`image clean`; `--no-clean`
-//!   skips it), `<name>.<frame>.cursor.txt` and `<name>.<frame>.text.txt` the
-//!   `cursor` and `text` replies;
-//! * `<name>.frames.tsv` each frame and the ms since the instance came up, plus
-//!   the `@<event>` rows (burst-start, burst-end, steam-start, steam-end,
-//!   enter, open-<page>) the labels count from;
-//! * `<name>.dims.txt` the `dims` reply (`trail-contrast`'s grid),
-//!   `<name>.status.txt` and `<name>.status-end.txt` `trail status` before and
-//!   after the scenario, `<name>.admissions.txt` `trail 40`, `<name>.gui.log`
-//!   the instance's log;
-//! * `gallery.pids`: pid, socket and name of every instance the run launched.
-//!   At the end each is checked by its pid against its own socket in its
-//!   arguments (so a recycled pid is never mistaken): one still running is
-//!   reported, killed by pid, and fails the run.
-//!
-//! The settings scenario writes `<name>.<page>.open.txt` and
-//! `<name>.<page>.controls.txt` instead of the per-frame sidecars and dims.
-//!
-//! # Which scenario each check uses
-//!
-//! | Check | Scenario and frames | Measure |
-//! |-------|---------------------|---------|
-//! | Typed glyphs stay legible under the trail | `typing` `mid` `t0`, both themes | `--newest-min`, `--find`, `--min` |
-//! | A glyph's contrast against `off` (e.g. 'fox' within 10%) | `typing` `t470`, the style and `off` | `--find fox` on both |
-//! | The caret stays visible against the page | `typing` `t0` `mid` `t470`; `idle10` | `--caret-min` |
-//! | No halo left at rest | `idle10` with `--extra 'cursor_blink = false'` | `diff_vs_clean.outside_caret_px` is 0 |
-//! | The trail leaves neighbouring rows alone | `context`, against `off` | `--row` of the rows above and below |
-//! | Backspace steam keeps the row above readable | `steam`, every frame from `bs03` to `t470` | `--row` of the row above |
-//! | Enter on a full screen (no streak across the prompt row) | `enter-bottom` `enter` `e120` | `diff_vs_clean`, by eye |
-//! | Long moves (jump effects) | `typing` `jump` | by eye |
-//! | Wide and right-to-left input | `cjk`, `bidi` | `--find`, `trail 40` admissions |
-//! | The Settings demo matches the terminal | `settings` | by eye, `controls prefs` |
-//! | A setting's effect (A/B) | any, with and without `--extra` | the same measure on both runs |
-//!
-//! Exit: 0 every instance took every frame and ended; 1 a frame or an
-//! instance failed, or one outlived the run; 2 usage (an output dir inside the
-//! repository among them); 3 not run (no aterm to drive, no roster).
+//! `trail-gallery`: photographs of cursor trail styles, one fresh private headless aterm per style, theme and scenario, through [`crate::instance`]'s machinery (a scratch HOME and XDG dirs, the automatic lanes off, a private control socket, a lifeline; ended by its process group, never by name).
 
 use std::fs::File;
 use std::io::Write as _;
@@ -168,9 +71,6 @@ impl Theme {
     }
 
     /// The theme's own selection colour as an SGR truecolour triple
-    /// (aterm-types scheme.rs: the renderer default #33415e, GitHub Light
-    /// #b6e3ff): `context` PAINTS its selected row, since a keypress clears a
-    /// real selection.
     fn selection(self) -> &'static str {
         match self {
             Theme::Dark => "51;65;94",
@@ -317,7 +217,6 @@ fn check_style(style: &str) -> Result<(), Fail> {
 }
 
 /// Read `trail-gallery`'s arguments.
-///
 /// # Errors
 /// A usage error (exit 2).
 pub fn parse_args(args: &[String]) -> Result<Args, Fail> {
@@ -395,8 +294,7 @@ pub fn parse_args(args: &[String]) -> Result<Args, Fail> {
     })
 }
 
-/// The top-level `aterm.toml` lines of one instance: the base lines, less any
-/// key an `--extra` line sets, then the extras.
+/// The top-level `aterm.toml` lines of one instance: the base lines, less any key an `--extra` line sets, then the extras.
 #[must_use]
 pub fn config_lines(style: &str, theme: Theme, extras: &[String]) -> Vec<String> {
     let mut lines = vec![
@@ -412,8 +310,7 @@ pub fn config_lines(style: &str, theme: Theme, extras: &[String]) -> Vec<String>
     lines
 }
 
-/// A style's file-name form: lower case, a space or `:` a `-`, nothing else
-/// but `[a-z0-9-]`.
+/// A style's file-name form: lower case, a space or `:` a `-`, nothing else but `[a-z0-9-]`.
 #[must_use]
 pub fn slug(style: &str) -> String {
     style
@@ -466,8 +363,7 @@ printf 'Below: pqgyj Wide test {braces} [ok]\r\n'
 printf '\033[5H'
 ";
 
-/// The PTY's script: a locale for wide input, a known prompt, then the
-/// scenario's paint, then an interactive shell.
+/// The PTY's script: a locale for wide input, a known prompt, then the scenario's paint, then an interactive shell.
 #[must_use]
 pub fn paint(scenario: Scenario, theme: Theme) -> String {
     let body = match scenario {
@@ -492,8 +388,7 @@ fn keys_of(word: &str) -> Vec<String> {
         .collect()
 }
 
-/// The gallery's private PTY child: a stalled synchronized redraw, or bare
-/// echo for the fold probe. It touches only its inherited terminal.
+/// The gallery's private PTY child: a stalled synchronized redraw, or bare echo for the fold probe.
 pub fn cmd_redraw_fixture(args: &[String]) -> Res {
     use std::io::Read as _;
 
@@ -577,9 +472,7 @@ fn joined(base: &Path, p: &str) -> PathBuf {
     }
 }
 
-/// Every checkout of the repository `repo` belongs to: `repo`, the main
-/// worktree and each linked worktree git records (`worktrees/*/gitdir`), read
-/// from git's own files.
+/// Every checkout of the repository `repo` belongs to: `repo`, the main worktree and each linked worktree git records (`worktrees/*/gitdir`), read from git's own files.
 #[must_use]
 pub fn checkouts(repo: &Path) -> Vec<PathBuf> {
     let mut out = vec![repo.to_path_buf()];
@@ -587,8 +480,6 @@ pub fn checkouts(repo: &Path) -> Vec<PathBuf> {
     let common = if dotgit.is_dir() {
         Some(dotgit)
     } else {
-        // A linked worktree: `.git` says `gitdir: <common>/worktrees/<name>`,
-        // whose `commondir` names the common dir.
         std::fs::read_to_string(&dotgit)
             .ok()
             .and_then(|t| {
@@ -620,16 +511,9 @@ pub fn checkouts(repo: &Path) -> Vec<PathBuf> {
     out
 }
 
-/// `given` (absolute) made physical: its deepest existing directory resolved
-/// through every link, then the part still to be made, which may not climb
-/// (a `..` there would resolve only once it is made). Refused when that
-/// directory is one of `checkouts` or lies inside one, compared by device and
-/// inode, so a link or another spelling on a case-insensitive volume does not
-/// slip past.
-///
+/// `given` (absolute) made physical: its deepest existing directory resolved through every link, then the part still to be made, which may not climb (a `..` there would resolve only once it is made).
 /// # Errors
-/// The path climbs out of a directory that does not exist yet, or it is
-/// inside a checkout.
+/// The path climbs out of a directory that does not exist yet, or it is inside a checkout.
 pub fn resolve_out(given: &str, checkouts: &[PathBuf]) -> Result<PathBuf, String> {
     let mut head = PathBuf::from(given);
     let mut rest: Vec<std::ffi::OsString> = Vec::new();
@@ -675,8 +559,7 @@ pub fn resolve_out(given: &str, checkouts: &[PathBuf]) -> Result<PathBuf, String
     Ok(out)
 }
 
-/// The styles of the Settings picker: the `options=[…]` list of the
-/// `cursor_trail_style` field of a `controls prefs` reply.
+/// The styles of the Settings picker: the `options=[…]` list of the `cursor_trail_style` field of a `controls prefs` reply.
 #[must_use]
 pub fn roster_of(prefs: &str) -> Option<Vec<String>> {
     let line = prefs
@@ -692,7 +575,6 @@ pub fn roster_of(prefs: &str) -> Option<Vec<String>> {
 }
 
 /// A running instance and its scratch world: dropped, the instance is stopped
-/// (its process group) before the world is removed (fields drop in order).
 struct Live {
     inst: Instance,
     _world: World,
@@ -789,7 +671,6 @@ impl Shot<'_> {
     }
 
     /// `ctl image …` (`OK <w> <h> <path>`, a file under the instance's
-    /// socket dir), copied to `dest` at once.
     fn grab(&mut self, request: &[&str], dest: &Path) -> bool {
         let r = self.inst.ctl(request);
         let line = r.stdout.lines().next().unwrap_or("");
@@ -857,7 +738,6 @@ impl Shot<'_> {
     }
 
     /// A typed burst, a key per 60 ms (~17 keys/s) unless a frame is slower,
-    /// each followed by a frame: key `mid` is kept as `mid`.
     fn burst(&mut self, mid: Option<u64>, keys: &[String]) -> Result<(), Stopped> {
         self.mark("burst-start");
         let start = self.mark;
@@ -926,7 +806,6 @@ impl Shot<'_> {
                 self.tick();
                 sleep(200)?;
                 self.tick();
-                // A jump: Ctrl-L clears and homes the cursor, the long-move path.
                 self.press("ctrl+l");
                 sleep(50)?;
                 self.snap("jump");
@@ -1057,7 +936,6 @@ struct Gallery {
 
 impl Gallery {
     /// A fresh world whose `aterm.toml` is `lines` over the lanes-off base,
-    /// the scenario's paint, and the instance started in it (not yet ready).
     fn launch(
         &mut self,
         name: &str,
@@ -1070,8 +948,6 @@ impl Gallery {
         let script = world.dir.join("paint.sh");
         std::fs::write(&script, paint(scenario, theme))
             .map_err(|e| format!("cannot write {}: {e}", script.display()))?;
-        // The world's `ENV` rc file sets its own prompt, which would replace the
-        // one a scenario paints when the interactive shell starts.
         let env = world
             .env()
             .into_iter()
@@ -1252,8 +1128,6 @@ impl Gallery {
     }
 
     /// Every launched instance must be gone: one still running (its pid
-    /// checked against its own socket in its arguments, so a recycled pid is
-    /// never mistaken) is reported and killed by pid. How many there were.
     fn survivors(&self) -> u32 {
         let mut alive = 0;
         for (pid, sock, name) in &self.launched {
@@ -1268,7 +1142,6 @@ impl Gallery {
 }
 
 /// Wait for a launched instance to answer and settle: its socket, `ready`,
-/// then half a second with no output.
 fn settle(inst: &mut Instance) -> Result<(), Fail> {
     inst.await_socket(instance::BOOT)?;
     let ready = inst.ctl(&["ready"]);
@@ -1296,7 +1169,6 @@ fn remove_named(dir: &Path, name: &str) {
 }
 
 /// `trail-gallery`.
-///
 /// # Errors
 /// Usage (2), not run (3), or interrupted (128 + the signal).
 pub fn cmd_trail_gallery(args: &[String]) -> Res {

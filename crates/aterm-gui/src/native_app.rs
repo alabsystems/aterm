@@ -2,10 +2,6 @@
 // Copyright 2026 Andrew Yates
 
 //! Closed, capability-shaped runtime for first-party native tab applications.
-//!
-//! The generic tab host owns `ViewId -> View::Native(instance)` links in
-//! [`crate::tab_model`].  This module owns app instances and the presentation state
-//! keyed by those view ids; it never owns tabs, windows, PTYs, or renderer handles.
 
 use std::collections::BTreeMap;
 use std::marker::PhantomData;
@@ -56,8 +52,7 @@ impl AppKind {
         }
     }
 
-    /// Human-facing name, spelled as the apps' own tooltips spell it (`"Markdown · {uri}"`),
-    /// so a tab's install-time tooltip never changes case on first refresh.
+    /// Human-facing name, spelled as the apps' own tooltips spell it (`"Markdown · {uri}"`), so a tab's install-time tooltip never changes case on first refresh.
     pub(crate) const fn display_name(self) -> &'static str {
         match self {
             Self::Settings => "Settings",
@@ -116,13 +111,7 @@ pub(crate) struct CommonViewState {
     pub(crate) presentation_revision: u64,
     /// Authorization identity for one review; independent of paints and focus.
     pub(crate) review_revision: u64,
-    /// THE VIEW'S CONTENT REVISION: the runtime moves it on every access
-    /// that can change the view's state or what it renders from — an event
-    /// it dispatches, a host's mutable access, a projection it publishes
-    /// ([`AppViewState::touch`]) — so a render can tell a frame that only
-    /// moved the clock (a preview's animation) from one whose content may
-    /// have changed, and reuse what it decided for the content it had
-    /// (Settings' page chrome, `native_settings::page`).
+    /// THE VIEW'S CONTENT REVISION: the runtime moves it on every access that can change the view's state or what it renders from.
     pub(crate) content_epoch: u64,
 }
 
@@ -169,8 +158,7 @@ impl AppViewState {
         }
     }
 
-    /// Move the view's content revision ([`CommonViewState::content_epoch`]):
-    /// what it renders from may have changed.
+    /// Move the view's content revision ([`CommonViewState::content_epoch`]): what it renders from may have changed.
     pub(crate) fn touch(&mut self) {
         let common = self.common_mut();
         common.content_epoch = common.content_epoch.wrapping_add(1);
@@ -187,8 +175,7 @@ impl AppViewState {
     }
 }
 
-/// Markdown presentation is per-view: history, scroll, and selection never leak
-/// into another view of the same canonical document.
+/// Markdown presentation is per-view: history, scroll, and selection never leak into another view of the same canonical document.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum MarkdownViewMode {
     #[default]
@@ -213,66 +200,43 @@ pub(crate) struct MarkdownViewState {
     pub(crate) history: crate::native_markdown::MarkdownHistory,
     pub(crate) source_anchor: usize,
     /// Exact wrapped reader row within the block containing `source_anchor`.
-    /// This is semantic view state (and restore/history state), never a pixel
-    /// offset inferred by paint.
     pub(crate) visual_row: usize,
     pub(crate) selection: Option<std::ops::Range<usize>>,
-    /// One document can be previewed, inspected as exact source, and split in
-    /// different views without leaking presentation state between them.
+    /// One document can be previewed, inspected as exact source, and split in different views without leaking presentation state between them.
     pub(crate) mode: MarkdownViewMode,
     /// Short, view-local feedback for clipboard and external-link operations.
-    /// It is deliberately not document state and never leaks across split views.
     pub(crate) notice: Option<String>,
 }
 
-/// Editor presentation is per-view. Canonical bytes/edit sequence remain in the
-/// process-wide `DocumentStore`.
+/// Editor presentation is per-view.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct EditorViewState {
     pub(crate) common: CommonViewState,
-    /// Canonical editor interaction state for this view. Document bytes remain
-    /// exclusively in `DocumentStore`; this carries only selections, viewport,
-    /// chord/minibuffer state, and the store-issued `DocumentViewId`.
+    /// Canonical editor interaction state for this view.
     pub(crate) buffer: Option<crate::native_editor::EditorBufferView>,
     pub(crate) preedit: String,
     /// Platform marked-text caret in UTF-8 bytes, after native-field validation.
-    /// Absent keeps the field convention of placing the caret at the text end.
     pub(crate) preedit_caret: Option<usize>,
     pub(crate) status: Option<String>,
     /// Persistent host-watcher warning for the canonical config/theme inputs.
-    /// Kept separate from command feedback and diagnostics so either can change
-    /// without erasing the other; a typed recovery edge alone clears it.
     pub(crate) config_watch_status: Option<String>,
-    /// Selected contextual aterm.toml completion. The visible window is
-    /// derived from this index and the exact responsive row capacity.
+    /// Selected contextual aterm.toml completion.
     pub(crate) config_completion_selected: usize,
     /// Exact assist context whose completion row owns keyboard navigation.
-    /// Merely showing suggestions must never steal Enter or the arrow keys
-    /// from ordinary editing.
     pub(crate) config_completion_interaction:
         Option<crate::native_config_language::ConfigCompletionContext>,
-    /// Escape dismisses contextual assistance only for the immutable document
-    /// sequence + caret that produced it. Any edit or caret move naturally
-    /// creates a new context and may offer assistance again.
+    /// Escape dismisses contextual assistance only for the immutable document sequence + caret that produced it.
     pub(crate) config_completion_dismissed:
         Option<crate::native_config_language::ConfigCompletionContext>,
-    /// Retained Manual diagnostics are navigable without moving the document
-    /// caret. The semantic modeline announces the complete selected message.
+    /// Retained Manual diagnostics are navigable without moving the document caret.
     pub(crate) config_diagnostic_selected: usize,
-    /// What Settings ▸ Manual's reveal did ("… added at its default"). The
-    /// footer shows it ahead of a standing config warning until the next edit
-    /// or caret move.
+    /// What Settings ▸ Manual's reveal did ("… added at its default").
     pub(crate) reveal_status: Option<String>,
-    /// The header row of an `edit` ticket's own view (`app_edit`): who asked
-    /// for the edit and how to answer it. `None` on every other view, the
-    /// person's own view of the same file included.
+    /// The header row of an `edit` ticket's own view (`app_edit`): who asked for the edit and how to answer it.
     pub(crate) edit_header: Option<EditHeader>,
 }
 
-/// The header row of an `edit` ticket's view (amacs design §6.5), e.g.
-/// `Editing for git · C-c C-c done · C-c C-k abort`: its words, then a
-/// "done" part (`editor/finish`) and, while a program waits, an "abort" part
-/// (`editor/abort`). The host keeps it in step with the ticket's waiter.
+/// The header row of an `edit` ticket's view (amacs design §6.5), e.g. `Editing for git · C-c C-c done · C-c C-k abort`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct EditHeader {
     /// The program the edit is for (the request's `for=`), when it named one.
@@ -283,14 +247,11 @@ pub(crate) struct EditHeader {
 /// Whether a program waits on an `edit` ticket's answer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum EditWaiter {
-    /// It waits, or will (its `await edit` is on its way): done and abort
-    /// answer it.
+    /// It waits, or will (its `await edit` is on its way): done and abort answer it.
     Waiting,
-    /// Its wait hung up and none came back: done still saves and closes, and
-    /// there is nobody to abort for.
+    /// Its wait hung up and none came back: done still saves and closes, and there is nobody to abort for.
     Gone,
-    /// Nothing waits on it (`edit … wait=0`, `amacs --no-wait`): done saves
-    /// and closes.
+    /// Nothing waits on it (`edit … wait=0`, `amacs --no-wait`): done saves and closes.
     Never,
 }
 
@@ -308,15 +269,12 @@ impl EditHeader {
         }
     }
 
-    /// Whether the row offers abort: only a waiting program can be told the
-    /// edit was abandoned, and with nobody to tell, abort would only throw the
-    /// person's typing away.
+    /// Whether the row offers abort.
     pub(crate) fn offers_abort(&self) -> bool {
         self.waiter == EditWaiter::Waiting
     }
 
     /// The done part's spoken label: its visible words first, as every
-    /// control's name holds what it paints.
     fn done_label(&self) -> String {
         match (self.waiter, self.for_word.as_deref()) {
             (EditWaiter::Waiting, Some(program)) => {
@@ -429,8 +387,6 @@ pub(crate) enum RecoveryCapability {
         kind: AppKind,
         uri: String,
         /// Preserve the privileged config-editor reducer on Retry. Treating
-        /// this document as an ordinary Editor would bypass schema diagnostics
-        /// and the versioned config save lane after a failed restore.
         config_editor: bool,
     },
 }
@@ -449,21 +405,16 @@ pub(crate) enum RecoveryOutcome {
 }
 
 /// Read-only, capability-free presentation for an unavailable or corrupt restored leaf.
-/// The original bounded metadata remains copyable; it is never interpreted as an action,
-/// URI, path, or shell input.
 pub(crate) struct RecoveryApp {
     pub(crate) restore_tag: String,
     pub(crate) reason: String,
     pub(crate) metadata: String,
-    /// Structured authority retained from a validated restore descriptor. The
-    /// copyable metadata above is never parsed back into a URI or action.
+    /// Structured authority retained from a validated restore descriptor.
     pub(crate) capability: Option<RecoveryCapability>,
 }
 
 pub(crate) enum NativeApp {
-    /// Boxed: the one Settings controller carries every page's projection and
-    /// dwarfs the document apps, which are the many instances (as its view
-    /// state is boxed in [`AppViewState::Settings`]).
+    /// Boxed: the one Settings controller carries every page's projection and dwarfs the document apps, which are the many instances (as its view state is boxed in [`AppViewState::Settings`]).
     Settings(Box<crate::native_settings::SettingsApp>),
     SystemState(Box<crate::system_state::SystemStateApp>),
     Markdown(MarkdownApp),
@@ -484,9 +435,7 @@ type CommandsCallback =
 type PresentationCallback = fn(&NativeApp, &AppViewState) -> Result<AppPresentation, RuntimeError>;
 type CloseCallback = for<'a> fn(&mut NativeApp, CloseRequest, &mut UpdateCx<'a>) -> CloseReadiness;
 
-/// Required behavior table for every first-party app variant. The single
-/// no-wildcard [`NativeApp::vtable`] match makes an added enum variant fail to
-/// compile until all runtime surfaces are supplied.
+/// Required behavior table for every first-party app variant.
 pub(crate) struct AppVTable {
     pub(crate) kind: AppKind,
     pub(crate) restore_tag: &'static str,
@@ -880,8 +829,6 @@ fn recovery_push_wrapped(
             });
             continue;
         }
-        // Never bisect a user-perceived character. This matters for copied
-        // crash reports containing combining marks, flags, or ZWJ emoji.
         let graphemes = physical.graphemes().collect::<Vec<_>>();
         let mut start = 0;
         while start < graphemes.len() {
@@ -1126,9 +1073,6 @@ impl NativeAppModel for RecoveryApp {
                         ),
                         ..ControlState::default()
                     })
-                    // Retry is the page's default while actionable: the Primary a bare
-                    // Return activates (`CompiledUi::default_action`). With no retained
-                    // capability nothing is Primary and Return stays inert.
                     .style(if key == "recovery/retry" && enabled {
                         StyleRef::Primary
                     } else {
@@ -1143,7 +1087,6 @@ impl NativeAppModel for RecoveryApp {
             button(
                 "recovery/retry",
                 "Retry",
-                // Named by the word it paints, then what it does.
                 if self.capability.is_some() {
                     "Retry: reopen this view".to_string()
                 } else {
@@ -1161,8 +1104,6 @@ impl NativeAppModel for RecoveryApp {
                 } else {
                     "Open Original"
                 },
-                // Named by the words it paints ("Open" where narrow), then
-                // what it does.
                 if matches!(self.capability, Some(RecoveryCapability::Document { .. })) {
                     "Open Original: the file, in the editor".to_string()
                 } else {
@@ -1416,8 +1357,6 @@ mod recovery_tests {
     use aterm_spec::interp::{State, admits};
 
     /// A recovery page whose diagnostics span at least three pages at every target size,
-    /// with one unbroken token wider than the widest column so it hard-breaks mid-token.
-    /// No larger than that: every page is re-projected per size.
     fn recovery(capability: Option<RecoveryCapability>) -> RecoveryApp {
         let mut metadata = (0..60)
             .map(|line| format!("diagnostic-{line:03}=bounded detail\n"))
@@ -1669,8 +1608,6 @@ mod recovery_tests {
                 }),
             )
             .unwrap();
-        // Retry emits exactly the typed capability the recovery page was minted
-        // with: the document's kind and URI, nothing the view could widen.
         let operation = match report.effects.as_slice() {
             [
                 AppEffect::Recovery {
@@ -1688,7 +1625,6 @@ mod recovery_tests {
         let pending = recovery_model_projection(&model, &real_view(&runtime), 1, 0, 0);
         assert_recovery_transition(&model, &before, &pending, "BeginRetry");
 
-        // A peer action cannot start while Retry owns the one capability flight.
         let duplicate = runtime
             .dispatch(
                 instance,
@@ -1705,8 +1641,6 @@ mod recovery_tests {
             pending
         );
 
-        // Even the right operation identifier arriving on the wrong completion
-        // channel is stale and cannot clear Retry's ownership.
         runtime
             .dispatch(
                 instance,
@@ -1751,8 +1685,6 @@ mod recovery_tests {
         let completed = recovery_model_projection(&model, &real_view(&runtime), 1, 3, 0);
         assert_recovery_transition(&model, &stale_id, &completed, "MatchingComplete");
 
-        // Negative control: clearing ownership on a stale completion is neither an
-        // admitted transition nor a valid state.
         let mut stale_cleared = pending.clone();
         stale_cleared.insert("pending", 0);
         stale_cleared.insert("inflight", 0);
@@ -1785,16 +1717,14 @@ mod recovery_tests {
 pub(crate) enum AppEvent {
     Action(ActionInvocation),
     FocusChanged(Option<UiKey>),
-    /// An assistive technology asks for `key`, which its list holds off
-    /// screen, to be scrolled into view; the keyboard stays where it is.
+    /// An assistive technology asks for `key`, which its list holds off screen, to be scrolled into view; the keyboard stays where it is.
     #[cfg(any(a11y_tree, test))]
     RevealControl(UiKey),
     /// Text an assistive technology inserts (only the accessibility tree does).
     #[cfg(any(a11y_tree, test))]
     InsertText(String),
     TextInput(TextInputEvent),
-    /// A key, text or paste for an Editor view, which amacs's shared input
-    /// reducer turns into commands (`EditorWorkspace::handle_input`).
+    /// A key, text or paste for an Editor view, which amacs's shared input reducer turns into commands (`EditorWorkspace::handle_input`).
     EditorInput(amacs::input::EditorInput),
     EditorCommand(crate::native_editor::EditorCommand),
     EditorCompletion(crate::native_editor::EditorCompletionAction),
@@ -1812,77 +1742,53 @@ pub(crate) enum AppEvent {
         previous: bool,
     },
     /// Accessibility-owned source-byte selection for the editable text viewport.
-    /// The document workspace validates UTF-8 boundaries before installing it.
     #[cfg(any(a11y_tree, test))]
     EditorSetSelection {
         anchor: usize,
         head: usize,
     },
-    /// Host-owned semantic viewport capacity, derived from the exact editor
-    /// rect and active text scale before an editor reducer transition.
+    /// Host-owned semantic viewport capacity, derived from the exact editor rect and active text scale before an editor reducer transition.
     EditorViewportChanged {
         visible_lines: usize,
     },
     ScrollLines(i32),
-    /// A press on the picture of control `key` a scrolling list draws in
-    /// the strip under its room ([`crate::native_ui::CompiledUi::list_picture_at`]):
-    /// a scroll, never the control's action — the list brings the control
-    /// into its room as a press on one its edge cuts does
-    /// (`SettingsViewState::reveal_pressed`).
+    /// A press on the picture of control `key` a scrolling list draws in the strip under its room ([`crate::native_ui::CompiledUi::list_picture_at`]).
     PressListPicture(UiKey),
-    /// A scroll aimed at `key`: the innermost node under the pointer for a
-    /// wheel, or the node an assistive technology scrolls. A view with a
-    /// second scrolling region (Settings' sidebar) scrolls the one `key` is
-    /// in; to every other view, and anywhere else, it is `ScrollLines`
-    /// ([`NativeRuntime::dispatch`] lowers it for them).
+    /// A scroll aimed at `key`: the innermost node under the pointer for a wheel, or the node an assistive technology scrolls.
     ScrollAt {
         lines: i32,
         key: UiKey,
     },
-    /// Up (`-1`) / Down (`1`) in Settings: focus moves to the previous or next
-    /// control in the page's list and the list follows; with no list control
-    /// focused, the list scrolls a row. Only Settings is sent this; the wheel
-    /// stays `ScrollLines`.
+    /// Up (`-1`) / Down (`1`) in Settings: focus moves to the previous or next control in the page's list and the list follows.
     StepFocus(i32),
-    /// Page Up (`-1`) / Page Down (`1`) in Settings: the reducer moves by the page its
-    /// last render showed. Only Settings is sent this; Markdown gets `MarkdownPage` and
-    /// other views `ScrollLines(±8)`.
+    /// Page Up (`-1`) / Page Down (`1`) in Settings: the reducer moves by the page its last render showed.
     ScrollPage(i32),
-    /// Markdown scrolling needs the exact semantic viewport measure so a tall
-    /// block advances by rows rather than collapsing to one block step.
+    /// Markdown scrolling needs the exact semantic viewport measure so a tall block advances by rows rather than collapsing to one block step.
     MarkdownScroll {
         lines: i32,
         viewport_width: f32,
         viewport_height: f32,
     },
-    /// One Markdown page move, with the whole native viewport. The reader
-    /// derives its body geometry exactly as it does for the rendered page
-    /// controls, including after a resize or mode change.
+    /// One Markdown page move, with the whole native viewport.
     MarkdownPage {
         direction: i32,
         viewport_width: f32,
         viewport_height: f32,
     },
-    /// Complete, atomically revisioned service snapshot. Text and the immutable
-    /// asset catalog are one payload so cross-window Settings delivery can
-    /// never observe catalog N with text/revision N+1.
+    /// Complete, atomically revisioned service snapshot.
     ConfigChanged(crate::native_config_service::ConfigSnapshot),
     UpdateChanged {
         revision: u64,
     },
-    /// The packages projection advanced (worker completion or busy flip);
-    /// every Settings view repaints from the shared controller snapshot.
+    /// The packages projection advanced (worker completion or busy flip).
     PackagesChanged {
         revision: u64,
     },
-    /// The Settings ▸ Messages projection advanced (a row posted, restated, retired or
-    /// pressed, or the 60 s tick that moves the relative times); every Settings view
-    /// repaints from the shared controller snapshot.
+    /// The Settings ▸ Messages projection advanced (a row posted, restated, retired or pressed, or the 60 s tick that moves the relative times).
     MessagesChanged {
         revision: u64,
     },
-    /// The Settings ▸ Harness projection advanced; every Settings view
-    /// repaints from the shared controller snapshot.
+    /// The Settings ▸ Harness projection advanced; every Settings view repaints from the shared controller snapshot.
     HarnessChanged {
         revision: u64,
     },
@@ -1890,9 +1796,7 @@ pub(crate) enum AppEvent {
         document: DocumentId,
         revision: u64,
     },
-    /// The host successfully focused or installed the editor for a Markdown
-    /// document. This closes the synchronous open handshake in the originating
-    /// reader instead of leaving its transient "Opening editor…" status behind.
+    /// The host successfully focused or installed the editor for a Markdown document.
     DocumentEditorOpened {
         document: DocumentId,
     },
@@ -1921,8 +1825,7 @@ pub(crate) enum AppEvent {
         operation: OperationId,
         outcome: PackagesOutcome,
     },
-    /// The host performed (or refused) a Settings ▸ Messages entry's button
-    /// (`AppEffect::MessageAct`); the page words its feedback from it.
+    /// The host performed (or refused) a Settings ▸ Messages entry's button (`AppEffect::MessageAct`).
     MessageActFinished {
         operation: OperationId,
         outcome: MessageActOutcome,
@@ -1935,11 +1838,7 @@ pub(crate) enum AppEvent {
         operation: OperationId,
         outcome: RecoveryOutcome,
     },
-    /// A seamless update's successor reopened this Settings view from the
-    /// handoff layout, and these are the unsaved field drafts its predecessor
-    /// carried ([`crate::restore::NativeLeafRestore::settings_drafts`]). The
-    /// view takes each one its build still edits as a draft — unsaved, exactly
-    /// as the person left it. Only the restore sends it.
+    /// A seamless update's successor reopened this Settings view from the handoff layout, and these are the unsaved field drafts its predecessor carried ([`crate::restore::NativeLeafRestore::settings_drafts`]).
     SettingsDraftsCarried(Vec<crate::restore::SettingsDraftRestore>),
 }
 
@@ -1948,7 +1847,6 @@ pub(crate) enum TextInputEvent {
     Preedit {
         text: String,
         /// Platform caret/selection within `text`, in UTF-8 bytes (winit's
-        /// convention). The receiving field validates and grapheme-clamps it.
         selection: Option<std::ops::Range<usize>>,
     },
     Commit(String),
@@ -1999,18 +1897,12 @@ pub(crate) enum SemanticInput {
     Text(String),
     Bool(bool),
     Number(f64),
-    /// A UTF-8 byte boundary resolved from the exact painted text-field
-    /// projection. `extend` preserves the field's current anchor (Shift-click
-    /// and pointer release); otherwise the reducer collapses to a caret first.
-    /// This is deliberately reducer input rather than host-side field mutation.
+    /// A UTF-8 byte boundary resolved from the exact painted text-field projection.
     TextPosition {
         byte: usize,
         extend: bool,
     },
-    /// A hue and saturation picked on the exact painted colour wheel
-    /// ([`crate::native_ui::CompiledUi::color_wheel_pick_at`]), each in
-    /// `0..=1`. The picker combines them with its own brightness, so a pick
-    /// on a wheel taken to black still picks a hue.
+    /// A hue and saturation picked on the exact painted colour wheel ([`crate::native_ui::CompiledUi::color_wheel_pick_at`]), each in `0..=1`.
     ColorPick {
         hue: f32,
         saturation: f32,
@@ -2037,16 +1929,9 @@ pub(crate) enum CloseScope {
     Tab,
     Window,
     AppQuit,
-    /// The process is replaced by an update whose successor reopens nothing of this
-    /// view: a cold exec, the Windows replace, a headless successor. Non-durable view
-    /// state dies with it, so an app holds it here exactly as for a window close.
+    /// The process is replaced by an update whose successor reopens nothing of this view.
     Relaunch,
-    /// The process is replaced by an update whose successor reopens this view from the
-    /// handed-over layout with its unsaved view state (`App::capture_handoff_layout`
-    /// carries a Settings view's field drafts and an editor's draft journal). An app whose
-    /// unsaved state that layout carries may answer Ready here and nowhere else. The host
-    /// asks with this scope only when its successor restores native tabs, and counts what
-    /// rides so the lanes that cannot carry it refuse (`App::native_update_close_preflight`).
+    /// Replaced by an update whose successor reopens this view with its unsaved state (`App::capture_handoff_layout`).
     CarriedRelaunch,
 }
 
@@ -2072,9 +1957,7 @@ pub(crate) enum DamageRegion {
     },
 }
 
-/// What a Settings edit expects its key to hold. Every write says, so a file
-/// changed underneath it conflicts instead of being overwritten unseen, and
-/// the status can name the value a change replaced.
+/// What a Settings edit expects its key to hold.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ExpectedConfigValue {
     Exact(Option<String>),
@@ -2089,9 +1972,7 @@ pub(crate) struct ConfigEdit {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ConfigPatch {
-    /// Revision observed by the reducer when the user made this edit. The host
-    /// must not replace it with its current revision or stale UI writes would
-    /// silently defeat optimistic concurrency control.
+    /// Revision observed by the reducer when the user made this edit.
     pub(crate) base_revision: u64,
     pub(crate) edits: Vec<ConfigEdit>,
 }
@@ -2105,9 +1986,7 @@ pub(crate) enum ConfigPatchOutcome {
     Conflict {
         revision: u64,
     },
-    /// Replacement may be visible, but the atomic writer could not prove its
-    /// final bytes/durability. Callers must reconcile before claiming success
-    /// or issuing a blind follow-up.
+    /// Replacement may be visible, but the atomic writer could not prove its final bytes/durability.
     Indeterminate {
         message: String,
     },
@@ -2123,31 +2002,19 @@ pub(crate) struct ExternalOpenRequest {
 }
 
 /// What Settings' theme picker asks the host to do with the themes folder.
-/// The view names a theme by its catalog id, never by a path: the host
-/// resolves the folder ([`aterm_types::scheme::user_theme_dir`]) itself.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ThemesRequest {
-    /// Show the themes folder (created first, so there is somewhere to drop
-    /// a file).
+    /// Show the themes folder (created first, so there is somewhere to drop a file).
     OpenFolder,
-    /// Show the file behind the catalog row `id`; the folder when no such
-    /// file is there (an unreadable name, or a file since removed).
+    /// Show the file behind the catalog row `id`; the folder when no such file is there (an unreadable name, or a file since removed).
     OpenFile { id: String },
-    /// Ask for a theme file in the platform file picker and import it as a
-    /// new theme ([`aterm_types::scheme_install::install_theme_file_as_new`]).
+    /// Ask for a theme file in the platform file picker and import it as a new theme ([`aterm_types::scheme_install::install_theme_file_as_new`]).
     Import,
-    /// Settings ▸ Themes' "Save as theme…": write `text` (a native theme
-    /// file the view serialized and read back) into the themes folder as
-    /// `<id>.conf`, never over an existing theme.
+    /// Settings ▸ Themes' "Save as theme…".
     Save { id: String, text: String },
-    /// Settings ▸ Themes' Trash on a card of the person's own: move the file
-    /// behind catalog id `id` to the Trash (recoverable). The host refuses a
-    /// built-in's name and an id that names no regular file in the folder;
-    /// the view refuses the theme in use before asking.
+    /// Settings ▸ Themes' Trash on a card of the person's own: move the file behind catalog id `id` to the Trash (recoverable).
     Trash { id: String },
-    /// Keep on a Settings ▸ Themes ▸ Community row: install the pack theme `id`
-    /// (`aterm_theme_pack::install`, never replacing) into the themes
-    /// folder. The view names the pack id; the host resolves the folder.
+    /// Keep on a Settings ▸ Themes ▸ Community row.
     AddPack { id: String },
 }
 
@@ -2168,8 +2035,7 @@ pub(crate) enum ThemesOutcome {
     Trashed {
         id: String,
     },
-    /// The pack theme `id` is in the themes folder (a
-    /// [`ThemesRequest::AddPack`]): written now, or already there unchanged.
+    /// The pack theme `id` is in the themes folder (a [`ThemesRequest::AddPack`]): written now, or already there unchanged.
     Added {
         id: String,
     },
@@ -2192,10 +2058,7 @@ pub(crate) enum ConfigEditorOutcome {
     Failed { message: String },
 }
 
-/// Path-authority-free intent carried from Settings to the canonical Manual
-/// editor: the key to reveal, or to offer to add. The host resolves only its own
-/// aterm.toml capability; this value can choose text inside that document but
-/// can never redirect the filesystem open.
+/// Path-authority-free intent carried from Settings to the canonical Manual editor: the key to reveal, or to offer to add.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ConfigEditorTarget {
     Key(String),
@@ -2208,49 +2071,29 @@ pub(crate) enum UpdateRequest {
     Retry,
 }
 
-/// What Settings ▸ Harness asks of the host (`AppEffect::Harness`). The
-/// reducer names a session by its local id and an Autopilot word, never a path
-/// or a store: the host re-resolves the session and writes the word through
-/// the App's one writer (`App::set_session_autopilot`). No request has a reply:
-/// the page converges on the republished projection (`AppEvent::HarnessChanged`).
+/// What Settings ▸ Harness asks of the host (`AppEffect::Harness`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum HarnessRequest {
-    /// Read the harness's ledgers again, off the event loop, and republish
-    /// (the page's Refresh, and the route's arrival).
+    /// Read the harness's ledgers again, off the event loop, and republish (the page's Refresh, and the route's arrival).
     Refresh,
-    /// Write session `session`'s own Autopilot word (a press on its row's
-    /// Cruise, Land or Off).
+    /// Write session `session`'s own Autopilot word (a press on its row's Cruise, Land or Off).
     Autopilot {
         session: u64,
         word: aterm_agent::supervise::Autopilot,
     },
-    /// Look at the AI CLIs again, off the event loop, and republish (Settings
-    /// ▸ Harness ▸ AI CLIs' Refresh, and the route's arrival).
+    /// Look at the AI CLIs again, off the event loop, and republish (Settings ▸ Harness ▸ AI CLIs' Refresh, and the route's arrival).
     AiLook,
-    /// Fetch the fleet document from its URL now, off the event loop, then
-    /// look and republish (Settings ▸ Harness ▸ AI CLIs' Fetch now).
+    /// Fetch the fleet document from its URL now, off the event loop, then look and republish (Settings ▸ Harness ▸ AI CLIs' Fetch now).
     AiFleetFetch,
-    /// Open a tab that runs one AI CLI's fix: `aterm ai login <id>`, or `aterm
-    /// pkg install <id>` for one not installed (its row's Sign in or Install).
-    /// The host re-reads the row from its newest look and types the line into
-    /// a fresh shell as the operator's launch line is typed.
+    /// Open a tab that runs one AI CLI's fix.
     AiSignIn { id: &'static str },
-    /// Raise session `session`'s tab and focus its pane (a press on its row's
-    /// Show, design §10.3.1; `App::raise_session_pane`).
+    /// Raise session `session`'s tab and focus its pane (a press on its row's Show, design §10.3.1; `App::raise_session_pane`).
     Show { session: u64 },
-    /// A press on SESSIONS' `Every session` row (design §11.5): one choice
-    /// for every session the harness can steer, read again at the press and
-    /// written in one batch (`App::press_autopilot_every`).
+    /// A press on SESSIONS' `Every session` row (design §11.5).
     Every(crate::harness_screen::EveryPress),
 }
 
-/// Settings ▸ Harness's TIMER press (design §9.3.4,
-/// `AppEffect::HarnessTimer`): session `session`'s timed Cruise — 1 h, 2 h,
-/// 4 h, until `[harness] land_at` — or its cancel. The host re-resolves the
-/// session and writes through the App's one writer
-/// (`App::choose_autopilot_timer`); no reply — the page converges on the
-/// republished projection. Its own effect beside [`HarnessRequest`], whose
-/// host arm is the page's.
+/// Settings ▸ Harness's TIMER press (design §9.3.4, `AppEffect::HarnessTimer`): session `session`'s timed Cruise.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct HarnessTimerRequest {
     pub(crate) session: u64,
@@ -2265,8 +2108,7 @@ pub(crate) enum UpdateOutcome {
         build: u64,
         message: String,
     },
-    /// Automatic apply observed input/output before reader park. Exact intent
-    /// remains armed and no physical retry budget is consumed.
+    /// Automatic apply observed input/output before reader park.
     Deferred {
         reason: String,
     },
@@ -2276,42 +2118,27 @@ pub(crate) enum UpdateOutcome {
     Failed {
         message: String,
     },
-    /// The park's capture refused the desk deterministically: a failure to every
-    /// surface (the ledger records it, so `failing_applies` moves and `update status`
-    /// names the session), but the automatic lane keeps its intent and retries once
-    /// the desk changes. Not `Failed`, which the automatic reducer latches, nor
-    /// `Deferred`, which is the machine being busy.
+    /// The park's capture refused the desk deterministically.
     #[cfg(any(unix, test))]
     CaptureRefused {
         message: String,
     },
 }
 
-/// One user-initiated packages verb, run by the host against the co-located `atpkg`
-/// binary (never `PATH`), always off the UI thread. Plain status refreshes are not a
-/// request: the host calls `start_native_packages_refresh` directly.
+/// One user-initiated packages verb, run by the host against the co-located `atpkg` binary (never `PATH`), always off the UI thread.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum PackagesRequest {
     /// `atpkg update` — check/update every installed managed program now.
     CheckUpdate,
     /// `atpkg install --default-set` — the explicit ALab-toolset consent click.
     InstallDefaultSet,
-    /// `atpkg uninstall --all` — remove the whole managed toolset and reclaim its
-    /// disk (multiple GB). Installing the app installs the toolset with no prompt, so
-    /// the way out is a click too, not a CLI verb; trashing aterm.app orphans the store
-    /// under Application Support rather than reclaiming it.
+    /// `atpkg uninstall --all` — remove the whole managed toolset and reclaim its disk (multiple GB).
     UninstallAll,
-    /// `atpkg machine apply` — the `[machine]` host settings (Universal Control off
-    /// for this host), applied NOW from
-    /// Security's This Mac status — the verb that keeps them applied (a pass
-    /// carries only an edit to the table); a local verb (no store lock, no network) that
-    /// works with the package manager switched off. macOS only.
+    /// `atpkg machine apply`.
     MachineApply,
 }
 
-/// Synchronous admission outcome for a [`PackagesRequest`] (the worker's real
-/// results arrive later through the packages projection's revision fan-out,
-/// exactly like update checks).
+/// Synchronous admission outcome for a [`PackagesRequest`] (the worker's real results arrive later through the packages projection's revision fan-out, exactly like update checks).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum PackagesOutcome {
     Accepted,
@@ -2324,11 +2151,7 @@ pub(crate) enum PackagesOutcome {
     },
 }
 
-/// What came of an [`AppEffect::MessageAct`] — the host's answer, already in
-/// the words the page shows (`aterm_messages::page::act_feedback`): the
-/// intent was performed, it was refused (a path that is no crash log, a pane
-/// that did not open), or the entry no longer offers that button (a decision
-/// row that retired under the press, an id the ring has evicted).
+/// What came of an [`AppEffect::MessageAct`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum MessageActOutcome {
     Performed { feedback: String },
@@ -2342,9 +2165,7 @@ pub(crate) enum ClipboardRequest {
         text: String,
         sensitive: bool,
     },
-    /// Resolve an exact UTF-8 source range in the host-owned canonical document
-    /// at effect execution time. Native apps never receive ambient document or
-    /// clipboard access merely because they can paint a preview.
+    /// Resolve an exact UTF-8 source range in the host-owned canonical document at effect execution time.
     CopyDocumentRange {
         document: DocumentId,
         range: std::ops::Range<usize>,
@@ -2397,9 +2218,7 @@ pub(crate) struct ReplyToken<T> {
 pub(crate) enum UndoTarget {
     /// A change that landed, by the undo token it landed with.
     Token(u64),
-    /// The view's own write still on its way: what it lands with, taken back
-    /// right after it in the serialized config lane, its token read there. A
-    /// press on Undo while the change it names is saving is never refused.
+    /// The view's own write still on its way.
     Landing(OperationId),
 }
 
@@ -2409,9 +2228,6 @@ pub(crate) enum AppEffect {
         patch: ConfigPatch,
         reply: ReplyToken<ConfigPatchOutcome>,
         /// The view's own writes still on their way when it made this one,
-        /// to a key this one writes too: it shows their values and composed
-        /// this one over them, so its expectations are theirs
-        /// ([`UpdateCx::config_patch`]).
         follows: Vec<OperationId>,
     },
     ConfigUndo {
@@ -2422,8 +2238,7 @@ pub(crate) enum AppEffect {
         request: ExternalOpenRequest,
         reply: ReplyToken<ExternalOpenOutcome>,
     },
-    /// Resolve, ensure, and open the process's canonical `aterm.toml` through
-    /// the native editor host. The reducer receives no ambient path authority.
+    /// Resolve, ensure, and open the process's canonical `aterm.toml` through the native editor host.
     OpenConfigEditor {
         target: Option<ConfigEditorTarget>,
         reply: ReplyToken<ConfigEditorOutcome>,
@@ -2436,9 +2251,7 @@ pub(crate) enum AppEffect {
         request: PackagesRequest,
         reply: ReplyToken<PackagesOutcome>,
     },
-    /// Press button `action` of message `id` from Settings ▸ Messages. The reducer
-    /// supplies identity only, never a path or a route: the host re-resolves both
-    /// against the center and the log and performs the intent in the pressing window.
+    /// Press button `action` of message `id` from Settings ▸ Messages.
     MessageAct {
         id: u64,
         action: u8,
@@ -2452,35 +2265,23 @@ pub(crate) enum AppEffect {
         request: RecoveryRequest,
         reply: ReplyToken<RecoveryOutcome>,
     },
-    /// Request the host's already-granted canonical document in the native
-    /// editor. The reducer supplies identity, never a path.
+    /// Request the host's already-granted canonical document in the native editor.
     OpenDocumentEditor {
         document: DocumentId,
     },
-    /// Open the host's native image picker for the terminal wallpaper; on an
-    /// approved selection the host writes the `wallpaper` key through the
-    /// versioned config lane (which re-decodes the image), so no reply is
-    /// needed — the view converges via the ordinary config-change projection.
+    /// Open the host's native image picker for the terminal wallpaper.
     ChooseWallpaperImage,
-    /// Open atpkg's `packages.log` (Settings ▸ Packages' "Open Log"). The host resolves
-    /// the path itself and opens it through NSWorkspace (macOS only): no shell.
+    /// Open atpkg's `packages.log` (Settings ▸ Packages' "Open Log").
     OpenPackagesLog,
-    /// Open the log directory (Settings ▸ Messages' "Open Log Folder"): `aterm.log`,
-    /// `messages.log`, `packages.log` and the crash reports. The host resolves the
-    /// directory itself and opens it through NSWorkspace (macOS only): no shell, no path
-    /// from the view. It answers `ExternalOpenFinished` so the page can report a failure.
+    /// Open the log directory (Settings ▸ Messages' "Open Log Folder").
     OpenLogFolder {
         reply: ReplyToken<ExternalOpenOutcome>,
     },
-    /// A Settings ▸ Harness request ([`HarnessRequest`]), performed by the
-    /// host and answered by the republished projection.
+    /// A Settings ▸ Harness request ([`HarnessRequest`]), performed by the host and answered by the republished projection.
     Harness(HarnessRequest),
-    /// Settings ▸ Harness's timer press ([`HarnessTimerRequest`]): performed
-    /// by the host, answered by the republished projection.
+    /// Settings ▸ Harness's timer press ([`HarnessTimerRequest`]): performed by the host, answered by the republished projection.
     HarnessTimer(HarnessTimerRequest),
-    /// Settings' theme picker asks the host for a [`ThemesRequest`]: a theme
-    /// by catalog id, never a path (the `OpenConfigEditor` rule); answers
-    /// `ThemesFinished`.
+    /// Settings' theme picker asks the host for a [`ThemesRequest`]: a theme by catalog id, never a path (the `OpenConfigEditor` rule).
     Themes {
         request: ThemesRequest,
         reply: ReplyToken<ThemesOutcome>,
@@ -2498,30 +2299,17 @@ pub(crate) struct ViewMotionCx {
     pub(crate) system_reduced: bool,
     pub(crate) focused: bool,
     pub(crate) performance_reduced: bool,
-    /// Live OS light/dark appearance. This is a host fact, not terminal palette
-    /// state: Settings uses it to resolve `window_theme = "auto"` previews.
+    /// Live OS light/dark appearance.
     pub(crate) system_dark: bool,
-    /// The process-wide serious-mode override. Unlike Reduce Motion, this also
-    /// suppresses static cursor trails and post-processing in authored previews.
+    /// The process-wide serious-mode override.
     pub(crate) serious: bool,
-    /// Whether this run can use a GPU (`App::gpu_capable`): a live device, or an intent
-    /// not yet redeemed. Injected like every other host fact here, never read from a
-    /// process global.
+    /// Whether this run can use a GPU (`App::gpu_capable`): a live device, or an intent not yet redeemed.
     pub(crate) backend_gpu: bool,
-    /// The cat this window's cursor companion wears now (the pinned
-    /// favourite, else the tenured program cat, else the launch kitty), so
-    /// the Cursor Styles preview draws the coat this terminal draws.
+    /// The cat this window's cursor companion wears now (the pinned favourite, else the tenured program cat, else the launch kitty), so the Cursor Styles preview draws the coat this terminal draws.
     pub(crate) companion_look: aterm_effects::kitty_registry::KittyLook,
-    /// The window's screen can show EDR (HDR glow's display): a host fact
-    /// read off the platform ([`crate::platform::PlatformAppRt::screen_edr_potential`]),
-    /// never in a headless run.
+    /// The window's screen can show EDR (HDR glow's display).
     pub(crate) display_edr: bool,
-    /// The colour this window paints its selected tab with while the
-    /// `active_tab_color` key is unset ([`crate::App::automatic_tab_color`]:
-    /// the strip's selected tab over this frame's floor, a colour the theme
-    /// authors, the system's selected-content pill on macOS's toolbar, the
-    /// highlight under High Contrast), so Settings shows the automatic colour
-    /// it names. Injected like every host fact here.
+    /// Automatic selected-tab colour when `active_tab_color` is unset ([`crate::App::automatic_tab_color`]).
     pub(crate) automatic_tab_color: [u8; 3],
 }
 
@@ -2548,22 +2336,14 @@ impl Default for ViewMotionCx {
 pub(crate) struct ViewCx<'a> {
     pub(crate) viewport: LogicalRect,
     /// Monotonic, host-injected phase for bounded semantic demonstrations.
-    /// App models remain clockless and deterministic for an equal context.
     pub(crate) animation_phase_ms: u64,
-    /// Unresolved host accessibility/focus/load facts. Settings resolves its
-    /// currently highlighted candidate mode against these exact inputs, so
-    /// preview paint and scheduling agree before the candidate is committed.
+    /// Unresolved host accessibility/focus/load facts.
     pub(crate) motion: ViewMotionCx,
-    /// The terminal renderer's actually-applied font size in physical pixels, so an
-    /// unset/automatic Settings preview stays honest across scale factors, environment
-    /// overrides and live zoom.
+    /// The terminal renderer's actually-applied font size in physical pixels, so an unset/automatic Settings preview stays honest across scale factors, environment overrides and live zoom.
     pub(crate) terminal_font_px: f32,
-    /// Device pixels per logical native pixel; previews convert their selected
-    /// physical size before native paint applies this scale.
+    /// Device pixels per logical native pixel; previews convert their selected physical size before native paint applies this scale.
     pub(crate) terminal_scale: f32,
     /// One exact host-prepared semantic renderer source for this view pass.
-    /// Semantic compile and paint only consume this immutable snapshot; they
-    /// never request, poll, or lock the candidate service.
     pub(crate) semantic_font: Option<crate::tray_raster::PreparedSemanticFont>,
     pub(crate) document: Option<&'a crate::document_store::DocumentSnapshot>,
 }
@@ -2625,11 +2405,7 @@ impl UpdateCx<'_> {
         }
     }
 
-    /// Write `patch`. `follows` names the view's own writes still on their
-    /// way to a key it writes: the page showed their values and composed this
-    /// patch over them, so the serialized config lane checks it against the
-    /// revision the last of them produced, not the one the page last read
-    /// (a second click on a switch whose first is still saving).
+    /// Write `patch`.
     pub(crate) fn config_patch(
         &mut self,
         patch: ConfigPatch,
@@ -2645,8 +2421,7 @@ impl UpdateCx<'_> {
         operation
     }
 
-    /// Undo `target`: a change that landed, or the view's own write still
-    /// on its way ([`UndoTarget::Landing`]), taken back once it lands.
+    /// Undo `target`: a change that landed, or the view's own write still on its way ([`UndoTarget::Landing`]), taken back once it lands.
     pub(crate) fn config_undo(&mut self, target: UndoTarget) -> OperationId {
         let reply = self.service_reply(ServiceId::CONFIG);
         let operation = reply.operation;
@@ -2668,8 +2443,7 @@ impl UpdateCx<'_> {
         operation
     }
 
-    /// Press button `action` of message `id` (an [`AppEffect::MessageAct`]);
-    /// the completion returns to this view as `MessageActFinished`.
+    /// Press button `action` of message `id` (an [`AppEffect::MessageAct`]); the completion returns to this view as `MessageActFinished`.
     pub(crate) fn message_act(&mut self, id: u64, action: u8) -> OperationId {
         let reply = self.view_reply();
         let operation = reply.operation;
@@ -2715,8 +2489,7 @@ impl UpdateCx<'_> {
         self.effects.push(AppEffect::Harness(request));
     }
 
-    /// Ask the host for a session's timed Cruise or its cancel
-    /// ([`AppEffect::HarnessTimer`]).
+    /// Ask the host for a session's timed Cruise or its cancel ([`AppEffect::HarnessTimer`]).
     pub(crate) fn harness_timer(&mut self, request: HarnessTimerRequest) {
         self.effects.push(AppEffect::HarnessTimer(request));
     }
@@ -2782,9 +2555,7 @@ pub(crate) enum RuntimeError {
     KindMismatch { app: AppKind, view: AppKind },
 }
 
-/// Process-wide native-app instance and view-state store. Stable ids are never
-/// reused; removing an owner advances its generation before stale async work can
-/// be observed.
+/// Process-wide native-app instance and view-state store.
 pub(crate) struct NativeRuntime {
     instance_ids: crate::tab_model::IdAllocator<AppInstanceId>,
     instances: BTreeMap<AppInstanceId, NativeApp>,
@@ -2794,7 +2565,6 @@ pub(crate) struct NativeRuntime {
     view_lifecycles: BTreeMap<ViewId, crate::front_content::ViewLifecycle>,
     service_generations: BTreeMap<ServiceId, u64>,
     /// Process-global failure/recovery projection for the config and theme
-    /// watcher. New Settings/Manual views inherit this state at attach time.
     config_watch_status: crate::config_watcher::WatchStatusState,
     next_operation: u64,
 }
@@ -2835,9 +2605,7 @@ impl NativeRuntime {
         Ok(id)
     }
 
-    /// Attach state for a core-owned native view. The host passes the instance
-    /// from `tab_model::NativeViewRef`; it is validated but not duplicated in the
-    /// stored view state.
+    /// Attach state for a core-owned native view.
     pub(crate) fn attach_view(
         &mut self,
         view: ViewId,
@@ -2884,7 +2652,6 @@ impl NativeRuntime {
     }
 
     /// Take one detached view state and invalidate every view-owned reply token.
-    /// The core host must remove the `ViewStore` link in the same transaction.
     pub(crate) fn take_view_state(&mut self, view: ViewId) -> Option<AppViewState> {
         let state = self.views.remove(&view)?;
         if let Some(lifecycle) = self.view_lifecycles.get_mut(&view) {
@@ -2938,8 +2705,7 @@ impl NativeRuntime {
         })
     }
 
-    /// Test setup can mutate the projection directly; production mutations use
-    /// the change-aware publications below.
+    /// Test setup can mutate the projection directly; production mutations use the change-aware publications below.
     #[cfg(test)]
     pub(crate) fn system_state_mut(&mut self) -> Option<&mut crate::system_state::SystemStateApp> {
         self.touch_system_state_views();
@@ -3044,9 +2810,7 @@ impl NativeRuntime {
         })
     }
 
-    /// Stop an automatic offer immediately without replacing the presented
-    /// pointer target between a mouse press and its release. The host's next
-    /// normal tick publishes the changed countdown label.
+    /// Stop an automatic offer immediately without replacing the presented pointer target between a mouse press and its release.
     pub(crate) fn system_state_interact(&mut self) -> bool {
         let Some(state) = self.instances.values_mut().find_map(|app| match app {
             NativeApp::SystemState(state) => Some(state.as_mut()),
@@ -3069,8 +2833,7 @@ impl NativeRuntime {
             .any(|app| app.document_id() == Some(document))
     }
 
-    /// Replace the process-global Settings updater projection. There is at most
-    /// one Settings controller; any number of views subscribe to that instance.
+    /// Replace the process-global Settings updater projection.
     pub(crate) fn replace_settings_update(
         &mut self,
         update: crate::update_screen::UpdateState,
@@ -3091,7 +2854,6 @@ impl NativeRuntime {
     }
 
     /// Every Settings view renders from the projection just published: each
-    /// one's content revision moves ([`AppViewState::touch`]).
     fn touch_settings_views(&mut self) {
         for state in self.views.values_mut() {
             if matches!(state, AppViewState::Settings(_)) {
@@ -3100,8 +2862,7 @@ impl NativeRuntime {
         }
     }
 
-    /// Replace the process-global Settings packages projection (the packages
-    /// analogue of [`Self::replace_settings_update`]).
+    /// Replace the process-global Settings packages projection (the packages analogue of [`Self::replace_settings_update`]).
     pub(crate) fn replace_settings_packages(
         &mut self,
         packages: crate::packages_screen::PackagesState,
@@ -3121,8 +2882,7 @@ impl NativeRuntime {
         true
     }
 
-    /// Replace the process-global Settings ▸ Messages projection (the
-    /// messages analogue of [`Self::replace_settings_packages`]).
+    /// Replace the process-global Settings ▸ Messages projection (the messages analogue of [`Self::replace_settings_packages`]).
     pub(crate) fn replace_settings_messages(
         &mut self,
         messages: crate::messages_host::MessagesState,
@@ -3142,8 +2902,7 @@ impl NativeRuntime {
         true
     }
 
-    /// Replace the process-global Settings ▸ Harness projection (the harness
-    /// analogue of [`Self::replace_settings_packages`]).
+    /// Replace the process-global Settings ▸ Harness projection (the harness analogue of [`Self::replace_settings_packages`]).
     pub(crate) fn replace_settings_harness(
         &mut self,
         harness: crate::harness_screen::HarnessState,
@@ -3163,8 +2922,7 @@ impl NativeRuntime {
         true
     }
 
-    /// Refresh every controller derived from one canonical document. The source
-    /// remains owned by `DocumentStore`; Markdown retains only its parsed projection.
+    /// Refresh every controller derived from one canonical document.
     pub(crate) fn publish_document(
         &mut self,
         document: DocumentId,
@@ -3181,9 +2939,6 @@ impl NativeRuntime {
                 NativeApp::Editor(editor) if editor.document == document => {
                     editor.dirty = dirty;
                     if editor.config_editor && editor.config_analysis_revision != revision {
-                        // Pure TOML/schema analysis is worker-owned. Publishing
-                        // new bytes only invalidates the old projection and
-                        // closes Save until that exact revision completes.
                         editor.config_analysis = None;
                         editor.config_analysis_revision = revision;
                         editor.config_host_requested_revision = None;
@@ -3196,8 +2951,6 @@ impl NativeRuntime {
     }
 
     /// Mark one already-granted canonical document as the real aterm config.
-    /// The host resolves that identity; the editor model receives only immutable
-    /// bytes and a document revision, never a path or filesystem capability.
     pub(crate) fn enable_config_editor(
         &mut self,
         document: DocumentId,
@@ -3223,9 +2976,7 @@ impl NativeRuntime {
         enabled
     }
 
-    /// Apply a de-duplicated watcher edge and fan the resulting persistent
-    /// status to every live Settings and config-editor view. Returns whether the
-    /// process-global projection changed; callers then schedule one redraw.
+    /// Apply a de-duplicated watcher edge and fan the resulting persistent status to every live Settings and config-editor view.
     pub(crate) fn apply_config_watch_status(
         &mut self,
         event: crate::config_watcher::WatchStatusEvent,
@@ -3327,9 +3078,7 @@ impl NativeRuntime {
         }
     }
 
-    /// Latch one complete Manual analysis request for an exact source and host
-    /// environment generation. The worker runs pure parsing first and probes
-    /// filesystem-backed semantics only when that parse is admissible.
+    /// Latch one complete Manual analysis request for an exact source and host environment generation.
     pub(crate) fn begin_config_host_analysis(
         &mut self,
         document: DocumentId,
@@ -3349,11 +3098,6 @@ impl NativeRuntime {
             {
                 continue;
             }
-            // A byte-identical environment refresh can invalidate host-backed
-            // asset/font diagnostics without changing the document revision.
-            // Retaining the previous generation here would leave every Save
-            // face enabled during the worker gap, so make validation pending
-            // until this exact `(revision, generation)` completes.
             editor.config_analysis = None;
             editor.config_assist_cache.borrow_mut().clear();
             editor.config_host_requested_revision = Some(request);
@@ -3362,8 +3106,7 @@ impl NativeRuntime {
         requested
     }
 
-    /// Merge a host completion only into the exact Manual source revision that
-    /// requested it. A completion from older text is presentation-inert.
+    /// Merge a host completion only into the exact Manual source revision that requested it.
     pub(crate) fn finish_config_host_analysis(
         &mut self,
         document: DocumentId,
@@ -3435,10 +3178,6 @@ impl NativeRuntime {
     }
 
     /// Resolve and retain assistance for one exact document sequence + caret.
-    /// Both paint and keyboard input cross this seam, so activation never
-    /// depends on a prior `EditorApp::view` pass having happened to fill the
-    /// cache. The analysis-owned lexical index keeps a cache miss bounded to
-    /// one line lookup and the size-capped current line.
     pub(crate) fn config_editor_assist(
         &self,
         instance: AppInstanceId,
@@ -3575,10 +3314,7 @@ impl NativeRuntime {
             .collect()
     }
 
-    /// Recompute human-readable document titles from immutable canonical
-    /// identity. Equal basenames remain short when unique; collisions receive
-    /// the shortest unique parent suffix. The canonical URI itself never
-    /// changes and remains the exact tooltip/restore/save authority.
+    /// Recompute human-readable document titles from immutable canonical identity.
     pub(crate) fn disambiguate_document_titles(&mut self) -> Vec<AppInstanceId> {
         let identities = self
             .instances
@@ -3663,9 +3399,7 @@ impl NativeRuntime {
         self.views.get(&view)
     }
 
-    /// Current lifecycle generation for one live view. Host-owned async and
-    /// accessibility routes stamp this value so a detached view can never receive a
-    /// completion or platform action issued for its former incarnation.
+    /// Current lifecycle generation for one live view.
     pub(crate) fn view_generation(&self, view: ViewId) -> Option<u64> {
         if !self.views.contains_key(&view) {
             return None;
@@ -3682,7 +3416,6 @@ impl NativeRuntime {
     }
 
     /// Suspend hidden native views without destroying their view-local state.
-    /// A closing/closed view rejects attempts to become visible again.
     pub(crate) fn set_view_suspended(
         &mut self,
         view: ViewId,
@@ -3709,25 +3442,14 @@ impl NativeRuntime {
             .ok_or(RuntimeError::UnknownView(view))
     }
 
-    /// Mutate view-local controller state without exposing the runtime's app or
-    /// generation maps. Document hosts use this immediately after attaching a
-    /// core-owned view to install its store-issued editor buffer handle.
-    /// The view's state, to change: its content revision moves
-    /// ([`AppViewState::touch`]), whatever the caller changes.
+    /// Mutate view-local controller state without exposing the runtime's app or generation maps.
     pub(crate) fn view_state_mut(&mut self, view: ViewId) -> Option<&mut AppViewState> {
         let state = self.views.get_mut(&view)?;
         state.touch();
         Some(state)
     }
 
-    /// A host's change to view `view`'s state that knows whether it changed
-    /// what the view renders from: `change` says so, and only then does the
-    /// view's content revision move ([`AppViewState::touch`]). The pass the
-    /// event loop runs before every wait hands each view facts that are
-    /// almost always the ones it has (`App::sync_settings_views`); taken
-    /// through [`Self::view_state_mut`] it moved every view's revision every
-    /// frame, so nothing a render remembers for its content (Settings' page
-    /// chrome) outlived a frame. `false` where there is no such view.
+    /// A host's change to view `view`'s state that knows whether it changed what the view renders from.
     pub(crate) fn change_view_state(
         &mut self,
         view: ViewId,
@@ -3773,8 +3495,6 @@ impl NativeRuntime {
             service_generations: &mut self.service_generations,
             effects: Vec::new(),
         };
-        // Only Settings scrolls a second region (its sidebar); every other
-        // view's wheel moves its one list.
         let event = match event {
             AppEvent::ScrollAt { lines, .. } if app.kind() != AppKind::Settings => {
                 AppEvent::ScrollLines(lines)
@@ -3884,8 +3604,6 @@ impl NativeRuntime {
     }
 
     /// A reply token is one routing proof, not two unrelated live handles: owner and
-    /// sink identity/generation stay coupled so a result can never be redirected into
-    /// another live sink merely because both halves pass their own lifecycle checks.
     fn owner_matches_sink(owner: WorkOwner, sink: CompletionSink) -> bool {
         match (owner, sink) {
             (
@@ -3969,7 +3687,6 @@ fn canonical_uri_parent_segments(uri: &str) -> Vec<String> {
             .filter(|segment| !segment.is_empty())
             .map(display_uri_segment),
     );
-    // The final URI segment is the basename already present in the title.
     let _ = segments.pop();
     segments
 }
@@ -4030,7 +3747,6 @@ fn shortest_unique_document_parent(uri: &str, group: &[(AppInstanceId, String)])
 
 fn stable_uri_tag(uri: &str) -> u64 {
     // Explicit FNV-1a keeps presentation stable across runs/toolchains. This is
-    // a disambiguating display tag, never authority or a security decision.
     aterm_hash::fnv1a_64(uri.as_bytes())
 }
 
@@ -4050,8 +3766,6 @@ fn bounded_document_parent_label(label: &str, uri: &str) -> String {
 }
 
 /// The reader body after its outline, toolbar, padding and split gutter.
-/// Rendering and page navigation must use the same measure: the whole native
-/// viewport includes chrome that cannot show document rows.
 #[derive(Clone, Copy)]
 struct MarkdownReaderGeometry {
     wide_outline: bool,
@@ -4122,8 +3836,7 @@ impl MarkdownReaderGeometry {
     }
 }
 
-/// Compact Markdown controller. It references one canonical document and keeps
-/// only the parsed projection required to build the current semantic tree.
+/// Compact Markdown controller.
 #[derive(Debug)]
 pub(crate) struct MarkdownApp {
     pub(crate) document: DocumentId,
@@ -4291,9 +4004,6 @@ impl NativeAppModel for MarkdownApp {
                 view.common.last_focus = focus;
                 EventResult::Handled
             }
-            // Runtime-only callers (principally conformance tests) do not own a
-            // window geometry. Production input is upgraded by the host to
-            // `MarkdownScroll`; retain a deterministic reader measure here.
             AppEvent::ScrollLines(lines) => {
                 let next = crate::native_markdown::move_visual_rows(
                     &self.parsed,
@@ -4440,8 +4150,6 @@ impl NativeAppModel for MarkdownApp {
                         view.common.presentation_revision =
                             view.common.presentation_revision.saturating_add(1);
                     }
-                    // Local documents require an explicit host open workflow and
-                    // denied schemes never emit a capability request.
                     LinkPolicy::LocalDocument
                     | LinkPolicy::DeniedScheme
                     | LinkPolicy::ExplicitExternal => {}
@@ -4637,10 +4345,6 @@ impl NativeAppModel for MarkdownApp {
             preview_viewport_height,
         );
         let anchor_index = visible.anchor_index;
-        // Page controls carry an exact block target in their semantic action.
-        // Both directions use the same bounded, width-aware height estimator as
-        // the visible layout, so inspect/act and a pointer click advance by the
-        // same reading band without smuggling pixel offsets into the reducer.
         let current_location = Self::location(view);
         let previous_page = self.page_target(view, &geometry, -1);
         let next_page = self.page_target(view, &geometry, 1);
@@ -4721,10 +4425,6 @@ impl NativeAppModel for MarkdownApp {
             .or(self.recovery_status.as_deref())
             .map_or(progress, |notice| bounded_markdown_text(notice, 180));
         let reader_status = bounded_markdown_label(&reader_status, if compact { 52 } else { 96 });
-        // When the wide outline is already consuming reader width, dormant
-        // history affordances should not erase the document identity. They
-        // reappear as one stable pair as soon as either direction is useful;
-        // narrower/split layouts keep the familiar fixed toolbar group.
         let show_history_controls =
             !wide_outline || view.history.can_back() || view.history.can_forward();
 
@@ -4762,10 +4462,6 @@ impl NativeAppModel for MarkdownApp {
         let compact_selection_width =
             markdown_toolbar_label_width(selection_label, 42.0, text_scale);
 
-        // The title is the only flexible item in this row. Bound it with the
-        // same proportional title metrics used by the rasterizer, after
-        // reserving the exact button, gap, and inset budget. A character cap
-        // can still hard-clip wide glyphs (and wastes room on narrow ones).
         let wide_mode_controls = preview_button_width
             + source_button_width
             + split_button_width
@@ -4800,9 +4496,6 @@ impl NativeAppModel for MarkdownApp {
             "Markdown reader: {}",
             bounded_markdown_text(&self.title, 180)
         );
-        // Compact surfaces already name the document in the selected tab; repeating it
-        // in this narrow row leaves an opaque `S…` and steals touch-target space, so
-        // only desktop keeps the in-view title.
         let mut header_row_children = if compact {
             Vec::new()
         } else {
@@ -5017,7 +4710,6 @@ impl NativeAppModel for MarkdownApp {
                 .layout(Layout::default().width(Length::Fill).height(Length::Fill)),
                 button(
                     "markdown/previous-page-button".to_string(),
-                    // Named by the words it paints, the short ones too.
                     ButtonSpec::new(if compact {
                         "Prev: the previous reading page"
                     } else {
@@ -5153,9 +4845,6 @@ impl NativeAppModel for MarkdownApp {
                     preview_horizontal_inset,
                     preview_vertical_inset,
                 ))
-                // A small reserved tail of each virtual block sits outside its
-                // painted rect, so cards do not collide while block+gap stays
-                // aligned with virtual scroll geometry.
                 .gap(crate::native_markdown::VISUAL_BLOCK_GAP)
                 .clipped(),
         )
@@ -5448,8 +5137,6 @@ impl NativeAppModel for MarkdownApp {
     fn commands(&self, view: &Self::ViewState, out: &mut Vec<Command>) {
         let active_heading =
             crate::native_markdown::heading_at_source(&self.parsed, view.source_anchor);
-        // The reader's chords are live on every platform (the dispatch arm tests
-        // `SUPER | CTRL`), so they are named per platform rather than blanked.
         out.push(Command {
             id: ActionId::new("markdown/back"),
             title: "Reader: Back".to_string(),
@@ -5480,10 +5167,6 @@ impl NativeAppModel for MarkdownApp {
         out.push(Command {
             id: ActionId::new("markdown/select-all"),
             title: "Reader: Select All Source".to_string(),
-            // Live off macOS too: the `Character('a' | 'A') if command` arm sends
-            // `TextInput(SelectAll)`, which the reducer answers with this action's
-            // body. The readline arms that shadow 'a' need `settings_active`, and
-            // `ctrl+a` is not in `PLATFORM_DEFAULT_PAIRS`, so nothing claims it first.
             shortcut: Some(reader_command_chord("A")),
             enabled: self.can_select_source()
                 && self.selection(view).as_ref() != Some(&(0..self.parsed.source_len)),
@@ -5491,8 +5174,6 @@ impl NativeAppModel for MarkdownApp {
         out.push(Command {
             id: ActionId::new("markdown/copy"),
             title: "Reader: Copy Source Selection".to_string(),
-            // Off macOS the live chord is the seeded `ctrl+shift+c` (`copy`), which
-            // `on_key_native_mode` routes to `copy_native_selection`; not Ctrl+C.
             shortcut: Some(
                 if cfg!(target_os = "macos") {
                     "Cmd-C"
@@ -5661,8 +5342,6 @@ fn markdown_range_from_action(action: &str) -> Option<std::ops::Range<usize>> {
 }
 
 /// Resolve only the link rows intersecting a materialized source window. Links
-/// are parser-ordered, so the initial partition is logarithmic and the remainder
-/// is capped by `limit` rather than total document size.
 fn markdown_links_in_range(
     document: &crate::native_markdown::MarkdownDocument,
     source: std::ops::Range<usize>,
@@ -5707,10 +5386,7 @@ fn markdown_images_in_range(
         .collect()
 }
 
-/// Block `index`'s bounded display text and its styled spans (prose kinds only; code
-/// and tables paint verbatim). The spans are clipped to the block's own text: when the
-/// 128 KiB bound cut the block, a span clipped to the display length would end inside
-/// the appended three-byte `…`, a slice the painter cannot take.
+/// Block `index`'s bounded display text and its styled spans (prose kinds only; code and tables paint verbatim).
 pub(crate) fn bounded_markdown_block_paint(
     parsed: &crate::native_markdown::MarkdownDocument,
     index: usize,
@@ -5726,10 +5402,8 @@ pub(crate) fn bounded_markdown_block_paint(
         | MarkdownBlock::Paragraph { text, .. }
         | MarkdownBlock::ListItem { text, .. }
         | MarkdownBlock::Quote { text, .. } => text.len(),
-        // No styled spans: nothing to clip.
         _ => 0,
     };
-    // `bounded_markdown_text` only ever shortens: a shorter copy is a cut one.
     let kept = if text.len() < own {
         text.len() - '…'.len_utf8()
     } else {
@@ -5783,8 +5457,6 @@ fn bounded_markdown_block_text(block: &crate::native_markdown::MarkdownBlock) ->
 }
 
 /// The reader's `command`-modifier chord for `key`, spelled the way this platform's
-/// keyboard reaches it. The dispatch arm accepts `SUPER | CTRL` everywhere, but `Cmd-[`
-/// names the Windows key to a Windows user, and the shell owns that.
 fn reader_command_chord(key: &str) -> String {
     let modifier = if cfg!(target_os = "macos") {
         "Cmd-"
@@ -5805,8 +5477,6 @@ fn bounded_markdown_text(text: &str, limit: usize) -> String {
 }
 
 /// Bounded visual label projection. Unlike byte caps used for clipboard and
-/// semantic block materialization, chrome is sized in displayed characters so
-/// compact layouts receive a deliberate ellipsis instead of relying on clipping.
 fn bounded_markdown_label(text: &str, max_chars: usize) -> String {
     if max_chars == 0 {
         return String::new();
@@ -5820,7 +5490,6 @@ fn bounded_markdown_label(text: &str, max_chars: usize) -> String {
 }
 
 /// Width for a centered Markdown toolbar label, measured with the UI face and type step
-/// `native_ui` paints, so labels do not ellipsize at accessibility text scales.
 fn markdown_toolbar_label_width(label: &str, minimum: f32, text_scale: f32) -> f32 {
     let scale = if text_scale.is_finite() && text_scale > 0.0 {
         text_scale.clamp(0.85, 2.0)
@@ -5833,8 +5502,6 @@ fn markdown_toolbar_label_width(label: &str, minimum: f32, text_scale: f32) -> f
 }
 
 /// Filename-like chrome keeps both identity-bearing ends. A long document title
-/// should retain its extension and distinguishing prefix instead of relying on a
-/// parent clip that can also cover the cursor/save indicators beside it.
 fn bounded_middle_label(text: &str, max_chars: usize) -> String {
     bounded_middle_label_from_graphemes(&text.graphemes().collect::<Vec<_>>(), max_chars)
 }
@@ -5858,7 +5525,6 @@ fn bounded_middle_label_from_graphemes(graphemes: &[&str], max_chars: usize) -> 
 }
 
 /// Fit filename-like chrome to a pixel budget with the face metrics used to paint it,
-/// keeping both identity-bearing ends.
 fn bounded_middle_label_to_width(text: &str, max_width: f32, px: f32) -> String {
     bounded_middle_label_to_width_for_face(text, max_width, px, crate::widget::TextFace::UiBold)
 }
@@ -5880,9 +5546,6 @@ fn bounded_middle_label_to_width_for_face(
         return text.to_string();
     }
 
-    // 256 displayed graphemes is already far beyond any title that can fit in
-    // native app chrome. Capping also prevents adversarial service titles from
-    // turning a layout pass into an unbounded quadratic search.
     let graphemes = text.graphemes().collect::<Vec<_>>();
     let count = graphemes.len().min(256);
     for max_chars in (2..=count).rev() {
@@ -5898,9 +5561,7 @@ fn bounded_middle_label_to_width_for_face(
     }
 }
 
-/// Compact editor controller seam. The editor module owns commands/edit
-/// reduction; the app runtime owns lifecycle, semantic presentation, and close
-/// readiness around the shared `DocumentId`.
+/// Compact editor controller seam.
 #[derive(Debug)]
 pub(crate) struct EditorApp {
     pub(crate) document: DocumentId,
@@ -5909,8 +5570,7 @@ pub(crate) struct EditorApp {
     pub(crate) canonical_uri: String,
     pub(crate) dirty: bool,
     pub(crate) checkpoint_pending: bool,
-    /// The saver baseline no longer matches disk. Save stays unavailable until
-    /// the host installs an explicitly reconciled observation.
+    /// The saver baseline no longer matches disk.
     pub(crate) disk_conflict: bool,
     pub(crate) recovery_status: Option<String>,
     pub(crate) can_undo: bool,
@@ -5919,8 +5579,6 @@ pub(crate) struct EditorApp {
     config_analysis: Option<crate::native_config_language::ConfigAnalysis>,
     config_analysis_revision: u64,
     /// Exact source/environment generation admitted to the off-thread config analysis
-    /// lane. Latched beside the analysis so repeat presentation refreshes are idempotent
-    /// and stale worker completions are rejected.
     config_host_requested_revision: Option<(u64, u64)>,
     config_assist_cache: std::cell::RefCell<
         Vec<(
@@ -5933,17 +5591,10 @@ pub(crate) struct EditorApp {
 }
 
 /// `(document id, document seq, line-start index)`: the memo behind
-/// [`EditorApp::line_index`]. The inner `None` is a memoized refusal, not a miss: the
-/// revision is too line-dense to index within
-/// [`crate::native_editor::MAX_LINE_INDEX_ENTRIES`], so a pathological document does not
-/// re-scan every frame.
 type LineIndexMemo = Option<(u64, u64, Option<std::sync::Arc<[usize]>>)>;
 
 impl EditorApp {
-    /// What this editor's toolbar holds beyond its fixed commands: the
-    /// Previous/Next problem pair while a config file has findings, Reload in
-    /// Commands' place while the file changed on disk under local edits. The
-    /// view draws it and the host sizes the file's rows by it.
+    /// What this editor's toolbar holds beyond its fixed commands.
     pub(crate) fn toolbar(&self) -> crate::native_ui::EditorToolbar {
         crate::native_ui::EditorToolbar {
             problem_navigation: self.config_editor
@@ -5956,8 +5607,7 @@ impl EditorApp {
         }
     }
 
-    /// [`Self::toolbar`] as view `view` draws it: an `edit` ticket's view
-    /// adds its header row ([`EditHeader`]).
+    /// [`Self::toolbar`] as view `view` draws it: an `edit` ticket's view adds its header row ([`EditHeader`]).
     pub(crate) fn toolbar_in(&self, view: &EditorViewState) -> crate::native_ui::EditorToolbar {
         crate::native_ui::EditorToolbar {
             edit_header: view.edit_header.is_some(),
@@ -5995,9 +5645,7 @@ impl EditorApp {
         }
     }
 
-    /// Whether this editor view can save its current changes without
-    /// interrupting a prompt that owns its input.
-    /// Shared by its toolbar, command metadata and the native File menu.
+    /// Whether this editor view can save its current changes without interrupting a prompt that owns its input.
     pub(crate) fn can_save(&self, view: &EditorViewState) -> bool {
         let config_valid = !self.config_editor
             || self
@@ -6015,12 +5663,6 @@ impl EditorApp {
     }
 
     /// Line-start index for `snapshot`, built once per document revision.
-    ///
-    /// `view` runs every frame and keystroke and needs line structure for the viewport
-    /// reconcile, the projection and the cursor label; re-scanning the bytes for each cost
-    /// up to ~150 ms/frame at the 32 MiB document limit. `None` means "do not index this
-    /// revision" (see [`LineIndexMemo`]); callers fall back to `EditorLines::scanning`,
-    /// which answers identically.
     fn line_index(
         &self,
         snapshot: &crate::document_store::DocumentSnapshot,
@@ -6203,9 +5845,6 @@ impl NativeAppModel for EditorApp {
         })
         .flatten()
         .filter(|(context, _)| view.config_completion_dismissed != Some(*context))
-        // Suggestions list only while a name is partly typed or once asked for
-        // (Ctrl-Space, Tab); a caret resting on a key shows just its one line
-        // of help. `waiting`: suggestions exist but were not asked for.
         .map(|(context, mut assist)| {
             let listed = assist.typed || view.config_completion_interaction == Some(context);
             let waiting = !listed && !assist.completions.is_empty();
@@ -6216,8 +5855,6 @@ impl NativeAppModel for EditorApp {
             (context, assist, waiting, listed)
         })
         .filter(|(_, assist, _, _)| assist.help.is_some() || !assist.completions.is_empty());
-        // The panel over the file: rows when the list is shown, else the help
-        // line alone.
         let completion_count = command_completion.as_ref().map_or_else(
             || {
                 config_assist.as_ref().map_or(
@@ -6249,8 +5886,6 @@ impl NativeAppModel for EditorApp {
             toolbar,
         );
         let editor_geometry = crate::native_ui::text_viewport_geometry(editor_rect);
-        // Caret reveal keeps to the rows shown whole; the painter projects
-        // the part row too.
         let line_capacity = crate::native_ui::editor_visible_line_capacity_with_palette(
             cx.viewport,
             completion_count,
@@ -6266,8 +5901,6 @@ impl NativeAppModel for EditorApp {
             .floor() as usize;
         let mut projection = cx.document.and_then(|snapshot| {
             view.buffer.as_ref().map(|buffer| {
-                // Memoized per revision (`EditorApp::line_index`); the cursor label
-                // below reuses it.
                 let starts = self.line_index(snapshot);
                 let lines = match starts.as_deref() {
                     Some(starts) => {
@@ -6275,10 +5908,6 @@ impl NativeAppModel for EditorApp {
                     }
                     None => crate::native_editor::EditorLines::scanning(&snapshot.text),
                 };
-                // Runtime-only renderers do not have a host resize event. Use a
-                // reconciled view clone so direct semantic/introspection renders
-                // still obey the renderer's actual capacity; the window host
-                // persists this same capacity before ordinary reducer input.
                 let mut effective = buffer.clone();
                 effective.reconcile_viewport_with(&lines, line_capacity);
                 crate::native_editor::project_viewport_with(
@@ -6306,10 +5935,6 @@ impl NativeAppModel for EditorApp {
                 editor_cursor_label_with(&lines, buffer)
             })
         });
-        // The footer message paints from `rect.x + 72` with a 16 px right gutter (the
-        // slot `paint_text_viewport` reports as `footer-available`). The minibuffer's
-        // character cap only bounds projection work: Dynamic Type and fallback fonts
-        // change Mono caption advances, so fit is measured. Reserve the caret's pixel too.
         let footer_width = (editor_rect.width - 88.0).max(112.0);
         let footer_chars = ((footer_width / 7.0).floor() as usize).clamp(16, 256);
         let minibuffer_width = (editor_rect.width - 88.0 - 1.0).max(0.0);
@@ -6362,10 +5987,6 @@ impl NativeAppModel for EditorApp {
         } else {
             0
         };
-        // THE TOOLBAR IS ONE MEASURED PLAN ([`crate::native_ui::plan_editor_toolbar`]),
-        // the same the host sizes the file's rows by: each button as wide as
-        // its words, as Settings' buttons are, flowed into as few rows as the
-        // bar holds, in plain words (the Emacs chords are in the spoken label).
         let command_button = |key: &'static str,
                               visual_label: &'static str,
                               width: f32,
@@ -6448,8 +6069,6 @@ impl NativeAppModel for EditorApp {
             shell.command_bar_width,
             command_gap,
         );
-        // An `edit` ticket's view: its header row heads the bar, counted in
-        // the bar's rows (`EditorToolbar::edit_header`) as the buttons are.
         let edit_header_row = view.edit_header.as_ref().map(|header| {
             let part =
                 |key: &'static str, words: &'static str, label: String, action: &'static str| {
@@ -6489,7 +6108,6 @@ impl NativeAppModel for EditorApp {
                     "editor/abort",
                 ));
             }
-            // What the parts and the gaps before them take from the words.
             let parts_width: f32 = std::iter::once(EDIT_DONE_WORDS)
                 .chain(header.offers_abort().then_some(EDIT_ABORT_WORDS))
                 .map(|words| command_gap + crate::native_ui::editor_toolbar_button_width(words))
@@ -6691,9 +6309,6 @@ impl NativeAppModel for EditorApp {
             let available_width = (cx.viewport.width
                 - shell.outer_padding * 2.0
                 - shell.palette_padding * 2.0
-                // TextSpec's visual status treatment owns additional optical
-                // inset beyond the palette's structural padding. Keep the
-                // width-bound copy inside that painted measure as well.
                 - 72.0)
                 .max(0.0);
             let help = assist
@@ -6729,16 +6344,8 @@ impl NativeAppModel for EditorApp {
             } else {
                 help.to_string()
             };
-            // The strip paints the words the status semantics carry, never
-            // re-worded, measured with the regular/caption typography TextSpec
-            // paints (the semibold title helper measures differently).
             let concise_help = help.to_string();
-            // Where the strip is short, the key hints go first, then the
-            // count; the help itself is cut at its end, never in the middle,
-            // where the key and its values are.
             let range = (total > capacity).then(|| format!("{}–{end}/{total}", start + 1));
-            // Suggestions waiting to be asked for say how on the help line
-            // itself: the resting panel has no row under it.
             let hints = if total > 0 {
                 Some("Ctrl-Space · ↑↓ select · Enter/Tab insert")
             } else if *waiting {
@@ -6797,7 +6404,6 @@ impl NativeAppModel for EditorApp {
                 ]),
             ];
             if !*listed {
-                // The help line alone.
             } else if assist.completions.is_empty() {
                 children.push(
                     UiNode::new(
@@ -7002,8 +6608,6 @@ impl NativeAppModel for EditorApp {
             Command {
                 id: ActionId::new("editor/save"),
                 title: "Save Buffer".to_string(),
-                // `platform_accel` strips the `Cmd-S` half off macOS; `C-x C-s` is
-                // true everywhere. Windows also seeds plain Ctrl+S (`Keymap::emacs`).
                 shortcut: Some(
                     if cfg!(windows) {
                         "C-s \u{b7} C-x C-s"
@@ -7029,8 +6633,6 @@ impl NativeAppModel for EditorApp {
             Command {
                 id: ActionId::new("editor/find"),
                 title: "Incremental Search".to_string(),
-                // Windows spends `C-s` on Save, so isearch is `M-s` there (emacs's
-                // search-map prefix, free in this keymap); elsewhere it is `C-s`.
                 shortcut: Some(if cfg!(windows) { "M-s" } else { "C-s" }.to_string()),
                 enabled: view
                     .buffer
@@ -7056,8 +6658,6 @@ impl NativeAppModel for EditorApp {
                 enabled: self.dirty && !self.checkpoint_pending,
             },
         ]);
-        // An `edit` ticket's view answers the program that asked, as its
-        // header row's parts do.
         if let Some(header) = &view.edit_header {
             out.push(Command {
                 id: ActionId::new("editor/finish"),
@@ -7116,8 +6716,6 @@ impl NativeAppModel for EditorApp {
 
     fn prepare_close(&mut self, _request: CloseRequest, _cx: &mut UpdateCx<'_>) -> CloseReadiness {
         // Durability belongs to `DocumentStore` and the document host: one document can
-        // back several Markdown and editor views, so only the host knows the final view
-        // and performs its proof-gated checkpoint before committing a detach.
         CloseReadiness::Ready
     }
 }
@@ -7155,10 +6753,6 @@ fn editor_prompt_projection(
     max_chars: usize,
     max_width: f32,
 ) -> (String, usize) {
-    // Minibuffer editing is append-only (`insert_minibuffer_text` /
-    // `minibuffer_backspace`), so its committed caret is query.len(). Map
-    // marked-text movement from there through the same sanitizing/elision as
-    // the painted label. Replacing CR/LF by one space preserves byte offsets.
     let body = format!("{query}{preedit}").replace(['\r', '\n'], " ");
     let prefix_chars = prefix.graphemes().count();
     let body_graphemes = body.grapheme_indices().collect::<Vec<_>>();
@@ -7186,8 +6780,6 @@ fn editor_prompt_projection(
     if max_chars == 0 || ellipsis_width > max_width {
         return (String::new(), 0);
     }
-    // At extremely narrow widths the prompt itself cannot fit. Keep the live
-    // query tail and its input caret instead of painting a clipped prompt.
     let (prefix, prefix_chars, prefix_width) = if prefix_chars.saturating_add(1) <= max_chars
         && prefix_width + ellipsis_width <= max_width
     {
@@ -7197,9 +6789,6 @@ fn editor_prompt_projection(
     };
     let tail_chars = max_chars.saturating_sub(prefix_chars.saturating_add(1));
     let fixed_width = prefix_width + ellipsis_width;
-    // At most the existing character cap is measured, even for a long query.
-    // Mono advances are nonnegative, so the first fitting suffix is found in
-    // logarithmically many bounded measurements, only when rebuilding the view.
     let mut lo = body_chars.saturating_sub(tail_chars);
     let mut hi = body_chars;
     while lo < hi {
@@ -7221,11 +6810,9 @@ fn editor_prompt_projection(
     )
 }
 
-/// What a document whose file changed under an unsaved draft says: the
-/// editor's default recovery line, the file watcher's and the save refusal's.
+/// What a document whose file changed under an unsaved draft says.
 pub(crate) const DISK_CONFLICT_RECOVERY: &str = "File changed on disk; Save is blocked. Copy any local edits you need to keep, then choose ‘Discard Changes and Reload from Disk’";
-/// The recovery line for a draft whose file was deleted, or appeared, on
-/// disk since it was opened (the file watcher's and the save refusal's).
+/// The recovery line for a draft whose file was deleted, or appeared, on disk since it was opened (the file watcher's and the save refusal's).
 pub(crate) const DISK_EXISTENCE_RECOVERY: &str =
     "File was deleted or replaced on disk; Save is blocked. Copy any local edits you need to keep.";
 
@@ -7267,7 +6854,6 @@ fn editor_status_message(
         summary
     } else if let Some(status) = view.status.as_deref().filter(|status| {
         // Command feedback may outlive its command, but a clean-buffer notice
-        // cannot describe edits made after that save or checkpoint.
         !status.is_empty() && !(app.dirty && matches!(*status, "Saved" | "No unsaved changes"))
     }) {
         status.to_string()
@@ -7302,8 +6888,6 @@ fn command_palette_status(matches: usize, compact: bool) -> String {
 }
 
 /// Scanning form: derives the caret's line by walking the document. Kept for
-/// one-shot callers; the render path uses [`editor_cursor_label_with`] with the
-/// resident line index instead of re-scanning every frame.
 #[cfg(test)]
 fn editor_cursor_label(text: &str, view: &crate::native_editor::EditorBufferView) -> String {
     editor_cursor_label_with(&crate::native_editor::EditorLines::scanning(text), view)
@@ -7322,9 +6906,6 @@ fn editor_cursor_label_with(
     let before = &text[..caret];
     let line = lines.number_at(caret) + 1;
     let line_start = before.rfind('\n').map_or(0, |newline| newline + 1);
-    // Pass the whole logical line: a defensive selection can land inside a combining or
-    // ZWJ cluster, and slicing there would overstate the column. The helper stops before
-    // the enclosing grapheme and applies the widths projection, paint and hit testing use.
     let line_end = text[caret..]
         .find('\n')
         .map_or(text.len(), |relative| caret + relative);
@@ -8253,7 +7834,6 @@ mod markdown_reader_tests {
     }
 
     /// Page keys and the visible buttons move through the same reading body,
-    /// not the whole tab. Narrow and split bodies also change wrapped rows.
     #[test]
     fn markdown_page_keys_reach_the_rendered_button_targets_in_every_mode() {
         let paragraph = "A paragraph with enough words to wrap differently in a narrow reader, \
@@ -8280,7 +7860,8 @@ mod markdown_reader_tests {
                 (390.0, 568.0),
             ] {
                 if mode == MarkdownViewMode::Split && width < 620.0 {
-                    continue; // The reader does not offer Split at this width.
+                    // The reader does not offer Split at this width.
+                    continue;
                 }
                 let (mut runtime, instance, view) = markdown_runtime(&source);
                 runtime
@@ -8362,8 +7943,6 @@ mod markdown_reader_tests {
     }
 
     fn editor_input_focus(app: &mut EditorApp, view: &mut EditorViewState, focused: bool) {
-        // The host marks keyboard focus visible; the real reducer chooses its
-        // target. A painted but unfocused editor must never own IME geometry.
         view.common.focus_visible = true;
         let mut next_operation = 1;
         let mut service_generations = BTreeMap::new();
@@ -8460,7 +8039,6 @@ mod markdown_reader_tests {
         app.config_editor = true;
         app.config_analysis = Some(crate::native_config_language::analyze(source));
         app.recovery_status = Some(crate::app_documents::CARRIED_DRAFT_NOTICE.to_string());
-        // Before any Save, the standing recovery note is the line.
         let before = editor_status_message(&app, &view, None, false).unwrap();
         assert!(before.starts_with("Recovery · "), "{before}");
 
@@ -8468,7 +8046,6 @@ mod markdown_reader_tests {
         let refused = editor_status_message(&app, &view, None, false).unwrap();
         assert!(refused.starts_with("Save blocked"), "{refused}");
 
-        // An in-flight save also outranks it.
         view.status = None;
         app.checkpoint_pending = true;
         assert_eq!(
@@ -8508,11 +8085,6 @@ mod markdown_reader_tests {
     }
 
     /// The config editor's problem buttons compile at every width, each
-    /// named by the words it paints ("Prev Issue", "Prev", "!›"): the UI
-    /// compiler refuses a button whose painted words are not in its name
-    /// ([`crate::native_ui::visible_label_in_name`]), and the wide "Prev
-    /// Issue" / "Next Issue" were named "Previous config problem" and "Next
-    /// config problem", which no test compiled.
     #[test]
     fn config_problem_buttons_compile_at_every_width() {
         let source = "future_first_setting = 1\nfuture_second_setting = 2\n";
@@ -8608,10 +8180,6 @@ mod markdown_reader_tests {
     }
 
     /// The caret line is painted whole above the footer: caret reveal counts
-    /// only the rows shown whole, never the part row the footer cuts (or the
-    /// reveal-ahead row under it). Checked at 80x24 (584x348) and 102x29
-    /// (738x418), caret on the last line of a 31-line aterm.toml, in the
-    /// config editor (resting help panel up) and a plain one.
     #[test]
     fn the_caret_line_is_painted_whole_above_the_footer() {
         let mut source = String::new();
@@ -8659,8 +8227,6 @@ mod markdown_reader_tests {
     }
 
     /// A resting caret's help line is a panel of its own height with no row
-    /// under it (no "Nothing to suggest here"), so the file keeps that room;
-    /// how to open the list is said on the help line itself.
     #[test]
     fn resting_help_is_one_line_with_no_row_under_it() {
         let source = "gpu = true\n";
@@ -8692,7 +8258,6 @@ mod markdown_reader_tests {
                 .is_none(),
             "no row under the help line"
         );
-        // The host sizes the file for the same panel the view draws.
         assert_eq!(
             crate::native_ui::editor_text_viewport_rect_with_palette(
                 viewport,
@@ -8709,9 +8274,6 @@ mod markdown_reader_tests {
     }
 
     /// The Manual's landing frame at a default 80x24 window (viewport 744x420), caret at
-    /// Ln 1 Col 1 with nothing typed or asked for: the help line shows but no suggestion
-    /// list, the edited file gets most of the height, and the config's error sits on a
-    /// painted row.
     #[test]
     fn manual_landing_paints_the_config_file_not_only_its_completion_list() {
         let mut source = String::from("theme = \"Draculla\"\nbidi = \"sidewayz\"\n");
@@ -8732,7 +8294,6 @@ mod markdown_reader_tests {
         let assist = compiled
             .semantic(&UiKey::new("editor/config-assist"))
             .expect("the help line for the key under the caret");
-        // Nothing was typed or asked for: no list of suggestions opens.
         assert!(
             compiled
                 .semantics
@@ -8762,9 +8323,6 @@ mod markdown_reader_tests {
             projection.total_lines
         );
 
-        // Projected is not painted: the last projected row is the reveal-ahead
-        // overscan row, which the viewport clips. Count the rows the glass
-        // actually carries and put the file's only error inside them.
         let geometry = crate::native_ui::text_viewport_geometry(buffer.rect);
         let painted_rows = (geometry.body_h / geometry.line_h).floor() as usize;
         assert!(
@@ -8860,8 +8418,6 @@ mod markdown_reader_tests {
             (after_emoji, "Ln 2, Col 10"),
             (after_flag, "Ln 2, Col 12"),
             (after_flag + 1, "Ln 2, Col 13"),
-            // Defensive selections on character boundaries inside a cluster
-            // resolve to the cluster's leading edge, never a phantom cell.
             (after_tab + 'e'.len_utf8(), "Ln 2, Col 5"),
             (after_cjk + '👩'.len_utf8(), "Ln 2, Col 8"),
         ] {
@@ -8904,14 +8460,6 @@ mod markdown_reader_tests {
     }
 
     /// THE EDITOR TOOLBAR IS ONE MEASURED PLAN IN WHOLE WORDS: at every
-    /// width from a wide window to a phone-width one, with and without config
-    /// problems and a disk conflict's Reload, every button paints whole words
-    /// from the toolbar's own vocabulary at its own width (no "‹!", no "…",
-    /// no shared-slot squeeze); the rows the view draws are the rows the
-    /// metrics count; and the file's rect is the one the host sizes the caret
-    /// for. At 738 and 374pt with problems the words are the long ones, in
-    /// two rows at 374. (The bar used to pick its rows and words from fixed
-    /// breakpoints: "Run…", "Go to…", "‹!" and "!›" at 374pt.)
     #[test]
     fn the_editor_toolbar_is_one_measured_plan_in_whole_words() {
         const WORDS: [&str; 11] = [
@@ -8928,7 +8476,6 @@ mod markdown_reader_tests {
             "Reload",
         ];
         let whole_word = |label: &str| WORDS.contains(&label);
-        // Negative control: the old glyphs and cut words are not words.
         for bad in ["‹!", "!›", "Go to…", "Run…", "F…", "…"] {
             assert!(!whole_word(bad), "{bad}");
         }
@@ -9029,9 +8576,6 @@ mod markdown_reader_tests {
                     assert_eq!(rows, 1, "{context}");
                 }
                 if problems && !conflict && width == 374.0 {
-                    // Two rows hold them where the problem pair takes its
-                    // short words, the last buttons first; the others keep
-                    // theirs.
                     assert_eq!(rows, 2, "{context}");
                     assert_eq!(
                         [
@@ -9042,7 +8586,6 @@ mod markdown_reader_tests {
                         "{context}"
                     );
                 }
-                // The host sizes the file for the toolbar the view draws.
                 let palette = if compiled
                     .semantic(&UiKey::new("editor/config-assist"))
                     .is_some()
@@ -9099,8 +8642,6 @@ mod markdown_reader_tests {
                         .any(|hit| { hit.key.as_str() == key && hit.action.as_str() == action })
                 );
             }
-            // Plain words on glass, never Emacs chords, and whole: the bar
-            // flows into rows rather than cutting a label.
             let painted = |key: &str| {
                 compiled
                     .paint
@@ -9251,8 +8792,6 @@ mod markdown_reader_tests {
         use crate::native_appearance::{
             AppearancePreferences, current_preferences, install_preferences,
         };
-        // Native appearance and chrome fonts already use the existing per-test
-        // thread-local host seam. Restore it even if an assertion fails.
         struct RestoreAppearance(AppearancePreferences);
         impl Drop for RestoreAppearance {
             fn drop(&mut self) {
@@ -9329,8 +8868,6 @@ mod markdown_reader_tests {
                     crate::widget::TextWeight::Regular,
                 ) + 1.0
                     > node.rect.width - 72.0;
-                // None means the end of marked text; its visible Z advance is a
-                // negative control for accidentally discarding the middle byte.
                 view.preedit_caret = None;
                 let at_end = app
                     .view(&view, &cx(viewport, Some(&snapshot)))

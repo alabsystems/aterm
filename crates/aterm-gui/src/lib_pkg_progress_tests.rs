@@ -844,7 +844,7 @@ fn the_tailer_reports_a_siblings_advance_at_finish() {
     // A refresh that always differs from the baseline: the stamp is whole
     // seconds, so `pkg_unix_now()` here would usually rewrite the same value
     // and the negative control would compare an unchanged file.
-    file.heartbeat_unix += 1;
+    file.heartbeat_unix = (file.heartbeat_unix + 1).max(pkg_unix_now());
     write(&file);
     assert!(
         !idle.finish(),
@@ -852,6 +852,8 @@ fn the_tailer_reports_a_siblings_advance_at_finish() {
     );
     // The idle tailer is joined, so everything it posted is queued already.
     while rx.try_recv().is_ok() {}
+    file.heartbeat_unix = file.heartbeat_unix.max(pkg_unix_now());
+    write(&file);
     let sender = tx;
     let busy = PkgProgressTailer::spawn(
         layout.clone(),

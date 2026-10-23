@@ -1,11 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The Autopilot menu (`docs/DESIGN-harness-autopilot-2026-10-15.md`
-//! §9.3.3, §9.3.8): the model's rows under each posture, the geometry, the
-//! hit test and keys, the paint, the accessibility node, `controls
-//! autopilot-menu`, and the menu on a real footer — opened from its chip,
-//! acting, and closing at the first frame whose glass no longer shows it.
+//! The Autopilot menu (`docs/DESIGN-harness-autopilot-2026-10-15.md` §9.3.3, §9.3.8): the model's rows under each posture, the geometry, the hit test and keys, the paint, the accessibility node, `controls autopilot-menu`, and the menu on a real footer — opened from its chip, acting, and closing at the first frame whose glass no longer shows it.
 
 use std::time::Instant;
 
@@ -56,12 +52,6 @@ fn item(rows: &[MenuRow], key: &str) -> MenuRow {
 }
 
 /// THE MODEL UNDER EACH POSTURE (§9.3.3). Carrying a mode: the three modes,
-/// the effective one checked; 1 h, 2 h and 4 h; until `[harness] land_at`
-/// only where it is set; the cancel only while a timer is armed, naming its
-/// time (and its weekday on another day); Settings — every choice on.
-/// NEGATIVE CONTROLS: under the master switch or with no host the mode and
-/// timer rows are there but disabled under `harness off in Settings`,
-/// nothing is checked, and only Settings acts.
 #[test]
 fn the_menus_rows_follow_the_posture_the_offer_and_the_timer() {
     let rows = rows(&facts(AutopilotView::Cruise));
@@ -118,7 +108,6 @@ fn the_menus_rows_follow_the_posture_the_offer_and_the_timer() {
         assert_eq!(item(&rows, key).text(), text);
     }
 
-    // Land checked under Land; the offer and the cancel where they apply.
     let mut f = facts(AutopilotView::Land);
     f.land_at = offer(18, 0, None);
     f.armed_at_ms = Some(1_792_177_200_000);
@@ -135,8 +124,6 @@ fn the_menus_rows_follow_the_posture_the_offer_and_the_timer() {
         item(&rows, "autopilot-menu/land-at").text(),
         "\u{221e}\u{2913} Cruise until 18:00, then land"
     );
-    // Today's 18:00 passed, the offer arms Saturday's, and says so as the
-    // state line will (D6).
     let mut later = f.clone();
     later.land_at = offer(18, 0, Some(Weekday::Sat));
     let MenuRow::Item { label, spoken, .. } = item(&super::rows(&later), "autopilot-menu/land-at")
@@ -185,7 +172,6 @@ fn the_menus_rows_follow_the_posture_the_offer_and_the_timer() {
             }
         }
     }
-    // Every spoken label is words: no glyph.
     for row in super::rows(&f) {
         if let MenuRow::Item { spoken, .. } = row {
             assert!(
@@ -199,12 +185,6 @@ fn the_menus_rows_follow_the_posture_the_offer_and_the_timer() {
 }
 
 /// UNDER THE AGENT'S OWN SWITCH (§10.2.1, §10.2.7): the menu says why its
-/// rows are off as the chip's title does, by the switch's Settings label —
-/// `Supervise Claude Code sessions is off` (a codex-alab tab's `Watch
-/// codex-alab sessions is off`) — never the master switch's words, and,
-/// as under the master switch, only Settings acts and nothing is checked.
-/// NEGATIVE CONTROL: the master switch and no host still read `harness off in
-/// Settings`, so the note follows the view, not a fixed line.
 #[test]
 fn under_an_agents_own_switch_the_menu_names_that_switch() {
     use aterm_phase::Program;
@@ -248,12 +228,6 @@ fn under_an_agents_own_switch_the_menu_names_that_switch() {
 }
 
 /// THE PLACES KEPT (lifecycle-1, pure): rows built again under an open menu
-/// are laid into the places the shown rows hold. A row that left — the
-/// cancel, once the timer fired — leaves a blank, inert gap as wide as it
-/// was, so every remaining row keeps its index, the card its width, and
-/// `place` the very rect it gave; the keys skip the gap. NEGATIVE CONTROL: a
-/// row that arrives has no place (`None`: the card is laid out afresh), and
-/// rows that did not move are laid as they were.
 #[test]
 fn rows_built_again_keep_their_places_and_a_row_that_left_leaves_a_gap() {
     let armed = MenuFacts {
@@ -292,9 +266,6 @@ fn rows_built_again_keep_their_places_and_a_row_that_left_leaves_a_gap() {
 }
 
 /// THE GEOMETRY: above the chip with its left edge at the chip's column;
-/// shifted left only to stay whole; below only where it is not whole above;
-/// over the chip's row, whole, where neither side holds it; its first rows
-/// where the frame is shorter than it; none where no card fits.
 #[test]
 fn the_card_hangs_above_the_chip_and_opens_down_only_where_fewer_rows_are_above() {
     let rows = rows(&facts(AutopilotView::Cruise));
@@ -326,7 +297,6 @@ fn the_card_hangs_above_the_chip_and_opens_down_only_where_fewer_rows_are_above(
     assert_eq!(row_at(short, 2), Some(0));
     assert_eq!(row_at(short, 8), Some(6));
     assert_eq!(row_at(short, 9), None, "the bottom border");
-    // A prefix never ends on a rule: one row shorter.
     let ruled = place(&rows, (6, 0), (0..8, 0..120), (120, 8), 1).unwrap();
     assert_eq!(
         (ruled.row, ruled.h),
@@ -347,29 +317,14 @@ fn the_card_hangs_above_the_chip_and_opens_down_only_where_fewer_rows_are_above(
 }
 
 /// THE CARD STAYS IN ITS PANE, UP AND DOWN AND ACROSS (the review of
-/// v3/polish-page): within the pane's rows it hangs above
-/// the chip, opens downward only where it is not whole above, and covers
-/// the chip's row to stay whole where neither side of the pane holds it —
-/// never reaching into a pane above or below; a pane shorter than the card
-/// shows its first rows; a pane too short for the header and the three
-/// modes lends it the frame. Across, a pane narrower than the card gives up
-/// the card's padding before a cell of its words, and a place still too
-/// wide breaks at its comma, so the pane word is whole. NEGATIVE CONTROLS:
-/// the same chips in the frame alone open into the pane below or above, and
-/// at a wide pane the card keeps its padding and one header row.
 #[test]
 fn the_card_keeps_to_its_panes_rows_and_gives_up_its_padding_first() {
     let rows = rows(&facts(AutopilotView::Cruise));
     let want = rows.len() + 2;
-    // A top pane (frame rows 1..12 of 30), its chip at 10: shorter than the
-    // card, so its first rows, the last rule left off.
     let top = place(&rows, (10, 4), (1..12, 0..100), (100, 30), 1).unwrap();
     assert_eq!((top.row, top.h), (1, 10), "its pane's rows, a prefix");
     let frame = place(&rows, (10, 4), (0..30, 0..100), (100, 30), 1).unwrap();
     assert_eq!(frame.row, 11, "control: the frame alone opens it downward");
-    // A bottom pane (17..30), its chip at 24 (Claude Code's footer with
-    // rows free under it): neither side holds it, the pane does — whole,
-    // over the chip's row.
     let bottom = place(&rows, (24, 4), (17..30, 0..100), (100, 30), 1).unwrap();
     assert_eq!((bottom.row, bottom.h), (17, want), "whole in its pane");
     let frame = place(&rows, (24, 4), (0..30, 0..100), (100, 30), 1).unwrap();
@@ -378,7 +333,6 @@ fn the_card_keeps_to_its_panes_rows_and_gives_up_its_padding_first() {
         24 - want,
         "control: the frame alone, over the pane above"
     );
-    // More of the pane's rows below: below, or over the chip from the bottom.
     let low = place(&rows, (3, 4), (1..30, 0..100), (100, 30), 1).unwrap();
     assert_eq!((low.row, low.h), (4, want), "below, whole");
     let lower = place(&rows, (5, 4), (1..16, 0..100), (100, 30), 1).unwrap();
@@ -391,11 +345,8 @@ fn the_card_keeps_to_its_panes_rows_and_gives_up_its_padding_first() {
         lower.row <= 5 && 5 < lower.row + lower.h,
         "{lower:?} covers the chip"
     );
-    // Too short for the header and the modes: the frame's rows.
     let lent = place(&rows, (28, 4), (25..30, 0..100), (100, 30), 1).unwrap();
     assert_eq!((lent.row, lent.h), (28 - want, want), "lent the frame");
-    // Across: a 31-column pane (a 64-column window's right half) holds
-    // `tab 1, right pane` and every choice whole once the padding goes.
     let named = |cols: usize| MenuFacts {
         title: "Autopilot \u{b7} tab 1, right pane".to_string(),
         name: Some("\u{2733} Claude Code".to_string()),
@@ -426,7 +377,6 @@ fn the_card_keeps_to_its_panes_rows_and_gives_up_its_padding_first() {
             .any(|row| row.contains("\u{221e}\u{2913} Cruise 4 hours, then land")),
         "{painted:#?}"
     );
-    // A 29-column pane: the place breaks at its comma.
     let tighter = super::rows(&named(29));
     assert_eq!(
         tighter[..3],
@@ -436,7 +386,6 @@ fn the_card_keeps_to_its_panes_rows_and_gives_up_its_padding_first() {
             MenuRow::Name("\u{2733} Claude Code".to_string()),
         ]
     );
-    // CONTROL: a wide pane keeps the padding and one row for the place.
     let wide = super::rows(&named(100));
     assert_eq!(
         wide[0],
@@ -448,7 +397,6 @@ fn the_card_keeps_to_its_panes_rows_and_gives_up_its_padding_first() {
 }
 
 /// The hit test chooses only a shown, enabled choice; the keys step over
-/// headers, rules and disabled rows, wrapping; the key table.
 #[test]
 fn the_hit_test_and_the_keys_land_only_on_live_choices() {
     let rows = rows(&facts(AutopilotView::Cruise));
@@ -496,7 +444,6 @@ fn the_hit_test_and_the_keys_land_only_on_live_choices() {
 }
 
 /// THE PAINT: exactly the rect; the checked row's `●` flush right; a disabled
-/// row in the disabled ink; the highlighted row on its own ground.
 #[test]
 fn the_card_paints_its_rect_its_check_and_its_disabled_rows() {
     let theme = aterm_render::Theme {
@@ -534,16 +481,6 @@ fn the_card_paints_its_rect_its_check_and_its_disabled_rows() {
 }
 
 /// WHO SET IT, UNDER THE HEADER (design §11.7.1, §11.7.3, item 6): the note
-/// is one inert row under the header in the note's ink — never chosen, never
-/// lit — where it is whole in the card's room; broken at its comma onto two
-/// rows where only its halves are whole (`… from Settings ▸ Harness,` then
-/// `every session`); absent where no half is; and absent with no setter.
-/// IT GIVES WAY FIRST ([`fit_rows`]): in a pane that holds every choice only
-/// without it, or only by moving the card over its chip, the card drops the
-/// note and keeps every choice whole on its side. NEGATIVE CONTROL: the rows
-/// placed with the note in that tight pane cut the card to a prefix (the
-/// in-test check below), which `fit_rows` returning its rows untouched would
-/// ship.
 #[test]
 fn the_setters_note_is_whole_or_absent_and_gives_way_first() {
     let with = |set_by: &str, room: usize| {
@@ -580,22 +517,18 @@ fn the_setters_note_is_whole_or_absent_and_gives_way_first() {
         Some(2),
         "the first choice is lit, never the note"
     );
-    // The bulk row's words are wider than the card: two whole rows.
     let bulk = "set 14:05 from Settings \u{25b8} Harness, every session";
     assert!(display_cells(bulk) > MAX_CONTENT);
     assert_eq!(
         notes(&with(bulk, MAX_CONTENT)),
         ["set 14:05 from Settings \u{25b8} Harness,", "every session"]
     );
-    // A room no half fits: none, never a cut note.
     assert_eq!(notes(&with(bulk, 24)), Vec::<String>::new());
     assert_eq!(
         notes(&with("set 14:05 over aterm ctl", 20)),
         Vec::<String>::new()
     );
 
-    // THE NOTE GIVES WAY: the chip on the frame's last row, a tab strip of
-    // one row. Tall, the card hangs above it with the note.
     let fit = |frame_rows: usize, chip_row: usize| {
         let pane = (0..frame_rows, 0..120);
         let fitted = fit_rows(
@@ -612,14 +545,10 @@ fn the_setters_note_is_whole_or_absent_and_gives_way_first() {
     assert_eq!(kept, noted, "room for it: kept");
     assert_eq!(rect.h, noted.len() + 2, "whole");
     assert!(rect.row + rect.h <= 23, "above its chip");
-    // Twelve rows above the chip: the plain card whole above it, the noted
-    // one only over the chip — the note goes.
     let (fitted, rect) = fit(15, 13);
     assert_eq!(fitted, plain, "the note gave way");
     assert_eq!(rect.h, plain.len() + 2, "every choice whole");
     assert!(rect.row + rect.h <= 13, "still above its chip");
-    // Twelve rows in all: the plain card only over the chip, whole; with
-    // the note, a prefix.
     let (fitted, rect) = fit(13, 12);
     assert_eq!(fitted, plain);
     assert_eq!(rect.h, plain.len() + 2, "whole");
@@ -631,8 +560,6 @@ fn the_setters_note_is_whole_or_absent_and_gives_way_first() {
 }
 
 /// A headless App with a host, its session a Claude Code pane drawn with its
-/// footer (the chips' fixture in `claude_lights`): 120 columns, the facts
-/// published, the composer between its two rules.
 fn claude_app() -> (App, WindowId, u64, crate::harness_host::HostHandle) {
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
@@ -684,8 +611,6 @@ fn frame(app: &mut App, wid: WindowId) {
 }
 
 /// [`frame`], with `before_menu` run over the frame just before the menu's
-/// splice: where the overlays this frame published (the caret, the pet)
-/// stand when the card is painted over them.
 fn frame_with(app: &mut App, wid: WindowId, before_menu: impl FnOnce(&mut App)) {
     if let Some((plan, crate::VisibleContentRoute::Heterogeneous)) =
         app.active_visible_frame_layout(wid)
@@ -724,14 +649,6 @@ fn row_text(app: &App, wid: WindowId, row: usize) -> String {
 }
 
 /// THE MENU ON THE GLASS: opened from the chip (`open autopilot-menu`, as `↓`
-/// on the selected chip), it paints above it and reads back through
-/// `controls autopilot-menu` (its accessibility node:
-/// `the_open_menu_is_published_in_words_its_highlighted_row_focused`); `↓`/`↑` move the
-/// highlight and Return chooses (a timed Cruise armed, one frame each);
-/// a right-click on the chip opens it; Esc closes it. THE STALE CLOSE: at the
-/// first frame that draws a box over the composer under it (no chip on the
-/// glass), it closes. NEGATIVE CONTROL: while the chip is on the glass it
-/// stays open frame after frame.
 #[test]
 fn the_menu_opens_from_its_chip_acts_and_closes_with_the_chip() {
     let (mut app, wid, session, host) = claude_app();
@@ -774,7 +691,6 @@ fn the_menu_opens_from_its_chip_acts_and_closes_with_the_chip() {
             .contains("key=autopilot-menu/mode/cruise enabled=true checked=true selected=true")),
         "{lines:?}"
     );
-    // ↓ ↓ ↓ ↓: Cruise → Land → Off → 1 hour → 2 hours; Return arms it.
     for _ in 0..4 {
         assert!(app.autopilot_menu_nav(wid, MenuKey::Down));
     }
@@ -798,7 +714,6 @@ fn the_menu_opens_from_its_chip_acts_and_closes_with_the_chip() {
     assert_eq!(land_at, Some(wall + 3_600_000), "Cruise 1 hour, then land");
     assert!(app.chip_glass(session).land_at.is_some());
 
-    // A right-click on the chip opens it again — with the cancel row.
     frame(&mut app, wid);
     let (x, y) = app.frame_cell_centre(wid, anchor);
     assert!(app.open_autopilot_menu_at(wid, x, y));
@@ -816,13 +731,10 @@ fn the_menu_opens_from_its_chip_acts_and_closes_with_the_chip() {
     assert!(app.autopilot_menu.is_none());
     assert!(!app.autopilot_menu_nav(wid, MenuKey::Close), "nothing open");
 
-    // A key it does not own closes it and goes on.
     app.open_front_autopilot_menu().unwrap();
     assert!(!app.autopilot_menu_nav(wid, MenuKey::PassThrough));
     assert!(app.autopilot_menu.is_none());
 
-    // A FOCUS CHANGE closes it (the focus it opened under is no longer the
-    // window's), while an unchanged focus keeps it, chip and all.
     app.open_front_autopilot_menu().unwrap();
     frame(&mut app, wid);
     assert!(app.autopilot_menu.is_some(), "the same focus: it stays");
@@ -830,7 +742,6 @@ fn the_menu_opens_from_its_chip_acts_and_closes_with_the_chip() {
     frame(&mut app, wid);
     assert!(app.autopilot_menu.is_none(), "the focus moved: closed");
 
-    // THE STALE CLOSE: a box replaces the composer under the open menu.
     app.open_front_autopilot_menu().unwrap();
     frame(&mut app, wid);
     assert!(app.autopilot_menu.is_some());
@@ -848,8 +759,6 @@ fn the_menu_opens_from_its_chip_acts_and_closes_with_the_chip() {
 }
 
 /// The menu closes with its window's focus (design §9.3.3) on the controller's
-/// `focus out` too, which drives `App::on_focus` with no `WindowEvent::Focused`, as
-/// every headless drive does; a focus the window already had keeps it.
 #[test]
 fn a_controller_focus_out_closes_the_menu_as_the_os_edge_does() {
     let (mut app, wid, _session, host) = claude_app();
@@ -865,10 +774,6 @@ fn a_controller_focus_out_closes_the_menu_as_the_os_edge_does() {
 }
 
 /// A CLICK ON A ROW acts for the menu's session: a mode is written as its
-/// own word (the timer dropped, as every hand write drops it), Settings
-/// opens Settings ▸ Harness; a press on the card off a choice keeps it
-/// open; a press off the card closes it, spent. NEGATIVE CONTROL: under the
-/// master switch a mode row is disabled and a press on it writes nothing.
 #[test]
 fn a_click_on_a_row_acts_and_a_click_off_the_card_closes_it() {
     let (mut app, wid, session, host) = claude_app();
@@ -893,7 +798,6 @@ fn a_click_on_a_row_acts_and_a_click_off_the_card_closes_it() {
     };
     app.open_front_autopilot_menu().unwrap();
     frame(&mut app, wid);
-    // The header: on the card, no choice — the card stays.
     let rect = app.autopilot_menu.as_ref().unwrap().rect.unwrap();
     let (x, y) = app.frame_cell_centre(wid, (rect.row + 1, rect.col + 3));
     assert!(app.autopilot_menu_press(wid, true, x, y));
@@ -913,13 +817,11 @@ fn a_click_on_a_row_acts_and_a_click_off_the_card_closes_it() {
         (meta.autopilot.as_deref(), meta.land_at),
         (Some("off"), None)
     );
-    // Off the card: closed, nothing else.
     app.open_front_autopilot_menu().unwrap();
     frame(&mut app, wid);
     let (x, y) = app.frame_cell_centre(wid, (0, 0));
     assert!(app.autopilot_menu_press(wid, true, x, y));
     assert!(app.autopilot_menu.is_none());
-    // Under the master switch: the mode rows are off; Settings acts.
     app.harness_policy = crate::harness_policy_cell::HarnessPolicyCell::new(
         crate::app_config::HarnessPolicy::read("[harness]\nenabled = false\n"),
     );
@@ -955,13 +857,6 @@ fn a_click_on_a_row_acts_and_a_click_off_the_card_closes_it() {
 }
 
 /// THE `land_at` ROW SAYS THE DAY IT WOULD ARM (§9.3.3; the Together run's
-/// D6): at 18:49 local on a Friday, `[harness] land_at = "18:36"` has passed
-/// today, so the row reads `Cruise until Sat 18:36, then land` (the day in
-/// the zone this runs in), and choosing it arms a timer whose face says the
-/// same words the state line does; `"18:55"` is still ahead, reads `Cruise
-/// until 18:55, then land` and arms today. NEGATIVE CONTROL: the row and the
-/// armed face agree in both cases, so a row that dropped the day (the defect)
-/// fails the first and a row that always named it fails the second.
 #[test]
 fn the_land_at_row_names_the_day_it_would_arm_as_the_state_line_does() {
     let (mut app, wid, session, host) = claude_app();
@@ -1014,13 +909,6 @@ fn the_land_at_row_names_the_day_it_would_arm_as_the_state_line_does() {
 }
 
 /// A MENU HELD OPEN ACROSS THE MINUTE SAYS THE DAY FROM THAT MINUTE ON
-/// (§9.3.3; the review of the Together run's D6): opened at 18:30 on a
-/// Friday with `land_at = "18:36"`, the row reads `18:36` and owes ONE wake,
-/// at 18:36; there its words turn to `Sat 18:36` (what a press arms now), and
-/// the next wake is local midnight, where they turn back to `18:36` (today is
-/// Saturday). A pass of the loop short of the turn builds nothing. NEGATIVE
-/// CONTROL: a closed menu owes no wake, and the next pass drops the note, so
-/// idle stays at zero work.
 #[test]
 fn a_menu_held_open_across_the_minute_names_the_day_from_then_on() {
     let (mut app, wid, _session, host) = claude_app();
@@ -1086,7 +974,6 @@ fn a_menu_held_open_across_the_minute_names_the_day_from_then_on() {
     frame(&mut app, wid);
     assert!(row(&app).ends_with(&says("18:36")), "{}", row(&app));
 
-    // NEGATIVE CONTROL: closed, nothing is owed.
     assert!(app.close_autopilot_menu());
     assert_eq!(
         app.autopilot_offer_deadline(),
@@ -1100,12 +987,6 @@ fn a_menu_held_open_across_the_minute_names_the_day_from_then_on() {
 }
 
 /// THE MENU'S NAME DROPS THE AGENT'S SPINNER FRAME (the Together run's
-/// D7): built once at the open, it names the tab by the agent's title
-/// without the frame it froze (`⠦ Add tested …` reads `Add tested …`).
-/// The title arrives as the agent sends it, an OSC title into its pane's
-/// terminal: the menu reads the page's source (`harness_session_name`),
-/// not the store's copy only the front pane's window title writes.
-/// NEGATIVE CONTROL: Claude Code's rest mark `✳` stays.
 #[test]
 fn the_menus_name_drops_the_agents_spinner_frame() {
     let (mut app, wid, session, host) = claude_app();
@@ -1129,7 +1010,6 @@ fn the_menus_name_drops_the_agents_spinner_frame() {
             .process(format!("\x1b]2;{title}\x07").as_bytes());
         app.open_front_autopilot_menu()
             .expect("the chip is on the glass");
-        // The name ends the header's row, or has the row under it.
         let labels: Vec<String> = app
             .autopilot_menu_controls()
             .into_iter()
@@ -1183,12 +1063,6 @@ fn chip_cell(app: &App, wid: WindowId, session: u64) -> (usize, usize) {
 }
 
 /// THE POINTER, through the real mouse path (`on_cursor_moved`,
-/// `on_mouse_input`): a RIGHT press on the Autopilot chip opens the menu hung
-/// from it, no row lit, and cycles nothing; the pointer over a row lights it;
-/// a left press there chooses it (Off, written as the session's word) and
-/// closes; a right press reopens it, and a press off the card closes it and
-/// acts on nothing under it. NEGATIVE CONTROL: a LEFT press on the chip still
-/// cycles the word, as in v1, and opens no menu.
 #[test]
 fn the_pointer_opens_the_menu_from_the_chip_and_chooses_a_row() {
     use aterm_window::event::{ElementState, MouseButton};
@@ -1230,7 +1104,6 @@ fn the_pointer_opens_the_menu_from_the_chip_and_chooses_a_row() {
     app.on_mouse_input(wid, ElementState::Released, MouseButton::Left);
     assert!(app.autopilot_menu.is_none(), "chosen and closed");
     assert_eq!(word(&app).as_deref(), Some("off"));
-    // Reopened, then a press off the card: closed, nothing chosen.
     frame(&mut app, wid);
     let chip = chip_cell(&app, wid, session);
     let (x, y) = app.frame_cell_centre(wid, chip);
@@ -1247,7 +1120,6 @@ fn the_pointer_opens_the_menu_from_the_chip_and_chooses_a_row() {
         "a press off the card closes it"
     );
     assert_eq!(word(&app).as_deref(), Some("off"), "and is spent on that");
-    // NEGATIVE CONTROL: with no menu open, a left press on the chip cycles.
     frame(&mut app, wid);
     app.on_mouse_input(wid, ElementState::Pressed, MouseButton::Left);
     app.on_mouse_input(wid, ElementState::Released, MouseButton::Left);
@@ -1257,11 +1129,6 @@ fn the_pointer_opens_the_menu_from_the_chip_and_chooses_a_row() {
 }
 
 /// THE KEYBOARD (macOS: `ctrl+shift+tab` selects the chips): with the
-/// Autopilot chip selected, `↓` opens the menu, its first choice lit; `↓`
-/// steps, Return chooses; shift+F10 opens it too; Esc closes it; a key it
-/// does not own closes it and goes on to the pane. A controller's `key` moves
-/// it as a hand does (`App::input`). NEGATIVE CONTROL: `↓` with no chip
-/// selected opens nothing.
 #[cfg(target_os = "macos")]
 #[test]
 fn the_keyboard_opens_the_menu_from_the_selected_chip() {
@@ -1310,7 +1177,6 @@ fn the_keyboard_opens_the_menu_from_the_selected_chip() {
         None,
     );
     assert!(app.autopilot_menu.is_none(), "Esc closes it");
-    // shift+F10 opens it; a letter closes it and goes on.
     select(&mut app);
     frame(&mut app, wid);
     app.windows.get_mut(&wid).unwrap().mods = ModifiersState::SHIFT;
@@ -1325,7 +1191,6 @@ fn the_keyboard_opens_the_menu_from_the_selected_chip() {
         Some("x"),
     );
     assert!(app.autopilot_menu.is_none(), "a letter closes it");
-    // The controller's keys: `key down`, `key down`, `key enter` → Land now.
     app.open_front_autopilot_menu().unwrap();
     frame(&mut app, wid);
     let key = |name: aterm_types::keyboard::NamedKey| crate::input::InputEvent::Key {
@@ -1361,7 +1226,6 @@ fn pair(app: &App, session: u64) -> (Option<String>, Option<i64>) {
 }
 
 /// `meta <rest>` over the wire on `session`, as the dispatch arm runs it:
-/// stored, its `MetaChanged` still in flight (not applied).
 fn wire(app: &App, session: u64, rest: &str) {
     let entry = app.pool.get(session).unwrap();
     let (term, ctx) = (entry.term.clone(), entry.ctx.clone());
@@ -1379,18 +1243,6 @@ fn row_of(app: &App, key: &str) -> Option<usize> {
 }
 
 /// AN OPEN MENU NEVER GOES STALE, AND ITS CANCEL NEVER WRITES OVER A HAND
-/// (review of slice B). The menu's rows are built again whenever
-/// its session's pair moves under it — a wire `meta set autopilot off` once
-/// its wake lands, the timer's own fire — so its `●` and its cancel row say
-/// what is stored; a lit row whose words went dark is unlit, and Return then
-/// closes the menu without acting. The cancel is a compare-and-set on the
-/// store: with a wire write stored and its wake still in flight, choosing the
-/// row the open menu still shows writes nothing — over `off`, or over a new
-/// arm at another instant than the one the row named.
-///
-/// RED before the fix: the open menu kept `mode/cruise checked=true` and
-/// `Cancel landing at …` after a wire Off, and choosing that row stored
-/// `cruise` over the Off (and over the timer's `land`).
 #[test]
 fn an_open_menu_follows_its_session_and_its_cancel_never_writes_over_a_hand() {
     let (mut app, wid, session, host) = claude_app();
@@ -1401,7 +1253,6 @@ fn an_open_menu_follows_its_session_and_its_cancel_never_writes_over_a_hand() {
     let cancel = "autopilot-menu/land-cancel";
     let lines = |app: &App| app.autopilot_menu_controls().join("\n");
 
-    // A wire Off whose wake lands under the open menu: rebuilt.
     assert!(app.choose_autopilot_timer(
         session,
         crate::autopilot_timers::TimerChoice::In(120),
@@ -1438,8 +1289,6 @@ fn an_open_menu_follows_its_session_and_its_cancel_never_writes_over_a_hand() {
         "and acted on nothing"
     );
 
-    // A wire Off stored, its wake in flight: the cancel the menu still shows
-    // writes nothing.
     assert!(app.choose_autopilot_timer(
         session,
         crate::autopilot_timers::TimerChoice::In(120),
@@ -1457,8 +1306,6 @@ fn an_open_menu_follows_its_session_and_its_cancel_never_writes_over_a_hand() {
         "the hand wins"
     );
 
-    // A new arm stored at another instant, its wake in flight: the cancel
-    // names the old one, and drops nothing.
     assert!(app.choose_autopilot_timer(
         session,
         crate::autopilot_timers::TimerChoice::In(60),
@@ -1475,7 +1322,6 @@ fn an_open_menu_follows_its_session_and_its_cancel_never_writes_over_a_hand() {
         "the new arm stands"
     );
     app.on_meta_changed(session);
-    // … and the cancel for the instant shown drops it.
     frame(&mut app, wid);
     app.open_front_autopilot_menu().unwrap();
     let at = row_of(&app, cancel).expect("offered");
@@ -1486,7 +1332,6 @@ fn an_open_menu_follows_its_session_and_its_cancel_never_writes_over_a_hand() {
         "cancelled"
     );
 
-    // The timer fires under the open menu: rebuilt, Land checked, no cancel.
     assert!(app.choose_autopilot_timer(
         session,
         crate::autopilot_timers::TimerChoice::In(60),
@@ -1507,8 +1352,6 @@ fn an_open_menu_follows_its_session_and_its_cancel_never_writes_over_a_hand() {
         "{shown}"
     );
     assert!(!shown.contains(cancel), "{shown}");
-    // NEGATIVE CONTROLS: a cancel with no timer stored writes nothing, over
-    // `land`, `off` or a bare Cruise.
     let cancel_now = |app: &mut App| {
         app.choose_autopilot_timer(
             session,
@@ -1537,21 +1380,6 @@ fn an_open_menu_follows_its_session_and_its_cancel_never_writes_over_a_hand() {
 }
 
 /// THE OPEN MENU IS PUBLISHED IN WORDS, ITS HIGHLIGHTED ROW FOCUSED (design
-/// §9.2.1, §9.3.3): the tree the window publishes (`App::grid_a11y_tree`,
-/// what `push_a11y_tree` hands the adapter) holds, once a frame has painted
-/// the menu, one `Role::Menu` named in words (`Autopilot, tab 1…`) with one
-/// item per choice the card shows, each in words — Cruise, Land now and Off
-/// radios, the session's mode checked; the timed Cruises and Harness
-/// settings plain items — over the card's cells, and the tree's focus on the
-/// highlighted row, which follows `↓`. A reader's click on an item does what
-/// a click on its row does (Land now, written as the session's word). Under
-/// the master switch the menu's name says `harness off in Settings`, the
-/// mode and timer rows are disabled and offered no click, and a reader's
-/// click on one writes nothing.
-///
-/// NEGATIVE CONTROL: with no menu open — before it opens, opened but not yet
-/// painted, and after it closes — no menu node is published and the focus
-/// is the grid's.
 #[cfg(a11y_tree)]
 #[test]
 fn the_open_menu_is_published_in_words_its_highlighted_row_focused() {
@@ -1579,7 +1407,6 @@ fn the_open_menu_is_published_in_words_its_highlighted_row_focused() {
     let (mut app, wid, session, host) = claude_app();
     let _host = MenuTestHost(host);
     frame(&mut app, wid);
-    // NEGATIVE CONTROL: no menu.
     let bare = app.grid_a11y_tree(wid, None).expect("the grid's tree");
     assert!(menu_nodes(&bare).is_empty(), "no menu, no menu node");
     assert_eq!(crate::a11y_tree::menu_item_for(bare.focus), None);
@@ -1650,7 +1477,6 @@ fn the_open_menu_is_published_in_words_its_highlighted_row_focused() {
             assert_eq!(n.toggled(), None, "{label}");
         }
     }
-    // Over the card's cells: the card's rows, each item on its own row.
     if let (Some(menu_box), Some(first)) = (menu.bounds(), items[0].1.bounds()) {
         let cell_h = (menu_box.y1 - menu_box.y0) / rect.h as f64;
         assert!(
@@ -1658,14 +1484,11 @@ fn the_open_menu_is_published_in_words_its_highlighted_row_focused() {
             "Cruise is the card's third row"
         );
     }
-    // The focus is the highlighted row (a keyboard open lights Cruise), and
-    // follows `↓`.
     assert_eq!(tree.focus, items[0].0, "the highlighted row: Cruise");
     assert!(app.autopilot_menu_nav(wid, MenuKey::Down));
     frame(&mut app, wid);
     let stepped = app.grid_a11y_tree(wid, None).unwrap();
     assert_eq!(stepped.focus, items[1].0, "↓: Land now");
-    // A reader's click on Land now chooses it, and the menu leaves the tree.
     app.on_accessibility_action(
         wid,
         ActionRequest {
@@ -1682,8 +1505,6 @@ fn the_open_menu_is_published_in_words_its_highlighted_row_focused() {
     let closed = app.grid_a11y_tree(wid, None).unwrap();
     assert!(menu_nodes(&closed).is_empty(), "closed: no menu node");
     assert_eq!(crate::a11y_tree::menu_item_for(closed.focus), None);
-    // Under the master switch: named so, the mode and timer rows disabled,
-    // and a reader's click on one writes nothing.
     app.harness_policy = crate::harness_policy_cell::HarnessPolicyCell::new(
         crate::app_config::HarnessPolicy::read("[harness]\nenabled = false\n"),
     );
@@ -1737,7 +1558,6 @@ fn the_open_menu_is_published_in_words_its_highlighted_row_focused() {
 }
 
 /// The open menu's items as window `wid` publishes them (`App::grid_a11y_tree`):
-/// each item's id and its words, top down; empty with no menu node.
 #[cfg(a11y_tree)]
 fn published_items(app: &App, wid: WindowId) -> Vec<(aterm_a11y::model::NodeId, String)> {
     let Some(tree) = app.grid_a11y_tree(wid, None) else {
@@ -1779,18 +1599,6 @@ fn reader(
 }
 
 /// A READER'S CLICK HEARD FROM ROWS THAT MOVED CHOOSES NOTHING.
-/// Each item's id carries the
-/// epoch of the rows it was published from, so a click from a tree built
-/// before a timer was armed over the wire under the open menu — which puts
-/// its cancel where `Harness settings` stood — is refused before the frame
-/// that paints the new rows AND after it, and the armed timer stands. A
-/// click on a row a card cut short no longer shows is refused; another
-/// window publishes no menu node and its request for this menu's item is
-/// nothing. POSITIVE CONTROL: the new tree's own cancel acts.
-///
-/// RED before the fix: ids were positions, so the old tree's `Harness
-/// settings` (item 6) chose the new item 6 — the cancel — and dropped the
-/// timer someone had just armed; Settings never opened.
 #[cfg(a11y_tree)]
 #[test]
 fn a_readers_click_heard_from_rows_that_moved_chooses_nothing() {
@@ -1812,7 +1620,6 @@ fn a_readers_click_heard_from_rows_that_moved_chooses_nothing() {
     let settings = named(&heard, "Harness settings");
     assert_eq!(heard.last().map(|(id, _)| *id), Some(settings), "{heard:?}");
 
-    // The rows move under the open menu: a timer armed over the wire.
     wire(&app, session, "set autopilot cruise until=+4h");
     app.on_meta_changed(session);
     let armed = pair(&app, session);
@@ -1824,15 +1631,12 @@ fn a_readers_click_heard_from_rows_that_moved_chooses_nothing() {
         row_of(&app, "autopilot-menu/land-cancel").is_some(),
         "rebuilt"
     );
-    // Before the frame that paints them: refused.
     reader(&mut app, wid, Action::Click, settings);
     assert!(
         app.autopilot_menu.is_some(),
         "unpainted rows: nothing chosen"
     );
     assert_eq!(pair(&app, session), armed, "the timer stands");
-    // After it: the cancel stands where Settings stood, and the old id is
-    // still refused.
     frame(&mut app, wid);
     let now = published_items(&app, wid);
     assert_eq!(now.len(), heard.len() + 1, "{now:?}");
@@ -1853,15 +1657,11 @@ fn a_readers_click_heard_from_rows_that_moved_chooses_nothing() {
     assert_eq!(pair(&app, session), armed, "the timer someone armed stands");
 
     let cancel = named(&now, "Cancel landing");
-    // Another window publishes no menu node, and its request for this
-    // menu's item is nothing.
     let other = WindowId(wid.0 + 1);
     assert!(app.autopilot_grid_menu(other).is_none());
     reader(&mut app, other, Action::Click, cancel);
     assert!(app.autopilot_menu.is_some(), "another window's: nothing");
     assert_eq!(pair(&app, session), armed);
-    // A card a short frame cuts to its first rows (the header, Cruise and
-    // Land now) shows no cancel: a click on it is refused.
     {
         let menu = app.autopilot_menu.as_mut().unwrap();
         let rect = menu.rect.expect("painted");
@@ -1874,7 +1674,6 @@ fn a_readers_click_heard_from_rows_that_moved_chooses_nothing() {
     );
     assert_eq!(pair(&app, session), armed);
 
-    // POSITIVE CONTROL: the new tree's own cancel, on the card it painted.
     frame(&mut app, wid);
     assert_eq!(
         published_items(&app, wid),
@@ -1891,14 +1690,6 @@ fn a_readers_click_heard_from_rows_that_moved_chooses_nothing() {
 }
 
 /// A READER OPENS THE MENU FROM THE CHIP (design §9.3.3):
-/// the Autopilot
-/// chip's node says it has a menu (`HasPopup::Menu`) and offers
-/// `ShowContextMenu`, which opens it as the keyboard does — its first
-/// choice lit — so once a frame has painted it the tree's focus is Cruise.
-/// NEGATIVE CONTROLS: the chip's Click still cycles the mode and opens no
-/// menu (the Team chip, which offers none, is `a11y_tree`'s control); a
-/// request for a chip the glass no longer shows (a box covered the
-/// composer) opens none.
 #[cfg(a11y_tree)]
 #[test]
 fn a_reader_opens_the_menu_from_the_autopilot_chip() {
@@ -1920,7 +1711,6 @@ fn a_reader_opens_the_menu_from_the_autopilot_chip() {
     assert!(node.supports_action(Action::ShowContextMenu));
     assert!(node.supports_action(Action::Click));
 
-    // NEGATIVE CONTROL: a Click cycles the mode and opens no menu.
     let before = pair(&app, session).0;
     reader(&mut app, wid, Action::Click, autopilot);
     assert!(app.autopilot_menu.is_none(), "a click opens no menu");
@@ -1928,12 +1718,9 @@ fn a_reader_opens_the_menu_from_the_autopilot_chip() {
     assert!(after.is_some() && after != before, "{before:?} → {after:?}");
     frame(&mut app, wid);
 
-    // ShowContextMenu opens it, its first choice lit and, painted, focused.
     reader(&mut app, wid, Action::ShowContextMenu, autopilot);
     let menu = app.autopilot_menu.as_ref().expect("opened");
     assert_eq!(menu.session, session);
-    // The first choice, under the header and the note the click's own word
-    // brought (`set … from the chip`, §11.7.1).
     assert!(
         matches!(menu.rows.get(1), Some(MenuRow::SetBy { text, .. }) if text.ends_with(" from the chip")),
         "{:?}",
@@ -1952,8 +1739,6 @@ fn a_reader_opens_the_menu_from_the_autopilot_chip() {
     assert_eq!(pair(&app, session).0, after, "opening writes nothing");
     assert!(app.autopilot_menu_nav(wid, MenuKey::Close));
 
-    // NEGATIVE CONTROL: the chip covered by a box — the glass no longer
-    // shows it — opens nothing.
     feed(
         &app,
         session,
@@ -1980,8 +1765,6 @@ impl Drop for MenuTestHost {
 }
 
 /// THE MIXED TAB: Settings split beside a stub terminal pane that runs
-/// Claude Code's composer (its footer facts, its bottom block), framed once
-/// on the heterogeneous route. The terminal pane's session.
 fn beside_settings(app: &mut App, wid: WindowId) -> u64 {
     assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Home));
     assert!(app.apply_term_resize(wid, 60, 120));
@@ -2031,8 +1814,6 @@ fn beside_settings(app: &mut App, wid: WindowId) -> u64 {
 }
 
 /// macOS secondary activation has the same meaning on terminal-only and
-/// heterogeneous tabs; an ordinary press still cycles, and a non-chip does not
-/// open the menu. All hits come from an actual composed frame.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_control_click_opens_the_menu_in_terminal_and_mixed_tabs() {
@@ -2101,7 +1882,6 @@ fn a_control_click_opens_the_menu_in_terminal_and_mixed_tabs() {
 }
 
 /// An elapsed duration is valid even when its timezone face cannot be read.
-/// Its raw stored instant still offers Cancel, including the existing CAS fence.
 #[test]
 fn an_armed_timer_can_be_cancelled_without_a_local_time_face() {
     use crate::autopilot_timers::{TimerChoice, When, resolve};
@@ -2111,7 +1891,6 @@ fn an_armed_timer_can_be_cancelled_without_a_local_time_face() {
     let wall = 1_792_177_200_000_i64;
     crate::autopilot_timers::set_fake_clocks(Some((mono, wall)));
     frame(&mut app, wid);
-    // Ordinary localized control before the unavailable-zone case.
     assert!(app.choose_autopilot_timer(
         session,
         TimerChoice::In(60),
@@ -2147,7 +1926,6 @@ fn an_armed_timer_can_be_cancelled_without_a_local_time_face() {
         app.autopilot_menu.as_ref().unwrap().cancels,
         Some(resolved.at_ms)
     );
-    // A hand-stored later arm, whose wake is still queued, wins over the old row.
     wire(&app, session, "set autopilot cruise until=+4h");
     app.choose_autopilot_menu_row(cancel);
     assert_eq!(
@@ -2168,7 +1946,6 @@ fn an_armed_timer_can_be_cancelled_without_a_local_time_face() {
 }
 
 /// A mode offered under an earlier policy is not permission to write after the
-/// master switch is turned off. The enabled-policy choice is a positive control.
 #[test]
 fn a_menu_opened_before_the_master_switch_went_off_cannot_write_a_mode() {
     let (mut app, wid, session, host) = claude_app();
@@ -2204,10 +1981,6 @@ fn a_menu_opened_before_the_master_switch_went_off_cannot_write_a_mode() {
 }
 
 /// A cancel's reader identity follows its exact stored instant, even when
-/// the local face cannot be read or two instants share one HH:MM face.
-/// The actual owned-menu refresh keeps those equal rows painted; only the
-/// authority the cancel names moved. Highlight-only and equal-timer refresh
-/// controls precede both observations. No App, clock override or host.
 #[cfg(a11y_tree)]
 #[test]
 fn a_readers_cancel_identity_tracks_its_exact_timer_when_the_face_stays() {
@@ -2261,10 +2034,6 @@ fn a_readers_cancel_identity_tracks_its_exact_timer_when_the_face_stays() {
         );
         assert_eq!(menu.rect, Some(rect), "equal rows remain painted");
 
-        // Ordinary changed rows still invalidate paint and change identity:
-        // here a row the card did not have, so the shown rows cannot keep
-        // their places (lifecycle-1; Land's own rows keep Cruise's places and
-        // width, so they alone would leave the card painted, as they should).
         let mut ordinary = menu.clone();
         let mut land = f.clone();
         land.view = AutopilotView::Land;
@@ -2274,8 +2043,6 @@ fn a_readers_cancel_identity_tracks_its_exact_timer_when_the_face_stays() {
         assert_eq!(ordinary.rect, None);
         assert_ne!(ordinary.a11y_epoch(), heard, "ordinary row-change control");
 
-        // Replacement timer, equal visible rows: exercise the same refresh
-        // the real App calls, rather than assigning its cancel field here.
         f.armed_at_ms = Some(SECOND);
         let fresh = rows(&f);
         assert_eq!(fresh, menu.rows, "neither the labels nor choices moved");
@@ -2292,10 +2059,6 @@ fn a_readers_cancel_identity_tracks_its_exact_timer_when_the_face_stays() {
 }
 
 /// THE MENU'S HEADER NAMES ITS PANE (hunt surfaces-F1, design §10.3.1):
-/// two Claude Code panes of one tab open menus whose headers read apart —
-/// `Autopilot · tab 1, left pane` and `…, right pane` — in the words the
-/// SESSIONS rows use, read headless from the session's own place.
-/// NEGATIVE CONTROL: one Claude Code beside a shell names no pane.
 #[test]
 fn the_menus_header_names_its_pane_where_two_agents_share_a_tab() {
     let mut app = App::headless_for_test();
@@ -2329,17 +2092,12 @@ fn the_menus_header_names_its_pane_where_two_agents_share_a_tab() {
 }
 
 /// A Claude Code | Claude Code split of one tab (side by side, or one above
-/// the other: `dir`) in a window `rows` × `cols`, both panes drawn with their
-/// composer and their footer's facts and named by the agent's own title
-/// (`✳ Claude Code`), the second pane focused: the app, the window, the
-/// first and second sessions and the host.
 fn claude_split(
     (rows, cols): (u16, u16),
     dir: crate::pane::SplitDir,
 ) -> (App, WindowId, u64, u64, crate::harness_host::HostHandle) {
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
-    // False where the window is that size already (80 × 24).
     app.apply_term_resize(wid, rows, cols);
     assert_eq!(
         app.windows.get(&wid).map(|ws| (ws.rows, ws.cols)),
@@ -2387,26 +2145,6 @@ fn claude_split(
 }
 
 /// THE MENU KEEPS ITS SESSION'S NAME WHOLE AND STAYS IN ITS PANE (behaviour-3 and owner-eye-5):
-/// in a
-/// Claude Code | Claude Code split, side by side or one above the other,
-/// each pane's menu names its pane — `tab 1, right pane` whole, broken at
-/// its comma where the pane cannot hold it on one row — and `“✳ Claude
-/// Code”` whole, on the row under the place where the card cannot hold both
-/// on one. The card is drawn inside its own pane's rows and columns, and
-/// every cell of the other pane is as it was: as wide as its choices ask
-/// where the pane holds that, its choices whole; as narrow as the pane where
-/// it does not, however narrow, its side margins given up first (so `Cruise
-/// 4 hours, then land` is whole in a 31-column pane) and then the ends of
-/// its rows (a 23-column pane, the right half of 48 columns, still says
-/// `Cruise 4 hours` and the name whole); as tall as the pane where the pane
-/// is shorter than it, its first rows. NEGATIVE CONTROLS: before the fix the
-/// header was one row cut at the card's ceiling
-/// (`…tab 1, right pane “✳ Claude Cod…`), the right pane's card at a narrow
-/// window was shifted left over the left pane, a stacked pane's card opened
-/// over the other pane, a 31-column pane cut `right p…` and `then la…`, and
-/// (the review of v3/polish-page's fixes) a pane under 26 columns
-/// lent its card the frame: 26 columns over the divider and the next pane,
-/// its choices cut all the same.
 #[test]
 fn the_menu_keeps_its_name_whole_and_stays_in_its_pane() {
     use crate::pane::SplitDir;
@@ -2481,7 +2219,6 @@ fn the_menu_keeps_its_name_whole_and_stays_in_its_pane() {
             let shown: Vec<String> = (rect.row + 1..rect.row + rect.h - 1)
                 .map(|row| cells(&app, wid, row, rect.col..rect.col + rect.w))
                 .collect();
-            // The header rows (and the modes) are first: always shown.
             assert!(
                 shown
                     .iter()
@@ -2506,7 +2243,6 @@ fn the_menu_keeps_its_name_whole_and_stays_in_its_pane() {
                     "{context}: {mode} shown: {shown:?}"
                 );
             }
-            // However narrow the pane, a timed Cruise it shows says how long.
             for (key, span) in [
                 ("autopilot-menu/land-in/60", "Cruise 1 hour"),
                 ("autopilot-menu/land-in/240", "Cruise 4 hours"),
@@ -2520,7 +2256,6 @@ fn the_menu_keeps_its_name_whole_and_stays_in_its_pane() {
                     );
                 }
             }
-            // The card is whole wherever the pane holds it, else its prefix.
             let want = menu.rows.len() + 2;
             if rows.len() >= want {
                 assert_eq!(rect.h, want, "{context}: whole");
@@ -2531,8 +2266,6 @@ fn the_menu_keeps_its_name_whole_and_stays_in_its_pane() {
             } else {
                 assert!(rect.h < want, "{context}: a prefix {rect:?}");
             }
-            // The choices keep their width wherever the pane holds it,
-            // inside the card's borders.
             let longest = "\u{221e}\u{2913} Cruise 4 hours, then land";
             let four = row_of(&app, "autopilot-menu/land-in/240").expect("the 4 h row");
             if let Some(text) = shown.get(four)
@@ -2555,18 +2288,12 @@ fn the_menu_keeps_its_name_whole_and_stays_in_its_pane() {
 }
 
 /// THE MENU'S `Harness settings…` LANDS THE PAGE ON ITS SESSION'S ROW
-/// (§10.3.3 item 8; the review of v3/stats-fold): chosen with a
-/// click on the menu of Claude Code's tab, it opens Settings ▸ Harness
-/// landed on that session — its row's Show drawn selected, and no other
-/// row's. NEGATIVE CONTROL: before the choice, the page opened at its top
-/// is landed nowhere.
 #[test]
 fn the_menus_harness_settings_lands_the_page_on_its_sessions_row() {
     use crate::app_introspect::AuxTarget;
     use crate::harness_screen::HarnessFocus;
     use crate::native_settings::SettingsRoute;
     let (mut app, wid, session, host) = claude_app();
-    // The page lists both as Claude Code's: their programs read.
     app.pool
         .get(session)
         .expect("session")
@@ -2593,7 +2320,6 @@ fn the_menus_harness_settings_lands_the_page_on_its_sessions_row() {
             .iter()
             .any(|l| l.starts_with(&show) && l.contains("selected:true"))
     };
-    // CONTROL: the top door.
     assert!(app.open_harness_settings(wid, HarnessFocus::Top));
     assert_eq!(landed(&app), Some(HarnessFocus::Top));
     assert!(!selected(&app, session) && !selected(&app, other));
@@ -2623,11 +2349,6 @@ fn the_menus_harness_settings_lands_the_page_on_its_sessions_row() {
 }
 
 /// THE MENU'S CARD IS THE PET'S OVERLAY, NOT ITS GROUND (review of
-/// owner-eye-6, lab `rv-day-menu`): the splice notes the card apart from the
-/// chrome (`PetChrome::note_overlay`), so the pet's rest seat is solved
-/// without it and opening the menu sends the sleeping cat nowhere; closing
-/// it clears the overlay. NEGATIVE CONTROL (as run, failing this test): the
-/// card noted as chrome (`PetChrome::note`), it is ground.
 #[test]
 fn the_open_menus_card_is_the_pets_overlay_not_its_ground() {
     let (mut app, wid, _session, host) = claude_app();
@@ -2662,14 +2383,6 @@ fn the_open_menus_card_is_the_pets_overlay_not_its_ground() {
 }
 
 /// THE CARD IS ON TOP OF THE CARET AND THE PET (surfaces-F3): an open menu
-/// is painted after the frame published its overlays, so the composer's
-/// caret under it and the resident pet sitting where it opened would paint
-/// over its rows. On a terminal tab and on a mixed one (Settings beside the
-/// pane), the frame the menu is painted in hides a caret on the card, cuts a
-/// pet at the card's edge — its part beside the card stays — and is a host
-/// write (`snapshot_seq` moves, so the renderer compares every row and the
-/// card is never painted in strips). NEGATIVE CONTROL: a caret beside the
-/// card, on the same row, stands.
 #[test]
 fn the_open_menu_hides_the_caret_and_cuts_the_pet_under_it_on_both_routes() {
     use aterm_core::render::FreeSprite;
@@ -2696,7 +2409,6 @@ fn the_open_menu_hides_the_caret_and_cuts_the_pet_under_it_on_both_routes() {
             right + 3 < app.windows[&wid].input_scratch.cols,
             "mixed={mixed}: room beside the card"
         );
-        // A pet four cells wide over the card's right edge, on its second row.
         let pet = FreeSprite {
             x: px(right - 2, cw),
             y: px(rect.row + 2, ch),
@@ -2748,7 +2460,6 @@ fn the_open_menu_hides_the_caret_and_cuts_the_pet_under_it_on_both_routes() {
 }
 
 /// The frame rows the renderer's damage diff repaints going from `prev` to
-/// `now`: every row on a full repaint.
 fn repainted(
     prev: &aterm_render::RenderInput,
     now: &aterm_render::RenderInput,
@@ -2771,15 +2482,6 @@ fn repainted(
 }
 
 /// THE CARD IS PAINTED WHOLE (review of surfaces-F3): the renderer repaints
-/// only the rows whose inputs moved, and reads a row the engine vouches for
-/// by its revision stamp alone — so a card written over rows the program did
-/// not redraw, with nothing saying so, was painted only where the program
-/// happened to redraw (in strips, the lab's `main-menu-open-c.png`), and its
-/// rows lingered after the close the same way. The menu's paint is a host
-/// write (`snapshot_seq`): the frame it opens in repaints every row of the
-/// card, and so does the frame it closes in, on a terminal tab and on a
-/// mixed one. NEGATIVE CONTROL: a frame the card did not move in does not
-/// repaint the card whole (so the diff is not a full repaint every frame).
 #[test]
 fn the_open_menu_is_repainted_whole_where_the_program_drew_nothing() {
     for mixed in [false, true] {
@@ -2822,22 +2524,17 @@ fn the_open_menu_is_repainted_whole_where_the_program_drew_nothing() {
 }
 
 /// How a press reaches the open menu in a lifecycle test, always at the
-/// pixel the pointer last moved to.
 #[derive(Clone, Copy, Debug)]
 enum Press {
     /// The event loop's `MouseInput` alone, as Linux and Windows deliver it.
     Bare,
     /// As AppKit delivers a click: `mouseDown:` (and `mouseUp:`) queue a
-    /// `CursorMoved` at the press point ahead of the button
-    /// (`aterm-window`'s macOS `view.rs`, `mouse_down`) — a motion event
-    /// in which the pointer did not move.
     AppKit,
     /// `ctl pointer click`, which runs what the platform delivers.
     Ctl,
 }
 
 /// One left click on window `wid` at `(x, y)` (where the pointer is), the
-/// way `how` delivers it.
 fn click(app: &mut App, wid: WindowId, (x, y): (f64, f64), how: Press) {
     use aterm_window::event::{ElementState, MouseButton};
     assert_eq!(app.windows[&wid].last_cursor_px, (x, y), "{how:?}: pointer");
@@ -2863,7 +2560,6 @@ fn rect_of(app: &App) -> Option<MenuRect> {
 }
 
 /// Window `wid`'s pixel at the centre of the open menu's row `i` (its third
-/// column), and that row's frame row.
 fn row_px(app: &App, wid: WindowId, i: usize) -> ((f64, f64), usize) {
     let rect = rect_of(app).expect("painted");
     let row = rect.row + 1 + i;
@@ -2880,38 +2576,12 @@ fn key_on(app: &App, row: usize) -> Option<String> {
 }
 
 /// `session`'s timer, armed elsewhere for an hour from the fake wall clock
-/// (a wire `meta set`, its wake applied): the cancel row ARRIVES in an open
-/// menu, which grows above the chip, so the rows above it move up one.
 fn arm_elsewhere(app: &mut App, session: u64) {
     wire(app, session, "set autopilot cruise until=+1h");
     app.on_meta_changed(session);
 }
 
 /// THE ROWS NEVER MOVE UNDER A STILL POINTER TO ANOTHER CHOICE
-/// (lifecycle-1), for every way a press arrives ([`Press`]).
-///
-/// * A row LEAVES — the timer fires under a pointer resting on `Off`: the
-///   card keeps its rect and every remaining row its frame row at once, so
-///   a press before the next frame chooses `Off`; after the frame the
-///   cancel's place is a blank `autopilot-menu gap` and Land still stands
-///   where it stood.
-/// * A row ARRIVES — a timer armed elsewhere under a pointer resting on
-///   `Land now`: the card grows above the chip and `Off` now stands under
-///   the pointer. A press there chooses nothing, AppKit's motion at the
-///   press point included (the pointer did not move: the pixel is the one
-///   it rested on); it lights `Off`, and the next press takes it.
-/// * The pointer never moved since a keyboard open, resting over the card
-///   from before it: after a row arrives the press is refused the same way.
-/// * The card WIDENS under a pointer resting beside it (its name grew): a
-///   press there, on the card now, is refused the same way.
-///
-/// NEGATIVE CONTROL: a pointer that moved after the rows moved presses at
-/// once, every way.
-///
-/// RED before the fix: the fire laid the card out one row shorter, its rows
-/// slid down under the pointer and the press chose `Land now`; and before
-/// the review fix, AppKit's motion at the press point counted as the
-/// pointer moving, so its press after a row arrived chose `Off`.
 #[test]
 fn a_row_never_moves_under_a_still_pointer_to_another_choice() {
     use crate::autopilot_timers::TimerChoice;
@@ -2919,7 +2589,6 @@ fn a_row_never_moves_under_a_still_pointer_to_another_choice() {
     const OFF: &str = "autopilot-menu/mode/off";
     let menu_open = |app: &App| app.autopilot_menu.is_some();
     for how in [Press::Bare, Press::Ctl, Press::AppKit] {
-        // A row leaves.
         let (mut app, wid, session, host) = claude_app();
         let _host = MenuTestHost(host);
         let (mono, wall) = (Instant::now(), 1_792_177_200_000_i64);
@@ -2978,7 +2647,6 @@ fn a_row_never_moves_under_a_still_pointer_to_another_choice() {
             app.on_cursor_left(wid);
         }
 
-        // A row arrives under a still pointer.
         let (mut app, wid, session, host) = claude_app();
         let _host = MenuTestHost(host);
         crate::autopilot_timers::set_fake_clocks(Some((mono, wall)));
@@ -2991,9 +2659,6 @@ fn a_row_never_moves_under_a_still_pointer_to_another_choice() {
         arm_elsewhere(&mut app, session);
         frame(&mut app, wid);
         let grown = rect_of(&app).expect("painted");
-        // The cancel row arrived, and the note of who armed it under the name
-        // (`set … over aterm ctl`, §11.7.1): the card grew by both, upward,
-        // so only the cancel moved the choices above it.
         assert_eq!(grown.h, rect.h + 2, "the cancel row arrived: the card grew");
         assert_eq!(
             key_on(&app, frame_row).as_deref(),
@@ -3017,11 +2682,6 @@ fn a_row_never_moves_under_a_still_pointer_to_another_choice() {
         assert!(!menu_open(&app), "{how:?}: the next press chose it");
         assert_eq!(pair(&app, session), (Some("off".into()), None));
 
-        // The pointer never moved since a keyboard open: it rests where the
-        // card came up, from before the open — over the grid (whose
-        // same-pixel filter takes AppKit's motion at the press), or over the
-        // card of a menu closed by the keyboard and opened again (the motion
-        // at the press reaches the new menu).
         for over_a_menu in [false, true] {
             app.open_front_autopilot_menu().unwrap();
             frame(&mut app, wid);
@@ -3054,9 +2714,6 @@ fn a_row_never_moves_under_a_still_pointer_to_another_choice() {
             app.on_cursor_left(wid);
         }
 
-        // The card WIDENS under a pointer resting beside it (its name grew):
-        // the pointer saw no choice where it rests, so a press there, on the
-        // card now, chooses nothing — and the next one takes the row.
         let (mut wide_app, wwid, wsession, whost) = claude_app();
         let _whost = MenuTestHost(whost);
         frame(&mut wide_app, wwid);
@@ -3105,7 +2762,6 @@ fn a_row_never_moves_under_a_still_pointer_to_another_choice() {
         assert_eq!(pair(&wide_app, wsession), (Some("land".into()), None));
         drop(wide_app);
 
-        // NEGATIVE CONTROL: the pointer moved after the rows moved.
         app.open_front_autopilot_menu().unwrap();
         frame(&mut app, wid);
         let (at, _) = row_px(&app, wid, row_of(&app, LAND).unwrap());
@@ -3123,19 +2779,6 @@ fn a_row_never_moves_under_a_still_pointer_to_another_choice() {
 }
 
 /// A CARD PAINTED UNDER A RESTING POINTER TAKES NO PRESS IT DID NOT SEE (the
-/// review of v3/polish-page's fixes), for every way a press
-/// arrives ([`Press`]). In a 24 × 80 Claude Code over Claude Code split the
-/// bottom pane's card is whole only over its own chip's row, so `Cruise 2
-/// hours, then land` comes up under the pointer that right-clicked the chip.
-/// A left press there, the pointer not moved, chooses nothing: it lights
-/// that row, and the next press takes it. The same for a card a keyboard
-/// open puts under a resting pointer. NEGATIVE CONTROL: a pointer that moved
-/// once the card was up (one pixel, on that row) chooses with its first
-/// press.
-///
-/// RED before the fix: the left press armed a two-hour Cruise the person
-/// never pointed at — the open had read nothing, and a press at the rows'
-/// first generation landed.
 #[test]
 fn a_card_painted_under_a_resting_pointer_takes_no_press_it_did_not_see() {
     use crate::pane::SplitDir;
@@ -3183,7 +2826,6 @@ fn a_card_painted_under_a_resting_pointer_takes_no_press_it_did_not_see() {
         assert_ne!(pair(&app, session), before, "{how:?}: {under} written");
         app.set_session_autopilot(session, None, crate::autopilot::Surface::Menu);
         let before = pair(&app, session);
-        // A keyboard open under the resting pointer: the same.
         frame(&mut app, wid);
         app.open_front_autopilot_menu().unwrap();
         frame(&mut app, wid);
@@ -3200,7 +2842,6 @@ fn a_card_painted_under_a_resting_pointer_takes_no_press_it_did_not_see() {
         );
         assert!(app.close_autopilot_menu());
         frame(&mut app, wid);
-        // NEGATIVE CONTROL: the pointer moved once the card was up.
         open_by_hand(&mut app);
         let moved = (at.0 + 1.0, at.1);
         app.on_cursor_moved(wid, moved.0, moved.1);
@@ -3216,12 +2857,6 @@ fn a_card_painted_under_a_resting_pointer_takes_no_press_it_did_not_see() {
 }
 
 /// THE MENU CUTS THE LIGHT (`docs/DESIGN-card-engine-2026-10-19.md` §7
-/// `fx_occluders_compose`): the open Autopilot menu, then the paste question
-/// over the top rows, each push an engine occluder, so light in every fx slot
-/// over the whole frame leaves both byte-identical to the frame without it.
-/// CONTROLS (rendered in the helper): with no occluder the light lands on
-/// both; a single cut (the question's, the last writer's) leaves it on the
-/// menu.
 #[test]
 fn fx_occluders_compose_over_the_autopilot_menu_and_the_paste_banner() {
     use crate::app_render::fx_occluder_tests::{
@@ -3260,22 +2895,12 @@ fn fx_occluders_compose_over_the_autopilot_menu_and_the_paste_banner() {
 }
 
 /// THREE SURFACES IN ONE FRAME (`docs/DESIGN-card-engine-2026-10-19.md` §7
-/// `fx_occluders_compose`): the open Autopilot menu, the paste question over
-/// the top rows and the caption of a hovered link on the bottom row, each
-/// spliced over the same frame, each push an engine occluder, and light in
-/// every fx slot leaves all three byte-identical to the frame without it.
-/// The tab menu cannot join them: the link caption yields to it
-/// (`compose_link_caption`), so this is the largest set of the four that
-/// shares a frame. CONTROLS (rendered in the helper): with no occluder the
-/// light lands on all three; a single cut (the caption's, the last writer's)
-/// leaves it on the menu and the question.
 #[test]
 fn fx_occluders_compose_over_the_autopilot_menu_the_question_and_the_caption() {
     use crate::app_render::fx_occluder_tests::{
         Shape, assert_chrome_cuts_the_light, chrome_written, trace_splice,
     };
     let (mut app, wid, session, _host) = claude_app();
-    // An OSC 8 link mid-screen, the composer's caret put back after it.
     feed(
         &app,
         session,
@@ -3319,15 +2944,11 @@ fn fx_occluders_compose_over_the_autopilot_menu_the_question_and_the_caption() {
 }
 
 /// A font zoom to `size` px: the zoom's own transaction, its renderer
-/// rebuild elided (a headless window has none, nor an OS window to re-fit),
-/// so the window's cells grow and its grid keeps its rows and columns — and
-/// Claude's screen, and the chip at the open menu's anchor.
 fn zoom(app: &mut App, size: f32) {
     assert!(app.set_font_size_with(size, |_| true), "zoomed to {size}");
 }
 
 /// The word choosing row `i` of `rows` writes, where it is an enabled mode
-/// choice (`Cruise`, `Land now`, `Off`).
 fn mode_word(rows: &[MenuRow], i: usize) -> Option<&'static str> {
     match rows.get(i)? {
         MenuRow::Item {
@@ -3340,11 +2961,6 @@ fn mode_word(rows: &[MenuRow], i: usize) -> Option<&'static str> {
 }
 
 /// The menu open from the chip as a pointer opens it (no row lit) and
-/// painted, and the first zoom step from the window's font that puts, under
-/// the pixel of one mode choice of the painted card — as the grid it was
-/// laid on shows it — another mode choice's cell of that card: the zoom's
-/// size, the choice the pixel shows, the choice the zoomed grid puts under
-/// it, and the pixel. The zoom undone.
 fn open_where_a_zoom_moves_a_choice(
     app: &mut App,
     wid: WindowId,
@@ -3389,17 +3005,6 @@ fn lit(app: &App) -> Option<usize> {
 }
 
 /// A RE-GRID LEAVES THE AUTOPILOT MENU'S LAST RECT ANSWERING NOTHING: the
-/// menu open from its chip and painted, the pointer resting on a mode
-/// choice. A font zoom re-grids the window — its cells grow — and puts
-/// another mode choice's cell of the last frame's rect under that pixel.
-/// Before the next frame a motion there finds nothing on the card (the
-/// choice it rested on stays lit, as off the card), and a press there closes
-/// the menu having chosen nothing, as a press before its first paint does.
-/// A fact's menu is the same card, with the same rect and stamp.
-///
-/// NEGATIVE CONTROL: the last frame's rect stamped as the zoomed grid's (no
-/// stamp, as before), the same motion lights the other choice and the press
-/// chooses it: the word the pointer never rested on is written.
 #[test]
 fn a_regrid_leaves_the_autopilot_menus_last_rect_answering_nothing() {
     for forged in [true, false] {
@@ -3453,19 +3058,6 @@ fn a_regrid_leaves_the_autopilot_menus_last_rect_answering_nothing() {
 }
 
 /// THE RE-GRID'S FRAME LAYS THE CARD AGAIN, AND ITS ROWS MOVED UNDER A STILL
-/// POINTER (lifecycle-1): the menu open and painted, the pointer resting on
-/// a mode choice; a font zoom puts another choice under that pixel with no
-/// motion. The re-grid closes nothing — the chip still stands at the menu's
-/// anchor, so the next frame lays the card again, at the same cells, on the
-/// zoomed grid. The pointer saw none of the rows now under it: a press there
-/// chooses nothing and lights the choice now under it, and the next press
-/// takes that choice.
-///
-/// NEGATIVE CONTROL: a pointer that moved after the frame laid the card
-/// again presses at once.
-///
-/// RED before the fix: the card laid again at the same rect did not count as
-/// arrived, and the first press chose the choice the pointer never rested on.
 #[test]
 fn a_card_laid_again_on_a_new_grid_takes_no_press_it_did_not_see() {
     for moved in [false, true] {
@@ -3523,16 +3115,6 @@ fn a_card_laid_again_on_a_new_grid_takes_no_press_it_did_not_see() {
 }
 
 /// A DOUBLE-CLICK'S SECOND PRESS IS JUDGED WHERE THE CARD WAS LAID: a press
-/// on a mode choice chooses it and closes the card; a font zoom then
-/// re-grids the window before the double-click's second press at the same
-/// pixel, which the zoomed grid puts off the card's rect. Judged on the grid
-/// the card was laid on, the press fell on the card, and is spent there.
-///
-/// NEGATIVE CONTROL: a second press that moved off the card — on the grid it
-/// was laid on — is not spent.
-///
-/// RED before the fix: the press was judged on the zoomed grid, off the
-/// card, and passed on to what the card covered.
 #[test]
 fn a_regrid_between_a_double_clicks_presses_moves_no_pixel_of_it() {
     for on_card in [true, false] {

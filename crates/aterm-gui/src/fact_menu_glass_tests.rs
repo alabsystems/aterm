@@ -13,6 +13,7 @@ use std::sync::Arc;
 
 use aterm_agent::harness::footer::{FactKind, FactMask, FooterFacts};
 use aterm_agent::harness::session_usage::{ModelTokens, TrafficView, UsageFacts};
+use aterm_core::render::{BandIcon, ChromeIcon};
 use aterm_window::event::{ElementState, MouseButton};
 
 use super::Fact;
@@ -20,6 +21,7 @@ use super::gesture_tests::*;
 use crate::autopilot_menu::{MenuOwner, MenuRow};
 use crate::claude_footer::FactSide;
 use crate::fact_menu::NEW_TABS_ASKED;
+use crate::tab_menu::MenuRect;
 use crate::{App, WindowId};
 
 /// One frame through the capture route's splices, the menu's last.
@@ -443,4 +445,150 @@ fn a_closed_card_reads_no_side() {
     assert_eq!(crate::work_counts::take_traffic_side_reads(), 1, "the wake");
     menu_frame(&mut app, wid);
     assert_eq!(crate::work_counts::take_traffic_side_reads(), 0, "a frame");
+}
+
+/// Every glass mark (`BandIcon::glass_mark`) the frame draws as the chrome's
+/// icon, as `(frame row, icon)`, in frame order.
+fn drawn_marks(app: &App, wid: WindowId) -> Vec<(usize, ChromeIcon)> {
+    let mut marks: Vec<(usize, ChromeIcon)> = app.windows[&wid]
+        .input_scratch
+        .chrome_rasters
+        .iter()
+        .flat_map(|raster| raster.icons.iter().map(|i| (usize::from(raster.row), *i)))
+        .filter(|(_, i)| BandIcon::glass_mark(i.icon.ch()).is_some())
+        .collect();
+    marks.sort_unstable_by_key(|&(row, i)| (row, i.col));
+    marks
+}
+
+/// The open card and the marks its cells print: each full-size, narrow cell
+/// on it whose character is a glass mark, as the icon the glass draws there.
+fn card_and_its_marks(app: &App, wid: WindowId) -> (MenuRect, Vec<(usize, ChromeIcon)>) {
+    let rect = app
+        .autopilot_menu
+        .as_ref()
+        .and_then(|m| m.rect)
+        .expect("the card is painted");
+    let cells = &app.windows[&wid].input_scratch.cells;
+    let printed = (rect.row..rect.row + rect.h)
+        .flat_map(|row| (rect.col..rect.col + rect.w).map(move |col| (row, col)))
+        .filter_map(|(row, col)| {
+            let cell = cells[row][col];
+            let normal = cell.script == aterm_core::terminal::Script::Normal;
+            let icon = BandIcon::glass_mark(cell.ch).filter(|_| normal && !cell.wide)?;
+            let col = u16::try_from(col).expect("a frame column");
+            Some((row, ChromeIcon { col, icon }))
+        })
+        .collect();
+    (rect, printed)
+}
+
+/// THE CARD'S MARKS ARE THE GLASS'S (`BandIcon::glass_mark`, one map): the
+/// Autopilot card's `⤓ ○ ●` and the fact menus' `◉ ◈ ⌂ ○` (whose Arial
+/// Unicode glyphs drew 6 × 6 at 1× beside SF Mono's 8 × 9 `● ○`) are drawn as
+/// the chrome's icons over the cells that keep them, once however often the
+/// card is painted, standing through the card's own scrub (which takes every
+/// icon on the card it covers); and once it closes the frame draws the marks
+/// it drew before the card opened, none of the card's left. NEGATIVE
+/// CONTROL: the card's other marks (`∞ ⚙ ⋯ + ⧉`, the faces' or within a
+/// pixel of them) and its words draw nothing.
+#[test]
+fn a_cards_marks_are_drawn_while_it_is_open_and_gone_once_it_closes() {
+    use crate::fact_menu::FactMenuFacts;
+    let (mut app, wid, _session, _reader) = glass(true);
+    let _host = host(&mut app);
+    menu_frame(&mut app, wid);
+    let before = drawn_marks(&app, wid);
+    let autopilot = |app: &mut App| {
+        app.open_front_autopilot_menu()
+            .expect("the chip is on the glass");
+    };
+    // The effort's card with the top-effort key's row (`◈`), which a Claude
+    // Code new enough to take the key offers.
+    let effort = |app: &mut App| {
+        app.open_front_fact_menu(Fact::Effort)
+            .expect("the effort is on the glass");
+        let facts = FactMenuFacts {
+            title: "Effort \u{b7} tab 1".into(),
+            room: 44,
+            effort: Some("xhigh".into()),
+            key_row: Some(true),
+            ..FactMenuFacts::default()
+        };
+        app.autopilot_menu.as_mut().expect("open").rows =
+            crate::fact_menu::rows(Fact::Effort, &facts);
+    };
+    let folder = |app: &mut App| {
+        app.open_front_fact_menu(Fact::Path)
+            .expect("the folder is on the glass");
+    };
+    // What the card is, how it opens, the glass marks it prints and plain marks it prints.
+    type Case = (
+        &'static str,
+        fn(&mut App),
+        &'static [BandIcon],
+        &'static [char],
+    );
+    let cases: [Case; 3] = [
+        (
+            "Autopilot",
+            autopilot,
+            &[BandIcon::ToBar, BandIcon::Ring, BandIcon::Disc],
+            &['\u{221e}', '\u{2699}'],
+        ),
+        (
+            "effort",
+            effort,
+            &[BandIcon::Fisheye, BandIcon::InsetDiamond, BandIcon::Ring],
+            &['\u{22ef}'],
+        ),
+        (
+            "folder",
+            folder,
+            &[BandIcon::House, BandIcon::Ring],
+            &['+', '\u{29c9}'],
+        ),
+    ];
+    for (what, open, want, plain) in cases {
+        open(&mut app);
+        menu_frame(&mut app, wid);
+        let (rect, printed) = card_and_its_marks(&app, wid);
+        for icon in want {
+            assert!(
+                printed.iter().any(|(_, i)| i.icon == *icon),
+                "{what}: the card prints {:?}: {printed:?}",
+                icon.ch()
+            );
+        }
+        let on_card = |app: &App| {
+            drawn_marks(app, wid)
+                .into_iter()
+                .filter(|(row, i)| rect.contains(*row, usize::from(i.col)))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(on_card(&app), printed, "{what}: each mark drawn, once");
+        menu_frame(&mut app, wid);
+        assert_eq!(on_card(&app), printed, "{what}: painted again, once");
+        // CONTROL: the card's other marks keep their glyphs.
+        let cells = &app.windows[&wid].input_scratch.cells;
+        for &ch in plain {
+            let at = (rect.row..rect.row + rect.h)
+                .flat_map(|row| (rect.col..rect.col + rect.w).map(move |col| (row, col)))
+                .find(|&(row, col)| cells[row][col].ch == ch)
+                .unwrap_or_else(|| panic!("{what}: the card prints {ch:?}"));
+            assert!(
+                !printed
+                    .iter()
+                    .any(|&(row, i)| (row, usize::from(i.col)) == at),
+                "{what}: control, {ch:?} draws nothing"
+            );
+        }
+        assert!(app.close_autopilot_menu(), "{what}: closed");
+        menu_frame(&mut app, wid);
+        assert_eq!(
+            drawn_marks(&app, wid),
+            before,
+            "{what}: closed, the glass's marks alone"
+        );
+    }
 }

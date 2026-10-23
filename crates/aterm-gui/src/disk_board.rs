@@ -1,19 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE DISK BOARD (design `docs/DESIGN-disk-awareness-2026-10-17.md` §3.1):
-//! what the disk watch last measured, ONE leaf-locked value written by the
-//! watch (`harness_host::disk_look`) and read by `status` (`disk=`,
-//! [`status_fields`]) and `await sys` (`control_disk`). It holds the
-//! episode the watch keeps of sessions a full disk stopped ([`DiskEpisode`]),
-//! so there is one store of the watch's last look, not two. It also keeps
-//! today's tally of what aterm's cleaner freed ([`FreedTally`]), and the
-//! Stats Deck reads its disk facts off it ([`Shelf::deck_facts`]; design
-//! `docs/DESIGN-stats-deck-v2-2026-10-20.md` §7.1, §7.3, §7.6).
-//!
-//! Its lock is a LEAF: nothing is locked, read from the file system or
-//! logged under it. A reader takes it, copies what it needs and lets go;
-//! `status` does no I/O at all.
+//! Shared disk-watch state board (`status disk=` and `await sys`).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -23,154 +11,125 @@ use std::time::{Duration, Instant};
 use aterm_agent::harness::disk::{Class, Hog, Level, Thresholds};
 use aterm_sysprobe::volumes::{Reading, Table, VolumeKey};
 
-/// The most volumes the board holds: the home volume and the volumes the
-/// sessions work on, deduped by [`VolumeKey`].
+/// Maximum number of deduplicated volumes retained on the board.
 pub(crate) const MAX_VOLUMES: usize = 8;
 
-/// The most sessions whose 8.3 working directory the board keeps spelled
-/// long ([`Board::spelled`]); past it the oldest session's (the lowest local
-/// id) goes first.
+/// Maximum number of Windows 8.3 short-to-long working directory mappings cached.
 pub(crate) const MAX_SPELLED: usize = 256;
 
-/// Where the watch stands, for the hang detector of `await sys`.
+/// Disk-watch progress state for `await sys` hang detection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Watch {
-    /// No look yet.
+    /// No disk look has started yet.
     NotStarted,
-    /// Looking, and the last sign of progress came at `beat`
-    /// (`aterm_agent::harness::disk::beat`).
+    /// Disk look is active with last progress at `beat`.
     Running { beat: Instant },
-    /// The host is not active (a seamless successor before its Commit): no
-    /// look runs, and the hang detector does not count.
+    /// Host is suspended; no look runs.
     Suspended,
 }
 
-/// One volume as the watch last measured it.
+/// Last measured state of a single volume.
 #[derive(Debug, Clone)]
 pub(crate) struct VolumeRow {
-    /// The reading.
+    /// Raw volume space and inode reading.
     pub(crate) reading: Reading,
-    /// The lines in force on it (the `[disk]` knobs, its share, its room).
+    /// Active warning and floor thresholds for the volume.
     pub(crate) thresholds: Thresholds,
-    /// Where it stands against them.
+    /// Evaluated disk pressure [`Level`].
     pub(crate) level: Level,
-    /// Its room ([`aterm_agent::harness::disk::room`]); `None` where no
-    /// meter reads it (a volume only a wait measured, or the harness state
-    /// missing): a `free>=room` on it is unavailable, never met at once.
+    /// Reclaimable bytes on the volume (`None` when unmeasured).
     pub(crate) room: Option<u64>,
-    /// When it was read.
+    /// Monotonic timestamp of the reading.
     pub(crate) as_of: Instant,
-    /// When it was read, unix seconds (a reply's `as_of=`).
+    /// Unix timestamp (seconds) of the reading.
     pub(crate) as_of_unix: i64,
-    /// A pass removes on it (the home volume; never another).
+    /// Whether automatic reclamation runs on this volume (home volume only).
     pub(crate) reclaimed_here: bool,
 }
 
-/// What the last pass did, for a wait to answer from.
+/// Summary of the most recent reclamation pass.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PassSummary {
-    /// The volume it ran on.
+    /// Volume the pass ran on.
     pub(crate) key: VolumeKey,
-    /// When it ended.
+    /// Monotonic completion timestamp.
     pub(crate) ended_at: Instant,
-    /// Free bytes measured after it.
+    /// Free bytes measured after the pass.
     pub(crate) free_after: Option<u64>,
-    /// The tiers it ran (numbers).
+    /// Reclamation tier numbers executed.
     pub(crate) tiers: Vec<u8>,
-    /// What its removals counted.
+    /// Total bytes freed by the pass.
     pub(crate) freed: u64,
-    /// The demand it adopted, need bytes.
+    /// Demand target (in bytes free) adopted by the pass.
     pub(crate) demand: Option<u64>,
-    /// It RAN OUT of what it may take: every row of every tier it admitted
-    /// tried, no tier stopped by a figure it could not read or by the bytes
-    /// it counted, the search for build directories finished
-    /// (`aterm_agent::harness::disk::Applied::ran_out`).
+    /// Whether the pass exhausted all admissible reclamation candidates.
     pub(crate) ran_out: bool,
-    /// It ran out ([`Self::ran_out`]) for its demand and free space is still
-    /// below the need (`ERR unmet why=spent`): [`spent`].
+    /// Whether the pass exhausted candidates while free space remained below `demand`.
     pub(crate) spent: bool,
-    /// `disk.idle_build_dirs` off kept tier 3 from running (`why=held-back`).
+    /// Whether `disk.idle_build_dirs = false` held back tier-3 reclamation.
     pub(crate) held_back: bool,
-    /// How many build directories it could not reclaim, and the largest.
+    /// Count and largest size of unreclaimed build directories.
     pub(crate) hogs: usize,
     pub(crate) largest: u64,
-    /// Those build directories, as the pass named them: the deck's "where"
-    /// when no survey is newer.
+    /// Unreclaimed build-directory hogs reported by the pass.
     pub(crate) left: Vec<Hog>,
-    /// When it ended, unix seconds: the time the deck gives its hog list
-    /// (`None` where the wall clock could not be read).
+    /// Unix completion timestamp (`None` if wall clock was unavailable).
     pub(crate) ended_at_unix: Option<i64>,
 }
 
-/// THE SPENT RULE: a pass that adopted `demand` (need bytes) was spent for
-/// it — what is left is not aterm's to free (`ERR unmet why=spent`) — only
-/// when it `ran_out` of what it may take ([`PassSummary::ran_out`]) and free
-/// space MEASURED after it (`free_after`) is still below the need. A pass
-/// stopped for another reason (a figure it could not read, its search cut
-/// short), or one whose figure after is unknown, is not spent: the wait parks
-/// on. Bound to `DiskAwait`'s `pass` (`disk_await_conformance`).
+/// Whether a reclamation pass for `demand` exhausted all candidates without meeting `demand`.
 pub(crate) fn spent(demand: Option<u64>, free_after: Option<u64>, ran_out: bool) -> bool {
     ran_out && demand.is_some_and(|need| free_after.is_some_and(|f| f < need))
 }
 
-/// An agent's wait for free space the watch has not met yet.
+/// Pending `await sys` free-space demand registered on the board.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Demand {
-    /// The wait's own id ([`Board::demand`]).
+    /// Demand identifier ([`Board::demand`]).
     pub(crate) id: u64,
-    /// The session that waits.
+    /// Requesting session ID.
     pub(crate) session: u64,
-    /// The volume it waits on.
+    /// Target volume key.
     pub(crate) key: VolumeKey,
-    /// The free bytes it needs.
+    /// Required free bytes.
     pub(crate) need: u64,
-    /// Its working directory: its checkout joins the pass's reach.
+    /// Requesting session's working directory.
     pub(crate) cwd: Option<PathBuf>,
-    /// When it was armed.
+    /// Monotonic timestamp when the demand was registered.
     pub(crate) armed_at: Instant,
 }
 
-/// THE DISK EPISODE: what the watch knows of sessions a full disk stopped,
-/// read by each worker's idle points (`harness_host::disk_withholds`,
-/// `disk_owed`).
+/// Episode state tracking sessions stopped by a full disk.
 #[derive(Debug)]
 pub(crate) struct DiskEpisode {
-    /// The volume's level at the last look (`None`: not measured yet).
+    /// Home volume level at the last look.
     pub(crate) level: Option<Level>,
-    /// Sessions whose Claude Code said the disk is full while the volume
-    /// MEASURED at an emergency, with the code it named: no continuation is
-    /// typed into them while it stands.
+    /// Sessions stopped by a full disk (`sid -> error_code`).
     pub(crate) stuck: BTreeMap<String, String>,
-    /// Sessions owed the resume text once space is back, with it and the
-    /// tries left.
+    /// Sessions owed a resume prompt once space recovers (`sid -> (prompt, tries_left)`).
     pub(crate) owed: BTreeMap<String, (String, u8)>,
-    /// What the passes of this episode freed, and the largest of it.
+    /// Total and largest bytes freed during this episode.
     pub(crate) freed: u64,
     pub(crate) went: Vec<String>,
-    /// Sessions whose sighting was said in the log (said again once the
-    /// notice left the screen and came back).
+    /// Sessions whose full-disk stop has already been logged.
     pub(crate) said: BTreeSet<String>,
-    /// The owner's alert stands.
+    /// Whether the standing owner alert is active.
     pub(crate) alerted: bool,
 }
 
-/// The clocks, read once and outside the board's lock (the local offset may
-/// read the zone's file): the monotonic instant the watch's beat is on, the
-/// wall clock, and the local offset from UTC that places a local day.
+/// Monotonic and wall-clock snapshot taken outside the board lock.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Clock {
-    /// The monotonic clock.
+    /// Monotonic instant.
     pub(crate) at: Instant,
-    /// The wall clock, unix seconds (`None` where it reads before the
-    /// epoch).
+    /// Unix timestamp in seconds (`None` before epoch).
     pub(crate) unix: Option<i64>,
-    /// The local offset from UTC at `unix`, seconds (`None` where the
-    /// platform cannot say, or the wall clock is unread).
+    /// Local UTC offset in seconds (`None` if unavailable).
     pub(crate) offset: Option<i64>,
 }
 
 impl Clock {
-    /// The clocks now.
+    /// Sample monotonic, Unix, and local-offset clocks now.
     pub(crate) fn read() -> Self {
         let unix = unix_now();
         Self {
@@ -180,37 +139,28 @@ impl Clock {
         }
     }
 
-    /// The local calendar day: whole days since 1970-01-01 on the local
-    /// clock, so a new one starts at local midnight. `None` where the wall
-    /// clock or the local offset is unread: no day is guessed.
+    /// Local calendar day count since `1970-01-01`.
     pub(crate) fn day(&self) -> Option<u32> {
         let local = self.unix?.saturating_add(self.offset?);
         u32::try_from(local.div_euclid(86_400)).ok()
     }
 }
 
-/// The wall clock, unix seconds (`None` before the epoch).
+/// Current Unix timestamp in seconds (`None` before epoch).
 pub(crate) fn unix_now() -> Option<i64> {
     aterm_time::unix_secs().map(|s| i64::try_from(s).unwrap_or(i64::MAX))
 }
 
-/// What aterm's cleaner freed today (design §7.3): the bytes each removal it
-/// recorded released, counted once each, and the last of them. In memory
-/// only, and only aterm's own frees: space that came back by itself is not
-/// inferred.
+/// Per-day tally of bytes freed by `aterm`'s cleaners.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct FreedTally {
-    /// The local calendar day it counts ([`Clock::day`]); a removal on a
-    /// later day starts it again from nothing.
+    /// Local calendar day ([`Clock::day`]) for this tally.
     pub(crate) day: u32,
-    /// The bytes freed that day.
+    /// Total bytes freed today.
     pub(crate) aterm_bytes: u64,
-    /// When the last removal was counted, unix seconds.
+    /// Unix timestamp (seconds) of the most recent removal.
     pub(crate) last_at: i64,
-    /// What the last removal was, in words ([`freed_what`]). Both of
-    /// aterm's cleaners remove build caches only (the supervised pass's plan,
-    /// `aterm_agent::harness::disk::pass_plan`, and the no-session sweep), so
-    /// this names what the last pass removed.
+    /// Short label describing the most recent removal ([`freed_what`]).
     pub(crate) last_what: String,
 }
 
@@ -225,11 +175,7 @@ impl FreedTally {
         }
     }
 
-    /// Count `bytes` a removal released, `what` it was, at `now`. A tally of
-    /// an earlier day is reset first, so the count is today's. A removal
-    /// that released nothing counts nothing, and neither does one whose day
-    /// cannot be placed ([`Clock::day`]): the tally is a local day's, and no
-    /// time is made up for it.
+    /// Add a removal of `bytes` (`what`) at `now`, resetting first if the local day advanced.
     pub(crate) fn add(&mut self, bytes: u64, what: &str, now: &Clock) {
         let (Some(day), Some(unix)) = (now.day(), now.unix) else {
             return;
@@ -245,19 +191,13 @@ impl FreedTally {
         self.last_at = unix;
     }
 
-    /// The tally if it is `now`'s day's and counts something; `None` once
-    /// local midnight has passed since the last removal, before any, or
-    /// while the day cannot be placed.
+    /// Return `Some(self)` if this tally belongs to `now`'s local day and is non-zero.
     pub(crate) fn today(&self, now: &Clock) -> Option<&Self> {
         (now.day() == Some(self.day) && self.aterm_bytes > 0).then_some(self)
     }
 }
 
-/// What a supervised pass's removal was, in the words the deck and the lens
-/// print after "freed" ([`FreedTally::last_what`]). The pass removes build
-/// caches only (`aterm_agent::harness::disk::pass_plan`); the other classes
-/// are named for when it removes more. The no-session sweep takes only build
-/// caches ([`BUILD_CACHES`]).
+/// Short human-readable label for a supervised pass removal of `class`.
 pub(crate) fn freed_what(class: Class) -> &'static str {
     match class {
         Class::CargoTargets => BUILD_CACHES,
@@ -267,51 +207,36 @@ pub(crate) fn freed_what(class: Class) -> &'static str {
     }
 }
 
-/// The words for what the build-cache removals free.
+/// Label for build-cache removals.
 pub(crate) const BUILD_CACHES: &str = "build caches";
 
-/// The disk facts the Stats Deck reads off the board for the home volume
-/// ([`Board::deck_facts`]), before the vitals host maps them onto
-/// `aterm_vitals`' own types. With the harness off it is empty and `watch`
-/// is false ([`Shelf::deck_facts`]): no level, no lines, no stuck count and
-/// no freed tally, since aterm's cleaner is the harness.
+/// Raw home-volume disk facts read by the Stats Deck ([`Board::deck_facts`]).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct DiskFactsRaw {
-    /// The home volume's level at the last look; `None` before a look
-    /// measured it.
+    /// Home volume pressure level at the last look.
     pub(crate) level: Option<Level>,
-    /// The lines in force on it, bytes free: below `warn` it is low, below
-    /// `floor` aterm cleans (`None` with the automatic pass off, or where no
-    /// pass removes on it: [`VolumeRow::reclaimed_here`]), below `emergency`
-    /// writes are about to fail.
+    /// Warning, floor, and target free-byte thresholds on the home volume.
     pub(crate) warn: Option<u64>,
     pub(crate) floor: Option<u64>,
     pub(crate) emergency: Option<u64>,
-    /// The emergency comes from the inode line, not the free bytes: the deck
-    /// says "out of file slots" and prints no free figure.
+    /// Whether an emergency is caused by inode exhaustion rather than free bytes.
     pub(crate) files_emergency: bool,
-    /// Sessions stuck on a full disk.
+    /// Number of sessions stopped by a full disk.
     pub(crate) stuck: u16,
-    /// Every other volume the board measured: its name, its level and its
-    /// free bytes.
+    /// Other measured volumes as `(name, level, free_bytes)`.
     pub(crate) others: Vec<(String, Level, u64)>,
-    /// When the watch last made progress, unix seconds, once that is two of
-    /// its look periods old ([`crate::control::control_disk::STALL`]); a
-    /// stall the unread wall clock cannot date is not given.
+    /// Unix timestamp of the last watch beat when the watch has stalled.
     pub(crate) stalled_since: Option<i64>,
-    /// What aterm freed today, when it freed anything.
+    /// Today's freed-space tally, if non-zero.
     pub(crate) freed_today: Option<FreedTally>,
-    /// The build directories the last pass on the home volume could not
-    /// reclaim, and when it ended (`None` when it named none, or when the
-    /// wall clock could not be read at its end).
+    /// Unreclaimed build-directory hogs from the last pass and its completion timestamp.
     pub(crate) hogs: Vec<Hog>,
     pub(crate) hogs_at: Option<i64>,
-    /// A disk watch runs: the harness is on.
+    /// Whether the disk watch is active.
     pub(crate) watch: bool,
 }
 
 /// A volume's name for a person: its mount point's last component
-/// ("Backup"), or the whole mount point where it has none ("/").
 fn volume_name(mount: &Path) -> String {
     mount.file_name().map_or_else(
         || mount.display().to_string(),
@@ -319,42 +244,28 @@ fn volume_name(mount: &Path) -> String {
     )
 }
 
-/// The board ([`Shelf::board_lock`]).
+/// Shared disk-watch board state ([`Shelf::board_lock`]).
 #[derive(Debug)]
 pub(crate) struct Board {
-    /// Where the watch stands.
+    /// Current watch progress state.
     pub(crate) watch: Watch,
-    /// A disk watch runs in this process: the harness host is on
-    /// (`[harness]` enabled; a suspended successor's host counts, it resumes
-    /// at its Commit). Off, a wait registers no demand (`why=no-watch`) and a
-    /// look adopts none.
+    /// Whether a disk watch runs in this process.
     pub(crate) watched: bool,
-    /// The mount table of the last look.
+    /// Mount table from the last look.
     pub(crate) table: Table,
-    /// Each volume measured, at most [`MAX_VOLUMES`]; the first is the home
-    /// volume once a look has run.
+    /// Measured volumes (up to [`MAX_VOLUMES`], home volume first).
     pub(crate) volumes: Vec<VolumeRow>,
-    /// Each session's volume (an index into [`Self::volumes`]), from its
-    /// working directory resolved at the last look.
+    /// Per-session volume index into [`Self::volumes`].
     pub(crate) sessions: BTreeMap<u64, usize>,
-    /// Each session whose tab reported its working directory with 8.3 short
-    /// names (`C:\Users\ANDREW~1\x`, which no mount places as spelled): that
-    /// spelling and its long one, spelled OFF the status path when the
-    /// report arrived or a wait read it (`harness_host::disk_cwd_reported`,
-    /// `harness_host::disk_spell_now`). [`Self::row_of`] places the session
-    /// by the long one while the tab still reports the short one, so `status
-    /// disk=` fills before the watch's first look and where no watch runs.
-    /// Spellings, never rows: no index here goes stale when the first
-    /// reading or a look replaces the rows, or when the tab moves (its new
-    /// spelling no longer matches). At most [`MAX_SPELLED`].
+    /// Cached Windows 8.3 `(short, long)` working-directory spellings per session.
     pub(crate) spelled: BTreeMap<u64, (PathBuf, PathBuf)>,
-    /// The last pass.
+    /// Summary of the last reclamation pass.
     pub(crate) last_pass: Option<PassSummary>,
-    /// The waits for free space not met yet.
+    /// Active unmet free-space demands.
     pub(crate) demands: Vec<Demand>,
-    /// The episode.
+    /// Full-disk episode state.
     pub(crate) episode: DiskEpisode,
-    /// What aterm's cleaner freed today ([`Shelf::tally_freed`]).
+    /// Today's freed-bytes tally.
     pub(crate) freed: FreedTally,
     /// The next demand's id.
     next_demand: u64,
@@ -389,22 +300,13 @@ impl Board {
         }
     }
 
-    /// The Stats Deck's disk facts for the home volume `home` at `now`
-    /// (design §7.1): its level and lines, whether an emergency is the inode
-    /// line's, the stuck sessions, every other volume measured, the watch's
-    /// stall, today's freed tally and the last pass's hog list. The floor
-    /// is given only where a pass removes: under a private state root the
-    /// watch measures and cleans nothing. Empty, with `watch` false, when no
-    /// watch runs in this process ([`Self::watched`]). Pure: nothing is
-    /// looked at.
+    /// Snapshot [`DiskFactsRaw`] for the home volume `home` at `now`.
     pub(crate) fn deck_facts(&self, home: &VolumeKey, now: &Clock) -> DiskFactsRaw {
         if !self.watched {
             return DiskFactsRaw::default();
         }
         let row = self.row_keyed(home).filter(|r| r.level != Level::Unknown);
         let lines = row.map(|r| r.thresholds);
-        // A stall is the hang detector's (`control_disk`): a running watch
-        // whose beat is two look periods old. It began at that beat.
         let stalled_since = match self.watch {
             Watch::Running { beat } => {
                 let quiet = now.at.saturating_duration_since(beat);
@@ -427,8 +329,6 @@ impl Board {
                 .map(|r| r.thresholds.floor)
                 .filter(|f| *f > 0),
             emergency: lines.map(|t| t.emergency),
-            // At an emergency with the free bytes above its line, the inode
-            // line is what crossed.
             files_emergency: row.is_some_and(|r| {
                 r.level == Level::Emergency && r.reading.free >= r.thresholds.emergency
             }),
@@ -447,11 +347,7 @@ impl Board {
         }
     }
 
-    /// The row of session `session`: the volume its working directory was
-    /// resolved onto at the last look, else the mount its spelling `cwd`
-    /// names in the last table — the long spelling of that spelling where
-    /// one was spelled for this session ([`Self::spelled`]) and the session
-    /// still reports it (pure: nothing is looked at).
+    /// Look up the [`VolumeRow`] for `session` (or resolve `cwd` against `table`).
     pub(crate) fn row_of(&self, session: u64, cwd: Option<&str>) -> Option<&VolumeRow> {
         if let Some(row) = self
             .sessions
@@ -468,9 +364,7 @@ impl Board {
         self.row_at(at)
     }
 
-    /// Keep `long` as the long spelling of the working directory `short`
-    /// session `session` reports ([`Self::spelled`]; its earlier one
-    /// replaced), the oldest session's dropped past [`MAX_SPELLED`].
+    /// Cache `long` as the expanded path for `session`'s 8.3 path `short`.
     pub(crate) fn spell(&mut self, session: u64, short: PathBuf, long: PathBuf) {
         self.spelled.insert(session, (short, long));
         while self.spelled.len() > MAX_SPELLED {
@@ -478,7 +372,7 @@ impl Board {
         }
     }
 
-    /// The row of the volume holding `path`, by the last table (pure).
+    /// Look up the [`VolumeRow`] containing `path`.
     pub(crate) fn row_at(&self, path: &Path) -> Option<&VolumeRow> {
         let mount = aterm_sysprobe::volumes::mount_of(path, &self.table)?;
         self.volumes
@@ -490,22 +384,12 @@ impl Board {
             })
     }
 
-    /// The row of volume `key`.
+    /// Look up the [`VolumeRow`] for `key`.
     pub(crate) fn row_keyed(&self, key: &VolumeKey) -> Option<&VolumeRow> {
         self.volumes.iter().find(|r| &r.reading.key == key)
     }
 
-    /// Put a wait's own reading `row` in place of the row of its volume (or
-    /// add it, while there is room). THE WATCH'S JUDGEMENT STAYS: a wait
-    /// reads free space and nothing else, so a row already held keeps its
-    /// room, its lines (the `[disk]` knobs raised to the room) and whether a
-    /// pass removes on it, the level read again on those lines — whatever
-    /// the wait built its row from. A wait whose spelling the board could not
-    /// place (an 8.3 `vol=`) read the volume with no row to start from: its
-    /// reading must not leave every tab on that volume `free>=room`
-    /// `why=room-unknown`, `disk_room_mb=-`, and a demand `why=not-reclaimed`,
-    /// until the next look (live5 F1). A volume no row holds yet is added as
-    /// the wait read it: the owner's lines, no room, nothing removed there.
+    /// Update `row`'s reading from a waiter probe while preserving the watch's pressure judgment.
     pub(crate) fn refresh(&mut self, row: VolumeRow) {
         let row = match self.row_keyed(&row.reading.key) {
             Some(held) => VolumeRow {
@@ -522,9 +406,7 @@ impl Board {
         self.measured(row);
     }
 
-    /// Put the watch's own reading `row`, its judgement with it, in place of
-    /// the row of its volume (or add it, while there is room): the volume as
-    /// a pass left it (`harness_host::disk_look`).
+    /// Record an authoritative volume reading and judgment from the disk watch.
     pub(crate) fn measured(&mut self, row: VolumeRow) {
         match self
             .volumes
@@ -537,8 +419,7 @@ impl Board {
         }
     }
 
-    /// Register a demand: session `session` needs `need` bytes on `key`.
-    /// Answers its id.
+    /// Register a free-space demand for `session` on `key` and return its demand ID.
     pub(crate) fn demand(
         &mut self,
         session: u64,
@@ -560,13 +441,12 @@ impl Board {
         id
     }
 
-    /// Forget demand `id` (its wait answered or hung up).
+    /// Remove demand `id`.
     pub(crate) fn drop_demand(&mut self, id: u64) {
         self.demands.retain(|d| d.id != id);
     }
 
-    /// The largest need on volume `key` and every demanding session's
-    /// working directory there: what a pass adopts.
+    /// Return the maximum demanded bytes on `key` and the working directories of demanding sessions.
     pub(crate) fn adopt(&self, key: &VolumeKey) -> Option<(u64, Vec<PathBuf>)> {
         let mine: Vec<&Demand> = self.demands.iter().filter(|d| &d.key == key).collect();
         let need = mine.iter().map(|d| d.need).max()?;
@@ -574,15 +454,14 @@ impl Board {
     }
 }
 
-/// A board and the condvar its parked waits sleep on: the process's one
-/// ([`SHELF`]), or a test's own.
+/// Mutex-guarded [`Board`] paired with a [`Condvar`] for parked waiters.
 pub(crate) struct Shelf {
     board: Mutex<Board>,
     changed: Condvar,
 }
 
 impl Shelf {
-    /// An empty board.
+    /// Create an empty [`Shelf`].
     pub(crate) const fn new() -> Self {
         Self {
             board: Mutex::new(Board::new()),
@@ -590,12 +469,12 @@ impl Shelf {
         }
     }
 
-    /// The board, its leaf lock held (the lock-order census's `board`).
+    /// Lock and return the [`Board`].
     pub(crate) fn board_lock(&self) -> MutexGuard<'_, Board> {
         self.board.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Change the board under its lock and wake every parked wait.
+    /// Mutate the [`Board`] under its lock and notify all parked waiters.
     pub(crate) fn publish(&self, f: impl FnOnce(&mut Board)) {
         {
             let mut b = self.board_lock();
@@ -604,13 +483,7 @@ impl Shelf {
         self.changed.notify_all();
     }
 
-    /// Count into today's tally ([`Board::freed`]) each removal one pass of
-    /// aterm's cleaner recorded, the bytes it released and what it was: once
-    /// per `removed` row of a supervised pass and per `build-cache-sweep`
-    /// removal row of the no-session sweep (`harness_host`'s
-    /// `disk_pass_removals` and `disk_sweep_removals`). The clocks are read
-    /// before the lock is taken. Wakes no wait: a wait parks on free space,
-    /// not on the tally.
+    /// Record `(bytes, what)` removals into today's [`FreedTally`].
     pub(crate) fn tally_freed(&self, removals: &[(u64, &str)]) {
         if removals.is_empty() {
             return;
@@ -622,22 +495,17 @@ impl Shelf {
         }
     }
 
-    /// The Stats Deck's disk facts for the home volume `home` at `now`
-    /// ([`Board::deck_facts`]): empty, `watch` false, while no disk watch
-    /// runs here, and the deck says "disk watch off" (design §7.6).
+    /// Read [`DiskFactsRaw`] for `home` at `now` from this shelf.
     pub(crate) fn deck_facts(&self, home: &VolumeKey, now: &Clock) -> DiskFactsRaw {
         self.board_lock().deck_facts(home, now)
     }
 
-    /// Whether a disk watch runs in this process ([`Board::watched`]: the
-    /// harness host is on). `harness_host::harness_state` is no such sign: it
-    /// answers a state directory whether or not the harness runs.
+    /// Whether the disk watch is active on this shelf.
     pub(crate) fn watched(&self) -> bool {
         self.board_lock().watched
     }
 
-    /// Park on the board until it changes or `wait` passes, `guard` released
-    /// meanwhile and held again on return.
+    /// Wait on the shelf's condvar up to `wait`.
     pub(crate) fn park<'a>(
         &'a self,
         guard: MutexGuard<'a, Board>,
@@ -650,27 +518,23 @@ impl Shelf {
     }
 }
 
-/// The process's board.
+/// Process-wide disk board shelf.
 pub(crate) static SHELF: Shelf = Shelf::new();
 
 #[cfg(test)]
 impl Shelf {
-    /// Whether nobody holds this board's lock this instant (a test's: a host
-    /// callback must be able to read it). Asked of a test's OWN board: every
-    /// host tick, idle point and `status` reply of another test holds the
-    /// process's [`SHELF`] for an instant, so asked of that it is a race.
+    /// Whether the board mutex is currently unlocked (for tests).
     pub(crate) fn is_free(&self) -> bool {
         self.board.try_lock().is_ok()
     }
 }
 
-/// Change the board under its lock and wake every parked wait.
+/// Mutate [`SHELF`] under its lock and wake all parked waiters.
 pub(crate) fn publish(f: impl FnOnce(&mut Board)) {
     SHELF.publish(f);
 }
 
-/// THE BEAT: the watch made progress now ([`Watch::Running`]). Wakes no
-/// wait: a wait reads the beat at its own wakes.
+/// Record a disk-watch progress heartbeat on [`SHELF`].
 pub(crate) fn beat() {
     let mut b = SHELF.board_lock();
     if b.watch != Watch::Suspended {
@@ -680,7 +544,7 @@ pub(crate) fn beat() {
     }
 }
 
-/// The watch is suspended (`true`: the host is not active) or running again.
+/// Set whether the disk watch on [`SHELF`] is suspended.
 pub(crate) fn suspend(suspended: bool) {
     let mut b = SHELF.board_lock();
     b.watch = match (suspended, b.watch) {
@@ -692,20 +556,13 @@ pub(crate) fn suspend(suspended: bool) {
     };
 }
 
-/// Whether a disk watch runs in this process (the harness host is on:
-/// [`Board::watched`]), told by the host at each of its ticks.
+/// Set whether a disk watch is active in this process.
 pub(crate) fn watching(on: bool) {
     let mut b = SHELF.board_lock();
     b.watched = on;
 }
 
-/// `status`'s disk fields for session `session` working in `cwd` (its
-/// reported spelling): `disk=<level> disk_free_mb=<n> disk_room_mb=<n>
-/// disk_age_ms=<n>` of the volume holding its working directory, `-` each
-/// where the board holds no row for it (not measured yet, a platform with no
-/// volume reader, a remote or automounted mount, a spelling the table cannot
-/// place and none spelled long for the session yet: [`Board::spelled`]).
-/// From the board under its leaf lock; no I/O.
+/// Format `status` disk fields (`disk=`, `disk_free_mb=`, `disk_room_mb=`) for `session`.
 pub(crate) fn status_fields(session: u64, cwd: Option<&str>) -> String {
     let b = SHELF.board_lock();
     match b.row_of(session, cwd) {
@@ -746,11 +603,6 @@ mod tests {
     }
 
     /// `status` reads `-` on an empty board, the session's mapped row once a
-    /// look resolved its working directory, and — for a session not mapped
-    /// yet — the row its spelling's mount names in the last table. NEGATIVE
-    /// CONTROL: a spelling no row holds reads `-`.
-    // Unix: its spellings are macOS's (Windows' are
-    // `a_windows_spelling_reads_the_row_of_its_volume`).
     #[cfg(unix)]
     #[test]
     fn status_reads_the_row_of_the_sessions_volume_or_dashes() {
@@ -787,12 +639,6 @@ mod tests {
     }
 
     /// WINDOWS: a session's working directory in any spelling a Windows tab
-    /// reports — plain, verbatim (`\\?\`), another case, a trailing
-    /// separator, forward slashes, the drive path an MSYS `/c/…` report is
-    /// rewritten to — reads the row of the volume the table places it on,
-    /// so `status disk=` fills for a Windows tab. NEGATIVE CONTROLS: a drive
-    /// the board holds no row for, a share (`\\srv\share`: no local volume),
-    /// an 8.3 spelling the key cannot place, and a relative path read `-`.
     #[cfg(windows)]
     #[test]
     fn a_windows_spelling_reads_the_row_of_its_volume() {
@@ -845,8 +691,6 @@ mod tests {
     }
 
     /// A demand is registered, adopted as the largest need on its volume with
-    /// every demanding session's directory, and dropped by its id; a wait's
-    /// own reading replaces its volume's row.
     #[test]
     fn demands_are_adopted_by_their_volumes_largest_need() {
         let mut b = Board::new();
@@ -884,12 +728,6 @@ mod tests {
     }
 
     /// The tally adds every removal of the local day, names what the last
-    /// one was, ignores a removal that released nothing, and starts again
-    /// at LOCAL midnight: read after it, it is gone before any removal; the
-    /// next removal counts alone. UTC's midnight, two hours later, resets
-    /// nothing. NEGATIVE CONTROL: with the local offset or the wall clock
-    /// unread no day is placed, so a removal counts nothing, resets nothing
-    /// and the tally reads as no day's.
     #[test]
     fn freed_tally_counts_the_local_day_and_starts_again_at_its_midnight() {
         let local_midnight = UTC_MIDNIGHT - EAST_2H;
@@ -986,15 +824,6 @@ mod tests {
     }
 
     /// With the watch on, the deck reads the home volume's level and lines
-    /// (no floor where no pass removes, a private state root's volume, nor
-    /// with the automatic pass off), the inode emergency as its own flag,
-    /// the stuck sessions, every other measured volume by name, a stall
-    /// only once the beat is two look periods old (dated at the beat),
-    /// today's tally and the last home pass's hogs with its time. NEGATIVE
-    /// CONTROLS: an unread wall clock dates neither a stall nor the hogs, a
-    /// pass on another volume names no hogs, a home volume the board has
-    /// not measured reads no level, and a process with no watch reads
-    /// nothing.
     #[test]
     fn deck_facts_with_the_watch_on() {
         let home = VolumeKey::Container("disk3".to_owned());
@@ -1058,8 +887,6 @@ mod tests {
         assert_eq!(f.hogs, std::slice::from_ref(&hog));
         assert_eq!(f.hogs_at, Some(UTC_MIDNIGHT + 30_000));
 
-        // An unread wall clock dates no stall, and a pass that ended under
-        // one gives its hogs no time.
         let unread = Clock {
             unix: None,
             offset: None,
@@ -1070,8 +897,6 @@ mod tests {
         let f = b.deck_facts(&home, &now);
         assert_eq!((f.hogs.len(), f.hogs_at), (1, None));
 
-        // A beat younger than two look periods is no stall; a suspended
-        // watch never stalls.
         let fresh = Clock {
             at: beat + crate::control::control_disk::STALL - Duration::from_secs(1),
             ..now
@@ -1080,23 +905,18 @@ mod tests {
         b.watch = Watch::Suspended;
         assert_eq!(b.deck_facts(&home, &now).stalled_since, None);
 
-        // Out of file slots with bytes to spare: the inode line's emergency.
         b.volumes[0] = measured("/System/Volumes/Data", home.clone(), 41 * GIB, 10);
         let f = b.deck_facts(&home, &now);
         assert_eq!(f.level, Some(Level::Emergency));
         assert!(f.files_emergency);
-        // Below the emergency line in bytes: the free figure's emergency.
         b.volumes[0] = measured("/System/Volumes/Data", home.clone(), 6 * GIB, 10);
         assert!(!b.deck_facts(&home, &now).files_emergency);
-        // A private state root: the watch measures and cleans nothing, so
-        // no floor line, while the warning and the emergency stand.
         b.volumes[0].reclaimed_here = false;
         let f = b.deck_facts(&home, &now);
         assert_eq!((f.warn, f.floor), (Some(69 * GIB), None));
         assert_eq!(f.emergency, Some(8 * GIB));
         b.volumes[0].reclaimed_here = true;
         assert_eq!(b.deck_facts(&home, &now).floor, Some(34 * GIB));
-        // The automatic pass off: no floor line.
         b.volumes[0].thresholds.floor = 0;
         assert_eq!(b.deck_facts(&home, &now).floor, None);
 
@@ -1115,10 +935,6 @@ mod tests {
     }
 
     /// With the harness off (the host's tick says no watch runs) the deck
-    /// reads no board facts, even from a board that holds a level, a stuck
-    /// session and a tally: it is empty with `watch` false, and the shelf
-    /// says it is not watched. NEGATIVE CONTROL: the same board watched reads
-    /// them.
     #[test]
     fn with_the_harness_off_the_deck_reads_no_board_facts() {
         let home = VolumeKey::Container("disk3".to_owned());
@@ -1152,18 +968,10 @@ mod tests {
     }
 
     /// THE WATCH'S JUDGEMENT STAYS (live5 F1): a wait's own reading of a
-    /// volume the watch measured — one built with no row to start from, as a
-    /// wait whose 8.3 `vol=` the board could not place builds it: the
-    /// owner's plain lines, no room, nothing removed there — replaces the
-    /// row's reading and keeps the watch's room, its raised lines and
-    /// `reclaimed_here`, the level read again on those lines. NEGATIVE
-    /// CONTROLS: a volume no row holds yet is added as the wait read it, and
-    /// the watch's own reading ([`Board::measured`]) replaces the row whole.
     #[test]
     fn a_waits_own_reading_keeps_the_watchs_judgement_of_its_volume() {
         let key = VolumeKey::Container("disk3".to_owned());
         let plain = aterm_agent::harness::disk::Config::default().thresholds(Some(2000 << 30));
-        // The lines raised to a room (warn at least twice it).
         let raised = aterm_agent::harness::disk::Thresholds {
             warn: 900 << 30,
             ..plain
@@ -1202,7 +1010,6 @@ mod tests {
             (None, false, plain)
         );
 
-        // The watch's own reading is its judgement: it replaces the row whole.
         b.measured(wait(400 << 30, key.clone()));
         let judged = b.row_keyed(&key).expect("the watch's row");
         assert_eq!(
@@ -1212,10 +1019,6 @@ mod tests {
     }
 
     /// A board holding one volume's row, its table placing `placed` on it,
-    /// and an 8.3 spelling `short` of that place the table cannot place as
-    /// written: a Windows drive (`C:\PROGRA~1\x`), or on unix a macOS
-    /// spelling outside every mount (no short names exist there; the rule
-    /// is pure).
     fn one_volume_board() -> (Board, &'static str, &'static str) {
         let mut b = Board::new();
         #[cfg(windows)]
@@ -1260,14 +1063,6 @@ mod tests {
     }
 
     /// AN 8.3 TAB SPELLED LONG READS ITS VOLUME'S ROW (live5 F2): before any
-    /// look maps it and where no watch runs, a session whose reported
-    /// spelling was spelled long ([`Board::spell`]) reads the row its long
-    /// spelling places on — after the rows are replaced too (the first
-    /// reading publishes them whole), with no index to go stale — and only
-    /// while it still reports that spelling. NEGATIVE CONTROLS: the spelling
-    /// before it is spelled, another session reporting it, and the session
-    /// once it moved, read no row. Past [`MAX_SPELLED`] the oldest session's
-    /// spelling goes.
     #[test]
     fn a_session_spelled_long_reads_its_volumes_row_while_it_reports_it() {
         let (mut b, placed, short) = one_volume_board();

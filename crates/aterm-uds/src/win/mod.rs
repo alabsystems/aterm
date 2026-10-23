@@ -1,28 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! AF_UNIX over winsock: the Windows [`CtlStream`]/[`CtlListener`].
-//!
-//! Mirrors the `std::os::unix::net` surface the control channel uses:
-//! `connect`/`bind`/`incoming`/`accept`/`pair`/`try_clone`/`shutdown`/
-//! `set_read_timeout`/`set_write_timeout` plus `Read`+`Write` for owned and
-//! borrowed streams. Two parts differ in mechanism:
-//!
-//! * `try_clone` shares one socket via `Arc`: afunix does not reliably support
-//!   `WSADuplicateSocketW` and `DuplicateHandle` does not support sockets.
-//!   Clones behave like Unix `dup`s (`shutdown` and timeouts affect all; the
-//!   socket closes when the last clone drops), so dropping a clone closes
-//!   nothing.
-//! * Timeouts and interruptible waits use `WSAEventSelect`. On afunix a local
-//!   `shutdown` does not wake a `recv` blocked on another thread, yet relay
-//!   teardown depends on that wake. So every socket is armed with
-//!   `WSAEventSelect(FD_READ|FD_WRITE|FD_CLOSE)` (which also makes it
-//!   non-blocking) and a blocked read/write parks in `WSAWaitForMultipleEvents`
-//!   over `[net_ev, shutdown_ev]`. A caller timeout becomes the wait's timeout
-//!   (expiring as `ErrorKind::WouldBlock`); `shutdown()` sets the direction's
-//!   `shutdown_ev`, waking the parked thread and yielding EOF (reads) or
-//!   `BrokenPipe` (writes), as on Unix. `recv`/`send` treat `WSAEWOULDBLOCK` by
-//!   re-arming via `WSAEnumNetworkEvents` and looping.
+//! Windows `AF_UNIX` stream and listener sockets ([`CtlStream`], [`CtlListener`]) over Winsock.
 
 pub(crate) mod ffi;
 
@@ -35,40 +14,26 @@ use std::time::{Duration, Instant};
 use ffi::RawSocket;
 
 /// Call `WSAStartup(2.2)` once, process-wide, before the first socket call.
-/// Never paired with `WSACleanup`. std::net's lazy init cannot be relied on:
-/// this crate may run before any std socket exists.
 fn init() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         let mut data = ffi::WsaData { _opaque: [0; 512] };
-        // 0x0202 == winsock 2.2. Failure leaves later calls to surface
-        // WSANOTINITIALISED as ordinary io::Errors.
         let _ = unsafe { ffi::WSAStartup(0x0202, &mut data) };
     });
 }
 
 /// The current thread's last winsock error as an [`io::Error`] (std maps the
-/// `WSAE*` codes onto the portable [`io::ErrorKind`]s, e.g.
-/// `WSAECONNREFUSED` → `ConnectionRefused`).
 fn last_wsa_error() -> io::Error {
     io::Error::from_raw_os_error(unsafe { ffi::WSAGetLastError() })
 }
 
 /// Encode `path` into a `sockaddr_un`, stripping a canonicalize-style verbatim
-/// prefix (`\\?\` / `\\?\UNC\`) first. afunix reads `sun_path` as UTF-8, so any
-/// valid-Unicode path of at most 107 UTF-8 bytes is accepted directly
-/// (including non-ASCII user profiles). Longer or non-Unicode paths fall back
-/// to the 8.3 short name of the existing parent directory, else fail with
-/// actionable advice rather than binding a garbled path.
 fn encode_sun_path(path: &Path) -> io::Result<(ffi::SockaddrUn, i32)> {
     if let Some(s) = path.to_str()
         && let Some(addr) = try_encode(s)
     {
         return Ok(addr);
     }
-    // Short-path fallback: the parent dir must already exist for
-    // GetShortPathNameW; the file name itself must be valid Unicode and fit
-    // (aterm's instance-socket names are short ASCII).
     if let (Some(parent), Some(name)) = (path.parent(), path.file_name())
         && let Some(name) = name.to_str()
         && let Some(short_parent) = short_path(parent)
@@ -88,7 +53,6 @@ fn encode_sun_path(path: &Path) -> io::Result<(ffi::SockaddrUn, i32)> {
 }
 
 /// One encode attempt: strip the verbatim prefix, then require UTF-8 ≤ 107
-/// bytes (NUL-terminated in a 108-byte `sun_path`).
 fn try_encode(s: &str) -> Option<(ffi::SockaddrUn, i32)> {
     let stripped = strip_verbatim(s);
     let bytes = stripped.as_bytes();
@@ -104,7 +68,6 @@ fn try_encode(s: &str) -> Option<(ffi::SockaddrUn, i32)> {
 }
 
 /// Strip `std::fs::canonicalize`'s verbatim prefixes: `\\?\C:\x` → `C:\x`,
-/// `\\?\UNC\server\share` → `\\server\share`.
 fn strip_verbatim(s: &str) -> String {
     if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
         format!(r"\\{rest}")
@@ -116,7 +79,6 @@ fn strip_verbatim(s: &str) -> String {
 }
 
 /// The 8.3 short form of an existing path via `GetShortPathNameW`, or `None`
-/// if unavailable (volume with 8.3 generation disabled, path missing).
 fn short_path(p: &Path) -> Option<String> {
     use std::os::windows::ffi::OsStrExt;
     let wide: Vec<u16> = p
@@ -135,12 +97,6 @@ fn short_path(p: &Path) -> Option<String> {
 }
 
 /// Park until the socket is readable/writable, locally shut down, or the
-/// deadline passes. Waits on `[net_ev, shutdown_ev]` (the `WSAEventSelect`
-/// readiness event and this direction's manual-reset shutdown event). Returns:
-/// * `Ok(true)`: woke on readiness; retry the recv/send.
-/// * `Ok(false)`: the socket was locally shut down for this direction.
-/// * `Err(WouldBlock)`: the caller's `deadline` (`None` = no timeout) passed,
-///   the kind a Unix `UnixStream` timeout yields.
 fn wait_interruptible(
     raw: RawSocket,
     net_ev: ffi::WsaEvent,
@@ -161,7 +117,6 @@ fn wait_interruptible(
                     "control-socket operation timed out",
                 ));
             }
-            // Never let a finite deadline round up to WSA_INFINITE.
             remaining.min(u128::from(ffi::WSA_INFINITE - 1)).max(1) as u32
         }
     };
@@ -177,14 +132,9 @@ fn wait_interruptible(
             "control-socket operation timed out",
         ));
     }
-    // A local shutdown may race the readiness wake; the flag is authoritative.
     if shutdown_flag.load(Ordering::Acquire) {
         return Ok(false);
     }
-    // Readiness wake: reset `net_ev` and clear the socket's event record. If
-    // anything fired, re-signal `net_ev` so a parked opposite-direction wait on
-    // the same socket (clones share it) does not lose its wakeup to our reset.
-    // Bounded: `net_ev` only re-fires on a real network event.
     let mut ne = ffi::WsaNetworkEvents {
         lNetworkEvents: 0,
         _iErrorCode: [0; 10],
@@ -196,11 +146,6 @@ fn wait_interruptible(
 }
 
 /// The shared socket state behind every clone of one [`CtlStream`].
-/// Timeouts are in milliseconds, `0` meaning none (std rejects a zero
-/// timeout). The shutdown flags record a local `shutdown` per direction for
-/// parked waits to observe ([`wait_interruptible`]); the paired manual-reset
-/// events wake a thread parked in `WSAWaitForMultipleEvents`. `net_ev` is the
-/// readiness event armed in [`CtlStream::from_raw`].
 #[derive(Debug)]
 struct Inner {
     raw: RawSocket,
@@ -215,7 +160,6 @@ struct Inner {
 
 impl Drop for Inner {
     fn drop(&mut self) {
-        // Last clone gone — close the one underlying socket and its events.
         unsafe {
             let _ = ffi::closesocket(self.raw);
             let _ = ffi::WSACloseEvent(self.net_ev);
@@ -225,17 +169,12 @@ impl Drop for Inner {
     }
 }
 
-/// A connected AF_UNIX stream socket (Windows). See the module docs for the
-/// `try_clone`/timeout semantics; everything else matches
-/// `std::os::unix::net::UnixStream` at the call-site level.
+/// Connected Windows `AF_UNIX` stream socket.
 #[derive(Debug)]
 pub struct CtlStream(Arc<Inner>);
 
 impl CtlStream {
     /// Wrap an already-connected socket: create its three events and arm
-    /// `WSAEventSelect(FD_READ|FD_WRITE|FD_CLOSE)` on `net_ev`. That makes the
-    /// socket non-blocking, so it must run after connect/accept. On failure the
-    /// socket and any created events are closed and the winsock error returned.
     fn from_raw(raw: RawSocket) -> io::Result<Self> {
         let net_ev = unsafe { ffi::WSACreateEvent() };
         let recv_shutdown_ev = unsafe { ffi::WSACreateEvent() };
@@ -274,13 +213,9 @@ impl CtlStream {
         })))
     }
 
-    /// Connect to the AF_UNIX socket bound at `path`.
-    ///
+    /// Connects to the `AF_UNIX` socket bound at `path`.
     /// # Errors
-    /// `NotFound` when nothing exists at `path` (normalized, so
-    /// `socket_is_live`'s `ConnectionRefused | NotFound` stale test holds);
-    /// `ConnectionRefused` for a stale file with no listener; the mapped
-    /// winsock error otherwise.
+    /// Returns an error if `path` cannot be encoded or `socket`/`connect` fails.
     pub fn connect<P: AsRef<Path>>(path: P) -> io::Result<CtlStream> {
         init();
         let path = path.as_ref();
@@ -289,15 +224,9 @@ impl CtlStream {
         if raw == ffi::INVALID_SOCKET {
             return Err(last_wsa_error());
         }
-        // Connect while still blocking (arming events makes it non-blocking,
-        // and connect would then return WSAEWOULDBLOCK).
         if unsafe { ffi::connect(raw, &addr, len) } == ffi::SOCKET_ERROR {
             let err = last_wsa_error();
             let _ = unsafe { ffi::closesocket(raw) };
-            // A genuinely absent path reads as NotFound. `try_exists`, not
-            // `symlink_metadata`: a bound afunix socket is a reparse point that
-            // `symlink_metadata` cannot stat cross-process, while `try_exists`
-            // returns Ok(true) for it, so a present socket keeps its real error.
             if matches!(path.try_exists(), Ok(false)) {
                 return Err(io::Error::new(
                     io::ErrorKind::NotFound,
@@ -306,17 +235,12 @@ impl CtlStream {
             }
             return Err(err);
         }
-        CtlStream::from_raw(raw) // arms readiness/shutdown events; closes on failure
+        CtlStream::from_raw(raw)
     }
 
-    /// A connected pair, emulating `socketpair(2)`: bind a throwaway listener
-    /// under the temp dir, connect, accept, then close and unlink the listener.
-    /// Safe single-threaded, since afunix completes the connect against the
-    /// backlog before the accept. The per-process, per-call temp path is
-    /// same-user territory, like a Unix socketpair's fd table.
-    ///
+    /// Creates a connected pair of [`CtlStream`]s via a temporary listener.
     /// # Errors
-    /// Any bind/connect/accept failure (e.g. an unusable temp dir).
+    /// Returns any Winsock or filesystem error from binding, connecting, or accepting.
     pub fn pair() -> io::Result<(CtlStream, CtlStream)> {
         static PAIR_SEQ: AtomicU64 = AtomicU64::new(0);
         init();
@@ -331,19 +255,13 @@ impl CtlStream {
         Ok((accepted?, connector))
     }
 
-    /// The connected peer's pid as afunix recorded it at `connect`
-    /// (`SIO_AF_UNIX_GETPEERPID`), which the peer cannot assert for itself.
-    ///
+    /// Queries the connected peer's process ID via `SIO_AF_UNIX_GETPEERPID`.
     /// # Errors
-    /// Whatever `WSAIoctl` reports (an afunix without the ioctl answers
-    /// `WSAEINVAL`/`WSAEOPNOTSUPP`), and `InvalidData` for a short answer or a
-    /// zero pid.
+    /// Returns the mapped Winsock error if `WSAIoctl` fails.
     pub fn peer_pid(&self) -> io::Result<u32> {
         let mut pid: u32 = 0;
         let mut returned: u32 = 0;
-        // SAFETY: `raw` is this stream's live socket; the output buffer is a
-        // `u32` we own, sized by `cbOutBuffer`; no input buffer, synchronous
-        // (null overlapped and completion routine).
+        // SAFETY: `raw` is a live socket and `pid` is a valid `u32` output buffer for synchronous `WSAIoctl`.
         let rc = unsafe {
             ffi::WSAIoctl(
                 self.0.raw,
@@ -369,24 +287,16 @@ impl CtlStream {
         Ok(pid)
     }
 
-    /// A handle sharing this socket (an `Arc` clone; fallible only for parity
-    /// with `UnixStream::try_clone`). Clones share `shutdown` and timeouts, and
-    /// the socket closes when the last clone drops.
-    ///
+    /// Returns a cloned handle sharing the underlying socket state.
     /// # Errors
-    /// Never fails on Windows.
+    /// Infallible; returns `io::Result` for parity with `UnixStream::try_clone`.
     pub fn try_clone(&self) -> io::Result<CtlStream> {
         Ok(CtlStream(Arc::clone(&self.0)))
     }
 
-    /// Shut down one or both directions (`ws2_32 shutdown`), raise the matching
-    /// local flags, and set each direction's shutdown event, which wakes a
-    /// `read`/`write` parked on another thread's clone (afunix does not; see the
-    /// module docs).
-    ///
+    /// Shuts down one or both directions and signals any parked reads or writes.
     /// # Errors
-    /// The mapped winsock error (an already-shut-down socket errors, as on
-    /// Unix); the flags are raised only on success.
+    /// Returns the mapped Winsock error if `shutdown` fails.
     pub fn shutdown(&self, how: std::net::Shutdown) -> io::Result<()> {
         let (flag_recv, flag_send, how) = match how {
             std::net::Shutdown::Read => (true, false, ffi::SD_RECEIVE),
@@ -396,8 +306,6 @@ impl CtlStream {
         if unsafe { ffi::shutdown(self.0.raw, how) } == ffi::SOCKET_ERROR {
             return Err(last_wsa_error());
         }
-        // Raise the flag, then wake the parked wait, which re-checks the flag
-        // (Release/Acquire pairs the two).
         if flag_recv {
             self.0.recv_shutdown.store(true, Ordering::Release);
             let _ = unsafe { ffi::WSASetEvent(self.0.recv_shutdown_ev) };
@@ -409,16 +317,9 @@ impl CtlStream {
         Ok(())
     }
 
-    /// One non-blocking `recv`: returns `WouldBlock` when nothing is queued and
-    /// `Ok(0)` on peer close or local read shutdown.
-    ///
-    /// Used by the control socket's push loop to probe liveness without waiting
-    /// out a read timeout (`WSAEventSelect` already put the socket in
-    /// non-blocking mode). Consumes any byte it reads, so callers use it only on
-    /// streams where any client byte ends the subscription.
-    ///
+    /// Performs one non-blocking `recv`, returning `WouldBlock` when empty or `Ok(0)` on EOF.
     /// # Errors
-    /// `WouldBlock` for a quiet open peer; the mapped winsock error otherwise.
+    /// Returns `WouldBlock` when no bytes are queued, or the mapped Winsock error.
     pub fn read_nonblocking(&self, buf: &mut [u8]) -> io::Result<usize> {
         let inner = &self.0;
         let len = buf.len().min(i32::MAX as usize) as i32;
@@ -428,20 +329,15 @@ impl CtlStream {
         }
         let err = last_wsa_error();
         match err.raw_os_error() {
-            // `read` would park here and then report a local shutdown as EOF
-            // (its wait re-checks the flag); answer the same without parking.
             Some(ffi::WSAEWOULDBLOCK) if inner.recv_shutdown.load(Ordering::Acquire) => Ok(0),
             Some(ffi::WSAESHUTDOWN) => Ok(0),
             _ => Err(err),
         }
     }
 
-    /// Set the read timeout (`None` clears it). Expiry surfaces as
-    /// `ErrorKind::WouldBlock`. Shared by all clones and safe to call from any
-    /// thread.
-    ///
+    /// Sets or clears the read timeout shared across clones.
     /// # Errors
-    /// `InvalidInput` for a zero `Duration`, matching std.
+    /// Returns `InvalidInput` for a zero `Duration`.
     pub fn set_read_timeout(&self, t: Option<Duration>) -> io::Result<()> {
         self.0
             .read_timeout_ms
@@ -449,10 +345,9 @@ impl CtlStream {
         Ok(())
     }
 
-    /// Set the write timeout (`None` clears it), for parity with std.
-    ///
+    /// Sets or clears the write timeout shared across clones.
     /// # Errors
-    /// `InvalidInput` for a zero `Duration`, matching std.
+    /// Returns `InvalidInput` for a zero `Duration`.
     pub fn set_write_timeout(&self, t: Option<Duration>) -> io::Result<()> {
         self.0
             .write_timeout_ms
@@ -462,7 +357,6 @@ impl CtlStream {
 }
 
 /// std-compatible timeout validation: `Some(0)` is an error, sub-millisecond
-/// values round up to 1ms (never to "no timeout").
 fn timeout_to_ms(t: Option<Duration>) -> io::Result<u64> {
     match t {
         None => Ok(0),
@@ -481,8 +375,6 @@ impl io::Read for &CtlStream {
         let deadline = (timeout != 0).then(|| Instant::now() + Duration::from_millis(timeout));
         let len = buf.len().min(i32::MAX as usize) as i32;
         loop {
-            // The socket is non-blocking (WSAEventSelect): recv first, park
-            // only when there is nothing to read.
             let n = unsafe { ffi::recv(inner.raw, buf.as_mut_ptr(), len, 0) };
             if n != ffi::SOCKET_ERROR {
                 return Ok(n as usize);
@@ -497,13 +389,10 @@ impl io::Read for &CtlStream {
                         &inner.recv_shutdown,
                         deadline,
                     )? {
-                        // Locally shut down: EOF, as on Unix, so a relay pump
                         // parked on a clone exits cleanly.
                         return Ok(0);
                     }
                 }
-                // A raced local `shutdown` surfaces as WSAESHUTDOWN from recv;
-                // same normalization to EOF as the flag path above.
                 Some(ffi::WSAESHUTDOWN) => return Ok(0),
                 _ => return Err(err),
             }
@@ -512,13 +401,10 @@ impl io::Read for &CtlStream {
 }
 
 /// The most slices one [`io::Write::write_vectored`] hands `WSASend`, the
-/// same bound as `IOV_MAX` on Unix; the rest is a short write.
 const MAX_SEND_BUFS: usize = 1024;
 
 impl CtlStream {
     /// Run `attempt`, one non-blocking `send`/`WSASend` answering the bytes it
-    /// sent or `None` on `SOCKET_ERROR`, until it sends: parked on the
-    /// readiness event while the socket has no room, under the write timeout.
     fn send_with(&self, mut attempt: impl FnMut() -> Option<usize>) -> io::Result<usize> {
         let inner = &self.0;
         let timeout = inner.write_timeout_ms.load(Ordering::Relaxed);
@@ -537,7 +423,6 @@ impl CtlStream {
                         &inner.send_shutdown,
                         deadline,
                     )? {
-                        // Locally shut down for writing: `BrokenPipe`, as on
                         // Unix.
                         return Err(io::Error::new(
                             io::ErrorKind::BrokenPipe,
@@ -545,7 +430,6 @@ impl CtlStream {
                         ));
                     }
                 }
-                // Same parity for a raced local shutdown observed by send.
                 Some(ffi::WSAESHUTDOWN) => {
                     return Err(io::Error::new(
                         io::ErrorKind::BrokenPipe,
@@ -569,7 +453,6 @@ impl io::Write for &CtlStream {
     }
 
     /// One `WSASend` of up to [`MAX_SEND_BUFS`] slices, where std's default
-    /// would make one `send` per slice.
     fn write_vectored(&mut self, bufs: &[io::IoSlice<'_>]) -> io::Result<usize> {
         let bufs = &bufs[..bufs.len().min(MAX_SEND_BUFS)];
         if bufs.is_empty() {
@@ -594,7 +477,8 @@ impl io::Write for &CtlStream {
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        Ok(()) // sends are unbuffered; nothing to push
+        // sends are unbuffered; nothing to push
+        Ok(())
     }
 }
 
@@ -618,21 +502,16 @@ impl io::Write for CtlStream {
     }
 }
 
-/// A bound, listening AF_UNIX socket (Windows). Dropping it closes the
-/// listening socket but, like `UnixListener`, does not unlink the socket file.
+/// Bound and listening Windows `AF_UNIX` socket.
 #[derive(Debug)]
 pub struct CtlListener {
     raw: RawSocket,
 }
 
 impl CtlListener {
-    /// Bind and listen (backlog 128) at `path`. The socket file is an afunix
-    /// reparse point; a stale one must be removed first, as on Unix.
-    ///
+    /// Binds and listens at `path`.
     /// # Errors
-    /// `InvalidInput` for an unencodable path (see [`CtlStream::connect`]);
-    /// `AddrInUse` when a file already exists there; the mapped winsock error
-    /// otherwise.
+    /// Returns an error if `path` cannot be encoded or `socket`/`bind`/`listen` fails.
     pub fn bind<P: AsRef<Path>>(path: P) -> io::Result<CtlListener> {
         init();
         let (addr, len) = encode_sun_path(path.as_ref())?;
@@ -640,7 +519,7 @@ impl CtlListener {
         if raw == ffi::INVALID_SOCKET {
             return Err(last_wsa_error());
         }
-        let listener = CtlListener { raw }; // owns + closes on early return
+        let listener = CtlListener { raw };
         if unsafe { ffi::bind(raw, &addr, len) } == ffi::SOCKET_ERROR {
             return Err(last_wsa_error());
         }
@@ -650,11 +529,9 @@ impl CtlListener {
         Ok(listener)
     }
 
-    /// Accept one connection. The `()` stands where std returns the peer
-    /// `SocketAddr` (unnamed for AF_UNIX peers; no call site reads it).
-    ///
+    /// Accepts one incoming connection.
     /// # Errors
-    /// The mapped winsock error.
+    /// Returns the mapped Winsock error if `accept` fails.
     pub fn accept(&self) -> io::Result<(CtlStream, ())> {
         let raw = unsafe { ffi::accept(self.raw, std::ptr::null_mut(), std::ptr::null_mut()) };
         if raw == ffi::INVALID_SOCKET {
@@ -663,8 +540,7 @@ impl CtlListener {
         Ok((CtlStream::from_raw(raw)?, ()))
     }
 
-    /// A blocking iterator over incoming connections (never `None`), matching
-    /// `UnixListener::incoming`.
+    /// Returns a blocking iterator over incoming connections.
     pub fn incoming(&self) -> Incoming<'_> {
         Incoming { listener: self }
     }
@@ -695,12 +571,9 @@ mod tests {
     use super::*;
 
     /// A hang detector, never a latency budget: a wake that must come ends the
-    /// wait the moment it lands.
     const HANG_DETECTOR: Duration = Duration::from_secs(60);
 
     /// Non-ASCII (but valid-UTF-8) paths encode directly — the default socket
-    /// dir under a Cyrillic/CJK `%LOCALAPPDATA%` must not need any fallback —
-    /// while the 107-byte sun_path budget stays enforced on the UTF-8 length.
     #[test]
     fn utf8_non_ascii_paths_encode_directly() {
         let s = "C:\\Users\\Владимир\\AppData\\Local\\aterm\\aterm-1234.sock";
@@ -708,7 +581,6 @@ mod tests {
         assert_eq!(addr.sun_family, ffi::AF_UNIX as u16);
         assert_eq!(&addr.sun_path[..s.len()], s.as_bytes());
         assert_eq!(addr.sun_path[s.len()], 0, "NUL-terminated");
-        // 54 two-byte chars = 108 UTF-8 bytes + "C:\" — over the 107 budget.
         assert!(try_encode(&format!("C:\\{}", "я".repeat(54))).is_none());
         assert!(
             try_encode("C:\\a\0b.sock").is_none(),
@@ -717,7 +589,6 @@ mod tests {
     }
 
     /// afunix.sys reads `sun_path` as UTF-8: a full bind/connect/accept round
-    /// trip through a non-ASCII directory.
     #[test]
     fn non_ascii_dir_binds_and_connects() {
         use std::io::{Read, Write};
@@ -741,14 +612,12 @@ mod tests {
         assert_eq!(&back, b"ping");
         server.join().expect("server thread");
 
-        // The socket file landed at the real (non-ASCII) path.
         assert!(std::fs::symlink_metadata(&path).is_ok());
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A no-timeout read parks on the readiness/shutdown events and wakes
-    /// with EOF when a clone is shut down.
     #[test]
     fn idle_parked_read_wakes_on_shutdown() {
         use std::io::Read;
@@ -757,7 +626,6 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         let reader = std::thread::spawn(move || {
             let mut buf = [0u8; 16];
-            // No timeout: parks until the shutdown event fires.
             let _ = tx.send((&a).read(&mut buf));
         });
         std::thread::sleep(Duration::from_millis(80));
@@ -772,7 +640,6 @@ mod tests {
     }
 
     /// A no-timeout read parked with no data wakes on the peer's write via the
-    /// `FD_READ` readiness event and returns the bytes.
     #[test]
     fn parked_read_wakes_on_peer_write() {
         use std::io::{Read, Write};

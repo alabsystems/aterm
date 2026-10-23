@@ -1,39 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! CLAUDE CODE'S VERSIONS ([`super::Class::ClaudeStaleVersions`]): which entry
-//! of the vendor's `versions/` folder is the LIVE one, and which of the others
-//! something still holds. The class is removed only by the owner's own
-//! `aterm harness disk --apply claude-stale-versions`; the window's pass never
-//! takes it ([`super::pass_plan`]).
-//!
-//! * **The live one.** On macOS and Linux `~/.local/bin/claude` is a SYMLINK
-//!   into `versions/`, and the entry it resolves into is live. On Windows
-//!   `~/.local/bin/claude.exe` is a COPY of the live entry (measured
-//!   2026-10-19: 245,092,000 bytes, byte-identical to the one entry,
-//!   `versions\2.1.286`, itself a FILE), so a path names nothing there: the
-//!   live entry is the one whose CONTENT the launcher is — equal length, then
-//!   equal SHA-256 ([`copy_of`]). A launcher that names no entry strictly
-//!   inside `versions/` — a link resolving elsewhere, a regular file on macOS
-//!   or Linux, a copy of none of them or of two — names no live one, and then
-//!   every row of the class is blocked ([`super::version_dir_of`]): "not the
-//!   live one" would be a guess.
-//! * **What still holds another** ([`kept`]): Claude Code's own lock for it
-//!   (`~/.local/state/claude/locks/<version>.lock`); a running process using it
-//!   — its executable, working directory or an open file
-//!   ([`super::discover::unused_under`]'s rule, one scan for every entry while
-//!   none is used, one more for each entry a found use does not name:
-//!   [`mark_kept`]; a scan that could not rule everyone out keeps it, as an
-//!   unreadable process is unknown, so held); and on Windows an entry NEWER than the
-//!   live one, the update a running `claude.exe` keeps the updater from
-//!   swapping in (a name that is no version number has no order, so it is
-//!   kept too: a download being staged is one).
-//! * **The digest cache.** A digest reads the whole file, a quarter GiB a
-//!   version, so each is kept in the harness state directory ([`HASH_FILE`])
-//!   under its path and what the file's OWN handle says of it — its length,
-//!   last write and creation time, and its identity (volume and file number)
-//!   — and is read again whenever one of those moved, or the bytes moved
-//!   while they were read.
+//! CLAUDE CODE'S VERSIONS ([`super::Class::ClaudeStaleVersions`]): which entry of the vendor's `versions/` folder is the LIVE one, and which of the others something still holds.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read as _;
@@ -46,8 +14,7 @@ use super::VersionDir;
 /// The digest cache's file, under the harness state directory.
 pub const HASH_FILE: &str = "claude-version-hashes.json";
 
-/// The most digests the cache keeps: the launcher's and every entry's of its
-/// length that one survey read.
+/// The most digests the cache keeps: the launcher's and every entry's of its length that one survey read.
 pub const MAX_HASHES: usize = 32;
 
 /// The most bytes of cache file read back; a larger one is no cache.
@@ -56,29 +23,19 @@ const MAX_HASH_FILE_BYTES: u64 = 64 * 1024;
 /// What one survey read of the versions folder.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Versions {
-    /// Its entries, each strictly inside it (canonical), sized, and with why
-    /// it is kept when something still holds it.
+    /// Its entries, each strictly inside it (canonical), sized, and with why it is kept when something still holds it.
     pub entries: Vec<VersionDir>,
     /// The live entry, when the launcher named one.
     pub live: Option<PathBuf>,
-    /// The launcher the live entry was named from BY CONTENT (Windows'
-    /// `claude.exe` copy); `None` when a link named it.
+    /// The launcher the live entry was named from BY CONTENT (Windows' `claude.exe` copy); `None` when a link named it.
     pub copy_of: Option<PathBuf>,
     /// Why no live entry was named.
     pub unnamed: Option<String>,
 }
 
-/// Read the versions folder `roots` names: its entries ([`list`]), the live
-/// one ([`live_of`]), and for every other one what still holds it
-/// ([`mark_kept`], the running processes read once through `processes`).
-/// Nothing is read when no
-/// versions folder is named or it is not there.
+/// Read the versions folder `roots` names: its entries ([`list`]), the live one ([`live_of`]), and for every other one what still holds it ([`mark_kept`], the running processes read once through `processes`).
 #[must_use]
 pub fn read(roots: &super::Roots, processes: super::discover::Processes<'_>) -> Versions {
-    // Both sides are canonical or neither is compared: the report decides
-    // the class by path equality, and on macOS `/var` resolves to
-    // `/private/var`, so comparing a resolved link against an unresolved
-    // listing would make the live version read as stale.
     let Some(root) = roots
         .versions_dir
         .as_ref()
@@ -114,18 +71,7 @@ pub fn read(roots: &super::Roots, processes: super::discover::Processes<'_>) -> 
     out
 }
 
-/// Why each of `entries` but the `live` one is KEPT ([`kept`]'s rule), from
-/// ONE scan of the running processes over every entry no lock or name already
-/// keeps. A use is placed on an entry by the one path rule over `table`
-/// ([`super::idle::under`]: on Windows the kernel's plain `C:\…\held.exe`
-/// against the listing's `\\?\C:\…`), in the spelling the scan placed it by
-/// ([`aterm_uds::holders::PathUse::path`]: on Windows each 8.3 short name
-/// spelled long, so a use through a short spelling keeps its own entry
-/// alone); one it cannot place counts for every entry, as held. While
-/// nothing uses any entry, that one scan is all. A scan
-/// names only the FIRST use of each process, so once it found a use, each
-/// entry no use of it names is scanned again on its own (a process using two
-/// of them keeps both): one scan, and one more for each such entry.
+/// Why each of `entries` but the `live` one is KEPT ([`kept`]'s rule), from ONE scan of the running processes over every entry no lock or name already keeps.
 pub fn mark_kept(
     entries: &mut [VersionDir],
     live: &Path,
@@ -164,12 +110,7 @@ pub fn mark_kept(
     }
 }
 
-/// The entries of the canonical versions folder `root`: each child that
-/// canonicalizes to a DIRECT child of `root` (a link inside it leading out is
-/// no entry: removing its target would remove what no listing of `versions/`
-/// holds), once, sized as what it is — a file by its length (the native
-/// installs' layout on every OS), a folder by its walk ([`super::dir_bytes`]).
-/// Anything else is no entry.
+/// The entries of the canonical versions folder `root`: each child that canonicalizes to a DIRECT child of `root` (a link inside it leading out is no entry: removing its target would remove what no listing of `versions/` holds), once, sized as what it is — a file by its length (the native installs' layout on every OS), a folder by its walk ([`super::dir_bytes`]).
 #[must_use]
 pub fn list(root: &Path) -> Vec<VersionDir> {
     let mut out: Vec<VersionDir> = Vec::new();
@@ -177,8 +118,6 @@ pub fn list(root: &Path) -> Vec<VersionDir> {
         if out.len() >= super::MAX_ROWS_PER_CLASS {
             break;
         }
-        // A child that will not canonicalize has no comparable identity, so
-        // it gets no row rather than an unchecked one.
         let Ok(path) = std::fs::canonicalize(&child) else {
             continue;
         };
@@ -205,18 +144,8 @@ pub fn list(root: &Path) -> Vec<VersionDir> {
     out
 }
 
-/// The live entry of the canonical versions folder `root`, named by
-/// `launcher`, and — when it was named by content — the launcher it is the
-/// original of.
-///
-/// A link (any OS; on Windows one made under Developer Mode) names the entry
-/// its resolved target lies in. On Windows a regular file is the installer's
-/// COPY and names the one entry it is a byte-for-byte copy of ([`copy_of`]).
-/// On macOS and Linux a launcher that is not a link names nothing (it
-/// resolves to itself, outside `versions/`).
-///
+/// The live entry of the canonical versions folder `root`, named by `launcher`, and — when it was named by content — the launcher it is the original of.
 /// # Errors
-///
 /// Why it names no entry.
 pub fn live_of(
     launcher: &Path,
@@ -233,15 +162,11 @@ pub fn live_of(
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 return Err(format!("there is no live launcher {}", launcher.display()));
             }
-            // A link (Developer Mode) resolves as on Unix; anything else
-            // fails to.
             _ => {}
         }
     }
     let resolved = std::fs::canonicalize(launcher)
         .map_err(|_| "the live symlink did not resolve".to_owned())?;
-    // The link points at the executable inside a version directory on some
-    // installs; the version is the ancestor whose parent is the root.
     super::version_dir_of(&resolved, Some(root))
         .map(|v| (v, None))
         .ok_or_else(|| {
@@ -253,14 +178,9 @@ pub fn live_of(
         })
 }
 
-/// The ONE entry of `entries` that `launcher` is a byte-for-byte copy of:
-/// every regular-file entry of the launcher's length is digested
-/// ([`Hashes::digest`]) and compared with the launcher's.
-///
+/// The ONE entry of `entries` that `launcher` is a byte-for-byte copy of: every regular-file entry of the launcher's length is digested ([`Hashes::digest`]) and compared with the launcher's.
 /// # Errors
-///
-/// The launcher is a copy of none of them, or of more than one (which is the
-/// original is then unknown), or a file could not be read.
+/// The launcher is a copy of none of them, or of more than one (which is the original is then unknown), or a file could not be read.
 pub fn copy_of(
     launcher: &Path,
     entries: &[VersionDir],
@@ -292,10 +212,7 @@ pub fn copy_of(
     }
 }
 
-/// Why the entry `v` (not the live one, `live`) is KEPT, or `None` when
-/// nothing holds it: Claude Code's lock for it in `locks`, (Windows) it is
-/// newer than the live one or has no version number, or a running process
-/// uses it (`processes`, asked last: it is the one scan of every process).
+/// Why the entry `v` (not the live one, `live`) is KEPT, or `None` when nothing holds it: Claude Code's lock for it in `locks`, (Windows) it is newer than the live one or has no version number, or a running process uses it (`processes`, asked last: it is the one scan of every process).
 #[must_use]
 pub fn kept(
     v: &VersionDir,
@@ -333,10 +250,7 @@ fn kept_by_name(v: &VersionDir, live: &Path, locks: Option<&Path>) -> Option<Str
     None
 }
 
-/// Why the entry named `name` is not older than the live entry `live` — it is
-/// newer (a running `claude.exe` keeps the updater from swapping it in), or
-/// one of the two names is no version number, so the order is unknown —
-/// else `None`.
+/// Why the entry named `name` is not older than the live entry `live` — it is newer (a running `claude.exe` keeps the updater from swapping it in), or one of the two names is no version number, so the order is unknown — else `None`.
 #[must_use]
 pub fn newer_than(name: &str, live: &Path) -> Option<String> {
     let live_name = live
@@ -355,8 +269,7 @@ pub fn newer_than(name: &str, live: &Path) -> Option<String> {
     }
 }
 
-/// A dotted version number's parts (`2.1.286` → `[2, 1, 286]`), compared part
-/// by part; `None` for any other name.
+/// A dotted version number's parts (`2.1.286` → `[2, 1, 286]`), compared part by part; `None` for any other name.
 #[must_use]
 pub fn version_number(name: &str) -> Option<Vec<u64>> {
     name.split('.')
@@ -369,26 +282,15 @@ pub fn version_number(name: &str) -> Option<Vec<u64>> {
 }
 
 /// The digest cache's schema: 2 since a file's identity is the one export's
-/// full width ([`Stamp::id`]). A cache of another schema is no cache — every
-/// digest is read anew — so one written with the old, narrower identity
-/// (schema 1: a 32-bit volume serial and a 64-bit file index on Windows) is
-/// never taken for a hit.
 const HASH_SCHEMA: u64 = 2;
 
 /// What a file's own handle says of it: a digest stands while none of it
-/// moved — its length, last write, creation, and its identity, so a file
-/// renamed over the one read is read anew.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Stamp {
     len: u64,
     written_ns: Option<u64>,
     created_ns: Option<u64>,
     /// The file's volume and number, as the one identity export reads them
-    /// ([`aterm_sysprobe::volumes::FileId`]: `st_dev` and `st_ino`; on
-    /// Windows the 64-bit volume serial and the 128-bit file id, read from
-    /// the open handle, [`aterm_sysprobe::volumes::file_id_of_handle`]).
-    /// `None` where it cannot be read (a FAT or exFAT volume keeps no file
-    /// ids): the other fields then stand alone.
     id: Option<(u64, u128)>,
 }
 
@@ -409,7 +311,6 @@ impl Stamp {
 }
 
 /// The identity of the file open as `file` (read as `meta`), by the one
-/// export's width ([`Stamp::id`]).
 fn file_id(
     file: &std::fs::File,
     meta: &std::fs::Metadata,
@@ -436,10 +337,7 @@ fn file_id(
     }
 }
 
-/// THE DIGEST CACHE ([`HASH_FILE`]): each file's SHA-256 under its path and
-/// its [`Stamp`]. Only the digests one survey used are written back, so it
-/// holds at most the launcher and the entries of its length
-/// ([`MAX_HASHES`]).
+/// THE DIGEST CACHE ([`HASH_FILE`]): each file's SHA-256 under its path and its [`Stamp`].
 #[derive(Debug, Default)]
 pub struct Hashes {
     /// Where it is kept; `None`: nothing is read or written.
@@ -478,7 +376,6 @@ impl Hashes {
             return out;
         }
         let ns = |e: &Value, k: &str| e.get(k).and_then(Value::as_u64);
-        // The file id is written in decimal: 128 bits fit no JSON number.
         let ino = |e: &Value| {
             e.get("ino")
                 .and_then(Value::as_str)
@@ -508,15 +405,9 @@ impl Hashes {
         out
     }
 
-    /// The length and lowercase hex SHA-256 of the regular file at `path`,
-    /// read through ONE handle: from the cache while the handle's [`Stamp`]
-    /// matches the one it was kept under, else by reading every byte, the
-    /// stamp read again after (a file written meanwhile has no digest).
-    ///
+    /// The length and lowercase hex SHA-256 of the regular file at `path`, read through ONE handle: from the cache while the handle's [`Stamp`] matches the one it was kept under, else by reading every byte, the stamp read again after (a file written meanwhile has no digest).
     /// # Errors
-    ///
-    /// It could not be opened or read, is not a regular file, or moved while
-    /// it was read.
+    /// It could not be opened or read, is not a regular file, or moved while it was read.
     pub fn digest(&mut self, path: &Path) -> Result<(u64, String), String> {
         let err = |e: std::io::Error| format!("{} could not be read: {e}", path.display());
         let mut file = std::fs::File::open(path).map_err(err)?;
@@ -542,7 +433,6 @@ impl Hashes {
             }
             hash.update(&buf[..n]);
             read = read.saturating_add(n as u64);
-            // Each MiB read is the scan moving ([`super::beat`]).
             super::beat::tick(1);
         }
         let after = file.metadata().map_err(err)?;
@@ -585,9 +475,7 @@ impl Hashes {
         aterm_json::to_string(&Value::Object(o)).unwrap_or_else(|_| "{}".to_owned())
     }
 
-    /// Write the cache back when a digest was read anew or one it held went
-    /// unused, by temp file and rename. A failed write (a full disk) costs only
-    /// the next survey a re-read, so it is not reported.
+    /// Write the cache back when a digest was read anew or one it held went unused, by temp file and rename.
     pub fn save(&self) {
         let Some(file) = &self.file else {
             return;

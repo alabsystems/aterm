@@ -1,91 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The `fabric` lane: what aterm's use of the astream bus costs, MEASURED and
-//! never judged.
-//!
-//! The measurement itself is Trust code in the package it measures:
-//! `crates/aterm/benches/fabric_bench.rs`, an explicit bench that mounts the fabric
-//! worlds' harness and boots the real stack — astream's broker opened guarded,
-//! with aterm's own options for the arm's tier (unless named, the tier aterm
-//! opens its guarded broker at by default: ordered at its horizon), in the
-//! bench process, the headless `aterm` and the `aterm link serve` bridge that
-//! `aterm` supervises. Its entry requires a
-//! `FABRIC_BENCH` specification; this lane supplies one:
-//!
-//! ```text
-//! targo --unverified bench -q --profile test -p aterm --bench fabric_bench
-//! ```
-//!
-//! with `FABRIC_BENCH="out=<scratch> samples=… burst=… pingpong=… attach=…
-//! rounds=…"`. The bench writes `fabric.json` (every raw value beside its
-//! summary) and `fabric.md` (the tables); the lane prints the tables, writes both
-//! into the append-only ledger `docs/measured/fabric/` with the run's
-//! provenance, and copies the JSON to `--json-out` when given.
-//!
-//! `--pingpong-rounds N` sizes the ping-pong arm (A posts, B replies on
-//! receipt, back to back): its round trip, each reply's wait for the commit of
-//! the delivery it answers, and where the bridge's loop spent the window — the broker,
-//! the verb lane, the state dir, its park and its wakes — which the bridge
-//! counts itself (its wait-tally development seam, `aterm_link::wait_tally`
-//! v=2, set in that arm's world alone), and a paced sub-phase on an idle loop.
-//! `--bystanders N` spawns N idle sessions beside the messaging and ping-pong
-//! worlds' two, so the walks over every session carry them.
-//! Every tier arm runs all scenarios unless `--scenario` selects only
-//! messaging, pingpong, attach or handoff. Unselected scenarios never start.
-//!
-//! `--durability strict,ordered,relaxed` names the ARMS, each one bench run
-//! and one ledger entry on the one build: the bench opens its broker with
-//! aterm's own options for the tier (the escalation table on the weak ones),
-//! so the ordered arm measures aterm's real table, once per `--horizon-ms`
-//! (aterm's 100 ms unless named); relaxed is the ceiling (no
-//! flush before an ack), never what aterm runs by default, and its entry says
-//! so above its tables. `--passes N` runs the arm list N times, forward then
-//! backward, so one invocation interleaves a comparison A B B A. With no
-//! `--durability` the one arm is what aterm ships, NAMED in the entry's words
-//! and reproducing line ([`Arm::shipped`]): ordered at 100 ms since the
-//! 2026-10-20 re-gate, strict in every bare entry before it.
-//!
-//! WHAT SHIPS, AND ITS PARTS. Every world's broker retains its log by aterm's
-//! default rules, set at every open as `aterm link broker` sets them, and the
-//! bridge runs its bus mirror at `--log auto` (on over a retaining broker):
-//! what ships. `--retention off` opens every world's broker with no rules (a
-//! broker from before astream's R4, which also keeps the auto mirror off),
-//! `--log off` takes the mirror away and keeps retention, so one pair of runs
-//! separates the two; `--retention-interval-ms N` runs the retaining broker's
-//! tick every N ms instead of astream's minute, which no world outlives. Each
-//! reaches the bench's words, and the entry's reproducing line, only when
-//! given.
-//!
-//! WHY NO FLOOR. Every message costs Strict appends, and a Strict append is an
-//! fsync — `F_FULLFSYNC` on macOS — whose price is the disk's: an absolute
-//! bound would fail a correct build on a slower machine and pass a regression
-//! on a faster one. A before/after claim is two runs of this lane on one
-//! machine, compared; the ledger keeps them.
-//!
-//! TWO ARMS, `--profile dev|opt`, BOTH WITH DEBUG ASSERTIONS. The harness reaches the
-//! `aterm` binary through `CARGO_BIN_EXE_aterm` and the bridge through the
-//! `ATERM_FABRIC_COMMAND` development seam, which a build without debug
-//! assertions compiles out, and a `--release` test build of a crate that calls
-//! other crates' debug-only test seams does not compile (AGENTS.md). So `dev`
-//! (the default) explicitly selects the `test` profile, preserving the original
-//! measurement's build rather than the bench default's release profile. The
-//! bridge itself, aterm-link, runs at its `[profile.dev.package.aterm-link]`
-//! opt-level 2, but most crates on the path — astream-broker, aterm-gui — are
-//! opt-level 0, and the arm's numbers overstate the CPU part of every cost. A
-//! `dev` before/after across a change to those rows compares unlike builds;
-//! each entry's plan line says which opt-levels it measured. `opt` is the root
-//! manifest's `[profile.opt-test]`: release code
-//! generation with debug assertions on (the arm's table, and why it does not
-//! inherit `dev`, is the bench's `fabric_bench/profile.rs`). Before measuring,
-//! the lane reads cargo's plan for the arm and refuses an opt build with any
-//! crate on the measured path below opt-level 3 ([`units`]), and holds the
-//! rustflags cargo appends beside the plan to setting none of what it resolved
-//! ([`flags`]: the caller's environment sources are removed, the config files'
-//! are read). It builds, takes the `aterm` cargo reports and that file's
-//! identity, and after the run refuses a report of any other path, or of that
-//! path holding another file at the bench's start or end. Every entry names its
-//! arm, what the plan said and every rustflag beside it; compare like with like.
+//! `verify perf fabric` benchmark lane runner and provenance ledger writer.
 
 use std::collections::BTreeMap;
 use std::io::BufRead as _;
@@ -98,10 +14,6 @@ use super::{LaneRun, workspace_root};
 use crate::perf::driver::CargoDriver;
 
 /// THE BENCH'S OWN GRAMMAR for a run, mounted from the bench (std-only) the way
-/// `crate::toolchain` is shared with atpkg: the lane refuses exactly what the
-/// bench would — before the build, as a usage error, never as a red lane after
-/// one — and no bound (`BURST_MAX`, `ATTACH_MAX`, the rising list) is kept in
-/// two places to drift.
 #[path = "../../../aterm/tests/fabric_bench/spec.rs"]
 #[expect(
     dead_code,
@@ -111,7 +23,6 @@ use crate::perf::driver::CargoDriver;
 mod bench_spec;
 
 /// THE BENCH'S OWN TABLE of arms, mounted the same way: the cargo profile each
-/// builds with, where its binaries land, and the opt-level it promises.
 #[path = "../../../aterm/tests/fabric_bench/profile.rs"]
 mod bench_profile;
 
@@ -120,24 +31,16 @@ mod units;
 
 use bench_profile::Profile;
 
-/// One ARM of a run: the broker tier the bench opens, and an ordered arm's
-/// horizon — one bench run and one ledger entry each.
+/// One benchmark arm: broker durability tier and optional ordered horizon.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Arm {
     pub tier: bench_spec::Tier,
-    /// `Some` exactly for an ordered arm.
+    /// Ordered-tier horizon in milliseconds (`Some` iff `tier` is ordered).
     pub horizon_ms: Option<u64>,
 }
 
 impl Arm {
     /// THE DEFAULT ARM, NAMED: what aterm opens its guarded broker at by
-    /// default — the bench's own default tier, which the bench holds equal to
-    /// `aterm_link::durability::default_for` (`fabric_bench/run.rs`), at
-    /// aterm's horizon when it is ordered. A bare run measures the
-    /// configuration aterm ships, and its entry names the arm in its words
-    /// and its reproducing line, so the entry still says what it measured
-    /// after that default moves (as it did on 2026-10-20, strict to ordered:
-    /// a bare entry before then is a strict one).
     fn shipped() -> Arm {
         let tier = bench_spec::Tier::default();
         Arm {
@@ -166,41 +69,31 @@ impl Arm {
     }
 }
 
-/// The lane's options, parsed, and checked by the bench's own grammar. `None`
-/// leaves the bench's default (`crates/aterm/tests/fabric_bench/spec.rs`).
+/// Parsed `verify perf fabric` CLI options.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(crate) struct Args {
-    /// The scenarios measured (`--scenario`), all unless named.
+    /// Scenarios to measure (`--scenario`).
     pub scenario: bench_spec::Scenario,
     pub samples: Option<u32>,
     pub burst: Option<u32>,
-    /// The ping-pong arm's measured round trips (`--pingpong-rounds`).
+    /// Ping-pong measured round trips (`--pingpong-rounds`).
     pub pingpong: Option<u32>,
     pub attach: Option<Vec<u32>>,
     pub rounds: Option<u32>,
-    /// The arms measured, in order (`--durability strict,ordered,relaxed`, an
-    /// ordered tier once per `--horizon-ms`), each checked by the bench's own
-    /// grammar. Empty runs the default arm, named ([`Arm::shipped`]).
+    /// Arms to measure in order (`--durability` and `--horizon-ms`).
     pub arms: Vec<Arm>,
-    /// How many times the arm list runs (`--passes`, at least one): forward,
-    /// then backward, and so on, so one invocation interleaves the arms A B B
-    /// A as the ledger's README asks of a comparison.
+    /// Number of alternating passes over `arms` (`--passes`).
     pub passes: u32,
     pub json_out: Option<PathBuf>,
-    /// The arm measured (`--profile`), dev unless named.
+    /// Cargo profile to measure (`--profile`).
     pub profile: Profile,
-    /// `--retention on|off`: whether each world's broker retains its log by
-    /// aterm's default rules; `None` leaves the bench's default, on (what
-    /// ships).
+    /// Broker log retention override (`--retention on|off`).
     pub retention: Option<bool>,
-    /// `--log auto|off`: the bridge's bus mirror; `None` leaves the bench's
-    /// default, auto (what ships).
+    /// Bridge bus mirror mode (`--log auto|off`).
     pub log: Option<bench_spec::Log>,
-    /// `--retention-interval-ms N`: the retaining broker's tick interval;
-    /// `None` leaves astream's minute (what ships).
+    /// Retaining broker tick interval override in milliseconds (`--retention-interval-ms`).
     pub retention_interval_ms: Option<u64>,
-    /// `--bystanders N`: idle sessions spawned beside the messaging and
-    /// ping-pong worlds' two; `None` leaves the bench's default, none.
+    /// Idle bystander sessions spawned alongside measured sessions (`--bystanders`).
     pub bystanders: Option<u32>,
 }
 
@@ -212,16 +105,10 @@ fn positive(flag: &str, raw: &str) -> Result<u32, String> {
 }
 
 impl Args {
-    /// Parse the options the fabric lane reads — `super::main` hands it only
-    /// those (`super::options_for`), so any other flag here is one the table
-    /// gives this lane and this parser forgot.
+    /// Parse `verify perf fabric` CLI options.
     ///
     /// # Errors
-    ///
-    /// A value that is not a positive integer, a run the bench's grammar
-    /// refuses (a burst or population past what one instance carries, a
-    /// population list that does not rise, a tier it does not know), a
-    /// horizon with no ordered arm to take it, or a flag with no parser.
+    /// Returns an error string if an option value or combination is rejected by the benchmark grammar.
     pub(crate) fn from_options(options: &BTreeMap<&'static str, String>) -> Result<Args, String> {
         let mut a = Args {
             passes: 1,
@@ -299,8 +186,6 @@ impl Args {
                         format!("`{flag}` needs a non-negative integer, got `{raw}`")
                     })?);
                 }
-                // The run's switch, which `super::main` reads; it names every
-                // lane, so every lane's parser is handed it.
                 "--no-windows" => {}
                 other => {
                     return Err(format!(
@@ -346,9 +231,7 @@ impl Args {
         Ok(a)
     }
 
-    /// The runs, in order: the arm list (or the default arm, named:
-    /// [`Arm::shipped`]), forward on the first pass, backward on the second,
-    /// and so on.
+    /// Build the alternating pass schedule of [`Arm`]s (forward on even passes, reversed on odd passes).
     pub(crate) fn plan(&self) -> Vec<Arm> {
         let arms: Vec<Arm> = if self.arms.is_empty() {
             vec![Arm::shipped()]
@@ -366,8 +249,7 @@ impl Args {
             .collect()
     }
 
-    /// The `FABRIC_BENCH` words for one run of `arm` writing into `out`.
-    /// Pure (unit-tested).
+    /// Format the `FABRIC_BENCH` environment string for `arm` writing to `out`.
     pub(crate) fn bench_words(&self, out: &Path, arm: Arm) -> String {
         let mut words = vec![format!("out={}", out.display())];
         if self.scenario != bench_spec::Scenario::All {
@@ -405,15 +287,12 @@ impl Args {
         words.join(" ")
     }
 
-    /// The `verify perf fabric …` line that reproduces one run of `arm`, for
-    /// its ledger entry.
+    /// Format the reproducing `verify perf fabric` command line for `arm`.
     pub(crate) fn command_line(&self, arm: Arm) -> String {
         let mut line = String::from("targo --unverified verify perf fabric");
         if self.scenario != bench_spec::Scenario::All {
             line.push_str(&format!(" --scenario {}", self.scenario.word()));
         }
-        // The default arm is left unsaid, so a dev entry reads exactly as every
-        // entry before the opt arm did.
         if self.profile != Profile::Dev {
             line.push_str(&format!(" --profile {}", self.profile.name()));
         }
@@ -449,10 +328,7 @@ impl Args {
         line
     }
 
-    /// The cargo arguments that name this arm's build of the bench: the arm's
-    /// profile, the package, the bench target. The plan and the run both take
-    /// them, so the build the lane checks is the build it runs. Pure
-    /// (unit-tested).
+    /// Cargo arguments naming the benchmark target and profile for this run.
     pub(crate) fn build_args(&self) -> Vec<&'static str> {
         vec![
             "--profile",
@@ -469,13 +345,12 @@ impl Args {
 const BENCH_ENV: &str = "FABRIC_BENCH";
 
 /// The bench's progress lines start with this; the lane echoes them live and
-/// keeps the rest of the build's chatter for a failure message.
 const PROGRESS: &str = "fabric bench:";
 
 /// How many trailing output lines a failure quotes.
 const TAIL: usize = 60;
 
-/// The lane.
+/// Run the `fabric` performance lane.
 pub(crate) fn run(args: &Args) -> LaneRun {
     arena::outcome(measure(args))
 }
@@ -490,9 +365,6 @@ fn measure(args: &Args) -> Result<String, Halt> {
     }
     let targo = Targo::new(crate::perf::driver::cargo_driver()?);
     let profile = args.profile;
-    // THE FLAGS BESIDE THE PROFILE: the caller's environment sources are
-    // removed from every targo below; the config files' are read and held to
-    // the plan ([`flags`]).
     let removed: Vec<String> = std::env::vars_os()
         .filter_map(|(key, _)| key.into_string().ok())
         .filter(|key| flags::is_env_source(key))
@@ -532,9 +404,6 @@ fn measure(args: &Args) -> Result<String, Halt> {
     ));
     eprintln!("  {build}");
     let load_before = load_average();
-    // THE BINARY THIS ARM BUILT, as cargo reports it, and its identity right
-    // after the build: the bench must report launching exactly that file, at
-    // its start and at its end.
     let built = build_bench(&targo, args)?;
     if Profile::of_binary(&built) != Some(profile) {
         return Err(Halt::Fail(format!(
@@ -551,12 +420,6 @@ fn measure(args: &Args) -> Result<String, Halt> {
         identity: built_identity,
         lane_build: build,
     };
-    // ONE BUILD, EVERY RUN: each arm of the plan is one bench run and one
-    // ledger entry, back to back on the binary just built — each run's
-    // `targo bench` builds nothing, because the build's git facts are pinned
-    // on every targo here ([`git_facts`]) and no git operation in the shared
-    // repository can make it relink. A run that fails stops the plan there;
-    // the entries before it stand.
     let plan = args.plan();
     let mut written = Vec::with_capacity(plan.len());
     let mut load = format!("{load_before} before the build");
@@ -584,8 +447,6 @@ struct Built {
 }
 
 /// One bench run of `arm` on the binary `built`, written into the ledger: the
-/// entry's path. `load_before` is the load average the entry quotes before
-/// the run (before the build, for the first run).
 fn run_arm(
     targo: &Targo<'_>,
     args: &Args,
@@ -614,9 +475,6 @@ fn run_arm(
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| format!("could not run targo: {e}"))?;
-    // stdout carries the tables the bench also writes to its report file:
-    // read on a thread so neither pipe can fill and stall the
-    // other, and kept only for a failure message.
     let stdout = child.stdout.take().map(|out| {
         std::thread::spawn(move || {
             let mut text = String::new();
@@ -669,8 +527,6 @@ fn run_arm(
             args.scenario.word()
         )));
     }
-    // The entry's JSON carries what the lane read about the build, beside the
-    // bench's own words for the arm.
     if let Some(fields) = report.as_object_mut() {
         fields.insert("lane_build".to_string(), built.lane_build.clone().into());
     }
@@ -717,7 +573,6 @@ fn run_arm(
         json_path.display()
     );
     if let Some(out) = &args.json_out {
-        // One run only: `Args::from_options` refuses it beside a plan of more.
         std::fs::write(out, &json)
             .map_err(|e| format!("could not write {}: {e}", out.display()))?;
         eprintln!("json written: {}", out.display());
@@ -726,20 +581,6 @@ fn run_arm(
 }
 
 /// Every targo this lane runs: the run's toolchain ([`CargoDriver`]), in the
-/// workspace, with no environment source of rustflags ([`flags`]), and led by
-/// the build-dir `--config` every perf build of the workspace gets
-/// ([`crate::perf::driver::workspace_build_dir`]): the one atpkg's shim hands a
-/// plain `targo` here, else `<target>/build.noindex`.
-///
-/// ONE CACHE WITH A SHELL BUILD. Without that `--config` the lane compiled into
-/// `target/<profile>/deps` while `targo --unverified test …` from a shell (and
-/// `verify`'s own test builds) compiled the same units into the shim's build
-/// directory: two full copies of one build, 3.7 GiB for the dev arm and 727 MiB
-/// for the opt arm. With it, the lane's units are the shell's; the binaries
-/// still land in `target/<profile dir>/`.
-///
-/// ONE READING OF THE BUILD'S GIT FACTS FOR THE WHOLE PLAN ([`git_facts`]),
-/// set on every targo it runs.
 struct Targo<'a> {
     driver: &'a CargoDriver,
     build_dir: Option<String>,
@@ -759,7 +600,6 @@ impl<'a> Targo<'a> {
     }
 
     /// The arguments before the caller's: the cache `--config`, the lane flag,
-    /// the verb.
     fn lead(&self, verb: &str) -> Vec<String> {
         let mut lead = Vec::new();
         if let Some(value) = &self.build_dir {
@@ -797,7 +637,6 @@ impl<'a> Targo<'a> {
     }
 
     /// Run `verb args` to completion; its stdout, or a failure quoting its
-    /// stderr's tail.
     fn output(&self, verb: &str, args: &[&str], what: &str) -> Result<String, Halt> {
         let out = self
             .command(verb)
@@ -819,7 +658,6 @@ impl<'a> Targo<'a> {
 }
 
 /// The three facts `crates/aterm/build.rs` stamps `aterm` with that it would
-/// otherwise probe from git, by the names it reads them pinned under.
 const GIT_FACTS: [&str; 3] = [
     "ATERM_BUILD_GIT_COMMIT",
     "ATERM_BUILD_GIT_COMMIT_FULL",
@@ -827,23 +665,6 @@ const GIT_FACTS: [&str; 3] = [
 ];
 
 /// THE BUILD'S GIT FACTS, PINNED FOR THE WHOLE PLAN: the caller's when it
-/// pinned all three (`caller` reads the environment; an empty value is
-/// unpinned, as build.rs reads it), else build.rs's own reading of them
-/// (`probe`). Pure over its two readers (unit-tested).
-///
-/// WHY. Unpinned, aterm's build script watches git paths that hang off the
-/// repository's SHARED common dir — `packed-refs` and the nearest
-/// `refs/heads/…` directory — so a commit, `fetch` or `pack-refs` in ANY
-/// worktree re-runs it, and the next `targo bench` relinks `aterm`. A plan of
-/// several arms runs `targo bench` once per arm over minutes, and in the
-/// shared checkout another session's git work lands in that window: on
-/// 2026-10-20 it relinked `target/debug/aterm` between the re-gate's third
-/// run and its fourth, and [`another_build`] refused the fourth, rightly.
-/// Pinned on every targo the lane runs — the plan, the build and each run —
-/// the script watches no git path, so the build the lane checks is the build
-/// every run launches; the facts are the ones the script would have stamped
-/// at the start. (The first pinned build re-runs the script once, the pins
-/// being new to it, before the lane takes the binary's identity.)
 fn git_facts(
     caller: impl Fn(&str) -> Option<String>,
     probe: impl FnOnce() -> [String; 3],
@@ -860,9 +681,6 @@ fn git_facts(
 }
 
 /// build.rs's own reading of the three facts in `dir`, probe for probe
-/// (`build_stamp::emit`): HEAD's 12-hex commit with `-dirty` when `git status`
-/// lists anything, the full commit, and the commits since the newest `v*.*.0`
-/// tag — `unknown`, `unknown` and `0` where git cannot say.
 fn probe_git_facts(dir: &Path) -> [String; 3] {
     let git = |args: &[&str]| {
         arena::stdout_of(
@@ -887,7 +705,6 @@ fn probe_git_facts(dir: &Path) -> [String; 3] {
 }
 
 /// Cargo's plan for this arm's build of the bench (`--unit-graph`, which
-/// compiles nothing), read down to the units on the measured path.
 fn plan(targo: &Targo<'_>, args: &Args) -> Result<units::Audit, Halt> {
     let mut plan_args = args.build_args();
     plan_args.extend(["--unit-graph", "-Z", "unstable-options"]);
@@ -897,7 +714,6 @@ fn plan(targo: &Targo<'_>, args: &Args) -> Result<units::Audit, Halt> {
 }
 
 /// The rustflags cargo's config files hold (`targo config get` of the `build`
-/// and `target` tables; a table not set is none).
 fn config_rustflags(targo: &Targo<'_>) -> Result<Vec<flags::Source>, Halt> {
     let table = |name: &str| -> Result<Option<String>, Halt> {
         let args = ["-Z", "unstable-options", "get", "--format", "json", name];
@@ -924,7 +740,6 @@ fn config_rustflags(targo: &Targo<'_>) -> Result<Vec<flags::Source>, Halt> {
 }
 
 /// Build the arm's bench and the `aterm` it launches, and return where cargo
-/// says it wrote that `aterm`.
 fn build_bench(targo: &Targo<'_>, args: &Args) -> Result<PathBuf, Halt> {
     let mut build_args = vec!["-q"];
     build_args.extend(args.build_args());
@@ -935,7 +750,6 @@ fn build_bench(targo: &Targo<'_>, args: &Args) -> Result<PathBuf, Halt> {
 }
 
 /// The executable cargo reports for the binary target `name`, out of a
-/// build's `--message-format json` lines. Pure (unit-tested).
 fn built_binary(messages: &str, name: &str) -> Result<PathBuf, String> {
     for line in messages.lines() {
         let Ok(message) = aterm_json::from_str::<aterm_json::Value>(line) else {
@@ -965,8 +779,6 @@ fn built_binary(messages: &str, name: &str) -> Result<PathBuf, String> {
 }
 
 /// Why the bench's report is not of the binary the lane built — another path,
-/// or the same path holding another file at the run's start or end — or
-/// `None`. Pure (unit-tested).
 fn another_build(report: &aterm_json::Value, built: &Path, identity: &str) -> Option<String> {
     let ran = report
         .get("aterm_binary")
@@ -995,7 +807,6 @@ fn another_build(report: &aterm_json::Value, built: &Path, identity: &str) -> Op
 }
 
 /// `<dir>/<date>-fabric.md` and its `.json`, or `-2`, `-3`… when a run that
-/// day already wrote one: the ledger is append-only.
 fn ledger_paths(dir: &Path, date: &str) -> (PathBuf, PathBuf) {
     let mut n = 1;
     loop {
@@ -1014,12 +825,6 @@ fn ledger_paths(dir: &Path, date: &str) -> (PathBuf, PathBuf) {
 }
 
 /// `sysctl -n vm.loadavg`'s three averages (`1.0 2.0 3.0`), or `unavailable`.
-///
-/// RECORDED BECAUSE IT MOVES THE NUMBERS: every message here waits on fsyncs,
-/// and on a host shared with builds and other agents an `F_FULLFSYNC` flushes
-/// their writes too. The entry says how busy the machine was, so two entries
-/// are compared knowing it; the bench's own yardstick is the in-run
-/// correction.
 fn load_average() -> String {
     arena::stdout_of(aterm_uds::spawnfd::command("sysctl").args(["-n", "vm.loadavg"]))
         .map(|s| {
@@ -1031,9 +836,6 @@ fn load_average() -> String {
 }
 
 /// The cores a load average is read against: logical CPUs and, where the OS
-/// says (Apple silicon), how many are performance cores. A load of 12 is a
-/// quiet 18-core machine and a queue on its 6 performance cores, and every
-/// fabric hop is a thread waiting for one.
 fn cpus() -> String {
     let logical = std::thread::available_parallelism()
         .map_or_else(|_| "?".to_string(), |n| n.get().to_string());
@@ -1121,9 +923,6 @@ mod tests {
         assert_eq!(a.scenario, bench_spec::Scenario::All);
         assert_eq!(a.samples, Some(50));
         assert_eq!(a.attach, Some(vec![1, 4, 16]));
-        // No tier named: the one arm aterm ships, NAMED in the bench's words
-        // and the ledger's reproducing line, so the entry says what it
-        // measured after the default moves.
         let shipped = Arm {
             tier: bench_spec::Tier::Ordered,
             horizon_ms: Some(bench_spec::ORDERED_HORIZON_MS),
@@ -1142,8 +941,6 @@ mod tests {
             "targo --unverified verify perf fabric --latency-samples 50 --attach-sessions 1,4,16 \
              --durability ordered --horizon-ms 100"
         );
-        // The ceiling arm: the tier reaches the bench's words and the ledger's
-        // reproducing line.
         o.insert("--durability", "relaxed".to_string());
         let a = Args::from_options(&o).expect("parses");
         let relaxed = Arm {
@@ -1160,8 +957,6 @@ mod tests {
             "{}",
             a.command_line(relaxed)
         );
-        // The ping-pong arm's rounds reach the bench's words and the ledger's
-        // reproducing line, under the bench's own word for them.
         o.insert("--pingpong-rounds", "40".to_string());
         let a = Args::from_options(&o).expect("parses");
         assert_eq!(a.pingpong, Some(40));
@@ -1174,7 +969,6 @@ mod tests {
             "{}",
             a.command_line(relaxed)
         );
-        // No option: the bench's own defaults, and the shipped arm, named.
         assert_eq!(
             Args::from_options(&BTreeMap::new())
                 .expect("parses")
@@ -1201,9 +995,6 @@ mod tests {
                 );
             }
         }
-        // Refused here, before any build: what does not parse, and what the
-        // bench's own grammar refuses (past one instance's capacity, a list
-        // that does not rise, a tier it does not know).
         for (flag, bad) in [
             ("--burst", "0"),
             ("--burst", "x"),
@@ -1228,23 +1019,16 @@ mod tests {
             o.insert(flag, bad.to_string());
             assert!(Args::from_options(&o).is_err(), "{flag} {bad}");
         }
-        // At the bench's bounds exactly: taken.
         let mut o = BTreeMap::new();
         o.insert("--burst", bench_spec::BURST_MAX.to_string());
         o.insert("--attach-sessions", format!("1,{}", bench_spec::ATTACH_MAX));
         assert!(Args::from_options(&o).is_ok());
-        // A flag this lane is handed but has no arm for is an internal error,
-        // never silently dropped.
         let mut o = BTreeMap::new();
         o.insert("--warmup", "3".to_string());
         assert!(Args::from_options(&o).is_err());
     }
 
     /// WHAT SHIPS, NAMED APART: `--retention`, `--log` and
-    /// `--retention-interval-ms` reach the bench's words and every entry's
-    /// reproducing line only when given (the bench's defaults are what
-    /// ships, and its report names them either way), and the bench's own
-    /// grammar refuses a tick interval on a broker that retains nothing.
     #[test]
     fn retention_the_mirror_and_the_tick_reach_the_bench_and_the_ledger() {
         let shipped = Arm::shipped();
@@ -1292,8 +1076,6 @@ mod tests {
     }
 
     /// `--bystanders N` (B10) reaches the bench's words and the entry's
-    /// reproducing line only when given, 0 included; the bench's own grammar
-    /// refuses a count past what one instance carries.
     #[test]
     fn the_bystanders_reach_the_bench_and_the_ledger() {
         let shipped = Arm::shipped();
@@ -1325,11 +1107,6 @@ mod tests {
     }
 
     /// THE SAME-DAY ARMS IN ONE INVOCATION: `--durability` names the tiers in
-    /// order, an ordered tier runs once per `--horizon-ms` (aterm's 100 ms,
-    /// `bench_spec::ORDERED_HORIZON_MS`, when none is named), and `--passes
-    /// 2` runs the list forward then backward — A B C D D C B A — each run's
-    /// own reproducing line naming its arm alone. `--json-out` names one file,
-    /// so it is refused beside a plan of more than one run.
     #[test]
     fn the_arms_run_in_order_and_alternate_by_pass() {
         use bench_spec::Tier;
@@ -1376,10 +1153,6 @@ mod tests {
     }
 
     /// THE BUILD'S GIT FACTS ARE ONE READING, all three pinned on every
-    /// targo: the caller's when it pinned all three (nothing probed), else
-    /// the probe's for all three — never a mix, under which aterm's build
-    /// script would still read git for the rest and watch the shared refs —
-    /// and an empty pin is none, as the script reads it.
     #[test]
     fn the_build_git_facts_are_the_callers_three_or_one_probe() {
         let probe = || {
@@ -1429,8 +1202,6 @@ mod tests {
 
     #[test]
     fn the_profile_option_picks_the_arm_its_build_and_its_command_line() {
-        // Unnamed: the dev arm, built and reproduced exactly as every entry
-        // before the opt arm was (its tier is named: the shipped arm).
         let dev = Args::from_options(&BTreeMap::new()).expect("parses");
         assert_eq!(dev.profile, Profile::Dev);
         assert_eq!(
@@ -1468,8 +1239,6 @@ mod tests {
                 "fabric_bench"
             ]
         );
-        // The ledger's command line reproduces the arm; the bench's words
-        // never carry it (the bench names its arm from the binary it runs).
         assert_eq!(
             opt.command_line(Arm::shipped()),
             "targo --unverified verify perf fabric --profile opt --burst 150 --durability ordered \
@@ -1490,9 +1259,6 @@ mod tests {
 
     #[test]
     fn the_built_aterm_is_the_binary_cargo_reports() {
-        // The shape of the lines `--no-run --message-format json` printed for
-        // the opt arm on 2026-10-17 (fields trimmed): the test executable sits
-        // in the shim's build directory, the binary in the target directory.
         let messages = [
             r#"{"reason":"compiler-artifact","target":{"kind":["lib"],"name":"aterm"},"executable":null,"fresh":true}"#,
             r#"{"reason":"compiler-artifact","target":{"kind":["bin"],"name":"aterm"},"filenames":["/w/target/opt-test/aterm"],"executable":"/w/target/opt-test/aterm","fresh":false}"#,
@@ -1522,17 +1288,14 @@ mod tests {
         };
         let path = built.to_str().expect("utf-8");
         assert_eq!(another_build(&report(path, id, id), built, id), None);
-        // The dev arm's binary, or any other path.
         let why =
             another_build(&report("/w/target/debug/aterm", id, id), built, id).expect("refused");
         assert!(why.contains("/w/target/debug/aterm"), "{why}");
-        // The right path, rewritten before the run or during it.
         let other = "84000000 bytes, modified 1792221999.000000001";
         for (start, end, moment) in [(other, id, "start"), (id, other, "end")] {
             let why = another_build(&report(path, start, end), built, id).expect("refused");
             assert!(why.contains(moment) && why.contains(other), "{why}");
         }
-        // A bench that reported no identity measured no known binary.
         let bare = aterm_json::json!({ "aterm_binary": path });
         assert!(another_build(&bare, built, id).is_some());
     }
